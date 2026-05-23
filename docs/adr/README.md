@@ -38,15 +38,17 @@ ADRs use the Michael Nygard format. A blank template lives at [`0000-template.md
 | [0020](./0020-nova-evaluation.md) | NOVA evaluation — design inspiration, not implementation language | Accepted | Three structural gaps (GPU kernels, ML bindings, Python interop) preclude NOVA as v0 implementation. NOVA continues as DSL inspiration. Revisit at 12–18 months. |
 | [0021](./0021-privacy-and-data-handling.md) | Privacy and data handling | Accepted | Per-user encryption; export/delete primitives; per-session consent for sensors and outside-world actions; opt-in telemetry; audit log. |
 | [0022](./0022-evaluation-and-milestone-plan.md) | Evaluation criteria and v0 milestone work plan | Accepted | Three v0 success criteria (medicine QA with calibrated refusal; cross-session memory coherence; constitutional enforcement); six milestones (M1–M6) with definitions-of-done. |
+| [0023](./0023-user-interface-and-product-surface.md) | User interface and product surface | Accepted (user-overridable) | Responsive PWA with three coordinated panels (conversational, memory & self, governance & trust); React 18 + Vite + Tailwind + shadcn/ui; WCAG 2.2 AA; passkey-first auth via Lucia; English-only at v0. |
 
 ## Contested decisions
 
-Four ADRs are marked **Accepted (user-overridable)**, meaning the user's chosen option differed from the assistant's recommendation during the design conversation. The user is decision owner; both views are recorded in each ADR's "Alternatives considered" section.
+Five ADRs are marked **Accepted (user-overridable)**, meaning the user's chosen option differed from the assistant's recommendation during the design conversation, or the decision is opinionated enough that the user should be able to revisit it. The user is decision owner; both views are recorded in each ADR's "Alternatives considered" section.
 
 - ADR-0003 — implementation stack (user accepted assistant's recommendation; status reflects active negotiation).
 - ADR-0007 — knowledge update policy (user chose deltas; assistant recommended incremental).
 - ADR-0011 — soul values governance (assistant introduced the three-tier model in response to the user's initial framing; user accepted).
 - ADR-0015 — deployment topology (assistant's reading of the user's "per-user skin" phrasing; user invited to confirm).
+- ADR-0023 — user interface and product surface (the three-panel structure and the React+Vite+Tailwind+PWA stack are opinionated choices the user may revisit; six alternatives are recorded).
 
 ## Proposed decisions
 
