@@ -4,6 +4,8 @@ This directory contains the Architecture Decision Records (ADRs) for the Crossen
 
 ADRs use the Michael Nygard format. A blank template lives at [`0000-template.md`](./0000-template.md). The process for adding, accepting, and superseding ADRs is defined in [ADR-0001](./0001-record-architecture-decisions.md).
 
+> **Substrate architecture set (ADR-001…ADR-050).** A separate, self-contained document — [`crossengin-substrate-architecture.md`](./crossengin-substrate-architecture.md) — records 50 ADRs for the NOVA-first cognitive *substrate* architecture (nodes / synapses / signals / atoms / moments / gates / multi-KG, with no LLM in cognition). It uses its own template (Context / Decision / Options Considered / Consequences / Implementation Notes) and reflects the current architectural intent, superseding the v0 stack decisions where they conflict (notably [ADR-0003](./0003-implementation-language-and-stack.md) and [ADR-0020](./0020-nova-evaluation.md)). The per-file v0 ADRs below remain as the historical record.
+
 ## Status legend
 
 - **Accepted** — decision is in force.
