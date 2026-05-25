@@ -11,7 +11,7 @@ continue. It is updated at every session boundary.
 - Phase 4 memory and learning: **complete**
 - Phase 5 self-directed learning: **complete**
 - Phase 6 cognitive subsystems: **complete**
-- Phase 7 agent architecture: not started
+- Phase 7 agent architecture: **complete**
 - Phase 8 safety and audit: not started
 - Phase 9 IO and effectors: not started
 - Phase 10 persistence and operations: not started
@@ -153,21 +153,48 @@ import the kg layer on a single prefix (NOVA blocker #10).
 
 README updated to v0.6.
 
+## Completed modules — Phase 7 (agent architecture)
+
+Scheduler under `src/scheduler/`, loops under `src/agent/`, meta under
+`src/parts/meta/`. Each module compiles with a matching unit-test suite. Design
+that respects NOVA blocker #10: each loop is a self-contained unit over the
+shared `loop_coordination` blackboard (one subsystem import, one node_pool
+path); the scheduler is substrate-subtree only. Wiring all loops + the scheduler
+into one program is the Phase 10 `main` (needs a `nova_packages/` shim).
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| scheduler/event_dispatch.nova | 0037 | 10 | done |
+| scheduler/tick_loop.nova | 0037 | 8 | done |
+| scheduler/hybrid_scheduler.nova | 0037, 0036 | 11 | done |
+| agent/loop_coordination.nova | 0036 | 16 | done |
+| agent/loop_perception.nova | 0036 | 4 | done |
+| agent/loop_memory.nova | 0036 | 4 | done |
+| agent/loop_reasoning.nova | 0036 | 3 | done |
+| agent/loop_emotion.nova | 0036, 0035 | 3 | done |
+| agent/loop_goals.nova | 0036, 0033 | 3 | done |
+| agent/loop_action.nova | 0036, 0013 | 4 | done |
+| agent/loop_imagination_idle.nova | 0036, 0032 | 2 | done |
+| parts/meta/self_model_query.nova | 0038 | 9 | done |
+| parts/meta/theory_of_mind.nova | 0039, 0044 | 13 | done |
+| parts/meta/long_horizon_goals.nova | 0040 | 9 | done |
+
+README updated to v0.7.
+
 ## Partially completed modules
 
-None. There are no stubs and no `TODO`s in committed code. Every Phase 1–6
+None. There are no stubs and no `TODO`s in committed code. Every Phase 1–7
 module is fully implemented and tested. No `.pending` files were needed.
 
 ## Modules not yet started (in plan order)
 
-- Phase 7: `src/agent/{loop_perception,loop_memory,loop_reasoning,loop_emotion,loop_action,loop_goals,loop_imagination_idle,loop_coordination}.nova`,
-  `src/scheduler/{hybrid_scheduler,tick_loop,event_dispatch}.nova`,
-  `src/parts/meta/{self_model_query,theory_of_mind,long_horizon_goals}.nova`
-- Phases 8–10: as listed in the master plan.
+- Phase 8: `src/safety/{permission_tiers,reversibility_classifier,decision_log,override_mechanism,constitutional_filter}.nova`,
+  `src/audit/{audit_writer,audit_reader}.nova`
+- Phases 9–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 59 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive); **1051 assertions**.
+- Total unit suites: 73 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent); **1150 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -275,35 +302,39 @@ std-importable and to canonicalize import paths.
 
 ## Recommended next session start point
 
-**Phase 7 — agent architecture (ADR-0036..0040).** The integration phase that
-finally wires the parts into a living agent: the six concurrent loops + the
-imagination idle loop, the hybrid 100Hz tick + event scheduler, and the meta
-part (self-model query, theory of mind, long-horizon goals). Suggested order:
+**Phase 8 — safety and audit (ADR-0041..0045, ADR-0043).** Self-contained and
+well-specified; a good, lower-risk phase after the big integration. Suggested
+order:
 
-1. `src/scheduler/{tick_loop,event_dispatch,hybrid_scheduler}.nova` (ADR-0037) —
-   the logical 100Hz tick (build on `tick_driver`'s `td_engine`) fused with an
-   event queue. Wall-clock pacing is NOVA enhancement #5; `sleep_ms`/`time` exist
-   if approximate pacing is wanted.
-2. `src/agent/loop_*.nova` (ADR-0036) — perception, memory, reasoning, emotion,
-   action, goals + the imagination idle loop. **This is where the long-deferred
-   wiring lands:** feed `predictive_coding_runtime` error and
-   `plasticity_modulation`/emotion modulator into `tick_driver` (currently 0 /
-   neutral), and route reader percepts and fired-node signals through
-   `gate_router` to other parts' first nodes. **Heed NOVA blocker #10:** a loop
-   that touches both the substrate subtree (gate_router/tick_driver) and the kg
-   subtree will double-include shared modules unless all imports resolve through
-   one prefix -- introduce a `nova_packages/` shim (compiler checks it first, so
-   a bare name resolves to one canonical string) or route everything via one
-   subtree. Prototype the import graph for ONE loop before writing all eight.
-3. `src/parts/meta/{self_model_query,theory_of_mind,long_horizon_goals}.nova`
-   (ADR-0038/0039/0040) — self-model query reads `competence_tracker`; theory of
-   mind models other agents' beliefs/goals; long-horizon goals build on
-   `goal_engine` + `goal_persistence`.
+1. `src/safety/permission_tiers.nova` (ADR-0041) — observe/respond/full tiers and
+   the permission check; elevation requires explicit confirmation.
+2. `src/safety/reversibility_classifier.nova` (ADR-0042) — classify actions as
+   reversible / partially / irreversible; irreversible actions require
+   confirmation.
+3. `src/audit/{audit_writer,audit_reader}.nova` (ADR-0043) — the append-only
+   decision log (every decision traced). In-memory + serialized now; crash-safe
+   fsync durability is NOVA enhancement #9 (likely a documented gap).
+4. `src/safety/decision_log.nova` (ADR-0043) — the decision-record structure the
+   audit writer persists.
+5. `src/safety/override_mechanism.nova` (ADR-0044) — one-shot override
+   grant/consume; also backs user-model delete (theory_of_mind already exposes
+   usermodel_delete).
+6. `src/safety/constitutional_filter.nova` (ADR-0045) — the output filter chain
+   that enforces the soul constitution (constitution.nova + XSIG_CONST already
+   exist) over every motor-effector-bound output. No bypass paths.
 
-Everything the loops need now exists as tested building blocks: substrate
-(`tick_driver`, `gate_router`), reader (`reader_read`), kg + learning fabric,
-goals/soul/emotion/reasoning/imagination. Phase 7 is mostly composition + the
-cross-subtree import resolution.
+These are self-contained / soul-importing modules (single subtree), so blocker
+#10 does not bite. The "every output passes the safety chain" wiring is exercised
+at the Phase 9 effectors / Phase 10 main.
+
+**Then Phase 9 (IO/effectors) and Phase 10 (persistence + the daemon).** Phase 10
+`main` is where the cross-subtree assembly finally happens (all loops + scheduler
++ safety): plan a `nova_packages/` shim so every shared module resolves to one
+canonical import string (the compiler checks `nova_packages/<name>` before
+relative paths), or keep `main` thin and route through one subtree. This is also
+where the long-deferred wiring lands: feed `predictive_coding_runtime` error and
+the emotion/`plasticity_modulation` modulator into `tick_driver` (currently 0 /
+neutral), and route reader percepts + fired-node signals through `gate_router`.
 
 ## Build/test commands verified working
 
@@ -312,8 +343,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 59 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 59/59 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 73 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 73/73 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"

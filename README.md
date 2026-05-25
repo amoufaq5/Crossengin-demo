@@ -7,16 +7,17 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.6 — Phases 1–6 of 10 complete (substrate + reader + knowledge +
-> memory/learning + self-directed learning + cognitive subsystems). There is no
-> end-user cognitive agent yet.** Implemented in NOVA and verified against the
-> real self-hosting toolchain: 59 modules compile (`make build`), 59 unit-test
-> suites pass (`make test`, 1051 assertions), three benchmarks report metrics
-> (`make benchmark`), and the substrate self-check boots the kernel end-to-end
-> (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
-> works, what does not, and where to continue.
+> **Status: v0.7 — Phases 1–7 of 10 complete (substrate + reader + knowledge +
+> memory/learning + self-directed learning + cognitive subsystems + agent
+> architecture). There is no end-user cognitive daemon yet.** Implemented in
+> NOVA and verified against the real self-hosting toolchain: 73 modules compile
+> (`make build`), 73 unit-test suites pass (`make test`, 1150 assertions), three
+> benchmarks report metrics (`make benchmark`), and the substrate self-check
+> boots the kernel end-to-end (`make run`). See
+> [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what works, what does not,
+> and where to continue.
 
-## What works now (v0.6)
+## What works now (v0.7)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -122,8 +123,26 @@ The Phase 6 cognitive subsystems (`src/parts/`):
   forward simulation, counterfactual, dream recombination, and scenario planning
   (ADR-0032).
 
-Everything else (the meta part, agent loops, safety/audit, IO, persistence) is
-specified in the ADRs but **not yet implemented**.
+The Phase 7 agent architecture (`src/scheduler/`, `src/agent/`, `src/parts/meta/`):
+
+- **scheduler** (`scheduler/`) — the hybrid 100Hz tick (`tick_loop` over the
+  substrate) + event-driven coordination (`event_dispatch`), fused with idle
+  detection in `hybrid_scheduler` (ADR-0037).
+- **agent loops** (`agent/`) — the six cognitive loops (perception, memory,
+  reasoning, emotion, goals, action) + the idle-gated imagination loop, over a
+  shared `loop_coordination` blackboard (ADR-0036).
+- **meta** (`parts/meta/`) — the self-model query API ("what/state/goals/
+  competence", ADR-0038), theory-of-mind user model (ADR-0039), and
+  long-horizon goal accrual + revisit scan (ADR-0040).
+
+Everything else (safety/audit, IO/effectors, persistence, and the top-level
+daemon that wires the loops to the substrate tick) is specified in the ADRs but
+**not yet implemented**.
+
+> Integration note: each loop is a self-contained unit over the shared
+> blackboard, so the loops compose without tripping NOVA's import-dedup limit
+> (blocker #10). Wiring all loops + the scheduler together in one program is the
+> Phase 10 `main`, which will need a `nova_packages/` shim (see NEXT_SESSION.md).
 
 ## What "substrate, not workflow" means
 
