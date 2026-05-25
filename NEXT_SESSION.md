@@ -79,7 +79,17 @@ Every Phase 1 module is fully implemented and tested.
    (atoms/KG) and Phase 4 (moments), yet the five-stage reader (ADR-0011/0012)
    anchors input to *word atoms* and spreads activation over a *KG* — both
    later-phase primitives. Recommendation below resolves this.
-3. **Scale targets are aspirational for v0.x NOVA.** ADRs target 1M nodes/part,
+3. **Persistence: "day one" rule vs. Phase 10 ordering.** The master plan's
+   rule 8 says every state-bearing module should implement save/load "from day
+   one," but its own phase plan places persistence at Phase 10, and ADR-0048
+   specifies a *single ordered* snapshot/rehydration scheme (soul → KGs →
+   episodic) rather than ad-hoc per-module files. The Phase 1 substrate is
+   therefore in-memory only; bolting on per-module save/load now would risk
+   diverging from the ADR-0048 design. Decision: defer persistence to a coherent
+   Phase 10 implementation against ADR-0048, but keep node/synapse/part state in
+   plain integer arrays and stable first-node index ranges precisely so it
+   snapshots cleanly. Flagged for human review.
+4. **Scale targets are aspirational for v0.x NOVA.** ADRs target 1M nodes/part,
    ~1000 synapses/node, 100Hz wall-clock, true concurrency. Phase 1 implements
    the correct *semantics* at configurable capacity; the scale/throughput/
    concurrency aspects are the upstream NOVA enhancements in `nova-deps.toml`
