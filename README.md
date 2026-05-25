@@ -7,16 +7,16 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.4 — Phases 1–4 of 10 complete (substrate kernel + reader/language
-> + knowledge representation + memory/learning). There is no end-user cognitive
-> agent yet.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 33 modules compile (`make build`), 33 unit-test suites pass
-> (`make test`, 719 assertions), three benchmarks report metrics
+> **Status: v0.5 — Phases 1–5 of 10 complete (substrate kernel + reader/language
+> + knowledge + memory/learning + self-directed learning). There is no end-user
+> cognitive agent yet.** Implemented in NOVA and verified against the real
+> self-hosting toolchain: 39 modules compile (`make build`), 39 unit-test suites
+> pass (`make test`, 844 assertions), three benchmarks report metrics
 > (`make benchmark`), and the substrate self-check boots the kernel end-to-end
 > (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
 > works, what does not, and where to continue.
 
-## What works now (v0.4)
+## What works now (v0.5)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -88,9 +88,25 @@ The Phase 4 memory and learning fabric (`src/parts/episodic/`, `src/learning/`):
 - **plasticity_modulation** — the learning-rate modulator from emotional
   arousal/valence/reward (ADR-0035/0007).
 
-Everything else (self-directed learning, the remaining cognitive subsystems,
-agent loops, safety/audit, IO, persistence) is specified in the ADRs but
-**not yet implemented**.
+The Phase 5 self-directed learning layer (`src/learning/`):
+
+- **self_learning_triggers** — gap detection (prediction error, curiosity,
+  imagination gap, unknown query, user request), priority scoring, and an
+  arbitration queue with user pre-emption (ADR-0026).
+- **confidence_thresholds** — the low/high-stakes "learned enough" gates and
+  hard caps that close a learning episode (ADR-0030).
+- **ask_user_to_teach** — gap→question with an ask budget; ingests the reply as
+  Beta(4,1) user-taught Tier-A evidence (ADR-0027).
+- **source_whitelist / source_authority** — the allowed-domain gate, source
+  tiers (A/B/C) with evidence weights, recency-policy conflict resolution, and
+  user-taught precedence (ADR-0028/0029).
+- **internet_fetch** — whitelist + rate-limit + cache + validation + tiered
+  ingestion (ADR-0028); the TLS transport itself is a deferred seam (NOVA
+  enhancement #11).
+
+Everything else (the remaining cognitive subsystems — reasoning, imagination,
+goals, soul, emotion, meta — agent loops, safety/audit, IO, persistence) is
+specified in the ADRs but **not yet implemented**.
 
 ## What "substrate, not workflow" means
 

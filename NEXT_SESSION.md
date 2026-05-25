@@ -9,7 +9,7 @@ continue. It is updated at every session boundary.
 - Phase 2 reader and language: **complete**
 - Phase 3 knowledge representation: **complete**
 - Phase 4 memory and learning: **complete**
-- Phase 5 self-directed learning: not started
+- Phase 5 self-directed learning: **complete**
 - Phase 6 cognitive subsystems: not started
 - Phase 7 agent architecture: not started
 - Phase 8 safety and audit: not started
@@ -104,19 +104,43 @@ passed as parameters.
 
 README updated to v0.4.
 
+## Completed modules — Phase 5 (self-directed learning)
+
+All under `src/learning/`, each compiling with a matching unit-test suite. Kept
+self-contained or kg-layer-only (NOVA blocker #10). The internet fetch transport
+(TLS byte retrieval) is a deferred seam -- NOVA enhancement #11; the pipeline
+(whitelist, rate limit, cache, validation, ingestion) is complete and tested.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| confidence_thresholds.nova | 0030 | 23 | done |
+| source_whitelist.nova | 0028 | 14 | done |
+| source_authority.nova | 0029 | 22 | done |
+| self_learning_triggers.nova | 0026 | 27 | done |
+| ask_user_to_teach.nova | 0027 | 19 | done |
+| internet_fetch.nova | 0028, 0029 | 20 | done |
+
+README updated to v0.5.
+
 ## Partially completed modules
 
-None. There are no stubs, no `.pending` files, and no `TODO`s in committed code.
-Every Phase 1, 2, 3, and 4 module is fully implemented and tested.
+None. There are no stubs and no `TODO`s in committed code. Every Phase 1–5
+module is fully implemented and tested. (No `.pending` files were needed: the
+one truly network-dependent piece, the fetch transport, is handled as a
+dependency-injection seam in `internet_fetch.nova` rather than a stub.)
 
 ## Modules not yet started (in plan order)
 
-- Phase 5: `src/learning/{self_learning_triggers,ask_user_to_teach,internet_fetch,source_whitelist,source_authority,confidence_thresholds}.nova`
-- Phases 6–10: as listed in the master plan.
+- Phase 6: `src/parts/reasoning/{reasoning_atoms,reasoning_module}.nova`,
+  `src/parts/imagination/{imagination_engine,forward_sim,counterfactual,dream_recombination,scenario_planner}.nova`,
+  `src/parts/goals/{goal_engine,drive_generators,goal_persistence}.nova`,
+  `src/parts/soul/{identity,state,goals_in_soul,values,constitution,themes,loyalty}.nova`,
+  `src/parts/emotion/{appraisal,ocean_conditioning,plasticity_mod}.nova`
+- Phases 7–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 33 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning); **719 assertions**.
+- Total unit suites: 39 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed); **844 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -154,6 +178,14 @@ Every Phase 1, 2, 3, and 4 module is fully implemented and tested.
    the correct *semantics* at configurable capacity; the scale/throughput/
    concurrency aspects are the upstream NOVA enhancements in `nova-deps.toml`
    (#1–#14), cited per module header. No ADR was contradicted.
+5. **Source-tier weights differ between ADRs.** The ADR-0023 narrative implies
+   evidence weights A=1.0/B=0.6/C=0.3 (and user=1.5), while ADR-0029 (the
+   authoritative source-authority ADR) specifies A=1.0/B=0.5/C=0.2 with alpha/
+   beta increments 3x the weight. Resolution: `bayesian_updates` keeps the
+   generic ADR-0023 `SRC_*` weights (it accepts any explicit weight), and
+   `source_authority` implements the authoritative ADR-0029 numbers; fetched
+   evidence is ingested with the ADR-0029 increment, user-taught with the
+   ADR-0027 Beta(4,1) prior. Flagged for human review (align the two ADRs).
 
 ## NOVA blockers and footguns (important — read before continuing)
 
@@ -216,42 +248,39 @@ std-importable and to canonicalize import paths.
 
 ## Recommended next session start point
 
-**Phase 5 — self-directed learning (ADR-0026..0030).** The reader already raises
-LEARN_ASK_USER / LEARN_FETCH triggers (stage 5) and predictive coding flags
-sustained surprise; Phase 5 turns those into action. Suggested order:
+**Phase 6 — cognitive subsystems (ADR-0031..0035).** The largest remaining
+phase: reasoning, imagination, goals, soul, and emotion (~20 modules). Suggested
+order (each builds on existing kg / belief / concept primitives):
 
-1. `src/learning/self_learning_triggers.nova` (ADR-0026) — detect knowledge gaps
-   from sustained prediction error (predictive_coding_runtime), unfilled concept
-   slots (concept_layer `concept_gaps`), low competence (competence_tracker), and
-   reader curiosity. Emit a learning goal.
-2. `src/learning/confidence_thresholds.nova` (ADR-0030) — the "learned enough"
-   gates that stop a learning loop (belief strength / competence tier).
-3. `src/learning/ask_user_to_teach.nova` (ADR-0027) — turn a gap into a question;
-   ingest the taught answer as user-tier evidence (bayesian_updates SRC_USER) and
-   a candidate word/atom birth.
-4. `src/learning/{source_whitelist,source_authority,internet_fetch}.nova`
-   (ADR-0028/0029) — whitelisted, rate-limited fetch (NOVA enhancement #11 -- no
-   verified TLS/socket stack, so the fetch transport is a likely `.nova.pending`;
-   the whitelist, source-authority tiers, and ingestion are implementable now).
+1. `src/parts/reasoning/{reasoning_atoms,reasoning_module}.nova` (ADR-0031) —
+   deduction/abduction/analogy over atoms, concepts, and cross-KG references;
+   reuse `cross_kg_references` (XREF_CAUSAL/ANALOGICAL) and `concept_layer`.
+2. `src/parts/goals/{goal_engine,drive_generators,goal_persistence}.nova`
+   (ADR-0033) — priority-sorted goals and the four drives; the
+   `self_learning_triggers` arbiter and `competence_tracker` gaps feed curiosity.
+3. `src/parts/soul/{identity,state,values,constitution,themes,loyalty,goals_in_soul}.nova`
+   (ADR-0034) — identity, values, and the constitution whose rules ride the
+   privileged `XSIG_CONST` route already built in `gate_router`.
+4. `src/parts/emotion/{appraisal,ocean_conditioning,plasticity_mod}.nova`
+   (ADR-0035) — appraisal producing the valence/arousal/reward that
+   `plasticity_modulation.pm_modulator` already consumes.
+5. `src/parts/imagination/{imagination_engine,forward_sim,counterfactual,dream_recombination,scenario_planner}.nova`
+   (ADR-0032) — forward simulation and recombination over episodes
+   (`episode_storage` replay) and the world/concept model.
 
-Reuse what exists: the reader's `rctx` triggers, `predictive_coding_runtime`
-surprise, `bayesian_updates` tiered evidence (SRC_USER weight 1.5), `atom_birth_
-monitor`, `competence_tracker`, and `concept_gaps`. Stay in the kg/self-contained
-layer (NOVA blocker #10); keep imports to one subtree per compile unit.
+Reuse what exists: `bayesian_updates` (beliefs), `concept_layer` (schemas,
+DAG), `cross_kg_references` (causal/analogical edges), `episode_storage`
+(replay), `self_learning_triggers`, `competence_tracker`. Stay one subtree per
+compile unit (NOVA blocker #10).
 
-Cross-cutting, also valuable: **wiring the learning fabric into the tick.**
-`tick_driver` passes error=0 and modulator=neutral; `predictive_coding_runtime`
-now produces the error and `plasticity_modulation` the modulator. Feeding them in
-(and inter-part signal emission) is the six-loop agent architecture (Phase 7).
-Mind NOVA blocker #10 when bridging the kg and substrate subtrees in one compile
-unit (one import-prefix convention, or a `nova_packages/` shim).
-
-Cross-cutting, also valuable: **inter-part signal emission + reader→substrate
-wiring** — today `tick_driver` propagates *within* a part and the reader routes
-to symbolic targets. Wiring fired nodes (and reader percepts) through
-`gate_router` to other parts' first nodes is the bridge to the six-loop agent
+Cross-cutting, also valuable (and the bridge to Phase 7): **wire the fabric into
+the tick.** `tick_driver` passes error=0 and modulator=neutral;
+`predictive_coding_runtime` now produces the error and `plasticity_modulation`
+the modulator. Likewise the reader routes to *symbolic* targets and
+`tick_driver` propagates only *within* a part -- wiring fired nodes and reader
+percepts through `gate_router` to other parts' first nodes is the six-loop agent
 architecture (Phase 7). Mind NOVA blocker #10 when bridging the kg and substrate
-subtrees in one compile unit (use one import-prefix convention or a
+subtrees in one compile unit (one import-prefix convention, or a
 `nova_packages/` shim).
 
 ## Build/test commands verified working
@@ -261,8 +290,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 33 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 33/33 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 39 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 39/39 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
