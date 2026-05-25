@@ -7,6 +7,7 @@
 # Targets:
 #   build      compile every implemented NOVA module under src/ (no .pending)
 #   test       compile and run every unit test under tests/unit/
+#   benchmark  run every benchmark under tests/benchmark/ and report metrics
 #   install    build the substrate self-check binary into ./bin/
 #   clean      remove build artifacts
 #   check-nova verify the NOVA toolchain is reachable
@@ -18,9 +19,10 @@ BIN       := bin
 
 SRC_MODULES := $(shell find src -name '*.nova' ! -name '*.pending' 2>/dev/null | sort)
 UNIT_TESTS  := $(shell find tests/unit -name '*.nova' 2>/dev/null | sort)
+BENCHMARKS  := $(shell find tests/benchmark -name '*.nova' 2>/dev/null | sort)
 SELFCHECK   := examples/kernel_selfcheck.nova
 
-.PHONY: all build test install clean check-nova help
+.PHONY: all build test benchmark install clean check-nova help
 
 all: build
 
@@ -47,6 +49,13 @@ build: check-nova
 test: check-nova
 	@NOVA_ROOT="$(NOVA_ROOT)" bash scripts/test.sh
 
+benchmark: check-nova
+	@if [ -z "$(BENCHMARKS)" ]; then echo "benchmark: no benchmarks under tests/benchmark/ yet."; exit 0; fi
+	@for b in $(BENCHMARKS); do \
+	  echo "--- $$b ---"; \
+	  "$(NOVA)" run "$$b" 2>&1 | grep -v '^Compiled:'; \
+	done
+
 install: build
 	@mkdir -p $(BIN)
 	@if [ -f "$(SELFCHECK)" ]; then \
@@ -68,6 +77,7 @@ help:
 	@echo "CrossEngin make targets:"
 	@echo "  build      compile every implemented NOVA module under src/"
 	@echo "  test       compile and run every unit test under tests/unit/"
+	@echo "  benchmark  run every benchmark under tests/benchmark/"
 	@echo "  install    build the substrate self-check binary into ./bin/"
 	@echo "  clean      remove build artifacts"
 	@echo "  check-nova verify the NOVA toolchain is reachable"

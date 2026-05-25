@@ -7,12 +7,39 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.1 — substrate kernel scaffold in progress. There is no
-> functional cognitive agent yet.** This repository currently contains the
-> complete set of Architecture Decision Records (ADRs) and the first
-> compile-and-test-verified substrate primitives. See
+> **Status: v0.1 — Phase 1 of 10 (substrate kernel) complete. There is no
+> end-user cognitive agent yet.** The full substrate kernel is implemented in
+> NOVA and verified against the real self-hosting toolchain: 9 modules under
+> `src/substrate/` compile (`make build`), 9 unit-test suites pass (`make test`,
+> 284 assertions), two benchmarks report metrics (`make benchmark`), and the
+> substrate self-check boots the kernel end-to-end (`make run`). See
 > [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what works, what does not,
 > and where to continue.
+
+## What works now (v0.1)
+
+The Phase 1 substrate kernel (`src/substrate/`):
+
+- **node_pool_manager** — the uniform leaky-integrate-and-fire node kernel over
+  a pre-allocated pool, with novelty tracking and the integer milli-fixed-point
+  convention (ADR-0006).
+- **signal_dispatch** — the 18 `XSIG_*` signal types with ADR-0008 priorities
+  and a priority-bucketed FIFO dispatch queue.
+- **synapse_graph** — sparse weighted synapses with Hebbian + error-driven
+  plasticity, eligibility decay, growth, and idle prune/reclaim (ADR-0007).
+- **first_nodes** — stable per-part input blocks and modality presets (ADR-0010).
+- **part_registry / part_lifecycle** — the seven fixed parts plus dynamic,
+  per-domain KG parts (ADR-0001).
+- **gate_router** — learned content-based routing with the privileged,
+  non-learnable constitutional broadcast (ADR-0009, ADR-0045).
+- **resonance_engine** — bidirectional co-activation reinforcement into stable
+  assemblies.
+- **tick_driver** — the four-phase substrate tick: snapshot → integrate →
+  propagate → learn (ADR-0006, ADR-0001).
+
+Everything else (reader, KGs, memory, learning fabric, self-directed learning,
+cognitive subsystems, agent loops, safety/audit, IO, persistence) is specified
+in the ADRs but **not yet implemented**.
 
 ## What "substrate, not workflow" means
 
