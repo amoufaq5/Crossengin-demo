@@ -18,6 +18,7 @@ today (v0.1, Phase 1 of 10). The binding specification is the ADR set under
 | gate | `src/substrate/gate_router.nova` | learned content-based router (ADR-0009) |
 | part | `src/substrate/part_registry.nova` | a region owning a pool + graph + first nodes (ADR-0001) |
 | atom / KG | `src/kg/atom_store.nova`, `src/kg/multi_kg_manager.nova` | persistent Bayesian knowledge unit in per-domain KGs (ADR-0016, ADR-0004) |
+| reader | `src/reader/reader.nova` (+ 5 stages) | five-stage hybrid input processor; not a parser, not an LLM (ADR-0011/0012) |
 | moment | (Phase 4) | timestamped perception record, the input entry point |
 
 The Phase 3 knowledge layer adds, on top of those: cross-KG references and the
@@ -26,6 +27,14 @@ spawn heuristic (`cross_kg_references.nova`, ADR-0017), the concept DAG
 procedural skills (`skills_kg.nova`, ADR-0019), and the self-model competence
 tracker (`competence_tracker.nova`, ADR-0020). Belief is alpha/beta Bayesian
 (milli) and similarity is integer cosine, both in `atom_store.nova`.
+
+The Phase 2 language layer (`src/language/`: word/phoneme/syntax atoms, ADR-0015)
+and reader (`src/reader/`: the five stages lexical_anchor -> context_bias ->
+spreading_activation -> coherence_check -> fetch_route_learn, composed by
+`reader.nova`, ADR-0011/0012) turn surface text into a settled, routed percept
+purely over the KG and substrate signals -- no LLM (ADR-0014). The reader emits
+symbolic route targets; binding them to gate-routed part signals is the agent
+layer's job (Phase 7).
 
 Supporting Phase 1 modules: `first_nodes.nova` (stable input block per part,
 ADR-0010), `resonance_engine.nova` (bidirectional co-activation reinforcement),

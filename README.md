@@ -7,16 +7,16 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.2 — Phases 1 and 3 of 10 complete (substrate kernel + knowledge
-> representation). There is no end-user cognitive agent yet.** Implemented in
-> NOVA and verified against the real self-hosting toolchain: 16 modules compile
-> (`make build`), 16 unit-test suites pass (`make test`, 463 assertions), three
-> benchmarks report metrics (`make benchmark`), and the substrate self-check
-> boots the kernel end-to-end (`make run`). See
-> [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what works, what does not,
-> and where to continue.
+> **Status: v0.3 — Phases 1, 2, and 3 of 10 complete (substrate kernel +
+> reader/language + knowledge representation). There is no end-user cognitive
+> agent yet.** Implemented in NOVA and verified against the real self-hosting
+> toolchain: 25 modules compile (`make build`), 25 unit-test suites pass
+> (`make test`, 580 assertions), three benchmarks report metrics
+> (`make benchmark`), and the substrate self-check boots the kernel end-to-end
+> (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
+> works, what does not, and where to continue.
 
-## What works now (v0.2)
+## What works now (v0.3)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -56,9 +56,24 @@ The Phase 3 knowledge layer (`src/kg/`):
   understand) computed from belief/skill/concept state, with four tiers
   (ADR-0020).
 
-Everything else (Phase 2 reader/language atoms, episodic memory, the learning
-fabric, self-directed learning, cognitive subsystems, agent loops, safety/audit,
-IO, persistence) is specified in the ADRs but **not yet implemented**.
+The Phase 2 language layer (`src/language/`) and reader (`src/reader/`):
+
+- **word_atoms / phoneme_atoms / syntax_atoms** — words (with lexical vectors
+  and weighted concept senses), phonemes, and ordered syntax patterns as
+  ATOM_LANG atoms in a language KG (ADR-0015).
+- **reader** (five stages, ADR-0011/0012, no LLM per ADR-0014):
+  - **lexical_anchor** — tokenize and match to word atoms; SENSORY on a hit,
+    CURIOSITY on an out-of-vocabulary token.
+  - **context_bias** — resolve polysemy by similarity to the active context.
+  - **spreading_activation** — spread over cross-KG edges and settle on an
+    active concept set.
+  - **coherence_check** — accept a mutually-referencing reading or escalate.
+  - **fetch_route_learn** — route a comprehended percept and strengthen
+    anchors, or trigger ask-user / fetch learning.
+
+Everything else (episodic memory, the learning fabric, self-directed learning,
+cognitive subsystems, agent loops, safety/audit, IO, persistence) is specified
+in the ADRs but **not yet implemented**.
 
 ## What "substrate, not workflow" means
 

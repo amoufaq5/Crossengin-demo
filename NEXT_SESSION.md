@@ -6,7 +6,7 @@ continue. It is updated at every session boundary.
 ## Phase progress
 
 - Phase 1 substrate kernel: **complete**
-- Phase 2 reader and language: not started
+- Phase 2 reader and language: **complete**
 - Phase 3 knowledge representation: **complete**
 - Phase 4 memory and learning: not started
 - Phase 5 self-directed learning: not started
@@ -60,22 +60,43 @@ implemented in-house (see NOVA blockers).
 | competence_tracker.nova | 0020 | 27 | done |
 
 Also delivered: `tests/benchmark/bench_kg_query.nova` (insertion, id/label
-lookup, observation throughput); README updated to v0.2.
+lookup, observation throughput).
+
+## Completed modules — Phase 2 (reader and language)
+
+Language atoms under `src/language/`; the five-stage reader under `src/reader/`.
+Each compiles with a matching unit-test suite. No LLM is touched (ADR-0014); the
+reader operates purely over the language KG, concept layer, and substrate
+signals.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| language/word_atoms.nova | 0015 | 20 | done |
+| language/phoneme_atoms.nova | 0015 | 12 | done |
+| language/syntax_atoms.nova | 0015, 0013 | 14 | done |
+| reader/lexical_anchor.nova | 0012 (stage 1), 0011 | 19 | done |
+| reader/context_bias.nova | 0012 (stage 2) | 9 | done |
+| reader/spreading_activation.nova | 0012 (stage 3), 0017 | 8 | done |
+| reader/coherence_check.nova | 0012 (stage 4) | 11 | done |
+| reader/fetch_route_learn.nova | 0012 (stage 5) | 11 | done |
+| reader/reader.nova | 0011, 0012 | 13 | done |
+
+README updated to v0.3.
 
 ## Partially completed modules
 
 None. There are no stubs, no `.pending` files, and no `TODO`s in committed code.
-Every Phase 1 and Phase 3 module is fully implemented and tested.
+Every Phase 1, 2, and 3 module is fully implemented and tested.
 
 ## Modules not yet started (in plan order)
 
-- Phase 2: `src/reader/{lexical_anchor,context_bias,spreading_activation,coherence_check,fetch_route_learn,reader}.nova`,
-  `src/language/{word_atoms,phoneme_atoms,syntax_atoms}.nova`
-- Phases 4–10: as listed in the master plan.
+- Phase 4: `src/parts/episodic/{moment_stream,episode_storage,consolidation}.nova`,
+  `src/learning/{bayesian_updates,predictive_coding_runtime,atom_birth_monitor,atom_death_monitor,plasticity_modulation}.nova`
+- Phases 5–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 16 (9 substrate + 7 knowledge); **463 assertions**.
+- Total unit suites: 25 (9 substrate + 7 knowledge + 9 reader/language); **580 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -154,43 +175,55 @@ shaped the implementation and must be respected going forward:
    minimal alpha/beta belief and integer cosine vectors in `atom_store.nova`
    (milli-fixed-point, same semantics as `core/belief.nova`), and uses id-indexed
    lists + linear-scan for name lookup. `contains()` does work for string lists.
+10. **Import dedup is by accumulated path string, not canonical path.** A shared
+   module reached via two different relative-path accumulations (e.g.
+   `.../kg/../substrate/node_pool_manager.nova` via the kg subtree and
+   `.../substrate/node_pool_manager.nova` via a substrate sibling) is included
+   *twice* -> duplicate-symbol link errors. NOVA does not normalize `..`.
+   **Consequence (Phase 2):** the reader stays within the kg + signal_dispatch
+   layer (signal_dispatch is standalone, so it does not drag node_pool); it does
+   NOT import the substrate part registry / gate router. Mapping the reader's
+   symbolic route targets to gate-routed part signals is therefore deferred to
+   the agent layer (Phase 7), which is the right layering anyway. When Phase 7
+   must bridge subtrees, either route everything through one subtree's import
+   prefix, or introduce a `nova_packages/` shim so shared modules resolve to one
+   canonical string.
 
 None of these is a hard blocker (all worked around with correct, non-stub code).
-#1, #6, and #9 are the ones most likely to constrain later phases; #1/#6 have
-upstream-enhancement entries, #9 wants NOVA to make the cognitive-core modules
-std-importable.
+#1, #6, #9, #10 are the ones most likely to constrain later phases; #1/#6 have
+upstream-enhancement entries, #9/#10 want NOVA to make cognitive-core modules
+std-importable and to canonicalize import paths.
 
 ## Recommended next session start point
 
-Phases 1 and 3 are done, so the prerequisites the reader needs now exist. Two
-good options:
+**Phase 4 — episodic memory and the learning fabric.** Now the natural next
+step (the reader exists and produces percepts to remember/learn from). Suggested
+order:
 
-**Option A (recommended): Phase 2 — reader and language atoms.** Now unblocked
-by the knowledge layer. Suggested order:
+1. `src/parts/episodic/moment_stream.nova` (ADR-0021) — the timestamped moment
+   record and the append-only moment stream. This gives atoms real
+   `created_moment` timestamps (currently a passed-in logical tick) and the
+   reader a place to record each read.
+2. `src/parts/episodic/{episode_storage,consolidation}.nova` (ADR-0022) —
+   episodes over the moment stream; consolidation into semantic atoms.
+3. `src/learning/bayesian_updates.nova` (ADR-0023) — formalizes the alpha/beta
+   evidence updates atoms/skills already use (build on `atom_store`'s `bel_*`).
+4. `src/learning/{predictive_coding_runtime,atom_birth_monitor,atom_death_monitor,plasticity_modulation}.nova`
+   (ADR-0024, 0025) — the error term `tick_driver` currently passes as 0, and
+   novelty-gated atom birth / decay-gated death (atoms already track a version
+   and belief; nodes already track novelty).
 
-1. `src/language/word_atoms.nova` (ADR-0015) — word atoms as `ATOM_LANG` atoms
-   in a language KG (via `kg_add_atom`), each with a lexical facet vector. Then
-   `phoneme_atoms.nova`, `syntax_atoms.nova`.
-2. `src/reader/lexical_anchor.nova` (ADR-0011/0012) — match input tokens to word
-   atoms (label lookup / lexical-vector similarity), emit `XSIG_SENSORY` into
-   perception first nodes (the substrate + gate routing already support this).
-3. `src/reader/{context_bias,spreading_activation,coherence_check,fetch_route_learn,reader}.nova`
-   — spreading activation runs over the KG + concept layer (both implemented);
-   `fetch_route_learn` is the bridge to Phase 5 (defer the fetch to whitelist).
+Reuse what exists: `atom_store` `bel_*`/`vec_*`/`handle_*`, the substrate node
+novelty accumulator, and the reader's `rctx`. Do not reach for NOVA's
+core/belief or std/embed (NOVA blocker #9).
 
-**Option B: Phase 4 — episodic memory + the learning fabric.** `moment_stream`
-gives atoms real `created_moment` timestamps (currently a passed-in logical
-tick), and `bayesian_updates` formalizes the belief observations atoms already
-use. Independent of the reader.
-
-Cross-cutting, needs no new primitives: **inter-part signal emission** — today
-`tick_driver` propagates *within* a part; wiring fired nodes through
+Cross-cutting, also valuable: **inter-part signal emission + reader→substrate
+wiring** — today `tick_driver` propagates *within* a part and the reader routes
+to symbolic targets. Wiring fired nodes (and reader percepts) through
 `gate_router` to other parts' first nodes is the bridge to the six-loop agent
-architecture (Phase 7).
-
-Build the knowledge layer's belief/vector helpers on what exists: reuse
-`atom_store`'s `bel_*`, `vec_*`, and `handle_*`; do not reach for NOVA's
-core/belief or std/embed (see NOVA blocker #9).
+architecture (Phase 7). Mind NOVA blocker #10 when bridging the kg and substrate
+subtrees in one compile unit (use one import-prefix convention or a
+`nova_packages/` shim).
 
 ## Build/test commands verified working
 
@@ -199,8 +232,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 9 substrate modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 9/9 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 25 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 25/25 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
