@@ -7,16 +7,16 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.5 — Phases 1–5 of 10 complete (substrate kernel + reader/language
-> + knowledge + memory/learning + self-directed learning). There is no end-user
-> cognitive agent yet.** Implemented in NOVA and verified against the real
-> self-hosting toolchain: 39 modules compile (`make build`), 39 unit-test suites
-> pass (`make test`, 844 assertions), three benchmarks report metrics
+> **Status: v0.6 — Phases 1–6 of 10 complete (substrate + reader + knowledge +
+> memory/learning + self-directed learning + cognitive subsystems). There is no
+> end-user cognitive agent yet.** Implemented in NOVA and verified against the
+> real self-hosting toolchain: 59 modules compile (`make build`), 59 unit-test
+> suites pass (`make test`, 1051 assertions), three benchmarks report metrics
 > (`make benchmark`), and the substrate self-check boots the kernel end-to-end
 > (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
 > works, what does not, and where to continue.
 
-## What works now (v0.5)
+## What works now (v0.6)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -104,8 +104,25 @@ The Phase 5 self-directed learning layer (`src/learning/`):
   ingestion (ADR-0028); the TLS transport itself is a deferred seam (NOVA
   enhancement #11).
 
-Everything else (the remaining cognitive subsystems — reasoning, imagination,
-goals, soul, emotion, meta — agent loops, safety/audit, IO, persistence) is
+The Phase 6 cognitive subsystems (`src/parts/`):
+
+- **goals** (`goals/`) — priority-sorted goal trees with rollup, block
+  propagation, leaf arbitration, and staleness decay; the four intrinsic drives;
+  and serialization with load-time validation (ADR-0033).
+- **soul** (`soul/`) — the behavioral identity: slow identity (gated, audited
+  revision) + OCEAN, fast state, medium goal summary, and the cross-cutting
+  values, constitution (privileged XSIG_CONST veto), themes, and loyalty
+  hierarchy (ADR-0034).
+- **emotion** (`emotion/`) — OCC appraisal → valence/arousal/emotion-type, OCEAN
+  conditioning, and emotion-modulated plasticity + episodic encoding (ADR-0035).
+- **reasoning** (`reasoning/`) — operator atoms (causal/implicative/analogical/
+  evidential) and five thin strategies: forward chaining, abduction, analogical
+  transfer, evidential combination, and means-ends decomposition (ADR-0031).
+- **imagination** (`imagination/`) — learned pattern atoms and four modes:
+  forward simulation, counterfactual, dream recombination, and scenario planning
+  (ADR-0032).
+
+Everything else (the meta part, agent loops, safety/audit, IO, persistence) is
 specified in the ADRs but **not yet implemented**.
 
 ## What "substrate, not workflow" means

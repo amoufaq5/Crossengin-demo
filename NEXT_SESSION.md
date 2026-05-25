@@ -10,7 +10,7 @@ continue. It is updated at every session boundary.
 - Phase 3 knowledge representation: **complete**
 - Phase 4 memory and learning: **complete**
 - Phase 5 self-directed learning: **complete**
-- Phase 6 cognitive subsystems: not started
+- Phase 6 cognitive subsystems: **complete**
 - Phase 7 agent architecture: not started
 - Phase 8 safety and audit: not started
 - Phase 9 IO and effectors: not started
@@ -122,25 +122,52 @@ self-contained or kg-layer-only (NOVA blocker #10). The internet fetch transport
 
 README updated to v0.5.
 
+## Completed modules — Phase 6 (cognitive subsystems)
+
+Five subsystems under `src/parts/`, each module compiling with a matching
+unit-test suite. Goals/soul/emotion are self-contained; reasoning/imagination
+import the kg layer on a single prefix (NOVA blocker #10).
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| goals/goal_engine.nova | 0033 | 20 | done |
+| goals/drive_generators.nova | 0033 | 15 | done |
+| goals/goal_persistence.nova | 0033 | 11 | done |
+| soul/identity.nova | 0034 | 13 | done |
+| soul/state.nova | 0034 | 11 | done |
+| soul/values.nova | 0034 | 8 | done |
+| soul/constitution.nova | 0034, 0045 | 11 | done |
+| soul/themes.nova | 0034 | 7 | done |
+| soul/loyalty.nova | 0034 | 9 | done |
+| soul/goals_in_soul.nova | 0034 | 7 | done |
+| emotion/appraisal.nova | 0035 | 14 | done |
+| emotion/ocean_conditioning.nova | 0035 | 8 | done |
+| emotion/plasticity_mod.nova | 0035, 0007 | 7 | done |
+| reasoning/reasoning_atoms.nova | 0031 | 13 | done |
+| reasoning/reasoning_module.nova | 0031 | 12 | done |
+| imagination/imagination_engine.nova | 0032 | 14 | done |
+| imagination/forward_sim.nova | 0032 | 7 | done |
+| imagination/counterfactual.nova | 0032 | 8 | done |
+| imagination/dream_recombination.nova | 0032 | 6 | done |
+| imagination/scenario_planner.nova | 0032 | 6 | done |
+
+README updated to v0.6.
+
 ## Partially completed modules
 
-None. There are no stubs and no `TODO`s in committed code. Every Phase 1–5
-module is fully implemented and tested. (No `.pending` files were needed: the
-one truly network-dependent piece, the fetch transport, is handled as a
-dependency-injection seam in `internet_fetch.nova` rather than a stub.)
+None. There are no stubs and no `TODO`s in committed code. Every Phase 1–6
+module is fully implemented and tested. No `.pending` files were needed.
 
 ## Modules not yet started (in plan order)
 
-- Phase 6: `src/parts/reasoning/{reasoning_atoms,reasoning_module}.nova`,
-  `src/parts/imagination/{imagination_engine,forward_sim,counterfactual,dream_recombination,scenario_planner}.nova`,
-  `src/parts/goals/{goal_engine,drive_generators,goal_persistence}.nova`,
-  `src/parts/soul/{identity,state,goals_in_soul,values,constitution,themes,loyalty}.nova`,
-  `src/parts/emotion/{appraisal,ocean_conditioning,plasticity_mod}.nova`
-- Phases 7–10: as listed in the master plan.
+- Phase 7: `src/agent/{loop_perception,loop_memory,loop_reasoning,loop_emotion,loop_action,loop_goals,loop_imagination_idle,loop_coordination}.nova`,
+  `src/scheduler/{hybrid_scheduler,tick_loop,event_dispatch}.nova`,
+  `src/parts/meta/{self_model_query,theory_of_mind,long_horizon_goals}.nova`
+- Phases 8–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 39 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed); **844 assertions**.
+- Total unit suites: 59 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive); **1051 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -248,40 +275,35 @@ std-importable and to canonicalize import paths.
 
 ## Recommended next session start point
 
-**Phase 6 — cognitive subsystems (ADR-0031..0035).** The largest remaining
-phase: reasoning, imagination, goals, soul, and emotion (~20 modules). Suggested
-order (each builds on existing kg / belief / concept primitives):
+**Phase 7 — agent architecture (ADR-0036..0040).** The integration phase that
+finally wires the parts into a living agent: the six concurrent loops + the
+imagination idle loop, the hybrid 100Hz tick + event scheduler, and the meta
+part (self-model query, theory of mind, long-horizon goals). Suggested order:
 
-1. `src/parts/reasoning/{reasoning_atoms,reasoning_module}.nova` (ADR-0031) —
-   deduction/abduction/analogy over atoms, concepts, and cross-KG references;
-   reuse `cross_kg_references` (XREF_CAUSAL/ANALOGICAL) and `concept_layer`.
-2. `src/parts/goals/{goal_engine,drive_generators,goal_persistence}.nova`
-   (ADR-0033) — priority-sorted goals and the four drives; the
-   `self_learning_triggers` arbiter and `competence_tracker` gaps feed curiosity.
-3. `src/parts/soul/{identity,state,values,constitution,themes,loyalty,goals_in_soul}.nova`
-   (ADR-0034) — identity, values, and the constitution whose rules ride the
-   privileged `XSIG_CONST` route already built in `gate_router`.
-4. `src/parts/emotion/{appraisal,ocean_conditioning,plasticity_mod}.nova`
-   (ADR-0035) — appraisal producing the valence/arousal/reward that
-   `plasticity_modulation.pm_modulator` already consumes.
-5. `src/parts/imagination/{imagination_engine,forward_sim,counterfactual,dream_recombination,scenario_planner}.nova`
-   (ADR-0032) — forward simulation and recombination over episodes
-   (`episode_storage` replay) and the world/concept model.
+1. `src/scheduler/{tick_loop,event_dispatch,hybrid_scheduler}.nova` (ADR-0037) —
+   the logical 100Hz tick (build on `tick_driver`'s `td_engine`) fused with an
+   event queue. Wall-clock pacing is NOVA enhancement #5; `sleep_ms`/`time` exist
+   if approximate pacing is wanted.
+2. `src/agent/loop_*.nova` (ADR-0036) — perception, memory, reasoning, emotion,
+   action, goals + the imagination idle loop. **This is where the long-deferred
+   wiring lands:** feed `predictive_coding_runtime` error and
+   `plasticity_modulation`/emotion modulator into `tick_driver` (currently 0 /
+   neutral), and route reader percepts and fired-node signals through
+   `gate_router` to other parts' first nodes. **Heed NOVA blocker #10:** a loop
+   that touches both the substrate subtree (gate_router/tick_driver) and the kg
+   subtree will double-include shared modules unless all imports resolve through
+   one prefix -- introduce a `nova_packages/` shim (compiler checks it first, so
+   a bare name resolves to one canonical string) or route everything via one
+   subtree. Prototype the import graph for ONE loop before writing all eight.
+3. `src/parts/meta/{self_model_query,theory_of_mind,long_horizon_goals}.nova`
+   (ADR-0038/0039/0040) — self-model query reads `competence_tracker`; theory of
+   mind models other agents' beliefs/goals; long-horizon goals build on
+   `goal_engine` + `goal_persistence`.
 
-Reuse what exists: `bayesian_updates` (beliefs), `concept_layer` (schemas,
-DAG), `cross_kg_references` (causal/analogical edges), `episode_storage`
-(replay), `self_learning_triggers`, `competence_tracker`. Stay one subtree per
-compile unit (NOVA blocker #10).
-
-Cross-cutting, also valuable (and the bridge to Phase 7): **wire the fabric into
-the tick.** `tick_driver` passes error=0 and modulator=neutral;
-`predictive_coding_runtime` now produces the error and `plasticity_modulation`
-the modulator. Likewise the reader routes to *symbolic* targets and
-`tick_driver` propagates only *within* a part -- wiring fired nodes and reader
-percepts through `gate_router` to other parts' first nodes is the six-loop agent
-architecture (Phase 7). Mind NOVA blocker #10 when bridging the kg and substrate
-subtrees in one compile unit (one import-prefix convention, or a
-`nova_packages/` shim).
+Everything the loops need now exists as tested building blocks: substrate
+(`tick_driver`, `gate_router`), reader (`reader_read`), kg + learning fabric,
+goals/soul/emotion/reasoning/imagination. Phase 7 is mostly composition + the
+cross-subtree import resolution.
 
 ## Build/test commands verified working
 
@@ -290,8 +312,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 39 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 39/39 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 59 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 59/59 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
