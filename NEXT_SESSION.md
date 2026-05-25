@@ -8,7 +8,7 @@ continue. It is updated at every session boundary.
 - Phase 1 substrate kernel: **complete**
 - Phase 2 reader and language: **complete**
 - Phase 3 knowledge representation: **complete**
-- Phase 4 memory and learning: not started
+- Phase 4 memory and learning: **complete**
 - Phase 5 self-directed learning: not started
 - Phase 6 cognitive subsystems: not started
 - Phase 7 agent architecture: not started
@@ -83,20 +83,40 @@ signals.
 
 README updated to v0.3.
 
+## Completed modules — Phase 4 (memory and learning)
+
+Episodic modules under `src/parts/episodic/`; learning fabric under
+`src/learning/`. Each compiles with a matching unit-test suite. Kept in the
+kg / self-contained layer (no direct substrate-node imports) to respect NOVA
+blocker #10; node-level values (novelty, activation, error, modulator) are
+passed as parameters.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| episodic/moment_stream.nova | 0021 | 29 | done |
+| episodic/episode_storage.nova | 0022 | 19 | done |
+| episodic/consolidation.nova | 0022, 0025 | 10 | done |
+| learning/bayesian_updates.nova | 0023, 0029 | 20 | done |
+| learning/predictive_coding_runtime.nova | 0024 | 18 | done |
+| learning/atom_birth_monitor.nova | 0025 | 15 | done |
+| learning/atom_death_monitor.nova | 0025 | 18 | done |
+| learning/plasticity_modulation.nova | 0035, 0007 | 10 | done |
+
+README updated to v0.4.
+
 ## Partially completed modules
 
 None. There are no stubs, no `.pending` files, and no `TODO`s in committed code.
-Every Phase 1, 2, and 3 module is fully implemented and tested.
+Every Phase 1, 2, 3, and 4 module is fully implemented and tested.
 
 ## Modules not yet started (in plan order)
 
-- Phase 4: `src/parts/episodic/{moment_stream,episode_storage,consolidation}.nova`,
-  `src/learning/{bayesian_updates,predictive_coding_runtime,atom_birth_monitor,atom_death_monitor,plasticity_modulation}.nova`
-- Phases 5–10: as listed in the master plan.
+- Phase 5: `src/learning/{self_learning_triggers,ask_user_to_teach,internet_fetch,source_whitelist,source_authority,confidence_thresholds}.nova`
+- Phases 6–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 25 (9 substrate + 7 knowledge + 9 reader/language); **580 assertions**.
+- Total unit suites: 33 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning); **719 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -135,7 +155,7 @@ Every Phase 1, 2, and 3 module is fully implemented and tested.
    concurrency aspects are the upstream NOVA enhancements in `nova-deps.toml`
    (#1–#14), cited per module header. No ADR was contradicted.
 
-## NOVA blockers and footguns (important — read before Phase 2)
+## NOVA blockers and footguns (important — read before continuing)
 
 The CrossEngin spec assumes "NOVA v4.1 + N1–N29"; the actual toolchain is the
 self-hosting NOVA in the sibling checkout (launcher reports v0.9.0, core
@@ -196,26 +216,35 @@ std-importable and to canonicalize import paths.
 
 ## Recommended next session start point
 
-**Phase 4 — episodic memory and the learning fabric.** Now the natural next
-step (the reader exists and produces percepts to remember/learn from). Suggested
-order:
+**Phase 5 — self-directed learning (ADR-0026..0030).** The reader already raises
+LEARN_ASK_USER / LEARN_FETCH triggers (stage 5) and predictive coding flags
+sustained surprise; Phase 5 turns those into action. Suggested order:
 
-1. `src/parts/episodic/moment_stream.nova` (ADR-0021) — the timestamped moment
-   record and the append-only moment stream. This gives atoms real
-   `created_moment` timestamps (currently a passed-in logical tick) and the
-   reader a place to record each read.
-2. `src/parts/episodic/{episode_storage,consolidation}.nova` (ADR-0022) —
-   episodes over the moment stream; consolidation into semantic atoms.
-3. `src/learning/bayesian_updates.nova` (ADR-0023) — formalizes the alpha/beta
-   evidence updates atoms/skills already use (build on `atom_store`'s `bel_*`).
-4. `src/learning/{predictive_coding_runtime,atom_birth_monitor,atom_death_monitor,plasticity_modulation}.nova`
-   (ADR-0024, 0025) — the error term `tick_driver` currently passes as 0, and
-   novelty-gated atom birth / decay-gated death (atoms already track a version
-   and belief; nodes already track novelty).
+1. `src/learning/self_learning_triggers.nova` (ADR-0026) — detect knowledge gaps
+   from sustained prediction error (predictive_coding_runtime), unfilled concept
+   slots (concept_layer `concept_gaps`), low competence (competence_tracker), and
+   reader curiosity. Emit a learning goal.
+2. `src/learning/confidence_thresholds.nova` (ADR-0030) — the "learned enough"
+   gates that stop a learning loop (belief strength / competence tier).
+3. `src/learning/ask_user_to_teach.nova` (ADR-0027) — turn a gap into a question;
+   ingest the taught answer as user-tier evidence (bayesian_updates SRC_USER) and
+   a candidate word/atom birth.
+4. `src/learning/{source_whitelist,source_authority,internet_fetch}.nova`
+   (ADR-0028/0029) — whitelisted, rate-limited fetch (NOVA enhancement #11 -- no
+   verified TLS/socket stack, so the fetch transport is a likely `.nova.pending`;
+   the whitelist, source-authority tiers, and ingestion are implementable now).
 
-Reuse what exists: `atom_store` `bel_*`/`vec_*`/`handle_*`, the substrate node
-novelty accumulator, and the reader's `rctx`. Do not reach for NOVA's
-core/belief or std/embed (NOVA blocker #9).
+Reuse what exists: the reader's `rctx` triggers, `predictive_coding_runtime`
+surprise, `bayesian_updates` tiered evidence (SRC_USER weight 1.5), `atom_birth_
+monitor`, `competence_tracker`, and `concept_gaps`. Stay in the kg/self-contained
+layer (NOVA blocker #10); keep imports to one subtree per compile unit.
+
+Cross-cutting, also valuable: **wiring the learning fabric into the tick.**
+`tick_driver` passes error=0 and modulator=neutral; `predictive_coding_runtime`
+now produces the error and `plasticity_modulation` the modulator. Feeding them in
+(and inter-part signal emission) is the six-loop agent architecture (Phase 7).
+Mind NOVA blocker #10 when bridging the kg and substrate subtrees in one compile
+unit (one import-prefix convention, or a `nova_packages/` shim).
 
 Cross-cutting, also valuable: **inter-part signal emission + reader→substrate
 wiring** — today `tick_driver` propagates *within* a part and the reader routes
@@ -232,8 +261,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 25 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 25/25 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 33 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 33/33 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"

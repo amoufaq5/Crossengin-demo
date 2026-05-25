@@ -7,16 +7,16 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.3 — Phases 1, 2, and 3 of 10 complete (substrate kernel +
-> reader/language + knowledge representation). There is no end-user cognitive
+> **Status: v0.4 — Phases 1–4 of 10 complete (substrate kernel + reader/language
+> + knowledge representation + memory/learning). There is no end-user cognitive
 > agent yet.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 25 modules compile (`make build`), 25 unit-test suites pass
-> (`make test`, 580 assertions), three benchmarks report metrics
+> toolchain: 33 modules compile (`make build`), 33 unit-test suites pass
+> (`make test`, 719 assertions), three benchmarks report metrics
 > (`make benchmark`), and the substrate self-check boots the kernel end-to-end
 > (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
 > works, what does not, and where to continue.
 
-## What works now (v0.3)
+## What works now (v0.4)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -71,9 +71,26 @@ The Phase 2 language layer (`src/language/`) and reader (`src/reader/`):
   - **fetch_route_learn** — route a comprehended percept and strengthen
     anchors, or trigger ask-user / fetch learning.
 
-Everything else (episodic memory, the learning fabric, self-directed learning,
-cognitive subsystems, agent loops, safety/audit, IO, persistence) is specified
-in the ADRs but **not yet implemented**.
+The Phase 4 memory and learning fabric (`src/parts/episodic/`, `src/learning/`):
+
+- **moment_stream** — timestamped, append-only moment records with a
+  PERCEIVED→SETTLED→CONSOLIDATED lifecycle (ADR-0021).
+- **episode_storage** — episodes over moments with decay, recall reinforcement,
+  tiering, and drop (ADR-0022).
+- **consolidation** — recurring co-activation signatures become atom-birth
+  candidates (ADR-0022).
+- **bayesian_updates** — tracked beliefs with decay, tiered evidence, conflict,
+  and a CONTESTED flag (ADR-0023).
+- **predictive_coding_runtime** — precision-weighted prediction error with
+  suppression/surprise thresholds and the upward error signal (ADR-0024).
+- **atom_birth_monitor / atom_death_monitor** — novelty/frequency/stability
+  gated atom birth, and decay/belief gated death with tombstoning (ADR-0025).
+- **plasticity_modulation** — the learning-rate modulator from emotional
+  arousal/valence/reward (ADR-0035/0007).
+
+Everything else (self-directed learning, the remaining cognitive subsystems,
+agent loops, safety/audit, IO, persistence) is specified in the ADRs but
+**not yet implemented**.
 
 ## What "substrate, not workflow" means
 
