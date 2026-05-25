@@ -1,0 +1,218 @@
+// CrossEngin substrate: node pool manager.
+//
+// Purpose
+//   Owns the pre-allocated pool of uniform computational units (nodes) for a
+//   part, and implements the single uniform node kernel that every node runs
+//   each tick. Specialization is NOT a behavioral switch on node type; it
+//   emerges from learned synapse structure (ADR-0006). The six NTYPE_* values
+//   are affinity hints only.
+//
+// Node state (one fixed-size slot per node, integer milli-fixed-point):
+//   activation, threshold, bias, last_fired_tick, novelty_accum, ntype,
+//   inbox_accum, fires  (ADR-0006 field set, plus an inbox accumulator and a
+//   lifetime fire counter used by the tick driver and atom-birth monitor).
+//
+// Fixed-point convention (substrate-wide): real values are integers scaled by
+//   FP_SCALE = 1000, so 1.0 == 1000, 0.5 == 500. Multiplication is
+//   fp_mul(a,b) = a*b/FP_SCALE. We deliberately avoid NOVA's float_* builtins
+//   here: they operate on IEEE-754 doubles, a different representation, and
+//   integer milli-units keep substrate dynamics fully deterministic.
+//
+// ADRs implemented: ADR-0002 (NODE primitive), ADR-0006 (node design, uniform
+//   kernel, novelty-gated state), ADR-0010 (reserves the front of the pool so
+//   first_nodes.nova can carve out a stable first-node block).
+//   Scale note: ADR-0006 targets 1M nodes/part. That density is NOVA
+//   enhancement #1 (pre-allocated 1M+ arenas); this module is functionally
+//   correct at any configurable capacity now and scales unchanged when #1 lands.
+//
+// NOVA dependencies: runtime/node_pool.nova (pool_new/claim/release/set/
+//   get_values/is_used/used/available/capacity, N18). Builtins: list ops, exit.
+// CrossEngin dependencies: none (this is the substrate root module).
+
+import "std/node_pool"
+
+// ---- fixed-point ----------------------------------------------------------
+let FP_SCALE = 1000
+let FP_ONE   = 1000
+
+fn fp_mul(a, b) {
+    return (a * b) / FP_SCALE
+}
+
+fn fp_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// ---- node-state slot layout ----------------------------------------------
+let NODE_SIZE = 8
+let NS_ACTIVATION = 0
+let NS_THRESHOLD  = 1
+let NS_BIAS       = 2
+let NS_LAST_FIRED = 3
+let NS_NOVELTY    = 4
+let NS_NTYPE      = 5
+let NS_INBOX      = 6
+let NS_FIRES      = 7
+
+// ---- NTYPE affinity hints (ADR-0006: hints, not behavior switches) --------
+let NTYPE_PERCEIVER  = 1
+let NTYPE_KNOWER     = 2
+let NTYPE_REMEMBERER = 3
+let NTYPE_REASONER   = 4
+let NTYPE_FEELER     = 5
+let NTYPE_ACTOR      = 6
+
+// ---- kernel tuning (milli units) -----------------------------------------
+let NODE_ACT_DECAY        = 900   // 0.9 leaky retention per integrate step
+let NODE_ACT_CEIL         = 4000  // 4.0 activation ceiling (bounds runaway)
+let NODE_DEFAULT_THRESH   = 500   // 0.5 default firing threshold
+let NODE_NOVELTY_GAIN     = 200   // 0.2 novelty added on each fire
+let NODE_NOVELTY_DECAY    = 850   // 0.85 novelty retention per integrate step
+
+// Create a node pool with `capacity` slots, each NODE_SIZE words wide.
+fn npm_pool_new(capacity) {
+    return pool_new(capacity, NODE_SIZE)
+}
+
+// Build the initial state list for a node.
+fn _npm_init_state(ntype, threshold, bias) {
+    let s = list_new()
+    push(s, 0)          // NS_ACTIVATION
+    push(s, threshold)  // NS_THRESHOLD
+    push(s, bias)       // NS_BIAS
+    push(s, -1)         // NS_LAST_FIRED (never)
+    push(s, 0)          // NS_NOVELTY
+    push(s, ntype)      // NS_NTYPE
+    push(s, 0)          // NS_INBOX
+    push(s, 0)          // NS_FIRES
+    return s
+}
+
+// Claim and initialize a node. Returns its id, or -1 if the pool is full.
+fn npm_node_create(pool, ntype, threshold, bias) {
+    let id = pool_claim(pool)
+    if id == -1 {
+        return -1
+    }
+    pool_set(pool, id, _npm_init_state(ntype, threshold, bias))
+    return id
+}
+
+// Convenience: a node with default threshold and no bias.
+fn npm_node_create_default(pool, ntype) {
+    return npm_node_create(pool, ntype, NODE_DEFAULT_THRESH, 0)
+}
+
+fn _npm_valid(pool, id) {
+    if id < 0 { return 0 }
+    if id >= pool_capacity(pool) { return 0 }
+    return 1
+}
+
+// Read one field; returns 0 for an out-of-range id (graceful on bad input).
+fn npm_get(pool, id, field) {
+    if _npm_valid(pool, id) == 0 { return 0 }
+    let s = pool_get_values(pool, id, NODE_SIZE)
+    return s[field]
+}
+
+// Write one field; no-op for an out-of-range id.
+fn npm_set(pool, id, field, value) {
+    if _npm_valid(pool, id) == 0 { return 0 }
+    let s = pool_get_values(pool, id, NODE_SIZE)
+    list_set(s, field, value)
+    pool_set(pool, id, s)
+    return 1
+}
+
+// Named accessors (read).
+fn npm_activation(pool, id)  { return npm_get(pool, id, NS_ACTIVATION) }
+fn npm_threshold(pool, id)   { return npm_get(pool, id, NS_THRESHOLD) }
+fn npm_bias(pool, id)        { return npm_get(pool, id, NS_BIAS) }
+fn npm_last_fired(pool, id)  { return npm_get(pool, id, NS_LAST_FIRED) }
+fn npm_novelty(pool, id)     { return npm_get(pool, id, NS_NOVELTY) }
+fn npm_ntype(pool, id)       { return npm_get(pool, id, NS_NTYPE) }
+fn npm_inbox(pool, id)       { return npm_get(pool, id, NS_INBOX) }
+fn npm_fires(pool, id)       { return npm_get(pool, id, NS_FIRES) }
+
+// Named accessors (write).
+fn npm_set_activation(pool, id, v) { return npm_set(pool, id, NS_ACTIVATION, fp_clamp(v, 0, NODE_ACT_CEIL)) }
+fn npm_set_threshold(pool, id, v)  { return npm_set(pool, id, NS_THRESHOLD, v) }
+fn npm_set_bias(pool, id, v)       { return npm_set(pool, id, NS_BIAS, v) }
+
+// Deliver weighted input into a node's inbox for the current tick. `amount`
+// is signed: positive excites, negative (e.g. XSIG_INHIBIT) suppresses.
+fn npm_node_input(pool, id, amount) {
+    if _npm_valid(pool, id) == 0 { return 0 }
+    let s = pool_get_values(pool, id, NODE_SIZE)
+    list_set(s, NS_INBOX, s[NS_INBOX] + amount)
+    pool_set(pool, id, s)
+    return 1
+}
+
+// The uniform node kernel for one integrate step (ADR-0006 xnode_tick core):
+//   leaky-integrate accumulated input into activation, apply bias, test the
+//   firing threshold, and on fire record the tick, bump the fire counter and
+//   the novelty accumulator, then enter refractory (activation reset to 0).
+//   The inbox is always drained. Returns 1 if the node fired this tick, else 0.
+// Emission of outgoing signals down synapses is the tick driver's job; this
+// kernel only reports whether the node fired.
+fn npm_node_integrate(pool, id, tick) {
+    if _npm_valid(pool, id) == 0 { return 0 }
+    if pool_is_used(pool, id) == 0 { return 0 }
+    let s = pool_get_values(pool, id, NODE_SIZE)
+
+    let act     = s[NS_ACTIVATION]
+    let inbox   = s[NS_INBOX]
+    let bias    = s[NS_BIAS]
+    let novelty = s[NS_NOVELTY]
+
+    // Leaky integration of accumulated weighted input plus bias.
+    let next = fp_mul(act, NODE_ACT_DECAY) + inbox + bias
+    next = fp_clamp(next, 0, NODE_ACT_CEIL)
+
+    // Novelty trace decays every step regardless of firing.
+    novelty = fp_mul(novelty, NODE_NOVELTY_DECAY)
+
+    let fired = 0
+    if next >= s[NS_THRESHOLD] {
+        fired = 1
+        list_set(s, NS_LAST_FIRED, tick)
+        list_set(s, NS_FIRES, s[NS_FIRES] + 1)
+        novelty = novelty + NODE_NOVELTY_GAIN
+        if novelty > FP_ONE { novelty = FP_ONE }
+        next = 0   // refractory reset
+    }
+
+    list_set(s, NS_ACTIVATION, next)
+    list_set(s, NS_NOVELTY, novelty)
+    list_set(s, NS_INBOX, 0)   // drain inbox
+    pool_set(pool, id, s)
+    return fired
+}
+
+// Reset the dynamic state of a node (activation/inbox/novelty/last_fired/fires)
+// while preserving its configuration (threshold/bias/ntype). Used by tests and
+// by rehydration sanity paths.
+fn npm_node_reset(pool, id) {
+    if _npm_valid(pool, id) == 0 { return 0 }
+    let s = pool_get_values(pool, id, NODE_SIZE)
+    list_set(s, NS_ACTIVATION, 0)
+    list_set(s, NS_LAST_FIRED, -1)
+    list_set(s, NS_NOVELTY, 0)
+    list_set(s, NS_INBOX, 0)
+    list_set(s, NS_FIRES, 0)
+    pool_set(pool, id, s)
+    return 1
+}
+
+fn npm_node_is_live(pool, id) {
+    if _npm_valid(pool, id) == 0 { return 0 }
+    return pool_is_used(pool, id)
+}
+
+fn npm_capacity(pool)  { return pool_capacity(pool) }
+fn npm_live_count(pool) { return pool_used(pool) }
+fn npm_available(pool) { return pool_available(pool) }

@@ -1,0 +1,305 @@
+// CrossEngin substrate: synapse graph.
+//
+// Purpose
+//   Persistent weighted connections between nodes, stored as the parallel typed
+//   arrays of ADR-0007 (pre, post, weight, eligibility, last_active_tick,
+//   sig_type_mask, alive), with a source-keyed adjacency index modelling the
+//   CSR-by-source layout. Implements the fused Hebbian + error-driven plasticity
+//   rule, eligibility decay, synapse growth, and idle pruning with slot reclaim.
+//
+// Plasticity (ADR-0007): per active synapse,
+//     dw_hebb = eta_h * pre_act * post_act
+//     dw_err  = eta_e * pre_act * error_signal
+//     dw      = modulator * (dw_hebb + dw_err)      (modulator from ADR-0035)
+//     weight  = clamp(weight + dw, W_MIN, W_MAX)
+//   Weight sign carries excitatory (+) vs inhibitory (-) intent (ADR-0008).
+//   Eligibility is a co-activation trace that decays each step; a synapse whose
+//   |weight| and eligibility both stay below the death thresholds is pruned and
+//   its slot reclaimed via a free list.
+//
+//   Growth: the substrate exposes the mechanism (grow a pre->post synapse if
+//   absent). The policy that triggers it -- N ticks of unconnected
+//   co-activation -- lives in the learning fabric (ADR-0025, a later phase).
+//
+// ADRs implemented: ADR-0002 (SYNAPSE primitive), ADR-0007 (synapse design).
+//   Depends-on notes: NOVA enhancement #2 (true CSR sparse adjacency with O(1)
+//   reclaim at 1M-node scale) and #12 (batched plasticity kernels) are scale /
+//   performance upgrades; the semantics here are complete now.
+// NOVA dependencies: builtins (lists, maps, len, list_remove, int_to_str).
+// CrossEngin dependencies: src/substrate/node_pool_manager.nova (FP_SCALE,
+//   fp_mul, fp_clamp, milli-fixed-point convention).
+
+import "node_pool_manager.nova"
+
+// ---- weight bounds and plasticity tuning (milli units) --------------------
+let W_MIN = -1000   // -1.0  (fully inhibitory)
+let W_MAX = 1000    //  1.0  (fully excitatory)
+let SYN_ETA_H = 20      // 0.02 Hebbian learning rate
+let SYN_ETA_E = 30      // 0.03 error-driven learning rate
+let SYN_ELIG_DECAY = 900    // 0.9 eligibility retention per step
+let SYN_ELIG_CEIL = 1000    // 1.0 eligibility ceiling
+let SYN_DEATH_W = 20    // |weight| below 0.02 ...
+let SYN_DEATH_ELIG = 10 // ... and eligibility below 0.01 -> prunable
+
+// ---- graph layout ---------------------------------------------------------
+let SG_TAG   = 0
+let SG_PRE   = 1
+let SG_POST  = 2
+let SG_W     = 3
+let SG_ELIG  = 4
+let SG_LAST  = 5
+let SG_MASK  = 6
+let SG_ALIVE = 7
+let SG_ADJ   = 8    // map: int_to_str(src) -> list of synapse indices
+let SG_LIVE  = 9    // live synapse count
+let SG_FREE  = 10   // free list of reclaimed (dead) indices
+let SG_GRAPH_TAG = 770
+
+fn syn_graph_new() {
+    let g = list_new()
+    push(g, SG_GRAPH_TAG)
+    push(g, list_new())   // pre
+    push(g, list_new())   // post
+    push(g, list_new())   // weight
+    push(g, list_new())   // elig
+    push(g, list_new())   // last
+    push(g, list_new())   // mask
+    push(g, list_new())   // alive
+    push(g, map_new())    // adjacency
+    push(g, 0)            // live
+    push(g, list_new())   // free
+    return g
+}
+
+// ---- signal-type masks ----------------------------------------------------
+// A synapse carries a subset of the 18 signal types; bit (stype-1) marks type.
+fn syn_mask_bit(stype) {
+    if stype < 1 { return 0 }
+    let bit = 1
+    let i = 1
+    while i < stype {
+        bit = bit * 2
+        i = i + 1
+    }
+    return bit
+}
+
+fn syn_mask_add(mask, stype) { return mask | syn_mask_bit(stype) }
+fn syn_mask_has(mask, stype) {
+    if (mask & syn_mask_bit(stype)) != 0 { return 1 }
+    return 0
+}
+
+fn _syn_adj_get(g, src) {
+    let adj = g[SG_ADJ]
+    let key = int_to_str(src)
+    if map_has(adj, key) == 1 {
+        return map_get(adj, key)
+    }
+    let lst = list_new()
+    map_set(adj, key, lst)
+    return lst
+}
+
+// Create a synapse pre->post with the given weight (clamped) and type mask.
+// Reuses a reclaimed slot when one is available, else appends. Returns index.
+fn syn_new(g, pre, post, weight, mask) {
+    let w = fp_clamp(weight, W_MIN, W_MAX)
+    let free = g[SG_FREE]
+    let idx = -1
+    if len(free) > 0 {
+        idx = free[len(free) - 1]
+        list_remove(free, len(free) - 1)
+        list_set(g[SG_PRE], idx, pre)
+        list_set(g[SG_POST], idx, post)
+        list_set(g[SG_W], idx, w)
+        list_set(g[SG_ELIG], idx, 0)
+        list_set(g[SG_LAST], idx, -1)
+        list_set(g[SG_MASK], idx, mask)
+        list_set(g[SG_ALIVE], idx, 1)
+    } else {
+        push(g[SG_PRE], pre)
+        push(g[SG_POST], post)
+        push(g[SG_W], w)
+        push(g[SG_ELIG], 0)
+        push(g[SG_LAST], -1)
+        push(g[SG_MASK], mask)
+        push(g[SG_ALIVE], 1)
+        idx = len(g[SG_PRE]) - 1
+    }
+    push(_syn_adj_get(g, pre), idx)
+    list_set(g, SG_LIVE, g[SG_LIVE] + 1)
+    return idx
+}
+
+fn syn_total(g) { return len(g[SG_PRE]) }   // includes dead slots
+fn syn_live(g)  { return g[SG_LIVE] }
+
+fn _syn_valid(g, idx) {
+    if idx < 0 { return 0 }
+    if idx >= len(g[SG_PRE]) { return 0 }
+    return 1
+}
+
+fn syn_alive(g, idx) {
+    if _syn_valid(g, idx) == 0 { return 0 }
+    return g[SG_ALIVE][idx]
+}
+fn syn_pre(g, idx)    { if _syn_valid(g, idx) == 0 { return -1 } return g[SG_PRE][idx] }
+fn syn_post(g, idx)   { if _syn_valid(g, idx) == 0 { return -1 } return g[SG_POST][idx] }
+fn syn_weight(g, idx) { if _syn_valid(g, idx) == 0 { return 0 } return g[SG_W][idx] }
+fn syn_elig(g, idx)   { if _syn_valid(g, idx) == 0 { return 0 } return g[SG_ELIG][idx] }
+fn syn_last(g, idx)   { if _syn_valid(g, idx) == 0 { return -1 } return g[SG_LAST][idx] }
+fn syn_mask(g, idx)   { if _syn_valid(g, idx) == 0 { return 0 } return g[SG_MASK][idx] }
+
+fn syn_set_weight(g, idx, w) {
+    if _syn_valid(g, idx) == 0 { return 0 }
+    list_set(g[SG_W], idx, fp_clamp(w, W_MIN, W_MAX))
+    return 1
+}
+
+fn syn_carries(g, idx, stype) {
+    if _syn_valid(g, idx) == 0 { return 0 }
+    return syn_mask_has(g[SG_MASK][idx], stype)
+}
+
+// Live outgoing synapse indices from a source node.
+fn syn_out(g, src) {
+    let result = list_new()
+    let adj = g[SG_ADJ]
+    let key = int_to_str(src)
+    if map_has(adj, key) == 0 { return result }
+    let idxs = map_get(adj, key)
+    let i = 0
+    while i < len(idxs) {
+        let idx = idxs[i]
+        if g[SG_ALIVE][idx] == 1 { push(result, idx) }
+        i = i + 1
+    }
+    return result
+}
+
+// Find a live synapse pre->post, or -1.
+fn syn_find(g, pre, post) {
+    let outs = syn_out(g, pre)
+    let i = 0
+    while i < len(outs) {
+        let idx = outs[i]
+        if g[SG_POST][idx] == post { return idx }
+        i = i + 1
+    }
+    return -1
+}
+
+// Growth mechanism: ensure a pre->post synapse exists; create it if absent.
+fn syn_grow_if_absent(g, pre, post, init_weight, mask) {
+    let existing = syn_find(g, pre, post)
+    if existing != -1 { return existing }
+    return syn_new(g, pre, post, init_weight, mask)
+}
+
+// Transmit a presynaptic activation along synapse idx for the given tick.
+// Returns the signed contribution (fp_mul(weight, pre_act)); negative weights
+// inhibit. Records co-activation eligibility and last-active tick.
+fn syn_transmit(g, idx, pre_act, tick) {
+    if _syn_valid(g, idx) == 0 { return 0 }
+    if g[SG_ALIVE][idx] == 0 { return 0 }
+    let contribution = fp_mul(g[SG_W][idx], pre_act)
+    if pre_act > 0 {
+        list_set(g[SG_LAST], idx, tick)
+    }
+    return contribution
+}
+
+// Apply the fused plasticity rule to one synapse given pre/post activations,
+// a bottom-up error term, and a global modulator (1000 == neutral 1.0).
+fn syn_learn_one(g, idx, pre_act, post_act, error, modulator) {
+    if _syn_valid(g, idx) == 0 { return 0 }
+    if g[SG_ALIVE][idx] == 0 { return 0 }
+    let dw_hebb = fp_mul(SYN_ETA_H, fp_mul(pre_act, post_act))
+    let dw_err  = fp_mul(SYN_ETA_E, fp_mul(pre_act, error))
+    let dw = fp_mul(modulator, dw_hebb + dw_err)
+    list_set(g[SG_W], idx, fp_clamp(g[SG_W][idx] + dw, W_MIN, W_MAX))
+    if pre_act > 0 {
+        if post_act > 0 {
+            let e = g[SG_ELIG][idx] + fp_mul(pre_act, post_act)
+            list_set(g[SG_ELIG], idx, fp_clamp(e, 0, SYN_ELIG_CEIL))
+        }
+    }
+    return 1
+}
+
+fn syn_decay_eligibility(g) {
+    let n = len(g[SG_PRE])
+    let i = 0
+    while i < n {
+        if g[SG_ALIVE][i] == 1 {
+            list_set(g[SG_ELIG], i, fp_mul(g[SG_ELIG][i], SYN_ELIG_DECAY))
+        }
+        i = i + 1
+    }
+}
+
+// The ADR-0007 fused plasticity pass over all live synapses. `act_snapshot` is
+// a list indexed by node id giving each node's activation (milli) at
+// propagation time -- using a snapshot avoids reading post-refractory zeros.
+// Returns the number of synapses updated.
+fn syn_plasticity_step(g, act_snapshot, error, modulator, tick) {
+    let n = len(g[SG_PRE])
+    let updated = 0
+    let i = 0
+    while i < n {
+        if g[SG_ALIVE][i] == 1 {
+            let pre = g[SG_PRE][i]
+            let post = g[SG_POST][i]
+            let pre_act = 0
+            let post_act = 0
+            if pre >= 0 { if pre < len(act_snapshot) { pre_act = act_snapshot[pre] } }
+            if post >= 0 { if post < len(act_snapshot) { post_act = act_snapshot[post] } }
+            syn_learn_one(g, i, pre_act, post_act, error, modulator)
+            if pre_act > 0 { if post_act > 0 { list_set(g[SG_LAST], i, tick) } }
+            updated = updated + 1
+        }
+        i = i + 1
+    }
+    syn_decay_eligibility(g)
+    return updated
+}
+
+fn _syn_remove_from_adj(g, idx) {
+    let outs = map_get(g[SG_ADJ], int_to_str(g[SG_PRE][idx]))
+    let j = 0
+    while j < len(outs) {
+        if outs[j] == idx {
+            list_remove(outs, j)
+            return 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+// Prune idle, near-zero synapses (ADR-0007 death rule). Returns count pruned.
+fn syn_prune(g) {
+    let n = len(g[SG_PRE])
+    let pruned = 0
+    let i = 0
+    while i < n {
+        if g[SG_ALIVE][i] == 1 {
+            let w = g[SG_W][i]
+            let aw = w
+            if aw < 0 { aw = 0 - aw }
+            if aw < SYN_DEATH_W {
+                if g[SG_ELIG][i] < SYN_DEATH_ELIG {
+                    _syn_remove_from_adj(g, i)
+                    list_set(g[SG_ALIVE], i, 0)
+                    push(g[SG_FREE], i)
+                    list_set(g, SG_LIVE, g[SG_LIVE] - 1)
+                    pruned = pruned + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return pruned
+}
