@@ -7,16 +7,16 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.1 — Phase 1 of 10 (substrate kernel) complete. There is no
-> end-user cognitive agent yet.** The full substrate kernel is implemented in
-> NOVA and verified against the real self-hosting toolchain: 9 modules under
-> `src/substrate/` compile (`make build`), 9 unit-test suites pass (`make test`,
-> 284 assertions), two benchmarks report metrics (`make benchmark`), and the
-> substrate self-check boots the kernel end-to-end (`make run`). See
+> **Status: v0.2 — Phases 1 and 3 of 10 complete (substrate kernel + knowledge
+> representation). There is no end-user cognitive agent yet.** Implemented in
+> NOVA and verified against the real self-hosting toolchain: 16 modules compile
+> (`make build`), 16 unit-test suites pass (`make test`, 463 assertions), three
+> benchmarks report metrics (`make benchmark`), and the substrate self-check
+> boots the kernel end-to-end (`make run`). See
 > [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what works, what does not,
 > and where to continue.
 
-## What works now (v0.1)
+## What works now (v0.2)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -37,9 +37,28 @@ The Phase 1 substrate kernel (`src/substrate/`):
 - **tick_driver** — the four-phase substrate tick: snapshot → integrate →
   propagate → learn (ADR-0006, ADR-0001).
 
-Everything else (reader, KGs, memory, learning fabric, self-directed learning,
-cognitive subsystems, agent loops, safety/audit, IO, persistence) is specified
-in the ADRs but **not yet implemented**.
+The Phase 3 knowledge layer (`src/kg/`):
+
+- **atom_store** — the persistent knowledge atom with immutable (kg_id, id)
+  identity, versioned mutation, and a Bayesian alpha/beta belief; also the
+  shared milli belief + integer-cosine vector helpers (ADR-0016, ADR-0023).
+- **multi_kg_manager** — per-domain knowledge graphs with embedding centroids
+  (ADR-0004).
+- **cross_kg_references** — automatic + earned cross-KG links and the
+  spawn-on-new-domain heuristic (ADR-0017).
+- **schemas** — entity-type validation with required/optional fields and
+  min/max constraints (ADR-0018).
+- **concept_layer** — the concept DAG with promotion, schema slots, facet
+  vectors, members, and kg_span (ADR-0018).
+- **skills_kg** — procedural skills (ATOM_SKILL) with Bayesian reliability,
+  step rules, activation, and retirement (ADR-0019).
+- **competence_tracker** — the self-model: per-domain competence (know/do/
+  understand) computed from belief/skill/concept state, with four tiers
+  (ADR-0020).
+
+Everything else (Phase 2 reader/language atoms, episodic memory, the learning
+fabric, self-directed learning, cognitive subsystems, agent loops, safety/audit,
+IO, persistence) is specified in the ADRs but **not yet implemented**.
 
 ## What "substrate, not workflow" means
 

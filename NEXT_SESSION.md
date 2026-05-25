@@ -7,7 +7,7 @@ continue. It is updated at every session boundary.
 
 - Phase 1 substrate kernel: **complete**
 - Phase 2 reader and language: not started
-- Phase 3 knowledge representation: not started
+- Phase 3 knowledge representation: **complete**
 - Phase 4 memory and learning: not started
 - Phase 5 self-directed learning: not started
 - Phase 6 cognitive subsystems: not started
@@ -16,7 +16,7 @@ continue. It is updated at every session boundary.
 - Phase 9 IO and effectors: not started
 - Phase 10 persistence and operations: not started
 
-## Completed modules this session (Phase 1)
+## Completed modules — Phase 1 (substrate kernel)
 
 All under `src/substrate/`. Each compiles with `nova build` and has a matching
 `tests/unit/test_<module>.nova` suite (happy path + edge + failure cases).
@@ -41,30 +41,49 @@ Also delivered:
 - `tests/benchmark/bench_tick_rate.nova`, `tests/benchmark/bench_node_throughput.nova`.
 - `make benchmark` target added to the Makefile.
 - Docs: `docs/runbook/{build,test,run,troubleshooting}.md`,
-  `docs/design/{overview,data_flow}.md`; README updated to v0.1 reality.
+  `docs/design/{overview,data_flow}.md`.
+
+## Completed modules — Phase 3 (knowledge representation)
+
+All under `src/kg/`, each compiling with a matching unit-test suite. Built on
+the substrate's milli-fixed-point convention; belief and vector cosine are
+implemented in-house (see NOVA blockers).
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| atom_store.nova | 0016, 0023 | 42 | done |
+| multi_kg_manager.nova | 0004, 0016 | 23 | done |
+| cross_kg_references.nova | 0017, 0004 | 20 | done |
+| schemas.nova | 0018 | 13 | done |
+| concept_layer.nova | 0018 | 28 | done |
+| skills_kg.nova | 0019 | 26 | done |
+| competence_tracker.nova | 0020 | 27 | done |
+
+Also delivered: `tests/benchmark/bench_kg_query.nova` (insertion, id/label
+lookup, observation throughput); README updated to v0.2.
 
 ## Partially completed modules
 
 None. There are no stubs, no `.pending` files, and no `TODO`s in committed code.
-Every Phase 1 module is fully implemented and tested.
+Every Phase 1 and Phase 3 module is fully implemented and tested.
 
 ## Modules not yet started (in plan order)
 
 - Phase 2: `src/reader/{lexical_anchor,context_bias,spreading_activation,coherence_check,fetch_route_learn,reader}.nova`,
   `src/language/{word_atoms,phoneme_atoms,syntax_atoms}.nova`
-- Phase 3: `src/kg/{multi_kg_manager,atom_store,cross_kg_references,concept_layer,schemas,skills_kg,competence_tracker}.nova`
 - Phases 4–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 9 (one per Phase 1 module); **284 assertions**.
+- Total unit suites: 16 (9 substrate + 7 knowledge); **463 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
-- Total benchmarks: 2 (`bench_tick_rate`, `bench_node_throughput`).
+- Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution
   clock): single-part ~60k ticks/sec; full 7-part substrate ~35k part-ticks/sec;
-  node throughput ~768k integrations/sec. These bound the current scalar driver;
-  see ADR-0001's 100Hz target and enhancements #4/#5.
+  node throughput ~768k integrations/sec; KG O(1) id-lookup ~300k/sec; KG O(n)
+  label scan is the slow path (linear over atoms) -- a scalable name index is a
+  future optimization. These bound the current scalar implementation.
 
 ## ADR ambiguities encountered
 
@@ -128,33 +147,50 @@ shaped the implementation and must be respected going forward:
    the same top-level `let`/`fn` name collide at assembly time. Prefix module
    constants (we use `NS_`, `SG_`, `PART_`, `GATE_`, `XSIG_`, `TD_`, ...).
 8. **Reserved word `asm`.** Cannot be used as an identifier.
+9. **NOVA's knowledge modules do not std-import cleanly (v0.x).** `core/belief.nova`
+   is not in the std-package registry (segfaults on use); `import "std/embed"`
+   fails with duplicate-symbol link errors; `import "std/map"` segfaults the
+   *compiler*. **Workaround applied (Phase 3):** CrossEngin implements its own
+   minimal alpha/beta belief and integer cosine vectors in `atom_store.nova`
+   (milli-fixed-point, same semantics as `core/belief.nova`), and uses id-indexed
+   lists + linear-scan for name lookup. `contains()` does work for string lists.
 
-None of these is a hard blocker for Phase 1 (all worked around with correct,
-non-stub code). #1 and #6 are the ones most likely to constrain later phases at
-scale; both have upstream-enhancement entries.
+None of these is a hard blocker (all worked around with correct, non-stub code).
+#1, #6, and #9 are the ones most likely to constrain later phases; #1/#6 have
+upstream-enhancement entries, #9 wants NOVA to make the cognitive-core modules
+std-importable.
 
 ## Recommended next session start point
 
-**Pull Phase 3's atom/KG core forward before the Phase 2 reader**, because the
-reader (ADR-0011/0012) cannot anchor or spread without atoms and a KG. Concrete
-order:
+Phases 1 and 3 are done, so the prerequisites the reader needs now exist. Two
+good options:
 
-1. `src/kg/atom_store.nova` (ADR-0016) — the persistent, mutable knowledge atom
-   (id, content, belief α/β via NOVA `belief_*`, links). Build on the substrate
-   conventions established this session (milli-fixed-point, indexed arrays).
-2. `src/kg/multi_kg_manager.nova` (ADR-0004/0016) — per-domain KGs keyed to the
-   KG *parts* already supported by `part_lifecycle`.
-3. `src/language/word_atoms.nova` (ADR-0015) — word atoms as KG atoms.
-4. Then the Phase 2 reader stages, now that atoms/KG exist.
+**Option A (recommended): Phase 2 — reader and language atoms.** Now unblocked
+by the knowledge layer. Suggested order:
 
-If strict phase order is preferred instead, start at
-`src/language/word_atoms.nova` and define a minimal local atom representation,
-but expect to refactor onto the Phase 3 KG. Flag this decision for human review.
+1. `src/language/word_atoms.nova` (ADR-0015) — word atoms as `ATOM_LANG` atoms
+   in a language KG (via `kg_add_atom`), each with a lexical facet vector. Then
+   `phoneme_atoms.nova`, `syntax_atoms.nova`.
+2. `src/reader/lexical_anchor.nova` (ADR-0011/0012) — match input tokens to word
+   atoms (label lookup / lexical-vector similarity), emit `XSIG_SENSORY` into
+   perception first nodes (the substrate + gate routing already support this).
+3. `src/reader/{context_bias,spreading_activation,coherence_check,fetch_route_learn,reader}.nova`
+   — spreading activation runs over the KG + concept layer (both implemented);
+   `fetch_route_learn` is the bridge to Phase 5 (defer the fetch to whitelist).
 
-A second, independent track that needs no new primitives: **inter-part signal
-emission** — today `tick_driver` propagates *within* a part; wiring fired nodes
-through `gate_router` to other parts' first nodes is the bridge to the six-loop
-agent architecture (Phase 7) and would make the self-check multi-part-dynamic.
+**Option B: Phase 4 — episodic memory + the learning fabric.** `moment_stream`
+gives atoms real `created_moment` timestamps (currently a passed-in logical
+tick), and `bayesian_updates` formalizes the belief observations atoms already
+use. Independent of the reader.
+
+Cross-cutting, needs no new primitives: **inter-part signal emission** — today
+`tick_driver` propagates *within* a part; wiring fired nodes through
+`gate_router` to other parts' first nodes is the bridge to the six-loop agent
+architecture (Phase 7).
+
+Build the knowledge layer's belief/vector helpers on what exists: reuse
+`atom_store`'s `bel_*`, `vec_*`, and `handle_*`; do not reach for NOVA's
+core/belief or std/embed (see NOVA blocker #9).
 
 ## Build/test commands verified working
 
