@@ -7,17 +7,21 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.9 — Phases 1–9 of 10 complete (substrate + reader + knowledge +
-> memory/learning + self-directed learning + cognitive subsystems + agent
-> architecture + safety/audit + IO/effectors). There is no end-user cognitive
-> daemon yet.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 83 modules compile (`make build`), 83 unit-test suites pass
-> (`make test`, 1360 assertions), three benchmarks report metrics
-> (`make benchmark`), and the substrate self-check boots the kernel end-to-end
-> (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
-> works, what does not, and where to continue.
+> **Status: v0.10 — all 10 phases' modules complete (substrate + reader +
+> knowledge + memory/learning + self-directed learning + cognitive subsystems +
+> agent architecture + safety/audit + IO/effectors + persistence).** Implemented
+> in NOVA and verified against the real self-hosting toolchain: 85 modules
+> compile (`make build`), 85 unit-test suites pass (`make test`, 1412
+> assertions), three benchmarks report metrics (`make benchmark`), and two
+> runnable spine artifacts build and run (`make install`): the substrate kernel
+> self-check and the safety+IO+persistence companion spine. The full **unified**
+> agent process (every subtree in one binary) is the remaining integration step
+> — it is gated on NOVA import-path canonicalization (blocker #10); a verified
+> `nova_packages/` shim recipe is documented in
+> [`NEXT_SESSION.md`](./NEXT_SESSION.md), which also records exactly what works,
+> what does not, and where to continue.
 
-## What works now (v0.9)
+## What works now (v0.10)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -175,9 +179,27 @@ The Phase 9 IO and effectors layer (`src/io/`):
   percept (ADR-0011/0012, ADR-0021); strictly outside cognition (ADR-0014).
   Text/file are normalized now; audio (STT) is the honest deferred bridge seam.
 
-Everything else (persistence and the top-level daemon that wires the loops +
-safety + io to the substrate tick) is specified in the ADRs but **not yet
-implemented**.
+The Phase 10 persistence layer (`src/persistence/`):
+
+- **snapshot_writer** (ADR-0048) — the substrate-snapshot container: a tagged,
+  versioned image with fixed, ordered sections `[SOUL][KGS][EPISODIC][SYNAPSES]
+  [SELFMODEL]`, each holding a subsystem-serialized blob. Generic over the blobs
+  (so it stays standalone); the crash-safe disk write (temp → fsync → atomic
+  rename) is the runtime seam.
+- **snapshot_reader** (ADR-0048) — parse + tag/version rejection, and the
+  **load-bearing mandatory rehydration order** (soul → KGs → episodic): it
+  refuses to load KGs before the soul (constitution must be live before any atom
+  is admitted) or episodic before KGs (moments would dangle), and emits the
+  ordered rehydration plan. The decision log persists independently and is not
+  rolled back by a restore.
+
+Two runnable artifacts demonstrate the ends of the system (`make install`):
+`examples/kernel_selfcheck.nova` boots the substrate kernel; `examples/
+companion_spine.nova` runs the safety + IO + persistence spine end-to-end —
+transduce input → produce governed output through the safety gate (forbidden
+utterances vetoed, every action logged) → checkpoint and rehydrate. Wiring
+*every* subtree into one unified process is the final integration step, gated on
+import-path canonicalization (see [`NEXT_SESSION.md`](./NEXT_SESSION.md)).
 
 > Integration note: each loop is a self-contained unit over the shared
 > blackboard, so the loops compose without tripping NOVA's import-dedup limit
@@ -223,6 +245,7 @@ src/
   io/         transducers (STT/TTS modality) and motor effectors
   scheduler/  hybrid 100Hz tick + event scheduler (ADR-0037)
   audit/      append-only decision log (ADR-0043)
+  persistence/ ordered substrate snapshot + rehydration (ADR-0048)
 tests/        unit / integration / benchmark
 scripts/      bootstrap.sh, run.sh, test.sh
 examples/     runnable demos (kernel self-check)

@@ -14,7 +14,8 @@ continue. It is updated at every session boundary.
 - Phase 7 agent architecture: **complete**
 - Phase 8 safety and audit: **complete**
 - Phase 9 IO and effectors: **complete**
-- Phase 10 persistence and operations: not started
+- Phase 10 persistence and operations: **complete** (modules + spine artifact;
+  unified single-process daemon gated on blocker #10 — see below)
 
 ## Completed modules — Phase 1 (substrate kernel)
 
@@ -238,19 +239,54 @@ enhancements #11/#14); all gate/log/generation logic is real and tested.
 
 README updated to v0.9.
 
+## Completed modules — Phase 10 (persistence + spine artifact)
+
+Persistence under `src/persistence/`, plus the runnable companion-spine artifact.
+Each module compiles with a matching unit-test suite. The snapshot writer/reader
+are the generic ADR-0048 CONTAINER (tagged/versioned, fixed ordered sections,
+each an opaque subsystem blob), so they stay standalone (no subsystem imports,
+no blocker #10) and compose into any binary. The load-bearing part is enforced
+in the reader: the mandatory rehydration order soul -> KGs -> episodic (refuse
+KGs before soul, episodic before KGs), so the constitution is live before any
+atom is admitted and no moment dangles. The decision log (ADR-0043) is
+durable-but-separate and is not rolled back by a restore. Crash-safe disk write
+(temp -> fsync -> atomic rename) and subsystem byte-serialization are the runtime
+seams (NOVA enhancements #9/#10); the container, ordering, and validation are
+implemented and tested.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| persistence/snapshot_writer.nova | 0048 | 27 | done |
+| persistence/snapshot_reader.nova | 0048 | 25 | done |
+
+Also delivered: `examples/companion_spine.nova` — the runnable v0.10 artifact
+(`make install` -> `bin/crossengin-spine`). It wires the Phase 8/9/10 spine
+end-to-end: boot a soul + constitution, transduce input, produce governed output
+through the safety gate (forbidden utterances vetoed, every action logged in the
+tamper-evident decision log), then checkpoint and rehydrate in mandatory order.
+Pure substrate, no LLM. (Companion to `examples/kernel_selfcheck.nova`, the
+substrate-kernel spine.)
+
+README updated to v0.10.
+
 ## Partially completed modules
 
-None. There are no stubs and no `TODO`s in committed code. Every Phase 1–9
-module is fully implemented and tested. No `.pending` files were needed.
+None. There are no stubs and no `TODO`s in committed code. Every Phase 1–10
+module is fully implemented and tested. No `.pending` files were needed. The one
+thing NOT yet built is the **unified single-process daemon** (all subtrees in one
+binary) — this is an integration limitation of the current NOVA backend (blocker
+#10), not a missing module; the verified unblock recipe is below.
 
 ## Modules not yet started (in plan order)
 
-- Phase 10: persistence (ADR-0048 ordered snapshot/rehydrate) + the top-level
-  daemon/`main` (cross-subtree assembly; see the recommendation below).
+- None. All 50 ADRs across all 10 phases have an implemented, tested module.
+  Remaining work is integration (the unified daemon) + landing the documented
+  runtime seams; see the recommendation section.
 
 ## Tests status
 
-- Total unit suites: 83 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors); **1360 assertions**.
+- Total unit suites: 85 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence); **1412 assertions**.
+- Runnable artifacts: 2 — `examples/kernel_selfcheck.nova` (substrate kernel) and `examples/companion_spine.nova` (safety+IO+persistence spine); both build via `make install` and run to a passing self-report.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -372,42 +408,61 @@ loop-body multiply codegen fixed.
 
 ## Recommended next session start point
 
-**Phase 10 — persistence + the daemon (ADR-0048, ADR-0046).** The last phase: a
-crash-safe substrate snapshot with a *mandatory ordered rehydration*, then the
-top-level `main` that finally assembles every subtree into a running companion.
-Suggested order:
+All 50 ADRs across all 10 phases now have an implemented, tested module. The
+remaining work is **integration**, not new modules: assemble the full agent into
+one unified process, then land the documented runtime seams. Two items.
 
-1. `src/persistence/snapshot_writer.nova` (ADR-0048) — assemble the tagged,
-   versioned snapshot: header (`SNAP` tag, format version, instance identity,
-   timestamp, section offset table) then length-prefixed sections
-   `[SOUL][KGS][EPISODIC][SYNAPSES][SELFMODEL]`. Ephemeral signal traffic /
-   node scratch is NOT persisted (it is reconstructed by running the loops).
-   The disk write is crash-safe by temp-file + fsync + atomic rename — that
-   syscall layer is the runtime seam (NOVA enhancement #10); the section
-   assembly/serialization-to-record and the ordering logic are implementable and
-   testable now (mirror the `internet_fetch` transport-seam pattern).
-2. `src/persistence/snapshot_reader.nova` (ADR-0048) — rehydrate in the
-   **load-bearing mandatory order: soul -> KGs -> episodic** (constitution must
-   be in force before any atom is admitted; moments reference atoms so they load
-   last); synapses/self-model load with/after KGs. Long-horizon goals ride
-   inside the soul block. Assert the order in tests.
-   **The decision log (ADR-0043) is durable-but-separate: it is persisted
-   continuously and is NOT rolled back by a snapshot restore.**
-3. The daemon / `main` — the cross-subtree assembly. This is where NOVA blocker
-   #10 finally bites for real (all loops + scheduler + safety + io + persistence
-   in one program). Plan a `nova_packages/` shim so every shared module resolves
-   to one canonical import string (the compiler checks `nova_packages/<name>`
-   before relative paths), or keep `main` thin and stage subtrees. Wire the
-   long-deferred hooks here: feed `predictive_coding_runtime` error and the
-   emotion/`plasticity_modulation` modulator into `tick_driver` (currently 0 /
-   neutral); route reader percepts (via the new `input_transducer`) and
-   fired-node signals through `gate_router`; send all output through
-   `effector_gate` (so every utterance/action is gated + logged); checkpoint via
-   the snapshot writer at idle and on clean shutdown.
+### 1. The unified single-process daemon (the last integration step)
 
-This is the v1 acceptance milestone (ADR-0050 Step 10): the multi-day
-companion-quality test across real restarts, plus capability tests #6
-(long-horizon goals) and #8 (NO-LLM-cognition verification).
+The blocker: NOVA dedups relative imports by their *accumulated path string*, so
+a shared low-level module reached from two subtrees via different relative
+prefixes (e.g. `node_pool_manager` as `"node_pool_manager.nova"` from the
+substrate vs `"../substrate/node_pool_manager.nova"` from kg) is included twice
+-> "symbol already defined" (blocker #10). The two shipped spine artifacts each
+stay inside a clean import set; the *unified* daemon spans all subtrees and trips
+this.
+
+**Verified unblock recipe (tested this phase).** The compiler's import resolver
+(`/home/user/NOVA/src/compiler/compiler.nova`, `_resolve_import_inner`) checks
+`nova_packages/<imp_path>` BEFORE the relative path, and dedups it by that
+canonical key regardless of which directory imports it. I confirmed empirically:
+a shared module placed in `nova_packages/shared.nova` and imported as
+`"shared.nova"` from two different directories is included exactly once and
+links. So the unification path is:
+
+- Move (or mirror) the shared low-level modules that multiple subtrees pull —
+  `node_pool_manager`, `signal_dispatch`, `atom_store` and its kg chain — into
+  `nova_packages/`, and change their importers to the bare canonical name
+  (e.g. `import "node_pool_manager.nova"`). Then every subtree resolves them to
+  the one canonical key and the duplicates collapse.
+- Caveats: `nova_packages/` is currently in `.gitignore` (un-ignore it, or add a
+  populated copy the build expects); the per-module unit tests must still build
+  (they will, since the compiler checks `nova_packages/` from the repo-root cwd).
+  Do this as a careful, mechanical migration with `make build`/`make test` green
+  at each step — it touches the import lines of the foundational modules, so it
+  is the one change that can destabilize the 85 passing suites if rushed.
+- Alternative (cleaner, upstream): teach NOVA to canonicalize `..` in import
+  paths so relative dedup is by real path — then no migration is needed. This is
+  the right long-term fix (a NOVA enhancement).
+
+Once unified, the daemon wires the long-deferred hooks: feed
+`predictive_coding_runtime` error and the emotion/`plasticity_modulation`
+modulator into `tick_driver` (currently 0 / neutral); route reader percepts (via
+`input_transducer`) and fired-node signals through `gate_router`; send every
+output/action through `effector_gate` (gated + logged); checkpoint via
+`snapshot_writer` at idle (ADR-0037 hook) and on clean shutdown; rehydrate via
+`snapshot_reader` in mandatory order on boot. This is the v1 acceptance milestone
+(ADR-0050 Step 10): the multi-day companion test across real restarts, plus
+capability tests #6 (long-horizon goals) and #8 (NO-LLM-cognition).
+
+### 2. Land the runtime seams (NOVA enhancements)
+
+Every deferred seam is a documented DI boundary with real logic behind it, not a
+stub. To make the daemon production-real: #9/#10 fsync-durable decision log +
+snapshot write (temp->fsync->atomic-rename); #11 the internet-fetch TLS
+transport; #14 the STT/TTS modality bridge (isolated, no cognition path); #5 a
+sub-second clock for the true 100Hz pacer; #4 SIMD/GPU batched propagation for
+scale. These are tracked per-module in headers and in `nova-deps.toml`.
 
 ## Build/test commands verified working
 
@@ -416,11 +471,12 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 83 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 83/83 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 85 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 85/85 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
-make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
+make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck + bin/crossengin-spine
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
+$NOVA_ROOT/nova run examples/companion_spine.nova   # prints "companion spine: OK"
 ```
 
 To build the NOVA toolchain itself (one time): `cd /home/user/NOVA && make`
