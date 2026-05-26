@@ -7,17 +7,17 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.8 — Phases 1–8 of 10 complete (substrate + reader + knowledge +
+> **Status: v0.9 — Phases 1–9 of 10 complete (substrate + reader + knowledge +
 > memory/learning + self-directed learning + cognitive subsystems + agent
-> architecture + safety/audit). There is no end-user cognitive daemon yet.**
-> Implemented in NOVA and verified against the real self-hosting toolchain: 80
-> modules compile (`make build`), 80 unit-test suites pass (`make test`, 1308
-> assertions), three benchmarks report metrics (`make benchmark`), and the
-> substrate self-check boots the kernel end-to-end (`make run`). See
-> [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what works, what does not,
-> and where to continue.
+> architecture + safety/audit + IO/effectors). There is no end-user cognitive
+> daemon yet.** Implemented in NOVA and verified against the real self-hosting
+> toolchain: 83 modules compile (`make build`), 83 unit-test suites pass
+> (`make test`, 1360 assertions), three benchmarks report metrics
+> (`make benchmark`), and the substrate self-check boots the kernel end-to-end
+> (`make run`). See [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what
+> works, what does not, and where to continue.
 
-## What works now (v0.8)
+## What works now (v0.9)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -158,8 +158,25 @@ The Phase 8 safety and audit stack (`src/safety/`, `src/audit/`):
   unclearable by user approval) → hard stop → permission tier, plus the soul
   loyalty resolution (constitution > enterprise > user > system) (ADR-0045).
 
-Everything else (IO/effectors, persistence, and the top-level daemon that wires
-the loops + safety to the substrate tick) is specified in the ADRs but **not yet
+The Phase 9 IO and effectors layer (`src/io/`):
+
+- **output_generation** (`io/effectors/`) — pure-substrate language production
+  (ADR-0013), the reverse of the reader: a communicative intent (role→concept
+  assignments) resolves to real word atoms, a learned syntax-pattern atom orders
+  them, and the text is emitted; well-formed patterns win, ill-formed are pruned,
+  and accepted phrasings strengthen via plasticity. NO LLM (ADR-0014).
+- **effector_gate** (`io/effectors/`) — the action chokepoint: every outward
+  action runs the Phase 8 `safety_gate` (constitutional veto → hard stop →
+  permission tier), logs an intent entry **before** the effector and an outcome
+  **after** (ADR-0043). The text/SPEAK effector is fully implemented; governed
+  speak vetoes a constitutionally-forbidden utterance by its text and never
+  emits it.
+- **input_transducer** (`io/transducers/`) — modality → reader-ready normalized
+  percept (ADR-0011/0012, ADR-0021); strictly outside cognition (ADR-0014).
+  Text/file are normalized now; audio (STT) is the honest deferred bridge seam.
+
+Everything else (persistence and the top-level daemon that wires the loops +
+safety + io to the substrate tick) is specified in the ADRs but **not yet
 implemented**.
 
 > Integration note: each loop is a self-contained unit over the shared

@@ -1,0 +1,134 @@
+// CrossEngin io/effectors: effector safety gate.
+//
+// Purpose
+//   The single chokepoint every outward action passes through before it runs
+//   (ADR-0041..0045 + ADR-0043). It composes the Phase 8 safety gate
+//   (constitutional veto -> hard stop -> permission tier, which folds the
+//   reversibility floor) with the append-only decision log: an INTENT entry is
+//   written BEFORE the effector runs and an OUTCOME entry after, so every gated
+//   action is durably traced. Constitutional vetoes are terminal and recorded;
+//   suspended (APPROVE-tier, unapproved) and halted actions never run.
+//
+//   The text/SPEAK effector is implemented here in full -- it is the one
+//   terminal effector executable without a runtime transport seam (it emits
+//   text). File/network/message effectors submit through the same gate; their
+//   actual transport is the deferred runtime seam (like internet_fetch's TLS),
+//   driven by the caller, which then records the outcome here.
+//
+//   Note (blocker #10): this composes the safety subtree (constitutional_filter)
+//   with the standalone decision_log -- two disjoint trees, so they coexist. It
+//   deliberately does NOT import audit_writer (whose own permission_tiers path
+//   would collide with constitutional_filter's); the descriptor and append are
+//   reconstructed here from the live permission/reversibility logic.
+//
+// ADRs implemented: ADR-0041..0045 (gate), ADR-0043 (decision log), ADR-0013
+//   (the speak effector is the terminal output stage). NOVA dependencies:
+//   builtins. CrossEngin dependencies: src/safety/constitutional_filter.nova
+//   (-> permission_tiers -> reversibility_classifier, + soul), and
+//   src/audit/decision_log.nova.
+
+import "../../safety/constitutional_filter.nova"
+import "../../audit/decision_log.nova"
+
+// Effector results: how the gate disposed of a submitted action.
+let EFF_EXECUTED  = 1   // AUTO tier: ran immediately
+let EFF_NOTIFIED  = 2   // NOTIFY tier: ran, with a notify obligation
+let EFF_SUSPENDED = 3   // APPROVE tier, not yet approved: held, did not run
+let EFF_VETOED    = 4   // constitutional veto: terminal, never runs
+let EFF_HALTED    = 5   // hard stop active: drained, did not run
+
+fn eff_name(r) {
+    if r == EFF_EXECUTED  { return "executed" }
+    if r == EFF_NOTIFIED  { return "notified" }
+    if r == EFF_SUSPENDED { return "suspended" }
+    if r == EFF_VETOED    { return "vetoed" }
+    if r == EFF_HALTED    { return "halted" }
+    return "unknown"
+}
+
+// Did the action actually run (and therefore need an outcome record)?
+fn eff_runs(result) {
+    if result == EFF_EXECUTED { return 1 }
+    if result == EFF_NOTIFIED { return 1 }
+    return 0
+}
+
+// [action_class, action_type, perm_tier, rev_class] for the log entry, derived
+// from the live permission/reversibility logic so the record reflects the tier
+// that actually gated the action.
+fn _eff_desc(action_type) {
+    let d = list_new()
+    push(d, action_type)
+    push(d, action_type)
+    push(d, perm_effective_tier(action_type))
+    push(d, reversibility_class(action_type))
+    return d
+}
+
+fn _eff_result(decision) {
+    if decision == GATE_EXECUTE { return EFF_EXECUTED }
+    if decision == GATE_NOTIFY  { return EFF_NOTIFIED }
+    if decision == GATE_SUSPEND { return EFF_SUSPENDED }
+    if decision == GATE_VETOED  { return EFF_VETOED }
+    return EFF_HALTED
+}
+
+// Submit a candidate action: run the gate and write the INTENT entry BEFORE any
+// effector runs. const_veto / halted are bits from the soul watcher and the
+// override safety-state; user_approved is the in-the-moment approval. Returns
+// [eff_result, intent_seq]. The caller runs the real effector iff
+// eff_runs(result)==1, then calls effector_complete(intent_seq, ...).
+fn effector_submit(log, action_type, const_veto, halted, user_approved, goal, trace, soul_ref, now) {
+    let decision = safety_gate(action_type, const_veto, halted, user_approved)
+    let result = _eff_result(decision)
+    let outcome = OUT_PENDING
+    if result == EFF_VETOED { outcome = OUT_VETOED }
+    let seq = dl_append(log, DLK_INTENT, 0 - 1, now, _eff_desc(action_type), goal, trace, soul_ref, outcome)
+    let r = list_new()
+    push(r, result)
+    push(r, seq)
+    return r
+}
+
+// Record the effector's completion (ADR-0043 outcome record), referencing and
+// copying the intent. success=1 -> OUT_OK else OUT_FAILED.
+fn effector_complete(log, intent_seq, success, now) {
+    let it = dl_get(log, intent_seq)
+    let d = list_new()
+    let outcome = OUT_FAILED
+    if success == 1 { outcome = OUT_OK }
+    if it == 0 {
+        push(d, 0)
+        push(d, 0)
+        push(d, 0)
+        push(d, 0)
+        return dl_append(log, DLK_OUTCOME, intent_seq, now, d, 0 - 1, list_new(), 0, outcome)
+    }
+    push(d, dl_action_class(it))
+    push(d, dl_action_type(it))
+    push(d, dl_perm_tier(it))
+    push(d, dl_rev_class(it))
+    return dl_append(log, DLK_OUTCOME, intent_seq, now, d, dl_goal(it), dl_trace(it), dl_soul_ref(it), outcome)
+}
+
+// The text / SPEAK effector: gate ACT_SPEAK and, if permitted, "emit" the text
+// (return it for the modality bridge / stdout) and log the OK outcome. Returns
+// "" when the gate blocks it (veto / hard stop). SPEAK is recoverable -> NOTIFY,
+// so it runs unless vetoed or halted.
+fn effector_speak(log, text, const_veto, halted, goal, trace, soul_ref, now) {
+    let sub = effector_submit(log, ACT_SPEAK, const_veto, halted, 0, goal, trace, soul_ref, now)
+    let result = sub[0]
+    let seq = sub[1]
+    if eff_runs(result) == 0 { return "" }
+    effector_complete(log, seq, 1, now)
+    return text
+}
+
+// End-to-end governed speak: derive the constitutional veto from the soul by
+// matching the actual output text against the constitution, then emit through
+// the gate. A constitutionally-forbidden utterance is vetoed (never emitted) and
+// the veto is recorded -- "every output passes the safety chain".
+fn effector_speak_governed(log, sl, text, halted, goal, trace, soul_ref, now) {
+    let veto = const_veto_for(sl, text)
+    return effector_speak(log, text, veto, halted, goal, trace, soul_ref, now)
+}

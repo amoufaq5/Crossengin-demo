@@ -13,7 +13,7 @@ continue. It is updated at every session boundary.
 - Phase 6 cognitive subsystems: **complete**
 - Phase 7 agent architecture: **complete**
 - Phase 8 safety and audit: **complete**
-- Phase 9 IO and effectors: not started
+- Phase 9 IO and effectors: **complete**
 - Phase 10 persistence and operations: not started
 
 ## Completed modules — Phase 1 (substrate kernel)
@@ -210,18 +210,47 @@ and tested.
 
 README updated to v0.8.
 
+## Completed modules — Phase 9 (IO and effectors)
+
+Output generation and effectors under `src/io/effectors/`, the input transducer
+under `src/io/transducers/`. Each module compiles with a matching unit-test
+suite. Layering for NOVA blocker #10: `output_generation` is the language
+subtree only (it reaches words/syntax via a single import prefix);
+`effector_gate` composes the safety subtree (`constitutional_filter`) with the
+standalone `decision_log` — two disjoint trees, so no double-include (it
+deliberately does NOT also import `audit_writer`, whose `permission_tiers` path
+would collide, and rebuilds the descriptor/append locally); `input_transducer`
+is standalone.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| io/effectors/output_generation.nova | 0013, 0015, 0007 | 10 | done |
+| io/effectors/effector_gate.nova | 0041..0045, 0043, 0013 | 23 | done |
+| io/transducers/input_transducer.nova | 0014, 0011, 0012, 0021 | 19 | done |
+
+Pure substrate, NO LLM (ADR-0014): `output_generation` produces text by the
+reverse of comprehension (intent -> real word atoms -> learned syntax ordering),
+`effector_gate` is the chokepoint that runs the Phase 8 `safety_gate` and writes
+intent-before/outcome-after decision-log entries (the SPEAK effector is fully
+implemented; governed speak vetoes forbidden output by its text). File/network/
+message transport and audio STT/TTS are the documented runtime seams (NOVA
+enhancements #11/#14); all gate/log/generation logic is real and tested.
+
+README updated to v0.9.
+
 ## Partially completed modules
 
-None. There are no stubs and no `TODO`s in committed code. Every Phase 1–8
+None. There are no stubs and no `TODO`s in committed code. Every Phase 1–9
 module is fully implemented and tested. No `.pending` files were needed.
 
 ## Modules not yet started (in plan order)
 
-- Phases 9–10: as listed in the master plan.
+- Phase 10: persistence (ADR-0048 ordered snapshot/rehydrate) + the top-level
+  daemon/`main` (cross-subtree assembly; see the recommendation below).
 
 ## Tests status
 
-- Total unit suites: 80 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit); **1308 assertions**.
+- Total unit suites: 83 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors); **1360 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -343,42 +372,42 @@ loop-body multiply codegen fixed.
 
 ## Recommended next session start point
 
-**Phase 9 — IO and effectors (ADR-0013, plus the Phase 8 safety chain wired in).**
-The `src/io/` layer is where the substrate finally touches the outside world:
-input transducers turn raw modality (text now; STT/TTS audio is a deferred
-NOVA-IO seam) into percepts for the reader, and output/motor effectors consume
-the action loop's intents and execute them — but **only after** passing the
-Phase 8 gate. This is the phase that exercises the "every output passes the
-safety chain" contract the safety stack was built for. Suggested order:
+**Phase 10 — persistence + the daemon (ADR-0048, ADR-0046).** The last phase: a
+crash-safe substrate snapshot with a *mandatory ordered rehydration*, then the
+top-level `main` that finally assembles every subtree into a running companion.
+Suggested order:
 
-1. `src/io/output_render.nova` (ADR-0013) — pure-substrate rendering of an
-   intent/answer to text. NO LLM; templated from real state, exactly like the
-   `selfmodel_*` and `audit_*` renderers already do.
-2. `src/io/effector_gate.nova` — the action-execution chokepoint: for each
-   candidate effector action call `safety_gate(action_type, const_veto, halted,
-   user_approved)` (constitutional_filter), then `audit_intent` before running
-   and `audit_outcome` after (audit_writer); respect `safety_is_halted`
-   (override_mechanism). NB blocker #10: this needs `constitutional_filter`
-   (safety subtree) + `audit_writer` (audit subtree) + `override_mechanism`
-   (which itself spans kg/goals/audit) — verify the import set compiles as a
-   unit early; if it collides, route through one subtree or stage via a
-   `nova_packages/` shim.
-3. `src/io/input_transducer.nova` — modality -> normalized percept stream feeding
-   the reader (ADR-0011/0012 already consume normalized text).
-4. Motor/tool effectors as the ADRs specify (file/net/message effectors mapped to
-   the `ACT_*` classes the classifier already defines).
+1. `src/persistence/snapshot_writer.nova` (ADR-0048) — assemble the tagged,
+   versioned snapshot: header (`SNAP` tag, format version, instance identity,
+   timestamp, section offset table) then length-prefixed sections
+   `[SOUL][KGS][EPISODIC][SYNAPSES][SELFMODEL]`. Ephemeral signal traffic /
+   node scratch is NOT persisted (it is reconstructed by running the loops).
+   The disk write is crash-safe by temp-file + fsync + atomic rename — that
+   syscall layer is the runtime seam (NOVA enhancement #10); the section
+   assembly/serialization-to-record and the ordering logic are implementable and
+   testable now (mirror the `internet_fetch` transport-seam pattern).
+2. `src/persistence/snapshot_reader.nova` (ADR-0048) — rehydrate in the
+   **load-bearing mandatory order: soul -> KGs -> episodic** (constitution must
+   be in force before any atom is admitted; moments reference atoms so they load
+   last); synapses/self-model load with/after KGs. Long-horizon goals ride
+   inside the soul block. Assert the order in tests.
+   **The decision log (ADR-0043) is durable-but-separate: it is persisted
+   continuously and is NOT rolled back by a snapshot restore.**
+3. The daemon / `main` — the cross-subtree assembly. This is where NOVA blocker
+   #10 finally bites for real (all loops + scheduler + safety + io + persistence
+   in one program). Plan a `nova_packages/` shim so every shared module resolves
+   to one canonical import string (the compiler checks `nova_packages/<name>`
+   before relative paths), or keep `main` thin and stage subtrees. Wire the
+   long-deferred hooks here: feed `predictive_coding_runtime` error and the
+   emotion/`plasticity_modulation` modulator into `tick_driver` (currently 0 /
+   neutral); route reader percepts (via the new `input_transducer`) and
+   fired-node signals through `gate_router`; send all output through
+   `effector_gate` (so every utterance/action is gated + logged); checkpoint via
+   the snapshot writer at idle and on clean shutdown.
 
-**Then Phase 10 (persistence + the daemon).** Phase 10 `main` is where the
-cross-subtree assembly finally happens (all loops + scheduler + safety + io):
-plan a `nova_packages/` shim so every shared module resolves to one canonical
-import string (the compiler checks `nova_packages/<name>` before relative
-paths), or keep `main` thin and route through one subtree. Persistence is the
-single ordered snapshot/rehydrate of ADR-0048 (soul -> KGs -> episodic);
-**note the decision log is durable-but-separate — it is NOT rolled back by a
-substrate snapshot restore** (ADR-0043). This is also where the long-deferred
-wiring lands: feed `predictive_coding_runtime` error and the emotion/
-`plasticity_modulation` modulator into `tick_driver` (currently 0 / neutral),
-and route reader percepts + fired-node signals through `gate_router`.
+This is the v1 acceptance milestone (ADR-0050 Step 10): the multi-day
+companion-quality test across real restarts, plus capability tests #6
+(long-horizon goals) and #8 (NO-LLM-cognition verification).
 
 ## Build/test commands verified working
 
@@ -387,8 +416,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 80 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 80/80 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 83 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 83/83 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
