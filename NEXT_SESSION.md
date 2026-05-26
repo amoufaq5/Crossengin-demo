@@ -12,7 +12,7 @@ continue. It is updated at every session boundary.
 - Phase 5 self-directed learning: **complete**
 - Phase 6 cognitive subsystems: **complete**
 - Phase 7 agent architecture: **complete**
-- Phase 8 safety and audit: not started
+- Phase 8 safety and audit: **complete**
 - Phase 9 IO and effectors: not started
 - Phase 10 persistence and operations: not started
 
@@ -181,20 +181,47 @@ into one program is the Phase 10 `main` (needs a `nova_packages/` shim).
 
 README updated to v0.7.
 
+## Completed modules — Phase 8 (safety and audit)
+
+Safety stack under `src/safety/`, the audit/decision log under `src/audit/`.
+Each module compiles with a matching unit-test suite. The whole safety stack is
+a single clean dependency chain (no blocker #10): `reversibility_classifier`
+(also home to the shared `ACT_*` constants) <- `permission_tiers` <-
+`constitutional_filter`; the audit log layers `decision_log` <- `audit_writer`/
+`audit_reader`; `override_mechanism` composes the kg-belief, goal-engine, and
+audit subtrees (three disjoint subtrees, so they coexist). The gate chain is
+`safety_gate` (constitutional veto -> hard stop -> permission tier, which folds
+the reversibility floor); the audit log is append-only and hash-chained
+(tamper-evident: mutation, reorder, and tail-truncation all fail `dl_verify`).
+Pure substrate, NO LLM (ADR-0014). The fsync-backed durable store (ADR-0043
+write path) and the process-exit/snapshot syscalls (ADR-0044 kill) are the
+documented runtime seams (NOVA enhancements #9/#10); all decision logic is real
+and tested.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| safety/reversibility_classifier.nova | 0042, 0041 | 21 | done |
+| safety/permission_tiers.nova | 0041, 0042 | 24 | done |
+| audit/decision_log.nova | 0043 | 25 | done |
+| audit/audit_writer.nova | 0043 | 25 | done |
+| audit/audit_reader.nova | 0043, 0038 | 14 | done |
+| safety/override_mechanism.nova | 0044, 0043, 0023 | 27 | done |
+| safety/constitutional_filter.nova | 0045, 0041, 0042 | 22 | done |
+
+README updated to v0.8.
+
 ## Partially completed modules
 
-None. There are no stubs and no `TODO`s in committed code. Every Phase 1–7
+None. There are no stubs and no `TODO`s in committed code. Every Phase 1–8
 module is fully implemented and tested. No `.pending` files were needed.
 
 ## Modules not yet started (in plan order)
 
-- Phase 8: `src/safety/{permission_tiers,reversibility_classifier,decision_log,override_mechanism,constitutional_filter}.nova`,
-  `src/audit/{audit_writer,audit_reader}.nova`
 - Phases 9–10: as listed in the master plan.
 
 ## Tests status
 
-- Total unit suites: 73 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent); **1150 assertions**.
+- Total unit suites: 80 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit); **1308 assertions**.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -294,47 +321,64 @@ shaped the implementation and must be respected going forward:
    must bridge subtrees, either route everything through one subtree's import
    prefix, or introduce a `nova_packages/` shim so shared modules resolve to one
    canonical string.
+11. **Large-magnitude integer multiply inside a loop miscompiles (segfault).**
+   Discovered (Phase 8) building the decision-log hash chain. A multiply whose
+   product is large (empirically &gt;~1e12, and reliably so when a large literal/
+   constant multiplier like 1000003 is used) crashes at runtime *when it is
+   inside a `while` loop*; the identical multiply outside a loop, and small-
+   multiplier multiplies (e.g. `*31`, `*131`) inside loops, are fine. Modulo with
+   a large divisor is fine on its own. NOVA integers are 64-bit (1e10/1e12
+   multiplies print correctly outside loops), so this is a loop-body codegen/
+   register bug, not an overflow. **Workaround applied:** `decision_log`'s rolling
+   hash uses multiplier 131 and modulus 1000003 (prime) and folds a pre-built
+   flat field list with an *inlined* step (no helper call, no large product in
+   the loop) — every intermediate stays &lt; ~1.3e8. Keep loop-body arithmetic
+   small; precompute large constants outside loops.
 
 None of these is a hard blocker (all worked around with correct, non-stub code).
-#1, #6, #9, #10 are the ones most likely to constrain later phases; #1/#6 have
-upstream-enhancement entries, #9/#10 want NOVA to make cognitive-core modules
-std-importable and to canonicalize import paths.
+#1, #6, #9, #10, #11 are the ones most likely to constrain later phases; #1/#6
+have upstream-enhancement entries, #9/#10 want NOVA to make cognitive-core
+modules std-importable and to canonicalize import paths, and #11 wants the
+loop-body multiply codegen fixed.
 
 ## Recommended next session start point
 
-**Phase 8 — safety and audit (ADR-0041..0045, ADR-0043).** Self-contained and
-well-specified; a good, lower-risk phase after the big integration. Suggested
-order:
+**Phase 9 — IO and effectors (ADR-0013, plus the Phase 8 safety chain wired in).**
+The `src/io/` layer is where the substrate finally touches the outside world:
+input transducers turn raw modality (text now; STT/TTS audio is a deferred
+NOVA-IO seam) into percepts for the reader, and output/motor effectors consume
+the action loop's intents and execute them — but **only after** passing the
+Phase 8 gate. This is the phase that exercises the "every output passes the
+safety chain" contract the safety stack was built for. Suggested order:
 
-1. `src/safety/permission_tiers.nova` (ADR-0041) — observe/respond/full tiers and
-   the permission check; elevation requires explicit confirmation.
-2. `src/safety/reversibility_classifier.nova` (ADR-0042) — classify actions as
-   reversible / partially / irreversible; irreversible actions require
-   confirmation.
-3. `src/audit/{audit_writer,audit_reader}.nova` (ADR-0043) — the append-only
-   decision log (every decision traced). In-memory + serialized now; crash-safe
-   fsync durability is NOVA enhancement #9 (likely a documented gap).
-4. `src/safety/decision_log.nova` (ADR-0043) — the decision-record structure the
-   audit writer persists.
-5. `src/safety/override_mechanism.nova` (ADR-0044) — one-shot override
-   grant/consume; also backs user-model delete (theory_of_mind already exposes
-   usermodel_delete).
-6. `src/safety/constitutional_filter.nova` (ADR-0045) — the output filter chain
-   that enforces the soul constitution (constitution.nova + XSIG_CONST already
-   exist) over every motor-effector-bound output. No bypass paths.
+1. `src/io/output_render.nova` (ADR-0013) — pure-substrate rendering of an
+   intent/answer to text. NO LLM; templated from real state, exactly like the
+   `selfmodel_*` and `audit_*` renderers already do.
+2. `src/io/effector_gate.nova` — the action-execution chokepoint: for each
+   candidate effector action call `safety_gate(action_type, const_veto, halted,
+   user_approved)` (constitutional_filter), then `audit_intent` before running
+   and `audit_outcome` after (audit_writer); respect `safety_is_halted`
+   (override_mechanism). NB blocker #10: this needs `constitutional_filter`
+   (safety subtree) + `audit_writer` (audit subtree) + `override_mechanism`
+   (which itself spans kg/goals/audit) — verify the import set compiles as a
+   unit early; if it collides, route through one subtree or stage via a
+   `nova_packages/` shim.
+3. `src/io/input_transducer.nova` — modality -> normalized percept stream feeding
+   the reader (ADR-0011/0012 already consume normalized text).
+4. Motor/tool effectors as the ADRs specify (file/net/message effectors mapped to
+   the `ACT_*` classes the classifier already defines).
 
-These are self-contained / soul-importing modules (single subtree), so blocker
-#10 does not bite. The "every output passes the safety chain" wiring is exercised
-at the Phase 9 effectors / Phase 10 main.
-
-**Then Phase 9 (IO/effectors) and Phase 10 (persistence + the daemon).** Phase 10
-`main` is where the cross-subtree assembly finally happens (all loops + scheduler
-+ safety): plan a `nova_packages/` shim so every shared module resolves to one
-canonical import string (the compiler checks `nova_packages/<name>` before
-relative paths), or keep `main` thin and route through one subtree. This is also
-where the long-deferred wiring lands: feed `predictive_coding_runtime` error and
-the emotion/`plasticity_modulation` modulator into `tick_driver` (currently 0 /
-neutral), and route reader percepts + fired-node signals through `gate_router`.
+**Then Phase 10 (persistence + the daemon).** Phase 10 `main` is where the
+cross-subtree assembly finally happens (all loops + scheduler + safety + io):
+plan a `nova_packages/` shim so every shared module resolves to one canonical
+import string (the compiler checks `nova_packages/<name>` before relative
+paths), or keep `main` thin and route through one subtree. Persistence is the
+single ordered snapshot/rehydrate of ADR-0048 (soul -> KGs -> episodic);
+**note the decision log is durable-but-separate — it is NOT rolled back by a
+substrate snapshot restore** (ADR-0043). This is also where the long-deferred
+wiring lands: feed `predictive_coding_runtime` error and the emotion/
+`plasticity_modulation` modulator into `tick_driver` (currently 0 / neutral),
+and route reader percepts + fired-node signals through `gate_router`.
 
 ## Build/test commands verified working
 
@@ -343,8 +387,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 73 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 73/73 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 80 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 80/80 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"

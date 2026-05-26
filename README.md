@@ -7,17 +7,17 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.7 — Phases 1–7 of 10 complete (substrate + reader + knowledge +
+> **Status: v0.8 — Phases 1–8 of 10 complete (substrate + reader + knowledge +
 > memory/learning + self-directed learning + cognitive subsystems + agent
-> architecture). There is no end-user cognitive daemon yet.** Implemented in
-> NOVA and verified against the real self-hosting toolchain: 73 modules compile
-> (`make build`), 73 unit-test suites pass (`make test`, 1150 assertions), three
-> benchmarks report metrics (`make benchmark`), and the substrate self-check
-> boots the kernel end-to-end (`make run`). See
+> architecture + safety/audit). There is no end-user cognitive daemon yet.**
+> Implemented in NOVA and verified against the real self-hosting toolchain: 80
+> modules compile (`make build`), 80 unit-test suites pass (`make test`, 1308
+> assertions), three benchmarks report metrics (`make benchmark`), and the
+> substrate self-check boots the kernel end-to-end (`make run`). See
 > [`NEXT_SESSION.md`](./NEXT_SESSION.md) for exactly what works, what does not,
 > and where to continue.
 
-## What works now (v0.7)
+## What works now (v0.8)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -135,9 +135,32 @@ The Phase 7 agent architecture (`src/scheduler/`, `src/agent/`, `src/parts/meta/
   competence", ADR-0038), theory-of-mind user model (ADR-0039), and
   long-horizon goal accrual + revisit scan (ADR-0040).
 
-Everything else (safety/audit, IO/effectors, persistence, and the top-level
-daemon that wires the loops to the substrate tick) is specified in the ADRs but
-**not yet implemented**.
+The Phase 8 safety and audit stack (`src/safety/`, `src/audit/`):
+
+- **reversibility_classifier** — classifies each action class as reversible /
+  recoverable / irreversible, defaulting any unlisted action to irreversible
+  (fail-safe); also home to the shared `ACT_*` action-class constants (ADR-0042).
+- **permission_tiers** — the AUTO / NOTIFY / APPROVE tiers as the MAX of a
+  static per-class default and the reversibility floor, so irreversible actions
+  are always ≥ APPROVE; unknown classes default to APPROVE (ADR-0041).
+- **decision_log** — the append-only, hash-chained decision record: every entry
+  links to its predecessor so mutation, reorder, and tail-truncation all fail
+  `dl_verify` (ADR-0043).
+- **audit_writer / audit_reader** — the write path (intent entry before the
+  effector, outcome after; corrections and overrides appended) and the
+  inspection path (chain verification + plain-language "why did you do X?"
+  rendered purely from stored state, no LLM) (ADR-0043, ADR-0038).
+- **override_mechanism** — the four graded user interventions: belief edit
+  (privileged α/β write + pin), goal veto (subtree prune + standing regen-block),
+  hard stop (drain actions, substrate alive), and kill switch (clean snapshots,
+  panic skips); all but panic-kill are logged (ADR-0044).
+- **constitutional_filter** — the safety gate: constitutional veto (terminal,
+  unclearable by user approval) → hard stop → permission tier, plus the soul
+  loyalty resolution (constitution > enterprise > user > system) (ADR-0045).
+
+Everything else (IO/effectors, persistence, and the top-level daemon that wires
+the loops + safety to the substrate tick) is specified in the ADRs but **not yet
+implemented**.
 
 > Integration note: each loop is a self-contained unit over the shared
 > blackboard, so the loops compose without tripping NOVA's import-dedup limit
