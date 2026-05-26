@@ -198,14 +198,15 @@ The Phase 10 persistence layer (`src/persistence/`):
 Three runnable artifacts build via `make install`: `examples/kernel_selfcheck.nova`
 boots the substrate kernel; `examples/companion_spine.nova` runs the safety + IO +
 persistence spine; and **`examples/crossengin_daemon.nova` → `bin/crossengin` is
-the whole agent in one process**, run as a real multi-cycle affect-modulated
-loop. Each cycle appraises the event, the emotion loop sets mood, and that mood
-becomes the substrate tick's plasticity modulator while a predictive-coding
-residual becomes its error (closing the affect→learning feedback the spine demos
-left neutral); then drive-based goal arbitration, governed output (forbidden
-actions vetoed and logged), and idle-cycle checkpointing, with the last image
-rehydrated in mandatory order. This unified cross-subtree assembly is what the
-import-path fix unblocked.
+the whole agent in one process**, running the full ADR-0036 six-loop cycle
+(perception via the five-stage reader → memory → reasoning → emotion → goals →
+action, plus idle-gated imagination) over a shared concept KG, so a word read in
+perception seeds reasoning and imagination. The conditioned mood becomes the
+substrate tick's plasticity modulator and a predictive-coding residual becomes
+its error (closing the affect→learning feedback); output is generated from
+substrate atoms and gated (forbidden actions vetoed and logged); idle cycles
+checkpoint, and the last image rehydrates in mandatory order. This unified
+cross-subtree assembly is what the import-path fix unblocked.
 
 > Integration note: each loop is a self-contained unit over the shared
 > blackboard, so the loops compose without tripping NOVA's import-dedup limit

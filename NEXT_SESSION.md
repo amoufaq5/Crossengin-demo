@@ -266,15 +266,21 @@ Also delivered (runnable artifacts via `make install`):
 - `examples/companion_spine.nova` -> `bin/crossengin-spine` — the safety + IO +
   persistence spine.
 - `examples/crossengin_daemon.nova` -> `bin/crossengin` — **the whole agent in
-  one process**, run as a real multi-cycle affect-modulated loop: substrate +
-  knowledge + soul + goals + scheduler + emotion + IO + safety + audit +
-  persistence. Each cycle appraises the event (ADR-0035), the emotion loop sets
-  mood, and that mood becomes the substrate tick's plasticity MODULATOR while a
-  predictive-coding residual (ADR-0024) becomes the tick's ERROR -- closing the
-  affect feedback the spine demos left at neutral/0. Forbidden actions are vetoed
-  + logged; idle cycles checkpoint; the last image rehydrates in mandatory order.
-  Pure substrate, no LLM. Unblocked by the blocker #10 toolchain fix (below);
-  prints `crossengin: OK`.
+  one process**, running the full ADR-0036 six-loop cycle as a real multi-cycle,
+  affect-modulated loop. Each active cycle runs perception (the five-stage reader
+  anchors the input to concept atoms), memory (moment capture + episodic record),
+  reasoning (forward-chaining from the percept), emotion (appraisal -> conditioned
+  mood), goals (drives + arbitration), and action (substrate-generated output,
+  gated); idle cycles run imagination over the lingering active set and
+  checkpoint. The reader, reasoning operators, and imagination patterns share ONE
+  concept KG, so a word read in perception is a valid seed for reasoning and a
+  valid state for imagination -- the loops are a coherent pipeline, not isolated
+  units. Mood becomes the tick's plasticity MODULATOR and a predictive-coding
+  residual (ADR-0024) becomes its ERROR (no longer neutral/0). Forbidden actions
+  vetoed + logged; the last image rehydrates in mandatory order. Pure substrate,
+  no LLM. Unblocked by the blocker #10 toolchain fix (below); prints
+  `crossengin: OK`. Observed run: perception m=1/2 known words, reasoning 2
+  conclusions, imagination 3 states on idle, the "exfiltrate" action vetoed.
 
   Composing every subsystem also surfaced the one genuine cross-module name
   collision in the codebase (blocker #7): `E_TAG` was defined in both
@@ -440,30 +446,30 @@ All 50 ADRs across all 10 phases have an implemented, tested module, AND they no
 assemble into one unified process (`bin/crossengin`). What remains is depth, not
 breadth — two areas.
 
-### 1. Unified daemon: shipped + looping; deepen the remaining cognitive wiring
+### 1. Unified daemon: all six loops wired; remaining = continuous run + grounding
 
 The cross-subtree assembly is shipped (`examples/crossengin_daemon.nova` ->
-`bin/crossengin`) and now runs as a real multi-cycle loop with **affect-modulated
-learning wired in**: the emotion loop's conditioned mood drives the substrate
-tick's plasticity modulator and a predictive-coding residual drives its error
-(no longer neutral/0), with drive-based goal arbitration, governed output, and
-idle checkpointing each cycle. Done this session. What remains to make it the
-full ADR-0036 six-loop agent (now mechanically possible since everything links):
+`bin/crossengin`) and now runs the **full ADR-0036 six-loop cycle**: perception
+(five-stage reader), memory (episodic), reasoning (forward-chaining), emotion,
+goals, and action, plus idle-gated imagination — over a shared concept KG so a
+read word seeds reasoning and imagination. Affect-modulated learning is wired
+(mood -> plasticity modulator, PC residual -> tick error), output is gated +
+logged, and idle cycles checkpoint. Done this + the prior session. What remains:
 
-- **Wire the remaining loops**: route the transduced percept through the
-  five-stage `reader` (`loop_perception`) and fired-node signals through
-  `gate_router` to the parts; run `loop_memory` (moment capture + episodic),
-  `loop_reasoning` (forward-chaining over a seeded reasoning KG), and
-  `loop_imagination_idle`; let the reasoning/goal loops form the communicative
-  intent that `output_generation` renders (instead of the demo's fixed `ack`
-  intent). These need their KGs seeded with vocabulary / operators to be
-  non-trivial; the wiring itself is now unblocked.
-- **Run continuously**: drive the loop from the `hybrid_scheduler` event/idle
-  cycle over `coord_active_loops`, checkpoint on clean shutdown as well as idle,
-  and rehydrate via `snapshot_reader` on boot. This is the path to the ADR-0050
-  Step 10 v1 acceptance (multi-day companion test across real restarts,
-  capability tests #6 long-horizon goals and #8 NO-LLM-cognition) — which also
-  needs the runtime seams below.
+- **Run continuously**: replace the scripted episode with the `hybrid_scheduler`
+  event/idle cycle driving `coord_active_loops`, reading real input events,
+  checkpointing on clean shutdown as well as idle, and rehydrating via
+  `snapshot_reader` on boot. (The daemon currently runs a fixed 4-cycle episode
+  to demonstrate the loops; a real driver loops until shutdown.)
+- **Deepen grounding**: the demo seeds a tiny concept KG (fever/infection/treat)
+  and emits a fixed `ack` intent; a real agent grows the KGs through the learning
+  loops (ADR-0026..0030) and forms the communicative intent from the reasoning
+  conclusions / active goal (reverse concept->word lookup for generation). Route
+  fired-node signals through `gate_router` to the parts so substrate dynamics,
+  not just the symbolic loops, drive activation.
+- This is the path to the ADR-0050 Step 10 v1 acceptance (multi-day companion
+  test across real restarts, capability tests #6 long-horizon goals and #8
+  NO-LLM-cognition) — which also needs the runtime seams below.
 
 ### 2. Land the runtime seams (NOVA enhancements)
 
