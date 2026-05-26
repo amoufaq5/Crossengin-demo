@@ -22,6 +22,7 @@ UNIT_TESTS  := $(shell find tests/unit -name '*.nova' 2>/dev/null | sort)
 BENCHMARKS  := $(shell find tests/benchmark -name '*.nova' 2>/dev/null | sort)
 SELFCHECK   := examples/kernel_selfcheck.nova
 SPINE       := examples/companion_spine.nova
+DAEMON      := examples/crossengin_daemon.nova
 
 .PHONY: all build test benchmark install clean check-nova help
 
@@ -77,6 +78,14 @@ install: build
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
 	fi
+	@if [ -f "$(DAEMON)" ]; then \
+	  printf '  build %s ... ' "$(DAEMON)"; \
+	  if "$(NOVA)" build "$(DAEMON)" -o "$(BIN)/crossengin" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
 
 clean:
 	rm -rf $(BIN) /tmp/ce_build_check.bin /tmp/ce_build.log /tmp/ce_install.log
@@ -87,7 +96,7 @@ help:
 	@echo "  build      compile every implemented NOVA module under src/"
 	@echo "  test       compile and run every unit test under tests/unit/"
 	@echo "  benchmark  run every benchmark under tests/benchmark/"
-	@echo "  install    build the self-check + companion-spine binaries into ./bin/"
+	@echo "  install    build the self-check, companion-spine, and unified daemon into ./bin/"
 	@echo "  clean      remove build artifacts"
 	@echo "  check-nova verify the NOVA toolchain is reachable"
 	@echo "Override the toolchain with: make NOVA_ROOT=/path/to/NOVA <target>"

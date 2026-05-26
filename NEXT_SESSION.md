@@ -14,8 +14,9 @@ continue. It is updated at every session boundary.
 - Phase 7 agent architecture: **complete**
 - Phase 8 safety and audit: **complete**
 - Phase 9 IO and effectors: **complete**
-- Phase 10 persistence and operations: **complete** (modules + spine artifact;
-  unified single-process daemon gated on blocker #10 — see below)
+- Phase 10 persistence and operations: **complete** (modules + spine artifact +
+  the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
+  NOVA toolchain — see below)
 
 ## Completed modules — Phase 1 (substrate kernel)
 
@@ -259,15 +260,18 @@ implemented and tested.
 | persistence/snapshot_writer.nova | 0048 | 27 | done |
 | persistence/snapshot_reader.nova | 0048 | 25 | done |
 
-Also delivered: `examples/companion_spine.nova` — the runnable v0.10 artifact
-(`make install` -> `bin/crossengin-spine`). It wires the Phase 8/9/10 spine
-end-to-end: boot a soul + constitution, transduce input, produce governed output
-through the safety gate (forbidden utterances vetoed, every action logged in the
-tamper-evident decision log), then checkpoint and rehydrate in mandatory order.
-Pure substrate, no LLM. (Companion to `examples/kernel_selfcheck.nova`, the
-substrate-kernel spine.)
+Also delivered (runnable artifacts via `make install`):
+- `examples/kernel_selfcheck.nova` -> `bin/crossengin-selfcheck` — the substrate
+  kernel spine.
+- `examples/companion_spine.nova` -> `bin/crossengin-spine` — the safety + IO +
+  persistence spine.
+- `examples/crossengin_daemon.nova` -> `bin/crossengin` — **the whole agent in
+  one process**: substrate + knowledge + soul + goals + scheduler + IO + safety +
+  audit + persistence, driving one wake -> perceive -> think -> act -> checkpoint
+  cycle. Pure substrate, no LLM. This unified cross-subtree assembly was unblocked
+  by the blocker #10 toolchain fix (below); it prints `crossengin: OK`.
 
-README updated to v0.10.
+README updated to v1.0.
 
 ## Partially completed modules
 
@@ -286,7 +290,8 @@ binary) — this is an integration limitation of the current NOVA backend (block
 ## Tests status
 
 - Total unit suites: 85 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence); **1412 assertions**.
-- Runnable artifacts: 2 — `examples/kernel_selfcheck.nova` (substrate kernel) and `examples/companion_spine.nova` (safety+IO+persistence spine); both build via `make install` and run to a passing self-report.
+- Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
+- Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 85 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -373,11 +378,23 @@ shaped the implementation and must be respected going forward:
    minimal alpha/beta belief and integer cosine vectors in `atom_store.nova`
    (milli-fixed-point, same semantics as `core/belief.nova`), and uses id-indexed
    lists + linear-scan for name lookup. `contains()` does work for string lists.
-10. **Import dedup is by accumulated path string, not canonical path.** A shared
-   module reached via two different relative-path accumulations (e.g.
-   `.../kg/../substrate/node_pool_manager.nova` via the kg subtree and
-   `.../substrate/node_pool_manager.nova` via a substrate sibling) is included
-   *twice* -> duplicate-symbol link errors. NOVA does not normalize `..`.
+10. **[FIXED in the toolchain]** Import dedup *was* by accumulated path string,
+   not canonical path: a shared module reached via two different relative-path
+   accumulations (e.g. `.../kg/../substrate/node_pool_manager.nova` via the kg
+   subtree and `.../substrate/node_pool_manager.nova` via a substrate sibling)
+   was included *twice* -> duplicate-symbol link errors, because NOVA did not
+   normalize `..`. **Fix (this session, in the `amoufaq5/nova` repo on branch
+   `claude/festive-franklin-PP7mW`):** added `normalize_path()` to
+   `src/compiler/compiler.nova` and applied it to the relative-import dedup key
+   (`imp_full`) in `_resolve_import_inner`, so `..`/`.` are collapsed before both
+   the `already_imported` check and the propagated base_dir. Rebuilt the
+   self-hosting compiler (`make bin/nova`), verified self-hosting (stage2 ==
+   stage3) and NOVA's own tests, and confirmed all 85 CrossEngin suites still
+   pass and the previously-colliding cross-subtree combos now link. This is what
+   made the unified `bin/crossengin` daemon possible. The notes below preserve
+   the original constraint for historical context.
+
+   ORIGINAL CONSTRAINT (now resolved):
    **Consequence (Phase 2):** the reader stays within the kg + signal_dispatch
    layer (signal_dispatch is standalone, so it does not drag node_pool); it does
    NOT import the substrate part registry / gate router. Mapping the reader's
@@ -400,60 +417,39 @@ shaped the implementation and must be respected going forward:
    the loop) — every intermediate stays &lt; ~1.3e8. Keep loop-body arithmetic
    small; precompute large constants outside loops.
 
-None of these is a hard blocker (all worked around with correct, non-stub code).
-#1, #6, #9, #10, #11 are the ones most likely to constrain later phases; #1/#6
-have upstream-enhancement entries, #9/#10 want NOVA to make cognitive-core
-modules std-importable and to canonicalize import paths, and #11 wants the
-loop-body multiply codegen fixed.
+None of these is a hard blocker. #10 is now **fixed in the toolchain** (see
+above). The ones most likely to constrain further work are #1/#6 (scale + a
+real sub-second clock) and #9/#11 (durable I/O, loop-body multiply codegen); all
+have upstream-enhancement entries.
 
 ## Recommended next session start point
 
-All 50 ADRs across all 10 phases now have an implemented, tested module. The
-remaining work is **integration**, not new modules: assemble the full agent into
-one unified process, then land the documented runtime seams. Two items.
+All 50 ADRs across all 10 phases have an implemented, tested module, AND they now
+assemble into one unified process (`bin/crossengin`). What remains is depth, not
+breadth — two areas.
 
-### 1. The unified single-process daemon (the last integration step)
+### 1. Unified daemon: DONE; deepen the cognitive wiring
 
-The blocker: NOVA dedups relative imports by their *accumulated path string*, so
-a shared low-level module reached from two subtrees via different relative
-prefixes (e.g. `node_pool_manager` as `"node_pool_manager.nova"` from the
-substrate vs `"../substrate/node_pool_manager.nova"` from kg) is included twice
--> "symbol already defined" (blocker #10). The two shipped spine artifacts each
-stay inside a clean import set; the *unified* daemon spans all subtrees and trips
-this.
+The cross-subtree assembly is shipped (`examples/crossengin_daemon.nova` ->
+`bin/crossengin`), unblocked by the blocker #10 toolchain fix. It runs one wake
+-> perceive -> think -> act -> checkpoint cycle through every layer. Two follow-
+ups make it a richer agent (now mechanically possible since everything links):
 
-**Verified unblock recipe (tested this phase).** The compiler's import resolver
-(`/home/user/NOVA/src/compiler/compiler.nova`, `_resolve_import_inner`) checks
-`nova_packages/<imp_path>` BEFORE the relative path, and dedups it by that
-canonical key regardless of which directory imports it. I confirmed empirically:
-a shared module placed in `nova_packages/shared.nova` and imported as
-`"shared.nova"` from two different directories is included exactly once and
-links. So the unification path is:
-
-- Move (or mirror) the shared low-level modules that multiple subtrees pull —
-  `node_pool_manager`, `signal_dispatch`, `atom_store` and its kg chain — into
-  `nova_packages/`, and change their importers to the bare canonical name
-  (e.g. `import "node_pool_manager.nova"`). Then every subtree resolves them to
-  the one canonical key and the duplicates collapse.
-- Caveats: `nova_packages/` is currently in `.gitignore` (un-ignore it, or add a
-  populated copy the build expects); the per-module unit tests must still build
-  (they will, since the compiler checks `nova_packages/` from the repo-root cwd).
-  Do this as a careful, mechanical migration with `make build`/`make test` green
-  at each step — it touches the import lines of the foundational modules, so it
-  is the one change that can destabilize the 85 passing suites if rushed.
-- Alternative (cleaner, upstream): teach NOVA to canonicalize `..` in import
-  paths so relative dedup is by real path — then no migration is needed. This is
-  the right long-term fix (a NOVA enhancement).
-
-Once unified, the daemon wires the long-deferred hooks: feed
-`predictive_coding_runtime` error and the emotion/`plasticity_modulation`
-modulator into `tick_driver` (currently 0 / neutral); route reader percepts (via
-`input_transducer`) and fired-node signals through `gate_router`; send every
-output/action through `effector_gate` (gated + logged); checkpoint via
-`snapshot_writer` at idle (ADR-0037 hook) and on clean shutdown; rehydrate via
-`snapshot_reader` in mandatory order on boot. This is the v1 acceptance milestone
-(ADR-0050 Step 10): the multi-day companion test across real restarts, plus
-capability tests #6 (long-horizon goals) and #8 (NO-LLM-cognition).
+- **Wire the long-deferred hooks** that are still passed as 0 / neutral: feed
+  `predictive_coding_runtime` error and the emotion/`plasticity_modulation`
+  modulator into the substrate tick (`hs_step`/`tl_tick` currently take a neutral
+  modulator + 0 error); route the transduced percept through the five-stage
+  `reader` and fired-node signals through `gate_router` to the parts; let the
+  reasoning/goal loops form the communicative intent that `output_generation`
+  renders (instead of the demo's fixed intent). Every subtree is importable in
+  one binary now, so these are wiring tasks, not architecture.
+- **Run it as a real loop**: replace the single demo cycle with the
+  `hybrid_scheduler` event/idle loop driving the six agent loops
+  (`coord_active_loops`), checkpointing via `snapshot_writer` at idle (ADR-0037
+  hook) and on clean shutdown, and rehydrating via `snapshot_reader` on boot.
+  This is the path to the ADR-0050 Step 10 v1 acceptance (the multi-day companion
+  test across real restarts, capability tests #6 long-horizon goals and #8
+  NO-LLM-cognition) — which also needs the runtime seams below.
 
 ### 2. Land the runtime seams (NOVA enhancements)
 
@@ -474,9 +470,10 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 make build      NOVA_ROOT=/home/user/NOVA   # compiles all 85 modules -> OK
 make test       NOVA_ROOT=/home/user/NOVA   # 85/85 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
-make install    NOVA_ROOT=/home/user/NOVA   # builds bin/crossengin-selfcheck + bin/crossengin-spine
+make install    NOVA_ROOT=/home/user/NOVA   # builds bin/{crossengin-selfcheck,crossengin-spine,crossengin}
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
 $NOVA_ROOT/nova run examples/companion_spine.nova   # prints "companion spine: OK"
+$NOVA_ROOT/nova run examples/crossengin_daemon.nova # the whole agent; prints "crossengin: OK"
 ```
 
 To build the NOVA toolchain itself (one time): `cd /home/user/NOVA && make`

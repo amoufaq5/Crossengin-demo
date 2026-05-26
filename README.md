@@ -7,21 +7,23 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v0.10 — all 10 phases' modules complete (substrate + reader +
-> knowledge + memory/learning + self-directed learning + cognitive subsystems +
-> agent architecture + safety/audit + IO/effectors + persistence).** Implemented
-> in NOVA and verified against the real self-hosting toolchain: 85 modules
-> compile (`make build`), 85 unit-test suites pass (`make test`, 1412
-> assertions), three benchmarks report metrics (`make benchmark`), and two
-> runnable spine artifacts build and run (`make install`): the substrate kernel
-> self-check and the safety+IO+persistence companion spine. The full **unified**
-> agent process (every subtree in one binary) is the remaining integration step
-> — it is gated on NOVA import-path canonicalization (blocker #10); a verified
-> `nova_packages/` shim recipe is documented in
-> [`NEXT_SESSION.md`](./NEXT_SESSION.md), which also records exactly what works,
-> what does not, and where to continue.
+> **Status: v1.0 — all 10 phases complete and assembled into one unified agent
+> process.** Implemented in NOVA and verified against the real self-hosting
+> toolchain: 85 modules compile (`make build`), 85 unit-test suites pass
+> (`make test`, 1412 assertions), three benchmarks report metrics
+> (`make benchmark`), and three runnable artifacts build and run
+> (`make install`): the substrate kernel self-check, the safety+IO+persistence
+> companion spine, and **`bin/crossengin` — the whole agent in one process**
+> (substrate + knowledge + soul + goals + scheduler + IO + safety + persistence,
+> no LLM). The unified assembly was previously blocked by NOVA's import-path
+> dedup (blocker #10); that is now **fixed in the toolchain** (path
+> canonicalization — see [`NEXT_SESSION.md`](./NEXT_SESSION.md)). What remains is
+> production hardening of the documented runtime seams (fsync-durable
+> persistence, TLS fetch, STT/TTS bridge, a sub-second wall-clock pacer, SIMD) so
+> the daemon can run continuously across real restarts. NEXT_SESSION.md records
+> exactly what works, what does not, and where to continue.
 
-## What works now (v0.10)
+## What works now (v1.0)
 
 The Phase 1 substrate kernel (`src/substrate/`):
 
@@ -193,13 +195,15 @@ The Phase 10 persistence layer (`src/persistence/`):
   ordered rehydration plan. The decision log persists independently and is not
   rolled back by a restore.
 
-Two runnable artifacts demonstrate the ends of the system (`make install`):
-`examples/kernel_selfcheck.nova` boots the substrate kernel; `examples/
-companion_spine.nova` runs the safety + IO + persistence spine end-to-end —
-transduce input → produce governed output through the safety gate (forbidden
-utterances vetoed, every action logged) → checkpoint and rehydrate. Wiring
-*every* subtree into one unified process is the final integration step, gated on
-import-path canonicalization (see [`NEXT_SESSION.md`](./NEXT_SESSION.md)).
+Three runnable artifacts build via `make install`: `examples/kernel_selfcheck.nova`
+boots the substrate kernel; `examples/companion_spine.nova` runs the safety + IO +
+persistence spine; and **`examples/crossengin_daemon.nova` → `bin/crossengin` is
+the whole agent in one process** — boot soul + constitution, substrate parts,
+knowledge graphs, goals, and the scheduler; transduce input; arbitrate a goal;
+generate output purely from substrate word/syntax atoms; emit it through the
+safety gate (forbidden utterances vetoed, every action logged); then checkpoint
+and rehydrate in mandatory order. This unified cross-subtree assembly is what the
+import-path fix unblocked.
 
 > Integration note: each loop is a self-contained unit over the shared
 > blackboard, so the loops compose without tripping NOVA's import-dedup limit
