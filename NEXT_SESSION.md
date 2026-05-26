@@ -266,10 +266,22 @@ Also delivered (runnable artifacts via `make install`):
 - `examples/companion_spine.nova` -> `bin/crossengin-spine` — the safety + IO +
   persistence spine.
 - `examples/crossengin_daemon.nova` -> `bin/crossengin` — **the whole agent in
-  one process**: substrate + knowledge + soul + goals + scheduler + IO + safety +
-  audit + persistence, driving one wake -> perceive -> think -> act -> checkpoint
-  cycle. Pure substrate, no LLM. This unified cross-subtree assembly was unblocked
-  by the blocker #10 toolchain fix (below); it prints `crossengin: OK`.
+  one process**, run as a real multi-cycle affect-modulated loop: substrate +
+  knowledge + soul + goals + scheduler + emotion + IO + safety + audit +
+  persistence. Each cycle appraises the event (ADR-0035), the emotion loop sets
+  mood, and that mood becomes the substrate tick's plasticity MODULATOR while a
+  predictive-coding residual (ADR-0024) becomes the tick's ERROR -- closing the
+  affect feedback the spine demos left at neutral/0. Forbidden actions are vetoed
+  + logged; idle cycles checkpoint; the last image rehydrates in mandatory order.
+  Pure substrate, no LLM. Unblocked by the blocker #10 toolchain fix (below);
+  prints `crossengin: OK`.
+
+  Composing every subsystem also surfaced the one genuine cross-module name
+  collision in the codebase (blocker #7): `E_TAG` was defined in both
+  `audit/decision_log.nova` (unused there) and `parts/episodic/episode_storage.nova`.
+  Fixed by removing the dead constant from `decision_log` (offset 0 is documented
+  as the `LOG_ENTRY` tag). A full-codebase scan confirms no other duplicate
+  top-level symbol remains.
 
 README updated to v1.0.
 
@@ -428,28 +440,30 @@ All 50 ADRs across all 10 phases have an implemented, tested module, AND they no
 assemble into one unified process (`bin/crossengin`). What remains is depth, not
 breadth — two areas.
 
-### 1. Unified daemon: DONE; deepen the cognitive wiring
+### 1. Unified daemon: shipped + looping; deepen the remaining cognitive wiring
 
 The cross-subtree assembly is shipped (`examples/crossengin_daemon.nova` ->
-`bin/crossengin`), unblocked by the blocker #10 toolchain fix. It runs one wake
--> perceive -> think -> act -> checkpoint cycle through every layer. Two follow-
-ups make it a richer agent (now mechanically possible since everything links):
+`bin/crossengin`) and now runs as a real multi-cycle loop with **affect-modulated
+learning wired in**: the emotion loop's conditioned mood drives the substrate
+tick's plasticity modulator and a predictive-coding residual drives its error
+(no longer neutral/0), with drive-based goal arbitration, governed output, and
+idle checkpointing each cycle. Done this session. What remains to make it the
+full ADR-0036 six-loop agent (now mechanically possible since everything links):
 
-- **Wire the long-deferred hooks** that are still passed as 0 / neutral: feed
-  `predictive_coding_runtime` error and the emotion/`plasticity_modulation`
-  modulator into the substrate tick (`hs_step`/`tl_tick` currently take a neutral
-  modulator + 0 error); route the transduced percept through the five-stage
-  `reader` and fired-node signals through `gate_router` to the parts; let the
-  reasoning/goal loops form the communicative intent that `output_generation`
-  renders (instead of the demo's fixed intent). Every subtree is importable in
-  one binary now, so these are wiring tasks, not architecture.
-- **Run it as a real loop**: replace the single demo cycle with the
-  `hybrid_scheduler` event/idle loop driving the six agent loops
-  (`coord_active_loops`), checkpointing via `snapshot_writer` at idle (ADR-0037
-  hook) and on clean shutdown, and rehydrating via `snapshot_reader` on boot.
-  This is the path to the ADR-0050 Step 10 v1 acceptance (the multi-day companion
-  test across real restarts, capability tests #6 long-horizon goals and #8
-  NO-LLM-cognition) — which also needs the runtime seams below.
+- **Wire the remaining loops**: route the transduced percept through the
+  five-stage `reader` (`loop_perception`) and fired-node signals through
+  `gate_router` to the parts; run `loop_memory` (moment capture + episodic),
+  `loop_reasoning` (forward-chaining over a seeded reasoning KG), and
+  `loop_imagination_idle`; let the reasoning/goal loops form the communicative
+  intent that `output_generation` renders (instead of the demo's fixed `ack`
+  intent). These need their KGs seeded with vocabulary / operators to be
+  non-trivial; the wiring itself is now unblocked.
+- **Run continuously**: drive the loop from the `hybrid_scheduler` event/idle
+  cycle over `coord_active_loops`, checkpoint on clean shutdown as well as idle,
+  and rehydrate via `snapshot_reader` on boot. This is the path to the ADR-0050
+  Step 10 v1 acceptance (multi-day companion test across real restarts,
+  capability tests #6 long-horizon goals and #8 NO-LLM-cognition) — which also
+  needs the runtime seams below.
 
 ### 2. Land the runtime seams (NOVA enhancements)
 
