@@ -206,11 +206,13 @@ shared concept KG, so a word read in perception seeds reasoning and imagination.
 Affect emerges from the agent's own comprehension and becomes the tick's
 plasticity modulator (with a predictive-coding residual as its error); a run of
 empty ticks throttles the scheduler 100Hz→10Hz idle, gating imagination and
-triggering a checkpoint. Output now *emerges from the substrate's reasoning*: a
-reverse concept→word lookup finds the naming word for a new conclusion and
-speaks it through the gated effector, so the agent says what it concluded ("see
-treat" after reading "fever"), not a hard-coded literal — no LLM picks the
-wording. Forbidden actions are vetoed and logged; on shutdown the agent reboots
+triggering a checkpoint. Output emerges from the substrate's reasoning: a reverse concept→word lookup
+finds the naming word for a new conclusion and speaks it through the gated
+effector ("see treat" after reading "fever"), no LLM picking the wording. The
+agent also *grows its knowledge graphs at runtime*: unknown surface forms fire
+self-learning triggers; at idle the arbiter drains them and `ask_user_to_teach`
+ingests new word atoms + concept bindings (Beta(4,1) Tier-A prior) — a
+follow-up event with the freshly-taught vocabulary is then comprehended. Forbidden actions are vetoed and logged; on shutdown the agent reboots
 by rehydrating in mandatory order. This unified cross-subtree assembly is what
 the import-path fix unblocked.
 

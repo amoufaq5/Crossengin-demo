@@ -290,7 +290,13 @@ Also delivered (runnable artifacts via `make install`):
   through `gate_router` -- SENSORY on percept, CURIOSITY on unknown tokens, GOAL
   on successful action -- and the destination parts receive `part_inject`, so
   the substrate parts actually wake to stimuli rather than ticking idle
-  (ADR-0009 wiring closed).
+  (ADR-0009 wiring closed). The agent GROWS ITS KGs AT RUNTIME: each unknown
+  surface form submits an SLT_UNKNOWN_QUERY trigger (ADR-0026); at idle the
+  arbiter drains the queue and `au_ingest` (ADR-0027, Beta(4,1) user-taught
+  prior) creates a new word atom + concept binding. A verification event posted
+  with one of the freshly-taught words is then fully comprehended (matched=2 on
+  "the keys" after teaching), closing the perceive -> learn -> perceive cycle
+  end-to-end in one run.
 
   Composing every subsystem also surfaced the one genuine cross-module name
   collision in the codebase (blocker #7): `E_TAG` was defined in both
@@ -469,16 +475,14 @@ from the agent's own comprehension and a boot(cold)/shutdown(checkpoint)/reboot
   when quiescent (so the artifact terminates). A production daemon blocks on a
   real event source (stdin/socket/IPC) and loops until a shutdown signal,
   checkpointing periodically. That source is a runtime/syscall seam (below).
-- **Deepen grounding**: the daemon now forms its output intent from cognition
-  via `gen_word_for_concept` (reverse concept -> word lookup, ADR-0013) so it
-  speaks what it concluded ("see treat") rather than a fixed `ack`; and it
-  routes events through the gate (`gate_route` + `part_inject`) so the substrate
-  parts actually receive SENSORY/CURIOSITY/GOAL signals (ADR-0009) instead of
-  ticking with no stimulus. What remains: grow the KGs through the learning
-  loops (ADR-0026..0030, all implemented as modules) instead of the demo's tiny
-  seeded vocabulary — wire `self_learning_triggers` from the CURIOSITY signal
-  the daemon already emits on unknown tokens, drain the queue at idle, and
-  ingest answers via `ask_user_to_teach`.
+- **Cognitive wiring done.** All the deferred hooks I listed are now in
+  `bin/crossengin`: output from reasoning via `gen_word_for_concept`, gate
+  routing of percept/curiosity/goal signals into the substrate parts, and the
+  full learning loop (`self_learning_triggers` -> `ask_user_to_teach`) growing
+  the KGs at runtime so previously-unknown words are comprehended on the next
+  encounter. The seed KG is still tiny, but the loop that GROWS it from input
+  is wired and observed; in a long-running daemon it would just keep going.
+  The remaining items below are I/O and performance, not cognition.
 - This is the path to the ADR-0050 Step 10 v1 acceptance (multi-day companion
   test across real restarts, capability tests #6 long-horizon goals and #8
   NO-LLM-cognition) — which also needs the runtime seams below.
