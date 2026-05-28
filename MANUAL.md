@@ -17,6 +17,12 @@ third-party dependencies. Linux x86-64 host with:
 
 That's it. No npm, no Python, no Cargo, no JVM.
 
+**On Windows or macOS?** The NOVA toolchain emits Linux ELF binaries and uses
+Linux x86-64 syscalls in its runtime, so you run the same Linux build inside a
+thin wrapper. See [`docs/runbook/windows.md`](./docs/runbook/windows.md) for the
+step-by-step WSL2 (recommended) or Docker Desktop setup on Windows. macOS works
+the same way under Docker, or via Linux x86-64 emulation under Apple Silicon.
+
 ## 2. Get and build the NOVA toolchain
 
 CrossEngin expects a NOVA checkout next to it (`$HOME/NOVA` by default):
