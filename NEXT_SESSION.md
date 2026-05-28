@@ -286,7 +286,11 @@ Also delivered (runnable artifacts via `make install`):
   agent derives infection -> treat via the causal/imply operators and says "see
   treat"; on the "exfiltrate" message the constitutional gate vetoes; then
   idle@10Hz -> imagination 3 states + checkpoint. Prints `crossengin: OK`.
-  Unblocked by the blocker #10 toolchain fix (below).
+  Unblocked by the blocker #10 toolchain fix (below). Events are also routed
+  through `gate_router` -- SENSORY on percept, CURIOSITY on unknown tokens, GOAL
+  on successful action -- and the destination parts receive `part_inject`, so
+  the substrate parts actually wake to stimuli rather than ticking idle
+  (ADR-0009 wiring closed).
 
   Composing every subsystem also surfaced the one genuine cross-module name
   collision in the codebase (blocker #7): `E_TAG` was defined in both
@@ -466,12 +470,15 @@ from the agent's own comprehension and a boot(cold)/shutdown(checkpoint)/reboot
   real event source (stdin/socket/IPC) and loops until a shutdown signal,
   checkpointing periodically. That source is a runtime/syscall seam (below).
 - **Deepen grounding**: the daemon now forms its output intent from cognition
-  via `gen_word_for_concept` (reverse concept -> word lookup, ADR-0013, added
-  this session with 4 new unit tests), so it speaks what it concluded ("see
-  treat") rather than a fixed `ack`. What remains: grow the KGs through the
-  learning loops (ADR-0026..0030, all implemented) instead of the demo's tiny
-  seeded vocabulary, and route fired-node signals through `gate_router` to the
-  parts so substrate dynamics, not only the symbolic loops, drive activation.
+  via `gen_word_for_concept` (reverse concept -> word lookup, ADR-0013) so it
+  speaks what it concluded ("see treat") rather than a fixed `ack`; and it
+  routes events through the gate (`gate_route` + `part_inject`) so the substrate
+  parts actually receive SENSORY/CURIOSITY/GOAL signals (ADR-0009) instead of
+  ticking with no stimulus. What remains: grow the KGs through the learning
+  loops (ADR-0026..0030, all implemented as modules) instead of the demo's tiny
+  seeded vocabulary — wire `self_learning_triggers` from the CURIOSITY signal
+  the daemon already emits on unknown tokens, drain the queue at idle, and
+  ingest answers via `ask_user_to_teach`.
 - This is the path to the ADR-0050 Step 10 v1 acceptance (multi-day companion
   test across real restarts, capability tests #6 long-horizon goals and #8
   NO-LLM-cognition) — which also needs the runtime seams below.
