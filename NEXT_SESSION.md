@@ -278,11 +278,15 @@ Also delivered (runnable artifacts via `make install`):
   lingering active set) and triggers a checkpoint; on shutdown the agent reboots
   by rehydrating in mandatory order (soul -> KGs). The reader, reasoning
   operators, and imagination patterns share ONE concept KG, so a read word is a
-  valid reasoning seed and imagination state -- a coherent pipeline. Pure
-  substrate, no LLM. Observed run: 3 messages processed at 100Hz (mood rises with
-  comprehension 656 -> 723; the "exfiltrate" message vetoed), reasoning derives 2
-  conclusions, then idle@10Hz -> imagination 3 states + checkpoint. Prints
-  `crossengin: OK`. Unblocked by the blocker #10 toolchain fix (below).
+  valid reasoning seed and imagination state -- a coherent pipeline. Output now
+  emerges from the substrate's reasoning: after the loops produce conclusions, a
+  reverse concept->word lookup (`gen_word_for_concept`) finds the naming word and
+  speaks it through the gated effector -- the agent SAYS WHAT IT CONCLUDED, not a
+  hard-coded literal, no LLM picking the wording. Observed run: on "fever" the
+  agent derives infection -> treat via the causal/imply operators and says "see
+  treat"; on the "exfiltrate" message the constitutional gate vetoes; then
+  idle@10Hz -> imagination 3 states + checkpoint. Prints `crossengin: OK`.
+  Unblocked by the blocker #10 toolchain fix (below).
 
   Composing every subsystem also surfaced the one genuine cross-module name
   collision in the codebase (blocker #7): `E_TAG` was defined in both
@@ -309,7 +313,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 85 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence); **1412 assertions**.
+- Total unit suites: 85 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence); **1416 assertions**.
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 85 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
@@ -461,13 +465,13 @@ from the agent's own comprehension and a boot(cold)/shutdown(checkpoint)/reboot
   when quiescent (so the artifact terminates). A production daemon blocks on a
   real event source (stdin/socket/IPC) and loops until a shutdown signal,
   checkpointing periodically. That source is a runtime/syscall seam (below).
-- **Deepen grounding**: the demo seeds a tiny concept KG (fever/infection/treat)
-  and emits a fixed `ack` intent; a real agent grows the KGs through the learning
-  loops (ADR-0026..0030, all implemented) and forms the communicative intent from
-  the reasoning conclusions / active goal (a reverse concept->word lookup for
-  generation, the one piece of new glue still to write). Route fired-node signals
-  through `gate_router` to the parts so substrate dynamics, not only the symbolic
-  loops, drive activation.
+- **Deepen grounding**: the daemon now forms its output intent from cognition
+  via `gen_word_for_concept` (reverse concept -> word lookup, ADR-0013, added
+  this session with 4 new unit tests), so it speaks what it concluded ("see
+  treat") rather than a fixed `ack`. What remains: grow the KGs through the
+  learning loops (ADR-0026..0030, all implemented) instead of the demo's tiny
+  seeded vocabulary, and route fired-node signals through `gate_router` to the
+  parts so substrate dynamics, not only the symbolic loops, drive activation.
 - This is the path to the ADR-0050 Step 10 v1 acceptance (multi-day companion
   test across real restarts, capability tests #6 long-horizon goals and #8
   NO-LLM-cognition) — which also needs the runtime seams below.
