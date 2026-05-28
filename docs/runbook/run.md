@@ -1,57 +1,94 @@
 # Run
 
-## v0.1: the substrate self-check
+Three runnable artifacts ship via `make install` into `./bin/`. The end-to-end
+walkthrough lives in the top-level [`MANUAL.md`](../../MANUAL.md); this page is
+the per-artifact reference.
 
-There is **no end-user cognitive agent yet** (see NEXT_SESSION.md). The runnable
-artifact at this stage is the substrate self-check, which boots the implemented
-kernel, wires a small slice of it, drives it for several ticks, and prints a
-liveness report.
+## bin/crossengin — the unified daemon (the whole agent)
 
-```sh
-bash scripts/run.sh               # or: NOVA_ROOT=/path/to/NOVA bash scripts/run.sh
-```
-
-Equivalently, build and run the binary:
+The full ADR-0036 six-loop agent in one process, driven by the ADR-0037
+event/idle hybrid scheduler. Pure substrate, NO LLM.
 
 ```sh
 make install
-./bin/crossengin-selfcheck
+./bin/crossengin
+# or, without installing:
+$NOVA_ROOT/nova run examples/crossengin_daemon.nova
 ```
 
-Expected output (abridged):
+What it does, per cycle:
+- **perception** — the five-stage reader anchors the input to concept atoms.
+- **memory** — the moment is captured + recorded episodically.
+- **reasoning** — forward-chaining from the percept yields conclusions.
+- **emotion** — appraisal of the agent's *own comprehension* → conditioned mood.
+- **goals** — drives regenerate; the active goal is arbitrated.
+- **action** — output is generated *from a reasoning conclusion* via a reverse
+  concept→word lookup, then gated (constitutional veto blocks forbidden text)
+  and logged to the tamper-evident decision log.
+
+Conditioned mood drives the substrate tick's plasticity modulator; a
+predictive-coding residual drives its error. A run of empty ticks throttles the
+scheduler 100Hz → 10Hz idle, which gates imagination and triggers a
+checkpoint. At idle the self-learning arbiter drains its trigger queue and
+`ask_user_to_teach` ingests new word↔concept bindings — the agent grows its KGs
+at runtime. On shutdown the agent reboots by rehydrating in mandatory order
+(soul → KGs).
+
+Exit code: `0` on `crossengin: OK`, non-zero with `FAILURE(S)` otherwise.
+
+## bin/crossengin-selfcheck — the substrate kernel spine
+
+Boots the Phase 1 kernel (parts, node pools, signals, gates, tick) and asserts
+liveness. Useful for verifying the substrate itself.
+
+```sh
+./bin/crossengin-selfcheck                # or: bash scripts/run.sh
+```
+
+Tail of expected output:
 
 ```
-=== CrossEngin substrate self-check (v0.1) ===
-parts spawned        : 8 (8 active)
-  dynamic KG: kg-medicine
-perception nodes     : 9   synapses: 3
-SENSORY routes to    : 1 part(s); perception in set = 1
-CONST broadcasts to  : 8 part(s) (all)
-ticks run            : 8
-total node fires     : 23
-first node 0 fired   : tick 1
-interior fired       : tick 2  (propagation across ticks)
-resonant pair {1,2}  : strength 600
 substrate self-check: OK
 ```
 
-The self-check exits 0 on success and non-zero (printing `SELFCHECK FAILED`) if
-any substrate invariant did not hold.
+Exits 0 on success; non-zero with `SELFCHECK FAILED: <invariant>` if any
+substrate invariant did not hold.
 
-## What it exercises
-
-- `part_registry` / `part_lifecycle` — the seven fixed parts plus a spawned
-  `kg-medicine` domain part.
-- `node_pool_manager` / `first_nodes` — node pools and the stable first-node
-  block per part.
-- `synapse_graph` / `resonance_engine` — a feedforward chain and a resonant
-  pair.
+What it exercises:
+- `part_registry` / `part_lifecycle` — seven fixed parts + a spawned KG part.
+- `node_pool_manager` / `first_nodes` — node pools and stable first-node blocks.
+- `synapse_graph` / `resonance_engine` — a feedforward chain and a resonant pair.
 - `signal_dispatch` / `gate_router` — typed signals, learned routing, and the
   privileged constitutional broadcast.
 - `tick_driver` — the four-phase substrate tick (snapshot, integrate,
-  propagate, learn) and cross-tick signal propagation.
+  propagate, learn).
 
-## Not yet runnable
+## bin/crossengin-spine — the safety + IO + persistence spine
 
-The conversational daemon, CLI/socket interface, persistence, reader, KGs, and
-learning fabric are not implemented yet. See NEXT_SESSION.md for the roadmap.
+The Phase 8/9/10 spine without the substrate or cognition layers: soul +
+constitution, input transduction, governed output through the safety gate
+(forbidden utterances vetoed and logged), checkpoint and rehydrate. Useful for
+exercising the safety chain alone.
+
+```sh
+./bin/crossengin-spine
+# ... per-step OK / FAIL lines ...
+# companion spine: OK
+```
+
+## A word on the seed
+
+`bin/crossengin` boots with the seed in
+[`src/seed/first_atoms.nova`](../../src/seed/first_atoms.nova) — the foundational
+self-knowledge (self, user, query, response, help, ok) plus a tiny medical
+demo chain (fever → infection ⇒ treat) and the two output syntax patterns.
+Everything else is learned at runtime from input. To change the seed, edit
+`first_atoms.nova` (and the matching `tests/unit/test_first_atoms.nova`); the
+daemon picks it up automatically.
+
+## Where things go on disk
+
+CrossEngin's *runtime* state is in-memory only; production durability
+(`*.cesnap` substrate snapshots and `*.celog` decision logs) is the documented
+NOVA enhancement #9/#10 seam. Built binaries live under `bin/`; build artifacts
+are under `/tmp/` per `nova build` invocation.

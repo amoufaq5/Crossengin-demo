@@ -9,8 +9,8 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 85 modules compile (`make build`), 85 unit-test suites pass
-> (`make test`, 1416 assertions), three benchmarks report metrics
+> toolchain: 86 modules compile (`make build`), 86 unit-test suites pass
+> (`make test`, 1434 assertions), three benchmarks report metrics
 > (`make benchmark`), and three runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
 > companion spine, and **`bin/crossengin` — the whole agent in one process**
@@ -279,20 +279,26 @@ GNU `as`, `ld`, `make`, and `gcc`.
 # one-time: verify host tools, locate/build the NOVA compiler
 bash scripts/bootstrap.sh
 
-# compile every implemented substrate module
+# compile every module under src/
 make build
 
-# compile and run the unit tests
+# compile and run every unit test
 make test
 
-# run the substrate self-check (no full agent yet)
-bash scripts/run.sh
+# build all three runnable artifacts into ./bin/
+make install
+./bin/crossengin                # the whole agent in one process
+./bin/crossengin-selfcheck      # substrate kernel spine
+./bin/crossengin-spine          # safety + IO + persistence spine
 ```
 
 Point the build at a NOVA checkout elsewhere with `make NOVA_ROOT=/path/to/NOVA build`.
 
-See [`docs/runbook/build.md`](./docs/runbook/build.md) and
-[`docs/runbook/test.md`](./docs/runbook/test.md) for details, and
+**For a complete walkthrough — prerequisites, three artifacts with expected
+output, writing a new test, and troubleshooting — see [`MANUAL.md`](./MANUAL.md).**
+Per-topic references: [`docs/runbook/build.md`](./docs/runbook/build.md),
+[`docs/runbook/test.md`](./docs/runbook/test.md),
+[`docs/runbook/run.md`](./docs/runbook/run.md), and
 [`docs/design/overview.md`](./docs/design/overview.md) for the architecture.
 
 ## NOVA dependency and version note

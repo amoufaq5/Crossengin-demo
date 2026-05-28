@@ -18,6 +18,14 @@ continue. It is updated at every session boundary.
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
 
+Top-level [`MANUAL.md`](./MANUAL.md) walks through running and testing locally
+end-to-end (build, all three artifacts, the test suite, writing a new test).
+The daemon boots from [`src/seed/first_atoms.nova`](./src/seed/first_atoms.nova),
+which installs the foundational concepts the agent knows about itself (self,
+user, query, response, help, ok), the operators that connect them, the two
+output syntax patterns, and a tiny medical demo chain (fever -> infection =>
+treat). Everything else is learned at runtime via the learning loops.
+
 ## Completed modules — Phase 1 (substrate kernel)
 
 All under `src/substrate/`. Each compiles with `nova build` and has a matching
@@ -323,7 +331,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 85 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence); **1416 assertions**.
+- Total unit suites: 86 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence + 1 seed); **1434 assertions**.
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 85 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
