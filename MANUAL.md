@@ -181,12 +181,22 @@ $NOVA_ROOT/nova run examples/crossengin_daemon.nova
 
 ### Chat with it interactively
 
-`scripts/chat.sh` is a tiny bash REPL around the daemon: you type a line, it
-writes it to `/tmp/crossengin_input`, runs `bin/crossengin` once, and prints
-the agent's reply.
+Two ways to talk to the agent:
+
+**A. `bin/crossengin-chat` — a real REPL with persistent state across turns.**
+The agent boots once and stays alive; what it learns from one message carries
+to the next.
 
 ```sh
 make install
+./bin/crossengin-chat
+```
+
+**B. `scripts/chat.sh` — a bash shim** that runs `bin/crossengin` once per
+message via a file. Each turn is a fresh boot (state doesn't persist), but it
+needs nothing beyond the bash you already have.
+
+```sh
 ./scripts/chat.sh
 ```
 

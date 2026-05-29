@@ -23,6 +23,7 @@ BENCHMARKS  := $(shell find tests/benchmark -name '*.nova' 2>/dev/null | sort)
 SELFCHECK   := examples/kernel_selfcheck.nova
 SPINE       := examples/companion_spine.nova
 DAEMON      := examples/crossengin_daemon.nova
+CHAT        := examples/crossengin_chat.nova
 
 .PHONY: all build test benchmark install clean check-nova help
 
@@ -82,6 +83,14 @@ install: build
 	  printf '  build %s ... ' "$(DAEMON)"; \
 	  if "$(NOVA)" build "$(DAEMON)" -o "$(BIN)/crossengin" >/tmp/ce_install.log 2>&1; then \
 	    echo "OK -> $(BIN)/crossengin"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
+	@if [ -f "$(CHAT)" ]; then \
+	  printf '  build %s ... ' "$(CHAT)"; \
+	  if "$(NOVA)" build "$(CHAT)" -o "$(BIN)/crossengin-chat" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-chat"; \
 	  else \
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \

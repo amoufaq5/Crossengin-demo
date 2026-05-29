@@ -1,0 +1,294 @@
+// CrossEngin interactive chat.
+//
+// Purpose
+//   The unified daemon's per-message logic, but driven from an stdin REPL
+//   instead of a fixed scripted episode. Boot once, then loop: read a line,
+//   post it as an EV_MESSAGE event, drain the scheduler to consume it, print
+//   the agent's reply. Because the agent stays alive across turns, learned
+//   vocabulary and decision-log entries PERSIST -- a follow-up message can use
+//   words taught earlier in the same conversation.
+//
+//   This is what the chat experience should be, and it's possible because the
+//   NOVA std/io fix (str_new + NUL-terminated string format) made io_input()
+//   return whole lines reliably. Before that fix, the bash-shim chat.sh was
+//   the only way to talk to the agent and each turn was a fresh boot.
+//
+//   Run with:  $NOVA_ROOT/nova run examples/crossengin_chat.nova
+//   Quit:      type "quit" / "exit" / Ctrl-D / an empty line at the prompt.
+//
+// ADRs exercised: same as examples/crossengin_daemon.nova -- this differs only
+//   in driving the loop from real stdin.
+
+import "std/syscall"
+import "std/string"
+import "std/io"
+
+import "../src/substrate/gate_router.nova"
+import "../src/substrate/part_lifecycle.nova"
+import "../src/scheduler/hybrid_scheduler.nova"
+import "../src/agent/loop_perception.nova"
+import "../src/agent/loop_memory.nova"
+import "../src/agent/loop_reasoning.nova"
+import "../src/agent/loop_emotion.nova"
+import "../src/agent/loop_goals.nova"
+import "../src/agent/loop_imagination_idle.nova"
+import "../src/parts/emotion/plasticity_mod.nova"
+import "../src/learning/predictive_coding_runtime.nova"
+import "../src/learning/self_learning_triggers.nova"
+import "../src/learning/ask_user_to_teach.nova"
+import "../src/io/transducers/input_transducer.nova"
+import "../src/io/effectors/output_generation.nova"
+import "../src/io/effectors/effector_gate.nova"
+import "../src/seed/first_atoms.nova"
+
+let CE_CAP   = 128
+let CE_FIRST = 8
+
+// ---- buffered line reader ------------------------------------------------
+// io_input() returns whatever sys_read drained -- on a terminal in line mode
+// that's one line, but on a pipe (or after a paste) it can be several lines
+// in one call. Buffer reads so the REPL always processes ONE line per turn.
+let _buf = ""
+
+fn _take_line() {
+    let i = 0
+    while i < len(_buf) {
+        if char_at(_buf, i) == 10 {
+            let line = substr(_buf, 0, i)
+            _buf = substr(_buf, i + 1, len(_buf) - i - 1)
+            return line
+        }
+        i = i + 1
+    }
+    let chunk = io_input()
+    if len(chunk) == 0 {
+        let line = _buf
+        _buf = ""
+        return line
+    }
+    _buf = _buf + chunk + "\n"
+    return _take_line()
+}
+
+fn _intent1(role, lemma) {
+    let it = list_new()
+    let a = list_new() push(a, role) push(a, lemma)
+    push(it, a)
+    return it
+}
+
+// Build a gated signal and inject its strength into every routed destination
+// part (ADR-0009 path from event to substrate stimulus).
+fn _route_and_inject(reg, gate, stype, strength, moment) {
+    let s = sig_new(stype, 0 - 1, 0 - 1, strength, moment, 0)
+    let dests = gate_route(gate, s)
+    let i = 0
+    while i < len(dests) {
+        part_inject(reg, dests[i], strength)
+        i = i + 1
+    }
+    return dests
+}
+
+// Submit one trigger per unknown surface form (ADR-0026).
+fn _submit_curiosity(arb, lang, input_text) {
+    let toks = split(input_text, " ")
+    let ti = 0
+    while ti < len(toks) {
+        let tok = str_trim(toks[ti])
+        if len(tok) > 0 {
+            if word_find(lang, tok) == 0 {
+                slt_submit(arb, trigger_new(SLT_UNKNOWN_QUERY, tok, 800, 500))
+            }
+        }
+        ti = ti + 1
+    }
+    return 1
+}
+
+// Drain the trigger arbiter, ingesting up to 4 unknowns into the KGs at idle.
+// Returns how many were taught this cycle.
+fn _drain_and_teach(arb, kg, lang, now) {
+    let go = 1
+    let taught = 0
+    while go == 1 {
+        if slt_queue_size(arb) == 0 { go = 0 }
+        if go == 1 {
+            if taught >= 4 { go = 0 }
+        }
+        if go == 1 {
+            let trig = slt_arbiter_step(arb)
+            if trig != 0 {
+                let target = slt_target(trig)
+                au_ingest(lang, kg, target, "u:" + target, now)
+                taught = taught + 1
+            }
+            slt_clear_active(arb)
+        }
+    }
+    return taught
+}
+
+fn main() {
+    io_println("=== CrossEngin chat ===")
+    io_println("state persists across turns; type 'quit' / 'exit' / empty / Ctrl-D to leave")
+    io_println("")
+
+    // Boot: soul, substrate, ONE shared concept KG (seed installs core +
+    // medical demo), scheduler, learning arbiter.
+    let sl = soul_new("Aurora")
+    soul_set_identity(sl, "understand and assist", "curious")
+    soul_set_ocean(sl, 700, 600, 500, 800, 300)
+    soul_add_constitution(sl, "exfiltrate", CONST_BLOCK)
+    let reg = part_registry_new()
+    registry_spawn_fixed(reg, CE_CAP, CE_FIRST)
+    pl_spawn_kg(reg, "world", CE_CAP, CE_FIRST)
+    let kgreg = kg_registry_new()
+    let kg = reasoning_kg_init(kgreg)
+    let lang = lang_kg_init(kgreg)
+    let ikg = imagination_kg_init(kgreg)
+    seed_apply(kg, lang, ikg, 0)
+    let world_kg_id = atom_kg(kg_find_atom(kg, "fever"))
+    let reader = reader_new(kgreg, lang, 0)
+    let stream = ms_new()
+    let em = em_new()
+    let cands = list_new()
+    push(cands, syntax_find(lang, "ack"))
+    push(cands, syntax_find(lang, "see_topic"))
+    let engine = goal_engine_new()
+    goal_new(engine, "assist the user", 800, 0, 0, 0)
+    let log = dl_new()
+    let ctx = ctx_new()
+    let hs = hs_new(reg)
+    let gate = gate_new(reg)
+    gate_seed_from_parts(gate, reg)
+    let arb = slt_arbiter_new()
+    let modulator = 1000
+    let error = 0
+    let predicted = 300
+    let turn = 0
+
+    io_println("(seed: " + int_to_str(kg_atom_count(kg)) + " atoms, "
+        + soul_name(sl) + " ready)")
+    io_println("")
+
+    while 1 == 1 {
+        io_print("> ")
+        let msg = _take_line()
+        if len(msg) == 0 {
+            io_println("bye.")
+            return 0
+        }
+        if str_eq(msg, "quit") == 1 {
+            io_println("bye.")
+            return 0
+        }
+        if str_eq(msg, "exit") == 1 {
+            io_println("bye.")
+            return 0
+        }
+
+        hs_post_event(hs, EV_MESSAGE, msg)
+        let reply = ""
+
+        // Drain: each hs_step pops <=1 event and ticks once. Stop when the
+        // event has been processed (idle counter starts climbing).
+        let drained = 0
+        let drain_steps = 0
+        while drained == 0 {
+            let ev = hs_step(hs, modulator, error)
+            drain_steps = drain_steps + 1
+            if ev != 0 {
+                let raw = event_payload(ev)
+                let p = transduce(IN_TEXT, raw)
+                ctx_set_input(ctx, percept_text(p))
+                ctx_set_idle(ctx, 0)
+                ctx_set_tick(ctx, hs_now(hs))
+                let matched = loop_perception_step(ctx, reader)
+                loop_memory_step(ctx, stream, em)
+                let nconcl = loop_reasoning_step(ctx, kg)
+
+                _route_and_inject(reg, gate, XSIG_SENSORY, 700, hs_now(hs))
+                let unk = ctx_unknown(ctx)
+                if unk > 0 {
+                    _route_and_inject(reg, gate, XSIG_CURIOSITY, 600, hs_now(hs))
+                    _submit_curiosity(arb, lang, ctx_input(ctx))
+                }
+
+                // Affect from comprehension -> mood -> tick modulation.
+                let des = matched * 300 - unk * 150
+                loop_emotion_step(ctx, sl, des, 0, matched * 100)
+                let val = ctx_valence(ctx)
+                let aro = ctx_arousal(ctx)
+                modulator = emotion_modulate_plasticity(val, aro, val)
+                error = pc_residual(aro, predicted)
+                predicted = aro
+
+                let gap = 200
+                if unk > 0 { gap = 700 }
+                loop_goals_step(ctx, engine, gap, turn, 0, 300)
+
+                if str_find(ctx_input(ctx), "exfiltrate") >= 0 {
+                    effector_speak_governed(log, sl, ctx_input(ctx), 0, 0 - 1, list_new(), 0, hs_now(hs))
+                    reply = "[refused]"
+                } else {
+                    // Output emerges from cognition: pick the first NEW
+                    // conclusion, reverse-look up its naming word, speak it.
+                    let percept = ctx_percept(ctx)
+                    let concs = ctx_conclusions(ctx)
+                    let intent = _intent1("ACK", "okay")
+                    let derived = ""
+                    let ck = 0
+                    while ck < len(concs) {
+                        if len(derived) == 0 {
+                            let cid = concs[ck]
+                            let in_p = 0
+                            let pi = 0
+                            while pi < len(percept) {
+                                if percept[pi][1] == cid { in_p = 1 }
+                                pi = pi + 1
+                            }
+                            if in_p == 0 {
+                                let w = gen_word_for_concept(lang, world_kg_id, cid)
+                                if w != 0 { derived = word_form(w) }
+                            }
+                        }
+                        ck = ck + 1
+                    }
+                    if len(derived) > 0 {
+                        let it = list_new()
+                        let a = list_new() push(a, "SEE") push(a, "see")
+                        let b = list_new() push(b, "TOPIC") push(b, derived)
+                        push(it, a) push(it, b)
+                        intent = it
+                    }
+                    let resp = gen_from_intent(lang, cands, intent, hs_now(hs))
+                    let said = effector_speak_governed(log, sl, resp, 0, 0 - 1, list_new(), 0, hs_now(hs))
+                    ctx_set_output(ctx, said)
+                    _route_and_inject(reg, gate, XSIG_GOAL, 800, hs_now(hs))
+                    reply = said
+                    if len(reply) == 0 { reply = "[silent]" }
+                }
+                drained = 1
+            } else {
+                // Empty step; if we've burned many empty ticks without the
+                // event being drained, bail out (defensive).
+                if drain_steps > 10 { drained = 1 }
+            }
+        }
+
+        // Idle-style: if curiosity triggers were submitted, drain + teach now
+        // so the agent grows its KGs mid-conversation.
+        let taught = _drain_and_teach(arb, kg, lang, hs_now(hs))
+
+        if len(reply) == 0 { reply = "[no response]" }
+        io_println("agent> " + reply)
+        if taught > 0 {
+            io_println("       (learned " + int_to_str(taught) + " new word(s) -- "
+                + int_to_str(kg_atom_count(kg)) + " atoms total)")
+        }
+        turn = turn + 1
+    }
+    return 0
+}
+main()
