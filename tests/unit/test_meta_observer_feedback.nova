@@ -1,0 +1,270 @@
+// Unit tests for the P1.1 meta-observer -> source_authority feedback loop
+// added to src/parts/meta/meta_observer.nova. Verifies:
+//   * the synthetic-host mapping for source tags (src:topic:fever ->
+//     learned:topic:fever; bare tags -> learned:builtin:<tag>);
+//   * mo_feedback_dryrun returns NONE when the sample size is below the
+//     MO_FB_WINDOW window (no thrash on tiny samples);
+//   * with manufactured rates above the promotion threshold, dryrun proposes
+//     promote + the synthetic host is moved A/B/C up one tier;
+//   * with manufactured rates above the atrophy threshold, dryrun proposes
+//     demote + the synthetic host is moved one tier down;
+//   * mo_apply_feedback actually mutates `sa` so sa_tier_for_host reflects
+//     the new tier;
+//   * tier promotion is capped at SA_TIER_A (no underflow);
+//   * tier demotion is capped at SA_TIER_C (no overflow);
+//   * promotion wins over atrophy when BOTH thresholds are crossed
+//     (handled-deterministically branch);
+//   * a sustained signal is required: dryrun + apply on a 5-atom source
+//     proposes NONE and leaves the registry untouched;
+//   * mo_apply_feedback chains across multiple cycles -- two apply calls on
+//     a tier-C source whose rates stay above the promotion threshold land it
+//     at tier A (one tier step per call). ADR-0050 P1.1.
+
+import "../ce_test.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/learning/source_authority.nova"
+
+// ---- helpers ------------------------------------------------------------
+
+// Attribute N atom ids to `tag`, then directly manufacture the source
+// record's running counters (promotions / atrophies) so we can test the
+// feedback decisions without driving a full poll loop. We touch the
+// internal slots through the documented constants MO_MS_*.
+fn _manufacture(mo, tag, sample_n, promos, atrophies) {
+    let i = 0
+    while i < sample_n {
+        mo_attribute(mo, tag, i + 1000)
+        i = i + 1
+    }
+    let srcs = mo[MO_SOURCES]
+    let j = 0
+    while j < len(srcs) {
+        if str_eq(srcs[j][MO_MS_TAG], tag) == 1 {
+            list_set(srcs[j], MO_MS_PROMOTIONS, promos)
+            list_set(srcs[j], MO_MS_ATROPHIES, atrophies)
+        }
+        j = j + 1
+    }
+    return 1
+}
+
+// ---- mapping ------------------------------------------------------------
+
+fn test_tag_to_host_src_prefix() {
+    ce_str_eq("src:topic:fever -> learned:topic:fever",
+        mo_tag_to_host("src:topic:fever"), "learned:topic:fever")
+    ce_str_eq("src:url:wikipedia -> learned:url:wikipedia",
+        mo_tag_to_host("src:url:wikipedia"), "learned:url:wikipedia")
+    ce_str_eq("src:file:my_notes -> learned:file:my_notes",
+        mo_tag_to_host("src:file:my_notes"), "learned:file:my_notes")
+}
+
+fn test_tag_to_host_builtin() {
+    ce_str_eq("seed -> learned:builtin:seed",
+        mo_tag_to_host("seed"), "learned:builtin:seed")
+    ce_str_eq("user-teach -> learned:builtin:user-teach",
+        mo_tag_to_host("user-teach"), "learned:builtin:user-teach")
+}
+
+// ---- sustained-signal guard --------------------------------------------
+
+// Sample size of 5 (below MO_FB_WINDOW=10) must produce action=NONE even
+// when the rates would otherwise cross the thresholds.
+fn test_below_window_no_action() {
+    let mo = mo_new()
+    let sa = sa_new()
+    _manufacture(mo, "src:topic:tiny", 5, 5, 5)
+    let rows = mo_feedback_dryrun(mo, sa)
+    ce_eq("one row", len(rows), 1)
+    let r = rows[0]
+    ce_eq("action is NONE when sample below window",
+        r[MO_FB_ACTION], MO_FB_NONE)
+    ce_eq("old tier == new tier", r[MO_FB_OLD_TIER], r[MO_FB_NEW_TIER])
+}
+
+// ---- promotion ---------------------------------------------------------
+
+// With 10 atoms attributed and 8 promotions (80% promotion rate), the source
+// crosses the 70% promotion threshold -> dryrun proposes PROMOTE and apply
+// moves the synthetic host one tier up (default Tier C -> Tier B).
+fn test_promote_dryrun_then_apply() {
+    let mo = mo_new()
+    let sa = sa_new()
+    _manufacture(mo, "src:topic:fever", 10, 8, 0)
+    let rows = mo_feedback_dryrun(mo, sa)
+    ce_eq("one row", len(rows), 1)
+    let r = rows[0]
+    ce_str_eq("tag is the original source tag", r[MO_FB_TAG], "src:topic:fever")
+    ce_str_eq("host is the synthetic learned: host",
+        r[MO_FB_HOST], "learned:topic:fever")
+    ce_eq("action is PROMOTE", r[MO_FB_ACTION], MO_FB_PROMOTE)
+    ce_eq("old tier defaults to C", r[MO_FB_OLD_TIER], SA_TIER_C)
+    ce_eq("new tier is B", r[MO_FB_NEW_TIER], SA_TIER_B)
+    ce_eq("promo rate is 800 milli (80.0%)", r[MO_FB_PROMO], 800)
+    ce_eq("atrophy rate is 0", r[MO_FB_ATROPHY], 0)
+    ce_eq("sample is 10", r[MO_FB_SAMPLE], 10)
+    // Dryrun must NOT have mutated the registry yet.
+    ce_eq("dryrun did not mutate sa (still tier C)",
+        sa_tier_for_host(sa, "learned:topic:fever"), SA_TIER_C)
+    // Apply commits the change.
+    let acts = mo_apply_feedback(mo, sa)
+    ce_eq("apply returns the same row count", len(acts), 1)
+    ce_eq("apply moved the host to tier B",
+        sa_tier_for_host(sa, "learned:topic:fever"), SA_TIER_B)
+}
+
+// ---- atrophy -----------------------------------------------------------
+
+// With 10 atoms attributed and 6 atrophies (60% atrophy rate), the source
+// crosses the 50% atrophy threshold -> dryrun proposes DEMOTE.
+// Pre-seed the host at tier A so the demotion has somewhere to go.
+fn test_demote_dryrun_then_apply() {
+    let mo = mo_new()
+    let sa = sa_new()
+    sa_host_set_tier(sa, "learned:topic:rumor", SA_TIER_A)
+    _manufacture(mo, "src:topic:rumor", 10, 0, 6)
+    let rows = mo_feedback_dryrun(mo, sa)
+    let r = rows[0]
+    ce_eq("action is DEMOTE", r[MO_FB_ACTION], MO_FB_DEMOTE)
+    ce_eq("old tier is A (pre-seeded)", r[MO_FB_OLD_TIER], SA_TIER_A)
+    ce_eq("new tier is B", r[MO_FB_NEW_TIER], SA_TIER_B)
+    mo_apply_feedback(mo, sa)
+    ce_eq("apply moved the host to tier B",
+        sa_tier_for_host(sa, "learned:topic:rumor"), SA_TIER_B)
+}
+
+// ---- caps --------------------------------------------------------------
+
+// Already at tier A: PROMOTE action stays set but new_tier == old_tier.
+fn test_promote_capped_at_tier_a() {
+    let mo = mo_new()
+    let sa = sa_new()
+    sa_host_set_tier(sa, "learned:topic:trusted", SA_TIER_A)
+    _manufacture(mo, "src:topic:trusted", 12, 10, 0)
+    let rows = mo_feedback_dryrun(mo, sa)
+    let r = rows[0]
+    ce_eq("action is PROMOTE", r[MO_FB_ACTION], MO_FB_PROMOTE)
+    ce_eq("old tier is A", r[MO_FB_OLD_TIER], SA_TIER_A)
+    ce_eq("new tier capped at A", r[MO_FB_NEW_TIER], SA_TIER_A)
+    mo_apply_feedback(mo, sa)
+    ce_eq("apply did not underflow",
+        sa_tier_for_host(sa, "learned:topic:trusted"), SA_TIER_A)
+}
+
+// Already at tier C: DEMOTE action stays set but new_tier == old_tier.
+fn test_demote_capped_at_tier_c() {
+    let mo = mo_new()
+    let sa = sa_new()
+    _manufacture(mo, "src:topic:noise", 10, 0, 8)
+    let rows = mo_feedback_dryrun(mo, sa)
+    let r = rows[0]
+    ce_eq("action is DEMOTE", r[MO_FB_ACTION], MO_FB_DEMOTE)
+    ce_eq("old tier defaults to C", r[MO_FB_OLD_TIER], SA_TIER_C)
+    ce_eq("new tier capped at C", r[MO_FB_NEW_TIER], SA_TIER_C)
+    mo_apply_feedback(mo, sa)
+    ce_eq("apply did not overflow",
+        sa_tier_for_host(sa, "learned:topic:noise"), SA_TIER_C)
+}
+
+// ---- precedence --------------------------------------------------------
+
+// When BOTH thresholds are crossed (promo >= 70%, atrophy >= 50%) -- a
+// physically-rare but possible combination -- promotion wins, matching the
+// design intent: a productive source is worth weighting up even if some of
+// its atoms also atrophy.
+fn test_promotion_wins_over_atrophy() {
+    let mo = mo_new()
+    let sa = sa_new()
+    _manufacture(mo, "src:topic:mixed", 10, 8, 6)
+    let rows = mo_feedback_dryrun(mo, sa)
+    let r = rows[0]
+    ce_eq("action is PROMOTE", r[MO_FB_ACTION], MO_FB_PROMOTE)
+    ce_eq("promo rate is 80.0%", r[MO_FB_PROMO], 800)
+    ce_eq("atrophy rate is 60.0%", r[MO_FB_ATROPHY], 600)
+}
+
+// ---- multi-source ------------------------------------------------------
+
+fn test_multiple_sources_split_actions() {
+    let mo = mo_new()
+    let sa = sa_new()
+    _manufacture(mo, "src:topic:good", 10, 9, 0)     // PROMOTE
+    _manufacture(mo, "src:topic:bad", 10, 0, 7)      // DEMOTE (capped at C)
+    _manufacture(mo, "src:topic:meh", 10, 4, 3)      // NONE
+    let rows = mo_feedback_dryrun(mo, sa)
+    ce_eq("three rows", len(rows), 3)
+    // Tags appear in insertion order (the observer pushes onto the sources
+    // list as each tag is first seen).
+    ce_str_eq("row 0 tag", rows[0][MO_FB_TAG], "src:topic:good")
+    ce_eq("row 0 PROMOTE", rows[0][MO_FB_ACTION], MO_FB_PROMOTE)
+    ce_str_eq("row 1 tag", rows[1][MO_FB_TAG], "src:topic:bad")
+    ce_eq("row 1 DEMOTE", rows[1][MO_FB_ACTION], MO_FB_DEMOTE)
+    ce_str_eq("row 2 tag", rows[2][MO_FB_TAG], "src:topic:meh")
+    ce_eq("row 2 NONE", rows[2][MO_FB_ACTION], MO_FB_NONE)
+}
+
+// ---- chained apply ------------------------------------------------------
+
+// Tier C source whose rates keep exceeding the promotion threshold: each
+// mo_apply_feedback call should move it ONE tier up. After two calls a
+// tier-C source lands at tier A. The third call leaves it at A (capped).
+fn test_chained_promotions_one_tier_per_call() {
+    let mo = mo_new()
+    let sa = sa_new()
+    _manufacture(mo, "src:topic:climbing", 20, 18, 0)
+    ce_eq("start tier C",
+        sa_tier_for_host(sa, "learned:topic:climbing"), SA_TIER_C)
+    mo_apply_feedback(mo, sa)
+    ce_eq("after one apply -> tier B",
+        sa_tier_for_host(sa, "learned:topic:climbing"), SA_TIER_B)
+    mo_apply_feedback(mo, sa)
+    ce_eq("after two applies -> tier A",
+        sa_tier_for_host(sa, "learned:topic:climbing"), SA_TIER_A)
+    mo_apply_feedback(mo, sa)
+    ce_eq("third apply is capped at A",
+        sa_tier_for_host(sa, "learned:topic:climbing"), SA_TIER_A)
+}
+
+// ---- action names -------------------------------------------------------
+
+fn test_action_name_helper() {
+    ce_str_eq("PROMOTE name", mo_fb_action_name(MO_FB_PROMOTE), "promote")
+    ce_str_eq("DEMOTE name",  mo_fb_action_name(MO_FB_DEMOTE),  "demote")
+    ce_str_eq("NONE name",    mo_fb_action_name(MO_FB_NONE),    "none")
+}
+
+fn test_tier_name_helper() {
+    ce_str_eq("tier A name", mo_tier_name(SA_TIER_A), "A")
+    ce_str_eq("tier B name", mo_tier_name(SA_TIER_B), "B")
+    ce_str_eq("tier C name", mo_tier_name(SA_TIER_C), "C")
+}
+
+// ---- empty observer ----------------------------------------------------
+
+fn test_empty_observer_yields_empty_rows() {
+    let mo = mo_new()
+    let sa = sa_new()
+    let rows = mo_feedback_dryrun(mo, sa)
+    ce_eq("no tracked sources => no rows", len(rows), 0)
+    let acts = mo_apply_feedback(mo, sa)
+    ce_eq("apply on empty also returns no rows", len(acts), 0)
+}
+
+fn main() {
+    test_tag_to_host_src_prefix()
+    test_tag_to_host_builtin()
+    test_below_window_no_action()
+    test_promote_dryrun_then_apply()
+    test_demote_dryrun_then_apply()
+    test_promote_capped_at_tier_a()
+    test_demote_capped_at_tier_c()
+    test_promotion_wins_over_atrophy()
+    test_multiple_sources_split_actions()
+    test_chained_promotions_one_tier_per_call()
+    test_action_name_helper()
+    test_tier_name_helper()
+    test_empty_observer_yields_empty_rows()
+    ce_summary("meta_observer_feedback")
+}
+
+main()

@@ -110,6 +110,80 @@ continue. It is updated at every session boundary.
   counter -- 39 assertions across 10 test functions. Sample `/meta` smoke
   run after `/teach widget` + `/teach gadget`: `seed 572 / 572 tentative /
   0 durable / 0.0 / 0.0` and `user-teach 2 / 0 / 2 / 100.0 / 0.0`.
+- P1.1 + P1.6 -- meta-observer feedback into source_authority + atom-death
+  attribution: **complete**. Closes the loop on ADR-0050: until this
+  session the meta-observer only REPORTED per-source promotion / atrophy
+  rates; now it ACTS on them and the atom-death monitor attributes deaths
+  back to the observer.
+  **P1.1 (feedback):** `src/parts/meta/meta_observer.nova` gains
+  `mo_apply_feedback(mo, source_auth)` (mutates) and a paired
+  `mo_feedback_dryrun(mo, source_auth)` (read-only). Both walk every
+  tracked source: a cumulative promotion rate >= 700/1000 (70%) over a
+  sample window of >= 10 attributed atoms promotes the source's host one
+  tier (C -> B -> A); a cumulative atrophy rate >= 500/1000 (50%) over
+  the same window demotes one tier (A -> B -> C). The window + threshold
+  guard against thrash from a single-atom flip -- sustained signals only.
+  When both thresholds cross, promotion wins. Source-tag bridge: today
+  `source_authority` is host-keyed (URLs map via `sw_host` -> registry),
+  while the P15 source tags (`src:topic:fever`) aren't host-keyed; the
+  observer maps each tag to a synthetic host string
+  (`src:<kind>:<tag>` -> `learned:<kind>:<tag>`; bare tags like `seed`
+  and `user-teach` -> `learned:builtin:<tag>`) and calls a new
+  `sa_host_set_tier(sa, host, tier)` accessor added to
+  `src/learning/source_authority.nova` (plus the read companion
+  `sa_tier_for_host`). The `learned:` prefix keeps synthetic hosts from
+  colliding with real domains. The daemon
+  (`examples/crossengin_daemon.nova`) wires the feedback into the idle
+  loop: every `MO_FEEDBACK_EVERY` polls (default 20, override via env),
+  it invokes `mo_apply_feedback` and prints a
+  `(meta-feedback: '<tag>' -> host '<host>' promote tier C -> B)` line
+  only when a tier ACTUALLY moves. The chat (`examples/crossengin_chat.nova`)
+  gets two new admin commands: `/meta-feedback` is a dry-run that prints
+  the per-source feedback table (tag / host / promo% / atrophy% / sample /
+  current / proposed / action) and a "(N tier change(s) pending; run
+  /meta-apply to commit)" footer, and `/meta-apply` actually invokes
+  `mo_apply_feedback` on the process-shared `sauth` registry (built at
+  boot from `sa_default()`). Tier hops are ONE step per call -- chained
+  promotions / demotions require multiple feedback cycles. Sample smoke
+  (after `/teach`-ing 12 words and `/pin`-ing them all to confidence 800):
+  `/meta-feedback` shows `user-teach learned:builtin:user-teach 100.0 0.0
+  12 C B promote`; `/meta-apply` reports
+  `(user-teach -> host 'learned:builtin:user-teach' promote tier C -> B |
+  promo=100.0% atrophy=0.0% sample=12)`; a second `/meta-feedback`
+  shows the same source now at B and proposed for A.
+  **P1.6 (atom-death attribution):** `src/learning/atom_death_monitor.nova`
+  gains `adm_sweep_attributed(reg, kg, mo)` (the legacy `adm_sweep(reg, kg)`
+  is now a wrapper that passes `mo=0`, preserving the existing test +
+  caller surface). At the tombstone -> dead transition, the new entry
+  calls `mo_record_death(mo, atom_id(a))` when `mo != 0` so a
+  source-attributed atom that dies outright (durable atom GC'd by the GC
+  before the next poll would have classified it as "vanished") bumps the
+  observer's per-source atrophy counter immediately. The hook is a
+  function-pointer-shaped thing in NOVA -- practically just an import +
+  one extra call gated on `mo != 0`. Acceptance:
+  `tests/unit/test_meta_observer_feedback.nova` covers the synthetic-host
+  mapping for both `src:*` and bare tags, the sustained-signal guard
+  (sample below window -> NONE), promote dryrun-then-apply moving tier
+  C -> B, demote dryrun-then-apply moving a pre-seeded tier-A source to
+  tier B, promote / demote tier-edge clamps, the "promotion wins when
+  both cross" branch, a 3-source split (PROMOTE / DEMOTE / NONE),
+  chained two-apply promotion from C to A, the `mo_fb_action_name` /
+  `mo_tier_name` helpers, and the empty-observer no-op -- 54 assertions
+  across 13 test functions. `tests/unit/test_atom_death_attribution.nova`
+  covers `mo_record_death` direct (tagged atom -> +1, untagged -> no-op),
+  the legacy `adm_sweep` back-compat, `adm_sweep_attributed(reg, kg, 0)`
+  null-mo behaviour, the headline "attributed durable atom dies ->
+  observer atrophy counter +1", idempotency under repeated sweeps (the
+  dead-flag guard prevents double-attribution), multi-attribution in one
+  sweep, mixed tagged + untagged, an empty-observer guard, and the
+  protected-atom case (never collected, never attributed) -- 28
+  assertions across 10 test functions. Tier transitions observed under
+  these tests: tier-C synthetic host -> tier-B after one apply for a
+  source whose 10 attributed atoms had 8 promotions (80%); tier-A host
+  -> tier-B after one apply for a source whose 10 atoms had 6 atrophies
+  (60%); chained C -> B -> A across two apply calls for a 20-atom source
+  with 18 promotions (90%); both promotion and demotion saturate at the
+  A / C edges (no underflow / overflow).
 - Phase 14 Tier-2 item #2 -- structural-neighborhood activation: **complete**.
   The reader now has a substrate-native similarity surface for indirect input.
   A new `src/reader/neighborhood.nova` exposes `find_neighbors(kg_reg, handle,
@@ -290,6 +364,40 @@ continue. It is updated at every session boundary.
   can corroborate / atrophy by source. Acceptance: `scripts/learn_smoke_multi.sh`
   exercises all three kinds; `tests/unit/test_learn_tag.nova` covers the
   tag-derivation contract with 22 assertions.
+- P1.5 -- composite `/learn` kinds (batch URLs, RSS feed, recursive
+  directory): **complete**. Extends the P15 dispatcher with three new
+  prefix-detected source kinds, all sharing the same `_learn_tag` /
+  `_admin_learn` pipeline:
+  - `@/path/urls.txt` -- one URL per line; the bash side iterates and
+    recursively self-calls per URL, then concatenates per-URL caches into
+    `/tmp/crossengin_learn_batch_<basename>.txt`. Tag = `batch_<basename>`.
+    The chat ingests the combined cache then re-derives each per-URL tag
+    and ingests the individual cache too so each URL keeps its own
+    `src:url:<tag>` attribution for meta-observer scoring.
+  - `rss:URL` -- fetches the feed, parses up to `LEARN_RSS_MAX` (default 5)
+    `<link>...</link>` (RSS) or `<link href="...">` (Atom) entries, then
+    batch-ingests them. Tag = `rss_<host>`. Lossy regex parser is fine --
+    the chat-side filter is the ground truth for triples.
+  - `dir:/path/` -- recursively walks for `*.txt` + `*.md` files (find -type
+    f, NUL-delimited so spaces survive), recursively self-calls per file,
+    concatenates per-file caches into the combined cache. Tag =
+    `dir_<basename>`.
+  All composite kinds prepend their prefix BEFORE path-shape detection
+  (`_learn_kind` now checks `@`/`rss:`/`dir:` before the `/abs`/`./rel`
+  branches), so a directory called `./foo` is never misclassified as FILE.
+  NOVA-side helpers `_tag_sanitise`, `_learn_tag_batch`, `_learn_tag_rss`,
+  `_learn_tag_dir`, `_basename`, and `_learn_ingest_one` /
+  `_learn_ingest_batch_per_url` live alongside the existing P15 helpers
+  in `examples/crossengin_chat.nova` (no new admin commands, no new
+  dispatch lines -- the existing `/learn` line in `_try_admin` calls the
+  same `_admin_learn`). Acceptance:
+  `tests/unit/test_learn_tag.nova` is now 40 assertions (+18: 6 new kind
+  classifications plus 4 batch + 4 rss + 4 dir tag derivations);
+  `scripts/learn_smoke_multi.sh` is now 6 source-kind cases + 4 negative
+  cases (was 3 + 1) and verifies BATCH @-prefix, RSS feed parsing, DIR
+  walk, plus error-out on missing list / missing dir / empty rss URL.
+  Network-dependent steps (TOPIC, URL, RSS, BATCH-of-URLs) skip cleanly
+  if curl can't reach Wikipedia.
 - Phase 11 Tier-1 item #1 -- full SOUL + KGS subsystem blob serialization:
   **complete**. `snapshot_disk.nova` now round-trips every atom (label, kind,
   alpha/beta belief, owning KG label) and the full SOUL state (name, purpose,
@@ -732,7 +840,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 100 (the prior 95 + `test_realtime_pacer` and `test_decision_log_durable` added by P0.6/P0.7 + 3 episodic/synapses/selfmodel snapshot suites concurrently added by Agent X); **+64 assertions added by P0.6/P0.7** (27 in `test_realtime_pacer.nova`, 37 in `test_decision_log_durable.nova`).
+- Total unit suites: 102 (the prior 100 + `test_meta_observer_feedback` (P1.1) + `test_atom_death_attribution` (P1.6)); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 16 scripts under `tests/integration/` covering 9 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation) and 5 admin-command edge-case scripts. Run with `make integration`.

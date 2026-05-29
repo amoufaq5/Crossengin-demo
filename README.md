@@ -12,13 +12,16 @@ computational units rather than orchestrating a pipeline of modules.
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain: 95 modules compile (`make build`, +1 from `realtime_pacer.nova`
-> added in P0.6 wall-clock pacer), 103 unit-test suites pass
+> added in P0.6 wall-clock pacer), 102 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
 > P0.7 decision-log durable path,
 > +3 suites / +132 assertions from `test_snapshot_{episodic,synapses,
-> selfmodel}.nova` added in P0.1 full-state persistence),
+> selfmodel}.nova` added in P0.1 full-state persistence,
+> +2 suites / +82 assertions from `test_meta_observer_feedback.nova` +
+> `test_atom_death_attribution.nova` added in P1.1 meta-observer feedback
+> into source_authority + P1.6 atom-death attribution),
 > 16 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
@@ -154,8 +157,16 @@ The Phase 7 agent architecture (`src/scheduler/`, `src/agent/`, `src/parts/meta/
   reasoning, emotion, goals, action) + the idle-gated imagination loop, over a
   shared `loop_coordination` blackboard (ADR-0036).
 - **meta** (`parts/meta/`) — the self-model query API ("what/state/goals/
-  competence", ADR-0038), theory-of-mind user model (ADR-0039), and
-  long-horizon goal accrual + revisit scan (ADR-0040).
+  competence", ADR-0038), theory-of-mind user model (ADR-0039),
+  long-horizon goal accrual + revisit scan (ADR-0040), and the
+  meta-learning observer (ADR-0050) that watches per-source promotion /
+  atrophy and (P1.1) FEEDS those rates back into `source_authority` by
+  promoting / demoting host tiers when sustained signal crosses thresholds
+  -- 70% promotion over a 10-atom window promotes one tier; 50% atrophy
+  demotes; the chat surfaces both via `/meta-feedback` (dry-run) and
+  `/meta-apply` (commit). Atom death attribution (P1.6) is wired so a
+  durable atom dying outright bumps the observer's atrophy counter
+  immediately rather than waiting for the next poll.
 
 The Phase 8 safety and audit stack (`src/safety/`, `src/audit/`):
 

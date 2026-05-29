@@ -9,10 +9,31 @@
 //   -> tentative, dropped/tombstoned) rates so the operator -- and eventually
 //   the agent itself -- can tell which sources of evidence are productive.
 //
-//   This session ships only the observer + plumbing + reporting. Feeding the
-//   numbers back into `source_authority` (the policy that would up- or down-
-//   weight a source based on these rates) is deferred: that loop is the
-//   dangerous part and needs more design.
+//   P1.1 (this revision) closes the loop: the observer can now FEED its
+//   per-source rates back into `source_authority` by promoting or demoting a
+//   host's tier when a sustained signal crosses thresholds. `mo_apply_feedback`
+//   walks every tracked source; if the cumulative promotion rate >= 700/1000
+//   (70%) over a window of >= 10 attributed atoms, it promotes the
+//   corresponding host one tier; if the cumulative atrophy rate >= 500/1000
+//   (50%) over the same window, it demotes one tier. The window + threshold
+//   guard against thrash from a single-atom flip. `mo_feedback_dryrun` is the
+//   read-only twin used by the chat's `/meta-feedback` admin to PREVIEW what
+//   would change before `/meta-apply` actually mutates.
+//
+//   Source whitelist bridge: today `source_authority` is host-keyed (URLs map
+//   to a tier via a host registry). The P15 source tags (`src:topic:fever`)
+//   are NOT host-keyed, so the observer maps each tag to a synthetic host
+//   `learned:<kind>:<tag>` (see `_mo_tag_to_host`) before calling the
+//   `sa_host_set_tier` accessor. Tags that are not in the `src:...` form
+//   (e.g. `seed`, `user-teach`) map to `learned:builtin:<tag>` so they too
+//   have a tier registry slot. The mapping is one-way + idempotent.
+//
+//   P1.6 (this revision) adds atom-death attribution: `mo_record_death(mo,
+//   atom_id)` is called by the atom-death monitor at the death-decision
+//   callsite. Today the observer only sees atrophy as "tentative ->
+//   sub-threshold" via the rolling poll; this hook closes the case where a
+//   DURABLE atom dies outright (tombstone -> dead) before the next poll
+//   would have caught the transition.
 //
 //   Minimum-viable source tagging: atoms only carry a source if a caller
 //   explicitly tags them via `mo_attribute`. Atoms born without a tag are
@@ -33,12 +54,15 @@
 //     promotion_rate = newly_durable_this_poll * 1000 / (newly_durable + new_tentative_remaining)
 //     atrophy_rate   = atrophied_this_poll     * 1000 /  born_in_window
 //
-// ADRs implemented: ADR-0050 (meta-learning observer). NOVA dependencies:
+// ADRs implemented: ADR-0050 (meta-learning observer; P1.1 feedback into
+//   source_authority + P1.6 atom-death attribution). NOVA dependencies:
 //   builtins. CrossEngin dependencies: src/kg/atom_store.nova (read-only,
 //   transitively via multi_kg_manager), src/parts/meta/reflection_loop.nova
-//   (read-only, for the refl_kg promotion counter).
+//   (read-only, for the refl_kg promotion counter), src/learning/source_authority.nova
+//   (for the host-keyed tier accessor `sa_host_set_tier`).
 
 import "../../kg/multi_kg_manager.nova"
+import "../../learning/source_authority.nova"
 
 // ---- thresholds (milli) --------------------------------------------------
 let MO_DURABLE_MEAN = 750   // posterior mean at/above this counts as durable
@@ -323,4 +347,189 @@ fn mo_format_pct(milli) {
     let tenth = milli - whole * 10
     if tenth < 0 { tenth = 0 - tenth }
     return int_to_str(whole) + "." + int_to_str(tenth)
+}
+
+// ---- P1.1: source_authority feedback -------------------------------------
+// Thresholds + minimum-window for promoting / demoting a source. Tuned to
+// avoid thrash: a single-atom flip cannot move tiers; sustained signals only.
+let MO_FB_PROMO_MILLI   = 700   // cumulative promotion >= 70.0% -> promote
+let MO_FB_ATROPHY_MILLI = 500   // cumulative atrophy   >= 50.0% -> demote
+let MO_FB_WINDOW        = 10    // need at least this many attributed atoms
+
+// Feedback action codes (returned by mo_feedback_dryrun / mo_apply_feedback).
+let MO_FB_NONE    = 0   // sample too small, or no threshold crossed
+let MO_FB_PROMOTE = 1   // promotion rate crossed; tier moves up one (smaller #)
+let MO_FB_DEMOTE  = 2   // atrophy   rate crossed; tier moves down one (larger #)
+
+// Action-row layout (one per evaluated source):
+//   [tag, host, action, old_tier, new_tier, promo_milli, atrophy_milli, sample]
+let MO_FB_TAG       = 0
+let MO_FB_HOST      = 1
+let MO_FB_ACTION    = 2
+let MO_FB_OLD_TIER  = 3
+let MO_FB_NEW_TIER  = 4
+let MO_FB_PROMO     = 5
+let MO_FB_ATROPHY   = 6
+let MO_FB_SAMPLE    = 7
+
+// Map a source tag to the synthetic host string that source_authority's
+// host-keyed registry will store. The convention:
+//   "src:topic:fever"   -> "learned:topic:fever"
+//   "src:url:wikipedia" -> "learned:url:wikipedia"
+//   "seed"              -> "learned:builtin:seed"
+//   "user-teach"        -> "learned:builtin:user-teach"
+// One-way and idempotent. The "learned:" prefix keeps these synthetic hosts
+// from colliding with any real domain a future fetch path might register.
+fn _mo_tag_to_host(tag) {
+    if starts_with(tag, "src:") == 1 {
+        // strip the leading "src:" and prepend "learned:"
+        let rest = substr(tag, 4, len(tag) - 4)
+        return "learned:" + rest
+    }
+    return "learned:builtin:" + tag
+}
+
+// Public alias for callers that want the mapping (chat / docs). Same impl.
+fn mo_tag_to_host(tag) { return _mo_tag_to_host(tag) }
+
+// Decide what feedback (if any) a single source row should produce. Pure --
+// does not mutate anything. Reads the source's CUMULATIVE counters and
+// returns the action code (MO_FB_NONE / PROMOTE / DEMOTE) plus the rates +
+// sample. Promotion wins when both thresholds are crossed (rare).
+fn _mo_feedback_decide(src) {
+    let sample = len(src[MO_MS_ATOM_IDS])
+    let promos = src[MO_MS_PROMOTIONS]
+    let atrophies = src[MO_MS_ATROPHIES]
+    let promo_rate = _mo_rate_milli(promos, sample)
+    let atrophy_rate = _mo_rate_milli(atrophies, sample)
+    let action = MO_FB_NONE
+    if sample >= MO_FB_WINDOW {
+        if promo_rate >= MO_FB_PROMO_MILLI {
+            action = MO_FB_PROMOTE
+        } else {
+            if atrophy_rate >= MO_FB_ATROPHY_MILLI {
+                action = MO_FB_DEMOTE
+            }
+        }
+    }
+    let row = list_new()
+    push(row, action)
+    push(row, promo_rate)
+    push(row, atrophy_rate)
+    push(row, sample)
+    return row
+}
+
+// Build the per-source feedback action list WITHOUT mutating `source_auth`.
+// One row per tracked source. `mo_feedback_dryrun` is what `/meta-feedback`
+// surfaces; `mo_apply_feedback` shares the decision logic and then commits.
+fn mo_feedback_dryrun(mo, source_auth) {
+    let srcs = mo[MO_SOURCES]
+    let out = list_new()
+    let i = 0
+    while i < len(srcs) {
+        let s = srcs[i]
+        let tag = s[MO_MS_TAG]
+        let host = _mo_tag_to_host(tag)
+        let dec = _mo_feedback_decide(s)
+        let action = dec[0]
+        let promo_rate = dec[1]
+        let atrophy_rate = dec[2]
+        let sample = dec[3]
+        let old_tier = sa_tier_for_host(source_auth, host)
+        let new_tier = old_tier
+        if action == MO_FB_PROMOTE {
+            if old_tier > SA_TIER_A { new_tier = old_tier - 1 }
+            else { new_tier = old_tier }   // already top tier; effective no-op
+        }
+        if action == MO_FB_DEMOTE {
+            if old_tier < SA_TIER_C { new_tier = old_tier + 1 }
+            else { new_tier = old_tier }   // already bottom tier; effective no-op
+        }
+        let row = list_new()
+        push(row, tag)
+        push(row, host)
+        push(row, action)
+        push(row, old_tier)
+        push(row, new_tier)
+        push(row, promo_rate)
+        push(row, atrophy_rate)
+        push(row, sample)
+        push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
+// Apply the feedback: for every source whose dryrun row carries a non-NONE
+// action AND whose tier would actually change, write the new tier back into
+// `source_auth` via sa_host_set_tier. Returns the same action-row list as
+// dryrun (the rows that ACTUALLY moved a tier carry old_tier != new_tier;
+// other rows reflect either "no action" or "action capped at A / C edge").
+//
+// Sustained signals only: a source with fewer than MO_FB_WINDOW attributed
+// atoms is left alone (action = NONE). Tier hops are ONE step per call --
+// chained promotions / demotions require multiple feedback cycles.
+fn mo_apply_feedback(mo, source_auth) {
+    let rows = mo_feedback_dryrun(mo, source_auth)
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let old_tier = r[MO_FB_OLD_TIER]
+        let new_tier = r[MO_FB_NEW_TIER]
+        if new_tier != old_tier {
+            sa_host_set_tier(source_auth, r[MO_FB_HOST], new_tier)
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+// Human-readable action name for chat output.
+fn mo_fb_action_name(action) {
+    if action == MO_FB_PROMOTE { return "promote" }
+    if action == MO_FB_DEMOTE  { return "demote" }
+    return "none"
+}
+
+// Human-readable tier name (matches the source_authority ADR-0029 letters).
+fn mo_tier_name(tier) {
+    if tier == SA_TIER_A { return "A" }
+    if tier == SA_TIER_B { return "B" }
+    if tier == SA_TIER_C { return "C" }
+    return "?"
+}
+
+// ---- P1.6: atom-death attribution hook ----------------------------------
+// Called by the atom-death monitor (`adm_sweep` in
+// `src/learning/atom_death_monitor.nova`) at the moment an atom transitions
+// from tombstone -> dead. If the dead atom was attributed to a tracked
+// source, increments that source's atrophy counter directly so the
+// observer's per-source rate reflects the outright death (which the next
+// `mo_poll` would have classified as "vanished" anyway -- this hook makes
+// the attribution immediate AND robust to the atom being GC-removed before
+// the next poll fires).
+//
+// Returns 1 if the atom was found in a source's id-list and the counter
+// was bumped; 0 if the atom was untagged (never attributed). Idempotency
+// caveat: the caller is expected to invoke this AT MOST ONCE per atom
+// (the death-transition is itself one-shot); if it ever fires twice the
+// counter will double-count, but adm_sweep's dead-flag guard prevents that.
+fn mo_record_death(mo, atom_id) {
+    let srcs = mo[MO_SOURCES]
+    let i = 0
+    while i < len(srcs) {
+        let s = srcs[i]
+        let ids = s[MO_MS_ATOM_IDS]
+        let j = 0
+        while j < len(ids) {
+            if ids[j] == atom_id {
+                list_set(s, MO_MS_ATROPHIES, s[MO_MS_ATROPHIES] + 1)
+                return 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
 }
