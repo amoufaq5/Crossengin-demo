@@ -185,12 +185,33 @@ Two ways to talk to the agent:
 
 **A. `bin/crossengin-chat` — a real REPL with persistent state across turns.**
 The agent boots once and stays alive; what it learns from one message carries
-to the next.
+to the next. Plain lines are messages to the agent; lines starting with `/`
+are **admin commands** that operate on its state directly:
 
 ```sh
 make install
 ./bin/crossengin-chat
 ```
+
+```
+> fever
+agent> see treat
+> /status                    soul / mood / KG / scheduler state
+> /teach widget              ingest "widget" as a new word + concept
+> /pin widget 900            pin its belief to 0.9
+> /why                       explain the most recent decision
+> /history 10                last 10 decision-log entries
+> /halt                      stop the effector (input keeps flowing)
+> /resume                    un-halt
+> /help                      full listing
+> /quit                      exit
+```
+
+`/halt` flips the same safety bit `effector_speak_governed` checks (ADR-0044
+hard stop) — the substrate keeps perceiving, reasoning, and learning, but
+nothing is emitted until `/resume`. `/teach` ingests via the same
+`ask_user_to_teach` path the agent uses at idle. `/pin` writes the word's
+Bayesian α/β directly.
 
 **B. `scripts/chat.sh` — a bash shim** that runs `bin/crossengin` once per
 message via a file. Each turn is a fresh boot (state doesn't persist), but it
