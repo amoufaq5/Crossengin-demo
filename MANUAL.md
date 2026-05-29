@@ -213,6 +213,30 @@ nothing is emitted until `/resume`. `/teach` ingests via the same
 `ask_user_to_teach` path the agent uses at idle. `/pin` writes the word's
 Bayesian α/β directly.
 
+#### Learn a topic from the web
+
+`scripts/learn.sh <topic>` fetches Wikipedia (or any URL via `LEARN_URL=`),
+extracts the topic's most-frequent vocabulary, and writes it to
+`/tmp/crossengin_learn_<topic>.txt`. The chat's `/learn <topic>` reads that
+file and ingests each word via the same path `/teach` uses — they become
+real language atoms in the live KG. NOVA has no fork/exec, so the curl lives
+in bash and the agent only reads.
+
+```sh
+# in one terminal:
+scripts/learn.sh fever
+# wrote 30 candidate words to /tmp/crossengin_learn_fever.txt
+
+# in the chat:
+> /status                    13 atoms (seed only)
+> /learn fever               29 new atoms (one was already seeded), 42 total
+> temperature                agent> okay   (the word was JUST learned)
+> body                       agent> okay   (same)
+```
+
+Use `LEARN_URL='...'` to point at any other source, and `LEARN_MAX=50` to
+adjust how many candidates to keep (default 30).
+
 **B. `scripts/chat.sh` — a bash shim** that runs `bin/crossengin` once per
 message via a file. Each turn is a fresh boot (state doesn't persist), but it
 needs nothing beyond the bash you already have.
