@@ -188,6 +188,7 @@ into one program is the Phase 10 `main` (needs a `nova_packages/` shim).
 | parts/meta/self_model_query.nova | 0038 | 9 | done |
 | parts/meta/theory_of_mind.nova | 0039, 0044 | 13 | done |
 | parts/meta/long_horizon_goals.nova | 0040 | 9 | done |
+| parts/meta/reflection_loop.nova | 0032, 0023 | 16 | done |
 
 README updated to v0.7.
 
@@ -319,6 +320,18 @@ Also delivered (runnable artifacts via `make install`):
   top-level symbol remains.
 
 README updated to v1.0.
+
+## Completed modules — Seed (boot state)
+
+The cold-boot seed under `src/seed/`. Loaded by the daemon at startup to install
+the foundational concepts, core English vocabulary, output syntax patterns,
+reasoning operators, imagination patterns, and the medical-demo chain (fever ->
+infection => treat). 572 atoms across self/pronoun/verb/noun/health/daily/etc.;
+everything else is learned at runtime via the learning loops.
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| seed/first_atoms.nova | 0010, 0015, 0016, 0017, 0031, 0032, 0034 | 18 | done |
 
 ## Partially completed modules
 
