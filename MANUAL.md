@@ -237,6 +237,29 @@ and surfaced a treatment chain it hadn't explicitly derived. `/status` shows
 both counts: the shared KG and the reflection-KG. Re-running `/reflect` from
 the same seed corroborates existing tentative atoms instead of duplicating.
 
+**Speculation gets corroborated by perception → promoted to belief.** When a
+subsequent percept anchors a label that's already in the reflection KG, the
+agent's prior speculation is confirmed; the tentative atom's Beta(2,1) → (3,1)
+crosses the promotion threshold and graduates to the main concept KG with a
+word binding. The chat prints `(promoted from reflection: …)` when that
+happens:
+
+```
+> fever
+agent> see headache
+> /reflect
+(reflected on 6 concept(s); 4 tentative inference(s):
+ doctor, prescription, medicine, recover)  refl_kg=4
+> medicine                                    ← perception corroborates
+agent> see recover
+       (promoted from reflection: doctor, medicine)
+```
+
+"doctor" and "medicine" were anchored by the percept (spreading activation
+also pulled `doctor` in via the seeded `doctor↔medicine` cross-ref); their
+refl_kg confidence crossed threshold and they were graduated. "prescription"
+and "recover" stay tentative until perception corroborates them too.
+
 #### Learn a topic from the web
 
 `scripts/learn.sh <topic>` fetches Wikipedia (or any URL via `LEARN_URL=`),
