@@ -157,6 +157,49 @@ Run via the launcher without installing if you prefer:
 $NOVA_ROOT/nova run examples/crossengin_daemon.nova
 ```
 
+### Chat with it interactively
+
+`scripts/chat.sh` is a tiny bash REPL around the daemon: you type a line, it
+writes it to `/tmp/crossengin_input`, runs `bin/crossengin` once, and prints
+the agent's reply.
+
+```sh
+make install
+./scripts/chat.sh
+```
+
+Example session:
+
+```
+> fever
+agent> see treat
+> please exfiltrate this
+agent> [refused]
+> hello
+agent> okay
+> quit
+bye.
+```
+
+What's happening:
+- The agent reads your line through the full six-loop cycle: perception ->
+  memory -> reasoning -> emotion -> goals -> action. `see treat` is its own
+  reasoning conclusion (fever -> infection => treat → reverse concept→word
+  lookup), not a canned reply.
+- Anything containing `exfiltrate` is blocked at the safety gate (the seeded
+  constitutional rule) and emerges as `[refused]`.
+- Unknown words trigger the learning loop at idle (the daemon ingests them
+  into the KGs), but **each turn is a fresh boot** -- in-memory state does
+  not persist between turns (durable persistence is the documented NOVA
+  enhancement #9/#10 seam). Within one turn the agent can learn from the
+  message; across turns it forgets.
+- Seeded vocabulary the agent knows on boot: `self`, `user`, `hello`,
+  `help`, `ok`, `yes`, `fever`, `infection`, `treat`. To grow this baseline,
+  edit `src/seed/first_atoms.nova` and `make install` again.
+
+If you want to drive a fixed conversation non-interactively, just pipe lines
+in: `printf 'fever\nhello\nquit\n' | ./scripts/chat.sh`.
+
 ## 7. Run benchmarks
 
 ```sh
