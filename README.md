@@ -11,23 +11,28 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 91 modules compile (`make build`), 93 unit-test suites pass
-> (`make test`, 1715 assertions, +1 suite / +22 assertions from
+> toolchain: 96 modules compile (`make build`), 95 unit-test suites pass
+> (`make test`, 1820 assertions, +1 suite / +22 assertions from
 > `test_learn_tag.nova` added in Phase 15 Tier-2 #3 multi-source `/learn`,
 > +1 suite / +39 assertions from `test_meta_observer.nova` added in Phase 13
 > Tier-2 #1 meta-learning observer,
 > +1 suite / +31 assertions from `test_neighborhood_activation.nova` added
 > in Phase 14 Tier-2 #2 structural-neighborhood activation,
 > +1 suite / +66 assertions from `test_session.nova` added in Phase 18
-> Tier-3 #3 multi-tenant session foundation), 12 end-to-end integration
-> scripts run (`make integration`, 110 assertions, 6 scenarios + 5
+> Tier-3 #3 multi-tenant session foundation,
+> +1 suite / +53 assertions from `test_kg_sync.nova` added in Phase 20
+> Tier-4 #2 distributed-substrate seam,
+> +1 suite / +52 assertions from `test_audio_synth.nova` added in Phase 19
+> Tier-4 #1 audio modality bridge), 13 end-to-end integration
+> scripts run (`make integration`, 123 assertions, 7 scenarios + 5
 > admin-command coverage scripts in Phase 16/17 Tier-3 #1+#2),
 > three benchmarks report metrics
-> (`make benchmark`), and three runnable artifacts build and run
+> (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
-> companion spine, and **`bin/crossengin` — the whole agent in one process**
+> companion spine, **`bin/crossengin` — the whole agent in one process**
 > (substrate + knowledge + soul + goals + scheduler + IO + safety + persistence,
-> no LLM). The unified assembly was previously blocked by NOVA's import-path
+> no LLM), and the distributed-substrate seam's two halves
+> (`bin/crossengin-kg-publisher` / `bin/crossengin-kg-subscriber`). The unified assembly was previously blocked by NOVA's import-path
 > dedup (blocker #10); that is now **fixed in the toolchain** (path
 > canonicalization — see [`NEXT_SESSION.md`](./NEXT_SESSION.md)). What remains is
 > production hardening of the documented runtime seams (fsync-durable
@@ -297,11 +302,32 @@ make build
 # compile and run every unit test
 make test
 
-# build all three runnable artifacts into ./bin/
+# build all runnable artifacts into ./bin/
 make install
-./bin/crossengin                # the whole agent in one process
-./bin/crossengin-selfcheck      # substrate kernel spine
-./bin/crossengin-spine          # safety + IO + persistence spine
+./bin/crossengin                  # the whole agent in one process
+./bin/crossengin-selfcheck        # substrate kernel spine
+./bin/crossengin-spine            # safety + IO + persistence spine
+./bin/crossengin-kg-publisher     # distributed-substrate seam: publisher
+./bin/crossengin-kg-subscriber    # distributed-substrate seam: subscriber
+```
+
+### Distributed KG sync (publisher / subscriber demo)
+
+Phase 20 / Tier-4 #2 ships the minimum viable distributed-substrate seam:
+two `bin/crossengin-kg-*` processes exchange atom-birth events over a TCP
+socket so a second daemon mirrors the first daemon's KG state without sharing
+memory. The wire protocol is text, one operation per line (`HELLO` /
+`OK` / `SUB *` / `ATOM kg id kind alpha beta label` / `ACK <id>` / `BYE`),
+defined in `src/io/transducers/kg_sync.nova`. The publisher binds 127.0.0.1
+by default (set `CE_KGSYNC_BIND=0.0.0.0` to expose) and listens on port 8766
+(override via `CE_KGSYNC_PORT`). The main `bin/crossengin` daemon is not
+touched; rolling the seam into its idle loop is a future enhancement.
+
+```sh
+./bin/crossengin-kg-subscriber > /tmp/sub.out &      # waits for handshake
+sleep 0.5
+printf 'widget\ngadget\nfever\n' | ./bin/crossengin-kg-publisher
+grep widget /tmp/sub.out     # recv kg=language id=0 label=widget
 ```
 
 Point the build at a NOVA checkout elsewhere with `make NOVA_ROOT=/path/to/NOVA build`.

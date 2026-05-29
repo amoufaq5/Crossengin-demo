@@ -24,6 +24,8 @@ SELFCHECK   := examples/kernel_selfcheck.nova
 SPINE       := examples/companion_spine.nova
 DAEMON      := examples/crossengin_daemon.nova
 CHAT        := examples/crossengin_chat.nova
+KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
+KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 
 .PHONY: all build test benchmark install integration clean check-nova help
 
@@ -95,6 +97,22 @@ install: build
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
 	fi
+	@if [ -f "$(KGSYNC_PUB)" ]; then \
+	  printf '  build %s ... ' "$(KGSYNC_PUB)"; \
+	  if "$(NOVA)" build "$(KGSYNC_PUB)" -o "$(BIN)/crossengin-kg-publisher" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-kg-publisher"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
+	@if [ -f "$(KGSYNC_SUB)" ]; then \
+	  printf '  build %s ... ' "$(KGSYNC_SUB)"; \
+	  if "$(NOVA)" build "$(KGSYNC_SUB)" -o "$(BIN)/crossengin-kg-subscriber" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-kg-subscriber"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
 
 integration: install
 	@scripts="$$(find tests/integration -maxdepth 1 -name '*.sh' ! -name '_*' 2>/dev/null | sort)"; \
@@ -121,7 +139,7 @@ help:
 	@echo "  build       compile every implemented NOVA module under src/"
 	@echo "  test        compile and run every unit test under tests/unit/"
 	@echo "  benchmark   run every benchmark under tests/benchmark/"
-	@echo "  install     build the self-check, companion-spine, and unified daemon into ./bin/"
+	@echo "  install     build the self-check, companion-spine, unified daemon, and kg-sync pub/sub into ./bin/"
 	@echo "  integration run every end-to-end scenario + admin-command script in tests/integration/"
 	@echo "  clean       remove build artifacts"
 	@echo "  check-nova  verify the NOVA toolchain is reachable"

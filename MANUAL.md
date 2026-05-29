@@ -219,6 +219,8 @@ agent> see treat
 > /history 10                last 10 decision-log entries
 > /halt                      stop the effector (input keeps flowing)
 > /resume                    un-halt
+> /speak hello world         synthesize speech (or `/speak` alone speaks the
+>                            agent's last reply) -> /tmp/ce_speech.wav
 > /help                      full listing
 > /quit                      exit
 ```
@@ -227,7 +229,14 @@ agent> see treat
 hard stop) — the substrate keeps perceiving, reasoning, and learning, but
 nothing is emitted until `/resume`. `/teach` ingests via the same
 `ask_user_to_teach` path the agent uses at idle. `/pin` writes the word's
-Bayesian α/β directly.
+Bayesian α/β directly. `/speak` (Phase 19 / Tier-4 #1) closes the audio
+modality bridge ADR-0014 names: by default Mode 1 (pure-NOVA phoneme
+synth) writes a 44-byte RIFF/WAVE/PCM16 file at `/tmp/ce_speech.wav`
+(override with `CE_SPEECH_PATH`); if `espeak` is on PATH the chat escalates
+to Mode 2 for a much higher-quality voice into the same path; if `aplay` or
+`paplay` is available the file is best-effort played as Mode 3. The seam
+returns success as long as the WAV reached disk — playback failure does not
+fail `/speak`.
 
 #### Reflect on what was just said
 
@@ -394,6 +403,28 @@ curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"message":"/reflect"}' http://localhost:8765/api/chat
 # {"reply": "(reflected on 6 concept(s); 4 tentative inference(s):
 #   doctor, prescription, medicine, recover)  refl_kg=4"}
+```
+
+### Distributed KG sync (publisher / subscriber)
+
+The Phase 20 / Tier-4 #2 distributed-substrate seam lets two CrossEngin
+processes converge their KG state over a TCP socket. The publisher binary
+opens a localhost listener (port 8766 by default, override with
+`CE_KGSYNC_PORT`; bind 127.0.0.1 by default, opt in to broader interfaces
+with `CE_KGSYNC_BIND=0.0.0.0`); the subscriber dials in, performs a
+`HELLO`/`OK`/`SUB *` handshake, then receives `ATOM kg id kind alpha beta
+label` lines and installs each one in its own local KG. Wire-protocol
+details live in `src/io/transducers/kg_sync.nova`. This seam is
+intentionally separate from `bin/crossengin` — rolling it into the unified
+daemon's idle path is a follow-up task.
+
+```sh
+make install                                       # builds the two binaries
+./bin/crossengin-kg-subscriber > /tmp/sub.out &    # blocks on connect
+sleep 0.5
+printf 'widget\ngadget\nfever\n' | ./bin/crossengin-kg-publisher
+grep widget /tmp/sub.out
+# recv kg=language id=0 label=widget
 ```
 
 ## 7. Run benchmarks

@@ -70,6 +70,80 @@ continue. It is updated at every session boundary.
   via spreading_activation, cross-KG ref case, paraphrase via lexical
   fallback, exact-match dominance) with 30 assertions across 10 test
   functions.
+- Phase 19 Tier-4 item #1 -- audio modality bridge: **complete**.
+  Two new modules under `src/io/effectors/` realize the minimum-viable
+  audio leg of ADR-0014 -- the modality bridge that until now was a
+  documented deferred runtime seam. `audio_synth.nova` is the always-on
+  Mode 1 floor: a 256-entry quarter-wave sine table built at startup via
+  Bhaskara's degree-domain approximation (full-period samples via 4-fold
+  symmetry), a Bresenham-style integer phase generator (all loop-body
+  intermediates < 16k so the NOVA loop-multiply pointer threshold,
+  blocker #11, is never crossed), per-phoneme synthesis at 8 kHz / 16 bit
+  PCM mono (150 ms = 1200 samples per atom, triangular envelope to keep
+  edges click-free), a hard-coded formant table for ~30 common ARPABET-ish
+  phonemes (vowels 270-730 Hz, fricatives 2.5-3.8 kHz, plosives 180-240 Hz,
+  unknown -> 440 Hz A4 fallback), word-level concatenation that prefers
+  recorded phonemes from `word_atoms.nova`'s `word_phonemes()` xref when
+  available and otherwise falls back to one tone per character at a
+  word-length-derived carrier, and a single-shot WAV writer that allocates
+  the full byte buffer + writes through `sys_open/sys_write/sys_fsync/
+  sys_close` so the file is durable before any aplay reader opens it
+  (same contract as `snapshot_disk.nova`). `audio_speak.nova` layers
+  Modes 2 + 3 on top: `_try_espeak` uses `fork_process`+`exec_program`+
+  `waitpid` to detect `espeak` on PATH via `command -v`, then shells
+  out `espeak -w PATH 'TEXT'` for a much higher-quality voice; `_try_aplay`
+  best-effort plays via `aplay -q` or `paplay`. Both gracefully fall back
+  to the next mode -- the seam returns success as long as the WAV reached
+  disk, so playback failure does NOT fail the speak call. The chat gets a
+  new `/speak [TEXT]` admin command (default path `/tmp/ce_speech.wav`,
+  override via `CE_SPEECH_PATH`); with no TEXT it speaks the agent's last
+  reply, captured via a `_last_reply` global the main loop updates on each
+  drained event. Acceptance: `tests/unit/test_audio_synth.nova` covers the
+  44-byte RIFF header bytes (incl. canonical PCM marker at offset 36-39
+  and little-endian sample-rate + data-size fields), 8000-sample sine
+  generation (first/last near zero at 1 Hz, peak ~+16000 / min ~-16000),
+  zero-sample edge case, 1200-sample phoneme invariant including the
+  unknown-label fallback and a 3500 Hz fricative, multi-word + empty-text
+  + lang-KG-overrides-fallback paths for `synth_text`, and the on-disk
+  WAV round-trip (write `[0,0,0]` to /tmp/ce_test_audio.wav, sys_read the
+  first 4 bytes back, assert `R,I,F,F`; 10-sample run is exactly 64 bytes
+  on disk = 44 header + 20 PCM) -- 52 assertions across 16 test functions.
+  Verified end-to-end in chat:
+  `printf '/speak hello world\n/quit\n' | ./bin/crossengin-chat` produces
+  `(spoke 'hello world' [synth-only]; wrote /tmp/ce_speech.wav)`, and
+  `file /tmp/ce_speech.wav` reports
+  `RIFF (little-endian) data, WAVE audio, Microsoft PCM, 16 bit, mono 8000 Hz`
+  (24044 bytes). In this sandbox neither `espeak` nor `aplay`/`paplay`
+  is installed, so Mode 1 carries the seam end-to-end; Modes 2 and 3 are
+  exercised by their detection code at runtime and skipped silently.
+- Phase 20 Tier-4 item #2 -- distributed-substrate seam: **complete**.
+  New `src/io/transducers/kg_sync.nova` defines a one-op-per-line text
+  wire protocol for atom-birth events plus the publisher + subscriber
+  socket halves. Operations: `HELLO ce-kg-sync v1` / `OK v1 protocol
+  accepted` (handshake), `SUB *` (subscribe to all atoms), `ATOM
+  <kg_label> <id> <kind> <alpha> <beta> <label>` (one atom birth),
+  `ACK <id>` (per-atom ack), `BYE` (graceful close), `ERR <reason>`
+  (handshake refusal). Defaults match the rest of the repo's safe-bind
+  pattern: 127.0.0.1 (override `CE_KGSYNC_BIND=0.0.0.0`), port 8766
+  (override `CE_KGSYNC_PORT`), subscriber host `127.0.0.1` (override
+  `CE_KGSYNC_HOST`). Two new artifacts compose it: `bin/crossengin-kg-
+  publisher` (binds + accepts ONE subscriber + reads labels from stdin +
+  emits atom-births) and `bin/crossengin-kg-subscriber` (dials in +
+  handshake + applies received atoms to its own KG). The main
+  `bin/crossengin` daemon is intentionally untouched -- this is the seam,
+  not the multi-process refactor. Acceptance:
+  `tests/unit/test_kg_sync.nova` covers format/parse round-trip,
+  malformed-line rejection, CRLF/LF normalization, dash + underscore
+  label preservation, and the IP-string parser -- 53 assertions across
+  20 test functions. `tests/integration/scenario_g_kg_sync.sh` spawns
+  both binaries against a per-run high port, drives `widget`/`gadget`/
+  `fever` through the publisher's stdin, and asserts the subscriber's
+  stdout shows all three `recv ... label=X` lines plus a final
+  `local kg=3` (13 assertions; the script prints SKIP if `socket(2,1,0)`
+  itself fails so a denying sandbox doesn't break CI). Sample manual
+  smoke (verified): `./bin/crossengin-kg-subscriber > /tmp/sub.out &`
+  then `printf 'widget\n' | ./bin/crossengin-kg-publisher` produces
+  `recv kg=language id=0 label=widget` in /tmp/sub.out.
 - Phase 18 Tier-3 item #3 -- multi-tenant session foundation: **complete**.
   New `src/session/session.nova` (ADR-0051) defines a Session struct -- a
   flat 15-slot bundle (id, name, created_at, last_active, soul, kgreg, kg,
@@ -341,7 +415,10 @@ is standalone.
 |--------|------|--------------|--------|
 | io/effectors/output_generation.nova | 0013, 0015, 0007 | 10 | done |
 | io/effectors/effector_gate.nova | 0041..0045, 0043, 0013 | 23 | done |
+| io/effectors/audio_synth.nova (Phase 19 Tier-4 #1: audio modality bridge -- WAV + sine + phoneme synth) | 0014, 0015, 0013 | 52 | done |
+| io/effectors/audio_speak.nova (Phase 19 Tier-4 #1: audio modality bridge -- espeak/aplay escalation) | 0014 | 0 | done |
 | io/transducers/input_transducer.nova | 0014, 0011, 0012, 0021 | 19 | done |
+| io/transducers/kg_sync.nova (Phase 20 Tier-4 #2: distributed-substrate seam) | 0014, 0016 | 53 | done |
 
 Pure substrate, NO LLM (ADR-0014): `output_generation` produces text by the
 reverse of comprehension (intent -> real word atoms -> learned syntax ordering),
@@ -350,6 +427,39 @@ intent-before/outcome-after decision-log entries (the SPEAK effector is fully
 implemented; governed speak vetoes forbidden output by its text). File/network/
 message transport and audio STT/TTS are the documented runtime seams (NOVA
 enhancements #11/#14); all gate/log/generation logic is real and tested.
+
+Phase 20 / Tier 4 item #2 -- distributed-substrate seam: **complete**.
+New `src/io/transducers/kg_sync.nova` defines a text wire protocol (one op
+per line, `\n` terminated) for atom-birth events plus the publisher +
+subscriber socket halves, and two new artifacts compose it end-to-end:
+`examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher`
+(binds 127.0.0.1:8766 by default, accepts ONE subscriber, reads labels from
+stdin, births an atom + pushes it on the wire) and
+`examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber`
+(dials the publisher, sends `HELLO ce-kg-sync v1` + `SUB *`, reads
+`ATOM <kg> <id> <kind> <alpha> <beta> <label>` lines, ACKs each, installs
+into its own local KG). Wire ops: `HELLO ce-kg-sync v1`, `OK v1 protocol
+accepted`, `SUB *`, `ATOM kg id kind alpha beta label`, `ACK <id>`,
+`BYE`, `ERR <reason>`. Defaults: bind `127.0.0.1` (opt in to broader via
+`CE_KGSYNC_BIND=0.0.0.0`, mirroring web.py); port 8766 (override via
+`CE_KGSYNC_PORT`); subscriber host `127.0.0.1` (override via
+`CE_KGSYNC_HOST`). The main `bin/crossengin` daemon is intentionally NOT
+modified -- rolling kg_sync into its idle path is a future enhancement.
+Acceptance: `tests/unit/test_kg_sync.nova` covers format/parse round-trip,
+malformed line rejection (missing fields, wrong op, non-numeric numerics,
+illegal label chars), CRLF + LF eol handling, dash/underscore label
+preservation, and the IP-string -> packed-int helper -- 53 assertions
+across 20 test functions; `tests/integration/scenario_g_kg_sync.sh`
+spawns both binaries against a per-run port, sends three labels through
+the publisher's stdin, and asserts the subscriber's stdout shows
+`recv ... label=widget`, `... label=gadget`, `... label=fever` plus a
+final `local kg=3` (13 assertions). Sandbox-quirk handling: the script
+prints a `SKIP` block if `socket(2,1,0)` returns -1 (some sandboxes
+disallow AF_INET entirely) so the rest of the suite keeps passing.
+Sample manual smoke: `./bin/crossengin-kg-subscriber > /tmp/sub.out &`
+then `printf 'widget\ngadget\nfever\n' | ./bin/crossengin-kg-publisher`
+yields three `recv kg=language id=N label=...` lines in `/tmp/sub.out`,
+verified locally.
 
 README updated to v0.9.
 
@@ -477,10 +587,10 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 93 (9 substrate + 7 knowledge + 10 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 2 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3 + 1 meta-observer `test_meta_observer` added Phase 13 Tier-2 item #1 + 1 structural-neighborhood `test_neighborhood_activation` added Phase 14 Tier-2 item #2 + 1 session `test_session` added Phase 18 Tier-3 item #3); **1715 assertions** (delta = +22 from `test_learn_tag.nova`, +39 from `test_meta_observer.nova`, +31 from `test_neighborhood_activation.nova` Phase 14 Tier-2 #2 = +30 new + 1 added to `test_spreading_activation.nova` for the round-trip path, +66 from `test_session.nova` Phase 18 Tier-3 #3).
-- Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
+- Total unit suites: 95 (9 substrate + 7 knowledge + 10 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 2 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3 + 1 meta-observer `test_meta_observer` added Phase 13 Tier-2 item #1 + 1 structural-neighborhood `test_neighborhood_activation` added Phase 14 Tier-2 item #2 + 1 session `test_session` added Phase 18 Tier-3 item #3 + 1 kg-sync `test_kg_sync` added Phase 20 Tier-4 item #2 + 1 audio-synth `test_audio_synth` added Phase 19 Tier-4 item #1); **~1820 assertions** (delta = +22 from `test_learn_tag.nova`, +39 from `test_meta_observer.nova`, +31 from `test_neighborhood_activation.nova` Phase 14 Tier-2 #2 = +30 new + 1 added to `test_spreading_activation.nova` for the round-trip path, +66 from `test_session.nova` Phase 18 Tier-3 #3, +53 from `test_kg_sync.nova` Phase 20 Tier-4 #2, +52 from `test_audio_synth.nova` Phase 19 Tier-4 #1).
+- Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 12 scripts under `tests/integration/` covering 6 multi-step scenarios (durability across SIGKILL, neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke) and 5 admin-command edge-case scripts, with 110 assertions across the suite. Run with `make integration`.
+- Total integration tests: 13 scripts under `tests/integration/` covering 7 multi-step scenarios (durability across SIGKILL, neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync between two processes) and 5 admin-command edge-case scripts, with 123 assertions across the suite (+13 from `scenario_g_kg_sync.sh` Phase 20 Tier-4 #2). Run with `make integration`.
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution
