@@ -82,6 +82,9 @@ assert_file_exists() {
 
 # Pipe the given text into the chat once, capture stdout+stderr, and echo it
 # back. Always feeds /quit as the final line so the process terminates.
+# P0.7: each chat invocation starts with a fresh dlog file. Tests that need
+# durable rehydrate (scenario_a3_dlog.sh) export CE_DLOG_PATH themselves so
+# their dedicated path survives between the kill and the reopen.
 run_chat() {
     local input="$1"
     # Append /quit if not already present. (Caller often passes it explicitly
@@ -89,6 +92,12 @@ run_chat() {
     if ! echo "$input" | grep -qE '^/quit|^/exit|^quit|^exit'; then
         input="${input}
 /quit"
+    fi
+    # Wipe the default dlog so /history before any decision sees an empty
+    # log. A test that wants to test rehydrate sets CE_DLOG_PATH explicitly
+    # and is responsible for its own cleanup.
+    if [ -z "${CE_DLOG_PATH:-}" ]; then
+        rm -f /tmp/crossengin.dlog
     fi
     printf '%s\n' "$input" | "$CHAT" 2>&1
 }

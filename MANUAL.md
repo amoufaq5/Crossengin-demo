@@ -189,6 +189,20 @@ atomic rename + parent-dir fsync) to `$CE_SNAP_PATH` (default
 falls back to the in-memory image only if the read fails, so the "durable via
 write_tmp->fsync->atomic_rename" line above is now literally true.
 
+**P0.6 wall-clock pacing.** Export `CE_REALTIME=1` to make the scheduler tick
+at actual 100Hz / 10Hz instead of "as fast as the host permits"; the daemon
+prints a `pacer: <N> ticks, <M> overruns (max <K>ms over budget)` line at exit
+when pacing is enabled. Disabled by default so unit tests stay full speed.
+
+**P0.7 decision-log durability.** Every `dl_append` is also written to a
+pipe-separated, append-only file at `$CE_DLOG_PATH` (default
+`/tmp/crossengin.dlog`); fsync is batched (`CE_DLOG_FSYNC_EVERY=16` entries or
+`CE_DLOG_FSYNC_INTERVAL_MS=1000` ms, whichever fires first). On boot the chat
+and daemon both call `dl_open` to rehydrate the chain; a corrupt tail (likely
+a crash mid-write) is truncated with a `warning -- truncated corrupt tail`
+line. The dlog lives at its own path so a `/load` of the snapshot does NOT
+roll back audit history (ADR-0043 "durable-but-separate").
+
 Run via the launcher without installing if you prefer:
 
 ```sh
@@ -221,9 +235,23 @@ agent> see treat
 > /resume                    un-halt
 > /speak hello world         synthesize speech (or `/speak` alone speaks the
 >                            agent's last reply) -> /tmp/ce_speech.wav
+> /switch alice              activate session 'alice' (creates fresh if absent)
+> /switch                    list every session; `*` marks active
 > /help                      full listing
 > /quit                      exit
 ```
+
+`/switch` is the in-process multi-tenant routing surface (Phase 18 / Half A,
+ADR-0051). At boot the chat registers a single session under the id `default`
+with display name `"Aurora"`. `/switch <id>` swaps the live state to that
+session's soul / KGs / decision log / engine / observer / scheduler — every
+subsequent message lands in the new tenant's KG, and `/teach widget` in
+session A is invisible to session B. Existing `bin/crossengin-chat`
+invocations stay bit-identical to before because no `/switch` is ever
+issued and the default is the only registered session. The substrate's part
+registry, gate router, learning-trigger arbiter, moment stream, and
+episodic memory are intentionally process-shared; only the cognitive state
+flips on `/switch`.
 
 `/halt` flips the same safety bit `effector_speak_governed` checks (ADR-0044
 hard stop) — the substrate keeps perceiving, reasoning, and learning, but
@@ -376,11 +404,16 @@ in: `printf 'fever\nhello\nquit\n' | ./scripts/chat.sh`.
 
 ### Run as a web app (browser UI)
 
-`scripts/web.py` is a tiny stdlib-only Python frontend that spawns
-`bin/crossengin-chat` as one persistent child and serves a browser chat at
-`http://localhost:8765/`. State carries across HTTP requests because the same
-child handles them all — admin commands (`/teach`, `/reflect`, `/learn`,
-`/status`, `/halt`, …) work the same as in the terminal.
+`scripts/web.py` is a tiny stdlib-only Python frontend that serves a browser
+chat at `http://localhost:8765/` and spawns **one `bin/crossengin-chat` child
+per unique session cookie** (Phase 18 Half B). Every HTTP request comes in
+with (or gets a fresh) `Set-Cookie: ce_sid=<UUID>; Path=/; HttpOnly; SameSite=Strict`
+header; the server routes the request to that cookie's child, so two
+browsers / users hitting the same server get isolated cognitive state. State
+carries across HTTP requests because the cookie's child stays alive between
+them — admin commands (`/teach`, `/reflect`, `/learn`, `/status`, `/halt`,
+`/switch`, …) all work the same as in the terminal but ONLY affect the
+caller's session.
 
 ```sh
 make install
@@ -388,21 +421,45 @@ python3 scripts/web.py
 # open http://localhost:8765/ in a browser
 ```
 
-Override the port or binary path with env vars: `CE_PORT=9000` /
-`CE_BIN=./bin/crossengin-chat`. No `pip install` — needs only Python 3.7+.
+Override the port, binary path, or per-cookie session cap with env vars:
+`CE_PORT=9000` / `CE_BIN=./bin/crossengin-chat` /
+`CE_WEB_MAX_SESSIONS=16` (default 8; least-recently-used cookies are evicted
+cleanly via `/quit` when the cap is exceeded). No `pip install` — needs
+only Python 3.7+.
 
 The protocol is a single `POST /api/chat` with JSON `{"message": "..."}`
-returning `{"reply": "..."}`. Plain `curl` works:
+returning `{"reply": "..."}`. `curl --cookie-jar` threads the Set-Cookie
+back into the next request on the same jar so plain `curl` runs the same
+session-isolated experience the browser does:
 
 ```sh
-curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"message":"fever"}' http://localhost:8765/api/chat
-# {"reply": "agent> see headache"}
+# First request: server returns Set-Cookie; jar.txt captures the UUID.
+curl -s --cookie-jar /tmp/jar.txt --cookie /tmp/jar.txt \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"message":"/teach widget"}' http://localhost:8765/api/chat
+# {"reply": "(ingested 'widget' -- 573 atoms now)"}
 
-curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"message":"/reflect"}' http://localhost:8765/api/chat
-# {"reply": "(reflected on 6 concept(s); 4 tentative inference(s):
-#   doctor, prescription, medicine, recover)  refl_kg=4"}
+# Same jar -> same session -> the agent remembers widget.
+curl -s --cookie-jar /tmp/jar.txt --cookie /tmp/jar.txt \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"message":"widget"}' http://localhost:8765/api/chat
+# {"reply": "agent> okay\n       perceive(m=1,unk=0)"}
+
+# Different jar -> different session -> widget is unknown.
+curl -s --cookie-jar /tmp/jar_B.txt --cookie /tmp/jar_B.txt \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"message":"widget"}' http://localhost:8765/api/chat
+# {"reply": "agent> okay\n       perceive(m=0,unk=1) ..."}
+```
+
+A read-only diagnostic endpoint is exposed for ops introspection:
+
+```sh
+curl -s http://localhost:8765/api/sessions
+# {"sessions": [
+#   {"id": "<UUID>", "last_active_ms": 1748..., "age_ms": 4521},
+#   {"id": "<UUID>", "last_active_ms": 1748..., "age_ms": 1207}
+# ]}
 ```
 
 ### Distributed KG sync (publisher / subscriber)

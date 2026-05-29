@@ -44,6 +44,7 @@ import "../src/seed/first_atoms.nova"
 import "../src/parts/meta/reflection_loop.nova"
 import "../src/parts/meta/meta_observer.nova"
 import "../src/persistence/snapshot_disk.nova"
+import "../src/session/session.nova"
 
 let CE_CAP   = 128
 let CE_FIRST = 8
@@ -59,6 +60,16 @@ let halted = 0
 // `/speak` (Phase 19 Tier-4 #1): the agent's last reply, captured after each
 // drained event. `/speak` with no text speaks this; mutated by the main loop.
 let _last_reply = ""
+
+// Phase 18 (Half A): in-process multi-tenant routing. `sreg` is the
+// SessionRegistry (built at boot); `active_id` is the id of the session every
+// turn currently dispatches into. `/switch <id>` flips `active_id` (creating
+// a fresh session under that id if it does not yet exist). The default
+// session is "default" with display-name "Aurora" -- existing
+// ./bin/crossengin-chat invocations stay bit-identical to before because no
+// /switch is ever issued.
+let sreg = sreg_new()
+let active_id = "default"
 
 // ---- buffered line reader ------------------------------------------------
 // io_input() returns whatever sys_read drained -- on a terminal in line mode
@@ -190,17 +201,25 @@ fn _admin_help() {
     io_println("  /meta               per-source promotion / atrophy rates")
     io_println("  /speak [TEXT]       synthesize and play TEXT (or last reply); writes")
     io_println("                      /tmp/ce_speech.wav and plays via aplay if available")
+    io_println("  /switch [ID]        list sessions (no arg) or activate/create ID")
     io_println("  /quit  /exit        exit chat")
     return 1
 }
 
-fn _admin_status(sl, kg, refl_kg, log, engine, hs) {
+fn _admin_status(sl, kg, refl_kg, log, engine, hs, stream, em, syn_g, sm) {
     io_println("soul     : " + soul_name(sl) + " (purpose: " + soul_purpose(sl) + ")")
     io_println("mood     : valence=" + int_to_str(soul_mood_valence(sl))
         + " arousal=" + int_to_str(soul_mood_arousal(sl)))
     io_println("knowledge: " + int_to_str(kg_atom_count(kg)) + " atoms in shared KG, "
         + int_to_str(refl_size(refl_kg)) + " tentative reflections")
     io_println("audit    : " + int_to_str(dl_count(log)) + " decision-log entries")
+    // P0.1 follow-up: surface the durable-snapshot subsystems so a /load can
+    // be verified post-restart by reading /status. The headline acceptance
+    // test asserts moments/synapses survive a round-trip.
+    io_println("moments  : " + int_to_str(ms_count(stream)) + " moment(s), "
+        + int_to_str(em_count(em)) + " episode(s)")
+    io_println("synapses : " + int_to_str(syn_live(syn_g)) + " live edge(s) (reasoning part)")
+    io_println("selfmodel: " + int_to_str(self_model_count(sm)) + " competence record(s)")
     io_println("scheduler: tick=" + int_to_str(hs_now(hs)) + " rate=" + int_to_str(hs_rate(hs)) + "Hz")
     let g = goal_arbitrate(engine)
     if g >= 0 {
@@ -660,7 +679,7 @@ fn _admin_speak(lang, arg) {
 // the chat created with `lang_kg_init`). The legacy first slots are kept
 // ([0]=name for SOUL, [0]=atom_count for KGS) so the daemon's reboot print
 // still works against the same image.
-fn _build_snapshot(sl, kg, lang, now) {
+fn _build_snapshot(sl, kg, lang, stream, em, syn_g, sm, now) {
     let snap = snap_new(1, now)
     snap_put_section(snap, SEC_SOUL, soul_section_build(sl))
     // Combine the concept KG and the language KG into one KGS blob so a
@@ -679,6 +698,15 @@ fn _build_snapshot(sl, kg, lang, now) {
     while j < len(lang_recs) { push(recs, lang_recs[j]); j = j + 1 }
     push(merged, recs)                                       // [1] atoms
     snap_put_section(snap, SEC_KGS, merged)
+    // P0.1 (this edit): EPISODIC / SYNAPSES / SELFMODEL also carry full
+    // payloads. EPISODIC persists moment timestamps/lifecycle/traces and
+    // episode tiers via `stream` + `em`. SYNAPSES persists the reasoning
+    // part's synapse graph (chosen as the most learning-bearing graph --
+    // multi-part synapse capture is a separate phase). SELFMODEL persists
+    // the per-domain competence record list.
+    snap_put_section(snap, SEC_EPISODIC,  episodic_section_build(stream, em))
+    snap_put_section(snap, SEC_SYNAPSES,  synapses_section_build(syn_g))
+    snap_put_section(snap, SEC_SELFMODEL, selfmodel_section_build(sm))
     return snap
 }
 
@@ -694,14 +722,17 @@ fn _snap_path(arg) {
 // /save [PATH]: durably write a snapshot of the live soul + KG to disk.
 // Uses write_tmp -> fsync -> atomic_rename -> fsync(parent) so a crash mid-
 // write never corrupts the last good image.
-fn _admin_save(sl, kg, lang, arg, now) {
+fn _admin_save(sl, kg, lang, stream, em, syn_g, sm, arg, now) {
     let path = _snap_path(arg)
-    let snap = _build_snapshot(sl, kg, lang, now)
+    let snap = _build_snapshot(sl, kg, lang, stream, em, syn_g, sm, now)
     let ok = snap_save(snap, path)
     if ok == 1 {
         io_println("(saved soul=" + soul_name(sl) + " kg=" + int_to_str(kg_atom_count(kg))
             + " atom(s) + lang=" + int_to_str(kg_atom_count(lang))
-            + " atom(s) -> " + path + " durably)")
+            + " atom(s) + " + int_to_str(ms_count(stream))
+            + " moment(s) + " + int_to_str(syn_live(syn_g))
+            + " syn(s) + " + int_to_str(self_model_count(sm))
+            + " competence record(s) -> " + path + " durably)")
     } else {
         io_println("(save FAILED: could not write " + path + " -- check directory exists / permissions)")
     }
@@ -710,16 +741,14 @@ fn _admin_save(sl, kg, lang, arg, now) {
 
 // /load [PATH]: read a snapshot from disk and rehydrate the live substrate.
 //
-// Policy: REPLACE BY LABEL. SOUL is overwritten in place (name / purpose /
-// identity / mood / OCEAN / constitution all swap to the snapshot values).
-// The KGS blob is applied with `kg_section_apply` -- atoms are merged BY
-// LABEL into the existing KGs (the seed has already been installed at chat
-// boot, so the snapshot's "self" atom for example refreshes the seed's
-// rather than orthogonally re-creating it). Atoms with novel labels (the
-// user's taught vocabulary, e.g. "widget") are created fresh in the matching
-// KG. Old-format snapshots (no `kgs.atoms.count` line) apply zero atoms and
-// the load surface explains that the file predates Phase 11.
-fn _admin_load(sl, kg, lang, kgreg, arg, now) {
+// Policy: REPLACE BY LABEL for KGS atoms (idempotent merge). For EPISODIC /
+// SYNAPSES / SELFMODEL the policy is straight REPLACE -- the snapshot is the
+// new ground truth, and a /load is "boot from this state", not "merge". The
+// live `stream` / `em` get wiped to length zero before reinstalling moments
+// + episodes; the reasoning part's synapse graph gets each pre->post edge
+// overwritten (idempotent on a second /load); the self-model gets cleared
+// + reinstalled.
+fn _admin_load(sl, kg, lang, kgreg, stream, em, syn_g, sm, arg, now) {
     let path = _snap_path(arg)
     let snap = snap_load(path)
     if snap == 0 {
@@ -728,6 +757,9 @@ fn _admin_load(sl, kg, lang, kgreg, arg, now) {
     }
     let soul_p = snap_has_section(snap, SEC_SOUL)
     let kgs_p = snap_has_section(snap, SEC_KGS)
+    let ep_p  = snap_has_section(snap, SEC_EPISODIC)
+    let syn_p = snap_has_section(snap, SEC_SYNAPSES)
+    let sm_p  = snap_has_section(snap, SEC_SELFMODEL)
     let before_kg = kg_atom_count(kg)
     let before_lang = kg_atom_count(lang)
     io_println("(loaded " + path + ":"
@@ -761,9 +793,23 @@ fn _admin_load(sl, kg, lang, kgreg, arg, now) {
             }
         }
     }
-    io_println("  episodic.present=" + int_to_str(snap_has_section(snap, SEC_EPISODIC))
-        + " synapses.present=" + int_to_str(snap_has_section(snap, SEC_SYNAPSES))
-        + " selfmodel.present=" + int_to_str(snap_has_section(snap, SEC_SELFMODEL)))
+    if ep_p == 1 {
+        let eb = snap_section(snap, SEC_EPISODIC)
+        let restored = episodic_section_apply(stream, em, eb)
+        io_println("  episodic: " + int_to_str(restored) + " moment(s) + "
+            + int_to_str(em_count(em)) + " episode(s) restored")
+    }
+    if syn_p == 1 {
+        let sb = snap_section(snap, SEC_SYNAPSES)
+        let n = synapses_section_apply(syn_g, sb)
+        io_println("  synapses: " + int_to_str(n) + " edge(s) restored (threshold="
+            + int_to_str(sb[0]) + " milli)")
+    }
+    if sm_p == 1 {
+        let mb = snap_section(snap, SEC_SELFMODEL)
+        let n = selfmodel_section_apply(sm, mb)
+        io_println("  selfmodel: " + int_to_str(n) + " competence record(s) restored")
+    }
     return 1
 }
 
@@ -844,26 +890,117 @@ fn _mo_pad(s, width) {
     return out
 }
 
-fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, now) {
+// ---- session bootstrap helper --------------------------------------------
+// Build a fresh Session value with a default-shaped soul, KG registry, all
+// three KGs with the seed applied, reflection KG, ctx, decision log, goal
+// engine, meta-observer (seeded sources attributed), and a per-tenant
+// hybrid scheduler attached to the SHARED substrate `reg`. Returns the
+// constructed Session ready for sreg_register. Mirrors the boot block in
+// main() byte-for-byte so a /switch into a brand-new id is indistinguishable
+// from a fresh process boot.
+fn _new_session_for(reg, id, name, now) {
+    let sl = soul_new(name)
+    soul_set_identity(sl, "understand and assist", "curious")
+    soul_set_ocean(sl, 700, 600, 500, 800, 300)
+    soul_add_constitution(sl, "exfiltrate", CONST_BLOCK)
+    let kgreg = kg_registry_new()
+    let kg = reasoning_kg_init(kgreg)
+    let lang = lang_kg_init(kgreg)
+    let ikg = imagination_kg_init(kgreg)
+    seed_apply(kg, lang, ikg, 0)
+    let ctx = ctx_new()
+    let log = dl_new()
+    let engine = goal_engine_new()
+    goal_new(engine, "assist the user", 800, 0, 0, 0)
+    let refl_kg = refl_kg_init(kgreg)
+    let mo = mo_new()
+    let mo_seed_n = kg_atom_count(kg)
+    let mo_si = 0
+    while mo_si < mo_seed_n {
+        mo_attribute(mo, "seed", mo_si)
+        mo_si = mo_si + 1
+    }
+    let hs = hs_new(reg)
+    return session_make(id, name, now, sl, kgreg, kg, lang, ikg, refl_kg,
+                        ctx, log, engine, mo, hs)
+}
+
+// ---- /switch: in-process tenant routing ----------------------------------
+// `/switch <id>` activates an existing session under that id, or creates one
+// fresh if absent. `/switch` (no arg) lists all known sessions with a `*`
+// marker on the active row. Mutates `active_id` (the top-level mutable that
+// the main loop reads at the top of every turn -- same NOVA pattern the
+// `halted` flag uses).
+fn _admin_switch(reg, arg, now) {
+    if len(arg) == 0 {
+        // List mode.
+        let ids = sreg_ids(sreg)
+        let n = len(ids)
+        io_println("sessions (" + int_to_str(n) + " total):")
+        let i = 0
+        while i < n {
+            let id = ids[i]
+            let s = sreg_lookup(sreg, id)
+            let marker = " "
+            if str_eq(id, active_id) == 1 { marker = "*" }
+            let atoms = kg_atom_count(session_kg(s))
+            let last = now - session_last_active(s)
+            io_println("  " + marker + _mo_pad(id, 14)
+                + "\"" + session_name(s) + "\""
+                + _mo_pad("", 4)
+                + int_to_str(atoms) + " atoms"
+                + _mo_pad("", 3)
+                + "last " + int_to_str(last) + "s ago")
+            i = i + 1
+        }
+        io_println("(* = active)")
+        return 1
+    }
+    // Activate or create.
+    let existing = sreg_lookup(sreg, arg)
+    if existing != 0 {
+        active_id = arg
+        session_touch(existing, now)
+        let atoms = kg_atom_count(session_kg(existing))
+        io_println("(switched to session '" + arg + "' ("
+            + session_name(existing) + ", " + int_to_str(atoms) + " atoms))")
+        return 1
+    }
+    // Create a fresh session under this id. Default display name = "Default"
+    // (consistent with the brief's example output line).
+    let fresh = _new_session_for(reg, arg, "Default", now)
+    sreg_register(sreg, fresh)
+    active_id = arg
+    let atoms = kg_atom_count(session_kg(fresh))
+    io_println("(created and switched to new session '" + arg
+        + "' (Default, " + int_to_str(atoms) + " atoms))")
+    return 1
+}
+
+fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, reg, stream, em, syn_g, sm, now) {
     if len(msg) == 0 { return 0 }
     if char_at(msg, 0) != 47 { return 0 }   // not '/'
     let parts = _split_cmd(msg)
     let cmd = parts[0]
     let arg = parts[1]
-    if str_eq(cmd, "/quit") == 1 { io_println("bye.") exit(0) }
-    if str_eq(cmd, "/exit") == 1 { io_println("bye.") exit(0) }
+    // P0.7: shutdown lines. dl_close flushes any pending dlog batch so a
+    // clean /quit doesn't lose the last entries; the daemon's atexit-style
+    // path is the main-loop fall-through.
+    if str_eq(cmd, "/quit") == 1 { io_println("bye.") dl_close(log) exit(0) }
+    if str_eq(cmd, "/exit") == 1 { io_println("bye.") dl_close(log) exit(0) }
     if str_eq(cmd, "/help")    == 1 { return _admin_help() }
-    if str_eq(cmd, "/status")  == 1 { return _admin_status(sl, kg, refl_kg, log, engine, hs) }
+    if str_eq(cmd, "/status")  == 1 { return _admin_status(sl, kg, refl_kg, log, engine, hs, stream, em, syn_g, sm) }
     if str_eq(cmd, "/why")     == 1 { return _admin_why(log) }
     if str_eq(cmd, "/halt")    == 1 { return _admin_halt() }
     if str_eq(cmd, "/resume")  == 1 { return _admin_resume() }
     if str_eq(cmd, "/teach")   == 1 { return _admin_teach(lang, kg, mo, arg, now) }
     if str_eq(cmd, "/learn")   == 1 { return _admin_learn(lang, kg, arg, now) }
     if str_eq(cmd, "/reflect") == 1 { return _admin_reflect(ctx, kg, ikg, refl_kg, arg, now) }
-    if str_eq(cmd, "/save")    == 1 { return _admin_save(sl, kg, lang, arg, now) }
-    if str_eq(cmd, "/load")    == 1 { return _admin_load(sl, kg, lang, kgreg, arg, now) }
+    if str_eq(cmd, "/save")    == 1 { return _admin_save(sl, kg, lang, stream, em, syn_g, sm, arg, now) }
+    if str_eq(cmd, "/load")    == 1 { return _admin_load(sl, kg, lang, kgreg, stream, em, syn_g, sm, arg, now) }
     if str_eq(cmd, "/speak")   == 1 { return _admin_speak(lang, arg) }
     if str_eq(cmd, "/meta")    == 1 { return _admin_meta(mo, refl_kg, kg, now) }
+    if str_eq(cmd, "/switch")  == 1 { return _admin_switch(reg, arg, now) }
     if str_eq(cmd, "/history") == 1 {
         let n = 5
         if len(arg) > 0 { n = rt_str_to_int(arg) }
@@ -884,62 +1021,69 @@ fn main() {
     io_println("type /help for admin commands (/teach, /pin, /status, /halt, ...)")
     io_println("")
 
-    // Boot: soul, substrate, ONE shared concept KG (seed installs core +
-    // medical demo), scheduler, learning arbiter.
-    //
-    // (Phase 18 multi-tenant note: the state below is currently the single
-    //  session. A multi-tenant deployment would wrap it as:
-    //    let sess = session_make(id, name, now, sl, kgreg, kg, lang, ikg,
-    //                            refl_kg, ctx, log, engine, mo, hs)
-    //    sreg_register(sreg, sess)
-    //  ... then drive the loops over session_*(sess) accessors. The chat is
-    //  intentionally NOT yet wrapped; this is the ADR-0051 foundation pass.
-    //  See src/session/session.nova.)
-    let sl = soul_new("Aurora")
-    soul_set_identity(sl, "understand and assist", "curious")
-    soul_set_ocean(sl, 700, 600, 500, 800, 300)
-    soul_add_constitution(sl, "exfiltrate", CONST_BLOCK)
+    // Substrate-side, PROCESS-SHARED state. The part registry, gate router,
+    // and learning trigger arbiter route activation across all tenants --
+    // they are not part of the per-session bundle (see ADR-0051; the Session
+    // struct holds COGNITIVE state -- soul, KGs, ctx, log, engine, mo, hs --
+    // not substrate plumbing). `stream` (moment stream) and `em` (episodic
+    // memory) are also shared today; the Session shape can grow slots for
+    // them later if cross-tenant bleed becomes observable.
     let reg = part_registry_new()
     registry_spawn_fixed(reg, CE_CAP, CE_FIRST)
     pl_spawn_kg(reg, "world", CE_CAP, CE_FIRST)
-    let kgreg = kg_registry_new()
-    let kg = reasoning_kg_init(kgreg)
-    let lang = lang_kg_init(kgreg)
-    let ikg = imagination_kg_init(kgreg)
-    seed_apply(kg, lang, ikg, 0)
-    let world_kg_id = atom_kg(kg_find_atom(kg, "fever"))
-    let reader = reader_new(kgreg, lang, 0)
-    let stream = ms_new()
-    let em = em_new()
-    let cands = list_new()
-    push(cands, syntax_find(lang, "ack"))
-    push(cands, syntax_find(lang, "see_topic"))
-    let engine = goal_engine_new()
-    goal_new(engine, "assist the user", 800, 0, 0, 0)
-    let log = dl_new()
-    let ctx = ctx_new()
-    let hs = hs_new(reg)
     let gate = gate_new(reg)
     gate_seed_from_parts(gate, reg)
     let arb = slt_arbiter_new()
-    let refl_kg = refl_kg_init(kgreg)
-    // ADR-0050: meta-learning observer. Attribute the seed-installed
-    // contiguous ID block as "seed" so per-source promotion / atrophy rates
-    // have a baseline; further attribution happens at /teach time.
-    let mo = mo_new()
-    let mo_seed_n = kg_atom_count(kg)
-    let mo_si = 0
-    while mo_si < mo_seed_n {
-        mo_attribute(mo, "seed", mo_si)
-        mo_si = mo_si + 1
+    let stream = ms_new()
+    let em = em_new()
+    // P0.1 (this edit): synapse graph + self-model are also shared across
+    // sessions for now. We choose the "reasoning" part's synapse graph as the
+    // persistence target -- it's the part where Hebbian learning between
+    // concept neurons happens, so it's the most learning-bearing graph.
+    // (Multi-part synapse capture is a separate phase; the wire format does
+    // not yet carry a part id.) The self-model starts empty; competence
+    // assessment is run on demand from the live KGs.
+    let reasoning_part = registry_get(reg, registry_find(reg, "reasoning"))
+    let syn_g = part_syn(reasoning_part)
+    let sm = self_model_new()
+
+    // Phase 18 Half A: install the default session ("default" / "Aurora") in
+    // the registry. Every subsequent turn looks up the active session via
+    // `active_id` and re-binds the cognitive locals. Bit-identical behaviour
+    // for vanilla ./bin/crossengin-chat (no /switch issued) because the only
+    // registered session at boot is the default and `active_id` starts at
+    // "default".
+    sreg_register(sreg, _new_session_for(reg, "default", "Aurora", 0))
+
+    // P0.7: wire the default session's dlog to its durable file. Path comes
+    // from CE_DLOG_PATH (default /tmp/crossengin.dlog); a failed open leaves
+    // the dlog in-memory (a warning prints) so the chat still boots. The
+    // existing /history admin reads dl_get; that surface is unchanged.
+    let _dlog_env = getenv("CE_DLOG_PATH")
+    let _dlog_path = "/tmp/crossengin.dlog"
+    if _dlog_env != 0 {
+        if len(_dlog_env) > 0 { _dlog_path = _dlog_env }
     }
+    let _boot_log = session_log(sreg_lookup(sreg, active_id))
+    let _dlog_ok = dl_open(_boot_log, _dlog_path)
+    if _dlog_ok == 0 {
+        io_println("(warning: dlog could not be opened at " + _dlog_path + " -- in-memory only)")
+    } else {
+        if dl_count(_boot_log) > 0 {
+            io_println("(dlog: " + dl_path(_boot_log) + " loaded "
+                + int_to_str(dl_count(_boot_log)) + " prior entries)")
+        }
+    }
+
     let modulator = 1000
     let error = 0
     let predicted = 300
     let turn = 0
 
-    io_println("(seed: " + int_to_str(kg_atom_count(kg)) + " atoms, "
-        + soul_name(sl) + " ready)")
+    // For the boot banner, peek at the default session's KG.
+    let _boot_sess = sreg_lookup(sreg, active_id)
+    io_println("(seed: " + int_to_str(kg_atom_count(session_kg(_boot_sess))) + " atoms, "
+        + soul_name(session_soul(_boot_sess)) + " ready)")
     io_println("")
 
     while 1 == 1 {
@@ -947,18 +1091,53 @@ fn main() {
         let msg = _take_line()
         if len(msg) == 0 {
             io_println("bye.")
+            dl_close(_boot_log)
             return 0
         }
         if str_eq(msg, "quit") == 1 {
             io_println("bye.")
+            dl_close(_boot_log)
             return 0
         }
         if str_eq(msg, "exit") == 1 {
             io_println("bye.")
+            dl_close(_boot_log)
             return 0
         }
 
-        if _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, hs_now(hs)) == 1 {
+        // ---- per-turn: bind cognitive locals from the active session ----
+        // This is the load-bearing re-bind: `/switch` mutates `active_id`,
+        // so the NEXT iteration picks up the new session's soul / KG / ctx
+        // / log automatically. Per-session reader / world_kg_id / cands are
+        // re-derived here too so they reflect the active session's KGs.
+        let sess = sreg_lookup(sreg, active_id)
+        let sl = session_soul(sess)
+        let kgreg = session_kgreg(sess)
+        let kg = session_kg(sess)
+        let lang = session_lang(sess)
+        let ikg = session_ikg(sess)
+        let refl_kg = session_refl_kg(sess)
+        let ctx = session_ctx(sess)
+        let log = session_log(sess)
+        let engine = session_engine(sess)
+        let mo = session_mo(sess)
+        let hs = session_hs(sess)
+        let world_kg_id = atom_kg(kg_find_atom(kg, "fever"))
+        let reader = reader_new(kgreg, lang, 0)
+        // Build syntax candidates from the active session's language KG.
+        // Skip nulls defensively: a stale snapshot loaded over the seed can
+        // forcibly overwrite the syntax atom's `ltype` to LWORD inside
+        // kg_section_apply, after which syntax_find returns 0. Dropping the
+        // null keeps gen_best_pattern's loop from dereferencing it; the
+        // fallback path (_gen_emit_intent) still produces a reply.
+        let cands = list_new()
+        let _ack = syntax_find(lang, "ack")
+        if _ack != 0 { push(cands, _ack) }
+        let _see = syntax_find(lang, "see_topic")
+        if _see != 0 { push(cands, _see) }
+        session_touch(sess, hs_now(hs))
+
+        if _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, reg, stream, em, syn_g, sm, hs_now(hs)) == 1 {
             // Admin command handled; do not feed to the agent.
         } else {
 

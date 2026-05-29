@@ -17,6 +17,68 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P0.6 real-time wall-clock pacer: **complete**.
+  New `src/scheduler/realtime_pacer.nova` turns the abstract "100Hz active /
+  10Hz idle" tiers into actual wall-clock pacing. The pacer samples
+  `nanotime()` at each tick start, lets the tick body run, samples again,
+  and `sleep_ms`'s the remainder of the 10ms / 100ms budget; if the tick
+  overran, it counts the overrun and the worst-case nanoseconds-over and
+  proceeds without sleeping (so the next tick is on time even if this one
+  slipped). The wrapper `hs_step_paced(hs, modulator, error, pacer)` lives
+  in `hybrid_scheduler.nova` and routes the active/idle budget by reading
+  `hs_rate()`. Pacing is OPT-IN via `CE_REALTIME=1` -- when off, the pacer
+  is a no-op so unit tests stay full-speed. The daemon prints
+  `pacer: <N> ticks, <M> overruns (max <K>ms over budget)` at exit when
+  pacing is enabled. A slow-mo factor (`pacer_set_factor`) multiplies the
+  budget for regression tests that want to stretch wall-clock time without
+  changing call sites. Pacing uses an inline `_imul_raw` asm shim because
+  the budget * factor multiply both operands are well above NOVA's
+  pointer-threshold (0x100000) and would otherwise dispatch into
+  `_nova_mul`'s str_repeat / list_repeat path. Acceptance:
+  `tests/unit/test_realtime_pacer.nova` covers construction defaults, the
+  disabled no-op, real-sleep wall-clock confirmation via raw `nanotime`
+  reads (50ms +/- 15ms), deliberate-overrun reporting, slow-mo (factor 3
+  -> ~60ms wall), factor clamp on non-positive k, multi-tick counter
+  accumulation, and the summary format -- 27 assertions across 8 test
+  functions. Sample smoke: `CE_REALTIME=1 ./bin/crossengin 2>&1 | tail -3`
+  ends with `pacer: 44 ticks, 0 overruns (max 0ms over budget)`.
+- P0.7 decision-log durable path: **complete**.
+  `src/audit/decision_log.nova` gained the runtime seam that was formerly
+  the documented NOVA-enhancement #9. Each `dl_append` now ALSO writes a
+  pipe-separated line to an `O_WRONLY|O_CREAT|O_APPEND` file (path from
+  `getenv("CE_DLOG_PATH")`, default `/tmp/crossengin.dlog`). fsync is
+  batched: every 16 entries (`CE_DLOG_FSYNC_EVERY`) or every 1000 ms
+  (`CE_DLOG_FSYNC_INTERVAL_MS`) since the last fsync, whichever fires
+  first -- so a single-entry burst doesn't pay the full fsync cost but a
+  steady stream still gets a sub-second flush latency. Per-message
+  ADR-0043 trace fields (the bulky visited-node list) are NOT serialized
+  to the on-disk line because they are reconstructible from the snapshot;
+  the hash chain is recomputed at recovery from the same fields, so
+  `dl_verify` still works post-rehydrate (trace is empty in the recovered
+  copy but the chain math agrees). On boot, `dl_open(path, log)` reads
+  every line, replays each through `_dl_apply_line` (bypassing the
+  re-write side-effect), and stops at the first corrupt line; the tail
+  past that point is truncated via a fresh `O_TRUNC` write of the bytes
+  that DID parse, with a `warning -- truncated corrupt tail` line printed
+  to stdout. The dlog is "durable-but-separate" per ADR-0043: it lives at
+  its own path, so a snapshot rehydrate does NOT roll back audit history.
+  New API on top of the existing `dl_append`/`dl_verify`/`dl_get`/
+  `dl_count`: `dl_open(log, path)`, `dl_close(log)`, `dl_path(log)`,
+  `dl_pending_writes(log)`, `dl_is_durable(log)`, `dl_force_fsync(log)`.
+  The daemon and chat both call `dl_open(log, ...)` after `dl_new()` and
+  `dl_close(log)` at exit (the chat hooks `/quit` and `/exit` shutdown
+  paths in `_try_admin` plus the bare `quit`/`exit`/EOF paths in `main`);
+  no new admin command is added (`/history` already covers `dl_get`).
+  Acceptance: `tests/unit/test_decision_log_durable.nova` covers fresh-
+  path open + close, append-writes-to-disk, restart-preserves-entries,
+  multi-entry recovery with follow-up append landing at the right seq,
+  corrupt-tail truncation, batched-fsync threshold via `dl_pending_writes`,
+  and in-memory-only behaviour -- 37 assertions across 7 test functions.
+  `tests/integration/scenario_a3_dlog.sh` drives 3 chat messages, SIGKILL,
+  relaunch, and confirms `/history` shows the prior entries with the
+  `dlog: ... loaded N prior entries` boot banner. Sample smoke:
+  `CE_DLOG_PATH=/tmp/test.dlog ./bin/crossengin && wc -l /tmp/test.dlog`
+  prints `7 /tmp/test.dlog` first run, `14 /tmp/test.dlog` second run.
 - Phase 13 Tier-2 item #1 -- meta-learning observer: **complete**.
   New `src/parts/meta/meta_observer.nova` (ADR-0050) is a low-frequency,
   purely-observational loop: it snapshots per-source atom-belief
@@ -158,18 +220,64 @@ continue. It is updated at every session boundary.
   `session_touch(s, now)`; registry `sreg_new`, `sreg_create(reg, id, name,
   now)`, `sreg_register(reg, sess)`, `sreg_lookup(reg, id)`,
   `sreg_destroy(reg, id)`, `sreg_count(reg)`, `sreg_ids(reg)` (ascending),
-  `sreg_active(reg, max_idle, now)` (inclusive cutoff). Conservative scope:
-  the daemon and chat still run the single-soul path -- the only contact
-  is a multi-line comment block above each boot sequence showing how the
-  state would be wrapped, with a pointer to `src/session/session.nova`.
-  The scheduler is per-session by design (clean tenant isolation, each
-  tenant has its own tick clock / idle counter); revisit if N >> 1.
+  `sreg_active(reg, max_idle, now)` (inclusive cutoff). The scheduler is
+  per-session by design (clean tenant isolation, each tenant has its own
+  tick clock / idle counter); revisit if N >> 1.
   Acceptance: `tests/unit/test_session.nova` covers session_make field
   storage + accessors, session_touch, zero-slot tolerance, registry empty
   state, create + lookup, duplicate-id rejection, pre-built register,
   destroy + no-op destroy, ids sorted ascending, active() inclusive idle
   filter, soul-mutation isolation between sessions, and post-destroy
   survivor integrity -- 66 assertions across 12 test functions.
+- Phase 18 Tier-3 item #3 SECOND HALF -- chat `/switch` + web.py per-cookie
+  routing: **complete**.
+  The chat's `main()` now drives every turn through the SessionRegistry:
+  at boot, the default session (`"default"` / "Aurora") is built via a
+  new `_new_session_for(reg, id, name, now)` helper and inserted into the
+  top-level `sreg`; each iteration of the REPL loop looks up the active
+  session by `active_id` and re-binds the cognitive locals
+  (`sl, kgreg, kg, lang, ikg, refl_kg, ctx, log, engine, mo, hs`) so every
+  admin / message handler operates on the live session's state. New
+  `/switch [ID]` admin command: with no arg it lists each session as
+  `*active id  "name"  N atoms  last Ss ago` (asterisk marks the active
+  row); with an id it activates the existing session or creates a fresh
+  one (default name "Default", full seed installed via the same path the
+  default session uses at boot). The dispatch table grows by exactly one
+  entry. Substrate-side state (part registry, gate router, learning
+  trigger arbiter, moment stream, episodic memory) stays process-shared
+  -- the Session struct holds only cognitive state. Vanilla
+  `./bin/crossengin-chat` is bit-identical to before because no `/switch`
+  is ever issued and the default session is the only registered tenant.
+  `scripts/web.py` was restructured around a new `SessionStore` class
+  that maps `cookie -> [ChatChild, created_ms, last_active_ms]` with an
+  LRU cap (default 8, override `CE_WEB_MAX_SESSIONS`). Cookies follow
+  the `ce_sid=<UUID>; Path=/; HttpOnly; SameSite=Strict` convention;
+  absent or malformed cookies get a freshly-minted UUID via `uuid.uuid4()`
+  and a Set-Cookie response header. The existing per-child `request_lock`
+  still serializes the send-and-wait handshake; a new registry-level lock
+  guards add/evict so two unknown cookies cannot race for the same slot.
+  New diagnostic endpoint `GET /api/sessions` returns
+  `{"sessions":[{id, last_active_ms, age_ms}, ...]}`. Shutdown walks
+  every child and sends `/quit`. One incidental fix: `kg_section_apply`
+  forcibly overwrites all `ATOM_LANG` atoms' `ltype` to `LWORD`, which
+  corrupts the seed's syntax atoms (`"ack"`, `"see_topic"`) after `/load`;
+  the chat now filters `0`s from the `gen_from_intent` candidates list
+  when `syntax_find` returns 0 after a `/load`, falling back to
+  `_gen_emit_intent`. Acceptance:
+  `tests/integration/scenario_h_session_switch.sh` (16 assertions: teach
+  in default, /switch alice, teach gadget, /switch back, verify
+  per-session recognition both directions; the listing format with
+  `* = active`; re-activate the same id; `/help` advertises `/switch`);
+  `tests/integration/scenario_i_web_isolation.sh` (12 assertions: two
+  distinct cookie jars get distinct ce_sid values; A's `/teach widget`
+  is recognized by A but unknown to B; A's state survives B's
+  intervening request; `/api/sessions` lists both with the diagnostic
+  fields; SIGTERM cleans up). A 3-cookie concurrent stress run (3
+  simultaneous `/teach` + query pairs) confirmed no race / interleave:
+  each cookie received only its own taught word's response and
+  cross-cookie isolation held at the read side too. An LRU stress at
+  `CE_WEB_MAX_SESSIONS=3` with 5 sequential cookies evicts the oldest
+  two as expected.
 - Phase 15 Tier-2 item #3 -- multi-source `/learn`: **complete**.
   `scripts/learn.sh` now accepts a bare TOPIC (Wikipedia, unchanged), an
   http(s):// URL (fetched verbatim), or a local `/abs|./rel|../rel` file
@@ -193,6 +301,43 @@ continue. It is updated at every session boundary.
   xrefs to same-labeled concept atoms). Acceptance test passes: after
   `/teach widget` + `/save`, a re-launched chat with `/load` recognizes
   `widget` (`perceive(m=1,unk=0)`).
+- Phase 11 P0.1 follow-up -- full EPISODIC + SYNAPSES + SELFMODEL section
+  serialization: **complete**. The remaining three snapshot sections now carry
+  their full payloads, closing the daemon-restart gap that previously lost
+  every moment, synapse weight, and competence reading. EPISODIC persists per
+  moment (timestamp, lifecycle PERCEIVED/SETTLED/CONSOLIDATED, valence/salience,
+  the list of atom ids in the moment's trace) and per episode (id, tier
+  RECENT/CONSOLIDATED/ARCHIVED, the moment id list); SYNAPSES persists
+  (src, dst, weight, eligibility) for every live synapse with |weight| >=
+  100 milli (default cut, auto-raised in 100-milli increments if the
+  above-threshold count exceeds 50K to keep snapshots under ~2MB); SELFMODEL
+  persists per-domain competence records (label, kind, reliability, evidence,
+  derived tier). Restore policy is REPLACE on all three (the snapshot is the
+  new ground truth on /load, not a merge target). Backwards compatibility:
+  a snapshot with only `<section>.present 1` and no sub-fields parses cleanly
+  as an empty section (same legacy-hint convention as `kgs.atoms`). New
+  restore helpers added (kept small, additive, documented): `ms_clear` +
+  `ms_restore` in `moment_stream.nova`, `em_clear` + `em_restore` in
+  `episode_storage.nova`, `syn_set_eligibility` + `syn_restore` in
+  `synapse_graph.nova`, `self_model_clear` + `self_model_restore` in
+  `competence_tracker.nova`. The chat's `_build_snapshot`, `_admin_save`,
+  and `_admin_load` thread the moment stream, episodic memory, the reasoning
+  part's synapse graph, and a self-model through the new section helpers;
+  the daemon's `_checkpoint` does the same. `/status` gains three new lines
+  (`moments`, `synapses`, `selfmodel`) so a post-restart `/load` is
+  immediately verifiable. Acceptance test passes: `printf
+  '/teach widget\nwidget\nwidget gadget\nwidget gadget fever\n/save\n/quit\n'
+  | ./bin/crossengin-chat` followed by `printf '/load\n/status\n/quit\n' |
+  ./bin/crossengin-chat` reports `moments : 3 moment(s), 3 episode(s)` plus
+  `knowledge: 574 atoms` and the right `audit: K decision-log entries`.
+  Acceptance: `tests/unit/test_snapshot_episodic.nova` (51 assertions),
+  `tests/unit/test_snapshot_synapses.nova` (43 assertions including the
+  threshold-cut behavior + the inhibitory-weight case + idempotent re-apply),
+  `tests/unit/test_snapshot_selfmodel.nova` (38 assertions covering the
+  three competence kinds, derived-tier survival, REPLACE policy, legacy
+  presence-only stub) -- 132 new assertions across the three suites;
+  `tests/integration/scenario_a2_full_state.sh` extends scenario A with 16
+  assertions for SIGKILL durability of the new sections.
 
 Top-level [`MANUAL.md`](./MANUAL.md) walks through running and testing locally
 end-to-end (build, all three artifacts, the test suite, writing a new test).
@@ -587,10 +732,10 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 95 (9 substrate + 7 knowledge + 10 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 2 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3 + 1 meta-observer `test_meta_observer` added Phase 13 Tier-2 item #1 + 1 structural-neighborhood `test_neighborhood_activation` added Phase 14 Tier-2 item #2 + 1 session `test_session` added Phase 18 Tier-3 item #3 + 1 kg-sync `test_kg_sync` added Phase 20 Tier-4 item #2 + 1 audio-synth `test_audio_synth` added Phase 19 Tier-4 item #1); **1816 assertions** (delta = +22 from `test_learn_tag.nova`, +39 from `test_meta_observer.nova`, +31 from `test_neighborhood_activation.nova` Phase 14 Tier-2 #2 = +30 new + 1 added to `test_spreading_activation.nova` for the round-trip path, +66 from `test_session.nova` Phase 18 Tier-3 #3, +53 from `test_kg_sync.nova` Phase 20 Tier-4 #2, +52 from `test_audio_synth.nova` Phase 19 Tier-4 #1).
+- Total unit suites: 100 (the prior 95 + `test_realtime_pacer` and `test_decision_log_durable` added by P0.6/P0.7 + 3 episodic/synapses/selfmodel snapshot suites concurrently added by Agent X); **+64 assertions added by P0.6/P0.7** (27 in `test_realtime_pacer.nova`, 37 in `test_decision_log_durable.nova`).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 13 scripts under `tests/integration/` covering 7 multi-step scenarios (durability across SIGKILL, neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync between two processes) and 5 admin-command edge-case scripts, with 123 assertions across the suite (+13 from `scenario_g_kg_sync.sh` Phase 20 Tier-4 #2). Run with `make integration`.
+- Total integration tests: 16 scripts under `tests/integration/` covering 9 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation) and 5 admin-command edge-case scripts. Run with `make integration`.
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution

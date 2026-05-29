@@ -11,21 +11,21 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 94 modules compile (`make build`), 95 unit-test suites pass
-> (`make test`, 1816 assertions, +1 suite / +22 assertions from
-> `test_learn_tag.nova` added in Phase 15 Tier-2 #3 multi-source `/learn`,
-> +1 suite / +39 assertions from `test_meta_observer.nova` added in Phase 13
-> Tier-2 #1 meta-learning observer,
-> +1 suite / +31 assertions from `test_neighborhood_activation.nova` added
-> in Phase 14 Tier-2 #2 structural-neighborhood activation,
-> +1 suite / +66 assertions from `test_session.nova` added in Phase 18
-> Tier-3 #3 multi-tenant session foundation,
-> +1 suite / +53 assertions from `test_kg_sync.nova` added in Phase 20
-> Tier-4 #2 distributed-substrate seam,
-> +1 suite / +52 assertions from `test_audio_synth.nova` added in Phase 19
-> Tier-4 #1 audio modality bridge), 13 end-to-end integration
-> scripts run (`make integration`, 123 assertions, 7 scenarios + 5
-> admin-command coverage scripts in Phase 16/17 Tier-3 #1+#2),
+> toolchain: 95 modules compile (`make build`, +1 from `realtime_pacer.nova`
+> added in P0.6 wall-clock pacer), 103 unit-test suites pass
+> (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
+> added in P0.6 real-time wall-clock pacer,
+> +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
+> P0.7 decision-log durable path,
+> +3 suites / +132 assertions from `test_snapshot_{episodic,synapses,
+> selfmodel}.nova` added in P0.1 full-state persistence),
+> 19 end-to-end integration
+> scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
+> P0.7 dlog durability across SIGKILL, +2 from
+> `scenario_h_session_switch.sh` + `scenario_i_web_isolation.sh` added in
+> P0.8 chat /switch + web.py per-cookie routing,
+> +1 from `scenario_a2_full_state.sh` added in P0.1
+> full-state durability across SIGKILL),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence

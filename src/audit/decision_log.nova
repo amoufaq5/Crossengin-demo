@@ -1,4 +1,4 @@
-// CrossEngin audit: decision log (append-only, hash-chained).
+// CrossEngin audit: decision log (append-only, hash-chained, durable).
 //
 // Purpose
 //   The authoritative, non-decaying record of what the system did and why
@@ -9,14 +9,46 @@
 //   chained to its predecessor, so mutation, reordering, mid-chain cuts, and
 //   tail truncation are all detectable by dl_verify.
 //
-//   The on-disk, fsync-backed segment store is NOVA enhancement #9 (deferred to
-//   the runtime seam); this module is the in-memory append-only chain and the
-//   tamper-evidence logic that storage layer will persist verbatim. The hash is a
-//   deterministic integer rolling hash (not cryptographic; runtime/crypto is the
-//   future hardening per ADR-0043).
+//   Durability (P0.7, the runtime seam that was historically deferred): every
+//   appended entry is ALSO written to an append-only file whose path is set
+//   via dl_open(path, log). The same fsync semantics snapshot_disk.nova uses
+//   apply -- the file is opened O_WRONLY|O_CREAT|O_APPEND once, each entry is
+//   written as one ASCII line, and fsync is batched (default: every 16 entries
+//   OR every 1000 ms since the last fsync, whichever fires first). The trade-
+//   off is documented at the dl_open call site: an abrupt kill may lose up to
+//   N-1 entries from the in-flight batch, but never corrupts entries already
+//   fsynced. The batch size and interval can be overridden via the env vars
+//   CE_DLOG_FSYNC_EVERY and CE_DLOG_FSYNC_INTERVAL_MS. Path resolution is
+//   getenv("CE_DLOG_PATH") with a fall-through to /tmp/crossengin.dlog.
 //
-// ADRs implemented: ADR-0043 (decision log). NOVA dependencies: builtins.
+//   On-disk format (one entry per line, pipe-separated, easy to awk):
+//     SEQ|KIND|REF|TS|ACLASS|ATYPE|PTIER|RCLASS|GOAL|SOUL|OUTCOME|PREV|HASH
+//   Trace nodes are NOT serialized (they are bulky and reconstructible from
+//   the snapshot when one is available); the entry's hash is computed over
+//   the in-memory trace, so a recovered entry preserves its hash but its
+//   trace list is empty (a documented scope cut -- dl_verify still re-walks
+//   the chain correctly because dl_hash_entry is fed the same fields).
+//
+//   ADR-0043 also says the dlog is "durable-but-separate": separate from the
+//   snapshot, so a snapshot restore doesn't roll back audit history. The
+//   file lives at its own path, and dl_open on a chat boot rehydrates the
+//   chain into memory before any new appends; the in-memory log becomes a
+//   hot cache and the file is the source of truth.
+//
+//   On recovery: dl_open parses each line into an in-memory entry and feeds
+//   it through a fast path that bypasses dl_append (so the file is not
+//   re-written by the load). If the file is corrupt past line N (the
+//   probable cause is a crash mid-write of line N+1), we truncate to N and
+//   log a warning -- the dlog never refuses to start, because the next
+//   append must succeed.
+//
+// ADRs implemented: ADR-0043 (decision log + the durable seam, formerly
+//   NOVA enhancement #9). NOVA dependencies: builtins + sys_open/sys_write/
+//   sys_fsync/sys_close from std/syscall and nanotime() from std/io.
 // CrossEngin dependencies: none.
+
+import "std/syscall"
+import "std/io"
 
 // ---- entry kinds ----------------------------------------------------------
 let DLK_INTENT     = 1   // recorded before an effector runs
@@ -53,12 +85,30 @@ let DLOG_TAG   = 4301
 let DL_TAGOFF  = 0
 let DL_ENTRIES = 1
 let DL_HEAD    = 2   // running hash of the last entry (0 for an empty chain)
+// Durability state (P0.7). DL_FD == -1 means "no durable path wired" (in-
+// memory only); any other value is a live append-only file descriptor.
+let DL_PATH       = 3   // wired path or "" if not wired
+let DL_FD         = 4   // -1 if not wired; otherwise an O_APPEND fd
+let DL_PEND       = 5   // count of entries appended since the last fsync
+let DL_LAST_FSYNC = 6   // nanotime at the last fsync (-1 if never)
+let DL_FSYNC_EVERY     = 7  // entries per batch (default 16)
+let DL_FSYNC_INTERVAL  = 8  // ms between fsyncs (default 1000)
+
+// Default batching policy. Each tuneable via an env var; see dl_open.
+let DL_DEFAULT_FSYNC_EVERY    = 16
+let DL_DEFAULT_FSYNC_INTERVAL = 1000
 
 fn dl_new() {
     let g = list_new()
     push(g, DLOG_TAG)
     push(g, list_new())
     push(g, 0)
+    push(g, "")          // no path
+    push(g, 0 - 1)       // no fd
+    push(g, 0)           // pending writes
+    push(g, 0 - 1)       // never fsynced
+    push(g, DL_DEFAULT_FSYNC_EVERY)
+    push(g, DL_DEFAULT_FSYNC_INTERVAL)
     return g
 }
 
@@ -153,6 +203,8 @@ fn dl_append(log, kind, ref, ts, desc, goal, trace, sref, outcome) {
     push(e, h)
     push(log[DL_ENTRIES], e)
     list_set(log, DL_HEAD, h)
+    // P0.7: durable write -- only if dl_open wired an fd.
+    if log[DL_FD] >= 0 { _dl_write_entry(log, e) }
     return seq
 }
 
@@ -191,3 +243,299 @@ fn dl_verify(log) {
     if prev != log[DL_HEAD] { return 0 }
     return 1
 }
+
+// ---- durability (P0.7) ----------------------------------------------------
+//
+// Each appended entry is serialized as a single ASCII line, pipe-separated,
+// no embedded newlines. Trace nodes are omitted (bulky; reconstructible from
+// the snapshot). dl_open wires a file path and recovers any existing entries;
+// dl_close flushes + closes; dl_force_fsync forces a flush mid-run (tests +
+// clean-shutdown call this).
+
+let _DL_LINE_SEP   = "|"
+let _DL_LINE_END   = "\n"
+
+// Linux O_APPEND mode bits (file creation mode 0640 = rw-r-----).
+let _DL_OPEN_FLAGS = 1089   // O_WRONLY | O_CREAT | O_APPEND  = 1+64+1024
+let _DL_OPEN_MODE  = 416    // 0640 = rw-r-----
+
+// Resolve an integer environment override; returns default_val if unset.
+fn _dl_env_int(name, default_val) {
+    let env = getenv(name)
+    if env == 0 { return default_val }
+    if len(env) == 0 { return default_val }
+    let v = str_to_int(env)
+    if v <= 0 { return default_val }
+    return v
+}
+
+// Serialize one entry as "SEQ|KIND|REF|TS|ACLASS|ATYPE|PTIER|RCLASS|GOAL|SOUL|OUTCOME|PREV|HASH\n".
+// All fields are integers; soul-ref is stored as its integer reference. Trace
+// is intentionally omitted (see module header).
+fn _dl_serialize_entry(e) {
+    return int_to_str(e[E_SEQ])     + _DL_LINE_SEP
+        +  int_to_str(e[E_KIND])    + _DL_LINE_SEP
+        +  int_to_str(e[E_REF])     + _DL_LINE_SEP
+        +  int_to_str(e[E_TS])      + _DL_LINE_SEP
+        +  int_to_str(e[E_ACLASS])  + _DL_LINE_SEP
+        +  int_to_str(e[E_ATYPE])   + _DL_LINE_SEP
+        +  int_to_str(e[E_PTIER])   + _DL_LINE_SEP
+        +  int_to_str(e[E_RCLASS])  + _DL_LINE_SEP
+        +  int_to_str(e[E_GOAL])    + _DL_LINE_SEP
+        +  int_to_str(e[E_SOUL])    + _DL_LINE_SEP
+        +  int_to_str(e[E_OUTCOME]) + _DL_LINE_SEP
+        +  int_to_str(e[E_PREV])    + _DL_LINE_SEP
+        +  int_to_str(e[E_HASH])    + _DL_LINE_END
+}
+
+// Decide whether the next-pending-entry write should be followed by an
+// fsync. Two triggers, whichever fires first: at least FSYNC_EVERY pending
+// writes since the last fsync, OR at least FSYNC_INTERVAL ms wall-clock
+// elapsed since the last fsync. The "last fsync was -1" (never) case is
+// folded into the entry-count branch.
+fn _dl_should_fsync(log) {
+    if log[DL_PEND] >= log[DL_FSYNC_EVERY] { return 1 }
+    let last = log[DL_LAST_FSYNC]
+    if last < 0 { return 0 }
+    let now = nanotime()
+    let elapsed_ms = (now - last) / 1000000
+    if elapsed_ms >= log[DL_FSYNC_INTERVAL] { return 1 }
+    return 0
+}
+
+// Write one entry's bytes to the open fd. Increments the pending counter and
+// performs an fsync if the policy says so.
+fn _dl_write_entry(log, e) {
+    let fd = log[DL_FD]
+    if fd < 0 { return 0 }
+    let line = _dl_serialize_entry(e)
+    let n = len(line)
+    let written = sys_write(fd, line, n)
+    if written != n { return 0 }
+    list_set(log, DL_PEND, log[DL_PEND] + 1)
+    if _dl_should_fsync(log) == 1 {
+        sys_fsync(fd)
+        list_set(log, DL_PEND, 0)
+        list_set(log, DL_LAST_FSYNC, nanotime())
+    }
+    return 1
+}
+
+// Force-flush + fsync any pending writes immediately. Tests + clean shutdown
+// call this. Updates last-fsync so a follow-up dl_append doesn't re-fsync
+// for free.
+fn dl_force_fsync(log) {
+    let fd = log[DL_FD]
+    if fd < 0 { return 0 }
+    sys_fsync(fd)
+    list_set(log, DL_PEND, 0)
+    list_set(log, DL_LAST_FSYNC, nanotime())
+    return 1
+}
+
+// ---- parse one durable line ------------------------------------------------
+//
+// One line decodes into a 13-int list in the same field order
+// _dl_serialize_entry emits. Returns 0 if the line is malformed (bad count,
+// non-integer field) so the recovery loop can truncate at that point.
+fn _dl_parse_line(line) {
+    let fields = list_new()
+    let n = len(line)
+    let start = 0
+    let i = 0
+    while i < n {
+        let c = char_at(line, i)
+        if c == 124 {                         // '|'
+            push(fields, substr(line, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(fields, substr(line, start, n - start))
+    if len(fields) != 13 { return 0 }
+    let out = list_new()
+    let j = 0
+    while j < len(fields) {
+        push(out, str_to_int(fields[j]))
+        j = j + 1
+    }
+    return out
+}
+
+// Apply one parsed line to the log WITHOUT re-writing to disk. The line came
+// FROM the file, so dl_append's durable side-effect must be skipped. We also
+// recompute the hash from the parsed fields and verify it against the stored
+// HASH; if they disagree the line is treated as corrupt.
+fn _dl_apply_line(log, vals) {
+    let e = list_new()
+    push(e, LOG_ENTRY)
+    push(e, vals[0])               // SEQ
+    push(e, vals[1])               // KIND
+    push(e, vals[2])               // REF
+    push(e, vals[3])               // TS
+    push(e, vals[4])               // ACLASS
+    push(e, vals[5])               // ATYPE
+    push(e, vals[6])               // PTIER
+    push(e, vals[7])               // RCLASS
+    push(e, vals[8])               // GOAL
+    push(e, list_new())            // TRACE -- empty, see header
+    push(e, vals[9])               // SOUL
+    push(e, vals[10])              // OUTCOME
+    let computed = dl_hash_entry(log[DL_HEAD], e)
+    if computed != vals[12] { return 0 }     // hash mismatch -> corrupt
+    if vals[11] != log[DL_HEAD] { return 0 } // PREV mismatch -> corrupt
+    if vals[0] != len(log[DL_ENTRIES]) { return 0 } // SEQ skew -> corrupt
+    push(e, vals[11])              // PREV
+    push(e, vals[12])              // HASH
+    push(log[DL_ENTRIES], e)
+    list_set(log, DL_HEAD, vals[12])
+    return 1
+}
+
+// Read the entire file at path (or return 0 if missing/unreadable). Mirrors
+// snap_read_text but lives here so the audit subtree stays self-contained.
+fn _dl_read_text(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let chunk = 4096
+    let buf = alloc(chunk + 1)
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        let m = sys_read(fd, buf, chunk)
+        if m <= 0 {
+            done = 1
+        } else {
+            store8(buf + m, 0)
+            acc = acc + buf
+            if m < chunk { done = 1 }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// Recovery: parse each line of the on-disk file into the in-memory log. Stops
+// at the first corrupt line; the remaining bytes are discarded by truncating
+// to the byte count that successfully replayed.
+//
+// Returns a 2-element list [entries_loaded, recovered_bytes]. The caller
+// decides whether to truncate the file based on whether recovered_bytes is
+// less than the file's length on disk (i.e., a partial-write tail was
+// discarded).
+fn _dl_recover(log, text) {
+    let n = len(text)
+    let good_bytes = 0
+    let entries_loaded = 0
+    let i = 0
+    let line_start = 0
+    while i < n {
+        if char_at(text, i) == 10 {              // newline
+            let line = substr(text, line_start, i - line_start)
+            if len(line) > 0 {
+                let vals = _dl_parse_line(line)
+                if vals == 0 {
+                    // Malformed line -> stop. Bail out of the recovery walk.
+                    let pair = list_new()
+                    push(pair, entries_loaded)
+                    push(pair, good_bytes)
+                    return pair
+                }
+                if _dl_apply_line(log, vals) == 0 {
+                    let pair = list_new()
+                    push(pair, entries_loaded)
+                    push(pair, good_bytes)
+                    return pair
+                }
+                entries_loaded = entries_loaded + 1
+                good_bytes = i + 1               // include the trailing \n
+            } else {
+                good_bytes = i + 1
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    // Any trailing characters past the last newline are an unfinished line;
+    // ignore them but report the byte count up through the last good line.
+    let pair = list_new()
+    push(pair, entries_loaded)
+    push(pair, good_bytes)
+    return pair
+}
+
+// Open + wire the durable path. If the file exists, every parseable line is
+// replayed into the in-memory log BEFORE the fd is opened for append; the fd
+// is then opened with O_APPEND so subsequent writes land at the right
+// position. A corrupt tail (likely a half-written final entry) is detected
+// during recovery and the file is truncated at the last good line via a
+// fresh O_TRUNC write of the recovered bytes. This is the same "append +
+// fsync gives this guarantee" pattern snapshot_disk's atomic-rename uses.
+//
+// Env overrides: CE_DLOG_FSYNC_EVERY (entries) and CE_DLOG_FSYNC_INTERVAL_MS.
+//
+// Returns 1 on success (path wired, fd open), 0 on syscall failure. A failed
+// open leaves the log purely in-memory; the daemon prints a warning but does
+// NOT refuse to start.
+fn dl_open(log, path) {
+    list_set(log, DL_PATH, path)
+    list_set(log, DL_FSYNC_EVERY,
+        _dl_env_int("CE_DLOG_FSYNC_EVERY", DL_DEFAULT_FSYNC_EVERY))
+    list_set(log, DL_FSYNC_INTERVAL,
+        _dl_env_int("CE_DLOG_FSYNC_INTERVAL_MS", DL_DEFAULT_FSYNC_INTERVAL))
+    let text = _dl_read_text(path)
+    let recovered_bytes = 0
+    let original_bytes = 0
+    let entries_loaded = 0
+    if text != 0 {
+        original_bytes = len(text)
+        if original_bytes > 0 {
+            let report = _dl_recover(log, text)
+            entries_loaded = report[0]
+            recovered_bytes = report[1]
+            // If we couldn't replay everything we read, the tail is corrupt
+            // (probable cause: crash mid-write of the next entry). Re-open
+            // the file with O_TRUNC and re-write the bytes that DID parse,
+            // so the next append lands at the correct offset and the next
+            // fsync covers a clean prefix. This is non-fatal -- the rest
+            // of recovery proceeds normally.
+            if recovered_bytes < original_bytes {
+                let prefix = substr(text, 0, recovered_bytes)
+                let trunc_fd = sys_open(path, O_WRONLY + O_CREAT + 512, _DL_OPEN_MODE)
+                if trunc_fd >= 0 {
+                    if recovered_bytes > 0 {
+                        sys_write(trunc_fd, prefix, recovered_bytes)
+                    }
+                    sys_fsync(trunc_fd)
+                    sys_close(trunc_fd)
+                    println("dl_open: warning -- truncated corrupt tail of "
+                        + path + " (kept "
+                        + int_to_str(entries_loaded) + " entries)")
+                }
+            }
+        }
+    }
+    let fd = sys_open(path, _DL_OPEN_FLAGS, _DL_OPEN_MODE)
+    if fd < 0 { return 0 }
+    list_set(log, DL_FD, fd)
+    list_set(log, DL_PEND, 0)
+    list_set(log, DL_LAST_FSYNC, nanotime())
+    return 1
+}
+
+// Close + final fsync. Tests and clean shutdown call this; subsequent
+// dl_append calls degrade to in-memory only.
+fn dl_close(log) {
+    let fd = log[DL_FD]
+    if fd < 0 { return 0 }
+    sys_fsync(fd)
+    sys_close(fd)
+    list_set(log, DL_FD, 0 - 1)
+    list_set(log, DL_PEND, 0)
+    return 1
+}
+
+// Diagnostics.
+fn dl_path(log)           { return log[DL_PATH] }
+fn dl_pending_writes(log) { return log[DL_PEND] }
+fn dl_is_durable(log)     { if log[DL_FD] >= 0 { return 1 } return 0 }
