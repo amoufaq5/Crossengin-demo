@@ -364,6 +364,55 @@ continue. It is updated at every session boundary.
   can corroborate / atrophy by source. Acceptance: `scripts/learn_smoke_multi.sh`
   exercises all three kinds; `tests/unit/test_learn_tag.nova` covers the
   tag-derivation contract with 22 assertions.
+- P1.4 -- plain-HTTP in-process transport seam (NOVA enhancement #11 audit +
+  minimum-viable lift off `curl` for `http://`): **complete**. Real TLS stays
+  deferred (4-6 weeks; see [`TLS_AUDIT.md`](./TLS_AUDIT.md) for the roadmap).
+  New `src/io/transducers/http_client.nova` is a pure-NOVA HTTP/1.1 client
+  built on NOVA's existing socket builtins (same idioms as `kg_sync.nova`):
+  `http_parse_url(url) -> [scheme, host, port, path]` parses
+  `http(s)://host[:port][/path]` with default port 80/443 and "/" default
+  path, returning `["", "", 0, ""]` on malformed input; `http_get(url,
+  max_bytes) -> [status_code, headers_list, body, error_msg]` opens a TCP
+  socket via `socket(2,1,0)` + `make_sockaddr_in` + `connect_socket`, sends
+  `GET <path> HTTP/1.1\r\nHost: <host>\r\nUser-Agent: crossengin/0.1\r\n
+  Accept: */*\r\nConnection: close\r\n\r\n`, loops `recv_data` until EOF or
+  `max_bytes+8K` cap is reached, then splits on `\r\n\r\n` (with `\n\n`
+  fallback), parses `HTTP/1.x NNN ...` status, accumulates `Name: value`
+  headers; `http_header_get(headers, name)` is case-insensitive;
+  `http_is_redirect(status_code)` classifies 3xx (callers re-issue with
+  Location). DNS workaround for NOVA having no getaddrinfo: dotted-quad
+  hosts (e.g. `127.0.0.1`) work directly; named hosts must be in the
+  process-local cache populated from env
+  `HTTP_DNS_HOST_TO_IP="host:ip,host:ip"` at first lookup. Unknown hosts
+  return the canonical `HTTP_ERR_DNS` error and a deliberately loud
+  pointer at `TLS_AUDIT.md`. Mode 3 wiring lives in `internet_fetch.nova`:
+  new `if_dispatch_transport(url, max_bytes) -> [tag, status, body, err]`
+  returns `IF_TRANSPORT_HTTP_OK` (1) for successful `http://`,
+  `IF_TRANSPORT_HTTP_ERR` (2) for plain-HTTP transport failure,
+  `IF_TRANSPORT_DEFERRED` (3) for `https://` (caller falls back to
+  `scripts/learn.sh` curl, unchanged), `IF_TRANSPORT_BAD_URL` (4) on
+  malformed URL. The whitelist + rate-limit + cache pipeline is UNCHANGED
+  -- callers still `if_permit` before and `if_complete` + `if_ingest`
+  after. Acceptance: `tests/unit/test_http_client.nova` covers the parser
+  matrix (full URL, default ports for http/https, no-path -> "/",
+  authority-only with port, ftp:// scheme rejection, malformed inputs),
+  DNS register + lookup (case-insensitive on host, bad-IP rejection,
+  dotted-quad bypass), case-insensitive header lookup, 3xx redirect
+  classifier, status-line parser (200 / 404 / 301 / no-text / bad
+  cases), and the dispatcher branches (https deferred, malformed bad-url,
+  http unresolved DNS) -- 59 assertions across 15 test functions.
+  `tests/integration/scenario_j_http_client.sh` spawns `python3 -m
+  http.server` on a per-run port (31000+), writes a known marker file,
+  builds an inline NOVA driver under `tests/integration/_scenario_j_drivers/`
+  that calls `if_dispatch_transport("http://127.0.0.1:PORT/test_html.html",
+  4096)`, and asserts: NOVA exits 0, tag=1 (HTTP_OK), status=200, body
+  contains the marker, err empty, body_len >= 50, plus bonus drivers for
+  the bad-URL and https-deferred branches -- 9 assertions; SKIPs cleanly
+  if python3 isn't available or `socket(2,1,0)` returns -1 (sandbox denies
+  AF_INET). Verified locally: scenario_j passes 9/9 with python3 present.
+  Production blocker still loud: HTTP_DNS_HOST_TO_IP is a manual table,
+  not real DNS; full resolution + TLS is the 4-6-week call documented in
+  TLS_AUDIT.md.
 - P1.5 -- composite `/learn` kinds (batch URLs, RSS feed, recursive
   directory): **complete**. Extends the P15 dispatcher with three new
   prefix-detected source kinds, all sharing the same `_learn_tag` /
@@ -672,6 +721,7 @@ is standalone.
 | io/effectors/audio_speak.nova (Phase 19 Tier-4 #1: audio modality bridge -- espeak/aplay escalation) | 0014 | 0 | done |
 | io/transducers/input_transducer.nova | 0014, 0011, 0012, 0021 | 19 | done |
 | io/transducers/kg_sync.nova (Phase 20 Tier-4 #2: distributed-substrate seam) | 0014, 0016 | 53 | done |
+| io/transducers/http_client.nova (P1.4: plain-HTTP/1.1 in-process client + dispatcher seam; HTTPS deferred -- see TLS_AUDIT.md) | 0028, 0014 | 59 | done |
 
 Pure substrate, NO LLM (ADR-0014): `output_generation` produces text by the
 reverse of comprehension (intent -> real word atoms -> learned syntax ordering),
@@ -840,10 +890,10 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 102 (the prior 100 + `test_meta_observer_feedback` (P1.1) + `test_atom_death_attribution` (P1.6)); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`).
+- Total unit suites: 103 (the prior 102 + `test_http_client` (P1.4)); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 16 scripts under `tests/integration/` covering 9 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation) and 5 admin-command edge-case scripts. Run with `make integration`.
+- Total integration tests: 17 scripts under `tests/integration/` covering 10 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4]) and 5 admin-command edge-case scripts. Run with `make integration`.
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution

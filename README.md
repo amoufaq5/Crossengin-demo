@@ -11,8 +11,9 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 95 modules compile (`make build`, +1 from `realtime_pacer.nova`
-> added in P0.6 wall-clock pacer), 102 unit-test suites pass
+> toolchain: 96 modules compile (`make build`, +1 from `realtime_pacer.nova`
+> added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
+> plain-HTTP in-process transport seam), 103 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -24,13 +25,17 @@ computational units rather than orchestrating a pipeline of modules.
 > into source_authority + P1.6 atom-death attribution,
 > +18 assertions to `test_learn_tag.nova` (22 -> 40) from P1.5 composite
 > `/learn` kinds: batch `@/path/urls.txt`, RSS `rss:URL`, recursive
-> `dir:/path` directory walk),
-> 16 end-to-end integration
+> `dir:/path` directory walk,
+> +1 suite / +59 assertions from `test_http_client.nova` added in P1.4
+> plain-HTTP client + dispatcher),
+> 17 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
 > `scenario_h_session_switch.sh` + `scenario_i_web_isolation.sh` added in
-> P0.8 chat /switch + web.py per-cookie routing),
+> P0.8 chat /switch + web.py per-cookie routing,
+> +1 from `scenario_j_http_client.sh` added in P1.4 plain-HTTP loopback
+> against `python3 -m http.server`),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
