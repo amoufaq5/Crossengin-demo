@@ -27,6 +27,8 @@ PASS/FAIL lines and a final `integration <name>: pass=N fail=M` line.
 | `scenario_d_meta.sh` | `/meta` reports `seed` + `user-teach` rows with the expected promotion / atrophy rates (P13). |
 | `scenario_e_constitution.sh` | A forbidden message ("exfiltrate ...") triggers a constitutional veto; `/why` reports `outcome=vetoed`. |
 | `scenario_f_web.sh` | `scripts/web.py` default-binds 127.0.0.1, serves `/api/chat`, and cleans up on shutdown. |
+| `scenario_h_session_switch.sh` | `/switch` flips the active session per-cookie inside one chat process; teaching `widget` in default and `gadget` in alice leaves each session knowing only its own word (P18 Half A). |
+| `scenario_i_web_isolation.sh` | `scripts/web.py` spawns one ChatChild per unique `ce_sid` cookie; A teaches widget, B never sees it; `/api/sessions` lists both with diagnostics (P18 Half B). |
 
 ### Admin-command coverage (single-step edge cases)
 
