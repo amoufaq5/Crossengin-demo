@@ -25,7 +25,9 @@ fi
 TOPIC="$1"
 URL="${LEARN_URL:-https://en.wikipedia.org/wiki/$TOPIC}"
 OUT="/tmp/crossengin_learn_${TOPIC}.txt"
+TRIPLES="/tmp/crossengin_learn_${TOPIC}_triples.txt"
 MAX_WORDS="${LEARN_MAX:-30}"
+MAX_TRIPLES="${LEARN_MAX_TRIPLES:-20}"
 
 echo "fetching: $URL"
 if ! BODY=$(curl -sLf --max-time 15 -A "crossengin-learn/0.1" "$URL"); then
@@ -53,5 +55,97 @@ echo "$BODY" \
 
 N=$(wc -l < "$OUT")
 echo "wrote $N candidate words to $OUT"
+
+# ---- structural triples ---------------------------------------------------
+# In addition to vocabulary, mine simple surface patterns from the same body
+# so /learn can ingest reasoning operators (ADR-0031), not just words. The
+# extractor is intentionally permissive -- /learn drops any triple whose
+# subject or object is not already a known atom, so noise is harmless.
+#
+# Patterns (lowercase, 4-14 alpha chars on each side, same as vocabulary):
+#   "X causes Y" / "X caused Y" / "X cause Y"      -> X|causal|Y
+#   "X is a Y" / "X is an Y" / "X is the Y"        -> X|is_a|Y
+#   "X is Y"                                       -> X|is_a|Y
+#   "X has Y" / "X have Y"                         -> X|has|Y
+# We also accept a single bridge word (e.g. "may", "can", "often", "usually",
+# "the") between the relation and Y so we catch real prose: "X causes the Y",
+# "X may cause Y", "X is often Y" all map to the same triple.
+#
+# Pipeline: strip HTML, lowercase, fold whitespace, then awk over a 5-word
+# sliding window. We don't try to be smart -- false positives are fine because
+# the chat-side filter is the ground truth.
+# Two passes over the cleaned token stream:
+#   pass 1: count word occurrences (used to rank candidate triples -- topic-
+#           relevant words appear more often than incidental boilerplate).
+#   pass 2: extract candidate triples via sliding window, then sort by
+#           freq(S)+freq(O) descending and keep top $MAX_TRIPLES.
+TOKENS=$(mktemp)
+trap 'rm -f "$TOKENS"' EXIT
+echo "$BODY" \
+    | sed -E 's|<script[^<]*</script>||g; s|<style[^<]*</style>||g; s/<[^>]*>/ /g; s/&[a-z]+;//g' \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c '[:alpha:]' ' ' \
+    | tr -s ' ' '\n' > "$TOKENS"
+
+awk -v MAX="$MAX_TRIPLES" '
+        BEGIN {
+            # Determiners + small filler that may sit between verb and Y.
+            det["a"]=1; det["an"]=1; det["the"]=1
+            bridge["may"]=1; bridge["can"]=1; bridge["could"]=1; bridge["might"]=1
+            bridge["often"]=1; bridge["usually"]=1; bridge["sometimes"]=1
+            bridge["also"]=1; bridge["typically"]=1; bridge["generally"]=1
+            bridge["not"]=1; bridge["always"]=1; bridge["thus"]=1
+            bridge["the"]=1; bridge["a"]=1; bridge["an"]=1
+            bridge["in"]=1; bridge["of"]=1; bridge["from"]=1
+            is_form["is"]=1; is_form["are"]=1; is_form["be"]=1
+            is_form["was"]=1; is_form["were"]=1
+            cause_form["causes"]=1; cause_form["caused"]=1; cause_form["cause"]=1
+            cause_form["causing"]=1
+            has_form["has"]=1; has_form["have"]=1; has_form["had"]=1
+        }
+        function emit(s, r, o,    key, score) {
+            if (length(s) < 4 || length(s) > 14) return
+            if (length(o) < 4 || length(o) > 14) return
+            if (s == o) return
+            key = s "|" r "|" o
+            if (key in seen) return
+            seen[key] = 1
+            score = freq[s] + freq[o]
+            # rank-prefixed line so a single sort -rn -k1 brings best to top.
+            cand[++n] = score "\t" key
+        }
+        # First pass over the file: count word occurrences.
+        FNR == NR { freq[$0]++; next }
+        # Second pass: slide a 6-word window and extract candidate triples.
+        {
+            w[5]=w[4]; w[4]=w[3]; w[3]=w[2]; w[2]=w[1]; w[1]=w[0]; w[0]=$0
+            # --- causal: "X causes Y", and with 1-2 word bridges -----------
+            if (w[1] in cause_form)                       emit(w[2], "causal", w[0])
+            if ((w[2] in cause_form) && (w[1] in bridge)) emit(w[3], "causal", w[0])
+            if ((w[3] in cause_form) && (w[2] in bridge) && (w[1] in bridge))
+                                                          emit(w[4], "causal", w[0])
+            # --- "X caused by Y" -> Y|causal|X (passive reversal) ----------
+            if (w[2] == "caused" && w[1] == "by")         emit(w[0], "causal", w[3])
+            # --- is_a: "X is Y", "X is <det> Y", "X is <bridge> Y" --------
+            if ((w[1] in is_form) && !(w[0] in det))      emit(w[2], "is_a", w[0])
+            if ((w[2] in is_form) && (w[1] in det))       emit(w[3], "is_a", w[0])
+            if ((w[2] in is_form) && (w[1] in bridge) && !(w[1] in det)) \
+                                                          emit(w[3], "is_a", w[0])
+            # "X may be Y" / "X can be Y" -> X|is_a|Y -----------------------
+            if ((w[2] in bridge) && (w[1] in is_form))    emit(w[3], "is_a", w[0])
+            # --- has: "X has Y", "X have Y", with optional bridge ---------
+            if (w[1] in has_form)                         emit(w[2], "has",  w[0])
+            if ((w[2] in has_form) && (w[1] in bridge))   emit(w[3], "has",  w[0])
+        }
+        END {
+            for (i = 1; i <= n; i++) print cand[i]
+        }
+    ' "$TOKENS" "$TOKENS" \
+    | sort -rn -k1,1 \
+    | head -n "$MAX_TRIPLES" \
+    | cut -f2 > "$TRIPLES"
+
+T=$(wc -l < "$TRIPLES")
+echo "wrote $T candidate triples to $TRIPLES"
 echo
 echo "Next: in bin/crossengin-chat type  /learn $TOPIC"
