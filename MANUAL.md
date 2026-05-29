@@ -5,6 +5,28 @@ your machine. For deep references see [`docs/runbook/`](./docs/runbook/) and
 [`docs/adr/`](./docs/adr/); for project status see
 [`NEXT_SESSION.md`](./NEXT_SESSION.md).
 
+## 0. Zero-install quickstart (browser)
+
+The fastest way to try CrossEngin without installing anything:
+
+[**Open in GitHub Codespaces**](https://codespaces.new/amoufaq5/Crossengin-demo)
+
+One click → a Linux VM in your browser with the NOVA toolchain cloned + built
+and CrossEngin pre-built (the [`.devcontainer/`](./.devcontainer/) handles all
+of that on first creation; takes ~2 minutes). When the terminal opens:
+
+```sh
+make test                       # 86/86 unit suites
+make install                    # build the runnable artifacts
+./bin/crossengin                # the whole agent in one process
+./scripts/chat.sh               # interactive chat
+```
+
+Same devcontainer works locally with **VS Code** + the **Dev Containers**
+extension — open the folder, "Reopen in Container."
+
+For a permanent local install (or to develop offline), continue with section 1.
+
 ## 1. Prerequisites
 
 CrossEngin compiles with the NOVA self-hosting toolchain. NOVA has no

@@ -1,5 +1,7 @@
 # CrossEngin
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/amoufaq5/Crossengin-demo)
+
 CrossEngin is a non-LLM cognitive **substrate** system, implemented in
 [NOVA](https://github.com/amoufaq5/nova). It targets AGI-relevant capability —
 continuous learning, self-directed skill acquisition, theory of mind,
