@@ -1,0 +1,386 @@
+// CrossEngin reader: structural-neighborhood activation.
+//
+// Purpose
+//   Today the reader matches input tokens to atoms by exact lemma -- a paraphrase
+//   like "high temperature" misses the "fever" concept entirely even though the
+//   two are tightly linked in the seeded operator chain. This module gives the
+//   reader a cheap substrate-native similarity surface so related concepts
+//   activate when the direct lookup misses (Phase 14 / Tier 2 item #2).
+//
+//   NO embeddings. NO transformer. Pure substrate similarity from data already
+//   in the system. Evidence is mined from TWO sources (the cheapest viable pair
+//   per the design note in NEXT_SESSION.md):
+//     1. Reasoning operator edges (ADR-0031). For an atom A, every operator
+//        atom whose premise is A contributes the operator's confidence to the
+//        conclusion, and every operator whose conclusion is A contributes its
+//        confidence to the premise (operators are directional but neighborhoods
+//        are symmetric for surfacing purposes).
+//     2. Cross-KG reference edges (ADR-0017). For an atom A, every xref on A
+//        contributes its weight to the destination handle.
+//   A small bonus from polysemous-word co-senses (ADR-0015) is included: if two
+//   concepts share a word atom's sense list, they are word-neighbors with a
+//   modest fixed strength (the word's confidence x 0.5).
+//
+//   Strengths are integer milli (0..1000). The neighborhood is built by BFS over
+//   one or two hops; 2-hop contributions are decayed by SPREAD_DECAY (0.5 per
+//   ADR-0012 stage 3). Evidence is aggregated per neighbor handle by summing and
+//   clamping at 1000. Returns the top max_results neighbors sorted descending.
+//
+//   The exported entry point is find_neighbors(kg_reg, handle, max_hops,
+//   max_results). The spreading_activation stage uses it to surface related
+//   concepts on indirect input (Step 3); the activation strength it injects is
+//   the neighborhood similarity, so spurious matches stay low and known matches
+//   stay high. For an exact-match input, neighborhood activation runs
+//   ADDITIONALLY -- exact match still wins because it gets full strength 1000.
+//
+// ADRs implemented: ADR-0012 (extends stage 3 with a structural-similarity
+//   surface), ADR-0017 (cross-KG ref walking), ADR-0031 (operator edge walking),
+//   ADR-0015 (word-sense co-finding).
+// NOVA dependencies: builtins (lists).
+// CrossEngin dependencies: src/reader/lexical_anchor.nova (renv/rctx, resolve;
+//   transitively atom_store handles + xrefs + word atoms),
+//   src/parts/reasoning/reasoning_atoms.nova (operator queries).
+
+import "lexical_anchor.nova"
+import "../parts/reasoning/reasoning_atoms.nova"
+
+// Decay applied to 2-hop neighborhood contributions (0.5 per ADR-0012 stage 3).
+let NEIGH_HOP_DECAY = 500
+// Word-sense co-occurrence contribution scale: word_confidence * 0.5 (modest).
+let NEIGH_WORD_SHARE = 500
+// Hard ceiling on neighbor entries collected before sort/trim (guards walk cost).
+let NEIGH_SCAN_CAP = 256
+
+// ---- accumulator helpers --------------------------------------------------
+// Entries are [handle, strength]. The accumulator is a plain list; lookup is a
+// linear scan (set sizes here are bounded by NEIGH_SCAN_CAP). We avoid the
+// builtin map (blocker #1, 16-key cap).
+
+fn _nh_index(acc, h) {
+    let i = 0
+    while i < len(acc) {
+        if handle_eq(acc[i][0], h) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _nh_add(acc, h, delta) {
+    if delta <= 0 { return 0 }
+    let idx = _nh_index(acc, h)
+    if idx == -1 {
+        if len(acc) >= NEIGH_SCAN_CAP { return 0 }
+        let entry = list_new()
+        push(entry, h)
+        push(entry, delta)
+        push(acc, entry)
+        return 1
+    }
+    let v = acc[idx][1] + delta
+    if v > 1000 { v = 1000 }
+    list_set(acc[idx], 1, v)
+    return 0
+}
+
+// Has the accumulator already collected this handle? (used to avoid recounting
+// the source atom itself and to track frontier expansion.)
+fn _nh_contains(acc, h) {
+    if _nh_index(acc, h) == -1 { return 0 }
+    return 1
+}
+
+// ---- operator-edge walking -------------------------------------------------
+// All KGs hosting operator atoms are inspected. Operators live as ATOM_RELATION
+// with payload "op" -- is_operator() is the discriminator; rk_operators_from /
+// rk_operators_to do the per-KG scan. We resolve the operator's other side to a
+// handle in the SAME KG as the operator atom (operator atoms reference atoms by
+// id inside their owning KG, per reasoning_atoms.nova / seed/first_atoms.nova).
+
+fn _walk_ops(reg, src_kg_label, src_id, acc, weight_scale, source_handle) {
+    let nk = kg_count(reg)
+    let i = 0
+    while i < nk {
+        let kg = kg_get(reg, i)
+        if kg != 0 {
+            let kg_label = kg_label(kg)
+            // Outgoing: ops whose premise is src_id (only in the kg that owns
+            // the source -- operators reference atom_ids inside their owning KG).
+            if str_eq(kg_label, src_kg_label) == 1 {
+                let outs = rk_operators_from(kg, src_id)
+                let j = 0
+                while j < len(outs) {
+                    let nh = handle_new(kg_label, rop_conclusion(outs[j]))
+                    if handle_eq(nh, source_handle) == 0 {
+                        let strength = fp_mul(rop_confidence(outs[j]), weight_scale)
+                        _nh_add(acc, nh, strength)
+                    }
+                    j = j + 1
+                }
+                // Incoming: ops whose conclusion is src_id contribute their
+                // premise as a backward neighbor. Operators are directional but
+                // semantic neighborhood is symmetric for surfacing.
+                let ins = rk_operators_to(kg, src_id)
+                let k = 0
+                while k < len(ins) {
+                    let ph = handle_new(kg_label, rop_premise(ins[k]))
+                    if handle_eq(ph, source_handle) == 0 {
+                        let strength = fp_mul(rop_confidence(ins[k]), weight_scale)
+                        _nh_add(acc, ph, strength)
+                    }
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(acc)
+}
+
+// ---- cross-KG reference walking --------------------------------------------
+// Every atom carries its outbound xref list (atom_xrefs). One walk is one hop.
+
+fn _walk_xrefs(atom, acc, weight_scale, source_handle) {
+    if atom == 0 { return 0 }
+    let xr = atom_xrefs(atom)
+    let i = 0
+    while i < len(xr) {
+        let nh = handle_new(xref_dst_kg(xr[i]), xref_dst_atom(xr[i]))
+        if handle_eq(nh, source_handle) == 0 {
+            let strength = fp_mul(xref_weight(xr[i]), weight_scale)
+            _nh_add(acc, nh, strength)
+        }
+        i = i + 1
+    }
+    return len(acc)
+}
+
+// ---- word-sense co-occurrence ----------------------------------------------
+// If a word atom's sense list contains the source concept, every OTHER sense of
+// that word is a word-neighbor (polysemy / synonymy substrate). Scan all word
+// atoms in every language-like KG and contribute their cross-sense links.
+
+fn _walk_word_senses(reg, source_handle, acc, weight_scale) {
+    let nk = kg_count(reg)
+    let i = 0
+    while i < nk {
+        let kg = kg_get(reg, i)
+        if kg != 0 {
+            let atoms = kg_atoms(kg)
+            let a = 0
+            while a < len(atoms) {
+                let w = atoms[a]
+                if is_word_atom(w) == 1 {
+                    let senses = atom_xrefs(w)
+                    // Does this word have a sense pointing at source?
+                    let has = 0
+                    let s = 0
+                    while s < len(senses) {
+                        let sh = handle_new(xref_dst_kg(senses[s]), xref_dst_atom(senses[s]))
+                        if handle_eq(sh, source_handle) == 1 { has = 1 }
+                        s = s + 1
+                    }
+                    // If yes, every other sense becomes a word-neighbor of source.
+                    if has == 1 {
+                        let conf = atom_confidence(w)
+                        let s2 = 0
+                        while s2 < len(senses) {
+                            let oh = handle_new(xref_dst_kg(senses[s2]), xref_dst_atom(senses[s2]))
+                            if handle_eq(oh, source_handle) == 0 {
+                                let base = fp_mul(conf, NEIGH_WORD_SHARE)
+                                _nh_add(acc, oh, fp_mul(base, weight_scale))
+                            }
+                            s2 = s2 + 1
+                        }
+                    }
+                }
+                a = a + 1
+            }
+        }
+        i = i + 1
+    }
+    return len(acc)
+}
+
+// ---- one-hop and frontier-driven multi-hop expansion -----------------------
+
+// Run one hop from a single source handle. Weight scale is FP_SCALE for the
+// first hop, NEIGH_HOP_DECAY for hops beyond. The source handle is excluded so
+// neighbors never include the seed itself.
+fn _expand_one(reg, source_handle, acc, weight_scale) {
+    let src_atom = renv_resolve_in(reg, source_handle)
+    let src_kg_label = handle_kg(source_handle)
+    let src_id = handle_atom(source_handle)
+    _walk_ops(reg, src_kg_label, src_id, acc, weight_scale, source_handle)
+    _walk_xrefs(src_atom, acc, weight_scale, source_handle)
+    _walk_word_senses(reg, source_handle, acc, weight_scale)
+    return len(acc)
+}
+
+// Standalone handle-resolver: like renv_resolve but takes a bare registry (no
+// renv wrapper required for callers outside the reader).
+fn renv_resolve_in(reg, h) {
+    if h == 0 { return 0 }
+    let kg = kg_find(reg, handle_kg(h))
+    if kg == 0 { return 0 }
+    return kg_atom(kg, handle_atom(h))
+}
+
+// ---- sort + trim by descending strength -----------------------------------
+// Simple selection sort on a small list (max_results <= a few dozen typically;
+// scan cap is 256). Stable in the natural sense -- ties preserve input order.
+
+fn _nh_sort_desc(acc) {
+    let n = len(acc)
+    let i = 0
+    while i < n {
+        let best = i
+        let j = i + 1
+        while j < n {
+            if acc[j][1] > acc[best][1] { best = j }
+            j = j + 1
+        }
+        if best != i {
+            let tmp = acc[i]
+            list_set(acc, i, acc[best])
+            list_set(acc, best, tmp)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+// ---- public entry point ----------------------------------------------------
+
+// Find the structural neighbors of an atom inside a KG registry.
+//
+//   kg_reg       : the KG registry (kg_registry_new() result).
+//   source_handle: [kg_label, atom_id] handle of the seed atom.
+//   max_hops     : 1 or 2. (Hops beyond 2 are clamped to 2; the strength curve
+//                  decays each hop and aggregation gets noisy past two hops --
+//                  the spreading_activation stage already does its own 2-hop
+//                  reach over xrefs.)
+//   max_results  : cap on returned neighbors.
+//
+// Returns a list of [handle, similarity_milli] entries, sorted by descending
+// strength. similarity_milli is in 0..1000; a one-hop neighbor reached via a
+// strong operator (confidence ~1000) lands near the ceiling; a two-hop neighbor
+// is decayed by NEIGH_HOP_DECAY. Aggregation across sources sums strengths and
+// clamps at 1000.
+fn find_neighbors(kg_reg, source_handle, max_hops, max_results) {
+    let out = list_new()
+    if kg_reg == 0 { return out }
+    if source_handle == 0 { return out }
+    let hops = max_hops
+    if hops < 1 { return out }
+    if hops > 2 { hops = 2 }
+
+    let acc = list_new()
+    // Hop 1: full weight (scale = FP_SCALE so fp_mul(x, FP_SCALE) == x).
+    _expand_one(kg_reg, source_handle, acc, FP_SCALE)
+
+    if hops >= 2 {
+        // Snapshot the one-hop frontier handles before expanding hop 2 (so we
+        // do not chase entries added during the walk and double-decay).
+        let hop1 = list_new()
+        let h = 0
+        while h < len(acc) {
+            push(hop1, acc[h][0])
+            h = h + 1
+        }
+        let i = 0
+        while i < len(hop1) {
+            let next_src = hop1[i]
+            if handle_eq(next_src, source_handle) == 0 {
+                _expand_one(kg_reg, next_src, acc, NEIGH_HOP_DECAY)
+            }
+            i = i + 1
+        }
+    }
+
+    // Drop any stray self-entry (paranoid; _expand_one already excludes it).
+    let cleaned = list_new()
+    let c = 0
+    while c < len(acc) {
+        if handle_eq(acc[c][0], source_handle) == 0 {
+            if acc[c][1] > 0 { push(cleaned, acc[c]) }
+        }
+        c = c + 1
+    }
+
+    _nh_sort_desc(cleaned)
+
+    let cap = max_results
+    if cap < 0 { cap = 0 }
+    if cap > len(cleaned) { cap = len(cleaned) }
+    let o = 0
+    while o < cap {
+        push(out, cleaned[o])
+        o = o + 1
+    }
+    return out
+}
+
+// Strength of a specific neighbor in a find_neighbors result (0 if not in the
+// result; convenient for tests / spreading_activation seeding).
+fn neighbor_strength(neighbors, h) {
+    let i = 0
+    while i < len(neighbors) {
+        if handle_eq(neighbors[i][0], h) == 1 { return neighbors[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- token fallback helpers (used by spreading_activation step 3) ---------
+
+// For an unmatched token (no exact word_find hit), the cheapest substrate-native
+// recovery is to search the language KG for OTHER words whose sense set already
+// contains a concept reachable from a context concept -- but at the lexical
+// level (without context), we expose one direct helper: enumerate the senses of
+// every word atom in the language KG, returning [word_atom, sense_handles] only
+// for words whose normalized form shares >=1 character with the token. Tiny and
+// approximate -- the real recovery loop is the reader's stage 5 learn trigger;
+// this just gives the spreading_activation stage candidates to seed.
+//
+// The result is a list of [concept_handle, score_milli]. Score is the word's
+// confidence times the sense's xref weight, milli.
+fn lexical_fallback_candidates(reg, lang_kg, token, max_results) {
+    let out = list_new()
+    if lang_kg == 0 { return out }
+    let norm = lang_normalize(token)
+    let tlen = len(norm)
+    if tlen == 0 { return out }
+    let atoms = kg_atoms(lang_kg)
+    let acc = list_new()
+    let i = 0
+    while i < len(atoms) {
+        let w = atoms[i]
+        if is_word_atom(w) == 1 {
+            let sim = word_form_similarity(norm, atom_label(w))
+            // Require a non-trivial lexical overlap; rejects unrelated tokens.
+            if sim > 300 {
+                let senses = atom_xrefs(w)
+                let conf = atom_confidence(w)
+                let weighted = fp_mul(sim, conf)
+                let s = 0
+                while s < len(senses) {
+                    let nh = handle_new(xref_dst_kg(senses[s]), xref_dst_atom(senses[s]))
+                    let strength = fp_mul(weighted, xref_weight(senses[s]))
+                    _nh_add(acc, nh, strength)
+                    s = s + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    _nh_sort_desc(acc)
+    let cap = max_results
+    if cap < 0 { cap = 0 }
+    if cap > len(acc) { cap = len(acc) }
+    let o = 0
+    while o < cap {
+        push(out, acc[o])
+        o = o + 1
+    }
+    return out
+}
