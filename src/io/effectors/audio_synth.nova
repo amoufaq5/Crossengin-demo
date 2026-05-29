@@ -1,0 +1,480 @@
+// CrossEngin io/effectors: pure-substrate audio synthesis.
+//
+// Purpose
+//   Phase 19 Tier-4 item #1: the minimum-viable audio modality bridge
+//   (ADR-0014 names phoneme/TTS as a deferred runtime seam). Real phoneme-level
+//   synthesis is a month-long lift; this module realizes the FLOOR that closes
+//   the seam: integer-only PCM16 generation in pure NOVA -- a sine carrier per
+//   phoneme, a triangular amplitude envelope per atom, and a 44-byte
+//   RIFF/WAVE/PCM file written via the sys_write floor. The output is
+//   audibly a sequence of phonemes; quality is the higher-mode escalation's
+//   job (Mode 2 = espeak; Mode 3 = aplay). Tone is robotic on purpose --
+//   the seam is what is load-bearing, and it is closed.
+//
+//   No floating point: a 256-entry quarter-wave sine table built at startup
+//   via Bhaskara's degree-domain approximation (see _sin_table_init) drives
+//   the carrier; full waveform comes from 4-fold symmetry. The table is
+//   amplitude-scaled to 16000 (well below the int16 peak of 32767, so even
+//   the noisiest fricative cannot clip). Per-phoneme samples are 150ms at
+//   8000Hz = 1200 samples; the formant table maps ~20 common ARPABET-ish
+//   atoms to vowel formants (~400..1000 Hz) and consonant carriers
+//   (fricatives 4kHz-ish, plosives short bursts). Unknown phonemes default
+//   to 440Hz (A4) so any text always produces audio.
+//
+//   The PCM16 byte layout is little-endian by construction (low byte first,
+//   then high), and writes go through sys_open/sys_write/sys_fsync/sys_close
+//   so the file is durable before any aplay reader opens it (same contract
+//   as snapshot_disk.nova's write_durable). Caller composes Modes 2/3 above
+//   this floor; see audio_speak.nova.
+//
+//   The synthesizer accesses the language KG for phoneme references via
+//   word_atoms.nova's `word_phonemes(word)` cross-ref (when the seed or the
+//   learner has installed them). Words without recorded phonemes fall back
+//   to a one-syllable-per-word policy at a carrier derived from the word's
+//   length, so synth_text("hello", 0) always produces audible output even
+//   on the cold seed.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- the audio leg), ADR-0015
+//   (phoneme atoms feed the synth), ADR-0013 (output is the terminal stage of
+//   substrate generation). NOVA dependencies: builtins (alloc/store8/store64/
+//   list_*) + sys_open/sys_write/sys_fsync/sys_close from std/syscall.
+//   CrossEngin dependencies: src/language/phoneme_atoms.nova (-> word_atoms
+//   -> kg) -- for word_phonemes and phoneme symbol lookup.
+
+import "std/syscall"
+import "../../language/phoneme_atoms.nova"
+
+// ---- audio constants ------------------------------------------------------
+
+let AUDIO_SAMPLE_RATE  = 8000     // Hz; tiny files at full audibility
+let AUDIO_BITS_PER_SAMPLE = 16
+let AUDIO_CHANNELS     = 1        // mono
+let AUDIO_AMPLITUDE    = 16000    // peak PCM16 value (well below 32767)
+let AUDIO_PHONEME_MS   = 150      // ~150ms per phoneme atom
+// 150ms @ 8000Hz = 1200 samples per phoneme. Hard-coded so tests can
+// assert without recomputing.
+let AUDIO_PHONEME_SAMPLES = 1200
+
+// Envelope shape: triangular ramp-up over the first envelope-frac of the
+// phoneme, sustain at peak, ramp-down over the last envelope-frac. Keeps
+// edges click-free.
+let AUDIO_ENV_FRAC = 4            // 1/4 of duration ramps each side
+
+// ---- sine table -----------------------------------------------------------
+//
+// A 256-entry quarter-wave table built via Bhaskara's degree-domain sine
+// approximation in integer arithmetic. The approximation:
+//
+//   sin(deg) ~= (4 * deg * (180 - deg)) / (40500 - deg * (180 - deg))
+//
+// is accurate to ~1.7% across [0, 180]. We sample 256 points across [0, 90]
+// (so the table indexes are quarter-period steps) and scale to AUDIO_AMPLITUDE.
+// Full-period values come from 4-fold symmetry:
+//
+//   q in [0..255]                -> +table[q]              (Q1)
+//   q in [256..511]              -> +table[511 - q]        (Q2)
+//   q in [512..767]              -> -table[q - 512]        (Q3)
+//   q in [768..1023]             -> -table[1023 - q]       (Q4)
+//
+// One period = 1024 entries; pointer-thresholds in the loop never exceed
+// AUDIO_AMPLITUDE * 180 < 3e6, well under the NOVA loop-multiply ceiling
+// (blocker #11).
+
+let _SIN_TABLE_SIZE = 256        // quarter-wave entries
+let _SIN_PERIOD     = 1024       // full-wave entries via 4-fold symmetry
+
+let _sin_table = 0               // initialized lazily on first synth_sine
+
+fn _sin_q_milli(deg) {
+    // Bhaskara, scaled to milli (1000 = sin(90)).
+    let prod = deg * (180 - deg)
+    let num = 4 * prod * 1000
+    let den = 40500 - prod
+    if den <= 0 { return 1000 }
+    return num / den
+}
+
+// Build the 256-entry quarter-wave table mapping index 0..255 -> 0..AMPLITUDE.
+// We sample at deg = i * 90 / 255 across [0, 90], so the last entry is the
+// peak. Idempotent: re-calling installs the same values.
+fn _sin_table_init() {
+    if _sin_table != 0 { return _sin_table }
+    let t = list_new()
+    let i = 0
+    while i < _SIN_TABLE_SIZE {
+        // Degree in [0..90]; integer-precise division for both ends.
+        let deg = (i * 90) / (_SIN_TABLE_SIZE - 1)
+        let milli = _sin_q_milli(deg)
+        let amp = (milli * AUDIO_AMPLITUDE) / 1000
+        push(t, amp)
+        i = i + 1
+    }
+    _sin_table = t
+    return t
+}
+
+// Look up sin(theta) for theta in 0..1023 (one period), returning a signed
+// integer in [-AMPLITUDE..+AMPLITUDE]. 4-fold symmetry off the quarter table.
+fn _sin_lookup(phase) {
+    let t = _sin_table_init()
+    let p = phase
+    while p < 0 { p = p + _SIN_PERIOD }
+    p = p - (p / _SIN_PERIOD) * _SIN_PERIOD
+    if p < _SIN_TABLE_SIZE {
+        return t[p]                              // Q1
+    }
+    if p < 2 * _SIN_TABLE_SIZE {
+        return t[2 * _SIN_TABLE_SIZE - 1 - p]    // Q2
+    }
+    if p < 3 * _SIN_TABLE_SIZE {
+        return 0 - t[p - 2 * _SIN_TABLE_SIZE]    // Q3
+    }
+    return 0 - t[4 * _SIN_TABLE_SIZE - 1 - p]    // Q4
+}
+
+// Public sample lookup for callers / tests. Wraps phase to one period.
+fn audio_sine_sample(phase) {
+    return _sin_lookup(phase)
+}
+
+// ---- WAV header -----------------------------------------------------------
+//
+// Builds the 44-byte RIFF/WAVE/PCM header as a list of 44 ints (one byte
+// each, 0..255). Returned as a list so callers can introspect; the writer
+// appends the PCM data directly with the same byte semantics.
+//
+// Layout (RIFF little-endian throughout):
+//   0..3   "RIFF"
+//   4..7   chunk size = 36 + data_size              (LE u32)
+//   8..11  "WAVE"
+//   12..15 "fmt "
+//   16..19 fmt chunk size = 16                      (LE u32)
+//   20..21 audio format = 1 (PCM)                   (LE u16)
+//   22..23 n channels = 1 (mono)                    (LE u16)
+//   24..27 sample rate                              (LE u32)
+//   28..31 byte rate = sample_rate * 2              (LE u32)
+//   32..33 block align = 2                          (LE u16)
+//   34..35 bits per sample = 16                     (LE u16)
+//   36..39 "data"
+//   40..43 data size = n_samples * 2                (LE u32)
+
+fn _push_le_u16(buf, v) {
+    push(buf, v & 255)
+    push(buf, (v / 256) & 255)
+    return buf
+}
+
+fn _push_le_u32(buf, v) {
+    push(buf, v & 255)
+    push(buf, (v / 256) & 255)
+    push(buf, (v / 65536) & 255)
+    push(buf, (v / 16777216) & 255)
+    return buf
+}
+
+fn _push_ascii(buf, s) {
+    let i = 0
+    while i < len(s) {
+        push(buf, char_at(s, i))
+        i = i + 1
+    }
+    return buf
+}
+
+fn wav_header(sample_rate, n_samples) {
+    let data_size = n_samples * 2
+    let h = list_new()
+    _push_ascii(h, "RIFF")                          // 0..3
+    _push_le_u32(h, 36 + data_size)                 // 4..7
+    _push_ascii(h, "WAVE")                          // 8..11
+    _push_ascii(h, "fmt ")                          // 12..15
+    _push_le_u32(h, 16)                             // 16..19 fmt chunk size
+    _push_le_u16(h, 1)                              // 20..21 PCM
+    _push_le_u16(h, AUDIO_CHANNELS)                 // 22..23 mono
+    _push_le_u32(h, sample_rate)                    // 24..27
+    _push_le_u32(h, sample_rate * 2)                // 28..31 byte rate
+    _push_le_u16(h, 2)                              // 32..33 block align
+    _push_le_u16(h, AUDIO_BITS_PER_SAMPLE)          // 34..35 bps
+    _push_ascii(h, "data")                          // 36..39 canonical PCM marker
+    _push_le_u32(h, data_size)                      // 40..43
+    return h
+}
+
+fn wav_header_byte(h, i) {
+    if i < 0 { return 0 }
+    if i >= len(h) { return 0 }
+    return h[i]
+}
+
+// ---- sine generation ------------------------------------------------------
+//
+// Generates n_samples PCM16 samples of a sine wave at freq_hz, sampled at
+// sample_rate. Integer math throughout:
+//
+//   phase(t) = (t * freq_hz * _SIN_PERIOD / sample_rate) mod _SIN_PERIOD
+//
+// Intermediate t*freq stays under 1e8 for our parameters (1200 samples,
+// 1000 Hz peak), well clear of the NOVA loop-multiply ceiling (blocker #11).
+
+fn synth_sine(freq_hz, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    _sin_table_init()
+    // Bresenham-style phase generator: keep all loop-body intermediates
+    // small (<~16k) so the NOVA codegen loop-multiply pointer threshold
+    // (blocker #11, ~1M for audio loops) is never crossed. The wide
+    // outside-loop products (freq * 1024 / sample_rate) are safe -- the
+    // blocker only bites inside the loop body.
+    //
+    //   step_int  = floor(freq * 1024 / sample_rate)
+    //   step_num  = (freq * 1024) mod sample_rate
+    //   err += step_num per sample; when err >= sample_rate, phase += 1
+    //   phase wraps modulo 1024 with a subtract (no multiply).
+    let product = freq_hz * _SIN_PERIOD       // outside the loop
+    let step_int = product / sample_rate      // outside the loop
+    let step_num = product - step_int * sample_rate
+    let phase = 0
+    let err = 0
+    let t = 0
+    while t < n_samples {
+        push(samples, _sin_lookup(phase))
+        phase = phase + step_int
+        err = err + step_num
+        if err >= sample_rate {
+            err = err - sample_rate
+            phase = phase + 1
+        }
+        while phase >= _SIN_PERIOD { phase = phase - _SIN_PERIOD }
+        t = t + 1
+    }
+    return samples
+}
+
+// Apply a triangular envelope in place over `samples` (returns the same list).
+// Ramp up over the first n/AUDIO_ENV_FRAC samples, sustain at full, ramp down
+// over the last n/AUDIO_ENV_FRAC samples. Keeps edges click-free between
+// concatenated phonemes.
+fn _apply_envelope(samples) {
+    let n = len(samples)
+    if n == 0 { return samples }
+    let ramp = n / AUDIO_ENV_FRAC
+    if ramp < 1 { ramp = 1 }
+    let i = 0
+    while i < n {
+        let g = 1000   // 1.0 in milli
+        if i < ramp {
+            g = (i * 1000) / ramp
+        } else {
+            if i >= n - ramp {
+                let k = n - 1 - i
+                g = (k * 1000) / ramp
+            }
+        }
+        samples[i] = (samples[i] * g) / 1000
+        i = i + 1
+    }
+    return samples
+}
+
+// ---- phoneme table --------------------------------------------------------
+//
+// Per-phoneme carrier frequency lookup. Vowels are voiced formant-ish
+// (400..1000 Hz approximates the F1 of common vowels); plosives use short
+// bursts at higher carriers (the envelope shortens them); fricatives use
+// a high carrier (4 kHz Nyquist territory at 8kHz sample rate produces
+// the noisy quality). The mapping is small on purpose -- ~20 entries
+// covers the common English atoms the language module installs.
+
+fn _phoneme_freq(label) {
+    let s = str_trim(label)
+    if str_eq(s, "a")  == 1 { return 700 }
+    if str_eq(s, "e")  == 1 { return 500 }
+    if str_eq(s, "i")  == 1 { return 350 }
+    if str_eq(s, "o")  == 1 { return 450 }
+    if str_eq(s, "u")  == 1 { return 320 }
+    if str_eq(s, "ah") == 1 { return 730 }
+    if str_eq(s, "ae") == 1 { return 660 }
+    if str_eq(s, "eh") == 1 { return 530 }
+    if str_eq(s, "ih") == 1 { return 390 }
+    if str_eq(s, "iy") == 1 { return 270 }
+    if str_eq(s, "oh") == 1 { return 570 }
+    if str_eq(s, "ow") == 1 { return 470 }
+    if str_eq(s, "uw") == 1 { return 300 }
+    if str_eq(s, "p")  == 1 { return 200 }
+    if str_eq(s, "t")  == 1 { return 220 }
+    if str_eq(s, "k")  == 1 { return 240 }
+    if str_eq(s, "b")  == 1 { return 180 }
+    if str_eq(s, "d")  == 1 { return 190 }
+    if str_eq(s, "g")  == 1 { return 210 }
+    if str_eq(s, "s")  == 1 { return 3500 }    // fricative
+    if str_eq(s, "z")  == 1 { return 3200 }
+    if str_eq(s, "f")  == 1 { return 3800 }
+    if str_eq(s, "v")  == 1 { return 3300 }
+    if str_eq(s, "sh") == 1 { return 2800 }
+    if str_eq(s, "h")  == 1 { return 2500 }
+    if str_eq(s, "m")  == 1 { return 280 }     // nasal
+    if str_eq(s, "n")  == 1 { return 310 }
+    if str_eq(s, "ng") == 1 { return 260 }
+    if str_eq(s, "l")  == 1 { return 360 }     // liquid
+    if str_eq(s, "r")  == 1 { return 340 }
+    if str_eq(s, "w")  == 1 { return 290 }
+    if str_eq(s, "y")  == 1 { return 380 }
+    return 440                                  // A4 fallback
+}
+
+// Synthesize one phoneme atom: AUDIO_PHONEME_SAMPLES PCM16 samples at the
+// per-label formant, with a triangular envelope so concatenated atoms do not
+// click. Always returns a 1200-sample list (the brief's invariant).
+fn synth_phoneme(phoneme_label) {
+    let f = _phoneme_freq(phoneme_label)
+    let samples = synth_sine(f, AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+    _apply_envelope(samples)
+    return samples
+}
+
+// ---- text-level synthesis -------------------------------------------------
+//
+// Splits text into space-delimited words; for each word, looks up its
+// phoneme sequence in the language KG via word_phonemes(); concatenates
+// synth_phoneme(...) per phoneme. When the language KG is unavailable
+// (lang == 0) or the word has no recorded phonemes, falls back to ONE
+// "syllable" per word at a carrier derived from the word's length (so the
+// cold seed still emits audible output: short word -> brighter pitch).
+
+fn _len_to_freq(n) {
+    // Map word length 1..10 -> 800 Hz .. 350 Hz (shorter -> higher pitch).
+    let f = 850 - n * 50
+    if f < 250 { f = 250 }
+    if f > 900 { f = 900 }
+    return f
+}
+
+fn _append_all(dst, src) {
+    let i = 0
+    while i < len(src) {
+        push(dst, src[i])
+        i = i + 1
+    }
+    return dst
+}
+
+// When the language KG is missing or the word has no recorded phonemes, we
+// fall back to one tone per character, each at the word-length-derived
+// carrier. That keeps the fallback per-syllable-ish (a 5-char word emits 5
+// tones) so synth_text("hello", 0) still produces enough samples to test.
+fn _synth_word_fallback(word) {
+    let n = len(word)
+    let out = list_new()
+    if n == 0 { return out }
+    let f_base = _len_to_freq(n)
+    let i = 0
+    while i < n {
+        // Slight per-position pitch shift so successive tones do not blur.
+        let f = f_base + i * 15
+        let one = synth_sine(f, AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        _apply_envelope(one)
+        _append_all(out, one)
+        i = i + 1
+    }
+    return out
+}
+
+fn _resolve_phoneme_label(lang_kg, atom_id_val) {
+    if lang_kg == 0 { return "" }
+    let a = kg_atom(lang_kg, atom_id_val)
+    if a == 0 { return "" }
+    if is_phoneme_atom(a) == 0 { return "" }
+    return phoneme_symbol(a)
+}
+
+fn synth_text(text, lang_kg) {
+    let out = list_new()
+    let toks = split(text, " ")
+    let i = 0
+    while i < len(toks) {
+        let w = str_trim(toks[i])
+        if len(w) > 0 {
+            let used_phon = 0
+            if lang_kg != 0 {
+                let wa = word_find(lang_kg, w)
+                if wa != 0 {
+                    let pids = word_phonemes(wa)
+                    let j = 0
+                    while j < len(pids) {
+                        let lab = _resolve_phoneme_label(lang_kg, pids[j])
+                        if len(lab) > 0 {
+                            let chunk = synth_phoneme(lab)
+                            _append_all(out, chunk)
+                            used_phon = 1
+                        }
+                        j = j + 1
+                    }
+                }
+            }
+            if used_phon == 0 {
+                let chunk2 = _synth_word_fallback(w)
+                _append_all(out, chunk2)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- WAV writer -----------------------------------------------------------
+//
+// audio_write_wav(samples, path) -> 1 on success, 0 on any syscall failure.
+//
+// Allocates a single contiguous byte buffer of (44 + n*2) bytes, copies the
+// wav_header() into the leading 44 bytes, encodes each PCM16 sample as
+// (low byte, high byte), then sys_write the full buffer in one call and
+// sys_fsync before close (same durability contract as snapshot_disk.nova,
+// so any subsequent aplay reads the file we just wrote, not a stale one).
+// Negative-sample two's-complement is enforced by masking with 0xFFFF.
+
+let _AUDIO_FILE_MODE = 420       // 0644 rw-r--r--
+
+fn audio_write_wav(samples, path) {
+    let n = len(samples)
+    let header = wav_header(AUDIO_SAMPLE_RATE, n)
+    let hn = len(header)                          // 44 by construction
+    let total = hn + n * 2
+    let buf = alloc(total + 1)                    // +1 for an end NUL byte
+    let i = 0
+    while i < hn {
+        store8(buf + i, header[i])
+        i = i + 1
+    }
+    let j = 0
+    while j < n {
+        let s = samples[j]
+        // PCM16 two's-complement: signed int -> unsigned 16-bit via mask.
+        // NOVA integers are 64-bit, so (& 65535) is safe for negative s.
+        let u = s & 65535
+        if s < 0 {
+            u = (s + 65536) & 65535
+        }
+        store8(buf + hn + j * 2,     u & 255)
+        store8(buf + hn + j * 2 + 1, (u / 256) & 255)
+        j = j + 1
+    }
+    store8(buf + total, 0)
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, _AUDIO_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, total)
+    if written != total {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// Convenience for diagnostics: total samples in a duration ms at the canonical
+// rate. Used by the speak escalation logic when sizing temp buffers.
+fn audio_samples_for_ms(ms) {
+    return (ms * AUDIO_SAMPLE_RATE) / 1000
+}

@@ -11,8 +11,8 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 96 modules compile (`make build`), 95 unit-test suites pass
-> (`make test`, 1820 assertions, +1 suite / +22 assertions from
+> toolchain: 94 modules compile (`make build`), 95 unit-test suites pass
+> (`make test`, 1816 assertions, +1 suite / +22 assertions from
 > `test_learn_tag.nova` added in Phase 15 Tier-2 #3 multi-source `/learn`,
 > +1 suite / +39 assertions from `test_meta_observer.nova` added in Phase 13
 > Tier-2 #1 meta-learning observer,

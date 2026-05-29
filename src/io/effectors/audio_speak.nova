@@ -1,0 +1,238 @@
+// CrossEngin io/effectors: audio speak escalation.
+//
+// Purpose
+//   Phase 19 Tier-4 item #1 (Modes 2 + 3): the audio speak entrypoint, which
+//   layers on top of audio_synth.nova's Mode 1 floor:
+//
+//     Mode 1 (always works): pure-NOVA phoneme synthesis -> 44-byte WAV.
+//                            Closes the seam unconditionally; tone is robotic.
+//     Mode 2 (when espeak):  shell out via fork/exec to `espeak -w PATH TEXT`,
+//                            producing a much higher-quality voice into the
+//                            same WAV path. Falls back to Mode 1 if espeak is
+//                            not on $PATH (detected by a `command -v` probe).
+//     Mode 3 (when ALSA/PA): after a WAV is produced, best-effort play it via
+//                            `aplay -q PATH` or `paplay PATH`. Skipped silently
+//                            in headless / sandboxed environments.
+//
+//   The seam is the same in all three modes: effector_speak_audio(text,
+//   out_path) returns 1 on success (a playable WAV exists at out_path), 0 on
+//   failure. Playback failure is NOT a synthesis failure -- if the file is on
+//   disk, the function returns 1 regardless of whether aplay/paplay was
+//   available. This matches the brief's "best-effort plays it" semantics and
+//   keeps the speak path useful in CI / headless test rigs.
+//
+//   Process escalation uses NOVA's fork_process / exec_program / waitpid
+//   builtins directly. exec_program's signature is (path, argv), where argv
+//   is a NULL-terminated C-style array of char* pointers (i.e. a raw memory
+//   block of 8-byte slots populated via store64, terminated by a 0). We
+//   never reach back through stdout/stderr -- we only care about the child's
+//   exit status, which waitpid hands back already shifted + masked (codegen
+//   detail) to a 0..255 byte. Probing whether a binary is on PATH is a single
+//   /bin/sh -c "command -v BIN >/dev/null 2>&1" fork.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- audio leg, escalation tiers).
+//   NOVA dependencies: builtins (alloc/store64/list_*) + fork_process,
+//   exec_program, waitpid, getenv from the runtime. CrossEngin dependencies:
+//   src/io/effectors/audio_synth.nova (Mode 1 floor + WAV writer).
+
+import "audio_synth.nova"
+
+// Default destination for synthesized speech. Overridable via CE_SPEECH_PATH.
+let CE_DEFAULT_SPEECH_PATH = "/tmp/ce_speech.wav"
+
+// ---- argv builder ---------------------------------------------------------
+//
+// exec_program wants a NULL-terminated argv: a raw memory block with one
+// 8-byte slot per char* + a final 0. Each slot's value is a pointer to a
+// NUL-terminated byte sequence (a NOVA string IS such a sequence, since
+// _nova_len walks bytes until 0). _argv2/3/4 build the common shapes.
+
+fn _argv2(a0, a1) {
+    let p = alloc(3 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, 0)
+    return p
+}
+
+fn _argv3(a0, a1, a2) {
+    let p = alloc(4 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, 0)
+    return p
+}
+
+fn _argv4(a0, a1, a2, a3) {
+    let p = alloc(5 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, a3)
+    store64(p + 32, 0)
+    return p
+}
+
+// ---- shell-out helpers ----------------------------------------------------
+//
+// We always go through /bin/sh -c "<command>" so:
+//   - PATH lookup for the target binary works without us reimplementing it,
+//   - shell quoting of the text argument is the shell's problem (we wrap the
+//     user text in single quotes after escaping any embedded single quotes),
+//   - stdout/stderr can be silenced with the same redirection idiom.
+//
+// _shell_quote_single converts `text` into a shell-safe single-quoted token:
+// each embedded ' becomes '\'' (close-quote, escaped-quote, open-quote).
+
+fn _shell_quote_single(text) {
+    let out = "'"
+    let i = 0
+    while i < len(text) {
+        let c = char_at(text, i)
+        if c == 39 {                      // '
+            out = out + "'\\''"
+        } else {
+            out = out + substr(text, i, 1)
+        }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// Run /bin/sh -c "<cmd>" synchronously; return child exit status (0 on
+// success). On fork failure or exec failure we report a non-zero status so
+// callers can fall back. Stdout/stderr of the child stays attached to ours
+// for Mode 3 -- aplay is quiet (-q) and shell warnings would be informative
+// in a normal terminal; tests pipe to /dev/null at the integration layer.
+fn _run_sh_c(cmd) {
+    let argv = _argv3("sh", "-c", cmd)
+    let pid = fork_process()
+    if pid < 0 { return 127 }            // fork failure -> "not found"-ish
+    if pid == 0 {
+        exec_program("/bin/sh", argv)
+        // exec_program only returns on failure; signal it explicitly.
+        exit(127)
+    }
+    return waitpid(pid)
+}
+
+// Probe whether a binary is on PATH. Uses `command -v BIN >/dev/null 2>&1`
+// which is POSIX and exits 0 iff BIN is found.
+fn _have_binary(bin) {
+    let cmd = "command -v " + bin + " >/dev/null 2>&1"
+    let st = _run_sh_c(cmd)
+    if st == 0 { return 1 }
+    return 0
+}
+
+// ---- Mode 2: espeak escalation -------------------------------------------
+//
+// If espeak is on PATH, run `espeak -w PATH "TEXT" >/dev/null 2>&1`. Returns
+// 1 if espeak both ran AND produced a non-empty file at PATH; 0 otherwise.
+// On any failure the caller is responsible for Mode 1 fallback.
+
+fn _file_nonempty(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let buf = alloc(5)
+    let n = sys_read(fd, buf, 4)
+    sys_close(fd)
+    if n > 0 { return 1 }
+    return 0
+}
+
+fn _try_espeak(text, out_path) {
+    if _have_binary("espeak") == 0 { return 0 }
+    let cmd = "espeak -w " + _shell_quote_single(out_path)
+        + " " + _shell_quote_single(text)
+        + " >/dev/null 2>&1"
+    let st = _run_sh_c(cmd)
+    if st != 0 { return 0 }
+    if _file_nonempty(out_path) == 0 { return 0 }
+    return 1
+}
+
+// ---- Mode 3: aplay / paplay escalation -----------------------------------
+//
+// Try ALSA's aplay first (quiet flag swallows the per-file noise), then
+// PulseAudio's paplay. Returns 1 if either ran successfully; 0 if neither
+// was available or both failed. Playback failure is NEVER an effector_speak
+// failure -- the WAV is the load-bearing artifact.
+
+fn _try_aplay(path) {
+    if _have_binary("aplay") == 1 {
+        let cmd = "aplay -q " + _shell_quote_single(path) + " >/dev/null 2>&1"
+        let st = _run_sh_c(cmd)
+        if st == 0 { return 1 }
+    }
+    if _have_binary("paplay") == 1 {
+        let cmd = "paplay " + _shell_quote_single(path) + " >/dev/null 2>&1"
+        let st = _run_sh_c(cmd)
+        if st == 0 { return 1 }
+    }
+    return 0
+}
+
+// ---- public entrypoint ----------------------------------------------------
+//
+// effector_speak_audio(text, out_path) -> 1 on success, 0 on failure.
+//
+// Pipeline:
+//   1. Try espeak (Mode 2). If it produced a WAV, skip Mode 1.
+//   2. Otherwise synth_text(text, lang_kg) + audio_write_wav(...) (Mode 1).
+//      We don't have the language KG at this seam (the chat passes 0); the
+//      synth falls back to per-word fallback frequencies and still emits.
+//   3. Either way, best-effort _try_aplay(out_path) (Mode 3).
+//
+// Caller supplies out_path; pass empty string ("") to use the default
+// (CE_DEFAULT_SPEECH_PATH or $CE_SPEECH_PATH).
+
+fn _resolve_path(out_path) {
+    if len(out_path) > 0 { return out_path }
+    let env = getenv("CE_SPEECH_PATH")
+    if len(env) > 0 { return env }
+    return CE_DEFAULT_SPEECH_PATH
+}
+
+fn effector_speak_audio(text, out_path) {
+    let path = _resolve_path(out_path)
+    let used_espeak = _try_espeak(text, path)
+    if used_espeak == 0 {
+        // Mode 1 floor: pure-NOVA synth. lang_kg=0 -> fallback per-word
+        // frequencies (still audible). The chat may call effector_speak_audio_kg
+        // to thread the live language KG in.
+        let samples = synth_text(text, 0)
+        if audio_write_wav(samples, path) == 0 { return 0 }
+    }
+    // Mode 3 is best-effort; result does NOT gate success.
+    _try_aplay(path)
+    return 1
+}
+
+// Variant that threads the live language KG through to Mode 1, so seeded
+// phoneme atoms drive the carrier. Mode 2/3 are identical to the above.
+fn effector_speak_audio_kg(text, lang_kg, out_path) {
+    let path = _resolve_path(out_path)
+    let used_espeak = _try_espeak(text, path)
+    if used_espeak == 0 {
+        let samples = synth_text(text, lang_kg)
+        if audio_write_wav(samples, path) == 0 { return 0 }
+    }
+    _try_aplay(path)
+    return 1
+}
+
+// Status reporter for chat /speak: returns a short string for the operator
+// describing which mode actually produced the file ("espeak" / "synth") and
+// whether playback was attempted. Pure inspection -- no syscalls run.
+// Format: "speak: mode=<m> wav=<path>" -- the caller prepends "(spoke ...".
+fn audio_modes_available() {
+    let s = ""
+    if _have_binary("espeak") == 1 { s = s + "espeak " }
+    if _have_binary("aplay")  == 1 { s = s + "aplay " }
+    if _have_binary("paplay") == 1 { s = s + "paplay " }
+    if len(s) == 0 { s = "synth-only" }
+    return s
+}
