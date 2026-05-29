@@ -213,6 +213,30 @@ nothing is emitted until `/resume`. `/teach` ingests via the same
 `ask_user_to_teach` path the agent uses at idle. `/pin` writes the word's
 Bayesian α/β directly.
 
+#### Reflect on what was just said
+
+`/reflect [depth]` runs a reflection cycle in a **sandbox**: the agent takes
+its current reasoning conclusions, forward-simulates them in the imagination
+KG (depth 4 by default), and records the resulting NEW labels into a separate
+**reflection KG** as tentative atoms (Beta(2,1) weak prior). The live
+blackboard isn't touched and the gate isn't called — the agent isn't acting,
+just speculating about what else could be true.
+
+```
+> fever
+agent> see headache
+> /reflect
+(reflected on 6 concept(s); 4 tentative inference(s): doctor, prescription, medicine, recover)  refl_kg=4
+> /reflect 6
+(reflected on 6 concept(s); 5 tentative inference(s): doctor, prescription, medicine, recover, rest)  refl_kg=5
+```
+
+The agent reasoned about "fever" (concluded `headache`), then reflection
+followed the narrative-leap patterns (`fever → doctor`, `pain → medicine`, …)
+and surfaced a treatment chain it hadn't explicitly derived. `/status` shows
+both counts: the shared KG and the reflection-KG. Re-running `/reflect` from
+the same seed corroborates existing tentative atoms instead of duplicating.
+
 #### Learn a topic from the web
 
 `scripts/learn.sh <topic>` fetches Wikipedia (or any URL via `LEARN_URL=`),
