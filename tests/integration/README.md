@@ -40,6 +40,33 @@ PASS/FAIL lines and a final `integration <name>: pass=N fail=M` line.
 | `admin_reflect_halt.sh` | `/reflect` (empty context + with depth), `/halt` -> drain -> `/resume` |
 | `admin_learn_meta.sh` | `/learn` (TOPIC + FILE), `/meta` table shape |
 
+### Failure-mode probes (P1.7)
+
+The `failmode_*.sh` scripts target the bug class that drove several Agent-C-style
+code-review findings: durability under crash, hostile / oversized input, IPC
+peer death, runaway-input gating, and concurrent access. Each script either
+asserts the system's *correct* response to the failure, OR -- when the test
+revealed a real bug -- pins the *current observed behavior* with a `# KNOWN:`
+comment so a future fix is detected (the test will start failing in the
+opposite direction once the bug is closed, and must be updated then).
+
+| Script | What it proves |
+|--------|---------------|
+| `failmode_disk_full_save.sh` | `/save` to a non-existent dir / read-only dir reports `(save FAILED: ...)` cleanly; the chat stays alive; a subsequent good-path save works. |
+| `failmode_killed_mid_fsync.sh` | `kill -9` at three offsets inside the `/save` pipeline (0ms, 50ms, 200ms) never leaves a partial snapshot at the final path; the file always ends with `end\n`; a `/load` of the surviving file succeeds. |
+| `failmode_corrupt_snap_recovery.sh` | A snapshot truncated to 100 bytes makes `/load` report FAILED; the running chat session's previously taught word is still recognized (failed load does NOT clobber live state). |
+| `failmode_dlog_corrupt_tail.sh` | Appending garbage to the dlog tail triggers `dl_open: warning -- truncated corrupt tail of <path>` on restart; the original entry count is preserved; the on-disk file is rewritten to the good prefix. |
+| `failmode_runaway_atom_births.sh` | Feeding 200 distinct unknown words yields a knowledge-count delta in [200, 800]; the auto-learn fires; the chat stays responsive. |
+| `failmode_soul_mood_overflow.sh` | 50 alternating high-arousal turns leave `valence` and `arousal` inside [0, 1000]; no integer wrap or negative readings appear in any `/status` line. |
+| `failmode_unknown_kg_load.sh` | A hand-rewritten snapshot with `kgs.atoms[0].kg unknownkg` loads successfully because `kg_spawn` is idempotent on label -- a NEW KG with that label is auto-created. Pins current behavior; documented for future "skip-with-warning" policy. |
+| `failmode_kgsync_subscriber_drop.sh` | Killing the subscriber `-9` mid-stream does NOT cause the publisher to detect the drop on its next send (TCP buffer absorbs it); the publisher continues, then exits on `bye` / EOF. KNOWN: no liveness check; no reconnect-resume. |
+| `failmode_web_concurrent_burst.sh` | 20 concurrent POSTs against the same `ce_sid` all complete without errors; no response is empty / has a missing `reply` field; the web server is still answering after the burst. |
+| `failmode_web_huge_payload.sh` | A 1MB POST to `/api/chat` does NOT crash the web server (the response or follow-up error is returned cleanly); a fresh cookie can still spawn a working chat child. KNOWN: the chat segfaults on the huge percept; the server catches the dead child via `chat process has exited`. |
+| `failmode_chat_long_line.sh` | A ~70-token line is processed cleanly; a ~200-token line currently SEGFAULTs the chat binary. CURRENT-BEHAVIOR pin -- KNOWN: chat segfaults on input lines longer than ~470 bytes. |
+| `failmode_session_eviction.sh` | With `CE_WEB_MAX_SESSIONS=2`, hitting web.py with 5 unique cookies leaves exactly 2 in `/api/sessions` -- the most-recent 2; the first 3 were evicted in LRU order. |
+| `failmode_save_load_ping_pong.sh` | 20 alternations of `/save` + `/load` in one chat session leave knowledge count, soul name, and taught words exactly as before -- no progressive corruption. |
+| `failmode_constitution_bypass_attempts.sh` | 5 different rephrasings of "exfiltrate ..." all trigger `[refused]` + `outcome : vetoed`; no normal `agent> see X` reply slips through. KNOWN: the safety stack is a keyword filter today; rephrasings that avoid the trigger word are still allowed -- documented for future semantic-intent extension. |
+
 ### Shared library
 
 `_lib.sh` holds the assertion harness (`assert_eq`, `assert_match`,
