@@ -110,6 +110,91 @@ continue. It is updated at every session boundary.
   counter -- 39 assertions across 10 test functions. Sample `/meta` smoke
   run after `/teach widget` + `/teach gadget`: `seed 572 / 572 tentative /
   0 durable / 0.0 / 0.0` and `user-teach 2 / 0 / 2 / 100.0 / 0.0`.
+- P1.3 -- kg-sync v2 protocol (N-subscriber + bidirectional + reconnect +
+  auth + conflict): **complete**. Matures the P20 distributed-substrate
+  seam from a one-shot single-subscriber demo into a production-shape
+  pub/sub. The protocol bumps to v2 (HELLO + OK lines change version,
+  three new event kinds, optional auth token, optional resume cursor); v1
+  HELLO/OK strings are still recognised by the server so an old subscriber
+  can attach to a new publisher. The end-to-end shape:
+  - **N-subscriber fan-out**: publisher reads `CE_KGSYNC_SUBS` (default 1
+    for backward compat) and accepts that many initial subscribers via
+    `sync_pub_accept_n`. Each sub becomes a `[fd, last_ack_id,
+    last_active_ns]` record; on every atom-birth (or PROMOTE / ATROPHY /
+    DELETE event) the publisher iterates the live list and calls
+    `_broadcast_line` -- round-robin per-event matches the brief's
+    "background-style send loop" in a single process without
+    threads. Rejected handshakes (bad token, malformed HELLO) do NOT
+    count toward N; the publisher keeps accepting up to `3*N+4` total
+    attempts. Subscribers whose `last_active` is older than
+    `KGSYNC_PRUNE_NS` (30 s) are dropped before the next broadcast.
+  - **Bidirectional**: SUB and PUB sides are symmetric after the
+    handshake. Each subscriber can teach back to the publisher by
+    piggybacking a `PUB <kg> <id> <kind> <a> <b> <label>` line on its
+    ACK channel; the publisher's `_broadcast_line` collects PUB replies
+    into an inbox the caller drains via `sync_apply_atom` (which is
+    conflict-aware -- see below).
+  - **Three new event kinds**: `PROMOTE <kg> <id> <alpha> <beta>` (belief
+    update), `ATROPHY <kg> <id>` (sub-threshold mark), `DELETE <kg> <id>`
+    (atom killed). The publisher exposes `sync_pub_broadcast_promote /
+    _atrophy / _delete` helpers wired into a tiny stdin admin protocol
+    (`promote <id>` / `atrophy <id>` / `delete <id>`); a full daemon
+    would call them directly from the bayesian-update / evidence-cut /
+    atom_death_monitor signal paths.
+  - **Reconnect on disconnect**: subscriber holds a `[fd, host, port,
+    token, since_atom_id]` state via `sync_sub_connect_state`. When
+    `_recv_line` returns 0 mid-stream (peer closed mid-stream and not via
+    BYE), `sync_sub_reconnect` closes the dead fd, re-dials with the
+    60-attempt budget, and re-handshakes with `SUB FROM <cursor>` so the
+    publisher can resume from the highest ATOM id the sub has applied.
+    The subscriber distinguishes a clean BYE (don't reconnect, exit) from
+    an unexpected EOF (reconnect).
+  - **Auth handshake**: server reads `CE_KGSYNC_TOKEN` from env at
+    accept-time. If set, the client must send `HELLO ce-kg-sync v2
+    token=<TOK>` matching the server's token; otherwise the server
+    replies `ERR auth` and closes. If unset, any HELLO is accepted
+    (anonymous backwards-compat mode). The client's
+    `sync_sub_connect`/`_state` mirrors the env so a single
+    `export CE_KGSYNC_TOKEN=...` configures both sides.
+  - **Conflict resolution**: `sync_apply_atom(kg, remote_id, kind, alpha,
+    beta, label)` is the canonical receiver. Policy: (1) no local atom
+    with `label` -> birth fresh; (2) local atom shares the remote id ->
+    refresh belief in place; (3) local atom exists at a DIFFERENT id
+    (the "two ends taught the same word" race) -> MERGE by averaging
+    alpha and beta in-place, keeping the local id stable so any synapses
+    that already point at it stay valid. No new atom is born on a merge.
+    Documented in the module header.
+  Wire constants live in `src/io/transducers/kg_sync.nova`:
+  `KGSYNC_HELLO_V2_LINE`, `KGSYNC_OK_V2_LINE`, `KGSYNC_SUB_FROM_PREFIX`,
+  `KGSYNC_PUB_PREFIX`, `KGSYNC_PROMOTE_PREFIX`, `KGSYNC_ATROPHY_PREFIX`,
+  `KGSYNC_DELETE_PREFIX`, `KGSYNC_ERR_AUTH`, `KGSYNC_TOKEN_TAG`.
+  Acceptance: `tests/unit/test_kg_sync.nova` covers format/parse
+  round-trip for ATOM + PUB + PROMOTE + ATROPHY + DELETE, the top-level
+  `_parse_line` classifier, HELLO token extraction (v1, v2 with and
+  without token, malformed `token=` clause, empty token value), all four
+  v1 malformed-line rejections (still), `_starts_with` prefix helper, the
+  three new env helpers (`kgsync_subs_from_env`, `kgsync_token_from_env`
+  default-anon), subscriber record init + set_ack + staleness threshold,
+  the four `sync_apply_*` policies including the merge path that asserts
+  local-id stability and the averaged belief, and the connection-state
+  cursor accessors -- 169 assertions across 49 test functions (+116 over
+  v1). `tests/integration/scenario_g2_kg_sync_multi.sh` (NEW; 24
+  assertions) exercises all five features end-to-end: 3 subscribers fan
+  out widget + gadget, sub1 piggybacks alpha-bird + beta-fish back to
+  the publisher, a publisher with token rejects an anonymous client and
+  accepts the token-bearing one, and a same-label collision (both ends
+  teach `shared-label`) verifies the merge keeps the publisher's local
+  KG at 1 atom. `tests/integration/scenario_g_kg_sync.sh` (v1 single-sub
+  demo) keeps passing unchanged (13 assertions), and
+  `tests/integration/failmode_kgsync_subscriber_drop.sh` (the pre-P1.3
+  current-behavior pin) also still passes -- the publisher's surface
+  hasn't regressed for an abrupt kill, the subscriber's reconnect path is
+  the affirmative direction now.
+  Sample manual smoke (verified):
+  `CE_KGSYNC_SUBS=3 CE_KGSYNC_TOKEN=s3kret ./bin/crossengin-kg-publisher`
+  with three `CE_KGSYNC_TOKEN=s3kret ./bin/crossengin-kg-subscriber`
+  clients yields `send kg=language id=0 label=widget delivered=3`,
+  with each sub printing `recv kg=language id=0 label=widget`.
 - P1.1 + P1.6 -- meta-observer feedback into source_authority + atom-death
   attribution: **complete**. Closes the loop on ADR-0050: until this
   session the meta-observer only REPORTED per-source promotion / atrophy
@@ -252,34 +337,45 @@ continue. It is updated at every session boundary.
   (24044 bytes). In this sandbox neither `espeak` nor `aplay`/`paplay`
   is installed, so Mode 1 carries the seam end-to-end; Modes 2 and 3 are
   exercised by their detection code at runtime and skipped silently.
-- Phase 20 Tier-4 item #2 -- distributed-substrate seam: **complete**.
+- Phase 20 Tier-4 item #2 -- distributed-substrate seam: **complete**
+  (upgraded to v2 by P1.3 -- see entry above for the multi-subscriber +
+  bidirectional + reconnect + auth + conflict-merge details).
   New `src/io/transducers/kg_sync.nova` defines a one-op-per-line text
   wire protocol for atom-birth events plus the publisher + subscriber
-  socket halves. Operations: `HELLO ce-kg-sync v1` / `OK v1 protocol
-  accepted` (handshake), `SUB *` (subscribe to all atoms), `ATOM
-  <kg_label> <id> <kind> <alpha> <beta> <label>` (one atom birth),
-  `ACK <id>` (per-atom ack), `BYE` (graceful close), `ERR <reason>`
-  (handshake refusal). Defaults match the rest of the repo's safe-bind
-  pattern: 127.0.0.1 (override `CE_KGSYNC_BIND=0.0.0.0`), port 8766
-  (override `CE_KGSYNC_PORT`), subscriber host `127.0.0.1` (override
-  `CE_KGSYNC_HOST`). Two new artifacts compose it: `bin/crossengin-kg-
-  publisher` (binds + accepts ONE subscriber + reads labels from stdin +
-  emits atom-births) and `bin/crossengin-kg-subscriber` (dials in +
-  handshake + applies received atoms to its own KG). The main
-  `bin/crossengin` daemon is intentionally untouched -- this is the seam,
-  not the multi-process refactor. Acceptance:
-  `tests/unit/test_kg_sync.nova` covers format/parse round-trip,
-  malformed-line rejection, CRLF/LF normalization, dash + underscore
-  label preservation, and the IP-string parser -- 53 assertions across
-  20 test functions. `tests/integration/scenario_g_kg_sync.sh` spawns
-  both binaries against a per-run high port, drives `widget`/`gadget`/
-  `fever` through the publisher's stdin, and asserts the subscriber's
-  stdout shows all three `recv ... label=X` lines plus a final
-  `local kg=3` (13 assertions; the script prints SKIP if `socket(2,1,0)`
-  itself fails so a denying sandbox doesn't break CI). Sample manual
-  smoke (verified): `./bin/crossengin-kg-subscriber > /tmp/sub.out &`
-  then `printf 'widget\n' | ./bin/crossengin-kg-publisher` produces
-  `recv kg=language id=0 label=widget` in /tmp/sub.out.
+  socket halves. v1 operations (still recognised by the v2 server):
+  `HELLO ce-kg-sync v1` / `OK v1 protocol accepted` (handshake), `SUB *`
+  (subscribe to all atoms), `ATOM <kg_label> <id> <kind> <alpha> <beta>
+  <label>` (one atom birth), `ACK <id>` (per-atom ack), `BYE` (graceful
+  close), `ERR <reason>` (handshake refusal). Defaults match the rest of
+  the repo's safe-bind pattern: 127.0.0.1 (override `CE_KGSYNC_BIND=0.0.0.0`),
+  port 8766 (override `CE_KGSYNC_PORT`), subscriber host `127.0.0.1`
+  (override `CE_KGSYNC_HOST`). v2 adds three event kinds (PROMOTE,
+  ATROPHY, DELETE), bidirectional PUB-from-subscriber, an optional
+  `token=<TOK>` HELLO clause + `CE_KGSYNC_TOKEN` env gate, `SUB FROM
+  <id>` cursor-based resume, and N-subscriber fan-out gated by
+  `CE_KGSYNC_SUBS` (default 1 for v1 backwards compat). Two artifacts
+  compose it: `bin/crossengin-kg-publisher` (binds + accepts N
+  subscribers + reads labels from stdin + emits atom-births / PROMOTE /
+  ATROPHY / DELETE) and `bin/crossengin-kg-subscriber` (dials in +
+  handshake + applies received events to its own KG + may teach back via
+  stdin -> PUB). The main `bin/crossengin` daemon is intentionally
+  untouched -- this is the seam, not the multi-process refactor.
+  Acceptance: `tests/unit/test_kg_sync.nova` covers format/parse round-
+  trip for ATOM + PUB + PROMOTE + ATROPHY + DELETE, the top-level
+  `_parse_line` classifier, HELLO token extraction, all four v1
+  malformed-line rejections, the three new env helpers, subscriber
+  record init + set_ack + staleness threshold, the four `sync_apply_*`
+  policies (including the merge path that asserts local-id stability
+  and the averaged belief), and the connection-state cursor accessors
+  -- 169 assertions across 49 test functions (+116 over v1).
+  `tests/integration/scenario_g_kg_sync.sh` (v1, 13 assertions) and
+  `tests/integration/scenario_g2_kg_sync_multi.sh` (v2, 24 assertions)
+  exercise both protocols end-to-end against per-run high ports; both
+  print SKIP if `socket(2,1,0)` itself fails so a denying sandbox
+  doesn't break CI. Sample manual smoke (verified):
+  `./bin/crossengin-kg-subscriber > /tmp/sub.out &` then `printf 'widget\n'
+  | ./bin/crossengin-kg-publisher` produces `recv kg=language id=0
+  label=widget` in /tmp/sub.out.
 - Phase 18 Tier-3 item #3 -- multi-tenant session foundation: **complete**.
   New `src/session/session.nova` (ADR-0051) defines a Session struct -- a
   flat 15-slot bundle (id, name, created_at, last_active, soul, kgreg, kg,
@@ -720,7 +816,7 @@ is standalone.
 | io/effectors/audio_synth.nova (Phase 19 Tier-4 #1: audio modality bridge -- WAV + sine + phoneme synth) | 0014, 0015, 0013 | 52 | done |
 | io/effectors/audio_speak.nova (Phase 19 Tier-4 #1: audio modality bridge -- espeak/aplay escalation) | 0014 | 0 | done |
 | io/transducers/input_transducer.nova | 0014, 0011, 0012, 0021 | 19 | done |
-| io/transducers/kg_sync.nova (Phase 20 Tier-4 #2: distributed-substrate seam) | 0014, 0016 | 53 | done |
+| io/transducers/kg_sync.nova (Phase 20 Tier-4 #2: distributed-substrate seam; P1.3 v2 upgrade -- N-subs + bidir + reconnect + auth + conflict) | 0014, 0016 | 169 | done |
 | io/transducers/http_client.nova (P1.4: plain-HTTP/1.1 in-process client + dispatcher seam; HTTPS deferred -- see TLS_AUDIT.md) | 0028, 0014 | 59 | done |
 
 Pure substrate, NO LLM (ADR-0014): `output_generation` produces text by the
@@ -732,37 +828,53 @@ message transport and audio STT/TTS are the documented runtime seams (NOVA
 enhancements #11/#14); all gate/log/generation logic is real and tested.
 
 Phase 20 / Tier 4 item #2 -- distributed-substrate seam: **complete**.
-New `src/io/transducers/kg_sync.nova` defines a text wire protocol (one op
-per line, `\n` terminated) for atom-birth events plus the publisher +
-subscriber socket halves, and two new artifacts compose it end-to-end:
+P1.3 upgraded the protocol to v2 (N-subscriber fan-out, bidirectional
+PUB-from-subscriber, three new event kinds PROMOTE / ATROPHY / DELETE,
+auth handshake via `CE_KGSYNC_TOKEN`, reconnect-on-disconnect with
+`SUB FROM <id>` cursor resume, and conflict-resolution merge by averaged
+belief; v1 HELLO/OK strings are still recognised). The original artifact
+shape is preserved: `src/io/transducers/kg_sync.nova` defines a text
+wire protocol (one op per line, `\n` terminated) with the publisher +
+subscriber socket halves; two artifacts compose it end-to-end:
 `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher`
-(binds 127.0.0.1:8766 by default, accepts ONE subscriber, reads labels from
-stdin, births an atom + pushes it on the wire) and
+(binds 127.0.0.1:8766 by default, accepts `CE_KGSYNC_SUBS` subscribers --
+default 1 for backwards compat -- reads labels from stdin, births an
+atom + fans it out to every live sub in a round-robin send loop, prunes
+subs whose `last_active` is older than 30s) and
 `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber`
-(dials the publisher, sends `HELLO ce-kg-sync v1` + `SUB *`, reads
-`ATOM <kg> <id> <kind> <alpha> <beta> <label>` lines, ACKs each, installs
-into its own local KG). Wire ops: `HELLO ce-kg-sync v1`, `OK v1 protocol
-accepted`, `SUB *`, `ATOM kg id kind alpha beta label`, `ACK <id>`,
-`BYE`, `ERR <reason>`. Defaults: bind `127.0.0.1` (opt in to broader via
-`CE_KGSYNC_BIND=0.0.0.0`, mirroring web.py); port 8766 (override via
-`CE_KGSYNC_PORT`); subscriber host `127.0.0.1` (override via
-`CE_KGSYNC_HOST`). The main `bin/crossengin` daemon is intentionally NOT
-modified -- rolling kg_sync into its idle path is a future enhancement.
-Acceptance: `tests/unit/test_kg_sync.nova` covers format/parse round-trip,
-malformed line rejection (missing fields, wrong op, non-numeric numerics,
-illegal label chars), CRLF + LF eol handling, dash/underscore label
-preservation, and the IP-string -> packed-int helper -- 53 assertions
-across 20 test functions; `tests/integration/scenario_g_kg_sync.sh`
-spawns both binaries against a per-run port, sends three labels through
-the publisher's stdin, and asserts the subscriber's stdout shows
-`recv ... label=widget`, `... label=gadget`, `... label=fever` plus a
-final `local kg=3` (13 assertions). Sandbox-quirk handling: the script
-prints a `SKIP` block if `socket(2,1,0)` returns -1 (some sandboxes
-disallow AF_INET entirely) so the rest of the suite keeps passing.
+(dials the publisher, sends `HELLO ce-kg-sync v2[ token=<TOK>]` +
+`SUB *` or `SUB FROM <id>`, reads + applies events, transparently
+reconnects on EOF, and may teach back via stdin -> PUB). Wire ops:
+`HELLO ce-kg-sync v{1|2}[ token=<TOK>]`, `OK v{1|2} protocol accepted`,
+`SUB *`, `SUB FROM <id>`, `ATOM kg id kind alpha beta label`, `PUB
+kg id kind alpha beta label`, `PROMOTE kg id alpha beta`, `ATROPHY
+kg id`, `DELETE kg id`, `ACK <id>`, `BYE`, `ERR <reason>`, `ERR auth`.
+Defaults: bind `127.0.0.1` (opt in to broader via `CE_KGSYNC_BIND=0.0.0.0`,
+mirroring web.py); port 8766 (override via `CE_KGSYNC_PORT`);
+subscriber host `127.0.0.1` (override via `CE_KGSYNC_HOST`);
+expected-subs `1` (override via `CE_KGSYNC_SUBS`); token unset
+(override via `CE_KGSYNC_TOKEN` -- if unset, anonymous). The main
+`bin/crossengin` daemon is intentionally NOT modified -- rolling
+kg_sync into its idle path is a future enhancement.
+Acceptance: `tests/unit/test_kg_sync.nova` covers format/parse round-trip
+for ATOM + PUB + PROMOTE + ATROPHY + DELETE, malformed line rejection
+(missing fields, wrong op, non-numeric numerics, illegal label chars,
+empty fields), CRLF + LF eol handling, dash/underscore label preservation,
+the IP-string -> packed-int helper, the top-level `_parse_line`
+classifier, HELLO token extraction, env helpers, subscriber record + staleness,
+the four `sync_apply_*` policies (including the merge), and connection-state
+cursor accessors -- 169 assertions across 49 test functions;
+`tests/integration/scenario_g_kg_sync.sh` exercises v1 single-sub
+(13 assertions), `tests/integration/scenario_g2_kg_sync_multi.sh`
+exercises v2 (24 assertions: 3 subs fan-out + bidir + reconnect-pin +
+auth gate + conflict merge). Sandbox-quirk handling: both scripts
+print a `SKIP` block if `socket(2,1,0)` returns -1 so a denying sandbox
+keeps the suite green.
 Sample manual smoke: `./bin/crossengin-kg-subscriber > /tmp/sub.out &`
 then `printf 'widget\ngadget\nfever\n' | ./bin/crossengin-kg-publisher`
 yields three `recv kg=language id=N label=...` lines in `/tmp/sub.out`,
-verified locally.
+verified locally; with `CE_KGSYNC_SUBS=3` the publisher fans the same
+labels to three subscribers.
 
 README updated to v0.9.
 

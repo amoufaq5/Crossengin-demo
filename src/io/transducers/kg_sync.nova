@@ -1,81 +1,150 @@
 // CrossEngin io/transducers: distributed knowledge-graph sync (publisher + subscriber).
 //
 // Purpose
-//   Phase 20 / Tier 4 item #2 minimal viable seam for the multi-process
-//   substrate: one CrossEngin daemon (publisher) advertises atom-birth events
-//   over a TCP socket, another daemon (subscriber) reads them and applies them
-//   to its own local KG, so two processes can converge their knowledge state
-//   without sharing memory. This is the *seam*, not the full multi-process
-//   refactor -- the existing bin/crossengin is untouched; the two example
-//   artifacts (crossengin_kg_publisher / crossengin_kg_subscriber) demonstrate
-//   the protocol end-to-end and a future task may roll it into the main
-//   daemon's checkpoint/idle path.
+//   Phase 20 / Tier 4 #2 distributed-substrate seam. Two or more daemons
+//   converge their knowledge state by exchanging atom-birth, promotion,
+//   atrophy, and deletion events over a TCP socket. One process is the
+//   publisher (binds + accepts); others are subscribers (dial in). The
+//   protocol is bidirectional and symmetric from v2 onwards -- every endpoint
+//   has its own local KG and can both EMIT and CONSUME events. The publisher
+//   is just the broker / hub.
 //
-//   This module is the wire protocol + the publisher and subscriber sockets.
-//   The protocol is text -- ONE operation per line, fields space-separated,
-//   `\n` terminated -- so it is debuggable from netcat and round-trips losslessly
-//   under the seed's label alphabet ([A-Za-z0-9_-]; no spaces). Cognition is
-//   never on the wire (ADR-0014); only the public atom-birth fields are.
+// Wire protocol v2 (text, one op per line, '\n' terminated)
 //
-//   Operations (vNUM = 1):
-//     C->S : HELLO ce-kg-sync v1
-//     S->C : OK v1 protocol accepted             (success handshake)
-//     S->C : ERR <reason>                        (handshake refusal)
-//     C->S : SUB *                               (subscribe to all atoms)
-//     S->C : ATOM <kg_label> <id> <kind> <alpha> <beta> <label>
-//     C->S : ACK <id>                            (per-atom acknowledgement)
-//     either: BYE                                (graceful close)
+//   Handshake (auth optional; server reads CE_KGSYNC_TOKEN from env)
+//     C->S : HELLO ce-kg-sync v2                       (anonymous)
+//     C->S : HELLO ce-kg-sync v2 token=<TOKEN>         (authed)
+//     S->C : OK v2 protocol accepted
+//     S->C : ERR auth                                  (token mismatch)
+//     S->C : ERR <reason>                              (other handshake refusal)
+//     C->S : SUB *                                     (subscribe to all)
+//     C->S : SUB FROM <id>                             (resume from cursor)
 //
-//   The publisher is the SERVER (it owns the events). The subscriber is the
-//   CLIENT (it connects in, sends HELLO + SUB *, and reads ATOM lines as they
-//   arrive). One-to-one only in this iteration; broadcasting to N subscribers
-//   is a future enhancement.
+//   Events (either direction, after handshake)
+//     ATOM <kg> <id> <kind> <alpha> <beta> <label>     (new atom birth)
+//     PROMOTE <kg> <id> <alpha> <beta>                 (belief update)
+//     ATROPHY <kg> <id>                                (sub-threshold mark)
+//     DELETE <kg> <id>                                 (atom killed)
+//     PUB <kg> <id> <kind> <alpha> <beta> <label>      (subscriber teaches; same wire as ATOM)
+//     ACK <id>                                         (per-event ack)
+//     BYE                                              (graceful close)
 //
-//   Localhost-only binding by default (`127.0.0.1`). Set CE_KGSYNC_BIND=0.0.0.0
-//   to expose to other interfaces. This mirrors the web.py pattern in the rest
-//   of the repo (safe default; explicit env var opt-in to broaden).
+//   Backward compatibility: the v1 lines (HELLO ce-kg-sync v1, OK v1 protocol
+//   accepted) are still recognised by the server-side accept path so an old
+//   subscriber can attach to a new publisher; the publisher rejects v0 only
+//   if the token gate is armed and the client did not authenticate.
 //
-//   NOVA gotchas (see NEXT_SESSION.md): `accept_conn` is blocking; the
-//   publisher accept path will park the process until a subscriber connects --
-//   document that at every call site. Writes (`send_data`) and reads
-//   (`recv_data`) may return partial counts; we loop. Lines are bounded at
-//   1024 bytes (the seed's largest label is ~16 chars; one line never
-//   approaches that limit but the limit is a defence against a runaway peer).
+// Conflict resolution
+//   When two peers teach the same label concurrently, both birth a local
+//   atom (different ids). On receive, if the local KG already holds an atom
+//   with the same label at a DIFFERENT id, the receiver MERGES: it keeps its
+//   own local id, and updates the local belief to the AVERAGE of the two
+//   beliefs (alpha_local <- (alpha_local + alpha_remote) / 2; same for beta).
+//   No new atom is born. Identity is local-id-stable so synapses stay valid.
+//
+// Reconnect
+//   Subscriber tracks a `since_atom_id` cursor (highest id it has received).
+//   If `_recv_line` returns 0 mid-stream (peer closed), `sync_sub_reconnect`
+//   re-runs the connect + handshake and sends `SUB FROM <cursor>` so the
+//   publisher knows to resume from that id (the publisher's response policy
+//   is implementation-defined; the minimum is "continue with fresh ATOMs").
+//
+// Auth
+//   Server reads `CE_KGSYNC_TOKEN` from env at accept-time. If set, only
+//   clients whose HELLO carries a matching `token=<TOKEN>` clause are
+//   accepted; everyone else gets `ERR auth` and is disconnected. If the env
+//   is unset, any HELLO is accepted (backwards-compatible default).
+//
+// N-subscriber fan-out (publisher)
+//   `sync_pub_accept_n` accepts the requested count of subscribers and
+//   returns a list of subscriber records, each `[fd, last_ack_id,
+//   last_active_ns]`. `sync_pub_broadcast_atom` (and the promote / atrophy /
+//   delete variants) iterates the record list and pushes the event to each
+//   live sub; a sub that fails to send or whose last_active is older than
+//   `KGSYNC_PRUNE_NS` (30s) is dropped. Round-robin per-event matches the
+//   brief's "background-style send loop" without any actual concurrency.
 //
 // ADRs implemented: ADR-0014 (no LLM, no cognition on the wire), ADR-0016
-//   (the on-the-wire record IS an atom-birth: kg_label / id / kind / alpha /
-//   beta / label). NOVA dependencies: socket builtins (`socket`,
-//   `bind_socket`, `listen_socket`, `accept_conn`, `connect_socket`,
-//   `send_data`, `recv_data`, `close_fd`, `make_sockaddr_in`), `alloc`,
-//   `store8`, `load8`, `getenv`, `int_to_str`, `str_to_int`. CrossEngin
-//   dependencies: none -- the protocol is pure string transduction so the
-//   tests can exercise it without a live socket.
+//   (the on-the-wire record IS an atom-birth / belief mutation). NOVA
+//   dependencies: socket builtins (`socket`, `bind_socket`, `listen_socket`,
+//   `accept_conn`, `connect_socket`, `send_data`, `recv_data`, `close_fd`,
+//   `make_sockaddr_in`), `alloc`, `store8`, `load8`, `getenv`, `int_to_str`,
+//   `str_to_int`, `nanotime`. CrossEngin dependencies: src/kg/atom_store.nova
+//   (for the merge policy helpers); no other parts reach down here.
+
+import "std/io"
+import "../../kg/atom_store.nova"
 
 // ---- protocol constants ---------------------------------------------------
-let KGSYNC_VERSION       = 1
+let KGSYNC_VERSION       = 2
 let KGSYNC_DEFAULT_PORT  = 8766
 let KGSYNC_DEFAULT_BIND  = "127.0.0.1"
 let KGSYNC_LINE_MAX      = 1024
-// Connect-side retry budget: lets the documented "subscriber first" run
-// pattern survive a slow publisher boot without losing the subscriber.
+// Connect-side retry budget: lets "subscriber first, publisher second"
+// survive a slow publisher boot.
 let KGSYNC_CONNECT_RETRIES   = 30
 let KGSYNC_CONNECT_DELAY_MS  = 100
-let KGSYNC_HELLO_LINE    = "HELLO ce-kg-sync v1"
-let KGSYNC_OK_LINE       = "OK v1 protocol accepted"
-let KGSYNC_SUB_LINE      = "SUB *"
+// Reconnect budget after a mid-stream disconnect. Slightly more generous --
+// a publisher restart can take a moment.
+let KGSYNC_RECONNECT_RETRIES = 60
+let KGSYNC_RECONNECT_DELAY_MS = 500
+// Default expected initial subscriber count (env: CE_KGSYNC_SUBS).
+let KGSYNC_DEFAULT_SUBS  = 1
+// Prune any subscriber whose last_active gap exceeds this many ns (30 s).
+let KGSYNC_PRUNE_NS      = 30000000000
+
+// Wire op tokens.
+let KGSYNC_HELLO_V1_LINE = "HELLO ce-kg-sync v1"
+let KGSYNC_HELLO_V2_LINE = "HELLO ce-kg-sync v2"
+let KGSYNC_OK_V1_LINE    = "OK v1 protocol accepted"
+let KGSYNC_OK_V2_LINE    = "OK v2 protocol accepted"
+let KGSYNC_SUB_ALL_LINE  = "SUB *"
+let KGSYNC_SUB_FROM_PREFIX = "SUB FROM "
 let KGSYNC_BYE_LINE      = "BYE"
 let KGSYNC_ATOM_PREFIX   = "ATOM "
+let KGSYNC_PUB_PREFIX    = "PUB "
+let KGSYNC_PROMOTE_PREFIX= "PROMOTE "
+let KGSYNC_ATROPHY_PREFIX= "ATROPHY "
+let KGSYNC_DELETE_PREFIX = "DELETE "
 let KGSYNC_ACK_PREFIX    = "ACK "
+let KGSYNC_NACK_PREFIX   = "NACK "
 let KGSYNC_ERR_PREFIX    = "ERR "
 let KGSYNC_OK_PREFIX     = "OK "
+let KGSYNC_ERR_AUTH      = "ERR auth"
+let KGSYNC_TOKEN_TAG     = "token="
 
-// Record slot layout returned by _parse_atom_line / sync_sub_recv_atom.
-let KGSYNC_R_KG    = 0
-let KGSYNC_R_ID    = 1
-let KGSYNC_R_KIND  = 2
-let KGSYNC_R_ALPHA = 3
-let KGSYNC_R_BETA  = 4
-let KGSYNC_R_LABEL = 5
+// Record-kind tags returned by sync_recv_event so callers can switch.
+let KGSYNC_EV_NONE    = 0
+let KGSYNC_EV_ATOM    = 1
+let KGSYNC_EV_PROMOTE = 2
+let KGSYNC_EV_ATROPHY = 3
+let KGSYNC_EV_DELETE  = 4
+let KGSYNC_EV_PUB     = 5
+let KGSYNC_EV_BYE     = 6
+let KGSYNC_EV_ACK     = 7
+
+// Record slot layout. Slot 0 is always the kind tag (one of KGSYNC_EV_*).
+// Slot 1 is the kg label. The rest are kind-specific:
+//   ATOM/PUB : [kind, id, atom_kind, alpha, beta, label]
+//   PROMOTE  : [kind, id, alpha, beta]
+//   ATROPHY  : [kind, id]
+//   DELETE   : [kind, id]
+let KGSYNC_R_TYPE  = 0
+let KGSYNC_R_KG    = 1
+let KGSYNC_R_ID    = 2
+let KGSYNC_R_KIND  = 3
+let KGSYNC_R_ALPHA = 4
+let KGSYNC_R_BETA  = 5
+let KGSYNC_R_LABEL = 6
+
+// Promote layout (after KG): [type, kg, id, alpha, beta].
+let KGSYNC_P_ALPHA = 3
+let KGSYNC_P_BETA  = 4
+
+// Subscriber record slots (the per-sub bookkeeping the publisher keeps).
+let KGSYNC_S_FD          = 0
+let KGSYNC_S_LAST_ACK    = 1
+let KGSYNC_S_LAST_ACTIVE = 2
 
 // ---- text helpers (pure -- unit-testable without a socket) ---------------
 
@@ -92,8 +161,7 @@ fn _is_digits(s) {
     return 1
 }
 
-// True iff char is in the seed-label alphabet: [A-Za-z0-9_-]. No dots, no
-// spaces, no slashes -- if a future seed introduces them, lift this gate too.
+// Seed-label alphabet: [A-Za-z0-9_-]. No dots, no spaces, no slashes.
 fn _is_label_char(c) {
     if c >= 48 { if c <= 57  { return 1 } }   // 0..9
     if c >= 65 { if c <= 90  { return 1 } }   // A..Z
@@ -108,6 +176,25 @@ fn _is_label(s) {
     let i = 0
     while i < len(s) {
         if _is_label_char(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Token chars allow '=' and ':' on top of the label set (so a future
+// expansion can carry compound tokens).
+fn _is_token_char(c) {
+    if _is_label_char(c) == 1 { return 1 }
+    if c == 61 { return 1 }   // '='
+    if c == 58 { return 1 }   // ':'
+    return 0
+}
+
+fn _is_token(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _is_token_char(char_at(s, i)) == 0 { return 0 }
         i = i + 1
     }
     return 1
@@ -128,10 +215,7 @@ fn _strip_eol(s) {
     return substr(s, 0, n)
 }
 
-// Split on a single ' ' (space). Empty input yields a single empty token.
-// We deliberately split on space-only (NOT collapsing runs, NOT trimming)
-// because the protocol is one-space-between-fields and we want a malformed
-// double-space to fail to parse, not silently round-trip.
+// Split on a single ' ' (space).
 fn _split_spaces(s) {
     let out = list_new()
     let i = 0
@@ -147,9 +231,21 @@ fn _split_spaces(s) {
     return out
 }
 
-// Encode an ATOM birth line. The line ends with '\n' so a caller can
-// `send_data(fd, line, len(line))` and the receiver's line-reader will close
-// at the LF byte.
+// String prefix check: does `s` begin with `prefix`?
+fn _starts_with(s, prefix) {
+    let pn = len(prefix)
+    if len(s) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- format ---------------------------------------------------------------
+
+// Encode an ATOM birth line.
 //   format(lang, 42, 1, 800, 200, "widget") -> "ATOM lang 42 1 800 200 widget\n"
 fn _format_atom_line(kg_label, atom_id, kind, alpha, beta, label) {
     return KGSYNC_ATOM_PREFIX + kg_label + " "
@@ -160,17 +256,65 @@ fn _format_atom_line(kg_label, atom_id, kind, alpha, beta, label) {
         + label + "\n"
 }
 
-// Parse an ATOM birth line (with or without the trailing newline). Returns
-// the 6-element record on success; 0 on any malformation (missing fields,
-// wrong prefix, non-numeric numerics, illegal label chars, etc.).
+// Encode a subscriber-side teach. Same payload as ATOM but with PUB prefix
+// so the publisher can distinguish "originated here" vs "broadcast from me".
+fn _format_pub_line(kg_label, atom_id, kind, alpha, beta, label) {
+    return KGSYNC_PUB_PREFIX + kg_label + " "
+        + int_to_str(atom_id) + " "
+        + int_to_str(kind) + " "
+        + int_to_str(alpha) + " "
+        + int_to_str(beta) + " "
+        + label + "\n"
+}
+
+// Encode a promotion (alpha/beta update for an existing atom).
+//   format("lang", 42, 1800, 200) -> "PROMOTE lang 42 1800 200\n"
+fn _format_promote_line(kg_label, atom_id, alpha, beta) {
+    return KGSYNC_PROMOTE_PREFIX + kg_label + " "
+        + int_to_str(atom_id) + " "
+        + int_to_str(alpha) + " "
+        + int_to_str(beta) + "\n"
+}
+
+// Encode an atrophy mark.
+fn _format_atrophy_line(kg_label, atom_id) {
+    return KGSYNC_ATROPHY_PREFIX + kg_label + " "
+        + int_to_str(atom_id) + "\n"
+}
+
+// Encode a delete.
+fn _format_delete_line(kg_label, atom_id) {
+    return KGSYNC_DELETE_PREFIX + kg_label + " "
+        + int_to_str(atom_id) + "\n"
+}
+
+// ---- parsers --------------------------------------------------------------
+
+// Parse an ATOM birth line. Returns the 7-slot record on success; 0 on any
+// malformation. The first slot is the TYPE tag (KGSYNC_EV_ATOM here), so all
+// parsers return records with the same first-slot convention.
 fn _parse_atom_line(text) {
     let line = _strip_eol(text)
-    if len(line) < len(KGSYNC_ATOM_PREFIX) { return 0 }
-    if str_eq(substr(line, 0, 5), KGSYNC_ATOM_PREFIX) == 0 { return 0 }
+    if _starts_with(line, KGSYNC_ATOM_PREFIX) == 0 { return 0 }
     let toks = _split_spaces(line)
-    // Must be exactly 7 tokens: ATOM <kg> <id> <kind> <alpha> <beta> <label>.
     if len(toks) != 7 { return 0 }
     if str_eq(toks[0], "ATOM") == 0 { return 0 }
+    return _build_atomish(KGSYNC_EV_ATOM, toks)
+}
+
+// Parse a PUB line (same shape as ATOM, different tag).
+fn _parse_pub_line(text) {
+    let line = _strip_eol(text)
+    if _starts_with(line, KGSYNC_PUB_PREFIX) == 0 { return 0 }
+    let toks = _split_spaces(line)
+    if len(toks) != 7 { return 0 }
+    if str_eq(toks[0], "PUB") == 0 { return 0 }
+    return _build_atomish(KGSYNC_EV_PUB, toks)
+}
+
+// Shared body validator for ATOM-like records (ATOM + PUB carry the same
+// 6-field payload).
+fn _build_atomish(tag, toks) {
     let kg_label = toks[1]
     let id_str   = toks[2]
     let kind_str = toks[3]
@@ -184,6 +328,7 @@ fn _parse_atom_line(text) {
     if _is_digits(b_str)    == 0 { return 0 }
     if _is_label(label)     == 0 { return 0 }
     let rec = list_new()
+    push(rec, tag)
     push(rec, kg_label)
     push(rec, str_to_int(id_str))
     push(rec, str_to_int(kind_str))
@@ -193,16 +338,132 @@ fn _parse_atom_line(text) {
     return rec
 }
 
+// Parse PROMOTE <kg> <id> <alpha> <beta>. Returns [PROMOTE, kg, id, alpha, beta] or 0.
+fn _parse_promote_line(text) {
+    let line = _strip_eol(text)
+    if _starts_with(line, KGSYNC_PROMOTE_PREFIX) == 0 { return 0 }
+    let toks = _split_spaces(line)
+    if len(toks) != 5 { return 0 }
+    if str_eq(toks[0], "PROMOTE") == 0 { return 0 }
+    let kg_label = toks[1]
+    let id_str   = toks[2]
+    let a_str    = toks[3]
+    let b_str    = toks[4]
+    if _is_label(kg_label) == 0 { return 0 }
+    if _is_digits(id_str)  == 0 { return 0 }
+    if _is_digits(a_str)   == 0 { return 0 }
+    if _is_digits(b_str)   == 0 { return 0 }
+    let rec = list_new()
+    push(rec, KGSYNC_EV_PROMOTE)
+    push(rec, kg_label)
+    push(rec, str_to_int(id_str))
+    push(rec, str_to_int(a_str))
+    push(rec, str_to_int(b_str))
+    return rec
+}
+
+// Parse ATROPHY <kg> <id>. Returns [ATROPHY, kg, id] or 0.
+fn _parse_atrophy_line(text) {
+    let line = _strip_eol(text)
+    if _starts_with(line, KGSYNC_ATROPHY_PREFIX) == 0 { return 0 }
+    let toks = _split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "ATROPHY") == 0 { return 0 }
+    let kg_label = toks[1]
+    let id_str   = toks[2]
+    if _is_label(kg_label) == 0 { return 0 }
+    if _is_digits(id_str)  == 0 { return 0 }
+    let rec = list_new()
+    push(rec, KGSYNC_EV_ATROPHY)
+    push(rec, kg_label)
+    push(rec, str_to_int(id_str))
+    return rec
+}
+
+// Parse DELETE <kg> <id>. Returns [DELETE, kg, id] or 0.
+fn _parse_delete_line(text) {
+    let line = _strip_eol(text)
+    if _starts_with(line, KGSYNC_DELETE_PREFIX) == 0 { return 0 }
+    let toks = _split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "DELETE") == 0 { return 0 }
+    let kg_label = toks[1]
+    let id_str   = toks[2]
+    if _is_label(kg_label) == 0 { return 0 }
+    if _is_digits(id_str)  == 0 { return 0 }
+    let rec = list_new()
+    push(rec, KGSYNC_EV_DELETE)
+    push(rec, kg_label)
+    push(rec, str_to_int(id_str))
+    return rec
+}
+
+// Top-level line classifier. Returns the matching record (with type tag in
+// slot 0), or a single-slot [KGSYNC_EV_BYE] for BYE, or 0 on parse failure.
+fn _parse_line(text) {
+    let line = _strip_eol(text)
+    if len(line) == 0 { return 0 }
+    if str_eq(line, KGSYNC_BYE_LINE) == 1 {
+        let rec = list_new()
+        push(rec, KGSYNC_EV_BYE)
+        return rec
+    }
+    if _starts_with(line, KGSYNC_ATOM_PREFIX)    == 1 { return _parse_atom_line(line) }
+    if _starts_with(line, KGSYNC_PUB_PREFIX)     == 1 { return _parse_pub_line(line) }
+    if _starts_with(line, KGSYNC_PROMOTE_PREFIX) == 1 { return _parse_promote_line(line) }
+    if _starts_with(line, KGSYNC_ATROPHY_PREFIX) == 1 { return _parse_atrophy_line(line) }
+    if _starts_with(line, KGSYNC_DELETE_PREFIX)  == 1 { return _parse_delete_line(line) }
+    if _starts_with(line, KGSYNC_ACK_PREFIX)     == 1 {
+        // ACK <id> -- ack records carry just the id.
+        let toks = _split_spaces(line)
+        if len(toks) != 2 { return 0 }
+        if _is_digits(toks[1]) == 0 { return 0 }
+        let rec = list_new()
+        push(rec, KGSYNC_EV_ACK)
+        push(rec, "")
+        push(rec, str_to_int(toks[1]))
+        return rec
+    }
+    return 0
+}
+
+// ---- HELLO parsing --------------------------------------------------------
+
+// Extract the token from a HELLO line, or 0 if no token clause.
+//   "HELLO ce-kg-sync v2 token=foo"  -> "foo"
+//   "HELLO ce-kg-sync v2"            -> 0
+//   "HELLO ce-kg-sync v1"            -> 0
+// Returns the token string, or 0 when missing. Used by the server to gate
+// auth against CE_KGSYNC_TOKEN.
+fn _parse_hello_token(text) {
+    let line = _strip_eol(text)
+    let toks = _split_spaces(line)
+    // HELLO ce-kg-sync v1   -> 3 tokens, no token clause
+    // HELLO ce-kg-sync v2   -> 3 tokens, no token clause
+    // HELLO ce-kg-sync v2 token=X -> 4 tokens, last is token clause
+    if len(toks) < 4 { return 0 }
+    let last = toks[3]
+    if _starts_with(last, KGSYNC_TOKEN_TAG) == 0 { return 0 }
+    let val = substr(last, 6, len(last) - 6)
+    if len(val) == 0 { return 0 }
+    if _is_token(val) == 0 { return 0 }
+    return val
+}
+
+// Is this any flavour of HELLO line (v1 or v2, with or without token)?
+fn _is_hello(line) {
+    if _starts_with(line, KGSYNC_HELLO_V1_LINE) == 1 { return 1 }
+    if _starts_with(line, KGSYNC_HELLO_V2_LINE) == 1 { return 1 }
+    return 0
+}
+
 // ---- buffer / socket helpers ---------------------------------------------
 
-// Write the full string to fd. Loops on partial writes (POSIX send may return
-// fewer bytes than requested). Returns 1 on success, 0 on any error/EOF.
+// Write the full string to fd. Loops on partial writes.
 fn _send_all(fd, s) {
     let total = len(s)
     let sent = 0
     while sent < total {
-        // send_data wants a byte pointer + length. NOVA strings ARE byte
-        // pointers, and substr lets us advance past already-sent bytes.
         let chunk = substr(s, sent, total - sent)
         let n = send_data(fd, chunk, total - sent)
         if n <= 0 { return 0 }
@@ -212,9 +473,8 @@ fn _send_all(fd, s) {
 }
 
 // Read one '\n'-terminated line from fd. Reads byte-by-byte so we never
-// over-read past a line boundary (which would matter if a single TCP segment
-// carried more than one frame). Returns the bare line (without the LF) on
-// success, or 0 on EOF/error before any '\n' was seen.
+// over-read past a line boundary. Returns the bare line (without the LF)
+// on success, or 0 on EOF/error before any '\n' was seen.
 fn _recv_line(fd) {
     let buf = alloc(KGSYNC_LINE_MAX)
     let n = 0
@@ -236,17 +496,7 @@ fn _recv_line(fd) {
     return _strip_eol(buf)
 }
 
-// Encode "127.0.0.1" (or any dotted-quad) as the 32-bit value
-// make_sockaddr_in's second argument expects. The codegen writes this value
-// as r13d (LSB first) into bytes [addr+4..+7], so to put 127 in the network's
-// first byte we must put 127 in the LSB: low-byte=A, byte1=B, byte2=C,
-// high-byte=D for A.B.C.D. Returns -1 on parse error.
-//
-// Why the chained-shift form: NOVA's compiler segfaults on `d * 16777216`
-// (large literal multiplied by a variable -- another flavour of blocker #11
-// in NEXT_SESSION.md). Building the high byte's place value as 256*256*256
-// via intermediate variables sidesteps the bad codegen path. The result is
-// identical -- a is in bits 0..7, b in 8..15, c in 16..23, d in 24..31.
+// Encode a dotted-quad as the 32-bit value make_sockaddr_in expects.
 fn _ip_str_to_int(ip) {
     let toks = list_new()
     let i = 0
@@ -300,13 +550,69 @@ fn kgsync_port_from_env() {
     return KGSYNC_DEFAULT_PORT
 }
 
+// Resolve the configured auth token from the environment, or 0 if unset.
+// When unset, the publisher operates anonymously (backwards-compat).
+fn kgsync_token_from_env() {
+    let env = getenv("CE_KGSYNC_TOKEN")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return 0
+}
+
+// Resolve the initial expected-subscriber count.
+fn kgsync_subs_from_env() {
+    let env = getenv("CE_KGSYNC_SUBS")
+    if env != 0 {
+        if len(env) > 0 {
+            let v = str_to_int(env)
+            if v > 0 { return v }
+        }
+    }
+    return KGSYNC_DEFAULT_SUBS
+}
+
+// ---- subscriber record helpers --------------------------------------------
+
+// Build one [fd, last_ack_id, last_active_ns] record.
+fn sync_sub_record(fd) {
+    let r = list_new()
+    push(r, fd)
+    push(r, -1)               // no acks observed yet
+    push(r, nanotime())       // birth = first activity
+    return r
+}
+
+fn sync_sub_fd(rec)         { return rec[KGSYNC_S_FD] }
+fn sync_sub_last_ack(rec)   { return rec[KGSYNC_S_LAST_ACK] }
+fn sync_sub_last_active(rec){ return rec[KGSYNC_S_LAST_ACTIVE] }
+
+fn sync_sub_touch(rec, now_ns) {
+    list_set(rec, KGSYNC_S_LAST_ACTIVE, now_ns)
+    return 1
+}
+
+fn sync_sub_set_ack(rec, id, now_ns) {
+    list_set(rec, KGSYNC_S_LAST_ACK, id)
+    list_set(rec, KGSYNC_S_LAST_ACTIVE, now_ns)
+    return 1
+}
+
+// True if last_active is older than KGSYNC_PRUNE_NS relative to now.
+fn sync_sub_is_stale(rec, now_ns) {
+    let last = rec[KGSYNC_S_LAST_ACTIVE]
+    let gap = now_ns - last
+    if gap < 0 { return 0 }
+    if gap > KGSYNC_PRUNE_NS { return 1 }
+    return 0
+}
+
 // ---- publisher (server) ---------------------------------------------------
 
-// Open a TCP listener on (bind_ip, port). Bind IP comes from CE_KGSYNC_BIND
-// (default 127.0.0.1). Returns the server fd or -1.
+// Open a TCP listener on (bind_ip, port).
 fn sync_pub_listen(port) {
     let bind_ip = _kgsync_bind_ip()
-    let server_fd = socket(2, 1, 0)               // AF_INET, SOCK_STREAM
+    let server_fd = socket(2, 1, 0)
     if server_fd < 0 { return -1 }
     let ip = _ip_str_to_int(bind_ip)
     if ip < 0 {
@@ -319,64 +625,263 @@ fn sync_pub_listen(port) {
         close_fd(server_fd)
         return -1
     }
-    if listen_socket(server_fd, 1) < 0 {
+    if listen_socket(server_fd, 8) < 0 {
         close_fd(server_fd)
         return -1
     }
     return server_fd
 }
 
-// Block until a single subscriber connects, then perform the HELLO/OK +
-// SUB-* handshake on that connection. Returns the subscriber fd (already
-// past the handshake -- caller may immediately call sync_pub_send_atom), or
-// -1 on any handshake error (and the new fd is closed).
+// Accept one subscriber and run the handshake.
+// Returns the connection fd (past handshake; caller may immediately
+// broadcast), or -1 on any error (and the new fd is closed).
 //
-// NOTE: `accept_conn` is BLOCKING in NOVA; the publisher process parks here
-// until the subscriber dials in. Call this from an idle path.
-fn sync_pub_accept(server_fd) {
+// If `expected_token` is non-zero, the client's HELLO must carry a matching
+// `token=<TOK>` clause; otherwise the server replies `ERR auth` and closes.
+// If `expected_token` is 0, the server accepts any HELLO (anonymous mode).
+//
+// Returns the cursor (since_atom_id) that the client requested via SUB FROM
+// in *_cursor (a 1-element list slot); caller may use that to replay events.
+// If the caller doesn't need the cursor, pass an empty list and ignore.
+fn sync_pub_accept_one(server_fd, expected_token, out_cursor) {
     let sub_fd = accept_conn(server_fd, 0, 0)
     if sub_fd < 0 { return -1 }
-    // Expect the client's HELLO.
     let hello = _recv_line(sub_fd)
     if hello == 0 {
         close_fd(sub_fd)
         return -1
     }
-    if str_eq(hello, KGSYNC_HELLO_LINE) == 0 {
-        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected " + KGSYNC_HELLO_LINE + "\n")
+    if _is_hello(hello) == 0 {
+        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected HELLO\n")
         close_fd(sub_fd)
         return -1
     }
-    if _send_all(sub_fd, KGSYNC_OK_LINE + "\n") == 0 {
+    if expected_token != 0 {
+        let client_tok = _parse_hello_token(hello)
+        if client_tok == 0 {
+            _send_all(sub_fd, KGSYNC_ERR_AUTH + "\n")
+            close_fd(sub_fd)
+            return -1
+        }
+        if str_eq(client_tok, expected_token) == 0 {
+            _send_all(sub_fd, KGSYNC_ERR_AUTH + "\n")
+            close_fd(sub_fd)
+            return -1
+        }
+    }
+    // Mirror the client's protocol version in our OK line so v1 clients keep
+    // their v1 acceptance string.
+    let ok_line = KGSYNC_OK_V2_LINE
+    if _starts_with(hello, KGSYNC_HELLO_V1_LINE) == 1 { ok_line = KGSYNC_OK_V1_LINE }
+    if _send_all(sub_fd, ok_line + "\n") == 0 {
         close_fd(sub_fd)
         return -1
     }
-    // Expect SUB *. (A future enhancement could match SUB <kg>.)
-    let sub = _recv_line(sub_fd)
-    if sub == 0 {
+    let sub_line = _recv_line(sub_fd)
+    if sub_line == 0 {
         close_fd(sub_fd)
         return -1
     }
-    if str_eq(sub, KGSYNC_SUB_LINE) == 0 {
-        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected SUB *\n")
-        close_fd(sub_fd)
-        return -1
+    // Accept either SUB * (full subscription) or SUB FROM <id> (resume).
+    let cursor = -1
+    if str_eq(sub_line, KGSYNC_SUB_ALL_LINE) == 1 {
+        cursor = -1
+    } else {
+        if _starts_with(sub_line, KGSYNC_SUB_FROM_PREFIX) == 1 {
+            let tail = substr(sub_line, len(KGSYNC_SUB_FROM_PREFIX),
+                              len(sub_line) - len(KGSYNC_SUB_FROM_PREFIX))
+            if _is_digits(tail) == 0 {
+                _send_all(sub_fd, KGSYNC_ERR_PREFIX + "bad SUB FROM\n")
+                close_fd(sub_fd)
+                return -1
+            }
+            cursor = str_to_int(tail)
+        } else {
+            _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected SUB\n")
+            close_fd(sub_fd)
+            return -1
+        }
+    }
+    if len(out_cursor) > 0 {
+        list_set(out_cursor, 0, cursor)
+    } else {
+        push(out_cursor, cursor)
     }
     return sub_fd
 }
 
-// Push one atom-birth event to the subscriber. Reads back the ACK <id> the
-// subscriber sends; ack mismatches are a warning, not a hard failure (we do
-// not retry -- the subscriber is best-effort by spec). Returns 1 on send +
-// ack success, 0 on any write failure (the caller should treat the
-// subscriber as gone and close).
+// Back-compat shim for callers (and the v1 demos) that only want a single
+// subscriber and don't care about token or cursor.
+fn sync_pub_accept(server_fd) {
+    let cur = list_new()
+    return sync_pub_accept_one(server_fd, kgsync_token_from_env(), cur)
+}
+
+// Accept N subscribers up-front, returning a list of subscriber records.
+// (Cursor-on-resume is honoured but not surfaced; callers that need cursor
+// inspection should call sync_pub_accept_one directly.)
+//
+// Rejected handshakes (bad HELLO, wrong token) do NOT count toward N --
+// the publisher keeps accepting until N have successfully attached, or
+// until the cap of (3 * N + 4) total attempts is reached (whichever
+// comes first). The cap stops a malicious or buggy client from holding
+// the publisher hostage; a typical valid run will succeed in N attempts.
+fn sync_pub_accept_n(server_fd, n) {
+    let tok = kgsync_token_from_env()
+    let subs = list_new()
+    let attempts = 0
+    let max_attempts = 3 * n + 4
+    while len(subs) < n {
+        if attempts >= max_attempts { return subs }
+        let cur = list_new()
+        let fd = sync_pub_accept_one(server_fd, tok, cur)
+        if fd >= 0 {
+            push(subs, sync_sub_record(fd))
+        }
+        attempts = attempts + 1
+    }
+    return subs
+}
+
+// Read one line from a subscriber and parse it. Returns the parsed record
+// (with type tag in slot 0), [KGSYNC_EV_BYE], or 0 on EOF / parse error.
+fn sync_pub_recv_from(sub_rec) {
+    let fd = sub_rec[KGSYNC_S_FD]
+    let line = _recv_line(fd)
+    if line == 0 { return 0 }
+    let rec = _parse_line(line)
+    if rec == 0 { return 0 }
+    sync_sub_touch(sub_rec, nanotime())
+    if rec[KGSYNC_R_TYPE] == KGSYNC_EV_ACK {
+        sync_sub_set_ack(sub_rec, rec[KGSYNC_R_ID], nanotime())
+    }
+    return rec
+}
+
+// Send a single line to one subscriber, then wait for the matched ACK
+// (or any reply line that the caller will route). Returns the reply line's
+// parsed record, or 0 on send/recv error.
+fn sync_pub_emit(sub_rec, line) {
+    let fd = sub_rec[KGSYNC_S_FD]
+    if _send_all(fd, line) == 0 { return 0 }
+    return sync_pub_recv_from(sub_rec)
+}
+
+// Broadcast an atom-birth to every live subscriber, then prune any sub that
+// is stale or fails to send. Returns the number of subscribers that
+// successfully received the event.
+//
+// `inbox` is an optional out-list: any PUB lines the subs piggyback into
+// their ACK channel get pushed here as parsed records, for the caller to
+// apply locally and re-broadcast as it sees fit.
+fn sync_pub_broadcast_atom(subs, kg_label, atom_id, kind, alpha, beta, label, inbox) {
+    let line = _format_atom_line(kg_label, atom_id, kind, alpha, beta, label)
+    return _broadcast_line(subs, line, inbox, atom_id)
+}
+
+fn sync_pub_broadcast_promote(subs, kg_label, atom_id, alpha, beta, inbox) {
+    let line = _format_promote_line(kg_label, atom_id, alpha, beta)
+    return _broadcast_line(subs, line, inbox, atom_id)
+}
+
+fn sync_pub_broadcast_atrophy(subs, kg_label, atom_id, inbox) {
+    let line = _format_atrophy_line(kg_label, atom_id)
+    return _broadcast_line(subs, line, inbox, atom_id)
+}
+
+fn sync_pub_broadcast_delete(subs, kg_label, atom_id, inbox) {
+    let line = _format_delete_line(kg_label, atom_id)
+    return _broadcast_line(subs, line, inbox, atom_id)
+}
+
+// Internal: walk subs, push `line` to each, drain one reply per sub. Drop
+// dead/stale fds in-place. Replies that are not ACKs (i.e. PUB-from-sub) get
+// pushed to the caller's inbox.
+fn _broadcast_line(subs, line, inbox, ev_id) {
+    let now = nanotime()
+    let i = 0
+    let delivered = 0
+    while i < len(subs) {
+        let sub = subs[i]
+        let fd = sub[KGSYNC_S_FD]
+        if fd < 0 {
+            i = i + 1
+        } else {
+            if sync_sub_is_stale(sub, now) == 1 {
+                close_fd(fd)
+                list_set(sub, KGSYNC_S_FD, -1)
+                i = i + 1
+            } else {
+                let ok = _send_all(fd, line)
+                if ok == 0 {
+                    close_fd(fd)
+                    list_set(sub, KGSYNC_S_FD, -1)
+                    i = i + 1
+                } else {
+                    let reply = sync_pub_recv_from(sub)
+                    if reply == 0 {
+                        close_fd(fd)
+                        list_set(sub, KGSYNC_S_FD, -1)
+                        i = i + 1
+                    } else {
+                        delivered = delivered + 1
+                        // If the reply is a PUB (subscriber teaching back),
+                        // queue it; otherwise it's the matching ACK.
+                        let t = reply[KGSYNC_R_TYPE]
+                        if t != KGSYNC_EV_ACK {
+                            push(inbox, reply)
+                            // Also drain an immediate ACK so the subscriber
+                            // can keep the request-response cadence steady.
+                            // The subscriber should ack right after sending
+                            // its PUB.
+                            let ack2 = sync_pub_recv_from(sub)
+                            // ack2 may be 0 -- best-effort
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+    }
+    return delivered
+}
+
+// Compact the subscriber list: remove records whose fd is -1 (dropped).
+fn sync_pub_compact(subs) {
+    let kept = list_new()
+    let i = 0
+    while i < len(subs) {
+        if subs[i][KGSYNC_S_FD] >= 0 {
+            push(kept, subs[i])
+        }
+        i = i + 1
+    }
+    return kept
+}
+
+// Send BYE to every live sub and close. Convenience for graceful shutdown.
+fn sync_pub_bye_all(subs) {
+    let i = 0
+    while i < len(subs) {
+        let sub = subs[i]
+        let fd = sub[KGSYNC_S_FD]
+        if fd >= 0 {
+            _send_all(fd, KGSYNC_BYE_LINE + "\n")
+            close_fd(fd)
+            list_set(sub, KGSYNC_S_FD, -1)
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// One-shot send used by the v1 demo and the bidirectional fanout. Sends an
+// ATOM and reads back any reply line. Returns 1 on send/ack OK, 0 otherwise.
 fn sync_pub_send_atom(sub_fd, kg_label, atom_id, kind, alpha, beta, label) {
     let line = _format_atom_line(kg_label, atom_id, kind, alpha, beta, label)
     if _send_all(sub_fd, line) == 0 { return 0 }
     let ack = _recv_line(sub_fd)
     if ack == 0 { return 0 }
-    // Accept any ACK line. Validate the id when present; warn only.
-    if len(ack) < len(KGSYNC_ACK_PREFIX) { return 1 }
     return 1
 }
 
@@ -388,39 +893,64 @@ fn sync_pub_bye(sub_fd) {
 
 // ---- subscriber (client) --------------------------------------------------
 
-// Open a TCP client to (host, port). Performs the HELLO handshake (we send
-// HELLO, expect OK) and then sends SUB *. Returns the conn fd on success,
-// or -1 (and closes the fd) on any handshake error.
-//
-// The connect step retries briefly so the documented run pattern
-// "subscriber first in the background, then publisher" works without a
-// race: a publisher that takes a few ticks to bind still gets connected
-// without the subscriber dying. Retries cap at KGSYNC_CONNECT_RETRIES
-// attempts with a 100ms wait between (default ~3s total), then return -1.
-fn sync_sub_connect(host, port) {
+// A subscriber connection state: [fd, host, port, token, since_atom_id].
+// Carried by the reconnect-aware helpers so the protocol can resume after
+// a publisher restart without losing the cursor.
+let KGSYNC_C_FD     = 0
+let KGSYNC_C_HOST   = 1
+let KGSYNC_C_PORT   = 2
+let KGSYNC_C_TOKEN  = 3
+let KGSYNC_C_CURSOR = 4
+
+fn sync_conn_new(fd, host, port, token, cursor) {
+    let c = list_new()
+    push(c, fd)
+    push(c, host)
+    push(c, port)
+    push(c, token)
+    push(c, cursor)
+    return c
+}
+
+fn sync_conn_fd(c)     { return c[KGSYNC_C_FD] }
+fn sync_conn_cursor(c) { return c[KGSYNC_C_CURSOR] }
+
+fn sync_conn_set_cursor(c, id) {
+    list_set(c, KGSYNC_C_CURSOR, id)
+    return 1
+}
+
+// Internal: do one connect + handshake attempt. Returns the live fd or -1.
+fn _sync_handshake(host, port, token, cursor, retries, delay_ms) {
     let ip = _ip_str_to_int(host)
     if ip < 0 { return -1 }
     let addr = make_sockaddr_in(port, ip)
     let sock = -1
     let attempt = 0
-    while attempt < KGSYNC_CONNECT_RETRIES {
+    while attempt < retries {
         sock = socket(2, 1, 0)
         if sock < 0 { return -1 }
         let r = connect_socket(sock, addr, 16)
         if r >= 0 {
-            attempt = KGSYNC_CONNECT_RETRIES
+            attempt = retries
         } else {
             close_fd(sock)
             sock = -1
             attempt = attempt + 1
-            if attempt < KGSYNC_CONNECT_RETRIES {
-                sleep_ms(KGSYNC_CONNECT_DELAY_MS)
+            if attempt < retries {
+                sleep_ms(delay_ms)
             }
         }
     }
     if sock < 0 { return -1 }
-    // Send HELLO, expect OK ...
-    if _send_all(sock, KGSYNC_HELLO_LINE + "\n") == 0 {
+    // Build the HELLO line; include the token clause iff token != 0.
+    let hello = KGSYNC_HELLO_V2_LINE
+    if token != 0 {
+        if len(token) > 0 {
+            hello = KGSYNC_HELLO_V2_LINE + " " + KGSYNC_TOKEN_TAG + token
+        }
+    }
+    if _send_all(sock, hello + "\n") == 0 {
         close_fd(sock)
         return -1
     }
@@ -429,34 +959,112 @@ fn sync_sub_connect(host, port) {
         close_fd(sock)
         return -1
     }
-    // Accept any `OK v1 ...` greeting.
-    if len(ok) < len(KGSYNC_OK_PREFIX) {
+    // Server replied: OK v? protocol accepted   OR   ERR ...
+    if _starts_with(ok, KGSYNC_OK_PREFIX) == 0 {
         close_fd(sock)
         return -1
     }
-    if str_eq(substr(ok, 0, 3), KGSYNC_OK_PREFIX) == 0 {
-        close_fd(sock)
-        return -1
+    // Send the SUB line. SUB * if cursor < 0 (no resume), otherwise SUB FROM N.
+    let sub_line = KGSYNC_SUB_ALL_LINE
+    if cursor >= 0 {
+        sub_line = KGSYNC_SUB_FROM_PREFIX + int_to_str(cursor)
     }
-    if _send_all(sock, KGSYNC_SUB_LINE + "\n") == 0 {
+    if _send_all(sock, sub_line + "\n") == 0 {
         close_fd(sock)
         return -1
     }
     return sock
 }
 
-// Read one ATOM line, ACK by atom id, return the parsed record. Returns 0 on
-// EOF, BYE, or any malformed input (the caller closes the fd).
+// Open a fresh client connection. Returns the fd or -1.
+// Reads CE_KGSYNC_TOKEN from env so the client mirrors the server's auth
+// expectation (a script can set CE_KGSYNC_TOKEN once for both sides).
+fn sync_sub_connect(host, port) {
+    return _sync_handshake(host, port, kgsync_token_from_env(), -1,
+                           KGSYNC_CONNECT_RETRIES, KGSYNC_CONNECT_DELAY_MS)
+}
+
+// Reconnect-aware variant: returns a connection state instead of a raw fd.
+// The state holds host/port/token/cursor so a later sync_sub_reconnect can
+// resume from the last-known-good atom id.
+fn sync_sub_connect_state(host, port) {
+    let tok = kgsync_token_from_env()
+    let fd = _sync_handshake(host, port, tok, -1,
+                              KGSYNC_CONNECT_RETRIES, KGSYNC_CONNECT_DELAY_MS)
+    if fd < 0 { return 0 }
+    return sync_conn_new(fd, host, port, tok, -1)
+}
+
+// Reconnect after a mid-stream disconnect. Closes the old fd (if alive) and
+// performs a fresh handshake with the saved cursor. Returns 1 on success
+// (and updates conn[KGSYNC_C_FD] to the new fd), 0 on failure.
+fn sync_sub_reconnect(conn) {
+    let old = conn[KGSYNC_C_FD]
+    if old >= 0 { close_fd(old) }
+    list_set(conn, KGSYNC_C_FD, -1)
+    let host = conn[KGSYNC_C_HOST]
+    let port = conn[KGSYNC_C_PORT]
+    let tok  = conn[KGSYNC_C_TOKEN]
+    let cur  = conn[KGSYNC_C_CURSOR]
+    let fd = _sync_handshake(host, port, tok, cur,
+                              KGSYNC_RECONNECT_RETRIES, KGSYNC_RECONNECT_DELAY_MS)
+    if fd < 0 { return 0 }
+    list_set(conn, KGSYNC_C_FD, fd)
+    return 1
+}
+
+// Read one ATOM line and ACK it. Back-compat: same shape as the v1 helper,
+// returning a 6-slot atom record (no leading type tag) so existing callers
+// keep working. Returns 0 on EOF / BYE / malformed input.
 fn sync_sub_recv_atom(conn_fd) {
     let line = _recv_line(conn_fd)
     if line == 0 { return 0 }
     if str_eq(line, KGSYNC_BYE_LINE) == 1 { return 0 }
-    let rec = _parse_atom_line(line)
-    if rec == 0 { return 0 }
-    // Ack the atom id so the publisher knows the row landed.
-    let ack = KGSYNC_ACK_PREFIX + int_to_str(rec[KGSYNC_R_ID]) + "\n"
+    let parsed = _parse_atom_line(line)
+    if parsed == 0 { return 0 }
+    // Strip the leading type tag for the v1-shape return.
+    let rec = list_new()
+    push(rec, parsed[KGSYNC_R_KG])
+    push(rec, parsed[KGSYNC_R_ID])
+    push(rec, parsed[KGSYNC_R_KIND])
+    push(rec, parsed[KGSYNC_R_ALPHA])
+    push(rec, parsed[KGSYNC_R_BETA])
+    push(rec, parsed[KGSYNC_R_LABEL])
+    let ack = KGSYNC_ACK_PREFIX + int_to_str(rec[1]) + "\n"
     if _send_all(conn_fd, ack) == 0 { return 0 }
     return rec
+}
+
+// Receive any v2 event from the connection. Returns the parsed record (with
+// type tag in slot 0), 0 on EOF/error, or a single-slot [KGSYNC_EV_BYE]
+// record on a clean BYE so the caller can distinguish disconnect from
+// intentional close. Caller is responsible for sending the ACK; this layer
+// does not ack so the caller can piggyback an outbound PUB along with the ack.
+fn sync_sub_recv_event(conn_fd) {
+    let line = _recv_line(conn_fd)
+    if line == 0 { return 0 }
+    let rec = _parse_line(line)
+    if rec == 0 { return 0 }
+    return rec
+}
+
+// Send an ACK + (optionally) a PUB line in one go. The PUB is sent first so
+// the publisher's broadcast loop sees it as the immediate reply; then the
+// ACK confirms the original event landed.
+fn sync_sub_ack_with_pub(conn_fd, ack_id, pub_line) {
+    if pub_line != 0 {
+        if len(pub_line) > 0 {
+            if _send_all(conn_fd, pub_line) == 0 { return 0 }
+        }
+    }
+    let ack = KGSYNC_ACK_PREFIX + int_to_str(ack_id) + "\n"
+    return _send_all(conn_fd, ack)
+}
+
+// Plain ACK with no payload.
+fn sync_sub_ack(conn_fd, ack_id) {
+    let ack = KGSYNC_ACK_PREFIX + int_to_str(ack_id) + "\n"
+    return _send_all(conn_fd, ack)
 }
 
 // Send BYE; caller closes the fd next.
@@ -465,9 +1073,92 @@ fn sync_sub_bye(conn_fd) {
     return 1
 }
 
+// ---- conflict resolution --------------------------------------------------
+
+// Merge a received atom into a local KG. The merge policy:
+//   * If no local atom carries `label`: install a new atom (uses
+//     kg_add_atom; the LOCAL id is assigned by the local KG, not the
+//     remote-sent id, because the local id space is independent).
+//   * If a local atom with `label` exists and shares the remote id: just
+//     refresh the local belief to the remote alpha/beta (a no-op for a
+//     pristine echo of our own teach).
+//   * If a local atom with `label` exists at a DIFFERENT id (the "two ends
+//     taught the same word" race): MERGE: keep local id, set local belief
+//     to the average of (local, remote) alpha/beta. No new atom is born.
+//
+// Returns the local atom (existing or newly inserted) on success, 0 on
+// failure (e.g., kg is 0). The returned atom's id is always the LOCAL id;
+// callers that need to track the remote id should do so externally.
+fn sync_apply_atom(kg, remote_id, kind, alpha, beta, label) {
+    if kg == 0 { return 0 }
+    let existing = kg_find_atom(kg, label)
+    if existing == 0 {
+        let a = kg_add_atom(kg, kind, label, 0)
+        let b = atom_belief(a)
+        list_set(b, 0, alpha)
+        list_set(b, 1, beta)
+        return a
+    }
+    let local_id = atom_id(existing)
+    let b = atom_belief(existing)
+    if local_id == remote_id {
+        // Same atom on both ends -- refresh belief to the latest reported.
+        list_set(b, 0, alpha)
+        list_set(b, 1, beta)
+        return existing
+    }
+    // Conflict: same label, different ids. Merge by averaging belief and
+    // keep the local id stable so any synapses pointing at it stay valid.
+    let a_avg = (b[0] + alpha) / 2
+    let bb_avg = (b[1] + beta) / 2
+    list_set(b, 0, a_avg)
+    list_set(b, 1, bb_avg)
+    return existing
+}
+
+// Apply a PROMOTE event to a local KG. Looks up the atom by id; if absent,
+// returns 0 (the receiver may not have the atom yet -- the publisher should
+// retransmit ATOM if needed). Returns 1 on success.
+fn sync_apply_promote(kg, atom_id_v, alpha, beta) {
+    if kg == 0 { return 0 }
+    let a = kg_atom(kg, atom_id_v)
+    if a == 0 { return 0 }
+    let b = atom_belief(a)
+    list_set(b, 0, alpha)
+    list_set(b, 1, beta)
+    return 1
+}
+
+// Apply an ATROPHY event. The minimal contract: mark the atom's belief
+// counts to the uniform prior (signalling "evidence is below threshold").
+// A future version could carry an explicit `alive` flag.
+fn sync_apply_atrophy(kg, atom_id_v) {
+    if kg == 0 { return 0 }
+    let a = kg_atom(kg, atom_id_v)
+    if a == 0 { return 0 }
+    let b = atom_belief(a)
+    list_set(b, 0, BEL_PRIOR)
+    list_set(b, 1, BEL_PRIOR)
+    return 1
+}
+
+// Apply a DELETE event. The minimal contract: zero the atom's label so a
+// later kg_find_atom won't find it. Storing it in-place keeps id stability
+// for any synapses that already point at this slot.
+fn sync_apply_delete(kg, atom_id_v) {
+    if kg == 0 { return 0 }
+    let a = kg_atom(kg, atom_id_v)
+    if a == 0 { return 0 }
+    list_set(a, A_LABEL, "")
+    let b = atom_belief(a)
+    list_set(b, 0, 0)
+    list_set(b, 1, 0)
+    return 1
+}
+
 // ---- shared --------------------------------------------------------------
 
-// Close any kg_sync-owned fd (server, subscriber, connection).
+// Close any kg_sync-owned fd.
 fn sync_close(fd) {
     if fd < 0 { return 0 }
     close_fd(fd)

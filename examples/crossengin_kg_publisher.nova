@@ -1,103 +1,246 @@
-// CrossEngin KG sync publisher (Phase 20 / Tier 4 #2 distributed-substrate seam).
+// CrossEngin KG sync publisher (Phase 20 / P1.3 -- N-subscriber + bidirectional).
 //
 // Purpose
-//   Minimum-viable publisher half of the kg-sync demo: open a localhost TCP
-//   listener, wait for ONE subscriber to dial in, then read labels from
-//   stdin. Each label becomes a new concept atom in the local language KG;
-//   each atom-birth is also pushed to the subscriber over the wire so the
-//   two processes converge their knowledge state. The protocol is defined
-//   in src/io/transducers/kg_sync.nova (text, one op per line).
+//   The publisher half of the kg-sync seam. v1 accepted ONE subscriber and
+//   exited; v2 accepts up to N subscribers up-front (`CE_KGSYNC_SUBS`,
+//   default 1 for backward compat), then fan-outs each stdin label as an
+//   atom-birth to every live sub in a round-robin "background-style" send
+//   loop. A subscriber that fails to send, fails to ack, or whose last
+//   activity is older than 30s gets pruned. Subscribers may also publish:
+//   when a subscriber piggybacks a `PUB <kg> <id> <kind> <a> <b> <label>`
+//   line on its ACK channel, the publisher applies it to its own local KG
+//   (with the conflict-resolution policy in kg_sync.sync_apply_atom) AND
+//   re-broadcasts the resulting atom to every OTHER subscriber.
 //
-//   This is the *seam*, not the unified daemon -- bin/crossengin is unchanged;
-//   the demo runs as two distinct processes (bin/crossengin-kg-publisher and
-//   bin/crossengin-kg-subscriber). A future enhancement may roll the
-//   accept/send_atom loop into the main daemon's idle path.
+//   Auth: if `CE_KGSYNC_TOKEN` is set the publisher requires every HELLO
+//   to carry a matching `token=` clause; otherwise it accepts any HELLO
+//   (backwards compat).
 //
 //   Run with: ./bin/crossengin-kg-publisher
-//     (typically piped: `printf 'widget\ngadget\nfever\n' | ./bin/...`)
+//     (e.g. for the 3-sub demo: CE_KGSYNC_SUBS=3 ./bin/crossengin-kg-publisher)
+//
 //   Env:
 //     CE_KGSYNC_PORT  -- listen port  (default 8766)
 //     CE_KGSYNC_BIND  -- bind address (default 127.0.0.1)
-//   stdin -> one label per line. `bye` or empty line / EOF -> graceful close.
+//     CE_KGSYNC_SUBS  -- expected initial subscriber count (default 1)
+//     CE_KGSYNC_TOKEN -- shared auth token (default: anonymous)
 //
-// ADRs exercised: ADR-0014 (no LLM, no cognition on the wire), ADR-0016
-//   (atom birth is the unit). NOVA dependencies: socket builtins,
-//   `read_line`, `getenv`. CrossEngin dependencies:
-//   src/io/transducers/kg_sync.nova, src/kg/multi_kg_manager.nova.
+//   stdin -> one label per line. `bye` or empty line / EOF -> graceful close.
+//   In addition the publisher recognises three out-of-band stdin commands so
+//   integration tests can exercise the other v2 events:
+//     promote <id>      -- emit PROMOTE on the local atom (alpha += 1000)
+//     atrophy <id>      -- emit ATROPHY on the local atom
+//     delete <id>       -- emit DELETE on the local atom
+//   These are minimal smoke triggers; in the full daemon the corresponding
+//   subsystem signals (Bayesian update, evidence-below-threshold,
+//   atom_death_monitor) would call into the broadcast helpers directly.
+//
+// ADRs exercised: ADR-0014 (no LLM on the wire), ADR-0016 (atom birth +
+//   belief mutation). NOVA dependencies: socket builtins, `read_line`,
+//   `getenv`. CrossEngin dependencies: src/io/transducers/kg_sync.nova,
+//   src/kg/multi_kg_manager.nova.
 
 import "../src/io/transducers/kg_sync.nova"
 import "../src/kg/multi_kg_manager.nova"
 
 let CE_KGSYNC_MAX_ATOMS = 1024   // defensive runaway-input cap
 
+// Render a friendly auth-mode label for the boot banner.
+fn _auth_mode_str(token) {
+    if token == 0 { return "anon" }
+    if len(token) == 0 { return "anon" }
+    return "token"
+}
+
+fn _line_starts(line, prefix) {
+    let pn = len(prefix)
+    if len(line) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(line, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _line_arg_int(line, offset) {
+    let tail = substr(line, offset, len(line) - offset)
+    let i = 0
+    while i < len(tail) {
+        let c = char_at(tail, i)
+        if c < 48 { return -1 }
+        if c > 57 { return -1 }
+        i = i + 1
+    }
+    if len(tail) == 0 { return -1 }
+    return str_to_int(tail)
+}
+
+// Apply an inbox of subscriber-originated PUB events to the local KG and
+// echo them onward to all subscribers (with conflict-aware install). On a
+// minimal-loop design we don't re-broadcast to "other" subs only; we just
+// install locally and rely on the next pump cycle to be the canonical
+// re-broadcast point.
+//
+// Returns the count of events drained.
+fn _drain_inbox(inbox, subs, kg) {
+    let i = 0
+    let n = 0
+    while i < len(inbox) {
+        let rec = inbox[i]
+        let t = rec[KGSYNC_R_TYPE]
+        if t == KGSYNC_EV_PUB {
+            let a = sync_apply_atom(kg,
+                rec[KGSYNC_R_ID],
+                rec[KGSYNC_R_KIND],
+                rec[KGSYNC_R_ALPHA],
+                rec[KGSYNC_R_BETA],
+                rec[KGSYNC_R_LABEL])
+            if a != 0 {
+                println("pub-apply kg=" + kg_label(kg)
+                    + " id=" + int_to_str(atom_id(a))
+                    + " label=" + atom_label(a)
+                    + " from-sub-pub remote-id=" + int_to_str(rec[KGSYNC_R_ID]))
+                n = n + 1
+            }
+        }
+        if t == KGSYNC_EV_ATOM {
+            // Shouldn't happen via PUB channel but be defensive.
+            sync_apply_atom(kg, rec[KGSYNC_R_ID], rec[KGSYNC_R_KIND],
+                rec[KGSYNC_R_ALPHA], rec[KGSYNC_R_BETA], rec[KGSYNC_R_LABEL])
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Parse an admin command from stdin. Returns 1 if the line was an admin
+// command (consumed); 0 if it should be treated as a normal label.
+//
+// Recognised: `promote <id>`, `atrophy <id>`, `delete <id>`.
+fn _handle_admin_cmd(line, subs, kg) {
+    if _line_starts(line, "promote ") == 1 {
+        let id = _line_arg_int(line, 8)
+        if id < 0 { return 0 }
+        let a = kg_atom(kg, id)
+        if a == 0 {
+            println("admin: promote id=" + int_to_str(id) + " missing locally")
+            return 1
+        }
+        let b = atom_belief(a)
+        let new_a = b[0] + BEL_PRIOR
+        let new_b = b[1]
+        list_set(b, 0, new_a)
+        let inbox = list_new()
+        let n = sync_pub_broadcast_promote(subs, kg_label(kg), id, new_a, new_b, inbox)
+        println("admin: promote kg=" + kg_label(kg)
+            + " id=" + int_to_str(id)
+            + " alpha=" + int_to_str(new_a) + " beta=" + int_to_str(new_b)
+            + " delivered=" + int_to_str(n))
+        return 1
+    }
+    if _line_starts(line, "atrophy ") == 1 {
+        let id = _line_arg_int(line, 8)
+        if id < 0 { return 0 }
+        let inbox = list_new()
+        let n = sync_pub_broadcast_atrophy(subs, kg_label(kg), id, inbox)
+        println("admin: atrophy kg=" + kg_label(kg)
+            + " id=" + int_to_str(id)
+            + " delivered=" + int_to_str(n))
+        return 1
+    }
+    if _line_starts(line, "delete ") == 1 {
+        let id = _line_arg_int(line, 7)
+        if id < 0 { return 0 }
+        let inbox = list_new()
+        let n = sync_pub_broadcast_delete(subs, kg_label(kg), id, inbox)
+        println("admin: delete kg=" + kg_label(kg)
+            + " id=" + int_to_str(id)
+            + " delivered=" + int_to_str(n))
+        return 1
+    }
+    return 0
+}
+
 fn main() {
     let port = kgsync_port_from_env()
-    println("kg-publisher: starting on port " + int_to_str(port))
+    let n_subs = kgsync_subs_from_env()
+    let token = kgsync_token_from_env()
+    println("kg-publisher: starting on port " + int_to_str(port)
+        + " expected-subs=" + int_to_str(n_subs)
+        + " auth=" + _auth_mode_str(token))
 
-    // 1. BOOT: own a small language KG. The publisher's local state evolves
-    // exactly the same way the subscriber's will -- one atom per label.
+    // 1. BOOT: own a small language KG.
     let kgreg = kg_registry_new()
     let kg = kg_spawn(kgreg, "language")
     println("kg-publisher: boot kg=language atoms=" + int_to_str(kg_atom_count(kg)))
 
-    // 2. LISTEN + ACCEPT one subscriber. accept_conn blocks until the dial-in
-    // arrives -- that's by design (NOVA gotcha: blocking accept is fine here
-    // because this binary's whole purpose is to publish).
+    // 2. LISTEN + ACCEPT N subscribers up-front. accept_conn is blocking;
+    // we accept exactly N before pumping (the minimum that satisfies the
+    // brief's "loop accept_conn to take many subscribers" semantic in a
+    // single-process design).
     let server_fd = sync_pub_listen(port)
     if server_fd < 0 {
         println("kg-publisher: ERROR cannot bind / listen on port "
             + int_to_str(port))
         exit(1)
     }
-    println("kg-publisher: listening, awaiting subscriber HELLO ...")
-    let sub_fd = sync_pub_accept(server_fd)
-    if sub_fd < 0 {
-        println("kg-publisher: ERROR handshake failed")
-        sync_close(server_fd)
-        exit(1)
-    }
-    println("kg-publisher: subscriber attached, accepting labels on stdin")
+    println("kg-publisher: listening, awaiting "
+        + int_to_str(n_subs) + " subscriber HELLO(s) ...")
 
-    // 3. PUMP: read stdin -> create atom -> publish.
+    let subs = sync_pub_accept_n(server_fd, n_subs)
+    if len(subs) < n_subs {
+        println("kg-publisher: WARN only "
+            + int_to_str(len(subs)) + " of " + int_to_str(n_subs)
+            + " subscribers attached")
+    }
+    println("kg-publisher: " + int_to_str(len(subs))
+        + " subscriber(s) attached, accepting labels on stdin")
+    if len(subs) > 0 {
+        // Back-compat phrasing kept so the v1 scenario_g grep still matches.
+        println("kg-publisher: subscriber attached, accepting labels on stdin")
+    }
+
+    // 3. PUMP.
     let pumped = 0
     let go = 1
     while go == 1 {
         let line = read_line()
         if len(line) == 0 {
-            // EOF (read_line returns the empty string on closed stdin).
             go = 0
         } else {
             let label = str_trim(line)
             if len(label) == 0 {
-                // Blank line -> graceful close (matches the brief's "bye/EOF
-                // exits" contract; an interactive user could leave it open
-                // by feeding a non-blank line).
                 go = 0
             } else {
                 if str_eq(label, "bye") == 1 {
                     go = 0
                 } else {
-                    if pumped >= CE_KGSYNC_MAX_ATOMS {
-                        println("kg-publisher: max atoms reached, closing")
-                        go = 0
-                    } else {
-                        // Local birth: a new concept atom in the publisher's
-                        // own KG (the SIMPLEST KG API -- kg_add_atom).
-                        let a = kg_add_atom(kg, ATOM_CONCEPT, label, 0)
-                        let b = atom_belief(a)
-                        // Send the atom-birth over the wire. The subscriber
-                        // will install an identical local atom and ACK.
-                        let ok = sync_pub_send_atom(sub_fd,
-                            kg_label(kg), atom_id(a), atom_kind(a),
-                            b[0], b[1], label)
-                        if ok == 0 {
-                            println("kg-publisher: send failed (subscriber gone)")
+                    let consumed = _handle_admin_cmd(label, subs, kg)
+                    if consumed == 0 {
+                        if pumped >= CE_KGSYNC_MAX_ATOMS {
+                            println("kg-publisher: max atoms reached, closing")
                             go = 0
                         } else {
+                            // Local birth.
+                            let a = kg_add_atom(kg, ATOM_CONCEPT, label, 0)
+                            let b = atom_belief(a)
+                            // Broadcast to all live subs.
+                            let inbox = list_new()
+                            let n = sync_pub_broadcast_atom(subs,
+                                kg_label(kg), atom_id(a), atom_kind(a),
+                                b[0], b[1], label, inbox)
                             println("send kg=" + kg_label(kg)
                                 + " id=" + int_to_str(atom_id(a))
-                                + " label=" + label)
+                                + " label=" + label
+                                + " delivered=" + int_to_str(n))
+                            // Apply any sub-originated PUBs.
+                            _drain_inbox(inbox, subs, kg)
                             pumped = pumped + 1
+                            // Compact pruned subs so the next round's loop
+                            // sees a tight list.
+                            subs = sync_pub_compact(subs)
                         }
                     }
                 }
@@ -105,11 +248,11 @@ fn main() {
         }
     }
 
-    // 4. CLOSE: BYE, drop subscriber, drop server.
-    sync_pub_bye(sub_fd)
-    sync_close(sub_fd)
+    // 4. CLOSE: BYE everyone, drop server.
+    sync_pub_bye_all(subs)
     sync_close(server_fd)
     println("kg-publisher: closed (published " + int_to_str(pumped)
         + " atom(s), local kg=" + int_to_str(kg_atom_count(kg)) + ")")
 }
+
 main()

@@ -331,21 +331,54 @@ make install
 
 ### Distributed KG sync (publisher / subscriber demo)
 
-Phase 20 / Tier-4 #2 ships the minimum viable distributed-substrate seam:
-two `bin/crossengin-kg-*` processes exchange atom-birth events over a TCP
-socket so a second daemon mirrors the first daemon's KG state without sharing
-memory. The wire protocol is text, one operation per line (`HELLO` /
-`OK` / `SUB *` / `ATOM kg id kind alpha beta label` / `ACK <id>` / `BYE`),
-defined in `src/io/transducers/kg_sync.nova`. The publisher binds 127.0.0.1
-by default (set `CE_KGSYNC_BIND=0.0.0.0` to expose) and listens on port 8766
-(override via `CE_KGSYNC_PORT`). The main `bin/crossengin` daemon is not
-touched; rolling the seam into its idle loop is a future enhancement.
+Phase 20 / Tier-4 #2 ships the distributed-substrate seam: two or more
+`bin/crossengin-kg-*` processes exchange atom-birth + belief-update events
+over a TCP socket so subscriber daemons mirror the publisher's KG state
+without sharing memory. P1.3 upgraded the protocol to v2 (the v1 lines are
+still recognised); the new capabilities are N-subscriber fan-out, three new
+event kinds (`PROMOTE` / `ATROPHY` / `DELETE`), bidirectional teach (a
+subscriber can publish back to the publisher), reconnect-on-disconnect with
+a `SUB FROM <id>` cursor resume, optional shared-token auth, and a
+local-id-stable belief-average merge when both ends teach the same label.
+Wire protocol is text, one operation per line, defined in
+`src/io/transducers/kg_sync.nova`:
+
+```
+HELLO ce-kg-sync v2 [token=<TOK>]            -- handshake (anon or authed)
+OK v2 protocol accepted                      -- handshake good
+ERR auth                                     -- handshake refused (bad token)
+SUB *                                        -- subscribe to all events
+SUB FROM <id>                                -- resume after the given atom id
+ATOM <kg> <id> <kind> <alpha> <beta> <label> -- atom birth (publisher -> subscriber)
+PUB  <kg> <id> <kind> <alpha> <beta> <label> -- atom birth (subscriber -> publisher)
+PROMOTE <kg> <id> <alpha> <beta>             -- belief update
+ATROPHY <kg> <id>                            -- sub-threshold mark
+DELETE  <kg> <id>                            -- atom killed
+ACK <id>                                     -- per-event ack
+BYE                                          -- graceful close
+```
+
+The publisher binds 127.0.0.1 by default (set `CE_KGSYNC_BIND=0.0.0.0` to
+expose), listens on port 8766 (override via `CE_KGSYNC_PORT`), accepts the
+number of subscribers given by `CE_KGSYNC_SUBS` (default 1 for backwards
+compat), and -- if `CE_KGSYNC_TOKEN` is set -- gates new connections against
+that token. The main `bin/crossengin` daemon is not touched; rolling the
+seam into its idle loop is a future enhancement.
 
 ```sh
+# v1-shape single-subscriber demo (unchanged)
 ./bin/crossengin-kg-subscriber > /tmp/sub.out &      # waits for handshake
 sleep 0.5
 printf 'widget\ngadget\nfever\n' | ./bin/crossengin-kg-publisher
 grep widget /tmp/sub.out     # recv kg=language id=0 label=widget
+
+# v2 fan-out: one publisher, three subscribers, token-gated
+export CE_KGSYNC_TOKEN=s3kret
+./bin/crossengin-kg-subscriber > /tmp/sub1.out &
+./bin/crossengin-kg-subscriber > /tmp/sub2.out &
+./bin/crossengin-kg-subscriber > /tmp/sub3.out &
+sleep 0.5
+printf 'widget\ngadget\n' | CE_KGSYNC_SUBS=3 ./bin/crossengin-kg-publisher
 ```
 
 Point the build at a NOVA checkout elsewhere with `make NOVA_ROOT=/path/to/NOVA build`.
