@@ -301,6 +301,37 @@ What's happening:
 If you want to drive a fixed conversation non-interactively, just pipe lines
 in: `printf 'fever\nhello\nquit\n' | ./scripts/chat.sh`.
 
+### Run as a web app (browser UI)
+
+`scripts/web.py` is a tiny stdlib-only Python frontend that spawns
+`bin/crossengin-chat` as one persistent child and serves a browser chat at
+`http://localhost:8765/`. State carries across HTTP requests because the same
+child handles them all — admin commands (`/teach`, `/reflect`, `/learn`,
+`/status`, `/halt`, …) work the same as in the terminal.
+
+```sh
+make install
+python3 scripts/web.py
+# open http://localhost:8765/ in a browser
+```
+
+Override the port or binary path with env vars: `CE_PORT=9000` /
+`CE_BIN=./bin/crossengin-chat`. No `pip install` — needs only Python 3.7+.
+
+The protocol is a single `POST /api/chat` with JSON `{"message": "..."}`
+returning `{"reply": "..."}`. Plain `curl` works:
+
+```sh
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"message":"fever"}' http://localhost:8765/api/chat
+# {"reply": "agent> see headache"}
+
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"message":"/reflect"}' http://localhost:8765/api/chat
+# {"reply": "(reflected on 6 concept(s); 4 tentative inference(s):
+#   doctor, prescription, medicine, recover)  refl_kg=4"}
+```
+
 ## 7. Run benchmarks
 
 ```sh
