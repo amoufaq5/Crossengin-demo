@@ -172,7 +172,12 @@ top-ranked conclusion's *naming word* via a reverse concept→word lookup — no
 LLM picks the wording. The constitutional gate vetoes the forbidden message.
 At idle, the learning loop drains the trigger queue and `ask_user_to_teach`
 ingests four new word↔concept bindings; a follow-up event using one of the
-freshly-taught words ("the keys") is then comprehended (`m=2`).
+freshly-taught words ("the keys") is then comprehended (`m=2`). The idle
+checkpoint is now a real on-disk write via `snapshot_disk.nova` (tmp + fsync +
+atomic rename + parent-dir fsync) to `$CE_SNAP_PATH` (default
+`/tmp/crossengin.snap`); the reboot rehydrates from that file when present and
+falls back to the in-memory image only if the read fails, so the "durable via
+write_tmp->fsync->atomic_rename" line above is now literally true.
 
 Run via the launcher without installing if you prefer:
 
