@@ -16,7 +16,7 @@ and CrossEngin pre-built (the [`.devcontainer/`](./.devcontainer/) handles all
 of that on first creation; takes ~2 minutes). When the terminal opens:
 
 ```sh
-make test                       # 92/92 unit suites
+make test                       # 93/93 unit suites
 make install                    # build the runnable artifacts
 ./bin/crossengin                # the whole agent in one process
 ./scripts/chat.sh               # interactive chat
@@ -76,7 +76,7 @@ Compiles each implemented module under `src/` independently with
 x86-64. Expected tail:
 
 ```
-build: all 90 module(s) compiled.
+build: all 91 module(s) compiled.
 ```
 
 The assembler prints one harmless `end of file not at end of a line` warning per
@@ -92,7 +92,7 @@ Each test compiles and runs as its own program; a test passes iff it exits 0
 and prints no `FAIL` line (case-insensitive). Expected tail:
 
 ```
-  passed: 92   failed: 0   total: 92
+  passed: 93   failed: 0   total: 93
 === all unit tests passed ===
 ```
 

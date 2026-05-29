@@ -70,6 +70,32 @@ continue. It is updated at every session boundary.
   via spreading_activation, cross-KG ref case, paraphrase via lexical
   fallback, exact-match dominance) with 30 assertions across 10 test
   functions.
+- Phase 18 Tier-3 item #3 -- multi-tenant session foundation: **complete**.
+  New `src/session/session.nova` (ADR-0051) defines a Session struct -- a
+  flat 15-slot bundle (id, name, created_at, last_active, soul, kgreg, kg,
+  lang, ikg, refl_kg, ctx, log, engine, mo, hs) -- plus a linear
+  SessionRegistry keyed by id. The module is dependency-free: every
+  subsystem state object is stored OPAQUELY (Session never reads past the
+  top-level slot), so the daemon's existing boot sequence builds each
+  handle as before and then wraps them with one `session_make(...)` call.
+  API: `session_make(id, name, now, sl, kgreg, kg, lang, ikg, refl_kg, ctx,
+  log, engine, mo, hs)`, per-slot accessors `session_id/name/created_at/
+  last_active/soul/kgreg/kg/lang/ikg/refl_kg/ctx/log/engine/mo/hs`,
+  `session_touch(s, now)`; registry `sreg_new`, `sreg_create(reg, id, name,
+  now)`, `sreg_register(reg, sess)`, `sreg_lookup(reg, id)`,
+  `sreg_destroy(reg, id)`, `sreg_count(reg)`, `sreg_ids(reg)` (ascending),
+  `sreg_active(reg, max_idle, now)` (inclusive cutoff). Conservative scope:
+  the daemon and chat still run the single-soul path -- the only contact
+  is a multi-line comment block above each boot sequence showing how the
+  state would be wrapped, with a pointer to `src/session/session.nova`.
+  The scheduler is per-session by design (clean tenant isolation, each
+  tenant has its own tick clock / idle counter); revisit if N >> 1.
+  Acceptance: `tests/unit/test_session.nova` covers session_make field
+  storage + accessors, session_touch, zero-slot tolerance, registry empty
+  state, create + lookup, duplicate-id rejection, pre-built register,
+  destroy + no-op destroy, ids sorted ascending, active() inclusive idle
+  filter, soul-mutation isolation between sessions, and post-destroy
+  survivor integrity -- 66 assertions across 12 test functions.
 - Phase 15 Tier-2 item #3 -- multi-source `/learn`: **complete**.
   `scripts/learn.sh` now accepts a bare TOPIC (Wikipedia, unchanged), an
   http(s):// URL (fetched verbatim), or a local `/abs|./rel|../rel` file
@@ -412,6 +438,29 @@ everything else is learned at runtime via the learning loops.
 |--------|------|--------------|--------|
 | seed/first_atoms.nova | 0010, 0015, 0016, 0017, 0031, 0032, 0034 | 18 | done |
 
+## Completed modules — Phase 18 (multi-tenant session foundation)
+
+Per-tenant `Session` value + linear registry under `src/session/`. The Session
+struct is a flat 15-slot list bundling every piece of state today's
+single-Aurora daemon initialises in `main()` (soul, KG registry, reasoning /
+language / imagination / reflection KGs, blackboard ctx, decision log, goal
+engine, meta-observer, hybrid scheduler) plus id / name / created_at /
+last_active. The module is dependency-free -- every subsystem handle is stored
+opaquely, so the caller (daemon, chat, future router) constructs the
+subsystems exactly as before and just wraps them. The registry walks linearly
+(N is small per ADR-0051 -- 1..100 tenants -- and the NOVA builtin map caps
+at 16 keys per blocker #1). Scheduler is per-session by design (clean
+isolation; each tenant has its own tick clock and idle counter).
+
+| Module | ADRs | Unit asserts | Status |
+|--------|------|--------------|--------|
+| session/session.nova | 0051 | 66 | done |
+
+The daemon and chat are NOT yet routed through the registry: this session is
+the foundation pass. Both files carry a documentation-only comment block
+above their boot sequence pointing at `session_make` / `sreg_register` for a
+follow-up agent to wire.
+
 ## Partially completed modules
 
 None. There are no stubs and no `TODO`s in committed code. Every Phase 1–10
@@ -428,7 +477,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 92 (9 substrate + 7 knowledge + 10 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 2 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3 + 1 meta-observer `test_meta_observer` added Phase 13 Tier-2 item #1 + 1 structural-neighborhood `test_neighborhood_activation` added Phase 14 Tier-2 item #2); **1649 assertions** (delta = +22 from `test_learn_tag.nova`, +39 from `test_meta_observer.nova`, +31 from `test_neighborhood_activation.nova` Phase 14 Tier-2 #2 = +30 new + 1 added to `test_spreading_activation.nova` for the round-trip path).
+- Total unit suites: 93 (9 substrate + 7 knowledge + 10 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 2 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3 + 1 meta-observer `test_meta_observer` added Phase 13 Tier-2 item #1 + 1 structural-neighborhood `test_neighborhood_activation` added Phase 14 Tier-2 item #2 + 1 session `test_session` added Phase 18 Tier-3 item #3); **1715 assertions** (delta = +22 from `test_learn_tag.nova`, +39 from `test_meta_observer.nova`, +31 from `test_neighborhood_activation.nova` Phase 14 Tier-2 #2 = +30 new + 1 added to `test_spreading_activation.nova` for the round-trip path, +66 from `test_session.nova` Phase 18 Tier-3 #3).
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
