@@ -96,6 +96,16 @@ and prints no `FAIL` line (case-insensitive). Expected tail:
 === all unit tests passed ===
 ```
 
+For end-to-end coverage on the built binaries (durability across SIGKILL
+restart, neighborhood paraphrase, multi-source `/learn`, `/meta` shape,
+constitutional veto, web frontend), also run the integration suite:
+
+```sh
+make integration                   # builds bin/* first, then runs tests/integration/*.sh
+```
+
+Expected tail: `=== all integration tests passed ===` after 12 scripts.
+
 ## 6. Run the three artifacts
 
 `make install` builds all three runnable artifacts into `./bin/`:

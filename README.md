@@ -19,7 +19,9 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 suite / +31 assertions from `test_neighborhood_activation.nova` added
 > in Phase 14 Tier-2 #2 structural-neighborhood activation,
 > +1 suite / +66 assertions from `test_session.nova` added in Phase 18
-> Tier-3 #3 multi-tenant session foundation),
+> Tier-3 #3 multi-tenant session foundation), 12 end-to-end integration
+> scripts run (`make integration`, 110 assertions, 6 scenarios + 5
+> admin-command coverage scripts in Phase 16/17 Tier-3 #1+#2),
 > three benchmarks report metrics
 > (`make benchmark`), and three runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence

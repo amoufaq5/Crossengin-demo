@@ -25,7 +25,7 @@ SPINE       := examples/companion_spine.nova
 DAEMON      := examples/crossengin_daemon.nova
 CHAT        := examples/crossengin_chat.nova
 
-.PHONY: all build test benchmark install clean check-nova help
+.PHONY: all build test benchmark install integration clean check-nova help
 
 all: build
 
@@ -96,16 +96,33 @@ install: build
 	  fi; \
 	fi
 
+integration: install
+	@scripts="$$(find tests/integration -maxdepth 1 -name '*.sh' ! -name '_*' 2>/dev/null | sort)"; \
+	if [ -z "$$scripts" ]; then \
+	    echo "integration: no scripts under tests/integration/"; exit 0; \
+	fi; \
+	failed=0; \
+	for t in $$scripts; do \
+	    echo "==> $$t"; \
+	    if ! bash "$$t"; then \
+	        echo "integration: FAILED -- $$t"; \
+	        failed=1; \
+	    fi; \
+	done; \
+	if [ $$failed -ne 0 ]; then exit 1; fi; \
+	echo "=== all integration tests passed ==="
+
 clean:
 	rm -rf $(BIN) /tmp/ce_build_check.bin /tmp/ce_build.log /tmp/ce_install.log
 	@echo "clean: done"
 
 help:
 	@echo "CrossEngin make targets:"
-	@echo "  build      compile every implemented NOVA module under src/"
-	@echo "  test       compile and run every unit test under tests/unit/"
-	@echo "  benchmark  run every benchmark under tests/benchmark/"
-	@echo "  install    build the self-check, companion-spine, and unified daemon into ./bin/"
-	@echo "  clean      remove build artifacts"
-	@echo "  check-nova verify the NOVA toolchain is reachable"
+	@echo "  build       compile every implemented NOVA module under src/"
+	@echo "  test        compile and run every unit test under tests/unit/"
+	@echo "  benchmark   run every benchmark under tests/benchmark/"
+	@echo "  install     build the self-check, companion-spine, and unified daemon into ./bin/"
+	@echo "  integration run every end-to-end scenario + admin-command script in tests/integration/"
+	@echo "  clean       remove build artifacts"
+	@echo "  check-nova  verify the NOVA toolchain is reachable"
 	@echo "Override the toolchain with: make NOVA_ROOT=/path/to/NOVA <target>"
