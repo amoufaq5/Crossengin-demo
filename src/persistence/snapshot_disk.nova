@@ -1,0 +1,326 @@
+// CrossEngin persistence: on-disk snapshot I/O (the runtime seam).
+//
+// Purpose
+//   Realize the byte-level write/read seam that snapshot_writer.nova names but
+//   intentionally leaves abstract. Two responsibilities:
+//
+//     1. Text-encode / decode the framed snapshot value so it can travel as a
+//        file. The format is line-oriented (one `key value` pair per line) so a
+//        human can inspect a checkpoint with `cat`, and so a parse failure has
+//        a localizable cause.
+//
+//     2. Provide the crash-safe write contract: write_tmp -> fsync -> atomic
+//        rename -> fsync(parent_dir). A crash mid-write never corrupts the last
+//        good snapshot because the live filename only flips after the new bytes
+//        are durable. The parent-dir fsync makes the rename itself durable on
+//        ext4/xfs (otherwise a power loss right after rename can lose the dir
+//        entry update). This is the contract `snap_durable_steps()` advertises.
+//
+//   The syscall floor (sys_open / sys_write / sys_fsync / sys_close /
+//   sys_rename) lives in NOVA's runtime; this module just composes it.
+//
+//   The textual format keeps the well-known SOUL and KGS section blobs
+//   (`[name_str, constitution_count]` and `[atom_count]`) round-trippable, and
+//   round-trips the presence flag for EPISODIC / SYNAPSES / SELFMODEL (their
+//   blobs aren't populated yet by `_checkpoint`, so a present=1 with empty
+//   blob is the only legal shape today). When those subsystems start emitting
+//   blobs, extend `snap_to_text` / `snap_from_text` per-section -- this module
+//   is the only place that knows the wire shape.
+//
+// ADRs implemented: ADR-0048 (the runtime seam for write_tmp -> fsync ->
+//   atomic_rename). NOVA dependencies: builtins + sys_open/sys_write/sys_read/
+//   sys_close/sys_fsync (74)/sys_rename (82) from std/syscall. CrossEngin
+//   dependencies: src/persistence/snapshot_writer.nova (frame + section ids),
+//   src/persistence/snapshot_reader.nova (snap_parse for the round-trip half).
+
+import "std/syscall"
+import "snapshot_reader.nova"
+
+// ---- text encoding ---------------------------------------------------------
+//
+// Wire format (line-oriented, ASCII; one `key SP value` pair per line):
+//
+//   crossengin-snapshot v1
+//   tag <int>
+//   ver <int>
+//   instance <int>
+//   timestamp <int>
+//   sections <int>          # mandatory == SEC_COUNT (5)
+//   soul.present 0|1
+//   soul.name <string>      # only if soul.present==1
+//   soul.constcount <int>   # only if soul.present==1
+//   kgs.present 0|1
+//   kgs.atoms <int>         # only if kgs.present==1
+//   episodic.present 0|1
+//   synapses.present 0|1
+//   selfmodel.present 0|1
+//   end
+//
+// Strings (currently only the soul name) must not contain newlines. The seed
+// data we ship never produces newline-bearing atom names, so this is enough.
+
+let _SNAP_HEADER = "crossengin-snapshot v1"
+
+fn _line_kv_int(key, val) {
+    return key + " " + int_to_str(val) + "\n"
+}
+
+fn _line_kv_str(key, val) {
+    return key + " " + val + "\n"
+}
+
+fn snap_to_text(s) {
+    if snap_valid(s) == 0 { return "" }
+    let out = _SNAP_HEADER + "\n"
+    out = out + _line_kv_int("tag", snap_tag(s))
+    out = out + _line_kv_int("ver", snap_version(s))
+    out = out + _line_kv_int("instance", snap_instance(s))
+    out = out + _line_kv_int("timestamp", snap_timestamp(s))
+    out = out + _line_kv_int("sections", SEC_COUNT)
+
+    let soul_p = snap_has_section(s, SEC_SOUL)
+    out = out + _line_kv_int("soul.present", soul_p)
+    if soul_p == 1 {
+        let sb = snap_section(s, SEC_SOUL)
+        out = out + _line_kv_str("soul.name", sb[0])
+        out = out + _line_kv_int("soul.constcount", sb[1])
+    }
+
+    let kgs_p = snap_has_section(s, SEC_KGS)
+    out = out + _line_kv_int("kgs.present", kgs_p)
+    if kgs_p == 1 {
+        let kb = snap_section(s, SEC_KGS)
+        out = out + _line_kv_int("kgs.atoms", kb[0])
+    }
+
+    out = out + _line_kv_int("episodic.present", snap_has_section(s, SEC_EPISODIC))
+    out = out + _line_kv_int("synapses.present", snap_has_section(s, SEC_SYNAPSES))
+    out = out + _line_kv_int("selfmodel.present", snap_has_section(s, SEC_SELFMODEL))
+    out = out + "end\n"
+    return out
+}
+
+// ---- text decoding ---------------------------------------------------------
+
+fn _find_byte(s, start, byte) {
+    let n = len(s)
+    let i = start
+    while i < n {
+        if char_at(s, i) == byte { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Returns [line_text, position_after_newline]. If no newline is found, the
+// trailing characters are returned and position lands at end-of-text so the
+// caller's loop terminates.
+fn _next_line(text, pos) {
+    let nl = _find_byte(text, pos, 10)
+    let pair = list_new()
+    if nl < 0 {
+        push(pair, substr(text, pos, len(text) - pos))
+        push(pair, len(text))
+        return pair
+    }
+    push(pair, substr(text, pos, nl - pos))
+    push(pair, nl + 1)
+    return pair
+}
+
+fn _line_key(line) {
+    let sp = _find_byte(line, 0, 32)
+    if sp < 0 { return line }
+    return substr(line, 0, sp)
+}
+
+fn _line_val(line) {
+    let sp = _find_byte(line, 0, 32)
+    if sp < 0 { return "" }
+    return substr(line, sp + 1, len(line) - sp - 1)
+}
+
+fn _line_val_int(line) {
+    return str_to_int(_line_val(line))
+}
+
+// Parse a textual snapshot. Returns the snapshot value on success, 0 on any
+// shape mismatch (wrong header, missing required key, wrong tag/version).
+fn snap_from_text(text) {
+    let cursor = _next_line(text, 0)
+    if str_eq(cursor[0], _SNAP_HEADER) == 0 { return 0 }
+    let pos = cursor[1]
+
+    let tag = -1
+    let ver = -1
+    let instance = -1
+    let timestamp = -1
+    let sections = -1
+    let soul_present = 0
+    let soul_name = ""
+    let soul_constcount = 0
+    let kgs_present = 0
+    let kgs_atoms = 0
+    let episodic_present = 0
+    let synapses_present = 0
+    let selfmodel_present = 0
+    let saw_end = 0
+
+    while pos < len(text) {
+        let parsed = _next_line(text, pos)
+        pos = parsed[1]
+        let line = parsed[0]
+        if len(line) > 0 {
+            let k = _line_key(line)
+            if str_eq(k, "end") == 1 {
+                saw_end = 1
+                pos = len(text)
+            } else {
+                if str_eq(k, "tag") == 1               { tag               = _line_val_int(line) }
+                if str_eq(k, "ver") == 1               { ver               = _line_val_int(line) }
+                if str_eq(k, "instance") == 1          { instance          = _line_val_int(line) }
+                if str_eq(k, "timestamp") == 1         { timestamp         = _line_val_int(line) }
+                if str_eq(k, "sections") == 1          { sections          = _line_val_int(line) }
+                if str_eq(k, "soul.present") == 1      { soul_present      = _line_val_int(line) }
+                if str_eq(k, "soul.name") == 1         { soul_name         = _line_val(line) }
+                if str_eq(k, "soul.constcount") == 1   { soul_constcount   = _line_val_int(line) }
+                if str_eq(k, "kgs.present") == 1       { kgs_present       = _line_val_int(line) }
+                if str_eq(k, "kgs.atoms") == 1         { kgs_atoms         = _line_val_int(line) }
+                if str_eq(k, "episodic.present") == 1  { episodic_present  = _line_val_int(line) }
+                if str_eq(k, "synapses.present") == 1  { synapses_present  = _line_val_int(line) }
+                if str_eq(k, "selfmodel.present") == 1 { selfmodel_present = _line_val_int(line) }
+            }
+        }
+    }
+
+    if saw_end == 0 { return 0 }
+    if tag != SNAP_TAG { return 0 }
+    if ver != SNAP_FORMAT_VERSION { return 0 }
+    if sections != SEC_COUNT { return 0 }
+
+    let s = snap_new(instance, timestamp)
+    if soul_present == 1 {
+        let sb = list_new()
+        push(sb, soul_name)
+        push(sb, soul_constcount)
+        snap_put_section(s, SEC_SOUL, sb)
+    }
+    if kgs_present == 1 {
+        let kb = list_new()
+        push(kb, kgs_atoms)
+        snap_put_section(s, SEC_KGS, kb)
+    }
+    if episodic_present == 1 {
+        snap_put_section(s, SEC_EPISODIC, list_new())
+    }
+    if synapses_present == 1 {
+        snap_put_section(s, SEC_SYNAPSES, list_new())
+    }
+    if selfmodel_present == 1 {
+        snap_put_section(s, SEC_SELFMODEL, list_new())
+    }
+    return s
+}
+
+// ---- crash-safe disk I/O (the runtime seam) --------------------------------
+//
+// The five-step contract `snap_durable_steps()` advertises is realized here:
+//
+//   1. open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+//   2. write(tmp_fd, bytes)
+//   3. fsync(tmp_fd)
+//   4. close(tmp_fd) + rename(tmp -> final)
+//   5. open(parent_dir, O_RDONLY) + fsync(dir_fd) + close(dir_fd)
+//
+// Step 5 makes the rename itself durable on ext4/xfs (without it, a power
+// loss right after step 4 can lose the dir entry even though the data block
+// is already on disk). We ignore the parent-fsync's return: if the dir can't
+// be opened we still succeed at the file level (best-effort).
+
+let _SNAP_MODE = 420   // 0644: rw-r--r--
+
+// Find the rightmost '/' (byte 47) in `path`. Returns -1 if none.
+fn _last_slash(path) {
+    let i = len(path) - 1
+    while i >= 0 {
+        if char_at(path, i) == 47 { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _parent_dir(path) {
+    let i = _last_slash(path)
+    if i < 0 { return "." }
+    if i == 0 { return "/" }
+    return substr(path, 0, i)
+}
+
+// Write `text` to `path` durably. Returns 1 on success, 0 on any syscall
+// failure (open or write). A returned 1 means the snapshot has been committed
+// via fsync + atomic rename and survives an abrupt kill.
+fn snap_write_durable(text, path) {
+    let tmp = snap_tmp_path(path)
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(tmp, flags, _SNAP_MODE)
+    if fd < 0 { return 0 }
+    let n = len(text)
+    let written = sys_write(fd, text, n)
+    if written != n {
+        sys_close(fd)
+        sys_unlink(tmp)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    let rr = sys_rename(tmp, path)
+    if rr != 0 {
+        sys_unlink(tmp)
+        return 0
+    }
+    let parent = _parent_dir(path)
+    let dfd = sys_open(parent, O_RDONLY, 0)
+    if dfd >= 0 {
+        sys_fsync(dfd)
+        sys_close(dfd)
+    }
+    return 1
+}
+
+// Read the entire file at `path` as text. Returns 0 if the file can't be
+// opened (missing, permission denied), otherwise the textual content.
+fn snap_read_text(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let chunk = 4096
+    let buf = alloc(chunk + 1)
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        let m = sys_read(fd, buf, chunk)
+        if m <= 0 {
+            done = 1
+        } else {
+            store8(buf + m, 0)
+            acc = acc + buf
+            if m < chunk { done = 1 }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// Convenience: durably write a snapshot to disk in one call.
+fn snap_save(s, path) {
+    if snap_valid(s) == 0 { return 0 }
+    return snap_write_durable(snap_to_text(s), path)
+}
+
+// Convenience: read + parse a snapshot from disk in one call. Returns 0 if
+// the file is missing, unreadable, or contents do not parse / validate.
+fn snap_load(path) {
+    let text = snap_read_text(path)
+    if text == 0 { return 0 }
+    if len(text) == 0 { return 0 }
+    return snap_from_text(text)
+}

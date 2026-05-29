@@ -259,14 +259,19 @@ in the reader: the mandatory rehydration order soul -> KGs -> episodic (refuse
 KGs before soul, episodic before KGs), so the constitution is live before any
 atom is admitted and no moment dangles. The decision log (ADR-0043) is
 durable-but-separate and is not rolled back by a restore. Crash-safe disk write
-(temp -> fsync -> atomic rename) and subsystem byte-serialization are the runtime
-seams (NOVA enhancements #9/#10); the container, ordering, and validation are
-implemented and tested.
+(temp -> fsync -> atomic rename -> parent-dir fsync) is now realized in
+`snapshot_disk.nova` against NOVA's sys_fsync (74) and sys_rename (82); the
+chat `/save` and `/load` admin commands exercise the seam end-to-end. Subsystem
+byte-serialization of the section blobs is still a deferred runtime seam --
+the framed image round-trips today via a line-oriented text format (one
+`key value` pair per line) that captures the well-known SOUL/KGS fields and the
+presence flag for the other sections.
 
 | Module | ADRs | Unit asserts | Status |
 |--------|------|--------------|--------|
 | persistence/snapshot_writer.nova | 0048 | 27 | done |
 | persistence/snapshot_reader.nova | 0048 | 25 | done |
+| persistence/snapshot_disk.nova | 0048 | 31 | done |
 
 Also delivered (runnable artifacts via `make install`):
 - `examples/kernel_selfcheck.nova` -> `bin/crossengin-selfcheck` — the substrate
@@ -331,9 +336,9 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 87 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence + 1 seed + 1 meta); **1450 assertions**.
+- Total unit suites: 88 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 3 persistence + 1 seed + 1 meta); **1481 assertions**.
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
-- Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 87 CrossEngin suites.
+- Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -431,7 +436,7 @@ shaped the implementation and must be respected going forward:
    (`imp_full`) in `_resolve_import_inner`, so `..`/`.` are collapsed before both
    the `already_imported` check and the propagated base_dir. Rebuilt the
    self-hosting compiler (`make bin/nova`), verified self-hosting (stage2 ==
-   stage3) and NOVA's own tests, and confirmed all 87 CrossEngin suites still
+   stage3) and NOVA's own tests, and confirmed all 88 CrossEngin suites still
    pass and the previously-colliding cross-subtree combos now link. This is what
    made the unified `bin/crossengin` daemon possible. The notes below preserve
    the original constraint for historical context.
@@ -511,8 +516,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 87 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 87/87 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 88 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 88/88 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/{crossengin-selfcheck,crossengin-spine,crossengin}
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"

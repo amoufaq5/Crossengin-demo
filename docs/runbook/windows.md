@@ -72,7 +72,7 @@ git clone https://github.com/amoufaq5/Crossengin-demo
 cd Crossengin-demo
 
 make build                          # compile every module
-make test                           # run all 87 unit suites
+make test                           # run all 88 unit suites
 make install                        # build the three runnable artifacts
 
 ./bin/crossengin                    # the whole agent in one process
