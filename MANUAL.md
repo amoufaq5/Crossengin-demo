@@ -266,29 +266,54 @@ also pulled `doctor` in via the seeded `doctor↔medicine` cross-ref); their
 refl_kg confidence crossed threshold and they were graduated. "prescription"
 and "recover" stay tentative until perception corroborates them too.
 
-#### Learn a topic from the web
+#### Learn from a TOPIC, URL, or FILE
 
-`scripts/learn.sh <topic>` fetches Wikipedia (or any URL via `LEARN_URL=`),
-extracts the topic's most-frequent vocabulary, and writes it to
-`/tmp/crossengin_learn_<topic>.txt`. The chat's `/learn <topic>` reads that
-file and ingests each word via the same path `/teach` uses — they become
-real language atoms in the live KG. NOVA has no fork/exec, so the curl lives
-in bash and the agent only reads.
+`scripts/learn.sh <ARG>` accepts THREE source kinds. In every case it writes
+`/tmp/crossengin_learn_<tag>.txt` (vocabulary, one word per line) plus
+`/tmp/crossengin_learn_<tag>_triples.txt` (structural triples for the
+operator extractor). The chat's `/learn <ARG>` re-derives the same `<tag>`
+from the user-typed argument and ingests both files; each word/operator is
+attributed back to its source via a `src:<kind>:<tag>` label so a future
+meta-loop can corroborate or atrophy by source.
+
+1. **TOPIC** (bare word) — fetches Wikipedia by default; override the URL
+   for topic-kind via `LEARN_URL=...`. The tag is the topic itself.
+   ```sh
+   scripts/learn.sh fever
+   # writes /tmp/crossengin_learn_fever.txt + ..._fever_triples.txt
+   ```
+2. **URL** — argument starts with `http://` or `https://`. Tag is derived
+   from `host+path` (scheme stripped, `/` -> `_`, non-alnum dropped, capped
+   at 64 chars).
+   ```sh
+   scripts/learn.sh https://en.wikipedia.org/wiki/Aspirin
+   # writes /tmp/crossengin_learn_enwikipediaorg_wiki_Aspirin.txt + ...
+   ```
+3. **FILE** — argument starts with `/`, `./`, or `../`. Plain text on disk
+   (no fetch). Tag is `basename` minus the last extension, with non-alnum
+   collapsed to `_`.
+   ```sh
+   scripts/learn.sh /tmp/test_corpus.txt
+   # writes /tmp/crossengin_learn_test_corpus.txt + ..._test_corpus_triples.txt
+   ```
 
 ```sh
 # in one terminal:
 scripts/learn.sh fever
-# wrote 30 candidate words to /tmp/crossengin_learn_fever.txt
+# wrote 30 words to /tmp/crossengin_learn_fever.txt
+# wrote 20 triples to /tmp/crossengin_learn_fever_triples.txt
 
 # in the chat:
 > /status                    13 atoms (seed only)
-> /learn fever               29 new atoms (one was already seeded), 42 total
+> /learn fever               (learned about 'fever' [topic]: 30 word(s), 7 operator(s) ingested, KG=600)
 > temperature                agent> okay   (the word was JUST learned)
 > body                       agent> okay   (same)
+> /learn /tmp/notes.txt      (learned about '/tmp/notes.txt' [file]: 4 word(s), 1 operator(s) ingested, KG=604)
 ```
 
-Use `LEARN_URL='...'` to point at any other source, and `LEARN_MAX=50` to
-adjust how many candidates to keep (default 30).
+Use `LEARN_URL='...'` to point a TOPIC at a non-Wikipedia source, and
+`LEARN_MAX=50` (default 30) / `LEARN_MAX_TRIPLES=30` (default 20) to adjust
+how many candidates to keep.
 
 **B. `scripts/chat.sh` — a bash shim** that runs `bin/crossengin` once per
 message via a file. Each turn is a fresh boot (state doesn't persist), but it

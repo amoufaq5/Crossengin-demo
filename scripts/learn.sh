@@ -1,47 +1,98 @@
 #!/usr/bin/env bash
-# Fetch a topic page and extract candidate vocabulary for the chat's
-# `/learn <topic>` admin command.
+# Fetch a topic page (or arbitrary URL, or local text file) and extract
+# candidate vocabulary + structural triples for the chat's `/learn <ARG>`
+# admin command.
 #
-# Default source is Wikipedia; override with LEARN_URL='...' for any URL that
-# returns HTML or plain text. Output is /tmp/crossengin_learn_<topic>.txt --
-# one candidate word per line, deduplicated, lowercased, alphabetic only.
+# Three source kinds are accepted:
+#   TOPIC  scripts/learn.sh fever
+#          -> fetches https://en.wikipedia.org/wiki/fever (override LEARN_URL=)
+#   URL    scripts/learn.sh https://example.com/page
+#          -> fetches the URL verbatim, derives tag from host+path
+#   FILE   scripts/learn.sh /path/to/local.txt   (also ./rel or ../rel)
+#          -> reads the file from disk, derives tag from the basename
 #
-# Usage:    scripts/learn.sh <topic>
-#           LEARN_URL='https://...' scripts/learn.sh <topic>
-#           LEARN_MAX=50 scripts/learn.sh <topic>   # words to keep (default 30)
+# In all three cases the downstream pipeline is identical: BODY is split into
+# lowercase alphabetic words for /tmp/crossengin_learn_<tag>.txt, and the same
+# 5-word sliding-window extractor mines /tmp/crossengin_learn_<tag>_triples.txt.
+# The user types `/learn <ARG>` (the original argument) in the chat -- the chat
+# re-derives the same <tag> via the matching logic in `_learn_tag`.
 #
-# Then in bin/crossengin-chat:  /learn <topic>
+# Usage:    scripts/learn.sh <topic|url|file>
+#           LEARN_URL='https://...' scripts/learn.sh <topic>   # override URL only for topic-kind
+#           LEARN_MAX=50 scripts/learn.sh <topic>              # words to keep (default 30)
+#           LEARN_MAX_TRIPLES=30 scripts/learn.sh <topic>      # triples (default 20)
+#
+# Then in bin/crossengin-chat:  /learn <ARG>
 
 set -uo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "usage: $0 <topic>"
-    echo "  fetches https://en.wikipedia.org/wiki/<topic> by default,"
-    echo "  extracts candidate vocabulary, writes /tmp/crossengin_learn_<topic>.txt."
-    echo "  Then in bin/crossengin-chat:  /learn <topic>"
+    echo "usage: $0 <topic|url|file>"
+    echo "  TOPIC: fetches https://en.wikipedia.org/wiki/<topic> by default"
+    echo "  URL:   fetches the URL verbatim (http:// or https:// prefix)"
+    echo "  FILE:  reads from disk (/abs/path, ./rel, or ../rel)"
+    echo "  writes /tmp/crossengin_learn_<tag>.txt + ..._<tag>_triples.txt."
+    echo "  Then in bin/crossengin-chat:  /learn <ARG>"
     exit 1
 fi
 
-TOPIC="$1"
-URL="${LEARN_URL:-https://en.wikipedia.org/wiki/$TOPIC}"
-OUT="/tmp/crossengin_learn_${TOPIC}.txt"
-TRIPLES="/tmp/crossengin_learn_${TOPIC}_triples.txt"
+ARG="$1"
+
+# Detect the source kind. Tag derivation MUST stay in lockstep with the NOVA
+# helper `_learn_tag` in examples/crossengin_chat.nova -- the chat re-derives
+# the tag from the user's argument to locate the cache files this script wrote.
+case "$ARG" in
+    http://*|https://*)
+        KIND="url"
+        URL="$ARG"
+        TAG=$(echo "$ARG" | sed -E 's|^https?://||; s|/|_|g; s|[^a-zA-Z0-9_-]||g' | cut -c1-64)
+        ;;
+    /*|./*|../*)
+        if [ -f "$ARG" ]; then
+            KIND="file"
+            FILE="$ARG"
+            TAG=$(basename "$ARG" | sed -E 's|\.[^.]+$||; s|[^a-zA-Z0-9_-]|_|g' | cut -c1-64)
+        else
+            echo "ERROR: file not found: $ARG" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        KIND="topic"
+        TOPIC="$ARG"
+        URL="${LEARN_URL:-https://en.wikipedia.org/wiki/$TOPIC}"
+        TAG="$TOPIC"
+        ;;
+esac
+
+OUT="/tmp/crossengin_learn_${TAG}.txt"
+TRIPLES="/tmp/crossengin_learn_${TAG}_triples.txt"
 MAX_WORDS="${LEARN_MAX:-30}"
 MAX_TRIPLES="${LEARN_MAX_TRIPLES:-20}"
 
-echo "fetching: $URL"
-if ! BODY=$(curl -sLf --max-time 15 -A "crossengin-learn/0.1" "$URL"); then
-    echo "ERROR: fetch failed -- network blocked, URL bad, or page missing."
-    echo "Workaround for sandboxed environments: write the words yourself:"
-    echo "  printf 'word1\\nword2\\nword3\\n' > \"$OUT\""
-    echo "  then in chat: /learn \"$TOPIC\""
-    exit 2
+# Acquire BODY: from disk for FILE-kind, from curl for URL/TOPIC.
+if [ "$KIND" = "file" ]; then
+    echo "reading: $FILE  (kind=file tag=$TAG)"
+    if ! BODY=$(cat "$FILE"); then
+        echo "ERROR: failed to read $FILE" >&2
+        exit 2
+    fi
+else
+    echo "fetching: $URL  (kind=$KIND tag=$TAG)"
+    if ! BODY=$(curl -sLf --max-time 15 -A "crossengin-learn/0.1" "$URL"); then
+        echo "ERROR: fetch failed -- network blocked, URL bad, or page missing."
+        echo "Workaround for sandboxed environments: write the words yourself:"
+        echo "  printf 'word1\\nword2\\nword3\\n' > \"$OUT\""
+        echo "  then in chat: /learn \"$ARG\""
+        exit 2
+    fi
 fi
 
 # Strip script/style blocks, then all tags, then HTML entities. Split into
 # lowercase alphabetic words, filter to plausible lemmas (4-14 chars), then
 # rank by occurrence count -- topic-relevant words appear most often on the
-# page, while page-nav / boilerplate tends to appear once or twice.
+# page, while page-nav / boilerplate tends to appear once or twice. For FILE
+# kind the HTML strip is a no-op (plain text passes through cleanly).
 echo "$BODY" \
     | sed -E 's|<script[^<]*</script>||g; s|<style[^<]*</style>||g; s/<[^>]*>/ /g; s/&[a-z]+;//g' \
     | tr -c '[:alpha:]' '\n' \
@@ -54,7 +105,7 @@ echo "$BODY" \
     | awk '{print $2}' > "$OUT"
 
 N=$(wc -l < "$OUT")
-echo "wrote $N candidate words to $OUT"
+echo "wrote $N words to $OUT"
 
 # ---- structural triples ---------------------------------------------------
 # In addition to vocabulary, mine simple surface patterns from the same body
@@ -146,6 +197,6 @@ awk -v MAX="$MAX_TRIPLES" '
     | cut -f2 > "$TRIPLES"
 
 T=$(wc -l < "$TRIPLES")
-echo "wrote $T candidate triples to $TRIPLES"
+echo "wrote $T triples to $TRIPLES"
 echo
-echo "Next: in bin/crossengin-chat type  /learn $TOPIC"
+echo "Next: in bin/crossengin-chat type  /learn $ARG"

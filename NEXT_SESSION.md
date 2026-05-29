@@ -17,6 +17,40 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- Phase 14 Tier-2 item #2 -- structural-neighborhood activation: **complete**.
+  The reader now has a substrate-native similarity surface for indirect input.
+  A new `src/reader/neighborhood.nova` exposes `find_neighbors(kg_reg, handle,
+  max_hops, max_results)` that mines TWO substrate sources -- reasoning
+  operator edges (ADR-0031) and cross-KG xref edges (ADR-0017) -- plus a small
+  word-sense co-occurrence pass (ADR-0015), and aggregates evidence by summing
+  strengths and clamping to 0..1000. One-hop wins; two-hop is decayed by
+  NEIGH_HOP_DECAY (0.5, same constant as ADR-0012 stage 3).
+  `spreading_activation` now seeds neighborhood hits ADDITIONALLY on every
+  exact-match anchor's chosen sense (exact match still gets full SPREAD_SEED
+  so it dominates) and falls back to `lexical_fallback_candidates` on
+  unmatched tokens -- a substrate-native miss recovery that surfaces concept
+  handles named by lexically-similar known words. Sample:
+  `find_neighbors(fever, 2, 5)` over a fever -> infection -> treat seed
+  returns `infection -> 1000` (one-hop direct, operator + xref both fire),
+  `treat -> 600` (two-hop, decayed), `headache -> 500` (one-hop operator
+  only). NO embeddings, NO transformer; pure substrate. Acceptance:
+  `tests/unit/test_neighborhood_activation.nova` covers all four scenarios in
+  the brief (basic find_neighbors, sorted/capped output, hop-depth, round-trip
+  via spreading_activation, cross-KG ref case, paraphrase via lexical
+  fallback, exact-match dominance) with 30 assertions across 10 test
+  functions.
+- Phase 15 Tier-2 item #3 -- multi-source `/learn`: **complete**.
+  `scripts/learn.sh` now accepts a bare TOPIC (Wikipedia, unchanged), an
+  http(s):// URL (fetched verbatim), or a local `/abs|./rel|../rel` file
+  (read from disk). Each kind derives a sanitised `<tag>` and writes the
+  same `/tmp/crossengin_learn_<tag>.txt` + `..._<tag>_triples.txt`. The chat's
+  `/learn <ARG>` admin command re-derives the same tag via a NOVA
+  `_learn_tag` helper (lock-step with the bash `case`+`sed` pipeline) and
+  ingests both files. Every word / operator carries a `src:<kind>:<tag>`
+  attribution so a future meta-loop / source-authority pass (ADR-0029)
+  can corroborate / atrophy by source. Acceptance: `scripts/learn_smoke_multi.sh`
+  exercises all three kinds; `tests/unit/test_learn_tag.nova` covers the
+  tag-derivation contract with 22 assertions.
 - Phase 11 Tier-1 item #1 -- full SOUL + KGS subsystem blob serialization:
   **complete**. `snapshot_disk.nova` now round-trips every atom (label, kind,
   alpha/beta belief, owning KG label) and the full SOUL state (name, purpose,
@@ -97,7 +131,8 @@ signals.
 | language/syntax_atoms.nova | 0015, 0013 | 14 | done |
 | reader/lexical_anchor.nova | 0012 (stage 1), 0011 | 19 | done |
 | reader/context_bias.nova | 0012 (stage 2) | 9 | done |
-| reader/spreading_activation.nova | 0012 (stage 3), 0017 | 8 | done |
+| reader/spreading_activation.nova | 0012 (stage 3), 0017 | 9 | done |
+| reader/neighborhood.nova (Phase 14 Tier-2 #2: structural-neighborhood) | 0012, 0017, 0031, 0015 | 30 | done |
 | reader/coherence_check.nova | 0012 (stage 4) | 11 | done |
 | reader/fetch_route_learn.nova | 0012 (stage 5) | 11 | done |
 | reader/reader.nova | 0011, 0012 | 13 | done |
@@ -361,7 +396,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 89 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 1 meta); **1557 assertions**.
+- Total unit suites: 90 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 1 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3); **1579 assertions** (delta = +22 from `test_learn_tag.nova`).
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
