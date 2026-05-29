@@ -21,7 +21,10 @@ computational units rather than orchestrating a pipeline of modules.
 > selfmodel}.nova` added in P0.1 full-state persistence,
 > +2 suites / +82 assertions from `test_meta_observer_feedback.nova` +
 > `test_atom_death_attribution.nova` added in P1.1 meta-observer feedback
-> into source_authority + P1.6 atom-death attribution),
+> into source_authority + P1.6 atom-death attribution,
+> +18 assertions to `test_learn_tag.nova` (22 -> 40) from P1.5 composite
+> `/learn` kinds: batch `@/path/urls.txt`, RSS `rss:URL`, recursive
+> `dir:/path` directory walk),
 > 16 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`

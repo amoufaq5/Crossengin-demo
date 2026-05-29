@@ -343,6 +343,36 @@ meta-loop can corroborate or atrophy by source.
    scripts/learn.sh /tmp/test_corpus.txt
    # writes /tmp/crossengin_learn_test_corpus.txt + ..._test_corpus_triples.txt
    ```
+4. **BATCH** (P1.5) — argument starts with `@` and points at a local text
+   file containing one URL per line (blank lines and `#` comments skipped).
+   The script recursively self-calls per URL, writing each per-URL cache
+   under its URL-derived tag AND concatenating all per-URL caches into a
+   combined cache. Tag is `batch_<basename(list-file without .ext)>`. The
+   chat ingests the combined cache then iterates each per-URL tag so each
+   URL keeps its own `src:url:<url-tag>` attribution for meta-observer
+   scoring.
+   ```sh
+   printf 'https://en.wikipedia.org/wiki/Aspirin\nhttps://en.wikipedia.org/wiki/Fever\n' > /tmp/urls.txt
+   scripts/learn.sh @/tmp/urls.txt
+   # writes /tmp/crossengin_learn_batch_urls.txt + per-URL caches
+   ```
+5. **RSS** (P1.5) — argument is `rss:URL`. Fetches the feed, parses up to
+   `LEARN_RSS_MAX` (default 5) `<link>...</link>` (RSS) or
+   `<link href="...">` (Atom) entries, then batch-ingests them as URLs.
+   Tag is `rss_<host>`. Lossy regex parsing is fine; the chat-side filter
+   is the ground truth for triples.
+   ```sh
+   scripts/learn.sh rss:https://feeds.example.org/atom.xml
+   # writes /tmp/crossengin_learn_rss_feeds_example_org.txt
+   ```
+6. **DIR** (P1.5) — argument is `dir:/path/to/corpus/`. Recursively walks
+   the directory for `*.txt` and `*.md` files, ingests each as a FILE,
+   then concatenates their per-file caches into the combined cache. Tag is
+   `dir_<basename(corpus)>`.
+   ```sh
+   scripts/learn.sh dir:/tmp/test_corpus_dir/
+   # writes /tmp/crossengin_learn_dir_test_corpus_dir.txt + per-file caches
+   ```
 
 ```sh
 # in one terminal:
@@ -356,11 +386,14 @@ scripts/learn.sh fever
 > temperature                agent> okay   (the word was JUST learned)
 > body                       agent> okay   (same)
 > /learn /tmp/notes.txt      (learned about '/tmp/notes.txt' [file]: 4 word(s), 1 operator(s) ingested, KG=604)
+> /learn @/tmp/urls.txt      (learned about '@/tmp/urls.txt' [batch]: combined 46 word(s) 0 op(s); per-URL 60 word(s) 11 op(s) across 2 URL(s), KG=616)
+> /learn dir:/tmp/corpus/    (learned about 'dir:/tmp/corpus/' [dir]: 12 word(s), 0 operator(s) ingested, KG=625)
 ```
 
 Use `LEARN_URL='...'` to point a TOPIC at a non-Wikipedia source, and
 `LEARN_MAX=50` (default 30) / `LEARN_MAX_TRIPLES=30` (default 20) to adjust
-how many candidates to keep.
+how many candidates to keep. `LEARN_RSS_MAX=N` adjusts how many feed items
+are ingested (default 5).
 
 **B. `scripts/chat.sh` — a bash shim** that runs `bin/crossengin` once per
 message via a file. Each turn is a fresh boot (state doesn't persist), but it
