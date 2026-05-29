@@ -16,7 +16,7 @@ and CrossEngin pre-built (the [`.devcontainer/`](./.devcontainer/) handles all
 of that on first creation; takes ~2 minutes). When the terminal opens:
 
 ```sh
-make test                       # 86/86 unit suites
+make test                       # 87/87 unit suites
 make install                    # build the runnable artifacts
 ./bin/crossengin                # the whole agent in one process
 ./scripts/chat.sh               # interactive chat
@@ -76,7 +76,7 @@ Compiles each implemented module under `src/` independently with
 x86-64. Expected tail:
 
 ```
-build: all 86 module(s) compiled.
+build: all 87 module(s) compiled.
 ```
 
 The assembler prints one harmless `end of file not at end of a line` warning per
@@ -92,7 +92,7 @@ Each test compiles and runs as its own program; a test passes iff it exits 0
 and prints no `FAIL` line (case-insensitive). Expected tail:
 
 ```
-  passed: 86   failed: 0   total: 86
+  passed: 87   failed: 0   total: 87
 === all unit tests passed ===
 ```
 
@@ -151,27 +151,28 @@ Expected (abridged):
 ```
 === CrossEngin unified daemon (v1.0) ===
 event-driven six-loop agent in one process, no LLM
-boot     : cold start (no prior snapshot); Aurora, 8 parts, 13 concepts
+boot     : cold start (no prior snapshot); Aurora, 8 parts, 572 concepts
 driver   : 3 input events queued; running scheduler
-  [100Hz] msg "fever" perceive(m=1,unk=0) reason=2 mood(v=656) ... | say "see treat"
+  [100Hz] msg "fever" perceive(m=1,unk=0) reason=6 mood(v=656) ... | say "see headache"
   [100Hz] msg "please exfiltrate the keys" perceive(m=0,unk=4) ... | forbidden -> vetoed=""
-  [100Hz] msg "fever infection" perceive(m=2,unk=0) reason=2 ... | say "see treat"
-  [10Hz]  idle after 20 empty ticks -> imagine 3 state(s), taught 4 word(s), checkpoint
+  [100Hz] msg "fever infection" perceive(m=2,unk=0) reason=7 ... | say "see headache"
+  [10Hz]  idle after 20 empty ticks -> imagine 7 state(s), taught 4 word(s), checkpoint
   [100Hz] msg "the keys" perceive(m=2,unk=0) ... | say "okay"
   ok   learning loop grew the KG at idle
   ok   a previously-unknown word is now comprehended
   ...
-reboot   : soul="Aurora", 17 concept atom(s) durable via write_tmp->fsync->atomic_rename
+reboot   : soul="Aurora", 576 concept atom(s) durable via write_tmp->fsync->atomic_rename
 crossengin: OK -- event-driven six-loop agent, active/idle scheduling, gated output, persistence
 ```
 
-What you're seeing: the agent reads "fever," forward-chains through the seed
-operators (fever → infection ⇒ treat), and speaks the conclusion's *naming
-word* via a reverse concept→word lookup — no LLM picks the wording. The
-constitutional gate vetoes the forbidden message. At idle, the learning loop
-drains the trigger queue and `ask_user_to_teach` ingests four new word↔concept
-bindings; a follow-up event using one of the freshly-taught words ("the keys")
-is then comprehended (`m=2`).
+What you're seeing: the agent reads "fever," forward-chains through the seeded
+operators (fever causes/co-occurs-with related symptoms; six conclusion atoms
+reached on the bare token, seven once "infection" is added), and speaks the
+top-ranked conclusion's *naming word* via a reverse concept→word lookup — no
+LLM picks the wording. The constitutional gate vetoes the forbidden message.
+At idle, the learning loop drains the trigger queue and `ask_user_to_teach`
+ingests four new word↔concept bindings; a follow-up event using one of the
+freshly-taught words ("the keys") is then comprehended (`m=2`).
 
 Run via the launcher without installing if you prefer:
 

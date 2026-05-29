@@ -33,8 +33,8 @@ echo "fetching: $URL"
 if ! BODY=$(curl -sLf --max-time 15 -A "crossengin-learn/0.1" "$URL"); then
     echo "ERROR: fetch failed -- network blocked, URL bad, or page missing."
     echo "Workaround for sandboxed environments: write the words yourself:"
-    echo "  printf 'word1\\nword2\\nword3\\n' > $OUT"
-    echo "  then in chat: /learn $TOPIC"
+    echo "  printf 'word1\\nword2\\nword3\\n' > \"$OUT\""
+    echo "  then in chat: /learn \"$TOPIC\""
     exit 2
 fi
 

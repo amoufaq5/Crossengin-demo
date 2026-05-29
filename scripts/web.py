@@ -27,6 +27,7 @@ Requires: Python 3.7+ (for ThreadingHTTPServer). No third-party libraries.
 import http.server
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -35,6 +36,10 @@ import time
 
 PORT = int(os.environ.get("CE_PORT", 8765))
 BIN  = os.environ.get("CE_BIN", "./bin/crossengin-chat")
+# Default to loopback because the chat surface exposes admin commands
+# (/teach, /halt, /quit -> exit(0)) that should not be reachable from the LAN.
+# Override with CE_BIND=0.0.0.0 when you specifically want LAN access.
+BIND = os.environ.get("CE_BIND", "127.0.0.1")
 PROMPT_END = b"> "
 READ_TIMEOUT = 30.0
 
@@ -57,9 +62,17 @@ class ChatChild:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
+            # New session so the child does not receive the server's SIGINT
+            # alongside the orderly shutdown. We deliver /quit to it ourselves.
+            start_new_session=True,
         )
         self.buffer = b""
+        # Two locks. `lock` guards the buffer (held briefly by the reader
+        # thread and the prompt waiter). `request_lock` serializes the entire
+        # send-and-wait handshake across concurrent HTTP requests, so request B
+        # never consumes request A's reply or interleaves stdin bytes.
         self.lock = threading.Lock()
+        self.request_lock = threading.Lock()
         self.reader = threading.Thread(target=self._reader, daemon=True)
         self.reader.start()
         try:
@@ -95,11 +108,15 @@ class ChatChild:
         raise TimeoutError(f"no prompt within {timeout:.0f}s")
 
     def send(self, message):
-        if self.proc.poll() is not None:
-            raise RuntimeError("chat process has exited")
-        self.proc.stdin.write((message + "\n").encode("utf-8"))
-        self.proc.stdin.flush()
-        return self._wait_for_prompt()
+        # Serialize the whole stdin.write + prompt-wait across concurrent
+        # callers. Without this, two threads writing to stdin in quick
+        # succession would race for the same "> "-terminated reply.
+        with self.request_lock:
+            if self.proc.poll() is not None:
+                raise RuntimeError("chat process has exited")
+            self.proc.stdin.write((message + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            return self._wait_for_prompt()
 
     def shutdown(self):
         try:
@@ -267,16 +284,35 @@ def make_handler(child):
 
 def main():
     child = ChatChild(BIN)
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), make_handler(child))
-    url = f"http://localhost:{PORT}/"
-    print(f"CrossEngin web at {url}  (talking to {BIN})", file=sys.stderr)
+    server = http.server.ThreadingHTTPServer((BIND, PORT), make_handler(child))
+    # Reachable hostname for the user (loopback bind is the default).
+    pretty_host = "localhost" if BIND in ("127.0.0.1", "0.0.0.0") else BIND
+    url = f"http://{pretty_host}:{PORT}/"
+    print(f"CrossEngin web at {url}  (talking to {BIN}, bound on {BIND})", file=sys.stderr)
+    if BIND == "0.0.0.0":
+        print("WARNING: bound on 0.0.0.0 -- admin commands are reachable from the LAN.",
+              file=sys.stderr)
     print("Ctrl-C to stop.", file=sys.stderr)
+
+    stop_event = threading.Event()
+
+    def _stop(signum, frame):
+        if not stop_event.is_set():
+            stop_event.set()
+            # Triggers serve_forever's loop to exit. Called from the signal
+            # context; nothing here may block (server.shutdown does block, so
+            # we leave it for the finally block below).
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _stop)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down...", file=sys.stderr)
     finally:
-        server.shutdown()
+        if not stop_event.is_set():
+            server.shutdown()
         server.server_close()
         child.shutdown()
 

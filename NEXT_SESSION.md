@@ -331,9 +331,9 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 86 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence + 1 seed); **1434 assertions**.
+- Total unit suites: 87 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 2 persistence + 1 seed + 1 meta); **1450 assertions**.
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
-- Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 85 CrossEngin suites.
+- Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 87 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
@@ -431,7 +431,7 @@ shaped the implementation and must be respected going forward:
    (`imp_full`) in `_resolve_import_inner`, so `..`/`.` are collapsed before both
    the `already_imported` check and the propagated base_dir. Rebuilt the
    self-hosting compiler (`make bin/nova`), verified self-hosting (stage2 ==
-   stage3) and NOVA's own tests, and confirmed all 85 CrossEngin suites still
+   stage3) and NOVA's own tests, and confirmed all 87 CrossEngin suites still
    pass and the previously-colliding cross-subtree combos now link. This is what
    made the unified `bin/crossengin` daemon possible. The notes below preserve
    the original constraint for historical context.
@@ -511,8 +511,8 @@ pass `NOVA_ROOT` explicitly (or set it in your shell):
 
 ```sh
 # from the CrossEngin repo root, with NOVA built at /home/user/NOVA
-make build      NOVA_ROOT=/home/user/NOVA   # compiles all 85 modules -> OK
-make test       NOVA_ROOT=/home/user/NOVA   # 85/85 unit suites PASS
+make build      NOVA_ROOT=/home/user/NOVA   # compiles all 87 modules -> OK
+make test       NOVA_ROOT=/home/user/NOVA   # 87/87 unit suites PASS
 make benchmark  NOVA_ROOT=/home/user/NOVA   # prints tick-rate + throughput metrics
 make install    NOVA_ROOT=/home/user/NOVA   # builds bin/{crossengin-selfcheck,crossengin-spine,crossengin}
 bash scripts/run.sh                          # (honors $NOVA_ROOT env) prints "substrate self-check: OK"
