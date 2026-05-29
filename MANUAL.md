@@ -16,7 +16,7 @@ and CrossEngin pre-built (the [`.devcontainer/`](./.devcontainer/) handles all
 of that on first creation; takes ~2 minutes). When the terminal opens:
 
 ```sh
-make test                       # 88/88 unit suites
+make test                       # 89/89 unit suites
 make install                    # build the runnable artifacts
 ./bin/crossengin                # the whole agent in one process
 ./scripts/chat.sh               # interactive chat
@@ -92,7 +92,7 @@ Each test compiles and runs as its own program; a test passes iff it exits 0
 and prints no `FAIL` line (case-insensitive). Expected tail:
 
 ```
-  passed: 88   failed: 0   total: 88
+  passed: 89   failed: 0   total: 89
 === all unit tests passed ===
 ```
 

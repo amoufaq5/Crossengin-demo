@@ -17,6 +17,17 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- Phase 11 Tier-1 item #1 -- full SOUL + KGS subsystem blob serialization:
+  **complete**. `snapshot_disk.nova` now round-trips every atom (label, kind,
+  alpha/beta belief, owning KG label) and the full SOUL state (name, purpose,
+  identity, mood valence/arousal, OCEAN, constitution rule list); old-format
+  snapshots still parse but install zero atoms (legacy `kgs.atoms` is treated
+  as a metadata-only hint). The chat's `/load` is now a real rehydrate that
+  replaces SOUL fields in place and merges KGS atoms by label, including the
+  LANG-atom lexical fixture (`ltype = LWORD`, char-vector embedding, sense
+  xrefs to same-labeled concept atoms). Acceptance test passes: after
+  `/teach widget` + `/save`, a re-launched chat with `/load` recognizes
+  `widget` (`perceive(m=1,unk=0)`).
 
 Top-level [`MANUAL.md`](./MANUAL.md) walks through running and testing locally
 end-to-end (build, all three artifacts, the test suite, writing a new test).
@@ -273,6 +284,7 @@ presence flag for the other sections.
 | persistence/snapshot_writer.nova | 0048 | 27 | done |
 | persistence/snapshot_reader.nova | 0048 | 25 | done |
 | persistence/snapshot_disk.nova | 0048 | 31 | done |
+| persistence/snapshot_disk.nova (Phase 11: full SOUL + KGS blob serialize/apply) | 0048 | 72 | done |
 
 Also delivered (runnable artifacts via `make install`):
 - `examples/kernel_selfcheck.nova` -> `bin/crossengin-selfcheck` — the substrate
@@ -349,7 +361,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 88 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 3 persistence + 1 seed + 1 meta); **1481 assertions**.
+- Total unit suites: 89 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 1 meta); **1557 assertions**.
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).

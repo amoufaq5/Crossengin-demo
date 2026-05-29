@@ -11,8 +11,8 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 88 modules compile (`make build`), 88 unit-test suites pass
-> (`make test`, 1481 assertions), three benchmarks report metrics
+> toolchain: 88 modules compile (`make build`), 89 unit-test suites pass
+> (`make test`, 1557 assertions), three benchmarks report metrics
 > (`make benchmark`), and three runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
 > companion spine, and **`bin/crossengin` — the whole agent in one process**
