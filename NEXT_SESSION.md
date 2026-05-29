@@ -17,6 +17,37 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- Phase 13 Tier-2 item #1 -- meta-learning observer: **complete**.
+  New `src/parts/meta/meta_observer.nova` (ADR-0050) is a low-frequency,
+  purely-observational loop: it snapshots per-source atom-belief
+  distributions and reports rolling promotion (tentative -> durable) and
+  atrophy (durable -> sub-threshold or vanished) rates so the operator can
+  tell which sources of evidence are productive. Source tagging is
+  minimum-viable and explicit -- atoms only carry a source if a caller calls
+  `mo_attribute(mo, tag, atom_id)` at creation time; the atom_store data
+  shape is unchanged (the tag table lives entirely in the observer's
+  side-table). The daemon attributes the contiguous seed-installed atom
+  block as `"seed"` at boot and tags freshly-ingested concept atoms from
+  the trigger-drain path as `"user-teach"`; the chat's `_admin_teach` does
+  the same for `/teach`. Idle-tick polling (`mo_poll`, every
+  `MO_POLL_EVERY` ticks, default 10) walks each source's attributed atoms,
+  classifies each against the ADR-0030 mean threshold (>= 750/1000 =
+  durable), accumulates per-source promotion / atrophy counters, and emits
+  a `(meta: source 'X' promotion=N.N% atrophy=N.N%)` line only when either
+  rate has activity (so normal stdout stays quiet). The chat has a new
+  `/meta` admin command that prints the per-source table (`source / atoms /
+  tentative / durable / promotion% / atrophy% / last_poll`). Defer for
+  follow-up: feeding the rates back into `source_authority` (the dangerous
+  up-/down-weight policy). Acceptance:
+  `tests/unit/test_meta_observer.nova` covers empty observer, attribution
+  dedup, the classification on poll (durable/tentative split for belief
+  means 750/250 vs 500/500 vs 100/900), the promotion delta on a
+  tentative-then-promoted atom, the atrophy delta on a durable-then-dropped
+  atom, multi-poll accumulation, the report shape including every tracked
+  source, the milli-percentage formatter, and the refl-kg promotion
+  counter -- 39 assertions across 10 test functions. Sample `/meta` smoke
+  run after `/teach widget` + `/teach gadget`: `seed 572 / 572 tentative /
+  0 durable / 0.0 / 0.0` and `user-teach 2 / 0 / 2 / 100.0 / 0.0`.
 - Phase 14 Tier-2 item #2 -- structural-neighborhood activation: **complete**.
   The reader now has a substrate-native similarity surface for indirect input.
   A new `src/reader/neighborhood.nova` exposes `find_neighbors(kg_reg, handle,
@@ -235,6 +266,7 @@ into one program is the Phase 10 `main` (needs a `nova_packages/` shim).
 | parts/meta/theory_of_mind.nova | 0039, 0044 | 13 | done |
 | parts/meta/long_horizon_goals.nova | 0040 | 9 | done |
 | parts/meta/reflection_loop.nova | 0032, 0023 | 16 | done |
+| parts/meta/meta_observer.nova (Phase 13 Tier-2 #1: per-source promotion/atrophy observer) | 0050 | 39 | done |
 
 README updated to v0.7.
 
@@ -396,7 +428,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 90 (9 substrate + 7 knowledge + 9 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 1 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3); **1579 assertions** (delta = +22 from `test_learn_tag.nova`).
+- Total unit suites: 92 (9 substrate + 7 knowledge + 10 reader/language + 8 memory/learning + 6 self-directed + 20 cognitive + 14 agent + 7 safety/audit + 3 io/effectors + 4 persistence + 1 seed + 2 meta + 1 multi-source-learn `test_learn_tag` added Phase 15 Tier-2 item #3 + 1 meta-observer `test_meta_observer` added Phase 13 Tier-2 item #1 + 1 structural-neighborhood `test_neighborhood_activation` added Phase 14 Tier-2 item #2); **1649 assertions** (delta = +22 from `test_learn_tag.nova`, +39 from `test_meta_observer.nova`, +31 from `test_neighborhood_activation.nova` Phase 14 Tier-2 #2 = +30 new + 1 added to `test_spreading_activation.nova` for the round-trip path).
 - Runnable artifacts: 3 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), and `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 0 (Phase 7+ deliverable).
