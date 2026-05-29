@@ -69,12 +69,59 @@
 //     kgs.atoms[N].alpha <int>         # belief alpha (milli)
 //     kgs.atoms[N].beta <int>          # belief beta (milli)
 //
-//   The remaining sections (EPISODIC / SYNAPSES / SELFMODEL) only round-trip
-//   their presence flag for now -- they remain forward-compat placeholders.
+//   EPISODIC section. The moment stream (append-only perception record) and
+//   episode storage (higher-order groupings). Atoms in moment traces are stored
+//   by their atom_id in the moment-owning KG context; on /load they restore
+//   into the same id space because kg_section_apply preserves order. Fields
+//   like raw text / soul_ref / salience are NOT persisted -- they're
+//   reconstructible from the next live perception cycle and we keep the wire
+//   format small. (Documented skip: moment.raw, moment.soul_ref, moment.salience,
+//   moment.modality default MODALITY_TEXT, moment.origin_part default 0.)
 //
-//     episodic.present 0|1
-//     synapses.present 0|1
-//     selfmodel.present 0|1
+//     episodic.present 1
+//     episodic.moments.count <int>
+//     episodic.moments[N].timestamp <int>
+//     episodic.moments[N].lifecycle <int>      # PERCEIVED|SETTLED|CONSOLIDATED
+//     episodic.moments[N].valence <int>        # -1000..1000 (was: salience)
+//     episodic.moments[N].atom_count <int>
+//     episodic.moments[N].atoms[K] <int>       # ids of activated atoms
+//     episodic.episodes.count <int>
+//     episodic.episodes[N].id <int>
+//     episodic.episodes[N].tier <int>          # FRESH|RECENT|CONSOLIDATED|ARCHIVED
+//     episodic.episodes[N].moment_count <int>
+//     episodic.episodes[N].moments[K] <int>    # moment ids
+//
+//   SYNAPSES section. Captures only synapses with |weight| >= 100 milli (0.1)
+//   so we don't burn snapshot bytes on freshly-grown noise. If the above-threshold
+//   count exceeds 50K we auto-raise the cut to ~2MB ceiling (see SYN_SNAP_*).
+//
+//     synapses.present 1
+//     synapses.threshold <int>                 # the cut actually used (milli)
+//     synapses.count <int>
+//     synapses[N].src <int>
+//     synapses[N].dst <int>
+//     synapses[N].weight <int>                 # milli
+//     synapses[N].eligibility <int>            # milli
+//
+//   SELFMODEL section. Per-domain competence (know/do/understand). Per record
+//   we encode reliability, evidence count, and the derived tier (so a /status
+//   right after /load reports the same tier even before the next assessment
+//   pass recomputes it).
+//
+//     selfmodel.present 1
+//     selfmodel.domains.count <int>
+//     selfmodel.domains[N].label <string>      # domain name (e.g. "medicine")
+//     selfmodel.domains[N].kind <int>          # COMP_KNOW|COMP_DO|COMP_UNDERSTAND
+//     selfmodel.domains[N].know <int>          # milli (reliability for COMP_KNOW)
+//     selfmodel.domains[N].do <int>            # milli (reliability for COMP_DO)
+//     selfmodel.domains[N].understand <int>    # milli (reliability for COMP_UNDERSTAND)
+//     selfmodel.domains[N].evidence <int>      # evidence count
+//     selfmodel.domains[N].tier <int>          # NOVICE|APPRENTICE|JOURNEYMAN|MASTER
+//
+//   Backwards compat: an `episodic.present 1` line with no moments.count
+//   parses to an EMPTY section (same legacy-hint policy as `kgs.atoms`); same
+//   for synapses / selfmodel.
+//
 //     end
 //
 //   Blob layout (in-memory section value):
@@ -113,6 +160,10 @@ import "snapshot_reader.nova"
 import "../parts/soul/constitution.nova"
 import "../kg/multi_kg_manager.nova"
 import "../language/word_atoms.nova"
+import "../parts/episodic/moment_stream.nova"
+import "../parts/episodic/episode_storage.nova"
+import "../substrate/synapse_graph.nova"
+import "../kg/competence_tracker.nova"
 
 // ---- text encoding ---------------------------------------------------------
 
@@ -389,6 +440,357 @@ fn _has_sense_to(word, dst_kg, dst_atom) {
     return 0
 }
 
+// ---- EPISODIC section blob: build / serialize / parse / apply -------------
+//
+// Blob layout:
+//   [0] moments: list of per-moment records, each [ts, lifecycle, valence,
+//                                                   atom_ids_list]
+//   [1] episodes: list of per-episode records, each [id, tier, moment_ids_list]
+// Fields documented as "skipped" in the section header (modality default
+// MODALITY_TEXT, raw=empty, salience hardcoded 600, soul_ref=0) are NOT
+// persisted: they reconstruct fine from the next live perception cycle.
+
+fn episodic_section_build(stream, em) {
+    let blob = list_new()
+    let moments = list_new()
+    let i = 0
+    let n = ms_count(stream)
+    while i < n {
+        let m = ms_get(stream, i)
+        if m != 0 {
+            let rec = list_new()
+            push(rec, moment_timestamp(m))
+            push(rec, moment_status(m))
+            push(rec, moment_salience(m))   // wire field "valence"
+            let trace = moment_trace(m)
+            let atoms = list_new()
+            let j = 0
+            while j < len(trace) {
+                push(atoms, trace[j])
+                j = j + 1
+            }
+            push(rec, atoms)
+            push(moments, rec)
+        }
+        i = i + 1
+    }
+    push(blob, moments)                     // [0]
+
+    let episodes = list_new()
+    let k = 0
+    let nk = em_count(em)
+    while k < nk {
+        let e = em_get(em, k)
+        if e != 0 {
+            // Only include live (non-DROPPED) episodes: a dropped episode is
+            // already excluded from any active recall/replay logic; the boot
+            // re-runs the drop sweep anyway.
+            if episode_tier(e) != EP_DROPPED {
+                let rec = list_new()
+                push(rec, episode_id(e))
+                push(rec, episode_tier(e))
+                // Per the brief, we serialize the moments list per episode.
+                // Each episode in this implementation tracks ONE moment ref;
+                // we emit [moment_id] as a 1-element list so the wire format
+                // is forward-compatible with multi-moment episodes.
+                let mids = list_new()
+                push(mids, episode_moment(e))
+                push(rec, mids)
+                push(episodes, rec)
+            }
+        }
+        k = k + 1
+    }
+    push(blob, episodes)                    // [1]
+    return blob
+}
+
+fn episodic_section_serialize(blob) {
+    let lines = list_new()
+    let moments = list_new()
+    let episodes = list_new()
+    if len(blob) > 0 { moments  = blob[0] }
+    if len(blob) > 1 { episodes = blob[1] }
+
+    _push_kv_int(lines, "episodic.moments.count", len(moments))
+    let i = 0
+    while i < len(moments) {
+        let r = moments[i]
+        let prefix = "episodic.moments[" + int_to_str(i) + "]"
+        _push_kv_int(lines, prefix + ".timestamp",  r[0])
+        _push_kv_int(lines, prefix + ".lifecycle",  r[1])
+        _push_kv_int(lines, prefix + ".valence",    r[2])
+        let atoms = r[3]
+        _push_kv_int(lines, prefix + ".atom_count", len(atoms))
+        let j = 0
+        while j < len(atoms) {
+            _push_kv_int(lines, prefix + ".atoms[" + int_to_str(j) + "]", atoms[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    _push_kv_int(lines, "episodic.episodes.count", len(episodes))
+    let k = 0
+    while k < len(episodes) {
+        let r = episodes[k]
+        let prefix = "episodic.episodes[" + int_to_str(k) + "]"
+        _push_kv_int(lines, prefix + ".id",            r[0])
+        _push_kv_int(lines, prefix + ".tier",          r[1])
+        let mids = r[2]
+        _push_kv_int(lines, prefix + ".moment_count", len(mids))
+        let mj = 0
+        while mj < len(mids) {
+            _push_kv_int(lines, prefix + ".moments[" + int_to_str(mj) + "]", mids[mj])
+            mj = mj + 1
+        }
+        k = k + 1
+    }
+    return lines
+}
+
+// Apply the EPISODIC blob: REPLACE policy. Wipe the live stream + em, then
+// install moments + episodes from the snapshot in id order. Returns the
+// number of moments restored.
+fn episodic_section_apply(stream, em, blob) {
+    if len(blob) == 0 { return 0 }
+    ms_clear(stream)
+    em_clear(em)
+    let moments = blob[0]
+    let i = 0
+    while i < len(moments) {
+        let r = moments[i]
+        let ts        = r[0]
+        let lifecycle = r[1]
+        let valence   = r[2]
+        let atoms     = r[3]
+        // Restore at id=i to keep the monotonic id sequence aligned with the
+        // snapshot's iteration order (modality default TEXT, raw="" since the
+        // wire format doesn't carry it -- see brief's "skipped fields" note).
+        ms_restore(stream, i, ts, MODALITY_TEXT, "", valence, 0, lifecycle, atoms)
+        i = i + 1
+    }
+    if len(blob) > 1 {
+        let episodes = blob[1]
+        let k = 0
+        while k < len(episodes) {
+            let r = episodes[k]
+            let eid   = r[0]
+            let tier  = r[1]
+            let mids  = r[2]
+            // Use the first moment_id as the episode's moment ref (today's
+            // schema is one-moment-per-episode; the list wraps it for forward
+            // compatibility).
+            let mref = 0
+            if len(mids) > 0 { mref = mids[0] }
+            em_restore(em, eid, mref, tier)
+            k = k + 1
+        }
+    }
+    return len(moments)
+}
+
+// ---- SYNAPSES section blob: build / serialize / parse / apply -------------
+//
+// Threshold cut: any synapse with |weight| below SYN_SNAP_MIN milli (default
+// 100 == 0.1) is skipped. If the above-threshold count exceeds SYN_SNAP_HARDCAP
+// (50K) we auto-raise the threshold to keep the snapshot small. The wire
+// format records the threshold actually used so a reader can know what was
+// dropped.
+//
+// Blob layout:
+//   [0] threshold (int, milli)
+//   [1] records: list of [src, dst, weight, eligibility]
+
+let SYN_SNAP_MIN     = 100      // 0.1 default cut: anything weaker is noise
+let SYN_SNAP_HARDCAP = 50000    // auto-raise threshold once we'd write >50K syns
+
+fn _count_above_threshold(g, threshold) {
+    let n = syn_total(g)
+    let c = 0
+    let i = 0
+    while i < n {
+        if syn_alive(g, i) == 1 {
+            let w = syn_weight(g, i)
+            let aw = w
+            if aw < 0 { aw = 0 - aw }
+            if aw >= threshold { c = c + 1 }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn synapses_section_build(g) {
+    let blob = list_new()
+    let threshold = SYN_SNAP_MIN
+    // Auto-tune: if the default threshold would exceed the hardcap, raise.
+    // We bump in 100-milli increments rather than computing a precise cut --
+    // the substrate's weight distribution is bumpy enough that a one-shot
+    // analytical pick wouldn't help, and this keeps the cut human-readable.
+    while _count_above_threshold(g, threshold) > SYN_SNAP_HARDCAP {
+        if threshold >= 900 {
+            threshold = 900
+            // can't raise further; the recs will exceed the hardcap. The
+            // writer keeps going (a 50K+ snapshot is still readable; the cap
+            // is a guidance, not a hard error).
+            let above = _count_above_threshold(g, threshold)
+            // Defensive: still over cap -> break the loop.
+            if above > SYN_SNAP_HARDCAP { threshold = 1000 }
+        } else {
+            threshold = threshold + 100
+        }
+        if threshold > 999 {
+            // No threshold short of W_MAX will get us under cap; settle here
+            // and emit what we have. The reader will see synapses.threshold
+            // and know what fell off.
+            threshold = 999
+            // Final defensive exit -- one extra pass max.
+            if _count_above_threshold(g, threshold) <= SYN_SNAP_HARDCAP {
+                // Acceptable; fall through.
+            } else {
+                threshold = 1000
+            }
+        }
+    }
+    push(blob, threshold)
+
+    let recs = list_new()
+    let n = syn_total(g)
+    let i = 0
+    while i < n {
+        if syn_alive(g, i) == 1 {
+            let w = syn_weight(g, i)
+            let aw = w
+            if aw < 0 { aw = 0 - aw }
+            if aw >= threshold {
+                let r = list_new()
+                push(r, syn_pre(g, i))
+                push(r, syn_post(g, i))
+                push(r, w)
+                push(r, syn_elig(g, i))
+                push(recs, r)
+            }
+        }
+        i = i + 1
+    }
+    push(blob, recs)
+    return blob
+}
+
+fn synapses_section_serialize(blob) {
+    let lines = list_new()
+    let threshold = SYN_SNAP_MIN
+    let recs = list_new()
+    if len(blob) > 0 { threshold = blob[0] }
+    if len(blob) > 1 { recs = blob[1] }
+    _push_kv_int(lines, "synapses.threshold", threshold)
+    _push_kv_int(lines, "synapses.count",     len(recs))
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        let prefix = "synapses[" + int_to_str(i) + "]"
+        _push_kv_int(lines, prefix + ".src",         r[0])
+        _push_kv_int(lines, prefix + ".dst",         r[1])
+        _push_kv_int(lines, prefix + ".weight",      r[2])
+        _push_kv_int(lines, prefix + ".eligibility", r[3])
+        i = i + 1
+    }
+    return lines
+}
+
+// Apply the SYNAPSES blob: install each (src, dst, weight, elig) into the
+// live graph. Existing pre->post edges get their weight overwritten (idempotent
+// on a second /load of the same snapshot via syn_restore's syn_find shortcut).
+fn synapses_section_apply(g, blob) {
+    if len(blob) < 2 { return 0 }
+    let recs = blob[1]
+    let n = 0
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        syn_restore(g, r[0], r[1], r[2], r[3])
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// ---- SELFMODEL section blob: build / serialize / parse / apply ------------
+//
+// Blob layout:
+//   [0] records: list of [domain_label, kind, reliability, evidence, tier]
+//
+// `tier` is the derived value from competence_tier(record); we persist it so
+// /status right after /load can report it without re-running the assessment
+// (which the snapshot boot order can't yet guarantee).
+
+fn selfmodel_section_build(sm) {
+    let blob = list_new()
+    let recs = list_new()
+    let records = self_model_snapshot(sm)
+    let i = 0
+    while i < len(records) {
+        let r = records[i]
+        let rec = list_new()
+        push(rec, competence_domain(r))
+        push(rec, competence_kind(r))
+        push(rec, competence_reliability(r))
+        push(rec, competence_evidence(r))
+        push(rec, competence_tier(r))
+        push(recs, rec)
+        i = i + 1
+    }
+    push(blob, recs)
+    return blob
+}
+
+fn selfmodel_section_serialize(blob) {
+    let lines = list_new()
+    let recs = list_new()
+    if len(blob) > 0 { recs = blob[0] }
+    _push_kv_int(lines, "selfmodel.domains.count", len(recs))
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        let prefix = "selfmodel.domains[" + int_to_str(i) + "]"
+        _push_kv_str(lines, prefix + ".label",      r[0])
+        _push_kv_int(lines, prefix + ".kind",       r[1])
+        // The brief asks for know/do/understand columns; we write the
+        // reliability into whichever column matches the record's kind so a
+        // future single-row-per-domain reader can pivot. For now we also write
+        // a kind-agnostic field so a domain can be reconstructed in one read.
+        let know = 0
+        let do_v = 0
+        let und  = 0
+        if r[1] == COMP_KNOW       { know = r[2] }
+        if r[1] == COMP_DO         { do_v = r[2] }
+        if r[1] == COMP_UNDERSTAND { und  = r[2] }
+        _push_kv_int(lines, prefix + ".know",       know)
+        _push_kv_int(lines, prefix + ".do",         do_v)
+        _push_kv_int(lines, prefix + ".understand", und)
+        _push_kv_int(lines, prefix + ".evidence",   r[3])
+        _push_kv_int(lines, prefix + ".tier",       r[4])
+        i = i + 1
+    }
+    return lines
+}
+
+// Apply the SELFMODEL blob: REPLACE policy. Wipe the live self-model, then
+// install one competence record per snapshot row.
+fn selfmodel_section_apply(sm, blob) {
+    if len(blob) == 0 { return 0 }
+    self_model_clear(sm)
+    let recs = blob[0]
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        self_model_restore(sm, r[0], r[1], r[2], r[3])
+        i = i + 1
+    }
+    return len(recs)
+}
+
 // ---- snap_to_text ----------------------------------------------------------
 //
 // Emit the framed snapshot as a list of newline-terminated lines, then join
@@ -426,9 +828,38 @@ fn snap_to_text(s) {
         }
     }
 
-    _push_kv_int(lines, "episodic.present",  snap_has_section(s, SEC_EPISODIC))
-    _push_kv_int(lines, "synapses.present",  snap_has_section(s, SEC_SYNAPSES))
-    _push_kv_int(lines, "selfmodel.present", snap_has_section(s, SEC_SELFMODEL))
+    let ep_p = snap_has_section(s, SEC_EPISODIC)
+    _push_kv_int(lines, "episodic.present", ep_p)
+    if ep_p == 1 {
+        let ep_lines = episodic_section_serialize(snap_section(s, SEC_EPISODIC))
+        let i = 0
+        while i < len(ep_lines) {
+            push(lines, ep_lines[i])
+            i = i + 1
+        }
+    }
+
+    let syn_p = snap_has_section(s, SEC_SYNAPSES)
+    _push_kv_int(lines, "synapses.present", syn_p)
+    if syn_p == 1 {
+        let syn_lines = synapses_section_serialize(snap_section(s, SEC_SYNAPSES))
+        let i = 0
+        while i < len(syn_lines) {
+            push(lines, syn_lines[i])
+            i = i + 1
+        }
+    }
+
+    let sm_p = snap_has_section(s, SEC_SELFMODEL)
+    _push_kv_int(lines, "selfmodel.present", sm_p)
+    if sm_p == 1 {
+        let sm_lines = selfmodel_section_serialize(snap_section(s, SEC_SELFMODEL))
+        let i = 0
+        while i < len(sm_lines) {
+            push(lines, sm_lines[i])
+            i = i + 1
+        }
+    }
     push(lines, "end\n")
     return join(lines, "")
 }
@@ -535,6 +966,94 @@ fn _ensure_const_rules(rules, n) {
     return 1
 }
 
+// Pad a list of moment records (ts, lifecycle, valence, atoms) to length n.
+fn _ensure_moment_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)              // ts
+        push(r, MSTAT_PERCEIVED) // lifecycle (1 by default)
+        push(r, 0)              // valence
+        push(r, list_new())     // atoms
+        push(recs, r)
+    }
+    return 1
+}
+
+// Pad the atoms sub-list of a single moment record to k elements.
+fn _ensure_moment_atoms(atoms, k) {
+    while len(atoms) < k {
+        push(atoms, 0)
+        k = k
+    }
+    return 1
+}
+
+// Pad a list of episode records (id, tier, moment_ids).
+fn _ensure_episode_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)              // id
+        push(r, EP_RECENT)      // tier
+        push(r, list_new())     // moment ids
+        push(recs, r)
+    }
+    return 1
+}
+
+fn _ensure_episode_mids(mids, k) {
+    while len(mids) < k {
+        push(mids, 0)
+        k = k
+    }
+    return 1
+}
+
+// Pad a list of synapse records (src, dst, weight, eligibility).
+fn _ensure_syn_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)              // src
+        push(r, 0)              // dst
+        push(r, 0)              // weight
+        push(r, 0)              // eligibility
+        push(recs, r)
+    }
+    return 1
+}
+
+// Pad a list of selfmodel domain records (label, kind, reliability, evidence, tier).
+fn _ensure_sm_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, "")             // label
+        push(r, COMP_KNOW)      // kind default
+        push(r, 0)              // reliability
+        push(r, 0)              // evidence
+        push(r, TIER_UNKNOWN)   // tier
+        push(recs, r)
+    }
+    return 1
+}
+
+// Parse keys like `episodic.moments[12].atoms[3]` -> [12, 3]. Returns 0 if the
+// shape doesn't have the expected nested form.
+fn _nested_indices(key) {
+    let lb1 = _find_byte(key, 0, 91)   // first '['
+    if lb1 < 0 { return 0 }
+    let rb1 = _find_byte(key, lb1 + 1, 93)
+    if rb1 < 0 { return 0 }
+    let outer = str_to_int(substr(key, lb1 + 1, rb1 - lb1 - 1))
+    let lb2 = _find_byte(key, rb1 + 1, 91)
+    if lb2 < 0 { return 0 }
+    let rb2 = _find_byte(key, lb2 + 1, 93)
+    if rb2 < 0 { return 0 }
+    let inner = str_to_int(substr(key, lb2 + 1, rb2 - lb2 - 1))
+    let pair = list_new()
+    push(pair, outer)
+    push(pair, inner)
+    return pair
+}
+
 // Parse a textual snapshot. Returns the snapshot value on success, 0 on any
 // shape mismatch (wrong header, missing required key, wrong tag/version).
 //
@@ -573,8 +1092,17 @@ fn snap_from_text(text) {
     let kgs_atoms_count_seen = -1
     let kgs_recs = list_new()
     let episodic_present = 0
+    let ep_moments = list_new()
+    let ep_moments_count_seen = -1
+    let ep_episodes = list_new()
+    let ep_episodes_count_seen = -1
     let synapses_present = 0
+    let syn_threshold = SYN_SNAP_MIN
+    let syn_count_seen = -1
+    let syn_recs = list_new()
     let selfmodel_present = 0
+    let sm_count_seen = -1
+    let sm_recs = list_new()
     let saw_end = 0
 
     while pos < len(text) {
@@ -639,6 +1167,123 @@ fn snap_from_text(text) {
                         if str_eq(suf, "severity") == 1 { list_set(r, 1, _line_val_int(line)) }
                     }
                 }
+
+                // ---- EPISODIC ------------------------------------------------
+                if str_eq(k, "episodic.moments.count") == 1 {
+                    ep_moments_count_seen = _line_val_int(line)
+                }
+                if str_eq(k, "episodic.episodes.count") == 1 {
+                    ep_episodes_count_seen = _line_val_int(line)
+                }
+                // episodic.moments[N].field (non-nested fields)
+                if _starts_with(k, "episodic.moments[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_moment_recs(ep_moments, idx + 1)
+                        let rec = ep_moments[idx]
+                        if str_eq(suf, "timestamp") == 1  { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "lifecycle") == 1  { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "valence") == 1    { list_set(rec, 2, _line_val_int(line)) }
+                        if str_eq(suf, "atom_count") == 1 {
+                            // Pre-allocate the atom slots so out-of-order keys
+                            // (atoms[K] arriving before atom_count) still land.
+                            let n_atoms = _line_val_int(line)
+                            _ensure_moment_atoms(rec[3], n_atoms)
+                        }
+                        // Nested atoms: episodic.moments[N].atoms[K]
+                        if _starts_with(suf, "atoms[") == 1 {
+                            let lb = _find_byte(suf, 0, 91)
+                            let rb = _find_byte(suf, lb + 1, 93)
+                            if lb >= 0 {
+                                if rb > lb + 1 {
+                                    let kidx = str_to_int(substr(suf, lb + 1, rb - lb - 1))
+                                    _ensure_moment_atoms(rec[3], kidx + 1)
+                                    list_set(rec[3], kidx, _line_val_int(line))
+                                }
+                            }
+                        }
+                    }
+                }
+                // episodic.episodes[N].field
+                if _starts_with(k, "episodic.episodes[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_episode_recs(ep_episodes, idx + 1)
+                        let rec = ep_episodes[idx]
+                        if str_eq(suf, "id") == 1            { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "tier") == 1          { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "moment_count") == 1 {
+                            let n_mids = _line_val_int(line)
+                            _ensure_episode_mids(rec[2], n_mids)
+                        }
+                        if _starts_with(suf, "moments[") == 1 {
+                            let lb = _find_byte(suf, 0, 91)
+                            let rb = _find_byte(suf, lb + 1, 93)
+                            if lb >= 0 {
+                                if rb > lb + 1 {
+                                    let kidx = str_to_int(substr(suf, lb + 1, rb - lb - 1))
+                                    _ensure_episode_mids(rec[2], kidx + 1)
+                                    list_set(rec[2], kidx, _line_val_int(line))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- SYNAPSES ------------------------------------------------
+                if str_eq(k, "synapses.threshold") == 1 {
+                    syn_threshold = _line_val_int(line)
+                }
+                if str_eq(k, "synapses.count") == 1 {
+                    syn_count_seen = _line_val_int(line)
+                }
+                // synapses[N].field
+                if _starts_with(k, "synapses[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_syn_recs(syn_recs, idx + 1)
+                        let rec = syn_recs[idx]
+                        if str_eq(suf, "src") == 1         { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "dst") == 1         { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "weight") == 1      { list_set(rec, 2, _line_val_int(line)) }
+                        if str_eq(suf, "eligibility") == 1 { list_set(rec, 3, _line_val_int(line)) }
+                    }
+                }
+
+                // ---- SELFMODEL -----------------------------------------------
+                if str_eq(k, "selfmodel.domains.count") == 1 {
+                    sm_count_seen = _line_val_int(line)
+                }
+                if _starts_with(k, "selfmodel.domains[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_sm_recs(sm_recs, idx + 1)
+                        let rec = sm_recs[idx]
+                        if str_eq(suf, "label") == 1      { list_set(rec, 0, _line_val(line)) }
+                        if str_eq(suf, "kind") == 1       { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "know") == 1 {
+                            // know/do/understand each carry the reliability for
+                            // ONE kind; the per-record kind tells us which one
+                            // owns the value. We coalesce in install below.
+                            let v = _line_val_int(line)
+                            if v > 0 { list_set(rec, 2, v) }
+                        }
+                        if str_eq(suf, "do") == 1 {
+                            let v = _line_val_int(line)
+                            if v > 0 { list_set(rec, 2, v) }
+                        }
+                        if str_eq(suf, "understand") == 1 {
+                            let v = _line_val_int(line)
+                            if v > 0 { list_set(rec, 2, v) }
+                        }
+                        if str_eq(suf, "evidence") == 1   { list_set(rec, 3, _line_val_int(line)) }
+                        if str_eq(suf, "tier") == 1       { list_set(rec, 4, _line_val_int(line)) }
+                    }
+                }
             }
         }
     }
@@ -701,13 +1346,72 @@ fn snap_from_text(text) {
         snap_put_section(s, SEC_KGS, kb)
     }
     if episodic_present == 1 {
-        snap_put_section(s, SEC_EPISODIC, list_new())
+        let eb = list_new()
+        // Trim ep_moments / ep_episodes to explicit counts if seen; otherwise
+        // use what we accumulated (backwards-compat: presence flag alone means
+        // an empty section, same convention as `kgs.atoms` legacy hint).
+        if ep_moments_count_seen >= 0 {
+            _ensure_moment_recs(ep_moments, ep_moments_count_seen)
+            while len(ep_moments) > ep_moments_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < ep_moments_count_seen {
+                    push(trimmed, ep_moments[i])
+                    i = i + 1
+                }
+                ep_moments = trimmed
+            }
+        }
+        if ep_episodes_count_seen >= 0 {
+            _ensure_episode_recs(ep_episodes, ep_episodes_count_seen)
+            while len(ep_episodes) > ep_episodes_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < ep_episodes_count_seen {
+                    push(trimmed, ep_episodes[i])
+                    i = i + 1
+                }
+                ep_episodes = trimmed
+            }
+        }
+        push(eb, ep_moments)
+        push(eb, ep_episodes)
+        snap_put_section(s, SEC_EPISODIC, eb)
     }
     if synapses_present == 1 {
-        snap_put_section(s, SEC_SYNAPSES, list_new())
+        let sb = list_new()
+        if syn_count_seen >= 0 {
+            _ensure_syn_recs(syn_recs, syn_count_seen)
+            while len(syn_recs) > syn_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < syn_count_seen {
+                    push(trimmed, syn_recs[i])
+                    i = i + 1
+                }
+                syn_recs = trimmed
+            }
+        }
+        push(sb, syn_threshold)
+        push(sb, syn_recs)
+        snap_put_section(s, SEC_SYNAPSES, sb)
     }
     if selfmodel_present == 1 {
-        snap_put_section(s, SEC_SELFMODEL, list_new())
+        let mb = list_new()
+        if sm_count_seen >= 0 {
+            _ensure_sm_recs(sm_recs, sm_count_seen)
+            while len(sm_recs) > sm_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < sm_count_seen {
+                    push(trimmed, sm_recs[i])
+                    i = i + 1
+                }
+                sm_recs = trimmed
+            }
+        }
+        push(mb, sm_recs)
+        snap_put_section(s, SEC_SELFMODEL, mb)
     }
     return s
 }

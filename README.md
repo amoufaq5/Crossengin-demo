@@ -19,13 +19,12 @@ computational units rather than orchestrating a pipeline of modules.
 > P0.7 decision-log durable path,
 > +3 suites / +132 assertions from `test_snapshot_{episodic,synapses,
 > selfmodel}.nova` added in P0.1 full-state persistence),
-> 19 end-to-end integration
+> 16 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
-> P0.7 dlog durability across SIGKILL, +2 from
+> P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
+> added in P0.1 full-state persistence across SIGKILL, +2 from
 > `scenario_h_session_switch.sh` + `scenario_i_web_isolation.sh` added in
-> P0.8 chat /switch + web.py per-cookie routing,
-> +1 from `scenario_a2_full_state.sh` added in P0.1
-> full-state durability across SIGKILL),
+> P0.8 chat /switch + web.py per-cookie routing),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
