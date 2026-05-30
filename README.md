@@ -244,6 +244,18 @@ The Phase 9 IO and effectors layer (`src/io/`):
 - **input_transducer** (`io/transducers/`) — modality → reader-ready normalized
   percept (ADR-0011/0012, ADR-0021); strictly outside cognition (ADR-0014).
   Text/file are normalized now; audio (STT) is the honest deferred bridge seam.
+- **audio_synth / audio_speak** (`io/effectors/`) — the audio modality bridge
+  (Phase 19 Tier-4 #1; P2.6 multi-formant upgrade). `audio_synth.nova` is the
+  always-on Mode-1 floor: a pure-NOVA Klatt-style two-formant phoneme
+  synthesizer (13 vowels with F1+F2+F3, 6 plosives as silence+burst, 7
+  fricatives via a small-multiplier LCG pseudo-noise, 3 nasals with damping,
+  4 liquids, 33 phonemes total + a 440 Hz unknown fallback), 5 ms attack +
+  10 ms release anti-click ADSR per phoneme, and a 44-byte RIFF/WAVE/PCM
+  writer (8 kHz, 16-bit, mono) durable via `sys_fsync` before close. The
+  legacy single-carrier sine synth lives on as `synth_phoneme_sine` and is
+  selectable at runtime via `CE_SYNTH_MODE=sine`; `CE_SYNTH_MODE=silence`
+  emits zero samples for CI. `audio_speak.nova` layers Mode-2 espeak
+  escalation and Mode-3 aplay/paplay best-effort playback on top.
 
 The Phase 10 persistence layer (`src/persistence/`):
 

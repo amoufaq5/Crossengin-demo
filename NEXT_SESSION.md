@@ -106,6 +106,97 @@ continue. It is updated at every session boundary.
   Sample stats output (verified): `(compacted: 99 dead atoms dropped, 0
   archived episodes dropped, 0 old moments dropped, 0 synapses below new
   threshold dropped; snapshot 184KB -> 168KB)`.
+- P2.6 multi-formant Klatt phoneme synthesizer: **complete**.
+  The original P19 audio bridge shipped a pure-NOVA single-carrier sine
+  synth -- audibly a sequence of phonemes but comically robotic. P2.6
+  replaces the Mode-1 carrier with a simplified-Klatt two-formant model
+  while keeping every wire-format invariant intact: still 8 kHz, still
+  16-bit PCM mono, still 150 ms (1200 samples) per phoneme, still the
+  same `audio_write_wav` byte layout. The old sine-only path lives on
+  as `synth_phoneme_sine` (legacy / A-B test target) and is selectable
+  via `CE_SYNTH_MODE=sine` at runtime.
+  New entry points in `src/io/effectors/audio_synth.nova`:
+  - `phoneme_formants(label)` -> [F1, F2, F3, kind] -- hard-coded
+    formant table covering 13 vowels (a/ah/e/eh/i/iy/ih/o/oh/ow/u/uw/ae)
+    with full F1+F2+F3 from Hillenbrand 1995, 6 plosives (p/t/k/b/d/g)
+    with a high-F2 carrier hint for the burst, 7 fricatives
+    (s/z/f/v/sh/th/h) with carrier hints, 3 nasals (n/m/ng), 4 liquids
+    (l/r/w/y) treated as low-F1 vowels, and an unknown -> 440 Hz fallback.
+    `kind` in {UNKNOWN=0, VOWEL=1, PLOSIVE=2, FRICATIVE=3, NASAL=4}.
+  - `synth_phoneme_klatt(phoneme_label)` -- the new default per-phoneme
+    synthesizer. Dispatches on `kind`:
+    * VOWEL: two cosine carriers F1+F2 at half-amplitude each, summed
+      so the peak stays at AUDIO_AMPLITUDE (well under PCM16 clip).
+    * PLOSIVE: 5 ms leading silence + 30 ms LCG noise burst modulated by
+      the high-F2 carrier hint + trailing silence to fill the 150 ms
+      phoneme slot.
+    * FRICATIVE: 120 ms of LCG pseudo-noise at half-amplitude (white
+      noise sounds like a fricative when summed at moderate amplitude;
+      full Klatt would high-pass filter it).
+    * NASAL: single low formant (~250-500 Hz) with a linear amplitude
+      damping (1000 -> 500 milli over the buffer) producing the muffled,
+      fading quality of a nasal consonant.
+    * UNKNOWN: the legacy 440 Hz sine fallback.
+  - `_envelope(samples, attack_ms, hold_ms, release_ms, sample_rate)`
+    (public wrapper `audio_envelope`) -- anti-click ADSR: 5 ms attack +
+    sustain + 10 ms release per phoneme by default. Click-free at
+    phoneme boundaries.
+  - `_lcg_next(amp)` (public `audio_lcg_next`) + `_lcg_reset` (public
+    `audio_lcg_reset`) -- pseudo-noise via a small-multiplier LCG
+    (`state = state * 31 + 7`, masked to 20 bits to stay under NOVA's
+    codegen pointer threshold blocker #11). Deterministic seed (12345)
+    so the same input always produces the same noise bytes.
+  - `audio_synth_mode()` / `audio_synth_mode_reset()` -- resolves the
+    `CE_SYNTH_MODE` env once per process (cached). Values: `klatt`
+    (default), `sine` (pre-P2.6 legacy), `silence` (1200 zero samples
+    per phoneme -- useful in CI to suppress audible noise but keep the
+    WAV path valid).
+  `synth_phoneme(label)` now dispatches through the mode resolver,
+  so a single env flag flips the whole audio output without disturbing
+  `synth_text`, `audio_write_wav`, or any downstream caller (the brief's
+  "transparent behavior swap"). `audio_speak.nova` is documentation-only:
+  the CE_SYNTH_MODE selector lives in audio_synth.nova; audio_speak's
+  Mode-1 leg delegates unchanged.
+  Phoneme set covered: 33 distinct labels -- 13 vowels (a, ah, e, eh, i,
+  iy, ih, o, oh, ow, u, uw, ae), 6 plosives (p, t, k, b, d, g), 7
+  fricatives (s, z, f, v, sh, th, h), 3 nasals (n, m, ng), 4
+  liquids/glides (l, r, w, y). Anything else falls through to the
+  440 Hz unknown placeholder.
+  Acceptance: `tests/unit/test_audio_synth.nova` extended with 47 new
+  assertions across 14 new test functions (99 total, up from 52),
+  covering: formant-table return shape + correct kind dispatch for
+  vowel/plosive/fricative/nasal/unknown; vowel "a" peak-to-peak > 5000,
+  sustain RMS proxy > 2000, max < 32000 (no clipping); fricative "s"
+  has higher zero-crossing rate than vowel "a" (>= 1.5x); plosive "p"
+  has zero RMS in first 5 ms, burst peak > 1000 in next 30 ms, zero
+  RMS in trailing region; anti-click attack: max-abs in samples [0..20]
+  < max-abs in samples [20..40] (envelope ramp); anti-click release:
+  symmetric pattern at the buffer tail; first/last sample exactly 0;
+  `audio_envelope` applied directly to a flat 16000-buffer yields the
+  expected ADSR shape (sample 20 in [7000..9000], sample 600 == 16000,
+  ends at 0); LCG determinism: reset + 3 draws == another reset + 3
+  draws bit-identical; LCG bounded in [-16000..+16000] with > 10000
+  range; klatt vs sine sample-wise differ on > 50/100 of first samples;
+  default mode resolves to klatt when CE_SYNTH_MODE is unset; nasal
+  has higher max-abs in the first quarter than the last quarter
+  (damping); the on-disk WAV size for a short sentence is exactly
+  44 + n*2 bytes (= 12000 samples + 44 header for "hello world this
+  is a test"). Verified end-to-end:
+  - `make build` -> all 107 modules compile.
+  - `make test` -> 114 unit-test files pass; audio_synth.nova alone
+    reports `audio_synth: OK (99 checks)` (up from 52, +47).
+  - `make install && rm -f /tmp/ce_speech.wav && printf '/speak hello
+    world\n/quit\n' | ./bin/crossengin-chat` -> still prints
+    `(spoke 'hello world' [synth-only]; wrote /tmp/ce_speech.wav)`.
+  - `ls -la /tmp/ce_speech.wav` -> 24044 bytes (= 44 header + 12000 *
+    2 PCM bytes; "hello world" is 10 chars in the cold-seed fallback
+    path, 10 character-phonemes * 1200 samples each).
+  - `file /tmp/ce_speech.wav` -> "RIFF (little-endian) data, WAVE
+    audio, Microsoft PCM, 16 bit, mono 8000 Hz" (unchanged shape).
+  - Sample quality sentence "hello world this is a test of the formant
+    synthesizer" yields a 105644-byte WAV (= 44 + 52800 * 2; 44 chars
+    -> 44 syllables in fallback) -- valid Microsoft PCM 16-bit mono
+    8 kHz at /tmp/ce_quality_test.wav.
 - P2.8 streaming event sources (stdin + Unix socket + HTTP webhook): **complete**
   for stdin; framework-only for the other two.
   Three new transducers under `src/io/transducers/` lift the daemon from a
@@ -1110,7 +1201,7 @@ is standalone.
 |--------|------|--------------|--------|
 | io/effectors/output_generation.nova | 0013, 0015, 0007 | 10 | done |
 | io/effectors/effector_gate.nova | 0041..0045, 0043, 0013 | 23 | done |
-| io/effectors/audio_synth.nova (Phase 19 Tier-4 #1: audio modality bridge -- WAV + sine + phoneme synth) | 0014, 0015, 0013 | 52 | done |
+| io/effectors/audio_synth.nova (Phase 19 Tier-4 #1: audio modality bridge -- WAV + Klatt two-formant phoneme synth; P2.6 upgrade) | 0014, 0015, 0013 | 99 | done |
 | io/effectors/audio_speak.nova (Phase 19 Tier-4 #1: audio modality bridge -- espeak/aplay escalation) | 0014 | 0 | done |
 | io/transducers/input_transducer.nova | 0014, 0011, 0012, 0021 | 19 | done |
 | io/transducers/kg_sync.nova (Phase 20 Tier-4 #2: distributed-substrate seam; P1.3 v2 upgrade -- N-subs + bidir + reconnect + auth + conflict) | 0014, 0016 | 169 | done |
