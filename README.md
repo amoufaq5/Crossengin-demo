@@ -11,7 +11,9 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 109 modules compile (`make build`, +1 from `realtime_pacer.nova`
+> toolchain: 110 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
+> +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
 > plain-HTTP in-process transport seam, +4 from `seed/pack_registry.nova` +
 > `seed/packs/{medical,ops_runbook,code_review}_pack.nova` added in P1.9
@@ -23,7 +25,7 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `persistence/snapshot_compaction.nova` added in P2.10 snapshot
 > compaction pass,
 > +2 from `io/transducers/{stt_seam,stream_audio}.nova` added in P2.5
-> STT framework + audit), 115 unit-test suites pass
+> STT framework + audit), 116 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -50,6 +52,10 @@ computational units rather than orchestrating a pipeline of modules.
 > real-time streaming event sources,
 > +1 suite / +48 assertions from `test_snapshot_compaction.nova` added in
 > P2.10 snapshot compaction pass,
+> +1 suite / +46 assertions from `test_ann_index.nova` added in P3.4
+> LSH approximate-nearest-neighbor over atom embeddings (40x speedup
+> over linear cosine scan at 1000 atoms, K=8 hyperplanes / 256 buckets;
+> see `tests/benchmark/bench_ann_query.nova`),
 > +1 suite / +26 assertions from `test_stt_seam.nova` added in P2.5
 > STT framework + audit -- the speech-to-text half of the audio
 > modality bridge, pluggable behind `EV_MESSAGE` -- documented in

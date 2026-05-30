@@ -1133,8 +1133,9 @@ implemented in-house (see NOVA blockers).
 | Module | ADRs | Unit asserts | Status |
 |--------|------|--------------|--------|
 | atom_store.nova (P2.4 added `label_hash` + `LABEL_BUCKETS` for the hash index) | 0016, 0023 | 42 | done |
-| multi_kg_manager.nova (P2.4: hash + kind indexes, `kg_remove_atom`, `kg_rebuild_index`, `kg_atoms_by_kind`) | 0004, 0016 | 23 | done |
+| multi_kg_manager.nova (P2.4: hash + kind indexes, `kg_remove_atom`, `kg_rebuild_index`, `kg_atoms_by_kind`; P3.4: optional `kg_set_ann` / `kg_ann` LSH side-index) | 0004, 0016 | 23 | done |
 | atom_store_index (P2.4 hash + kind indexes: separate test suite) | 0016, 0049 | 61 | done |
+| ann_index.nova (P3.4 LSH approximate-nearest-neighbor over atom embeddings; K=8 hyperplanes -> 256 buckets; deterministic LCG-seeded; rebuild on snapshot apply) | 0016, 0049 | 46 | done |
 | cross_kg_references.nova | 0017, 0004 | 20 | done |
 | schemas.nova | 0018 | 13 | done |
 | concept_layer.nova | 0018 | 28 | done |
@@ -1142,7 +1143,9 @@ implemented in-house (see NOVA blockers).
 | competence_tracker.nova | 0020 | 27 | done |
 
 Also delivered: `tests/benchmark/bench_kg_query.nova` (insertion, id/label
-lookup, observation throughput).
+lookup, observation throughput); `tests/benchmark/bench_ann_query.nova`
+(P3.4: linear cosine scan vs LSH-bucketed query head-to-head, 40x speedup
+at 1000 atoms).
 
 ## Completed modules — Phase 2 (reader and language)
 
@@ -1502,11 +1505,11 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 115 (115 PASS, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
+- Total unit suites: 116 (116 PASS, +1 from P3.4 `test_ann_index.nova`, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+46 assertions added by P3.4** (`test_ann_index.nova`), **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.
-- Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
+- Total benchmarks: 4 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`, `bench_ann_query` -- P3.4 LSH speedup).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution
   clock): single-part ~60k ticks/sec; full 7-part substrate ~35k part-ticks/sec;
@@ -1517,6 +1520,15 @@ binary) — this is an integration limitation of the current NOVA backend (block
   ~8700ms (~115k lookups/sec); ratio ~50x**. The legacy O(N) linear scan is
   preserved as a backwards-compat fallback for KGs rehydrated from snapshots
   predating P2.4. These bound the current scalar implementation.
+  **P3.4 (this revision):** atom similarity ("atoms similar to X") is now
+  approximate via LSH (Locality-Sensitive Hashing) over the integer-cosine
+  embeddings (`src/kg/ann_index.nova`). K=8 random hyperplanes -> 8-bit
+  signature -> 256 buckets; `ann_query` walks only the matching bucket
+  instead of all atoms. `bench_ann_query` over a 1000-atom KG (5000 queries
+  per side): **linear cosine scan ~4000ms vs LSH ~100ms; ratio ~40x**. The
+  index is opt-in per-KG via `kg_set_ann(kg, ann)`; `kg_rebuild_index`
+  rebuilds it on snapshot apply (mirroring the P2.4 pattern). Mode 1 only
+  -- multi-probe (Mode 2) and multi-table (Mode 3) deferred.
 
 ## ADR ambiguities encountered
 

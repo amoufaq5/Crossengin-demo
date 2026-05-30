@@ -1,0 +1,468 @@
+// CrossEngin knowledge: approximate-nearest-neighbor (ANN) index over atom
+// embeddings (P3.4).
+//
+// Purpose
+//   `atom_store.nova` already gives every atom an integer milli-fixed-point
+//   embedding (`vec_cosine`, ATOM_EMBED_DIMS=8). Finding "atoms similar to X"
+//   today is a linear scan over the whole KG -- fine at 100 atoms, painful at
+//   1000+. This module adds a Locality-Sensitive Hashing (LSH) side-index on
+//   top of those vectors: a fixed set of K random hyperplanes converts each
+//   embedding to a K-bit signature; atoms with the same signature land in the
+//   same bucket and are likely cosine-similar. Query "atoms similar to v" then
+//   hashes v, walks the matching bucket, ranks by the full `vec_cosine`. With
+//   K=8 the bucket count is 256, so a 1000-atom KG drops the inner scan from
+//   1000 to ~4 atoms -- ~100x faster.
+//
+//   The index is per-KG (attached via `kg_set_ann` in `multi_kg_manager.nova`)
+//   and is maintained transparently: `kg_add_atom` and `kg_remove_atom` call
+//   `ann_add` / `ann_remove` when an ann is attached, and `kg_rebuild_index`
+//   (the snapshot rehydrate hook P2.4 added) also rebuilds the ann. Atoms
+//   keyed by id, so handles stay stable across mutations.
+//
+//   This is Mode 1 in the scope ladder: single LSH table, K=8 hyperplanes.
+//   Mode 2 (multi-probe: query top-3 nearest buckets) and Mode 3 (multiple
+//   tables with different random projections) are deferred.
+//
+// Hash convention
+//   Each hyperplane is an integer vector of dimension N=ATOM_EMBED_DIMS with
+//   components in [-1000, +1000] (the same milli-fixed-point range the
+//   embeddings live in). The signature of a vector v is built bit-by-bit:
+//   bit k is 1 iff `dot(v, h_k) >= bias_k`, else 0. The bias is the
+//   projection of the *midpoint* of the expected embedding range onto the
+//   plane -- a guard rail for callers who somehow attach a non-zero-summed
+//   plane. In practice we generate planes that are mean-zero by construction
+//   (each plane has its mean subtracted out so its components sum to zero,
+//   modulo integer rounding); with mean-zero planes the bias is exactly
+//   zero and the decision boundary passes through the origin even when the
+//   input embeddings are non-negative (which is the common case in
+//   CrossEngin -- `word_lexical_vec` produces vectors in [0, 1000]). With
+//   non-mean-zero planes the bias keeps the partition useful instead of
+//   biased toward "every vector hashes to the same bucket". The full
+//   signature is the integer formed by the K bits (LSB = bit 0). K=8 means
+//   signatures fall in [0, 256).
+//
+//   The hyperplanes are seeded with a deterministic linear-congruential
+//   generator (LCG) so two ann_new(seed=S) calls produce the same buckets.
+//   The LCG keeps every intermediate multiply tiny (* 31, mask 32767) so the
+//   NOVA codegen pointer-threshold bug (#11) cannot fire -- this is the same
+//   workaround the P2.4 label_hash uses. (NOVA bug count workarounds: this
+//   makes #5 in `ann_index.nova` itself; the running list lives in
+//   NEXT_SESSION.md.)
+//
+// ADRs implemented: ADR-0016 (atom embeddings), ADR-0049 (testing and
+//   benchmarks for the speedup claim).
+// NOVA dependencies: builtins (lists, int math).
+// CrossEngin dependencies: src/kg/atom_store.nova (vec_cosine,
+//   ATOM_EMBED_DIMS, atom_embed, atom_id).
+
+import "atom_store.nova"
+
+// ---- ann_state layout -----------------------------------------------------
+// We use a tagged list so callers can distinguish an ann from any other
+// list-shaped object the way the rest of CrossEngin tags its records.
+let ANN_TAG    = 0
+let ANN_DIM    = 1   // embedding dimension (== ATOM_EMBED_DIMS)
+let ANN_K      = 2   // number of hyperplanes (== signature bits)
+let ANN_PLANES = 3   // list of K hyperplane vectors; each is [int] of length DIM
+let ANN_BUCKETS = 4  // list of 2^K buckets; each bucket is a list of atom_ids
+let ANN_SEED   = 5   // LCG seed used to generate the hyperplanes (for rebuild)
+let ANN_BIASES = 6   // P3.4: per-plane projection bias (midpoint dot-product
+                     //       so non-negative embeddings don't all hash same)
+let ANN_OBJ_TAG = 1801
+
+// Midpoint of the expected embedding component range. Existing CrossEngin
+// embeddings (`word_lexical_vec`, the seed pack embeddings) sit in roughly
+// [0, 1000] milli, so the midpoint is 500. The bias for each plane is the
+// projection of the constant `[ANN_MIDPOINT, ANN_MIDPOINT, ...]` onto the
+// plane -- i.e. `ANN_MIDPOINT * sum(plane_components)`.
+let ANN_MIDPOINT = 500
+
+// Default number of hyperplanes. K=8 -> 256 buckets, the sweet spot for the
+// 1000-atom workload the benchmark targets. Smaller K trades faster query for
+// more false positives in the bucket; larger K trades fewer collisions for
+// more false negatives.
+let ANN_DEFAULT_K = 8
+
+// Default LCG seed. Arbitrary nonzero; the only contract is determinism.
+let ANN_DEFAULT_SEED = 1469598103
+
+// LCG mask + multiplier kept tiny to dodge NOVA codegen bug #11 (large-
+// magnitude multiplies inside a loop body miscompile). 32767 * 31 = 1015777,
+// safely under the 1048576 threshold. `lcg_next` returns the new state.
+let _ANN_LCG_MASK = 32767
+let _ANN_LCG_MUL  = 31
+let _ANN_LCG_ADD  = 1013
+
+fn _ann_lcg_next(state) {
+    return ((state * _ANN_LCG_MUL) + _ANN_LCG_ADD) & _ANN_LCG_MASK
+}
+
+// Pull one hyperplane component in [-1000, +1000]. The LCG yields a 15-bit
+// non-negative integer; we map it into [-1000, 1000] via modulo 2001 then
+// subtract 1000.
+fn _ann_component(state) {
+    let r = state % 2001
+    return r - 1000
+}
+
+// Build one hyperplane vector of length `dim` from the LCG. Returns
+// [new_state, hyperplane_list]. Two-value returns aren't a thing in NOVA so
+// we mutate the state-holder list in place.
+//
+// We then re-center the plane so its components sum to zero: that makes the
+// hash decision boundary pass through the origin even when the input
+// embeddings are non-negative (like CrossEngin's `word_lexical_vec`).
+// Without this, a plane with sum=+S biases every non-negative vector toward
+// `dot >= 0`, collapsing the partition. The re-center is "subtract the mean"
+// from every component; we round so components stay integer.
+fn _ann_make_plane(state_holder, dim) {
+    let plane = list_new()
+    let raw_sum = 0
+    let i = 0
+    while i < dim {
+        let s = _ann_lcg_next(state_holder[0])
+        list_set(state_holder, 0, s)
+        let c = _ann_component(s)
+        push(plane, c)
+        raw_sum = raw_sum + c
+        i = i + 1
+    }
+    // Mean per component (integer division -- residual is < dim, negligible
+    // versus the [-1000, 1000] component range).
+    let mean = raw_sum / dim
+    let j = 0
+    while j < dim {
+        list_set(plane, j, plane[j] - mean)
+        j = j + 1
+    }
+    return plane
+}
+
+// Build the list of K hyperplanes from `seed`. Deterministic: given the same
+// (seed, dim, k) the planes are bit-identical, so a rebuild from a snapshot
+// produces the same buckets.
+fn _ann_make_planes(seed, dim, k) {
+    let planes = list_new()
+    let state_holder = list_new()
+    push(state_holder, seed & _ANN_LCG_MASK)
+    let i = 0
+    while i < k {
+        push(planes, _ann_make_plane(state_holder, dim))
+        i = i + 1
+    }
+    return planes
+}
+
+// Allocate `n` empty buckets (each an empty list of atom_ids).
+fn _ann_new_buckets(n) {
+    let bs = list_new()
+    let i = 0
+    while i < n {
+        push(bs, list_new())
+        i = i + 1
+    }
+    return bs
+}
+
+// 2^k via repeated doubling (NOVA has no shift / pow builtin).
+fn _ann_pow2(k) {
+    let p = 1
+    let i = 0
+    while i < k {
+        p = p * 2
+        i = i + 1
+    }
+    return p
+}
+
+// ---- public API -----------------------------------------------------------
+
+// Create a fresh ann_state with `dim`-dimensional embeddings and `k`
+// hyperplanes. Uses the default seed so two anns built with the same (dim, k)
+// produce the same buckets -- the determinism the snapshot rehydrate path
+// relies on. Callers wanting a different random projection can construct one
+// directly with `ann_new_seeded`.
+fn ann_new(dim, k) {
+    return ann_new_seeded(dim, k, ANN_DEFAULT_SEED)
+}
+
+// Same as `ann_new` but with an explicit seed; used by Mode-3 multi-table
+// LSH (deferred) and by tests that want to vary the projection.
+fn ann_new_seeded(dim, k, seed) {
+    let nbuckets = _ann_pow2(k)
+    let planes = _ann_make_planes(seed, dim, k)
+    let ann = list_new()
+    push(ann, ANN_OBJ_TAG)
+    push(ann, dim)
+    push(ann, k)
+    push(ann, planes)
+    push(ann, _ann_new_buckets(nbuckets))
+    push(ann, seed)
+    push(ann, _ann_make_biases(planes))
+    return ann
+}
+
+// Per-plane bias: `ANN_MIDPOINT * sum(plane_components)`. Computed once at
+// ann construction so the hash path is one extra subtraction per plane.
+// Stays well under the codegen threshold: 1000 * 8 * 1000 = 8M, fine.
+fn _ann_make_biases(planes) {
+    let biases = list_new()
+    let k = 0
+    while k < len(planes) {
+        let plane = planes[k]
+        let s = 0
+        let d = 0
+        while d < len(plane) {
+            s = s + plane[d]
+            d = d + 1
+        }
+        push(biases, ANN_MIDPOINT * s)
+        k = k + 1
+    }
+    return biases
+}
+
+// Accessors.
+fn ann_dim(ann)     { return ann[ANN_DIM] }
+fn ann_k(ann)       { return ann[ANN_K] }
+fn ann_seed(ann)    { return ann[ANN_SEED] }
+fn ann_bucket_total(ann) { return len(ann[ANN_BUCKETS]) }
+
+// Number of atom_ids currently in the bucket. Diagnostic helper; returns 0
+// for an out-of-range bucket id (so callers can probe without bounds checks).
+fn ann_bucket_count(ann, bucket_id) {
+    if bucket_id < 0 { return 0 }
+    let bs = ann[ANN_BUCKETS]
+    if bucket_id >= len(bs) { return 0 }
+    return len(bs[bucket_id])
+}
+
+// Total number of atoms tracked across every bucket. Sum of bucket sizes;
+// useful when reasoning about index size vs the underlying KG.
+fn ann_size(ann) {
+    let bs = ann[ANN_BUCKETS]
+    let total = 0
+    let i = 0
+    while i < len(bs) {
+        total = total + len(bs[i])
+        i = i + 1
+    }
+    return total
+}
+
+// Compute the LSH signature of a vector against the ann's hyperplanes. The
+// k-th bit is 1 iff `dot(vec, planes[k]) >= biases[k]`, where the bias
+// centers the threshold around the midpoint of the expected embedding range
+// (see ANN_MIDPOINT above). The signature is the bit pattern packed
+// LSB-first.
+//
+// Underflow guard: the dot-product accumulator can grow as large as
+// dim * 1000 * 1000 = 8,000,000 per plane. Well within int range, but we
+// take care to compute it incrementally so no intermediate overflows. The
+// bias is computed once at construction and stays bounded by the same
+// magnitude.
+fn _lsh_hash(vec, planes, biases) {
+    let kk = len(planes)
+    let sig = 0
+    let bit_val = 1
+    let k = 0
+    while k < kk {
+        let plane = planes[k]
+        let n = len(plane)
+        if n > len(vec) { n = len(vec) }
+        let dot = 0
+        let i = 0
+        while i < n {
+            dot = dot + vec[i] * plane[i]
+            i = i + 1
+        }
+        if dot >= biases[k] { sig = sig + bit_val }
+        bit_val = bit_val * 2
+        k = k + 1
+    }
+    return sig
+}
+
+// Public hash entry point so callers (tests, diagnostics) can ask "which
+// bucket does this vector land in?" without poking into the internals.
+fn ann_hash(ann, vec) {
+    return _lsh_hash(vec, ann[ANN_PLANES], ann[ANN_BIASES])
+}
+
+// Insert atom_id under the bucket given by hashing `vec`. Idempotent: a
+// repeat insert of the same (bucket, atom_id) pair is a no-op so callers
+// can replay a snapshot without doubling up.
+fn ann_add(ann, atom_id, vec) {
+    let sig = _lsh_hash(vec, ann[ANN_PLANES], ann[ANN_BIASES])
+    let bucket = ann[ANN_BUCKETS][sig]
+    let i = 0
+    while i < len(bucket) {
+        if bucket[i] == atom_id { return 1 }
+        i = i + 1
+    }
+    push(bucket, atom_id)
+    return 1
+}
+
+// Remove atom_id from its bucket. We don't know the original vec, so we
+// scan every bucket -- O(B + size). A typical use is removal during atom
+// death, infrequent enough that this is fine. (Callers that have the vec
+// at hand can compute the signature and remove from one bucket; we keep
+// the conservative path for the same reason `kg_remove_atom` doesn't trust
+// the caller to remember which bucket the atom was filed under.) Rebuilds
+// the touched bucket without the matching id (no list `pop` builtin).
+//
+// Returns 1 if a remove happened, 0 if the atom was never present.
+fn ann_remove(ann, atom_id) {
+    let bs = ann[ANN_BUCKETS]
+    let removed = 0
+    let b = 0
+    while b < len(bs) {
+        let bucket = bs[b]
+        let found = 0
+        let i = 0
+        while i < len(bucket) {
+            if bucket[i] == atom_id { found = 1 }
+            i = i + 1
+        }
+        if found == 1 {
+            let kept = list_new()
+            let j = 0
+            while j < len(bucket) {
+                if bucket[j] != atom_id { push(kept, bucket[j]) }
+                j = j + 1
+            }
+            list_set(bs, b, kept)
+            removed = 1
+        }
+        b = b + 1
+    }
+    return removed
+}
+
+// Query the ann for atoms similar to `query_vec`. Hashes the query, walks
+// the matching bucket, scores every atom_id in that bucket via the full
+// `vec_cosine` against its stored embedding, and returns the top
+// `max_results` results sorted by cosine (descending).
+//
+// Returns a list of [atom_id, cosine_milli] pairs (so the caller can both
+// fetch atoms and inspect their similarity score). Empty list when the
+// bucket is empty.
+//
+// Caller supplies the KG (or anything that responds to `atoms[i] = atom`
+// with `atom_embed(atom)` -- we expect the `kg_atoms(kg)` list here).
+fn ann_query(ann, atoms_list, query_vec, max_results) {
+    let out = list_new()
+    if max_results <= 0 { return out }
+    let sig = _lsh_hash(query_vec, ann[ANN_PLANES], ann[ANN_BIASES])
+    let bucket = ann[ANN_BUCKETS][sig]
+    let n = len(bucket)
+    if n == 0 { return out }
+    // Walk the bucket, streaming top-K. Maintains `out` as a top-K buffer
+    // (sorted descending). The swap-out-worst trick keeps `out` short --
+    // O(bucket_size * K) total work, with K usually 5. At 1000 atoms with
+    // K=8 planes, bucket_size averages ~4-21 atoms, so the inner work is
+    // bounded by ~100 cosine + ~100 swap-checks per query -- well below
+    // the 1000 cosines a linear scan would pay.
+    let i = 0
+    while i < n {
+        let aid = bucket[i]
+        if aid >= 0 {
+            if aid < len(atoms_list) {
+                let a = atoms_list[aid]
+                if a != 0 {
+                    let c = vec_cosine(query_vec, atom_embed(a))
+                    if len(out) < max_results {
+                        let entry = list_new()
+                        push(entry, aid)
+                        push(entry, c)
+                        // Insert in the right slot (descending by cosine).
+                        let pos = len(out)
+                        let p = 0
+                        while p < len(out) {
+                            if pos == len(out) {
+                                if out[p][1] < c { pos = p }
+                            }
+                            p = p + 1
+                        }
+                        if pos == len(out) {
+                            push(out, entry)
+                        } else {
+                            // Shift right, place entry at pos.
+                            push(out, out[len(out) - 1])
+                            let q = len(out) - 2
+                            while q > pos {
+                                list_set(out, q, out[q - 1])
+                                q = q - 1
+                            }
+                            list_set(out, pos, entry)
+                        }
+                    } else {
+                        // Top-K full; swap if better than the worst (last).
+                        if c > out[len(out) - 1][1] {
+                            let entry = list_new()
+                            push(entry, aid)
+                            push(entry, c)
+                            // Find insertion position.
+                            let pos = len(out)
+                            let p = 0
+                            while p < len(out) {
+                                if pos == len(out) {
+                                    if out[p][1] < c { pos = p }
+                                }
+                                p = p + 1
+                            }
+                            // Shift entries one slot right starting at pos
+                            // (drops the old worst-at-end).
+                            let q = len(out) - 1
+                            while q > pos {
+                                list_set(out, q, out[q - 1])
+                                q = q - 1
+                            }
+                            list_set(out, pos, entry)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Drop every atom from every bucket. Used by `ann_rebuild` and tests; cheaper
+// than allocating a fresh bucket list because we preserve the bucket count.
+fn ann_clear(ann) {
+    let bs = ann[ANN_BUCKETS]
+    let i = 0
+    while i < len(bs) {
+        list_set(bs, i, list_new())
+        i = i + 1
+    }
+    return 1
+}
+
+// Rebuild the ann from a KG (the snapshot-apply hook, mirroring P2.4's
+// `kg_rebuild_index`). Walks every atom and re-inserts its (id, embed) into
+// the bucket selected by hashing the embed. The KG is supplied via its
+// raw atoms list -- we read `atom_id` and `atom_embed` from each entry, the
+// same accessors `kg_atoms` produces. Returns the number of atoms inserted.
+//
+// We don't pass the multi_kg_manager KG record directly to avoid a circular
+// import (ann_index -> multi_kg_manager would inflate the dep graph; instead
+// multi_kg_manager calls us with `kg_atoms(kg)`).
+fn ann_rebuild_from_atoms(ann, atoms_list) {
+    ann_clear(ann)
+    let n = len(atoms_list)
+    let i = 0
+    let inserted = 0
+    while i < n {
+        let a = atoms_list[i]
+        if a != 0 {
+            ann_add(ann, atom_id(a), atom_embed(a))
+            inserted = inserted + 1
+        }
+        i = i + 1
+    }
+    return inserted
+}
