@@ -11,7 +11,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 112 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 114 modules compile (`make build`, +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
@@ -31,7 +31,11 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `safety/differential_privacy.nova` added in P3.6 minimum-viable
 > differential privacy at the KG-query surface (integer Laplace mechanism +
 > per-session epsilon-budget accountant, ADR-0053 -- documented in
-> [`DP_AUDIT.md`](./DP_AUDIT.md))), 118 unit-test suites pass
+> [`DP_AUDIT.md`](./DP_AUDIT.md)),
+> +2 from `io/transducers/{image_pgm,visual_perception}.nova` added in P3.1
+> minimum-viable image modality -- pure-NOVA PGM-P5 decoder + pluggable
+> visual perception seam producing feature atoms, documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md)), 119 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -78,8 +82,17 @@ computational units rather than orchestrating a pipeline of modules.
 > integer Laplace mechanism (Geometric-on-Z), per-session epsilon-budget
 > accountant, `kg_atom_count_dp` / `kg_atom_belief_mean_dp` opt-in
 > wrappers, surfaced via the chat `/dp_status` + `/dp_query atoms` admin
-> commands, documented in [`DP_AUDIT.md`](./DP_AUDIT.md)),
-> 23 end-to-end integration
+> commands, documented in [`DP_AUDIT.md`](./DP_AUDIT.md),
+> +1 suite / +43 assertions from `test_image_pgm.nova` added in P3.1
+> minimum-viable image modality -- pure-NOVA PGM-P5 binary decoder
+> (header + raw bytes, no compression) with histogram / mean-intensity
+> / nearest-neighbor resize / dominant-intensity bucket statistics
+> and the pluggable `visual_perception.nova` seam producing crude
+> feature atoms (image_dim_*, image_dark/mid/bright, image_bucket_*,
+> image_hist_peaked/uniform); surfaced via the chat `/see PATH` admin
+> command and the `scripts/image_to_pgm.sh` ImageMagick/ffmpeg shim
+> for non-PGM input, documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md)),
+> 24 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -104,7 +117,15 @@ computational units rather than orchestrating a pipeline of modules.
 > at the KG-query surface: /dp_status initial budget -> 130 /dp_query
 > atoms drains the 10000 milli-eps budget to zero (with true vs noisy
 > count per call, noise variance > 0 across draws) -> /dp_query past
-> exhaustion returns "budget exhausted"),
+> exhaustion returns "budget exhausted",
+> +1 from `scenario_q_image_see.sh` added in P3.1 minimum-viable
+> image modality: hand-rolled 4x4 gradient + uniform-grey PGM
+> fixtures, /see prints the operator-readable summary
+> (dims + mean + dominant bucket + entropy) and the feature-atom
+> labels (image_dim_small + image_mid + image_bucket_0 on the
+> gradient; image_bright + image_hist_peaked + image_bucket_6 on the
+> uniform fixture); malformed input is rejected with the parser's
+> bracketed error and the chat survives to /quit cleanly),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence

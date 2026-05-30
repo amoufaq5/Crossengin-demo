@@ -17,6 +17,136 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.1 minimum-viable image modality (framework + audit):
+  **complete (framework only)** (ADR-0014 visual half / NOVA
+  enhancement #15). Visual perception was entirely missing from
+  CrossEngin: text (P15) and audio (P19 TTS + P2.6 / P2.5 STT
+  framework) already had pluggable modality bridges; images had no
+  decoder, no perception path, no admin command. P3.1 lands the
+  smallest possible plank: a pure-NOVA decoder for the simplest
+  standardized image format (PGM-P5 binary; ASCII / 16-bit deferred),
+  a pluggable visual-perception seam (`stt_seam.nova`-shape) that
+  turns pixel statistics into substrate-shaped feature atoms, the
+  chat-side admin command `/see PATH`, and the
+  `scripts/image_to_pgm.sh` ImageMagick/ffmpeg shim for any non-PGM
+  input. The full pipeline (JPEG decode, edge detection, SIFT,
+  embeddings) is months of work and is documented in
+  `IMAGE_AUDIT.md` as the realistic path; this round closes the
+  framework hole so the visual seam compiles, exercises a real
+  decoder, and produces feature atoms an integration test can
+  observe -- without inventing a JPEG decoder out of thin air.
+  - **`image_pgm.nova`** (NEW) -- pure-NOVA PGM-P5 decoder. Public
+    API: `pgm_parse_bytes(ptr, len) / pgm_parse_file(path) -> [w, h,
+    maxval, pixel_data_ptr, error_msg]` (5-tuple result; helpers
+    `pgm_result_width / _height / _maxval / _data / _error / _ok`),
+    `pgm_pixel(data, w, x, y) -> int` (row-major, 0..255),
+    `pgm_histogram(data, w, h) -> list of 256 counts`,
+    `pgm_mean_intensity(data, w, h) -> int (0..255)`,
+    `pgm_dominant_intensity(data, w, h) -> int (0..7 bucket;
+    bins of 32 levels each)`, `pgm_histogram_entropy_milli(hist)
+    -> int (0..8000 milli-bits)`, `pgm_resize_nn(src, src_w, src_h,
+    dst_w, dst_h) -> dst_data_ptr` (nearest-neighbor, integer math
+    only). The parser tolerates `# comment` lines in the header
+    (the shape `convert input.jpg output.pgm` always writes a
+    "# CREATOR: ImageMagick" line). Dimension cap: 1024 per axis
+    so `width * height <= 1048576 == 2^20` stays under NOVA's
+    codegen pointer-threshold gotcha (#11); larger PGMs are
+    refused with a "downsample first" error. ASCII PGM (`P2`
+    magic) is rejected with the right diagnostic (a deferred
+    follow-up).
+  - **`visual_perception.nova`** (NEW) -- pluggable visual-perception
+    seam, EXACTLY the shape of `stt_seam.nova`. Public API:
+    `vp_seam_new()` constructs a seam (pre-registers "stub" + "pgm"
+    backends), `vp_decode_image(seam, path) -> [feature_atoms,
+    confidence_milli, error_msg]`, `vp_register_decoder(seam, name,
+    decoder_id)`, `vp_default_decoder()` (from `CE_VP_DECODER` env;
+    "pgm" / unset -> PGM, "stub" -> STUB),
+    `vp_seam_set_default(seam, decoder_id)`,
+    `vp_seam_decoder_name(seam) / _decoder_id_for / _last_features /
+    _last_confidence / _last_error / _last_summary / _call_count`,
+    `vp_features_for_image(w, h, data) -> list of label strings`,
+    `vp_summary_for_image(w, h, data) -> "<w>x<h> mean=<m>
+    dom_bucket=<b> entropy=<e>"`. Feature atoms produced:
+    `image_dim_<small|medium|large>` (area <= 4096 small,
+    <= 65536 medium, else large), `image_<dark|mid|bright>`
+    (mean < 80 dark, > 175 bright, else mid),
+    `image_bucket_<0..7>` (dominant intensity bin),
+    `image_hist_<peaked|uniform>` (entropy < 3000 milli-bits
+    peaked, > 6000 milli-bits uniform; mid-range emits nothing
+    on this axis -- the dominant-bucket label already covers it).
+    Successful PGM decode -> confidence 800 milli (same ballpark
+    as the STT subprocess path); STUB -> 0; parse error ->
+    confidence 0 with `image_unavailable` placeholder atom so
+    downstream callers always see >=1 atom. The atom-creation
+    wire-up (binding each label to an `ATOM_VISUAL` atom via the
+    existing `atom_birth_monitor` path) lives in
+    `src/agent/loop_perception.nova` and is explicitly out of
+    P3.1's scope -- the framework is the load-bearing piece.
+  - **`scripts/image_to_pgm.sh`** (NEW) -- subprocess shim that
+    converts an arbitrary image (JPEG, PNG, WebP, BMP, GIF, TIFF,
+    HEIC, ...) into a PGM the pure-NOVA decoder can read. Probe
+    order: ImageMagick `convert` (IM 6) -> `magick` (IM 7) ->
+    `ffmpeg` -> 16x16 grey placeholder PGM (so a sealed sandbox
+    still produces a decodable image). Env knobs: `CE_PGM_OUT`
+    (destination path, default `/tmp/ce_image.pgm`),
+    `CE_PGM_MAX_DIM` (longest side in pixels, default 256). Exits
+    0 in all branches including "no backend installed" -- same
+    contract as `scripts/transcribe.sh` for STT.
+  - **chat-side `/see PATH` admin command**
+    (`examples/crossengin_chat.nova`). Loads the PGM at PATH via
+    the seam, prints the operator-readable summary line
+    (`saw image <path> [<w>x<h> mean=<m> dom_bucket=<b>
+    entropy=<e>, decoder=pgm]`), and one indented `features:` line
+    listing the feature-atom labels. `/see` with no arg prints
+    a usage hint; `/see` on a malformed file surfaces the
+    parser's bracketed error. The visual seam is lazily
+    constructed on first `/see` so chat startup is unchanged when
+    the command is never used. One dispatch line + one /help
+    line, matching the brief's scope.
+  - **`IMAGE_AUDIT.md`** (NEW) -- the realistic-path write-up.
+    Why visual perception is structurally hard (2-D field with no
+    inherent boundaries; binary decoding AND perception are each
+    multi-week lifts); why PGM-P5 specifically (simplest
+    standardized format, ~30 lines pure-NOVA, common test fixture
+    via `convert`); the four realistic options (subprocess shim
+    -- landed; WASM-bundled stb_image once P2.7 lands; pure-NOVA
+    PNG via zlib ~3-4 weeks; pure-NOVA JPEG ~6-8 weeks); the
+    vision feature ladder (Sobel / Harris / Canny / HOG / SIFT /
+    HSV histograms / CNN embeddings, each weeks-to-months);
+    mapping features to atoms via Beta(4,1) high-confidence /
+    Beta(2,1) low-confidence priors; wall-clock estimate (2-4
+    months to "ingests photographs", 6-12 months to "production
+    scene understanding"); recommended path (ImageMagick shim
+    NOW; pure-NOVA JPEG before PNG once the modality bridge
+    matures); NOVA gotchas worked around (codegen pointer-
+    threshold #11 -- dimension cap; `read_file` NUL stop -- raw
+    `sys_read` loop instead; ASCII-vs-binary PGM -- P5 only).
+  - **No touches** to `src/io/effectors/*` (audio side, locked
+    after P2.6), `src/parts/`, `src/reader/`, `src/agent/`,
+    `src/kg/`, `src/persistence/`, `src/learning/`,
+    `examples/crossengin_daemon.nova` (chat-only integration
+    this round), or `scripts/web.py`. Perception-loop wire-up is
+    a follow-up.
+  Acceptance: `tests/unit/test_image_pgm.nova` (NEW; 43
+  assertions across 13 test functions): parse happy path (dims,
+  pixels, row-major access), histogram on gradient (bins, total),
+  mean intensity, dominant intensity bucket (flat 0/200/255),
+  nearest-neighbor resize 4x4 -> 2x2 (correct pixel index
+  selection) and 2x2 -> 4x4 (upscale), malformed inputs (bad
+  magic, P2 ASCII, truncated buffer, missing pixel bytes), `#`
+  comment in header tolerated, dimension cap rejects >1024.
+  `tests/integration/scenario_q_image_see.sh` (NEW; 11
+  assertions): /help advertises /see; /see PATH prints
+  dimensions + summary + feature atoms on a 4x4 gradient
+  (`image_dim_small + image_mid + image_bucket_0`) AND on a
+  uniform-grey fixture (`image_bright + image_hist_peaked +
+  image_bucket_6`); /see with no arg prints usage; /see on
+  random bytes prints the parser's bracketed error; chat
+  reaches /quit cleanly afterwards. Final counts: 114 modules
+  (+2 from `image_pgm.nova` and `visual_perception.nova`),
+  119 unit-test suites (+1 suite for `test_image_pgm.nova`,
+  +43 assertions), 24 integration scripts pass (+1 for
+  `scenario_q_image_see.sh`, +11 assertions).
 - P3.6 minimum-viable differential privacy at the KG-query surface:
   **complete** (ADR-0053). Today CrossEngin's KGs are queryable (atom
   counts, beliefs, neighborhoods) but there is no formal privacy layer:

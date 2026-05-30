@@ -1,0 +1,385 @@
+// CrossEngin io/transducers: visual perception seam (P3.1).
+//
+// Purpose
+//   The visual half of the modality bridge that text (P15) and audio
+//   (P19 / P2.6 TTS + P2.5 STT framework) already cover. Image data is
+//   structurally different from text or speech: a raw pixel stream has
+//   no tokens, no phonemes, no inherent boundaries -- it is a 2-D field
+//   of intensities the substrate has to interpret. P3.1 lands the smallest
+//   plank that makes the substrate perceive an image AT ALL: a pluggable
+//   decoder (PGM today; PNG / JPEG / WebP deferred per `IMAGE_AUDIT.md`)
+//   plus a tiny feature-extraction pass that turns pixel statistics into
+//   a list of label-shaped "feature atoms" the agent's perception path
+//   can consume as if they were words.
+//
+//   The seam EXACTLY mirrors the shape of `stt_seam.nova` (P2.5):
+//   pluggable backends keyed by integer id, an env-driven default,
+//   per-call result triple (extended to a 3-tuple here: feature atoms,
+//   confidence_milli, error_msg), and "last_*" mirrors for observability.
+//   Tests can register a mock backend without touching env. The only
+//   moving piece that does real work today is the PGM decoder; every
+//   other backend resolves to STUB.
+//
+//   "Feature atoms" are just labels (strings) the chat / daemon can
+//   append to its perception buffer or hand to `transduce_text` for
+//   normalization. Today's set:
+//     image_dim_small | image_dim_medium | image_dim_large
+//       -- by pixel area (small <= 4096; medium <= 65536; else large)
+//     image_dark | image_mid | image_bright
+//       -- by mean intensity (<80 dark; >175 bright; else mid)
+//     image_hist_peaked | image_hist_uniform
+//       -- by histogram entropy (entropy < 3000 milli-bits peaked;
+//          entropy > 6000 milli-bits uniform; else neither label)
+//     image_bucket_<0..7>
+//       -- dominant-intensity bucket (8 bins of 32 levels each)
+//   Each is independently included; a real "scene" image is typically
+//   2-3 atoms in size. The substrate later learns associations between
+//   these atoms and concepts via the same Hebbian + atom-birth path
+//   that text perception uses (ADR-0023 + ADR-0025).
+//
+//   The full vision pipeline -- edge detection (Sobel / Canny), corner
+//   features (Harris / SIFT), color histograms in HSV, deep-learning
+//   embeddings (CNN feature vectors) -- is months of work and out of
+//   scope for P3.1. See `IMAGE_AUDIT.md` for the wall-clock estimate
+//   and the recommended ImageMagick shim path until then.
+//
+// Public API
+//   vp_seam_new() -> vp_seam state
+//   vp_decode_image(seam, path) -> [feature_atoms, confidence_milli,
+//                                   error_msg]
+//   vp_register_decoder(seam, name, decoder_id)
+//   vp_default_decoder() -> VP_DECODER_PGM | VP_DECODER_STUB
+//   vp_seam_decoder_name(seam) -> string
+//   vp_seam_decoder_id_for(seam, name) -> int
+//   vp_seam_set_default(seam, decoder_id)
+//   vp_seam_last_features(seam) / _last_confidence / _last_error /
+//     _call_count
+//   vp_features_for_image(width, height, data) -> list of feature
+//     atom labels (no I/O; pure-function helper -- tests use this)
+//
+// Confidence: PGM-decoded features are reported at 800 milli (0.8
+// ballpark, the same default the STT subprocess backend uses for
+// successful transcriptions). The STUB path returns 0. Calibration is
+// a follow-up -- the meaningful signal today is whether the decoder
+// ran at all.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+//   The output is label-shaped; mapping labels to atoms is the perception
+//   loop's job (a separate follow-up that lives in src/agent/, not here).
+// NOVA dependencies: builtins -- list_new, push, list_set, len, str_eq,
+//   getenv, int_to_str. CrossEngin dependencies: image_pgm.nova (the
+//   only working decoder).
+
+import "image_pgm.nova"
+
+// ---- decoder identifiers --------------------------------------------------
+
+let VP_DECODER_NONE   = 0       // sentinel, never registered
+let VP_DECODER_STUB   = 1       // deterministic placeholder
+let VP_DECODER_PGM    = 2       // real PGM-P5 decoder (image_pgm.nova)
+let VP_DECODER_CUSTOM = 3       // user-registered (tests, plugins)
+
+// Confidence sentinels (mirror the STT seam's pattern).
+let VP_CONFIDENCE_NONE    = 0
+let VP_CONFIDENCE_STUB    = 0
+let VP_CONFIDENCE_DEFAULT = 800
+
+// Placeholder feature list the STUB backend returns. A single
+// `image_unavailable` atom so the perception path sees ONE label even
+// when no decoder fires -- the agent can learn associations between
+// "saw something but could not decode it" and downstream outcomes.
+let VP_STUB_LABEL = "image_unavailable"
+
+// Feature labels exposed publicly so callers + tests can match against
+// them without re-hardcoding strings.
+let VP_LABEL_DIM_SMALL    = "image_dim_small"
+let VP_LABEL_DIM_MEDIUM   = "image_dim_medium"
+let VP_LABEL_DIM_LARGE    = "image_dim_large"
+let VP_LABEL_DARK         = "image_dark"
+let VP_LABEL_MID          = "image_mid"
+let VP_LABEL_BRIGHT       = "image_bright"
+let VP_LABEL_HIST_PEAKED  = "image_hist_peaked"
+let VP_LABEL_HIST_UNIFORM = "image_hist_uniform"
+
+// Thresholds (kept as constants so the audit doc + tests can refer to
+// the same numbers).
+let VP_DIM_SMALL_AREA  = 4096        // 64x64
+let VP_DIM_MEDIUM_AREA = 65536       // 256x256
+let VP_DARK_MEAN       = 80
+let VP_BRIGHT_MEAN     = 175
+let VP_ENTROPY_PEAKED  = 3000        // milli-bits
+let VP_ENTROPY_UNIFORM = 6000        // milli-bits
+
+// ---- seam state layout ----------------------------------------------------
+//
+// Shape parallel to `stt_seam.nova`:
+//   [0] tag                (VP_SEAM_TAG)
+//   [1] default_decoder    (resolved from env at construction)
+//   [2] registered_count   (number of decoders registered)
+//   [3] registered_names   (list of strings)
+//   [4] registered_ids     (list of int ids -- parallel to names)
+//   [5] last_features      (list of strings -- most recent successful call)
+//   [6] last_confidence    (int milli -- mirror)
+//   [7] last_error         (string -- last error_msg, or "")
+//   [8] call_count         (counter for observability)
+//   [9] last_summary       (operator-readable digest: "256x256 mean=148 ...")
+
+let VP_SEAM_TAG = 6311
+
+let VP_TAG            = 0
+let VP_DEFAULT_DEC    = 1
+let VP_REG_COUNT      = 2
+let VP_REG_NAMES      = 3
+let VP_REG_IDS        = 4
+let VP_LAST_FEATS     = 5
+let VP_LAST_CONF      = 6
+let VP_LAST_ERR       = 7
+let VP_CALL_COUNT     = 8
+let VP_LAST_SUMMARY   = 9
+
+// ---- env helpers ----------------------------------------------------------
+
+// vp_default_decoder() reads CE_VP_DECODER once and returns the constant.
+// Empty / unset / "pgm" -> PGM; "stub" -> STUB; anything else -> PGM
+// (defensive default; PGM is the only working decoder today so we
+// prefer it when no policy is expressed).
+fn vp_default_decoder() {
+    let env = getenv("CE_VP_DECODER")
+    if env == 0 { return VP_DECODER_PGM }
+    if len(env) == 0 { return VP_DECODER_PGM }
+    if str_eq(env, "pgm") == 1 { return VP_DECODER_PGM }
+    if str_eq(env, "stub") == 1 { return VP_DECODER_STUB }
+    return VP_DECODER_PGM
+}
+
+// ---- constructor ----------------------------------------------------------
+
+fn vp_seam_new() {
+    let s = list_new()
+    push(s, VP_SEAM_TAG)
+    push(s, vp_default_decoder())   // [1] default decoder
+    push(s, 0)                      // [2] registered_count
+    push(s, list_new())             // [3] names
+    push(s, list_new())             // [4] ids
+    push(s, list_new())             // [5] last_features
+    push(s, 0)                      // [6] last_confidence
+    push(s, "")                     // [7] last_error
+    push(s, 0)                      // [8] call_count
+    push(s, "")                     // [9] last_summary
+    _vp_register_builtin(s, "stub", VP_DECODER_STUB)
+    _vp_register_builtin(s, "pgm",  VP_DECODER_PGM)
+    return s
+}
+
+fn _vp_register_builtin(s, name, id) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    push(names, name)
+    push(ids, id)
+    list_set(s, VP_REG_COUNT, s[VP_REG_COUNT] + 1)
+    return 1
+}
+
+// ---- public accessors -----------------------------------------------------
+
+fn vp_seam_enabled(s) {
+    if s[VP_REG_COUNT] > 0 { return 1 }
+    return 0
+}
+
+fn vp_seam_decoder_name(s) {
+    let id = s[VP_DEFAULT_DEC]
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(ids)
+    while i < n {
+        if ids[i] == id { return names[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn vp_seam_last_features(s)   { return s[VP_LAST_FEATS] }
+fn vp_seam_last_confidence(s) { return s[VP_LAST_CONF] }
+fn vp_seam_last_error(s)      { return s[VP_LAST_ERR] }
+fn vp_seam_last_summary(s)    { return s[VP_LAST_SUMMARY] }
+fn vp_seam_call_count(s)      { return s[VP_CALL_COUNT] }
+fn vp_seam_default_decoder(s) { return s[VP_DEFAULT_DEC] }
+
+fn vp_register_decoder(s, name, decoder_id) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 {
+            list_set(ids, i, decoder_id)
+            return 1
+        }
+        i = i + 1
+    }
+    push(names, name)
+    push(ids, decoder_id)
+    list_set(s, VP_REG_COUNT, s[VP_REG_COUNT] + 1)
+    return 1
+}
+
+fn vp_seam_set_default(s, decoder_id) {
+    list_set(s, VP_DEFAULT_DEC, decoder_id)
+    return 1
+}
+
+fn vp_seam_decoder_id_for(s, name) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 { return ids[i] }
+        i = i + 1
+    }
+    return VP_DECODER_NONE
+}
+
+// ---- result + mirror writers ----------------------------------------------
+
+fn _vp_result(s, feats, confidence, error_msg, summary) {
+    let triple = list_new()
+    push(triple, feats)
+    push(triple, confidence)
+    push(triple, error_msg)
+    list_set(s, VP_LAST_FEATS,   feats)
+    list_set(s, VP_LAST_CONF,    confidence)
+    list_set(s, VP_LAST_ERR,     error_msg)
+    list_set(s, VP_LAST_SUMMARY, summary)
+    list_set(s, VP_CALL_COUNT,   s[VP_CALL_COUNT] + 1)
+    return triple
+}
+
+// ---- feature extraction (pure-function, image_pgm-shaped) -----------------
+//
+// `vp_features_for_image(w, h, data_ptr)` -- the substrate-facing surface
+// the perception path calls once the decoder has produced a pixel buffer.
+// Tests use this directly without going through a decoder.
+
+fn vp_features_for_image(width, height, data_ptr) {
+    let feats = list_new()
+    if width <= 0   { return feats }
+    if height <= 0  { return feats }
+    if data_ptr == 0 { return feats }
+
+    // Dimension bucket. We avoid an unnecessary width*height multiply when
+    // either dim is already over the medium threshold.
+    let area_bucket = 2   // 0=small, 1=medium, 2=large; default large
+    if width <= 256 {
+        if height <= 256 {
+            let area = width * height
+            if area <= VP_DIM_SMALL_AREA { area_bucket = 0 }
+            else {
+                if area <= VP_DIM_MEDIUM_AREA { area_bucket = 1 }
+            }
+        }
+    }
+    if area_bucket == 0 { push(feats, VP_LABEL_DIM_SMALL) }
+    if area_bucket == 1 { push(feats, VP_LABEL_DIM_MEDIUM) }
+    if area_bucket == 2 { push(feats, VP_LABEL_DIM_LARGE) }
+
+    // Mean intensity bucket.
+    let mean = pgm_mean_intensity(data_ptr, width, height)
+    if mean < VP_DARK_MEAN          { push(feats, VP_LABEL_DARK) }
+    else {
+        if mean > VP_BRIGHT_MEAN    { push(feats, VP_LABEL_BRIGHT) }
+        else                        { push(feats, VP_LABEL_MID) }
+    }
+
+    // Dominant intensity bucket as `image_bucket_<0..7>`.
+    let dom = pgm_dominant_intensity(data_ptr, width, height)
+    push(feats, "image_bucket_" + int_to_str(dom))
+
+    // Histogram entropy classification. Only emit a label at the extremes
+    // so the substrate has a clean peaked-vs-uniform signal -- mid-range
+    // entropy yields nothing on this axis (the dominant-bucket label
+    // already covers that case).
+    let hist = pgm_histogram(data_ptr, width, height)
+    let entropy = pgm_histogram_entropy_milli(hist)
+    if entropy < VP_ENTROPY_PEAKED  { push(feats, VP_LABEL_HIST_PEAKED) }
+    if entropy > VP_ENTROPY_UNIFORM { push(feats, VP_LABEL_HIST_UNIFORM) }
+
+    return feats
+}
+
+// vp_summary_for_image: operator-readable digest string. Format:
+//   "<w>x<h> mean=<mean> dom_bucket=<dom> entropy=<entropy_milli>"
+fn vp_summary_for_image(width, height, data_ptr) {
+    if width <= 0  { return "image: invalid dimensions" }
+    if height <= 0 { return "image: invalid dimensions" }
+    if data_ptr == 0 { return "image: no pixel data" }
+    let mean = pgm_mean_intensity(data_ptr, width, height)
+    let dom  = pgm_dominant_intensity(data_ptr, width, height)
+    let hist = pgm_histogram(data_ptr, width, height)
+    let ent  = pgm_histogram_entropy_milli(hist)
+    return int_to_str(width) + "x" + int_to_str(height)
+        + " mean=" + int_to_str(mean)
+        + " dom_bucket=" + int_to_str(dom)
+        + " entropy=" + int_to_str(ent)
+}
+
+// ---- STUB decoder ---------------------------------------------------------
+//
+// Deterministic single-element list `image_unavailable`. Always returns
+// confidence 0. Selected when CE_VP_DECODER=stub (or any tests that
+// explicitly switch via vp_seam_set_default).
+
+fn _vp_decode_stub(s, path) {
+    let feats = list_new()
+    push(feats, VP_STUB_LABEL)
+    return _vp_result(s, feats, VP_CONFIDENCE_STUB, "", "image: stub decoder (no pixel data)")
+}
+
+// ---- PGM decoder ----------------------------------------------------------
+//
+// Calls pgm_parse_file, then vp_features_for_image. Errors from the
+// underlying parser propagate to the seam's last_error slot and the
+// returned triple's error_msg. On error we still return a single-element
+// list with VP_STUB_LABEL so downstream callers always see at least one
+// atom (matches the contract of the STT seam).
+
+fn _vp_decode_pgm(s, path) {
+    let r = pgm_parse_file(path)
+    let err = pgm_result_error(r)
+    if len(err) > 0 {
+        let feats = list_new()
+        push(feats, VP_STUB_LABEL)
+        return _vp_result(s, feats, VP_CONFIDENCE_NONE, err, "image: pgm decode failed -- " + err)
+    }
+    let w    = pgm_result_width(r)
+    let h    = pgm_result_height(r)
+    let data = pgm_result_data(r)
+    let feats   = vp_features_for_image(w, h, data)
+    let summary = vp_summary_for_image(w, h, data)
+    return _vp_result(s, feats, VP_CONFIDENCE_DEFAULT, "", summary)
+}
+
+// ---- public dispatch ------------------------------------------------------
+
+// vp_decode_image(seam, path) -> [feature_atoms, confidence_milli,
+//                                 error_msg]
+//
+// Routes to the seam's active decoder. Tests can swap decoders via
+// vp_seam_set_default; chat / daemon resolves once from env.
+fn vp_decode_image(s, path) {
+    let id = s[VP_DEFAULT_DEC]
+    if id == VP_DECODER_PGM    { return _vp_decode_pgm(s, path) }
+    if id == VP_DECODER_STUB   { return _vp_decode_stub(s, path) }
+    // Custom / unknown ids fall through to STUB (same contract as
+    // stt_seam.nova). A pluggable future replaces this with a function-
+    // pointer table when NOVA gains first-class fn pointers.
+    return _vp_decode_stub(s, path)
+}
+
+// ---- result-tuple accessors (mirror stt_result_*) ------------------------
+
+fn vp_result_features(r)   { return r[0] }
+fn vp_result_confidence(r) { return r[1] }
+fn vp_result_error(r)      { return r[2] }
