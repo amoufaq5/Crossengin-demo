@@ -17,6 +17,65 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.6 minimum-viable differential privacy at the KG-query surface:
+  **complete** (ADR-0053). Today CrossEngin's KGs are queryable (atom
+  counts, beliefs, neighborhoods) but there is no formal privacy layer:
+  if two users teach a single soul, one user's queries can in principle
+  leak the other's teaching. New module
+  `src/safety/differential_privacy.nova` is the noise floor: a pure-
+  integer Laplace mechanism (Geometric-on-Z, drawn as G(p) - G(p)) over
+  numeric KG queries, with a per-session epsilon-budget accountant.
+  Default budget 10.0 epsilon (10000 milli-eps); override via
+  `CE_DP_EPSILON_BUDGET`. Each query consumes a piece of the budget;
+  on exhaustion the wrappers return `DP_REFUSED` and the caller-side
+  helper prints "budget exhausted". API: `dp_new(budget_milli)`,
+  `dp_consume(dp, eps_milli)`, `dp_remaining_budget(dp)`,
+  `dp_laplace_noise(dp, scale_milli)`, `dp_noisy_count(dp, true_count,
+  eps_milli)`, `dp_noisy_mean(dp, true_mean_milli, sens_milli,
+  eps_milli)`, `dp_reset_budget(dp, budget_milli)`,
+  `dp_budget_from_env()`. KG-side opt-in wrappers in
+  `src/kg/multi_kg_manager.nova`: `kg_atom_count_dp(kg, dp, eps_milli)`
+  (sensitivity 1) and `kg_atom_belief_mean_dp(kg, atom_id, dp,
+  eps_milli)` (sensitivity 1000 / (alpha+beta) milli, floored at 100).
+  Session integration: new `SES_DP` slot in `src/session/session.nova`
+  + `session_dp(s)` / `session_attach_dp(s, dp)` accessors. The chat
+  and daemon both wire a per-session dp_state at boot (one new
+  `dp_new(dp_budget_from_env())` call per session). Chat surface
+  (`examples/crossengin_chat.nova`): two new admin commands +
+  dispatch + /help -- `/dp_status` prints
+  `dp budget: 0 / 10000 milli-eps consumed (remaining 10000 milli-eps
+  over 0 queries)` and `/dp_query atoms` runs `kg_atom_count_dp` at
+  epsilon = 100 milli, printing both the true count and the noisy
+  count for operator inspection: `dp_query atoms: true=572 noisy=583
+  (epsilon=100 milli, remaining 9900)`. Post-exhaustion: `dp_query
+  atoms: budget exhausted (remaining 0 milli-eps)`. The original
+  `kg_atom_count` etc. are unchanged -- the DP variants are opt-in;
+  every caller that wants the privacy floor uses the `_dp` suffix.
+  NOVA gotchas worked around: the LCG seed is masked to 15 bits at
+  every step (the codegen pointer-threshold bug, NOVA #5/6 -- any
+  large multiply misroutes into `str_repeat`; the LCG uses small
+  multiplier 6917 < 2^13 and an avalanche XOR of the high half into
+  the low half each step to break the linearity of the 15-bit LCG's
+  low bits); the geometric loop is capped at 1000 iterations (the
+  brief calls this out as a known sharp edge). Acceptance:
+  `tests/unit/test_differential_privacy.nova` covers 52 assertions
+  across 16 test functions: budget accounting (new / consume / exhaust
+  edges / reset), Laplace mean near zero over 1000 samples (max |sum|
+  observed across 10 seeds: ~90), Laplace shape (~65% within +/-1
+  scale, ~83% within +/-2 -- matches the Laplace CDF), determinism
+  (same seed -> same sequence), noisy-count + noisy-mean variance and
+  clamping, refusal sentinel.
+  `tests/integration/scenario_p_dp_budget.sh` (NEW; 10 assertions): the
+  chat boots, /dp_status prints the initial 10000 milli budget, 130
+  /dp_query atoms calls drain the budget to zero (each call lists true
+  + noisy + remaining, monotonically decreasing), the second /dp_status
+  reports 10000 consumed / 0 remaining over 100 queries, a /dp_query
+  past exhaustion is refused. DP_AUDIT.md (NEW, repo root) documents
+  why integer Laplace is the right primitive, per-query sensitivities,
+  the moderate epsilon=10 default vs the 0.1-1.0 production-grade
+  setting, sequential composition + the gaps (advanced composition /
+  RDP / parallel composition / distributed DP for federated multi-soul
+  in P3.7), and the refusal-on-exhaustion contract.
 - P3.5 minimum-viable proof checker: **complete** (ADR-0052).
   Today reasoning produces a conclusion via operator chains
   (`fever -> infection -> treat`) but the chain itself is never surfaced --

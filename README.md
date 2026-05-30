@@ -11,7 +11,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 111 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 112 modules compile (`make build`, +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
@@ -27,7 +27,11 @@ computational units rather than orchestrating a pipeline of modules.
 > +2 from `io/transducers/{stt_seam,stream_audio}.nova` added in P2.5
 > STT framework + audit,
 > +1 from `parts/reasoning/proof_checker.nova` added in P3.5 minimum
-> viable proof checker), 117 unit-test suites pass
+> viable proof checker,
+> +1 from `safety/differential_privacy.nova` added in P3.6 minimum-viable
+> differential privacy at the KG-query surface (integer Laplace mechanism +
+> per-session epsilon-budget accountant, ADR-0053 -- documented in
+> [`DP_AUDIT.md`](./DP_AUDIT.md))), 118 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -68,8 +72,14 @@ computational units rather than orchestrating a pipeline of modules.
 > minimum-viable proof checker -- bounded BFS over the operator graph
 > returning audit-grade derivation traces with composed Bayesian
 > confidence, surfaced via the chat `/prove PREMISE CONCLUSION [DEPTH]`
-> admin command),
-> 22 end-to-end integration
+> admin command,
+> +1 suite / +52 assertions from `test_differential_privacy.nova` added in
+> P3.6 minimum-viable differential privacy at the KG-query surface --
+> integer Laplace mechanism (Geometric-on-Z), per-session epsilon-budget
+> accountant, `kg_atom_count_dp` / `kg_atom_belief_mean_dp` opt-in
+> wrappers, surfaced via the chat `/dp_status` + `/dp_query atoms` admin
+> commands, documented in [`DP_AUDIT.md`](./DP_AUDIT.md)),
+> 23 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -89,7 +99,12 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `scenario_o_proof_checker.sh` added in P3.5 minimum-viable
 > proof checker: /seed medical -> /prove headache hydration prints the
 > headache -> dehydration -> hydration operator chain with composed
-> confidence and visit/depth counters),
+> confidence and visit/depth counters,
+> +1 from `scenario_p_dp_budget.sh` added in P3.6 differential privacy
+> at the KG-query surface: /dp_status initial budget -> 130 /dp_query
+> atoms drains the 10000 milli-eps budget to zero (with true vs noisy
+> count per call, noise variance > 0 across draws) -> /dp_query past
+> exhaustion returns "budget exhausted"),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
