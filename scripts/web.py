@@ -25,8 +25,17 @@ Overrides:
     CE_PORT=9000 CE_BIN=./bin/crossengin-chat python3 scripts/web.py
     CE_WEB_MAX_SESSIONS=16 python3 scripts/web.py   # raise the LRU cap
 
-Diagnostic endpoint:
+Diagnostic endpoints:
     GET /api/sessions -> JSON list of {id, last_active_ms, age_ms}.
+    GET /metrics      -> Prometheus text-format scrape (P2.9). Bound to the
+                        same loopback default as /api/chat -- the probe is
+                        read-only (calls the chat's `/__metrics__` admin
+                        command, which only polls mo_poll and reads counters)
+                        and rate-limited to once per CE_METRICS_CACHE_S
+                        (default 10 seconds) per cookie. Cached responses
+                        let external scrapers (Prometheus, Grafana Agent)
+                        hit /metrics at the usual 15s scrape interval
+                        without serializing on the chat children.
 
 Requires: Python 3.7+ (for ThreadingHTTPServer). No third-party libraries.
 """
@@ -56,6 +65,12 @@ MAX_SESSIONS = int(os.environ.get("CE_WEB_MAX_SESSIONS", 8))
 PROMPT_END = b"> "
 READ_TIMEOUT = 30.0
 COOKIE_NAME = "ce_sid"
+# P2.9: how long a /metrics probe response is reused before refreshing. The
+# probe is cheap (one round-trip into a chat child plus a ~few-line parse) but
+# we don't want a Prometheus scraper at 15s intervals to serialize against
+# normal /api/chat traffic, so default 10s gives at most one fresh probe per
+# scrape window even with multiple scrapers per cookie.
+METRICS_CACHE_S = float(os.environ.get("CE_METRICS_CACHE_S", 10.0))
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +174,24 @@ class SessionStore:
         # cookie -> [ChatChild, created_ms, last_active_ms]
         self.children = {}
         self.lock = threading.Lock()
+        # P2.9: per-cookie POST counter and a tiny rolling latency window for
+        # the Prometheus scrape. `request_total` is a plain int (Counter); the
+        # latency window is the last N samples we average + cap into the
+        # response (a Prometheus Summary's _count / _sum is exact, the
+        # quantiles are approximate -- a uniform-cap rolling window is good
+        # enough at our request rate). `evicted_total` counts LRU evictions
+        # since startup (a process-wide Counter); the live total is len(children).
+        self.request_total = {}            # cookie -> int
+        self.request_durations = []        # rolling list of seconds (float)
+        self.request_durations_max = 256
+        self.evicted_total = 0
+        # P2.9 probe cache: cookie -> (expire_at, parsed_dict). The dict is the
+        # `key=value` map parsed out of the /__metrics__ block; we re-render
+        # the Prometheus text on every /metrics call but skip the actual probe
+        # while the cache is fresh. Each entry has its own expiry so different
+        # cookies don't share a single TTL.
+        self.metrics_cache = {}            # cookie -> (float expire, dict)
+        self.metrics_lock = threading.Lock()
         # Capture the chat's boot banner once so /api/banner can echo it
         # without spawning a child for the caller's cookie. We use a primer
         # child for this and shut it down immediately -- a one-shot ~100ms
@@ -199,10 +232,73 @@ class SessionStore:
                 key=lambda kv: kv[1][2],
             )
             del self.children[victim_cookie]
+            self.evicted_total += 1
             # /quit the victim outside our brief lock -- shutdown() can
             # block for up to 3s waiting for the child to drain.
             child = victim_entry[0]
             threading.Thread(target=child.shutdown, daemon=True).start()
+
+    def note_request(self, cookie, duration_s):
+        """Record one /api/chat POST for this cookie (counter += 1) and
+        append the wall-clock duration to the rolling latency window. Called
+        from the request handler after `child.send` returns (success or not).
+        """
+        with self.lock:
+            self.request_total[cookie] = self.request_total.get(cookie, 0) + 1
+            self.request_durations.append(float(duration_s))
+            if len(self.request_durations) > self.request_durations_max:
+                # Drop oldest -- the rolling window stays bounded so a long-
+                # running server doesn't grow without bound. Prometheus
+                # quantiles are approximate anyway; the _count / _sum we
+                # emit IS exact (running totals on top of the bounded list).
+                self.request_durations.pop(0)
+
+    def request_metrics_snapshot(self):
+        """Return ({cookie: count}, [durations]) for the /metrics renderer.
+        Both shallow copies; the caller iterates without holding our lock."""
+        with self.lock:
+            return dict(self.request_total), list(self.request_durations)
+
+    def evicted_count(self):
+        with self.lock:
+            return self.evicted_total
+
+    def cookie_for_probe(self):
+        """Return the cookie of the most-recently-active child, or None if
+        there are no live children. /metrics callers without their own cookie
+        (typical for a Prometheus scrape) probe whatever sessions exist
+        instead of spawning a fresh child for the scraper itself."""
+        with self.lock:
+            if not self.children:
+                return None
+            # Most-recently-active first -- a scrape that piggy-backs on the
+            # already-warm child is cheaper than waking an idle one.
+            return max(
+                self.children.items(),
+                key=lambda kv: kv[1][2],
+            )[0]
+
+    def probe_metrics(self, cookie, now):
+        """Run a /__metrics__ probe against the chat child bound to `cookie`
+        (or serve a cached value within METRICS_CACHE_S). Returns a parsed
+        `dict` of `key -> value` (values are strings; the renderer converts).
+        Raises if the cookie has no live child."""
+        with self.metrics_lock:
+            entry = self.metrics_cache.get(cookie)
+            if entry is not None and entry[0] > now:
+                return dict(entry[1])
+        # Fall through: probe the child without holding metrics_lock. The
+        # child's request_lock serializes against /api/chat already.
+        with self.lock:
+            child_entry = self.children.get(cookie)
+            child = child_entry[0] if child_entry else None
+        if child is None:
+            raise RuntimeError(f"no live child for cookie {cookie}")
+        raw = child.send("/__metrics__")
+        parsed = _parse_metrics_block(raw)
+        with self.metrics_lock:
+            self.metrics_cache[cookie] = (now + METRICS_CACHE_S, parsed)
+        return dict(parsed)
 
     def snapshot(self):
         """Return a JSON-serializable list of session diagnostics."""
@@ -227,6 +323,216 @@ class SessionStore:
                 entry[0].shutdown()
             except Exception:
                 pass
+
+
+# --------------------------------------------------------------------------
+# P2.9: /metrics. The chat child's `/__metrics__` admin command emits a block
+# bounded by `METRICS_BEGIN` / `METRICS_END` with one `key=value` line per
+# metric. We parse that into a dict, then render Prometheus text-format with
+# the per-cookie labels.
+
+# Prometheus label-value escaping per the exposition format spec: backslash,
+# newline, double-quote.
+def _esc_label(v):
+    return (
+        str(v)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
+
+
+def _parse_metrics_block(raw):
+    """Extract `key=value` lines bounded by METRICS_BEGIN / METRICS_END.
+    Returns a dict; unparseable lines are skipped silently (the chat-side
+    block is well-defined, but the chat also prints a trailing perceive line
+    we want to ignore)."""
+    out = {}
+    in_block = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if line == "METRICS_BEGIN":
+            in_block = True
+            continue
+        if line == "METRICS_END":
+            in_block = False
+            continue
+        if not in_block:
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _milli_to_unit(v):
+    """ADR-0050 percentages and ADR-0034 mood values are stored as milli
+    (0..1000). The Prometheus convention is a unit-scale 0..1 gauge, so we
+    divide by 1000 for the on-the-wire value."""
+    try:
+        return float(v) / 1000.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def render_prometheus(store):
+    """Compose a Prometheus text-format response from a probe of every live
+    session plus the process-wide counters. The body is a single string with
+    LF line terminators per the spec; the HTTP handler sets the matching
+    `Content-Type: text/plain; version=0.0.4` header."""
+    now = time.time()
+    lines = []
+
+    # ---- per-session gauges (probed via /__metrics__) -------------------
+    # Walk the live children with their cookies; the probe is cached per
+    # cookie so a tight scrape loop only round-trips into the child once
+    # per METRICS_CACHE_S.
+    sessions = store.snapshot()
+    per_sid_metrics = []  # [(sid, parsed_dict)]
+    for sess in sessions:
+        sid = sess["id"]
+        try:
+            parsed = store.probe_metrics(sid, now)
+        except Exception:
+            # A child that has exited mid-probe shouldn't poison the whole
+            # response; just skip its row.
+            continue
+        per_sid_metrics.append((sid, parsed))
+
+    def emit(name, help_text, metric_type, samples):
+        # samples: list of (label_str, float_value)
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {metric_type}")
+        for label_str, value in samples:
+            if label_str:
+                lines.append(f"{name}{{{label_str}}} {value}")
+            else:
+                lines.append(f"{name} {value}")
+
+    # atom_count (reasoning + language)
+    reasoning_samples = []
+    language_samples = []
+    refl_samples = []
+    dlog_samples = []
+    valence_samples = []
+    arousal_samples = []
+    tick_rate_samples = []
+    overrun_samples = []
+    promotion_samples = {}   # source -> [(sid, value)]
+    atrophy_samples = {}     # source -> [(sid, value)]
+    for sid, parsed in per_sid_metrics:
+        lbl = f'sid="{_esc_label(sid)}"'
+        reasoning_samples.append(
+            (f'kg="reasoning",sid="{_esc_label(sid)}"',
+             _as_float(parsed.get("atom_count_reasoning", 0))))
+        language_samples.append(
+            (f'kg="language",sid="{_esc_label(sid)}"',
+             _as_float(parsed.get("atom_count_language", 0))))
+        refl_samples.append(
+            (lbl, _as_float(parsed.get("refl_atom_count", 0))))
+        dlog_samples.append(
+            (lbl, _as_float(parsed.get("dlog_entries", 0))))
+        valence_samples.append(
+            (lbl, _milli_to_unit(parsed.get("soul_mood_valence", 0))))
+        arousal_samples.append(
+            (lbl, _milli_to_unit(parsed.get("soul_mood_arousal", 0))))
+        tick_rate_samples.append(
+            (lbl, _as_float(parsed.get("scheduler_rate_hz", 0))))
+        overrun_samples.append(
+            (lbl, _as_float(parsed.get("scheduler_overruns", 0))))
+        # promotion_milli_<source> / atrophy_milli_<source>
+        for k, v in parsed.items():
+            if k.startswith("promotion_milli_"):
+                src = k[len("promotion_milli_"):]
+                promotion_samples.setdefault(src, []).append(
+                    (f'source="{_esc_label(src)}",sid="{_esc_label(sid)}"',
+                     _milli_to_unit(v)))
+            elif k.startswith("atrophy_milli_"):
+                src = k[len("atrophy_milli_"):]
+                atrophy_samples.setdefault(src, []).append(
+                    (f'source="{_esc_label(src)}",sid="{_esc_label(sid)}"',
+                     _milli_to_unit(v)))
+
+    emit("crossengin_atom_count",
+         "Atoms in a per-session knowledge graph (kg label: reasoning|language).",
+         "gauge", reasoning_samples + language_samples)
+    emit("crossengin_refl_atom_count",
+         "Tentative reflection-KG atoms per session.",
+         "gauge", refl_samples)
+    emit("crossengin_dlog_entries",
+         "Decision-log entries per session (ADR-0043).",
+         "gauge", dlog_samples)
+    # Promotion / atrophy: one TYPE line per metric name, sources interleaved.
+    promo_all = []
+    for src, rows in promotion_samples.items():
+        promo_all.extend(rows)
+    emit("crossengin_promotion_rate",
+         "Per-source promotion rate (tentative->durable) from /meta (ADR-0050, unit scale 0..1).",
+         "gauge", promo_all)
+    atroph_all = []
+    for src, rows in atrophy_samples.items():
+        atroph_all.extend(rows)
+    emit("crossengin_atrophy_rate",
+         "Per-source atrophy rate (durable->sub-threshold or vanished) from /meta (ADR-0050, unit scale 0..1).",
+         "gauge", atroph_all)
+    emit("crossengin_soul_mood_valence",
+         "Soul mood valence (ADR-0034, unit scale 0..1).",
+         "gauge", valence_samples)
+    emit("crossengin_soul_mood_arousal",
+         "Soul mood arousal (ADR-0034, unit scale 0..1).",
+         "gauge", arousal_samples)
+    emit("crossengin_scheduler_tick_rate",
+         "Current hybrid-scheduler rate in Hz (100=active, 10=idle; ADR-0037).",
+         "gauge", tick_rate_samples)
+    emit("crossengin_scheduler_overruns",
+         "Realtime pacer overrun count per session (P0.6; 0 in chat mode -- pacer is daemon-only).",
+         "counter", overrun_samples)
+
+    # ---- process-wide gauges -------------------------------------------
+    emit("crossengin_active_session_count",
+         "Total live sessions in web.py's per-cookie store.",
+         "gauge", [("", float(len(sessions)))])
+    emit("crossengin_evicted_session_count",
+         "Cumulative LRU evictions since web.py startup.",
+         "counter", [("", float(store.evicted_count()))])
+
+    # ---- per-cookie request counter ------------------------------------
+    request_total, durations = store.request_metrics_snapshot()
+    request_rows = [
+        (f'cookie="{_esc_label(c)}"', float(n))
+        for c, n in request_total.items()
+    ]
+    emit("crossengin_request_total",
+         "Total /api/chat POST count per cookie since web.py startup.",
+         "counter", request_rows)
+
+    # ---- request duration summary --------------------------------------
+    # Approximate: _count and _sum are exact over the rolling window; the
+    # 0.5 / 0.9 / 0.99 quantiles are computed from the window snapshot.
+    count = len(durations)
+    total = sum(durations)
+    lines.append("# HELP crossengin_request_duration_seconds /api/chat wall-clock latency over the last 256 requests.")
+    lines.append("# TYPE crossengin_request_duration_seconds summary")
+    if count > 0:
+        ordered = sorted(durations)
+        for q in (0.5, 0.9, 0.99):
+            idx = int(q * (count - 1))
+            lines.append(
+                f'crossengin_request_duration_seconds{{quantile="{q}"}} {ordered[idx]}'
+            )
+    lines.append(f"crossengin_request_duration_seconds_count {count}")
+    lines.append(f"crossengin_request_duration_seconds_sum {total}")
+
+    # Spec requires a trailing newline; concatenate and add the LF.
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -398,6 +704,14 @@ def make_handler(store):
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_text(self, body, content_type="text/plain; charset=utf-8"):
+            data = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
             cookie, is_new = self._cookie_for()
             set_cookie = cookie if is_new else None
@@ -419,6 +733,26 @@ def make_handler(store):
                     {"sessions": store.snapshot()},
                     set_cookie=set_cookie,
                 )
+            if self.path == "/metrics":
+                # P2.9: Prometheus text-format scrape. Read-only (the
+                # underlying probe just polls counters via /__metrics__);
+                # bound to the same loopback default as /api/chat. We do NOT
+                # call store.get_or_create here -- a Prometheus scraper has
+                # no business spawning a fresh ChatChild just to scrape.
+                # render_prometheus walks the existing live sessions and
+                # piggy-backs on them via the per-cookie probe cache.
+                try:
+                    body = render_prometheus(store)
+                except Exception as e:
+                    return self._send_json(500, {"error": str(e)})
+                # Standard exposition Content-Type per the OpenMetrics spec
+                # (Prometheus accepts text/plain too, but versioned form is
+                # the canonical choice -- avoid the "no version" warning in
+                # Prometheus's log when it scrapes us).
+                return self._send_text(
+                    body,
+                    content_type="text/plain; version=0.0.4; charset=utf-8",
+                )
             return self._send_json(404, {"error": "not found"}, set_cookie=set_cookie)
 
         def do_POST(self):
@@ -434,6 +768,11 @@ def make_handler(store):
             message = (payload.get("message") or "").strip()
             if not message:
                 return self._send_json(400, {"error": "empty message"}, set_cookie=set_cookie)
+            # P2.9: time the round-trip so /metrics can publish a request
+            # duration summary. The counter ticks once per attempt regardless
+            # of outcome (a 504/500 is still a request the operator wanted to
+            # count).
+            t0 = time.time()
             try:
                 child = store.get_or_create(cookie)
                 reply = child.send(message)
@@ -446,6 +785,8 @@ def make_handler(store):
                 return self._send_json(504, {"error": str(e)}, set_cookie=set_cookie)
             except Exception as e:
                 return self._send_json(500, {"error": str(e)}, set_cookie=set_cookie)
+            finally:
+                store.note_request(cookie, time.time() - t0)
 
     return Handler
 

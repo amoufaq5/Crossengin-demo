@@ -387,6 +387,55 @@ continue. It is updated at every session boundary.
   via spreading_activation, cross-KG ref case, paraphrase via lexical
   fallback, exact-match dominance) with 30 assertions across 10 test
   functions.
+- P2.1 + P2.2 -- cofire and syntactic-slot similarity sources: **complete**.
+  Two more substrate-native similarity sources for `find_neighbors`, both
+  deferred from the original Phase 14 / Tier-2 #2 work because they needed
+  side-indices. Now closed.
+  **P2.1 (co-fire from moment_stream):** `src/reader/cofire_index.nova` is
+  a side-table keyed by canonicalized atom-id-pair, counting how many
+  distinct moments their activations co-appeared. `ci_strength(ci, a, b)
+  -> milli` normalizes by the GLOBAL maximum co-fire count -- a rare pair
+  that fires as often as the most-frequent pair still scores 1000; a pair
+  that appeared in only 1 of 10 max moments scores 100. Storage is a list
+  of `[kg_label_a, atom_a, kg_label_b, atom_b, count]` rows; lookup is a
+  linear scan (N small in practice; deferred hash index per NEXT_SESSION
+  blocker #1). Wired at the PERCEIVED -> SETTLED transition: the daemon
+  calls `ms_settle_old_with_cofire(stream, now, ci, kg_label)` at every
+  idle tick, which fires `ci_record_moment(ci, kg_label, moment_trace(m))`
+  exactly once per moment as it crosses the settle boundary. Empty traces
+  and singleton traces are no-ops.
+  **P2.2 (syntactic-slot from output_generation):** `src/reader/
+  slot_index.nova` is a side-table keyed by (pattern_atom_id, role_name)
+  with a histogram of atom-ids that have filled the slot. `si_strength(si,
+  a, b) -> milli` sums each slot's contribution and clamps to 1000; the
+  per-slot contribution is `min(count_a, count_b) * 1000 / slot_max`, so
+  the rarer filler bounds the strength. Wired at the output-generation
+  callsite: the daemon's `gen_from_intent_with_slot(lang, cands, intent,
+  moment, si)` records each `[role, word_atom]` filler after the chosen
+  pattern is selected. Different roles return 0; different patterns share
+  no slot; two atoms that have co-filled the same (pattern, role) cell
+  surface as role-neighbors.
+  **`find_neighbors_full(kg_reg, source, ci, si, max_hops, max_results)`**
+  takes both indices, walks all five sources (operator, xref, sense,
+  cofire, slot) into one accumulator, and clamps at 1000 per-neighbor. The
+  3-arg `find_neighbors(...)` stays as a wrapper that passes `ci=0, si=0`
+  so legacy callers and all pre-P2.1/P2.2 tests are bit-identical.
+  Sample (paraphrase demo, fever+infection seeded chat history of 10
+  co-occurring moments): `ci_strength(fever, infection) = 1000`,
+  `ci_strength(fever, treat) = 300` (3 of max 10), `si_strength` between
+  two TOPIC-role co-fillers = 1000; baseline `find_neighbors(fever)` gave
+  `infection=1000, treat=600` (2-hop xref decayed), but
+  `find_neighbors_full(fever, ci, 0)` lifts `treat` to 900 via the cofire
+  evidence the moment-stream collected. Acceptance:
+  `tests/unit/test_cofire_index.nova` (35 assertions across 10 functions),
+  `tests/unit/test_slot_index.nova` (23 assertions across 10 functions),
+  plus 4 new tests added to `tests/unit/test_neighborhood_activation.nova`
+  (cofire-only neighbor, slot-only neighbor, combined-clamped, 3-arg
+  wrapper bit-identity) bringing that suite from 30 to 45 assertions. The
+  daemon + chat now allocate `ci_new()` / `si_new()` at boot and pass them
+  into the settle and gen calls; no new admin commands. The indices are
+  NOT yet persisted across sessions -- next-session indices start fresh; a
+  Phase-10 follow-up will lift them into the snapshot.
 - Phase 19 Tier-4 item #1 -- audio modality bridge: **complete**.
   Two new modules under `src/io/effectors/` realize the minimum-viable
   audio leg of ADR-0014 -- the modality bridge that until now was a
@@ -758,7 +807,9 @@ signals.
 | reader/lexical_anchor.nova | 0012 (stage 1), 0011 | 19 | done |
 | reader/context_bias.nova | 0012 (stage 2) | 9 | done |
 | reader/spreading_activation.nova | 0012 (stage 3), 0017 | 9 | done |
-| reader/neighborhood.nova (Phase 14 Tier-2 #2: structural-neighborhood) | 0012, 0017, 0031, 0015 | 30 | done |
+| reader/neighborhood.nova (Phase 14 Tier-2 #2: structural-neighborhood; P2.1+P2.2 follow-up adds find_neighbors_full with cofire + slot side-indices) | 0012, 0017, 0031, 0015, 0021 | 45 | done |
+| reader/cofire_index.nova (P2.1: co-fire side-index, atom-pair counts from settled moments) | 0021, 0012 | 35 | done |
+| reader/slot_index.nova (P2.2: syntactic-slot side-index, (pattern, role) filler histogram from output generation) | 0015, 0013, 0012 | 23 | done |
 | reader/coherence_check.nova | 0012 (stage 4) | 11 | done |
 | reader/fetch_route_learn.nova | 0012 (stage 5) | 11 | done |
 | reader/reader.nova | 0011, 0012 | 13 | done |
@@ -1099,7 +1150,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 114 (114 PASS, +1 from P2.4 `test_atom_store_index.nova`); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`).
+- Total unit suites: 114 (114 PASS, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.

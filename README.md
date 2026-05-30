@@ -15,7 +15,9 @@ computational units rather than orchestrating a pipeline of modules.
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
 > plain-HTTP in-process transport seam, +4 from `seed/pack_registry.nova` +
 > `seed/packs/{medical,ops_runbook,code_review}_pack.nova` added in P1.9
-> domain seed packs), 109 unit-test suites pass
+> domain seed packs, +2 from `reader/cofire_index.nova` +
+> `reader/slot_index.nova` added in P2.1/P2.2 co-fire + syntactic-slot
+> similarity side-indices), 114 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -32,7 +34,12 @@ computational units rather than orchestrating a pipeline of modules.
 > plain-HTTP client + dispatcher,
 > +4 suites / +73 assertions from `test_pack_registry.nova` +
 > `test_medical_pack.nova` + `test_ops_pack.nova` +
-> `test_code_review_pack.nova` added in P1.9 domain seed packs),
+> `test_code_review_pack.nova` added in P1.9 domain seed packs,
+> +2 suites / +58 assertions from `test_cofire_index.nova` +
+> `test_slot_index.nova` added in P2.1/P2.2 co-fire + syntactic-slot
+> similarity side-indices, plus +15 assertions to
+> `test_neighborhood_activation.nova` (30 -> 45) covering
+> `find_neighbors_full` with the two new index sources),
 > 19 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
