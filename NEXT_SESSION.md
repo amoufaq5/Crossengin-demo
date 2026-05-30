@@ -17,6 +17,44 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P2.4 atom-store hash index (label + kind buckets): **complete**.
+  `src/kg/multi_kg_manager.nova` now carries a side-table label hash index
+  inside every KG (`KG_LABEL_IDX`, `LABEL_BUCKETS = 256` buckets of
+  `[label_hash, atom_id]` pairs) plus a parallel kind index
+  (`KG_KIND_IDX`, `ATOM_KIND_COUNT` lists of atom_ids). `kg_find_atom(kg,
+  label)` now hashes the label (deterministic shift-xor in
+  `atom_store.nova::label_hash` — `h = ((h * 31) + c) & 32767`, seed 5381,
+  bucket = `h & 255`), jumps to the bucket, and linear-walks the small
+  bucket; with 1000 atoms each bucket holds ~4 entries so lookup is
+  effectively O(1) amortized. The hash function uses a 15-bit mask
+  (32767 max) so the multiply intermediate stays well below NOVA's
+  large-magnitude pointer-threshold (0x100000) — see footgun #11. Mutation
+  hooks: `kg_add_atom` populates both indexes after appending the atom,
+  `kg_remove_atom` (new, for atom_death_monitor's tombstone path) deletes
+  the index entries but leaves the atom slot in place so existing handle
+  callers don't blow up. Snapshot rehydrate: `kg_section_apply` in
+  `snapshot_disk.nova` now ends with a per-KG `kg_rebuild_index(kg)` so
+  rehydrated atoms are addressable on the first lookup; `kg_rebuild_index`
+  also auto-installs the index slots on a legacy KG that lacks them
+  (backwards-compat). Backwards-compat: `kg_find_atom` checks
+  `_kg_has_index(kg)` and falls back to the original linear scan if
+  absent (a snapshot rehydrated through some other path stays
+  functional). `kg_atoms_by_kind(kg, kind)` is the matching public read
+  surface for the kind index. Acceptance:
+  `tests/unit/test_atom_store_index.nova` covers the hash function
+  (determinism, range/mask invariants), fresh-KG index-slot presence,
+  add->hit / remove->miss mutation hooks, hash-collision retrievability,
+  1000-atom indexed lookup under 50ms wall-clock (via `nanotime()`), the
+  snapshot rehydrate path (clear-then-`kg_rebuild_index` round-trip),
+  5000-atom (2x 2500) cross-KG isolation including a shared-label probe
+  in both KGs, and the legacy-snapshot linear-scan fallback for a
+  hand-built indexless KG — 61 assertions across 10 test functions.
+  `tests/benchmark/bench_kg_query.nova` extended with a head-to-head
+  section (1000-atom KG, 1M lookups via `nanotime()`):
+  `indexed elapsed(ms): ~170` vs `scalar elapsed(ms): ~8700`, **speedup
+  ratio ~50x** (within the bounds of O(1) vs O(N/2=500) with constant
+  factors). The legacy 3000-atom scalar-walk section is kept for
+  comparison with prior benchmark runs.
 - P0.6 real-time wall-clock pacer: **complete**.
   New `src/scheduler/realtime_pacer.nova` turns the abstract "100Hz active /
   10Hz idle" tiers into actual wall-clock pacing. The pacer samples
@@ -79,6 +117,64 @@ continue. It is updated at every session boundary.
   `dlog: ... loaded N prior entries` boot banner. Sample smoke:
   `CE_DLOG_PATH=/tmp/test.dlog ./bin/crossengin && wc -l /tmp/test.dlog`
   prints `7 /tmp/test.dlog` first run, `14 /tmp/test.dlog` second run.
+- P2.9 Prometheus `/metrics` scrape endpoint: **complete**.
+  `scripts/web.py` now serves `GET /metrics` in the Prometheus text-format
+  (`# HELP <name> <help>` + `# TYPE <name> gauge|counter|summary` framing
+  followed by `name{labels} value` samples), so external monitors
+  (Prometheus, Grafana Agent, vmagent, ...) can scrape live agent state at
+  the usual 15s cadence. Probe path: the chat side gained an
+  underscore-prefixed `/__metrics__` admin command that walks the live
+  session and emits one `key=value` line per metric between explicit
+  `METRICS_BEGIN` / `METRICS_END` markers (so the python parser doesn't
+  depend on log-line ordering); web.py runs that probe lazily per cookie
+  and caches each parsed response for `CE_METRICS_CACHE_S` seconds
+  (default 10) so a tight scrape loop never serializes against `/api/chat`
+  traffic. Metric families exposed: `crossengin_atom_count{kg=...,sid=...}`
+  (reasoning + language KGs), `crossengin_refl_atom_count{sid=...}`,
+  `crossengin_dlog_entries{sid=...}`, `crossengin_promotion_rate`
+  + `crossengin_atrophy_rate` (`{source=...,sid=...}`, ADR-0050 milli
+  percent rescaled to unit 0..1), `crossengin_soul_mood_valence` /
+  `crossengin_soul_mood_arousal{sid=...}` (ADR-0034 mood, rescaled
+  0..1), `crossengin_scheduler_tick_rate{sid=...}` (Hz),
+  `crossengin_scheduler_overruns{sid=...}` (P0.6 pacer counter, 0 in
+  chat mode), `crossengin_active_session_count` (live SessionStore size),
+  `crossengin_evicted_session_count` (cumulative LRU evictions),
+  `crossengin_request_total{cookie=...}` (per-cookie POST counter), and
+  the `crossengin_request_duration_seconds` summary with `_count`,
+  `_sum`, and `{quantile="0.5|0.9|0.99"}` over a 256-sample rolling
+  window. The `/__metrics__` admin command is read-only -- the probe only
+  calls `mo_poll` (the same idempotent side-effect `/meta` does) and
+  reads `kg_atom_count` / `dl_count` / soul mood / `hs_now` / `hs_rate`.
+  `/metrics` inherits the loopback bind default from `/api/chat`
+  (`CE_BIND` env defaults to `127.0.0.1`), so a `CE_BIND=0.0.0.0` deploy
+  must accept the same caveat as the rest of the admin surface (a curl
+  from the LAN can scrape the agent's live state). The endpoint never
+  spawns a `ChatChild` -- a Prometheus scraper with no cookie sees only
+  the process-wide counters plus per-cookie data for whichever sessions
+  are already alive, never extending the LRU footprint. Acceptance:
+  `tests/integration/scenario_m_metrics_endpoint.sh` (35 assertions):
+  asserts the static loopback bind + cache env, launches the server,
+  POSTs `hello` to materialise a cookie's child, scrapes `/metrics`,
+  validates HTTP 200 + `Content-Type: text/plain; version=0.0.4`,
+  validates the `# HELP` / `# TYPE` framing for every metric family
+  exposed, validates label shapes (`{kg="reasoning",sid="..."}`,
+  `{cookie="..."}`, `{source=...,sid=...}`, etc.), asserts
+  `request_total >= 1` after the POST, asserts the second scrape inside
+  the cache window returns the same per-sid atom counts (cache hit, no
+  re-probe), and confirms `/metrics` is read-only (active session count
+  is unchanged across two scrapes). Sample output (10 lines):
+  ```
+  # HELP crossengin_atom_count Atoms in a per-session knowledge graph (kg label: reasoning|language).
+  # TYPE crossengin_atom_count gauge
+  crossengin_atom_count{kg="reasoning",sid="947f14a4-..."} 572.0
+  crossengin_atom_count{kg="language",sid="947f14a4-..."} 547.0
+  # HELP crossengin_dlog_entries Decision-log entries per session (ADR-0043).
+  # TYPE crossengin_dlog_entries gauge
+  crossengin_dlog_entries{sid="947f14a4-..."} 2.0
+  # HELP crossengin_soul_mood_valence Soul mood valence (ADR-0034, unit scale 0..1).
+  # TYPE crossengin_soul_mood_valence gauge
+  crossengin_soul_mood_valence{sid="947f14a4-..."} 0.656
+  ```
 - Phase 13 Tier-2 item #1 -- meta-learning observer: **complete**.
   New `src/parts/meta/meta_observer.nova` (ADR-0050) is a low-frequency,
   purely-observational loop: it snapshots per-source atom-belief
@@ -635,8 +731,9 @@ implemented in-house (see NOVA blockers).
 
 | Module | ADRs | Unit asserts | Status |
 |--------|------|--------------|--------|
-| atom_store.nova | 0016, 0023 | 42 | done |
-| multi_kg_manager.nova | 0004, 0016 | 23 | done |
+| atom_store.nova (P2.4 added `label_hash` + `LABEL_BUCKETS` for the hash index) | 0016, 0023 | 42 | done |
+| multi_kg_manager.nova (P2.4: hash + kind indexes, `kg_remove_atom`, `kg_rebuild_index`, `kg_atoms_by_kind`) | 0004, 0016 | 23 | done |
+| atom_store_index (P2.4 hash + kind indexes: separate test suite) | 0016, 0049 | 61 | done |
 | cross_kg_references.nova | 0017, 0004 | 20 | done |
 | schemas.nova | 0018 | 13 | done |
 | concept_layer.nova | 0018 | 28 | done |
@@ -1002,17 +1099,21 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 103 (the prior 102 + `test_http_client` (P1.4)); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`).
+- Total unit suites: 114 (114 PASS, +1 from P2.4 `test_atom_store_index.nova`); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 17 scripts under `tests/integration/` covering 10 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4]) and 5 admin-command edge-case scripts. Run with `make integration`.
+- Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.
 - Total benchmarks: 3 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution
   clock): single-part ~60k ticks/sec; full 7-part substrate ~35k part-ticks/sec;
-  node throughput ~768k integrations/sec; KG O(1) id-lookup ~300k/sec; KG O(n)
-  label scan is the slow path (linear over atoms) -- a scalable name index is a
-  future optimization. These bound the current scalar implementation.
+  node throughput ~768k integrations/sec; KG O(1) id-lookup ~300k/sec.
+  **P2.4 (this revision):** KG label lookup is now O(1) amortized via a hash
+  index inside each KG (`bench_kg_query`'s head-to-head section): 1M lookups
+  over a 1000-atom KG -- **indexed ~170ms (~6M lookups/sec) vs scalar walk
+  ~8700ms (~115k lookups/sec); ratio ~50x**. The legacy O(N) linear scan is
+  preserved as a backwards-compat fallback for KGs rehydrated from snapshots
+  predating P2.4. These bound the current scalar implementation.
 
 ## ADR ambiguities encountered
 
