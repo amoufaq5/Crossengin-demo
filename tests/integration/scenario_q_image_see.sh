@@ -70,8 +70,10 @@ INPUT=$(
 
 OUT=$(echo "$INPUT" | "$CHAT" 2>&1)
 
-# 1. /help advertises /see PATH.
-assert_match "$OUT" "/see PATH +decode the PGM image at PATH" \
+# 1. /help advertises /see PATH. (Help text covers both PGM and PNG
+# after P3.1.PNG; the original PGM-only wording was relaxed to match
+# the broader "decode the PGM ... PNG ... image" line.)
+assert_match "$OUT" "/see PATH +decode the PGM .* image" \
     "/help advertises /see"
 
 # 2. /see with no arg prints the usage line.

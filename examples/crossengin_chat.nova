@@ -52,6 +52,7 @@ import "../src/persistence/snapshot_disk.nova"
 import "../src/session/session.nova"
 import "../src/safety/differential_privacy.nova"
 import "../src/learning/federated_aggregator.nova"
+import "../src/learning/secure_aggregation.nova"
 import "../src/chat/helpers.nova"
 
 let CE_CAP   = 128
@@ -407,9 +408,11 @@ fn _admin_help() {
     io_println("  /meta-apply         commit those source_authority tier changes")
     io_println("  /speak [TEXT]       synthesize and play TEXT (or last reply); writes")
     io_println("                      /tmp/ce_speech.wav and plays via aplay if available")
-    io_println("  /see PATH           decode the PGM image at PATH via the visual seam;")
-    io_println("                      prints dims + mean + feature atoms (image_dim_*,")
-    io_println("                      image_dark/mid/bright, image_bucket_<0..7>, ...)")
+    io_println("  /see PATH           decode the PGM (.pgm) or grayscale-8 PNG (.png) image at")
+    io_println("                      PATH via the visual seam; prints dims + mean + feature")
+    io_println("                      atoms (image_dim_*, image_dark/mid/bright,")
+    io_println("                      image_bucket_<0..7>, ...). PNG: stored-DEFLATE only --")
+    io_println("                      see IMAGE_AUDIT.md for the Huffman roadmap.")
     io_println("  /play PATH [N]      decode N frames (default 10) of the Y4M video at PATH")
     io_println("                      via the video seam; emits per-frame events + motion +")
     io_println("                      scene-change atoms. See VIDEO_AUDIT.md for codecs.")
@@ -904,8 +907,12 @@ fn _admin_see(arg) {
     }
     let feats = vp_result_features(r)
     let summary = vp_seam_last_summary(_vp_seam)
+    // Report the decoder actually used (may differ from the seam's
+    // default when extension routing dispatched .png -> PNG / .pgm -> PGM).
+    let dec_name = vp_seam_last_decoder_name(_vp_seam)
+    if len(dec_name) == 0 { dec_name = vp_seam_decoder_name(_vp_seam) }
     io_println("(saw image " + arg + " [" + summary
-        + ", decoder=" + vp_seam_decoder_name(_vp_seam) + "])")
+        + ", decoder=" + dec_name + "])")
     let i = 0
     let labels = ""
     while i < len(feats) {
@@ -1787,6 +1794,123 @@ fn _fed_parse_url(arg) {
     return out
 }
 
+// P3.8 SecAgg-mode one-round driver. Reads FED_ROUND, emits all
+// FED_STAT_MASKED records, sends ACK <round_id>, collects
+// FED_AGGREGATE_SUM replies. Returns [completed, round_id, stats_sent,
+// aggs_recv].
+fn _admin_fed_one_round_secagg(f, fd, source_auth) {
+    let out = list_new()
+    push(out, 0)        // completed
+    push(out, 0 - 1)    // round_id
+    push(out, 0)        // stats_sent
+    push(out, 0)        // aggs_recv
+    let line = _admin_recv_line(fd)
+    if line == 0 { return out }
+    let rec = _admin_parse_fed_line(line)
+    if rec == 0 { return out }
+    let t = rec[0]
+    // Expect FED_ROUND.
+    if t != FED_EV_ROUND { return out }
+    let round_id = rec[FEDR_ROUND_ID]
+    let deadline = rec[FEDR_DEADLINE]
+    list_set(out, 1, round_id)
+    fed_agg_round_start(f, round_id, deadline)
+    let stats = fed_agg_emit_masked_stats(f)
+    let i = 0
+    while i < len(stats) {
+        let row = stats[i]
+        let stat_line = fed_agg_format_stat_masked_line(f, row[0], row[1], row[2])
+        if _admin_send_line(fd, stat_line) == 0 {
+            i = len(stats)
+        } else {
+            list_set(out, 2, out[2] + 1)
+            i = i + 1
+        }
+    }
+    let ack_line = "ACK " + int_to_str(round_id) + "\n"
+    let _ack = _admin_send_line(fd, ack_line)
+    // Collect FED_AGGREGATE_SUM replies.
+    let go = 1
+    while go == 1 {
+        let aline = _admin_recv_line(fd)
+        if aline == 0 { go = 0 }
+        else {
+            let arec = _admin_parse_fed_line(aline)
+            if arec == 0 { go = 0 }
+            else {
+                let tt = arec[0]
+                if tt == SECAGG_EV_AGG_SUM {
+                    let rid = arec[1]
+                    if rid == round_id {
+                        let tag = arec[2]
+                        let sp = arec[3]
+                        let sa_ = arec[4]
+                        let n = arec[5]
+                        fed_agg_receive_aggregate_sum(f, tag, sp, sa_, n, source_auth)
+                        list_set(out, 3, out[3] + 1)
+                    }
+                } else { go = 0 }
+            }
+        }
+    }
+    fed_agg_round_end(f, round_id)
+    list_set(out, 0, 1)
+    return out
+}
+
+// Tiny IO wrappers so _admin_fed_one_round_secagg can use the chat's
+// existing per-line send/recv shape. We reuse fed_send_join's
+// underlying send_data loop via the federated_aggregator's
+// `_fed_send_all` -- but that's a private helper, so we replicate a
+// small version here.
+fn _admin_send_line(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _admin_recv_line(fd) {
+    let cap = 1024
+    let buf = alloc(cap)
+    let n = 0
+    while n < cap - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return buf
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return buf
+        }
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+// Parse a FED_ROUND / FED_AGGREGATE_SUM line by dispatching to the
+// federated_aggregator's parser for FED_ROUND, or to the SecAgg
+// module's parser for FED_AGGREGATE_SUM. We inline a tiny dispatch
+// here so we don't have to add a new wrapper in either module.
+fn _admin_parse_fed_line(text) {
+    // Try FED_ROUND first.
+    let r = _fed_parse_line(text)
+    if r != 0 { return r }
+    // Then FED_AGGREGATE_SUM.
+    let s = sa_parse_line(text)
+    if s != 0 { return s }
+    return 0
+}
+
 fn _admin_fed_join(sess, arg, source_auth) {
     if _fed_conn_fd >= 0 {
         io_println("(already joined a federation -- use /fed_leave first)")
@@ -1807,6 +1931,60 @@ fn _admin_fed_join(sess, arg, source_auth) {
     }
     let soul_id = session_id(sess)
     if len(soul_id) == 0 { soul_id = "default" }
+    // P3.8: detect SecAgg opt-in via CE_SECAGG_ENABLED. When set, dial
+    // the coordinator with the v2-sa HELLO, build an sa_state from
+    // env's CE_SECAGG_PEERS + CE_FED_TOKEN_<peer>, register peers, and
+    // drive the round via the SecAgg masked-stat path. Default: v1.
+    let secagg = sa_enabled_from_env()
+    if secagg == 1 {
+        io_println("fed_join: [SECAGG] enabled (v2-sa); dialing " + host + ":" + int_to_str(port)
+            + " as soul=" + soul_id)
+        let fdsa = fed_dial_secagg(host, port)
+        if fdsa < 0 {
+            io_println("fed_join: ERROR cannot connect / SecAgg handshake")
+            return 1
+        }
+        let sa = sa_state_new(soul_id)
+        let peer_ids = sa_peer_ids_from_env()
+        let pi = 0
+        while pi < len(peer_ids) {
+            let peer_id = peer_ids[pi]
+            let token = sa_peer_token_from_env(peer_id)
+            if token != 0 {
+                sa_register_peer(sa, peer_id, token)
+            }
+            pi = pi + 1
+        }
+        _fed_agg = fed_agg_new_secagg(soul_id, dp, mo, sa)
+        fed_agg_join(_fed_agg)
+        if fed_send_join(_fed_agg, fdsa) == 0 {
+            fed_close(fdsa)
+            _fed_agg = 0
+            io_println("fed_join: ERROR sending FED_JOIN")
+            return 1
+        }
+        fed_send_peers(_fed_agg, fdsa)
+        let _ack0 = _admin_send_line(fdsa, "ACK 0\n")
+        _fed_conn_fd = fdsa
+        io_println("fed_join: [SECAGG] HELLO ce-fed v2-sa + FED_JOIN exchange complete, "
+            + "peers=" + int_to_str(sa_peer_count(sa)))
+        let resultsa = _admin_fed_one_round_secagg(_fed_agg, fdsa, source_auth)
+        let completedsa = resultsa[0]
+        let round_idsa = resultsa[1]
+        let stats_sentsa = resultsa[2]
+        let aggs_recvsa = resultsa[3]
+        if completedsa == 1 {
+            io_println("fed: [SECAGG] round " + int_to_str(round_idsa) + " complete ("
+                + int_to_str(stats_sentsa) + " masked stats sent, "
+                + int_to_str(aggs_recvsa) + " sum aggregates received)")
+        } else {
+            io_println("fed_join: [SECAGG] coordinator closed before round completed")
+            fed_close(fdsa)
+            _fed_conn_fd = 0 - 1
+            _fed_agg = 0
+        }
+        return 1
+    }
     io_println("fed_join: dialing " + host + ":" + int_to_str(port)
         + " as soul=" + soul_id)
     let fd = fed_dial(host, port)

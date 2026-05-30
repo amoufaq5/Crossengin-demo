@@ -75,6 +75,25 @@ if [ ! -f "$SRC" ]; then
     exit 2
 fi
 
+# --- Mode 0: PNG passthrough (P3.1.PNG) ---------------------------------------
+# When the source is already a PNG, the pure-NOVA decoder in
+# src/io/transducers/png_decode.nova can ingest it directly -- the
+# visual_perception seam routes `.png` paths to the PNG backend via
+# file-extension detection. We skip the convert/ffmpeg step entirely
+# and echo the original PNG path so the caller can feed it straight to
+# the seam. Caveat: the pure-NOVA decoder supports stored-DEFLATE only,
+# so a standard libpng-compressed PNG will trip the documented
+# "deflate: BTYPE=01/10 not implemented (TODO)" error. The visual_seam
+# surfaces that error; the operator can re-run with the original SRC
+# through ImageMagick to fall back to PGM if needed.
+case "$SRC" in
+    *.png|*.PNG)
+        echo "INFO: input is PNG; routing through pure-NOVA decoder (no conversion)." >&2
+        echo "$SRC"
+        exit 0
+        ;;
+esac
+
 # --- Mode 1: ImageMagick `convert` ---------------------------------------
 if command -v convert >/dev/null 2>&1; then
     # `-resize NxN>` only shrinks (no upscale); `-colorspace Gray` flattens

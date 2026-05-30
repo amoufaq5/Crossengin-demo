@@ -84,6 +84,7 @@ import "std/io"
 import "../safety/differential_privacy.nova"
 import "../parts/meta/meta_observer.nova"
 import "source_authority.nova"
+import "secure_aggregation.nova"
 
 // ---- protocol constants --------------------------------------------------
 // These mirror kg_sync's FED_* constants (kept in sync intentionally; the
@@ -153,6 +154,8 @@ let FED_LAST_EMIT_LIST = 11 // list of [tag, noised_promo, noised_atr] from
                             // the most recent emit (for /fed_stats dry-run)
 let FED_GLOBAL_SEEN   = 12  // list of [tag, avg_promo, avg_atr, n_part] --
                             // the last federation aggregate observed per tag
+let FED_SECAGG_MODE   = 13  // 0 = v1 (DP-only), 1 = v2-sa (SecAgg)
+let FED_SA_STATE      = 14  // SA state handle (0 if not in v2-sa mode)
 let FED_OBJ_TAG = 7401      // disambiguating tag
 
 // Default epsilon spent per source per round, in milli. The audit doc
@@ -215,6 +218,22 @@ fn fed_agg_new(soul_id, dp, mo) {
     push(f, 0)                   // FED_ROUNDS
     push(f, list_new())          // FED_LAST_EMIT_LIST
     push(f, list_new())          // FED_GLOBAL_SEEN
+    push(f, 0)                   // FED_SECAGG_MODE (0 = v1)
+    push(f, 0)                   // FED_SA_STATE (none)
+    return f
+}
+
+// Build a fresh fed_state in v2-sa SecAgg mode. The `sa` argument is
+// an sa_state from secure_aggregation.nova that already has its peers
+// registered (via sa_register_peer or sa_register_peers_from_env).
+// In SecAgg mode the soul does NOT apply DP noise to its stats --
+// the pairwise masks provide information-theoretic privacy for the
+// sum. The dp handle is still accepted (we keep it consistent so
+// callers don't have to special-case the API) but unused for noise.
+fn fed_agg_new_secagg(soul_id, dp, mo, sa) {
+    let f = fed_agg_new(soul_id, dp, mo)
+    list_set(f, FED_SECAGG_MODE, 1)
+    list_set(f, FED_SA_STATE, sa)
     return f
 }
 
@@ -231,6 +250,8 @@ fn fed_agg_agg_count(f)      { return f[FED_AGGS] }
 fn fed_agg_rounds(f)         { return f[FED_ROUNDS] }
 fn fed_agg_last_emit(f)      { return f[FED_LAST_EMIT_LIST] }
 fn fed_agg_global_table(f)   { return f[FED_GLOBAL_SEEN] }
+fn fed_agg_secagg_mode(f)    { return f[FED_SECAGG_MODE] }
+fn fed_agg_sa_state(f)       { return f[FED_SA_STATE] }
 
 // Override the per-round epsilon. Used by tests and by the chat's
 // /fed_join command (which can carry an epsilon as a second token).
@@ -390,6 +411,74 @@ fn fed_agg_emit_noised_stats(f) {
     }
     list_set(f, FED_LAST_EMIT_LIST, out)
     return out
+}
+
+// SecAgg variant: walk the meta_observer's tracked sources and produce
+// a list of MASKED FED_STAT_MASKED records ready to ship. Instead of
+// applying DP noise, the soul applies pairwise additive masks via the
+// sa_state: for each peer registered on the SA state, the soul adds
+// +mask_ij (if its id is smaller) or -mask_ij (if its id is larger).
+// The coordinator's sum cancels the masks pairwise; the coordinator
+// never sees the raw x_i. SecAgg mode does NOT debit the DP budget --
+// the mask provides the privacy.
+//
+// Returns a list of [tag, masked_promo, masked_atr] rows. The list is
+// also cached on `f` so /fed_stats can preview "what would be sent".
+fn fed_agg_emit_masked_stats(f) {
+    let out = list_new()
+    let mo = f[FED_MO]
+    if mo == 0 { return out }
+    if f[FED_SECAGG_MODE] != 1 { return out }
+    let sa = f[FED_SA_STATE]
+    if sa == 0 { return out }
+    // Bind the SA state to the current round id so the mask derivation
+    // uses the same round id we tag the wire records with.
+    sa_round_set(sa, f[FED_ROUND_ID])
+    let report = mo_report(mo)
+    let i = 0
+    while i < len(report) {
+        let row = report[i]
+        let tag = row[0]
+        let promo = row[1]
+        let atr = row[2]
+        let sample = row[3]
+        if sample >= 1 {
+            let masked = sa_apply_masks_pair(sa, promo, atr)
+            let rec = list_new()
+            push(rec, tag)
+            push(rec, masked[0])
+            push(rec, masked[1])
+            push(out, rec)
+            list_set(f, FED_EMITS, f[FED_EMITS] + 1)
+        }
+        i = i + 1
+    }
+    list_set(f, FED_LAST_EMIT_LIST, out)
+    return out
+}
+
+// SecAgg-mode wire formatter for the v2-sa stat line.
+//   FED_STAT_MASKED <round_id> <source_tag> <masked_promo> <masked_atr>
+fn fed_agg_format_stat_masked_line(f, source_tag, masked_promo, masked_atr) {
+    return sa_format_stat_masked_line(f[FED_ROUND_ID], source_tag,
+        masked_promo, masked_atr)
+}
+
+// Receive a SUM aggregate from the coordinator and recover the
+// federation-wide average. In v2-sa mode the coordinator broadcasts
+// the SUM (not the average) so the soul has the choice: divide by
+// n_participants to get the average (standard interpretation), or
+// keep the sum for a custom weight scheme.
+//
+// We forward to fed_agg_receive_aggregate after dividing by n_part,
+// so the tier-EMA logic + global-seen table stay identical between
+// v1 and v2-sa. n_part == 0 -> we treat as "no participants, no
+// signal" and skip (defensive).
+fn fed_agg_receive_aggregate_sum(f, source_tag, sum_promo, sum_atr, n_part, source_auth) {
+    if n_part <= 0 { return 0 }
+    let avg_p = sum_promo / n_part
+    let avg_a = sum_atr / n_part
+    return fed_agg_receive_aggregate(f, source_tag, avg_p, avg_a, n_part, source_auth)
 }
 
 // Receive a federation-wide aggregate for one source tag. Stores the
@@ -967,6 +1056,56 @@ fn fed_dial(host, port) {
 fn fed_send_join(f, fd) {
     let line = fed_agg_format_join_line(f)
     return _fed_send_all(fd, line)
+}
+
+// SecAgg-mode handshake dial: sends SECAGG_HELLO ce-fed v2-sa instead
+// of HELLO ce-fed v1. Returns the fd on success, -1 on failure.
+fn fed_dial_secagg(host, port) {
+    let ip = _fed_ip_str_to_int(host)
+    if ip < 0 { return 0 - 1 }
+    let addr = make_sockaddr_in(port, ip)
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return 0 - 1 }
+    let r = connect_socket(sock, addr, 16)
+    if r < 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if _fed_send_all(sock, sa_format_hello_line()) == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    let ok = _fed_recv_line(sock)
+    if ok == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if _fed_starts_with(ok, FED_OK_PREFIX) == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    return sock
+}
+
+// SecAgg-mode peer announcement: send one SECAGG_PEER line per peer
+// the soul has registered on the SA state. Returns count of lines
+// sent (0 if the SA state is empty or there's no SA state on f).
+fn fed_send_peers(f, fd) {
+    if f[FED_SECAGG_MODE] != 1 { return 0 }
+    let sa = f[FED_SA_STATE]
+    if sa == 0 { return 0 }
+    let peers = sa_peers(sa)
+    let sent = 0
+    let i = 0
+    while i < len(peers) {
+        let row = peers[i]
+        let line = sa_format_peer_line(row[SA_PEER_ID], row[SA_PEER_TOKEN])
+        if _fed_send_all(fd, line) == 1 {
+            sent = sent + 1
+        }
+        i = i + 1
+    }
+    return sent
 }
 
 // Send FED_LEAVE on the live fd.

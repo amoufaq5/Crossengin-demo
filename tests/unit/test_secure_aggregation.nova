@@ -1,0 +1,492 @@
+// Unit tests for src/learning/secure_aggregation.nova (P3.8 / ADR-0055).
+//
+// Coverage (the brief's "~30 assertions" target):
+//   - sa_state_new returns a non-zero, well-formed state object.
+//   - sa_register_peer adds peers; idempotent re-register updates token.
+//   - sa_token_for_peer returns the registered token; 0 for unknown.
+//   - sa_mask_for_peer is DETERMINISTIC: same (token, round_id, k_dim)
+//     -> same mask.
+//   - Round-id rotation: different round_id -> different mask (with the
+//     same token).
+//   - k_dim rotation: different k_dim -> different mask within the
+//     same round.
+//   - 2-soul masking + sum (THE CORE DEMO): x_A=100, x_B=200; the pair
+//     shares token "secret"; the sum of masked values == 100 + 200 = 300.
+//   - 3-soul masking + sum: round-robin pairwise masks cancel.
+//   - The coordinator-side accumulator (sa_acc_new / sa_acc_add_masked /
+//     sa_acc_sums) sums masked values per source.
+//   - sa_apply_masks_pair masks both stats independently.
+//   - Wire formatters produce the documented line shapes.
+//   - Local parsers (sa_parse_peer_line / sa_parse_stat_masked_line /
+//     sa_parse_aggregate_sum_line / sa_parse_line) accept valid and
+//     reject malformed input.
+//   - sa_sum_to_avg reverses the SUM-to-AVG conversion.
+//   - sa_enabled_from_env defaults (env-not-set -> 0).
+//   - sa_id_compare follows lex order; equal -> 0; mask sign decision.
+//
+// IMPORTANT (per the brief): "Verify the coordinator NEVER sees x_A or
+// x_B individually (assert by inspecting what the coordinator-side code
+// receives)." The 2-soul demo test below asserts:
+//   1) the coordinator receives ONLY masked values (none equal to x_A
+//      or x_B individually -- masked = x + sign*mask, and mask >= 1).
+//   2) the coordinator's sum equals x_A + x_B.
+//   3) the coordinator's stored accumulator NEVER stores the raw values
+//      anywhere -- only the sum across souls.
+
+import "../ce_test.nova"
+import "../../src/learning/secure_aggregation.nova"
+
+// ---- state construction --------------------------------------------------
+
+fn test_sa_state_new_returns_state() {
+    let sa = sa_state_new("alice")
+    ce_check("sa_state_new non-zero", sa != 0)
+    ce_str_eq("soul_id stored", sa_soul_id(sa), "alice")
+    ce_eq("peer count starts at 0", sa_peer_count(sa), 0)
+    ce_eq("round id starts at -1", sa_round_id(sa), 0 - 1)
+}
+
+fn test_sa_register_peer_basic() {
+    let sa = sa_state_new("alice")
+    let r1 = sa_register_peer(sa, "bob", "secret-ab")
+    ce_eq("first register returns 1", r1, 1)
+    ce_eq("peer count = 1 after one register", sa_peer_count(sa), 1)
+    let tok = sa_token_for_peer(sa, "bob")
+    ce_str_eq("token round-trips", tok, "secret-ab")
+}
+
+fn test_sa_register_peer_idempotent_update() {
+    let sa = sa_state_new("alice")
+    sa_register_peer(sa, "bob", "secret-1")
+    let r2 = sa_register_peer(sa, "bob", "secret-2")
+    ce_eq("re-register returns 0 (idempotent)", r2, 0)
+    ce_eq("peer count still 1", sa_peer_count(sa), 1)
+    let tok = sa_token_for_peer(sa, "bob")
+    ce_str_eq("token updated to new value", tok, "secret-2")
+}
+
+fn test_sa_token_for_unknown_peer_is_zero() {
+    let sa = sa_state_new("alice")
+    let tok = sa_token_for_peer(sa, "ghost")
+    ce_eq("unknown peer -> 0 token", tok, 0)
+}
+
+// ---- mask determinism + rotation ----------------------------------------
+
+fn test_sa_mask_deterministic_same_inputs() {
+    let sa = sa_state_new("alice")
+    sa_register_peer(sa, "bob", "shared-token")
+    let m1 = sa_mask_for_peer(sa, "bob", 7, 0)
+    let m2 = sa_mask_for_peer(sa, "bob", 7, 0)
+    ce_eq("same (token, round, k) -> same mask", m1, m2)
+    ce_check("mask is positive", m1 > 0)
+}
+
+fn test_sa_mask_round_id_rotation() {
+    let sa = sa_state_new("alice")
+    sa_register_peer(sa, "bob", "shared-token")
+    let m_r1 = sa_mask_for_peer(sa, "bob", 1, 0)
+    let m_r2 = sa_mask_for_peer(sa, "bob", 2, 0)
+    let m_r3 = sa_mask_for_peer(sa, "bob", 3, 0)
+    // With the same token but different round_id, the mask must rotate.
+    // (We accept a tiny non-zero chance of collision on the 15-bit
+    // domain; for three independent draws the chance is small enough
+    // that a single test run is robust against it.)
+    ce_check("round rotation changes mask", m_r1 != m_r2)
+    ce_check("round rotation changes mask 2", m_r2 != m_r3)
+}
+
+fn test_sa_mask_k_dim_rotation() {
+    let sa = sa_state_new("alice")
+    sa_register_peer(sa, "bob", "shared-token")
+    let m_d0 = sa_mask_for_peer(sa, "bob", 1, 0)
+    let m_d1 = sa_mask_for_peer(sa, "bob", 1, 1)
+    ce_check("k_dim rotation changes mask", m_d0 != m_d1)
+}
+
+// ---- pair-symmetric masks (the cancellation invariant) ------------------
+
+fn test_sa_pair_symmetric_mask_same_token() {
+    // Two souls share the SAME token; they must derive the SAME mask
+    // (so when one adds and the other subtracts, the masks cancel).
+    let sa_a = sa_state_new("alice")
+    sa_register_peer(sa_a, "bob", "shared-token")
+    let sa_b = sa_state_new("bob")
+    sa_register_peer(sa_b, "alice", "shared-token")
+    // Both look up the mask for the peer at the same round + dim.
+    let m_from_a = sa_mask_for_peer(sa_a, "bob", 1, 0)
+    let m_from_b = sa_mask_for_peer(sa_b, "alice", 1, 0)
+    ce_eq("pair-symmetric mask matches", m_from_a, m_from_b)
+}
+
+// ---- id compare ----------------------------------------------------------
+
+fn test_sa_id_compare_lexical() {
+    ce_eq("alice < bob", sa_id_compare("alice", "bob"), 0 - 1)
+    ce_eq("bob > alice", sa_id_compare("bob", "alice"), 1)
+    ce_eq("equal == 0", sa_id_compare("bob", "bob"), 0)
+    ce_eq("shorter prefix < longer", sa_id_compare("bob", "bobby"), 0 - 1)
+}
+
+// ---- the 2-soul masking + sum demo (CORE BRIEF CHECK) -------------------
+
+fn test_secagg_two_soul_sum_demo() {
+    // x_A = 100, x_B = 200. Shared token "secret". Sum should equal 300.
+    let sa_a = sa_state_new("alice")
+    sa_register_peer(sa_a, "bob", "secret")
+    sa_round_set(sa_a, 1)
+    let sa_b = sa_state_new("bob")
+    sa_register_peer(sa_b, "alice", "secret")
+    sa_round_set(sa_b, 1)
+
+    let x_a = 100
+    let x_b = 200
+
+    // alice < bob lex -> alice ADDS mask, bob SUBTRACTS mask.
+    let masked_a = sa_apply_masks(sa_a, x_a, 0)
+    let masked_b = sa_apply_masks(sa_b, x_b, 0)
+
+    // Get the mask for the audit-trail comparison.
+    let mask_ab = sa_mask_for_peer(sa_a, "bob", 1, 0)
+
+    // Sanity: alice's masked value = x_a + mask; bob's = x_b - mask.
+    ce_eq("alice masked = x_a + mask", masked_a, x_a + mask_ab)
+    ce_eq("bob masked = x_b - mask", masked_b, x_b - mask_ab)
+
+    // CRITICAL: the masked values must NOT equal the raw values
+    // (the mask is positive; alice ADDS it, so masked_a != x_a).
+    ce_check("masked_a != x_a (mask non-zero)", masked_a != x_a)
+    ce_check("masked_b != x_b (mask non-zero)", masked_b != x_b)
+
+    // Now run the coordinator-side sum. The coordinator only sees
+    // masked_a and masked_b; it sums them.
+    let acc = sa_acc_new(1)
+    sa_acc_add_masked(acc, "topic:test", masked_a, 0)
+    sa_acc_add_masked(acc, "topic:test", masked_b, 0)
+    let sums = sa_acc_sums(acc)
+    ce_eq("one source row in accumulator", len(sums), 1)
+    let sum_row = sums[0]
+    ce_str_eq("sum tag", sum_row[0], "topic:test")
+    // The promotion-dimension sum equals x_a + x_b (masks cancel).
+    ce_eq("sum equals x_a + x_b (masks canceled)", sum_row[1], x_a + x_b)
+    ce_eq("sum equals 300 (the brief's expected)", sum_row[1], 300)
+    ce_eq("n_participants = 2", sum_row[3], 2)
+}
+
+// Three-soul round-robin: A, B, C all share pairwise tokens.
+// x_A = 50, x_B = 100, x_C = 150. Sum should equal 300 after all
+// pairwise masks cancel.
+fn test_secagg_three_soul_sum_demo() {
+    let sa_a = sa_state_new("alice")
+    sa_register_peer(sa_a, "bob",   "tok-ab")
+    sa_register_peer(sa_a, "carol", "tok-ac")
+    sa_round_set(sa_a, 42)
+
+    let sa_b = sa_state_new("bob")
+    sa_register_peer(sa_b, "alice", "tok-ab")
+    sa_register_peer(sa_b, "carol", "tok-bc")
+    sa_round_set(sa_b, 42)
+
+    let sa_c = sa_state_new("carol")
+    sa_register_peer(sa_c, "alice", "tok-ac")
+    sa_register_peer(sa_c, "bob",   "tok-bc")
+    sa_round_set(sa_c, 42)
+
+    let x_a = 50
+    let x_b = 100
+    let x_c = 150
+
+    let m_a = sa_apply_masks(sa_a, x_a, 0)
+    let m_b = sa_apply_masks(sa_b, x_b, 0)
+    let m_c = sa_apply_masks(sa_c, x_c, 0)
+
+    let acc = sa_acc_new(42)
+    sa_acc_add_masked(acc, "topic:test", m_a, 0)
+    sa_acc_add_masked(acc, "topic:test", m_b, 0)
+    sa_acc_add_masked(acc, "topic:test", m_c, 0)
+    let sums = sa_acc_sums(acc)
+    ce_eq("one source row (3-soul)", len(sums), 1)
+    ce_eq("3-soul sum equals x_a + x_b + x_c", sums[0][1], x_a + x_b + x_c)
+    ce_eq("3-soul sum equals 300", sums[0][1], 300)
+    ce_eq("n_participants = 3", sums[0][3], 3)
+}
+
+// ---- audit invariant: coordinator never sees raw x_i ---------------------
+
+fn test_secagg_coord_never_sees_raw() {
+    // Verify by inspection: the SUM the coordinator computes equals
+    // x_a + x_b, but neither masked_a nor masked_b alone equals
+    // x_a or x_b. This makes the "coordinator sees only the sum"
+    // claim concrete: the per-soul masked values are arithmetically
+    // distinct from the raw values, and the coordinator never has
+    // any code path that recovers raw values from masked ones.
+    let sa_a = sa_state_new("alice")
+    sa_register_peer(sa_a, "bob", "audit-token")
+    sa_round_set(sa_a, 5)
+    let sa_b = sa_state_new("bob")
+    sa_register_peer(sa_b, "alice", "audit-token")
+    sa_round_set(sa_b, 5)
+
+    let x_a = 700
+    let x_b = 800
+    let masked_a = sa_apply_masks(sa_a, x_a, 0)
+    let masked_b = sa_apply_masks(sa_b, x_b, 0)
+
+    // Even a passive observer of the coordinator's accumulator
+    // post-add sees just the running sum, not the per-soul
+    // contributions. After adding alice's masked value, the
+    // accumulator stores masked_a. After bob's, it stores
+    // masked_a + masked_b = x_a + x_b. At no point does it
+    // store x_a or x_b alone.
+    let acc = sa_acc_new(5)
+    sa_acc_add_masked(acc, "topic:audit", masked_a, 0)
+    let after_a = acc[SA_ACC_ROWS][0][SA_ACR_PROMO]
+    // After alice's add, the accumulator stores masked_a, NOT x_a.
+    ce_check("after alice's add, stored value != x_a", after_a != x_a)
+    ce_eq("after alice's add, stored value == masked_a", after_a, masked_a)
+    sa_acc_add_masked(acc, "topic:audit", masked_b, 0)
+    let final_v = acc[SA_ACC_ROWS][0][SA_ACR_PROMO]
+    ce_eq("after bob's add, stored value == x_a + x_b", final_v, x_a + x_b)
+    // The coordinator can compute the sum, but cannot recover x_a or x_b.
+    ce_check("final sum != x_a alone", final_v != x_a)
+    ce_check("final sum != x_b alone", final_v != x_b)
+}
+
+// ---- masks_pair (atrophy + promotion together) --------------------------
+
+fn test_sa_apply_masks_pair_both_dims() {
+    let sa = sa_state_new("alice")
+    sa_register_peer(sa, "bob", "token")
+    sa_round_set(sa, 1)
+    let m = sa_apply_masks_pair(sa, 100, 200)
+    ce_eq("pair has 2 elements", len(m), 2)
+    // alice < bob -> +mask added to both.
+    let exp_promo = 100 + sa_mask_for_peer(sa, "bob", 1, 0)
+    let exp_atr   = 200 + sa_mask_for_peer(sa, "bob", 1, 1)
+    ce_eq("promo dim 0 mask applied", m[0], exp_promo)
+    ce_eq("atr dim 1 mask applied", m[1], exp_atr)
+}
+
+// ---- sa_acc accumulator behaviour ---------------------------------------
+
+fn test_sa_acc_new_empty() {
+    let a = sa_acc_new(1)
+    ce_eq("round_id stored", sa_acc_round_id(a), 1)
+    ce_eq("empty rows", sa_acc_count(a), 0)
+    let s = sa_acc_sums(a)
+    ce_eq("empty sums list", len(s), 0)
+}
+
+fn test_sa_acc_multi_source() {
+    let a = sa_acc_new(1)
+    sa_acc_add_masked(a, "topic:fever",   100, 50)
+    sa_acc_add_masked(a, "topic:fever",   200, 30)
+    sa_acc_add_masked(a, "topic:headache", 70, 80)
+    let s = sa_acc_sums(a)
+    ce_eq("two source rows", len(s), 2)
+    let i = 0
+    let fever_seen = 0
+    let headache_seen = 0
+    while i < len(s) {
+        if str_eq(s[i][0], "topic:fever") == 1 {
+            ce_eq("fever sum_promo", s[i][1], 300)
+            ce_eq("fever sum_atr",   s[i][2], 80)
+            ce_eq("fever n_part",    s[i][3], 2)
+            fever_seen = 1
+        }
+        if str_eq(s[i][0], "topic:headache") == 1 {
+            ce_eq("headache sum_promo", s[i][1], 70)
+            ce_eq("headache sum_atr",   s[i][2], 80)
+            ce_eq("headache n_part",    s[i][3], 1)
+            headache_seen = 1
+        }
+        i = i + 1
+    }
+    ce_eq("fever seen", fever_seen, 1)
+    ce_eq("headache seen", headache_seen, 1)
+}
+
+// ---- wire formatters ----------------------------------------------------
+
+fn test_sa_format_hello_line() {
+    let s = sa_format_hello_line()
+    ce_str_eq("hello", s, "SECAGG_HELLO ce-fed v2-sa\n")
+}
+
+fn test_sa_format_peer_line() {
+    let s = sa_format_peer_line("bob", "secret-ab")
+    ce_str_eq("peer line", s, "SECAGG_PEER bob secret-ab\n")
+}
+
+fn test_sa_format_stat_masked_line() {
+    let s = sa_format_stat_masked_line(7, "topic:fever", 150, 60)
+    ce_str_eq("masked stat", s, "FED_STAT_MASKED 7 topic:fever 150 60\n")
+}
+
+fn test_sa_format_aggregate_sum_line() {
+    let s = sa_format_aggregate_sum_line(5, "topic:fever", 800, 100, 3)
+    ce_str_eq("aggregate sum", s,
+        "FED_AGGREGATE_SUM 5 topic:fever 800 100 3\n")
+}
+
+// ---- local parsers -------------------------------------------------------
+
+fn test_sa_parse_peer_line() {
+    let r = sa_parse_peer_line("SECAGG_PEER bob secret-ab")
+    ce_check("parse peer non-zero", r != 0)
+    ce_eq("peer ev type", r[SECAGG_R_TYPE], SECAGG_EV_PEER)
+    ce_str_eq("peer id", r[SECAGG_R_PEER_ID], "bob")
+    ce_str_eq("peer token", r[SECAGG_R_TOKEN], "secret-ab")
+}
+
+fn test_sa_parse_stat_masked_line() {
+    let r = sa_parse_stat_masked_line("FED_STAT_MASKED 7 topic:fever 150 60")
+    ce_check("parse stat_masked non-zero", r != 0)
+    ce_eq("ev type", r[SECAGG_R_TYPE], SECAGG_EV_STAT_MASKED)
+    ce_eq("round id", r[SECAGG_R_ROUND], 7)
+    ce_str_eq("tag", r[SECAGG_R_TAG], "topic:fever")
+    ce_eq("masked promo", r[SECAGG_R_PROMO], 150)
+    ce_eq("masked atr", r[SECAGG_R_ATR], 60)
+}
+
+fn test_sa_parse_aggregate_sum_line() {
+    let r = sa_parse_aggregate_sum_line(
+        "FED_AGGREGATE_SUM 5 topic:fever 800 100 3")
+    ce_check("parse agg_sum non-zero", r != 0)
+    ce_eq("ev type", r[SECAGG_R_TYPE], SECAGG_EV_AGG_SUM)
+    ce_eq("round id", r[SECAGG_R_ROUND], 5)
+    ce_str_eq("tag", r[SECAGG_R_TAG], "topic:fever")
+    ce_eq("sum promo", r[SECAGG_R_PROMO], 800)
+    ce_eq("sum atr", r[SECAGG_R_ATR], 100)
+    ce_eq("n_part", r[SECAGG_R_NPART], 3)
+}
+
+fn test_sa_parse_stat_masked_accepts_negative() {
+    // Masked values can be negative (after a sign-flipped mask
+    // subtraction). The parser must accept '-' as a leading char.
+    let r = sa_parse_stat_masked_line("FED_STAT_MASKED 1 topic:test -42 -7")
+    ce_check("parse negative-masked non-zero", r != 0)
+    ce_eq("negative promo", r[SECAGG_R_PROMO], 0 - 42)
+    ce_eq("negative atr", r[SECAGG_R_ATR], 0 - 7)
+}
+
+fn test_sa_parse_line_dispatch() {
+    let r1 = sa_parse_line("SECAGG_HELLO ce-fed v2-sa")
+    ce_check("dispatch HELLO", r1 != 0)
+    ce_eq("HELLO type", r1[SECAGG_R_TYPE], SECAGG_EV_HELLO)
+    let r2 = sa_parse_line("SECAGG_PEER bob secret")
+    ce_eq("dispatch PEER", r2[SECAGG_R_TYPE], SECAGG_EV_PEER)
+    let r3 = sa_parse_line("FED_STAT_MASKED 1 t 10 20")
+    ce_eq("dispatch STAT_MASKED", r3[SECAGG_R_TYPE], SECAGG_EV_STAT_MASKED)
+    let r4 = sa_parse_line("FED_AGGREGATE_SUM 1 t 10 20 2")
+    ce_eq("dispatch AGG_SUM", r4[SECAGG_R_TYPE], SECAGG_EV_AGG_SUM)
+}
+
+fn test_sa_parse_line_rejects_garbage() {
+    let r = sa_parse_line("GARBAGE here")
+    ce_eq("garbage -> 0", r, 0)
+}
+
+// ---- sum-to-avg conversion ----------------------------------------------
+
+fn test_sa_sum_to_avg_normal() {
+    let v = sa_sum_to_avg(300, 90, 3)
+    ce_eq("avg promo = sum/n", v[0], 100)
+    ce_eq("avg atr = sum/n",   v[1], 30)
+}
+
+fn test_sa_sum_to_avg_zero_n() {
+    let v = sa_sum_to_avg(100, 50, 0)
+    ce_eq("n=0 -> 0 promo", v[0], 0)
+    ce_eq("n=0 -> 0 atr",   v[1], 0)
+}
+
+// ---- env helpers ---------------------------------------------------------
+
+fn test_sa_enabled_from_env_default() {
+    // No CE_SECAGG_ENABLED set -> 0 (default off, backwards-compat).
+    let v = sa_enabled_from_env()
+    ce_eq("default off (env not set)", v, 0)
+}
+
+fn test_sa_peer_ids_from_env_default() {
+    // No CE_SECAGG_PEERS set -> empty list.
+    let v = sa_peer_ids_from_env()
+    ce_eq("default empty peer-ids list", len(v), 0)
+}
+
+// ---- mask robustness: hash determinism + LCG step independence ---------
+
+fn test_sa_hash_determinism() {
+    // Same token + round -> same seed every time.
+    let s1 = _sa_seed_for_pair("token-x", 5)
+    let s2 = _sa_seed_for_pair("token-x", 5)
+    ce_eq("seed deterministic", s1, s2)
+    let s3 = _sa_seed_for_pair("token-y", 5)
+    ce_check("different token -> different seed", s1 != s3)
+}
+
+fn test_sa_lcg_step_distribution() {
+    // 10 successive steps from a fixed seed produce 10 distinct values
+    // (the LCG has period > 10 with a good seed).
+    let seed = _sa_hash_str("test")
+    let cur = seed
+    let seen = list_new()
+    let i = 0
+    while i < 10 {
+        cur = _sa_lcg_step(cur)
+        push(seen, cur)
+        i = i + 1
+    }
+    // Count uniques by O(n^2) compare (n=10).
+    let unique_n = 0
+    let j = 0
+    while j < len(seen) {
+        let dup = 0
+        let k = 0
+        while k < j {
+            if seen[j] == seen[k] { dup = 1 }
+            k = k + 1
+        }
+        if dup == 0 { unique_n = unique_n + 1 }
+        j = j + 1
+    }
+    // Allow some collisions on a 15-bit space, but expect mostly unique.
+    ce_check("10 LCG steps have at least 8 unique values", unique_n >= 8)
+}
+
+fn main() {
+    test_sa_state_new_returns_state()
+    test_sa_register_peer_basic()
+    test_sa_register_peer_idempotent_update()
+    test_sa_token_for_unknown_peer_is_zero()
+    test_sa_mask_deterministic_same_inputs()
+    test_sa_mask_round_id_rotation()
+    test_sa_mask_k_dim_rotation()
+    test_sa_pair_symmetric_mask_same_token()
+    test_sa_id_compare_lexical()
+    test_secagg_two_soul_sum_demo()
+    test_secagg_three_soul_sum_demo()
+    test_secagg_coord_never_sees_raw()
+    test_sa_apply_masks_pair_both_dims()
+    test_sa_acc_new_empty()
+    test_sa_acc_multi_source()
+    test_sa_format_hello_line()
+    test_sa_format_peer_line()
+    test_sa_format_stat_masked_line()
+    test_sa_format_aggregate_sum_line()
+    test_sa_parse_peer_line()
+    test_sa_parse_stat_masked_line()
+    test_sa_parse_aggregate_sum_line()
+    test_sa_parse_stat_masked_accepts_negative()
+    test_sa_parse_line_dispatch()
+    test_sa_parse_line_rejects_garbage()
+    test_sa_sum_to_avg_normal()
+    test_sa_sum_to_avg_zero_n()
+    test_sa_enabled_from_env_default()
+    test_sa_peer_ids_from_env_default()
+    test_sa_hash_determinism()
+    test_sa_lcg_step_distribution()
+    ce_summary("secure_aggregation")
+}
+main()

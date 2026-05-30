@@ -1,0 +1,293 @@
+// CrossEngin io/transducers: DEFLATE decompressor (P3.1.PNG MVP).
+//
+// Purpose
+//   The DEFLATE bitstream is the inner compression layer of PNG (zlib(DEFLATE)
+//   + filter prediction + scanline framing). This module is the FIRST half of
+//   the pure-NOVA PNG decoder: it accepts a DEFLATE stream and returns the
+//   raw uncompressed bytes. PNG's outer zlib wrapper (2-byte header + 4-byte
+//   Adler-32 trailer) lives in `png_decode.nova` -- this module deals only
+//   with the inner DEFLATE block structure.
+//
+//   DEFLATE has three block types (RFC 1951 section 3.2):
+//
+//     BTYPE = 00  STORED (uncompressed)
+//                 A length-prefixed copy of the raw bytes. No Huffman, no
+//                 LZ77 back-references. The encoder uses this for already-
+//                 compressed payloads (gzip's "no improvement" path) and
+//                 for very small payloads where a Huffman table would not
+//                 amortize. PNG encoders can be forced into stored-only
+//                 mode via `pngcrush -force` / `optipng -o0` / explicit
+//                 zlib level 0.
+//
+//     BTYPE = 01  STATIC HUFFMAN
+//                 Fixed pre-defined Huffman tables (literal/length + distance).
+//                 ~280 lines of pure-NOVA work: bit-level reader, Huffman
+//                 tree decoder, LZ77 back-reference resolver, the
+//                 length/distance code tables from RFC 1951 section 3.2.6.
+//                 DEFERRED -- the framework + the BTYPE=00 path proves the
+//                 decoder pipeline.
+//
+//     BTYPE = 10  DYNAMIC HUFFMAN
+//                 Variable Huffman tables transmitted in the block header
+//                 (HLIT/HDIST/HCLEN + code-length-code-lengths +
+//                 literal/length codes + distance codes). Same back-reference
+//                 resolver as static, but a much larger header-parse step.
+//                 ~320 lines on top of BTYPE=01. DEFERRED.
+//
+//   Scope for THIS session: BTYPE = 00 only. The MVP can ingest any PNG
+//   written by `pngcrush -force --brute -m 1` (libpng level 0) or any
+//   tool that emits zlib level-0 compression. Standard PNGs from a phone
+//   camera or a screenshot tool use level 6 dynamic Huffman and will
+//   trip the documented `deflate: BTYPE=N not implemented (TODO)` error.
+//
+// Public API
+//   deflate_decode_stored(bytes_ptr, len) -> [output_ptr, output_len,
+//                                             error_msg]
+//     Reads a DEFLATE bitstream of one or more BFINAL-tagged stored
+//     blocks. Returns the concatenated raw payload. Empty input or any
+//     non-stored block sets the error_msg and returns a zero-length
+//     output.
+//   deflate_block_type_at(bytes_ptr, bit_offset) -> int (0..3)
+//     Read the BTYPE field at the given bit offset (after the BFINAL bit).
+//     Returned for diagnostics / TODO error messages.
+//
+// Stored-block format (RFC 1951 section 3.2.4):
+//   1 bit   BFINAL (last block flag)
+//   2 bits  BTYPE  (== 00)
+//   align   skip to next byte boundary
+//   2 bytes LEN     (little-endian)
+//   2 bytes NLEN    (one's complement of LEN, MUST match)
+//   LEN bytes raw payload
+//
+// CrossEngin contract:
+//   * Decoder is single-buffer: caller passes the bitstream pointer and
+//     length; we allocate the output buffer. Stored blocks have a 64 KiB
+//     LEN cap (2^16 - 1 == 65535 bytes per block, per RFC 1951). We cap
+//     the total decompressed size at 1 MiB (PGM_MAX_PIXEL_AREA from
+//     image_pgm.nova) so the buffer never exceeds NOVA's codegen pointer-
+//     threshold gotcha #11.
+//   * No back-pressure / streaming -- the entire output buffer is
+//     allocated up front at LEN bytes and copied in one loop.
+//   * No CRC / Adler-32 / window tracking -- those live in png_decode.nova
+//     (CRC32 per PNG chunk) and are not DEFLATE's concern.
+//
+// ADRs implemented: ADR-0014 (modality bridge / no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push, len,
+//   int_to_str. CrossEngin dependencies: none (leaf module -- png_decode
+//   imports this).
+
+// ---- format constants -----------------------------------------------------
+
+// DEFLATE block types per RFC 1951 section 3.2.3.
+let DEFLATE_BTYPE_STORED   = 0      // BTYPE = 00: uncompressed
+let DEFLATE_BTYPE_STATIC   = 1      // BTYPE = 01: static Huffman (TODO)
+let DEFLATE_BTYPE_DYNAMIC  = 2      // BTYPE = 10: dynamic Huffman (TODO)
+let DEFLATE_BTYPE_RESERVED = 3      // BTYPE = 11: reserved error (RFC)
+
+// Maximum LEN per RFC 1951: 16-bit field, so 65535 bytes per stored block.
+let DEFLATE_STORED_MAX_LEN = 65535
+
+// Total decompressed cap. Mirrors PGM_MAX_PIXEL_AREA (1 MiB) so the output
+// buffer always lands under NOVA's codegen pointer-threshold gotcha #11.
+// A PNG with a 1024x1024 grayscale plane decompresses to ~1 MiB raw
+// (+ 1 filter byte per scanline, so ~1.0009 MiB); we leave a small
+// margin above the pixel-area cap.
+let DEFLATE_MAX_OUTPUT_BYTES = 1100000
+
+// Result tuple indices.
+let DEFLATE_R_OUTPUT = 0
+let DEFLATE_R_LENGTH = 1
+let DEFLATE_R_ERROR  = 2
+
+// ---- result helpers -------------------------------------------------------
+
+fn _deflate_result(output_ptr, output_len, error_msg) {
+    let r = list_new()
+    push(r, output_ptr)
+    push(r, output_len)
+    push(r, error_msg)
+    return r
+}
+
+fn _deflate_fail(error_msg) {
+    return _deflate_result(0, 0, error_msg)
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn deflate_result_output(r) { return r[DEFLATE_R_OUTPUT] }
+fn deflate_result_length(r) { return r[DEFLATE_R_LENGTH] }
+fn deflate_result_error(r)  { return r[DEFLATE_R_ERROR] }
+
+// ---- bit-field reader (small surface used by the stored path) -------------
+//
+// DEFLATE is bit-level inside a block, but the stored variant ALIGNS to
+// the next byte boundary after the 3-bit BFINAL+BTYPE prefix. So for the
+// BTYPE=00 path we need exactly one helper: read N bits starting at a
+// bit offset, returning [value, new_bit_offset]. The bit order is
+// little-endian (LSB-first within each byte) per RFC 1951.
+
+fn _deflate_read_bits(bytes_ptr, total_len, bit_off, n) {
+    let v = 0
+    let i = 0
+    while i < n {
+        let byte_index = bit_off / 8
+        // bit_index in 0..7 LSB-first. Computed via int_sub + int_mul so the
+        // multiply stays safe even if bit_off grows past NOVA's 1MB threshold
+        // (which it does for 1MiB-decompressed PNG bitstreams).
+        let bit_index  = int_sub(bit_off, int_mul(byte_index, 8))
+        if byte_index >= total_len {
+            // Out of bounds -- caller is responsible for not asking for
+            // more bits than exist. Return what we have so far.
+            let pair = list_new()
+            push(pair, v)
+            push(pair, bit_off)
+            return pair
+        }
+        let b = load8(bytes_ptr + byte_index)
+        // Extract bit `bit_index` from byte b. `bit_index` is in 0..7 so
+        // _deflate_pow2 returns 1..128 -- always small, safe for smart-*.
+        let bit = (b / _deflate_pow2(bit_index)) - ((b / _deflate_pow2(bit_index + 1)) * 2)
+        // `i` is in 0..16 here (we only ask for up to 16 bits at a time),
+        // so _deflate_pow2(i) <= 65536 -- safe for smart-* with `bit`
+        // (which is 0 or 1).
+        v = v + bit * _deflate_pow2(i)
+        bit_off = bit_off + 1
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, v)
+    push(pair, bit_off)
+    return pair
+}
+
+// Power-of-two helper for shifts. Small table (0..23 enough for our use).
+fn _deflate_pow2(n) {
+    if n <= 0 { return 1 }
+    let v = 1
+    let i = 0
+    while i < n {
+        v = v * 2
+        i = i + 1
+    }
+    return v
+}
+
+// Advance bit_off to the next byte boundary. Returns the new offset.
+// bit_off can grow large (1MB stored payload * 8 = 8.8M bits) so the
+// quotient*8 multiply uses int_mul to stay safe past the threshold.
+fn _deflate_align_to_byte(bit_off) {
+    let q = bit_off / 8
+    let r = int_sub(bit_off, int_mul(q, 8))   // remainder bits in current byte
+    if r == 0 { return bit_off }
+    return bit_off + (8 - r)
+}
+
+// ---- BTYPE readback (used by the TODO error message) ---------------------
+
+fn deflate_block_type_at(bytes_ptr, total_len, bit_off) {
+    // The BTYPE field is 2 bits, AFTER BFINAL (1 bit). Caller passes the
+    // bit offset of BFINAL; we read past it.
+    let after_bfinal = bit_off + 1
+    let r = _deflate_read_bits(bytes_ptr, total_len, after_bfinal, 2)
+    return r[0]
+}
+
+// ---- stored-block decoder -------------------------------------------------
+//
+// Loop over one or more DEFLATE blocks until BFINAL is set. For each block:
+//   - Read BFINAL (1 bit) and BTYPE (2 bits) at the current bit offset.
+//   - If BTYPE != STORED, fail with a clear "not implemented (TODO)" error.
+//   - Otherwise align to the next byte boundary, read LEN and NLEN
+//     (little-endian 16-bit each), verify NLEN == ~LEN (one's complement,
+//     masked to 16 bits), then copy LEN bytes from the input buffer to
+//     the output buffer.
+//   - Continue with the next block unless BFINAL is set.
+//
+// LEN can be zero (a degenerate but legal empty stored block); LEN of
+// zero plus BFINAL=1 is a valid "compressed payload is empty" stream.
+//
+// On any error we return an empty result with a descriptive error message
+// that callers can surface verbatim to the operator.
+
+fn deflate_decode_stored(bytes_ptr, total_len) {
+    if total_len <= 0 {
+        return _deflate_fail("deflate: empty input")
+    }
+    // Output buffer: allocated at the cap so we can grow without reallocating.
+    // We track `out_len` separately and trim by returning the actual length;
+    // callers receive the [ptr, len, ""] triple.
+    let out = alloc(DEFLATE_MAX_OUTPUT_BYTES + 1)
+    let out_len = 0
+    let bit_off = 0
+    let done = 0
+    while done == 0 {
+        // Need at least 3 bits remaining for BFINAL + BTYPE.
+        // total_len * 8 can exceed NOVA's 1MB threshold for 1MiB outputs,
+        // so use int_mul + int_add for the comparison operand.
+        let total_bits = int_mul(total_len, 8)
+        if int_add(bit_off, 3) > total_bits {
+            return _deflate_fail("deflate: truncated block header")
+        }
+        let bfinal_r = _deflate_read_bits(bytes_ptr, total_len, bit_off, 1)
+        let bfinal = bfinal_r[0]
+        let after_bfinal = bfinal_r[1]
+        let btype_r = _deflate_read_bits(bytes_ptr, total_len, after_bfinal, 2)
+        let btype = btype_r[0]
+        let after_btype = btype_r[1]
+        if btype == DEFLATE_BTYPE_STATIC {
+            return _deflate_fail("deflate: BTYPE=01 (static Huffman) not implemented (TODO)")
+        }
+        if btype == DEFLATE_BTYPE_DYNAMIC {
+            return _deflate_fail("deflate: BTYPE=10 (dynamic Huffman) not implemented (TODO)")
+        }
+        if btype == DEFLATE_BTYPE_RESERVED {
+            return _deflate_fail("deflate: BTYPE=11 (reserved) is illegal per RFC 1951")
+        }
+        // BTYPE == STORED. Align to the next byte boundary, then read LEN
+        // and NLEN as little-endian 16-bit.
+        let aligned = _deflate_align_to_byte(after_btype)
+        let byte_off = aligned / 8
+        if byte_off + 4 > total_len {
+            return _deflate_fail("deflate: stored-block header truncated (need LEN+NLEN)")
+        }
+        let len_lo = load8(bytes_ptr + byte_off)
+        let len_hi = load8(bytes_ptr + byte_off + 1)
+        let nlen_lo = load8(bytes_ptr + byte_off + 2)
+        let nlen_hi = load8(bytes_ptr + byte_off + 3)
+        let block_len = len_lo + len_hi * 256
+        let nlen      = nlen_lo + nlen_hi * 256
+        // NLEN must be the one's complement of LEN, masked to 16 bits.
+        // (LEN ^ 0xFFFF) == NLEN, or equivalently LEN + NLEN == 65535.
+        if block_len + nlen != 65535 {
+            return _deflate_fail("deflate: LEN/NLEN check failed (corrupted stored block)")
+        }
+        if block_len > DEFLATE_STORED_MAX_LEN {
+            return _deflate_fail("deflate: stored-block LEN exceeds 65535")
+        }
+        let data_off = byte_off + 4
+        if data_off + block_len > total_len {
+            return _deflate_fail("deflate: stored-block payload truncated")
+        }
+        if out_len + block_len > DEFLATE_MAX_OUTPUT_BYTES {
+            return _deflate_fail("deflate: decompressed size exceeds 1MiB cap")
+        }
+        // Copy LEN bytes from the input buffer to the output buffer.
+        let i = 0
+        while i < block_len {
+            store8(out + out_len + i, load8(bytes_ptr + data_off + i))
+            i = i + 1
+        }
+        out_len = out_len + block_len
+        // Advance to byte AFTER the payload. Next block starts at a
+        // byte boundary (BFINAL is bit-level within the byte but the
+        // stored block ends byte-aligned). data_off + block_len can
+        // exceed 1MB on a 1MiB DEFLATE stream (16 stored blocks of
+        // 64KiB), so use int_mul to lift the * 8 above the threshold.
+        bit_off = int_mul(int_add(data_off, block_len), 8)
+        if bfinal == 1 { done = 1 }
+    }
+    store8(out + out_len, 0)   // sentinel NUL; callers should use the
+                                 // returned length, not strlen
+    return _deflate_result(out, out_len, "")
+}

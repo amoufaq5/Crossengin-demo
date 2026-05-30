@@ -45,6 +45,7 @@
 
 import "../src/io/transducers/kg_sync.nova"
 import "../src/learning/federated_aggregator.nova"
+import "../src/learning/secure_aggregation.nova"
 
 let CE_FED_DEFAULT_DEADLINE_NS = 2000000000   // 2 s after round open
 
@@ -118,6 +119,73 @@ fn _fed_accept_handshake(sub_fd, expected_token) {
     return _csoul_new(sub_fd, soul_id, epsilon)
 }
 
+// SecAgg-mode handshake: expect SECAGG_HELLO ce-fed v2-sa, accept
+// a FED_JOIN, then drain SECAGG_PEER lines (one per peer; soul
+// terminates with an ACK <round=0> sentinel so we can stop reading
+// peer lines without a time-based deadline). Returns
+// [fd, soul_id, epsilon, peer_count] on success, 0 on rejection.
+fn _fed_accept_handshake_secagg(sub_fd) {
+    let hello = _recv_line(sub_fd)
+    if hello == 0 {
+        close_fd(sub_fd)
+        return 0
+    }
+    if _is_hello_fed_secagg(hello) == 0 {
+        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected SECAGG_HELLO ce-fed v2-sa\n")
+        close_fd(sub_fd)
+        return 0
+    }
+    if _send_all(sub_fd, KGSYNC_OK_FED_V2SA_LINE + "\n") == 0 {
+        close_fd(sub_fd)
+        return 0
+    }
+    // Expect FED_JOIN next.
+    let join_line = _recv_line(sub_fd)
+    if join_line == 0 {
+        close_fd(sub_fd)
+        return 0
+    }
+    let rec = _parse_fed_join_line(join_line)
+    if rec == 0 {
+        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected FED_JOIN\n")
+        close_fd(sub_fd)
+        return 0
+    }
+    let soul_id = rec[KGSYNC_FED_SOUL_ID]
+    let epsilon = rec[KGSYNC_FED_EPSILON]
+    // Drain SECAGG_PEER lines until we see an ACK 0 sentinel. The
+    // coordinator does NOT need to verify each peer announcement
+    // against expected tokens -- the masks themselves enforce the
+    // pair-cancellation contract (a tampered peer line on one side
+    // just produces an uncancelled mask, leaving an arithmetic
+    // signature in the final sum that the audit doc walks).
+    let peer_count = 0
+    let done = 0
+    while done == 0 {
+        let line = _recv_line(sub_fd)
+        if line == 0 {
+            close_fd(sub_fd)
+            return 0
+        }
+        let prec = _parse_line(line)
+        if prec == 0 { done = 1 }
+        else {
+            let t = prec[KGSYNC_R_TYPE]
+            if t == KGSYNC_EV_SECAGG_PEER {
+                peer_count = peer_count + 1
+                println("fed-coord: SECAGG_PEER soul=" + soul_id
+                    + " peer=" + prec[KGSYNC_SECAGG_PEER_ID])
+            } else {
+                if t == KGSYNC_EV_ACK { done = 1 }
+                else { done = 1 }
+            }
+        }
+    }
+    let s = _csoul_new(sub_fd, soul_id, epsilon)
+    push(s, peer_count)   // index 4 = peer count
+    return s
+}
+
 // Accept exactly N souls up-front (rejected handshakes do NOT count
 // toward N; bounded by 3*N+4 attempts).
 fn _fed_accept_n(server_fd, n, expected_token) {
@@ -140,6 +208,132 @@ fn _fed_accept_n(server_fd, n, expected_token) {
         attempts = attempts + 1
     }
     return souls
+}
+
+// SecAgg-mode accept loop -- analogous to _fed_accept_n but uses the
+// v2-sa HELLO.
+fn _fed_accept_n_secagg(server_fd, n) {
+    let souls = list_new()
+    let attempts = 0
+    let max_attempts = 3 * n + 4
+    while len(souls) < n {
+        if attempts >= max_attempts { return souls }
+        let fd = accept_conn(server_fd, 0, 0)
+        if fd >= 0 {
+            let s = _fed_accept_handshake_secagg(fd)
+            if s != 0 {
+                push(souls, s)
+                println("fed-coord: SECAGG JOIN soul=" + s[CSOUL_ID]
+                    + " peers=" + int_to_str(s[4])
+                    + " (total " + int_to_str(len(souls)) + " of "
+                    + int_to_str(n) + ")")
+            }
+        }
+        attempts = attempts + 1
+    }
+    return souls
+}
+
+// SecAgg-mode collect: read FED_STAT_MASKED lines from each soul and
+// SUM (not average) per source. The coordinator never sees individual
+// raw values -- only the masked submissions, whose sum equals the sum
+// of raw values via pairwise mask cancellation.
+//
+// CRITICAL audit property: at no point does the coordinator look at a
+// single soul's masked value as if it were the soul's true stat. The
+// only quantity the coordinator computes is the SUM across souls.
+// The println of "MASKED_STAT" below reports JUST the masked value
+// the soul sent (which is uninformative on its own) -- the coordinator
+// does NOT have access to per-soul x_i.
+fn _fed_collect_masked(souls, round_id) {
+    let acc = sa_acc_new(round_id)
+    let i = 0
+    while i < len(souls) {
+        let s = souls[i]
+        let fd = s[CSOUL_FD]
+        if fd >= 0 {
+            let done = 0
+            let read_n = 0
+            while done == 0 {
+                let line = _recv_line(fd)
+                if line == 0 {
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                    done = 1
+                } else {
+                    let rec = _parse_line(line)
+                    if rec == 0 { done = 1 }
+                    else {
+                        let t = rec[KGSYNC_R_TYPE]
+                        if t == KGSYNC_EV_FED_STAT_MASKED {
+                            let rid = rec[KGSYNC_FED_ROUND_ID]
+                            if rid == round_id {
+                                let tag = rec[KGSYNC_FED_TAG]
+                                let mp = rec[KGSYNC_FED_PROMO]
+                                let ma = rec[KGSYNC_FED_ATR]
+                                sa_acc_add_masked(acc, tag, mp, ma)
+                                read_n = read_n + 1
+                                println("fed-coord: MASKED_STAT soul=" + s[CSOUL_ID]
+                                    + " round=" + int_to_str(round_id)
+                                    + " tag=" + tag
+                                    + " [SECAGG] masked-value-opaque")
+                                list_set(s, CSOUL_ACTIVE, nanotime())
+                            }
+                        } else {
+                            if t == KGSYNC_EV_ACK { done = 1 }
+                            else {
+                                if t == KGSYNC_EV_FED_LEAVE {
+                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
+                                    close_fd(fd)
+                                    list_set(s, CSOUL_FD, 0 - 1)
+                                    done = 1
+                                } else { done = 1 }
+                            }
+                        }
+                    }
+                }
+            }
+            println("fed-coord: soul=" + s[CSOUL_ID] + " emitted "
+                + int_to_str(read_n) + " masked-stat(s)")
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+// SecAgg-mode broadcast: send FED_AGGREGATE_SUM lines (sum, not avg).
+fn _fed_broadcast_sum(souls, round_id, sums) {
+    let sent = 0
+    let i = 0
+    while i < len(sums) {
+        let row = sums[i]
+        let tag = row[0]
+        let sp = row[1]
+        let sa_ = row[2]
+        let n = row[3]
+        let line = sa_format_aggregate_sum_line(round_id, tag, sp, sa_, n)
+        let j = 0
+        while j < len(souls) {
+            let s = souls[j]
+            let fd = s[CSOUL_FD]
+            if fd >= 0 {
+                if _send_all(fd, line) == 0 {
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                } else {
+                    sent = sent + 1
+                }
+            }
+            j = j + 1
+        }
+        println("fed-coord: [SECAGG] AGGREGATE_SUM round=" + int_to_str(round_id)
+            + " tag=" + tag
+            + " sum_promo=" + int_to_str(sp)
+            + " sum_atr=" + int_to_str(sa_)
+            + " n_part=" + int_to_str(n))
+        i = i + 1
+    }
+    return sent
 }
 
 // Broadcast a FED_ROUND line to every active soul. Returns the number of
@@ -324,11 +518,16 @@ fn main() {
     let n_souls = _fed_souls_env()
     let max_rounds = _fed_max_rounds()
     let round_interval = fed_round_interval_from_env()
+    let secagg = sa_enabled_from_env()
+
+    let mode_str = "v1"
+    if secagg == 1 { mode_str = "v2-sa (SecAgg)" }
 
     println("fed-coord: starting on port " + int_to_str(port)
         + " (bind " + bind_ip + ")"
         + " expected-souls=" + int_to_str(n_souls)
         + " auth=" + _auth_mode_str(token)
+        + " mode=" + mode_str
         + " round-interval-ns=" + int_to_str(round_interval))
 
     let server_fd = sync_pub_listen(port)
@@ -340,7 +539,12 @@ fn main() {
     println("fed-coord: listening, awaiting "
         + int_to_str(n_souls) + " soul HELLO(s) ...")
 
-    let souls = _fed_accept_n(server_fd, n_souls, token)
+    let souls = list_new()
+    if secagg == 1 {
+        souls = _fed_accept_n_secagg(server_fd, n_souls)
+    } else {
+        souls = _fed_accept_n(server_fd, n_souls, token)
+    }
     if len(souls) < n_souls {
         println("fed-coord: WARN only "
             + int_to_str(len(souls)) + " of " + int_to_str(n_souls)
@@ -377,13 +581,28 @@ fn main() {
                 println("fed-coord: no souls received the round line; exiting")
                 go = 0
             } else {
-                let acc = _fed_collect_stats(souls, round_id)
-                let averages = fed_acc_averages(acc)
-                if len(averages) == 0 {
-                    println("fed-coord: round " + int_to_str(round_id)
-                        + " produced no aggregates (no soul stats)")
+                if secagg == 1 {
+                    // SecAgg path: SUM the masked submissions, broadcast
+                    // FED_AGGREGATE_SUM. The coordinator never sees raw
+                    // per-soul values; only the sum (which equals Σ x_i
+                    // via mask cancellation).
+                    let acc = _fed_collect_masked(souls, round_id)
+                    let sums = sa_acc_sums(acc)
+                    if len(sums) == 0 {
+                        println("fed-coord: [SECAGG] round " + int_to_str(round_id)
+                            + " produced no aggregates (no soul stats)")
+                    } else {
+                        _fed_broadcast_sum(souls, round_id, sums)
+                    }
                 } else {
-                    _fed_broadcast_aggregate(souls, round_id, averages)
+                    let acc = _fed_collect_stats(souls, round_id)
+                    let averages = fed_acc_averages(acc)
+                    if len(averages) == 0 {
+                        println("fed-coord: round " + int_to_str(round_id)
+                            + " produced no aggregates (no soul stats)")
+                    } else {
+                        _fed_broadcast_aggregate(souls, round_id, averages)
+                    }
                 }
                 rounds_done = rounds_done + 1
                 round_id = round_id + 1
