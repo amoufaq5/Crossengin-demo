@@ -11,7 +11,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 110 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 111 modules compile (`make build`, +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
@@ -25,7 +25,9 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `persistence/snapshot_compaction.nova` added in P2.10 snapshot
 > compaction pass,
 > +2 from `io/transducers/{stt_seam,stream_audio}.nova` added in P2.5
-> STT framework + audit), 116 unit-test suites pass
+> STT framework + audit,
+> +1 from `parts/reasoning/proof_checker.nova` added in P3.5 minimum
+> viable proof checker), 117 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -61,8 +63,13 @@ computational units rather than orchestrating a pipeline of modules.
 > modality bridge, pluggable behind `EV_MESSAGE` -- documented in
 > [`STT_AUDIT.md`](./STT_AUDIT.md), with `scripts/transcribe.sh` as the
 > auto-detecting subprocess shim and `src/io/transducers/stream_audio.nova`
-> as the env-gated audio-capture source),
-> 21 end-to-end integration
+> as the env-gated audio-capture source,
+> +1 suite / +56 assertions from `test_proof_checker.nova` added in P3.5
+> minimum-viable proof checker -- bounded BFS over the operator graph
+> returning audit-grade derivation traces with composed Bayesian
+> confidence, surfaced via the chat `/prove PREMISE CONCLUSION [DEPTH]`
+> admin command),
+> 22 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -78,7 +85,11 @@ computational units rather than orchestrating a pipeline of modules.
 > source acceptance test,
 > +1 from `scenario_n_compaction.sh` added in P2.10 snapshot compaction
 > pass: /save -> /teach 50 -> /compact -> /save shrinks file growth by
-> >50% vs the baseline /save -> /teach 50 -> /save),
+> >50% vs the baseline /save -> /teach 50 -> /save,
+> +1 from `scenario_o_proof_checker.sh` added in P3.5 minimum-viable
+> proof checker: /seed medical -> /prove headache hydration prints the
+> headache -> dehydration -> hydration operator chain with composed
+> confidence and visit/depth counters),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence

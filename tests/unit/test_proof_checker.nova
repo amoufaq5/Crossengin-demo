@@ -1,0 +1,281 @@
+// Unit tests for src/parts/reasoning/proof_checker.nova (P3.5 / ADR-0052).
+// Verifies:
+//   - trivial proof (premise == conclusion)
+//   - one-hop proof
+//   - two-hop proof + strength composition
+//   - no-path
+//   - cycle handling
+//   - depth bound
+//   - strength clamp
+//   - proof_format output shape
+//   - proof_to_dlog_trace shape
+//   - proof_check_stateful records stats
+
+import "../ce_test.nova"
+import "../../src/parts/reasoning/proof_checker.nova"
+
+// ---- builders ------------------------------------------------------------
+// Each builder returns the reasoning_kg; atom ids are 0..N in insertion order
+// (multi_kg_manager assigns them sequentially).
+
+fn build_empty() {
+    let reg = kg_registry_new()
+    return reasoning_kg_init(reg)
+}
+
+fn build_one_hop() {
+    let rkg = build_empty()
+    kg_add_atom(rkg, ATOM_FACT, "A", 0)          // 0
+    kg_add_atom(rkg, ATOM_FACT, "B", 0)          // 1
+    let op = rop_new(rkg, ROP_CAUSAL, 0, 1, "A->B", 0)
+    // Strengthen so the test does not depend on the (500-milli) uniform prior.
+    rop_observe(op, 1); rop_observe(op, 1); rop_observe(op, 1)
+    return rkg
+}
+
+fn build_two_hop() {
+    let rkg = build_empty()
+    kg_add_atom(rkg, ATOM_FACT, "A", 0)          // 0
+    kg_add_atom(rkg, ATOM_FACT, "B", 0)          // 1
+    kg_add_atom(rkg, ATOM_FACT, "C", 0)          // 2
+    let op1 = rop_new(rkg, ROP_CAUSAL, 0, 1, "A->B", 0)
+    let op2 = rop_new(rkg, ROP_IMPLY, 1, 2, "B->C", 0)
+    rop_observe(op1, 1); rop_observe(op1, 1); rop_observe(op1, 1)
+    rop_observe(op2, 1); rop_observe(op2, 1); rop_observe(op2, 1)
+    return rkg
+}
+
+fn build_disconnected() {
+    let rkg = build_empty()
+    kg_add_atom(rkg, ATOM_FACT, "A", 0)          // 0
+    kg_add_atom(rkg, ATOM_FACT, "B", 0)          // 1
+    kg_add_atom(rkg, ATOM_FACT, "X", 0)          // 2 (no edges)
+    rop_new(rkg, ROP_CAUSAL, 0, 1, "A->B", 0)
+    return rkg
+}
+
+fn build_cycle() {
+    let rkg = build_empty()
+    kg_add_atom(rkg, ATOM_FACT, "A", 0)          // 0
+    kg_add_atom(rkg, ATOM_FACT, "B", 0)          // 1
+    rop_new(rkg, ROP_CAUSAL, 0, 1, "A->B", 0)
+    rop_new(rkg, ROP_CAUSAL, 1, 0, "B->A", 0)
+    return rkg
+}
+
+// 5-hop chain A0 -> A1 -> A2 -> A3 -> A4 -> A5
+fn build_five_hop() {
+    let rkg = build_empty()
+    kg_add_atom(rkg, ATOM_FACT, "A0", 0)         // 0
+    kg_add_atom(rkg, ATOM_FACT, "A1", 0)         // 1
+    kg_add_atom(rkg, ATOM_FACT, "A2", 0)         // 2
+    kg_add_atom(rkg, ATOM_FACT, "A3", 0)         // 3
+    kg_add_atom(rkg, ATOM_FACT, "A4", 0)         // 4
+    kg_add_atom(rkg, ATOM_FACT, "A5", 0)         // 5
+    rop_new(rkg, ROP_CAUSAL, 0, 1, "0->1", 0)
+    rop_new(rkg, ROP_CAUSAL, 1, 2, "1->2", 0)
+    rop_new(rkg, ROP_CAUSAL, 2, 3, "2->3", 0)
+    rop_new(rkg, ROP_CAUSAL, 3, 4, "3->4", 0)
+    rop_new(rkg, ROP_CAUSAL, 4, 5, "4->5", 0)
+    return rkg
+}
+
+// 3-hop with KNOWN confidences for strength check:
+//   op1: confidence 900, op2: 800, op3: 700.
+// rop_confidence is the Bayesian-belief mean: alpha/(alpha+beta) in milli.
+// Starting from the uniform (1.0, 1.0) prior, observing +1 nine times yields
+// alpha=10, beta=1, mean=909 milli. Tweak via rop_observe() until we hit the
+// targets; for the strength check the exact deltas are aimed at:
+//   900-ish: 9 +1s     -> alpha=10000, beta=1000, mean=909
+//   800-ish: 4 +1s     -> alpha=5000, beta=1000, mean=833
+//   700-ish: 2 +1s     -> alpha=3000, beta=1000, mean=750
+// Product: 909 * 833 / 1000 = 757; 757 * 750 / 1000 = 567. Test uses ce_near.
+
+fn build_strength_chain() {
+    let rkg = build_empty()
+    kg_add_atom(rkg, ATOM_FACT, "S0", 0)
+    kg_add_atom(rkg, ATOM_FACT, "S1", 0)
+    kg_add_atom(rkg, ATOM_FACT, "S2", 0)
+    kg_add_atom(rkg, ATOM_FACT, "S3", 0)
+    let op1 = rop_new(rkg, ROP_CAUSAL, 0, 1, "S0->S1", 0)
+    let op2 = rop_new(rkg, ROP_CAUSAL, 1, 2, "S1->S2", 0)
+    let op3 = rop_new(rkg, ROP_CAUSAL, 2, 3, "S2->S3", 0)
+    let i = 0
+    while i < 9 { rop_observe(op1, 1); i = i + 1 }
+    let j = 0
+    while j < 4 { rop_observe(op2, 1); j = j + 1 }
+    let k = 0
+    while k < 2 { rop_observe(op3, 1); k = k + 1 }
+    return rkg
+}
+
+// ---- substring helper for proof_format assertions ------------------------
+fn _contains_substr(hay, needle) {
+    let h = len(hay)
+    let n = len(needle)
+    if n == 0 { return 1 }
+    if h < n { return 0 }
+    let i = 0
+    while i <= h - n {
+        if str_eq(substr(hay, i, n), needle) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- tests ---------------------------------------------------------------
+
+fn test_trivial() {
+    let rkg = build_one_hop()
+    let r = proof_check(0, 0, rkg, 0, 0)
+    ce_eq("trivial valid", proof_result_valid(r), 1)
+    ce_eq("trivial chain empty", len(proof_result_chain(r)), 0)
+    ce_eq("trivial strength 1000", proof_result_strength(r), 1000)
+    ce_eq("trivial visited 1", proof_result_visited(r), 1)
+}
+
+fn test_one_hop() {
+    let rkg = build_one_hop()
+    let r = proof_check(0, 1, rkg, 0, 0)
+    ce_eq("one-hop valid", proof_result_valid(r), 1)
+    ce_eq("one-hop chain size", len(proof_result_chain(r)), 1)
+    ce_check("one-hop strength > 0", proof_result_strength(r) > 0)
+    // op0 has 3 successes on uniform: alpha=4000, beta=1000, mean=800.
+    ce_eq("one-hop strength is op confidence", proof_result_strength(r), 800)
+    let chain = proof_result_chain(r)
+    ce_eq("one-hop chain op premise", rop_premise(chain[0]), 0)
+    ce_eq("one-hop chain op conclusion", rop_conclusion(chain[0]), 1)
+}
+
+fn test_two_hop() {
+    let rkg = build_two_hop()
+    let r = proof_check(0, 2, rkg, 0, 0)
+    ce_eq("two-hop valid", proof_result_valid(r), 1)
+    ce_eq("two-hop chain size", len(proof_result_chain(r)), 2)
+    // Strength: each op is 800 milli; 800 * 800 / 1000 = 640.
+    ce_eq("two-hop strength is product", proof_result_strength(r), 640)
+    let chain = proof_result_chain(r)
+    ce_eq("first op premise A", rop_premise(chain[0]), 0)
+    ce_eq("first op conclusion B", rop_conclusion(chain[0]), 1)
+    ce_eq("second op premise B", rop_premise(chain[1]), 1)
+    ce_eq("second op conclusion C", rop_conclusion(chain[1]), 2)
+}
+
+fn test_no_path() {
+    let rkg = build_disconnected()
+    let r = proof_check(0, 2, rkg, 0, 0)   // A -> X (X has no edges)
+    ce_eq("no path valid=0", proof_result_valid(r), 0)
+    ce_eq("no path empty chain", len(proof_result_chain(r)), 0)
+    ce_eq("no path strength 0", proof_result_strength(r), 0)
+    ce_check("no path some visits", proof_result_visited(r) >= 1)
+}
+
+fn test_cycle_self() {
+    let rkg = build_cycle()
+    // Self-proof on either node should be trivially valid.
+    let r0 = proof_check(0, 0, rkg, 2, 0)
+    ce_eq("cycle A->A valid", proof_result_valid(r0), 1)
+    ce_eq("cycle A->A empty chain", len(proof_result_chain(r0)), 0)
+    ce_eq("cycle A->A strength 1000", proof_result_strength(r0), 1000)
+    let r1 = proof_check(1, 1, rkg, 2, 0)
+    ce_eq("cycle B->B valid", proof_result_valid(r1), 1)
+    ce_eq("cycle B->B empty chain", len(proof_result_chain(r1)), 0)
+    // A->B reachable via single op, despite the back-edge: cycle does not
+    // cause infinite expansion (visit-set check).
+    let r2 = proof_check(0, 1, rkg, 4, 32)
+    ce_eq("cycle A->B reachable", proof_result_valid(r2), 1)
+    ce_eq("cycle A->B chain size 1", len(proof_result_chain(r2)), 1)
+}
+
+fn test_depth_bound() {
+    let rkg = build_five_hop()
+    // Full chain reachable with depth >= 5.
+    let r_ok = proof_check(0, 5, rkg, 5, 0)
+    ce_eq("5-hop with depth 5 valid", proof_result_valid(r_ok), 1)
+    ce_eq("5-hop chain size 5", len(proof_result_chain(r_ok)), 5)
+    // Depth 3 cannot reach atom 5 from atom 0.
+    let r_short = proof_check(0, 5, rkg, 3, 0)
+    ce_eq("5-hop with depth 3 invalid", proof_result_valid(r_short), 0)
+    ce_eq("5-hop depth 3 empty chain", len(proof_result_chain(r_short)), 0)
+}
+
+fn test_strength_three_chain() {
+    let rkg = build_strength_chain()
+    let r = proof_check(0, 3, rkg, 0, 0)
+    ce_eq("3-chain valid", proof_result_valid(r), 1)
+    ce_eq("3-chain size", len(proof_result_chain(r)), 3)
+    // Targets (see build_strength_chain comment): 909 * 833 * 750 / 1000^2.
+    // 909 * 833 / 1000 = 757; 757 * 750 / 1000 = 567. Allow a small tolerance
+    // because integer truncation per link is order-dependent.
+    ce_near("3-chain strength near 567", proof_result_strength(r), 567, 10)
+    // Strength must be strictly below the weakest link (chain composition
+    // can only DECREASE confidence).
+    let chain = proof_result_chain(r)
+    let weakest = rop_confidence(chain[0])
+    let m = 1
+    while m < len(chain) {
+        if rop_confidence(chain[m]) < weakest { weakest = rop_confidence(chain[m]) }
+        m = m + 1
+    }
+    ce_check("chain strength <= weakest link", proof_result_strength(r) <= weakest)
+}
+
+fn test_format() {
+    let rkg = build_two_hop()
+    let r = proof_check(0, 2, rkg, 0, 0)
+    let s = proof_format(proof_result_chain(r), rkg)
+    ce_check("format header has proof:", _contains_substr(s, "proof:"))
+    ce_check("format mentions A label", _contains_substr(s, "A"))
+    ce_check("format mentions B label", _contains_substr(s, "B"))
+    ce_check("format mentions C label", _contains_substr(s, "C"))
+    ce_check("format mentions causal kind", _contains_substr(s, "causal"))
+    ce_check("format mentions implicative kind", _contains_substr(s, "implicative"))
+    ce_check("format mentions op #", _contains_substr(s, "op #"))
+    ce_check("format mentions confidence", _contains_substr(s, "confidence"))
+    ce_check("format mentions strength", _contains_substr(s, "strength:"))
+    // Trivial-proof formatter.
+    let empty = list_new()
+    let st = proof_format(empty, rkg)
+    ce_check("trivial format string", _contains_substr(st, "trivial"))
+}
+
+fn test_dlog_trace() {
+    let rkg = build_two_hop()
+    let r = proof_check(0, 2, rkg, 0, 0)
+    let chain = proof_result_chain(r)
+    let trace = proof_to_dlog_trace(chain, rkg)
+    ce_eq("trace length 2", len(trace), 2)
+    // Each entry is [op_atom_id, premise_id, conclusion_id, confidence].
+    ce_eq("trace[0] arity", len(trace[0]), 4)
+    ce_eq("trace[0] premise", trace[0][1], 0)
+    ce_eq("trace[0] conclusion", trace[0][2], 1)
+    ce_eq("trace[1] premise", trace[1][1], 1)
+    ce_eq("trace[1] conclusion", trace[1][2], 2)
+}
+
+fn test_stateful() {
+    let rkg = build_two_hop()
+    let st = proof_new()
+    ce_eq("initial queries", proof_queries(st), 0)
+    ce_eq("initial visited", proof_visited(st), 0)
+    proof_check_stateful(st, 0, 2, rkg, 0, 0)
+    proof_check_stateful(st, 0, 1, rkg, 0, 0)
+    ce_eq("two queries", proof_queries(st), 2)
+    ce_check("visited recorded", proof_visited(st) >= 2)
+}
+
+fn main() {
+    test_trivial()
+    test_one_hop()
+    test_two_hop()
+    test_no_path()
+    test_cycle_self()
+    test_depth_bound()
+    test_strength_three_chain()
+    test_format()
+    test_dlog_trace()
+    test_stateful()
+    ce_summary("proof_checker")
+}
+
+main()

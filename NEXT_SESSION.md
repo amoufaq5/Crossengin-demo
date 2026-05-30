@@ -17,6 +17,56 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.5 minimum-viable proof checker: **complete** (ADR-0052).
+  Today reasoning produces a conclusion via operator chains
+  (`fever -> infection -> treat`) but the chain itself is never surfaced --
+  there is no formal proof trail you can ask for, audit, or attach to a
+  decision-log entry. New module `src/parts/reasoning/proof_checker.nova`
+  closes that hole: bounded BFS over the operator graph (`rk_operators_from`
+  forward + `rk_operators_to` backward) from a premise atom to a
+  conclusion atom, returning either a valid operator-chain proof + its
+  composed Bayesian confidence or "no proof found within depth D".
+  API: `proof_new()`, `proof_check(premise_id, conclusion_id, rkg,
+  max_depth, max_visits) -> [valid, chain_ops, strength_milli,
+  visited_count]`, `proof_format(chain, rkg)` for the audit-grade
+  human-readable string (`proof: A -> B -> C` header, one indented line
+  per operator with kind + label + confidence, `strength: <milli>` footer),
+  and `proof_to_dlog_trace(chain, rkg)` returning a list of
+  [op_atom_id, premise_id, conclusion_id, confidence] entries matching
+  the trace shape `reason_forward_chain` already produces, so any
+  `dl_append` trace field can carry a proof trail uniformly.
+  Strength is the product of per-operator Beta-posterior means
+  (`rop_confidence` = `bel_mean` = `alpha / (alpha+beta)` milli), composed
+  one link at a time via `result = result * confidence / 1000` and clamped
+  to [0, 1000] -- the same integer-milli pattern `reason_evidential_chain`
+  uses, so intermediates stay well under the codegen pointer-threshold
+  danger zone. Defaults: depth 6, visits 1024; both are caller-overridable
+  via the public API and via the chat `/prove PREMISE CONCLUSION [DEPTH]`
+  surface. Edge cases: premise == conclusion is the trivial proof
+  (chain=[], strength=1000); cycles (a->b->a) are visit-set-bounded so
+  they cannot expand twice; no path within depth returns valid=0 with the
+  visit counter so the operator can distinguish depth-bound vs
+  graph-bound failure. Chat surface (`examples/crossengin_chat.nova`): a
+  single new `_admin_prove` admin function + one dispatch line + one
+  /help line. Prints either
+  ```
+  proof: headache -> dehydration -> hydration
+    op #623 (causal) headache -> dehydration; confidence 500
+    op #632 (implicative) dehydration -> hydration; confidence 500
+  strength: 250 milli (product of confidences)
+  visited 6 state(s); depth budget 6, visit budget 1024
+  ```
+  or `no proof: headache -> motorcycle within depth 6 (visited N of 1024)`.
+  Unit test `tests/unit/test_proof_checker.nova` (+56 assertions, 117 total
+  suites) covers trivial / one-hop / two-hop / no-path / cycle / depth-bound
+  / strength composition / format / dlog-trace / stateful counters.
+  Integration scenario `tests/integration/scenario_o_proof_checker.sh`
+  (+10 assertions) runs the medical seed and asserts the chain output for
+  headache -> dehydration -> hydration plus the baseline-seed
+  fever -> infection -> treat chain, plus the trivial / unknown-label /
+  /help-listing paths. No SAT solver, no embedding lookup -- pure
+  substrate integer arithmetic over operator edges already in the
+  reasoning KG.
 - P2.10 snapshot compaction pass: **complete**.
   After hours of operation a long-running snapshot grows linearly with KG
   size + moment count + episode count: a steady accumulation of dead atoms
@@ -1141,6 +1191,7 @@ implemented in-house (see NOVA blockers).
 | concept_layer.nova | 0018 | 28 | done |
 | skills_kg.nova | 0019 | 26 | done |
 | competence_tracker.nova | 0020 | 27 | done |
+| parts/reasoning/proof_checker.nova (P3.5 bounded-BFS operator-chain proof checker; product-of-Bayesian-mean strength; trivial / cycle / depth-bound / no-path edges; chat `/prove` surface) | 0031, 0052 | 56 | done |
 
 Also delivered: `tests/benchmark/bench_kg_query.nova` (insertion, id/label
 lookup, observation throughput); `tests/benchmark/bench_ann_query.nova`
@@ -1505,7 +1556,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 116 (116 PASS, +1 from P3.4 `test_ann_index.nova`, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+46 assertions added by P3.4** (`test_ann_index.nova`), **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
+- Total unit suites: 117 (117 PASS, +1 from P3.5 `test_proof_checker.nova`, +1 from P3.4 `test_ann_index.nova`, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+56 assertions added by P3.5** (`test_proof_checker.nova`), **+46 assertions added by P3.4** (`test_ann_index.nova`), **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.
