@@ -83,6 +83,15 @@ let active_id = "default"
 // `src/parts/meta/meta_observer.nova` for the threshold logic.
 let sauth = sa_default()
 
+// P2.10 -- per-active-session pending compacted snapshot. When non-zero,
+// `_pending_compact_snap` holds a snapshot value produced by /compact; the
+// next /save reads it (instead of rebuilding from live state) and clears
+// the slot. We also track `_pending_compact_session` so a /switch into a
+// different session invalidates the buffer. The buffer is a single global
+// -- /compact only operates on the active session.
+let _pending_compact_snap = 0
+let _pending_compact_session = ""
+
 // ---- buffered line reader ------------------------------------------------
 // io_input() returns whatever sys_read drained -- on a terminal in line mode
 // that's one line, but on a pipe (or after a paste) it can be several lines
@@ -200,6 +209,11 @@ fn _admin_help() {
     io_println("                      /tmp/ce_speech.wav and plays via aplay if available")
     io_println("  /switch [ID]        list sessions (no arg) or activate/create ID")
     io_println("  /seed [PACK]        list domain seed packs (no arg) or install PACK")
+    io_println("  /compact [--dry-run] compact the in-memory snapshot: drop dead atoms")
+    io_println("                      (mean<0.05), archived episodes, old moments, and")
+    io_println("                      sub-threshold synapses; next /save writes the")
+    io_println("                      compacted form. Knobs: CE_COMPACT_DEAD_BELIEF /")
+    io_println("                      _MOMENT_MAX_AGE_NS / _SYNAPSE_THRESHOLD")
     io_println("  /__metrics__        (internal) machine-readable key=value lines for")
     io_println("                      scripts/web.py's /metrics Prometheus scraper")
     io_println("  /quit  /exit        exit chat")
@@ -714,18 +728,54 @@ fn _snap_path(arg, session_id) {
 // leaving the default tenant's snapshot at its own path untouched (P1.2).
 fn _admin_save(sl, kg, lang, stream, em, syn_g, sm, arg, session_id, now) {
     let path = _snap_path(arg, session_id)
-    let snap = _build_snapshot(sl, kg, lang, stream, em, syn_g, sm, now)
+    // P2.10: if /compact stashed a compacted snapshot for this session, write
+    // THAT instead of rebuilding from live state.
+    let snap = 0
+    let used_pending = 0
+    if _pending_compact_snap != 0 {
+        if str_eq(_pending_compact_session, session_id) == 1 {
+            snap = _pending_compact_snap
+            used_pending = 1
+        }
+    }
+    if snap == 0 {
+        snap = _build_snapshot(sl, kg, lang, stream, em, syn_g, sm, now)
+    }
     let ok = snap_save(snap, path)
     if ok == 1 {
-        io_println("(saved soul=" + soul_name(sl) + " kg=" + int_to_str(kg_atom_count(kg))
-            + " atom(s) + lang=" + int_to_str(kg_atom_count(lang))
-            + " atom(s) + " + int_to_str(ms_count(stream))
-            + " moment(s) + " + int_to_str(syn_live(syn_g))
-            + " syn(s) + " + int_to_str(self_model_count(sm))
-            + " competence record(s) -> " + path + " durably)")
+        if used_pending == 1 {
+            let kgs_recs = 0
+            let kgs_blob = snap_section(snap, SEC_KGS)
+            if kgs_blob != 0 {
+                if len(kgs_blob) > 1 { kgs_recs = len(kgs_blob[1]) }
+            }
+            let mom_count = ms_count(stream)
+            let ep_blob = snap_section(snap, SEC_EPISODIC)
+            if ep_blob != 0 {
+                if len(ep_blob) > 0 { mom_count = len(ep_blob[0]) }
+            }
+            let syn_count = syn_live(syn_g)
+            let syn_blob = snap_section(snap, SEC_SYNAPSES)
+            if syn_blob != 0 {
+                if len(syn_blob) > 1 { syn_count = len(syn_blob[1]) }
+            }
+            io_println("(saved compacted snapshot: kg=" + int_to_str(kgs_recs)
+                + " atom(s), " + int_to_str(mom_count)
+                + " moment(s), " + int_to_str(syn_count)
+                + " syn(s) -> " + path + " durably)")
+        } else {
+            io_println("(saved soul=" + soul_name(sl) + " kg=" + int_to_str(kg_atom_count(kg))
+                + " atom(s) + lang=" + int_to_str(kg_atom_count(lang))
+                + " atom(s) + " + int_to_str(ms_count(stream))
+                + " moment(s) + " + int_to_str(syn_live(syn_g))
+                + " syn(s) + " + int_to_str(self_model_count(sm))
+                + " competence record(s) -> " + path + " durably)")
+        }
     } else {
         io_println("(save FAILED: could not write " + path + " -- check directory exists / permissions)")
     }
+    _pending_compact_snap = 0
+    _pending_compact_session = ""
     return 1
 }
 
@@ -801,6 +851,59 @@ fn _admin_load(sl, kg, lang, kgreg, stream, em, syn_g, sm, arg, session_id, now)
         let mb = snap_section(snap, SEC_SELFMODEL)
         let n = selfmodel_section_apply(sm, mb)
         io_println("  selfmodel: " + int_to_str(n) + " competence record(s) restored")
+    }
+    return 1
+}
+
+// /compact [--dry-run] (P2.10): run a compaction pass over the active
+// session's live state and either (a) cache the compacted snapshot for the
+// next /save (default) or (b) print the would-be stats without mutating the
+// pending-snapshot slot (--dry-run). Stats reported:
+//   - dead atoms dropped (mean < CE_COMPACT_DEAD_BELIEF, default 0.05)
+//   - archived episodes dropped (tier == EP_ARCHIVED)
+//   - moments older than CE_COMPACT_MOMENT_MAX_AGE_NS dropped
+//   - synapses with |weight| below CE_COMPACT_SYNAPSE_THRESHOLD (default
+//     0.2 milli, tighter than the wire-format default of 0.1) dropped
+//   - on-disk size delta: live-state snapshot size vs compacted size
+//
+// The "live state snapshot" is built fresh here (via _build_snapshot) so
+// the size delta reflects what /save WOULD have written without /compact
+// vs what it WILL write with the compaction cached. On a non-dry run, the
+// compacted snapshot is stashed in `_pending_compact_snap` keyed by the
+// active session id; _admin_save consumes it.
+//
+// Bytes -> KB rounding uses integer arithmetic (1000-based, matches `du
+// --si`).
+fn _admin_compact(sl, kg, lang, stream, em, syn_g, sm, arg, session_id, now) {
+    let dry = 0
+    if str_eq(arg, "--dry-run") == 1 { dry = 1 }
+    let live_snap = _build_snapshot(sl, kg, lang, stream, em, syn_g, sm, now)
+    let opts = compact_opts_from_env()
+    let stats = snap_compact_stats(live_snap, opts)
+    let dead_drop = stats[0]
+    let ep_drop = stats[1]
+    let m_drop = stats[2]
+    let syn_drop = stats[3]
+    let before_text = snap_to_text(live_snap)
+    let before_bytes = len(before_text)
+    let compacted = snap_compact(live_snap, opts)
+    let after_text = snap_to_text(compacted)
+    let after_bytes = len(after_text)
+    let before_kb = before_bytes / 1000
+    let after_kb = after_bytes / 1000
+    let mode_str = ""
+    if dry == 1 { mode_str = " (dry-run)" }
+    io_println("(compacted" + mode_str + ": "
+        + int_to_str(dead_drop) + " dead atoms dropped, "
+        + int_to_str(ep_drop) + " archived episodes dropped, "
+        + int_to_str(m_drop) + " old moments dropped, "
+        + int_to_str(syn_drop) + " synapses below new threshold dropped; "
+        + "snapshot " + int_to_str(before_kb) + "KB -> "
+        + int_to_str(after_kb) + "KB)")
+    if dry == 0 {
+        _pending_compact_snap = compacted
+        _pending_compact_session = session_id
+        io_println("(in-memory snapshot replaced; next /save writes the compacted form)")
     }
     return 1
 }
@@ -1173,6 +1276,7 @@ fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, 
     if str_eq(cmd, "/reflect") == 1 { return _admin_reflect(ctx, kg, ikg, refl_kg, arg, now) }
     if str_eq(cmd, "/save")    == 1 { return _admin_save(sl, kg, lang, stream, em, syn_g, sm, arg, active_id, now) }
     if str_eq(cmd, "/load")    == 1 { return _admin_load(sl, kg, lang, kgreg, stream, em, syn_g, sm, arg, active_id, now) }
+    if str_eq(cmd, "/compact") == 1 { return _admin_compact(sl, kg, lang, stream, em, syn_g, sm, arg, active_id, now) }
     if str_eq(cmd, "/speak")   == 1 { return _admin_speak(lang, arg) }
     if str_eq(cmd, "/meta")    == 1 { return _admin_meta(mo, refl_kg, kg, now) }
     if str_eq(cmd, "/meta-feedback") == 1 { return _admin_meta_feedback(mo, sauth) }
@@ -1215,6 +1319,14 @@ fn main() {
     let arb = slt_arbiter_new()
     let stream = ms_new()
     let em = em_new()
+    // P2.1 + P2.2: cofire + slot similarity side-indices. Initialized at
+    // boot; the cofire index accumulates pairs of co-firing atoms when
+    // moments settle (via ms_settle_old_with_cofire), and the slot index
+    // accumulates pattern fillers each time gen_from_intent_with_slot
+    // runs. These feed the reader's find_neighbors_full surface (Phase 14
+    // / Tier-2 #2 P2.1/P2.2 follow-up).
+    let ci = ci_new()
+    let si = si_new()
     // P0.1 (this edit): synapse graph + self-model are also shared across
     // sessions for now. We choose the "reasoning" part's synapse graph as the
     // persistence target -- it's the part where Hebbian learning between
@@ -1401,7 +1513,7 @@ fn main() {
                         push(it, a) push(it, b)
                         intent = it
                     }
-                    let resp = gen_from_intent(lang, cands, intent, hs_now(hs))
+                    let resp = gen_from_intent_with_slot(lang, cands, intent, hs_now(hs), si)
                     let said = effector_speak_governed(log, sl, resp, halted, 0 - 1, list_new(), 0, hs_now(hs))
                     ctx_set_output(ctx, said)
                     _route_and_inject(reg, gate, XSIG_GOAL, 800, hs_now(hs))

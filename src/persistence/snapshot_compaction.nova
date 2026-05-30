@@ -1,0 +1,485 @@
+// CrossEngin persistence: snapshot compaction (P2.10).
+//
+// Purpose
+//   A long-running CrossEngin process grows three classes of "tombstoned"
+//   state inside the durable snapshot:
+//
+//     1. KG atoms whose belief has collapsed to near-zero (mean < 0.05 ==
+//        50 milli). They take up wire-format bytes per atom (kg / id / kind /
+//        label / alpha / beta -- six lines each) but contribute nothing to
+//        the live inference graph because every reader gates on
+//        atom_confidence >= 750/1000 (or even >= 500). Dropping them is
+//        free at this point.
+//
+//     2. Episodes that have been archived (tier EP_ARCHIVED). They survive
+//        the boot sweep but are no longer in the active recall path; the
+//        snapshot can drop them and the next live perception cycle won't
+//        miss them. We also drop moments older than a configurable horizon
+//        (default 1h) so the moment stream stops growing without bound.
+//
+//     3. Synapses with |weight| below a tunable cut (raised on demand from
+//        the default 100 milli to e.g. 200 milli) -- the snapshot already
+//        runs a base cut at SYN_SNAP_MIN in synapses_section_build, but a
+//        long-running daemon may want a tighter cut without changing the
+//        live threshold.
+//
+//   This module is the IN-MEMORY compactor: take a parsed snapshot value,
+//   walk each section's blob, and produce a NEW snapshot with the same
+//   shape but smaller payloads. The on-disk text encoding is delegated
+//   back to snap_to_text in snapshot_disk.nova; the compacted snapshot
+//   parses + applies identically to a fresh one (the wire format is
+//   unchanged).
+//
+//   The orchestrator is `snap_compact(snap, opts)`; the per-section
+//   compactors `compact_kgs`, `compact_episodic`, `compact_synapses` are
+//   exported so a caller (e.g. a chat admin command) can run them
+//   selectively or report per-section stats.
+//
+//   Stats:
+//     - `compact_kgs` returns [new_blob, dropped_count].
+//     - `compact_episodic` returns [new_blob, dropped_episodes, dropped_moments].
+//     - `compact_synapses` returns [new_blob, dropped_count].
+//     - `snap_compact` returns the compacted snapshot value; per-section
+//       counts are reported via `snap_compact_stats`, which runs each
+//       compactor in dry-run shape and totals up what would be dropped.
+//
+//   List-mutation safety: NOVA's `list_set` does NOT remove elements; for
+//   filtering, we always copy survivors into a fresh list (the NOVA
+//   gotcha called out in the brief). Per-record records are reused
+//   directly (no need to clone -- they're never mutated after copy).
+//
+//   Codegen pointer-threshold: defaults are kept under 0x100000 where
+//   reasonable; the moment-age horizon (3.6e12 ns == 1 hour) IS large, so
+//   we keep it as a `let` constant that NOVA constant-folds rather than
+//   inlining at every use site.
+//
+// ADRs implemented: ADR-0048 (persistence container -- compaction is the
+//   in-memory editor of the same value the container holds). NOVA
+//   dependencies: builtins + getenv from std/syscall. CrossEngin
+//   dependencies:
+//     - src/persistence/snapshot_writer.nova (SEC_* ids + snap_new +
+//       snap_put_section + snap_has_section + snap_section).
+//
+// Public surface:
+//   compact_opts_new()                                  -> opts
+//   compact_opts_set_dead_belief(opts, milli)           -> opts
+//   compact_opts_set_moment_max_age(opts, ns)           -> opts
+//   compact_opts_set_synapse_threshold(opts, milli)     -> opts
+//   compact_opts_set_drop_label_prefix(opts, prefix)    -> opts
+//   compact_opts_dead_belief(opts)                      -> int (milli)
+//   compact_opts_moment_max_age(opts)                   -> int (ns)
+//   compact_opts_synapse_threshold(opts)                -> int (milli)
+//   compact_opts_drop_label_prefix(opts)                -> string
+//   compact_opts_from_env()                             -> opts (env-driven)
+//
+//   compact_kgs(snap, opts)        -> [new_kgs_blob, dropped]
+//   compact_episodic(snap, opts)   -> [new_blob, dropped_eps, dropped_moments]
+//   compact_synapses(snap, opts)   -> [new_syn_blob, dropped]
+//   snap_compact(snap, opts)       -> compacted_snap
+//   snap_compact_stats(snap, opts) -> [k_drop, ep_drop, m_drop, syn_drop]
+//   snap_text_size(snap)           -> int (bytes the snapshot would take on
+//                                         disk via snap_to_text)
+//
+// Knobs (defaults):
+//   dead_belief       =     50 milli (0.05) -- atoms below this are dropped
+//   moment_max_age    = 3600000000000 ns (1 hour, in ns)
+//   synapse_threshold =    200 milli (0.2, tighter than SYN_SNAP_MIN)
+//   drop_label_prefix = ""    (no prefix-based atom drop unless set)
+
+import "std/syscall"
+import "snapshot_writer.nova"
+
+// ---- env-driven defaults ---------------------------------------------------
+// Conventionally: env wins, else compile-time defaults.
+//   CE_COMPACT_DEAD_BELIEF        (milli; default 50)
+//   CE_COMPACT_MOMENT_MAX_AGE_NS  (ns;    default 3,600,000,000,000 == 1h)
+//   CE_COMPACT_SYNAPSE_THRESHOLD  (milli; default 200)
+//   CE_COMPACT_DROP_LABEL_PREFIX  (string; default "" -- disabled when empty)
+
+// 1 hour in nanoseconds: 3,600,000,000,000.
+// This sits above NOVA's pointer-threshold (0x100000) so we keep it as a
+// `let` constant (constant-folded) rather than inlining everywhere; the
+// brief calls out this codegen footgun explicitly.
+let _NS_PER_HOUR = 3600000000000
+
+let _DEFAULT_DEAD_BELIEF       = 50      // 0.05 in milli
+let _DEFAULT_SYN_THRESHOLD     = 200     // 0.2 in milli
+let _DEFAULT_DROP_LABEL_PREFIX = ""
+
+// Opts layout: a small list-record so each knob is addressable by id.
+let _CO_TAG          = 0
+let _CO_DEAD_BELIEF  = 1   // int, milli
+let _CO_MOMENT_AGE   = 2   // int, ns
+let _CO_SYN_THRESH   = 3   // int, milli
+let _CO_DROP_PREFIX  = 4   // string
+let _CO_OBJ_TAG      = 7301
+
+fn compact_opts_new() {
+    let o = list_new()
+    push(o, _CO_OBJ_TAG)
+    push(o, _DEFAULT_DEAD_BELIEF)
+    push(o, _NS_PER_HOUR)
+    push(o, _DEFAULT_SYN_THRESHOLD)
+    push(o, _DEFAULT_DROP_LABEL_PREFIX)
+    return o
+}
+
+fn compact_opts_set_dead_belief(o, milli) {
+    list_set(o, _CO_DEAD_BELIEF, milli)
+    return o
+}
+fn compact_opts_set_moment_max_age(o, ns) {
+    list_set(o, _CO_MOMENT_AGE, ns)
+    return o
+}
+fn compact_opts_set_synapse_threshold(o, milli) {
+    list_set(o, _CO_SYN_THRESH, milli)
+    return o
+}
+fn compact_opts_set_drop_label_prefix(o, prefix) {
+    list_set(o, _CO_DROP_PREFIX, prefix)
+    return o
+}
+
+fn compact_opts_dead_belief(o)       { return o[_CO_DEAD_BELIEF] }
+fn compact_opts_moment_max_age(o)    { return o[_CO_MOMENT_AGE] }
+fn compact_opts_synapse_threshold(o) { return o[_CO_SYN_THRESH] }
+fn compact_opts_drop_label_prefix(o) { return o[_CO_DROP_PREFIX] }
+
+// Read an integer env override or fall back to `def`. Empty/zero/negative
+// values fall back to the default (mirrors `_dl_env_int` in decision_log).
+fn _co_env_int(name, def) {
+    let env = getenv(name)
+    if env == 0 { return def }
+    if len(env) == 0 { return def }
+    let v = str_to_int(env)
+    if v <= 0 { return def }
+    return v
+}
+
+fn _co_env_str(name, def) {
+    let env = getenv(name)
+    if env == 0 { return def }
+    if len(env) == 0 { return def }
+    return env
+}
+
+// Build a fresh opts pre-populated from the CE_COMPACT_* env vars (any unset
+// or invalid var falls through to the static default). Callers wanting raw
+// defaults should use `compact_opts_new()` directly.
+fn compact_opts_from_env() {
+    let o = compact_opts_new()
+    compact_opts_set_dead_belief(o,
+        _co_env_int("CE_COMPACT_DEAD_BELIEF",       _DEFAULT_DEAD_BELIEF))
+    compact_opts_set_moment_max_age(o,
+        _co_env_int("CE_COMPACT_MOMENT_MAX_AGE_NS", _NS_PER_HOUR))
+    compact_opts_set_synapse_threshold(o,
+        _co_env_int("CE_COMPACT_SYNAPSE_THRESHOLD", _DEFAULT_SYN_THRESHOLD))
+    compact_opts_set_drop_label_prefix(o,
+        _co_env_str("CE_COMPACT_DROP_LABEL_PREFIX", _DEFAULT_DROP_LABEL_PREFIX))
+    return o
+}
+
+// ---- helpers --------------------------------------------------------------
+// Posterior mean alpha/(alpha+beta), in milli (0..1000). Inlined here so the
+// compactor doesn't have to import atom_store.nova (and pick up its
+// dependency chain) just for this one helper -- the atom record in the
+// snapshot blob is a flat [kg, id, kind, label, alpha, beta] tuple.
+fn _compact_belief_mean(alpha, beta) {
+    let total = alpha + beta
+    if total <= 0 { return 500 }
+    return alpha * 1000 / total
+}
+
+// Returns 1 if `s` starts with `prefix`. Empty `prefix` returns 0 (sentinel:
+// no prefix drop active). Pure builtin scan, no extra alloc.
+fn _compact_starts_with(s, prefix) {
+    let p = len(prefix)
+    if p == 0 { return 0 }
+    if p > len(s) { return 0 }
+    let i = 0
+    while i < p {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- compact_kgs -----------------------------------------------------------
+//
+// Drop atoms whose belief mean < opts.dead_belief; optionally also drop atoms
+// whose label starts with `opts.drop_label_prefix` (e.g. "debug:" to clear a
+// scratch namespace). Returns [new_blob, dropped_count].
+//
+// The KGS blob shape is [atom_count_int, list_of_records]; each record is
+// [kg_label, id, kind, label, alpha, beta] (matches `kg_section_build`).
+// blob[0] (legacy atom count) is rewritten to match the surviving list so
+// the daemon's reboot print stays consistent.
+//
+// List-mutation safety: we copy SURVIVORS into a fresh list rather than
+// removing in place -- NOVA has no list_remove-by-index that shifts trailing
+// elements, and even with one, filter-while-iterate is a footgun. (The
+// brief calls this out: "list mutations during iteration are dangerous --
+// copy to a new list when filtering".)
+fn compact_kgs(snap, opts) {
+    let result = list_new()
+    let new_blob = list_new()
+    push(new_blob, 0)
+    push(new_blob, list_new())
+    push(result, new_blob)
+    push(result, 0)
+    if snap_has_section(snap, SEC_KGS) == 0 { return result }
+    let blob = snap_section(snap, SEC_KGS)
+    if len(blob) < 2 {
+        // Legacy / metadata-only blob: copy through unchanged.
+        list_set(new_blob, 0, blob[0])
+        return result
+    }
+    let recs = blob[1]
+    let dead = compact_opts_dead_belief(opts)
+    let prefix = compact_opts_drop_label_prefix(opts)
+    let kept = list_new()
+    let dropped = 0
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        // Record shape: [kg, id, kind, label, alpha, beta].
+        let label = r[3]
+        let alpha = r[4]
+        let beta  = r[5]
+        let mean = _compact_belief_mean(alpha, beta)
+        let drop = 0
+        if mean < dead { drop = 1 }
+        if drop == 0 {
+            if _compact_starts_with(label, prefix) == 1 { drop = 1 }
+        }
+        if drop == 1 {
+            dropped = dropped + 1
+        } else {
+            push(kept, r)
+        }
+        i = i + 1
+    }
+    list_set(new_blob, 0, len(kept))
+    list_set(new_blob, 1, kept)
+    list_set(result, 1, dropped)
+    return result
+}
+
+// ---- compact_episodic ------------------------------------------------------
+//
+// Drop episodes at tier EP_ARCHIVED; drop moments older than
+// opts.moment_max_age_ns. Returns [new_blob, dropped_episodes, dropped_moments].
+//
+// EPISODIC blob shape (built by `episodic_section_build`):
+//   blob[0] = list of moment records [ts, lifecycle, valence, atoms_list]
+//   blob[1] = list of episode records [id, tier, moment_ids_list]
+//
+// "Older than" is computed relative to the LATEST moment in the stream: the
+// moment timestamps are logical-tick or wall-clock-ns values written by the
+// live system, and we don't have a "now" handy. Using the stream's max ts
+// is monotonic and avoids needing an external clock reference.
+//
+// EP_ARCHIVED is sourced from src/parts/episodic/episode_storage.nova; we
+// hardcode the integer value (2) here to avoid pulling in the whole episode
+// storage module (and its dependency chain) just for one constant -- the
+// compactor's job is to manipulate the OPAQUE blob value the snapshot
+// carries. The value is documented in the section header.
+let _CO_EP_ARCHIVED = 2
+
+fn compact_episodic(snap, opts) {
+    let result = list_new()
+    let new_blob = list_new()
+    push(new_blob, list_new())   // moments
+    push(new_blob, list_new())   // episodes
+    push(result, new_blob)
+    push(result, 0)   // dropped episodes
+    push(result, 0)   // dropped moments
+    if snap_has_section(snap, SEC_EPISODIC) == 0 { return result }
+    let blob = snap_section(snap, SEC_EPISODIC)
+    if len(blob) == 0 { return result }
+
+    let moments = list_new()
+    if len(blob) > 0 { moments = blob[0] }
+    let episodes = list_new()
+    if len(blob) > 1 { episodes = blob[1] }
+    let max_age = compact_opts_moment_max_age(opts)
+
+    // Find the newest moment ts so we can compute "older than max_age" without
+    // a wall clock reference. An empty stream -> no age-filter (every moment
+    // is "current" by convention).
+    let now_ts = 0
+    let i = 0
+    while i < len(moments) {
+        let ts = moments[i][0]
+        if ts > now_ts { now_ts = ts }
+        i = i + 1
+    }
+
+    // Filter moments: keep those whose age (now_ts - ts) is <= max_age.
+    let kept_moments = list_new()
+    let dropped_m = 0
+    let j = 0
+    while j < len(moments) {
+        let m = moments[j]
+        let ts = m[0]
+        let age = now_ts - ts
+        if age < 0 { age = 0 }
+        if age <= max_age {
+            push(kept_moments, m)
+        } else {
+            dropped_m = dropped_m + 1
+        }
+        j = j + 1
+    }
+
+    // Filter episodes: drop those at EP_ARCHIVED.
+    let kept_episodes = list_new()
+    let dropped_e = 0
+    let k = 0
+    while k < len(episodes) {
+        let e = episodes[k]
+        // Record shape: [id, tier, moment_ids_list].
+        let tier = e[1]
+        if tier == _CO_EP_ARCHIVED {
+            dropped_e = dropped_e + 1
+        } else {
+            push(kept_episodes, e)
+        }
+        k = k + 1
+    }
+
+    list_set(new_blob, 0, kept_moments)
+    list_set(new_blob, 1, kept_episodes)
+    list_set(result, 1, dropped_e)
+    list_set(result, 2, dropped_m)
+    return result
+}
+
+// ---- compact_synapses ------------------------------------------------------
+//
+// The synapse writer already runs a base cut at SYN_SNAP_MIN (100 milli).
+// This compactor TIGHTENS the cut to opts.synapse_threshold (default 200
+// milli) so an operator can raise the cut on a hot snapshot without
+// changing the live threshold.
+//
+// Returns [new_blob, dropped_count]. SYNAPSES blob shape (built by
+// synapses_section_build):
+//   blob[0] = threshold (int, milli)
+//   blob[1] = list of [src, dst, weight, eligibility] records
+//
+// We rewrite blob[0] to the NEW threshold so a reader sees the actual cut.
+// If the compactor's threshold is below or equal to the current blob's,
+// we leave the blob untouched (no-op tighten).
+fn compact_synapses(snap, opts) {
+    let result = list_new()
+    let new_blob = list_new()
+    push(new_blob, 0)
+    push(new_blob, list_new())
+    push(result, new_blob)
+    push(result, 0)
+    if snap_has_section(snap, SEC_SYNAPSES) == 0 { return result }
+    let blob = snap_section(snap, SEC_SYNAPSES)
+    if len(blob) < 2 {
+        if len(blob) > 0 { list_set(new_blob, 0, blob[0]) }
+        return result
+    }
+    let cur_threshold = blob[0]
+    let new_threshold = compact_opts_synapse_threshold(opts)
+    let recs = blob[1]
+    let effective = new_threshold
+    if effective < cur_threshold { effective = cur_threshold }
+    let kept = list_new()
+    let dropped = 0
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        // Record shape: [src, dst, weight, eligibility]. |weight| < effective
+        // -> drop.
+        let w = r[2]
+        let aw = w
+        if aw < 0 { aw = 0 - aw }
+        if aw < effective {
+            dropped = dropped + 1
+        } else {
+            push(kept, r)
+        }
+        i = i + 1
+    }
+    list_set(new_blob, 0, effective)
+    list_set(new_blob, 1, kept)
+    list_set(result, 1, dropped)
+    return result
+}
+
+// ---- snap_compact orchestrator --------------------------------------------
+//
+// Build a NEW snapshot value with the same headers (instance, timestamp,
+// soul, selfmodel) and rewritten KGS / EPISODIC / SYNAPSES blobs. The soul
+// and selfmodel sections are copied through unchanged -- their byte budget
+// is negligible compared to the three growing sections.
+//
+// Returns the compacted snapshot. Caller is responsible for writing it back
+// to disk via snap_save (or replacing the live in-memory snapshot).
+fn snap_compact(snap, opts) {
+    if snap == 0 { return 0 }
+    let out = snap_new(snap_instance(snap), snap_timestamp(snap))
+    // SOUL: copy through unchanged.
+    if snap_has_section(snap, SEC_SOUL) == 1 {
+        snap_put_section(out, SEC_SOUL, snap_section(snap, SEC_SOUL))
+    }
+    // KGS: drop dead atoms (+ optional prefix).
+    if snap_has_section(snap, SEC_KGS) == 1 {
+        let kg_res = compact_kgs(snap, opts)
+        snap_put_section(out, SEC_KGS, kg_res[0])
+    }
+    // EPISODIC: drop archived episodes + old moments.
+    if snap_has_section(snap, SEC_EPISODIC) == 1 {
+        let ep_res = compact_episodic(snap, opts)
+        snap_put_section(out, SEC_EPISODIC, ep_res[0])
+    }
+    // SYNAPSES: tighten threshold.
+    if snap_has_section(snap, SEC_SYNAPSES) == 1 {
+        let sy_res = compact_synapses(snap, opts)
+        snap_put_section(out, SEC_SYNAPSES, sy_res[0])
+    }
+    // SELFMODEL: copy through unchanged.
+    if snap_has_section(snap, SEC_SELFMODEL) == 1 {
+        snap_put_section(out, SEC_SELFMODEL, snap_section(snap, SEC_SELFMODEL))
+    }
+    return out
+}
+
+// Combined per-section stats: returns [kgs_dropped, episodes_dropped,
+// moments_dropped, synapses_dropped]. Lets the /compact admin command print
+// "47 dead atoms / 12 archived episodes / 23 sub-threshold synapses" in a
+// single pass without doing the dry-run by hand.
+fn snap_compact_stats(snap, opts) {
+    let out = list_new()
+    let kg_res = compact_kgs(snap, opts)
+    push(out, kg_res[1])
+    let ep_res = compact_episodic(snap, opts)
+    push(out, ep_res[1])
+    push(out, ep_res[2])
+    let sy_res = compact_synapses(snap, opts)
+    push(out, sy_res[1])
+    return out
+}
+
+// Stat helper: how many bytes a textual snapshot would take on disk via
+// snap_to_text. Used by /compact to print "snapshot 540KB -> 320KB" without
+// having to import snapshot_disk.nova into this module (the chat does the
+// snap_to_text call; this module just exposes the contract).
+//
+// The /compact command in the chat:
+//   1. snap_compact_stats(live, opts) to get per-section drop counts
+//   2. snap_to_text(live) for the "before" size
+//   3. snap_compact(live, opts) -> new snap
+//   4. snap_to_text(new) for the "after" size
+//   5. swap the live snapshot pointer to the new one (in-memory only;
+//      next /save writes the compacted form).
+//
+// Because snap_to_text lives in snapshot_disk.nova and this module is below
+// it in the dependency graph, the chat calls snap_to_text itself rather than
+// us trampolining through. This keeps snapshot_compaction.nova free of any
+// dependency on disk I/O.

@@ -17,6 +17,95 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P2.10 snapshot compaction pass: **complete**.
+  After hours of operation a long-running snapshot grows linearly with KG
+  size + moment count + episode count: a steady accumulation of dead atoms
+  (mean < 0.05, kept for posterity but never reached at inference), archived
+  episodes (tier == EP_ARCHIVED, past the active recall window), and weak
+  synapses (|weight| < 0.2 milli) that all together push the wire format
+  past 500KB and make /load take a noticeable beat. New module
+  `src/persistence/snapshot_compaction.nova` is the in-memory editor: it
+  takes a PARSED snapshot value and returns a NEW snapshot value with the
+  same wire format (no SNAP_FORMAT_VERSION bump) but smaller payloads, by
+  filtering each section's blob against a configurable opts struct.
+  Sub-compactors:
+  - `compact_kgs(snap, opts) -> [new_blob, dropped]` drops atoms whose
+    posterior mean (alpha / (alpha+beta) in milli) is below
+    `opts.dead_belief` (default 50, i.e. 0.05). Optionally also drops
+    atoms whose label starts with `opts.drop_label_prefix` -- the
+    scratch-namespace knob (`debug:` or test prefixes).
+  - `compact_episodic(snap, opts) -> [new_blob, dropped_eps, dropped_moments]`
+    drops episodes at tier EP_ARCHIVED (== 2) and moments older than
+    `opts.moment_max_age_ns` (default 1h == 3,600,000,000,000 ns). "Older
+    than" is computed relative to the newest moment timestamp in the
+    stream, so it works without an external clock reference.
+  - `compact_synapses(snap, opts) -> [new_blob, dropped]` tightens the
+    already-applied SYN_SNAP_MIN cut (100 milli) to
+    `opts.synapse_threshold` (default 200 milli). No-op when the blob's
+    current threshold is already at or above the requested level (only
+    ever tightens, never relaxes).
+  - `snap_compact(snap, opts) -> new_snap` orchestrates all three +
+    copies SOUL / SELFMODEL through unchanged. `snap_compact_stats(snap,
+    opts) -> [kg_drop, ep_drop, m_drop, syn_drop]` does the same scan
+    without producing the new snapshot (used by `/compact --dry-run`).
+  Opts knobs are env-driven via `compact_opts_from_env()`:
+  `CE_COMPACT_DEAD_BELIEF` (milli), `CE_COMPACT_MOMENT_MAX_AGE_NS` (ns),
+  `CE_COMPACT_SYNAPSE_THRESHOLD` (milli), `CE_COMPACT_DROP_LABEL_PREFIX`
+  (string). All four fall through to the static defaults when unset /
+  invalid (mirrors `_dl_env_int` in decision_log).
+  Chat surface (`examples/crossengin_chat.nova`): a single new
+  `_admin_compact` admin function + dispatch line for `/compact`.
+  `/compact` (no arg) builds the live snapshot via `_build_snapshot`,
+  runs `snap_compact_stats` for the report, runs `snap_compact` for the
+  payload, prints
+  `(compacted: 47 dead atoms dropped, 12 archived episodes dropped,
+   0 old moments dropped, 23 synapses below new threshold dropped;
+   snapshot 540KB -> 320KB)` and stashes the compacted snapshot in a
+  global `_pending_compact_snap` buffer keyed by `active_id`. The NEXT
+  `/save` reads the buffer instead of rebuilding from live state and
+  prints `(saved compacted snapshot: kg=N atom(s), M moment(s), K syn(s)
+  -> path durably)`. Buffer is cleared after every /save; the per-session
+  key lets a `/switch` invalidate a stale buffer.
+  `/compact --dry-run` prints the same stats line with " (dry-run)" mode
+  marker but does NOT touch the pending buffer -- the next /save still
+  rebuilds from live state.
+  Snapshot-disk hook: `snap_save(s, path)` honours
+  `CE_AUTO_COMPACT_ON_SAVE=1` -- when set, the snapshot is passed through
+  `snap_compact(s, compact_opts_from_env())` before serializing to text,
+  so a daemon that wants to write only compacted images can opt in via
+  env. Off by default (manual `/compact` is the primary surface).
+  NOVA list-mutation safety: every per-section compactor copies survivors
+  into a fresh list rather than removing in place (the brief calls this
+  out -- list_set has no shift-and-remove semantics, so filter-while-
+  iterate is a footgun). The 1-hour ns default sits above NOVA's
+  pointer-threshold (0x100000) and is held in a `let` constant rather
+  than inlined.
+  Acceptance: `tests/unit/test_snapshot_compaction.nova` covers opts
+  defaults + setters, KGS drops by dead-belief + by label prefix,
+  EPISODIC drops by tier + by moment age, SYNAPSES tighten-only
+  threshold (including the no-op-when-blob-already-tighter case), full
+  orchestrator pipeline with mixed sections, round-trip through
+  `snap_to_text / snap_from_text` (the compacted shape is still wire-
+  format compatible), size-shrinks bound (100 atoms, half dead -> >25%
+  byte savings), empty-snapshot edge case, and env-driven default
+  helpers -- 48 assertions across 13 test functions.
+  `tests/integration/scenario_n_compaction.sh` (NEW; 12 assertions): seed
+  baseline /save -> /teach 50 unknowns + /pin each to confidence=10 ->
+  /save baseline; then seed baseline -> /teach 50 + /pin -> /compact ->
+  /save with `CE_COMPACT_DROP_LABEL_PREFIX=scenN`. Verifies the stats line
+  format, the drop count (99 of 100 atoms -- 50 lang pinned to dead
+  belief + 50 reasoning prefix-matched, one of the lang word atoms
+  shares its alpha/beta state at the same address as the reasoning
+  atom's), the `(in-memory snapshot replaced)` banner, the
+  `(saved compacted snapshot: ...)` /save banner variant, and the
+  acceptance check `compacted_growth < 50% of baseline_growth` (typically
+  878B vs 16404B -- ~5%). Also exercises `/compact --dry-run` (must
+  print "(dry-run)", must NOT print "in-memory snapshot replaced", and a
+  subsequent /save must use live state) and verifies /help lists
+  /compact.
+  Sample stats output (verified): `(compacted: 99 dead atoms dropped, 0
+  archived episodes dropped, 0 old moments dropped, 0 synapses below new
+  threshold dropped; snapshot 184KB -> 168KB)`.
 - P2.8 streaming event sources (stdin + Unix socket + HTTP webhook): **complete**
   for stdin; framework-only for the other two.
   Three new transducers under `src/io/transducers/` lift the daemon from a
