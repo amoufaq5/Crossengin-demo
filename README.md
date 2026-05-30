@@ -11,7 +11,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 115 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 117 modules compile (`make build`, +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
@@ -36,13 +36,19 @@ computational units rather than orchestrating a pipeline of modules.
 > minimum-viable image modality -- pure-NOVA PGM-P5 decoder + pluggable
 > visual perception seam producing feature atoms, documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +2 from `io/transducers/{video_y4m,video_perception}.nova` added in P3.2
+> minimum-viable video modality -- pure-NOVA Y4M (raw YUV4MPEG2) decoder +
+> pluggable video perception seam producing per-frame feature atoms +
+> motion / scene-change labels, surfaced via the chat `/play PATH [N]`
+> admin command and the `scripts/video_to_y4m.sh` ffmpeg shim for
+> compressed video input, documented in [`VIDEO_AUDIT.md`](./VIDEO_AUDIT.md),
 > +1 from `learning/federated_aggregator.nova` added in P3.7
 > minimum-viable federated multi-soul learning -- per-soul DP-noised
 > per-source promotion/atrophy rates + coordinator-side aggregation +
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 120 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 121 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -98,8 +104,17 @@ computational units rather than orchestrating a pipeline of modules.
 > feature atoms (image_dim_*, image_dark/mid/bright, image_bucket_*,
 > image_hist_peaked/uniform); surfaced via the chat `/see PATH` admin
 > command and the `scripts/image_to_pgm.sh` ImageMagick/ffmpeg shim
-> for non-PGM input, documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md)),
-> 24 end-to-end integration
+> for non-PGM input, documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 suite / +34 assertions from `test_video_y4m.nova` added in P3.2
+> minimum-viable video modality -- pure-NOVA Y4M raw-video decoder
+> (ASCII header + per-frame iterator over the YCbCr planes, no
+> compression) with mean-absolute-difference motion proxy across
+> the luma plane, and the pluggable `video_perception.nova` seam
+> producing per-frame feature atoms + motion_<low|mid|high> +
+> scene_change labels; surfaced via the chat `/play PATH [N]` admin
+> command and the `scripts/video_to_y4m.sh` ffmpeg shim for
+> compressed video input, documented in [`VIDEO_AUDIT.md`](./VIDEO_AUDIT.md)),
+> 25 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -133,6 +148,14 @@ computational units rather than orchestrating a pipeline of modules.
 > gradient; image_bright + image_hist_peaked + image_bucket_6 on the
 > uniform fixture); malformed input is rejected with the parser's
 > bracketed error and the chat survives to /quit cleanly,
+> +1 from `scenario_s_video_play.sh` added in P3.2 minimum-viable
+> video modality: a hand-rolled 5-frame 4x4 Y4M fixture with two
+> forced scene changes, /play prints per-frame event lines (image
+> features + motion + scene_change labels) and the operator-readable
+> summary (`played PATH: N frame(s), <w>x<h>, motion=<...>, scene
+> changes: 2, decoder=y4m`); /help advertises /play; malformed
+> input is rejected with the parser's bracketed error and the chat
+> survives to /quit cleanly,
 > +1 from `scenario_r_federated.sh` added in P3.7 minimum-viable
 > federated multi-soul: a coordinator daemon accepts a chat's
 > FED_JOIN, opens round 1, collects the soul's noised FED_STAT batch,

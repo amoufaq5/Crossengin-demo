@@ -17,6 +17,129 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.2 minimum-viable video modality (framework + audit):
+  **complete (framework only)** (ADR-0014 video half / NOVA
+  enhancement #15). Video was the natural step after P3.1's image
+  plank: a single image is one perception in a 2-D field; video is
+  a STREAM of perceptions in TIME ORDER, each correlated with its
+  neighbors. Real codecs (H.264, H.265, AV1, VP9) are each MONTHS
+  of pure-NOVA work; P3.2 lands the smallest possible plank: a
+  pure-NOVA decoder for the simplest standardized raw-video format
+  (YUV4MPEG2 / Y4M), a pluggable video-perception seam (exactly
+  the shape of `visual_perception.nova` from P3.1) that turns
+  per-frame Y-plane statistics + frame-to-frame deltas into
+  substrate-shaped feature atoms + motion + scene-change labels,
+  the chat-side admin command `/play PATH [MAX_FRAMES]`, and the
+  `scripts/video_to_y4m.sh` ffmpeg shim for any compressed video
+  input. The full pipeline (H.264 decode, optical flow, object
+  tracking, action recognition) is months-to-a-year of work and is
+  documented in `VIDEO_AUDIT.md` as the realistic path; this round
+  closes the framework hole so the video seam compiles, exercises
+  a real decoder against a hand-built fixture, and produces per-
+  frame perception events an integration test can observe --
+  without inventing an H.264 decoder out of thin air.
+  - **`video_y4m.nova`** (NEW) -- pure-NOVA Y4M decoder + per-frame
+    iterator + motion proxy. Public API: `y4m_open(path) -> state`
+    (NUL-safe sys_open + sys_read loop, parses the ASCII header
+    line and validates dims), `y4m_open_bytes(buf, total) -> state`
+    (in-memory fixture path for unit tests), `y4m_dimensions(state)
+    -> [w, h, fps_num, fps_den]`, `y4m_next_frame(state) ->
+    [y_ptr, cb_ptr, cr_ptr, frame_index, error_msg]` (returns
+    pointers INTO the open file buffer -- no copy; end-of-stream
+    sets `"y4m: end of stream"`), `y4m_close(state)`,
+    `y4m_frame_to_pgm(y_ptr, w, h)` (identity wrapper -- the Y
+    plane IS a PGM image so callers can pass it straight into
+    pgm_histogram / pgm_mean_intensity / pgm_dominant_intensity
+    from P3.1), `y4m_mean_abs_diff(prev_ptr, cur_ptr, w, h) ->
+    int (0..255)` (mean of |prev[i] - cur[i]| across the Y plane
+    only; chroma ignored). Dimension cap: 768 x 432 per axis so
+    `width * height <= 331776` and the per-frame total (`w*h*3/2 ==
+    497664` for 4:2:0) stays well under NOVA's codegen pointer-
+    threshold gotcha #11; larger Y4M files refused at header time
+    with a clear "downsample first" error. Only 4:2:0 chroma
+    subsampling (the dominant `ffmpeg -pix_fmt yuv420p` output)
+    supported today; the `C` tag in the header is parsed but its
+    value is currently ignored.
+  - **`video_perception.nova`** (NEW) -- pluggable video-perception
+    seam, exactly the shape of `visual_perception.nova` (P3.1) and
+    `stt_seam.nova` (P2.5). Public API: `vid_seam_new()` constructs
+    a seam (pre-registers "stub" + "y4m" backends),
+    `vid_decode_video(seam, path, max_frames) -> [events,
+    confidence_milli, error_msg]`, `vid_register_decoder(seam,
+    name, decoder_id)`, `vid_default_decoder()` (from
+    `CE_VID_DECODER` env; "y4m" / unset -> Y4M, "stub" -> STUB),
+    `vid_seam_set_default(seam, decoder_id)`,
+    `vid_seam_decoder_name / _decoder_id_for / _last_events /
+    _last_confidence / _last_error / _last_summary /
+    _last_frame_count / _last_scene_changes / _call_count`,
+    `vid_per_frame_features(seam, y4m_state, max_frames) -> list
+    of per-frame feature-atom-label lists`. Per-frame events are
+    formatted as `EV_MESSAGE`-shaped lines (`"frame N: image_dim_*
+    image_<dark|mid|bright> image_bucket_<0..7> [motion_<low|mid|
+    high>] [scene_change]"`) the perception path could feed to
+    `transduce_text` exactly the way speech transcription does;
+    wiring per-frame events into the live perception path is a
+    deferred follow-up. Motion thresholds (in mean |a-b| over the
+    luma plane, 0..255): motion_low `[1, 15)`, motion_mid `[15,
+    50)`, motion_high `>= 50`. scene_change: mean diff > 50,
+    fires INDEPENDENTLY of motion_high so the substrate can treat
+    high motion and scene cut as overlapping but distinct evidence.
+    Successful Y4M decode -> confidence 800 milli (same ballpark as
+    STT subprocess + visual_perception P3.1); STUB -> 0; parse
+    error -> confidence 0 with `video_unavailable` placeholder
+    event so downstream callers always see >=1 event. Default
+    max_frames per call: 10; hard cap: 60 (the realtime pacer from
+    P0.6 already throttles perception at ~10 events/second so
+    larger windows simply queue).
+  - **`scripts/video_to_y4m.sh`** (NEW) -- ffmpeg subprocess shim
+    that converts any compressed video (MP4, MKV, WebM, MOV, AVI)
+    to a Y4M 4:2:0 file the pure-NOVA decoder can ingest. Env knobs
+    `CE_Y4M_OUT` (destination path), `CE_Y4M_MAX_DIM` (longest
+    side, default 432), `CE_Y4M_MAX_FRAMES` (default 30). Single
+    backend (ffmpeg); on a sealed sandbox without ffmpeg it prints
+    the install hint to stderr and exits 0 (same exit semantics as
+    `scripts/image_to_pgm.sh` and `scripts/transcribe.sh`).
+  - **`examples/crossengin_chat.nova`** -- ONE new admin command
+    `/play PATH [MAX_FRAMES]` (lazy seam construction) + dispatch
+    line + /help line. The /help line points at VIDEO_AUDIT.md
+    for the codec roadmap. No other admin commands touched.
+  - **DO NOT TOUCH this round:** `src/io/effectors/*`,
+    `src/io/transducers/image_pgm.nova` /
+    `visual_perception.nova` (P3.1 surface stays exactly the
+    way we shipped it; the video seam IMPORTS the image surface
+    rather than rewriting it), `src/parts/`, `src/reader/`,
+    `src/kg/`, `src/persistence/`, `src/learning/`, `src/audit/`,
+    `examples/crossengin_daemon.nova`, `scripts/web.py`.
+  Acceptance: `tests/unit/test_video_y4m.nova` (NEW; 34 assertions
+  across 9 test functions): header happy path (dims, fps,
+  state_ok), per-frame iteration (frame index, Y / Cb / Cr pointers
+  round-trip correctly), end-of-stream after the last frame,
+  y4m_frame_to_pgm identity wrapper (the Y plane IS a PGM image),
+  malformed inputs (bad magic, missing W tag), dimension cap
+  rejects > 768 width, mean-absolute-difference motion proxy on
+  identical buffers (0) + constant +50 delta (50).
+  `tests/integration/scenario_s_video_play.sh` (NEW; 12 assertions):
+  /help advertises /play; /play with no arg prints usage; /play
+  PATH 5 on a hand-rolled 5-frame 4x4 Y4M fixture prints frame
+  count + dims + scene-change tally + decoder name, each of the
+  five frame lines carries the expected image features + motion
+  bucket + scene_change label, malformed input is rejected with
+  the parser's bracketed error and the chat survives to /quit
+  cleanly. Final counts: 117 modules (+2 from `video_y4m.nova`
+  and `video_perception.nova`), 121 unit-test suites (+1 suite for
+  `test_video_y4m.nova`, +34 assertions), 25 integration scripts
+  pass (+1 for `scenario_s_video_play.sh`, +12 assertions).
+  `VIDEO_AUDIT.md` (NEW, repo root) documents the temporal
+  hardness (codec + perception), the Y4M-vs-everything trade-off,
+  the codec ladder (Y4M -> MJPEG -> H.264 -> H.265/AV1/VP9),
+  realistic options (ffmpeg shim now / WASM libavcodec / pure-NOVA
+  MJPEG / pure-NOVA H.264), the feature pipeline beyond pixels
+  (optical flow, object tracking, background subtraction, action
+  recognition), atom mapping (per ADR-0022 consolidation), the
+  wall-clock estimate (4-8 months for codec + features; 12+ months
+  for action recognition), and the recommended path (ffmpeg shim
+  now; pure-NOVA MJPEG as a stretch goal; H.264 only if a use case
+  demands it).
 - P3.1 minimum-viable image modality (framework + audit):
   **complete (framework only)** (ADR-0014 visual half / NOVA
   enhancement #15). Visual perception was entirely missing from

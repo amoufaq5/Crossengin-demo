@@ -1,0 +1,442 @@
+// CrossEngin io/transducers: video perception seam (P3.2).
+//
+// Purpose
+//   The video half of the modality bridge. Video is the natural next
+//   step after the image plank (P3.1): a single image is ONE perception
+//   in a 2-D field; video is a STREAM of perceptions in TIME ORDER,
+//   each correlated with its neighbors. P3.2 lands the smallest plank
+//   that makes the substrate "see" a moving image at all: a pluggable
+//   Y4M (raw YCbCr) decoder, per-frame feature extraction (image stats
+//   per P3.1 + motion + scene-change), and the chat-side `/play PATH
+//   [MAX_FRAMES]` admin command. The full pipeline (H.264 decode,
+//   optical flow, object tracking, action recognition) is months of
+//   work and is documented in `VIDEO_AUDIT.md` as the realistic path.
+//
+//   The seam EXACTLY mirrors `visual_perception.nova` (P3.1) and
+//   `stt_seam.nova` (P2.5): pluggable backends keyed by integer id,
+//   an env-driven default (CE_VID_DECODER), per-call result triple
+//   (event list, confidence_milli, error_msg), and "last_*" mirrors
+//   for observability. The only working backend today is the Y4M
+//   decoder; STUB is the alternative for tests / sealed sandboxes.
+//
+//   Per-frame events are formatted as `EV_MESSAGE`-shaped lines:
+//     "frame N: image_dim_<...> image_<dark|mid|bright>
+//                image_bucket_<0..7> [image_hist_<peaked|uniform>]
+//                [motion_<low|mid|high>] [scene_change]"
+//   Each line is a substrate-shaped perception input the chat /
+//   daemon could feed to `transduce_text` exactly the way speech
+//   transcription does. Wiring those events into the live perception
+//   path is a follow-up; this round emits them as chat output so the
+//   operator can observe what the seam SEES.
+//
+// Public API
+//   vid_seam_new() -> vid_seam state
+//   vid_decode_video(seam, path, max_frames)
+//     -> [events, confidence_milli, error_msg]
+//   vid_register_decoder(seam, name, decoder_id)
+//   vid_default_decoder() -> VID_DECODER_Y4M | VID_DECODER_STUB
+//   vid_seam_decoder_name(seam) -> string
+//   vid_seam_decoder_id_for(seam, name) -> int
+//   vid_seam_set_default(seam, decoder_id)
+//   vid_seam_last_events(seam) / _last_confidence / _last_error /
+//     _last_summary / _call_count
+//   vid_per_frame_features(seam, y4m_state, max_frames)
+//     -> list of per-frame feature lists (no I/O after the seam was
+//        constructed -- tests use this directly)
+//
+// Confidence: Y4M-decoded events are reported at 800 milli (same
+// ballpark as STT subprocess and visual_perception P3.1). The STUB
+// path returns 0.
+//
+// Motion thresholds (in mean |a-b| over the luma plane, 0..255):
+//   motion_low  : mean diff in   [1, 15)
+//   motion_mid  : mean diff in  [15, 50)
+//   motion_high : mean diff >=    50
+// Scene change: mean diff > VID_SCENE_CHANGE_THRESHOLD (50). This
+// fires INDEPENDENTLY of motion_high (both apply when the frame-to-
+// frame delta is huge) so the substrate can treat "high motion" and
+// "scene cut" as overlapping but distinct evidence.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+//   The output is `EV_MESSAGE`-shaped text; mapping per-frame events
+//   into atoms is the perception loop's job (a follow-up that lives
+//   in src/agent/, not here).
+// NOVA dependencies: builtins -- list_new, push, list_set, len,
+//   str_eq, getenv, int_to_str. CrossEngin dependencies: video_y4m.nova
+//   (the only working decoder) which transitively imports image_pgm.nova
+//   (the Y plane IS a PGM image -- we reuse pgm_mean_intensity, etc).
+
+import "video_y4m.nova"
+import "visual_perception.nova"
+
+// ---- decoder identifiers --------------------------------------------------
+
+let VID_DECODER_NONE   = 0       // sentinel, never registered
+let VID_DECODER_STUB   = 1       // deterministic placeholder
+let VID_DECODER_Y4M    = 2       // real Y4M decoder (video_y4m.nova)
+let VID_DECODER_CUSTOM = 3       // user-registered (tests, plugins)
+
+// Confidence sentinels (mirror the visual_perception seam).
+let VID_CONFIDENCE_NONE    = 0
+let VID_CONFIDENCE_STUB    = 0
+let VID_CONFIDENCE_DEFAULT = 800
+
+// Placeholder event the STUB backend emits when nothing else is wired.
+let VID_STUB_LABEL = "video_unavailable"
+
+// Motion / scene-change thresholds (mean absolute Y-plane difference).
+let VID_MOTION_LOW_MIN     = 1
+let VID_MOTION_MID_MIN     = 15
+let VID_MOTION_HIGH_MIN    = 50
+let VID_SCENE_CHANGE_MIN   = 50    // same threshold as motion_high; both fire.
+
+// Default per-call max frames (used if the caller passes 0). Y4M
+// playback in this seam is always bounded -- the substrate cannot
+// usefully consume an unbounded stream of frames in one synchronous
+// call.
+let VID_DEFAULT_MAX_FRAMES = 10
+
+// Hard upper bound on max frames per /play invocation. Larger values
+// are clamped silently. 60 frames at 768x432 is ~60 * 497664 = 29.8 MB
+// of decoded data; comfortably under the 16 MiB file cap if input is
+// 256x144 or similar.
+let VID_MAX_FRAMES_CAP = 60
+
+// Public feature-atom labels so callers + tests can match against them
+// without re-hardcoding strings.
+let VID_LABEL_MOTION_LOW   = "motion_low"
+let VID_LABEL_MOTION_MID   = "motion_mid"
+let VID_LABEL_MOTION_HIGH  = "motion_high"
+let VID_LABEL_SCENE_CHANGE = "scene_change"
+
+// ---- seam state layout ----------------------------------------------------
+//
+// Shape parallel to `visual_perception.nova` (which itself mirrors
+// stt_seam.nova):
+//   [0] tag                (VID_SEAM_TAG)
+//   [1] default_decoder    (resolved from env at construction)
+//   [2] registered_count   (number of decoders registered)
+//   [3] registered_names   (list of strings)
+//   [4] registered_ids     (list of int ids -- parallel to names)
+//   [5] last_events        (list of strings -- most recent successful call)
+//   [6] last_confidence    (int milli -- mirror)
+//   [7] last_error         (string -- last error_msg, or "")
+//   [8] call_count         (counter for observability)
+//   [9] last_summary       (operator-readable digest: "played PATH: N frames ...")
+//   [10] last_frame_count  (frames decoded in the most recent call)
+//   [11] last_scene_changes (count of scene_change events in the most recent call)
+
+let VID_SEAM_TAG = 6312
+
+let VID_TAG                = 0
+let VID_DEFAULT_DEC        = 1
+let VID_REG_COUNT          = 2
+let VID_REG_NAMES          = 3
+let VID_REG_IDS            = 4
+let VID_LAST_EVENTS        = 5
+let VID_LAST_CONF          = 6
+let VID_LAST_ERR           = 7
+let VID_CALL_COUNT         = 8
+let VID_LAST_SUMMARY       = 9
+let VID_LAST_FRAME_COUNT   = 10
+let VID_LAST_SCENE_CHANGES = 11
+
+// ---- env helpers ----------------------------------------------------------
+
+fn vid_default_decoder() {
+    let env = getenv("CE_VID_DECODER")
+    if env == 0 { return VID_DECODER_Y4M }
+    if len(env) == 0 { return VID_DECODER_Y4M }
+    if str_eq(env, "y4m") == 1 { return VID_DECODER_Y4M }
+    if str_eq(env, "stub") == 1 { return VID_DECODER_STUB }
+    return VID_DECODER_Y4M
+}
+
+// ---- constructor ----------------------------------------------------------
+
+fn vid_seam_new() {
+    let s = list_new()
+    push(s, VID_SEAM_TAG)
+    push(s, vid_default_decoder())   // [1] default decoder
+    push(s, 0)                       // [2] registered_count
+    push(s, list_new())              // [3] names
+    push(s, list_new())              // [4] ids
+    push(s, list_new())              // [5] last_events
+    push(s, 0)                       // [6] last_confidence
+    push(s, "")                      // [7] last_error
+    push(s, 0)                       // [8] call_count
+    push(s, "")                      // [9] last_summary
+    push(s, 0)                       // [10] last_frame_count
+    push(s, 0)                       // [11] last_scene_changes
+    _vid_register_builtin(s, "stub", VID_DECODER_STUB)
+    _vid_register_builtin(s, "y4m",  VID_DECODER_Y4M)
+    return s
+}
+
+fn _vid_register_builtin(s, name, id) {
+    let names = s[VID_REG_NAMES]
+    let ids = s[VID_REG_IDS]
+    push(names, name)
+    push(ids, id)
+    list_set(s, VID_REG_COUNT, s[VID_REG_COUNT] + 1)
+    return 1
+}
+
+// ---- public accessors -----------------------------------------------------
+
+fn vid_seam_enabled(s) {
+    if s[VID_REG_COUNT] > 0 { return 1 }
+    return 0
+}
+
+fn vid_seam_decoder_name(s) {
+    let id = s[VID_DEFAULT_DEC]
+    let names = s[VID_REG_NAMES]
+    let ids = s[VID_REG_IDS]
+    let i = 0
+    let n = len(ids)
+    while i < n {
+        if ids[i] == id { return names[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn vid_seam_last_events(s)         { return s[VID_LAST_EVENTS] }
+fn vid_seam_last_confidence(s)     { return s[VID_LAST_CONF] }
+fn vid_seam_last_error(s)          { return s[VID_LAST_ERR] }
+fn vid_seam_last_summary(s)        { return s[VID_LAST_SUMMARY] }
+fn vid_seam_call_count(s)          { return s[VID_CALL_COUNT] }
+fn vid_seam_default_decoder(s)     { return s[VID_DEFAULT_DEC] }
+fn vid_seam_last_frame_count(s)    { return s[VID_LAST_FRAME_COUNT] }
+fn vid_seam_last_scene_changes(s)  { return s[VID_LAST_SCENE_CHANGES] }
+
+fn vid_register_decoder(s, name, decoder_id) {
+    let names = s[VID_REG_NAMES]
+    let ids = s[VID_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 {
+            list_set(ids, i, decoder_id)
+            return 1
+        }
+        i = i + 1
+    }
+    push(names, name)
+    push(ids, decoder_id)
+    list_set(s, VID_REG_COUNT, s[VID_REG_COUNT] + 1)
+    return 1
+}
+
+fn vid_seam_set_default(s, decoder_id) {
+    list_set(s, VID_DEFAULT_DEC, decoder_id)
+    return 1
+}
+
+fn vid_seam_decoder_id_for(s, name) {
+    let names = s[VID_REG_NAMES]
+    let ids = s[VID_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 { return ids[i] }
+        i = i + 1
+    }
+    return VID_DECODER_NONE
+}
+
+// ---- result + mirror writers ----------------------------------------------
+
+fn _vid_result(s, events, confidence, error_msg, summary, frame_count, scene_changes) {
+    let triple = list_new()
+    push(triple, events)
+    push(triple, confidence)
+    push(triple, error_msg)
+    list_set(s, VID_LAST_EVENTS,        events)
+    list_set(s, VID_LAST_CONF,          confidence)
+    list_set(s, VID_LAST_ERR,           error_msg)
+    list_set(s, VID_LAST_SUMMARY,       summary)
+    list_set(s, VID_LAST_FRAME_COUNT,   frame_count)
+    list_set(s, VID_LAST_SCENE_CHANGES, scene_changes)
+    list_set(s, VID_CALL_COUNT,         s[VID_CALL_COUNT] + 1)
+    return triple
+}
+
+// ---- per-frame feature extraction (pure helper) --------------------------
+
+// _vid_motion_label(mean_diff) -> "motion_low" | "motion_mid" | "motion_high"
+// | "" (no label if mean_diff == 0)
+fn _vid_motion_label(mean_diff) {
+    if mean_diff >= VID_MOTION_HIGH_MIN { return VID_LABEL_MOTION_HIGH }
+    if mean_diff >= VID_MOTION_MID_MIN  { return VID_LABEL_MOTION_MID }
+    if mean_diff >= VID_MOTION_LOW_MIN  { return VID_LABEL_MOTION_LOW }
+    return ""
+}
+
+// Format a single per-frame event line into a string the perception
+// path can swallow as if it were a chat message. Shape:
+//   "frame N: <image features> [motion_<...>] [scene_change]"
+fn _vid_frame_event(idx, image_feats, motion_label, scene_change) {
+    let s = "frame " + int_to_str(idx) + ":"
+    let i = 0
+    while i < len(image_feats) {
+        s = s + " " + image_feats[i]
+        i = i + 1
+    }
+    if len(motion_label) > 0 { s = s + " " + motion_label }
+    if scene_change == 1     { s = s + " " + VID_LABEL_SCENE_CHANGE }
+    return s
+}
+
+// vid_per_frame_features(seam, y4m_state, max_frames)
+//   Iterate up to `max_frames` frames from an OPEN y4m state. For each
+//   frame return the LIST OF FEATURE-ATOM LABEL STRINGS the perception
+//   path would consume (NOT the formatted event line -- that is the
+//   `vid_decode_video` shape). Tests use this directly to verify
+//   per-frame feature extraction without the chat formatter.
+//
+// Returns a list-of-lists. Outer length == frames actually iterated.
+// On end-of-stream / decode error stops cleanly (caller can read
+// y4m_state_error to find out why).
+fn vid_per_frame_features(s, y4m, max_frames) {
+    let all = list_new()
+    if max_frames <= 0 { max_frames = VID_DEFAULT_MAX_FRAMES }
+    if max_frames > VID_MAX_FRAMES_CAP { max_frames = VID_MAX_FRAMES_CAP }
+    if y4m == 0 { return all }
+    if y4m_state_ok(y4m) == 0 { return all }
+    let w = y4m_state_width(y4m)
+    let h = y4m_state_height(y4m)
+    let prev = 0
+    let i = 0
+    while i < max_frames {
+        let f = y4m_next_frame(y4m)
+        let err = y4m_frame_error(f)
+        if len(err) > 0 { i = max_frames }
+        if i < max_frames {
+            let yp = y4m_frame_y(f)
+            // Image-side feature atoms via the P3.1 pure helper.
+            let img_feats = vp_features_for_image(w, h, yp)
+            let frame_feats = list_new()
+            let k = 0
+            while k < len(img_feats) {
+                push(frame_feats, img_feats[k])
+                k = k + 1
+            }
+            // Motion + scene change vs the previous frame.
+            if prev != 0 {
+                let d = y4m_mean_abs_diff(prev, yp, w, h)
+                let ml = _vid_motion_label(d)
+                if len(ml) > 0 { push(frame_feats, ml) }
+                if d > VID_SCENE_CHANGE_MIN { push(frame_feats, VID_LABEL_SCENE_CHANGE) }
+            }
+            push(all, frame_feats)
+            prev = yp
+            i = i + 1
+        }
+    }
+    return all
+}
+
+// ---- STUB decoder ---------------------------------------------------------
+
+fn _vid_decode_stub(s, path, max_frames) {
+    let events = list_new()
+    push(events, VID_STUB_LABEL)
+    return _vid_result(s, events, VID_CONFIDENCE_STUB, "",
+        "video: stub decoder (no frames)", 0, 0)
+}
+
+// ---- Y4M decoder ----------------------------------------------------------
+//
+// Opens the file via y4m_open, iterates up to `max_frames` frames,
+// emits one perception event PER FRAME, and tallies the dominant
+// motion summary + scene change count. On any decode error the error
+// propagates to the seam's last_error slot.
+fn _vid_decode_y4m(s, path, max_frames) {
+    if max_frames <= 0 { max_frames = VID_DEFAULT_MAX_FRAMES }
+    if max_frames > VID_MAX_FRAMES_CAP { max_frames = VID_MAX_FRAMES_CAP }
+    let y4m = y4m_open(path)
+    let err = y4m_state_error(y4m)
+    if len(err) > 0 {
+        let events = list_new()
+        push(events, VID_STUB_LABEL)
+        return _vid_result(s, events, VID_CONFIDENCE_NONE, err,
+            "video: y4m open failed -- " + err, 0, 0)
+    }
+    let w = y4m_state_width(y4m)
+    let h = y4m_state_height(y4m)
+    let events = list_new()
+    let prev = 0
+    let frames = 0
+    let scene_changes = 0
+    // Track the dominant motion bucket via simple counts; the operator
+    // summary line reports whichever bucket dominated this playback.
+    let low_n  = 0
+    let mid_n  = 0
+    let high_n = 0
+    let i = 0
+    let keep = 1
+    while keep == 1 {
+        if i >= max_frames { keep = 0 }
+        if keep == 1 {
+            let f = y4m_next_frame(y4m)
+            let ferr = y4m_frame_error(f)
+            if len(ferr) > 0 { keep = 0 }
+            if keep == 1 {
+                let yp = y4m_frame_y(f)
+                let img_feats = vp_features_for_image(w, h, yp)
+                let motion_label = ""
+                let is_scene_change = 0
+                if prev != 0 {
+                    let d = y4m_mean_abs_diff(prev, yp, w, h)
+                    motion_label = _vid_motion_label(d)
+                    if str_eq(motion_label, VID_LABEL_MOTION_LOW)  == 1 { low_n  = low_n  + 1 }
+                    if str_eq(motion_label, VID_LABEL_MOTION_MID)  == 1 { mid_n  = mid_n  + 1 }
+                    if str_eq(motion_label, VID_LABEL_MOTION_HIGH) == 1 { high_n = high_n + 1 }
+                    if d > VID_SCENE_CHANGE_MIN {
+                        is_scene_change = 1
+                        scene_changes = scene_changes + 1
+                    }
+                }
+                let line = _vid_frame_event(frames, img_feats, motion_label, is_scene_change)
+                push(events, line)
+                prev = yp
+                frames = frames + 1
+                i = i + 1
+            }
+        }
+    }
+    y4m_close(y4m)
+    // Dominant motion bucket label (or "" if no frame-to-frame deltas
+    // were observed -- single-frame playback).
+    let motion_summary = ""
+    let dom = high_n
+    motion_summary = VID_LABEL_MOTION_HIGH
+    if mid_n > dom { dom = mid_n; motion_summary = VID_LABEL_MOTION_MID }
+    if low_n > dom { dom = low_n; motion_summary = VID_LABEL_MOTION_LOW }
+    if dom == 0    { motion_summary = "" }
+    let summary = "played " + path + ": " + int_to_str(frames) + " frame(s), "
+        + int_to_str(w) + "x" + int_to_str(h)
+    if len(motion_summary) > 0 { summary = summary + ", motion=" + motion_summary }
+    summary = summary + ", scene changes: " + int_to_str(scene_changes)
+    return _vid_result(s, events, VID_CONFIDENCE_DEFAULT, "", summary,
+        frames, scene_changes)
+}
+
+// ---- public dispatch ------------------------------------------------------
+
+// vid_decode_video(seam, path, max_frames) -> [events, confidence_milli,
+//                                              error_msg]
+fn vid_decode_video(s, path, max_frames) {
+    let id = s[VID_DEFAULT_DEC]
+    if id == VID_DECODER_Y4M  { return _vid_decode_y4m(s, path, max_frames) }
+    if id == VID_DECODER_STUB { return _vid_decode_stub(s, path, max_frames) }
+    return _vid_decode_stub(s, path, max_frames)
+}
+
+// ---- result-tuple accessors (mirror vp_result_*) -------------------------
+
+fn vid_result_events(r)     { return r[0] }
+fn vid_result_confidence(r) { return r[1] }
+fn vid_result_error(r)      { return r[2] }
