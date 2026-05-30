@@ -11,7 +11,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 114 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 115 modules compile (`make build`, +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
@@ -35,7 +35,14 @@ computational units rather than orchestrating a pipeline of modules.
 > +2 from `io/transducers/{image_pgm,visual_perception}.nova` added in P3.1
 > minimum-viable image modality -- pure-NOVA PGM-P5 decoder + pluggable
 > visual perception seam producing feature atoms, documented in
-> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md)), 119 unit-test suites pass
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from `learning/federated_aggregator.nova` added in P3.7
+> minimum-viable federated multi-soul learning -- per-soul DP-noised
+> per-source promotion/atrophy rates + coordinator-side aggregation +
+> EMA pull toward the federation mean, surfaced via the chat
+> `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
+> `bin/crossengin-fed-coordinator` daemon, documented in
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 120 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -125,14 +132,22 @@ computational units rather than orchestrating a pipeline of modules.
 > labels (image_dim_small + image_mid + image_bucket_0 on the
 > gradient; image_bright + image_hist_peaked + image_bucket_6 on the
 > uniform fixture); malformed input is rejected with the parser's
-> bracketed error and the chat survives to /quit cleanly),
+> bracketed error and the chat survives to /quit cleanly,
+> +1 from `scenario_r_federated.sh` added in P3.7 minimum-viable
+> federated multi-soul: a coordinator daemon accepts a chat's
+> FED_JOIN, opens round 1, collects the soul's noised FED_STAT batch,
+> broadcasts FED_AGGREGATE, and the chat receives + EMA-blends the
+> federation-wide rate back into local source_authority -- the
+> framework piece of P3.7 with `FEDERATED_AUDIT.md` walking the
+> trust model, composition, sybil, and convergence trade-offs),
 > three benchmarks report metrics
-> (`make benchmark`), and five runnable artifacts build and run
+> (`make benchmark`), and six runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
 > companion spine, **`bin/crossengin` — the whole agent in one process**
 > (substrate + knowledge + soul + goals + scheduler + IO + safety + persistence,
-> no LLM), and the distributed-substrate seam's two halves
-> (`bin/crossengin-kg-publisher` / `bin/crossengin-kg-subscriber`). The unified assembly was previously blocked by NOVA's import-path
+> no LLM), the distributed-substrate seam's two halves
+> (`bin/crossengin-kg-publisher` / `bin/crossengin-kg-subscriber`), and the
+> federated-coordinator (`bin/crossengin-fed-coordinator`, P3.7). The unified assembly was previously blocked by NOVA's import-path
 > dedup (blocker #10); that is now **fixed in the toolchain** (path
 > canonicalization — see [`NEXT_SESSION.md`](./NEXT_SESSION.md)). What remains is
 > production hardening of the documented runtime seams (fsync-durable

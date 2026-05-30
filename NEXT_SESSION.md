@@ -147,6 +147,113 @@ continue. It is updated at every session boundary.
   119 unit-test suites (+1 suite for `test_image_pgm.nova`,
   +43 assertions), 24 integration scripts pass (+1 for
   `scenario_q_image_see.sh`, +11 assertions).
+- P3.7 minimum-viable federated multi-soul (framework + audit):
+  **complete (framework only)** (ADR-0054). Today CrossEngin has two
+  foundations (P20 + P1.3 kg-sync v2 for cross-soul atom replication;
+  P3.6 per-session DP for query leakage bounds) but no federation
+  layer that lets souls share what *works* (productive sources, durable
+  topics) without sharing what they were *taught* (raw atoms). This
+  round lands the smallest possible plank: a soul-side
+  `federated_aggregator` that walks the meta_observer's per-source
+  promotion + atrophy rates, applies DP noise via the existing dp
+  module (one `dp_noisy_mean` call per rate per round), and ships
+  the noised rates as FED_STAT records to a small coordinator
+  daemon. The coordinator averages across N souls and broadcasts
+  FED_AGGREGATE; the soul EMA-blends the federation mean into its
+  local source_authority tier signal (10% pull per round). The
+  noise is added LOCALLY -- the coordinator never sees raw rates,
+  only DP-noised ones. The full production stack is months of work
+  and is documented in `FEDERATED_AUDIT.md`; this round closes the
+  framework hole so the federation seam compiles, exercises a real
+  TCP round-trip, and the chat can drive the JOIN -> ROUND -> STAT
+  -> AGGREGATE handshake end-to-end.
+  - **`federated_aggregator.nova`** (NEW) -- soul-side aggregator
+    plus coordinator-side accumulator and network bridge. Public
+    API: `fed_agg_new(soul_id, dp, mo) -> fed_state`,
+    `fed_agg_round_start(f, round_id, deadline_ns)`,
+    `fed_agg_emit_noised_stats(f) -> list of [tag, noised_promo,
+    noised_atr] rows`, `fed_agg_receive_aggregate(f, tag, avg_promo,
+    avg_atr, n_part, source_auth)`, `fed_agg_round_end(f, round_id)`,
+    plus wire formatters (`fed_agg_format_join_line` /
+    `_stat_line` / `_leave_line`, `fed_format_round_line` /
+    `_aggregate_line`), inspection helpers (`fed_agg_round_id` /
+    `_active` / `_emit_count` / `_agg_count` / `_rounds` /
+    `_global_seen`), the coordinator-side accumulator
+    (`fed_acc_new` / `_add_stat` / `_averages` / `_count`), the
+    network bridge (`fed_dial` / `fed_send_join` / `fed_send_leave`
+    / `fed_close` / `fed_one_round`), env helpers
+    (`fed_token_from_env` / `fed_port_from_env` /
+    `fed_round_interval_from_env` / `fed_bind_from_env`), and a
+    local copy of the FED_* parser branch (renamed `_fed_*` to
+    sidestep the snapshot_disk + kg_sync `_starts_with` TU-scope
+    collision: both modules define a `_starts_with` helper, and the
+    chat imports both, so the federated_aggregator carries its own
+    renamed copies of the helpers it needs).
+  - **`examples/crossengin_fed_coordinator.nova`** (NEW; binary
+    `bin/crossengin-fed-coordinator`) -- small TCP server that
+    listens on `CE_FED_PORT` (default 8777), accepts
+    `CE_FED_SOULS` JOIN handshakes, runs `CE_FED_MAX_ROUNDS`
+    rounds (0 = unbounded; tests use 1 for determinism), and
+    logs round results to stdout. Auth via `CE_FED_TOKEN`
+    (mirror of `CE_KGSYNC_TOKEN`). Per-round flow: open
+    FED_ROUND -> collect FED_STAT to deadline -> average per
+    source_tag -> broadcast FED_AGGREGATE.
+  - **`src/io/transducers/kg_sync.nova`** -- additive FED_*
+    parser branch (one `_parse_fed_*_line` per event kind +
+    dispatch case in `_parse_line`) alongside the unchanged v2
+    protocol. Constants follow `KGSYNC_FED_*` naming so v2 is
+    strictly untouched (the brief's "additive case only"
+    contract).
+  - **chat-side `/fed_join` + `/fed_stats` + `/fed_leave`**
+    (`examples/crossengin_chat.nova`). `/fed_join URL` connects
+    to a coordinator (default 127.0.0.1:8777), sends HELLO
+    ce-fed v1 + FED_JOIN, then drives one round inline
+    (FED_ROUND -> emit FED_STAT batch -> ACK -> collect
+    FED_AGGREGATE -> EMA-blend into local source_authority).
+    `/fed_stats` prints the local DP-noised stats that the
+    next FED_STAT batch would carry (dry-run preview; DOES
+    consume the per-round epsilon -- the audit walks why a
+    truly non-consuming preview is impossible without
+    redesigning the dp module's API). `/fed_leave` sends
+    FED_LEAVE and closes the connection. Help text updated
+    with all three commands.
+  - **`Makefile`** -- `make install` builds
+    `bin/crossengin-fed-coordinator` alongside the existing
+    five binaries; `cross-windows` also cross-compiles it.
+  Acceptance: `tests/unit/test_federated_aggregator.nova` covers
+  91 assertions across 30 test functions: state construction
+  (non-zero, slot defaults), epsilon override, join / leave
+  flags, round lifecycle (start, emit, end, no-start-while-
+  inactive), DP noise variance > 0 across consecutive emits at
+  same round, budget drain proportional to N*eps*2, empty
+  observer -> zero rows, receive_aggregate records global +
+  bumps tier when high signal + leaves tier when neutral signal,
+  agg count tracking, all five wire formatter shapes, the
+  coordinator accumulator (empty, single-contributor, multi-
+  contributor, multi-source), env helpers, milli formatter,
+  local parsers, full self-aggregation round-trip
+  (emit -> accumulator -> averages -> receive).
+  `tests/integration/scenario_r_federated.sh` (NEW; 15
+  assertions): start the coordinator with `CE_FED_MAX_ROUNDS=1`
+  in background, boot the chat with `/teach` warmup + `/fed_join
+  127.0.0.1:<PORT>` + `/fed_leave` + `/help`, verify the
+  coordinator log shows JOIN + round open + STAT receipt +
+  AGGREGATE broadcast, verify the chat log shows handshake +
+  round complete + stats sent + aggregates received + /help
+  listing all three commands. Final counts: 115 modules (+1
+  from `federated_aggregator.nova`), 120 unit-test suites (+1
+  for `test_federated_aggregator.nova`, +91 assertions), 25
+  integration scripts pass (+1 for `scenario_r_federated.sh`,
+  +15 assertions), 6 install binaries (+1 for
+  `crossengin-fed-coordinator`). FEDERATED_AUDIT.md (NEW, repo
+  root) documents the trust model (trusted-coordinator + DP
+  vs SecAgg), DP composition across rounds (10ε session
+  supports ~10 rounds at 1.0ε or ~100 rounds at 0.1ε), the
+  not-secure-aggregation caveat (production federation needs
+  MPC / HE -- months of crypto), sybil resistance (the shared
+  CE_FED_TOKEN is a starting line, not a finish), and EMA
+  convergence (10% pull per round -> ~10 rounds to converge,
+  with the noise-resistance trade-off explained).
 - P3.6 minimum-viable differential privacy at the KG-query surface:
   **complete** (ADR-0053). Today CrossEngin's KGs are queryable (atom
   counts, beliefs, neighborhoods) but there is no formal privacy layer:
@@ -1745,7 +1852,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 117 (117 PASS, +1 from P3.5 `test_proof_checker.nova`, +1 from P3.4 `test_ann_index.nova`, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+56 assertions added by P3.5** (`test_proof_checker.nova`), **+46 assertions added by P3.4** (`test_ann_index.nova`), **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
+- Total unit suites: 120 (120 PASS, +1 from P3.7 `test_federated_aggregator.nova`, +1 from P3.6 `test_differential_privacy.nova`, +1 from P3.1 `test_image_pgm.nova`, +1 from P3.5 `test_proof_checker.nova`, +1 from P3.4 `test_ann_index.nova`, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+91 assertions added by P3.7** (`test_federated_aggregator.nova`), **+52 assertions added by P3.6** (`test_differential_privacy.nova`), **+43 assertions added by P3.1** (`test_image_pgm.nova`), **+56 assertions added by P3.5** (`test_proof_checker.nova`), **+46 assertions added by P3.4** (`test_ann_index.nova`), **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.

@@ -50,6 +50,7 @@ import "../src/learning/source_authority.nova"
 import "../src/persistence/snapshot_disk.nova"
 import "../src/session/session.nova"
 import "../src/safety/differential_privacy.nova"
+import "../src/learning/federated_aggregator.nova"
 import "../src/chat/helpers.nova"
 
 let CE_CAP   = 128
@@ -101,6 +102,17 @@ let _pending_compact_session = ""
 // startup is unchanged when the visual seam is never used. Pre-registered
 // builtins: "stub" + "pgm"; CE_VP_DECODER overrides the default.
 let _vp_seam = 0
+
+// P3.7 federated aggregator state (per-process, single soul today). When
+// `/fed_join` connects to a coordinator, `_fed_agg` is constructed against
+// the active session's dp + meta_observer and `_fed_conn_fd` holds the
+// live TCP connection. `/fed_stats` runs a DRY-RUN emit (no consume) so
+// the operator can preview what the next FED_STAT batch would carry.
+// `/fed_leave` sends a FED_LEAVE line and closes the connection.
+// Federation is per-process (not per-session) for simplicity -- the audit
+// doc walks why multi-session federation is reserved for a future round.
+let _fed_agg = 0
+let _fed_conn_fd = 0 - 1
 
 // ---- buffered line reader ------------------------------------------------
 // io_input() returns whatever sys_read drained -- on a terminal in line mode
@@ -234,6 +246,11 @@ fn _admin_help() {
     io_println("                      to atom labelled C (bounded BFS, default depth 6)")
     io_println("  /dp_status          print the session's differential-privacy budget")
     io_println("  /dp_query TARGET    run a DP-noised KG query (TARGET=atoms; 0.1 eps)")
+    io_println("  /fed_join URL       connect to a federated coordinator (default")
+    io_println("                      127.0.0.1:8777; URL=HOST:PORT) and send FED_JOIN")
+    io_println("  /fed_stats          dry-run preview of the local DP-noised per-source")
+    io_println("                      stats that the next FED_STAT batch would send")
+    io_println("  /fed_leave          drop out of the federation (send FED_LEAVE + close)")
     io_println("  /quit  /exit        exit chat")
     return 1
 }
@@ -1482,6 +1499,182 @@ fn _admin_dp_query(kg, dp, arg) {
     return 1
 }
 
+// ---- P3.7: /fed_join + /fed_stats + /fed_leave (ADR-0054) ---------------
+// `/fed_join URL`: connect to a federated coordinator at URL (default
+// 127.0.0.1:8777), send the ce-fed v1 HELLO (with CE_FED_TOKEN if set)
+// + a FED_JOIN line, then enter a tight in-line loop that handles
+// FED_ROUND / FED_AGGREGATE events until the coordinator closes (BYE)
+// or this soul's `_fed_conn_fd` is reset by /fed_leave. The chat REPL
+// is blocked during /fed_join -- the operator is expected to start the
+// coordinator in a separate terminal and then run /fed_join, and the
+// admin sees one round trip cycle then control returns. Multi-round
+// participation is via the integration test which scripts the
+// coordinator + multiple sessions.
+//
+// `/fed_stats`: print the local DP-noised stats that the NEXT round
+// would emit. This is a DRY-RUN -- it does consume the per-round
+// epsilon from the dp budget, because the noise sample needs the
+// budget to produce a useful preview. The audit doc walks why a
+// non-consuming preview is impossible without redesigning the dp
+// module's API.
+//
+// `/fed_leave`: send FED_LEAVE on the live connection and close the fd.
+// No-op if not currently joined.
+
+// Parse "HOST:PORT" -> [host, port]. Empty / malformed -> defaults.
+fn _fed_parse_url(arg) {
+    let host = "127.0.0.1"
+    let port = 8777
+    if len(arg) == 0 {
+        let out = list_new()
+        push(out, host)
+        push(out, port)
+        return out
+    }
+    // Split on ':'
+    let i = 0
+    let colon = 0 - 1
+    while i < len(arg) {
+        if char_at(arg, i) == 58 {
+            colon = i
+            i = len(arg)
+        } else {
+            i = i + 1
+        }
+    }
+    if colon < 0 {
+        host = arg
+    } else {
+        host = substr(arg, 0, colon)
+        let port_str = substr(arg, colon + 1, len(arg) - colon - 1)
+        let p = rt_str_to_int(port_str)
+        if p > 0 { port = p }
+    }
+    if len(host) == 0 { host = "127.0.0.1" }
+    let out = list_new()
+    push(out, host)
+    push(out, port)
+    return out
+}
+
+fn _admin_fed_join(sess, arg, source_auth) {
+    if _fed_conn_fd >= 0 {
+        io_println("(already joined a federation -- use /fed_leave first)")
+        return 1
+    }
+    let parts = _fed_parse_url(arg)
+    let host = parts[0]
+    let port = parts[1]
+    let dp = session_dp(sess)
+    let mo = session_mo(sess)
+    if dp == 0 {
+        io_println("(DP not configured for this session; cannot join federation)")
+        return 1
+    }
+    if mo == 0 {
+        io_println("(meta-observer not configured for this session)")
+        return 1
+    }
+    let soul_id = session_id(sess)
+    if len(soul_id) == 0 { soul_id = "default" }
+    io_println("fed_join: dialing " + host + ":" + int_to_str(port)
+        + " as soul=" + soul_id)
+    let fd = fed_dial(host, port)
+    if fd < 0 {
+        io_println("fed_join: ERROR cannot connect / handshake")
+        return 1
+    }
+    // Build the fed_agg + send FED_JOIN.
+    _fed_agg = fed_agg_new(soul_id, dp, mo)
+    fed_agg_join(_fed_agg)
+    if fed_send_join(_fed_agg, fd) == 0 {
+        fed_close(fd)
+        _fed_agg = 0
+        io_println("fed_join: ERROR sending FED_JOIN")
+        return 1
+    }
+    _fed_conn_fd = fd
+    io_println("fed_join: HELLO + FED_JOIN exchange complete, "
+        + "epsilon=" + int_to_str(fed_agg_epsilon(_fed_agg)) + " milli/round")
+    // Drive one round inline (the integration test relies on this). The
+    // chat returns to the REPL after the first round; subsequent rounds
+    // require another /fed_join (per-round invocation matches the brief's
+    // minimum-viable shape).
+    let result = fed_one_round(_fed_agg, fd, source_auth)
+    let completed = fed_round_result_completed(result)
+    let round_id = fed_round_result_round_id(result)
+    let stats_sent = fed_round_result_stats_sent(result)
+    let aggs_recv = fed_round_result_aggs_recv(result)
+    if completed == 1 {
+        io_println("fed: round " + int_to_str(round_id) + " complete ("
+            + int_to_str(stats_sent) + " stats sent, "
+            + int_to_str(aggs_recv) + " aggregates received)")
+    } else {
+        io_println("fed_join: coordinator closed before round completed")
+        fed_close(fd)
+        _fed_conn_fd = 0 - 1
+        _fed_agg = 0
+    }
+    return 1
+}
+
+fn _admin_fed_stats(sess) {
+    let dp = session_dp(sess)
+    let mo = session_mo(sess)
+    if dp == 0 {
+        io_println("(DP not configured for this session)")
+        return 1
+    }
+    if mo == 0 {
+        io_println("(meta-observer not configured for this session)")
+        return 1
+    }
+    // Build a temporary fed_agg if none exists.
+    let f = _fed_agg
+    if f == 0 {
+        let soul_id = session_id(sess)
+        if len(soul_id) == 0 { soul_id = "default" }
+        f = fed_agg_new(soul_id, dp, mo)
+    }
+    io_println("fed_stats: dry-run preview (next FED_STAT batch)")
+    io_println("  soul=" + fed_agg_soul_id(f)
+        + " epsilon=" + int_to_str(fed_agg_epsilon(f)) + " milli/round")
+    io_println("  dp budget remaining: " + int_to_str(dp_remaining_budget(dp))
+        + " milli-eps")
+    let stats = fed_agg_emit_noised_stats(f)
+    if len(stats) == 0 {
+        io_println("  (no source tags tracked yet; teach some atoms first)")
+        return 1
+    }
+    let i = 0
+    while i < len(stats) {
+        let row = stats[i]
+        io_println("  " + row[FED_STAT_TAG]
+            + ": noised_promo=" + fed_format_milli(row[FED_STAT_PROMO])
+            + " noised_atr=" + fed_format_milli(row[FED_STAT_ATR]))
+        i = i + 1
+    }
+    io_println("  (" + int_to_str(len(stats)) + " source(s); dp budget after: "
+        + int_to_str(dp_remaining_budget(dp)) + " milli-eps)")
+    return 1
+}
+
+fn _admin_fed_leave() {
+    if _fed_conn_fd < 0 {
+        io_println("(not currently joined to a federation)")
+        return 1
+    }
+    if _fed_agg != 0 {
+        fed_send_leave(_fed_agg, _fed_conn_fd)
+        fed_agg_leave(_fed_agg)
+    }
+    fed_close(_fed_conn_fd)
+    _fed_conn_fd = 0 - 1
+    _fed_agg = 0
+    io_println("fed_leave: dropped out of federation")
+    return 1
+}
+
 fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, reg, stream, em, syn_g, sm, now) {
     if len(msg) == 0 { return 0 }
     if char_at(msg, 0) != 47 { return 0 }   // not '/'
@@ -1516,6 +1709,9 @@ fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, 
     if str_eq(cmd, "/prove")       == 1 { return _admin_prove(kg, arg) }
     if str_eq(cmd, "/dp_status")   == 1 { return _admin_dp_status(session_dp(sreg_lookup(sreg, active_id))) }
     if str_eq(cmd, "/dp_query")    == 1 { return _admin_dp_query(kg, session_dp(sreg_lookup(sreg, active_id)), arg) }
+    if str_eq(cmd, "/fed_join")    == 1 { return _admin_fed_join(sreg_lookup(sreg, active_id), arg, sauth) }
+    if str_eq(cmd, "/fed_stats")   == 1 { return _admin_fed_stats(sreg_lookup(sreg, active_id)) }
+    if str_eq(cmd, "/fed_leave")   == 1 { return _admin_fed_leave() }
     if str_eq(cmd, "/history") == 1 {
         let n = 5
         if len(arg) > 0 { n = rt_str_to_int(arg) }

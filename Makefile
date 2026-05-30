@@ -26,6 +26,7 @@ DAEMON      := examples/crossengin_daemon.nova
 CHAT        := examples/crossengin_chat.nova
 KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
+FED_COORD   := examples/crossengin_fed_coordinator.nova
 
 .PHONY: all build test benchmark install integration clean check-nova help cross-windows
 
@@ -43,7 +44,7 @@ NOVA_COMPILE = $(NOVA_ROOT)/bin/nova
 
 cross-windows: check-nova
 	@mkdir -p $(BIN)
-	@for src in $(SELFCHECK) $(SPINE) $(DAEMON) $(CHAT) $(KGSYNC_PUB) $(KGSYNC_SUB); do \
+	@for src in $(SELFCHECK) $(SPINE) $(DAEMON) $(CHAT) $(KGSYNC_PUB) $(KGSYNC_SUB) $(FED_COORD); do \
 		if [ ! -f "$$src" ]; then continue; fi; \
 		name=$$(basename "$$src" .nova); \
 		printf '  cross-compile %-50s ' "$$src"; \
@@ -140,6 +141,14 @@ install: build
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
 	fi
+	@if [ -f "$(FED_COORD)" ]; then \
+	  printf '  build %s ... ' "$(FED_COORD)"; \
+	  if "$(NOVA)" build "$(FED_COORD)" -o "$(BIN)/crossengin-fed-coordinator" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-fed-coordinator"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
 
 integration: install
 	@scripts="$$(find tests/integration -maxdepth 1 -name '*.sh' ! -name '_*' 2>/dev/null | sort)"; \
@@ -166,7 +175,7 @@ help:
 	@echo "  build       compile every implemented NOVA module under src/"
 	@echo "  test        compile and run every unit test under tests/unit/"
 	@echo "  benchmark   run every benchmark under tests/benchmark/"
-	@echo "  install     build the self-check, companion-spine, unified daemon, and kg-sync pub/sub into ./bin/"
+	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, and fed-coordinator into ./bin/"
 	@echo "  integration run every end-to-end scenario + admin-command script in tests/integration/"
 	@echo "  clean       remove build artifacts"
 	@echo "  check-nova  verify the NOVA toolchain is reachable"

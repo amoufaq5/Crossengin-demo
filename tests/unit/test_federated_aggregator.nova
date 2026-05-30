@@ -1,0 +1,492 @@
+// Unit tests for src/learning/federated_aggregator.nova (P3.7 / ADR-0054).
+//
+// Coverage:
+//   - fed_agg_new returns a non-zero, well-formed state object.
+//   - fed_agg_emit_noised_stats applies DP noise (consecutive calls
+//     produce different noised values within the variance budget).
+//   - fed_agg_receive_aggregate adjusts the local source_authority
+//     (verify by reading the sa tier before/after).
+//   - Round lifecycle: start -> emit -> receive -> end leaves state
+//     clean; round_id resets to -1 after end.
+//   - Budget consumption: each round consumes the agreed per-round
+//     epsilon from the dp budget.
+//   - Wire formatters produce the expected line shapes.
+//   - The coordinator-side accumulator averages per-source rates
+//     correctly.
+
+import "../ce_test.nova"
+import "../../src/learning/federated_aggregator.nova"
+
+// ---- helpers --------------------------------------------------------------
+// Build a minimal mo / kg / dp triple that lets the aggregator find at
+// least one tracked source with both promotion + atrophy non-zero. This
+// mirrors the setup test_meta_observer uses.
+
+fn _set_mean(atom, mean_milli) {
+    let b = atom_belief(atom)
+    list_set(b, 0, mean_milli)
+    list_set(b, 1, 1000 - mean_milli)
+    return 1
+}
+
+fn _build_mo_with_two_sources() {
+    let mo = mo_new()
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "world")
+    // Source "topic:fever" -- 12 atoms (above MO_FB_WINDOW), mixed durable / tentative.
+    let i = 0
+    while i < 12 {
+        let lbl = "fv_" + int_to_str(i)
+        let a = kg_add_atom(kg, ATOM_CONCEPT, lbl, 0)
+        if i < 9 {
+            _set_mean(a, 800)   // durable
+        } else {
+            _set_mean(a, 200)   // tentative
+        }
+        mo_attribute(mo, "topic:fever", atom_id(a))
+        i = i + 1
+    }
+    // Source "topic:headache" -- 12 atoms, mostly tentative.
+    let j = 0
+    while j < 12 {
+        let lbl = "hd_" + int_to_str(j)
+        let a = kg_add_atom(kg, ATOM_CONCEPT, lbl, 0)
+        if j < 2 {
+            _set_mean(a, 800)
+        } else {
+            _set_mean(a, 100)
+        }
+        mo_attribute(mo, "topic:headache", atom_id(a))
+        j = j + 1
+    }
+    // Poll once so the lifetime counters are populated.
+    mo_poll(mo, kg, 0, 0)
+    let out = list_new()
+    push(out, mo)
+    push(out, kg)
+    return out
+}
+
+// ---- tests --------------------------------------------------------------
+
+fn test_fed_agg_new_returns_state() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo)
+    ce_check("fed_agg_new non-zero", f != 0)
+    ce_str_eq("soul id", fed_agg_soul_id(f), "alice")
+    ce_check("dp wired", fed_agg_dp(f) != 0)
+    ce_check("mo wired", fed_agg_mo(f) != 0)
+    ce_eq("round id starts at -1", fed_agg_round_id(f), 0 - 1)
+    ce_eq("active starts at 0", fed_agg_active(f), 0)
+    ce_eq("emit count starts at 0", fed_agg_emit_count(f), 0)
+    ce_eq("agg count starts at 0", fed_agg_agg_count(f), 0)
+    ce_eq("rounds count starts at 0", fed_agg_rounds(f), 0)
+}
+
+fn test_fed_agg_default_epsilon() {
+    let mok = _build_mo_with_two_sources()
+    let f = fed_agg_new("alice", dp_new(10000), mok[0])
+    ce_eq("default epsilon 1000 milli", fed_agg_epsilon(f), 1000)
+    fed_agg_set_epsilon(f, 250)
+    ce_eq("epsilon override 250", fed_agg_epsilon(f), 250)
+    fed_agg_set_epsilon(f, 0)
+    // Zero or negative is rejected; the epsilon must stay at 250.
+    ce_eq("zero epsilon rejected", fed_agg_epsilon(f), 250)
+}
+
+fn test_fed_agg_join_leave_flags() {
+    let mok = _build_mo_with_two_sources()
+    let f = fed_agg_new("alice", dp_new(10000), mok[0])
+    fed_agg_join(f)
+    ce_eq("active=1 after join", fed_agg_active(f), 1)
+    fed_agg_leave(f)
+    ce_eq("active=0 after leave", fed_agg_active(f), 0)
+    ce_eq("round id reset on leave", fed_agg_round_id(f), 0 - 1)
+}
+
+fn test_fed_agg_round_lifecycle_clean() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo)
+    fed_agg_join(f)
+    let r1 = fed_agg_round_start(f, 42, 1000000)
+    ce_eq("round start while active = 1", r1, 1)
+    ce_eq("round id set", fed_agg_round_id(f), 42)
+    ce_eq("rounds bumped", fed_agg_rounds(f), 1)
+    let stats = fed_agg_emit_noised_stats(f)
+    ce_check("emit produced rows", len(stats) >= 1)
+    let r2 = fed_agg_round_end(f, 42)
+    ce_eq("round end match", r2, 1)
+    ce_eq("round id cleared", fed_agg_round_id(f), 0 - 1)
+}
+
+fn test_fed_agg_round_start_inactive_refused() {
+    let mok = _build_mo_with_two_sources()
+    let f = fed_agg_new("alice", dp_new(10000), mok[0])
+    // Did NOT call fed_agg_join.
+    let r = fed_agg_round_start(f, 1, 0)
+    ce_eq("round start without join = 0", r, 0)
+}
+
+// Apply noise to the same source rates twice. The noised values should
+// differ between the two emits (or at most one in many be identical;
+// across the whole list at least one should differ).
+fn test_fed_agg_emit_applies_noise() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new_seeded(100000, 4242)
+    let f = fed_agg_new("alice", dp, mo)
+    fed_agg_join(f)
+    fed_agg_round_start(f, 1, 1000000)
+    let s1 = fed_agg_emit_noised_stats(f)
+    let s2 = fed_agg_emit_noised_stats(f)
+    ce_check("both emits produced rows", len(s1) >= 1)
+    ce_check("emit shape stable", len(s1) == len(s2))
+    // Find at least one differing noised promotion value across the two
+    // emits (variance > 0). If every value was identical, the noise was
+    // zero -- the DP guarantee is empty.
+    let any_diff = 0
+    let i = 0
+    while i < len(s1) {
+        if s1[i][FED_STAT_PROMO] != s2[i][FED_STAT_PROMO] { any_diff = 1 }
+        if s1[i][FED_STAT_ATR] != s2[i][FED_STAT_ATR] { any_diff = 1 }
+        i = i + 1
+    }
+    ce_eq("noise variance > 0 across emits", any_diff, 1)
+}
+
+fn test_fed_agg_emit_consumes_budget() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo)
+    fed_agg_set_epsilon(f, 500)
+    fed_agg_join(f)
+    fed_agg_round_start(f, 1, 1000000)
+    let pre = dp_remaining_budget(dp)
+    let stats = fed_agg_emit_noised_stats(f)
+    let post = dp_remaining_budget(dp)
+    // Each successful row consumed epsilon * 2 (one per rate).
+    let expected_min = pre - len(stats) * 500 * 2
+    ce_check("budget drained by at least N*eps*2", post <= expected_min)
+    ce_check("budget did not over-drain", post >= 0)
+    fed_agg_round_end(f, 1)
+}
+
+fn test_fed_agg_emit_skips_empty_sources() {
+    // An observer with zero attributions should produce zero rows.
+    let mo = mo_new()
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo)
+    fed_agg_join(f)
+    fed_agg_round_start(f, 1, 1000000)
+    let stats = fed_agg_emit_noised_stats(f)
+    ce_eq("empty observer -> zero rows", len(stats), 0)
+    fed_agg_round_end(f, 1)
+}
+
+// fed_agg_receive_aggregate should remember the global mean per source.
+fn test_fed_agg_receive_records_global() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo)
+    let sa = sa_new()
+    fed_agg_receive_aggregate(f, "topic:fever", 800, 100, 3, sa)
+    let row = fed_agg_global_seen(f, "topic:fever")
+    ce_check("global row not zero", row != 0)
+    ce_eq("global promo recorded", row[FED_GS_PROMO], 800)
+    ce_eq("global atrophy recorded", row[FED_GS_ATR], 100)
+    ce_eq("global n_part recorded", row[FED_GS_NPART], 3)
+}
+
+// A high global promotion rate should pull the local source's tier
+// up (toward A). We verify by reading the sa tier before / after.
+fn test_fed_agg_receive_promotes_tier_high_signal() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo)
+    let sa = sa_new()
+    // Default tier for unknown host is SA_TIER_C.
+    let host = mo_tag_to_host("topic:fever")
+    let tier_before = sa_tier_for_host(sa, host)
+    ce_eq("starts at tier C", tier_before, SA_TIER_C)
+    // Send an EXTREMELY high promotion (1000 milli == 100%) so the
+    // EMA-blended value crosses the 700 threshold.
+    fed_agg_receive_aggregate(f, "topic:fever", 1000, 0, 5, sa)
+    let tier_after = sa_tier_for_host(sa, host)
+    ce_check("tier moved up (smaller)", tier_after < tier_before)
+}
+
+// A neutral global signal AND a neutral local rate should leave the
+// tier alone. We use a fresh observer with NO attributions so the
+// local rate is 0; EMA-blended with global=500 yields 50, well below
+// both thresholds.
+fn test_fed_agg_receive_no_change_neutral_signal() {
+    let mo_empty = mo_new()
+    let dp = dp_new(10000)
+    let f = fed_agg_new("alice", dp, mo_empty)
+    let sa = sa_new()
+    let host = mo_tag_to_host("topic:fever")
+    let tier_before = sa_tier_for_host(sa, host)
+    // Neutral signal (500 milli) -- between the two thresholds.
+    fed_agg_receive_aggregate(f, "topic:fever", 500, 200, 3, sa)
+    let tier_after = sa_tier_for_host(sa, host)
+    ce_eq("neutral signal -> no tier change", tier_after, tier_before)
+}
+
+fn test_fed_agg_receive_bumps_count() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let f = fed_agg_new("alice", dp_new(10000), mo)
+    let sa = sa_new()
+    fed_agg_receive_aggregate(f, "topic:fever", 800, 100, 3, sa)
+    fed_agg_receive_aggregate(f, "topic:headache", 200, 300, 3, sa)
+    ce_eq("agg count = 2", fed_agg_agg_count(f), 2)
+}
+
+// ---- wire formatters ----------------------------------------------------
+
+fn test_fed_agg_format_join_line() {
+    let mok = _build_mo_with_two_sources()
+    let f = fed_agg_new("alice", dp_new(10000), mok[0])
+    let s = fed_agg_format_join_line(f)
+    ce_str_eq("join line", s, "FED_JOIN alice 1000\n")
+}
+
+fn test_fed_agg_format_stat_line() {
+    let mok = _build_mo_with_two_sources()
+    let f = fed_agg_new("alice", dp_new(10000), mok[0])
+    fed_agg_join(f)
+    fed_agg_round_start(f, 7, 1000000)
+    let s = fed_agg_format_stat_line(f, "topic:fever", 850, 50)
+    ce_str_eq("stat line", s, "FED_STAT 7 topic:fever 850 50\n")
+}
+
+fn test_fed_agg_format_leave_line() {
+    let mok = _build_mo_with_two_sources()
+    let f = fed_agg_new("bob", dp_new(10000), mok[0])
+    let s = fed_agg_format_leave_line(f)
+    ce_str_eq("leave line", s, "FED_LEAVE bob\n")
+}
+
+fn test_fed_format_round_line() {
+    let s = fed_format_round_line(42, 1000000)
+    ce_str_eq("round line", s, "FED_ROUND 42 1000000\n")
+}
+
+fn test_fed_format_aggregate_line() {
+    let s = fed_format_aggregate_line(5, "topic:fever", 800, 100, 3)
+    ce_str_eq("aggregate line", s, "FED_AGGREGATE 5 topic:fever 800 100 3\n")
+}
+
+// ---- coordinator-side accumulator ---------------------------------------
+
+fn test_fed_acc_new_empty() {
+    let a = fed_acc_new(1)
+    ce_eq("acc round id", fed_acc_round_id(a), 1)
+    ce_eq("acc empty rows", fed_acc_count(a), 0)
+    let avgs = fed_acc_averages(a)
+    ce_eq("empty averages", len(avgs), 0)
+}
+
+fn test_fed_acc_add_stat_single() {
+    let a = fed_acc_new(1)
+    fed_acc_add_stat(a, "topic:fever", 800, 100)
+    ce_eq("one source after one add", fed_acc_count(a), 1)
+    let avgs = fed_acc_averages(a)
+    ce_eq("one avg row", len(avgs), 1)
+    ce_str_eq("avg tag", avgs[0][0], "topic:fever")
+    ce_eq("single contributor -> avg = value", avgs[0][1], 800)
+    ce_eq("single contributor -> atrophy avg = value", avgs[0][2], 100)
+    ce_eq("n_part = 1", avgs[0][3], 1)
+}
+
+fn test_fed_acc_averages_multi_contributors() {
+    let a = fed_acc_new(1)
+    fed_acc_add_stat(a, "topic:fever", 800, 100)
+    fed_acc_add_stat(a, "topic:fever", 600, 200)
+    fed_acc_add_stat(a, "topic:fever", 700, 150)
+    let avgs = fed_acc_averages(a)
+    ce_eq("still one source", len(avgs), 1)
+    // Sum 800+600+700 = 2100; avg = 700.
+    ce_eq("avg promo", avgs[0][1], 700)
+    // Sum 100+200+150 = 450; avg = 150.
+    ce_eq("avg atr", avgs[0][2], 150)
+    ce_eq("n_part = 3", avgs[0][3], 3)
+}
+
+fn test_fed_acc_averages_multi_sources() {
+    let a = fed_acc_new(1)
+    fed_acc_add_stat(a, "topic:fever", 800, 100)
+    fed_acc_add_stat(a, "topic:fever", 600, 200)
+    fed_acc_add_stat(a, "topic:headache", 300, 700)
+    fed_acc_add_stat(a, "topic:headache", 200, 800)
+    let avgs = fed_acc_averages(a)
+    ce_eq("two source rows", len(avgs), 2)
+    // We don't depend on order; check by tag.
+    let i = 0
+    let fever_seen = 0
+    let headache_seen = 0
+    while i < len(avgs) {
+        if str_eq(avgs[i][0], "topic:fever") == 1 {
+            ce_eq("fever avg promo", avgs[i][1], 700)
+            ce_eq("fever avg atr", avgs[i][2], 150)
+            ce_eq("fever n_part", avgs[i][3], 2)
+            fever_seen = 1
+        }
+        if str_eq(avgs[i][0], "topic:headache") == 1 {
+            ce_eq("headache avg promo", avgs[i][1], 250)
+            ce_eq("headache avg atr", avgs[i][2], 750)
+            ce_eq("headache n_part", avgs[i][3], 2)
+            headache_seen = 1
+        }
+        i = i + 1
+    }
+    ce_eq("fever seen", fever_seen, 1)
+    ce_eq("headache seen", headache_seen, 1)
+}
+
+// ---- env / utility -------------------------------------------------------
+
+fn test_fed_token_from_env_default() {
+    let v = fed_token_from_env()
+    // Without CE_FED_TOKEN set, returns 0. (We can't mutate env from
+    // NOVA; just verify the default branch.)
+    ce_check("token default acceptable", v == 0)
+}
+
+fn test_fed_round_interval_default() {
+    let v = fed_round_interval_from_env()
+    ce_check("default interval positive", v > 0)
+}
+
+fn test_fed_port_default() {
+    let v = fed_port_from_env()
+    ce_check("default port positive", v > 0)
+}
+
+fn test_fed_format_milli() {
+    ce_str_eq("125 milli", fed_format_milli(125), "12.5")
+    ce_str_eq("1000 milli", fed_format_milli(1000), "100.0")
+    ce_str_eq("0 milli", fed_format_milli(0), "0.0")
+}
+
+fn test_fed_str_to_int() {
+    ce_eq("zero", _fed_str_to_int("0"), 0)
+    ce_eq("positive", _fed_str_to_int("12345"), 12345)
+    ce_eq("garbage", _fed_str_to_int("abc"), 0)
+}
+
+// ---- local parsers -------------------------------------------------------
+
+fn test_fed_parse_round_line() {
+    let r = _fed_parse_round("FED_ROUND 42 1000000")
+    ce_check("parse round non-zero", r != 0)
+    ce_eq("round type", r[FEDR_TYPE], FED_EV_ROUND)
+    ce_eq("round id", r[FEDR_ROUND_ID], 42)
+    ce_eq("round deadline", r[FEDR_DEADLINE], 1000000)
+}
+
+fn test_fed_parse_agg_line() {
+    let r = _fed_parse_agg("FED_AGGREGATE 5 topic:fever 800 100 3")
+    ce_check("parse agg non-zero", r != 0)
+    ce_eq("agg type", r[FEDR_TYPE], FED_EV_AGG)
+    ce_eq("agg round", r[FEDR_ROUND_ID], 5)
+    ce_str_eq("agg tag", r[FEDR_TAG_SLOT], "topic:fever")
+    ce_eq("agg promo", r[FEDR_PROMO], 800)
+    ce_eq("agg atr", r[FEDR_ATR], 100)
+    ce_eq("agg n_part", r[FEDR_NPART], 3)
+}
+
+fn test_fed_parse_line_bye() {
+    let r = _fed_parse_line("BYE")
+    ce_check("parse BYE non-zero", r != 0)
+    ce_eq("BYE type", r[FEDR_TYPE], FED_EV_BYE)
+}
+
+fn test_fed_parse_line_rejects_garbage() {
+    let r = _fed_parse_line("GARBAGE here")
+    ce_eq("parse garbage = 0", r, 0)
+}
+
+// ---- full round-trip simulation ------------------------------------------
+// emit_noised_stats -> coordinator accumulator -> averages ->
+// receive_aggregate. Verifies the loop is internally consistent: a
+// federation of one (the chat's own emit fed into its own receive)
+// records the original noised values as the global mean (n_part = 1).
+fn test_fed_full_round_self_aggregation() {
+    let mok = _build_mo_with_two_sources()
+    let mo = mok[0]
+    let dp = dp_new(50000)
+    let f = fed_agg_new("alice", dp, mo)
+    let sa = sa_new()
+    fed_agg_join(f)
+    fed_agg_round_start(f, 1, 1000000)
+    let stats = fed_agg_emit_noised_stats(f)
+    ce_check("emitted at least one row", len(stats) >= 1)
+    let acc = fed_acc_new(1)
+    let i = 0
+    while i < len(stats) {
+        let row = stats[i]
+        fed_acc_add_stat(acc, row[FED_STAT_TAG], row[FED_STAT_PROMO], row[FED_STAT_ATR])
+        i = i + 1
+    }
+    let avgs = fed_acc_averages(acc)
+    // n_part = 1 for every row when only one soul contributed.
+    let j = 0
+    while j < len(avgs) {
+        ce_eq("n_part = 1", avgs[j][3], 1)
+        j = j + 1
+    }
+    // Apply back.
+    let k = 0
+    while k < len(avgs) {
+        let row = avgs[k]
+        fed_agg_receive_aggregate(f, row[0], row[1], row[2], row[3], sa)
+        k = k + 1
+    }
+    ce_eq("agg count = number of sources", fed_agg_agg_count(f), len(avgs))
+    fed_agg_round_end(f, 1)
+    ce_eq("round id cleared", fed_agg_round_id(f), 0 - 1)
+}
+
+fn main() {
+    test_fed_agg_new_returns_state()
+    test_fed_agg_default_epsilon()
+    test_fed_agg_join_leave_flags()
+    test_fed_agg_round_lifecycle_clean()
+    test_fed_agg_round_start_inactive_refused()
+    test_fed_agg_emit_applies_noise()
+    test_fed_agg_emit_consumes_budget()
+    test_fed_agg_emit_skips_empty_sources()
+    test_fed_agg_receive_records_global()
+    test_fed_agg_receive_promotes_tier_high_signal()
+    test_fed_agg_receive_no_change_neutral_signal()
+    test_fed_agg_receive_bumps_count()
+    test_fed_agg_format_join_line()
+    test_fed_agg_format_stat_line()
+    test_fed_agg_format_leave_line()
+    test_fed_format_round_line()
+    test_fed_format_aggregate_line()
+    test_fed_acc_new_empty()
+    test_fed_acc_add_stat_single()
+    test_fed_acc_averages_multi_contributors()
+    test_fed_acc_averages_multi_sources()
+    test_fed_token_from_env_default()
+    test_fed_round_interval_default()
+    test_fed_port_default()
+    test_fed_format_milli()
+    test_fed_str_to_int()
+    test_fed_parse_round_line()
+    test_fed_parse_agg_line()
+    test_fed_parse_line_bye()
+    test_fed_parse_line_rejects_garbage()
+    test_fed_full_round_self_aggregation()
+    ce_summary("federated_aggregator")
+}
+main()

@@ -1,0 +1,406 @@
+// CrossEngin federated learning coordinator (P3.7 / ADR-0054).
+//
+// Purpose
+//   The coordinator side of the federated multi-soul protocol. A small
+//   TCP server that:
+//     1. Listens on CE_FED_PORT (default 8777) -- one above the kgsync
+//        default 8766 so a local dev box can run both seam types in
+//        parallel without port-clash.
+//     2. Accepts FED_JOIN messages from souls. Each soul presents the
+//        ce-fed v1 HELLO (with an optional `token=` clause when
+//        CE_FED_TOKEN is armed) and a FED_JOIN line carrying its
+//        soul_id and the per-round epsilon it intends to spend.
+//     3. Every CE_FED_ROUND_INTERVAL_NS (default 30s), opens a new
+//        round: sends FED_ROUND <round_id> <deadline_ns> to every
+//        active soul.
+//     4. Collects FED_STAT replies until the deadline, accumulating
+//        per-source averages.
+//     5. Broadcasts FED_AGGREGATE <round_id> <source_tag>
+//        <avg_promo> <avg_atr> <n_participants> to every active soul.
+//     6. Loops.
+//
+//   This is a SIMPLE coordinator -- it does NOT support reconnect, does
+//   NOT persist round history, and does NOT do anything sophisticated
+//   for soul-side failures (a quiet soul just gets less weight in the
+//   next aggregate). The acceptance test asserts the round-trip flow.
+//   The audit doc walks the production gaps.
+//
+//   stdin -> none consumed. The coordinator runs until SIGTERM / EOF
+//   on stdin (we read one line of stdin per round end so a script can
+//   feed "bye\n" to terminate cleanly between rounds).
+//
+//   Env:
+//     CE_FED_PORT              -- listen port (default 8777)
+//     CE_FED_BIND              -- bind address (default 127.0.0.1)
+//     CE_FED_ROUND_INTERVAL_NS -- ns between rounds (default 30000000000)
+//     CE_FED_TOKEN             -- shared auth token (default: anonymous)
+//     CE_FED_SOULS             -- expected initial soul count (default 1)
+//     CE_FED_MAX_ROUNDS        -- bound rounds (test mode; default 0 = forever)
+//
+// ADRs exercised: ADR-0054 (federated multi-soul framework). NOVA
+//   dependencies: socket builtins, getenv, nanotime, read_line.
+// CrossEngin dependencies: src/io/transducers/kg_sync.nova (FED_*
+//   parser + socket plumbing), src/learning/federated_aggregator.nova
+//   (the FED_ACC accumulator + wire formatters).
+
+import "../src/io/transducers/kg_sync.nova"
+import "../src/learning/federated_aggregator.nova"
+
+let CE_FED_DEFAULT_DEADLINE_NS = 2000000000   // 2 s after round open
+
+// Per-soul tracker on the coordinator side:
+//   [fd, soul_id, epsilon_milli, last_active_ns]
+let CSOUL_FD       = 0
+let CSOUL_ID       = 1
+let CSOUL_EPSILON  = 2
+let CSOUL_ACTIVE   = 3
+
+fn _csoul_new(fd, soul_id, epsilon) {
+    let s = list_new()
+    push(s, fd)
+    push(s, soul_id)
+    push(s, epsilon)
+    push(s, nanotime())
+    return s
+}
+
+fn _auth_mode_str(token) {
+    if token == 0 { return "anon" }
+    if len(token) == 0 { return "anon" }
+    return "token"
+}
+
+// Run the FED-side HELLO + FED_JOIN handshake on a freshly-accepted fd.
+// Returns the [fd, soul_id, epsilon] tuple on success, or 0 on rejection
+// (and the fd is closed).
+fn _fed_accept_handshake(sub_fd, expected_token) {
+    let hello = _recv_line(sub_fd)
+    if hello == 0 {
+        close_fd(sub_fd)
+        return 0
+    }
+    if _is_hello_fed(hello) == 0 {
+        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected HELLO ce-fed v1\n")
+        close_fd(sub_fd)
+        return 0
+    }
+    if expected_token != 0 {
+        let client_tok = _parse_hello_token(hello)
+        if client_tok == 0 {
+            _send_all(sub_fd, KGSYNC_ERR_AUTH + "\n")
+            close_fd(sub_fd)
+            return 0
+        }
+        if str_eq(client_tok, expected_token) == 0 {
+            _send_all(sub_fd, KGSYNC_ERR_AUTH + "\n")
+            close_fd(sub_fd)
+            return 0
+        }
+    }
+    if _send_all(sub_fd, KGSYNC_OK_FED_V1_LINE + "\n") == 0 {
+        close_fd(sub_fd)
+        return 0
+    }
+    // Expect FED_JOIN next.
+    let join_line = _recv_line(sub_fd)
+    if join_line == 0 {
+        close_fd(sub_fd)
+        return 0
+    }
+    let rec = _parse_fed_join_line(join_line)
+    if rec == 0 {
+        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected FED_JOIN\n")
+        close_fd(sub_fd)
+        return 0
+    }
+    let soul_id = rec[KGSYNC_FED_SOUL_ID]
+    let epsilon = rec[KGSYNC_FED_EPSILON]
+    return _csoul_new(sub_fd, soul_id, epsilon)
+}
+
+// Accept exactly N souls up-front (rejected handshakes do NOT count
+// toward N; bounded by 3*N+4 attempts).
+fn _fed_accept_n(server_fd, n, expected_token) {
+    let souls = list_new()
+    let attempts = 0
+    let max_attempts = 3 * n + 4
+    while len(souls) < n {
+        if attempts >= max_attempts { return souls }
+        let fd = accept_conn(server_fd, 0, 0)
+        if fd >= 0 {
+            let s = _fed_accept_handshake(fd, expected_token)
+            if s != 0 {
+                push(souls, s)
+                println("fed-coord: JOIN soul=" + s[CSOUL_ID]
+                    + " epsilon=" + int_to_str(s[CSOUL_EPSILON])
+                    + " (total " + int_to_str(len(souls)) + " of "
+                    + int_to_str(n) + ")")
+            }
+        }
+        attempts = attempts + 1
+    }
+    return souls
+}
+
+// Broadcast a FED_ROUND line to every active soul. Returns the number of
+// souls that received the line successfully. Marks any soul whose send
+// failed as inactive (fd set to -1).
+fn _fed_broadcast_round(souls, round_id, deadline_ns) {
+    let line = fed_format_round_line(round_id, deadline_ns)
+    let i = 0
+    let sent = 0
+    while i < len(souls) {
+        let s = souls[i]
+        let fd = s[CSOUL_FD]
+        if fd >= 0 {
+            if _send_all(fd, line) == 0 {
+                close_fd(fd)
+                list_set(s, CSOUL_FD, 0 - 1)
+            } else {
+                sent = sent + 1
+                list_set(s, CSOUL_ACTIVE, nanotime())
+            }
+        }
+        i = i + 1
+    }
+    return sent
+}
+
+// Read FED_STAT messages from every active soul until the deadline OR
+// each soul has sent at least one stat (the soul-side emit is one batch
+// of stats per round). For simplicity we ask each soul to emit ALL of
+// its stats followed by a NACK <round_id> sentinel; the coordinator
+// counts soul-side acks to know when this round's input is in.
+//
+// Returns the populated accumulator.
+fn _fed_collect_stats(souls, round_id) {
+    let acc = fed_acc_new(round_id)
+    let i = 0
+    while i < len(souls) {
+        let s = souls[i]
+        let fd = s[CSOUL_FD]
+        if fd >= 0 {
+            // Read up to N stat lines from this soul. The soul-side emit
+            // finishes with an ACK <round_id> sentinel so we can tell
+            // "this soul is done" without a time-based deadline (which
+            // is unreliable in the NOVA single-thread blocking-IO model).
+            let done = 0
+            let read_n = 0
+            while done == 0 {
+                let line = _recv_line(fd)
+                if line == 0 {
+                    // EOF / disconnect.
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                    done = 1
+                } else {
+                    let rec = _parse_line(line)
+                    if rec == 0 {
+                        // Parse error: unknown line. Best-effort skip.
+                        done = 1
+                    } else {
+                        let t = rec[KGSYNC_R_TYPE]
+                        if t == KGSYNC_EV_FED_STAT {
+                            let rid = rec[KGSYNC_FED_ROUND_ID]
+                            if rid == round_id {
+                                let tag = rec[KGSYNC_FED_TAG]
+                                let p = rec[KGSYNC_FED_PROMO]
+                                let a = rec[KGSYNC_FED_ATR]
+                                fed_acc_add_stat(acc, tag, p, a)
+                                read_n = read_n + 1
+                                println("fed-coord: STAT soul=" + s[CSOUL_ID]
+                                    + " round=" + int_to_str(round_id)
+                                    + " tag=" + tag
+                                    + " promo=" + int_to_str(p)
+                                    + " atr=" + int_to_str(a))
+                                list_set(s, CSOUL_ACTIVE, nanotime())
+                            }
+                        } else {
+                            if t == KGSYNC_EV_ACK {
+                                done = 1
+                            } else {
+                                if t == KGSYNC_EV_FED_LEAVE {
+                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
+                                    close_fd(fd)
+                                    list_set(s, CSOUL_FD, 0 - 1)
+                                    done = 1
+                                } else {
+                                    // Unknown / unexpected; consume and continue.
+                                    done = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println("fed-coord: soul=" + s[CSOUL_ID] + " emitted "
+                + int_to_str(read_n) + " stat(s)")
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+// Broadcast the FED_AGGREGATE lines for this round to every active soul.
+// Returns the number of aggregate lines sent across all souls.
+fn _fed_broadcast_aggregate(souls, round_id, averages) {
+    let sent = 0
+    let i = 0
+    while i < len(averages) {
+        let row = averages[i]
+        let tag = row[0]
+        let ap = row[1]
+        let aa = row[2]
+        let n = row[3]
+        let line = fed_format_aggregate_line(round_id, tag, ap, aa, n)
+        let j = 0
+        while j < len(souls) {
+            let s = souls[j]
+            let fd = s[CSOUL_FD]
+            if fd >= 0 {
+                if _send_all(fd, line) == 0 {
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                } else {
+                    sent = sent + 1
+                }
+            }
+            j = j + 1
+        }
+        println("fed-coord: AGGREGATE round=" + int_to_str(round_id)
+            + " tag=" + tag
+            + " avg_promo=" + int_to_str(ap)
+            + " avg_atr=" + int_to_str(aa)
+            + " n_part=" + int_to_str(n))
+        i = i + 1
+    }
+    return sent
+}
+
+// Send BYE to every active soul.
+fn _fed_close_all(souls) {
+    let i = 0
+    while i < len(souls) {
+        let s = souls[i]
+        let fd = s[CSOUL_FD]
+        if fd >= 0 {
+            _send_all(fd, KGSYNC_BYE_LINE + "\n")
+            close_fd(fd)
+            list_set(s, CSOUL_FD, 0 - 1)
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Read CE_FED_MAX_ROUNDS from env; 0 means unbounded.
+fn _fed_max_rounds() {
+    let env = getenv("CE_FED_MAX_ROUNDS")
+    if env != 0 {
+        if len(env) > 0 {
+            let v = _fed_str_to_int(env)
+            if v > 0 { return v }
+        }
+    }
+    return 0
+}
+
+// Read CE_FED_SOULS from env; default 1 (matches kgsync pattern).
+fn _fed_souls_env() {
+    let env = getenv("CE_FED_SOULS")
+    if env != 0 {
+        if len(env) > 0 {
+            let v = _fed_str_to_int(env)
+            if v > 0 { return v }
+        }
+    }
+    return 1
+}
+
+fn main() {
+    let port = fed_port_from_env()
+    let bind_ip = fed_bind_from_env()
+    let token = fed_token_from_env()
+    let n_souls = _fed_souls_env()
+    let max_rounds = _fed_max_rounds()
+    let round_interval = fed_round_interval_from_env()
+
+    println("fed-coord: starting on port " + int_to_str(port)
+        + " (bind " + bind_ip + ")"
+        + " expected-souls=" + int_to_str(n_souls)
+        + " auth=" + _auth_mode_str(token)
+        + " round-interval-ns=" + int_to_str(round_interval))
+
+    let server_fd = sync_pub_listen(port)
+    if server_fd < 0 {
+        println("fed-coord: ERROR cannot bind / listen on port "
+            + int_to_str(port))
+        exit(1)
+    }
+    println("fed-coord: listening, awaiting "
+        + int_to_str(n_souls) + " soul HELLO(s) ...")
+
+    let souls = _fed_accept_n(server_fd, n_souls, token)
+    if len(souls) < n_souls {
+        println("fed-coord: WARN only "
+            + int_to_str(len(souls)) + " of " + int_to_str(n_souls)
+            + " souls attached")
+    }
+    println("fed-coord: " + int_to_str(len(souls))
+        + " soul(s) attached, running federated rounds")
+
+    let round_id = 1
+    let rounds_done = 0
+    let go = 1
+    while go == 1 {
+        // Compute the deadline AS A LITERAL: nanotime is > 2^40 and we
+        // MUST NOT add to it (NOVA bug #5). The "deadline_ns" we wire is
+        // an INDEPENDENT integer offset that the soul will treat as a
+        // nominal field; the coordinator does not enforce it
+        // sub-second-ly (would require timer plumbing). We use a small
+        // literal so the wire-side serializer stays under 2^20.
+        let deadline_ns = CE_FED_DEFAULT_DEADLINE_NS
+        let active_count = 0
+        let ci = 0
+        while ci < len(souls) {
+            if souls[ci][CSOUL_FD] >= 0 { active_count = active_count + 1 }
+            ci = ci + 1
+        }
+        if active_count == 0 {
+            println("fed-coord: no active souls; exiting")
+            go = 0
+        } else {
+            println("fed-coord: opening round " + int_to_str(round_id)
+                + " with " + int_to_str(active_count) + " soul(s)")
+            let sent = _fed_broadcast_round(souls, round_id, deadline_ns)
+            if sent == 0 {
+                println("fed-coord: no souls received the round line; exiting")
+                go = 0
+            } else {
+                let acc = _fed_collect_stats(souls, round_id)
+                let averages = fed_acc_averages(acc)
+                if len(averages) == 0 {
+                    println("fed-coord: round " + int_to_str(round_id)
+                        + " produced no aggregates (no soul stats)")
+                } else {
+                    _fed_broadcast_aggregate(souls, round_id, averages)
+                }
+                rounds_done = rounds_done + 1
+                round_id = round_id + 1
+                if max_rounds > 0 {
+                    if rounds_done >= max_rounds {
+                        println("fed-coord: completed " + int_to_str(rounds_done)
+                            + " round(s); exiting (CE_FED_MAX_ROUNDS)")
+                        go = 0
+                    }
+                }
+            }
+        }
+    }
+
+    _fed_close_all(souls)
+    sync_close(server_fd)
+    println("fed-coord: closed (" + int_to_str(rounds_done) + " round(s) done)")
+}
+
+main()
