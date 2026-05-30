@@ -8,11 +8,17 @@
 //   and atom store underneath it. Each KG also exposes an embedding centroid,
 //   the mean of its atoms' embeddings, used for routing and spawn decisions.
 //
-//   Atoms are stored in a list indexed by atom_id (O(1) by handle); label
-//   lookup is a linear scan (a hash map would hit NOVA's 16-key builtin-map
-//   cap -- see NEXT_SESSION.md). KG eviction/rehydration to disk is part of the
-//   ADR-0048 persistence work (Phase 10) and is deliberately not implemented
-//   here.
+//   Atoms are stored in a list indexed by atom_id (O(1) by handle). Label
+//   lookup is O(1) amortized via a hand-rolled hash index (P2.4): each KG
+//   carries a `label_index` side-table of 256 buckets, where each bucket holds
+//   `[label_hash, atom_id]` pairs. `kg_find_atom` hashes the label, jumps to
+//   the bucket, and linear-walks the (small) bucket. Kind lookups are O(1)
+//   via a parallel `kind_index` keyed on ATOM_KIND_COUNT entries. Both
+//   indexes are transparent to callers: legacy snapshots that rehydrate
+//   without indexes fall back to the original linear scan, and snapshot
+//   apply paths call `kg_rebuild_index(kg)` to repopulate the index after
+//   replaying atoms. The hash bucket count + hash function live in
+//   atom_store.nova (`LABEL_BUCKETS`, `label_hash`).
 //
 // ADRs implemented: ADR-0004 (multi-KG organization), ADR-0016 (atoms live in
 //   KGs). Depends-on note: NOVA enhancement #8 (multi-KG namespacing) is the
@@ -29,7 +35,15 @@ let KG_NUMID  = 2   // registry-local numeric id
 let KG_ATOMS  = 3   // list indexed by atom_id -> atom
 let KG_NEXTID = 4
 let KG_ALIVE  = 5
+let KG_LABEL_IDX = 6   // P2.4: hash index, list of LABEL_BUCKETS buckets;
+                       // bucket = list of [label_hash, atom_id] pairs.
+let KG_KIND_IDX  = 7   // P2.4: kind index, list of ATOM_KIND_COUNT lists of
+                       // atom_ids. Slot 0 is unused (kinds start at 1).
 let KG_OBJ_TAG = 1701
+
+// ATOM_RULE is the highest kind code (= 6); add one for slot-0 padding so the
+// kind_index can be indexed directly by kind without subtracting.
+let ATOM_KIND_COUNT = 7
 
 // ---- registry layout ------------------------------------------------------
 let KREG_TAG  = 0
@@ -45,6 +59,28 @@ fn kg_registry_new() {
     return reg
 }
 
+// Allocate a fresh empty hash index: LABEL_BUCKETS empty buckets.
+fn _new_label_index() {
+    let buckets = list_new()
+    let i = 0
+    while i < LABEL_BUCKETS {
+        push(buckets, list_new())
+        i = i + 1
+    }
+    return buckets
+}
+
+// Allocate a fresh empty kind index: ATOM_KIND_COUNT empty atom-id lists.
+fn _new_kind_index() {
+    let kinds = list_new()
+    let i = 0
+    while i < ATOM_KIND_COUNT {
+        push(kinds, list_new())
+        i = i + 1
+    }
+    return kinds
+}
+
 fn _kg_build(label, num_id) {
     let kg = list_new()
     push(kg, KG_OBJ_TAG)
@@ -53,7 +89,24 @@ fn _kg_build(label, num_id) {
     push(kg, list_new())
     push(kg, 0)
     push(kg, 1)
+    push(kg, _new_label_index())   // KG_LABEL_IDX
+    push(kg, _new_kind_index())    // KG_KIND_IDX
     return kg
+}
+
+// Does this KG carry the P2.4 hash index? Old snapshots rehydrated before the
+// indexes existed will be short (len <= KG_ALIVE+1) -- callers then fall back
+// to linear scans.
+fn _kg_has_index(kg) {
+    if len(kg) <= KG_LABEL_IDX { return 0 }
+    if kg[KG_LABEL_IDX] == 0 { return 0 }
+    return 1
+}
+
+fn _kg_has_kind_index(kg) {
+    if len(kg) <= KG_KIND_IDX { return 0 }
+    if kg[KG_KIND_IDX] == 0 { return 0 }
+    return 1
 }
 
 // Find a KG by label (linear scan); returns the KG object or 0.
@@ -93,13 +146,100 @@ fn kg_is_alive(kg) { return kg[KG_ALIVE] }
 fn kg_atom_count(kg) { return len(kg[KG_ATOMS]) }
 fn kg_atoms(kg)    { return kg[KG_ATOMS] }
 
+// Append (label_hash, atom_id) to the bucket selected by `label`. Idempotent
+// for the same (hash, id) pair, so re-indexing the same atom is a no-op.
+fn _idx_label_add(kg, label, atom_id) {
+    if _kg_has_index(kg) == 0 { return 0 }
+    let h = label_hash(label)
+    let bucket = kg[KG_LABEL_IDX][h & LABEL_BUCKETS_MASK]
+    let i = 0
+    while i < len(bucket) {
+        if bucket[i][0] == h {
+            if bucket[i][1] == atom_id { return 1 }
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, h)
+    push(entry, atom_id)
+    push(bucket, entry)
+    return 1
+}
+
+// Remove (label_hash, atom_id) from the bucket. Rebuilds the bucket without
+// the matching entry (no `pop` builtin); cheap because bucket size is small.
+fn _idx_label_remove(kg, label, atom_id) {
+    if _kg_has_index(kg) == 0 { return 0 }
+    let h = label_hash(label)
+    let buckets = kg[KG_LABEL_IDX]
+    let bidx = h & LABEL_BUCKETS_MASK
+    let bucket = buckets[bidx]
+    let kept = list_new()
+    let i = 0
+    let removed = 0
+    while i < len(bucket) {
+        let keep = 1
+        if bucket[i][0] == h {
+            if bucket[i][1] == atom_id {
+                keep = 0
+                removed = 1
+            }
+        }
+        if keep == 1 { push(kept, bucket[i]) }
+        i = i + 1
+    }
+    list_set(buckets, bidx, kept)
+    return removed
+}
+
+// Append atom_id to the kind bucket; idempotent.
+fn _idx_kind_add(kg, kind, atom_id) {
+    if _kg_has_kind_index(kg) == 0 { return 0 }
+    if kind < 0 { return 0 }
+    if kind >= ATOM_KIND_COUNT { return 0 }
+    let bucket = kg[KG_KIND_IDX][kind]
+    let i = 0
+    while i < len(bucket) {
+        if bucket[i] == atom_id { return 1 }
+        i = i + 1
+    }
+    push(bucket, atom_id)
+    return 1
+}
+
+// Remove atom_id from the kind bucket; rebuilds the bucket without it.
+fn _idx_kind_remove(kg, kind, atom_id) {
+    if _kg_has_kind_index(kg) == 0 { return 0 }
+    if kind < 0 { return 0 }
+    if kind >= ATOM_KIND_COUNT { return 0 }
+    let kinds = kg[KG_KIND_IDX]
+    let bucket = kinds[kind]
+    let kept = list_new()
+    let i = 0
+    let removed = 0
+    while i < len(bucket) {
+        if bucket[i] == atom_id {
+            removed = 1
+        } else {
+            push(kept, bucket[i])
+        }
+        i = i + 1
+    }
+    list_set(kinds, kind, kept)
+    return removed
+}
+
 // Create and store a new atom in the KG; assigns the next atom id. Returns the
-// atom. Identity (kg label, atom id) is stable for the atom's lifetime.
+// atom. Identity (kg label, atom id) is stable for the atom's lifetime. The
+// P2.4 label + kind indexes are updated transparently so callers don't need to
+// know they exist.
 fn kg_add_atom(kg, kind, label, moment) {
     let id = kg[KG_NEXTID]
     let a = atom_new(kg[KG_LABEL], id, kind, label, moment)
     push(kg[KG_ATOMS], a)
     list_set(kg, KG_NEXTID, id + 1)
+    _idx_label_add(kg, label, id)
+    _idx_kind_add(kg, kind, id)
     return a
 }
 
@@ -111,15 +251,112 @@ fn kg_atom(kg, atom_id) {
     return atoms[atom_id]
 }
 
-// First atom with the given label (linear scan); 0 if none.
+// First atom with the given label; 0 if none. P2.4: O(1) amortized via the
+// label hash index. Falls back to a linear scan if the KG has no index (e.g.
+// a legacy snapshot rehydrated before this change).
 fn kg_find_atom(kg, label) {
     let atoms = kg[KG_ATOMS]
+    if _kg_has_index(kg) == 1 {
+        let h = label_hash(label)
+        let bucket = kg[KG_LABEL_IDX][h & LABEL_BUCKETS_MASK]
+        let i = 0
+        while i < len(bucket) {
+            if bucket[i][0] == h {
+                let aid = bucket[i][1]
+                if aid >= 0 {
+                    if aid < len(atoms) {
+                        let a = atoms[aid]
+                        if str_eq(atom_label(a), label) == 1 { return a }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        // Hash-clean miss is a real miss; no need to fall through to the
+        // linear scan path here. (Index integrity is maintained by
+        // kg_add_atom / kg_remove_atom / kg_rebuild_index.)
+        return 0
+    }
+    // Backwards-compat: no index installed yet -- fall back to linear scan.
     let i = 0
     while i < len(atoms) {
         if str_eq(atom_label(atoms[i]), label) == 1 { return atoms[i] }
         i = i + 1
     }
     return 0
+}
+
+// All atom ids in `kg` of the given kind. P2.4: O(1) via the kind index.
+// Returns a fresh list of atom_ids (never the bucket itself; callers may
+// mutate it freely). Falls back to a linear scan over kg_atoms when the
+// index is absent.
+fn kg_atoms_by_kind(kg, kind) {
+    let out = list_new()
+    if _kg_has_kind_index(kg) == 1 {
+        if kind < 0 { return out }
+        if kind >= ATOM_KIND_COUNT { return out }
+        let bucket = kg[KG_KIND_IDX][kind]
+        let i = 0
+        while i < len(bucket) {
+            push(out, bucket[i])
+            i = i + 1
+        }
+        return out
+    }
+    let atoms = kg[KG_ATOMS]
+    let i = 0
+    while i < len(atoms) {
+        if atom_kind(atoms[i]) == kind {
+            push(out, atom_id(atoms[i]))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Remove the index entry for an atom (P2.4 hook for atom_death_monitor's
+// tombstone path). The atom slot in `kg_atoms` is left in place so existing
+// (kg, atom_id) handles + iteration callers stay valid -- only the label +
+// kind indexes are updated to forget the atom. After this call,
+// `kg_find_atom(kg, label)` will return 0 for the dead atom (a hash miss in
+// the bucket), but `kg_atom(kg, atom_id)` still returns the atom object so
+// callers that still hold a handle can observe the tombstone via
+// `adm_is_dead`/`adm_is_tombstoned`. Returns 1 if the atom existed, 0 if
+// out of range.
+fn kg_remove_atom(kg, atom_id) {
+    let atoms = kg[KG_ATOMS]
+    if atom_id < 0 { return 0 }
+    if atom_id >= len(atoms) { return 0 }
+    let a = atoms[atom_id]
+    if a == 0 { return 0 }
+    _idx_label_remove(kg, atom_label(a), atom_id)
+    _idx_kind_remove(kg, atom_kind(a), atom_id)
+    return 1
+}
+
+// Rebuild the label + kind indexes from scratch by walking every atom in
+// kg_atoms. Snapshot rehydration calls this after `kg_section_apply` so the
+// restored atoms are addressable by the hash path on the first lookup. Also
+// the recovery path for a KG whose indexes got out of sync.
+fn kg_rebuild_index(kg) {
+    // Auto-grow: a legacy KG (built before P2.4) may not have the index slots.
+    // Extend the list to install them in place.
+    while len(kg) <= KG_LABEL_IDX { push(kg, 0) }
+    while len(kg) <= KG_KIND_IDX  { push(kg, 0) }
+    list_set(kg, KG_LABEL_IDX, _new_label_index())
+    list_set(kg, KG_KIND_IDX,  _new_kind_index())
+    let atoms = kg[KG_ATOMS]
+    let n = len(atoms)
+    let i = 0
+    while i < n {
+        let a = atoms[i]
+        if a != 0 {
+            _idx_label_add(kg, atom_label(a), atom_id(a))
+            _idx_kind_add(kg, atom_kind(a), atom_id(a))
+        }
+        i = i + 1
+    }
+    return n
 }
 
 // The KG's embedding centroid: the per-dimension mean of its atoms' embeddings.

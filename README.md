@@ -33,7 +33,7 @@ computational units rather than orchestrating a pipeline of modules.
 > +4 suites / +73 assertions from `test_pack_registry.nova` +
 > `test_medical_pack.nova` + `test_ops_pack.nova` +
 > `test_code_review_pack.nova` added in P1.9 domain seed packs),
-> 18 end-to-end integration
+> 19 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -42,7 +42,9 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `scenario_j_http_client.sh` added in P1.4 plain-HTTP loopback
 > against `python3 -m http.server`,
 > +1 from `scenario_k_seed_pack.sh` added in P1.9 `/seed` domain pack
-> install + listing),
+> install + listing,
+> +1 from `scenario_m_metrics_endpoint.sh` added in P2.9 Prometheus
+> text-format `/metrics` scrape endpoint over `scripts/web.py`),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence
