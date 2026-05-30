@@ -25,7 +25,7 @@ CHAT="$REPO_ROOT/bin/crossengin-chat"
 DAEMON="$REPO_ROOT/bin/crossengin"
 WEB_PY="$REPO_ROOT/scripts/web.py"
 LEARN_SH="$REPO_ROOT/scripts/learn.sh"
-SNAP="${CE_SNAP_PATH:-/tmp/crossengin.snap}"
+SNAP="${CE_SNAP_PATH:-/tmp/crossengin.default.snap}"
 
 # ANSI colour helpers (only when stdout is a tty).
 if [ -t 1 ]; then
@@ -95,9 +95,12 @@ run_chat() {
     fi
     # Wipe the default dlog so /history before any decision sees an empty
     # log. A test that wants to test rehydrate sets CE_DLOG_PATH explicitly
-    # and is responsible for its own cleanup.
+    # and is responsible for its own cleanup. P1.2 moved the default
+    # location to /tmp/crossengin.default.dlog (per-session derivation with
+    # session_id="default"); the legacy /tmp/crossengin.dlog path is also
+    # wiped here so a stale pre-P1.2 file doesn't leak across runs.
     if [ -z "${CE_DLOG_PATH:-}" ]; then
-        rm -f /tmp/crossengin.dlog
+        rm -f /tmp/crossengin.default.dlog /tmp/crossengin.dlog
     fi
     printf '%s\n' "$input" | "$CHAT" 2>&1
 }

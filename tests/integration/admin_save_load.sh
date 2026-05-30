@@ -6,20 +6,24 @@ require_chat
 
 PASS=0; FAIL=0
 
-SNAP_DEFAULT="/tmp/crossengin.snap"
+SNAP_DEFAULT="/tmp/crossengin.default.snap"
 SNAP_EXPLICIT="/tmp/ce_int_admin_save.snap"
 SNAP_BADDIR="/this_dir_does_not_exist_xyz/snap.snap"
 CORRUPT="/tmp/ce_int_corrupt.snap"
 
-trap 'rm -f "$SNAP_EXPLICIT" "$SNAP_EXPLICIT.tmp" "$CORRUPT"' EXIT
-rm -f "$SNAP_EXPLICIT" "$SNAP_EXPLICIT.tmp" "$CORRUPT"
+trap 'rm -f "$SNAP_DEFAULT" "$SNAP_EXPLICIT" "$SNAP_EXPLICIT.tmp" "$CORRUPT"' EXIT
+rm -f "$SNAP_DEFAULT" "$SNAP_EXPLICIT" "$SNAP_EXPLICIT.tmp" "$CORRUPT"
 
 # -------------------- /save --------------------
 it_section "admin: /save"
 
-# Default path: no arg.
+# Default path: no arg. P1.2 changed the default from /tmp/crossengin.snap to
+# a per-session-derived path /tmp/crossengin.<session_id>.snap. The default
+# session id is "default", so /save with no arg + no env override resolves
+# to /tmp/crossengin.default.snap.
 OUT=$(run_chat '/save')
-assert_match "$OUT" "saved soul=.*-> /tmp/crossengin.snap durably" "/save with no path uses default"
+assert_match "$OUT" "saved soul=.*-> /tmp/crossengin.default.snap durably" \
+    "/save with no path uses per-session default"
 assert_file_exists "$SNAP_DEFAULT" "default snapshot file exists"
 
 # Explicit path.
