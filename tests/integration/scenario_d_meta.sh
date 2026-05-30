@@ -20,7 +20,7 @@ OUT=$(run_chat '/teach widget
 assert_match "$OUT" "source +atoms +tentative +durable +promotion%" "meta header shows expected columns"
 
 # Seed row present.
-assert_match "$OUT" "  seed +572" "seed source row appears with 572 atoms"
+assert_match "$OUT" "  seed +584" "seed source row appears with 572 atoms"
 
 # user-teach row with 2 atoms, both durable, 100% promotion.
 # user-teach atoms ingested by au_ingest with Beta(4,1) get confidence

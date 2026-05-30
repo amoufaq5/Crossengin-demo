@@ -72,7 +72,7 @@ it_section "admin: /meta"
 
 OUT=$(run_chat '/meta')
 assert_match "$OUT" "meta-observer status" "/meta prints status header"
-assert_match "$OUT" "  seed +572" "/meta shows the seed source row at boot"
+assert_match "$OUT" "  seed +584" "/meta shows the seed source row at boot"
 assert_match "$OUT" "poll\\(s\\) total" "/meta shows the poll count footer"
 
 summary "admin_learn_meta"

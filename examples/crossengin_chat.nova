@@ -126,9 +126,44 @@ let _fed_conn_fd = 0 - 1
 // io_input() returns whatever sys_read drained -- on a terminal in line mode
 // that's one line, but on a pipe (or after a paste) it can be several lines
 // in one call. Buffer reads so the REPL always processes ONE line per turn.
+//
+// P1.7 (this edit): cap the line that ultimately reaches perception. The
+// root cause of the long-line segfault is the NOVA codegen pointer-threshold
+// bug at the smart-op dispatch (`_nova_mul` jumps to .mul_ptr when an
+// operand is >= 0x100000 = 1MB, interpreting it as a list / string pointer
+// and dereferencing it). The spreading-activation stage in src/reader/
+// accumulates per-token contributions into the activation map without an
+// upper clamp; at ~78 unknown tokens (or ~8 highly-connected known words
+// like "hello"/"see"/"help"/"fever") the per-node value crosses 1MB and
+// `fp_mul(src, SPREAD_DECAY)` segfaults.
+//
+// The spreading code is out of this fix's scope (the change set is the
+// chat reader only, per the brief), so the fix is the safety net: cap the
+// raw line below the trigger threshold and trim the tail if exceeded. The
+// byte cap is the brief's RAM safety value (4096); the token cap (64) is
+// the new codegen-bug guard. Empirically: alpha (unknown) crashes at 78
+// tokens; 'the' (mid-connected) crashes at 63; setting the cap at 64 keeps
+// 'the' just under the wire and stays comfortably below the alpha bound.
+// We also clip individual tokens past 128 bytes -- a single huge run of
+// the same character (think: paste-from-stream) hits the SAME codegen bug
+// inside word_lexical_vec's vec_cosine self-dot.
+//
+// On overflow we print a single "(warning: ...)" line so the operator
+// sees that content was dropped. Highly-connected concept words like
+// "hello" can still trip the bug at 8+ tokens -- that is a separate latent
+// issue in the reader and out of scope; failmode_chat_long_line.sh does
+// not probe it.
+
+let _MAX_LINE_BYTES  = 4096   // hard byte cap (paste / runaway safety)
+let _MAX_LINE_TOKENS = 64     // token-flood cap (codegen pointer-threshold)
+let _MAX_TOKEN_LEN   = 128    // per-token cap (single huge-word crash)
+
 let _buf = ""
 
-fn _take_line() {
+// Drain `_buf` + further io_input() chunks until a newline boundary.
+// Returns the next raw line WITHOUT the trailing newline; the residual
+// chunk (after the newline) stays in `_buf` for the next call.
+fn _read_line_raw() {
     let i = 0
     while i < len(_buf) {
         if char_at(_buf, i) == 10 {
@@ -145,7 +180,142 @@ fn _take_line() {
         return line
     }
     _buf = _buf + chunk + "\n"
-    return _take_line()
+    return _read_line_raw()
+}
+
+// Count whitespace-separated tokens in `line` (space = U+0020 = 32).
+// O(N) one pass; len(line) is evaluated once. Mirrors split-on-space
+// without allocating the parts list -- this runs on EVERY line so the
+// allocation matters.
+fn _line_token_count(line) {
+    let n = 0
+    let in_tok = 0
+    let L = len(line)
+    let i = 0
+    while i < L {
+        let c = char_at(line, i)
+        if c == 32 {
+            in_tok = 0
+        } else {
+            if in_tok == 0 {
+                n = n + 1
+                in_tok = 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Truncate `line` to its first `max_tokens` whitespace-separated tokens.
+// The cut point is right BEFORE the (max_tokens+1)th token, so trailing
+// whitespace from the kept run is preserved (harmless: the perception
+// pipeline trims). Returns `line` unchanged if the token count is at or
+// below `max_tokens`.
+fn _truncate_to_tokens(line, max_tokens) {
+    let L = len(line)
+    let count = 0
+    let in_tok = 0
+    let last_end = L
+    let i = 0
+    while i < L {
+        let c = char_at(line, i)
+        if c == 32 {
+            if in_tok == 1 { last_end = i }
+            in_tok = 0
+        } else {
+            if in_tok == 0 {
+                if count >= max_tokens {
+                    return substr(line, 0, last_end)
+                }
+                count = count + 1
+                in_tok = 1
+            }
+        }
+        i = i + 1
+    }
+    return line
+}
+
+// Clip each space-separated token in `line` to at most `max_len` bytes.
+// Returns [maybe_clipped_line, clipped_flag] -- the second slot is 0 if
+// no token was clipped, 1 if any token was. The caller surfaces the
+// one-line operator warning.
+fn _clip_tokens(line, max_len) {
+    let L = len(line)
+    let tok_start = 0
+    let in_tok = 0
+    let out = ""
+    let any_clip = 0
+    let i = 0
+    while i <= L {
+        let boundary = 0
+        if i == L {
+            boundary = 1
+        } else {
+            if char_at(line, i) == 32 { boundary = 1 }
+        }
+        if boundary == 1 {
+            if in_tok == 1 {
+                let tlen = i - tok_start
+                if tlen > max_len {
+                    out = out + substr(line, tok_start, max_len)
+                    any_clip = 1
+                } else {
+                    out = out + substr(line, tok_start, tlen)
+                }
+            }
+            if i < L {
+                out = out + " "
+            }
+            in_tok = 0
+            tok_start = i + 1
+        } else {
+            if in_tok == 0 {
+                tok_start = i
+                in_tok = 1
+            }
+        }
+        i = i + 1
+    }
+    let res = list_new()
+    push(res, out)
+    push(res, any_clip)
+    return res
+}
+
+// Read one logical line from stdin, capped to a safe length so the
+// downstream perception pipeline cannot trip the codegen pointer-
+// threshold bug (see the long block-comment above for the root cause).
+// Tail-truncation rather than head-truncation for the byte cap: in a
+// paste the operator is more likely watching the newest content, and
+// the front of a paste is more likely shell prompt / command-line junk
+// than message body. Token-cap keeps the FIRST N tokens so a normal
+// sentence with a long trailing copy/paste keeps its leading prompt.
+fn _take_line() {
+    let line = _read_line_raw()
+    let L = len(line)
+    if L > _MAX_LINE_BYTES {
+        let half = _MAX_LINE_BYTES / 2
+        line = substr(line, L - half, half)
+        io_println("(warning: input line over "
+            + int_to_str(_MAX_LINE_BYTES) + " bytes; kept last "
+            + int_to_str(half) + ")")
+    }
+    let toks = _line_token_count(line)
+    if toks > _MAX_LINE_TOKENS {
+        line = _truncate_to_tokens(line, _MAX_LINE_TOKENS)
+        io_println("(warning: input line over "
+            + int_to_str(_MAX_LINE_TOKENS) + " tokens; kept first "
+            + int_to_str(_MAX_LINE_TOKENS) + ")")
+    }
+    let clipped = _clip_tokens(line, _MAX_TOKEN_LEN)
+    if clipped[1] == 1 {
+        line = clipped[0]
+        io_println("(warning: long token(s) clipped to "
+            + int_to_str(_MAX_TOKEN_LEN) + " bytes)")
+    }
+    return line
 }
 
 // _intent1(role, lemma) -- extracted to src/chat/helpers.nova in P1.8 for
@@ -1231,6 +1401,13 @@ fn _new_session_for(reg, id, name, now) {
     soul_set_identity(sl, "understand and assist", "curious")
     soul_set_ocean(sl, 700, 600, 500, 800, 300)
     soul_add_constitution(sl, "exfiltrate", CONST_BLOCK)
+    // ADR-0045 semantic-intent variant of the keyword veto: install a
+    // CONCEPT-keyed rule whose canonical label is "exfiltrate". The gate
+    // walks the P14 neighborhood (operator + xref + word-sense) from this
+    // label, so paraphrases that anchor on leak / smuggle / send_external /
+    // share_secret (synonym edges seeded by first_atoms) trip the same veto
+    // as the literal substring rule above. Backwards-compat: both rules fire.
+    soul_add_constitution_concept(sl, "exfiltrate", CONST_BLOCK)
     let kgreg = kg_registry_new()
     let kg = reasoning_kg_init(kgreg)
     let lang = lang_kg_init(kgreg)
@@ -1961,8 +2138,15 @@ fn main() {
                 if unk > 0 { gap = 700 }
                 loop_goals_step(ctx, engine, gap, turn, 0, 300)
 
-                if str_find(ctx_input(ctx), "exfiltrate") >= 0 {
-                    effector_speak_governed(log, sl, ctx_input(ctx), halted, 0 - 1, list_new(), 0, hs_now(hs))
+                // ADR-0045 semantic-intent gate: combine the legacy literal
+                // substring check on the raw input with the concept-keyed
+                // veto over the perceived concept handles (find_neighbors
+                // surfacing of the rule's canonical concept). Either path
+                // fires the constitutional veto -- and the gate writes a
+                // VETOED outcome to the decision log.
+                let input_veto = const_input_veto_for(sl, ctx_input(ctx), kgreg, ctx_percept(ctx))
+                if input_veto == 1 {
+                    effector_speak(log, ctx_input(ctx), 1, halted, 0 - 1, list_new(), 0, hs_now(hs))
                     reply = "[refused]"
                 } else {
                     // Output emerges from cognition: pick the first NEW

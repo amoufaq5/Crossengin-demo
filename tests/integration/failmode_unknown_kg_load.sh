@@ -2,15 +2,16 @@
 # Failure mode -- /load on a snapshot containing a kgs.atoms[N].kg label that
 # the running daemon does not know.
 #
-# Current behavior (per src/persistence/snapshot_disk.nova: kg_section_apply):
-#   `kg_spawn(kg_reg, kg_lbl)` is idempotent -- it auto-creates a NEW KG with
-#   the unknown label if one doesn't exist, then installs the atom there.
-#   This means an unknown kg label is silently accepted; the atom lands in a
-#   new auto-spawned KG; the /load reports success and `new_atoms=1` (or
-#   whatever the count is).
+# Fixed behavior (per src/persistence/snapshot_disk.nova: kg_section_apply,
+# after the bug-fix sprint):
+#   kg_section_apply validates each atom's kg label against the known-KG set
+#   (reasoning / language / imagination / world). Unknown labels trigger a
+#   "snapshot atom #N has unknown kg 'X' -- skipped" warning and the atom
+#   is silently dropped instead of being installed into an auto-spawned KG.
+#   This blocks a malicious snapshot from creating arbitrary KGs.
 #
-# This test asserts that current behavior. If the policy ever changes to
-# "skip unknown KGs with a warning" or "error out", this test must be updated.
+# Previously (KNOWN-broken state pinned by P1.7): kg_spawn was idempotent on
+# label so unknown labels silently auto-created new KGs.
 
 . "$(dirname "$0")/_lib.sh"
 require_chat
@@ -39,20 +40,13 @@ assert_eq "$HACK_LINES" "1" "hack: atoms[0].kg rewritten to 'unknownkg' once"
 # --- Step 3: load it and observe the behavior. ----------------------------
 OUT_LOAD=$(printf '/load %s\n/status\n/quit\n' "$HACKED_SNAP" | "$CHAT" 2>&1)
 
-# CURRENT BEHAVIOR: the load succeeds; the unknown kg label is treated as a
-# new KG to auto-spawn (kg_spawn is idempotent on label). The integration
-# point is `kg_section_apply` in src/persistence/snapshot_disk.nova.
-assert_match "$OUT_LOAD" "loaded $HACKED_SNAP" "/load on unknown-KG snapshot succeeds (current behavior)"
-# `new_atoms=` will be at least 1 because the unknown-KG atom is new (no
-# existing same-label atom in a same-named KG).
-assert_match "$OUT_LOAD" "new_atoms=[1-9][0-9]*" "/load reports >=1 new atoms (unknown-kg atom was created)"
+# FIXED BEHAVIOR: the load still succeeds (the other 1136 atoms install
+# fine), but the unknown-kg atom is SKIPPED with a warning. new_atoms is 0
+# because the malicious unknown-kg atom did NOT create an auto-spawned KG.
+assert_match "$OUT_LOAD" "loaded $HACKED_SNAP" "/load on unknown-KG snapshot succeeds (skip-with-warning)"
+assert_match "$OUT_LOAD" "warning: snapshot atom #[0-9]+ has unknown kg 'unknownkg' -- skipped" "warning identifies the skipped atom + unknown kg label"
+assert_match "$OUT_LOAD" "new_atoms=0" "/load reports new_atoms=0 (unknown-kg atom rejected, not auto-spawned)"
 # /status must still work.
 assert_match "$OUT_LOAD" "soul +: Aurora" "/status still reports Aurora after the load"
-
-# KNOWN: kg_section_apply (snapshot_disk.nova) does kg_spawn on any label it
-# sees -- there is no warning for "unrecognized kg label" today. If the
-# policy ever grows a skip-with-warning behavior, the assertions above need
-# to flip (`load FAILED`/`warning skipping kg=`/etc) and the test must be
-# updated. Documenting present behavior, not blessing it as right.
 
 summary "failmode_unknown_kg_load"

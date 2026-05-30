@@ -33,12 +33,12 @@ OUT=$(run_chat '/teach widget
 /teach widget
 /status')
 # Two "(ingested 'widget' ...)" lines should appear, and the final atom
-# count should be exactly one more than the seed (572). The second call is
+# count should be exactly one more than the seed (584). The second call is
 # a no-op at the KG level.
 COUNT_LINES=$(echo "$OUT" | grep -c "ingested 'widget'")
 assert_eq "$COUNT_LINES" "2" "/teach prints ingestion line both times"
 FINAL=$(echo "$OUT" | grep "knowledge:" | grep -oE '[0-9]+' | head -1)
-assert_eq "$FINAL" "573" "/teach W twice yields exactly one new atom (no double-count)"
+assert_eq "$FINAL" "585" "/teach W twice yields exactly one new atom (no double-count)"
 
 # -------------------- /pin --------------------
 it_section "admin: /pin"

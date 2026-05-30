@@ -156,6 +156,7 @@
 //   src/kg/atom_store.nova (KG/atom walk + create).
 
 import "std/syscall"
+import "std/io"
 import "snapshot_reader.nova"
 import "snapshot_compaction.nova"
 import "../parts/soul/constitution.nova"
@@ -360,22 +361,39 @@ fn kg_section_serialize(blob) {
 // loading the snapshot, so the snapshot's "self" atom merges with the seed's
 // rather than orthogonally re-creating it).
 //
-// The KG registry is auto-grown: an atom's `kg` field names its owning KG by
-// label, and we `kg_spawn` if it doesn't exist yet (idempotent).
+// Bug 1 (unknown-KG) policy: SKIP-WITH-WARNING.
+//   `kg_spawn` is idempotent on label and silently creates a NEW KG for any
+//   label a hand-rewritten snapshot might name -- so a malicious snapshot
+//   could ask the running daemon to spin up arbitrary KG namespaces and
+//   land atoms in them, undetected. We harden this by validating each
+//   atom's `kg` field against the registry's known labels (populated at
+//   boot by *_kg_init); an unknown label is SKIPPED with a one-line stdout
+//   warning naming the atom index and the label. The remaining atoms in
+//   the snapshot still install (friendlier for forward-compat: a snapshot
+//   from a future build that mentions a new KG can rehydrate the parts an
+//   older build still recognizes, instead of failing the whole /load).
+//   The warning text format is:
+//     `(warning: snapshot atom #N has unknown kg 'X' -- skipped)`
+//   The chat's _admin_load wrapper does not need to change -- the warning
+//   travels on stdout alongside the apply's existing `applied=N new_atoms=K`
+//   summary line.
 //
 // LANG atoms (kind == ATOM_LANG) get the lexical fixture re-installed: the
 // `ltype = LWORD` payload and the deterministic character-vector embedding,
 // so `word_find` recognizes them and `is_word_atom` returns 1. We also walk
 // every OTHER KG in the registry looking for a same-labeled concept atom and
 // attach a sense xref from the word -> concept (the binding the reader needs
-// to anchor a token and route activation to its concept).
+// to anchor a token and route activation to its concept). The sense restore
+// is IDEMPOTENT (see _restore_word_senses) -- replaying the same snapshot
+// must never grow the xref count, which is the Bug 2 ping-pong-drift fix.
 //
 // Returns the number of new atoms created (0 if every atom merged into an
-// existing entry).
+// existing entry; skipped unknown-KG atoms are NOT counted as created).
 fn kg_section_apply(kg_reg, blob, moment) {
     if len(blob) < 2 { return 0 }
     let recs = blob[1]
     let created = 0
+    let skipped = 0
     let i = 0
     while i < len(recs) {
         let r = recs[i]
@@ -384,23 +402,31 @@ fn kg_section_apply(kg_reg, blob, moment) {
         let label  = r[3]
         let alpha  = r[4]
         let beta   = r[5]
-        let target = kg_spawn(kg_reg, kg_lbl)
-        let existing = kg_find_atom(target, label)
-        let a = existing
-        if existing == 0 {
-            a = kg_add_atom(target, kind, label, moment)
-            created = created + 1
-        }
-        let b = atom_belief(a)
-        list_set(b, 0, alpha)
-        list_set(b, 1, beta)
-        if kind == ATOM_LANG {
-            // Re-install the lexical fixture so the reader recognizes the
-            // word: ltype = LWORD, char-vector embedding, and a sense xref to
-            // any same-labeled concept atom in a sibling KG of the registry.
-            atom_payload_set(a, "ltype", LWORD)
-            atom_set_embed(a, word_lexical_vec(label))
-            _restore_word_senses(kg_reg, a, label, kg_lbl)
+        // Bug 1 guard: refuse to auto-spawn KGs the running daemon does not
+        // know. Skip the atom with a stdout warning and continue.
+        if kgreg_has_label(kg_reg, kg_lbl) == 0 {
+            io_println("(warning: snapshot atom #" + int_to_str(i)
+                + " has unknown kg '" + kg_lbl + "' -- skipped)")
+            skipped = skipped + 1
+        } else {
+            let target = kg_spawn(kg_reg, kg_lbl)
+            let existing = kg_find_atom(target, label)
+            let a = existing
+            if existing == 0 {
+                a = kg_add_atom(target, kind, label, moment)
+                created = created + 1
+            }
+            let b = atom_belief(a)
+            list_set(b, 0, alpha)
+            list_set(b, 1, beta)
+            if kind == ATOM_LANG {
+                // Re-install the lexical fixture so the reader recognizes the
+                // word: ltype = LWORD, char-vector embedding, and a sense xref to
+                // any same-labeled concept atom in a sibling KG of the registry.
+                atom_payload_set(a, "ltype", LWORD)
+                atom_set_embed(a, word_lexical_vec(label))
+                _restore_word_senses(kg_reg, a, label, kg_lbl)
+            }
         }
         i = i + 1
     }
@@ -425,19 +451,50 @@ fn kg_section_apply(kg_reg, blob, moment) {
 }
 
 // Walk every NON-language KG in the registry; for any atom whose label
-// matches `form`, add a weighted sense xref from `word` to it (idempotent:
-// re-applying a snapshot does not pile up duplicate senses because we check
-// for an existing edge to the same destination).
+// matches `form`, add a weighted sense xref from `word` to it.
+//
+// Bug 2 (idempotence): re-applying the same snapshot must NOT grow the
+// word's xref count. A /save + /load ping-pong in a single chat session
+// previously could drift the knowledge count by +1 because this routine
+// re-added sense xrefs on every replay -- if a candidate concept matched
+// by label but lived in a different KG slot than the original sense, the
+// (dst_kg, dst_atom) tuple did not match and a duplicate xref slipped in.
+// The current guards make the routine bit-for-bit idempotent:
+//
+//   1. Skip the word's own language KG (lang_label match) -- a sense from
+//      a word into itself in the same KG is never wanted.
+//   2. Skip a matched candidate that IS the word atom itself (atom_kg
+//      string + atom_id match) -- defends against a hypothetical second
+//      language KG holding a same-labeled word.
+//   3. Skip ATOM_LANG candidates -- senses must point at concept/fact/
+//      skill atoms in domain KGs, never at other words.
+//   4. _has_sense_to de-dupes by (dst_kg, dst_atom_id), so the add path is
+//      a no-op when the edge is already present.
 fn _restore_word_senses(kg_reg, word, form, lang_label) {
     let kgs = kg_reg[KREG_KGS]
+    let word_kg = atom_kg(word)
+    let word_id = atom_id(word)
     let i = 0
     while i < len(kgs) {
         let k = kgs[i]
+        // Guard (1): never link a word into its own language KG.
         if str_eq(kg_label(k), lang_label) == 0 {
             let concept = kg_find_atom(k, form)
             if concept != 0 {
-                if _has_sense_to(word, atom_kg(concept), atom_id(concept)) == 0 {
-                    word_add_sense(word, concept, 900)
+                // Guard (2): never link a word to itself (a defense for a
+                // second language KG holding the same form).
+                let same_atom = 0
+                if str_eq(atom_kg(concept), word_kg) == 1 {
+                    if atom_id(concept) == word_id { same_atom = 1 }
+                }
+                if same_atom == 0 {
+                    // Guard (3): never link to another ATOM_LANG.
+                    if atom_kind(concept) != ATOM_LANG {
+                        // Guard (4): de-dupe on existing xref to the same dst.
+                        if _has_sense_to(word, atom_kg(concept), atom_id(concept)) == 0 {
+                            word_add_sense(word, concept, 900)
+                        }
+                    }
                 }
             }
         }
