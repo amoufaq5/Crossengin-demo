@@ -1,0 +1,672 @@
+// CrossEngin io/transducers: HTTP webhook streaming source (P2.8).
+//
+// Purpose
+//   Third of three real-time event sources for the daemon. A tiny embedded
+//   HTTP/1.1 server on `127.0.0.1:$CE_STREAM_HTTP_PORT` (default 8767)
+//   that accepts `POST /api/event` with `Content-Type: application/json`
+//   and a body of `{"message":"text"}`. The "text" payload becomes one
+//   `EV_MESSAGE` on the shared scheduler queue. All other paths / methods
+//   return 404 or 405 respectively. Bound to loopback by default because
+//   the body is fed unfiltered into the agent's cognition path -- the
+//   same threat-model boundary `scripts/web.py` honors (see its
+//   `BIND=127.0.0.1` default).
+//
+//   Implementation status: this revision ships the FRAMEWORK (env gate,
+//   sockaddr_in setup, bind+listen on the configured port, accept-when-
+//   polled, the public stream_http_poll(state, hs) seam) plus a minimal
+//   JSON `message` field extractor sufficient for the documented payload
+//   shape. The handshake-style HTTP framing -- read request line, headers,
+//   the Content-Length-bounded body -- runs synchronously on the accepted
+//   connection. Concurrent client handling and chunked-transfer encoding
+//   are stubbed: this revision serves ONE request per poll. The next pass
+//   will swap accept for fcntl-O_NONBLOCK + per-conn state without
+//   changing the public API.
+//
+//   Enable via `CE_STREAM_HTTP_PORT=8767` (or any positive int). Default
+//   off so the daemon's existing scripted-episode integration tests are
+//   bit-identical. `CE_STREAM_HTTP_BIND` overrides the bind IP (default
+//   127.0.0.1; do NOT use 0.0.0.0 without a reverse proxy doing auth).
+//
+//   This intentionally mirrors `scripts/web.py`'s pattern (request-per-
+//   thread model, JSON-in / 200-out) but is a separate server: the Python
+//   web frontend manages the chat-process LRU; this HTTP source is a
+//   one-shot pipe into the daemon's event queue.
+//
+// ADRs implemented: ADR-0014 (modality bridge), ADR-0037 (event-driven
+//   scheduler -- this module is an event producer).
+// NOVA dependencies: builtins -- alloc, store8, load8, len, push, list_new,
+//   list_set, getenv, char_at, str_eq, substr, asm (raw fcntl syscall),
+//   socket, bind_socket, listen_socket, accept_conn, recv_data, send_data,
+//   close_fd, make_sockaddr_in, str_to_int.
+// CrossEngin dependencies: src/io/transducers/input_transducer.nova
+//   (transduce_text), src/scheduler/hybrid_scheduler.nova
+//   (hs_post_event, EV_MESSAGE).
+
+import "input_transducer.nova"
+import "../../scheduler/hybrid_scheduler.nova"
+
+// AF_INET=2, SOCK_STREAM=1 -- the conventional TCP listener triple. The
+// brief explicitly notes this is the IP family; AF_UNIX is `stream_unix`'s
+// concern.
+let STREAM_HTTP_AF_INET    = 2
+let STREAM_HTTP_SOCK_STREAM = 1
+
+// Defaults: a sub-1024 port would need root, so we pick a four-digit one
+// well outside any well-known range and far from scripts/web.py's 8765 to
+// avoid collision when both run on the same host.
+let STREAM_HTTP_DEFAULT_PORT = 8767
+let STREAM_HTTP_DEFAULT_BIND = "127.0.0.1"
+
+// Recv chunk / request cap. HTTP requests for our single-purpose endpoint
+// are tiny; cap the total accepted bytes per request to avoid a runaway
+// memory footprint from a malicious or buggy client.
+let STREAM_HTTP_RECV_CHUNK   = 4096
+let STREAM_HTTP_REQUEST_MAX  = 65536
+
+// ---- raw fcntl shim --------------------------------------------------------
+// Same shape as stream_stdin / stream_unix_socket: switch the listen fd to
+// non-blocking so accept returns -EAGAIN immediately when no client is
+// waiting, letting the daemon's idle tick proceed.
+let STREAM_HTTP_F_SETFL    = 4
+let STREAM_HTTP_O_NONBLOCK = 2048
+
+fn _stream_http_fcntl(fd, cmd, arg) {
+    asm {
+        "mov rax, 72"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// ---- IP helper -------------------------------------------------------------
+// Encode a dotted-quad like "127.0.0.1" as the int the make_sockaddr_in
+// builtin expects. Returns -1 on malformed input. Mirrors the helper in
+// kg_sync.nova but local-leaf so this transducer stays self-contained.
+fn _stream_http_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _stream_http_ip_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _stream_http_is_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    let b_p = b * k256
+    let c_p = c * k256 * k256
+    let d_p = d * k256 * k256 * k256
+    return a + b_p + c_p + d_p
+}
+
+// ---- stream state ---------------------------------------------------------
+// Shape:
+//   [0] tag
+//   [1] enabled       (env-gated)
+//   [2] initialized   (bind+listen succeeded)
+//   [3] port          (resolved port)
+//   [4] bind_ip       (resolved bind IP string)
+//   [5] listen_fd     (>0 once listening, 0 otherwise)
+//   [6] events_total  (counter: requests that produced EV_MESSAGE)
+//   [7] requests_total (counter: all accepted connections)
+
+let STREAM_HTTP_TAG = 6203
+
+let SH_TAG            = 0
+let SH_ENABLED        = 1
+let SH_INITIALIZED    = 2
+let SH_PORT           = 3
+let SH_BIND_IP        = 4
+let SH_LISTEN_FD      = 5
+let SH_EVENTS_TOTAL   = 6
+let SH_REQUESTS_TOTAL = 7
+
+fn stream_http_new() {
+    let s = list_new()
+    push(s, STREAM_HTTP_TAG)
+    push(s, 0)
+    push(s, 0)
+    push(s, STREAM_HTTP_DEFAULT_PORT)
+    push(s, STREAM_HTTP_DEFAULT_BIND)
+    push(s, 0)
+    push(s, 0)
+    push(s, 0)
+    return s
+}
+
+fn stream_http_enabled(s)        { return s[SH_ENABLED] }
+fn stream_http_port(s)           { return s[SH_PORT] }
+fn stream_http_bind_ip(s)        { return s[SH_BIND_IP] }
+fn stream_http_initialized(s)    { return s[SH_INITIALIZED] }
+fn stream_http_listen_fd(s)      { return s[SH_LISTEN_FD] }
+fn stream_http_events_total(s)   { return s[SH_EVENTS_TOTAL] }
+fn stream_http_requests_total(s) { return s[SH_REQUESTS_TOTAL] }
+
+// ---- env gate -------------------------------------------------------------
+// CE_STREAM_HTTP_PORT=<int>   -> enabled, listen on that port.
+// CE_STREAM_HTTP_PORT="" / unset / 0 / non-numeric -> disabled.
+// CE_STREAM_HTTP_BIND=<ip>    -> override the loopback default. Operators
+//                                must understand the security implication
+//                                (the daemon's full cognition path is
+//                                fed by the body) before exposing to LAN.
+fn _stream_http_port_from_env() {
+    let env = getenv("CE_STREAM_HTTP_PORT")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if _stream_http_is_digits(env) == 0 { return 0 }
+    let v = str_to_int(env)
+    if v <= 0 { return 0 }
+    if v > 65535 { return 0 }
+    return v
+}
+
+fn _stream_http_bind_from_env() {
+    let env = getenv("CE_STREAM_HTTP_BIND")
+    if env == 0 { return STREAM_HTTP_DEFAULT_BIND }
+    if len(env) == 0 { return STREAM_HTTP_DEFAULT_BIND }
+    return env
+}
+
+fn stream_http_init_from_env(s) {
+    let port = _stream_http_port_from_env()
+    if port == 0 {
+        list_set(s, SH_ENABLED, 0)
+        return 0
+    }
+    list_set(s, SH_ENABLED, 1)
+    list_set(s, SH_PORT, port)
+    list_set(s, SH_BIND_IP, _stream_http_bind_from_env())
+    return 1
+}
+
+// ---- socket setup ---------------------------------------------------------
+fn stream_http_init(s) {
+    if s[SH_ENABLED] == 0 { return 0 }
+    if s[SH_INITIALIZED] == 1 { return 1 }
+    let fd = socket(STREAM_HTTP_AF_INET, STREAM_HTTP_SOCK_STREAM, 0)
+    if fd < 0 {
+        list_set(s, SH_ENABLED, 0)
+        return 0
+    }
+    let ip = _stream_http_ip_to_int(s[SH_BIND_IP])
+    if ip < 0 {
+        close_fd(fd)
+        list_set(s, SH_ENABLED, 0)
+        return 0
+    }
+    let addr = make_sockaddr_in(s[SH_PORT], ip)
+    let br = bind_socket(fd, addr, 16)
+    if br < 0 {
+        close_fd(fd)
+        list_set(s, SH_ENABLED, 0)
+        return 0
+    }
+    if listen_socket(fd, 8) < 0 {
+        close_fd(fd)
+        list_set(s, SH_ENABLED, 0)
+        return 0
+    }
+    _stream_http_fcntl(fd, STREAM_HTTP_F_SETFL, STREAM_HTTP_O_NONBLOCK)
+    list_set(s, SH_LISTEN_FD, fd)
+    list_set(s, SH_INITIALIZED, 1)
+    return 1
+}
+
+// ---- helpers --------------------------------------------------------------
+fn _stream_http_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    // chr()-based -- see stream_stdin.nova:_stream_bytes_to_str for the
+    // str_new compilation-unit hang this works around.
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _stream_http_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _stream_http_send_status(fd, status_line, body) {
+    // Minimal HTTP/1.1 response. Connection: close so curl + every other
+    // simple client knows the body ends at byte N. No keep-alive (we're
+    // one-request-per-accept anyway).
+    let resp = "HTTP/1.1 " + status_line + "\r\n"
+        + "Content-Type: text/plain\r\n"
+        + "Content-Length: " + int_to_str(len(body)) + "\r\n"
+        + "Connection: close\r\n\r\n"
+        + body
+    return _stream_http_send_all(fd, resp)
+}
+
+// Look up a header value by name (case-insensitive). The input `headers`
+// is the raw header block (everything between the request line and the
+// CRLF CRLF body separator). Returns 0 if the header is not present.
+// We only need this for Content-Length so the matcher is intentionally
+// minimal: it walks the header lines and compares each name lower-cased.
+fn _stream_http_lower_ch(c) {
+    if c >= 65 {
+        if c <= 90 { return c + 32 }
+    }
+    return c
+}
+
+fn _stream_http_lower(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(_stream_http_lower_ch(char_at(s, i)))
+        i = i + 1
+    }
+    return out
+}
+
+fn _stream_http_get_header(headers, name) {
+    let target = _stream_http_lower(name) + ":"
+    let n = len(headers)
+    let line_start = 0
+    let i = 0
+    while i <= n {
+        let at_end = 0
+        if i == n {
+            at_end = 1
+        } else {
+            if char_at(headers, i) == 10 { at_end = 1 }
+        }
+        if at_end == 1 {
+            if i > line_start {
+                let raw = substr(headers, line_start, i - line_start)
+                // Strip trailing CR.
+                let raw_n = len(raw)
+                if raw_n > 0 {
+                    if char_at(raw, raw_n - 1) == 13 {
+                        raw = substr(raw, 0, raw_n - 1)
+                    }
+                }
+                let colon = -1
+                let k = 0
+                while k < len(raw) {
+                    if char_at(raw, k) == 58 {
+                        if colon == -1 { colon = k }
+                    }
+                    k = k + 1
+                }
+                if colon >= 0 {
+                    let hname = substr(raw, 0, colon)
+                    let lower_name = _stream_http_lower(hname) + ":"
+                    if str_eq(lower_name, target) == 1 {
+                        let val = substr(raw, colon + 1, len(raw) - colon - 1)
+                        return str_trim(val)
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- JSON message extractor -----------------------------------------------
+// Extract the value of the `message` field from a JSON object. Returns 0
+// if not found. We do NOT bring in a full JSON parser: the documented
+// payload shape is `{"message":"<text>"}` and a tolerant single-field
+// scanner is sufficient for the webhook contract. The scanner handles
+// optional whitespace around the colon and inside the value, plus a few
+// common JSON escapes (\" and \\) in the value. This is the same
+// surface-area tradeoff scripts/web.py inherits from the json module: a
+// caller wanting structured JSON beyond `message` should escalate to a
+// full parser.
+fn _stream_http_is_ws(c) {
+    if c == 32 { return 1 }
+    if c ==  9 { return 1 }
+    if c == 10 { return 1 }
+    if c == 13 { return 1 }
+    return 0
+}
+
+fn _stream_http_json_message(body) {
+    // Find the substring `"message"` in the body.
+    let target = "\"message\""
+    let pos = -1
+    let bn = len(body)
+    let tn = len(target)
+    let i = 0
+    while i <= bn - tn {
+        if pos == -1 {
+            if str_eq(substr(body, i, tn), target) == 1 { pos = i }
+        }
+        i = i + 1
+    }
+    if pos < 0 { return 0 }
+    // Skip past the key, optional whitespace before ':'.
+    let j = pos + tn
+    let skip1 = 1
+    while skip1 == 1 {
+        if j >= bn { skip1 = 0 } else {
+            if _stream_http_is_ws(char_at(body, j)) == 1 { j = j + 1 } else { skip1 = 0 }
+        }
+    }
+    if j >= bn { return 0 }
+    // Expect ':'
+    if char_at(body, j) != 58 { return 0 }
+    j = j + 1
+    // Skip post-colon whitespace.
+    let skip2 = 1
+    while skip2 == 1 {
+        if j >= bn { skip2 = 0 } else {
+            if _stream_http_is_ws(char_at(body, j)) == 1 { j = j + 1 } else { skip2 = 0 }
+        }
+    }
+    if j >= bn { return 0 }
+    if char_at(body, j) != 34 { return 0 }
+    j = j + 1
+    // Walk the string value, honoring \" and \\.
+    let value_start = j
+    let escapes = 0
+    let scan = 1
+    while scan == 1 {
+        if j >= bn { return 0 }
+        let c = char_at(body, j)
+        if c == 92 {
+            escapes = escapes + 1
+            j = j + 2
+        } else {
+            if c == 34 { scan = 0 } else { j = j + 1 }
+        }
+    }
+    if j > bn { return 0 }
+    // j now points at the closing quote.
+    let raw = substr(body, value_start, j - value_start)
+    if escapes == 0 { return raw }
+    // Decode \" and \\ via chr concatenation (avoids the str_new hang).
+    let dn = len(raw)
+    let out = ""
+    let di = 0
+    while di < dn {
+        let dc = char_at(raw, di)
+        if dc == 92 {
+            if di + 1 < dn {
+                let nx = char_at(raw, di + 1)
+                out = out + chr(nx)
+                di = di + 2
+            } else {
+                out = out + chr(dc)
+                di = di + 1
+            }
+        } else {
+            out = out + chr(dc)
+            di = di + 1
+        }
+    }
+    return out
+}
+
+// Public surface for tests: extract the message field from a JSON body.
+fn stream_http_extract_message(body) {
+    return _stream_http_json_message(body)
+}
+
+// ---- request parser -------------------------------------------------------
+// Read a single HTTP request from the connection: request line + headers +
+// optional Content-Length-bounded body. Returns a record:
+//   [0] method  (e.g. "POST")
+//   [1] path    (e.g. "/api/event")
+//   [2] body    (raw body bytes as a string)
+// or 0 on malformed input. Bounded by STREAM_HTTP_REQUEST_MAX.
+fn _stream_http_read_request(conn_fd) {
+    let acc = ""
+    let header_end = -1
+    let total = 0
+    let go = 1
+    while go == 1 {
+        if total >= STREAM_HTTP_REQUEST_MAX { go = 0 }
+        if go == 1 {
+            let buf = alloc(STREAM_HTTP_RECV_CHUNK)
+            let n = recv_data(conn_fd, buf, STREAM_HTTP_RECV_CHUNK)
+            if n <= 0 {
+                go = 0
+            } else {
+                total = total + n
+                acc = acc + _stream_http_bytes_to_str(buf, n)
+                // Look for header/body separator (CRLF CRLF).
+                let an = len(acc)
+                let i = 0
+                while i <= an - 4 {
+                    if header_end == -1 {
+                        if char_at(acc, i)     == 13 {
+                            if char_at(acc, i + 1) == 10 {
+                                if char_at(acc, i + 2) == 13 {
+                                    if char_at(acc, i + 3) == 10 {
+                                        header_end = i
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i = i + 1
+                }
+                if header_end >= 0 {
+                    // Have we received the full body yet?
+                    let head = substr(acc, 0, header_end)
+                    let body_start = header_end + 4
+                    let body_have = len(acc) - body_start
+                    // Look for Content-Length on the header block.
+                    let first_lf = -1
+                    let ki = 0
+                    while ki < len(head) {
+                        if first_lf == -1 {
+                            if char_at(head, ki) == 10 { first_lf = ki }
+                        }
+                        ki = ki + 1
+                    }
+                    let headers_only = ""
+                    if first_lf > 0 { headers_only = substr(head, first_lf + 1, len(head) - first_lf - 1) }
+                    let cl_raw = _stream_http_get_header(headers_only, "Content-Length")
+                    let cl = 0
+                    if cl_raw != 0 {
+                        if _stream_http_is_digits(cl_raw) == 1 { cl = str_to_int(cl_raw) }
+                    }
+                    if body_have >= cl { go = 0 }
+                }
+            }
+        }
+    }
+    if header_end < 0 { return 0 }
+    let head = substr(acc, 0, header_end)
+    let body_start = header_end + 4
+    let body = substr(acc, body_start, len(acc) - body_start)
+    // Split the head into request-line + the rest.
+    let first_lf = -1
+    let ki = 0
+    while ki < len(head) {
+        if first_lf == -1 {
+            if char_at(head, ki) == 10 { first_lf = ki }
+        }
+        ki = ki + 1
+    }
+    if first_lf < 0 { return 0 }
+    let req_line = substr(head, 0, first_lf)
+    // Strip trailing CR from the request line.
+    let rn = len(req_line)
+    if rn > 0 {
+        if char_at(req_line, rn - 1) == 13 { req_line = substr(req_line, 0, rn - 1) }
+    }
+    // Tokenize: METHOD SP PATH SP VERSION.
+    let sp1 = -1
+    let sp2 = -1
+    let qi = 0
+    while qi < len(req_line) {
+        if char_at(req_line, qi) == 32 {
+            if sp1 == -1 { sp1 = qi } else { if sp2 == -1 { sp2 = qi } }
+        }
+        qi = qi + 1
+    }
+    if sp1 < 0 { return 0 }
+    if sp2 < 0 { return 0 }
+    let method = substr(req_line, 0, sp1)
+    let path = substr(req_line, sp1 + 1, sp2 - sp1 - 1)
+    let rec = list_new()
+    push(rec, method)
+    push(rec, path)
+    push(rec, body)
+    return rec
+}
+
+// Public surface for tests: parse a fully buffered HTTP request blob
+// (CRLF-delimited request line + headers + body) into [method, path, body].
+fn stream_http_parse_request(blob) {
+    let header_end = -1
+    let n = len(blob)
+    let i = 0
+    while i <= n - 4 {
+        if header_end == -1 {
+            if char_at(blob, i)     == 13 {
+                if char_at(blob, i + 1) == 10 {
+                    if char_at(blob, i + 2) == 13 {
+                        if char_at(blob, i + 3) == 10 {
+                            header_end = i
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if header_end < 0 { return 0 }
+    let head = substr(blob, 0, header_end)
+    let body_start = header_end + 4
+    let body = substr(blob, body_start, n - body_start)
+    let first_lf = -1
+    let ki = 0
+    while ki < len(head) {
+        if first_lf == -1 {
+            if char_at(head, ki) == 10 { first_lf = ki }
+        }
+        ki = ki + 1
+    }
+    if first_lf < 0 { return 0 }
+    let req_line = substr(head, 0, first_lf)
+    let rn = len(req_line)
+    if rn > 0 {
+        if char_at(req_line, rn - 1) == 13 { req_line = substr(req_line, 0, rn - 1) }
+    }
+    let sp1 = -1
+    let sp2 = -1
+    let qi = 0
+    while qi < len(req_line) {
+        if char_at(req_line, qi) == 32 {
+            if sp1 == -1 { sp1 = qi } else { if sp2 == -1 { sp2 = qi } }
+        }
+        qi = qi + 1
+    }
+    if sp1 < 0 { return 0 }
+    if sp2 < 0 { return 0 }
+    let method = substr(req_line, 0, sp1)
+    let path = substr(req_line, sp1 + 1, sp2 - sp1 - 1)
+    let rec = list_new()
+    push(rec, method)
+    push(rec, path)
+    push(rec, body)
+    return rec
+}
+
+// ---- per-connection handler -----------------------------------------------
+// Read the request, validate method + path, extract the message, post it.
+// Send a 200 / 4xx response. Returns 1 if an EV_MESSAGE was posted.
+fn _stream_http_handle_conn(s, hs, conn_fd) {
+    let req = _stream_http_read_request(conn_fd)
+    if req == 0 {
+        _stream_http_send_status(conn_fd, "400 Bad Request", "malformed\n")
+        return 0
+    }
+    let method = req[0]
+    let path = req[1]
+    let body = req[2]
+    if str_eq(method, "POST") == 0 {
+        _stream_http_send_status(conn_fd, "405 Method Not Allowed", "POST required\n")
+        return 0
+    }
+    if str_eq(path, "/api/event") == 0 {
+        _stream_http_send_status(conn_fd, "404 Not Found", "use POST /api/event\n")
+        return 0
+    }
+    let msg = _stream_http_json_message(body)
+    if msg == 0 {
+        _stream_http_send_status(conn_fd, "400 Bad Request", "missing \"message\"\n")
+        return 0
+    }
+    let norm = transduce_text(msg)
+    if len(norm) == 0 {
+        _stream_http_send_status(conn_fd, "400 Bad Request", "empty after normalization\n")
+        return 0
+    }
+    hs_post_event(hs, EV_MESSAGE, norm)
+    list_set(s, SH_EVENTS_TOTAL, s[SH_EVENTS_TOTAL] + 1)
+    _stream_http_send_status(conn_fd, "200 OK", "queued\n")
+    return 1
+}
+
+// ---- poll -----------------------------------------------------------------
+// One poll. accept() one waiting client (non-blocking listen socket; -1
+// when none) and handle the request. Returns 1 if a message was posted.
+fn stream_http_poll(s, hs) {
+    if s[SH_ENABLED] == 0 { return 0 }
+    if s[SH_INITIALIZED] == 0 { return 0 }
+    let conn_fd = accept_conn(s[SH_LISTEN_FD], 0, 0)
+    if conn_fd < 0 { return 0 }
+    list_set(s, SH_REQUESTS_TOTAL, s[SH_REQUESTS_TOTAL] + 1)
+    let r = _stream_http_handle_conn(s, hs, conn_fd)
+    close_fd(conn_fd)
+    return r
+}
+
+fn stream_http_close(s) {
+    if s[SH_INITIALIZED] == 0 { return 0 }
+    let fd = s[SH_LISTEN_FD]
+    if fd > 0 { close_fd(fd) }
+    list_set(s, SH_INITIALIZED, 0)
+    list_set(s, SH_LISTEN_FD, 0)
+    return 1
+}

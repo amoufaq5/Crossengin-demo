@@ -1,0 +1,382 @@
+// CrossEngin io/transducers: Unix-domain socket streaming source (P2.8).
+//
+// Purpose
+//   Second of three real-time event sources for the daemon. This module
+//   exposes the same poll(state, hs) entry point as `stream_stdin.nova`
+//   but the bytes come from a Unix-domain server socket bound to
+//   `$CE_STREAM_SOCKET` (default `/tmp/crossengin.sock`). Each connection
+//   sends one or more newline-terminated lines; each line becomes an
+//   `EV_MESSAGE` on the shared scheduler queue, indistinguishable from
+//   any other source.
+//
+//   Implementation status: this revision ships the FRAMEWORK and the
+//   listen-socket lifecycle (env gate, sockaddr_un construction, bind,
+//   listen, accept-when-polled). The connection-handling drain is wired
+//   through the same _stream_split_first_newline helper used by stdin,
+//   but accept() in NOVA's runtime is blocking, so this revision serves
+//   ONE connected client per poll synchronously. Multi-client + truly
+//   non-blocking accept lives behind the same call surface; the next
+//   pass will swap the blocking accept_conn for a fcntl-O_NONBLOCK fd
+//   without changing the public API.
+//
+//   Enable via `CE_STREAM_SOCKET=/tmp/crossengin.sock` (path) or just
+//   any non-empty `CE_STREAM_SOCKET` env to take the default. Default off.
+//
+//   The brief calls out (NOVA gotchas) that AF_UNIX is family 1 and
+//   SOCK_STREAM is type 1 -- which is what `socket(1, 1, 0)` requests.
+//   sockaddr_un is `[u16 family][char path[108]]` -- we build it with
+//   alloc + store8 to avoid the int_mul pointer-threshold trap.
+//
+// ADRs implemented: ADR-0014 (modality bridge), ADR-0037 (event-driven
+//   scheduler, this module is an event producer).
+// NOVA dependencies: builtins -- alloc, store8, load8, len, push, list_new,
+//   list_set, getenv, char_at, str_eq, substr, asm (raw syscalls),
+//   socket, bind_socket, listen_socket, accept_conn, recv_data, close_fd.
+// CrossEngin dependencies: src/io/transducers/input_transducer.nova
+//   (transduce_text), src/scheduler/hybrid_scheduler.nova
+//   (hs_post_event, EV_MESSAGE).
+
+import "input_transducer.nova"
+import "../../scheduler/hybrid_scheduler.nova"
+
+// AF_UNIX = 1, SOCK_STREAM = 1. The brief calls this out as a NOVA gotcha:
+// the IP stream socket factory under socket(2, 1, 0) is AF_INET; for the
+// Unix-domain pipe we need socket(1, 1, 0).
+let STREAM_SOCK_AF_UNIX  = 1
+let STREAM_SOCK_STREAM   = 1
+
+// Default path if the operator sets `CE_STREAM_SOCKET=1` or empty (i.e.,
+// "turn this on but I don't care where"). Matches the brief.
+let STREAM_SOCKET_DEFAULT_PATH = "/tmp/crossengin.sock"
+
+// sockaddr_un size: 2 family bytes + 108 path bytes = 110.
+let STREAM_SOCKADDR_UN_SIZE = 110
+// Path field length (sun_path is fixed-size 108 bytes on glibc).
+let STREAM_SOCKADDR_UN_PATH_MAX = 108
+
+// Recv chunk size + soft buffer cap. Mirror stream_stdin so a future
+// extraction of a shared helper is straightforward.
+let STREAM_UNIX_RECV_CHUNK = 4096
+let STREAM_UNIX_BUF_MAX    = 65536
+
+// ---- raw fcntl / unlink shims ---------------------------------------------
+// fcntl(fd, F_SETFL, O_NONBLOCK) -- same syscall 72 / cmd 4 / flag 2048
+// path stream_stdin uses. Repeated here so this module stays leaf (no
+// cross-import of a private helper from another transducer).
+let STREAM_UN_F_SETFL    = 4
+let STREAM_UN_O_NONBLOCK = 2048
+
+fn _stream_un_fcntl(fd, cmd, arg) {
+    asm {
+        "mov rax, 72"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// unlink(path) -- remove a stale socket file. syscall 87 on Linux x86-64.
+// We unlink before bind so the daemon survives an unclean previous exit
+// that left the socket file present; otherwise bind would return EADDRINUSE.
+fn _stream_un_unlink(path_buf) {
+    asm {
+        "mov rax, 87"
+        "mov rdi, [rbp-8]"
+        "syscall"
+    }
+}
+
+// ---- sockaddr_un builder --------------------------------------------------
+// Build a sockaddr_un with sun_family = AF_UNIX and sun_path = `path` (NUL
+// terminated, zero-padded to STREAM_SOCKADDR_UN_PATH_MAX). The struct is
+// laid out byte-by-byte with store8 -- avoids any int_mul above the
+// pointer threshold per the brief's gotcha.
+fn _stream_make_sockaddr_un(path) {
+    let addr = alloc(STREAM_SOCKADDR_UN_SIZE)
+    // Family bytes (little-endian u16): AF_UNIX = 1.
+    store8(addr, STREAM_SOCK_AF_UNIX)
+    store8(addr + 1, 0)
+    // Zero-fill the path region.
+    let i = 0
+    while i < STREAM_SOCKADDR_UN_PATH_MAX {
+        store8(addr + 2 + i, 0)
+        i = i + 1
+    }
+    // Copy path bytes. Cap at PATH_MAX - 1 so the NUL terminator stays in
+    // bounds. NOVA's char_at returns the byte code at index.
+    let n = len(path)
+    if n > STREAM_SOCKADDR_UN_PATH_MAX - 1 { n = STREAM_SOCKADDR_UN_PATH_MAX - 1 }
+    let j = 0
+    while j < n {
+        store8(addr + 2 + j, char_at(path, j))
+        j = j + 1
+    }
+    return addr
+}
+
+// Build a NUL-terminated C string buffer for a path (for the unlink syscall).
+fn _stream_make_cstr(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+// ---- stream state ---------------------------------------------------------
+// Shape:
+//   [0] tag
+//   [1] enabled       (env-gated)
+//   [2] initialized   (bind+listen succeeded)
+//   [3] path          (resolved socket path)
+//   [4] listen_fd     (>0 once listening, 0 otherwise)
+//   [5] lines_total   (counter)
+//   [6] accepts_total (counter)
+//   [7] residual      (per-poll buffered partial line; reset between connects)
+
+let STREAM_UNIX_TAG = 6202
+
+let SU_TAG           = 0
+let SU_ENABLED       = 1
+let SU_INITIALIZED   = 2
+let SU_PATH          = 3
+let SU_LISTEN_FD     = 4
+let SU_LINES_TOTAL   = 5
+let SU_ACCEPTS_TOTAL = 6
+let SU_RESIDUAL      = 7
+
+fn stream_unix_new() {
+    let s = list_new()
+    push(s, STREAM_UNIX_TAG)
+    push(s, 0)
+    push(s, 0)
+    push(s, "")
+    push(s, 0)
+    push(s, 0)
+    push(s, 0)
+    push(s, "")
+    return s
+}
+
+fn stream_unix_enabled(s)       { return s[SU_ENABLED] }
+fn stream_unix_path(s)          { return s[SU_PATH] }
+fn stream_unix_listen_fd(s)     { return s[SU_LISTEN_FD] }
+fn stream_unix_lines_total(s)   { return s[SU_LINES_TOTAL] }
+fn stream_unix_accepts_total(s) { return s[SU_ACCEPTS_TOTAL] }
+fn stream_unix_initialized(s)   { return s[SU_INITIALIZED] }
+
+// ---- env gate -------------------------------------------------------------
+// CE_STREAM_SOCKET=<path>     -> enabled, use that path
+// CE_STREAM_SOCKET=1          -> enabled, use the default path
+// CE_STREAM_SOCKET="" / unset -> disabled (default)
+// CE_STREAM_SOCKET=0 / false  -> explicitly disabled
+fn _stream_unix_env_says_on() {
+    let env = getenv("CE_STREAM_SOCKET")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "0") == 1 { return 0 }
+    if str_eq(env, "false") == 1 { return 0 }
+    if str_eq(env, "no") == 1 { return 0 }
+    return 1
+}
+
+fn _stream_unix_env_path() {
+    let env = getenv("CE_STREAM_SOCKET")
+    if env == 0 { return STREAM_SOCKET_DEFAULT_PATH }
+    if len(env) == 0 { return STREAM_SOCKET_DEFAULT_PATH }
+    // "1" / "true" / "yes" are also interpreted as "use default path" so the
+    // operator can flip the toggle without typing a full path.
+    if str_eq(env, "1") == 1 { return STREAM_SOCKET_DEFAULT_PATH }
+    if str_eq(env, "true") == 1 { return STREAM_SOCKET_DEFAULT_PATH }
+    if str_eq(env, "yes") == 1 { return STREAM_SOCKET_DEFAULT_PATH }
+    return env
+}
+
+fn stream_unix_init_from_env(s) {
+    if _stream_unix_env_says_on() == 1 {
+        list_set(s, SU_ENABLED, 1)
+        list_set(s, SU_PATH, _stream_unix_env_path())
+        return 1
+    }
+    list_set(s, SU_ENABLED, 0)
+    return 0
+}
+
+// ---- socket setup ---------------------------------------------------------
+// Create, bind, and listen on the configured path. Idempotent: a second
+// call when already-initialized is a no-op. Returns 1 on success, 0 on
+// any failure (in which case the stream stays disabled and the daemon
+// continues without this source).
+fn stream_unix_init(s) {
+    if s[SU_ENABLED] == 0 { return 0 }
+    if s[SU_INITIALIZED] == 1 { return 1 }
+    let path = s[SU_PATH]
+    if len(path) == 0 {
+        list_set(s, SU_ENABLED, 0)
+        return 0
+    }
+    // Best-effort unlink of any stale socket file from a prior unclean
+    // exit. We ignore the return value -- failing because the file did
+    // not exist is the common case.
+    let cpath = _stream_make_cstr(path)
+    _stream_un_unlink(cpath)
+    // socket(AF_UNIX, SOCK_STREAM, 0).
+    let fd = socket(STREAM_SOCK_AF_UNIX, STREAM_SOCK_STREAM, 0)
+    if fd < 0 {
+        list_set(s, SU_ENABLED, 0)
+        return 0
+    }
+    let addr = _stream_make_sockaddr_un(path)
+    let bind_r = bind_socket(fd, addr, STREAM_SOCKADDR_UN_SIZE)
+    if bind_r < 0 {
+        close_fd(fd)
+        list_set(s, SU_ENABLED, 0)
+        return 0
+    }
+    let lis_r = listen_socket(fd, 8)
+    if lis_r < 0 {
+        close_fd(fd)
+        list_set(s, SU_ENABLED, 0)
+        return 0
+    }
+    // Switch the listen fd to non-blocking so subsequent accept() returns
+    // -EAGAIN instead of stalling the daemon's tick loop when no client
+    // is waiting. We do not check the result -- a kernel that refuses
+    // O_NONBLOCK is unusual but harmless: the poll path tolerates a
+    // blocking accept by simply not being called when no client is
+    // imminent (the daemon polls at idle only).
+    _stream_un_fcntl(fd, STREAM_UN_F_SETFL, STREAM_UN_O_NONBLOCK)
+    list_set(s, SU_LISTEN_FD, fd)
+    list_set(s, SU_INITIALIZED, 1)
+    return 1
+}
+
+// ---- per-connection line drain -------------------------------------------
+// Read every byte the connected client has buffered, peel off complete
+// '\n'-terminated lines, post each as EV_MESSAGE. Then close the fd.
+//
+// This is intentionally a one-shot per accept: the call site polls once
+// per idle tick, accepting at most one new client per poll. A single
+// client may still send multiple lines in one connection -- we drain
+// everything they sent. Long-lived persistent connections are NOT yet
+// supported; that's a multi-fd select / per-conn state extension.
+fn _stream_unix_split_first_newline(text) {
+    let i = 0
+    let n = len(text)
+    while i < n {
+        if char_at(text, i) == 10 {
+            let pre = substr(text, 0, i)
+            let post = substr(text, i + 1, n - i - 1)
+            let pair = list_new()
+            push(pair, pre)
+            push(pair, post)
+            return pair
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _stream_unix_post_line(s, hs, line_text) {
+    let norm = transduce_text(line_text)
+    if len(norm) == 0 { return 0 }
+    hs_post_event(hs, EV_MESSAGE, norm)
+    list_set(s, SU_LINES_TOTAL, s[SU_LINES_TOTAL] + 1)
+    return 1
+}
+
+fn _stream_unix_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    // chr()-based concatenation -- str_new exhibits the same hang inside
+    // the daemon's compilation unit that stream_stdin works around. See
+    // stream_stdin.nova:_stream_bytes_to_str for the analysis.
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _stream_unix_drain_conn(s, hs, conn_fd) {
+    // Reset per-connection residual; lines do not persist across closes.
+    list_set(s, SU_RESIDUAL, "")
+    let posted = 0
+    let go = 1
+    while go == 1 {
+        let buf = alloc(STREAM_UNIX_RECV_CHUNK)
+        let n = recv_data(conn_fd, buf, STREAM_UNIX_RECV_CHUNK)
+        if n <= 0 {
+            // EOF or error: flush any unterminated trailing residual then
+            // exit. The trailing fragment IS posted as a best-effort final
+            // line (mirrors the stdin EOF behaviour).
+            let tail = s[SU_RESIDUAL]
+            list_set(s, SU_RESIDUAL, "")
+            if len(tail) > 0 {
+                if _stream_unix_post_line(s, hs, tail) == 1 {
+                    posted = posted + 1
+                }
+            }
+            go = 0
+        } else {
+            let chunk = _stream_unix_bytes_to_str(buf, n)
+            let combined = s[SU_RESIDUAL] + chunk
+            list_set(s, SU_RESIDUAL, combined)
+            let drain_more = 1
+            while drain_more == 1 {
+                let current = s[SU_RESIDUAL]
+                let split = _stream_unix_split_first_newline(current)
+                if split == 0 {
+                    if len(current) >= STREAM_UNIX_BUF_MAX {
+                        list_set(s, SU_RESIDUAL, "")
+                        if _stream_unix_post_line(s, hs, current) == 1 {
+                            posted = posted + 1
+                        }
+                    }
+                    drain_more = 0
+                } else {
+                    list_set(s, SU_RESIDUAL, split[1])
+                    if _stream_unix_post_line(s, hs, split[0]) == 1 {
+                        posted = posted + 1
+                    }
+                }
+            }
+        }
+    }
+    return posted
+}
+
+// ---- poll -----------------------------------------------------------------
+// One poll. If the listen socket has a pending connection, accept it and
+// drain. Otherwise (EAGAIN), return 0 immediately. accept_conn returns -1
+// when no client is waiting on a non-blocking listener -- the daemon's
+// idle tick happily proceeds. Returns the count of lines posted.
+fn stream_unix_poll(s, hs) {
+    if s[SU_ENABLED] == 0 { return 0 }
+    if s[SU_INITIALIZED] == 0 { return 0 }
+    let conn_fd = accept_conn(s[SU_LISTEN_FD], 0, 0)
+    if conn_fd < 0 { return 0 }
+    list_set(s, SU_ACCEPTS_TOTAL, s[SU_ACCEPTS_TOTAL] + 1)
+    let posted = _stream_unix_drain_conn(s, hs, conn_fd)
+    close_fd(conn_fd)
+    return posted
+}
+
+// Cleanly close the listen socket and unlink the socket file. Called at
+// daemon shutdown. Idempotent.
+fn stream_unix_close(s) {
+    if s[SU_INITIALIZED] == 0 { return 0 }
+    let fd = s[SU_LISTEN_FD]
+    if fd > 0 { close_fd(fd) }
+    let cpath = _stream_make_cstr(s[SU_PATH])
+    _stream_un_unlink(cpath)
+    list_set(s, SU_INITIALIZED, 0)
+    list_set(s, SU_LISTEN_FD, 0)
+    return 1
+}

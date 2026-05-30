@@ -17,7 +17,11 @@ computational units rather than orchestrating a pipeline of modules.
 > `seed/packs/{medical,ops_runbook,code_review}_pack.nova` added in P1.9
 > domain seed packs, +2 from `reader/cofire_index.nova` +
 > `reader/slot_index.nova` added in P2.1/P2.2 co-fire + syntactic-slot
-> similarity side-indices), 114 unit-test suites pass
+> similarity side-indices, +3 from
+> `io/transducers/stream_{stdin,unix_socket,http}.nova` added in P2.8
+> real-time streaming event sources,
+> +1 from `persistence/snapshot_compaction.nova` added in P2.10 snapshot
+> compaction pass), 116 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -39,8 +43,12 @@ computational units rather than orchestrating a pipeline of modules.
 > `test_slot_index.nova` added in P2.1/P2.2 co-fire + syntactic-slot
 > similarity side-indices, plus +15 assertions to
 > `test_neighborhood_activation.nova` (30 -> 45) covering
-> `find_neighbors_full` with the two new index sources),
-> 19 end-to-end integration
+> `find_neighbors_full` with the two new index sources,
+> +1 suite / +28 assertions from `test_stream_stdin.nova` added in P2.8
+> real-time streaming event sources,
+> +1 suite / +48 assertions from `test_snapshot_compaction.nova` added in
+> P2.10 snapshot compaction pass),
+> 21 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -51,7 +59,12 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `scenario_k_seed_pack.sh` added in P1.9 `/seed` domain pack
 > install + listing,
 > +1 from `scenario_m_metrics_endpoint.sh` added in P2.9 Prometheus
-> text-format `/metrics` scrape endpoint over `scripts/web.py`),
+> text-format `/metrics` scrape endpoint over `scripts/web.py`,
+> +1 from `scenario_l_stream_stdin.sh` added in P2.8 stdin streaming
+> source acceptance test,
+> +1 from `scenario_n_compaction.sh` added in P2.10 snapshot compaction
+> pass: /save -> /teach 50 -> /compact -> /save shrinks file growth by
+> >50% vs the baseline /save -> /teach 50 -> /save),
 > three benchmarks report metrics
 > (`make benchmark`), and five runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence

@@ -17,6 +17,66 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P2.8 streaming event sources (stdin + Unix socket + HTTP webhook): **complete**
+  for stdin; framework-only for the other two.
+  Three new transducers under `src/io/transducers/` lift the daemon from a
+  fixed pre-loaded event queue to a long-running event consumer fed by real
+  input at runtime. Each ships a uniform poll surface
+  (`stream_*_poll(state, hs)`) the daemon calls once per tick, plus an
+  env-toggled `init_from_env` / `init` lifecycle so the default scripted-
+  episode integration tests stay bit-identical.
+  **stream_stdin (fully implemented):** `CE_STREAM_STDIN=1` switches fd 0
+  to non-blocking via a raw `fcntl(72, F_SETFL=4, O_NONBLOCK=2048)` shim,
+  then each poll calls `sys_read(0, ...)` non-blocking; complete
+  newline-terminated lines are normalized via the existing
+  `transduce_text` and posted as `EV_MESSAGE`. A persistent line-residual
+  buffer holds partial reads until the next newline. EOF flushes any tail
+  and marks the source done.
+  **stream_unix_socket (framework + listen-socket lifecycle):**
+  `CE_STREAM_SOCKET=<path>` (default `/tmp/crossengin.sock`) builds a
+  sockaddr_un by hand (AF_UNIX=1, 110-byte struct, store8-per-byte to
+  dodge the pointer-threshold), binds + listens, sets the listen fd to
+  O_NONBLOCK, then per poll accepts one client and drains its lines
+  synchronously. Multi-client + truly non-blocking accept are stubbed
+  behind the same call surface.
+  **stream_http (framework + JSON message-field extractor):**
+  `CE_STREAM_HTTP_PORT=<int>` (default disabled) binds `127.0.0.1` by
+  default (loopback enforced because the body feeds cognition).
+  `POST /api/event` with `{"message":"text"}` -> EV_MESSAGE; all other
+  paths/methods return 4xx. A tolerant single-field JSON extractor reads
+  the `message` value (handles `\"` + `\\` escapes); a full JSON parser
+  would be over-scope for this single endpoint. Concurrent client
+  handling stubbed: one request per poll.
+  **Daemon integration:** any of the three CE_STREAM_* envs trips
+  `streaming_mode=1`, which (a) suppresses the scripted episode, (b) lifts
+  the CE_MAXSTEP cap so the daemon runs indefinitely, (c) adds one poll
+  per source per tick to the main loop, (d) suppresses the post-loop
+  scripted-episode "must" assertions, (e) skips the reboot-rehydrate
+  block (handled out-of-band by SIGINT/SIGTERM + the idle checkpoint).
+  Default behaviour (no env set) is bit-identical to pre-P2.8.
+  **NOVA gotcha worked around:** `str_new(buf, n)` (from
+  `std/string`) hangs inside the daemon's compilation unit when called
+  from a transducer poll. All three modules build their post-read NOVA
+  string by `chr()`-concatenation in a tight loop instead; the loop is
+  O(n) per syscall chunk (bounded by 4096 bytes) so the overhead is
+  acceptable. The unit test `test_stream_stdin.nova` exercises the
+  shared splitting+posting logic via a `stream_stdin_test_feed` helper
+  that does NOT touch real stdin -- 28 assertions across 7 test
+  functions (well above the ~10 target). The integration test
+  `tests/integration/scenario_l_stream_stdin.sh` launches the daemon
+  with `CE_STREAM_STDIN=1`, sends `fever` via a held-open FIFO, and
+  asserts (a) the streaming-mode banner names stdin, (b) the driver
+  line announces streaming-mode, (c) the percept line `msg "fever"
+  perceive(m>=1` was emitted, (d) the scripted-episode messages were
+  suppressed. Sample smoke run:
+  ```
+  echo "fever" | CE_STREAM_STDIN=1 ./bin/crossengin
+  # ===                          ===
+  # boot     : cold start (no prior snapshot); Aurora, 8 parts, 572 concepts
+  # stream  : stdin
+  # driver   : streaming-mode -- waiting for events from stream sources
+  #   [100Hz] msg "fever" perceive(m=1,unk=0) reason=9 mood(v=656) ... say "see recover"
+  ```
 - P2.4 atom-store hash index (label + kind buckets): **complete**.
   `src/kg/multi_kg_manager.nova` now carries a side-table label hash index
   inside every KG (`KG_LABEL_IDX`, `LABEL_BUCKETS = 256` buckets of
