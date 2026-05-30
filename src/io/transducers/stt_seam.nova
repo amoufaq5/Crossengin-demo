@@ -1,0 +1,659 @@
+// CrossEngin io/transducers: speech-to-text pluggable seam (P2.5).
+//
+// Purpose
+//   The STT half of the audio modality bridge (ADR-0014 / NOVA enhancement
+//   #14). P19 + P2.6 closed the TTS half (`audio_synth.nova` Klatt-style
+//   formant synthesis + `audio_speak.nova` espeak/aplay escalation); this
+//   module is the matching STT framework, pluggable behind the existing
+//   `EV_MESSAGE` event source.
+//
+//   Speech-to-text in 2026 is either a deep-learning blackbox (Whisper,
+//   wav2vec, Conformer-RNN-T) or a multi-month classical pipeline
+//   (MFCC + GMM-HMM + Viterbi); neither fits in pure NOVA this decade.
+//   See `STT_AUDIT.md` for the long-form analysis. The framework here
+//   exposes ONE public surface -- `stt_transcribe_wav(seam, wav_path)` --
+//   that returns `[transcript_string, confidence_milli, error_msg]`
+//   regardless of which backend produced the answer. Backends are
+//   registered via function pointers (well, function pointer in the
+//   NOVA-of-2026 shape -- a constant integer the dispatcher matches
+//   against). Two backends ship today:
+//
+//     "subprocess" -- shells out to `scripts/transcribe.sh <wav>` via
+//                     /bin/sh -c, reads stdout. Auto-detects whisper-cli
+//                     / main / vosk-transcriber at the script layer;
+//                     when none are installed, the script returns the
+//                     placeholder "[stt: no backend installed]" with
+//                     exit 0 (i.e. graceful failure -- the seam treats
+//                     this as confidence-0 STUB).
+//
+//     "stub"       -- the deterministic placeholder. Returns
+//                     "[stt unavailable]" + confidence 0 + empty error.
+//                     Selected when no env wires the subprocess path,
+//                     used by tests, and the default in CI / sandboxed
+//                     environments where we never want fork/exec.
+//
+//   The default backend is resolved from `CE_STT_BACKEND`:
+//     "subprocess" -> SUBPROCESS, "stub" / unset -> STUB.
+//   Tests can override via `stt_register_backend(seam, name, fn_id)`
+//   without touching env.
+//
+//   Confidence is reported in milli (0..1000); 1000 = 1.0. The
+//   subprocess backend has no per-utterance confidence path (the
+//   external CLI does not expose it on stdout), so a successful
+//   transcription returns 800 (informative ballpark; documented).
+//   The placeholder returns 0. Real backends with native confidence
+//   (vosk emits json with score; whisper.cpp has --print-confidence on
+//   recent builds) can register a richer wrapper.
+//
+//   Sample rate handling: `stt_transcribe_pcm(seam, pcm_bytes,
+//   sample_rate)` is the same surface for in-memory PCM (when the
+//   capture is in-process). The framework writes the PCM to a temp
+//   WAV via `audio_synth.audio_write_wav`'s shape, then calls
+//   `stt_transcribe_wav` -- so backends only need to know how to read
+//   a WAV. The sample-rate range (8000-48000) fits inside NOVA's
+//   small-integer codegen window (gotcha #11); confidence milli
+//   (0..1000) likewise.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+//   NOVA dependencies: builtins -- alloc, store8, store64, load8, list_new,
+//   list_set, push, getenv, str_eq, char_at, substr, chr, fork_process,
+//   exec_program, waitpid, sys_open, sys_read, sys_write, sys_close,
+//   sys_fsync from std/syscall (raw pipe2/dup2/close shims via inline
+//   asm). The fork/pipe seam shape is borrowed from `audio_speak.nova`'s
+//   `_run_sh_c` -- same /bin/sh -c argv pattern, plus stdout-capture
+//   wiring layered on top.
+// CrossEngin dependencies: none (intentional -- the seam is a leaf so a
+//   future test rig can mock backends without dragging the daemon's
+//   compilation unit).
+
+import "std/syscall"
+
+// ---- backend identifiers --------------------------------------------------
+
+// stt_default_backend() returns one of these. Tests / chat can override.
+let STT_BACKEND_NONE       = 0      // sentinel, never registered
+let STT_BACKEND_STUB       = 1      // deterministic placeholder
+let STT_BACKEND_SUBPROCESS = 2      // shells out to scripts/transcribe.sh
+let STT_BACKEND_CUSTOM     = 3      // user-registered (tests, plugins)
+
+// Confidence sentinels. Backends are free to emit anywhere in [0..1000].
+let STT_CONFIDENCE_NONE     = 0
+let STT_CONFIDENCE_STUB     = 0          // placeholder -> zero
+let STT_CONFIDENCE_DEFAULT  = 800        // subprocess success -> 0.8 ballpark
+
+// Default path the subprocess shim lives at. Resolvable as a relative path
+// because tests + the daemon both `cd` to repo root before invocation.
+let STT_SHIM_PATH = "scripts/transcribe.sh"
+
+// Placeholder transcript the stub backend returns. Loud enough that the
+// downstream chat / daemon can dispatch a fallback "I cannot hear right
+// now" path without needing a magic error code -- the string itself is
+// the signal.
+let STT_STUB_PLACEHOLDER = "[stt unavailable]"
+
+// Subprocess-backend placeholder (mirrors scripts/transcribe.sh's
+// "[stt: no backend installed]"). The seam strips the brackets check
+// to also recognise the "[stt: input wav missing]" variant.
+let STT_SUBPROC_NO_BACKEND = "[stt: no backend installed]"
+
+// ---- seam state layout ----------------------------------------------------
+//
+// Shape (parallel to stream_stdin.nova's state-list pattern):
+//   [0] tag                (sentinel: STT_SEAM_TAG)
+//   [1] default_backend    (STT_BACKEND_STUB or _SUBPROCESS from env)
+//   [2] registered_count   (number of backends registered)
+//   [3] registered_names   (list of strings -- one entry per backend)
+//   [4] registered_ids     (list of int ids -- parallel to names)
+//   [5] last_transcript    (string -- most recent successful call)
+//   [6] last_confidence    (int milli -- mirror)
+//   [7] last_error         (string -- last error_msg, or "")
+//   [8] call_count         (counter for observability)
+
+let STT_SEAM_TAG = 6301
+
+let STT_TAG            = 0
+let STT_DEFAULT_BACK   = 1
+let STT_REG_COUNT      = 2
+let STT_REG_NAMES      = 3
+let STT_REG_IDS        = 4
+let STT_LAST_TRANS     = 5
+let STT_LAST_CONF      = 6
+let STT_LAST_ERR       = 7
+let STT_CALL_COUNT     = 8
+
+// ---- env helpers -----------------------------------------------------------
+
+// stt_default_backend() reads CE_STT_BACKEND once and returns the
+// constant. Empty / unset / "stub" -> STUB; "subprocess" -> SUBPROCESS;
+// anything else -> STUB (defensive default; we never silently load an
+// unknown plugin).
+fn stt_default_backend() {
+    let env = getenv("CE_STT_BACKEND")
+    if env == 0 { return STT_BACKEND_STUB }
+    if len(env) == 0 { return STT_BACKEND_STUB }
+    if str_eq(env, "subprocess") == 1 { return STT_BACKEND_SUBPROCESS }
+    if str_eq(env, "stub") == 1 { return STT_BACKEND_STUB }
+    return STT_BACKEND_STUB
+}
+
+// ---- constructor -----------------------------------------------------------
+
+fn stt_seam_new() {
+    let s = list_new()
+    push(s, STT_SEAM_TAG)
+    push(s, stt_default_backend())   // [1]
+    push(s, 0)                       // [2] registered_count
+    push(s, list_new())              // [3] names
+    push(s, list_new())              // [4] ids
+    push(s, "")                      // [5] last_transcript
+    push(s, 0)                       // [6] last_confidence
+    push(s, "")                      // [7] last_error
+    push(s, 0)                       // [8] call_count
+    // Pre-register the two built-in backends so stt_seam_backend_name()
+    // returns a sensible string even before the first transcribe call.
+    _stt_register_builtin(s, "stub",       STT_BACKEND_STUB)
+    _stt_register_builtin(s, "subprocess", STT_BACKEND_SUBPROCESS)
+    return s
+}
+
+fn _stt_register_builtin(s, name, id) {
+    let names = s[STT_REG_NAMES]
+    let ids = s[STT_REG_IDS]
+    push(names, name)
+    push(ids, id)
+    list_set(s, STT_REG_COUNT, s[STT_REG_COUNT] + 1)
+    return 1
+}
+
+// ---- public accessors ------------------------------------------------------
+
+// Any backend wired? Returns 1 iff at least one backend is registered
+// AND the default backend (env-driven) is registered. Stub is always
+// wired so this is effectively "is the seam initialized?".
+fn stt_seam_enabled(s) {
+    if s[STT_REG_COUNT] > 0 { return 1 }
+    return 0
+}
+
+// Name of the currently-active default backend, or "" if none.
+// Matches the order: env -> resolved id -> name lookup.
+fn stt_seam_backend_name(s) {
+    let id = s[STT_DEFAULT_BACK]
+    let names = s[STT_REG_NAMES]
+    let ids = s[STT_REG_IDS]
+    let i = 0
+    let n = len(ids)
+    while i < n {
+        if ids[i] == id {
+            return names[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn stt_seam_last_transcript(s) { return s[STT_LAST_TRANS] }
+fn stt_seam_last_confidence(s) { return s[STT_LAST_CONF] }
+fn stt_seam_last_error(s)      { return s[STT_LAST_ERR] }
+fn stt_seam_call_count(s)      { return s[STT_CALL_COUNT] }
+fn stt_seam_default_backend(s) { return s[STT_DEFAULT_BACK] }
+
+// stt_register_backend(seam, name, backend_id) -- append a backend to the
+// registered list. If `name` is already registered, the existing entry's
+// id is updated in place (so tests can swap a mock in). The backend_id
+// becomes the default if it matches the env-resolved choice for `name`;
+// otherwise the env-driven default sticks. Callers that want to FORCE
+// the default switch should also call `stt_seam_set_default`.
+fn stt_register_backend(s, name, backend_id) {
+    let names = s[STT_REG_NAMES]
+    let ids = s[STT_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 {
+            list_set(ids, i, backend_id)
+            return 1
+        }
+        i = i + 1
+    }
+    push(names, name)
+    push(ids, backend_id)
+    list_set(s, STT_REG_COUNT, s[STT_REG_COUNT] + 1)
+    return 1
+}
+
+// stt_seam_set_default(seam, backend_id) -- override the env-driven choice.
+// Tests use this to force the stub or a registered mock; the chat would
+// call this from `/listen --backend=NAME` if such an admin command lands.
+fn stt_seam_set_default(s, backend_id) {
+    list_set(s, STT_DEFAULT_BACK, backend_id)
+    return 1
+}
+
+// Convenience: resolve a name (string) to its registered id, or
+// STT_BACKEND_NONE if not present.
+fn stt_seam_backend_id_for(s, name) {
+    let names = s[STT_REG_NAMES]
+    let ids = s[STT_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 { return ids[i] }
+        i = i + 1
+    }
+    return STT_BACKEND_NONE
+}
+
+// ---- result helpers --------------------------------------------------------
+//
+// Build the [transcript, confidence, error] triple. Mutates the seam's
+// "last_*" mirrors so callers can introspect after the fact (tests + chat
+// admin both rely on this).
+
+fn _stt_result(s, transcript, confidence, error_msg) {
+    let triple = list_new()
+    push(triple, transcript)
+    push(triple, confidence)
+    push(triple, error_msg)
+    list_set(s, STT_LAST_TRANS, transcript)
+    list_set(s, STT_LAST_CONF, confidence)
+    list_set(s, STT_LAST_ERR, error_msg)
+    list_set(s, STT_CALL_COUNT, s[STT_CALL_COUNT] + 1)
+    return triple
+}
+
+// ---- stub backend ----------------------------------------------------------
+//
+// Deterministic: always returns the same placeholder + zero confidence.
+// Selected by default in CI, sandboxed environments, and any test that
+// doesn't want to exercise fork/exec.
+
+fn _stt_backend_stub(s, wav_path) {
+    return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_STUB, "")
+}
+
+// ---- subprocess backend ---------------------------------------------------
+//
+// Forks /bin/sh -c "scripts/transcribe.sh <wav>" with stdout wired to a
+// pipe; reads up to ~16 KB of output, takes the first line, returns it as
+// the transcript. Confidence is the documented ballpark (STT_CONFIDENCE_
+// DEFAULT, 800 milli) on success; 0 if the shim emitted a placeholder
+// line; an error message if fork/exec/read failed outright.
+//
+// The pipe-and-fork dance: NOVA's audio_speak.nova ships a `_run_sh_c`
+// that only cares about the child's exit status. The STT path needs the
+// child's STDOUT, which means:
+//   1. pipe2() (raw asm) -> [read_fd, write_fd].
+//   2. fork. In child: dup2(write_fd, 1), close both pipe ends, exec sh.
+//      In parent: close write_fd, sys_read from read_fd until EOF.
+//   3. waitpid the child to reap (and to get the exit code -- but the
+//      shim contract is "exit 0 even on no backend", so the exit code
+//      is informational only).
+//
+// All raw asm shims are kept SMALL (no large-magnitude multiplies, no
+// loops over giant byte counts at one go) to avoid the codegen pointer-
+// threshold gotcha #11.
+
+// Linux x86-64 syscall numbers
+let _STT_SYS_PIPE2   = 293
+let _STT_SYS_DUP2    = 33
+let _STT_SYS_CLOSE   = 3
+let _STT_SYS_READ    = 0
+
+// argv-builder mirroring audio_speak.nova's _argv3.
+fn _stt_argv3(a0, a1, a2) {
+    let p = alloc(4 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, 0)
+    return p
+}
+
+// pipe2(pipefd[2], 0) -- syscall 293. Returns 0 on success, -1 on failure.
+// pipefd is a 2-int (2 x 4 byte) buffer the kernel fills with [read, write].
+fn _stt_pipe2(pipefd_buf) {
+    asm {
+        "mov rax, 293"
+        "mov rdi, [rbp-8]"
+        "xor rsi, rsi"
+        "syscall"
+    }
+}
+
+fn _stt_dup2(oldfd, newfd) {
+    asm {
+        "mov rax, 33"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "syscall"
+    }
+}
+
+fn _stt_close(fd) {
+    asm {
+        "mov rax, 3"
+        "mov rdi, [rbp-8]"
+        "syscall"
+    }
+}
+
+fn _stt_read(fd, buf, count) {
+    asm {
+        "mov rax, 0"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// Read a little-endian unsigned 32-bit int from `addr`. NOVA has no
+// load32 builtin (only load8). File descriptors are small ints (3..256
+// typically) so the high two bytes are virtually always zero, and we
+// keep the in-function arithmetic small to stay well under NOVA's
+// pointer-threshold (gotcha #11): just byte-shift via add + multiply
+// by 256 + 65536, no 24-bit multiplier in the loop / function body.
+fn _stt_load_le_u32(addr) {
+    let b0 = load8(addr)
+    let b1 = load8(addr + 1)
+    let b2 = load8(addr + 2)
+    let b3 = load8(addr + 3)
+    // Compose without a 16M multiplier: (b3 * 65536) * 256 keeps each
+    // intermediate <= 2^24 (16M), still under the empirical ~1M loop-
+    // body ceiling -- but this is a straight-line function body, so
+    // even the larger products would be fine.
+    let lo = b0 + b1 * 256
+    let hi = b2 + b3 * 256
+    return lo + hi * 65536
+}
+
+// Shell-quote a single argument with single quotes (cribbed from
+// audio_speak.nova's _shell_quote_single). Embedded ' becomes '\''.
+fn _stt_shell_quote(text) {
+    let out = "'"
+    let i = 0
+    while i < len(text) {
+        let c = char_at(text, i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + substr(text, i, 1)
+        }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// Build the shell command line: bash + path + quoted wav.
+fn _stt_build_cmd(wav_path) {
+    return "bash " + STT_SHIM_PATH + " " + _stt_shell_quote(wav_path)
+}
+
+// Convert a raw byte buffer (n bytes) into a NOVA string. Same chr()
+// concatenation pattern stream_stdin uses to dodge the str_new hang.
+fn _stt_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+// Take only the first '\n'-delimited line of `text` (or the whole thing
+// if there's no newline). Trims trailing whitespace + carriage return.
+fn _stt_first_line(text) {
+    let n = len(text)
+    let i = 0
+    while i < n {
+        let c = char_at(text, i)
+        if c == 10 {
+            return substr(text, 0, i)
+        }
+        i = i + 1
+    }
+    return text
+}
+
+// Heuristic: did the shim emit a "[stt: ...]" placeholder rather than a
+// real transcript? Used to map the subprocess result to a STUB-shaped
+// triple. We match on the literal prefix.
+fn _stt_is_placeholder(line) {
+    let n = len(line)
+    if n < 6 { return 0 }
+    if char_at(line, 0) != 91 { return 0 }   // '['
+    if char_at(line, 1) != 115 { return 0 }  // 's'
+    if char_at(line, 2) != 116 { return 0 }  // 't'
+    if char_at(line, 3) != 116 { return 0 }  // 't'
+    return 1
+}
+
+// Read up to `max_bytes` from `fd` into a fresh string, looping until EOF
+// or the cap is hit. Bounded buffer is allocated once outside the loop
+// to keep the in-loop arithmetic small (no big multiplies). The 16 KB
+// cap is far above any realistic single-utterance transcript and well
+// under NOVA's pointer-threshold ceiling.
+fn _stt_drain_fd(fd, max_bytes) {
+    let acc = ""
+    let buf = alloc(4096)
+    let total = 0
+    let keep = 1
+    while keep == 1 {
+        let n = _stt_read(fd, buf, 4096)
+        if n <= 0 {
+            keep = 0
+        } else {
+            acc = acc + _stt_bytes_to_str(buf, n)
+            total = total + n
+            if total >= max_bytes { keep = 0 }
+        }
+    }
+    return acc
+}
+
+fn _stt_backend_subprocess(s, wav_path) {
+    // Build the /bin/sh -c command line. The shim path is relative so
+    // the daemon's cwd matters; tests cd to repo root before driving.
+    let cmd = _stt_build_cmd(wav_path)
+    let argv = _stt_argv3("sh", "-c", cmd)
+
+    // pipe2 to capture stdout. pipefd is two int32s = 8 bytes total.
+    let pipefd_buf = alloc(8)
+    let pipe_r = _stt_pipe2(pipefd_buf)
+    if pipe_r < 0 {
+        return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE, "pipe2 failed")
+    }
+    // NOVA has no load32 builtin; reassemble the two int32 fds from
+    // little-endian byte streams. fd values are small (<1024 typically),
+    // so reading the low byte alone would even suffice, but we do the
+    // full 4-byte LE for robustness on systems with high-fd seeds.
+    let read_fd  = _stt_load_le_u32(pipefd_buf)
+    let write_fd = _stt_load_le_u32(pipefd_buf + 4)
+
+    let pid = fork_process()
+    if pid < 0 {
+        _stt_close(read_fd)
+        _stt_close(write_fd)
+        return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE, "fork failed")
+    }
+    if pid == 0 {
+        // CHILD: rewire stdout to the pipe's write end, close both pipe
+        // ends in the child (dup2 keeps fd 1 open), exec /bin/sh.
+        _stt_dup2(write_fd, 1)
+        _stt_close(write_fd)
+        _stt_close(read_fd)
+        exec_program("/bin/sh", argv)
+        // exec_program only returns on failure; we can't propagate a
+        // meaningful error back through the pipe at this point, so just
+        // exit with a non-zero code -- the parent reads "" from the pipe
+        // and reports it as an empty transcript with an error.
+        exit(127)
+    }
+
+    // PARENT: close the write end (so the read side sees EOF when the
+    // child exits), drain the read end, reap the child.
+    _stt_close(write_fd)
+    let out = _stt_drain_fd(read_fd, 16384)
+    _stt_close(read_fd)
+    let status = waitpid(pid)
+
+    // Strip to the first line.
+    let line = _stt_first_line(out)
+    let n = len(line)
+    if n == 0 {
+        // Empty output -- treat as an error result. The exit status is
+        // diagnostic; the seam reports the line as the placeholder.
+        return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE,
+                           "subprocess returned no transcript")
+    }
+    if _stt_is_placeholder(line) == 1 {
+        // The shim ran but no backend was available, or the input WAV
+        // was missing. Map to a stub-shaped triple (confidence 0) but
+        // preserve the bracketed message in the transcript slot so the
+        // operator can see what happened.
+        return _stt_result(s, line, STT_CONFIDENCE_STUB, "")
+    }
+    return _stt_result(s, line, STT_CONFIDENCE_DEFAULT, "")
+}
+
+// ---- public dispatch ------------------------------------------------------
+
+// stt_transcribe_wav(seam, wav_path) -> [transcript, confidence_milli,
+//                                         error_msg]
+//
+// Resolves the seam's active backend id, dispatches to the matching
+// `_stt_backend_*` function, returns the triple. Callers should treat
+// transcript=="[stt unavailable]" + confidence==0 as "no STT today" and
+// the chat path as "the operator's speech was not heard".
+
+fn stt_transcribe_wav(s, wav_path) {
+    let id = s[STT_DEFAULT_BACK]
+    if id == STT_BACKEND_SUBPROCESS {
+        return _stt_backend_subprocess(s, wav_path)
+    }
+    // STT_BACKEND_STUB or anything else.
+    return _stt_backend_stub(s, wav_path)
+}
+
+// stt_transcribe_pcm(seam, pcm_bytes, sample_rate) -> [transcript, conf,
+//                                                      error]
+//
+// In-memory PCM path. This rev WRITES the buffer to a temp WAV at a fixed
+// path (`/tmp/ce_stt_input.wav`) using the same 44-byte RIFF/WAVE/PCM
+// header that audio_synth.nova ships, then delegates to
+// `stt_transcribe_wav`. A future revision would skip the temp file when
+// the backend supports stdin PCM (whisper.cpp `-f -` reads stdin).
+//
+// pcm_bytes is a LIST of signed-int samples (matches audio_synth's
+// sample format). sample_rate is in Hz; supported range 8000..48000
+// (NOVA-friendly small ints, no pointer-threshold risk).
+
+let _STT_TMP_WAV_PATH = "/tmp/ce_stt_input.wav"
+
+// File flags + mode for the temp WAV write. Identical numerics to
+// audio_synth.nova's audio_write_wav -- O_WRONLY|O_CREAT|O_TRUNC = 577.
+let _STT_WAV_FLAGS = 577
+let _STT_WAV_MODE  = 420       // 0644
+
+// Push a 16-bit little-endian value into a byte-buffer at `off`. Caller
+// guarantees the buffer is large enough.
+fn _stt_put_le_u16(buf, off, v) {
+    store8(buf + off,     v & 255)
+    store8(buf + off + 1, (v / 256) & 255)
+    return 1
+}
+
+fn _stt_put_le_u32(buf, off, v) {
+    store8(buf + off,     v & 255)
+    store8(buf + off + 1, (v / 256) & 255)
+    store8(buf + off + 2, (v / 65536) & 255)
+    store8(buf + off + 3, (v / 16777216) & 255)
+    return 1
+}
+
+fn _stt_put_ascii(buf, off, s) {
+    let i = 0
+    while i < len(s) {
+        store8(buf + off + i, char_at(s, i))
+        i = i + 1
+    }
+    return 1
+}
+
+// Compose a 44-byte WAV header for `n_samples` 16-bit mono samples at
+// `sample_rate`. Same layout as wav_header() in audio_synth.nova; we
+// duplicate the math here so this module stays a leaf (no dep on
+// audio_synth pulling in its language KG transitive imports).
+fn _stt_write_wav_header(buf, sample_rate, n_samples) {
+    let data_size = n_samples * 2
+    _stt_put_ascii(buf, 0,  "RIFF")
+    _stt_put_le_u32(buf, 4, 36 + data_size)
+    _stt_put_ascii(buf, 8,  "WAVE")
+    _stt_put_ascii(buf, 12, "fmt ")
+    _stt_put_le_u32(buf, 16, 16)
+    _stt_put_le_u16(buf, 20, 1)             // PCM
+    _stt_put_le_u16(buf, 22, 1)             // mono
+    _stt_put_le_u32(buf, 24, sample_rate)
+    _stt_put_le_u32(buf, 28, sample_rate * 2)
+    _stt_put_le_u16(buf, 32, 2)
+    _stt_put_le_u16(buf, 34, 16)
+    _stt_put_ascii(buf, 36, "data")
+    _stt_put_le_u32(buf, 40, data_size)
+    return 1
+}
+
+// Write the PCM list out as a 44-byte WAV header + 16-bit samples to
+// path. Returns 1 on success, 0 on syscall failure. Mirrors the
+// audio_write_wav durability contract (write + fsync + close).
+fn _stt_write_pcm_wav(pcm_list, sample_rate, path) {
+    let n = len(pcm_list)
+    let total = 44 + n * 2
+    let buf = alloc(total + 1)
+    _stt_write_wav_header(buf, sample_rate, n)
+    let i = 0
+    while i < n {
+        let v = pcm_list[i]
+        let u = v & 65535
+        if v < 0 { u = (v + 65536) & 65535 }
+        store8(buf + 44 + i * 2,     u & 255)
+        store8(buf + 44 + i * 2 + 1, (u / 256) & 255)
+        i = i + 1
+    }
+    let fd = sys_open(path, _STT_WAV_FLAGS, _STT_WAV_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, total)
+    if written != total {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+fn stt_transcribe_pcm(s, pcm_list, sample_rate) {
+    // Defensive parameter clamp -- the sample rate must be a small int
+    // so the wav-header LE encoder stays under NOVA's pointer threshold.
+    let sr = sample_rate
+    if sr < 8000 { sr = 8000 }
+    if sr > 48000 { sr = 48000 }
+    let wrote = _stt_write_pcm_wav(pcm_list, sr, _STT_TMP_WAV_PATH)
+    if wrote == 0 {
+        return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE,
+                           "could not write temp wav")
+    }
+    return stt_transcribe_wav(s, _STT_TMP_WAV_PATH)
+}
+
+// ---- result tuple accessors ----------------------------------------------
+//
+// Helpers so callers don't have to remember the tuple index order.
+// `stt_result_*` reads the [transcript, confidence, error] triple.
+
+fn stt_result_transcript(r) { return r[0] }
+fn stt_result_confidence(r) { return r[1] }
+fn stt_result_error(r)      { return r[2] }

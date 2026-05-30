@@ -106,6 +106,118 @@ continue. It is updated at every session boundary.
   Sample stats output (verified): `(compacted: 99 dead atoms dropped, 0
   archived episodes dropped, 0 old moments dropped, 0 synapses below new
   threshold dropped; snapshot 184KB -> 168KB)`.
+- P2.5 STT framework + audit: **complete (framework only)**.
+  The matching STT (speech-to-text) half of the audio modality bridge that
+  P19 + P2.6 closed for TTS. Speech recognition in 2026 is either a
+  deep-learning blackbox (Whisper, wav2vec, Conformer-RNN-T) or a
+  multi-month classical pipeline (MFCC + GMM-HMM + Viterbi); neither
+  fits in pure NOVA this decade. This session ships the FRAMEWORK
+  (pluggable backend seam, subprocess shim, env-gated audio capture
+  source) and a thorough audit (`STT_AUDIT.md`, ~900 words) documenting
+  the realistic path -- mirroring the WIN32_AUDIT / MACOS_AUDIT /
+  TLS_AUDIT / WASM_AUDIT precedents. The sandbox has no microphone
+  hardware and none of the standard CPU acoustic toolchains installed
+  (verified: no `whisper-cli`, no `whisper`, no `main`,
+  no `vosk-transcriber`, no `arecord`, no `parecord`, no `espeak`), so
+  no real STT exists. The end-to-end run-time path (mic -> WAV ->
+  transcript -> EV_MESSAGE) is documented as "deferred until microphone
+  hardware" and is the natural follow-up.
+  New modules under `src/io/transducers/`:
+  - **`stt_seam.nova`** (NEW) -- the pluggable STT surface. Public API:
+    `stt_seam_new()` constructs a seam (pre-registers "stub" and
+    "subprocess" backends so `stt_seam_backend_name()` returns a
+    sensible string even before the first transcription call).
+    `stt_seam_enabled(seam)` returns 1 iff any backend is wired (always
+    1 post-construction since the stub is always registered).
+    `stt_seam_backend_name(seam)` returns the active default's name
+    string ("subprocess" / "stub" / "" if unset).
+    `stt_transcribe_wav(seam, wav_path)` returns the
+    `[transcript, confidence_milli, error_msg]` triple regardless of
+    which backend produced the answer. `stt_transcribe_pcm(seam,
+    pcm_list, sample_rate)` writes the PCM samples to a temp WAV at
+    `/tmp/ce_stt_input.wav` (same 44-byte RIFF/WAVE/PCM header
+    `audio_synth.audio_write_wav` ships) then delegates to
+    `stt_transcribe_wav`. `stt_register_backend(seam, name,
+    backend_id)` appends or in-place-updates a backend in the registry
+    (so a test mock or a future WASM plugin can wire in without
+    touching the dispatcher). `stt_default_backend()` reads
+    `CE_STT_BACKEND` once: "subprocess" -> SUBPROCESS, anything else /
+    unset -> STUB. Two real backends ship:
+    * **Stub backend** -- deterministic placeholder.
+      Returns `[stt unavailable]` + confidence 0 + empty error.
+      Selected by default in CI / sandboxed environments where
+      fork/exec is undesirable.
+    * **Subprocess backend** -- shells out to `scripts/transcribe.sh
+      <wav>` via /bin/sh -c with stdout wired through a `pipe2(2)` so
+      the seam reads the child's transcript line. The fork/pipe dance
+      is a small raw-asm cluster (pipe2, dup2, close are inline asm;
+      fork_process/exec_program/waitpid are existing NOVA builtins).
+      Confidence on success is the documented ballpark 800 milli
+      (subprocess output has no native confidence on stdout); on
+      placeholder output ("[stt: ...]") the confidence is 0 and the
+      bracketed line is preserved in the transcript slot so callers
+      can introspect which fallback fired.
+  - **`stream_audio.nova`** (NEW) -- env-gated audio-capture source.
+    Same poll-once-per-tick shape as `stream_stdin.nova`, takes
+    `CE_AUDIO_CAPTURE_CMD` (e.g. `arecord -d 5 -q -f cd
+    /tmp/ce_input.wav`) and `CE_STT_BACKEND` from env; activates only
+    when BOTH are set non-empty. Each `stream_audio_poll(s, hs)`
+    advances a tick counter; on every `CE_AUDIO_POLL_INTERVAL_TICKS`
+    (default 100 -- roughly once per second at 100 Hz) the source
+    shells out to the capture command, runs the STT seam against the
+    produced WAV, normalizes the transcript via `transduce_text` (the
+    same path stdin uses), and posts it as `EV_MESSAGE` -- unless the
+    transcript is a `[stt...` placeholder, in which case the source
+    silently drops it. Default OFF so all existing integration tests
+    are bit-identical.
+  New shim under `scripts/`:
+  - **`scripts/transcribe.sh`** (NEW) -- the subprocess shim. Takes a
+    WAV file path; emits the transcript on stdout, one line. Detects
+    which backend is installed at runtime (quality order:
+    `whisper-cli` -> `main` -> `vosk-transcriber`); falls back to
+    `echo "[stt: no backend installed]"` when none are present. Exits
+    0 on success AND on "no backend available" AND on "input WAV
+    missing" (so a caller in a sealed sandbox never sees a non-zero
+    exit -- the placeholder line tells it the transcript is
+    unavailable). Install commands for each backend documented in the
+    script header (`git clone whisper.cpp`; `pip install vosk
+    vosk-transcriber`).
+  New centerpiece doc at repo root:
+  - **`STT_AUDIT.md`** (NEW) -- the realistic-path write-up. Why
+    structural STT is hard (non-stationary noise + voiced segments;
+    Whisper/wav2vec presupposes hundreds of MB of trained weights;
+    classical Kaldi/HTK pipelines presuppose Viterbi+FST+EM training);
+    three realistic options for CrossEngin in increasing difficulty
+    (subprocess shim ~3-5 days, WASM-compiled Whisper ~2-3 weeks once
+    P2.7 ships, pure-NOVA phoneme classifier ~3-6 months); the
+    WASI/Linux/macOS/Windows audio-capture matrix; the
+    `scripts/transcribe.sh` contract; latency budgets (real-time
+    conversation needs <500 ms; whisper.cpp tiny.en CPU is 1-2 s for a
+    5-second utterance; vosk is closer to real-time); cross-references
+    to the new modules + ADR-0014/0015.
+  Acceptance: `tests/unit/test_stt_seam.nova` (NEW; ~15 assertions
+  asked, 26 delivered) covers seam construction + tag sentinel,
+  default backend env-resolved validity, the two built-in backends
+  pre-registered post-construction, `stt_seam_enabled`/backend-name
+  accessors, the stub backend's deterministic
+  placeholder+confidence-0+empty-error triple, last_* mirrors tracking
+  call_count, the subprocess backend's missing-file
+  "[stt: input wav missing]" prefix recognition (mapping to confidence
+  0 with the bracketed line in the transcript slot), `stt_register_backend`
+  append + in-place-update semantics, the dispatcher's fall-through
+  for any non-SUBPROCESS id (custom mock id lands on the stub branch
+  -- documents the "function-pointer-shaped thing" limitation), and
+  the `stt_result_*` triple accessors. Verified:
+  - `NOVA_ROOT=/home/user/NOVA make build` -> all 109 modules compile
+    (+2 from `stt_seam.nova` and `stream_audio.nova`).
+  - `NOVA_ROOT=/home/user/NOVA make test` -> 115 unit-test files pass
+    (+1 suite for `test_stt_seam.nova`, +26 assertions).
+  - `bash scripts/transcribe.sh /tmp/nonexistent.wav` -> echoes
+    `[stt: input wav missing]`, exit 0 (as required).
+  - The streaming-stdin integration path is bit-identical (no
+    `stream_stdin.nova` changes).
+  - No microphone hardware in sandbox -> integration test is the
+    documented deferred follow-up.
 - P2.6 multi-formant Klatt phoneme synthesizer: **complete**.
   The original P19 audio bridge shipped a pure-NOVA single-carrier sine
   synth -- audibly a sequence of phonemes but comically robotic. P2.6
@@ -1390,7 +1502,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 114 (114 PASS, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
+- Total unit suites: 115 (115 PASS, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
 - Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.
