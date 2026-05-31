@@ -1593,9 +1593,14 @@ continue. It is updated at every session boundary.
   `episode_storage.nova`, `syn_set_eligibility` + `syn_restore` in
   `synapse_graph.nova`, `self_model_clear` + `self_model_restore` in
   `competence_tracker.nova`. The chat's `_build_snapshot`, `_admin_save`,
-  and `_admin_load` thread the moment stream, episodic memory, the reasoning
-  part's synapse graph, and a self-model through the new section helpers;
-  the daemon's `_checkpoint` does the same. `/status` gains three new lines
+  and `_admin_load` thread the moment stream, episodic memory, the WHOLE
+  part registry (multi-part synapse capture, P0.1 follow-up #2; was
+  reasoning-only), and a self-model through the new section helpers;
+  the daemon's `_checkpoint` does the same. The wire format gained a
+  `synapses.parts.count` / `synapses.parts[N].label` / per-part nested
+  records block (additive, backward-compatible: a legacy snapshot with
+  only `synapses.count` parses as before and installs into reasoning).
+  `/status` gains three new lines
   (`moments`, `synapses`, `selfmodel`) so a post-restart `/load` is
   immediately verifiable. Acceptance test passes: `printf
   '/teach widget\nwidget\nwidget gadget\nwidget gadget fever\n/save\n/quit\n'
@@ -1603,11 +1608,16 @@ continue. It is updated at every session boundary.
   ./bin/crossengin-chat` reports `moments : 3 moment(s), 3 episode(s)` plus
   `knowledge: 574 atoms` and the right `audit: K decision-log entries`.
   Acceptance: `tests/unit/test_snapshot_episodic.nova` (51 assertions),
-  `tests/unit/test_snapshot_synapses.nova` (43 assertions including the
-  threshold-cut behavior + the inhibitory-weight case + idempotent re-apply),
+  `tests/unit/test_snapshot_synapses.nova` (89 assertions: the original 43
+  -- threshold-cut, inhibitory-weight, idempotent re-apply -- plus 46 new
+  multi-part assertions added in the P0.1 follow-up #2: 3-part round-trip
+  with distinct synapse patterns + per-part survival + cross-part
+  isolation, empty-part skipping, legacy-fallback apply, multi-part
+  idempotence, unknown-part skip-with-warning),
   `tests/unit/test_snapshot_selfmodel.nova` (38 assertions covering the
   three competence kinds, derived-tier survival, REPLACE policy, legacy
-  presence-only stub) -- 132 new assertions across the three suites;
+  presence-only stub) -- 178 assertions across the three suites
+  (132 in the original P0.1 lift + 46 in the multi-part follow-up);
   `tests/integration/scenario_a2_full_state.sh` extends scenario A with 16
   assertions for SIGKILL durability of the new sections.
 

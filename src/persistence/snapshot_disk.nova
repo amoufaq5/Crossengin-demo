@@ -97,11 +97,30 @@
 //
 //     synapses.present 1
 //     synapses.threshold <int>                 # the cut actually used (milli)
-//     synapses.count <int>
+//     synapses.count <int>                     # LEGACY: count of records in
+//                                              # the back-compat top-level block
+//                                              # (mirrors parts[0]'s records)
 //     synapses[N].src <int>
 //     synapses[N].dst <int>
 //     synapses[N].weight <int>                 # milli
 //     synapses[N].eligibility <int>            # milli
+//     synapses.parts.count <int>               # NEW: how many parts have synapses
+//     synapses.parts[N].label <string>         # e.g. "reasoning", "emotion"
+//     synapses.parts[N].synapses.count <int>
+//     synapses.parts[N].synapses[K].src <int>
+//     synapses.parts[N].synapses[K].dst <int>
+//     synapses.parts[N].synapses[K].weight <int>
+//     synapses.parts[N].synapses[K].eligibility <int>
+//
+//   Multi-part capture (P0.1 follow-up #2): the substrate's part registry
+//   exposes each part's synapse graph; the writer walks every part with
+//   live synapses and emits a per-part block. The top-level legacy block
+//   stays populated with whatever was previously the single captured graph
+//   ("reasoning") so an OLD reader still rehydrates the most learning-bearing
+//   part. A NEW reader that sees `synapses.parts.count` ignores the legacy
+//   block and consumes per-part records, installing each into its named
+//   part. Backwards compat: a snapshot WITHOUT `synapses.parts.count` parses
+//   as before -- the legacy records install into the reasoning part only.
 //
 //   SELFMODEL section. Per-domain competence (know/do/understand). Per record
 //   we encode reliability, evidence count, and the derived tier (so a /status
@@ -165,6 +184,7 @@ import "../language/word_atoms.nova"
 import "../parts/episodic/moment_stream.nova"
 import "../parts/episodic/episode_storage.nova"
 import "../substrate/synapse_graph.nova"
+import "../substrate/part_registry.nova"
 import "../kg/competence_tracker.nova"
 
 // ---- text encoding ---------------------------------------------------------
@@ -673,9 +693,16 @@ fn episodic_section_apply(stream, em, blob) {
 // format records the threshold actually used so a reader can know what was
 // dropped.
 //
-// Blob layout:
+// Blob layout (multi-part):
 //   [0] threshold (int, milli)
-//   [1] records: list of [src, dst, weight, eligibility]
+//   [1] records: list of [src, dst, weight, eligibility]   // LEGACY: the
+//       reasoning part's records (or the single-graph build's records),
+//       kept populated so an OLD reader still rehydrates that graph.
+//   [2] parts: list of per-part records, each a 2-element list
+//              [label_string, list of [src, dst, weight, eligibility]]
+//       This is the multi-part capture. A new reader prefers this list
+//       and installs each part's records into the matching named part;
+//       a missing or empty parts list falls through to the legacy block.
 
 let SYN_SNAP_MIN     = 100      // 0.1 default cut: anything weaker is noise
 let SYN_SNAP_HARDCAP = 50000    // auto-raise threshold once we'd write >50K syns
@@ -696,31 +723,23 @@ fn _count_above_threshold(g, threshold) {
     return c
 }
 
-fn synapses_section_build(g) {
-    let blob = list_new()
+// Pick a writer-side threshold for a single graph: start at SYN_SNAP_MIN,
+// auto-raise in 100-milli steps until the count above threshold is under the
+// 50K hardcap. Same auto-tune that `synapses_section_build` ran inline; we
+// pulled it out so the multi-part builder can apply ONE threshold across
+// every part (the wire format records ONE threshold for the whole section).
+fn _syn_pick_threshold(g) {
     let threshold = SYN_SNAP_MIN
-    // Auto-tune: if the default threshold would exceed the hardcap, raise.
-    // We bump in 100-milli increments rather than computing a precise cut --
-    // the substrate's weight distribution is bumpy enough that a one-shot
-    // analytical pick wouldn't help, and this keeps the cut human-readable.
     while _count_above_threshold(g, threshold) > SYN_SNAP_HARDCAP {
         if threshold >= 900 {
             threshold = 900
-            // can't raise further; the recs will exceed the hardcap. The
-            // writer keeps going (a 50K+ snapshot is still readable; the cap
-            // is a guidance, not a hard error).
             let above = _count_above_threshold(g, threshold)
-            // Defensive: still over cap -> break the loop.
             if above > SYN_SNAP_HARDCAP { threshold = 1000 }
         } else {
             threshold = threshold + 100
         }
         if threshold > 999 {
-            // No threshold short of W_MAX will get us under cap; settle here
-            // and emit what we have. The reader will see synapses.threshold
-            // and know what fell off.
             threshold = 999
-            // Final defensive exit -- one extra pass max.
             if _count_above_threshold(g, threshold) <= SYN_SNAP_HARDCAP {
                 // Acceptable; fall through.
             } else {
@@ -728,8 +747,12 @@ fn synapses_section_build(g) {
             }
         }
     }
-    push(blob, threshold)
+    return threshold
+}
 
+// Build the flat (src,dst,weight,elig) record list from a single graph, dropping
+// anything with |weight| below the supplied threshold.
+fn _syn_records_for(g, threshold) {
     let recs = list_new()
     let n = syn_total(g)
     let i = 0
@@ -749,7 +772,90 @@ fn synapses_section_build(g) {
         }
         i = i + 1
     }
+    return recs
+}
+
+// Single-graph builder (legacy contract). Used by callers (and existing
+// tests) that only persist one graph. blob[2] is left empty -- the multi-
+// part list is opt-in via `synapses_section_build_multi`.
+fn synapses_section_build(g) {
+    let threshold = _syn_pick_threshold(g)
+    let recs = _syn_records_for(g, threshold)
+    let blob = list_new()
+    push(blob, threshold)
     push(blob, recs)
+    push(blob, list_new())   // [2] parts: empty (single-graph build)
+    return blob
+}
+
+// Multi-part builder. Walks every part in the registry; for each part with at
+// least one synapse above the chosen threshold, emits a (label, records) pair
+// into blob[2]. The chosen threshold is the MAX of every per-part autotune so
+// the section's recorded `synapses.threshold` is a true lower-bound across
+// all captured records.
+//
+// blob[1] (legacy block) mirrors the reasoning part's records when one
+// exists; otherwise it mirrors the FIRST part with records. This keeps an
+// OLD reader rehydrating the most learning-bearing graph as before.
+fn synapses_section_build_multi(reg) {
+    // First pass: pick a section-wide threshold. We need ONE int for the
+    // whole section, so we take the max of every per-part autotune.
+    let threshold = SYN_SNAP_MIN
+    let n = registry_count(reg)
+    let i = 0
+    while i < n {
+        let p = registry_get(reg, i)
+        if p != 0 {
+            let g = part_syn(p)
+            if g != 0 {
+                let t = _syn_pick_threshold(g)
+                if t > threshold { threshold = t }
+            }
+        }
+        i = i + 1
+    }
+
+    // Second pass: capture per-part records. Skip parts whose record list
+    // is empty after the threshold cut -- they'd just add noise to the wire
+    // format. Order matches the registry's part-id order, which is stable
+    // for the process lifetime (registry_add appends).
+    let parts_list = list_new()
+    let legacy_recs = list_new()
+    let legacy_chosen = 0
+    let reasoning_recs = 0
+    let i2 = 0
+    while i2 < n {
+        let p = registry_get(reg, i2)
+        if p != 0 {
+            let g = part_syn(p)
+            if g != 0 {
+                let recs = _syn_records_for(g, threshold)
+                if len(recs) > 0 {
+                    let entry = list_new()
+                    push(entry, part_name(p))
+                    push(entry, recs)
+                    push(parts_list, entry)
+                    // Legacy fallback choice: prefer the reasoning part; else
+                    // first non-empty.
+                    if str_eq(part_name(p), "reasoning") == 1 {
+                        reasoning_recs = recs
+                    } else {
+                        if legacy_chosen == 0 {
+                            legacy_recs = recs
+                            legacy_chosen = 1
+                        }
+                    }
+                }
+            }
+        }
+        i2 = i2 + 1
+    }
+    if reasoning_recs != 0 { legacy_recs = reasoning_recs }
+
+    let blob = list_new()
+    push(blob, threshold)
+    push(blob, legacy_recs)
+    push(blob, parts_list)
     return blob
 }
 
@@ -757,8 +863,10 @@ fn synapses_section_serialize(blob) {
     let lines = list_new()
     let threshold = SYN_SNAP_MIN
     let recs = list_new()
+    let parts_list = list_new()
     if len(blob) > 0 { threshold = blob[0] }
     if len(blob) > 1 { recs = blob[1] }
+    if len(blob) > 2 { parts_list = blob[2] }
     _push_kv_int(lines, "synapses.threshold", threshold)
     _push_kv_int(lines, "synapses.count",     len(recs))
     let i = 0
@@ -771,12 +879,41 @@ fn synapses_section_serialize(blob) {
         _push_kv_int(lines, prefix + ".eligibility", r[3])
         i = i + 1
     }
+    // Multi-part block. We always emit `synapses.parts.count`, even when 0,
+    // so a reader can DISTINGUISH "no parts list known" (legacy snapshot
+    // omits the line) from "explicitly empty" (count = 0).
+    _push_kv_int(lines, "synapses.parts.count", len(parts_list))
+    let pj = 0
+    while pj < len(parts_list) {
+        let pe = parts_list[pj]
+        let plabel = pe[0]
+        let precs  = pe[1]
+        let pp = "synapses.parts[" + int_to_str(pj) + "]"
+        _push_kv_str(lines, pp + ".label",          plabel)
+        _push_kv_int(lines, pp + ".synapses.count", len(precs))
+        let pk = 0
+        while pk < len(precs) {
+            let r = precs[pk]
+            let pkpref = pp + ".synapses[" + int_to_str(pk) + "]"
+            _push_kv_int(lines, pkpref + ".src",         r[0])
+            _push_kv_int(lines, pkpref + ".dst",         r[1])
+            _push_kv_int(lines, pkpref + ".weight",      r[2])
+            _push_kv_int(lines, pkpref + ".eligibility", r[3])
+            pk = pk + 1
+        }
+        pj = pj + 1
+    }
     return lines
 }
 
 // Apply the SYNAPSES blob: install each (src, dst, weight, elig) into the
 // live graph. Existing pre->post edges get their weight overwritten (idempotent
 // on a second /load of the same snapshot via syn_restore's syn_find shortcut).
+//
+// This is the LEGACY single-graph apply. The multi-part apply
+// `synapses_section_apply_multi(reg, blob)` is preferred when a part
+// registry is available; this function stays for callers that only have
+// one graph at hand (unit tests, the daemon's single-graph path).
 fn synapses_section_apply(g, blob) {
     if len(blob) < 2 { return 0 }
     let recs = blob[1]
@@ -789,6 +926,77 @@ fn synapses_section_apply(g, blob) {
         i = i + 1
     }
     return n
+}
+
+// Multi-part apply. Looks up each `synapses.parts[N]` entry's named part in
+// the registry and installs its records there. If a part labelled in the
+// snapshot is not present in the live registry, the entry is SKIPPED with a
+// one-line stdout warning -- same friendly-forward-compat policy as
+// kg_section_apply: a snapshot from a future build that names a new part
+// (e.g. "language", added post-rebuild) can still rehydrate the parts an
+// older build still recognizes.
+//
+// Backwards compat: a snapshot without `synapses.parts.count` (legacy P0.1
+// shape) has blob[2] absent or empty; in that case we fall through to the
+// reasoning part and install blob[1] there -- bit-identical to the old
+// `synapses_section_apply(reasoning_syn_g, blob)` path.
+//
+// Returns the total number of synapses installed across all parts.
+fn synapses_section_apply_multi(reg, blob) {
+    if len(blob) < 2 { return 0 }
+    let parts_list = list_new()
+    if len(blob) > 2 { parts_list = blob[2] }
+    let n_parts = len(parts_list)
+    if n_parts == 0 {
+        // Legacy / empty multi-block: install legacy records into the
+        // reasoning part (the historic single-graph target).
+        let reasoning_id = registry_find(reg, "reasoning")
+        if reasoning_id == -1 { return 0 }
+        let rp = registry_get(reg, reasoning_id)
+        if rp == 0 { return 0 }
+        return synapses_section_apply(part_syn(rp), blob)
+    }
+    let total = 0
+    let i = 0
+    while i < n_parts {
+        let pe = parts_list[i]
+        let plabel = pe[0]
+        let precs  = pe[1]
+        let pid = registry_find(reg, plabel)
+        if pid == -1 {
+            // Split into single appends to dodge a NOVA codegen pointer-
+            // threshold overflow seen on a longer chained "+" form. The
+            // same workaround pattern as Agent B's long-line fix in the
+            // chat binary -- a single tall expression with this many
+            // string constants spills past the threshold.
+            let msg = "(warning: snapshot synapses.parts["
+            msg = msg + int_to_str(i)
+            msg = msg + "] names unknown part '"
+            msg = msg + plabel
+            msg = msg + "' -- skipped)"
+            io_println(msg)
+        } else {
+            let p = registry_get(reg, pid)
+            if p != 0 {
+                let g = part_syn(p)
+                let k = 0
+                while k < len(precs) {
+                    let r = precs[k]
+                    syn_restore(g, r[0], r[1], r[2], r[3])
+                    total = total + 1
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// Count of distinct parts captured in the multi-part block (0 for legacy).
+fn synapses_section_parts_count(blob) {
+    if len(blob) < 3 { return 0 }
+    return len(blob[2])
 }
 
 // ---- SELFMODEL section blob: build / serialize / parse / apply ------------
@@ -1096,6 +1304,17 @@ fn _ensure_syn_recs(recs, n) {
     return 1
 }
 
+// Pad a list of multi-part synapse entries: each entry is [label, records_list].
+fn _ensure_syn_part_entries(parts, n) {
+    while len(parts) < n {
+        let pe = list_new()
+        push(pe, "")            // label
+        push(pe, list_new())    // records list (each rec: [src,dst,w,e])
+        push(parts, pe)
+    }
+    return 1
+}
+
 // Pad a list of selfmodel domain records (label, kind, reliability, evidence, tier).
 fn _ensure_sm_recs(recs, n) {
     while len(recs) < n {
@@ -1175,6 +1394,8 @@ fn snap_from_text(text) {
     let syn_threshold = SYN_SNAP_MIN
     let syn_count_seen = -1
     let syn_recs = list_new()
+    let syn_parts_count_seen = -1
+    let syn_parts = list_new()        // list of [label, records_list]
     let selfmodel_present = 0
     let sm_count_seen = -1
     let sm_recs = list_new()
@@ -1314,7 +1535,7 @@ fn snap_from_text(text) {
                 if str_eq(k, "synapses.count") == 1 {
                     syn_count_seen = _line_val_int(line)
                 }
-                // synapses[N].field
+                // synapses[N].field (legacy single-graph records)
                 if _starts_with(k, "synapses[") == 1 {
                     let idx = _index_in_key(k)
                     let suf = _suffix_in_key(k)
@@ -1325,6 +1546,62 @@ fn snap_from_text(text) {
                         if str_eq(suf, "dst") == 1         { list_set(rec, 1, _line_val_int(line)) }
                         if str_eq(suf, "weight") == 1      { list_set(rec, 2, _line_val_int(line)) }
                         if str_eq(suf, "eligibility") == 1 { list_set(rec, 3, _line_val_int(line)) }
+                    }
+                }
+                // Multi-part synapses block (forward-compat with single-part
+                // capture). `synapses.parts.count` is the entry count; each
+                // entry is identified by `synapses.parts[N].<field>` and
+                // nested `synapses.parts[N].synapses[K].<field>` records.
+                if str_eq(k, "synapses.parts.count") == 1 {
+                    syn_parts_count_seen = _line_val_int(line)
+                }
+                if _starts_with(k, "synapses.parts[") == 1 {
+                    // Outer index is the parts-entry id; the rest of the key
+                    // is either `.label`, `.synapses.count`, or a nested
+                    // `.synapses[K].<field>`.
+                    let lb1 = _find_byte(k, 0, 91)              // first '['
+                    let rb1 = _find_byte(k, lb1 + 1, 93)
+                    if lb1 >= 0 {
+                        if rb1 > lb1 + 1 {
+                            let pidx = str_to_int(substr(k, lb1 + 1, rb1 - lb1 - 1))
+                            // Suffix begins after `].`
+                            let suf_start = rb1 + 2
+                            if suf_start <= len(k) {
+                                let suf = substr(k, suf_start, len(k) - suf_start)
+                                _ensure_syn_part_entries(syn_parts, pidx + 1)
+                                let pe = syn_parts[pidx]
+                                if str_eq(suf, "label") == 1 {
+                                    list_set(pe, 0, _line_val(line))
+                                }
+                                if str_eq(suf, "synapses.count") == 1 {
+                                    // No pre-allocation needed -- records
+                                    // are appended via _ensure_syn_recs as
+                                    // each `synapses[K]` arrives.
+                                }
+                                // Nested per-record: `synapses[K].<field>`.
+                                if _starts_with(suf, "synapses[") == 1 {
+                                    let lb2 = _find_byte(suf, 0, 91)
+                                    let rb2 = _find_byte(suf, lb2 + 1, 93)
+                                    if lb2 >= 0 {
+                                        if rb2 > lb2 + 1 {
+                                            let kidx = str_to_int(substr(suf, lb2 + 1, rb2 - lb2 - 1))
+                                            let suf2_start = rb2 + 2
+                                            let suf2 = ""
+                                            if suf2_start < len(suf) {
+                                                suf2 = substr(suf, suf2_start, len(suf) - suf2_start)
+                                            }
+                                            let p_recs = pe[1]
+                                            _ensure_syn_recs(p_recs, kidx + 1)
+                                            let rec = p_recs[kidx]
+                                            if str_eq(suf2, "src") == 1         { list_set(rec, 0, _line_val_int(line)) }
+                                            if str_eq(suf2, "dst") == 1         { list_set(rec, 1, _line_val_int(line)) }
+                                            if str_eq(suf2, "weight") == 1      { list_set(rec, 2, _line_val_int(line)) }
+                                            if str_eq(suf2, "eligibility") == 1 { list_set(rec, 3, _line_val_int(line)) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1467,8 +1744,29 @@ fn snap_from_text(text) {
                 syn_recs = trimmed
             }
         }
+        // Multi-part block: trim/pad to the explicit count when seen so a
+        // malformed file with extra `synapses.parts[N]` keys past the
+        // declared count doesn't leak entries through.
+        if syn_parts_count_seen >= 0 {
+            _ensure_syn_part_entries(syn_parts, syn_parts_count_seen)
+            while len(syn_parts) > syn_parts_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < syn_parts_count_seen {
+                    push(trimmed, syn_parts[i])
+                    i = i + 1
+                }
+                syn_parts = trimmed
+            }
+        } else {
+            // No `synapses.parts.count` line in the file -- legacy P0.1
+            // shape. Force the parts list to empty so the apply path
+            // chooses the legacy fallback (install blob[1] into reasoning).
+            syn_parts = list_new()
+        }
         push(sb, syn_threshold)
         push(sb, syn_recs)
+        push(sb, syn_parts)
         snap_put_section(s, SEC_SYNAPSES, sb)
     }
     if selfmodel_present == 1 {
