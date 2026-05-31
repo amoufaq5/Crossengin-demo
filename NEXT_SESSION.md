@@ -1475,6 +1475,59 @@ continue. It is updated at every session boundary.
   Production blocker still loud: HTTP_DNS_HOST_TO_IP is a manual table,
   not real DNS; full resolution + TLS is the 4-6-week call documented in
   TLS_AUDIT.md.
+- P1.4 PSK secure-channel continuation -- ChaCha20-Poly1305 envelope
+  over TCP (the next hop after plain HTTP on the TLS roadmap):
+  **complete**. Pure-NOVA ChaCha20 stream cipher
+  (`src/safety/chacha20.nova`, 20 rounds per 64-byte keystream block,
+  ARX over `int_add` / `int_xor` / `int_shl` / `int_shr` / `int_or` /
+  `int_and` with 32-bit masking after every shift / add to keep every
+  intermediate below 2^32 -- dodges NOVA gotcha #11) verified against
+  RFC 7539 sections 2.1.1 (quarter-round), 2.3.2 (block, key=00..1f,
+  nonce=00..09 00 00 00, counter=1), and 2.4.2 (114-byte "Ladies and
+  Gentlemen" plaintext) -- 26 assertions in `tests/unit/test_chacha20.nova`.
+  Pure-NOVA Poly1305 MAC (`src/safety/poly1305.nova`, 5 x 26-bit limb
+  decomposition of the 130-bit accumulator, evaluating
+  `(a + n) * r mod (2^130 - 5)` per 16-byte block with the standard
+  carry-propagate-then-reduce trick) verified against RFC 7539 section
+  2.5 (clamp), 2.5.2 (the canonical "Cryptographic Forum Research Group"
+  vector with tag `a8061dc1305136c6c22b8baf0c0127a9`), and 2.6.2
+  (Poly1305 key derived from `ChaCha20(counter=0)`) -- 9 assertions in
+  `tests/unit/test_poly1305.nova`. The secure-channel framework
+  (`src/io/transducers/secure_channel.nova`) wraps a TCP socket with a
+  per-frame envelope `[4 BE length][12 nonce][ciphertext][16 tag]`,
+  where the 12-byte nonce splits 4 / 8 into a session-id prefix +
+  per-direction monotonic counter; per-frame Poly1305 one-time key is
+  `ChaCha20(session_key, frame_nonce, counter=0)[0..32]` (RFC 7539
+  AEAD construction). Public API: `sc_open(host, port, psk_hex)` ->
+  opens TCP, sends 12-byte handshake nonce, both sides derive session
+  key = `ChaCha20(PSK, hs_nonce, 0)[0..32]`, client sends a 16-byte
+  "CE-SC-HS-OK" magic frame, server echoes back -- mismatch means PSK
+  mismatch or in-flight tampering; `sc_send(state, buf, len)` / 
+  `sc_recv(state)` are simple frame-at-a-time helpers; `sc_close(state)`
+  closes the socket idempotently. 16 assertions in
+  `tests/unit/test_secure_channel.nova` cover PSK validation,
+  session-key determinism, nonce-layout, frame round-trip, single-bit
+  tamper rejection, counter advancement. Integration test
+  (`tests/integration/scenario_v_secure_channel.sh`) spawns a Python
+  counterpart (`scripts/secure_channel_echo.py`) that implements the
+  same wire framing, has the NOVA client send "ping", and asserts the
+  decrypted reply is "pong" (the Python server transforms ping -> pong
+  so we know the bytes were actually decrypted, not just byte-echoed)
+  -- 6 bash assertions. The PSK is randomized per run (32 bytes from
+  `/dev/urandom`) so the catastrophic nonce-reuse failure mode of any
+  stream-cipher AEAD can't fire across CI runs. `http_client.nova`
+  gains an opt-in `https_get_psk(url, psk_hex, max_bytes)` that opens
+  the channel and routes the HTTP/1.1 request through it. This is NOT
+  real HTTPS -- no certificate validation, no TLS framing, no
+  hostname-to-PSK binding; it's "HTTP over a PSK-encrypted channel"
+  suitable for a CrossEngin daemon talking to a CrossEngin-controlled
+  upstream. SAFETY caveat documented in `secure_channel.nova` header
+  and `TLS_AUDIT.md`: NOVA has no `getrandom(2)`, so the handshake
+  nonce is derived from `nanotime()` + a process-local counter -- an
+  attacker can predict it but the PSK stays secret; the failure mode
+  is replay + traffic-analysis, not key recovery. Real TLS 1.3 with
+  X.509 still costs ~5-6 weeks (was 4-6 before; the symmetric-crypto
+  block is gone now), tracked in `TLS_AUDIT.md`.
 - P1.5 -- composite `/learn` kinds (batch URLs, RSS feed, recursive
   directory): **complete**. Extends the P15 dispatcher with three new
   prefix-detected source kinds, all sharing the same `_learn_tag` /
@@ -1790,7 +1843,10 @@ is standalone.
 | io/effectors/audio_speak.nova (Phase 19 Tier-4 #1: audio modality bridge -- espeak/aplay escalation) | 0014 | 0 | done |
 | io/transducers/input_transducer.nova | 0014, 0011, 0012, 0021 | 19 | done |
 | io/transducers/kg_sync.nova (Phase 20 Tier-4 #2: distributed-substrate seam; P1.3 v2 upgrade -- N-subs + bidir + reconnect + auth + conflict) | 0014, 0016 | 169 | done |
-| io/transducers/http_client.nova (P1.4: plain-HTTP/1.1 in-process client + dispatcher seam; HTTPS deferred -- see TLS_AUDIT.md) | 0028, 0014 | 59 | done |
+| io/transducers/http_client.nova (P1.4: plain-HTTP/1.1 in-process client + dispatcher seam + opt-in `https_get_psk` over PSK secure channel; full TLS deferred -- see TLS_AUDIT.md) | 0028, 0014 | 59 | done |
+| io/transducers/secure_channel.nova (P1.4 cont.: PSK ChaCha20-Poly1305 envelope over TCP; framing for the wireguard-style "noise" channel) | TLS_AUDIT.md | 16 | done |
+| safety/chacha20.nova (P1.4 cont.: pure-NOVA ChaCha20 stream cipher, RFC 7539) | TLS_AUDIT.md | 26 | done |
+| safety/poly1305.nova (P1.4 cont.: pure-NOVA Poly1305 MAC, RFC 7539) | TLS_AUDIT.md | 9 | done |
 
 Pure substrate, NO LLM (ADR-0014): `output_generation` produces text by the
 reverse of comprehension (intent -> real word atoms -> learned syntax ordering),
@@ -1975,10 +2031,39 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 120 (120 PASS, +1 from P3.7 `test_federated_aggregator.nova`, +1 from P3.6 `test_differential_privacy.nova`, +1 from P3.1 `test_image_pgm.nova`, +1 from P3.5 `test_proof_checker.nova`, +1 from P3.4 `test_ann_index.nova`, +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4 `test_atom_store_index.nova`, +2 from P2.1/P2.2 `test_cofire_index.nova` and `test_slot_index.nova`); **+91 assertions added by P3.7** (`test_federated_aggregator.nova`), **+52 assertions added by P3.6** (`test_differential_privacy.nova`), **+43 assertions added by P3.1** (`test_image_pgm.nova`), **+56 assertions added by P3.5** (`test_proof_checker.nova`), **+46 assertions added by P3.4** (`test_ann_index.nova`), **+26 assertions added by P2.5** (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in `test_meta_observer_feedback.nova`, 28 in `test_atom_death_attribution.nova`), **+59 assertions added by P1.4** (`test_http_client.nova`), **+61 assertions added by P2.4** (`test_atom_store_index.nova`), **+58 + 15 assertions added by P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going 30 -> 45).
+- Total unit suites: 129 (129 PASS; **+3 suites / +51 assertions from P1.4
+  PSK secure-channel continuation** -- `test_chacha20.nova` (26),
+  `test_poly1305.nova` (9), `test_secure_channel.nova` (16); +1 from P3.7
+  `test_federated_aggregator.nova`, +1 from P3.6
+  `test_differential_privacy.nova`, +1 from P3.1 `test_image_pgm.nova`, +1
+  from P3.5 `test_proof_checker.nova`, +1 from P3.4 `test_ann_index.nova`,
+  +1 from P2.5 `test_stt_seam.nova`, +1 from P2.4
+  `test_atom_store_index.nova`, +2 from P2.1/P2.2
+  `test_cofire_index.nova` and `test_slot_index.nova`); **+91 assertions
+  added by P3.7** (`test_federated_aggregator.nova`), **+52 assertions
+  added by P3.6** (`test_differential_privacy.nova`), **+43 assertions
+  added by P3.1** (`test_image_pgm.nova`), **+56 assertions added by
+  P3.5** (`test_proof_checker.nova`), **+46 assertions added by P3.4**
+  (`test_ann_index.nova`), **+26 assertions added by P2.5**
+  (`test_stt_seam.nova`), **+82 assertions added by P1.1/P1.6** (54 in
+  `test_meta_observer_feedback.nova`, 28 in
+  `test_atom_death_attribution.nova`), **+59 assertions added by P1.4**
+  (`test_http_client.nova`), **+61 assertions added by P2.4**
+  (`test_atom_store_index.nova`), **+58 + 15 assertions added by
+  P2.1/P2.2** (35 in `test_cofire_index.nova`, 23 in
+  `test_slot_index.nova`, +15 in `test_neighborhood_activation.nova` going
+  30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 18 scripts under `tests/integration/` covering 11 multi-step scenarios (durability across SIGKILL, decision-log durability across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`, `/meta` table, constitutional veto, web frontend smoke, distributed KG sync, session switch isolation, web cookie isolation, plain-HTTP client loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35 assertions]) and 5 admin-command edge-case scripts. Run with `make integration`.
+- Total integration tests: 19 scripts under `tests/integration/` covering 12
+  multi-step scenarios (durability across SIGKILL, decision-log durability
+  across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`,
+  `/meta` table, constitutional veto, web frontend smoke, distributed KG
+  sync, session switch isolation, web cookie isolation, plain-HTTP client
+  loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35
+  assertions], **PSK secure-channel loopback [P1.4 cont. -- 6
+  assertions]**) and 5 admin-command edge-case scripts. Run with `make
+  integration`.
 - Total benchmarks: 4 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`, `bench_ann_query` -- P3.4 LSH speedup).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution

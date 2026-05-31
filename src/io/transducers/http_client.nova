@@ -61,6 +61,15 @@
 // contract (no sockets, ~20 assertions) and
 // tests/integration/scenario_j_http_client.sh for the full
 // loopback (python -m http.server) round-trip.
+//
+// PSK secure-channel mode (post-P1.4 extension, see TLS_AUDIT.md):
+//   https_get_psk(url, psk_hex, max_bytes) routes the HTTP/1.1 request
+//   through src/io/transducers/secure_channel.nova -- ChaCha20-Poly1305
+//   per-frame envelope on top of TCP, using a 32-byte pre-shared key.
+//   NOT real HTTPS (no certs, no TLS framing); see secure_channel.nova
+//   header for the SAFETY caveat (predictable nonce w/o getrandom).
+
+import "secure_channel.nova"
 
 // ---- error tags (text, so they show up in logs unmangled) -----------------
 let HTTP_ERR_MALFORMED   = "malformed url"
@@ -668,6 +677,127 @@ fn http_get(url, max_bytes) {
     }
     let err = ""
     if truncated == 1 { err = HTTP_ERR_TOO_LARGE }
+    if len(body) >= max_bytes { err = HTTP_ERR_TOO_LARGE }
+    return _http_result(status, headers, body, err)
+}
+
+// ---- PSK-secured GET (https-but-not-really) ------------------------------
+//
+// Opt-in opener that routes the HTTP/1.1 request through the
+// secure_channel framework (`src/io/transducers/secure_channel.nova`):
+// ChaCha20-Poly1305 envelope per frame on top of a plain TCP socket
+// with a pre-shared key. This is NOT real HTTPS:
+//   * no TLS framing, no record layer
+//   * no X.509 certificate, no CA bundle, no hostname matching
+//   * predictable nonce material (see SAFETY caveat in secure_channel.nova)
+// It is "HTTP over a PSK-encrypted channel" -- useful for a CrossEngin
+// daemon talking to a CrossEngin-controlled upstream where both sides
+// have provisioned a 32-byte shared key out of band. The remaining
+// ~2 weeks of work to layer X.509 / RSA-PSS / SHA-256 on top are
+// tracked in TLS_AUDIT.md.
+//
+// Wire flow:
+//   1. sc_open(host, port, psk_hex) handshakes the PSK secure channel.
+//   2. The HTTP/1.1 request bytes are written via sc_send(state, ...) in
+//      one frame (small requests; multi-frame is fine since the framing
+//      naturally chunks).
+//   3. Response bytes are read via sc_recv(state) in one or more frames
+//      until the peer closes; the response is parsed by the same
+//      _hc_parse_response helper used for plain HTTP.
+//
+// Public API:
+//   https_get_psk(url, psk_hex, max_bytes) -> same shape as http_get
+//     status_code, headers_list, body, error_msg.
+//   On any error (PSK invalid, connect failed, handshake reject, MAC
+//   verification failure, EOF before a status line) returns the same
+//   _http_err shape with a descriptive tag.
+
+let HTTP_ERR_PSK         = "psk: hex must decode to 32 bytes"
+let HTTP_ERR_SC_HANDSHAKE = "secure_channel: handshake failed"
+let HTTP_ERR_SC_VERIFY    = "secure_channel: tag verification failed"
+
+// secure_channel.nova is imported at the top of this file (see header
+// comment). Callers that only need plain `http_get` still pay nothing
+// at runtime for the unused PSK path -- the imported chacha20 +
+// poly1305 modules are leaf primitives with no init-side effects.
+
+fn https_get_psk(url, psk_hex, max_bytes) {
+    let parts = http_parse_url(url)
+    let scheme = parts[0]
+    let host = parts[1]
+    let port = parts[2]
+    let path = parts[3]
+    if len(scheme) == 0 { return _http_err(HTTP_ERR_MALFORMED) }
+    // We accept both "http://" and "https://" here -- the scheme is
+    // informational since the actual transport is PSK-secured. (Callers
+    // that want strict scheme enforcement should check the URL.)
+    if sc_psk_validate(psk_hex) == 0 { return _http_err(HTTP_ERR_PSK) }
+    if max_bytes <= 0 { max_bytes = HTTP_RECV_CAP }
+    let ip = _http_dns_lookup(host)
+    if len(ip) == 0 { return _http_err(HTTP_ERR_DNS) }
+    let state = sc_open(ip, port, psk_hex)
+    if state == 0 { return _http_err(HTTP_ERR_SC_HANDSHAKE) }
+    // Build the HTTP request as a NOVA string (all ASCII, no zero bytes).
+    let req = "GET " + path + " HTTP/1.1\r\n"
+        + "Host: " + host + "\r\n"
+        + "User-Agent: crossengin/0.1-psk\r\n"
+        + "Accept: */*\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+    let req_len = len(req)
+    let req_buf = alloc(req_len + 1)
+    let i = 0
+    while i < req_len {
+        store8(req_buf + i, char_at(req, i))
+        i = i + 1
+    }
+    store8(req_buf + req_len, 0)
+    if sc_send(state, req_buf, req_len) == 0 {
+        sc_close(state)
+        return _http_err(HTTP_ERR_SEND)
+    }
+    // Pull frames until the peer closes; concatenate plaintext into one
+    // contiguous buffer for the parser.
+    let acc = alloc(HTTP_RECV_CAP + 1)
+    let acc_len = 0
+    let done = 0
+    while done == 0 {
+        let frame = sc_recv(state)
+        if frame == 0 {
+            // Either clean EOF or a verification failure. The state's last
+            // error tag distinguishes.
+            let tag = sc_last_error(state)
+            if str_eq(tag, SC_ERR_TAG_FAIL) == 1 {
+                sc_close(state)
+                return _http_err(HTTP_ERR_SC_VERIFY)
+            }
+            // Otherwise: clean shutdown of the peer is expected.
+            done = 1
+        } else {
+            let n = frame[1]
+            if acc_len + n > HTTP_RECV_CAP { n = HTTP_RECV_CAP - acc_len }
+            let j = 0
+            while j < n {
+                store8(acc + acc_len + j, load8(frame[0] + j))
+                j = j + 1
+            }
+            acc_len = acc_len + n
+            if acc_len >= HTTP_RECV_CAP { done = 1 }
+        }
+    }
+    sc_close(state)
+    store8(acc + acc_len, 0)
+    let split = _hc_parse_response(acc, acc_len, max_bytes)
+    let status_line = split[0]
+    let headers = split[1]
+    let body = split[2]
+    let split_err = split[3]
+    if len(split_err) > 0 { return _http_err(split_err) }
+    let status = _http_status_from_line(status_line)
+    if status < 0 {
+        return _http_err(HTTP_ERR_BAD_STATUS)
+    }
+    let err = ""
     if len(body) >= max_bytes { err = HTTP_ERR_TOO_LARGE }
     return _http_result(status, headers, body, err)
 }

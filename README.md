@@ -11,11 +11,15 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 117 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 126 modules compile (`make build`, +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
-> plain-HTTP in-process transport seam, +4 from `seed/pack_registry.nova` +
+> plain-HTTP in-process transport seam,
+> +3 from `safety/{chacha20,poly1305}.nova` + `io/transducers/secure_channel.nova`
+> added in the P1.4 PSK secure-channel continuation -- pure-NOVA
+> ChaCha20-Poly1305 (RFC 7539) over TCP as a "noise envelope" alternative to
+> TLS framing, documented in [`TLS_AUDIT.md`](./TLS_AUDIT.md), +4 from `seed/pack_registry.nova` +
 > `seed/packs/{medical,ops_runbook,code_review}_pack.nova` added in P1.9
 > domain seed packs, +2 from `reader/cofire_index.nova` +
 > `reader/slot_index.nova` added in P2.1/P2.2 co-fire + syntactic-slot
@@ -48,7 +52,7 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 121 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 129 unit-test suites pass
 > (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -63,6 +67,11 @@ computational units rather than orchestrating a pipeline of modules.
 > `dir:/path` directory walk,
 > +1 suite / +59 assertions from `test_http_client.nova` added in P1.4
 > plain-HTTP client + dispatcher,
+> +3 suites / +51 assertions from `test_chacha20.nova` (26),
+> `test_poly1305.nova` (9), `test_secure_channel.nova` (16) added in the
+> P1.4 PSK secure-channel continuation -- RFC 7539 ChaCha20 + Poly1305
+> primitives plus the per-frame PSK envelope, documented in
+> [`TLS_AUDIT.md`](./TLS_AUDIT.md),
 > +4 suites / +73 assertions from `test_pack_registry.nova` +
 > `test_medical_pack.nova` + `test_ops_pack.nova` +
 > `test_code_review_pack.nova` added in P1.9 domain seed packs,
@@ -114,7 +123,7 @@ computational units rather than orchestrating a pipeline of modules.
 > scene_change labels; surfaced via the chat `/play PATH [N]` admin
 > command and the `scripts/video_to_y4m.sh` ffmpeg shim for
 > compressed video input, documented in [`VIDEO_AUDIT.md`](./VIDEO_AUDIT.md)),
-> 25 end-to-end integration
+> 26 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -122,6 +131,11 @@ computational units rather than orchestrating a pipeline of modules.
 > P0.8 chat /switch + web.py per-cookie routing,
 > +1 from `scenario_j_http_client.sh` added in P1.4 plain-HTTP loopback
 > against `python3 -m http.server`,
+> +1 from `scenario_v_secure_channel.sh` added in the P1.4 PSK
+> secure-channel continuation -- NOVA client opens a ChaCha20-Poly1305
+> envelope over TCP against a Python counterpart
+> (`scripts/secure_channel_echo.py`), sends "ping", asserts the decrypted
+> reply equals "pong",
 > +1 from `scenario_k_seed_pack.sh` added in P1.9 `/seed` domain pack
 > install + listing,
 > +1 from `scenario_m_metrics_endpoint.sh` added in P2.9 Prometheus

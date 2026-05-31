@@ -1,0 +1,451 @@
+// CrossEngin safety: pure-NOVA Poly1305 message-authentication code
+//   (RFC 7539 / RFC 8439 section 2.5).
+//
+// Purpose
+//   The MAC primitive used by `src/io/transducers/secure_channel.nova`
+//   for the authenticate half of the PSK secure-channel framework. Paired
+//   with ChaCha20 (the encrypt half) it implements the AEAD construction
+//   RFC 7539 calls ChaCha20-Poly1305 -- inputs (key, nonce, plaintext)
+//   -> ciphertext + 16-byte authentication tag. Any single-byte tamper to
+//   the ciphertext flips the tag with overwhelming probability (2^-128).
+//
+// Algorithm at a glance
+//   Poly1305 evaluates a polynomial in GF(2^130 - 5) with the message
+//   broken into 16-byte chunks. Each chunk c[i] is treated as a 130-bit
+//   integer with bit 128 set (an "0x01 byte" appended for full chunks)
+//   or as a shorter integer with bit at the appropriate position for
+//   the last short chunk. The MAC is:
+//     a := 0
+//     for i in 1..n: a := (a + n_i) * r mod (2^130 - 5)
+//     tag := (a + s) mod 2^128
+//   where (r, s) are derived from the 32-byte one-time key:
+//     r := first 16 bytes, with 22 specific bits cleared (called "clamping")
+//     s := last 16 bytes
+//
+// Limb representation -- 5 x 26-bit
+//   The reference RFC 7539 implementation uses 5 26-bit limbs to spread a
+//   130-bit value across machine words. We do the same: each limb fits
+//   in 26 bits (max value 2^26 - 1 = 67108863), products of two 26-bit
+//   values fit in 52 bits, and the sum of 5 such products fits in
+//   ~55 bits -- well under NOVA's 63-bit signed positive range. The mask
+//   2^26 - 1 = 67108863 lives in a let-const so it doesn't trip the
+//   NOVA loop-body literal threshold.
+//
+// Reduction mod 2^130 - 5
+//   The classic trick: a 130-bit-overflow value v can be reduced by
+//   v_lo = v & (2^130 - 1)  (the lower 130 bits)
+//   v_hi = v >> 130        (everything above)
+//   v   := v_lo + 5 * v_hi
+//   One iteration brings the result into [0, 2^131); a second iteration
+//   is sufficient to get into [0, 2^130). For Poly1305 we additionally
+//   do a final conditional subtraction of (2^130 - 5) if a >= 2^130 - 5
+//   to fold into the canonical range [0, 2^130 - 5).
+//
+// Public API
+//   poly1305_mac_buf(key_buf, msg_buf, msg_len) -> tag_buf
+//       key_buf:  32-byte buffer (the one-time Poly1305 key derived by
+//                 the AEAD construction or supplied raw for tests).
+//       msg_buf:  pointer to the message bytes.
+//       msg_len:  number of bytes (any non-negative length is fine; the
+//                 last partial 16-byte chunk is handled).
+//       returns:  a fresh alloc'd 17-byte buffer; the first 16 bytes are
+//                 the tag and the trailing byte is a NUL terminator.
+//
+//   poly1305_verify_buf(key_buf, msg_buf, msg_len, expected_tag_buf)
+//       -> 1 iff the recomputed tag matches the expected 16 bytes, 0
+//          otherwise. Comparison is constant-time over the 16 bytes
+//          (XOR-accumulate to dodge per-byte short-circuit).
+//
+// Test parity
+//   tests/unit/test_poly1305.nova covers the RFC 7539 test vector in
+//   section 2.5.2: key=85d6be7857556d337f4452fe42d506a8 ...; msg = "Cryp"
+//   "tographic Forum Research Group" (34 bytes); expected tag =
+//   a8061dc1305136c6c22b8baf0c0127a9.
+//
+// ADRs touched: TLS_AUDIT.md (PSK-only secure channel above the curl shim).
+// NOVA dependencies: builtins only -- int_add, int_and, int_or, int_xor,
+//   int_shl, int_shr, int_mul, alloc, store8, load8.
+// CrossEngin dependencies: none -- pure leaf primitive.
+
+// ---- limb-size constants --------------------------------------------------
+// 2^26 - 1 = 67108863  (per-limb low-26-bit mask)
+let PL_LIMB_MASK = 67108863
+// 2^26 = 67108864      (the "carry up" divisor / shift base)
+// Held implicitly via int_shr 26.
+
+// 5 (the reduction multiplier for the 2^130 - 5 wrap-around).
+let PL_FIVE = 5
+
+// ---- the "clamp r" routine -----------------------------------------------
+// Poly1305 requires several specific bits of r be zero so that all
+// products with r stay <= 2^130 + small slack. The mask, per RFC 7539
+// section 2.5: r[3], r[7], r[11], r[15] &= 15;  r[4], r[8], r[12] &= 252.
+
+fn _pl_clamp_r_into(buf, key_buf) {
+    let i = 0
+    while i < 16 {
+        store8(buf + i, load8(key_buf + i))
+        i = i + 1
+    }
+    // Apply the clamp mask.
+    store8(buf + 3,  int_and(load8(buf + 3),  15))
+    store8(buf + 7,  int_and(load8(buf + 7),  15))
+    store8(buf + 11, int_and(load8(buf + 11), 15))
+    store8(buf + 15, int_and(load8(buf + 15), 15))
+    store8(buf + 4,  int_and(load8(buf + 4),  252))
+    store8(buf + 8,  int_and(load8(buf + 8),  252))
+    store8(buf + 12, int_and(load8(buf + 12), 252))
+    return 1
+}
+
+// ---- limb conversions -----------------------------------------------------
+//
+// Read a 128-bit little-endian integer from a 16-byte buffer into 5
+// 26-bit limbs.  Layout (low to high):
+//   r0 = bits 0..25       = bytes 0..3 (low 26)
+//   r1 = bits 26..51      = bytes 3..6
+//   r2 = bits 52..77      = bytes 6..9
+//   r3 = bits 78..103     = bytes 9..12
+//   r4 = bits 104..127    = bytes 13..16 (top 24 bits cleared by clamp anyway)
+//
+// We use the bit-packed-LE trick: load each pair of adjacent 32-bit
+// little-endian halfwords, shift, and mask.
+
+fn _pl_load_le32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = b0
+    v = int_or(v, int_shl(b1, 8))
+    v = int_or(v, int_shl(b2, 16))
+    v = int_or(v, int_shl(b3, 24))
+    return v
+}
+
+// Decompose a 16-byte little-endian 128-bit number into 5 26-bit limbs.
+// Returns the 5-element limb list. The high "fifth limb" only carries
+// 24 bits of data (bits 104..127); we leave bits 24..25 zero.
+fn _pl_bytes_to_limbs5(buf) {
+    let w0 = _pl_load_le32(buf, 0)    // bits 0..31
+    let w1 = _pl_load_le32(buf, 4)    // bits 32..63
+    let w2 = _pl_load_le32(buf, 8)    // bits 64..95
+    let w3 = _pl_load_le32(buf, 12)   // bits 96..127
+    let limbs = list_new()
+    push(limbs, int_and(w0, PL_LIMB_MASK))
+    push(limbs, int_and(int_or(int_shr(w0, 26), int_shl(w1, 6)),  PL_LIMB_MASK))
+    push(limbs, int_and(int_or(int_shr(w1, 20), int_shl(w2, 12)), PL_LIMB_MASK))
+    push(limbs, int_and(int_or(int_shr(w2, 14), int_shl(w3, 18)), PL_LIMB_MASK))
+    push(limbs, int_shr(w3, 8))
+    return limbs
+}
+
+// Pack a 5-limb fully-reduced (< 2^130) value into a 16-byte little-endian
+// output buffer (the canonical Poly1305 tag form, no carry above 128).
+// Writes into `out` (must be at least 16 bytes).
+fn _pl_limbs_to_bytes16(limbs, out) {
+    // Reassemble the 4 32-bit halfwords.
+    let l0 = limbs[0]
+    let l1 = limbs[1]
+    let l2 = limbs[2]
+    let l3 = limbs[3]
+    let l4 = limbs[4]
+    let w0 = int_or(l0, int_and(int_shl(l1, 26), 4294967295))
+    let w1 = int_or(int_shr(l1, 6),
+             int_or(int_and(int_shl(l2, 20), 4294967295), 0))
+    let w2 = int_or(int_shr(l2, 12),
+             int_or(int_and(int_shl(l3, 14), 4294967295), 0))
+    let w3 = int_or(int_shr(l3, 18),
+             int_and(int_shl(l4, 8), 4294967295))
+    // Emit each 32-bit halfword little-endian.
+    store8(out + 0,  int_and(w0, 255))
+    store8(out + 1,  int_and(int_shr(w0, 8),  255))
+    store8(out + 2,  int_and(int_shr(w0, 16), 255))
+    store8(out + 3,  int_and(int_shr(w0, 24), 255))
+    store8(out + 4,  int_and(w1, 255))
+    store8(out + 5,  int_and(int_shr(w1, 8),  255))
+    store8(out + 6,  int_and(int_shr(w1, 16), 255))
+    store8(out + 7,  int_and(int_shr(w1, 24), 255))
+    store8(out + 8,  int_and(w2, 255))
+    store8(out + 9,  int_and(int_shr(w2, 8),  255))
+    store8(out + 10, int_and(int_shr(w2, 16), 255))
+    store8(out + 11, int_and(int_shr(w2, 24), 255))
+    store8(out + 12, int_and(w3, 255))
+    store8(out + 13, int_and(int_shr(w3, 8),  255))
+    store8(out + 14, int_and(int_shr(w3, 16), 255))
+    store8(out + 15, int_and(int_shr(w3, 24), 255))
+    return 1
+}
+
+// Load one Poly1305 "input number" from a message-block buffer of up to
+// 16 bytes. Pads with the special "1 bit" at position 128 for full
+// 16-byte blocks, or at position (8 * length) for short final blocks.
+// Returns a 5-limb list; the fifth limb carries the 1 bit for full
+// blocks (== 0x1000000 = bit 26 of that limb, == bit 130 of the whole
+// value), or the partial high portion + the position-aware 1 bit for
+// short blocks.
+fn _pl_load_block_limbs(msg_buf, off, block_len) {
+    let tmp = alloc(17)
+    let i = 0
+    while i < 16 {
+        if i < block_len { store8(tmp + i, load8(msg_buf + off + i)) }
+        else {
+            if i == block_len { store8(tmp + i, 1) }     // pad bit
+            else { store8(tmp + i, 0) }
+        }
+        i = i + 1
+    }
+    store8(tmp + 16, 0)
+    let limbs = _pl_bytes_to_limbs5(tmp)
+    // For a FULL 16-byte block the pad bit sits at byte 16, which is
+    // outside the 128-bit window we just read -- so it must be applied
+    // to the limb above by hand: set bit 24 of limb[4] (== bit 130 of
+    // the whole number, == bit 128 if you count from 0). Wait: 24+26*4
+    // = 128, so bit 24 of limb[4] is bit 128. Bit 24 = 0x1000000 = 16777216.
+    if block_len == 16 {
+        list_set(limbs, 4, int_or(limbs[4], 16777216))
+    }
+    return limbs
+}
+
+// ---- accumulator math (5-limb GF(2^130 - 5)) -----------------------------
+//
+// We carry the accumulator a in 5 26-bit limbs. After each multiplication
+// the intermediate limbs grow to ~52 bits + sum-of-5 (~55 bits), which
+// still fits in 63 bits of positive NOVA int. We immediately propagate
+// carries down so a stays canonical.
+
+// a += b (in-place on a).
+fn _pl_add(a, b) {
+    list_set(a, 0, int_add(a[0], b[0]))
+    list_set(a, 1, int_add(a[1], b[1]))
+    list_set(a, 2, int_add(a[2], b[2]))
+    list_set(a, 3, int_add(a[3], b[3]))
+    list_set(a, 4, int_add(a[4], b[4]))
+    return 1
+}
+
+// Multiply `a` by `r` (both 5-limb), reducing the result mod (2^130 - 5)
+// into 5 26-bit limbs in `a`.  The standard Poly1305 multiply with the
+// reduction trick:
+//
+//   d0 = a0*r0 + 5*(a1*r4 + a2*r3 + a3*r2 + a4*r1)
+//   d1 = a0*r1 + a1*r0 + 5*(a2*r4 + a3*r3 + a4*r2)
+//   d2 = a0*r2 + a1*r1 + a2*r0 + 5*(a3*r4 + a4*r3)
+//   d3 = a0*r3 + a1*r2 + a2*r1 + a3*r0 + 5*(a4*r4)
+//   d4 = a0*r4 + a1*r3 + a2*r2 + a3*r1 + a4*r0
+//
+// The 5* factor encodes the (2^130 mod p) ≡ 5 wrap from the high half
+// folding back into the low. After computing d0..d4 we carry-propagate
+// downward; any high bit above 2^130 gets the same 5-wrap.
+fn _pl_mul_r(a, r) {
+    let a0 = a[0]; let a1 = a[1]; let a2 = a[2]; let a3 = a[3]; let a4 = a[4]
+    let r0 = r[0]; let r1 = r[1]; let r2 = r[2]; let r3 = r[3]; let r4 = r[4]
+    // 5*r1, 5*r2, 5*r3, 5*r4 -- precompute to keep d-expression readable.
+    // The factor 5 is < 2^3 so multiplying a 26-bit value by 5 stays in
+    // 29 bits, well below the 52-bit product band.
+    let s1 = int_mul(r1, PL_FIVE)
+    let s2 = int_mul(r2, PL_FIVE)
+    let s3 = int_mul(r3, PL_FIVE)
+    let s4 = int_mul(r4, PL_FIVE)
+    let d0 = int_add(int_mul(a0, r0),
+             int_add(int_mul(a1, s4),
+             int_add(int_mul(a2, s3),
+             int_add(int_mul(a3, s2),
+                     int_mul(a4, s1)))))
+    let d1 = int_add(int_mul(a0, r1),
+             int_add(int_mul(a1, r0),
+             int_add(int_mul(a2, s4),
+             int_add(int_mul(a3, s3),
+                     int_mul(a4, s2)))))
+    let d2 = int_add(int_mul(a0, r2),
+             int_add(int_mul(a1, r1),
+             int_add(int_mul(a2, r0),
+             int_add(int_mul(a3, s4),
+                     int_mul(a4, s3)))))
+    let d3 = int_add(int_mul(a0, r3),
+             int_add(int_mul(a1, r2),
+             int_add(int_mul(a2, r1),
+             int_add(int_mul(a3, r0),
+                     int_mul(a4, s4)))))
+    let d4 = int_add(int_mul(a0, r4),
+             int_add(int_mul(a1, r3),
+             int_add(int_mul(a2, r2),
+             int_add(int_mul(a3, r1),
+                     int_mul(a4, r0)))))
+    // Carry-propagate down. d0..d4 each fit in ~55 bits; their carry
+    // chains are bounded by the limb mask each step.
+    let c = int_shr(d0, 26)
+    let h0 = int_and(d0, PL_LIMB_MASK)
+    d1 = int_add(d1, c)
+    c = int_shr(d1, 26)
+    let h1 = int_and(d1, PL_LIMB_MASK)
+    d2 = int_add(d2, c)
+    c = int_shr(d2, 26)
+    let h2 = int_and(d2, PL_LIMB_MASK)
+    d3 = int_add(d3, c)
+    c = int_shr(d3, 26)
+    let h3 = int_and(d3, PL_LIMB_MASK)
+    d4 = int_add(d4, c)
+    c = int_shr(d4, 26)
+    let h4 = int_and(d4, PL_LIMB_MASK)
+    // Wrap the high-26-bit carry back into h0 with the * 5 factor.
+    h0 = int_add(h0, int_mul(c, PL_FIVE))
+    // One more carry pass for h0 (the 5* may have grown it past 26 bits).
+    c = int_shr(h0, 26)
+    h0 = int_and(h0, PL_LIMB_MASK)
+    h1 = int_add(h1, c)
+    list_set(a, 0, h0)
+    list_set(a, 1, h1)
+    list_set(a, 2, h2)
+    list_set(a, 3, h3)
+    list_set(a, 4, h4)
+    return 1
+}
+
+// Final reduction: bring `a` from up-to-2^131 down to <= 2^130 - 6 (the
+// largest legal canonical value), then if a >= 2^130 - 5 subtract once.
+// After this `a` is in [0, 2^130 - 5).
+fn _pl_finalize(a) {
+    // One more carry pass through all 5 limbs (just in case _pl_mul_r
+    // left top-limb growth that wasn't fully propagated).
+    let c = int_shr(a[0], 26)
+    list_set(a, 0, int_and(a[0], PL_LIMB_MASK))
+    list_set(a, 1, int_add(a[1], c))
+    c = int_shr(a[1], 26)
+    list_set(a, 1, int_and(a[1], PL_LIMB_MASK))
+    list_set(a, 2, int_add(a[2], c))
+    c = int_shr(a[2], 26)
+    list_set(a, 2, int_and(a[2], PL_LIMB_MASK))
+    list_set(a, 3, int_add(a[3], c))
+    c = int_shr(a[3], 26)
+    list_set(a, 3, int_and(a[3], PL_LIMB_MASK))
+    list_set(a, 4, int_add(a[4], c))
+    c = int_shr(a[4], 26)
+    list_set(a, 4, int_and(a[4], PL_LIMB_MASK))
+    list_set(a, 0, int_add(a[0], int_mul(c, PL_FIVE)))
+    c = int_shr(a[0], 26)
+    list_set(a, 0, int_and(a[0], PL_LIMB_MASK))
+    list_set(a, 1, int_add(a[1], c))
+    // Now `a` < 2^130. Compute t = a + 5 (with carries) to see if a >=
+    // 2^130 - 5: if (a + 5) overflows past bit 130, then a >= 2^130 - 5
+    // and we should subtract (2^130 - 5) which is equivalent to using
+    // t mod 2^130 as the canonical reduced value.
+    let t0 = int_add(a[0], PL_FIVE)
+    let cc = int_shr(t0, 26)
+    let u0 = int_and(t0, PL_LIMB_MASK)
+    let t1 = int_add(a[1], cc)
+    cc = int_shr(t1, 26)
+    let u1 = int_and(t1, PL_LIMB_MASK)
+    let t2 = int_add(a[2], cc)
+    cc = int_shr(t2, 26)
+    let u2 = int_and(t2, PL_LIMB_MASK)
+    let t3 = int_add(a[3], cc)
+    cc = int_shr(t3, 26)
+    let u3 = int_and(t3, PL_LIMB_MASK)
+    let t4 = int_add(a[4], cc)
+    // If t4 has bit 26 set, a + 5 overflowed past 2^130. In that case
+    // (u0..u4 with t4 masked) IS the reduced value (a + 5) mod 2^130.
+    let overflow_bit = int_and(int_shr(t4, 26), 1)
+    let u4 = int_and(t4, PL_LIMB_MASK)
+    if overflow_bit == 1 {
+        list_set(a, 0, u0)
+        list_set(a, 1, u1)
+        list_set(a, 2, u2)
+        list_set(a, 3, u3)
+        list_set(a, 4, u4)
+    }
+    return 1
+}
+
+// ---- public API -----------------------------------------------------------
+
+// Compute the Poly1305 tag for `msg_buf[0..msg_len]` under the 32-byte
+// one-time key. Returns a fresh 17-byte buffer; first 16 bytes are the
+// tag, last byte is a NUL terminator.
+fn poly1305_mac_buf(key_buf, msg_buf, msg_len) {
+    // r := clamped first 16 bytes; s := last 16 bytes.
+    let r_buf = alloc(17)
+    _pl_clamp_r_into(r_buf, key_buf)
+    let r = _pl_bytes_to_limbs5(r_buf)
+    // The 5th limb of r will have bit 24 clear thanks to clamping (the
+    // top byte was AND'd with 0x0F so the top 4 bits are clear, putting
+    // r4 entirely within bits 104..127); no extra zeroing needed.
+    let s_buf = alloc(17)
+    let i = 0
+    while i < 16 {
+        store8(s_buf + i, load8(key_buf + 16 + i))
+        i = i + 1
+    }
+    store8(s_buf + 16, 0)
+    // a := 0.
+    let a = list_new()
+    push(a, 0); push(a, 0); push(a, 0); push(a, 0); push(a, 0)
+    // For each 16-byte block: a := (a + block) * r (mod p).
+    let off = 0
+    while off < msg_len {
+        let take = msg_len - off
+        if take > 16 { take = 16 }
+        let n = _pl_load_block_limbs(msg_buf, off, take)
+        _pl_add(a, n)
+        _pl_mul_r(a, r)
+        off = off + take
+    }
+    // Final reduction + add s + emit low 128 bits.
+    _pl_finalize(a)
+    let s_limbs = _pl_bytes_to_limbs5(s_buf)
+    // Add s (mod 2^128 -- we don't need any further wrap, the top bit
+    // of (a + s) just falls off the end of the 16-byte tag).
+    _pl_add(a, s_limbs)
+    // Carry-propagate the bottom 4 limbs so each fits in 26 bits before
+    // bit-packing; the 5th limb's high bits beyond 2^128 are simply
+    // discarded by _pl_limbs_to_bytes16 (it only emits up to bit 127).
+    let c = int_shr(a[0], 26)
+    list_set(a, 0, int_and(a[0], PL_LIMB_MASK))
+    list_set(a, 1, int_add(a[1], c))
+    c = int_shr(a[1], 26)
+    list_set(a, 1, int_and(a[1], PL_LIMB_MASK))
+    list_set(a, 2, int_add(a[2], c))
+    c = int_shr(a[2], 26)
+    list_set(a, 2, int_and(a[2], PL_LIMB_MASK))
+    list_set(a, 3, int_add(a[3], c))
+    c = int_shr(a[3], 26)
+    list_set(a, 3, int_and(a[3], PL_LIMB_MASK))
+    list_set(a, 4, int_add(a[4], c))
+    let out = alloc(17)
+    _pl_limbs_to_bytes16(a, out)
+    store8(out + 16, 0)
+    return out
+}
+
+// Constant-time 16-byte tag comparison: XOR-accumulate so the timing
+// only depends on the length, not on where the first mismatch is.
+fn _pl_ct_eq16(a, b) {
+    let acc = 0
+    let i = 0
+    while i < 16 {
+        acc = int_or(acc, int_xor(load8(a + i), load8(b + i)))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+// Verify that `expected_tag_buf[0..16]` matches the Poly1305 tag for
+// the given key + message. 1 on match, 0 otherwise.
+fn poly1305_verify_buf(key_buf, msg_buf, msg_len, expected_tag_buf) {
+    let actual = poly1305_mac_buf(key_buf, msg_buf, msg_len)
+    return _pl_ct_eq16(actual, expected_tag_buf)
+}
+
+// ---- test-only re-exports -------------------------------------------------
+//
+// The unit test reaches into the clamp helper to confirm the masking
+// matches the RFC 7539 worked example.
+
+fn _pl_test_clamp(key_buf) {
+    let buf = alloc(17)
+    _pl_clamp_r_into(buf, key_buf)
+    store8(buf + 16, 0)
+    return buf
+}
