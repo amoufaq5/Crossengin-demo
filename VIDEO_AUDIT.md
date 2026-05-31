@@ -102,6 +102,7 @@ The realistic feature ladder, each rung its own multi-week lift:
 | Feature                              | NOVA effort     |
 |--------------------------------------|-----------------|
 | Mean intensity / motion / scene-change | landed (P3.2) |
+| Block-matching motion vector field   | DONE (P3.3)     |
 | Optical flow (Lucas-Kanade)          | 1-2 weeks       |
 | Object tracking (IoU / Kalman)       | 2-3 weeks       |
 | Background subtraction (MOG)         | 1-2 weeks       |
@@ -115,6 +116,32 @@ flow + object tracking + background subtraction), and **12+ months** for
 trained action-recognition. Pure-NOVA 3D CNN training is unrealistic
 this decade; the WASM libavcodec + an embedded action-recognition model
 is the realistic embedded-model option once both halves land.
+
+## P3.3 motion vector field (landed)
+
+P3.2's mean-absolute-difference motion proxy is the WHO of motion (is
+the frame changing?) but not the WHERE (which way is the object moving?).
+P3.3 added a STRUCTURAL motion estimator so the substrate can perceive
+direction, not just magnitude:
+
+- **Block-matching motion vectors**
+  (`src/io/transducers/video_motion_vectors.nova`). The frame is divided
+  into 16x16 blocks. For each block, the previous frame is searched in
+  a +/-8 pixel window for the integer (dx, dy) offset that minimizes
+  the sum of absolute differences (SAD). Per-block output: (dx, dy)
+  motion vector and its SAD score. Per-frame aggregates produce the
+  atoms `motion_dir_<left|right|up|down|static>` (dominant direction
+  based on the mean (dx, dy)) and `motion_complexity_<simple|complex>`
+  (variance of the per-block vectors in milli-fixed-point).
+
+Block-matching only fires when both consecutive frames are at least
+16x16 (the block size). Smaller fixtures (e.g. the existing 4x4 test
+fixture in `scenario_s_video_play.sh`) still produce the P3.2 motion /
+scene-change labels but skip the structural motion vector field. The
+search performs 17x17 = 289 SAD evaluations per block; at the 768x432
+cap that's (48*27) blocks * 289 = ~375K SAD evaluations per frame pair,
+each over 256 byte loads -- the worst-case cost is ~100M loads, which
+NOVA can run in a few seconds even without vectorization.
 
 ## Mapping video features to atoms
 
@@ -143,6 +170,7 @@ for a live camera feed.
 | Milestone                                          | Effort           |
 |----------------------------------------------------|------------------|
 | Y4M + per-frame stats + motion + ffmpeg shim       | landed (P3.2)    |
+| Block-matching motion vector field                 | DONE (P3.3)      |
 | Pure-NOVA MJPEG (per-frame JPEG)                   | 3-4 weeks*       |
 | Pure-NOVA H.264                                    | 2-4 months       |
 | Pure-NOVA H.265 / AV1 / VP9                        | 6-12 months each |
@@ -207,9 +235,13 @@ year.
 
 * `src/io/transducers/video_y4m.nova` — pure-NOVA Y4M decoder +
   per-frame iterator + mean-absolute-difference motion proxy.
+* `src/io/transducers/video_motion_vectors.nova` — pure-NOVA block-
+  matching motion vector field with direction + complexity aggregates
+  (DONE, P3.3).
 * `src/io/transducers/video_perception.nova` — pluggable seam +
   per-frame feature extraction (image features from P3.1 + motion +
-  scene-change).
+  scene-change; extended in P3.3 with motion vector aggregates when
+  frame size >= 16x16).
 * `scripts/video_to_y4m.sh` — ffmpeg shim with a "no backend" exit-0
   fallback so a sealed sandbox never crashes the operator's pipeline.
 * `examples/crossengin_chat.nova` — `/play PATH [MAX_FRAMES]` admin
@@ -217,9 +249,13 @@ year.
 * `tests/unit/test_video_y4m.nova` — in-memory assertions covering
   header parsing, frame iteration, malformed inputs, end-of-stream
   semantics, and the motion proxy.
+* `tests/unit/test_video_motion_vectors.nova` — in-memory assertions
+  covering block-matching on identical / shifted / static fixtures plus
+  the direction + complexity label helpers.
 * `tests/integration/scenario_s_video_play.sh` — end-to-end /play chat
-  assertions against a hand-rolled 5-frame 4x4 Y4M fixture with two
-  forced scene changes.
+  assertions against the hand-rolled 4x4 fixture (P3.2 motion proxy +
+  scene change) and a 32x32 leftward-motion fixture (P3.3 motion
+  vector field).
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (image and video decode, feature extraction, embeddings).
 * `IMAGE_AUDIT.md` — sibling audit for the still-image modality

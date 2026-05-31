@@ -1,0 +1,315 @@
+// CrossEngin io/transducers: motion vector field (P3.3 video structural feature).
+//
+// Purpose
+//   The first STRUCTURAL video feature beyond P3.2's mean-absolute-diff
+//   motion proxy. Block matching divides a frame into 16x16 blocks; for
+//   each block, we search a +/-8 pixel window in the PREVIOUS frame for
+//   the integer (dx, dy) offset that minimizes the sum of absolute
+//   differences (SAD). The result is a per-block motion vector --
+//   structural information that captures the DIRECTION of motion, not
+//   just its magnitude.
+//
+//   Block matching was chosen over more sophisticated optical flow
+//   (Lucas-Kanade, Horn-Schunck) for the same reason Sobel is the first
+//   edge detector to land: it is the simplest STANDARDIZED motion
+//   estimator that the substrate can use to perceive "leftward motion"
+//   or "upward motion" as distinct atoms. The whole pipeline fits in
+//   ~200 lines: a 17x17 search per block (289 SAD evaluations) and a
+//   per-block aggregation step.
+//
+// Per-block output:
+//   (dx, dy) integer pair in -8..+8 each.
+//
+// Aggregate atoms:
+//   `motion_dir_left`   if dominant dx < -DX_THRESHOLD
+//   `motion_dir_right`  if dominant dx > DX_THRESHOLD
+//   `motion_dir_up`     if dominant dy < -DY_THRESHOLD
+//   `motion_dir_down`   if dominant dy > DY_THRESHOLD
+//   `motion_dir_static` if all blocks below threshold magnitude
+//   `motion_complexity_simple`  if variance of (dx, dy) low
+//   `motion_complexity_complex` if variance high
+//
+// Public API
+//   mv_apply(prev_ptr, cur_ptr, width, height)
+//     -> [vectors_list, mean_dx, mean_dy, variance_milli]
+//   mv_direction_label(mean_dx, mean_dy) -> string (one of motion_dir_*)
+//   mv_complexity_label(variance_milli) -> string (motion_complexity_*)
+//   mv_aggregate_labels(result) -> list of feature atom strings
+//
+// Pixel-area cap: same 512x512 (per-axis) ceiling as image_sobel.nova.
+// The per-block SAD accumulator is at most 16*16*255 = 65280; the
+// per-frame total is at most 32 blocks * 32 blocks * SAD = ~67M, well
+// within NOVA's 64-bit int range.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, int_to_str.
+// CrossEngin dependencies: none (leaf module -- video_perception.nova
+//   imports this).
+
+// ---- format constants -----------------------------------------------------
+
+// Block side (pixels). Standard MPEG/H.264 macroblock size.
+let MV_BLOCK_SIZE = 16
+
+// Search radius (pixels). +/-8 yields a 17x17 search window per block.
+let MV_SEARCH_RADIUS = 8
+
+// Minimum |dx| or |dy| to call a block "moving" in that axis. Anything
+// less is treated as zero motion (a one-pixel jitter is below noise).
+let MV_DX_THRESHOLD = 1
+let MV_DY_THRESHOLD = 1
+
+// Variance threshold (milli-fixed-point) for the complex/simple split.
+let MV_COMPLEXITY_MIN_MILLI = 5000
+
+// Hard cap on dimensions (same as the rest of the visual stack).
+let MV_MAX_DIM = 512
+let MV_MAX_PIXEL_AREA = 262144   // 512 * 512
+
+// Per-block vector record slot indices.
+let MV_V_BLOCK_X = 0
+let MV_V_BLOCK_Y = 1
+let MV_V_DX      = 2
+let MV_V_DY      = 3
+let MV_V_SAD     = 4
+
+// Result tuple slot indices.
+let MV_R_VECTORS  = 0
+let MV_R_MEAN_DX  = 1
+let MV_R_MEAN_DY  = 2
+let MV_R_VARIANCE = 3
+let MV_R_BLOCK_N  = 4
+
+// ---- result helpers ------------------------------------------------------
+
+fn _mv_vector(bx, by, dx, dy, sad) {
+    let v = list_new()
+    push(v, bx)
+    push(v, by)
+    push(v, dx)
+    push(v, dy)
+    push(v, sad)
+    return v
+}
+
+fn _mv_result(vectors, mean_dx, mean_dy, variance, n) {
+    let r = list_new()
+    push(r, vectors)
+    push(r, mean_dx)
+    push(r, mean_dy)
+    push(r, variance)
+    push(r, n)
+    return r
+}
+
+fn _mv_fail() {
+    return _mv_result(list_new(), 0, 0, 0, 0)
+}
+
+// ---- per-block SAD --------------------------------------------------------
+//
+// Compute SAD between a 16x16 block at (bx, by) in the current frame
+// and the same-shape block at (bx + dx, by + dy) in the previous frame.
+// Both source coordinates must be valid (caller has clipped); we don't
+// re-validate inside the inner loop for speed.
+//
+// SAD = sum_{i, j} |cur[bx + i, by + j] - prev[bx + dx + i, by + dy + j]|
+//
+// At MV_BLOCK_SIZE=16 and 8-bit pixels, max SAD = 16 * 16 * 255 = 65280,
+// safely under any pointer threshold.
+
+fn _mv_sad(prev_ptr, cur_ptr, width, bx, by, dx, dy) {
+    let total = 0
+    let j = 0
+    while j < MV_BLOCK_SIZE {
+        let cur_row_off  = int_mul(int_add(by, j), width)
+        let prev_row_off = int_mul(int_add(int_add(by, j), dy), width)
+        let i = 0
+        while i < MV_BLOCK_SIZE {
+            let cur_x  = int_add(bx, i)
+            let prev_x = int_add(int_add(bx, i), dx)
+            let a = load8(cur_ptr + int_add(cur_row_off, cur_x))
+            let b = load8(prev_ptr + int_add(prev_row_off, prev_x))
+            let d = int_sub(a, b)
+            if d < 0 { d = 0 - d }
+            total = int_add(total, d)
+            i = int_add(i, 1)
+        }
+        j = int_add(j, 1)
+    }
+    return total
+}
+
+// ---- per-block search ----------------------------------------------------
+//
+// For block at (bx, by) in the current frame, search over a +/-8 window
+// in the previous frame. Return the (dx, dy) offset with minimum SAD,
+// plus the SAD value itself. If multiple offsets tie, the lower
+// (dy then dx) wins (stable order).
+
+fn _mv_block_search(prev_ptr, cur_ptr, width, height, bx, by) {
+    let best_dx = 0
+    let best_dy = 0
+    let best_sad = -1
+    let dy = 0 - MV_SEARCH_RADIUS
+    while dy <= MV_SEARCH_RADIUS {
+        // Bound check: prev block's top-left y in 0..height-block_size.
+        let prev_top_y = int_add(by, dy)
+        if prev_top_y >= 0 {
+            if int_add(prev_top_y, MV_BLOCK_SIZE) <= height {
+                let dx = 0 - MV_SEARCH_RADIUS
+                while dx <= MV_SEARCH_RADIUS {
+                    let prev_left_x = int_add(bx, dx)
+                    if prev_left_x >= 0 {
+                        if int_add(prev_left_x, MV_BLOCK_SIZE) <= width {
+                            let sad = _mv_sad(prev_ptr, cur_ptr, width, bx, by, dx, dy)
+                            if best_sad < 0 {
+                                best_sad = sad
+                                best_dx = dx
+                                best_dy = dy
+                            } else {
+                                if sad < best_sad {
+                                    best_sad = sad
+                                    best_dx = dx
+                                    best_dy = dy
+                                }
+                            }
+                        }
+                    }
+                    dx = int_add(dx, 1)
+                }
+            }
+        }
+        dy = int_add(dy, 1)
+    }
+    let v = list_new()
+    push(v, best_dx)
+    push(v, best_dy)
+    push(v, best_sad)
+    return v
+}
+
+// ---- main entry point ----------------------------------------------------
+//
+// Walk the frame in 16x16 blocks; for each whole block (those that fit
+// completely within the frame) compute the best motion vector via
+// _mv_block_search and accumulate the per-frame mean / variance.
+// Partial blocks at the right or bottom edge are ignored (the standard
+// way block-matching codecs handle non-multiple-of-16 dimensions in
+// MVP form).
+
+fn mv_apply(prev_ptr, cur_ptr, width, height) {
+    if width <= 0   { return _mv_fail() }
+    if height <= 0  { return _mv_fail() }
+    if prev_ptr == 0 { return _mv_fail() }
+    if cur_ptr == 0 { return _mv_fail() }
+    if width > MV_MAX_DIM  { return _mv_fail() }
+    if height > MV_MAX_DIM { return _mv_fail() }
+    let area = int_mul(width, height)
+    if area > MV_MAX_PIXEL_AREA { return _mv_fail() }
+    if width < MV_BLOCK_SIZE  { return _mv_fail() }
+    if height < MV_BLOCK_SIZE { return _mv_fail() }
+
+    let vectors = list_new()
+    let sum_dx = 0
+    let sum_dy = 0
+    let n = 0
+    let by = 0
+    while int_add(by, MV_BLOCK_SIZE) <= height {
+        let bx = 0
+        while int_add(bx, MV_BLOCK_SIZE) <= width {
+            let res = _mv_block_search(prev_ptr, cur_ptr, width, height, bx, by)
+            let dx = res[0]
+            let dy = res[1]
+            let sad = res[2]
+            push(vectors, _mv_vector(bx, by, dx, dy, sad))
+            sum_dx = int_add(sum_dx, dx)
+            sum_dy = int_add(sum_dy, dy)
+            n = int_add(n, 1)
+            bx = int_add(bx, MV_BLOCK_SIZE)
+        }
+        by = int_add(by, MV_BLOCK_SIZE)
+    }
+    if n == 0 {
+        return _mv_result(vectors, 0, 0, 0, 0)
+    }
+    let mean_dx = sum_dx / n
+    let mean_dy = sum_dy / n
+    // Variance in milli units: 1000 * sum((dx_i - mean_dx)^2 + (dy_i - mean_dy)^2) / n
+    let var_acc = 0
+    let i = 0
+    while i < n {
+        let v = vectors[i]
+        let ddx = int_sub(v[MV_V_DX], mean_dx)
+        let ddy = int_sub(v[MV_V_DY], mean_dy)
+        var_acc = int_add(var_acc, int_add(int_mul(ddx, ddx), int_mul(ddy, ddy)))
+        i = int_add(i, 1)
+    }
+    let variance_milli = int_mul(var_acc, 1000) / n
+    return _mv_result(vectors, mean_dx, mean_dy, variance_milli, n)
+}
+
+// ---- aggregate labels ----------------------------------------------------
+
+// Pick the dominant cardinal direction from the mean (dx, dy). Tie-break:
+// left/right over up/down (horizontal motion is more salient in most
+// natural footage). Returns "" if motion is below threshold in both axes.
+//
+// Note: in image coordinates a POSITIVE dy means the previous frame's
+// block came from BELOW (object moved up in screen space), so:
+//   dy > 0 -> motion_dir_up
+//   dy < 0 -> motion_dir_down
+// Similarly dx > 0 in the search means the previous-frame block was to
+// the RIGHT, so the object moved LEFT.
+fn mv_direction_label(mean_dx, mean_dy) {
+    let abs_dx = mean_dx
+    if abs_dx < 0 { abs_dx = 0 - abs_dx }
+    let abs_dy = mean_dy
+    if abs_dy < 0 { abs_dy = 0 - abs_dy }
+    if abs_dx < MV_DX_THRESHOLD {
+        if abs_dy < MV_DY_THRESHOLD {
+            return "motion_dir_static"
+        }
+    }
+    if abs_dx >= abs_dy {
+        if mean_dx > 0  { return "motion_dir_left" }
+        if mean_dx < 0  { return "motion_dir_right" }
+    }
+    if mean_dy > 0 { return "motion_dir_up" }
+    if mean_dy < 0 { return "motion_dir_down" }
+    return "motion_dir_static"
+}
+
+// Classify variance into simple/complex motion.
+fn mv_complexity_label(variance_milli) {
+    if variance_milli >= MV_COMPLEXITY_MIN_MILLI {
+        return "motion_complexity_complex"
+    }
+    return "motion_complexity_simple"
+}
+
+// Build the per-frame aggregate label set. Returns a list of strings the
+// video perception path can splice into the per-frame feature atoms.
+fn mv_aggregate_labels(result) {
+    let out = list_new()
+    if result[MV_R_BLOCK_N] == 0 { return out }
+    let dir_label = mv_direction_label(result[MV_R_MEAN_DX], result[MV_R_MEAN_DY])
+    if len(dir_label) > 0 { push(out, dir_label) }
+    push(out, mv_complexity_label(result[MV_R_VARIANCE]))
+    return out
+}
+
+// ---- result-tuple accessors ----------------------------------------------
+
+fn mv_result_vectors(r)  { return r[MV_R_VECTORS] }
+fn mv_result_mean_dx(r)  { return r[MV_R_MEAN_DX] }
+fn mv_result_mean_dy(r)  { return r[MV_R_MEAN_DY] }
+fn mv_result_variance(r) { return r[MV_R_VARIANCE] }
+fn mv_result_block_n(r)  { return r[MV_R_BLOCK_N] }
+
+fn mv_vector_block_x(v) { return v[MV_V_BLOCK_X] }
+fn mv_vector_block_y(v) { return v[MV_V_BLOCK_Y] }
+fn mv_vector_dx(v)      { return v[MV_V_DX] }
+fn mv_vector_dy(v)      { return v[MV_V_DY] }
+fn mv_vector_sad(v)     { return v[MV_V_SAD] }

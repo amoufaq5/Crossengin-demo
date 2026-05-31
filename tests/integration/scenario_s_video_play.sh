@@ -30,8 +30,9 @@ it_section "scenario S: /play Y4M video admin command (ADR-0014 video seam)"
 
 FIX="/tmp/ce_scenario_s.y4m"
 BAD="/tmp/ce_scenario_s_bad.bin"
+MV="/tmp/ce_scenario_s_mv.y4m"
 
-rm -f "$FIX" "$BAD"
+rm -f "$FIX" "$BAD" "$MV"
 
 # Build a 5-frame 4x4 Y4M 4:2:0 fixture.
 # Per-frame: "FRAME\n" + 16 Y bytes + 4 Cb bytes + 4 Cr bytes = 30 bytes.
@@ -74,6 +75,45 @@ rm -f "$FIX" "$BAD"
 # bailing out with "buffer too short".
 printf '\x4e\x4f\x54\x59\x34\x4d\x32\x42\x41\x44\x42\x59\x54\x45\x53\x21' > "$BAD"
 
+# Build a 32x32 Y4M fixture with KNOWN LEFTWARD MOTION. Frames contain a
+# 16x16 white block on a black background. The block moves from x=16 in
+# frame 0 to x=12 in frame 1 to x=8 in frame 2 (4 pixels left per frame).
+# The motion vector field's per-block search finds the block's PREVIOUS
+# position to the RIGHT of its current position -> positive dx ->
+# motion_dir_left. At 32x32 with 16x16 blocks we have a 2x2 block grid.
+# Per frame Y plane: 32*32 = 1024 bytes; chroma planes: 16*16 = 256 bytes
+# each; per frame total: 6 + 1024 + 256 + 256 = 1542 bytes.
+python3 - <<'PY' > "$MV"
+import sys, struct
+sys.stdout = sys.stdout.buffer if hasattr(sys.stdout, "buffer") else sys.stdout
+
+def emit(b):
+    sys.stdout.write(b)
+
+# Header.
+emit(b"YUV4MPEG2 W32 H32 F30:1 Ip A1:1 C420\n")
+
+W = 32
+H = 32
+
+def frame_with_block(bx, by, bsize=16):
+    # Y plane: 0 everywhere except 255 inside the block.
+    plane = bytearray(W * H)
+    for y in range(by, by + bsize):
+        if 0 <= y < H:
+            for x in range(bx, bx + bsize):
+                if 0 <= x < W:
+                    plane[y * W + x] = 255
+    return plane
+
+# 3 frames with the block moving leftward by 4 px each frame.
+for bx in (16, 12, 8):
+    emit(b"FRAME\n")
+    emit(bytes(frame_with_block(bx, 8)))
+    emit(b"\x80" * (16 * 16))   # Cb
+    emit(b"\x80" * (16 * 16))   # Cr
+PY
+
 if [ ! -s "$FIX" ]; then
     printf "  ${C_RED}FAIL${C_RST}  fixture %s did not get written\n" "$FIX"
     FAIL=$((FAIL+1))
@@ -85,6 +125,7 @@ INPUT=$(
     printf '/help\n'
     printf '/play\n'
     printf '/play %s 5\n' "$FIX"
+    printf '/play %s 3\n' "$MV"
     printf '/play %s\n' "$BAD"
     printf '/quit\n'
 )
@@ -139,7 +180,24 @@ assert_match "$OUT" "play FAILED: y4m: bad magic" \
 assert_match "$OUT" "bye\." \
     "chat reaches /quit cleanly after malformed /play"
 
+# ---- P3.3 motion vector field on 32x32 leftward-motion fixture ----------
+
+# 13. /play on the 32x32 motion fixture prints its summary.
+assert_match "$OUT" "played $MV: 3 frame\(s\), 32x32" \
+    "/play prints frame count + dims on 32x32 motion fixture"
+
+# 14. The motion vector field detects LEFTWARD motion on frames 1 and 2
+# (the white block moves left between consecutive frames). The per-frame
+# event line includes motion_dir_left.
+assert_match "$OUT" "frame 1:.*motion_dir_left" \
+    "/play frame 1 of 32x32 fixture carries motion_dir_left"
+
+# 15. The motion is simple (uniform translation of one block), so the
+# complexity label is motion_complexity_simple on at least frame 2.
+assert_match "$OUT" "frame 2:.*motion_complexity_simple" \
+    "/play frame 2 of 32x32 fixture carries motion_complexity_simple"
+
 # Cleanup.
-rm -f "$FIX" "$BAD"
+rm -f "$FIX" "$BAD" "$MV"
 
 summary "scenario_s_video_play"

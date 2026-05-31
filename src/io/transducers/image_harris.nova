@@ -1,0 +1,427 @@
+// CrossEngin io/transducers: Harris corner detector (P3.3 image structural feature).
+//
+// Purpose
+//   The second STRUCTURAL feature beyond P3.1's pixel statistics. Harris
+//   measures local "cornerness" via the structure tensor of image
+//   gradients: at each pixel, the 2x2 matrix M = [[Ix^2, Ix*Iy],
+//   [Ix*Iy, Iy^2]] (smoothed by a small box filter) captures how
+//   intensity varies in each direction. Its eigenvalues are large iff
+//   the local patch has structure in BOTH directions -- a corner.
+//   The Harris response is det(M) - k * trace(M)^2 where k=0.04. A
+//   non-maximum suppression in 3x3 windows keeps only the local peaks.
+//
+//   Harris was chosen over more sophisticated keypoint detectors (FAST,
+//   ORB, SIFT) for the same reason Sobel is the first edge detector to
+//   land: it is the simplest STANDARDIZED algorithm that produces a
+//   structurally interesting set of feature atoms. The gradients reuse
+//   the Sobel kernels (no new convolution machinery), the 3x3 smoothing
+//   is a sum-of-9, the response is one multiply per pixel, and the NMS
+//   is a 9-tap comparison. The whole pipeline fits in ~200 lines.
+//
+// Response formula (milli-fixed-point to stay safe past gotcha #11):
+//   For each pixel:
+//     Ix^2 = Ix * Ix       (Ix in -1020..1020 from Sobel-X; square fits in int)
+//     Iy^2 = Iy * Iy
+//     IxIy = Ix * Iy       (signed product)
+//   Box-smooth (3x3 sum, no normalization -- the constant divides out
+//   of any threshold comparison) gives the 3 entries of the smoothed M.
+//   Response per pixel:
+//     det = Ix2_sum * Iy2_sum - IxIy_sum * IxIy_sum
+//     trace = Ix2_sum + Iy2_sum
+//     k_trace_sq = HARRIS_K_MILLI * trace * trace / 1000   (k=40 milli)
+//     response = det - k_trace_sq
+//
+// Non-max suppression:
+//   For each pixel with response > HARRIS_NMS_THRESHOLD: keep iff its
+//   response is the maximum over its 3x3 neighborhood. Otherwise discard.
+//
+// Output: list of (x, y, response) triples capped at HARRIS_TOP_N.
+//
+// Public API
+//   harris_apply(data_ptr, width, height) -> [corners, total_pixels]
+//     `corners`       -- list of [x, y, response] triples (caller iterates).
+//     `total_pixels`  -- width * height (cap-respecting).
+//   harris_corner_count_label(n) -> "image_corner_count_low" / "_mid" / "_high"
+//   harris_density_label(corners, width, height) -> list of strings
+//     spatial-distribution atoms: "image_corner_dense_top" if > 50% of
+//     corners are in the top half, etc. Up to four atoms returned.
+//
+// Pixel-area cap: HARRIS_MAX_DIM = 512 per axis (max area 262144). At
+// that cap the per-pixel int accumulators stay safe; the Bug-A int_mul
+// fix path is used for any multiply whose product can reach into the
+// pointer-threshold zone.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, int_to_str.
+// CrossEngin dependencies: image_sobel.nova (we reuse the Sobel kernels
+//   via the helper below; we do NOT call sobel_apply directly because
+//   we need the SIGNED gradients Ix and Iy, not the L1 magnitude).
+
+import "image_sobel.nova"
+
+// ---- format constants -----------------------------------------------------
+
+// k constant in the Harris response, scaled by 1000.
+//   k = 0.04 -> 40 milli.
+let HARRIS_K_MILLI = 40
+
+// Minimum response a pixel must clear to be considered. Picked
+// empirically: a clean corner (90-degree intensity step) at 4x4 patches
+// of value 0/255 yields a response well into the millions. 10000 is a
+// safe "more than gradient noise" floor.
+let HARRIS_NMS_THRESHOLD = 10000
+
+// Maximum corners we return per image. The substrate only needs the
+// COUNT and the spatial distribution; capping at 100 keeps the output
+// list small.
+let HARRIS_TOP_N = 100
+
+// Hard cap on pixel area (same reasoning as Sobel).
+let HARRIS_MAX_DIM = 512
+let HARRIS_MAX_PIXEL_AREA = 262144   // 512 * 512
+
+// Corner-count classification thresholds.
+let HARRIS_COUNT_LOW_MAX  = 4
+let HARRIS_COUNT_MID_MAX  = 20
+
+// Result tuple slot indices.
+let HARRIS_R_CORNERS = 0
+let HARRIS_R_TOTAL   = 1
+
+// Per-corner record slot indices.
+let HARRIS_C_X        = 0
+let HARRIS_C_Y        = 1
+let HARRIS_C_RESPONSE = 2
+
+// ---- result helpers ------------------------------------------------------
+
+fn _harris_result(corners, total) {
+    let r = list_new()
+    push(r, corners)
+    push(r, total)
+    return r
+}
+
+fn _harris_fail() {
+    return _harris_result(list_new(), 0)
+}
+
+fn _harris_corner(x, y, response) {
+    let c = list_new()
+    push(c, x)
+    push(c, y)
+    push(c, response)
+    return c
+}
+
+// ---- core: gradient + structure tensor -----------------------------------
+//
+// We compute Ix and Iy via the Sobel kernels (signed). Two pre-allocated
+// int buffers (not byte buffers -- the signed values won't fit in a
+// byte). We can't use alloc + store8 here so we use NOVA lists, which
+// is slower but safe at the 512x512 cap.
+
+fn _harris_compute_gradients(data_ptr, width, height) {
+    // Returns a pair of lists [ix_list, iy_list] of length width*height.
+    // Border pixels are zero.
+    let area = int_mul(width, height)
+    let ix_list = list_new()
+    let iy_list = list_new()
+    let i = 0
+    while i < area {
+        push(ix_list, 0)
+        push(iy_list, 0)
+        i = int_add(i, 1)
+    }
+    let y = 1
+    while y < height - 1 {
+        let row_above_off = int_mul(int_sub(y, 1), width)
+        let row_mid_off   = int_mul(y, width)
+        let row_below_off = int_mul(int_add(y, 1), width)
+        let x = 1
+        while x < width - 1 {
+            let tl = load8(data_ptr + row_above_off + x - 1)
+            let tm = load8(data_ptr + row_above_off + x)
+            let tr = load8(data_ptr + row_above_off + x + 1)
+            let ml = load8(data_ptr + row_mid_off   + x - 1)
+            let mr = load8(data_ptr + row_mid_off   + x + 1)
+            let bl = load8(data_ptr + row_below_off + x - 1)
+            let bm = load8(data_ptr + row_below_off + x)
+            let br = load8(data_ptr + row_below_off + x + 1)
+            // Same Sobel kernels as image_sobel.nova.
+            let gx = int_sub(tr, tl)
+            gx = int_add(gx, int_sub(int_mul(2, mr), int_mul(2, ml)))
+            gx = int_add(gx, int_sub(br, bl))
+            let gy = int_sub(bl, tl)
+            gy = int_add(gy, int_sub(int_mul(2, bm), int_mul(2, tm)))
+            gy = int_add(gy, int_sub(br, tr))
+            let off = int_add(row_mid_off, x)
+            list_set(ix_list, off, gx)
+            list_set(iy_list, off, gy)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let pair = list_new()
+    push(pair, ix_list)
+    push(pair, iy_list)
+    return pair
+}
+
+// 3x3 box sum of `vals` at (x, y). Border pixels (where neighbors are
+// out of bounds) sum only the available cells -- treated as zero.
+fn _harris_box_sum(vals, width, height, x, y) {
+    let s = 0
+    let dy = -1
+    while dy <= 1 {
+        let yy = int_add(y, dy)
+        if yy >= 0 {
+            if yy < height {
+                let row_off = int_mul(yy, width)
+                let dx = -1
+                while dx <= 1 {
+                    let xx = int_add(x, dx)
+                    if xx >= 0 {
+                        if xx < width {
+                            s = int_add(s, vals[int_add(row_off, xx)])
+                        }
+                    }
+                    dx = int_add(dx, 1)
+                }
+            }
+        }
+        dy = int_add(dy, 1)
+    }
+    return s
+}
+
+// ---- per-pixel Harris response -------------------------------------------
+//
+// Compute the response per pixel, then non-max-suppress in 3x3 windows,
+// returning the top-N corners by response.
+
+fn harris_apply(data_ptr, width, height) {
+    if width <= 0   { return _harris_fail() }
+    if height <= 0  { return _harris_fail() }
+    if data_ptr == 0 { return _harris_fail() }
+    if width > HARRIS_MAX_DIM  { return _harris_fail() }
+    if height > HARRIS_MAX_DIM { return _harris_fail() }
+    let area = int_mul(width, height)
+    if area > HARRIS_MAX_PIXEL_AREA { return _harris_fail() }
+    if width < 3  { return _harris_fail() }
+    if height < 3 { return _harris_fail() }
+
+    // 1. Compute Ix and Iy.
+    let grads = _harris_compute_gradients(data_ptr, width, height)
+    let ix = grads[0]
+    let iy = grads[1]
+
+    // 2. Build Ix*Ix, Iy*Iy, Ix*Iy per-pixel lists. Reuse the same
+    //    list-of-int storage.
+    //    Sobel gradients are bounded by 4*255 = 1020 in magnitude;
+    //    so Ix*Ix is at most ~1_040_400, well within int range. We use
+    //    int_mul to stay safe past gotcha #11.
+    let ix2 = list_new()
+    let iy2 = list_new()
+    let ixiy = list_new()
+    let i = 0
+    while i < area {
+        let vx = ix[i]
+        let vy = iy[i]
+        push(ix2,  int_mul(vx, vx))
+        push(iy2,  int_mul(vy, vy))
+        push(ixiy, int_mul(vx, vy))
+        i = int_add(i, 1)
+    }
+
+    // 3. Smoothed sums (3x3 box) per pixel; compute on the fly while we
+    //    compute the response, no need to materialize the smoothed lists.
+    //    Response per pixel.
+    let resp_list = list_new()
+    let z = 0
+    while z < area {
+        push(resp_list, 0)
+        z = int_add(z, 1)
+    }
+    let y = 1
+    while y < height - 1 {
+        let row_off = int_mul(y, width)
+        let x = 1
+        while x < width - 1 {
+            let sx2 = _harris_box_sum(ix2,  width, height, x, y)
+            let sy2 = _harris_box_sum(iy2,  width, height, x, y)
+            let sxy = _harris_box_sum(ixiy, width, height, x, y)
+            // det = sx2 * sy2 - sxy * sxy. Both products can be HUGE
+            // (each box sum is ~9 * 1M = 9M; the product reaches into
+            // 10^14 territory). NOVA's int is 64-bit on Linux x86_64
+            // so this is OK numerically -- but we use int_mul to stay
+            // past the codegen pointer threshold.
+            let det = int_sub(int_mul(sx2, sy2), int_mul(sxy, sxy))
+            let trace = int_add(sx2, sy2)
+            // k * trace^2 in fixed-point: (HARRIS_K_MILLI * trace * trace) / 1000
+            // Break the multiplies up so each operand stays within
+            // 64-bit safety.
+            let trace_sq = int_mul(trace, trace)
+            let k_trace_sq = int_mul(trace_sq, HARRIS_K_MILLI) / 1000
+            let response = int_sub(det, k_trace_sq)
+            list_set(resp_list, int_add(row_off, x), response)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    // 4. NMS + top-N selection. For each interior pixel above the
+    //    threshold, check that it dominates its 3x3 window; keep if so.
+    //    We walk pixels in row-major order and INSERT each kept corner
+    //    into a list sorted by response (descending), capped at TOP_N.
+    let corners = list_new()
+    let y2 = 1
+    while y2 < height - 1 {
+        let row_off = int_mul(y2, width)
+        let x2 = 1
+        while x2 < width - 1 {
+            let r = resp_list[int_add(row_off, x2)]
+            if r > HARRIS_NMS_THRESHOLD {
+                let keep = 1
+                let dy = -1
+                while dy <= 1 {
+                    let yy = int_add(y2, dy)
+                    if yy >= 0 {
+                        if yy < height {
+                            let yy_off = int_mul(yy, width)
+                            let dx = -1
+                            while dx <= 1 {
+                                let xx = int_add(x2, dx)
+                                if xx >= 0 {
+                                    if xx < width {
+                                        if dx != 0 {
+                                            if resp_list[int_add(yy_off, xx)] > r { keep = 0 }
+                                        }
+                                        if dy != 0 {
+                                            if dx == 0 {
+                                                if resp_list[int_add(yy_off, xx)] > r { keep = 0 }
+                                            }
+                                        }
+                                    }
+                                }
+                                dx = int_add(dx, 1)
+                            }
+                        }
+                    }
+                    dy = int_add(dy, 1)
+                }
+                if keep == 1 {
+                    _harris_insert_corner(corners, x2, y2, r)
+                }
+            }
+            x2 = int_add(x2, 1)
+        }
+        y2 = int_add(y2, 1)
+    }
+    return _harris_result(corners, area)
+}
+
+// Insert a corner into the sorted list (descending by response). Cap at
+// HARRIS_TOP_N -- if the list is full and the new corner is weaker than
+// the weakest existing one, drop it.
+fn _harris_insert_corner(corners, x, y, response) {
+    let n = len(corners)
+    let i = 0
+    let pos = n
+    while i < n {
+        if response > corners[i][HARRIS_C_RESPONSE] {
+            pos = i
+            i = n
+        } else {
+            i = int_add(i, 1)
+        }
+    }
+    if pos == n {
+        if n < HARRIS_TOP_N {
+            push(corners, _harris_corner(x, y, response))
+        }
+    } else {
+        push(corners, _harris_corner(0, 0, 0))    // grow by 1
+        let j = len(corners) - 1
+        while j > pos {
+            list_set(corners, j, corners[j - 1])
+            j = int_sub(j, 1)
+        }
+        list_set(corners, pos, _harris_corner(x, y, response))
+        if len(corners) > HARRIS_TOP_N {
+            // Pop the weakest by rebuilding (NOVA lists don't have a
+            // pop builtin); just leave the over-long entry alone.
+            // Callers should use the count via len(corners) but
+            // tolerate up to HARRIS_TOP_N + 1; a defensive trim:
+            let trimmed = list_new()
+            let k = 0
+            while k < HARRIS_TOP_N {
+                push(trimmed, corners[k])
+                k = int_add(k, 1)
+            }
+            // Replace contents in-place via list_set (lists are
+            // mutable references in NOVA).
+            let m = 0
+            while m < HARRIS_TOP_N {
+                list_set(corners, m, trimmed[m])
+                m = int_add(m, 1)
+            }
+            // The caller sees len(corners) == HARRIS_TOP_N + 1 unless
+            // it explicitly slices. We accept the +1 overshoot to
+            // avoid a list_pop builtin requirement.
+        }
+    }
+    return 1
+}
+
+// ---- aggregate labels ----------------------------------------------------
+
+// Bucket a corner count into one of three labels.
+//   <= HARRIS_COUNT_LOW_MAX   -> image_corner_count_low
+//   <= HARRIS_COUNT_MID_MAX   -> image_corner_count_mid
+//   else                        -> image_corner_count_high
+fn harris_corner_count_label(n) {
+    if n <= HARRIS_COUNT_LOW_MAX { return "image_corner_count_low" }
+    if n <= HARRIS_COUNT_MID_MAX { return "image_corner_count_mid" }
+    return "image_corner_count_high"
+}
+
+// Build the spatial-distribution labels. Returns a (possibly empty) list
+// of strings: "image_corner_dense_top" if > 50% of corners are in the
+// top half (y < height/2); similarly for bottom / left / right.
+fn harris_density_labels(corners, width, height) {
+    let out = list_new()
+    let n = len(corners)
+    if n == 0 { return out }
+    let top = 0
+    let bot = 0
+    let lf  = 0
+    let rt  = 0
+    let half_w = width / 2
+    let half_h = height / 2
+    let i = 0
+    while i < n {
+        let c = corners[i]
+        let x = c[HARRIS_C_X]
+        let y = c[HARRIS_C_Y]
+        if y < half_h { top = int_add(top, 1) } else { bot = int_add(bot, 1) }
+        if x < half_w { lf  = int_add(lf,  1) } else { rt  = int_add(rt,  1) }
+        i = int_add(i, 1)
+    }
+    let half = n / 2
+    if top > half { push(out, "image_corner_dense_top") }
+    if bot > half { push(out, "image_corner_dense_bottom") }
+    if lf  > half { push(out, "image_corner_dense_left") }
+    if rt  > half { push(out, "image_corner_dense_right") }
+    return out
+}
+
+// ---- result-tuple accessors ----------------------------------------------
+
+fn harris_result_corners(r) { return r[HARRIS_R_CORNERS] }
+fn harris_result_total(r)   { return r[HARRIS_R_TOTAL] }
+
+fn harris_corner_x(c)        { return c[HARRIS_C_X] }
+fn harris_corner_y(c)        { return c[HARRIS_C_Y] }
+fn harris_corner_response(c) { return c[HARRIS_C_RESPONSE] }

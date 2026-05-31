@@ -85,8 +85,8 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 | Feature                         | NOVA effort |
 |---------------------------------|-------------|
 | Mean intensity / histogram      | landed      |
-| Sobel edge magnitude            | 1-2 weeks   |
-| Harris corner detector          | 2-3 weeks   |
+| Sobel edge magnitude            | DONE (P3.3) |
+| Harris corner detector          | DONE (P3.3) |
 | Canny edge with hysteresis      | 2-3 weeks   |
 | HOG (oriented gradients)        | 2-3 weeks   |
 | SIFT-like keypoints + 128-D     | 4-6 weeks   |
@@ -100,6 +100,35 @@ weeks for SIFT-quality keypoints, and many months for a trained CNN-like
 embedding. Pure-NOVA CNN training is unrealistic this decade; the WASM
 stb_image + an embedded ONNX-runtime path is the realistic embedded-model
 option once both halves land.
+
+## P3.3 structural features (landed)
+
+After P3.1 P3.1.PNG landed the pixel-statistics half, P3.3 added the
+first two STRUCTURAL feature pipelines so the substrate can perceive
+gradient structure and corner geometry, not just intensity moments:
+
+- **Sobel edge detection** (`src/io/transducers/image_sobel.nova`).
+  Convolves the grayscale image with the standard 3x3 Sobel-X and
+  Sobel-Y kernels. Output: per-pixel L1-norm edge magnitude + a 4-bin
+  orientation bucket (0 / 45 / 90 / 135 degrees). Per-image atoms:
+  `image_edge_dense` (when more than 10% of pixels exceed the magnitude
+  threshold) or `image_edge_sparse`, plus an `image_orient_<deg>` atom
+  for the dominant orientation bucket.
+- **Harris corner detection** (`src/io/transducers/image_harris.nova`).
+  Builds the 2x2 structure tensor M = [[Ix^2, Ix*Iy], [Ix*Iy, Iy^2]]
+  from the Sobel gradients, smooths it via a 3x3 box filter, and
+  computes the response det(M) - k * trace(M)^2 in milli-fixed-point
+  (k = 0.04 -> 40 milli). 3x3 non-maximum suppression keeps only local
+  peaks. Returns the top-N corners by response. Per-image atoms:
+  `image_corner_count_<low|mid|high>` for the bucketed count, plus
+  spatial-distribution labels `image_corner_dense_<top|bottom|left|right>`
+  for the directional skew of the corner set.
+
+Both detectors fire only when the image is at least 16x16 in each axis
+(the kernel needs a 3x3 neighborhood and the count buckets need
+meaningful scale). Dimensions are capped at 512x512 per axis in this MVP
+to keep all intermediate accumulators well under NOVA's 2^20 codegen
+pointer threshold (gotcha #11).
 
 ## Mapping features to atoms
 
@@ -129,9 +158,10 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | Milestone                                          | Effort           |
 |----------------------------------------------------|------------------|
 | PGM + crude stats + ImageMagick shim               | landed (P3.1)    |
+| Sobel + Harris structural features                 | DONE (P3.3)      |
 | JPEG decode in pure NOVA                           | 6-8 weeks        |
 | PNG decode (zlib + filters)                        | 3-4 weeks        |
-| Sobel / Harris / color histograms                  | 6-9 weeks total  |
+| Color histograms                                   | 2-3 weeks        |
 | SIFT-like keypoints                                | 4-6 weeks        |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
@@ -177,15 +207,25 @@ any roadmap within the next year.
 ## Cross-references
 
 * `src/io/transducers/image_pgm.nova` — pure-NOVA PGM-P5 decoder + stats.
+* `src/io/transducers/image_sobel.nova` — pure-NOVA Sobel edge detector
+  (DONE, P3.3).
+* `src/io/transducers/image_harris.nova` — pure-NOVA Harris corner
+  detector with milli-fixed-point response (DONE, P3.3).
 * `src/io/transducers/visual_perception.nova` — pluggable seam + feature
-  extraction.
+  extraction (extended in P3.3 to call Sobel + Harris on images
+  >= 16x16).
 * `scripts/image_to_pgm.sh` — ImageMagick / ffmpeg / placeholder shim.
 * `examples/crossengin_chat.nova` — `/see PATH` admin command + dispatch
   + /help entry.
 * `tests/unit/test_image_pgm.nova` — 43 in-memory assertions covering
   parse, stats, resize, and malformed inputs.
-* `tests/integration/scenario_q_image_see.sh` — 11 end-to-end /see chat
-  assertions against hand-rolled gradient + uniform PGM fixtures.
+* `tests/unit/test_image_sobel.nova` — in-memory assertions covering
+  Sobel kernel response, orientation buckets, density math, caps.
+* `tests/unit/test_image_harris.nova` — in-memory assertions covering
+  Harris corner detection on flat / edge / corner fixtures plus the
+  count + spatial-distribution label helpers.
+* `tests/integration/scenario_q_image_see.sh` — end-to-end /see chat
+  assertions against gradient + uniform + 16x16 edge fixtures.
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (JPEG / PNG decode, feature extraction, embeddings).
 * `STT_AUDIT.md` — sibling audit for the audio modality bridge.

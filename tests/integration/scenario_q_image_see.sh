@@ -31,9 +31,10 @@ it_section "scenario Q: /see PGM image admin command (ADR-0014 visual seam)"
 FIX="/tmp/ce_scenario_q.pgm"
 FLAT="/tmp/ce_scenario_q_flat.pgm"
 BAD="/tmp/ce_scenario_q_bad.bin"
+EDGE="/tmp/ce_scenario_q_edge.pgm"
 
 # Cleanup any stale fixture files from a previous run.
-rm -f "$FIX" "$FLAT" "$BAD"
+rm -f "$FIX" "$FLAT" "$BAD" "$EDGE"
 
 # Build the 4x4 gradient: pixels 0, 16, 32, ..., 240 (mean = 120).
 # Header: P5\n4 4\n255\n  (11 bytes)
@@ -52,6 +53,21 @@ rm -f "$FIX" "$FLAT" "$BAD"
 # Build a bad fixture: 8 random bytes with no PGM magic.
 printf '\x4e\x4f\x54\x50\x47\x4d\x00\x00' > "$BAD"
 
+# Build a 16x16 vertical-edge fixture: left half intensity 0 (black),
+# right half intensity 255 (white). This trips the P3.3 structural
+# detectors: Sobel finds a strong vertical-edge column producing
+# image_edge_dense + image_orient_0 (horizontal gradient = vertical edge).
+# Harris finds NO strong corners on a pure edge so image_corner_count_low
+# fires.
+{
+    printf 'P5\n16 16\n255\n'
+    # 16 rows. Each row: 8 zero bytes + 8 0xFF bytes.
+    for i in $(seq 1 16); do
+        head -c 8 /dev/zero
+        head -c 8 /dev/zero | tr '\000' '\377'
+    done
+} > "$EDGE"
+
 if [ ! -s "$FIX" ]; then
     printf "  ${C_RED}FAIL${C_RST}  fixture %s did not get written\n" "$FIX"
     FAIL=$((FAIL+1))
@@ -64,6 +80,7 @@ INPUT=$(
     printf '/see\n'
     printf '/see %s\n' "$FIX"
     printf '/see %s\n' "$FLAT"
+    printf '/see %s\n' "$EDGE"
     printf '/see %s\n' "$BAD"
     printf '/quit\n'
 )
@@ -116,7 +133,28 @@ assert_match "$OUT" "see FAILED: pgm: not a PGM" \
 assert_match "$OUT" "bye\." \
     "chat reaches /quit cleanly after malformed /see"
 
+# ---- P3.3 structural features on 16x16 vertical-edge fixture -------------
+
+# 12. /see on the 16x16 edge fixture prints the summary line.
+assert_match "$OUT" "saw image $EDGE \[16x16" \
+    "/see prints dims on 16x16 edge fixture"
+
+# 13. The 16x16 edge fixture triggers Sobel: image_edge_dense (transition
+# column has many high-magnitude pixels).
+assert_match "$OUT" "features:.*image_edge_dense" \
+    "/see surfaces image_edge_dense on 16x16 vertical-edge fixture"
+
+# 14. The 16x16 edge fixture has a vertical edge (intensity changes
+# horizontally), so the dominant orientation is bucket 0 = horizontal
+# gradient. The label image_orient_0 appears.
+assert_match "$OUT" "features:.*image_orient_0" \
+    "/see surfaces image_orient_0 on vertical edge"
+
+# 15. Harris on a pure-edge fixture finds few corners: image_corner_count_low.
+assert_match "$OUT" "features:.*image_corner_count_low" \
+    "/see surfaces image_corner_count_low on edge-only fixture"
+
 # Cleanup.
-rm -f "$FIX" "$FLAT" "$BAD"
+rm -f "$FIX" "$FLAT" "$BAD" "$EDGE"
 
 summary "scenario_q_image_see"
