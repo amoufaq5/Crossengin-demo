@@ -74,7 +74,8 @@ NOVA_SRC="$DRV_DIR/sc_client_driver.nova"
 SRV_OUT="/tmp/ce_int_sc_srv.out"
 NOVA_OUT="/tmp/ce_int_sc_nova.out"
 
-trap 'kill -9 $SRV_PID 2>/dev/null; rm -rf "$SRV_OUT" "$NOVA_OUT" "$DRV_DIR"' EXIT
+SRV_PID=""
+trap 'if [ -n "${SRV_PID:-}" ]; then kill -9 $SRV_PID 2>/dev/null; fi; rm -rf "$SRV_OUT" "$NOVA_OUT" "$DRV_DIR"' EXIT
 
 # Stage 0: pre-flight AF_INET availability via NOVA so the SKIP path
 # catches the "sandbox denies sockets entirely" case before we try to
