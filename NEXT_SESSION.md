@@ -17,6 +17,84 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.1.JPEG minimum-viable JPEG modality (structural half + audit):
+  **complete (framework only)** (ADR-0014 image half / NOVA enhancement
+  #15). P3.1 shipped PGM-P5; P3.1.PNG shipped the grayscale-8 PNG
+  decoder. JPEG is the format `IMAGE_AUDIT.md` calls out as "JPEG
+  before PNG" for the agent's perception path -- the dominant on-disk
+  format for photographs. The full JPEG decoder is 6-8 weeks of work
+  (Huffman entropy + de-quant + IDCT + block assembly + YCbCr -> RGB
+  + chroma upsample); this session ships the STRUCTURAL HALF only --
+  segment-marker iteration + DQT + SOF0 + DHT table parsing -- so the
+  agent can identify a valid baseline grayscale JPEG, report its
+  dimensions on the perception path, and surface a clear "JPEG
+  entropy decode + IDCT not yet implemented" diagnostic. The
+  remaining 3-4 weeks of work are documented in `JPEG_AUDIT.md`.
+  - **`jpeg_decode.nova`** (NEW) -- pure-NOVA JPEG structural parser.
+    Public API: `jpeg_parse_segments(bytes_ptr, len) -> list of
+    [marker, offset, length]` walks the SOI/APPn/COM/DQT/SOF0/DHT/SOS/
+    EOI markers (filler 0xFF runs skipped; SOS terminates iteration);
+    `jpeg_parse_dqt(bytes_ptr, off, len) -> list of [precision,
+    table_id, list_of_64_ints]` extracts quantization tables;
+    `jpeg_parse_sof0(bytes_ptr, off, len) -> [precision, height,
+    width, n_components, components, error_msg]` validates baseline
+    dimensions + component records; `jpeg_parse_dht(bytes_ptr, off,
+    len) -> list of [table_class, table_id, length_counts, symbols]`
+    extracts Huffman BITS + HUFFVAL; `jpeg_decode_grayscale(path) ->
+    [width, height, "", error_msg]` is the entry-point stub that
+    returns the dimensions + the documented gap message. Dimension
+    cap 1024 per axis matches PGM_MAX_DIM / PNG_MAX_DIM; file cap
+    1 MiB. Big-endian throughout; codegen pointer-threshold gotcha
+    #11 is well under bounds at 2-byte length fields.
+  - **`visual_perception.nova`** (EXTENDED) -- new `VP_DECODER_JPEG = 4`
+    constant; registered as "jpeg" in `vp_seam_new()`; `CE_VP_DECODER=
+    jpeg` / `=jpg` recognized by `vp_default_decoder()`. New
+    `_vp_decode_jpeg(seam, path)` surfaces dimensions + the
+    `image_jpeg_header_only` feature atom + the size-bucket atom
+    even when pixels are absent. New `_vp_path_ends_with_jpg` /
+    `_vp_path_ends_with_jpeg` route `.jpg` / `.jpeg` paths to the
+    JPEG decoder via `_vp_pick_decoder_for_path`.
+  - **`crossengin_chat.nova`** (TINY HELP TEXT UPDATE) -- `/help`
+    advertises JPEG support and points operators at `JPEG_AUDIT.md`.
+    No new admin command; the existing `/see PATH` handles `.jpg` /
+    `.jpeg` via the seam's path-extension routing.
+  - **`scripts/gen_test_jpeg.py`** (NEW) -- Python fixture generator.
+    Uses Pillow (PIL.Image) when available to encode a deterministic
+    16x16 grayscale gradient as a real baseline-sequential JPEG;
+    falls back to a hand-rolled minimal SOI+APP0+DQT+SOF0+DHT+SOS+EOI
+    envelope (not a decodable JPEG, but enough structure for the
+    pure-NOVA parser to walk) when Pillow is not installed.
+  - **`tests/unit/test_jpeg_decode.nova`** (NEW; 54 assertions across
+    13 test functions) -- in-memory fixture builder mirrors the
+    `_build_png` shape from `test_png_decode.nova`; covers segment
+    iteration (SOI/APP0/DQT/SOF0/DHT/SOS surface in order), DQT
+    parser yields 64 entries at precision 0, SOF0 parser surfaces
+    custom dimensions + component records, DHT parser handles both
+    the all-zero BITS case (0 symbols) and a 2-codes-of-length-1
+    case (2 symbols), end-to-end `jpeg_decode_grayscale_bytes`
+    documents the gap message with the parsed dimensions, oversized
+    SOF0 dims rejected with "downsample first", progressive (SOF2)
+    rejected with "not supported", bad SOI rejected, truncated input
+    rejected.
+  - **`JPEG_AUDIT.md`** (NEW) -- mirror of IMAGE_AUDIT / STT_AUDIT /
+    VIDEO_AUDIT pattern. Documents WHY baseline grayscale is the
+    right MVP target (skip color YCbCr -> RGB, skip arithmetic
+    coding, skip progressive); WHAT this session shipped (the
+    structural half); WHAT remains (Huffman entropy decode ~1 week,
+    de-quant + zig-zag ~3 days, 8x8 IDCT ~1 week, block-row
+    assembly ~3 days = ~3-4 weeks total to a working grayscale
+    decoder); the ITU-T T.81 references; the NOVA gotchas worked
+    around (big-endian, dimension cap, file cap, no `break`,
+    `match` reserved identifier).
+  Acceptance: `tests/unit/test_jpeg_decode.nova` 54 in-memory
+  assertions all pass; `make build` adds +1 module
+  (`jpeg_decode.nova`); `make test` adds +1 suite
+  (`test_jpeg_decode.nova`); `make integration` all scenarios still
+  PASS. On a real 24x24 Pillow-encoded JPEG the chat prints
+  `(see FAILED: jpeg: 24x24 grayscale baseline header parsed;
+  entropy decode + IDCT not yet implemented; see JPEG_AUDIT.md)`
+  and then `bye.` -- the documented dimensions surface and the
+  substrate continues cleanly.
 - P3.1.PNG full DEFLATE inflate (BTYPE=00 + BTYPE=01 + BTYPE=02):
   **complete** (ADR-0014 image half / NOVA enhancement #15). Item 3
   shipped the stored-only DEFLATE path (BTYPE=00) so PNGs produced by

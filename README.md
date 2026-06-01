@@ -11,7 +11,15 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 127 modules compile (`make build`, +1 from `safety/bignum.nova`
+> toolchain: 130 modules compile (`make build`,
+> +1 from `io/transducers/jpeg_decode.nova` added in P3.1.JPEG minimum-viable
+> JPEG modality -- structural-half pure-NOVA parser (segment markers + DQT +
+> SOF0 + DHT tables), with `jpeg_decode_grayscale` returning the dimensions +
+> a documented "entropy decode + IDCT not yet implemented" diagnostic so
+> the `/see` perception path can surface real JPEG dimensions without
+> crashing; the entropy + IDCT pipeline remains a 3-4-week follow-up
+> documented in [`JPEG_AUDIT.md`](./JPEG_AUDIT.md),
+> +1 from `safety/bignum.nova`
 > added in P3.9 pure-NOVA 256-bit unsigned bignum library -- the DH
 > key-exchange prerequisite the federated SecAgg MVP could not ship
 > without (Item 6 of the brief), now landed as a leaf primitive
@@ -92,8 +100,17 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 135 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 136 unit-test suites pass
 > (`make test`,
+> +1 suite / +54 assertions from `test_jpeg_decode.nova` added in
+> P3.1.JPEG minimum-viable JPEG modality: in-memory baseline-grayscale
+> fixture builder; segment iteration walks SOI/APP0/DQT/SOF0/DHT/SOS/EOI;
+> DQT parser extracts the 64 quant-table entries; SOF0 parser surfaces
+> dimensions + components; DHT parser extracts BITS + HUFFVAL;
+> jpeg_decode_grayscale_bytes returns the dimensions + the documented
+> "entropy decode TODO" gap message; rejects oversized dims (> 1024),
+> SOF2 (progressive), and bad SOI; documented in
+> [`JPEG_AUDIT.md`](./JPEG_AUDIT.md),
 > +1 suite / +46 assertions from `test_deflate.nova` added in
 > P3.1.PNG full DEFLATE inflate -- extends the Item-3 stored-only
 > path (BTYPE=00) with RFC 1951 BTYPE=01 static Huffman + BTYPE=02
