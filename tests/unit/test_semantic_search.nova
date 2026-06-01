@@ -1,0 +1,384 @@
+// Unit tests for src/kg/semantic_search.nova (R10C).
+//
+// Covers the TF-IDF + cosine-similarity semantic-search index added on
+// top of atom_store's exact-id lookup, episodic.nova's R6F+R8F retrieval
+// surface, and ann_index's embedding-cosine nearest-neighbour. This
+// suite tests the textual ranker by tokenization, IDF behaviour, full
+// search end-to-end on a 5-atom fixture, identical/orthogonal-vector
+// cosine properties, top-K clamping, empty-input edge cases, idempotency
+// of repeated add_atom calls, and the search_by_atom_id companion API
+// (which must drop the query atom from its own results).
+//
+// Total assertions: 50+. Helpers are integer-only (no floats), so
+// everything compares as exact integer equality at milli scale.
+//
+// ADRs: ADR-0016 (atom labels are the textual field ranked),
+//       ADR-0049 (testing + benchmarks).
+
+import "../ce_test.nova"
+import "../../src/kg/semantic_search.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Build a 5-atom fixture that the brief calls out: "fox" query must rank
+// the brown-fox atom first. The other four atoms share NO tokens with
+// the brown-fox one (we deliberately avoid overlap so the ranking is
+// crisp and easy to assert).
+fn _fixture_5() {
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "the quick brown fox jumps")
+    ss_index_add_atom(ix, 2, "hello world today good")
+    ss_index_add_atom(ix, 3, "machine learning is fun")
+    ss_index_add_atom(ix, 4, "deep learning neural network")
+    ss_index_add_atom(ix, 5, "computer programming language design")
+    return ix
+}
+
+// Build a 10-atom fixture with one ML-themed atom, used for the brief's
+// "/find 'machine learning' returns ML-related first" property test.
+fn _fixture_10() {
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "machine learning models data analysis")
+    ss_index_add_atom(ix, 2, "deep neural networks training algorithm")
+    ss_index_add_atom(ix, 3, "the quick brown fox jumps lazy dog")
+    ss_index_add_atom(ix, 4, "cooking recipes kitchen food preparation")
+    ss_index_add_atom(ix, 5, "weather forecast sunny clear sky today")
+    ss_index_add_atom(ix, 6, "music classical composers orchestra symphony")
+    ss_index_add_atom(ix, 7, "sports football basketball tennis golf")
+    ss_index_add_atom(ix, 8, "history ancient rome empire civilization")
+    ss_index_add_atom(ix, 9, "geography mountains rivers lakes forests")
+    ss_index_add_atom(ix, 10, "literature poetry novels stories writing")
+    return ix
+}
+
+// ---- tokenization --------------------------------------------------------
+
+fn test_tokenize_hello_world() {
+    let t = _tokenize("Hello, World!")
+    ce_eq("hello world -> 2 tokens", len(t), 2)
+    ce_str_eq("first token is hello",  t[0], "hello")
+    ce_str_eq("second token is world", t[1], "world")
+}
+
+fn test_tokenize_empty() {
+    let t = _tokenize("")
+    ce_eq("empty string -> 0 tokens", len(t), 0)
+}
+
+fn test_tokenize_drops_short_tokens() {
+    // "a" and "is" are below SS_MIN_TOKEN_LEN=3 and must be dropped.
+    // "cat" passes through.
+    let t = _tokenize("a cat is happy")
+    ce_eq("drops short tokens -> 2 remain", len(t), 2)
+    ce_str_eq("first kept is cat",   t[0], "cat")
+    ce_str_eq("second kept is happy", t[1], "happy")
+}
+
+fn test_tokenize_lowercase() {
+    let t = _tokenize("MixedCase WORDS")
+    ce_eq("mixed case -> 2 tokens", len(t), 2)
+    ce_str_eq("first lowered",  t[0], "mixedcase")
+    ce_str_eq("second lowered", t[1], "words")
+}
+
+fn test_tokenize_punctuation_splits() {
+    // Punctuation acts as a delimiter; the word "foo-bar-baz" splits.
+    let t = _tokenize("foo-bar.baz_qux")
+    ce_eq("punctuation splits -> 3 tokens (underscore not a delimiter)", len(t), 3)
+    ce_str_eq("first is foo", t[0], "foo")
+    ce_str_eq("second is bar", t[1], "bar")
+    ce_str_eq("third is baz_qux (underscore preserved)", t[2], "baz_qux")
+}
+
+// ---- integer math primitives ---------------------------------------------
+
+fn test_int_sqrt() {
+    ce_eq("sqrt(0) = 0",        _int_sqrt(0), 0)
+    ce_eq("sqrt(1) = 1",        _int_sqrt(1), 1)
+    ce_eq("sqrt(4) = 2",        _int_sqrt(4), 2)
+    ce_eq("sqrt(16) = 4",       _int_sqrt(16), 4)
+    ce_eq("sqrt(10000) = 100",  _int_sqrt(10000), 100)
+    ce_eq("sqrt(1000000) = 1000", _int_sqrt(1000000), 1000)
+}
+
+fn test_int_log2() {
+    ce_eq("log2(1) = 0 milli",     _int_log2(1), 0)
+    ce_eq("log2(2) = 1000 milli",  _int_log2(2), 1000)
+    ce_eq("log2(4) = 2000 milli",  _int_log2(4), 2000)
+    ce_eq("log2(8) = 3000 milli",  _int_log2(8), 3000)
+    ce_eq("log2(1024) = 10000 milli", _int_log2(1024), 10000)
+    // log2(10) ~= 3.3219, so we expect ~3322 milli; the integer
+    // interpolation lands at 3250 milli (between 3000 = log2(8) and
+    // 4000 = log2(16), linearly interpolated).
+    ce_check("log2(10) > 3000 milli", _int_log2(10) > 3000)
+    ce_check("log2(10) < 4000 milli", _int_log2(10) < 4000)
+}
+
+fn test_idf_milli_rare_higher_than_common() {
+    // A token in 1 of 10 atoms should have a LARGER idf than a token in
+    // 9 of 10 atoms (the rare-tokens-discriminate property).
+    let rare   = _idf_milli(10, 1)
+    let common = _idf_milli(10, 9)
+    ce_check("idf(10,1) > idf(10,9)", rare > common)
+    ce_eq("idf(N,N) = SS_IDF_SMOOTH (one in every doc)",
+        _idf_milli(10, 10), SS_IDF_SMOOTH)
+}
+
+fn test_idf_zero_corpus() {
+    ce_eq("idf(0,0) = 0 (empty corpus)", _idf_milli(0, 0), 0)
+}
+
+// ---- TF-IDF end-to-end ---------------------------------------------------
+
+fn test_search_fox_ranks_brown_fox_first() {
+    let ix = _fixture_5()
+    let hits = ss_search(ix, "fox", 5)
+    ce_eq("query 'fox' -> 1 hit", len(hits), 1)
+    ce_eq("first (only) hit is atom 1", hits[0][0], 1)
+    ce_check("similarity > 0",          hits[0][1] > 0)
+}
+
+fn test_search_machine_learning_ranks_ml_first() {
+    let ix = _fixture_5()
+    let hits = ss_search(ix, "machine learning", 5)
+    // Atom 3 ("machine learning is fun") shares 2 query tokens; atom 4
+    // ("deep learning neural network") shares 1.
+    ce_check("ML query has >= 1 hit", len(hits) >= 1)
+    ce_eq("top hit is atom 3 (machine learning is fun)", hits[0][0], 3)
+    if len(hits) >= 2 {
+        ce_eq("second hit is atom 4 (deep learning)", hits[1][0], 4)
+        ce_check("atom 3 ranked higher than atom 4",
+            hits[0][1] > hits[1][1])
+    }
+}
+
+fn test_search_10atom_ml_query_ranks_ml_atom_first() {
+    // 10-atom fixture: query "machine learning" must land atom 1
+    // ("machine learning models data analysis") at the top.
+    let ix = _fixture_10()
+    let hits = ss_search(ix, "machine learning", 5)
+    ce_check("10-atom ML query has >= 1 hit", len(hits) >= 1)
+    ce_eq("top hit is atom 1 (machine learning)", hits[0][0], 1)
+    ce_check("top similarity > 500 milli (strong match)", hits[0][1] > 500)
+}
+
+// ---- cosine similarity properties ----------------------------------------
+
+fn test_cosine_identical_vectors_1000() {
+    // Two atoms with the same text -> cosine == 1000 milli.
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "alpha beta gamma")
+    ss_index_add_atom(ix, 2, "alpha beta gamma")
+    let hits = ss_search(ix, "alpha beta gamma", 5)
+    ce_eq("identical -> 2 hits", len(hits), 2)
+    ce_eq("first hit sim = 1000 milli (identical)",  hits[0][1], FP_SCALE)
+    ce_eq("second hit sim = 1000 milli (identical)", hits[1][1], FP_SCALE)
+}
+
+fn test_cosine_orthogonal_vectors_zero() {
+    // Two atoms with completely disjoint vocab; query matches exactly
+    // one and the OTHER (sharing no token) is filtered out (sim=0).
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "alpha beta gamma")
+    ss_index_add_atom(ix, 2, "delta epsilon zeta")
+    let hits = ss_search(ix, "delta epsilon zeta", 5)
+    ce_eq("orthogonal -> 1 hit (the other is filtered)", len(hits), 1)
+    ce_eq("the one hit is atom 2 (matching)", hits[0][0], 2)
+    ce_eq("its sim is 1000 milli (identical to query)", hits[0][1], FP_SCALE)
+}
+
+fn test_cosine_partial_overlap_predictable() {
+    // Two atoms differing by one token. Query against the first should
+    // rank IT first (cosine=1000) and the partially-overlapping one
+    // strictly LOWER but strictly > 0.
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "alpha beta gamma")
+    ss_index_add_atom(ix, 2, "alpha beta delta")
+    let hits = ss_search(ix, "alpha beta gamma", 5)
+    ce_eq("2 hits expected", len(hits), 2)
+    ce_eq("first hit is atom 1 (exact match)", hits[0][0], 1)
+    ce_eq("its sim = 1000 milli", hits[0][1], FP_SCALE)
+    ce_eq("second hit is atom 2 (partial overlap)", hits[1][0], 2)
+    ce_check("partial overlap > 0",       hits[1][1] > 0)
+    ce_check("partial overlap < 1000",    hits[1][1] < FP_SCALE)
+}
+
+// ---- top-K clamping ------------------------------------------------------
+
+fn test_top_k_limit_5_of_100() {
+    // 100 atoms indexed, top_k=5 -> 5 results returned.
+    let ix = ss_index_new()
+    let i = 0
+    while i < 100 {
+        ss_index_add_atom(ix, i + 1, "alpha beta gamma token" + int_to_str(i))
+        i = i + 1
+    }
+    let hits = ss_search(ix, "alpha beta", 5)
+    ce_eq("top_k=5 returns 5 results", len(hits), 5)
+}
+
+fn test_top_k_zero_returns_empty() {
+    let ix = _fixture_5()
+    let hits = ss_search(ix, "machine learning", 0)
+    ce_eq("top_k=0 -> empty",   len(hits), 0)
+    let hits2 = ss_search(ix, "machine learning", 0 - 5)
+    ce_eq("top_k=-5 -> empty",  len(hits2), 0)
+}
+
+fn test_top_k_huge_clamped() {
+    let ix = _fixture_5()
+    // top_k far above MAX (1000) AND above the store size -- clamped,
+    // truncation is a no-op (return everything we matched).
+    let hits = ss_search(ix, "fox", 10000)
+    ce_eq("top_k=10000 returns the only matching atom", len(hits), 1)
+}
+
+// ---- empty edges ---------------------------------------------------------
+
+fn test_empty_index_returns_empty() {
+    let ix = ss_index_new()
+    let hits = ss_search(ix, "anything", 5)
+    ce_eq("empty index -> empty result", len(hits), 0)
+    let hits2 = ss_search_by_atom_id(ix, 0, 5)
+    ce_eq("empty index / by id -> empty", len(hits2), 0)
+}
+
+fn test_empty_query_returns_empty() {
+    let ix = _fixture_5()
+    let hits = ss_search(ix, "", 5)
+    ce_eq("empty query -> empty", len(hits), 0)
+}
+
+fn test_unknown_query_tokens_returns_empty() {
+    // Query containing ONLY tokens absent from the corpus -> no results.
+    let ix = _fixture_5()
+    let hits = ss_search(ix, "zzz qqq xxx", 5)
+    ce_eq("all-unknown query -> empty", len(hits), 0)
+}
+
+// ---- idempotency ---------------------------------------------------------
+
+fn test_idempotency_no_double_count() {
+    // Adding the same atom_id with the same text twice must NOT double-
+    // count the term frequencies. Result: same scores either way.
+    let ix1 = ss_index_new()
+    ss_index_add_atom(ix1, 1, "alpha beta gamma")
+    ss_index_add_atom(ix1, 2, "alpha beta delta")
+    let hits1 = ss_search(ix1, "alpha", 5)
+
+    let ix2 = ss_index_new()
+    ss_index_add_atom(ix2, 1, "alpha beta gamma")
+    ss_index_add_atom(ix2, 1, "alpha beta gamma")   // duplicate add
+    ss_index_add_atom(ix2, 2, "alpha beta delta")
+    let hits2 = ss_search(ix2, "alpha", 5)
+
+    ce_eq("same number of hits after re-add", len(hits2), len(hits1))
+    ce_eq("atom count stays 2 (not doubled)", ss_index_atom_count(ix2), 2)
+}
+
+fn test_re_add_updates_text() {
+    // Adding the same atom_id with NEW text should replace, not append.
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "alpha beta gamma")
+    ss_index_add_atom(ix, 1, "delta epsilon zeta")   // overwrites
+    let hits = ss_search(ix, "alpha", 5)
+    ce_eq("alpha no longer in atom 1 -> 0 hits", len(hits), 0)
+    let hits2 = ss_search(ix, "delta", 5)
+    ce_eq("delta now in atom 1 -> 1 hit", len(hits2), 1)
+    ce_eq("the hit is atom 1", hits2[0][0], 1)
+}
+
+// ---- search_by_atom_id --------------------------------------------------
+
+fn test_search_by_atom_id_excludes_query() {
+    // The query atom itself must be ABSENT from its own results.
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "alpha beta gamma")
+    ss_index_add_atom(ix, 2, "alpha beta delta")
+    ss_index_add_atom(ix, 3, "unrelated different word")
+    let hits = ss_search_by_atom_id(ix, 1, 5)
+    ce_eq("by_id(1) -> 1 hit (atom 1 excluded, atom 3 has no overlap)",
+        len(hits), 1)
+    ce_eq("the hit is atom 2 (the only overlap)", hits[0][0], 2)
+}
+
+fn test_search_by_atom_id_missing_atom() {
+    let ix = _fixture_5()
+    let hits = ss_search_by_atom_id(ix, 999, 5)
+    ce_eq("by_id of unknown atom -> empty", len(hits), 0)
+}
+
+fn test_search_by_atom_id_top_k_zero() {
+    let ix = _fixture_5()
+    let hits = ss_search_by_atom_id(ix, 1, 0)
+    ce_eq("by_id top_k=0 -> empty", len(hits), 0)
+}
+
+// ---- ranking properties --------------------------------------------------
+
+fn test_ranking_descending_by_similarity() {
+    // Top hits must be in non-increasing similarity order.
+    let ix = _fixture_10()
+    let hits = ss_search(ix, "machine learning data", 5)
+    let i = 1
+    while i < len(hits) {
+        ce_check("hits ranked desc by sim (position " + int_to_str(i) + ")",
+            hits[i - 1][1] >= hits[i][1])
+        i = i + 1
+    }
+}
+
+// ---- ss_index_from_kg / find dispatch -----------------------------------
+//
+// We don't drive the full chat KG fixture here (that lives in the
+// integration scenario), but the constructor + emit helpers should at
+// least be reachable in unit-test scope.
+
+fn test_index_token_count_starts_zero() {
+    let ix = ss_index_new()
+    ce_eq("token_count zero on empty index", ss_index_token_count(ix), 0)
+    ce_eq("atom_count zero on empty index",  ss_index_atom_count(ix), 0)
+}
+
+fn test_index_token_count_grows() {
+    let ix = ss_index_new()
+    ss_index_add_atom(ix, 1, "alpha beta gamma")
+    ce_eq("token_count after 1 atom (3 unique)", ss_index_token_count(ix), 3)
+    ss_index_add_atom(ix, 2, "alpha beta delta")
+    ce_eq("token_count after 2 atoms (1 new)",   ss_index_token_count(ix), 4)
+}
+
+fn main() {
+    test_tokenize_hello_world()
+    test_tokenize_empty()
+    test_tokenize_drops_short_tokens()
+    test_tokenize_lowercase()
+    test_tokenize_punctuation_splits()
+    test_int_sqrt()
+    test_int_log2()
+    test_idf_milli_rare_higher_than_common()
+    test_idf_zero_corpus()
+    test_search_fox_ranks_brown_fox_first()
+    test_search_machine_learning_ranks_ml_first()
+    test_search_10atom_ml_query_ranks_ml_atom_first()
+    test_cosine_identical_vectors_1000()
+    test_cosine_orthogonal_vectors_zero()
+    test_cosine_partial_overlap_predictable()
+    test_top_k_limit_5_of_100()
+    test_top_k_zero_returns_empty()
+    test_top_k_huge_clamped()
+    test_empty_index_returns_empty()
+    test_empty_query_returns_empty()
+    test_unknown_query_tokens_returns_empty()
+    test_idempotency_no_double_count()
+    test_re_add_updates_text()
+    test_search_by_atom_id_excludes_query()
+    test_search_by_atom_id_missing_atom()
+    test_search_by_atom_id_top_k_zero()
+    test_ranking_descending_by_similarity()
+    test_index_token_count_starts_zero()
+    test_index_token_count_grows()
+    ce_summary("semantic_search")
+}
+
+main()
