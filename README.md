@@ -11,7 +11,26 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 137 modules compile (`make build`, +1 from
+> toolchain: 138 modules compile (`make build`, +1 from
+> `io/transducers/image_stereo.nova` added in R7E -- block-matching
+> Sum-of-Absolute-Differences (SAD) stereo disparity from horizontally
+> separated PGM-P5 pairs, plus depth recovery via
+> `depth_mm = baseline_mm * focal_pixels / disparity`. Per pixel: extract
+> a 7x7 block in LEFT centered there, slide along the same scanline in
+> RIGHT from x down to x - 64, compute SAD at each offset, store the
+> minimizing offset as disparity. Depth at zero disparity clamps to
+> STEREO_MAX_DEPTH_MM (100 m) as an "unknown / infinity" sentinel. On a
+> synthesized "right = left shifted left by 10 px" textured pair the
+> unit test asserts disparity == 10 EXACTLY at probed interior points;
+> mean lands at 6-8 because the leftmost half-window columns cannot
+> reach the true disparity. New chat admin: `/depth L.pgm R.pgm` prints
+> `(depth WxH mean_disp=D density=Dmilli image_stereo_density_*)`.
+> Visual seam emits `image_stereo_disparity_mean_*` +
+> `image_stereo_density_*` atoms when `CE_VP_STEREO_RIGHT` env points
+> at the companion right PGM. ~54 unit assertions + 10 integration
+> assertions; all green. See IMAGE_AUDIT.md for LR-check / sub-pixel /
+> SGM follow-ups,
+> +1 from
 > `io/transducers/audio_vad.nova` added in R7F (energy + ZCR Voice
 > Activity Detection: 30 ms frames, 4-state hysteresis machine with K=3
 > speech-on / M=10 speech-off thresholds; integrated into

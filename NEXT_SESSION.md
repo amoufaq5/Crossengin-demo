@@ -3,7 +3,120 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R7F (this session) — IO: Voice Activity Detection on audio capture + clean STT seam
+## R7E (this session) — IO: stereo depth via block-matching SAD disparity
+
+**Status: complete -- `src/io/transducers/image_stereo.nova` lands as a
+new leaf module that adds the missing third dimension to the CV pipeline.**
+The pipeline so far operates on a SINGLE image: edge gradients (Sobel /
+Canny), corner / keypoint features (Harris / SIFT / ORB), per-frame motion
+(`video_motion_vectors`). None of those recover depth. Stereo block
+matching with Sum-of-Absolute-Differences (SAD) is the simplest integer-
+only path to a PER-PIXEL DEPTH estimate: feed two horizontally-separated
+images of the same scene (left + right, conventionally captured by a
+stereo camera rig with a known baseline) and compute a DISPARITY map --
+the per-pixel horizontal shift between views. Depth follows from
+similar triangles: `depth_mm = baseline_mm * focal_pixels / disparity`.
+
+### Algorithm
+
+For each pixel (x, y) in the LEFT image, extract a WIN_SIZE x WIN_SIZE
+block (default 7x7) centered there, then slide that block along the SAME
+scanline in the RIGHT image from x down to x - MAX_DISP (default 64) and
+compute the SAD at each offset. Disparity at (x, y) = offset minimizing
+SAD. Output: disparity map (same dims as left, encoded as bytes
+0..MAX_DISP).
+
+Border pixels (where the window would fall off the image) keep disparity
+0. The leftmost interior columns where x - half < SHIFT cannot reach the
+true disparity (local_max_d caps below SHIFT) so they read smaller
+disparities, dragging the mean down a few units below the ground-truth
+shift -- on a 64x32 textured pair shifted by 10 px the unit test asserts
+disparity == 10 at the well-defined interior points (x=30, 35, 40, 45),
+and the mean lands ~6-8. SHIFT=10 is recovered EXACTLY at any pixel where
+the search window has room.
+
+### What landed
+
+- **`src/io/transducers/image_stereo.nova`** (NEW): 365 lines. Leaf module.
+  Public API:
+  * `stereo_disparity(left, right, w, h, win_size, max_disp)` -> result
+    tuple [map, mean, density_milli, total].
+  * `stereo_depth(disp_map, w, h, baseline_mm, focal_pixels)` -> list of
+    ints in mm; disparity == 0 -> STEREO_MAX_DEPTH_MM sentinel (100000mm
+    = 100m, "infinity / unknown").
+  * `stereo_sad_block(left, right, w, x_l, x_r, y, win_size)` -> raw SAD.
+  * `stereo_disparity_at(map, w, x, y)`, `stereo_depth_at(depth, w, x, y)`,
+    `stereo_density_label(milli)`, `stereo_disparity_mean_label(mean)`,
+    result-tuple accessors.
+  * `stereo_append_features_if_paired(feats, left, w, h)` -- visual
+    perception integration hook. Reads `CE_VP_STEREO_RIGHT` env; when
+    set, parses that PGM, validates matching dims, runs disparity, and
+    appends `image_stereo_disparity_mean_*` + `image_stereo_density_*`
+    atoms. Silent (no atoms) when unset or dims mismatch.
+  * `stereo_pgm_args(arg)`, `stereo_pgm_paths(L, R)` -- chat /depth
+    admin one-liners.
+- **`src/io/transducers/visual_perception.nova`** (+5 lines): import,
+  VP_STEREO_MIN_DIM = 32, VP_LABEL_STEREO_DENSITY_LOW const, and one
+  conditional call in `_vp_append_structural_features`. Stereo runs
+  only when both axes >= 32 (the 7x7 window + 64-disp search needs
+  headroom).
+- **`examples/crossengin_chat.nova`** (+2 lines): `/depth L.pgm R.pgm`
+  dispatch + help. The dispatch is a one-liner forwarding to
+  `stereo_pgm_args(arg)` so the chat surface stays at 1 line.
+- **`tests/unit/test_stereo.nova`** (NEW, 54 assertions):
+  SAD on constant blocks (3 cases over sizes); SAD on known intensity
+  diff (49*10=490 at 7x7, 9*10=90 at 3x3, 25*10=250 at 5x5; SAD a-b
+  symmetric with SAD b-a); disparity on identical inputs (mean 0,
+  density 0); disparity on shifted pair (probed at x=30,35,40,45 all
+  == SHIFT=10); dim cap rejects 300x300; zero-pointer / zero-dim
+  refusals; depth formula known triples (b=120 f=600 d=10 -> 7200,
+  d=20 -> 3600, d=5 -> 14400; b=60 f=500 d=1,2,3 -> 30000, 15000,
+  10000); depth zero-disparity clamped at MAX_DEPTH; depth bad inputs;
+  density label round-trip (low <100, mid 100-499, high >=500);
+  disparity_at / depth_at OOB safety; /depth args dispatch.
+- **`tests/integration/scenario_hh_stereo.sh`** (NEW, 10 assertions):
+  Build a 40x40 textured left PGM and the shifted-by-8 right
+  companion. Cases: /help advertises /depth; no-arg / 1-arg usage;
+  identical inputs report `mean_disp=0`; shifted pair reports
+  `mean_disp >= 4` (lands at 6-8 with SHIFT=8); density label
+  emitted; dim mismatch (40x40 vs 32x32) prints clear error; missing
+  file prints PGM parser error; chat reaches /quit cleanly.
+
+### Verification
+
+- `tests/unit/test_stereo.nova`: **54 assertions, all pass**. The
+  disparity-on-shifted-pair test confirms disparity == 10 EXACTLY at
+  4 probed interior points (x=30,35,40,45 with SHIFT=10 on a 64x32
+  textured fixture). Depth formula tests confirm `depth = baseline *
+  focal / disparity` for 6 known triples.
+- `tests/integration/scenario_hh_stereo.sh`: **10 assertions, all pass**.
+- All existing unit tests pass (image_pgm 43, image_sobel 30,
+  image_canny 22, image_sift 25, orb 34).
+
+### Module count: 137 -> 138 (image_stereo.nova added).
+
+### Future work (carried forward)
+
+- **Left-right consistency check (LR-check)**: re-run disparity from
+  right to left and zero any pixel where the two answers disagree
+  by > 1. Standard outlier filter; ~2x runtime + an extra disparity
+  map. Currently no consistency check means occlusions on the
+  rightmost columns of LEFT (no right-image match) silently return
+  best-effort SAD.
+- **Sub-pixel disparity refinement**: parabolic fit on the three SAD
+  values around the minimum gives 0.1-pixel-accurate disparity. Today
+  we return integer disparity in raw pixel units. (Needs fixed-point
+  math; ~50 LoC.)
+- **Semi-Global Matching (SGM)**: aggregate SAD costs along 4-8
+  directions per pixel. Much more accurate than per-pixel
+  block-matching (especially in textureless regions where SAD has no
+  clear minimum), but ~10x runtime and ~5x memory.
+- **JPEG / PNG stereo pairs**: today the chat dispatches `/depth L.pgm
+  R.pgm` -- only PGM. `_vp_pick_decoder_for_path` could be extended
+  to dispatch stereo through the same routing the seam already has,
+  so `/depth L.png R.png` works too.
+
+## R7F (prior session) — IO: Voice Activity Detection on audio capture + clean STT seam
 
 **Status: complete -- `src/io/transducers/audio_vad.nova` lands as a
 new leaf module sitting between `audio_capture.nova` (WAV ingest) and

@@ -250,6 +250,50 @@ gradient structure and corner geometry, not just intensity moments:
   ORB ships ~3-5x faster than SIFT for end-to-end keypoint+match
   on the same fixture, with integer-only arithmetic throughout the
   hot loops.
+- **Stereo block-matching SAD disparity + depth**
+  (`src/io/transducers/image_stereo.nova`, R7E -- the missing third
+  dimension). The CV pipeline so far operates on a single image:
+  edge gradients (Sobel/Canny), corner/keypoint features
+  (Harris/SIFT/ORB), per-frame motion (`video_motion_vectors`). None
+  of those recover depth. Stereo block matching with
+  Sum-of-Absolute-Differences (SAD) is the simplest integer-only
+  path to a per-pixel DEPTH estimate. For each pixel (x, y) in the
+  LEFT image, extract a WIN_SIZE x WIN_SIZE block (default 7x7)
+  centered there, slide that block along the SAME scanline in the
+  RIGHT image from x down to x - MAX_DISP (default 64), compute SAD
+  at each offset, store the offset minimizing SAD as disparity.
+  Depth follows from the similar-triangles formula
+  `depth_mm = baseline_mm * focal_pixels / disparity`; disparity == 0
+  clamps to `STEREO_MAX_DEPTH_MM` (100 m) as an "unknown / infinity"
+  sentinel. Border pixels (window would fall off the image) keep
+  disparity 0. The leftmost interior columns where x - half < SHIFT
+  cannot reach the true disparity (local_max_d caps below SHIFT) so
+  they read smaller disparities, dragging the mean a few units below
+  the ground-truth shift -- on a 64x32 textured pair shifted by 10
+  pixels the unit test asserts disparity == 10 EXACTLY at probed
+  interior points, and the mean lands at 6-8. Density classifier
+  (per-thousand pixels with non-zero disparity): low <100, mid
+  100..499, high >=500. New chat admin: `/depth L.pgm R.pgm` decodes
+  two same-dimension PGM paths and prints
+  `(depth WxH mean_disp=D density=Dmilli image_stereo_density_*)`.
+  Visual seam (`vp_features_for_image`) emits
+  `image_stereo_disparity_mean_<low|mid|high>` +
+  `image_stereo_density_<low|mid|high>` atoms when
+  `CE_VP_STEREO_RIGHT` env points at the companion right PGM. SAD
+  was chosen over normalized cross-correlation (NCC) and
+  semi-global matching (SGM) for the same reason PGM was chosen
+  over JPEG: simplest standardized algorithm that produces a
+  structurally interesting feature, with NO division in the inner
+  loop and NO floating-point operations. Follow-ups (separate
+  drops): left-right consistency check (re-run disparity right->left,
+  zero pixels where the two answers disagree); sub-pixel disparity
+  refinement (parabolic fit around the SAD minimum); SGM (aggregate
+  costs along 4-8 directions per pixel, much more accurate in
+  textureless regions but ~10x runtime + ~5x memory). Dimensions
+  capped at 256x256 per axis (the inner triple loop runs in
+  O(W*H*MAX_DISP*WIN_SIZE^2) = O(W*H*3136); at 256x256 that's ~205M
+  ops, the upper bound for the chat's per-command latency budget);
+  minimum dim 32x32 (the 7x7 window + 64-disp search needs headroom).
 
 Sobel + Harris fire only when the image is at least 16x16 in each axis
 (the kernel needs a 3x3 neighborhood and the count buckets need
@@ -296,6 +340,9 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | PNG decode (zlib + filters)                        | DONE (grayscale-8)|
 | Color histograms                                   | 2-3 weeks        |
 | SIFT 128-D descriptor + matching                   | DONE (P3.3 cont. v2)|
+| ORB (FAST + rBRIEF + Hamming matcher)              | DONE (P3.3 cont. v3)|
+| Stereo block-matching SAD disparity + depth         | DONE (R7E)       |
+| Stereo SGM + LR-check + sub-pixel                  | 3-4 weeks        |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
 
