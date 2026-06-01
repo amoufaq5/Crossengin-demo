@@ -11,7 +11,25 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 144 modules compile (`make build`, R10C adds
+> toolchain: 145 modules compile (`make build`, R10F adds
+> `src/io/transducers/audio_pitch.nova` — autocorrelation-based F0 (pitch)
+> estimation that completes the audio triad next to R6E Klatt synthesis
+> and R7F+R9B VAD. Per ~30 ms frame compute
+> `R(tau) = sum x(n) * x(n+tau)` over tau in [sr/f0_max..sr/f0_min] (32..320
+> samples @ 16 kHz / 50..500 Hz), pick argmax, then sweep integer multiples
+> for octave-down correction at the classical 0.92 threshold. Voicing rides
+> on the normalized peak `R(best_tau) / R(0) >= 0.300`. Output in centi-Hz
+> (Hz × 100) to preserve sub-Hz resolution in pure integer arithmetic. Pure
+> sines at 100, 200, 400 Hz @ 16 kHz hit exactly 100/200/400 Hz; white
+> noise + silence resolve unvoiced; Klatt /uw/ vowel resolves at 296 Hz
+> (formant snap, in [50..500] Hz band, voicing 868 milli); JFK
+> adult-male WAV resolves at 220 Hz mean across 287 voiced frames
+> (first-formant snap; YIN-class cure on the R10F roadmap; see
+> AUDIO_AUDIT.md "R10F"). New chat admin: `/pitch PATH` prints
+> `(pitch PATH: f0_mean=N Hz, f0_range=L-H Hz [...])`; graceful FAILED
+> on missing WAV. 52 unit assertions (`tests/unit/test_audio_pitch.nova`)
+> + 20 integration assertions (`tests/integration/scenario_tt_pitch.sh`);
+> all green. R10C adds
 > `src/kg/semantic_search.nova` — a purely textual TF-IDF +
 > integer-cosine ranker over atom labels. Closes the KG read story
 > alongside exact lookup (`atom_store.kg_find_atom`), episodic
