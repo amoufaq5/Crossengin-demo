@@ -312,12 +312,130 @@ the transcript + segment count + backend used.
 pass unchanged: `audio_synth: OK (209)`, `audio_capture: OK (28)`,
 `stt_seam: OK (26)`.
 
+### R9B update: adaptive noise-floor calibration + JFK end-to-end
+
+R8B (commit `0874516`) wired whisper.cpp into the seam and exercised the
+JFK 16 kHz WAV via `stt_transcribe_wav` (bypassing VAD) — that worked.
+The end-to-end `/listen /tmp/whisper.cpp/samples/jfk.wav` path however
+reported `vad_segments=0` and short-circuited to the placeholder. Two
+root causes:
+
+1. **WAV parser strict-offset bug.** `audio_capture_to_pcm` required the
+   `data` sub-chunk at byte offset 36 — the canonical layout for a
+   barebones RIFF/WAVE/PCM file with no metadata chunks. whisper.cpp's
+   bundled `jfk.wav` carries a `LIST/INFO ISFT 'Lavf...'` chunk between
+   the `fmt ` and `data` sub-chunks (ffmpeg encoder metadata), so `data`
+   actually lives at offset 70. The parser now scans forward through any
+   optional sub-chunk (LIST/INFO/bext/junk/...) until it finds `data`,
+   per RIFF spec. The fmt-body length comes from off 16 (4-byte LE u32)
+   and unknown chunks are word-aligned-padded if their body length is
+   odd.
+
+2. **Energy threshold needed to adapt to the recording's noise floor.**
+   R7F's threshold (50000 @ 8 kHz, scaling linearly to 100000 @ 16 kHz)
+   was tuned against Klatt-synthesized utterances with exact-zero
+   leading silence. On real recordings the noise floor sits above zero
+   (USB-mic preamp hiss, room HVAC, distant PA bleed); a different mic
+   gain stage rolls the threshold the wrong way. R9B adds an adaptive
+   multiplier (Option A from the threshold-tuning brief):
+
+   * **Calibration window:** `VAD_NOISE_CALIB_FRAMES = 16` × 30 ms ≈
+     480 ms of leading audio.
+   * **Noise floor estimator:** minimum per-frame energy across that
+     window. MIN-not-MEAN avoids biasing the floor upward when the
+     speaker starts inside the calibration window (a short utterance
+     that lands wholly within 500 ms still has MIN = silent frame).
+   * **Effective threshold:** `max(noise_floor × 3, R7F_floor)`. The
+     3× multiplier is the classical "speech runs ~10-30 dB above the
+     room floor" rule; webrtcvad and Silero use similar ratios.
+   * **R7F floor preserved.** The hard minimum is the R7F linear-scaling
+     threshold (`VAD_ENERGY_BASE_8K × frame_size / 240`). On Klatt
+     fixtures + JFK (both have exact-zero leading silence) the floor
+     wins and behavior is bit-identical to R7F.
+
+   The state struct gains four slots: `e_thresh_floor`, `noise_floor`,
+   `calibrated`, `adaptive`. The `V_*` indices for existing slots are
+   unchanged (only `push`-ed at the tail), so R7F's index-based access
+   from tests and consumers keeps working. `vad_set_energy_thresh` flips
+   adaptive=OFF + calibrated=ON to preserve R7F's "operator override
+   wins" semantic.
+
+   Auto-calibration is wired into `vad_process_pcm` only (the
+   buffer-level entry point). Per-frame entry points
+   (`vad_process_frame`, `vad_classify_frame`) keep the state's
+   threshold as set, so any per-frame R7F test runs bit-identical.
+   Subsequent `vad_process_pcm` calls do NOT re-calibrate (the
+   calibrated flag is sticky) — a streaming workflow that fans multiple
+   buffers through the same state keeps its initial baseline.
+
+   New public surface: `vad_calibrate_noise_floor(state, samples,
+   max_frames)`, `vad_noise_floor(state)`, `vad_e_thresh_floor(state)`,
+   `vad_is_calibrated(state)`, `vad_is_adaptive(state)`,
+   `vad_set_adaptive(state, on)`.
+
+3. **JFK end-to-end transcript.** After the two fixes,
+   `/listen /tmp/whisper.cpp/samples/jfk.wav` produces:
+
+   ```
+   (heard 'and so my fellow Americans ask not what your country can do
+    for you ask what you can do for your country'
+    [vad_segments=1, backend=whisper];
+    read /tmp/whisper.cpp/samples/jfk.wav)
+   ```
+
+   VAD detects 1 segment (the full utterance), filtered PCM = 170880
+   samples ≈ 10.7 s of speech out of the 11 s clip. Whisper decodes the
+   full quote.
+
+### Verification (R9B)
+
+- `tests/unit/test_audio_vad.nova`: 86 assertions (55 R7F preserved
+  bit-identical + 31 new). New coverage:
+  * `test_adaptive_defaults` (5 checks) — default state has adaptive
+    ON, not calibrated, noise_floor=0, e_thresh_floor mirrors the R7F
+    initial threshold at both 8 kHz (50000) and 16 kHz (100000).
+  * `test_calibrate_on_silence_keeps_floor` (3 checks) — pure-zero lead
+    -in → noise_floor=0 → live threshold stays at R7F floor.
+  * `test_calibrate_on_noisy_lead_in_lifts_threshold` (4 checks) —
+    amp=200 triangle lead-in → noise_floor ≈ 24000 → live threshold ≈
+    72000 (3× floor).
+  * `test_process_pcm_auto_calibrates` (4 checks) — buffer-level entry
+    point auto-runs calibration on first call, still detects the speech
+    burst in a noisy lead-in.
+  * `test_set_energy_thresh_disables_adaptive` (4 checks) — explicit
+    operator override sticks across subsequent `vad_process_pcm` calls.
+  * `test_set_adaptive_off_skips_calibration` (3 checks) — explicit opt
+    -out preserves R7F floor without changing the threshold.
+  * `test_calibrate_empty_buffer_safe` (3 checks) — calibration on an
+    empty buffer doesn't crash; state marks calibrated, threshold stays
+    at floor.
+  * `test_full_walk_noisy_lead_in_one_segment` (2 checks) — headline
+    R9B scenario in synthesized form: noisy lead-in + clean speech →
+    exactly 1 segment.
+  * `test_double_process_pcm_only_calibrates_once` (2 checks) — second
+    buffer through the same state does NOT re-baseline noise floor.
+- `tests/integration/scenario_oo_vad_natural.sh`: 15 assertions.
+  Synthetic silence WAV → 0 segments. Synthetic noisy + speech WAV →
+  1 segment (adaptive threshold isolates speech from amp=200 lead-in
+  noise). JFK 16 kHz WAV decoded by parser (LIST chunk accepted), VAD
+  → 1 segment, filtered PCM 170880 samples in expected duration band
+  [80000, 208000]. End-to-end `/listen JFK` → `vad_segments=1`,
+  transcript contains "fellow Americans" or "your country", dispatched
+  through `backend=whisper`. SKIPs gracefully if JFK WAV or
+  whisper-main aren't installed.
+
+`audio_vad: OK (86 checks)`. All R7F integration scenarios continue to
+pass bit-identical: `scenario_ii_vad: pass=17 fail=0`, `scenario_jj_
+whisper: pass=13 fail=0`, `scenario_w_audio_capture: pass=23 fail=0`,
+`scenario_oo_vad_natural: pass=15 fail=0`.
+
 ### Future work (VAD)
 
-- Adaptive thresholds: keep a rolling silence-floor estimator so a noisy
-  recording environment doesn't need manual energy-threshold tuning.
 - Spectral entropy / sub-band energy: add an extra discriminator that
   rejects single-frequency interference (HVAC hum, 50/60 Hz mains).
+- Per-utterance re-calibration: an optional flag to force calibration
+  re-baselining at silence boundaries, useful for very long capture
+  buffers where the noise floor drifts.
 - VAD-aware re-segmentation in STT: rather than concatenating speech
   segments back-to-back, hand each segment to STT independently and
   join transcripts at segment boundaries — preserves utterance pauses

@@ -76,6 +76,14 @@ let VAD_M_SILENCE = 10      // ~300 ms confirmation -- speech OFF
 //     the noisiest silence baseline we've observed in tests.
 // Per-frame: scales with sample_rate (more samples -> higher sum), so the
 // state struct stores a scaled version of this baseline.
+//
+// R9B note: this is now the FLOOR of the adaptive threshold -- the
+// actual effective threshold is max(3 * noise_floor, this floor). The
+// floor still wins when the noise floor is low (synthetic test fixtures
+// with pure-zero silence, or whisper.cpp's bundled JFK WAV which has a
+// clean leading silence), but the adaptive multiplier kicks in for
+// real-mic recordings where the noise floor sits well above zero (USB
+// mic preamp noise, room HVAC, distant PA bleed).
 let VAD_ENERGY_BASE_8K = 50000
 
 // ZCR ceiling. Frames with ZCR above this look like white noise, not
@@ -97,6 +105,31 @@ let VAD_ZCR_MIN_PCT = 1
 let VAD_RATE_MIN = 8000
 let VAD_RATE_MAX = 48000
 
+// R9B: adaptive energy threshold (Option A from the threshold-tuning brief).
+//
+// Calibration window: ~500 ms of leading audio is used to estimate the
+// noise floor (the minimum frame energy in that window). 500 ms /
+// 30 ms-per-frame ~= 16-17 frames; we round to 16 for a clean integer
+// even when the buffer is short.
+//
+// Multiplier: the effective energy threshold becomes
+//   max(VAD_ENERGY_BASE_8K_scaled, noise_floor * VAD_NOISE_MULT).
+//
+// 3x is the classical "speech runs ~10-30 dB above the room noise floor"
+// rule of thumb; webrtcvad and Silero use similar ratios (Silero's "very
+// permissive" mode is ~2x; "aggressive" is ~4x). We pick 3 as a
+// compromise: catches conversational-volume utterances on a USB mic
+// pre-amp while still rejecting fan noise and HVAC rumble.
+//
+// The hard floor (VAD_ENERGY_BASE_8K_scaled) prevents the adaptive
+// path from collapsing to 0 on a buffer that happens to start with
+// exact-zero samples (synthesized fixtures + whisper.cpp's bundled
+// jfk.wav both have an exact-silent lead-in). With noise_floor=0
+// the adaptive path would otherwise classify ANY non-zero frame as
+// speech, regressing the R7F low-amp-triangle rejection test.
+let VAD_NOISE_CALIB_FRAMES = 16
+let VAD_NOISE_MULT         = 3
+
 // ---- state machine codes --------------------------------------------------
 
 let VAD_STATE_SILENCE          = 0
@@ -114,7 +147,11 @@ let VAD_EVENT_SPEECH_END   = 2
 //   [0] tag             (sentinel: VAD_STATE_TAG)
 //   [1] sample_rate
 //   [2] frame_size      (samples per 30 ms frame)
-//   [3] energy_thresh   (per-frame absolute-sum threshold)
+//   [3] energy_thresh   (per-frame absolute-sum threshold; live -- the
+//                        adaptive path REWRITES this slot after
+//                        calibration to keep the per-frame classifier
+//                        unchanged; tests that override via
+//                        vad_set_energy_thresh disable adaptive)
 //   [4] zcr_max         (per-frame zero-crossing count ceiling)
 //   [5] machine_state   (one of VAD_STATE_*)
 //   [6] speech_run      (consecutive speech frames seen)
@@ -126,23 +163,45 @@ let VAD_EVENT_SPEECH_END   = 2
 //   [12] segments       (list of [start_sample, end_sample] pairs)
 //   [13] cur_seg_start  (sample index where current SPEECH segment opened,
 //                        or -1 if not in a segment)
+//   [14] e_thresh_floor (R9B: hard minimum for the adaptive path -- the
+//                        R7F fixed threshold derived from
+//                        VAD_ENERGY_BASE_8K * frame_size / 240. Adaptive
+//                        calibration may raise the live energy_thresh
+//                        above this floor when the noise floor is high,
+//                        but never lowers it below)
+//   [15] noise_floor    (R9B: per-frame energy of the quietest frame in
+//                        the leading calibration window; 0 if not yet
+//                        calibrated or if the leading audio is exact
+//                        silence)
+//   [16] calibrated     (R9B: 0 = not yet calibrated, 1 = calibration
+//                        already applied. vad_process_pcm auto-calibrates
+//                        when this flag is 0 + adaptive is enabled)
+//   [17] adaptive       (R9B: 1 = adaptive calibration is enabled
+//                        (default), 0 = disabled (e.g. after the test
+//                        explicitly overrode the threshold via
+//                        vad_set_energy_thresh, or after the caller asked
+//                        for fixed-threshold mode via vad_set_adaptive(s, 0)))
 
 let VAD_STATE_TAG = 7401
 
-let V_TAG          = 0
-let V_RATE         = 1
-let V_FRAME_SIZE   = 2
-let V_E_THRESH     = 3
-let V_ZCR_MAX      = 4
-let V_MSTATE       = 5
-let V_SPEECH_RUN   = 6
-let V_SILENCE_RUN  = 7
-let V_LAST_EVENT   = 8
-let V_FRAMES_TOT   = 9
-let V_FRAMES_SP    = 10
-let V_FRAMES_SI    = 11
-let V_SEGMENTS     = 12
-let V_CUR_SEG      = 13
+let V_TAG            = 0
+let V_RATE           = 1
+let V_FRAME_SIZE     = 2
+let V_E_THRESH       = 3
+let V_ZCR_MAX        = 4
+let V_MSTATE         = 5
+let V_SPEECH_RUN     = 6
+let V_SILENCE_RUN    = 7
+let V_LAST_EVENT     = 8
+let V_FRAMES_TOT     = 9
+let V_FRAMES_SP      = 10
+let V_FRAMES_SI      = 11
+let V_SEGMENTS       = 12
+let V_CUR_SEG        = 13
+let V_E_THRESH_FLOOR = 14
+let V_NOISE_FLOOR    = 15
+let V_CALIBRATED     = 16
+let V_ADAPTIVE       = 17
 
 // ---- helpers --------------------------------------------------------------
 
@@ -201,6 +260,14 @@ fn vad_state_new(sample_rate) {
     push(s, 0)                          // [11] frames_silence
     push(s, list_new())                 // [12] segments
     push(s, 0 - 1)                      // [13] cur_seg_start
+    // R9B: adaptive-threshold fields. The floor mirrors the R7F fixed
+    // threshold; before calibration it equals the live threshold (no
+    // behavior change). After calibration the live threshold is
+    // max(noise_floor * VAD_NOISE_MULT, floor).
+    push(s, e_thresh)                   // [14] e_thresh_floor
+    push(s, 0)                          // [15] noise_floor (uncalibrated)
+    push(s, 0)                          // [16] calibrated flag
+    push(s, 1)                          // [17] adaptive (on by default)
     return s
 }
 
@@ -221,14 +288,105 @@ fn vad_segments(s)       { return s[V_SEGMENTS] }
 
 // ---- threshold override (tests / tuning) ---------------------------------
 
+// Any explicit threshold override disables adaptive calibration -- the
+// caller has spoken, we don't overwrite their bound on the next
+// vad_process_pcm call. This mirrors R7F's behavior bit-identical: tests
+// that constructed a state, called vad_set_energy_thresh, and then ran
+// per-frame classification still see exactly that override.
 fn vad_set_energy_thresh(s, v) {
     list_set(s, V_E_THRESH, v)
+    list_set(s, V_ADAPTIVE, 0)
+    list_set(s, V_CALIBRATED, 1)
     return 1
 }
 
 fn vad_set_zcr_max(s, v) {
     list_set(s, V_ZCR_MAX, v)
     return 1
+}
+
+// ---- R9B: adaptive-threshold accessors + tuning hooks --------------------
+//
+// vad_e_thresh_floor(s)   -- the hard minimum (R7F fixed threshold).
+// vad_noise_floor(s)      -- the min frame energy seen in the leading
+//                            calibration window; 0 before calibration.
+// vad_is_calibrated(s)    -- 1 once vad_process_pcm or vad_calibrate_
+//                            noise_floor has run; 0 before.
+// vad_is_adaptive(s)      -- 1 by default; 0 after vad_set_energy_thresh
+//                            or vad_set_adaptive(s, 0).
+//
+// vad_set_adaptive(s, v)  -- explicit opt-in/out for the buffer-level
+//                            entry point. Useful for tests that want to
+//                            assert the floor-only behavior without
+//                            calling vad_set_energy_thresh (which also
+//                            changes the threshold).
+
+fn vad_e_thresh_floor(s) { return s[V_E_THRESH_FLOOR] }
+fn vad_noise_floor(s)    { return s[V_NOISE_FLOOR] }
+fn vad_is_calibrated(s)  { return s[V_CALIBRATED] }
+fn vad_is_adaptive(s)    { return s[V_ADAPTIVE] }
+
+fn vad_set_adaptive(s, v) {
+    let on = 0
+    if v != 0 { on = 1 }
+    list_set(s, V_ADAPTIVE, on)
+    return 1
+}
+
+// ---- R9B: noise-floor calibration ----------------------------------------
+//
+// vad_calibrate_noise_floor(state, samples, max_frames) -> noise_floor
+//
+// Walks up to `max_frames` frames at the START of `samples` (the leading
+// audio, typically the "pre-speech" silence), computes per-frame energy
+// for each, takes the MIN as the noise-floor estimate, then sets the
+// live energy_thresh slot to max(noise_floor * VAD_NOISE_MULT, e_thresh_floor).
+// Marks the state as calibrated.
+//
+// If `samples` is shorter than one frame, no calibration happens and the
+// pre-existing threshold is retained.
+//
+// MIN-not-MEAN was chosen because:
+//   * The classical noise-floor estimator (Rabiner) takes the minimum
+//     spectral or temporal-energy value across a leading window to avoid
+//     biasing the floor upwards if the speaker started talking before
+//     the window ended. A short utterance ("hi") can land entirely
+//     inside the calibration window; MIN still finds the silent frames.
+//   * It preserves the existing tests: synthetic fixtures start with
+//     pure-zero silence, so MIN(window) = 0 -> live threshold falls back
+//     to the floor and behavior matches R7F.
+
+fn vad_calibrate_noise_floor(s, samples, max_frames) {
+    let frame_size = s[V_FRAME_SIZE]
+    let total = len(samples)
+    let avail_frames = total / frame_size
+    let n = max_frames
+    if n > avail_frames { n = avail_frames }
+    if n < 1 {
+        // Nothing to calibrate from; mark as calibrated to avoid a future
+        // re-attempt on the same state.
+        list_set(s, V_CALIBRATED, 1)
+        return s[V_NOISE_FLOOR]
+    }
+    let i = 0
+    let off = 0
+    let min_e = 0
+    while i < n {
+        let e = vad_frame_energy(samples, off, frame_size)
+        if i == 0 { min_e = e }
+        if e < min_e { min_e = e }
+        i = i + 1
+        off = off + frame_size
+    }
+    list_set(s, V_NOISE_FLOOR, min_e)
+    // Effective threshold: max(noise_floor * mult, floor).
+    let candidate = min_e * VAD_NOISE_MULT
+    let floor = s[V_E_THRESH_FLOOR]
+    let live = candidate
+    if floor > live { live = floor }
+    list_set(s, V_E_THRESH, live)
+    list_set(s, V_CALIBRATED, 1)
+    return min_e
 }
 
 // ---- frame analysis (pure helpers, no state) ----------------------------
@@ -431,6 +589,18 @@ fn vad_process_frame(s, samples, off, n) {
 //   Returns the seg-pair list (also accessible via vad_segments(state)).
 
 fn vad_process_pcm(s, samples) {
+    // R9B: auto-calibrate the noise floor from the leading window before
+    // any per-frame classification. The MIN-over-window estimator falls
+    // through to the existing R7F fixed floor when the leading samples
+    // are exact zero (synthetic fixtures, whisper.cpp's jfk.wav), so all
+    // R7F test fixtures stay bit-identical. Real-mic recordings whose
+    // noise floor sits well above zero get their threshold proportionally
+    // raised, eliminating false positives from steady-state preamp noise.
+    if s[V_ADAPTIVE] == 1 {
+        if s[V_CALIBRATED] == 0 {
+            vad_calibrate_noise_floor(s, samples, VAD_NOISE_CALIB_FRAMES)
+        }
+    }
     let frame_size = s[V_FRAME_SIZE]
     let total = len(samples)
     let off = 0

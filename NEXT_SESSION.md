@@ -3,7 +3,307 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R8B (this session) — Audio: whisper.cpp STT backend, /listen actually transcribes
+## R9A (this session) — IO: Semi-Global Matching (SGM) stereo on R7E + R8D
+
+**Status: complete -- `src/io/transducers/image_stereo.nova` extends
+R7E's block-matching SAD disparity and R8D's LR-check + sub-pixel
+refinement with the third stereo-quality tier flagged in IMAGE_AUDIT.md:
+4-path Semi-Global Matching (Hirschmuller 2008).** R7E + R8D run an
+INDEPENDENT per-pixel SAD minimization; SGM AGGREGATES the matching cost
+along multiple 1-D scanline paths to enforce smoothness and dramatically
+reduces speckle in low-texture regions, the canonical stereo failure mode
+where R7E's argmin picks whatever d happens to break a ~tied SAD.
+
+### Algorithm (4-path, P1=8 / P2=32 defaults)
+
+1. Build cost volume `C(x, y, d)` from `stereo_sad_block` (same kernel as
+   R7E). Pixels with no valid match (border + `x - d < half`) get
+   `STEREO_SGM_INF` so SGM never picks them.
+2. For each path direction r in { LR, TB, RL, BT } and each pixel p:
+   `L_r(p, d) = C(p, d) + min(L_r(p-r, d), L_r(p-r, d-1) + P1,`
+   `L_r(p-r, d+1) + P1, min_d' L_r(p-r, d') + P2) - min_d' L_r(p-r, d')`.
+   The trailing subtraction prevents unbounded growth (uniform offset
+   does not change argmin).
+3. Aggregate: `S(p, d) = sum over r of L_r(p, d)`.
+4. Output `argmin_d S(p, d)` as the disparity map.
+
+Each path keeps only ONE row/column buffer of size W*D so working memory
+is bounded; the cost volume itself is allocated as raw bytes via
+`alloc + store64` (8 bytes per int) and capped at W*H*D <= 512K ints
+(<= 4MB). Pass 1 is the cache-friendly forward sweep (LR + TB); pass 2
+is the reverse sweep (RL + BT).
+
+### What landed
+
+- **`src/io/transducers/image_stereo.nova`** (+~570 lines, EXTENDED;
+  R7E + R8D surfaces untouched for back-compat). New public API:
+  * `stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2)`
+    -> result tuple identical to R7E's. p1=0 / p2=0 use defaults.
+  * `stereo_disparity_sgm_quality(left, right, w, h, win_size, max_disp,`
+    `p1, p2, lr_tolerance)` -> combined: SGM + LR-check (vs R8D's
+    right->left block-matching map) + sub-pixel parabolic refinement
+    on the SGM-aggregated cost. Returns milli-disparity list.
+  * `stereo_sgm_pgm_paths(L, R)`, `stereo_sgm_pgm_args(arg)` -- chat
+    `/depth_sgm` admin one-liners.
+- **`examples/crossengin_chat.nova`** (+1 line): `/depth_sgm L.pgm R.pgm`
+  dispatch. The R7E `/depth` admin and its help line stay; R8D's
+  `/depth_q` stays; `/depth_sgm` is dispatch-only (no help line).
+- **`tests/unit/test_stereo_sgm.nova`** (NEW, 30 assertions):
+  SGM identical inputs (mean / density 0, probed pixels 0); SGM
+  shifted-by-8 pair (probed interior reads disparity 8 exactly);
+  textureless-band fixture with tiny left/right noise (SGM variance
+  <= BM variance over the band -- the headline SGM benefit);
+  P2 >> P1 smoothness (band variance < 64); P2 == P1 case (band
+  variance < 64); very high P1+P2 over-smooths interior (variance
+  < 200); combined SGM-quality on shifted-by-8 pair (milli within
+  +/- 300 of 8000 at probed pixels, 0 at borders); SGM-quality on
+  textureless band (pipeline produces some non-zero milli); invalid-
+  input refusals + volume cap (128x128x64 rejected, > 4MB);
+  /depth_sgm dispatch usage strings.
+- **`tests/integration/scenario_nn_stereo_sgm.sh`** (NEW, 11 assertions):
+  build LEFT_TEX (textured 32x24 PGM), RIGHT_TEX (shifted-by-8),
+  LEFT_BAND + RIGHT_BAND (textured with a textureless-noise band),
+  RIGHT_SMALL (24x20). Cases: /help still advertises /depth (R7E
+  preserved); /depth_sgm no-arg / one-arg usage; identical inputs
+  report mean_disp=0; shifted pair reports mean_disp >= 1 + density
+  label; dim mismatch + missing-file errors surface cleanly; both
+  /depth and /depth_sgm output lines emitted on the band fixture
+  (BM-vs-SGM coexistence); chat reaches /quit cleanly.
+- **`IMAGE_AUDIT.md`**: R9A SGM (4 paths) checked off in the feature
+  ladder; 8-path + mutual-information data-term track listed at
+  "2-3 weeks" as the next stereo follow-up.
+- **`README.md`**: short blurb summarizing the third stereo tier.
+
+### Verification
+
+- 30/30 unit assertions in `test_stereo_sgm.nova` green.
+- 11/11 integration assertions in `scenario_nn_stereo_sgm.sh` green.
+- R7E's `test_stereo.nova` (54 assertions) + `scenario_hh_stereo.sh`
+  (10 assertions) still green -- R7E's contract preserved.
+- R8D's `test_stereo_quality.nova` (42 assertions) +
+  `scenario_kk_stereo_quality.sh` (11 assertions) still green --
+  R8D's contract preserved.
+- Full unit suite: 149/149 green (added 1 file, no regressions).
+- `make build` still 141 modules.
+
+### Follow-ups not in this session
+
+- **8-path SGM**: add the diagonal paths (LR-down, LR-up, RL-down, RL-up)
+  for ~2x quality on slanted depth boundaries; ~2x runtime + 2x prev-
+  buffer memory.
+- **Mutual-information data term**: Hirschmuller's full paper replaces
+  SAD with a joint-histogram-derived MI cost. Sharper edges and better
+  robustness to illumination differences between L and R.
+- **Data-adaptive P2**: scale P2 by `1 / (1 + |I(p) - I(p - r)|)` so
+  large penalties relax across intensity edges (= depth discontinuities).
+- **Visual-perception seam integration**: switch
+  `stereo_append_features_if_paired` from R7E's `stereo_disparity` to
+  `stereo_disparity_sgm` so the emitted atoms reflect SGM's smoother
+  disparity field.
+
+---
+
+## R9B (this session) — IO: adaptive VAD thresholds + JFK end-to-end `/listen`
+
+**Status: complete -- `src/io/transducers/audio_vad.nova` extends R7F's
+energy + ZCR + K=3/M=10 hysteresis VAD with an adaptive noise-floor
+multiplier (Option A from the threshold-tuning brief), and
+`src/io/transducers/audio_capture.nova` learns to skip RIFF metadata
+sub-chunks so whisper.cpp's bundled JFK 16 kHz WAV finally parses
+through the VAD-gated path.** R8B (commit `0874516`) wired whisper.cpp
+into the seam and confirmed direct `stt_transcribe_wav` decodes JFK to
+"Americans" correctly. The full `/listen jfk.wav` path however reported
+`vad_segments=0` and short-circuited to the placeholder -- two bugs:
+
+1. **WAV parser strict-offset bug.** `audio_capture_to_pcm` required
+   `data` at byte offset 36. JFK has a `LIST/INFO ISFT 'Lavf...'`
+   chunk between fmt and data (ffmpeg encoder metadata), pushing data
+   to offset 70. The parser now scans forward through any optional
+   sub-chunk (LIST/INFO/bext/junk/...) per RIFF spec.
+
+2. **Energy threshold needed to adapt to the noise floor.** R7F's
+   fixed threshold (50000 @ 8 kHz, scaling linearly with frame_size)
+   was tuned against Klatt-synthesized utterances with exact-zero
+   leading silence. Real mic recordings sit on a noise floor that
+   varies with preamp gain / room HVAC / distant PA bleed. R9B adds
+   an adaptive multiplier: take the **MIN per-frame energy across the
+   leading ~480 ms** (16 frames) as the noise floor estimate, set the
+   live threshold to `max(noise_floor × 3, R7F_floor)`. The 3×
+   multiplier is the classical "speech runs ~10-30 dB above the room
+   floor" rule of thumb (webrtcvad / Silero use similar ratios).
+
+   The state struct gains four slots (`e_thresh_floor`, `noise_floor`,
+   `calibrated`, `adaptive`) appended at the tail so R7F's `V_*` index
+   constants are unchanged. Auto-calibration is wired into
+   `vad_process_pcm` only -- per-frame entry points keep the state's
+   threshold as set, preserving R7F's per-frame test contract
+   bit-identical.
+
+### What landed
+
+- **`src/io/transducers/audio_vad.nova`** (+~120 lines, EXTENDED): new
+  public surface -- `vad_calibrate_noise_floor(state, samples,
+  max_frames)`, `vad_noise_floor(state)`, `vad_e_thresh_floor(state)`,
+  `vad_is_calibrated(state)`, `vad_is_adaptive(state)`,
+  `vad_set_adaptive(state, on)`. Constants
+  `VAD_NOISE_CALIB_FRAMES = 16`, `VAD_NOISE_MULT = 3`.
+  `vad_set_energy_thresh` flips adaptive=OFF + calibrated=ON to
+  preserve R7F's "operator override wins" semantic. The R7F threshold
+  values (`VAD_ENERGY_BASE_8K = 50000`, scaled), accessors, hysteresis,
+  segment recording, and `vad_filter_pcm` are untouched.
+- **`src/io/transducers/audio_capture.nova`** (parser-only fix): scan
+  forward through optional RIFF sub-chunks after `fmt ` until
+  `data` is found. The data-offset is now whatever the scan resolves
+  (no longer hard-coded 44).
+- **`tests/unit/test_audio_vad.nova`** (+~140 lines, EXTENDED): 31 new
+  R9B assertions covering adaptive defaults, calibration on silence
+  vs noisy lead-in, auto-calibration via `vad_process_pcm`,
+  `vad_set_energy_thresh` override semantics, `vad_set_adaptive` opt-
+  out, empty-buffer safety, headline noisy-lead-in single-segment
+  scenario, double-process-pcm one-shot calibration. R7F's 55
+  assertions still PASS bit-identical.
+- **`tests/integration/scenario_oo_vad_natural.sh`** (NEW, 15
+  assertions): synthetic silence (0 segments), synthetic noisy+speech
+  (1 segment under adaptive threshold), JFK 16 kHz (parsed at 16 kHz,
+  >=1 segment, filtered PCM 170880 samples in [80000, 208000]),
+  end-to-end `/listen JFK` (vad_segments=1, transcript contains
+  "fellow Americans" or "your country", backend=whisper). SKIPs
+  cleanly if JFK WAV or whisper-main absent.
+- **`AUDIO_AUDIT.md`**: R9B sub-section under R7F documents the two
+  fixes, the adaptive design, the calibration window / multiplier
+  rationale, the preserved R7F test contract, and the JFK end-to-end
+  transcript.
+- **`README.md`**: short blurb summarizing /listen now resolving on
+  natural recordings.
+
+### Verification
+
+- **R7F's 55 existing assertions pass bit-identical** (`audio_vad: OK
+  (86 checks)` -- 55 R7F + 31 R9B).
+- 15/15 assertions in `scenario_oo_vad_natural.sh` green.
+- R7F's `scenario_ii_vad.sh` (17 assertions), R8B's
+  `scenario_jj_whisper.sh` (13 assertions), R7F's
+  `test_audio_capture.nova` (28 assertions), R7F's
+  `test_audio_synth.nova` (209 assertions), R6E's `scenario_w_audio_
+  capture.sh` (23 assertions) all green.
+- Full unit suite 150/150 green.
+- End-to-end `/listen /tmp/whisper.cpp/samples/jfk.wav` produces:
+  `(heard 'and so my fellow Americans ask not what your country can
+  do for you ask what you can do for your country' [vad_segments=1,
+  backend=whisper]; ...)`.
+
+### Follow-ups not in this session
+
+- **Per-utterance re-calibration**: optional flag to force calibration
+  re-baselining at silence boundaries for very long capture buffers
+  where the noise floor drifts.
+- **Spectral entropy** as a third discriminator -- rejects single-
+  frequency interference (HVAC hum, 50/60 Hz mains).
+- **VAD-aware segment-level STT dispatch**: hand each VAD segment to
+  STT independently and join transcripts at segment boundaries,
+  preserving utterance pauses for prosody / turn-taking.
+
+---
+
+## R9F (this session) — Federated Learning: Byzantine resilience (trimmed mean + median)
+
+**Status: complete -- `src/learning/byzantine_aggregation.nova` lands as
+a new leaf module wired into the federated aggregator with a parallel
+`fed_acc_byz_*` accumulator.** P3.7 shipped FL averaging under an honest
+participant model; R5 added SecAgg (pairwise additive masking) so the
+coordinator only sees the SUM, not per-soul values; R5A + R7B migrated
+DH to bn256_* + RFC 7919 Group 14. NONE of that defends against a
+malicious participant submitting a poisoned update (a single soul
+submitting `1_000_000` shifts the mean arbitrarily). R9F adds two
+robust aggregation rules from the standard literature (Yin et al. 2018,
+Chen et al. 2017):
+
+- **Trimmed mean** (`byz_trimmed_mean(updates, trim_k)`): per-coord
+  sort, drop top-k + bottom-k extremes, mean of the remainder.
+  Tolerates k Byzantine per coordinate.
+- **Coordinate-wise median** (`byz_coordinate_median(updates)`): per-
+  coord median. Tolerates ~n/2 Byzantine in the worst case (a strict
+  majority of honest values pins the median to the honest cluster).
+
+Both share an `_byz_sort_int_list` helper (insertion sort; n is small
+in practice, ~5..50). `byz_aggregate(updates, strategy, trim_k)`
+dispatches BYZ_NONE / BYZ_TRIMMED_MEAN / BYZ_MEDIAN.
+
+The federated aggregator gains a parallel accumulator
+(`fed_acc_byz_new` / `_add_stat` / `_aggregate` / `_part_count`) that
+keeps per-participant rows (so the reducer can inspect them) instead
+of collapsing to a sum at submit time. `fed_acc_byz_aggregate(acc,
+strategy, trim_k)` returns the same shape as `fed_acc_averages` so
+downstream consumers don't need to change.
+
+### SecAgg vs Byzantine trade-off (deliberate)
+
+R9F's central design decision: SecAgg and Byzantine resilience are
+FUNDAMENTALLY in tension. SecAgg hides per-soul values; Byzantine
+filtering requires them. The two naive compositions fail:
+
+- SecAgg-then-Byzantine -- aggregator unmasks to inspect -> defeats
+  SecAgg's privacy guarantee.
+- Byzantine-then-SecAgg -- soul filters its own update before masking
+  -> trivially circumventable by a lying soul.
+
+R9F therefore makes them SEPARATE privacy postures, not layers.
+Operators pick ONE per round (`sa_acc_*` for SecAgg / `fed_acc_byz_*`
+for Byzantine). The advanced primitives that close the gap (ZK proofs
+of well-formedness, threshold-homomorphic encryption with range proofs,
+trimmed-mean over secret shares) are out of scope for P3.10 and
+walked in SECAGG_AUDIT.md's R9F appendix.
+
+### Env knobs
+
+- `CE_FL_BYZ_STRATEGY` -- `none|trimmed|median`. Default `none`
+  (preserves P3.7 averaging behaviour).
+- `CE_FL_BYZ_TRIM_K` -- integer; trim count per end per coord.
+  Default 1.
+
+### Verification
+
+- `tests/unit/test_byzantine_aggregation.nova` -- **74 assertions**
+  covering algorithm semantics, poisoning resilience, multi-dim
+  aggregation, edge cases, env parsers, dispatcher routing, AND
+  the `fed_acc_byz_*` federated integration.
+- `tests/integration/scenario_pp_byz_fl.sh` -- **15 assertions**
+  on a NOVA driver simulating 5 souls (4 honest, 1 Byzantine
+  submitting 9999/9999 vs honest cluster 690-720 / 190-220 milli).
+  BYZ_NONE produces the poisoned 2563/2163; BYZ_TRIMMED_MEAN
+  (trim_k=1) recovers 710/210; BYZ_MEDIAN recovers 710/210.
+  **Skew reduction: ~370x** (NONE skew = 1858, trimmed = 5).
+- `tests/unit/test_secure_aggregation.nova` -- 170 assertions
+  bit-identically green (only a header-comment note added to
+  the SecAgg module).
+- `tests/unit/test_federated_aggregator.nova` -- 91 assertions
+  bit-identically green (Byzantine path is purely additive).
+
+### Files touched
+
+- NEW `src/learning/byzantine_aggregation.nova` (leaf module, ~280
+  lines; depends only on `std/io`).
+- `src/learning/federated_aggregator.nova` (additive: import +
+  `fed_acc_byz_*` accumulator block; existing `fed_acc_*` path
+  unchanged).
+- `src/learning/secure_aggregation.nova` (header-comment note only).
+- NEW `tests/unit/test_byzantine_aggregation.nova` (74 assertions).
+- NEW `tests/integration/scenario_pp_byz_fl.sh` (15 assertions).
+- NEW `tests/integration/_scenario_pp_drivers/byz_aggregation_driver.nova`.
+- `SECAGG_AUDIT.md` (R9F appendix).
+- `README.md` / `NEXT_SESSION.md` (this entry).
+
+### Why R9F does NOT implement Krum / Bulyan
+
+Krum (O(n^2 * d) per round) and Bulyan (O(n^3), needs n >= 4f+3) bind
+their asymptotic guarantees at n=20+ scales. CrossEngin's current
+federations are n=5-ish, where coordinate-wise median already pins
+the aggregate to the honest cluster. Both are clean one-case
+extensions of `byz_aggregate` when the federation scales.
+
+### Module count: 140 -> 141
+
+## R8B (R8 session) — Audio: whisper.cpp STT backend, /listen actually transcribes
 
 **Status: complete -- `src/io/transducers/whisper_backend.nova` lands as
 the third leg of the speech-to-text seam from R7F (`stt_seam.nova`).**

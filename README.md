@@ -11,9 +11,28 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 140 modules compile (`make build`, R8F extends
-> `kg/episodic.nova` in place with the READ-side companion to R6F's
-> consolidation cycle -- six retrieval functions
+> toolchain: 141 modules compile (`make build`, R9F adds
+> `src/learning/byzantine_aggregation.nova` — two coordinate-wise robust
+> aggregation rules (trimmed mean + median) that tolerate up to f
+> malicious participants per federated round. The federated
+> aggregator gains a parallel `fed_acc_byz_*` accumulator that keeps
+> per-participant rows so the reducer can inspect each contribution;
+> `byz_aggregate(updates, strategy, trim_k)` dispatches BYZ_NONE /
+> BYZ_TRIMMED_MEAN / BYZ_MEDIAN. `CE_FL_BYZ_STRATEGY=trimmed|median|none`
+> + `CE_FL_BYZ_TRIM_K=<k>` env knobs flip strategy without code edits.
+> On the canonical 5-soul fixture with one 100x poisoning outlier
+> (honest mean 705/205 milli), BYZ_NONE yields the poisoned 2563/2163,
+> BYZ_TRIMMED_MEAN (trim_k=1) recovers 710/210, BYZ_MEDIAN recovers
+> 710/210 -- ~370x skew reduction. The SecAgg vs Byzantine trade-off
+> (filtering needs per-soul values; SecAgg hides them) is
+> deliberately surfaced in SECAGG_AUDIT.md: operators pick ONE
+> privacy posture per round. R9F adds 74 unit assertions
+> (`tests/unit/test_byzantine_aggregation.nova`) + 15 integration
+> assertions (`tests/integration/scenario_pp_byz_fl.sh`); all green;
+> R5's SecAgg (170 unit + 48 integration) and P3.7 federated
+> aggregator (91 unit) tests remain bit-identically green. R8F
+> extended `kg/episodic.nova` in place with the READ-side companion
+> to R6F's consolidation cycle -- six retrieval functions
 > (`episodic_recall_by_member`, `episodic_recall_by_window`,
 > `episodic_recall_by_pattern`, `episodic_recall_top_belief`,
 > `episodic_recall_most_recent`, `episodic_provenance`) so other parts
@@ -66,16 +85,32 @@ computational units rather than orchestrating a pipeline of modules.
 > `(depth WxH mean_disp=D density=Dmilli image_stereo_density_*)`.
 > Visual seam emits `image_stereo_disparity_mean_*` +
 > `image_stereo_density_*` atoms when `CE_VP_STEREO_RIGHT` env points
-> at the companion right PGM. ~54 unit assertions + 10 integration
-> assertions; all green. See IMAGE_AUDIT.md for LR-check / sub-pixel /
-> SGM follow-ups,
+> at the companion right PGM. R8D LR-check + sub-pixel refinement
+> (`/depth_q`) and R9A Semi-Global Matching (`/depth_sgm`) extend the
+> quality / smoothness side: R9A aggregates the SAD cost volume along
+> 4 scanline paths (Hirschmuller 2008 recurrence with P1=8 / P2=32
+> default penalties) so the disparity is smooth in textureless
+> regions where block-matching speckles -- the unit test asserts
+> SGM variance <= BM variance in a noisy-flat band. Cap dims at
+> 128x128 with MAX_DISP<=64 to keep the cost volume under 4MB.
+> ~54 + 42 + 30 unit assertions + 10 + 11 + 11 integration
+> assertions; all green. See IMAGE_AUDIT.md for the 8-path / MI
+> data-term follow-ups,
 > +1 from
 > `io/transducers/audio_vad.nova` added in R7F (energy + ZCR Voice
 > Activity Detection: 30 ms frames, 4-state hysteresis machine with K=3
 > speech-on / M=10 speech-off thresholds; integrated into
 > `audio_capture_to_pcm_vad` and `stt_transcribe_wav_vad` so STT only
-> sees confirmed-speech PCM, see AUDIO_AUDIT.md for the algorithm +
-> verification),
+> sees confirmed-speech PCM) and extended in R9B with adaptive noise-
+> floor calibration so `/listen` resolves on natural recordings: VAD
+> takes the MIN per-frame energy across the leading ~480 ms as the
+> noise floor estimate and lifts the live threshold to
+> `max(noise_floor × 3, R7F_floor)`. R9B also relaxes
+> `audio_capture_to_pcm` to scan past optional RIFF sub-chunks
+> (LIST/INFO/bext/...) so whisper.cpp's bundled JFK 16 kHz WAV parses
+> cleanly. End-to-end `/listen /tmp/whisper.cpp/samples/jfk.wav`
+> now produces `vad_segments=1` and the full JFK transcript through
+> whisper. See AUDIO_AUDIT.md for the algorithm + verification,
 > +1 from
 > `io/transducers/whisper_backend.nova` added in R8B (whisper.cpp STT
 > backend wired into the seam from R7F — `/listen` actually transcribes
@@ -504,7 +539,10 @@ computational units rather than orchestrating a pipeline of modules.
 > speech-on / M=10 speech-off commit thresholds; thresholds scale
 > linearly with frame_size so the same module works at 8/16/22.05/
 > 44.1/48 kHz. Rejects pure-noise inputs via the ZCR ceiling
-> (alternating ±3000 = max ZCR = silence verdict),
+> (alternating ±3000 = max ZCR = silence verdict). R9B extended with
+> +31 assertions for adaptive noise-floor calibration (MIN over
+> leading 480 ms × 3 multiplier, R7F floor preserved bit-identical);
+> total now 86 checks,
 > +1 suite / +28 assertions from `test_whisper_backend.nova` added in
 > R8B -- whisper.cpp STT backend wired into the seam: env-resolver
 > fallback (default canonical install paths when CE_WHISPER_BIN /
@@ -608,6 +646,17 @@ computational units rather than orchestrating a pipeline of modules.
 > SKIPs gracefully if whisper-main / ggml-tiny.en.bin are not
 > installed (10 of 13 assertions still run; the model-decode
 > assertions are the optional 3),
+> +1 from `scenario_oo_vad_natural.sh` added in R9B adaptive VAD +
+> JFK end-to-end: synthetic silence -> 0 segments (R7F floor
+> preserved when leading audio is exact-zero), synthetic noisy
+> + speech -> 1 segment (adaptive threshold lifts above amp=200
+> triangle lead-in noise without losing the amp=3000 speech burst),
+> JFK 16 kHz WAV decoded by parser past the LIST/INFO sub-chunk
+> -> 1 VAD segment + filtered PCM 170880 samples (~10.7 s of the
+> 11 s clip), end-to-end `/listen JFK` reports `vad_segments=1`
+> + transcript contains "fellow Americans" or "your country" +
+> `backend=whisper`. SKIPs cleanly if the JFK WAV or whisper-main
+> are not installed,
 > +1 from `scenario_n_compaction.sh` added in P2.10 snapshot compaction
 > pass: /save -> /teach 50 -> /compact -> /save shrinks file growth by
 > >50% vs the baseline /save -> /teach 50 -> /save,
