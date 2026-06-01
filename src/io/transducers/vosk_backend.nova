@@ -1,0 +1,515 @@
+// CrossEngin io/transducers: Vosk offline STT backend (R10B).
+//
+// Purpose
+//   The FOURTH leg of the speech-to-text seam (`stt_seam.nova`). R7F's
+//   seam already exposes stub + subprocess; R8B added the native
+//   whisper.cpp backend; R10B adds Vosk as an OFFLINE-FIRST alternative
+//   for hosts where whisper.cpp isn't installed.
+//
+//   Vosk (https://alphacephei.com/vosk/) is a pure-C streaming STT
+//   engine built on Kaldi, distributed as a PyPI wheel + downloadable
+//   Kaldi-format model packs. The "small" English model is ~50 MB,
+//   runs comfortably on a single CPU core in real-time, and has no
+//   GPU/network requirements. CrossEngin's "no-LLM, no-GPU, no-FFI"
+//   constraint puts it squarely in scope -- the pure-Python wrapper
+//   is just a wrapper around libvosk.so + a small JSON-emitting shim.
+//
+//   The contract (matching `whisper_backend.nova` shape):
+//     `vosk_transcribe(bin_path, model_path, wav_path) ->
+//          [text, confidence_milli, error_msg]`
+//
+//   Vosk's JSON output (per `KaldiRecognizer.Result()`) includes a
+//   `conf` field per word recognised. We accumulate the per-word
+//   confidence + average for an utterance-level milli value. Empirical
+//   range on clean studio audio (the bundled JFK sample) is ~0.95-0.98
+//   -> 950-980 milli; noisy field audio drops to ~0.4-0.7 -> 400-700.
+//
+//   Errors surfaced:
+//     * "binary not found"  -- python3 missing from $PATH (extremely
+//                              rare on a system with NOVA installed).
+//     * "model not found"   -- model_path does not point at a Vosk
+//                              model directory.
+//     * "wav not found"     -- wav_path does not exist.
+//     * "wav not mono16"    -- wav has wrong channels / sample width.
+//     * "vosk not installed"-- python3 lacks the `vosk` module.
+//     * "fork failed"       -- the kernel refused to clone.
+//     * "pipe2 failed"      -- pipe creation failed.
+//     * "exec failed"       -- exec_program returned (child exit 127).
+//     * "empty transcript"  -- Vosk returned no words.
+//
+//   The dispatch shape is parallel to whisper_backend.nova: fork +
+//   execve `python3 -c '<inline script>' <wav> <model>` with stdout
+//   wired to a pipe, drain, parse "OK <milli> <text>" or "ERR <msg>".
+//   Vosk's wheel ships with a vosk-transcriber CLI, but the inline
+//   Python is cleaner: it lets us emit our exact OK/ERR contract
+//   without depending on the CLI's argv layout (which has drifted
+//   across Vosk releases) and without writing a separate shim.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- STT leg, second real
+//   backend; runs parallel to R8B's whisper.cpp leg).
+// NOVA dependencies: builtins -- alloc, store8, store64, load8, list_new,
+//   list_set, push, getenv, str_eq, char_at, substr, chr, fork_process,
+//   exec_program, waitpid, sys_open, sys_close.
+// CrossEngin dependencies: none (intentional -- leaf module, same shape
+//   as whisper_backend.nova).
+
+import "std/syscall"
+
+// ---- defaults / canonical install paths -----------------------------------
+//
+// The canonical install layout this module expects:
+//   /usr/local/bin/python3                         -- python3 interpreter.
+//   /usr/local/share/vosk/vosk-model-small-en-us-0.15
+//                                                  -- the small English
+//                                                     Vosk model (~50 MB).
+//
+// Operators can override via env: CE_VOSK_BIN, CE_VOSK_MODEL. The bin
+// path is the python3 interpreter; we don't ship a standalone vosk-cli
+// binary because the wheel doesn't install one consistently across
+// releases.
+
+let VOSK_DEFAULT_BIN   = "/usr/local/bin/python3"
+let VOSK_DEFAULT_MODEL = "/usr/local/share/vosk/vosk-model-small-en-us-0.15"
+
+// Confidence ballpark when JSON parsing succeeds but no per-word `conf`
+// values are present (older Vosk releases, or a model that doesn't
+// emit per-word data). We mirror whisper_backend.WHISPER_CONFIDENCE_DEFAULT
+// so cross-backend comparisons stay sane.
+let VOSK_CONFIDENCE_DEFAULT = 800
+
+// Cap on stdout bytes we'll read from the child. Vosk emits one line:
+// `OK <milli> <text>` or `ERR <msg>`. 64 KB is well above realistic.
+let _VOSK_MAX_OUT_BYTES = 65536
+
+// Syscall numbers -- duplicated locally so this module stays a leaf.
+let _VOSK_SYS_PIPE2 = 293
+let _VOSK_SYS_DUP2  = 33
+let _VOSK_SYS_CLOSE = 3
+let _VOSK_SYS_READ  = 0
+
+// ---- env resolvers --------------------------------------------------------
+
+fn vosk_resolve_bin() {
+    let env = getenv("CE_VOSK_BIN")
+    if env == 0 { return VOSK_DEFAULT_BIN }
+    if len(env) == 0 { return VOSK_DEFAULT_BIN }
+    return env
+}
+
+fn vosk_resolve_model() {
+    let env = getenv("CE_VOSK_MODEL")
+    if env == 0 { return VOSK_DEFAULT_MODEL }
+    if len(env) == 0 { return VOSK_DEFAULT_MODEL }
+    return env
+}
+
+// ---- file-existence probe -------------------------------------------------
+//
+// Same trick whisper_backend uses: sys_open + sys_close. We probe the
+// Vosk model by checking a known file inside the model directory
+// (`am/final.mdl`) -- a directory itself opens via O_RDONLY too, but
+// that doesn't distinguish "real model" from "any directory". The
+// final.mdl file is invariant across Vosk's small + large English
+// model layouts.
+
+fn _vosk_file_openable(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    sys_close(fd)
+    return 1
+}
+
+fn _vosk_model_openable(model_path) {
+    // Probe for <model>/am/final.mdl which is canonical across all
+    // Vosk models we care about. If model_path is empty or missing the
+    // sentinel file, return 0.
+    if len(model_path) == 0 { return 0 }
+    let probe = model_path + "/am/final.mdl"
+    return _vosk_file_openable(probe)
+}
+
+// vosk_backend_available(bin, model) -> 1 iff both the python3 binary
+// AND the Vosk model directory's sentinel file exist. Public so the
+// seam can auto-pick.
+fn vosk_backend_available(bin_path, model_path) {
+    if _vosk_file_openable(bin_path) == 0 { return 0 }
+    if _vosk_model_openable(model_path) == 0 { return 0 }
+    return 1
+}
+
+// ---- raw syscall shims ----------------------------------------------------
+
+fn _vosk_pipe2(pipefd_buf) {
+    asm {
+        "mov rax, 293"
+        "mov rdi, [rbp-8]"
+        "xor rsi, rsi"
+        "syscall"
+    }
+}
+
+fn _vosk_dup2(oldfd, newfd) {
+    asm {
+        "mov rax, 33"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "syscall"
+    }
+}
+
+fn _vosk_close(fd) {
+    asm {
+        "mov rax, 3"
+        "mov rdi, [rbp-8]"
+        "syscall"
+    }
+}
+
+fn _vosk_read(fd, buf, count) {
+    asm {
+        "mov rax, 0"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// Reassemble a little-endian u32 from a 4-byte buffer. Same shape as the
+// whisper_backend / stt_seam variants; copied locally for leaf-module
+// reasons.
+fn _vosk_load_le_u32(addr) {
+    let b0 = load8(addr)
+    let b1 = load8(addr + 1)
+    let b2 = load8(addr + 2)
+    let b3 = load8(addr + 3)
+    let lo = b0 + b1 * 256
+    let hi = b2 + b3 * 256
+    return lo + hi * 65536
+}
+
+// ---- inline Python script -------------------------------------------------
+//
+// The script ships as a literal NOVA string. We pass `wav_path` as argv[1]
+// and `model_path` as argv[2]. The script prints exactly one of:
+//   OK <milli> <text>
+//   ERR <msg>
+// on stdout, then exits 0 (OK) or 1 (ERR). Diagnostics from Vosk are
+// silenced via SetLogLevel(-1) so the OK/ERR line is the ONLY stdout.
+//
+// We deliberately keep the script SHORT: every byte is part of the argv
+// envelope, and the kernel's argv-size cap is finite. Total script length
+// stays well under 4 KB.
+
+fn _vosk_python_script() {
+    let s = "import sys,json,wave,os\n"
+    s = s + "from vosk import Model,KaldiRecognizer,SetLogLevel\n"
+    s = s + "SetLogLevel(-1)\n"
+    s = s + "wav_path=sys.argv[1]\n"
+    s = s + "model_path=sys.argv[2]\n"
+    s = s + "if not os.path.exists(wav_path):\n"
+    s = s + " print('ERR wav not found');sys.exit(1)\n"
+    s = s + "if not os.path.isdir(model_path):\n"
+    s = s + " print('ERR model not found');sys.exit(1)\n"
+    s = s + "try:\n"
+    s = s + " wf=wave.open(wav_path,'rb')\n"
+    s = s + "except Exception:\n"
+    s = s + " print('ERR wav parse failed');sys.exit(1)\n"
+    s = s + "if wf.getnchannels()!=1 or wf.getsampwidth()!=2:\n"
+    s = s + " print('ERR wav not mono16');sys.exit(1)\n"
+    s = s + "model=Model(model_path)\n"
+    s = s + "rec=KaldiRecognizer(model,wf.getframerate())\n"
+    s = s + "rec.SetWords(True)\n"
+    s = s + "parts=[];csum=0.0;cn=0\n"
+    s = s + "while True:\n"
+    s = s + " data=wf.readframes(4000)\n"
+    s = s + " if not data:break\n"
+    s = s + " if rec.AcceptWaveform(data):\n"
+    s = s + "  r=json.loads(rec.Result())\n"
+    s = s + "  if r.get('text'):parts.append(r['text'])\n"
+    s = s + "  for w in r.get('result',[]):csum+=w.get('conf',0);cn+=1\n"
+    s = s + "r=json.loads(rec.FinalResult())\n"
+    s = s + "if r.get('text'):parts.append(r['text'])\n"
+    s = s + "for w in r.get('result',[]):csum+=w.get('conf',0);cn+=1\n"
+    s = s + "avg=(csum/cn) if cn>0 else 0\n"
+    s = s + "text=' '.join(p for p in parts if p)\n"
+    s = s + "milli=int(max(0,min(1000,round(avg*1000))))\n"
+    s = s + "print('OK '+str(milli)+' '+text)\n"
+    return s
+}
+
+// ---- argv builder (5 + null) ----------------------------------------------
+//
+// We invoke python3 with exactly five argv entries plus a NULL terminator:
+//   [0] bin_path        (e.g. /usr/local/bin/python3)
+//   [1] "-c"            (run inline script)
+//   [2] script          (the inline body)
+//   [3] wav_path
+//   [4] model_path
+//   [5] NULL
+
+fn _vosk_argv6(a0, a1, a2, a3, a4) {
+    let p = alloc(6 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, a3)
+    store64(p + 32, a4)
+    store64(p + 40, 0)
+    return p
+}
+
+// ---- stdout drain ---------------------------------------------------------
+
+fn _vosk_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _vosk_drain_fd(fd, max_bytes) {
+    let acc = ""
+    let buf = alloc(4096)
+    let total = 0
+    let keep = 1
+    while keep == 1 {
+        let n = _vosk_read(fd, buf, 4096)
+        if n <= 0 {
+            keep = 0
+        } else {
+            acc = acc + _vosk_bytes_to_str(buf, n)
+            total = total + n
+            if total >= max_bytes { keep = 0 }
+        }
+    }
+    return acc
+}
+
+// ---- output parsing ------------------------------------------------------
+//
+// The Python script emits "OK <milli> <text>\n" or "ERR <msg>\n". On the
+// happy path the Vosk import + model load can also emit diagnostics
+// despite SetLogLevel(-1) (the C-level libvosk logs to stderr only --
+// we don't drain it, so it goes to the parent's stderr).
+//
+// If `python3` is missing OR the vosk module is missing, the script
+// never reaches its first print -- instead Python prints a traceback
+// to stderr (which we don't drain) and exits non-zero. We detect this
+// case by the absence of any "OK " or "ERR " line in stdout and map
+// to "vosk not installed".
+
+// _vosk_first_line(text) -- find the first newline-terminated line.
+fn _vosk_first_line(text) {
+    let n = len(text)
+    let i = 0
+    while i < n {
+        if char_at(text, i) == 10 { return substr(text, 0, i) }
+        i = i + 1
+    }
+    return text
+}
+
+// _vosk_starts_with(text, prefix) -- 1 if text starts with prefix.
+fn _vosk_starts_with(text, prefix) {
+    let tn = len(text)
+    let pn = len(prefix)
+    if tn < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(text, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// _vosk_parse_milli(line, start) -> [milli, end_offset] -- parse a decimal
+// integer at `line[start:]` and return its value + the offset of the
+// first non-digit character. Returns [-1, start] on parse failure.
+fn _vosk_parse_milli(line, start) {
+    let n = len(line)
+    let i = start
+    let v = 0
+    let found = 0
+    let keep = 1
+    while keep == 1 {
+        if i >= n {
+            keep = 0
+        } else {
+            let c = char_at(line, i)
+            if c >= 48 {
+                if c <= 57 {
+                    v = v * 10 + (c - 48)
+                    found = 1
+                    i = i + 1
+                } else { keep = 0 }
+            } else { keep = 0 }
+        }
+    }
+    let out = list_new()
+    if found == 0 {
+        push(out, -1)
+        push(out, start)
+        return out
+    }
+    if v > 1000 { v = 1000 }
+    push(out, v)
+    push(out, i)
+    return out
+}
+
+// Parse the OK / ERR contract from `line`.
+//   "OK <milli> <text>" -> [text, milli, ""]
+//   "ERR <msg>"          -> ["", 0, msg]
+//   anything else        -> ["", 0, "vosk not installed"]
+fn _vosk_parse_output(line) {
+    let r = list_new()
+    if _vosk_starts_with(line, "OK ") == 1 {
+        // Skip "OK ", parse milli, skip one space, rest is text.
+        let pair = _vosk_parse_milli(line, 3)
+        let milli = pair[0]
+        let after = pair[1]
+        if milli < 0 {
+            push(r, "")
+            push(r, 0)
+            push(r, "vosk not installed")
+            return r
+        }
+        let n = len(line)
+        let text_start = after
+        if text_start < n {
+            if char_at(line, text_start) == 32 { text_start = text_start + 1 }
+        }
+        let text = ""
+        if text_start < n { text = substr(line, text_start, n - text_start) }
+        push(r, text)
+        push(r, milli)
+        push(r, "")
+        return r
+    }
+    if _vosk_starts_with(line, "ERR ") == 1 {
+        let n = len(line)
+        let msg = ""
+        if n > 4 { msg = substr(line, 4, n - 4) }
+        push(r, "")
+        push(r, 0)
+        push(r, msg)
+        return r
+    }
+    // No recognisable prefix -> assume python or vosk import blew up.
+    push(r, "")
+    push(r, 0)
+    push(r, "vosk not installed")
+    return r
+}
+
+// vosk_parse_output(line) -- public so tests can exercise the parser
+// against canned fixtures without spawning python.
+fn vosk_parse_output(line) {
+    return _vosk_parse_output(line)
+}
+
+// ---- result helpers -------------------------------------------------------
+
+fn _vosk_result(text, conf, err) {
+    let r = list_new()
+    push(r, text)
+    push(r, conf)
+    push(r, err)
+    return r
+}
+
+fn vosk_result_transcript(r) { return r[0] }
+fn vosk_result_confidence(r) { return r[1] }
+fn vosk_result_error(r)      { return r[2] }
+
+// ---- public surface: vosk_transcribe --------------------------------------
+//
+// vosk_transcribe(bin_path, model_path, wav_path) ->
+//     [transcript, confidence_milli, error_msg]
+//
+// Spawns `<bin_path> -c <inline-script> <wav> <model>` via fork+execve
+// with stdout wired to a pipe. The inline Python script (see
+// `_vosk_python_script`) runs the Vosk recognizer, accumulates per-word
+// confidence, and prints "OK <milli> <text>" on success or "ERR <msg>"
+// on failure. Pre-flights existence checks so the caller gets precise
+// error codes rather than a generic "exec failed".
+
+fn vosk_transcribe(bin_path, model_path, wav_path) {
+    // Pre-flight: python interpreter must exist.
+    if _vosk_file_openable(bin_path) == 0 {
+        return _vosk_result("", 0, "binary not found")
+    }
+    // Model directory must contain the Kaldi acoustic-model file.
+    if _vosk_model_openable(model_path) == 0 {
+        return _vosk_result("", 0, "model not found")
+    }
+    if _vosk_file_openable(wav_path) == 0 {
+        return _vosk_result("", 0, "wav not found")
+    }
+
+    // pipe2 -> [read_fd, write_fd].
+    let pipefd_buf = alloc(8)
+    let pipe_rc = _vosk_pipe2(pipefd_buf)
+    if pipe_rc < 0 {
+        return _vosk_result("", 0, "pipe2 failed")
+    }
+    let read_fd  = _vosk_load_le_u32(pipefd_buf)
+    let write_fd = _vosk_load_le_u32(pipefd_buf + 4)
+
+    let script = _vosk_python_script()
+    let argv = _vosk_argv6(bin_path, "-c", script, wav_path, model_path)
+
+    let pid = fork_process()
+    if pid < 0 {
+        _vosk_close(read_fd)
+        _vosk_close(write_fd)
+        return _vosk_result("", 0, "fork failed")
+    }
+    if pid == 0 {
+        // CHILD: rewire stdout to the pipe, close both ends, exec.
+        // stderr stays connected to the parent's stderr so libvosk's
+        // C-level logs (and any Python traceback if the vosk module
+        // is missing) reach the operator.
+        _vosk_dup2(write_fd, 1)
+        _vosk_close(write_fd)
+        _vosk_close(read_fd)
+        exec_program(bin_path, argv)
+        exit(127)
+    }
+
+    // PARENT: close the write end, drain stdout, reap.
+    _vosk_close(write_fd)
+    let raw = _vosk_drain_fd(read_fd, _VOSK_MAX_OUT_BYTES)
+    _vosk_close(read_fd)
+    let status = waitpid(pid)
+
+    // First line is the contract; anything after is benign Vosk noise
+    // (the SetLogLevel(-1) call usually suppresses it but races with
+    // import are possible).
+    let line = _vosk_first_line(raw)
+    let parsed = _vosk_parse_output(line)
+    let text = vosk_result_transcript(parsed)
+    let conf = vosk_result_confidence(parsed)
+    let err  = vosk_result_error(parsed)
+    if len(err) > 0 {
+        return _vosk_result("", 0, err)
+    }
+    if len(text) == 0 {
+        return _vosk_result("", 0, "empty transcript")
+    }
+    return _vosk_result(text, conf, "")
+}
+
+// vosk_transcribe_default(wav_path) -- env-resolved convenience wrapper,
+// parallel to whisper_transcribe_default. The seam calls this from its
+// auto-dispatch path.
+fn vosk_transcribe_default(wav_path) {
+    let bin = vosk_resolve_bin()
+    let model = vosk_resolve_model()
+    return vosk_transcribe(bin, model, wav_path)
+}

@@ -69,6 +69,7 @@
 import "std/syscall"
 import "audio_capture.nova"
 import "whisper_backend.nova"
+import "vosk_backend.nova"
 
 // ---- backend identifiers --------------------------------------------------
 
@@ -78,6 +79,7 @@ let STT_BACKEND_STUB       = 1      // deterministic placeholder
 let STT_BACKEND_SUBPROCESS = 2      // shells out to scripts/transcribe.sh
 let STT_BACKEND_CUSTOM     = 3      // user-registered (tests, plugins)
 let STT_BACKEND_WHISPER    = 4      // R8B: native whisper.cpp dispatch
+let STT_BACKEND_VOSK       = 5      // R10B: native Vosk (python3 + libvosk)
 
 // Confidence sentinels. Backends are free to emit anywhere in [0..1000].
 let STT_CONFIDENCE_NONE     = 0
@@ -129,38 +131,48 @@ let STT_CALL_COUNT     = 8
 // stt_default_backend() reads CE_STT_BACKEND once and returns the
 // constant.
 //   * "whisper"    -> WHISPER       (R8B: native whisper.cpp dispatch)
+//   * "vosk"       -> VOSK          (R10B: native Vosk dispatch)
 //   * "subprocess" -> SUBPROCESS    (legacy scripts/transcribe.sh shim)
 //   * "stub"       -> STUB          (deterministic placeholder)
-//   * unset        -> auto-pick     (whisper if bin+model present, else
-//                                    stub -- never SUBPROCESS unless the
-//                                    operator explicitly asks for it,
-//                                    since the shim is slower than the
-//                                    native dispatch by a fork+exec hop)
+//   * unset        -> auto-pick     (whisper > vosk > stub -- never
+//                                    SUBPROCESS unless the operator
+//                                    explicitly asks for it, since the
+//                                    shim is slower than the native
+//                                    dispatch by a fork+exec hop)
 //   * anything else -> STUB (defensive default; we never silently load
 //                                    an unknown plugin).
 //
 // The auto-pick is conservative: we DO NOT scan the env for whisper bin
 // / model overrides here -- that's `whisper_resolve_*`'s job; we just
 // ask "can the whisper backend run with whatever paths it resolves?"
-// and trust the answer.
+// and trust the answer. Same shape for vosk.
 fn stt_default_backend() {
     let env = getenv("CE_STT_BACKEND")
     if env == 0 { return _stt_autopick_backend() }
     if len(env) == 0 { return _stt_autopick_backend() }
     if str_eq(env, "whisper") == 1 { return STT_BACKEND_WHISPER }
+    if str_eq(env, "vosk") == 1 { return STT_BACKEND_VOSK }
     if str_eq(env, "subprocess") == 1 { return STT_BACKEND_SUBPROCESS }
     if str_eq(env, "stub") == 1 { return STT_BACKEND_STUB }
     return STT_BACKEND_STUB
 }
 
-// _stt_autopick_backend() -- env unset: prefer whisper if installed,
-// fall back to stub (NEVER subprocess; that's a legacy shim path that
-// requires explicit opt-in via CE_STT_BACKEND=subprocess).
+// _stt_autopick_backend() -- env unset: prefer whisper > vosk > stub.
+// We NEVER pick subprocess here; that's a legacy shim path that requires
+// explicit opt-in via CE_STT_BACKEND=subprocess. The whisper > vosk
+// ordering reflects whisper's higher accuracy on the bundled tiny.en
+// vs Vosk's small-en model on clean studio audio; for noisy / accented
+// audio the operator can flip with CE_STT_BACKEND=vosk.
 fn _stt_autopick_backend() {
-    let bin   = whisper_resolve_bin()
-    let model = whisper_resolve_model()
-    if whisper_backend_available(bin, model) == 1 {
+    let wbin   = whisper_resolve_bin()
+    let wmodel = whisper_resolve_model()
+    if whisper_backend_available(wbin, wmodel) == 1 {
         return STT_BACKEND_WHISPER
+    }
+    let vbin   = vosk_resolve_bin()
+    let vmodel = vosk_resolve_model()
+    if vosk_backend_available(vbin, vmodel) == 1 {
+        return STT_BACKEND_VOSK
     }
     return STT_BACKEND_STUB
 }
@@ -181,9 +193,11 @@ fn stt_seam_new() {
     // Pre-register the built-in backends so stt_seam_backend_name()
     // returns a sensible string even before the first transcribe call.
     // R8B: "whisper" joins "stub" + "subprocess" as a first-class entry.
+    // R10B: "vosk" joins as the offline-first alternative.
     _stt_register_builtin(s, "stub",       STT_BACKEND_STUB)
     _stt_register_builtin(s, "subprocess", STT_BACKEND_SUBPROCESS)
     _stt_register_builtin(s, "whisper",    STT_BACKEND_WHISPER)
+    _stt_register_builtin(s, "vosk",       STT_BACKEND_VOSK)
     return s
 }
 
@@ -206,6 +220,17 @@ fn stt_seam_new_whisper(model_path) {
     // happens at dispatch time via `whisper_resolve_model()` reading
     // CE_WHISPER_MODEL. We expose the param for parity with future
     // backends that want a per-seam binding.
+    return s
+}
+
+// stt_seam_new_vosk(model_path) -- R10B convenience constructor that
+// builds a seam pre-pointed at the Vosk backend with `model_path`
+// pinned via env. Same shape as stt_seam_new_whisper. The `model_path`
+// param is informational -- actual resolution happens at dispatch
+// time via `vosk_resolve_model()` reading CE_VOSK_MODEL.
+fn stt_seam_new_vosk(model_path) {
+    let s = stt_seam_new()
+    stt_seam_set_default(s, STT_BACKEND_VOSK)
     return s
 }
 
@@ -591,15 +616,20 @@ fn stt_transcribe_wav(s, wav_path) {
     if id == STT_BACKEND_WHISPER {
         return _stt_backend_whisper(s, wav_path)
     }
+    if id == STT_BACKEND_VOSK {
+        return _stt_backend_vosk(s, wav_path)
+    }
     // STT_BACKEND_STUB or anything else.
     return _stt_backend_stub(s, wav_path)
 }
 
-// ---- whisper backend (R8B) -----------------------------------------------
+// ---- whisper backend (R8B; R10B confidence upgrade) ---------------------
 //
 // _stt_backend_whisper(seam, wav_path) -- calls into
-// `whisper_backend.whisper_transcribe_default` which spawns the
-// installed whisper-cli on `wav_path` and returns the parsed transcript.
+// `whisper_backend.whisper_transcribe_with_confidence_default` which
+// spawns the installed whisper-cli with `-ojf` so we get per-token
+// probabilities in a JSON file alongside the transcript, then parses
+// that file to derive a real per-utterance confidence.
 //
 // On success the seam mirrors the transcript + confidence into its
 // `last_*` fields and reports `error=""`. On any failure (binary
@@ -607,9 +637,14 @@ fn stt_transcribe_wav(s, wav_path) {
 // placeholder in the transcript slot but PRESERVES the precise error
 // string so the chat layer can show the operator a meaningful failure
 // reason ("model not found" rather than just "[stt unavailable]").
+//
+// R10B note: the confidence-aware path falls back to the WHISPER_CONFIDENCE_
+// DEFAULT (800) milli internally if the JSON parse fails, so older
+// whisper-cli releases that don't support `-ojf` still get a sensible
+// number -- the API contract did not change.
 
 fn _stt_backend_whisper(s, wav_path) {
-    let r = whisper_transcribe_default(wav_path)
+    let r = whisper_transcribe_with_confidence_default(wav_path)
     let text = whisper_result_transcript(r)
     let conf = whisper_result_confidence(r)
     let err  = whisper_result_error(r)
@@ -617,6 +652,29 @@ fn _stt_backend_whisper(s, wav_path) {
         // Pass the error through so the chat can surface it. The
         // transcript slot carries the stub placeholder so any
         // downstream filter that watches for "[stt..." still trips.
+        return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE, err)
+    }
+    return _stt_result(s, text, conf, "")
+}
+
+// ---- vosk backend (R10B) -------------------------------------------------
+//
+// _stt_backend_vosk(seam, wav_path) -- calls into
+// `vosk_backend.vosk_transcribe_default` which spawns the installed
+// python3 with the inline Vosk script on `wav_path` and returns the
+// parsed transcript + per-word-confidence average.
+//
+// Symmetric to _stt_backend_whisper -- same error-passthrough contract,
+// same last_* mirror semantics. On any failure the seam returns the
+// stub placeholder in the transcript slot but PRESERVES the precise
+// error string ("vosk not installed", "model not found", etc.).
+
+fn _stt_backend_vosk(s, wav_path) {
+    let r = vosk_transcribe_default(wav_path)
+    let text = vosk_result_transcript(r)
+    let conf = vosk_result_confidence(r)
+    let err  = vosk_result_error(r)
+    if len(err) > 0 {
         return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE, err)
     }
     return _stt_result(s, text, conf, "")

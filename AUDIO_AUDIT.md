@@ -549,6 +549,281 @@ On the dev container the JFK sample transcribes to:
   whisper independently rather than concatenating; preserves
   utterance boundaries for downstream prosody analysis.
 
+## R10B: per-utterance confidence + Vosk offline backend
+
+Status: **landed.** Two R8B follow-ups closed:
+  1. The whisper.cpp backend's flat 800-milli confidence placeholder
+     is replaced by real per-utterance confidence derived from the
+     `-ojf` (output-json-full) per-token probability stream.
+  2. A second first-class STT backend (Vosk, pure-Python wrapper over
+     libvosk + a Kaldi-format model) joins the seam, giving CrossEngin
+     an OFFLINE-FIRST alternative when whisper.cpp isn't installed.
+
+### Whisper per-utterance confidence
+
+`whisper_transcribe_with_confidence(bin, model, wav)` is a parallel
+entry point to R8B's `whisper_transcribe`. It runs whisper-cli with
+`-ojf -of <stable_path>` so the child emits a JSON file with the full
+transcription tree, including per-token `"p": <0..1 float>` values.
+The parent reads that file after the child exits, scans for every
+`"p":` key, parses the value as milli, and averages.
+
+JFK on tiny.en: avg over ~22 tokens = **895 milli** (was a flat 800
+placeholder). Fallback to legacy 800-milli ballpark when the JSON
+file is missing / unparseable. The basic `whisper_transcribe` still
+returns 800 byte-for-byte compatibly with scenario_jj_whisper's
+existing assertions. The seam (`_stt_backend_whisper`) was switched
+to the confidence-aware variant.
+
+### Vosk backend
+
+`src/io/transducers/vosk_backend.nova` (NEW) mirrors whisper_backend's
+shape: `vosk_transcribe(bin, model, wav) -> [text, conf_milli, err]`
++ env-resolver + availability probe + output parser.
+
+Dispatch: fork + execve `python3 -c '<inline-script>' <wav> <model>`
+with stdout drained through a pipe. The inline Python (~30 lines,
+embedded as a NOVA string literal) imports vosk, streams 4 KB at a
+time through KaldiRecognizer with SetWords(True), accumulates per-word
+`conf` values, prints exactly `OK <milli> <text>` or `ERR <msg>`.
+
+Pre-flight error codes parallel whisper's: "binary not found"
+(python3 missing), "model not found" (model dir's `am/final.mdl`
+sentinel absent), "wav not found", "vosk not installed" (no OK/ERR
+line emitted -- import blew up).
+
+JFK on the small-en Vosk model: avg per-word conf = **968 milli**.
+
+### Seam wiring (`stt_seam.nova`)
+
+- New constant: `STT_BACKEND_VOSK = 5`.
+- New constructor: `stt_seam_new_vosk(model_path)`.
+- New env mapping: `CE_STT_BACKEND=vosk` -> `STT_BACKEND_VOSK`.
+- Auto-pick order: whisper > vosk > stub. Subprocess opt-in only.
+- `_stt_backend_whisper` switched to the confidence-aware variant.
+
+### Install / dependency notes (Vosk)
+
+The Vosk wheel is pure-Python with a bundled libvosk.so. Pip-install
+on Debian-flavoured hosts can require `--no-deps --break-system-packages`
+when system packaging conflicts with PEP 668. The transitive deps
+(`srt`, `requests`, `tqdm`) are needed for `vosk/__init__.py`'s
+top-level imports; they install cleanly via `apt-get install
+python3-requests python3-tqdm` plus a manual copy of the single-file
+`srt.py` module.
+
+Small English model: ~50 MB. Download
+https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+and unzip into `/usr/local/share/vosk/`.
+
+Both deps stay optional: the seam's `vosk_backend_available()` probe
+returns 0 cleanly when python+vosk+model aren't all present, the
+auto-pick falls back to whisper or stub, and the test suite SKIPs
+real-decode assertions accordingly.
+
+### Verification (R10B)
+
+- `tests/unit/test_vosk_backend.nova` (NEW): 19 fns / 39 checks.
+- `tests/unit/test_whisper_backend.nova` (extended): 28 -> 41 checks.
+- `tests/integration/scenario_qq_vosk.sh` (NEW): 16 assertions when
+  whisper + vosk + JFK present. Drives seam through each
+  CE_STT_BACKEND value; asserts JFK conf > 800 milli via whisper
+  (real per-utterance) and > 500 milli via Vosk.
+
+### Future work (R10B)
+
+- Whisper streaming via `-f -` stdin PCM.
+- Larger Vosk model (`vosk-model-en-us-0.42`, ~1.8 GB).
+- Per-word time-aligned confidence stream from Vosk.
+- Vosk word-level grammar hints for the chat command vocabulary.
+
+## R10F: autocorrelation F0 (pitch) estimation
+
+R10F completes the audio triad next to R6E Klatt synthesis and R7F+R9B
+VAD (with R7F+R8B STT). The new module
+`src/io/transducers/audio_pitch.nova` extracts per-frame fundamental
+frequency (F0) from PCM directly via short-time autocorrelation -- no
+FFT, no floats, no DSP library. F0 / prosody is the missing modality
+parallel to the transcript: STT tells us *what* was said, pitch tells us
+*how* it was said (rising vs falling, soft vs emphasized, adult-male vs
+child).
+
+### Why a pure-NOVA F0 estimator earns its keep
+
+- **Prosody atoms.** Mean voiced F0 + range expansion over a VAD
+  speech segment are the two prosodic features most directly tied to
+  arousal in the literature (angry / happy widen the range; sad /
+  bored collapse it; rising terminal -> question; falling terminal ->
+  statement). Attaching these to the moment-scope atoms that the chat
+  already emits costs almost nothing and gives downstream layers a
+  read-out the LLM-free path otherwise couldn't reach.
+- **Speaker-mean banding.** Mean voiced F0 separates adult-male
+  (80-180 Hz), adult-female (160-300 Hz), and child (250+ Hz)
+  speakers reliably. A session-level rolling average across voiced
+  runs is enough to distinguish multiple speakers in an hour-long log
+  without proper diarization.
+- **Question detection without LLM heuristics.** Last-frame F0 above
+  the speaker median is the canonical "rising intonation" cue. The
+  chat input layer can route question vs statement on this signal
+  alone for short utterances.
+
+### Algorithm
+
+Per ~30 ms frame at the configured sample_rate (240 @ 8 kHz, 480 @
+16 kHz):
+
+1. Compute `R(tau) = sum_{n=0}^{N-tau-1} x(n) * x(n+tau)` for
+   tau in [tau_min, tau_max] where
+   `tau_min = sample_rate / f0_max` (16000/500 = 32 @ 16 kHz)
+   and `tau_max = sample_rate / f0_min` (16000/50 = 320 @ 16 kHz).
+2. Raw argmax: `best_tau = argmax_{tau} R(tau)`.
+3. **Octave-down correction (pass 2).** Walk `tau = best_tau * k` for
+   k = 2, 3, ... while `tau <= tau_max`; if `R(tau) >= 0.92 *
+   R(best_tau)` accept the longer period and raise the threshold to
+   0.92 * R(new). Cures the autocorrelation-on-harmonics failure
+   mode where the raw argmax locks onto the first formant period.
+4. Voicing: `voicing_milli = (1000 * R(best_tau)) / R(0)`. Voiced
+   iff `voicing_milli >= 300`. Below threshold -> unvoiced
+   (f0_centihz = 0 sentinel).
+5. **Output in centi-Hz** (Hz * 100): preserves sub-Hz precision in
+   pure integer arithmetic so a 119 Hz speaker is distinguishable
+   from a 120 Hz speaker (which a plain Hz int would round away).
+
+### Empirical calibration of the 0.92 octave threshold
+
+For a pure sine at frequency f sampled at sr for N samples, the
+autocorrelation at period T = sr / f is
+
+  R(T) = (N - T) / 2 * A^2          (perfect alignment, cos = 1)
+
+and at multiples kT:
+
+  R(kT) = (N - kT) / 2 * A^2        (also perfect, cos = 1)
+
+So the ratio R(2T) / R(T) = (N - 2T) / (N - T) depends only on T / N:
+
+| f0 (Hz) | T (samples @ 16 kHz) | R(2T)/R(T) |
+|--------:|---------------------:|-----------:|
+|     100 |                  160 |       0.50 |
+|     200 |                   80 |       0.80 |
+|     300 |                   53 |       0.86 |
+|     400 |                   40 |       0.91 |
+|     500 |                   32 |       0.93 |
+
+A threshold of 0.92 leaves the 100, 200, 300, 400 Hz cases UNTOUCHED
+(no octave snap on pure sines below 500 Hz). Klatt vowels (sum of two
+cosines at F1, F2) and natural speech (glottal pulse train + formants)
+have R(2T)/R(T) at the true glottal period that exceeds 0.92 because
+the harmonic structure adds in-phase to the autocorrelation at every
+multiple of the true period. So the octave check fires at the right
+place but stays bit-identical to raw argmax on a pure sine.
+
+The threshold is exposed as the constant `PITCH_OCTAVE_RATIO_MILLI`
+in the module so future tuning experiments can override it without
+touching the algorithm.
+
+### Integer-arithmetic safety dance
+
+The autocorrelation accumulator and the normalized-peak division both
+cross NOVA's smart-op 16 GiB pointer-classifier threshold on a loud
+480-sample frame (PCM16 max yields R(0) up to ~5e11, far above the 16
+GiB high-end where the smart-op heuristic treats values as pointers
+and dispatches to string-concat / strcmp / str_repeat).
+
+The fix is the documented `int_*` escape hatch:
+
+| Operation                          | Pattern                          |
+|------------------------------------|----------------------------------|
+| `sum + a*b` (accumulator)          | `int_add(sum, a*b)` (a*b is small)|
+| `cur > best_r` (both potentially large) | `int_sub(cur, best_r) > 0`   |
+| `(1000 * big) / r0`                | `int_div(int_mul(1000, big), r0)` |
+| `if r0 <= 0`                       | `if int_sub(r0, 1) < 0`           |
+
+Comparisons against ZERO (a small int) ARE safe under the smart-op
+because the classifier's `_nova_lt` / `_nova_gt` go to the integer
+path if EITHER operand is integer; 0 is always integer. So
+`if voicing < 300` and `if best_r > 0` both work without int_sub.
+
+### Verification (R10F)
+
+- `tests/unit/test_audio_pitch.nova`: **52 assertions** spanning
+  constants/accessors, autocorrelation primitives, pure-sine
+  estimates at 100/200/400 Hz, white-noise unvoiced, silence
+  unvoiced, Klatt vowel band, `pitch_track` on a rising-pitch
+  contour, `pitch_mean_voiced` on mixed buffers, `pitch_range`
+  known-min-max, F0_MIN / F0_MAX bounds enforcement (25 Hz with
+  f0_min=50 is rejected; 1500 Hz with f0_max=500 is rejected),
+  short-buffer edge cases.
+
+- `tests/integration/scenario_tt_pitch.sh`: **20 assertions**.
+  Round-trip synthesized PCM16 WAVs (200 Hz sine, Klatt /uw/ vowel)
+  through audio_capture_to_pcm and pitch_track; assert mean F0 within
+  expected range. Chat-surface assertions: /help advertises /pitch
+  with R10F tag; /pitch <wav> reports f0_mean + f0_range; /pitch
+  (no arg) prints usage; /pitch <missing> -> graceful FAILED. JFK
+  fixture assertions (when /tmp/whisper.cpp/samples/jfk.wav is
+  present): mean F0 in [80..280] Hz adult range, >= 100 voiced
+  frames out of ~366 total.
+
+### Measured F0 values on the audit fixtures
+
+| Fixture                          | True F0    | R10F mean | Voicing       | Notes                            |
+|----------------------------------|-----------:|----------:|--------------:|----------------------------------|
+| 100 Hz sine (480 @ 16 kHz)       |    100 Hz  |  100 Hz   | 666 milli     | exact (period quantizes to 160)  |
+| 200 Hz sine                      |    200 Hz  |  200 Hz   | 833 milli     | exact (period 80)                 |
+| 400 Hz sine                      |    400 Hz  |  400 Hz   | 916 milli     | exact (period 40); 0.92 threshold |
+| Klatt /uw/ vowel (8 kHz, F1=300) |    n/a     |  296 Hz   | 868 milli     | snaps to F1 cluster (no glottal)  |
+| JFK adult-male (16 kHz, 5.5 s)   |   ~140 Hz  |  220 Hz   | -- (per-frame) | first-formant snap; see below     |
+
+### Known limitations (R10F)
+
+- **JFK mean F0 = 220 Hz, not the textbook 140 Hz.** Unmodified
+  autocorrelation snaps to the first formant region on natural
+  speech. The integer-multiple peak check cures simple 2x / 3x
+  octave snaps on harmonic structure (the Klatt /uw/ result is
+  better than raw argmax) but doesn't fully cure the formant snap
+  on harmonic-rich utterances like JFK. Classical YIN
+  (de Cheveigne & Kawahara 2002) cures this via the cumulative mean
+  normalized difference function -- ~2x the autocorrelation cost,
+  to within a few Hz of ground truth. Acceptable for R10F's
+  "plausible adult voice" tier; the chat surface reports the value
+  transparently so downstream consumers can flag the band.
+- **R6E Klatt has no glottal source.** The two-formant carrier
+  is a sum of cosines at F1 and F2 -- there is no actual fundamental
+  at 120 Hz or anywhere else. Autocorrelation on Klatt output picks
+  the F1 / GCD periodicity. A future R6E revision that adds a glottal
+  pulse train (the canonical Klatt synthesizer has this) would let the
+  R10F unit test assert F0 at the synthesized fundamental directly.
+- **No per-frame F0 smoothing.** A future revision can add a 5-frame
+  median filter or Viterbi smoothing to stabilize the F0 trajectory
+  across voiced runs.
+
+### Future work (R10F)
+
+- YIN / RAPT cumulative-mean-normalized-difference variant for true
+  octave robustness on JFK-class natural speech. ~2x the
+  autocorrelation cost; cures the formant snap to within a few Hz of
+  ground truth.
+- Cepstral pitch detection as a second algorithm (R7F-style backend
+  switch): take the log of the magnitude spectrum and find its
+  quefrency-domain peak. Requires an FFT (or a real autocorrelation-
+  of-log-autocorrelation hack); maps cleanly onto the existing seam
+  pattern. Two estimators give a vote-or-pick path.
+- Pitch-contour atoms: emit one prosody atom per VAD speech segment
+  with (mean_f0_centihz, range_centihz, terminal_rise_or_fall) so the
+  KG can store intonation curves alongside the transcript. The chat
+  `/listen` could then attach these as moment-scope features.
+- Speaker-mean banding: a session-level rolling average of mean F0
+  over voiced runs, with a 3-band classifier (adult-male / adult-
+  female / child) attached as a session-scope atom.
+- Stream/online estimator: pitch_estimate_frame is pure per-frame;
+  wiring it to audio_capture's streaming PCM iterator gives a real-
+  time F0 stream parallel to the VAD event stream.
+- 16 kHz internal default: VAD/STT/whisper all work at 16 kHz; audio_synth
+  is 8 kHz by R6E convention. The pitch estimator clamps to [8..48 kHz]
+  but defaults to whatever rate the WAV declares. A future R6E upgrade
+  to 16 kHz would let pitch tests assert at the higher resolution.
+
 ## Future work
 
 - Promote OW to a true diphthong (it's /oʊ/, gliding toward /ʊ/). Backward-

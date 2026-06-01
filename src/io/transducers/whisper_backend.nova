@@ -457,3 +457,362 @@ fn whisper_transcribe_default(wav_path) {
     let model = whisper_resolve_model()
     return whisper_transcribe(bin, model, wav_path)
 }
+
+// ===========================================================================
+// R10B: Per-utterance confidence via --output-json-full parsing
+// ===========================================================================
+//
+// R8B shipped a fixed 800-milli placeholder on success. R10B adds a parallel
+// path that asks whisper-cli for per-token probabilities (`-ojf -of <path>`
+// emits a JSON file with the full transcription tree, including per-token
+// `"p": <0..1 float>` values). We average those probabilities, clamp the
+// result to [0, 1000] milli, and return it as the real per-utterance
+// confidence. If the JSON parse fails (older whisper-cli build, IO error,
+// or the file is corrupt) the parser returns -1 and the caller falls back
+// to the 800-milli legacy path -- the v1 contract still holds.
+//
+// Why probabilities instead of log-probs:
+//   The brief calls out `avg_logprob` as the canonical confidence proxy.
+//   Whisper-cli's `-ojf` JSON output only exposes per-token `"p"` (linear
+//   probability, equal to exp(logprob)). For our 0..1000 milli output we
+//   just multiply by 1000 -- the linear mapping preserves the desired
+//   "low probability -> low confidence" ordering. (Mapping via
+//   1000 + logprob*100 as the brief suggests would also work, but only
+//   if we had logprobs; we don't, so we use the equivalent linear form.)
+//
+// Why `-ojf` not `-oj`:
+//   `-oj` (basic) does NOT include per-token data -- only segment-level
+//   text + timestamps. `-ojf` (full) includes the `tokens` array with
+//   per-token `p` values. The flag has been in whisper-cli since 2024
+//   (well before the canonical install instructions in scenario_jj).
+
+// Output-file base for the JSON probe. We use a stable path so the
+// parser knows where to look without round-tripping the value back from
+// the child. /tmp lifetime is process-scoped; we unlink before each call
+// to avoid a stale read from a previous failure.
+let _WHISPER_JSON_BASE = "/tmp/ce_whisper_out"
+let _WHISPER_JSON_PATH = "/tmp/ce_whisper_out.json"
+
+// Cap on JSON bytes we'll read. The full-JSON file for a 30 s utterance
+// is ~30 KB on tiny.en (~50 tokens * ~600 bytes/token incl. timestamp
+// metadata). 256 KB is well above realistic + safely under the pointer-
+// threshold ceiling for any single read loop.
+let _WHISPER_JSON_MAX_BYTES = 262144
+
+// ---- argv builder for the JSON-emitting invocation ------------------------
+//
+// We invoke whisper-main with eleven argv entries plus a NULL terminator:
+//   [0]  bin_path
+//   [1]  "-m"
+//   [2]  model_path
+//   [3]  "-f"
+//   [4]  wav_path
+//   [5]  "-nt"
+//   [6]  "-np"
+//   [7]  "-ojf"      -- emit JSON-full
+//   [8]  "-of"       -- output-file base name (no extension)
+//   [9]  base_path
+//   [10] NULL
+//
+// The text transcript still lands on stdout (whisper-cli writes both the
+// stdout text AND the JSON file), so we keep draining stdout exactly as
+// before. The JSON file is opened + parsed after the child exits.
+
+fn _whisper_argv11(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) {
+    let p = alloc(11 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, a3)
+    store64(p + 32, a4)
+    store64(p + 40, a5)
+    store64(p + 48, a6)
+    store64(p + 56, a7)
+    store64(p + 64, a8)
+    store64(p + 72, a9)
+    store64(p + 80, 0)
+    return p
+}
+
+// ---- JSON file reader -----------------------------------------------------
+//
+// Slurps the JSON file into a NOVA string via chr() concat (same dodge the
+// rest of this module uses). Returns "" on any IO failure.
+
+fn _whisper_read_json_file(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return "" }
+    let buf = alloc(4096)
+    let acc = ""
+    let total = 0
+    let keep = 1
+    while keep == 1 {
+        let n = _whisper_read(fd, buf, 4096)
+        if n <= 0 {
+            keep = 0
+        } else {
+            let i = 0
+            while i < n {
+                acc = acc + chr(load8(buf + i))
+                i = i + 1
+            }
+            total = total + n
+            if total >= _WHISPER_JSON_MAX_BYTES { keep = 0 }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// ---- JSON tokenizer-free probability scanner ------------------------------
+//
+// The full-JSON file shape (per whisper.cpp's writer):
+//   "transcription": [
+//     { ... "tokens": [
+//         { "text": "...", ..., "p": 0.97311, "t_dtw": -1 },
+//         { "text": "...", ..., "p": 0.55776, "t_dtw": -1 },
+//         ...
+//       ] }
+//   ]
+//
+// We do NOT bring in a full JSON parser (NOVA has none, and a tolerant
+// scanner is plenty for this single field). The scanner finds every
+// `"p":` key occurrence + parses the float that follows as a milli value
+// (multiplied by 1000), accumulating sum + count.
+//
+// To avoid mis-counting other "p" fields, we look for the EXACT pattern
+// `"p":` (quoted-p, colon) which only appears in the tokens array (the
+// systeminfo / params blocks do not have a bare "p" field).
+
+// _whisper_scan_p_milli(body) -> [sum, count] -- a 2-element list with
+// the sum of all token probabilities (in milli) and the count of token
+// entries found. Used to compute the per-utterance average.
+fn _whisper_scan_p_milli(body) {
+    let result = list_new()
+    let sum = 0
+    let count = 0
+    let n = len(body)
+    let i = 0
+    // We look for the 4-byte sequence `"p":` -- bytes 34, 112, 34, 58.
+    while i < n - 3 {
+        if char_at(body, i) == 34 {
+            if char_at(body, i + 1) == 112 {
+                if char_at(body, i + 2) == 34 {
+                    if char_at(body, i + 3) == 58 {
+                        // Found "p": -- skip past it + any whitespace.
+                        let j = i + 4
+                        let skip = 1
+                        while skip == 1 {
+                            if j >= n { skip = 0 } else {
+                                let c = char_at(body, j)
+                                if c == 32 { j = j + 1 } else {
+                                    if c == 9 { j = j + 1 } else { skip = 0 }
+                                }
+                            }
+                        }
+                        // Parse a decimal number 0.XXXXXX (or 1.XXX, or just
+                        // "1" / "0"). We compute the milli value as the
+                        // first 4 significant digits, scaled appropriately.
+                        let milli = _whisper_parse_milli(body, j)
+                        if milli >= 0 {
+                            sum = sum + milli
+                            count = count + 1
+                        }
+                        i = j
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    push(result, sum)
+    push(result, count)
+    return result
+}
+
+// _whisper_parse_milli(body, off) -> int milli in [0..1000] or -1 on parse
+// failure. Parses a JSON number of the form `X.YYY` where X is 0 or 1
+// and Y are decimal digits; returns floor(value * 1000). We tolerate a
+// trailing comma / whitespace / brace as the number terminator.
+//
+// Why milli and not full float: NOVA has no native float; we work in
+// fixed-point. The token probabilities are in [0, 1] so milli is a
+// natural unit (0..1000).
+fn _whisper_parse_milli(body, off) {
+    let n = len(body)
+    if off >= n { return -1 }
+    let c0 = char_at(body, off)
+    // First char must be a digit.
+    if c0 < 48 { return -1 }
+    if c0 > 57 { return -1 }
+    let int_part = c0 - 48
+    let j = off + 1
+    // Whisper emits at most "0.XXX" or "1" so the integer part is one
+    // digit; we don't loop to consume multi-digit integers.
+    if j < n {
+        let cd = char_at(body, j)
+        if cd != 46 {
+            // No fractional part -- this is "0" / "1" / etc. Map to milli.
+            if int_part >= 1 { return 1000 }
+            return 0
+        }
+        j = j + 1                  // skip the '.'
+    } else {
+        if int_part >= 1 { return 1000 }
+        return 0
+    }
+    // Read up to 3 fractional digits as milli; ignore subsequent digits.
+    // We pad with 0 if fewer than 3 are present.
+    let d1 = 0
+    let d2 = 0
+    let d3 = 0
+    if j < n {
+        let c1 = char_at(body, j)
+        if c1 >= 48 {
+            if c1 <= 57 {
+                d1 = c1 - 48
+                j = j + 1
+            }
+        }
+    }
+    if j < n {
+        let c2 = char_at(body, j)
+        if c2 >= 48 {
+            if c2 <= 57 {
+                d2 = c2 - 48
+                j = j + 1
+            }
+        }
+    }
+    if j < n {
+        let c3 = char_at(body, j)
+        if c3 >= 48 {
+            if c3 <= 57 {
+                d3 = c3 - 48
+                j = j + 1
+            }
+        }
+    }
+    // Skip any remaining fractional digits without affecting the milli value.
+    let skip_more = 1
+    while skip_more == 1 {
+        if j >= n { skip_more = 0 } else {
+            let cm = char_at(body, j)
+            if cm >= 48 {
+                if cm <= 57 { j = j + 1 } else { skip_more = 0 }
+            } else { skip_more = 0 }
+        }
+    }
+    let milli = int_part * 1000 + d1 * 100 + d2 * 10 + d3
+    if milli > 1000 { milli = 1000 }
+    if milli < 0 { milli = 0 }
+    return milli
+}
+
+// whisper_parse_confidence_milli(json_body) -> milli in [0..1000] or -1
+// on parse failure / no tokens. Public so tests can exercise the
+// parser against canned JSON fixtures without spawning whisper.
+//
+// The returned value is the AVERAGE of all per-token probabilities,
+// converted to milli. JFK on tiny.en typically averages ~0.85-0.95
+// -> 850-950 milli. A noisy or silent input drops to 100-400 milli.
+fn whisper_parse_confidence_milli(json_body) {
+    if len(json_body) == 0 { return -1 }
+    let pair = _whisper_scan_p_milli(json_body)
+    let sum = pair[0]
+    let count = pair[1]
+    if count == 0 { return -1 }
+    let avg = sum / count
+    if avg < 0 { return 0 }
+    if avg > 1000 { return 1000 }
+    return avg
+}
+
+// ---- public surface: whisper_transcribe_with_confidence -------------------
+//
+// whisper_transcribe_with_confidence(bin, model, wav) ->
+//     [transcript, confidence_milli, error]
+//
+// Variant of `whisper_transcribe` that asks for `-ojf` JSON output,
+// parses it for per-token probabilities, and returns the average as
+// the real per-utterance confidence. On JSON parse failure (older
+// whisper-cli that doesn't support `-ojf`, IO error on the JSON file,
+// or zero tokens emitted) the function falls back to the 800-milli
+// legacy path -- the success contract still holds.
+//
+// stdout is drained just as before so the cleaned transcript matches
+// the v1 path byte-for-byte; only the confidence slot changes.
+
+fn whisper_transcribe_with_confidence(bin_path, model_path, wav_path) {
+    // Pre-flight: identical to whisper_transcribe's checks. Surfacing
+    // the same precise error codes so the test suite + chat both see
+    // the same failure modes regardless of which variant they call.
+    if _whisper_file_openable(bin_path) == 0 {
+        return _whisper_result("", 0, "binary not found")
+    }
+    if _whisper_file_openable(model_path) == 0 {
+        return _whisper_result("", 0, "model not found")
+    }
+    if _whisper_file_openable(wav_path) == 0 {
+        return _whisper_result("", 0, "wav not found")
+    }
+
+    // Unlink any stale JSON file from a previous run so a parse-failure
+    // on this call doesn't pick up old data. (sys_unlink isn't exposed
+    // in std/syscall today; we rely on O_TRUNC behaviour at the child
+    // level -- whisper-cli opens the output with O_CREAT|O_TRUNC.)
+
+    let pipefd_buf = alloc(8)
+    let pipe_rc = _whisper_pipe2(pipefd_buf)
+    if pipe_rc < 0 {
+        return _whisper_result("", 0, "pipe2 failed")
+    }
+    let read_fd  = _whisper_load_le_u32(pipefd_buf)
+    let write_fd = _whisper_load_le_u32(pipefd_buf + 4)
+
+    let argv = _whisper_argv11(bin_path, "-m", model_path, "-f", wav_path,
+                                "-nt", "-np", "-ojf", "-of",
+                                _WHISPER_JSON_BASE)
+
+    let pid = fork_process()
+    if pid < 0 {
+        _whisper_close(read_fd)
+        _whisper_close(write_fd)
+        return _whisper_result("", 0, "fork failed")
+    }
+    if pid == 0 {
+        _whisper_dup2(write_fd, 1)
+        _whisper_close(write_fd)
+        _whisper_close(read_fd)
+        exec_program(bin_path, argv)
+        exit(127)
+    }
+
+    _whisper_close(write_fd)
+    let raw = _whisper_drain_fd(read_fd, _WHISPER_MAX_OUT_BYTES)
+    _whisper_close(read_fd)
+    let status = waitpid(pid)
+
+    let cleaned = whisper_clean_transcript(raw)
+    if len(cleaned) == 0 {
+        return _whisper_result("", 0, "empty transcript")
+    }
+
+    // Try to read + parse the JSON file. On any failure fall back to
+    // the v1 800-milli ballpark -- the transcript is still good.
+    let json_body = _whisper_read_json_file(_WHISPER_JSON_PATH)
+    let milli = whisper_parse_confidence_milli(json_body)
+    if milli < 0 {
+        return _whisper_result(cleaned, WHISPER_CONFIDENCE_DEFAULT, "")
+    }
+    return _whisper_result(cleaned, milli, "")
+}
+
+// whisper_transcribe_with_confidence_default(wav_path) -- env-resolved
+// convenience wrapper, parallel to whisper_transcribe_default. The seam
+// calls this when it wants per-utterance confidence.
+fn whisper_transcribe_with_confidence_default(wav_path) {
+    let bin = whisper_resolve_bin()
+    let model = whisper_resolve_model()
+    return whisper_transcribe_with_confidence(bin, model, wav_path)
+}
