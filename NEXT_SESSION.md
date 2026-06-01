@@ -449,6 +449,47 @@ continue. It is updated at every session boundary.
     asserts coordinator sees `sum_promo = 200 = x_A + x_C` (the
     brief's expected behaviour, B excluded).
 - P3.9 pure-NOVA 256-bit bignum library (DH key-exchange prerequisite):
+  **complete (leaf primitive)**. Public surface: bn_new, bn_from_int,
+  bn_from_hex, bn_to_hex, bn_zero, bn_eq, bn_cmp, bn_add, bn_sub,
+  bn_mul, bn_mod, bn_modmul, bn_modpow, bn_modpow_ct (P3.9 follow-up
+  this session: Montgomery ladder; constant-time per bit -- DH/ECDH
+  private exponents no longer leak the Hamming weight via wall-clock
+  timing). 66 assertions in tests/unit/test_bignum.nova incl. textbook
+  2^10 mod 1000 = 24, Curve25519 2^255 mod (2^255-19) = 19 (verified
+  against BOTH bn_modpow AND bn_modpow_ct), 100-vector equivalence
+  sweep bn_modpow == bn_modpow_ct, and a timing-comparison report
+  (~1.88x ratio of ct to fast on the dev sandbox; analytic ~2x
+  bound). bn_modpow is now marked loudly as fast/SIDE-CHANNEL-UNSAFE/
+  offline self-tests only; bn_modpow_ct is the crypto-safe variant
+  consumers must use for any private exponent.
+- P3.9 SecAgg DH key agreement (v2-sa-dh): **complete (this
+  session)**. Replaces the pre-shared-token path with a real
+  Diffie-Hellman key agreement when the soul opts in via
+  CE_SECAGG_DH=1. Wire protocol: one new line FED_DH_PUBLIC
+  <soul_id> <pubkey_hex> (additive on v2-sa-r). Chat soul generates
+  a 256-bit DH keypair via sa_dh_generate_keys (uses bn_modpow_ct(g,
+  priv, p)), sends the public key to the coordinator during the
+  handshake, then receives every other soul'''s public key from the
+  coordinator'''s broadcast phase and registers them via
+  sa_register_peer_dh. The pairwise shared secret peer_pubkey ^
+  my_private mod p SEEDS the existing LCG mask derivation in place
+  of the pre-shared token, so by DH commutativity both sides of
+  each pair derive the SAME shared secret and thus the SAME mask --
+  the SecAgg cancellation invariant holds. Caveats called out
+  loudly in SECAGG_AUDIT.md: 256-bit DH prime is BROKEN against
+  modern adversaries; private key is nanotime+LCG weak random;
+  p_25519 is a field prime not a safe DH prime. The MVP
+  demonstrates the wire protocol + flow, not the cryptographic
+  strength. Coord additively extends _fed_accept_handshake_secagg
+  to drain optional FED_DH_PUBLIC during handshake + adds new
+  _fed_broadcast_dh_pubkeys phase. Chat adds exactly ONE
+  sa_dh_enabled_from_env() probe -- no new admin commands. Tests:
+  test_secure_aggregation 126 -> 157 (31 new DH assertions incl.
+  the CORE 2-soul DH pair-mask-equivalence smoke);
+  scenario_u_secagg 36 -> 41 (scenario U.dh, a real 2-soul chat
+  federation round-trip under CE_SECAGG_DH=1). Verified: make test
+  134/134 PASS; scenario U.dh passes all assertions.
+- P3.9 pure-NOVA 256-bit bignum library (DH key-exchange prerequisite):
   **complete (leaf primitive)**. The federated SecAgg MVP (P3.8) shipped
   pre-shared tokens because NOVA had no bignum. This session lands the
   smallest viable bignum library that unblocks the layered upgrades --
