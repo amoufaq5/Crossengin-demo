@@ -191,31 +191,42 @@ primitives already in tree:
 * SHA-256 (FIPS 180-4) — new pure-NOVA implementation in noise_xk.nova
   itself (~150 lines).
 * HMAC-SHA256 + HKDF (RFC 2104, RFC 5869) — built from SHA-256.
-* X25519-shape Diffie-Hellman — `c25519_*` surface wrapping
-  `bn_modpow_ct` from `src/safety/bignum.nova` against the field
-  prime p_25519 = 2^255 - 19 with generator g = 2. Wire layout is
-  X25519-compatible (32-byte little-endian pubkeys + scalars); real
-  ECDH on the curve is a drop-in replacement when Field 25519 lands.
+* 2048-bit Diffie-Hellman over RFC 7919 Group 14 (R7C upgrade) —
+  `bn2048_modpow_ct` from `src/safety/bignum_2048.nova` (Montgomery
+  REDC + constant-time Montgomery ladder) against the 2048-bit MODP
+  safe prime, generator g = 2. Wire layout is 256-byte little-endian
+  pubkeys + scalars. The R6C 256-bit field-prime DH (`bn_modpow_ct`
+  over `p_25519`) was below the RFC 7919 Group 1 floor and is retired;
+  this revision is the cryptographically-reasonable upgrade.
 * ChaCha20-Poly1305 AEAD — RFC 7539 construction over the existing
   `src/safety/chacha20.nova` + `poly1305.nova` leaves; bound to the
   Noise transcript hash on every message.
 * OS CSPRNG via `secure_random(buf, n)` (R5B builtin) for ephemeral
   key generation; nanotime+LCG fallback path documented as weaker.
 
-### Wire protocol v3
+### Wire protocol v3 (post-R7C 2048-bit widening)
 
 Three handshake messages (each preceded by a 4-byte BE length so framing
 is unambiguous before keys exist), then encrypted transport:
 
 ```
-  -> msg1 (48 B): e_pub (32) || tag(empty plaintext, k=HKDF(es)) (16)
-  <- msg2 (48 B): e_pub (32) || tag(empty plaintext, k=HKDF(es,ee)) (16)
-  -> msg3 (64 B): AEAD-encrypted s_pub (32+16) || tag(empty, k=HKDF(es,ee,se)) (16)
+  -> msg1 (272 B): e_pub (256) || tag(empty plaintext, k=HKDF(es)) (16)
+  <- msg2 (272 B): e_pub (256) || tag(empty plaintext, k=HKDF(es,ee)) (16)
+  -> msg3 (288 B): AEAD-encrypted s_pub (256+16) || tag(empty, k=HKDF(es,ee,se)) (16)
 
   transport: [4 B BE len] [ct] [16 B Poly1305 tag]
              nonce = [4 zero bytes || 8 B LE counter]
              counters monotonic, independent per direction
 ```
+
+The R6C 32-byte pubkeys widened to 256 bytes to carry the full 2048-bit
+Group 14 pubkey. Length-prefix framing (kg_sync v3 uses `[4 B BE len]
+[handshake msg]`) was already wire-size-agnostic so no kg_sync changes
+were required to accommodate the widening. The protocol-name binding
+folded into the initial session hash also changed from
+`"Noise_XK_25519_ChaChaPoly_SHA256"` to
+`"Noise_XK_RFC7919G14_ChaChaPoly_SHA256"` so a session set up under R6C
+cannot be confused with an R7C session by transcript replay.
 
 ### Mutual auth contract
 
@@ -240,43 +251,54 @@ the integration test).
 - `CE_KGSYNC_REQUIRE_NOISE=1`: the publisher refuses plaintext and
   every connection must complete the Noise XK handshake.
 
-### Performance
+### Performance (R7C 2048-bit DH)
 
-Curve25519-shape DH via `bn_modpow_ct` is the dominant cost: ~120 ms
-per scalar mult on the integration runner. Full XK handshake = 4 DH
-operations on the initiator side (es, ee, se) plus 3 on the responder
-(es, ee, se), plus SHA-256 + HKDF (negligible). Measured on the
-integration scenario: **~508 ms wall-clock end-to-end** for a fresh
-handshake, well under the 2-second budget. Real ECDH on Curve25519
-(with the X25519 ladder) drops this to ~5 ms when it lands.
+`bn2048_modpow_ct` over RFC 7919 Group 14 with Montgomery REDC (R5A
+kernel) costs ~1-4 s per modpow on the integration runner. Full XK
+handshake = 4 modpow ops on the initiator side (one ephemeral keygen +
+es, ee, se DH) plus 3 on the responder (one ephemeral keygen + es, ee,
+se DH; the responder also runs `nxk_responder_new` which does ONE
+modpow for its own static-keypair derivation that the initiator already
+did before calling `nxk_initiator_new`). The Group 14 Montgomery
+context is built ONCE (lazy module-level singleton in `_nxk_g14_ctx()`)
+and reused across every modpow in the process lifetime, amortizing the
+~hundreds-of-ms `_bn2048_compute_r2_mod_n` precompute. SHA-256 + HKDF
+are negligible against the modpow cost.
+
+End-to-end handshake target: **~5-15 s wall-clock** (vs. R6C's ~508 ms
+under the 256-bit DH path). Integration-test budget widened to 15s
+(scenario_gg_noise_kg.sh:HANDSHAKE_MS < 15000). The latency increase is
+the price of cryptographic strength: R6C's 256-bit DH was below the
+RFC 7919 Group 1 (768-bit) floor and breakable on commodity hardware;
+R7C's 2048-bit DH puts the discrete-log work factor at ~2^112 bits,
+comfortably out of reach.
 
 ### Verification
 
-- Unit (`tests/unit/test_noise_xk.nova`): **42 assertions** covering
+- Unit (`tests/unit/test_noise_xk.nova`): **~42 assertions** covering
   SHA-256 KAT (FIPS 180-4 "abc" + empty + 448-bit boundary),
-  HMAC-SHA256 KAT (RFC 4231 TC1), DH commutativity, keypair
-  generation, full handshake convergence (both sides agree on session
-  hash + transport keys), responder learns initiator pubkey,
-  transport round-trip both directions, tampered ciphertext +
-  tampered length-prefix rejected, replay rejected (nonce
-  monotonicity), MITM with wrong responder pubkey rejected at msg1.
+  HMAC-SHA256 KAT (RFC 4231 TC1), 2048-bit DH commutativity, keypair
+  generation (now 512-char hex), full handshake convergence (both
+  sides agree on session hash + transport keys; msg1/msg2 = 272 B,
+  msg3 = 288 B), responder learns initiator pubkey, transport
+  round-trip both directions, tampered ciphertext + tampered length-
+  prefix rejected, replay rejected (nonce monotonicity), MITM with
+  wrong responder pubkey rejected at msg1.
 - Integration (`tests/integration/scenario_gg_noise_kg.sh`): **12
   assertions** running two NOVA souls over a real TCP socket.
   Stage 1 proves a clean handshake + one encrypted KG delta decrypts
   at the far end; Stage 2 proves MITM with a wrong static priv is
-  rejected.
+  rejected. Timing budget widened from 2s (R6C) to 15s (R7C) to
+  accommodate the 2048-bit modpow cost.
 
 ### LOUD caveats
 
-- The DH is bignum-mod-prime, not real elliptic-curve scalar mult.
-  Wire layout matches X25519 so a future real-ECDH drop-in changes
-  only `c25519_*`; the noise XK state machine is unchanged.
-- 256-bit DH is below the 768-bit RFC 7919 Group 1 floor and is
-  breakable in tractable time on commodity hardware. The MVP
-  demonstrates the wire protocol + the mutual-auth contract, NOT
-  cryptographic strength against a serious adversary. The 2048-bit
-  SECAGG_AUDIT path (`bn2048_modpow_ct` + RFC 7919 Group 14, landed
-  in R5A) is the upgrade target.
+- The DH is bignum-mod-prime exponentiation over RFC 7919 Group 14,
+  NOT elliptic-curve. The 2048-bit MODP group is the smallest standard
+  DH group considered cryptographically reasonable in 2025; future
+  upgrades (3072 / 4096 bits) need only a constant swap inside
+  bignum_2048.nova + a wider BN_LIMBS, the noise XK state machine is
+  unchanged.
 - The fallback random path (when `secure_random` syscall returns -1)
   is a nanotime+LCG stretch and is NOT cryptographically secure;
   the production path is OS getrandom via the R5B builtin.

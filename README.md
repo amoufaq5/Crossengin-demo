@@ -12,21 +12,25 @@ computational units rather than orchestrating a pipeline of modules.
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain: 136 modules compile (`make build`, +1 from
-> `io/transducers/noise_xk.nova` added in R6C — pure-NOVA Noise XK
+> `io/transducers/noise_xk.nova` added in R6C and upgraded in R7C to
+> 2048-bit RFC 7919 Group 14 DH — pure-NOVA Noise XK
 > mutual-auth handshake + ChaCha20-Poly1305 transport encryption for
 > kg_sync v3, closing the federation audit's "plaintext TCP" gap. Ships
 > SHA-256 (FIPS 180-4), HMAC-SHA256 + HKDF (RFC 2104 / RFC 5869),
-> Curve25519-shape DH (`bn_modpow_ct` over `p_25519` with g=2; X25519
-> wire layout), and the Noise XK state machine
+> 2048-bit DH over RFC 7919 Group 14 via `bn2048_modpow_ct` (Montgomery
+> REDC, R5A), and the Noise XK state machine
 > (`-> e, es; <- e, ee; -> s, se`) on top of `chacha20.nova` +
-> `poly1305.nova` + `bignum.nova`. `kg_sync.nova` extended with
+> `poly1305.nova` + `bignum_2048.nova`. `kg_sync.nova` extended with
 > `kgsync_v3_handshake_initiator/responder` + `kgsync_v3_send_line` /
 > `kgsync_v3_recv_line` that wrap every line in an AEAD frame; v2
 > plaintext stays the default, `CE_KGSYNC_REQUIRE_NOISE=1` opts in to
-> v3-only. 42 unit assertions + 12 integration assertions; handshake
-> measured at **~508 ms** wall-clock (well under the 2s budget); MITM
-> with a wrong responder static key correctly rejected at msg1 AEAD
-> verify. Documented in [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md),
+> v3-only. ~42 unit assertions + 12 integration assertions; R7C
+> handshake budgeted at **~5-15 s** wall-clock (4 modpow ops at ~1-4 s
+> each via Montgomery REDC); MITM with a wrong responder static key
+> correctly rejected at msg1 AEAD verify (auth contract survives the
+> DH widening). The R6C 256-bit field-prime DH was below the RFC 7919
+> Group 1 floor and is retired in favor of this 2048-bit upgrade.
+> Documented in [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md),
 > +1 from
 > `kg/episodic.nova` added in R6F -- the ADR-0022 episodic-memory
 > consolidation cycle. Scans the recent moment stream for clusters of

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scenario GG -- Noise XK encrypted KG sync end-to-end (R6).
+# Scenario GG -- Noise XK encrypted KG sync end-to-end (R6, R7C 2048-bit DH).
 #
 # Federation gap closer. v2 of kg_sync ran in plaintext TCP; v3 wraps every
 # line in a Noise XK mutual-auth handshake + ChaCha20-Poly1305 transport.
@@ -7,6 +7,14 @@
 # NOVA responder driver that both `import` src/io/transducers/kg_sync.nova
 # and run the kgsync_v3_* surface directly (no chat/daemon involvement;
 # the goal is to validate the wire protocol).
+#
+# R7C swap (vs R6C): the DH primitive widened from 256-bit field-prime DH
+# to RFC 7919 Group 14 (2048-bit MODP safe prime) via bn2048_modpow_ct
+# (Montgomery REDC). Wire-level changes: pubkey 32B -> 256B, static
+# priv/pub hex 64 -> 512 chars. The auth contract + AEAD framing are
+# unchanged. Per R5A Montgomery REDC, each modpow costs ~1-4s; the four
+# handshake modpows on the initiator side give an end-to-end handshake
+# budget of ~5-15s. The pass/fail threshold below widens accordingly.
 #
 # Assertions:
 #   * Two souls (A = initiator, B = responder) with known static keys
@@ -20,8 +28,9 @@
 #     MixHash(rs) bound to a different key).
 #
 # KNOWN LIMITATIONS:
-#   * NOVA socket builtins are blocking; if either side hangs the 15s
-#     deadline trips and the script reports FAIL.
+#   * NOVA socket builtins are blocking; if either side hangs the 60s
+#     deadline trips and the script reports FAIL. (Widened from 15s for
+#     R7C to accommodate the four 1-4s bn2048_modpow_ct ops per side.)
 #   * If `socket(2,1,0)` returns -1 (sandbox denies AF_INET sockets
 #     entirely) the script prints SKIP and passes.
 
@@ -78,9 +87,14 @@ fi
 # Both sides hardcode their static priv hex strings in the driver source;
 # the initiator's `peer_pub` is derived from the responder's priv before
 # the test runs. We avoid env vars here to keep the driver minimal.
-INIT_PRIV="0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
-RESP_PRIV="0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
-WRONG_RESP_PRIV="0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+#
+# R7C: keys are 512 lowercase hex chars (the 2048-bit RFC 7919 Group 14
+# little-endian wire form). Each key is a single nibble repeated 512
+# times; the bn2048_modpow_ct math doesn't care about pattern, and the
+# repeating shape keeps the source readable.
+INIT_PRIV="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+RESP_PRIV="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+WRONG_RESP_PRIV="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 # ---- responder driver ---------------------------------------------------
 RESP_SRC="$DRV_DIR/resp.nova"
@@ -302,14 +316,17 @@ main()
 NOVA
 
 # ---- Stage 1: the happy path --------------------------------------------
+# R7C: responder takes ~1-3s to build the module-level Montgomery ctx +
+# generate its static keypair (one bn2048_modpow_ct) on first listen, so
+# sleep 3 instead of 1 before connecting to give it a head start.
 "$NOVA_BIN" run "$RESP_SRC" >"$RESP_OUT" 2>&1 &
 RESP_PID=$!
-sleep 1
+sleep 3
 "$NOVA_BIN" run "$INIT_SRC" >"$INIT_OUT" 2>&1
 INIT_RC=$?
 
 # Wait for the responder to drain.
-DEADLINE=15
+DEADLINE=60
 elapsed=0
 while [ "$elapsed" -lt "$DEADLINE" ] && kill -0 $RESP_PID 2>/dev/null; do
     sleep 1
@@ -329,28 +346,30 @@ assert_match "$RESP_TXT" "resp: handshake OK"   "responder reports handshake suc
 assert_match "$RESP_TXT" "resp: received plaintext='ATOM lang 7 1 800 200 widget'" \
              "responder decrypted KG delta to expected plaintext"
 
-# Cross-verify the responder LEARNED a 64-char hex initiator pubkey
-# (the literal mutual-auth contract). The exact value was derived inside
-# the test driver; we just assert it's a non-empty 64-char hex string,
-# which by construction equals the initiator's static pub.
+# Cross-verify the responder LEARNED a 512-char hex initiator pubkey
+# (the literal mutual-auth contract -- post-R7C 2048-bit DH widening).
+# The exact value was derived inside the test driver; we just assert
+# it's a non-empty 512-char hex string, which by construction equals the
+# initiator's static pub.
 RESP_PEER=$(echo "$RESP_TXT" | grep -oE 'learned init pubkey=[0-9a-f]+' | head -1 | sed 's/learned init pubkey=//')
 RESP_PEER_LEN=${#RESP_PEER}
-assert_eq "$RESP_PEER_LEN" "64" "responder learned 64-char-hex initiator pubkey (mutual auth)"
+assert_eq "$RESP_PEER_LEN" "512" "responder learned 512-char-hex initiator pubkey (mutual auth)"
 # Also verify the initiator's stored peer pubkey is non-empty (it should
 # equal the responder's static pub by construction).
 INIT_PEER=$(echo "$INIT_TXT" | grep -oE 'peer pubkey=[0-9a-f]+' | head -1 | sed 's/peer pubkey=//')
 INIT_PEER_LEN=${#INIT_PEER}
-assert_eq "$INIT_PEER_LEN" "64" "initiator knows 64-char-hex responder pubkey"
+assert_eq "$INIT_PEER_LEN" "512" "initiator knows 512-char-hex responder pubkey"
 
-# Extract the wall-clock handshake timing.
+# Extract the wall-clock handshake timing. R7C: budget widened to 15000ms
+# (15s) from R6C's 2000ms to accommodate four ~1-4s bn2048_modpow_ct ops.
 HANDSHAKE_MS=$(echo "$INIT_TXT" | grep -oE 'handshake OK in [0-9]+ ms' | grep -oE '[0-9]+' || echo "0")
 printf "  ${C_DIM}timing${C_RST}  Noise XK handshake: %s ms\n" "$HANDSHAKE_MS"
-if [ "$HANDSHAKE_MS" -lt 2000 ]; then
+if [ "$HANDSHAKE_MS" -lt 15000 ]; then
     PASS=$((PASS+1))
-    printf "  ${C_GRN}PASS${C_RST}  handshake under 2000ms budget\n"
+    printf "  ${C_GRN}PASS${C_RST}  handshake under 15000ms budget (R7C 2048-bit DH)\n"
 else
     FAIL=$((FAIL+1))
-    printf "  ${C_RED}FAIL${C_RST}  handshake exceeded 2000ms budget (got %s ms)\n" "$HANDSHAKE_MS"
+    printf "  ${C_RED}FAIL${C_RST}  handshake exceeded 15000ms budget (got %s ms)\n" "$HANDSHAKE_MS"
 fi
 
 # ---- Stage 2: MITM rejection -------------------------------------------
@@ -358,12 +377,12 @@ it_section "scenario GG stage 2: MITM with wrong responder pubkey"
 
 "$NOVA_BIN" run "$MITM_SRC" >"$MITM_OUT" 2>&1 &
 MITM_PID=$!
-sleep 1
+sleep 3
 MITM_INIT_OUT="/tmp/ce_int_gg_mitm_init.out"
 "$NOVA_BIN" run "$MITM_INIT_SRC" >"$MITM_INIT_OUT" 2>&1
 MITM_INIT_RC=$?
 
-DEADLINE=15
+DEADLINE=60
 elapsed=0
 while [ "$elapsed" -lt "$DEADLINE" ] && kill -0 $MITM_PID 2>/dev/null; do
     sleep 1
