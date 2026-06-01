@@ -11,7 +11,52 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 142 modules compile (`make build`, R10D adds
+> toolchain: 144 modules compile (`make build`, R10C adds
+> `src/kg/semantic_search.nova` — a purely textual TF-IDF +
+> integer-cosine ranker over atom labels. Closes the KG read story
+> alongside exact lookup (`atom_store.kg_find_atom`), episodic
+> retrieval (R6F + R8F `episodic_recall_*`), and embedding-cosine
+> nearest-neighbour (P3.4 `ann_query`). No neural embedding, no LLM
+> call -- deterministic counting math in milli-fixed-point
+> (FP_SCALE=1000). Tokenize splits on whitespace + ASCII punctuation,
+> lowercase, drops < 3 chars / > 30 chars. Sub-linear TF
+> (`1 + log2(count)`) + IDF (`log2(n) - log2(df) + smoothing`, the
+> log subtraction sidesteps integer-div precision loss when df ~ n)
+> + cosine (`dot * 1000 / (norm_q * norm_d)` with Newton sqrt).
+> Sparse index: forward `[atom_id -> [(tid, tfidf_milli)]]` + inverted
+> `[tid -> [atom_id...]]` + lazy IDF cache. Public API:
+> `ss_index_new`, `ss_index_add_atom` (idempotent), `ss_search`,
+> `ss_search_by_atom_id` (excludes the query atom). New chat admin:
+> `/find <query>` builds a transient index over `kg_atoms` and prints
+> top-5 as `FIND query="..." matched=N` / `RESULT rank=K atom_id=A
+> sim=M milli` / `FIND_END query="..."`. On the 10-atom
+> semantic_search_demo fixture, `/find "machine learning"` ranks the
+> ML atom (id=1) at sim=521 milli, the deep-learning atom (id=2) at
+> 171 milli; identical-vector cosine = 1000 milli; orthogonal (disjoint
+> vocab) = 0. 73 unit assertions
+> (`tests/unit/test_semantic_search.nova`) + 21 integration assertions
+> (`tests/integration/scenario_rr_semantic_search.sh`); all green.
+> R8F episodic retrieval (96 + 19), R6F consolidation (79 + 18), and
+> R5 atom-store tests remain bit-identically green. +1 from R10B
+> adding
+> `src/io/transducers/vosk_backend.nova` — Vosk offline STT as a
+> first-class alternative to whisper.cpp (~50 MB English model, pure-C
+> streaming recognizer; JFK conf=968 milli). Auto-pick now does
+> whisper > vosk > stub; `CE_STT_BACKEND=vosk` forces the new path.
+> R10B also closes the R8B follow-up on per-utterance whisper
+> confidence: `whisper_transcribe_with_confidence` parses
+> `src/io/transducers/vosk_backend.nova` — Vosk offline STT as a
+> first-class alternative to whisper.cpp (~50 MB English model, pure-C
+> streaming recognizer; JFK conf=968 milli). Auto-pick now does
+> whisper > vosk > stub; `CE_STT_BACKEND=vosk` forces the new path.
+> R10B also closes the R8B follow-up on per-utterance whisper
+> confidence: `whisper_transcribe_with_confidence` parses
+> whisper-cli's `-ojf` JSON output for per-token probabilities
+> (JFK lands at 895 milli, up from the legacy 800 ballpark). New
+> tests: `test_vosk_backend.nova` (39 checks),
+> `test_whisper_backend.nova` extended 28 -> 41 checks,
+> `scenario_qq_vosk.sh` (16 assertions). All green. See AUDIO_AUDIT.md
+> "R10B: per-utterance confidence + Vosk offline backend". R10D adds
 > `src/io/transducers/image_optical_flow.nova` — Lucas-Kanade dense
 > per-pixel optical flow between two consecutive PGM frames. For each
 > interior pixel, compute integer image gradients (Ix, Iy via central

@@ -3,6 +3,362 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R10C (this session) — KG: TF-IDF semantic search across atom labels
+
+**Status: complete -- new module `src/kg/semantic_search.nova` ships a
+purely textual TF-IDF + integer-cosine ranker over atom labels, closing
+the KG read story alongside exact lookup (`atom_store.kg_find_atom`),
+episodic retrieval (R6F + R8F: `episodic_recall_*`), and embedding
+nearest-neighbour (P3.4: `ann_query`).** No neural embedding, no LLM
+call, no external service -- pure deterministic counting math in
+milli-fixed-point (FP_SCALE=1000). The chat gains `/find <query>` for
+top-K (default 5) most-similar atoms; the API also exposes
+`ss_search_by_atom_id` for "atoms similar to this existing one".
+
+### Algorithm
+
+1. **Tokenize**: split on whitespace + ASCII punctuation, lowercase,
+   drop tokens < 3 chars or > 30 chars. Underscore is a token char.
+2. **TF**: sub-linearly scaled, `1 + log2(count)` in milli. count=1
+   -> 1000 milli, count=2 -> 2000 milli.
+3. **IDF**: `log2(n) - log2(df) + SS_IDF_SMOOTH` in milli (the log
+   subtraction sidesteps the integer-div precision loss of log2(n/df);
+   smoothing = 100 milli, the smallest constant that resolves
+   identical-vector cosine = 1000 milli while keeping rare > common).
+4. **TF-IDF**: `tfidf(t,a) = tf * idf / 1000` in milli, stored sparsely
+   as `[(token_id, score)]` per atom, sorted by token_id.
+5. **Cosine**: dot = sum(q*d) in raw milli^2 (no per-step /1000),
+   norm = sqrt(sum(tfidf^2)) via integer Newton iteration, output
+   `dot * 1000 / (norm_q * norm_d)` clamped to [0, 1000].
+6. **Top-K**: insertion-sort by sim desc, tiebreak by atom_id asc.
+
+### Index layout
+
+```
+ss_index = [SS_OBJ_TAG=1901, tokens, forward, inverted, idf_cache,
+            idf_valid, atom_text]
+```
+
+Lazy IDF refresh + per-atom norm cache. `ss_index_add_atom` is
+idempotent: re-add same id replaces (strips old postings + df bumps).
+
+### Public API
+
+- `ss_index_new()`, `ss_index_add_atom(ix, id, text)`,
+  `ss_index_atom_count(ix)`, `ss_index_token_count(ix)`
+- `ss_search(ix, query_text, top_k)` -> `[(atom_id, sim_milli)]` desc
+- `ss_search_by_atom_id(ix, id, top_k)` -> excludes query atom
+- `ss_index_from_kg(kg)` + `ss_find_cmd(kg, arg)` for chat dispatch
+
+### Verification
+
+- **Unit (73 assertions, NEW `tests/unit/test_semantic_search.nova`)**:
+  tokenization shapes, log2/sqrt/IDF primitives, 5-atom + 10-atom
+  fixture ranking, identical=1000 / orthogonal=0 / partial-overlap
+  in-between cosine properties, top-K clamping, empty-edge cases,
+  add idempotency, search_by_atom_id self-exclusion.
+- **Integration (21 assertions, NEW `scenario_rr_semantic_search.sh`)**:
+  end-to-end via `examples/semantic_search_demo.nova` + chat dispatch
+  (`/find` no-arg usage line, `/find machine`, `/help` listing).
+- **No-regression**: all 154 existing unit tests PASS; R8F's 19
+  episodic-recall integration assertions PASS; admin help/status
+  (38 assertions) PASS.
+
+### Files touched
+
+- NEW `src/kg/semantic_search.nova`
+- NEW `tests/unit/test_semantic_search.nova`
+- NEW `tests/integration/scenario_rr_semantic_search.sh`
+- NEW `examples/semantic_search_demo.nova`
+- `examples/crossengin_chat.nova` (+3 lines: import, dispatch, help)
+- `README.md` + `NEXT_SESSION.md`
+
+### Followups (deferred)
+
+1. **Phrase queries / bigram scoring** at the inverted-index level.
+2. **Stemming** (Porter or Lancaster) to collapse learn/learns/learned.
+3. **Per-KG persistent index** (mirror `kg_set_ann` attach pattern).
+4. **BM25** as a one-day swap inside `_ss_tf_milli` + `_idf_milli`.
+
+## R10B (this session) — Audio: whisper per-utterance confidence + Vosk offline backend
+
+**Status: complete -- two follow-ups from R8B closed.** R8B's whisper.cpp
+backend returned a flat `WHISPER_CONFIDENCE_DEFAULT = 800` milli on
+success regardless of the actual decode quality; the audit document
+called this out as a placeholder pending a real per-utterance value.
+R10B parses whisper-cli's `-ojf` (output-json-full) JSON output for
+per-token probabilities and averages them into a true per-utterance
+confidence (JFK lands at 895 milli; an all-silence WAV at 0). The
+seam's `_stt_backend_whisper` was switched to the confidence-aware
+variant so `/listen` now reports real numbers.
+
+R10B also ships a SECOND first-class STT backend: Vosk
+(`src/io/transducers/vosk_backend.nova`), a pure-C streaming STT
+engine with a ~50 MB English model. The seam's auto-pick now does
+whisper > vosk > stub; `CE_STT_BACKEND=vosk` forces the new path
+explicitly. Vosk's per-word `conf` field is averaged for an
+utterance-level milli confidence (JFK lands at 968 milli).
+
+### What landed
+
+- **`src/io/transducers/whisper_backend.nova`** (extended, +260 lines).
+  New public API: `whisper_transcribe_with_confidence(bin, model, wav)`
+  and `whisper_transcribe_with_confidence_default(wav)`. Internals
+  parse the `-ojf` JSON file scanning for `"p":` token-probability
+  fields and averaging them as milli. Falls back to the 800-milli
+  legacy ballpark when the JSON file is unparseable.
+
+- **`src/io/transducers/vosk_backend.nova`** (NEW, leaf module).
+  Public API mirrors whisper_backend's shape; dispatch is fork +
+  execve `python3 -c '<inline-script>' <wav> <model>` with the
+  inline Python script (embedded as a NOVA string literal) running
+  Vosk's KaldiRecognizer and printing exactly `OK <milli> <text>`
+  or `ERR <msg>`.
+
+- **`src/io/transducers/stt_seam.nova`** (extended). New constant
+  `STT_BACKEND_VOSK = 5`. New constructor `stt_seam_new_vosk`.
+  New env mapping: `CE_STT_BACKEND=vosk`. Auto-pick now does
+  whisper > vosk > stub. `_stt_backend_whisper` switched to call
+  the confidence-aware variant. New `_stt_backend_vosk` calls
+  `vosk_transcribe_default`.
+
+- **`tests/unit/test_whisper_backend.nova`** (extended, +13 assertions
+  on the JSON confidence parser: single high/low p, avg of two/three
+  tokens, integer edges p=0/p=1, no-tokens sentinel, whitespace
+  tolerance). 28 -> 41 checks.
+
+- **`tests/unit/test_vosk_backend.nova`** (NEW, 19 fns / 39 checks).
+  Env-resolver fallback paths, availability-probe error codes,
+  pre-flight error codes, output-parser fixtures, accessors, seam
+  dispatch, constructor pins, JFK real-decode (SKIPs if Vosk
+  isn't installed).
+
+- **`tests/integration/scenario_qq_vosk.sh`** (NEW, 16 assertions).
+  Drives the seam through each CE_STT_BACKEND value. Asserts:
+  whisper JFK conf > 800 milli (proof JSON parser produced real
+  value, not 800 ballpark), vosk JFK conf > 500 milli, auto-pick
+  ordering, seam dispatch through whisper / vosk produces non-empty
+  transcripts.
+
+- **`AUDIO_AUDIT.md`** (extended). New top-level section "R10B:
+  per-utterance confidence + Vosk offline backend".
+
+### On the dev container
+
+- `whisper_transcribe_with_confidence_default("/tmp/whisper.cpp/samples/jfk.wav")`
+  -> `["And so my fellow Americans...", 895, ""]` (avg over ~22 tokens).
+- `vosk_transcribe_default("/tmp/whisper.cpp/samples/jfk.wav")`
+  -> `["and so my fellow americans...", 968, ""]` (avg per-word conf).
+
+### Future work (R10B)
+
+- Whisper streaming via `-f -` stdin PCM.
+- Larger Vosk model (`vosk-model-en-us-0.42`, ~1.8 GB).
+- Per-word time-aligned confidence stream from Vosk.
+- Vosk word-level grammar hints for the chat command vocabulary.
+
+---
+
+## R10F (this session) — Audio: autocorrelation F0 (pitch) estimation
+
+**Status: complete -- new module `src/io/transducers/audio_pitch.nova`
+ships a per-frame fundamental-frequency estimator built on short-time
+autocorrelation. This is the third pillar of the audio triad after R6E
+Klatt synthesis and R7F+R9B VAD, completing the input chain alongside
+R7F+R8B STT.** No FFT, no floats, no DSP library -- the algorithm
+is a textbook Rabiner & Schafer (1978) short-time autocorrelation with
+a classical integer-multiple peak-check for octave-down correction. The
+chat surface gains `/pitch PATH`, a one-shot diagnostic that prints
+mean F0 + range over a WAV.
+
+### Why pitch matters next to STT
+
+CrossEngin has *what was said* (STT) but not *how it was said*. Prosody
+(intonation contour) carries question-vs-statement (rising vs falling
+terminals), surprise / emphasis (excursions above the speaker mean),
+and turn-taking cues (sustained low F0 -> end of turn). Mean voiced F0
+also separates adult-male / adult-female / child speakers without
+diarization machinery. Mean F0 + range expansion are the two signatures
+research links most directly to arousal (angry / happy widen the range;
+sad / bored collapse it).
+
+All three signals are now extractable from the same PCM buffer
+`/listen` already produces, without an LLM and without a DSP library.
+
+### Algorithm
+
+Per ~30 ms frame at the configured sample_rate (240 @ 8 kHz, 480 @ 16 kHz):
+
+1. Compute autocorrelation
+   `R(tau) = sum_{n=0}^{N-tau-1} x(n) * x(n+tau)`
+   for tau in [tau_min, tau_max] where
+   `tau_min = sample_rate / f0_max` (16000/500 = 32 @ 16 kHz)
+   and `tau_max = sample_rate / f0_min` (16000/50 = 320 @ 16 kHz).
+2. Raw argmax: `best_tau = argmax_{tau} R(tau)`. F0 candidate =
+   sample_rate / best_tau.
+3. Octave-down correction (classical Rabiner-1977 peak picker): walk
+   `tau = best_tau * k` for k = 2, 3, ... while `tau <= tau_max`; if
+   `R(tau) >= 0.92 * R(best_tau)` accept the longer period (raise
+   threshold to 0.92 * R(new) and continue). Cures the autocorrelation
+   first-formant snap that systematically reports a multiple of the
+   true glottal F0 on harmonic-rich speech.
+4. Voicing: `voicing_milli = (1000 * R(best_tau)) / R(0)`. Voiced iff
+   `voicing_milli >= 300 milli`. Below that the frame is unvoiced
+   (f0_centihz = 0 sentinel).
+5. F0 in **centi-Hz** (Hz * 100): preserves sub-Hz precision in pure
+   integer arithmetic. A 119 Hz speaker is 11900, distinguishable from
+   a 120 Hz speaker at 12000.
+
+The 0.92 octave-correction threshold was empirically calibrated against
+the unit-test fixtures: pure sines at 100, 200, 400 Hz give exact F0
+estimates (R(2T)/R(T) plateaus at 0.50, 0.80, 0.91 -- all just below
+0.92, so the correction never snaps pure sines), while Klatt vowels +
+natural speech have R(2T)/R(T) >= 0.92 at the true glottal period.
+
+### What landed
+
+- **`src/io/transducers/audio_pitch.nova`** (NEW, ~340 lines). Public
+  API:
+  * `pitch_estimate_frame(samples, sample_rate, f0_min, f0_max) ->
+    [f0_centihz, voicing_milli]` -- the per-frame estimator. Bounds
+    of 0/0 fall back to the module defaults (50/500 Hz).
+  * `pitch_track(samples, sample_rate) -> list of [f0, voicing]`
+    -- walks the buffer in non-overlapping 30 ms frames, returns the
+    contour. `pitch_track_with_bounds(..., f0_min, f0_max)` for
+    per-call override.
+  * `pitch_mean_voiced(contour) -> int centi-Hz` -- mean across only
+    the voiced frames; 0 if none.
+  * `pitch_range(contour) -> [min, max]` -- voiced-frame range; [0,0]
+    if no voiced frames.
+  * `pitch_voiced_count(contour) -> int` -- how many frames are voiced.
+  * `pitch_autocorr_at(samples, off, n, tau) -> R(tau)` and
+    `pitch_frame_energy(samples, off, n)` -- pure helpers exposed for
+    tests + future second-pass algorithms.
+  * `pitch_centihz_to_hz(c)` -- rounded conversion for human reports.
+  * Constants: `pitch_default_f0_min/max`, `pitch_frame_ms`,
+    `pitch_voicing_threshold`, `pitch_unvoiced_sentinel`.
+  * `pitch_run_command(arg)` -- the chat /pitch one-liner. Returns a
+    single human-readable line `(pitch PATH: f0_mean=X Hz,
+    f0_range=L-H Hz [...])`; graceful FAILED on missing file.
+
+  Implementation note: per-frame at 16 kHz the inner autocorrelation
+  loop runs ~480 * 290 = 139k multiply-adds. The accumulator peaks
+  around 5e11 -- above NOVA's smart-op 16 GiB pointer-classifier
+  threshold -- so the accumulator uses `int_add` and the comparison
+  `cur > best_r` (both potentially > 16 GiB) uses `int_sub(cur, best_r)
+  > 0` (the sign-bit check works because the classifier always treats
+  negatives as integer regardless of magnitude).
+
+- **`examples/crossengin_chat.nova`** (+3 lines): one import, one help
+  line, one dispatch line. Matches R10D's structural minimum
+  (`/flow PATH` was the prior pattern).
+
+- **`tests/unit/test_audio_pitch.nova`** (NEW, 23 test fns / **52 checks
+  total**). Coverage:
+  * Public constants + accessors (defaults, frame size, voicing
+    threshold, unvoiced sentinel, centi-Hz->Hz).
+  * Energy + autocorrelation primitives: zero buffer = 0, constant
+    buffer = N*v^2, R(0) == energy, R(period) > R(half-period) on a
+    pure sine.
+  * Pure sines at 100, 200, 400 Hz @ 16 kHz: F0 within ±200 centi-Hz
+    tolerance, voicing >= 600 milli.
+  * White noise: F0 = 0 (PITCH_UNVOICED sentinel), voicing < 300 milli.
+  * Pure silence: F0 = 0, voicing = 0.
+  * Square wave: returns in [0..1000] voicing without crashing.
+  * Klatt vowel /uw/ @ 8 kHz: voiced, F0 in [50..500] Hz band,
+    voicing crosses threshold.
+  * `pitch_track` on a 10-frame rising-pitch buffer (100..190 Hz):
+    contour has 10 entries, all 10 voiced, rises from first to last
+    frame, first frame ~ 100 Hz, last frame ~ 190 Hz.
+  * `pitch_mean_voiced` on mixed voiced+silence buffer: only voiced
+    frames contribute (mean ~ 200 Hz on a 6-voiced-frame fixture).
+  * `pitch_range` known min/max: 200/300 Hz sines produce range
+    [200..300] Hz (within centi tolerance).
+  * Bounds enforcement: 25 Hz with f0_min=50 -> NOT in [24..26] Hz
+    band (the search range excluded it); 1500 Hz with f0_max=500 ->
+    NOT in [1490..1510] Hz band (out of band -> subharmonic snap).
+  * Edge cases: short buffer -> unvoiced; default bounds (0/0) -> 200
+    Hz still works; swapped bounds (500/50) -> 200 Hz still works.
+
+- **`tests/integration/scenario_tt_pitch.sh`** (NEW, 20 assertions).
+  Synthesizes a 200 Hz sine + Klatt /uw/ vowel via R6E, writes
+  canonical PCM16 WAVs, runs the round-trip through
+  `audio_capture_to_pcm` + `pitch_track`. Asserts mean F0 on each
+  fixture within expected range. Chat-surface assertions:
+  * `/help` advertises `/pitch` with the R10F label.
+  * `/pitch <wav>` reports f0_mean + f0_range and echoes the path.
+  * `/pitch` (no arg) prints usage.
+  * `/pitch <missing>` -> graceful FAILED.
+  * JFK fixture (if present): mean F0 in [80..280] Hz adult range,
+    >= 100 voiced frames.
+
+  SKIPs the JFK assertions gracefully when the fixture is missing,
+  matching scenario_jj_whisper's convention.
+
+- **`AUDIO_AUDIT.md`** (extended). New top-level section "R10F:
+  autocorrelation F0 (pitch) estimation" documenting the algorithm
+  shape, the integer-only arithmetic safety dance, the empirical
+  threshold tuning, JFK measured value (220 Hz formant-snap vs true
+  140 Hz), the YIN / cepstral / RAPT octave-correction roadmap, and
+  the use cases (prosody atoms, speaker-mean banding, emotion proxy).
+
+### Verification (R10F)
+
+- `make test`: **154 unit tests pass** (was 153 before R10F).
+  test_audio_pitch contributes 52 new checks; the new module is the
+  +1.
+- `tests/integration/scenario_tt_pitch.sh`: 20 assertions, all pass.
+  200 Hz sine -> 200.00 Hz mean (20000 centi); Klatt /uw/ -> 296 Hz
+  mean (formant snap, in-band); JFK -> 220 Hz mean (in adult band).
+- All audio tests intact: `audio_synth` 209, `audio_vad` 86,
+  `audio_capture` 28, `stt_seam` 27, `whisper_backend` 41, and the
+  new `audio_pitch` 52.
+
+### Known limitations (R10F)
+
+- **JFK mean F0 = 220 Hz vs true ~140 Hz.** Unmodified autocorrelation
+  systematically snaps to the first formant region on harmonic-rich
+  natural speech. Classical YIN (de Cheveigne & Kawahara 2002) uses
+  the cumulative mean normalized difference function to push this
+  octave error below 1%. The integer-multiple peak check we use cures
+  the 2x / 3x snaps on simple harmonic structure but not the more
+  subtle formant snaps. **Acceptable for R10F's "plausible adult
+  voice" tier**; the chat surface reports it transparently so
+  downstream consumers can flag the band.
+- **No per-frame F0 smoothing.** A future revision can add a median
+  filter or Viterbi smoothing over the contour to stabilize the F0
+  trajectory across voiced runs.
+- **No glottal-source modeling in R6E Klatt.** The two-formant carrier
+  (sum of cosines at F1, F2) has no actual fundamental; autocorrelation
+  on it picks the F1 / GCD periodicity, NOT the conceptual 120 Hz
+  "speaker F0" the synth nominally targets. A future R6E revision that
+  adds a glottal pulse train carrier would let this test assert F0 at
+  the synthesized fundamental directly.
+
+### Future work (R10F)
+
+- YIN / RAPT cumulative-mean-normalized-difference variant for true
+  octave robustness on JFK-class natural speech. ~2x the
+  autocorrelation cost; cures the formant snap to within a few Hz of
+  ground truth.
+- Cepstral pitch detection as a second algorithm (R7F-style backend
+  switch): take the log of the magnitude spectrum and look for its
+  quefrency-domain peak. Requires an FFT (or a real autocorrelation-
+  of-log-autocorrelation hack); maps cleanly onto the existing seam
+  pattern.
+- Pitch-contour atoms: emit one prosody atom per VAD speech segment
+  with `(mean_f0_centihz, range_centihz, rise_or_fall)` so the KG
+  can store intonation curves alongside the transcript. The chat
+  `/listen` could then attach these as moment-scope features.
+- Speaker-mean banding: a session-level rolling average of mean F0
+  over voiced runs, with a 3-band classifier (adult-male / adult-
+  female / child) attached as a session-scope atom. No diarization,
+  but enough signal to separate one speaker from another across an
+  hour-long log.
+- Stream/online estimator: pitch_estimate_frame is pure per-frame;
+  wiring it to audio_capture's streaming PCM iterator gives a real-
+  time F0 stream parallel to the VAD event stream.
+
 ## R10D (this session) — IO: Lucas-Kanade dense optical flow
 
 **Status: complete -- new module `src/io/transducers/image_optical_flow.nova`
