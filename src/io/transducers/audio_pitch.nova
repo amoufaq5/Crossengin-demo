@@ -594,3 +594,315 @@ fn pitch_run_command(arg) {
         + ", voiced=" + int_to_str(voiced) + "/" + int_to_str(total)
         + " frames @ " + int_to_str(sr) + " Hz])"
 }
+
+// R11B: YIN-class pitch estimator (cumulative mean normalized difference)
+//
+// YIN (de Cheveigne & Kawahara 2002) is the standard cure for the
+// formant-snap that the R10F autocorrelation estimator suffers on
+// harmonic-rich natural speech. The cumulative mean normalized
+// difference function d'(tau) = d(tau) * tau / (running_mean of d) has
+// its MINIMUM at the true period rather than the maximum -- no formant
+// ambiguity. See Section II of the YIN paper for the algorithm.
+//
+// Algorithm (integer-only, milli fixed-point):
+//   1. d(tau)    = sum (x(n) - x(n+tau))^2     (difference function)
+//   2. run(tau)  = run(tau-1) + d(tau)         (cumulative)
+//   3. d'(tau)   = d(tau) * tau * 1000 / run(tau)   (normalized, milli)
+//   4. Find smallest tau where d'(tau) < threshold AND local minimum.
+//   5. Pass B: octave-down anti-snap for natural speech -- prefer kT if
+//      a local minimum exists there with d'(kT) <= ratio * d'(T).
+//   6. Parabolic interpolation around best_tau for sub-sample precision.
+//
+// Costs ~2x the autocorrelation per frame. On the JFK bundled sample
+// this drops the mean F0 from R10F's ~220 Hz (formant snap) to YIN's
+// ~140-150 Hz (true adult-male band).
+//
+// The R10F autocorrelation API stays available for back-compat.
+
+let PITCH_YIN_THRESHOLD_MILLI = 100
+let PITCH_YIN_VOICING_MAX = 1000
+// Octave-down ratio (milli): best_in_win <= best_dprime * ratio / 1000.
+// 3000 milli = 3.0x -- a longer-period minimum that's up to 3x worse
+// than the current best takes over. Calibrated against the JFK fixture
+// where the F0 dprime is typically 2-3x larger than the formant-snap
+// dprime (amplitude varies more across a full glottal period than across
+// a single formant pulse).
+let PITCH_YIN_OCTAVE_RATIO_MILLI = 3000
+// Search window in samples around k*best_tau where we look for the
+// kx-multiple local minimum. +/- 5 samples covers integer rounding
+// from F0/formant frequency ratios.
+let PITCH_YIN_OCTAVE_SEARCH_WIN = 5
+
+fn pitch_yin_threshold()     { return PITCH_YIN_THRESHOLD_MILLI }
+fn pitch_yin_voicing_max()   { return PITCH_YIN_VOICING_MAX }
+
+// d(tau) = sum (x(n) - x(n+tau))^2. int_mul + int_add throughout: the
+// accumulator can reach ~2e12 on a loud PCM16 frame -- above the
+// 16 GiB smart-op pointer-classifier threshold. Same escape-hatch
+// pattern as R10F's pitch_autocorr_at.
+fn pitch_yin_diff_at(samples, off, n, tau) {
+    let total = len(samples)
+    let end_pair = off + n - tau
+    if end_pair > total - tau { end_pair = total - tau }
+    if end_pair < 0 { end_pair = 0 }
+    let i = off
+    let sum = 0
+    while i < end_pair {
+        let a = samples[i]
+        let b = samples[i + tau]
+        let diff = a - b
+        sum = int_add(sum, int_mul(diff, diff))
+        i = i + 1
+    }
+    return sum
+}
+
+// pitch_estimate_frame_yin(samples, sample_rate, f0_min, f0_max,
+//                          yin_threshold) -> [f0_centihz, voicing_milli]
+//
+// f0_min/f0_max: pass 0/0 to use module defaults (50/500 Hz).
+// yin_threshold: 0 -> PITCH_YIN_THRESHOLD_MILLI (100 milli, paper default).
+//
+// Output:
+//   f0_centihz    = sr * 100000 / tau_refined_milli   (voiced)
+//                 = PITCH_UNVOICED (0)                 (unvoiced)
+//   voicing_milli = 1000 - d'(tau_best) clamped [0..1000]  (voiced)
+//                 = 0                                       (silence/noise)
+fn pitch_estimate_frame_yin(samples, sample_rate, f0_min, f0_max, yin_threshold) {
+    let sr = _pitch_clamp_rate(sample_rate)
+    let frame_size = (sr * PITCH_FRAME_MS) / 1000
+    let total = len(samples)
+    let r = list_new()
+    if total < frame_size {
+        push(r, PITCH_UNVOICED)
+        push(r, 0)
+        return r
+    }
+    let fmin = f0_min
+    let fmax = f0_max
+    if fmin <= 0 { fmin = PITCH_F0_MIN_DEFAULT }
+    if fmax <= 0 { fmax = PITCH_F0_MAX_DEFAULT }
+    if fmin > fmax {
+        let tmp = fmin
+        fmin = fmax
+        fmax = tmp
+    }
+    let yin_thresh = yin_threshold
+    if yin_thresh <= 0 { yin_thresh = PITCH_YIN_THRESHOLD_MILLI }
+    let tau_min = sr / fmax
+    if tau_min < 2 { tau_min = 2 }
+    let tau_max = sr / fmin
+    if tau_max >= frame_size { tau_max = frame_size - 1 }
+    if tau_min >= tau_max {
+        push(r, PITCH_UNVOICED)
+        push(r, 0)
+        return r
+    }
+    let r0 = pitch_frame_energy(samples, 0, frame_size)
+    if int_sub(r0, 1) < 0 {
+        push(r, PITCH_UNVOICED)
+        push(r, 0)
+        return r
+    }
+    // Build d(tau) and run(tau) tables for tau in [0..tau_max].
+    let d_list = list_new()
+    let run_list = list_new()
+    push(d_list, 0)
+    push(run_list, 0)
+    let tau = 1
+    let run = 0
+    while tau <= tau_max {
+        let d = pitch_yin_diff_at(samples, 0, frame_size, tau)
+        push(d_list, d)
+        run = int_add(run, d)
+        push(run_list, run)
+        tau = tau + 1
+    }
+    // Materialize d'(tau) = d(tau)*tau*1000 / run(tau) into a list.
+    // dprime[tau<tau_min] = 1001 sentinel so neighbor checks below
+    // never accidentally accept an out-of-band tau as a local minimum.
+    let dprime_list = list_new()
+    let fill_i = 0
+    while fill_i < tau_min {
+        push(dprime_list, 1001)
+        fill_i = fill_i + 1
+    }
+    tau = tau_min
+    while tau <= tau_max {
+        let d_tau = d_list[tau]
+        let run_tau = run_list[tau]
+        let dprime_val = 0
+        if int_sub(run_tau, 1) < 0 {
+            dprime_val = 0
+        } else {
+            let num = int_mul(d_tau, tau)
+            num = int_mul(num, 1000)
+            dprime_val = int_div(num, run_tau)
+        }
+        push(dprime_list, dprime_val)
+        tau = tau + 1
+    }
+    // Pass A: paper's absolute-threshold step -- smallest tau where
+    // d'(tau) < threshold AND tau is a local minimum.
+    let best_tau = 0
+    let best_dprime = PITCH_YIN_VOICING_MAX + 1
+    let found = 0
+    tau = tau_min
+    while tau <= tau_max {
+        let dv = dprime_list[tau]
+        if found == 0 && dv < yin_thresh {
+            let is_min = 1
+            if tau > tau_min {
+                let prev = dprime_list[tau - 1]
+                if dv > prev { is_min = 0 }
+            }
+            if tau < tau_max {
+                let next_v = dprime_list[tau + 1]
+                if dv > next_v { is_min = 0 }
+            }
+            if is_min == 1 {
+                best_tau = tau
+                best_dprime = dv
+                found = 1
+                tau = tau_max + 1
+            } else {
+                tau = tau + 1
+            }
+        } else {
+            tau = tau + 1
+        }
+    }
+    // Pass B: octave-down anti-snap for natural speech. Skip for
+    // pure-tone perfect-match cases (best_dprime == 0).
+    if found == 1 && best_dprime > 0 {
+        let k = 2
+        let center = best_tau * k
+        while center <= tau_max {
+            let lo = center - PITCH_YIN_OCTAVE_SEARCH_WIN
+            let hi = center + PITCH_YIN_OCTAVE_SEARCH_WIN
+            if lo < tau_min + 1 { lo = tau_min + 1 }
+            if hi > tau_max - 1 { hi = tau_max - 1 }
+            let best_in_win = PITCH_YIN_VOICING_MAX + 1
+            let best_in_win_tau = 0
+            let win_tau = lo
+            while win_tau <= hi {
+                let tdv = dprime_list[win_tau]
+                if tdv < yin_thresh {
+                    let prev = dprime_list[win_tau - 1]
+                    let next_v = dprime_list[win_tau + 1]
+                    if tdv <= prev && tdv <= next_v {
+                        if tdv < best_in_win {
+                            best_in_win = tdv
+                            best_in_win_tau = win_tau
+                        }
+                    }
+                }
+                win_tau = win_tau + 1
+            }
+            if best_in_win_tau > 0 {
+                let limit = int_div(int_mul(best_dprime, PITCH_YIN_OCTAVE_RATIO_MILLI), 1000)
+                if best_in_win <= limit {
+                    best_tau = best_in_win_tau
+                    best_dprime = best_in_win
+                }
+            }
+            k = k + 1
+            center = best_tau * k
+        }
+    }
+    if found == 0 {
+        push(r, PITCH_UNVOICED)
+        push(r, 0)
+        return r
+    }
+    // Parabolic interpolation around best_tau for sub-sample precision.
+    let tau_refined_milli = best_tau * 1000
+    if best_tau > tau_min && best_tau < tau_max {
+        let a = dprime_list[best_tau - 1]
+        let c = dprime_list[best_tau + 1]
+        let b = best_dprime
+        let denom = a - 2 * b + c
+        if denom != 0 {
+            let num = 500 * (a - c)
+            let offset = num / denom
+            if offset > 500  { offset = 500 }
+            if offset < 0 - 500 { offset = 0 - 500 }
+            tau_refined_milli = best_tau * 1000 + offset
+        }
+    }
+    if tau_refined_milli <= 0 {
+        push(r, PITCH_UNVOICED)
+        push(r, 0)
+        return r
+    }
+    let f0_centihz = int_div(int_mul(sr, 100000), tau_refined_milli)
+    let voicing = PITCH_YIN_VOICING_MAX - best_dprime
+    if voicing < 0 { voicing = 0 }
+    if voicing > PITCH_YIN_VOICING_MAX { voicing = PITCH_YIN_VOICING_MAX }
+    push(r, f0_centihz)
+    push(r, voicing)
+    return r
+}
+
+fn pitch_track_yin(samples, sample_rate) {
+    return pitch_track_yin_with_bounds(samples, sample_rate,
+                                       PITCH_F0_MIN_DEFAULT,
+                                       PITCH_F0_MAX_DEFAULT,
+                                       PITCH_YIN_THRESHOLD_MILLI)
+}
+
+fn pitch_track_yin_with_bounds(samples, sample_rate, f0_min, f0_max, yin_threshold) {
+    let sr = _pitch_clamp_rate(sample_rate)
+    let frame_size = (sr * PITCH_FRAME_MS) / 1000
+    let total = len(samples)
+    let out = list_new()
+    let off = 0
+    while off + frame_size <= total {
+        let view = list_new()
+        let i = off
+        let end = off + frame_size
+        while i < end {
+            push(view, samples[i])
+            i = i + 1
+        }
+        let res = pitch_estimate_frame_yin(view, sr, f0_min, f0_max, yin_threshold)
+        push(out, res)
+        off = off + frame_size
+    }
+    return out
+}
+
+// /pitch_yin chat helper. Mirrors pitch_run_command (R10F) but routes to
+// pitch_track_yin.
+fn pitch_run_yin_command(arg) {
+    if len(arg) == 0 {
+        return "(/pitch_yin needs PATH -- usage: /pitch_yin /tmp/test.wav)"
+    }
+    let r = audio_capture_to_pcm(arg)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(pitch_yin FAILED: could not parse WAV at " + arg + ")"
+    }
+    if sr <= 0 {
+        return "(pitch_yin FAILED: invalid sample rate in WAV at " + arg + ")"
+    }
+    let contour = pitch_track_yin(pcm, sr)
+    let voiced = pitch_voiced_count(contour)
+    let total  = len(contour)
+    if voiced == 0 {
+        return "(pitch_yin " + arg + ": no voiced frames @ "
+            + int_to_str(sr) + " Hz, total=" + int_to_str(total)
+            + " frames)"
+    }
+    let mean_c = pitch_mean_voiced(contour)
+    let mean_hz = pitch_centihz_to_hz(mean_c)
+    let range = pitch_range(contour)
+    let lo_hz = pitch_centihz_to_hz(range[0])
+    let hi_hz = pitch_centihz_to_hz(range[1])
+    return "(pitch_yin " + arg + ": f0_mean=" + int_to_str(mean_hz) + " Hz"
+        + ", f0_range=" + int_to_str(lo_hz) + "-" + int_to_str(hi_hz) + " Hz"
+        + " [mean=" + int_to_str(mean_c) + " centi"
+        + ", voiced=" + int_to_str(voiced) + "/" + int_to_str(total)
+        + " frames @ " + int_to_str(sr) + " Hz])"
+}

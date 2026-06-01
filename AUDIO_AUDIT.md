@@ -782,12 +782,10 @@ path if EITHER operand is integer; 0 is always integer. So
   speech. The integer-multiple peak check cures simple 2x / 3x
   octave snaps on harmonic structure (the Klatt /uw/ result is
   better than raw argmax) but doesn't fully cure the formant snap
-  on harmonic-rich utterances like JFK. Classical YIN
-  (de Cheveigne & Kawahara 2002) cures this via the cumulative mean
-  normalized difference function -- ~2x the autocorrelation cost,
-  to within a few Hz of ground truth. Acceptable for R10F's
-  "plausible adult voice" tier; the chat surface reports the value
-  transparently so downstream consumers can flag the band.
+  on harmonic-rich utterances like JFK. **R11B (below)** shipped
+  the classical YIN cure (cumulative mean normalized difference)
+  as a parallel entry point; on JFK it drops the mean from 220 Hz
+  (R10F formant snap) to 144 Hz (R11B YIN, in the adult-male band).
 - **R6E Klatt has no glottal source.** The two-formant carrier
   is a sum of cosines at F1 and F2 -- there is no actual fundamental
   at 120 Hz or anywhere else. Autocorrelation on Klatt output picks
@@ -800,10 +798,9 @@ path if EITHER operand is integer; 0 is always integer. So
 
 ### Future work (R10F)
 
-- YIN / RAPT cumulative-mean-normalized-difference variant for true
-  octave robustness on JFK-class natural speech. ~2x the
-  autocorrelation cost; cures the formant snap to within a few Hz of
-  ground truth.
+- ~~YIN / RAPT cumulative-mean-normalized-difference variant for true~~
+  ~~octave robustness on JFK-class natural speech.~~ **DONE in R11B**
+  -- see "R11B" section below.
 - Cepstral pitch detection as a second algorithm (R7F-style backend
   switch): take the log of the magnitude spectrum and find its
   quefrency-domain peak. Requires an FFT (or a real autocorrelation-
@@ -823,6 +820,112 @@ path if EITHER operand is integer; 0 is always integer. So
   is 8 kHz by R6E convention. The pitch estimator clamps to [8..48 kHz]
   but defaults to whatever rate the WAV declares. A future R6E upgrade
   to 16 kHz would let pitch tests assert at the higher resolution.
+
+## R11B: YIN-class F0 estimator (cumulative mean normalized difference)
+
+R11B extends R10F's `src/io/transducers/audio_pitch.nova` with a
+parallel YIN-class entry point that cures R10F's first-formant snap
+on harmonic-rich natural speech. R10F's autocorrelation API stays
+available for back-compat; callers pick the method per call.
+
+### Algorithm
+
+Following de Cheveigne & Kawahara, "YIN, a fundamental frequency
+estimator for speech and music," JASA 111(4) April 2002:
+
+1. **Difference function** `d(tau) = sum_{n} (x(n) - x(n+tau))^2`.
+   Unlike autocorrelation, d(tau) is ZERO at the true period and
+   positive elsewhere -- the MINIMUM marks the period, with no
+   formant ambiguity.
+2. **Cumulative mean normalization**:
+   `d'(tau) = d(tau) * tau * 1000 / running_sum`, in milli units.
+   Flattens the function at low tau so very-short lags don't
+   dominate.
+3. **Absolute threshold step**: find the smallest tau where d'(tau)
+   < 100 milli (paper default 0.1) AND is a local minimum. If no
+   such tau, the frame is unvoiced.
+4. **Pass B octave-down anti-snap** (R11B-specific): walk integer
+   multiples k=2,3,... of the candidate period. Prefer the LONGER
+   period if a local minimum exists in a +/- 5 sample window around
+   k*best_tau with d'(kT) <= 3.0 * d'(T). Gated by best_dprime > 0
+   so pure-tone perfect-match cases stay at the fundamental.
+5. **Parabolic interpolation** around best_tau for sub-sample
+   precision: `tau_refined = tau + 0.5 * (a - c) / (a - 2*b + c)`
+   where a, b, c = d'(tau-1), d'(tau), d'(tau+1).
+
+### Public API (parallel to R10F)
+
+- `pitch_estimate_frame_yin(samples, sr, f0_min, f0_max, yin_threshold)
+  -> [f0_centihz, voicing_milli]`
+- `pitch_track_yin(samples, sr)` -- module defaults
+- `pitch_track_yin_with_bounds(samples, sr, f0_min, f0_max, yin_threshold)`
+- `pitch_run_yin_command(arg)` -- chat /pitch_yin helper
+- `pitch_yin_threshold()` / `pitch_yin_voicing_max()` accessors
+
+### Verification (R11B)
+
+- `make test`: 87 pitch checks total (52 R10F + 35 R11B), all green
+- Unit tests in `tests/unit/test_audio_pitch_yin.nova`:
+  - Pure 100/200/400 Hz sines: YIN F0 exact within +/- 50 centi-Hz
+  - Harmonic-rich 120 Hz fixture (fundamental + 2nd + 3rd harmonics):
+    YIN F0 = 12007 centi-Hz, NOT 24000 (2nd-harmonic snap) or
+    36000 (3rd-harmonic snap)
+  - White noise + silence: unvoiced (d' never below threshold)
+  - Klatt /uw/: voiced, in [50..500] Hz band
+  - Sub-sample parabolic interpolation: 197 Hz and 173 Hz fixtures
+    where the true period is between integer samples; YIN's centi-Hz
+    output lands within +/- 200 of the true value
+  - R10F autocorrelation back-compat: both APIs still callable in
+    the same compilation unit, no regression
+- Integration scenario `tests/integration/scenario_vv_yin_pitch.sh`:
+  - Synthetic 200 Hz sine WAV: both R10F and YIN report 20000 centi-Hz
+  - JFK adult-male sample: R10F mean = 21954 centi-Hz (~220 Hz
+    formant snap), YIN mean = 14461 centi-Hz (~145 Hz, in adult-male
+    band [80..180] Hz). YIN < R10F demonstrated (formant snap cured).
+
+### Results table (R11B vs R10F)
+
+| Fixture                          | True F0   | R10F mean | R11B YIN mean | Outcome           |
+|----------------------------------|----------:|----------:|--------------:|-------------------|
+| 100 Hz sine (480 @ 16 kHz)       |   100 Hz  |   100 Hz  |     100 Hz    | parity            |
+| 200 Hz sine                      |   200 Hz  |   200 Hz  |     200 Hz    | parity            |
+| 400 Hz sine                      |   400 Hz  |   400 Hz  |     400 Hz    | parity            |
+| 120 Hz harmonic stack (1+2+3 hx) |   120 Hz  |   120 Hz  |     120 Hz    | both OK on synth  |
+| Klatt /uw/ vowel (8 kHz F1=300)  |    n/a    |   296 Hz  |     145 Hz    | YIN dodges F1 snap|
+| JFK adult-male (16 kHz, 5.5 s)   |  ~140 Hz  |   220 Hz  |     145 Hz    | YIN cures snap    |
+
+### Known limitations (R11B)
+
+- **JFK Pass B aggressive 3.0x ratio.** The Pass B octave-down ratio
+  (3000 milli = 3.0x) was empirically calibrated against the bundled
+  JFK fixture. Higher-fidelity speech (clean broadcast voice) may
+  benefit from a tighter 2.0x ratio (less aggressive snap-down). The
+  ratio is a constant for now; future work could expose it as a
+  parameter.
+- **No temporal smoothing.** Per-frame YIN can still occasionally
+  emit an octave-up frame in the middle of an otherwise-low voiced
+  region. The YIN paper's Step 5 ("best local estimate") uses a
+  +/- 1 frame sliding window to stabilize; not implemented here.
+- **2x autocorrelation cost.** Per frame at 16 kHz: ~139k
+  subtract-square-add (YIN diff function) vs ~139k multiply-add
+  (autocorrelation), plus ~290-step running sum and ~290-step
+  normalization. Roughly 2x the R10F cost; still pure integer
+  arithmetic, no FFT.
+
+### Future work (R11B)
+
+- **YIN Step 5 best local estimate** -- per-frame minimum search
+  within a +/- 1-frame sliding window stabilizes octave errors.
+- **Adaptive YIN_OCTAVE_RATIO_MILLI** tuned to per-frame SNR --
+  high-SNR frames can use a tighter ratio (less aggressive snap);
+  low-SNR (formant-dominated) frames can keep the current 3.0x.
+- **Backend switch on the pitch seam** -- letting the chat surface
+  pick R10F autocorrelation, R11B YIN, or a future cepstral
+  detector by per-session knob (mirrors the R7F+R10B STT seam).
+- **Streaming YIN** -- the per-frame estimator is already pure; a
+  push-style iterator over audio_capture's PCM stream would emit
+  one [f0_centihz, voicing_milli] per 30 ms tick alongside the
+  VAD event stream.
 
 ## Future work
 

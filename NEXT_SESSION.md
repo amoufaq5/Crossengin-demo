@@ -3,6 +3,87 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R11B (this session) — Audio: YIN-class F0 estimator (cumulative mean normalized difference)
+
+**Status: complete -- extended `src/io/transducers/audio_pitch.nova`
+(R10F's file) with parallel YIN-class entry points that cure R10F's
+first-formant snap on harmonic-rich natural speech.** R10F's
+autocorrelation API stays available unchanged. YIN
+(de Cheveigne & Kawahara 2002) replaces autocorrelation's argmax with
+the cumulative mean normalized difference function `d'(tau) =
+d(tau) * tau / running_sum`, whose MINIMUM marks the period -- no
+formant ambiguity. Pure integer arithmetic, no FFT, no floats.
+
+### Algorithm
+
+1. `d(tau) = sum (x(n) - x(n+tau))^2` -- ZERO at the true period.
+2. `run(tau) = run(tau-1) + d(tau)` -- cumulative sum.
+3. `d'(tau) = d(tau) * tau * 1000 / run(tau)` -- milli units.
+4. Find smallest tau where d'(tau) < 100 milli AND local minimum.
+5. **Pass B** (R11B-specific): walk integer multiples k=2,3,... of
+   best_tau; prefer the LONGER period if a local minimum exists
+   with d'(kT) <= 3x d'(T). Gated by best_dprime > 0 (pure synthetic
+   signals are unaffected).
+6. Parabolic interpolation around best_tau for sub-sample precision.
+
+### Public API (parallel to R10F)
+
+- `pitch_estimate_frame_yin(pcm, sr, f0_min, f0_max, yin_threshold)
+  -> [f0_centihz, voicing_milli]`
+- `pitch_track_yin(pcm, sr)` -- default bounds + threshold
+- `pitch_track_yin_with_bounds(pcm, sr, f0_min, f0_max, yin_threshold)`
+- `pitch_run_yin_command(arg)` -- chat /pitch_yin helper
+- `pitch_yin_threshold()` / `pitch_yin_voicing_max()` accessors
+
+### Results
+
+| Fixture                          | True F0   | R10F mean | R11B YIN mean | Outcome           |
+|----------------------------------|----------:|----------:|--------------:|-------------------|
+| 100/200/400 Hz pure sine         | 100/200/400 | exact   |   exact       | parity            |
+| 120 Hz harmonic stack (1+2+3 hx) |   120 Hz  |   120 Hz  |     120 Hz    | both OK on synth  |
+| Klatt /uw/ vowel (8 kHz F1=300)  |    n/a    |   296 Hz  |     145 Hz    | YIN dodges F1 snap|
+| JFK adult-male (16 kHz, 5.5 s)   |  ~140 Hz  |   220 Hz  |     145 Hz    | YIN cures snap    |
+
+### Verification
+
+- **Unit (35 assertions, NEW `tests/unit/test_audio_pitch_yin.nova`)**:
+  pure-sine exactness at 100/200/400 Hz, harmonic-rich 120 Hz no-snap,
+  white-noise/silence unvoiced, Klatt /uw/ in band, sub-sample
+  parabolic refinement (197 Hz + 173 Hz), R10F back-compat, edge cases.
+- **Integration (9 assertions, NEW `scenario_vv_yin_pitch.sh`)**:
+  synthetic 200 Hz both methods, JFK head-to-head -- R10F at 219.54 Hz,
+  YIN at 144.61 Hz (in adult-male [80..180] Hz band), YIN < R10F strict.
+- **R10F regression**: existing `test_audio_pitch` (52 / 52) and
+  `scenario_tt_pitch` (20 / 20) remain bit-identically green.
+- **Module count unchanged** (extension only -- no new module).
+
+### New files
+
+- `src/io/transducers/audio_pitch.nova` (EXTENDED; 596 -> 908 lines)
+- `tests/unit/test_audio_pitch_yin.nova` (35 assertions)
+- `tests/integration/scenario_vv_yin_pitch.sh` (9 assertions)
+- `examples/crossengin_chat.nova` +1 line: `/pitch_yin` dispatch
+- `AUDIO_AUDIT.md` (R11B section added; R10F YIN follow-up marked DONE)
+- `README.md` (R11B blurb)
+
+### Known limitations (R11B)
+
+- **JFK Pass B uses 3.0x ratio.** Aggressive enough to cure formant
+  snap on JFK; higher-fidelity broadcast speech might prefer 2.0x.
+- **No temporal smoothing.** Per-frame YIN can still emit an octave-
+  up frame in a low-voiced run. YIN paper Step 5 (best-local-estimate)
+  is not in R11B.
+- **2x autocorrelation cost.** Per-frame at 16 kHz: ~139k
+  subtract-square-add + ~290 running-sum steps + ~290 normalization
+  divides.
+
+### Future work (R11B)
+
+- YIN Step 5 best-local-estimate temporal smoothing (+/- 1 frame).
+- Adaptive YIN_OCTAVE_RATIO_MILLI per-frame SNR-tuned.
+- Pitch-algorithm backend switch (R7F+R10B style seam).
+- Streaming YIN over audio_capture's PCM iterator.
+
 ## R11A (this session) — IO: pyramidal Lucas-Kanade optical flow (Bouguet 2000 extension)
 
 **Status: complete -- `src/io/transducers/image_optical_flow.nova` EXTENDS

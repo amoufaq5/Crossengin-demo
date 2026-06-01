@@ -11,7 +11,23 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 146 modules compile (`make build`). R11F adds
+> toolchain: 146 modules compile (`make build`). R11B extends
+> `src/io/transducers/audio_pitch.nova` (R10F's file) with parallel
+> YIN-class entry points (`pitch_estimate_frame_yin`, `pitch_track_yin`,
+> `pitch_run_yin_command`) that cure R10F's first-formant snap on
+> harmonic-rich natural speech. YIN (de Cheveigne & Kawahara 2002)
+> replaces autocorrelation's argmax with the cumulative mean normalized
+> difference function `d'(tau) = d(tau) * tau * 1000 / running_sum`,
+> whose MINIMUM marks the period (no formant ambiguity). Pure integer
+> arithmetic, no FFT, no floats. R10F autocorrelation API stays
+> unchanged for back-compat. **JFK head-to-head: R10F mean 220 Hz
+> (formant snap) -> R11B YIN mean 145 Hz (in adult-male [80..180] Hz
+> band).** Klatt /uw/: 296 Hz -> 145 Hz. Pure 100/200/400 Hz sines:
+> both methods parity (exact). New chat admin: `/pitch_yin PATH`
+> prints `(pitch_yin PATH: f0_mean=N Hz, ...)`. 35 unit assertions
+> (`tests/unit/test_audio_pitch_yin.nova`) + 9 integration assertions
+> (`tests/integration/scenario_vv_yin_pitch.sh`); all green. R10F's
+> 52 unit + 20 integration tests remain bit-identically green. R11F adds
 > `src/kg/graph_clustering.nova` — Raghavan-2007 label-propagation
 > community detection over the KG's xref link graph, the STRUCTURAL
 > companion to R10C's textual TF-IDF ranker. R10C asks "which atoms
