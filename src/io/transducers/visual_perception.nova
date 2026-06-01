@@ -76,6 +76,7 @@
 
 import "image_pgm.nova"
 import "png_decode.nova"
+import "jpeg_decode.nova"
 import "image_sobel.nova"
 import "image_harris.nova"
 import "image_sift.nova"
@@ -86,7 +87,9 @@ let VP_DECODER_NONE   = 0       // sentinel, never registered
 let VP_DECODER_STUB   = 1       // deterministic placeholder
 let VP_DECODER_PGM    = 2       // real PGM-P5 decoder (image_pgm.nova)
 let VP_DECODER_PNG    = 3       // grayscale-8 PNG decoder (png_decode.nova)
-let VP_DECODER_CUSTOM = 4       // user-registered (tests, plugins)
+let VP_DECODER_JPEG   = 4       // grayscale baseline JPEG header parser
+                                //   (jpeg_decode.nova; entropy decode TODO)
+let VP_DECODER_CUSTOM = 5       // user-registered (tests, plugins)
 
 // Confidence sentinels (mirror the STT seam's pattern).
 let VP_CONFIDENCE_NONE    = 0
@@ -196,16 +199,19 @@ let VP_LAST_DEC       = 10
 // ---- env helpers ----------------------------------------------------------
 
 // vp_default_decoder() reads CE_VP_DECODER once and returns the constant.
-// Empty / unset / "pgm" -> PGM; "png" -> PNG; "stub" -> STUB; anything
-// else -> PGM (defensive default; per-call extension detection in
-// `_vp_pick_decoder_for_path` can still route a `.png` path to the PNG
-// decoder when the default is PGM).
+// Empty / unset / "pgm" -> PGM; "png" -> PNG; "jpeg"/"jpg" -> JPEG (header
+// parse only -- entropy decode is deferred per JPEG_AUDIT.md); "stub" ->
+// STUB; anything else -> PGM (defensive default; per-call extension
+// detection in `_vp_pick_decoder_for_path` can still route a `.png` /
+// `.jpg` path to the matching decoder when the default is PGM).
 fn vp_default_decoder() {
     let env = getenv("CE_VP_DECODER")
     if env == 0 { return VP_DECODER_PGM }
     if len(env) == 0 { return VP_DECODER_PGM }
     if str_eq(env, "pgm") == 1 { return VP_DECODER_PGM }
     if str_eq(env, "png") == 1 { return VP_DECODER_PNG }
+    if str_eq(env, "jpeg") == 1 { return VP_DECODER_JPEG }
+    if str_eq(env, "jpg") == 1 { return VP_DECODER_JPEG }
     if str_eq(env, "stub") == 1 { return VP_DECODER_STUB }
     return VP_DECODER_PGM
 }
@@ -228,6 +234,7 @@ fn vp_seam_new() {
     _vp_register_builtin(s, "stub", VP_DECODER_STUB)
     _vp_register_builtin(s, "pgm",  VP_DECODER_PGM)
     _vp_register_builtin(s, "png",  VP_DECODER_PNG)
+    _vp_register_builtin(s, "jpeg", VP_DECODER_JPEG)
     return s
 }
 
@@ -514,6 +521,73 @@ fn _vp_decode_png(s, path) {
     return _vp_result(s, feats, VP_CONFIDENCE_DEFAULT, "", summary)
 }
 
+// ---- JPEG decoder ---------------------------------------------------------
+//
+// Calls jpeg_decode_grayscale, which today parses only the STRUCTURAL
+// half of a baseline grayscale JPEG (segment markers + DQT + SOF0 + DHT)
+// and returns the dimensions WITHOUT decoding any pixels. The full
+// entropy decode + IDCT + block assembly is deferred per
+// `JPEG_AUDIT.md` (estimated 3-4 more weeks). The seam still surfaces
+// the dimensions and a clear "JPEG entropy decode + IDCT not yet
+// implemented" diagnostic so operators and the perception path know
+// what is missing without the chat crashing.
+//
+// On success (dims-only): we emit a single VP_LABEL_JPEG_HEADER atom
+// + the dimension bucket atom so downstream learning has SOMETHING to
+// bind. Confidence is reported as VP_CONFIDENCE_NONE (zero) until the
+// full pixel-decoder lands.
+
+let VP_LABEL_JPEG_HEADER = "image_jpeg_header_only"
+
+fn _vp_decode_jpeg(s, path) {
+    let r = jpeg_decode_grayscale(path)
+    let err = jpeg_result_error(r)
+    let w   = jpeg_result_width(r)
+    let h   = jpeg_result_height(r)
+    let feats = list_new()
+    push(feats, VP_LABEL_JPEG_HEADER)
+    // We still want the size bucket so dim atoms are emitted even
+    // without pixel data.
+    let area_bucket = 2
+    if w > 0 {
+        if h > 0 {
+            if w <= 256 {
+                if h <= 256 {
+                    let area = w * h
+                    if area <= VP_DIM_SMALL_AREA { area_bucket = 0 }
+                    else {
+                        if area <= VP_DIM_MEDIUM_AREA { area_bucket = 1 }
+                    }
+                }
+            }
+        }
+    }
+    if area_bucket == 0 { push(feats, VP_LABEL_DIM_SMALL) }
+    if area_bucket == 1 { push(feats, VP_LABEL_DIM_MEDIUM) }
+    if area_bucket == 2 { push(feats, VP_LABEL_DIM_LARGE) }
+    // Build summary that includes the dimensions (so operators see
+    // the header parse succeeded even though pixels are missing).
+    let summary = ""
+    if w > 0 {
+        if h > 0 {
+            summary = "image: jpeg " + int_to_str(w) + "x" + int_to_str(h)
+                + " header parsed (pixel decode pending; see JPEG_AUDIT.md)"
+        } else {
+            summary = "image: jpeg decode failed -- " + err
+        }
+    } else {
+        summary = "image: jpeg decode failed -- " + err
+    }
+    // The error_msg passed up to the caller IS the documented gap
+    // message from jpeg_decode_grayscale (carrying the dimensions),
+    // which the chat will print via the (saw image ... FAILED ...)
+    // path. We deliberately pass the gap as `error_msg` so the chat's
+    // existing "vp_result_error -> /see FAILED" branch triggers and
+    // the operator sees the diagnostic. Width / height are also
+    // available via vp_seam_last_summary.
+    return _vp_result(s, feats, VP_CONFIDENCE_NONE, err, summary)
+}
+
 // ---- file-extension routing -----------------------------------------------
 //
 // `_vp_pick_decoder_for_path(seam, path)` lets the seam route a `.png`
@@ -543,12 +617,35 @@ fn _vp_path_ends_with_pgm(path) {
     return 1
 }
 
+fn _vp_path_ends_with_jpg(path) {
+    let n = len(path)
+    if n < 4 { return 0 }
+    if char_at(path, n - 4) != 46 { return 0 }    // '.'
+    if char_at(path, n - 3) != 106 { return 0 }   // 'j'
+    if char_at(path, n - 2) != 112 { return 0 }   // 'p'
+    if char_at(path, n - 1) != 103 { return 0 }   // 'g'
+    return 1
+}
+
+fn _vp_path_ends_with_jpeg(path) {
+    let n = len(path)
+    if n < 5 { return 0 }
+    if char_at(path, n - 5) != 46 { return 0 }    // '.'
+    if char_at(path, n - 4) != 106 { return 0 }   // 'j'
+    if char_at(path, n - 3) != 112 { return 0 }   // 'p'
+    if char_at(path, n - 2) != 101 { return 0 }   // 'e'
+    if char_at(path, n - 1) != 103 { return 0 }   // 'g'
+    return 1
+}
+
 fn _vp_pick_decoder_for_path(s, path) {
     // Forced STUB: never auto-route, the operator wants the placeholder.
     let dflt = s[VP_DEFAULT_DEC]
     if dflt == VP_DECODER_STUB { return VP_DECODER_STUB }
     if _vp_path_ends_with_png(path) == 1 { return VP_DECODER_PNG }
     if _vp_path_ends_with_pgm(path) == 1 { return VP_DECODER_PGM }
+    if _vp_path_ends_with_jpg(path) == 1 { return VP_DECODER_JPEG }
+    if _vp_path_ends_with_jpeg(path) == 1 { return VP_DECODER_JPEG }
     return dflt
 }
 
@@ -567,6 +664,7 @@ fn vp_decode_image(s, path) {
     list_set(s, VP_LAST_DEC, id)
     if id == VP_DECODER_PGM    { return _vp_decode_pgm(s, path) }
     if id == VP_DECODER_PNG    { return _vp_decode_png(s, path) }
+    if id == VP_DECODER_JPEG   { return _vp_decode_jpeg(s, path) }
     if id == VP_DECODER_STUB   { return _vp_decode_stub(s, path) }
     // Custom / unknown ids fall through to STUB (same contract as
     // stt_seam.nova). A pluggable future replaces this with a function-

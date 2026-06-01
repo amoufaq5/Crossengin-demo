@@ -1,0 +1,733 @@
+// CrossEngin io/transducers: JPEG (baseline sequential) header parser (P3.1.JPEG).
+//
+// Purpose
+//   The next plank after PNG (P3.1.PNG) in the modality bridge -- a
+//   minimum-viable pure-NOVA reader for the BASELINE-SEQUENTIAL
+//   8-bit-grayscale JPEG format. JPEG is the dominant on-disk format
+//   for photographs and is the format `IMAGE_AUDIT.md` calls out as
+//   "JPEG before PNG" for the agent's perception path. The full JPEG
+//   decoder is 6-8 weeks of work (Huffman entropy + IDCT + de-quant +
+//   block assembly); this session ships the STRUCTURAL HALF only --
+//   segment-marker parsing, DQT + SOF0 + DHT table extraction -- so the
+//   agent can know the dimensions and validate a JPEG file before the
+//   entropy decoder lands.
+//
+//   Scope of this MVP (deferred items are spelled out below):
+//     * Segment marker iteration (SOI/APPn/COM/DQT/SOF0/DHT/SOS/EOI)
+//                                            supported
+//     * DQT parse (quantization table)        supported
+//     * SOF0 parse (baseline dimensions)      supported
+//     * DHT parse (Huffman table headers)     supported
+//     * APPn / COM / unknown markers          skipped over by length
+//     * SOF1/2/3/.. (extended / progressive / lossless / arithmetic)
+//                                            DEFERRED (rejected at parse)
+//     * SOS scan-data + Huffman entropy decode  DEFERRED (~1 week)
+//     * De-quantize + inverse zig-zag          DEFERRED (~3 days)
+//     * 8x8 IDCT (DCT inverse)                  DEFERRED (~1 week)
+//     * Block-row assembly into pixel buffer    DEFERRED (~3 days)
+//     * YCbCr -> RGB color conversion          DEFERRED (grayscale-only MVP)
+//     * 4:2:0 / 4:2:2 chroma subsampling       DEFERRED (grayscale-only MVP)
+//
+//   The "structural half" lets the agent open a real JPEG, identify it
+//   as a valid baseline grayscale JPEG, report its dimensions on the
+//   perception path, and surface a clear "JPEG entropy decode TODO"
+//   message in the chat so operators know what is missing. This is the
+//   same pattern PNG used (DEFLATE stored-only) and the same pattern
+//   the audio modality used (STT subprocess shim until pure-NOVA STT
+//   lands). See `JPEG_AUDIT.md` for the wall-clock estimate on the
+//   missing pieces.
+//
+// Public API
+//   jpeg_parse_segments(bytes_ptr, len) -> list of
+//       [marker, offset, length] tuples (one per segment found)
+//   jpeg_parse_dqt(bytes_ptr, segment_offset, segment_length) ->
+//       list of [precision, table_id, list_of_64_ints] tuples (a DQT
+//       segment may carry MORE than one quantization table)
+//   jpeg_parse_sof0(bytes_ptr, segment_offset, segment_length) ->
+//       [precision, height, width, n_components,
+//        list_of_[id, h_samp, v_samp, q_table_id], error_msg]
+//   jpeg_parse_dht(bytes_ptr, segment_offset, segment_length) ->
+//       list of [table_class, table_id, list_of_16_length_counts,
+//                list_of_symbols] tuples (a DHT segment may carry MORE
+//       than one Huffman table)
+//   jpeg_decode_grayscale(path) -> [width, height, pixel_data, error]
+//       where pixel_data is "" and error is the documented "not yet
+//       implemented" string. Returns the SOF0 dims in width/height
+//       slots so the perception path can still surface them.
+//
+// JPEG marker layout (ITU-T T.81 Annex B):
+//   Every segment begins with a 2-byte marker: 0xFF followed by a
+//   marker code byte (0x00 = byte stuffing, 0xFF = filler, 0xD8 = SOI,
+//   0xD9 = EOI, 0xC0 = SOF0 baseline, 0xC4 = DHT, 0xDB = DQT, 0xDA = SOS,
+//   0xE0..0xEF = APPn, 0xFE = COM, ...). Most segments carry a 2-byte
+//   big-endian length field (including the length bytes themselves)
+//   right after the marker; SOI / EOI / TEM and the RST markers
+//   (0xD0..0xD7) are length-less.
+//
+// DQT layout (ITU-T T.81 section B.2.4.1):
+//   Each table in a DQT segment: 1 byte (Pq:4 | Tq:4) where Pq is
+//   precision (0 = 8-bit, 1 = 16-bit) and Tq is table id (0..3), then
+//   64 quantization values in zig-zag order. 8-bit table = 64 bytes;
+//   16-bit table = 128 bytes (16-bit big-endian). A single DQT segment
+//   can hold multiple tables back-to-back.
+//
+// SOF0 layout (ITU-T T.81 section B.2.2):
+//   1 byte  precision (always 8 for baseline)
+//   2 bytes height (big-endian)
+//   2 bytes width  (big-endian)
+//   1 byte  n_components (1 for grayscale, 3 for YCbCr)
+//   per component:
+//     1 byte  component id (1 = Y, 2 = Cb, 3 = Cr conventionally)
+//     1 byte  (H_sampling:4 | V_sampling:4)
+//     1 byte  quantization table id (0..3)
+//
+// DHT layout (ITU-T T.81 section B.2.4.2):
+//   1 byte (Tc:4 | Th:4) where Tc is table class (0 = DC, 1 = AC) and
+//     Th is table id (0..3 for baseline)
+//   16 bytes: number of codes of each length (1..16)
+//   N bytes: the actual code values, where N = sum of the 16 length
+//     counts. A single DHT segment can hold multiple tables.
+//
+// File cap: JPEG dimensions are bounded at 1024x1024 (mirror of
+// PGM_MAX_DIM / PNG_MAX_DIM) so the dimension product stays at or
+// under NOVA's codegen pointer-threshold gotcha #11. File-read cap
+// is 1 MiB (1048576 bytes); JPEG is heavily compressed so a 1024x1024
+// grayscale photograph is typically 50-300 KB on disk.
+//
+// NOVA gotchas worked around:
+//   - JPEG is BIG-ENDIAN throughout (markers, lengths, dimensions).
+//     We use byte-by-byte int_mul-based reads same as `png_decode.nova`.
+//   - Codegen pointer-threshold (gotcha #11): dimension product
+//     (width * height) capped at 1024*1024 = 1048576 = 2^20.
+//   - File cap 1 MiB matches `JPEG_MAX_FILE_BYTES` defined below; the
+//     decoder rejects oversized files at read time.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_to_str, int_add, int_mul, int_sub, int_and,
+//   int_shr, sys_open, sys_read, sys_close from std/syscall.
+// CrossEngin dependencies: NONE (leaf module like deflate_decode.nova
+//   for now; the future entropy/IDCT path will likely live in
+//   sibling .nova files imported here).
+
+import "std/syscall"
+
+// ---- marker constants -----------------------------------------------------
+//
+// JPEG marker bytes follow a 0xFF prefix. We name only the markers we
+// care about; everything else falls through to the "skip by length"
+// branch in the segment iterator.
+
+let JPEG_MARKER_PREFIX = 255    // 0xFF
+let JPEG_MARKER_SOI    = 216    // 0xD8: Start Of Image (no length)
+let JPEG_MARKER_EOI    = 217    // 0xD9: End Of Image (no length)
+let JPEG_MARKER_SOF0   = 192    // 0xC0: baseline DCT
+let JPEG_MARKER_SOF1   = 193    // 0xC1: extended sequential (DEFERRED)
+let JPEG_MARKER_SOF2   = 194    // 0xC2: progressive (DEFERRED)
+let JPEG_MARKER_SOF3   = 195    // 0xC3: lossless (DEFERRED)
+let JPEG_MARKER_DHT    = 196    // 0xC4: Define Huffman Table
+let JPEG_MARKER_DAC    = 204    // 0xCC: arithmetic coding (DEFERRED)
+let JPEG_MARKER_DQT    = 219    // 0xDB: Define Quantization Table
+let JPEG_MARKER_DRI    = 221    // 0xDD: Define Restart Interval
+let JPEG_MARKER_SOS    = 218    // 0xDA: Start Of Scan (entropy-coded data follows)
+let JPEG_MARKER_COM    = 254    // 0xFE: Comment
+let JPEG_MARKER_APP0   = 224    // 0xE0: JFIF / JFXX header
+let JPEG_MARKER_APP1   = 225    // 0xE1: EXIF / XMP header
+let JPEG_MARKER_APPF   = 239    // 0xEF: highest APPn (APP15)
+
+// Restart markers 0xD0..0xD7 are inline within scan data and length-less.
+let JPEG_MARKER_RST0   = 208
+let JPEG_MARKER_RST7   = 215
+
+// ---- caps / sentinels -----------------------------------------------------
+
+let JPEG_MAX_DIM        = 1024
+let JPEG_MAX_PIXEL_AREA = 1048576    // 1024 * 1024
+
+// File cap. JPEG is heavily compressed so this gives plenty of headroom
+// for the kind of photograph the perception path will encounter.
+let JPEG_MAX_FILE_BYTES = 1048576    // 1 MiB
+
+// A DQT segment with a single 8-bit table is exactly 64 entries.
+let JPEG_DQT_ENTRIES = 64
+
+// DHT length counts are always 16 (one per code length 1..16 bits).
+let JPEG_DHT_LENGTHS = 16
+
+// Baseline JPEG SOF0 precision is always 8 bits per sample.
+let JPEG_BASELINE_PRECISION = 8
+
+// Maximum components in SOF0 we care about: grayscale=1, YCbCr=3 (CMYK=4
+// is out of scope for the MVP).
+let JPEG_MAX_COMPONENTS = 4
+
+// Result tuple indices for jpeg_decode_grayscale.
+let JPEG_R_WIDTH  = 0
+let JPEG_R_HEIGHT = 1
+let JPEG_R_DATA   = 2
+let JPEG_R_ERROR  = 3
+
+// Segment tuple indices for jpeg_parse_segments entries.
+let JPEG_S_MARKER = 0
+let JPEG_S_OFFSET = 1
+let JPEG_S_LENGTH = 2
+
+// DQT-per-table tuple indices.
+let JPEG_DQT_PRECISION = 0
+let JPEG_DQT_TABLE_ID  = 1
+let JPEG_DQT_ENTRIES_I = 2
+
+// SOF0 result tuple indices.
+let JPEG_SOF0_PRECISION  = 0
+let JPEG_SOF0_HEIGHT     = 1
+let JPEG_SOF0_WIDTH      = 2
+let JPEG_SOF0_NCOMPS     = 3
+let JPEG_SOF0_COMPONENTS = 4
+let JPEG_SOF0_ERROR      = 5
+
+// Per-component tuple indices inside SOF0_COMPONENTS.
+let JPEG_COMP_ID         = 0
+let JPEG_COMP_H_SAMP     = 1
+let JPEG_COMP_V_SAMP     = 2
+let JPEG_COMP_QTABLE_ID  = 3
+
+// DHT-per-table tuple indices.
+let JPEG_DHT_CLASS      = 0
+let JPEG_DHT_TABLE_ID   = 1
+let JPEG_DHT_LENGTHS_I  = 2
+let JPEG_DHT_SYMBOLS_I  = 3
+
+// ---- result helpers -------------------------------------------------------
+
+fn _jpeg_decode_result(width, height, data, error_msg) {
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, data)
+    push(r, error_msg)
+    return r
+}
+
+fn _jpeg_decode_fail(error_msg) {
+    return _jpeg_decode_result(0, 0, "", error_msg)
+}
+
+fn _jpeg_segment(marker, offset, length) {
+    let r = list_new()
+    push(r, marker)
+    push(r, offset)
+    push(r, length)
+    return r
+}
+
+fn _jpeg_dqt_table(precision, table_id, entries) {
+    let r = list_new()
+    push(r, precision)
+    push(r, table_id)
+    push(r, entries)
+    return r
+}
+
+fn _jpeg_dht_table(table_class, table_id, lengths, symbols) {
+    let r = list_new()
+    push(r, table_class)
+    push(r, table_id)
+    push(r, lengths)
+    push(r, symbols)
+    return r
+}
+
+fn _jpeg_sof0_result(precision, height, width, n_comps, comps, error_msg) {
+    let r = list_new()
+    push(r, precision)
+    push(r, height)
+    push(r, width)
+    push(r, n_comps)
+    push(r, comps)
+    push(r, error_msg)
+    return r
+}
+
+fn _jpeg_sof0_fail(error_msg) {
+    let empty = list_new()
+    return _jpeg_sof0_result(0, 0, 0, 0, empty, error_msg)
+}
+
+fn _jpeg_comp(id, h_samp, v_samp, qtable_id) {
+    let r = list_new()
+    push(r, id)
+    push(r, h_samp)
+    push(r, v_samp)
+    push(r, qtable_id)
+    return r
+}
+
+// ---- result accessors -----------------------------------------------------
+
+fn jpeg_result_width(r)  { return r[JPEG_R_WIDTH] }
+fn jpeg_result_height(r) { return r[JPEG_R_HEIGHT] }
+fn jpeg_result_data(r)   { return r[JPEG_R_DATA] }
+fn jpeg_result_error(r)  { return r[JPEG_R_ERROR] }
+fn jpeg_result_ok(r) {
+    if len(r[JPEG_R_ERROR]) > 0 { return 0 }
+    if r[JPEG_R_WIDTH] <= 0 { return 0 }
+    return 1
+}
+
+fn jpeg_segment_marker(seg) { return seg[JPEG_S_MARKER] }
+fn jpeg_segment_offset(seg) { return seg[JPEG_S_OFFSET] }
+fn jpeg_segment_length(seg) { return seg[JPEG_S_LENGTH] }
+
+fn jpeg_dqt_precision(t) { return t[JPEG_DQT_PRECISION] }
+fn jpeg_dqt_table_id(t)  { return t[JPEG_DQT_TABLE_ID] }
+fn jpeg_dqt_entries(t)   { return t[JPEG_DQT_ENTRIES_I] }
+
+fn jpeg_dht_class(t)     { return t[JPEG_DHT_CLASS] }
+fn jpeg_dht_table_id(t)  { return t[JPEG_DHT_TABLE_ID] }
+fn jpeg_dht_lengths(t)   { return t[JPEG_DHT_LENGTHS_I] }
+fn jpeg_dht_symbols(t)   { return t[JPEG_DHT_SYMBOLS_I] }
+
+fn jpeg_sof0_precision(r)  { return r[JPEG_SOF0_PRECISION] }
+fn jpeg_sof0_height(r)     { return r[JPEG_SOF0_HEIGHT] }
+fn jpeg_sof0_width(r)      { return r[JPEG_SOF0_WIDTH] }
+fn jpeg_sof0_n_comps(r)    { return r[JPEG_SOF0_NCOMPS] }
+fn jpeg_sof0_components(r) { return r[JPEG_SOF0_COMPONENTS] }
+fn jpeg_sof0_error(r)      { return r[JPEG_SOF0_ERROR] }
+
+fn jpeg_comp_id(c)         { return c[JPEG_COMP_ID] }
+fn jpeg_comp_h_samp(c)     { return c[JPEG_COMP_H_SAMP] }
+fn jpeg_comp_v_samp(c)     { return c[JPEG_COMP_V_SAMP] }
+fn jpeg_comp_qtable_id(c)  { return c[JPEG_COMP_QTABLE_ID] }
+
+// ---- big-endian readers ---------------------------------------------------
+//
+// JPEG length / dimension fields are 2-byte big-endian. We do the multiply
+// via int_mul so the result stays safe past NOVA's 1MB threshold (a 16-bit
+// length never exceeds 65535, well under the ceiling, but consistency with
+// `png_decode.nova` is worth it).
+
+fn _jpeg_read_u16_be(bytes_ptr, off) {
+    let b0 = load8(bytes_ptr + off)
+    let b1 = load8(bytes_ptr + off + 1)
+    return int_add(int_mul(b0, 256), b1)
+}
+
+// ---- segment iterator -----------------------------------------------------
+//
+// Walk a JPEG bytestream starting at offset 0, return a list of
+// [marker, offset, length] tuples one per segment. The walk:
+//   1. Expect 0xFF marker prefix; skip filler 0xFF bytes between segments.
+//   2. Read the marker code byte. SOI/EOI/TEM/RSTn are length-less.
+//   3. For every other marker, read the 2-byte big-endian length field
+//      (which INCLUDES the length bytes themselves -- so the payload
+//      size is `length - 2`).
+//   4. The `offset` in the returned tuple points at the start of the
+//      PAYLOAD (after the marker AND the length bytes); `length` is the
+//      payload length (length_field - 2). For SOI/EOI/RSTn (no length)
+//      offset points at the marker itself and length is 0.
+//   5. SOS marks the start of entropy-coded data. Per ITU-T T.81 B.1.1.2
+//      "the data following the SOS segment shall be the entropy-coded
+//      data segment...". For our purposes we record the SOS segment
+//      and stop iteration; the entropy data is parsed by the (deferred)
+//      Huffman path. We do NOT scan past SOS for nested markers since
+//      a 0xFF in entropy-coded data is escaped as 0xFF 0x00.
+//
+// Returns: a list (possibly empty) of segment tuples. Callers should
+// look for SOI as the first tuple and EOI as the last; the SOF0 / DQT /
+// DHT tuples in between are what the parser functions consume.
+
+fn jpeg_parse_segments(bytes_ptr, total_len) {
+    let out = list_new()
+    if total_len < 2 { return out }
+    let off = 0
+    let keep = 1
+    while keep == 1 {
+        // Skip filler bytes between markers (per ITU-T T.81 B.1.1.2).
+        // Multiple 0xFF bytes in a row before a non-zero marker code
+        // are legal "filler"; we advance past them. We use a sentinel
+        // variable rather than `break` so the loop stays portable to
+        // every NOVA codegen path the rest of CrossEngin uses.
+        let scanning = 1
+        while scanning == 1 {
+            if off >= total_len {
+                scanning = 0
+                keep = 0
+                return out
+            }
+            if load8(bytes_ptr + off) == JPEG_MARKER_PREFIX {
+                if off + 1 >= total_len {
+                    scanning = 0
+                    keep = 0
+                    return out
+                }
+                let next = load8(bytes_ptr + off + 1)
+                if next == JPEG_MARKER_PREFIX {
+                    // Filler 0xFF 0xFF; advance one byte and re-check.
+                    off = off + 1
+                } else {
+                    // Real marker found; stop scanning and fall through.
+                    scanning = 0
+                }
+            } else {
+                // No marker prefix here -- could be entropy data we
+                // walked into; abort iteration.
+                scanning = 0
+                keep = 0
+                return out
+            }
+        }
+        if off >= total_len { keep = 0; return out }
+        if off + 1 >= total_len { keep = 0; return out }
+        if load8(bytes_ptr + off) != JPEG_MARKER_PREFIX {
+            keep = 0
+            return out
+        }
+        let marker = load8(bytes_ptr + off + 1)
+        // SOI / EOI / TEM / RSTn / 0x00 padding: length-less.
+        if _jpeg_marker_is_lengthless(marker) == 1 {
+            push(out, _jpeg_segment(marker, off, 0))
+            off = int_add(off, 2)
+            if marker == JPEG_MARKER_EOI { keep = 0 }
+        } else {
+            // Standard length-prefixed segment. Read the 2-byte
+            // big-endian length field that follows the marker.
+            if off + 4 > total_len {
+                // Truncated length field.
+                push(out, _jpeg_segment(marker, off, 0))
+                keep = 0
+                return out
+            }
+            let length_field = _jpeg_read_u16_be(bytes_ptr, off + 2)
+            // payload size = length_field - 2 (length field includes
+            // its own two bytes per ITU-T T.81 B.1.1.4).
+            let payload_len = 0
+            if length_field >= 2 {
+                payload_len = int_sub(length_field, 2)
+            }
+            let payload_off = int_add(off, 4)
+            if int_add(payload_off, payload_len) > total_len {
+                // Truncated payload.
+                push(out, _jpeg_segment(marker, payload_off, 0))
+                keep = 0
+                return out
+            }
+            push(out, _jpeg_segment(marker, payload_off, payload_len))
+            // SOS marks start of entropy-coded data; stop walking.
+            if marker == JPEG_MARKER_SOS {
+                keep = 0
+                return out
+            }
+            off = int_add(payload_off, payload_len)
+        }
+    }
+    return out
+}
+
+// Return 1 if `marker` is one of the length-less JPEG markers
+// (SOI, EOI, TEM, RST0..RST7). All others carry a 2-byte length field.
+fn _jpeg_marker_is_lengthless(marker) {
+    if marker == JPEG_MARKER_SOI { return 1 }
+    if marker == JPEG_MARKER_EOI { return 1 }
+    // TEM = 0x01; RSTn = 0xD0..0xD7.
+    if marker == 1 { return 1 }
+    if marker >= JPEG_MARKER_RST0 {
+        if marker <= JPEG_MARKER_RST7 { return 1 }
+    }
+    // 0x00 is byte-stuffing (used to escape 0xFF inside entropy data).
+    if marker == 0 { return 1 }
+    return 0
+}
+
+// ---- DQT parser -----------------------------------------------------------
+//
+// jpeg_parse_dqt(bytes_ptr, segment_offset, segment_length) -> list of
+//   [precision, table_id, list_of_64_ints] tuples
+//
+// A single DQT segment can carry MORE than one quantization table; we
+// walk the segment payload until exhausted. Each table is either 65 bytes
+// (8-bit precision Pq=0, 1 + 64) or 129 bytes (16-bit precision Pq=1,
+// 1 + 128). Baseline JPEG only uses 8-bit tables; we still PARSE 16-bit
+// tables defensively so the iterator does not stall on a non-baseline
+// fixture, but the values are stored as their raw 16-bit unsigned ints.
+
+fn jpeg_parse_dqt(bytes_ptr, segment_off, segment_len) {
+    let out = list_new()
+    let pos = 0
+    while pos < segment_len {
+        if int_add(pos, 1) > segment_len {
+            return out
+        }
+        let header = load8(bytes_ptr + segment_off + pos)
+        let precision = int_shr(header, 4)         // Pq: upper 4 bits
+        let table_id  = int_and(header, 15)        // Tq: lower 4 bits
+        let entry_bytes = 64
+        if precision == 1 {
+            entry_bytes = 128
+        }
+        if int_add(pos + 1, entry_bytes) > segment_len {
+            return out
+        }
+        let entries = list_new()
+        let i = 0
+        while i < JPEG_DQT_ENTRIES {
+            if precision == 0 {
+                let v = load8(bytes_ptr + segment_off + pos + 1 + i)
+                push(entries, v)
+            } else {
+                // 16-bit big-endian entry.
+                let hi = load8(bytes_ptr + segment_off + pos + 1 + i * 2)
+                let lo = load8(bytes_ptr + segment_off + pos + 1 + i * 2 + 1)
+                push(entries, int_add(int_mul(hi, 256), lo))
+            }
+            i = i + 1
+        }
+        push(out, _jpeg_dqt_table(precision, table_id, entries))
+        pos = int_add(pos, int_add(1, entry_bytes))
+    }
+    return out
+}
+
+// ---- SOF0 parser ----------------------------------------------------------
+//
+// jpeg_parse_sof0(bytes_ptr, segment_offset, segment_length) ->
+//   [precision, height, width, n_components, components, error_msg]
+//
+// SOF0 segment payload:
+//   1 byte  P (sample precision, always 8 for baseline)
+//   2 bytes Y (height, big-endian)
+//   2 bytes X (width, big-endian)
+//   1 byte  Nf (number of components, 1 or 3 typically)
+//   per component:
+//     1 byte Ci (component id)
+//     1 byte (Hi:4 | Vi:4) sampling factors
+//     1 byte Tqi (quantization table id, 0..3)
+// Minimum payload = 6 + 3 * Nf bytes.
+
+fn jpeg_parse_sof0(bytes_ptr, segment_off, segment_len) {
+    if segment_len < 6 {
+        return _jpeg_sof0_fail("jpeg: SOF0 segment too short for header")
+    }
+    let precision  = load8(bytes_ptr + segment_off + 0)
+    let height     = _jpeg_read_u16_be(bytes_ptr, segment_off + 1)
+    let width      = _jpeg_read_u16_be(bytes_ptr, segment_off + 3)
+    let n_comps    = load8(bytes_ptr + segment_off + 5)
+    if precision != JPEG_BASELINE_PRECISION {
+        return _jpeg_sof0_fail("jpeg: SOF0 precision != 8 (only baseline 8-bit supported)")
+    }
+    if width <= 0 {
+        return _jpeg_sof0_fail("jpeg: SOF0 width is zero")
+    }
+    if height <= 0 {
+        return _jpeg_sof0_fail("jpeg: SOF0 height is zero")
+    }
+    if width > JPEG_MAX_DIM {
+        return _jpeg_sof0_fail("jpeg: width exceeds 1024 (downsample first)")
+    }
+    if height > JPEG_MAX_DIM {
+        return _jpeg_sof0_fail("jpeg: height exceeds 1024 (downsample first)")
+    }
+    if n_comps <= 0 {
+        return _jpeg_sof0_fail("jpeg: SOF0 n_components is zero")
+    }
+    if n_comps > JPEG_MAX_COMPONENTS {
+        return _jpeg_sof0_fail("jpeg: SOF0 n_components > 4 (unsupported)")
+    }
+    let needed = int_add(6, int_mul(n_comps, 3))
+    if segment_len < needed {
+        return _jpeg_sof0_fail("jpeg: SOF0 segment truncated for component table")
+    }
+    let comps = list_new()
+    let i = 0
+    while i < n_comps {
+        let base = segment_off + 6 + i * 3
+        let id     = load8(bytes_ptr + base + 0)
+        let samp   = load8(bytes_ptr + base + 1)
+        let h_samp = int_shr(samp, 4)
+        let v_samp = int_and(samp, 15)
+        let qid    = load8(bytes_ptr + base + 2)
+        push(comps, _jpeg_comp(id, h_samp, v_samp, qid))
+        i = i + 1
+    }
+    return _jpeg_sof0_result(precision, height, width, n_comps, comps, "")
+}
+
+// ---- DHT parser -----------------------------------------------------------
+//
+// jpeg_parse_dht(bytes_ptr, segment_offset, segment_length) -> list of
+//   [table_class, table_id, list_of_16_length_counts, list_of_symbols]
+//
+// A single DHT segment can carry MULTIPLE Huffman tables back-to-back.
+// Each table layout:
+//   1 byte (Tc:4 | Th:4)
+//   16 bytes BITS[1..16] (number of codes of each bit length)
+//   N bytes HUFFVAL (the actual symbol values, length = sum of BITS)
+// Total per table = 1 + 16 + N bytes.
+
+fn jpeg_parse_dht(bytes_ptr, segment_off, segment_len) {
+    let out = list_new()
+    let pos = 0
+    while pos < segment_len {
+        if int_add(pos, 17) > segment_len {
+            return out
+        }
+        let header = load8(bytes_ptr + segment_off + pos)
+        let table_class = int_shr(header, 4)    // Tc: 0=DC, 1=AC
+        let table_id    = int_and(header, 15)   // Th: 0..3 (baseline)
+        // Read the 16 length counts.
+        let lengths = list_new()
+        let total_symbols = 0
+        let i = 0
+        while i < JPEG_DHT_LENGTHS {
+            let c = load8(bytes_ptr + segment_off + pos + 1 + i)
+            push(lengths, c)
+            total_symbols = int_add(total_symbols, c)
+            i = i + 1
+        }
+        // The symbol table follows immediately.
+        if int_add(pos + 17, total_symbols) > segment_len {
+            return out
+        }
+        let symbols = list_new()
+        let k = 0
+        while k < total_symbols {
+            let s = load8(bytes_ptr + segment_off + pos + 17 + k)
+            push(symbols, s)
+            k = k + 1
+        }
+        push(out, _jpeg_dht_table(table_class, table_id, lengths, symbols))
+        pos = int_add(pos, int_add(17, total_symbols))
+    }
+    return out
+}
+
+// ---- segment finders ------------------------------------------------------
+//
+// Convenience helpers for the dispatch path: walk a segment list returned
+// by jpeg_parse_segments and find the first SOF0 / first SOS / first DQT
+// segment by marker code. Returns the segment tuple or 0 if not found.
+
+fn jpeg_find_segment(segments, marker) {
+    let i = 0
+    let n = len(segments)
+    while i < n {
+        let s = segments[i]
+        if jpeg_segment_marker(s) == marker {
+            return s
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn jpeg_count_segments(segments, marker) {
+    let count = 0
+    let i = 0
+    let n = len(segments)
+    while i < n {
+        let s = segments[i]
+        if jpeg_segment_marker(s) == marker {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ---- decoder entry point --------------------------------------------------
+//
+// jpeg_decode_grayscale(path) -- the full pipeline target. For now this
+// reads the file, parses the structural segments (SOI/.../SOS/EOI),
+// validates the JPEG is baseline grayscale, and returns the dimensions
+// in the width/height slots of the result tuple WITHOUT decoding any
+// pixels. The error_msg slot carries the "JPEG entropy decode + IDCT
+// not yet implemented" message so the perception path can surface a
+// clear "feature is coming" diagnostic. pixel_data is set to "" to
+// indicate "no data available".
+
+fn jpeg_decode_grayscale(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 {
+        return _jpeg_decode_fail("jpeg: cannot open file")
+    }
+    let buf = alloc(JPEG_MAX_FILE_BYTES + 1)
+    let total = 0
+    let keep = 1
+    let chunk = 4096
+    while keep == 1 {
+        let space_left = int_sub(JPEG_MAX_FILE_BYTES, total)
+        let want = chunk
+        if want > space_left { want = space_left }
+        if want <= 0 { keep = 0 }
+        if keep == 1 {
+            let n = sys_read(fd, buf + total, want)
+            if n <= 0 {
+                keep = 0
+            } else {
+                total = int_add(total, n)
+                if total >= JPEG_MAX_FILE_BYTES { keep = 0 }
+            }
+        }
+    }
+    sys_close(fd)
+    if total <= 0 {
+        return _jpeg_decode_fail("jpeg: empty file")
+    }
+    return jpeg_decode_grayscale_bytes(buf, total)
+}
+
+// In-memory variant. Useful for unit tests that build a fixture in alloc'd
+// memory rather than on disk.
+fn jpeg_decode_grayscale_bytes(buf, total) {
+    if total < 4 {
+        return _jpeg_decode_fail("jpeg: file too short")
+    }
+    // Validate SOI: 0xFF 0xD8 at the start.
+    if load8(buf + 0) != JPEG_MARKER_PREFIX {
+        return _jpeg_decode_fail("jpeg: missing SOI marker (first byte != 0xFF)")
+    }
+    if load8(buf + 1) != JPEG_MARKER_SOI {
+        return _jpeg_decode_fail("jpeg: missing SOI marker (second byte != 0xD8)")
+    }
+    let segments = jpeg_parse_segments(buf, total)
+    let nseg = len(segments)
+    if nseg == 0 {
+        return _jpeg_decode_fail("jpeg: no segments parsed")
+    }
+    // Look for SOF0.
+    let sof0_seg = jpeg_find_segment(segments, JPEG_MARKER_SOF0)
+    if sof0_seg == 0 {
+        // Check whether the file uses an unsupported SOF variant.
+        if jpeg_find_segment(segments, JPEG_MARKER_SOF1) != 0 {
+            return _jpeg_decode_fail("jpeg: SOF1 (extended sequential) not supported -- see JPEG_AUDIT.md")
+        }
+        if jpeg_find_segment(segments, JPEG_MARKER_SOF2) != 0 {
+            return _jpeg_decode_fail("jpeg: SOF2 (progressive) not supported -- see JPEG_AUDIT.md")
+        }
+        if jpeg_find_segment(segments, JPEG_MARKER_SOF3) != 0 {
+            return _jpeg_decode_fail("jpeg: SOF3 (lossless) not supported -- see JPEG_AUDIT.md")
+        }
+        return _jpeg_decode_fail("jpeg: no SOF0 (baseline) marker found")
+    }
+    let sof0 = jpeg_parse_sof0(buf, jpeg_segment_offset(sof0_seg),
+                               jpeg_segment_length(sof0_seg))
+    let sof0_err = jpeg_sof0_error(sof0)
+    if len(sof0_err) > 0 {
+        return _jpeg_decode_fail(sof0_err)
+    }
+    let width  = jpeg_sof0_width(sof0)
+    let height = jpeg_sof0_height(sof0)
+    let n_comps = jpeg_sof0_n_comps(sof0)
+    // For grayscale, n_comps must be 1.
+    if n_comps != 1 {
+        // Return dimensions but a clear color-not-supported message so
+        // the perception path can still surface the size.
+        return _jpeg_decode_result(width, height, "",
+            "jpeg: n_components=" + int_to_str(n_comps)
+            + " (only grayscale n_components=1 supported in MVP); see JPEG_AUDIT.md")
+    }
+    // STRUCTURAL parse OK. Surface the documented gap message with the
+    // dimensions filled in so callers can still report them.
+    return _jpeg_decode_result(width, height, "",
+        "jpeg: " + int_to_str(width) + "x" + int_to_str(height)
+        + " grayscale baseline header parsed; entropy decode + IDCT not yet implemented; see JPEG_AUDIT.md")
+}
