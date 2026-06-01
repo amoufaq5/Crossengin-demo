@@ -896,3 +896,127 @@ per iter**).
     the other in-tree caller. That migration is **R7C's scope** and
     targets `bn2048_modpow_ct` (RFC 7919 Group 14, strength upgrade
     in addition to perf), so this audit does not touch noise_xk.
+
+## R9F appendix — Byzantine-resilient federated aggregation (P3.10 / ADR-0056)
+
+### What R9F adds
+
+A new leaf module `src/learning/byzantine_aggregation.nova` plus a
+Byzantine-aware accumulator path in `federated_aggregator.nova`. The
+module ships two coordinate-wise robust aggregation rules:
+
+  * **Trimmed mean** (`byz_trimmed_mean(updates, trim_k)`):
+    sort each coordinate across participants, drop the top-k and
+    bottom-k extreme values, mean of the remainder. Tolerates `k`
+    Byzantine participants per coordinate. Fast (O(n^2) insertion
+    sort dominates; n is small in practice).
+  * **Coordinate-wise median** (`byz_coordinate_median(updates)`):
+    median per coordinate. Tolerates up to ~n/2 Byzantine in the
+    worst case. Same per-coord cost as trimmed mean; no `trim_k`
+    knob to tune.
+
+Both algorithms work on lists of integer-vector "updates" so the same
+module can serve federated rate-of-promotion aggregation today and
+generic D-dim model deltas in a future round.
+
+A `byz_aggregate(updates, strategy, trim_k)` dispatcher routes the
+caller's `BYZ_NONE | BYZ_TRIMMED_MEAN | BYZ_MEDIAN` choice. The
+existing `federated_aggregator.nova` gains a parallel accumulator
+(`fed_acc_byz_*`) that keeps per-participant rows rather than
+collapsing to a sum, and a `fed_acc_byz_aggregate(acc, strategy,
+trim_k)` reducer that returns the same shape as `fed_acc_averages`.
+
+### The SecAgg vs Byzantine trade-off (deliberate)
+
+SecAgg's privacy guarantee is that the coordinator sees ONLY the SUM
+of all souls' contributions: per-soul values are hidden via pairwise
+additive masks that cancel in aggregate. A coordinator following the
+protocol literally cannot inspect a single soul's masked submission.
+
+Byzantine-resilient aggregation does the OPPOSITE: to filter
+adversarial outliers, the aggregator MUST inspect each soul's
+contribution individually. The two are FUNDAMENTALLY in tension at
+this layer. Two naive composition options exist:
+
+  * **SecAgg-then-Byzantine** -- coordinator decrypts to per-soul
+    values, then trims. This DEFEATS SecAgg's privacy property:
+    inspecting per-soul values to filter outliers is exactly the
+    capability SecAgg withholds from the coordinator.
+  * **Byzantine-then-SecAgg** -- each soul filters its OWN update
+    before masking. Trivially circumventable: a Byzantine soul
+    simply skips the filter and masks its poisoned update directly.
+    The masks cancel as designed; the poisoned value contributes to
+    the sum without any defense.
+
+R9F therefore makes Byzantine resilience a SEPARATE PRIVACY POSTURE
+from SecAgg, not a layer over it. Operators pick ONE per round:
+
+  * **SecAgg mode** (use `sa_acc_*`): privacy guarantee, no Byzantine
+    defense beyond a per-soul range clamp (which an adversarial soul
+    can defeat by submitting in-range but biased values).
+  * **Byzantine mode** (use `fed_acc_byz_*`): per-soul plaintext
+    visible to the coordinator, robust aggregation against an
+    adaptive adversary up to f participants.
+
+The advanced primitives that would close this gap — zero-knowledge
+proofs of well-formedness on masked submissions, threshold-
+homomorphic encryption with range proofs, or trimmed-mean computed
+directly over secret shares — require months of crypto-protocol
+engineering and are deliberately out of scope for P3.10. The trade-
+off is surfaced here so operators choose the correct posture for
+their threat model.
+
+### Env knobs
+
+  * `CE_FL_BYZ_STRATEGY` -- `none` | `trimmed` | `median`. Default
+    `none` (preserves P3.7's averaging behaviour). Recognised
+    lowercase tokens only.
+  * `CE_FL_BYZ_TRIM_K` -- integer; the number of extreme values to
+    drop from EACH end per coordinate. Default `1`. A value of 0
+    reduces trimmed mean to the plain mean. Excessively large values
+    (`2 * trim_k >= n`) return zeros (degenerate config; caller
+    should reduce `trim_k`).
+
+### Verification
+
+  * `tests/unit/test_byzantine_aggregation.nova` -- 74 assertions
+    covering the algorithm semantics on the canonical fixtures, the
+    poisoning resilience (one 100x outlier among 5; both algorithms
+    track the honest cluster), multi-dim per-coord aggregation,
+    edge cases (empty / single-participant / 2-participant /
+    degenerate `trim_k`), the env parsers, the dispatcher routing,
+    and the `fed_acc_byz_*` integration with the federated
+    accumulator.
+  * `tests/integration/scenario_pp_byz_fl.sh` -- 15 assertions
+    against a NOVA driver that simulates 5 souls (4 honest, 1
+    Byzantine) submitting the same source rate. The bash side
+    asserts that BYZ_NONE produces a poisoned aggregate
+    (promo=2563, atr=2163 on a 9999-poisoned fixture where the
+    honest mean is 705/205), BYZ_TRIMMED_MEAN matches the honest
+    mean (promo=710, atr=210), and BYZ_MEDIAN matches the honest
+    median (promo=710, atr=210). The poisoning-skew reduction is
+    ~370x (NONE skew = 1858, trimmed skew = 5).
+  * `tests/unit/test_secure_aggregation.nova` -- 170 assertions
+    bit-identically green (the SecAgg path is untouched; the only
+    edit to `secure_aggregation.nova` was a header-comment note on
+    the trade-off).
+  * `tests/unit/test_federated_aggregator.nova` -- 91 assertions
+    bit-identically green (the FL aggregator gains the parallel
+    `fed_acc_byz_*` block but the existing `fed_acc_*` path is
+    unchanged).
+
+### Why R9F does NOT implement Krum / Bulyan
+
+  * **Krum** -- O(n^2 * d) per round. Implementable in pure NOVA, but
+    the n=5 federations CrossEngin currently runs are small enough
+    that median already pins the result to the honest cluster.
+    Trimmed mean is faster and gives most of the benefit at this
+    scale; the additional 2x slowdown of Krum buys little.
+  * **Bulyan** (Krum followed by trimmed mean) -- O(n^3) per round,
+    requires n >= 4f + 3. The asymptotic robustness guarantees
+    matter at the n=20+ scale; R9F's 5-soul fixture is too small
+    for the guarantees to bind.
+
+Both are tractable follow-ups when the federation scales. The current
+`byz_aggregate` dispatcher is structured so a future Krum / Bulyan
+addition is a one-case extension, not a re-architecture.
