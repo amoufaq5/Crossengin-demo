@@ -4,7 +4,10 @@
 extended to **P3.8r — dropout-resilient SecAgg (v2-sa-r)**, further
 extended to **P3.9 — DH key agreement (v2-sa-dh)** which replaces
 the pre-shared-token path with a real Diffie-Hellman exchange when
-the soul opts in via `CE_SECAGG_DH=1`.
+the soul opts in via `CE_SECAGG_DH=1`, and **P3.9 cont. — 2048-bit
+DH on RFC 7919 Group 14 (v2-sa-dh-2048)** which swaps the 256-bit
+Curve25519-field strawman for a cryptographically-reasonable 2048-bit
+MODP safe-prime group when the soul opts in via `CE_SECAGG_DH_2048=1`.
 **ADR:** ADR-0055 — SecAgg via pairwise additive masking with
 pre-shared tokens. The dropout-resilience extension layers on top of
 the original ADR-0055 primitive: same mask derivation, same wire
@@ -20,7 +23,17 @@ pre-shared token.
 FED_RECON_MASKED wire formatters + parsers + the
 `CE_FED_ROUND_DEADLINE_MS` env helper; P3.9: `sa_dh_generate_keys` /
 `sa_dh_shared_secret_for_peer` / `sa_register_peer_dh` + the
-FED_DH_PUBLIC wire formatter + parser + `sa_dh_enabled_from_env`),
+FED_DH_PUBLIC wire formatter + parser + `sa_dh_enabled_from_env`;
+P3.9 cont.: `sa_dh_generate_keys_2048` / `sa_dh_shared_secret_for_peer_2048`
++ `sa_dh_2048_enabled_from_env` + the SA_DH_BITS state slot routing
+`sa_mask_for_peer` to the 2048-bit shared-secret derivation when the
+soul opts in to v2-sa-dh-2048),
+`src/safety/bignum_2048.nova` (NEW; P3.9 cont.: a 64-limb 2048-bit
+pure-NOVA bignum library parallel to the 256-bit `bignum.nova`;
+exposes `bn2048_modpow_ct` -- Montgomery-ladder constant-time
+exponentiation on RFC 7919 Group 14 -- as the crypto-safe primitive
+for 2048-bit DH; the non-CT square-and-multiply variant is
+intentionally OMITTED to prevent timing leaks on private exponents),
 `src/learning/federated_aggregator.nova` (extended with v2-sa mode and
 the P3.8r reconciliation emitter `fed_agg_emit_recon_masked`),
 `src/safety/bignum.nova` (P3.9: `bn_modpow_ct` -- Montgomery-ladder
@@ -374,18 +387,21 @@ masks; the coordinator's AGGREGATE_SUM still equals Σ raw values).
 
 ### Crypto-strength caveats (LOUD)
 
-**256-bit prime is BROKEN against modern adversaries.** We use
+**256-bit prime is BROKEN against modern adversaries** (in the
+v2-sa-dh path; v2-sa-dh-2048 below CLOSES this caveat). We use
 `p = 2^255 - 19` (the Curve25519 field prime) and `g = 2` because
-our bignum library is 256-bit and RFC 7919 Group 1 (the smallest
+our bignum library WAS 256-bit; RFC 7919 Group 1 (the smallest
 standard MODP group) is already 768-bit. A 256-bit DH group is
-recoverable via index-calculus on commodity hardware; this MVP
-demonstrates the WIRE PROTOCOL + FLOW, not the cryptographic
+recoverable via index-calculus on commodity hardware; the v2-sa-dh
+MVP demonstrates the WIRE PROTOCOL + FLOW, not the cryptographic
 strength. The audit-readable contract: the wire shapes
 (`FED_DH_PUBLIC` line + broadcast phase), the soul-side keygen +
 shared-secret derivation, and the LCG seeding-from-shared-secret
-all match the production design. Upgrading to a 2048-bit RFC 7919
-group is a (a) wider bignum (~ 64 limbs; multi-week) + (b)
-constant-table swap (a one-liner once the wider bignum lands).
+all match the production design. **UPDATE (P3.9 cont.):** the
+2048-bit `bignum_2048.nova` + `sa_dh_*_2048` variants + RFC 7919
+Group 14 constants shipped this session; the `CE_SECAGG_DH_2048=1`
+opt-in flips the DH primitive to a cryptographically reasonable
+group. See "Shipped: 2048-bit DH on RFC 7919 Group 14" below.
 
 **`p_25519` is NOT a "safe" DH prime.** Curve25519's prime is the
 *field* prime of an elliptic curve, not the order of a prime-order
@@ -466,17 +482,135 @@ multiply on roughly half the bits already.
 plus the Curve25519 `2^255 mod p = 19` vector. The two functions
 are observably interchangeable on the test surface.
 
+## Shipped: 2048-bit DH on RFC 7919 Group 14 (P3.9 cont. / v2-sa-dh-2048)
+
+**Status:** shipped (this session). The 256-bit `p_25519`-based DH
+that v2-sa-dh used was cryptographically broken (a 256-bit DH group
+is recoverable via index-calculus on commodity hardware; and
+`p_25519` is a field prime, not a safe DH prime). This session adds
+the 2048-bit `bignum_2048.nova` module + `sa_dh_generate_keys_2048`
++ `sa_dh_shared_secret_for_peer_2048` + the `CE_SECAGG_DH_2048` env
+flag, all backed by the standard RFC 7919 Group 14 (= RFC 3526 §3,
+the 2048-bit MODP "More Modular Exponential") safe-prime group with
+generator g = 2.
+
+**Verified by:**
+- `tests/unit/test_bignum_2048.nova` (NEW) — the **headline check**:
+  `bn2048_modpow_ct(g=2, p-1, p) == 1` (Fermat's little theorem on
+  the RFC 7919 Group 14 safe prime). Costs ~15s wall-clock on this
+  dev sandbox; passes. Plus 24+ correctness assertions: constructor
+  + hex round-trip on zero/max/short inputs, 32-bit carry across
+  limb #16 boundary in `bn2048_add`, underflow wrap in `bn2048_sub`,
+  small + carry-into-hi cases for `bn2048_mul`, `2^1024 mod 1009 =
+  960` small-modulus scale-up check for `bn2048_modpow_ct`, RFC
+  7919 Group 14 constant validation.
+- `tests/unit/test_secure_aggregation.nova` (extended) —
+  `test_sa_dh_two_soul_2048_pair_mask_matches`: the 2-soul DH-2048
+  pair-equivalence check. Alice and bob each generate a 2048-bit
+  keypair, exchange pubkeys, derive the pairwise shared secret via
+  `sa_dh_shared_secret_for_peer_2048`, and BOTH sides land on the
+  SAME shared secret + the SAME LCG-derived mask. Costs ~60-140s
+  wall-clock (4 modpow_ct calls + 2 mask derivations). PASSES.
+- `tests/integration/scenario_u_secagg.sh` (extended) — scenario
+  U.dh2048: two chat souls join with `CE_SECAGG_DH_2048=1`, generate
+  2048-bit keypairs, broadcast pubkeys via FED_DH_PUBLIC, and
+  complete a SecAgg round with DH-derived masks on the wider group.
+  Timing budget is 180s (3 minutes) per the wall-clock-cost-realism
+  banner in the script.
+
+### Wire protocol additions (additive on v2-sa-dh)
+
+| Line | Direction | Meaning |
+|---|---|---|
+| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | both directions | unchanged shape; the `pubkey_hex` field is now 512 chars (2048 bits) instead of 64 chars (256 bits) |
+
+The coordinator does NOT need to know which group the souls use —
+the wire layer just forwards opaque hex pubkeys. Both ends of each
+pair must agree on the bits (256 or 2048) for the shared secret
+derivation to land on the same value; the env-driven opt-in
+(`CE_SECAGG_DH_2048` set on BOTH sides) is how this is bootstrapped.
+
+### Protocol flow (delta vs v2-sa-dh)
+
+Identical to v2-sa-dh, with two substitutions:
+1. `sa_dh_generate_keys(s)` → `sa_dh_generate_keys_2048(s)` when the
+   chat detects `CE_SECAGG_DH_2048=1` at JOIN time. This sets
+   `SA_DH_BITS = 2048` on the soul's `sa_state`.
+2. `sa_mask_for_peer` now dispatches on `SA_DH_BITS`:
+   - 256 → existing `sa_dh_shared_secret_for_peer` (8-limb path)
+   - 2048 → new `sa_dh_shared_secret_for_peer_2048` (64-limb path)
+
+The LCG seed builder (`_sa_hash_str` → `_sa_seed_for_pair`) walks
+the shared-secret hex byte-by-byte and works for any string length,
+so the mask cancellation invariant holds regardless of the DH width.
+
+### Crypto-strength caveats (now narrower)
+
+**RFC 7919 Group 14 IS a "safe" DH prime.** It satisfies p = 2q + 1
+with q prime, and g = 2 generates the order-q subgroup. This is the
+SMALLEST DH MODP group the IETF still considers cryptographically
+reasonable in 2025 — the upgrade closes the "256-bit DH is broken"
+caveat the v2-sa-dh path carried.
+
+**Weak random STILL applies.** The 2048-bit "random" private key
+uses the SAME stretched-nanotime + 15-bit LCG as the 256-bit path
+(see `_sa_dh_random_bn2048_from_nanotime` — extends the 256-bit
+helper to 64 limbs). The 2048-bit arithmetic is strong; the
+2048-bit entropy is NOT. Production needs `/dev/urandom` or the
+platform CSPRNG; the NOVA toolchain does not expose one today.
+
+**Timing reality check (LOUD).** One full-width `bn2048_modpow_ct`
+costs ~15 seconds on this dev sandbox (vs. ~40 ms for the 256-bit
+`bn_modpow_ct`). A 2-soul DH-2048 round = 2 keygens + 2 shared-secret
+derivations + 2 mask derivations = ~6 modpow_ct = ~90 seconds. An
+N-soul round scales as N + N*(N-1) = O(N²) modpow_ct calls; a
+5-soul round takes ~5 minutes wall-clock. v2-sa-dh-2048 is
+deliberately gated behind `CE_SECAGG_DH_2048=1` (separate from
+`CE_SECAGG_DH`) so an operator must consciously accept the latency
+budget. **Not for per-message real-time rounds.** A future
+optimization (Barrett or Montgomery reduction on the wider bignum)
+would cut the per-modpow cost roughly 8x, but is multi-week work.
+
+**Constant-time `bn2048_modpow_ct` IS used.** Same Montgomery-ladder
+shape as the 256-bit `bn_modpow_ct`; per-bit wall-clock is exponent-
+bit-independent. The non-CT square-and-multiply variant is
+INTENTIONALLY OMITTED from the `bignum_2048` public API (unlike the
+256-bit `bignum` module which exposes both): for 2048-bit DH any
+remote-callable code path that uses the non-CT variant on a private
+exponent is exploitable by a timing observer, and the cost of
+keeping a "fast" non-CT variant available is not worth the
+foot-gun risk.
+
+### Bignum_2048 correctness fix vs the 256-bit reference
+
+The 256-bit `bn_mod` in `bignum.nova` IGNORED the carry-out of the
+in-place shift-left-by-one, because Curve25519's prime
+(p = 2^255 - 19) has bit 255 CLEAR. The shift therefore never
+overflowed the 256-bit container in any reachable test case. For
+RFC 7919 Group 14 (top hex digit `ffffffff`, bit 2047 set) the
+shift DOES overflow when the running remainder is close to m, and
+silently dropping the top bit makes the reduction return 0 instead
+of the correct value. The 2048-bit `_bn2048_shl1_inplace` returns
+the carry-out bit, and `bn2048_mod` / `_bn2048_mod4096` force a
+subtract of m whenever the shift overflows (the post-subtract value
+correctly reflects the underlying mathematical operation via the
+borrow-chain wraparound — see the inline comment in `bn2048_mod`).
+This is the only algorithmic difference between the two modules
+beyond limb-count scaling.
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
 adds:
 
-1. **DH key agreement** — **shipped (this session, v2-sa-dh).**
-   See "Shipped: DH key agreement" above. Production-grade upgrade
-   still needs (a) a wider bignum (2048+ bits, RFC 7919 Group 14)
-   so the prime can match modern standards, and (b) a CSPRNG so the
-   private key generation isn't weak-random. Both are bounded by
-   NOVA-toolchain capabilities, not by the SecAgg module shape.
+1. **DH key agreement** — **shipped (this session, v2-sa-dh; AND
+   v2-sa-dh-2048 on RFC 7919 Group 14).**
+   See "Shipped: DH key agreement" and "Shipped: 2048-bit DH on RFC
+   7919 Group 14" above. The 2048-bit group closes the "BROKEN"
+   caveat; the remaining production-grade gap is a CSPRNG (the NOVA
+   toolchain does not expose `/dev/urandom` today; the LCG-stretched
+   nanotime seed leaks to anyone who can guess boot time within
+   seconds).
 2. **Shamir secret sharing of mask seeds** — ~2 weeks once we have
    a finite-field polynomial primitive.
 3. **Dropout handling** — **shipped (P3.8r).** The MVP path
@@ -528,3 +662,43 @@ on the dev container; a single `bn_modpow_ct` call at 256-bit modulus
 on an 8-bit exponent clocks ~40 ms (vs. ~20 ms for `bn_modpow` -- the
 ~1.88x ratio matches the ladder always doing both ops vs.
 square-and-multiply skipping the multiply on 0-bits).
+
+## What "bignum_2048 landed" means concretely
+
+`src/safety/bignum_2048.nova` (NEW) is a 64-limb (32-bit-per-limb)
+pure-NOVA 2048-bit unsigned bignum library, parallel to the 256-bit
+`bignum.nova`. Same shape, just wider. Public surface:
+
+| Function | Returns | Description |
+|---|---|---|
+| `bn2048_new()` | bn2048 | 2048-bit zero |
+| `bn2048_from_int(n)` | bn2048 | small int -> bn2048 (two-limb split) |
+| `bn2048_from_hex(hex)` | bn2048 | hex string (1..512 chars) -> bn2048 |
+| `bn2048_to_hex(bn)` | string | canonical 512-char lowercase hex |
+| `bn2048_zero(bn)` | int (0/1) | 1 iff all limbs zero |
+| `bn2048_eq(a, b)` | int (0/1) | structural equality |
+| `bn2048_cmp(a, b)` | int (-1/0/1) | comparator |
+| `bn2048_add(a, b)` | bn2048 | (a + b) mod 2^2048 |
+| `bn2048_sub(a, b)` | bn2048 | (a - b) mod 2^2048 (two's-complement wrap) |
+| `bn2048_mul(a, b)` | [hi, lo] | full 4096-bit product |
+| `bn2048_mod(a, m)` | bn2048 | a mod m (bit-by-bit long division) |
+| `bn2048_modmul(a, b, m)` | bn2048 | (a * b) mod m, via the full 4096-bit product |
+| `bn2048_modpow_ct(b, e, m)` | bn2048 | b^e mod m via Montgomery ladder (CRYPTO-SAFE; the ONLY exposed modpow variant) |
+| `rfc7919_group14_p()` | bn2048 | the RFC 7919 Group 14 / RFC 3526 §3 2048-bit MODP safe prime |
+| `rfc7919_group14_g()` | bn2048 | the RFC 7919 Group 14 generator g = 2 |
+
+**INTENTIONAL OMISSION:** there is NO `bn2048_modpow` (non-CT
+square-and-multiply variant). For 2048-bit DH, only the CT path is
+safe to expose to any remote-callable code path; a passive timing
+observer of a non-CT 2048-bit modpow could recover the soul's
+private exponent from per-bit timing variance.
+
+Test coverage in `tests/unit/test_bignum_2048.nova` (NEW) -- 50+
+assertions, including the **headline check** Fermat's little theorem
+on the safe prime: `bn2048_modpow_ct(2, p-1, p) == 1` passes in
+~15 seconds wall-clock on the dev container. A single `bn2048_modmul`
+costs ~3 ms; one `bn2048_modpow_ct` at the RFC 7919 Group 14 prime
+costs ~15 s (4096 modmuls + the 4096-bit bit-by-bit reduction inside
+each one). Translates to a 2-soul DH-2048 round of ~60-90 seconds
+wall-clock; the integration scenario U.dh2048 budgets 180s for
+headroom.

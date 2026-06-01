@@ -12,6 +12,23 @@ computational units rather than orchestrating a pipeline of modules.
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain: 131 modules compile (`make build`, +1 from
+> `safety/bignum_2048.nova` added in P3.9 cont. 2048-bit DH on RFC 7919
+> Group 14 -- the cryptographically-reasonable upgrade to the 256-bit
+> v2-sa-dh strawman SECAGG_AUDIT.md flagged as broken. The bn2048 module
+> is a 64-limb (32-bit-per-limb) pure-NOVA bignum parallel to `bignum.nova`;
+> only `bn2048_modpow_ct` (Montgomery ladder) is exposed -- the non-CT
+> variant is intentionally omitted because a 2048-bit private exponent
+> can't safely tolerate any timing leak. RFC 7919 Group 14 constants land
+> as `rfc7919_group14_p()` and `rfc7919_group14_g()`. Verified by the
+> headline Fermat's-little-theorem check `bn2048_modpow_ct(2, p-1, p) ==
+> 1` (~15s wall-clock). `src/learning/secure_aggregation.nova` extended
+> with `sa_dh_generate_keys_2048` / `sa_dh_shared_secret_for_peer_2048`
+> + the `CE_SECAGG_DH_2048` env flag + a SA_DH_BITS state slot routing
+> `sa_mask_for_peer` to the right shared-secret derivation. The chat
+> gates on a single `CE_SECAGG_DH_2048` env probe; everything else runs
+> through the existing v2-sa-dh pipeline. Cost reality: 2-soul DH-2048
+> round = ~60s wall-clock; OFFLINE federation mode only,
+> +1 from
 > `io/transducers/audio_capture.nova` added in P2.5 cont. real microphone
 > capture (parecord/arecord/sox auto-detect via `scripts/audio_capture.sh`
 > + silent-WAV fallback) wired into `stream_audio.nova` via the

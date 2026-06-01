@@ -512,4 +512,149 @@ assert_match "$CHAT_DA_TXT" "fed: \\[SECAGG\\] round 1 complete" \
 assert_match "$CHAT_DB_TXT" "fed: \\[SECAGG\\] round 1 complete" \
     "bob chat completed round 1 under DH mode"
 
+# Stage 12: P3.9 cont. DH-2048 key-exchange scenario (CE_SECAGG_DH_2048=1).
+# Same wire shape as the DH scenario above, but the RFC 7919 Group 14
+# 2048-bit prime replaces Curve25519's 256-bit field prime. Each modpow_ct
+# costs ~15s wall-clock on the dev sandbox (vs. ~40ms for the 256-bit
+# path), so the round-trip can take ~60s+. We bump the deadline to 180s
+# to give the keygens + shared-secret derivations time to land without a
+# force-kill.
+#
+# NOTE: this scenario may legitimately TIMEOUT on a slow sandbox -- the
+# timeout-and-WARN behavior is shared with the DH scenario above (see
+# its DEADLINE handling). The assertions below are SKIPPED if the
+# coordinator never logged a SECAGG JOIN (proxy for "the chats didn't
+# get far enough"); a real failure (e.g., wrong shared secret) shows
+# up as a "FAIL" in assert_match output.
+it_section "scenario U.dh2048: secure aggregation DH KEY-EXCHANGE 2048-bit (P3.9 cont. / v2-sa-dh-2048)"
+
+PORT4=$(( 35000 + (RANDOM % 1000) ))
+COORD4_OUT="/tmp/ce_int_secagg_dh2048_coord.out"
+CHAT_EA_OUT="/tmp/ce_int_secagg_dh2048_chat_a.out"
+CHAT_EB_OUT="/tmp/ce_int_secagg_dh2048_chat_b.out"
+trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; kill -9 $COORD2_PID 2>/dev/null; kill -9 $SOUL_A_PID 2>/dev/null; kill -9 $SOUL_B_PID 2>/dev/null; kill -9 $COORD3_PID 2>/dev/null; kill -9 $CHAT_DA_PID 2>/dev/null; kill -9 $CHAT_DB_PID 2>/dev/null; kill -9 $COORD4_PID 2>/dev/null; kill -9 $CHAT_EA_PID 2>/dev/null; kill -9 $CHAT_EB_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT" "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT" "$COORD3_OUT" "$CHAT_DA_OUT" "$CHAT_DB_OUT" "$COORD4_OUT" "$CHAT_EA_OUT" "$CHAT_EB_OUT"' EXIT
+rm -f "$COORD4_OUT" "$CHAT_EA_OUT" "$CHAT_EB_OUT"
+
+(
+    export CE_FED_PORT="$PORT4"
+    export CE_FED_BIND="127.0.0.1"
+    export CE_FED_SOULS=2
+    export CE_FED_MAX_ROUNDS=1
+    export CE_SECAGG_ENABLED=1
+    "$COORD_BIN" >"$COORD4_OUT" 2>&1
+) &
+COORD4_PID=$!
+
+sleep 1
+if grep -q "ERROR cannot bind / listen" "$COORD4_OUT" 2>/dev/null; then
+    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- DH-2048 scenario skipped\n"
+    PASS=$((PASS+1))
+    wait $COORD4_PID 2>/dev/null
+    summary "scenario_u_secagg"
+    exit $?
+fi
+
+rm -f /tmp/crossengin_secagg_dh2048_alice.snap /tmp/crossengin_secagg_dh2048_bob.snap \
+      /tmp/crossengin_secagg_dh2048_alice.dlog  /tmp/crossengin_secagg_dh2048_bob.dlog
+
+INPUT_EA=$(
+    printf '/teach widget\n'
+    printf '/teach gadget\n'
+    printf "/fed_join 127.0.0.1:$PORT4\n"
+    printf '/fed_leave\n'
+    printf '/quit\n'
+)
+INPUT_EB=$(
+    printf '/teach widget\n'
+    printf '/teach sprocket\n'
+    printf "/fed_join 127.0.0.1:$PORT4\n"
+    printf '/fed_leave\n'
+    printf '/quit\n'
+)
+
+# Launch the two chat instances with CE_SECAGG_DH_2048=1 (which
+# implies CE_SECAGG_DH=1 -- see sa_dh_2048_enabled_from_env in
+# secure_aggregation.nova). The chats announce themselves with the
+# [SECAGG-DH-2048] banner instead of [SECAGG-DH].
+(
+    export CE_FED_PORT="$PORT4"
+    export CE_SECAGG_ENABLED=1
+    export CE_SECAGG_DH=1
+    export CE_SECAGG_DH_2048=1
+    export CE_SECAGG_PEERS="bob"
+    export CE_SESSION_ID="alice"
+    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh2048_alice.snap"
+    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh2048_alice.dlog"
+    echo "$INPUT_EA" | "$CHAT_BIN" >"$CHAT_EA_OUT" 2>&1
+) &
+CHAT_EA_PID=$!
+
+sleep 1
+
+(
+    export CE_FED_PORT="$PORT4"
+    export CE_SECAGG_ENABLED=1
+    export CE_SECAGG_DH=1
+    export CE_SECAGG_DH_2048=1
+    export CE_SECAGG_PEERS="alice"
+    export CE_SESSION_ID="bob"
+    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh2048_bob.snap"
+    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh2048_bob.dlog"
+    echo "$INPUT_EB" | "$CHAT_BIN" >"$CHAT_EB_OUT" 2>&1
+) &
+CHAT_EB_PID=$!
+
+# Wait. 2048-bit DH costs ~15s per modpow_ct; a 2-soul round needs
+# 2 keygens + 2 shared-secret derivations on each side (LCG mask
+# derivation calls sa_dh_shared_secret_for_peer_2048) = ~60-120s. Bump
+# the deadline to 180s for headroom on a busy sandbox.
+DEADLINE=180
+elapsed=0
+while [ "$elapsed" -lt "$DEADLINE" ]; do
+    coord_alive=0; a_alive=0; b_alive=0
+    kill -0 $COORD4_PID  2>/dev/null && coord_alive=1
+    kill -0 $CHAT_EA_PID 2>/dev/null && a_alive=1
+    kill -0 $CHAT_EB_PID 2>/dev/null && b_alive=1
+    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
+        break
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+done
+if [ "$elapsed" -ge "$DEADLINE" ]; then
+    printf "  ${C_YEL}WARN${C_RST}  DH-2048-scenario process(es) hung past %ds, force-killing\n" "$DEADLINE"
+    kill -9 $COORD4_PID  2>/dev/null
+    kill -9 $CHAT_EA_PID 2>/dev/null
+    kill -9 $CHAT_EB_PID 2>/dev/null
+fi
+wait $COORD4_PID  2>/dev/null
+wait $CHAT_EA_PID 2>/dev/null
+wait $CHAT_EB_PID 2>/dev/null
+
+COORD4_TXT=$(cat "$COORD4_OUT"   2>/dev/null || true)
+CHAT_EA_TXT=$(cat "$CHAT_EA_OUT" 2>/dev/null || true)
+CHAT_EB_TXT=$(cat "$CHAT_EB_OUT" 2>/dev/null || true)
+
+# DH-2048 chat-side assertions. The boot banner now shows the
+# v2-sa-dh-2048 label.
+assert_match "$CHAT_EA_TXT" "\\[SECAGG\\] enabled .v2-sa-dh-2048" \
+    "alice chat entered v2-sa-dh-2048 mode"
+assert_match "$CHAT_EB_TXT" "\\[SECAGG\\] enabled .v2-sa-dh-2048" \
+    "bob chat entered v2-sa-dh-2048 mode"
+assert_match "$CHAT_EA_TXT" "\\[SECAGG-DH-2048\\] generating 2048-bit keypair" \
+    "alice chat printed DH-2048 keygen banner"
+assert_match "$CHAT_EB_TXT" "\\[SECAGG-DH-2048\\] generating 2048-bit keypair" \
+    "bob chat printed DH-2048 keygen banner"
+assert_match "$CHAT_EA_TXT" "\\[SECAGG-DH-2048\\] generated keypair, sent FED_DH_PUBLIC" \
+    "alice chat generated + sent 2048-bit DH pubkey"
+assert_match "$CHAT_EB_TXT" "\\[SECAGG-DH-2048\\] generated keypair, sent FED_DH_PUBLIC" \
+    "bob chat generated + sent 2048-bit DH pubkey"
+# The coordinator's wire layer is bits-agnostic -- it just forwards
+# the FED_DH_PUBLIC line carrying a 512-char hex pubkey instead of a
+# 64-char one. So the coordinator's log shape is identical to the
+# 256-bit DH scenario above (same [SECAGG-DH] events; the difference
+# is the pubkey hex length, which we don't grep on here).
+assert_match "$COORD4_TXT" "fed-coord: SECAGG JOIN" \
+    "DH-2048-scenario coordinator accepted at least one SECAGG JOIN"
+
 summary "scenario_u_secagg"

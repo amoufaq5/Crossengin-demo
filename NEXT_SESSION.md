@@ -17,6 +17,51 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- **P3.9 cont. (this session) 2048-bit DH on RFC 7919 Group 14**:
+  **complete -- v2-sa-dh-2048 LANDED**. The 256-bit DH path shipped in
+  P3.9 v2-sa-dh was cryptographically broken (256-bit DH groups are
+  recoverable via index-calculus on commodity hardware; SECAGG_AUDIT.md
+  called for a 2048-bit upgrade). This session lands the upgrade:
+  - **`src/safety/bignum_2048.nova`** (NEW) -- pure-NOVA 64-limb
+    2048-bit unsigned bignum library, parallel to the 256-bit
+    `bignum.nova`. Same shape, just wider: `bn2048_new/from_int/
+    from_hex/to_hex/zero/eq/cmp/add/sub/mul/mod/modmul/modpow_ct` +
+    `rfc7919_group14_p()` / `rfc7919_group14_g()`. The non-CT
+    square-and-multiply modpow variant is INTENTIONALLY OMITTED:
+    for 2048-bit DH only the CT path is safe to expose to any
+    remote-callable code path. Carry-handling fix vs the 256-bit
+    reference: `_bn2048_shl1_inplace` returns its carry-out, and
+    the reduction loops honor it so the running remainder isn't
+    silently truncated when the modulus has bit 2047 set (true for
+    RFC 7919 Group 14, false for Curve25519's prime -- this is why
+    the bug was latent in the 256-bit reference).
+  - **`src/learning/secure_aggregation.nova`** (EXTENDED) --
+    `sa_dh_generate_keys_2048(s)`, `sa_dh_shared_secret_for_peer_2048
+    (s, peer_id)`, `sa_dh_2048_enabled_from_env()`, and a new
+    `SA_DH_BITS` slot (default 256, 2048 after `sa_dh_generate_keys_
+    2048`) that routes `sa_mask_for_peer` to the appropriate
+    shared-secret derivation. Backwards compatible: `sa_dh_bits()`
+    accessor tolerates older sa_state objects that don't carry the
+    slot. The wire protocol shape (FED_DH_PUBLIC) is bit-identical;
+    only the pubkey hex width changes (64 -> 512 chars).
+  - **`examples/crossengin_chat.nova`** (EXTENDED) -- one new env
+    probe `sa_dh_2048_enabled_from_env()` decides whether to call
+    `sa_dh_generate_keys_2048` instead of `sa_dh_generate_keys` at
+    JOIN time. The single env check enables a strict superset of the
+    DH path; everything else (the FED_DH_PUBLIC announce + broadcast
+    drain phase) reuses the v2-sa-dh code unchanged.
+  - **Timing reality check**: one `bn2048_modpow_ct` costs ~15s
+    wall-clock on this dev sandbox (vs. ~40ms for the 256-bit
+    `bn_modpow_ct`). A 2-soul DH-2048 round = 2 keygens + 2 shared-
+    secret derivations = ~60s. The integration scenario U.dh2048
+    budgets 180s. **Not for per-message realtime rounds.**
+  - **Headline test**: `bn2048_modpow_ct(2, p-1, p) == 1` (Fermat's
+    little theorem on the RFC 7919 Group 14 safe prime). PASSES in
+    ~15s wall-clock. 2-soul DH-2048 pair equivalence
+    (`shared_a == shared_b`) also passes. Test count delta:
+    +50 in `test_bignum_2048.nova` (NEW); +13 in
+    `test_secure_aggregation.nova` (DH-2048 pair test).
+  - Module count: 131 (+1 from bignum_2048).
 - **P3.1.JPEG cont. (this session) entropy decode + IDCT pipeline**:
   **complete -- grayscale baseline END-TO-END DECODE LANDED**. The
   structural half (segments + DQT + SOF0 + DHT) landed in the original
