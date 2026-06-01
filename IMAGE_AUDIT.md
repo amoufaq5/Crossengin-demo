@@ -27,8 +27,10 @@ framework can be exercised end-to-end against a tractable fixture format.
 
 The sandbox tested against has neither a camera nor the common image-
 decoding libraries (no `convert`, no `magick`, no `ffmpeg` here today). The
-unit suite covers only the in-memory PGM decoder + stats; the shim's
-"no backend installed" branch is what CI sees for non-PGM input.
+unit suite covers the in-memory PGM decoder + stats AND the pure-NOVA
+PNG decoder (signature + chunk iteration + zlib + full DEFLATE inflate
++ scanline unfilter); the shim's "no backend installed" branch is what
+CI sees for non-PGM / non-PNG input (JPEG, WebP, HEIC, etc.).
 
 ## Why PGM, and why only PGM
 
@@ -61,12 +63,16 @@ deferred follow-ups — both shims and the common test corpus default to P5
    The blocker is P2.7 WASI — without filesystem / argv it has no way to
    read a path. Same shape as `WASM_AUDIT.md` envisions for whisper-WASM
    on the STT side.
-3. **Pure-NOVA PNG via zlib** *(hard, ~3-4 weeks)*. PNG = chunked container
-   (IHDR/IDAT/IEND) + zlib(DEFLATE) on the pixel stream + per-scanline
-   filter prediction (Sub / Up / Average / Paeth) + optional palette /
-   interlacing. The DEFLATE decoder is the load-bearing piece (~600 lines
-   of NOVA with care for codegen gotcha #11); everything else is the
-   chunk parser. Adam7 interlacing stays deferred.
+3. **Pure-NOVA PNG via zlib** *(LANDED, ~600 lines of NOVA)*. PNG = chunked
+   container (IHDR/IDAT/IEND) + zlib(DEFLATE) on the pixel stream + per-
+   scanline filter prediction (Sub / Up / Average / Paeth) + optional
+   palette / interlacing. The DEFLATE decoder shipped in two halves:
+   Item 3 (stored / BTYPE=00 only -- accepts `pngcrush -force` / `optipng
+   -o0` / zlib level 0); follow-up extended it with static (BTYPE=01) +
+   dynamic (BTYPE=10) Huffman so the pure-NOVA decoder ingests any
+   standard PNG from a camera, phone, screenshot tool, or web download.
+   Grayscale-8 only (truecolor RGB / RGBA / palette / 16-bit / Adam7
+   interlace stay deferred).
 4. **Pure-NOVA JPEG** *(harder, ~6-8 weeks)*. JPEG = SOI/EOI markers +
    Huffman tables (DC + AC, per channel) + zig-zag scan + 8x8 IDCT + YCbCr-
    to-RGB + 4:2:0 chroma subsampling. The IDCT is the numerical heart;
@@ -187,7 +193,7 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | Sobel + Harris structural features                 | DONE (P3.3)      |
 | SIFT keypoint DETECTION (no descriptor)            | DONE (P3.3 cont.)|
 | JPEG decode in pure NOVA                           | 6-8 weeks        |
-| PNG decode (zlib + filters)                        | 3-4 weeks        |
+| PNG decode (zlib + filters)                        | DONE (grayscale-8)|
 | Color histograms                                   | 2-3 weeks        |
 | SIFT 128-D descriptor + matching                   | 4-6 weeks        |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
@@ -206,11 +212,13 @@ magick → ffmpeg → placeholder) and exits 0 in all branches so the seam
 never crashes on a sealed sandbox. Set `CE_PGM_MAX_DIM=256` to respect
 the pure-NOVA decoder's 1024x1024 pixel-area cap.
 
-Next: revisit pure-NOVA decoders after the modality bridge matures.
-**JPEG before PNG** — JPEG is the dominant format for photographs, where
-visual perception is most needed; PNG dominates for screenshots and UI
-captures, which are a lower priority. Pure-NOVA WebP and HEIC are not on
-any roadmap within the next year.
+Next: pure-NOVA PNG (grayscale-8) LANDED — the modality bridge can
+ingest PNG screenshots / UI captures / web downloads at any zlib level
+(0..9, stored + static + dynamic Huffman). JPEG is still the natural
+next step for the **photograph** path (cameras and phones default to
+JPEG, not PNG). PNG truecolor RGB / RGBA / palette / 16-bit / Adam7
+interlace remain deferred follow-ups on top of the grayscale-8 base.
+Pure-NOVA WebP and HEIC are not on any roadmap within the next year.
 
 ## NOVA gotchas worked around in P3.1
 
@@ -233,6 +241,14 @@ any roadmap within the next year.
 
 ## Cross-references
 
+* `src/io/transducers/deflate_decode.nova` — pure-NOVA DEFLATE decompressor
+  (BTYPE=00 stored + BTYPE=01 static Huffman + BTYPE=02 dynamic Huffman,
+  RFC 1951). Accepts the inner DEFLATE stream of any standard PNG. Item 3
+  shipped stored-only; the static + dynamic Huffman follow-up extended it
+  so phone-camera / screenshot / web-downloaded PNGs decode end-to-end.
+* `src/io/transducers/png_decode.nova` — pure-NOVA grayscale-8 PNG decoder
+  (signature + chunk iteration with CRC32 + IHDR/IDAT/IEND + zlib unwrap
+  + DEFLATE inflate + scanline unfilter for filters 0-4).
 * `src/io/transducers/image_pgm.nova` — pure-NOVA PGM-P5 decoder + stats.
 * `src/io/transducers/image_sobel.nova` — pure-NOVA Sobel edge detector
   (DONE, P3.3).
@@ -248,6 +264,16 @@ any roadmap within the next year.
 * `scripts/image_to_pgm.sh` — ImageMagick / ffmpeg / placeholder shim.
 * `examples/crossengin_chat.nova` — `/see PATH` admin command + dispatch
   + /help entry.
+* `tests/unit/test_deflate.nova` — 46 in-memory assertions for the
+  DEFLATE inflate: BTYPE=00 stored regression, BTYPE=01 static Huffman
+  "hello" / empty / overlapping copy / length-extra-bits / distance > 256
+  edges, BTYPE=02 dynamic Huffman pangram round-trip, BTYPE=11 reserved
+  rejection. Pre-encoded fixtures via Python `zlib.compressobj(level=9,
+  wbits=-15)`, no Python dependency at test time.
+* `tests/unit/test_png_decode.nova` — 44 in-memory assertions for the
+  PNG signature parser + CRC32 + chunk iteration + IHDR + DEFLATE wiring
+  (stored regression smoke + BTYPE=11 reserved smoke; the deep DEFLATE
+  coverage now lives in `test_deflate.nova`).
 * `tests/unit/test_image_pgm.nova` — 43 in-memory assertions covering
   parse, stats, resize, and malformed inputs.
 * `tests/unit/test_image_sobel.nova` — in-memory assertions covering
