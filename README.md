@@ -46,6 +46,14 @@ computational units rather than orchestrating a pipeline of modules.
 > minimum-viable image modality -- pure-NOVA PGM-P5 decoder + pluggable
 > visual perception seam producing feature atoms, documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from `io/transducers/image_sift.nova` added in P3.3 cont. SIFT
+> keypoint DETECTION (scale-space + DoG extrema only; the 128-D
+> descriptor remains deferred) -- 3-octave Gaussian pyramid, 5 blur
+> levels per octave, 4 DoG layers, 3x3x3 spatial-and-scale extremum
+> check, contrast threshold 30 milli-normalized + Harris-style edge
+> rejection reusing `harris_apply` from R1.6; producing the
+> `image_keypoint_count_<low|mid|high>` feature atom on images >= 32x32,
+> documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +2 from `io/transducers/{video_y4m,video_perception}.nova` added in P3.2
 > minimum-viable video modality -- pure-NOVA Y4M (raw YUV4MPEG2) decoder +
 > pluggable video perception seam producing per-frame feature atoms +
@@ -58,8 +66,15 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 130 unit-test suites pass
-> (`make test`, +1 suite / +54 assertions from `test_bignum.nova` added in
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 131 unit-test suites pass
+> (`make test`, +1 suite / +25 assertions from `test_image_sift.nova`
+> added in P3.3 cont. SIFT keypoint DETECTION: uniform-grey 32x32 -> 0
+> keypoints; single bright 5x5 spot at (13,13) in 32x32 -> 1 keypoint at
+> (15,15) with contrast 55; 32x32 four-spots fixture -> 4 keypoints
+> (one per spot) at the spot centers; dimension caps reject < 32x32 and
+> > 256x256; per-keypoint accessors round-trip; max_keypoints cap
+> honored, documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 suite / +54 assertions from `test_bignum.nova` added in
 > P3.9 pure-NOVA 256-bit bignum library: `bn_new` / `bn_from_int` /
 > `bn_from_hex` / `bn_to_hex` / `bn_zero` / `bn_eq` / `bn_cmp` / `bn_add`
 > / `bn_sub` / `bn_mul` (full 512-bit product as `[hi, lo]`) / `bn_mod`
@@ -180,7 +195,11 @@ computational units rather than orchestrating a pipeline of modules.
 > labels (image_dim_small + image_mid + image_bucket_0 on the
 > gradient; image_bright + image_hist_peaked + image_bucket_6 on the
 > uniform fixture); malformed input is rejected with the parser's
-> bracketed error and the chat survives to /quit cleanly,
+> bracketed error and the chat survives to /quit cleanly, extended in
+> P3.3 cont. (SIFT keypoint DETECTION) with +2 assertions covering a
+> hand-rolled 32x32 four-spots PGM fixture: the summary line carries
+> "32x32"; the feature line surfaces `image_keypoint_count_low` (4
+> keypoints, below the low/mid threshold of 10),
 > +1 from `scenario_s_video_play.sh` added in P3.2 minimum-viable
 > video modality: a hand-rolled 5-frame 4x4 Y4M fixture with two
 > forced scene changes, /play prints per-frame event lines (image

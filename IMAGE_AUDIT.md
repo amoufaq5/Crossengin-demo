@@ -82,17 +82,19 @@ P3.1 ships a deliberately crude set — `image_dim_<small|medium|large>`,
 uniform>` — that the substrate can bind exactly the way it binds a word
 atom. The realistic feature ladder, each rung its own multi-week lift:
 
-| Feature                         | NOVA effort |
-|---------------------------------|-------------|
-| Mean intensity / histogram      | landed      |
-| Sobel edge magnitude            | DONE (P3.3) |
-| Harris corner detector          | DONE (P3.3) |
-| Canny edge with hysteresis      | 2-3 weeks   |
-| HOG (oriented gradients)        | 2-3 weeks   |
-| SIFT-like keypoints + 128-D     | 4-6 weeks   |
-| Color histograms (HSV / Lab)    | 2-3 weeks   |
-| CNN feature vector (untrained)  | 4-8 weeks   |
-| CNN feature vector (trained)    | 6-12 months |
+| Feature                          | NOVA effort         |
+|----------------------------------|---------------------|
+| Mean intensity / histogram       | landed              |
+| Sobel edge magnitude             | DONE (P3.3)         |
+| Harris corner detector           | DONE (P3.3)         |
+| SIFT keypoint DETECTION (scale-  | DONE (P3.3 cont.)   |
+|   space + DoG extrema only)      |                     |
+| Canny edge with hysteresis       | 2-3 weeks           |
+| HOG (oriented gradients)         | 2-3 weeks           |
+| SIFT-like 128-D descriptor       | 4-6 weeks (DEFERRED)|
+| Color histograms (HSV / Lab)     | 2-3 weeks           |
+| CNN feature vector (untrained)   | 4-8 weeks           |
+| CNN feature vector (trained)     | 6-12 months         |
 
 A "production agent that can see photographs and reason about them" is
 weeks 1-4 for JPEG decode + Sobel + Harris (~1.5 months honestly), 4-8
@@ -123,12 +125,36 @@ gradient structure and corner geometry, not just intensity moments:
   `image_corner_count_<low|mid|high>` for the bucketed count, plus
   spatial-distribution labels `image_corner_dense_<top|bottom|left|right>`
   for the directional skew of the corner set.
+- **SIFT keypoint DETECTION** (`src/io/transducers/image_sift.nova`,
+  P3.3 cont. -- DESCRIPTOR DEFERRED). The full SIFT pipeline is
+  (1) scale-space + DoG extrema, (2) sub-pixel refinement +
+  orientation histograms, (3) 128-dimensional descriptor,
+  (4) matching. Pieces (2)-(4) are 4-6 weeks of pure-NOVA work; this
+  module ships ONLY piece (1) -- the keypoint LOCATIONS in (x, y,
+  octave, scale) space. The scale-invariance comes from a 3-octave
+  Gaussian pyramid (1x, 1/2x, 1/4x downsampled), each octave with 5
+  blur levels (the 3x3 Gaussian kernel applied 3x per level, so the
+  effective sigma between adjacent levels is wide enough to produce
+  meaningful DoG signal), and 3x3x3 spatial-and-scale extremum
+  checking on the 4 DoG layers per octave. Candidates are filtered
+  by contrast (`|DoG|*1000/255 > 30` milli-normalized, matching
+  Lowe's 0.03 threshold) and by Harris-style edge rejection (we
+  reuse `harris_apply` from R1.6 and require a Harris corner within
+  Chebyshev distance 2 of each candidate). Per-image atom:
+  `image_keypoint_count_<low|mid|high>` (low <10, mid 10..100, high
+  >100). Dimensions capped at 256x256 per axis (3 octaves * 5 blur
+  levels means up to 15x the per-pixel work of the input; 256x256
+  keeps every intermediate accumulator well under the 2^20 codegen
+  pointer-threshold ceiling). Minimum dim 32x32 (smaller images
+  cannot usefully sample 3 octaves).
 
-Both detectors fire only when the image is at least 16x16 in each axis
+Sobel + Harris fire only when the image is at least 16x16 in each axis
 (the kernel needs a 3x3 neighborhood and the count buckets need
-meaningful scale). Dimensions are capped at 512x512 per axis in this MVP
-to keep all intermediate accumulators well under NOVA's 2^20 codegen
-pointer threshold (gotcha #11).
+meaningful scale). SIFT-detection runs only on images >= 32x32 (the
+3-octave scale-space cannot sample usefully below that). Dimensions are
+capped at 512x512 for Sobel/Harris, 256x256 for SIFT-detection, to keep
+all intermediate accumulators well under NOVA's 2^20 codegen pointer
+threshold (gotcha #11).
 
 ## Mapping features to atoms
 
@@ -159,10 +185,11 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 |----------------------------------------------------|------------------|
 | PGM + crude stats + ImageMagick shim               | landed (P3.1)    |
 | Sobel + Harris structural features                 | DONE (P3.3)      |
+| SIFT keypoint DETECTION (no descriptor)            | DONE (P3.3 cont.)|
 | JPEG decode in pure NOVA                           | 6-8 weeks        |
 | PNG decode (zlib + filters)                        | 3-4 weeks        |
 | Color histograms                                   | 2-3 weeks        |
-| SIFT-like keypoints                                | 4-6 weeks        |
+| SIFT 128-D descriptor + matching                   | 4-6 weeks        |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
 
@@ -211,9 +238,13 @@ any roadmap within the next year.
   (DONE, P3.3).
 * `src/io/transducers/image_harris.nova` — pure-NOVA Harris corner
   detector with milli-fixed-point response (DONE, P3.3).
+* `src/io/transducers/image_sift.nova` — pure-NOVA SIFT keypoint
+  DETECTION (scale-space + DoG extrema, no descriptor) reusing
+  `harris_apply` from R1.6 for the edge-rejection filter (DONE, P3.3
+  cont.).
 * `src/io/transducers/visual_perception.nova` — pluggable seam + feature
   extraction (extended in P3.3 to call Sobel + Harris on images
-  >= 16x16).
+  >= 16x16, and SIFT-detection on images >= 32x32).
 * `scripts/image_to_pgm.sh` — ImageMagick / ffmpeg / placeholder shim.
 * `examples/crossengin_chat.nova` — `/see PATH` admin command + dispatch
   + /help entry.
@@ -224,8 +255,13 @@ any roadmap within the next year.
 * `tests/unit/test_image_harris.nova` — in-memory assertions covering
   Harris corner detection on flat / edge / corner fixtures plus the
   count + spatial-distribution label helpers.
+* `tests/unit/test_image_sift.nova` — in-memory assertions covering
+  SIFT-detection on uniform / single-bright-spot / four-spots fixtures
+  plus the dimension caps, count-bucket helpers, and per-keypoint
+  accessors.
 * `tests/integration/scenario_q_image_see.sh` — end-to-end /see chat
-  assertions against gradient + uniform + 16x16 edge fixtures.
+  assertions against gradient + uniform + 16x16 edge + 32x32 four-spots
+  fixtures.
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (JPEG / PNG decode, feature extraction, embeddings).
 * `STT_AUDIT.md` — sibling audit for the audio modality bridge.

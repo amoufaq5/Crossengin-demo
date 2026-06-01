@@ -17,6 +17,85 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.3 cont. SIFT keypoint DETECTION (scale-space + DoG extrema only;
+  descriptor deferred): **complete (framework only)** (ADR-0014 image
+  half / NOVA enhancement #15). R1.6 shipped Sobel edges + Harris
+  corners + block-matching motion vectors as the first STRUCTURAL feature
+  pipelines. SIFT is the next classical-CV layer; full SIFT
+  (scale-space + DoG extrema + orientation histograms + 128-D
+  descriptor) is 4-6 weeks of pure-NOVA work and was scope-cut for this
+  round. This session ships the keypoint LOCATION half only -- enough
+  to surface a SCALE-INVARIANT corner-like feature atom
+  (`image_keypoint_count_<low|mid|high>`) on the perception path; the
+  128-D descriptor + matching are explicitly deferred per
+  `IMAGE_AUDIT.md`'s feature ladder.
+  - **`image_sift.nova`** (NEW) -- pure-NOVA SIFT keypoint detector.
+    Public API: `sift_keypoints(data_ptr, width, height,
+    max_keypoints) -> list of [x, y, octave, scale, contrast]`
+    tuples (the keypoint location records, with coordinates projected
+    back to the original octave-0 image frame), `sift_keypoint_count_bucket(n)
+    -> "low" | "mid" | "high"` (count classifier), `sift_count_label(n)
+    -> "image_keypoint_count_<low|mid|high>"` (feature-atom label
+    formatter), plus per-keypoint accessors (`sift_kp_x/_y/_octave/
+    _scale/_contrast`). Algorithm (Lowe 2004, detection only):
+    (1) Build a 3-octave Gaussian pyramid; each octave has 5 blur
+    levels via successive 3-pass 3x3 Gaussian convolutions (a single
+    3x3 pass per level produces nearly-identical adjacent blurs and
+    kills the DoG signal, so we stack 3 passes per level for an
+    effective sigma growth proportional to sqrt(3) that produces
+    detectable DoG extrema). (2) Compute 4 DoG layers per octave
+    via adjacent-blur subtraction. (3) Find 3x3x3 local extrema
+    (spatial + scale) in the 2 interior DoG layers (1 and 2) of
+    each octave. (4) Filter by contrast: `|DoG|*1000/255 > 30`
+    milli-normalized, matching Lowe's 0.03 threshold for 8-bit
+    images. (5) Filter by Harris-style edge rejection: reuse
+    `harris_apply` from R1.6 on the original image; candidates
+    are kept iff a Harris corner lies within Chebyshev distance 2.
+    (6) Insertion-sort by contrast descending; cap at
+    `SIFT_HARD_MAX = 200`. Dimension caps: minimum 32x32 (3 octaves
+    can't sample usefully below that), maximum 256x256 (3 octaves x
+    5 blur levels x 3 passes per level = 45 Gaussian-pass equivalents;
+    256x256 keeps every intermediate accumulator well under NOVA's
+    2^20 codegen pointer-threshold ceiling, gotcha #11). Every
+    Gaussian-weight multiply uses `int_mul` (Bug-A fix path).
+  - **`visual_perception.nova`** -- extends `_vp_append_structural_features`
+    to call `sift_keypoints` when both axes are >= `VP_SIFT_MIN_DIM`
+    (32); appends `sift_count_label(len(keypoints))` to the per-image
+    feature-atom list. Smaller images continue to surface only the
+    Sobel + Harris atoms.
+  - **NO touches** to `src/io/transducers/{image_sobel,image_harris,
+    image_pgm,png_decode,deflate_decode}.nova` (the R1.5 / R1.6
+    surfaces are settled read-only), `src/safety/`, `src/learning/`,
+    or `/home/user/NOVA` (other agents).
+  Acceptance: `tests/unit/test_image_sift.nova` (NEW; 25 assertions
+  across 12 test functions): uniform-grey 32x32 -> 0 keypoints; single
+  bright 5x5 spot at (13,13) in 32x32 -> >0 keypoints with the
+  strongest peak within Chebyshev 8 of the spot center; 32x32
+  four-spots fixture (one bright 5x5 patch near each corner) -> >= 2
+  keypoints; 16x16 (< SIFT_MIN_DIM) -> empty list; 300x300 (>
+  SIFT_MAX_DIM) -> empty list; data_ptr=0 / width=0 / height=0 ->
+  empty list; count-bucket classifier (0/9 -> low, 10/100 -> mid,
+  101/200 -> high); count-label formatter; per-keypoint accessors
+  round-trip; max_keypoints cap honored (tolerates the +1 overshoot
+  matching the image_harris insertion-sort pattern).
+  `tests/integration/scenario_q_image_see.sh` (+2 assertions over
+  R1.6's 15): a hand-rolled 32x32 four-spots PGM fixture is fed via
+  `/see`; the summary line carries "32x32"; the feature line carries
+  `image_keypoint_count_low` (4 keypoints, well below the low/mid
+  boundary of 10). On the standard test fixtures the detector
+  produces: uniform 32x32 -> 0 keypoints; single 5x5 spot -> 1
+  keypoint at the spot center with contrast 55; four 5x5 spots -> 4
+  keypoints (one per spot) with contrast 55 each. Final counts:
+  132 modules (+1 from `image_sift.nova`; the visual_perception
+  extension is in-place), 132 unit-test suites (+1 from
+  `test_image_sift.nova`, +25 assertions), 26 integration scripts
+  pass (`scenario_q_image_see.sh` extended from 15 to 17 assertions,
+  +2).
+  `IMAGE_AUDIT.md`: marks "SIFT keypoint DETECTION" as DONE in the
+  feature ladder; the SIFT 128-D descriptor + matching remain in
+  the "4-6 weeks" row as the deferred follow-up; P3.3 structural-
+  features section extended with the SIFT-detection algorithm,
+  parameters, and dimension caps.
 - P3.9 pure-NOVA 256-bit bignum library (DH key-exchange prerequisite):
   **complete (leaf primitive)**. The federated SecAgg MVP (P3.8) shipped
   pre-shared tokens because NOVA had no bignum. This session lands the
@@ -2066,8 +2145,14 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 130 (130 PASS; **+1 suite / +54 assertions from
-  this session's pure-NOVA 256-bit bignum library** -- `test_bignum.nova`
+- Total unit suites: 131 (131 PASS; **+1 suite / +25 assertions from
+  this session's SIFT keypoint detection (scale-space + DoG extrema only,
+  descriptor deferred)** -- `test_image_sift.nova` covers uniform-grey
+  no-keypoint baseline, single-bright-spot localization, four-spots
+  detection, dimension-cap rejection, null-pointer + zero-dim guards,
+  count-bucket classifier, count-label formatter, per-keypoint accessors,
+  max_keypoints cap honored. **+1 suite / +54 assertions from
+  P3.9 pure-NOVA 256-bit bignum library** -- `test_bignum.nova`
   covers `bn_to_hex` / `bn_from_hex` round-trip on the all-zeros,
   all-ones, short, and case-mixed inputs; 32-bit carry propagation in
   `bn_add` (2^32-1 + 1 = 2^32); underflow wrap in `bn_sub` (3 - 5 =

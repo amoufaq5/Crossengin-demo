@@ -32,9 +32,10 @@ FIX="/tmp/ce_scenario_q.pgm"
 FLAT="/tmp/ce_scenario_q_flat.pgm"
 BAD="/tmp/ce_scenario_q_bad.bin"
 EDGE="/tmp/ce_scenario_q_edge.pgm"
+SPOTS="/tmp/ce_scenario_q_spots.pgm"
 
 # Cleanup any stale fixture files from a previous run.
-rm -f "$FIX" "$FLAT" "$BAD" "$EDGE"
+rm -f "$FIX" "$FLAT" "$BAD" "$EDGE" "$SPOTS"
 
 # Build the 4x4 gradient: pixels 0, 16, 32, ..., 240 (mean = 120).
 # Header: P5\n4 4\n255\n  (11 bytes)
@@ -68,6 +69,31 @@ printf '\x4e\x4f\x54\x50\x47\x4d\x00\x00' > "$BAD"
     done
 } > "$EDGE"
 
+# Build a 32x32 four-spots fixture for the SIFT-detection keypoint scan
+# (P3.3 cont.). Black background (intensity 0) with four bright 5x5
+# patches (intensity 255) near each corner: (4,4), (23,4), (4,23),
+# (23,23). The 4-bright-spots layout produces 4 DoG extrema that
+# survive the contrast threshold + the Harris-style edge filter --
+# enough for image_keypoint_count_low to fire (< 10 keypoints) while
+# also producing image_corner_count_* on the same image.
+build_four_spots_pgm() {
+    local out="$1"
+    {
+        printf 'P5\n32 32\n255\n'
+        python3 -c '
+import sys
+W, H = 32, 32
+buf = [0] * (W * H)
+for sx, sy in ((4, 4), (W - 9, 4), (4, H - 9), (W - 9, H - 9)):
+    for dy in range(5):
+        for dx in range(5):
+            buf[(sy + dy) * W + (sx + dx)] = 255
+sys.stdout.buffer.write(bytes(buf))
+'
+    } > "$out"
+}
+build_four_spots_pgm "$SPOTS"
+
 if [ ! -s "$FIX" ]; then
     printf "  ${C_RED}FAIL${C_RST}  fixture %s did not get written\n" "$FIX"
     FAIL=$((FAIL+1))
@@ -81,6 +107,7 @@ INPUT=$(
     printf '/see %s\n' "$FIX"
     printf '/see %s\n' "$FLAT"
     printf '/see %s\n' "$EDGE"
+    printf '/see %s\n' "$SPOTS"
     printf '/see %s\n' "$BAD"
     printf '/quit\n'
 )
@@ -154,7 +181,21 @@ assert_match "$OUT" "features:.*image_orient_0" \
 assert_match "$OUT" "features:.*image_corner_count_low" \
     "/see surfaces image_corner_count_low on edge-only fixture"
 
+# ---- P3.3 cont. SIFT-detection keypoint count on 32x32 four-spots fixture --
+
+# 16. /see on the 32x32 four-spots fixture prints the summary line.
+assert_match "$OUT" "saw image $SPOTS \[32x32" \
+    "/see prints dims on 32x32 four-spots fixture"
+
+# 17. The 32x32 four-spots fixture trips SIFT-detection: four bright 5x5
+# patches each yield one DoG extremum near the patch center; the resulting
+# keypoint count (~4) lands in the LOW bucket (< 10), so
+# image_keypoint_count_low fires. SIFT runs only on images >= 32x32 so the
+# 16x16 fixture above does NOT carry this atom.
+assert_match "$OUT" "features:.*image_keypoint_count_low" \
+    "/see surfaces image_keypoint_count_low on 32x32 four-spots fixture"
+
 # Cleanup.
-rm -f "$FIX" "$FLAT" "$BAD" "$EDGE"
+rm -f "$FIX" "$FLAT" "$BAD" "$EDGE" "$SPOTS"
 
 summary "scenario_q_image_see"

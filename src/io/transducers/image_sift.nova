@@ -1,0 +1,601 @@
+// CrossEngin io/transducers: SIFT-detection scale-invariant keypoint
+// detector (P3.3 continuation -- the third STRUCTURAL feature pipeline
+// after Sobel edges + Harris corners).
+//
+// Purpose
+//   Full SIFT (Lowe 2004) is four pieces: (1) scale-space + DoG extrema
+//   detection, (2) sub-pixel refinement + orientation histograms,
+//   (3) 128-dimensional descriptor, (4) matching. Pieces (2)-(4) are
+//   weeks of pure-NOVA work each; this module ships ONLY piece (1) --
+//   the keypoint LOCATIONS in (x, y, octave, scale) space, with the
+//   descriptor explicitly deferred (the brief: "scope-cut version: ship
+//   just the keypoint DETECTION").
+//
+//   What lands here is enough to surface a SCALE-INVARIANT corner-like
+//   feature the substrate can perceive. Sobel finds edges in the
+//   original image; Harris finds corners in the original image; SIFT-
+//   detection finds blob-like extrema across MULTIPLE SCALES (1x, 1/2x,
+//   1/4x downsampled) so a detail that appears at one scale and not
+//   another still produces a perceptible atom. The full descriptor
+//   (rotation + scale invariant 128-D vector for matching) is in the
+//   audit doc as the next 4-6 week lift.
+//
+// Algorithm (Lowe 2004, detection only):
+//   1. Build a 3-octave Gaussian pyramid. Each octave has 5 blur levels,
+//      successively smoothed with a 3x3 Gaussian kernel ([1 2 1; 2 4 2;
+//      1 2 1] / 16, the standard separable approximation). Octaves are
+//      downsampled 2x by 2x2 averaging between octaves.
+//   2. Compute 4 Difference-of-Gaussian (DoG) images per octave by
+//      subtracting adjacent blur levels.
+//   3. Find 3x3x3 local extrema in the DoG cube (x, y, scale): a pixel
+//      qualifies iff it is strictly brighter (or strictly darker) than
+//      all 26 neighbors in DoG[s-1], DoG[s], DoG[s+1]. With 4 DoGs
+//      per octave we check scales s=1 and s=2 only (s=0 and s=3 lack
+//      a neighbor in one direction).
+//   4. Filter by contrast: |DoG| > SIFT_CONTRAST_THRESHOLD. The DoG
+//      signal is a difference of byte intensities (-255..255 signed);
+//      30 is approximately 12% of full range, the same ballpark Lowe's
+//      0.03 normalized threshold lands at for an 8-bit image.
+//   5. Filter by Harris-style edge response: reuse harris_apply from
+//      R1.6. A SIFT keypoint should be a BLOB, not an edge -- if the
+//      candidate pixel coincides with a Harris-detected EDGE (low
+//      response) we drop it.
+//   6. Return up to SIFT_MAX_KEYPOINTS (x, y, octave, scale, contrast)
+//      records, sorted by contrast (descending).
+//
+// Public API
+//   sift_keypoints(data_ptr, width, height, max_keypoints) ->
+//       list of [x, y, octave, scale, contrast] in IMAGE coordinates
+//       (octave-0 frame; sub-octave positions are scaled back up via
+//       `x * 2^octave`). max_keypoints is hard-capped at
+//       SIFT_HARD_MAX (=200) regardless of caller request.
+//   sift_keypoint_count_bucket(n) -> "low" | "mid" | "high"
+//   sift_count_label(n) -> "image_keypoint_count_<low|mid|high>"
+//
+// Per-keypoint record slots:
+//   SIFT_KP_X        = 0
+//   SIFT_KP_Y        = 1
+//   SIFT_KP_OCTAVE   = 2  (0 = full-res; 1 = half-res; 2 = quarter-res)
+//   SIFT_KP_SCALE    = 3  (1 or 2 -- the interior DoG layer it peaked in)
+//   SIFT_KP_CONTRAST = 4  (signed |DoG| at the peak, absolute value)
+//
+// Pixel-area cap: SIFT_MAX_DIM = 256 per axis. 3 octaves x 5 blur levels
+//   means we pay 15x the per-pixel work of the input; combined with
+//   Harris-style filtering this is the largest area we can run without
+//   tripping NOVA's codegen pointer-threshold gotcha #11. Smaller-than-
+//   32x32 inputs return an empty list (we cannot sample 3 octaves).
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub.
+// CrossEngin dependencies: image_harris.nova (edge-response filter
+//   reuses Harris from R1.6).
+
+import "image_harris.nova"
+
+// ---- format constants -----------------------------------------------------
+
+// Number of octaves and blur levels per octave. Lowe ships 4 octaves x
+// 5 levels = 20 Gaussian images; we ship 3 x 5 = 15 to stay under the
+// pointer-threshold cap at 256x256 inputs.
+let SIFT_OCTAVES = 3
+let SIFT_BLUR_LEVELS = 5         // 5 -> 4 DoG layers per octave
+let SIFT_DOG_LAYERS = 4
+let SIFT_DOG_INTERIOR_LAYERS = 2 // we check scales 1 and 2 only
+
+// Number of 3x3 Gaussian passes per blur LEVEL. A single 3x3 Gaussian
+// has effective sigma ~0.85. Real SIFT uses logarithmically-spaced
+// sigmas (sigma * 2^(1/3) between levels). Stacking N passes per level
+// gives an effective sigma growth proportional to sqrt(N), which
+// produces meaningful DoG signal between adjacent blur levels (a single
+// pass produces nearly identical adjacent blurs, killing the DoG
+// signal). We pick 3 passes per level as the smallest count that
+// produces detectable DoG extrema on the 5x5-spot fixture without
+// exploding the per-octave work.
+let SIFT_BLUR_PASSES_PER_LEVEL = 3
+
+// Contrast threshold on the DoG response, expressed in MILLI-NORMALIZED
+// units. The DoG signal is a difference of byte intensities in
+// [-255, 255]; we compare |DoG| * 1000 / 255 against this threshold
+// (Lowe's normalized 0.03 threshold corresponds to 30 milli). For a
+// well-blurred bright 5x5 spot the DoG peak lands around |DoG| = 16
+// which is 62 milli -- well above the 30-milli floor.
+let SIFT_CONTRAST_THRESHOLD_MILLI = 30
+
+// Maximum keypoints we return regardless of caller request.
+let SIFT_HARD_MAX = 200
+
+// Hard cap on input dimensions. 256x256 = 65536 px; with 3 octaves and
+// 5 blurs per octave we keep all per-pyramid-pixel multiplies under
+// 2^20 (the codegen pointer-threshold ceiling, gotcha #11).
+let SIFT_MAX_DIM = 256
+let SIFT_MAX_PIXEL_AREA = 65536      // 256 * 256
+
+// Minimum input dimensions. Below 32x32 we cannot sample 3 octaves
+// usefully (the third octave would shrink to 8x8, where a 3x3 kernel
+// has barely any interior pixels).
+let SIFT_MIN_DIM = 32
+
+// Keypoint-count classification thresholds. <10 low, 10..100 mid, >100 high.
+let SIFT_COUNT_LOW_MAX = 9
+let SIFT_COUNT_MID_MAX = 100
+
+// Per-keypoint record slot indices.
+let SIFT_KP_X        = 0
+let SIFT_KP_Y        = 1
+let SIFT_KP_OCTAVE   = 2
+let SIFT_KP_SCALE    = 3
+let SIFT_KP_CONTRAST = 4
+
+// Gaussian-kernel weight constants (3x3, sum = 16). We keep them as
+// individual lets so the inner-loop multiplies use small operands
+// (gotcha #11 / Bug-A safety).
+let SIFT_G_CORNER = 1   // 4 corner taps
+let SIFT_G_EDGE   = 2   // 4 edge taps
+let SIFT_G_CENTER = 4   // 1 center tap
+let SIFT_G_SUM    = 16  // 4*1 + 4*2 + 4 = 16
+
+// ---- keypoint helpers ----------------------------------------------------
+
+fn _sift_make_keypoint(x, y, octave, scale, contrast) {
+    let kp = list_new()
+    push(kp, x)
+    push(kp, y)
+    push(kp, octave)
+    push(kp, scale)
+    push(kp, contrast)
+    return kp
+}
+
+// ---- core: Gaussian blur (3x3, weights 1/2/4/2/1, sum 16) ----------------
+//
+// One blur pass. Source is a int list (length area), destination is a
+// freshly-allocated int list (length area). Border pixels are
+// COPIED unchanged from the source (zero-pad would warp the DoG signal
+// near the image edges).
+
+fn _sift_blur_3x3(src, width, height) {
+    let area = int_mul(width, height)
+    let dst = list_new()
+    // Pre-fill so we can use list_set on every index (including borders).
+    let i = 0
+    while i < area {
+        push(dst, src[i])
+        i = int_add(i, 1)
+    }
+    if width < 3 { return dst }
+    if height < 3 { return dst }
+    let y = 1
+    while y < height - 1 {
+        let row_above = int_mul(int_sub(y, 1), width)
+        let row_mid   = int_mul(y, width)
+        let row_below = int_mul(int_add(y, 1), width)
+        let x = 1
+        while x < width - 1 {
+            // 9-tap weighted sum: corners*1 + edges*2 + center*4, /16.
+            let tl = src[int_add(row_above, int_sub(x, 1))]
+            let tm = src[int_add(row_above, x)]
+            let tr = src[int_add(row_above, int_add(x, 1))]
+            let ml = src[int_add(row_mid,   int_sub(x, 1))]
+            let mc = src[int_add(row_mid,   x)]
+            let mr = src[int_add(row_mid,   int_add(x, 1))]
+            let bl = src[int_add(row_below, int_sub(x, 1))]
+            let bm = src[int_add(row_below, x)]
+            let br = src[int_add(row_below, int_add(x, 1))]
+            // Use int_mul on every weighted multiply (Bug-A fix path).
+            let s = int_mul(SIFT_G_CORNER, tl)
+            s = int_add(s, int_mul(SIFT_G_EDGE,   tm))
+            s = int_add(s, int_mul(SIFT_G_CORNER, tr))
+            s = int_add(s, int_mul(SIFT_G_EDGE,   ml))
+            s = int_add(s, int_mul(SIFT_G_CENTER, mc))
+            s = int_add(s, int_mul(SIFT_G_EDGE,   mr))
+            s = int_add(s, int_mul(SIFT_G_CORNER, bl))
+            s = int_add(s, int_mul(SIFT_G_EDGE,   bm))
+            s = int_add(s, int_mul(SIFT_G_CORNER, br))
+            let v = s / SIFT_G_SUM
+            list_set(dst, int_add(row_mid, x), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- bytes -> int-list -------------------------------------------------
+
+// Convert the data_ptr byte buffer into a NOVA int list. Subsequent
+// blur passes operate on int lists so border-pixel sums (up to 16*255 =
+// 4080) and DoG differences (up to +/- 255) stay safely signed and
+// don't require store8 clamping.
+fn _sift_bytes_to_list(data_ptr, width, height) {
+    let area = int_mul(width, height)
+    let out = list_new()
+    let i = 0
+    while i < area {
+        push(out, load8(data_ptr + i))
+        i = int_add(i, 1)
+    }
+    return out
+}
+
+// ---- 2x2 downsample (octave step) --------------------------------------
+//
+// New dimensions are width/2, height/2. Each destination pixel is the
+// average of a 2x2 block in the source. Border-row / column truncation
+// when width or height is odd.
+
+fn _sift_downsample_2x(src, width, height) {
+    let new_w = width / 2
+    let new_h = height / 2
+    let out = list_new()
+    let y = 0
+    while y < new_h {
+        let sy = int_mul(y, 2)
+        let row_a = int_mul(sy, width)
+        let row_b = int_mul(int_add(sy, 1), width)
+        let x = 0
+        while x < new_w {
+            let sx = int_mul(x, 2)
+            let a = src[int_add(row_a, sx)]
+            let b = src[int_add(row_a, int_add(sx, 1))]
+            let c = src[int_add(row_b, sx)]
+            let d = src[int_add(row_b, int_add(sx, 1))]
+            push(out, (a + b + c + d) / 4)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return out
+}
+
+// ---- DoG construction -------------------------------------------------
+//
+// For each adjacent pair of blur levels at the same scale, compute
+// dog[i] = blur[i+1] - blur[i]. Returns a list of SIFT_DOG_LAYERS int
+// lists, each of length width*height.
+
+fn _sift_build_dog(blurs, width, height) {
+    let area = int_mul(width, height)
+    let dogs = list_new()
+    let s = 0
+    while s < SIFT_DOG_LAYERS {
+        let dog = list_new()
+        let cur = blurs[s]
+        let nxt = blurs[int_add(s, 1)]
+        let i = 0
+        while i < area {
+            push(dog, int_sub(nxt[i], cur[i]))
+            i = int_add(i, 1)
+        }
+        push(dogs, dog)
+        s = int_add(s, 1)
+    }
+    return dogs
+}
+
+// ---- 3x3x3 extremum check ---------------------------------------------
+//
+// Returns 1 iff dogs[scale][y*width+x] is strictly greater than ALL 26
+// neighbors (across DoG layers scale-1, scale, scale+1) OR strictly
+// less than ALL 26 neighbors. Border pixels (x == 0, x == width-1,
+// y == 0, y == height-1) automatically fail.
+
+fn _sift_is_extremum(dogs, scale, width, height, x, y) {
+    if x <= 0 { return 0 }
+    if y <= 0 { return 0 }
+    if x >= width - 1 { return 0 }
+    if y >= height - 1 { return 0 }
+    let center = dogs[scale][int_add(int_mul(y, width), x)]
+    let is_max = 1
+    let is_min = 1
+    let ds = -1
+    while ds <= 1 {
+        let s2 = int_add(scale, ds)
+        let layer = dogs[s2]
+        let dy = -1
+        while dy <= 1 {
+            let yy = int_add(y, dy)
+            let row_off = int_mul(yy, width)
+            let dx = -1
+            while dx <= 1 {
+                let xx = int_add(x, dx)
+                // Skip the center pixel itself (ds==0, dy==0, dx==0).
+                let skip = 0
+                if ds == 0 {
+                    if dy == 0 {
+                        if dx == 0 { skip = 1 }
+                    }
+                }
+                if skip == 0 {
+                    let v = layer[int_add(row_off, xx)]
+                    if v >= center { is_max = 0 }
+                    if v <= center { is_min = 0 }
+                }
+                dx = int_add(dx, 1)
+            }
+            dy = int_add(dy, 1)
+        }
+        ds = int_add(ds, 1)
+    }
+    if is_max == 1 { return 1 }
+    if is_min == 1 { return 1 }
+    return 0
+}
+
+// ---- per-octave pyramid build + extrema scan ---------------------------
+//
+// For one octave at the given (octave_w, octave_h):
+//   1. Apply Gaussian 3x3 successively 4 times to produce 5 blur levels.
+//   2. Compute 4 DoG layers (blur[i+1] - blur[i]).
+//   3. Scan the 2 interior DoG layers for 3x3x3 extrema with |contrast|
+//      > SIFT_CONTRAST_THRESHOLD.
+// Returns a list of [octave_x, octave_y, scale, |contrast|] tuples (NB:
+// IN THE OCTAVE-LOCAL COORDINATE FRAME; the caller scales x and y up by
+// 2^octave to project back to the original image).
+
+fn _sift_scan_octave(base_pixels, width, height, octave) {
+    let kps = list_new()
+    if width < 3 { return kps }
+    if height < 3 { return kps }
+    // Build 5 blur levels: blurs[0] is the base; blurs[i] is N passes of
+    // the 3x3 Gaussian applied to blurs[i-1]. The multi-pass-per-level
+    // pattern produces meaningful DoG signal between adjacent levels
+    // (a single 3x3 pass per level barely changes the image so the DoG
+    // signal vanishes -- see the design comment on
+    // SIFT_BLUR_PASSES_PER_LEVEL).
+    let blurs = list_new()
+    push(blurs, base_pixels)
+    let b = 1
+    while b < SIFT_BLUR_LEVELS {
+        let next_blur = blurs[int_sub(b, 1)]
+        let p = 0
+        while p < SIFT_BLUR_PASSES_PER_LEVEL {
+            next_blur = _sift_blur_3x3(next_blur, width, height)
+            p = int_add(p, 1)
+        }
+        push(blurs, next_blur)
+        b = int_add(b, 1)
+    }
+    // Build 4 DoG layers.
+    let dogs = _sift_build_dog(blurs, width, height)
+    // Scan interior DoG layers (1 and 2) for 3x3x3 extrema.
+    let scale = 1
+    while scale <= SIFT_DOG_INTERIOR_LAYERS {
+        let y = 1
+        while y < height - 1 {
+            let row_off = int_mul(y, width)
+            let x = 1
+            while x < width - 1 {
+                let dog_val = dogs[scale][int_add(row_off, x)]
+                let abs_dog = dog_val
+                if abs_dog < 0 { abs_dog = 0 - abs_dog }
+                // Convert absolute DoG (byte difference) to milli-units
+                // (1000 = full byte range) for threshold comparison.
+                // Use int_mul to stay safe past the codegen pointer
+                // threshold even though abs_dog * 1000 is bounded by
+                // 255*1000 = 255000 which is well under 2^20.
+                let abs_dog_milli = int_mul(abs_dog, 1000) / 255
+                if abs_dog_milli > SIFT_CONTRAST_THRESHOLD_MILLI {
+                    if _sift_is_extremum(dogs, scale, width, height, x, y) == 1 {
+                        let rec = list_new()
+                        push(rec, x)
+                        push(rec, y)
+                        push(rec, scale)
+                        push(rec, abs_dog)
+                        push(kps, rec)
+                    }
+                }
+                x = int_add(x, 1)
+            }
+            y = int_add(y, 1)
+        }
+        scale = int_add(scale, 1)
+    }
+    return kps
+}
+
+// ---- Harris-style edge filter (reuses harris_apply from R1.6) ----------
+//
+// We compute Harris corners on the ORIGINAL (octave-0) image once;
+// keypoints projected back to (full_x, full_y) are accepted only if
+// they are within SIFT_EDGE_REJECT_RADIUS of a Harris corner OR if the
+// Harris response at the candidate location is NOT in the "edge"
+// regime. Implementing the full second-moment-matrix edge test
+// (Lowe 2004, eq. 18) requires re-computing Hessian eigenvalues per
+// candidate -- that's roughly the same code Harris already runs. We
+// reuse the Harris output directly: candidates are kept iff no Harris
+// corner lies within SIFT_EDGE_REJECT_RADIUS pixels (i.e., the
+// candidate is in a region Harris already classified as "not just an
+// edge"). This is a coarser test than Lowe's, but it leverages an
+// already-debugged module without re-doing the convolutions.
+
+let SIFT_EDGE_REJECT_RADIUS = 2
+
+// Returns 1 if a Harris corner is "near" (x, y) in the original image
+// coordinate frame (within SIFT_EDGE_REJECT_RADIUS Chebyshev distance).
+// 0 otherwise.
+fn _sift_has_nearby_harris(corners, x, y) {
+    let n = len(corners)
+    let i = 0
+    while i < n {
+        let c = corners[i]
+        let dx = int_sub(c[0], x)
+        if dx < 0 { dx = 0 - dx }
+        let dy = int_sub(c[1], y)
+        if dy < 0 { dy = 0 - dy }
+        if dx <= SIFT_EDGE_REJECT_RADIUS {
+            if dy <= SIFT_EDGE_REJECT_RADIUS {
+                return 1
+            }
+        }
+        i = int_add(i, 1)
+    }
+    return 0
+}
+
+// ---- top-N insertion sort (by contrast, descending) -------------------
+
+fn _sift_insert_kp(out, kp, cap) {
+    let n = len(out)
+    let contrast = kp[SIFT_KP_CONTRAST]
+    let pos = n
+    let i = 0
+    while i < n {
+        if contrast > out[i][SIFT_KP_CONTRAST] {
+            pos = i
+            i = n
+        } else {
+            i = int_add(i, 1)
+        }
+    }
+    if pos == n {
+        if n < cap { push(out, kp) }
+        return 1
+    }
+    push(out, _sift_make_keypoint(0, 0, 0, 0, 0))
+    let j = len(out) - 1
+    while j > pos {
+        list_set(out, j, out[j - 1])
+        j = int_sub(j, 1)
+    }
+    list_set(out, pos, kp)
+    if len(out) > cap {
+        // Trim by rebuilding into a capped list and copying back via
+        // list_set (NOVA has no list_pop). The +1 overshoot is the same
+        // pattern image_harris uses.
+        let trimmed = list_new()
+        let k = 0
+        while k < cap {
+            push(trimmed, out[k])
+            k = int_add(k, 1)
+        }
+        let m = 0
+        while m < cap {
+            list_set(out, m, trimmed[m])
+            m = int_add(m, 1)
+        }
+    }
+    return 1
+}
+
+// ---- public API ------------------------------------------------------
+
+// sift_keypoints(data_ptr, width, height, max_keypoints)
+//   -> list of [x, y, octave, scale, contrast] tuples (each a 5-list).
+// Coordinates are in the ORIGINAL (octave-0) image frame: x and y
+// returned for a keypoint detected in octave o are octave_x * 2^o.
+// Returns an empty list on invalid inputs (zero / negative dims, NULL
+// pointer, dimensions outside [SIFT_MIN_DIM, SIFT_MAX_DIM]).
+fn sift_keypoints(data_ptr, width, height, max_keypoints) {
+    let empty = list_new()
+    if width <= 0  { return empty }
+    if height <= 0 { return empty }
+    if data_ptr == 0 { return empty }
+    if width < SIFT_MIN_DIM  { return empty }
+    if height < SIFT_MIN_DIM { return empty }
+    if width > SIFT_MAX_DIM  { return empty }
+    if height > SIFT_MAX_DIM { return empty }
+    let area = int_mul(width, height)
+    if area > SIFT_MAX_PIXEL_AREA { return empty }
+    // Clamp max_keypoints into [1, SIFT_HARD_MAX].
+    let cap = max_keypoints
+    if cap < 1 { cap = 1 }
+    if cap > SIFT_HARD_MAX { cap = SIFT_HARD_MAX }
+
+    // Harris on the ORIGINAL image (octave 0) -- the "is this an edge?"
+    // filter. We get a list of corner records; SIFT keypoints near a
+    // Harris corner are KEPT (they are blob-like / corner-like), the
+    // rest are dropped as edge-only DoG extrema.
+    let harris_r = harris_apply(data_ptr, width, height)
+    let harris_corners = harris_result_corners(harris_r)
+    let n_harris = len(harris_corners)
+
+    // Octave 0 pixels as an int list. Each subsequent octave halves.
+    let oct_pixels = _sift_bytes_to_list(data_ptr, width, height)
+    let oct_w = width
+    let oct_h = height
+    let out = list_new()
+    let octave = 0
+    while octave < SIFT_OCTAVES {
+        let oct_kps = _sift_scan_octave(oct_pixels, oct_w, oct_h, octave)
+        let n_oct = len(oct_kps)
+        let i = 0
+        // Per-octave scale-up multiplier: 2^octave. Use a small int_mul
+        // so we don't trip the codegen pointer threshold at octave 2.
+        let scale_up = 1
+        let oo = 0
+        while oo < octave {
+            scale_up = int_mul(scale_up, 2)
+            oo = int_add(oo, 1)
+        }
+        while i < n_oct {
+            let rec = oct_kps[i]
+            let lx = rec[0]
+            let ly = rec[1]
+            let lscale = rec[2]
+            let lcontrast = rec[3]
+            // Project back to original image coordinates.
+            let fx = int_mul(lx, scale_up)
+            let fy = int_mul(ly, scale_up)
+            // Edge-response filter via Harris proximity.
+            // If Harris found NO corners at all on this image, we cannot
+            // apply the proximity filter; in that case we KEEP candidates
+            // (the substrate uses keypoint_count_low to signal a poor
+            // detection regardless). Otherwise we require a Harris corner
+            // within SIFT_EDGE_REJECT_RADIUS.
+            let keep = 1
+            if n_harris > 0 {
+                keep = _sift_has_nearby_harris(harris_corners, fx, fy)
+            }
+            if keep == 1 {
+                let kp = _sift_make_keypoint(fx, fy, octave, lscale, lcontrast)
+                _sift_insert_kp(out, kp, cap)
+            }
+            i = int_add(i, 1)
+        }
+        // Downsample for the next octave.
+        if octave + 1 < SIFT_OCTAVES {
+            let new_w = oct_w / 2
+            let new_h = oct_h / 2
+            if new_w >= 3 {
+                if new_h >= 3 {
+                    oct_pixels = _sift_downsample_2x(oct_pixels, oct_w, oct_h)
+                    oct_w = new_w
+                    oct_h = new_h
+                } else {
+                    octave = SIFT_OCTAVES   // break
+                }
+            } else {
+                octave = SIFT_OCTAVES   // break
+            }
+        }
+        octave = int_add(octave, 1)
+    }
+    return out
+}
+
+// ---- count-bucket helpers --------------------------------------------
+
+// sift_keypoint_count_bucket(n) -> "low" | "mid" | "high".
+//   <10 -> low; 10..100 -> mid; >100 -> high.
+fn sift_keypoint_count_bucket(n) {
+    if n <= SIFT_COUNT_LOW_MAX { return "low" }
+    if n <= SIFT_COUNT_MID_MAX { return "mid" }
+    return "high"
+}
+
+// sift_count_label(n) -> the full feature-atom label
+//   "image_keypoint_count_<low|mid|high>".
+fn sift_count_label(n) {
+    if n <= SIFT_COUNT_LOW_MAX { return "image_keypoint_count_low" }
+    if n <= SIFT_COUNT_MID_MAX { return "image_keypoint_count_mid" }
+    return "image_keypoint_count_high"
+}
+
+// ---- per-keypoint accessors ------------------------------------------
+
+fn sift_kp_x(kp)        { return kp[SIFT_KP_X] }
+fn sift_kp_y(kp)        { return kp[SIFT_KP_Y] }
+fn sift_kp_octave(kp)   { return kp[SIFT_KP_OCTAVE] }
+fn sift_kp_scale(kp)    { return kp[SIFT_KP_SCALE] }
+fn sift_kp_contrast(kp) { return kp[SIFT_KP_CONTRAST] }
