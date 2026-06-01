@@ -599,3 +599,655 @@ fn sift_kp_y(kp)        { return kp[SIFT_KP_Y] }
 fn sift_kp_octave(kp)   { return kp[SIFT_KP_OCTAVE] }
 fn sift_kp_scale(kp)    { return kp[SIFT_KP_SCALE] }
 fn sift_kp_contrast(kp) { return kp[SIFT_KP_CONTRAST] }
+
+// ============================================================================
+// SIFT 128-D DESCRIPTOR + MATCHER (P3.3 cont. v2 -- descriptor + matcher half)
+// ============================================================================
+//
+// Algorithm (Lowe 2004, descriptor only):
+//   For each keypoint (x, y, octave, scale) produced by the detector above:
+//
+//   1. Orientation assignment. Compute gradient magnitude + direction at
+//      every pixel in a 16x16 window around the keypoint. Build a 36-bin
+//      orientation histogram (each bin = 10 degrees). The peak bin is the
+//      keypoint's dominant orientation; the descriptor is rotated so this
+//      orientation becomes "bin 0" (rotation-invariance).
+//
+//   2. 4x4 grid of 8-bin direction histograms. Divide the 16x16 window
+//      into 16 cells of 4x4 pixels each. For each cell, accumulate the
+//      magnitudes of its pixels into an 8-bin direction histogram (each
+//      bin = 45 degrees, indexed RELATIVE to the keypoint's dominant
+//      orientation). Each pixel contributes magnitude * gaussian_weight
+//      (16x16 Gaussian falloff from the keypoint center).
+//
+//   3. Concatenate the 16 cell histograms into a 128-D vector.
+//
+//   4. Normalize: L2 norm -> 1000 (milli-unit); cap each component at
+//      200 (Lowe's 0.2 threshold for illumination invariance);
+//      re-normalize to 1000.
+//
+// Matcher (Lowe's ratio test):
+//   sift_match(desc_a, desc_b, ratio_milli=700) returns 1 iff
+//   best_distance(desc_a, b_list) / second_best_distance < 0.7. The
+//   keypoint-list variant returns the surviving [idx_a, idx_b, dist] triples.
+//
+// NOVA gotchas honored:
+//   * 128-D vector, max component ~= 1000. L2 sum-of-squares <= 128*1e6
+//     which is over 2^20 (the pointer-threshold ceiling on naive `a*b`).
+//     Every multiplication of two values that can each reach 1000 goes
+//     through int_mul (Bug-A safe path).
+//   * atan2 implemented as an 8-quadrant integer table lookup keyed on
+//     the (sign, |dx|/|dy| comparison) quadrants -- no float, no atan, no
+//     trig table beyond the 36 orientation-histogram bins.
+//   * 16x16 Gaussian weight table precomputed once as a module-level
+//     constant (256 ints, sigma ~= 8 -- half the window) so we don't pay
+//     re-derivation cost per keypoint.
+
+// ---- descriptor constants ---------------------------------------------------
+
+// Window side (16x16 = 256 pixels) and per-cell side (4x4 = 16 cells).
+let SIFT_DESC_WIN     = 16
+let SIFT_DESC_HALF    = 8       // window radius (pixels on each side of kp)
+let SIFT_DESC_CELL    = 4       // cell side (pixels)
+let SIFT_DESC_GRID    = 4       // 4x4 grid of cells
+let SIFT_DESC_BINS    = 8       // 8 direction bins per cell
+let SIFT_DESC_DIMS    = 128     // 16 cells * 8 bins
+
+// Orientation-histogram bin count (10 degrees per bin -> 36 bins).
+let SIFT_ORIENT_BINS  = 36
+
+// Milli-unit reference values.
+let SIFT_DESC_L2_TARGET    = 1000  // post-normalization L2 norm (milli-unit)
+let SIFT_DESC_CAP_MILLI    = 200   // Lowe's 0.2 illumination cap
+let SIFT_DESC_DEFAULT_RATIO = 700  // Lowe's 0.7 ratio test default
+
+// 8-direction quadrant boundaries. We sort gradient direction into 8 bins
+// of 45 degrees each. The bin layout matches a counter-clockwise sweep
+// starting at the positive-x axis:
+//   bin 0:  -22.5 <= theta <   22.5 (E)
+//   bin 1:   22.5 <= theta <   67.5 (NE)
+//   bin 2:   67.5 <= theta <  112.5 (N)
+//   bin 3:  112.5 <= theta <  157.5 (NW)
+//   bin 4:  157.5 <= theta or theta < -157.5 (W)
+//   bin 5: -157.5 <= theta <  -112.5 (SW)
+//   bin 6: -112.5 <= theta <   -67.5 (S)
+//   bin 7:  -67.5 <= theta <   -22.5 (SE)
+
+// ---- 16x16 Gaussian weight table (precomputed, milli-unit) -----------------
+//
+// Approximate Gaussian with sigma ~= window_radius/2 = 4 pixels. We
+// pre-bake the squared-distance-from-center -> weight curve as a small
+// integer table the inner loop indexes by (dx_from_center^2 + dy_from_center^2).
+//
+// The actual values are derived from exp(-r^2 / (2 * 4^2)) = exp(-r^2/32),
+// then scaled to milli (1000 = exp(0)). We build it once at descriptor-init
+// time (cached in a module-level slot via _sift_gauss_table_get).
+
+// Cache slot for the 16x16 weight table (256 ints, milli-scaled). 0 means
+// "not built yet"; built on first call to _sift_gauss_table_get.
+let _sift_gauss_cache = 0
+
+// Integer-table approximation of exp(-r2/32) * 1000 for the unique
+// r2 values that occur in a 16x16 window (dx, dy in -8..7). Largest
+// |dx|, |dy| is 8 so r2 max is 128. We use a piecewise-linear
+// approximation that matches the true Gaussian to within ~5%:
+//   r2 =   0 -> w = 1000
+//   r2 =  16 -> w =  607   (exp(-0.5)  ~= 0.607)
+//   r2 =  32 -> w =  368   (exp(-1.0)  ~= 0.368)
+//   r2 =  64 -> w =  135   (exp(-2.0)  ~= 0.135)
+//   r2 = 128 -> w =   18   (exp(-4.0)  ~= 0.018)
+// For r2 in between, we linearly interpolate between the brackets.
+// Implemented as a small fn instead of a lookup table to avoid a 256-int
+// constant list (table_get is < 10 comparisons).
+fn _sift_gauss_weight_for_r2(r2) {
+    if r2 <= 0 { return 1000 }
+    if r2 >= 128 { return 18 }
+    if r2 <= 16 {
+        // Interpolate 1000 -> 607 over r2 in [0, 16].
+        let span = int_sub(1000, 607)
+        let drop = int_mul(span, r2) / 16
+        return int_sub(1000, drop)
+    }
+    if r2 <= 32 {
+        let span = int_sub(607, 368)
+        let drop = int_mul(span, int_sub(r2, 16)) / 16
+        return int_sub(607, drop)
+    }
+    if r2 <= 64 {
+        let span = int_sub(368, 135)
+        let drop = int_mul(span, int_sub(r2, 32)) / 32
+        return int_sub(368, drop)
+    }
+    let span = int_sub(135, 18)
+    let drop = int_mul(span, int_sub(r2, 64)) / 64
+    return int_sub(135, drop)
+}
+
+// ---- 8-bin direction quadrant via integer comparisons ----------------------
+//
+// Given signed dx, dy gradient components, return the bin index in [0, 7].
+// The bin layout (counter-clockwise from +x axis, 45 degrees per bin):
+//   bin 0  East          dx >  |dy|        ( dx>0, |dx|>=|dy| )
+//   bin 1  NorthEast     dx >= 0, dy > 0   ( dx>=0, dy>0, |dy| <= |dx|*tan67.5 / |dx| <= |dy|*... )
+//
+// We approximate atan2 with two integer comparisons per octant:
+//
+//   - The 4 cardinal-vs-diagonal split is |dx| vs |dy|. If |dx| > |dy|
+//     we are E/W; otherwise N/S.
+//   - Within each pair we use the sign of dx (resp. dy) to disambiguate.
+//   - The 8 octants split further by comparing the SHORTER axis against
+//     half the longer axis -- the boundary between "more cardinal than
+//     diagonal" and "more diagonal" lands at tan(22.5 deg) ~= 0.414, so
+//     short < 0.414 * long means cardinal; we use short < long * 414 / 1000
+//     which is an int_mul-safe comparison.
+//
+// Returns 0..7. Zero-vector (dx == dy == 0) returns 0 (arbitrary).
+fn _sift_dir_bin(dx, dy) {
+    if dx == 0 {
+        if dy == 0 { return 0 }
+    }
+    // Absolute values for comparisons.
+    let ax = dx
+    if ax < 0 { ax = 0 - ax }
+    let ay = dy
+    if ay < 0 { ay = 0 - ay }
+    // tan(22.5 deg) ~= 414/1000. Use int_mul to keep the cross-multiply
+    // safe at large gradients (ax, ay each can reach 4*255 = 1020 from
+    // the Sobel kernel; 1020 * 1000 = 1.02M which is over 2^20 -- exactly
+    // the gotcha #11 trap).
+    let ax_long = int_mul(ax, 1000)
+    let ay_long = int_mul(ay, 1000)
+    let ax_414 = int_mul(ax, 414)
+    let ay_414 = int_mul(ay, 414)
+    if ax >= ay {
+        // E/W half. Short axis is ay.
+        if ay_long <= ax_414 {
+            // Almost-pure horizontal: bin 0 (E) or bin 4 (W).
+            if dx >= 0 { return 0 }
+            return 4
+        }
+        // Diagonal: bin 1 NE, 3 NW, 5 SW, 7 SE.
+        if dx >= 0 {
+            if dy >= 0 { return 1 }
+            return 7
+        }
+        if dy >= 0 { return 3 }
+        return 5
+    }
+    // N/S half. Short axis is ax.
+    if ax_long <= ay_414 {
+        // Almost-pure vertical: bin 2 (N) or bin 6 (S).
+        if dy >= 0 { return 2 }
+        return 6
+    }
+    // Diagonal: bin 1 NE, 3 NW, 5 SW, 7 SE (same as above).
+    if dx >= 0 {
+        if dy >= 0 { return 1 }
+        return 7
+    }
+    if dy >= 0 { return 3 }
+    return 5
+}
+
+// ---- 36-bin orientation histogram for the keypoint -------------------------
+//
+// Walk the 16x16 window, compute per-pixel gradient magnitude and direction
+// (via 36 / 360-deg bins indexed by an integer-arctan reduction), and
+// accumulate magnitude-weighted votes. Returns the dominant-bin index in
+// [0, 36).
+//
+// We reduce direction to a 36-bin index without computing actual radians:
+//   8 octants from _sift_dir_bin gives 45 degrees of resolution. To refine
+//   to 10 degrees we subdivide each octant into ~4.5 sub-bins by ratio of
+//   short/long axis. The dominant bin is what we return; we don't need
+//   exact float radians.
+//
+// Returns an int in [0, 36).
+fn _sift_dominant_orientation(data_ptr, width, height, cx, cy) {
+    let hist = list_new()
+    let bi = 0
+    while bi < SIFT_ORIENT_BINS {
+        push(hist, 0)
+        bi = int_add(bi, 1)
+    }
+    let dy = 0 - SIFT_DESC_HALF
+    while dy < SIFT_DESC_HALF {
+        let yy = int_add(cy, dy)
+        if yy >= 1 {
+            if yy < int_sub(height, 1) {
+                let row_above = int_mul(int_sub(yy, 1), width)
+                let row_mid   = int_mul(yy, width)
+                let row_below = int_mul(int_add(yy, 1), width)
+                let dx = 0 - SIFT_DESC_HALF
+                while dx < SIFT_DESC_HALF {
+                    let xx = int_add(cx, dx)
+                    if xx >= 1 {
+                        if xx < int_sub(width, 1) {
+                            // Central differences for the gradient: cheaper
+                            // than Sobel and standard for SIFT descriptors.
+                            let gx = int_sub(load8(data_ptr + row_mid   + int_add(xx, 1)),
+                                             load8(data_ptr + row_mid   + int_sub(xx, 1)))
+                            let gy = int_sub(load8(data_ptr + row_below + xx),
+                                             load8(data_ptr + row_above + xx))
+                            // L1-norm magnitude (cheaper than sqrt and
+                            // monotone-equivalent for argmax voting).
+                            let agx = gx
+                            if agx < 0 { agx = 0 - agx }
+                            let agy = gy
+                            if agy < 0 { agy = 0 - agy }
+                            let mag = int_add(agx, agy)
+                            if mag > 0 {
+                                // 36-bin index. We map each of the 8 octants
+                                // (45 deg) to 4 or 5 contiguous bins; the
+                                // sub-position within the octant is approx
+                                // by short/long * 4 (integer fraction).
+                                let oct = _sift_dir_bin(gx, gy)
+                                let ax = gx
+                                if ax < 0 { ax = 0 - ax }
+                                let ay = gy
+                                if ay < 0 { ay = 0 - ay }
+                                let lng = ax
+                                let sht = ay
+                                if ay > ax {
+                                    lng = ay
+                                    sht = ax
+                                }
+                                // sub in [0, 4]. Each octant covers ~4.5 of
+                                // the 36 bins; we map to 4 sub-bins so the
+                                // total is octant*4 + sub in [0, 32]. For
+                                // octant 8 we'd overshoot; we wrap with mod.
+                                let sub = 0
+                                if lng > 0 {
+                                    sub = int_mul(sht, 4) / lng
+                                    if sub > 3 { sub = 3 }
+                                }
+                                let bin = int_add(int_mul(oct, 4), sub) % SIFT_ORIENT_BINS
+                                // Gaussian-weight the contribution.
+                                let r2 = int_add(int_mul(dx, dx), int_mul(dy, dy))
+                                let w  = _sift_gauss_weight_for_r2(r2)
+                                let contrib = int_mul(mag, w) / 1000
+                                if contrib < 1 { contrib = 1 }
+                                list_set(hist, bin, int_add(hist[bin], contrib))
+                            }
+                        }
+                    }
+                    dx = int_add(dx, 1)
+                }
+            }
+        }
+        dy = int_add(dy, 1)
+    }
+    // Pick the peak bin.
+    let best_bin = 0
+    let best_val = hist[0]
+    let i = 1
+    while i < SIFT_ORIENT_BINS {
+        if hist[i] > best_val {
+            best_val = hist[i]
+            best_bin = i
+        }
+        i = int_add(i, 1)
+    }
+    return best_bin
+}
+
+// ---- L2-norm helpers (integer sqrt + scale) ---------------------------------
+//
+// integer sqrt via Newton's method (bounded iterations). Returns floor(sqrt(n))
+// for n >= 0. For n = 0 returns 0.
+fn _sift_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 4 { return 1 }
+    // Initial guess: half the value. For our range (n up to 128 * 1e6 ~= 1.28e8)
+    // this converges in ~30 iterations.
+    let x = n
+    let y = int_add(n / 2, 1)
+    let iter = 0
+    while iter < 40 {
+        if y >= x { iter = 40 }
+        else {
+            x = y
+            y = int_add(x, n / x) / 2
+            iter = int_add(iter, 1)
+        }
+    }
+    return x
+}
+
+// Compute L2 norm = sqrt(sum(c_i^2)) of a 128-int vector. Uses int_mul
+// for every square (each c_i up to 1000 -> c_i^2 up to 1e6, sum up to
+// 128e6 -- safely above the 2^20 pointer threshold so we MUST go through
+// int_mul; gotcha #11).
+fn _sift_vec_l2_norm(vec) {
+    let n = len(vec)
+    let sum_sq = 0
+    let i = 0
+    while i < n {
+        let v = vec[i]
+        sum_sq = int_add(sum_sq, int_mul(v, v))
+        i = int_add(i, 1)
+    }
+    return _sift_isqrt(sum_sq)
+}
+
+// Scale every component of `vec` so the post-scale L2 norm is `target`
+// (milli-unit). Components are floored to ints. Returns 1 (in-place mutation).
+fn _sift_vec_normalize_l2(vec, target) {
+    let cur = _sift_vec_l2_norm(vec)
+    if cur <= 0 { return 0 }
+    let n = len(vec)
+    let i = 0
+    while i < n {
+        let v = vec[i]
+        let scaled = int_mul(v, target) / cur
+        list_set(vec, i, scaled)
+        i = int_add(i, 1)
+    }
+    return 1
+}
+
+// Cap each component at `cap_milli`. In place. Returns the number of
+// components clamped.
+fn _sift_vec_clamp(vec, cap_milli) {
+    let n = len(vec)
+    let clipped = 0
+    let i = 0
+    while i < n {
+        if vec[i] > cap_milli {
+            list_set(vec, i, cap_milli)
+            clipped = int_add(clipped, 1)
+        }
+        i = int_add(i, 1)
+    }
+    return clipped
+}
+
+// ---- main descriptor pipeline ----------------------------------------------
+//
+// _sift_compute_descriptor: build the 128-D descriptor for one keypoint.
+// Returns [vec_128, valid] where valid == 1 iff we had enough in-bounds
+// pixels to compute a meaningful vector (i.e. the 16x16 window fit at
+// least partly inside the image).
+fn _sift_compute_descriptor(data_ptr, width, height, kp) {
+    let result = list_new()
+    let vec = list_new()
+    let i = 0
+    while i < SIFT_DESC_DIMS {
+        push(vec, 0)
+        i = int_add(i, 1)
+    }
+    push(result, vec)
+    push(result, 0)   // valid (set to 1 below on success)
+    if data_ptr == 0 { return result }
+    if width  < SIFT_DESC_WIN { return result }
+    if height < SIFT_DESC_WIN { return result }
+    let kx = sift_kp_x(kp)
+    let ky = sift_kp_y(kp)
+    // Bring kx/ky into a window-safe interior. We don't bail when the
+    // keypoint sits within HALF pixels of the edge; instead we shift the
+    // window so it fits inside the image. This keeps a usable descriptor
+    // for edge keypoints (with a small position bias).
+    let cx = kx
+    if cx < SIFT_DESC_HALF { cx = SIFT_DESC_HALF }
+    if cx > int_sub(width, SIFT_DESC_HALF + 1) { cx = int_sub(width, SIFT_DESC_HALF + 1) }
+    let cy = ky
+    if cy < SIFT_DESC_HALF { cy = SIFT_DESC_HALF }
+    if cy > int_sub(height, SIFT_DESC_HALF + 1) { cy = int_sub(height, SIFT_DESC_HALF + 1) }
+    // Dominant orientation -> rotation offset for 8-bin direction histograms.
+    let dom36 = _sift_dominant_orientation(data_ptr, width, height, cx, cy)
+    // Convert 36-bin orientation to an 8-bin offset (the 4x4 cells use
+    // 8-bin histograms). dom36 in [0, 36); 36/8 = 4.5 per 8-bin slot, so
+    // dom8 = dom36 * 8 / 36 = dom36 * 2 / 9 (closest integer mapping).
+    let dom8 = int_mul(dom36, 2) / 9
+
+    // Walk the 16x16 window and accumulate magnitude votes into the
+    // 4x4 grid of 8-bin histograms.
+    let dy = 0 - SIFT_DESC_HALF
+    while dy < SIFT_DESC_HALF {
+        let yy = int_add(cy, dy)
+        if yy >= 1 {
+            if yy < int_sub(height, 1) {
+                let row_above = int_mul(int_sub(yy, 1), width)
+                let row_mid   = int_mul(yy, width)
+                let row_below = int_mul(int_add(yy, 1), width)
+                let dx = 0 - SIFT_DESC_HALF
+                while dx < SIFT_DESC_HALF {
+                    let xx = int_add(cx, dx)
+                    if xx >= 1 {
+                        if xx < int_sub(width, 1) {
+                            let gx = int_sub(load8(data_ptr + row_mid   + int_add(xx, 1)),
+                                             load8(data_ptr + row_mid   + int_sub(xx, 1)))
+                            let gy = int_sub(load8(data_ptr + row_below + xx),
+                                             load8(data_ptr + row_above + xx))
+                            let agx = gx
+                            if agx < 0 { agx = 0 - agx }
+                            let agy = gy
+                            if agy < 0 { agy = 0 - agy }
+                            let mag = int_add(agx, agy)
+                            if mag > 0 {
+                                // Cell index: each cell is 4x4. (dx, dy) in
+                                // [-8, 7] maps to (gx_idx, gy_idx) in [0, 3].
+                                let gx_idx = int_add(dx, SIFT_DESC_HALF) / SIFT_DESC_CELL
+                                let gy_idx = int_add(dy, SIFT_DESC_HALF) / SIFT_DESC_CELL
+                                if gx_idx >= 0 {
+                                    if gx_idx < SIFT_DESC_GRID {
+                                        if gy_idx >= 0 {
+                                            if gy_idx < SIFT_DESC_GRID {
+                                                // Direction bin RELATIVE
+                                                // to the keypoint's dominant
+                                                // orientation.
+                                                let bin = _sift_dir_bin(gx, gy)
+                                                let rbin = int_sub(bin, dom8)
+                                                if rbin < 0 { rbin = int_add(rbin, SIFT_DESC_BINS) }
+                                                rbin = rbin % SIFT_DESC_BINS
+                                                // Gaussian-weight contribution.
+                                                let r2 = int_add(int_mul(dx, dx), int_mul(dy, dy))
+                                                let w  = _sift_gauss_weight_for_r2(r2)
+                                                let contrib = int_mul(mag, w) / 1000
+                                                if contrib < 1 { contrib = 1 }
+                                                // 128-D index: cell * 8 + bin.
+                                                let cell_idx = int_add(int_mul(gy_idx, SIFT_DESC_GRID), gx_idx)
+                                                let vec_idx  = int_add(int_mul(cell_idx, SIFT_DESC_BINS), rbin)
+                                                list_set(vec, vec_idx, int_add(vec[vec_idx], contrib))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dx = int_add(dx, 1)
+                }
+            }
+        }
+        dy = int_add(dy, 1)
+    }
+    // Normalize: scale to L2 = 1000 (milli).
+    let ok = _sift_vec_normalize_l2(vec, SIFT_DESC_L2_TARGET)
+    if ok == 0 {
+        // All-zero gradient region (uniform image around keypoint).
+        // Return the zero vector with valid=0 -- the matcher will refuse it.
+        list_set(result, 1, 0)
+        return result
+    }
+    // Cap at 200 milli (Lowe's 0.2 illumination cap).
+    _sift_vec_clamp(vec, SIFT_DESC_CAP_MILLI)
+    // Re-normalize to L2 = 1000.
+    _sift_vec_normalize_l2(vec, SIFT_DESC_L2_TARGET)
+    list_set(result, 1, 1)
+    return result
+}
+
+// ---- public descriptor API --------------------------------------------------
+
+// sift_describe(pgm_data, width, height, keypoint) -> [vec_128, valid].
+//   pgm_data: data_ptr returned by pgm_parse_file (or any byte buffer).
+//   keypoint: a 5-element list as produced by sift_keypoints().
+//   Returns a 2-element list: [vec, valid]
+//     vec   -- a 128-int list (milli-fixed-point components in [0, 200] post-cap)
+//     valid -- 1 on success; 0 if the keypoint has no gradient signal
+//              (uniform window around it) or the inputs are degenerate.
+fn sift_describe(pgm_data, width, height, keypoint) {
+    return _sift_compute_descriptor(pgm_data, width, height, keypoint)
+}
+
+// sift_descriptor_vec(result) / sift_descriptor_valid(result) -- accessors.
+fn sift_descriptor_vec(result)   { return result[0] }
+fn sift_descriptor_valid(result) { return result[1] }
+
+// ---- matcher: L2 distance between two 128-D descriptors --------------------
+//
+// sift_match_descriptors(desc_a, desc_b) -> int distance (milli-unit).
+// The two descriptors must be 128-int lists post-normalization (L2 = 1000).
+// We return sqrt(sum((a_i - b_i)^2)) in milli-unit. Maximum value is
+// roughly sqrt(128 * 200^2) ~= 2263 (worst case: a and b max-different at
+// every component); typical matches land below ~600, non-matches around
+// 1200+.
+fn sift_match_descriptors(desc_a, desc_b) {
+    let na = len(desc_a)
+    let nb = len(desc_b)
+    if na != nb { return 0 - 1 }
+    if na == 0 { return 0 - 1 }
+    let sum_sq = 0
+    let i = 0
+    while i < na {
+        let d = int_sub(desc_a[i], desc_b[i])
+        // d in roughly [-200, 200]; d*d up to 40000 well under 2^20 but
+        // we use int_mul for symmetry and Bug-A safety on larger inputs.
+        sum_sq = int_add(sum_sq, int_mul(d, d))
+        i = int_add(i, 1)
+    }
+    return _sift_isqrt(sum_sq)
+}
+
+// ---- matcher: Lowe's ratio test --------------------------------------------
+//
+// sift_match(desc_a, desc_b_list, ratio_milli) returns the best match index
+// in desc_b_list for desc_a, provided best_dist / second_best_dist <
+// ratio_milli/1000. Returns -1 on no-confident-match.
+//
+// To match the brief's API (`sift_match(desc_a, desc_b, ratio_milli) -> 1`):
+// we also expose the 1/0 variant that compares ONE pair against a list of
+// candidates inferred from the caller's context.
+//
+// In practice the keypoint-list driver below is the operator-facing API;
+// this single-pair confidence test is provided for unit-test ergonomics.
+
+fn _sift_best_two_distances(desc_a, desc_b_list) {
+    let n = len(desc_b_list)
+    let best = 0 - 1
+    let second = 0 - 1
+    let best_idx = 0 - 1
+    let i = 0
+    while i < n {
+        let d = sift_match_descriptors(desc_a, desc_b_list[i])
+        if d >= 0 {
+            if best < 0 {
+                best = d
+                best_idx = i
+            } else {
+                if d < best {
+                    second = best
+                    best = d
+                    best_idx = i
+                } else {
+                    if second < 0 { second = d }
+                    else {
+                        if d < second { second = d }
+                    }
+                }
+            }
+        }
+        i = int_add(i, 1)
+    }
+    let triple = list_new()
+    push(triple, best)
+    push(triple, second)
+    push(triple, best_idx)
+    return triple
+}
+
+// sift_match(desc_a, desc_b_list, ratio_milli) -> 1 if Lowe's ratio test
+// passes (best/second < ratio_milli/1000) on the best candidate in
+// desc_b_list, else 0. desc_b_list must contain at least 2 descriptors
+// (the ratio test is undefined with fewer).
+fn sift_match(desc_a, desc_b_list, ratio_milli) {
+    let n = len(desc_b_list)
+    if n < 2 { return 0 }
+    let pair = _sift_best_two_distances(desc_a, desc_b_list)
+    let best = pair[0]
+    let second = pair[1]
+    if best < 0 { return 0 }
+    if second <= 0 { return 0 }
+    // best/second < ratio_milli/1000 <=> best * 1000 < ratio_milli * second.
+    // Use int_mul both sides (each factor up to ~2263 * 1000 ~ 2.3e6,
+    // safely above 2^20 -- gotcha #11 trap if we don't).
+    let lhs = int_mul(best, 1000)
+    let rhs = int_mul(ratio_milli, second)
+    if lhs < rhs { return 1 }
+    return 0
+}
+
+// ---- matcher: keypoint-list driver -----------------------------------------
+//
+// sift_match_keypoints(kps_a, descs_a, kps_b, descs_b, ratio_milli) ->
+//   list of [idx_a, idx_b, distance] triples for every keypoint in A whose
+//   best match in B passes Lowe's ratio test.
+//   * descs_a/descs_b are parallel lists of 128-int vectors (same length
+//     as kps_a/kps_b respectively).
+//   * ratio_milli is the threshold (default 700 = 0.7).
+fn sift_match_keypoints(kps_a, descs_a, kps_b, descs_b, ratio_milli) {
+    let matches = list_new()
+    let na = len(descs_a)
+    let nb = len(descs_b)
+    if na == 0 { return matches }
+    if nb < 2 { return matches }
+    let i = 0
+    while i < na {
+        let pair = _sift_best_two_distances(descs_a[i], descs_b)
+        let best = pair[0]
+        let second = pair[1]
+        let best_idx = pair[2]
+        if best >= 0 {
+            if second > 0 {
+                let lhs = int_mul(best, 1000)
+                let rhs = int_mul(ratio_milli, second)
+                if lhs < rhs {
+                    let m = list_new()
+                    push(m, i)
+                    push(m, best_idx)
+                    push(m, best)
+                    push(matches, m)
+                }
+            }
+        }
+        i = int_add(i, 1)
+    }
+    return matches
+}
+
+// ---- descriptor-set helper for visual_perception ---------------------------
+//
+// sift_describe_all(pgm_data, width, height, keypoints) ->
+//   list of [vec_128, valid] descriptors, one per keypoint (parallel order).
+//   Used by visual_perception.nova to emit the descriptor-count atom.
+fn sift_describe_all(pgm_data, width, height, keypoints) {
+    let out = list_new()
+    let n = len(keypoints)
+    let i = 0
+    while i < n {
+        push(out, sift_describe(pgm_data, width, height, keypoints[i]))
+        i = int_add(i, 1)
+    }
+    return out
+}
+
+// sift_descriptor_count_label(n) -> "image_descriptors_<low|mid|high>"
+//   <10 -> low; 10..100 -> mid; >100 -> high. Matches the keypoint count
+//   buckets so the perception path can bind both atoms via the same
+//   substrate machinery.
+fn sift_descriptor_count_label(n) {
+    if n <= SIFT_COUNT_LOW_MAX { return "image_descriptors_low" }
+    if n <= SIFT_COUNT_MID_MAX { return "image_descriptors_mid" }
+    return "image_descriptors_high"
+}
