@@ -322,7 +322,21 @@ computational units rather than orchestrating a pipeline of modules.
 > broadcasts FED_AGGREGATE, and the chat receives + EMA-blends the
 > federation-wide rate back into local source_authority -- the
 > framework piece of P3.7 with `FEDERATED_AUDIT.md` walking the
-> trust model, composition, sybil, and convergence trade-offs),
+> trust model, composition, sybil, and convergence trade-offs,
+> +1 from `scenario_aa_atom_search.sh` added in P-AA web atom-search:
+> `python3 scripts/web.py` -> `GET /api/atoms?q=fever&limit=5` returns
+> `{"atoms": [...]}` listing the fever concept atom and its three
+> operator atoms; `GET /atoms` serves a tiny vanilla-JS HTML page
+> (search box + KG filter + table); second `/api/atoms` call within
+> the cache window confirms the `CE_ATOMS_CACHE_S` (default 30s)
+> probe cache; 14 assertions,
+> +1 from `scenario_bb_why_deep.sh` added in P-BB `/why-deep [N]`:
+> `/teach widget` -> ask -> `/why-deep 3` prints a decision header,
+> a `proof:` line (operator chain via P3.5 `proof_checker.nova`), an
+> `activated by:` line surfacing the raw input, and an `upstream
+> evidence:` section listing per-atom belief mean + source provenance
+> (`user_taught` for `/teach` atoms, `seed` for first_atoms); 13
+> assertions),
 > three benchmarks report metrics
 > (`make benchmark`), and six runnable artifacts build and run
 > (`make install`): the substrate kernel self-check, the safety+IO+persistence

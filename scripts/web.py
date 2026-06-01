@@ -71,6 +71,16 @@ COOKIE_NAME = "ce_sid"
 # normal /api/chat traffic, so default 10s gives at most one fresh probe per
 # scrape window even with multiple scrapers per cookie.
 METRICS_CACHE_S = float(os.environ.get("CE_METRICS_CACHE_S", 10.0))
+# P-AA: how long a /__atoms__ probe response is reused before refreshing. The
+# probe walks the active session's reasoning + language KGs and emits up to
+# ~1000 ATOM lines; a 30s cache keeps the GET /api/atoms search snappy even
+# under a tight reload loop in the browser without serializing on the chat
+# child for every keystroke.
+ATOMS_CACHE_S = float(os.environ.get("CE_ATOMS_CACHE_S", 30.0))
+# Hard cap on the /api/atoms response size so an unbounded q="" search can't
+# blow up the browser. The chat-side probe is already capped at ~1000 atoms
+# per session; the server-side filter trims further to this many matches.
+ATOMS_RESPONSE_LIMIT = int(os.environ.get("CE_ATOMS_RESPONSE_LIMIT", 200))
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +202,10 @@ class SessionStore:
         # cookies don't share a single TTL.
         self.metrics_cache = {}            # cookie -> (float expire, dict)
         self.metrics_lock = threading.Lock()
+        # P-AA: per-cookie /__atoms__ cache. Same shape as metrics_cache, but
+        # the value is the parsed atom list (see _parse_atoms_block).
+        self.atoms_cache = {}              # cookie -> (float expire, list[dict])
+        self.atoms_lock = threading.Lock()
         # Capture the chat's boot banner once so /api/banner can echo it
         # without spawning a child for the caller's cookie. We use a primer
         # child for this and shut it down immediately -- a one-shot ~100ms
@@ -300,6 +314,28 @@ class SessionStore:
             self.metrics_cache[cookie] = (now + METRICS_CACHE_S, parsed)
         return dict(parsed)
 
+    def probe_atoms(self, cookie, now):
+        """Run a /__atoms__ probe against the chat child bound to `cookie`
+        (or serve a cached value within ATOMS_CACHE_S). Returns a list of
+        dicts shaped like
+            {"id": int, "label": str, "kind": str, "kg": str, "belief_mean": int}
+        ready for the /api/atoms JSON response. Raises if the cookie has no
+        live child."""
+        with self.atoms_lock:
+            entry = self.atoms_cache.get(cookie)
+            if entry is not None and entry[0] > now:
+                return list(entry[1])
+        with self.lock:
+            child_entry = self.children.get(cookie)
+            child = child_entry[0] if child_entry else None
+        if child is None:
+            raise RuntimeError(f"no live child for cookie {cookie}")
+        raw = child.send("/__atoms__")
+        parsed = _parse_atoms_block(raw)
+        with self.atoms_lock:
+            self.atoms_cache[cookie] = (now + ATOMS_CACHE_S, parsed)
+        return list(parsed)
+
     def snapshot(self):
         """Return a JSON-serializable list of session diagnostics."""
         now_ms = int(time.time() * 1000)
@@ -363,6 +399,100 @@ def _parse_metrics_block(raw):
             continue
         k, v = line.split("=", 1)
         out[k.strip()] = v.strip()
+    return out
+
+
+# Map kind ids (atom_kind from src/kg/atom_store.nova) to human labels. The
+# chat emits the raw integer; the python side renames so the JSON consumer
+# (browser) gets a readable string. Anything outside the table is reported
+# as "unknown" with the numeric value preserved for diagnosis.
+_KIND_NAMES = {
+    1: "fact",
+    2: "relation",
+    3: "concept",
+    4: "skill",
+    5: "lang",
+    6: "rule",
+}
+
+
+def _parse_atoms_block(raw):
+    """Extract `ATOM kg=... id=... kind=... label=... belief_mean=...` lines
+    bounded by ATOMS_BEGIN / ATOMS_END. Returns a list of dicts. Unparseable
+    lines are skipped (defensive against trailing perceive lines from the
+    chat surface)."""
+    out = []
+    in_block = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped == "ATOMS_BEGIN":
+            in_block = True
+            continue
+        if stripped == "ATOMS_END":
+            in_block = False
+            continue
+        if not in_block:
+            continue
+        if not stripped.startswith("ATOM "):
+            continue
+        # Parse the four whitespace-separated KEY=VALUE pairs that come after
+        # the ATOM prefix. label= can contain anything but newline -- it is
+        # the LAST field, so we split off the leading 4 tokens and take the
+        # remainder as the label. (No labels with spaces today, but this
+        # keeps the parser robust if a future ingestor allows them.)
+        body = stripped[len("ATOM "):]
+        fields = {}
+        # Walk tokens left-to-right; once we hit "label=" capture the rest.
+        rest = body
+        while rest:
+            eq = rest.find("=")
+            if eq < 0:
+                break
+            key = rest[:eq]
+            value_start = eq + 1
+            if key == "label":
+                # Take everything until the next space-delimited key (we know
+                # belief_mean is the only field that comes after label in the
+                # chat-emitted order, so split on " belief_mean=" if present).
+                tail = rest[value_start:]
+                marker = " belief_mean="
+                if marker in tail:
+                    label_val, _, rest_after = tail.partition(marker)
+                    fields["label"] = label_val
+                    rest = "belief_mean=" + rest_after
+                else:
+                    fields["label"] = tail
+                    rest = ""
+                continue
+            sp = rest.find(" ", value_start)
+            if sp < 0:
+                fields[key] = rest[value_start:]
+                rest = ""
+            else:
+                fields[key] = rest[value_start:sp]
+                rest = rest[sp + 1:]
+        # Must have id + label at a minimum to be usable.
+        if "id" not in fields or "label" not in fields:
+            continue
+        try:
+            atom_id_int = int(fields["id"])
+        except ValueError:
+            continue
+        try:
+            kind_int = int(fields.get("kind", "0"))
+        except ValueError:
+            kind_int = 0
+        try:
+            belief_int = int(fields.get("belief_mean", "0"))
+        except ValueError:
+            belief_int = 0
+        out.append({
+            "id": atom_id_int,
+            "label": fields["label"],
+            "kind": _KIND_NAMES.get(kind_int, "unknown"),
+            "kg": fields.get("kg", ""),
+            "belief_mean": belief_int,
+        })
     return out
 
 
@@ -633,6 +763,129 @@ form.addEventListener('submit', async (e) => {
 """
 
 
+# P-AA: tiny standalone HTML+JS for the /atoms search page. Vanilla JS so the
+# page works without any framework or build step; the form GETs /api/atoms?q=...
+# and renders the resulting JSON as a table.
+ATOMS_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CrossEngin atom search</title>
+<style>
+  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+         max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { margin: 0 0 .25rem; font-size: 1.25rem; }
+  .meta { color: #666; margin-bottom: 1rem; font-size: 13px; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; align-items: center; }
+  input[type=text] { flex: 1; padding: .5rem .75rem; font: inherit;
+                     border: 1px solid #aaa; border-radius: 6px; }
+  select { padding: .5rem; font: inherit; border: 1px solid #aaa;
+           border-radius: 6px; }
+  button { padding: .5rem 1rem; font: inherit; border: 1px solid #888;
+           border-radius: 6px; background: #f4f4f4; cursor: pointer; }
+  button:hover { background: #eaeaea; }
+  table { width: 100%; border-collapse: collapse; font: 13px/1.4 ui-monospace,
+          "SF Mono", Menlo, monospace; }
+  th, td { padding: .35rem .6rem; border-bottom: 1px solid #eee;
+           text-align: left; vertical-align: top; }
+  th { background: #f9f9f9; color: #333; font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: .03em; }
+  tr:hover { background: #fafafa; }
+  .empty { color: #888; padding: 1rem .6rem; }
+  .err   { color: #b22; padding: 1rem .6rem; }
+  .belief { color: #555; font-variant-numeric: tabular-nums; }
+  .kind   { color: #0a7f2e; }
+  .kg     { color: #1a52b8; }
+  code { background: #f4f4f4; padding: 0 .2rem; border-radius: 3px; }
+  nav { color: #888; font-size: 12px; margin-bottom: 1rem; }
+  nav a { color: #1a52b8; text-decoration: none; }
+</style>
+</head>
+<body>
+<h1>CrossEngin atom search</h1>
+<nav><a href="/">chat</a> &middot; <a href="/atoms">atoms</a> &middot;
+  <a href="/metrics">metrics</a> &middot; <a href="/api/sessions">sessions</a>
+</nav>
+<p class="meta">Browse the active session's knowledge graphs by label
+substring. Type any fragment of a label (case-sensitive substring) and press
+Search.</p>
+<form id="form" autocomplete="off">
+  <input id="q" type="text" placeholder="label substring (e.g. fever)" autofocus>
+  <select id="kg">
+    <option value="">all KGs</option>
+    <option value="reasoning">reasoning</option>
+    <option value="language">language</option>
+  </select>
+  <input id="limit" type="text" value="50" style="flex:0 0 4rem">
+  <button type="submit">Search</button>
+</form>
+<div id="result"></div>
+
+<script>
+const form   = document.getElementById('form');
+const qIn    = document.getElementById('q');
+const kgIn   = document.getElementById('kg');
+const limIn  = document.getElementById('limit');
+const resBox = document.getElementById('result');
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+function renderRows(atoms) {
+  if (!atoms.length) {
+    resBox.innerHTML = '<div class="empty">no matching atoms.</div>';
+    return;
+  }
+  const rows = atoms.map(a => `
+    <tr>
+      <td>${escapeHtml(a.id)}</td>
+      <td>${escapeHtml(a.label)}</td>
+      <td class="kind">${escapeHtml(a.kind)}</td>
+      <td class="kg">${escapeHtml(a.kg)}</td>
+      <td class="belief">${escapeHtml(a.belief_mean)}</td>
+    </tr>`).join('');
+  resBox.innerHTML = `<table>
+    <thead><tr>
+      <th>ID</th><th>Label</th><th>Kind</th><th>KG</th><th>Belief (milli)</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const q = qIn.value;
+  const kg = kgIn.value;
+  const limit = limIn.value;
+  const params = new URLSearchParams();
+  if (q)    params.set('q', q);
+  if (kg)   params.set('kg', kg);
+  if (limit) params.set('limit', limit);
+  resBox.innerHTML = '<div class="empty">searching...</div>';
+  try {
+    const r = await fetch('/api/atoms?' + params.toString());
+    const j = await r.json();
+    if (j.error) {
+      resBox.innerHTML = '<div class="err">ERROR: ' + escapeHtml(j.error) + '</div>';
+    } else {
+      renderRows(j.atoms || []);
+    }
+  } catch (err) {
+    resBox.innerHTML = '<div class="err">network ERROR: ' + escapeHtml(err.message) + '</div>';
+  }
+});
+
+// Convenience: empty submit shows everything (up to limit).
+form.dispatchEvent(new Event('submit'));
+</script>
+</body>
+</html>
+"""
+
+
 # --------------------------------------------------------------------------
 # HTTP server.
 
@@ -649,6 +902,30 @@ def _parse_cookie(header_value):
         if k == COOKIE_NAME:
             return v.strip()
     return None
+
+
+def _url_decode(s):
+    """Tiny percent-decoder for query-string values. Replaces '+' with space
+    and '%XX' with the matching byte. Avoids pulling in urllib.parse for a
+    three-line conversion (the only chars we expect are letters, digits,
+    underscore, dash, and the occasional %20 from a browser submit)."""
+    if not s:
+        return ""
+    s = s.replace("+", " ")
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "%" and i + 2 < len(s):
+            try:
+                out.append(chr(int(s[i + 1:i + 3], 16)))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _valid_uuid(s):
@@ -752,6 +1029,59 @@ def make_handler(store):
                 return self._send_text(
                     body,
                     content_type="text/plain; version=0.0.4; charset=utf-8",
+                )
+            # P-AA: server-side rendered HTML atom search UI. Static page;
+            # the JS hits /api/atoms below. Like /, we Set-Cookie on a fresh
+            # visit so the JS query travels with the cookie that owns the
+            # session whose atoms we want to surface.
+            if self.path == "/atoms":
+                return self._send_html(ATOMS_HTML, set_cookie=set_cookie)
+            # P-AA: /api/atoms?q=&limit=&kg= -- searches the active session's
+            # KGs by label substring. Read-only (the underlying /__atoms__
+            # probe just walks atom storage); we DO call get_or_create here
+            # so a browser visiting /atoms can ALWAYS see its own session
+            # (the chat is what owns the per-cookie cognitive state).
+            if self.path.startswith("/api/atoms"):
+                # Parse the query string manually to avoid importing urllib.parse
+                # for a 3-field decode -- the spec is tiny.
+                qs = ""
+                if "?" in self.path:
+                    qs = self.path.split("?", 1)[1]
+                params = {}
+                for part in qs.split("&") if qs else []:
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        params[_url_decode(k)] = _url_decode(v)
+                    elif part:
+                        params[_url_decode(part)] = ""
+                q = params.get("q", "")
+                kg_filter = params.get("kg", "")
+                try:
+                    limit = int(params.get("limit", ATOMS_RESPONSE_LIMIT))
+                except ValueError:
+                    limit = ATOMS_RESPONSE_LIMIT
+                if limit <= 0 or limit > ATOMS_RESPONSE_LIMIT:
+                    limit = ATOMS_RESPONSE_LIMIT
+                try:
+                    store.get_or_create(cookie)
+                    atoms = store.probe_atoms(cookie, time.time())
+                except Exception as e:
+                    return self._send_json(
+                        500, {"error": str(e)}, set_cookie=set_cookie,
+                    )
+                matched = []
+                for a in atoms:
+                    if q and q not in a["label"]:
+                        continue
+                    if kg_filter and a["kg"] != kg_filter:
+                        continue
+                    matched.append(a)
+                    if len(matched) >= limit:
+                        break
+                return self._send_json(
+                    200,
+                    {"atoms": matched},
+                    set_cookie=set_cookie,
                 )
             return self._send_json(404, {"error": "not found"}, set_cookie=set_cookie)
 

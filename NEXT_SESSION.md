@@ -17,6 +17,30 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P-AA + P-BB web-side cognition introspection: **complete**.
+  - **P-AA `/api/atoms` + `/atoms` HTML**: new GET endpoint
+    `/api/atoms?q=<substring>&limit=N&kg=<label>` returns
+    `{"atoms": [...]}` with per-atom `{id, label, kind, kg, belief_mean}`
+    dicts. Backed by the chat's new `/__atoms__` admin command (same
+    probe pattern as `/__metrics__` -- emits `ATOM kg=... id=... kind=...
+    label=... belief_mean=...` lines framed by `ATOMS_BEGIN`/`ATOMS_END`,
+    capped at ~1000 atoms per probe). Python parser builds the JSON;
+    response is cached per cookie for `CE_ATOMS_CACHE_S` seconds
+    (default 30). A tiny vanilla-JS HTML page lives at `/atoms` --
+    search box + KG filter + limit, table of results. Loopback bind
+    inherited from `/api/chat`. 14 assertions in
+    `tests/integration/scenario_aa_atom_search.sh`.
+  - **P-BB `/why-deep [N]` chat admin command**: recursive decision
+    tree on the most recent log entry. For the spoken output and the
+    perceived percept atoms, runs `proof_check` (from P3.5
+    `proof_checker.nova`) with max_depth=N (default 3, capped at 8) to
+    surface every operator chain that could justify each conclusion.
+    Renders via `proof_format` (the same operator-chain format /prove
+    uses), plus an "activated by:" line for the raw input and an
+    "upstream evidence:" section listing per-atom belief means with
+    `provenance` from `atom_payload` (e.g. `source='user_taught'` for
+    `/teach` atoms, `source='seed'` for first_atoms). 13 assertions in
+    `tests/integration/scenario_bb_why_deep.sh`.
 - P2.5 cont. real microphone capture (input half of the audio modality
   bridge): **complete (real-hardware path wired; sealed-sandbox silent-WAV
   fallback)** (ADR-0014). P19 + P2.6 shipped the OUTPUT half (Klatt
@@ -2589,15 +2613,17 @@ binary) — this is an integration limitation of the current NOVA backend (block
   30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 19 scripts under `tests/integration/` covering 12
+- Total integration tests: 51 scripts under `tests/integration/` covering 14
   multi-step scenarios (durability across SIGKILL, decision-log durability
   across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`,
   `/meta` table, constitutional veto, web frontend smoke, distributed KG
   sync, session switch isolation, web cookie isolation, plain-HTTP client
   loopback [P1.4], Prometheus `/metrics` scrape endpoint [P2.9 -- 35
   assertions], **PSK secure-channel loopback [P1.4 cont. -- 6
-  assertions]**) and 5 admin-command edge-case scripts. Run with `make
-  integration`.
+  assertions]**, **P-AA atom-search `/api/atoms` endpoint + `/atoms` HTML
+  page [14 assertions]**, **P-BB `/why-deep [N]` recursive decision tree
+  [13 assertions]**) and 5 admin-command edge-case scripts. Run with
+  `make integration`.
 - Total benchmarks: 4 (`bench_tick_rate`, `bench_node_throughput`, `bench_kg_query`, `bench_ann_query` -- P3.4 LSH speedup).
 - All passing: **yes**. Failures: none.
 - Latest benchmark numbers (NOVA v0.x, single container, second-resolution
