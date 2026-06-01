@@ -47,11 +47,16 @@
 //   promotion of recurring patterns into durable knowledge), ADR-0023
 //   (Bayesian belief tracking via Beta(alpha, beta) on each episodic atom),
 //   ADR-0048 (persistence -- the third sub-list in the EPISODIC blob).
-// NOVA dependencies: builtins (lists, sort, join, int_to_str, str_eq).
+// NOVA dependencies: builtins (lists, sort, join, int_to_str, str_eq);
+//   std/io and std/string are pulled in by the R8F retrieval API block at
+//   the bottom of the file (chat-print dispatcher uses io_println + the
+//   runtime helpers char_at/substr/str_trim/rt_str_to_int).
 // CrossEngin dependencies: src/kg/atom_store.nova (BEL_PRIOR, bel_*),
 //   src/parts/episodic/moment_stream.nova (ms_*, moment_*),
 //   src/parts/episodic/episode_storage.nova (em_* for status lookups).
 
+import "std/io"
+import "std/string"
 import "atom_store.nova"
 import "../parts/episodic/moment_stream.nova"
 import "../parts/episodic/episode_storage.nova"
@@ -470,4 +475,407 @@ fn episodic_observe(eas, observation_atom_ids, now_ns) {
         i = i + 1
     }
     return updated
+}
+
+// ---- retrieval API (the READ side, R8F) -----------------------------------
+//
+// The consolidation cycle above is the WRITE side: it scans the moment
+// stream and mints episodic atoms. Other parts of the substrate -- chat
+// (/recall admin command), the decision loop (filling out a "what episodes
+// do I remember about X" cue), KG queries -- need a pull-based READ side
+// that asks "give me episodic memories matching pattern P".
+//
+// Ranking & ties: every retrieval function ranks its candidate matches
+// before truncating to top_k. The composite key is:
+//   - PRIMARY: count desc        (more evidence -> higher rank)
+//   - SECONDARY: last_seen desc  (more recent ties first)
+//   - TERTIARY: id asc           (deterministic tiebreak)
+// `recall_most_recent` swaps the primary to last_seen desc;
+// `recall_top_belief` swaps the primary to confidence desc. Both keep the
+// secondary/tertiary tiebreak chain for determinism.
+//
+// `top_k <= 0` returns an empty list; `top_k > store_count` returns
+// everything (no overflow). The cap MAX defends against silly inputs but
+// the algorithm is O(N log N) so even max_int is fine -- we cap at
+// EPISODIC_RECALL_TOP_K_MAX so callers can't accidentally print 1e9 lines.
+//
+// All retrieval is integer-arithmetic / list-traversal only -- no FP, no
+// LLM call. Mirrors the convention in atom_store.nova (return a list of
+// atoms; caller formats).
+
+let EPISODIC_RECALL_TOP_K_DEFAULT = 10
+let EPISODIC_RECALL_TOP_K_MAX     = 1000
+
+// Clamp a caller-supplied top_k into [0, EPISODIC_RECALL_TOP_K_MAX].
+// Negative or zero -> 0 (returns empty); large positives are capped to MAX
+// so a /recall ... 1000000 from chat cannot OOM the result list.
+fn _episodic_clamp_top_k(top_k) {
+    if top_k <= 0 { return 0 }
+    if top_k > EPISODIC_RECALL_TOP_K_MAX { return EPISODIC_RECALL_TOP_K_MAX }
+    return top_k
+}
+
+// Composite ordering used by the four list-returning recall APIs. Returns
+// 1 iff atom `a` should appear BEFORE atom `b` under the given primary
+// key. mode = 0 -> count desc (default), mode = 1 -> last_seen desc,
+// mode = 2 -> confidence desc. Ties break on last_seen desc then id asc.
+fn _episodic_better(a, b, mode) {
+    if mode == 1 {
+        if episodic_atom_last_seen(a) != episodic_atom_last_seen(b) {
+            if episodic_atom_last_seen(a) > episodic_atom_last_seen(b) { return 1 }
+            return 0
+        }
+    } else {
+        if mode == 2 {
+            let ca = episodic_atom_confidence(a)
+            let cb = episodic_atom_confidence(b)
+            if ca != cb {
+                if ca > cb { return 1 }
+                return 0
+            }
+        } else {
+            if episodic_atom_count(a) != episodic_atom_count(b) {
+                if episodic_atom_count(a) > episodic_atom_count(b) { return 1 }
+                return 0
+            }
+        }
+    }
+    // Secondary: last_seen desc.
+    if episodic_atom_last_seen(a) != episodic_atom_last_seen(b) {
+        if episodic_atom_last_seen(a) > episodic_atom_last_seen(b) { return 1 }
+        return 0
+    }
+    // Tertiary: id asc.
+    if episodic_atom_id(a) < episodic_atom_id(b) { return 1 }
+    return 0
+}
+
+// In-place insertion sort by the composite key. N is bounded by the
+// store size (usually 10-100, never above EPISODIC_SCAN_MAX_ATOMS); O(N^2)
+// is fine. Keeps the implementation builtin-only (no comparator-sort).
+fn _episodic_rank_inplace(candidates, mode) {
+    let n = len(candidates)
+    let i = 1
+    while i < n {
+        let cur = candidates[i]
+        let j = i - 1
+        let placed = 0
+        while j >= 0 {
+            if placed == 0 {
+                if _episodic_better(cur, candidates[j], mode) == 1 {
+                    list_set(candidates, j + 1, candidates[j])
+                    j = j - 1
+                } else {
+                    list_set(candidates, j + 1, cur)
+                    placed = 1
+                    j = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(candidates, 0, cur) }
+        i = i + 1
+    }
+    return candidates
+}
+
+// Truncate a ranked candidate list to its first `k` entries (k clamped).
+fn _episodic_truncate(candidates, k) {
+    if k <= 0 {
+        let empty = list_new()
+        return empty
+    }
+    let n = len(candidates)
+    if n <= k { return candidates }
+    let out = list_new()
+    let i = 0
+    while i < k {
+        push(out, candidates[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Collect every atom in the store into a fresh list (the caller will sort
+// and truncate). Returns an empty list if the store is empty.
+fn _episodic_all(eas) {
+    let out = list_new()
+    let l = eas[EAS_LIST]
+    let i = 0
+    while i < len(l) {
+        push(out, l[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Count how many ids in `members_a` also appear in `members_b`. O(N*M)
+// but both lists are bounded by EPISODIC_MIN_CLUSTER_SIZE..~16 in
+// practice; a hash would be a micro-optimization.
+fn _episodic_overlap(members_a, members_b) {
+    let n = 0
+    let i = 0
+    while i < len(members_a) {
+        let target = members_a[i]
+        let j = 0
+        let hit = 0
+        while j < len(members_b) {
+            if hit == 0 {
+                if members_b[j] == target { hit = 1 }
+            }
+            j = j + 1
+        }
+        n = n + hit
+        i = i + 1
+    }
+    return n
+}
+
+// ---- public retrieval functions -------------------------------------------
+
+// Episodic memories where `atom_id` is in the cluster.
+//
+// e.g. `episodic_recall_by_member(eas, 42, 10)` returns up to 10 episodic
+// atoms that name atom 42 in their cluster member list.
+fn episodic_recall_by_member(eas, atom_id, top_k) {
+    let k = _episodic_clamp_top_k(top_k)
+    if k == 0 {
+        let empty = list_new()
+        return empty
+    }
+    let cand = list_new()
+    let l = eas[EAS_LIST]
+    let i = 0
+    while i < len(l) {
+        if episodic_match(l[i], atom_id) == 1 {
+            push(cand, l[i])
+        }
+        i = i + 1
+    }
+    _episodic_rank_inplace(cand, 0)
+    return _episodic_truncate(cand, k)
+}
+
+// Episodic memories whose [first_seen, last_seen] span overlaps the given
+// window [ns_start, ns_end]. Overlap test is the standard interval
+// overlap: a.first <= b.end && b.start <= a.last.
+fn episodic_recall_by_window(eas, ns_start, ns_end, top_k) {
+    let k = _episodic_clamp_top_k(top_k)
+    if k == 0 {
+        let empty = list_new()
+        return empty
+    }
+    let cand = list_new()
+    let l = eas[EAS_LIST]
+    let i = 0
+    while i < len(l) {
+        let ep = l[i]
+        let f = episodic_atom_first_seen(ep)
+        let s = episodic_atom_last_seen(ep)
+        if f <= ns_end {
+            if ns_start <= s { push(cand, ep) }
+        }
+        i = i + 1
+    }
+    _episodic_rank_inplace(cand, 1)
+    return _episodic_truncate(cand, k)
+}
+
+// Episodic memories whose cluster overlaps with given members by at least
+// `min_overlap` (Jaccard-style numerator; no normalization -- /recall by
+// pattern is "fire if the user named >= K of the cluster's atoms").
+fn episodic_recall_by_pattern(eas, member_ids, min_overlap, top_k) {
+    let k = _episodic_clamp_top_k(top_k)
+    if k == 0 {
+        let empty = list_new()
+        return empty
+    }
+    let cand = list_new()
+    let l = eas[EAS_LIST]
+    let i = 0
+    while i < len(l) {
+        let ep = l[i]
+        let ov = _episodic_overlap(member_ids, episodic_atom_members(ep))
+        if ov >= min_overlap { push(cand, ep) }
+        i = i + 1
+    }
+    _episodic_rank_inplace(cand, 0)
+    return _episodic_truncate(cand, k)
+}
+
+// Top-K most-believed episodic memories (highest alpha/(alpha+beta)).
+fn episodic_recall_top_belief(eas, top_k) {
+    let k = _episodic_clamp_top_k(top_k)
+    if k == 0 {
+        let empty = list_new()
+        return empty
+    }
+    let cand = _episodic_all(eas)
+    _episodic_rank_inplace(cand, 2)
+    return _episodic_truncate(cand, k)
+}
+
+// Top-K most-recently-seen episodic memories.
+fn episodic_recall_most_recent(eas, top_k) {
+    let k = _episodic_clamp_top_k(top_k)
+    if k == 0 {
+        let empty = list_new()
+        return empty
+    }
+    let cand = _episodic_all(eas)
+    _episodic_rank_inplace(cand, 1)
+    return _episodic_truncate(cand, k)
+}
+
+// Full provenance for one episodic memory.
+//
+// Returns [member_atoms, count, first_ns, last_ns, alpha, beta] -- a flat
+// list, NOT the raw episodic atom (the raw atom is also accessible via
+// episodic_atoms_get). Returns 0 if the id is not found in the store.
+fn episodic_provenance(eas, episodic_id) {
+    let ep = episodic_atoms_get(eas, episodic_id)
+    if ep == 0 { return 0 }
+    let prov = list_new()
+    push(prov, episodic_atom_members(ep))
+    push(prov, episodic_atom_count(ep))
+    push(prov, episodic_atom_first_seen(ep))
+    push(prov, episodic_atom_last_seen(ep))
+    push(prov, episodic_atom_alpha(ep))
+    push(prov, episodic_atom_beta(ep))
+    return prov
+}
+
+// ---- chat-print dispatcher (R8F /recall command) --------------------------
+//
+// The chat binary's /recall admin command routes through this helper. It
+// runs a transient consolidation against the LIVE moment stream, parses
+// the subcommand off `arg`, and prints the matching episodes via
+// io_println. The chat process today doesn't own a persistent `eas` (only
+// the daemon's loop_memory_step_with_episodic call site does), so /recall
+// always re-derives from the moments captured so far this session and
+// discards the transient store after the call. This matches the
+// expectation that /recall is a read-only inspection -- the cycle's
+// persistent state lives in the daemon snapshot, not the chat REPL.
+//
+// Subcommands (each prints "RECALL <label> matched=<N>" + one EPISODE
+// line per atom + "RECALL_END <label>"):
+//   member <id>           -- episodes where atom <id> is in the cluster
+//   window <start> <end>  -- episodes whose [first,last] overlaps the window
+//   top                   -- top-10 most-believed episodes
+//   recent                -- top-10 most-recently-seen episodes
+// Empty / unknown arg prints a usage line. Returns 1 (chat admin convention).
+
+// Format a single episodic atom into a one-line summary suitable for
+// io_println. Mirrors the ATOM line style of /__atoms__ but keeps it on
+// one line per atom so /recall pages nicely.
+fn _episodic_recall_format(ep) {
+    let members = episodic_atom_members(ep)
+    let parts = list_new()
+    let i = 0
+    while i < len(members) {
+        push(parts, int_to_str(members[i]))
+        i = i + 1
+    }
+    let sig = join(parts, ",")
+    return "EPISODE id=" + int_to_str(episodic_atom_id(ep))
+        + " members={" + sig + "}"
+        + " count=" + int_to_str(episodic_atom_count(ep))
+        + " first_ns=" + int_to_str(episodic_atom_first_seen(ep))
+        + " last_ns=" + int_to_str(episodic_atom_last_seen(ep))
+        + " belief=" + int_to_str(episodic_atom_confidence(ep))
+        + " alpha=" + int_to_str(episodic_atom_alpha(ep))
+        + " beta=" + int_to_str(episodic_atom_beta(ep))
+}
+
+// Print a list of episodic atoms with a header line carrying the matched
+// count. The header is grep-friendly for the integration scenario.
+fn _episodic_recall_emit(label, hits) {
+    io_println("RECALL " + label + " matched=" + int_to_str(len(hits)))
+    let i = 0
+    while i < len(hits) {
+        io_println(_episodic_recall_format(hits[i]))
+        i = i + 1
+    }
+    io_println("RECALL_END " + label)
+    return 1
+}
+
+// Split args on a single ASCII space. Returns [first_token, rest] -- rest
+// may be empty. Same shape as src/chat/helpers.nova:_split_cmd, but
+// duplicated here so episodic.nova stays a kg/ leaf and doesn't pull
+// chat/ upstream.
+fn _episodic_recall_split(arg) {
+    let i = 0
+    while i < len(arg) {
+        if char_at(arg, i) == 32 {
+            let pair = list_new()
+            push(pair, substr(arg, 0, i))
+            push(pair, str_trim(substr(arg, i + 1, len(arg) - i - 1)))
+            return pair
+        }
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+// Build a transient eas by running episodic_consolidate against the live
+// stream. The chat does not own a persistent eas, so /recall always
+// re-derives from the moments captured this session.
+fn _episodic_recall_build_eas(stream) {
+    let eas = episodic_atoms_new()
+    episodic_consolidate(eas, stream, 0, 0)
+    return eas
+}
+
+// Public dispatch: the chat dispatch line calls `episodic_recall_cmd(
+// stream, arg)`. `arg` is the rest-of-line after "/recall " (e.g.
+// "member 1"). Returns 1 (admin-command convention: "handled").
+fn episodic_recall_cmd(stream, arg) {
+    let eas = _episodic_recall_build_eas(stream)
+    let total = episodic_atoms_count(eas)
+    if len(arg) == 0 {
+        io_println("usage: /recall {member <id> | window <start> <end> | top | recent}")
+        io_println("RECALL store_size=" + int_to_str(total))
+        return 1
+    }
+    let parts = _episodic_recall_split(arg)
+    let sub = parts[0]
+    let rest = parts[1]
+    let k = EPISODIC_RECALL_TOP_K_DEFAULT
+    if str_eq(sub, "member") == 1 {
+        if len(rest) == 0 {
+            io_println("usage: /recall member <atom_id>")
+            return 1
+        }
+        let id = rt_str_to_int(rest)
+        let hits = episodic_recall_by_member(eas, id, k)
+        return _episodic_recall_emit("member=" + int_to_str(id), hits)
+    }
+    if str_eq(sub, "window") == 1 {
+        let p2 = _episodic_recall_split(rest)
+        if len(p2[0]) == 0 {
+            io_println("usage: /recall window <start_ns> <end_ns>")
+            return 1
+        }
+        if len(p2[1]) == 0 {
+            io_println("usage: /recall window <start_ns> <end_ns>")
+            return 1
+        }
+        let s = rt_str_to_int(p2[0])
+        let e = rt_str_to_int(p2[1])
+        let hits = episodic_recall_by_window(eas, s, e, k)
+        return _episodic_recall_emit("window=" + int_to_str(s) + ".." + int_to_str(e), hits)
+    }
+    if str_eq(sub, "top") == 1 {
+        let hits = episodic_recall_top_belief(eas, k)
+        return _episodic_recall_emit("top_belief", hits)
+    }
+    if str_eq(sub, "recent") == 1 {
+        let hits = episodic_recall_most_recent(eas, k)
+        return _episodic_recall_emit("most_recent", hits)
+    }
+    io_println("(unknown /recall subcommand: " + sub + " -- try member|window|top|recent)")
+    return 1
 }

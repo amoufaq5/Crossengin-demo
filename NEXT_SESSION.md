@@ -3,6 +3,118 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R8F (this session) — KG: episodic memory retrieval API + `/recall` chat command
+
+**Status: complete -- the READ-side companion to R6F's WRITE-side
+consolidation cycle landed as a pure extension to
+`src/kg/episodic.nova`.** R6F shipped the cycle that scans recent
+moments, detects co-occurring clusters, and promotes each into a
+durable "episodic atom" with Beta(alpha,beta) belief; this session adds
+the retrieval surface other parts of the substrate (chat /recall, the
+decision loop's "what episodes do I remember about X" cue, KG queries)
+need to pull memories OUT of the store by member, time window, pattern,
+belief, or recency. The cycle is now bidirectional: writes via the
+memory-loop sub-task (R6F), reads via the new retrieval API and the
+chat dispatcher.
+
+What landed:
+
+- **`src/kg/episodic.nova`** (EXTENDED, +~310 lines beyond R6F's 473;
+  R6F's write-side functions are bit-identical -- pure extension):
+  - **Six retrieval functions** (all integer-arithmetic, no FP, no LLM
+    call):
+    - `episodic_recall_by_member(eas, atom_id, top_k)` -- episodic
+      memories where `atom_id` is in the cluster (e.g., "show me all
+      episodes involving atom 42").
+    - `episodic_recall_by_window(eas, ns_start, ns_end, top_k)` --
+      episodic memories whose [first_seen, last_seen] span overlaps the
+      window (inclusive interval-overlap).
+    - `episodic_recall_by_pattern(eas, member_ids, min_overlap, top_k)`
+      -- episodic memories whose cluster overlaps the query by >=
+      `min_overlap` ids (Jaccard-style numerator).
+    - `episodic_recall_top_belief(eas, top_k)` -- top-K most-believed
+      episodic memories (highest alpha/(alpha+beta)).
+    - `episodic_recall_most_recent(eas, top_k)` -- top-K most-recently
+      seen episodic memories (last_seen desc).
+    - `episodic_provenance(eas, episodic_id)` -- full provenance tuple
+      [members, count, first_ns, last_ns, alpha, beta] for one episode;
+      0 if the id is not in the store.
+  - **Ranking + tiebreak chain**: primary key = count desc (default) /
+    last_seen desc (`most_recent`) / confidence desc (`top_belief`);
+    secondary = last_seen desc; tertiary = id asc. Deterministic
+    across runs.
+  - **top_k clamping**: `top_k <= 0` returns empty; `top_k >
+    EPISODIC_RECALL_TOP_K_MAX (=1000)` clamps; `top_k > store_count`
+    returns everything (no overflow).
+  - **`episodic_recall_cmd(stream, arg)`** chat dispatcher: runs a
+    transient `episodic_consolidate` against the live moment stream,
+    parses the subcommand off `arg`, prints a "RECALL <label>
+    matched=<N>" header + one "EPISODE id=... members={...} count=...
+    first_ns=... last_ns=... belief=... alpha=... beta=..." line per
+    hit + a "RECALL_END <label>" trailer. Subcommands: `member <id>`,
+    `window <start> <end>`, `top`, `recent`. Empty / unknown arg
+    prints a usage line.
+- **Chat wiring** (`examples/crossengin_chat.nova`, strict +5 lines):
+  1 dispatch line (`if str_eq(cmd, "/recall") == 1 { return
+  episodic_recall_cmd(stream, arg) }`) + 4 help lines describing the
+  four subcommands. Reachable from the running chat binary as `/recall
+  member 1`, `/recall window 0 100`, `/recall top`, `/recall recent`.
+  No changes to R6F's `loop_memory.nova` wiring; the retrieval surface
+  is pull-based, so the daemon's persistent eas and the chat's
+  transient eas use the same retrieval functions.
+
+Tests:
+
+- **`tests/unit/test_episodic_retrieval.nova`** (NEW, 77 assertions):
+  - Canonical fixture: R6F's 5x (1,2,3) triplets + scattered noise ->
+    1 episodic atom; `episodic_recall_by_member(eas, 1, 10)` returns
+    the {1,2,3} episode; `episodic_recall_by_member(eas, 99, 10)`
+    returns empty.
+  - Window overlap (inside, outside, touching first_seen / last_seen
+    boundary); pattern overlap (>= K, < K, disjoint); top_belief,
+    most_recent singletons; full provenance tuple round-trip; missing
+    id; top_k=0 / negative / huge (1M -> no overflow).
+  - Multi-episode rank order: insert a second cluster {4,5,6} (ts
+    200..240) and verify `most_recent` orders id=0 (the newer cluster,
+    last_seen=240) before id=1 (the older cluster, last_seen=40); the
+    `top_belief` tiebreak falls through to last_seen desc when both
+    are at the uniform prior; after three `episodic_observe` calls on
+    {1,2,3} the older id=1 wins on confidence; `by_member` and
+    `by_window` filters are isolation-clean; `top_k=1` returns only
+    the highest-ranked hit. ALL PASS.
+- **`tests/integration/scenario_mm_episodic_recall.sh`** (NEW, 19
+  assertions): `examples/episodic_recall_demo.nova` (NEW driver
+  mirroring `episodic_demo.nova`'s shape) mints the two-cluster
+  fixture and exercises every `/recall` subcommand via the same
+  `episodic_recall_cmd` dispatcher the chat process routes to; the
+  shell asserts on each RECALL header line, the EPISODE record, the
+  `matched=` count, and the usage / unknown-subcommand diagnostics.
+  ALL PASS.
+
+Canonical fixture (R6F's 5x (1,2,3) + 4 noise) extended for R8F to a
+two-cluster fixture: 5x (1,2,3) at ts 0/10/20/30/40 then 5x (4,5,6) at
+ts 200/210/220/230/240 -- the consolidation scan walks moments
+newest-first, so episode id=0 is the newer {4,5,6} and id=1 is the
+older {1,2,3}. `/recall recent` surfaces id=0 first (last_seen=240
+> 40); `/recall top` tiebreaks on last_seen because both belief means
+land at 500 at the uniform prior. After three episodic_observe calls
+on (1,2,3), the older id=1 cluster wins on confidence.
+
+ADRs honored: ADR-0022 (the consolidation cycle now has both write
+and read sides), ADR-0023 (Bayesian belief surfaces as a rankable
+key on the read side). NOVA dependencies: builtins + std/io + std/string
+(io_println, char_at, substr, str_trim, rt_str_to_int -- pulled in by
+the new chat-print dispatcher block at the bottom of `episodic.nova`).
+
+Module count: unchanged from R7E -- the retrieval API extends
+`episodic.nova` in place rather than adding a new module. The only NEW
+files beyond tests are `examples/episodic_recall_demo.nova` (a scenario
+driver, not a substrate module) and the new unit + integration suites.
+Unit suites: +1 (`test_episodic_retrieval.nova`, 77 assertions); all
+149 unit tests pass (148 existing + 1 new). Integration: +1 scenario
+(`scenario_mm_episodic_recall.sh`, 19 assertions, ALL PASS); R6F's
+scenario_ff_episodic.sh (37 assertions) still green.
+
 ## R8E (this session) — KG atom schema-evolution / migration framework
 
 **Status: complete -- `src/persistence/schema_migration.nova` lands

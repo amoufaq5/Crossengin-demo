@@ -11,7 +11,27 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 139 modules compile (`make build`, +1 from
+> toolchain: 140 modules compile (`make build`, R8F extends
+> `kg/episodic.nova` in place with the READ-side companion to R6F's
+> consolidation cycle -- six retrieval functions
+> (`episodic_recall_by_member`, `episodic_recall_by_window`,
+> `episodic_recall_by_pattern`, `episodic_recall_top_belief`,
+> `episodic_recall_most_recent`, `episodic_provenance`) so other parts
+> of the substrate can pull memories OUT of the episodic store by member,
+> time window, pattern overlap, belief, or recency. Each returns up to
+> `top_k` (default 10, cap 1000) ranked by a composite key (primary =
+> count / last_seen / confidence depending on the API; secondary =
+> last_seen desc; tertiary = id asc). New chat admin command `/recall
+> {member <id> | window <start> <end> | top | recent}` routes through
+> `episodic_recall_cmd` which runs a transient consolidation against the
+> live moment stream and prints RECALL / EPISODE / RECALL_END lines.
+> Module count unchanged (extension only); +1 from
+> 77 R8F unit
+> assertions (`tests/unit/test_episodic_retrieval.nova`) + 19 integration
+> assertions (`tests/integration/scenario_mm_episodic_recall.sh`) all
+> PASS; R6F's existing 79 episodic unit assertions and 37 episodic
+> integration assertions remain bit-identically green (the read API is
+> a pure extension of the write side). +1 from
 > `persistence/schema_migration.nova` added in R8E -- a generic,
 > declarative KG-atom schema-evolution framework that generalizes R5D's
 > one-off snapshot v1->v2 migration into per-atom-kind ADD / RENAME /
