@@ -220,6 +220,62 @@ continue. It is updated at every session boundary.
     +50 in `test_bignum_2048.nova` (NEW); +13 in
     `test_secure_aggregation.nova` (DH-2048 pair test).
   - Module count: 131 (+1 from bignum_2048).
+- **R4D (this session) Montgomery REDC perf upgrade for bn2048_modpow_ct**:
+  **complete -- ~10x speedup on RFC 7919 Group 14 LANDED**.
+  Pre-R4D, one `bn2048_modpow_ct` on the 2048-bit RFC 7919 Group 14
+  prime cost ~15-18 seconds because every modmul (4096 per modpow) did
+  a 4096-bit bit-by-bit reduction (~786k limb-ops per reduce). The
+  SECAGG_AUDIT.md "next perf step" called for Barrett or Montgomery
+  reduction for ~8x speedup. This session ships Montgomery REDC (CIOS
+  form). Measured speedup: **~10x** (Mont ~1.2s vs Legacy ~12.8s on
+  the speedup-ratio test; the headline Fermat test drops from ~18s to
+  ~1.2s wall-clock).
+  - **`src/safety/bignum_2048.nova`** (EXTENDED) -- six new public
+    functions for Montgomery form: `bn2048_mont_ctx_new(N)` (precomputes
+    `n_prime0 = -N^-1 mod 2^32` via Newton's iteration + `r2_mod_n =
+    R^2 mod N` via the legacy reducer; paid ONCE per modulus),
+    `bn2048_to_mont(x, ctx)` / `bn2048_from_mont(x_mont, ctx)` (enter
+    / leave Montgomery form), `bn2048_montmul(a, b, ctx)` (CIOS form
+    -- the Montgomery REDC hot path), `bn2048_modpow_ct_mont(b, e, ctx)`
+    (caller-managed-ctx exponentiation). One internal helper kept as
+    the legacy fallback: `_bn2048_modpow_ct_legacy(b, e, m)` (used
+    when N is even -- the Montgomery path requires gcd(N, R) = 1;
+    every DH safe prime is odd so this is unreachable from the
+    SecAgg DH code path). `bn2048_modpow_ct` (the public CT modpow)
+    keeps its external signature bit-exact and routes through
+    `bn2048_modpow_ct_mont` after building the ctx; existing callers
+    transparently get the ~10x speedup with zero API changes.
+  - **CIOS implementation note**: the inner-loop 32x32 -> 64-bit
+    multiplies are INLINED (split into 16-bit halves directly) rather
+    than calling a helper that returns a `[lo, hi]` pair. The helper
+    would allocate ~32M short-lived 2-element lists per modpow_ct
+    (8192 inner-loop hits * 4096 outer iters); under NOVA's allocation
+    semantics this ballooned the heap to 14GB+ and the OS OOM-killed
+    the process. The inline form allocates ZERO per-iter lists past
+    the one-shot 65-limb accumulator, and the modpow runs cleanly
+    inside the sandbox memory budget.
+  - **`tests/unit/test_bignum_2048.nova`** (EXTENDED) -- three new
+    test functions: `test_bn2048_mont_ctx_round_trip` (small-N
+    `mont_to/mul/from` chain returns `(a*b) mod N`),
+    `test_bn2048_modpow_mont_eq_legacy_small_n` (2-vector pseudo-
+    random equivalence sweep proving `bn2048_modpow_ct ==
+    _bn2048_modpow_ct_legacy` bit-exactly), and
+    `test_bn2048_modpow_mont_speedup_ratio` (the headline measurement
+    -- ONE legacy vs ONE Montgomery modpow on RFC 7919 Group 14 with
+    a short non-trivial exponent; prints the ratio, asserts >=2x).
+    The Fermat test still passes, now in ~1.2s wall-clock instead of
+    ~18s. Test count: +7 new assertions (65 total in
+    `test_bignum_2048`).
+  - **2-soul DH-2048 equivalence test**: `test_sa_dh_two_soul_2048_
+    pair_mask_matches` in `test_secure_aggregation.nova` runs
+    bit-identical -- shared secret derives identically on both sides
+    -- but now in ~8.7s wall-clock total (was ~60-140s pre-Mont).
+  - **Integration scenario timing**: `scenario_u_secagg.sh` (the full
+    U.dh2048 stage) drops from ~141s end-to-end to ~19s wall-clock.
+    The 180s scenario deadline is unchanged for slow-sandbox
+    headroom but is no longer near the limit.
+  - **Module count**: still 132 (Montgomery code is additive within
+    `bignum_2048.nova`, not a new module).
 - **P3.1.JPEG cont. (this session) entropy decode + IDCT pipeline**:
   **complete -- grayscale baseline END-TO-END DECODE LANDED**. The
   structural half (segments + DQT + SOF0 + DHT) landed in the original

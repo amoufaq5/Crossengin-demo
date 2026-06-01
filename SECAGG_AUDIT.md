@@ -28,12 +28,19 @@ P3.9 cont.: `sa_dh_generate_keys_2048` / `sa_dh_shared_secret_for_peer_2048`
 + `sa_dh_2048_enabled_from_env` + the SA_DH_BITS state slot routing
 `sa_mask_for_peer` to the 2048-bit shared-secret derivation when the
 soul opts in to v2-sa-dh-2048),
-`src/safety/bignum_2048.nova` (NEW; P3.9 cont.: a 64-limb 2048-bit
-pure-NOVA bignum library parallel to the 256-bit `bignum.nova`;
-exposes `bn2048_modpow_ct` -- Montgomery-ladder constant-time
-exponentiation on RFC 7919 Group 14 -- as the crypto-safe primitive
+`src/safety/bignum_2048.nova` (NEW in P3.9 cont., **extended in R4D
+with Montgomery REDC**: a 64-limb 2048-bit pure-NOVA bignum library
+parallel to the 256-bit `bignum.nova`; exposes `bn2048_modpow_ct` --
+Montgomery-ladder constant-time exponentiation on RFC 7919 Group 14
+now backed by Montgomery REDC (CIOS form) for **~10x speedup** vs the
+original bit-by-bit reduce: one full-width modpow_ct on the RFC 7919
+Group 14 prime drops from ~18s to ~1.2s -- as the crypto-safe primitive
 for 2048-bit DH; the non-CT square-and-multiply variant is
-intentionally OMITTED to prevent timing leaks on private exponents),
+intentionally OMITTED to prevent timing leaks on private exponents;
+the public surface gains
+`bn2048_mont_ctx_new`/`bn2048_to_mont`/`bn2048_montmul`/
+`bn2048_from_mont`/`bn2048_modpow_ct_mont` for caller-managed
+Montgomery form),
 `src/learning/federated_aggregator.nova` (extended with v2-sa mode and
 the P3.8r reconciliation emitter `fed_agg_emit_recon_masked`),
 `src/safety/bignum.nova` (P3.9: `bn_modpow_ct` -- Montgomery-ladder
@@ -559,17 +566,39 @@ helper to 64 limbs). The 2048-bit arithmetic is strong; the
 2048-bit entropy is NOT. Production needs `/dev/urandom` or the
 platform CSPRNG; the NOVA toolchain does not expose one today.
 
-**Timing reality check (LOUD).** One full-width `bn2048_modpow_ct`
-costs ~15 seconds on this dev sandbox (vs. ~40 ms for the 256-bit
-`bn_modpow_ct`). A 2-soul DH-2048 round = 2 keygens + 2 shared-secret
-derivations + 2 mask derivations = ~6 modpow_ct = ~90 seconds. An
-N-soul round scales as N + N*(N-1) = O(N²) modpow_ct calls; a
-5-soul round takes ~5 minutes wall-clock. v2-sa-dh-2048 is
-deliberately gated behind `CE_SECAGG_DH_2048=1` (separate from
-`CE_SECAGG_DH`) so an operator must consciously accept the latency
-budget. **Not for per-message real-time rounds.** A future
-optimization (Barrett or Montgomery reduction on the wider bignum)
-would cut the per-modpow cost roughly 8x, but is multi-week work.
+**Timing reality check (LOUD; post-R4D Montgomery REDC).** One full-
+width `bn2048_modpow_ct` costs ~**1.2 seconds** on this dev sandbox
+post-Montgomery REDC (was ~15-18 seconds pre-Mont; **~10-15x speedup**).
+A 2-soul DH-2048 round = 2 keygens + 2 shared-secret derivations + 2
+mask derivations = ~6 modpow_ct = ~**8-10 seconds wall-clock** (was
+~60-90s pre-Mont). An N-soul round scales as N + N*(N-1) = O(N²)
+modpow_ct calls; a 5-soul round takes ~**30-60 seconds wall-clock**
+(was ~5 minutes pre-Mont). v2-sa-dh-2048 is no longer the per-round
+latency liability it was; it remains gated behind `CE_SECAGG_DH_2048=1`
+mostly for backward-compat opt-in. The integration scenario
+`tests/integration/scenario_u_secagg.sh` now completes in ~**19 seconds**
+end-to-end (was ~141 seconds pre-Mont). For comparison, the 256-bit
+`bn_modpow_ct` still costs ~40 ms (no Mont upgrade on bignum.nova
+yet; the 256-bit path is no longer recommended anyway).
+
+**Montgomery REDC implementation notes (R4D perf upgrade).** Replaced
+the bit-by-bit `_bn2048_mod4096` reduction (4096 iterations × 64-limb
+passes = ~786k limb-ops per reduce) with CIOS Montgomery REDC
+(~8k limb-mults per reduce). The CIOS inner loop inlines the 32x32 →
+[lo32, hi32] multiply to avoid the per-cell `list_new` allocations
+that would otherwise OOM the NOVA sandbox (an unrolled modpow does
+~32M 32x32 multiplies; allocating a 2-element list per multiply
+ballooned the heap to 14GB+ before the inline fix). The Montgomery
+context (`bn2048_mont_ctx_new`) precomputes `n_prime0 = -N^-1 mod
+2^32` (via Newton's iteration: 5 squarings from `x_0 = 1`) and
+`r2_mod_n = R^2 mod N` (via the legacy bit-by-bit reducer, paid once
+per modulus). The public API gains
+`bn2048_mont_ctx_new`/`bn2048_to_mont`/`bn2048_montmul`/
+`bn2048_from_mont`/`bn2048_modpow_ct_mont` (caller-managed Mont
+form) plus a kept-for-fallback `_bn2048_modpow_ct_legacy` (used when
+the modulus is even, which DH primes never are). `bn2048_modpow_ct`
+keeps its external signature bit-exact; the only observable change
+is the ~10x wall-clock drop.
 
 **Constant-time `bn2048_modpow_ct` IS used.** Same Montgomery-ladder
 shape as the 256-bit `bn_modpow_ct`; per-bit wall-clock is exponent-
@@ -683,7 +712,12 @@ pure-NOVA 2048-bit unsigned bignum library, parallel to the 256-bit
 | `bn2048_mul(a, b)` | [hi, lo] | full 4096-bit product |
 | `bn2048_mod(a, m)` | bn2048 | a mod m (bit-by-bit long division) |
 | `bn2048_modmul(a, b, m)` | bn2048 | (a * b) mod m, via the full 4096-bit product |
-| `bn2048_modpow_ct(b, e, m)` | bn2048 | b^e mod m via Montgomery ladder (CRYPTO-SAFE; the ONLY exposed modpow variant) |
+| `bn2048_modpow_ct(b, e, m)` | bn2048 | b^e mod m via Montgomery ladder + Montgomery REDC under the hood (CRYPTO-SAFE; the ONLY exposed modpow variant) |
+| `bn2048_mont_ctx_new(N)` | mont_ctx | precomputed Montgomery context (`n_prime0`, `r2_mod_n`, `N`, `N_LIMBS`) for a fixed odd modulus N — amortizes the one-time precompute across many ops |
+| `bn2048_to_mont(x, ctx)` | bn2048 | enter Montgomery form: `x_mont = x * R mod N` |
+| `bn2048_from_mont(x_mont, ctx)` | bn2048 | leave Montgomery form: `x = x_mont * R^-1 mod N` |
+| `bn2048_montmul(a, b, ctx)` | bn2048 | (a * b * R^-1) mod N via CIOS (the Montgomery REDC hot path) |
+| `bn2048_modpow_ct_mont(b, e, ctx)` | bn2048 | b^e mod N via Montgomery REDC (caller-managed ctx; same shape as `bn2048_modpow_ct` but skips the per-call ctx allocation when the caller has it already) |
 | `rfc7919_group14_p()` | bn2048 | the RFC 7919 Group 14 / RFC 3526 §3 2048-bit MODP safe prime |
 | `rfc7919_group14_g()` | bn2048 | the RFC 7919 Group 14 generator g = 2 |
 
@@ -693,12 +727,27 @@ safe to expose to any remote-callable code path; a passive timing
 observer of a non-CT 2048-bit modpow could recover the soul's
 private exponent from per-bit timing variance.
 
-Test coverage in `tests/unit/test_bignum_2048.nova` (NEW) -- 50+
-assertions, including the **headline check** Fermat's little theorem
-on the safe prime: `bn2048_modpow_ct(2, p-1, p) == 1` passes in
-~15 seconds wall-clock on the dev container. A single `bn2048_modmul`
-costs ~3 ms; one `bn2048_modpow_ct` at the RFC 7919 Group 14 prime
-costs ~15 s (4096 modmuls + the 4096-bit bit-by-bit reduction inside
-each one). Translates to a 2-soul DH-2048 round of ~60-90 seconds
-wall-clock; the integration scenario U.dh2048 budgets 180s for
-headroom.
+Test coverage in `tests/unit/test_bignum_2048.nova` (extended in the
+R4D Montgomery upgrade) -- **65 assertions**, including:
+- The **headline check** Fermat's little theorem on the safe prime:
+  `bn2048_modpow_ct(2, p-1, p) == 1` -- now passes in ~**1.2 seconds**
+  wall-clock on the dev container (was ~15-18 seconds pre-Mont).
+- A Montgomery context round-trip on small N (`(5*6) mod 1009 = 30`
+  via the explicit `bn2048_to_mont` / `bn2048_montmul` /
+  `bn2048_from_mont` chain).
+- A 2-vector pseudo-random equivalence sweep
+  (`bn2048_modpow_ct == _bn2048_modpow_ct_legacy` on small N=1009).
+- The headline speedup-ratio measurement: ONE legacy modpow_ct vs
+  ONE Montgomery modpow_ct on the RFC 7919 Group 14 prime with a
+  short non-trivial exponent (`0xDEADBEEFDEADBEEF`). Observed median
+  on this dev container: **~10x** (Mont ~1.2 s, Legacy ~12.8 s).
+  The test prints the ratio and asserts a conservative >=2x band
+  to keep CI stable under sandbox-load variance.
+
+The 2-soul DH-2048 round now lands in ~**8.7 seconds** wall-clock
+(was ~60-90 s pre-Mont; per `test_secure_aggregation.nova`'s
+`test_sa_dh_two_soul_2048_pair_mask_matches`). The integration
+scenario `scenario_u_secagg.sh` (U.dh2048 stage) completes the full
+2-soul DH-2048 SecAgg round in ~**19 seconds** end-to-end (was
+~141 s pre-Mont; the 180s scenario deadline still holds for slow-
+sandbox headroom).

@@ -32,20 +32,24 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from
 > `safety/bignum_2048.nova` added in P3.9 cont. 2048-bit DH on RFC 7919
 > Group 14 -- the cryptographically-reasonable upgrade to the 256-bit
-> v2-sa-dh strawman SECAGG_AUDIT.md flagged as broken. The bn2048 module
-> is a 64-limb (32-bit-per-limb) pure-NOVA bignum parallel to `bignum.nova`;
-> only `bn2048_modpow_ct` (Montgomery ladder) is exposed -- the non-CT
-> variant is intentionally omitted because a 2048-bit private exponent
-> can't safely tolerate any timing leak. RFC 7919 Group 14 constants land
-> as `rfc7919_group14_p()` and `rfc7919_group14_g()`. Verified by the
-> headline Fermat's-little-theorem check `bn2048_modpow_ct(2, p-1, p) ==
-> 1` (~15s wall-clock). `src/learning/secure_aggregation.nova` extended
-> with `sa_dh_generate_keys_2048` / `sa_dh_shared_secret_for_peer_2048`
-> + the `CE_SECAGG_DH_2048` env flag + a SA_DH_BITS state slot routing
+> v2-sa-dh strawman SECAGG_AUDIT.md flagged as broken; **extended in
+> R4D with Montgomery REDC (CIOS form) for ~10x speedup**. The bn2048
+> module is a 64-limb (32-bit-per-limb) pure-NOVA bignum parallel to
+> `bignum.nova`; only `bn2048_modpow_ct` (Montgomery ladder, now backed
+> by Montgomery REDC under the hood) is exposed -- the non-CT variant
+> is intentionally omitted because a 2048-bit private exponent can't
+> safely tolerate any timing leak. RFC 7919 Group 14 constants land as
+> `rfc7919_group14_p()` and `rfc7919_group14_g()`. Verified by the
+> headline Fermat's-little-theorem check `bn2048_modpow_ct(2, p-1, p)
+> == 1` (~**1.2s wall-clock**, was ~15s pre-Mont).
+> `src/learning/secure_aggregation.nova` extended with
+> `sa_dh_generate_keys_2048` / `sa_dh_shared_secret_for_peer_2048` +
+> the `CE_SECAGG_DH_2048` env flag + a SA_DH_BITS state slot routing
 > `sa_mask_for_peer` to the right shared-secret derivation. The chat
 > gates on a single `CE_SECAGG_DH_2048` env probe; everything else runs
-> through the existing v2-sa-dh pipeline. Cost reality: 2-soul DH-2048
-> round = ~60s wall-clock; OFFLINE federation mode only,
+> through the existing v2-sa-dh pipeline. Cost reality (post-Mont):
+> 2-soul DH-2048 round = ~**8.7s wall-clock** (was ~60s); integration
+> scenario U.dh2048 completes in ~**19s** end-to-end (was ~141s),
 > +1 from
 > `io/transducers/audio_capture.nova` added in P2.5 cont. real microphone
 > capture (parecord/arecord/sox auto-detect via `scripts/audio_capture.sh`
@@ -225,6 +229,18 @@ computational units rather than orchestrating a pipeline of modules.
 > any private exponent. Documented in
 > [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md) ("bignum landed; DH key
 > exchange unblocked + shipped as v2-sa-dh"),
+> (and `test_bignum_2048.nova` from P3.9 cont. extended in R4D
+> for Montgomery REDC: now **65 assertions** total, +7 new for the
+> mont-ctx round-trip, mont == legacy equivalence on small N=1009,
+> and the speedup-ratio measurement on RFC 7919 Group 14. The
+> headline check Fermat's little theorem on the safe prime
+> `bn2048_modpow_ct(2, p-1, p) == 1` -- now ~1.2s wall-clock under
+> Montgomery REDC, was ~15-18s pre-Mont; **~10x speedup** measured
+> end-to-end. The 2-soul DH-2048 pair-equivalence test in
+> `test_secure_aggregation.nova` drops from ~60-140s to ~8.7s.
+> Documented in [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md)
+> ("Montgomery REDC landed; timing reduced from ~18s to ~1.2s
+> per modpow_ct")),
 > +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
