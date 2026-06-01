@@ -607,17 +607,25 @@ The Phase 9 IO and effectors layer (`src/io/`):
   percept (ADR-0011/0012, ADR-0021); strictly outside cognition (ADR-0014).
   Text/file are normalized now; audio (STT) is the honest deferred bridge seam.
 - **audio_synth / audio_speak** (`io/effectors/`) — the audio modality bridge
-  (Phase 19 Tier-4 #1; P2.6 multi-formant upgrade). `audio_synth.nova` is the
-  always-on Mode-1 floor: a pure-NOVA Klatt-style two-formant phoneme
-  synthesizer (13 vowels with F1+F2+F3, 6 plosives as silence+burst, 7
-  fricatives via a small-multiplier LCG pseudo-noise, 3 nasals with damping,
-  4 liquids, 33 phonemes total + a 440 Hz unknown fallback), 5 ms attack +
-  10 ms release anti-click ADSR per phoneme, and a 44-byte RIFF/WAVE/PCM
-  writer (8 kHz, 16-bit, mono) durable via `sys_fsync` before close. The
-  legacy single-carrier sine synth lives on as `synth_phoneme_sine` and is
-  selectable at runtime via `CE_SYNTH_MODE=sine`; `CE_SYNTH_MODE=silence`
-  emits zero samples for CI. `audio_speak.nova` layers Mode-2 espeak
-  escalation and Mode-3 aplay/paplay best-effort playback on top.
+  (Phase 19 Tier-4 #1; P2.6 multi-formant upgrade; P6 full-ARPAbet expansion).
+  `audio_synth.nova` is the always-on Mode-1 floor: a pure-NOVA Klatt-style
+  two-formant phoneme synthesizer covering the full English ARPAbet inventory
+  (~44 distinct phonemes, 53 dispatches counting aliases like a/aa/ah): 20
+  monophthongs with F1+F2+F3 (a/aa/ah, ae, e/eh, er, i/iy, ih, ix, ax, axr,
+  o/oh/ao, ow, u/uw, uh), 4 diphthongs with linear formant glides (aw, ay,
+  ey, oy), 6 plosives as silence+burst (b/d/g/k/p/t), 2 affricates as
+  sequenced stop+fricative (ch=t+sh, jh=d+zh), 10 fricatives via a
+  small-multiplier LCG pseudo-noise (s, z, f, v, sh, zh, th, dh, h/hh), 3
+  onset nasals with damping (n, m, ng), 4 syllabic nasals/liquids with
+  reduced amplitude (em, en, eng, el), and 4 liquids/glides (l, r, w, y), +
+  a 440 Hz unknown fallback. 5 ms attack + 10 ms release anti-click ADSR per
+  phoneme, and a 44-byte RIFF/WAVE/PCM writer (8 kHz, 16-bit, mono) durable
+  via `sys_fsync` before close. The legacy single-carrier sine synth lives
+  on as `synth_phoneme_sine` and is selectable at runtime via
+  `CE_SYNTH_MODE=sine`; `CE_SYNTH_MODE=silence` emits zero samples for CI.
+  `audio_speak.nova` layers Mode-2 espeak escalation and Mode-3 aplay/paplay
+  best-effort playback on top. See `AUDIO_AUDIT.md` for the phoneme inventory
+  audit + diphthong/affricate canonical formant tables.
 
 The Phase 10 persistence layer (`src/persistence/`):
 

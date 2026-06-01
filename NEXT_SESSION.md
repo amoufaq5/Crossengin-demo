@@ -3,6 +3,74 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R6E (this session) — Audio: full ~44-phoneme ARPAbet Klatt synthesis
+
+**Status: complete -- `src/io/effectors/audio_synth.nova` LANDED with the
+expanded inventory.** The pre-P6 Klatt-style two-formant synthesizer
+recognized 33 phoneme dispatches (28 distinct symbols with a/ah, e/eh,
+i/iy, o/oh, u/uw aliasing). P6 expands to **53 dispatches covering 44
+distinct ARPAbet symbols**, plugging the gaps that made the Mode-1 floor
+mispronounce diphthongs (FACE/PRICE/MOUTH/CHOICE), affricates
+(CHURCH/JUDGE), voiced fricatives (THIS/MEASURE), and syllabic
+nasals/liquids (BOTTOM/BOTTLE).
+
+Added 20 dispatches across 5 categories:
+
+- **+7 monophthongs**: aa, ao (formerly aliased), uh (foot, lax),
+  er (bird, rhotacized), ax (schwa), ix (reduced high), axr (rhotacized
+  schwa).
+- **+4 diphthongs**: aw (MOUTH), ay (PRICE), ey (FACE), oy (CHOICE).
+  Encoded as 4-element formant table (start formants + DIPHTHONG kind) +
+  parallel `_diphthong_end_formants` table for the glide target. New
+  `_synth_diphthong` linearly interpolates F1/F2 per-sample across the
+  1200-sample buffer (~0.88 Hz/sample for the largest jump, AY's F2
+  1230->2290).
+- **+2 affricates**: ch (T+SH), jh (D+ZH). Encoded as AFFRICATE kind with
+  `_affricate_parts` returning [stop_label, fricative_label]; new
+  `_synth_affricate` concatenates ~40% plosive + ~60% fricative within
+  the 1200-sample budget.
+- **+3 fricatives**: dh (voiced TH), zh (voiced SH), hh (HH alias for h).
+- **+4 syllabic nasals/liquids**: em, en, eng, el. New SYLLABIC kind with
+  `_synth_syllabic` applying gentler damping (1000->700 vs nasal's
+  1000->500) and reduced amplitude (~70% of onset).
+
+Public API surface (additive):
+
+- `klatt_phoneme_count()` -> `53` (inventory size).
+- `klatt_phoneme_labels()` -> list of all 53 labels in dispatch order.
+- `diphthong_end_formants(label)` -> end formants for 4 diphthongs.
+- 3 new phoneme kinds: `PHO_KIND_DIPHTHONG=5`, `PHO_KIND_AFFRICATE=6`,
+  `PHO_KIND_SYLLABIC=7`. Existing kinds (VOWEL=1, PLOSIVE=2, FRICATIVE=3,
+  NASAL=4) unchanged.
+
+Files touched:
+
+- `src/io/effectors/audio_synth.nova` (+~220 lines: extended formant
+  table, 3 new synth functions, klatt_phoneme_count/labels API).
+- `tests/unit/test_audio_synth.nova` (+22 test functions / +110 ce_*
+  checks; 99 -> 209 total assertions).
+- `examples/crossengin_chat.nova` (+1 line in `/help` mentioning the
+  ~44-phoneme inventory; explicit per the R6E brief's "AT MOST 1-2
+  lines" cap).
+- `AUDIO_AUDIT.md` (NEW): full audit doc with category-by-category
+  comparison (33 baseline vs 53 expanded), diphthong glide arithmetic,
+  affricate sequencing, syllabic vs onset comparison, verification
+  inventory.
+- `README.md` (`audio_synth / audio_speak` paragraph extended with the
+  full inventory enumeration).
+
+Verification: `audio_synth: OK (209 checks)`; full unit-test suite
+139/139 PASS (no regressions). The 4-word diphthong test utterance
+("DAY KAY MOW BOY" = D+EY, K+EY, M+OW, B+OY) synthesizes to exactly
+4 * 2400 = 9600 samples = 1.2 s @ 8 kHz; on-disk WAV is 44 + 9600*2 =
+19244 bytes.
+
+Future work (deferred): promote OW to a true diphthong (currently kept as
+monophthong for byte-for-byte backward compat); add glottal voicing
+source so DH/ZH are perceptually distinct from TH/SH; per-stress-mark
+variants (AH0/AH1/AH2); coarticulation across phoneme boundaries. See
+`AUDIO_AUDIT.md` "Future work" for the full list.
+
 ## Phase progress
 
 - Phase 1 substrate kernel: **complete**
