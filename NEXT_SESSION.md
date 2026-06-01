@@ -17,6 +17,31 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.9 pure-NOVA 256-bit bignum library (DH key-exchange prerequisite):
+  **complete (leaf primitive)**. The federated SecAgg MVP (P3.8) shipped
+  pre-shared tokens because NOVA had no bignum. This session lands the
+  smallest viable bignum library that unblocks the layered upgrades --
+  Diffie-Hellman key agreement (the SecAgg layer 2), RSA decrypt/verify
+  (TLS), and the future modular-exponentiation kernel under a real
+  X25519/Curve25519 scalar mult. Scope: 256-bit FIXED width (NOT
+  arbitrary precision; that's an order-of-magnitude more work). 8
+  32-bit limbs, LSB at index 0; the schoolbook 256x256 multiply
+  internally splits each 32-bit limb into two 16-bit halves so per-cell
+  products fit cleanly in the positive signed 63-bit band and dodge
+  NOVA gotcha #11. Public surface: `bn_new`, `bn_from_int`,
+  `bn_from_hex`, `bn_to_hex`, `bn_zero`, `bn_eq`, `bn_cmp`, `bn_add`,
+  `bn_sub`, `bn_mul` (returns `[hi, lo]` -- the full 512-bit product),
+  `bn_mod`, `bn_modmul`, `bn_modpow`. 54 assertions in
+  `tests/unit/test_bignum.nova`, including the textbook `2^10 mod 1000
+  = 24` and the Curve25519 prime sanity check `2^255 mod (2^255-19)
+  = 19`. Smallest measurable op: a single `bn_add` call clocks ~800 ns
+  via `nanotime()`. **Side-channel disclaimer:** at MVP `bn_modpow` and
+  `bn_cmp` are NOT constant-time; safe for offline self-tests, NOT for
+  remote-callable code paths (timing leaks the exponent's Hamming
+  weight). Const-time follow-up is its own ~2-3 week project per
+  primitive. Documented in `SECAGG_AUDIT.md` ("bignum landed; DH key
+  exchange unblocked") and `TLS_AUDIT.md` (modpow is the kernel of RSA
+  verify + DHE key share derivation).
 - P3.2 minimum-viable video modality (framework + audit):
   **complete (framework only)** (ADR-0014 video half / NOVA
   enhancement #15). Video was the natural step after P3.1's image
@@ -2041,9 +2066,19 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 129 (129 PASS; **+3 suites / +51 assertions from P1.4
-  PSK secure-channel continuation** -- `test_chacha20.nova` (26),
-  `test_poly1305.nova` (9), `test_secure_channel.nova` (16); +1 from P3.7
+- Total unit suites: 130 (130 PASS; **+1 suite / +54 assertions from
+  this session's pure-NOVA 256-bit bignum library** -- `test_bignum.nova`
+  covers `bn_to_hex` / `bn_from_hex` round-trip on the all-zeros,
+  all-ones, short, and case-mixed inputs; 32-bit carry propagation in
+  `bn_add` (2^32-1 + 1 = 2^32); underflow wrap in `bn_sub` (3 - 5 =
+  2^256 - 2); small + 2^128-squared + max-squared products in `bn_mul`;
+  small modulus + a < m in `bn_mod`; `(5*6) mod 7 = 2` in `bn_modmul`;
+  the textbook `2^10 mod 1000 = 24` and the Curve25519 `2^255 mod
+  (2^255-19) = 19` in `bn_modpow`; plus a `nanotime()`-measured single
+  `bn_add` op (~800 ns on the dev container). **+3 suites / +51
+  assertions from P1.4 PSK secure-channel continuation** --
+  `test_chacha20.nova` (26), `test_poly1305.nova` (9),
+  `test_secure_channel.nova` (16); +1 from P3.7
   `test_federated_aggregator.nova`, +1 from P3.6
   `test_differential_privacy.nova`, +1 from P3.1 `test_image_pgm.nova`, +1
   from P3.5 `test_proof_checker.nova`, +1 from P3.4 `test_ann_index.nova`,

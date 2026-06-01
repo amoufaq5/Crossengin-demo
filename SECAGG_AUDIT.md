@@ -214,7 +214,36 @@ gives the headline property.
 The reference Google SecAgg (~4-6 weeks per the published prototype)
 adds:
 
-1. **DH key agreement** — ~2 weeks pending NOVA bignum support.
+1. **DH key agreement** — **bignum prerequisite landed (`src/safety/bignum.nova`);
+   DH key exchange unblocked.** A pure-NOVA 256-bit unsigned bignum library
+   shipped in the session that produced this paragraph: `bn_new` /
+   `bn_from_hex` / `bn_to_hex` / `bn_add` / `bn_sub` / `bn_mul` (512-bit
+   product as `[hi, lo]`) / `bn_mod` / `bn_modmul` / `bn_modpow`. The
+   modular-exponentiation kernel is verified against the textbook
+   `2^10 mod 1000 = 24` and against the Curve25519 prime
+   `p = 2^255 - 19` (`2^255 mod p = 19`, equivalent to RFC 7748's
+   field-element reduction step). Limb representation: 8 32-bit limbs,
+   LSB at index 0, so each per-limb arithmetic intermediate stays well
+   under 2^64 (the schoolbook 256x256 multiply splits each 32-bit limb
+   into two 16-bit halves so per-cell products fit cleanly in the
+   positive signed 63-bit band). With bignum in hand, an X25519 DH
+   exchange becomes (a) generate a 256-bit scalar, (b) call a (yet to be
+   shipped) Curve25519 scalar-mult primitive
+   `x25519(scalar, base_point)` over the Curve25519 Montgomery form, (c)
+   send the public point, (d) on receive call `x25519(scalar, peer_point)`
+   to derive the shared mask seed. Steps (a) + (b) + (d) need 1-2 weeks
+   of pure crypto work on top of the bignum library: the actual scalar-
+   mult routine (Montgomery ladder), the Curve25519 field-element
+   compression / decompression, and the public-key encoding.
+   **Constant-time follow-up required for production.** The MVP `bn_modpow`
+   branches on the exponent's bit pattern (square-and-multiply) so the
+   timing leak is observable to a network adversary. The constant-time
+   re-implementation (Montgomery ladder for scalar mult, masked
+   subtraction for borrow, fixed-window exp for `bn_modpow`) is its own
+   ~2-3 week project per primitive. The current MVP `bn_modpow` is
+   sufficient for OFFLINE self-tests + verification of stored
+   crypto material; do NOT export it to a remote-callable code path
+   without the const-time follow-up.
 2. **Shamir secret sharing of mask seeds** — ~2 weeks once we have
    a finite-field polynomial primitive.
 3. **Dropout handling** — ~1 week once Shamir lands (compose the
@@ -226,3 +255,37 @@ adds:
 The MVP's pairwise-additive-masking module is the foundation; each
 of the four layers above sits on top of it without invalidating the
 existing primitive.
+
+## What "bignum landed" means concretely
+
+`src/safety/bignum.nova` is now a leaf primitive alongside `chacha20.nova`
+and `poly1305.nova` -- no cross-safety imports, pure builtins (`int_add`,
+`int_sub`, `int_mul`, `int_and`, `int_or`, `int_shl`, `int_shr`, list
+ops). Public surface:
+
+| Function | Returns | Description |
+|---|---|---|
+| `bn_new()` | bn | 256-bit zero |
+| `bn_from_int(n)` | bn | small int -> bn (handles up to 2^64-1 via two-limb split) |
+| `bn_from_hex(hex)` | bn | hex string (lower or upper case, 1..64 chars) -> bn |
+| `bn_to_hex(bn)` | string | canonical 64-char lowercase hex |
+| `bn_zero(bn)` | int (0 or 1) | 1 iff all limbs zero |
+| `bn_eq(a, b)` | int (0 or 1) | structural equality |
+| `bn_cmp(a, b)` | int (-1, 0, 1) | comparator |
+| `bn_add(a, b)` | bn | (a + b) mod 2^256 (drops carry past bit 255) |
+| `bn_sub(a, b)` | bn | (a - b) mod 2^256 (two's-complement wrap on underflow) |
+| `bn_mul(a, b)` | [hi, lo] | full 512-bit product (no truncation) |
+| `bn_mod(a, m)` | bn | a mod m (bit-by-bit long division) |
+| `bn_modmul(a, b, m)` | bn | (a * b) mod m, via the full 512-bit product |
+| `bn_modpow(b, e, m)` | bn | b^e mod m, right-to-left square-and-multiply |
+
+Test coverage lives in `tests/unit/test_bignum.nova` -- 54 assertions
+across `bn_to_hex` / `bn_from_hex` round-trip on the all-zeros, all-ones,
+short, and case-mixed inputs; 32-bit carry propagation in `bn_add`;
+underflow wrap in `bn_sub`; small + 2^128-squared + max-squared products
+in `bn_mul`; small modulus + a < m in `bn_mod`; `(5*6) mod 7 = 2` in
+`bn_modmul`; the textbook `2^10 mod 1000 = 24` and the Curve25519
+`2^255 mod (2^255-19) = 19` in `bn_modpow`. The smallest measurable
+op (a single `bn_add` call, no loop) clocks ~800 ns via `nanotime()`
+on the dev container (one-time measurement -- environments vary by
+10x).

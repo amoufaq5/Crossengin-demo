@@ -11,7 +11,13 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 126 modules compile (`make build`, +1 from `kg/ann_index.nova`
+> toolchain: 127 modules compile (`make build`, +1 from `safety/bignum.nova`
+> added in P3.9 pure-NOVA 256-bit unsigned bignum library -- the DH
+> key-exchange prerequisite the federated SecAgg MVP could not ship
+> without (Item 6 of the brief), now landed as a leaf primitive
+> alongside `chacha20.nova` and `poly1305.nova`; documented in
+> [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md),
+> +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
 > added in P0.6 wall-clock pacer, +1 from `http_client.nova` added in P1.4
@@ -52,8 +58,21 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 129 unit-test suites pass
-> (`make test`, +1 suite / +27 assertions from `test_realtime_pacer.nova`
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 130 unit-test suites pass
+> (`make test`, +1 suite / +54 assertions from `test_bignum.nova` added in
+> P3.9 pure-NOVA 256-bit bignum library: `bn_new` / `bn_from_int` /
+> `bn_from_hex` / `bn_to_hex` / `bn_zero` / `bn_eq` / `bn_cmp` / `bn_add`
+> / `bn_sub` / `bn_mul` (full 512-bit product as `[hi, lo]`) / `bn_mod`
+> / `bn_modmul` / `bn_modpow`, with the textbook `2^10 mod 1000 = 24`
+> and the Curve25519 prime sanity check `2^255 mod (2^255-19) = 19`
+> verified end-to-end; this unblocks the SecAgg DH key-agreement layer
+> + RSA verify + future X25519 ECDH on top of `src/safety/bignum.nova`
+> -- side-channel caveat is that MVP `bn_modpow` is NOT constant-time
+> (square-and-multiply leaks Hamming weight); the const-time
+> reimplementation is a follow-up project per primitive, documented in
+> [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md) ("bignum landed; DH key
+> exchange unblocked"),
+> +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
 > P0.7 decision-log durable path,
