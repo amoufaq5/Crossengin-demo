@@ -132,10 +132,12 @@ fn _fed_accept_handshake(sub_fd, expected_token) {
 }
 
 // SecAgg-mode handshake: expect SECAGG_HELLO ce-fed v2-sa, accept
-// a FED_JOIN, then drain SECAGG_PEER lines (one per peer; soul
-// terminates with an ACK <round=0> sentinel so we can stop reading
-// peer lines without a time-based deadline). Returns
-// [fd, soul_id, epsilon, peer_count] on success, 0 on rejection.
+// a FED_JOIN, then drain SECAGG_PEER and (P3.9, additive) FED_DH_PUBLIC
+// lines until the ACK <round=0> sentinel. Returns
+// [fd, soul_id, epsilon, peer_count, dh_pubkey_or_0] on success, 0
+// on rejection. dh_pubkey_or_0 is the hex string of this soul's DH
+// public key when the soul opted into v2-sa-dh, or 0 when the soul
+// announced no FED_DH_PUBLIC (pre-shared-token v2-sa-r mode).
 fn _fed_accept_handshake_secagg(sub_fd) {
     let hello = _recv_line(sub_fd)
     if hello == 0 {
@@ -165,13 +167,14 @@ fn _fed_accept_handshake_secagg(sub_fd) {
     }
     let soul_id = rec[KGSYNC_FED_SOUL_ID]
     let epsilon = rec[KGSYNC_FED_EPSILON]
-    // Drain SECAGG_PEER lines until we see an ACK 0 sentinel. The
-    // coordinator does NOT need to verify each peer announcement
-    // against expected tokens -- the masks themselves enforce the
-    // pair-cancellation contract (a tampered peer line on one side
-    // just produces an uncancelled mask, leaving an arithmetic
-    // signature in the final sum that the audit doc walks).
+    // Drain SECAGG_PEER and (P3.9, additive) FED_DH_PUBLIC lines until
+    // an ACK 0 sentinel. The coordinator does NOT validate the per-peer
+    // tokens / pubkeys -- the masks themselves enforce the pair-
+    // cancellation contract (a tampered peer line on one side just
+    // produces an uncancelled mask, leaving an arithmetic signature in
+    // the final sum that the audit doc walks).
     let peer_count = 0
+    let dh_pubkey = 0
     let done = 0
     while done == 0 {
         let line = _recv_line(sub_fd)
@@ -188,13 +191,23 @@ fn _fed_accept_handshake_secagg(sub_fd) {
                 println("fed-coord: SECAGG_PEER soul=" + soul_id
                     + " peer=" + prec[KGSYNC_SECAGG_PEER_ID])
             } else {
-                if t == KGSYNC_EV_ACK { done = 1 }
-                else { done = 1 }
+                if t == KGSYNC_EV_FED_DH_PUBLIC {
+                    // P3.9 v2-sa-dh: stash this soul's DH public key
+                    // so the coordinator can broadcast it to peers
+                    // after all souls have joined.
+                    dh_pubkey = prec[KGSYNC_FED_DH_PUBKEY]
+                    println("fed-coord: [SECAGG-DH] FED_DH_PUBLIC soul=" + soul_id
+                        + " pubkey=" + substr(dh_pubkey, 0, 16) + "...")
+                } else {
+                    if t == KGSYNC_EV_ACK { done = 1 }
+                    else { done = 1 }
+                }
             }
         }
     }
     let s = _csoul_new(sub_fd, soul_id, epsilon)
     push(s, peer_count)   // index 4 = peer count
+    push(s, dh_pubkey)    // index 5 = DH pubkey hex (0 if not DH mode)
     return s
 }
 
@@ -244,6 +257,78 @@ fn _fed_accept_n_secagg(server_fd, n) {
         attempts = attempts + 1
     }
     return souls
+}
+
+// P3.9 v2-sa-dh: after all souls have announced their DH public keys
+// during the handshake, the coordinator forwards every pubkey to every
+// other soul. Each soul then has the material it needs to derive a
+// pairwise shared secret with every peer via
+// `peer_pubkey ^ my_private mod p`.
+//
+// We do NOT forward a soul's own pubkey back to itself (a soul has no
+// pair to mask against itself). Sending one FED_DH_PUBLIC line per peer
+// per soul keeps the wire shape simple and audit-readable: the souls
+// just register each line they receive via sa_register_peer_dh.
+//
+// Returns the number of FED_DH_PUBLIC lines successfully sent. Returns
+// 0 if no soul announced a DH pubkey (then this function is a no-op and
+// the round proceeds in pre-shared-token v2-sa mode).
+fn _fed_broadcast_dh_pubkeys(souls) {
+    // Count how many souls announced a DH key (slot 5 != 0).
+    let dh_n = 0
+    let i = 0
+    while i < len(souls) {
+        let s = souls[i]
+        if len(s) > 5 {
+            if s[5] != 0 { dh_n = dh_n + 1 }
+        }
+        i = i + 1
+    }
+    if dh_n == 0 { return 0 }
+    println("fed-coord: [SECAGG-DH] broadcasting " + int_to_str(dh_n)
+        + " DH pubkey(s) to " + int_to_str(len(souls)) + " soul(s)")
+    // For every soul SRC that announced a pubkey, send a FED_DH_PUBLIC
+    // line carrying SRC's id + pubkey to every OTHER soul (DST != SRC).
+    let sent = 0
+    let src_i = 0
+    while src_i < len(souls) {
+        let src = souls[src_i]
+        let src_pub = 0
+        if len(src) > 5 { src_pub = src[5] }
+        if src_pub != 0 {
+            let line = sa_format_dh_public_line(src[CSOUL_ID], src_pub)
+            let dst_i = 0
+            while dst_i < len(souls) {
+                if dst_i != src_i {
+                    let dst = souls[dst_i]
+                    let dst_fd = dst[CSOUL_FD]
+                    if dst_fd >= 0 {
+                        if _send_all(dst_fd, line) == 0 {
+                            close_fd(dst_fd)
+                            list_set(dst, CSOUL_FD, 0 - 1)
+                        } else {
+                            sent = sent + 1
+                        }
+                    }
+                }
+                dst_i = dst_i + 1
+            }
+        }
+        src_i = src_i + 1
+    }
+    // After broadcasting, send a sentinel ACK 0 to every soul so the
+    // soul-side receiver knows the DH-pubkey-broadcast phase is over
+    // and can transition to the round loop.
+    let si = 0
+    while si < len(souls) {
+        let s = souls[si]
+        let fd = s[CSOUL_FD]
+        if fd >= 0 {
+            _send_all(fd, "ACK 0\n")
+        }
+        si = si + 1
+    }
+    return sent
 }
 
 // SecAgg-mode collect: read FED_STAT_MASKED lines from each soul and
@@ -787,6 +872,18 @@ fn main() {
     let souls = list_new()
     if secagg == 1 {
         souls = _fed_accept_n_secagg(server_fd, n_souls)
+        // P3.9 DH key-exchange phase: if any soul announced a DH pubkey
+        // during the handshake, broadcast every pubkey to every other
+        // soul so each soul can derive pairwise shared secrets. Souls
+        // that did not announce a DH pubkey (pre-shared-token v2-sa mode)
+        // are unaffected. Returns the number of DH lines actually sent;
+        // 0 means no DH exchange happened and the round proceeds in
+        // pre-shared-token mode.
+        let dh_sent = _fed_broadcast_dh_pubkeys(souls)
+        if dh_sent > 0 {
+            println("fed-coord: [SECAGG-DH] DH key-exchange phase complete ("
+                + int_to_str(dh_sent) + " pubkey line(s) broadcast)")
+        }
     } else {
         souls = _fed_accept_n(server_fd, n_souls, token)
     }

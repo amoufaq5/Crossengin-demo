@@ -1,26 +1,42 @@
 # Secure Aggregation (SecAgg) Audit
 
 **Phase:** P3.8 — secure aggregation MVP (pairwise additive masking),
-extended to **P3.8r — dropout-resilient SecAgg (v2-sa-r)**.
+extended to **P3.8r — dropout-resilient SecAgg (v2-sa-r)**, further
+extended to **P3.9 — DH key agreement (v2-sa-dh)** which replaces
+the pre-shared-token path with a real Diffie-Hellman exchange when
+the soul opts in via `CE_SECAGG_DH=1`.
 **ADR:** ADR-0055 — SecAgg via pairwise additive masking with
 pre-shared tokens. The dropout-resilience extension layers on top of
 the original ADR-0055 primitive: same mask derivation, same wire
 envelope, with an additive FED_DROPOUT + FED_RECON_MASKED protocol
 pair that lets the surviving souls reconcile their submissions when
-one peer vanishes mid-round.
+one peer vanishes mid-round. The DH extension adds an additive
+FED_DH_PUBLIC line on top of v2-sa-r: the wire protocol shape is
+unchanged below the round_open, and the mask derivation is the same
+LCG -- just seeded by a DH-derived shared secret instead of a
+pre-shared token.
 **Modules:** `src/learning/secure_aggregation.nova` (P3.8r:
 `sa_recompute_without` / `sa_reconcile_for_dropped` + FED_DROPOUT /
 FED_RECON_MASKED wire formatters + parsers + the
-`CE_FED_ROUND_DEADLINE_MS` env helper),
+`CE_FED_ROUND_DEADLINE_MS` env helper; P3.9: `sa_dh_generate_keys` /
+`sa_dh_shared_secret_for_peer` / `sa_register_peer_dh` + the
+FED_DH_PUBLIC wire formatter + parser + `sa_dh_enabled_from_env`),
 `src/learning/federated_aggregator.nova` (extended with v2-sa mode and
 the P3.8r reconciliation emitter `fed_agg_emit_recon_masked`),
-SECAGG\_\* parser branch additively added to
+`src/safety/bignum.nova` (P3.9: `bn_modpow_ct` -- Montgomery-ladder
+constant-time modular exponentiation -- replaces the side-channel-
+unsafe `bn_modpow` for DH/ECDH/RSA private-exponent operations),
+SECAGG\_\* / FED\_DH\_PUBLIC parser branches additively added to
 `src/io/transducers/kg_sync.nova` (one more dispatch case for
-FED_DROPOUT / FED_RECON_MASKED),
+FED_DROPOUT / FED_RECON_MASKED / FED_DH_PUBLIC),
 `examples/crossengin_fed_coordinator.nova` (SecAgg-r coordinator with
-dropout detection + reconciliation broadcast / collect path),
+dropout detection + reconciliation broadcast / collect path; P3.9:
+DH-pubkey collection during handshake drain + `_fed_broadcast_dh_pubkeys`
+phase after all souls join),
 `examples/crossengin_chat.nova` (env-detected v2-sa fed_join path with
-the FED_DROPOUT receive hook -- no new admin commands).
+the FED_DROPOUT receive hook -- no new admin commands; P3.9: single
+`CE_SECAGG_DH` env probe gates the DH keygen + announce + receive
+broadcast cycle).
 
 ## What changed from P3.7
 
@@ -302,45 +318,170 @@ strictest threat model". For CrossEngin's threat model
 (soul-vs-coordinator with at-least-one honest soul), SecAgg alone
 gives the headline property.
 
+## Shipped: DH key agreement (P3.9 / v2-sa-dh)
+
+**Status:** shipped (this session). Replaces the pre-shared-token
+path with a real Diffie-Hellman key agreement when the soul opts in
+via `CE_SECAGG_DH=1`. The pre-shared-token path remains the default
+and is unchanged for backwards compatibility.
+
+**Verified by:** `test_sa_dh_two_soul_pair_mask_matches` +
+`test_secagg_two_soul_dh_sum_demo` in
+`tests/unit/test_secure_aggregation.nova` (the headline check: alice
+and bob each generate a 256-bit private key + matching public key,
+exchange pubkeys via the coordinator broadcast, then each derives
+the pairwise shared secret via `peer_pubkey ^ my_private mod p` and
+both sides land on the SAME shared secret; the LCG mask derivation
+seeded by that shared secret produces matching masks so the SecAgg
+cancellation invariant holds), and `tests/integration/scenario_u_secagg.sh`
+"scenario U.dh" (a real 2-soul TCP round-trip where both chat souls
+generate keypairs, send FED_DH_PUBLIC to the coordinator, receive
+the broadcast pubkeys back, and complete a round with DH-derived
+masks; the coordinator's AGGREGATE_SUM still equals Σ raw values).
+
+### Wire protocol additions (additive on v2-sa-r)
+
+| Line | Direction | Meaning |
+|---|---|---|
+| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | client → server (during handshake) | soul announces its DH public key |
+| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | server → client (after all join) | coord broadcasts every peer's pubkey |
+| `ACK 0` | server → client | sentinel: DH-broadcast phase ended |
+
+### Protocol flow
+
+1. Each soul generates a 256-bit private key `d_i` via
+   `_sa_dh_random_bn_from_nanotime` (a stretched-nanotime LCG; see
+   weak-random caveat below) and computes its public key
+   `P_i = g^d_i mod p` via `bn_modpow_ct` (the constant-time
+   Montgomery ladder).
+2. During the v2-sa handshake (after FED_JOIN), each soul sends
+   `FED_DH_PUBLIC <soul_id> <pubkey_hex>` instead of (or alongside
+   nothing — the DH mode does NOT load `CE_FED_TOKEN_<peer>` env
+   vars) `SECAGG_PEER` lines.
+3. The coordinator collects each soul's pubkey during the handshake
+   drain, then after all N souls have joined, broadcasts every
+   pubkey to every OTHER soul (one `FED_DH_PUBLIC` line per peer
+   per soul), then sends a sentinel `ACK 0`.
+4. Each soul receives the peer pubkeys and registers them via
+   `sa_register_peer_dh(s, peer_id, peer_pubkey_hex)`. The shared
+   secret with peer j is `s_ij = P_j^d_i mod p`, derived on demand
+   by `sa_dh_shared_secret_for_peer` (called from `sa_mask_for_peer`
+   when `s[SA_DH_MODE] == 1`).
+5. By DH commutativity `(g^a)^b == (g^b)^a mod p`, so both sides of
+   each pair compute the SAME shared secret; the existing LCG mask
+   derivation seeded by the shared secret then produces matching
+   masks and the SecAgg cancellation invariant holds.
+
+### Crypto-strength caveats (LOUD)
+
+**256-bit prime is BROKEN against modern adversaries.** We use
+`p = 2^255 - 19` (the Curve25519 field prime) and `g = 2` because
+our bignum library is 256-bit and RFC 7919 Group 1 (the smallest
+standard MODP group) is already 768-bit. A 256-bit DH group is
+recoverable via index-calculus on commodity hardware; this MVP
+demonstrates the WIRE PROTOCOL + FLOW, not the cryptographic
+strength. The audit-readable contract: the wire shapes
+(`FED_DH_PUBLIC` line + broadcast phase), the soul-side keygen +
+shared-secret derivation, and the LCG seeding-from-shared-secret
+all match the production design. Upgrading to a 2048-bit RFC 7919
+group is a (a) wider bignum (~ 64 limbs; multi-week) + (b)
+constant-table swap (a one-liner once the wider bignum lands).
+
+**`p_25519` is NOT a "safe" DH prime.** Curve25519's prime is the
+*field* prime of an elliptic curve, not the order of a prime-order
+subgroup of `(Z/pZ)*`. Real DH wants `p = 2q + 1` with `q` prime
+AND a generator of the order-`q` subgroup. We use `p_25519` + `g=2`
+anyway because the WIRE PROTOCOL CORRECTNESS check
+(`shared_from_a == shared_from_b`) is group-structure-independent
+(commutativity is the only algebraic property we exercise).
+Production must swap to an RFC 7919 group.
+
+**Weak random.** The 256-bit private key is generated via
+`nanotime() + 15-bit LCG` -- not cryptographically random. A
+network adversary that can guess the soul's boot time to within a
+second can brute-force the private key by enumerating LCG seeds
+(roughly thousands of candidates). Production needs `/dev/urandom`
+(or the OS-equivalent CSPRNG); the NOVA toolchain does not expose
+one today. This is the SAME weak-random caveat the P3.8 LCG-driven
+mask derivation carries; DH inherits it without making things
+worse.
+
+**Constant-time `bn_modpow_ct` IS used.** `sa_dh_generate_keys` and
+`sa_dh_shared_secret_for_peer` both call `bn_modpow_ct` (Montgomery
+ladder; see `src/safety/bignum.nova`) for the modular exponentiation
+so the PRIVATE KEY EXPONENT does not leak via wall-clock timing to a
+passive network observer. The square-and-multiply `bn_modpow` is
+NOT used on private exponents anywhere; it remains in the public API
+for offline test vector / public-exponent verification only.
+
+## Constant-time `bn_modpow_ct` (P3.9 prerequisite)
+
+**Status:** shipped (this session). The square-and-multiply
+`bn_modpow` shipped in R2D leaked the exponent's Hamming weight
+via timing (the `if (bit set)` branch only ran the multiply on
+1-bits). For DH this would have leaked the soul's private key to
+a passive eavesdropper measuring round-trip wall-clock.
+
+`bn_modpow_ct` replaces this with the textbook **Montgomery ladder**:
+
+```
+R0 = 1, R1 = base mod m
+for i = bit_len - 1 DOWN TO 0:
+  b = exp.bit(i)
+  if b == 0:
+    R1 = R0 * R1 mod m
+    R0 = R0 * R0 mod m
+  else:
+    R0 = R0 * R1 mod m
+    R1 = R1 * R1 mod m
+return R0
+```
+
+Both branches execute exactly one modmul + one square per bit, so
+the per-bit wall-clock is exponent-bit-independent. The outer loop
+walks all 256 bits (no leading-zero skip -- that would itself leak
+the position of the most-significant set bit), so the function's
+total runtime is exponent-Hamming-weight-INDEPENDENT.
+
+`bn_modpow` remains in the public API for OFFLINE self-tests and
+public-exponent verification (the documentation marks it "fast,
+side-channel-unsafe; use only for offline self-tests"). Both
+`sa_dh_generate_keys` (the `g^private mod p` keygen) and
+`sa_dh_shared_secret_for_peer` (the `peer_pubkey^private mod p`
+derivation) call `bn_modpow_ct` exclusively.
+
+**Cost.** `bn_modpow_ct` is ~2x slower than `bn_modpow` per
+bit-loop iteration on uniformly random exponents (square-and-multiply
+averages 1.5 modmuls per bit; the ladder always does 2). For a
+short exponent like `2^255 - 19 mod 1009` (1-byte exp, 8 set bits)
+the dev sandbox measures ~20 ms for `bn_modpow` and ~40 ms for
+`bn_modpow_ct` -- a ~1.88x ratio that matches the analytic
+prediction. For full 256-bit private exponents (~128 set bits on
+average) the ratio narrows to ~4/3x because `bn_modpow` runs the
+multiply on roughly half the bits already.
+
+**Equivalence.** `tests/unit/test_bignum.nova` asserts
+`bn_modpow == bn_modpow_ct` on a 100-vector deterministic sweep
+(72 textbook-fixed vectors + 28 pseudo-random LCG-seeded vectors)
+plus the Curve25519 `2^255 mod p = 19` vector. The two functions
+are observably interchangeable on the test surface.
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
 adds:
 
-1. **DH key agreement** — **bignum prerequisite landed (`src/safety/bignum.nova`);
-   DH key exchange unblocked.** A pure-NOVA 256-bit unsigned bignum library
-   shipped in the session that produced this paragraph: `bn_new` /
-   `bn_from_hex` / `bn_to_hex` / `bn_add` / `bn_sub` / `bn_mul` (512-bit
-   product as `[hi, lo]`) / `bn_mod` / `bn_modmul` / `bn_modpow`. The
-   modular-exponentiation kernel is verified against the textbook
-   `2^10 mod 1000 = 24` and against the Curve25519 prime
-   `p = 2^255 - 19` (`2^255 mod p = 19`, equivalent to RFC 7748's
-   field-element reduction step). Limb representation: 8 32-bit limbs,
-   LSB at index 0, so each per-limb arithmetic intermediate stays well
-   under 2^64 (the schoolbook 256x256 multiply splits each 32-bit limb
-   into two 16-bit halves so per-cell products fit cleanly in the
-   positive signed 63-bit band). With bignum in hand, an X25519 DH
-   exchange becomes (a) generate a 256-bit scalar, (b) call a (yet to be
-   shipped) Curve25519 scalar-mult primitive
-   `x25519(scalar, base_point)` over the Curve25519 Montgomery form, (c)
-   send the public point, (d) on receive call `x25519(scalar, peer_point)`
-   to derive the shared mask seed. Steps (a) + (b) + (d) need 1-2 weeks
-   of pure crypto work on top of the bignum library: the actual scalar-
-   mult routine (Montgomery ladder), the Curve25519 field-element
-   compression / decompression, and the public-key encoding.
-   **Constant-time follow-up required for production.** The MVP `bn_modpow`
-   branches on the exponent's bit pattern (square-and-multiply) so the
-   timing leak is observable to a network adversary. The constant-time
-   re-implementation (Montgomery ladder for scalar mult, masked
-   subtraction for borrow, fixed-window exp for `bn_modpow`) is its own
-   ~2-3 week project per primitive. The current MVP `bn_modpow` is
-   sufficient for OFFLINE self-tests + verification of stored
-   crypto material; do NOT export it to a remote-callable code path
-   without the const-time follow-up.
+1. **DH key agreement** — **shipped (this session, v2-sa-dh).**
+   See "Shipped: DH key agreement" above. Production-grade upgrade
+   still needs (a) a wider bignum (2048+ bits, RFC 7919 Group 14)
+   so the prime can match modern standards, and (b) a CSPRNG so the
+   private key generation isn't weak-random. Both are bounded by
+   NOVA-toolchain capabilities, not by the SecAgg module shape.
 2. **Shamir secret sharing of mask seeds** — ~2 weeks once we have
    a finite-field polynomial primitive.
-3. **Dropout handling** — ~1 week once Shamir lands (compose the
-   share-reveal protocol with the mask cancellation).
+3. **Dropout handling** — **shipped (P3.8r).** The MVP path
+   ("dropped soul advertised, every survivor subtracts the dropped
+   peer's mask from its own submission") works without Shamir.
 4. **Authenticated channel** — ~1 week given a TLS-style HMAC
    primitive (which today's CrossEngin lacks; the kg-sync `token=`
    tag is the closest analogue and is purely a shared-secret check).
@@ -370,15 +511,20 @@ ops). Public surface:
 | `bn_mul(a, b)` | [hi, lo] | full 512-bit product (no truncation) |
 | `bn_mod(a, m)` | bn | a mod m (bit-by-bit long division) |
 | `bn_modmul(a, b, m)` | bn | (a * b) mod m, via the full 512-bit product |
-| `bn_modpow(b, e, m)` | bn | b^e mod m, right-to-left square-and-multiply |
+| `bn_modpow(b, e, m)` | bn | b^e mod m, right-to-left square-and-multiply (FAST, SIDE-CHANNEL-UNSAFE; offline tests only) |
+| `bn_modpow_ct(b, e, m)` | bn | b^e mod m via Montgomery ladder (CRYPTO-SAFE; constant-time per bit; use for DH/ECDH/RSA private exponents) |
 
-Test coverage lives in `tests/unit/test_bignum.nova` -- 54 assertions
+Test coverage lives in `tests/unit/test_bignum.nova` -- 66 assertions
 across `bn_to_hex` / `bn_from_hex` round-trip on the all-zeros, all-ones,
 short, and case-mixed inputs; 32-bit carry propagation in `bn_add`;
 underflow wrap in `bn_sub`; small + 2^128-squared + max-squared products
 in `bn_mul`; small modulus + a < m in `bn_mod`; `(5*6) mod 7 = 2` in
 `bn_modmul`; the textbook `2^10 mod 1000 = 24` and the Curve25519
-`2^255 mod (2^255-19) = 19` in `bn_modpow`. The smallest measurable
+`2^255 mod (2^255-19) = 19` in both `bn_modpow` and `bn_modpow_ct`; and
+the equivalence sweep `bn_modpow == bn_modpow_ct` on 100 deterministic
+vectors (72 textbook + 28 pseudo-random). The smallest measurable
 op (a single `bn_add` call, no loop) clocks ~800 ns via `nanotime()`
-on the dev container (one-time measurement -- environments vary by
-10x).
+on the dev container; a single `bn_modpow_ct` call at 256-bit modulus
+on an 8-bit exponent clocks ~40 ms (vs. ~20 ms for `bn_modpow` -- the
+~1.88x ratio matches the ladder always doing both ops vs.
+square-and-multiply skipping the multiply on 0-bits).

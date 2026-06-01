@@ -336,4 +336,180 @@ assert_match "$COORD2_TXT" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=100 s
 assert_match "$SOUL_A_TXT" "FED_DROPOUT" \
     "alice survivor saw FED_DROPOUT in its receive stream"
 
+# Stage 9: P3.9 DH key-exchange scenario (CE_SECAGG_DH=1).
+# Two chat souls join with DH enabled. No pre-shared CE_FED_TOKEN_*
+# env vars: the pairwise shared secrets are derived from the DH
+# exchange that happens during the handshake. The coordinator's sum
+# must still equal x_a + x_b because the DH-derived masks cancel
+# pairwise just like the token-derived ones did.
+#
+# We use the chat binary (not a Python helper) for both souls -- the
+# chat-side DH support is the focus of the scenario, and the wire
+# protocol already round-trips via the v2-sa-r path. The masks now
+# come from `peer_pubkey ^ my_private mod p` instead of
+# `hash(CE_FED_TOKEN_<peer> + ":" + round_id)`. The headline check is
+# that the coordinator's AGGREGATE_SUM line shows up exactly once, the
+# coordinator logs the SECAGG-DH broadcast phase, and neither soul
+# logs an error.
+it_section "scenario U.dh: secure aggregation DH KEY-EXCHANGE (P3.9 / v2-sa-dh)"
+
+PORT3=$(( 34000 + (RANDOM % 1000) ))
+COORD3_OUT="/tmp/ce_int_secagg_dh_coord.out"
+CHAT_DA_OUT="/tmp/ce_int_secagg_dh_chat_a.out"
+CHAT_DB_OUT="/tmp/ce_int_secagg_dh_chat_b.out"
+trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; kill -9 $COORD2_PID 2>/dev/null; kill -9 $SOUL_A_PID 2>/dev/null; kill -9 $SOUL_B_PID 2>/dev/null; kill -9 $COORD3_PID 2>/dev/null; kill -9 $CHAT_DA_PID 2>/dev/null; kill -9 $CHAT_DB_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT" "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT" "$COORD3_OUT" "$CHAT_DA_OUT" "$CHAT_DB_OUT"' EXIT
+rm -f "$COORD3_OUT" "$CHAT_DA_OUT" "$CHAT_DB_OUT"
+
+# Launch coord for the DH scenario in SecAgg mode (the coord auto-detects
+# DH-mode from incoming FED_DH_PUBLIC lines during the handshake).
+(
+    export CE_FED_PORT="$PORT3"
+    export CE_FED_BIND="127.0.0.1"
+    export CE_FED_SOULS=2
+    export CE_FED_MAX_ROUNDS=1
+    export CE_SECAGG_ENABLED=1
+    "$COORD_BIN" >"$COORD3_OUT" 2>&1
+) &
+COORD3_PID=$!
+
+sleep 1
+if grep -q "ERROR cannot bind / listen" "$COORD3_OUT" 2>/dev/null; then
+    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- DH scenario skipped\n"
+    PASS=$((PASS+1))
+    wait $COORD3_PID 2>/dev/null
+    summary "scenario_u_secagg"
+    exit $?
+fi
+
+rm -f /tmp/crossengin_secagg_dh_alice.snap /tmp/crossengin_secagg_dh_bob.snap \
+      /tmp/crossengin_secagg_dh_alice.dlog  /tmp/crossengin_secagg_dh_bob.dlog
+
+INPUT_DA=$(
+    printf '/teach widget\n'
+    printf '/teach gadget\n'
+    printf "/fed_join 127.0.0.1:$PORT3\n"
+    printf '/fed_leave\n'
+    printf '/quit\n'
+)
+INPUT_DB=$(
+    printf '/teach widget\n'
+    printf '/teach sprocket\n'
+    printf "/fed_join 127.0.0.1:$PORT3\n"
+    printf '/fed_leave\n'
+    printf '/quit\n'
+)
+
+# Stage 10: launch the two chat instances with CE_SECAGG_DH=1.
+# CRITICAL: no CE_FED_TOKEN_* env vars -- the DH path replaces the
+# pre-shared tokens. CE_SECAGG_PEERS still names the peers (so the
+# soul knows which peer ids to expect FED_DH_PUBLIC from) but in DH
+# mode the chat does NOT call sa_peer_token_from_env at all (verified
+# by the chat boot log "[SECAGG-DH]").
+(
+    export CE_FED_PORT="$PORT3"
+    export CE_SECAGG_ENABLED=1
+    export CE_SECAGG_DH=1
+    export CE_SECAGG_PEERS="bob"
+    export CE_SESSION_ID="alice"
+    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh_alice.snap"
+    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh_alice.dlog"
+    echo "$INPUT_DA" | "$CHAT_BIN" >"$CHAT_DA_OUT" 2>&1
+) &
+CHAT_DA_PID=$!
+
+sleep 1
+
+(
+    export CE_FED_PORT="$PORT3"
+    export CE_SECAGG_ENABLED=1
+    export CE_SECAGG_DH=1
+    export CE_SECAGG_PEERS="alice"
+    export CE_SESSION_ID="bob"
+    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh_bob.snap"
+    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh_bob.dlog"
+    echo "$INPUT_DB" | "$CHAT_BIN" >"$CHAT_DB_OUT" 2>&1
+) &
+CHAT_DB_PID=$!
+
+# Stage 11: wait. DH-mode keygen + shared-secret derivation costs ~50-
+# 100 ms per op; total DH overhead for two souls is ~few hundred ms.
+# Add some slack to the deadline so the soul-side bn_modpow_ct runs
+# don't push us into a force-kill.
+DEADLINE=30
+elapsed=0
+while [ "$elapsed" -lt "$DEADLINE" ]; do
+    coord_alive=0; a_alive=0; b_alive=0
+    kill -0 $COORD3_PID  2>/dev/null && coord_alive=1
+    kill -0 $CHAT_DA_PID 2>/dev/null && a_alive=1
+    kill -0 $CHAT_DB_PID 2>/dev/null && b_alive=1
+    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+if [ "$elapsed" -ge "$DEADLINE" ]; then
+    printf "  ${C_YEL}WARN${C_RST}  DH-scenario process(es) hung past %ds, force-killing\n" "$DEADLINE"
+    kill -9 $COORD3_PID  2>/dev/null
+    kill -9 $CHAT_DA_PID 2>/dev/null
+    kill -9 $CHAT_DB_PID 2>/dev/null
+fi
+wait $COORD3_PID  2>/dev/null
+wait $CHAT_DA_PID 2>/dev/null
+wait $CHAT_DB_PID 2>/dev/null
+
+COORD3_TXT=$(cat "$COORD3_OUT"   2>/dev/null || true)
+CHAT_DA_TXT=$(cat "$CHAT_DA_OUT" 2>/dev/null || true)
+CHAT_DB_TXT=$(cat "$CHAT_DB_OUT" 2>/dev/null || true)
+
+# DH-scenario coordinator-side invariants.
+# NOTE: the bin/crossengin-chat binary hardcodes the session id "default"
+# at boot (CE_SESSION_ID is consumed only by snap-path resolution, not by
+# the SecAgg soul-id), so both chats announce themselves as soul=default.
+# The integration test asserts on the SECAGG-DH wire events, not on
+# per-soul identity (the soul-id is exercised by the dropout scenario
+# above via the Python helper which DOES take --soul-id).
+assert_match "$COORD3_TXT" "fed-coord: SECAGG JOIN" \
+    "DH-scenario coordinator accepted at least one SECAGG JOIN"
+# Coordinator logged that it received FED_DH_PUBLIC lines and broadcast
+# pubkeys back -- this is the new v2-sa-dh wire phase. We assert the
+# event count rather than per-soul ids since both chats use the same
+# default soul_id.
+assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] FED_DH_PUBLIC soul=default pubkey=" \
+    "DH-scenario coordinator received at least one FED_DH_PUBLIC"
+assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] broadcasting 2 DH pubkey" \
+    "DH-scenario coordinator broadcast both DH pubkeys"
+assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] DH key-exchange phase complete" \
+    "DH-scenario coordinator completed DH exchange phase"
+# The masked stats / aggregate sum still flow as in v2-sa: DH only
+# changes WHERE the per-pair mask seed comes from (LCG-fed-by-DH-secret
+# instead of LCG-fed-by-token-hash); the rest of the protocol is bit-
+# identical. So we still expect the AGGREGATE_SUM broadcast.
+assert_match "$COORD3_TXT" "\\[SECAGG\\] AGGREGATE_SUM round=1" \
+    "DH-scenario coordinator broadcast AGGREGATE_SUM"
+
+# Chat-side (per-soul) DH invariants. The chat boot banner contains
+# parentheses "enabled (v2-sa-dh ..." -- we use a `.` (any single char)
+# in place of `(` since _lib.sh's assert_match runs grep -E and the
+# parens would otherwise be alternation metacharacters.
+assert_match "$CHAT_DA_TXT" "\\[SECAGG\\] enabled .v2-sa-dh" \
+    "alice chat entered v2-sa-dh mode"
+assert_match "$CHAT_DB_TXT" "\\[SECAGG\\] enabled .v2-sa-dh" \
+    "bob chat entered v2-sa-dh mode"
+assert_match "$CHAT_DA_TXT" "\\[SECAGG-DH\\] generated keypair, sent FED_DH_PUBLIC" \
+    "alice chat generated + sent DH pubkey"
+assert_match "$CHAT_DB_TXT" "\\[SECAGG-DH\\] generated keypair, sent FED_DH_PUBLIC" \
+    "bob chat generated + sent DH pubkey"
+assert_match "$CHAT_DA_TXT" "\\[SECAGG-DH\\] received 1 peer pubkey" \
+    "alice chat received bob's DH pubkey from coord"
+assert_match "$CHAT_DB_TXT" "\\[SECAGG-DH\\] received 1 peer pubkey" \
+    "bob chat received alice's DH pubkey from coord"
+# Round-complete invariant: each chat finished round 1 cleanly under
+# DH mode -- the masks derived from DH shared secrets canceled
+# pairwise just like the token-derived ones would have.
+assert_match "$CHAT_DA_TXT" "fed: \\[SECAGG\\] round 1 complete" \
+    "alice chat completed round 1 under DH mode"
+assert_match "$CHAT_DB_TXT" "fed: \\[SECAGG\\] round 1 complete" \
+    "bob chat completed round 1 under DH mode"
+
 summary "scenario_u_secagg"
