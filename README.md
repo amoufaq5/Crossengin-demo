@@ -18,11 +18,17 @@ computational units rather than orchestrating a pipeline of modules.
 > `CE_AUDIO_CAPTURE_CMD=auto` sentinel,
 > +1 from `io/transducers/jpeg_decode.nova` added in P3.1.JPEG minimum-viable
 > JPEG modality -- structural-half pure-NOVA parser (segment markers + DQT +
-> SOF0 + DHT tables), with `jpeg_decode_grayscale` returning the dimensions +
-> a documented "entropy decode + IDCT not yet implemented" diagnostic so
-> the `/see` perception path can surface real JPEG dimensions without
-> crashing; the entropy + IDCT pipeline remains a 3-4-week follow-up
-> documented in [`JPEG_AUDIT.md`](./JPEG_AUDIT.md),
+> SOF0 + DHT tables); **P3.1.JPEG cont. this session: entropy decode + IDCT
+> pipeline shipped** -- canonical Huffman build (T.81 Annex C) + MSB-first
+> bit reader with 0xFF 0x00 byte-stuffing + DC differential / AC RLE
+> decoder + dequant + un-zig-zag + separable 8x8 integer IDCT (10-bit
+> fixed-point cosine table) + MCU block assembly, all wired into
+> `_jpeg_decode_scan`. `jpeg_decode_grayscale(path)` now returns real
+> pixel data for baseline-sequential 8-bit single-component JPEGs up to
+> 512x512; pixel values match libjpeg/Pillow within +/-3. The visual
+> seam (`_vp_decode_jpeg`) feeds decoded buffers through the same
+> `vp_features_for_image` surface PGM/PNG use. See
+> [`JPEG_AUDIT.md`](./JPEG_AUDIT.md) for the full pipeline notes;
 > +1 from `safety/bignum.nova`
 > added in P3.9 pure-NOVA 256-bit unsigned bignum library -- the DH
 > key-exchange prerequisite the federated SecAgg MVP could not ship
@@ -106,14 +112,16 @@ computational units rather than orchestrating a pipeline of modules.
 > `bin/crossengin-fed-coordinator` daemon, documented in
 > [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 137 unit-test suites pass
 > (`make test`,
-> +1 suite / +54 assertions from `test_jpeg_decode.nova` added in
-> P3.1.JPEG minimum-viable JPEG modality: in-memory baseline-grayscale
-> fixture builder; segment iteration walks SOI/APP0/DQT/SOF0/DHT/SOS/EOI;
-> DQT parser extracts the 64 quant-table entries; SOF0 parser surfaces
-> dimensions + components; DHT parser extracts BITS + HUFFVAL;
-> jpeg_decode_grayscale_bytes returns the dimensions + the documented
-> "entropy decode TODO" gap message; rejects oversized dims (> 1024),
-> SOF2 (progressive), and bad SOI; documented in
+> +1 suite / +87 assertions from `test_jpeg_decode.nova` covering
+> P3.1.JPEG structural parser + P3.1.JPEG cont. entropy decode + IDCT
+> pipeline: in-memory baseline-grayscale fixture builder; segment
+> iteration walks SOI/APP0/DQT/SOF0/DHT/SOS/EOI; DQT/SOF0/DHT parsing;
+> canonical Huffman table build + bit reader; 8x8 IDCT (all-zero block
+> -> 128 everywhere, DC-only block -> uniform value); dequant + un-zig-zag
+> round-trip; end-to-end `jpeg_decode_grayscale_bytes` on a synthetic
+> 16x16 stream; real-Pillow first-pixel match within +/-3 of libjpeg;
+> rejects oversized dims (> 512 decode cap, > 1024 structural), SOF2
+> (progressive), and bad SOI; documented in
 > [`JPEG_AUDIT.md`](./JPEG_AUDIT.md),
 > +1 suite / +46 assertions from `test_deflate.nova` added in
 > P3.1.PNG full DEFLATE inflate -- extends the Item-3 stored-only

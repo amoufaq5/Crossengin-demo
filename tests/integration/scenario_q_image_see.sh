@@ -33,9 +33,10 @@ FLAT="/tmp/ce_scenario_q_flat.pgm"
 BAD="/tmp/ce_scenario_q_bad.bin"
 EDGE="/tmp/ce_scenario_q_edge.pgm"
 SPOTS="/tmp/ce_scenario_q_spots.pgm"
+JPG="/tmp/ce_scenario_q_pillow.jpg"
 
 # Cleanup any stale fixture files from a previous run.
-rm -f "$FIX" "$FLAT" "$BAD" "$EDGE" "$SPOTS"
+rm -f "$FIX" "$FLAT" "$BAD" "$EDGE" "$SPOTS" "$JPG"
 
 # Build the 4x4 gradient: pixels 0, 16, 32, ..., 240 (mean = 120).
 # Header: P5\n4 4\n255\n  (11 bytes)
@@ -94,6 +95,26 @@ sys.stdout.buffer.write(bytes(buf))
 }
 build_four_spots_pgm "$SPOTS"
 
+# Build a 32x32 JPEG fixture via Pillow (or hand-rolled fallback) so the
+# scenario exercises the full entropy decode + IDCT pipeline (P3.1.JPEG
+# cont.). The JPEG fixture is a 32x32 grayscale gradient; gen_test_jpeg.py
+# falls back to a hand-rolled minimal JPEG when Pillow is absent (in which
+# case the entropy data isn't real -- the decoder will surface "missing AC
+# Huffman table" rather than producing pixels). The shell test below
+# tolerates BOTH outcomes so the scenario stays green in either env.
+JPEG_AVAILABLE=0
+if python3 "$REPO_ROOT/scripts/gen_test_jpeg.py" 32 32 "$JPG" >/dev/null 2>&1; then
+    if [ -s "$JPG" ]; then
+        JPEG_AVAILABLE=1
+        # Detect Pillow vs hand-rolled by output line content.
+        if python3 -c "from PIL import Image" 2>/dev/null; then
+            JPEG_PILLOW=1
+        else
+            JPEG_PILLOW=0
+        fi
+    fi
+fi
+
 if [ ! -s "$FIX" ]; then
     printf "  ${C_RED}FAIL${C_RST}  fixture %s did not get written\n" "$FIX"
     FAIL=$((FAIL+1))
@@ -108,6 +129,9 @@ INPUT=$(
     printf '/see %s\n' "$FLAT"
     printf '/see %s\n' "$EDGE"
     printf '/see %s\n' "$SPOTS"
+    if [ "$JPEG_AVAILABLE" -eq 1 ]; then
+        printf '/see %s\n' "$JPG"
+    fi
     printf '/see %s\n' "$BAD"
     printf '/quit\n'
 )
@@ -195,7 +219,33 @@ assert_match "$OUT" "saw image $SPOTS \[32x32" \
 assert_match "$OUT" "features:.*image_keypoint_count_low" \
     "/see surfaces image_keypoint_count_low on 32x32 four-spots fixture"
 
+# ---- P3.1.JPEG cont. entropy decode + IDCT on Pillow-generated JPEG -------
+
+if [ "$JPEG_AVAILABLE" -eq 1 ]; then
+    # 18. /see on the JPEG prints the dimensions in the summary line.
+    # The summary format is "saw image PATH [WxH mean=..." for both PGM
+    # and JPEG when decode succeeds; for header-only failure (hand-rolled
+    # fallback) it's "(saw image PATH ... FAILED ...)".
+    if [ "$JPEG_PILLOW" -eq 1 ]; then
+        # Pillow path: real entropy decode + IDCT runs, pixel data flows
+        # into the same feature pipeline as PGM/PNG. The 32x32 gradient
+        # produces image_dim_small (32*32=1024 < 4096 threshold).
+        assert_match "$OUT" "saw image $JPG \[32x32 mean=" \
+            "/see prints dims + mean on 32x32 Pillow JPEG"
+        assert_match "$OUT" "features:.*image_dim_small" \
+            "/see features contain image_dim_small for 32x32 JPEG"
+    else
+        # Hand-rolled fallback path: decode reaches "missing AC Huffman"
+        # because the fixture only has a DC header. The seam still
+        # surfaces the dimensions + jpeg_header_only atom.
+        assert_match "$OUT" "saw image $JPG" \
+            "/see acknowledges JPEG path even on hand-rolled fixture"
+        assert_match "$OUT" "features:.*image_jpeg_header_only" \
+            "/see surfaces image_jpeg_header_only on hand-rolled fallback"
+    fi
+fi
+
 # Cleanup.
-rm -f "$FIX" "$FLAT" "$BAD" "$EDGE" "$SPOTS"
+rm -f "$FIX" "$FLAT" "$BAD" "$EDGE" "$SPOTS" "$JPG"
 
 summary "scenario_q_image_see"

@@ -1,16 +1,18 @@
 # JPEG_AUDIT — what a pure-NOVA JPEG decoder would take
 
-Status: **structural half landed (P3.1.JPEG); entropy decode + IDCT
-deferred ~3-4 weeks.** This document mirrors `IMAGE_AUDIT.md` /
-`STT_AUDIT.md` / `VIDEO_AUDIT.md` -- the realistic path, not a promise.
-The first plank lands in this session: a pure-NOVA segment-marker
-parser + DQT / SOF0 / DHT table extractor in
-`src/io/transducers/jpeg_decode.nova`. The dispatch hook in
+Status: **grayscale baseline END-TO-END DECODE LANDED (P3.1.JPEG cont.).**
+The structural half (segment markers + DQT + SOF0 + DHT) landed first;
+the entropy decode + IDCT pipeline followed in the same module. Today
+`jpeg_decode_grayscale(path)` returns real pixel data for any
+baseline-sequential 8-bit single-component JPEG with dimensions up to
+512x512. Pixel values match libjpeg (Pillow) within +/-3 due to the
+slight precision difference between our 10-bit fixed-point IDCT and
+Pillow's floating-point reference. The dispatch hook in
 `src/io/transducers/visual_perception.nova` routes `*.jpg` / `*.jpeg`
-paths to the JPEG backend; the dimensions surface to the operator and
-the perception path receives an `image_jpeg_header_only` atom + the
-size bucket. Pixel-level decoding is the next 3-4 weeks of work
-documented below.
+paths to the JPEG backend and -- when decode succeeds -- feeds the
+resulting pixel buffer through the same `vp_features_for_image` pipeline
+that PGM and PNG use. Color (YCbCr) + chroma subsampling are still
+deferred per the table below.
 
 ## Why baseline grayscale is the right MVP target
 
@@ -68,14 +70,38 @@ the framework right; color is an incremental layer.
   can carry multiple Huffman tables. `length_counts` is the 16-element
   BITS array (codes of each length 1..16); `symbols` is the HUFFVAL
   list (length = sum of BITS).
-- **`jpeg_decode_grayscale(path) -> [width, height, "", error_msg]`** --
+- **`jpeg_decode_grayscale(path) -> [width, height, pixel_data_ptr, error_msg]`** --
   Opens the file, validates SOI, walks segments, finds SOF0, validates
-  the JPEG is baseline grayscale, and returns the dimensions WITHOUT
-  decoding pixels. The error_msg slot carries the documented
-  "entropy decode + IDCT not yet implemented; see JPEG_AUDIT.md" string
-  with the parsed dimensions embedded, so the perception path can
-  still surface the width / height and a clear "feature is coming"
-  message.
+  the JPEG is baseline grayscale, builds canonical DC + AC Huffman
+  tables from BITS+HUFFVAL, runs the entropy + IDCT pipeline block by
+  block, and returns an alloc'd `width*height` byte buffer of decoded
+  grayscale samples. On unsupported variants or decode failure, the
+  error_msg slot carries a clear diagnostic and pixel_data_ptr is the
+  sentinel 0.
+- **Pipeline internals (per ITU-T T.81 Annex F):**
+  - `_jpeg_bitreader_new(...)` -- MSB-first bit reader with 0xFF 0x00
+    byte stuffing per B.1.1.5; stashes an inline marker (e.g. EOI) when
+    encountered so the caller knows the entropy stream ended cleanly.
+  - `_jpeg_build_huffman(bits, huffval)` -- canonical Huffman table
+    builder per Annex C (mincode / maxcode / valptr / huffval).
+  - `_jpeg_br_decode_huffman(br, tbl)` -- one symbol per call, accumulating
+    `code` MSB-first until `code <= maxcode[L]`.
+  - `_jpeg_extend(v, s)` -- T.81 Figure F.12 sign-extend for SSSS-bit
+    magnitudes.
+  - `_jpeg_decode_block(br, dc, ac, prev_dc)` -- decode one 8x8 block in
+    zig-zag order: DC differential, AC RLE with EOB/ZRL markers.
+  - `_jpeg_dequant_and_unzigzag(zz, qt)` -- multiply zig-zag coefficients
+    by the quant table and place them in row-major natural order via
+    the standard zig-zag-to-natural index map (T.81 Figure A.6).
+  - `_jpeg_idct_2d(block)` -- separable 8x8 IDCT using 10-bit fixed-point
+    cosine coefficients (table cached on first use). Each 1-D pass does
+    64 int_mul + int_add accumulations; divisions use the Bug-A int_*
+    builtins so intermediate ~2^28 products stay in the pointer-safe
+    regime. Level-shift (+128) and 0..255 clamp applied in the final pass.
+  - `_jpeg_decode_scan(br, w, h, dc, ac, qt, pixels)` -- walks MCU rows
+    left-to-right, top-to-bottom, decodes each block, and writes the
+    8x8 sample tile at (bx*8, by*8) in the output buffer. Trailing
+    partial blocks are decoded fully and clipped to the image dims.
 
 `scripts/gen_test_jpeg.py`:
 - If Pillow is installed: encodes a deterministic 16x16 grayscale
@@ -92,25 +118,31 @@ the framework right; color is an incremental layer.
   `vp_seam_new()`.
 - `vp_default_decoder()` accepts `CE_VP_DECODER=jpeg` (or `=jpg`) and
   returns the JPEG constant.
-- `_vp_decode_jpeg(seam, path)` calls `jpeg_decode_grayscale`,
-  emits the `image_jpeg_header_only` + dimension-bucket feature atoms,
-  surfaces the gap diagnostic in `vp_result_error`, and writes the
-  operator-readable summary "image: jpeg WxH header parsed (pixel
-  decode pending; see JPEG_AUDIT.md)" to `vp_seam_last_summary`.
+- `_vp_decode_jpeg(seam, path)` calls `jpeg_decode_grayscale`; on
+  success (pixel buffer returned), feeds the buffer through the SAME
+  `vp_features_for_image` + `vp_summary_for_image` surface PGM and
+  PNG use (so the perception path emits the standard size / mean /
+  bucket / orientation / edge / corner / SIFT atoms). On failure
+  (color JPEG, oversized dims, missing tables, malformed entropy data),
+  emits `image_jpeg_header_only` + the dimension bucket and surfaces
+  the diagnostic via `vp_result_error` so the chat's "(saw image ...
+  FAILED ...)" branch fires.
 - `.jpg` / `.jpeg` path-extension routing dispatches to the JPEG
   decoder even when the seam's default is PGM.
 
-## What this session does NOT ship (the next 3-4 weeks)
+## What landed in this session (entropy decode + IDCT pipeline)
 
-The decode pipeline downstream of the header parse:
+The previously-deferred decode pipeline downstream of the header parse:
 
-| Step                            | Effort     | What it does |
-|---------------------------------|------------|--------------|
-| Huffman entropy decoder         | ~1 week    | Build canonical Huffman trees from BITS+HUFFVAL; bit-level reader; resolve DC differential coding + AC RLE/EOB markers. |
-| De-quantize + inverse zig-zag   | ~3 days    | Multiply each of 64 coefficients by the corresponding quant-table entry; un-zig-zag from JPEG's serpentine scan order to the 8x8 row-major layout. |
-| 8x8 IDCT (inverse DCT)          | ~1 week    | Apply the 64-coefficient inverse DCT to each 8x8 block. The classic AAN (Arai-Agui-Nakajima) factorization needs only 5 multiplies per 1-D pass, 64 multiplies total per block. Fixed-point milli-arithmetic. |
-| Block-row assembly              | ~3 days    | Walk MCU rows, decode 8x8 blocks in the SOS-declared component order, level-shift (+128), clamp to 0..255, write into the output pixel buffer. |
-| **Subtotal grayscale baseline** | **~3-4 wk**| End-to-end pure-NOVA decoder for the format the MVP targets. |
+| Step                            | Status     | Where it lives |
+|---------------------------------|------------|----------------|
+| Huffman entropy decoder         | **shipped**| `_jpeg_build_huffman` + `_jpeg_br_decode_huffman` + `_jpeg_extend`; canonical T.81 Annex C codes; MSB-first bit reader with 0xFF 0x00 byte-stuff handling. |
+| De-quantize + inverse zig-zag   | **shipped**| `_jpeg_dequant_and_unzigzag`; uses the standard zig-zag table cached on first call; int_mul keeps the multiplies on the pointer-safe fast path. |
+| 8x8 IDCT (inverse DCT)          | **shipped**| `_jpeg_idct_2d` + `_jpeg_idct_1d`; separable integer IDCT with a 10-bit fixed-point cosine table. ~8 multiplies per output sample per 1-D pass = 128 multiplies per block. |
+| Block-row assembly              | **shipped**| `_jpeg_decode_scan`; walks MCU rows left-to-right, top-to-bottom; level-shift (+128) and clamp baked into `_jpeg_idct_2d`. Trailing partial blocks are decoded and clipped. |
+| **Subtotal grayscale baseline** | **shipped**| End-to-end pure-NOVA decoder; `jpeg_decode_grayscale("/path.jpg")` returns real pixel data. |
+
+## What this session does NOT ship
 
 Beyond grayscale baseline:
 
@@ -139,13 +171,25 @@ The structural parser implements:
 - **Annex B.1.1.4** -- 0xFF 0x00 byte stuffing within entropy data
   (relevant only when the entropy decoder lands).
 
-The deferred entropy + IDCT pipeline would implement:
+The entropy + IDCT pipeline (P3.1.JPEG cont., this session) implements:
 - **Annex F** "Sequential DCT-based mode of operation" -- block-by-block
-  Huffman decoding + de-quantization + IDCT + level-shift.
+  Huffman decoding + de-quantization + IDCT + level-shift. Realised in
+  `_jpeg_decode_scan` + `_jpeg_decode_block` + `_jpeg_dequant_and_unzigzag`
+  + `_jpeg_idct_2d`.
 - **Annex F.2.2** -- Huffman decoding (canonical table construction +
-  DC differential + AC zero-run-length).
-- **Annex A.3.3** -- Inverse DCT mathematical definition (the AAN
-  factorization is recommended for fixed-point implementations).
+  DC differential + AC zero-run-length). Table build in
+  `_jpeg_build_huffman` (Annex C); per-symbol decode in
+  `_jpeg_br_decode_huffman`; sign-extend in `_jpeg_extend`.
+- **Annex A.3.3** -- Inverse DCT mathematical definition. We use a
+  separable integer IDCT with a 10-bit fixed-point cosine table (see
+  `_jpeg_idct_cos_table`) rather than AAN proper, because the cosine-
+  matrix form is simpler to read and the multiply count per block
+  (128) is still well under NOVA's per-image arithmetic budget for the
+  512x512 dimension cap.
+- **Annex B.1.1.5** -- 0xFF 0x00 byte stuffing within entropy data.
+  Handled transparently by `_jpeg_br_refill_byte`; any other 0xFF nn
+  pair is treated as an embedded marker, stashed in `JPEG_BR_MARKER`,
+  and the bit-reader stops refilling.
 
 ## NOVA gotchas worked around in P3.1.JPEG
 
@@ -174,20 +218,32 @@ The deferred entropy + IDCT pipeline would implement:
 
 ## Cross-references
 
-* `src/io/transducers/jpeg_decode.nova` -- the structural parser
-  (segments + DQT + SOF0 + DHT) and the entry-point stub for the
-  full grayscale decoder.
+* `src/io/transducers/jpeg_decode.nova` -- structural parser
+  (segments + DQT + SOF0 + DHT) AND the entropy decode + IDCT
+  pipeline (Huffman + dequant + un-zig-zag + 8x8 IDCT + block
+  assembly).
 * `src/io/transducers/visual_perception.nova` -- dispatches `.jpg` /
-  `.jpeg` paths to the JPEG decoder via `VP_DECODER_JPEG`.
-* `tests/unit/test_jpeg_decode.nova` -- 54 in-memory assertions
+  `.jpeg` paths to the JPEG decoder via `VP_DECODER_JPEG`; on
+  decode success feeds pixel data through the standard
+  `vp_features_for_image` pipeline.
+* `tests/unit/test_jpeg_decode.nova` -- 87 in-memory assertions
   covering segment iteration, DQT / SOF0 / DHT parsing, the
-  oversized-dimension rejection, and the documented-gap error
-  message.
+  oversized-dimension rejection, the canonical Huffman build, the
+  bit reader with byte-stuffing, the 8x8 IDCT (all-zero block,
+  DC-only block), the dequant + un-zig-zag round-trip, the end-to-end
+  `jpeg_decode_grayscale_bytes` on a synthetic stream, and the
+  real-Pillow first-pixel match (within +/-3 of libjpeg).
 * `scripts/gen_test_jpeg.py` -- Pillow-based JPEG fixture generator
-  with a hand-rolled fallback for sandboxes without Pillow.
-* `IMAGE_AUDIT.md` -- broader image-modality audit; lists JPEG as
-  the most-wanted format and estimates the full decoder at 6-8
-  weeks (the structural half landed here is ~10% of that estimate).
+  with a hand-rolled fallback for sandboxes without Pillow; also
+  exposes a `reference_decode_first_pixel(jpeg_bytes)` helper used
+  by integration smokes that want a libjpeg ground-truth comparison.
+* `tests/integration/scenario_q_image_see.sh` -- `/see` scenario now
+  includes a 32x32 Pillow-generated JPEG fixture and verifies the
+  chat surfaces the expected dimensions + feature atoms (matching
+  the equivalent PGM fixture's labels modulo JPEG's lossy smoothing).
+* `IMAGE_AUDIT.md` -- broader image-modality audit; with grayscale
+  baseline shipped, the remaining JPEG work (color + chroma) is
+  ~1-2 weeks rather than the 6-8 originally estimated.
 * `tests/unit/test_png_decode.nova` -- sibling structural parser
   that landed in P3.1.PNG; same shape (in-memory fixtures, parser-
   surface assertions, hand-rolled malformed inputs).

@@ -17,6 +17,64 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- **P3.1.JPEG cont. (this session) entropy decode + IDCT pipeline**:
+  **complete -- grayscale baseline END-TO-END DECODE LANDED**. The
+  structural half (segments + DQT + SOF0 + DHT) landed in the original
+  P3.1.JPEG session; this session ships the remaining ~3-4 weeks of
+  work: Huffman entropy decode + dequant + un-zig-zag + 8x8 IDCT +
+  block assembly. `jpeg_decode_grayscale("/path.jpg")` now returns
+  REAL PIXEL DATA for baseline-sequential 8-bit single-component JPEGs
+  up to 512x512 (decode-time dimension cap, distinct from the 1024x1024
+  structural cap). On a Pillow-encoded 8x8 grayscale gradient the
+  first pixel is `0` (matches libjpeg's `0` exactly); the rest of the
+  block matches libjpeg within +/-3 per pixel. Module shape unchanged
+  (`jpeg_decode.nova` extended in place, no new module). New surfaces
+  inside `jpeg_decode.nova`:
+  - `_jpeg_bitreader_new` / `_jpeg_br_refill_byte` / `_jpeg_br_read_bits`
+    -- MSB-first bit reader with 0xFF 0x00 byte-stuffing (T.81 B.1.1.5).
+  - `_jpeg_build_huffman` -- canonical Huffman codes per T.81 Annex C.
+  - `_jpeg_br_decode_huffman` -- per-symbol decode walking lengths
+    1..16 with mincode/maxcode/valptr table layout.
+  - `_jpeg_extend` -- T.81 Figure F.12 SSSS-bit sign-extend.
+  - `_jpeg_decode_block` -- one 8x8 block in zig-zag order: DC
+    differential + AC RLE with EOB / ZRL markers.
+  - `_jpeg_zigzag_table` -- standard JPEG zig-zag-to-natural index
+    map (cached on first use).
+  - `_jpeg_dequant_and_unzigzag` -- multiply by quant table, place
+    into row-major natural order via the cached zig-zag map.
+  - `_jpeg_idct_cos_table` + `_jpeg_idct_1d` + `_jpeg_idct_2d` --
+    separable 8-point IDCT with a 10-bit fixed-point cosine table;
+    int_mul throughout (per-output ~2^24 accumulator stays in the
+    pointer-safe regime); divides by 1024 between passes with rounding;
+    level-shift (+128) and 0..255 clamp baked into the final pass.
+  - `_jpeg_decode_scan` -- MCU loop. For grayscale baseline each MCU
+    is one 8x8 block; walks left-to-right then top-to-bottom,
+    decodes/dequantizes/IDCTs/writes each block at (bx*8, by*8) with
+    trailing partial-block clipping.
+  - `_jpeg_find_huffman_table` / `_jpeg_find_quant_table` /
+    `_jpeg_parse_sos` -- table lookup + SOS payload parser; pulls
+    the (Td, Ta) DC/AC table ids from SOS and the quantization table
+    id from the SOF0 component descriptor.
+  Pipeline entry point (`jpeg_decode_grayscale_bytes`): rewritten to
+  walk SOI -> SOF0 -> SOS, resolve DC + AC Huffman tables and the
+  quant table, then call `_jpeg_decode_scan`. On success returns
+  `[width, height, pixel_data_ptr, ""]`; on failure (color image,
+  oversized dims, missing tables, malformed entropy data) returns
+  `[width, height, 0, error_msg]` with the dimensions surfaced so the
+  perception path can still report them.
+  `_vp_decode_jpeg` in `visual_perception.nova`: on decode success
+  feeds the buffer through the same `vp_features_for_image` +
+  `vp_summary_for_image` surfaces PGM and PNG use; on failure emits
+  `image_jpeg_header_only` + dim bucket and the diagnostic.
+  Acceptance: 87 in-memory assertions in `tests/unit/test_jpeg_decode.nova`
+  (+33 from the original 54) all pass; `make build` still reports 130
+  modules; `make test` adds 0 suites and 33 assertions; scenario_q
+  extended to include a Pillow JPEG fixture (+2 assertions, 17 -> 19);
+  `/see /tmp/test.jpg` and `/see /tmp/test.pgm` on an equivalent 32x32
+  fixture produce the same dim/mid/bucket/orient/corner/keypoint
+  feature labels (entropy label differs slightly due to JPEG's
+  smoothing). JPEG_AUDIT.md updated: the "deferred ~3-4 weeks" entropy
+  + IDCT block moved to "shipped this session".
 - P-AA + P-BB web-side cognition introspection: **complete**.
   - **P-AA `/api/atoms` + `/atoms` HTML**: new GET endpoint
     `/api/atoms?q=<substring>&limit=N&kg=<label>` returns

@@ -83,6 +83,34 @@ def gradient_pixels(width: int, height: int) -> bytes:
     return bytes(out)
 
 
+def uniform_pixels(width: int, height: int, value: int) -> bytes:
+    """
+    All-uniform pixel buffer. Useful for IDCT round-trip tests: a uniform
+    image encodes to mostly-DC coefficients and decodes back to (very nearly)
+    the same uniform value. After P3.1.JPEG cont. (entropy + IDCT) this
+    fixture exercises the DC-only IDCT path end-to-end.
+    """
+    return bytes([value & 0xFF] * (width * height))
+
+
+def reference_decode_first_pixel(jpeg_bytes: bytes) -> int:
+    """
+    Decode the first pixel of a JPEG via Pillow (if available) so the
+    pure-NOVA decoder's first-pixel value can be compared against a real
+    libjpeg reference. Returns the pixel intensity (0..255), or -1 if
+    Pillow is unavailable.
+    """
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(jpeg_bytes))
+        if img.mode != "L":
+            img = img.convert("L")
+        return img.getpixel((0, 0))
+    except ImportError:
+        return -1
+
+
 def try_pillow_jpeg(width: int, height: int, pixels: bytes) -> bytes:
     """
     Encode a grayscale JPEG via Pillow. Returns the JPEG bytes, or raises
