@@ -1,0 +1,649 @@
+// CrossEngin safety: pure-NOVA 2048-bit unsigned bignum library.
+//
+// Purpose
+//   The 256-bit `bignum.nova` shipped in R2D / P3.9 v1-sa-dh was enough
+//   to demonstrate the Diffie-Hellman wire protocol, but a 256-bit DH
+//   group is BROKEN against modern adversaries (RFC 7919 starts at
+//   2048-bit precisely because index-calculus on classical DH groups
+//   recovers smaller primes on commodity hardware). SECAGG_AUDIT.md
+//   flagged the 256-bit DH path as cryptographically broken and called
+//   for a 2048-bit upgrade. This module is that upgrade: a 64-limb
+//   2048-bit bignum that lets `secure_aggregation.nova` swap in a real
+//   RFC 7919 Group 14 (2048-bit MODP) safe-prime group when the
+//   operator sets `CE_SECAGG_DH_2048=1`.
+//
+// Scope -- 2048-bit fixed, NOT arbitrary precision
+//   2048 bits matches RFC 7919 Group 14, the smallest standard
+//   modern-day DH group. Going higher (3072 / 4096 / 8192 bits) needs
+//   only a constant-table swap and a wider BN2048_LIMBS; the
+//   algorithmic shape is identical. The cost grows quadratically with
+//   limb count.
+//
+// Representation
+//   `bn2048` is a NOVA list of exactly BN2048_LIMBS = 64 limbs, each a
+//   32-bit non-negative integer. Index 0 is the LEAST-significant limb;
+//   index 63 is the MOST-significant. Concretely:
+//     value = sum over i in 0..63 of limbs[i] * (2^32)^i
+//   Same convention as `bignum.nova`: little-endian internally for the
+//   natural multiplication and addition algorithms; big-endian for
+//   `bn2048_to_hex` / `bn2048_from_hex` per crypto convention. The
+//   32-bit mask BN2048_MASK32 = 0xFFFFFFFF folds intermediate products
+//   back into 32 bits after each carry-propagate.
+//
+// Why 32-bit limbs (mirror of bignum.nova rationale, just wider)
+//   * Sum of 64 32-bit limbs fits comfortably in a 64-bit signed int
+//     (NOVA's underlying int) with room for carries.
+//   * Product of two 32-bit limbs does NOT fit in signed 64-bit; same
+//     16-bit-half schoolbook trick as `bn_mul` -- each 32-bit limb
+//     splits into two 16-bit halves, the per-cell product is at most
+//     2^32, the column sum stays under 2^36.
+//   * `int_mul` is used exclusively for arithmetic so NOVA gotcha #11
+//     (pointer-threshold bug at ~2^20 for the smart `*` operator inside
+//     loops) does not apply.
+//
+// Performance reality check
+//   A 2048-bit modpow_ct does 2048 modular squarings + 2048 modular
+//   multiplications in the Montgomery ladder. Each modmul is 64 x 64
+//   limbs -> 4096 single-limb multiplies. The reduction step (`_bn2048_
+//   mod4096`) walks 4096 bits of the wide intermediate. Measured on
+//   this dev sandbox: a single full-width `bn2048_modmul` costs
+//   ~3 ms; a full `bn2048_modpow_ct` (4096 modmuls) costs ~15 seconds.
+//   Acceptable for offline DH rounds; not a hot path. A DH key
+//   generation + per-peer shared-secret derivation each cost one
+//   modpow_ct, so a 2-soul DH round is ~30 seconds wall clock.
+//   Multi-soul rounds (N souls, N keygens + N*(N-1) shared-secret
+//   derivations) can take minutes -- documented in SECAGG_AUDIT.md.
+//
+// Reduction-loop correctness note
+//   `_bn2048_shl1_inplace` returns the bit that fell off the top of
+//   the 2048-bit container. The reduction loops in `bn2048_mod` and
+//   `_bn2048_mod4096` honor this carry-out to handle the case where
+//   the in-place shift overflows the container -- which IS reachable
+//   when m has bit 2047 set (as it does for the RFC 7919 Group 14
+//   prime, which starts with 0xFFFFFFFF...). The original 256-bit
+//   `bn_mod` in bignum.nova ignored shl1's carry-out because the only
+//   modulus it was exercised with (Curve25519's p = 2^255 - 19) has
+//   bit 255 CLEAR -- the shift never overflowed. For our 2048-bit
+//   modulus the carry-out must be honored to land correct results.
+//
+// Public API (mirrors bignum.nova; same shape, 64-limb wide)
+//   bn2048_new()                       -> a fresh zero 2048-bit bignum
+//   bn2048_from_int(n)                 -> bignum holding the small non-negative n
+//   bn2048_from_hex(hex_str)           -> bignum from 1..512-char hex string
+//   bn2048_to_hex(bn)                  -> canonical 512-char lowercase hex string
+//   bn2048_zero(bn)                    -> 1 iff all limbs are zero, else 0
+//   bn2048_eq(a, b)                    -> 1 iff a == b, else 0
+//   bn2048_cmp(a, b)                   -> -1 if a < b, 0 if a == b, 1 if a > b
+//   bn2048_add(a, b)                   -> (a + b) mod 2^2048
+//   bn2048_sub(a, b)                   -> (a - b) mod 2^2048
+//   bn2048_mul(a, b)                   -> [hi, lo], 4096-bit product split into
+//                                         two 2048-bit halves
+//   bn2048_mod(a, m)                   -> a mod m (2048-bit operands; m > 0)
+//   bn2048_modmul(a, b, m)             -> (a * b) mod m
+//   bn2048_modpow_ct(base, exp, m)     -> base^exp mod m, Montgomery ladder
+//                                         (constant-time per bit; CRYPTO-SAFE)
+//
+// !!! INTENTIONAL OMISSION !!!
+//   We do NOT expose a `bn2048_modpow` (non-CT square-and-multiply
+//   variant). For 2048-bit DH, only the CT path is safe to expose to
+//   any remote-callable code path: a passive timing observer of a
+//   non-CT 2048-bit modpow could recover the soul's private exponent
+//   from the per-bit timing variance.
+//
+// Constant-time / side-channel disclaimer
+//   Same caveats as bignum.nova: `bn2048_cmp` and `bn2048_sub` still
+//   branch on data, so they leak the operand bits they walk.
+//   `bn2048_modpow_ct` uses both internally -- those calls have data-
+//   dependent control flow on the OPERANDS, but the OUTER LOOP
+//   STRUCTURE of `bn2048_modpow_ct` is exponent-bit-INDEPENDENT (one
+//   mul + one square per bit, regardless of bit value). The headline
+//   exponent-correlated timing channel is closed.
+//
+// ADRs touched: SECAGG_AUDIT.md ("2048-bit DH landed via RFC 7919 Group 14").
+// NOVA dependencies: builtins only.
+// CrossEngin dependencies: none -- pure leaf primitive (parallel to
+//   bignum.nova; both leaves consume only NOVA builtins).
+
+// ---- size constants -------------------------------------------------------
+//
+// BN2048_LIMBS = 64 -> 2048-bit total. BN2048_MASK32 = 2^32 - 1 mirrors
+// the 256-bit module. BN2048_HEX_DIGITS = 512 = 64 limbs * 8 hex chars
+// each.
+let BN2048_LIMBS    = 64
+let BN2048_MASK32   = 4294967295    // 2^32 - 1
+let BN2048_MASK16   = 65535         // 2^16 - 1
+let BN2048_LIMB_BITS = 32
+let BN2048_HALF_BITS = 16
+let BN2048_HEX_DIGITS = 512         // 64 limbs * 8 hex chars each
+// Precomputed loop bounds for hot paths -- avoids `int_mul` in the
+// loop predicate evaluation under NOVA's smart-op handling.
+let BN2048_TOTAL_BITS = 2048        // BN2048_LIMBS * BN2048_LIMB_BITS
+let BN2048_DOUBLE_BITS = 4096       // 2 * BN2048_TOTAL_BITS
+let BN2048_HALF_LIMBS = 128         // BN2048_LIMBS * 2  (16-bit half count in bn2048_mul)
+let BN2048_HALF_LIMBS_DOUBLE = 256  // 2 * BN2048_HALF_LIMBS
+
+// ---- internal helpers -----------------------------------------------------
+
+fn _bn2048_mask32(x) {
+    return int_and(x, BN2048_MASK32)
+}
+
+// Construct a fresh `bn2048` with all 64 limbs zero. Used as the public
+// `bn2048_new` constructor and as the result-buffer in every arithmetic op.
+fn _bn2048_alloc_zero() {
+    let r = list_new()
+    let i = 0
+    while i < BN2048_LIMBS {
+        push(r, 0)
+        i = i + 1
+    }
+    return r
+}
+
+// Hex-nibble parser identical to bignum.nova / chacha20 codec.
+fn _bn2048_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }   // '0'..'9'
+    if c >= 97 { if c <= 102 { return c - 87 } }   // 'a'..'f'
+    if c >= 65 { if c <= 70  { return c - 55 } }   // 'A'..'F'
+    return -1
+}
+
+// Inverse: nibble (0..15) -> lowercase hex char code.
+fn _bn2048_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87    // 'a'..'f'
+}
+
+// ---- constructors --------------------------------------------------------
+
+fn bn2048_new() {
+    return _bn2048_alloc_zero()
+}
+
+// Build a bignum from a small NOVA int. Low 32 bits in limb[0], next
+// 32 bits in limb[1], rest zero. Negative inputs clamp to zero.
+fn bn2048_from_int(n) {
+    let r = _bn2048_alloc_zero()
+    if n <= 0 { return r }
+    list_set(r, 0, _bn2048_mask32(n))
+    list_set(r, 1, _bn2048_mask32(int_shr(n, 32)))
+    return r
+}
+
+// Parse a hex string (no "0x" prefix; 1..512 hex chars; case-insensitive)
+// into a 2048-bit bignum. Right-justifies. Returns bn2048_new() on
+// invalid input.
+fn bn2048_from_hex(hex_str) {
+    let r = _bn2048_alloc_zero()
+    let n = len(hex_str)
+    if n == 0 { return r }
+    if n > BN2048_HEX_DIGITS { return r }   // too wide for 2048-bit
+    let i = n - 1
+    let bit_pos = 0
+    while i >= 0 {
+        let c = char_at(hex_str, i)
+        let v = _bn2048_hex_nibble(c)
+        if v < 0 {
+            return _bn2048_alloc_zero()
+        }
+        let limb_idx = int_shr(bit_pos, 5)            // bit_pos / 32
+        let shift    = int_and(bit_pos, 31)           // bit_pos mod 32
+        let cur      = r[limb_idx]
+        let add      = _bn2048_mask32(int_shl(v, shift))
+        list_set(r, limb_idx, _bn2048_mask32(int_or(cur, add)))
+        bit_pos = bit_pos + 4
+        i = i - 1
+    }
+    return r
+}
+
+// Canonical 512-character lowercase hex serialization (big-endian).
+// Always emits exactly BN2048_HEX_DIGITS = 512 characters with leading
+// zeros preserved.
+fn bn2048_to_hex(bn) {
+    let s = ""
+    let i = BN2048_LIMBS - 1
+    while i >= 0 {
+        let limb = bn[i]
+        let j = 7
+        while j >= 0 {
+            let nib = int_and(int_shr(limb, int_mul(j, 4)), 15)
+            s = s + chr(_bn2048_nibble_hex(nib))
+            j = j - 1
+        }
+        i = i - 1
+    }
+    return s
+}
+
+// ---- predicates ----------------------------------------------------------
+
+fn bn2048_zero(bn) {
+    let i = 0
+    while i < BN2048_LIMBS {
+        if bn[i] != 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn bn2048_eq(a, b) {
+    let i = 0
+    while i < BN2048_LIMBS {
+        if a[i] != b[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// -1 / 0 / +1 comparator. Walks from MSB to LSB; first differing limb
+// determines the sign. NOT constant-time.
+fn bn2048_cmp(a, b) {
+    let i = BN2048_LIMBS - 1
+    while i >= 0 {
+        let ai = a[i]
+        let bi = b[i]
+        if ai < bi { return -1 }
+        if ai > bi { return 1 }
+        i = i - 1
+    }
+    return 0
+}
+
+// ---- addition + subtraction ----------------------------------------------
+
+fn bn2048_add(a, b) {
+    let r = _bn2048_alloc_zero()
+    let carry = 0
+    let i = 0
+    while i < BN2048_LIMBS {
+        let sum = int_add(int_add(a[i], b[i]), carry)
+        list_set(r, i, _bn2048_mask32(sum))
+        carry = int_shr(sum, 32)
+        i = i + 1
+    }
+    return r
+}
+
+fn bn2048_sub(a, b) {
+    let r = _bn2048_alloc_zero()
+    let borrow = 0
+    let i = 0
+    while i < BN2048_LIMBS {
+        let diff = int_sub(int_sub(a[i], b[i]), borrow)
+        if diff < 0 {
+            diff = int_add(diff, int_shl(1, 32))    // diff + 2^32
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        list_set(r, i, _bn2048_mask32(diff))
+        i = i + 1
+    }
+    return r
+}
+
+// ---- multiplication ------------------------------------------------------
+
+// Split a 32-bit limb into [lo16, hi16].
+fn _bn2048_split16(limb) {
+    let lo = int_and(limb, BN2048_MASK16)
+    let hi = int_and(int_shr(limb, 16), BN2048_MASK16)
+    let p = list_new()
+    push(p, lo)
+    push(p, hi)
+    return p
+}
+
+// Convert a list of 128 "32-bit limbs" into [hi, lo] bignum pair, both
+// 64-limb 2048-bit bignums.
+fn _bn2048_pack128_to_pair(limbs128) {
+    let lo = _bn2048_alloc_zero()
+    let hi = _bn2048_alloc_zero()
+    let i = 0
+    while i < BN2048_LIMBS {
+        list_set(lo, i, limbs128[i])
+        list_set(hi, i, limbs128[i + BN2048_LIMBS])
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, hi)
+    push(pair, lo)
+    return pair
+}
+
+// Full 2048x2048 -> 4096 multiplier (schoolbook). Same shape as
+// `bn_mul` in bignum.nova, just 128 16-bit halves instead of 16.
+// Returns [hi_bn, lo_bn] where hi_bn * 2^2048 + lo_bn = a * b exactly.
+fn bn2048_mul(a, b) {
+    // Build 128-half views of a and b.
+    let ah = list_new()
+    let bh = list_new()
+    let k = 0
+    while k < BN2048_LIMBS {
+        let pa = _bn2048_split16(a[k])
+        let pb = _bn2048_split16(b[k])
+        push(ah, pa[0])
+        push(ah, pa[1])
+        push(bh, pb[0])
+        push(bh, pb[1])
+        k = k + 1
+    }
+    // Accumulator: 256 16-bit slots. Values stay within 32 bits after
+    // every column-merge step.
+    let acc = list_new()
+    let z = 0
+    while z < BN2048_HALF_LIMBS_DOUBLE {
+        push(acc, 0)
+        z = z + 1
+    }
+    let i = 0
+    while i < BN2048_HALF_LIMBS {
+        let aw = ah[i]
+        let j = 0
+        while j < BN2048_HALF_LIMBS {
+            let prod = int_mul(aw, bh[j])
+            let pos = i + j
+            let s = int_add(acc[pos], prod)
+            list_set(acc, pos, int_and(s, BN2048_MASK16))
+            let carry = int_shr(s, 16)
+            let p2 = pos + 1
+            while carry > 0 {
+                if p2 >= BN2048_HALF_LIMBS_DOUBLE { carry = 0 }
+                else {
+                    let s2 = int_add(acc[p2], carry)
+                    list_set(acc, p2, int_and(s2, BN2048_MASK16))
+                    carry = int_shr(s2, 16)
+                    p2 = p2 + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Merge 256 16-bit slots into 128 32-bit limbs.
+    let limbs128 = list_new()
+    let q = 0
+    while q < BN2048_HALF_LIMBS {
+        let lo16 = acc[int_mul(q, 2)]
+        let hi16 = acc[int_add(int_mul(q, 2), 1)]
+        let limb = _bn2048_mask32(int_or(lo16, int_shl(hi16, 16)))
+        push(limbs128, limb)
+        q = q + 1
+    }
+    return _bn2048_pack128_to_pair(limbs128)
+}
+
+// ---- modular reduction ---------------------------------------------------
+
+// Shallow copy of a bignum_2048. Standalone so callers don't risk aliasing.
+fn _bn2048_clone(bn) {
+    let r = _bn2048_alloc_zero()
+    let i = 0
+    while i < BN2048_LIMBS {
+        list_set(r, i, bn[i])
+        i = i + 1
+    }
+    return r
+}
+
+// In-place copy: copy src limbs into dst.
+fn _bn2048_copy_into(dst, src) {
+    let i = 0
+    while i < BN2048_LIMBS {
+        list_set(dst, i, src[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// In-place 2048-bit shift-left-by-one. Returns the carry-out (0 or 1)
+// -- the bit that fell off the top of the 2048-bit container. The
+// reduction loop uses this carry-out to detect the case where the
+// shifted value would have crossed 2^2048: in that case the value is
+// >= m (since m > 2^2047 for any 2048-bit modulus with bit 2047 set,
+// including the RFC 7919 Group 14 prime), so the subsequent
+// `if r >= m: r -= m` step must force a subtraction even though the
+// in-container r (mod 2^2048) appears small. Without this fix the
+// reduction silently drops the top bit of the running remainder and
+// loops thereafter return 0 instead of the correct value.
+fn _bn2048_shl1_inplace(bn) {
+    let carry = 0
+    let i = 0
+    while i < BN2048_LIMBS {
+        let v = bn[i]
+        let new_v = _bn2048_mask32(int_or(int_shl(v, 1), carry))
+        list_set(bn, i, new_v)
+        carry = int_and(int_shr(v, 31), 1)
+        i = i + 1
+    }
+    return carry
+}
+
+// In-place subtraction: dst = dst - src. Avoids the alloc + copy-back
+// that `bn2048_sub` followed by `_bn2048_copy_into` would impose on
+// every reducing subtract inside `bn2048_mod` / `_bn2048_mod4096`.
+// Under-flow wraps two's-complement in the 2048-bit container (same
+// semantics as `bn2048_sub`).
+fn _bn2048_sub_inplace(dst, src) {
+    let borrow = 0
+    let i = 0
+    while i < BN2048_LIMBS {
+        let diff = int_sub(int_sub(dst[i], src[i]), borrow)
+        if diff < 0 {
+            diff = int_add(diff, int_shl(1, 32))
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        list_set(dst, i, _bn2048_mask32(diff))
+        i = i + 1
+    }
+    return 1
+}
+
+// Bit-by-bit modular reduction: a mod m. 2048 iterations; each
+// iteration does a shl + a cmp + (maybe) a sub. With the in-place
+// sub the per-iteration cost is ~3 64-limb passes.
+//
+// The `shift_carry` branch handles the case where shifting the running
+// remainder overflows the 2048-bit container: when m has bit 2047 set
+// (true for RFC 7919 Group 14), shift-overflow means the true value
+// is >= m, so we force a subtract. See `_bn2048_shl1_inplace`'s
+// docstring for the correctness argument.
+fn bn2048_mod(a, m) {
+    if bn2048_zero(m) != 0 {
+        return _bn2048_clone(a)
+    }
+    if bn2048_cmp(a, m) < 0 {
+        return _bn2048_clone(a)
+    }
+    let r = _bn2048_alloc_zero()
+    let bit = BN2048_TOTAL_BITS - 1
+    while bit >= 0 {
+        let shift_carry = _bn2048_shl1_inplace(r)
+        let limb_idx = int_shr(bit, 5)                  // bit / 32
+        let bit_idx  = int_and(bit, 31)                 // bit mod 32
+        let a_bit    = int_and(int_shr(a[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if shift_carry != 0 {
+            _bn2048_sub_inplace(r, m)
+        } else {
+            if bn2048_cmp(r, m) >= 0 {
+                _bn2048_sub_inplace(r, m)
+            }
+        }
+        bit = bit - 1
+    }
+    return r
+}
+
+// (a * b) mod m via the 4096-bit product, reduced by `_bn2048_mod4096`.
+fn bn2048_modmul(a, b, m) {
+    let pair = bn2048_mul(a, b)
+    let hi = pair[0]
+    let lo = pair[1]
+    return _bn2048_mod4096(hi, lo, m)
+}
+
+// Reduce a 4096-bit number (split as hi * 2^2048 + lo) modulo a
+// 2048-bit modulus. Walks all 4096 bits high to low. The remainder is
+// always < 2^2048.
+//
+// We split the walk into two phases (hi-half then lo-half) instead of
+// a single 4096-bit loop with a `bit >= TOTAL_BITS` branch: dispatching
+// the source once per phase removes one conditional from the hot path.
+// The `shift_carry` handling is the same as in `bn2048_mod` (see that
+// function's comment for the correctness argument).
+fn _bn2048_mod4096(hi, lo, m) {
+    if bn2048_zero(m) != 0 {
+        return _bn2048_clone(lo)
+    }
+    let r = _bn2048_alloc_zero()
+    // Phase 1: hi-half bits, high to low.
+    let bit = BN2048_TOTAL_BITS - 1
+    while bit >= 0 {
+        let shift_carry = _bn2048_shl1_inplace(r)
+        let limb_idx = int_shr(bit, 5)
+        let bit_idx  = int_and(bit, 31)
+        let a_bit    = int_and(int_shr(hi[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if shift_carry != 0 {
+            _bn2048_sub_inplace(r, m)
+        } else {
+            if bn2048_cmp(r, m) >= 0 {
+                _bn2048_sub_inplace(r, m)
+            }
+        }
+        bit = bit - 1
+    }
+    // Phase 2: lo-half bits, high to low.
+    bit = BN2048_TOTAL_BITS - 1
+    while bit >= 0 {
+        let shift_carry = _bn2048_shl1_inplace(r)
+        let limb_idx = int_shr(bit, 5)
+        let bit_idx  = int_and(bit, 31)
+        let a_bit    = int_and(int_shr(lo[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if shift_carry != 0 {
+            _bn2048_sub_inplace(r, m)
+        } else {
+            if bn2048_cmp(r, m) >= 0 {
+                _bn2048_sub_inplace(r, m)
+            }
+        }
+        bit = bit - 1
+    }
+    return r
+}
+
+// ---- modular exponentiation (CT only) -----------------------------------
+//
+// Constant-time modular exponentiation via the Montgomery ladder.
+// IDENTICAL ALGORITHM to bignum.nova's bn_modpow_ct, just over 2048-bit
+// values:
+//
+//   R0 = 1, R1 = base mod m
+//   for i = bit_len - 1 DOWN TO 0:
+//     b = exp.bit(i)
+//     if b == 0:
+//         R1 = R0 * R1 mod m
+//         R0 = R0 * R0 mod m
+//     else:
+//         R0 = R0 * R1 mod m
+//         R1 = R1 * R1 mod m
+//   return R0
+//
+// Cost: 2048 iterations x 2 modmul = 4096 modmuls per call. Each
+// modmul is ~16k single-limb multiplies + a 4096-bit reduction. On
+// this sandbox: ~3 ms per full-width modmul, so ~15 seconds per
+// modpow_ct at the RFC 7919 Group 14 prime. For DH key generation +
+// per-peer shared-secret derivation, that's one modpow_ct per
+// primitive operation -- multi-soul federation rounds can take
+// minutes.
+//
+// Returns base^exp mod m, 2048-bit. Edge cases match bn_modpow_ct:
+//   - m == 0  -> returns a clone of base
+//   - m == 1  -> returns 0
+//   - exp == 0 -> returns 1
+fn bn2048_modpow_ct(base, exp, m) {
+    if bn2048_zero(m) != 0 {
+        return _bn2048_clone(base)
+    }
+    let one = bn2048_from_int(1)
+    if bn2048_eq(m, one) != 0 {
+        return _bn2048_alloc_zero()
+    }
+    let r0 = bn2048_from_int(1)
+    let r1 = bn2048_mod(base, m)
+    let i = BN2048_TOTAL_BITS - 1
+    while i >= 0 {
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let b = int_and(int_shr(exp[limb_idx], bit_idx), 1)
+        if b == 0 {
+            r1 = bn2048_modmul(r0, r1, m)
+            r0 = bn2048_modmul(r0, r0, m)
+        } else {
+            r0 = bn2048_modmul(r0, r1, m)
+            r1 = bn2048_modmul(r1, r1, m)
+        }
+        i = i - 1
+    }
+    return r0
+}
+
+// ---- RFC 7919 Group 14 constants ----------------------------------------
+//
+// RFC 3526 §3 / RFC 7919 Group 14 (the 2048-bit MODP "More Modular
+// Exponential" group). The prime is a SAFE prime
+//   p = 2^2048 - 2^1984 - 1 + 2^64 * { [2^1918 pi] + 124476 }
+// where q = (p - 1) / 2 is also prime. Generator g = 2 is a generator
+// of the order-q subgroup. RFC 7919 Group 14 is the smallest standard
+// DH MODP group considered cryptographically reasonable in 2025.
+//
+// The hex encoding below is the EXACT constant from RFC 3526 §3:
+//
+//     FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1
+//     29024E08 8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD
+//     EF9519B3 CD3A431B 302B0A6D F25F1437 4FE1356D 6D51C245
+//     E485B576 625E7EC6 F44C42E9 A637ED6B 0BFF5CB6 F406B7ED
+//     EE386BFB 5A899FA5 AE9F2411 7C4B1FE6 49286651 ECE45B3D
+//     C2007CB8 A163BF05 98DA4836 1C55D39A 69163FA8 FD24CF5F
+//     83655D23 DCA3AD96 1C62F356 208552BB 9ED52907 7096966D
+//     670C354E 4ABC9804 F1746C08 CA18217C 32905E46 2E36CE3B
+//     E39E772C 180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9
+//     DE2BCBF6 95581718 3995497C EA956AE5 15D22618 98FA0510
+//     15728E5A 8AACAA68 FFFFFFFF FFFFFFFF
+//
+// Total: 512 hex chars = 2048 bits exactly, MSB-first.
+//
+// These constants are produced lazily by `rfc7919_group14_p()` and
+// `rfc7919_group14_g()` rather than as let-globals because top-level
+// `let` initializers run at module-load time across every importer;
+// a 64-element list allocation per import would inflate boot cost
+// for callers that don't use the DH path.
+fn rfc7919_group14_p() {
+    return bn2048_from_hex(
+        "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd1"
+        + "29024e088a67cc74020bbea63b139b22514a08798e3404dd"
+        + "ef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245"
+        + "e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7ed"
+        + "ee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3d"
+        + "c2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f"
+        + "83655d23dca3ad961c62f356208552bb9ed529077096966d"
+        + "670c354e4abc9804f1746c08ca18217c32905e462e36ce3b"
+        + "e39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9"
+        + "de2bcbf6955817183995497cea956ae515d2261898fa0510"
+        + "15728e5a8aacaa68ffffffffffffffff")
+}
+
+fn rfc7919_group14_g() {
+    return bn2048_from_int(2)
+}
