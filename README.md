@@ -11,7 +11,26 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 138 modules compile (`make build`, +1 from
+> toolchain: 139 modules compile (`make build`, +1 from
+> `persistence/schema_migration.nova` added in R8E -- a generic,
+> declarative KG-atom schema-evolution framework that generalizes R5D's
+> one-off snapshot v1->v2 migration into per-atom-kind ADD / RENAME /
+> RETYPE / REMOVE rules. Each atom carries a `schema_version` payload
+> field; migrations are registered once and frozen for bit-reproducibility
+> across sessions. Two demo migrations ship today: V1->V2 ADD `created_ns`
+> across every atom kind (defaulting to the snapshot's `timestamp` when
+> the ADD default is 0), V2->V3 RENAME `label` -> `display_label` on
+> FACT atoms only (LANG / CONCEPT / SKILL keep `label`). A new optional
+> `schema.atoms_version <int>` line in the v2 meta block carries the
+> per-file generation; older v2 readers ignore it (forward-compatible).
+> The schema layer is orthogonal to the wire layer -- R5D's v1->v2
+> container migration still works bit-identically. ~78 unit
+> assertions (test_schema_migration.nova) + 17 integration assertions
+> (scenario_ll_schema_migrate.sh); all green; R5D's snapshot migrate
+> tests (37) + R6F's episodic tests (79 unit + 37 integration) all
+> still pass. Documented in SNAPSHOT_FORMAT.md "Atom-shape schema
+> evolution (R8E)" section,
+> +1 from
 > `io/transducers/image_stereo.nova` added in R7E -- block-matching
 > Sum-of-Absolute-Differences (SAD) stereo disparity from horizontally
 > separated PGM-P5 pairs, plus depth recovery via

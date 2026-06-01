@@ -3,7 +3,152 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R7E (this session) — IO: stereo depth via block-matching SAD disparity
+## R8E (this session) — KG atom schema-evolution / migration framework
+
+**Status: complete -- `src/persistence/schema_migration.nova` lands
+as a generic, declarative framework for evolving the SHAPE of an atom
+(its payload schema) over time without breaking R5D's v2 wire format
+or R6F's episodic snapshot persistence.**
+
+R5D's snapshot v2 added a one-off `snap_migrate_v1_to_v2` that bumps
+the CONTAINER wire format from v1 -> v2. R6F added episodic atoms as
+a forward-compatible third sub-list. Those covered the wire layer.
+R8E adds the NEXT layer: a per-atom-kind schema generation that the
+substrate uses to add / rename / retype / remove payload fields
+cleanly, with old migrations frozen for bit-reproducibility across
+sessions.
+
+### Supported operations
+
+- **ADD**     a new payload field with a default value
+- **RENAME**  an existing payload field (rewrite key)
+- **RETYPE**  a field's type (e.g. int -> milli via `SCHEMA_RETYPE_X1000`)
+- **REMOVE**  a deprecated payload field
+
+Each atom carries a `schema_version` payload entry naming the
+generation that produced it. An atom missing the entry is treated as
+`SCHEMA_LEGACY_VERSION = 1` -- the implicit shape every pre-R8E atom
+has.
+
+### Wire format
+
+A new optional line in the v2 meta block:
+
+```
+schema.atoms_version <int>      # e.g. 3
+```
+
+A pre-R8E v2 file omits the line; the reader treats absence as v1
+and migrates up cleanly. An older v2 reader that sees the line
+ignores it (same forward-compat as `meta.creator` / `meta.created_ns`).
+The wire format stays at v2 -- the schema layer is orthogonal.
+
+### What landed
+
+- **`src/persistence/schema_migration.nova`** (NEW): the framework.
+  Public API:
+  * `Migration` descriptor: `[from_v, to_v, kind, op, field, default]`
+  * `register_migration(from, to, kind, op, field, default)` --
+    declarative registration; new rules APPENDED, old rules NEVER mutated.
+  * `apply_migration(atom, m)` -- single-step apply
+  * `migrate_atom(atom, target_version)` -- chain every applicable
+    rule up to `target_version`
+  * `migrate_kg(kg, target_version)` -- walk every atom in a KG
+  * `migrate_kg_with_default_ns(kg, target_version, snapshot_ts)` --
+    variant the snapshot reader uses to inherit `created_ns` from
+    the snapshot timestamp when the ADD default is 0.
+  * `snap_post_load_migrate(s, kg_reg)` -- reader hook: reads
+    `snap_meta_atoms_version(s)`, walks every KG, migrates each to
+    `SCHEMA_CURRENT_VERSION`, stamps the snapshot's atoms_version
+    slot so the next save emits the new line.
+  * `atom_schema_version(a)` / `atom_set_schema_version(a, v)` --
+    payload-field helpers.
+- **`src/persistence/snapshot_writer.nova`** (+45 lines): meta block
+  grew from 4 to 5 cells (slot 4: `atoms_version`); new accessors
+  `snap_meta_atoms_version` / `snap_meta_set_atoms_version` /
+  `snap_meta_has_atoms_version`; `snap_meta_new` defaults to
+  `SNAP_META_ATOMS_VER_CURRENT (= 3)`; `snap_migrate_v1_to_v2`
+  stamps the slot with `SNAP_META_ATOMS_VER_LEGACY (= 1)`.
+- **`src/persistence/snapshot_disk.nova`** (+25 lines): import
+  `schema_migration.nova`; emit one `schema.atoms_version <int>`
+  line in the v2 meta block; parse the line in `snap_from_text`;
+  install via `snap_meta_set_atoms_version` on v2 dispatch.
+- **`examples/migrate_schema.nova`** (NEW): the runnable schema-
+  migration helper. Reads `$CE_MIGRATE_OLD`, applies the chain via
+  `snap_post_load_migrate`, writes `$CE_MIGRATE_NEW`, reports
+  `migrated atoms v<old> -> v<new> (N atoms across K KGs)`.
+- **`tests/unit/test_schema_migration.nova`** (NEW, 78 assertions):
+  ADD basic + kind_any + idempotency; RENAME on FACT (rule kind) +
+  no-op on LANG / CONCEPT / FACT-without-old-key; REMOVE one-shot +
+  via chain; RETYPE x1000 one-shot + via chain + absent-field
+  no-op; V1 -> V3 chain (both demo rules); V1 -> V3 chain on
+  non-FACT keeps `label`; migrate_kg on 5-atom KG (ordering
+  preserved); migrate_kg idempotency on already-V3 KG; snapshot
+  reads legacy v2 file as schema V1; snapshot emits the new meta
+  line; meta line round-trips; `migrate_kg_with_default_ns`
+  substitutes snapshot timestamp; default registry has both demos.
+- **`tests/integration/scenario_ll_schema_migrate.sh`** (NEW, 17
+  assertions): hand-rolls a pre-R8E v2 snapshot with two atoms,
+  runs the schema-migration driver, asserts output declares
+  `schema.atoms_version 3`, asserts atom payloads survive the
+  round-trip, asserts a second run is idempotent (v3 -> v3).
+- **`SNAPSHOT_FORMAT.md`** (+80 lines): new "Atom-shape schema
+  evolution (R8E)" section.
+
+### Demo migrations registered today
+
+| From | To | Kind        | Op     | Field                | Default        |
+|------|----|-------------|--------|----------------------|----------------|
+| 1    | 2  | `KIND_ANY`  | ADD    | `created_ns`         | 0 (or snapshot ts via `migrate_kg_with_default_ns`) |
+| 2    | 3  | `ATOM_FACT` | RENAME | `label:display_label`| n/a            |
+
+The first proves a kind-agnostic ADD across the chain. The second
+proves a kind-specific RENAME (LANG / CONCEPT / SKILL atoms keep
+their `label` payload). REMOVE + RETYPE are wired but not in the
+default registry -- a future schema-change session registers them
+in one line. Old migrations stay frozen for reproducibility.
+
+### Verification
+
+- `tests/unit/test_schema_migration.nova`: **78 assertions, all pass**.
+- `tests/unit/test_snapshot_migrate.nova` (R5D's): **37 assertions,
+  all pass** -- the v1 -> v2 wire migration is bit-identical because
+  schema-migration rides on a different layer.
+- `tests/unit/test_episodic.nova` (R6F's): **79 assertions, all
+  pass** -- episodic atoms keep their `label` payload through the
+  V2 -> V3 step because that rule is FACT-only.
+- `tests/integration/scenario_ll_schema_migrate.sh`: **17
+  assertions, all pass**.
+- `tests/integration/scenario_dd_snap_migrate.sh` (R5D's): **16
+  assertions, all pass**.
+- `tests/integration/scenario_ff_episodic.sh` (R6F's): **37
+  assertions, all pass**.
+- Snapshot-related unit tests still green:
+  `test_snapshot_disk` (31), `test_snapshot_writer` (27),
+  `test_snapshot_episodic` (51), `test_snapshot_synapses` (89),
+  `test_snapshot_compaction` (48), `test_snapshot_selfmodel` (38),
+  `test_atom_store` (42), `test_atom_store_index` (61),
+  `test_ann_index` (46), `test_multi_kg_manager` (23).
+
+### Module count: 138 -> 139 (schema_migration.nova added).
+
+### Future work (carried forward)
+
+- **Production migrations**: as new fields are added to atom payloads,
+  register the migration in `_schema_register_default_migrations`
+  and bump `SCHEMA_CURRENT_VERSION`. Old rules are frozen.
+- **More RETYPE transforms**: only `SCHEMA_RETYPE_X1000` (int ->
+  milli) is shipped. Add new tags (e.g. `string_to_int_hash`) as a
+  new branch in `apply_migration`'s RETYPE case without disturbing
+  any existing migration.
+- **Daemon wire-up**: the chat/daemon's `/load` path currently
+  doesn't call `snap_post_load_migrate`. A follow-up patches the
+  daemon's `_admin_load` to invoke the hook after
+  `kg_section_apply` so live restarts pick up schema migrations
+  automatically. For now the explicit `examples/migrate_schema.nova`
+  driver covers the offline-migration use case.
+
+## R7E (previous session) — IO: stereo depth via block-matching SAD disparity
 
 **Status: complete -- `src/io/transducers/image_stereo.nova` lands as a
 new leaf module that adds the missing third dimension to the CV pipeline.**

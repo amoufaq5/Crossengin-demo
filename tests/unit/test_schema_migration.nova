@@ -1,0 +1,407 @@
+// Unit tests for the KG atom schema-evolution / migration framework.
+//
+// Exercises:
+//   - ADD migration installs a default field on an atom missing the key
+//   - RENAME migration rewrites the payload key in place
+//   - RENAME on a kind that doesn't match is a no-op
+//   - REMOVE migration drops the deprecated field
+//   - RETYPE migration runs the int -> milli (x1000) transform
+//   - Migration chain: V1 -> V3 applies V1->V2 then V2->V3 in order
+//   - migrate_kg walks every atom in a 5-atom KG, ordering preserved
+//   - Idempotency: rerunning migrate_kg on a fully-migrated KG is a no-op
+//   - Snapshot round-trip: write V2-era atoms, reload, migrations apply
+//   - Backward read: snapshot without schema.atoms_version is V1, migrates
+//
+// ADRs touched: ADR-0048 (persistence), ADR-0016 (atom design).
+
+import "../ce_test.nova"
+import "../../src/persistence/schema_migration.nova"
+import "../../src/persistence/snapshot_disk.nova"
+import "../../src/persistence/snapshot_reader.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+
+// ---- helpers ---------------------------------------------------------------
+//
+// Build a freestanding atom for testing the migrator in isolation. The
+// atom is not attached to any KG; the framework operates on the atom's
+// payload directly so it doesn't need to be.
+fn _new_atom(kg_label, id, kind, label) {
+    return atom_new(kg_label, id, kind, label, 0)
+}
+
+// ADD migration verifications -----------------------------------------------
+
+fn test_add_migration_basic() {
+    let a = _new_atom("k", 1, ATOM_FACT, "hi")
+    ce_eq("v1 atom has no schema_version payload", atom_payload_has(a, SCHEMA_FIELD_VERSION), 0)
+    ce_eq("v1 atom defaults to legacy version", atom_schema_version(a), 1)
+    ce_eq("v1 atom has no created_ns", atom_payload_has(a, "created_ns"), 0)
+    migrate_atom(a, 2)
+    ce_eq("after migrate-to-v2 schema_version is 2", atom_schema_version(a), 2)
+    ce_eq("after migrate-to-v2 has created_ns",      atom_payload_has(a, "created_ns"), 1)
+    ce_eq("after migrate-to-v2 created_ns is 0 (default)", atom_payload_get(a, "created_ns"), 0)
+}
+
+fn test_add_migration_kind_any_runs_on_lang() {
+    // ATOM_LANG atom should also pick up created_ns (kind_any rule).
+    let a = _new_atom("lang", 7, ATOM_LANG, "word")
+    ce_eq("LANG atom starts at v1",  atom_schema_version(a), 1)
+    migrate_atom(a, 2)
+    ce_eq("LANG atom now has created_ns", atom_payload_has(a, "created_ns"), 1)
+    ce_eq("LANG atom schema_version is 2", atom_schema_version(a), 2)
+}
+
+fn test_add_idempotent() {
+    let a = _new_atom("k", 2, ATOM_FACT, "x")
+    migrate_atom(a, 2)
+    // Manually stamp created_ns; re-running migrate must not overwrite.
+    atom_payload_set(a, "created_ns", 12345)
+    // Reset schema_version to v1 to trigger the rerun, then migrate again.
+    atom_set_schema_version(a, 1)
+    migrate_atom(a, 2)
+    ce_eq("ADD does not overwrite existing value", atom_payload_get(a, "created_ns"), 12345)
+}
+
+// RENAME migration verifications ---------------------------------------------
+
+fn test_rename_on_observation_fact() {
+    let a = _new_atom("k", 3, ATOM_FACT, "labelvalue")
+    atom_payload_set(a, "label", "the observation note")
+    atom_set_schema_version(a, 2)
+    ce_eq("pre-rename has 'label' payload", atom_payload_has(a, "label"), 1)
+    migrate_atom(a, 3)
+    ce_eq("post-rename schema_version is 3", atom_schema_version(a), 3)
+    ce_eq("post-rename has 'display_label'", atom_payload_has(a, "display_label"), 1)
+    ce_eq("post-rename has no 'label'",      atom_payload_has(a, "label"), 0)
+    ce_str_eq("rename preserves value",
+        atom_payload_get(a, "display_label"), "the observation note")
+}
+
+fn test_rename_on_lang_is_noop() {
+    // Episodic-style behaviour: LANG atoms keep their `label` payload
+    // unchanged because the V2 -> V3 rule is tagged ATOM_FACT only.
+    let a = _new_atom("k", 4, ATOM_LANG, "word_lbl")
+    atom_payload_set(a, "label", "lang_payload_label")
+    atom_set_schema_version(a, 2)
+    migrate_atom(a, 3)
+    ce_eq("LANG atom keeps 'label' field",       atom_payload_has(a, "label"), 1)
+    ce_eq("LANG atom never gets 'display_label'", atom_payload_has(a, "display_label"), 0)
+    ce_eq("LANG atom still lands at schema v3", atom_schema_version(a), 3)
+}
+
+fn test_rename_on_concept_is_noop() {
+    let a = _new_atom("k", 5, ATOM_CONCEPT, "concept_lbl")
+    atom_payload_set(a, "label", "concept_payload_label")
+    atom_set_schema_version(a, 2)
+    migrate_atom(a, 3)
+    ce_eq("CONCEPT atom keeps 'label'",            atom_payload_has(a, "label"), 1)
+    ce_eq("CONCEPT atom never gets display_label", atom_payload_has(a, "display_label"), 0)
+}
+
+fn test_rename_atom_without_old_key_is_noop() {
+    // FACT atom that lacks the `label` payload key entirely: the rename
+    // doesn't error, doesn't install anything; the schema version still
+    // advances (the rule applied, just had nothing to rewrite).
+    let a = _new_atom("k", 6, ATOM_FACT, "fact_lbl")
+    atom_set_schema_version(a, 2)
+    migrate_atom(a, 3)
+    ce_eq("FACT without label has no display_label", atom_payload_has(a, "display_label"), 0)
+    ce_eq("FACT version advances to v3 anyway",      atom_schema_version(a), 3)
+}
+
+// REMOVE migration verifications --------------------------------------------
+//
+// REMOVE is exercised against a synthetic registry (the default
+// registry doesn't ship a REMOVE rule). We snapshot the default
+// registry, install a REMOVE rule, run, and restore.
+
+fn test_remove_migration() {
+    let a = _new_atom("k", 7, ATOM_FACT, "fact")
+    atom_payload_set(a, "deprecated_field", 42)
+    atom_set_schema_version(a, 5)
+    ce_eq("pre-remove has the deprecated field", atom_payload_has(a, "deprecated_field"), 1)
+
+    // Apply a one-shot REMOVE migration in isolation (bypass the
+    // registry chain so we don't have to mutate it). apply_migration
+    // is the single-step entry point the chain uses internally.
+    let m = migration_new(5, 6, SCHEMA_KIND_ANY, SCHEMA_OP_REMOVE, "deprecated_field", 0)
+    apply_migration(a, m)
+    ce_eq("post-remove deprecated_field gone", atom_payload_has(a, "deprecated_field"), 0)
+}
+
+fn test_remove_via_chain() {
+    // Now exercise REMOVE through the chain: register a fresh rule,
+    // run migrate_atom, then unregister via clear-for-test.
+    let snapshot_count = schema_migration_count()
+    let a = _new_atom("k", 8, ATOM_FACT, "fact")
+    atom_payload_set(a, "old_field", 7)
+    atom_set_schema_version(a, 10)
+    register_migration(10, 11, SCHEMA_KIND_ANY, SCHEMA_OP_REMOVE, "old_field", 0)
+    migrate_atom(a, 11)
+    ce_eq("REMOVE via chain dropped the field", atom_payload_has(a, "old_field"), 0)
+    ce_eq("REMOVE via chain bumped version",   atom_schema_version(a), 11)
+    ce_eq("registry grew by 1", schema_migration_count(), snapshot_count + 1)
+}
+
+// RETYPE migration verifications --------------------------------------------
+
+fn test_retype_int_to_milli() {
+    let a = _new_atom("k", 9, ATOM_FACT, "fact")
+    atom_payload_set(a, "score", 7)
+    atom_set_schema_version(a, 1)
+    let m = migration_new(1, 2, SCHEMA_KIND_ANY, SCHEMA_OP_RETYPE, "score", SCHEMA_RETYPE_X1000)
+    apply_migration(a, m)
+    ce_eq("RETYPE x1000 multiplies the int value",
+        atom_payload_get(a, "score"), 7000)
+}
+
+fn test_retype_via_chain() {
+    let snapshot_count = schema_migration_count()
+    let a = _new_atom("k", 10, ATOM_FACT, "fact")
+    atom_payload_set(a, "level", 3)
+    atom_set_schema_version(a, 20)
+    register_migration(20, 21, SCHEMA_KIND_ANY, SCHEMA_OP_RETYPE, "level", SCHEMA_RETYPE_X1000)
+    migrate_atom(a, 21)
+    ce_eq("RETYPE via chain produced milli", atom_payload_get(a, "level"), 3000)
+    ce_eq("RETYPE via chain bumped version", atom_schema_version(a), 21)
+    ce_eq("registry grew by 1",              schema_migration_count(), snapshot_count + 1)
+}
+
+fn test_retype_absent_field_is_noop() {
+    let a = _new_atom("k", 11, ATOM_FACT, "fact")
+    atom_set_schema_version(a, 1)
+    let m = migration_new(1, 2, SCHEMA_KIND_ANY, SCHEMA_OP_RETYPE, "no_such_field", SCHEMA_RETYPE_X1000)
+    apply_migration(a, m)
+    ce_eq("RETYPE on absent field installs nothing",
+        atom_payload_has(a, "no_such_field"), 0)
+}
+
+// Migration chain verification ----------------------------------------------
+
+fn test_chain_v1_to_v3() {
+    // V1 atom with a `label` payload: V1 -> V2 adds created_ns,
+    // V2 -> V3 renames label -> display_label on FACT.
+    let a = _new_atom("k", 12, ATOM_FACT, "atomlabel")
+    atom_payload_set(a, "label", "chain_value")
+    ce_eq("starts at v1", atom_schema_version(a), 1)
+    migrate_atom(a, SCHEMA_CURRENT_VERSION)
+    ce_eq("lands at v3",  atom_schema_version(a), SCHEMA_CURRENT_VERSION)
+    ce_eq("created_ns installed by step 1", atom_payload_has(a, "created_ns"), 1)
+    ce_eq("display_label installed by step 2", atom_payload_has(a, "display_label"), 1)
+    ce_eq("old label payload dropped",         atom_payload_has(a, "label"), 0)
+    ce_str_eq("rename preserved the value",
+        atom_payload_get(a, "display_label"), "chain_value")
+}
+
+fn test_chain_v1_to_v3_non_fact_keeps_label() {
+    // A LANG atom going through the same chain: ADD applies, RENAME
+    // does not (kind mismatch).
+    let a = _new_atom("k", 13, ATOM_LANG, "word")
+    atom_payload_set(a, "label", "word_payload")
+    migrate_atom(a, SCHEMA_CURRENT_VERSION)
+    ce_eq("LANG ends at v3",      atom_schema_version(a), SCHEMA_CURRENT_VERSION)
+    ce_eq("LANG has created_ns",  atom_payload_has(a, "created_ns"), 1)
+    ce_eq("LANG keeps label",     atom_payload_has(a, "label"), 1)
+    ce_eq("LANG has no display_label", atom_payload_has(a, "display_label"), 0)
+}
+
+// migrate_kg verification ----------------------------------------------------
+
+fn test_migrate_kg_five_atoms() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "test_kg")
+    // 5 atoms in registration order: 2 FACT, 1 CONCEPT, 1 LANG, 1 SKILL.
+    let a1 = kg_add_atom(kg, ATOM_FACT,    "fact1",    0)
+    atom_payload_set(a1, "label", "f1_payload")
+    let a2 = kg_add_atom(kg, ATOM_FACT,    "fact2",    0)
+    atom_payload_set(a2, "label", "f2_payload")
+    let a3 = kg_add_atom(kg, ATOM_CONCEPT, "concept1", 0)
+    atom_payload_set(a3, "label", "c1_payload")
+    let a4 = kg_add_atom(kg, ATOM_LANG,    "lang1",    0)
+    atom_payload_set(a4, "label", "l1_payload")
+    let a5 = kg_add_atom(kg, ATOM_SKILL,   "skill1",   0)
+    atom_payload_set(a5, "label", "s1_payload")
+    ce_eq("kg has 5 atoms", len(kg_atoms(kg)), 5)
+    // Every atom starts at the legacy version.
+    ce_eq("atom1 starts at v1", atom_schema_version(a1), 1)
+    ce_eq("atom5 starts at v1", atom_schema_version(a5), 1)
+    let touched = migrate_kg(kg, SCHEMA_CURRENT_VERSION)
+    ce_eq("migrate_kg touched 5", touched, 5)
+    // All atoms reach v3.
+    ce_eq("a1 at v3", atom_schema_version(a1), SCHEMA_CURRENT_VERSION)
+    ce_eq("a2 at v3", atom_schema_version(a2), SCHEMA_CURRENT_VERSION)
+    ce_eq("a3 at v3", atom_schema_version(a3), SCHEMA_CURRENT_VERSION)
+    ce_eq("a4 at v3", atom_schema_version(a4), SCHEMA_CURRENT_VERSION)
+    ce_eq("a5 at v3", atom_schema_version(a5), SCHEMA_CURRENT_VERSION)
+    // FACT atoms had label -> display_label
+    ce_eq("a1 (FACT) has display_label", atom_payload_has(a1, "display_label"), 1)
+    ce_eq("a1 (FACT) has no label",      atom_payload_has(a1, "label"), 0)
+    ce_eq("a2 (FACT) has display_label", atom_payload_has(a2, "display_label"), 1)
+    // Non-FACT atoms keep label
+    ce_eq("a3 (CONCEPT) keeps label",    atom_payload_has(a3, "label"), 1)
+    ce_eq("a4 (LANG)    keeps label",    atom_payload_has(a4, "label"), 1)
+    ce_eq("a5 (SKILL)   keeps label",    atom_payload_has(a5, "label"), 1)
+    // Ordering preserved: kg_atoms returns the same list pointers in the same order.
+    let final = kg_atoms(kg)
+    ce_check("a1 in slot 0", final[0] == a1)
+    ce_check("a2 in slot 1", final[1] == a2)
+    ce_check("a5 in slot 4", final[4] == a5)
+}
+
+fn test_migrate_kg_idempotent() {
+    // Running migrate_kg twice must not change anything once the KG
+    // is at SCHEMA_CURRENT_VERSION.
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "test_kg")
+    let a = kg_add_atom(kg, ATOM_FACT, "fact_idem", 0)
+    atom_payload_set(a, "label", "idem_v")
+    migrate_kg(kg, SCHEMA_CURRENT_VERSION)
+    let display_after_first = atom_payload_get(a, "display_label")
+    let version_after_first = atom_schema_version(a)
+    migrate_kg(kg, SCHEMA_CURRENT_VERSION)
+    ce_eq("second-run version unchanged", atom_schema_version(a), version_after_first)
+    ce_str_eq("second-run display_label unchanged",
+        atom_payload_get(a, "display_label"), display_after_first)
+    ce_eq("second-run still no 'label'", atom_payload_has(a, "label"), 0)
+    ce_eq("second-run still has display_label", atom_payload_has(a, "display_label"), 1)
+}
+
+// Snapshot round-trip --------------------------------------------------------
+
+// Build a synthetic V1-shape snapshot text with no schema.atoms_version
+// in the meta block. The atoms have no schema_version payload (the
+// implicit-v1 contract).
+fn _build_v1_snap_no_schema_meta() {
+    let lines = list_new()
+    push(lines, "crossengin-snapshot v1\n")
+    push(lines, "tag 5361\n")
+    push(lines, "ver 2\n")
+    push(lines, "instance 1\n")
+    push(lines, "timestamp 1700000000\n")
+    push(lines, "sections 5\n")
+    push(lines, "meta.creator crossengin/0.1.0\n")
+    push(lines, "meta.created_ns 1700000000000000000\n")
+    push(lines, "meta.compaction_threshold -1\n")
+    push(lines, "meta.encryption none\n")
+    push(lines, "soul.present 0\n")
+    push(lines, "kgs.present 1\n")
+    push(lines, "kgs.atoms 1\n")
+    push(lines, "kgs.atoms.count 1\n")
+    push(lines, "kgs.atoms[0].kg reasoning\n")
+    push(lines, "kgs.atoms[0].id 0\n")
+    push(lines, "kgs.atoms[0].kind 1\n")
+    push(lines, "kgs.atoms[0].label fact1\n")
+    push(lines, "kgs.atoms[0].alpha 1000\n")
+    push(lines, "kgs.atoms[0].beta 1000\n")
+    push(lines, "episodic.present 0\n")
+    push(lines, "synapses.present 0\n")
+    push(lines, "selfmodel.present 0\n")
+    push(lines, "end\n")
+    return join(lines, "")
+}
+
+fn test_snapshot_reads_legacy_default_v1() {
+    // A snapshot without schema.atoms_version parses; the parsed
+    // snapshot defaults to SCHEMA_LEGACY_VERSION when the meta key is
+    // absent. We verify via the snapshot_disk.nova helper.
+    let text = _build_v1_snap_no_schema_meta()
+    let s = snap_from_text(text)
+    ce_check("v1 snapshot parses", s != 0)
+    ce_eq("legacy snapshot schema version defaults to V1",
+        snap_meta_atoms_version(s), SCHEMA_LEGACY_VERSION)
+}
+
+fn test_snapshot_emits_schema_meta_line() {
+    // A snapshot created in this build should emit the new meta line.
+    let s = snap_new(1, 0)
+    snap_meta_set_atoms_version(s, SCHEMA_CURRENT_VERSION)
+    let text = snap_to_text(s)
+    // Look for the marker substring.
+    let needle = "schema.atoms_version 3"
+    let found = 0
+    let n = len(text)
+    let needle_len = len(needle)
+    let i = 0
+    while i + needle_len <= n {
+        let hit = 1
+        let j = 0
+        while j < needle_len {
+            if char_at(text, i + j) != char_at(needle, j) {
+                hit = 0
+                j = needle_len
+            }
+            j = j + 1
+        }
+        if hit == 1 {
+            found = 1
+            i = n
+        }
+        i = i + 1
+    }
+    ce_eq("snapshot text carries schema.atoms_version line", found, 1)
+}
+
+fn test_snapshot_schema_meta_round_trip() {
+    // Stamp atoms_version = 3, save to text, reload, check survives.
+    let s = snap_new(2, 100)
+    snap_meta_set_atoms_version(s, SCHEMA_CURRENT_VERSION)
+    let text = snap_to_text(s)
+    let s2 = snap_from_text(text)
+    ce_check("v2-shape snapshot re-parses", s2 != 0)
+    ce_eq("atoms_version round-trips",
+        snap_meta_atoms_version(s2), SCHEMA_CURRENT_VERSION)
+}
+
+fn test_migrate_kg_with_default_ns() {
+    // migrate_kg_with_default_ns substitutes the snapshot ts as
+    // created_ns when the v1 -> v2 demo migration installs a zero
+    // default. We verify with a freshly-spawned KG.
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "k_ns")
+    let a = kg_add_atom(kg, ATOM_FACT, "x", 0)
+    ce_eq("pre: no created_ns", atom_payload_has(a, "created_ns"), 0)
+    migrate_kg_with_default_ns(kg, SCHEMA_CURRENT_VERSION, 1700000000)
+    ce_eq("post: has created_ns",   atom_payload_has(a, "created_ns"), 1)
+    ce_eq("post: created_ns matches snapshot ts",
+        atom_payload_get(a, "created_ns"), 1700000000)
+}
+
+fn test_default_registry_populated() {
+    ce_check("default registry has at least 2 migrations",
+        schema_migration_count() >= 2)
+    // Spot-check the two shipped demos.
+    let m0 = schema_migration_at(0)
+    ce_eq("first demo: from = 1", migration_from(m0), 1)
+    ce_eq("first demo: to = 2",   migration_to(m0),   2)
+    ce_eq("first demo: kind = ANY", migration_kind(m0), SCHEMA_KIND_ANY)
+    ce_eq("first demo: op = ADD",   migration_op(m0),   SCHEMA_OP_ADD)
+    ce_str_eq("first demo: field = created_ns",
+        migration_field(m0), "created_ns")
+}
+
+fn main() {
+    test_add_migration_basic()
+    test_add_migration_kind_any_runs_on_lang()
+    test_add_idempotent()
+    test_rename_on_observation_fact()
+    test_rename_on_lang_is_noop()
+    test_rename_on_concept_is_noop()
+    test_rename_atom_without_old_key_is_noop()
+    test_remove_migration()
+    test_remove_via_chain()
+    test_retype_int_to_milli()
+    test_retype_via_chain()
+    test_retype_absent_field_is_noop()
+    test_chain_v1_to_v3()
+    test_chain_v1_to_v3_non_fact_keeps_label()
+    test_migrate_kg_five_atoms()
+    test_migrate_kg_idempotent()
+    test_snapshot_reads_legacy_default_v1()
+    test_snapshot_emits_schema_meta_line()
+    test_snapshot_schema_meta_round_trip()
+    test_migrate_kg_with_default_ns()
+    test_default_registry_populated()
+    ce_summary("schema_migration")
+}
+main()

@@ -93,6 +93,105 @@ and `snap_parse` in `src/persistence/snapshot_reader.nova`) dispatches
 on the `ver` field and calls the corresponding migration function in
 the chain until the snapshot reaches `SNAP_FORMAT_VERSION`.
 
+## Atom-shape schema evolution (R8E)
+
+Separate from the snapshot **container** format above, CrossEngin's
+**atom payloads** carry their own evolution layer: a per-atom-kind
+schema generation that lets the substrate add / rename / retype /
+remove payload fields without bumping `SNAP_FORMAT_VERSION`. The
+schema layer is forward-compatible with the v2 container: it rides
+on an optional meta line.
+
+### Wire-format extension
+
+A new optional line in the v2 meta block names the snapshot's
+per-atom-kind schema generation:
+
+```
+schema.atoms_version <int>      # e.g. 3
+```
+
+A pre-R8E v2 file omits this line; the reader treats absence as
+`SCHEMA_LEGACY_VERSION = 1` (the implicit shape every pre-R8E atom
+has). A v2 reader that doesn't know about the line ignores it (same
+forward-compat as the other `meta.*` lines).
+
+### Per-atom payload field
+
+Each atom carries a `schema_version` payload entry naming the schema
+generation that produced it. An atom rehydrated from a pre-R8E
+snapshot has no such entry and reads as `SCHEMA_LEGACY_VERSION` via
+`atom_schema_version(a)`.
+
+### Migration descriptor
+
+A Migration is a 6-element list registered via
+`register_migration(from_v, to_v, kind, op, field, default)`:
+
+| Field      | Meaning                                              |
+|------------|------------------------------------------------------|
+| `from_v`   | atom schema version this migration starts from      |
+| `to_v`     | the version the atom lands at after this step       |
+| `kind`     | `ATOM_FACT` / `ATOM_CONCEPT` / ... or `SCHEMA_KIND_ANY` (-1) for kind-agnostic |
+| `op`       | `SCHEMA_OP_ADD` / `RENAME` / `RETYPE` / `REMOVE`     |
+| `field`    | payload key (for RENAME: `"old:new"`)                |
+| `default`  | ADD: default value; RETYPE: transform tag (`SCHEMA_RETYPE_X1000`) |
+
+The registry is module-state in `src/persistence/schema_migration.nova`.
+New migrations are APPENDED; old migrations are NEVER mutated, so the
+chain a snapshot from any historic build runs is bit-for-bit
+reproducible across sessions.
+
+### Demo migrations shipped today
+
+| From | To | Kind        | Op     | Field                | Default        |
+|------|----|-------------|--------|----------------------|----------------|
+| 1    | 2  | `KIND_ANY`  | ADD    | `created_ns`         | 0 (or snapshot timestamp via `migrate_kg_with_default_ns`) |
+| 2    | 3  | `ATOM_FACT` | RENAME | `label:display_label`| n/a            |
+
+The first proves a kind-agnostic ADD; the second proves a
+kind-specific RENAME (LANG / CONCEPT / SKILL atoms keep `label`).
+REMOVE and RETYPE are exercised by unit tests via
+`register_migration` + the synthetic ruleset escape hatch.
+
+### Reader hook
+
+After `snap_from_text` returns and the daemon's `kg_section_apply`
+installs the live atoms, the next step is
+`snap_post_load_migrate(s, kg_reg)`. It reads the snapshot's
+`schema.atoms_version` (defaulting to `SCHEMA_LEGACY_VERSION`),
+walks every KG in the registry, runs `migrate_atom` on each atom
+up to `SCHEMA_CURRENT_VERSION`, and stamps the snapshot's
+atoms_version slot so a subsequent `snap_save` emits the new
+line.
+
+### Migration tool
+
+* **Explicit one-shot:** `examples/migrate_schema.nova` reads
+  `$CE_MIGRATE_OLD`, applies the schema-migration chain, and writes
+  `$CE_MIGRATE_NEW`. Reports:
+
+  ```
+  migrated atoms v1 -> v3 (N atoms across K KGs)
+  written <bytes> bytes to <path>
+  ```
+
+* **Inline:** any caller that uses `snap_load + snap_save + the
+  post-load migration hook` gets migrations applied transparently on
+  load and persisted on the next save.
+
+### See also
+
+* `src/persistence/schema_migration.nova` — Migration descriptor,
+  registry, ADD / RENAME / RETYPE / REMOVE ops, `migrate_atom`,
+  `migrate_kg`, `snap_post_load_migrate`.
+* `tests/unit/test_schema_migration.nova` — unit tests for the
+  ADD / RENAME / RETYPE / REMOVE ops, chain, idempotency.
+* `tests/integration/scenario_ll_schema_migrate.sh` — end-to-end
+  test on a hand-rolled pre-R8E v2 snapshot.
+* `examples/migrate_schema.nova` — the runnable schema-migration
+  helper.
+
 ## Migration tools
 
 * **Inline (transparent):** `snap_load(path)` runs the migration chain
