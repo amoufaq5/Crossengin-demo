@@ -93,7 +93,7 @@ computational units rather than orchestrating a pipeline of modules.
 > regions where block-matching speckles -- the unit test asserts
 > SGM variance <= BM variance in a noisy-flat band. Cap dims at
 > 128x128 with MAX_DISP<=64 to keep the cost volume under 4MB.
-> ~54 + 42 + 30 unit assertions + 10 + 11 + 11 integration
+> ~54 + 42 + 39 unit assertions + 10 + 11 + 13 integration
 > assertions; all green. See IMAGE_AUDIT.md for the 8-path / MI
 > data-term follow-ups,
 > +1 from

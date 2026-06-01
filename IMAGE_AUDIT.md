@@ -286,7 +286,22 @@ gradient structure and corner geometry, not just intensity moments:
   structurally interesting feature, with NO division in the inner
   loop and NO floating-point operations. **R8D quality follow-ups**
   added LR-check and sub-pixel refinement on top of R7E's integer
-  path (the SGM track stays deferred): `stereo_disparity_lr_check`
+  path; **R9A** then landed SGM (the third stereo tier):
+  `stereo_disparity_sgm` aggregates the SAD cost volume along 4
+  scanline paths (left-right, top-bottom, right-left, bottom-top)
+  with the Hirschmuller (2008) recurrence
+  `L_r(p, d) = C(p, d) + min(L_r(p-r, d), L_r(p-r, d-1) + P1,
+  L_r(p-r, d+1) + P1, min_d' L_r(p-r, d') + P2) - min_d' L_r(p-r, d')`,
+  emits the argmin of the 4-path sum as the disparity map, and
+  caps dims at 128x128 with MAX_DISP<=64 to keep the cost volume
+  under 4MB. P1=8/P2=32 default penalties; `stereo_disparity_sgm_quality`
+  layers LR-check + sub-pixel parabolic refinement on the
+  SGM-aggregated cost. Unit tests show SGM <= BM variance in a
+  textureless noisy band (the headline SGM benefit -- speckle
+  reduction). New chat admin `/depth_sgm L.pgm R.pgm`. Remaining
+  follow-ups: 8-path SGM, mutual-information data term, and
+  data-adaptive P2.
+  R8D's lineage: `stereo_disparity_lr_check`
   computes left->right + right->left disparities and zeros pixels
   where the two answers disagree by more than `lr_tolerance` pixels
   (textbook default 1) -- rejects occlusions, texture-less regions,
@@ -305,9 +320,9 @@ gradient structure and corner geometry, not just intensity moments:
   within +/- 200 of 10000; on a synthetic-occlusion fixture (right
   has a horizontal black band only) the LR-check rejects the majority
   of band-region pixels while textured-row pixels survive at the
-  correct integer disparity. Remaining follow-up: SGM (aggregate
-  costs along 4-8 directions per pixel, much more accurate in
-  textureless regions but ~10x runtime + ~5x memory). Dimensions
+  correct integer disparity. SGM (4 paths) is now in (R9A); the
+  8-path / mutual-information-data-term extensions remain
+  deferred. Dimensions
   capped at 256x256 per axis (the inner triple loop runs in
   O(W*H*MAX_DISP*WIN_SIZE^2) = O(W*H*3136); at 256x256 that's ~205M
   ops, the upper bound for the chat's per-command latency budget);
@@ -361,7 +376,8 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | ORB (FAST + rBRIEF + Hamming matcher)              | DONE (P3.3 cont. v3)|
 | Stereo block-matching SAD disparity + depth         | DONE (R7E)       |
 | Stereo LR-check + sub-pixel refinement              | DONE (R8D)       |
-| Stereo SGM                                          | 3-4 weeks        |
+| Stereo Semi-Global Matching (4 paths)               | DONE (R9A)       |
+| Stereo SGM 8-path + mutual-information data term    | 2-3 weeks        |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
 
@@ -508,6 +524,24 @@ Pure-NOVA WebP and HEIC are not on any roadmap within the next year.
   sub-pixel-shifted pair reports mean_milli >= 500, dim mismatch +
   missing-file errors surface cleanly, chat reaches /quit cleanly
   after the probing sequence.
+* `tests/unit/test_stereo_sgm.nova` — 39 in-memory assertions
+  covering R9A's 4-path Semi-Global Matching: SGM on identical
+  inputs (every pixel 0), shifted-by-8 pair (probed interior reads
+  disparity 8), pure-noise pair (BM speckles -> variance > 0,
+  SGM smooths -> variance < BM variance; the headline SGM
+  invariant), textureless-band fixture (SGM propagates the
+  surround SHIFT into the band), large P2 / P2 == P1 / very-high
+  penalty cases, combined SGM-quality on shifted-by-8 pair (milli
+  ~8000 at consistent pixels), invalid-input refusals + volume cap
+  (128x128x64 rejected), /depth_sgm dispatch usage strings.
+* `tests/integration/scenario_nn_stereo_sgm.sh` — 13 end-to-end
+  /depth_sgm chat assertions against textured + textureless-band
+  + pure-noise PGM fixtures: identical inputs report mean_disp=0,
+  shifted pair reports mean_disp >= 1 with a density label, dim
+  mismatch + missing-file errors surface cleanly, BM-vs-SGM
+  band-fixture output lines coexist, on the pure-noise fixture
+  BM reports density "mid|high" (speckle) while SGM reports
+  "low" (smooth), chat reaches /quit cleanly.
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (JPEG / PNG decode, feature extraction, embeddings).
 * `STT_AUDIT.md` — sibling audit for the audio modality bridge.

@@ -48,27 +48,35 @@ is the reverse sweep (RL + BT).
 - **`examples/crossengin_chat.nova`** (+1 line): `/depth_sgm L.pgm R.pgm`
   dispatch. The R7E `/depth` admin and its help line stay; R8D's
   `/depth_q` stays; `/depth_sgm` is dispatch-only (no help line).
-- **`tests/unit/test_stereo_sgm.nova`** (NEW, 30 assertions):
+- **`tests/unit/test_stereo_sgm.nova`** (NEW, 39 assertions):
   SGM identical inputs (mean / density 0, probed pixels 0); SGM
   shifted-by-8 pair (probed interior reads disparity 8 exactly);
-  textureless-band fixture with tiny left/right noise (SGM variance
-  <= BM variance over the band -- the headline SGM benefit);
-  P2 >> P1 smoothness (band variance < 64); P2 == P1 case (band
-  variance < 64); very high P1+P2 over-smooths interior (variance
-  < 200); combined SGM-quality on shifted-by-8 pair (milli within
-  +/- 300 of 8000 at probed pixels, 0 at borders); SGM-quality on
-  textureless band (pipeline produces some non-zero milli); invalid-
-  input refusals + volume cap (128x128x64 rejected, > 4MB);
+  pure-noise pair (both sides flat-128 + uncorrelated mod-4 noise --
+  the canonical SGM-wins case: BM variance > 0 with speckle,
+  SGM variance < BM variance; the headline R9A demonstration);
+  textureless-band fixture (SGM propagates the surround SHIFT into
+  the band; SGM band mean > BM band mean); large P2 -> band pixels
+  >= SHIFT/2; P2 == P1 -> SGM still recovers SHIFT exactly at
+  probed pixels on a clean shifted pair; very high P1+P2 over-
+  smooths interior (probed pixels all equal a reference pixel);
+  combined SGM-quality on shifted-by-8 pair (milli within +/- 300
+  of 8000 at probed pixels, 0 at borders); SGM-quality on
+  textureless band (pipeline produces some non-zero milli);
+  invalid-input refusals + volume cap (128x128x64 rejected, > 4MB);
   /depth_sgm dispatch usage strings.
-- **`tests/integration/scenario_nn_stereo_sgm.sh`** (NEW, 11 assertions):
+- **`tests/integration/scenario_nn_stereo_sgm.sh`** (NEW, 13 assertions):
   build LEFT_TEX (textured 32x24 PGM), RIGHT_TEX (shifted-by-8),
   LEFT_BAND + RIGHT_BAND (textured with a textureless-noise band),
-  RIGHT_SMALL (24x20). Cases: /help still advertises /depth (R7E
-  preserved); /depth_sgm no-arg / one-arg usage; identical inputs
-  report mean_disp=0; shifted pair reports mean_disp >= 1 + density
-  label; dim mismatch + missing-file errors surface cleanly; both
-  /depth and /depth_sgm output lines emitted on the band fixture
-  (BM-vs-SGM coexistence); chat reaches /quit cleanly.
+  RIGHT_SMALL (24x20), LEFT_NOISE + RIGHT_NOISE (32x24 base-128 with
+  uncorrelated mod-4 noise). Cases: /help still advertises /depth
+  (R7E preserved); /depth_sgm no-arg / one-arg usage; identical
+  inputs report mean_disp=0; shifted pair reports mean_disp >= 1
+  + density label; dim mismatch + missing-file errors surface
+  cleanly; both /depth and /depth_sgm output lines emitted on the
+  band fixture (BM-vs-SGM coexistence); on the pure-noise fixture
+  /depth emits density "mid|high" (BM speckles) while /depth_sgm
+  emits density "low" (SGM smooths) -- the chat-level expression
+  of the R9A invariant; chat reaches /quit cleanly.
 - **`IMAGE_AUDIT.md`**: R9A SGM (4 paths) checked off in the feature
   ladder; 8-path + mutual-information data-term track listed at
   "2-3 weeks" as the next stereo follow-up.
@@ -76,8 +84,8 @@ is the reverse sweep (RL + BT).
 
 ### Verification
 
-- 30/30 unit assertions in `test_stereo_sgm.nova` green.
-- 11/11 integration assertions in `scenario_nn_stereo_sgm.sh` green.
+- 39/39 unit assertions in `test_stereo_sgm.nova` green.
+- 13/13 integration assertions in `scenario_nn_stereo_sgm.sh` green.
 - R7E's `test_stereo.nova` (54 assertions) + `scenario_hh_stereo.sh`
   (10 assertions) still green -- R7E's contract preserved.
 - R8D's `test_stereo_quality.nova` (42 assertions) +

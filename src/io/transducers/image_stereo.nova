@@ -107,6 +107,23 @@
 //   stereo_quality_pgm_args(arg)
 //       -> dispatch wrapper that splits `arg` on the first space.
 //
+// SGM API (R9A follow-up; cost aggregated along 4 scanline paths):
+//   stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2)
+//       -> [disp_map_bytes, mean, density_milli, total]
+//          Semi-global matching with 4 paths (LR + TB + RL + BT). p1=0
+//          / p2=0 use defaults (8 and 32). Cap dims at 128x128 with
+//          MAX_DISP <= 64 to keep the cost volume under 4MB.
+//   stereo_disparity_sgm_quality(left, right, w, h, win_size, max_disp,
+//                                p1, p2, lr_tolerance)
+//       -> [milli_list, mean_milli, density_milli, total]
+//          SGM + LR-check + sub-pixel parabolic refinement on the
+//          aggregated cost.
+//   stereo_sgm_pgm_paths(path_l, path_r)
+//       -> formatted "(depth_sgm WxH mean_disp=N density=M LABEL)" line
+//          for the optional /depth_sgm chat admin.
+//   stereo_sgm_pgm_args(arg)
+//       -> dispatch wrapper that splits `arg` on the first space.
+//
 // Pixel-area cap: STEREO_MAX_DIM = 256 per axis (max area 65536). The
 // inner loop runs in O(W * H * MAX_DISP * WIN_SIZE^2). With WIN_SIZE=7
 // and MAX_DISP=64 that is 49 * 64 = 3136 ops per pixel. At 256x256
@@ -1027,5 +1044,771 @@ fn stereo_quality_pgm_args(arg) {
     }
     let parts = _stereo_split_two(arg)
     return stereo_quality_pgm_paths(parts[0], parts[1])
+}
+
+// =========================================================================
+// R9A follow-up: Semi-Global Matching (SGM) stereo
+// =========================================================================
+//
+// R7E + R8D run an INDEPENDENT per-pixel SAD minimization. That works on
+// well-textured scenes but produces speckle in low-texture regions and
+// can pick wildly-wrong disparities at occlusion boundaries. Hirschmuller
+// (2008) "Stereo Processing by Semiglobal Matching and Mutual Information"
+// shows that AGGREGATING the matching cost along multiple 1-D scanline
+// paths (left-right, top-bottom, and the reverse pair) approximates a 2-D
+// global energy minimization at 1-D cost. The aggregation enforces local
+// smoothness (small P1 penalty for a 1-pixel disparity jump) while
+// permitting large depth discontinuities at edges (the larger P2 penalty
+// is data-aware in the full paper; we use a constant here for simplicity).
+//
+// Algorithm (simplified, 4-path version):
+//   1. C(x, y, d) = SAD over a WIN_SIZE x WIN_SIZE block of left at (x,y)
+//      against right at (x-d, y); same data term as R7E.
+//   2. For each path direction r in { left->right, top->bottom,
+//      right->left, bottom->top } and each pixel p along that path:
+//        L_r(p, d) = C(p, d) + min(
+//            L_r(p-r, d),
+//            L_r(p-r, d-1) + P1,
+//            L_r(p-r, d+1) + P1,
+//            min_d' L_r(p-r, d') + P2
+//          ) - min_d' L_r(p-r, d')
+//      The subtraction prevents L from growing unbounded; it's a uniform
+//      offset that does not change the argmin.
+//   3. Aggregate: S(p, d) = sum over r of L_r(p, d).
+//   4. Output disparity at p = argmin_d S(p, d).
+//
+// Implementation notes:
+//   * Cost volume C is laid out as W * H * D ints at base addr `cost`.
+//     Access: cost + (y * W + x) * D * 8 + d * 8 (8 bytes per int).
+//   * For the 4 paths we accumulate into a SINGLE S buffer (same layout):
+//     after pass 1 (LR + TB) S is partial; after pass 2 (RL + BT) S is
+//     complete; then argmin yields the final disparity.
+//   * Each path keeps only ONE previous-line buffer of size W * D (for
+//     vertical paths) or D (for horizontal paths) so working memory stays
+//     bounded.
+//   * Window border + invalid columns (where x - d < 0) get cost INFINITY
+//     so SGM never picks them.
+//
+// Memory budget (W*H*D ints, 8 bytes each):
+//   64x64,  D=16  ->  64K ints  ~512KB
+//   64x64,  D=32  -> 131K ints  ~1MB
+//   128x128,D=32  -> 524K ints  ~4MB  (the SGM cap we enforce)
+//   128x128,D=64  ->  1M ints   ~8MB  (rejected)
+//
+// Public API:
+//   stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2)
+//       -> [disp_map_bytes, mean, density_milli, total]
+//          Same shape as stereo_disparity (R7E). Pass p1=0 / p2=0 to use
+//          the default penalties (8 and 32).
+//   stereo_disparity_sgm_quality(left, right, w, h, win_size, max_disp,
+//                                p1, p2, lr_tolerance)
+//       -> [milli_list, mean_milli, density_milli, total]
+//          Adds LR-check + sub-pixel parabolic refinement on top of the
+//          SGM aggregated cost volume. The LR-check uses the integer SGM
+//          map (left->right) compared against an R8D-style right->left
+//          block-matching map (full SGM in both directions would double
+//          the memory budget; the per-pixel LR-check is the same shape
+//          either way and the block-matching right pass is what R8D used).
+//
+// Penalty defaults:
+//   STEREO_SGM_DEFAULT_P1 = 8    -- small step penalty
+//   STEREO_SGM_DEFAULT_P2 = 32   -- large step penalty
+//   The textbook ratio is roughly P2 / P1 ~= 4-8; we pick 4 here.
+
+// SGM-specific caps. Cost volume W*H*D ints must fit in 4MB = 512K ints
+// (8 bytes each). 128x128x32 = 524288 -> exactly at the cap; larger is
+// rejected. We enforce both per-axis (<=128) and the product (<=512K).
+let STEREO_SGM_MAX_DIM       = 128
+let STEREO_SGM_MAX_DISP      = 64
+let STEREO_SGM_MAX_VOLUME    = 524288    // W*H*D
+let STEREO_SGM_INF           = 1000000000
+let STEREO_SGM_DEFAULT_P1    = 8
+let STEREO_SGM_DEFAULT_P2    = 32
+
+// Clamp helpers for the SGM penalty arguments (caller passes 0 to use the
+// default; negative values are treated as the default; very large values
+// are capped to keep arithmetic in range alongside SAD per-window).
+fn _stereo_sgm_clamp_p1(p1) {
+    if p1 <= 0 { return STEREO_SGM_DEFAULT_P1 }
+    if p1 > 10000 { return 10000 }
+    return p1
+}
+
+fn _stereo_sgm_clamp_p2(p2, p1) {
+    if p2 <= 0 { return STEREO_SGM_DEFAULT_P2 }
+    if p2 > 100000 { return 100000 }
+    if p2 < p1 { return p1 }   // P2 must be at least P1 by definition
+    return p2
+}
+
+fn _stereo_sgm_clamp_max_disp(max_disp) {
+    if max_disp <= 0 { return STEREO_DEFAULT_MAX_DISP }
+    if max_disp > STEREO_SGM_MAX_DISP { return STEREO_SGM_MAX_DISP }
+    return max_disp
+}
+
+// ---- raw int buffer accessors -------------------------------------------
+//
+// store64 / load64 give us an 8-byte-per-int packed buffer. We treat
+// `base + idx * 8` as the address for entry `idx`. The buffer is allocated
+// with alloc(num_ints * 8 + 8) -- the trailing 8 keeps store64 in-bounds
+// at idx == num_ints - 1.
+
+fn _sgm_buf_alloc(num_ints, init_value) {
+    let bytes = int_mul(num_ints, 8)
+    let buf = alloc(int_add(bytes, 8))
+    let i = 0
+    while i < num_ints {
+        store64(int_add(buf, int_mul(i, 8)), init_value)
+        i = int_add(i, 1)
+    }
+    return buf
+}
+
+fn _sgm_set(buf, idx, val) {
+    store64(int_add(buf, int_mul(idx, 8)), val)
+}
+
+fn _sgm_get(buf, idx) {
+    return load64(int_add(buf, int_mul(idx, 8)))
+}
+
+// ---- cost-volume build ---------------------------------------------------
+//
+// _stereo_sgm_build_cost(left, right, w, h, ws, md) -> ptr
+//   Returns a packed int buffer of size W*H*D, indexed as
+//   (y * W + x) * D + d. For interior pixels we compute SAD over the
+//   WIN_SIZE x WIN_SIZE block. For border pixels OR offsets where
+//   x - d - half < 0 we write STEREO_SGM_INF so the aggregation never
+//   picks them. Border rows / columns store INF for every d.
+
+fn _stereo_sgm_build_cost(left, right, w, h, ws, md) {
+    let half = ws / 2
+    let area = int_mul(w, h)
+    let volume = int_mul(area, md)
+    let cost = _sgm_buf_alloc(volume, STEREO_SGM_INF)
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let base = int_mul(int_add(int_mul(y, w), x), md)
+            let cap = int_sub(x, half)
+            let local_max_d = int_sub(md, 1)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 - 1 }  // -1 -> no valid d
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block(left, right, w,
+                                           x, int_sub(x, d), y, ws)
+                _sgm_set(cost, int_add(base, d), sad)
+                d = int_add(d, 1)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return cost
+}
+
+// ---- path aggregation ----------------------------------------------------
+//
+// Each path's recurrence needs L_r(p - r, *) (the previous step along the
+// path) and min_d' L_r(p - r, d'). We keep ONE rolling buffer per path:
+//   * Horizontal paths (LR, RL): a single D-sized buffer of "previous
+//     pixel's L_r" + its scalar min.
+//   * Vertical paths (TB, BT): a W*D-sized buffer of "previous row's L_r"
+//     + a W-sized buffer of per-column scalar mins.
+// We DON'T allocate W*H*D for L_r itself; we accumulate directly into S.
+//
+// Update rule:
+//   m_prev      = min over d' of L_r(p - r, d')
+//   candidate_a = L_r(p - r, d)
+//   candidate_b = L_r(p - r, d - 1) + P1   (if d > 0)
+//   candidate_c = L_r(p - r, d + 1) + P1   (if d < D - 1)
+//   candidate_d = m_prev + P2
+//   L_r(p, d)   = C(p, d) + min(a, b, c, d) - m_prev
+// And we add L_r(p, d) into S(p, d) at the same time.
+
+fn _sgm_min2(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn _sgm_min4(a, b, c, d) {
+    let m = a
+    if b < m { m = b }
+    if c < m { m = c }
+    if d < m { m = d }
+    return m
+}
+
+// LR path: for each row, scan x = 0 .. w-1. Keep one D-sized rolling
+// buffer `prev` + scalar `prev_min`.
+fn _sgm_aggregate_lr(cost, sum, w, h, md, p1, p2) {
+    // prev: L_r at previous pixel for all d; prev_min: scalar min.
+    let prev = _sgm_buf_alloc(md, STEREO_SGM_INF)
+    let y = 0
+    while y < h {
+        // Reset prev for new row (no L_r from the previous row counts here).
+        let i = 0
+        while i < md {
+            _sgm_set(prev, i, STEREO_SGM_INF)
+            i = int_add(i, 1)
+        }
+        let prev_min = STEREO_SGM_INF
+        let x = 0
+        let row_off = int_mul(y, w)
+        while x < w {
+            let base = int_mul(int_add(row_off, x), md)
+            // First pixel in row: L_r = C (no previous to combine with).
+            let curr_min = STEREO_SGM_INF
+            // We need to compute new L for all d into a temp, then sum into S
+            // and roll into prev. Allocate temp per pixel keeps memory bounded.
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if x == 0 {
+                    l_val = c_pd
+                } else {
+                    if prev_min >= STEREO_SGM_INF {
+                        // No valid prev (e.g. first usable pixel after border).
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(prev, d)
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(prev, int_sub(d, 1)), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(prev, int_add(d, 1)), p1)
+                        }
+                        let dd = int_add(prev_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        // Cap c_pd contribution if it's already infinity:
+                        // INF + anything = still treated as INF after the
+                        // subtraction prev_min; we keep it as c_pd to flag.
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_min { curr_min = l_val }
+                d = int_add(d, 1)
+            }
+            // Add temp into sum; copy temp -> prev.
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(prev, d2, l_val)
+                d2 = int_add(d2, 1)
+            }
+            prev_min = curr_min
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return 0
+}
+
+// RL path: each row, scan x = w-1 .. 0.
+fn _sgm_aggregate_rl(cost, sum, w, h, md, p1, p2) {
+    let prev = _sgm_buf_alloc(md, STEREO_SGM_INF)
+    let y = 0
+    while y < h {
+        let i = 0
+        while i < md {
+            _sgm_set(prev, i, STEREO_SGM_INF)
+            i = int_add(i, 1)
+        }
+        let prev_min = STEREO_SGM_INF
+        let x = int_sub(w, 1)
+        let row_off = int_mul(y, w)
+        while x >= 0 {
+            let base = int_mul(int_add(row_off, x), md)
+            let curr_min = STEREO_SGM_INF
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if x == int_sub(w, 1) {
+                    l_val = c_pd
+                } else {
+                    if prev_min >= STEREO_SGM_INF {
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(prev, d)
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(prev, int_sub(d, 1)), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(prev, int_add(d, 1)), p1)
+                        }
+                        let dd = int_add(prev_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_min { curr_min = l_val }
+                d = int_add(d, 1)
+            }
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(prev, d2, l_val)
+                d2 = int_add(d2, 1)
+            }
+            prev_min = curr_min
+            x = int_sub(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return 0
+}
+
+// TB path: scan rows top to bottom. Maintain a W*D rolling buffer of the
+// "previous row's L" and a W-sized vector of per-column scalar mins.
+fn _sgm_aggregate_tb(cost, sum, w, h, md, p1, p2) {
+    let row_buf = _sgm_buf_alloc(int_mul(w, md), STEREO_SGM_INF)
+    let row_min = _sgm_buf_alloc(w, STEREO_SGM_INF)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let base = int_mul(int_add(row_off, x), md)
+            let prev_col_min = _sgm_get(row_min, x)
+            let prev_col_base = int_mul(x, md)
+            let curr_col_min = STEREO_SGM_INF
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if y == 0 {
+                    l_val = c_pd
+                } else {
+                    if prev_col_min >= STEREO_SGM_INF {
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(row_buf, int_add(prev_col_base, d))
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(row_buf,
+                                                  int_add(prev_col_base,
+                                                          int_sub(d, 1))), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(row_buf,
+                                                   int_add(prev_col_base,
+                                                           int_add(d, 1))), p1)
+                        }
+                        let dd = int_add(prev_col_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_col_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_col_min { curr_col_min = l_val }
+                d = int_add(d, 1)
+            }
+            // Add into sum and stash into row_buf for next y.
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(row_buf, int_add(prev_col_base, d2), l_val)
+                d2 = int_add(d2, 1)
+            }
+            _sgm_set(row_min, x, curr_col_min)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return 0
+}
+
+// BT path: scan rows bottom to top.
+fn _sgm_aggregate_bt(cost, sum, w, h, md, p1, p2) {
+    let row_buf = _sgm_buf_alloc(int_mul(w, md), STEREO_SGM_INF)
+    let row_min = _sgm_buf_alloc(w, STEREO_SGM_INF)
+    let y = int_sub(h, 1)
+    while y >= 0 {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let base = int_mul(int_add(row_off, x), md)
+            let prev_col_min = _sgm_get(row_min, x)
+            let prev_col_base = int_mul(x, md)
+            let curr_col_min = STEREO_SGM_INF
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if y == int_sub(h, 1) {
+                    l_val = c_pd
+                } else {
+                    if prev_col_min >= STEREO_SGM_INF {
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(row_buf, int_add(prev_col_base, d))
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(row_buf,
+                                                  int_add(prev_col_base,
+                                                          int_sub(d, 1))), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(row_buf,
+                                                   int_add(prev_col_base,
+                                                           int_add(d, 1))), p1)
+                        }
+                        let dd = int_add(prev_col_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_col_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_col_min { curr_col_min = l_val }
+                d = int_add(d, 1)
+            }
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(row_buf, int_add(prev_col_base, d2), l_val)
+                d2 = int_add(d2, 1)
+            }
+            _sgm_set(row_min, x, curr_col_min)
+            x = int_add(x, 1)
+        }
+        y = int_sub(y, 1)
+    }
+    return 0
+}
+
+// ---- argmin to disparity map --------------------------------------------
+//
+// _stereo_sgm_argmin(sum, w, h, ws, md) -> byte buffer (disparity map)
+//   For each interior pixel, walks the D entries in `sum` and picks the
+//   smallest. Border pixels (within `half` of the edge) store 0. The
+//   returned buffer is the standard R7E disparity-map byte layout.
+
+fn _stereo_sgm_argmin(sum, w, h, ws, md) {
+    let area = int_mul(w, h)
+    let map = _stereo_zero_map(area)
+    let half = ws / 2
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let base = int_mul(int_add(row_off, x), md)
+            let best = _sgm_get(sum, base)
+            let best_d = 0
+            let d = 1
+            while d < md {
+                let s = _sgm_get(sum, int_add(base, d))
+                if s < best {
+                    best = s
+                    best_d = d
+                }
+                d = int_add(d, 1)
+            }
+            if best_d > 255 { best_d = 255 }
+            store8(map + int_add(row_off, x), best_d)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return map
+}
+
+// ---- stereo_disparity_sgm ------------------------------------------------
+//
+// Public 4-path SGM entry point. Mirrors stereo_disparity's contract.
+
+fn stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2) {
+    if w <= 0   { return _stereo_fail() }
+    if h <= 0   { return _stereo_fail() }
+    if left == 0  { return _stereo_fail() }
+    if right == 0 { return _stereo_fail() }
+    if w > STEREO_SGM_MAX_DIM { return _stereo_fail() }
+    if h > STEREO_SGM_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(w, h)
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_sgm_clamp_max_disp(max_disp)
+    let pp1 = _stereo_sgm_clamp_p1(p1)
+    let pp2 = _stereo_sgm_clamp_p2(p2, pp1)
+    let volume = int_mul(area, md)
+    if volume > STEREO_SGM_MAX_VOLUME { return _stereo_fail() }
+    let half = ws / 2
+    if w < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if h < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+
+    let cost = _stereo_sgm_build_cost(left, right, w, h, ws, md)
+    let sum  = _sgm_buf_alloc(volume, 0)
+
+    // Pass 1: cache-friendly forward sweep (LR + TB).
+    _sgm_aggregate_lr(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_tb(cost, sum, w, h, md, pp1, pp2)
+    // Pass 2: reverse sweep (RL + BT).
+    _sgm_aggregate_rl(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_bt(cost, sum, w, h, md, pp1, pp2)
+
+    let map = _stereo_sgm_argmin(sum, w, h, ws, md)
+
+    // Stats over interior pixels.
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let dv = load8(map + int_add(row_off, x))
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, dv)
+            if dv > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// ---- stereo_disparity_sgm_quality ---------------------------------------
+//
+// SGM + LR-check + sub-pixel refinement. We:
+//   1. Build the SGM cost volume and aggregate (same as
+//      stereo_disparity_sgm).
+//   2. Argmin to get the integer SGM disparity map (left->right).
+//   3. Run R8D's right->left block-matching disparity scan.
+//   4. For each interior left pixel, compare the SGM disparity at (x, y)
+//      with the right pass's disparity at (x - d_L, y). If they agree
+//      within tolerance, refine the SGM disparity sub-pixel by fitting
+//      a parabola to S(x, y, d*-1), S(x, y, d*), S(x, y, d*+1).
+//   5. Inconsistent pixels store 0 milli (matching the integer LR contract).
+//
+// We reuse the SGM aggregated sum (which is a smoothed, monotonic-near-min
+// curve in d) for the parabolic fit -- not the raw SAD -- because the
+// SGM-aggregated S(x, y, d) is the actual cost function whose argmin we
+// took, so its parabolic neighborhood reflects the SGM-smoothed minimum.
+
+fn stereo_disparity_sgm_quality(left, right, w, h,
+                                win_size, max_disp,
+                                p1, p2, lr_tolerance) {
+    let empty = list_new()
+    if w <= 0   { return _stereo_result(empty, 0, 0, 0) }
+    if h <= 0   { return _stereo_result(empty, 0, 0, 0) }
+    if left == 0  { return _stereo_result(empty, 0, 0, 0) }
+    if right == 0 { return _stereo_result(empty, 0, 0, 0) }
+    if w > STEREO_SGM_MAX_DIM { return _stereo_result(empty, 0, 0, 0) }
+    if h > STEREO_SGM_MAX_DIM { return _stereo_result(empty, 0, 0, 0) }
+    let area = int_mul(w, h)
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_sgm_clamp_max_disp(max_disp)
+    let pp1 = _stereo_sgm_clamp_p1(p1)
+    let pp2 = _stereo_sgm_clamp_p2(p2, pp1)
+    let tol = _stereo_clamp_lr_tol(lr_tolerance)
+    let volume = int_mul(area, md)
+    if volume > STEREO_SGM_MAX_VOLUME { return _stereo_result(empty, 0, 0, 0) }
+    let half = ws / 2
+
+    // Pre-allocate milli list area entries.
+    let milli = list_new()
+    let z = 0
+    while z < area {
+        push(milli, 0)
+        z = int_add(z, 1)
+    }
+    if w < int_add(ws, 1) { return _stereo_result(milli, 0, 0, area) }
+    if h < ws             { return _stereo_result(milli, 0, 0, area) }
+
+    let cost = _stereo_sgm_build_cost(left, right, w, h, ws, md)
+    let sum  = _sgm_buf_alloc(volume, 0)
+    _sgm_aggregate_lr(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_tb(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_rl(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_bt(cost, sum, w, h, md, pp1, pp2)
+    let map_L = _stereo_sgm_argmin(sum, w, h, ws, md)
+
+    // Right->left block-matching map (R8D style; cheaper than full SGM).
+    let map_R = _stereo_disparity_right(left, right, w, h, ws, md)
+
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let dL = load8(map_L + int_add(row_off, x))
+            let x_r = int_sub(x, dL)
+            let consistent = 0
+            if x_r >= half {
+                if x_r < int_sub(w, half) {
+                    let dR = load8(map_R + int_add(row_off, x_r))
+                    let diff = int_sub(dL, dR)
+                    if diff < 0 { diff = 0 - diff }
+                    if diff <= tol { consistent = 1 }
+                }
+            }
+            let m_disp = 0
+            if consistent == 1 {
+                if dL > 0 {
+                    let base = int_mul(int_add(row_off, x), md)
+                    let s_0 = _sgm_get(sum, int_add(base, dL))
+                    let s_m1 = s_0
+                    if dL > 0 {
+                        s_m1 = _sgm_get(sum, int_add(base, int_sub(dL, 1)))
+                    }
+                    let s_p1 = s_0
+                    if int_add(dL, 1) < md {
+                        s_p1 = _sgm_get(sum, int_add(base, int_add(dL, 1)))
+                    }
+                    m_disp = _stereo_subpx_refine(dL, s_m1, s_0, s_p1)
+                } else {
+                    m_disp = 0
+                }
+            }
+            list_set(milli, int_add(row_off, x), m_disp)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, m_disp)
+            if m_disp > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(milli, mean, density_milli, area)
+}
+
+// ---- chat /depth_sgm helpers --------------------------------------------
+//
+// Optional SGM-mode chat admin. Same shape as stereo_pgm_args /
+// stereo_quality_pgm_args.
+
+fn stereo_sgm_pgm_paths(path_l, path_r) {
+    if len(path_l) == 0 {
+        return "(/depth_sgm needs two PATHs -- usage: /depth_sgm L.pgm R.pgm)"
+    }
+    if len(path_r) == 0 {
+        return "(/depth_sgm needs TWO paths -- got 1)"
+    }
+    let r_l = pgm_parse_file(path_l)
+    let err_l = pgm_result_error(r_l)
+    if len(err_l) > 0 {
+        return "(depth_sgm FAILED on L: " + err_l + ")"
+    }
+    let r_r = pgm_parse_file(path_r)
+    let err_r = pgm_result_error(r_r)
+    if len(err_r) > 0 {
+        return "(depth_sgm FAILED on R: " + err_r + ")"
+    }
+    let w_l = pgm_result_width(r_l)
+    let h_l = pgm_result_height(r_l)
+    let w_r = pgm_result_width(r_r)
+    let h_r = pgm_result_height(r_r)
+    if w_l != w_r {
+        return "(depth_sgm FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if h_l != h_r {
+        return "(depth_sgm FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if w_l > STEREO_SGM_MAX_DIM { return "(depth_sgm FAILED: L too large -- max 128x128)" }
+    if h_l > STEREO_SGM_MAX_DIM { return "(depth_sgm FAILED: L too large -- max 128x128)" }
+    let d_l = pgm_result_data(r_l)
+    let d_r = pgm_result_data(r_r)
+    let s = stereo_disparity_sgm(d_l, d_r, w_l, h_l,
+                                 STEREO_DEFAULT_WIN_SIZE,
+                                 32,
+                                 STEREO_SGM_DEFAULT_P1,
+                                 STEREO_SGM_DEFAULT_P2)
+    let mean = stereo_result_mean(s)
+    let density = stereo_result_density(s)
+    return "(depth_sgm " + int_to_str(w_l) + "x" + int_to_str(h_l)
+        + " mean_disp=" + int_to_str(mean)
+        + " density=" + int_to_str(density)
+        + "milli " + stereo_density_label(density) + ")"
+}
+
+fn stereo_sgm_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/depth_sgm needs two PATHs -- usage: /depth_sgm L.pgm R.pgm)"
+    }
+    let parts = _stereo_split_two(arg)
+    return stereo_sgm_pgm_paths(parts[0], parts[1])
 }
 
