@@ -11,7 +11,27 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 132 modules compile (`make build`, unchanged from the snapshot
+> toolchain: 134 modules compile (`make build`, +1 from
+> `io/transducers/image_orb.nova` added in P3.3 cont. v3 ORB feature
+> detector + Hamming-distance matcher -- the patent-free, integer-only
+> SIFT alternative (Rublee 2011): FAST-9 16-pixel Bresenham-circle
+> 9-of-9-contiguous corner test (t=20) + Harris-proximity ranking
+> reusing `harris_apply` from R1.6 + intensity-centroid orientation
+> (m_01/m_10 over a 31x31 patch, quantized to 30 buckets via a
+> precomputed cos/sin milli-unit table) + 256-bit rBRIEF descriptor
+> (LFSR-generated point pairs from a Galois 16-bit LFSR, polynomial
+> x^16+x^14+x^13+x^11+1, seed 0x12345; each pair rotated by the
+> keypoint angle before sampling) + Hamming-distance matcher with
+> Lowe ratio 0.75 (popcount-of-XOR over 8 int32 chunks; byte-wise
+> XOR / popcount synthesized from int_add / int_mul / % since NOVA
+> exposes no native bitwise builtins). On the 40x40 four-spots
+> reference fixture ORB finds 96 keypoints per image with 96
+> self-matches and 96 rotation matches (rotation invariance verified
+> by the unit suite); the spots-vs-vertical-edge cross fixture
+> produces 0 matches (the Harris-proximity filter rejects every FAST
+> candidate on a single-direction edge). New chat admin:
+> `/orb_match A B`. Documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> unchanged from the snapshot
 > v1 -> v2 migration session -- the bump landed inside the existing
 > `persistence/snapshot_{writer,disk,reader}.nova` trio +
 > `examples/migrate_snap.nova` (NEW) +
@@ -30,6 +50,19 @@ computational units rather than orchestrating a pipeline of modules.
 > atom on images >= 32x32. Documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 from
+> `safety/bignum_256.nova` added in R6B Montgomery REDC mirror for the
+> 256-bit case -- a parallel `bn256_*` prefix to the existing `bn_*`
+> from `bignum.nova` with CIOS-form Montgomery REDC backing
+> `bn256_modpow_ct`. Observed **~14x speedup** vs the legacy
+> bit-by-bit reducer (Mont ~3.1 ms vs Legacy ~45 ms) on the
+> Curve25519 prime with the full 254-bit `p-1` exponent; the
+> headline Fermat check `bn256_modpow_ct(2, p-1, p) == 1` passes in
+> ~3.1 ms wall-clock. Same INTENTIONAL OMISSION as bignum_2048: no
+> non-CT `bn256_modpow` (the existing `bn_modpow` in `bignum.nova`
+> covers the offline-only case). The new prefix is ship-able alongside
+> the legacy `bn_*` without touching any in-use call site;
+> `bn256_curve25519_p()` exposes the Curve25519 field prime
+> `p = 2^255 - 19` lazily. +1 from
 > `safety/bignum_2048.nova` added in P3.9 cont. 2048-bit DH on RFC 7919
 > Group 14 -- the cryptographically-reasonable upgrade to the 256-bit
 > v2-sa-dh strawman SECAGG_AUDIT.md flagged as broken; **extended in
@@ -157,8 +190,24 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 138 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 141 unit-test suites pass
 > (`make test`,
+> +1 suite / +34 assertions from `test_orb.nova` added in P3.3 cont. v3
+> ORB feature detector + Hamming-distance matcher: FAST-9 4-corner
+> detection on a 40x40 four-spots fixture surfaces 96 keypoints; orb
+> self-match yields 96 matches at Hamming distance 0; identical
+> descriptors -> 0; fully flipped 8-chunk descriptors (256-bit XOR =
+> all ones) -> Hamming 256; single-bit difference -> 1; cross-fixture
+> spots-vs-vertical-edge -> 0 matches (Harris filter rejects every FAST
+> candidate on a straight edge); 90-degree rotated four-spots -> at
+> least 1 match survives at ratio 900 milli (rotation invariance via
+> the intensity-centroid orientation + cos/sin rotation table); too-
+> small (16x16), too-large (300x300), null data_ptr, zero-width all
+> return 0 keypoints; matcher edge cases (empty inputs, < 2 candidates
+> in B, size-mismatch descriptors) all return empty / -1; count-bucket
+> labels + density labels round-trip; orb_kp_x/y/angle/score
+> accessors return values in expected ranges. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 suite / +22 assertions from `test_image_canny.nova` added in
 > P3.3 cont. Canny edge detection: uniform 32x32 -> 0 edges; vertical
 > step -> 30 edges (single-column NMS-thinned from Sobel's 60); diagonal
@@ -241,6 +290,20 @@ computational units rather than orchestrating a pipeline of modules.
 > Documented in [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md)
 > ("Montgomery REDC landed; timing reduced from ~18s to ~1.2s
 > per modpow_ct")),
+> +1 suite / +70 assertions from `test_bignum_256.nova` added in R6B
+> Montgomery REDC mirror for the 256-bit case: full coverage of the
+> new `bn256_*` API (`bn256_new` / `bn256_from_int` / `bn256_from_hex` /
+> `bn256_to_hex` / `bn256_eq` / `bn256_cmp` / `bn256_add` / `bn256_sub` /
+> `bn256_mul` / `bn256_mod` / `bn256_modmul` / `bn256_modpow_ct` plus
+> the Montgomery primitives `bn256_mont_ctx_new` / `bn256_to_mont` /
+> `bn256_from_mont` / `bn256_montmul` / `bn256_modpow_ct_mont` and the
+> legacy equivalence anchor `_bn256_modpow_ct_legacy`); the headline
+> Fermat check `bn256_modpow_ct(2, p-1, p) == 1` on the Curve25519
+> prime; mont == legacy equivalence on 2 pseudo-random vectors at
+> small N=1009 PLUS one cross-check on the Curve25519 prime with an
+> arbitrary 64-bit exponent; speedup-ratio measurement on the
+> Curve25519 prime with the full 254-bit `p-1` exponent reporting
+> **~14x speedup** (Mont ~3.1 ms vs Legacy ~45 ms),
 > +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
