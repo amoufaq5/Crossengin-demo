@@ -751,3 +751,76 @@ scenario `scenario_u_secagg.sh` (U.dh2048 stage) completes the full
 2-soul DH-2048 SecAgg round in ~**19 seconds** end-to-end (was
 ~141 s pre-Mont; the 180s scenario deadline still holds for slow-
 sandbox headroom).
+
+## What "bignum_256 landed" means concretely (R6B Montgomery REDC mirror)
+
+`src/safety/bignum_256.nova` (NEW in R6B) is an 8-limb (32-bit-per-limb)
+pure-NOVA 256-bit unsigned bignum library, parallel to the existing
+`bignum.nova` (the `bn_*` prefix) and `bignum_2048.nova` (the `bn2048_*`
+prefix). It mirrors R4D's Montgomery REDC upgrade for the 256-bit case:
+the bit-by-bit reducer behind every modmul is replaced by CIOS-form
+Montgomery REDC, dropping `bn256_modpow_ct` on the Curve25519 prime
+from ~45 ms (legacy) to ~3.1 ms (Montgomery) wall-clock -- a **~14x
+speedup** measured end-to-end on this dev container with the full
+254-bit `p-1` exponent.
+
+The new `bn256_*` prefix is shipped alongside the existing `bn_*`
+prefix from `bignum.nova` rather than replacing it. Existing callers
+(Curve25519 ECDH emulation paths, ChaCha20-Poly1305 field math, the
+`secure_aggregation.nova` DH-256 fallback) continue to import
+`bignum.nova` with byte-identical semantics during the transition;
+the upgrade is opt-in via the `bn256_*` prefix and a future patch
+can migrate consumers when convenient.
+
+Public surface mirrors `bignum_2048.nova`:
+`bn256_new` / `bn256_from_int` / `bn256_from_hex` / `bn256_to_hex` /
+`bn256_zero` / `bn256_eq` / `bn256_cmp` / `bn256_add` / `bn256_sub` /
+`bn256_mul` / `bn256_mod` / `bn256_modmul` / `bn256_modpow_ct` /
+`bn256_mont_ctx_new` / `bn256_to_mont` / `bn256_from_mont` /
+`bn256_montmul` / `bn256_modpow_ct_mont`; plus `bn256_curve25519_p()`
+for the Curve25519 field prime `p = 2^255 - 19`.
+
+**INTENTIONAL OMISSION (mirror of bignum_2048.nova):** there is NO
+`bn256_modpow` (non-CT square-and-multiply variant) in this module.
+The legacy non-CT path lives in `bignum.nova` as `bn_modpow` for
+offline test vectors only. For 256-bit DH / ECDH, only the CT path
+is safe to expose to any remote-callable code path.
+
+### CIOS implementation note (same anti-pattern as bn2048)
+
+The inner-loop 32x32 -> 64-bit multiplies are INLINED (split into
+16-bit halves directly) rather than calling a helper that returns a
+`[lo, hi]` pair. The helper form would allocate ~512k short-lived
+2-element lists per modpow at 256 bits; the 2048-bit module's
+experience was the same anti-pattern allocating ~32M pairs per
+modpow ballooning the heap to 14GB+ before the inline fix. The
+inline form allocates ZERO per-iter lists past the one-shot 9-limb
+accumulator, and the modpow runs cleanly inside the sandbox budget.
+
+### Test coverage
+
+`tests/unit/test_bignum_256.nova` (NEW in R6B) -- **70 assertions**
+across 27 test functions covering: hex round-trip / carry chains /
+underflow wrap / mul small + carry-into-hi + max-squared / mod /
+modmul / modpow_ct textbook + edges + Curve25519 2^255 sanity;
+Montgomery context round-trip on N=1009; mont == legacy equivalence
+on 2 pseudo-random vectors at small N + 1 cross-check on the
+Curve25519 prime with `0xDEADBEEFDEADBEEF`; the **headline check**
+Fermat's little theorem on the Curve25519 prime
+(`bn256_modpow_ct(2, p-1, p) == 1` -- passes in ~**3.1 ms** wall-
+clock); speedup-ratio measurement on the Curve25519 prime with the
+full 254-bit `p-1` exponent. Observed median on this dev container:
+**~14x** (Mont ~3.1 ms, Legacy ~45 ms). Both paths produce the
+Fermat identity value (1) -- the speedup ratio is over the identical
+computation, not a shortcut. The test prints the ratio and asserts
+a conservative >=2x band to keep CI stable under sandbox-load
+variance.
+
+### Existing `bignum.nova` (the `bn_*` prefix) is unchanged
+
+The existing `bn_modpow_ct` continues to use the bit-by-bit reducer
+and remains the primitive in use by Curve25519 ECDH emulation, the
+ChaCha20-Poly1305 field math, and the `secure_aggregation.nova`
+DH-256 fallback. Migrating those callers to `bn256_modpow_ct` for
+the per-op ~14x speedup is a follow-up patch (the new prefix is
+ship-able without touching any in-use call site).

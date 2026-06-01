@@ -12,6 +12,24 @@ computational units rather than orchestrating a pipeline of modules.
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain: 134 modules compile (`make build`, +1 from
+> `kg/episodic.nova` added in R6F -- the ADR-0022 episodic-memory
+> consolidation cycle. Scans the recent moment stream for clusters of
+> atoms that co-occur >=5 times within a small temporal window
+> (>=3 atoms within 10 ticks @100Hz), promotes each into a compound
+> "episodic atom" with Beta(alpha, beta) belief (ADR-0023) and
+> provenance label, and persists the result through the v2 snapshot's
+> EPISODIC section (new `episodic.atoms.*` sub-block; NO version bump,
+> a snapshot from a pre-this-build writer parses cleanly). Wired into
+> the memory loop (ADR-0036) as a sub-task -- ADR-0036 reserves the
+> 6+1 loop slots, so consolidation rides on memory, which already owns
+> moments + episodes. New API in `src/kg/episodic.nova`:
+> `episodic_consolidate`, `episodic_match`,
+> `episodic_match_observation`, `episodic_update_belief`,
+> `episodic_observe`. New 79 unit assertions
+> (`tests/unit/test_episodic.nova`) + 37 integration assertions
+> (`tests/integration/scenario_ff_episodic.sh`) all PASS; all
+> existing scenarios (durability A/A2/A3, snapshot DD migration,
+> KG/perception Q) still green. Also +1 from
 > `io/transducers/image_orb.nova` added in P3.3 cont. v3 ORB feature
 > detector + Hamming-distance matcher -- the patent-free, integer-only
 > SIFT alternative (Rublee 2011): FAST-9 16-pixel Bresenham-circle

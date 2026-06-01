@@ -3,7 +3,273 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R6D (this session) — IO: ORB (Oriented FAST + Rotated BRIEF) feature detector + Hamming-distance matcher (patent-free SIFT alternative)
+## R6C (this session) — IO: kg_sync v3 — Noise XK handshake for mutual auth + transport encryption
+
+**Status: complete -- `src/io/transducers/noise_xk.nova` LANDED + kg_sync
+wrapped for v3.** The federation audit's "plaintext TCP" open gap is now
+closed. Two souls federating their KGs over kg_sync v3 mutually
+authenticate via static Curve25519-shape pubkeys, derive a session hash
+that transcript-binds every byte of the handshake, and run all
+post-handshake traffic through per-direction ChaCha20-Poly1305 with
+monotonic 64-bit nonces.
+
+### What landed
+
+- **`src/io/transducers/noise_xk.nova`** (NEW, ~1500 lines) — pure-NOVA
+  Noise XK pattern (noiseprotocol.org section 7.5):
+    - SHA-256 (FIPS 180-4) implementation built from scratch.
+    - HMAC-SHA256 (RFC 2104) + HKDF-Extract/Expand (RFC 5869).
+    - Curve25519-shape DH (`bn_modpow_ct` over `p_25519` with g=2; wire
+      layout matches X25519 so a real-ECDH drop-in is straightforward).
+    - ChaCha20-Poly1305 AEAD (RFC 7539) on top of the existing
+      `src/safety/chacha20.nova` + `poly1305.nova` leaves.
+    - Noise SymmetricState: MixHash, MixKey, EncryptAndHash,
+      DecryptAndHash; HandshakeState driver for the XK pattern
+      (`-> e, es`; `<- e, ee`; `-> s, se`); Split to derive the two
+      transport keys; per-direction monotonic nonce counters with
+      replay rejection on open.
+    - OS CSPRNG via `secure_random(buf, n)` (R5B builtin) with
+      nanotime+LCG fallback path.
+
+- **`src/io/transducers/kg_sync.nova`** (MODIFIED, +350 lines, no v2
+  behavior change) — v3 wrap of the existing line protocol:
+    - `kgsync_v3_handshake_initiator(fd, static_priv, peer_pub)`
+      and `kgsync_v3_handshake_responder(fd, static_priv, allowlist)`
+      drive the three handshake messages over the TCP fd.
+    - `kgsync_v3_send_line(noise_conn, line)` /
+      `kgsync_v3_recv_line(noise_conn)` wrap every line in a Noise
+      transport AEAD frame `[4 B BE len] [ct] [16 B Poly1305 tag]`.
+    - Env knobs: `CE_KGSYNC_REQUIRE_NOISE` (gate the v3 path),
+      `CE_KGSYNC_NOISE_STATIC_PRIV` (64-hex), `CE_KGSYNC_NOISE_PEER_PUB`
+      (initiator only), `CE_KGSYNC_NOISE_ALLOWLIST` (responder allowlist
+      of accepted initiator pubkeys, comma-separated).
+    - v2 plaintext remains the default for backward compatibility;
+      `CE_KGSYNC_REQUIRE_NOISE=1` flips kg_sync into "Noise-only" mode.
+
+- **`tests/unit/test_noise_xk.nova`** (NEW) — **42 assertions** across
+  10 test functions:
+    - SHA-256 known-answer vectors (FIPS 180-4 "abc", empty string,
+      448-bit boundary).
+    - HMAC-SHA256 RFC 4231 Test Case 1.
+    - DH commutativity (`a^b == b^a mod p`).
+    - Static keypair gen: priv != pub; pub matches `g^priv`.
+    - Full Noise XK handshake: msg1/2/3 sizes, recv ok at each step;
+      both sides agree on session hash + transport keys; responder
+      learns initiator's static pubkey; initiator knows responder's.
+    - Transport round-trip: I->R + R->I encrypt/decrypt with matching
+      plaintexts.
+    - Tamper detection: single-byte CT flip rejected; length-prefix
+      tamper rejected.
+    - Replay rejected (nonce monotonicity).
+    - MITM with wrong responder pubkey rejected at msg1 (the
+      initiator's `MixHash(rs)` bound to the real pub, so the responder
+      with a different priv can't reproduce the same AEAD key).
+
+- **`tests/integration/scenario_gg_noise_kg.sh`** (NEW) — **12
+  assertions** across 2 stages. Stage 1 spins up a responder + initiator
+  as two NOVA processes over a real TCP socket: handshake completes,
+  initiator sends an `ATOM lang 7 1 800 200 widget\n` line encrypted,
+  responder decrypts to the expected plaintext, responder echoes back
+  `ACK 42`, initiator decrypts. Stage 2 spins up a MITM responder with
+  a DIFFERENT static priv: the initiator's handshake correctly fails
+  (rejected at msg1 AEAD verify on the responder side, and the
+  initiator gives up cleanly after msg2 fails on its side).
+
+### Verification
+
+- **All unit tests pass** (test_noise_xk adds 42 checks; existing
+  tests including test_kg_sync untouched).
+- **scenario_g_kg_sync** (v2 plaintext) still passes 13/13.
+- **scenario_g2_kg_sync_multi** (multi-sub + token + merge) still
+  passes 24/24.
+- **scenario_gg_noise_kg** (this session) passes 12/12.
+
+### Handshake timing
+
+Measured on the integration runner: **~508 ms wall-clock** for the full
+3-message Noise XK handshake (4x `bn_modpow_ct` operations dominate;
+SHA-256/HKDF are negligible). Well under the 2-second budget specified
+in the brief. Real ECDH on Curve25519 (X25519 ladder) drops this to
+~5 ms when it lands — the noise XK state machine is unchanged for that
+upgrade, only `c25519_scalarmult_base` / `_nxk_dh` need to be replaced.
+
+### LOUD caveats
+
+- 256-bit DH on `p_25519` is field-prime DH, NOT elliptic-curve scalar
+  mult. Wire layout matches X25519 so a real-ECDH drop-in is a leaf
+  replacement; the noise XK state machine plus the AEAD / HKDF /
+  transcript-hash machinery above are unchanged.
+- 256-bit DH is below the RFC 7919 Group 1 (768-bit) minimum and is
+  breakable in tractable time. The MVP demonstrates the wire protocol +
+  mutual-auth contract, not cryptographic strength. The 2048-bit
+  upgrade target is `bn2048_modpow_ct` + RFC 7919 Group 14 (already
+  shipped in R5A; the noise_xk module needs only a swap of the
+  underlying primitive + bumped wire sizes).
+- The fallback random path (when `secure_random` is unavailable) is a
+  nanotime+LCG stretch and is NOT cryptographically secure. The
+  production path is OS `getrandom` via the R5B builtin.
+
+## R6B (this session) — Safety: Montgomery REDC mirror for bn256_modpow_ct
+
+**Status: complete -- `src/safety/bignum_256.nova` LANDED with CIOS-form
+Montgomery REDC.** R5A landed Montgomery REDC for the 2048-bit case
+(commit `40c39326`) and gave ~10x speedup on `bn2048_modpow_ct`. This
+session mirrors that work for the 256-bit case as a parallel `bn256_*`
+prefix to the existing `bn_*` from `bignum.nova`. The new module
+exposes the same Montgomery shape:
+
+- `bn256_mont_ctx_new(N)` -- precomputes `n_prime0 = -N^-1 mod 2^32`
+  via Newton's iteration + `r2_mod_n = R^2 mod N` via the legacy
+  bit-by-bit reducer; paid ONCE per modulus, amortized across every
+  Montgomery op on the same N.
+- `bn256_to_mont(x, ctx)` / `bn256_from_mont(x_mont, ctx)` -- enter
+  / leave Montgomery form.
+- `bn256_montmul(a, b, ctx)` -- CIOS-form Montgomery multiplication
+  with the 32x32 -> 64 multiplies INLINED via 16-bit halves (the
+  same anti-pattern fix R5A discovered: a helper returning `[lo, hi]`
+  would allocate ~512k short-lived pairs per modpow at 256 bits;
+  inlining drops it to zero per-iter allocations past the one-shot
+  9-limb accumulator).
+- `bn256_modpow_ct_mont(b, e, ctx)` -- caller-managed Montgomery
+  exponentiation.
+- `bn256_modpow_ct(b, e, m)` -- the public CT modpow, routes through
+  Montgomery + per-modulus ctx; falls back to `_bn256_modpow_ct_legacy`
+  for even moduli (Montgomery REDC requires gcd(N, R) = 1; every
+  standard DH safe prime is odd).
+- `_bn256_modpow_ct_legacy(b, e, m)` -- retained as fallback + as the
+  equivalence anchor in unit tests.
+
+**Measured speedup on Curve25519 prime with 254-bit `p-1` exponent:
+~14x** (Mont ~3.1 ms vs Legacy ~45 ms). The headline Fermat check
+`bn256_modpow_ct(2, p-1, p) == 1` passes in ~3.1 ms wall-clock.
+
+- **`src/safety/bignum_256.nova`** (NEW) -- 8-limb 256-bit pure-NOVA
+  bignum library parallel to `bignum.nova` and `bignum_2048.nova`.
+  Public surface mirrors `bignum_2048.nova` shape (no non-CT
+  `bn256_modpow`; the legacy non-CT path lives in `bignum.nova` as
+  `bn_modpow` for offline test vectors). Includes
+  `bn256_curve25519_p()` for the Curve25519 field prime constant.
+- **`tests/unit/test_bignum_256.nova`** (NEW) -- 70 assertions across
+  27 test functions covering hex round-trip / carry chains / underflow
+  wrap / mul small + carry-into-hi + max-squared / mod / modmul /
+  modpow_ct textbook + edges + Curve25519 2^255 sanity; Montgomery
+  context round-trip on N=1009; mont == legacy equivalence on 2
+  pseudo-random vectors at small N + 1 cross-check on the Curve25519
+  prime with `0xDEADBEEFDEADBEEF`; headline Fermat check on Curve25519
+  prime; speedup-ratio measurement on the Curve25519 prime with the
+  full 254-bit `p-1` exponent (asserts >=2x band; observed ~14x).
+- **`src/safety/bignum.nova`** (UNCHANGED) -- the existing `bn_*`
+  prefix continues to use the bit-by-bit reducer and remains in use
+  by Curve25519 ECDH emulation, ChaCha20-Poly1305 field math, and
+  the `secure_aggregation.nova` DH-256 fallback. Migrating those
+  callers to `bn256_modpow_ct` for the per-op ~14x speedup is a
+  follow-up patch (the new prefix is ship-able without touching any
+  in-use call site).
+- **`make test`**: PASS (no regressions in any crypto suite --
+  bignum, bignum_256, bignum_2048, chacha20, poly1305,
+  secure_channel, secure_aggregation).
+- **`make build`**: PASS (the bignum_256.nova module is +1 module
+  in the count).
+- **`SECAGG_AUDIT.md`** extended with a new
+  `## What "bignum_256 landed" means concretely (R6B Montgomery REDC mirror)`
+  section documenting the public surface, the CIOS implementation
+  note, the test-coverage matrix, and the migration story for
+  existing `bn_*` callers.
+- **`README.md`** updated: unit-test suite count bumped to include
+  `test_bignum_256.nova` (+70 assertions); +1 module description for
+  `safety/bignum_256.nova` with the ~14x speedup headline + the
+  Curve25519 Fermat result.
+
+## R6F (this session) — KG: episodic memory consolidation cycle (long-term memory promotion)
+
+**Status: complete -- `src/kg/episodic.nova` LANDED with the full
+ADR-0022 consolidation cycle and wired into the memory loop.** The
+substrate observes and accumulates atoms (ADR-0016) and moments
+(ADR-0021) continuously; this session adds the cycle that scans recent
+observations, detects clusters of atoms that co-occur >=5 times within
+a small temporal window (>=3 atoms within 100ms / 10 ticks @100Hz per
+ADR-0037), and promotes each recurring cluster into a durable
+"episodic atom" -- a compound atom with its own Beta(alpha, beta)
+belief (ADR-0023) and provenance label. Subsequent observations
+matching an existing cluster update the belief in real time.
+
+What landed:
+
+- **`src/kg/episodic.nova`** (NEW, ~473 lines): the consolidation
+  cycle module. Defines `episodic_atom_t` = { id, cluster_member_ids,
+  count, first_seen_ns, last_seen_ns, alpha, beta, provenance_label }.
+  Public API:
+  - `episodic_consolidate(eas, stream, window_ticks, max_atoms)` --
+    scan recent moments, mint a new episodic atom for every
+    >=3-atom cluster whose count >=5 in the window; fold existing
+    cluster's evidence (count + last_seen) and bump belief on each
+    repeat pass.
+  - `episodic_match(ep_atom, observation_atom_id)` -- single-id
+    membership test.
+  - `episodic_match_observation(ep_atom, observation_atom_ids)` --
+    cluster-subset-of-observation test (the cluster fires iff every
+    cluster member appears in the observation; partial match
+    (A,B,X) vs {A,B,C} returns 0 -- documented policy).
+  - `episodic_update_belief(ep_atom, matched)` -- Beta(alpha, beta)
+    update; matched=1 increments alpha, matched=0 increments beta
+    (ADR-0023).
+  - `episodic_observe(eas, observation_atom_ids, now_ns)` -- walk
+    every stored atom, update belief + count + last_seen for each
+    cluster matched by the observation. Does NOT penalize
+    non-matches (typical observation covers one cluster).
+- **Wired into the memory loop** (`src/agent/loop_memory.nova`,
+  ADR-0036): added `loop_memory_step_with_episodic(ctx, stream, em,
+  eas)` extension. Every step calls `episodic_observe` for live
+  belief reinforcement; every LOOP_MEM_CONSOL_EVERY (=100) steps,
+  the consolidation sweep fires. ADR-0036 leaves no room for a new
+  loop, so the cycle lands as a memory sub-task -- the natural
+  owner since memory already manages the moment stream + episode
+  storage. The legacy 3-arg `loop_memory_step` is preserved so the
+  chat binary's existing call site keeps working.
+- **Snapshot persistence** (`src/persistence/snapshot_disk.nova`):
+  extended the EPISODIC section blob with an optional third
+  sub-list `episodic_atoms` -- forward-compatible with v2 (NO
+  major version bump; R5D's v2 format is preserved bit-identically
+  for snapshots that don't carry episodic atoms). New wire keys:
+  `episodic.atoms.count`, `episodic.atoms[N].{id,member_count,
+  members[K],count,first_ns,last_ns,alpha,beta,provenance}`. The
+  legacy 2-arg `episodic_section_build` and `episodic_section_apply`
+  are preserved; new 3-arg variants
+  (`episodic_section_build_with_atoms`,
+  `episodic_section_apply_with_atoms`) take the optional `eas`
+  store. A snapshot from a pre-this-build writer parses cleanly.
+
+Tests:
+
+- **`tests/unit/test_episodic.nova`** (NEW, 79 assertions):
+  atom shape, canonical signature (order-invariant), no-cooccurrence
+  consolidation produces zero atoms, canonical fixture (5x (1,2,3) +
+  scattered noise -> exactly 1 episodic atom with count=5), 6th
+  triplet -> match returns true + alpha increments by FP_SCALE,
+  partial (A,B,X) match rejection, explicit Beta update,
+  find-by-signature, re-consolidate dedup, full snapshot round-trip,
+  legacy 2-element blob forward-compat. ALL PASS.
+- **`tests/integration/scenario_ff_episodic.sh`** (NEW, 37 assertions):
+  hand-rolled NOVA driver (`examples/episodic_demo.nova`) mints +
+  persists an episodic atom, the script asserts on the wire format
+  keys + reload round-trip; legacy v2 file (no `episodic.atoms.*`
+  lines) parses to 3 sub-lists with the third empty (forward-compat).
+  ALL PASS.
+
+Canonical fixture (5x (1,2,3) triplets at ts = 0, 10, 20, 30, 40
+within EPISODIC_COOCCUR_WINDOW = 10 ticks @100Hz, plus four
+unrelated triplets at ts = 5, 15, 25, 35): **1 episodic atom**
+produced (cluster {1,2,3}, count=5, first_ns=0, last_ns=40).
+
+ADRs implemented this session: ADR-0022 (consolidation cycle, the
+long-term memory promotion the substrate didn't have), ADR-0023
+(Bayesian belief tracking on each episodic atom), ADR-0048 (the
+extended EPISODIC blob shape persists alongside KG atoms).
+
+Module count: 135 (134 at HEAD post-R6D + `src/kg/episodic.nova`).
+Unit suites: +1 (test_episodic.nova).
+
+## R6D (previous session, separate commit) — IO: ORB (Oriented FAST + Rotated BRIEF) feature detector + Hamming-distance matcher (patent-free SIFT alternative)
 
 **Status: complete -- `src/io/transducers/image_orb.nova` LANDED with the
 full Rublee 2011 pipeline.** R5C landed SIFT 128-D descriptor + Lowe
