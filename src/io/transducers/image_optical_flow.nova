@@ -543,3 +543,607 @@ fn lk_append_features_if_paired(feats, next_ptr, width, height) {
     push(feats, lk_flow_density_label(result))
     return 1
 }
+
+// =========================================================================
+// Pyramidal Lucas-Kanade (R11A extension -- Bouguet 2000 coarse-to-fine).
+// =========================================================================
+//
+// The single-level lk_optical_flow above is exact for SUB-pixel shifts
+// (the first-order Taylor expansion I_next(p) ~ I_prev(p) + grad . d holds
+// when |d| << 1). It under-estimates multi-pixel shifts because the
+// linearization breaks at the discontinuity. R10D's textbook fixture
+// measured u ~ 2384 milli when target was 3000 (3 px shift); larger
+// shifts degrade further. The classical workaround is a coarse-to-fine
+// Gaussian pyramid (Bouguet 2000, "Pyramidal Implementation of the
+// Lucas-Kanade Feature Tracker"):
+//
+//   1. Build Gaussian pyramids of both frames at L levels (each level
+//      smoothed via 3x3 Gaussian then downsampled by 2). At the coarsest
+//      level a K-pixel shift in the original image is only K / 2^(L-1)
+//      pixels, well inside the linear LK regime.
+//   2. From coarsest to finest level:
+//      a. Take current flow estimate (u, v) from the level above
+//         (initialized to (0, 0) at the coarsest level).
+//      b. Warp NEXT level by current flow (integer-pixel rounded:
+//         warped(x, y) = next(x + round(u), y + round(v)) with
+//         out-of-bounds zero-fill).
+//      c. Run single-level LK on (prev_level, warped) -> flow CORRECTION
+//         (du, dv); update (u, v) += (du, dv).
+//      d. Optionally repeat (b)+(c) MAX_ITERATIONS times (iterative
+//         warping refines the estimate at the same scale).
+//   3. Upsample (u, v) to the next finer level by doubling each
+//      component (pixel coordinates double; the underlying shift in
+//      pixels also doubles).
+//   4. Final output: (u, v) at the finest level.
+//
+// Implementation choices:
+//   * Pyramid levels are stored as RAW BYTE BUFFERS (alloc'd via _lk_alloc_bytes),
+//     same shape as PGM data. Each is a separate allocation, accessed via
+//     load8 / store8. This keeps lk_optical_flow unchanged -- it consumes
+//     byte buffers and we pass each level directly.
+//   * The Gaussian smoothing reuses Canny's 3x3 weights (1/2/4/2/1, sum 16)
+//     but operates byte->byte (not the byte->int_list shape of
+//     _canny_gaussian_3x3). Border pixels are copied unchanged.
+//   * Downsample by 2: each output pixel = average of the 2x2 source block
+//     (anti-aliased subsample, paired with the prior Gaussian).
+//   * Warp: integer pixel rounding (round-half-up via int_add(milli, 500)
+//     when milli >= 0, int_sub(milli, 500) when negative, then / 1000).
+//     OOB pixels read zero (Bouguet's recommendation -- mirroring would
+//     fight the linearization at the seam).
+//   * Pyramid level cap: LK_PYR_MAX_LEVELS = 5 (256 px / 2^4 = 16 px,
+//     just above the WIN_SIZE+pad floor lk_optical_flow needs).
+//   * Default iter count: LK_PYR_DEFAULT_MAX_ITER = 3 (Bouguet's
+//     recommendation -- gains diminish after the third warp+solve).
+//   * Default levels: LK_PYR_DEFAULT_LEVELS = 3 (handles shifts up to
+//     ~16 px on a 256 px image without the bottom level shrinking below
+//     the LK window minimum).
+
+let LK_PYR_DEFAULT_LEVELS    = 3
+let LK_PYR_DEFAULT_MAX_ITER  = 3
+let LK_PYR_MAX_LEVELS        = 5
+let LK_PYR_MIN_LEVEL_DIM     = 8       // below this, LK's 5x5 window fails
+let LK_PYR_LEVEL_W           = 0
+let LK_PYR_LEVEL_H           = 1
+let LK_PYR_LEVEL_BUF         = 2
+
+// ---- byte-buffer helpers ------------------------------------------------
+
+fn _lk_alloc_bytes(area) {
+    // alloc(area + 1) so the trailing NUL byte fits (mirrors PGM data
+    // shape; some downstream consumers treat the buffer as C-string-like).
+    let buf = alloc(int_add(area, 1))
+    let i = 0
+    while i < area {
+        store8(int_add(buf, i), 0)
+        i = int_add(i, 1)
+    }
+    store8(int_add(buf, area), 0)
+    return buf
+}
+
+// ---- Gaussian 3x3 smoothing (byte buffer -> byte buffer) ----------------
+//
+// 3x3 weights 1/2/4/2/1 (corners / edges / center) summing to 16. Border
+// pixels copied unchanged (same convention as image_canny.nova's
+// _canny_gaussian_3x3). Returns a NEW byte buffer of the same dimensions.
+
+fn _lk_gaussian_3x3_bytes(src, width, height) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    // Default: copy every pixel through (handles borders + dimensions
+    // too small for the kernel).
+    let i = 0
+    while i < area {
+        store8(int_add(dst, i), load8(int_add(src, i)))
+        i = int_add(i, 1)
+    }
+    if width  < 3 { return dst }
+    if height < 3 { return dst }
+    let y = 1
+    let y_max = int_sub(height, 1)
+    while y < y_max {
+        let row_above = int_mul(int_sub(y, 1), width)
+        let row_mid   = int_mul(y, width)
+        let row_below = int_mul(int_add(y, 1), width)
+        let x = 1
+        let x_max = int_sub(width, 1)
+        while x < x_max {
+            let tl = load8(int_add(src, int_add(row_above, int_sub(x, 1))))
+            let tm = load8(int_add(src, int_add(row_above, x)))
+            let tr = load8(int_add(src, int_add(row_above, int_add(x, 1))))
+            let ml = load8(int_add(src, int_add(row_mid,   int_sub(x, 1))))
+            let mc = load8(int_add(src, int_add(row_mid,   x)))
+            let mr = load8(int_add(src, int_add(row_mid,   int_add(x, 1))))
+            let bl = load8(int_add(src, int_add(row_below, int_sub(x, 1))))
+            let bm = load8(int_add(src, int_add(row_below, x)))
+            let br = load8(int_add(src, int_add(row_below, int_add(x, 1))))
+            // corners*1 + edges*2 + center*4, sum/16.
+            let s = int_add(tl, tr)
+            s = int_add(s, bl)
+            s = int_add(s, br)
+            s = int_add(s, int_mul(2, tm))
+            s = int_add(s, int_mul(2, ml))
+            s = int_add(s, int_mul(2, mr))
+            s = int_add(s, int_mul(2, bm))
+            s = int_add(s, int_mul(4, mc))
+            let v = s / 16
+            if v < 0   { v = 0 }
+            if v > 255 { v = 255 }
+            store8(int_add(dst, int_add(row_mid, x)), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- 2x downsample (byte buffer -> byte buffer of w/2 x h/2) ------------
+//
+// Each output pixel = average of the 2x2 source block. Pairs naturally
+// with the prior Gaussian smoothing to anti-alias the subsample.
+
+fn _lk_downsample_2x(src, width, height) {
+    let dw = width  / 2
+    let dh = height / 2
+    if dw < 1 { dw = 1 }
+    if dh < 1 { dh = 1 }
+    let area = int_mul(dw, dh)
+    let dst = _lk_alloc_bytes(area)
+    let y = 0
+    while y < dh {
+        let sy0 = int_mul(y, 2)
+        let sy1 = int_add(sy0, 1)
+        if sy1 >= height { sy1 = int_sub(height, 1) }
+        let row_off0 = int_mul(sy0, width)
+        let row_off1 = int_mul(sy1, width)
+        let drow_off = int_mul(y, dw)
+        let x = 0
+        while x < dw {
+            let sx0 = int_mul(x, 2)
+            let sx1 = int_add(sx0, 1)
+            if sx1 >= width { sx1 = int_sub(width, 1) }
+            let a = load8(int_add(src, int_add(row_off0, sx0)))
+            let b = load8(int_add(src, int_add(row_off0, sx1)))
+            let c = load8(int_add(src, int_add(row_off1, sx0)))
+            let d = load8(int_add(src, int_add(row_off1, sx1)))
+            let avg = int_add(int_add(a, b), int_add(c, d)) / 4
+            store8(int_add(dst, int_add(drow_off, x)), avg)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- lk_pyramid_build ---------------------------------------------------
+//
+// Returns a list of L levels, each `[level_w, level_h, level_buf]`.
+// Index 0 = finest (original); index L-1 = coarsest.
+//   * Level 0 is a COPY of the original (callers may free it
+//     independently of the source).
+//   * Each subsequent level: Gaussian-smooth the previous level then
+//     downsample by 2.
+//   * Stops early if the next level would be smaller than
+//     LK_PYR_MIN_LEVEL_DIM in either axis (LK's 5x5 window + pad needs
+//     headroom). Caller can inspect `len(pyramid)` to see how many
+//     levels actually built.
+
+fn lk_pyramid_build(image, width, height, levels) {
+    let pyramid = list_new()
+    if image == 0    { return pyramid }
+    if width  <= 0   { return pyramid }
+    if height <= 0   { return pyramid }
+    if width  > LK_MAX_DIM { return pyramid }
+    if height > LK_MAX_DIM { return pyramid }
+    let req_levels = levels
+    if req_levels < 1                  { req_levels = 1 }
+    if req_levels > LK_PYR_MAX_LEVELS  { req_levels = LK_PYR_MAX_LEVELS }
+    // Level 0 = copy of the original.
+    let area0 = int_mul(width, height)
+    let buf0 = _lk_alloc_bytes(area0)
+    let i = 0
+    while i < area0 {
+        store8(int_add(buf0, i), load8(int_add(image, i)))
+        i = int_add(i, 1)
+    }
+    let lvl0 = list_new()
+    push(lvl0, width)
+    push(lvl0, height)
+    push(lvl0, buf0)
+    push(pyramid, lvl0)
+    // Build successive coarser levels.
+    let prev_buf = buf0
+    let prev_w = width
+    let prev_h = height
+    let l = 1
+    while l < req_levels {
+        // Stop early if the next level would fall under the min dim.
+        let nw = prev_w / 2
+        let nh = prev_h / 2
+        if nw < LK_PYR_MIN_LEVEL_DIM { return pyramid }
+        if nh < LK_PYR_MIN_LEVEL_DIM { return pyramid }
+        let smoothed = _lk_gaussian_3x3_bytes(prev_buf, prev_w, prev_h)
+        let down = _lk_downsample_2x(smoothed, prev_w, prev_h)
+        let lvl = list_new()
+        push(lvl, nw)
+        push(lvl, nh)
+        push(lvl, down)
+        push(pyramid, lvl)
+        prev_buf = down
+        prev_w = nw
+        prev_h = nh
+        l = int_add(l, 1)
+    }
+    return pyramid
+}
+
+fn lk_pyramid_level_width(pyramid, idx) {
+    if idx < 0           { return 0 }
+    if idx >= len(pyramid) { return 0 }
+    let lvl = pyramid[idx]
+    return lvl[LK_PYR_LEVEL_W]
+}
+
+fn lk_pyramid_level_height(pyramid, idx) {
+    if idx < 0           { return 0 }
+    if idx >= len(pyramid) { return 0 }
+    let lvl = pyramid[idx]
+    return lvl[LK_PYR_LEVEL_H]
+}
+
+fn lk_pyramid_level_data(pyramid, idx) {
+    if idx < 0           { return 0 }
+    if idx >= len(pyramid) { return 0 }
+    let lvl = pyramid[idx]
+    return lvl[LK_PYR_LEVEL_BUF]
+}
+
+// ---- flow milli-to-int rounding ----------------------------------------
+//
+// Round half-away-from-zero so positive and negative shifts behave
+// symmetrically. milli=499 -> 0, milli=500 -> 1, milli=-499 -> 0,
+// milli=-500 -> -1.
+
+fn _lk_round_milli_to_int(milli) {
+    if milli >= 0 { return int_add(milli, LK_MILLI_PER_UNIT / 2) / LK_MILLI_PER_UNIT }
+    // negative: subtract half then divide. NOVA division truncates toward
+    // zero so we have to bias manually.
+    let neg = 0 - milli
+    let r = int_add(neg, LK_MILLI_PER_UNIT / 2) / LK_MILLI_PER_UNIT
+    return 0 - r
+}
+
+// ---- lk_warp_image ------------------------------------------------------
+//
+// Warps `image` by the per-pixel flow field (u_field, v_field, each a
+// flow_buf in the lk_optical_flow result shape -- packed (u_milli,
+// v_milli) per pixel). Output: a NEW byte buffer of the same dimensions.
+//
+//   warped(x, y) = image(x + round(u(x,y)/1000), y + round(v(x,y)/1000))
+//
+// OOB pixels read zero. If u_field == 0 we treat the displacement as
+// zero everywhere (handy for the identity-warp case).
+
+fn lk_warp_image(image, width, height, u_field, v_field) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    if image == 0 { return dst }
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let pixel_idx = int_add(row_off, x)
+            let du = 0
+            let dv = 0
+            if u_field != 0 {
+                du = _lk_round_milli_to_int(_lk_get(u_field, int_mul(pixel_idx, 2)))
+            }
+            if v_field != 0 {
+                dv = _lk_round_milli_to_int(_lk_get(v_field, int_add(int_mul(pixel_idx, 2), 1)))
+            }
+            let sx = int_add(x, du)
+            let sy = int_add(y, dv)
+            let v = 0
+            if sx >= 0 {
+                if sx < width {
+                    if sy >= 0 {
+                        if sy < height {
+                            v = load8(int_add(image, int_add(int_mul(sy, width), sx)))
+                        }
+                    }
+                }
+            }
+            store8(int_add(dst, pixel_idx), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- internal: warp using a single (u_int, v_int) shift ----------------
+//
+// The pyramid orchestrator below tracks (u, v) as a single per-level
+// shift (in INTEGER pixel units at that level's resolution), not a
+// per-pixel field. Warping by a constant shift collapses to a simple
+// translation; we keep this helper distinct from lk_warp_image (which
+// takes a per-pixel field) so the common case is straight-line code.
+
+fn _lk_warp_uniform(image, width, height, du_int, dv_int) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    if image == 0 { return dst }
+    let y = 0
+    while y < height {
+        let sy = int_add(y, dv_int)
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let sx = int_add(x, du_int)
+            let v = 0
+            if sx >= 0 {
+                if sx < width {
+                    if sy >= 0 {
+                        if sy < height {
+                            v = load8(int_add(image, int_add(int_mul(sy, width), sx)))
+                        }
+                    }
+                }
+            }
+            store8(int_add(dst, int_add(row_off, x)), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- lk_optical_flow_pyramid (Bouguet 2000) ----------------------------
+//
+// Coarse-to-fine LK with iterative warping at each level. Returns a
+// result tuple in the SAME shape as lk_optical_flow at the FINEST level.
+// The aggregated flow at every interior pixel is the level-0 flow.
+//
+// Per-level invariant: we track a GLOBAL (u, v) shift in milli units at
+// the current level's pixel scale. Warping uses the integer-rounded
+// shift; the residual flow returned by the inner LK solve is added to
+// the global accumulator. Upsampling between levels DOUBLES (u, v) (the
+// shift in pixels doubles because pixel coordinates double).
+//
+// This shape -- accumulating a SINGLE (u, v) for the whole image rather
+// than a per-pixel field across levels -- is the simplification that
+// keeps the code tractable while still beating single-level LK on the
+// large-displacement fixtures the brief calls out. The downside is the
+// algorithm becomes a "translational pyramid" -- it handles rigid
+// frame-to-frame translation excellently but blurs across rotational /
+// non-rigid motion. The PER-PIXEL flow field at the finest level still
+// captures local variation around the global translation; the global
+// (u, v) merely brings the inner solver into its linear regime.
+
+fn lk_optical_flow_pyramid(prev_ptr, next_ptr, width, height, win_size, levels, max_iter) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let req_levels = levels
+    if req_levels < 1                 { req_levels = LK_PYR_DEFAULT_LEVELS }
+    if req_levels > LK_PYR_MAX_LEVELS { req_levels = LK_PYR_MAX_LEVELS }
+    let req_iter = max_iter
+    if req_iter < 1 { req_iter = LK_PYR_DEFAULT_MAX_ITER }
+    if req_iter > 8 { req_iter = 8 }
+
+    let pyr_prev = lk_pyramid_build(prev_ptr, width, height, req_levels)
+    let pyr_next = lk_pyramid_build(next_ptr, width, height, req_levels)
+    let L = len(pyr_prev)
+    if L < 1 { return _lk_fail() }
+    if len(pyr_next) < L { L = len(pyr_next) }
+
+    // Global accumulated shift in milli units at the CURRENT level scale.
+    let u_milli = 0
+    let v_milli = 0
+
+    // Iterate coarsest -> finest. At entry to each level, (u_milli,
+    // v_milli) is the shift at THAT level's pixel scale. At exit we
+    // double it before descending.
+    let l = int_sub(L, 1)
+    while l >= 0 {
+        let lw = lk_pyramid_level_width(pyr_prev, l)
+        let lh = lk_pyramid_level_height(pyr_prev, l)
+        let p_buf = lk_pyramid_level_data(pyr_prev, l)
+        let n_buf = lk_pyramid_level_data(pyr_next, l)
+        // Iterative warping: warp NEXT by current (u, v), solve LK,
+        // accumulate, repeat up to req_iter times. We accept the
+        // refined estimate even if the inner LK marks pixels invalid --
+        // the global (u, v) accumulator is robust to per-pixel noise.
+        let it = 0
+        while it < req_iter {
+            let du_int = _lk_round_milli_to_int(u_milli)
+            let dv_int = _lk_round_milli_to_int(v_milli)
+            let warped = _lk_warp_uniform(n_buf, lw, lh, du_int, dv_int)
+            let inner = lk_optical_flow(p_buf, warped, lw, lh, ws)
+            // The inner solve produces a per-pixel field. Reduce it to a
+            // single (du, dv) by taking a CLAMPED median-style aggregate
+            // over valid pixels. Means are catastrophically pulled by
+            // boundary discontinuities (a shifted-zero strip at the
+            // image edge survives Gaussian smoothing into the coarse
+            // levels and produces wild per-pixel u, v there). The
+            // robust aggregate clamps each per-pixel flow to a small
+            // window around the prior, then averages.
+            //
+            //   * Maximum per-pixel correction expected at this level is
+            //     ~half the level's window radius worth of pixels (in
+            //     milli units). We clamp |du - 0| and |dv - 0| to a
+            //     conservative ceiling = LK_PYR_MAX_CORRECTION_MILLI per
+            //     iteration. Outliers above the ceiling get scaled down
+            //     to the ceiling magnitude (preserving sign).
+            let flow_buf  = inner[LK_R_FLOW_BUF]
+            let valid_buf = inner[LK_R_VALID_BUF]
+            let valid_cnt = inner[LK_R_VALID_COUNT]
+            if valid_cnt == 0 {
+                // No valid solve at this level -- give up early; downstream
+                // levels will refine from whatever (u, v) we have so far.
+                it = req_iter
+            } else {
+                // Per-iteration correction ceiling. At level l in a
+                // 256-px image, a single pyramid step doubles the residual
+                // shift. The most useful information comes from the inner
+                // solve when each per-pixel correction is at most a few
+                // pixels (~4000 milli). Outliers far beyond this are
+                // boundary artifacts; clamp them to the ceiling so they
+                // don't dominate the average.
+                let ceil_milli = 4000
+                let sum_u = 0
+                let sum_v = 0
+                let level_area = int_mul(lw, lh)
+                let pi = 0
+                while pi < level_area {
+                    if _lk_get(valid_buf, pi) == 1 {
+                        let pu = _lk_get(flow_buf, int_mul(pi, 2))
+                        let pv = _lk_get(flow_buf, int_add(int_mul(pi, 2), 1))
+                        if pu >  ceil_milli { pu =  ceil_milli }
+                        if pu < 0 - ceil_milli { pu = 0 - ceil_milli }
+                        if pv >  ceil_milli { pv =  ceil_milli }
+                        if pv < 0 - ceil_milli { pv = 0 - ceil_milli }
+                        sum_u = int_add(sum_u, pu)
+                        sum_v = int_add(sum_v, pv)
+                    }
+                    pi = int_add(pi, 1)
+                }
+                let du_milli = sum_u / valid_cnt
+                let dv_milli = sum_v / valid_cnt
+                u_milli = int_add(u_milli, du_milli)
+                v_milli = int_add(v_milli, dv_milli)
+                // If the correction is tiny we can break early (saves the
+                // remaining warp+solve calls).
+                let mag = du_milli
+                if mag < 0 { mag = 0 - mag }
+                let mag2 = dv_milli
+                if mag2 < 0 { mag2 = 0 - mag2 }
+                if int_add(mag, mag2) < 50 { it = req_iter }
+            }
+            it = int_add(it, 1)
+        }
+        // Descend: pixel coordinates double at the next finer level so
+        // the corresponding shift in pixels also doubles.
+        if l > 0 {
+            u_milli = int_mul(u_milli, 2)
+            v_milli = int_mul(v_milli, 2)
+        }
+        l = int_sub(l, 1)
+    }
+
+    // Final pass at the finest level: run lk_optical_flow on (prev,
+    // warped_next) one last time so the returned result tuple has the
+    // full per-pixel flow field (the global (u, v) PLUS the level-0
+    // residual at every pixel). The aggregated (u_milli, v_milli)
+    // captures the translational portion; this final per-pixel solve
+    // captures any local variation around it.
+    let du_int = _lk_round_milli_to_int(u_milli)
+    let dv_int = _lk_round_milli_to_int(v_milli)
+    let warped_final = _lk_warp_uniform(next_ptr, width, height, du_int, dv_int)
+    let final_inner = lk_optical_flow(prev_ptr, warped_final, width, height, ws)
+    // Add the global (u, v) to every valid pixel in the inner field.
+    let flow_buf  = final_inner[LK_R_FLOW_BUF]
+    let valid_buf = final_inner[LK_R_VALID_BUF]
+    let total     = final_inner[LK_R_TOTAL]
+    let valid_cnt = 0
+    let mag_sum = 0
+    let pi = 0
+    while pi < total {
+        let v_flag = _lk_get(valid_buf, pi)
+        if v_flag == 1 {
+            let u_local = _lk_get(flow_buf, int_mul(pi, 2))
+            let v_local = _lk_get(flow_buf, int_add(int_mul(pi, 2), 1))
+            let u_total = int_add(u_milli, u_local)
+            let v_total = int_add(v_milli, v_local)
+            _lk_set(flow_buf, int_mul(pi, 2),                 u_total)
+            _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),     v_total)
+            valid_cnt = int_add(valid_cnt, 1)
+            let mag = _lk_isqrt(int_add(int_mul(u_total, u_total),
+                                        int_mul(v_total, v_total)))
+            mag_sum = int_add(mag_sum, mag)
+        } else {
+            // The inner solve marked this pixel invalid (e.g. textureless
+            // region). If the global (u, v) is non-trivial we still want
+            // pixels to read it -- otherwise the average magnitude would
+            // be 0 over a textureless image translated by 5 px, which is
+            // wrong. We do NOT bump valid_cnt here (the per-pixel solve
+            // genuinely has no opinion) but we DO write the global shift.
+            _lk_set(flow_buf, int_mul(pi, 2),                 u_milli)
+            _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),     v_milli)
+        }
+        pi = int_add(pi, 1)
+    }
+    let mean_mag = 0
+    if valid_cnt > 0 { mean_mag = mag_sum / valid_cnt }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_cnt,
+                      total, width, height)
+}
+
+// ---- chat admin: /flow_pyr prev.pgm next.pgm ----------------------------
+//
+// Mirrors lk_pgm_args / lk_pgm_paths above but routes through the
+// pyramidal solver. Same output shape so callers (scripts, the visual-
+// perception seam if it grows a pyramidal mode) can swap one for the
+// other without parsing changes.
+
+fn lk_pgm_args_pyramid(arg) {
+    if len(arg) == 0 {
+        return "(/flow_pyr needs two PATHs -- usage: /flow_pyr prev.pgm next.pgm)"
+    }
+    let parts = _lk_split_two(arg)
+    return lk_pgm_paths_pyramid(parts[0], parts[1])
+}
+
+fn lk_pgm_paths_pyramid(path_prev, path_next) {
+    if len(path_prev) == 0 {
+        return "(/flow_pyr needs two PATHs -- usage: /flow_pyr prev.pgm next.pgm)"
+    }
+    if len(path_next) == 0 {
+        return "(/flow_pyr needs TWO paths -- got 1)"
+    }
+    let r_p = pgm_parse_file(path_prev)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(flow_pyr FAILED on prev: " + err_p + ")"
+    }
+    let r_n = pgm_parse_file(path_next)
+    let err_n = pgm_result_error(r_n)
+    if len(err_n) > 0 {
+        return "(flow_pyr FAILED on next: " + err_n + ")"
+    }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    let w_n = pgm_result_width(r_n)
+    let h_n = pgm_result_height(r_n)
+    if w_p != w_n {
+        return "(flow_pyr FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if h_p != h_n {
+        return "(flow_pyr FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if w_p > LK_MAX_DIM { return "(flow_pyr FAILED: prev too large -- max 256x256)" }
+    if h_p > LK_MAX_DIM { return "(flow_pyr FAILED: prev too large -- max 256x256)" }
+    let d_p = pgm_result_data(r_p)
+    let d_n = pgm_result_data(r_n)
+    let result = lk_optical_flow_pyramid(d_p, d_n, w_p, h_p,
+                                          LK_DEFAULT_WIN_SIZE,
+                                          LK_PYR_DEFAULT_LEVELS,
+                                          LK_PYR_DEFAULT_MAX_ITER)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    let valid    = lk_flow_valid_count(result)
+    return "(flow_pyr " + int_to_str(w_p) + "x" + int_to_str(h_p)
+        + " mean_mag=" + int_to_str(mean_mag)
+        + "milli valid=" + int_to_str(valid)
+        + " " + lk_flow_density_label(result) + ")"
+}

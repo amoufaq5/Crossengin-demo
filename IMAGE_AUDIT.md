@@ -100,6 +100,7 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 | SIFT-like 128-D descriptor       | DONE (P3.3 cont. v2)|
 | ORB (FAST + rBRIEF, patent-free) | DONE (P3.3 cont. v3)|
 | Color histograms (HSV / Lab)     | 2-3 weeks           |
+| Spatial k-means segmentation     | DONE (R11E)         |
 | CNN feature vector (untrained)   | 4-8 weeks           |
 | CNN feature vector (trained)     | 6-12 months         |
 
@@ -358,12 +359,50 @@ gradient structure and corner geometry, not just intensity moments:
   `(flow WxH mean_mag=Nmilli valid=K image_optical_flow_density_*)`.
   Visual seam emits `image_optical_flow_magnitude_<low|mid|high>`
   + `image_optical_flow_density_<low|mid|high>` atoms when
-  `CE_VP_FLOW_PREV` env points at the PREVIOUS frame PGM. The
-  algorithm is exact for sub-pixel shifts (first-order Taylor regime);
-  multi-pixel shifts under-estimate slightly because the linearization
-  breaks at the discontinuity but stay above the density-"low" floor.
-  Follow-ups: pyramidal LK (coarse-to-fine warping for multi-pixel
-  shifts), iterative refinement, dense farneback flow.
+  `CE_VP_FLOW_PREV` env points at the PREVIOUS frame PGM. The R10D
+  single-level algorithm is exact for sub-pixel shifts (first-order
+  Taylor regime); multi-pixel shifts under-estimate because the
+  linearization breaks at the discontinuity. R11A adds the pyramidal
+  coarse-to-fine extension below. Follow-ups: dense Farneback flow,
+  per-pixel residual fields across pyramid levels (the full Bouguet
+  algorithm without R11A's translational-aggregate simplification),
+  motion-occlusion masks.
+
+- **Pyramidal Lucas-Kanade (R11A on top of R10D)**
+  (`src/io/transducers/image_optical_flow.nova`, EXTENDED). R10D's
+  single-level solver under-estimates large displacements -- the
+  textbook fixture measured u ~ 2384 milli when target was 3000 (3 px
+  shift) and u ~ 918 milli when target was 1000 (1 px shift). R11A
+  adds the classical Bouguet 2000 coarse-to-fine pyramid: build
+  Gaussian image pyramids of both frames (3x3 Gaussian smooth + 2x
+  downsample per level, default L=3 levels), start at the coarsest
+  level with flow (0, 0), iteratively warp NEXT by the current flow
+  and re-solve via R10D's `lk_optical_flow` to produce a flow
+  correction, upsample (u, v) by 2 when descending to the next
+  level, repeat up to MAX_ITERATIONS=3 (default) at each level.
+  Public API: `lk_pyramid_build(image, w, h, levels)` -> list of
+  `[level_w, level_h, level_buf]`;
+  `lk_warp_image(image, w, h, u_field, v_field)` -> warped byte
+  buffer (integer pixel rounding, OOB zero-fill);
+  `lk_optical_flow_pyramid(prev, next, w, h, win_size, levels,
+  max_iter)` -> same result tuple shape as R10D's `lk_optical_flow`.
+  Reuses R10D's single-level solver as the inner step (no
+  duplication). On the headline R10D-fails fixture (8-px rigid
+  right-shift, 80x64): single-level reads u=5697 milli at (20, 16);
+  pyramid reads u=7531 milli (target 8000, within +/-500). 4-px down:
+  v=4116 (target 4000); diag (3, 3): u=2962 v=2762 (target 3000,
+  3000). Identical frames: u=v=0 with the inner per-pixel valid flag
+  intact. Texture-less fixtures still flag det=0 -> valid=0 (the
+  R10D degeneracy detection is not masked by the orchestrator).
+  Per-iteration correction clamped to +/-4000 milli per pixel to
+  suppress boundary discontinuity outliers (a shifted-zero strip at
+  the image edge survives the Gaussian into the coarse levels and
+  would otherwise dominate the averaged global shift). New chat
+  admin `/flow_pyr prev.pgm next.pgm` (dispatch only, no help line
+  to stay in chat budget). Caps mirror R10D: dims <= 256x256; levels
+  in [1..LK_PYR_MAX_LEVELS=5]; default L=3 (handles ~16 px shifts on
+  a 256 px image without the bottom level falling under
+  LK_PYR_MIN_LEVEL_DIM=8).
 
 Sobel + Harris fire only when the image is at least 16x16 in each axis
 (the kernel needs a 3x3 neighborhood and the count buckets need
@@ -374,6 +413,31 @@ the chain to be informative). Dimensions are capped at 512x512 for
 Sobel/Harris/Canny, 256x256 for SIFT-detection, to keep all
 intermediate accumulators well under NOVA's 2^20 codegen pointer
 threshold (gotcha #11).
+
+## R11E spatial k-means image segmentation (landed)
+
+After R10D landed dense optical flow, the CV pipeline still had no
+COARSE region partitioner. R11E adds spatial k-means in the
+(intensity, x, y) joint space:
+
+- `src/io/transducers/image_segmentation.nova`. Textbook Lloyd's
+  k-means on integer arithmetic. K centroids on a tiled grid; assign
+  each pixel to the centroid minimizing
+  `w_intensity * (I - I_k)^2 + w_spatial * ((x - x_k)^2 + (y - y_k)^2)`;
+  recompute centroids as integer means; iterate until stable or
+  `max_iter` reached. Dimensions capped at 256x256; K in [1..32];
+  max_iter <= 50. Public API: `seg_kmeans`, `seg_kmeans_weighted`,
+  `seg_label_at`, `seg_centroid_at`, `seg_render_pgm`,
+  `seg_render_to_file`. Per-image atoms:
+  `image_segmentation_cluster_count_<K>` and
+  `image_segmentation_dominant_<id>`. Chat: `/segment PATH [K]`
+  (default K=5) writes a segmented PGM to `/tmp/segmented.pgm` for
+  human inspection.
+
+Limitations: deterministic grid init (not k-means++), no empty-cluster
+re-seeding, no connectivity constraint (a single cluster may span
+disconnected regions of equal intensity). SLIC superpixels + graph-cut
+remain future follow-ups for true region-segmentation.
 
 ## Mapping features to atoms
 
@@ -415,6 +479,7 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | Stereo LR-check + sub-pixel refinement              | DONE (R8D)       |
 | Stereo Semi-Global Matching (4 paths)               | DONE (R9A)       |
 | Stereo SGM 8-path + mutual-information data term    | 2-3 weeks        |
+| Spatial k-means image segmentation                  | DONE (R11E)      |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
 
