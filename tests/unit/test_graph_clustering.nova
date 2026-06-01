@@ -1,0 +1,372 @@
+// Unit tests for src/kg/graph_clustering.nova (R11F).
+//
+// Covers the integer-only label-propagation community detection added
+// on top of atom_store's atom + xref representation, complementing
+// R10C's TF-IDF textual ranker (semantic_search.nova) -- R10C finds
+// atoms whose LABELS look alike; this module finds atoms that are
+// LINKED to each other through xrefs.
+//
+// We exercise:
+//   - extraction edge cases (empty KG, singleton, disconnected pairs);
+//   - the classic LPA fixtures (barbell, 3-clique, linear chain);
+//   - modularity sanity (well-separated cliques HIGH, single-cluster LOW);
+//   - determinism (same seed -> same labels);
+//   - convergence speed on simple fixtures;
+//   - public API surface (gc_label_at, gc_community_count,
+//     gc_community_members, gc_largest_community).
+//
+// Total assertions: 30+.
+//
+// ADRs: ADR-0016 (atom + xref shape), ADR-0017 (xref is the link type
+// we cluster), ADR-0049 (testing).
+
+import "../ce_test.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/cross_kg_references.nova"
+import "../../src/kg/graph_clustering.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Build a fresh KG with `n` atoms, no xrefs. Returns the KG.
+fn _mk_kg_n(label, n) {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, label)
+    let i = 0
+    while i < n {
+        kg_add_atom(kg, ATOM_FACT, "atom_" + int_to_str(i), 0)
+        i = i + 1
+    }
+    return kg
+}
+
+// Wire an undirected link between two atoms by id. We push an xref on
+// BOTH directions because LPA needs the bi-directional view, even
+// though _gc_extract_graph handles the undirected fuse internally --
+// adding both at construction time keeps the test fixture readable
+// (the adjacency for either endpoint is obvious by inspection).
+fn _link(kg, a_id, b_id) {
+    let a = kg_atom(kg, a_id)
+    let b = kg_atom(kg, b_id)
+    let x = xref_new(a, b, XREF_SIMILAR, 900, 0)
+    atom_add_xref(a, x)
+    let y = xref_new(b, a, XREF_SIMILAR, 900, 0)
+    atom_add_xref(b, y)
+    return 1
+}
+
+// Fully connect every pair in [start, start+size).
+fn _clique(kg, start, size) {
+    let i = 0
+    while i < size {
+        let j = i + 1
+        while j < size {
+            _link(kg, start + i, start + j)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Linear chain a0 -- a1 -- a2 -- ... -- a(n-1).
+fn _chain(kg, start, n) {
+    let i = 0
+    while i < n - 1 {
+        _link(kg, start + i, start + i + 1)
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- extraction edge cases ------------------------------------------------
+
+fn test_empty_kg_zero_communities() {
+    let kg = _mk_kg_n("test_empty", 0)
+    let r = gc_label_propagation(kg, 20)
+    ce_eq("empty KG -> 0 communities",   gc_community_count(r), 0)
+    ce_eq("empty KG -> 0 edges",         gc_total_edges(r), 0)
+    ce_eq("empty KG -> 0 iterations",    gc_iterations(r), 0)
+    ce_eq("largest community id = -1",   gc_largest_community(r)[0], 0 - 1)
+    ce_eq("largest community size = 0",  gc_largest_community(r)[1], 0)
+}
+
+fn test_singleton_kg_one_community() {
+    let kg = _mk_kg_n("test_singleton", 1)
+    let r = gc_label_propagation(kg, 20)
+    ce_eq("singleton -> 1 community",        gc_community_count(r), 1)
+    ce_eq("singleton -> 0 edges",            gc_total_edges(r), 0)
+    ce_eq("singleton label_at(0) = 0",       gc_label_at(r, 0), 0)
+    let members = gc_community_members(r, 0)
+    ce_eq("singleton community 0 has 1 member", len(members), 1)
+    ce_eq("singleton community 0 member id = 0", members[0], 0)
+}
+
+fn test_two_linked_atoms_one_community() {
+    let kg = _mk_kg_n("test_pair", 2)
+    _link(kg, 0, 1)
+    let r = gc_label_propagation(kg, 20)
+    ce_eq("two linked atoms -> 1 community", gc_community_count(r), 1)
+    ce_eq("two linked atoms -> 1 edge",      gc_total_edges(r), 1)
+    // Both must share the same label.
+    ce_eq("atoms 0 + 1 share a label",
+        gc_label_at(r, 0), gc_label_at(r, 1))
+}
+
+fn test_two_disconnected_pairs_two_communities() {
+    let kg = _mk_kg_n("test_pairs", 4)
+    _link(kg, 0, 1)
+    _link(kg, 2, 3)
+    let r = gc_label_propagation(kg, 20)
+    ce_eq("two disconnected pairs -> 2 communities",
+        gc_community_count(r), 2)
+    ce_eq("two pairs -> 2 edges total",  gc_total_edges(r), 2)
+    // The pairs MUST cluster together, not across.
+    ce_eq("0 + 1 same label",
+        gc_label_at(r, 0), gc_label_at(r, 1))
+    ce_eq("2 + 3 same label",
+        gc_label_at(r, 2), gc_label_at(r, 3))
+    ce_check("0 + 2 different labels",
+        gc_label_at(r, 0) != gc_label_at(r, 2))
+}
+
+// ---- the barbell fixture ------------------------------------------------
+//
+// Two 4-cliques (atoms 0-3 and 4-7) joined by a single thin bridge
+// edge (atom 3 -- atom 4). The textbook LPA outcome is 2 communities:
+// one per clique, with the bridge edge sitting BETWEEN them. The
+// bridge atom (either 3 or 4) can land on either side depending on
+// shuffle order, but the two cliques must NOT collapse into one.
+fn test_barbell_two_communities() {
+    let kg = _mk_kg_n("test_barbell", 8)
+    _clique(kg, 0, 4)   // atoms 0..3
+    _clique(kg, 4, 4)   // atoms 4..7
+    _link(kg, 3, 4)     // the bridge
+    let r = gc_label_propagation(kg, 20)
+    // Edge count: each 4-clique has C(4,2) = 6 edges, plus the bridge = 13.
+    ce_eq("barbell edge count = 13", gc_total_edges(r), 13)
+    ce_eq("barbell -> 2 communities", gc_community_count(r), 2)
+    // The "interior" of each clique (atoms 0, 1, 2 on the left; 5, 6, 7
+    // on the right) MUST share a community within their side; the
+    // bridge atoms 3 and 4 are allowed to swing either way.
+    ce_eq("left interior 0 + 1 same",
+        gc_label_at(r, 0), gc_label_at(r, 1))
+    ce_eq("left interior 0 + 2 same",
+        gc_label_at(r, 0), gc_label_at(r, 2))
+    ce_eq("right interior 5 + 6 same",
+        gc_label_at(r, 5), gc_label_at(r, 6))
+    ce_eq("right interior 5 + 7 same",
+        gc_label_at(r, 5), gc_label_at(r, 7))
+    ce_check("left interior 0 != right interior 5",
+        gc_label_at(r, 0) != gc_label_at(r, 5))
+}
+
+// ---- the 3-clique fixture ----------------------------------------------
+//
+// Three disjoint triangles (3-cliques): atoms 0-1-2, 3-4-5, 6-7-8.
+// No inter-cluster edges -> LPA finds exactly 3 communities, one per
+// triangle, with all 3 atoms of each triangle sharing a label.
+fn test_three_disjoint_triangles_three_communities() {
+    let kg = _mk_kg_n("test_3clique", 9)
+    _clique(kg, 0, 3)
+    _clique(kg, 3, 3)
+    _clique(kg, 6, 3)
+    let r = gc_label_propagation(kg, 20)
+    // Each triangle has C(3,2) = 3 edges; 3 triangles = 9.
+    ce_eq("3-clique edge count = 9", gc_total_edges(r), 9)
+    ce_eq("3-clique -> 3 communities", gc_community_count(r), 3)
+    // Members within each triangle share a label.
+    ce_eq("triangle 1: 0 + 1 same",
+        gc_label_at(r, 0), gc_label_at(r, 1))
+    ce_eq("triangle 1: 0 + 2 same",
+        gc_label_at(r, 0), gc_label_at(r, 2))
+    ce_eq("triangle 2: 3 + 4 same",
+        gc_label_at(r, 3), gc_label_at(r, 4))
+    ce_eq("triangle 2: 3 + 5 same",
+        gc_label_at(r, 3), gc_label_at(r, 5))
+    ce_eq("triangle 3: 6 + 7 same",
+        gc_label_at(r, 6), gc_label_at(r, 7))
+    ce_eq("triangle 3: 6 + 8 same",
+        gc_label_at(r, 6), gc_label_at(r, 8))
+    // Distinct cluster labels across triangles.
+    ce_check("triangle 1 != triangle 2",
+        gc_label_at(r, 0) != gc_label_at(r, 3))
+    ce_check("triangle 1 != triangle 3",
+        gc_label_at(r, 0) != gc_label_at(r, 6))
+    ce_check("triangle 2 != triangle 3",
+        gc_label_at(r, 3) != gc_label_at(r, 6))
+}
+
+// ---- linear chain (deterministic-but-degenerate) ----------------------
+//
+// 1-2-3-...-10 chain. LPA on a chain may converge to one big
+// community or to multiple sub-segments depending on init/order.
+// We only assert that the OUTCOME IS DETERMINISTIC for a given seed,
+// and that the chain edge count is correct.
+fn test_linear_chain_deterministic() {
+    let kg_a = _mk_kg_n("test_chain_a", 10)
+    _chain(kg_a, 0, 10)
+    let r_a = gc_label_propagation_seeded(kg_a, 20, 42)
+    ce_eq("chain edge count = 9", gc_total_edges(r_a), 9)
+    // Same KG snapshot + same seed -> bit-identical clustering.
+    let kg_b = _mk_kg_n("test_chain_b", 10)
+    _chain(kg_b, 0, 10)
+    let r_b = gc_label_propagation_seeded(kg_b, 20, 42)
+    ce_eq("chain repeatable: n_comm",
+        gc_community_count(r_a), gc_community_count(r_b))
+    let i = 0
+    while i < 10 {
+        ce_eq("chain repeatable: label_at(" + int_to_str(i) + ")",
+            gc_label_at(r_a, i), gc_label_at(r_b, i))
+        i = i + 1
+    }
+}
+
+// ---- modularity sanity --------------------------------------------------
+
+fn test_modularity_well_separated_high() {
+    // Two cliques of size 4, NO bridge. Q approaches 0.5 for perfectly
+    // separated equal-size cliques (the well-known Newman upper bound
+    // on a 2-clique graph). 200 milli is the conservative threshold
+    // the brief calls out; this fixture should sail well past it.
+    let kg = _mk_kg_n("test_mod_high", 8)
+    _clique(kg, 0, 4)
+    _clique(kg, 4, 4)
+    let r = gc_label_propagation(kg, 20)
+    let q = gc_modularity(kg, r)
+    ce_check("well-separated cliques modularity > 200 milli", q > 200)
+    ce_check("modularity <= 1000 milli", q <= 1000)
+}
+
+fn test_modularity_single_cluster_low() {
+    // A single 4-clique. The entire graph is one community, so
+    // intra-edges / m == 1 and a^2/(4m^2) == 1 too. Q = 1 - 1 = 0.
+    // We allow a tiny window around 0 (integer rounding may shift by
+    // a couple of milli).
+    let kg = _mk_kg_n("test_mod_low", 4)
+    _clique(kg, 0, 4)
+    let r = gc_label_propagation(kg, 20)
+    let q = gc_modularity(kg, r)
+    ce_near("single-cluster modularity ~= 0 milli", q, 0, 10)
+}
+
+fn test_modularity_empty_graph() {
+    let kg = _mk_kg_n("test_mod_empty", 0)
+    let r = gc_label_propagation(kg, 20)
+    ce_eq("modularity on empty graph = 0",
+        gc_modularity(kg, r), 0)
+}
+
+// ---- determinism --------------------------------------------------------
+
+fn test_same_seed_same_result() {
+    let kg_a = _mk_kg_n("test_seed_a", 6)
+    _clique(kg_a, 0, 3)
+    _clique(kg_a, 3, 3)
+    let r_a = gc_label_propagation_seeded(kg_a, 20, 1234)
+
+    let kg_b = _mk_kg_n("test_seed_b", 6)
+    _clique(kg_b, 0, 3)
+    _clique(kg_b, 3, 3)
+    let r_b = gc_label_propagation_seeded(kg_b, 20, 1234)
+
+    ce_eq("same seed -> same community count",
+        gc_community_count(r_a), gc_community_count(r_b))
+    let i = 0
+    while i < 6 {
+        ce_eq("same seed -> identical label at " + int_to_str(i),
+            gc_label_at(r_a, i), gc_label_at(r_b, i))
+        i = i + 1
+    }
+}
+
+// ---- convergence speed --------------------------------------------------
+
+fn test_simple_fixtures_converge_in_few_iters() {
+    // The 3-clique fixture is so cleanly separated that LPA pins
+    // each triangle to its lowest-id label after at most 2 passes:
+    // pass 1 propagates the lowest label outward in each triangle,
+    // pass 2 stabilises (no further change). The third pass with
+    // changed=0 is the convergence detector.
+    let kg = _mk_kg_n("test_conv", 9)
+    _clique(kg, 0, 3)
+    _clique(kg, 3, 3)
+    _clique(kg, 6, 3)
+    let r = gc_label_propagation(kg, 20)
+    ce_check("3-clique converges in <= 5 iterations",
+        gc_iterations(r) <= 5)
+    ce_check("3-clique does at least 1 pass",
+        gc_iterations(r) >= 1)
+}
+
+// ---- gc_largest_community + gc_community_members ----------------------
+
+fn test_largest_community_picks_biggest() {
+    // Atoms 0..4 form one 5-clique, atom 5 is isolated.
+    let kg = _mk_kg_n("test_largest", 6)
+    _clique(kg, 0, 5)
+    let r = gc_label_propagation(kg, 20)
+    let big = gc_largest_community(r)
+    ce_eq("largest community has 5 members", big[1], 5)
+    let members = gc_community_members(r, big[0])
+    ce_eq("largest community member list len = 5", len(members), 5)
+    // Members are sorted ascending; 0..4 must be present.
+    ce_eq("member 0 = 0", members[0], 0)
+    ce_eq("member 1 = 1", members[1], 1)
+    ce_eq("member 2 = 2", members[2], 2)
+    ce_eq("member 3 = 3", members[3], 3)
+    ce_eq("member 4 = 4", members[4], 4)
+}
+
+fn test_community_members_missing_returns_empty() {
+    let kg = _mk_kg_n("test_missing", 2)
+    _link(kg, 0, 1)
+    let r = gc_label_propagation(kg, 20)
+    let members = gc_community_members(r, 9999)
+    ce_eq("missing community -> empty member list", len(members), 0)
+}
+
+fn test_label_at_missing_atom() {
+    let kg = _mk_kg_n("test_missing_aid", 3)
+    _link(kg, 0, 1)
+    let r = gc_label_propagation(kg, 20)
+    // Atom id 100 is way outside the KG; label_at returns -1.
+    ce_eq("label_at(missing atom) = -1",
+        gc_label_at(r, 100), 0 - 1)
+}
+
+// ---- max_iter clamp -------------------------------------------------------
+
+fn test_max_iter_zero_uses_default() {
+    // max_iter <= 0 falls back to GC_DEFAULT_MAX_ITER, so we get the
+    // same answer as the default path.
+    let kg = _mk_kg_n("test_mxz", 4)
+    _clique(kg, 0, 2)
+    _clique(kg, 2, 2)
+    let r_def = gc_label_propagation(kg, GC_DEFAULT_MAX_ITER)
+    let r_zero = gc_label_propagation(kg, 0)
+    ce_eq("max_iter=0 -> same community count as default",
+        gc_community_count(r_def), gc_community_count(r_zero))
+}
+
+fn main() {
+    test_empty_kg_zero_communities()
+    test_singleton_kg_one_community()
+    test_two_linked_atoms_one_community()
+    test_two_disconnected_pairs_two_communities()
+    test_barbell_two_communities()
+    test_three_disjoint_triangles_three_communities()
+    test_linear_chain_deterministic()
+    test_modularity_well_separated_high()
+    test_modularity_single_cluster_low()
+    test_modularity_empty_graph()
+    test_same_seed_same_result()
+    test_simple_fixtures_converge_in_few_iters()
+    test_largest_community_picks_biggest()
+    test_community_members_missing_returns_empty()
+    test_label_at_missing_atom()
+    test_max_iter_zero_uses_default()
+    ce_summary("graph_clustering")
+}
+
+main()

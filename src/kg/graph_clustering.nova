@@ -1,0 +1,759 @@
+// CrossEngin knowledge: KG graph clustering / community detection.
+//
+// Purpose
+//   The KG read story already covers:
+//     - exact lookup by atom id (atom_store.kg_find_atom),
+//     - episodic retrieval by member / window / pattern (R6F + R8F:
+//       episodic_recall_*),
+//     - LSH-bucketed cosine nearest-neighbour over the atom EMBEDDING
+//       vector (P3.4: ann_query),
+//     - TF-IDF semantic search over atom LABEL TEXT (R10C: ss_search).
+//
+//   What was missing is a STRUCTURAL view: which atoms talk to each
+//   other (through cross-reference edges, atom_xrefs) more than they
+//   talk to the rest of the graph? This module answers that question by
+//   finding "communities" of tightly-linked atoms via the classic label-
+//   propagation algorithm (Raghavan, Albert, Kumara, 2007 -- "Near linear
+//   time algorithm to detect community structures in large-scale
+//   networks"). Complement to R10C's textual ranker: R10C asks "which
+//   atoms LOOK alike" (label semantics); this module asks "which atoms
+//   are LINKED to each other" (graph structure).
+//
+// Algorithm summary -- Label Propagation (LPA)
+//   1. Initialize: every atom_id is its own community label.
+//   2. Repeat until labels stabilise OR max_iter reached:
+//        For each atom (in a deterministic-shuffled order):
+//          - Look at the labels of every directly-linked neighbour
+//            (xrefs out of this atom + xrefs into this atom from any
+//            other atom -- the link graph is treated as undirected here,
+//            as Raghavan's analysis demands).
+//          - Adopt the most-frequent neighbour label; ties break by the
+//            lowest label id (deterministic tiebreak).
+//   3. Output: final label per atom. Atoms sharing a label form a
+//      community.
+//
+//   Why LPA (vs Louvain or spectral):
+//     - O(V + E) per iteration, integer-only counting math, no FP
+//       weights, no eigenvector solve.
+//     - Streaming-friendly (a single atom's update only needs its
+//       neighbour set).
+//     - Empirically gives strong NMI scores on planted-partition
+//       benchmarks at a fraction of Louvain's cost (and Louvain wants
+//       modularity-greedy merges, which need FP weights).
+//
+// Determinism
+//   The Raghavan paper specifies a uniformly-random update order. True
+//   randomness kills reproducibility, so this module accepts a `seed`
+//   integer and uses a deterministic linear-congruential shuffle of the
+//   atom-id list. Same seed + same KG snapshot -> same label assignment,
+//   bit-identical across runs. Different seeds may produce different
+//   (still-valid) clusterings on graphs with multiple stable fixed
+//   points (e.g. a long chain), but identical clusterings on graphs with
+//   a unique optimum (e.g. two cliques + a thin bridge).
+//
+// Modularity (Newman, "Modularity and community structure in networks",
+// 2006). For a partition into communities C, modularity is:
+//     Q = sum over communities c of (e_cc - a_c^2)
+//   where
+//     - e_cc = (intra-community-c edge count) / total_edges  ("fraction
+//       of edges that fall WITHIN community c"), and
+//     - a_c  = (total degree of community c) / (2 * total_edges)
+//              ("fraction of edge-endpoints attached to community c").
+//   Range: [-0.5, 1.0]. Well-separated communities sit near 1.0; a
+//   single-cluster trivial assignment sits near 0.
+//
+//   In integer milli-units: every fraction is multiplied by FP_SCALE
+//   (= 1000) so a perfect partition lands near 1000 milli. Q < 0 stays
+//   representable (we use signed integers throughout). The `> 200 milli`
+//   threshold the brief calls out for "well-separated cliques" sits at
+//   the conservative end -- a barbell or 3-clique fixture should sail
+//   past it.
+//
+// Result layout (gc_result):
+//   [GC_OBJ_TAG, atom_ids, labels, communities, total_edges,
+//    iterations]
+//     - atom_ids:    list of atom_ids covered by the clustering, sorted
+//                    ascending (deterministic enumeration order); the
+//                    `labels` list lines up index-for-index.
+//     - labels:      list of community labels, one per atom_ids slot.
+//     - communities: list of [community_id, [atom_id, ...]] pairs,
+//                    sorted by community_id ascending. Used for O(1)
+//                    membership lookup (`gc_community_members`).
+//     - total_edges: number of UNIQUE undirected edges considered
+//                    (each xref counted once; (a -> b) and (b -> a) on
+//                    the same pair fuse to one edge).
+//     - iterations:  number of LPA passes the run actually used (<=
+//                    max_iter).
+//
+// ADRs implemented: ADR-0016 (atom xrefs ARE the links we cluster over),
+//   ADR-0017 (cross-KG references; LPA is intra-KG only here -- a
+//   follow-up could span multiple KGs by walking xrefs across KGs but
+//   the brief asks for single-KG clustering), ADR-0049 (testing).
+// NOVA dependencies: builtins (lists, push, list_set, len);
+//   std/io + std/string for the chat dispatch surface at the bottom of
+//   the file (io_println + int_to_str).
+// CrossEngin dependencies: src/kg/atom_store.nova (atom_id, atom_xrefs,
+//   xref_src_atom, xref_dst_atom), src/kg/multi_kg_manager.nova
+//   (kg_atoms, kg_label), src/kg/cross_kg_references.nova (xref_*),
+//   src/substrate/node_pool_manager.nova (FP_SCALE).
+
+import "std/io"
+import "std/string"
+import "../substrate/node_pool_manager.nova"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+import "cross_kg_references.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let GC_DEFAULT_MAX_ITER = 20    // Raghavan's empirical "almost-all-graphs
+                                // converge in < 5 iters", so 20 is a safe
+                                // upper bound for the synthetic fixtures.
+let GC_DEFAULT_SEED     = 0     // deterministic LCG seed for shuffles.
+
+// ---- gc_result layout -----------------------------------------------------
+let GC_OBJ_TAG       = 2001     // distinct from SS_OBJ_TAG (1901),
+                                // ANN_OBJ_TAG (1801), XREF_OBJ_TAG (1801).
+let GC_TAG           = 0
+let GC_ATOM_IDS      = 1
+let GC_LABELS        = 2
+let GC_COMMUNITIES   = 3
+let GC_TOTAL_EDGES   = 4
+let GC_ITERATIONS    = 5
+
+// Community-table slot offsets.
+let GC_COMM_ID       = 0
+let GC_COMM_MEMBERS  = 1
+
+// ---- deterministic shuffle -------------------------------------------
+//
+// A simple shift-xor mixer threaded by `seed`. We don't need crypto
+// strength -- just enough mixing to break the natural-order bias of
+// "every atom processed in id order" (which would always merge into
+// one big community on a connected graph because the lowest-id atom's
+// label dominates the front of the sweep).
+//
+// We mirror the well-tested shift-xor pattern from atom_store.label_hash
+// (h * 31 + c, masked to 15 bits) so every multiply intermediate stays
+// well below the NOVA codegen-bug threshold (#11: multiply > ~2^20
+// inside a loop body miscompiles). 31 * 32767 = 1,015,777 < 2^20.
+// Output is a 15-bit non-negative integer in [0, 32767]; that's plenty
+// of mixing for the shuffle since we only use it to compare for sort
+// order, not for unique-key distribution.
+let _GC_RAND_MASK = 32767       // 15-bit cap; matches LABEL_HASH_MASK.
+
+fn _gc_rand_next(state, salt) {
+    // shift-xor mix: h * 31 + salt, masked to 15 bits. `salt` is
+    // typically the current iteration index, so consecutive calls
+    // walk distinct points in the cycle. The +1 shift on the
+    // intermediate protects against state=0 stagnating at 0.
+    let h = state
+    if h == 0 { h = 5381 }    // djb2 seed; non-zero so the multiply does work
+    h = ((h * 31) + salt + 1) & _GC_RAND_MASK
+    return h
+}
+
+// Build the deterministic visit order: walk the mixer `n` times to fill
+// a list of [rand_key, atom_index_in_atom_ids] pairs, sort by rand_key
+// ascending, return the resulting atom-index list. Ties (same rand_key
+// for two indices) preserve original order through stable insertion
+// sort, which keeps the assignment deterministic even when two slots
+// hash to the same 15-bit bucket.
+//
+// O(n^2) insertion sort -- n is bounded by the active atom count,
+// typical KGs sit in the hundreds and the LPA inner loop is already
+// O(V*deg) so the sort never dominates.
+fn _gc_shuffle_order(n, seed) {
+    let pairs = list_new()
+    let state = seed + 1   // +1 so seed=0 still produces a non-zero state
+    if state <= 0 { state = 1 }
+    let i = 0
+    while i < n {
+        state = _gc_rand_next(state, i)
+        let pair = list_new()
+        push(pair, state)
+        push(pair, i)
+        push(pairs, pair)
+        i = i + 1
+    }
+    // Insertion sort ascending by pair[0]; the index pair[1] is the
+    // payload that survives into the output.
+    let m = len(pairs)
+    let k = 1
+    while k < m {
+        let cur = pairs[k]
+        let j = k - 1
+        let placed = 0
+        while j >= 0 {
+            if placed == 0 {
+                if pairs[j][0] > cur[0] {
+                    list_set(pairs, j + 1, pairs[j])
+                    j = j - 1
+                } else {
+                    list_set(pairs, j + 1, cur)
+                    placed = 1
+                    j = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(pairs, 0, cur) }
+        k = k + 1
+    }
+    let out = list_new()
+    let p = 0
+    while p < m {
+        push(out, pairs[p][1])
+        p = p + 1
+    }
+    return out
+}
+
+// ---- adjacency extraction -------------------------------------------------
+//
+// Collect a "live atom_ids" list + an adjacency-list representation
+// from the KG's atoms and their xrefs. We treat the link graph as
+// undirected (an xref a -> b implies the pair {a, b} are in the same
+// neighbourhood for LPA purposes), and dedupe duplicate edges so the
+// modularity denominator (`total_edges`) reflects unique pairs only.
+//
+// Dead atoms (zeroed slots in kg_atoms, the tombstone path that
+// kg_remove_atom leaves behind for stable handle integrity) are skipped:
+// a dead atom is no longer part of the live graph and shouldn't get a
+// community label.
+//
+// Returns [atom_ids, adjacency, total_edges]:
+//   - atom_ids:   sorted-ascending list of live atom ids
+//   - adjacency:  list, same length as atom_ids, of neighbour-index
+//                 lists (positions INTO atom_ids, not atom_ids
+//                 themselves -- so the LPA inner loop never needs the
+//                 reverse-lookup table)
+//   - total_edges: number of unique undirected edges (cross-KG xrefs
+//                 with dst outside this KG are dropped at extract time
+//                 since LPA is single-KG here)
+fn _gc_extract_graph(kg) {
+    let atoms = kg_atoms(kg)
+    let my_kg_label = kg_label(kg)
+    let n_raw = len(atoms)
+
+    // Pass 1: identify live atoms + their ids; build atom_id -> position map.
+    let atom_ids = list_new()
+    let i = 0
+    while i < n_raw {
+        let a = atoms[i]
+        if a != 0 {
+            push(atom_ids, atom_id(a))
+        }
+        i = i + 1
+    }
+    // atom_ids is in id-ascending order because kg.atoms is dense
+    // (atom_id == slot index by construction in kg_add_atom). No sort
+    // needed.
+
+    let n = len(atom_ids)
+    let adj = list_new()
+    let j = 0
+    while j < n {
+        push(adj, list_new())
+        j = j + 1
+    }
+
+    // Pass 2: extract xref endpoints + populate adjacency. We dedupe
+    // PER NEIGHBOUR -- if atom a has two xrefs to b, the pair {a, b}
+    // is one edge, not two; LPA + modularity both want unique pairs.
+    //
+    // To dedupe efficiently without an O(deg^2) re-scan, we append
+    // and then sweep neighbour lists at the end for unique entries.
+    // For typical degrees (< 50) the post-sweep dedupe is microseconds.
+    let total_edges = 0
+    let k = 0
+    while k < n_raw {
+        let a = atoms[k]
+        if a != 0 {
+            let src_idx = _gc_atom_pos(atom_ids, atom_id(a))
+            if src_idx >= 0 {
+                let xs = atom_xrefs(a)
+                let xi = 0
+                while xi < len(xs) {
+                    let x = xs[xi]
+                    let dst_kg = xref_dst_kg(x)
+                    let dst_id = xref_dst_atom(x)
+                    // Single-KG LPA: skip cross-KG edges. The brief's
+                    // follow-up could broaden this; for now any xref
+                    // whose dst lives in another KG is ignored.
+                    if str_eq(dst_kg, my_kg_label) == 1 {
+                        let dst_idx = _gc_atom_pos(atom_ids, dst_id)
+                        if dst_idx >= 0 {
+                            if dst_idx != src_idx {
+                                // Append to BOTH sides (undirected).
+                                _gc_neighbour_add(adj[src_idx], dst_idx)
+                                _gc_neighbour_add(adj[dst_idx], src_idx)
+                            }
+                        }
+                    }
+                    xi = xi + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+
+    // Pass 3: count unique edges. We sum half of every adjacency-list
+    // size (each undirected edge contributes to two endpoints'
+    // adjacency lists, so |E| = sum(deg) / 2). At this point the
+    // neighbour lists are already dedup'd by _gc_neighbour_add.
+    let sum_deg = 0
+    let p = 0
+    while p < n {
+        sum_deg = sum_deg + len(adj[p])
+        p = p + 1
+    }
+    total_edges = sum_deg / 2
+
+    let out = list_new()
+    push(out, atom_ids)
+    push(out, adj)
+    push(out, total_edges)
+    return out
+}
+
+// Lookup position of `target_id` in the sorted atom_ids list. Returns
+// -1 if absent. Linear scan -- atom_ids is small enough in practice
+// that binary search isn't worth the complexity for clarity.
+fn _gc_atom_pos(atom_ids, target_id) {
+    let n = len(atom_ids)
+    let i = 0
+    while i < n {
+        if atom_ids[i] == target_id { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Idempotent neighbour-list append: only push `idx` if it's not
+// already present. Keeps the adjacency dedup'd at construction time
+// so the LPA inner loop sees each neighbour exactly once.
+fn _gc_neighbour_add(nbrs, idx) {
+    let i = 0
+    while i < len(nbrs) {
+        if nbrs[i] == idx { return 0 }
+        i = i + 1
+    }
+    push(nbrs, idx)
+    return 1
+}
+
+// ---- label propagation ----------------------------------------------------
+//
+// Core LPA inner loop. For each atom in the shuffled order, count
+// neighbour labels and adopt the most-frequent one; ties break by
+// lowest label-id. Returns 1 if any label changed this pass, else 0
+// (caller uses this to detect convergence and short-circuit).
+//
+// Implementation: instead of building a hashmap of label -> count
+// (overkill for the typical < 50 neighbour case), we walk the
+// neighbour list and accumulate [label, count] pairs in a flat list.
+// O(deg^2) per atom, but deg is bounded by neighbour count and the
+// constant factor is tiny vs hashmap overhead.
+fn _gc_step(adj, labels, order) {
+    let n = len(labels)
+    let changed = 0
+    let i = 0
+    while i < n {
+        let pos = order[i]
+        let nbrs = adj[pos]
+        let deg = len(nbrs)
+        if deg > 0 {
+            // Accumulate [label, count] pairs in `tally`.
+            let tally = list_new()
+            let j = 0
+            while j < deg {
+                let nbr_label = labels[nbrs[j]]
+                let found = -1
+                let t = 0
+                while t < len(tally) {
+                    if found < 0 {
+                        if tally[t][0] == nbr_label { found = t }
+                    }
+                    t = t + 1
+                }
+                if found >= 0 {
+                    list_set(tally[found], 1, tally[found][1] + 1)
+                } else {
+                    let entry = list_new()
+                    push(entry, nbr_label)
+                    push(entry, 1)
+                    push(tally, entry)
+                }
+                j = j + 1
+            }
+            // Pick the best: highest count, tie-break by lowest label.
+            let best_label = labels[pos]   // hold current if no better
+            let best_count = -1
+            let q = 0
+            while q < len(tally) {
+                let lab = tally[q][0]
+                let cnt = tally[q][1]
+                let take = 0
+                if cnt > best_count {
+                    take = 1
+                } else {
+                    if cnt == best_count {
+                        if lab < best_label { take = 1 }
+                    }
+                }
+                if take == 1 {
+                    best_label = lab
+                    best_count = cnt
+                }
+                q = q + 1
+            }
+            if best_label != labels[pos] {
+                list_set(labels, pos, best_label)
+                changed = 1
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+// Build the canonical communities table from a labels vector: a
+// sorted-by-community-id list of [community_id, [atom_id, ...]]
+// pairs, with the inner member list ALSO sorted by atom_id ascending
+// for deterministic output.
+fn _gc_build_communities(atom_ids, labels) {
+    let n = len(labels)
+    let by_label = list_new()
+    let i = 0
+    while i < n {
+        let lab = labels[i]
+        let aid = atom_ids[i]
+        let found = -1
+        let j = 0
+        while j < len(by_label) {
+            if found < 0 {
+                if by_label[j][GC_COMM_ID] == lab { found = j }
+            }
+            j = j + 1
+        }
+        if found >= 0 {
+            push(by_label[found][GC_COMM_MEMBERS], aid)
+        } else {
+            let entry = list_new()
+            push(entry, lab)
+            let members = list_new()
+            push(members, aid)
+            push(entry, members)
+            push(by_label, entry)
+        }
+        i = i + 1
+    }
+    // Insertion sort by community_id ascending.
+    let m = len(by_label)
+    let k = 1
+    while k < m {
+        let cur = by_label[k]
+        let p = k - 1
+        let placed = 0
+        while p >= 0 {
+            if placed == 0 {
+                if by_label[p][GC_COMM_ID] > cur[GC_COMM_ID] {
+                    list_set(by_label, p + 1, by_label[p])
+                    p = p - 1
+                } else {
+                    list_set(by_label, p + 1, cur)
+                    placed = 1
+                    p = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(by_label, 0, cur) }
+        k = k + 1
+    }
+    return by_label
+}
+
+// ---- public API -----------------------------------------------------------
+
+// Run label propagation on the KG's link graph with a deterministic
+// shuffle seeded by `seed`. Returns a gc_result. max_iter <= 0 falls
+// back to GC_DEFAULT_MAX_ITER; seed = GC_DEFAULT_SEED uses the default.
+//
+// Edge cases:
+//   - Empty KG (no atoms):  0 communities, total_edges = 0, iterations = 0.
+//   - Single atom, no xrefs: 1 community of size 1, total_edges = 0,
+//                            iterations = 0 (no work to do).
+//   - Disconnected atoms:    each atom keeps its initial label and
+//                            forms its own community (the no-neighbour
+//                            branch of _gc_step is a no-op).
+fn gc_label_propagation_seeded(kg, max_iter, seed) {
+    let mx = max_iter
+    if mx <= 0 { mx = GC_DEFAULT_MAX_ITER }
+
+    let g = _gc_extract_graph(kg)
+    let atom_ids = g[0]
+    let adj = g[1]
+    let total_edges = g[2]
+    let n = len(atom_ids)
+
+    // Initialize labels: each atom's label is its atom_id. Using
+    // atom_id (not position) means the output labels carry meaning --
+    // a community labelled "5" reflects "the cluster that absorbed
+    // atom 5's initial label", not an opaque internal index.
+    let labels = list_new()
+    let i = 0
+    while i < n {
+        push(labels, atom_ids[i])
+        i = i + 1
+    }
+
+    let iterations = 0
+    if n > 0 {
+        let order = _gc_shuffle_order(n, seed)
+        let pass = 0
+        let done = 0
+        while pass < mx {
+            if done == 0 {
+                let changed = _gc_step(adj, labels, order)
+                iterations = iterations + 1
+                if changed == 0 { done = 1 }
+            }
+            pass = pass + 1
+        }
+    }
+
+    let communities = _gc_build_communities(atom_ids, labels)
+
+    let r = list_new()
+    push(r, GC_OBJ_TAG)
+    push(r, atom_ids)
+    push(r, labels)
+    push(r, communities)
+    push(r, total_edges)
+    push(r, iterations)
+    return r
+}
+
+// Convenience wrapper using the default seed.
+fn gc_label_propagation(kg, max_iter) {
+    return gc_label_propagation_seeded(kg, max_iter, GC_DEFAULT_SEED)
+}
+
+// Public accessors. Calling code should NOT poke at raw slot indices
+// -- the layout may shift in a future revision (e.g. when we add an
+// inverted "atom_id -> community" lookup table).
+
+fn gc_total_edges(r) { return r[GC_TOTAL_EDGES] }
+fn gc_iterations(r)  { return r[GC_ITERATIONS] }
+
+// Label (community id) for `atom_id`. Returns -1 if the atom isn't in
+// the clustering (e.g. it was dead at extract time, or never lived).
+fn gc_label_at(r, target_id) {
+    let atom_ids = r[GC_ATOM_IDS]
+    let labels = r[GC_LABELS]
+    let i = 0
+    while i < len(atom_ids) {
+        if atom_ids[i] == target_id { return labels[i] }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Number of distinct communities. Equals the length of the
+// canonical communities table.
+fn gc_community_count(r) {
+    return len(r[GC_COMMUNITIES])
+}
+
+// All atom_ids in `community_id`, in ascending order. Returns a fresh
+// list every call (the caller may push/pop freely). Empty list if the
+// community isn't present.
+fn gc_community_members(r, community_id) {
+    let comms = r[GC_COMMUNITIES]
+    let i = 0
+    while i < len(comms) {
+        if comms[i][GC_COMM_ID] == community_id {
+            // Defensive copy so callers can't mutate the result table.
+            let out = list_new()
+            let members = comms[i][GC_COMM_MEMBERS]
+            let j = 0
+            while j < len(members) {
+                push(out, members[j])
+                j = j + 1
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return list_new()
+}
+
+// The largest community: returns [community_id, size]. Ties break by
+// lowest community_id (so the result is fully deterministic). Returns
+// [-1, 0] when there are no communities (empty clustering).
+fn gc_largest_community(r) {
+    let comms = r[GC_COMMUNITIES]
+    let best_id = 0 - 1
+    let best_sz = 0
+    let i = 0
+    while i < len(comms) {
+        let sz = len(comms[i][GC_COMM_MEMBERS])
+        let take = 0
+        if sz > best_sz {
+            take = 1
+        } else {
+            if sz == best_sz {
+                if best_id < 0 { take = 1 } else {
+                    if comms[i][GC_COMM_ID] < best_id { take = 1 }
+                }
+            }
+        }
+        if take == 1 {
+            best_id = comms[i][GC_COMM_ID]
+            best_sz = sz
+        }
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, best_id)
+    push(out, best_sz)
+    return out
+}
+
+// Newman modularity in milli (scale 1000). Range [-500, 1000] in
+// principle; well-separated cliques sit near 1000; a single-cluster
+// trivial partition sits near 0. Returns 0 when the graph has no
+// edges (the formula is undefined; 0 is the conservative answer).
+//
+// Computation (integer-only, no division until the final step to
+// preserve precision):
+//   Q = sum_c (e_cc / m  -  (a_c / (2m))^2)
+//     = (sum_c e_cc) / m  -  (sum_c a_c^2) / (4 * m^2)
+//   where m = total_edges, e_cc = intra-community edge count
+//   (each edge counted ONCE), a_c = sum of degrees of atoms in c.
+//
+//   In milli:
+//     Q_milli = (sum_intra * FP_SCALE) / m
+//             - (sum_a_sq * FP_SCALE) / (4 * m * m)
+//
+//   The subtraction is over signed integers; modularity CAN go
+//   negative (e.g. an "anti-clustering" that puts every connected
+//   pair in different communities), and the test fixture for a
+//   single-cluster all-in-one graph lands near 0 exactly.
+fn gc_modularity(kg, r) {
+    let m = r[GC_TOTAL_EDGES]
+    if m <= 0 { return 0 }
+
+    // Rebuild the adjacency the same way the LPA did -- callers want
+    // to apply modularity to ANY labels assignment (not just the one
+    // we computed), so we don't carry the adjacency in the result.
+    let g = _gc_extract_graph(kg)
+    let atom_ids = g[0]
+    let adj = g[1]
+
+    // Build pos -> label map from r, lining up against atom_ids
+    // returned by _gc_extract_graph (the live atoms may differ if
+    // the KG was mutated between gc_label_propagation and now, but
+    // for a stable KG they're the same order).
+    let n = len(atom_ids)
+    let labels = list_new()
+    let i = 0
+    while i < n {
+        push(labels, gc_label_at(r, atom_ids[i]))
+        i = i + 1
+    }
+
+    // Group positions by label.
+    let groups = list_new()
+    let j = 0
+    while j < n {
+        let lab = labels[j]
+        let found = -1
+        let k = 0
+        while k < len(groups) {
+            if found < 0 {
+                if groups[k][0] == lab { found = k }
+            }
+            k = k + 1
+        }
+        if found >= 0 {
+            push(groups[found][1], j)
+        } else {
+            let entry = list_new()
+            push(entry, lab)
+            let pos_list = list_new()
+            push(pos_list, j)
+            push(entry, pos_list)
+            push(groups, entry)
+        }
+        j = j + 1
+    }
+
+    // Compute (sum_intra, sum_a_sq). For each community:
+    //   - intra = number of edges with BOTH endpoints in the
+    //     community, counted once.
+    //   - a = total degree of atoms in the community = sum(len(adj[p]))
+    //     for p in community.
+    let sum_intra = 0
+    let sum_a_sq = 0
+    let gi = 0
+    while gi < len(groups) {
+        let members = groups[gi][1]
+        let a_c = 0
+        let intra_double = 0   // each intra edge counted twice across
+                               // the two endpoints; halve at the end.
+        let p = 0
+        while p < len(members) {
+            let pos = members[p]
+            let nbrs = adj[pos]
+            let deg = len(nbrs)
+            a_c = a_c + deg
+            // Count intra: how many of pos's neighbours are also in
+            // this community (i.e. share the same label).
+            let q = 0
+            while q < deg {
+                let nbr_pos = nbrs[q]
+                if labels[nbr_pos] == labels[pos] {
+                    intra_double = intra_double + 1
+                }
+                q = q + 1
+            }
+            p = p + 1
+        }
+        let intra = intra_double / 2
+        sum_intra = sum_intra + intra
+        sum_a_sq = sum_a_sq + a_c * a_c
+        gi = gi + 1
+    }
+
+    // Final: Q_milli = (sum_intra * FP_SCALE) / m  -  (sum_a_sq * FP_SCALE) / (4*m*m)
+    // Compute each term separately and subtract.
+    let term1 = (sum_intra * FP_SCALE) / m
+    let four_m_sq = 4 * m * m
+    let term2 = 0
+    if four_m_sq > 0 {
+        term2 = (sum_a_sq * FP_SCALE) / four_m_sq
+    }
+    return term1 - term2
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/communities` admin: runs LPA on the live KG and reports the headline
+// triple (# communities, largest size, modularity milli). Mirrors the
+// emit-line discipline of /find / /recall: one CMD header line, no
+// per-community detail (the user can drill in with the public API if
+// they're driving from a test harness).
+
+fn gc_communities_cmd(kg) {
+    let r = gc_label_propagation(kg, GC_DEFAULT_MAX_ITER)
+    let n_comm = gc_community_count(r)
+    let big = gc_largest_community(r)
+    let big_sz = big[1]
+    let q_milli = gc_modularity(kg, r)
+    io_println("COMMUNITIES n=" + int_to_str(n_comm)
+        + " largest=" + int_to_str(big_sz)
+        + " modularity=" + int_to_str(q_milli) + " milli"
+        + " edges=" + int_to_str(gc_total_edges(r))
+        + " iter=" + int_to_str(gc_iterations(r)))
+    return 1
+}
