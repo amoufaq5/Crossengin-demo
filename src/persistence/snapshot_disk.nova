@@ -1079,6 +1079,16 @@ fn selfmodel_section_apply(sm, blob) {
 // Emit the framed snapshot as a list of newline-terminated lines, then join
 // them once. The list-then-join shape avoids the O(N^2) string-concat tax
 // that would otherwise dominate a snapshot with hundreds of atoms.
+//
+// v2 wire shape adds an OPTIONAL meta block between the `sections` header
+// and the first section. The block emits four lines:
+//   meta.creator <string>
+//   meta.created_ns <int>
+//   meta.compaction_threshold <int>
+//   meta.encryption <string>
+// A reader that ignores them parses unchanged (the lines look like any other
+// `key val` pair and aren't dispatched into a section blob). The block is
+// written iff snap_version(s) >= 2 -- a v1 image is preserved bit-identical.
 fn snap_to_text(s) {
     if snap_valid(s) == 0 { return "" }
     let lines = list_new()
@@ -1088,6 +1098,19 @@ fn snap_to_text(s) {
     _push_kv_int(lines, "instance", snap_instance(s))
     _push_kv_int(lines, "timestamp", snap_timestamp(s))
     _push_kv_int(lines, "sections", SEC_COUNT)
+
+    // v2 meta block. Emit only when the snapshot is at v2+ and carries a
+    // populated meta block (snap_has_meta == 1). The fields are optional on
+    // the wire -- a malformed file that drops one parses as the default for
+    // that field.
+    if snap_version(s) >= 2 {
+        if snap_has_meta(s) == 1 {
+            _push_kv_str(lines, "meta.creator",              snap_meta_creator(s))
+            _push_kv_int(lines, "meta.created_ns",           snap_meta_created_ns(s))
+            _push_kv_int(lines, "meta.compaction_threshold", snap_meta_compaction_threshold(s))
+            _push_kv_str(lines, "meta.encryption",           snap_meta_encryption(s))
+        }
+    }
 
     let soul_p = snap_has_section(s, SEC_SOUL)
     _push_kv_int(lines, "soul.present", soul_p)
@@ -1400,6 +1423,14 @@ fn snap_from_text(text) {
     let sm_count_seen = -1
     let sm_recs = list_new()
     let saw_end = 0
+    // v2 meta block. Defaults match the v1-migration recovery values so a
+    // file that omits one or more fields (legacy v1, or a v2 file with a
+    // partial meta block) parses without erroring.
+    let meta_seen     = 0
+    let meta_creator  = SNAP_META_CREATOR_DEFAULT_V1
+    let meta_created  = 0
+    let meta_compact  = SNAP_META_COMPACT_TH_UNKNOWN
+    let meta_encrypt  = SNAP_META_ENCRYPTION_NONE
 
     while pos < len(text) {
         let parsed = _next_line(text, pos)
@@ -1435,6 +1466,27 @@ fn snap_from_text(text) {
                 if str_eq(k, "episodic.present") == 1  { episodic_present  = _line_val_int(line) }
                 if str_eq(k, "synapses.present") == 1  { synapses_present  = _line_val_int(line) }
                 if str_eq(k, "selfmodel.present") == 1 { selfmodel_present = _line_val_int(line) }
+
+                // v2 meta block. Each field is optional; an absent field
+                // keeps its default. The block lives between `sections` and
+                // the first section but the parser accepts the lines in any
+                // position (same shape as the rest of the file).
+                if str_eq(k, "meta.creator") == 1 {
+                    meta_creator = _line_val(line)
+                    meta_seen    = 1
+                }
+                if str_eq(k, "meta.created_ns") == 1 {
+                    meta_created = _line_val_int(line)
+                    meta_seen    = 1
+                }
+                if str_eq(k, "meta.compaction_threshold") == 1 {
+                    meta_compact = _line_val_int(line)
+                    meta_seen    = 1
+                }
+                if str_eq(k, "meta.encryption") == 1 {
+                    meta_encrypt = _line_val(line)
+                    meta_seen    = 1
+                }
 
                 // Indexed atom keys: kgs.atoms[N].field
                 if _starts_with(k, "kgs.atoms[") == 1 {
@@ -1642,10 +1694,34 @@ fn snap_from_text(text) {
 
     if saw_end == 0 { return 0 }
     if tag != SNAP_TAG { return 0 }
-    if ver != SNAP_FORMAT_VERSION { return 0 }
+    // v2 backwards compatibility: we accept any version in
+    // [SNAP_FORMAT_VERSION_MIN_SUPPORTED, SNAP_FORMAT_VERSION] and migrate
+    // up after the section blobs are installed. A version newer than
+    // SNAP_FORMAT_VERSION is REJECTED loudly -- a future v3 carries fields
+    // this build doesn't understand and silently downgrading would lose
+    // data.
+    if ver < SNAP_FORMAT_VERSION_MIN_SUPPORTED { return 0 }
+    if ver > SNAP_FORMAT_VERSION {
+        // Split the diagnostic into a sequence of single appends to dodge
+        // a NOVA codegen pointer-threshold overflow on long chained "+"
+        // expressions over many string constants (same workaround pattern
+        // used elsewhere in this file for the unknown-part warning).
+        let msg = "(error: snapshot format v"
+        msg = msg + int_to_str(ver)
+        msg = msg + " is newer than this build supports (max v"
+        msg = msg + int_to_str(SNAP_FORMAT_VERSION)
+        msg = msg + "); upgrade required)"
+        io_println(msg)
+        return 0
+    }
     if sections != SEC_COUNT { return 0 }
 
     let s = snap_new(instance, timestamp)
+    // snap_new stamps SNAP_FORMAT_VERSION (today: 2) into the version slot.
+    // To run the migration path on a v1 file we have to roll the version
+    // back to what the file actually declared, install section blobs, then
+    // dispatch on `ver` to migrate up.
+    list_set(s, SNAP_VER, ver)
     if soul_present == 1 {
         let sb = list_new()
         push(sb, soul_name)             // [0]
@@ -1785,6 +1861,30 @@ fn snap_from_text(text) {
         }
         push(mb, sm_recs)
         snap_put_section(s, SEC_SELFMODEL, mb)
+    }
+
+    // v1 -> v2 migration dispatch. Versions older than the current format
+    // need their meta block invented out of the v1-recovery defaults. We
+    // run that here so the daemon's snap_load() path receives a uniformly-
+    // shaped v2 snapshot regardless of the file's on-disk version.
+    //
+    // A v2 file installs the meta block as-parsed; if the file omitted some
+    // or all meta fields (forward-compat from a writer that stamped only a
+    // subset, or a v2 file produced by a build that's still rolling out),
+    // the missing fields keep the defaults set above (which match the v1
+    // migration recovery values).
+    if ver == 1 {
+        snap_migrate_v1_to_v2(s)
+    } else {
+        // v2+ path: install the parsed meta block. snap_new already attached
+        // a v2-default meta block; we overwrite the fields with the values
+        // pulled from the wire.
+        if snap_has_meta(s) == 1 {
+            snap_meta_set_creator(s,              meta_creator)
+            snap_meta_set_created_ns(s,           meta_created)
+            snap_meta_set_compaction_threshold(s, meta_compact)
+            snap_meta_set_encryption(s,           meta_encrypt)
+        }
     }
     return s
 }

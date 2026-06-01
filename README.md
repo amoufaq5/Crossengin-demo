@@ -11,7 +11,15 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 132 modules compile (`make build`, +1 from
+> toolchain: 132 modules compile (`make build`, unchanged from the snapshot
+> v1 -> v2 migration session -- the bump landed inside the existing
+> `persistence/snapshot_{writer,disk,reader}.nova` trio +
+> `examples/migrate_snap.nova` (NEW) +
+> `scripts/migrate_snapshot.sh` (NEW) + `SNAPSHOT_FORMAT.md` (NEW). The
+> v2 format adds an OPTIONAL
+> `meta.{creator,created_ns,compaction_threshold,encryption}` block; a v1
+> file migrates transparently via `snap_migrate_v1_to_v2`, and v3+ files
+> are rejected loudly with an upgrade-required diagnostic. +1 from
 > `io/transducers/image_canny.nova` added in P3.3 cont. Canny edge
 > detection -- the canonical edge detector after Sobel + Harris + SIFT.
 > Pure-NOVA Gaussian 3x3 smoothing + signed Sobel gradients + non-maximum

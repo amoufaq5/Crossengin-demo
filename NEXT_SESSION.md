@@ -17,6 +17,65 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- **Snapshot format v2 + v1->v2 migration (this session)**:
+  **complete -- format versioning policy + migration tool LANDED**.
+  Bumps `SNAP_FORMAT_VERSION` from 1 to 2 in
+  `src/persistence/snapshot_writer.nova`, with v2 adding an optional
+  meta block (`meta.creator`, `meta.created_ns`,
+  `meta.compaction_threshold`, `meta.encryption`) between the
+  `sections` header and the first section body. Backwards-compat is
+  transparent: a v1 file on disk parses into the same in-memory
+  shape as a v2 file via `snap_migrate_v1_to_v2`, dispatched from
+  `snap_from_text` (text reader, snapshot_disk.nova) and `snap_parse`
+  (framed-value reader, snapshot_reader.nova). A v3+ file is rejected
+  loudly with an upgrade-required diagnostic -- silently downgrading
+  would drop fields. New surfaces:
+  - `snap_meta_new` / `snap_meta_creator` / `snap_meta_created_ns` /
+    `snap_meta_compaction_threshold` / `snap_meta_encryption` plus
+    matching setters in `snapshot_writer.nova`.
+  - `snap_migrate_v1_to_v2(snap)` in `snapshot_writer.nova` -- bumps
+    the version slot, attaches a meta block populated with the v1
+    recovery defaults (`creator="unknown/<v1>"`, `created_ns=0`,
+    `compaction_threshold=-1`, `encryption="none"`).
+  - `snap_to_text` extended to emit the meta lines when
+    `snap_version(s) >= 2`; `snap_from_text` extended to parse them
+    and dispatch on version; the per-section/per-blob shape is
+    unchanged so all existing tests (test_snapshot_disk_full +72,
+    test_snapshot_episodic +51, test_snapshot_synapses +89,
+    test_snapshot_selfmodel +38) still pass bit-identically.
+  - `examples/migrate_snap.nova` (NEW) -- one-shot
+    migration helper that takes `CE_MIGRATE_OLD` /
+    `CE_MIGRATE_NEW` env vars, reads the old file, peeks the on-disk
+    version, runs the migration chain, writes the new file, and
+    prints a one-line report (`migrated v1 -> v2 (NNN -> MMM bytes)`).
+  - `scripts/migrate_snapshot.sh` (NEW) -- operator-facing shell
+    wrapper around `examples/migrate_snap.nova`. Resolves OLD.snap /
+    NEW.snap to absolute paths, dispatches to the NOVA helper, drops
+    the `Compiled: ...` prefix, surfaces the report.
+  - `SNAPSHOT_FORMAT.md` (NEW) -- the versioning policy doc: MAJOR
+    bump triggers (mandatory fields / removed sections / wire shape
+    changes) vs MINOR addition (purely additive optional fields),
+    v1 + v2 changelogs, the v1->v2 migration table, the
+    v2->v3 stub for future migrations.
+  - `tests/unit/test_snapshot_migrate.nova` (NEW, 37 ce_* checks):
+    `snap_migrate_v1_to_v2` invariants on a fake v1 snapshot (v2
+    rejected, v1 accepted, version slot bumps to 2, meta block
+    populated with recovery defaults); v1 file text parse migrates
+    transparently and surfaces the recovery defaults; v2 round-trip
+    preserves non-default meta values; migrated v1 re-saved as v2
+    re-parses cleanly; v3 wire-format rejected; `snap_parse` framed-
+    value migration path mirrors the text path.
+  - `tests/integration/scenario_dd_snap_migrate.sh` (NEW, 16
+    assertions): hand-rolls a v1 snapshot, runs the wrapper, verifies
+    the migration report mentions v1 -> v2 with byte counts, and that
+    the output declares `ver 2` + carries all four meta lines + the
+    payload section survives.
+  Module count UNCHANGED (still 4 modules under `src/persistence/`).
+  Test count: +1 suite / +37 assertions (`test_snapshot_migrate`).
+  Integration scenarios: +1 (`scenario_dd_snap_migrate`).
+  Existing scenario_a* (durability + full state + dlog) still pass --
+  v2 wire format is a superset of v1.
+
 - **P3.3 cont. (this session) Canny edge detection**: **complete --
   pure-NOVA `image_canny.nova` LANDED**. The fourth structural-feature
   pipeline on top of Sobel + Harris + SIFT-detection. Canny (1986) is
