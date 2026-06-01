@@ -1,0 +1,452 @@
+// Unit tests for the R8D stereo quality follow-ups in
+// src/io/transducers/image_stereo.nova: LR-check (`stereo_disparity_lr_check`)
+// + sub-pixel parabolic refinement (`stereo_disparity_subpx`) + combined
+// `stereo_disparity_quality`.
+//
+// All fixtures are in-memory (alloc + store8) so the suite never depends
+// on an on-disk image -- mirrors R7E's test_stereo.nova convention.
+//
+// Assertion targets (~28):
+//   * LR-check on identical left=right: every interior pixel consistent
+//     (d_L = d_R = 0 trivially); mean is 0; density is 0.
+//   * LR-check on shifted-by-10 pair: probed interior pixels read
+//     disparity == 10 (matches R7E's d_L behavior; right-pass agrees).
+//   * LR-check on synthetic OCCLUSION fixture (right has a horizontal
+//     black band over a textured row of left): pixels in the band region
+//     are rejected as inconsistent (read 0) while textured rows survive.
+//   * Sub-pixel on synthesized half-pixel-shifted pair (right = left
+//     shifted by 10.5px via bilinear interpolation): milli-disparity is
+//     within +/- 300 milli of 10500 at probed pixels.
+//   * Sub-pixel on integer-shifted pair: milli-disparity within +/- 200
+//     milli of 10000 at probed pixels (parabola fit on an exact integer
+//     match can drift slightly due to noise around the SAD minimum).
+//   * Combined stereo_disparity_quality on integer-shifted-by-8 pair:
+//     returns ~8000 milli at consistent interior pixels, 0 at borders.
+//   * Degenerate parabola case (denominator 0): _stereo_subpx_refine
+//     falls back to integer * 1000.
+//   * stereo_disparity_milli_at OOB returns 0.
+//   * Invalid-input refusals for the three new APIs.
+//   * stereo_quality_pgm_args dispatch usage strings.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_stereo.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+fn _flat_fixture(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// R7E's per-pixel pseudo-random pattern. Works for integer-disparity
+// tests (the LR-check + occlusion tests below) where exact integer
+// matches drive SAD to 0 at the true disparity.
+fn _textured_fixture(width, height) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = (x * 37 + y * 13)
+            let q = v / 256
+            v = v - q * 256
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Smooth aperiodic ramp for sub-pixel refinement tests: bilinear
+// interpolation on a high-frequency pattern leaves residual SAD that
+// drowns out the sub-pixel signal; this ramp's per-pixel derivative is
+// small enough that the bilinear-blended right image still produces a
+// clean U-shaped SAD curve with a single isolated minimum at the true
+// disparity. The (x * y) / 8 term breaks the period-256 symmetry that
+// would let SAD find spurious matches at distant disparities.
+fn _ramp_fixture(width, height) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let u = x * 3 + y * 2 + (x * y) / 8
+            let q = u / 256
+            let v = u - q * 256
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// right(x, y) = left(x + shift, y)  [integer shift, matches R7E]
+fn _shift_left_fixture(src, width, height, shift) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let sx = x + shift
+            let v = 0
+            if sx < width { v = load8(src + row_off + sx) }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Sub-pixel shift via bilinear interpolation:
+//   right(x, y) = (1-f) * left(x + s, y) + f * left(x + s + 1, y)
+// where s = floor(shift_milli/1000) and f = (shift_milli % 1000) / 1000.
+// We do integer math: out = ((1000 - f_m) * left[x+s] + f_m * left[x+s+1])
+//                            / 1000
+fn _shift_left_subpx(src, width, height, shift_milli) {
+    let s = shift_milli / 1000
+    let f_m = shift_milli - s * 1000
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let sx = x + s
+            let v = 0
+            if sx + 1 < width {
+                let a = load8(src + row_off + sx)
+                let b = load8(src + row_off + sx + 1)
+                v = ((1000 - f_m) * a + f_m * b) / 1000
+            } else {
+                if sx < width { v = load8(src + row_off + sx) }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Build an "occluded" right fixture: same texture as left, except rows
+// [y_lo..y_hi) get painted constant 0 (a "horizontal black band" that
+// hides the underlying scene in the right view only). The LR-check should
+// reject every pixel of the black band as inconsistent, since the
+// disparity that fits a black row from the right cannot match the
+// textured row from the left.
+fn _occluded_right_fixture(src, width, height, shift, y_lo, y_hi) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = 0
+            if y >= y_lo {
+                if y < y_hi {
+                    // Black band region -- always 0.
+                } else {
+                    let sx = x + shift
+                    if sx < width { v = load8(src + row_off + sx) }
+                }
+            } else {
+                let sx = x + shift
+                if sx < width { v = load8(src + row_off + sx) }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- LR-check tests ------------------------------------------------------
+
+fn test_lr_check_identical_inputs() {
+    // left == right -> every interior pixel agrees (d_L = d_R = 0).
+    let buf = _textured_fixture(48, 32)
+    let r = stereo_disparity_lr_check(buf, buf, 48, 32, 7, 32, 1)
+    let m = stereo_result_map(r)
+    ce_check("LR-check identical -> non-zero map ptr", m != 0)
+    ce_eq("LR-check identical -> mean 0", stereo_result_mean(r), 0)
+    ce_eq("LR-check identical -> density 0", stereo_result_density(r), 0)
+    // Sample interior pixels: all should read 0 (= 0-disparity matches kept).
+    ce_eq("LR-check identical disp(20, 16) == 0",
+          stereo_disparity_at(m, 48, 20, 16), 0)
+    ce_eq("LR-check identical disp(30, 20) == 0",
+          stereo_disparity_at(m, 48, 30, 20), 0)
+}
+
+fn test_lr_check_shifted_pair() {
+    // Standard left + left-shifted-by-10 fixture. R7E's test asserts
+    // d_L = 10 at probed interior pixels. The right->left scan should
+    // recover the SAME disparity at the corresponding pixel in the right
+    // image, so the LR-check passes and the surviving disparity is 10.
+    let SHIFT = 10
+    let left  = _textured_fixture(64, 32)
+    let right = _shift_left_fixture(left, 64, 32, SHIFT)
+    let r = stereo_disparity_lr_check(left, right, 64, 32, 7, 32, 1)
+    let m = stereo_result_map(r)
+    ce_check("LR-check shifted -> non-zero map", m != 0)
+    let d1 = stereo_disparity_at(m, 64, 30, 16)
+    let d2 = stereo_disparity_at(m, 64, 40, 20)
+    ce_eq("LR-check shifted disp(30, 16) == SHIFT (10)", d1, SHIFT)
+    ce_eq("LR-check shifted disp(40, 20) == SHIFT (10)", d2, SHIFT)
+}
+
+fn test_lr_check_occlusion_rejection() {
+    // Left = textured. Right = left shifted by 8, EXCEPT rows [12..20)
+    // are painted constant 0 (occluding band in the right view only).
+    // The LR-check should reject pixels in those rows (or at least
+    // mostly reject them) because the right's flat-zero region matches
+    // many positions equally well; the right->left scan picks the wrong
+    // d, the two disparities disagree, and the pixel is zeroed out.
+    let SHIFT = 8
+    let left  = _textured_fixture(64, 32)
+    let right = _occluded_right_fixture(left, 64, 32, SHIFT, 12, 20)
+
+    // Reference: stereo_disparity (no LR-check) on the same pair --
+    // textured row 24 should land near SHIFT; the band rows have garbage.
+    let r_base = stereo_disparity(left, right, 64, 32, 7, 32)
+    let m_base = stereo_result_map(r_base)
+    let d_textured_base = stereo_disparity_at(m_base, 64, 32, 24)
+    ce_check("baseline (no LR): textured row reads SHIFT-ish",
+             d_textured_base >= 6)
+
+    let r = stereo_disparity_lr_check(left, right, 64, 32, 7, 32, 1)
+    let m = stereo_result_map(r)
+    ce_check("LR-check occluded -> non-zero map", m != 0)
+
+    // Pixels in the band region: most should be rejected (read 0).
+    // Count rejections in row 16 (mid-band) across the safe interior.
+    let rejected = 0
+    let total = 0
+    let x = 16
+    while x < 50 {
+        let d = stereo_disparity_at(m, 64, x, 16)
+        if d == 0 { rejected = rejected + 1 }
+        total = total + 1
+        x = x + 1
+    }
+    ce_check("LR-check rejects majority of occluded band pixels",
+             rejected * 2 > total)
+
+    // Pixels in the well-textured row 24 (below the band): a fair number
+    // should survive at the correct disparity (SHIFT).
+    let kept = 0
+    let x2 = 16
+    while x2 < 50 {
+        let d = stereo_disparity_at(m, 64, x2, 24)
+        if d == SHIFT { kept = kept + 1 }
+        x2 = x2 + 1
+    }
+    ce_check("LR-check keeps several textured-row pixels at SHIFT",
+             kept >= 1)
+}
+
+fn test_lr_check_tolerance_zero_defaults() {
+    // lr_tolerance == 0 -> _stereo_clamp_lr_tol falls back to default 1.
+    let buf = _textured_fixture(40, 24)
+    let r = stereo_disparity_lr_check(buf, buf, 40, 24, 7, 16, 0)
+    ce_check("lr_tolerance=0 -> default 1 path runs",
+             stereo_result_total(r) > 0)
+}
+
+fn test_lr_check_invalid_inputs() {
+    let buf = _flat_fixture(8, 8, 100)
+    let r0 = stereo_disparity_lr_check(0, buf, 8, 8, 7, 4, 1)
+    ce_eq("LR-check zero left -> total 0", stereo_result_total(r0), 0)
+    let r1 = stereo_disparity_lr_check(buf, 0, 8, 8, 7, 4, 1)
+    ce_eq("LR-check zero right -> total 0", stereo_result_total(r1), 0)
+    let r2 = stereo_disparity_lr_check(buf, buf, 300, 300, 7, 4, 1)
+    ce_eq("LR-check oversize -> total 0", stereo_result_total(r2), 0)
+}
+
+// ---- sub-pixel tests -----------------------------------------------------
+
+fn test_subpx_integer_shift_close_to_milli() {
+    // Integer-shifted-by-10 pair on the SMOOTH ramp fixture. SAD at the
+    // true minimum is small but nonzero (the ramp wraps mod 256 so its
+    // derivative has occasional discontinuities); the parabola fit should
+    // still produce milli ~= 10000 at probed pixels.
+    let SHIFT = 10
+    let left  = _ramp_fixture(64, 32)
+    let right = _shift_left_fixture(left, 64, 32, SHIFT)
+    let r = stereo_disparity_subpx(left, right, 64, 32, 7, 32)
+    let m = stereo_result_map(r)
+    let total = stereo_result_total(r)
+    ce_check("subpx -> total = w*h", total == 64 * 32)
+    let m1 = stereo_disparity_milli_at(m, 64, 30, 16)
+    let m2 = stereo_disparity_milli_at(m, 64, 40, 20)
+    let m3 = stereo_disparity_milli_at(m, 64, 45, 14)
+    ce_near("subpx integer-shift milli(30, 16) ~= 10000", m1, 10000, 200)
+    ce_near("subpx integer-shift milli(40, 20) ~= 10000", m2, 10000, 200)
+    ce_near("subpx integer-shift milli(45, 14) ~= 10000", m3, 10000, 200)
+}
+
+fn test_subpx_half_pixel_shift_close_to_milli() {
+    // Sub-pixel-shifted (10.5 px) pair on the SMOOTH ramp fixture via
+    // bilinear interpolation. With a smooth low-derivative texture the
+    // SAD curve around the true minimum is parabolic; the integer best
+    // picks d* in {10, 11} and the parabola fit pulls toward 10500.
+    let SHIFT_MILLI = 10500
+    let left  = _ramp_fixture(64, 32)
+    let right = _shift_left_subpx(left, 64, 32, SHIFT_MILLI)
+    let r = stereo_disparity_subpx(left, right, 64, 32, 7, 32)
+    let m = stereo_result_map(r)
+    let m1 = stereo_disparity_milli_at(m, 64, 30, 16)
+    let m2 = stereo_disparity_milli_at(m, 64, 40, 20)
+    let m3 = stereo_disparity_milli_at(m, 64, 45, 14)
+    ce_near("subpx 10.5 px shift milli(30, 16) ~= 10500", m1, 10500, 300)
+    ce_near("subpx 10.5 px shift milli(40, 20) ~= 10500", m2, 10500, 300)
+    ce_near("subpx 10.5 px shift milli(45, 14) ~= 10500", m3, 10500, 300)
+}
+
+fn test_subpx_invalid_inputs() {
+    let buf = _flat_fixture(8, 8, 100)
+    let r0 = stereo_disparity_subpx(0, buf, 8, 8, 7, 4)
+    ce_eq("subpx zero left -> total 0", stereo_result_total(r0), 0)
+    let r1 = stereo_disparity_subpx(buf, 0, 8, 8, 7, 4)
+    ce_eq("subpx zero right -> total 0", stereo_result_total(r1), 0)
+    let r2 = stereo_disparity_subpx(buf, buf, 300, 300, 7, 4)
+    ce_eq("subpx oversize -> total 0", stereo_result_total(r2), 0)
+}
+
+fn test_subpx_milli_at_oob() {
+    let buf = _textured_fixture(32, 24)
+    let r = stereo_disparity_subpx(buf, buf, 32, 24, 7, 8)
+    let m = stereo_result_map(r)
+    ce_eq("milli_at negative x -> 0", stereo_disparity_milli_at(m, 32, -1, 4), 0)
+    ce_eq("milli_at negative y -> 0", stereo_disparity_milli_at(m, 32, 4, -1), 0)
+    ce_eq("milli_at far OOB -> 0", stereo_disparity_milli_at(m, 32, 999, 999), 0)
+}
+
+// ---- combined LR-check + sub-pixel tests --------------------------------
+
+fn test_quality_shifted_by_8() {
+    // Combined pipeline on a clean integer-shifted-by-8 pair: consistent
+    // interior pixels should land near 8000 milli; border / unreachable
+    // pixels read 0.
+    let SHIFT = 8
+    let left  = _textured_fixture(64, 32)
+    let right = _shift_left_fixture(left, 64, 32, SHIFT)
+    let r = stereo_disparity_quality(left, right, 64, 32, 7, 32, 1)
+    let m = stereo_result_map(r)
+    let m1 = stereo_disparity_milli_at(m, 64, 30, 16)
+    let m2 = stereo_disparity_milli_at(m, 64, 40, 20)
+    ce_near("quality shifted-by-8 milli(30, 16) ~= 8000", m1, 8000, 200)
+    ce_near("quality shifted-by-8 milli(40, 20) ~= 8000", m2, 8000, 200)
+    // Top-left corner is outside the interior -> 0.
+    ce_eq("quality border milli(0, 0) == 0",
+          stereo_disparity_milli_at(m, 64, 0, 0), 0)
+    ce_eq("quality border milli(1, 1) == 0",
+          stereo_disparity_milli_at(m, 64, 1, 1), 0)
+}
+
+fn test_quality_occlusion_rejects() {
+    // Quality pipeline on the occlusion fixture: pixels in the black band
+    // get LR-rejected (milli = 0), pixels on the textured rows survive
+    // and read near 8 * 1000.
+    let SHIFT = 8
+    let left  = _textured_fixture(64, 32)
+    let right = _occluded_right_fixture(left, 64, 32, SHIFT, 12, 20)
+    let r = stereo_disparity_quality(left, right, 64, 32, 7, 32, 1)
+    let m = stereo_result_map(r)
+    // Band row 16: many pixels should read 0 (rejected).
+    let zeros = 0
+    let x = 16
+    while x < 50 {
+        if stereo_disparity_milli_at(m, 64, x, 16) == 0 { zeros = zeros + 1 }
+        x = x + 1
+    }
+    ce_check("quality occlusion -> majority of band pixels rejected (= 0)",
+             zeros * 2 > 34)
+}
+
+fn test_quality_invalid_inputs() {
+    let buf = _flat_fixture(8, 8, 100)
+    let r0 = stereo_disparity_quality(0, buf, 8, 8, 7, 4, 1)
+    ce_eq("quality zero left -> total 0", stereo_result_total(r0), 0)
+    let r1 = stereo_disparity_quality(buf, 0, 8, 8, 7, 4, 1)
+    ce_eq("quality zero right -> total 0", stereo_result_total(r1), 0)
+    let r2 = stereo_disparity_quality(buf, buf, 300, 300, 7, 4, 1)
+    ce_eq("quality oversize -> total 0", stereo_result_total(r2), 0)
+}
+
+// ---- parabola degeneracy fallback ----------------------------------------
+
+fn test_subpx_degenerate_parabola_flat_sad() {
+    // Two identical flat (constant-color) fixtures -> SAD = 0 at every
+    // disparity offset. The parabola denominator is 0 (s_m1 = s_0 = s_p1
+    // = 0), so _stereo_subpx_refine must fall back to integer * 1000.
+    // For identical inputs the best disparity is 0, so the milli result
+    // should be 0 at every interior pixel.
+    let buf = _flat_fixture(32, 24, 128)
+    let r = stereo_disparity_subpx(buf, buf, 32, 24, 7, 16)
+    let m = stereo_result_map(r)
+    // Probe deep-interior pixels (the SAD is 0 at every d, so best_d = 0
+    // and milli = 0 * 1000 + 0 = 0).
+    ce_eq("subpx degenerate (flat) -> 0 at (15, 11)",
+          stereo_disparity_milli_at(m, 32, 15, 11), 0)
+    ce_eq("subpx degenerate (flat) -> 0 at (20, 12)",
+          stereo_disparity_milli_at(m, 32, 20, 12), 0)
+}
+
+// ---- /depth_q dispatch helpers ------------------------------------------
+
+fn test_quality_pgm_args_dispatch_basic() {
+    let r0 = stereo_quality_pgm_args("")
+    ce_check("/depth_q no-arg returns usage",
+             str_eq(r0, "(/depth_q needs two PATHs -- usage: /depth_q L.pgm R.pgm)") == 1)
+    let r1 = stereo_quality_pgm_args("only_one.pgm")
+    ce_check("/depth_q one-arg returns 'got 1' usage",
+             str_eq(r1, "(/depth_q needs TWO paths -- got 1)") == 1)
+    let r2 = stereo_quality_pgm_args("/nonexistent_left.pgm /nonexistent_right.pgm")
+    ce_check("/depth_q missing files returns error", len(r2) > 0)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_lr_check_identical_inputs()
+    test_lr_check_shifted_pair()
+    test_lr_check_occlusion_rejection()
+    test_lr_check_tolerance_zero_defaults()
+    test_lr_check_invalid_inputs()
+    test_subpx_integer_shift_close_to_milli()
+    test_subpx_half_pixel_shift_close_to_milli()
+    test_subpx_invalid_inputs()
+    test_subpx_milli_at_oob()
+    test_quality_shifted_by_8()
+    test_quality_occlusion_rejects()
+    test_quality_invalid_inputs()
+    test_subpx_degenerate_parabola_flat_sad()
+    test_quality_pgm_args_dispatch_basic()
+    ce_summary("image_stereo_quality")
+}
+
+main()

@@ -284,10 +284,28 @@ gradient structure and corner geometry, not just intensity moments:
   semi-global matching (SGM) for the same reason PGM was chosen
   over JPEG: simplest standardized algorithm that produces a
   structurally interesting feature, with NO division in the inner
-  loop and NO floating-point operations. Follow-ups (separate
-  drops): left-right consistency check (re-run disparity right->left,
-  zero pixels where the two answers disagree); sub-pixel disparity
-  refinement (parabolic fit around the SAD minimum); SGM (aggregate
+  loop and NO floating-point operations. **R8D quality follow-ups**
+  added LR-check and sub-pixel refinement on top of R7E's integer
+  path (the SGM track stays deferred): `stereo_disparity_lr_check`
+  computes left->right + right->left disparities and zeros pixels
+  where the two answers disagree by more than `lr_tolerance` pixels
+  (textbook default 1) -- rejects occlusions, texture-less regions,
+  and depth discontinuities cleanly; `stereo_disparity_subpx` fits a
+  parabola through SAD(d*-1), SAD(d*), SAD(d*+1) and emits
+  milli-disparity = int(x_min * 1000) (so 10.5 px = 10500); the
+  combined `stereo_disparity_quality` runs LR-check then sub-pixel
+  on survivors and returns a milli-disparity list with 0 at
+  inconsistent pixels. Degenerate-parabola fallback (denominator <= 0,
+  textureless / no-isolated-minimum regions): snap to integer * 1000.
+  New chat admin `/depth_q L.pgm R.pgm` prints
+  `(depth_q WxH mean_milli=M density=Dmilli image_stereo_density_*)`.
+  On a 64x32 ramp shifted by 10.5 px the unit test asserts milli is
+  within +/- 300 of 10500 at probed interior pixels (e.g. (30, 16),
+  (40, 20), (45, 14)); on an integer-shifted-by-10 pair milli stays
+  within +/- 200 of 10000; on a synthetic-occlusion fixture (right
+  has a horizontal black band only) the LR-check rejects the majority
+  of band-region pixels while textured-row pixels survive at the
+  correct integer disparity. Remaining follow-up: SGM (aggregate
   costs along 4-8 directions per pixel, much more accurate in
   textureless regions but ~10x runtime + ~5x memory). Dimensions
   capped at 256x256 per axis (the inner triple loop runs in
@@ -342,7 +360,8 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | SIFT 128-D descriptor + matching                   | DONE (P3.3 cont. v2)|
 | ORB (FAST + rBRIEF + Hamming matcher)              | DONE (P3.3 cont. v3)|
 | Stereo block-matching SAD disparity + depth         | DONE (R7E)       |
-| Stereo SGM + LR-check + sub-pixel                  | 3-4 weeks        |
+| Stereo LR-check + sub-pixel refinement              | DONE (R8D)       |
+| Stereo SGM                                          | 3-4 weeks        |
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
 
@@ -468,6 +487,27 @@ Pure-NOVA WebP and HEIC are not on any roadmap within the next year.
   per-image keypoint counts are reported, missing / partial arguments
   print the usage line, and the chat reaches /quit cleanly after the
   matcher probing sequence.
+* `tests/unit/test_stereo_quality.nova` — 42 in-memory assertions
+  covering R8D's LR-check + sub-pixel pipeline: LR-check on
+  identical inputs (every pixel consistent), shifted-by-10 pair
+  (interior disparities survive at 10), occluded fixture (band
+  pixels rejected, textured-row pixels kept), tolerance / invalid-
+  input clamping; sub-pixel on integer-shifted-by-10 pair (milli
+  within +/- 200 of 10000), 10.5-px-shifted pair via bilinear
+  interpolation (milli within +/- 300 of 10500), invalid inputs,
+  OOB accessor safety; combined `stereo_disparity_quality` on
+  integer-shifted-by-8 pair (milli ~8000 at consistent interior
+  pixels, 0 at borders) + occlusion fixture (band pixels rejected);
+  parabola-degeneracy fallback on flat SAD; /depth_q dispatch
+  usage strings.
+* `tests/integration/scenario_kk_stereo_quality.sh` — 11
+  end-to-end /depth_q chat assertions against ramp + integer-
+  shifted-by-10 + sub-pixel-shifted-by-10.5 PGM fixtures
+  synthesized in /tmp via Python: identical inputs report
+  mean_milli=0, integer-shifted pair reports mean_milli >= 1000,
+  sub-pixel-shifted pair reports mean_milli >= 500, dim mismatch +
+  missing-file errors surface cleanly, chat reaches /quit cleanly
+  after the probing sequence.
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (JPEG / PNG decode, feature extraction, embeddings).
 * `STT_AUDIT.md` — sibling audit for the audio modality bridge.

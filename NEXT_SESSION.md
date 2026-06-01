@@ -3,6 +3,237 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R8B (this session) — Audio: whisper.cpp STT backend, /listen actually transcribes
+
+**Status: complete -- `src/io/transducers/whisper_backend.nova` lands as
+the third leg of the speech-to-text seam from R7F (`stt_seam.nova`).**
+R7F shipped the clean `stt_transcribe(seam, audio_buffer) ->
+[transcript, confidence, error]` interface with VAD gating and two
+backends (stub + the legacy `scripts/transcribe.sh` subprocess shim).
+This round wires a FIRST-CLASS whisper.cpp backend that the seam
+dispatches to natively, so the chat's `/listen` command actually
+produces text instead of returning the `[stt unavailable]` placeholder.
+
+### Backend choice
+
+Whisper.cpp (https://github.com/ggerganov/whisper.cpp) is the
+MIT-licensed pure-C reimplementation of OpenAI Whisper. The `tiny.en`
+ggml quantized model is ~75 MB; the `whisper-cli` binary is ~3 MB.
+CPU-only inference on a 11-second JFK utterance completes in ~1 s on
+a modest amd64 box. This fits CE's "minimal external deps" constraint:
+no GPU, no LLM, no FFI; one fork+exec from NOVA.
+
+### What landed
+
+- **`src/io/transducers/whisper_backend.nova`** (NEW): 442 lines, leaf
+  module (no CrossEngin deps; imports `std/syscall`). Public API:
+  * `whisper_transcribe(bin_path, model_path, wav_path) ->
+    [transcript, confidence_milli, error_msg]` -- the canonical
+    spawn-and-drain entry point.
+  * `whisper_transcribe_default(wav_path)` -- convenience wrapper
+    that uses env-resolved `CE_WHISPER_BIN` / `CE_WHISPER_MODEL`.
+  * `whisper_backend_available(bin_path, model_path)` -- openable-ness
+    probe via `sys_open(O_RDONLY) + sys_close`; returns 1 iff both
+    files open cleanly.
+  * `whisper_resolve_bin()` / `whisper_resolve_model()` -- env-var
+    readers with canonical defaults
+    (`/usr/local/bin/whisper-main` + `/usr/local/share/whisper/ggml-tiny.en.bin`).
+  * `whisper_clean_transcript(raw)` -- trim whitespace + collapse
+    internal newlines to spaces + dedup runs of spaces. Public so
+    tests can exercise without spawning the binary.
+  * `whisper_result_transcript/_confidence/_error` -- tuple accessors.
+
+  Internal:
+  * Raw asm shims for `pipe2(293)`, `dup2(33)`, `close(3)`, `read(0)`
+    (same pattern as `stt_seam._stt_*`; duplicated here to keep this
+    module a leaf).
+  * `_whisper_argv8(bin, "-m", model, "-f", wav, "-nt", "-np")` --
+    seven-arg argv + NULL terminator; passed directly to
+    `exec_program(bin, argv)` so we don't need a `/bin/sh -c`
+    intermediate (saves one fork+exec).
+  * Child rewires stdout to the pipe's write end, parent drains
+    16 KB cap, both reap via `waitpid`.
+
+- **`src/io/transducers/stt_seam.nova`** (R7F's file, EXTENDED):
+  * Added `STT_BACKEND_WHISPER = 4` constant.
+  * Added `_stt_autopick_backend()` -- env unset prefers whisper if
+    installed, falls back to stub. NEVER auto-picks subprocess (the
+    legacy shim path requires explicit opt-in).
+  * Added `_stt_backend_whisper(s, wav_path)` -- routes to
+    `whisper_transcribe_default`, mirrors the triple into the seam's
+    `last_*` fields, preserves whisper's precise error string
+    (e.g. "model not found") rather than collapsing to the stub
+    placeholder.
+  * Added `stt_seam_new_whisper(model_path)` constructor -- test
+    convenience that pins the default to WHISPER and registers
+    "whisper" alongside the existing two builtins.
+  * Updated `stt_default_backend()` to recognize
+    `CE_STT_BACKEND=whisper` and call the auto-pick helper when
+    unset.
+
+### Install layout (canonical)
+
+| Path                                          | Source                                  |
+|-----------------------------------------------|-----------------------------------------|
+| `/usr/local/bin/whisper-main`                 | renamed from `whisper.cpp/build/bin/whisper-cli` |
+| `/usr/local/share/whisper/ggml-tiny.en.bin`   | from `whisper.cpp/models/download-ggml-model.sh tiny.en` |
+
+Operators override via `CE_WHISPER_BIN` / `CE_WHISPER_MODEL`. Build
+recipe (one-shot):
+
+```bash
+git clone https://github.com/ggerganov/whisper.cpp /tmp/whisper.cpp
+cd /tmp/whisper.cpp
+cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target whisper-cli
+bash ./models/download-ggml-model.sh tiny.en
+sudo cp build/bin/whisper-cli /usr/local/bin/whisper-main
+sudo mkdir -p /usr/local/share/whisper
+sudo cp models/ggml-tiny.en.bin /usr/local/share/whisper/
+```
+
+### Verification
+
+- `tests/unit/test_whisper_backend.nova`: 28 assertions covering env
+  resolvers (defaults + overrides), openable-ness probe, all three
+  pre-flight error paths ("binary not found" / "model not found" /
+  "wav not found"), transcript cleanup (trim, newline collapse,
+  space dedup, empty / all-whitespace input), result accessors, and
+  the stt_seam round-trip through STT_BACKEND_WHISPER (verified via
+  the seam's `last_error` surfacing the precise install gap).
+- `tests/integration/scenario_jj_whisper.sh`: 13 assertions when
+  whisper is installed (10 when it isn't). Synthesizes a Klatt
+  utterance, runs it through `whisper_transcribe`, then runs the
+  bundled `jfk.wav` and asserts the transcript contains
+  "Americans". Exercises `stt_seam_new_whisper(model_path)` + the
+  STT_BACKEND_STUB fallback path. SKIPs the model-decode assertions
+  when whisper is not installed so CI on bare environments still
+  passes.
+
+`whisper_backend: OK (28 checks)`. `stt_seam: OK (27 checks)`
+(unchanged shape; +1 assertion for the new "whisper" builtin
+registration). All other audio test suites continue to pass:
+`audio_synth: OK (209)`, `audio_capture: OK (28)`, `audio_vad: OK
+(55)`. Full unit-test sweep: 146 suites green (was 145; +1 from
+test_whisper_backend).
+
+On the dev container the JFK sample transcribes to:
+
+> "And so my fellow Americans ask not what your country can do for
+> you, ask what you can do for your country."
+
+(confidence=800, error="", tlen≈110 chars, ~1 s wall time on amd64).
+
+### Open follow-ups
+
+- Per-segment confidence via `--print-confidence`. Recent whisper-cli
+  builds expose per-token logprobs; parsing that into a per-utterance
+  milli value drops the current 800-ballpark.
+- Streaming transcription via `-f -` (stdin PCM). Would let
+  `stt_transcribe_pcm` skip the temp-WAV write and stream directly
+  from the capture pipeline.
+- Larger models (base.en / small.en / medium.en) for noisy /
+  accented audio. The env-driven model selection already supports
+  any model; the trade-off is download size + RAM.
+- VAD-aware segmentation: hand each VAD-detected speech segment to
+  whisper independently rather than concatenating. Preserves
+  utterance boundaries for downstream prosody / turn-taking
+  analysis.
+
+---
+
+## R8D (parallel session) — IO: stereo LR-check + sub-pixel refinement on R7E
+
+**Status: complete -- `src/io/transducers/image_stereo.nova` extends
+R7E's block-matching SAD disparity with the two quality follow-ups
+the original audit named as next steps.** The integer SAD path
+shipped in R7E is correct under the assumption that every interior
+pixel has a true match in the other view; that breaks at occlusions
+(a foreground edge in LEFT has no corresponding pixel in RIGHT
+because the foreground hides the background only on one side), at
+textureless regions (flat surfaces produce many equally-good SAD
+matches), and at periodic patterns (repeating texture produces
+multiple SAD minima at multiples of the period). LR-check rejects
+all three classes by ALSO computing disparity right->left and
+discarding pixels where the two answers disagree; sub-pixel
+refinement fits a parabola through SAD(d*-1, d*, d*+1) to recover
+fractional-pixel disparity. Both are textbook stereo quality
+improvements (Scharstein-Szeliski IJCV 2002).
+
+### What landed
+
+- **`src/io/transducers/image_stereo.nova`** (+520 lines, EXTENDED;
+  R7E's integer surface untouched for back-compat). New public API:
+  * `stereo_disparity_lr_check(left, right, w, h, win_size, max_disp,
+    lr_tolerance)` -> result tuple identical to R7E's; bytes are 0
+    where left->right and right->left disparities disagree by more
+    than `lr_tolerance` pixels (default 1).
+  * `stereo_disparity_subpx(left, right, w, h, win_size, max_disp)`
+    -> result tuple whose map slot is a LIST OF INTS (not bytes)
+    holding milli-disparity (int(d_subpx * 1000)). Degenerate-
+    parabola fallback (denom <= 0): snap to integer * 1000.
+  * `stereo_disparity_quality(left, right, w, h, win_size, max_disp,
+    lr_tolerance)` -> combined: LR-check first (rejects bad matches
+    -> milli 0), sub-pixel refines survivors.
+  * `stereo_disparity_milli_at(milli_list, w, x, y)` /
+    `stereo_quality_milli_at` (alias) -> accessor.
+  * `stereo_quality_pgm_paths(L, R)`, `stereo_quality_pgm_args(arg)`
+    -- chat `/depth_q` admin one-liners; same shape as R7E's
+    `stereo_pgm_args`.
+- **`examples/crossengin_chat.nova`** (+1 line): `/depth_q L.pgm R.pgm`
+  dispatch. The R7E `/depth` admin and its help line stay; `/depth_q`
+  is dispatch-only.
+- **`tests/unit/test_stereo_quality.nova`** (NEW, 42 assertions):
+  LR-check identical inputs (mean / density 0, probed pixels 0);
+  LR-check shifted-by-10 pair (probed disparities survive at 10);
+  LR-check on synthetic occlusion fixture (right has rows [12..20)
+  painted constant 0; majority of band-region pixels rejected,
+  textured-row pixels survive at SHIFT); LR-check tolerance / invalid
+  inputs; sub-pixel on integer-shifted-by-10 ramp (milli within
+  +/- 200 of 10000); sub-pixel on 10.5-px-shifted ramp via bilinear
+  interpolation (milli within +/- 300 of 10500); sub-pixel invalid
+  inputs / OOB accessor safety; combined `stereo_disparity_quality`
+  on integer-shifted-by-8 pair (milli ~8000 at consistent interior
+  pixels, 0 at borders) + occlusion fixture (band pixels rejected);
+  parabola-degeneracy fallback (flat SAD -> integer * 1000); /depth_q
+  dispatch usage strings.
+- **`tests/integration/scenario_kk_stereo_quality.sh`** (NEW, 11
+  assertions): build LEFT (smooth-ramp 48x32 PGM via Python),
+  RIGHT_INT (shifted-by-10), RIGHT_SUB (shifted-by-10.5 via bilinear
+  interpolation), RIGHT_SMALL (32x24 ramp). Cases: /help still
+  advertises /depth (R7E preserved); /depth_q no-arg / one-arg usage;
+  identical inputs report `mean_milli=0`; integer-shifted pair
+  reports `mean_milli >= 1000` + density label; sub-pixel-shifted
+  pair reports `mean_milli >= 500`; dim mismatch + missing-file
+  errors surface cleanly; chat reaches /quit cleanly.
+- **`IMAGE_AUDIT.md`**: R8D LR-check + sub-pixel checked off in the
+  feature ladder ("Stereo LR-check + sub-pixel refinement | DONE
+  (R8D)"); SGM stays at "3-4 weeks". Cross-references added for the
+  new unit + integration test files.
+
+### Verification
+
+- 42/42 unit assertions in `test_stereo_quality.nova` green.
+- 11/11 integration assertions in `scenario_kk_stereo_quality.sh` green.
+- R7E's `test_stereo.nova` (54 assertions) + `scenario_hh_stereo.sh`
+  (10 assertions) still green -- R7E's contract preserved.
+- Full unit suite: 148/148 green (added 1 file, no regressions).
+- `make build` still 140 modules.
+
+### Follow-ups not in this session
+
+- **SGM** (Semi-Global Matching, Hirschmuller 2008): aggregate costs
+  along 4-8 directions per pixel; smooths the disparity field via
+  pseudo-2D dynamic programming; ~10x runtime + ~5x memory vs SAD
+  but dramatically better in textureless regions. Significantly
+  harder lift -- 3-4 weeks honest estimate.
+- **Speckle filter**: connected-component analysis to drop
+  small-cluster disparity blobs (typical post-LR-check cleanup).
+- **Visual-perception seam** (`visual_perception.nova`) integration:
+  switch `stereo_append_features_if_paired` from R7E's
+  `stereo_disparity` to `stereo_disparity_quality` so the emitted
+  atoms reflect the LR-filtered density rather than raw SAD.
+
 ## R8F (this session) — KG: episodic memory retrieval API + `/recall` chat command
 
 **Status: complete -- the READ-side companion to R6F's WRITE-side

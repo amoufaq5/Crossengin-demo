@@ -77,6 +77,24 @@ computational units rather than orchestrating a pipeline of modules.
 > sees confirmed-speech PCM, see AUDIO_AUDIT.md for the algorithm +
 > verification),
 > +1 from
+> `io/transducers/whisper_backend.nova` added in R8B (whisper.cpp STT
+> backend wired into the seam from R7F — `/listen` actually transcribes
+> when whisper-main + ggml-tiny.en.bin are installed). Spawns the
+> whisper-cli binary via fork+exec from NOVA with stdout drained into
+> the seam's `[transcript, confidence_milli, error]` triple. Pre-flights
+> `binary not found` / `model not found` / `wav not found` so each
+> install gap surfaces precisely. Auto-picks `whisper` when env unset +
+> binary+model present, falls back to `stub`. Env knobs:
+> `CE_STT_BACKEND=whisper|stub|subprocess`,
+> `CE_WHISPER_BIN=/path/to/whisper-main`,
+> `CE_WHISPER_MODEL=/path/to/ggml-tiny.en.bin`. Confidence ballpark
+> 800 milli on success (per-utterance confidence via
+> `--print-confidence` is a future task). On the dev container the
+> bundled JFK sample transcribes to "And so my fellow Americans ask not
+> what your country can do for you, ask what you can do for your
+> country." See AUDIO_AUDIT.md "R8B: whisper.cpp STT backend" for the
+> install layout + verification details,
+> +1 from
 > `io/transducers/noise_xk.nova` added in R6C and upgraded in R7C to
 > 2048-bit RFC 7919 Group 14 DH — pure-NOVA Noise XK
 > mutual-auth handshake + ChaCha20-Poly1305 transport encryption for
@@ -487,6 +505,17 @@ computational units rather than orchestrating a pipeline of modules.
 > linearly with frame_size so the same module works at 8/16/22.05/
 > 44.1/48 kHz. Rejects pure-noise inputs via the ZCR ceiling
 > (alternating ±3000 = max ZCR = silence verdict),
+> +1 suite / +28 assertions from `test_whisper_backend.nova` added in
+> R8B -- whisper.cpp STT backend wired into the seam: env-resolver
+> fallback (default canonical install paths when CE_WHISPER_BIN /
+> CE_WHISPER_MODEL are unset), openable-ness probe (uses sys_open as
+> the access-proxy), three pre-flight error paths ("binary not
+> found", "model not found", "wav not found"), transcript cleanup
+> (trim whitespace + collapse internal newlines to single spaces +
+> dedup runs of spaces, handles empty + all-whitespace input),
+> result-tuple accessors, and a stt_seam round-trip through
+> STT_BACKEND_WHISPER dispatch (verified via the seam's last_error
+> surfacing the precise install gap),
 > +1 suite / +56 assertions from `test_proof_checker.nova` added in P3.5
 > minimum-viable proof checker -- bounded BFS over the operator graph
 > returning audit-grade derivation traces with composed Bayesian
@@ -565,6 +594,20 @@ computational units rather than orchestrating a pipeline of modules.
 > ceiling rejects high-energy noise). Chat `/help` advertises
 > `/listen`; `/listen <wav>` reports `vad_segments=N` and the active
 > STT backend,
+> +1 from `scenario_jj_whisper.sh` added in R8B whisper.cpp STT
+> backend end-to-end: Klatt-synthesizes a 4-phoneme utterance,
+> writes the WAV, calls `whisper_transcribe(bin, model, wav)`
+> directly; asserts the pipeline runs without crash; then runs
+> the bundled `jfk.wav` (16 kHz mono PCM16) through the same
+> path and asserts the transcript contains "Americans" -- proving
+> the whisper.cpp tiny.en model actually decoded English on top
+> of NOVA's fork+exec/pipe2/dup2/read drain pipeline. Also
+> exercises `stt_seam_new_whisper(model_path)` + the
+> STT_BACKEND_STUB fallback (no whisper invocation on the stub
+> path) + the seam's `last_error` surfacing precise install gaps.
+> SKIPs gracefully if whisper-main / ggml-tiny.en.bin are not
+> installed (10 of 13 assertions still run; the model-decode
+> assertions are the optional 3),
 > +1 from `scenario_n_compaction.sh` added in P2.10 snapshot compaction
 > pass: /save -> /teach 50 -> /compact -> /save shrinks file growth by
 > >50% vs the baseline /save -> /teach 50 -> /save,
