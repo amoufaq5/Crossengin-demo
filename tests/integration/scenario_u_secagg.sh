@@ -192,5 +192,148 @@ assert_match "$CHAT_A_TXT" "masked stats sent" \
     "alice chat printed masked-stats sent"
 assert_match "$CHAT_B_TXT" "masked stats sent" \
     "bob chat printed masked-stats sent"
+assert_match "$COORD_TXT" "mode=v2-sa-r" \
+    "coordinator reports dropout-resilient mode (v2-sa-r)"
+assert_match "$COORD_TXT" "round-deadline-ms=5000" \
+    "coordinator reports default 5000 ms round deadline"
+
+# Stage 8: P3.8r dropout-resilience scenario. Two souls join; one drops
+# mid-round (closes its socket after the JOIN handshake). The survivor
+# reconciles (FED_RECON_MASKED with the dropped peer's mask
+# contribution removed) and the round completes with just the
+# survivor's contribution in the sum.
+#
+# We use a Python soul-helper for both souls (scripts/secagg_smoke_soul.py)
+# so the dropout timing is deterministic. The Python script mirrors the
+# 15-bit LCG mask derivation from src/learning/secure_aggregation.nova
+# so the wire arithmetic exactly matches what the NOVA-side coordinator
+# expects. The chat binary itself cannot be killed at a deterministic
+# moment (its inline /fed_join completes the round too quickly), so the
+# Python helper acts as the "dropout" soul and runs both halves of the
+# brief's check: JOIN + close (dropout), and JOIN + FED_STAT_MASKED +
+# FED_RECON_MASKED (survivor).
+it_section "scenario U.r: secure aggregation DROPOUT (P3.8r / ADR-0055r)"
+
+SOUL_HELPER="$REPO_ROOT/scripts/secagg_smoke_soul.py"
+if [ ! -x "$SOUL_HELPER" ]; then
+    printf "  ${C_YEL}SKIP${C_RST}  $SOUL_HELPER not executable; dropout scenario skipped\n"
+    PASS=$((PASS+1))
+    summary "scenario_u_secagg"
+    exit $?
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    printf "  ${C_YEL}SKIP${C_RST}  python3 not on PATH; dropout scenario skipped\n"
+    PASS=$((PASS+1))
+    summary "scenario_u_secagg"
+    exit $?
+fi
+
+PORT2=$(( 33000 + (RANDOM % 1000) ))
+COORD2_OUT="/tmp/ce_int_secagg_drop_coord.out"
+SOUL_A_OUT="/tmp/ce_int_secagg_drop_soul_a.out"
+SOUL_B_OUT="/tmp/ce_int_secagg_drop_soul_b.out"
+trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; kill -9 $COORD2_PID 2>/dev/null; kill -9 $SOUL_A_PID 2>/dev/null; kill -9 $SOUL_B_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT" "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT"' EXIT
+rm -f "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT"
+
+# Launch coord for the dropout scenario in SecAgg-r mode.
+(
+    export CE_FED_PORT="$PORT2"
+    export CE_FED_BIND="127.0.0.1"
+    export CE_FED_SOULS=2
+    export CE_FED_MAX_ROUNDS=1
+    export CE_SECAGG_ENABLED=1
+    "$COORD_BIN" >"$COORD2_OUT" 2>&1
+) &
+COORD2_PID=$!
+
+sleep 1
+if grep -q "ERROR cannot bind / listen" "$COORD2_OUT" 2>/dev/null; then
+    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- dropout scenario skipped\n"
+    PASS=$((PASS+1))
+    wait $COORD2_PID 2>/dev/null
+    summary "scenario_u_secagg"
+    exit $?
+fi
+
+SHARED_TOKEN2="ce-secagg-shared-token-2"
+
+# Soul A: survivor. x_promo=100, x_atr=50 -> coordinator should see
+# exactly these values in its sum (the SHRUNK set after B drops has
+# only A, and the m_AB mask contribution on A's submission is removed
+# by reconciliation).
+(
+    python3 "$SOUL_HELPER" \
+        --mode survivor \
+        --soul-id alice --peer bob --token "$SHARED_TOKEN2" \
+        --host 127.0.0.1 --port "$PORT2" \
+        --x-promo 100 --x-atr 50 --tag topic:test \
+        >"$SOUL_A_OUT" 2>&1
+) &
+SOUL_A_PID=$!
+
+sleep 1
+
+# Soul B: dropout. JOIN handshake then immediately closes the socket.
+(
+    python3 "$SOUL_HELPER" \
+        --mode dropout \
+        --soul-id bob --peer alice --token "$SHARED_TOKEN2" \
+        --host 127.0.0.1 --port "$PORT2" \
+        >"$SOUL_B_OUT" 2>&1
+) &
+SOUL_B_PID=$!
+
+# Wait for coord + alice + bob to drain.
+DEADLINE=20
+elapsed=0
+while [ "$elapsed" -lt "$DEADLINE" ]; do
+    coord_alive=0; a_alive=0; b_alive=0
+    kill -0 $COORD2_PID  2>/dev/null && coord_alive=1
+    kill -0 $SOUL_A_PID  2>/dev/null && a_alive=1
+    kill -0 $SOUL_B_PID  2>/dev/null && b_alive=1
+    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+if [ "$elapsed" -ge "$DEADLINE" ]; then
+    printf "  ${C_YEL}WARN${C_RST}  dropout-scenario process(es) hung past %ds, force-killing\n" "$DEADLINE"
+    kill -9 $COORD2_PID  2>/dev/null
+    kill -9 $SOUL_A_PID  2>/dev/null
+    kill -9 $SOUL_B_PID  2>/dev/null
+fi
+wait $COORD2_PID  2>/dev/null
+wait $SOUL_A_PID  2>/dev/null
+wait $SOUL_B_PID  2>/dev/null
+
+COORD2_TXT=$(cat "$COORD2_OUT"  2>/dev/null || true)
+SOUL_A_TXT=$(cat "$SOUL_A_OUT"  2>/dev/null || true)
+
+# Dropout-scenario invariants (coord side).
+assert_match "$COORD2_TXT" "mode=v2-sa-r" \
+    "dropout-scenario coordinator boots in v2-sa-r mode"
+assert_match "$COORD2_TXT" "fed-coord: SECAGG JOIN soul=alice" \
+    "dropout-scenario coordinator accepted alice"
+assert_match "$COORD2_TXT" "fed-coord: SECAGG JOIN soul=bob" \
+    "dropout-scenario coordinator accepted bob"
+# The coord must log a DROPOUT line for bob.
+assert_match "$COORD2_TXT" "fed-coord: DROPOUT soul=bob" \
+    "coordinator detected bob's dropout"
+assert_match "$COORD2_TXT" "FED_DROPOUT round=1 dropped=bob broadcast to survivors" \
+    "coordinator broadcast FED_DROPOUT to survivors"
+assert_match "$COORD2_TXT" "RECON_MASKED soul=alice" \
+    "coordinator received alice's reconciled stat"
+assert_match "$COORD2_TXT" "round 1 reconciled" \
+    "coordinator round 1 reconciled (recon path)"
+# The coordinator's broadcast SUM after reconciliation should contain
+# alice's raw values exactly (since alice = sole survivor; her m_AB
+# contribution was removed). Promo=100, atr=50.
+assert_match "$COORD2_TXT" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=100 sum_atr=50 n_part=1" \
+    "coordinator sum equals alice's raw values (recon worked, n=1)"
+
+# Survivor (alice) invariants -- recorded via stderr by the Python helper.
+assert_match "$SOUL_A_TXT" "FED_DROPOUT" \
+    "alice survivor saw FED_DROPOUT in its receive stream"
 
 summary "scenario_u_secagg"

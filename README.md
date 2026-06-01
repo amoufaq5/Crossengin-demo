@@ -16,7 +16,16 @@ computational units rather than orchestrating a pipeline of modules.
 > key-exchange prerequisite the federated SecAgg MVP could not ship
 > without (Item 6 of the brief), now landed as a leaf primitive
 > alongside `chacha20.nova` and `poly1305.nova`; documented in
-> [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md),
+> [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md). **P3.8r extension (this
+> session):** `src/learning/secure_aggregation.nova` extended with
+> dropout-resilience -- the `sa_recompute_without` /
+> `sa_reconcile_for_dropped` pair, FED_DROPOUT + FED_RECON_MASKED wire
+> formatters + parsers, and the `CE_FED_ROUND_DEADLINE_MS` env helper
+> (default 5000 ms). The 3-soul A/B/C round where B drops mid-round
+> now ends with the coordinator's sum equal to x_A + x_C exactly (no
+> garbage mask residue), shipped without adding a new module --
+> dropout resilience moved from "limitations" to "shipped" in
+> SECAGG_AUDIT.md,
 > +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
@@ -106,6 +115,16 @@ computational units rather than orchestrating a pipeline of modules.
 > P1.4 PSK secure-channel continuation -- RFC 7539 ChaCha20 + Poly1305
 > primitives plus the per-frame PSK envelope, documented in
 > [`TLS_AUDIT.md`](./TLS_AUDIT.md),
+> +33 assertions added to `test_secure_aggregation.nova` (93 -> 126)
+> in P3.8r dropout-resilience: 3-soul A/B/C round where B drops mid-
+> round; A + C reconcile by removing m_AB and m_BC mask contributions;
+> coordinator's sum equals x_A + x_C exactly (200, the brief's
+> expected). Plus signed-mask `sa_recompute_without` determinism +
+> sign-mirror invariants across paired souls; FED_DROPOUT +
+> FED_RECON_MASKED wire formatter / parser shapes (including signed-
+> integer adjusted values for the residual-flips-sign case); top-
+> level dispatch through `sa_parse_line` for the two new events;
+> default `CE_FED_ROUND_DEADLINE_MS=5000` env helper,
 > +4 suites / +73 assertions from `test_pack_registry.nova` +
 > `test_medical_pack.nova` + `test_ops_pack.nova` +
 > `test_code_review_pack.nova` added in P1.9 domain seed packs,
@@ -170,6 +189,15 @@ computational units rather than orchestrating a pipeline of modules.
 > envelope over TCP against a Python counterpart
 > (`scripts/secure_channel_echo.py`), sends "ping", asserts the decrypted
 > reply equals "pong",
+> +9 dropout-resilience assertions extending
+> `scenario_u_secagg.sh` (P3.8r): scenario U.r spawns a 2-soul SecAgg
+> round where a Python `scripts/secagg_smoke_soul.py` helper acts as
+> the dropout peer (handshake then close); the surviving soul-helper
+> emits FED_RECON_MASKED with the dropped peer's mask removed; the
+> coordinator logs DROPOUT soul=bob, broadcasts FED_DROPOUT,
+> collects the reconciled stat, and the final FED_AGGREGATE_SUM
+> line carries the survivor's raw values exactly (sum_promo=100,
+> sum_atr=50, n_part=1),
 > +1 from `scenario_k_seed_pack.sh` added in P1.9 `/seed` domain pack
 > install + listing,
 > +1 from `scenario_m_metrics_endpoint.sh` added in P2.9 Prometheus

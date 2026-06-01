@@ -96,6 +96,102 @@ continue. It is updated at every session boundary.
   the "4-6 weeks" row as the deferred follow-up; P3.3 structural-
   features section extended with the SIFT-detection algorithm,
   parameters, and dimension caps.
+- P3.8r SecAgg dropout-resilience (v2-sa-r): **complete** (ADR-0055
+  extension). P3.8 shipped pairwise additive masking with a documented
+  failure mode: if a soul vanished mid-round, the surviving submissions
+  still carried the +/- m_ij terms for the absent peer and the
+  coordinator's sum was corrupted by the missing soul's net mask
+  contribution. This session lands Google-SecAgg-style dropout
+  resilience (without the Shamir / DH layers, which depend on the just-
+  landed P3.9 bignum): an additive `FED_DROPOUT` + `FED_RECON_MASKED`
+  protocol pair on top of the existing v2-sa wire envelope, plus the
+  soul-side `sa_recompute_without` / `sa_reconcile_for_dropped`
+  helpers that subtract the dropped peer's mask from an already-sent
+  submission. The 3-soul A/B/C round where B drops now ends with the
+  coordinator's sum equal to x_A + x_C exactly -- mask cancellation
+  holds across the SHRUNK survivor set because each surviving pair
+  still has its +m_ij / -m_ji symmetry, and the dropped peer's now-
+  uncancelled contributions were just removed by the survivors.
+  - **`src/learning/secure_aggregation.nova`** (EXTENDED) -- new
+    public API: `sa_recompute_without(s, dropped_id, k_dim) -> signed
+    mask delta`, `sa_recompute_without_pair(s, dropped_id) -> [dp,
+    da]`, `sa_reconcile_for_dropped(s, masked_x, dropped_id, k_dim)`,
+    `sa_reconcile_for_dropped_pair(s, mp, ma, dropped_id)`,
+    `sa_format_dropout_line` / `sa_format_recon_masked_line`,
+    `sa_parse_dropout_line` / `sa_parse_recon_masked_line`,
+    `sa_round_deadline_ms_from_env()` (default 5000 ms, capped at
+    60_000, floored at 100). Event tags: `SECAGG_EV_DROPOUT` = 5,
+    `SECAGG_EV_RECON_MASKED` = 6. The LCG mask derivation is the
+    same deterministic primitive from P3.8 -- `sa_mask_for_peer`
+    over `(token, round_id, k_dim)` -- so the soul can re-derive
+    the EXACT SAME mask used during the original masked-stat emit
+    and subtract it back out.
+  - **`src/io/transducers/kg_sync.nova`** (ADDITIVE CASE) -- one
+    more `_parse_fed_*_line` per new event + dispatch case at the
+    end of `_parse_line`. Constants follow the existing
+    `KGSYNC_FED_*` naming so the v2 + v2-sa cases above are strictly
+    untouched.
+  - **`src/learning/federated_aggregator.nova`** (EXTENDED) -- new
+    `fed_agg_emit_recon_masked(f, dropped_id)` walks the cached
+    `FED_LAST_EMIT_LIST` rows, applies `sa_reconcile_for_dropped_pair`
+    per row, and caches the new adjusted rows so a SECOND dropout in
+    the same round reconciles against the LATEST submission. New
+    `fed_agg_format_recon_masked_line(f, tag, adj_p, adj_a)` wraps
+    the SA-side formatter with `f[FED_SOUL_ID]` + `f[FED_ROUND_ID]`.
+  - **`examples/crossengin_fed_coordinator.nova`** (EXTENDED) --
+    `_fed_collect_masked_with_dropout(souls, round_id) -> [acc,
+    dropped_ids, recon_used]` replaces the old single-pass
+    `_fed_collect_masked` in the SecAgg path. Per-soul staging
+    preserves each soul's masked submissions; a soul whose recv-line
+    returns 0 BEFORE any FED_STAT_MASKED is recorded as DROPPED. If
+    any drops occurred, `_fed_run_reconciliation(souls, round_id,
+    dropped, staging)` broadcasts FED_DROPOUT to every survivor,
+    collects one FED_RECON_MASKED batch per survivor, and builds the
+    final sum from THOSE. The boot banner reports
+    `mode=v2-sa-r (SecAgg + dropout-resilient)` and
+    `round-deadline-ms=5000`.
+  - **`examples/crossengin_chat.nova`** (TINY HOOK) -- the existing
+    `_admin_fed_one_round_secagg` loop gains one branch on
+    `SECAGG_EV_DROPOUT` that calls `fed_agg_emit_recon_masked` and
+    ships a FED_RECON_MASKED per tag + ACK. No new admin commands.
+    Result tuple gains a 5th slot for `dropouts_seen`; the
+    `fed: [SECAGG] round N complete` line now reports
+    "<N> dropout(s) reconciled".
+  - **`scripts/secagg_smoke_soul.py`** (NEW) -- minimal SecAgg-aware
+    soul client (handshake + masked-stat + recon flow) used by the
+    integration test's dropout half. Mirrors the 15-bit LCG mask
+    derivation from `secure_aggregation.nova` so the wire
+    arithmetic is bit-identical to what the NOVA-side coordinator
+    expects. `--mode dropout` closes the socket after JOIN handshake
+    to act as the missing soul; `--mode survivor` runs the full
+    masked-stat + FED_RECON_MASKED roundtrip.
+  - **`tests/unit/test_secure_aggregation.nova`** (EXTENDED) -- 33
+    new assertions / 13 new test functions: the 3-soul dropout demo
+    asserting `sum == x_A + x_C` after B drops; LCG determinism for
+    `sa_recompute_without` across re-calls; sign-mirror invariant
+    across paired souls; unknown-peer / self defensive no-op;
+    `sa_reconcile_for_dropped` single-peer arithmetic;
+    pair-variant two-dim restore; wire formatter shapes; parser
+    shapes including signed-int recon (residual flips sign);
+    `sa_parse_line` dispatch on the two new events; default
+    `CE_FED_ROUND_DEADLINE_MS` 5000 ms.
+  - **`tests/integration/scenario_u_secagg.sh`** (EXTENDED) -- 9 new
+    dropout-resilience assertions ("scenario U.r"): coord boots in
+    `mode=v2-sa-r`, accepts both alice + bob, detects bob's dropout,
+    broadcasts FED_DROPOUT, collects alice's RECON_MASKED, and the
+    final FED_AGGREGATE_SUM carries alice's raw values exactly
+    (`sum_promo=100 sum_atr=50 n_part=1`). Plus 2 first-section
+    assertions for `mode=v2-sa-r` + the new
+    `round-deadline-ms=5000` banner.
+  - **`SECAGG_AUDIT.md`** (UPDATED) -- dropout resilience moved
+    from the "What this MVP does not do" list to a new "Shipped:
+    dropout resilience" section with the protocol flow, the
+    determinism contract, the (N-1) tolerance, and the
+    `CE_FED_ROUND_DEADLINE_MS` tuning knob.
+  - **Verified:** `make test` 131/131 PASS; `make integration` all
+    scenarios PASS including scenario U.r dropout. 3-soul unit demo
+    asserts coordinator sees `sum_promo = 200 = x_A + x_C` (the
+    brief's expected behaviour, B excluded).
 - P3.9 pure-NOVA 256-bit bignum library (DH key-exchange prerequisite):
   **complete (leaf primitive)**. The federated SecAgg MVP (P3.8) shipped
   pre-shared tokens because NOVA had no bignum. This session lands the
@@ -2160,7 +2256,18 @@ binary) — this is an integration limitation of the current NOVA backend (block
   small modulus + a < m in `bn_mod`; `(5*6) mod 7 = 2` in `bn_modmul`;
   the textbook `2^10 mod 1000 = 24` and the Curve25519 `2^255 mod
   (2^255-19) = 19` in `bn_modpow`; plus a `nanotime()`-measured single
-  `bn_add` op (~800 ns on the dev container). **+3 suites / +51
+  `bn_add` op (~800 ns on the dev container). **+33 assertions added
+  to `test_secure_aggregation.nova` in P3.8r dropout-resilience**
+  (93 -> 126 checks): the 3-soul A/B/C dropout demo (B drops, A + C
+  reconcile, coord sees only x_A + x_C = 200), `sa_recompute_without`
+  determinism + sign convention + unknown/self peer no-op,
+  `sa_reconcile_for_dropped` single-peer arithmetic +
+  `sa_reconcile_for_dropped_pair` two-dim restore, FED_DROPOUT +
+  FED_RECON_MASKED wire formatter + parser shapes (including signed-
+  integer adjusted values for the residual-flips-sign case),
+  `sa_parse_line` dispatch through the two new events, and the
+  `sa_round_deadline_ms_from_env` default 5000 ms env helper.
+  **+3 suites / +51
   assertions from P1.4 PSK secure-channel continuation** --
   `test_chacha20.nova` (26), `test_poly1305.nova` (9),
   `test_secure_channel.nova` (16); +1 from P3.7

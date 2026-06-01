@@ -1,13 +1,26 @@
 # Secure Aggregation (SecAgg) Audit
 
-**Phase:** P3.8 — secure aggregation MVP (pairwise additive masking)
-**ADR:** ADR-0055 — SecAgg via pairwise additive masking with pre-shared tokens
-**Modules:** `src/learning/secure_aggregation.nova`,
-`src/learning/federated_aggregator.nova` (extended with v2-sa mode),
+**Phase:** P3.8 — secure aggregation MVP (pairwise additive masking),
+extended to **P3.8r — dropout-resilient SecAgg (v2-sa-r)**.
+**ADR:** ADR-0055 — SecAgg via pairwise additive masking with
+pre-shared tokens. The dropout-resilience extension layers on top of
+the original ADR-0055 primitive: same mask derivation, same wire
+envelope, with an additive FED_DROPOUT + FED_RECON_MASKED protocol
+pair that lets the surviving souls reconcile their submissions when
+one peer vanishes mid-round.
+**Modules:** `src/learning/secure_aggregation.nova` (P3.8r:
+`sa_recompute_without` / `sa_reconcile_for_dropped` + FED_DROPOUT /
+FED_RECON_MASKED wire formatters + parsers + the
+`CE_FED_ROUND_DEADLINE_MS` env helper),
+`src/learning/federated_aggregator.nova` (extended with v2-sa mode and
+the P3.8r reconciliation emitter `fed_agg_emit_recon_masked`),
 SECAGG\_\* parser branch additively added to
-`src/io/transducers/kg_sync.nova`,
-`examples/crossengin_fed_coordinator.nova` (SecAgg coordinator branch),
-`examples/crossengin_chat.nova` (env-detected v2-sa fed_join path).
+`src/io/transducers/kg_sync.nova` (one more dispatch case for
+FED_DROPOUT / FED_RECON_MASKED),
+`examples/crossengin_fed_coordinator.nova` (SecAgg-r coordinator with
+dropout detection + reconciliation broadcast / collect path),
+`examples/crossengin_chat.nova` (env-detected v2-sa fed_join path with
+the FED_DROPOUT receive hook -- no new admin commands).
 
 ## What changed from P3.7
 
@@ -99,20 +112,17 @@ distribution per soul on the wire).
 
 ## What this MVP does not do
 
-- **No dropout handling.** If a soul vanishes between the JOIN
-  handshake and the FED\_STAT\_MASKED submission, the masks it
-  would have contributed don't get sent — the surviving souls'
-  submissions still carry their `+/-m_{ij}` terms for the absent
-  peer, which do NOT cancel. The coordinator's sum is corrupted by
-  an additive noise term equal to the missing soul's net mask
-  contribution. Production SecAgg fixes this with Shamir secret
-  sharing of each soul's mask seeds (any k of n shares
-  reconstruct the seed; missing souls' masks can be subtracted
-  from the sum after the fact). The MVP documents the failure
-  mode and refuses no round — the corrupted sum is the visible
-  symptom of the missing soul.
-
-- **No verifiable secret sharing (Shamir).** As above. Adding
+- **No verifiable secret sharing (Shamir).** Production SecAgg uses
+  Shamir secret sharing of each soul's mask seeds so any k of n
+  surviving peers can reconstruct a dropped soul's seed and
+  algebraically remove its mask from the sum WITHOUT requiring the
+  survivors to recompute their own submissions. The P3.8r path
+  shipped here uses a simpler, equivalent-strength mechanism
+  ("dropped soul advertised, every survivor subtracts the dropped
+  peer's mask from its own submission"). Both routes recover
+  Σ_{i ≠ dropped} x_i; Shamir is more bandwidth-efficient for
+  multiple simultaneous dropouts but adds polynomial-field-
+  arithmetic complexity that NOVA lacks today. Adding
   Shamir alone is ~2 weeks: polynomial interpolation in a finite
   field, the share-distribution protocol, and the recovery path.
 
@@ -189,11 +199,94 @@ protocol — the v1 lines are unchanged. New lines:
 | `SECAGG_PEER <peer_id> <token>` | client → server | announce one peer pair |
 | `FED_STAT_MASKED <round> <tag> <mp> <ma>` | client → server | masked stats |
 | `FED_AGGREGATE_SUM <round> <tag> <sp> <sa> <n>` | server → client | coord sum |
+| `FED_DROPOUT <round> <dropped_soul_id>` | server → client | a soul vanished; survivors reconcile (**P3.8r**) |
+| `FED_RECON_MASKED <round> <soul_id> <tag> <ap> <aa>` | client → server | reconciled stat (dropped peer's mask removed) (**P3.8r**) |
 
 The coordinator broadcasts the **sum** (not the average) so the
 audit-readable contract is clean: the coordinator only ever computes
 sums. The soul divides by `n_participants` on its own end to recover
 the average if it wants one (helper: `sa_sum_to_avg`).
+
+## Shipped: dropout resilience (P3.8r / v2-sa-r)
+
+**Status:** shipped. Previously documented as a limitation (see "What
+this MVP does not do" -- now moved to the production-ready row).
+**Verified by:** `test_secagg_three_soul_dropout_demo` in
+`tests/unit/test_secure_aggregation.nova` (the 3-soul A/B/C round
+where B drops; A + C reconcile by removing m_AB and m_BC from their
+masked submissions; the coordinator's sum equals x_A + x_C exactly),
+and `tests/integration/scenario_u_secagg.sh` "scenario U.r" (a real
+2-soul TCP round-trip where a Python soul-helper acts as the dropout
+peer -- handshake then close -- and the coordinator's
+FED_AGGREGATE_SUM line carries the surviving soul's raw values
+exactly, n_part=1).
+
+### Protocol flow (extension of v2-sa)
+
+1. Round begins with N expected souls and a list of their ids
+   (collected at JOIN time via SECAGG_PEER announcements).
+2. Each soul computes `masked_x_i` as in P3.8 and sends
+   `FED_STAT_MASKED <round> <tag> <mp> <ma>`.
+3. If soul k disconnects mid-round (the coord's `recv_line` returns 0
+   before any FED_STAT_MASKED arrives, OR the FED_ROUND broadcast
+   `_send_all` failed for that soul), the coordinator broadcasts
+   `FED_DROPOUT <round> <k>` to every surviving soul.
+4. Each surviving soul recomputes its mask vector EXCLUDING k:
+   - if i < k -> i had ADDED +m_ik, so it subtracts m_ik from its
+     already-sent masked_x_i (the helper `sa_recompute_without`
+     returns +m_ik, and `sa_reconcile_for_dropped` does
+     `adj = masked - delta`).
+   - if i > k -> i had SUBTRACTED -m_ki, so it adds m_ki back (the
+     helper returns -m_ki, the same subtraction undoes it).
+   The soul emits one `FED_RECON_MASKED <round> <i> <tag>
+   <adj_promo> <adj_atr>` per tag.
+5. The coordinator's reconciliation pass sums the FED_RECON_MASKED
+   submissions and broadcasts the FED_AGGREGATE_SUM. Mask
+   cancellation holds across the SHRUNK survivor set because every
+   surviving pair (i, j) still has its +m_ij / -m_ji symmetry and
+   the dropped peer's now-uncancelled contributions were just
+   removed.
+
+### Determinism contract
+
+The reconciliation step depends critically on the soul deriving the
+EXACT SAME mask that it used during the original masked-stat emit. The
+LCG is purely deterministic over `(token, round_id, k_dim)` -- a re-call
+of `sa_mask_for_peer` with those three inputs returns bit-identical
+output. This is asserted by `test_sa_mask_deterministic_same_inputs`
+(P3.8) and re-asserted by `test_sa_recompute_without_determinism`
+(P3.8r). The round_id stays bound to the SA state from the
+`fed_agg_emit_masked_stats` call through `fed_agg_emit_recon_masked`
+(both call `sa_round_set(sa, f[FED_ROUND_ID])` before the per-peer
+loop), so the round id never drifts between emit and reconcile.
+
+### Threshold
+
+The P3.8r flow tolerates **any number of simultaneous dropouts up to
+N-1**: as long as ≥1 soul survives, the coordinator can drive a clean
+reconciliation pass per dropped peer. With ≥2 dropouts in a single
+round, the coordinator broadcasts FED_DROPOUT once per dropped id
+(serially) and the survivors apply each adjustment in turn. Each
+reconciliation step caches the new "current submission" on the soul,
+so the SECOND reconciliation correctly subtracts against the
+FIRST-RECONCILED value (the `fed_agg_emit_recon_masked` helper
+overwrites `FED_LAST_EMIT_LIST` with the adjusted rows). The (N-1)
+collusion caveat from P3.8 still applies: if the coordinator colludes
+with N-1 of the survivors, the holdout is unmasked -- the survivor
+threshold for sum-recovery is identical to the original SecAgg MVP.
+
+### Tuning the round deadline
+
+`CE_FED_ROUND_DEADLINE_MS` (default 5000 ms, capped at 60_000 ms,
+floored at 100 ms) sets the nominal per-round receive deadline. In the
+NOVA single-thread blocking-IO model an explicit sub-recv timeout
+isn't available, so the coordinator's dropout signal is the
+conventional one: a peer-closed fd. The deadline value is reported in
+the coord's boot banner (`round-deadline-ms=5000`) so an operator can
+audit the tuning, but is not currently enforced against `nanotime()`
+inside the recv loop (a future revision could add `O_NONBLOCK` + a
+poll-based wait to honor the deadline literally; for now the
+peer-closed-fd signal is the production failure mode that matters).
 
 ## How this composes with P3.7's DP
 

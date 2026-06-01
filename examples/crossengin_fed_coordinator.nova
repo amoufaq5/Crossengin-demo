@@ -56,6 +56,18 @@ let CSOUL_ID       = 1
 let CSOUL_EPSILON  = 2
 let CSOUL_ACTIVE   = 3
 
+// P3.8r dropout-resilience state. The coordinator marks a soul as
+// "dropped this round" when the soul's recv-line returns 0 (EOF /
+// disconnect) before any FED_STAT_MASKED arrives. Maintained as a
+// list of soul_id strings reset each round. The brief calls for an
+// explicit deadline, but the NOVA single-thread blocking-IO model
+// can't enforce a sub-recv timeout without per-fd O_NONBLOCK, so we
+// detect the conventional dropout signal (peer-closed fd) and treat
+// the absence of a stat batch from a still-open peer as a
+// soft-dropout that the recon path then handles harmlessly (the
+// surviving souls still adjust their submissions, the dropped one
+// just contributes 0).
+
 fn _csoul_new(fd, soul_id, epsilon) {
     let s = list_new()
     push(s, fd)
@@ -301,6 +313,236 @@ fn _fed_collect_masked(souls, round_id) {
     return acc
 }
 
+// P3.8r SecAgg-mode collect WITH dropout-resilience.
+//
+// Returns a list:
+//   [acc, dropped_soul_ids, recon_used]
+// where:
+//   acc            -- the per-tag SUM the coordinator wants to broadcast
+//                     (built from the RECONCILED submissions when at
+//                      least one soul dropped, else from the original
+//                      masked submissions).
+//   dropped_soul_ids -- list of soul_id strings that dropped this round.
+//   recon_used     -- 1 if the FED_DROPOUT + FED_RECON_MASKED path
+//                     was exercised, 0 if the round completed cleanly.
+//
+// Flow:
+//   1. Iterate every soul; read its masked-stats batch (terminated by
+//      ACK / EOF / parse-error). A soul whose recv returns 0 BEFORE
+//      sending any FED_STAT_MASKED is recorded as DROPPED for this
+//      round. (NOVA blocking-IO + the brief's deadline mechanism: the
+//      conventional drop signal is a closed fd; an explicit ns
+//      deadline check is unreliable in the single-thread model. The
+//      tests/integration/scenario_u_secagg.sh dropout case kills the
+//      chat subprocess mid-round, which closes its fd cleanly.)
+//   2. Per-soul masked submissions are KEPT (per-row staging) so we
+//      can either ship the original sum (clean round) or rebuild
+//      the sum from FED_RECON_MASKED (dropout round).
+//   3. If any soul dropped, the coordinator broadcasts
+//      `FED_DROPOUT <round> <dropped_soul_id>` to every surviving
+//      soul, then reads exactly one FED_RECON_MASKED batch per
+//      survivor (terminated by ACK / EOF). Survivors recompute their
+//      submission with the dropped peer's mask contribution removed
+//      (sa_reconcile_for_dropped); the coordinator's new acc sums
+//      across survivors only. Mask cancellation holds because each
+//      surviving pair still has its +m_ij / -m_ji symmetry, and the
+//      dropped peer's now-uncancelled contribution was just removed.
+//
+// Per-soul staging row: [soul_idx, soul_id, list_of[tag, mp, ma]].
+fn _fed_collect_masked_with_dropout(souls, round_id) {
+    let staging = list_new()
+    let dropped = list_new()
+    let i = 0
+    while i < len(souls) {
+        let s = souls[i]
+        let fd = s[CSOUL_FD]
+        let stage = list_new()
+        push(stage, i)               // soul index
+        push(stage, s[CSOUL_ID])     // soul id
+        push(stage, list_new())      // per-tag rows
+        if fd >= 0 {
+            let done = 0
+            let read_n = 0
+            let saw_first = 0
+            while done == 0 {
+                let line = _recv_line(fd)
+                if line == 0 {
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                    done = 1
+                    if saw_first == 0 {
+                        push(dropped, s[CSOUL_ID])
+                        println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
+                            + " round=" + int_to_str(round_id)
+                            + " (peer closed fd before sending any masked stat)")
+                    }
+                } else {
+                    let rec = _parse_line(line)
+                    if rec == 0 { done = 1 }
+                    else {
+                        let t = rec[KGSYNC_R_TYPE]
+                        if t == KGSYNC_EV_FED_STAT_MASKED {
+                            let rid = rec[KGSYNC_FED_ROUND_ID]
+                            if rid == round_id {
+                                let tag = rec[KGSYNC_FED_TAG]
+                                let mp = rec[KGSYNC_FED_PROMO]
+                                let ma = rec[KGSYNC_FED_ATR]
+                                let row = list_new()
+                                push(row, tag)
+                                push(row, mp)
+                                push(row, ma)
+                                push(stage[2], row)
+                                read_n = read_n + 1
+                                saw_first = 1
+                                println("fed-coord: MASKED_STAT soul=" + s[CSOUL_ID]
+                                    + " round=" + int_to_str(round_id)
+                                    + " tag=" + tag
+                                    + " [SECAGG] masked-value-opaque")
+                                list_set(s, CSOUL_ACTIVE, nanotime())
+                            }
+                        } else {
+                            if t == KGSYNC_EV_ACK { done = 1 }
+                            else {
+                                if t == KGSYNC_EV_FED_LEAVE {
+                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
+                                    close_fd(fd)
+                                    list_set(s, CSOUL_FD, 0 - 1)
+                                    done = 1
+                                    if saw_first == 0 {
+                                        push(dropped, s[CSOUL_ID])
+                                        println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
+                                            + " round=" + int_to_str(round_id)
+                                            + " (FED_LEAVE before any masked stat)")
+                                    }
+                                } else { done = 1 }
+                            }
+                        }
+                    }
+                }
+            }
+            println("fed-coord: soul=" + s[CSOUL_ID] + " emitted "
+                + int_to_str(read_n) + " masked-stat(s)")
+        } else {
+            // FD already closed pre-round -> count as dropped.
+            push(dropped, s[CSOUL_ID])
+            println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
+                + " round=" + int_to_str(round_id)
+                + " (fd was closed pre-round)")
+        }
+        push(staging, stage)
+        i = i + 1
+    }
+    let out = list_new()
+    if len(dropped) == 0 {
+        // Clean round: build the sum from the original masked submissions.
+        let acc = sa_acc_new(round_id)
+        let si = 0
+        while si < len(staging) {
+            let rows = staging[si][2]
+            let ri = 0
+            while ri < len(rows) {
+                let row = rows[ri]
+                sa_acc_add_masked(acc, row[0], row[1], row[2])
+                ri = ri + 1
+            }
+            si = si + 1
+        }
+        push(out, acc)
+        push(out, dropped)
+        push(out, 0)        // recon_used = 0
+        return out
+    }
+    // Dropout path: broadcast FED_DROPOUT to every survivor, then read
+    // FED_RECON_MASKED replies and build the sum from THOSE.
+    let acc = _fed_run_reconciliation(souls, round_id, dropped, staging)
+    push(out, acc)
+    push(out, dropped)
+    push(out, 1)            // recon_used = 1
+    return out
+}
+
+// Broadcast FED_DROPOUT for every dropped soul to every survivor, then
+// read a FED_RECON_MASKED batch from each survivor and build the sum
+// from those adjusted values. Returns a populated sa_acc.
+fn _fed_run_reconciliation(souls, round_id, dropped, staging) {
+    // 1. Broadcast every FED_DROPOUT line to every survivor.
+    let di = 0
+    while di < len(dropped) {
+        let dropped_id = dropped[di]
+        let line = sa_format_dropout_line(round_id, dropped_id)
+        let sj = 0
+        while sj < len(souls) {
+            let s = souls[sj]
+            let fd = s[CSOUL_FD]
+            if fd >= 0 {
+                if _send_all(fd, line) == 0 {
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                }
+            }
+            sj = sj + 1
+        }
+        println("fed-coord: [SECAGG-R] FED_DROPOUT round=" + int_to_str(round_id)
+            + " dropped=" + dropped_id + " broadcast to survivors")
+        di = di + 1
+    }
+    // 2. Read FED_RECON_MASKED from each survivor and sum.
+    let acc = sa_acc_new(round_id)
+    let i = 0
+    while i < len(souls) {
+        let s = souls[i]
+        let fd = s[CSOUL_FD]
+        if fd >= 0 {
+            let done = 0
+            let read_n = 0
+            while done == 0 {
+                let line = _recv_line(fd)
+                if line == 0 {
+                    close_fd(fd)
+                    list_set(s, CSOUL_FD, 0 - 1)
+                    done = 1
+                } else {
+                    let rec = _parse_line(line)
+                    if rec == 0 { done = 1 }
+                    else {
+                        let t = rec[KGSYNC_R_TYPE]
+                        if t == KGSYNC_EV_FED_RECON_MASKED {
+                            let rid = rec[KGSYNC_FED_ROUND_ID]
+                            if rid == round_id {
+                                let tag = rec[KGSYNC_FED_RECON_TAG]
+                                let mp = rec[KGSYNC_FED_RECON_PROMO]
+                                let ma = rec[KGSYNC_FED_RECON_ATR]
+                                sa_acc_add_masked(acc, tag, mp, ma)
+                                read_n = read_n + 1
+                                println("fed-coord: [SECAGG-R] RECON_MASKED soul="
+                                    + s[CSOUL_ID]
+                                    + " round=" + int_to_str(round_id)
+                                    + " tag=" + tag
+                                    + " (after dropped-peer mask removed)")
+                                list_set(s, CSOUL_ACTIVE, nanotime())
+                            }
+                        } else {
+                            if t == KGSYNC_EV_ACK { done = 1 }
+                            else {
+                                if t == KGSYNC_EV_FED_LEAVE {
+                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
+                                    close_fd(fd)
+                                    list_set(s, CSOUL_FD, 0 - 1)
+                                    done = 1
+                                } else { done = 1 }
+                            }
+                        }
+                    }
+                }
+            }
+            println("fed-coord: [SECAGG-R] soul=" + s[CSOUL_ID] + " emitted "
+                + int_to_str(read_n) + " reconciled stat(s)")
+        }
+        i = i + 1
+    }
+    return acc
+}
+
 // SecAgg-mode broadcast: send FED_AGGREGATE_SUM lines (sum, not avg).
 fn _fed_broadcast_sum(souls, round_id, sums) {
     let sent = 0
@@ -521,14 +763,17 @@ fn main() {
     let secagg = sa_enabled_from_env()
 
     let mode_str = "v1"
-    if secagg == 1 { mode_str = "v2-sa (SecAgg)" }
+    if secagg == 1 { mode_str = "v2-sa-r (SecAgg + dropout-resilient)" }
+
+    let deadline_ms = sa_round_deadline_ms_from_env()
 
     println("fed-coord: starting on port " + int_to_str(port)
         + " (bind " + bind_ip + ")"
         + " expected-souls=" + int_to_str(n_souls)
         + " auth=" + _auth_mode_str(token)
         + " mode=" + mode_str
-        + " round-interval-ns=" + int_to_str(round_interval))
+        + " round-interval-ns=" + int_to_str(round_interval)
+        + " round-deadline-ms=" + int_to_str(deadline_ms))
 
     let server_fd = sync_pub_listen(port)
     if server_fd < 0 {
@@ -582,11 +827,23 @@ fn main() {
                 go = 0
             } else {
                 if secagg == 1 {
-                    // SecAgg path: SUM the masked submissions, broadcast
-                    // FED_AGGREGATE_SUM. The coordinator never sees raw
-                    // per-soul values; only the sum (which equals Σ x_i
-                    // via mask cancellation).
-                    let acc = _fed_collect_masked(souls, round_id)
+                    // SecAgg path with P3.8r dropout-resilience: SUM the
+                    // masked submissions, detect any soul that dropped
+                    // mid-round, broadcast FED_DROPOUT + collect
+                    // FED_RECON_MASKED replies, then broadcast the
+                    // FED_AGGREGATE_SUM. The coordinator never sees
+                    // raw per-soul values; only the sum (which equals
+                    // Σ x_i over survivors via mask cancellation across
+                    // the SHRUNK set).
+                    let drop_res = _fed_collect_masked_with_dropout(souls, round_id)
+                    let acc = drop_res[0]
+                    let dropped_ids = drop_res[1]
+                    let recon_used = drop_res[2]
+                    if recon_used == 1 {
+                        println("fed-coord: [SECAGG-R] round " + int_to_str(round_id)
+                            + " reconciled (dropped=" + int_to_str(len(dropped_ids))
+                            + ", survivors used FED_RECON_MASKED)")
+                    }
                     let sums = sa_acc_sums(acc)
                     if len(sums) == 0 {
                         println("fed-coord: [SECAGG] round " + int_to_str(round_id)

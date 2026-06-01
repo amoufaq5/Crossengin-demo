@@ -103,6 +103,18 @@ let SECAGG_OK_V2SA_LINE     = "OK ce-fed v2-sa protocol accepted"
 let SECAGG_PEER_PREFIX      = "SECAGG_PEER "
 let SECAGG_STAT_MASKED_PREFIX = "FED_STAT_MASKED "
 let SECAGG_AGG_SUM_PREFIX   = "FED_AGGREGATE_SUM "
+// P3.8r (v2-sa-r) dropout-resilience additions.
+//   FED_DROPOUT      <round> <dropped_soul_id>    coord -> all surviving souls
+//   FED_RECON_MASKED <round> <soul_id>            soul -> coord; the
+//                    <source_tag> <adjusted_promo>  surviving soul resubmits
+//                    <adjusted_atr>                 its masked stat after
+//                                                   subtracting the dropped
+//                                                   soul's mask contribution
+//                                                   (so the per-pair mask
+//                                                   cancellation still holds
+//                                                   across the SHRUNK set).
+let SECAGG_DROPOUT_PREFIX   = "FED_DROPOUT "
+let SECAGG_RECON_MASKED_PREFIX = "FED_RECON_MASKED "
 
 // Event tag values returned by the local parser.
 let SECAGG_EV_NONE         = 0
@@ -110,11 +122,16 @@ let SECAGG_EV_HELLO        = 1
 let SECAGG_EV_PEER         = 2
 let SECAGG_EV_STAT_MASKED  = 3
 let SECAGG_EV_AGG_SUM      = 4
+// P3.8r dropout-resilience events.
+let SECAGG_EV_DROPOUT      = 5
+let SECAGG_EV_RECON_MASKED = 6
 
 // Record slot conventions:
 //   SECAGG_PEER         : [type, peer_id, token]
 //   FED_STAT_MASKED     : [type, round_id, source_tag, masked_promo, masked_atr]
 //   FED_AGGREGATE_SUM   : [type, round_id, source_tag, sum_promo, sum_atr, n_part]
+//   FED_DROPOUT         : [type, round_id, dropped_soul_id]
+//   FED_RECON_MASKED    : [type, round_id, soul_id, source_tag, adj_promo, adj_atr]
 let SECAGG_R_TYPE    = 0
 let SECAGG_R_PEER_ID = 1
 let SECAGG_R_TOKEN   = 2
@@ -123,6 +140,13 @@ let SECAGG_R_TAG     = 2
 let SECAGG_R_PROMO   = 3
 let SECAGG_R_ATR     = 4
 let SECAGG_R_NPART   = 5
+// FED_DROPOUT slot layout
+let SECAGG_R_DROPPED_ID = 2
+// FED_RECON_MASKED slot layout (round_id at slot 1 reuses SECAGG_R_ROUND).
+let SECAGG_R_RECON_SOUL = 2
+let SECAGG_R_RECON_TAG  = 3
+let SECAGG_R_RECON_PROMO = 4
+let SECAGG_R_RECON_ATR   = 5
 
 // ---- SA_STATE layout ----------------------------------------------------
 let SA_TAG        = 0
@@ -357,6 +381,80 @@ fn sa_apply_masks_pair(s, x_promo, x_atr) {
     return out
 }
 
+// ---- P3.8r dropout reconciliation ---------------------------------------
+// When a soul k vanishes mid-round, the surviving souls' masked submissions
+// still carry the +/- m_ik terms that would have been cancelled by k's
+// submission. Each surviving soul i must REMOVE its (now-uncancelled)
+// contribution against k from its already-sent masked_x_i so the
+// coordinator's sum over the SURVIVORS still equals Σ_{i != k} x_i.
+//
+// Original masking: masked_x_i = x_i + Σ_{j>i} m_ij - Σ_{j<i} m_ji.
+// If peer k drops:
+//   - if i < k -> i had ADDED +m_ik, so adjusted_x_i = masked_x_i - m_ik
+//   - if i > k -> i had SUBTRACTED -m_ki, so adjusted_x_i = masked_x_i + m_ki
+//   - if i == k -> defensive no-op (the dropped soul itself doesn't reconcile)
+//   - if k is not a registered peer -> no-op (the soul didn't add/sub any
+//     mask against k anyway)
+//
+// LCG determinism is critical here: the soul MUST derive the EXACT SAME
+// mask used during sa_apply_masks to be able to subtract it back out. The
+// existing sa_mask_for_peer is purely deterministic (token + round + k_dim
+// -> mask), so calling it again produces the same value. We verify in
+// tests/unit/test_secure_aggregation.nova with the
+// test_sa_recompute_without_determinism case.
+//
+// sa_recompute_without computes the SIGNED mask contribution this soul
+// added against the dropped peer in the named k_dim. The surviving soul
+// SUBTRACTS this value from its masked_x_i to undo its participation:
+//   delta = sa_recompute_without(s, dropped_id, k_dim)
+//   adjusted_x_i = masked_x_i - delta
+// Returns 0 if the dropped id was not a peer, or if the dropped id equals
+// the soul's own id (defensive: a soul never masked against itself).
+fn sa_recompute_without(s, dropped_id, k_dim) {
+    let soul_id = s[SA_SOUL_ID]
+    if _sa_str_eq(soul_id, dropped_id) == 1 { return 0 }
+    let round_id = s[SA_ROUND_ID]
+    let token = sa_token_for_peer(s, dropped_id)
+    if token == 0 { return 0 }
+    let mask = sa_mask_for_peer(s, dropped_id, round_id, k_dim)
+    let cmp = sa_id_compare(soul_id, dropped_id)
+    if cmp < 0 { return mask }
+    if cmp > 0 { return 0 - mask }
+    return 0
+}
+
+// Pair variant: returns [delta_promo, delta_atr] -- the signed
+// contributions to subtract from a 2-dim (promotion + atrophy) masked
+// pair. Conventional wrapper so callers don't dual-call by hand.
+fn sa_recompute_without_pair(s, dropped_id) {
+    let dp = sa_recompute_without(s, dropped_id, 0)
+    let da = sa_recompute_without(s, dropped_id, 1)
+    let out = list_new()
+    push(out, dp)
+    push(out, da)
+    return out
+}
+
+// One-shot reconciliation: given the already-sent masked_x (single
+// dimension) and the id of the dropped peer, return the adjusted value
+// that the coordinator can sum across SURVIVORS. Equivalent to
+// `masked_x - sa_recompute_without(s, dropped_id, k_dim)` but the
+// helper documents the calling contract (subtract once per dropped peer).
+fn sa_reconcile_for_dropped(s, masked_x, dropped_id, k_dim) {
+    let delta = sa_recompute_without(s, dropped_id, k_dim)
+    return masked_x - delta
+}
+
+// Pair variant of sa_reconcile_for_dropped. Returns [adj_promo, adj_atr].
+fn sa_reconcile_for_dropped_pair(s, masked_promo, masked_atr, dropped_id) {
+    let dp = sa_recompute_without(s, dropped_id, 0)
+    let da = sa_recompute_without(s, dropped_id, 1)
+    let out = list_new()
+    push(out, masked_promo - dp)
+    push(out, masked_atr - da)
+    return out
+}
+
 // ---- wire formatters -----------------------------------------------------
 fn sa_format_hello_line() {
     return SECAGG_HELLO_V2SA_LINE + "\n"
@@ -383,6 +481,23 @@ fn sa_format_aggregate_sum_line(round_id, source_tag, sum_promo, sum_atr, n_part
         + int_to_str(sum_promo) + " "
         + int_to_str(sum_atr) + " "
         + int_to_str(n_part) + "\n"
+}
+
+// P3.8r FED_DROPOUT wire formatter (coord -> all survivors).
+//   FED_DROPOUT <round_id> <dropped_soul_id>
+fn sa_format_dropout_line(round_id, dropped_soul_id) {
+    return SECAGG_DROPOUT_PREFIX + int_to_str(round_id) + " "
+        + dropped_soul_id + "\n"
+}
+
+// P3.8r FED_RECON_MASKED wire formatter (soul -> coord).
+//   FED_RECON_MASKED <round_id> <soul_id> <source_tag> <adj_promo> <adj_atr>
+fn sa_format_recon_masked_line(round_id, soul_id, source_tag, adj_promo, adj_atr) {
+    return SECAGG_RECON_MASKED_PREFIX + int_to_str(round_id) + " "
+        + soul_id + " "
+        + source_tag + " "
+        + int_to_str(adj_promo) + " "
+        + int_to_str(adj_atr) + "\n"
 }
 
 // ---- coordinator-side sum accumulator ------------------------------------
@@ -488,6 +603,24 @@ fn sa_peer_token_from_env(peer_id) {
     if env == 0 { return 0 }
     if len(env) == 0 { return 0 }
     return env
+}
+
+// Read CE_FED_ROUND_DEADLINE_MS from env. Returns the per-soul receive
+// deadline in milliseconds (caller converts to ns if needed). Default
+// 5000 ms (the P3.8r dropout-resilience default per the brief). Capped
+// at 60_000 ms (1 minute) so a typo in the env can't lock the
+// coordinator for an arbitrary length of time. Below 100 ms is rounded
+// up to 100 to avoid wedging the coordinator into an aggressive
+// false-positive dropout loop on a slow handshake.
+fn sa_round_deadline_ms_from_env() {
+    let env = getenv("CE_FED_ROUND_DEADLINE_MS")
+    if env == 0 { return 5000 }
+    if len(env) == 0 { return 5000 }
+    let v = _sa_str_to_int(env)
+    if v <= 0 { return 5000 }
+    if v < 100 { return 100 }
+    if v > 60000 { return 60000 }
+    return v
 }
 
 // Read the list of peer ids from CE_SECAGG_PEERS (comma-separated).
@@ -655,6 +788,48 @@ fn sa_parse_aggregate_sum_line(text) {
     return rec
 }
 
+// Parse FED_DROPOUT <round_id> <dropped_soul_id>
+// Returns [SECAGG_EV_DROPOUT, round_id, dropped_soul_id] or 0.
+fn sa_parse_dropout_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_DROPOUT_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "FED_DROPOUT") == 0 { return 0 }
+    if _sa_is_digits(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_DROPOUT)
+    push(rec, _sa_str_to_int(toks[1]))
+    push(rec, toks[2])
+    return rec
+}
+
+// Parse FED_RECON_MASKED <round_id> <soul_id> <source_tag> <adj_promo> <adj_atr>
+// Returns [SECAGG_EV_RECON_MASKED, round_id, soul_id, tag, adj_promo, adj_atr] or 0.
+// Reconciled values can be negative (the dropped peer's mask subtraction
+// can leave a negative residual), so the parser accepts a leading '-'.
+fn sa_parse_recon_masked_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_RECON_MASKED_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 6 { return 0 }
+    if str_eq(toks[0], "FED_RECON_MASKED") == 0 { return 0 }
+    if _sa_is_digits(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    if len(toks[3]) == 0 { return 0 }
+    if _sa_is_digits(toks[4]) == 0 { return 0 }
+    if _sa_is_digits(toks[5]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_RECON_MASKED)
+    push(rec, _sa_str_to_int(toks[1]))
+    push(rec, toks[2])
+    push(rec, toks[3])
+    push(rec, _sa_str_to_int(toks[4]))
+    push(rec, _sa_str_to_int(toks[5]))
+    return rec
+}
+
 // Top-level dispatch -- handles the events the soul / coord receives.
 fn sa_parse_line(text) {
     let line = _sa_strip_eol(text)
@@ -667,6 +842,9 @@ fn sa_parse_line(text) {
     if _sa_starts_with(line, SECAGG_PEER_PREFIX) == 1 { return sa_parse_peer_line(line) }
     if _sa_starts_with(line, SECAGG_STAT_MASKED_PREFIX) == 1 { return sa_parse_stat_masked_line(line) }
     if _sa_starts_with(line, SECAGG_AGG_SUM_PREFIX) == 1 { return sa_parse_aggregate_sum_line(line) }
+    // P3.8r dropout-resilience dispatch (additive case).
+    if _sa_starts_with(line, SECAGG_DROPOUT_PREFIX) == 1 { return sa_parse_dropout_line(line) }
+    if _sa_starts_with(line, SECAGG_RECON_MASKED_PREFIX) == 1 { return sa_parse_recon_masked_line(line) }
     return 0
 }
 
