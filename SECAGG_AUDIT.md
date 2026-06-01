@@ -824,3 +824,75 @@ ChaCha20-Poly1305 field math, and the `secure_aggregation.nova`
 DH-256 fallback. Migrating those callers to `bn256_modpow_ct` for
 the per-op ~14x speedup is a follow-up patch (the new prefix is
 ship-able without touching any in-use call site).
+
+## R7B production migration: DH-256 (`bn_modpow_ct` -> `bn256_modpow_ct`)
+
+R7B realized the per-op ~14x speedup from R6B's bignum_256 in the only
+production caller of `bn_modpow_ct` (the legacy 256-bit
+`bn_modpow_ct`): the v2-sa-dh path in
+`src/learning/secure_aggregation.nova`. Two call sites:
+
+  * `sa_dh_generate_keys` (one `g^priv mod p` per soul per round);
+  * `sa_dh_shared_secret_for_peer` (one `peer_pub^my_priv mod p` per
+    peer per round).
+
+Both run on the Curve25519 prime `p = 2^255 - 19` (loaded from the
+existing `_SA_DH_P_HEX` constant), which is odd, so Montgomery REDC
+applies. Both were swapped from `bn_*` to `bn256_*` end-to-end
+(`bn_from_hex` -> `bn256_from_hex`, `bn_mod` -> `bn256_mod`,
+`bn_modpow_ct` -> `bn256_modpow_ct`, `bn_to_hex` -> `bn256_to_hex`).
+The on-disk hex representation is byte-identical between `bn_*` and
+`bn256_*` (both encode as 64 lowercase hex chars MSB-first; both
+internal layouts are 8 x 32-bit little-endian limbs), so registered
+peer pubkeys parse cleanly via either module and the wire format is
+unchanged.
+
+### Measured speedup (R7B, this dev container)
+
+Microbenchmark: 10 iterations of a 2-soul-pair DH round
+(2 keygens + 2 shared-secret derivations = **4 `bn_modpow_ct` calls
+per iter**).
+
+  * **BEFORE** (legacy bit-by-bit reducer): 260 ms / iter avg,
+    ~65 ms per `bn_modpow_ct` call.
+  * **AFTER** (Montgomery REDC via `bn256_modpow_ct`): 12.9 ms / iter
+    avg, ~3.2 ms per `bn256_modpow_ct` call.
+  * **Speedup: ~20x per call** (per-iter total 260 ms -> 12.9 ms).
+    Slightly above R6B's headline 14x microbenchmark on
+    `test_bn256_modpow_mont_speedup_ratio`; the difference is within
+    sandbox-load variance.
+
+### Correctness verification
+
+  * `tests/unit/test_bignum_256.nova` passes 70 checks, including the
+    Mont-vs-legacy equivalence sweep on the Curve25519 prime which
+    proves `bn256_modpow_ct == bn_modpow_ct` on the production
+    modulus.
+  * `tests/unit/test_secure_aggregation.nova` passes 170 checks --
+    notably the DH commutativity test
+    `test_sa_dh_two_soul_pair_mask_matches` (alice's
+    `peer_pub^my_priv` equals bob's `peer_pub^my_priv` after the
+    migration) and `test_secagg_two_soul_dh_sum_demo` (full end-to-
+    end masked-sum cancellation with DH-derived shared secrets).
+  * `tests/integration/scenario_u_secagg.sh` passes 48/48 across
+    SecAgg, dropout-resilience, DH-256, and DH-2048 sub-scenarios.
+  * `tests/integration/scenario_v_secure_channel.sh` passes 6/6 (PSK
+    secure channel; verifies the migration does not regress the
+    chacha20/poly1305 leaves it depends on transitively).
+
+### What stays on `bn_*`
+
+  * `tests/unit/test_bignum.nova` and `tests/unit/test_secure_aggregation.nova`
+    still call `bn_from_hex`/`bn_zero`/`bn_modpow`/`bn_modpow_ct`
+    directly to exercise the legacy primitive surface -- those tests
+    are unchanged. The legacy `bn_*` API in `bignum.nova` remains
+    in-tree as the equivalence anchor for `bn256_*` and as the public-
+    exponent (offline) `bn_modpow` test path.
+  * `src/safety/chacha20.nova` and `src/safety/poly1305.nova` do not
+    use `bn_modpow_ct` (Poly1305's 130-bit prime is a separate field
+    arithmetic, NOT 256-bit; the `bn256_*` 256-bit fixed width does
+    not apply).
+  * `src/io/transducers/noise_xk.nova` -- the Noise XK 256-bit DH was
+    the other in-tree caller. That migration is **R7C's scope** and
+    targets `bn2048_modpow_ct` (RFC 7919 Group 14, strength upgrade
+    in addition to perf), so this audit does not touch noise_xk.

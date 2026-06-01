@@ -3,7 +3,73 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R6C (this session) — IO: kg_sync v3 — Noise XK handshake for mutual auth + transport encryption
+## R7B (this session) — Safety: realize bn256 Montgomery REDC speedup in production (DH-256 migration)
+
+**Status: complete -- `src/learning/secure_aggregation.nova` migrated
+from legacy `bn_modpow_ct` to `bn256_modpow_ct`.** R6B's bignum_256
+Montgomery REDC mirror (commit `edf265b`) shipped a ~14x speedup on
+the Curve25519 prime in microbenchmark, but left every production
+caller untouched. R7B closes that gap for the only DH-256 production
+caller (the v2-sa-dh path in `secure_aggregation.nova`):
+
+  * `sa_dh_generate_keys` (one `g^priv mod p` per soul per round)
+  * `sa_dh_shared_secret_for_peer` (one `peer_pub^my_priv mod p` per
+    peer per round)
+
+Both run on `p = 2^255 - 19` (Curve25519 prime, loaded from the
+existing `_SA_DH_P_HEX` constant) which is odd, so Montgomery REDC
+applies. Wire format is byte-identical (same 64-char lowercase hex,
+same internal 8 x 32-bit little-endian limb layout shared by `bn_*`
+and `bn256_*`), so registered peer pubkeys still parse via either
+module. Tests prove bit-identical outputs:
+`tests/unit/test_bignum_256.nova` includes an explicit
+Mont-vs-legacy equivalence sweep on the Curve25519 prime.
+
+### Measured speedup (this dev container, 10-iter microbenchmark)
+
+A 2-soul-pair DH round (2 `sa_dh_generate_keys` + 2
+`sa_dh_shared_secret_for_peer` = **4 `bn_modpow_ct` calls per iter**):
+
+  * **BEFORE:** 260 ms / iter avg, ~65 ms per `bn_modpow_ct`
+  * **AFTER:**  12.9 ms / iter avg, ~3.2 ms per `bn256_modpow_ct`
+  * **Speedup: ~20x per call** (sandbox-variance-friendly window
+    around R6B's reported 14x).
+
+### Verification
+
+  * **142 / 142 unit tests pass** (`scripts/test.sh` full sweep),
+    including bit-identical equivalence proofs on
+    `test_bignum_256.nova` and the DH commutativity round-trip on
+    `test_secure_aggregation.nova` (170 checks).
+  * **`scenario_u_secagg.sh` passes 48/48** (full SecAgg + dropout-
+    resilience + DH-256 + DH-2048 sub-scenarios).
+  * **`scenario_v_secure_channel.sh` passes 6/6**.
+  * **Module count unchanged** (no new files; only
+    `src/learning/secure_aggregation.nova` modified).
+
+### What stays on legacy `bn_modpow_ct`
+
+  * **`tests/unit/test_bignum.nova`** + the legacy `bn_*` paths used
+    by the equivalence anchor in `tests/unit/test_bignum_256.nova`:
+    keep the bit-by-bit reducer as the bit-exactness anchor for
+    `bn256_*`.
+  * **`src/safety/chacha20.nova`** and **`src/safety/poly1305.nova`**
+    do not use `bn_modpow_ct` (Poly1305's field is the 130-bit prime
+    `2^130 - 5`; `bn256_*` is 256-bit and does not apply).
+  * **`src/io/transducers/noise_xk.nova`**: the Noise XK 256-bit DH
+    is the other in-tree caller; **R7C** owns its migration which
+    additionally upgrades to RFC 7919 Group 14 (2048-bit) for
+    strength reasons, so R7B does not touch it.
+
+### Files touched
+
+  * `src/learning/secure_aggregation.nova` (+37, -19 lines; one new
+    `import "../safety/bignum_256.nova"` + 2 modpow_ct call sites
+    + comment refresh)
+  * `SECAGG_AUDIT.md` (append "R7B production migration" subsection)
+  * `NEXT_SESSION.md` (this section)
+
+## R6C (previous session) — IO: kg_sync v3 — Noise XK handshake for mutual auth + transport encryption
 
 **Status: complete -- `src/io/transducers/noise_xk.nova` LANDED + kg_sync
 wrapped for v3.** The federation audit's "plaintext TCP" open gap is now

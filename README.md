@@ -96,7 +96,15 @@ computational units rather than orchestrating a pipeline of modules.
 > covers the offline-only case). The new prefix is ship-able alongside
 > the legacy `bn_*` without touching any in-use call site;
 > `bn256_curve25519_p()` exposes the Curve25519 field prime
-> `p = 2^255 - 19` lazily. +1 from
+> `p = 2^255 - 19` lazily. **R7B realized this speedup in production**
+> by migrating `src/learning/secure_aggregation.nova`'s DH-256 path
+> (`sa_dh_generate_keys` + `sa_dh_shared_secret_for_peer`) from
+> `bn_modpow_ct` to `bn256_modpow_ct`: measured 2-soul-pair DH round
+> drops from **~260 ms to ~12.9 ms** (~20x), per-modpow_ct
+> ~65 ms -> ~3.2 ms; all 142 unit tests + scenario_u_secagg's 48
+> assertions still pass bit-identically (wire format unchanged --
+> `bn_*` and `bn256_*` share the same 8 x 32-bit limb layout and
+> 64-char hex serialization). +1 from
 > `safety/bignum_2048.nova` added in P3.9 cont. 2048-bit DH on RFC 7919
 > Group 14 -- the cryptographically-reasonable upgrade to the 256-bit
 > v2-sa-dh strawman SECAGG_AUDIT.md flagged as broken; **extended in
