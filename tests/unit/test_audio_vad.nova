@@ -1,0 +1,479 @@
+// Unit tests for src/io/transducers/audio_vad.nova (R7F).
+//
+// Hermetic coverage of the energy/ZCR frame classifier + four-state
+// hysteresis machine. No I/O -- every fixture is a NOVA list of PCM
+// samples synthesized in-test. Coverage targets:
+//
+//   * vad_state_new defaults: tag sentinel, rate clamp, frame_size
+//     derivation (240 @ 8 kHz, 480 @ 16 kHz)         (~5 checks)
+//   * frame analysis: energy + ZCR on hand-built buffers
+//     (zero, constant, alternating, ramp, noise)     (~8 checks)
+//   * classifier: zero -> silence, vowel -> speech,
+//     pure noise -> rejected (high ZCR)              (~4 checks)
+//   * state machine hysteresis: K=3 enforced, M=10 enforced
+//     single-frame noise in silence does NOT flip    (~6 checks)
+//   * full PCM walk: synthesized utterance with vowel + gap +
+//     vowel pattern produces N=2 segments            (~4 checks)
+//   * vad_filter_pcm: returns only speech samples    (~3 checks)
+//
+// Total: ~30 assertions.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/audio_vad.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+// Build a constant-zero PCM list of n samples.
+fn _zero_buf(n) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        push(b, 0)
+        i = i + 1
+    }
+    return b
+}
+
+// Build a constant-amplitude PCM list of n samples at amplitude amp.
+fn _const_buf(n, amp) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        push(b, amp)
+        i = i + 1
+    }
+    return b
+}
+
+// Build an alternating +amp/-amp/+amp/-amp PCM list (max ZCR, square wave).
+fn _alternating_buf(n, amp) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        if (i - (i / 2) * 2) == 0 {
+            push(b, amp)
+        } else {
+            push(b, 0 - amp)
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// Build a sine-ish PCM list at "speech-like" rate -- a triangle wave that
+// crosses zero every `period_samples` samples. Energy is the integral of
+// the triangle, ZCR is total_samples / period_samples ~ moderate.
+//
+// For a 240-sample @ 8 kHz frame and a 50-sample period (160 Hz, near male
+// F0), we get ~4-5 crossings per frame -- well below the 40% / 96
+// crossings ZCR ceiling.
+fn _triangle_buf(n, amp, period_samples) {
+    let b = list_new()
+    let i = 0
+    let half = period_samples / 2
+    while i < n {
+        let phase = i - (i / period_samples) * period_samples
+        let v = 0
+        if phase < half {
+            // up-ramp 0 -> amp
+            v = (phase * amp) / half
+        } else {
+            // down-ramp amp -> -amp -> 0 segments. Use a simple
+            // odd/even cycle: if (i/period_samples) is odd, sign is
+            // negated.
+            v = ((phase - half) * amp) / half - amp
+        }
+        if (i / period_samples) - ((i / period_samples) / 2) * 2 == 1 {
+            v = 0 - v
+        }
+        push(b, v)
+        i = i + 1
+    }
+    return b
+}
+
+// Build a "noise" PCM list -- pseudo-random samples in [-amp..amp].
+// LCG with constants that produce many sign flips (~50%).
+fn _noise_buf(n, amp) {
+    let b = list_new()
+    let i = 0
+    let seed = 12345
+    while i < n {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        // Map seed -> [-amp..amp]. Use mod 2*amp + 1, then subtract amp.
+        let v = seed - (seed / (2 * amp + 1)) * (2 * amp + 1) - amp
+        push(b, v)
+        i = i + 1
+    }
+    return b
+}
+
+// Concatenate two PCM lists. NOVA's list has no append-list operator.
+fn _concat(a, b) {
+    let out = list_new()
+    let i = 0
+    while i < len(a) {
+        push(out, a[i])
+        i = i + 1
+    }
+    let j = 0
+    while j < len(b) {
+        push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+// ---- constructor tests --------------------------------------------------
+
+fn test_state_new_defaults_8k() {
+    let s = vad_state_new(8000)
+    ce_check("vad_state_new returns non-zero", s != 0)
+    ce_eq("vad tag sentinel", s[0], 7401)
+    ce_eq("sample_rate stored", vad_sample_rate(s), 8000)
+    ce_eq("frame_size = 240 @ 8 kHz", vad_frame_size(s), 240)
+    ce_eq("initial state SILENCE", vad_machine_state(s), 0)
+    ce_eq("initial frames_total = 0", vad_frames_total(s), 0)
+    ce_eq("initial segments empty", vad_segment_count(s), 0)
+}
+
+fn test_state_new_16k() {
+    let s = vad_state_new(16000)
+    ce_eq("frame_size = 480 @ 16 kHz", vad_frame_size(s), 480)
+    // Energy threshold scales linearly: 50000 * 480 / 240 = 100000.
+    ce_eq("energy_thresh scales to 100000 @ 16 kHz",
+          vad_energy_thresh(s), 100000)
+    // ZCR ceiling: 480 * 40% = 192.
+    ce_eq("zcr_max = 192 @ 16 kHz", vad_zcr_max(s), 192)
+}
+
+fn test_state_new_clamps_rate() {
+    let s1 = vad_state_new(2000)        // below floor
+    ce_eq("sample_rate clamped UP to 8000", vad_sample_rate(s1), 8000)
+    let s2 = vad_state_new(96000)       // above ceiling
+    ce_eq("sample_rate clamped DOWN to 48000", vad_sample_rate(s2), 48000)
+}
+
+// ---- frame analysis tests ----------------------------------------------
+
+fn test_energy_zero_buffer() {
+    let b = _zero_buf(240)
+    ce_eq("energy of zero buffer is 0", vad_frame_energy(b, 0, 240), 0)
+}
+
+fn test_energy_constant_buffer() {
+    // 240 samples of constant amplitude 1000 -> sum_abs = 240000.
+    let b = _const_buf(240, 1000)
+    ce_eq("energy of constant 1000 = 240000",
+          vad_frame_energy(b, 0, 240), 240000)
+}
+
+fn test_energy_negative_handled() {
+    // Sum of absolutes -- negatives must contribute positively.
+    let b = _const_buf(240, 0 - 500)
+    ce_eq("energy of constant -500 = 120000 (sum of |s|)",
+          vad_frame_energy(b, 0, 240), 120000)
+}
+
+fn test_zcr_zero_buffer() {
+    let b = _zero_buf(240)
+    ce_eq("ZCR of zero buffer is 0", vad_frame_zcr(b, 0, 240), 0)
+}
+
+fn test_zcr_constant_buffer() {
+    // No sign flips in a constant positive buffer.
+    let b = _const_buf(240, 1000)
+    ce_eq("ZCR of constant +1000 is 0", vad_frame_zcr(b, 0, 240), 0)
+}
+
+fn test_zcr_alternating_buffer() {
+    // +1000, -1000, +1000, -1000... for 240 samples = 239 crossings.
+    let b = _alternating_buf(240, 1000)
+    ce_eq("ZCR of alternating +/- = 239",
+          vad_frame_zcr(b, 0, 240), 239)
+}
+
+fn test_zcr_triangle_voiced_like() {
+    // 50-sample period -> 240/50 = ~4.8 cycles, each with 2 crossings
+    // = ~9 crossings. Well below the 96-frame ceiling and consistent with
+    // voiced speech.
+    let b = _triangle_buf(240, 3000, 50)
+    let z = vad_frame_zcr(b, 0, 240)
+    ce_check("ZCR of voiced-like triangle in [4..12]",
+             z >= 4 && z <= 12)
+}
+
+// ---- classifier tests --------------------------------------------------
+
+fn test_classify_silence() {
+    let s = vad_state_new(8000)
+    let b = _zero_buf(240)
+    let energy = vad_frame_energy(b, 0, 240)
+    let zcr = vad_frame_zcr(b, 0, 240)
+    ce_eq("silence frame classified as silence",
+          vad_classify_frame(s, energy, zcr), 0)
+}
+
+fn test_classify_vowel_like() {
+    // Triangle wave at amp 3000, 50-sample period.
+    // Energy ~ ~3000 * 240 / 2 (avg of ramp) = ~360000. Well above 50000.
+    // ZCR ~ ~10. Well below 96.
+    let s = vad_state_new(8000)
+    let b = _triangle_buf(240, 3000, 50)
+    let energy = vad_frame_energy(b, 0, 240)
+    let zcr = vad_frame_zcr(b, 0, 240)
+    ce_eq("vowel-like triangle classified as speech",
+          vad_classify_frame(s, energy, zcr), 1)
+}
+
+fn test_classify_rejects_white_noise() {
+    // Alternating +/-3000 -- max ZCR, will exceed the 96-frame ceiling.
+    let s = vad_state_new(8000)
+    let b = _alternating_buf(240, 3000)
+    let energy = vad_frame_energy(b, 0, 240)
+    let zcr = vad_frame_zcr(b, 0, 240)
+    ce_check("alternating sq-wave has high energy",
+             energy > 50000)
+    ce_check("alternating sq-wave has high ZCR (above ceiling)",
+             zcr >= 96)
+    ce_eq("alternating sq-wave classified as silence (not speech)",
+          vad_classify_frame(s, energy, zcr), 0)
+}
+
+fn test_classify_rejects_low_energy_signal() {
+    // Triangle wave at amp=50 -- audible but well below speech volume.
+    // Energy = ~50 * 240 / 2 = ~6000. Below 50000 threshold.
+    let s = vad_state_new(8000)
+    let b = _triangle_buf(240, 50, 50)
+    let energy = vad_frame_energy(b, 0, 240)
+    let zcr = vad_frame_zcr(b, 0, 240)
+    ce_check("low-amp triangle has below-threshold energy",
+             energy < 50000)
+    ce_eq("low-amp triangle classified as silence",
+          vad_classify_frame(s, energy, zcr), 0)
+}
+
+// ---- state machine hysteresis tests ------------------------------------
+
+fn test_hysteresis_single_speech_frame_does_not_commit() {
+    // K=3: a single speech-classified frame moves us SILENCE ->
+    // SPEECH_CANDIDATE but emits no event. Two consecutive speech
+    // frames still no event. Three consecutive speech frames -> commit.
+    let s = vad_state_new(8000)
+    let speech = _triangle_buf(240, 3000, 50)
+    let silence = _zero_buf(240)
+    // Frame 0: speech (cand 1).
+    let e0 = vad_process_frame(s, speech, 0, 240)
+    ce_eq("first speech frame -> no event yet", e0, 0)
+    ce_eq("state -> SPEECH_CANDIDATE",
+          vad_machine_state(s), 1)
+    // Frame 1: silence -- abandon candidate, back to SILENCE.
+    let e1 = vad_process_frame(s, silence, 0, 240)
+    ce_eq("silence frame in candidate -> no event",
+          e1, 0)
+    ce_eq("state -> SILENCE after abandon",
+          vad_machine_state(s), 0)
+}
+
+fn test_hysteresis_three_speech_frames_commits() {
+    // 3 consecutive speech frames must emit SPEECH_START.
+    // Use a buffer long enough that offsets 0/240/480 each land on valid
+    // samples (3 * 240 = 720). The triangle's period is 50 samples so
+    // each 240-sample window has comparable energy + ZCR.
+    let s = vad_state_new(8000)
+    let speech = _triangle_buf(720, 3000, 50)
+    vad_process_frame(s, speech, 0, 240)
+    vad_process_frame(s, speech, 240, 240)
+    let e2 = vad_process_frame(s, speech, 480, 240)
+    ce_eq("third consecutive speech frame -> SPEECH_START",
+          e2, 1)
+    ce_eq("state -> SPEECH", vad_machine_state(s), 2)
+}
+
+fn test_hysteresis_M_silence_frames_to_end() {
+    // After SPEECH committed, a single silence frame moves to
+    // SILENCE_CANDIDATE; need M=10 consecutive silences to emit SPEECH_END.
+    // Build a single concatenated buffer (3 speech + 10 silence = 13
+    // frames * 240 = 3120 samples) so the offsets 0..2880 are all in-range.
+    let s = vad_state_new(8000)
+    let speech = _triangle_buf(3 * 240, 3000, 50)
+    let silence = _zero_buf(10 * 240)
+    let pcm = _concat(speech, silence)
+    ce_eq("test buffer 3120 samples", len(pcm), 3120)
+
+    // Commit to SPEECH: 3 speech frames at offsets 0/240/480.
+    vad_process_frame(s, pcm, 0, 240)
+    vad_process_frame(s, pcm, 240, 240)
+    vad_process_frame(s, pcm, 480, 240)
+    ce_eq("at SPEECH", vad_machine_state(s), 2)
+
+    // 9 silence frames -- still SILENCE_CANDIDATE, no event.
+    let i = 0
+    let off = 720
+    let e_inter = 0
+    while i < 9 {
+        e_inter = vad_process_frame(s, pcm, off, 240)
+        i = i + 1
+        off = off + 240
+    }
+    ce_eq("9 silence frames -> no SPEECH_END yet", e_inter, 0)
+    ce_eq("state still SILENCE_CANDIDATE",
+          vad_machine_state(s), 3)
+
+    // 10th silence frame -> SPEECH_END.
+    let e10 = vad_process_frame(s, pcm, off, 240)
+    ce_eq("10th consecutive silence -> SPEECH_END", e10, 2)
+    ce_eq("state -> SILENCE", vad_machine_state(s), 0)
+    ce_eq("one segment recorded", vad_segment_count(s), 1)
+}
+
+// ---- full PCM walk -----------------------------------------------------
+
+fn test_full_walk_one_segment() {
+    // 5 silence frames (1200 samples) + 5 speech frames + 15 silence frames
+    // = 25 * 240 = 6000 samples total.
+    // Expected: exactly 1 SPEECH_START and 1 SPEECH_END -> 1 segment.
+    let s = vad_state_new(8000)
+    let pre = _zero_buf(5 * 240)
+    let mid = _triangle_buf(5 * 240, 3000, 50)
+    let post = _zero_buf(15 * 240)
+    let pcm = _concat(_concat(pre, mid), post)
+    ce_eq("input length 6000 samples", len(pcm), 6000)
+    let segs = vad_process_pcm(s, pcm)
+    ce_eq("one speech segment detected", len(segs), 1)
+    let pair = segs[0]
+    let seg_start = vad_segment_start(pair)
+    let seg_end = vad_segment_end(pair)
+    // The pre-segment was 5*240=1200 samples of silence; speech started at
+    // 1200; SPEECH_START commits when the 3rd consecutive speech frame
+    // (offset 1200 + 2*240 = 1680) is processed, but back-dates the start
+    // to the 1st (1200). Allow a tolerance of one frame_size.
+    ce_check("segment start near silence/speech boundary",
+             seg_start >= 1200 - 240 && seg_start <= 1200 + 240)
+    // Segment ends after the speech-then-silence boundary. The last
+    // speech frame ended at 1200+5*240=2400; SPEECH_END commits after
+    // M=10 silences; back-dates to the first silent frame. Allow +/- 1
+    // frame_size tolerance.
+    ce_check("segment end near speech/silence boundary",
+             seg_end >= 2400 - 240 && seg_end <= 2400 + 240)
+}
+
+fn test_full_walk_two_segments() {
+    // pattern: 5 silence + 5 speech + 20 silence + 5 speech + 15 silence.
+    // The 20-silence gap is > M=10 frames, so the two speech bursts
+    // resolve to TWO separate segments.
+    let s = vad_state_new(8000)
+    let pre = _zero_buf(5 * 240)
+    let sp1 = _triangle_buf(5 * 240, 3000, 50)
+    let gap = _zero_buf(20 * 240)
+    let sp2 = _triangle_buf(5 * 240, 3000, 50)
+    let post = _zero_buf(15 * 240)
+    let pcm = _concat(_concat(_concat(_concat(pre, sp1), gap), sp2), post)
+    let segs = vad_process_pcm(s, pcm)
+    ce_eq("two distinct speech segments", len(segs), 2)
+    // frames_speech counter should approximate the 10 speech frames we
+    // synthesized.
+    ce_check("frames_speech >= 8",
+             vad_frames_speech(s) >= 8)
+}
+
+fn test_full_walk_pure_silence() {
+    // 30 frames of zero -- expect zero segments and SILENCE state throughout.
+    let s = vad_state_new(8000)
+    let pcm = _zero_buf(30 * 240)
+    let segs = vad_process_pcm(s, pcm)
+    ce_eq("zero buffer -> zero segments", len(segs), 0)
+    ce_eq("frames_silence == 30", vad_frames_silence(s), 30)
+    ce_eq("frames_speech == 0", vad_frames_speech(s), 0)
+    ce_eq("ended in SILENCE state", vad_machine_state(s), 0)
+}
+
+fn test_full_walk_pure_noise_rejected() {
+    // White noise -- high energy AND high ZCR -> classifier rejects.
+    let s = vad_state_new(8000)
+    // 30 frames of high-amplitude alternating square-wave (max ZCR).
+    let pcm = _alternating_buf(30 * 240, 3000)
+    let segs = vad_process_pcm(s, pcm)
+    ce_eq("noise buffer -> zero segments", len(segs), 0)
+}
+
+// ---- vad_filter_pcm tests ---------------------------------------------
+
+fn test_filter_pcm_extracts_speech_only() {
+    // 5 silence + 5 speech + 15 silence. The filter should produce roughly
+    // the middle 5 frames (= 1200 samples), back-dated by K-1 frames and
+    // tail-padded by M-1 silence frames depending on segment-boundary
+    // arithmetic. We assert the output is non-empty and substantially
+    // shorter than the original.
+    let s = vad_state_new(8000)
+    let pre = _zero_buf(5 * 240)
+    let mid = _triangle_buf(5 * 240, 3000, 50)
+    let post = _zero_buf(15 * 240)
+    let pcm = _concat(_concat(pre, mid), post)
+    let filtered = vad_filter_pcm(s, pcm)
+    ce_check("filter output non-empty", len(filtered) > 0)
+    ce_check("filter output < input length",
+             len(filtered) < len(pcm))
+    ce_check("filter output >= 3 frames (speech segment)",
+             len(filtered) >= 3 * 240)
+}
+
+fn test_filter_pcm_all_silence_returns_empty() {
+    let s = vad_state_new(8000)
+    let pcm = _zero_buf(30 * 240)
+    let filtered = vad_filter_pcm(s, pcm)
+    ce_eq("all-silence filter -> empty list", len(filtered), 0)
+}
+
+// ---- threshold override --------------------------------------------------
+
+fn test_threshold_override() {
+    let s = vad_state_new(8000)
+    vad_set_energy_thresh(s, 1)
+    vad_set_zcr_max(s, 240)
+    // Tiny amplitude signal should now classify as speech.
+    let b = _triangle_buf(240, 100, 50)
+    let energy = vad_frame_energy(b, 0, 240)
+    let zcr = vad_frame_zcr(b, 0, 240)
+    ce_eq("with relaxed threshold, low-amp triangle = speech",
+          vad_classify_frame(s, energy, zcr), 1)
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    test_state_new_defaults_8k()
+    test_state_new_16k()
+    test_state_new_clamps_rate()
+
+    test_energy_zero_buffer()
+    test_energy_constant_buffer()
+    test_energy_negative_handled()
+    test_zcr_zero_buffer()
+    test_zcr_constant_buffer()
+    test_zcr_alternating_buffer()
+    test_zcr_triangle_voiced_like()
+
+    test_classify_silence()
+    test_classify_vowel_like()
+    test_classify_rejects_white_noise()
+    test_classify_rejects_low_energy_signal()
+
+    test_hysteresis_single_speech_frame_does_not_commit()
+    test_hysteresis_three_speech_frames_commits()
+    test_hysteresis_M_silence_frames_to_end()
+
+    test_full_walk_one_segment()
+    test_full_walk_two_segments()
+    test_full_walk_pure_silence()
+    test_full_walk_pure_noise_rejected()
+
+    test_filter_pcm_extracts_speech_only()
+    test_filter_pcm_all_silence_returns_empty()
+
+    test_threshold_override()
+
+    ce_summary("audio_vad")
+}
+
+main()

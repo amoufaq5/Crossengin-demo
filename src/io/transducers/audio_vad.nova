@@ -1,0 +1,508 @@
+// CrossEngin io/transducers: Voice Activity Detection (R7F).
+//
+// Purpose
+//   Inserts a VAD layer between `audio_capture.nova` (WAV/PCM ingest) and
+//   `stt_seam.nova` (transcription dispatch) so STT only sees frames that
+//   plausibly contain speech. Three wins:
+//
+//     1. **STT compute reduction.** Silence frames are dropped before they
+//        reach the backend; on a 5-second utterance with 60% silence, the
+//        STT call sees ~40% of the samples.
+//     2. **False-transcript reduction.** Pure silence in -> "[stt: input
+//        wav missing]" or the placeholder out is a real failure mode the
+//        stub backend has no signal to suppress; VAD short-circuits.
+//     3. **Segment boundaries.** SPEECH_START / SPEECH_END events let the
+//        chat (or any downstream consumer) chunk on real utterance
+//        boundaries -- no fixed 5-second windowing artifacts.
+//
+//   Algorithm: energy + zero-crossing-rate combined.
+//
+//     Per ~30 ms frame (240 samples @ 8 kHz, 480 samples @ 16 kHz):
+//       energy = sum( |sample| )                 -- variance proxy; sum of
+//                                                  absolutes avoids the
+//                                                  64-bit overflow / NOVA
+//                                                  pointer-threshold risk
+//                                                  of sum-of-squares.
+//       zcr    = count of sign flips             -- count adjacent samples
+//                                                  where sign changes.
+//                                                  Voiced speech: moderate.
+//                                                  Unvoiced fricatives:
+//                                                  high. Silence / pure
+//                                                  tones: low.
+//
+//     A frame is "speech" iff energy > E_THRESH AND zcr < ZCR_MAX. The
+//     ZCR ceiling rejects high-energy white noise (which has very high
+//     ZCR -- ~half the samples flip sign in pure-random noise).
+//
+//   State machine (hysteresis -- avoids flapping on per-frame edge cases):
+//
+//     SILENCE          --speech frame-->  SPEECH_CANDIDATE
+//     SPEECH_CANDIDATE --K speech in a row--> SPEECH (emit SPEECH_START)
+//     SPEECH_CANDIDATE --silence frame--> SILENCE
+//     SPEECH           --silence frame--> SILENCE_CANDIDATE
+//     SILENCE_CANDIDATE --M silence in a row--> SILENCE (emit SPEECH_END)
+//     SILENCE_CANDIDATE --speech frame--> SPEECH
+//
+//     Defaults: K=3 (need ~90 ms speech to commit), M=10 (need ~300 ms
+//     silence to release). These match the brief and the practical
+//     human-speech hysteresis empirically used by webrtcvad / Silero
+//     in aggressive-mode 1-2.
+//
+//   Sample rates supported: any rate in [8000..48000]. Frame size is
+//   computed as sample_rate * 30 / 1000 -- 240 / 480 / 720 / 1440 / etc.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- audio input chain).
+// NOVA dependencies: builtins -- alloc, list_new, push, list_set, len.
+//   No syscalls in the hot path (the module is pure -- caller does I/O).
+// CrossEngin dependencies: none (intentional -- leaf module so tests can
+//   exercise the VAD without dragging audio_capture or stt_seam into the
+//   unit compilation unit).
+
+// ---- frame / threshold constants ------------------------------------------
+
+// Frame duration in milliseconds. 30 ms is the webrtcvad / Silero standard.
+let VAD_FRAME_MS = 30
+
+// Hysteresis thresholds. K = SPEECH_CANDIDATE -> SPEECH commit count;
+// M = SILENCE_CANDIDATE -> SILENCE commit count.
+let VAD_K_SPEECH  = 3       // ~90 ms confirmation -- speech ON
+let VAD_M_SILENCE = 10      // ~300 ms confirmation -- speech OFF
+
+// Energy threshold: sum-of-absolutes per frame.
+// Default tuned for an 8 kHz / 240-sample frame with PCM16 samples:
+//   * silence baseline (LCG noise floor at +/-50): ~50 * 240 = 12000.
+//   * vowel (peak +/-4000-8000, RMS-proxy ~3000): ~3000 * 240 = 720000.
+//   * The threshold lives well between those; 50000 is a 4x margin over
+//     the noisiest silence baseline we've observed in tests.
+// Per-frame: scales with sample_rate (more samples -> higher sum), so the
+// state struct stores a scaled version of this baseline.
+let VAD_ENERGY_BASE_8K = 50000
+
+// ZCR ceiling. Frames with ZCR above this look like white noise, not
+// speech. White noise: ~50% of samples flip sign -> ZCR ~= n/2. Speech:
+// voiced ~10-20%, unvoiced fricatives ~25-35%. Threshold at 40% gives
+// a safety margin between unvoiced consonants and pure noise.
+// Per-frame: scales with frame_size, so state struct stores the
+// per-frame integer count derived from this percent.
+let VAD_ZCR_MAX_PCT = 40
+
+// ZCR floor for "is this actually a signal, not DC?". Pure silence has
+// zero crossings only from noise floor flicker; pure tones near DC have
+// very few. We don't currently require zcr >= floor (the energy gate
+// already rejects DC), but we expose the constant so a future revision
+// could add it without touching the public surface.
+let VAD_ZCR_MIN_PCT = 1
+
+// Sample-rate clamp -- matches stt_seam_pcm's range.
+let VAD_RATE_MIN = 8000
+let VAD_RATE_MAX = 48000
+
+// ---- state machine codes --------------------------------------------------
+
+let VAD_STATE_SILENCE          = 0
+let VAD_STATE_SPEECH_CANDIDATE = 1
+let VAD_STATE_SPEECH           = 2
+let VAD_STATE_SILENCE_CANDIDATE = 3
+
+// Per-frame event codes returned by `vad_process_frame`.
+let VAD_EVENT_NONE         = 0
+let VAD_EVENT_SPEECH_START = 1
+let VAD_EVENT_SPEECH_END   = 2
+
+// ---- state struct layout --------------------------------------------------
+// Shape (parallels stt_seam_new / audio_capture_state_new):
+//   [0] tag             (sentinel: VAD_STATE_TAG)
+//   [1] sample_rate
+//   [2] frame_size      (samples per 30 ms frame)
+//   [3] energy_thresh   (per-frame absolute-sum threshold)
+//   [4] zcr_max         (per-frame zero-crossing count ceiling)
+//   [5] machine_state   (one of VAD_STATE_*)
+//   [6] speech_run      (consecutive speech frames seen)
+//   [7] silence_run     (consecutive silence frames seen)
+//   [8] last_event      (VAD_EVENT_* from most recent vad_process_frame call)
+//   [9] frames_total    (counter -- observability)
+//   [10] frames_speech  (counter -- # frames classified speech)
+//   [11] frames_silence (counter -- # frames classified silence)
+//   [12] segments       (list of [start_sample, end_sample] pairs)
+//   [13] cur_seg_start  (sample index where current SPEECH segment opened,
+//                        or -1 if not in a segment)
+
+let VAD_STATE_TAG = 7401
+
+let V_TAG          = 0
+let V_RATE         = 1
+let V_FRAME_SIZE   = 2
+let V_E_THRESH     = 3
+let V_ZCR_MAX      = 4
+let V_MSTATE       = 5
+let V_SPEECH_RUN   = 6
+let V_SILENCE_RUN  = 7
+let V_LAST_EVENT   = 8
+let V_FRAMES_TOT   = 9
+let V_FRAMES_SP    = 10
+let V_FRAMES_SI    = 11
+let V_SEGMENTS     = 12
+let V_CUR_SEG      = 13
+
+// ---- helpers --------------------------------------------------------------
+
+// Absolute value. NOVA has no abs() builtin; this is a one-liner.
+fn _vad_abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// Sign of `x`: -1, 0, +1. Used by zero-crossing detection. Treating 0 as
+// its own class avoids false ZCR ticks on long stretches of exact zero
+// (which is what _synth_phoneme_silence emits).
+fn _vad_sign(x) {
+    if x > 0 { return 1 }
+    if x < 0 { return 0 - 1 }
+    return 0
+}
+
+// ---- constructor ----------------------------------------------------------
+//
+// vad_state_new(sample_rate) -> state list.
+//   sample_rate clamped to [8000..48000]. frame_size = rate * 30 / 1000.
+//   Thresholds derived from VAD_ENERGY_BASE_8K + VAD_ZCR_MAX_PCT, scaled to
+//   the frame_size so the per-frame integers don't drift across rates.
+//
+//   Test callers can override the thresholds via vad_set_energy_thresh /
+//   vad_set_zcr_max (tighter / looser bounds without touching env).
+
+fn vad_state_new(sample_rate) {
+    let rate = sample_rate
+    if rate < VAD_RATE_MIN { rate = VAD_RATE_MIN }
+    if rate > VAD_RATE_MAX { rate = VAD_RATE_MAX }
+    let frame_size = (rate * VAD_FRAME_MS) / 1000
+
+    // Energy threshold scales linearly with frame_size (sum of |s| grows
+    // with the number of samples). Baseline 50000 is calibrated to a
+    // 240-sample frame; for 480 samples we want ~100000, for 720 we want
+    // ~150000.
+    let e_thresh = (VAD_ENERGY_BASE_8K * frame_size) / 240
+
+    // ZCR ceiling: (frame_size * pct) / 100. 240 samples * 40% = 96.
+    let zcr_max = (frame_size * VAD_ZCR_MAX_PCT) / 100
+
+    let s = list_new()
+    push(s, VAD_STATE_TAG)              // [0]
+    push(s, rate)                       // [1]
+    push(s, frame_size)                 // [2]
+    push(s, e_thresh)                   // [3]
+    push(s, zcr_max)                    // [4]
+    push(s, VAD_STATE_SILENCE)          // [5]
+    push(s, 0)                          // [6] speech_run
+    push(s, 0)                          // [7] silence_run
+    push(s, VAD_EVENT_NONE)             // [8] last_event
+    push(s, 0)                          // [9] frames_total
+    push(s, 0)                          // [10] frames_speech
+    push(s, 0)                          // [11] frames_silence
+    push(s, list_new())                 // [12] segments
+    push(s, 0 - 1)                      // [13] cur_seg_start
+    return s
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn vad_sample_rate(s)    { return s[V_RATE] }
+fn vad_frame_size(s)     { return s[V_FRAME_SIZE] }
+fn vad_energy_thresh(s)  { return s[V_E_THRESH] }
+fn vad_zcr_max(s)        { return s[V_ZCR_MAX] }
+fn vad_machine_state(s)  { return s[V_MSTATE] }
+fn vad_speech_run(s)     { return s[V_SPEECH_RUN] }
+fn vad_silence_run(s)    { return s[V_SILENCE_RUN] }
+fn vad_last_event(s)     { return s[V_LAST_EVENT] }
+fn vad_frames_total(s)   { return s[V_FRAMES_TOT] }
+fn vad_frames_speech(s)  { return s[V_FRAMES_SP] }
+fn vad_frames_silence(s) { return s[V_FRAMES_SI] }
+fn vad_segments(s)       { return s[V_SEGMENTS] }
+
+// ---- threshold override (tests / tuning) ---------------------------------
+
+fn vad_set_energy_thresh(s, v) {
+    list_set(s, V_E_THRESH, v)
+    return 1
+}
+
+fn vad_set_zcr_max(s, v) {
+    list_set(s, V_ZCR_MAX, v)
+    return 1
+}
+
+// ---- frame analysis (pure helpers, no state) ----------------------------
+//
+// vad_frame_energy(samples, off, n) -> int
+//   Sum of absolute values across `samples[off..off+n]`. Bounds-checked:
+//   if off+n exceeds len(samples), the loop stops at the list end.
+//
+// vad_frame_zcr(samples, off, n) -> int
+//   Number of sign flips in `samples[off..off+n]`. Treats 0 as its own
+//   class so a long run of exact zero doesn't produce phantom crossings.
+
+fn vad_frame_energy(samples, off, n) {
+    let total = len(samples)
+    let end = off + n
+    if end > total { end = total }
+    let i = off
+    let sum = 0
+    while i < end {
+        sum = sum + _vad_abs(samples[i])
+        i = i + 1
+    }
+    return sum
+}
+
+fn vad_frame_zcr(samples, off, n) {
+    let total = len(samples)
+    let end = off + n
+    if end > total { end = total }
+    if end - off < 2 { return 0 }
+    let i = off + 1
+    let count = 0
+    let prev_sign = _vad_sign(samples[off])
+    while i < end {
+        let cur_sign = _vad_sign(samples[i])
+        // A crossing is a sign change from + to - or - to +.
+        // (sign 0 -> sign +/- is NOT a crossing; sign +/- -> sign 0 is NOT
+        // a crossing either; this is the classical webrtcvad convention.)
+        if prev_sign != 0 {
+            if cur_sign != 0 {
+                if prev_sign != cur_sign { count = count + 1 }
+            }
+        }
+        if cur_sign != 0 { prev_sign = cur_sign }
+        i = i + 1
+    }
+    return count
+}
+
+// ---- frame classification ------------------------------------------------
+//
+// vad_classify_frame(state, energy, zcr) -> 1 (speech) | 0 (silence)
+//
+// A frame is speech iff energy > threshold AND zcr is in (0, zcr_max).
+// The strict-greater on energy avoids classifying exactly-baseline frames
+// (a silent buffer with energy == 0 < threshold == 50000) as speech.
+
+fn vad_classify_frame(s, energy, zcr) {
+    if energy <= s[V_E_THRESH] { return 0 }
+    if zcr >= s[V_ZCR_MAX] { return 0 }
+    return 1
+}
+
+// ---- state machine -------------------------------------------------------
+//
+// _vad_advance(state, is_speech, sample_index) -> event code
+//
+// Walks the four-state machine once. `sample_index` is the global sample
+// offset where this frame STARTS (used to record segment boundaries).
+// Returns VAD_EVENT_NONE / _SPEECH_START / _SPEECH_END.
+
+fn _vad_advance(s, is_speech, sample_index) {
+    let state = s[V_MSTATE]
+    let event = VAD_EVENT_NONE
+
+    // SILENCE
+    if state == VAD_STATE_SILENCE {
+        if is_speech == 1 {
+            list_set(s, V_MSTATE, VAD_STATE_SPEECH_CANDIDATE)
+            list_set(s, V_SPEECH_RUN, 1)
+            list_set(s, V_SILENCE_RUN, 0)
+        } else {
+            // already silent -- just bump the counter so a future SPEECH_END
+            // path can introspect run length if needed.
+            list_set(s, V_SILENCE_RUN, s[V_SILENCE_RUN] + 1)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    // SPEECH_CANDIDATE
+    if state == VAD_STATE_SPEECH_CANDIDATE {
+        if is_speech == 1 {
+            let new_run = s[V_SPEECH_RUN] + 1
+            list_set(s, V_SPEECH_RUN, new_run)
+            if new_run >= VAD_K_SPEECH {
+                // Commit -- segment opens K frames BACK, at the first
+                // candidate frame, so the SPEECH_START sample index points
+                // to where the speech actually began (not where we
+                // confirmed it).
+                let frame_size = s[V_FRAME_SIZE]
+                let seg_start = sample_index - (VAD_K_SPEECH - 1) * frame_size
+                if seg_start < 0 { seg_start = 0 }
+                list_set(s, V_CUR_SEG, seg_start)
+                list_set(s, V_MSTATE, VAD_STATE_SPEECH)
+                list_set(s, V_SILENCE_RUN, 0)
+                event = VAD_EVENT_SPEECH_START
+            }
+        } else {
+            // Single noisy frame -- abandon candidate, go back to SILENCE.
+            list_set(s, V_MSTATE, VAD_STATE_SILENCE)
+            list_set(s, V_SPEECH_RUN, 0)
+            list_set(s, V_SILENCE_RUN, 1)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    // SPEECH
+    if state == VAD_STATE_SPEECH {
+        if is_speech == 1 {
+            list_set(s, V_SPEECH_RUN, s[V_SPEECH_RUN] + 1)
+            list_set(s, V_SILENCE_RUN, 0)
+        } else {
+            list_set(s, V_MSTATE, VAD_STATE_SILENCE_CANDIDATE)
+            list_set(s, V_SILENCE_RUN, 1)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    // SILENCE_CANDIDATE
+    if state == VAD_STATE_SILENCE_CANDIDATE {
+        if is_speech == 0 {
+            let new_run = s[V_SILENCE_RUN] + 1
+            list_set(s, V_SILENCE_RUN, new_run)
+            if new_run >= VAD_M_SILENCE {
+                // Commit -- segment closes M frames BACK (at the last
+                // SPEECH frame). The segment end-sample is sample_index
+                // minus the silent stretch that triggered the close.
+                let frame_size = s[V_FRAME_SIZE]
+                let seg_end = sample_index - (VAD_M_SILENCE - 1) * frame_size
+                if seg_end < 0 { seg_end = 0 }
+                let cur_start = s[V_CUR_SEG]
+                if cur_start >= 0 {
+                    let segs = s[V_SEGMENTS]
+                    let pair = list_new()
+                    push(pair, cur_start)
+                    push(pair, seg_end)
+                    push(segs, pair)
+                }
+                list_set(s, V_CUR_SEG, 0 - 1)
+                list_set(s, V_MSTATE, VAD_STATE_SILENCE)
+                list_set(s, V_SPEECH_RUN, 0)
+                event = VAD_EVENT_SPEECH_END
+            }
+        } else {
+            // Speech came back -- abandon silence candidate.
+            list_set(s, V_MSTATE, VAD_STATE_SPEECH)
+            list_set(s, V_SPEECH_RUN, s[V_SPEECH_RUN] + 1)
+            list_set(s, V_SILENCE_RUN, 0)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    list_set(s, V_LAST_EVENT, event)
+    return event
+}
+
+// ---- public frame processor ----------------------------------------------
+//
+// vad_process_frame(state, samples, off, n) -> event code
+//   Compute energy + zcr, classify, advance state machine. Updates the
+//   counters in the state struct. Returns one of VAD_EVENT_*.
+
+fn vad_process_frame(s, samples, off, n) {
+    let energy = vad_frame_energy(samples, off, n)
+    let zcr = vad_frame_zcr(samples, off, n)
+    let is_speech = vad_classify_frame(s, energy, zcr)
+
+    list_set(s, V_FRAMES_TOT, s[V_FRAMES_TOT] + 1)
+    if is_speech == 1 {
+        list_set(s, V_FRAMES_SP, s[V_FRAMES_SP] + 1)
+    } else {
+        list_set(s, V_FRAMES_SI, s[V_FRAMES_SI] + 1)
+    }
+    return _vad_advance(s, is_speech, off)
+}
+
+// ---- buffer processor ----------------------------------------------------
+//
+// vad_process_pcm(state, samples) -> list of [start, end] pairs
+//   Walks the PCM buffer in frame_size chunks, runs each through
+//   vad_process_frame. Tail (less than frame_size samples) is dropped.
+//   After processing every frame, if we're still inside a SPEECH or
+//   SILENCE_CANDIDATE segment, flush it -- close the segment at the end
+//   of the buffer.
+//
+//   Returns the seg-pair list (also accessible via vad_segments(state)).
+
+fn vad_process_pcm(s, samples) {
+    let frame_size = s[V_FRAME_SIZE]
+    let total = len(samples)
+    let off = 0
+    while off + frame_size <= total {
+        vad_process_frame(s, samples, off, frame_size)
+        off = off + frame_size
+    }
+    _vad_flush(s, off)
+    return s[V_SEGMENTS]
+}
+
+// _vad_flush(state, end_sample): if a segment is currently open
+// (SPEECH or SILENCE_CANDIDATE with a cur_seg_start >= 0), close it at
+// end_sample and emit SPEECH_END. Otherwise no-op.
+
+fn _vad_flush(s, end_sample) {
+    let state = s[V_MSTATE]
+    if state != VAD_STATE_SPEECH {
+        if state != VAD_STATE_SILENCE_CANDIDATE {
+            return 0
+        }
+    }
+    let cur_start = s[V_CUR_SEG]
+    if cur_start < 0 { return 0 }
+    let segs = s[V_SEGMENTS]
+    let pair = list_new()
+    push(pair, cur_start)
+    push(pair, end_sample)
+    push(segs, pair)
+    list_set(s, V_CUR_SEG, 0 - 1)
+    list_set(s, V_MSTATE, VAD_STATE_SILENCE)
+    list_set(s, V_SPEECH_RUN, 0)
+    list_set(s, V_SILENCE_RUN, 0)
+    list_set(s, V_LAST_EVENT, VAD_EVENT_SPEECH_END)
+    return 1
+}
+
+// ---- VAD filter: PCM-in -> filtered-PCM-out -----------------------------
+//
+// vad_filter_pcm(state, samples) -> filtered PCM list (speech only).
+//   Runs vad_process_pcm; then returns a new list containing only the
+//   samples inside speech segments. Concatenates segments back-to-back so
+//   the resulting buffer is a continuous "all speech" PCM stream suitable
+//   for handing to stt_transcribe.
+//
+//   If the input has no detected speech, returns an empty list.
+
+fn vad_filter_pcm(s, samples) {
+    vad_process_pcm(s, samples)
+    let segs = s[V_SEGMENTS]
+    let out = list_new()
+    let n = len(segs)
+    let total = len(samples)
+    let si = 0
+    while si < n {
+        let pair = segs[si]
+        let start = pair[0]
+        let end = pair[1]
+        if start < 0 { start = 0 }
+        if end > total { end = total }
+        let j = start
+        while j < end {
+            push(out, samples[j])
+            j = j + 1
+        }
+        si = si + 1
+    }
+    return out
+}
+
+// ---- segment-pair accessors -----------------------------------------------
+
+fn vad_segment_start(pair) { return pair[0] }
+fn vad_segment_end(pair)   { return pair[1] }
+fn vad_segment_count(s)    { return len(s[V_SEGMENTS]) }

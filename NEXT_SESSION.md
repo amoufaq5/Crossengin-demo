@@ -3,7 +3,112 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R7C (this session) — IO: Noise XK strength upgrade to 2048-bit RFC 7919 Group 14 DH
+## R7F (this session) — IO: Voice Activity Detection on audio capture + clean STT seam
+
+**Status: complete -- `src/io/transducers/audio_vad.nova` lands as a
+new leaf module sitting between `audio_capture.nova` (WAV ingest) and
+`stt_seam.nova` (transcription).** Before R7F, every audio capture
+(including all-silence sandbox runs) flowed to the STT backend
+unconditionally; the placeholder fall-through path (`"[stt: input wav
+missing]"`) burned cycles transcribing nothing on a regular cadence.
+R7F inserts a VAD layer so STT only sees confirmed-speech PCM, and the
+seam now has a single canonical entry point `stt_transcribe(seam,
+audio_buffer)` that dispatches by buffer shape regardless of which
+backend (stub / subprocess / future).
+
+### Algorithm
+
+Per ~30 ms frame (240 samples @ 8 kHz, 480 @ 16 kHz, 720 @ 24 kHz, etc.):
+
+  * `energy = Σ |sample|` (sum of absolutes; the variance proxy avoids
+    the 64-bit overflow risk of sum-of-squares at 48 kHz PCM16).
+  * `zcr = count of sign flips` (treats 0 as its own class so a stretch
+    of exact zero from `_synth_phoneme_silence` doesn't manufacture
+    phantom crossings).
+  * Classifier: `energy > E_THRESH AND zcr < ZCR_MAX`. The ZCR ceiling
+    rejects high-energy white noise — alternating ±3000 (max ZCR =
+    n-1) classifies as silence even though its energy is well above
+    threshold.
+
+State machine: four states with hysteresis. K=3 consecutive speech
+frames commit `SPEECH_START` (~90 ms confirmation); M=10 consecutive
+silence frames commit `SPEECH_END` (~300 ms confirmation). The
+`SPEECH_START` sample index is back-dated K-1 frames so segment
+boundaries align with where speech actually began, not where we
+confirmed it.
+
+### What changed
+
+- **NEW `src/io/transducers/audio_vad.nova`** — energy + ZCR helpers
+  (`vad_frame_energy`, `vad_frame_zcr`), classifier
+  (`vad_classify_frame`), state machine (`vad_process_frame`,
+  `_vad_advance`), buffer processor (`vad_process_pcm`), filter
+  (`vad_filter_pcm`). Pure module — no syscalls, all NOVA builtins.
+  Sample-rate clamp [8000..48000]; thresholds scale linearly with
+  frame_size so the same module works at every supported rate.
+- **`src/io/transducers/audio_capture.nova`**: added
+  `audio_capture_to_pcm_vad(wav_path) -> [filtered_pcm, sample_rate,
+  n_segments]`. Internal `AC_*` list-index constants renamed
+  `ACAP_*` to disambiguate from `loop_coordination.nova`'s `AC_TAG =
+  0` (agent-context), which collided once the transitive import chain
+  pulled both into the chat binary.
+- **`src/io/transducers/stream_audio.nova`**: one-line rename
+  `AC_WAV_PATH` -> `ACAP_WAV_PATH` to match the audio_capture
+  refactor. No semantic change.
+- **`src/io/transducers/stt_seam.nova`**:
+  * `stt_transcribe(seam, audio_buffer)` — canonical entry point.
+    Dispatches to `stt_transcribe_wav` (1-element buffer) or
+    `stt_transcribe_pcm` (2-element [pcm_list, sample_rate] buffer).
+  * `stt_transcribe_wav_vad(seam, wav_path)` — VAD-gated path.
+    Returns a 4-tuple `[transcript, confidence, error, n_segments]`.
+    Short-circuits to the stub placeholder if VAD detects zero speech
+    so the backend never sees pure-silence input.
+- **`examples/crossengin_chat.nova`**: `+1 import` (stt_seam), new
+  `_admin_listen` handler + `/listen [PATH]` dispatch line + help
+  line. With no arg, captures a fresh 5 s clip; with PATH, reads the
+  existing WAV. Reports transcript + segment count + active backend.
+
+### Verification
+
+- `tests/unit/test_audio_vad.nova` (NEW): **55 assertions** covering
+  rate clamp + frame_size derivation (240 @ 8 kHz, 480 @ 16 kHz),
+  energy/ZCR helpers (zero / constant / alternating / triangle / noise
+  buffers), classifier behaviour on silence / vowel / pure-noise /
+  low-amplitude inputs, K=3 commit hysteresis (single-frame noise
+  doesn't trigger; 3 consecutive speech frames does), M=10 silence-
+  release hysteresis (9 silence frames stay in candidate; 10th
+  commits SPEECH_END), full-buffer walks (1-segment / 2-segment /
+  all-silence / all-noise patterns), `vad_filter_pcm` extracts-speech-
+  only, threshold override.
+- `tests/integration/scenario_ii_vad.sh` (NEW): **17 assertions**.
+  Klatt-synthesizes "AY EY OW OY" (4 phonemes * 1200 samples @ 8 kHz
+  = 600 ms of voice) padded with 150 ms leading + 300 ms trailing
+  silence; writes WAV via `audio_write_wav`; reads back via
+  `audio_capture_to_pcm_vad`. Expected outcome on the speech fixture:
+  sr=8000, segments=1, filtered_len=4800. Pure-silence fixture: 0
+  segments, empty filtered PCM. Pure-noise fixture (alternating
+  ±3000): 0 segments (ZCR ceiling). Chat `/help` advertises
+  `/listen`; `/listen <wav>` reports `vad_segments=N`.
+- Existing audio test suites continue to pass unchanged: `audio_synth:
+  OK (209)`, `audio_capture: OK (28)`, `stt_seam: OK (26)`.
+- Full unit-test suite: `144 passed, 0 failed`.
+
+### Module count: 136 -> 137 (audio_vad.nova added).
+
+### Future work (carried forward)
+
+- Adaptive thresholds: rolling silence-floor estimator so a noisy
+  recording environment doesn't need manual energy-threshold tuning.
+- Spectral entropy / sub-band energy: extra discriminator rejecting
+  single-frequency interference (HVAC hum, 50/60 Hz mains).
+- VAD-aware re-segmentation: rather than concatenating speech
+  segments back-to-back, hand each segment to STT independently and
+  join transcripts at segment boundaries -- preserves utterance
+  pauses for downstream prosody / turn-taking.
+
+---
+
+## R7C — IO: Noise XK strength upgrade to 2048-bit RFC 7919 Group 14 DH
 
 **Status: complete -- `src/io/transducers/noise_xk.nova` swapped from
 256-bit field-prime DH to 2048-bit RFC 7919 Group 14 via

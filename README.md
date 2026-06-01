@@ -11,7 +11,14 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 136 modules compile (`make build`, +1 from
+> toolchain: 137 modules compile (`make build`, +1 from
+> `io/transducers/audio_vad.nova` added in R7F (energy + ZCR Voice
+> Activity Detection: 30 ms frames, 4-state hysteresis machine with K=3
+> speech-on / M=10 speech-off thresholds; integrated into
+> `audio_capture_to_pcm_vad` and `stt_transcribe_wav_vad` so STT only
+> sees confirmed-speech PCM, see AUDIO_AUDIT.md for the algorithm +
+> verification),
+> +1 from
 > `io/transducers/noise_xk.nova` added in R6C and upgraded in R7C to
 > 2048-bit RFC 7919 Group 14 DH — pure-NOVA Noise XK
 > mutual-auth handshake + ChaCha20-Poly1305 transport encryption for
@@ -414,6 +421,14 @@ computational units rather than orchestrating a pipeline of modules.
 > 48 kHz sample-rate variants) + malformed-WAV rejection (bad RIFF
 > magic / bad WAVE magic / non-PCM format / non-16-bit width /
 > truncated header / missing file) + stereo-to-mono averaging,
+> +1 suite / +55 assertions from `test_audio_vad.nova` added in R7F
+> Voice Activity Detection: energy (sum of absolutes) + ZCR (sign
+> flips) per 30 ms frame; 4-state hysteresis machine (SILENCE →
+> SPEECH_CANDIDATE → SPEECH → SILENCE_CANDIDATE → SILENCE) with K=3
+> speech-on / M=10 speech-off commit thresholds; thresholds scale
+> linearly with frame_size so the same module works at 8/16/22.05/
+> 44.1/48 kHz. Rejects pure-noise inputs via the ZCR ceiling
+> (alternating ±3000 = max ZCR = silence verdict),
 > +1 suite / +56 assertions from `test_proof_checker.nova` added in P3.5
 > minimum-viable proof checker -- bounded BFS over the operator graph
 > returning audit-grade derivation traces with composed Bayesian
@@ -482,6 +497,16 @@ computational units rather than orchestrating a pipeline of modules.
 > `audio_capture_to_pcm` (sample_rate=16000, samples non-empty), and the
 > `EV_MESSAGE` post-path round-trips through the scheduler queue via
 > `hs_post_event`,
+> +1 from `scenario_ii_vad.sh` added in R7F VAD end-to-end: Klatt-
+> synthesizes a 4-diphthong utterance ("AY EY OW OY") padded with
+> leading/trailing silence, writes the WAV via `audio_write_wav`,
+> reads back via `audio_capture_to_pcm_vad`, asserts >=1 speech segment
+> + non-empty filtered PCM (4800 samples = the speech burst with K=3
+> back-dating). Pure-silence WAV -> 0 segments + empty filtered PCM;
+> pure-noise WAV (alternating ±3000 = max ZCR) -> 0 segments (ZCR
+> ceiling rejects high-energy noise). Chat `/help` advertises
+> `/listen`; `/listen <wav>` reports `vad_segments=N` and the active
+> STT backend,
 > +1 from `scenario_n_compaction.sh` added in P2.10 snapshot compaction
 > pass: /save -> /teach 50 -> /compact -> /save shrinks file growth by
 > >50% vs the baseline /save -> /teach 50 -> /save,

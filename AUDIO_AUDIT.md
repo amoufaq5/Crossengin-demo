@@ -213,6 +213,116 @@ instead of an N's 310/0/0). The synth treats it identically.
 
 `audio_synth: OK (209 checks)` — all existing 99 + 110 new assertions pass.
 
+## R7F: Voice Activity Detection (VAD) layer
+
+Audio capture now passes through `src/io/transducers/audio_vad.nova` before
+reaching the STT seam: pure-silence frames are dropped, false transcripts on
+the `[stt unavailable]` placeholder path are avoided, and `SPEECH_START` /
+`SPEECH_END` boundary events let downstream consumers chunk on real
+utterance boundaries instead of fixed time windows.
+
+### Algorithm
+
+Per ~30 ms frame (240 samples @ 8 kHz, 480 @ 16 kHz, etc.):
+
+  * `energy = Σ |sample|` (sum of absolutes — variance proxy that avoids
+    the 64-bit overflow / NOVA pointer-threshold risk of sum-of-squares).
+  * `zcr = count of sign flips` (treats 0 as its own class so a long
+    stretch of exact zero from `_synth_phoneme_silence` doesn't produce
+    phantom crossings).
+  * Frame is "speech" iff `energy > E_THRESH AND zcr < ZCR_MAX`.
+  * Thresholds scale linearly with frame_size: `E_THRESH = 50000 *
+    frame_size / 240`, `ZCR_MAX = frame_size * 40 / 100`. At 8 kHz that's
+    50000 / 96; at 16 kHz it's 100000 / 192.
+
+### State machine (hysteresis)
+
+Four-state machine avoids flapping on per-frame edge cases:
+
+| From state | Trigger | To state | Event |
+|------------|---------|----------|-------|
+| `SILENCE` | speech frame | `SPEECH_CANDIDATE` | — |
+| `SPEECH_CANDIDATE` | K=3 speech frames in a row | `SPEECH` | `SPEECH_START` |
+| `SPEECH_CANDIDATE` | silence frame | `SILENCE` | — |
+| `SPEECH` | silence frame | `SILENCE_CANDIDATE` | — |
+| `SILENCE_CANDIDATE` | M=10 silence frames in a row | `SILENCE` | `SPEECH_END` |
+| `SILENCE_CANDIDATE` | speech frame | `SPEECH` | — |
+
+K=3 (~90 ms confirmation) matches webrtcvad's aggressive-mode minimum;
+M=10 (~300 ms confirmation) matches a relaxed conversational floor. The
+`SPEECH_START` sample index is back-dated to the first candidate frame,
+not the third, so segment boundaries align with where speech actually
+began.
+
+### Public API (`src/io/transducers/audio_vad.nova`)
+
+- `vad_state_new(sample_rate)` — clamps rate to [8000..48000], computes
+  frame_size + thresholds, initializes machine to SILENCE.
+- `vad_frame_energy(samples, off, n)` / `vad_frame_zcr(samples, off, n)` —
+  pure helpers, no state mutation. Bounds-checked.
+- `vad_classify_frame(state, energy, zcr) -> 0 | 1`.
+- `vad_process_frame(state, samples, off, n) -> event` — runs analysis +
+  state machine on one frame, returns one of `VAD_EVENT_NONE` (0),
+  `VAD_EVENT_SPEECH_START` (1), `VAD_EVENT_SPEECH_END` (2).
+- `vad_process_pcm(state, samples) -> [[start, end], ...]` — walks the
+  whole buffer, returns the list of detected speech segments.
+- `vad_filter_pcm(state, samples) -> filtered PCM` — concatenates speech
+  segments back-to-back; suitable for handing to `stt_transcribe`.
+
+### Integration: `audio_capture` + `stt_seam`
+
+- `audio_capture_to_pcm_vad(wav_path) -> [filtered_pcm, sample_rate,
+  n_segments]` — read WAV, parse PCM, run VAD, return speech-only PCM
+  plus the segment count. Zero segments on all-silence or all-noise
+  input.
+- `stt_transcribe(seam, audio_buffer)` — canonical entry point.
+  `audio_buffer` is `[pcm_list, sample_rate]` (in-memory PCM) or
+  `[wav_path]` (file on disk). Backward-compatible alongside the
+  existing `stt_transcribe_wav` / `stt_transcribe_pcm` variants.
+- `stt_transcribe_wav_vad(seam, wav_path)` — VAD-gated path: short-
+  circuits to the stub placeholder if VAD detects zero speech, so the
+  STT backend never sees pure-silence input. Returns a 4-tuple
+  `[transcript, confidence, error, n_segments]`.
+
+### Chat wiring
+
+`/listen [PATH]` admin command captures (or reads) a WAV, runs it through
+VAD, dispatches the filtered PCM to the seam's active STT backend, prints
+the transcript + segment count + backend used.
+
+### Verification (R7F)
+
+- `tests/unit/test_audio_vad.nova`: 55 assertions covering rate clamp,
+  frame-size derivation, energy/ZCR on hand-built buffers (zero,
+  constant, alternating, triangle), classifier behaviour on silence /
+  vowel / noise / low-amp signal, K=3 commit hysteresis, M=10
+  silence-release hysteresis, full-buffer walks (1-segment, 2-segment,
+  all-silence, all-noise), `vad_filter_pcm` extracts-only-speech +
+  empty-on-silence, threshold override.
+- `tests/integration/scenario_ii_vad.sh`: 17 assertions. Klatt-
+  synthesizes "AY EY OW OY" (4 diphthongs/monophthong @ 1200 samples
+  each + leading/trailing silence) → speech WAV → VAD detects 1
+  segment, 4800 filtered samples. Pure-silence WAV → 0 segments, 0
+  filtered samples. Pure-noise WAV (alternating ±3000) → 0 segments
+  (ZCR ceiling rejects high-energy high-flip noise). Chat `/help`
+  advertises `/listen`; `/listen <wav>` reports `vad_segments=N` and
+  the resolved backend.
+
+`audio_vad: OK (55 checks)`. All prior audio test suites continue to
+pass unchanged: `audio_synth: OK (209)`, `audio_capture: OK (28)`,
+`stt_seam: OK (26)`.
+
+### Future work (VAD)
+
+- Adaptive thresholds: keep a rolling silence-floor estimator so a noisy
+  recording environment doesn't need manual energy-threshold tuning.
+- Spectral entropy / sub-band energy: add an extra discriminator that
+  rejects single-frequency interference (HVAC hum, 50/60 Hz mains).
+- VAD-aware re-segmentation in STT: rather than concatenating speech
+  segments back-to-back, hand each segment to STT independently and
+  join transcripts at segment boundaries — preserves utterance pauses
+  for downstream prosody / turn-taking analysis.
+
 ## Future work
 
 - Promote OW to a true diphthong (it's /oʊ/, gliding toward /ʊ/). Backward-
