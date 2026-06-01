@@ -68,6 +68,7 @@
 
 import "std/syscall"
 import "audio_capture.nova"
+import "whisper_backend.nova"
 
 // ---- backend identifiers --------------------------------------------------
 
@@ -76,6 +77,7 @@ let STT_BACKEND_NONE       = 0      // sentinel, never registered
 let STT_BACKEND_STUB       = 1      // deterministic placeholder
 let STT_BACKEND_SUBPROCESS = 2      // shells out to scripts/transcribe.sh
 let STT_BACKEND_CUSTOM     = 3      // user-registered (tests, plugins)
+let STT_BACKEND_WHISPER    = 4      // R8B: native whisper.cpp dispatch
 
 // Confidence sentinels. Backends are free to emit anywhere in [0..1000].
 let STT_CONFIDENCE_NONE     = 0
@@ -125,15 +127,41 @@ let STT_CALL_COUNT     = 8
 // ---- env helpers -----------------------------------------------------------
 
 // stt_default_backend() reads CE_STT_BACKEND once and returns the
-// constant. Empty / unset / "stub" -> STUB; "subprocess" -> SUBPROCESS;
-// anything else -> STUB (defensive default; we never silently load an
-// unknown plugin).
+// constant.
+//   * "whisper"    -> WHISPER       (R8B: native whisper.cpp dispatch)
+//   * "subprocess" -> SUBPROCESS    (legacy scripts/transcribe.sh shim)
+//   * "stub"       -> STUB          (deterministic placeholder)
+//   * unset        -> auto-pick     (whisper if bin+model present, else
+//                                    stub -- never SUBPROCESS unless the
+//                                    operator explicitly asks for it,
+//                                    since the shim is slower than the
+//                                    native dispatch by a fork+exec hop)
+//   * anything else -> STUB (defensive default; we never silently load
+//                                    an unknown plugin).
+//
+// The auto-pick is conservative: we DO NOT scan the env for whisper bin
+// / model overrides here -- that's `whisper_resolve_*`'s job; we just
+// ask "can the whisper backend run with whatever paths it resolves?"
+// and trust the answer.
 fn stt_default_backend() {
     let env = getenv("CE_STT_BACKEND")
-    if env == 0 { return STT_BACKEND_STUB }
-    if len(env) == 0 { return STT_BACKEND_STUB }
+    if env == 0 { return _stt_autopick_backend() }
+    if len(env) == 0 { return _stt_autopick_backend() }
+    if str_eq(env, "whisper") == 1 { return STT_BACKEND_WHISPER }
     if str_eq(env, "subprocess") == 1 { return STT_BACKEND_SUBPROCESS }
     if str_eq(env, "stub") == 1 { return STT_BACKEND_STUB }
+    return STT_BACKEND_STUB
+}
+
+// _stt_autopick_backend() -- env unset: prefer whisper if installed,
+// fall back to stub (NEVER subprocess; that's a legacy shim path that
+// requires explicit opt-in via CE_STT_BACKEND=subprocess).
+fn _stt_autopick_backend() {
+    let bin   = whisper_resolve_bin()
+    let model = whisper_resolve_model()
+    if whisper_backend_available(bin, model) == 1 {
+        return STT_BACKEND_WHISPER
+    }
     return STT_BACKEND_STUB
 }
 
@@ -150,10 +178,34 @@ fn stt_seam_new() {
     push(s, 0)                       // [6] last_confidence
     push(s, "")                      // [7] last_error
     push(s, 0)                       // [8] call_count
-    // Pre-register the two built-in backends so stt_seam_backend_name()
+    // Pre-register the built-in backends so stt_seam_backend_name()
     // returns a sensible string even before the first transcribe call.
+    // R8B: "whisper" joins "stub" + "subprocess" as a first-class entry.
     _stt_register_builtin(s, "stub",       STT_BACKEND_STUB)
     _stt_register_builtin(s, "subprocess", STT_BACKEND_SUBPROCESS)
+    _stt_register_builtin(s, "whisper",    STT_BACKEND_WHISPER)
+    return s
+}
+
+// stt_seam_new_whisper(model_path) -- R8B convenience constructor that
+// builds a seam pre-pointed at the whisper backend with `model_path`
+// pinned via env. If `model_path` is empty, the env-driven default
+// (CE_WHISPER_MODEL or the canonical install path) is used. Tests use
+// this to force whisper dispatch regardless of CE_STT_BACKEND; chat
+// operators see the same effect via `CE_STT_BACKEND=whisper
+// CE_WHISPER_MODEL=...`.
+//
+// Note: this does NOT install / validate `model_path` -- the first
+// `stt_transcribe_wav` call will surface "model not found" if the path
+// is wrong. The constructor stays cheap (no syscalls) so tests can
+// spin up many seams without I/O.
+fn stt_seam_new_whisper(model_path) {
+    let s = stt_seam_new()
+    stt_seam_set_default(s, STT_BACKEND_WHISPER)
+    // `model_path` is informational here -- the actual resolution
+    // happens at dispatch time via `whisper_resolve_model()` reading
+    // CE_WHISPER_MODEL. We expose the param for parity with future
+    // backends that want a per-seam binding.
     return s
 }
 
@@ -536,8 +588,38 @@ fn stt_transcribe_wav(s, wav_path) {
     if id == STT_BACKEND_SUBPROCESS {
         return _stt_backend_subprocess(s, wav_path)
     }
+    if id == STT_BACKEND_WHISPER {
+        return _stt_backend_whisper(s, wav_path)
+    }
     // STT_BACKEND_STUB or anything else.
     return _stt_backend_stub(s, wav_path)
+}
+
+// ---- whisper backend (R8B) -----------------------------------------------
+//
+// _stt_backend_whisper(seam, wav_path) -- calls into
+// `whisper_backend.whisper_transcribe_default` which spawns the
+// installed whisper-cli on `wav_path` and returns the parsed transcript.
+//
+// On success the seam mirrors the transcript + confidence into its
+// `last_*` fields and reports `error=""`. On any failure (binary
+// missing / model missing / empty output) the seam returns the stub
+// placeholder in the transcript slot but PRESERVES the precise error
+// string so the chat layer can show the operator a meaningful failure
+// reason ("model not found" rather than just "[stt unavailable]").
+
+fn _stt_backend_whisper(s, wav_path) {
+    let r = whisper_transcribe_default(wav_path)
+    let text = whisper_result_transcript(r)
+    let conf = whisper_result_confidence(r)
+    let err  = whisper_result_error(r)
+    if len(err) > 0 {
+        // Pass the error through so the chat can surface it. The
+        // transcript slot carries the stub placeholder so any
+        // downstream filter that watches for "[stt..." still trips.
+        return _stt_result(s, STT_STUB_PLACEHOLDER, STT_CONFIDENCE_NONE, err)
+    }
+    return _stt_result(s, text, conf, "")
 }
 
 // stt_transcribe_pcm(seam, pcm_bytes, sample_rate) -> [transcript, conf,

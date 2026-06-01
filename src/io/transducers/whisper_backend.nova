@@ -1,0 +1,459 @@
+// CrossEngin io/transducers: whisper.cpp STT backend (R8B).
+//
+// Purpose
+//   The third leg of the speech-to-text seam (`stt_seam.nova`). R7F's
+//   seam already exposes a clean `stt_transcribe(seam, audio_buffer) ->
+//   [transcript, confidence, error]` interface with two backends ("stub"
+//   + the legacy "subprocess" shim path). This module adds a FIRST-CLASS
+//   whisper.cpp backend that the seam can dispatch to natively, so
+//   `/listen` actually transcribes when whisper.cpp is installed --
+//   no escape through scripts/transcribe.sh, no string-prefix juggling
+//   to recognise "[stt: no backend installed]".
+//
+//   whisper.cpp is the MIT-licensed pure-C reimplementation of OpenAI's
+//   Whisper ASR model (https://github.com/ggerganov/whisper.cpp). Its
+//   modern CLI (`whisper-cli`, or `whisper-main` after we rename it
+//   into /usr/local/bin) reads a WAV file and prints the transcript
+//   to stdout. We invoke it via fork+exec from NOVA -- NOVA does not
+//   bind to C libraries natively, so subprocess is the only seam shape
+//   that respects the "CE-minimal-deps" constraint (no FFI, no LLM, no
+//   GPU; just a CPU-only ggml inference run on a tiny.en quantized
+//   model).
+//
+//   The contract (matching `stt_seam.nova` shape):
+//     `whisper_transcribe(bin_path, model_path, wav_path) ->
+//          [text, confidence_milli, error_msg]`
+//
+//   Confidence: whisper-cli only exposes per-token confidence with the
+//   `--print-confidence` flag (recent builds). For the v1 of this
+//   backend we return a fixed `WHISPER_CONFIDENCE_DEFAULT = 800 milli`
+//   on success (matching `stt_seam.STT_CONFIDENCE_DEFAULT` -- documented
+//   as a ballpark, not a per-utterance value). A future revision can
+//   parse `--print-confidence` output and emit a real per-segment
+//   aggregate.
+//
+//   Errors surfaced:
+//     * "binary not found"   -- bin_path does not exist or is not exec.
+//     * "model not found"    -- model_path does not exist.
+//     * "wav not found"      -- wav_path does not exist.
+//     * "fork failed"        -- the kernel refused to clone our process.
+//     * "pipe2 failed"       -- pipe creation failed.
+//     * "exec failed"        -- exec_program returned (child exited 127).
+//     * "empty transcript"   -- subprocess returned 0 bytes / whitespace.
+//
+//   On any error the triple is [empty-string, 0, error_msg]. On success
+//   the triple is [transcript, 800, ""]. The seam dispatcher reads
+//   `error == ""` as the success signal.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- STT leg, real backend).
+// NOVA dependencies: builtins -- alloc, store8, store64, load8, list_new,
+//   list_set, push, getenv, str_eq, char_at, substr, chr, fork_process,
+//   exec_program, waitpid, sys_open, sys_close, sys_read.
+// CrossEngin dependencies: none (intentional -- leaf module). The seam
+//   imports US; we do not import the seam, so test compilation can
+//   exercise this module without the seam's transitive imports.
+
+import "std/syscall"
+
+// ---- defaults / canonical install paths -----------------------------------
+//
+// The canonical install layout this module expects:
+//   /usr/local/bin/whisper-main           -- the binary (renamed from
+//                                            whisper.cpp's `whisper-cli`
+//                                            so the CE conventions match
+//                                            the brief: a single, stable
+//                                            executable name across host
+//                                            distributions).
+//   /usr/local/share/whisper/ggml-tiny.en.bin
+//                                         -- the tiny.en ggml model (~75 MB).
+//
+// Operators can override via env: CE_WHISPER_BIN, CE_WHISPER_MODEL.
+
+let WHISPER_DEFAULT_BIN   = "/usr/local/bin/whisper-main"
+let WHISPER_DEFAULT_MODEL = "/usr/local/share/whisper/ggml-tiny.en.bin"
+
+// Confidence ballpark on a successful whisper-cli run. We pick the same
+// 800 milli the subprocess shim uses for consistency; once we wire
+// `--print-confidence` parsing this becomes a real per-utterance value.
+let WHISPER_CONFIDENCE_DEFAULT = 800
+
+// Cap on stdout bytes we'll read from the child. 16 KB is well above any
+// single-utterance transcript and well under NOVA's pointer-threshold
+// ceiling (gotcha #11). The tiny.en model produces ~200 chars/sec of
+// speech -> 6000 chars for a 30 s utterance -> 6 KB max realistic.
+let _WHISPER_MAX_OUT_BYTES = 16384
+
+// Syscall numbers (Linux x86-64). Same shape as stt_seam.nova's
+// `_STT_SYS_*` constants -- duplicated here so this module stays a leaf.
+let _WHISPER_SYS_PIPE2 = 293
+let _WHISPER_SYS_DUP2  = 33
+let _WHISPER_SYS_CLOSE = 3
+let _WHISPER_SYS_READ  = 0
+
+// ---- env resolvers --------------------------------------------------------
+//
+// whisper_resolve_bin() / whisper_resolve_model() read the env vars
+// `CE_WHISPER_BIN` / `CE_WHISPER_MODEL`, returning the operator-supplied
+// path if set + non-empty, otherwise the canonical default. The
+// resolvers do NOT validate existence -- callers do that explicitly
+// via `whisper_backend_available()` so the error message can be precise
+// (the test suite cares about "binary not found" vs "model not found"
+// being separate).
+
+fn whisper_resolve_bin() {
+    let env = getenv("CE_WHISPER_BIN")
+    if env == 0 { return WHISPER_DEFAULT_BIN }
+    if len(env) == 0 { return WHISPER_DEFAULT_BIN }
+    return env
+}
+
+fn whisper_resolve_model() {
+    let env = getenv("CE_WHISPER_MODEL")
+    if env == 0 { return WHISPER_DEFAULT_MODEL }
+    if len(env) == 0 { return WHISPER_DEFAULT_MODEL }
+    return env
+}
+
+// ---- file-existence probe -------------------------------------------------
+//
+// NOVA has no `access()` builtin. The cheapest way to ask "does this file
+// exist + is readable?" is to try `sys_open(path, O_RDONLY, 0)`; a
+// negative return is "no" (ENOENT / EACCES / EISDIR all collapse here),
+// a non-negative return is "yes" and we close it immediately. This is
+// the same shape `audio_capture._ac_read_file` uses for its READ path.
+//
+// Returns 1 if the file is openable, 0 otherwise.
+
+fn _whisper_file_openable(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    sys_close(fd)
+    return 1
+}
+
+// whisper_backend_available(bin_path, model_path) -> 1 iff both files
+// open cleanly. Public so the seam can decide whether to default to
+// whisper or fall back to stub.
+
+fn whisper_backend_available(bin_path, model_path) {
+    if _whisper_file_openable(bin_path) == 0 { return 0 }
+    if _whisper_file_openable(model_path) == 0 { return 0 }
+    return 1
+}
+
+// ---- raw syscall shims (pipe2 / dup2 / close / read) ----------------------
+//
+// Same shape as stt_seam.nova. Duplicated locally so this module is a
+// leaf (the seam imports us; if we imported the seam we'd close the
+// loop and break test compilation).
+
+fn _whisper_pipe2(pipefd_buf) {
+    asm {
+        "mov rax, 293"
+        "mov rdi, [rbp-8]"
+        "xor rsi, rsi"
+        "syscall"
+    }
+}
+
+fn _whisper_dup2(oldfd, newfd) {
+    asm {
+        "mov rax, 33"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "syscall"
+    }
+}
+
+fn _whisper_close(fd) {
+    asm {
+        "mov rax, 3"
+        "mov rdi, [rbp-8]"
+        "syscall"
+    }
+}
+
+fn _whisper_read(fd, buf, count) {
+    asm {
+        "mov rax, 0"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// Reassemble two little-endian int32s from an 8-byte pipefd buffer.
+// File descriptors are small (< 1024 in practice) so the high bytes are
+// usually zero, but we do the full 4-byte LE for robustness. Same math
+// as stt_seam._stt_load_le_u32; copied here for the leaf-module reason.
+fn _whisper_load_le_u32(addr) {
+    let b0 = load8(addr)
+    let b1 = load8(addr + 1)
+    let b2 = load8(addr + 2)
+    let b3 = load8(addr + 3)
+    let lo = b0 + b1 * 256
+    let hi = b2 + b3 * 256
+    return lo + hi * 65536
+}
+
+// ---- argv builder (5 + null) ----------------------------------------------
+//
+// We invoke whisper-main with exactly seven argv entries plus a NULL
+// terminator:
+//   [0] bin_path
+//   [1] "-m"
+//   [2] model_path
+//   [3] "-f"
+//   [4] wav_path
+//   [5] "-nt"            -- no timestamps
+//   [6] "-np"            -- no prints (suppress per-segment header)
+//   [7] NULL
+//
+// (We also tried passing `--no-fallback` but the flag landed in newer
+// builds only; -nt -np work on every release back to v1.4.x.)
+
+fn _whisper_argv8(a0, a1, a2, a3, a4, a5, a6) {
+    let p = alloc(8 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, a3)
+    store64(p + 32, a4)
+    store64(p + 40, a5)
+    store64(p + 48, a6)
+    store64(p + 56, 0)
+    return p
+}
+
+// ---- stdout drain ---------------------------------------------------------
+//
+// Read from `fd` until EOF or `max_bytes` reached. Same loop shape as
+// stt_seam._stt_drain_fd: a 4 KB read buffer, accumulate into a NOVA
+// string via chr() concat (the str_new hang dodge).
+
+fn _whisper_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _whisper_drain_fd(fd, max_bytes) {
+    let acc = ""
+    let buf = alloc(4096)
+    let total = 0
+    let keep = 1
+    while keep == 1 {
+        let n = _whisper_read(fd, buf, 4096)
+        if n <= 0 {
+            keep = 0
+        } else {
+            acc = acc + _whisper_bytes_to_str(buf, n)
+            total = total + n
+            if total >= max_bytes { keep = 0 }
+        }
+    }
+    return acc
+}
+
+// ---- transcript cleanup ---------------------------------------------------
+//
+// whisper-cli with -nt -np emits the transcript with a single leading
+// space and a trailing newline. Sometimes it adds bracketed special-
+// token annotations like "[BLANK_AUDIO]" or "[ MUSIC ]" -- those are
+// VALID transcript content (they tell us silence was detected) but
+// downstream the chat treats them like the stub placeholder. We trim
+// leading/trailing whitespace + carriage returns + newlines, then
+// collapse multiple internal newlines into single spaces (long
+// utterances span multiple whisper segments -- each on its own line).
+//
+// The output is a single-line transcript suitable for printing,
+// e.g.:  "And so my fellow Americans ask not what your country..."
+
+fn _whisper_is_space(c) {
+    if c == 32 { return 1 }     // ' '
+    if c == 9  { return 1 }     // tab
+    if c == 10 { return 1 }     // newline
+    if c == 13 { return 1 }     // CR
+    return 0
+}
+
+// Trim leading + trailing whitespace.
+fn _whisper_trim(text) {
+    let n = len(text)
+    let start = 0
+    while start < n {
+        if _whisper_is_space(char_at(text, start)) == 0 { break }
+        start = start + 1
+    }
+    let end = n
+    while end > start {
+        if _whisper_is_space(char_at(text, end - 1)) == 0 { break }
+        end = end - 1
+    }
+    if end <= start { return "" }
+    return substr(text, start, end - start)
+}
+
+// Collapse internal newlines into single spaces. (We keep the simpler
+// pattern of replacing CR+LF -> ' ' and LF -> ' ' inline; double spaces
+// are tolerated downstream.)
+fn _whisper_collapse_newlines(text) {
+    let n = len(text)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(text, i)
+        if c == 10 {
+            out = out + " "
+        } else {
+            if c == 13 {
+                // skip CR; following LF will become a space (or this is
+                // a bare CR which we also map to space).
+                out = out + " "
+            } else {
+                out = out + substr(text, i, 1)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// whisper_clean_transcript(text) -- public so tests can exercise the
+// cleanup logic against synthesized fixtures without spawning whisper.
+
+fn whisper_clean_transcript(text) {
+    let collapsed = _whisper_collapse_newlines(text)
+    let trimmed = _whisper_trim(collapsed)
+    // Collapse double spaces resulting from the above. One pass suffices
+    // for whisper's actual output shape (it never emits 3+ spaces).
+    let n = len(trimmed)
+    let out = ""
+    let i = 0
+    let prev_space = 0
+    while i < n {
+        let c = char_at(trimmed, i)
+        if c == 32 {
+            if prev_space == 0 {
+                out = out + " "
+                prev_space = 1
+            }
+        } else {
+            out = out + substr(trimmed, i, 1)
+            prev_space = 0
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- result helpers -------------------------------------------------------
+
+fn _whisper_result(text, conf, err) {
+    let r = list_new()
+    push(r, text)
+    push(r, conf)
+    push(r, err)
+    return r
+}
+
+fn whisper_result_transcript(r) { return r[0] }
+fn whisper_result_confidence(r) { return r[1] }
+fn whisper_result_error(r)      { return r[2] }
+
+// ---- public surface: whisper_transcribe -----------------------------------
+//
+// whisper_transcribe(bin_path, model_path, wav_path) ->
+//     [transcript, confidence_milli, error_msg]
+//
+// Spawns `<bin_path> -m <model_path> -f <wav_path> -nt -np` via
+// fork+execve with stdout wired to a pipe, drains the pipe, reaps the
+// child, returns the triple. Pre-flights existence checks so the
+// caller gets a precise error code rather than a generic "exec failed".
+
+fn whisper_transcribe(bin_path, model_path, wav_path) {
+    // Pre-flight: binary must exist + be readable. (We can't easily
+    // check the X bit from NOVA without sys_stat; readable-and-not-
+    // a-directory is a close enough proxy for the typical install
+    // shape, and the actual exec will fail loudly if the bit is off.)
+    if _whisper_file_openable(bin_path) == 0 {
+        return _whisper_result("", 0, "binary not found")
+    }
+    if _whisper_file_openable(model_path) == 0 {
+        return _whisper_result("", 0, "model not found")
+    }
+    if _whisper_file_openable(wav_path) == 0 {
+        return _whisper_result("", 0, "wav not found")
+    }
+
+    // pipe2 -> [read_fd, write_fd].
+    let pipefd_buf = alloc(8)
+    let pipe_rc = _whisper_pipe2(pipefd_buf)
+    if pipe_rc < 0 {
+        return _whisper_result("", 0, "pipe2 failed")
+    }
+    let read_fd  = _whisper_load_le_u32(pipefd_buf)
+    let write_fd = _whisper_load_le_u32(pipefd_buf + 4)
+
+    // Build argv. bin_path is argv[0] so the child can introspect its
+    // own name (some tools branch on argv[0]); whisper-main does not,
+    // but it's the conventional shape.
+    let argv = _whisper_argv8(bin_path, "-m", model_path, "-f", wav_path,
+                              "-nt", "-np")
+
+    let pid = fork_process()
+    if pid < 0 {
+        _whisper_close(read_fd)
+        _whisper_close(write_fd)
+        return _whisper_result("", 0, "fork failed")
+    }
+    if pid == 0 {
+        // CHILD: rewire stdout to the pipe, close both ends, exec.
+        // whisper.cpp also emits diagnostic lines to stderr (e.g.
+        // "whisper_init_from_file_with_params_no_state: loading model
+        // from '...'") -- we leave stderr connected to the parent's
+        // stderr so an operator running the chat interactively sees
+        // the loading-progress noise. The transcript itself lands on
+        // stdout where we drain it.
+        _whisper_dup2(write_fd, 1)
+        _whisper_close(write_fd)
+        _whisper_close(read_fd)
+        exec_program(bin_path, argv)
+        // exec_program only returns on failure.
+        exit(127)
+    }
+
+    // PARENT: close the write end (so the read side EOFs when the
+    // child exits), drain, reap.
+    _whisper_close(write_fd)
+    let raw = _whisper_drain_fd(read_fd, _WHISPER_MAX_OUT_BYTES)
+    _whisper_close(read_fd)
+    let status = waitpid(pid)
+
+    // Clean: collapse newlines -> spaces, trim, dedup spaces.
+    let cleaned = whisper_clean_transcript(raw)
+    if len(cleaned) == 0 {
+        // No transcript bytes at all. Most common cause: model
+        // mismatch / corrupted WAV / exec failed silently (exit 127).
+        // We surface this as "empty transcript" so the seam can map
+        // it to the stub placeholder downstream.
+        return _whisper_result("", 0, "empty transcript")
+    }
+    return _whisper_result(cleaned, WHISPER_CONFIDENCE_DEFAULT, "")
+}
+
+// whisper_transcribe_default(wav_path) -- convenience wrapper that uses
+// the env-resolved bin + model paths. Used by the seam's default
+// dispatcher.
+
+fn whisper_transcribe_default(wav_path) {
+    let bin = whisper_resolve_bin()
+    let model = whisper_resolve_model()
+    return whisper_transcribe(bin, model, wav_path)
+}

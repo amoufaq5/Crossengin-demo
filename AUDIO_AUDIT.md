@@ -323,6 +323,114 @@ pass unchanged: `audio_synth: OK (209)`, `audio_capture: OK (28)`,
   join transcripts at segment boundaries — preserves utterance pauses
   for downstream prosody / turn-taking analysis.
 
+## R8B: whisper.cpp STT backend (`/listen` actually transcribes)
+
+`src/io/transducers/whisper_backend.nova` lands as a first-class STT
+backend wired into the seam from R7F. The pipeline is now:
+
+```
+mic / audio_capture --> VAD (audio_vad)   --> stt_seam --> whisper-main
+                         (R7F)                  (R7F)        (R8B)
+```
+
+### Backend choice
+
+Whisper.cpp (https://github.com/ggerganov/whisper.cpp) is the
+MIT-licensed pure-C reimplementation of OpenAI Whisper. The `tiny.en`
+quantized model is ~75 MB; the `whisper-cli` binary is ~3 MB. CPU-only
+inference on a 11-second JFK utterance completes in ~1 s on a modest
+amd64 box. This is well within CE's "minimal external deps" constraint:
+no GPU, no LLM, no FFI; one fork+exec from NOVA.
+
+### Install layout (canonical)
+
+| Path                                          | Source                                  |
+|-----------------------------------------------|-----------------------------------------|
+| `/usr/local/bin/whisper-main`                 | renamed from `whisper.cpp/build/bin/whisper-cli` |
+| `/usr/local/share/whisper/ggml-tiny.en.bin`   | from `whisper.cpp/models/download-ggml-model.sh tiny.en` |
+
+Operators override via `CE_WHISPER_BIN` / `CE_WHISPER_MODEL`. The seam's
+`stt_default_backend()` auto-picks `whisper` when both files exist,
+falls back to `stub` otherwise (NEVER `subprocess` -- that's a
+legacy shim and requires explicit `CE_STT_BACKEND=subprocess`).
+
+### Public surface
+
+```nova
+whisper_transcribe(bin_path, model_path, wav_path)
+    -> [transcript, confidence_milli, error]
+whisper_transcribe_default(wav_path)        // uses env-resolved paths
+whisper_backend_available(bin, model)       // openable-ness probe
+whisper_resolve_bin() / whisper_resolve_model()
+whisper_clean_transcript(raw)               // trim + collapse newlines
+```
+
+The result triple matches `stt_seam`'s shape so the seam dispatcher is
+a one-line route in `_stt_backend_whisper`.
+
+### Errors surfaced
+
+| `error` value         | meaning                              |
+|-----------------------|--------------------------------------|
+| `""`                  | success (transcript non-empty, conf=800) |
+| `"binary not found"`  | `bin_path` not openable                |
+| `"model not found"`   | `model_path` not openable              |
+| `"wav not found"`     | `wav_path` not openable                |
+| `"pipe2 failed"`      | kernel refused pipe (rare)             |
+| `"fork failed"`       | kernel refused fork (rare)             |
+| `"empty transcript"`  | child exited 0 but produced no stdout (silent WAV / model mismatch / exec failed silently) |
+
+### Confidence
+
+`whisper-cli`'s `-nt -np` flags suppress timestamps + per-segment
+header; stdout is the transcript text only. Per-token confidence
+requires `--print-confidence` (recent builds). R8B returns a fixed
+`WHISPER_CONFIDENCE_DEFAULT = 800 milli` on success (the same
+ballpark the legacy subprocess shim uses). Wiring real per-utterance
+confidence is a future task.
+
+### Verification (R8B)
+
+- `tests/unit/test_whisper_backend.nova`: 28 assertions covering
+  the env resolvers (default + override), the openable-ness probe,
+  all three pre-flight error paths (`binary not found`, `model not
+  found`, `wav not found`), transcript cleanup (trim, newline
+  collapse, space dedup, empty/whitespace-only input), result-tuple
+  accessors, and the `stt_seam` round-trip through
+  `STT_BACKEND_WHISPER` (verified via the seam's `last_error`
+  surfacing).
+- `tests/integration/scenario_jj_whisper.sh`: 13 assertions when
+  whisper is installed (10 when it isn't). Synthesizes a Klatt
+  utterance, runs it through `whisper_transcribe`, then runs the
+  bundled `jfk.wav` and asserts the transcript contains
+  "Americans". Also exercises `stt_seam_new_whisper(model_path)`
+  + the `STT_BACKEND_STUB` fallback path. SKIPs the model-decode
+  assertions when whisper is not installed so CI on bare
+  environments still passes.
+
+On the dev container the JFK sample transcribes to:
+
+> "And so my fellow Americans ask not what your country can do for
+> you, ask what you can do for your country."
+
+(confidence=800, error="", tlen≈110 chars).
+
+### Future work (R8B)
+
+- Per-segment confidence via `--print-confidence`. Recent whisper-cli
+  builds expose per-token logprobs on stdout when this flag is set;
+  parsing that into a single milli value gives a real per-utterance
+  confidence instead of the current ballpark.
+- Streaming transcription: whisper-cli supports `-f -` for stdin PCM;
+  wiring this would drop the temp-WAV write in `stt_transcribe_pcm`
+  and let `/listen` stream directly from the capture pipeline.
+- Larger models (`base.en`, `small.en`, `medium.en`) for noisy /
+  accented audio. The download path + env-driven model selection
+  already supports any model; the trade-off is download size + RAM.
+- VAD-aware segmentation: hand each VAD-detected speech segment to
+  whisper independently rather than concatenating; preserves
+  utterance boundaries for downstream prosody analysis.
+
 ## Future work
 
 - Promote OW to a true diphthong (it's /oʊ/, gliding toward /ʊ/). Backward-
