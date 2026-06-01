@@ -1,0 +1,545 @@
+// CrossEngin io/transducers: Lucas-Kanade dense optical flow (R10D,
+// P3.3 cont. image structural feature -- the sixth pipeline after
+// Sobel + Harris + SIFT + Canny + ORB + Stereo).
+//
+// Purpose
+//   The CV motion pipeline so far covers BLOCK-based motion vectors
+//   (`video_motion_vectors.nova`, coarse per-block) and SPARSE
+//   keypoint matching (SIFT R5C + ORB R6D). What is missing is a
+//   DENSE per-pixel motion field between two consecutive frames -- the
+//   classic dense optical flow problem. Lucas-Kanade (1981) is the
+//   textbook local-window solution: pure integer arithmetic, no
+//   eigendecomposition, no sparse-matrix solver. For each pixel,
+//   compute image gradients (Ix, Iy) and the temporal gradient (It =
+//   I_next - I_prev) over a small WIN_SIZE x WIN_SIZE window centered
+//   there, then solve the 2x2 linear system:
+//
+//       [ Sum(Ix^2)   Sum(IxIy) ] [u]   [ -Sum(Ix*It) ]
+//       [                       ] [ ] = [             ]
+//       [ Sum(IxIy)   Sum(Iy^2) ] [v]   [ -Sum(Iy*It) ]
+//
+//   via the closed-form 2x2 inverse:
+//
+//       det     = (Sum Ix^2)(Sum Iy^2) - (Sum IxIy)^2
+//       u_milli = ((Sum Iy^2)(-Sum IxIt) - (Sum IxIy)(-Sum IyIt)) * 1000 / det
+//       v_milli = (-(Sum IxIy)(-Sum IxIt) + (Sum Ix^2)(-Sum IyIt)) * 1000 / det
+//
+//   Disparity-style milli encoding (u_milli = int(u * 1000)) keeps the
+//   whole thing in integer arithmetic; sub-pixel motion shows up as
+//   sub-1000 in the milli units. The det = 0 case (textureless region
+//   / aperture problem) is flagged invalid; flow at that pixel reads
+//   (0, 0, 0).
+//
+//   Gradients use the simple central / forward differences (also
+//   integer-friendly):
+//     Ix(x, y) = (I(x+1, y) - I(x-1, y)) / 2
+//     Iy(x, y) = (I(x, y+1) - I(x, y-1)) / 2
+//     It(x, y) = I_next(x, y) - I_prev(x, y)
+//
+//   The sums in the linear system are accumulated over the WIN_SIZE x
+//   WIN_SIZE window centered at the target pixel. Border pixels (where
+//   the window or the gradient stencil would fall off the image) are
+//   marked invalid -- the algorithm needs both a complete 3-point
+//   gradient stencil AND a complete window of sums.
+//
+//   Magnitude per pixel: mag_milli = sqrt(u_milli^2 + v_milli^2). We
+//   approximate sqrt with an integer Newton iteration (mirrors the
+//   image_sobel pattern). The mean magnitude over valid pixels is
+//   reported as the headline metric for the visual-perception seam.
+//
+// Algorithm caps:
+//   LK_MAX_DIM      = 256 per axis. Inner loop per pixel = O(WIN_SIZE^2)
+//                     so a 256x256 image with WIN_SIZE=5 runs ~1.6M ops.
+//                     Real callers downsample first; the 256 cap matches
+//                     R7E stereo so the same fixture sizes work end-to-end.
+//   WIN_SIZE [3..15] odd. Default 5 (matches OpenCV calcOpticalFlowPyrLK
+//                     winSize default; smaller is noisier, larger blurs
+//                     motion discontinuities).
+//
+// Public API
+//   lk_optical_flow(prev, next, w, h, win_size) -> flow_result
+//     `flow_result` = [flow_buf, valid_buf, mean_mag_milli,
+//                      valid_count, total_pixels, width, height]
+//     flow_buf  -- packed int buffer (2 ints per pixel: u_milli, v_milli)
+//     valid_buf -- packed int buffer (1 int per pixel: 0 / 1 valid flag)
+//   lk_flow_at(result, x, y) -> [u_milli, v_milli, valid]
+//   lk_flow_mean_magnitude(result) -> int (milli)
+//   lk_flow_density_label(result) -> "low" / "mid" / "high"
+//
+// Density label (per-axis pixel magnitude):
+//   low  : mean_mag < 200 milli  (stationary)
+//   mid  : 200 <= mean_mag < 2000 milli (moderate)
+//   high : mean_mag >= 2000 milli (large motion)
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, store64, load64,
+//   list_new, push, list_set, len, int_mul, int_add, int_sub, int_to_str,
+//   char_at, substr, getenv.
+// CrossEngin dependencies: image_pgm.nova (PGM-P5 decoder for the
+//   visual-perception seam + chat-admin pipe). The core algorithm has
+//   no intra-CrossEngin dependencies.
+
+import "image_pgm.nova"
+
+// ---- format constants ----------------------------------------------------
+
+// Hard cap on pixel area. 256 * 256 = 65536 == 2^16, comfortably under
+// the NOVA codegen pointer-threshold ceiling (#11). Matches R7E stereo's
+// cap so the same fixture sizes round-trip across the motion + stereo
+// pipelines.
+let LK_MAX_DIM        = 256
+let LK_MAX_PIXEL_AREA = 65536
+
+// Default Lucas-Kanade window size. 5x5 is OpenCV's default for
+// calcOpticalFlowPyrLK -- large enough to integrate enough texture for
+// the 2x2 normal-equation solve, small enough to preserve motion
+// boundaries.
+let LK_DEFAULT_WIN_SIZE = 5
+let LK_MIN_WIN_SIZE     = 3
+let LK_MAX_WIN_SIZE     = 15
+
+// Milli-disparity scale (mirrors stereo's STEREO_MILLI_PER_UNIT). u and
+// v are stored as int(u * 1000) so a flow of 3 pixels right reads u
+// == 3000.
+let LK_MILLI_PER_UNIT = 1000
+
+// Density bucket boundaries (in milli units = mean magnitude across
+// valid pixels). Stationary scenes typically read < 200 milli (noise
+// from gradient quantization); a moderate camera pan reads 500-1500;
+// rigid-shift fixtures read >= 2000.
+let LK_DENSITY_MID_MIN  = 200
+let LK_DENSITY_HIGH_MIN = 2000
+
+// Result tuple slot indices.
+let LK_R_FLOW_BUF    = 0
+let LK_R_VALID_BUF   = 1
+let LK_R_MEAN_MAG    = 2
+let LK_R_VALID_COUNT = 3
+let LK_R_TOTAL       = 4
+let LK_R_WIDTH       = 5
+let LK_R_HEIGHT      = 6
+
+// Feature-label strings (mirror image_stereo / image_orb / image_canny
+// convention).
+let LK_LABEL_DENSITY_LOW  = "image_optical_flow_density_low"
+let LK_LABEL_DENSITY_MID  = "image_optical_flow_density_mid"
+let LK_LABEL_DENSITY_HIGH = "image_optical_flow_density_high"
+
+// Magnitude-bucket atoms emitted by the visual_perception seam. These
+// summarize the SCALE of motion (mean magnitude over valid pixels) in
+// the same low / mid / high bucketing used for the density label, just
+// with different numeric thresholds.
+let LK_LABEL_MAG_LOW  = "image_optical_flow_magnitude_low"
+let LK_LABEL_MAG_MID  = "image_optical_flow_magnitude_mid"
+let LK_LABEL_MAG_HIGH = "image_optical_flow_magnitude_high"
+
+// Mean-magnitude bucket boundaries (milli units). Same scale as the
+// density label; we keep them distinct constants so the two axes can
+// drift independently if calibration ever calls for it.
+let LK_MAG_MID_MIN  = 500
+let LK_MAG_HIGH_MIN = 2000
+
+// ---- raw int-buffer accessors -------------------------------------------
+//
+// We pack (u_milli, v_milli) per pixel into a single int buffer indexed
+// by `2 * pixel_idx + slot`. valid_buf carries one int per pixel. Mirrors
+// the SGM cost-volume pattern in image_stereo.nova so memory ownership +
+// pointer arithmetic look the same across the IO layer.
+
+fn _lk_buf_alloc(num_ints, init_value) {
+    let bytes = int_mul(num_ints, 8)
+    let buf = alloc(int_add(bytes, 8))
+    let i = 0
+    while i < num_ints {
+        store64(int_add(buf, int_mul(i, 8)), init_value)
+        i = int_add(i, 1)
+    }
+    return buf
+}
+
+fn _lk_set(buf, idx, val) {
+    store64(int_add(buf, int_mul(idx, 8)), val)
+}
+
+fn _lk_get(buf, idx) {
+    return load64(int_add(buf, int_mul(idx, 8)))
+}
+
+// ---- result tuple helpers -----------------------------------------------
+
+fn _lk_result(flow_buf, valid_buf, mean_mag, valid_count, total, width, height) {
+    let r = list_new()
+    push(r, flow_buf)
+    push(r, valid_buf)
+    push(r, mean_mag)
+    push(r, valid_count)
+    push(r, total)
+    push(r, width)
+    push(r, height)
+    return r
+}
+
+fn _lk_fail() {
+    return _lk_result(0, 0, 0, 0, 0, 0, 0)
+}
+
+// ---- normalisation helpers ----------------------------------------------
+
+fn _lk_clamp_win_size(win_size) {
+    if win_size < LK_MIN_WIN_SIZE { return LK_DEFAULT_WIN_SIZE }
+    if win_size > LK_MAX_WIN_SIZE { return LK_MAX_WIN_SIZE }
+    let r = win_size
+    let q = r / 2
+    let twice_q = int_mul(2, q)
+    if twice_q == r { r = int_add(r, 1) }
+    if r > LK_MAX_WIN_SIZE { r = LK_MAX_WIN_SIZE }
+    return r
+}
+
+// ---- gradient helpers ---------------------------------------------------
+//
+// Central differences along x / y; forward difference (next - prev) along t.
+// All inputs are 8-bit grayscale; the central differences read 0..255
+// values and produce results in roughly -127..127.
+
+fn _lk_ix(data_ptr, width, x, y) {
+    let row_off = int_mul(y, width)
+    let left  = load8(int_add(data_ptr, int_add(row_off, int_sub(x, 1))))
+    let right = load8(int_add(data_ptr, int_add(row_off, int_add(x, 1))))
+    return int_sub(right, left) / 2
+}
+
+fn _lk_iy(data_ptr, width, x, y) {
+    let up   = load8(int_add(data_ptr, int_add(int_mul(int_sub(y, 1), width), x)))
+    let down = load8(int_add(data_ptr, int_add(int_mul(int_add(y, 1), width), x)))
+    return int_sub(down, up) / 2
+}
+
+fn _lk_it(prev_ptr, next_ptr, width, x, y) {
+    let off = int_add(int_mul(y, width), x)
+    let p = load8(int_add(prev_ptr, off))
+    let n = load8(int_add(next_ptr, off))
+    return int_sub(n, p)
+}
+
+// ---- integer sqrt (Newton iteration; mirrors image_sobel / image_harris) -
+
+fn _lk_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 2  { return n }
+    let x = n
+    let y = int_add(x, 1) / 2
+    let cont = 1
+    while cont == 1 {
+        if y < x {
+            x = y
+            y = int_add(y, n / y) / 2
+        } else {
+            cont = 0
+        }
+    }
+    return x
+}
+
+// ---- core: Lucas-Kanade per-pixel flow ----------------------------------
+//
+// lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+//   -> [flow_buf, valid_buf, mean_mag, valid_count, total, width, height]
+//
+// For each interior pixel (where the WIN_SIZE x WIN_SIZE window AND the
+// 3-point gradient stencil fit), accumulate the five sums, solve the
+// 2x2 system, store (u_milli, v_milli) in flow_buf and the valid flag
+// in valid_buf. Border / degenerate pixels read (0, 0, 0).
+
+fn lk_optical_flow(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    // The gradient stencil needs (x-1, x+1) and (y-1, y+1); the window
+    // needs (x +/- half, y +/- half). The combined stencil requires
+    // (half + 1) padding on every side.
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Accumulate the 5 sums over the WIN_SIZE x WIN_SIZE window
+            // centered at (x, y).
+            let sum_ix2  = 0
+            let sum_iy2  = 0
+            let sum_ixiy = 0
+            let sum_ixit = 0
+            let sum_iyit = 0
+            let dy = 0 - half
+            while dy <= half {
+                let py = int_add(y, dy)
+                let dx = 0 - half
+                while dx <= half {
+                    let px = int_add(x, dx)
+                    let ix = _lk_ix(prev_ptr, width, px, py)
+                    let iy = _lk_iy(prev_ptr, width, px, py)
+                    let it = _lk_it(prev_ptr, next_ptr, width, px, py)
+                    sum_ix2  = int_add(sum_ix2,  int_mul(ix, ix))
+                    sum_iy2  = int_add(sum_iy2,  int_mul(iy, iy))
+                    sum_ixiy = int_add(sum_ixiy, int_mul(ix, iy))
+                    sum_ixit = int_add(sum_ixit, int_mul(ix, it))
+                    sum_iyit = int_add(sum_iyit, int_mul(iy, it))
+                    dx = int_add(dx, 1)
+                }
+                dy = int_add(dy, 1)
+            }
+            // 2x2 inverse:
+            //   det     = sum_ix2 * sum_iy2 - sum_ixiy * sum_ixiy
+            //   u_milli = (sum_iy2 * (-sum_ixit) - sum_ixiy * (-sum_iyit)) * 1000 / det
+            //   v_milli = (-sum_ixiy * (-sum_ixit) + sum_ix2 * (-sum_iyit)) * 1000 / det
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // Aperture problem / no texture -- leave (0, 0) flow,
+                // mark invalid. Already zero-initialized.
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,                 u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1),     v_milli)
+                _lk_set(valid_buf, pixel_idx,               1)
+                valid_count = int_add(valid_count, 1)
+                // Accumulate magnitude. sqrt(u^2 + v^2). u,v are milli.
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// ---- accessors -----------------------------------------------------------
+
+// lk_flow_at(result, x, y) -> [u_milli, v_milli, valid]
+//   OOB / no-result / invalid-pixel returns [0, 0, 0].
+fn lk_flow_at(result, x, y) {
+    let triple = list_new()
+    push(triple, 0)
+    push(triple, 0)
+    push(triple, 0)
+    if len(result) < 7 { return triple }
+    let width  = result[LK_R_WIDTH]
+    let height = result[LK_R_HEIGHT]
+    let flow_buf  = result[LK_R_FLOW_BUF]
+    let valid_buf = result[LK_R_VALID_BUF]
+    if width  <= 0 { return triple }
+    if height <= 0 { return triple }
+    if x < 0       { return triple }
+    if y < 0       { return triple }
+    if x >= width  { return triple }
+    if y >= height { return triple }
+    if flow_buf  == 0 { return triple }
+    if valid_buf == 0 { return triple }
+    let pixel_idx = int_add(int_mul(y, width), x)
+    let u = _lk_get(flow_buf, int_mul(pixel_idx, 2))
+    let v = _lk_get(flow_buf, int_add(int_mul(pixel_idx, 2), 1))
+    let valid = _lk_get(valid_buf, pixel_idx)
+    list_set(triple, 0, u)
+    list_set(triple, 1, v)
+    list_set(triple, 2, valid)
+    return triple
+}
+
+fn lk_flow_mean_magnitude(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_MEAN_MAG]
+}
+
+fn lk_flow_valid_count(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_VALID_COUNT]
+}
+
+fn lk_flow_total(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_TOTAL]
+}
+
+fn lk_flow_width(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_WIDTH]
+}
+
+fn lk_flow_height(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_HEIGHT]
+}
+
+// lk_flow_density_label(result) -> "low" / "mid" / "high"
+//   Categorises the MEAN-MAGNITUDE-OVER-VALID-PIXELS bucket. Bucket
+//   names mirror image_stereo_density_label so the visual_perception
+//   seam can emit them as feature atoms uniformly.
+fn lk_flow_density_label(result) {
+    let mean_mag = lk_flow_mean_magnitude(result)
+    if mean_mag < LK_DENSITY_MID_MIN  { return LK_LABEL_DENSITY_LOW }
+    if mean_mag < LK_DENSITY_HIGH_MIN { return LK_LABEL_DENSITY_MID }
+    return LK_LABEL_DENSITY_HIGH
+}
+
+// lk_flow_magnitude_label(mean_mag) -> "image_optical_flow_magnitude_low"
+//   etc. Same bucketing as the density label; kept separate so the
+//   visual-perception seam can emit one atom for the magnitude scale and
+//   another for the density label without re-running the classifier.
+fn lk_flow_magnitude_label(mean_mag) {
+    if mean_mag < LK_MAG_MID_MIN  { return LK_LABEL_MAG_LOW }
+    if mean_mag < LK_MAG_HIGH_MIN { return LK_LABEL_MAG_MID }
+    return LK_LABEL_MAG_HIGH
+}
+
+// ---- chat admin helpers --------------------------------------------------
+//
+// `/flow prev.pgm next.pgm` admin -- the chat dispatches `lk_pgm_args(arg)`
+// directly (one io_println call), so this module owns the full PGM-parse
+// + lk_optical_flow + summary pipeline. The image_pgm import lives at
+// the top of the file.
+
+fn _lk_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn lk_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/flow needs two PATHs -- usage: /flow prev.pgm next.pgm)"
+    }
+    let parts = _lk_split_two(arg)
+    return lk_pgm_paths(parts[0], parts[1])
+}
+
+fn lk_pgm_paths(path_prev, path_next) {
+    if len(path_prev) == 0 {
+        return "(/flow needs two PATHs -- usage: /flow prev.pgm next.pgm)"
+    }
+    if len(path_next) == 0 {
+        return "(/flow needs TWO paths -- got 1)"
+    }
+    let r_p = pgm_parse_file(path_prev)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(flow FAILED on prev: " + err_p + ")"
+    }
+    let r_n = pgm_parse_file(path_next)
+    let err_n = pgm_result_error(r_n)
+    if len(err_n) > 0 {
+        return "(flow FAILED on next: " + err_n + ")"
+    }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    let w_n = pgm_result_width(r_n)
+    let h_n = pgm_result_height(r_n)
+    if w_p != w_n {
+        return "(flow FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if h_p != h_n {
+        return "(flow FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if w_p > LK_MAX_DIM { return "(flow FAILED: prev too large -- max 256x256)" }
+    if h_p > LK_MAX_DIM { return "(flow FAILED: prev too large -- max 256x256)" }
+    let d_p = pgm_result_data(r_p)
+    let d_n = pgm_result_data(r_n)
+    let result = lk_optical_flow(d_p, d_n, w_p, h_p, LK_DEFAULT_WIN_SIZE)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    let valid    = lk_flow_valid_count(result)
+    return "(flow " + int_to_str(w_p) + "x" + int_to_str(h_p)
+        + " mean_mag=" + int_to_str(mean_mag)
+        + "milli valid=" + int_to_str(valid)
+        + " " + lk_flow_density_label(result) + ")"
+}
+
+// ---- visual-perception integration --------------------------------------
+//
+// lk_append_features_if_paired(feats, prev_ptr, width, height)
+//   Reads the CE_VP_FLOW_PREV env var (a path to the PREVIOUS frame
+//   PGM); when set, decodes it, validates matching dims + minimum size,
+//   runs lk_optical_flow, and appends two atoms to `feats`:
+//     image_optical_flow_magnitude_<low|mid|high>  -- mean motion scale
+//     image_optical_flow_density_<low|mid|high>    -- density bucket
+//   The labels are silent (no atoms appended) when the env var is
+//   unset, the PGM fails to decode, or dimensions don't match -- the
+//   flow seam should never make /see fall over on an unpaired image.
+//
+//   Naming: the env var holds the PREVIOUS frame and `prev_ptr` (the
+//   image currently being decoded by the seam) is treated as the NEXT
+//   frame; flow is computed prev->next, matching the algorithmic
+//   convention.
+
+fn lk_append_features_if_paired(feats, next_ptr, width, height) {
+    let env = getenv("CE_VP_FLOW_PREV")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if width  > LK_MAX_DIM { return 0 }
+    if height > LK_MAX_DIM { return 0 }
+    let r_p = pgm_parse_file(env)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 { return 0 }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    if w_p != width  { return 0 }
+    if h_p != height { return 0 }
+    let d_p = pgm_result_data(r_p)
+    let result = lk_optical_flow(d_p, next_ptr, width, height,
+                                 LK_DEFAULT_WIN_SIZE)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    push(feats, lk_flow_magnitude_label(mean_mag))
+    push(feats, lk_flow_density_label(result))
+    return 1
+}

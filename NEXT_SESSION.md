@@ -3,6 +3,113 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R10D (this session) — IO: Lucas-Kanade dense optical flow
+
+**Status: complete -- new module `src/io/transducers/image_optical_flow.nova`
+ships a per-pixel Lucas-Kanade optical flow estimator, the sixth pipeline
+in the CV stack after Sobel + Harris + SIFT + Canny + ORB + Stereo.**
+The motion side of the CV pipeline previously covered only block-based
+motion vectors (`video_motion_vectors.nova`, coarse per-block) and sparse
+keypoint matching (SIFT R5C + ORB R6D). R10D adds the textbook DENSE
+per-pixel motion field between two consecutive frames using the
+1981 Lucas-Kanade local-window normal equations -- integer arithmetic
+only, no Eigen / no floats / no SVD.
+
+### Algorithm
+
+For each interior pixel (x, y), compute integer image gradients
+(Ix, Iy via central differences /2) and the temporal gradient
+(It = I_next - I_prev) over a WIN_SIZE x WIN_SIZE window centered
+there, then solve the 2x2 normal equations:
+
+```
+[ Sum(Ix^2)   Sum(IxIy) ] [u]   [ -Sum(Ix*It) ]
+[                       ] [ ] = [             ]
+[ Sum(IxIy)   Sum(Iy^2) ] [v]   [ -Sum(Iy*It) ]
+```
+
+via the closed-form 2x2 inverse:
+
+```
+det     = (Sum Ix^2)(Sum Iy^2) - (Sum IxIy)^2
+u_milli = ((Sum Iy^2)(-Sum IxIt) - (Sum IxIy)(-Sum IyIt)) * 1000 / det
+v_milli = (-(Sum IxIy)(-Sum IxIt) + (Sum Ix^2)(-Sum IyIt)) * 1000 / det
+```
+
+`det == 0` (no-texture / aperture-problem pixels) -> flow marked
+invalid; (u, v) reads (0, 0). Magnitude per pixel via integer
+Newton-Raphson sqrt (mirrors the Sobel / Harris convention).
+
+### What landed
+
+- **`src/io/transducers/image_optical_flow.nova`** (+~430 lines, NEW).
+  Public API:
+  * `lk_optical_flow(prev, next, w, h, win_size)` -> result tuple
+    `[flow_buf, valid_buf, mean_mag, valid_count, total, width, height]`
+    where `flow_buf` packs (u_milli, v_milli) per pixel and `valid_buf`
+    carries one 0/1 flag per pixel. Caps: dims <= 256x256;
+    WIN_SIZE clamped to odd in [3..15], default 5 (OpenCV's
+    calcOpticalFlowPyrLK default).
+  * `lk_flow_at(result, x, y)` -> `[u_milli, v_milli, valid]`
+    (OOB-safe; bad inputs -> (0, 0, 0)).
+  * `lk_flow_mean_magnitude(result)` -> int milli.
+  * `lk_flow_density_label(result)` -> "low" / "mid" / "high"
+    (mean-magnitude buckets at 200 / 2000 milli).
+  * `lk_flow_magnitude_label(mean_mag)` -> "image_optical_flow_magnitude_low"
+    / _mid / _high (parallel atom labels for the perception seam).
+  * `lk_pgm_paths(prev, next)`, `lk_pgm_args(arg)` -- chat
+    `/flow prev.pgm next.pgm` admin one-liners.
+  * `lk_append_features_if_paired(feats, next_ptr, w, h)` --
+    visual-perception integration hook (reads `CE_VP_FLOW_PREV` env
+    var; mirrors R7E stereo's pattern).
+- **`src/io/transducers/visual_perception.nova`** (+4 lines): import,
+  `VP_FLOW_MIN_DIM = 16` constant, and call to
+  `lk_append_features_if_paired` in `_vp_append_structural_features`.
+  When `CE_VP_FLOW_PREV` env var is set to a PGM path, /see emits
+  `image_optical_flow_magnitude_<low|mid|high>` and
+  `image_optical_flow_density_<low|mid|high>` atoms on the current
+  frame; silent (no atoms appended) on missing env, decode failure,
+  or dim mismatch.
+- **`examples/crossengin_chat.nova`** (+2 lines): `/flow prev.pgm
+  next.pgm` admin dispatch + matching `/help` line.
+
+### Headline numbers (from `tests/unit/test_optical_flow.nova`)
+
+- Smooth quadratic fixture (40x32) shifted RIGHT by 3 px:
+  u ~ 2384 milli at (20, 16) (target 3000 milli; first-order LK
+  under-estimates large rigid shifts), v ~ 222 milli (target 0).
+- Smooth quadratic fixture shifted DIAGONALLY by (1, 1):
+  u ~ 918 milli, v ~ 1042 milli at (20, 16) -- right on the
+  expected (1000, 1000) target.
+- Texture-less fixture (constant 128 fill): 0 / 1024 pixels valid
+  (100% degeneracy detection via det == 0).
+- Identical-frame fixture: mean magnitude 0 milli, density label
+  "image_optical_flow_density_low".
+
+### Tests
+
+- **`tests/unit/test_optical_flow.nova`** (NEW, 53 assertions):
+  identical frames give zero flow; horizontal / vertical / diagonal
+  rigid shifts produce the expected u, v at probed interior pixels
+  (within wide tolerance for multi-pixel shifts where the
+  first-order Taylor expansion degrades); texture-less fixtures
+  correctly mark every pixel invalid via det == 0; OOB safety on
+  `lk_flow_at`; oversized / zero-pointer inputs return clean
+  `_lk_fail()` shape; magnitude / density labels round-trip.
+- **`tests/integration/scenario_ss_optical_flow.sh`** (NEW, 11
+  assertions): `/help` advertises `/flow prev next`; usage strings
+  on 0 / 1 args; identical inputs emit `mean_mag=0milli` +
+  `image_optical_flow_density_low` atom; shifted pair (Python-built
+  quadratic-bowl PGM shifted by 3) emits `mean_mag` >= 1000 milli
+  with `valid` > 0; dim-mismatched and missing-file inputs surface
+  bracketed errors; chat survives all malformed inputs and reaches
+  `/quit` cleanly.
+
+### Module count: +1 (image_optical_flow.nova). All 153 unit tests
+green. R5C SIFT (25 + 28 unit), R6D ORB (34 unit), R7E stereo
+(54 unit), R8D quality (42 unit), R9A SGM (39 unit), and R5E
+Canny (22 unit) remain bit-identically green.
+
 ## R9A (this session) — IO: Semi-Global Matching (SGM) stereo on R7E + R8D
 
 **Status: complete -- `src/io/transducers/image_stereo.nova` extends

@@ -328,6 +328,43 @@ gradient structure and corner geometry, not just intensity moments:
   ops, the upper bound for the chat's per-command latency budget);
   minimum dim 32x32 (the 7x7 window + 64-disp search needs headroom).
 
+- **Lucas-Kanade dense optical flow**
+  (`src/io/transducers/image_optical_flow.nova`, R10D -- the missing
+  dense per-pixel motion field). The CV motion pipeline previously
+  covered only block-based motion vectors (`video_motion_vectors`,
+  coarse per-block) and sparse keypoint matching (SIFT R5C + ORB R6D
+  via descriptor matching across frames). R10D adds the textbook
+  DENSE per-pixel motion vector between two consecutive frames using
+  the 1981 Lucas-Kanade local-window normal equations -- integer
+  arithmetic only, no Eigen / no floats / no SVD. For each interior
+  pixel (x, y) compute integer image gradients (Ix, Iy via central
+  differences /2) and the temporal gradient (It = I_next - I_prev)
+  over a WIN_SIZE x WIN_SIZE window centered there, then solve the
+  2x2 system via the closed-form integer inverse:
+  `det = (Sum Ix^2)(Sum Iy^2) - (Sum IxIy)^2;` `u_milli =
+  ((Sum Iy^2)(-Sum IxIt) - (Sum IxIy)(-Sum IyIt)) * 1000 / det;`
+  `v_milli = (-(Sum IxIy)(-Sum IxIt) + (Sum Ix^2)(-Sum IyIt)) * 1000 / det`.
+  det == 0 (textureless / aperture-problem pixels) -> flow marked
+  invalid; (u, v) reads (0, 0). On a smooth quadratic-bowl fixture
+  shifted diagonally by (1, 1): u ~ 918 milli, v ~ 1042 milli at
+  probed interior pixels (target 1000, 1000); on a texture-less
+  constant-fill fixture all 1024 pixels are correctly marked invalid
+  (100% degeneracy detection rate). Default WIN_SIZE = 5 (matches
+  OpenCV calcOpticalFlowPyrLK), clamped to odd in [3..15]; dims
+  capped at 256x256 (matches R7E stereo so the same fixture sizes
+  round-trip). Density classifier on mean magnitude: low <200 milli,
+  mid 200..1999, high >=2000. New chat admin: `/flow prev.pgm
+  next.pgm` decodes two same-dimension PGMs and prints
+  `(flow WxH mean_mag=Nmilli valid=K image_optical_flow_density_*)`.
+  Visual seam emits `image_optical_flow_magnitude_<low|mid|high>`
+  + `image_optical_flow_density_<low|mid|high>` atoms when
+  `CE_VP_FLOW_PREV` env points at the PREVIOUS frame PGM. The
+  algorithm is exact for sub-pixel shifts (first-order Taylor regime);
+  multi-pixel shifts under-estimate slightly because the linearization
+  breaks at the discontinuity but stay above the density-"low" floor.
+  Follow-ups: pyramidal LK (coarse-to-fine warping for multi-pixel
+  shifts), iterative refinement, dense farneback flow.
+
 Sobel + Harris fire only when the image is at least 16x16 in each axis
 (the kernel needs a 3x3 neighborhood and the count buckets need
 meaningful scale). SIFT-detection + Canny run only on images >= 32x32

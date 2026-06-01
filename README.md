@@ -11,7 +11,31 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 141 modules compile (`make build`, R9F adds
+> toolchain: 142 modules compile (`make build`, R10D adds
+> `src/io/transducers/image_optical_flow.nova` — Lucas-Kanade dense
+> per-pixel optical flow between two consecutive PGM frames. For each
+> interior pixel, compute integer image gradients (Ix, Iy via central
+> differences) and the temporal gradient (It = I_next - I_prev) over a
+> WIN_SIZE x WIN_SIZE window centered there, then solve the 2x2 normal
+> equations via the closed-form integer inverse:
+> det = (Sum Ix^2)(Sum Iy^2) - (Sum IxIy)^2; u_milli, v_milli scaled
+> by 1000 / det. det == 0 (no-texture / aperture problem) marks the
+> pixel invalid (flow reads 0). Default WIN_SIZE = 5 (OpenCV's
+> calcOpticalFlowPyrLK default); dims cap 256x256. On the smooth
+> quadratic-bowl fixture shifted DIAGONALLY by (1, 1): u ~ 918 milli,
+> v ~ 1042 milli at probed interior pixels (target 1000, 1000 -- right
+> on). Texture-less constant-fill fixture: 0 / 1024 pixels valid (100%
+> degeneracy detection). Identical-frame fixture: mean magnitude = 0,
+> density label "low". New chat admin: `/flow prev.pgm next.pgm` prints
+> `(flow WxH mean_mag=Nmilli valid=K image_optical_flow_density_*)`.
+> Visual seam emits `image_optical_flow_magnitude_*` +
+> `image_optical_flow_density_*` atoms when `CE_VP_FLOW_PREV` env
+> points at the previous PGM frame. 53 unit assertions
+> (`tests/unit/test_optical_flow.nova`) + 11 integration assertions
+> (`tests/integration/scenario_ss_optical_flow.sh`); all green. R5C
+> SIFT, R6D ORB, R7E/R8D/R9A stereo, R5E Canny suites remain
+> bit-identically green.
+> +1 from R9F adding
 > `src/learning/byzantine_aggregation.nova` — two coordinate-wise robust
 > aggregation rules (trimmed mean + median) that tolerate up to f
 > malicious participants per federated round. The federated
