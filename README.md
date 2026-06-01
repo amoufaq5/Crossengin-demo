@@ -16,8 +16,8 @@ computational units rather than orchestrating a pipeline of modules.
 > key-exchange prerequisite the federated SecAgg MVP could not ship
 > without (Item 6 of the brief), now landed as a leaf primitive
 > alongside `chacha20.nova` and `poly1305.nova`; documented in
-> [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md). **P3.8r extension (this
-> session):** `src/learning/secure_aggregation.nova` extended with
+> [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md). **P3.8r extension:**
+> `src/learning/secure_aggregation.nova` extended with
 > dropout-resilience -- the `sa_recompute_without` /
 > `sa_reconcile_for_dropped` pair, FED_DROPOUT + FED_RECON_MASKED wire
 > formatters + parsers, and the `CE_FED_ROUND_DEADLINE_MS` env helper
@@ -25,7 +25,24 @@ computational units rather than orchestrating a pipeline of modules.
 > now ends with the coordinator's sum equal to x_A + x_C exactly (no
 > garbage mask residue), shipped without adding a new module --
 > dropout resilience moved from "limitations" to "shipped" in
-> SECAGG_AUDIT.md,
+> SECAGG_AUDIT.md.
+> **P3.9 extension (this session):** `bn_modpow_ct` (Montgomery ladder;
+> constant-time per bit) added to `src/safety/bignum.nova` so DH/ECDH
+> private exponents can be exported to remote-callable paths without
+> leaking via wall-clock timing. **DH key agreement landed (v2-sa-dh):**
+> `src/learning/secure_aggregation.nova` extended with
+> `sa_dh_generate_keys` / `sa_dh_shared_secret_for_peer` /
+> `sa_register_peer_dh` + FED_DH_PUBLIC wire format/parse/dispatch +
+> the `CE_SECAGG_DH` env flag; the coordinator collects soul pubkeys
+> during the handshake and broadcasts them back via the new
+> `_fed_broadcast_dh_pubkeys` phase; the chat soul gates on a single
+> `CE_SECAGG_DH` env probe and the rest of the path runs through the
+> existing v2-sa pipeline (the DH-derived shared secret slots in where
+> the pre-shared token used to). Caveats called out loudly in
+> SECAGG_AUDIT.md: 256-bit DH prime + weak-random private-key generation
+> + `p_25519` is a field prime not a safe DH prime -- the MVP
+> demonstrates the wire protocol + flow, not the cryptographic
+> strength,
 > +1 from `kg/ann_index.nova`
 > added in P3.4 LSH approximate-nearest-neighbor over atom embeddings,
 > +1 from `realtime_pacer.nova`
@@ -75,27 +92,45 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 131 unit-test suites pass
-> (`make test`, +1 suite / +25 assertions from `test_image_sift.nova`
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 135 unit-test suites pass
+> (`make test`,
+> +1 suite / +46 assertions from `test_deflate.nova` added in
+> P3.1.PNG full DEFLATE inflate -- extends the Item-3 stored-only
+> path (BTYPE=00) with RFC 1951 BTYPE=01 static Huffman + BTYPE=02
+> dynamic Huffman so the pure-NOVA PNG decoder ingests any standard
+> grayscale-8 PNG from a camera, phone, screenshot tool, or web
+> download (zlib level 0..9 all decode). Test coverage: stored-
+> block regression; static "hello" round-trip; static empty block;
+> 8 'a' overlapping copy (length > distance); 12 'A' + 'B' and
+> 12 'X' length-extra-bits; HELLO + 270 X + HELLO + 5 Y multi-byte
+> distance (> 256); a 22,500-byte dynamic-Huffman pangram round-
+> trip; BTYPE=11 reserved rejection. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 suite / +25 assertions from `test_image_sift.nova`
 > added in P3.3 cont. SIFT keypoint DETECTION: uniform-grey 32x32 -> 0
 > keypoints; single bright 5x5 spot at (13,13) in 32x32 -> 1 keypoint at
 > (15,15) with contrast 55; 32x32 four-spots fixture -> 4 keypoints
 > (one per spot) at the spot centers; dimension caps reject < 32x32 and
 > > 256x256; per-keypoint accessors round-trip; max_keypoints cap
 > honored, documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
-> +1 suite / +54 assertions from `test_bignum.nova` added in
+> +1 suite / +66 assertions from `test_bignum.nova` added in
 > P3.9 pure-NOVA 256-bit bignum library: `bn_new` / `bn_from_int` /
 > `bn_from_hex` / `bn_to_hex` / `bn_zero` / `bn_eq` / `bn_cmp` / `bn_add`
 > / `bn_sub` / `bn_mul` (full 512-bit product as `[hi, lo]`) / `bn_mod`
 > / `bn_modmul` / `bn_modpow`, with the textbook `2^10 mod 1000 = 24`
 > and the Curve25519 prime sanity check `2^255 mod (2^255-19) = 19`
-> verified end-to-end; this unblocks the SecAgg DH key-agreement layer
-> + RSA verify + future X25519 ECDH on top of `src/safety/bignum.nova`
-> -- side-channel caveat is that MVP `bn_modpow` is NOT constant-time
-> (square-and-multiply leaks Hamming weight); the const-time
-> reimplementation is a follow-up project per primitive, documented in
+> verified end-to-end. The const-time follow-up `bn_modpow_ct`
+> (Montgomery ladder; +12 of the 66 assertions: equivalence with
+> `bn_modpow` on a 100-vector deterministic sweep + textbook +
+> Curve25519 + timing-comparison report) closes the side-channel
+> leak on the exponent's Hamming weight so DH/ECDH private-key
+> exponents can be exported to remote-callable paths without leaking
+> via wall-clock timing. `bn_modpow` is now documented loudly as
+> "fast, side-channel-unsafe; offline self-tests only";
+> `bn_modpow_ct` is the crypto-safe variant consumers must use for
+> any private exponent. Documented in
 > [`SECAGG_AUDIT.md`](./SECAGG_AUDIT.md) ("bignum landed; DH key
-> exchange unblocked"),
+> exchange unblocked + shipped as v2-sa-dh"),
 > +1 suite / +27 assertions from `test_realtime_pacer.nova`
 > added in P0.6 real-time wall-clock pacer,
 > +1 suite / +37 assertions from `test_decision_log_durable.nova` added in
@@ -115,7 +150,13 @@ computational units rather than orchestrating a pipeline of modules.
 > P1.4 PSK secure-channel continuation -- RFC 7539 ChaCha20 + Poly1305
 > primitives plus the per-frame PSK envelope, documented in
 > [`TLS_AUDIT.md`](./TLS_AUDIT.md),
-> +33 assertions added to `test_secure_aggregation.nova` (93 -> 126)
+> +33 assertions added to `test_secure_aggregation.nova` (93 -> 126; further
+> extended to 157 in P3.9 DH key agreement below: 2-soul DH-derived
+> pair-mask match, full 2-soul DH sum demo, FED_DH_PUBLIC wire
+> formatter + parser + dispatch, default-off `CE_SECAGG_DH` env probe,
+> `sa_register_peer_dh` idempotency, `sa_dh_generate_keys` validity --
+> all of which exercise `bn_modpow_ct` on 256-bit private exponents
+> via DH commutativity)
 > in P3.8r dropout-resilience: 3-soul A/B/C round where B drops mid-
 > round; A + C reconcile by removing m_AB and m_BC mask contributions;
 > coordinator's sum equals x_A + x_C exactly (200, the brief's
@@ -547,6 +588,38 @@ make install
 ./bin/crossengin-spine            # safety + IO + persistence spine
 ./bin/crossengin-kg-publisher     # distributed-substrate seam: publisher
 ./bin/crossengin-kg-subscriber    # distributed-substrate seam: subscriber
+```
+
+### Operations utilities
+
+Three small shell tools cover the operations layer around the binaries:
+preflight, structured-log mode, and snapshot diff.
+
+```sh
+# Preflight: green/yellow/red checklist of host env + deps + paths + a
+# 3-second TCP probe of en.wikipedia.org (used by `/learn TOPIC`). Exits 0
+# when every critical check passes; 1 if any critical fails. Optional
+# helpers (ffmpeg, ImageMagick, espeak, aplay, parecord, whisper-cli,
+# vosk-transcriber, wat2wasm, wasmtime, node, python3) appear as WARN
+# when missing -- they do NOT gate the exit code.
+bash scripts/crossengin-doctor.sh
+
+# Structured JSON logging. `CE_LOG_JSON=1` flips the chat's per-turn
+# operator log lines (the "agent>" preamble + the "perceive(m=N,unk=N)"
+# line) and the daemon's per-cycle log line to one-line JSON objects:
+#   {"ts":<int>,"level":"info","session":"<id>","event":"perceive",
+#    "msg":"<input>","m":<int>,"unk":<int>}
+# Default (env unset) preserves the legacy human-readable output BIT-
+# IDENTICAL so existing log aggregators / web.py /metrics scrape stay
+# valid. Daemon adds extra fields (hz, reason, mood_v, mod, routed).
+CE_LOG_JSON=1 ./bin/crossengin-chat
+CE_LOG_JSON=1 ./bin/crossengin
+
+# Snapshot file diff: structural delta between two ./bin/crossengin*
+# snapshot files. Reports atoms added/removed (by kg+label), beliefs
+# changed (signed alpha/beta delta), sections added/removed, and soul
+# mood/OCEAN drift. ANSI colours on a tty, plain when piped.
+bash scripts/snap_diff.sh old.snap new.snap
 ```
 
 ### Distributed KG sync (publisher / subscriber demo)

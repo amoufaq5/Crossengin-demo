@@ -17,6 +17,56 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P3.1.PNG full DEFLATE inflate (BTYPE=00 + BTYPE=01 + BTYPE=02):
+  **complete** (ADR-0014 image half / NOVA enhancement #15). Item 3
+  shipped the stored-only DEFLATE path (BTYPE=00) so PNGs produced by
+  `optipng -o0` / `pngcrush -force` / explicit zlib level 0 decoded
+  end-to-end, but real-world PNGs from cameras, phones, and screenshot
+  tools use zlib level 6 dynamic Huffman -- the Item-3 decoder rejected
+  them with the documented "BTYPE=10 not implemented (TODO)" error.
+  This session extends `src/io/transducers/deflate_decode.nova` with
+  full RFC 1951 inflate: BTYPE=01 (static Huffman; fixed tables from
+  section 3.2.6) and BTYPE=02 (dynamic Huffman; HLIT/HDIST/HCLEN
+  header parse + code-length alphabet decode + literal+distance code-
+  length recovery via the 16/17/18 repeat ops). The shared block-body
+  loop decodes literal/length/end-of-block symbols against the Huffman
+  tables, expands the length / distance extra bits per RFC 1951
+  section 3.2.5, and copies back-references from the sliding window
+  (the same output buffer) byte-by-byte so OVERLAPPING copies
+  (distance < length, the RLE encoding path) read freshly-written
+  bytes.
+  - **`deflate_decode.nova`** (EXTENDED, ~930 lines total) -- new
+    public `deflate_decode(bytes_ptr, total_len)` dispatches per block
+    on BTYPE; `deflate_decode_stored` kept as alias for ABI continuity
+    with png_decode.nova. Canonical Huffman build returns a
+    [first_code[L], bl_count[L], sym_offset[L], sorted_syms[]] sub-
+    list family that lets `_deflate_decode_symbol` decode one symbol
+    per call in 1..15 bits. Static-Huffman tables built lazily and
+    cached at module scope.
+  - **`png_decode.nova`** (UNCHANGED -- already called the alias).
+  - **`tests/unit/test_deflate.nova`** (NEW; 46 assertions across 9
+    test functions) covers stored regression, static "hello",
+    empty block, overlapping copy, length-extra-bits, multi-byte
+    distance (> 256), dynamic-Huffman pangram round-trip, BTYPE=11
+    reserved rejection.
+  - **`tests/unit/test_png_decode.nova`** (EXTENDED) replaced the old
+    BTYPE=01/10 "TODO error" smokes with a single BTYPE=11 reserved-
+    error smoke.
+  - **`tests/integration/scenario_t_png_see.sh`** (EXTENDED, 10
+    assertions, was 7) generates TWO PNG fixtures via
+    `scripts/gen_test_png.py` (level 0 stored + level 9 dynamic) and
+    feeds both through `/see`.
+  - **`scripts/gen_test_png.py`** (EXTENDED) default zlib level
+    bumped 0 -> 9; new `--level N` flag.
+  Acceptance: `tests/unit/test_deflate.nova` passes all 46
+  assertions; `tests/unit/test_png_decode.nova` still passes (44
+  assertions); `tests/integration/scenario_t_png_see.sh` passes all
+  10 assertions including the level-9 dynamic-Huffman PNG round-trip;
+  `make test` runs all unit-test suites with no regressions;
+  `make build` still succeeds (module count unchanged).
+  Verified independently on a 16x16 zlib-level-9 PNG and a 32x32
+  Pillow-generated PNG -- every pixel round-trips bit-for-bit.
+  `IMAGE_AUDIT.md`: marks "PNG decode (zlib + filters)" DONE.
 - P3.3 cont. SIFT keypoint DETECTION (scale-space + DoG extrema only;
   descriptor deferred): **complete (framework only)** (ADR-0014 image
   half / NOVA enhancement #15). R1.6 shipped Sobel edges + Harris
@@ -2501,3 +2551,57 @@ $NOVA_ROOT/nova run examples/crossengin_daemon.nova # the whole agent; prints "c
 
 To build the NOVA toolchain itself (one time): `cd /home/user/NOVA && make`
 (produces `bin/nova` and the `nova` launcher; needs GNU `as`, `ld`).
+
+## Operations utilities (ops sprint)
+
+Three small shell tools cover the operations layer around the binaries.
+Independent of cognition; touch no src/ code.
+
+- **`scripts/crossengin-doctor.sh`** -- environment + dependency check.
+  Green/yellow/red checklist of host kernel, NOVA toolchain reachability,
+  bin/crossengin* binaries, /tmp writability + free space (>=100MB),
+  $CE_SNAP_DIR + $CE_DLOG_PATH writability, optional helpers
+  (curl, ffmpeg, ImageMagick, espeak, aplay, parecord, whisper-cli,
+  vosk-transcriber, python3, wat2wasm, wasmtime, node), and a 3-second TCP
+  probe to en.wikipedia.org (the `/learn TOPIC` default source). Prints a
+  load-bearing `"X/Y checks pass"` summary line consumed by
+  `tests/integration/scenario_x_doctor.sh`. Exit 0 if every critical check
+  passes; exit 1 if any critical fails. Optional deps print WARN but do
+  not gate exit.
+
+- **`CE_LOG_JSON=1` structured logging** -- chat + daemon env toggle.
+  Flips the per-turn operator log lines (the chat's `"agent>"` +
+  `"       perceive(m=N,unk=N)"` pair, and the daemon's `[Hz] msg ...`
+  one-liner) to one-line JSON objects:
+
+      {"ts":<int>,"level":"info","session":"<id>","event":"perceive",
+       "msg":"<input>","m":<int>,"unk":<int>}
+
+  Daemon adds `hz`, `reason`, `mood_v`, `mod`, `routed`, `note`. Boot
+  emits one `"event":"boot"` line summarising snap_path + dlog_path.
+  Default (env unset) preserves the legacy human-readable output
+  BIT-IDENTICAL -- existing scripts, `scripts/web.py` /metrics scrape,
+  and runbooks stay valid. Verified by
+  `tests/integration/scenario_y_json_logs.sh` (parses the line with
+  `python3 -c "import json; json.loads(...)"`).
+
+- **`scripts/snap_diff.sh`** -- structural diff of two snapshot files.
+  Reports atoms added/removed by `kg/label` (set difference on
+  `kgs.atoms[N]` blocks keyed by `(kg, label)`), beliefs changed (signed
+  alpha/beta deltas for atoms in both), sections added/removed
+  (`*.present 1` keys), and soul mood + per-trait OCEAN drift. Colours on
+  a tty; plain when piped. Verified by
+  `tests/integration/scenario_z_snap_diff.sh` (/save snap1, /teach
+  widget, /save snap2, diff prints `"added: widget"`).
+
+Verify locally:
+
+```sh
+NOVA_ROOT=/home/user/NOVA bash scripts/crossengin-doctor.sh
+NOVA_ROOT=/home/user/NOVA make install   # rebuild chat/daemon with JSON helpers
+CE_LOG_JSON=1 ./bin/crossengin-chat <<< $'fever\n/quit\n' | grep '"event":"perceive"'
+bash scripts/snap_diff.sh /tmp/snap1.snap /tmp/snap2.snap
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_x_doctor.sh
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_y_json_logs.sh
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_z_snap_diff.sh
+```
