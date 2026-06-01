@@ -1,0 +1,473 @@
+// CrossEngin knowledge: episodic memory consolidation cycle.
+//
+// Purpose
+//   Long-term-memory promotion. The substrate observes and accumulates
+//   atoms (ADR-0016) and moments (ADR-0021) continuously; this module is
+//   the consolidation cycle (ADR-0022) that scans recent observations,
+//   detects groups of atoms that co-occur within a tight temporal window,
+//   and promotes each recurring group into an "episodic atom" -- a
+//   compound atom with its own Bayesian belief (alpha/beta, ADR-0023) and
+//   provenance.
+//
+//   Episodic atoms are persisted alongside ordinary KG atoms via the v2
+//   snapshot format (ADR-0048) -- the EPISODIC section blob is extended
+//   with a third sub-list [moments, episodes, episodic_atoms]; older
+//   readers that look at only blob[0]/[1] are unaffected (forward-compat),
+//   and the wire format keeps `episodic.present 1` and adds new
+//   `episodic.atoms.*` keys that any reader can ignore.
+//
+//   Distinct from src/parts/episodic/consolidation.nova (which marks live
+//   episodes as CONSOLIDATED so they survive decay): THIS module mints a
+//   NEW persistent compound atom, with belief that updates on subsequent
+//   matching observations. The two modules are complementary -- they walk
+//   the same moment stream but produce different outputs (CONSOLIDATED
+//   tier marker vs a new atom).
+//
+// Episodic atom layout (mirrors ADR-0016 atom shape so the same Bayesian
+// belief helpers from atom_store.nova apply):
+//   [EPATOM_OBJ_TAG, id, cluster_member_ids, count, first_seen_ns,
+//    last_seen_ns, alpha, beta, provenance_label]
+//
+// Consolidation criterion (this build):
+//   - "co-occurring" = >=3 atom ids appearing in a moment's trace within a
+//     temporal window of <=100ms (10 ticks @100Hz, ADR-0037)
+//   - "recurring"    = >=5 distinct moments share the same canonical
+//     signature (sorted, comma-joined atom-id list) within the scan window
+//
+//   Both knobs are exposed as let-constants so callers / tests can tune.
+//
+// Wired from the MEMORY loop (ADR-0036) as a sub-task: ADR-0036 specifies
+// six loops and an imagination idle loop; it doesn't grant slots for new
+// loops, so a sub-task of an existing loop is the safe extension point.
+// Memory is the natural owner -- it already manages the moment stream
+// (ADR-0021) and episode storage (ADR-0022). The sub-task is rate-limited
+// so a chatty perception cycle does not block memory's primary record path.
+//
+// ADRs implemented: ADR-0022 (episodic memory consolidation cycle, the
+//   promotion of recurring patterns into durable knowledge), ADR-0023
+//   (Bayesian belief tracking via Beta(alpha, beta) on each episodic atom),
+//   ADR-0048 (persistence -- the third sub-list in the EPISODIC blob).
+// NOVA dependencies: builtins (lists, sort, join, int_to_str, str_eq).
+// CrossEngin dependencies: src/kg/atom_store.nova (BEL_PRIOR, bel_*),
+//   src/parts/episodic/moment_stream.nova (ms_*, moment_*),
+//   src/parts/episodic/episode_storage.nova (em_* for status lookups).
+
+import "atom_store.nova"
+import "../parts/episodic/moment_stream.nova"
+import "../parts/episodic/episode_storage.nova"
+
+// ---- tuning ---------------------------------------------------------------
+//
+// Window is in logical ticks @100Hz (ADR-0037): 100ms == 10 ticks.
+let EPISODIC_COOCCUR_WINDOW   = 10      // 10 ticks == 100ms @100Hz
+let EPISODIC_MIN_CLUSTER_SIZE = 3       // >=3 atoms must co-occur
+let EPISODIC_MIN_RECUR        = 5       // >=5 moments to consolidate
+let EPISODIC_SCAN_WINDOW      = 360000  // 1 hour @100Hz default
+let EPISODIC_SCAN_MAX_ATOMS   = 1000    // M atoms cap (cheaper than ts diff
+                                        // on very long streams)
+
+// ---- episodic atom shape --------------------------------------------------
+let EPATOM_OBJ_TAG  = 1602              // distinct from ATOM_OBJ_TAG (1601)
+let EA_TAG          = 0
+let EA_ID           = 1
+let EA_MEMBERS      = 2                 // list of atom ids in the cluster
+let EA_COUNT        = 3                 // observed co-occurrence count
+let EA_FIRST_NS     = 4                 // first observation tick
+let EA_LAST_NS      = 5                 // last observation tick
+let EA_ALPHA        = 6                 // belief alpha (milli, BEL_PRIOR-based)
+let EA_BETA         = 7                 // belief beta  (milli, BEL_PRIOR-based)
+let EA_PROVENANCE   = 8                 // provenance label (string)
+
+let EPISODIC_PROVENANCE_DEFAULT = "consolidation/cooccurrence"
+
+// Construct an episodic atom. Members must be sorted by the caller (the
+// canonical-signature path does this); we do NOT sort defensively here so
+// the test path can build a deterministic atom without an extra clone.
+//
+// Belief starts uniform (alpha = beta = BEL_PRIOR), per ADR-0023.
+fn episodic_atom_new(id, members, count, first_ns, last_ns, provenance) {
+    let a = list_new()
+    push(a, EPATOM_OBJ_TAG)
+    push(a, id)
+    push(a, members)
+    push(a, count)
+    push(a, first_ns)
+    push(a, last_ns)
+    push(a, BEL_PRIOR)          // alpha
+    push(a, BEL_PRIOR)          // beta
+    push(a, provenance)
+    return a
+}
+
+// Accessors.
+fn episodic_atom_id(a)            { return a[EA_ID] }
+fn episodic_atom_members(a)       { return a[EA_MEMBERS] }
+fn episodic_atom_count(a)         { return a[EA_COUNT] }
+fn episodic_atom_first_seen(a)    { return a[EA_FIRST_NS] }
+fn episodic_atom_last_seen(a)     { return a[EA_LAST_NS] }
+fn episodic_atom_alpha(a)         { return a[EA_ALPHA] }
+fn episodic_atom_beta(a)          { return a[EA_BETA] }
+fn episodic_atom_provenance(a)    { return a[EA_PROVENANCE] }
+
+// Posterior mean alpha/(alpha+beta), in milli (0..1000) -- mirrors
+// bel_mean from atom_store.nova.
+fn episodic_atom_confidence(a) {
+    let total = a[EA_ALPHA] + a[EA_BETA]
+    if total <= 0 { return 500 }
+    return a[EA_ALPHA] * FP_SCALE / total
+}
+
+// Total evidence mass alpha+beta in milli; used by /status-style reports.
+fn episodic_atom_strength(a) {
+    return a[EA_ALPHA] + a[EA_BETA]
+}
+
+// ---- canonical signature --------------------------------------------------
+//
+// Identical-by-name to consol_signature in parts/episodic/consolidation.nova
+// (the two modules don't cross-import; we duplicate to keep this module a
+// leaf of the KG layer and avoid pulling parts/episodic upstream into kg/).
+// Sorted, comma-joined atom-id list. Order-invariant.
+fn _episodic_signature(member_ids) {
+    let copy = list_new()
+    let i = 0
+    while i < len(member_ids) {
+        push(copy, member_ids[i])
+        i = i + 1
+    }
+    sort(copy)
+    let parts = list_new()
+    let j = 0
+    while j < len(copy) {
+        push(parts, int_to_str(copy[j]))
+        j = j + 1
+    }
+    return join(parts, ",")
+}
+
+fn episodic_signature(member_ids) { return _episodic_signature(member_ids) }
+
+// Sorted copy of an int list. Used to canonicalize members before mint so
+// every episodic atom carries its members in a stable order.
+fn _sorted_copy(l) {
+    let c = list_new()
+    let i = 0
+    while i < len(l) { push(c, l[i]); i = i + 1 }
+    sort(c)
+    return c
+}
+
+// ---- co-occurrence tally --------------------------------------------------
+//
+// Returns a list of [signature, sorted_members, count, first_ts, last_ts]
+// records over the scan window. The window is the most recent `max_atoms`
+// moments OR the last `window_ns` ticks, whichever is smaller -- a long
+// idle stream might have <1k moments but a chatty one will have many more,
+// so we apply BOTH bounds.
+//
+// "Within a small temporal window of each other" is satisfied trivially
+// for every moment-internal trace: every atom in moment_trace(m) by
+// definition arrived in the same input cycle (<=1 tick apart). For
+// cross-moment windowing -- pairs of moments at distinct timestamps that
+// together form a cluster -- we do NOT do that here; multi-moment cluster
+// detection is future work (ADR-0022's idle-replay-driven evolution).
+
+let EREC_SIG       = 0
+let EREC_MEMBERS   = 1
+let EREC_COUNT     = 2
+let EREC_FIRST_TS  = 3
+let EREC_LAST_TS   = 4
+
+fn _tally_lookup(tally, sig) {
+    let i = 0
+    while i < len(tally) {
+        if str_eq(tally[i][EREC_SIG], sig) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _tally_record(tally, members, ts) {
+    let n = len(members)
+    if n < EPISODIC_MIN_CLUSTER_SIZE { return 0 }
+    let sorted = _sorted_copy(members)
+    let sig = _episodic_signature(sorted)
+    let idx = _tally_lookup(tally, sig)
+    if idx == -1 {
+        let entry = list_new()
+        push(entry, sig)         // [0] signature
+        push(entry, sorted)      // [1] members (sorted)
+        push(entry, 1)           // [2] count
+        push(entry, ts)          // [3] first_ts
+        push(entry, ts)          // [4] last_ts
+        push(tally, entry)
+    } else {
+        let entry = tally[idx]
+        list_set(entry, EREC_COUNT, entry[EREC_COUNT] + 1)
+        if ts < entry[EREC_FIRST_TS] { list_set(entry, EREC_FIRST_TS, ts) }
+        if ts > entry[EREC_LAST_TS]  { list_set(entry, EREC_LAST_TS,  ts) }
+    }
+    return 1
+}
+
+// Scan recent moments and tally each moment-trace signature. Returns the
+// full tally. The window is min(window_ticks, max_atoms): we walk backwards
+// from the newest moment and stop at either limit. window_ticks=0 means
+// "no temporal limit, only max_atoms".
+fn episodic_tally(stream, window_ticks, max_atoms) {
+    let tally = list_new()
+    let total = ms_count(stream)
+    if total == 0 { return tally }
+    let upper = total - 1
+    let now = moment_timestamp(ms_get(stream, upper))
+    let i = upper
+    let scanned = 0
+    while i >= 0 {
+        if scanned >= max_atoms {
+            i = 0 - 1
+        } else {
+            let m = ms_get(stream, i)
+            if m == 0 {
+                i = i - 1
+            } else {
+                let mts = moment_timestamp(m)
+                if window_ticks > 0 {
+                    if now - mts > window_ticks {
+                        i = 0 - 1
+                    } else {
+                        _tally_record(tally, moment_trace(m), mts)
+                        scanned = scanned + 1
+                        i = i - 1
+                    }
+                } else {
+                    _tally_record(tally, moment_trace(m), mts)
+                    scanned = scanned + 1
+                    i = i - 1
+                }
+            }
+        }
+    }
+    return tally
+}
+
+// ---- store of episodic atoms ----------------------------------------------
+//
+// In-memory list of episodic atoms with O(N) signature lookup. N is bounded
+// (every consolidation pass mints at most one atom per qualifying cluster;
+// re-runs match-and-update instead of mint). Wired to the moment stream by
+// id -- the cluster_member_ids point at atom ids already present in the KG.
+
+let EAS_TAG  = 0
+let EAS_LIST = 1
+let EAS_NEXT = 2
+let EAS_OBJ_TAG = 1603
+
+fn episodic_atoms_new() {
+    let s = list_new()
+    push(s, EAS_OBJ_TAG)
+    push(s, list_new())
+    push(s, 0)
+    return s
+}
+
+fn episodic_atoms_count(eas) { return len(eas[EAS_LIST]) }
+
+fn episodic_atoms_get(eas, id) {
+    let l = eas[EAS_LIST]
+    if id < 0 { return 0 }
+    if id >= len(l) { return 0 }
+    return l[id]
+}
+
+// Look up an episodic atom by its canonical signature. Returns 0 if absent.
+fn episodic_atoms_find(eas, signature) {
+    let l = eas[EAS_LIST]
+    let i = 0
+    while i < len(l) {
+        if str_eq(_episodic_signature(episodic_atom_members(l[i])), signature) == 1 {
+            return l[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Mint a new episodic atom (caller has confirmed the cluster doesn't exist
+// yet via episodic_atoms_find). Returns the new atom.
+fn episodic_atoms_mint(eas, members, count, first_ns, last_ns, provenance) {
+    let id = eas[EAS_NEXT]
+    let a = episodic_atom_new(id, _sorted_copy(members), count, first_ns, last_ns, provenance)
+    push(eas[EAS_LIST], a)
+    list_set(eas, EAS_NEXT, id + 1)
+    return a
+}
+
+// Wipe the store (used by snapshot apply). REPLACE policy per ADR-0048.
+fn episodic_atoms_clear(eas) {
+    list_set(eas, EAS_LIST, list_new())
+    list_set(eas, EAS_NEXT, 0)
+    return 1
+}
+
+// Install an episodic atom verbatim (used by snapshot apply). Bypasses the
+// signature dedup -- the snapshot is the ground truth.
+fn episodic_atoms_restore(eas, id, members, count, first_ns, last_ns, alpha, beta, provenance) {
+    let a = list_new()
+    push(a, EPATOM_OBJ_TAG)
+    push(a, id)
+    push(a, members)
+    push(a, count)
+    push(a, first_ns)
+    push(a, last_ns)
+    push(a, alpha)
+    push(a, beta)
+    push(a, provenance)
+    push(eas[EAS_LIST], a)
+    let next = eas[EAS_NEXT]
+    if id + 1 > next { next = id + 1 }
+    list_set(eas, EAS_NEXT, next)
+    return a
+}
+
+// ---- the consolidation pass -----------------------------------------------
+//
+// Public API. Scans the moment stream over the window, mints a NEW
+// episodic atom for every signature whose count >= EPISODIC_MIN_RECUR and
+// whose member set has size >= EPISODIC_MIN_CLUSTER_SIZE. An already-known
+// cluster is NOT re-minted; instead each repeat in the window is folded
+// into the existing atom's count and reinforces its belief via
+// episodic_update_belief (the matched=1 path).
+//
+// Returns the count of NEWLY minted atoms.
+//
+// `window_ticks=0` means use EPISODIC_SCAN_WINDOW; same for max_atoms.
+fn episodic_consolidate(eas, stream, window_ticks, max_atoms) {
+    let wt = window_ticks
+    let mt = max_atoms
+    if wt <= 0 { wt = EPISODIC_SCAN_WINDOW }
+    if mt <= 0 { mt = EPISODIC_SCAN_MAX_ATOMS }
+    let tally = episodic_tally(stream, wt, mt)
+    let minted = 0
+    let i = 0
+    while i < len(tally) {
+        let rec = tally[i]
+        if rec[EREC_COUNT] >= EPISODIC_MIN_RECUR {
+            let existing = episodic_atoms_find(eas, rec[EREC_SIG])
+            if existing == 0 {
+                episodic_atoms_mint(
+                    eas,
+                    rec[EREC_MEMBERS],
+                    rec[EREC_COUNT],
+                    rec[EREC_FIRST_TS],
+                    rec[EREC_LAST_TS],
+                    EPISODIC_PROVENANCE_DEFAULT)
+                minted = minted + 1
+            } else {
+                // Fold the new evidence into the existing atom: bump the
+                // count, extend the last-seen timestamp, and observe the
+                // belief once per consolidation pass (not per matching
+                // moment -- treating one consolidation pass as one
+                // confirming "trial" so a single noisy pass cannot
+                // dominate the posterior).
+                let new_count = episodic_atom_count(existing) + rec[EREC_COUNT]
+                list_set(existing, EA_COUNT, new_count)
+                if rec[EREC_LAST_TS] > episodic_atom_last_seen(existing) {
+                    list_set(existing, EA_LAST_NS, rec[EREC_LAST_TS])
+                }
+                episodic_update_belief(existing, 1)
+            }
+        }
+        i = i + 1
+    }
+    return minted
+}
+
+// ---- match + belief update ------------------------------------------------
+//
+// An observation matches an episodic atom iff the observation atom id is in
+// the cluster's member list. Strict membership -- "partial match" of an
+// (A,B,X) observation against an {A,B,C} cluster returns 0 (the X breaks
+// the pattern). This is the documented policy: an episodic atom carries
+// the cluster identity exactly; observations that share part of the
+// cluster but introduce a new id are a DIFFERENT pattern and should mint a
+// separate atom on the next consolidation pass.
+//
+// The convenience overload `episodic_match_observation(atom, observation_ids)`
+// checks whether the observation's atom-id set is a SUPERSET of the
+// cluster members (every cluster member appears in the observation). This
+// is the "trace contains the cluster" test used by the live wiring.
+fn episodic_match(ep_atom, observation_atom_id) {
+    let members = episodic_atom_members(ep_atom)
+    let i = 0
+    while i < len(members) {
+        if members[i] == observation_atom_id { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Stronger predicate: every member of the cluster appears in the observed
+// atom-id list. Returns 1 if observed contains the cluster, 0 otherwise.
+// This is the "cluster extension" test the brief asks for: a 6th (A,B,C)
+// observation matches the {A,B,C} cluster; an (A,B,X) does NOT (because C
+// is missing from the observation).
+fn episodic_match_observation(ep_atom, observation_atom_ids) {
+    let members = episodic_atom_members(ep_atom)
+    let i = 0
+    while i < len(members) {
+        let target = members[i]
+        let found = 0
+        let j = 0
+        while j < len(observation_atom_ids) {
+            if observation_atom_ids[j] == target { found = 1 }
+            j = j + 1
+        }
+        if found == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Beta(alpha,beta) update on a confirming or contradicting observation,
+// ADR-0023. matched==1 increments alpha (the cluster fired again),
+// matched==0 increments beta (the cluster was expected but didn't fire).
+// Returns the new alpha (matched==1) or beta (matched==0).
+fn episodic_update_belief(ep_atom, matched) {
+    if matched == 1 {
+        list_set(ep_atom, EA_ALPHA, ep_atom[EA_ALPHA] + FP_SCALE)
+        return ep_atom[EA_ALPHA]
+    }
+    list_set(ep_atom, EA_BETA, ep_atom[EA_BETA] + FP_SCALE)
+    return ep_atom[EA_BETA]
+}
+
+// ---- record an observation against the store -----------------------------
+//
+// Walk every episodic atom and update each one's belief based on whether
+// the observation's atom-id list is a superset of its cluster. Atoms whose
+// cluster is fully present in the observation get matched=1; the rest get
+// nothing (we do NOT punish every non-match -- a typical observation
+// covers ONE cluster, so penalizing every other cluster would saturate
+// the Beta posterior). Returns the count of atoms whose belief was
+// updated.
+//
+// Also extends last_seen / count on each matched atom so the snapshot
+// carries up-to-date provenance.
+fn episodic_observe(eas, observation_atom_ids, now_ns) {
+    let l = eas[EAS_LIST]
+    let updated = 0
+    let i = 0
+    while i < len(l) {
+        let ep = l[i]
+        if episodic_match_observation(ep, observation_atom_ids) == 1 {
+            episodic_update_belief(ep, 1)
+            list_set(ep, EA_COUNT, episodic_atom_count(ep) + 1)
+            if now_ns > episodic_atom_last_seen(ep) {
+                list_set(ep, EA_LAST_NS, now_ns)
+            }
+            updated = updated + 1
+        }
+        i = i + 1
+    }
+    return updated
+}
