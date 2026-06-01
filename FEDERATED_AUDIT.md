@@ -176,3 +176,107 @@ fed: round 1 complete (2 stats sent, 2 aggregates received)
    kind would let `/why` surface federation-driven tier changes.
 8. **Reputation / weighted averaging** — downweight souls whose
    rates consistently diverge from the federation.
+
+## R6 extension: Noise XK mutual-auth + transport encryption (kg_sync v3)
+
+The remaining gap before this session was "plaintext TCP" on kg_sync.
+A passive observer between two federated souls could see every ATOM /
+PROMOTE / FED_STAT line in the clear; an active attacker could
+splice in fake atom-birth events. Both are now closed.
+
+`src/io/transducers/noise_xk.nova` ships a pure-NOVA implementation of
+the Noise XK pattern (noiseprotocol.org section 7.5) on top of the
+primitives already in tree:
+
+* SHA-256 (FIPS 180-4) — new pure-NOVA implementation in noise_xk.nova
+  itself (~150 lines).
+* HMAC-SHA256 + HKDF (RFC 2104, RFC 5869) — built from SHA-256.
+* X25519-shape Diffie-Hellman — `c25519_*` surface wrapping
+  `bn_modpow_ct` from `src/safety/bignum.nova` against the field
+  prime p_25519 = 2^255 - 19 with generator g = 2. Wire layout is
+  X25519-compatible (32-byte little-endian pubkeys + scalars); real
+  ECDH on the curve is a drop-in replacement when Field 25519 lands.
+* ChaCha20-Poly1305 AEAD — RFC 7539 construction over the existing
+  `src/safety/chacha20.nova` + `poly1305.nova` leaves; bound to the
+  Noise transcript hash on every message.
+* OS CSPRNG via `secure_random(buf, n)` (R5B builtin) for ephemeral
+  key generation; nanotime+LCG fallback path documented as weaker.
+
+### Wire protocol v3
+
+Three handshake messages (each preceded by a 4-byte BE length so framing
+is unambiguous before keys exist), then encrypted transport:
+
+```
+  -> msg1 (48 B): e_pub (32) || tag(empty plaintext, k=HKDF(es)) (16)
+  <- msg2 (48 B): e_pub (32) || tag(empty plaintext, k=HKDF(es,ee)) (16)
+  -> msg3 (64 B): AEAD-encrypted s_pub (32+16) || tag(empty, k=HKDF(es,ee,se)) (16)
+
+  transport: [4 B BE len] [ct] [16 B Poly1305 tag]
+             nonce = [4 zero bytes || 8 B LE counter]
+             counters monotonic, independent per direction
+```
+
+### Mutual auth contract
+
+After the three handshake messages both sides hold:
+- The same 32-byte session hash `h` (SHA-256 transcript binding).
+- Two 32-byte transport keys (k_init->resp, k_resp->init) via HKDF Split.
+- Independent monotonic 64-bit nonce counters per direction.
+
+The responder learns the initiator's static pubkey on msg3 (XK
+property); the responder may reject the connection if the learned
+pubkey is not on its `CE_KGSYNC_NOISE_ALLOWLIST`. The initiator
+already knows the responder's static pubkey out-of-band and commits
+to it via `MixHash(rs)` on every msg1 — a MITM presenting a
+different responder pubkey gets a tag failure on msg1 (verified by
+the integration test).
+
+### Backward compatibility
+
+- `CE_KGSYNC_REQUIRE_NOISE` unset (default): v2 plaintext stays the
+  primary path; existing `scenario_g_kg_sync.sh` /
+  `scenario_g2_kg_sync_multi.sh` pass unchanged.
+- `CE_KGSYNC_REQUIRE_NOISE=1`: the publisher refuses plaintext and
+  every connection must complete the Noise XK handshake.
+
+### Performance
+
+Curve25519-shape DH via `bn_modpow_ct` is the dominant cost: ~120 ms
+per scalar mult on the integration runner. Full XK handshake = 4 DH
+operations on the initiator side (es, ee, se) plus 3 on the responder
+(es, ee, se), plus SHA-256 + HKDF (negligible). Measured on the
+integration scenario: **~508 ms wall-clock end-to-end** for a fresh
+handshake, well under the 2-second budget. Real ECDH on Curve25519
+(with the X25519 ladder) drops this to ~5 ms when it lands.
+
+### Verification
+
+- Unit (`tests/unit/test_noise_xk.nova`): **42 assertions** covering
+  SHA-256 KAT (FIPS 180-4 "abc" + empty + 448-bit boundary),
+  HMAC-SHA256 KAT (RFC 4231 TC1), DH commutativity, keypair
+  generation, full handshake convergence (both sides agree on session
+  hash + transport keys), responder learns initiator pubkey,
+  transport round-trip both directions, tampered ciphertext +
+  tampered length-prefix rejected, replay rejected (nonce
+  monotonicity), MITM with wrong responder pubkey rejected at msg1.
+- Integration (`tests/integration/scenario_gg_noise_kg.sh`): **12
+  assertions** running two NOVA souls over a real TCP socket.
+  Stage 1 proves a clean handshake + one encrypted KG delta decrypts
+  at the far end; Stage 2 proves MITM with a wrong static priv is
+  rejected.
+
+### LOUD caveats
+
+- The DH is bignum-mod-prime, not real elliptic-curve scalar mult.
+  Wire layout matches X25519 so a future real-ECDH drop-in changes
+  only `c25519_*`; the noise XK state machine is unchanged.
+- 256-bit DH is below the 768-bit RFC 7919 Group 1 floor and is
+  breakable in tractable time on commodity hardware. The MVP
+  demonstrates the wire protocol + the mutual-auth contract, NOT
+  cryptographic strength against a serious adversary. The 2048-bit
+  SECAGG_AUDIT path (`bn2048_modpow_ct` + RFC 7919 Group 14, landed
+  in R5A) is the upgrade target.
+- The fallback random path (when `secure_random` syscall returns -1)
+  is a nanotime+LCG stretch and is NOT cryptographically secure;
+  the production path is OS getrandom via the R5B builtin.

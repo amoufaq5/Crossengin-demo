@@ -1,0 +1,309 @@
+// Unit tests for src/io/transducers/noise_xk.nova
+//
+// R6 federation-gap closer. Coverage:
+//   * SHA-256 known-answer vector (FIPS 180-4 "abc").
+//   * HMAC-SHA256 known-answer vector (RFC 4231 test case 1).
+//   * Curve25519-shape DH commutativity (a^b == b^a mod p).
+//   * Static keypair generation: priv != pub, pub matches g^priv.
+//   * Noise XK handshake completes between two souls with known static keys.
+//   * Both sides derive the SAME pair of transport keys after Split.
+//   * Both sides derive the SAME session hash after Split.
+//   * Responder learns the initiator's static pubkey from msg3.
+//   * Transport seal/open: I->R frame decrypts at R, R->I frame decrypts at I.
+//   * Tampered ciphertext rejected (AEAD auth fail).
+//   * Tampered length-prefix rejected (frame structure check).
+//   * Replayed (decremented-counter) frame rejected (nonce monotonicity).
+//   * MITM with wrong responder static pubkey -> handshake fails at responder.
+//
+// ~25 assertions total.
+
+import "../ce_test.nova"
+import "../../src/safety/chacha20.nova"
+import "../../src/io/transducers/noise_xk.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+fn _t_ascii_to_buf(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let r = list_new()
+    push(r, buf)
+    push(r, n)
+    return r
+}
+
+// ---- SHA-256 -------------------------------------------------------------
+
+fn test_sha256_known_vector() {
+    // FIPS 180-4 worked example: SHA-256("abc") =
+    //   ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c b410ff61 f20015ad
+    ce_str_eq("sha256(\"abc\")",
+              _nxk_test_sha256_str_hex("abc"),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    // Empty string -> e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    ce_str_eq("sha256(\"\")",
+              _nxk_test_sha256_str_hex(""),
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    // The 448-bit boundary case ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"):
+    //   248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+    ce_str_eq("sha256(NIST 448-bit vector)",
+              _nxk_test_sha256_str_hex(
+                  "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+}
+
+// ---- HMAC-SHA256 ---------------------------------------------------------
+
+fn test_hmac_sha256_rfc4231() {
+    // RFC 4231 Test Case 1: key = 0x0b * 20, data = "Hi There".
+    //   expected = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+    ce_str_eq("hmac-sha256(rfc4231 tc1)",
+              _nxk_test_hmac_hex(
+                  "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                  "Hi There"),
+              "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+}
+
+// ---- Curve25519-shape DH commutativity -----------------------------------
+
+fn test_dh_commutativity() {
+    // Two arbitrary 64-char hex scalars.
+    let priv_a = "0102030405060708090a0b0c0d0e0f10111213141516171819207f8090a0b0c0"
+    let priv_b = "12131415161718191a1b1c1d1e1f20212223242526272829303040506070800a"
+    let pub_a = nxk_pub_from_priv(priv_a)
+    let pub_b = nxk_pub_from_priv(priv_b)
+    ce_check("priv_a != pub_a", str_eq(priv_a, pub_a) == 0)
+    // a^b == b^a: shared_ab from A's perspective == shared_ba from B's
+    let s_ab = nxk_dh_hex(priv_a, pub_b)
+    let s_ba = nxk_dh_hex(priv_b, pub_a)
+    ce_str_eq("DH commutes (a^b == b^a mod p)", s_ab, s_ba)
+}
+
+fn test_static_keypair_generate() {
+    let kp = nxk_generate_static_keypair()
+    ce_check("keypair has 2 entries", len(kp) == 2)
+    ce_check("priv is 64 hex chars",  len(kp[0]) == 64)
+    ce_check("pub is 64 hex chars",   len(kp[1]) == 64)
+    // pub = g^priv mod p; matches nxk_pub_from_priv.
+    let pub2 = nxk_pub_from_priv(kp[0])
+    ce_str_eq("pub matches g^priv", kp[1], pub2)
+    // priv != pub (overwhelmingly).
+    ce_check("priv != pub", str_eq(kp[0], kp[1]) == 0)
+}
+
+// ---- Noise XK end-to-end handshake ---------------------------------------
+//
+// Use two FIXED static keypairs so the test is deterministic except for
+// the ephemeral keys (which are still freshly random each run -- a good
+// thing, exercises the random path).
+
+fn _t_known_static_keys() {
+    let r = list_new()
+    push(r, "1111111111111111111111111111111111111111111111111111111111111111")   // init priv
+    push(r, "2222222222222222222222222222222222222222222222222222222222222222")   // resp priv
+    return r
+}
+
+fn test_handshake_completes() {
+    let keys = _t_known_static_keys()
+    let init_priv = keys[0]
+    let resp_priv = keys[1]
+    let resp_pub  = nxk_pub_from_priv(resp_priv)
+    let init_pub  = nxk_pub_from_priv(init_priv)
+    let i_st = nxk_initiator_new(init_priv, resp_pub)
+    let r_st = nxk_responder_new(resp_priv)
+    ce_check("initiator state built", i_st != 0)
+    ce_check("responder state built", r_st != 0)
+    // msg1: i -> r
+    let m1 = nxk_msg1_send(i_st)
+    ce_check("msg1 sent", m1 != 0)
+    ce_eq("msg1 size = 32+16",   m1[1], 48)
+    ce_eq("msg1 recv ok",        nxk_msg1_recv(r_st, m1[0], m1[1]), 1)
+    // msg2: r -> i
+    let m2 = nxk_msg2_send(r_st)
+    ce_check("msg2 sent", m2 != 0)
+    ce_eq("msg2 size = 32+16",   m2[1], 48)
+    ce_eq("msg2 recv ok",        nxk_msg2_recv(i_st, m2[0], m2[1]), 1)
+    // msg3: i -> r
+    let m3 = nxk_msg3_send(i_st)
+    ce_check("msg3 sent", m3 != 0)
+    ce_eq("msg3 size = 32+16+16", m3[1], 64)
+    ce_eq("msg3 recv ok",        nxk_msg3_recv(r_st, m3[0], m3[1]), 1)
+    // Split on both sides.
+    ce_eq("initiator split ok",  nxk_split(i_st), 1)
+    ce_eq("responder split ok",  nxk_split(r_st), 1)
+    // Both sides agree on session hash.
+    ce_str_eq("session hashes match",
+              nxk_session_id_hex(i_st), nxk_session_id_hex(r_st))
+    // Both sides agree on the transport keys.
+    ce_str_eq("k_init_to_resp matches",
+              _nxk_test_k_init_to_resp_hex(i_st),
+              _nxk_test_k_init_to_resp_hex(r_st))
+    ce_str_eq("k_resp_to_init matches",
+              _nxk_test_k_resp_to_init_hex(i_st),
+              _nxk_test_k_resp_to_init_hex(r_st))
+    // Responder learned the initiator's static pubkey.
+    ce_str_eq("responder learned init pubkey",
+              nxk_peer_static_pub(r_st), init_pub)
+    // Initiator's known peer is the responder pubkey.
+    ce_str_eq("initiator knows resp pubkey",
+              nxk_peer_static_pub(i_st), resp_pub)
+}
+
+// ---- transport: round-trip both directions -------------------------------
+
+fn _t_run_complete_handshake() {
+    let keys = _t_known_static_keys()
+    let resp_pub = nxk_pub_from_priv(keys[1])
+    let i_st = nxk_initiator_new(keys[0], resp_pub)
+    let r_st = nxk_responder_new(keys[1])
+    let m1 = nxk_msg1_send(i_st)
+    nxk_msg1_recv(r_st, m1[0], m1[1])
+    let m2 = nxk_msg2_send(r_st)
+    nxk_msg2_recv(i_st, m2[0], m2[1])
+    let m3 = nxk_msg3_send(i_st)
+    nxk_msg3_recv(r_st, m3[0], m3[1])
+    nxk_split(i_st)
+    nxk_split(r_st)
+    let pair = list_new()
+    push(pair, i_st)
+    push(pair, r_st)
+    return pair
+}
+
+fn test_transport_round_trip() {
+    let p = _t_run_complete_handshake()
+    let i_st = p[0]
+    let r_st = p[1]
+    // I -> R: encode and decode "hello noise".
+    let msg = _t_ascii_to_buf("hello noise")
+    let sealed = nxk_seal(i_st, NXK_ROLE_INITIATOR, msg[0], msg[1])
+    ce_check("seal returned", sealed != 0)
+    let opened = nxk_open(r_st, NXK_ROLE_RESPONDER, sealed[0], sealed[1])
+    ce_check("open returned", opened != 0)
+    ce_eq("opened length matches", opened[1], 11)
+    // Compare bytes.
+    let ok = 1
+    let i = 0
+    while i < 11 {
+        if load8(opened[0] + i) != char_at("hello noise", i) { ok = 0 }
+        i = i + 1
+    }
+    ce_eq("I->R plaintext matches", ok, 1)
+    // R -> I: another payload.
+    let reply = _t_ascii_to_buf("hi there")
+    let r_sealed = nxk_seal(r_st, NXK_ROLE_RESPONDER, reply[0], reply[1])
+    let r_opened = nxk_open(i_st, NXK_ROLE_INITIATOR, r_sealed[0], r_sealed[1])
+    ce_check("R->I opened",        r_opened != 0)
+    ce_eq("R->I length matches",   r_opened[1], 8)
+    let ok2 = 1
+    let j = 0
+    while j < 8 {
+        if load8(r_opened[0] + j) != char_at("hi there", j) { ok2 = 0 }
+        j = j + 1
+    }
+    ce_eq("R->I plaintext matches", ok2, 1)
+}
+
+// ---- tamper detection ----------------------------------------------------
+
+fn test_tampered_ciphertext_rejected() {
+    let p = _t_run_complete_handshake()
+    let i_st = p[0]
+    let r_st = p[1]
+    let msg = _t_ascii_to_buf("payload bytes")
+    let sealed = nxk_seal(i_st, NXK_ROLE_INITIATOR, msg[0], msg[1])
+    // Flip one byte in the ciphertext (right after the 4-byte length).
+    let b = load8(sealed[0] + 4)
+    store8(sealed[0] + 4, int_xor(b, 1))
+    let opened = nxk_open(r_st, NXK_ROLE_RESPONDER, sealed[0], sealed[1])
+    ce_eq("tampered ct -> open fails", opened, 0)
+}
+
+fn test_tampered_length_rejected() {
+    let p = _t_run_complete_handshake()
+    let i_st = p[0]
+    let r_st = p[1]
+    let msg = _t_ascii_to_buf("payload bytes")
+    let sealed = nxk_seal(i_st, NXK_ROLE_INITIATOR, msg[0], msg[1])
+    // Bump the BE length field by 1; the frame no longer matches.
+    let orig_lo = load8(sealed[0] + 3)
+    store8(sealed[0] + 3, int_and(orig_lo + 1, 255))
+    let opened = nxk_open(r_st, NXK_ROLE_RESPONDER, sealed[0], sealed[1])
+    ce_eq("length-tamper -> open fails", opened, 0)
+}
+
+fn test_replay_rejected() {
+    // After a successful frame at counter N+1, the receiver's counter is
+    // now N+2. Replaying the original (counter N+1) frame uses the old
+    // nonce, which the receiver tries to verify against its CURRENT nonce
+    // (N+2) -- so the tag mismatches and the open fails.
+    let p = _t_run_complete_handshake()
+    let i_st = p[0]
+    let r_st = p[1]
+    let msg = _t_ascii_to_buf("first message")
+    let s1 = nxk_seal(i_st, NXK_ROLE_INITIATOR, msg[0], msg[1])
+    let o1 = nxk_open(r_st, NXK_ROLE_RESPONDER, s1[0], s1[1])
+    ce_check("first open ok", o1 != 0)
+    // Send a second; then attempt to "replay" the first.
+    let msg2 = _t_ascii_to_buf("second message")
+    let s2 = nxk_seal(i_st, NXK_ROLE_INITIATOR, msg2[0], msg2[1])
+    let o2 = nxk_open(r_st, NXK_ROLE_RESPONDER, s2[0], s2[1])
+    ce_check("second open ok", o2 != 0)
+    // Replay s1.
+    let replay = nxk_open(r_st, NXK_ROLE_RESPONDER, s1[0], s1[1])
+    ce_eq("replay rejected", replay, 0)
+}
+
+// ---- MITM: wrong responder pubkey -> handshake fails ---------------------
+//
+// The initiator believes it is talking to a peer whose static pubkey is X,
+// but the actual responder's static pubkey is Y != X. After msg1 + msg2,
+// the initiator's session hash has bound to X (via the initial
+// MixHash(rs) on the responder pubkey it KNOWS) while the responder's
+// session hash has bound to Y. The es DH on each side computes the same
+// shared secret IF the keys match; with mismatched assumed keys the DH
+// secrets diverge, so the AEAD tags in msg1 fail to verify.
+
+fn test_mitm_wrong_responder_key_rejected() {
+    // Real responder key.
+    let resp_priv = "2222222222222222222222222222222222222222222222222222222222222222"
+    let resp_pub  = nxk_pub_from_priv(resp_priv)
+    // Initiator THINKS the responder pubkey is something else.
+    let wrong_pub = nxk_pub_from_priv(
+        "3333333333333333333333333333333333333333333333333333333333333333")
+    let init_priv = "1111111111111111111111111111111111111111111111111111111111111111"
+    let i_st = nxk_initiator_new(init_priv, wrong_pub)
+    let r_st = nxk_responder_new(resp_priv)
+    let m1 = nxk_msg1_send(i_st)
+    // The responder receives msg1; its decrypt-and-hash on the empty
+    // payload tag fails because the initiator's MixKey(es) used a
+    // different rs (wrong_pub) than the responder's rs (its own real
+    // pubkey).
+    let r1 = nxk_msg1_recv(r_st, m1[0], m1[1])
+    ce_eq("MITM (wrong rs) -> msg1 rejected", r1, 0)
+}
+
+// ---- Run ----------------------------------------------------------------
+
+fn main() {
+    test_sha256_known_vector()
+    test_hmac_sha256_rfc4231()
+    test_dh_commutativity()
+    test_static_keypair_generate()
+    test_handshake_completes()
+    test_transport_round_trip()
+    test_tampered_ciphertext_rejected()
+    test_tampered_length_rejected()
+    test_replay_rejected()
+    test_mitm_wrong_responder_key_rejected()
+    ce_summary("noise_xk")
+}
+
+main()

@@ -46,6 +46,59 @@
 //   subscriber can attach to a new publisher; the publisher rejects v0 only
 //   if the token gate is armed and the client did not authenticate.
 //
+// Wire protocol v3 (R6) — Noise XK + ChaCha20-Poly1305 transport encryption
+//
+//   v3 wraps the v2 line protocol in a Noise XK mutual-auth handshake
+//   followed by per-line AEAD-encrypted transport frames. Gated by the
+//   env flag CE_KGSYNC_REQUIRE_NOISE=1; when unset, the publisher
+//   accepts BOTH v2 plaintext and v3 noise connections (the wire prefix
+//   on the first incoming bytes disambiguates: a 4-byte length header
+//   marking the v3 handshake's msg1 vs the text "HELLO ce-kg-sync ..."
+//   of v2). When set, the publisher REJECTS any plaintext connection.
+//
+//   Handshake (binary, 3 messages over the TCP fd; each preceded by a
+//   4-byte BE length header so framing is unambiguous before AEAD keys
+//   exist):
+//     C->S : msg1 (48 bytes: 32B initiator ephemeral pubkey ||
+//                            16B AEAD tag over empty plaintext
+//                            keyed by HKDF(es))
+//     S->C : msg2 (48 bytes: 32B responder ephemeral pubkey ||
+//                            16B AEAD tag over empty plaintext
+//                            keyed by HKDF(es, ee))
+//     C->S : msg3 (64 bytes: 32B AEAD-encrypted initiator static pubkey
+//                          + 16B tag (under post-ee key)
+//                          + 16B AEAD tag over empty plaintext
+//                            keyed by HKDF(es, ee, se))
+//
+//   After all three messages: both sides call nxk_split() which derives
+//   two 32-byte transport keys (k_init->resp and k_resp->init) via
+//   HKDF + Empty-IKM, plus independent monotonic 64-bit nonce counters
+//   per direction.
+//
+//   Transport (post-handshake; one frame per kg-sync line):
+//     [4 byte BE length of (ciphertext || tag)] [ciphertext] [16B Poly1305 tag]
+//
+//   Replay protection: each direction's counter monotonically increments
+//   on a successful seal/open; a frame whose nonce mismatches the
+//   receiver's CURRENT expected counter fails Poly1305 verify (since
+//   the AEAD nonce is the counter).
+//
+//   Auth: msg3 reveals the initiator's static pubkey to the responder,
+//   AEAD-bound to the handshake transcript hash. The responder can
+//   reject the connection if the learned static pubkey is not on its
+//   allowlist (CE_KGSYNC_NOISE_ALLOWLIST env var, comma-separated).
+//   The initiator already knew the responder's static pubkey
+//   out-of-band (the XK assumption); on every msg1 it commits to that
+//   knowledge via MixHash(rs), so a responder presenting a different
+//   key gets a tag failure on msg1's AEAD verify (MITM rejection).
+//
+//   Static keys per soul: CE_KGSYNC_NOISE_STATIC_PRIV (64 hex chars,
+//   the soul's own static priv); CE_KGSYNC_NOISE_PEER_PUB (initiator
+//   side only, 64 hex chars, the responder's static pub). On a fresh
+//   deploy the operator runs `nxk_generate_static_keypair()` once per
+//   soul to populate these envs (the priv stays local; the pub is
+//   announced via out-of-band config).
+//
 // Conflict resolution
 //   When two peers teach the same label concurrently, both birth a local
 //   atom (different ids). On receive, if the local KG already holds an atom
@@ -86,9 +139,19 @@
 
 import "std/io"
 import "../../kg/atom_store.nova"
+import "./noise_xk.nova"
 
 // ---- protocol constants ---------------------------------------------------
+// v2 = plaintext (the historical default that all existing scenarios speak).
+// v3 = Noise XK mutual-auth handshake + ChaCha20-Poly1305 transport (this
+//      session, R6). v3 is gated by the CE_KGSYNC_REQUIRE_NOISE env flag:
+//        unset / "0": v2 plaintext is accepted (back-compat mode).
+//        "1"        : peers MUST speak v3 or the publisher rejects + logs.
+//      With v3 enabled, the publisher and subscriber negotiate Noise XK
+//      BEFORE the textual HELLO line; once the handshake completes both
+//      sides wrap the existing line-oriented protocol in nxk_seal/open.
 let KGSYNC_VERSION       = 2
+let KGSYNC_VERSION_V3    = 3      // wire bump when Noise XK is in play
 let KGSYNC_DEFAULT_PORT  = 8766
 let KGSYNC_DEFAULT_BIND  = "127.0.0.1"
 let KGSYNC_LINE_MAX      = 1024
@@ -1001,6 +1064,294 @@ fn kgsync_token_from_env() {
         if len(env) > 0 { return env }
     }
     return 0
+}
+
+// ---- R6 noise-xk env helpers ----------------------------------------------
+//
+// CE_KGSYNC_REQUIRE_NOISE: when "1" the publisher REJECTS plaintext
+//   subscribers and forces every connection through Noise XK. Default
+//   (unset / "0") leaves v2 plaintext available so existing scenarios
+//   keep passing untouched; v3 is opt-in via this flag + the supplied
+//   static keys.
+// CE_KGSYNC_NOISE_STATIC_PRIV: 64-char lowercase hex of own static priv.
+// CE_KGSYNC_NOISE_PEER_PUB:    64-char lowercase hex of peer static pub
+//                              (initiator only; the responder learns
+//                              the peer pubkey during handshake).
+// CE_KGSYNC_NOISE_ALLOWLIST:   comma-separated list of pubkeys the
+//                              responder will accept (mutual auth
+//                              binding). Optional; when unset any
+//                              pubkey passes the handshake.
+fn kgsync_noise_required_from_env() {
+    let env = getenv("CE_KGSYNC_REQUIRE_NOISE")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "0") == 1 { return 0 }
+    return 1
+}
+
+fn kgsync_noise_static_priv_from_env() {
+    let env = getenv("CE_KGSYNC_NOISE_STATIC_PRIV")
+    if env == 0 { return 0 }
+    if len(env) != 64 { return 0 }
+    return env
+}
+
+fn kgsync_noise_peer_pub_from_env() {
+    let env = getenv("CE_KGSYNC_NOISE_PEER_PUB")
+    if env == 0 { return 0 }
+    if len(env) != 64 { return 0 }
+    return env
+}
+
+fn kgsync_noise_allowlist_from_env() {
+    let env = getenv("CE_KGSYNC_NOISE_ALLOWLIST")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    return env
+}
+
+// True iff `pubkey_hex` matches one of the comma-separated entries in
+// the allowlist string. An empty allowlist returns 1 (no restriction).
+fn _kgsync_pub_in_allowlist(pubkey_hex, allowlist) {
+    if allowlist == 0 { return 1 }
+    if len(allowlist) == 0 { return 1 }
+    let i = 0
+    let start = 0
+    let n = len(allowlist)
+    while i <= n {
+        let at_end = 0
+        if i == n { at_end = 1 }
+        let is_sep = 0
+        if at_end == 0 {
+            if char_at(allowlist, i) == 44 { is_sep = 1 }    // ','
+        }
+        if at_end == 1 {
+            let part = substr(allowlist, start, i - start)
+            if str_eq(part, pubkey_hex) == 1 { return 1 }
+            return 0
+        }
+        if is_sep == 1 {
+            let part = substr(allowlist, start, i - start)
+            if str_eq(part, pubkey_hex) == 1 { return 1 }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- v3 framed send / recv over a noise XK state --------------------------
+//
+// The plain v2 line protocol speaks `_send_all(fd, "ATOM lang...\n")`
+// and `_recv_line(fd)`. v3 wraps every line in a Noise XK transport
+// frame on send and unwraps on recv. We keep the line-oriented invariant
+// (each AEAD frame carries exactly one '\n'-terminated text line) so
+// the higher-layer parsers (_parse_line etc.) don't need to change.
+
+let KGSYNC_NXK_S_FD     = 0
+let KGSYNC_NXK_S_STATE  = 1     // the nxk_state list
+let KGSYNC_NXK_S_ROLE   = 2     // NXK_ROLE_INITIATOR or NXK_ROLE_RESPONDER
+let KGSYNC_NXK_S_PEERPK = 3     // 64-char hex of the peer's static pubkey
+
+fn _kgsync_nxk_new(fd, st, role, peer_pubkey_hex) {
+    let s = list_new()
+    push(s, fd)
+    push(s, st)
+    push(s, role)
+    push(s, peer_pubkey_hex)
+    return s
+}
+
+// 4-byte big-endian length prefix helpers (mirror the v3 wire format).
+fn _kgsync_send_buf(fd, buf, n) {
+    let sent = 0
+    while sent < n {
+        let r = send_data(fd, buf + sent, n - sent)
+        if r <= 0 { return 0 }
+        sent = sent + r
+    }
+    return 1
+}
+
+fn _kgsync_recv_exact(fd, n) {
+    if n <= 0 { return 0 }
+    let buf = alloc(n + 1)
+    let got = 0
+    while got < n {
+        let r = recv_data(fd, buf + got, n - got)
+        if r <= 0 { return 0 }
+        got = got + r
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+// Send one text line (caller-formatted with trailing '\n') over the
+// Noise XK session. Returns 1 on success, 0 on transport/AEAD failure.
+fn kgsync_v3_send_line(noise_conn, line) {
+    if noise_conn == 0 { return 0 }
+    let fd = noise_conn[KGSYNC_NXK_S_FD]
+    let st = noise_conn[KGSYNC_NXK_S_STATE]
+    let role = noise_conn[KGSYNC_NXK_S_ROLE]
+    let n = len(line)
+    // Materialize the line into a byte buffer.
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(line, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let sealed = nxk_seal(st, role, buf, n)
+    if sealed == 0 { return 0 }
+    return _kgsync_send_buf(fd, sealed[0], sealed[1])
+}
+
+// Receive one text line over Noise XK. Reads the 4-byte BE length
+// header, then exactly that many bytes, then nxk_open()s it. Returns
+// the bare line string (no trailing '\n') on success, 0 on EOF / AEAD
+// failure / monotonicity violation.
+fn kgsync_v3_recv_line(noise_conn) {
+    if noise_conn == 0 { return 0 }
+    let fd = noise_conn[KGSYNC_NXK_S_FD]
+    let st = noise_conn[KGSYNC_NXK_S_STATE]
+    let role = noise_conn[KGSYNC_NXK_S_ROLE]
+    let hdr = _kgsync_recv_exact(fd, 4)
+    if hdr == 0 { return 0 }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let b2 = load8(hdr[0] + 2)
+    let b3 = load8(hdr[0] + 3)
+    let body_n = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                int_shl(b2, 8)), b3)
+    if body_n <= 0 { return 0 }
+    if body_n > 65536 { return 0 }
+    let body = _kgsync_recv_exact(fd, body_n)
+    if body == 0 { return 0 }
+    // Re-assemble the full frame for nxk_open.
+    let frame_n = 4 + body_n
+    let frame = alloc(frame_n + 1)
+    let i = 0
+    while i < 4 {
+        store8(frame + i, load8(hdr[0] + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < body_n {
+        store8(frame + 4 + j, load8(body[0] + j))
+        j = j + 1
+    }
+    store8(frame + frame_n, 0)
+    let opened = nxk_open(st, role, frame, frame_n)
+    if opened == 0 { return 0 }
+    // Convert plaintext bytes back to a NOVA string, stripping any
+    // trailing newline so _parse_line sees the familiar shape.
+    let n = opened[1]
+    let s = ""
+    let k = 0
+    while k < n {
+        let c = load8(opened[0] + k)
+        if c == 0 { k = n }
+        else {
+            if c == 10 { k = n }
+            else {
+                s = s + chr(c)
+                k = k + 1
+            }
+        }
+    }
+    return s
+}
+
+// Run a Noise XK handshake over an existing TCP fd. Returns a
+// `noise_conn` list on success, 0 on any failure.
+//
+// initiator: knows responder_pub_hex out-of-band; sends msg1 first.
+// responder: accepts msg1, sends msg2, accepts msg3.
+//
+// The wire framing for the handshake messages is `[4 byte BE len][N bytes]`
+// for each of the three messages, so the receiver knows exactly how
+// many bytes to await.
+
+fn _kgsync_send_framed(fd, buf, n) {
+    let hdr = alloc(5)
+    store8(hdr + 0, int_and(int_shr(n, 24), 255))
+    store8(hdr + 1, int_and(int_shr(n, 16), 255))
+    store8(hdr + 2, int_and(int_shr(n, 8), 255))
+    store8(hdr + 3, int_and(n, 255))
+    store8(hdr + 4, 0)
+    if _kgsync_send_buf(fd, hdr, 4) == 0 { return 0 }
+    return _kgsync_send_buf(fd, buf, n)
+}
+
+fn _kgsync_recv_framed(fd) {
+    let hdr = _kgsync_recv_exact(fd, 4)
+    if hdr == 0 { return 0 }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let b2 = load8(hdr[0] + 2)
+    let b3 = load8(hdr[0] + 3)
+    let n = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                          int_shl(b2, 8)), b3)
+    if n <= 0 { return 0 }
+    if n > 4096 { return 0 }     // handshake messages are <= 64 bytes
+    return _kgsync_recv_exact(fd, n)
+}
+
+// Initiator-side handshake driver. Static-priv-hex must be 64 chars;
+// responder-pub-hex must be 64 chars.
+fn kgsync_v3_handshake_initiator(fd, static_priv_hex, responder_pub_hex) {
+    let st = nxk_initiator_new(static_priv_hex, responder_pub_hex)
+    if st == 0 { return 0 }
+    let m1 = nxk_msg1_send(st)
+    if m1 == 0 { return 0 }
+    if _kgsync_send_framed(fd, m1[0], m1[1]) == 0 { return 0 }
+    let m2 = _kgsync_recv_framed(fd)
+    if m2 == 0 { return 0 }
+    if nxk_msg2_recv(st, m2[0], m2[1]) == 0 { return 0 }
+    let m3 = nxk_msg3_send(st)
+    if m3 == 0 { return 0 }
+    if _kgsync_send_framed(fd, m3[0], m3[1]) == 0 { return 0 }
+    if nxk_split(st) == 0 { return 0 }
+    return _kgsync_nxk_new(fd, st, NXK_ROLE_INITIATOR, responder_pub_hex)
+}
+
+// Responder-side handshake driver. Static-priv-hex must be 64 chars;
+// `allowlist` is the optional comma-separated allowed-initiator-pubkey
+// string (0 == accept any).
+fn kgsync_v3_handshake_responder(fd, static_priv_hex, allowlist) {
+    let st = nxk_responder_new(static_priv_hex)
+    if st == 0 { return 0 }
+    let m1 = _kgsync_recv_framed(fd)
+    if m1 == 0 { return 0 }
+    if nxk_msg1_recv(st, m1[0], m1[1]) == 0 { return 0 }
+    let m2 = nxk_msg2_send(st)
+    if m2 == 0 { return 0 }
+    if _kgsync_send_framed(fd, m2[0], m2[1]) == 0 { return 0 }
+    let m3 = _kgsync_recv_framed(fd)
+    if m3 == 0 { return 0 }
+    if nxk_msg3_recv(st, m3[0], m3[1]) == 0 { return 0 }
+    if nxk_split(st) == 0 { return 0 }
+    let peer_pub = nxk_peer_static_pub(st)
+    if peer_pub == 0 { return 0 }
+    if _kgsync_pub_in_allowlist(peer_pub, allowlist) == 0 { return 0 }
+    return _kgsync_nxk_new(fd, st, NXK_ROLE_RESPONDER, peer_pub)
+}
+
+// Accessor: the peer's static pubkey (hex) on a successfully-negotiated
+// noise connection. Returns 0 if the connection is null.
+fn kgsync_v3_peer_pubkey(noise_conn) {
+    if noise_conn == 0 { return 0 }
+    return noise_conn[KGSYNC_NXK_S_PEERPK]
+}
+
+// Accessor: the underlying fd (so callers can close the socket).
+fn kgsync_v3_fd(noise_conn) {
+    if noise_conn == 0 { return -1 }
+    return noise_conn[KGSYNC_NXK_S_FD]
 }
 
 // Resolve the initial expected-subscriber count.
