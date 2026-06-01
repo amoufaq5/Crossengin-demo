@@ -1,0 +1,719 @@
+// CrossEngin io/transducers: spatial k-means image segmentation (R11E).
+//
+// Purpose
+//   Beyond features (SIFT / ORB), edges (Sobel / Canny), depth (stereo),
+//   and motion (LK), the CV pipeline still has NO COARSER notion of
+//   "where are the regions?" -- a frame is just a bag of pixels until
+//   something partitions it into homogeneous groups. K-means in the
+//   (intensity, x, y) joint space is the simplest, most-robust integer
+//   shot at region partitioning -- no clustering library, no graph cut,
+//   no DBSCAN epsilon-knob, no SLIC superpixel pipeline. K centroids
+//   are placed on a grid; each iteration assigns every pixel to the
+//   nearest centroid by combined intensity+spatial distance and then
+//   recomputes the centroid as the mean of its members.
+//
+//   This is NOT a perceptual-superpixel segmenter (which would weight
+//   colour over space and clamp centroids to local neighbourhoods).
+//   It IS the textbook spatial k-means -- Lloyd's algorithm on a fixed
+//   K -- run in pure integer arithmetic so the output is deterministic
+//   across platforms.
+//
+// Algorithm (textbook Lloyd's k-means):
+//   1. Initialize K centroids on an interior grid: K=1 -> center;
+//      K=2 -> (W/2, H/4) and (W/2, 3H/4); K=4 -> the 4 quadrant
+//      centers; K=5 -> the 4 corners of quadrants + image center;
+//      arbitrary K >= 2 -> tiled grid laid down in row-major order
+//      (ceil(sqrt(K)) rows and cols, then clip to K). Initial
+//      intensity for each centroid is the pixel at its (x, y).
+//   2. Assignment: per-pixel argmin over k of
+//        d_k(x, y) = w_intensity * (I(x,y) - I_k)^2
+//                  + w_spatial   * ((x - x_k)^2 + (y - y_k)^2)
+//      Ties go to the LOWER cluster id (stable behaviour). All
+//      arithmetic is integer (no floats); the squared-distance fits
+//      in a 64-bit accumulator because at the max dim 256x256 the
+//      worst-case spatial-square is 2 * 256^2 = 131072 and the
+//      intensity-square is 255^2 = 65025 -- their sum, times weights
+//      <= 1000, stays comfortably below 2^31.
+//   3. Update: for each cluster k, recompute centroid as integer mean
+//      of all assigned pixel (I, x, y). Empty clusters retain their
+//      previous centroid (Lloyd's classic degenerate case; we don't
+//      re-seed because that would break determinism).
+//   4. Stop when no assignment changed OR max_iter reached.
+//
+// Public API
+//   seg_kmeans(data_ptr, width, height, k, max_iter) -> seg_result
+//   seg_kmeans_weighted(data_ptr, width, height, k, max_iter,
+//                       w_intensity, w_spatial) -> seg_result
+//   seg_label_at(result, x, y) -> int cluster id (or SEG_LABEL_OOB)
+//   seg_centroid_count(result) -> int (== K on success, 0 on failure)
+//   seg_centroid_at(result, k) -> list [I_centroid, x_centroid, y_centroid]
+//   seg_iterations(result) -> int (1..max_iter)
+//   seg_converged(result)  -> int (1 if no change on the last step, else 0)
+//   seg_width(result)      -> int
+//   seg_height(result)     -> int
+//   seg_render_pgm(result, data_ptr) -> int byte buffer ptr
+//                                        (PGM P5 bytes, caller frees)
+//   seg_render_pgm_size(result)      -> int total length of the rendered
+//                                        PGM bytes (for the sys_write).
+//   seg_cluster_count_label(k) -> string atom label for VP wiring
+//   seg_dominant_label(result) -> string atom label "image_segmentation_dominant_<k>"
+//   seg_render_to_file(result, data_ptr, path) -> 1 on success / 0 on failure
+//
+// Caps:
+//   * Dimensions <= 256 per axis (max area = 65536).
+//   * K in [SEG_MIN_K=1, SEG_MAX_K=32].
+//   * max_iter <= SEG_MAX_ITER = 50.
+//   * Weights are positive integers; defaults (1, 1) keep arithmetic small.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, int_to_str.
+//   syscall: sys_open, sys_write, sys_fsync, sys_close, O_WRONLY,
+//   O_CREAT, O_TRUNC (for seg_render_to_file).
+// CrossEngin dependencies: image_pgm.nova ONLY (used by the chat helper
+//   to decode the operator-supplied PGM path; everything else is leaf).
+//   visual_perception.nova imports THIS module, not the other way around.
+
+import "std/syscall"
+import "image_pgm.nova"
+
+// ---- format constants ----------------------------------------------------
+
+// Dimension cap. 256 * 256 = 65536 == 2^16, well under NOVA's
+// pointer-threshold gotcha and small enough that the per-iteration
+// per-pixel loop stays under a few million instructions.
+let SEG_MAX_DIM        = 256
+let SEG_MAX_PIXEL_AREA = 65536
+
+// K cap. Twenty-eight clusters covers practical scene segmentation;
+// going beyond 32 hits the small-cluster degenerate regime that
+// undermines k-means anyway.
+let SEG_MIN_K = 1
+let SEG_MAX_K = 32
+
+// Iteration cap. Lloyd's algorithm converges in <= 10 iterations on
+// 99% of well-conditioned fixtures; 50 is the operator escape valve.
+let SEG_MAX_ITER = 50
+
+// Default weights. Both = 1 gives equal weight to one-unit intensity
+// difference and one-unit spatial distance (i.e., a single grayscale
+// step matters as much as one pixel of separation). This is the
+// CLASSIC spatial k-means tradeoff.
+let SEG_DEFAULT_W_INTENSITY = 1
+let SEG_DEFAULT_W_SPATIAL   = 1
+
+// Sentinel returned by seg_label_at on out-of-bounds. Picked outside
+// the valid range [0..SEG_MAX_K-1] so callers can string-match it.
+let SEG_LABEL_OOB = -1
+
+// Result tuple slot indices. Exposed for accessors and tests.
+let SEG_R_LABELS     = 0   // list of int (length area), per-pixel cluster id
+let SEG_R_CENTROIDS  = 1   // list of [I, x, y] triples (length K)
+let SEG_R_WIDTH      = 2
+let SEG_R_HEIGHT     = 3
+let SEG_R_K          = 4
+let SEG_R_ITER       = 5   // number of iterations actually run (1..max)
+let SEG_R_CONVERGED  = 6   // 1 if assignments stable on last iter, 0 otherwise
+
+// ---- result helpers ------------------------------------------------------
+
+fn _seg_result(labels, centroids, w, h, k, iters, converged) {
+    let r = list_new()
+    push(r, labels)
+    push(r, centroids)
+    push(r, w)
+    push(r, h)
+    push(r, k)
+    push(r, iters)
+    push(r, converged)
+    return r
+}
+
+fn _seg_fail() {
+    return _seg_result(list_new(), list_new(), 0, 0, 0, 0, 0)
+}
+
+fn _seg_centroid(intensity, x, y) {
+    let c = list_new()
+    push(c, intensity)
+    push(c, x)
+    push(c, y)
+    return c
+}
+
+// ---- centroid initialization --------------------------------------------
+//
+// Lay K centroids on a tiled grid INSIDE the image. cols = ceil(sqrt(K))
+// rows = ceil(K / cols). Within each row we step in equal increments of
+// W/cols; same for H/rows. The K=1, 2, 4, 5 cases land on intuitive
+// positions (center / vertical halves / quadrant centers / quincunx).
+// Initial intensity is the pixel sampled at the centroid's (x, y).
+
+fn _seg_isqrt_ceil(n) {
+    // Integer ceiling of sqrt(n). Linear in sqrt(n) -- K <= 32 so the
+    // loop body runs at most 6 times.
+    if n <= 1 { return 1 }
+    let i = 1
+    while int_mul(i, i) < n {
+        i = int_add(i, 1)
+    }
+    return i
+}
+
+fn _seg_init_centroids(data_ptr, width, height, k) {
+    let centroids = list_new()
+    if k <= 0 { return centroids }
+    let cols = _seg_isqrt_ceil(k)
+    if cols <= 0 { cols = 1 }
+    let rows = k / cols
+    if int_mul(rows, cols) < k { rows = int_add(rows, 1) }
+    if rows <= 0 { rows = 1 }
+    let placed = 0
+    let r = 0
+    while r < rows {
+        if placed < k {
+            // Vertical coordinate: ((2r + 1) * H) / (2 * rows). Lands at
+            // the row mid-line. For rows=2 the values are H/4 and 3H/4.
+            let y_cent = int_mul(int_add(int_mul(2, r), 1), height) / int_mul(2, rows)
+            if y_cent < 0 { y_cent = 0 }
+            if y_cent >= height { y_cent = height - 1 }
+            let c = 0
+            while c < cols {
+                if placed < k {
+                    let x_cent = int_mul(int_add(int_mul(2, c), 1), width) / int_mul(2, cols)
+                    if x_cent < 0 { x_cent = 0 }
+                    if x_cent >= width { x_cent = width - 1 }
+                    let i_cent = load8(data_ptr + int_add(int_mul(y_cent, width), x_cent))
+                    push(centroids, _seg_centroid(i_cent, x_cent, y_cent))
+                    placed = int_add(placed, 1)
+                }
+                c = int_add(c, 1)
+            }
+        }
+        r = int_add(r, 1)
+    }
+    return centroids
+}
+
+// ---- assignment step ----------------------------------------------------
+//
+// Walk every pixel and pick the centroid with minimum squared distance
+// in the (intensity, x, y) joint space. Writes the assigned cluster id
+// into `labels` at the pixel's offset; returns the count of pixels
+// whose assignment CHANGED from `labels` initial state. The change
+// count drives the convergence check (== 0 -> converged).
+
+fn _seg_squared_dist(p_intensity, px, py, centroid, w_intensity, w_spatial) {
+    let di = int_sub(p_intensity, centroid[0])
+    let dx = int_sub(px, centroid[1])
+    let dy = int_sub(py, centroid[2])
+    let d_int = int_mul(di, di)
+    let d_x   = int_mul(dx, dx)
+    let d_y   = int_mul(dy, dy)
+    let d_sp  = int_add(d_x, d_y)
+    return int_add(int_mul(w_intensity, d_int), int_mul(w_spatial, d_sp))
+}
+
+fn _seg_assign(data_ptr, labels, centroids, width, height,
+               w_intensity, w_spatial) {
+    let area = int_mul(width, height)
+    let k = len(centroids)
+    let changes = 0
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let off = int_add(row_off, x)
+            let p = load8(data_ptr + off)
+            // Compute distance to centroid 0 first; then walk the rest
+            // looking for a strictly-smaller distance (ties keep the
+            // lower id -- deterministic).
+            let best = 0
+            let best_d = _seg_squared_dist(p, x, y, centroids[0],
+                                           w_intensity, w_spatial)
+            let kk = 1
+            while kk < k {
+                let d = _seg_squared_dist(p, x, y, centroids[kk],
+                                          w_intensity, w_spatial)
+                if d < best_d {
+                    best_d = d
+                    best = kk
+                }
+                kk = int_add(kk, 1)
+            }
+            if labels[off] != best {
+                list_set(labels, off, best)
+                changes = int_add(changes, 1)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return changes
+}
+
+// ---- update step --------------------------------------------------------
+//
+// Recompute every centroid as the integer mean of its assigned pixels.
+// Empty clusters keep their previous centroid (Lloyd's classic
+// stale-centroid handling). The accumulator widths are safe: at the
+// 256x256 cap the worst-case sum_intensity = 65536 * 255 = 16711680
+// (under 2^25); sum_x or sum_y bounded by 65536 * 256 = 16777216 == 2^24.
+
+fn _seg_update(data_ptr, labels, centroids, width, height) {
+    let area = int_mul(width, height)
+    let k = len(centroids)
+    let sums_i = list_new()
+    let sums_x = list_new()
+    let sums_y = list_new()
+    let counts = list_new()
+    let i = 0
+    while i < k {
+        push(sums_i, 0)
+        push(sums_x, 0)
+        push(sums_y, 0)
+        push(counts, 0)
+        i = int_add(i, 1)
+    }
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let off = int_add(row_off, x)
+            let c = labels[off]
+            if c >= 0 {
+                if c < k {
+                    list_set(sums_i, c, int_add(sums_i[c], load8(data_ptr + off)))
+                    list_set(sums_x, c, int_add(sums_x[c], x))
+                    list_set(sums_y, c, int_add(sums_y[c], y))
+                    list_set(counts, c, int_add(counts[c], 1))
+                }
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let kk = 0
+    while kk < k {
+        let n = counts[kk]
+        if n > 0 {
+            let new_i = sums_i[kk] / n
+            let new_x = sums_x[kk] / n
+            let new_y = sums_y[kk] / n
+            list_set(centroids, kk, _seg_centroid(new_i, new_x, new_y))
+        }
+        kk = int_add(kk, 1)
+    }
+    return 1
+}
+
+// ---- public: seg_kmeans_weighted -----------------------------------------
+
+fn seg_kmeans_weighted(data_ptr, width, height, k, max_iter,
+                       w_intensity, w_spatial) {
+    if width <= 0   { return _seg_fail() }
+    if height <= 0  { return _seg_fail() }
+    if data_ptr == 0 { return _seg_fail() }
+    if width > SEG_MAX_DIM  { return _seg_fail() }
+    if height > SEG_MAX_DIM { return _seg_fail() }
+    let area = int_mul(width, height)
+    if area > SEG_MAX_PIXEL_AREA { return _seg_fail() }
+    if k < SEG_MIN_K { return _seg_fail() }
+    if k > SEG_MAX_K { return _seg_fail() }
+    if max_iter <= 0 { return _seg_fail() }
+    if max_iter > SEG_MAX_ITER { max_iter = SEG_MAX_ITER }
+    if w_intensity <= 0 { w_intensity = SEG_DEFAULT_W_INTENSITY }
+    if w_spatial   <= 0 { w_spatial   = SEG_DEFAULT_W_SPATIAL }
+
+    // Initialize labels with a sentinel (-1) so the very first assignment
+    // counts every pixel as a "change" -- the iter loop sees a positive
+    // change count and runs at least once.
+    let labels = list_new()
+    let p = 0
+    while p < area {
+        push(labels, -1)
+        p = int_add(p, 1)
+    }
+
+    let centroids = _seg_init_centroids(data_ptr, width, height, k)
+    if len(centroids) != k { return _seg_fail() }
+
+    let iters = 0
+    let converged = 0
+    let keep = 1
+    while keep == 1 {
+        let changes = _seg_assign(data_ptr, labels, centroids, width, height,
+                                  w_intensity, w_spatial)
+        iters = int_add(iters, 1)
+        if changes == 0 {
+            converged = 1
+            keep = 0
+        } else {
+            _seg_update(data_ptr, labels, centroids, width, height)
+            if iters >= max_iter { keep = 0 }
+        }
+    }
+    return _seg_result(labels, centroids, width, height, k, iters, converged)
+}
+
+// seg_kmeans -- default-weights convenience.
+fn seg_kmeans(data_ptr, width, height, k, max_iter) {
+    return seg_kmeans_weighted(data_ptr, width, height, k, max_iter,
+                               SEG_DEFAULT_W_INTENSITY, SEG_DEFAULT_W_SPATIAL)
+}
+
+// ---- result accessors ---------------------------------------------------
+
+fn seg_centroid_count(result) {
+    if len(result) <= SEG_R_K { return 0 }
+    return result[SEG_R_K]
+}
+
+fn seg_centroid_at(result, k) {
+    let centroids = result[SEG_R_CENTROIDS]
+    if k < 0 { return _seg_centroid(0, 0, 0) }
+    if k >= len(centroids) { return _seg_centroid(0, 0, 0) }
+    return centroids[k]
+}
+
+fn seg_iterations(result) {
+    if len(result) <= SEG_R_ITER { return 0 }
+    return result[SEG_R_ITER]
+}
+
+fn seg_converged(result) {
+    if len(result) <= SEG_R_CONVERGED { return 0 }
+    return result[SEG_R_CONVERGED]
+}
+
+fn seg_width(result) {
+    if len(result) <= SEG_R_WIDTH { return 0 }
+    return result[SEG_R_WIDTH]
+}
+
+fn seg_height(result) {
+    if len(result) <= SEG_R_HEIGHT { return 0 }
+    return result[SEG_R_HEIGHT]
+}
+
+// seg_label_at: bounds-checked per-pixel cluster id. Returns SEG_LABEL_OOB
+// (-1) on any out-of-range coordinate so callers can match without
+// crashing.
+fn seg_label_at(result, x, y) {
+    let w = seg_width(result)
+    let h = seg_height(result)
+    if w <= 0 { return SEG_LABEL_OOB }
+    if h <= 0 { return SEG_LABEL_OOB }
+    if x < 0 { return SEG_LABEL_OOB }
+    if y < 0 { return SEG_LABEL_OOB }
+    if x >= w { return SEG_LABEL_OOB }
+    if y >= h { return SEG_LABEL_OOB }
+    let labels = result[SEG_R_LABELS]
+    let off = int_add(int_mul(y, w), x)
+    if off < 0 { return SEG_LABEL_OOB }
+    if off >= len(labels) { return SEG_LABEL_OOB }
+    return labels[off]
+}
+
+// ---- VP label helpers ---------------------------------------------------
+//
+// Labels follow the existing pattern of the other CV modules:
+// "image_<modality>_<bucket>" so the substrate can match them as plain
+// atom strings.
+
+fn seg_cluster_count_label(k) {
+    return "image_segmentation_cluster_count_" + int_to_str(k)
+}
+
+// seg_dominant_label: returns "image_segmentation_dominant_<k>" where k
+// is the cluster id with the LARGEST member count. Useful as a coarse
+// "what's the most-common region?" gate.
+fn seg_dominant_label(result) {
+    let centroids = result[SEG_R_CENTROIDS]
+    let k = len(centroids)
+    if k <= 0 { return "image_segmentation_dominant_0" }
+    let counts = list_new()
+    let i = 0
+    while i < k {
+        push(counts, 0)
+        i = int_add(i, 1)
+    }
+    let labels = result[SEG_R_LABELS]
+    let n = len(labels)
+    let p = 0
+    while p < n {
+        let c = labels[p]
+        if c >= 0 {
+            if c < k {
+                list_set(counts, c, int_add(counts[c], 1))
+            }
+        }
+        p = int_add(p, 1)
+    }
+    let best = 0
+    let best_n = counts[0]
+    let kk = 1
+    while kk < k {
+        if counts[kk] > best_n {
+            best_n = counts[kk]
+            best = kk
+        }
+        kk = int_add(kk, 1)
+    }
+    return "image_segmentation_dominant_" + int_to_str(best)
+}
+
+// ---- PGM rendering ------------------------------------------------------
+//
+// Render the segmentation as a PGM-P5 byte buffer where every pixel's
+// intensity is replaced by its cluster's centroid intensity. Caller is
+// responsible for the buffer (returned via alloc()); the byte total
+// matches `seg_render_pgm_size`.
+//
+// Header shape (matches `convert`'s output):
+//   "P5\n<width> <height>\n255\n" then width * height bytes.
+
+fn _seg_int_digits(n) {
+    if n <= 0 { return 1 }
+    let d = 0
+    let v = n
+    while v > 0 {
+        d = int_add(d, 1)
+        v = v / 10
+    }
+    return d
+}
+
+fn _seg_header_len(width, height) {
+    // "P5\n"           = 3 bytes
+    // digits(w)         = D_w
+    // " "               = 1 byte
+    // digits(h)         = D_h
+    // "\n"              = 1 byte
+    // "255\n"           = 4 bytes
+    // Total           = 9 + D_w + D_h.
+    // For 32x32 the header is "P5\n32 32\n255\n" = 13 bytes.
+    return int_add(9, int_add(_seg_int_digits(width), _seg_int_digits(height)))
+}
+
+fn seg_render_pgm_size(result) {
+    let w = seg_width(result)
+    let h = seg_height(result)
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    return int_add(_seg_header_len(w, h), int_mul(w, h))
+}
+
+fn _seg_write_int_dec(buf, off, n) {
+    // Writes the decimal repr of n at buf+off; returns the new offset.
+    if n <= 0 {
+        store8(buf + off, 48)   // '0'
+        return int_add(off, 1)
+    }
+    let d = _seg_int_digits(n)
+    let v = n
+    let i = int_sub(d, 1)
+    while i >= 0 {
+        store8(buf + off + i, int_add(48, v - int_mul(v / 10, 10)))
+        v = v / 10
+        i = int_sub(i, 1)
+    }
+    return int_add(off, d)
+}
+
+fn seg_render_pgm(result, data_ptr) {
+    let w = seg_width(result)
+    let h = seg_height(result)
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    let labels = result[SEG_R_LABELS]
+    let centroids = result[SEG_R_CENTROIDS]
+    let k = len(centroids)
+    let total = seg_render_pgm_size(result)
+    let buf = alloc(total + 1)
+    // Header: "P5\n<w> <h>\n255\n".
+    let off = 0
+    store8(buf + off, 80) off = int_add(off, 1)     // 'P'
+    store8(buf + off, 53) off = int_add(off, 1)     // '5'
+    store8(buf + off, 10) off = int_add(off, 1)     // '\n'
+    off = _seg_write_int_dec(buf, off, w)
+    store8(buf + off, 32) off = int_add(off, 1)     // ' '
+    off = _seg_write_int_dec(buf, off, h)
+    store8(buf + off, 10) off = int_add(off, 1)     // '\n'
+    store8(buf + off, 50) off = int_add(off, 1)     // '2'
+    store8(buf + off, 53) off = int_add(off, 1)     // '5'
+    store8(buf + off, 53) off = int_add(off, 1)     // '5'
+    store8(buf + off, 10) off = int_add(off, 1)     // '\n'
+    // Pixel payload: every pixel gets its cluster centroid intensity.
+    let n = int_mul(w, h)
+    let p = 0
+    while p < n {
+        let c = labels[p]
+        let v = 0
+        if c >= 0 {
+            if c < k {
+                let centroid = centroids[c]
+                v = centroid[0]
+            }
+        }
+        if v < 0 { v = 0 }
+        if v > 255 { v = 255 }
+        store8(buf + off, v)
+        off = int_add(off, 1)
+        p = int_add(p, 1)
+    }
+    store8(buf + total, 0)
+    return buf
+}
+
+// seg_render_to_file: drive seg_render_pgm then sys_write the bytes.
+// Returns 1 on success, 0 on any syscall failure.
+let _SEG_FILE_MODE = 420   // 0644 rw-r--r--
+
+fn seg_render_to_file(result, data_ptr, path) {
+    let total = seg_render_pgm_size(result)
+    if total <= 0 { return 0 }
+    let buf = seg_render_pgm(result, data_ptr)
+    if buf == 0 { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, _SEG_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, total)
+    if written != total {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// ---- chat admin helper ---------------------------------------------------
+//
+// `/segment <pgm> [k]` admin -- the chat dispatches `seg_pgm_args(arg)`
+// directly (one io_println call), so this module owns the full PGM-parse
+// + seg_kmeans + render + write pipeline. The segmented PGM is written
+// to SEG_OUTPUT_PATH (= /tmp/segmented.pgm) so operators can `display`
+// or `convert` it for inspection.
+
+let SEG_OUTPUT_PATH = "/tmp/segmented.pgm"
+let SEG_DEFAULT_K   = 5
+let SEG_DEFAULT_MAX_ITER = 10
+
+fn _seg_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn _seg_str_to_int_default(s, default_v) {
+    if len(s) == 0 { return default_v }
+    let v = 0
+    let i = 0
+    let n = len(s)
+    let ok = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 48 {
+            if c <= 57 {
+                v = int_add(int_mul(v, 10), int_sub(c, 48))
+                ok = 1
+                i = int_add(i, 1)
+            } else {
+                return default_v
+            }
+        } else {
+            return default_v
+        }
+    }
+    if ok == 0 { return default_v }
+    return v
+}
+
+fn seg_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/segment needs PATH -- usage: /segment /tmp/test.pgm [k])"
+    }
+    let parts = _seg_split_two(arg)
+    let path = parts[0]
+    let k = _seg_str_to_int_default(parts[1], SEG_DEFAULT_K)
+    if k < SEG_MIN_K { k = SEG_DEFAULT_K }
+    if k > SEG_MAX_K { k = SEG_MAX_K }
+    let r_p = pgm_parse_file(path)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(segment FAILED on " + path + ": " + err_p + ")"
+    }
+    let w = pgm_result_width(r_p)
+    let h = pgm_result_height(r_p)
+    let data = pgm_result_data(r_p)
+    if w > SEG_MAX_DIM {
+        return "(segment FAILED: width " + int_to_str(w)
+            + " > " + int_to_str(SEG_MAX_DIM) + " cap; downsample first)"
+    }
+    if h > SEG_MAX_DIM {
+        return "(segment FAILED: height " + int_to_str(h)
+            + " > " + int_to_str(SEG_MAX_DIM) + " cap; downsample first)"
+    }
+    let result = seg_kmeans(data, w, h, k, SEG_DEFAULT_MAX_ITER)
+    let detected_k = seg_centroid_count(result)
+    if detected_k <= 0 {
+        return "(segment FAILED: kmeans rejected input -- check K / dims)"
+    }
+    let iters = seg_iterations(result)
+    let converged = seg_converged(result)
+    let dom = seg_dominant_label(result)
+    let wrote = seg_render_to_file(result, data, SEG_OUTPUT_PATH)
+    let conv_str = "no"
+    if converged == 1 { conv_str = "yes" }
+    let wrote_str = "no"
+    if wrote == 1 { wrote_str = "yes" }
+    return "(segment " + int_to_str(w) + "x" + int_to_str(h)
+        + " k=" + int_to_str(detected_k)
+        + " iterations=" + int_to_str(iters)
+        + " converged=" + conv_str
+        + " dominant=" + dom
+        + " wrote=" + wrote_str + " path=" + SEG_OUTPUT_PATH + ")"
+}
+
+// ---- visual-perception integration --------------------------------------
+//
+// seg_append_features(feats, data_ptr, width, height)
+//   Runs seg_kmeans(K=SEG_VP_DEFAULT_K) and appends:
+//     image_segmentation_cluster_count_<K>   -- centroid count detected
+//     image_segmentation_dominant_<i>        -- majority cluster id
+//   Called from visual_perception's structural-feature path when the
+//   image is at least SEG_VP_MIN_DIM in each axis (64 default). Small
+//   fixtures skip segmentation -- not enough pixels for K=5 to be
+//   meaningful.
+
+let SEG_VP_MIN_DIM = 64
+let SEG_VP_DEFAULT_K = 5
+let SEG_VP_MAX_ITER = 10
+
+fn seg_append_features(feats, data_ptr, width, height) {
+    if width < SEG_VP_MIN_DIM  { return 0 }
+    if height < SEG_VP_MIN_DIM { return 0 }
+    if width > SEG_MAX_DIM { return 0 }
+    if height > SEG_MAX_DIM { return 0 }
+    let r = seg_kmeans(data_ptr, width, height,
+                       SEG_VP_DEFAULT_K, SEG_VP_MAX_ITER)
+    let k = seg_centroid_count(r)
+    if k <= 0 { return 0 }
+    push(feats, seg_cluster_count_label(k))
+    push(feats, seg_dominant_label(r))
+    return 1
+}

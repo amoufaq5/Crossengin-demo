@@ -3,6 +3,269 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R11A (this session) — IO: pyramidal Lucas-Kanade optical flow (Bouguet 2000 extension)
+
+**Status: complete -- `src/io/transducers/image_optical_flow.nova` EXTENDS
+R10D's single-level Lucas-Kanade with the classical coarse-to-fine
+Gaussian pyramid + iterative warping orchestrator from Bouguet 2000.**
+R10D was exact in the first-order Taylor regime (sub-pixel shifts) but
+under-estimated multi-pixel shifts -- the textbook fixture measured
+u ~ 2384 milli when the target was 3000 milli (3 px shift). R11A
+handles displacements up to ~16 px on a 256 px image.
+
+### Algorithm
+
+1. Build Gaussian pyramids of both frames at L levels (3x3 Gaussian
+   smooth + 2x downsample per level, default L=3).
+2. From coarsest to finest: warp NEXT by current flow (integer-rounded),
+   run R10D's `lk_optical_flow` -> per-pixel correction, aggregate
+   via clamped mean (+/-4000 milli per pixel ceiling to suppress
+   boundary outliers), update global (u, v) += (du, dv). Iterate up
+   to MAX_ITER=3 times per level.
+3. Upsample (u, v) by 2 when descending levels.
+4. Final pass writes per-pixel field = global + level-0 residual.
+
+### What landed
+
+- **`src/io/transducers/image_optical_flow.nova`** (+~600 lines,
+  EXTENDED). New public API: `lk_pyramid_build`,
+  `lk_pyramid_level_width/height/data`, `lk_warp_image`,
+  `lk_optical_flow_pyramid`, `lk_pgm_args_pyramid`,
+  `lk_pgm_paths_pyramid`. R10D surfaces untouched.
+- **`examples/crossengin_chat.nova`** (+1 line): `/flow_pyr
+  prev.pgm next.pgm` dispatch (no help line; +1 dispatch + 0 help
+  to stay in chat budget).
+
+### Headline numbers
+
+| Fixture (80x64)             | Single-level (R10D) | Pyramid (R11A) | Target |
+|----------------------------:|--------------------:|---------------:|-------:|
+| 8-px right shift, u@(20,16) | 5697 milli          | 7531 milli     | 8000   |
+| 4-px down shift, v@(20,16)  | -                   | 4116 milli     | 4000   |
+| (3,3) diag, u@(20,16)       | -                   | 2962 milli     | 3000   |
+| (3,3) diag, v@(20,16)       | -                   | 2762 milli     | 3000   |
+| Identical, mean_mag         | 0                   | 0              | 0      |
+| Textureless, valid_count    | 0 / 1024            | 0 / 1024       | 0      |
+
+### Tests
+
+- **`tests/unit/test_optical_flow_pyramid.nova`** (NEW, 52
+  assertions). All R10D tests stay bit-identically green.
+- **`tests/integration/scenario_uu_pyramid_flow.sh`** (NEW, 12
+  assertions). `scenario_ss_optical_flow.sh` (R10D) stays green.
+
+### Module count: unchanged (extend-only). Coexists with R11E
+(`/segment`) and R11B (audio_pitch YIN extension), no file overlap.
+
+### Limitations / follow-ups (R11A)
+
+- **Translational-aggregate simplification.** Reduces each level's
+  per-pixel field to a single clamped-mean shift. Converges fast on
+  rigid translation but blurs across rotational / non-rigid motion.
+  The full Bouguet algorithm with per-pixel propagation is a
+  R11A.2 follow-up.
+- **Per-iteration correction clamp = +/-4000 milli** (per LEVEL pixel,
+  auto-scales with pyramid depth).
+- **Outlier rejection is a clamp, not a median** (the clamp's O(N)
+  is the pragmatic trade vs O(N log N) for a true median).
+
+## R11E (this session) — IO: spatial k-means image segmentation
+
+**Status: complete -- new module `src/io/transducers/image_segmentation.nova`
+ships textbook Lloyd's k-means on the (intensity, x, y) joint space, the
+first COARSE region partitioner the CV pipeline has. Everything before
+R11E (Sobel, Harris, SIFT, ORB, Canny, stereo, optical flow) operated on
+single pixels, gradients, or windows; segmentation now answers "which
+pixels belong to the same region?" so downstream code can reason about
+shapes rather than bags-of-pixels.**
+
+### Algorithm (textbook spatial k-means)
+
+1. **Initialize** K centroids on a tiled `ceil(sqrt(K))` x `ceil(K/cols)`
+   interior grid. K=1 -> center; K=2 -> (W/4, H/2) and (3W/4, H/2); K=4
+   -> the four quadrant centers; K=5 -> 2x3 grid with one slot empty.
+   Initial intensity is the pixel at the centroid's (x, y).
+2. **Assignment**: per-pixel argmin over k of
+   `d_k = w_intensity * (I - I_k)^2 + w_spatial * ((x - x_k)^2 + (y - y_k)^2)`.
+   Ties break to the lower cluster id (deterministic).
+3. **Update**: per-cluster integer mean of `(I, x, y)`. Empty clusters
+   retain their previous centroid (Lloyd's classic stale-centroid case).
+4. **Stop** when assignments don't change OR `max_iter` is reached.
+
+### Public API
+
+* `seg_kmeans(data_ptr, width, height, k, max_iter) -> result`
+* `seg_kmeans_weighted(..., w_intensity, w_spatial) -> result`
+* `seg_label_at(result, x, y) -> int` (returns `-1` on OOB)
+* `seg_centroid_count(result) -> int`
+* `seg_centroid_at(result, k) -> [I, x, y]`
+* `seg_iterations(result)` / `seg_converged(result)` /
+  `seg_width / seg_height(result)`
+* `seg_render_pgm(result, data_ptr) -> byte buffer`
+* `seg_render_to_file(result, data_ptr, path) -> 1/0`
+* `seg_cluster_count_label(k)` / `seg_dominant_label(result)`
+* `seg_append_features(feats, data_ptr, w, h)` -- visual_perception hook
+* `seg_pgm_args(arg)` -- chat `/segment PATH [K]` driver
+
+### Caps
+
+* Dimensions <= 256 per axis (max area 65536 pixels).
+* K in [1, 32].
+* max_iter <= 50.
+
+### Wiring
+
+* `visual_perception.nova` -- adds `image_segmentation.nova` import and
+  one `seg_append_features` call inside `_vp_append_structural_features`
+  (only fires when both dims >= `SEG_VP_MIN_DIM=64`).
+* `crossengin_chat.nova` -- adds `/segment PATH [K]` admin (one dispatch
+  line, one help line). Writes segmented PGM to `/tmp/segmented.pgm`.
+
+### Verification (R11E)
+
+* `make test`: **158 unit tests pass** (was 157 before R11E; +1 for the
+  new `test_image_segmentation.nova` suite, 69 assertions covering K=2
+  LR / K=4 quadrant / K=1 trivial / uniform-image / iteration cap /
+  dimension cap / K cap / OOB-label / weighted variant / render PGM /
+  label-string paths).
+* `tests/integration/scenario_ww_segmentation.sh`: **16 assertions pass**
+  (4-quadrant fixture, chat dispatch, missing-file safety, /help label).
+  K=4 quadrant fixture converges in 2 iterations with centroid intensities
+  0 / 85 / 170 / 255 each within +/-0 of expected.
+* All pre-existing CV scenarios still pass: scenario_cc (SIFT),
+  scenario_ee (ORB), scenario_hh (stereo), scenario_ss (optical flow),
+  scenario_q_image_see (full /see pipeline).
+
+### Known limitations (R11E)
+
+* **Deterministic grid init, not k-means++**: a tiled grid lays the K
+  centroids regardless of pixel distribution. K-means++ (D^2-weighted
+  sampling) would improve convergence on adversarial inputs at the
+  cost of a non-trivial second pass.
+* **No empty-cluster recovery**: Lloyd's classic stale-centroid case
+  retains the previous centroid when a cluster has zero members.
+* **L2 squared distance is integer-exact only up to 256x256**: the
+  worst-case spatial-square `256^2 = 65536` plus intensity-square
+  `255^2 = 65025` stays under 2^31 at default weights. Weights >> 1000
+  risk overflow.
+* **No superpixel connectivity constraint**: spatial k-means does NOT
+  enforce connectivity, so a single cluster may span disconnected
+  regions if they share an intensity.
+
+### Future work (R11E)
+
+* **K-means++ seeding** to dodge worst-case grid init.
+* **Multi-scale segmentation** -- run k-means at multiple K and merge
+  via region-adjacency graph (the start of a real superpixel pipeline).
+* **Per-cluster atom emission** -- a per-cluster centroid atom
+  (`image_segmentation_centroid_<k>_intensity_<bucket>`) would expose
+  scene composition to the KG.
+
+## R11F (this session) — KG: label-propagation community detection
+
+**Status: complete -- new module `src/kg/graph_clustering.nova` ships
+the Raghavan-2007 label-propagation algorithm over the KG's xref link
+graph, the STRUCTURAL companion to R10C's textual ranker. R10C asks
+"which atom LABELS look semantically alike" (TF-IDF); this module asks
+"which atoms are LINKED to each other" (xref-induced communities).**
+Pure integer arithmetic, no FP weights, deterministic-by-seed. The
+chat gains `/communities` for the headline (N communities, largest
+size, modularity in milli).
+
+### Algorithm (Raghavan, Albert, Kumara 2007)
+
+1. **Initialize**: every atom's label is its own atom_id.
+2. **Iterate** up to `max_iter` (default 20):
+   - Build a deterministic shuffle order from `seed` (default 0)
+     using a shift-xor mixer.
+   - For each atom in shuffle order, count neighbour labels and
+     adopt the most-frequent one; ties break by lowest label id.
+   - Short-circuit when a full pass changes no labels.
+3. **Output**: per-atom labels + a sorted communities table +
+   `total_edges` + `iterations`. Time complexity O((V+E) * iters);
+   Raghavan's empirical convergence is < 5 iters on planted-partition
+   fixtures and the unit tests confirm this on barbell + 3-clique.
+
+Why LPA over Louvain or spectral: O(V+E) per pass, integer-only, no
+eigenvector solve, no FP weights. Easy to verify by hand on small
+fixtures.
+
+### Modularity (Newman 2006)
+
+`Q = sum_c (e_cc - a_c^2)` in milli, where `e_cc` is the
+intra-community edge fraction and `a_c` is the community's
+half-degree fraction. Computed as
+`(sum_intra * 1000) / m - (sum_a_sq * 1000) / (4*m*m)` to keep every
+intermediate integer. Range [-500, 1000] milli; well-separated
+cliques sit well above 200 milli (the brief's threshold). Single-
+cluster trivial partition lands at 0 (the algebra collapses).
+
+### Edge representation
+
+Atoms carry their outgoing xrefs in `A_XREFS` (R6 atom_store layout);
+`cross_kg_references.xref_*` accessors are unchanged. We treat the
+graph as UNDIRECTED for LPA (an xref a->b means a and b share a
+neighbour). Cross-KG xrefs are dropped at extract time (LPA is
+single-KG here; spanning multiple KGs is a deferred follow-up).
+Duplicate edges are deduped during adjacency build so the modularity
+denominator reflects unique pairs only.
+
+### Public API
+
+* `gc_label_propagation(kg, max_iter)` -- seed=0 (default).
+* `gc_label_propagation_seeded(kg, max_iter, seed)`
+* `gc_label_at(r, atom_id) -> int_community_id` (-1 if absent)
+* `gc_community_count(r) -> int`
+* `gc_community_members(r, community_id) -> list[atom_id]` (sorted)
+* `gc_largest_community(r) -> [community_id, size]` (ties low-id)
+* `gc_modularity(kg, r) -> int_milli`
+* `gc_total_edges(r)` / `gc_iterations(r)`
+* `gc_communities_cmd(kg)` -- chat dispatch.
+
+### Verification
+
+* **Unit (71 assertions, NEW `tests/unit/test_graph_clustering.nova`)**:
+  empty KG / singleton / two linked / two disconnected pairs;
+  barbell (2 cliques + bridge -> 2 communities, 13 edges, interior
+  shared labels); 3-clique (3 disjoint triangles -> exactly 3
+  communities, 9 edges); linear chain determinism; modularity
+  well-separated > 200 milli + single-cluster ~ 0; same-seed
+  reproducibility; convergence <= 5 iters; gc_largest_community
+  selection + ties; gc_community_members missing + label_at missing;
+  max_iter <= 0 fallback.
+* **Integration (20 assertions, NEW
+  `tests/integration/scenario_xx_communities.sh`)**: drives
+  `examples/graph_clustering_demo.nova` (barbell + 3-triangle +
+  empty fixtures) + chat `/communities` + `/help` listing.
+* **No-regression**: all 159 unit tests PASS (158 existing + 1 new);
+  R10C semantic-search 21 integration assertions PASS; R8F episodic-
+  recall 19 PASS; R6F episodic 37 PASS; R8E schema-migrate 17 PASS.
+
+### Files touched
+
+* NEW `src/kg/graph_clustering.nova`
+* NEW `tests/unit/test_graph_clustering.nova`
+* NEW `tests/integration/scenario_xx_communities.sh`
+* NEW `examples/graph_clustering_demo.nova`
+* `examples/crossengin_chat.nova` (+3 lines: import, dispatch, help)
+* `README.md` + `NEXT_SESSION.md`
+
+### Module count
+
+R11F adds `src/kg/graph_clustering.nova` (+1 module). Committed
+baseline is 145 modules; this commit makes 146.
+
+### Followups (deferred)
+
+1. **Multi-KG span**: walk cross-KG xrefs so a community can span
+   multiple KGs (the brief calls this out as the natural extension).
+2. **Louvain modularity-greedy** for finer-grained clusters; needs
+   FP weights, but a sub-linear integer approximation is plausible.
+3. **Streaming LPA**: incremental update when xrefs are added/removed
+   without re-running the full passes.
+4. **Per-KG persistent community label cache** mirroring the
+   `kg_set_ann` attach pattern.
+
 ## R10C (this session) — KG: TF-IDF semantic search across atom labels
 
 **Status: complete -- new module `src/kg/semantic_search.nova` ships a

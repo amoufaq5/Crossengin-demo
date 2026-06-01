@@ -11,7 +11,31 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 145 modules compile (`make build`, R10F adds
+> toolchain: 146 modules compile (`make build`). R11F adds
+> `src/kg/graph_clustering.nova` — Raghavan-2007 label-propagation
+> community detection over the KG's xref link graph, the STRUCTURAL
+> companion to R10C's textual TF-IDF ranker. R10C asks "which atoms
+> LOOK alike" (TF-IDF over labels); R11F asks "which atoms are LINKED
+> to each other" (xref-induced communities). Pure integer arithmetic,
+> no FP weights. Each atom starts with its own atom_id as label; per
+> pass, every atom (in deterministic-shuffled order) adopts its
+> neighbours' most-frequent label, tie-breaking by lowest id. Up to
+> 20 iterations; Raghavan's empirical < 5 iters holds on barbell +
+> 3-clique fixtures. Newman modularity Q in milli (scale 1000):
+> `(sum_intra * 1000) / m - (sum_a_sq * 1000) / (4*m*m)`, signed so
+> anti-clusterings stay representable. New chat admin: `/communities`
+> prints `(COMMUNITIES n=N largest=L modularity=M milli edges=E
+> iter=I)`. Barbell fixture (two 4-cliques + bridge) -> 2 communities,
+> 13 edges, modularity 423 milli, 2 iterations; 3 disjoint triangles
+> -> 3 communities, 9 edges, modularity 667 milli; single 4-clique ->
+> modularity ~ 0. Public API: `gc_label_propagation(kg, max_iter)`,
+> `gc_label_propagation_seeded(kg, max_iter, seed)`, `gc_label_at`,
+> `gc_community_count`, `gc_community_members`,
+> `gc_largest_community`, `gc_modularity`. 71 unit assertions
+> (`tests/unit/test_graph_clustering.nova`) + 20 integration
+> assertions (`tests/integration/scenario_xx_communities.sh`); all
+> green. R10C/R8F/R5/R8E remain bit-identically green. R10F earlier
+> shipped
 > `src/io/transducers/audio_pitch.nova` — autocorrelation-based F0 (pitch)
 > estimation that completes the audio triad next to R6E Klatt synthesis
 > and R7F+R9B VAD. Per ~30 ms frame compute
@@ -98,6 +122,20 @@ computational units rather than orchestrating a pipeline of modules.
 > (`tests/integration/scenario_ss_optical_flow.sh`); all green. R5C
 > SIFT, R6D ORB, R7E/R8D/R9A stereo, R5E Canny suites remain
 > bit-identically green.
+> R11A extends R10D with the classical Bouguet 2000 coarse-to-fine
+> Gaussian pyramid + iterative warping so multi-pixel shifts stay
+> inside the LK linear regime at every level. New public API
+> `lk_pyramid_build`, `lk_warp_image`,
+> `lk_optical_flow_pyramid(prev, next, w, h, win, levels=3, iter=3)`;
+> chat `/flow_pyr prev.pgm next.pgm`. On the 8-px shift fixture
+> R10D under-estimated at u=5697 milli; R11A pyramid reads
+> u=7531 milli (target 8000, within +/-500). 4-px down: v=4116
+> (target 4000); diag (3, 3): u=2962 v=2762 (target 3000, 3000).
+> Per-iteration correction clamped at +/-4000 milli per pixel to
+> suppress boundary-discontinuity outliers in the coarse-level
+> warp. 52 new unit assertions
+> (`tests/unit/test_optical_flow_pyramid.nova`) + 12 integration
+> assertions (`tests/integration/scenario_uu_pyramid_flow.sh`).
 > +1 from R9F adding
 > `src/learning/byzantine_aggregation.nova` — two coordinate-wise robust
 > aggregation rules (trimmed mean + median) that tolerate up to f
