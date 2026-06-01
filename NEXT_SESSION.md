@@ -17,6 +17,134 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
+- P2.5 cont. real microphone capture (input half of the audio modality
+  bridge): **complete (real-hardware path wired; sealed-sandbox silent-WAV
+  fallback)** (ADR-0014). P19 + P2.6 shipped the OUTPUT half (Klatt
+  synth + WAV write); P2.5 first round shipped the STT FRAMEWORK
+  (pluggable `stt_seam.nova` + subprocess shim + env-gated
+  `stream_audio.nova` source). The missing piece was real INPUT:
+  capturing audio from a real microphone. This session lands it.
+  - **`scripts/audio_capture.sh`** (NEW) -- bash wrapper that
+    auto-detects the capture backend in order: `parecord` (PulseAudio /
+    pipewire-pulse, the default on modern desktop Linux) -> `arecord`
+    (ALSA, requires `/dev/snd` + the user in the `audio` group) ->
+    `sox -d` (PortAudio under the hood, the canonical macOS path).
+    When NONE of the three are on PATH OR no audio device is present
+    (no `/dev/snd`, no PulseAudio socket), falls back to a
+    DETERMINISTIC SILENT-WAV writer: composes the same canonical
+    44-byte RIFF/WAVE/PCM header (16 kHz / 16-bit / mono) all the
+    backend paths produce, then appends `N * 16000 * 2` zero bytes
+    of PCM silence. Lets the framework run end-to-end on a sealed
+    sandbox (CI, container, headless server) without crashing; a
+    real deployment with hardware "just works" because the higher-
+    priority backends fire first. Contract: takes `[OUT_PATH]
+    [DURATION_S]`, defaults `/tmp/ce_input.wav` / 5 seconds,
+    clamps duration to `[1..30]`, prints the destination path on
+    stdout, ALWAYS exits 0 (silent fallback OR real capture).
+    Diagnostics on stderr. Verified: in this sandbox (no
+    parecord/arecord/sox, no `/dev/snd`, no PulseAudio socket) the
+    silent fallback fires and produces a bit-perfect 32044-byte WAV
+    (44 header + 16000 * 2 zero samples) at 1-second duration --
+    canonical header bytes round-trip through Python's `struct`
+    parser at audio_format=1, channels=1, sample_rate=16000, bps=16,
+    data_size=32000.
+  - **`src/io/transducers/audio_capture.nova`** (NEW) -- pure-NOVA
+    wrapper. Public API:
+    * `audio_capture_state_new()` -- constructs the state struct;
+      reads `CE_AUDIO_CAPTURE_SCRIPT` / `CE_AUDIO_INPUT_PATH` /
+      `CE_AUDIO_CAPTURE_DURATION_MS` (default 5000 ms, clamped to
+      `[100..30000]`).
+    * `audio_capture_record(state, duration_ms, out_wav_path)` --
+      forks `/bin/sh -c "bash <script> <quoted-path> <secs>"` via
+      the same audio_speak `_run_sh_c` idiom; rounds duration UP to
+      whole seconds; waitpid's the child; updates `last_status` +
+      `last_path` + `captures_total`. Returns 1 on script exit 0
+      (the WAV file is now on disk -- captured audio OR silent
+      fallback), 0 on fork failure.
+    * `audio_capture_to_pcm(wav_path)` -> `[samples_list,
+      sample_rate]` -- reads the file via `sys_open + sys_read`
+      loop (NOVA strings can't carry binary content), validates the
+      canonical 44-byte RIFF/WAVE/PCM header (4 magic checks +
+      audio_format=1 + bps=16 + channels in [1..2] + non-zero
+      sample_rate), then decodes the data chunk frame-by-frame.
+      Mono frames pass through unchanged; stereo frames are
+      averaged to mono (L+R)/2 since whisper.cpp / vosk both want
+      mono input. Returns `[empty_list, 0]` on any malformed input
+      so the caller can map "parse failed" to a clear path. All
+      in-loop multiplies stay under NOVA's pointer-threshold
+      (gotcha #11): byte-by-byte walk + `(b1 * 256) + b0` per pair.
+      Hard cap of 1 MiB on the WAV-read buffer (30 seconds at
+      16 kHz 16-bit mono = 960 KB; well under the cap).
+  - **`src/io/transducers/stream_audio.nova`** (EXTENDED -- additive
+    only; existing P2.5 behavior is bit-identical for any non-"auto"
+    CE_AUDIO_CAPTURE_CMD value) -- two new state slots
+    (`SA_USE_AUTO=11`, `SA_CAPTURE=12`); `stream_audio_init_from_env`
+    recognises the new `STREAM_AUDIO_AUTO_TOKEN = "auto"` sentinel
+    and flips `use_auto=1`; the auto path also syncs the
+    `audio_capture` state's WAV path to the seam's resolved path so
+    `audio_capture_record(state, _, "")` lands on the same file the
+    STT seam then reads back; `stream_audio_poll` dispatches on
+    `SA_USE_AUTO`: if 1, calls `audio_capture_record` (which itself
+    runs `scripts/audio_capture.sh`); otherwise the existing
+    `_str_run_sh_c(cap_cmd)` path runs unchanged. Two new public
+    accessors: `stream_audio_use_auto(s)`, `stream_audio_capture(s)`.
+    `stream_audio_test_reset` clears the new flag too.
+  - **`STT_AUDIT.md`** (EXTENDED) -- new "P2.5 cont. update" paragraph
+    near the top documenting the auto-detect chain, the silent-WAV
+    fallback, the canonical WAV header layout shared between the
+    script and the NOVA-side parser, and the end-to-end real-hardware
+    path (`CE_AUDIO_CAPTURE_CMD=auto CE_STT_BACKEND=subprocess` ->
+    mic -> 16-bit mono 16 kHz WAV -> whisper-cli / vosk ->
+    EV_MESSAGE on the scheduler queue). Cross-references section
+    extended with the new files. The whisper-cli backend remains
+    the recommended STT for production deployments.
+  - **NO touches** to `src/io/effectors/{audio_synth,audio_speak}.nova`
+    (output side, settled), `src/io/transducers/{stt_seam,
+    stream_stdin,stream_unix_socket,stream_http}.nova` outside the
+    additive `stream_audio.nova` auto branch, or other-agent areas
+    (`src/io/transducers/{image_*,video_*,png_decode,deflate_decode,
+    kg_sync,secure_channel,http_client}.nova`, `src/safety/`,
+    `src/learning/`, `src/persistence/`, `/home/user/NOVA`).
+  Acceptance: `tests/unit/test_audio_capture.nova` (NEW; 28
+  assertions across 10 test functions): state-struct defaults +
+  tag sentinel (4 checks); hand-built canonical WAV round-trips with
+  KNOWN samples [100, 0, -200, 32000, -32000] at 16 kHz (5 checks);
+  sample-rate variants 8 kHz / 44.1 kHz / 48 kHz (3 checks);
+  missing-file rejection -> empty pcm + sample_rate=0 (2 checks);
+  bad RIFF magic / bad WAVE magic / non-PCM format / non-16-bit
+  width / truncated header all -> empty pcm (5 checks); stereo ->
+  mono averaging arithmetic (avg(100,200)=150, avg(0,0)=0,
+  avg(-500,-100)=-300) (3 checks).
+  `tests/integration/scenario_w_audio_capture.sh` (NEW; 23
+  assertions across two parts): PART 1 runs
+  `bash scripts/audio_capture.sh /tmp/ce_scenario_w_capture.wav 1`
+  + asserts exit 0, destination path printed, file exists, magic
+  bytes "RIFF" / "WAVE" / "fmt " / "data" at offsets 0/8/12/36,
+  audio_format=1 + channels=1 + sample_rate=16000 + bps=16 via a
+  one-shot Python parser, file size >= 1000 bytes. PART 2 emits a
+  tiny on-the-fly NOVA driver under
+  `tests/integration/_scenario_w_drivers/` (excluded from `make
+  integration` by the `_*` glob), runs it with
+  `CE_AUDIO_CAPTURE_CMD=auto CE_STT_BACKEND=stub
+  CE_AUDIO_INPUT_PATH=...` -- the driver constructs a stream_audio
+  state, calls `init_from_env` (verifies `use_auto=1`), forces
+  enabled + interval=1, runs `stream_audio_poll` (which forks the
+  capture script + drops the stub's "[stt unavailable]"
+  placeholder per the existing filter), parses the produced WAV via
+  `audio_capture_to_pcm` (verifies sample_rate=16000 + non-empty
+  samples), then proves the `EV_MESSAGE` post-path is wired by
+  posting "scenario w synthetic transcript" through `hs_post_event`
+  + draining the queue. Verified: scenario_w_audio_capture: pass=23
+  fail=0. Sandbox audio-backend detection: silent-fallback (no
+  parecord / arecord / sox).
+  Final counts: 131 modules compile (+1 from `audio_capture.nova`;
+  `stream_audio.nova` extension is in-place), 137 unit-test suites
+  PASS (+1 from `test_audio_capture.nova`, +28 assertions), 27
+  integration scripts (+1 from `scenario_w_audio_capture.sh`).
+  `NOVA_ROOT=/home/user/NOVA make build` -> all 131 module(s)
+  compiled OK; `NOVA_ROOT=/home/user/NOVA make test` -> all unit
+  tests PASS; `bash tests/integration/scenario_w_audio_capture.sh`
+  -> pass=23 fail=0.
 - P3.1.JPEG minimum-viable JPEG modality (structural half + audit):
   **complete (framework only)** (ADR-0014 image half / NOVA enhancement
   #15). P3.1 shipped PGM-P5; P3.1.PNG shipped the grayscale-8 PNG

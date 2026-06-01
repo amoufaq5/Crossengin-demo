@@ -1,0 +1,438 @@
+// CrossEngin io/transducers: microphone audio-capture (P2.5 cont.).
+//
+// Purpose
+//   The INPUT half of the audio modality bridge -- closes the loop that
+//   P19 + P2.6 opened on the OUTPUT side (`audio_synth.nova` /
+//   `audio_speak.nova`) and that P2.5 first round framed on the STT side
+//   (`stt_seam.nova` / `stream_audio.nova`). This module is what
+//   `CE_AUDIO_CAPTURE_CMD=auto` resolves to: a thin NOVA-side wrapper
+//   around `scripts/audio_capture.sh` that fork/execs the script,
+//   waits for the WAV file to land, and exposes a public WAV-to-PCM
+//   parser the STT seam (and tests) can hand the result to.
+//
+//   Three public surfaces:
+//     * `audio_capture_state_new()` -- constructs the capture state struct,
+//       resolving env knobs (CE_AUDIO_CAPTURE_DURATION_MS, CE_AUDIO_INPUT_PATH,
+//       CE_AUDIO_CAPTURE_SCRIPT) with sane defaults.
+//     * `audio_capture_record(state, duration_ms, out_wav_path)` -- shells
+//       out via /bin/sh -c "scripts/audio_capture.sh <path> <secs>",
+//       blocking until the script exits. Returns 1 on success (the WAV
+//       file is now on disk at `out_wav_path`), 0 on shell/fork failure.
+//       The script ALWAYS exits 0 -- either it captured real audio or
+//       it wrote a silent-WAV placeholder -- so the only failure mode
+//       here is fork/exec itself, not the absence of a microphone.
+//     * `audio_capture_to_pcm(wav_path)` -> [pcm_samples_list, sample_rate]
+//       OR [empty_list, 0] on parse failure. Reads the canonical 44-byte
+//       RIFF/WAVE/PCM header, validates the magic bytes + PCM format +
+//       16-bit width, then decodes the data chunk into a list of
+//       signed int samples (16-bit two's complement). Mono or stereo
+//       both accepted; stereo is decimated to mono by averaging the two
+//       channels (the STT backends all want mono).
+//
+//   The shape mirrors `image_pgm.nova`'s decoder (header parse + body
+//   walk via raw sys_read since binary content includes NUL bytes that
+//   would terminate a NOVA string). All in-loop multiplies stay under
+//   the NOVA codegen pointer-threshold (gotcha #11): we walk the data
+//   payload byte-by-byte (no big-index multiplies) and compose 16-bit
+//   samples via `(b1 * 256) + b0` per pair.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- audio leg, input side),
+//   ADR-0037 (event-driven scheduler integration via stream_audio.nova).
+// NOVA dependencies: builtins -- alloc, store64, load8, list_new, push,
+//   getenv, str_eq, char_at, substr, chr, fork_process, exec_program,
+//   waitpid, sys_open, sys_read, sys_close from std/syscall.
+// CrossEngin dependencies: none (intentional -- leaf module so tests can
+//   exercise the WAV parser without dragging the seam into the unit
+//   compilation unit).
+
+import "std/syscall"
+
+// ---- defaults / env knobs --------------------------------------------------
+
+// Default destination for captured audio. Mirrors stream_audio.nova's
+// STREAM_AUDIO_DEFAULT_WAV constant (kept identical so a chain of
+// auto-detect calls converges on the same path).
+let AUDIO_CAPTURE_DEFAULT_WAV  = "/tmp/ce_input.wav"
+
+// Default capture duration. The brief specifies 5 seconds as the
+// realistic conversational utterance length; the script accepts any
+// int in [1..30].
+let AUDIO_CAPTURE_DEFAULT_MS   = 5000
+
+// Default shim path. Tests / chat run from repo root so a relative path
+// resolves; operators with a custom installation can override via
+// CE_AUDIO_CAPTURE_SCRIPT.
+let AUDIO_CAPTURE_DEFAULT_SCRIPT = "scripts/audio_capture.sh"
+
+// Maximum WAV payload we will read into memory: 30 seconds at 16 kHz
+// 16-bit mono = 960 KB. Far above any single-utterance budget and
+// far below NOVA's pointer-threshold ceiling.
+let AUDIO_CAPTURE_MAX_BYTES    = 1024 * 1024
+
+// ---- state struct ----------------------------------------------------------
+// Shape (parallels stream_audio.nova / stt_seam.nova):
+//   [0] tag                (sentinel: AUDIO_CAPTURE_TAG)
+//   [1] script_path        (resolved CE_AUDIO_CAPTURE_SCRIPT)
+//   [2] wav_path           (resolved CE_AUDIO_INPUT_PATH or default)
+//   [3] duration_ms        (resolved CE_AUDIO_CAPTURE_DURATION_MS or default)
+//   [4] last_status        (waitpid exit code of the last script invocation)
+//   [5] last_path          (the WAV path the last invocation wrote to)
+//   [6] captures_total     (counter -- observability)
+
+let AUDIO_CAPTURE_TAG = 6411
+
+let AC_TAG             = 0
+let AC_SCRIPT_PATH     = 1
+let AC_WAV_PATH        = 2
+let AC_DURATION_MS     = 3
+let AC_LAST_STATUS     = 4
+let AC_LAST_PATH       = 5
+let AC_CAPTURES_TOTAL  = 6
+
+// ---- env helpers -----------------------------------------------------------
+
+fn _ac_env_or(name, fallback) {
+    let v = getenv(name)
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    return v
+}
+
+// Parse leading digits of `s` into an int. Returns fallback if `s` has
+// no parseable prefix. Bounded by 32-bit-ish range (we never need more
+// than 30000 ms here), so all in-function multiplies stay small.
+fn _ac_parse_int(s, fallback) {
+    if len(s) == 0 { return fallback }
+    let n = len(s)
+    let i = 0
+    let acc = 0
+    let any = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 48 && c <= 57 {
+            acc = acc * 10 + (c - 48)
+            any = 1
+        } else {
+            i = n
+        }
+        i = i + 1
+    }
+    if any == 0 { return fallback }
+    return acc
+}
+
+// ---- constructor -----------------------------------------------------------
+
+fn audio_capture_state_new() {
+    let s = list_new()
+    push(s, AUDIO_CAPTURE_TAG)                                       // [0]
+    push(s, _ac_env_or("CE_AUDIO_CAPTURE_SCRIPT",
+                       AUDIO_CAPTURE_DEFAULT_SCRIPT))                // [1]
+    push(s, _ac_env_or("CE_AUDIO_INPUT_PATH",
+                       AUDIO_CAPTURE_DEFAULT_WAV))                   // [2]
+    let dur_env = _ac_env_or("CE_AUDIO_CAPTURE_DURATION_MS", "")
+    let dur_ms = _ac_parse_int(dur_env, AUDIO_CAPTURE_DEFAULT_MS)
+    if dur_ms < 100   { dur_ms = 100 }
+    if dur_ms > 30000 { dur_ms = 30000 }
+    push(s, dur_ms)                                                  // [3]
+    push(s, 0)                                                       // [4] last_status
+    push(s, "")                                                      // [5] last_path
+    push(s, 0)                                                       // [6] captures_total
+    return s
+}
+
+// ---- accessors -------------------------------------------------------------
+
+fn audio_capture_script_path(s)    { return s[AC_SCRIPT_PATH] }
+fn audio_capture_wav_path(s)       { return s[AC_WAV_PATH] }
+fn audio_capture_duration_ms(s)    { return s[AC_DURATION_MS] }
+fn audio_capture_last_status(s)    { return s[AC_LAST_STATUS] }
+fn audio_capture_last_path(s)      { return s[AC_LAST_PATH] }
+fn audio_capture_captures_total(s) { return s[AC_CAPTURES_TOTAL] }
+
+// ---- shell-out helpers (mirror audio_speak/stt_seam) ---------------------
+
+fn _ac_argv3(a0, a1, a2) {
+    let p = alloc(4 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, 0)
+    return p
+}
+
+// Shell-quote a single argument with single quotes (same idiom as
+// stt_seam._stt_shell_quote / audio_speak._shell_quote_single). Embedded
+// ' becomes '\'' (close-quote, escaped-quote, open-quote).
+fn _ac_shell_quote(text) {
+    let out = "'"
+    let i = 0
+    while i < len(text) {
+        let c = char_at(text, i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + substr(text, i, 1)
+        }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// Render an int to its decimal string representation. NOVA has
+// int_to_str as a builtin but we keep this tiny formatter local so the
+// module stays leaf (no transitive deps via the test harness).
+fn _ac_int_to_str(n) {
+    if n == 0 { return "0" }
+    let neg = 0
+    if n < 0 { neg = 1; n = 0 - n }
+    let out = ""
+    while n > 0 {
+        let d = n - (n / 10) * 10
+        out = chr(48 + d) + out
+        n = n / 10
+    }
+    if neg == 1 { out = "-" + out }
+    return out
+}
+
+// Fork + exec /bin/sh -c "<cmd>". Returns child exit status (0 on
+// success). Same shape as audio_speak._run_sh_c.
+fn _ac_run_sh_c(cmd) {
+    let argv = _ac_argv3("sh", "-c", cmd)
+    let pid = fork_process()
+    if pid < 0 { return 127 }
+    if pid == 0 {
+        exec_program("/bin/sh", argv)
+        exit(127)
+    }
+    return waitpid(pid)
+}
+
+// ---- record -- shell out to scripts/audio_capture.sh ---------------------
+
+// audio_capture_record(state, duration_ms, out_wav_path) -> 1|0
+//
+// Shells out: bash scripts/audio_capture.sh <out_wav_path> <duration_s>.
+// duration_ms is rounded UP to the next whole second (we never want
+// to under-capture; an extra fraction of a second is harmless).
+//
+// out_wav_path defaults to state's resolved WAV path if "" passed.
+// duration_ms defaults to state's resolved duration if 0 passed.
+//
+// Returns 1 on script exit 0 (the WAV file exists at out_wav_path,
+// either captured real audio or the silent fallback). Returns 0 on
+// fork failure or non-zero script exit.
+
+fn audio_capture_record(state, duration_ms, out_wav_path) {
+    let path = out_wav_path
+    if len(path) == 0 { path = state[AC_WAV_PATH] }
+    let dur_ms = duration_ms
+    if dur_ms <= 0 { dur_ms = state[AC_DURATION_MS] }
+    // Round up to whole seconds. dur_s = ceil(dur_ms / 1000).
+    let dur_s = dur_ms / 1000
+    if dur_s * 1000 < dur_ms { dur_s = dur_s + 1 }
+    if dur_s < 1 { dur_s = 1 }
+    if dur_s > 30 { dur_s = 30 }
+
+    let cmd = "bash " + state[AC_SCRIPT_PATH]
+        + " " + _ac_shell_quote(path)
+        + " " + _ac_int_to_str(dur_s)
+    let st = _ac_run_sh_c(cmd)
+
+    list_set(state, AC_LAST_STATUS, st)
+    list_set(state, AC_LAST_PATH, path)
+    list_set(state, AC_CAPTURES_TOTAL, state[AC_CAPTURES_TOTAL] + 1)
+
+    if st == 0 { return 1 }
+    return 0
+}
+
+// ---- WAV reader ------------------------------------------------------------
+//
+// Reads the entire WAV file into a fresh memory buffer (single sys_read
+// loop), returns [buf_ptr, byte_count] or [0, 0] on failure. The caller
+// is responsible for parsing the buffer; we keep the read-path tiny so
+// any failmode (open / EOF / over-cap) is easy to reason about.
+
+fn _ac_read_file(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, 0)
+        return bad
+    }
+    // Allocate the cap up front; we re-read in 4 KB chunks into a
+    // single contiguous block. NOVA has no realloc; the cap is the
+    // ceiling so we never have to grow.
+    let buf = alloc(AUDIO_CAPTURE_MAX_BYTES + 1)
+    let total = 0
+    let keep = 1
+    let chunk = 4096
+    while keep == 1 {
+        let room = AUDIO_CAPTURE_MAX_BYTES - total
+        let want = chunk
+        if want > room { want = room }
+        if want <= 0 { keep = 0 }
+        if keep == 1 {
+            let n = sys_read(fd, buf + total, want)
+            if n <= 0 {
+                keep = 0
+            } else {
+                total = total + n
+            }
+        }
+    }
+    sys_close(fd)
+    let result = list_new()
+    push(result, buf)
+    push(result, total)
+    return result
+}
+
+// Read a little-endian u16 / u32 from `buf + off`. Same pattern as
+// `_stt_load_le_u32` in stt_seam.nova; the products stay small to
+// avoid the codegen pointer-threshold gotcha #11.
+fn _ac_load_le_u16(buf, off) {
+    let b0 = load8(buf + off)
+    let b1 = load8(buf + off + 1)
+    return b0 + b1 * 256
+}
+
+fn _ac_load_le_u32(buf, off) {
+    let b0 = load8(buf + off)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let lo = b0 + b1 * 256
+    let hi = b2 + b3 * 256
+    return lo + hi * 65536
+}
+
+// Load a signed 16-bit little-endian sample from `buf + off`. PCM16
+// is two's complement; we widen via subtract-65536 when the high bit
+// is set so the returned NOVA int matches what audio_synth produced
+// on the WRITE side.
+fn _ac_load_le_s16(buf, off) {
+    let u = _ac_load_le_u16(buf, off)
+    if u >= 32768 { return u - 65536 }
+    return u
+}
+
+// Compare `len` bytes at `buf + off` against the ASCII string `s`.
+// Returns 1 iff they match exactly.
+fn _ac_bytes_match(buf, off, s, slen) {
+    let i = 0
+    while i < slen {
+        if load8(buf + off + i) != char_at(s, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Parse-failure sentinel: [empty list, 0].
+fn _ac_parse_failure() {
+    let empty = list_new()
+    let r = list_new()
+    push(r, empty)
+    push(r, 0)
+    return r
+}
+
+// ---- audio_capture_to_pcm --------------------------------------------------
+//
+// Parses a canonical WAV file at `wav_path` into a list of signed-int
+// samples + the sample rate. Accepts the standard 44-byte RIFF/WAVE/PCM
+// header layout that `audio_capture.sh` (and `audio_synth.audio_write_wav`,
+// and parecord's --file-format=wav, and arecord's WAV mode) all produce:
+//
+//   off 0..3   "RIFF"
+//   off 4..7   chunk_size (LE u32, file_size - 8)
+//   off 8..11  "WAVE"
+//   off 12..15 "fmt "
+//   off 16..19 subchunk1_size (LE u32, 16 for PCM)
+//   off 20..21 audio_format (LE u16, 1 = PCM)
+//   off 22..23 num_channels (LE u16, 1 or 2)
+//   off 24..27 sample_rate (LE u32, e.g. 8000/16000/22050/44100/48000)
+//   off 28..31 byte_rate (sample_rate * channels * bps/8)
+//   off 32..33 block_align (channels * bps/8)
+//   off 34..35 bits_per_sample (LE u16, 16)
+//   off 36..39 "data"
+//   off 40..43 data_size (LE u32, n_samples * channels * bps/8)
+//   off 44..   raw PCM body (interleaved if stereo)
+//
+// On malformed input (wrong magic, non-PCM format, non-16-bit width,
+// truncated header, payload longer than the file claims, etc.) returns
+// [empty_list, 0] so the caller can map "parse failed" to a clear path
+// (the STT seam's "input wav missing" placeholder).
+//
+// Mono input: samples are passed through unchanged.
+// Stereo input: each sample-pair is averaged to mono (avoid (a+b)/2
+// overflow by widening to signed 32-bit, which NOVA's 64-bit int gives
+// us for free).
+
+fn audio_capture_to_pcm(wav_path) {
+    let file = _ac_read_file(wav_path)
+    let buf = file[0]
+    let n   = file[1]
+    if buf == 0 { return _ac_parse_failure() }
+    if n < 44   { return _ac_parse_failure() }
+
+    // Magic checks.
+    if _ac_bytes_match(buf, 0,  "RIFF", 4) == 0 { return _ac_parse_failure() }
+    if _ac_bytes_match(buf, 8,  "WAVE", 4) == 0 { return _ac_parse_failure() }
+    if _ac_bytes_match(buf, 12, "fmt ", 4) == 0 { return _ac_parse_failure() }
+    if _ac_bytes_match(buf, 36, "data", 4) == 0 { return _ac_parse_failure() }
+
+    // PCM format only. Bits-per-sample must be 16 (the canonical width
+    // every CrossEngin / whisper / vosk path uses).
+    let audio_format = _ac_load_le_u16(buf, 20)
+    let n_channels   = _ac_load_le_u16(buf, 22)
+    let sample_rate  = _ac_load_le_u32(buf, 24)
+    let bps          = _ac_load_le_u16(buf, 34)
+    let data_size    = _ac_load_le_u32(buf, 40)
+
+    if audio_format != 1 { return _ac_parse_failure() }
+    if bps != 16         { return _ac_parse_failure() }
+    if n_channels < 1    { return _ac_parse_failure() }
+    if n_channels > 2    { return _ac_parse_failure() }
+    if sample_rate < 1   { return _ac_parse_failure() }
+
+    // Payload bounds: data_size must fit in the file (file_size - 44).
+    let payload_avail = n - 44
+    let take = data_size
+    if take > payload_avail { take = payload_avail }
+    // Round DOWN to a whole frame (channels * 2 bytes).
+    let frame_bytes = n_channels * 2
+    if frame_bytes < 2 { return _ac_parse_failure() }
+    let n_frames = take / frame_bytes
+
+    let samples = list_new()
+    let f = 0
+    while f < n_frames {
+        let frame_off = 44 + f * frame_bytes
+        if n_channels == 1 {
+            push(samples, _ac_load_le_s16(buf, frame_off))
+        } else {
+            // Stereo -> mono via average. Sum the two channels then
+            // halve; result fits in PCM16 range without saturation
+            // because each operand is in [-32768..32767].
+            let l = _ac_load_le_s16(buf, frame_off)
+            let r = _ac_load_le_s16(buf, frame_off + 2)
+            push(samples, (l + r) / 2)
+        }
+        f = f + 1
+    }
+
+    let result = list_new()
+    push(result, samples)
+    push(result, sample_rate)
+    return result
+}
+
+// ---- public accessors for the result triple ------------------------------
+
+fn audio_capture_pcm_samples(r) { return r[0] }
+fn audio_capture_pcm_rate(r)    { return r[1] }

@@ -11,7 +11,11 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 130 modules compile (`make build`,
+> toolchain: 131 modules compile (`make build`, +1 from
+> `io/transducers/audio_capture.nova` added in P2.5 cont. real microphone
+> capture (parecord/arecord/sox auto-detect via `scripts/audio_capture.sh`
+> + silent-WAV fallback) wired into `stream_audio.nova` via the
+> `CE_AUDIO_CAPTURE_CMD=auto` sentinel,
 > +1 from `io/transducers/jpeg_decode.nova` added in P3.1.JPEG minimum-viable
 > JPEG modality -- structural-half pure-NOVA parser (segment markers + DQT +
 > SOF0 + DHT tables), with `jpeg_decode_grayscale` returning the dimensions +
@@ -100,7 +104,7 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 136 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 137 unit-test suites pass
 > (`make test`,
 > +1 suite / +54 assertions from `test_jpeg_decode.nova` added in
 > P3.1.JPEG minimum-viable JPEG modality: in-memory baseline-grayscale
@@ -205,6 +209,13 @@ computational units rather than orchestrating a pipeline of modules.
 > [`STT_AUDIT.md`](./STT_AUDIT.md), with `scripts/transcribe.sh` as the
 > auto-detecting subprocess shim and `src/io/transducers/stream_audio.nova`
 > as the env-gated audio-capture source,
+> +1 suite / +28 assertions from `test_audio_capture.nova` added in
+> P2.5 cont. real microphone capture: state-struct defaults +
+> hand-built canonical WAV round-trips (mono passthrough with KNOWN
+> samples [100, 0, -200, 32000, -32000] at 16 kHz; 8 kHz / 44.1 kHz /
+> 48 kHz sample-rate variants) + malformed-WAV rejection (bad RIFF
+> magic / bad WAVE magic / non-PCM format / non-16-bit width /
+> truncated header / missing file) + stereo-to-mono averaging,
 > +1 suite / +56 assertions from `test_proof_checker.nova` added in P3.5
 > minimum-viable proof checker -- bounded BFS over the operator graph
 > returning audit-grade derivation traces with composed Bayesian
@@ -234,7 +245,7 @@ computational units rather than orchestrating a pipeline of modules.
 > scene_change labels; surfaced via the chat `/play PATH [N]` admin
 > command and the `scripts/video_to_y4m.sh` ffmpeg shim for
 > compressed video input, documented in [`VIDEO_AUDIT.md`](./VIDEO_AUDIT.md)),
-> 26 end-to-end integration
+> 27 end-to-end integration
 > scripts run (`make integration`, +1 from `scenario_a3_dlog.sh` added in
 > P0.7 dlog durability across SIGKILL, +1 from `scenario_a2_full_state.sh`
 > added in P0.1 full-state persistence across SIGKILL, +2 from
@@ -262,6 +273,17 @@ computational units rather than orchestrating a pipeline of modules.
 > text-format `/metrics` scrape endpoint over `scripts/web.py`,
 > +1 from `scenario_l_stream_stdin.sh` added in P2.8 stdin streaming
 > source acceptance test,
+> +1 from `scenario_w_audio_capture.sh` added in P2.5 cont. microphone-
+> capture end-to-end: `scripts/audio_capture.sh /tmp/...wav 1` produces
+> a valid PCM-16 mono 16 kHz WAV (silent-fallback in the sandbox, real
+> audio on hardware -- header magic-bytes + numeric-fields all verified
+> via a one-shot Python parser); a tiny on-the-fly NOVA driver then runs
+> `stream_audio_init_from_env` with `CE_AUDIO_CAPTURE_CMD=auto`, confirms
+> the auto sentinel resolves to `use_auto=1`, `stream_audio_poll` invokes
+> `audio_capture_record` end-to-end, the produced WAV is parsed by
+> `audio_capture_to_pcm` (sample_rate=16000, samples non-empty), and the
+> `EV_MESSAGE` post-path round-trips through the scheduler queue via
+> `hs_post_event`,
 > +1 from `scenario_n_compaction.sh` added in P2.10 snapshot compaction
 > pass: /save -> /teach 50 -> /compact -> /save shrinks file growth by
 > >50% vs the baseline /save -> /teach 50 -> /save,

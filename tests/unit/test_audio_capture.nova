@@ -1,0 +1,317 @@
+// Unit tests for src/io/transducers/audio_capture.nova (P2.5 cont.).
+//
+// Hermetic coverage of the WAV-parser + state struct + duration clamp.
+// We do NOT shell out to the real capture script here -- that path is
+// exercised by tests/integration/scenario_w_audio_capture.sh which
+// actually invokes scripts/audio_capture.sh and asserts on the produced
+// WAV file. Here we focus on:
+//
+//   * audio_capture_state_new() defaults + tag sentinel       (4 checks)
+//   * audio_capture_to_pcm on a hand-built canonical WAV with
+//     known samples returns the right samples + sample rate    (5 checks)
+//   * audio_capture_to_pcm rejects malformed WAV with the
+//     [empty list, 0] sentinel: bad RIFF magic, bad WAVE magic,
+//     non-PCM audio format, non-16-bit width, truncated header  (6 checks)
+//   * audio_capture_to_pcm on a missing file returns the
+//     parse-failure sentinel                                    (2 checks)
+//   * stereo -> mono averaging round-trip                       (3 checks)
+//
+// Total: ~20 assertions (brief asks for ~15).
+
+import "std/syscall"
+import "../ce_test.nova"
+import "../../src/io/transducers/audio_capture.nova"
+
+// ---- file-write helpers --------------------------------------------------
+//
+// The unit tests live in the same process as the WAV parser, so we build
+// each fixture as a NOVA list of bytes, write it to /tmp via sys_open +
+// sys_write, then hand the path to audio_capture_to_pcm and assert on
+// what it returns. Same idiom as test_image_pgm uses for hand-rolled
+// PGM fixtures.
+
+let _TEST_FLAGS = 577    // O_WRONLY | O_CREAT | O_TRUNC
+let _TEST_MODE  = 420    // 0644
+
+fn _push_le_u16(buf, v) {
+    push(buf, v & 255)
+    push(buf, (v / 256) & 255)
+    return buf
+}
+
+fn _push_le_u32(buf, v) {
+    push(buf, v & 255)
+    push(buf, (v / 256) & 255)
+    push(buf, (v / 65536) & 255)
+    push(buf, (v / 16777216) & 255)
+    return buf
+}
+
+fn _push_ascii(buf, s) {
+    let i = 0
+    while i < len(s) {
+        push(buf, char_at(s, i))
+        i = i + 1
+    }
+    return buf
+}
+
+// Build a canonical 44-byte RIFF/WAVE/PCM mono header for `n_samples`
+// 16-bit samples at `sample_rate`. Same byte layout as
+// audio_synth.wav_header.
+fn _build_wav_header(sample_rate, n_channels, n_samples) {
+    let data_size = n_samples * n_channels * 2
+    let h = list_new()
+    _push_ascii(h, "RIFF")
+    _push_le_u32(h, 36 + data_size)
+    _push_ascii(h, "WAVE")
+    _push_ascii(h, "fmt ")
+    _push_le_u32(h, 16)
+    _push_le_u16(h, 1)                  // PCM
+    _push_le_u16(h, n_channels)
+    _push_le_u32(h, sample_rate)
+    _push_le_u32(h, sample_rate * n_channels * 2)
+    _push_le_u16(h, n_channels * 2)
+    _push_le_u16(h, 16)
+    _push_ascii(h, "data")
+    _push_le_u32(h, data_size)
+    return h
+}
+
+// Write a list of bytes to `path`. Returns 1 on success.
+fn _write_bytes(path, bytes) {
+    let n = len(bytes)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, bytes[i])
+        i = i + 1
+    }
+    let fd = sys_open(path, _TEST_FLAGS, _TEST_MODE)
+    if fd < 0 { return 0 }
+    let w = sys_write(fd, buf, n)
+    sys_close(fd)
+    if w == n { return 1 }
+    return 0
+}
+
+// Build a canonical mono WAV (header + PCM16 LE samples) and write it.
+fn _write_mono_wav(path, sample_rate, samples) {
+    let n = len(samples)
+    let buf = _build_wav_header(sample_rate, 1, n)
+    let i = 0
+    while i < n {
+        let s = samples[i]
+        let u = s & 65535
+        if s < 0 { u = (s + 65536) & 65535 }
+        push(buf, u & 255)
+        push(buf, (u / 256) & 255)
+        i = i + 1
+    }
+    return _write_bytes(path, buf)
+}
+
+// Build a canonical stereo WAV (header + interleaved PCM16 LE samples)
+// from two parallel sample lists L and R. Returns 1 on success.
+fn _write_stereo_wav(path, sample_rate, left, right) {
+    let n = len(left)
+    if len(right) < n { n = len(right) }
+    let buf = _build_wav_header(sample_rate, 2, n)
+    let i = 0
+    while i < n {
+        let sl = left[i]
+        let sr = right[i]
+        let ul = sl & 65535
+        let ur = sr & 65535
+        if sl < 0 { ul = (sl + 65536) & 65535 }
+        if sr < 0 { ur = (sr + 65536) & 65535 }
+        push(buf, ul & 255)
+        push(buf, (ul / 256) & 255)
+        push(buf, ur & 255)
+        push(buf, (ur / 256) & 255)
+        i = i + 1
+    }
+    return _write_bytes(path, buf)
+}
+
+// ---- state struct tests ---------------------------------------------------
+
+fn test_state_new_defaults() {
+    let s = audio_capture_state_new()
+    ce_check("state new returns non-zero", s != 0)
+    ce_eq("state tag sentinel", s[0], 6411)
+    // Default script path (no env override in unit test).
+    ce_str_eq("default script path", audio_capture_script_path(s),
+              "scripts/audio_capture.sh")
+    // Default duration clamped to [100..30000]; the default constant is
+    // 5000 ms. (CE_AUDIO_CAPTURE_DURATION_MS env unset in unit test, so
+    // _ac_parse_int returns the default.)
+    ce_eq("default duration is 5000ms", audio_capture_duration_ms(s), 5000)
+    ce_eq("captures_total starts at 0", audio_capture_captures_total(s), 0)
+}
+
+// ---- WAV parser happy path -----------------------------------------------
+
+fn test_to_pcm_mono_known_samples() {
+    // Build a tiny mono WAV with three KNOWN samples at 16 kHz.
+    // Samples chosen to span signed range: positive, zero, negative.
+    let path = "/tmp/ce_test_audio_capture_mono.wav"
+    let samples = list_new()
+    push(samples, 100)
+    push(samples, 0)
+    push(samples, 0 - 200)
+    push(samples, 32000)            // near positive PCM16 limit
+    push(samples, 0 - 32000)        // near negative PCM16 limit
+    let wrote = _write_mono_wav(path, 16000, samples)
+    ce_eq("wrote mono fixture", wrote, 1)
+
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr  = audio_capture_pcm_rate(r)
+    ce_eq("sample_rate decoded from fixture", sr, 16000)
+    ce_eq("decoded 5 samples", len(pcm), 5)
+    ce_eq("sample[0] round-trip", pcm[0], 100)
+    ce_eq("sample[1] zero round-trip", pcm[1], 0)
+    ce_eq("sample[2] negative round-trip", pcm[2], 0 - 200)
+    ce_eq("sample[3] large positive round-trip", pcm[3], 32000)
+    ce_eq("sample[4] large negative round-trip", pcm[4], 0 - 32000)
+}
+
+fn test_to_pcm_sample_rate_variants() {
+    // Confirm the LE u32 sample-rate decoding handles 8 kHz, 16 kHz, 44.1
+    // kHz, 48 kHz -- the four canonical PCM rates a real STT backend will
+    // ever see.
+    let samples = list_new()
+    push(samples, 1234)
+    push(samples, 0 - 1234)
+
+    let p1 = "/tmp/ce_test_audio_capture_8k.wav"
+    _write_mono_wav(p1, 8000, samples)
+    let r1 = audio_capture_to_pcm(p1)
+    ce_eq("8 kHz round-trip", audio_capture_pcm_rate(r1), 8000)
+
+    let p2 = "/tmp/ce_test_audio_capture_44k.wav"
+    _write_mono_wav(p2, 44100, samples)
+    let r2 = audio_capture_to_pcm(p2)
+    ce_eq("44.1 kHz round-trip", audio_capture_pcm_rate(r2), 44100)
+
+    let p3 = "/tmp/ce_test_audio_capture_48k.wav"
+    _write_mono_wav(p3, 48000, samples)
+    let r3 = audio_capture_to_pcm(p3)
+    ce_eq("48 kHz round-trip", audio_capture_pcm_rate(r3), 48000)
+}
+
+// ---- WAV parser rejects malformed input ----------------------------------
+
+fn test_reject_missing_file() {
+    let r = audio_capture_to_pcm("/tmp/definitely-not-a-file.wav")
+    let pcm = audio_capture_pcm_samples(r)
+    let sr  = audio_capture_pcm_rate(r)
+    ce_eq("missing file -> empty pcm list", len(pcm), 0)
+    ce_eq("missing file -> sample_rate=0", sr, 0)
+}
+
+fn test_reject_bad_riff_magic() {
+    // Build a 44-byte buffer with everything correct except the first 4
+    // bytes spell "XIFF" instead of "RIFF".
+    let path = "/tmp/ce_test_audio_capture_badriff.wav"
+    let buf = _build_wav_header(16000, 1, 0)
+    // Overwrite byte 0 from 'R' (82) to 'X' (88).
+    list_set(buf, 0, 88)
+    _write_bytes(path, buf)
+    let r = audio_capture_to_pcm(path)
+    ce_eq("bad RIFF magic -> empty pcm",
+          len(audio_capture_pcm_samples(r)), 0)
+    ce_eq("bad RIFF magic -> sample_rate=0",
+          audio_capture_pcm_rate(r), 0)
+}
+
+fn test_reject_bad_wave_magic() {
+    let path = "/tmp/ce_test_audio_capture_badwave.wav"
+    let buf = _build_wav_header(16000, 1, 0)
+    list_set(buf, 8, 88)            // "WAVE" -> "XAVE"
+    _write_bytes(path, buf)
+    let r = audio_capture_to_pcm(path)
+    ce_eq("bad WAVE magic -> empty pcm",
+          len(audio_capture_pcm_samples(r)), 0)
+}
+
+fn test_reject_non_pcm_format() {
+    // audio_format != 1 (e.g. 3 = IEEE float, 6 = mu-law). The parser
+    // must reject these because PCM16 is the only width whisper.cpp /
+    // vosk / the silent-fallback all produce.
+    let path = "/tmp/ce_test_audio_capture_nonpcm.wav"
+    let buf = _build_wav_header(16000, 1, 0)
+    // audio_format is at offset 20 (2 bytes LE). Set to 3 (IEEE float).
+    list_set(buf, 20, 3)
+    list_set(buf, 21, 0)
+    _write_bytes(path, buf)
+    let r = audio_capture_to_pcm(path)
+    ce_eq("non-PCM format -> empty pcm",
+          len(audio_capture_pcm_samples(r)), 0)
+}
+
+fn test_reject_non_16_bit_width() {
+    // 8-bit PCM (bps=8) is technically WAV-legal but every CrossEngin
+    // path produces 16-bit; reject it so a misconfigured backend gets
+    // an unambiguous parse failure rather than silently truncated
+    // samples.
+    let path = "/tmp/ce_test_audio_capture_8bit.wav"
+    let buf = _build_wav_header(16000, 1, 0)
+    list_set(buf, 34, 8)            // bps low byte: 16 -> 8
+    _write_bytes(path, buf)
+    let r = audio_capture_to_pcm(path)
+    ce_eq("8-bit width -> empty pcm",
+          len(audio_capture_pcm_samples(r)), 0)
+}
+
+fn test_reject_truncated_header() {
+    // File shorter than 44 bytes -> parser must bail out early.
+    let path = "/tmp/ce_test_audio_capture_trunc.wav"
+    let buf = list_new()
+    _push_ascii(buf, "RIFF\x10\x00")     // 6 bytes -- well under 44
+    _write_bytes(path, buf)
+    let r = audio_capture_to_pcm(path)
+    ce_eq("truncated header -> empty pcm",
+          len(audio_capture_pcm_samples(r)), 0)
+}
+
+// ---- stereo -> mono averaging --------------------------------------------
+
+fn test_stereo_to_mono_average() {
+    // Hand-built stereo WAV with three frames. The parser averages
+    // L+R to mono: expected outputs are (L[i] + R[i]) / 2.
+    let path = "/tmp/ce_test_audio_capture_stereo.wav"
+    let L = list_new()
+    let R = list_new()
+    push(L, 100);    push(R, 200)        // avg = 150
+    push(L, 0);      push(R, 0)          // avg = 0
+    push(L, 0 - 500); push(R, 0 - 100)   // avg = -300
+    _write_stereo_wav(path, 16000, L, R)
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    ce_eq("stereo decoded to 3 mono frames", len(pcm), 3)
+    ce_eq("stereo frame 0 -> avg(100,200)=150", pcm[0], 150)
+    ce_eq("stereo frame 1 -> avg(0,0)=0", pcm[1], 0)
+    // Note: integer division truncates toward zero, so avg(-500, -100)
+    // = -600/2 = -300 (NOVA's / is C-style truncation for negative).
+    ce_eq("stereo frame 2 -> avg(-500,-100)=-300", pcm[2], 0 - 300)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_state_new_defaults()
+    test_to_pcm_mono_known_samples()
+    test_to_pcm_sample_rate_variants()
+    test_reject_missing_file()
+    test_reject_bad_riff_magic()
+    test_reject_bad_wave_magic()
+    test_reject_non_pcm_format()
+    test_reject_non_16_bit_width()
+    test_reject_truncated_header()
+    test_stereo_to_mono_average()
+    ce_summary("audio_capture")
+}
+
+main()

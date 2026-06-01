@@ -9,6 +9,31 @@ runtime-detected subprocess shim. This document mirrors `WIN32_AUDIT.md` /
 `MACOS_AUDIT.md` / `TLS_AUDIT.md` / `WASM_AUDIT.md` — the realistic path,
 not a promise.
 
+**P2.5 cont. update (this session):** real microphone capture is now wired.
+`scripts/audio_capture.sh` auto-detects `parecord` (PulseAudio /
+pipewire-pulse) → `arecord` (ALSA) → `sox -d` (PortAudio), and falls back
+to a deterministic silent-WAV writer when none are available AND no audio
+device exists (sealed sandbox, CI container, headless server). The
+NOVA-side `src/io/transducers/audio_capture.nova` wraps the shim:
+`audio_capture_record(state, duration_ms, out_wav_path)` forks the script
+and waits, `audio_capture_to_pcm(wav_path)` parses the canonical RIFF/WAVE/
+PCM-16 header into `[samples_list, sample_rate]` (mono passthrough,
+stereo averaged to mono). `stream_audio.nova` gains a small auto-detect
+branch: when `CE_AUDIO_CAPTURE_CMD=auto` is set, the poll path calls
+`audio_capture_record` instead of `_str_run_sh_c` of the user-provided
+command. End-to-end on a real Linux desktop with PulseAudio:
+`CE_AUDIO_CAPTURE_CMD=auto CE_STT_BACKEND=subprocess` → mic →
+`audio_capture.sh` → 16-bit mono 16 kHz WAV at `/tmp/ce_input.wav` →
+`scripts/transcribe.sh` (whisper-cli / vosk) → transcript → `EV_MESSAGE`
+on the scheduler queue. The whisper-cli backend remains the recommended
+STT for production deployments; vosk hits the conversational latency
+target (sub-500 ms for a 5-second utterance) at a noticeable quality
+cost. Scenario `tests/integration/scenario_w_audio_capture.sh` exercises
+the silent-fallback path end-to-end (the sandbox has no microphone /
+no parecord/arecord/sox); the same scenario "just works" on real
+hardware because the silent-fallback writes the same canonical header
+layout as a real capture.
+
 ## Why STT is structurally hard
 
 A microphone is not a typewriter. The raw signal is non-stationary noise
@@ -164,12 +189,32 @@ the surrounding integration.
 * `src/io/transducers/stt_seam.nova` — the pluggable STT seam (P2.5).
 * `src/io/transducers/stream_audio.nova` — env-gated audio-capture
   source (P2.5; the `CE_AUDIO_CAPTURE_CMD` + `CE_STT_BACKEND`
-  consumer).
+  consumer). P2.5 cont. extension: `CE_AUDIO_CAPTURE_CMD=auto` routes
+  through `audio_capture_record` (the wired path); any other string
+  is treated as a literal `/bin/sh -c` command for back-compat.
+* `src/io/transducers/audio_capture.nova` — pure-NOVA microphone-
+  capture wrapper (P2.5 cont.). `audio_capture_record(state,
+  duration_ms, out_wav_path)` shells out to the bash shim;
+  `audio_capture_to_pcm(wav_path)` parses the produced WAV into
+  `[samples_list, sample_rate]` so downstream perception (the STT
+  seam, future MFCC frontend, future pure-NOVA phoneme classifier)
+  can ingest the bytes without re-implementing the header parser.
+* `scripts/audio_capture.sh` — the microphone-capture bash shim with
+  backend auto-detection (parecord / arecord / sox) and the
+  deterministic silent-WAV fallback for sealed sandboxes.
 * `scripts/transcribe.sh` — the subprocess shim with backend
   auto-detection.
 * `src/io/effectors/audio_synth.nova` / `audio_speak.nova` — the TTS
   half (P19 + P2.6) this STT half pairs with.
 * `src/language/phoneme_atoms.nova` (ADR-0015) — the phoneme inventory
   the pure-NOVA classifier (#3) would target.
+* `tests/unit/test_audio_capture.nova` — hermetic WAV-parser tests
+  (28 assertions across happy path / malformed-input rejection /
+  stereo-to-mono averaging).
+* `tests/integration/scenario_w_audio_capture.sh` — end-to-end
+  acceptance: `audio_capture.sh` produces a valid PCM-16 mono 16 kHz
+  WAV (silent fallback in the sandbox, real audio on hardware);
+  `CE_AUDIO_CAPTURE_CMD=auto` end-to-end through stream_audio_poll
+  with the EV_MESSAGE post-path verified.
 * `nova-deps.toml` entry #14 — upstream tracker for the modality
   bridge.

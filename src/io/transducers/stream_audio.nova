@@ -43,11 +43,21 @@
 
 import "stt_seam.nova"
 import "input_transducer.nova"
+import "audio_capture.nova"
 import "../../scheduler/hybrid_scheduler.nova"
 
 // Default WAV path the capture command is expected to produce. Operator
 // can override via `CE_AUDIO_INPUT_PATH=/some/where.wav`.
 let STREAM_AUDIO_DEFAULT_WAV = "/tmp/ce_input.wav"
+
+// Sentinel value for CE_AUDIO_CAPTURE_CMD that routes through the
+// pure-NOVA `audio_capture_record` path (which itself shells out to
+// `scripts/audio_capture.sh`, which auto-detects parecord/arecord/sox
+// and falls back to a silent WAV in a sealed sandbox). This is the
+// path the P2.5 cont. brief wires: operators set
+// `CE_AUDIO_CAPTURE_CMD=auto` instead of a hand-rolled command and
+// the framework handles backend probing + the silent-fallback contract.
+let STREAM_AUDIO_AUTO_TOKEN = "auto"
 
 // Default poll interval: once per 100 ticks (= ~1 sec at 100 Hz active /
 // ~10 sec at the 10 Hz idle rate). Operator can override via
@@ -83,18 +93,23 @@ fn _str_run_sh_c(cmd) {
 
 // ---- stream state ---------------------------------------------------------
 // Shape (parallels stream_stdin.nova / stream_unix_socket.nova):
-//   [0] tag                (STREAM_AUDIO_TAG)
-//   [1] enabled            (0|1, set by init_from_env when BOTH envs set)
-//   [2] initialized        (0|1, reserved for future warm-up step)
-//   [3] capture_cmd        (resolved CE_AUDIO_CAPTURE_CMD)
-//   [4] wav_path           (resolved CE_AUDIO_INPUT_PATH or default)
-//   [5] poll_interval      (resolved CE_AUDIO_POLL_INTERVAL_TICKS or default)
-//   [6] tick_counter       (advances every poll, mod poll_interval)
-//   [7] utterances_total   (count of EV_MESSAGE posts from this source)
-//   [8] captures_total     (count of capture-shell invocations -- including
-//                           those that produced placeholders)
-//   [9] last_transcript    (string)
-//  [10] seam               (the stt_seam used for transcription)
+//   [0]  tag                (STREAM_AUDIO_TAG)
+//   [1]  enabled            (0|1, set by init_from_env when BOTH envs set)
+//   [2]  initialized        (0|1, reserved for future warm-up step)
+//   [3]  capture_cmd        (resolved CE_AUDIO_CAPTURE_CMD, "" iff use_auto=1)
+//   [4]  wav_path           (resolved CE_AUDIO_INPUT_PATH or default)
+//   [5]  poll_interval      (resolved CE_AUDIO_POLL_INTERVAL_TICKS or default)
+//   [6]  tick_counter       (advances every poll, mod poll_interval)
+//   [7]  utterances_total   (count of EV_MESSAGE posts from this source)
+//   [8]  captures_total     (count of capture-shell invocations -- including
+//                            those that produced placeholders)
+//   [9]  last_transcript    (string)
+//   [10] seam               (the stt_seam used for transcription)
+//   [11] use_auto           (1 iff CE_AUDIO_CAPTURE_CMD == "auto" -- routes
+//                            poll through audio_capture_record(capture_state)
+//                            instead of the user-provided shell command)
+//   [12] capture            (the audio_capture_state_new() struct, used
+//                            only when use_auto=1)
 
 let STREAM_AUDIO_TAG = 6203
 
@@ -109,6 +124,8 @@ let SA_UTTERANCES_TOTAL  = 7
 let SA_CAPTURES_TOTAL    = 8
 let SA_LAST_TRANSCRIPT   = 9
 let SA_SEAM              = 10
+let SA_USE_AUTO          = 11
+let SA_CAPTURE           = 12
 
 fn stream_audio_new() {
     let s = list_new()
@@ -123,6 +140,8 @@ fn stream_audio_new() {
     push(s, 0)
     push(s, "")
     push(s, stt_seam_new())
+    push(s, 0)                            // [11] use_auto -- toggled by init_from_env
+    push(s, audio_capture_state_new())    // [12] capture struct (always present)
     return s
 }
 
@@ -138,6 +157,8 @@ fn stream_audio_utterances_total(s) { return s[SA_UTTERANCES_TOTAL] }
 fn stream_audio_captures_total(s)   { return s[SA_CAPTURES_TOTAL] }
 fn stream_audio_last_transcript(s)  { return s[SA_LAST_TRANSCRIPT] }
 fn stream_audio_seam(s)             { return s[SA_SEAM] }
+fn stream_audio_use_auto(s)         { return s[SA_USE_AUTO] }
+fn stream_audio_capture(s)          { return s[SA_CAPTURE] }
 
 // ---- env gate -------------------------------------------------------------
 // Activation requires BOTH:
@@ -202,15 +223,37 @@ fn _str_audio_env_poll_interval() {
 
 // init_from_env: resolves env vars and enables the source iff the gate
 // says on. Mirrors the stream_stdin / stream_unix_socket lifecycle.
+//
+// P2.5 cont.: when CE_AUDIO_CAPTURE_CMD == "auto" the source flips
+// SA_USE_AUTO to 1 and the poll path delegates to audio_capture_record
+// (which itself shells out to scripts/audio_capture.sh, which
+// auto-detects parecord/arecord/sox and falls back to a silent WAV in
+// sealed sandboxes). The CAPTURE_CMD slot is cleared in that case so a
+// later introspection ("which command produced the WAV?") can tell the
+// auto path from a user-provided command.
 fn stream_audio_init_from_env(s) {
     if _str_audio_env_says_on() == 1 {
         list_set(s, SA_ENABLED, 1)
-        list_set(s, SA_CAPTURE_CMD, _str_audio_env_capture_cmd())
-        list_set(s, SA_WAV_PATH, _str_audio_env_wav_path())
+        let cmd = _str_audio_env_capture_cmd()
+        let wav = _str_audio_env_wav_path()
+        list_set(s, SA_WAV_PATH, wav)
         list_set(s, SA_POLL_INTERVAL, _str_audio_env_poll_interval())
+        if str_eq(cmd, STREAM_AUDIO_AUTO_TOKEN) == 1 {
+            list_set(s, SA_USE_AUTO, 1)
+            list_set(s, SA_CAPTURE_CMD, "")
+            // Sync the audio_capture state's WAV path to the seam's
+            // resolved path so audio_capture_record(state, _, "") lands
+            // on the same file the STT seam then reads back.
+            let cap = s[SA_CAPTURE]
+            list_set(cap, AC_WAV_PATH, wav)
+        } else {
+            list_set(s, SA_USE_AUTO, 0)
+            list_set(s, SA_CAPTURE_CMD, cmd)
+        }
         return 1
     }
     list_set(s, SA_ENABLED, 0)
+    list_set(s, SA_USE_AUTO, 0)
     return 0
 }
 
@@ -269,12 +312,21 @@ fn stream_audio_poll(s, hs) {
     }
     list_set(s, SA_TICK_COUNTER, 0)
 
-    // Step 1: shell out to the capture command. Exit status is
-    // informational only; the WAV file at SA_WAV_PATH is the
-    // load-bearing artifact.
-    let cap_cmd = s[SA_CAPTURE_CMD]
-    if len(cap_cmd) > 0 {
-        _str_run_sh_c(cap_cmd)
+    // Step 1: produce a WAV at SA_WAV_PATH. Two paths converge on the
+    // same file: either (a) shell out to the user-provided
+    // CE_AUDIO_CAPTURE_CMD via /bin/sh -c, or (b) when SA_USE_AUTO=1
+    // (CE_AUDIO_CAPTURE_CMD=auto), delegate to audio_capture_record
+    // which itself runs scripts/audio_capture.sh + backend-detects
+    // parecord/arecord/sox + falls back to a silent WAV. Either way
+    // the WAV file at SA_WAV_PATH is the load-bearing artifact.
+    if s[SA_USE_AUTO] == 1 {
+        let cap = s[SA_CAPTURE]
+        audio_capture_record(cap, 0, s[SA_WAV_PATH])
+    } else {
+        let cap_cmd = s[SA_CAPTURE_CMD]
+        if len(cap_cmd) > 0 {
+            _str_run_sh_c(cap_cmd)
+        }
     }
     list_set(s, SA_CAPTURES_TOTAL, s[SA_CAPTURES_TOTAL] + 1)
 
@@ -333,5 +385,6 @@ fn stream_audio_test_reset(s) {
     list_set(s, SA_UTTERANCES_TOTAL, 0)
     list_set(s, SA_CAPTURES_TOTAL, 0)
     list_set(s, SA_LAST_TRANSCRIPT, "")
+    list_set(s, SA_USE_AUTO, 0)
     return 1
 }
