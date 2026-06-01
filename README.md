@@ -11,7 +11,17 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 131 modules compile (`make build`, +1 from
+> toolchain: 132 modules compile (`make build`, +1 from
+> `io/transducers/image_canny.nova` added in P3.3 cont. Canny edge
+> detection -- the canonical edge detector after Sobel + Harris + SIFT.
+> Pure-NOVA Gaussian 3x3 smoothing + signed Sobel gradients + non-maximum
+> suppression along the gradient direction + 8-connected hysteresis
+> worklist flood-fill with LOW=50 / HIGH=100 milli-normalized magnitude
+> thresholds; produces single-pixel-wide edges (strict subset of Sobel's
+> above-threshold set) and the `image_canny_edges_<low|mid|high>` feature
+> atom on images >= 32x32. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from
 > `safety/bignum_2048.nova` added in P3.9 cont. 2048-bit DH on RFC 7919
 > Group 14 -- the cryptographically-reasonable upgrade to the 256-bit
 > v2-sa-dh strawman SECAGG_AUDIT.md flagged as broken. The bn2048 module
@@ -108,13 +118,21 @@ computational units rather than orchestrating a pipeline of modules.
 > visual perception seam producing feature atoms, documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 from `io/transducers/image_sift.nova` added in P3.3 cont. SIFT
-> keypoint DETECTION (scale-space + DoG extrema only; the 128-D
-> descriptor remains deferred) -- 3-octave Gaussian pyramid, 5 blur
-> levels per octave, 4 DoG layers, 3x3x3 spatial-and-scale extremum
-> check, contrast threshold 30 milli-normalized + Harris-style edge
-> rejection reusing `harris_apply` from R1.6; producing the
-> `image_keypoint_count_<low|mid|high>` feature atom on images >= 32x32,
-> documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> keypoint DETECTION (scale-space + DoG extrema; the P3.3 cont. v2
+> follow-up landed the 128-D descriptor + Lowe-ratio-test matcher
+> in the SAME module) -- 3-octave Gaussian pyramid, 5 blur levels
+> per octave, 4 DoG layers, 3x3x3 spatial-and-scale extremum check,
+> contrast threshold 30 milli-normalized + Harris-style edge rejection
+> reusing `harris_apply` from R1.6; the descriptor pass walks a 16x16
+> window around each keypoint, builds a 4x4 grid of 8-bin direction
+> histograms (Gaussian-weighted by distance), normalizes to L2 =
+> 1000 milli, caps at 200 milli, and re-normalizes; producing the
+> `image_keypoint_count_<low|mid|high>` and
+> `image_descriptors_<low|mid|high>` feature atoms on images >= 32x32
+> plus the new `/match_images A B` admin command for image-to-image
+> keypoint correspondence (object recognition / image stitching /
+> motion tracking foundation), documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +2 from `io/transducers/{video_y4m,video_perception}.nova` added in P3.2
 > minimum-viable video modality -- pure-NOVA Y4M (raw YUV4MPEG2) decoder +
 > pluggable video perception seam producing per-frame feature atoms +
@@ -127,8 +145,18 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 137 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 138 unit-test suites pass
 > (`make test`,
+> +1 suite / +22 assertions from `test_image_canny.nova` added in
+> P3.3 cont. Canny edge detection: uniform 32x32 -> 0 edges; vertical
+> step -> 30 edges (single-column NMS-thinned from Sobel's 60); diagonal
+> step -> edges along |x-y| <= 2; hysteresis bridge fixture -> chain of
+> weak pixels kept; **Canny edges are a STRICT SUBSET of Sobel edges**
+> (every kept Canny pixel lands on a non-zero Sobel magnitude;
+> canny_n <= sobel_count); density-milli math + density-label
+> round-trip; dimension cap (>512) rejects without crashing; too-small
+> (2x2) images return empty edge list; result-tuple accessors work,
+> documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 suite / +87 assertions from `test_jpeg_decode.nova` covering
 > P3.1.JPEG structural parser + P3.1.JPEG cont. entropy decode + IDCT
 > pipeline: in-memory baseline-grayscale fixture builder; segment
@@ -159,6 +187,18 @@ computational units rather than orchestrating a pipeline of modules.
 > (one per spot) at the spot centers; dimension caps reject < 32x32 and
 > > 256x256; per-keypoint accessors round-trip; max_keypoints cap
 > honored, documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 suite / +28 assertions from `test_sift_descriptor.nova` added
+> in P3.3 cont. v2 SIFT 128-D descriptor + matcher (the previously-
+> deferred descriptor + matching half of Lowe 2004): descriptor L2
+> norm ~= 1000 milli on a bright-spot keypoint, component cap honored,
+> distance to self == 0, structurally-different fixtures > 200 milli
+> apart, rotated copy stays structurally similar (< 2263 milli max
+> theoretical), Lowe-ratio-test pass on a clear best match + reject on
+> an ambiguous pair + reject with < 2 candidates, keypoint-list matcher
+> self-pairing, empty-input / size-mismatch / null-data / tiny-image /
+> uniform-image rejection, edge-keypoint window shift, sift_describe_all
+> parallel-list shape, known-diff descriptor distance == 1000,
+> documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 suite / +66 assertions from `test_bignum.nova` added in
 > P3.9 pure-NOVA 256-bit bignum library: `bn_new` / `bn_from_int` /
 > `bn_from_hex` / `bn_to_hex` / `bn_zero` / `bn_eq` / `bn_cmp` / `bn_add`

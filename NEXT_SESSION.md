@@ -17,7 +17,106 @@ continue. It is updated at every session boundary.
 - Phase 10 persistence and operations: **complete** (modules + spine artifact +
   the unified single-process daemon `bin/crossengin`; blocker #10 fixed in the
   NOVA toolchain — see below)
-- **P3.9 cont. (this session) 2048-bit DH on RFC 7919 Group 14**:
+- **P3.3 cont. (this session) Canny edge detection**: **complete --
+  pure-NOVA `image_canny.nova` LANDED**. The fourth structural-feature
+  pipeline on top of Sobel + Harris + SIFT-detection. Canny (1986) is
+  the canonical edge detector: where Sobel ships raw gradient magnitudes
+  (thick, noisy edges), Canny chains Gaussian 3x3 smoothing + signed
+  Sobel gradients + non-maximum suppression along the gradient direction
+  + 8-connected hysteresis flood-fill with LOW=50 / HIGH=100 milli-
+  normalized thresholds to produce CLEAN SINGLE-PIXEL-WIDE edges. The
+  flood-fill is implemented as a worklist (`list_new` + `push` +
+  head-index walk) rather than recursion -- NOVA has no tail-call
+  optimization so a recursive flood would blow the stack on long edge
+  chains.
+  - **`src/io/transducers/image_canny.nova`** (NEW, +1 module ->
+    132 total) -- leaf module, no cross-module imports. Reimplements
+    the Gaussian + Sobel kernels rather than importing image_sift /
+    image_sobel because (a) it stays a leaf, and (b) Canny needs
+    SIGNED gradients (Gx, Gy) and image_sobel.sobel_apply returns
+    only the L1 magnitude. Public API: `canny_detect`,
+    `canny_density_milli`, `canny_density_label`,
+    `canny_result_edges/total/edge_count`. Dimensions capped at
+    512x512 per axis (matches Sobel/Harris); minimum dim 32x32.
+  - **`src/io/transducers/visual_perception.nova`** (EXTENDED) -- one
+    new structural-feature call: `canny_density_milli(data, w, h)` on
+    images >= 32x32, mapped to `image_canny_edges_<low|mid|high>` via
+    `canny_density_label`. Bucket thresholds (low <20 milli, mid
+    20..100, high >=100) are conservatively below Sobel's because
+    NMS + thresholding ALWAYS reduces.
+  - **Fixture edge counts** (verified end-to-end):
+    - Uniform 32x32 grey -> 0 edges, density 0 milli, label `_low`.
+    - Vertical step 32x32 -> 30 edges (one per interior row,
+      NMS-thinned from Sobel's 60), density 29 milli, label `_mid`.
+    - Four-spots 32x32 (scenario_q SPOTS fixture) -> 64 edges,
+      density 62 milli, label `_mid` (Sobel: 160; strict subset).
+    - Vertical step 16x16 -> 14 edges (Sobel: 28; subset confirmed).
+  - **Strict-subset assertion**: `test_canny_subset_of_sobel` verifies
+    that every Canny edge lands on a non-zero Sobel magnitude AND
+    `canny_n <= sobel_count`. PASSES on the vertical-step fixture.
+  - **Test count delta**: `test_image_canny.nova` (NEW) ships 22
+    in-memory assertions. `scenario_q_image_see.sh` extended with +1
+    assertion (`image_canny_edges_mid` on 32x32 four-spots);
+    total scenario_q assertions: 19 -> 20.
+- **P3.3 cont. v2 (this session) SIFT 128-D descriptor + matcher**:
+  **complete -- the previously-deferred descriptor + matching half of
+  SIFT LANDED**. The initial P3.3 cont. drop shipped piece (1) of Lowe
+  2004 (scale-space + DoG extrema). This session lands pieces (3)
+  128-D descriptor and (4) ratio-test matcher in pure NOVA -- the
+  foundation of image-to-image keypoint correspondence (object
+  recognition, image stitching, motion tracking). Pieces:
+  - **`src/io/transducers/image_sift.nova`** (EXTENDED) -- new public
+    surface: `sift_describe(pgm_data, w, h, kp) -> [vec_128, valid]`
+    builds the rotation-invariant 128-D feature vector for a keypoint
+    by walking a 16x16 window, accumulating gradient magnitudes into
+    a 4x4 grid of 8-bin direction histograms, Gaussian-weighting by
+    distance from the keypoint, normalizing to L2 = 1000 milli,
+    capping at 200 milli (Lowe's 0.2 illumination threshold), and
+    re-normalizing. `sift_match_descriptors(a, b)` returns the L2
+    distance in milli. `sift_match(desc_a, desc_b_list, ratio_milli)`
+    runs Lowe's ratio test (best/second < ratio). `sift_match_keypoints
+    (kps_a, descs_a, kps_b, descs_b, ratio_milli)` returns the surviving
+    `[idx_a, idx_b, dist]` triples. `sift_describe_all` /
+    `sift_descriptor_count_label` are the convenience helpers
+    visual_perception.nova uses. NOVA gotchas honored: all gradient-
+    square and L2-sum-of-square multiplies go through `int_mul`
+    (Bug-A safe path -- the L2 accumulator hits 128M, well over the
+    2^20 pointer threshold); atan2 implemented as 8-quadrant integer
+    table lookup with a sub-bin refinement via short/long axis ratio
+    (no float, no trig); the 16x16 Gaussian weight curve is a tiny
+    piecewise-linear approximation of `exp(-r2/32)` indexed by `r2`,
+    so we never materialize a 256-int table.
+  - **`src/io/transducers/visual_perception.nova`** (EXTENDED) -- the
+    structural feature pass now also runs `sift_describe_all` on the
+    detected keypoints and emits a parallel `image_descriptors_<low|
+    mid|high>` atom counting how many keypoints survived the
+    descriptor build (valid == 1). The keypoint count atom continues
+    to fire so existing seam consumers see no behavior change.
+  - **`examples/crossengin_chat.nova`** (EXTENDED) -- one new admin
+    command `/match_images A B` (PGM paths) decodes both images,
+    detects + describes keypoints in each, runs the Lowe-ratio-test
+    matcher, and prints `(matched N keypoint(s); A=...kps B=...kps)`.
+    /help advertises it; the dispatcher routes it next to /see + /play.
+    Per the brief: NO other chat changes.
+  - **`tests/unit/test_sift_descriptor.nova`** (NEW) -- 28 hermetic
+    assertions covering descriptor L2 norm, component cap, distance
+    to self == 0, structural-difference baseline, rotated copy
+    similarity (structural marker, not a tight tolerance), Lowe-
+    ratio-test pass + fail + degenerate cases, keypoint-list matcher,
+    descriptor count label boundaries, null-data / tiny-image /
+    uniform-image rejection, edge-keypoint window shift.
+  - **`tests/integration/scenario_cc_image_match.sh`** (NEW) -- 7
+    end-to-end assertions: /help advertises /match_images, usage line
+    for missing / single-arg invocations, same-image self-match
+    reports N >= 1, per-image keypoint counts surface, missing file
+    surfaces the PGM parser error, chat reaches /quit cleanly.
+  - **`IMAGE_AUDIT.md`** marked "SIFT 128-D descriptor + matcher" as
+    shipped; the deferred entry in the feature ladder flipped to
+    `DONE (P3.3 cont. v2)`.
+  - **`make build`**: unchanged 132 modules.
+  - **`make test`**: +28 assertions (sift_descriptor suite).
+  - **`make integration`**: +1 scenario (scenario_cc_image_match.sh).
+- **P3.9 cont. (previous session) 2048-bit DH on RFC 7919 Group 14**:
   **complete -- v2-sa-dh-2048 LANDED**. The 256-bit DH path shipped in
   P3.9 v2-sa-dh was cryptographically broken (256-bit DH groups are
   recoverable via index-calculus on commodity hardware; SECAGG_AUDIT.md
@@ -2665,13 +2764,25 @@ binary) — this is an integration limitation of the current NOVA backend (block
 
 ## Tests status
 
-- Total unit suites: 131 (131 PASS; **+1 suite / +25 assertions from
-  this session's SIFT keypoint detection (scale-space + DoG extrema only,
-  descriptor deferred)** -- `test_image_sift.nova` covers uniform-grey
-  no-keypoint baseline, single-bright-spot localization, four-spots
-  detection, dimension-cap rejection, null-pointer + zero-dim guards,
-  count-bucket classifier, count-label formatter, per-keypoint accessors,
-  max_keypoints cap honored. **+1 suite / +54 assertions from
+- Total unit suites: 132 (132 PASS; **+1 suite / +28 assertions from
+  this session's SIFT 128-D descriptor + matcher (P3.3 cont. v2,
+  the previously-deferred half)** -- `test_sift_descriptor.nova` covers
+  descriptor L2 norm == 1000 milli on a bright-spot keypoint, component
+  cap honoring, distance-to-self == 0, structurally-different fixtures
+  > 200 milli apart, rotated copy stays structurally similar (< 2263
+  milli, the max theoretical), Lowe-ratio-test pass on a clear match,
+  Lowe-ratio-test rejects an ambiguous match, < 2 candidates returns 0,
+  keypoint-list matcher self-pairing, empty inputs, size-mismatch
+  descriptor -> -1, descriptor count label boundaries, null data_ptr
+  -> valid=0, tiny image (8x8) -> valid=0, uniform image -> valid=0,
+  edge-keypoint window shift, sift_describe_all parallel-list shape,
+  known-diff descriptor distance == 1000. **+1 suite / +25 assertions
+  from the prior session's SIFT keypoint detection (scale-space + DoG
+  extrema only, descriptor deferred)** -- `test_image_sift.nova` covers
+  uniform-grey no-keypoint baseline, single-bright-spot localization,
+  four-spots detection, dimension-cap rejection, null-pointer +
+  zero-dim guards, count-bucket classifier, count-label formatter,
+  per-keypoint accessors, max_keypoints cap honored. **+1 suite / +54 assertions from
   P3.9 pure-NOVA 256-bit bignum library** -- `test_bignum.nova`
   covers `bn_to_hex` / `bn_from_hex` round-trip on the all-zeros,
   all-ones, short, and case-mixed inputs; 32-bit carry propagation in
@@ -2716,7 +2827,7 @@ binary) — this is an integration limitation of the current NOVA backend (block
   30 -> 45).
 - Runnable artifacts: 5 — `examples/kernel_selfcheck.nova` (substrate kernel), `examples/companion_spine.nova` (safety+IO+persistence spine), `examples/crossengin_daemon.nova` -> `bin/crossengin` (the whole agent in one process), `examples/crossengin_kg_publisher.nova` -> `bin/crossengin-kg-publisher` and `examples/crossengin_kg_subscriber.nova` -> `bin/crossengin-kg-subscriber` (Phase 20 / Tier 4 #2 distributed-substrate seam); all build via `make install` and run to a passing self-report.
 - Toolchain change: a one-function fix to `amoufaq5/nova` `src/compiler/compiler.nova` (import-path canonicalization, blocker #10) on branch `claude/festive-franklin-PP7mW`; rebuild with `cd /home/user/NOVA && make`, verified by `make self-host` + `make test` and by re-running all 88 CrossEngin suites.
-- Total integration tests: 51 scripts under `tests/integration/` covering 14
+- Total integration tests: 52 scripts under `tests/integration/` covering 14
   multi-step scenarios (durability across SIGKILL, decision-log durability
   across SIGKILL [P0.7], neighborhood paraphrase, multi-source `/learn`,
   `/meta` table, constitutional veto, web frontend smoke, distributed KG

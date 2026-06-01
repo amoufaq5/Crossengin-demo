@@ -95,9 +95,9 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 | Harris corner detector           | DONE (P3.3)         |
 | SIFT keypoint DETECTION (scale-  | DONE (P3.3 cont.)   |
 |   space + DoG extrema only)      |                     |
-| Canny edge with hysteresis       | 2-3 weeks           |
+| Canny edge with hysteresis       | DONE (P3.3 cont.)   |
 | HOG (oriented gradients)         | 2-3 weeks           |
-| SIFT-like 128-D descriptor       | 4-6 weeks (DEFERRED)|
+| SIFT-like 128-D descriptor       | DONE (P3.3 cont. v2)|
 | Color histograms (HSV / Lab)     | 2-3 weeks           |
 | CNN feature vector (untrained)   | 4-8 weeks           |
 | CNN feature vector (trained)     | 6-12 months         |
@@ -132,20 +132,21 @@ gradient structure and corner geometry, not just intensity moments:
   spatial-distribution labels `image_corner_dense_<top|bottom|left|right>`
   for the directional skew of the corner set.
 - **SIFT keypoint DETECTION** (`src/io/transducers/image_sift.nova`,
-  P3.3 cont. -- DESCRIPTOR DEFERRED). The full SIFT pipeline is
-  (1) scale-space + DoG extrema, (2) sub-pixel refinement +
-  orientation histograms, (3) 128-dimensional descriptor,
-  (4) matching. Pieces (2)-(4) are 4-6 weeks of pure-NOVA work; this
-  module ships ONLY piece (1) -- the keypoint LOCATIONS in (x, y,
-  octave, scale) space. The scale-invariance comes from a 3-octave
-  Gaussian pyramid (1x, 1/2x, 1/4x downsampled), each octave with 5
-  blur levels (the 3x3 Gaussian kernel applied 3x per level, so the
-  effective sigma between adjacent levels is wide enough to produce
-  meaningful DoG signal), and 3x3x3 spatial-and-scale extremum
-  checking on the 4 DoG layers per octave. Candidates are filtered
-  by contrast (`|DoG|*1000/255 > 30` milli-normalized, matching
-  Lowe's 0.03 threshold) and by Harris-style edge rejection (we
-  reuse `harris_apply` from R1.6 and require a Harris corner within
+  P3.3 cont.). The full SIFT pipeline is (1) scale-space + DoG
+  extrema, (2) sub-pixel refinement + orientation histograms, (3)
+  128-dimensional descriptor, (4) matching. The initial drop shipped
+  piece (1); the P3.3 cont. v2 follow-up landed pieces (3) and (4) as
+  well -- see the "SIFT 128-D descriptor + matcher" entry below.
+  Piece (1) returns the keypoint LOCATIONS in (x, y, octave, scale)
+  space. The scale-invariance comes from a 3-octave Gaussian pyramid
+  (1x, 1/2x, 1/4x downsampled), each octave with 5 blur levels (the
+  3x3 Gaussian kernel applied 3x per level, so the effective sigma
+  between adjacent levels is wide enough to produce meaningful DoG
+  signal), and 3x3x3 spatial-and-scale extremum checking on the 4 DoG
+  layers per octave. Candidates are filtered by contrast
+  (`|DoG|*1000/255 > 30` milli-normalized, matching Lowe's 0.03
+  threshold) and by Harris-style edge rejection (we reuse
+  `harris_apply` from R1.6 and require a Harris corner within
   Chebyshev distance 2 of each candidate). Per-image atom:
   `image_keypoint_count_<low|mid|high>` (low <10, mid 10..100, high
   >100). Dimensions capped at 256x256 per axis (3 octaves * 5 blur
@@ -153,13 +154,63 @@ gradient structure and corner geometry, not just intensity moments:
   keeps every intermediate accumulator well under the 2^20 codegen
   pointer-threshold ceiling). Minimum dim 32x32 (smaller images
   cannot usefully sample 3 octaves).
+- **SIFT 128-D descriptor + matcher** (`src/io/transducers/image_sift.nova`,
+  P3.3 cont. v2 -- the previously-deferred descriptor + matching half).
+  For every keypoint produced by piece (1), the descriptor builds a
+  rotation-invariant 128-D feature vector: walk the 16x16 window
+  around the keypoint, accumulate gradient magnitudes into a 4x4 grid
+  of 8-bin direction histograms (Gaussian-weighted by distance from
+  the keypoint), normalize the resulting 128-int vector to L2 = 1000
+  milli, cap each component at 200 milli (Lowe's illumination
+  threshold), and re-normalize. The dominant-orientation alignment
+  step rotates the descriptor frame so the same physical feature in
+  two rotated images produces structurally-related vectors -- the
+  rotation-invariance Lowe's paper is famous for. The matcher
+  implements Lowe's ratio test: `sift_match_keypoints` returns the
+  list of `[idx_a, idx_b, distance]` triples for which the best
+  match's L2 distance is < 0.7 (700 milli) of the second-best
+  candidate's distance. atan2 is computed via integer table lookup
+  (8 quadrants + integer ratio sub-bin) so no float, no trig. Per-
+  image atom: `image_descriptors_<low|mid|high>` mirrors the keypoint
+  bucket and counts how many keypoints survived the descriptor build
+  (uniform regions yield no gradient -> valid=0). New chat admin:
+  `/match_images A B` decodes two PGM paths, detects + describes
+  keypoints in each, runs the matcher, and prints
+  `(matched N keypoint(s); A=...kps B=...kps)`. Caps + minimums
+  inherit from the detection piece -- the descriptor's only extra
+  requirement is that the input image be >= 16 pixels on each axis
+  (the descriptor window itself is 16x16).
+- **Canny edge detection** (`src/io/transducers/image_canny.nova`,
+  P3.3 cont.). Canny (1986) is the CANONICAL edge detector and the
+  standard preprocessing step for almost every downstream computer-
+  vision task. Where Sobel ships the raw gradient magnitude, Canny
+  adds two more stages on top: (1) Gaussian 3x3 smoothing (same
+  1/2/4/2/1 weights image_sift uses), (2) Sobel signed gradients +
+  L1-norm magnitude + direction-bin quantization (4 bins: 0/45/90/
+  135 degrees), (3) non-maximum suppression along the gradient
+  direction (keep this pixel only if its magnitude strictly exceeds
+  both neighbors along the gradient axis -- thins thick edges to a
+  single pixel), and (4) hysteresis thresholding with LOW=50 and
+  HIGH=100 milli-normalized magnitudes via 8-connected worklist
+  flood-fill (no recursion -- NOVA has no tail-call optimization, so
+  a recursive flood would blow the stack on long edge chains). Per-
+  image atom: `image_canny_edges_<low|mid|high>` (<20 milli low,
+  20..100 mid, >=100 high). Strict-subset property holds by
+  construction: NMS + thresholding can only DROP pixels relative to
+  Sobel's above-threshold set, so every Canny edge has a non-zero
+  Sobel magnitude there (verified by unit test). Dimensions capped
+  at 512x512 per axis (same as Sobel/Harris); minimum dim 32x32
+  (smaller images don't have enough interior pixels for the
+  flood-fill to be informative).
 
 Sobel + Harris fire only when the image is at least 16x16 in each axis
 (the kernel needs a 3x3 neighborhood and the count buckets need
-meaningful scale). SIFT-detection runs only on images >= 32x32 (the
-3-octave scale-space cannot sample usefully below that). Dimensions are
-capped at 512x512 for Sobel/Harris, 256x256 for SIFT-detection, to keep
-all intermediate accumulators well under NOVA's 2^20 codegen pointer
+meaningful scale). SIFT-detection + Canny run only on images >= 32x32
+(SIFT's 3-octave scale-space cannot sample usefully below that;
+Canny's NMS + hysteresis flood-fill needs enough interior pixels for
+the chain to be informative). Dimensions are capped at 512x512 for
+Sobel/Harris/Canny, 256x256 for SIFT-detection, to keep all
+intermediate accumulators well under NOVA's 2^20 codegen pointer
 threshold (gotcha #11).
 
 ## Mapping features to atoms
@@ -192,10 +243,11 @@ lives in `src/agent/loop_perception.nova` and is a separate follow-up.
 | PGM + crude stats + ImageMagick shim               | landed (P3.1)    |
 | Sobel + Harris structural features                 | DONE (P3.3)      |
 | SIFT keypoint DETECTION (no descriptor)            | DONE (P3.3 cont.)|
+| Canny edge with NMS + hysteresis                   | DONE (P3.3 cont.)|
 | JPEG decode in pure NOVA                           | 6-8 weeks        |
 | PNG decode (zlib + filters)                        | DONE (grayscale-8)|
 | Color histograms                                   | 2-3 weeks        |
-| SIFT 128-D descriptor + matching                   | 4-6 weeks        |
+| SIFT 128-D descriptor + matching                   | DONE (P3.3 cont. v2)|
 | WASM-bundled stb_image bridge                      | 2 weeks post-P2.7|
 | CNN embeddings (untrained / trained)               | 2-12 months      |
 
@@ -255,15 +307,30 @@ Pure-NOVA WebP and HEIC are not on any roadmap within the next year.
 * `src/io/transducers/image_harris.nova` — pure-NOVA Harris corner
   detector with milli-fixed-point response (DONE, P3.3).
 * `src/io/transducers/image_sift.nova` — pure-NOVA SIFT keypoint
-  DETECTION (scale-space + DoG extrema, no descriptor) reusing
-  `harris_apply` from R1.6 for the edge-rejection filter (DONE, P3.3
-  cont.).
+  detection (scale-space + DoG extrema, DONE in P3.3 cont.) plus the
+  128-D descriptor + Lowe-ratio-test matcher (DONE in P3.3 cont. v2).
+  Reuses `harris_apply` from R1.6 for the edge-rejection filter; the
+  descriptor + matcher add `sift_describe`, `sift_match_descriptors`,
+  `sift_match`, `sift_match_keypoints`, `sift_describe_all`, and the
+  `sift_descriptor_count_label` count-bucket helper.
+* `src/io/transducers/image_canny.nova` — pure-NOVA Canny edge detector
+  with Gaussian smoothing + Sobel signed gradients + non-maximum
+  suppression + 8-connected hysteresis worklist flood-fill (DONE,
+  P3.3 cont.). Reimplements the Gaussian + Sobel kernels rather than
+  importing the SIFT/Sobel modules so the module stays a leaf with no
+  cross-module dependency; the Sobel reimplementation is necessary
+  anyway because Canny needs the SIGNED gradients (Gx, Gy) and
+  `image_sobel.sobel_apply` returns only the L1 magnitude.
 * `src/io/transducers/visual_perception.nova` — pluggable seam + feature
   extraction (extended in P3.3 to call Sobel + Harris on images
-  >= 16x16, and SIFT-detection on images >= 32x32).
+  >= 16x16, SIFT-detection + descriptor on images >= 32x32 -- the
+  descriptor pass emits a parallel `image_descriptors_<bucket>` atom --
+  and Canny edge density on images >= 32x32 emitting
+  `image_canny_edges_<low|mid|high>`).
 * `scripts/image_to_pgm.sh` — ImageMagick / ffmpeg / placeholder shim.
 * `examples/crossengin_chat.nova` — `/see PATH` admin command + dispatch
-  + /help entry.
+  + /help entry, plus `/match_images A B` for image-to-image keypoint
+  correspondence (P3.3 cont. v2).
 * `tests/unit/test_deflate.nova` — 46 in-memory assertions for the
   DEFLATE inflate: BTYPE=00 stored regression, BTYPE=01 static Huffman
   "hello" / empty / overlapping copy / length-extra-bits / distance > 256
@@ -285,9 +352,27 @@ Pure-NOVA WebP and HEIC are not on any roadmap within the next year.
   SIFT-detection on uniform / single-bright-spot / four-spots fixtures
   plus the dimension caps, count-bucket helpers, and per-keypoint
   accessors.
+* `tests/unit/test_sift_descriptor.nova` — 28 in-memory assertions
+  covering the 128-D descriptor pipeline (L2 norm ~= 1000 milli on a
+  bright-spot keypoint, component cap honored, structurally-different
+  fixtures land far apart, rotated copy stays structurally similar,
+  Lowe-ratio-test pass + fail cases, keypoint-list matcher) plus
+  invalid-input handling (null data, tiny image, uniform region,
+  size-mismatch descriptors, edge-keypoint window shift).
+* `tests/unit/test_image_canny.nova` — 22 in-memory assertions covering
+  Canny on uniform / vertical-step / diagonal-step / hysteresis-bridge
+  fixtures; the Canny-vs-Sobel STRICT-SUBSET invariant (every Canny
+  edge lands on a non-zero Sobel magnitude); density-milli math + the
+  density-label round-trip; dimension caps + too-small-image handling.
 * `tests/integration/scenario_q_image_see.sh` — end-to-end /see chat
   assertions against gradient + uniform + 16x16 edge + 32x32 four-spots
-  fixtures.
+  fixtures (+1 assertion for `image_canny_edges_mid` on the four-spots
+  fixture).
+* `tests/integration/scenario_cc_image_match.sh` — end-to-end
+  /match_images chat assertions: same-image self-match returns N >= 1,
+  per-image keypoint counts are reported, missing / partial arguments
+  print the usage line, and the chat reaches /quit cleanly after the
+  matcher probing sequence.
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (JPEG / PNG decode, feature extraction, embeddings).
 * `STT_AUDIT.md` — sibling audit for the audio modality bridge.

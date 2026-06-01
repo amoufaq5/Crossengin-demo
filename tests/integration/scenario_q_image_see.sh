@@ -219,6 +219,18 @@ assert_match "$OUT" "saw image $SPOTS \[32x32" \
 assert_match "$OUT" "features:.*image_keypoint_count_low" \
     "/see surfaces image_keypoint_count_low on 32x32 four-spots fixture"
 
+# ---- P3.3 cont. Canny edge density on 32x32 four-spots fixture ----------
+
+# 18. Canny runs only on images >= 32x32 (smaller fixtures don't have
+# enough interior pixels for hysteresis to be informative). The 32x32
+# four-spots fixture has 4 bright 5x5 patches each contributing a ring
+# of edges; with Canny's NMS + hysteresis the cleaned edge map has
+# ~64 edge pixels (density ~62 milli) which lands in the MID bucket.
+# The 16x16 vertical-edge fixture is below the minimum so it does NOT
+# carry a canny label there.
+assert_match "$OUT" "features:.*image_canny_edges_mid" \
+    "/see surfaces image_canny_edges_mid on 32x32 four-spots fixture"
+
 # ---- P3.1.JPEG cont. entropy decode + IDCT on Pillow-generated JPEG -------
 
 if [ "$JPEG_AVAILABLE" -eq 1 ]; then

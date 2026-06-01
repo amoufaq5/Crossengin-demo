@@ -1,0 +1,517 @@
+// CrossEngin io/transducers: Canny edge detector (P3.3 cont. image
+// structural feature -- the fourth pipeline after Sobel + Harris + SIFT).
+//
+// Purpose
+//   Canny (1986) is the CANONICAL edge detector and the standard
+//   preprocessing step for almost every downstream computer-vision task.
+//   Where Sobel (R1.6) ships the raw gradient magnitude, Canny extends
+//   it with two more stages that turn the thick, noisy Sobel output
+//   into clean, SINGLE-PIXEL-WIDE edges:
+//     1. Gaussian blur (3x3, weights 1/2/4/2/1, sum 16). Smooths the
+//        input so the gradient is computed on a denoised image. We
+//        reimplement the kernel here (rather than importing image_sift's
+//        `_sift_blur_3x3`) so the Canny module stays a leaf with no
+//        SIFT dependency.
+//     2. Sobel gradients (Gx, Gy) via the same kernels image_sobel
+//        ships. We reimplement the per-pixel inner loop here for the
+//        same reason -- we need the SIGNED gradients, not the L1
+//        magnitude image_sobel.sobel_apply returns. (image_harris.nova
+//        already follows this pattern; we mirror it.)
+//     3. Non-maximum suppression: per pixel, look at its 2 neighbors
+//        ALONG THE GRADIENT DIRECTION (rounded to 0/45/90/135 degrees).
+//        Keep the pixel ONLY if its magnitude exceeds both neighbors;
+//        otherwise zero it. Suppresses Sobel's thick edges down to a
+//        single pixel wide.
+//     4. Hysteresis thresholding: two thresholds, LOW and HIGH (in
+//        milli-normalized magnitude units). Pixels above HIGH are
+//        DEFINITE edges. Pixels below LOW are NON-edges. Pixels in
+//        the middle become edges ONLY IF they connect (8-neighborhood
+//        flood fill) to a definite edge. Implemented as a worklist
+//        flood-fill (NOVA has no tail-call optimization so a recursive
+//        implementation would blow the stack on a large connected
+//        component).
+//
+// Algorithm:
+//   smooth = gaussian_3x3(input)
+//   gx, gy = sobel_gradients(smooth)
+//   mag    = |gx| + |gy|          (L1-norm, same as image_sobel)
+//   dir    = quantize_4_bins(gx, gy)
+//   nms    = non_max_suppress(mag, dir)
+//   edges  = hysteresis(nms, LOW=50 milli, HIGH=100 milli)
+//
+// Public API
+//   canny_detect(data_ptr, width, height) ->
+//       [edge_pixels, total_count]
+//     `edge_pixels`  -- list of [x, y] pairs in row-major scan order
+//                       (caller iterates).
+//     `total_count`  -- width * height (cap-respecting; 0 on failure).
+//   canny_density_milli(data_ptr, width, height) -> int in 0..1000
+//   canny_result_edges(r)    -> list of [x, y]
+//   canny_result_total(r)    -> int (total pixels)
+//   canny_result_edge_count(r) -> int (len(edges); convenience)
+//   canny_density_label(density_milli) ->
+//       "image_canny_edges_low" / "_mid" / "_high"
+//
+// Density buckets (chosen so a clean vertical step in a 32x32 produces
+// ~32 edge pixels = 31 milli -> low; a busy / textured image with > 50
+// milli edges trips mid; > 150 milli is high. The bucket boundaries
+// are conservatively below Sobel's because NMS + hysteresis ALWAYS
+// reduces the edge count -- a clean Sobel "dense" image is a Canny
+// "mid" image typically).
+//   low  : density <  20 milli
+//   mid  : 20 milli <= density < 100 milli
+//   high : density >= 100 milli
+//
+// Direction quantization (4 bins, mirrors image_sobel's convention but
+// for the GRADIENT DIRECTION not the edge orientation -- they differ by
+// 90 degrees):
+//   bin 0 -- gradient is horizontal (Gx dominates)  -> NMS compares
+//            neighbors at (x-1, y) and (x+1, y)
+//   bin 1 -- gradient is 45-degree                  -> compares
+//            (x-1, y-1) and (x+1, y+1)
+//   bin 2 -- gradient is vertical (Gy dominates)    -> compares
+//            (x, y-1) and (x, y+1)
+//   bin 3 -- gradient is 135-degree                 -> compares
+//            (x+1, y-1) and (x-1, y+1)
+//
+// Hysteresis thresholds. CANNY_LOW_MILLI = 50, CANNY_HIGH_MILLI = 100
+// in normalized-magnitude units (raw magnitude clamped to 0..255 then
+// scaled by 1000/255 to milli units). 100 milli = ~25 raw magnitude
+// before scaling, well above Sobel's gradient-noise floor.
+//
+// Pixel-area cap: CANNY_MAX_DIM = 512 per axis (max area 262144).
+// Matches Sobel + Harris. SIFT's 256-cap is tighter only because SIFT
+// pays 15x per-pixel work for the pyramid; Canny pays 4-5x (one blur
+// pass + gradient + NMS + flood-fill) so we can run at the full 512.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub. No sys_* (no I/O).
+// CrossEngin dependencies: none (leaf module -- visual_perception.nova
+//   imports this; we don't import image_sobel.nova because Canny needs
+//   the SIGNED gradients, not the L1 magnitude).
+
+// ---- format constants ----------------------------------------------------
+
+// Hard cap on pixel area. 512 * 512 = 262144 == 2^18, under 2^20.
+let CANNY_MAX_DIM = 512
+let CANNY_MAX_PIXEL_AREA = 262144
+
+// Hysteresis thresholds in milli-normalized magnitude units (mag * 1000 / 255).
+// 100 milli ~= 25 raw magnitude; 50 milli ~= 13 raw. Below 50 = non-edge.
+let CANNY_LOW_MILLI  = 50
+let CANNY_HIGH_MILLI = 100
+
+// NMS direction bins.
+let CANNY_DIR_HORIZ   = 0   // gradient horizontal, compare (x-1, y) / (x+1, y)
+let CANNY_DIR_DIAG_PD = 1   // gradient 45-deg,    compare (x-1, y-1) / (x+1, y+1)
+let CANNY_DIR_VERT    = 2   // gradient vertical, compare (x, y-1) / (x, y+1)
+let CANNY_DIR_DIAG_ND = 3   // gradient 135-deg,  compare (x+1, y-1) / (x-1, y+1)
+
+// Hysteresis flood-fill pixel labels.
+let CANNY_LABEL_NONE   = 0   // not an edge
+let CANNY_LABEL_WEAK   = 1   // candidate (LOW <= mag < HIGH)
+let CANNY_LABEL_STRONG = 2   // definite edge (mag >= HIGH)
+let CANNY_LABEL_KEPT   = 3   // accepted by hysteresis (final output bit)
+
+// Gaussian-kernel weight constants (3x3, sum=16; same as image_sift's
+// _sift_blur_3x3). Kept as individual lets so the inner-loop multiplies
+// use small operands (gotcha #11 / Bug-A safety).
+let CANNY_G_CORNER = 1
+let CANNY_G_EDGE   = 2
+let CANNY_G_CENTER = 4
+let CANNY_G_SUM    = 16
+
+// Density classifier thresholds (in milli units = edges per 1000 pixels).
+let CANNY_DENSITY_MID_MIN  = 20
+let CANNY_DENSITY_HIGH_MIN = 100
+
+// Result tuple slot indices.
+let CANNY_R_EDGES = 0
+let CANNY_R_TOTAL = 1
+
+// ---- result helpers ------------------------------------------------------
+
+fn _canny_result(edges, total) {
+    let r = list_new()
+    push(r, edges)
+    push(r, total)
+    return r
+}
+
+fn _canny_fail() {
+    return _canny_result(list_new(), 0)
+}
+
+fn _canny_edge_xy(x, y) {
+    let e = list_new()
+    push(e, x)
+    push(e, y)
+    return e
+}
+
+// ---- stage 1: Gaussian blur (3x3, weights 1/2/4/2/1, sum 16) -------------
+//
+// Input: byte buffer (data_ptr). Output: int list of length width*height.
+// Border pixels are COPIED unchanged from the source (zero-pad would
+// dampen the gradient near the edges and shrink the effective image).
+
+fn _canny_gaussian_3x3(data_ptr, width, height) {
+    let area = int_mul(width, height)
+    let dst = list_new()
+    let i = 0
+    while i < area {
+        push(dst, load8(data_ptr + i))
+        i = int_add(i, 1)
+    }
+    if width < 3 { return dst }
+    if height < 3 { return dst }
+    let y = 1
+    while y < height - 1 {
+        let row_above = int_mul(int_sub(y, 1), width)
+        let row_mid   = int_mul(y, width)
+        let row_below = int_mul(int_add(y, 1), width)
+        let x = 1
+        while x < width - 1 {
+            let tl = load8(data_ptr + int_add(row_above, int_sub(x, 1)))
+            let tm = load8(data_ptr + int_add(row_above, x))
+            let tr = load8(data_ptr + int_add(row_above, int_add(x, 1)))
+            let ml = load8(data_ptr + int_add(row_mid,   int_sub(x, 1)))
+            let mc = load8(data_ptr + int_add(row_mid,   x))
+            let mr = load8(data_ptr + int_add(row_mid,   int_add(x, 1)))
+            let bl = load8(data_ptr + int_add(row_below, int_sub(x, 1)))
+            let bm = load8(data_ptr + int_add(row_below, x))
+            let br = load8(data_ptr + int_add(row_below, int_add(x, 1)))
+            // 9-tap weighted sum: corners*1 + edges*2 + center*4.
+            let s = int_mul(CANNY_G_CORNER, tl)
+            s = int_add(s, int_mul(CANNY_G_EDGE,   tm))
+            s = int_add(s, int_mul(CANNY_G_CORNER, tr))
+            s = int_add(s, int_mul(CANNY_G_EDGE,   ml))
+            s = int_add(s, int_mul(CANNY_G_CENTER, mc))
+            s = int_add(s, int_mul(CANNY_G_EDGE,   mr))
+            s = int_add(s, int_mul(CANNY_G_CORNER, bl))
+            s = int_add(s, int_mul(CANNY_G_EDGE,   bm))
+            s = int_add(s, int_mul(CANNY_G_CORNER, br))
+            let v = s / CANNY_G_SUM
+            list_set(dst, int_add(row_mid, x), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- stage 2: Sobel gradients (signed Gx, Gy + L1 magnitude + dir bin) ---
+//
+// Input: int list of smoothed pixels (from _canny_gaussian_3x3). Returns
+// a 2-list [mag_list, dir_list] of length width*height each. Border
+// pixels have magnitude 0 and an arbitrary (unused) direction.
+
+fn _canny_sobel_gradients(smoothed, width, height) {
+    let area = int_mul(width, height)
+    let mag_list = list_new()
+    let dir_list = list_new()
+    let i = 0
+    while i < area {
+        push(mag_list, 0)
+        push(dir_list, CANNY_DIR_HORIZ)
+        i = int_add(i, 1)
+    }
+    if width < 3 {
+        let pair = list_new()
+        push(pair, mag_list)
+        push(pair, dir_list)
+        return pair
+    }
+    if height < 3 {
+        let pair = list_new()
+        push(pair, mag_list)
+        push(pair, dir_list)
+        return pair
+    }
+    let y = 1
+    while y < height - 1 {
+        let row_above_off = int_mul(int_sub(y, 1), width)
+        let row_mid_off   = int_mul(y, width)
+        let row_below_off = int_mul(int_add(y, 1), width)
+        let x = 1
+        while x < width - 1 {
+            let tl = smoothed[int_add(row_above_off, int_sub(x, 1))]
+            let tm = smoothed[int_add(row_above_off, x)]
+            let tr = smoothed[int_add(row_above_off, int_add(x, 1))]
+            let ml = smoothed[int_add(row_mid_off,   int_sub(x, 1))]
+            let mr = smoothed[int_add(row_mid_off,   int_add(x, 1))]
+            let bl = smoothed[int_add(row_below_off, int_sub(x, 1))]
+            let bm = smoothed[int_add(row_below_off, x)]
+            let br = smoothed[int_add(row_below_off, int_add(x, 1))]
+            // Sobel-X: -tl + tr - 2*ml + 2*mr - bl + br
+            let gx = int_sub(tr, tl)
+            gx = int_add(gx, int_sub(int_mul(2, mr), int_mul(2, ml)))
+            gx = int_add(gx, int_sub(br, bl))
+            // Sobel-Y: -tl - 2*tm - tr + bl + 2*bm + br
+            let gy = int_sub(bl, tl)
+            gy = int_add(gy, int_sub(int_mul(2, bm), int_mul(2, tm)))
+            gy = int_add(gy, int_sub(br, tr))
+            let abs_gx = gx
+            if abs_gx < 0 { abs_gx = 0 - abs_gx }
+            let abs_gy = gy
+            if abs_gy < 0 { abs_gy = 0 - abs_gy }
+            // L1-norm magnitude. Bounded by 4*255 = 1020.
+            let m = int_add(abs_gx, abs_gy)
+            // Direction-bin quantization, based on |Gx| vs |Gy| and the
+            // sign-product of Gx*Gy. Same logic Sobel uses for the
+            // orientation bucket, but here we want the GRADIENT direction
+            // (the direction the intensity increases), not the EDGE
+            // orientation (perpendicular). Mapping is:
+            //   |Gx| >> |Gy|  -> bin 0 (horizontal gradient)
+            //   |Gy| >> |Gx|  -> bin 2 (vertical gradient)
+            //   else: diagonal. Sign(Gx)==Sign(Gy) -> bin 1 (45 deg);
+            //                   Sign(Gx)!=Sign(Gy) -> bin 3 (135 deg).
+            let bin = CANNY_DIR_HORIZ
+            if int_mul(2, abs_gx) < abs_gy {
+                bin = CANNY_DIR_VERT
+            } else {
+                if int_mul(2, abs_gy) < abs_gx {
+                    bin = CANNY_DIR_HORIZ
+                } else {
+                    let gx_pos = 0
+                    if gx > 0 { gx_pos = 1 }
+                    if gx == 0 { gx_pos = 1 }
+                    let gy_pos = 0
+                    if gy > 0 { gy_pos = 1 }
+                    if gy == 0 { gy_pos = 1 }
+                    if gx_pos == gy_pos { bin = CANNY_DIR_DIAG_PD }
+                    else { bin = CANNY_DIR_DIAG_ND }
+                }
+            }
+            let off = int_add(row_mid_off, x)
+            list_set(mag_list, off, m)
+            list_set(dir_list, off, bin)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let pair = list_new()
+    push(pair, mag_list)
+    push(pair, dir_list)
+    return pair
+}
+
+// ---- stage 3: non-maximum suppression ------------------------------------
+//
+// Per pixel, look at the 2 neighbors ALONG the gradient direction. Keep
+// the magnitude only if it strictly exceeds both neighbors; otherwise
+// zero it. Returns a NEW int list (length area) -- we don't mutate the
+// magnitude list in place because NMS reads neighbors that may already
+// have been processed.
+
+fn _canny_nms(mag_list, dir_list, width, height) {
+    let area = int_mul(width, height)
+    let out = list_new()
+    let i = 0
+    while i < area {
+        push(out, 0)
+        i = int_add(i, 1)
+    }
+    if width < 3 { return out }
+    if height < 3 { return out }
+    let y = 1
+    while y < height - 1 {
+        let row_off = int_mul(y, width)
+        let x = 1
+        while x < width - 1 {
+            let off = int_add(row_off, x)
+            let m = mag_list[off]
+            if m > 0 {
+                let d = dir_list[off]
+                // Determine the two neighbor offsets to compare against.
+                let n1 = 0
+                let n2 = 0
+                if d == CANNY_DIR_HORIZ {
+                    n1 = mag_list[int_add(row_off, int_sub(x, 1))]
+                    n2 = mag_list[int_add(row_off, int_add(x, 1))]
+                }
+                if d == CANNY_DIR_VERT {
+                    n1 = mag_list[int_add(int_mul(int_sub(y, 1), width), x)]
+                    n2 = mag_list[int_add(int_mul(int_add(y, 1), width), x)]
+                }
+                if d == CANNY_DIR_DIAG_PD {
+                    n1 = mag_list[int_add(int_mul(int_sub(y, 1), width), int_sub(x, 1))]
+                    n2 = mag_list[int_add(int_mul(int_add(y, 1), width), int_add(x, 1))]
+                }
+                if d == CANNY_DIR_DIAG_ND {
+                    n1 = mag_list[int_add(int_mul(int_sub(y, 1), width), int_add(x, 1))]
+                    n2 = mag_list[int_add(int_mul(int_add(y, 1), width), int_sub(x, 1))]
+                }
+                // Strict comparison so a flat ridge survives only at the
+                // local peak (>= here would keep all ties, defeating NMS).
+                if m >= n1 {
+                    if m >= n2 {
+                        list_set(out, off, m)
+                    }
+                }
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return out
+}
+
+// ---- stage 4: hysteresis thresholding (8-connected flood-fill) -----------
+//
+// Convert NMS magnitudes to labels (NONE / WEAK / STRONG). Then for every
+// STRONG pixel, run an 8-connected flood-fill that promotes any WEAK
+// pixel touching the strong region to KEPT. The flood uses a WORKLIST,
+// not recursion (NOVA has no TCO; a recursive walk on a long edge chain
+// would blow the stack).
+//
+// Returns a label list (length area); labels[off] == CANNY_LABEL_KEPT
+// iff the pixel is in the final edge set.
+
+fn _canny_hysteresis(nms_mag, width, height) {
+    let area = int_mul(width, height)
+    let labels = list_new()
+    let i = 0
+    while i < area {
+        push(labels, CANNY_LABEL_NONE)
+        i = int_add(i, 1)
+    }
+    // 1. Pre-label every pixel based on the milli-normalized magnitude.
+    //    Magnitudes are in 0..1020; we scale to 0..1000 milli via
+    //    mag * 1000 / 255 (matching image_sift's normalization).
+    let k = 0
+    while k < area {
+        let m = nms_mag[k]
+        if m > 0 {
+            let mm = int_mul(m, 1000) / 255
+            if mm >= CANNY_HIGH_MILLI {
+                list_set(labels, k, CANNY_LABEL_STRONG)
+            } else {
+                if mm >= CANNY_LOW_MILLI {
+                    list_set(labels, k, CANNY_LABEL_WEAK)
+                }
+            }
+        }
+        k = int_add(k, 1)
+    }
+    // 2. Worklist flood-fill: every STRONG pixel becomes KEPT; then we
+    //    walk the worklist, and for each KEPT pixel promote any WEAK
+    //    8-neighbor to KEPT and push it on the worklist.
+    let work = list_new()
+    let q = 0
+    while q < area {
+        if labels[q] == CANNY_LABEL_STRONG {
+            list_set(labels, q, CANNY_LABEL_KEPT)
+            push(work, q)
+        }
+        q = int_add(q, 1)
+    }
+    // Drain the worklist. We use a head index `hd` and grow `work` by
+    // `push` -- never remove from the front. The walk terminates when
+    // hd reaches len(work).
+    let hd = 0
+    while hd < len(work) {
+        let off = work[hd]
+        // Recover (x, y) from the row-major offset.
+        let y = off / width
+        let x = off - int_mul(y, width)
+        // Iterate the 8 neighbors. Skip out-of-bounds.
+        let dy = -1
+        while dy <= 1 {
+            let yy = int_add(y, dy)
+            if yy >= 0 {
+                if yy < height {
+                    let yy_off = int_mul(yy, width)
+                    let dx = -1
+                    while dx <= 1 {
+                        let xx = int_add(x, dx)
+                        let skip = 0
+                        if dx == 0 {
+                            if dy == 0 { skip = 1 }
+                        }
+                        if skip == 0 {
+                            if xx >= 0 {
+                                if xx < width {
+                                    let noff = int_add(yy_off, xx)
+                                    if labels[noff] == CANNY_LABEL_WEAK {
+                                        list_set(labels, noff, CANNY_LABEL_KEPT)
+                                        push(work, noff)
+                                    }
+                                }
+                            }
+                        }
+                        dx = int_add(dx, 1)
+                    }
+                }
+            }
+            dy = int_add(dy, 1)
+        }
+        hd = int_add(hd, 1)
+    }
+    return labels
+}
+
+// ---- public: canny_detect -----------------------------------------------
+
+fn canny_detect(data_ptr, width, height) {
+    if width <= 0   { return _canny_fail() }
+    if height <= 0  { return _canny_fail() }
+    if data_ptr == 0 { return _canny_fail() }
+    if width > CANNY_MAX_DIM  { return _canny_fail() }
+    if height > CANNY_MAX_DIM { return _canny_fail() }
+    let area = int_mul(width, height)
+    if area > CANNY_MAX_PIXEL_AREA { return _canny_fail() }
+    if width < 3  { return _canny_result(list_new(), area) }
+    if height < 3 { return _canny_result(list_new(), area) }
+
+    // 1. Gaussian-smoothed image.
+    let smoothed = _canny_gaussian_3x3(data_ptr, width, height)
+    // 2. Sobel gradients (magnitude + direction bin) on the smoothed image.
+    let grads = _canny_sobel_gradients(smoothed, width, height)
+    let mag_list = grads[0]
+    let dir_list = grads[1]
+    // 3. Non-maximum suppression along the gradient direction.
+    let nms = _canny_nms(mag_list, dir_list, width, height)
+    // 4. Hysteresis thresholding (8-connected flood fill).
+    let labels = _canny_hysteresis(nms, width, height)
+    // Collect the kept pixels into a list of (x, y) pairs in scan order.
+    let edges = list_new()
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            if labels[int_add(row_off, x)] == CANNY_LABEL_KEPT {
+                push(edges, _canny_edge_xy(x, y))
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return _canny_result(edges, area)
+}
+
+// canny_density_milli: edge density in parts per thousand. Same shape as
+// sobel_edge_density_milli.
+fn canny_density_milli(data_ptr, width, height) {
+    let r = canny_detect(data_ptr, width, height)
+    let edges = r[CANNY_R_EDGES]
+    let total = r[CANNY_R_TOTAL]
+    if total <= 0 { return 0 }
+    return int_mul(len(edges), 1000) / total
+}
+
+// canny_density_label: bucket a density-milli value into a feature atom
+// label. Used by visual_perception.nova.
+fn canny_density_label(density_milli) {
+    if density_milli >= CANNY_DENSITY_HIGH_MIN { return "image_canny_edges_high" }
+    if density_milli >= CANNY_DENSITY_MID_MIN  { return "image_canny_edges_mid" }
+    return "image_canny_edges_low"
+}
+
+// ---- result-tuple accessors ---------------------------------------------
+
+fn canny_result_edges(r)      { return r[CANNY_R_EDGES] }
+fn canny_result_total(r)      { return r[CANNY_R_TOTAL] }
+fn canny_result_edge_count(r) { return len(r[CANNY_R_EDGES]) }
