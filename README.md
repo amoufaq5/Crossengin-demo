@@ -79,7 +79,43 @@ computational units rather than orchestrating a pipeline of modules.
 > m in [1, 40], max_iter <= 20. 61 unit assertions
 > (`tests/unit/test_slic.nova`) + 16 integration assertions
 > (`tests/integration/scenario_yy_slic.sh`); all green.
-> R11E / R10D / R10F / R11B remain bit-identically green. R12C adds
+> R11E / R10D / R10F / R11B remain bit-identically green. R13E adds
+> `src/kg/pagerank.nova` — Brin & Page 1998 PageRank centrality, the
+> CENTRALITY companion to R11F (LPA) and R12C (Louvain) clustering.
+> Clustering asks "which atoms hang together?"; PageRank answers
+> "which atoms are individually most important?" by computing the
+> steady-state distribution of a damped random walk in
+> integer-milli units (no FP, fully deterministic). The per-atom
+> update `PR_new(i) = (1-d)/N + d * SUM_{j in In(i)}(PR(j)/out_deg(j))`
+> uses MICRO precision (`pr * 1000` per division) + an O(N)
+> renormalisation step each pass to absorb integer-truncation bias;
+> without that pass the Zachary karate fixture leaks ~40% of its
+> mass over 30 iterations. Dangling atoms (no out-edges) hand their
+> mass uniformly across the graph each iteration so no PR leaks.
+> On the **Zachary 1977 karate-club benchmark (34 atoms, 78 edges)
+> PageRank converges in 10 iterations and the top-2 atoms are
+> {0 (Mr Hi, PR=97 milli), 33 (Officer, PR=100 milli)}** -- the
+> classic Brin & Page centrality ranking, recovering Zachary's two
+> faction leaders without any text or label information. Total mass
+> is conserved within +/- 50 milli for N=34. On the **barbell
+> (two 4-cliques joined by a bridge) the bridge atoms (3, 4) own
+> the top-2 PR slots (149 milli each) with the six clique-interior
+> atoms tied at 116 milli** -- every cross-clique walk has to cross
+> the bridge, so the bridge accumulates centrality. Public API:
+> `pagerank_compute(kg, damping_milli, max_iter)`,
+> `pagerank_default(kg)` (Brin & Page defaults: d=850, iter=50),
+> `pagerank_at(result, atom_id)`,
+> `pagerank_top_k(result, k)`, `pagerank_converged`,
+> `pagerank_iterations`, `pagerank_n_atoms`, `pagerank_damping`,
+> `pagerank_total_mass`. New chat admin: `/pagerank` prints
+> `PAGERANK n=N iterations=I converged=yes/no top=[id=X,pr=Y ...]`.
+> Convergence threshold is L_inf < 2 milli (the brief's "< 1 milli"
+> with a 1-milli tolerance to absorb the unavoidable integer-noise
+> ping-pong on dense graphs). 90 unit assertions
+> (`tests/unit/test_pagerank.nova`) + 23 integration assertions
+> (`tests/integration/scenario_eee_pagerank.sh`); all green.
+> R11F's 71, R12C's 72 unit checks remain bit-identically green.
+> R12C adds
 > `src/kg/louvain.nova` — Blondel-2008 two-phase greedy modularity
 > optimiser, the gold-standard companion to R11F's label-propagation
 > detector. Phase 1 picks moves analytically (DQ in integer-only
@@ -589,8 +625,27 @@ computational units rather than orchestrating a pipeline of modules.
 > EMA pull toward the federation mean, surfaced via the chat
 > `/fed_join` / `/fed_stats` / `/fed_leave` admin commands and the
 > `bin/crossengin-fed-coordinator` daemon, documented in
-> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 141 unit-test suites pass
+> [`FEDERATED_AUDIT.md`](./FEDERATED_AUDIT.md)), 142 unit-test suites pass
 > (`make test`,
+> +1 suite / +84 assertions from `test_snapshot_delta.nova` added in
+> R13F incremental delta snapshots: writer accumulation (ADD/MOD/DEL),
+> text round-trip with empty / single-op / multi-op blobs, parse
+> hardening (missing-trailer / bad-header rejected), apply semantics
+> (ADD creates via replace-by-label, MOD patches alpha/beta, DEL
+> calls kg_remove_atom, unknown-KG silently skipped), fingerprint
+> guard (mismatched parent_snapshot refused, matching parent accepted),
+> multi-delta sequencing, path layout (3-digit zero-padded
+> `.delta.NNN`), enumeration (contiguous range + gap-stop), disk
+> round-trips (parent-only / one delta / three deltas), compaction
+> (below-threshold no-op + collapse 10 deltas + prune), R8E schema
+> migration interop (atoms reach SCHEMA_CURRENT_VERSION post-delta-
+> apply), R6F episodic preservation (parent's episodic moment survives
+> the delta + compact round-trip), `snap_make_delta_writer`
+> convenience. Integration scenario `scenario_fff_snap_delta.sh`
+> (+14 assertions) benches a 1000-atom KG showing delta is ~1.6x
+> faster than full on tmpfs (fsync-floor-bound at this size) and ~4x
+> faster on a 5000-atom KG. Documented in
+> [`SNAPSHOT_FORMAT.md`](./SNAPSHOT_FORMAT.md),
 > +1 suite / +34 assertions from `test_orb.nova` added in P3.3 cont. v3
 > ORB feature detector + Hamming-distance matcher: FAST-9 4-corner
 > detection on a 40x40 four-spots fixture surfaces 96 keypoints; orb

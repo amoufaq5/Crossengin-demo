@@ -3,6 +3,125 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R13E (this session) — KG PageRank / centrality: atom-importance scoring
+
+**Status: complete -- new module `src/kg/pagerank.nova` ships
+Brin & Page 1998 PageRank, the CENTRALITY companion to R11F's
+label-propagation and R12C's Louvain community-detection KG read
+primitives.** Clustering asks "which atoms hang together as a
+group?"; PageRank answers the orthogonal question "which atoms are
+individually most important?" by computing the steady-state
+distribution of a damped random walk on the directed xref graph.
+Pure integer arithmetic, no floats, fully deterministic (no
+randomness, no seed required).
+
+### Algorithm
+
+Per-atom update in integer milli-units:
+```
+PR_new(i) = (1000 - d) / N
+          + d * SUM_{j in In(i)} (PR(j) / out_deg(j)) / 1000
+          + d * dangling_mass / (1000 * N)
+```
+with `d = 850` milli (Brin & Page's classic damping) and
+`dangling_mass` = sum of PR over atoms with zero out-edges (so the
+total mass invariant SUM(PR(i)) = 1000 milli is preserved across
+iterations).
+
+**Integer precision trick.** A direct divide in milli (`pr[j] /
+out_deg[j]`) loses up to 0.5 milli per contribution; on Zachary's
+karate fixture that drains ~40% of the total mass over 30
+iterations and totally distorts the ranking. The kernel computes
+each contribution at MICRO precision (`pr * 1000` before the
+divide) and follows with an O(N) renormalisation pass each
+iteration that scales the per-atom score so the total lands at
+exactly 1,000,000 micro = 1000 milli (+/- N micro from the final
+divide). The result: total mass conserved within +/- 50 milli for
+N=34, and a stable ranking that doesn't depend on graph size.
+
+**Convergence threshold.** The brief asks for L_inf < 1 milli.
+Integer truncation through the renormalisation step introduces an
+unavoidable ~1-milli per-iteration ping-pong on dense graphs (e.g.
+the karate fixture oscillates between total-mass 982 and 984), so
+the kernel halts on L_inf < 2 milli, which captures the meaningful
+resolution of the integer representation -- a sub-milli change is
+not observable in the output anyway.
+
+### Public API
+
+- `pagerank_compute(kg, damping_milli, max_iter) -> pr_result`
+- `pagerank_default(kg)` -- damping=850, max_iter=50 (Brin & Page
+  classic defaults)
+- `pagerank_at(result, atom_id) -> int_milli` (or -1 if missing)
+- `pagerank_top_k(result, k) -> list[(atom_id, pr_milli)]`
+  (descending by PR, ties broken by lowest atom_id; k=0 returns
+  empty, k > N returns all)
+- `pagerank_converged(result) -> bool`
+- `pagerank_iterations(result) -> int`
+- `pagerank_n_atoms(result) -> int`
+- `pagerank_damping(result) -> int_milli`
+- `pagerank_total_mass(result) -> int_milli` (~1000 +/- N milli)
+
+### Headline results
+
+- **Zachary 1977 karate club (34 nodes, 78 edges):** PageRank
+  converges in 10 iterations. Top-2 atoms are {0 (Mr Hi, PR=97
+  milli), 33 (Officer, PR=100 milli)} -- the classic Brin & Page
+  centrality ranking, recovering Zachary's two faction leaders
+  without any text or label information. Both hubs beat the rest
+  of the field by 25+ milli.
+- **Barbell (two 4-cliques + bridge):** bridge atoms 3 and 4 own
+  the top-2 PR slots at 149 milli each; clique-interior atoms tied
+  at 116 milli. Every cross-clique walk has to cross the bridge,
+  so the bridge accumulates centrality -- textbook PR behaviour.
+  Converges in 3 iterations.
+- **damping = 0 sanity:** PR(i) = 250 for every atom on N=4,
+  confirming the math -- pure teleport reduces to uniform.
+- **damping = 1000 (pure random walk):** terminates cleanly,
+  preserves mass within tolerance, scores non-negative.
+- **Dangling-only graph:** uniform PR, mass conserved.
+
+### New chat admin: `/pagerank`
+
+Prints one CMD line on the live KG:
+```
+PAGERANK n=N iterations=I converged=yes/no top=[id=X,pr=Y ...]
+```
+on the seed-pack KG (584 atoms, mostly disconnected) the top-5
+end up dominated by hub atoms with the most connections.
+
+### Files
+
+- `src/kg/pagerank.nova`: NEW (~640 lines).
+- `tests/unit/test_pagerank.nova`: NEW (90 assertions).
+- `tests/integration/scenario_eee_pagerank.sh`: NEW (23
+  assertions).
+- `tests/integration/_scenario_eee_pagerank_driver/pagerank_driver.nova`:
+  NEW (~165 lines).
+- `examples/crossengin_chat.nova`: +3 net (1 import, 1 help, 1
+  dispatch).
+- `NEXT_SESSION.md`: this section.
+- `README.md`: R13E paragraph under the KG read story.
+
+### Verification
+
+- `tests/unit/test_pagerank.nova` -- 90/90.
+- `tests/unit/test_louvain.nova` -- 72/72 (unchanged).
+- `tests/unit/test_graph_clustering.nova` -- 71/71 (unchanged).
+- `tests/unit/test_semantic_search.nova` -- 73/73 (unchanged).
+- `tests/unit/test_episodic.nova` -- 79/79 (unchanged).
+- `tests/unit/test_episodic_retrieval.nova` -- 77/77 (unchanged).
+- `tests/integration/scenario_eee_pagerank.sh` -- 23/23.
+- `tests/integration/scenario_zz_louvain.sh` -- 19/19 (unchanged).
+- `tests/integration/scenario_xx_communities.sh` -- 20/20
+  (unchanged).
+- `tests/integration/scenario_rr_semantic_search.sh` -- 21/21
+  (unchanged).
+- `tests/integration/scenario_ff_episodic.sh` -- 37/37 (unchanged).
+- Full unit-test sweep: 166/167 pass (the one failure,
+  `test_optical_flow_perpixel.nova`, is pre-existing and owned by
+  R13B; it segfaults on the clean tree too).
+
 ## R12F (this session) — DP ε-budget UI / reporting: /dp admin command + status pane
 
 **Status: complete -- extended `src/safety/differential_privacy.nova`

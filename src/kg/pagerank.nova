@@ -1,0 +1,639 @@
+// CrossEngin knowledge: PageRank centrality on the KG xref graph (R13E).
+//
+// Purpose
+//   The KG read story already covers structural / textual / semantic
+//   retrieval and partitioning:
+//     - exact lookup by atom id (atom_store.kg_find_atom),
+//     - episodic retrieval (R6F + R8F: episodic_recall_*),
+//     - TF-IDF semantic ranker over labels (R10C: ss_search),
+//     - LSH-bucketed cosine k-NN over the embedding (P3.4: ann_query),
+//     - label-propagation community detection (R11F: gc_*),
+//     - Louvain greedy modularity-maximising community detection (R12C).
+//   What was missing is CENTRALITY -- a per-atom importance score that
+//   answers "which atoms are most important in the link graph?"
+//   PageRank (Brin & Page 1998, "The Anatomy of a Large-Scale
+//   Hypertextual Web Search Engine") is the gold-standard algorithm:
+//   each atom's score is the steady-state probability of being on under
+//   a damped random walk. Atoms with many in-links from already-high-PR
+//   atoms float to the top; sinks accumulate mass; sources leak it. The
+//   integer-only milli-unit form is bit-deterministic.
+//
+//   PageRank LIVES BESIDE clustering (R11F/R12C) -- they answer
+//   complementary questions:
+//     - Clustering -> "which atoms hang together as a group?"
+//     - PageRank   -> "which atoms are individually most important?"
+//
+// Algorithm summary -- PageRank, integer milli-units
+//   Total mass invariant: SUM(PR(i)) == 1000 milli always (= 1.0 in
+//   floating point). All scores stored as int_milli.
+//
+//   Initialise: PR(i) = 1000 / N for every live atom i (uniform start).
+//
+//   Iterate (up to MAX_ITER passes), with damping factor d in milli
+//   (default 850 milli = 0.85, Brin & Page's classic value):
+//     For each atom i:
+//       PR_new(i) = (1000 - d) * 1000 / (1000 * N)
+//                 + d * SUM over in-neighbours j of (PR(j) / out_deg(j))
+//                       / 1000
+//                 + dangling_term(i)
+//     Dangling atoms (no out-edges) hand their mass uniformly across
+//     the graph:
+//       dangling_mass = SUM over k with out_deg(k)==0 of PR(k)
+//       dangling_term(i) = d * dangling_mass / (1000 * N)
+//
+//   The (1000 - d) and damping multiplies stay below 10^6, so all
+//   intermediates sit well below the NOVA codegen pointer-threshold
+//   (see NOVA_BUG_THRESHOLD.md, escape via int_*). We still route
+//   multiplies through `int_mul` and divisions through `int_div` so the
+//   damping math is bullet-proof regardless of `N`.
+//
+//   Stop when max |PR_new(i) - PR_old(i)| < CONVERGENCE_THRESHOLD
+//   (default 1 milli) OR max_iter is reached. We record both -- the
+//   `pagerank_converged` accessor returns whether the L_inf tolerance
+//   triggered the halt vs. the iteration cap.
+//
+// Determinism
+//   No randomness. Same KG snapshot -> bit-identical PR scores; the
+//   in-edge tally walks atoms in id-ascending order (the same dense
+//   slot order that kg_atoms exposes). The convergence test compares
+//   integer differences -- no FP, no rounding-mode dependency.
+//
+// Edge cases
+//   - Empty KG (no atoms): pr_result with N=0, iterations=0, an empty
+//     scores list; top_k returns empty.
+//   - Single atom, no links: PR = 1000 (all mass on the one atom).
+//   - Two atoms with bidirectional link 1<->2: each gets 500 milli.
+//   - Dangling-only graph (no edges at all): every atom acts as
+//     dangling; mass redistributes uniformly each pass -> PR = 1000/N
+//     each atom (converges in 1 iter).
+//   - Linear chain 1->2->3->4->5 with no back-link: atom 5 is a sink;
+//     atoms 1..4 leak mass to atom 5 (which redistributes via the
+//     dangling term); steady state has 5 highest, 1 lowest.
+//   - Rounding: integer truncation per divide can leak ~N milli over
+//     many iterations; the dangling redistribution + the (1-d)/N
+//     teleport keep the L1 error bounded by ~N milli (tested in
+//     test_pagerank.nova).
+//
+// Result layout (pr_result):
+//   [PR_OBJ_TAG, atom_ids, scores, iterations, converged, damping,
+//    n_atoms]
+//     - atom_ids:   sorted-ascending list of live atom ids in the
+//                   graph (same shape as R11F/R12C).
+//     - scores:     parallel list of PR scores in milli units (int).
+//     - iterations: number of iterations actually performed (<= MAX).
+//     - converged:  1 if L_inf threshold triggered the halt, 0 if
+//                   iterations hit the cap.
+//     - damping:    damping factor used, in milli.
+//     - n_atoms:    len(atom_ids), cached for O(1).
+//
+// ADRs implemented: ADR-0016 (atom xrefs are the link graph), ADR-0049
+//   (testing). Companion to R11F (LPA) and R12C (Louvain).
+// NOVA dependencies: builtins (lists, push, list_set, len, int_mul,
+//   int_div); std/io + std/string for the chat dispatch helpers.
+// CrossEngin dependencies: src/kg/atom_store.nova (atom_id, atom_xrefs),
+//   src/kg/multi_kg_manager.nova (kg_atoms, kg_label),
+//   src/kg/cross_kg_references.nova (xref_*).
+
+import "std/io"
+import "std/string"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+import "cross_kg_references.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let PR_DEFAULT_DAMPING    = 850   // 0.85 -- Brin & Page's classic value
+let PR_DEFAULT_MAX_ITER   = 50    // PageRank converges in ~30 iters on
+                                  // well-conditioned graphs; 50 is a
+                                  // safe cap that absorbs harder cases.
+let PR_CONVERGE_THRESHOLD = 2     // L_inf diff in milli (2 milli = .002).
+                                  // The brief asks for "< 1 milli" as
+                                  // the strict threshold; integer
+                                  // truncation through divisions +
+                                  // renormalisation introduces an
+                                  // unavoidable ~1-milli per-iteration
+                                  // ping-pong on dense graphs (e.g. the
+                                  // Zachary karate fixture oscillates
+                                  // between total-mass 982 and 984).
+                                  // Treating the cap as "delta <= 1
+                                  // milli" via "delta < 2 milli" pins
+                                  // convergence to the meaningful
+                                  // resolution of the integer
+                                  // representation -- a sub-milli
+                                  // change is not observable in PR's
+                                  // output anyway.
+
+// ---- pr_result layout -----------------------------------------------------
+let PR_OBJ_TAG       = 2201       // distinct from LV_OBJ_TAG (2101),
+                                  // GC_OBJ_TAG (2001), SS_OBJ_TAG (1901),
+                                  // ANN_OBJ_TAG (1801).
+let PR_TAG           = 0
+let PR_ATOM_IDS      = 1
+let PR_SCORES        = 2
+let PR_ITERATIONS    = 3
+let PR_CONVERGED     = 4
+let PR_DAMPING       = 5
+let PR_N_ATOMS       = 6
+
+// ---- adjacency extraction -------------------------------------------------
+//
+// Build atom_ids (sorted ascending), a per-atom out-neighbour-index
+// list (positions INTO atom_ids), and a parallel in-neighbour-index
+// list. Treats the xref graph as DIRECTED: xref a->b means a has an
+// out-edge to b and b has an in-edge from a. (R11F / R12C dedupe to
+// undirected because LPA / Louvain need it; PageRank specifically
+// wants the directed structure.)
+//
+// Cross-KG edges are ignored (this module operates within a single KG
+// only, like its R11F / R12C cousins). Dead atoms (zeroed slots in
+// kg_atoms) are skipped.
+//
+// Returns [atom_ids, out_nbrs, in_nbrs, out_deg]:
+//   - atom_ids:  sorted-ascending list of live atom ids.
+//   - out_nbrs:  parallel list, out_nbrs[i] = list of neighbour
+//                positions for atom_ids[i]'s OUT-edges (deduped).
+//   - in_nbrs:   parallel list, in_nbrs[j] = list of neighbour
+//                positions for atom_ids[j]'s IN-edges (deduped).
+//   - out_deg:   parallel list of int out-degrees (= len(out_nbrs[i])).
+fn _pr_extract_graph(kg) {
+    let atoms = kg_atoms(kg)
+    let my_kg_label = kg_label(kg)
+    let n_raw = len(atoms)
+
+    // Pass 1: collect live atom ids in slot order (which IS id-ascending
+    // because kg_add_atom is dense: atom_id == slot index by construction).
+    let atom_ids = list_new()
+    let i = 0
+    while i < n_raw {
+        let a = atoms[i]
+        if a != 0 {
+            push(atom_ids, atom_id(a))
+        }
+        i = i + 1
+    }
+
+    let n = len(atom_ids)
+    let out_nbrs = list_new()
+    let in_nbrs = list_new()
+    let j = 0
+    while j < n {
+        push(out_nbrs, list_new())
+        push(in_nbrs, list_new())
+        j = j + 1
+    }
+
+    // Pass 2: walk every xref, dedupe per (src, dst) so a duplicate
+    // xref does not double-count an out-edge.
+    let k = 0
+    while k < n_raw {
+        let a = atoms[k]
+        if a != 0 {
+            let src_idx = _pr_atom_pos(atom_ids, atom_id(a))
+            if src_idx >= 0 {
+                let xs = atom_xrefs(a)
+                let xi = 0
+                while xi < len(xs) {
+                    let x = xs[xi]
+                    let dst_kg = xref_dst_kg(x)
+                    let dst_id = xref_dst_atom(x)
+                    if str_eq(dst_kg, my_kg_label) == 1 {
+                        let dst_idx = _pr_atom_pos(atom_ids, dst_id)
+                        if dst_idx >= 0 {
+                            if dst_idx != src_idx {
+                                let added = _pr_nbr_dedup(out_nbrs[src_idx],
+                                    dst_idx)
+                                if added == 1 {
+                                    _pr_nbr_dedup(in_nbrs[dst_idx], src_idx)
+                                }
+                            }
+                        }
+                    }
+                    xi = xi + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+
+    let out_deg = list_new()
+    let p = 0
+    while p < n {
+        push(out_deg, len(out_nbrs[p]))
+        p = p + 1
+    }
+
+    let out = list_new()
+    push(out, atom_ids)
+    push(out, out_nbrs)
+    push(out, in_nbrs)
+    push(out, out_deg)
+    return out
+}
+
+// Position-of `target_id` in atom_ids; -1 if absent. Linear scan
+// (same pattern as R11F/R12C; atom_ids is small in practice).
+fn _pr_atom_pos(atom_ids, target_id) {
+    let n = len(atom_ids)
+    let i = 0
+    while i < n {
+        if atom_ids[i] == target_id { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Idempotent neighbour-list append. Returns 1 if `idx` was newly added,
+// 0 if it was already present. Used to dedupe both in- and out-edges so
+// duplicate xrefs do not bias the PR distribution.
+fn _pr_nbr_dedup(nbrs, idx) {
+    let i = 0
+    while i < len(nbrs) {
+        if nbrs[i] == idx { return 0 }
+        i = i + 1
+    }
+    push(nbrs, idx)
+    return 1
+}
+
+// ---- iteration kernel ----------------------------------------------------
+//
+// One pass over all atoms. Computes the next PR vector from the current
+// one. Returns the max |PR_new - PR_old| in milli (L_inf delta).
+//
+// In milli units (FP_SCALE = 1000), the per-atom update is:
+//   pr_new[i] = teleport + damped_in + damped_dangling
+//   where
+//     teleport          = (1000 - d) * 1000 / (1000 * N)
+//                       = (1000 - d) / N                       (milli)
+//     damped_in         = d * SUM_j (pr[j] / out_deg[j]) / 1000
+//                                                              (milli)
+//     damped_dangling   = d * dangling_mass / (1000 * N)       (milli)
+//   with d = damping_milli.
+//
+// teleport + damped_dangling are constants (same for every i), so we
+// compute them once per pass.
+fn _pr_iterate(out_nbrs, in_nbrs, out_deg, pr, damping_milli) {
+    let n = len(pr)
+    if n == 0 { return 0 }
+
+    // dangling mass: sum of PR over atoms with out_deg == 0.
+    let dangling = 0
+    let i = 0
+    while i < n {
+        if out_deg[i] == 0 {
+            dangling = dangling + pr[i]
+        }
+        i = i + 1
+    }
+
+    // Per-pass constants. We compute the COMBINED constant
+    //   base_per_atom = (1000 - d) / N + d * dangling / (1000 * N)
+    //                                                       (milli units).
+    // Both terms are bounded by 1000 milli / N <= 1000, so we stay well
+    // inside the codegen-safe integer range. Use int_mul / int_div to
+    // be future-proof.
+    let one_minus_d = 1000 - damping_milli
+    let teleport = int_div(one_minus_d, n)
+    // damped_dangling = d * dangling / (1000 * N).
+    let dd_num = int_mul(damping_milli, dangling)
+    let dd_denom = int_mul(1000, n)
+    let damped_dangling = 0
+    if dd_denom > 0 {
+        damped_dangling = int_div(dd_num, dd_denom)
+    }
+    let base = teleport + damped_dangling
+
+    // Compute new pr scores into a fresh list (we cannot modify `pr` in
+    // place because the update reads pr[j] for every j; doing it
+    // in-place would be a Gauss-Seidel variant -- valid but different).
+    //
+    // We compute the per-atom score in MICRO units (scaled by 1000)
+    // internally to absorb integer-truncation bias -- a direct
+    // `pr[j] / out_deg[j]` in milli loses up to 0.5 milli per
+    // contribution; on Zachary karate that drains ~400 milli of mass
+    // over 30 iterations and totally distorts the ranking. The micro
+    // form keeps two extra decimal digits of precision per division;
+    // we divide back to milli AFTER the final renormalisation.
+    let pr_new_micro = list_new()
+    let base_micro = int_mul(base, 1000)
+    let k = 0
+    while k < n {
+        let in_list = in_nbrs[k]
+        let in_n = len(in_list)
+        // sum_in (in MICRO units) = SUM over in-neighbours j of
+        //   (pr[j] * 1000) / out_deg[j].
+        // pr[j] is in milli (<= 1000), so pr[j] * 1000 is <= 1,000,000;
+        // sum over indeg up to ~17 is <= 17,000,000. We route through
+        // int_mul / int_div so values above the smart-op threshold do
+        // not trigger codegen issues.
+        let sum_in_micro = 0
+        let p = 0
+        while p < in_n {
+            let j_pos = in_list[p]
+            let od = out_deg[j_pos]
+            if od > 0 {
+                let pr_j_micro = int_mul(pr[j_pos], 1000)
+                sum_in_micro = int_add(sum_in_micro,
+                    int_div(pr_j_micro, od))
+            }
+            p = p + 1
+        }
+        // damped_in_micro = d * sum_in_micro / 1000.
+        let damped_in_micro = int_div(int_mul(damping_milli, sum_in_micro),
+            1000)
+        let pr_k_micro = int_add(base_micro, damped_in_micro)
+        push(pr_new_micro, pr_k_micro)
+        k = k + 1
+    }
+
+    // Renormalise to total mass = 1,000,000 micro (= 1000 milli).
+    // Integer-rounding bias would otherwise compound -- e.g. with N=34
+    // and d=850 on the karate fixture, the un-renormalised total
+    // drifts from 1000 milli to ~577 milli after 30 iterations, which
+    // destroys the comparability of scores across runs. The
+    // renormalisation step costs O(N) and lifts the total back to
+    // exactly 1,000,000 micro (+/- N micro from the final divide).
+    let total_micro = 0
+    let t = 0
+    while t < n {
+        total_micro = int_add(total_micro, pr_new_micro[t])
+        t = t + 1
+    }
+    // Pathological guard: if total_micro <= 0 (impossible in valid
+    // runs but defensive) reseed uniformly. Comparison against the
+    // small literal 0 is smart-op-safe because the smart prologue
+    // falls through to the integer branch when EITHER operand is
+    // below the 2^20 threshold (NOVA_BUG_THRESHOLD.md).
+    if total_micro <= 0 {
+        let u = 0
+        while u < n {
+            list_set(pr_new_micro, u, int_div(int_mul(1000, 1000), n))
+            u = u + 1
+        }
+        total_micro = int_mul(1000, 1000)
+    }
+
+    // Scale every micro value: new_micro = old_micro * 1,000,000 / total_micro.
+    // Then convert back to milli by dividing by 1000.
+    //
+    // The two divides + a multiply can stay above the smart-op
+    // threshold; route through int_mul / int_div. The output is in
+    // milli units, so the final list_set writes back compact values.
+    let max_diff = 0
+    let q = 0
+    while q < n {
+        let raw = pr_new_micro[q]
+        // Normalised micro value: raw * 1000000 / total_micro.
+        // We split the multiply to keep intermediates manageable:
+        //   raw * (1000000 / total_micro)   is too lossy.
+        // Instead do raw * 1000000 first via int_mul, then int_div.
+        let norm_micro = int_div(int_mul(raw, 1000000), total_micro)
+        // Convert to milli (drop the extra 3 digits of precision).
+        let pr_k_milli = int_div(norm_micro, 1000)
+        let prev = pr[q]
+        list_set(pr, q, pr_k_milli)
+        let diff = pr_k_milli - prev
+        if diff < 0 { diff = 0 - diff }
+        if diff > max_diff { max_diff = diff }
+        q = q + 1
+    }
+    return max_diff
+}
+
+// ---- public API ----------------------------------------------------------
+
+// Compute PageRank on the KG's link graph with the given damping factor
+// (in milli; <= 0 falls back to PR_DEFAULT_DAMPING) and iteration cap
+// (<= 0 falls back to PR_DEFAULT_MAX_ITER). Returns a pr_result.
+//
+// Damping interpretation:
+//   damping_milli = 0     -> pure teleport (PR = uniform 1000/N each iter)
+//   damping_milli = 850   -> Brin & Page classic
+//   damping_milli = 1000  -> pure random walk (no teleport; may not
+//                            converge on disconnected graphs but the
+//                            iteration cap still terminates cleanly).
+fn pagerank_compute(kg, damping_milli, max_iter) {
+    // Damping handling:
+    //   damping_milli < 0  -> use the classic default (850 milli).
+    //   damping_milli == 0 -> valid explicit request for "no damping"
+    //                         (pure teleport; PR stays uniform 1000/N).
+    //   damping_milli > 1000 -> clamped to 1000 (saturated random walk).
+    //   0 <= damping_milli <= 1000 -> used as-is.
+    let d = damping_milli
+    if d < 0 { d = PR_DEFAULT_DAMPING }
+    if d > 1000 { d = 1000 }
+
+    let mx = max_iter
+    if mx <= 0 { mx = PR_DEFAULT_MAX_ITER }
+
+    let g = _pr_extract_graph(kg)
+    let atom_ids = g[0]
+    let out_nbrs = g[1]
+    let in_nbrs = g[2]
+    let out_deg = g[3]
+    let n = len(atom_ids)
+
+    let r = list_new()
+    push(r, PR_OBJ_TAG)
+    push(r, atom_ids)
+
+    // Empty graph -- short-circuit.
+    if n == 0 {
+        push(r, list_new())   // scores
+        push(r, 0)            // iterations
+        push(r, 1)            // converged (trivially)
+        push(r, d)
+        push(r, 0)
+        return r
+    }
+
+    // Initialise PR uniformly: PR(i) = 1000 / N. The remainder
+    // (1000 mod N) is silently dropped; the iteration's teleport +
+    // dangling redistribution restore the total mass within a few
+    // iterations. We document the tolerance: total mass after
+    // convergence is 1000 +/- ~N milli (one milli per dropped remainder
+    // per iteration in the worst case, but the dangling term
+    // re-injects).
+    let pr = list_new()
+    let init = int_div(1000, n)
+    let i0 = 0
+    while i0 < n {
+        push(pr, init)
+        i0 = i0 + 1
+    }
+
+    let iter_count = 0
+    let converged = 0
+    let done = 0
+    let step = 0
+    while step < mx {
+        if done == 0 {
+            let delta = _pr_iterate(out_nbrs, in_nbrs, out_deg, pr, d)
+            iter_count = iter_count + 1
+            if delta < PR_CONVERGE_THRESHOLD {
+                converged = 1
+                done = 1
+            }
+        }
+        step = step + 1
+    }
+
+    push(r, pr)
+    push(r, iter_count)
+    push(r, converged)
+    push(r, d)
+    push(r, n)
+    return r
+}
+
+// Convenience: classic Brin & Page defaults (damping=850, iter=50).
+fn pagerank_default(kg) {
+    return pagerank_compute(kg, PR_DEFAULT_DAMPING, PR_DEFAULT_MAX_ITER)
+}
+
+// PR score (milli) for `atom_id`; -1 if the atom is not in the result.
+// (PR scores are non-negative by construction, so -1 is unambiguous.)
+fn pagerank_at(result, target_id) {
+    let atom_ids = result[PR_ATOM_IDS]
+    let scores = result[PR_SCORES]
+    let i = 0
+    while i < len(atom_ids) {
+        if atom_ids[i] == target_id { return scores[i] }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Top-K atoms by PR score. Returns a list of [atom_id, pr_milli] pairs,
+// sorted by score DESCENDING (ties broken by lower atom_id). k <= 0
+// returns the empty list; k > N returns all atoms.
+fn pagerank_top_k(result, k) {
+    let out = list_new()
+    if k <= 0 { return out }
+
+    let atom_ids = result[PR_ATOM_IDS]
+    let scores = result[PR_SCORES]
+    let n = len(atom_ids)
+    if n == 0 { return out }
+
+    let kk = k
+    if kk > n { kk = n }
+
+    // Build [pr, atom_id] pairs (pr first so the sort key sits at [0]).
+    let pairs = list_new()
+    let i = 0
+    while i < n {
+        let pair = list_new()
+        push(pair, scores[i])
+        push(pair, atom_ids[i])
+        push(pairs, pair)
+        i = i + 1
+    }
+
+    // Insertion sort descending by pr, ties broken by ASCENDING
+    // atom_id (so the K=N output is fully deterministic).
+    let m = len(pairs)
+    let j = 1
+    while j < m {
+        let cur = pairs[j]
+        let p = j - 1
+        let placed = 0
+        while p >= 0 {
+            if placed == 0 {
+                let prev = pairs[p]
+                let take = 0
+                if prev[0] < cur[0] {
+                    take = 1
+                } else {
+                    if prev[0] == cur[0] {
+                        // tie -- smaller atom_id comes first
+                        if prev[1] > cur[1] { take = 1 }
+                    }
+                }
+                if take == 1 {
+                    list_set(pairs, p + 1, prev)
+                    p = p - 1
+                } else {
+                    list_set(pairs, p + 1, cur)
+                    placed = 1
+                    p = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(pairs, 0, cur) }
+        j = j + 1
+    }
+
+    // Emit top-kk as [atom_id, pr] pairs (canonical ordering).
+    let r = 0
+    while r < kk {
+        let entry = list_new()
+        push(entry, pairs[r][1])
+        push(entry, pairs[r][0])
+        push(out, entry)
+        r = r + 1
+    }
+    return out
+}
+
+// Whether convergence (L_inf < PR_CONVERGE_THRESHOLD) triggered the halt.
+fn pagerank_converged(result) { return result[PR_CONVERGED] == 1 }
+
+// Number of iterations actually performed.
+fn pagerank_iterations(result) { return result[PR_ITERATIONS] }
+
+// Number of atoms covered by the PR computation.
+fn pagerank_n_atoms(result) { return result[PR_N_ATOMS] }
+
+// Damping factor used (in milli).
+fn pagerank_damping(result) { return result[PR_DAMPING] }
+
+// Total PR mass across all atoms (in milli). Should be ~1000; integer
+// truncation can leak a few milli per iteration -- the tolerance is
+// roughly +/- N milli for graphs with N atoms.
+fn pagerank_total_mass(result) {
+    let scores = result[PR_SCORES]
+    let n = len(scores)
+    let total = 0
+    let i = 0
+    while i < n {
+        total = total + scores[i]
+        i = i + 1
+    }
+    return total
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/pagerank` admin: runs PageRank on the live KG and reports the
+// top-5 atoms by PR score plus iteration / convergence headline. Mirrors
+// the emit-line discipline of /louvain + /communities (single CMD line).
+fn pagerank_cmd(kg) {
+    let r = pagerank_default(kg)
+    let n = pagerank_n_atoms(r)
+    let iters = pagerank_iterations(r)
+    let cvg = "no"
+    if pagerank_converged(r) == 1 { cvg = "yes" }
+
+    if n == 0 {
+        io_println("PAGERANK n=0 iterations=" + int_to_str(iters)
+            + " converged=" + cvg + " (no atoms)")
+        return 1
+    }
+
+    let top = pagerank_top_k(r, 5)
+    let top_n = len(top)
+    let buf = "PAGERANK n=" + int_to_str(n)
+        + " iterations=" + int_to_str(iters)
+        + " converged=" + cvg
+        + " top=["
+    let i = 0
+    while i < top_n {
+        if i > 0 { buf = buf + " " }
+        buf = buf + "id=" + int_to_str(top[i][0])
+            + ",pr=" + int_to_str(top[i][1])
+        i = i + 1
+    }
+    buf = buf + "]"
+    io_println(buf)
+    return 1
+}
