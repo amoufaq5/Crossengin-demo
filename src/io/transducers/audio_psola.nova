@@ -1,0 +1,513 @@
+// CrossEngin io/transducers: TD-PSOLA pitch shifting + time stretching (R12D).
+//
+// Time-Domain Pitch-Synchronous Overlap-Add (Moulines & Charpentier 1990).
+// Closes the audio manipulation loop next to R6E Klatt synthesis, R7F/R9B
+// VAD, R8B/R10B STT, and R10F/R11B F0 estimation: independent pitch shift
+// and time stretch via pitch-mark anchored Hann-windowed segment OLA.
+//
+// Algorithm:
+//   1. Pitch mark detection via R11B YIN; signed-max anchoring per period.
+//   2. Hann window: hann(n,N) = (1000 - 1000*cos(2*pi*n/N)) / 2  (milli).
+//      Cosine from a 256-entry quarter-wave Bhaskara-degree table.
+//   3. Pitch shift (alpha): deposit segments at output period tau/alpha.
+//   4. Time stretch (beta): walk input marks at rate 1/beta.
+//   5. Combined: psola_transform composes both.
+//
+// Caps: PCM length <= 480000 (30 s @ 16 kHz); factors in [250, 4000] milli.
+//
+// ADRs: ADR-0014 (audio manipulation leg).
+// Deps: audio_pitch.nova (R11B YIN), audio_capture.nova (WAV round-trip).
+
+import "audio_capture.nova"
+import "audio_pitch.nova"
+
+let PSOLA_RATE_MIN = 8000
+let PSOLA_RATE_MAX = 48000
+let PSOLA_FACTOR_IDENTITY = 1000
+let PSOLA_FACTOR_MIN = 250
+let PSOLA_FACTOR_MAX = 4000
+let PSOLA_MAX_SAMPLES = 480000
+let PSOLA_FALLBACK_PERIOD_MS = 10
+let PSOLA_MIN_PERIOD_SAMPLES = 16
+let PSOLA_MAX_PERIOD_SAMPLES = 800
+let PSOLA_VOICING_FLOOR = 100
+let PSOLA_REFINE_HALF_WIN_FRAC = 2
+
+fn psola_factor_identity()      { return PSOLA_FACTOR_IDENTITY }
+fn psola_factor_min()           { return PSOLA_FACTOR_MIN }
+fn psola_factor_max()           { return PSOLA_FACTOR_MAX }
+fn psola_max_samples()          { return PSOLA_MAX_SAMPLES }
+fn psola_fallback_period_ms()   { return PSOLA_FALLBACK_PERIOD_MS }
+
+fn _psola_clamp_rate(sample_rate) {
+    let r = sample_rate
+    if r < PSOLA_RATE_MIN { r = PSOLA_RATE_MIN }
+    if r > PSOLA_RATE_MAX { r = PSOLA_RATE_MAX }
+    return r
+}
+
+fn _psola_clamp_factor(f) {
+    let v = f
+    if v < PSOLA_FACTOR_MIN { v = PSOLA_FACTOR_MIN }
+    if v > PSOLA_FACTOR_MAX { v = PSOLA_FACTOR_MAX }
+    return v
+}
+
+fn _psola_fallback_period(sample_rate) {
+    let p = (sample_rate * PSOLA_FALLBACK_PERIOD_MS) / 1000
+    if p < PSOLA_MIN_PERIOD_SAMPLES { p = PSOLA_MIN_PERIOD_SAMPLES }
+    return p
+}
+
+let _PSOLA_COS_QUARTER_SIZE = 256
+let _PSOLA_COS_PERIOD = 1024
+let _psola_cos_table = 0
+
+fn _psola_sin_q_milli(deg) {
+    let prod = deg * (180 - deg)
+    let num = 4 * prod * 1000
+    let den = 40500 - prod
+    if den <= 0 { return 1000 }
+    return num / den
+}
+
+fn _psola_cos_table_init() {
+    if _psola_cos_table != 0 { return _psola_cos_table }
+    let t = list_new()
+    let i = 0
+    while i < _PSOLA_COS_QUARTER_SIZE {
+        let deg = (i * 90) / (_PSOLA_COS_QUARTER_SIZE - 1)
+        let sin_complement = _psola_sin_q_milli(90 - deg)
+        push(t, sin_complement)
+        i = i + 1
+    }
+    _psola_cos_table = t
+    return t
+}
+
+fn _psola_cos_lookup(phase) {
+    let t = _psola_cos_table_init()
+    let p = phase
+    while p < 0 { p = p + _PSOLA_COS_PERIOD }
+    p = p - (p / _PSOLA_COS_PERIOD) * _PSOLA_COS_PERIOD
+    if p < _PSOLA_COS_QUARTER_SIZE {
+        return t[p]
+    }
+    if p < 2 * _PSOLA_COS_QUARTER_SIZE {
+        return 0 - t[2 * _PSOLA_COS_QUARTER_SIZE - 1 - p]
+    }
+    if p < 3 * _PSOLA_COS_QUARTER_SIZE {
+        return 0 - t[p - 2 * _PSOLA_COS_QUARTER_SIZE]
+    }
+    return t[4 * _PSOLA_COS_QUARTER_SIZE - 1 - p]
+}
+
+fn psola_hann_window(n, N) {
+    if N <= 0 { return 0 }
+    if n <= 0 { return 0 }
+    if n >= N { return 0 }
+    let phase = (n * _PSOLA_COS_PERIOD) / N
+    let cos_milli = _psola_cos_lookup(phase)
+    return (1000 - cos_milli) / 2
+}
+
+fn _psola_argmax_signed(samples, start, end) {
+    let n = len(samples)
+    let lo = start
+    let hi = end
+    if lo < 0 { lo = 0 }
+    if hi > n { hi = n }
+    if lo >= hi { return (start + end) / 2 }
+    let best_i = lo
+    let best_v = samples[lo]
+    let i = lo + 1
+    while i < hi {
+        let v = samples[i]
+        if v > best_v {
+            best_v = v
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+fn _psola_period_at(samples, sample_rate, off) {
+    let sr = _psola_clamp_rate(sample_rate)
+    let frame_size = (sr * 30) / 1000
+    let total = len(samples)
+    let fallback = _psola_fallback_period(sr)
+    if off + frame_size > total {
+        return fallback
+    }
+    let view = list_new()
+    let i = off
+    let end = off + frame_size
+    while i < end {
+        push(view, samples[i])
+        i = i + 1
+    }
+    let res = pitch_estimate_frame_yin(view, sr, 0, 0, 0)
+    let f0_centi = pitch_result_f0_centihz(res)
+    let v_milli = pitch_result_voicing_milli(res)
+    if f0_centi <= 0 { return fallback }
+    if v_milli < PSOLA_VOICING_FLOOR { return fallback }
+    let period = (sr * 100) / f0_centi
+    if period < PSOLA_MIN_PERIOD_SAMPLES { return fallback }
+    if period > PSOLA_MAX_PERIOD_SAMPLES { return fallback }
+    return period
+}
+
+fn psola_pitch_marks(pcm, sample_rate) {
+    let marks = list_new()
+    let n = len(pcm)
+    if n <= 0 { return marks }
+    if n > PSOLA_MAX_SAMPLES { return marks }
+    let sr = _psola_clamp_rate(sample_rate)
+    let frame_size = (sr * 30) / 1000
+    if n < frame_size {
+        push(marks, n / 2)
+        return marks
+    }
+    let tau = _psola_period_at(pcm, sr, 0)
+    let first = _psola_argmax_signed(pcm, 0, tau)
+    push(marks, first)
+    let last = first
+    let stride = tau
+    while last + stride < n {
+        let predicted = last + stride
+        let yin_off = last
+        if yin_off + frame_size > n { yin_off = n - frame_size }
+        if yin_off < 0 { yin_off = 0 }
+        let new_tau = _psola_period_at(pcm, sr, yin_off)
+        let half = new_tau / PSOLA_REFINE_HALF_WIN_FRAC
+        if half < 1 { half = 1 }
+        let lo = predicted - half
+        let hi = predicted + half
+        if lo < last + 1 { lo = last + 1 }
+        if hi > n        { hi = n }
+        if lo >= hi {
+            push(marks, predicted)
+            last = predicted
+        } else {
+            let m = _psola_argmax_signed(pcm, lo, hi)
+            push(marks, m)
+            last = m
+        }
+        stride = new_tau
+        if stride < PSOLA_MIN_PERIOD_SAMPLES { stride = PSOLA_MIN_PERIOD_SAMPLES }
+    }
+    return marks
+}
+
+fn _psola_extract_segment(pcm, centre, half_len) {
+    let seg = list_new()
+    let n = len(pcm)
+    let N = 2 * half_len
+    if N <= 0 { return seg }
+    let i = 0
+    while i < N {
+        let src = centre - half_len + i
+        let v = 0
+        if src >= 0 && src < n {
+            v = pcm[src]
+        }
+        let w = psola_hann_window(i, N)
+        push(seg, (v * w) / 1000)
+        i = i + 1
+    }
+    return seg
+}
+
+fn _psola_overlap_add(out, seg, centre, half_len) {
+    let out_len = len(out)
+    let N = len(seg)
+    let i = 0
+    while i < N {
+        let dst = centre - half_len + i
+        if dst >= 0 && dst < out_len {
+            let cur = out[dst]
+            list_set(out, dst, cur + seg[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn psola_pitch_shift(pcm, sample_rate, pitch_factor_milli) {
+    let n = len(pcm)
+    let alpha = _psola_clamp_factor(pitch_factor_milli)
+    if n <= 0 { return list_new() }
+    if n > PSOLA_MAX_SAMPLES { return list_new() }
+    let sr = _psola_clamp_rate(sample_rate)
+    let frame_size = (sr * 30) / 1000
+    if n < frame_size {
+        let copy = list_new()
+        let i = 0
+        while i < n {
+            push(copy, pcm[i])
+            i = i + 1
+        }
+        return copy
+    }
+    let marks = psola_pitch_marks(pcm, sr)
+    let m = len(marks)
+    if m == 0 {
+        let copy = list_new()
+        let i = 0
+        while i < n {
+            push(copy, pcm[i])
+            i = i + 1
+        }
+        return copy
+    }
+    let out = list_new()
+    let zi = 0
+    while zi < n {
+        push(out, 0)
+        zi = zi + 1
+    }
+    let out_mark_count = (m * alpha) / 1000
+    if out_mark_count < 1 { out_mark_count = 1 }
+    let avg_period = n
+    if m > 1 { avg_period = (marks[m - 1] - marks[0]) / (m - 1) }
+    if avg_period < PSOLA_MIN_PERIOD_SAMPLES { avg_period = PSOLA_MIN_PERIOD_SAMPLES }
+    let out_period = (avg_period * 1000) / alpha
+    if out_period < 1 { out_period = 1 }
+    let i = 0
+    while i < out_mark_count {
+        let src_idx = (i * 1000) / alpha
+        if src_idx >= m { src_idx = m - 1 }
+        let src_mark = marks[src_idx]
+        let local_tau = avg_period
+        if src_idx + 1 < m {
+            local_tau = marks[src_idx + 1] - src_mark
+        } else {
+            if src_idx > 0 {
+                local_tau = src_mark - marks[src_idx - 1]
+            }
+        }
+        if local_tau < PSOLA_MIN_PERIOD_SAMPLES { local_tau = PSOLA_MIN_PERIOD_SAMPLES }
+        if local_tau > PSOLA_MAX_PERIOD_SAMPLES { local_tau = PSOLA_MAX_PERIOD_SAMPLES }
+        let half = local_tau
+        let seg = _psola_extract_segment(pcm, src_mark, half)
+        let out_centre = marks[0] + i * out_period
+        if out_centre >= n {
+            i = out_mark_count
+        } else {
+            _psola_overlap_add(out, seg, out_centre, half)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn psola_time_stretch(pcm, sample_rate, time_factor_milli) {
+    let n = len(pcm)
+    let beta = _psola_clamp_factor(time_factor_milli)
+    if n <= 0 { return list_new() }
+    if n > PSOLA_MAX_SAMPLES { return list_new() }
+    let sr = _psola_clamp_rate(sample_rate)
+    let frame_size = (sr * 30) / 1000
+    if n < frame_size {
+        let copy = list_new()
+        let i = 0
+        while i < n {
+            push(copy, pcm[i])
+            i = i + 1
+        }
+        return copy
+    }
+    let marks = psola_pitch_marks(pcm, sr)
+    let m = len(marks)
+    if m == 0 {
+        let copy = list_new()
+        let i = 0
+        while i < n {
+            push(copy, pcm[i])
+            i = i + 1
+        }
+        return copy
+    }
+    let out_len = (n * beta) / 1000
+    if out_len < 1 { out_len = 1 }
+    let out = list_new()
+    let zi = 0
+    while zi < out_len {
+        push(out, 0)
+        zi = zi + 1
+    }
+    let avg_period = n
+    if m > 1 { avg_period = (marks[m - 1] - marks[0]) / (m - 1) }
+    if avg_period < PSOLA_MIN_PERIOD_SAMPLES { avg_period = PSOLA_MIN_PERIOD_SAMPLES }
+    let out_period = avg_period
+    if out_period < 1 { out_period = 1 }
+    let out_mark_count = (out_len - marks[0]) / out_period + 1
+    if out_mark_count < 1 { out_mark_count = 1 }
+    let i = 0
+    while i < out_mark_count {
+        let src_idx = (i * 1000) / beta
+        if src_idx >= m { src_idx = m - 1 }
+        let src_mark = marks[src_idx]
+        let local_tau = avg_period
+        if src_idx + 1 < m {
+            local_tau = marks[src_idx + 1] - src_mark
+        } else {
+            if src_idx > 0 {
+                local_tau = src_mark - marks[src_idx - 1]
+            }
+        }
+        if local_tau < PSOLA_MIN_PERIOD_SAMPLES { local_tau = PSOLA_MIN_PERIOD_SAMPLES }
+        if local_tau > PSOLA_MAX_PERIOD_SAMPLES { local_tau = PSOLA_MAX_PERIOD_SAMPLES }
+        let half = local_tau
+        let seg = _psola_extract_segment(pcm, src_mark, half)
+        let out_centre = marks[0] + i * out_period
+        if out_centre >= out_len {
+            i = out_mark_count
+        } else {
+            _psola_overlap_add(out, seg, out_centre, half)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn psola_transform(pcm, sample_rate, pitch_factor_milli, time_factor_milli) {
+    let n = len(pcm)
+    let alpha = _psola_clamp_factor(pitch_factor_milli)
+    let beta = _psola_clamp_factor(time_factor_milli)
+    if n <= 0 { return list_new() }
+    if n > PSOLA_MAX_SAMPLES { return list_new() }
+    let sr = _psola_clamp_rate(sample_rate)
+    let frame_size = (sr * 30) / 1000
+    if n < frame_size {
+        let copy = list_new()
+        let i = 0
+        while i < n {
+            push(copy, pcm[i])
+            i = i + 1
+        }
+        return copy
+    }
+    let marks = psola_pitch_marks(pcm, sr)
+    let m = len(marks)
+    if m == 0 {
+        let copy = list_new()
+        let i = 0
+        while i < n {
+            push(copy, pcm[i])
+            i = i + 1
+        }
+        return copy
+    }
+    let out_len = (n * beta) / 1000
+    if out_len < 1 { out_len = 1 }
+    let out = list_new()
+    let zi = 0
+    while zi < out_len {
+        push(out, 0)
+        zi = zi + 1
+    }
+    let avg_period = n
+    if m > 1 { avg_period = (marks[m - 1] - marks[0]) / (m - 1) }
+    if avg_period < PSOLA_MIN_PERIOD_SAMPLES { avg_period = PSOLA_MIN_PERIOD_SAMPLES }
+    let out_period = (avg_period * 1000) / alpha
+    if out_period < 1 { out_period = 1 }
+    let out_mark_count = (out_len - marks[0]) / out_period + 1
+    if out_mark_count < 1 { out_mark_count = 1 }
+    let i = 0
+    while i < out_mark_count {
+        let src_idx = (i * 1000) / beta
+        if src_idx >= m { src_idx = m - 1 }
+        let src_mark = marks[src_idx]
+        let local_tau = avg_period
+        if src_idx + 1 < m {
+            local_tau = marks[src_idx + 1] - src_mark
+        } else {
+            if src_idx > 0 {
+                local_tau = src_mark - marks[src_idx - 1]
+            }
+        }
+        if local_tau < PSOLA_MIN_PERIOD_SAMPLES { local_tau = PSOLA_MIN_PERIOD_SAMPLES }
+        if local_tau > PSOLA_MAX_PERIOD_SAMPLES { local_tau = PSOLA_MAX_PERIOD_SAMPLES }
+        let half = local_tau
+        let seg = _psola_extract_segment(pcm, src_mark, half)
+        let out_centre = marks[0] + i * out_period
+        if out_centre >= out_len {
+            i = out_mark_count
+        } else {
+            _psola_overlap_add(out, seg, out_centre, half)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn _psola_int_to_str(n) {
+    if n == 0 { return "0" }
+    let neg = 0
+    let v = n
+    if v < 0 { neg = 1; v = 0 - v }
+    let out = ""
+    while v > 0 {
+        let d = v - (v / 10) * 10
+        out = chr(48 + d) + out
+        v = v / 10
+    }
+    if neg == 1 { out = "-" + out }
+    return out
+}
+
+fn _psola_parse_int(s, fallback) {
+    if len(s) == 0 { return fallback }
+    let n = len(s)
+    let i = 0
+    let acc = 0
+    let any = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 48 && c <= 57 {
+            acc = acc * 10 + (c - 48)
+            any = 1
+        } else {
+            i = n
+        }
+        i = i + 1
+    }
+    if any == 0 { return fallback }
+    return acc
+}
+
+fn psola_run_pitch_shift_command(arg) {
+    if len(arg) == 0 {
+        return "(/pitch_shift needs PATH FACTOR -- usage: /pitch_shift /tmp/x.wav 2000)"
+    }
+    let parts = split(arg, " ")
+    let path = ""
+    let factor = PSOLA_FACTOR_IDENTITY
+    if len(parts) >= 1 { path = str_trim(parts[0]) }
+    if len(parts) >= 2 {
+        factor = _psola_parse_int(str_trim(parts[1]), PSOLA_FACTOR_IDENTITY)
+    }
+    if len(path) == 0 {
+        return "(/pitch_shift needs PATH FACTOR -- usage: /pitch_shift /tmp/x.wav 2000)"
+    }
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(pitch_shift FAILED: could not parse WAV at " + path + ")"
+    }
+    if sr <= 0 {
+        return "(pitch_shift FAILED: invalid sample rate in WAV at " + path + ")"
+    }
+    let shifted = psola_pitch_shift(pcm, sr, factor)
+    if len(shifted) == 0 {
+        return "(pitch_shift FAILED: empty output -- input over cap?)"
+    }
+    return "(pitch_shift " + path
+        + ": factor=" + _psola_int_to_str(factor) + " milli"
+        + ", input=" + _psola_int_to_str(len(pcm)) + " samples"
+        + ", output=" + _psola_int_to_str(len(shifted)) + " samples"
+        + " @ " + _psola_int_to_str(sr) + " Hz)"
+}
