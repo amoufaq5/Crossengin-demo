@@ -3,6 +3,85 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R12F (this session) — DP ε-budget UI / reporting: /dp admin command + status pane
+
+**Status: complete -- extended `src/safety/differential_privacy.nova`
+with budget-UI / reporting APIs (per-query log, warn threshold, reset
+audit counter, explicit-units accessors) and added a thin
+presentation layer in `src/safety/dp_budget_ui.nova` that wraps the
+existing privacy primitive in operator-facing ASCII bar lines.** The
+chat surface gains a single `/dp <subcommand>` entry point with
+subcommands `status`, `log`, `warn`, `reset`, and the existing
+`/status` pane gets a one-line `dp       :` row alongside the rest of
+the per-session state. None of the existing 52 DP unit assertions
+move; the existing `scenario_p_dp_budget.sh` continues to pass
+byte-for-byte.
+
+### DP module extensions (additive; no breaking changes)
+
+- New slots on `dp_state`: `DP_QUERY_LOG` (per-query log, ring cap 500),
+  `DP_LAST_QUERY_NS`, `DP_WARN_THRESHOLD` (default 80% of total),
+  `DP_WARN_EMITTED`, `DP_RESET_COUNT`.
+- New labelled-consume API: `dp_consume_labeled(dp, eps, label)`.
+  Existing `dp_consume` routes through it with `"query"` label;
+  `dp_noisy_count` logs under `"count"` and `dp_noisy_mean` under
+  `"mean"`.
+- Explicit-units accessors: `dp_budget_total_milli`,
+  `dp_budget_remaining_milli`, `dp_budget_consumed_milli`,
+  `dp_last_query_ns`, `dp_query_log`, `dp_query_log_count`,
+  `dp_qlog_{ts,label,epsilon}`, `dp_reset_count`.
+- Warn-cycle helpers: `dp_budget_warn_threshold` / `_set` /
+  `_should_warn` / `dp_warn_mark_emitted` / `dp_warn_emitted`.
+- Log + audit helpers: `dp_query_log_clear`, `dp_query_log_render`.
+- `dp_budget_reset` clears the warn-emitted bit AND bumps
+  `DP_RESET_COUNT`. Query log is **preserved** across resets.
+
+### New module: `src/safety/dp_budget_ui.nova` (~400 lines)
+
+Thin presentation layer with pure helpers (no I/O, no `nanotime`):
+`dpui_render_bar`, `dpui_status_line`, `dpui_status_pane_line`,
+`dpui_warn_line`, `dpui_log_lines`, `dpui_usage_lines`. The chat-side
+`admin_dp_dispatch(dp, arg)` + per-subcommand
+`_dpui_cmd_{status,log,warn,reset}` helpers colocate I/O with the
+formatters they drive.
+
+### Sample output
+
+After `dp_consume(dp, 250)` on a 1000-milli budget, `/dp status`:
+
+```
+DP budget: [###-------] 25% (250/1000 milli eps consumed; last query 12s ago)
+```
+
+`/status` gets one line at the existing layout rhythm:
+
+```
+scheduler: tick=0 rate=10Hz
+dp       : 25% used (250/1000 milli eps; 1 query)
+goal     : ...
+```
+
+`/dp reset 5000` (no `confirm`) is a NOOP that prints `PENDING`;
+`/dp reset 5000 confirm` actually applies and bumps `reset_count`.
+
+### Files
+
+- `src/safety/differential_privacy.nova`: 353 → 575 lines (R12F additions).
+- `src/safety/dp_budget_ui.nova`: NEW (~400 lines).
+- `examples/crossengin_chat.nova`: +8 net / 1 sig (1 import, 4 help,
+  1 dispatch, 1 status pane, 1 `_admin_status` signature).
+- `tests/unit/test_dp_budget_ui.nova`: NEW (81 assertions).
+- `tests/integration/scenario_bbb_dp_ui.sh`: NEW (21 assertions).
+- `DP_AUDIT.md`: R12F follow-up section appended.
+- `README.md`: R12F bullet under safety.
+
+### Verification
+
+- `tests/unit/test_dp_budget_ui.nova` — 81/81.
+- `tests/unit/test_differential_privacy.nova` — 52/52 (no change).
+- `tests/integration/scenario_bbb_dp_ui.sh` — 21/21.
+- `tests/integration/scenario_p_dp_budget.sh` — 10/10 (unchanged).
+
 ## R12B (this session) — CV: SLIC superpixel boundary-adherent segmentation
 
 **Status: complete -- new module
