@@ -11,7 +11,29 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 152 modules compile (`make build`). R13D adds
+> toolchain. R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
+> Ed25519 digital-signature primitive on top of the existing `bn256_*`
+> Montgomery REDC stack, closing the signature gap in the crypto suite
+> (alongside ChaCha20-Poly1305 AEAD, Curve25519/G14 DH, Noise XK mutual
+> auth, and Byzantine-resilient SecAgg). Self-contained: ships SHA-512
+> (FIPS 180-4) inline (the existing noise_xk has SHA-256 but not
+> SHA-512), field arithmetic over p = 2^255 - 19 (cached Montgomery
+> context for ~0.1-0.5 ms per fe_mul), Edwards curve point ops in
+> extended projective (X:Y:Z:T) form per RFC 8032 5.1.4, constant-time
+> scalar mult via Montgomery ladder, scalar arithmetic mod the
+> subgroup order L = 2^252 + 27742317777372353535851937790883648493,
+> and the public `ed25519_keygen` / `ed25519_sign` / `ed25519_verify`
+> API (32B seed, 32B pubkey, 64B signature). **All three RFC 8032 §7.1
+> reference test vectors pass bit-exact** (#1 empty message: pubkey
+> hex `d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a`,
+> signature hex matches the published 64-byte value; #2 1-byte "72";
+> #3 2-byte "af82" — all match). **Sign latency ~400 ms; verify
+> ~780 ms** on this sandbox (dominated by Edwards scalar_mult; one
+> in sign, two in verify). Tamper-detection paths all return 0:
+> wrong message, flipped signature bit, wrong pubkey. 46 unit
+> assertions + 12 integration assertions; all green. All existing
+> crypto tests pass unchanged (`test_bignum_256` 70, `test_chacha20`
+> 26, `test_poly1305` 9, `test_secure_aggregation` 170). R13D adds
 > `src/io/effectors/audio_voice_clone.nova` — non-LLM voice cloning via
 > Klatt formant transfer, the audio *cloning* leg next to R6E synthesis,
 > R7F/R9B VAD, R8B/R10B STT, R10F/R11B F0 estimation, and R12D TD-PSOLA.

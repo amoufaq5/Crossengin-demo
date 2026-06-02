@@ -3,7 +3,199 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R13B (this session) -- Full per-pixel pyramidal Lucas-Kanade
+## R14D (this session) -- HOG (Histogram of Oriented Gradients) dense descriptor
+
+**Status: complete -- `src/io/transducers/image_hog.nova` (NEW) lands the
+classic Dalal-Triggs 2005 dense feature alongside the sparse
+keypoint detectors (SIFT R5C, ORB R6D, Harris R1.6).** Sparse
+keypoints describe only the handful of points the detector flagged
+as distinctive; HOG tiles the WHOLE image (or detection window) and
+summarizes gradient orientation in fixed 8x8 cells, building a long
+fixed-topology descriptor. This is the feature that powered classical
+pedestrian detection and remains the standard baseline for "describe
+the image as a single vector" tasks that do NOT require sparse
+keypoint matching (whole-image classification, template matching,
+coarse retrieval). The R14D drop closes the HOG entry that was the
+last "DEFERRED" feature in the IMAGE_AUDIT.md ladder before the
+deep-learning rungs.
+
+### Algorithm (Dalal-Triggs 2005, integer-only adaptation)
+
+1. Per-pixel central-difference gradient (`Gx = I(x+1,y) - I(x-1,y)`,
+   `Gy = I(x,y+1) - I(x,y-1)`); border pixels contribute zero
+   magnitude.
+2. L1-magnitude (`|Gx| + |Gy|`) + unsigned orientation bin via an
+   integer atan2 lookup (the same 8-quadrant tangent-table trick
+   `_sift_dir_bin` uses; no float, no trig table).
+3. Divide image into 8x8 CELLS; per cell, accumulate magnitudes into
+   a 9-bin histogram indexed by orientation bin.
+4. Group cells into 2x2 BLOCKS (16x16 pixels). Concatenate 4 cell
+   histograms -> 36-int block descriptor. L2-normalize to 1000 milli,
+   clip every component at 200 milli (L2-Hys; Lowe's 0.2 illumination
+   cap, mirrored from SIFT's 128-D descriptor), re-normalize, apply
+   final clamp so the documented "no bin > 200 milli" invariant
+   holds post-renorm.
+5. Slide blocks at stride=1 cell (50% overlap). Concatenate every
+   block descriptor in scan order -> final HOG vector.
+
+For the canonical 64x128 Dalal-Triggs pedestrian window: 7x15=105
+blocks x 36 = 3780 ints. CrossEngin's reference fixture is 32x32:
+3x3=9 blocks x 36 = 324 ints, well under the 2^20 codegen
+pointer-threshold ceiling.
+
+### Public API
+
+- `hog_compute(image, w, h, cell_size, num_bins)` -> hog_result tuple.
+- `hog_compute_default(image, w, h)` -- cell_size=8, num_bins=9.
+- `hog_descriptor(result)` -- concatenated L2-Hys-normalized vector.
+- `hog_cell_histogram(result, cx, cy)` -- per-cell histogram for
+  inspection. Returns the empty list (sentinel) for OOB queries.
+- `hog_compare(hog_a, hog_b)` -- L1 distance over the concatenated
+  vectors. Returns -1 on length mismatch.
+- `hog_pgm_args(arg)` -- chat helper for `/hog PATH`.
+
+### Headline results
+
+- **Vertical-edge fixture (32x32)** -- dominant bin = 0 (horizontal
+  gradient direction; even though the EDGE is vertical, HOG quantizes
+  the gradient VECTOR's orientation, which points perpendicular to
+  the edge axis).
+- **Horizontal-edge fixture** -- dominant bin = 4 (vertical gradient).
+- **Diagonal-edge fixture** -- dominant bin in {2, 6}.
+- **Four-spots vs vertical-edge** -- DIFFERENT dominant bins (spots
+  produce bin 4, edge produces bin 0); the integration scenario
+  asserts these disagree, demonstrating HOG separates clustered
+  corners from single-direction edges.
+- **HOG NOT rotation-invariant** -- a 90-deg rotated copy of the
+  vertical-edge fixture produces L1 distance >= 2000 milli (the
+  dominant bin shifts from 0 to 4, and most edge-straddling blocks
+  move their normalized weight to a different histogram slot).
+  Contrast with SIFT/ORB which match such a rotation by design --
+  the HOG trade-off is intentional (templates carry orientation).
+- **HOG moderately translation-invariant** -- a 1-px column shift
+  produces L1 distance MUCH smaller than the rotation distance.
+- **32x32 descriptor size** = 324 ints; 64x64 = 1764 ints;
+  64x128 (Dalal-Triggs canonical) = 3780 ints.
+- **L2-Hys invariant** holds post-final-clip: every block component
+  is <= 200 milli; per-block sum_sq is bounded above by ~1M.
+
+### Chat wiring (2 lines)
+
+- 1 dispatch line routing `/hog` -> `hog_pgm_args`.
+- 1 help line advertising `/hog PATH`.
+
+### Visual perception wiring (1 multi-statement line)
+
+- Emits two atoms in `_vp_append_structural_features` whenever the
+  image is >= 16x16: `image_hog_descriptor_size_*` and
+  `image_hog_dominant_bin_*`.
+
+### Tests
+
+- `tests/unit/test_image_hog.nova` -- 55 assertions covering:
+  constant-image degeneracy, cardinal-direction dominant bins
+  (horizontal / vertical / diagonal), L2-Hys cap invariant,
+  hog_compare on identical / rotated / translated copies,
+  per-cell-histogram OOB sentinel, oversized / zero-pointer /
+  invalid-cell-size / invalid-num-bins safety, 32x32 and 64x64
+  descriptor-size sanity, cell_size=4 + num_bins=6 alternative
+  configurations, dominant-bin and descriptor-size label
+  round-trips.
+- `tests/integration/scenario_ggg_hog.sh` -- 10 assertions
+  covering /help advertise, usage strings, missing/too-small error
+  paths, four-spots and vertical-edge output validity, different-
+  fixtures-different-bins headline, cells=16 verification.
+
+## R14F (this session) — Ed25519 digital signatures (RFC 8032)
+
+**Status: complete — `src/safety/ed25519.nova` (NEW, ~1100 lines)
+ships a pure-NOVA RFC 8032 Ed25519 signature primitive on top of the
+existing `bn256_*` Montgomery REDC stack.** Closes the digital-
+signature gap in CrossEngin's crypto suite: prior to R14F we had
+confidentiality (ChaCha20-Poly1305), key agreement (Curve25519 +
+G14 DH), authenticated channels (Noise XK), and Byzantine-resilient
+aggregation (SecAgg), but NO signing primitive — needed for
+snapshot attestation, KG provenance signatures, and federation
+peer auth tokens.
+
+### What R14F ships
+
+  * **SHA-512 (FIPS 180-4)** — not previously available (noise_xk
+    has SHA-256 but not SHA-512). Implemented with `[lo32, hi32]`
+    limb pairs to dodge NOVA's arithmetic right-shift sign-extension
+    on negative values. NIST KATs verified for `SHA-512("")`,
+    `SHA-512("abc")`, plus a 104-byte ASCII KAT and a 114-byte dual-
+    block padding KAT.
+  * **Field arithmetic over p = 2^255 - 19** — `_fe_add`, `_fe_sub`,
+    `_fe_mul`, `_fe_neg`, `_fe_inv` (Fermat-style via
+    `bn256_modpow_ct(a, p-2, p)`). Backed by a cached Montgomery
+    context for p_25519 (singleton `_ED_P_CTX_CACHE`); per-fe_mul
+    ~0.1-0.5 ms.
+  * **Edwards point arithmetic in extended projective form**
+    (X:Y:Z:T) per RFC 8032 5.1.4. `_ed_point_add` (9 mults),
+    `_ed_point_double` (4 sqrs + 4 mults), `_ed_scalar_mult`
+    (constant-time Montgomery ladder, 256 iterations; loop body
+    bit-INDEPENDENT). Single `_fe_inv` at the END of scalar_mult
+    converts back to affine for encoding.
+  * **Scalar arithmetic mod L** — `_l_mod_512` reduces a 512-bit
+    SHA-512 output mod L = 2^252 + 27742317777372353535851937790883648493
+    via precomputed `2^256 mod L`. `_l_addmul(r, k, a) = (r + k*a)
+    mod L` is the only mod-L op the signing path needs.
+  * **Public API** —
+    `ed25519_keygen()` (32B seed + 32B pubkey),
+    `ed25519_sign(message, seed, pk)` (returns 64B signature),
+    `ed25519_verify(message, sig, pk)` (returns 1/0).
+    Plus `sha512_bytes` + hex codec helpers.
+
+### Verification
+
+  * `tests/unit/test_ed25519.nova` (NEW) — **46 assertions** —
+    SHA-512 NIST KATs, hex codec, all three RFC 8032 reference test
+    vectors (#1 empty / #2 1-byte / #3 2-byte) bit-exact, random
+    keypair + sign/verify round-trip, tamper detection on (message,
+    signature, pubkey), malformed-sig rejection, Edwards point
+    edges, sign latency reporting.
+  * `tests/integration/scenario_iii_ed25519.sh` (NEW) — **12
+    assertions** — driver exercises the full public surface
+    (keygen + sign + verify + 3 tamper paths + RFC 8032 TEST 1
+    reproduction).
+  * All existing crypto tests pass: `test_bignum_256` (70),
+    `test_chacha20` (26), `test_poly1305` (9),
+    `test_secure_aggregation` (170).
+
+### Measured performance
+
+  * `ed25519_sign` on a 32-byte message: ~390-410 ms.
+  * `ed25519_verify` on the canonical triple: ~750-800 ms.
+  * SHA-512 on a 32-byte input: ~0.1 ms.
+
+Brief expectation was 50-500 ms for sign; we land at the upper end
+(~400 ms). Dominant cost is the Edwards `_ed_scalar_mult` — 256
+doublings + ~128 adds; future tuning (B-table precompute, multi-
+scalar verify, 4-bit window) would reduce by ~3-5x but is not
+required for the API contract.
+
+### Files touched
+
+  * NEW: `src/safety/ed25519.nova` (~1100 lines; SHA-512 + field +
+    Edwards + public API).
+  * NEW: `tests/unit/test_ed25519.nova` (46 assertions).
+  * NEW: `tests/integration/scenario_iii_ed25519.sh` (12 assertions).
+  * `SECAGG_AUDIT.md` — appended R14F appendix.
+  * `NEXT_SESSION.md` — this entry.
+  * `README.md` — short call-out paragraph.
+
+### What R14F does NOT add (documented follow-ups)
+
+  * **Ed25519ph** (HashEdDSA pre-hash mode). Trivial follow-up; the
+    public API is structured so a `ed25519ph_sign` extension is a
+    one-function addition.
+  * **Batch verification** — current call sites verify one
+    signature at a time; the amortized single-product trick buys
+    nothing concrete today.
+  * **Ed448** — needs `bn512_*` + SHAKE256; out of scope.
+
+## R13B (previous session) -- Full per-pixel pyramidal Lucas-Kanade
 
 **Status: complete -- `src/io/transducers/image_optical_flow.nova`
 extended (~648 new lines) with `lk_optical_flow_pyramid_perpixel`,

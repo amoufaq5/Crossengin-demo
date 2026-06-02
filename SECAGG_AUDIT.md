@@ -1020,3 +1020,169 @@ their threat model.
 Both are tractable follow-ups when the federation scales. The current
 `byz_aggregate` dispatcher is structured so a future Krum / Bulyan
 addition is a one-case extension, not a re-architecture.
+
+## R14F appendix — Ed25519 digital signatures (RFC 8032)
+
+### What R14F adds
+
+The crypto stack prior to R14F covered confidentiality
+(ChaCha20-Poly1305 AEAD), key agreement (Curve25519 DH-256 + RFC 7919
+G14 DH-2048), authenticated channels (Noise XK mutual auth), and
+Byzantine-resilient federated aggregation (SecAgg). What was missing:
+a DIGITAL SIGNATURE primitive. R14F closes that gap by shipping a
+pure-NOVA RFC 8032 Ed25519 implementation at
+`src/safety/ed25519.nova`.
+
+Ed25519 is the modern standard signing scheme: 32-byte private seeds,
+32-byte public keys, 64-byte signatures, deterministic signing (no
+per-signature nonce randomness needed), and well-analyzed. Use cases
+inside CrossEngin:
+
+  * **Snapshot attestation** — sign the snapshot hash with the
+    operator's key so a future load can verify provenance.
+  * **KG provenance signatures** — federation peers can sign delta
+    lines so the consumer knows which peer authored them.
+  * **Federation peer auth tokens** — a peer presents a signed
+    challenge proving knowledge of its private key without revealing
+    it (similar to JWT-style tokens but without the LLM-shaped JSON
+    ceremony).
+
+### Algorithm shape (RFC 8032 PureEdDSA / Ed25519)
+
+Field: p = 2^255 - 19 (same prime as Curve25519). Subgroup order: L
+= 2^252 + 27742317777372353535851937790883648493. Curve: twisted
+Edwards `-x^2 + y^2 = 1 + d * x^2 * y^2` with d = -121665/121666 mod
+p. Base point B with known (Bx, By).
+
+  * **Key generation** — sample 32 random seed bytes via
+    `secure_random` (with the noise_xk-style nanotime+LCG fallback if
+    the OS CSPRNG is unavailable); SHA-512 the seed to derive a 256-
+    bit private scalar `a` (with RFC 8032 5.1.5 bit-clamping) and a
+    32-byte `prefix`. Public key A = encode(a * B).
+  * **Sign(message m)** —
+    r = SHA-512(prefix || m) mod L;
+    R = encode(r * B);
+    k = SHA-512(R || A || m) mod L;
+    s = (r + k * a) mod L;
+    return R || s (64 bytes).
+  * **Verify(message m, signature, A)** — parse R, s; recover R_pt
+    and A_pt; recompute k = SHA-512(R || A || m) mod L; check
+    s * B == R_pt + k * A_pt on the curve.
+
+### What R14F implements
+
+A self-contained 1100-line module that ships:
+
+  1. **SHA-512 (FIPS 180-4)** — not previously available in
+     CrossEngin (noise_xk has SHA-256 but not SHA-512). 64-bit words
+     are represented as `[lo32, hi32]` limb pairs to dodge NOVA's
+     arithmetic right-shift on negative values (a raw 64-bit int with
+     the high bit set would corrupt the FIPS-mandated unsigned
+     `SHR64`/`ROTR64` operations). Two NIST KATs verified
+     (SHA-512("") and SHA-512("abc")) plus a long-message KAT
+     (104-byte ASCII string) and a dual-block-padding KAT (114
+     bytes, forces `rem >= 112` so the second compression block
+     fires).
+  2. **Field arithmetic over p_25519** — `_fe_add`, `_fe_sub`,
+     `_fe_mul`, `_fe_neg`, `_fe_inv` (Fermat-style via
+     `bn256_modpow_ct(a, p-2, p)`), all routed through a CACHED
+     Montgomery context (`_ED_P_CTX_CACHE`, singleton). Per-fe_mul
+     cost ~0.1-0.5 ms.
+  3. **Edwards point arithmetic** — extended projective form
+     (X:Y:Z:T) per RFC 8032 5.1.4 + Hisil et al. 2008 formulas for
+     twisted Edwards a = -1. `_ed_point_add` (9 mults), `_ed_point_double`
+     (4 squarings + 4 mults), `_ed_scalar_mult` (constant-time
+     Montgomery ladder, 256 iterations). Single `_fe_inv` at the END
+     of scalar_mult to convert back to affine for encoding.
+  4. **Scalar arithmetic mod L** — `_l_mod_512` (reduce a 512-bit
+     SHA-512 output mod L) and `_l_addmul` (compute `(r + k*a) mod
+     L`). Uses a precomputed `2^256 mod L` constant to fold the
+     high half of a 512-bit dividend into the 256-bit modular form.
+  5. **Point encoding / decoding** — RFC 8032 5.1.2 / 5.1.3.
+     Encoded form: 32 little-endian bytes of `y`, with the sign of
+     `x` packed into the top bit of byte 31. Decoding recovers `x`
+     via the standard `x = u * v^3 * (uv^7)^((p-5)/8)` sqrt trick
+     (with the `sqrt(-1)` rescue branch), rejecting non-curve
+     points.
+  6. **Public API** — `ed25519_keygen()`, `ed25519_sign(message,
+     seed, pk)`, `ed25519_verify(message, signature, pk)`, plus
+     `sha512_bytes()` (exposed for caller convenience and the KAT
+     verifier) and `ed25519_hex_to_bytes` / `ed25519_bytes_to_hex`
+     helpers.
+
+### Measured performance (R14F, this dev container)
+
+  * `ed25519_sign` on a 32-byte message: ~390-410 ms.
+  * `ed25519_verify` on the canonical triple: ~750-800 ms.
+  * SHA-512 of a 32-byte input: ~0.1 ms (single compression block).
+
+The dominant cost is the Edwards `_ed_scalar_mult` (1 in sign, 2 in
+verify); each scalar_mult does 256 doublings + ~128 adds (Mont ladder
+loop body is bit-INDEPENDENT). Per-scalar_mult ~= 1920 modular mults.
+Caching the Mont context for p_25519 amortizes the ~1-2 ms ctx build
+across every fe_mul in the session.
+
+The brief's expected sign latency was "~50-500 ms"; we land at ~400
+ms which is the upper end of that range. Tuning headroom (a precomputed
+B-table for the base-point scalar mult; using one of the well-known
+double-scalar-multiplication shortcuts for verify; a true 4-bit window
+in scalar_mult) is documented as future work; it would not change the
+public API.
+
+### Constant-time / side-channel disclaimer
+
+  * `_ed_scalar_mult` uses the Montgomery ladder (one add + one
+    double per bit; loop body is bit-independent control flow).
+  * The internal `_fe_mul` / `_fe_inv` route through `bn256_*`
+    which has the same "OUTER loop is exponent-independent but
+    inner `bn256_cmp` / `bn256_sub` still branches on operand bits"
+    caveat documented in `bignum_256.nova`. We inherit that.
+  * The hash-then-reduce path inside sign uses SHA-512 (data-
+    dependent inner control flow over the message; this is fine —
+    the message is public input to the signer) and `_l_mod_512`
+    (data-dependent over the hash output, but the hash output is
+    treated as the actual secret material that we're committing
+    to; this is the standard RFC 8032 shape).
+
+### Verification
+
+  * `tests/unit/test_ed25519.nova` — 46 assertions covering:
+    SHA-512 NIST KATs (empty, "abc", 104-byte ASCII, 114-byte
+    dual-block), hex codec round-trips + edge cases, RFC 8032 test
+    vector #1 (empty message), RFC 8032 test vector #2 (1-byte
+    message), RFC 8032 test vector #3 (2-byte message), random
+    keypair generation + sign/verify round-trip, tamper detection
+    on all three paths (different message, flipped signature bit,
+    wrong pubkey), malformed signature/pubkey rejection, Edwards
+    point edges (0 * B == identity, 1 * B == B), and sign latency
+    reporting with a 30 s ceiling assertion.
+  * `tests/integration/scenario_iii_ed25519.sh` — 12 assertions
+    against a NOVA driver that exercises every public-API entrypoint:
+    keypair generation (32-byte seed + 32-byte pubkey shape
+    assertions), 64-byte signature shape, canonical verify returns
+    1, three tamper-detection paths (message / signature bit /
+    pubkey), and RFC 8032 TEST 1 reproduction (pubkey hex,
+    signature hex, verify all match the published values). Also
+    reports + asserts sign latency under 30 s.
+  * All existing crypto suites pass bit-identically:
+    `test_bignum_256` (70), `test_chacha20` (26), `test_poly1305`
+    (9), `test_secure_aggregation` (170).
+
+### What R14F does NOT add
+
+  * Ed25519ph (HashEdDSA pre-hash mode) — same primitives, trivial
+    follow-up (call SHA-512 over the message first, sign the digest
+    with a domain-separator prefix per RFC 8032 5.1.6). Documented as
+    out of scope here; the public API is structured so an Ed25519ph
+    extension is a one-function addition, not a re-architecture.
+  * Ed448 / SHAKE256 — the larger curve (448 bits, ~224-bit security)
+    requires `bn512_*` (not present in CrossEngin) and a SHAKE256
+    Keccak primitive (also not present). Same shape; tractable
+    follow-up when the federation scales beyond Ed25519's ~128-bit
+    security comfort zone.
+  * Batch verification — modern Ed25519 libraries amortize verify
+    across N signatures via the single multi-scalar product trick
+    (s_total * B == sum(R_i) + sum(k_i * A_i)); each per-sig verify
+    costs ~50 ms instead of ~750 ms in the batch case. CrossEngin's
+    current signing call sites verify one signature at a time, so
+    the optimization buys nothing concrete right now.

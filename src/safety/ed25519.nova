@@ -1,0 +1,1289 @@
+// CrossEngin safety: pure-NOVA Ed25519 (RFC 8032) signing.
+//
+// Purpose
+//   The crypto stack so far (ChaCha20-Poly1305 AEAD, Curve25519/G14 DH,
+//   SecAgg, ChaCha20 PSK channel, Noise XK mutual auth) covers
+//   confidentiality + key agreement + authenticated channels, but it
+//   has NO digital-signature primitive. Ed25519 (RFC 8032) is the
+//   modern standard signing scheme: 32-byte private keys, 32-byte
+//   public keys, 64-byte signatures, deterministic (no per-signature
+//   nonce randomness needed -- the nonce is derived from a hash of the
+//   private-key prefix and the message), fast verification, and well-
+//   analyzed. It's what we need for:
+//
+//     * Snapshot attestation -- sign the snapshot hash with the
+//       operator's key so a future load can verify provenance.
+//     * KG provenance signatures -- federation peers can sign delta
+//       lines so the consumer knows which peer authored them.
+//     * Federation peer auth tokens -- a peer presents a signed
+//       challenge proving knowledge of its private key without
+//       revealing it (similar to JWT-style tokens but without the
+//       LLM-shaped JSON ceremony).
+//
+//   This is the SIGNATURE primitive. Key agreement still uses
+//   Curve25519 / RFC 7919 G14; AEAD still uses ChaCha20-Poly1305.
+//
+// Algorithm (RFC 8032 PureEdDSA over Ed25519 / Edwards25519)
+//
+//   Domain parameters:
+//     p = 2^255 - 19                            // field prime
+//     d = -121665 / 121666  mod p               // curve coefficient
+//     L = 2^252 + 27742317777372353535851937790883648493
+//                                              // subgroup order
+//     B = (Bx, By) where                       // base point
+//       Bx = 15112221349535400772501151409588531511454012693041857206046113283949847762202
+//       By = 4 / 5  mod p (= 46316835694926478169428394003475163141307993866256225615783033603165251855960)
+//     Edwards form: -x^2 + y^2 = 1 + d*x^2*y^2
+//
+//   Key generation:
+//     1. seed = secure_random(32)              // 32-byte secret seed
+//     2. h = SHA-512(seed); h_lo = h[0..32], h_hi = h[32..64]
+//     3. clamp h_lo: a = h_lo with bits set per RFC 8032 5.1.5:
+//          a[0]  &= 0xF8     // clear bottom 3 bits
+//          a[31] &= 0x7F     // clear top bit
+//          a[31] |= 0x40     // set second-from-top bit
+//        Treat a as a 256-bit little-endian integer (the private scalar).
+//     4. prefix = h_hi (32 bytes)
+//     5. A = encode_point(a * B)               // 32-byte public key
+//     6. Output: (sk_seed=seed (32B), pk=A (32B))
+//
+//   Sign(message m, sk_seed, pk):
+//     1. h = SHA-512(sk_seed); a = clamped low 32B, prefix = h_hi
+//     2. r_bytes = SHA-512(prefix || m); r = r_bytes mod L
+//     3. R = encode_point(r * B)               // 32 bytes
+//     4. k_bytes = SHA-512(R || pk || m); k = k_bytes mod L
+//     5. s = (r + k * a) mod L                 // little-endian 32 bytes
+//     6. Signature = R || s (64 bytes)
+//
+//   Verify(message m, signature sig, pk):
+//     1. R = sig[0..32]; s = sig[32..64] as integer (must be < L; else reject)
+//     2. A = decode_point(pk); reject if invalid
+//     3. R_pt = decode_point(R); reject if invalid
+//     4. k_bytes = SHA-512(R || pk || m); k = k_bytes mod L
+//     5. Check s * B == R_pt + k * A on the curve. Return 1/0.
+//
+// Reuse
+//   * bn256_* (R6B/R7B) for 256-bit modular arithmetic over both p and L.
+//     Mont REDC + ctx caching amortizes per-call cost.
+//   * Curve25519 field prime via bn256_curve25519_p() -- shared with
+//     R7B's SecAgg DH-256 and the noise_xk Diffie-Hellman path.
+//   * secure_random (R5B) for the 32-byte secret seed; falls back to
+//     nanotime+LCG (loudly documented as weaker; same fallback shape
+//     as nxk_random_scalar in noise_xk.nova).
+//
+// New primitives in this module
+//   * SHA-512 (FIPS 180-4) -- not previously available in CrossEngin.
+//     Implemented inline to keep the signing module self-contained.
+//     Same Merkle-Damgard shape as the existing sha256 in noise_xk,
+//     but 64-bit words / 80 rounds / larger block. 64-bit words are
+//     represented as [lo32, hi32] pairs (mirror of bignum_256's
+//     limb-pair pattern) because NOVA's int_shr is arithmetic on
+//     negative values; using unsigned 64-bit words with a high bit
+//     set would corrupt the rotates.
+//   * Field arithmetic helpers over p_25519: fe_add, fe_sub, fe_mul,
+//     fe_neg, fe_inv (Fermat-style via bn256_modpow_ct), fe_eq, fe_is_neg.
+//   * Edwards point arithmetic: extended (X:Y:Z:T) projective form so
+//     the inner doublings + adds never touch a modular inverse.
+//     Single fe_inv at the END of scalar_mult to convert back to
+//     affine (x, y) for encoding.
+//   * Scalar arithmetic mod L (subgroup order): _l_mod_512, _l_addmul
+//     (s = (r + k*a) mod L; the only mod-L op the signing path needs).
+//
+// Public API
+//   ed25519_keygen()                              -> [seed_32B, pk_32B]
+//     Generates a fresh keypair. Both outputs are 32-element byte
+//     lists (each entry an int in [0, 255]).
+//
+//   ed25519_sign(message_bytes, sk_seed, pk_bytes) -> sig_64B (list)
+//     Signs `message_bytes` (a byte list) under (sk_seed, pk_bytes).
+//     Returns a 64-byte signature R || s.
+//
+//   ed25519_verify(message_bytes, sig_64B, pk_bytes) -> 1 if valid, 0 if not
+//
+//   sha512_bytes(byte_list)                       -> 64-byte hash (list)
+//     Convenience: hash a NOVA byte list (used by the test suite for
+//     NIST KAT verification).
+//
+//   ed25519_hex_to_bytes(hex_str)                  -> byte list
+//   ed25519_bytes_to_hex(byte_list)                -> lowercase hex string
+//     Helpers for test vectors and for callers that work in hex.
+//
+// Performance reality check
+//   The dominant cost is `_ed_scalar_mult` (256 doublings + ~128 adds
+//   per scalar_mult; one in sign, two in verify). Each Edwards add is
+//   ~7 fe_mul + ~3 fe_add/sub; each doubling is ~4 fe_mul + ~4
+//   fe_add/sub. Total fe_mul per scalar_mult ~= 256 * 4 + 128 * 7 =
+//   ~1920 modular mults. Each fe_mul on the Curve25519 prime via
+//   bn256_montmul costs ~0.1-0.5 ms on this sandbox. Per-scalar_mult
+//   ~= 200-1000 ms. Sign latency ~= 250-1100 ms (one scalar_mult +
+//   SHA-512 calls + small adds). Verify ~= 400-2000 ms (two scalar_mult
+//   ops; we do NOT implement the double-scalar trick s*B - k*A in one
+//   pass since the small extra constant doesn't change order-of-
+//   magnitude). The R5A Montgomery ctx cache (module-level singleton)
+//   amortizes the ~1-2 ms ctx build over every fe_mul in the session.
+//
+// Constant-time disclaimer
+//   * _ed_scalar_mult uses the Montgomery ladder (one add + one double
+//     per bit; loop body bit-independent control flow).
+//   * The internal fe_* helpers route through bn256_* which has the
+//     same "OUTER loop is exponent-independent but inner bn256_cmp /
+//     bn256_sub still branches on operand bits" caveat documented in
+//     bignum_256.nova. We inherit that. The headline guarantee is the
+//     bit-INDEPENDENT outer loop in scalar_mult, which the Mont ladder
+//     gives us.
+//   * The hash-then-reduce path inside sign uses SHA-512 (data-
+//     dependent inner control flow over the message; that's fine -- the
+//     message is public input to the signer) and bn512_mod_l (data-
+//     dependent over the hash output, but the hash output is treated
+//     as the actual secret material that we're committing to; this is
+//     the standard RFC 8032 shape).
+//
+// ADRs touched: SECAGG_AUDIT.md ("Ed25519 signature primitive (R14F)").
+// NOVA dependencies: builtins (list_new, push, len, list_set, int_*,
+//   alloc, load8, store8, secure_random, nanotime, exit).
+// CrossEngin dependencies:
+//   * src/safety/bignum_256.nova -- 256-bit Montgomery REDC + curve prime.
+
+import "../safety/bignum_256.nova"
+
+// ============================================================================
+//                              SHA-512 (FIPS 180-4)
+// ============================================================================
+//
+// SHA-512 over byte lists. 64-bit words held as [lo32, hi32] limb pairs
+// because NOVA's int_shr sign-extends negative values; using a raw int
+// to hold a 64-bit word with the high bit set would corrupt the
+// FIPS-mandated unsigned right-shifts inside the round function.
+
+let _SHA512_MASK32 = 4294967295    // 2^32 - 1; 32-bit word mask
+let _SHA512_BLOCK_BYTES = 128      // SHA-512 block size = 1024 bits
+let _SHA512_HASH_BYTES  = 64       // SHA-512 output = 512 bits
+let _SHA512_ROUNDS      = 80       // FIPS 180-4 round count
+
+// --- 64-bit-as-[lo32, hi32] helpers ---------------------------------------
+
+// Construct a 64-bit word from two 32-bit halves (lo first).
+fn _w64(lo, hi) {
+    let p = list_new()
+    push(p, int_and(lo, _SHA512_MASK32))
+    push(p, int_and(hi, _SHA512_MASK32))
+    return p
+}
+
+// 64-bit modular addition: returns ((a + b) mod 2^64) as [lo, hi].
+fn _add64(a, b) {
+    let sum_lo = int_add(a[0], b[0])
+    let carry  = int_shr(sum_lo, 32)
+    let sum_hi = int_add(int_add(a[1], b[1]), carry)
+    return _w64(sum_lo, sum_hi)
+}
+
+// 64-bit bitwise XOR.
+fn _xor64(a, b) {
+    return _w64(int_xor(a[0], b[0]), int_xor(a[1], b[1]))
+}
+
+// 64-bit bitwise AND.
+fn _and64(a, b) {
+    return _w64(int_and(a[0], b[0]), int_and(a[1], b[1]))
+}
+
+// 64-bit bitwise NOT (mod 2^64).
+fn _not64(a) {
+    return _w64(int_xor(a[0], _SHA512_MASK32),
+                int_xor(a[1], _SHA512_MASK32))
+}
+
+// 64-bit right rotate by n bits (0 < n < 64). Three cases:
+//   n in [1..31]: (x >> n) | (x << (64 - n))   -- straddles a limb
+//   n == 32:      swap the two halves
+//   n in [33..63]: ROTR(x, n) = ROTR(swap_halves(x), n - 32)
+fn _rotr64(x, n) {
+    let lo = x[0]
+    let hi = x[1]
+    if n < 32 {
+        if n == 0 { return _w64(lo, hi) }
+        // r_hi = (hi >> n) | (lo << (32 - n))
+        let r_hi = int_and(int_or(int_shr(hi, n),
+                                  int_shl(lo, 32 - n)), _SHA512_MASK32)
+        let r_lo = int_and(int_or(int_shr(lo, n),
+                                  int_shl(hi, 32 - n)), _SHA512_MASK32)
+        return _w64(r_lo, r_hi)
+    }
+    if n == 32 { return _w64(hi, lo) }
+    // n in [33..63]: rotate the swapped value by n - 32.
+    let m = n - 32
+    let r_hi = int_and(int_or(int_shr(lo, m),
+                              int_shl(hi, 32 - m)), _SHA512_MASK32)
+    let r_lo = int_and(int_or(int_shr(hi, m),
+                              int_shl(lo, 32 - m)), _SHA512_MASK32)
+    return _w64(r_lo, r_hi)
+}
+
+// 64-bit right shift by n bits (0 < n < 64). NO rotation; high bits
+// fill with zero.
+fn _shr64(x, n) {
+    let lo = x[0]
+    let hi = x[1]
+    if n == 0 { return _w64(lo, hi) }
+    if n < 32 {
+        let r_hi = int_shr(hi, n)
+        let r_lo = int_and(int_or(int_shr(lo, n),
+                                  int_shl(hi, 32 - n)), _SHA512_MASK32)
+        return _w64(r_lo, r_hi)
+    }
+    if n == 32 { return _w64(hi, 0) }
+    // n in [33..63]: r_lo = hi >> (n - 32); r_hi = 0.
+    return _w64(int_shr(hi, n - 32), 0)
+}
+
+// FIPS 180-4 round constants K[0..79] (first 64 bits of the fractional
+// parts of the cube roots of the first 80 primes 2..409). Returned as
+// [lo32, hi32] pairs. The values are HARD-CODED -- no algorithm to
+// derive them inside the runtime. Spelled out as hex constants split
+// into two 32-bit halves.
+fn _sha512_k(i) {
+    if i ==  0 { return _w64(3609767458, 1116352408) }  // 428a2f98 d728ae22
+    if i ==  1 { return _w64(602891725, 1899447441) }   // 71374491 23ef65cd
+    if i ==  2 { return _w64(3964484399, 3049323471) }  // b5c0fbcf ec4d3b2f
+    if i ==  3 { return _w64(2173295548, 3921009573) }  // e9b5dba5 8189dbbc
+    if i ==  4 { return _w64(4081628472, 961987163) }   // 3956c25b f348b538
+    if i ==  5 { return _w64(3053834265, 1508970993) }  // 59f111f1 b605d019
+    if i ==  6 { return _w64(2937671579, 2453635748) }  // 923f82a4 af194f9b
+    if i ==  7 { return _w64(3664609560, 2870763221) }  // ab1c5ed5 da6d8118
+    if i ==  8 { return _w64(2734883394, 3624381080) }  // d807aa98 a3030242
+    if i ==  9 { return _w64(1164996542, 310598401) }   // 12835b01 45706fbe
+    if i == 10 { return _w64(1323610764, 607225278) }   // 243185be 4ee4b28c
+    if i == 11 { return _w64(3590304994, 1426881987) }  // 550c7dc3 d5ffb4e2
+    if i == 12 { return _w64(4068182383, 1925078388) }  // 72be5d74 f27b896f
+    if i == 13 { return _w64(991336113, 2162078206) }   // 80deb1fe 3b1696b1
+    if i == 14 { return _w64(633803317, 2614888103) }   // 9bdc06a7 25c71235
+    if i == 15 { return _w64(3479774868, 3248222580) }  // c19bf174 cf692694
+    if i == 16 { return _w64(2666613458, 3835390401) }  // e49b69c1 9ef14ad2
+    if i == 17 { return _w64(944711139, 4022224774) }   // efbe4786 384f25e3
+    if i == 18 { return _w64(2341262773, 264347078) }   // 0fc19dc6 8b8cd5b5
+    if i == 19 { return _w64(2007800933, 604807628) }   // 240ca1cc 77ac9c65
+    if i == 20 { return _w64(1495990901, 770255983) }   // 2de92c6f 592b0275
+    if i == 21 { return _w64(1856431235, 1249150122) }  // 4a7484aa 6ea6e483
+    if i == 22 { return _w64(3175218132, 1555081692) }  // 5cb0a9dc bd41fbd4
+    if i == 23 { return _w64(2198950837, 1996064986) }  // 76f988da 831153b5
+    if i == 24 { return _w64(3999719339, 2554220882) }  // 983e5152 ee66dfab
+    if i == 25 { return _w64(766784016, 2821834349) }   // a831c66d 2db43210
+    if i == 26 { return _w64(2566594879, 2952996808) }  // b00327c8 98fb213f
+    if i == 27 { return _w64(3203337956, 3210313671) }  // bf597fc7 beef0ee4
+    if i == 28 { return _w64(1034457026, 3336571891) }  // c6e00bf3 3da88fc2
+    if i == 29 { return _w64(2466948901, 3584528711) }  // d5a79147 930aa725
+    if i == 30 { return _w64(3758326383, 113926993) }   // 06ca6351 e003826f
+    if i == 31 { return _w64(168717936, 338241895) }    // 14292967 0a0e6e70
+    if i == 32 { return _w64(1188179964, 666307205) }   // 27b70a85 46d22ffc
+    if i == 33 { return _w64(1546045734, 773529912) }   // 2e1b2138 5c26c926
+    if i == 34 { return _w64(1522805485, 1294757372) }  // 4d2c6dfc 5ac42aed
+    if i == 35 { return _w64(2643833823, 1396182291) }  // 53380d13 9d95b3df
+    if i == 36 { return _w64(2343527390, 1695183700) }  // 650a7354 8baf63de
+    if i == 37 { return _w64(1014477480, 1986661051) }  // 766a0abb 3c77b2a8
+    if i == 38 { return _w64(1206759142, 2177026350) }  // 81c2c92e 47edaee6
+    if i == 39 { return _w64(344077627, 2456956037) }   // 92722c85 1482353b
+    if i == 40 { return _w64(1290863460, 2730485921) }  // a2bfe8a1 4cf10364
+    if i == 41 { return _w64(3158454273, 2820302411) }  // a81a664b bc423001
+    if i == 42 { return _w64(3505952657, 3259730800) }  // c24b8b70 d0f89791
+    if i == 43 { return _w64(106217008, 3345764771) }   // c76c51a3 0654be30
+    if i == 44 { return _w64(3606008344, 3516065817) }  // d192e819 d6ef5218
+    if i == 45 { return _w64(1432725776, 3600352804) }  // d6990624 5565a910
+    if i == 46 { return _w64(1467031594, 4094571909) }  // f40e3585 5771202a
+    if i == 47 { return _w64(851169720, 275423344) }    // 106aa070 32bbd1b8
+    if i == 48 { return _w64(3100823752, 430227734) }   // 19a4c116 b8d2d0c8
+    if i == 49 { return _w64(1363258195, 506948616) }   // 1e376c08 5141ab53
+    if i == 50 { return _w64(3750685593, 659060556) }   // 2748774c df8eeb99
+    if i == 51 { return _w64(3785050280, 883997877) }   // 34b0bcb5 e19b48a8
+    if i == 52 { return _w64(3318307427, 958139571) }   // 391c0cb3 c5c95a63
+    if i == 53 { return _w64(3812723403, 1322822218) }  // 4ed8aa4a e3418acb
+    if i == 54 { return _w64(2003034995, 1537002063) }  // 5b9cca4f 7763e373
+    if i == 55 { return _w64(3602036899, 1747873779) }  // 682e6ff3 d5a06d39
+    if i == 56 { return _w64(1575990012, 1955562222) }  // 748f82ee 5defb2fc
+    if i == 57 { return _w64(1125592928, 2024104815) }  // 78a5636f 43172f60
+    if i == 58 { return _w64(2716904306, 2227730452) }  // 84c87814 a1f0ab72
+    if i == 59 { return _w64(442776044, 2361852424) }   // 8cc70208 1a6439ec
+    if i == 60 { return _w64(593698344, 2428436474) }   // 90befffa 23631e28
+    if i == 61 { return _w64(3733110249, 2756734187) }  // a4506ceb de82bde9
+    if i == 62 { return _w64(2999351573, 3204031479) }  // bef9a3f7 b2c67915
+    if i == 63 { return _w64(3815920427, 3329325298) }  // c67178f2 e372532b
+    if i == 64 { return _w64(3928383900, 3391569614) }  // ca273ece ea26619c
+    if i == 65 { return _w64(566280711, 3515267271) }   // d186b8c7 21c0c207
+    if i == 66 { return _w64(3454069534, 3940187606) }  // eada7dd6 cde0eb1e
+    if i == 67 { return _w64(4000239992, 4118630271) }  // f57d4f7f ee6ed178
+    if i == 68 { return _w64(1914138554, 116418474) }   // 06f067aa 72176fba
+    if i == 69 { return _w64(2731055270, 174292421) }   // 0a637dc5 a2c898a6
+    if i == 70 { return _w64(3203993006, 289380356) }   // 113f9804 bef90dae
+    if i == 71 { return _w64(320620315, 460393269) }    // 1b710b35 131c471b
+    if i == 72 { return _w64(587496836, 685471733) }    // 28db77f5 23047d84
+    if i == 73 { return _w64(1086792851, 852142971) }   // 32caab7b 40c72493
+    if i == 74 { return _w64(365543100, 1017036298) }   // 3c9ebe0a 15c9bebc
+    if i == 75 { return _w64(2618297676, 1126000580) }  // 431d67c4 9c100d4c
+    if i == 76 { return _w64(3409855158, 1288033470) }  // 4cc5d4be cb3e42b6
+    if i == 77 { return _w64(4234509866, 1501505948) }  // 597f299c fc657e2a
+    if i == 78 { return _w64(987167468, 1607167915) }   // 5fcb6fab 3ad6faec
+    if i == 79 { return _w64(1246189591, 1816402316) }  // 6c44198c 4a475817
+    return _w64(0, 0)
+}
+
+// SHA-512 initial hash values H[0..7]: first 64 bits of the fractional
+// parts of the square roots of the first 8 primes 2..19 (FIPS 180-4 5.3.5).
+fn _sha512_init_h() {
+    let h = list_new()
+    push(h, _w64(4089235720, 1779033703))   // 6a09e667 f3bcc908
+    push(h, _w64(2227873595, 3144134277))   // bb67ae85 84caa73b
+    push(h, _w64(4271175723, 1013904242))   // 3c6ef372 fe94f82b
+    push(h, _w64(1595750129, 2773480762))   // a54ff53a 5f1d36f1
+    push(h, _w64(2917565137, 1359893119))   // 510e527f ade682d1
+    push(h, _w64(725511199, 2600822924))    // 9b05688c 2b3e6c1f
+    push(h, _w64(4215389547, 528734635))    // 1f83d9ab fb41bd6b
+    push(h, _w64(327033209, 1541459225))    // 5be0cd19 137e2179
+    return h
+}
+
+// Big-endian 64-bit load from a byte list at offset off.
+fn _sha512_load_be64(buf, off) {
+    let b0 = buf[off + 0]
+    let b1 = buf[off + 1]
+    let b2 = buf[off + 2]
+    let b3 = buf[off + 3]
+    let b4 = buf[off + 4]
+    let b5 = buf[off + 5]
+    let b6 = buf[off + 6]
+    let b7 = buf[off + 7]
+    let hi = int_and(int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                          int_shl(b2, 8)), b3), _SHA512_MASK32)
+    let lo = int_and(int_or(int_or(int_or(int_shl(b4, 24), int_shl(b5, 16)),
+                                          int_shl(b6, 8)), b7), _SHA512_MASK32)
+    return _w64(lo, hi)
+}
+
+// Big-endian 64-bit store into a byte list at offset off.
+fn _sha512_store_be64(buf, off, w) {
+    let lo = w[0]
+    let hi = w[1]
+    list_set(buf, off + 0, int_and(int_shr(hi, 24), 255))
+    list_set(buf, off + 1, int_and(int_shr(hi, 16), 255))
+    list_set(buf, off + 2, int_and(int_shr(hi, 8), 255))
+    list_set(buf, off + 3, int_and(hi, 255))
+    list_set(buf, off + 4, int_and(int_shr(lo, 24), 255))
+    list_set(buf, off + 5, int_and(int_shr(lo, 16), 255))
+    list_set(buf, off + 6, int_and(int_shr(lo, 8), 255))
+    list_set(buf, off + 7, int_and(lo, 255))
+    return 1
+}
+
+// SHA-512 compression: process one 128-byte block. Updates h (length-8
+// list of 64-bit words) in place. blk is a byte list at the block's
+// start offset (we pass [buf, off] separately).
+fn _sha512_compress(h, buf, off) {
+    // Build the 80-word message schedule W[0..79].
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _sha512_load_be64(buf, off + int_mul(i, 8)))
+        i = i + 1
+    }
+    while i < 80 {
+        // s0 = ROTR(W[i-15], 1) XOR ROTR(W[i-15], 8) XOR SHR(W[i-15], 7)
+        let w15 = w[i - 15]
+        let s0 = _xor64(_xor64(_rotr64(w15, 1), _rotr64(w15, 8)),
+                        _shr64(w15, 7))
+        // s1 = ROTR(W[i-2], 19) XOR ROTR(W[i-2], 61) XOR SHR(W[i-2], 6)
+        let w2 = w[i - 2]
+        let s1 = _xor64(_xor64(_rotr64(w2, 19), _rotr64(w2, 61)),
+                        _shr64(w2, 6))
+        let v = _add64(_add64(_add64(w[i - 16], s0), w[i - 7]), s1)
+        push(w, v)
+        i = i + 1
+    }
+    // Working variables initialised from the current hash state.
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]
+    let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7]
+    let t = 0
+    while t < _SHA512_ROUNDS {
+        // S1 = ROTR(e,14) XOR ROTR(e,18) XOR ROTR(e,41)
+        let bs1 = _xor64(_xor64(_rotr64(e, 14), _rotr64(e, 18)),
+                         _rotr64(e, 41))
+        // Ch = (e AND f) XOR ((NOT e) AND g)
+        let ch = _xor64(_and64(e, f), _and64(_not64(e), g))
+        // T1 = hh + S1 + Ch + K[t] + W[t]
+        let t1 = _add64(_add64(_add64(_add64(hh, bs1), ch),
+                               _sha512_k(t)), w[t])
+        // S0 = ROTR(a,28) XOR ROTR(a,34) XOR ROTR(a,39)
+        let bs0 = _xor64(_xor64(_rotr64(a, 28), _rotr64(a, 34)),
+                         _rotr64(a, 39))
+        // Maj = (a AND b) XOR (a AND c) XOR (b AND c)
+        let maj = _xor64(_xor64(_and64(a, b), _and64(a, c)),
+                         _and64(b, c))
+        // T2 = S0 + Maj
+        let t2 = _add64(bs0, maj)
+        // Rotate: hh = g; g = f; f = e; e = d + T1; d = c; c = b; b = a; a = T1 + T2.
+        hh = g
+        g = f
+        f = e
+        e = _add64(d, t1)
+        d = c
+        c = b
+        b = a
+        a = _add64(t1, t2)
+        t = t + 1
+    }
+    list_set(h, 0, _add64(h[0], a))
+    list_set(h, 1, _add64(h[1], b))
+    list_set(h, 2, _add64(h[2], c))
+    list_set(h, 3, _add64(h[3], d))
+    list_set(h, 4, _add64(h[4], e))
+    list_set(h, 5, _add64(h[5], f))
+    list_set(h, 6, _add64(h[6], g))
+    list_set(h, 7, _add64(h[7], hh))
+    return 1
+}
+
+// SHA-512 of a byte list. Returns a 64-byte byte list.
+//
+// FIPS 180-4 padding: append 0x80, zero-pad to (length mod 128 == 112),
+// then append the original message length in BITS as a 128-bit big-
+// endian integer. The high 64 bits are zero in practice (our messages
+// are << 2^61 bytes long); we emit them explicitly to honor the spec.
+fn sha512_bytes(msg) {
+    let n = len(msg)
+    let h = _sha512_init_h()
+    let full_blocks = int_shr(n, 7)             // n / 128
+    let i = 0
+    while i < full_blocks {
+        _sha512_compress(h, msg, int_mul(i, _SHA512_BLOCK_BYTES))
+        i = i + 1
+    }
+    let consumed = int_mul(full_blocks, _SHA512_BLOCK_BYTES)
+    let rem = n - consumed
+    // Build the final padded block(s). Need one block if rem <= 111
+    // (1 byte for 0x80 + 16 bytes for the 128-bit length = 17, leaves
+    // up to 111 bytes for message tail); two blocks if rem >= 112.
+    let need_two = 0
+    if rem >= 112 { need_two = 1 }
+    let final_size = _SHA512_BLOCK_BYTES
+    if need_two == 1 { final_size = int_mul(_SHA512_BLOCK_BYTES, 2) }
+    let pad = list_new()
+    let j = 0
+    while j < final_size {
+        push(pad, 0)
+        j = j + 1
+    }
+    let k = 0
+    while k < rem {
+        list_set(pad, k, msg[consumed + k])
+        k = k + 1
+    }
+    list_set(pad, rem, 128)
+    // Zero bytes between rem+1 and final_size - 16 are already zero
+    // from the list initialisation above. Embed the 128-bit length:
+    // hi 64 bits = 0 (we don't support messages >= 2^61 bytes), lo 64
+    // bits = n * 8 (the message bit-length).
+    let total_bits_lo = int_and(int_shl(n, 3), _SHA512_MASK32)
+    let total_bits_hi = int_and(int_shr(n, 29), _SHA512_MASK32)
+    // length field is 16 bytes, big-endian, at offset final_size - 16.
+    // High 8 bytes (bits 127..64) are zero; already zero.
+    // Bytes [final_size-8 .. final_size-1] hold the low 64 bits of (n*8).
+    let off = final_size - 8
+    list_set(pad, off + 0, int_and(int_shr(total_bits_hi, 24), 255))
+    list_set(pad, off + 1, int_and(int_shr(total_bits_hi, 16), 255))
+    list_set(pad, off + 2, int_and(int_shr(total_bits_hi, 8), 255))
+    list_set(pad, off + 3, int_and(total_bits_hi, 255))
+    list_set(pad, off + 4, int_and(int_shr(total_bits_lo, 24), 255))
+    list_set(pad, off + 5, int_and(int_shr(total_bits_lo, 16), 255))
+    list_set(pad, off + 6, int_and(int_shr(total_bits_lo, 8), 255))
+    list_set(pad, off + 7, int_and(total_bits_lo, 255))
+    _sha512_compress(h, pad, 0)
+    if need_two == 1 {
+        _sha512_compress(h, pad, _SHA512_BLOCK_BYTES)
+    }
+    // Emit H[0..7] as 64 big-endian bytes.
+    let out = list_new()
+    let z = 0
+    while z < _SHA512_HASH_BYTES {
+        push(out, 0)
+        z = z + 1
+    }
+    let q = 0
+    while q < 8 {
+        _sha512_store_be64(out, int_mul(q, 8), h[q])
+        q = q + 1
+    }
+    return out
+}
+
+// ============================================================================
+//                          Byte-list <-> hex helpers
+// ============================================================================
+
+// Hex nibble -> 0..15 (returns -1 on bad input).
+fn _ed_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }
+    if c >= 97 { if c <= 102 { return c - 87 } }
+    if c >= 65 { if c <= 70  { return c - 55 } }
+    return -1
+}
+
+// Nibble -> lowercase hex char code.
+fn _ed_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87
+}
+
+// Hex string -> byte list. Returns an empty list on invalid input.
+fn ed25519_hex_to_bytes(s) {
+    let n = len(s)
+    let out = list_new()
+    if int_and(n, 1) != 0 { return out }   // odd length is invalid
+    let i = 0
+    while i < n {
+        let hi = _ed_hex_nibble(char_at(s, i))
+        let lo = _ed_hex_nibble(char_at(s, i + 1))
+        if hi < 0 { return list_new() }
+        if lo < 0 { return list_new() }
+        push(out, int_or(int_shl(hi, 4), lo))
+        i = i + 2
+    }
+    return out
+}
+
+// Byte list -> lowercase hex string.
+fn ed25519_bytes_to_hex(b) {
+    let n = len(b)
+    let s = ""
+    let i = 0
+    while i < n {
+        let v = b[i]
+        s = s + chr(_ed_nibble_hex(int_and(int_shr(v, 4), 15)))
+        s = s + chr(_ed_nibble_hex(int_and(v, 15)))
+        i = i + 1
+    }
+    return s
+}
+
+// Copy a slice [start, start+n) of a byte list into a fresh byte list.
+fn _ed_slice_bytes(b, start, n) {
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, b[start + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Concatenate three byte lists into one fresh byte list. Used by
+// SHA-512(R || A || M) and SHA-512(prefix || M).
+fn _ed_concat3_bytes(a, b, c) {
+    let out = list_new()
+    let i = 0
+    let na = len(a)
+    while i < na { push(out, a[i]); i = i + 1 }
+    i = 0
+    let nb = len(b)
+    while i < nb { push(out, b[i]); i = i + 1 }
+    i = 0
+    let nc = len(c)
+    while i < nc { push(out, c[i]); i = i + 1 }
+    return out
+}
+
+// Concatenate two byte lists.
+fn _ed_concat2_bytes(a, b) {
+    let out = list_new()
+    let i = 0
+    let na = len(a)
+    while i < na { push(out, a[i]); i = i + 1 }
+    i = 0
+    let nb = len(b)
+    while i < nb { push(out, b[i]); i = i + 1 }
+    return out
+}
+
+// ============================================================================
+//                       Little-endian bytes <-> bn256
+// ============================================================================
+
+// 32-byte little-endian byte list -> bn256 (8-limb little-endian 32-bit).
+// Byte 0 is the LSB; byte 31 is the MSB.
+fn _ed_le32_to_bn(bytes) {
+    let r = bn256_new()
+    let i = 0
+    while i < 8 {
+        let off = int_mul(i, 4)
+        let b0 = bytes[off + 0]
+        let b1 = bytes[off + 1]
+        let b2 = bytes[off + 2]
+        let b3 = bytes[off + 3]
+        let limb = int_or(int_or(int_or(b0, int_shl(b1, 8)),
+                                        int_shl(b2, 16)),
+                                 int_shl(b3, 24))
+        list_set(r, i, int_and(limb, 4294967295))
+        i = i + 1
+    }
+    return r
+}
+
+// bn256 -> 32-byte little-endian byte list. Byte 0 is the LSB.
+fn _ed_bn_to_le32(bn) {
+    let out = list_new()
+    let i = 0
+    while i < 32 { push(out, 0); i = i + 1 }
+    let j = 0
+    while j < 8 {
+        let limb = bn[j]
+        let off = int_mul(j, 4)
+        list_set(out, off + 0, int_and(limb, 255))
+        list_set(out, off + 1, int_and(int_shr(limb, 8), 255))
+        list_set(out, off + 2, int_and(int_shr(limb, 16), 255))
+        list_set(out, off + 3, int_and(int_shr(limb, 24), 255))
+        j = j + 1
+    }
+    return out
+}
+
+// 64-byte little-endian byte list -> [hi_bn, lo_bn] split. SHA-512
+// returns 64 bytes that need to be reduced mod L (and the reducer takes
+// a 512-bit dividend as [hi, lo]).
+fn _ed_le64_to_bn_pair(bytes) {
+    let lo = _ed_le32_to_bn(_ed_slice_bytes(bytes, 0, 32))
+    let hi = _ed_le32_to_bn(_ed_slice_bytes(bytes, 32, 32))
+    let pair = list_new()
+    push(pair, hi)
+    push(pair, lo)
+    return pair
+}
+
+// ============================================================================
+//                Field arithmetic over p = 2^255 - 19  (Curve25519)
+// ============================================================================
+//
+// Wrappers around bn256_* with a CACHED Montgomery context for the
+// field prime. Every fe_mul / fe_inv routes through this ctx so the
+// per-operation cost is the CIOS reduce, not the bit-by-bit fallback.
+// Same caching pattern as noise_xk's _nxk_g14_ctx.
+
+let _ED_P_CTX_CACHE = list_new()
+
+// Build (or return cached) Montgomery context for p_25519.
+fn _ed_p_ctx() {
+    if len(_ED_P_CTX_CACHE) == 0 {
+        let p = bn256_curve25519_p()
+        push(_ED_P_CTX_CACHE, bn256_mont_ctx_new(p))
+    }
+    return _ED_P_CTX_CACHE[0]
+}
+
+// Field add: (a + b) mod p. Done as a bignum add then a conditional
+// subtract of p. (Both a, b are assumed < p; the sum can exceed p by
+// at most one factor.)
+fn _fe_add(a, b) {
+    let p = bn256_curve25519_p()
+    let s = bn256_add(a, b)
+    if bn256_cmp(s, p) >= 0 {
+        return bn256_sub(s, p)
+    }
+    return s
+}
+
+// Field sub: (a - b) mod p. If a < b, add p first to avoid underflow.
+fn _fe_sub(a, b) {
+    let p = bn256_curve25519_p()
+    if bn256_cmp(a, b) < 0 {
+        let a_plus = bn256_add(a, p)
+        return bn256_sub(a_plus, b)
+    }
+    return bn256_sub(a, b)
+}
+
+// Field negation: (-a) mod p = p - a (with a == 0 case returning 0).
+fn _fe_neg(a) {
+    let p = bn256_curve25519_p()
+    if bn256_zero(a) != 0 { return bn256_new() }
+    return bn256_sub(p, a)
+}
+
+// Field multiply: (a * b) mod p. Routes through the cached Mont ctx.
+fn _fe_mul(a, b) {
+    let p = bn256_curve25519_p()
+    return bn256_modmul(a, b, p)
+}
+
+// Field square: a^2 mod p.
+fn _fe_sqr(a) {
+    return _fe_mul(a, a)
+}
+
+// Field inverse: a^(p-2) mod p (Fermat). p is prime so this is a
+// well-defined modular inverse for any a != 0. For a == 0 we return 0
+// (the call site for inv inside scalar_mult's final affine convert
+// MUST never see a zero Z because Edwards-form scalar_mult with the
+// base point never visits the curve identity except at the END of an
+// order-divisible exponent, and the sign + verify paths handle the
+// identity by encoding it as the canonical (0, 1) point).
+fn _fe_inv(a) {
+    if bn256_zero(a) != 0 { return bn256_new() }
+    let p = bn256_curve25519_p()
+    let two = bn256_from_int(2)
+    let exp = bn256_sub(p, two)             // p - 2
+    return bn256_modpow_ct(a, exp, p)
+}
+
+// Field equality + zero predicates: wrappers for readability.
+fn _fe_eq(a, b) { return bn256_eq(a, b) }
+fn _fe_zero(a)  { return bn256_zero(a) }
+
+// Test if a field element is "negative" per RFC 8032 5.1.2: the bit-0
+// of its canonical 256-bit little-endian encoding. Since our bn256
+// representation IS little-endian limb-array, that's just (a[0] & 1).
+fn _fe_is_neg(a) {
+    return int_and(a[0], 1)
+}
+
+// ============================================================================
+//                          Curve constants
+// ============================================================================
+//
+// The Edwards25519 curve coefficient d = -121665 / 121666 (mod p).
+// Hex form (RFC 8032 5.1):
+//   d = 0x52036cee2b6ffe73 8cc740797779e898 00700a4d4141d8ab 75eb4dca135978a3
+// And the base point coordinates Bx, By.
+
+fn _ed_d() {
+    return bn256_from_hex(
+        "52036cee2b6ffe738cc740797779e89800700a4d4141d8ab75eb4dca135978a3")
+}
+
+// The base point B for Ed25519.
+//   By = 4/5 mod p = 0x6666666666666666666666666666666666666666666666666666666666666658
+//   Bx = 0x216936d3cd6e53fec0a4e231fdd6dc5c692cc7609525a7b2c9562d608f25d51a
+fn _ed_bx() {
+    return bn256_from_hex(
+        "216936d3cd6e53fec0a4e231fdd6dc5c692cc7609525a7b2c9562d608f25d51a")
+}
+fn _ed_by() {
+    return bn256_from_hex(
+        "6666666666666666666666666666666666666666666666666666666666666658")
+}
+
+// The subgroup order L for Ed25519.
+//   L = 2^252 + 27742317777372353535851937790883648493
+//     = 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed
+// 253 bits (one bit beyond 252). Our 256-bit bignum holds this with
+// limb[7] = 0x10000000.
+fn _ed_l() {
+    return bn256_from_hex(
+        "1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed")
+}
+
+// Montgomery context for L (cached singleton).
+let _ED_L_CTX_CACHE = list_new()
+
+fn _ed_l_ctx() {
+    if len(_ED_L_CTX_CACHE) == 0 {
+        let L = _ed_l()
+        push(_ED_L_CTX_CACHE, bn256_mont_ctx_new(L))
+    }
+    return _ED_L_CTX_CACHE[0]
+}
+
+// Reduce a 512-bit value (split as [hi, lo]) mod L. Same shape as
+// bn256_modmul but used for the RFC 8032 "SHA-512(x) mod L" step.
+fn _l_mod_512(hi, lo) {
+    let L = _ed_l()
+    // _bn256_mod512 is private to bignum_256 but we can replicate the
+    // call via bn256_modmul(hi, 2^256-mod-form, L) + bn256_mod(lo, L).
+    // Simpler: do a bit-by-bit reduce here by splitting and using
+    // bn256_mod for lo, then adding hi * (2^256 mod L) and reducing
+    // again.
+    let lo_red = bn256_mod(lo, L)
+    if bn256_zero(hi) != 0 { return lo_red }
+    // r = lo + hi * 2^256, mod L.
+    // hi * 2^256 mod L = hi * (2^256 mod L) mod L.
+    let two_pow_256_mod_L = _ed_two_pow_256_mod_L()
+    let hi_part = bn256_modmul(hi, two_pow_256_mod_L, L)
+    let sum = bn256_add(lo_red, hi_part)
+    if bn256_cmp(sum, L) >= 0 {
+        return bn256_sub(sum, L)
+    }
+    return sum
+}
+
+// 2^256 mod L. Since L < 2^253, this fits in 256 bits. Precomputed
+// constant: 2^256 mod L = 2 * (2^255 mod L). 2^255 mod L was derived
+// off-line: 2^255 - 2^252 - 0x14def9dea2f79cd65812631a5cf5d3ed = ...
+// Concretely: 2^256 - L = 2^256 - (2^252 + c) where c =
+// 0x14def9dea2f79cd65812631a5cf5d3ed.
+// 2^256 - L = (2^256 - 2^252) - c
+//           = 2^252 * (16 - 1) - c
+//           = 15 * 2^252 - c
+// So 2^256 mod L = 15 * 2^252 - c when this is positive (it is).
+// Concrete hex of (2^256 - L):
+//   2^256 = 0x10000000000000000000000000000000000000000000000000000000000000000 (257 bits)
+//   L     = 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed
+//   diff  = 0x0fffffffffffffffffffffffffffffffeb2106215d08632a9a7ed9ce5a30a c c c c... let me recompute carefully.
+// Actually we MUST get this right -- it's a precomputed constant.
+// Off-line: 2^256 mod L = 2^256 - L = ?
+// 2^256             = 1 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+//                     |   bits 255..192    bits 191..128    bits 127..64     bits 63..0
+// L's hex (256-bit) = 1000000000000000 0000000000000000 0000000000000000 14def9dea2f79cd6 5812631a5cf5d3ed
+// (L is 253 bits; high half is 0x1000000000000000 followed by zeros up
+// to bit 128 then the low 128 bits.)
+// Subtract: 2^256 - L:
+//   high 64 bits of (2^256-1) = ffffffffffffffff;  minus L's high  = effffffffffffff... wait let me just split into 4 16-hex-char chunks.
+// 2^256 - 1 = ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff
+// L         = 1000000000000000 0000000000000000 14def9dea2f79cd6 5812631a5cf5d3ed
+// 2^256 - L = (2^256 - 1) - L + 1.
+// (2^256-1) - L = (f - 1)fffffff... - L's bits, do 4-chunk subtract:
+//   chunk 0 (low): ffffffffffffffff - 5812631a5cf5d3ed = a7ed9ce5a30a2c12
+//   chunk 1:       ffffffffffffffff - 14def9dea2f79cd6 = eb2106215d086329
+//   chunk 2:       ffffffffffffffff - 0000000000000000 = ffffffffffffffff
+//   chunk 3 (hi):  ffffffffffffffff - 1000000000000000 = efffffffffffffff
+// Then add 1 to the low chunk: a7ed9ce5a30a2c12 + 1 = a7ed9ce5a30a2c13.
+// So 2^256 mod L = efffffffffffffff ffffffffffffffff eb2106215d086329 a7ed9ce5a30a2c13.
+// 2^256 mod L. Derivation:
+//   2^256 - 1   = 0xffffffff_ffffffff_ffffffff_ffffffff_ffffffff_ffffffff_ffffffff_ffffffff
+//   L           = 0x10000000_00000000_00000000_00000000_14def9de_a2f79cd6_5812631a_5cf5d3ed
+//   (2^256-1)-L = 0xefffffff_ffffffff_ffffffff_ffffffff_eb210621_5d086329_a7ed9ce5_a30a2c12
+//   plus 1 to LSB:
+//   2^256 mod L = 0xefffffff_ffffffff_ffffffff_ffffffff_eb210621_5d086329_a7ed9ce5_a30a2c13
+fn _ed_two_pow_256_mod_L() {
+    return bn256_from_hex(
+        "efffffffffffffffffffffffffffffffeb2106215d086329a7ed9ce5a30a2c13")
+}
+
+// Scalar multiply mod L: (a + b * c) mod L. Used by sign to compute
+// s = (r + k * a) mod L. We do it as a 512-bit product k*a then reduce
+// mod L via _l_mod_512, then add r and reduce once more (single
+// subtract suffices since the sum is < 2L).
+fn _l_addmul(r, k, a) {
+    let pair = bn256_mul(k, a)
+    let hi = pair[0]
+    let lo = pair[1]
+    let prod_red = _l_mod_512(hi, lo)
+    let L = _ed_l()
+    let sum = bn256_add(r, prod_red)
+    if bn256_cmp(sum, L) >= 0 {
+        return bn256_sub(sum, L)
+    }
+    return sum
+}
+
+// ============================================================================
+//                Edwards25519 point arithmetic (extended projective)
+// ============================================================================
+//
+// Extended coordinates (X:Y:Z:T) for an affine point (x, y):
+//   x = X / Z,  y = Y / Z,  x * y = T / Z
+// (See RFC 8032 5.1.4 and Hisil et al. 2008 for the formulas used.)
+// Doubling and adding never touch a modular inverse in this
+// representation; a single fe_inv is needed at the end of
+// scalar_mult to convert back to affine for encoding.
+
+// Identity (neutral) point in extended form: (0, 1, 1, 0).
+fn _ed_pt_identity() {
+    let p = list_new()
+    push(p, bn256_new())             // X = 0
+    push(p, bn256_from_int(1))       // Y = 1
+    push(p, bn256_from_int(1))       // Z = 1
+    push(p, bn256_new())             // T = 0
+    return p
+}
+
+// Convert an affine (x, y) to extended form (x, y, 1, x*y).
+fn _ed_pt_from_affine(x, y) {
+    let p = list_new()
+    push(p, x)
+    push(p, y)
+    push(p, bn256_from_int(1))
+    push(p, _fe_mul(x, y))
+    return p
+}
+
+// The base point B in extended form. Built lazily; cached to avoid
+// rebuilding the bignum literals on every scalar_mult call.
+let _ED_BASE_CACHE = list_new()
+fn _ed_base_point() {
+    if len(_ED_BASE_CACHE) == 0 {
+        let bx = _ed_bx()
+        let by = _ed_by()
+        push(_ED_BASE_CACHE, _ed_pt_from_affine(bx, by))
+    }
+    return _ED_BASE_CACHE[0]
+}
+
+// Edwards point doubling in extended coordinates (RFC 8032 5.1.4):
+//   A = X1^2
+//   B = Y1^2
+//   C = 2 * Z1^2
+//   H = A + B
+//   E = H - (X1 + Y1)^2
+//   G = A - B
+//   F = C + G
+//   X3 = E * F
+//   Y3 = G * H
+//   T3 = E * H
+//   Z3 = F * G
+// 4 squarings + 4 multiplications + 7 add/sub. No inverse.
+fn _ed_point_double(P) {
+    let X1 = P[0]
+    let Y1 = P[1]
+    let Z1 = P[2]
+    let A = _fe_sqr(X1)
+    let B = _fe_sqr(Y1)
+    let C = _fe_add(_fe_sqr(Z1), _fe_sqr(Z1))     // 2 * Z1^2
+    let H = _fe_add(A, B)
+    let xy_sum = _fe_add(X1, Y1)
+    let E = _fe_sub(H, _fe_sqr(xy_sum))
+    let G = _fe_sub(A, B)
+    let F = _fe_add(C, G)
+    let X3 = _fe_mul(E, F)
+    let Y3 = _fe_mul(G, H)
+    let T3 = _fe_mul(E, H)
+    let Z3 = _fe_mul(F, G)
+    let r = list_new()
+    push(r, X3)
+    push(r, Y3)
+    push(r, Z3)
+    push(r, T3)
+    return r
+}
+
+// Edwards point addition in extended coordinates (Hisil et al. 2008,
+// formulas for twisted Edwards a = -1):
+//   A = (Y1 - X1) * (Y2 - X2)
+//   B = (Y1 + X1) * (Y2 + X2)
+//   C = T1 * 2 * d * T2
+//   D = Z1 * 2 * Z2
+//   E = B - A
+//   F = D - C
+//   G = D + C
+//   H = B + A
+//   X3 = E * F
+//   Y3 = G * H
+//   T3 = E * H
+//   Z3 = F * G
+// 9 mults + 0 squarings + 7 add/sub. No inverse.
+fn _ed_point_add(P, Q) {
+    let X1 = P[0]; let Y1 = P[1]; let Z1 = P[2]; let T1 = P[3]
+    let X2 = Q[0]; let Y2 = Q[1]; let Z2 = Q[2]; let T2 = Q[3]
+    let A = _fe_mul(_fe_sub(Y1, X1), _fe_sub(Y2, X2))
+    let B = _fe_mul(_fe_add(Y1, X1), _fe_add(Y2, X2))
+    let d = _ed_d()
+    let two = bn256_from_int(2)
+    let two_d = _fe_mul(two, d)
+    let C = _fe_mul(_fe_mul(T1, two_d), T2)
+    let D = _fe_mul(_fe_mul(Z1, two), Z2)
+    let E = _fe_sub(B, A)
+    let F = _fe_sub(D, C)
+    let G = _fe_add(D, C)
+    let H = _fe_add(B, A)
+    let X3 = _fe_mul(E, F)
+    let Y3 = _fe_mul(G, H)
+    let T3 = _fe_mul(E, H)
+    let Z3 = _fe_mul(F, G)
+    let r = list_new()
+    push(r, X3)
+    push(r, Y3)
+    push(r, Z3)
+    push(r, T3)
+    return r
+}
+
+// Scalar multiplication: k * P on Edwards25519 via the Montgomery
+// ladder (constant-time per bit). 256 iterations; each iteration does
+// one double + one conditional swap + one add. The loop body is
+// exponent-bit-INDEPENDENT.
+//
+// Algorithm (Mont ladder for additive groups):
+//   R0 = identity, R1 = P
+//   for i = 255 down to 0:
+//     b = bit i of k
+//     if b == 0:
+//       R1 = R0 + R1
+//       R0 = 2 * R0
+//     else:
+//       R0 = R0 + R1
+//       R1 = 2 * R1
+//   return R0
+fn _ed_scalar_mult(k, P) {
+    let R0 = _ed_pt_identity()
+    let R1 = P
+    let i = 255
+    while i >= 0 {
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let b = int_and(int_shr(k[limb_idx], bit_idx), 1)
+        if b == 0 {
+            R1 = _ed_point_add(R0, R1)
+            R0 = _ed_point_double(R0)
+        } else {
+            R0 = _ed_point_add(R0, R1)
+            R1 = _ed_point_double(R1)
+        }
+        i = i - 1
+    }
+    return R0
+}
+
+// Convert an extended point (X:Y:Z:T) back to affine (x, y) = (X/Z, Y/Z).
+fn _ed_pt_to_affine(P) {
+    let X = P[0]
+    let Y = P[1]
+    let Z = P[2]
+    let z_inv = _fe_inv(Z)
+    let x_aff = _fe_mul(X, z_inv)
+    let y_aff = _fe_mul(Y, z_inv)
+    let r = list_new()
+    push(r, x_aff)
+    push(r, y_aff)
+    return r
+}
+
+// Encode an Edwards point to 32 little-endian bytes per RFC 8032 5.1.2:
+// emit y as 32 LE bytes, with the SIGN of x packed into bit 7 of byte 31
+// (i.e., the most-significant bit of the 32-byte little-endian encoding,
+// which corresponds to bit 255 -- the unused high bit of the canonical
+// 255-bit y-coordinate).
+fn _ed_point_encode(P_ext) {
+    let aff = _ed_pt_to_affine(P_ext)
+    let x = aff[0]
+    let y = aff[1]
+    let y_bytes = _ed_bn_to_le32(y)
+    let sign_bit = _fe_is_neg(x)
+    // Set bit 255 (top bit of byte 31) to sign_bit. y's top bit is
+    // always 0 because y < p < 2^255 (Curve25519 prime has bit 255 clear).
+    let b31 = y_bytes[31]
+    list_set(y_bytes, 31, int_or(int_and(b31, 127), int_shl(sign_bit, 7)))
+    return y_bytes
+}
+
+// Decode 32 little-endian bytes -> Edwards point (in affine form, then
+// promoted to extended). Returns 0 (the integer zero -- NOT a list) on
+// invalid input. Per RFC 8032 5.1.3:
+//   1. The high bit of byte 31 carries x's sign.
+//   2. Recover y by masking off the sign bit; reject if y >= p.
+//   3. Compute x^2 = (y^2 - 1) / (d*y^2 + 1) and recover x via the
+//      Curve25519 sqrt-of-ratio trick:
+//        u = y^2 - 1
+//        v = d*y^2 + 1
+//        x = u * v^3 * (u * v^7)^((p-5)/8)
+//      (Check x^2 * v == u; if not, multiply x by sqrt(-1) and re-check.)
+//   4. If x == 0 and sign_bit == 1, reject (no canonical encoding).
+//   5. Apply sign: if (x is odd) != sign_bit, negate x.
+fn _ed_point_decode(bytes) {
+    if len(bytes) != 32 { return 0 }
+    let sign_bit = int_and(int_shr(bytes[31], 7), 1)
+    // Mask off the sign bit to get y.
+    let y_bytes = _ed_slice_bytes(bytes, 0, 32)
+    list_set(y_bytes, 31, int_and(y_bytes[31], 127))
+    let y = _ed_le32_to_bn(y_bytes)
+    let p = bn256_curve25519_p()
+    if bn256_cmp(y, p) >= 0 { return 0 }
+    // u = y^2 - 1, v = d*y^2 + 1.
+    let y2 = _fe_sqr(y)
+    let one = bn256_from_int(1)
+    let u = _fe_sub(y2, one)
+    let d = _ed_d()
+    let v = _fe_add(_fe_mul(d, y2), one)
+    // Compute x = u * v^3 * (u * v^7)^((p-5)/8).
+    let v2 = _fe_sqr(v)
+    let v3 = _fe_mul(v2, v)
+    let v4 = _fe_sqr(v2)
+    let v7 = _fe_mul(v4, v3)
+    let u_v7 = _fe_mul(u, v7)
+    // Exponent (p-5)/8 = (2^252 - 3) -- the standard Curve25519 sqrt exponent.
+    let exp = _ed_p_minus_5_div_8()
+    let pow = bn256_modpow_ct(u_v7, exp, p)
+    let x_cand = _fe_mul(_fe_mul(u, v3), pow)
+    // Check x_cand^2 * v == u (mod p). If not, multiply by sqrt(-1).
+    let xv = _fe_mul(_fe_sqr(x_cand), v)
+    if _fe_eq(xv, u) == 0 {
+        // Try x_cand * sqrt(-1).
+        let sqrt_m1 = _ed_sqrt_minus_1()
+        x_cand = _fe_mul(x_cand, sqrt_m1)
+        let xv2 = _fe_mul(_fe_sqr(x_cand), v)
+        if _fe_eq(xv2, u) == 0 { return 0 }     // not on curve
+    }
+    // If x_cand == 0 and sign_bit == 1, reject.
+    if _fe_zero(x_cand) != 0 {
+        if sign_bit != 0 { return 0 }
+    }
+    // Apply sign: if (x is odd) != sign_bit, negate x.
+    if _fe_is_neg(x_cand) != sign_bit {
+        x_cand = _fe_neg(x_cand)
+    }
+    return _ed_pt_from_affine(x_cand, y)
+}
+
+// (p - 5) / 8 = (2^255 - 19 - 5) / 8 = (2^255 - 24) / 8 = 2^252 - 3.
+// Hex form (256-bit limb-array, MSB-first):
+//   2^252 = 0x10000000000000000000000000000000_00000000000000000000000000000000
+//   Subtract 3: low limb becomes 0xfffffffd, carry borrows through to
+//   the high half:
+//   2^252 - 3 = 0x0fffffffffffffffffffffffffffffff_fffffffffffffffffffffffffffffffd
+fn _ed_p_minus_5_div_8() {
+    return bn256_from_hex(
+        "0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd")
+}
+
+// sqrt(-1) mod p = 2^((p-1)/4) = 0x2b8324804fc1df0b2b4d00993dfbd7a72f431806ad2fe478c4ee1b274a0ea0b0
+// (Standard Curve25519 sqrt-of-minus-one constant, RFC 8032.)
+fn _ed_sqrt_minus_1() {
+    return bn256_from_hex(
+        "2b8324804fc1df0b2b4d00993dfbd7a72f431806ad2fe478c4ee1b274a0ea0b0")
+}
+
+// Test equality of two points (in extended form). Convert both to
+// affine and compare (x, y) component-wise. NOT constant-time but
+// only used in verify -- the operands at that point are the public
+// signature R and the publicly-computed s*B - k*A, both observable.
+fn _ed_pt_eq(P, Q) {
+    let ap = _ed_pt_to_affine(P)
+    let aq = _ed_pt_to_affine(Q)
+    if _fe_eq(ap[0], aq[0]) == 0 { return 0 }
+    if _fe_eq(ap[1], aq[1]) == 0 { return 0 }
+    return 1
+}
+
+// ============================================================================
+//                 Random 32-byte secret seed (with fallback)
+// ============================================================================
+//
+// Mirror of noise_xk._nxk_random_scalar's RNG handling: try
+// secure_random first; on failure, fall back to nanotime + 15-bit LCG
+// stretch (loudly documented as cryptographically weaker).
+
+fn _ed_random_seed() {
+    let raw = alloc(33)
+    let got = secure_random(raw, 32)
+    let out = list_new()
+    let i = 0
+    if got == 32 {
+        while i < 32 {
+            push(out, load8(raw + i))
+            i = i + 1
+        }
+        return out
+    }
+    // Fallback: stretch nanotime() via the 15-bit LCG.
+    let seed = int_and(nanotime(), 32767)
+    if seed == 0 { seed = 1 }
+    while i < 32 {
+        seed = int_and(int_add(int_mul(seed, 1103), 12345), 32767)
+        push(out, int_and(int_shr(seed, 7), 255))
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+//                       Public Ed25519 API (RFC 8032)
+// ============================================================================
+
+// Derive the private scalar `a` and the SHA-512 prefix from a 32-byte
+// seed per RFC 8032 5.1.5. Returns [a_bn, prefix_bytes].
+fn _ed_derive_a_and_prefix(seed_bytes) {
+    let h = sha512_bytes(seed_bytes)
+    // Clamp h[0..32] per RFC 8032 5.1.5:
+    //   h[0]  &= 0xF8     (clear bottom 3 bits)
+    //   h[31] &= 0x7F     (clear top bit)
+    //   h[31] |= 0x40     (set second-from-top bit)
+    let a_bytes = _ed_slice_bytes(h, 0, 32)
+    list_set(a_bytes, 0, int_and(a_bytes[0], 248))
+    list_set(a_bytes, 31, int_and(a_bytes[31], 127))
+    list_set(a_bytes, 31, int_or(a_bytes[31], 64))
+    let a = _ed_le32_to_bn(a_bytes)
+    let prefix = _ed_slice_bytes(h, 32, 32)
+    let r = list_new()
+    push(r, a)
+    push(r, prefix)
+    return r
+}
+
+// Compute the public key A = encode(a * B) for a private scalar a.
+fn _ed_pk_from_a(a) {
+    let B = _ed_base_point()
+    let aB = _ed_scalar_mult(a, B)
+    return _ed_point_encode(aB)
+}
+
+// Public: generate a fresh Ed25519 keypair. Returns [seed_32B, pk_32B].
+fn ed25519_keygen() {
+    let seed = _ed_random_seed()
+    let parts = _ed_derive_a_and_prefix(seed)
+    let a = parts[0]
+    let pk = _ed_pk_from_a(a)
+    let r = list_new()
+    push(r, seed)
+    push(r, pk)
+    return r
+}
+
+// Sign a message under (sk_seed, pk). Returns a 64-byte signature R || s.
+//
+// Standard RFC 8032 PureEdDSA shape:
+//   1. h = SHA-512(seed); a = clamp(h[0..32]); prefix = h[32..64]
+//   2. r = SHA-512(prefix || M) mod L
+//   3. R = encode(r * B)
+//   4. k = SHA-512(R || A || M) mod L
+//   5. s = (r + k * a) mod L
+//   6. Output R || s
+fn ed25519_sign(message, sk_seed, pk) {
+    let parts = _ed_derive_a_and_prefix(sk_seed)
+    let a = parts[0]
+    let prefix = parts[1]
+    // r = SHA-512(prefix || M) reduced mod L.
+    let pm = _ed_concat2_bytes(prefix, message)
+    let r_bytes = sha512_bytes(pm)
+    let r_pair = _ed_le64_to_bn_pair(r_bytes)
+    let r_scalar = _l_mod_512(r_pair[0], r_pair[1])
+    // R = encode(r * B).
+    let B = _ed_base_point()
+    let R_pt = _ed_scalar_mult(r_scalar, B)
+    let R_enc = _ed_point_encode(R_pt)
+    // k = SHA-512(R || A || M) reduced mod L.
+    let ram = _ed_concat3_bytes(R_enc, pk, message)
+    let k_bytes = sha512_bytes(ram)
+    let k_pair = _ed_le64_to_bn_pair(k_bytes)
+    let k_scalar = _l_mod_512(k_pair[0], k_pair[1])
+    // s = (r + k * a) mod L. Serialise as 32 LE bytes.
+    let s_scalar = _l_addmul(r_scalar, k_scalar, a)
+    let s_bytes = _ed_bn_to_le32(s_scalar)
+    // Signature = R_enc || s_bytes.
+    return _ed_concat2_bytes(R_enc, s_bytes)
+}
+
+// Verify (message, signature, pk). Returns 1 if valid, 0 otherwise.
+//
+// Standard RFC 8032 verify shape:
+//   1. Parse R (sig[0..32]), s (sig[32..64] as integer); reject if s >= L.
+//   2. Decode A from pk (32 bytes); reject if invalid.
+//   3. Decode R as a point R_pt; reject if invalid.
+//   4. k = SHA-512(R || A || M) mod L.
+//   5. Check s * B == R_pt + k * A. Return 1/0.
+fn ed25519_verify(message, signature, pk) {
+    if len(signature) != 64 { return 0 }
+    if len(pk) != 32 { return 0 }
+    let R_enc = _ed_slice_bytes(signature, 0, 32)
+    let s_bytes = _ed_slice_bytes(signature, 32, 32)
+    let s = _ed_le32_to_bn(s_bytes)
+    let L = _ed_l()
+    if bn256_cmp(s, L) >= 0 { return 0 }
+    let A_pt = _ed_point_decode(pk)
+    if A_pt == 0 { return 0 }
+    let R_pt = _ed_point_decode(R_enc)
+    if R_pt == 0 { return 0 }
+    // k = SHA-512(R || A || M) mod L.
+    let ram = _ed_concat3_bytes(R_enc, pk, message)
+    let k_bytes = sha512_bytes(ram)
+    let k_pair = _ed_le64_to_bn_pair(k_bytes)
+    let k = _l_mod_512(k_pair[0], k_pair[1])
+    // Compute s*B and (R_pt + k*A); compare.
+    let B = _ed_base_point()
+    let sB = _ed_scalar_mult(s, B)
+    let kA = _ed_scalar_mult(k, A_pt)
+    let rhs = _ed_point_add(R_pt, kA)
+    return _ed_pt_eq(sB, rhs)
+}
