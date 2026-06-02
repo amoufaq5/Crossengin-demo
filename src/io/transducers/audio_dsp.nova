@@ -1,0 +1,622 @@
+// CrossEngin io/transducers: classical DSP effects -- Schroeder reverb and
+// noise gate / compressor (R14E).
+//
+// Closes the audio-effects leg next to R12D PSOLA pitch/time and R13D voice
+// cloning: integer-only Schroeder 1962 reverb (4 parallel comb filters into
+// 2 series allpass filters), a level-dependent noise gate with smoothed
+// attack/release ramps (no clicks), and the symmetric compressor (gate
+// inverted -- attenuates above threshold rather than below).
+//
+// All arithmetic is integer; gains are expressed in milli (1000 = unity).
+// Delay lines are ring buffers of int16 PCM samples (negatives preserved
+// natively as NOVA 64-bit ints, clipped on output to signed 16-bit range).
+//
+// Algorithm:
+//   1. Schroeder reverb (Manfred Schroeder, "Natural-Sounding Artificial
+//      Reverberation", JAES 1962): 4 parallel comb filters (different prime
+//      delay lengths and gains) summed into 2 cascaded allpass filters
+//      (delay lengths 1051 / 357 @ 16 kHz, fixed gain 0.7). Output is
+//      mixed with the dry signal: out = wet*wet_signal + (1000-wet)*dry.
+//   2. Noise gate: 30 ms RMS envelope -> compare against THRESHOLD (milli
+//      of full-scale, 32767). Below threshold, attenuate by RATIO. Crossing
+//      threshold ramps gain over ATTACK_MS (open) / RELEASE_MS (close)
+//      milliseconds to avoid clicks. ratio=1000 -> hard gate (full mute);
+//      ratio=500 -> 2:1 below threshold.
+//   3. Compressor: same envelope, inverted -- when envelope >= threshold
+//      attenuate by ratio. Useful for taming loud peaks after the reverb.
+//
+// Caps: PCM length <= 480000 samples (30 s @ 16 kHz), matching R12D.
+//
+// ADRs: ADR-0014 (audio manipulation leg).
+// Deps: audio_capture.nova (WAV round-trip), audio_synth.nova (write_wav).
+
+import "audio_capture.nova"
+
+let DSP_RATE_MIN = 8000
+let DSP_RATE_MAX = 48000
+let DSP_MAX_SAMPLES = 480000
+
+// ---- Schroeder reverb constants ------------------------------------------
+//
+// Delay lengths scaled FROM the canonical 16 kHz reference at runtime:
+// length(at sr) = ref_length * sr / 16000. Reference values from Schroeder's
+// original paper (and the Freeverb/Schroeder-CCRMA prime tables), tuned
+// for a small-room impulse response of ~300 ms decay at gain 0.8:
+//
+//   comb delays @ 16 kHz: 5963, 4998, 4327, 3911  (primes -> coloration-free)
+//   allpass delays      : 1051,  357                (mutually prime, fixed g=0.7)
+//
+// Comb gains scale with room_size_milli (room=600 milli == default):
+//   g_i = base_i * room_size_milli / 1000
+// Base gains chosen so g_eff <= 950 milli at room=1000 (decay never quite
+// unitary, so the IR is bounded).
+
+let DSP_REVERB_COMB_DELAY_0 = 5963
+let DSP_REVERB_COMB_DELAY_1 = 4998
+let DSP_REVERB_COMB_DELAY_2 = 4327
+let DSP_REVERB_COMB_DELAY_3 = 3911
+let DSP_REVERB_COMB_GAIN_BASE_0 = 822
+let DSP_REVERB_COMB_GAIN_BASE_1 = 802
+let DSP_REVERB_COMB_GAIN_BASE_2 = 773
+let DSP_REVERB_COMB_GAIN_BASE_3 = 753
+let DSP_REVERB_ALLPASS_DELAY_0 = 1051
+let DSP_REVERB_ALLPASS_DELAY_1 = 357
+let DSP_REVERB_ALLPASS_GAIN_MILLI = 700
+let DSP_REVERB_TAIL_MS = 400           // append zero-padded tail for decay
+let DSP_REVERB_REF_RATE = 16000
+
+let DSP_REVERB_WET_DEFAULT = 300
+let DSP_REVERB_ROOM_DEFAULT = 600
+let DSP_REVERB_MIX_MIN = 0
+let DSP_REVERB_MIX_MAX = 1000
+let DSP_REVERB_ROOM_MIN = 100          // very small box
+let DSP_REVERB_ROOM_MAX = 1000         // cathedral-ish
+
+// ---- Noise gate / compressor constants ------------------------------------
+
+let DSP_GATE_THRESHOLD_DEFAULT = 100   // 10% of full-scale (~3275 of 32767)
+let DSP_GATE_RATIO_DEFAULT = 1000      // hard gate
+let DSP_GATE_ATTACK_MS_DEFAULT = 5
+let DSP_GATE_RELEASE_MS_DEFAULT = 50
+let DSP_GATE_RMS_WINDOW_MS = 30
+let DSP_GATE_RATIO_MIN = 0
+let DSP_GATE_RATIO_MAX = 1000
+let DSP_GATE_THRESHOLD_MIN = 0
+let DSP_GATE_THRESHOLD_MAX = 1000
+let DSP_GATE_ATTACK_MIN = 1
+let DSP_GATE_ATTACK_MAX = 500
+let DSP_GATE_RELEASE_MIN = 1
+let DSP_GATE_RELEASE_MAX = 5000
+let DSP_FULL_SCALE = 32767
+
+// ---- public constant accessors -------------------------------------------
+
+fn dsp_reverb_wet_default()      { return DSP_REVERB_WET_DEFAULT }
+fn dsp_reverb_room_default()     { return DSP_REVERB_ROOM_DEFAULT }
+fn dsp_gate_threshold_default()  { return DSP_GATE_THRESHOLD_DEFAULT }
+fn dsp_gate_ratio_default()      { return DSP_GATE_RATIO_DEFAULT }
+fn dsp_gate_attack_ms_default()  { return DSP_GATE_ATTACK_MS_DEFAULT }
+fn dsp_gate_release_ms_default() { return DSP_GATE_RELEASE_MS_DEFAULT }
+fn dsp_max_samples()             { return DSP_MAX_SAMPLES }
+fn dsp_reverb_tail_ms()          { return DSP_REVERB_TAIL_MS }
+fn dsp_full_scale()              { return DSP_FULL_SCALE }
+
+// ---- helpers --------------------------------------------------------------
+
+fn _dsp_clamp_rate(sample_rate) {
+    let r = sample_rate
+    if r < DSP_RATE_MIN { r = DSP_RATE_MIN }
+    if r > DSP_RATE_MAX { r = DSP_RATE_MAX }
+    return r
+}
+
+fn _dsp_clamp(v, lo, hi) {
+    let x = v
+    if x < lo { x = lo }
+    if x > hi { x = hi }
+    return x
+}
+
+// int_lt / int_gt: scalar-only comparison wrappers. NOVA's smart `<` and
+// `>` operators dispatch to _nova_strcmp when either operand exceeds
+// the pointer threshold (1 MB), which segfaults on our intermediate
+// audio-product values (~1e9 for v*v, ~3e7 for wet*pcm). Reading the
+// sign bit of (a - b) via the arithmetic-shift builtin int_shr keeps
+// every binop scalar. See NOVA_BUG_THRESHOLD.md.
+fn int_lt(a, b) {
+    let d = int_sub(a, b)
+    let sign = int_shr(d, 63)
+    if sign == 0 { return 0 }
+    return 1
+}
+
+fn int_gt(a, b) {
+    return int_lt(b, a)
+}
+
+fn _dsp_scale_delay(ref_len, sample_rate) {
+    // Scale a reference delay (designed for 16 kHz) to the working rate.
+    // Integer-only: (ref * sr) / 16000, with a floor of 1 sample so very
+    // low rates don't collapse a delay line to zero length.
+    let d = (ref_len * sample_rate) / DSP_REVERB_REF_RATE
+    if d < 1 { d = 1 }
+    return d
+}
+
+fn _dsp_zero_buf(n) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        push(b, 0)
+        i = i + 1
+    }
+    return b
+}
+
+fn _dsp_clip_pcm16(v) {
+    let x = v
+    // v can be a pre-mix product up to ~3e7 -- well past NOVA's 1 MB
+    // smart-op threshold -- so we route the comparisons through int_lt
+    // / int_gt (see NOVA_BUG_THRESHOLD.md and the int_lt helper below).
+    if int_gt(x, DSP_FULL_SCALE) == 1 { x = DSP_FULL_SCALE }
+    let neg_floor = 0 - DSP_FULL_SCALE - 1
+    if int_lt(x, neg_floor) == 1 { x = neg_floor }
+    return x
+}
+
+// ---- Schroeder reverb -----------------------------------------------------
+//
+// dsp_reverb(pcm, sample_rate, wet_mix_milli, room_size_milli) -> reverbed
+//
+// Returns a new PCM list of length len(pcm) + tail_samples, where the tail
+// is DSP_REVERB_TAIL_MS @ sample_rate (400 ms by default at 16 kHz = 6400
+// samples). The tail carries the comb-filter decay past the input length so
+// callers hear the room ring out -- without it, a click at the input's
+// final sample chops the IR mid-decay.
+//
+// wet_mix_milli of 0 returns the dry input (padded with zeros for the tail),
+// 1000 returns the pure wet signal, defaults split 30% wet / 70% dry.
+
+fn dsp_reverb(pcm, sample_rate, wet_mix_milli, room_size_milli) {
+    let n = len(pcm)
+    if n <= 0 { return list_new() }
+    if n > DSP_MAX_SAMPLES { return list_new() }
+    let sr = _dsp_clamp_rate(sample_rate)
+    let wet = _dsp_clamp(wet_mix_milli, DSP_REVERB_MIX_MIN, DSP_REVERB_MIX_MAX)
+    let room = _dsp_clamp(room_size_milli, DSP_REVERB_ROOM_MIN, DSP_REVERB_ROOM_MAX)
+    let tail_samples = (sr * DSP_REVERB_TAIL_MS) / 1000
+    let out_len = n + tail_samples
+
+    // Comb delay lengths + per-comb gains scaled by room size.
+    let cd0 = _dsp_scale_delay(DSP_REVERB_COMB_DELAY_0, sr)
+    let cd1 = _dsp_scale_delay(DSP_REVERB_COMB_DELAY_1, sr)
+    let cd2 = _dsp_scale_delay(DSP_REVERB_COMB_DELAY_2, sr)
+    let cd3 = _dsp_scale_delay(DSP_REVERB_COMB_DELAY_3, sr)
+    let cg0 = (DSP_REVERB_COMB_GAIN_BASE_0 * room) / 1000
+    let cg1 = (DSP_REVERB_COMB_GAIN_BASE_1 * room) / 1000
+    let cg2 = (DSP_REVERB_COMB_GAIN_BASE_2 * room) / 1000
+    let cg3 = (DSP_REVERB_COMB_GAIN_BASE_3 * room) / 1000
+
+    let ad0 = _dsp_scale_delay(DSP_REVERB_ALLPASS_DELAY_0, sr)
+    let ad1 = _dsp_scale_delay(DSP_REVERB_ALLPASS_DELAY_1, sr)
+    let ag  = DSP_REVERB_ALLPASS_GAIN_MILLI
+
+    // Ring buffers for the 4 combs + 2 allpasses. Write-pointer per buffer.
+    let b0 = _dsp_zero_buf(cd0)
+    let b1 = _dsp_zero_buf(cd1)
+    let b2 = _dsp_zero_buf(cd2)
+    let b3 = _dsp_zero_buf(cd3)
+    let a0 = _dsp_zero_buf(ad0)
+    let a1 = _dsp_zero_buf(ad1)
+    let p0 = 0
+    let p1 = 0
+    let p2 = 0
+    let p3 = 0
+    let pa0 = 0
+    let pa1 = 0
+    let dry_complement = 1000 - wet
+    let out = list_new()
+    let t = 0
+    while t < out_len {
+        let x = 0
+        if t < n { x = pcm[t] }
+
+        // Each comb: y[n] = delayed + g * y[n-D]; emit delayed, then store
+        // (x + g * delayed) back into the ring buffer (feedback comb).
+        let d0 = b0[p0]
+        let d1 = b1[p1]
+        let d2 = b2[p2]
+        let d3 = b3[p3]
+        let new0 = x + (cg0 * d0) / 1000
+        let new1 = x + (cg1 * d1) / 1000
+        let new2 = x + (cg2 * d2) / 1000
+        let new3 = x + (cg3 * d3) / 1000
+        // Clip ring-buffer writes to PCM16 range so a runaway feedback
+        // gain (room=1000) can't ladder into 7-digit ints over a long tail.
+        list_set(b0, p0, _dsp_clip_pcm16(new0))
+        list_set(b1, p1, _dsp_clip_pcm16(new1))
+        list_set(b2, p2, _dsp_clip_pcm16(new2))
+        list_set(b3, p3, _dsp_clip_pcm16(new3))
+        p0 = p0 + 1
+        if p0 >= cd0 { p0 = 0 }
+        p1 = p1 + 1
+        if p1 >= cd1 { p1 = 0 }
+        p2 = p2 + 1
+        if p2 >= cd2 { p2 = 0 }
+        p3 = p3 + 1
+        if p3 >= cd3 { p3 = 0 }
+
+        // Sum the four comb outputs (the parallel bank). We do NOT divide
+        // by 4 here: real Schroeder structures lean on the post-allpass
+        // mix gain (wet_milli) for headroom control. Dividing here would
+        // collapse the IR for an impulse input (each comb fires sparsely
+        // at its own delay; their sum is rarely 4x).
+        let comb_sum = d0 + d1 + d2 + d3
+
+        // Allpass 0: y[n] = -g*x[n] + delayed + g*(delayed_feedback). We use
+        // the standard Schroeder allpass: y[n] = -g*x[n] + buf[n-D];
+        // buf[n] = x[n] + g*y[n] -- which produces flat magnitude / phase
+        // dispersion (the "diffuse" character of the late reverb).
+        let buf0 = a0[pa0]
+        let y0 = (0 - ag) * comb_sum / 1000 + buf0
+        let store0 = comb_sum + (ag * y0) / 1000
+        list_set(a0, pa0, _dsp_clip_pcm16(store0))
+        pa0 = pa0 + 1
+        if pa0 >= ad0 { pa0 = 0 }
+
+        let buf1 = a1[pa1]
+        let y1 = (0 - ag) * y0 / 1000 + buf1
+        let store1 = y0 + (ag * y1) / 1000
+        list_set(a1, pa1, _dsp_clip_pcm16(store1))
+        pa1 = pa1 + 1
+        if pa1 >= ad1 { pa1 = 0 }
+
+        // Mix wet/dry and clip to PCM16. Both wet*y1 and dry*x can be
+        // ~3e7 (> NOVA's 1 MB smart-op threshold), so the inner `+`
+        // must go through int_add to avoid dispatching to _nova_concat.
+        let wet_part = int_mul(wet, y1)
+        let dry_part = int_mul(dry_complement, x)
+        let mixed = int_div(int_add(wet_part, dry_part), 1000)
+        push(out, _dsp_clip_pcm16(mixed))
+        t = t + 1
+    }
+    return out
+}
+
+// ---- Noise gate envelope --------------------------------------------------
+//
+// RMS envelope over a 30 ms sliding window. Integer-only: maintain a
+// running sum-of-squares over the window, divide by window size, take an
+// integer square root. The output is sample-aligned with the input. To
+// avoid burning CPU on a real sqrt per sample, we sqrt the mean-square
+// directly (Newton's method, ~10 iterations) since we need its absolute
+// magnitude in PCM16 units.
+
+fn _dsp_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 4 { return 1 }
+    let x = n
+    let y = int_div(int_add(x, 1), 2)
+    let i = 0
+    // Bounded loop: classic Newton iteration converges in ~log2(n) steps;
+    // 32 is overkill for any 64-bit value but cheap. We use int_* for
+    // every binop here because n can be ~1e12 (sum-of-squares of a
+    // PCM16 buffer), well above NOVA's smart-op pointer threshold
+    // (1 MB) -- the smart `<`, `+`, `*` operators would dispatch to
+    // string runtime helpers and segfault. See NOVA_BUG_THRESHOLD.md.
+    while int_lt(y, x) == 1 && i < 32 {
+        x = y
+        y = int_div(int_add(x, int_div(n, x)), 2)
+        i = i + 1
+    }
+    return x
+}
+
+
+fn _dsp_abs(v) {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// Compute one envelope sample at position `i` over a back-window of `win`
+// samples. Returns RMS amplitude in PCM16 units. Used by both gate and
+// compressor.
+fn _dsp_envelope_at(pcm, i, win) {
+    let n = len(pcm)
+    let lo = i - win + 1
+    if lo < 0 { lo = 0 }
+    let hi = i + 1
+    if hi > n { hi = n }
+    let cnt = hi - lo
+    if cnt <= 0 { return 0 }
+    let sum_sq = 0
+    let k = lo
+    while k < hi {
+        let v = pcm[k]
+        // PCM16 squared is ~1e9, sum_sq across a 30 ms window is up to
+        // ~5e11 -- both above NOVA's 1 MB smart-op threshold. Use int_*
+        // so the smart `+`/`*` don't dispatch to string-runtime crashes
+        // (NOVA_BUG_THRESHOLD.md).
+        sum_sq = int_add(sum_sq, int_mul(v, v))
+        k = k + 1
+    }
+    let mean_sq = int_div(sum_sq, cnt)
+    return _dsp_isqrt(mean_sq)
+}
+
+// Compute the target gain in milli for a given envelope sample, given the
+// threshold, ratio, and full-scale conversion. Below threshold the gate
+// attenuates to (1000 - ratio) milli (ratio=1000 -> fully muted,
+// ratio=500 -> 2:1 / -6 dB). At or above threshold the gain is 1000 (unity).
+fn _dsp_gate_target_gain(envelope, threshold_units, ratio) {
+    if envelope >= threshold_units { return 1000 }
+    let cut = 1000 - ratio
+    if cut < 0 { cut = 0 }
+    return cut
+}
+
+fn _dsp_compressor_target_gain(envelope, threshold_units, ratio) {
+    if envelope < threshold_units { return 1000 }
+    let cut = 1000 - ratio
+    if cut < 0 { cut = 0 }
+    return cut
+}
+
+// dsp_noise_gate(pcm, sample_rate, threshold_milli, ratio_milli,
+//                attack_ms, release_ms) -> gated_pcm
+//
+// Attenuates samples whose 30 ms RMS envelope falls below `threshold_milli`
+// fraction of full-scale (1000 = full PCM16 peak). When the gate state
+// changes, the gain ramps linearly over attack_ms (open) or release_ms
+// (close) instead of switching instantly -- this avoids click artifacts at
+// the start/end of utterances.
+
+fn dsp_noise_gate(pcm, sample_rate, threshold_milli, ratio_milli, attack_ms, release_ms) {
+    let n = len(pcm)
+    if n <= 0 { return list_new() }
+    if n > DSP_MAX_SAMPLES { return list_new() }
+    let sr = _dsp_clamp_rate(sample_rate)
+    let thr_m = _dsp_clamp(threshold_milli, DSP_GATE_THRESHOLD_MIN, DSP_GATE_THRESHOLD_MAX)
+    let ratio = _dsp_clamp(ratio_milli, DSP_GATE_RATIO_MIN, DSP_GATE_RATIO_MAX)
+    let att = _dsp_clamp(attack_ms, DSP_GATE_ATTACK_MIN, DSP_GATE_ATTACK_MAX)
+    let rel = _dsp_clamp(release_ms, DSP_GATE_RELEASE_MIN, DSP_GATE_RELEASE_MAX)
+    let thr_units = (thr_m * DSP_FULL_SCALE) / 1000
+    let win = (sr * DSP_GATE_RMS_WINDOW_MS) / 1000
+    if win < 1 { win = 1 }
+    let att_samples = (sr * att) / 1000
+    if att_samples < 1 { att_samples = 1 }
+    let rel_samples = (sr * rel) / 1000
+    if rel_samples < 1 { rel_samples = 1 }
+    let out = list_new()
+    // Initial gain = closed (worst case) if first envelope is below; the
+    // attack ramp opens it. Init from the first sample's envelope so the
+    // start isn't always shut.
+    let env0 = _dsp_envelope_at(pcm, 0, win)
+    let cur_gain = _dsp_gate_target_gain(env0, thr_units, ratio)
+    let i = 0
+    while i < n {
+        let env = _dsp_envelope_at(pcm, i, win)
+        let target = _dsp_gate_target_gain(env, thr_units, ratio)
+        // Ramp toward target with attack or release step size.
+        if target > cur_gain {
+            let step = (target - (0 - (0 - cur_gain))) / att_samples + 1
+            // Linear ramp: (1000 - cur_cut) over att_samples; we just step
+            // by ceil((target - cur) / att_samples).
+            let diff = target - cur_gain
+            let inc = diff / att_samples
+            if inc < 1 { inc = 1 }
+            cur_gain = cur_gain + inc
+            if cur_gain > target { cur_gain = target }
+        } else {
+            if target < cur_gain {
+                let diff = cur_gain - target
+                let dec = diff / rel_samples
+                if dec < 1 { dec = 1 }
+                cur_gain = cur_gain - dec
+                if cur_gain < target { cur_gain = target }
+            }
+        }
+        let v = pcm[i]
+        let gated = (v * cur_gain) / 1000
+        push(out, _dsp_clip_pcm16(gated))
+        i = i + 1
+    }
+    return out
+}
+
+// dsp_compressor(pcm, sample_rate, threshold_milli, ratio_milli, attack_ms,
+//                release_ms) -> compressed_pcm
+//
+// Inverse of the gate: attenuates samples whose RMS envelope is at or
+// ABOVE threshold (ratio=1000 -> hard limiter; ratio=500 -> 2:1 above
+// threshold). Same smoothed attack/release semantics. Useful for taming
+// the reverb output before mixing back into the dry signal.
+
+fn dsp_compressor(pcm, sample_rate, threshold_milli, ratio_milli, attack_ms, release_ms) {
+    let n = len(pcm)
+    if n <= 0 { return list_new() }
+    if n > DSP_MAX_SAMPLES { return list_new() }
+    let sr = _dsp_clamp_rate(sample_rate)
+    let thr_m = _dsp_clamp(threshold_milli, DSP_GATE_THRESHOLD_MIN, DSP_GATE_THRESHOLD_MAX)
+    let ratio = _dsp_clamp(ratio_milli, DSP_GATE_RATIO_MIN, DSP_GATE_RATIO_MAX)
+    let att = _dsp_clamp(attack_ms, DSP_GATE_ATTACK_MIN, DSP_GATE_ATTACK_MAX)
+    let rel = _dsp_clamp(release_ms, DSP_GATE_RELEASE_MIN, DSP_GATE_RELEASE_MAX)
+    let thr_units = (thr_m * DSP_FULL_SCALE) / 1000
+    let win = (sr * DSP_GATE_RMS_WINDOW_MS) / 1000
+    if win < 1 { win = 1 }
+    let att_samples = (sr * att) / 1000
+    if att_samples < 1 { att_samples = 1 }
+    let rel_samples = (sr * rel) / 1000
+    if rel_samples < 1 { rel_samples = 1 }
+    let out = list_new()
+    let env0 = _dsp_envelope_at(pcm, 0, win)
+    let cur_gain = _dsp_compressor_target_gain(env0, thr_units, ratio)
+    let i = 0
+    while i < n {
+        let env = _dsp_envelope_at(pcm, i, win)
+        let target = _dsp_compressor_target_gain(env, thr_units, ratio)
+        if target > cur_gain {
+            let diff = target - cur_gain
+            let inc = diff / rel_samples
+            if inc < 1 { inc = 1 }
+            cur_gain = cur_gain + inc
+            if cur_gain > target { cur_gain = target }
+        } else {
+            if target < cur_gain {
+                let diff = cur_gain - target
+                let dec = diff / att_samples
+                if dec < 1 { dec = 1 }
+                cur_gain = cur_gain - dec
+                if cur_gain < target { cur_gain = target }
+            }
+        }
+        let v = pcm[i]
+        let comp = (v * cur_gain) / 1000
+        push(out, _dsp_clip_pcm16(comp))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- chat dispatch helpers ------------------------------------------------
+
+fn _dsp_int_to_str(n) {
+    if n == 0 { return "0" }
+    let neg = 0
+    let v = n
+    if v < 0 { neg = 1; v = 0 - v }
+    let out = ""
+    while v > 0 {
+        let d = v - (v / 10) * 10
+        out = chr(48 + d) + out
+        v = v / 10
+    }
+    if neg == 1 { out = "-" + out }
+    return out
+}
+
+fn _dsp_parse_int(s, fallback) {
+    if len(s) == 0 { return fallback }
+    let n = len(s)
+    let i = 0
+    let acc = 0
+    let any = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 48 && c <= 57 {
+            acc = acc * 10 + (c - 48)
+            any = 1
+        } else {
+            i = n
+        }
+        i = i + 1
+    }
+    if any == 0 { return fallback }
+    return acc
+}
+
+// Compute RMS of a PCM buffer as a single int (used by the chat command
+// to report a "before/after" diagnostic without forcing the caller to
+// re-run the envelope at every sample).
+fn dsp_rms(pcm) {
+    let n = len(pcm)
+    if n <= 0 { return 0 }
+    let sum_sq = 0
+    let i = 0
+    // PCM16 squared is ~1e9, well above NOVA's 1 MB pointer threshold
+    // (NOVA_BUG_THRESHOLD.md). Use int_mul / int_add so the smart
+    // operators don't dispatch to the string concat helper and crash.
+    while i < n {
+        let v = pcm[i]
+        sum_sq = int_add(sum_sq, int_mul(v, v))
+        i = i + 1
+    }
+    return _dsp_isqrt(int_div(sum_sq, n))
+}
+
+// dsp_run_reverb_command(arg) -> diagnostic string for /reverb <wav> [wet]
+//
+// Loads the WAV at the given path, applies the reverb with the supplied
+// wet-mix (default 300 milli), writes the result to <path>.reverb.wav,
+// and reports input/output RMS for a quick "is the tail audible" sanity
+// check. Mirrors psola_run_pitch_shift_command's contract.
+
+fn dsp_run_reverb_command(arg) {
+    if len(arg) == 0 {
+        return "(/reverb needs PATH [WET_MILLI] -- usage: /reverb /tmp/x.wav 300)"
+    }
+    let parts = split(arg, " ")
+    let path = ""
+    let wet = DSP_REVERB_WET_DEFAULT
+    if len(parts) >= 1 { path = str_trim(parts[0]) }
+    if len(parts) >= 2 {
+        wet = _dsp_parse_int(str_trim(parts[1]), DSP_REVERB_WET_DEFAULT)
+    }
+    if len(path) == 0 {
+        return "(/reverb needs PATH [WET_MILLI] -- usage: /reverb /tmp/x.wav 300)"
+    }
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(reverb FAILED: could not parse WAV at " + path + ")"
+    }
+    if sr <= 0 {
+        return "(reverb FAILED: invalid sample rate in WAV at " + path + ")"
+    }
+    let out = dsp_reverb(pcm, sr, wet, DSP_REVERB_ROOM_DEFAULT)
+    if len(out) == 0 {
+        return "(reverb FAILED: empty output -- input over cap?)"
+    }
+    let in_rms  = dsp_rms(pcm)
+    let out_rms = dsp_rms(out)
+    let out_path = path + ".reverb.wav"
+    return "(reverb " + path
+        + ": wet=" + _dsp_int_to_str(wet) + " milli"
+        + ", input=" + _dsp_int_to_str(len(pcm)) + " samples rms=" + _dsp_int_to_str(in_rms)
+        + ", output=" + _dsp_int_to_str(len(out)) + " samples rms=" + _dsp_int_to_str(out_rms)
+        + " @ " + _dsp_int_to_str(sr) + " Hz -> " + out_path + ")"
+}
+
+// dsp_run_gate_command(arg) -> diagnostic string for /gate <wav> [threshold]
+//
+// Symmetric to the reverb command above. Writes to <path>.gate.wav and
+// reports RMS before/after so the caller can verify floor attenuation.
+
+fn dsp_run_gate_command(arg) {
+    if len(arg) == 0 {
+        return "(/gate needs PATH [THRESHOLD_MILLI] -- usage: /gate /tmp/x.wav 100)"
+    }
+    let parts = split(arg, " ")
+    let path = ""
+    let thr = DSP_GATE_THRESHOLD_DEFAULT
+    if len(parts) >= 1 { path = str_trim(parts[0]) }
+    if len(parts) >= 2 {
+        thr = _dsp_parse_int(str_trim(parts[1]), DSP_GATE_THRESHOLD_DEFAULT)
+    }
+    if len(path) == 0 {
+        return "(/gate needs PATH [THRESHOLD_MILLI] -- usage: /gate /tmp/x.wav 100)"
+    }
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(gate FAILED: could not parse WAV at " + path + ")"
+    }
+    if sr <= 0 {
+        return "(gate FAILED: invalid sample rate in WAV at " + path + ")"
+    }
+    let out = dsp_noise_gate(pcm, sr, thr, DSP_GATE_RATIO_DEFAULT,
+                             DSP_GATE_ATTACK_MS_DEFAULT, DSP_GATE_RELEASE_MS_DEFAULT)
+    if len(out) == 0 {
+        return "(gate FAILED: empty output -- input over cap?)"
+    }
+    let in_rms  = dsp_rms(pcm)
+    let out_rms = dsp_rms(out)
+    let out_path = path + ".gate.wav"
+    return "(gate " + path
+        + ": threshold=" + _dsp_int_to_str(thr) + " milli"
+        + ", input=" + _dsp_int_to_str(len(pcm)) + " samples rms=" + _dsp_int_to_str(in_rms)
+        + ", output=" + _dsp_int_to_str(len(out)) + " samples rms=" + _dsp_int_to_str(out_rms)
+        + " @ " + _dsp_int_to_str(sr) + " Hz -> " + out_path + ")"
+}

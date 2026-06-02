@@ -11,7 +11,40 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
+> toolchain. R14E adds `src/io/transducers/audio_dsp.nova` — classical DSP
+> effects (Schroeder 1962 reverb + level-dependent noise gate + symmetric
+> compressor), closing the *effects* leg of the audio chain next to R6E
+> synth, R7F/R9B VAD, R8B/R10B STT, R10F/R11B pitch, R12D PSOLA, and
+> R13D voice cloning. Reverb is the textbook Schroeder structure: 4
+> parallel feedback comb filters (delays {5963, 4998, 4327, 3911}
+> scaled to working sample rate from the 16 kHz reference) into 2
+> cascaded allpass filters (delays {1051, 357}, fixed gain 0.7), mixed
+> with the dry signal as `(wet * wet_signal + (1000 - wet) * dry) / 1000`
+> in millis. Output is `len(pcm) + 400ms * sr / 1000` samples so the
+> IR rings out cleanly past the input. The noise gate computes a 30 ms
+> RMS envelope; below threshold it attenuates by `ratio_milli`
+> (1000 = hard gate, 500 = 2:1) with linear attack/release ramps
+> (default 5 ms / 50 ms) so the gain change at the threshold crossing
+> doesn't click. The compressor inverts that: it attenuates ABOVE
+> threshold, useful for taming the loud peaks of a `room=1000` reverb.
+> All integer arithmetic; ring buffers for delay lines; PCM16 per-sample
+> clipping. **Reverb impulse response (impulse at sample 0, 4000-sample
+> input @ 8 kHz, wet=1000, room=800): 7200 output samples, 610 non-zero
+> in the tail past the input** (the IR decay); first comb spike at
+> sample 1955. **Noise-gate attenuation on a 400-PCM16 square wave below
+> the default 100 milli threshold: input RMS 400 -> output RMS 0** (full
+> -inf-dB attenuation when `ratio_milli=1000`). Hardest engineering
+> problem was NOT the DSP -- the sum-of-squares envelope reaches ~1e12
+> and the reverb's wet/dry mix product hits ~3e7, both well above
+> NOVA's 1 MB smart-op pointer-threshold bug (`NOVA_BUG_THRESHOLD.md`).
+> Workaround: route the affected binops through `int_mul`, `int_add`,
+> `int_sub`, `int_div`, `int_shr`, and a sign-bit `int_lt` helper that
+> stays scalar even when both operands are huge. New chat admins:
+> `/reverb PATH [WET_MILLI]` (writes `<PATH>.reverb.wav`, reports
+> input/output RMS) and `/gate PATH [THRESHOLD_MILLI]` (writes
+> `<PATH>.gate.wav`, same diagnostic). 34 unit assertions + 23
+> integration assertions; all green. All R6E/R7F/R9B/R8B/R10F/R11B/
+> R12D/R13D audio tests pass unchanged. R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
 > Ed25519 digital-signature primitive on top of the existing `bn256_*`
 > Montgomery REDC stack, closing the signature gap in the crypto suite
 > (alongside ChaCha20-Poly1305 AEAD, Curve25519/G14 DH, Noise XK mutual

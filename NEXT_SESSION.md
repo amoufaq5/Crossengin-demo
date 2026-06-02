@@ -6745,3 +6745,76 @@ NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_x_doctor.sh
 NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_y_json_logs.sh
 NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_z_snap_diff.sh
 ```
+
+## R14E -- Classical DSP effects (Schroeder reverb + noise gate / compressor)
+
+**Module:** `src/io/transducers/audio_dsp.nova` (~590 lines)
+**Tests:** `tests/unit/test_audio_dsp.nova` (34 assertions),
+          `tests/integration/scenario_hhh_dsp.sh` (23 assertions)
+**Chat:** `/reverb PATH [WET]` and `/gate PATH [THR]`
+
+Round 14E closes the classical-DSP-effects leg of the audio chain. R6E
+provides the Klatt source, R10F/R11B extract pitch, R12D handles
+TD-PSOLA pitch shifting and time stretching, R13D clones voices via LPC
+formant transfer. R14E adds **room acoustics** (Schroeder reverb) and
+**dynamics** (noise gate + symmetric compressor) so the chain has an
+end-to-end professional path: synth -> manipulate -> shape -> output.
+
+Three public entry points, all integer arithmetic with millis for gains
+(1000 = unity), all delay lines as ring buffers of int16 PCM:
+
+- `dsp_reverb(pcm, sample_rate, wet_mix_milli, room_size_milli)` --
+  4 parallel feedback comb filters (delays {5963, 4998, 4327, 3911}
+  scaled to working sample rate from the 16 kHz reference) into 2
+  cascaded allpass filters (delays {1051, 357}, fixed gain 0.7). Mixed
+  with the dry signal via `(wet*wet + (1000-wet)*dry) / 1000`. Output
+  is `len(pcm) + 400ms*sr/1000` samples so the IR rings out cleanly past
+  the input. Defaults: wet=300 (30% wet), room=600.
+- `dsp_noise_gate(pcm, sample_rate, threshold_milli, ratio_milli,
+   attack_ms, release_ms)` -- 30 ms RMS envelope compared against
+   `threshold_milli * full_scale / 1000`. Below threshold, attenuates to
+   `(1000 - ratio_milli)` milli gain. Linear attack/release ramps over
+   `attack_ms` / `release_ms` (default 5 ms / 50 ms) eliminate clicks.
+   `ratio=1000` -> hard gate; `threshold=0` -> always open.
+- `dsp_compressor(pcm, ...)` -- symmetric inverse: attenuates ABOVE
+   threshold. Useful for taming the loud tail of a `room=1000` reverb.
+
+R14E's hardest engineering problem was NOT the DSP -- the integer
+arithmetic for sum-of-squares (envelope) and the wet/dry mix triggered
+**NOVA's known smart-op pointer-threshold bug**
+(`NOVA_BUG_THRESHOLD.md`): when both operands of `+`, `*`, `<`, `>`,
+`==` exceed `0x100000` (1 MB), the smart helper dispatches to
+`_nova_concat` / `_nova_strcmp` and crashes. Audio sum-of-squares
+reaches ~1e12 (well above the 1 MB threshold); a single intermediate
+reverb product `wet * y1` hits ~3e7. The workaround threaded through
+the module: route the relevant binops through the blessed scalar
+builtins (`int_mul`, `int_add`, `int_sub`, `int_div`, `int_shr`), and
+add an `int_lt` helper that reads the sign bit of `int_sub(a, b)`
+arithmetically shifted right by 63 to avoid the smart `<` dispatch.
+
+Chat wiring (2 dispatch lines + 2 help lines in `crossengin_chat.nova`):
+
+```
+/reverb PATH [WET]   wet=300 milli default; writes <PATH>.reverb.wav, reports RMS
+/gate   PATH [THR]   threshold=100 milli default; writes <PATH>.gate.wav, reports RMS
+```
+
+Verification snapshot (latest run):
+
+- 34 unit assertions, 23 integration assertions, all PASS
+- 170/170 unit tests + scenario_aaa_psola + scenario_ddd_voice_clone
+  still pass
+- Reverb impulse response (4000-sample input @ 8 kHz, wet=1000,
+  room=800): 7200 output samples, **610 non-zero in the tail past the
+  input** (the IR decay); first comb spike at sample 1955
+- Noise-gate attenuation on a 400 PCM16 square wave (below the default
+  100 milli threshold): input RMS 400 -> output RMS 0 (effectively -inf dB)
+
+Verify locally:
+
+```sh
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_audio_dsp.nova
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_hhh_dsp.sh
+NOVA_ROOT=/home/user/NOVA make install   # rebuild chat for /reverb + /gate
+echo '/help' | ./bin/crossengin-chat | grep R14E
+```

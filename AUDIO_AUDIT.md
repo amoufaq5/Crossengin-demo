@@ -1211,3 +1211,106 @@ spaced >= 500 Hz apart) at ~80 evaluations per frame at 8 kHz.
   trajectory tracked from the reference); cross-rate analysis (do
   LPC at 16 kHz on a 16 kHz reference and downsample formants to
   R6E's 8 kHz synth).
+
+## R14E -- Classical DSP effects (Schroeder reverb + noise gate / compressor)
+
+Module: `src/io/transducers/audio_dsp.nova` (~590 lines)
+Tests: `tests/unit/test_audio_dsp.nova` (34 assertions),
+       `tests/integration/scenario_hhh_dsp.sh` (23 assertions)
+Chat:  `/reverb PATH [WET]` and `/gate PATH [THR]`
+
+R14E closes the **effects** leg of the audio chain: synth (R6E) ->
+PSOLA pitch/time (R12D) -> voice cloning (R13D) -> **DSP effects (R14E)**
+-> output. Three independent transforms, all integer-only, all using
+ring-buffered delay lines and millis for gains (1000 = unity):
+
+1. **Schroeder reverb** (`dsp_reverb(pcm, sr, wet_mix_milli, room_size_milli)`)
+   reproduces Manfred Schroeder's 1962 classical reverb structure ("Natural-
+   Sounding Artificial Reverberation", JAES). The signal flow:
+
+       pcm -> [comb_0]  -+
+              [comb_1]  -+--+--> [allpass_0] -> [allpass_1] -> wet
+              [comb_2]  -+  |
+              [comb_3]  -+--+
+       wet_signal * wet_milli + dry * (1000 - wet_milli) -> output
+
+   - 4 parallel feedback comb filters at delays {5963, 4998, 4327, 3911}
+     samples (scaled to the working sample rate from the 16 kHz reference).
+     Per-comb gains scale with `room_size_milli`: bigger room -> longer
+     decay. The four prime delays ensure no obvious coloration.
+   - 2 cascaded allpass filters at delays {1051, 357} with the classical
+     fixed gain g=0.7 (700 milli). These produce flat magnitude with
+     dispersive phase -- the "diffuse" character of the late reverb.
+   - Output extends `len(pcm) + tail_ms * sr / 1000` samples; the 400 ms
+     tail lets the IR ring out past the input without clicking.
+   - Wet/dry mix is integer: `output = (wet * wet + (1000-wet) * dry) / 1000`,
+     with per-sample PCM16 clipping so a runaway room=1000 feedback can't
+     ladder beyond int16 range over a long tail.
+
+2. **Noise gate** (`dsp_noise_gate(pcm, sr, threshold_milli, ratio_milli,`
+   `attack_ms, release_ms)`) attenuates samples whose 30 ms RMS envelope
+   falls below the threshold. Smoothed attack/release ramps the gain
+   linearly over `attack_ms` (opening) / `release_ms` (closing) instead of
+   switching instantly -- avoids click artifacts at utterance boundaries.
+   `ratio=1000` -> hard gate (full mute); `ratio=500` -> 2:1 below
+   threshold; `threshold=0` -> always open (pass-through).
+
+3. **Compressor** (`dsp_compressor(...)`, same args) is the symmetric
+   inverse: attenuates samples ABOVE threshold, useful for taming loud
+   peaks (e.g. the wet output of `dsp_reverb` at room=1000).
+
+### Integer-safety against NOVA's 1 MB smart-op threshold
+
+The audio buffers themselves stay in PCM16 range (< 1 MB threshold), but
+the sum-of-squares accumulator in `dsp_rms` and `_dsp_envelope_at` reaches
+~1e12, and intermediate reverb products (`wet * y1`) hit ~3e7. NOVA's
+smart `<`, `>`, `+`, `*` operators dispatch to string-runtime helpers
+when both operands exceed `PTR_THRESHOLD = 0x100000` (see
+`NOVA_BUG_THRESHOLD.md`), causing SIGSEGV. Three workarounds applied:
+
+- `dsp_rms`, `_dsp_envelope_at`, `_sum_sq`: route the multiply and the
+  running-sum add through `int_mul` / `int_add` (scalar-safe builtins).
+- `_dsp_isqrt`: every binop (`<`, `+`, `/`) goes through `int_lt`,
+  `int_add`, `int_div`. The local `int_lt(a, b)` helper computes
+  `int_shr(int_sub(a, b), 63)` -- arithmetic shift of the sign bit --
+  to avoid the smart-op dispatch when both operands are huge.
+- `_dsp_clip_pcm16`: pre-mix values can be 3e7 (>1 MB), so the
+  `if x > FULL_SCALE` and `if x < neg_floor` checks route through
+  `int_gt` / `int_lt` for scalar safety.
+- Reverb's wet/dry mix `wet * y1 + dry_complement * x` would have
+  both addends in the 3e7 range; the addition goes through `int_add`
+  to dodge `_nova_concat`.
+
+### Verification snapshot (latest run)
+
+- 34 unit assertions, 23 integration assertions; 170/170 unit tests + all
+  related audio scenarios still pass.
+- Reverb impulse response (impulse at sample 0, 4000-sample input @ 8 kHz,
+  wet=1000, room=800): output length 7200 samples, **610 non-zero samples
+  past the input** (the decay tail), first comb spike at sample 1955
+  (`cd3 = 3911 * 8000 / 16000`).
+- Noise gate attenuation on a low-level square wave (amp=400, threshold=100
+  milli ~= 3275 units): input RMS = 400, output RMS = 0 (the gate fully
+  closes below threshold with ratio=1000). That is an unbounded dB
+  attenuation; for a finite reference, a mid-level signal (amp=2000) that
+  is still below threshold also collapses to RMS=0 after the release ramp
+  settles -- ~ -inf dB on the floor.
+
+### Future work
+
+- **Stereo reverb** -- duplicate the comb bank with slightly offset delays
+  per channel for a wider stereo image; mix matrix at the output.
+- **Pre-delay** -- a single short delay line in front of the comb bank
+  models the first early-reflection in a room ("how far from the wall").
+- **Damping per comb** -- feed the comb output through a 1-pole low-pass
+  before the feedback tap to model air absorption (higher frequencies
+  decay faster than lows). One IIR coefficient per comb.
+- **Lookahead compressor / limiter** -- buffer N samples ahead so the
+  attack ramp can start *before* the loud peak hits the output, achieving
+  zero-overshoot brick-wall limiting.
+- **Sidechain gate** -- compute the envelope from a separate auxiliary
+  input rather than the main signal (classic ducking for music + voice
+  beds).
+- **Multi-band processing** -- split the spectrum into 3..5 bands via
+  IIR crossovers and run an independent gate/compressor per band so the
+  bass doesn't trigger the high-frequency cell.
