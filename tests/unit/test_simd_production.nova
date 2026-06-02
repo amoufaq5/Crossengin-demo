@@ -1,0 +1,368 @@
+// R12A — SIMD wired into production hot paths (stereo SAD + optical-flow
+// LK accumulators). Verifies the SIMD variants produce BIT-IDENTICAL
+// disparity and flow output vs the scalar reference path.
+//
+// Coverage targets (~25 assertions):
+//   * SAD on 7x7 flat / known-diff / negative-diff fixtures: SIMD == scalar.
+//   * SAD on 3x3, 5x5, 7x7, 9x9, 11x11 windows: SIMD == scalar bit-by-bit.
+//   * stereo_disparity_simd vs locally-recomputed scalar reference on a
+//     textured 48x32 pair: byte-wise identical disparity map.
+//   * stereo_disparity_simd on R7E's shifted-by-8 fixture: SHIFT=8 at
+//     all interior probe pixels (correctness check on the SIMD path).
+//   * stereo_disparity public API auto-routes to SIMD by default.
+//   * lk_optical_flow_simd vs lk_optical_flow on identical-frames,
+//     shifted-by-3, and R10D's 80x64 textured fixture: bit-identical
+//     (u, v, valid) at probe pixels + equal mean magnitude + equal
+//     valid count.
+//   * lk_optical_flow_simd at win_size=7 (n_lanes=49 -> n_padded=56):
+//     exercises the lane-padding path.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_stereo.nova"
+import "../../src/io/transducers/image_optical_flow.nova"
+
+// ---- fixtures -----------------------------------------------------------
+
+fn _r12a_flat(w, h, v) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, v)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+fn _r12a_textured(w, h) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let v = int_add(int_mul(x, 37), int_mul(y, 13))
+            let q = v / 256
+            v = int_sub(v, int_mul(q, 256))
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+fn _r12a_smooth_quad(w, h) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let xx = int_mul(x, x)
+            let yy = int_mul(y, y)
+            let v = int_add(xx, int_mul(3, yy)) / 8
+            if v > 255 { v = 255 }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// right(x, y) = left(x + shift, y), zero-padded; mirrors stereo's
+// _shift_left_fixture so SHIFT=8 puts the matching block in right at
+// (x_l - SHIFT) -> disparity == SHIFT.
+fn _r12a_shift_left(src, w, h, shift) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let sx = int_add(x, shift)
+            let v = 0
+            if sx < w { v = load8(src + row_off + sx) }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// next(x, y) = prev(x - shift, y), zero-padded -- LK reports u_milli ~
+// shift * 1000 at interior pixels.
+fn _r12a_shift_right(src, w, h, shift) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let sx = int_sub(x, shift)
+            let v = 0
+            if sx >= 0 {
+                if sx < w { v = load8(src + row_off + sx) }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Local scalar reference: recompute the disparity map using ONLY the
+// scalar SAD (stereo_sad_block) so the baseline is independent of any
+// env-var dispatch. Mirrors stereo_disparity's pre-R12A inner loop.
+fn _r12a_scalar_disparity_map(lft, rgt, w, h, ws, md) {
+    let area = int_mul(w, h)
+    let map = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(map + i, 0)
+        i = i + 1
+    }
+    store8(map + area, 0)
+    let half = ws / 2
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block(lft, rgt, w, x, int_sub(x, d), y, ws)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            store8(map + int_add(row_off, x), best_d)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return map
+}
+
+// ---- SAD: SIMD == scalar -------------------------------------------------
+
+fn test_sad_simd_flat_zero() {
+    let a = _r12a_flat(16, 16, 100)
+    let b = _r12a_flat(16, 16, 100)
+    let l_buf = alloc(int_mul(int_add(49, 8), 4))
+    let r_buf = alloc(int_mul(int_add(49, 8), 4))
+    let s_scalar = stereo_sad_block(a, b, 16, 8, 8, 8, 7)
+    let s_simd   = stereo_sad_block_simd(a, b, 16, 8, 8, 8, 7, l_buf, r_buf)
+    ce_eq("SIMD SAD on flat=flat == scalar (0)", s_simd, s_scalar)
+    ce_eq("SIMD SAD on flat=flat == 0",          s_simd, 0)
+}
+
+fn test_sad_simd_known_diff() {
+    let a = _r12a_flat(16, 16, 100)
+    let b = _r12a_flat(16, 16, 110)
+    let l_buf = alloc(int_mul(int_add(49, 8), 4))
+    let r_buf = alloc(int_mul(int_add(49, 8), 4))
+    let s_scalar = stereo_sad_block(a, b, 16, 8, 8, 8, 7)
+    let s_simd   = stereo_sad_block_simd(a, b, 16, 8, 8, 8, 7, l_buf, r_buf)
+    ce_eq("SIMD SAD (100 vs 110) over 7x7 == scalar", s_simd, s_scalar)
+    ce_eq("SIMD SAD (100 vs 110) over 7x7 == 490",    s_simd, 490)
+}
+
+fn test_sad_simd_negative_diff_symmetric() {
+    let a = _r12a_flat(16, 16, 100)
+    let b = _r12a_flat(16, 16, 50)
+    let l_buf = alloc(int_mul(int_add(49, 8), 4))
+    let r_buf = alloc(int_mul(int_add(49, 8), 4))
+    let s_ab = stereo_sad_block_simd(a, b, 16, 8, 8, 8, 7, l_buf, r_buf)
+    let s_ba = stereo_sad_block_simd(b, a, 16, 8, 8, 8, 7, l_buf, r_buf)
+    ce_eq("SIMD SAD symmetric a/b == b/a",  s_ab, s_ba)
+    ce_eq("SIMD SAD (100 vs 50) == 49*50",  s_ab, 2450)
+}
+
+fn test_sad_simd_varying_winsize() {
+    // Across ws in {3, 5, 7, 9, 11} the SIMD SAD must agree with scalar
+    // bit-identically. ws=3 -> 9 lanes (1 SIMD vec + 1 tail), ws=5 ->
+    // 25 lanes, ws=7 -> 49, ws=9 -> 81, ws=11 -> 121. Covers the AVX2
+    // multi-vector path + the scalar-tail path inside the builtin.
+    let a = _r12a_textured(32, 32)
+    let b = _r12a_shift_left(a, 32, 32, 2)
+    let l_buf = alloc(int_mul(int_add(121, 8), 4))
+    let r_buf = alloc(int_mul(int_add(121, 8), 4))
+    let s3_sc = stereo_sad_block(a, b, 32, 16, 14, 16, 3)
+    let s3_sd = stereo_sad_block_simd(a, b, 32, 16, 14, 16, 3, l_buf, r_buf)
+    ce_eq("SIMD SAD ws=3 == scalar", s3_sd, s3_sc)
+    let s5_sc = stereo_sad_block(a, b, 32, 16, 14, 16, 5)
+    let s5_sd = stereo_sad_block_simd(a, b, 32, 16, 14, 16, 5, l_buf, r_buf)
+    ce_eq("SIMD SAD ws=5 == scalar", s5_sd, s5_sc)
+    let s7_sc = stereo_sad_block(a, b, 32, 16, 14, 16, 7)
+    let s7_sd = stereo_sad_block_simd(a, b, 32, 16, 14, 16, 7, l_buf, r_buf)
+    ce_eq("SIMD SAD ws=7 == scalar", s7_sd, s7_sc)
+    let s9_sc = stereo_sad_block(a, b, 32, 16, 14, 16, 9)
+    let s9_sd = stereo_sad_block_simd(a, b, 32, 16, 14, 16, 9, l_buf, r_buf)
+    ce_eq("SIMD SAD ws=9 == scalar", s9_sd, s9_sc)
+    let s11_sc = stereo_sad_block(a, b, 32, 16, 14, 16, 11)
+    let s11_sd = stereo_sad_block_simd(a, b, 32, 16, 14, 16, 11, l_buf, r_buf)
+    ce_eq("SIMD SAD ws=11 == scalar", s11_sd, s11_sc)
+}
+
+// ---- stereo_disparity_simd byte-wise == scalar reference -----------------
+
+fn test_disparity_simd_byte_wise_identical_textured() {
+    let lft = _r12a_textured(48, 32)
+    let rgt = _r12a_shift_left(lft, 48, 32, 6)
+    let m_sc = _r12a_scalar_disparity_map(lft, rgt, 48, 32, 7, 32)
+    let r_sd = stereo_disparity_simd(lft, rgt, 48, 32, 7, 32)
+    let m_sd = stereo_result_map(r_sd)
+    let area = 48 * 32
+    let mismatches = 0
+    let i = 0
+    while i < area {
+        if load8(m_sc + i) != load8(m_sd + i) {
+            mismatches = mismatches + 1
+        }
+        i = i + 1
+    }
+    ce_eq("SIMD vs scalar disparity map: byte-wise identical (48x32 textured)",
+          mismatches, 0)
+}
+
+// Spec: "SIMD path produces correct disparity on R7E's shifted-by-8
+// fixture (target u=8000): same as scalar". In raw stereo units that's
+// SHIFT=8 (u=8000 milli is the stereo_quality_subpx encoding); the R7E
+// integer-disparity bound is SHIFT, so we assert disparity == 8 at
+// interior probe pixels under SIMD.
+fn test_disparity_simd_shifted_by_8_correct() {
+    let SHIFT = 8
+    let lft = _r12a_textured(64, 32)
+    let rgt = _r12a_shift_left(lft, 64, 32, SHIFT)
+    let r = stereo_disparity_simd(lft, rgt, 64, 32, 7, 32)
+    let m = stereo_result_map(r)
+    ce_check("SIMD shifted-by-8 produces non-zero map", m != 0)
+    ce_eq("SIMD disparity at (30,16) == 8", stereo_disparity_at(m, 64, 30, 16), SHIFT)
+    ce_eq("SIMD disparity at (35,18) == 8", stereo_disparity_at(m, 64, 35, 18), SHIFT)
+    ce_eq("SIMD disparity at (40,20) == 8", stereo_disparity_at(m, 64, 40, 20), SHIFT)
+    ce_eq("SIMD disparity at (45,14) == 8", stereo_disparity_at(m, 64, 45, 14), SHIFT)
+}
+
+// Public stereo_disparity API auto-routes to SIMD (CE_STEREO_SIMD unset
+// or "on"); we verify behavior is correct on the shifted-by-10 fixture.
+fn test_stereo_disparity_simd_default_is_correct() {
+    let SHIFT = 10
+    let lft = _r12a_textured(64, 32)
+    let rgt = _r12a_shift_left(lft, 64, 32, SHIFT)
+    let r = stereo_disparity(lft, rgt, 64, 32, 7, 32)
+    let m = stereo_result_map(r)
+    ce_eq("public stereo_disparity SHIFT=10 at (30,16)",
+          stereo_disparity_at(m, 64, 30, 16), SHIFT)
+    ce_eq("public stereo_disparity SHIFT=10 at (40,20)",
+          stereo_disparity_at(m, 64, 40, 20), SHIFT)
+}
+
+// ---- optical-flow SIMD == scalar -----------------------------------------
+
+fn test_lk_simd_identical_frames_zero_flow() {
+    let buf = _r12a_smooth_quad(40, 32)
+    let r_sc = lk_optical_flow(buf, buf, 40, 32, 5)
+    let r_sd = lk_optical_flow_simd(buf, buf, 40, 32, 5)
+    ce_eq("LK SIMD identical frames -> mean mag 0 (scalar)",
+          lk_flow_mean_magnitude(r_sc), 0)
+    ce_eq("LK SIMD identical frames -> mean mag 0 (SIMD)",
+          lk_flow_mean_magnitude(r_sd), 0)
+    ce_eq("LK SIMD identical frames -> valid count identical",
+          lk_flow_valid_count(r_sd), lk_flow_valid_count(r_sc))
+}
+
+fn test_lk_simd_shifted_3px_matches_scalar() {
+    let prev = _r12a_smooth_quad(40, 32)
+    let next = _r12a_shift_right(prev, 40, 32, 3)
+    let r_sc = lk_optical_flow(prev, next, 40, 32, 5)
+    let r_sd = lk_optical_flow_simd(prev, next, 40, 32, 5)
+    ce_eq("LK SIMD shifted-3 -> valid count == scalar",
+          lk_flow_valid_count(r_sd), lk_flow_valid_count(r_sc))
+    ce_eq("LK SIMD shifted-3 -> mean magnitude == scalar",
+          lk_flow_mean_magnitude(r_sd), lk_flow_mean_magnitude(r_sc))
+    let p_sc = lk_flow_at(r_sc, 20, 16)
+    let p_sd = lk_flow_at(r_sd, 20, 16)
+    ce_eq("LK SIMD shifted-3 u at (20,16) == scalar",     p_sd[0], p_sc[0])
+    ce_eq("LK SIMD shifted-3 v at (20,16) == scalar",     p_sd[1], p_sc[1])
+    ce_eq("LK SIMD shifted-3 valid at (20,16) == scalar", p_sd[2], p_sc[2])
+}
+
+// R10D's textured fixture is 80x64; spec specifies this size.
+fn test_lk_simd_80x64_textured_bit_identical() {
+    let prev = _r12a_smooth_quad(80, 64)
+    let next = _r12a_shift_right(prev, 80, 64, 2)
+    let r_sc = lk_optical_flow(prev, next, 80, 64, 5)
+    let r_sd = lk_optical_flow_simd(prev, next, 80, 64, 5)
+    ce_eq("LK SIMD 80x64 -> valid count == scalar",
+          lk_flow_valid_count(r_sd), lk_flow_valid_count(r_sc))
+    ce_eq("LK SIMD 80x64 -> mean magnitude == scalar",
+          lk_flow_mean_magnitude(r_sd), lk_flow_mean_magnitude(r_sc))
+    let q1_sc = lk_flow_at(r_sc, 40, 32)
+    let q1_sd = lk_flow_at(r_sd, 40, 32)
+    ce_eq("LK SIMD 80x64 u at (40,32) == scalar", q1_sd[0], q1_sc[0])
+    ce_eq("LK SIMD 80x64 v at (40,32) == scalar", q1_sd[1], q1_sc[1])
+    let q2_sc = lk_flow_at(r_sc, 30, 20)
+    let q2_sd = lk_flow_at(r_sd, 30, 20)
+    ce_eq("LK SIMD 80x64 u at (30,20) == scalar", q2_sd[0], q2_sc[0])
+    ce_eq("LK SIMD 80x64 v at (30,20) == scalar", q2_sd[1], q2_sc[1])
+}
+
+// Larger window (ws=7, n_lanes=49 -> n_padded=56) exercises the
+// lane-padding path: 7 SIMD chunks per sum reduction.
+fn test_lk_simd_larger_winsize_bit_identical() {
+    let prev = _r12a_smooth_quad(40, 32)
+    let next = _r12a_shift_right(prev, 40, 32, 2)
+    let r_sc = lk_optical_flow(prev, next, 40, 32, 7)
+    let r_sd = lk_optical_flow_simd(prev, next, 40, 32, 7)
+    ce_eq("LK SIMD ws=7 -> valid count == scalar",
+          lk_flow_valid_count(r_sd), lk_flow_valid_count(r_sc))
+    ce_eq("LK SIMD ws=7 -> mean magnitude == scalar",
+          lk_flow_mean_magnitude(r_sd), lk_flow_mean_magnitude(r_sc))
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_sad_simd_flat_zero()
+    test_sad_simd_known_diff()
+    test_sad_simd_negative_diff_symmetric()
+    test_sad_simd_varying_winsize()
+    test_disparity_simd_byte_wise_identical_textured()
+    test_disparity_simd_shifted_by_8_correct()
+    test_stereo_disparity_simd_default_is_correct()
+    test_lk_simd_identical_frames_zero_flow()
+    test_lk_simd_shifted_3px_matches_scalar()
+    test_lk_simd_80x64_textured_bit_identical()
+    test_lk_simd_larger_winsize_bit_identical()
+    ce_summary("image_simd_production")
+}
+
+main()
