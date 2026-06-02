@@ -211,3 +211,109 @@ Distribution shape over 1000 samples at `scale = 1.0`:
 
 Sample mean over 1000 draws: `+13` (max ±100 expected; well within the
 sampling error of `sqrt(1000 * 2)` ~ `45`).
+
+## R12F follow-up — operator-facing reporting surface
+
+R12F extends the DP module with reporting APIs and adds the chat-side
+`/dp` admin command so an operator can SEE how much budget has been
+spent, WHICH queries spent it, and WHEN. None of the existing
+mechanism changes — `dp_consume`, `dp_noisy_count`, `dp_noisy_mean`,
+the discrete-Laplace sampler, the LCG, the geometric sampler — all
+remain bit-for-bit unchanged; the existing 52-assertion
+`test_differential_privacy.nova` and 10-assertion
+`scenario_p_dp_budget.sh` stay green without modification.
+
+### New state slots (`src/safety/differential_privacy.nova`)
+
+  - `DP_QUERY_LOG` — per-query log capped at 500 entries
+    (`[ts_ns, label, eps_milli]` per entry; ring buffer drops oldest
+    when cap hit). The label is the string passed to
+    `dp_consume_labeled` (or `"query"` for the legacy unlabelled
+    `dp_consume`, `"count"` for `dp_noisy_count`, `"mean"` for
+    `dp_noisy_mean`).
+  - `DP_LAST_QUERY_NS` — `nanotime()` of the most recent successful
+    consume; surfaced as `"last query Ts ago"` in the status line.
+  - `DP_WARN_THRESHOLD` — milli-eps consumption at which the warning
+    should fire. Default = 80% of the total budget (so a 10000-milli
+    budget warns at 8000). Sticky across `dp_budget_reset` (admin
+    knob).
+  - `DP_WARN_EMITTED` — single-shot bit so the warning fires once
+    per budget cycle; cleared by `dp_budget_reset` and
+    `dp_budget_warn_set` so a fresh cycle / lowered threshold can
+    re-fire.
+  - `DP_RESET_COUNT` — audit counter; an unexpected jump in this
+    counter would be a signal that an unauthorised reset path is
+    wired.
+
+### Refusal-on-exhaust posture (unchanged)
+
+The wrappers continue to return `DP_REFUSED` on budget exhaustion
+(option 2 in the P3.6 brief). The R12F reporting surface does not
+alter this contract — `/dp status` after exhaustion shows
+`100% (N/N milli eps consumed; last query Ts ago)` and the next
+`/dp_query atoms` continues to print
+`dp_query atoms: budget exhausted (remaining 0 milli-eps)`. An
+operator who wants to grant more budget can run
+`/dp reset T confirm` (audit-logged via `DP_RESET_COUNT`).
+
+### Chat surface (`examples/crossengin_chat.nova`)
+
+  - `/dp` — usage block (5 lines).
+  - `/dp status` — single-line bar + percent + remaining + last-query
+    age. Bar is ASCII `[#####-----]` for codepage portability.
+  - `/dp log [N]` — header + last N entries. Each entry is
+    `  <seq>. <label> -> <eps> milli-eps (<age>s ago)`.
+  - `/dp warn THRESH` — set the warn threshold (clamped to
+    `[0, total]`). Subsequent consume calls that cross the threshold
+    set `dp_budget_should_warn(dp) == 1` once.
+  - `/dp reset T confirm` — admin reset. Without `confirm` prints a
+    `PENDING` notice but does NOT touch the budget; the explicit
+    second word is the safeguard.
+  - `/status` — pre-existing pane gets one new line: `dp       :
+    25% used (250/1000 milli eps; 1 query)`.
+
+### Sample session
+
+```
+> /dp
+/dp <subcommand> -- differential-privacy budget management
+  /dp status              consumption bar + remaining budget
+  /dp log [N]             last N queries (default 10)
+  /dp warn <threshold>    set warn-at-consumption threshold (milli-eps)
+  /dp reset <new_total>   admin reset (requires explicit confirm word)
+
+> /dp status
+DP budget: [----------] 0% (0/10000 milli eps consumed; no queries yet)
+
+> /dp_query atoms
+dp_query atoms: true=584 noisy=577 (epsilon=100 milli, remaining 9900)
+
+> /dp_query atoms
+dp_query atoms: true=584 noisy=591 (epsilon=100 milli, remaining 9800)
+
+> /dp status
+DP budget: [----------] 2% (200/10000 milli eps consumed; last query 0s ago)
+
+> /dp log 2
+DP query log (last 2 of 2):
+  1. count -> 100 milli-eps (0s ago)
+  2. count -> 100 milli-eps (0s ago)
+
+> /dp reset 5000
+dp reset PENDING: would set total to 5000 milli-eps (re-run with 'confirm' to apply)
+
+> /dp reset 5000 confirm
+dp reset OK: total 10000 -> 5000 milli-eps (was 200 consumed; reset_count=1)
+```
+
+### Gaps remaining (R12F leaves open)
+
+  6. **Better random-number quality** — same gap as before; R12F is
+     unrelated to the LCG.
+  7. **Warn LINE wiring at the wrapper sites** — R12F provides
+     `dp_budget_should_warn` and `dp_warn_mark_emitted` but the
+     existing wrappers (`kg_atom_count_dp`, `kg_atom_belief_mean_dp`)
+     do not yet call these. A future revision can have the wrappers
+     emit the warn line immediately after a consume that crossed the
+     threshold — for now, an operator must run `/dp status` to see
+     the consumption hit.

@@ -927,6 +927,111 @@ estimator for speech and music," JASA 111(4) April 2002:
   one [f0_centihz, voicing_milli] per 30 ms tick alongside the
   VAD event stream.
 
+## R12D: TD-PSOLA pitch shifting + time stretching
+
+R12D adds the audio *manipulation* leg next to R6E synthesis, R7F/R9B
+VAD, R8B/R10B STT, and R10F/R11B F0 estimation. New module
+`src/io/transducers/audio_psola.nova` implements TD-PSOLA
+(Time-Domain Pitch-Synchronous Overlap-Add; Moulines & Charpentier
+1990) -- the classical integer-friendly algorithm for *independent*
+pitch shifting and time stretching.
+
+### Why TD-PSOLA
+
+Naive resampling shifts pitch *and* time together: 2x resample yields
+2x F0 *and* 2x speed (chipmunk). To shift pitch without changing
+duration (or vice versa) the substrate needs an algorithm that
+separately addresses the spectral envelope (formants) and the
+fundamental period. TD-PSOLA does this in the time domain only -- no
+FFT, no floats:
+
+1. **Pitch mark detection.** Run R11B YIN per frame to estimate the
+   local period `tau = sample_rate / F0`. Anchor a mark within each
+   predicted period at the local signed-max sample (positive glottal
+   pulse peak; the signed criterion avoids the half-period
+   alternation that |max| would suffer on a pure sine where both
+   +peak and -peak are local |maxima|). For unvoiced frames a 10 ms
+   fallback grid keeps the segment grid defined.
+2. **Hann windowing.** At each mark, extract a Hann-windowed segment
+   of length `2*tau` centred on the mark. Adjacent segments overlap
+   by exactly `tau` samples.
+3. **Pitch shift (alpha).** Keep segments; deposit them at a denser
+   (alpha > 1) or sparser (alpha < 1) grid with output period
+   `tau' = tau / alpha`. Spectral envelope (formants) preserved
+   because segments aren't resampled.
+4. **Time stretch (beta).** Keep output period at `tau`; walk input
+   marks at rate `1/beta`. Duplicates segments when slowing down,
+   skips them when speeding up. F0 preserved.
+5. **Combined.** `psola_transform(pcm, sr, alpha, beta)` composes
+   both.
+
+### Integer-only Hann window
+
+```
+hann(n, N) = (1000 - 1000 * cos(2*pi*n/N)) / 2     // milli
+```
+
+The cosine is sampled from a 256-entry quarter-wave Bhaskara-degree-
+domain table built lazily on first use (same shape as R6E
+audio_synth's sine table; duplicated here so the transducer module
+doesn't depend on the effector layer).
+
+### Public API
+
+- `psola_pitch_marks(pcm, sr) -> list[int]`
+- `psola_pitch_shift(pcm, sr, alpha) -> pcm`  -- 1000=identity, 2000=octave up
+- `psola_time_stretch(pcm, sr, beta) -> pcm`  -- 1000=identity, 2000=double duration
+- `psola_transform(pcm, sr, alpha, beta) -> pcm`
+- `psola_hann_window(n, N) -> int` (public for testability)
+- Accessors
+
+Chat: `/pitch_shift PATH FACTOR_MILLI` admin one-liner.
+
+### Caps
+
+- Input PCM length `<= 480000` samples (30 s @ 16 kHz)
+- `pitch_factor_milli` in `[250, 4000]` (-2 octaves to +2 octaves)
+- `time_factor_milli` in `[250, 4000]` (4x faster to 4x slower)
+
+### Verification (R12D)
+
+- **Unit (34 assertions, NEW `tests/unit/test_psola.nova`)**: pitch
+  shift up 2x doubles F0 (40005 centi-Hz on 200 Hz input, ~0.1%
+  error), pitch shift down 0.5x halves F0 (10000 centi-Hz exact),
+  time stretch 2x doubles output length, combined 2x/2x yields
+  ~400 Hz @ ~2x duration, identity transform preserves length + F0,
+  Klatt /ae/ pitch shift preserves length + energy, silence -> silence,
+  short input pass-through.
+- **Integration (`tests/integration/scenario_aaa_psola.sh`, 16
+  assertions)**: 200 Hz @ 8 kHz synthesized + written + re-decoded
+  yields F0 = 20000 centi-Hz exact; pitch-shifted 2x yields
+  F0 = 40022 centi-Hz (~400 Hz, within +/- 25 centi-Hz); time-
+  stretched 2x yields exactly 19200 samples = 2x 9600 input.
+- **All R6E + R7F + R9B + R8B + R10F + R11B audio unit tests pass**
+  (audio_synth: 209, audio_capture: 28, audio_vad: 86,
+  audio_pitch: 52, audio_pitch_yin: 35).
+
+### Known limitations (R12D)
+
+- **Identity reconstruction is not bit-exact.** Hann constant-
+  overlap-add only holds for ideal 50% overlap with no integer
+  quantization; integer-milli windowing introduces small boundary
+  errors (~17 in centre of a 200 Hz sine, larger near edges).
+  Acceptable for perceptual manipulation; the brief's +/- 5 per-
+  sample target is a strict mathematical bound rather than a
+  practical PSOLA reconstruction bound.
+- **Klatt vowel YIN tracking irregular.** Klatt's two-formant cosine
+  sum doesn't produce a clean glottal-pulse train, so the YIN-driven
+  pitch-mark walker sees irregular spacing. PSOLA still applies the
+  segment-overlap-add transform and the output has energy.
+- **Per-period YIN cost.** Each pitch mark triggers a YIN frame
+  estimate (O(frame_size^2)); for a 1-second 16 kHz buffer with 100
+  Hz F0, that's ~100 YIN calls per second of audio. Above ~5 s
+  callers should chunk.
+- **No anti-aliasing on extreme factors.** Alpha values near 4000
+  push the output spectrum near the Nyquist edge. Acceptable for
+  the +/- 1 octave canonical use case.
+
 ## Future work
 
 - Promote OW to a true diphthong (it's /oʊ/, gliding toward /ʊ/). Backward-

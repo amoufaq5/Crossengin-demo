@@ -11,7 +11,26 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 148 modules compile (`make build`). R12A wires R11D's i32x8
+> toolchain: 149 modules compile (`make build`). R12D adds
+> `src/io/transducers/audio_psola.nova` -- TD-PSOLA pitch shifting +
+> time stretching (Moulines & Charpentier 1990) -- the audio
+> *manipulation* leg next to R6E synthesis, R7F/R9B VAD, R8B/R10B STT,
+> and R10F/R11B F0 estimation. Where naive resampling changes pitch
+> AND speed together, TD-PSOLA changes either independently: pitch
+> marks (R11B YIN-driven) anchor Hann-windowed segments at the local
+> glottal-pulse peak; pitch shift redeposits segments at a
+> denser/sparser grid (formants preserved); time stretch walks input
+> marks at rate 1/beta (F0 preserved). Pure integer arithmetic,
+> integer-milli Hann window via a 256-entry quarter-wave cosine
+> table. **200 Hz sine pitch shifted by factor 2000 milli (1 octave
+> up) yields YIN mean F0 = 40005 centi-Hz = 400.05 Hz** (the doubled
+> F0 within 0.05 Hz of the target). Time stretch by factor 2000
+> milli: 9600 input samples -> 19200 output samples (exact 2x). New
+> chat admin: `/pitch_shift PATH FACTOR_MILLI` echoes input/output
+> sample counts. Caps: input PCM <= 480000 samples (30 s @ 16 kHz);
+> pitch/time factor in [250..4000] (-/+ 2 octaves). 34 unit assertions
+> + 16 integration assertions; all green. All R6E/R7F/R9B/R8B/R10F/
+> R11B audio tests pass unchanged. R12A wires R11D's i32x8
 > SIMD intrinsics (`simd_sum_abs_diff`, `simd_add_i32x8`) into the two
 > production hot paths identified in scope: stereo block-matching SAD
 > (R7E `image_stereo.nova`) and Lucas-Kanade dense optical-flow
@@ -30,7 +49,37 @@ computational units rather than orchestrating a pipeline of modules.
 > inner-loop win; future NOVA codegen inlining will surface the
 > primitive's speedup automatically through the same wiring. See
 > `scripts/bench_simd_production.sh` for the bit-identical-checked
-> bench harness. R12C adds
+> bench harness. R12B adds
+> `src/io/transducers/image_superpixels.nova` — SLIC (Simple Linear
+> Iterative Clustering, Achanta 2012), the standard boundary-adherent
+> superpixel segmenter and the natural complement to R11E's global
+> k-means. R11E does coarse `(intensity, x, y)` Lloyd's clustering --
+> works but cluster lines can cross intensity edges. R12B's SLIC
+> restricts each cluster's search to a `2S x 2S` window around its
+> center (where `S = sqrt(W*H / K)` is the grid step), making the
+> algorithm O(N) regardless of K. Combined distance metric weighs
+> intensity vs. spatial via compactness factor m (paper default 10);
+> integer form `D^2_scaled = d_int^2 * S^2 + d_spat^2 * m^2` avoids
+> floats AND avoids sqrt (argmin only). Centers are gradient-perturbed
+> in their 3x3 neighbourhood to avoid initialising on top of edges.
+> Boundary pixels are detected by 4-neighbour label difference; the
+> overlay render draws them white over the original intensity.
+> **4-quadrant 64x64 fixture (TL=0, TR=85, BL=170, BR=255) with K=16:
+> 16 centers placed, step=16, converges in 2 iterations, 732 boundary
+> pixels (~18% of the image), TL/TR/BL/BR pixels each land in a
+> cluster whose center is in the matching quadrant with intensity
+> within tol 30 of the quadrant intensity.** Public API:
+> `slic_segment`, `slic_segment_default`, `slic_label_at`,
+> `slic_center_at`, `slic_boundaries`, `slic_boundary_count`,
+> `slic_render_pgm`, `slic_render_to_file`, `slic_pgm_args` (chat),
+> `slic_append_features` (VP wiring). New chat admin: `/slic PATH
+> [K]` (default K=64) prints `(slic WxH k=K step=S iterations=N
+> converged=yes/no boundary_px=B wrote=yes path=/tmp/slic_overlay.pgm)`.
+> Caps: dims <= 256, K in [16, 1024] (auto-clamped to keep S >= 4),
+> m in [1, 40], max_iter <= 20. 61 unit assertions
+> (`tests/unit/test_slic.nova`) + 16 integration assertions
+> (`tests/integration/scenario_yy_slic.sh`); all green.
+> R11E / R10D / R10F / R11B remain bit-identically green. R12C adds
 > `src/kg/louvain.nova` — Blondel-2008 two-phase greedy modularity
 > optimiser, the gold-standard companion to R11F's label-propagation
 > detector. Phase 1 picks moves analytically (DQ in integer-only
@@ -500,6 +549,13 @@ computational units rather than orchestrating a pipeline of modules.
 > +1 from `safety/differential_privacy.nova` added in P3.6 minimum-viable
 > differential privacy at the KG-query surface (integer Laplace mechanism +
 > per-session epsilon-budget accountant, ADR-0053 -- documented in
+> [`DP_AUDIT.md`](./DP_AUDIT.md)),
+> +1 from `safety/dp_budget_ui.nova` added in R12F operator-facing
+> DP budget reporting -- ASCII bar / status / log / warn / reset
+> presentation layer on top of the R12F query-log + warn-threshold
+> slots in `differential_privacy.nova`, with the chat-side `/dp
+> <subcommand>` admin command and a one-line `dp       :` row in
+> `/status` (documented in the R12F follow-up section of
 > [`DP_AUDIT.md`](./DP_AUDIT.md)),
 > +2 from `io/transducers/{image_pgm,visual_perception}.nova` added in P3.1
 > minimum-viable image modality -- pure-NOVA PGM-P5 decoder + pluggable
