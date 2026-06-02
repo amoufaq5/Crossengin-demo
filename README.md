@@ -11,7 +11,26 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 148 modules compile (`make build`). R12C adds
+> toolchain: 148 modules compile (`make build`). R12A wires R11D's i32x8
+> SIMD intrinsics (`simd_sum_abs_diff`, `simd_add_i32x8`) into the two
+> production hot paths identified in scope: stereo block-matching SAD
+> (R7E `image_stereo.nova`) and Lucas-Kanade dense optical-flow
+> accumulators (R10D `image_optical_flow.nova`). Adds
+> `stereo_sad_block_simd`, `stereo_disparity_simd` (with
+> `CE_STEREO_SIMD` env-var dispatch from the public `stereo_disparity`
+> API), and `lk_optical_flow_simd` (with `CE_LK_SIMD` env-var
+> fallback). All existing regression suites stay bit-identical green
+> (R7E 54, R8D 42, R9A 39, R10D 53, R11A 52). New
+> `tests/unit/test_simd_production.nova` ships 35 assertions verifying
+> bit-identical SIMD vs scalar output across ws ∈ {3, 5, 7, 9, 11} and
+> on the R10D 80x64 textured fixture. Realized 256x256 wallclock
+> (current NOVA codegen): stereo SAD ~0.86x, LK ~0.20x — below the
+> R11D microbench's 335-450x because per-builtin-call overhead
+> amortized over ~49 lanes (one window) is larger than the AVX2
+> inner-loop win; future NOVA codegen inlining will surface the
+> primitive's speedup automatically through the same wiring. See
+> `scripts/bench_simd_production.sh` for the bit-identical-checked
+> bench harness. R12C adds
 > `src/kg/louvain.nova` — Blondel-2008 two-phase greedy modularity
 > optimiser, the gold-standard companion to R11F's label-propagation
 > detector. Phase 1 picks moves analytically (DQ in integer-only

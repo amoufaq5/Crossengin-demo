@@ -647,3 +647,71 @@ Pure-NOVA WebP and HEIC are not on any roadmap within the next year.
 * `nova-deps.toml` enhancement #15 — upstream tracker for full visual
   stack (JPEG / PNG decode, feature extraction, embeddings).
 * `STT_AUDIT.md` — sibling audit for the audio modality bridge.
+
+## R12A SIMD wiring into production hot paths (landed)
+
+R12A wires R11D's i32x8 SIMD intrinsics (`simd_sum_abs_diff`,
+`simd_add_i32x8`) into the two production hot paths that fit the i32
+lane envelope: stereo block-matching SAD (R7E) and Lucas-Kanade dense
+optical-flow accumulators (R10D). Autocorrelation pitch (R10F) was
+deliberately excluded — R(0) ~5e11 overflows i32 lanes and needs i64
+SIMD which R11D doesn't ship.
+
+* Public API additions (parallel to existing scalar variants for
+  back-compat):
+  - `stereo_sad_block_simd(left, right, w, x_l, x_r, y, ws, l_buf, r_buf)`
+    stages an i32 lane pair via single-byte writes (pixels are 0..255 so
+    upper 3 bytes stay zero across the buffer's lifetime) and reduces
+    via `simd_sum_abs_diff`. Bit-identical to scalar SAD.
+  - `stereo_disparity_simd(left, right, w, h, ws, max_disp)` is the
+    explicit SIMD entry point; honors `CE_STEREO_SIMD=off`.
+  - `stereo_disparity` (R7E public API) auto-routes to the SIMD inner
+    loop when `CE_STEREO_SIMD` is unset or "on".
+  - `lk_optical_flow_simd(prev, next, w, h, ws)` stages the 5 product
+    streams (ix^2, iy^2, ixiy, ixit, iyit) into i32 lane buffers
+    padded to a multiple of 8, lane-parallel-adds via simd_add_i32x8
+    into 8-lane accumulators, horizontal-sums per accumulator.
+    Honors `CE_LK_SIMD=off`.
+
+* Bit-identical correctness:
+  - integer add is associative + commutative, so lane-parallel
+    partial sums recombine to the same scalar total
+  - SAD on bytes (max |l - r| <= 255) over WIN_SIZE^2 cells fits in
+    i32 for the maximum 15x15 window (225 * 255 = 57375 << 2^31)
+  - LK products (ix * it etc.) with central-difference gradients
+    bounded ~±128 fit comfortably in i32 over a 15x15 window
+
+* `tests/unit/test_simd_production.nova` (35 assertions): SIMD SAD
+  bit-identical to scalar across ws ∈ {3, 5, 7, 9, 11};
+  `stereo_disparity_simd` byte-wise == locally-recomputed scalar
+  reference on a 48x32 textured pair (independent of env-var
+  dispatch); SIMD path produces SHIFT=8 disparity on R7E's
+  shifted-by-8 fixture; LK SIMD bit-identical to scalar on
+  identical-frames + shifted-by-3 + R10D's 80x64 smooth-quadratic
+  fixture at ws=5 and ws=7.
+
+* `scripts/bench_simd_production.sh` generates two NOVA bench
+  programs that assert bit-identical SIMD vs scalar output before
+  reporting wallclock + speedup ratio on 256x256 fixtures. Realized
+  numbers on the current NOVA codegen: stereo SAD ~0.86x, LK ~0.20x.
+  The R11D microbench showed 335-450x on the SIMD primitive itself
+  by calling `simd_sum_abs_diff` ONCE for 1024 lanes; in production
+  we call it ~65000 times per disparity scan, and the per-call
+  overhead (smart-op pointer checks, function-call ABI, lane
+  staging) amortized over only ~49 lanes per call exceeds the AVX2
+  inner-loop win. Future codegen wins (inlined builtin emission, a
+  `simd_mul_i32x8` for LK products, a `simd_horizontal_sum_i32x8`
+  for LK reductions) will surface the speedup automatically through
+  the same wiring.
+
+* Out-of-scope follow-ups: SGM cost-volume aggregation (R9A) — the
+  4-path DP accumulator could use simd_add_i32x8 lane-wise on cost
+  bins; pyramidal Lucas-Kanade (R11A) inherits SIMD via
+  lk_optical_flow internally.
+
+Files touched / added:
+* `src/io/transducers/image_stereo.nova` (+178 lines)
+* `src/io/transducers/image_optical_flow.nova` (+218 lines)
+* `tests/unit/test_simd_production.nova` (NEW, 35 assertions)
+* `scripts/bench_simd_production.sh` (NEW)
+
