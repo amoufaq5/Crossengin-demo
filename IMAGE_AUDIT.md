@@ -96,7 +96,7 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 | SIFT keypoint DETECTION (scale-  | DONE (P3.3 cont.)   |
 |   space + DoG extrema only)      |                     |
 | Canny edge with hysteresis       | DONE (P3.3 cont.)   |
-| HOG (oriented gradients)         | 2-3 weeks           |
+| HOG (oriented gradients)         | DONE (R14D)         |
 | SIFT-like 128-D descriptor       | DONE (P3.3 cont. v2)|
 | ORB (FAST + rBRIEF, patent-free) | DONE (P3.3 cont. v3)|
 | Color histograms (HSV / Lab)     | 2-3 weeks           |
@@ -251,6 +251,58 @@ gradient structure and corner geometry, not just intensity moments:
   ORB ships ~3-5x faster than SIFT for end-to-end keypoint+match
   on the same fixture, with integer-only arithmetic throughout the
   hot loops.
+- **HOG (Histogram of Oriented Gradients) dense descriptor**
+  (`src/io/transducers/image_hog.nova`, R14D -- the classic
+  Dalal-Triggs 2005 dense feature). Where SIFT/ORB describe a
+  handful of sparse keypoints, HOG tiles the WHOLE image (or
+  detection window) and summarizes gradient orientation in fixed
+  cells. The pipeline is: (1) per-pixel central-difference gradient
+  `Gx = I(x+1,y) - I(x-1,y)`, `Gy = I(x,y+1) - I(x,y-1)`;
+  (2) L1-magnitude `|Gx| + |Gy|` + unsigned orientation bin via an
+  integer atan2 lookup (the same 8-quadrant tangent-table trick
+  image_sift's `_sift_dir_bin` uses); (3) divide into 8x8 CELLS,
+  one num_bins=9 histogram per cell weighted by magnitude;
+  (4) group into 2x2 BLOCKS = 36-element descriptors,
+  L2-normalize to 1000 milli, clip every component at 200 milli
+  (L2-Hys; Lowe's 0.2 illumination cap mirrored from SIFT's
+  descriptor), re-normalize, and apply a final clamp so the
+  documented invariant "no bin > 200 milli" holds post-renorm;
+  (5) slide blocks at stride=1 (50% overlap) and concatenate in
+  scan order. Total descriptor length for a WxH image with
+  cell_size=8 is `(W/8 - 1) * (H/8 - 1) * 36`; for the 32x32
+  reference fixture that is `3 * 3 * 36 = 324` ints (well under
+  the 2^20 codegen pointer-threshold ceiling). HOG is the FOURTH
+  descriptor family alongside the sparse keypoint detectors:
+  unlike SIFT/ORB it is NOT rotation-invariant (a rotated copy of
+  the same image produces a different HOG vector, unit-tested),
+  but it IS moderately translation-invariant within a block stride
+  (also unit-tested). The trade-off is by design: HOG is meant
+  for templates where orientation is part of the identity
+  (upright pedestrians, cars from the side -- Dalal-Triggs's
+  canonical 64x128 pedestrian window produces 105 blocks x 36 =
+  3780 ints, the standard SVM input). Per-image atoms:
+  `image_hog_descriptor_size_<small|medium|large>` (size buckets:
+  <=200 small, <=1000 medium, >1000 large -- the 32x32 default
+  produces medium, the 64x128 Dalal-Triggs window produces large)
+  and `image_hog_dominant_bin_<0..8|none>` (the argmax over the
+  global per-bin magnitude sums). The vertical-edge integration
+  fixture produces `dominant_bin=0` (horizontal gradient direction
+  even though the EDGE is vertical -- HOG quantizes the gradient
+  vector's orientation, not the edge axis); the four-spots fixture
+  produces `dominant_bin=4` (vertical, since the spot edges run
+  horizontally across the spot boundary -- the unit test asserts
+  these two fixtures disagree, demonstrating that HOG separates
+  single-direction edges from clustered-corner content). The
+  `hog_compare` distance metric is L1 over the concatenated
+  normalized vectors (identical images -> 0; rotation by 90 deg
+  on the same fixture -> >= 2000 milli; 1-px translation -> small,
+  unit-tested). Dimensions capped at 256x256 per axis (same as
+  SIFT/ORB); cell_size in {4, 8, 16}; num_bins in {6, 9, 12}; the
+  minimum dim is 16 (two cells of 8 minimum to form one 2x2 block).
+  New chat admin: `/hog PATH` decodes a PGM and prints
+  `(hog WxH cells=N dominant_bin=K magnitude_mean=M)`. The integer
+  Newton's-method sqrt for the L2 norm is bounded at 50 iterations
+  (same shape as `_sift_isqrt`).
 - **Stereo block-matching SAD disparity + depth**
   (`src/io/transducers/image_stereo.nova`, R7E -- the missing third
   dimension). The CV pipeline so far operates on a single image:

@@ -512,6 +512,36 @@ computational units rather than orchestrating a pipeline of modules.
 > produces 0 matches (the Harris-proximity filter rejects every FAST
 > candidate on a single-direction edge). New chat admin:
 > `/orb_match A B`. Documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from
+> `io/transducers/image_hog.nova` added in R14D Histogram of Oriented
+> Gradients (Dalal-Triggs 2005) dense descriptor -- the FOURTH descriptor
+> family alongside the sparse keypoint detectors (SIFT R5C, ORB R6D,
+> Harris R1.6). Where sparse keypoints describe only a handful of
+> distinctive points, HOG tiles the WHOLE image and summarizes gradient
+> orientation in fixed 8x8 cells, building a long fixed-topology
+> descriptor (the feature that powered classical pedestrian detection
+> and the standard baseline for "describe the image as a single vector"
+> tasks). Per-pixel central-difference gradient -> L1-magnitude +
+> unsigned orientation bin (integer atan2 via 8-quadrant tangent table)
+> -> 8x8 cell histogram (9 bins, magnitude-weighted) -> 2x2 block
+> concatenation (36 ints) -> L2-Hys normalization (L2 = 1000 milli,
+> clip at 200 milli, re-normalize, final clamp so "no bin > 200" is
+> a documented invariant) -> stride-1 sliding (50% overlap) ->
+> concatenated descriptor. For the 32x32 reference fixture: 3x3=9
+> blocks x 36 = 324 ints. For Dalal-Triggs' canonical 64x128
+> pedestrian window: 7x15=105 blocks x 36 = 3780 ints. HOG is NOT
+> rotation-invariant by design (unit-tested: a 90-deg rotated copy of
+> the vertical-edge fixture produces L1 distance >= 2000 milli; SIFT/ORB
+> would match such a rotation) but IS moderately translation-invariant
+> within a block stride. New per-image atoms:
+> `image_hog_descriptor_size_<small|medium|large>` and
+> `image_hog_dominant_bin_<0..8|none>`. New chat admin: `/hog PATH`
+> prints `(hog WxH cells=N dominant_bin=K magnitude_mean=M)`. On the
+> 32x32 four-spots fixture dominant_bin=4 (vertical); on the 32x32
+> vertical-edge fixture dominant_bin=0 (horizontal -- the gradient
+> direction is perpendicular to the edge); the integration scenario
+> asserts these disagree. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > unchanged from the snapshot
 > v1 -> v2 migration session -- the bump landed inside the existing
 > `persistence/snapshot_{writer,disk,reader}.nova` trio +
@@ -718,6 +748,18 @@ computational units rather than orchestrating a pipeline of modules.
 > faster than full on tmpfs (fsync-floor-bound at this size) and ~4x
 > faster on a 5000-atom KG. Documented in
 > [`SNAPSHOT_FORMAT.md`](./SNAPSHOT_FORMAT.md),
+> +1 from `scenario_ggg_hog.sh` added in R14D HOG dense descriptor:
+> /help advertises /hog; /hog with no arg prints usage; /hog on
+> missing file surfaces parser error; /hog on too-small (8x8) image
+> prints the minimum-dim error; /hog on a 32x32 four-spots fixture
+> returns a valid `(hog 32x32 cells=16 dominant_bin=4 magnitude_mean=N)`
+> tuple; /hog on a 32x32 vertical-edge fixture returns dominant_bin=0
+> (horizontal gradient direction); the two fixtures produce different
+> dominant bins (HOG separates clustered corners from single-direction
+> edges); magnitude_mean > 0 on edge fixture; cells=16 matches the
+> expected 4x4 cell grid; the chat survives all probing and reaches
+> /quit cleanly. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 suite / +34 assertions from `test_orb.nova` added in P3.3 cont. v3
 > ORB feature detector + Hamming-distance matcher: FAST-9 4-corner
 > detection on a 40x40 four-spots fixture surfaces 96 keypoints; orb
@@ -744,6 +786,23 @@ computational units rather than orchestrating a pipeline of modules.
 > round-trip; dimension cap (>512) rejects without crashing; too-small
 > (2x2) images return empty edge list; result-tuple accessors work,
 > documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 suite / +55 assertions from `test_image_hog.nova` added in R14D
+> HOG (Histogram of Oriented Gradients) dense descriptor: uniform 32x32
+> -> all-zero per-cell histograms (degenerate); vertical-edge fixture ->
+> dominant bin 0 (horizontal gradient); horizontal-edge fixture ->
+> dominant bin 4 (vertical gradient); diagonal-edge fixture -> dominant
+> bin in {2, 6}; L2-Hys invariant -- every block component <= 200
+> milli post-final-clip; sum_sq in expected range; `hog_compare` ==
+> 0 on identical images, >= 2000 milli on a 90-deg rotated copy
+> (**HOG is NOT rotation-invariant** -- the documented trade-off
+> versus SIFT/ORB), and SMALLER than rotation on a 1-px translation;
+> per-cell-histogram OOB queries return the empty list sentinel;
+> oversized (300x300) / zero-pointer / invalid-cell-size (5) /
+> invalid-num-bins (7) / too-small (8x8) inputs return the empty
+> result; 32x32 descriptor length = 324, 64x64 = 1764; cell_size=4
+> and num_bins=6 alternative configurations work; dominant-bin and
+> descriptor-size label round-trips. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 suite / +87 assertions from `test_jpeg_decode.nova` covering
 > P3.1.JPEG structural parser + P3.1.JPEG cont. entropy decode + IDCT
 > pipeline: in-memory baseline-grayscale fixture builder; segment
