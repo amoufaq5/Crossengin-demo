@@ -1365,3 +1365,651 @@ fn lk_pgm_paths_pyramid(path_prev, path_next) {
         + "milli valid=" + int_to_str(valid)
         + " " + lk_flow_density_label(result) + ")"
 }
+
+// =========================================================================
+// R13B: Full per-pixel pyramidal Lucas-Kanade propagation.
+// =========================================================================
+//
+// R11A above ships pyramidal LK with a TRANSLATIONAL-AGGREGATE simplification:
+// at each level the per-pixel flow corrections are CLAMPED to +/-4000 milli
+// then AVERAGED into a single global (u, v) shift that propagates to the
+// next level. The clamp is load-bearing -- boundary discontinuities from
+// shifted-zero strips produce wild per-pixel values that would otherwise
+// dominate any unweighted mean. The downside: a frame whose left half
+// shifts by 8 px and right half shifts by 2 px collapses to ~5 px
+// everywhere (the average) -- motion DISCONTINUITIES are washed out.
+//
+// R13B implements the FULL Bouguet 2000 per-pixel propagation:
+//   1. Build Gaussian pyramid (reuse R11A's lk_pyramid_build).
+//   2. At the coarsest level, initialize the per-pixel flow field to all
+//      zeros.
+//   3. For each level coarsest -> finest:
+//      a. For each pixel (x, y): warp NEXT around (x + u(x,y), y + v(x,y))
+//         using BILINEAR interpolation (preserves sub-pixel accuracy
+//         across pyramid levels; the R11A integer warp would accumulate
+//         quantization error across levels).
+//      b. Run R10D's single-level LK on (prev[level], warped) -> per-
+//         pixel correction field (du(x,y), dv(x,y)).
+//      c. Apply ROBUST OUTLIER DETECTION per pixel: reject the
+//         candidate iff (|du| + |dv|) is more than 3 * MAD of the same
+//         magnitude in the surrounding 7x7 window. (Pixel-level
+//         decision; an outlier keeps its previous-level flow rather
+//         than dominating the answer.) A HARD CEILING of 8000 milli
+//         per single-iteration correction is applied first so that
+//         clusters of wild boundary corrections do not pollute the
+//         MAD baseline.
+//      d. Accepted: u(x,y) += du(x,y); v(x,y) += dv(x,y).
+//   4. At the COARSEST LEVEL ONLY, pixels whose inner solve was invalid
+//      or whose correction was rejected receive the GLOBAL MEDIAN
+//      correction as a fill, seeding the next level's warp with a
+//      coherent field everywhere. At finer levels the propagated
+//      coarser estimate IS the right fallback; we do not re-fill.
+//   5. Upsample the flow field to the next finer level:
+//        flow_at_finer(x, y) = 2 * flow_at_coarser(x/2, y/2)
+//      (nearest-neighbor on coarser coordinates; pixel coordinate AND shift
+//      both double when descending.)
+//   6. Final output: dense flow field at the finest level. The public
+//      result's valid_buf reflects only pixels whose own per-pixel
+//      solve accepted at the finest level -- textureless regions still
+//      flag invalid, matching the R10D / R11A contract.
+//
+// Per-pixel propagation handles motion DISCONTINUITIES (the brief's
+// headline win) without losing R11A's robustness to boundary outliers --
+// the MAD-based per-pixel rejection + hard ceiling replaces the blanket
+// +/-4000 ceiling on the global average. The downside is cost:
+// per-pixel solves at every level. On the 80x64 fixture this is ~5x
+// slower; acceptable for the offline /flow_pp admin pipeline.
+
+let LK_PP_DEFAULT_MAD_WINDOW = 7    // 7x7 robust-stats window per pixel
+let LK_PP_DEFAULT_MAD_FACTOR = 3    // 3x MAD acceptance ceiling
+let LK_PP_HARD_CEIL_MILLI    = 8000 // per-iteration absolute correction cap
+// Per-level iteration count. The per-pixel pipeline differs from R11A's
+// translational-aggregate pipeline: multi-iteration refinement at the
+// same level uses a per-pixel WARP that may include MAD-rejected pixels
+// (kept at their previous value). Subsequent iterations land on a
+// scrambled image and the inner solve produces wild residuals, which the
+// MAD test cannot reliably reject because the WHOLE neighborhood is wild.
+// Empirically, ONE iteration per level converges; iter >= 3 diverges.
+// Callers can opt back in via the max_iter parameter.
+let LK_PP_DEFAULT_MAX_ITER   = 1
+
+// ---- bilinear sample (byte buffer, sub-pixel x_milli, y_milli) ---------
+//
+// _lk_pp_bilinear(image, w, h, x_milli, y_milli) -> int in [0..255]
+//   x_milli, y_milli encode sub-pixel coordinates (x = x_milli / 1000).
+//   OOB samples read 0 (mirrors lk_warp_image; cleaner than mirror
+//   extrapolation at the linearization seam).
+
+fn _lk_pp_bilinear(image, width, height, x_milli, y_milli) {
+    if image == 0 { return 0 }
+    // Floor in milli space. NOVA integer division truncates toward zero;
+    // we want floor (round toward -inf) so negatives need a bias.
+    let x0 = 0
+    let y0 = 0
+    if x_milli >= 0 {
+        x0 = x_milli / LK_MILLI_PER_UNIT
+    } else {
+        let neg = 0 - x_milli
+        x0 = 0 - int_add(neg, int_sub(LK_MILLI_PER_UNIT, 1)) / LK_MILLI_PER_UNIT
+    }
+    if y_milli >= 0 {
+        y0 = y_milli / LK_MILLI_PER_UNIT
+    } else {
+        let neg = 0 - y_milli
+        y0 = 0 - int_add(neg, int_sub(LK_MILLI_PER_UNIT, 1)) / LK_MILLI_PER_UNIT
+    }
+    let fx_milli = int_sub(x_milli, int_mul(x0, LK_MILLI_PER_UNIT))
+    let fy_milli = int_sub(y_milli, int_mul(y0, LK_MILLI_PER_UNIT))
+    let one_minus_fx = int_sub(LK_MILLI_PER_UNIT, fx_milli)
+    let one_minus_fy = int_sub(LK_MILLI_PER_UNIT, fy_milli)
+    let x1 = int_add(x0, 1)
+    let y1 = int_add(y0, 1)
+    let p00 = 0
+    let p10 = 0
+    let p01 = 0
+    let p11 = 0
+    if x0 >= 0 {
+        if x0 < width {
+            if y0 >= 0 {
+                if y0 < height {
+                    p00 = load8(int_add(image, int_add(int_mul(y0, width), x0)))
+                }
+            }
+        }
+    }
+    if x1 >= 0 {
+        if x1 < width {
+            if y0 >= 0 {
+                if y0 < height {
+                    p10 = load8(int_add(image, int_add(int_mul(y0, width), x1)))
+                }
+            }
+        }
+    }
+    if x0 >= 0 {
+        if x0 < width {
+            if y1 >= 0 {
+                if y1 < height {
+                    p01 = load8(int_add(image, int_add(int_mul(y1, width), x0)))
+                }
+            }
+        }
+    }
+    if x1 >= 0 {
+        if x1 < width {
+            if y1 >= 0 {
+                if y1 < height {
+                    p11 = load8(int_add(image, int_add(int_mul(y1, width), x1)))
+                }
+            }
+        }
+    }
+    // Each weight is in [0..LK_MILLI_PER_UNIT]; the four sum to
+    // LK_MILLI_PER_UNIT^2 = 1,000,000. Divide once at the end.
+    let w00 = int_mul(one_minus_fx, one_minus_fy)
+    let w10 = int_mul(fx_milli,     one_minus_fy)
+    let w01 = int_mul(one_minus_fx, fy_milli)
+    let w11 = int_mul(fx_milli,     fy_milli)
+    let s = int_add(int_mul(w00, p00),
+                    int_add(int_mul(w10, p10),
+                            int_add(int_mul(w01, p01),
+                                    int_mul(w11, p11))))
+    let v = s / int_mul(LK_MILLI_PER_UNIT, LK_MILLI_PER_UNIT)
+    if v < 0   { v = 0 }
+    if v > 255 { v = 255 }
+    return v
+}
+
+// ---- per-pixel warp into a fresh byte buffer ---------------------------
+
+fn _lk_pp_warp_field(image, width, height, u_field, v_field) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    if image == 0 { return dst }
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let pi = int_add(row_off, x)
+            let u_m = 0
+            let v_m = 0
+            if u_field != 0 { u_m = _lk_get(u_field, pi) }
+            if v_field != 0 { v_m = _lk_get(v_field, pi) }
+            let sx_m = int_add(int_mul(x, LK_MILLI_PER_UNIT), u_m)
+            let sy_m = int_add(int_mul(y, LK_MILLI_PER_UNIT), v_m)
+            let v = _lk_pp_bilinear(image, width, height, sx_m, sy_m)
+            store8(int_add(dst, pi), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- upsample a flow field by 2x ---------------------------------------
+//
+// _lk_pp_upsample(field, sw, sh, dw, dh) -> field on dw x dh grid;
+//   finer[x, y] = 2 * coarse[x/2, y/2]. Nearest-neighbor with DOUBLING.
+
+fn _lk_pp_upsample(field, sw, sh, dw, dh) {
+    let area = int_mul(dw, dh)
+    let dst = _lk_buf_alloc(area, 0)
+    if field == 0 { return dst }
+    let y = 0
+    while y < dh {
+        let sy = y / 2
+        if sy >= sh { sy = int_sub(sh, 1) }
+        let src_row = int_mul(sy, sw)
+        let dst_row = int_mul(y, dw)
+        let x = 0
+        while x < dw {
+            let sx = x / 2
+            if sx >= sw { sx = int_sub(sw, 1) }
+            let v_coarse = _lk_get(field, int_add(src_row, sx))
+            _lk_set(dst, int_add(dst_row, x), int_mul(v_coarse, 2))
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- median + MAD over a small int list --------------------------------
+//
+// In-place insertion sort + median pick + MAD = median(|x - median|).
+// NOVA has no sort builtin; insertion sort is fine for n <= 49.
+
+fn _lk_pp_isort(arr, n) {
+    let i = 1
+    while i < n {
+        let key = arr[i]
+        let j = int_sub(i, 1)
+        while j >= 0 {
+            if arr[j] > key {
+                list_set(arr, int_add(j, 1), arr[j])
+                j = int_sub(j, 1)
+            } else {
+                // Inserted; break inner loop.
+                j = 0 - 1
+            }
+        }
+        list_set(arr, int_add(j, 1), key)
+        i = int_add(i, 1)
+    }
+}
+
+fn _lk_pp_median_of_list(arr, n) {
+    if n <= 0 { return 0 }
+    _lk_pp_isort(arr, n)
+    return arr[n / 2]
+}
+
+// _lk_pp_mad(arr, n) -> MAD. Mutates arr (sorts twice).
+fn _lk_pp_mad(arr, n) {
+    if n <= 0 { return 0 }
+    let med = _lk_pp_median_of_list(arr, n)
+    let i = 0
+    while i < n {
+        let d = int_sub(arr[i], med)
+        if d < 0 { d = 0 - d }
+        list_set(arr, i, d)
+        i = int_add(i, 1)
+    }
+    return _lk_pp_median_of_list(arr, n)
+}
+
+// ---- per-pixel correction validity ------------------------------------
+//
+// At pixel (cx, cy) we have a candidate correction (du, dv) and a 7x7
+// neighborhood of candidate corrections from the same level's inner
+// solve. We collect the |du|+|dv| magnitudes from that neighborhood
+// (excluding above-ceiling outliers, which would pollute the MAD
+// baseline) and compute the median + MAD; the candidate is accepted iff
+// |its magnitude - median| <= LK_PP_DEFAULT_MAD_FACTOR * MAD. The hard
+// ceiling is applied first.
+
+fn _lk_pp_accept_correction(corr_u, corr_v, valid_buf, width, height,
+                             cx, cy, du, dv, mad_window) {
+    let amag = du
+    if amag < 0 { amag = 0 - amag }
+    let avmag = dv
+    if avmag < 0 { avmag = 0 - avmag }
+    let mcand = int_add(amag, avmag)
+    if mcand > LK_PP_HARD_CEIL_MILLI { return 0 }
+    let half = mad_window / 2
+    let mags = list_new()
+    let dy = 0 - half
+    while dy <= half {
+        let py = int_add(cy, dy)
+        let dx = 0 - half
+        while dx <= half {
+            let px = int_add(cx, dx)
+            if px >= 0 {
+                if px < width {
+                    if py >= 0 {
+                        if py < height {
+                            let pi = int_add(int_mul(py, width), px)
+                            if _lk_get(valid_buf, pi) == 1 {
+                                let nu = _lk_get(corr_u, pi)
+                                let nv = _lk_get(corr_v, pi)
+                                let au = nu
+                                if au < 0 { au = 0 - au }
+                                let av = nv
+                                if av < 0 { av = 0 - av }
+                                let nm = int_add(au, av)
+                                if nm <= LK_PP_HARD_CEIL_MILLI {
+                                    push(mags, nm)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    let n = len(mags)
+    // Too few neighborhood samples to compute robust statistics; the
+    // hard ceiling is the sole guard in that degenerate case.
+    if n < 4 { return 1 }
+    let med = _lk_pp_median_of_list(mags, n)
+    let mad = _lk_pp_mad(mags, n)
+    // Floor MAD: prevents the test from collapsing on a uniform
+    // neighborhood. The floor scales with the median so that uniformly-
+    // large-but-truly-uniform neighborhoods accept everything within
+    // ~3x of the median rather than ~3x of zero.
+    let mad_floor = 50
+    let med_half = med / 2
+    if med_half > mad_floor { mad_floor = med_half }
+    if mad < mad_floor { mad = mad_floor }
+    let ceil = int_mul(mad, LK_PP_DEFAULT_MAD_FACTOR)
+    let dev = int_sub(mcand, med)
+    if dev < 0 { dev = 0 - dev }
+    if dev <= ceil { return 1 }
+    return 0
+}
+
+// _lk_pp_global_median(corr_u, corr_v, valid, area) -> [med_u, med_v]
+//   Robust per-axis median across the level's accepted-by-inner
+//   corrections (excluding above-ceiling outliers). Used at the
+//   coarsest level only to fill pixels that the inner solve could not
+//   handle.
+
+fn _lk_pp_global_median(corr_u, corr_v, valid, area) {
+    let us = list_new()
+    let vs = list_new()
+    let pi = 0
+    while pi < area {
+        if _lk_get(valid, pi) == 1 {
+            let u = _lk_get(corr_u, pi)
+            let v = _lk_get(corr_v, pi)
+            let au = u
+            if au < 0 { au = 0 - au }
+            let av = v
+            if av < 0 { av = 0 - av }
+            if int_add(au, av) <= LK_PP_HARD_CEIL_MILLI {
+                push(us, u)
+                push(vs, v)
+            }
+        }
+        pi = int_add(pi, 1)
+    }
+    let result = list_new()
+    let n = len(us)
+    if n == 0 {
+        push(result, 0)
+        push(result, 0)
+        return result
+    }
+    let mu = _lk_pp_median_of_list(us, n)
+    let mv = _lk_pp_median_of_list(vs, n)
+    push(result, mu)
+    push(result, mv)
+    return result
+}
+
+// _lk_pp_apply_level: warp + solve + per-pixel-accept at one level.
+//   `valid_field`    -- 1 if flow at this pixel is trustable to warp
+//                       with (real solve OR coarsest-level fill).
+//   `accepted_field` -- 1 iff the pixel was ever output of a real
+//                       inner-LK solve. The final result tuple's
+//                       valid_buf reflects this so textureless regions
+//                       still flag invalid.
+//   `is_coarsest`    -- 1 at the coarsest pyramid level; triggers the
+//                       global-median fill pass after the per-pixel
+//                       solves complete.
+
+fn _lk_pp_apply_level(u_field, v_field, valid_field, accepted_field,
+                      p_buf, n_buf,
+                      lw, lh, ws, max_iter, mad_window, is_coarsest) {
+    let level_area = int_mul(lw, lh)
+    let it = 0
+    while it < max_iter {
+        let warped = _lk_pp_warp_field(n_buf, lw, lh, u_field, v_field)
+        let inner = lk_optical_flow(p_buf, warped, lw, lh, ws)
+        let inner_flow  = inner[LK_R_FLOW_BUF]
+        let inner_valid = inner[LK_R_VALID_BUF]
+        let inner_cnt   = inner[LK_R_VALID_COUNT]
+        if inner_cnt == 0 {
+            it = max_iter
+        } else {
+            let corr_u = _lk_buf_alloc(level_area, 0)
+            let corr_v = _lk_buf_alloc(level_area, 0)
+            let pi = 0
+            while pi < level_area {
+                if _lk_get(inner_valid, pi) == 1 {
+                    _lk_set(corr_u, pi, _lk_get(inner_flow, int_mul(pi, 2)))
+                    _lk_set(corr_v, pi, _lk_get(inner_flow,
+                                                int_add(int_mul(pi, 2), 1)))
+                }
+                pi = int_add(pi, 1)
+            }
+            let u_new = _lk_buf_alloc(level_area, 0)
+            let v_new = _lk_buf_alloc(level_area, 0)
+            let valid_new = _lk_buf_alloc(level_area, 0)
+            let accepted_new = _lk_buf_alloc(level_area, 0)
+            let p0 = 0
+            while p0 < level_area {
+                _lk_set(u_new, p0, _lk_get(u_field, p0))
+                _lk_set(v_new, p0, _lk_get(v_field, p0))
+                _lk_set(valid_new, p0, _lk_get(valid_field, p0))
+                _lk_set(accepted_new, p0, _lk_get(accepted_field, p0))
+                p0 = int_add(p0, 1)
+            }
+            let total_correction_mag = 0
+            let accepted_cnt = 0
+            let y = 0
+            while y < lh {
+                let row_off = int_mul(y, lw)
+                let x = 0
+                while x < lw {
+                    let p = int_add(row_off, x)
+                    if _lk_get(inner_valid, p) == 1 {
+                        let du = _lk_get(corr_u, p)
+                        let dv = _lk_get(corr_v, p)
+                        let ok = _lk_pp_accept_correction(
+                            corr_u, corr_v, inner_valid, lw, lh,
+                            x, y, du, dv, mad_window)
+                        if ok == 1 {
+                            let new_u = int_add(_lk_get(u_field, p), du)
+                            let new_v = int_add(_lk_get(v_field, p), dv)
+                            _lk_set(u_new, p, new_u)
+                            _lk_set(v_new, p, new_v)
+                            _lk_set(valid_new, p, 1)
+                            _lk_set(accepted_new, p, 1)
+                            accepted_cnt = int_add(accepted_cnt, 1)
+                            let admag = du
+                            if admag < 0 { admag = 0 - admag }
+                            let avmag = dv
+                            if avmag < 0 { avmag = 0 - avmag }
+                            total_correction_mag = int_add(total_correction_mag,
+                                                            int_add(admag, avmag))
+                        }
+                    }
+                    x = int_add(x, 1)
+                }
+                y = int_add(y, 1)
+            }
+            if is_coarsest == 1 {
+                if accepted_cnt > 0 {
+                    let med = _lk_pp_global_median(corr_u, corr_v,
+                                                    inner_valid, level_area)
+                    let med_u = med[0]
+                    let med_v = med[1]
+                    let p2 = 0
+                    while p2 < level_area {
+                        if _lk_get(valid_new, p2) == 0 {
+                            _lk_set(u_new, p2,
+                                    int_add(_lk_get(u_field, p2), med_u))
+                            _lk_set(v_new, p2,
+                                    int_add(_lk_get(v_field, p2), med_v))
+                            _lk_set(valid_new, p2, 1)
+                        }
+                        p2 = int_add(p2, 1)
+                    }
+                }
+            }
+            let p1 = 0
+            while p1 < level_area {
+                _lk_set(u_field, p1, _lk_get(u_new, p1))
+                _lk_set(v_field, p1, _lk_get(v_new, p1))
+                _lk_set(valid_field, p1, _lk_get(valid_new, p1))
+                _lk_set(accepted_field, p1, _lk_get(accepted_new, p1))
+                p1 = int_add(p1, 1)
+            }
+            if accepted_cnt > 0 {
+                let mean_corr = total_correction_mag / accepted_cnt
+                if mean_corr < 100 { it = max_iter }
+            } else {
+                it = max_iter
+            }
+        }
+        it = int_add(it, 1)
+    }
+}
+
+// ---- lk_optical_flow_pyramid_perpixel (R13B public API) ---------------
+
+fn lk_optical_flow_pyramid_perpixel(prev_ptr, next_ptr, width, height,
+                                     win_size, levels, max_iter) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let req_levels = levels
+    if req_levels < 1                 { req_levels = LK_PYR_DEFAULT_LEVELS }
+    if req_levels > LK_PYR_MAX_LEVELS { req_levels = LK_PYR_MAX_LEVELS }
+    let req_iter = max_iter
+    if req_iter < 1 { req_iter = LK_PP_DEFAULT_MAX_ITER }
+    if req_iter > 8 { req_iter = 8 }
+
+    let pyr_prev = lk_pyramid_build(prev_ptr, width, height, req_levels)
+    let pyr_next = lk_pyramid_build(next_ptr, width, height, req_levels)
+    let L = len(pyr_prev)
+    if L < 1 { return _lk_fail() }
+    if len(pyr_next) < L { L = len(pyr_next) }
+
+    let coarsest = int_sub(L, 1)
+    let cw = lk_pyramid_level_width(pyr_prev,  coarsest)
+    let ch = lk_pyramid_level_height(pyr_prev, coarsest)
+    let coarsest_area = int_mul(cw, ch)
+    let u_field = _lk_buf_alloc(coarsest_area, 0)
+    let v_field = _lk_buf_alloc(coarsest_area, 0)
+    let valid_field    = _lk_buf_alloc(coarsest_area, 0)
+    let accepted_field = _lk_buf_alloc(coarsest_area, 0)
+
+    let l = coarsest
+    while l >= 0 {
+        let lw = lk_pyramid_level_width(pyr_prev,  l)
+        let lh = lk_pyramid_level_height(pyr_prev, l)
+        let p_buf = lk_pyramid_level_data(pyr_prev, l)
+        let n_buf = lk_pyramid_level_data(pyr_next, l)
+        let is_coarsest = 0
+        if l == coarsest { is_coarsest = 1 }
+        _lk_pp_apply_level(u_field, v_field, valid_field, accepted_field,
+                            p_buf, n_buf,
+                            lw, lh, ws, req_iter,
+                            LK_PP_DEFAULT_MAD_WINDOW, is_coarsest)
+        if l > 0 {
+            let nl = int_sub(l, 1)
+            let nw = lk_pyramid_level_width(pyr_prev,  nl)
+            let nh = lk_pyramid_level_height(pyr_prev, nl)
+            let new_u = _lk_pp_upsample(u_field, lw, lh, nw, nh)
+            let new_v = _lk_pp_upsample(v_field, lw, lh, nw, nh)
+            let new_valid_area = int_mul(nw, nh)
+            let new_valid    = _lk_buf_alloc(new_valid_area, 0)
+            let new_accepted = _lk_buf_alloc(new_valid_area, 0)
+            let yy = 0
+            while yy < nh {
+                let sy = yy / 2
+                if sy >= lh { sy = int_sub(lh, 1) }
+                let src_row = int_mul(sy, lw)
+                let dst_row = int_mul(yy, nw)
+                let xx = 0
+                while xx < nw {
+                    let sx = xx / 2
+                    if sx >= lw { sx = int_sub(lw, 1) }
+                    let sp = int_add(src_row, sx)
+                    let dp = int_add(dst_row, xx)
+                    _lk_set(new_valid,    dp, _lk_get(valid_field,    sp))
+                    _lk_set(new_accepted, dp, _lk_get(accepted_field, sp))
+                    xx = int_add(xx, 1)
+                }
+                yy = int_add(yy, 1)
+            }
+            u_field = new_u
+            v_field = new_v
+            valid_field    = new_valid
+            accepted_field = new_accepted
+        }
+        l = int_sub(l, 1)
+    }
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+    let pi = 0
+    while pi < area {
+        let u = _lk_get(u_field, pi)
+        let v = _lk_get(v_field, pi)
+        _lk_set(flow_buf, int_mul(pi, 2),               u)
+        _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),   v)
+        if _lk_get(accepted_field, pi) == 1 {
+            _lk_set(valid_buf, pi, 1)
+            valid_count = int_add(valid_count, 1)
+            let mag = _lk_isqrt(int_add(int_mul(u, u), int_mul(v, v)))
+            mag_sum = int_add(mag_sum, mag)
+        }
+        pi = int_add(pi, 1)
+    }
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// ---- chat admin: /flow_pp prev.pgm next.pgm ----------------------------
+
+fn lk_pgm_args_pyramid_perpixel(arg) {
+    if len(arg) == 0 {
+        return "(/flow_pp needs two PATHs -- usage: /flow_pp prev.pgm next.pgm)"
+    }
+    let parts = _lk_split_two(arg)
+    return lk_pgm_paths_pyramid_perpixel(parts[0], parts[1])
+}
+
+fn lk_pgm_paths_pyramid_perpixel(path_prev, path_next) {
+    if len(path_prev) == 0 {
+        return "(/flow_pp needs two PATHs -- usage: /flow_pp prev.pgm next.pgm)"
+    }
+    if len(path_next) == 0 {
+        return "(/flow_pp needs TWO paths -- got 1)"
+    }
+    let r_p = pgm_parse_file(path_prev)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(flow_pp FAILED on prev: " + err_p + ")"
+    }
+    let r_n = pgm_parse_file(path_next)
+    let err_n = pgm_result_error(r_n)
+    if len(err_n) > 0 {
+        return "(flow_pp FAILED on next: " + err_n + ")"
+    }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    let w_n = pgm_result_width(r_n)
+    let h_n = pgm_result_height(r_n)
+    if w_p != w_n {
+        return "(flow_pp FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if h_p != h_n {
+        return "(flow_pp FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if w_p > LK_MAX_DIM { return "(flow_pp FAILED: prev too large -- max 256x256)" }
+    if h_p > LK_MAX_DIM { return "(flow_pp FAILED: prev too large -- max 256x256)" }
+    let d_p = pgm_result_data(r_p)
+    let d_n = pgm_result_data(r_n)
+    let result = lk_optical_flow_pyramid_perpixel(
+        d_p, d_n, w_p, h_p,
+        LK_DEFAULT_WIN_SIZE,
+        LK_PYR_DEFAULT_LEVELS,
+        LK_PP_DEFAULT_MAX_ITER)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    let valid    = lk_flow_valid_count(result)
+    return "(flow_pp " + int_to_str(w_p) + "x" + int_to_str(h_p)
+        + " mean_mag=" + int_to_str(mean_mag)
+        + "milli valid=" + int_to_str(valid)
+        + " " + lk_flow_density_label(result) + ")"
+}
