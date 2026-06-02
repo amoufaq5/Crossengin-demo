@@ -3,6 +3,113 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R13B (this session) -- Full per-pixel pyramidal Lucas-Kanade
+
+**Status: complete -- `src/io/transducers/image_optical_flow.nova`
+extended (~648 new lines) with `lk_optical_flow_pyramid_perpixel`,
+closing the R11A.2 follow-up flagged in IMAGE_AUDIT.md.** R11A's
+pyramidal LK shipped a translational-aggregate simplification: at each
+pyramid level the per-pixel corrections were CLAMPED to +/-4000 milli
+then AVERAGED into a single global (u, v) shift propagated to the next
+level. Motion DISCONTINUITIES (left half shifts by 10 px, right half
+stays still) collapsed to a single global aggregate dominated by
+boundary noise. R13B implements the full Bouguet 2000 per-pixel
+propagation with MAD-based outlier rejection.
+
+### Algorithm (R13B)
+
+1. Build Gaussian pyramid (reuse R11A's `lk_pyramid_build`).
+2. Coarsest level: initialize per-pixel u, v fields to zeros.
+3. For each level coarse -> fine:
+   a. Bilinearly warp NEXT per-pixel by current (u, v) (sub-pixel
+      preserving across levels).
+   b. Run R10D's single-level LK on (prev, warped) -> per-pixel
+      correction field.
+   c. Per-pixel accept: |du|+|dv| <= 8000 milli HARD CEILING, then
+      |m - median(7x7-neighborhood-mags)| <= 3 * MAD(neighborhood).
+      Outliers keep their previous (u, v).
+   d. Update accepted pixels: u(x,y) += du; v(x,y) += dv.
+4. Coarsest level only: pixels whose inner solve was invalid or
+   MAD-rejected receive the GLOBAL MEDIAN correction as a fill --
+   seeds next level's warp with a coherent everywhere field. At finer
+   levels the propagated coarser estimate IS the right fallback.
+5. Upsample by 2x (doubling for u, v; nearest-neighbor for valid /
+   accepted flags) to next finer level.
+6. Final result tuple's valid_buf reflects only pixels that were ever
+   output of a real per-pixel inner solve (separate from fill
+   pixels) -- textureless regions still flag valid=0 (R10D contract
+   preserved).
+
+### Public API
+
+- `lk_optical_flow_pyramid_perpixel(prev, next, w, h, win_size,
+  levels, max_iter)` -> result tuple shape identical to R10D's
+  `lk_optical_flow`.
+- `lk_pgm_args_pyramid_perpixel(arg)` -> chat helper for `/flow_pp`.
+
+### Headline results
+
+- **Motion discontinuity (128x64, dense sinusoidal texture, left
+  shift=10 px, right shift=0 px)**: R13B reads LEFT u=8180 RIGHT u=0
+  (recovering both regions independently). R11A's translational-
+  aggregate reads LEFT u=2008 RIGHT u=552 (both halves collapse
+  toward boundary noise).
+- **Easy uniform 8-px shift (dense fixture)**: R13B reads u=7859
+  (target 8000); R11A reads u=8148 -- comparable, R13B does not
+  regress.
+- **Outlier rejection**: a single-pixel corruption in NEXT
+  (`next[16, 16] = 0` on otherwise-identical frames) is caught by the
+  MAD ceiling -- flow at the corrupt pixel stays near 0 rather than
+  tracking the inner LK's bad-data overshoot.
+- **Texture-less fixtures**: valid_count == 0 (R10D degeneracy
+  preserved by the orchestrator).
+
+### Chat wiring (1 line)
+
+- 1 dispatch line routing `/flow_pp` -> `lk_pgm_args_pyramid_perpixel`.
+  No new help line (within chat budget; consistent with R11A's
+  `/flow_pyr` which also chose dispatch-only).
+
+### Tests
+
+- `tests/unit/test_optical_flow_perpixel.nova` -- 34 assertions
+  covering identical-frames zero flow, motion-discontinuity headline,
+  uniform-shift no regression vs R11A, textureless invalidity,
+  outlier rejection, density-label round-trip, oversized + zero-
+  pointer failure paths, /flow_pp dispatch usage.
+- `tests/integration/scenario_ccc_lk_perpixel.sh` -- 11 assertions
+  covering /flow_pp end-to-end on dense sinusoidal fixtures
+  (identical, uniform shift, 10/0 split-shift discontinuity, dim
+  mismatch, missing file, /quit liveness), plus coexistence with
+  /flow_pyr (R11A) on the same fixture.
+
+### Module count: unchanged (extension only)
+
+### Default max_iter
+
+The brief specified `Default levels=3, max_iter=3` but the per-pixel
+pipeline diverges at max_iter >= 2 on practical fixtures: subsequent
+iterations at the same level warp with a per-pixel field that may
+include MAD-rejected pixels (kept at their previous value), the inner
+LK on that scrambled image produces wild residuals, and the MAD test
+cannot reliably reject them because the whole neighborhood is wild.
+Empirically iter=1 converges cleanly. The constant
+`LK_PP_DEFAULT_MAX_ITER = 1` is used when the caller passes
+max_iter < 1; the parameter remains for experimental control.
+
+### Known limitations
+
+- **Pathological large shifts (e.g. left=12 px / right=0 with L=3)**:
+  per-pixel propagation overshoots and gives a negative u in the
+  left half. The coarsest level's 2x downsample puts the 12-px shift
+  outside R10D's linear regime at L=2 (3 px after downsample); the
+  bootstrap fails. Workaround: use larger images so the pyramid can
+  go deeper, or constrain shift magnitudes to <= ~10 px at L=3.
+- **Cost**: per-pixel solves at every level. On 80x64 with L=3 this
+  is ~5x slower than R11A's translational aggregate. Acceptable for
+  the offline /flow_pp admin pipeline; the visual_perception seam
+  still routes through single-level R10D for live throughput.
+
 ## R13D (this session) — Voice cloning via Klatt formant transfer
 
 **Status: complete -- new `src/io/effectors/audio_voice_clone.nova`

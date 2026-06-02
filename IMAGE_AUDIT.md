@@ -363,10 +363,10 @@ gradient structure and corner geometry, not just intensity moments:
   single-level algorithm is exact for sub-pixel shifts (first-order
   Taylor regime); multi-pixel shifts under-estimate because the
   linearization breaks at the discontinuity. R11A adds the pyramidal
-  coarse-to-fine extension below. Follow-ups: dense Farneback flow,
-  per-pixel residual fields across pyramid levels (the full Bouguet
-  algorithm without R11A's translational-aggregate simplification),
-  motion-occlusion masks.
+  coarse-to-fine extension below; R13B closes R11A's translational-
+  aggregate simplification with full per-pixel propagation across
+  pyramid levels. Follow-ups: dense Farneback flow, motion-occlusion
+  masks.
 
 - **Pyramidal Lucas-Kanade (R11A on top of R10D)**
   (`src/io/transducers/image_optical_flow.nova`, EXTENDED). R10D's
@@ -403,6 +403,46 @@ gradient structure and corner geometry, not just intensity moments:
   in [1..LK_PYR_MAX_LEVELS=5]; default L=3 (handles ~16 px shifts on
   a 256 px image without the bottom level falling under
   LK_PYR_MIN_LEVEL_DIM=8).
+
+- **Full per-pixel pyramidal Lucas-Kanade (R13B on top of R11A)** --
+  same file. R11A's translational-aggregate simplification collapses
+  motion DISCONTINUITIES because it propagates a single (u, v) shift
+  across pyramid levels: a frame whose left half shifts by 10 px and
+  right half stays still gets resolved to ~2 px everywhere (the
+  boundary-noise-dominated average). R13B implements the full Bouguet
+  2000 algorithm: the per-pixel flow field is carried across pyramid
+  levels (each pixel warps NEXT using its own bilinear sub-pixel
+  offset, runs R10D's single-level LK to produce a per-pixel
+  correction, accepts or rejects the correction via a robust
+  7x7-window MAD test plus a per-iteration hard ceiling, then updates
+  the per-pixel u, v). At the coarsest level only, pixels whose inner
+  solve was invalid or whose correction was MAD-rejected receive the
+  global median correction as a fill -- giving the next-level warp a
+  coherent everywhere field rather than zeros. Public API:
+  `lk_optical_flow_pyramid_perpixel(prev, next, w, h, win_size,
+  levels, max_iter)` returns the same result-tuple shape as R10D's
+  single-level solver. The accepted field tracks pixels with REAL
+  per-pixel solves (separate from fill-from-median pixels); the
+  public valid_buf only flags accepted ones, so textureless regions
+  still flag det=0 -> valid=0. Bilinear warp inline (not R11A's
+  integer round-to-nearest) preserves sub-pixel accuracy across
+  pyramid levels. Default `max_iter=1` per level -- in the per-pixel
+  pipeline multi-iter at the same level uses a per-pixel warp that
+  may include rejected pixels (kept at their previous value), the
+  inner solve on that scrambled image produces wild residuals, and
+  the MAD test cannot reliably reject them because the whole
+  neighborhood is wild. New chat admin `/flow_pp prev.pgm next.pgm`.
+  Headline on the 128x64 split-shift fixture (left=10 px, right=0 px,
+  dense sinusoidal texture): R13B reads LEFT u=8180 RIGHT u=0
+  (recovering the discontinuity); R11A's translational-aggregate
+  reads LEFT u=2008 RIGHT u=552 (both halves dominated by boundary
+  noise). On the easy uniform 8-px shift case R13B reads u=7859
+  (target 8000); R11A reads u=8148 -- comparable. Outlier rejection:
+  a single-pixel corruption in NEXT (e.g. `next[16, 16] = 0`) is
+  caught by the MAD ceiling and the per-pixel flow at that pixel
+  stays near zero rather than tracking the inner LK's bad-data
+  overshoot. Textureless fixtures: valid_count == 0 (R10D degeneracy
+  preserved). Closes the R11A.2 follow-up flagged above.
 
 Sobel + Harris fire only when the image is at least 16x16 in each axis
 (the kernel needs a 3x3 neighborhood and the count buckets need

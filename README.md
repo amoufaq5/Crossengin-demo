@@ -298,6 +298,22 @@ computational units rather than orchestrating a pipeline of modules.
 > warp. 52 new unit assertions
 > (`tests/unit/test_optical_flow_pyramid.nova`) + 12 integration
 > assertions (`tests/integration/scenario_uu_pyramid_flow.sh`).
+> R13B (this session) closes R11A's translational-aggregate
+> simplification: `lk_optical_flow_pyramid_perpixel(prev, next, w, h,
+> win, levels=3, max_iter=1)` propagates the per-pixel flow field
+> across pyramid levels with a 7x7 MAD-based outlier rejection at
+> each pixel (replacing R11A's blanket +/-4000 milli ceiling on the
+> global average). Bilinear warp inline preserves sub-pixel accuracy
+> across levels. Headline on a 128x64 motion-discontinuity fixture
+> (dense sinusoidal texture, left half shift=10 px, right half
+> shift=0 px): R13B reads LEFT u=8180 RIGHT u=0 -- each half
+> recovered independently; R11A's translational-aggregate reads
+> LEFT u=2008 RIGHT u=552 -- both halves collapse toward boundary
+> noise. On the easy uniform 8-px shift R13B reads u=7859 vs R11A
+> u=8148 -- comparable, no regression. New chat admin `/flow_pp
+> prev.pgm next.pgm`. 34 new unit assertions
+> (`tests/unit/test_optical_flow_perpixel.nova`) + 11 integration
+> assertions (`tests/integration/scenario_ccc_lk_perpixel.sh`).
 > +1 from R9F adding
 > `src/learning/byzantine_aggregation.nova` — two coordinate-wise robust
 > aggregation rules (trimmed mean + median) that tolerate up to f
