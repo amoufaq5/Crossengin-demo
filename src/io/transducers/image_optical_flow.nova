@@ -351,6 +351,224 @@ fn lk_optical_flow(prev_ptr, next_ptr, width, height, win_size) {
                       area, width, height)
 }
 
+// ---- R12A: SIMD-accelerated Lucas-Kanade (uses R11D simd_add_i32x8) -----
+//
+// lk_optical_flow_simd(prev, next, w, h, win_size) -> same shape as
+// lk_optical_flow. Reuses identical gradient + 2x2 solve math; the only
+// difference is the WIN_SIZE x WIN_SIZE accumulator loop.
+//
+// SIMD accumulation strategy:
+//   1. Stage the 5 product streams (ix^2, iy^2, ixiy, ixit, iyit) for
+//      ALL win*win cells into 5 i32 lane buffers, padded to a multiple
+//      of 8 lanes with zero (zero adds harmlessly under simd_add_i32x8).
+//   2. For each of the 5 sums, maintain an 8-lane i32 accumulator buffer
+//      and invoke simd_add_i32x8(acc, stage_chunk, acc) per 8-lane chunk
+//      (lane-parallel partial sums).
+//   3. After all chunks, scalar-reduce the 8-lane accumulator to a
+//      single int via 8 load_i32_le + add. Mirrors what the AVX2
+//      vphaddd + vextracti128 sequence does at the end of
+//      simd_sum_abs_diff (R11D did not ship an explicit
+//      simd_horizontal_sum_i32x8 builtin).
+//
+// Bit-identical to scalar: integer add is associative + commutative, so
+// lane-parallel partial sums must reduce to the same scalar total.
+//
+// All scratch buffers are allocated ONCE per call and reused across the
+// entire interior pixel scan. Per-pixel alloc would eat the SIMD win.
+
+fn _lk_store_i32_le(buf, idx, v) {
+    let off = int_mul(idx, 4)
+    let u = v
+    if v < 0 { u = int_sub(4294967296, int_sub(0, v)) }
+    store8(int_add(buf, off),                     u % 256)
+    store8(int_add(buf, int_add(off, 1)),         int_div(u, 256) % 256)
+    store8(int_add(buf, int_add(off, 2)),         int_div(u, 65536) % 256)
+    store8(int_add(buf, int_add(off, 3)),         int_div(u, 16777216) % 256)
+}
+
+fn _lk_load_i32_le(buf, idx) {
+    let off = int_mul(idx, 4)
+    let b0 = load8(int_add(buf, off))
+    let b1 = load8(int_add(buf, int_add(off, 1)))
+    let b2 = load8(int_add(buf, int_add(off, 2)))
+    let b3 = load8(int_add(buf, int_add(off, 3)))
+    let u = int_add(b0, int_add(int_mul(b1, 256),
+                                int_add(int_mul(b2, 65536),
+                                        int_mul(b3, 16777216))))
+    if u >= 2147483648 { return int_sub(u, 4294967296) }
+    return u
+}
+
+// Sum lanes of an 8-lane i32 buffer to a scalar (horizontal reduce).
+fn _lk_simd_hsum8(buf) {
+    let s = 0
+    let i = 0
+    while i < 8 {
+        s = int_add(s, _lk_load_i32_le(buf, i))
+        i = int_add(i, 1)
+    }
+    return s
+}
+
+fn _lk_zero_buf(buf, n) {
+    let i = 0
+    while i < n {
+        _lk_store_i32_le(buf, i, 0)
+        i = int_add(i, 1)
+    }
+}
+
+// _lk_simd_enabled() -> 1 if CE_LK_SIMD env var is unset or "on", 0 if
+//   set to "off". A/B toggle for the bench script.
+fn _lk_simd_enabled() {
+    let env = getenv("CE_LK_SIMD")
+    if env == 0      { return 1 }
+    if len(env) == 0 { return 1 }
+    if str_eq(env, "off") == 1 { return 0 }
+    if str_eq(env, "0")   == 1 { return 0 }
+    if str_eq(env, "no")  == 1 { return 0 }
+    return 1
+}
+
+// Compute Σ(stage[0..n_padded)) via SIMD lane-parallel partial sums.
+// stage is an i32 lane buffer padded to a multiple of 8 with trailing
+// zeros; acc is an 8-lane scratch i32 buffer that is zeroed in-place
+// then mutated by the simd_add_i32x8 loop. Returns the scalar sum.
+fn _lk_simd_sum(stage, n_padded, acc) {
+    _lk_zero_buf(acc, 8)
+    let k = 0
+    while k < n_padded {
+        // acc = acc + stage[k .. k+8].
+        simd_add_i32x8(acc, int_add(stage, int_mul(k, 4)), acc)
+        k = int_add(k, 8)
+    }
+    return _lk_simd_hsum8(acc)
+}
+
+fn lk_optical_flow_simd(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+
+    // CE_LK_SIMD=off routes back through the scalar implementation.
+    if _lk_simd_enabled() == 0 {
+        return lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+    }
+
+    // Round n_cells (= ws * ws) up to the next multiple of 8 so the
+    // SIMD partial-sum loop's tail does not need a scalar fallback. The
+    // trailing zero lanes contribute 0 to every sum.
+    let n_cells  = int_mul(ws, ws)
+    let tail = int_sub(n_cells, int_mul(int_div(n_cells, 8), 8))
+    let n_padded = n_cells
+    if tail > 0 { n_padded = int_add(n_cells, int_sub(8, tail)) }
+    let buf_bytes = int_mul(int_add(n_padded, 8), 4)
+    let st_ix2  = alloc(buf_bytes)
+    let st_iy2  = alloc(buf_bytes)
+    let st_ixiy = alloc(buf_bytes)
+    let st_ixit = alloc(buf_bytes)
+    let st_iyit = alloc(buf_bytes)
+    let acc     = alloc(int_mul(8 + 8, 4))   // 8-lane scratch i32 buffer
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Stage the WIN_SIZE x WIN_SIZE product streams into the 5
+            // i32 lane buffers in row-major order. Pad trailing lanes
+            // with zero so simd_add_i32x8's chunk loop doesn't need a
+            // scalar tail.
+            let i = 0
+            let dy = 0 - half
+            while dy <= half {
+                let py = int_add(y, dy)
+                let dx = 0 - half
+                while dx <= half {
+                    let px = int_add(x, dx)
+                    let ix = _lk_ix(prev_ptr, width, px, py)
+                    let iy = _lk_iy(prev_ptr, width, px, py)
+                    let it = _lk_it(prev_ptr, next_ptr, width, px, py)
+                    _lk_store_i32_le(st_ix2,  i, int_mul(ix, ix))
+                    _lk_store_i32_le(st_iy2,  i, int_mul(iy, iy))
+                    _lk_store_i32_le(st_ixiy, i, int_mul(ix, iy))
+                    _lk_store_i32_le(st_ixit, i, int_mul(ix, it))
+                    _lk_store_i32_le(st_iyit, i, int_mul(iy, it))
+                    i = int_add(i, 1)
+                    dx = int_add(dx, 1)
+                }
+                dy = int_add(dy, 1)
+            }
+            while i < n_padded {
+                _lk_store_i32_le(st_ix2,  i, 0)
+                _lk_store_i32_le(st_iy2,  i, 0)
+                _lk_store_i32_le(st_ixiy, i, 0)
+                _lk_store_i32_le(st_ixit, i, 0)
+                _lk_store_i32_le(st_iyit, i, 0)
+                i = int_add(i, 1)
+            }
+            let sum_ix2  = _lk_simd_sum(st_ix2,  n_padded, acc)
+            let sum_iy2  = _lk_simd_sum(st_iy2,  n_padded, acc)
+            let sum_ixiy = _lk_simd_sum(st_ixiy, n_padded, acc)
+            let sum_ixit = _lk_simd_sum(st_ixit, n_padded, acc)
+            let sum_iyit = _lk_simd_sum(st_iyit, n_padded, acc)
+            // 2x2 inverse -- identical to lk_optical_flow.
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // No texture / aperture -- leave (0, 0, 0).
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,             u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1), v_milli)
+                _lk_set(valid_buf, pixel_idx,           1)
+                valid_count = int_add(valid_count, 1)
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
 // ---- accessors -----------------------------------------------------------
 
 // lk_flow_at(result, x, y) -> [u_milli, v_milli, valid]
