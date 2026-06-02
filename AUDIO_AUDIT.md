@@ -1032,6 +1032,157 @@ Chat: `/pitch_shift PATH FACTOR_MILLI` admin one-liner.
   push the output spectrum near the Nyquist edge. Acceptable for
   the +/- 1 octave canonical use case.
 
+## R13D: Voice cloning via Klatt formant transfer
+
+R13D adds the audio *cloning* leg next to R6E synthesis, R7F/R9B VAD,
+R8B/R10B STT, R10F/R11B F0 estimation, and R12D TD-PSOLA. New module
+`src/io/effectors/audio_voice_clone.nova` implements a non-LLM speaker
+voice transfer pipeline: analyze a reference WAV of the target speaker,
+extract their mean P0 (via R11B YIN) + per-formant centers (via
+integer-only LPC + spectral peak-picking), build a transferred phoneme
+formant table, then synthesize new text in the cloned voice.
+
+### Algorithm
+
+1. **Reference analysis** (`vc_analyze_reference`): read WAV via
+   `audio_capture_to_pcm`, run R11B `pitch_track_yin` over the full
+   PCM and take the mean across voiced frames -> P0 in centi-Hz. For
+   each 30-ms frame, run integer-only LPC (Levinson-Durbin on the
+   autocorrelation) at order 10, evaluate `|1/A(e^jw)|^2` at 50-Hz
+   spectrum-grid increments from 150 Hz to Nyquist, peak-pick the
+   top 3 local maxima -> per-frame [F1, F2, F3]. Aggregate across
+   frames via median (robust against LPC outliers).
+
+2. **Formant mapping** (`vc_apply_profile`): given a list of target
+   phoneme labels, produce a new formant table where:
+   - Labels present in the reference (the typical 5-second vowel-rich
+     sample contributes "ae") use the measured formants directly.
+   - Labels NOT in the reference get R6E's defaults scaled by the
+     measured F1/F2 ratios vs R6E's "ae" defaults (660 / 1720). So all
+     vowels coherently shift to the target speaker's vocal-tract
+     characteristics. Non-vowel phonemes (plosives/fricatives/nasals)
+     pass through unscaled -- their "formants" are carrier hints, not
+     vocal-tract resonances.
+
+3. **Pitch transfer**: the profile's P0 displaces R6E's implicit
+   ~120 Hz baseline. Implementation: instead of post-shifting R6E's
+   output via PSOLA (which works at 16 kHz but is unreliable at the
+   8-kHz R6E rate for low formant frequencies), the cloned synth
+   builds each voiced phoneme as a continuous-phase glottal-source +
+   light-formant mix at the target P0 (98% F0 + 1% per formant). The
+   continuous-phase invariant across phoneme boundaries keeps YIN
+   locked onto the cloned P0 across whole utterances.
+
+4. **Synth** (`vc_synth_with_profile`): walk the input text char-by-
+   char (same per-character fallback as R6E's `synth_text`); for each
+   voiced char emit a continuous-phase F0+formants segment; for each
+   unvoiced char fall back to R6E's `synth_phoneme` (no audible F0
+   phase break).
+
+### Integer-only LPC: Levinson-Durbin in milli fixed-point
+
+The Yule-Walker equations are solved via the classical Levinson-
+Durbin recursion (Press et al, Numerical Recipes 13.6) in 1000-unit
+milli precision:
+
+    E_0 = R(0)
+    for k = 1..P:
+      gamma_k = (R(k) - sum_{j=1..k-1} a_{k-1,j} * R(k-j)) / E_{k-1}
+      a_{k,k} = gamma_k
+      for j = 1..k-1: a_{k,j} = a_{k-1,j} - gamma_k * a_{k-1, k-j}
+      E_k = E_{k-1} * (1 - gamma_k^2)
+
+The numerator carries an extra factor of 1000 so the division yields a
+milli-scaled gamma directly. The cross-term update `gamma * a_prev` is
+divided by 1000 after the multiplication to stay in milli. The energy
+update `E * (1 - gamma^2/1000^2)` factors as `E * (1000 - g^2/1000) /
+1000`, keeping arithmetic in i32 range up to order 12. On a degenerate
+input (R(0) == 0 or numerical breakdown E_k <= 0) the coefficients
+collapse to [1000, 0, 0, ...] -- the trivial all-pass filter.
+
+Spectrum evaluation: at each query frequency hz, compute the inverse
+filter `A(e^jw) = 1 - sum_k a_k e^{-jwk}` as a complex number via
+R6E's existing 256-entry quarter-wave sine table (4-fold symmetry).
+Return `1 / |A|^2` in a fixed 1e9 scale so peak-picking is monotonic.
+The 50-Hz grid gives sub-formant precision (formants are typically
+spaced >= 500 Hz apart) at ~80 evaluations per frame at 8 kHz.
+
+### Headline results
+
+- **LPC on Klatt /ae/** (F1=660, F2=1720, F3=2410): extracted
+  formants F1=650, F2=1700, F3=2450 -- all within +/- 50 Hz of R6E's
+  defaults. The 50-Hz tolerance matches the spectrum-grid step.
+
+- **P0 transfer on 200 Hz reference -> 200 Hz cloned synth**:
+  reference 200 Hz sine YIN-extracted to P0 = 20000 centi-Hz exact;
+  `vc_synth_with_profile("aeaeaeae", profile)` YIN-measured at
+  20000 centi-Hz (200 Hz transferred faithfully via continuous-
+  phase F0 carrier).
+
+- **Identity profile (R6E ae defaults, ratios = 1000)**: applied to
+  [ae, iy, uw] returns each phoneme's R6E default unchanged (660/1720
+  for ae direct; 270/2290 for iy and 300/870 for uw via 1.0x
+  scaling). The identity-transfer assertion is the canonical
+  algorithm-correctness check.
+
+- **Profile with F1 ratio = 500 (0.5x)**: applied to "iy" returns
+  F1 = 135 (= 270 * 0.5), F2 = 1145 (= 2290 * 0.5), F3 = 1505 (=
+  3010 * 0.5). The ratio-application is the canonical "transfer to
+  unobserved phonemes" check.
+
+### Verification
+
+- **Unit (`tests/unit/test_voice_clone.nova`, 55 assertions)**: LPC
+  on pure 800 Hz sine detects formant near 800 Hz; LPC on Klatt /ae/
+  recovers (660, 1720, 2410) within +/- 100 Hz; `vc_analyze_reference`
+  on a 200 Hz sine reference yields P0 = 20000 centi-Hz (+/- 200);
+  `vc_apply_profile` identity profile returns unchanged R6E defaults;
+  `vc_apply_profile` with ratio 0.5 scales unobserved vowels exactly;
+  `vc_apply_profile` direct match returns reference formants;
+  `vc_synth_with_profile` produces non-empty output for any non-empty
+  text; `vc_synth_with_profile` with target P0=200 yields YIN F0 in
+  [18500..21500] centi-Hz; profiles with different P0 produce
+  measurably different synth F0.
+- **Integration (`tests/integration/scenario_ddd_voice_clone.sh`, 14
+  assertions)**: 200 Hz reference WAV -> profile.P0 = 20000 centi
+  exact; clone synth YIN = 20000 centi exact (transferred pitch);
+  applied table length matches input label list; chat /help and
+  /clone command paths wire correctly (happy + sad paths).
+- **All R6E + R7F + R9B + R8B + R10F + R11B + R12D audio unit tests
+  pass unchanged** (audio_synth: 209, audio_capture: 28, audio_vad:
+  86, audio_pitch: 52, audio_pitch_yin: 35, audio_psola: 34).
+
+### Known limitations (R13D)
+
+- **YIN octave-snap on high-pitched references.** R11B YIN snaps
+  300 Hz sine references down to 150 Hz centi (the 3000-milli
+  octave-down ratio is permissive enough to accept the 2x-period
+  minimum on pure tones). The cloned synth then targets 150 Hz, not
+  300 Hz. Workaround: use references in [80..220] Hz where YIN is
+  reliable. This is a YIN limitation inherited from R11B, not
+  introduced by R13D.
+- **Formant contribution capped at 1% per formant.** Higher mixes
+  (e.g. 5% per formant) let YIN's cumulative-mean-difference function
+  lock onto formant-sub-harmonic minima rather than the F0 minimum,
+  particularly when formants are at non-integer multiples of F0. 1%
+  keeps YIN locked at the cost of audibly-thinner vowel character;
+  perceptual quality is below a real Klatt-with-glottal-source synth
+  but matches the brief's "non-LLM voice cloning" altitude.
+- **Spectrum grid quantizes formant precision to 50 Hz.** Tighter
+  grids (e.g. 10 Hz) would give finer formant resolution at ~5x
+  per-frame cost; 50 Hz is the productivity sweet spot for typical
+  vowel formants spaced >= 500 Hz apart.
+- **No bandwidth measurement.** The profile carries per-formant
+  bandwidths (BW1/BW2/BW3) but they default to Klatt 1980 nominal
+  values (60/90/150 Hz). Measuring 3-dB FWHM from the local LPC
+  spectrum peak would be a single-pass extension; left for future
+  work where downstream phoneme synthesizers consume bandwidths.
+- **Reference WAV cap 30 s.** Matches R12D's PSOLA cap; beyond this
+  the per-frame LPC budget (~80 ms wall time at order 10 + median
+  aggregation across 1000+ frames) dominates the chat-latency
+  budget. Long references should be pre-trimmed to a vowel-rich
+  utterance.
+
 ## Future work
 
 - Promote OW to a true diphthong (it's /oʊ/, gliding toward /ʊ/). Backward-
@@ -1050,3 +1201,13 @@ Chat: `/pitch_shift PATH FACTOR_MILLI` admin one-liner.
   formant transitions across phoneme boundaries (e.g. consonant-to-vowel
   ramps) would substantially improve naturalness but is computationally
   much heavier.
+- **Voice cloning (R13D) extensions**: multi-vowel reference profiles
+  (analyze "AY EY OW OY UH" and store per-vowel formants separately);
+  glottal-source modeling (replace the F0 sine with a Liljencrants-
+  Fant glottal pulse for more natural quality); bandwidth measurement
+  via 3-dB FWHM on the local LPC spectrum peak; LPC root-finding via
+  Bairstow's method for sub-grid formant precision; PSOLA-based pitch
+  contour transfer (replace the constant target P0 with a full F0
+  trajectory tracked from the reference); cross-rate analysis (do
+  LPC at 16 kHz on a 16 kHz reference and downsample formants to
+  R6E's 8 kHz synth).

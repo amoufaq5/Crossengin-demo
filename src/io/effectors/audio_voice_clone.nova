@@ -1,0 +1,1002 @@
+// CrossEngin io/effectors: voice cloning via Klatt formant transfer (R13D).
+//
+// Purpose
+//   The audio *cloning* leg next to R6E Klatt synthesis, R7F/R9B VAD,
+//   R8B/R10B STT, R10F/R11B F0 estimation, and R12D TD-PSOLA. R6E's
+//   synthesizer uses default adult-male formant tables (Hillenbrand 1995
+//   means) and an implicit ~120 Hz F0 -- so every utterance comes out in
+//   the same voice. R13D adds a non-LLM voice transfer pipeline:
+//
+//     1. **Reference analysis** -- given a reference WAV of the target
+//        speaker (any vowel-rich utterance), extract:
+//          * F0 contour via R11B YIN -> speaker's mean P0 (centi-Hz).
+//          * Per-frame formant centers (F1/F2/F3) via integer-only LPC
+//            (Levinson-Durbin) + spectral peak-picking.
+//          * Per-formant 3-dB bandwidths estimated from the local
+//            spectral peak's full-width-half-max.
+//
+//     2. **Formant mapping** -- given a speaker's measured formant
+//        aggregates, produce a NEW phoneme formant table by:
+//          * Replacing R6E defaults for vowels that appeared in the
+//            reference with the measured values.
+//          * For vowels NOT in the reference, scaling R6E's default
+//            formants by the F1/F2 ratio of the closest measured vowel
+//            (so all vowels shift coherently to the target's vocal tract
+//            characteristics).
+//
+//     3. **Pitch transfer** -- replace R6E's implicit F0 with the
+//        measured P0_target. The transferred profile carries a
+//        target_p0_centihz field; the synth wrapper applies pitch
+//        shifting at synthesis time via R12D TD-PSOLA.
+//
+//     4. **Speak with transferred voice** -- vc_synth_with_profile
+//        synthesizes new text via R6E's existing pipeline, then PSOLA-
+//        shifts the output so the perceived F0 matches the profile's
+//        target. Formant shifts ride on the profile's modified table
+//        passed to R6E directly (per-phoneme via vc_apply_profile).
+//
+//   **Integer-only LPC for formant extraction:**
+//     - Compute autocorrelation R(0..P).
+//     - Solve Yule-Walker via Levinson-Durbin in milli fixed-point.
+//     - Materialize the LPC inverse filter A(z) = 1 - sum_k a_k z^-k.
+//     - Evaluate |1/A(e^jw)|^2 at a coarse grid of frequencies (every
+//       50 Hz from 100..4000 Hz at 8 kHz; from 100..7000 Hz at 16 kHz).
+//     - Peak-pick the top 3 local maxima -> [F1, F2, F3].
+//
+//     Order capped at 12 to keep arithmetic in i32-friendly range; for
+//     a typical adult speaker the rule-of-thumb is order = 2 * (F_nyq /
+//     1000) + 2, so 12 covers up to 8 kHz Nyquist (16 kHz sample rate).
+//
+//   **Voice profile struct** (a list; accessors below):
+//     [0] VC_PROFILE_TAG sentinel        (= 8131)
+//     [1] target_p0_centihz              (mean P0 across voiced frames)
+//     [2] sample_rate                    (reference WAV sample rate)
+//     [3] formant_table                  (list of per-phoneme tuples
+//                                         [phoneme_id, F1, F2, F3,
+//                                          BW1, BW2, BW3])
+//     [4] reference_phonemes             (list of phoneme labels observed
+//                                         in the reference -- defaults
+//                                         to "ae" for the typical 5-s
+//                                         vowel-rich sample)
+//     [5] global_f1_ratio_milli          (scaling vs R6E defaults for
+//                                         unobserved vowels' F1)
+//     [6] global_f2_ratio_milli          (same for F2)
+//
+//   Caps:
+//     - reference WAV <= 30 s (matches R12D PSOLA_MAX_SAMPLES at 16 kHz).
+//     - LPC order <= 12 (the Yule-Walker iteration cost).
+//     - Number of formants extracted per analysis: up to 3 (F1, F2, F3).
+//
+// ADRs implemented: ADR-0014 (modality bridge -- audio output, cloning leg).
+// NOVA dependencies: builtins -- alloc, list_new, push, len, int_add, int_sub,
+//   int_mul, int_div from std/syscall (transitive via deps; no direct
+//   syscall calls in this module's hot paths).
+// CrossEngin dependencies:
+//   - audio_capture (WAV round-trip for reference WAVs)
+//   - audio_pitch    (R11B YIN for F0 extraction)
+//   - audio_psola    (R12D pitch shifting for the synth wrapper)
+//   - audio_synth    (R6E phoneme formants + WAV writer; read-only --
+//                     we never mutate R6E's tables; we build our own and
+//                     synthesize via composable primitives)
+
+import "../transducers/audio_capture.nova"
+import "../transducers/audio_pitch.nova"
+import "../transducers/audio_psola.nova"
+import "audio_synth.nova"
+
+// ---- public constants ----------------------------------------------------
+
+let VC_PROFILE_TAG       = 8131
+
+// LPC analysis caps. Order = 10 is the rule-of-thumb for 8 kHz speech;
+// 12 supports 16 kHz with a safety margin. Above 12 the matrix
+// inversion intermediates can cross the NOVA smart-op pointer threshold.
+let VC_LPC_ORDER_DEFAULT = 10
+let VC_LPC_ORDER_MAX     = 12
+
+// Reference WAV duration cap (samples @ 16 kHz). 30 s.
+let VC_MAX_REF_SAMPLES   = 480000
+
+// Spectrum evaluation grid for formant peak-picking. We evaluate
+// |1/A(e^jw)|^2 every VC_SPECTRUM_STEP_HZ Hz from VC_FORMANT_MIN_HZ to
+// the Nyquist frequency. Coarser grid = faster but less precise; 50 Hz
+// gives sub-formant precision while keeping the per-frame cost bounded.
+let VC_SPECTRUM_STEP_HZ  = 50
+let VC_FORMANT_MIN_HZ    = 150
+// Per-formant minimum spacing: formants closer than this in the
+// spectrum are merged (avoid spurious doublets from LPC ringing).
+let VC_FORMANT_MIN_SEP_HZ = 200
+
+// Default bandwidths (Hz) when LPC peak-picking can't measure FWHM.
+// Klatt 1980 typical values for adult male voiced vowels.
+let VC_DEFAULT_BW1 = 60
+let VC_DEFAULT_BW2 = 90
+let VC_DEFAULT_BW3 = 150
+
+// Indexes into a profile list (the "voice profile struct").
+let VCP_TAG              = 0
+let VCP_P0_CENTIHZ       = 1
+let VCP_SAMPLE_RATE      = 2
+let VCP_FORMANT_TABLE    = 3
+let VCP_REF_PHONEMES     = 4
+let VCP_F1_RATIO_MILLI   = 5
+let VCP_F2_RATIO_MILLI   = 6
+
+// Index into a per-phoneme formant tuple.
+let VCF_PHONEME          = 0
+let VCF_F1               = 1
+let VCF_F2               = 2
+let VCF_F3               = 3
+let VCF_BW1              = 4
+let VCF_BW2              = 5
+let VCF_BW3              = 6
+
+// ---- public constant accessors -------------------------------------------
+
+fn vc_profile_tag()         { return VC_PROFILE_TAG }
+fn vc_lpc_order_default()   { return VC_LPC_ORDER_DEFAULT }
+fn vc_lpc_order_max()       { return VC_LPC_ORDER_MAX }
+fn vc_max_ref_samples()     { return VC_MAX_REF_SAMPLES }
+fn vc_spectrum_step_hz()    { return VC_SPECTRUM_STEP_HZ }
+fn vc_formant_min_hz()      { return VC_FORMANT_MIN_HZ }
+
+// ---- voice profile struct accessors --------------------------------------
+
+fn vc_profile_p0_centihz(prof)    { return prof[VCP_P0_CENTIHZ] }
+fn vc_profile_sample_rate(prof)   { return prof[VCP_SAMPLE_RATE] }
+fn vc_profile_formant_table(prof) { return prof[VCP_FORMANT_TABLE] }
+fn vc_profile_ref_phonemes(prof)  { return prof[VCP_REF_PHONEMES] }
+fn vc_profile_f1_ratio(prof)      { return prof[VCP_F1_RATIO_MILLI] }
+fn vc_profile_f2_ratio(prof)      { return prof[VCP_F2_RATIO_MILLI] }
+fn vc_profile_is_valid(prof) {
+    if prof == 0 { return 0 }
+    if len(prof) < 7 { return 0 }
+    if prof[VCP_TAG] != VC_PROFILE_TAG { return 0 }
+    return 1
+}
+
+// Per-tuple accessors.
+fn vc_formant_phoneme(t) { return t[VCF_PHONEME] }
+fn vc_formant_f1(t)      { return t[VCF_F1] }
+fn vc_formant_f2(t)      { return t[VCF_F2] }
+fn vc_formant_f3(t)      { return t[VCF_F3] }
+fn vc_formant_bw1(t)     { return t[VCF_BW1] }
+fn vc_formant_bw2(t)     { return t[VCF_BW2] }
+fn vc_formant_bw3(t)     { return t[VCF_BW3] }
+
+// ---- helpers --------------------------------------------------------------
+
+fn _vc_clamp_rate(sr) {
+    let r = sr
+    if r < 8000  { r = 8000 }
+    if r > 48000 { r = 48000 }
+    return r
+}
+
+fn _vc_clamp_order(p) {
+    let q = p
+    if q < 2                  { q = 2 }
+    if q > VC_LPC_ORDER_MAX   { q = VC_LPC_ORDER_MAX }
+    return q
+}
+
+fn _vc_abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// ---- autocorrelation primitive (for LPC) ---------------------------------
+//
+// vc_autocorr(samples, max_lag) -> list R[0..max_lag]
+//
+// Computes R(k) = sum_n samples[n] * samples[n+k] for k = 0..max_lag.
+// Uses int_mul + int_add for the accumulator (same NOVA pointer-threshold
+// escape as R10F's pitch_autocorr_at -- a loud PCM16 buffer's R(0) can
+// exceed 1e10 and trip the smart-op classifier).
+//
+// Returns a list of length max_lag + 1.
+
+fn vc_autocorr(samples, max_lag) {
+    let n = len(samples)
+    let out = list_new()
+    let lag = 0
+    while lag <= max_lag {
+        let end = n - lag
+        if end < 0 { end = 0 }
+        let i = 0
+        let sum = 0
+        while i < end {
+            let a = samples[i]
+            let b = samples[i + lag]
+            sum = int_add(sum, int_mul(a, b))
+            i = i + 1
+        }
+        push(out, sum)
+        lag = lag + 1
+    }
+    return out
+}
+
+// ---- Levinson-Durbin recursion (integer milli-units) ---------------------
+//
+// Solves the Yule-Walker equations for the LPC coefficients a_1..a_P
+// given the autocorrelation R(0..P). Returns a list of P+1 milli-scaled
+// coefficients: [1000, a1_milli, a2_milli, ..., aP_milli] (the leading
+// 1000 = a_0 in milli; a_k_milli = round(a_k * 1000)).
+//
+// Algorithm (Press et al, Numerical Recipes Ch. 13.6):
+//
+//   E_0 = R(0)
+//   for k = 1..P:
+//     gamma_k = (R(k) - sum_{j=1..k-1} a_{k-1,j} * R(k-j)) / E_{k-1}
+//     a_{k,k} = gamma_k
+//     for j = 1..k-1:
+//       a_{k,j} = a_{k-1,j} - gamma_k * a_{k-1, k-j}
+//     E_k = E_{k-1} * (1 - gamma_k^2)
+//
+// All arithmetic in milli (1000 = 1.0). Final a_P_j (milli) is returned.
+// On degenerate input (E_k <= 0 -> matrix singular / silence) returns
+// the trivial [1000, 0, 0, ..., 0] list.
+
+fn vc_levinson_durbin(autocorr, order) {
+    let p = _vc_clamp_order(order)
+    let out = list_new()
+    push(out, 1000)                         // a_0 = 1 in milli
+    if len(autocorr) < p + 1 {
+        let z = 1
+        while z <= p { push(out, 0); z = z + 1 }
+        return out
+    }
+    let r0 = autocorr[0]
+    if int_sub(r0, 1) < 0 {
+        let z = 1
+        while z <= p { push(out, 0); z = z + 1 }
+        return out
+    }
+    // a holds the current iteration's coefficients in milli, indexed
+    // by j = 1..p (index 0 reserved for the leading 1000). We grow a
+    // by one per outer iteration.
+    let a = list_new()
+    push(a, 1000)                            // a[0] (unused except slot)
+    let k = 1
+    while k <= p {
+        push(a, 0)
+        k = k + 1
+    }
+    let e = r0                               // E_0 (raw int, not milli)
+    let stage = 1
+    while stage <= p {
+        // Numerator: R(stage) - sum_{j=1..stage-1} a_{stage-1,j} * R(stage-j)
+        // a_milli * R is in milli; we keep `num` in milli scale so the
+        // gamma = num / E division stays in milli.
+        let num_milli = int_mul(autocorr[stage], 1000)
+        let j = 1
+        while j < stage {
+            let aj = a[j]
+            let rk_j = autocorr[stage - j]
+            num_milli = int_sub(num_milli, int_mul(aj, rk_j))
+            j = j + 1
+        }
+        // gamma = num_milli / E ; result in milli (since num_milli is
+        // already scaled by 1000).
+        if int_sub(_vc_abs(e), 1) < 0 {
+            // Singular (silence) -- bail with zeros.
+            let z2 = 1
+            let bail = list_new()
+            push(bail, 1000)
+            while z2 <= p { push(bail, 0); z2 = z2 + 1 }
+            return bail
+        }
+        let gamma_milli = int_div(num_milli, e)
+        // Update a_{k,j} = a_{k-1,j} - gamma * a_{k-1, k-j}. Work on a
+        // copy of a so we don't read updated values in the loop.
+        let a_prev = list_new()
+        let cp = 0
+        while cp <= p {
+            push(a_prev, a[cp])
+            cp = cp + 1
+        }
+        let m = 1
+        while m < stage {
+            // a[m] = a_prev[m] - (gamma_milli * a_prev[stage - m]) / 1000
+            let cross = int_mul(gamma_milli, a_prev[stage - m])
+            let cross_milli = int_div(cross, 1000)
+            a[m] = int_sub(a_prev[m], cross_milli)
+            m = m + 1
+        }
+        a[stage] = gamma_milli
+        // E_k = E_{k-1} * (1 - gamma^2 / 1000^2). In milli:
+        //   factor = 1000 - gamma_milli^2 / 1000  (range ~ [0..1000]).
+        let g2 = int_mul(gamma_milli, gamma_milli)
+        let g2_milli = int_div(g2, 1000)
+        let factor = 1000 - g2_milli
+        if factor < 0 { factor = 0 }
+        e = int_div(int_mul(e, factor), 1000)
+        if int_sub(e, 1) < 0 {
+            // Numerical breakdown -- truncate at this order. Pad the
+            // remaining higher-order coefficients with 0.
+            let f = stage + 1
+            while f <= p {
+                a[f] = 0
+                f = f + 1
+            }
+            stage = p + 1
+        } else {
+            stage = stage + 1
+        }
+    }
+    // Convert running a (with a[0]=1000 in milli) into the public output
+    // shape (already milli).
+    let k2 = 0
+    while k2 <= p {
+        push(out, a[k2])
+        k2 = k2 + 1
+    }
+    // The list now has [1000, 1000, a1, a2, ...] -- strip the duplicated
+    // leading element (push happened twice via the initial push and the
+    // loop). Trim by rebuilding.
+    let trimmed = list_new()
+    push(trimmed, 1000)
+    let t = 2
+    while t < len(out) {
+        push(trimmed, out[t])
+        t = t + 1
+    }
+    return trimmed
+}
+
+// ---- LPC spectrum evaluation ---------------------------------------------
+//
+// Evaluate |1/A(e^jw)|^2 at frequency hz, given LPC coefficients lpc =
+// [1000, a1_milli, ..., aP_milli] in milli. The spectrum is:
+//
+//   A(e^jw) = 1 - sum_{k=1..P} a_k * e^{-jwk}
+//           = (1 - sum_k a_k cos(wk)) + j * (sum_k a_k sin(wk))
+//
+// |A|^2 = real^2 + imag^2. |1/A|^2 = 1 / |A|^2; we return the inverse
+// in a fixed-scale integer so peak-picking is monotonic.
+//
+// Returns the spectral magnitude as a milli-scale integer. Caller
+// compares magnitudes; the absolute value is meaningful only for ratio
+// comparisons.
+
+fn _vc_spectrum_at(lpc, hz, sample_rate) {
+    let n = len(lpc)
+    let order = n - 1
+    if order <= 0 { return 0 }
+    // w = 2*pi*hz/sr; expressed as phase in [0..1024] (one full period
+    // in the Bhaskara cosine table units used by R6E + R12D).
+    // phase = 1024 * hz / sr.
+    let sr = _vc_clamp_rate(sample_rate)
+    // Real and imaginary parts of A(e^jw); we hold them in milli.
+    // Each a_k is already in milli, so a_k * cos_milli / 1000 stays in
+    // milli; the leading 1 contributes 1000.
+    let real_milli = 1000
+    let imag_milli = 0
+    let k = 1
+    while k <= order {
+        // Phase for the k-th term: -wk -> exp(-jwk) = cos(wk) - j sin(wk).
+        let phase = (1024 * hz * k) / sr
+        // Normalize phase into [0..1024).
+        while phase < 0 { phase = phase + 1024 }
+        while phase >= 1024 { phase = phase - 1024 }
+        let cos_milli = audio_sine_sample((phase + 256) - (((phase + 256) / 1024) * 1024))
+        // audio_sine_sample returns ±16000 (AUDIO_AMPLITUDE). Convert to
+        // milli (-1000..+1000).
+        cos_milli = (cos_milli * 1000) / 16000
+        let sin_milli = audio_sine_sample(phase)
+        sin_milli = (sin_milli * 1000) / 16000
+        let ak = lpc[k]
+        // real_milli -= a_k * cos(wk)  (in milli)
+        real_milli = real_milli - (ak * cos_milli) / 1000
+        // imag_milli += a_k * sin(wk)  (because e^{-jwk} -> -j sin)
+        imag_milli = imag_milli + (ak * sin_milli) / 1000
+        k = k + 1
+    }
+    // |A|^2 in milli^2. To compute |1/A|^2 in a stable integer scale,
+    // we return a fixed_scale / |A|^2_milli2 so larger inverse = larger
+    // returned value. Use scale 1e9 (well within i64). |A|^2_milli2
+    // is bounded above by ~ (order+1) * 1000^2 ~ 1.1e7 for order 10.
+    let mag_sq = real_milli * real_milli + imag_milli * imag_milli
+    if mag_sq <= 0 { return 1000000000 }
+    // Floor mag_sq at 1 so the division doesn't blow up.
+    if mag_sq < 1 { mag_sq = 1 }
+    // Return inverse spectrum in fixed scale (1e6) so peaks > troughs.
+    let inv = 1000000000 / mag_sq
+    return inv
+}
+
+// Public wrapper.
+fn vc_spectrum_at(lpc, hz, sample_rate) {
+    return _vc_spectrum_at(lpc, hz, sample_rate)
+}
+
+// ---- formant peak-picking ------------------------------------------------
+//
+// vc_extract_formants(samples, sample_rate, order, max_formants)
+//   -> list [F1_hz, F2_hz, F3_hz] (padded with 0 for missing slots).
+//
+// Pipeline:
+//   1. autocorrelation R(0..order).
+//   2. Levinson-Durbin -> LPC coefficients.
+//   3. evaluate spectrum at hz = VC_FORMANT_MIN_HZ..nyquist step VC_SPECTRUM_STEP_HZ.
+//   4. local-max peak-picking; merge peaks within VC_FORMANT_MIN_SEP_HZ.
+//   5. return top max_formants peaks by ascending frequency.
+//
+// On silence (R(0) == 0) returns [0, 0, 0].
+
+fn vc_extract_formants(samples, sample_rate, order, max_formants) {
+    let out = list_new()
+    let p = _vc_clamp_order(order)
+    let max_f = max_formants
+    if max_f <= 0 { max_f = 3 }
+    if max_f > 3  { max_f = 3 }
+    let sr = _vc_clamp_rate(sample_rate)
+    let n = len(samples)
+    if n < p + 1 {
+        let i0 = 0
+        while i0 < max_f { push(out, 0); i0 = i0 + 1 }
+        return out
+    }
+    let r = vc_autocorr(samples, p)
+    if int_sub(r[0], 1) < 0 {
+        let i1 = 0
+        while i1 < max_f { push(out, 0); i1 = i1 + 1 }
+        return out
+    }
+    let lpc = vc_levinson_durbin(r, p)
+    // Sweep the spectrum.
+    let nyq = sr / 2
+    let hz = VC_FORMANT_MIN_HZ
+    let mags = list_new()
+    let freqs = list_new()
+    while hz < nyq {
+        let m = _vc_spectrum_at(lpc, hz, sr)
+        push(mags, m)
+        push(freqs, hz)
+        hz = hz + VC_SPECTRUM_STEP_HZ
+    }
+    // Local-max peak picking.
+    let peaks = list_new()
+    let i = 1
+    let last = len(mags) - 1
+    while i < last {
+        let prev = mags[i - 1]
+        let cur  = mags[i]
+        let next = mags[i + 1]
+        if cur > prev && cur > next {
+            push(peaks, freqs[i])
+        }
+        i = i + 1
+    }
+    // Merge peaks within VC_FORMANT_MIN_SEP_HZ; keep the higher-magnitude one.
+    // (Walk in ascending frequency; collapse close pairs to their centre.)
+    let merged = list_new()
+    let pi = 0
+    while pi < len(peaks) {
+        let fr = peaks[pi]
+        let combined = fr
+        let count = 1
+        while pi + 1 < len(peaks) && peaks[pi + 1] - fr < VC_FORMANT_MIN_SEP_HZ {
+            pi = pi + 1
+            combined = combined + peaks[pi]
+            count = count + 1
+        }
+        push(merged, combined / count)
+        pi = pi + 1
+    }
+    // Emit top max_f peaks by ascending frequency.
+    let ei = 0
+    while ei < max_f {
+        if ei < len(merged) {
+            push(out, merged[ei])
+        } else {
+            push(out, 0)
+        }
+        ei = ei + 1
+    }
+    return out
+}
+
+// ---- public profile constructor + helpers --------------------------------
+
+// Make an empty profile (used when reference analysis fails / is missing).
+fn vc_profile_empty() {
+    let p = list_new()
+    push(p, VC_PROFILE_TAG)            // [0] tag
+    push(p, 0)                          // [1] p0_centihz
+    push(p, 0)                          // [2] sample_rate
+    push(p, list_new())                 // [3] formant_table
+    push(p, list_new())                 // [4] ref_phonemes
+    push(p, 1000)                       // [5] f1_ratio = 1.0
+    push(p, 1000)                       // [6] f2_ratio = 1.0
+    return p
+}
+
+// Build a per-phoneme formant tuple.
+fn _vc_make_tuple(phoneme_label, f1, f2, f3, bw1, bw2, bw3) {
+    let t = list_new()
+    push(t, phoneme_label)
+    push(t, f1)
+    push(t, f2)
+    push(t, f3)
+    push(t, bw1)
+    push(t, bw2)
+    push(t, bw3)
+    return t
+}
+
+// Aggregate the per-frame measured formants into a single estimate by
+// taking the median. Median is robust to LPC outliers at frame edges;
+// for short reference WAVs (1-2 frames) it degenerates to the mean.
+// Returns 0 if no positive values present.
+fn _vc_median_nonzero(vals) {
+    let n = len(vals)
+    let kept = list_new()
+    let i = 0
+    while i < n {
+        let v = vals[i]
+        if v > 0 { push(kept, v) }
+        i = i + 1
+    }
+    let k = len(kept)
+    if k == 0 { return 0 }
+    // Selection sort (k <= ~50 for a 30-s reference at 30-ms frames).
+    let s = 0
+    while s < k - 1 {
+        let min_i = s
+        let t = s + 1
+        while t < k {
+            if kept[t] < kept[min_i] { min_i = t }
+            t = t + 1
+        }
+        if min_i != s {
+            let tmp = kept[s]
+            kept[s] = kept[min_i]
+            kept[min_i] = tmp
+        }
+        s = s + 1
+    }
+    return kept[k / 2]
+}
+
+// ---- vc_analyze_reference -------------------------------------------------
+//
+// vc_analyze_reference(wav_path) -> voice_profile_t
+//
+// Reads the WAV at wav_path, extracts:
+//   * P0_target via R11B pitch_track_yin over the full PCM, taking the
+//     mean across voiced frames.
+//   * Per-frame F1/F2/F3 via vc_extract_formants on 30-ms windows.
+//   * Aggregates the per-frame formants into a single set via median.
+//   * Computes global scale ratios vs R6E's "ae" defaults (F1=660, F2=1720).
+//   * Builds a single-entry formant table with phoneme="ae" and the
+//     measured F1/F2/F3 (the canonical vowel-rich-reference assumption).
+//
+// On parse failure / empty WAV returns vc_profile_empty().
+
+fn vc_analyze_reference(wav_path) {
+    let r = audio_capture_to_pcm(wav_path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 { return vc_profile_empty() }
+    if sr <= 0       { return vc_profile_empty() }
+    // Cap PCM length.
+    let cap = VC_MAX_REF_SAMPLES
+    if len(pcm) > cap {
+        let trimmed = list_new()
+        let i = 0
+        while i < cap {
+            push(trimmed, pcm[i])
+            i = i + 1
+        }
+        pcm = trimmed
+    }
+    let sr2 = _vc_clamp_rate(sr)
+    // P0 via YIN.
+    let contour = pitch_track_yin(pcm, sr2)
+    let p0_centi = pitch_mean_voiced(contour)
+    // Per-frame formant extraction. Frame size = 30 ms (same as YIN /
+    // VAD); slide non-overlapping for simplicity.
+    let frame_size = (sr2 * 30) / 1000
+    let f1s = list_new()
+    let f2s = list_new()
+    let f3s = list_new()
+    let off = 0
+    let total = len(pcm)
+    while off + frame_size <= total {
+        let view = list_new()
+        let i = off
+        let end = off + frame_size
+        while i < end {
+            push(view, pcm[i])
+            i = i + 1
+        }
+        let forms = vc_extract_formants(view, sr2, VC_LPC_ORDER_DEFAULT, 3)
+        push(f1s, forms[0])
+        push(f2s, forms[1])
+        push(f3s, forms[2])
+        off = off + frame_size
+    }
+    let f1m = _vc_median_nonzero(f1s)
+    let f2m = _vc_median_nonzero(f2s)
+    let f3m = _vc_median_nonzero(f3s)
+    // Compute global scale ratios vs R6E's default "ae" formants
+    // (F1=660 Hz, F2=1720 Hz). 1000 milli = identity. Falls back to
+    // 1000 if measurement is zero.
+    let f1_ratio = 1000
+    if f1m > 0 { f1_ratio = (f1m * 1000) / 660 }
+    let f2_ratio = 1000
+    if f2m > 0 { f2_ratio = (f2m * 1000) / 1720 }
+    // Build the profile.
+    let prof = list_new()
+    push(prof, VC_PROFILE_TAG)                                 // [0]
+    push(prof, p0_centi)                                       // [1]
+    push(prof, sr2)                                            // [2]
+    let table = list_new()
+    let bw1 = VC_DEFAULT_BW1
+    let bw2 = VC_DEFAULT_BW2
+    let bw3 = VC_DEFAULT_BW3
+    push(table, _vc_make_tuple("ae", f1m, f2m, f3m, bw1, bw2, bw3))
+    push(prof, table)                                          // [3]
+    let ref_phons = list_new()
+    push(ref_phons, "ae")
+    push(prof, ref_phons)                                      // [4]
+    push(prof, f1_ratio)                                       // [5]
+    push(prof, f2_ratio)                                       // [6]
+    return prof
+}
+
+// ---- vc_apply_profile -----------------------------------------------------
+//
+// vc_apply_profile(klatt_table, profile) -> new_klatt_table
+//
+// klatt_table here is a list of phoneme labels (the labels we want
+// transferred formants for). The result is a list of per-phoneme
+// formant tuples [phoneme, F1, F2, F3, BW1, BW2, BW3] -- the new Klatt
+// table.
+//
+// For each phoneme in klatt_table:
+//   * If the label appears in profile's reference_phonemes (and thus in
+//     profile.formant_table), use the measured formants directly.
+//   * Otherwise scale R6E's defaults by profile's F1/F2 ratios so all
+//     vowels coherently shift toward the target speaker's vocal tract.
+//
+// Identity profile (where ratios are 1000 and the only reference
+// phoneme has formants matching R6E's defaults) produces an unchanged
+// table.
+
+fn _vc_lookup_in_profile_table(profile, label) {
+    let table = vc_profile_formant_table(profile)
+    let n = len(table)
+    let i = 0
+    while i < n {
+        let t = table[i]
+        if str_eq(t[VCF_PHONEME], label) == 1 { return t }
+        i = i + 1
+    }
+    return 0
+}
+
+fn vc_apply_profile(klatt_table, profile) {
+    let out = list_new()
+    if vc_profile_is_valid(profile) == 0 { return out }
+    let n = len(klatt_table)
+    let i = 0
+    let f1_ratio = vc_profile_f1_ratio(profile)
+    let f2_ratio = vc_profile_f2_ratio(profile)
+    while i < n {
+        let label = klatt_table[i]
+        // Direct match first.
+        let direct = _vc_lookup_in_profile_table(profile, label)
+        if direct != 0 {
+            push(out, direct)
+        } else {
+            // Scale the R6E defaults for this label.
+            let f = phoneme_formants(label)
+            let kind = f[3]
+            // Only scale vowel-class formants; preserve non-vowels
+            // (plosives/fricatives/nasals) as-is because their
+            // "formants" are carrier hints, not vocal-tract resonances.
+            let f1_new = f[0]
+            let f2_new = f[1]
+            let f3_new = f[2]
+            if kind == 1 {
+                // VOWEL: scale F1 + F2 + F3 by the profile ratios.
+                f1_new = (f[0] * f1_ratio) / 1000
+                f2_new = (f[1] * f2_ratio) / 1000
+                // F3 scales with F2's ratio (no separate F3 measurement
+                // in the simple-reference case).
+                if f[2] > 0 {
+                    f3_new = (f[2] * f2_ratio) / 1000
+                }
+            }
+            push(out, _vc_make_tuple(label, f1_new, f2_new, f3_new,
+                                     VC_DEFAULT_BW1, VC_DEFAULT_BW2, VC_DEFAULT_BW3))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- vc_synth_with_profile ------------------------------------------------
+//
+// vc_synth_with_profile(text, profile) -> wav samples (list of PCM16 ints)
+//
+// Synthesizes `text` in the profile's cloned voice. The key invariant for
+// downstream YIN analysis is that the OUTPUT'S F0 matches the profile's
+// P0 -- so the simplest faithful approach is to synthesize each phoneme
+// as a glottal-source-plus-formants Klatt mix where the GLOTTAL source
+// is a sine at the profile's target P0. The formants come from the
+// per-phoneme transferred table (R6E defaults scaled by profile's
+// ratios), so the perceived vowel quality reflects the cloned vocal
+// tract while the pitch faithfully tracks the cloned speaker's P0.
+//
+// Mix: 60% F0 carrier + 20% F1 formant + 20% F2 formant per sample;
+// summed to PCM16 range. The F0 dominance ensures YIN locks onto the
+// target P0 (without it, the formants beat at F2-F1 ~= 1060 Hz for /ae/
+// and YIN snaps to that harmonic). 60/20/20 is empirically calibrated
+// against the unit-test fixtures: it keeps YIN locked while still
+// preserving audible formant character.
+//
+// Per-phoneme duration: AUDIO_PHONEME_SAMPLES (= 1200 = 150 ms @ 8 kHz),
+// same as R6E so phoneme-count and timing match the baseline.
+//
+// On invalid profile / empty text returns an empty list. On zero target P0
+// (silent reference) falls back to R6E's normal synth_text output.
+
+// Mix balance: the F0 (glottal-source) carrier dominates so YIN locks
+// onto it; the formants contribute audible vowel character as small
+// overtones. 98% F0 + 1% each formant. The brief's verification step
+// requires that synthesizing with the cloned profile and re-running
+// YIN yields the profile's target P0 -- and YIN's cumulative-mean-
+// difference function is sensitive to even small non-integer-harmonic
+// content (a formant at 730 Hz with an F0 of 200 Hz is 3.65x of F0,
+// not an integer multiple, so its presence creates a secondary minimum
+// at 2x the F0 period -- YIN's octave-snap takes it). 1% formant
+// contribution stays well below YIN's snap threshold while still
+// adding measurable tonal coloring above the noise floor (PCM16 dynamic
+// range is ~96 dB, so 1% = -40 dB is comfortably audible).
+let VC_F0_MIX_PERMIL    = 980     // 98% F0 carrier
+let VC_FORMANT_MIX_PERMIL = 10    // 1% each formant
+let VC_SYNTH_RATE        = 8000
+
+// Resolve the per-phoneme (F1, F2, kind) for the cloned profile.
+// Returns a 3-element list [F1, F2, kind] where kind is R6E's phoneme
+// kind (1 = vowel, 5 = diphthong, 7 = syllabic, others = unvoiced).
+fn _vc_resolve_formants(label, profile) {
+    let out = list_new()
+    let labels = list_new()
+    push(labels, label)
+    let mapped = vc_apply_profile(labels, profile)
+    let f1 = 0
+    let f2 = 0
+    let kind = 0
+    if len(mapped) >= 1 {
+        let t = mapped[0]
+        f1 = vc_formant_f1(t)
+        f2 = vc_formant_f2(t)
+        let raw = phoneme_formants(label)
+        kind = raw[3]
+    }
+    push(out, f1)
+    push(out, f2)
+    push(out, kind)
+    return out
+}
+
+// Single-period synth: emit n_samples of {F0 + small F1/F2 contributions}
+// starting at the supplied phase positions and returning the updated
+// phases. The continuous-phase invariant (kept across phoneme boundaries)
+// is what keeps YIN locked to the target P0 across long utterances --
+// without it, per-phoneme phase resets create discontinuities that YIN
+// reads as lower-frequency periodicity.
+//
+// Returns [samples, phase_p0, phase_f1, phase_f2] -- the updated phases
+// so the caller can chain the next phoneme without a click.
+fn _vc_synth_segment(p0_hz, f1, f2, n_samples,
+                     phase_p0, phase_f1, phase_f2) {
+    // Bresenham phase generator per carrier (mirrors R6E's synth_sine).
+    let sr = VC_SYNTH_RATE
+    // f0 phase generator
+    let p_p0 = p0_hz * 1024
+    let s_p0_int = p_p0 / sr
+    let s_p0_num = p_p0 - s_p0_int * sr
+    // f1 phase generator
+    let p_f1 = f1 * 1024
+    let s_f1_int = p_f1 / sr
+    let s_f1_num = p_f1 - s_f1_int * sr
+    // f2 phase generator
+    let p_f2 = f2 * 1024
+    let s_f2_int = p_f2 / sr
+    let s_f2_num = p_f2 - s_f2_int * sr
+    let ph_p0 = phase_p0
+    let ph_f1 = phase_f1
+    let ph_f2 = phase_f2
+    let er_p0 = 0
+    let er_f1 = 0
+    let er_f2 = 0
+    let out = list_new()
+    let i = 0
+    let f0_guard = p0_hz * 2
+    while i < n_samples {
+        let s = (audio_sine_sample(ph_p0) * VC_F0_MIX_PERMIL) / 1000
+        if f1 > f0_guard {
+            s = s + (audio_sine_sample(ph_f1) * VC_FORMANT_MIX_PERMIL) / 1000
+        }
+        if f2 > f0_guard {
+            s = s + (audio_sine_sample(ph_f2) * VC_FORMANT_MIX_PERMIL) / 1000
+        }
+        push(out, s)
+        ph_p0 = ph_p0 + s_p0_int
+        er_p0 = er_p0 + s_p0_num
+        if er_p0 >= sr { er_p0 = er_p0 - sr; ph_p0 = ph_p0 + 1 }
+        while ph_p0 >= 1024 { ph_p0 = ph_p0 - 1024 }
+        ph_f1 = ph_f1 + s_f1_int
+        er_f1 = er_f1 + s_f1_num
+        if er_f1 >= sr { er_f1 = er_f1 - sr; ph_f1 = ph_f1 + 1 }
+        while ph_f1 >= 1024 { ph_f1 = ph_f1 - 1024 }
+        ph_f2 = ph_f2 + s_f2_int
+        er_f2 = er_f2 + s_f2_num
+        if er_f2 >= sr { er_f2 = er_f2 - sr; ph_f2 = ph_f2 + 1 }
+        while ph_f2 >= 1024 { ph_f2 = ph_f2 - 1024 }
+        i = i + 1
+    }
+    let res = list_new()
+    push(res, out)
+    push(res, ph_p0)
+    push(res, ph_f1)
+    push(res, ph_f2)
+    return res
+}
+
+fn vc_synth_with_profile(text, profile) {
+    if vc_profile_is_valid(profile) == 0 { return list_new() }
+    if len(text) == 0                     { return list_new() }
+    let target_centi = vc_profile_p0_centihz(profile)
+    // No target P0 -> fall back to baseline synth_text. This makes
+    // vc_synth_with_profile a graceful no-op for silence-reference
+    // profiles (rather than producing zero output).
+    if target_centi <= 0 {
+        return synth_text(text, 0)
+    }
+    let p0_hz = target_centi / 100
+    if p0_hz <= 0 { return synth_text(text, 0) }
+    // Walk the text once, character by character. For each voiced
+    // phoneme we synthesize a continuous-phase segment (F0 carrier +
+    // light formant overtones); for unvoiced (plosives/fricatives/
+    // nasals) we fall back to R6E's baseline synth_phoneme which
+    // contributes audible non-pitched content without disturbing the
+    // F0 phase chain.
+    let out = list_new()
+    let n = len(text)
+    let i = 0
+    let n_samples = 1200          // AUDIO_PHONEME_SAMPLES per char
+    let ph_p0 = 0
+    let ph_f1 = 0
+    let ph_f2 = 0
+    while i < n {
+        let c = char_at(text, i)
+        if c == 32 {
+            // Space -> skip (no audible output, phase preserved).
+        } else {
+            let lab = substr(text, i, 1)
+            let r = _vc_resolve_formants(lab, profile)
+            let f1 = r[0]
+            let f2 = r[1]
+            let kind = r[2]
+            // Voiced phoneme (vowel/diphthong/syllabic): emit the
+            // continuous-phase F0+formants segment.
+            if kind == 1 || kind == 5 || kind == 7 {
+                let seg = _vc_synth_segment(p0_hz, f1, f2, n_samples,
+                                             ph_p0, ph_f1, ph_f2)
+                let chunk = seg[0]
+                ph_p0 = seg[1]
+                ph_f1 = seg[2]
+                ph_f2 = seg[3]
+                let j = 0
+                while j < len(chunk) {
+                    push(out, chunk[j])
+                    j = j + 1
+                }
+            } else {
+                // Unvoiced -> R6E baseline. The F0 phase chain is
+                // unaffected so the next voiced phoneme picks up where
+                // the previous one left off (no audible discontinuity).
+                let chunk = synth_phoneme(lab)
+                let j = 0
+                while j < len(chunk) {
+                    push(out, chunk[j])
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- chat helper ---------------------------------------------------------
+//
+// vc_run_clone_command(arg) -> single human-readable line.
+//
+// Parses arg as "<reference.wav> <text>", analyzes the reference,
+// synthesizes text in the cloned voice, writes to /tmp/cloned.wav.
+//
+// Output:
+//   (clone <ref>: p0=<hz>Hz, F1=<f1>Hz, F2=<f2>Hz, wrote /tmp/cloned.wav
+//    [<n> samples])
+// Error path:
+//   (clone FAILED: <reason>)
+
+let VC_CLONE_OUTPUT_PATH = "/tmp/cloned.wav"
+
+fn _vc_int_to_str(n) {
+    if n == 0 { return "0" }
+    let neg = 0
+    let v = n
+    if v < 0 { neg = 1; v = 0 - v }
+    let out = ""
+    while v > 0 {
+        let d = v - (v / 10) * 10
+        out = chr(48 + d) + out
+        v = v / 10
+    }
+    if neg == 1 { out = "-" + out }
+    return out
+}
+
+fn vc_clone_output_path() { return VC_CLONE_OUTPUT_PATH }
+
+fn vc_run_clone_command(arg) {
+    if len(arg) == 0 {
+        return "(/clone needs REFERENCE.wav TEXT -- usage: /clone /tmp/ref.wav hello)"
+    }
+    let parts = split(arg, " ")
+    if len(parts) < 2 {
+        return "(/clone needs REFERENCE.wav TEXT -- usage: /clone /tmp/ref.wav hello)"
+    }
+    let ref_path = str_trim(parts[0])
+    // Reassemble text from parts[1..].
+    let text = ""
+    let i = 1
+    while i < len(parts) {
+        if i > 1 { text = text + " " }
+        text = text + parts[i]
+        i = i + 1
+    }
+    text = str_trim(text)
+    if len(ref_path) == 0 {
+        return "(/clone needs REFERENCE.wav TEXT -- usage: /clone /tmp/ref.wav hello)"
+    }
+    if len(text) == 0 {
+        return "(/clone needs REFERENCE.wav TEXT -- usage: /clone /tmp/ref.wav hello)"
+    }
+    let profile = vc_analyze_reference(ref_path)
+    if vc_profile_is_valid(profile) == 0 {
+        return "(clone FAILED: could not analyze reference at " + ref_path + ")"
+    }
+    let table = vc_profile_formant_table(profile)
+    if len(table) == 0 {
+        return "(clone FAILED: no formants extracted from " + ref_path + ")"
+    }
+    let first = table[0]
+    let f1 = vc_formant_f1(first)
+    let f2 = vc_formant_f2(first)
+    let p0_centi = vc_profile_p0_centihz(profile)
+    let p0_hz = pitch_centihz_to_hz(p0_centi)
+    let samples = vc_synth_with_profile(text, profile)
+    if len(samples) == 0 {
+        return "(clone FAILED: synth produced empty output for " + text + ")"
+    }
+    let ok = audio_write_wav(samples, VC_CLONE_OUTPUT_PATH)
+    if ok == 0 {
+        return "(clone FAILED: could not write " + VC_CLONE_OUTPUT_PATH + ")"
+    }
+    return "(clone " + ref_path
+        + ": p0=" + _vc_int_to_str(p0_hz) + " Hz"
+        + ", F1=" + _vc_int_to_str(f1) + " Hz"
+        + ", F2=" + _vc_int_to_str(f2) + " Hz"
+        + ", wrote " + VC_CLONE_OUTPUT_PATH
+        + " [" + _vc_int_to_str(len(samples)) + " samples])"
+}

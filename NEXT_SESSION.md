@@ -3,7 +3,107 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R13F (this session) — Snapshot incremental delta writes: fsync-floor reduction on the hot path
+## R13D (this session) — Voice cloning via Klatt formant transfer
+
+**Status: complete -- new `src/io/effectors/audio_voice_clone.nova`
+module implements non-LLM speaker voice transfer via integer-only
+LPC + Klatt formant table substitution.** Given a reference WAV of
+the target speaker, the pipeline extracts their mean P0 (via R11B
+YIN) + per-formant centers (via integer Levinson-Durbin LPC + spectrum
+peak-picking), builds a transferred phoneme formant table (direct
+match for observed phonemes; ratio-scaled R6E defaults for unobserved),
+and synthesizes new text in the cloned voice via a continuous-phase
+F0 carrier mixed with light formant overtones. All 55 unit assertions
++ 14 integration assertions are green; all R6E/R7F/R9B/R8B/R10F/R11B/
+R12D audio unit tests pass unchanged.
+
+### New module: `src/io/effectors/audio_voice_clone.nova` (~700 lines)
+
+Public API:
+
+- `vc_analyze_reference(wav_path)` -> voice_profile_t
+  Reads the WAV via `audio_capture_to_pcm`, runs `pitch_track_yin` for
+  P0, runs `vc_extract_formants` on 30-ms windows for per-frame F1/F2/
+  F3, aggregates via median, computes scale ratios vs R6E's "ae"
+  defaults (660/1720), returns a profile struct.
+- `vc_apply_profile(klatt_table, profile)` -> new_klatt_table
+  Maps a list of phoneme labels to per-phoneme [F1, F2, F3, BW1, BW2,
+  BW3] tuples; direct reference matches use measured formants; non-
+  reference vowels get R6E defaults scaled by the profile's ratios;
+  non-vowels pass through unscaled.
+- `vc_synth_with_profile(text, profile)` -> wav samples
+  Walks text char-by-char; voiced chars emit a continuous-phase
+  glottal-source (target P0) + light formant overtones (98% F0 + 1%
+  per formant); unvoiced chars fall back to `synth_phoneme`.
+- `vc_extract_formants(samples, sample_rate, order, max_formants)`
+  Direct LPC formant peak-picking.
+- `vc_autocorr(samples, max_lag)` and `vc_levinson_durbin(autocorr,
+  order)` -- the underlying primitives, exposed for tests.
+- `vc_run_clone_command(arg)` -- chat helper for `/clone REF TEXT`.
+
+### Algorithm
+
+1. Reference analysis: 30-ms frames -> LPC order 10 via Levinson-
+   Durbin in milli fixed-point -> spectrum `|1/A(e^jw)|^2` evaluated
+   at 50-Hz grid from 150 Hz to Nyquist -> top-3 local maxima are
+   F1/F2/F3 -> median aggregation.
+
+2. Formant mapping: per-phoneme lookup -> direct ref match OR R6E
+   default scaled by F1/F2 ratios.
+
+3. Pitch transfer via continuous-phase F0 carrier. The continuous-
+   phase invariant across phoneme boundaries is critical: R11B YIN's
+   cumulative-mean-difference function will snap to phoneme-boundary
+   discontinuity periodicity if each phoneme resets its F0 phase.
+
+### Headline results
+
+- **LPC on Klatt /ae/** (F1=660, F2=1720, F3=2410): extracted
+  formants (650, 1700, 2450) -- all within +/- 50 Hz (the spectrum-
+  grid step).
+- **P0 transfer**: 200 Hz reference sine -> profile.P0 = 20000
+  centi-Hz exact; cloned synth YIN F0 = 20000 centi-Hz exact.
+- **Identity profile**: applied to [ae, iy, uw] returns each
+  phoneme's R6E defaults unchanged.
+
+### Chat wiring (3 lines)
+
+- 1 import line (`audio_voice_clone.nova`)
+- 1 help line (`/clone REF.wav TEXT clone voice from REF.wav, synth
+  TEXT to /tmp/cloned.wav (R13D)`)
+- 1 dispatch line routing `/clone` -> `vc_run_clone_command(arg)`
+
+### Tests
+
+- `tests/unit/test_voice_clone.nova` -- 55 assertions covering
+  constants, autocorrelation, Levinson-Durbin, LPC formant
+  extraction on sine + Klatt /ae/, vc_analyze_reference happy + sad
+  paths, vc_apply_profile identity + scaled + direct-match,
+  vc_synth_with_profile happy + edge cases, vc_run_clone_command
+  4-state matrix.
+- `tests/integration/scenario_ddd_voice_clone.sh` -- 14 assertions
+  covering driver-level round-trip (200 Hz reference -> profile.P0 =
+  20000 centi -> cloned synth YIN = 20000 centi -> applied table
+  length matches input) + chat round-trip (/help advertises /clone;
+  /clone reports p0 + writes /tmp/cloned.wav; /clone graceful FAILED
+  on missing reference + missing text + missing path).
+
+### Module count: 151 -> 152
+
+### Known limitations
+
+- YIN inherits octave-snap on high-pitched references (300 Hz sine
+  -> P0 = 150 centi-Hz, not 300). Workaround: use references in
+  [80..220] Hz where YIN is reliable.
+- Formant mix capped at 1% per formant to keep YIN locked at the F0
+  carrier; perceptual quality is below a real Klatt-with-glottal-
+  source synth but matches the brief's "non-LLM voice cloning"
+  altitude.
+- No 3-dB FWHM bandwidth measurement; profile carries Klatt 1980
+  defaults (60/90/150 Hz).
+- Reference WAV cap 30 s (matches R12D PSOLA cap).
+
+## R13F (PREVIOUS session) — Snapshot incremental delta writes: fsync-floor reduction on the hot path
 
 **Status: complete -- new `src/persistence/snapshot_delta.nova` module
 implements append-only delta snapshots that record only ADD / MOD /

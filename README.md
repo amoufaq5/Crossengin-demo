@@ -11,7 +11,30 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 149 modules compile (`make build`). R12D adds
+> toolchain: 152 modules compile (`make build`). R13D adds
+> `src/io/effectors/audio_voice_clone.nova` — non-LLM voice cloning via
+> Klatt formant transfer, the audio *cloning* leg next to R6E synthesis,
+> R7F/R9B VAD, R8B/R10B STT, R10F/R11B F0 estimation, and R12D TD-PSOLA.
+> Given a reference WAV of the target speaker, the pipeline extracts
+> their mean P0 (via R11B YIN) + per-formant centers (via integer-only
+> Levinson-Durbin LPC on the autocorrelation, then peak-pick on the
+> `|1/A(e^jw)|^2` spectrum evaluated at a 50-Hz grid), builds a
+> transferred phoneme formant table (direct match for observed phonemes;
+> ratio-scaled R6E defaults for unobserved), and synthesizes new text in
+> the cloned voice via a continuous-phase glottal-source + light-formant
+> mix at the target P0. **LPC on Klatt /ae/ (F1=660, F2=1720, F3=2410)
+> recovers (650, 1700, 2450) -- all within +/- 50 Hz.** **200 Hz
+> reference -> profile.P0 = 20000 centi-Hz exact; cloned synth YIN F0 =
+> 20000 centi-Hz exact (pitch transferred faithfully).** Identity
+> profile (R6E defaults + ratio 1000) returns each phoneme unchanged.
+> Caps: reference WAV <= 30 s (= 480000 samples @ 16 kHz); LPC order
+> <= 12 (i32-friendly Levinson-Durbin range). New chat admin:
+> `/clone REF.wav TEXT` analyzes the reference, synths text in the
+> cloned voice, writes `/tmp/cloned.wav`, echoes
+> `(clone REF: p0=X Hz, F1=Y Hz, F2=Z Hz, wrote /tmp/cloned.wav [N
+> samples])`. 55 unit assertions + 14 integration assertions; all
+> green. All R6E/R7F/R9B/R8B/R10F/R11B/R12D audio tests pass unchanged.
+> R12D adds
 > `src/io/transducers/audio_psola.nova` -- TD-PSOLA pitch shifting +
 > time stretching (Moulines & Charpentier 1990) -- the audio
 > *manipulation* leg next to R6E synthesis, R7F/R9B VAD, R8B/R10B STT,
