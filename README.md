@@ -11,7 +11,26 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain: 146 modules compile (`make build`). R11B extends
+> toolchain: 148 modules compile (`make build`). R12C adds
+> `src/kg/louvain.nova` — Blondel-2008 two-phase greedy modularity
+> optimiser, the gold-standard companion to R11F's label-propagation
+> detector. Phase 1 picks moves analytically (DQ in integer-only
+> milli units: `gain_scaled = 2m*k_u_in_C - k_u*Sigma_tot_C`); Phase 2
+> aggregates communities into super-nodes and recurses until no merge
+> improves modularity. On the **Zachary 1977 karate-club benchmark
+> (34 nodes, 78 edges)** Louvain reports modularity 399 milli vs
+> R11F's 256 milli (**+143 milli, 56% relative improvement**) and
+> finds 3 communities vs LPA's 2. On the barbell + 3-triangle
+> fixtures both algorithms find the same global optimum (423/667
+> milli). New chat admin: `/louvain` prints
+> `(LOUVAIN n=N largest=L modularity=M milli edges=E depth=D)`.
+> Module exports `louvain_communities`, `louvain_label_at`,
+> `louvain_community_members`, `louvain_largest_community`,
+> `louvain_modularity`, `louvain_levels`, `louvain_dendrogram` (the
+> hierarchical merge tree, finest -> coarsest). 67 unit assertions
+> (`tests/unit/test_louvain.nova`) + 19 integration assertions
+> (`tests/integration/scenario_zz_louvain.sh`); all green. R11F's
+> 71 unit checks remain bit-identically green. R11B extends
 > `src/io/transducers/audio_pitch.nova` (R10F's file) with parallel
 > YIN-class entry points (`pitch_estimate_frame_yin`, `pitch_track_yin`,
 > `pitch_run_yin_command`) that cure R10F's first-formant snap on

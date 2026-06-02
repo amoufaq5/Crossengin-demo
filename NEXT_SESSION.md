@@ -3,7 +3,107 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R11B (this session) — Audio: YIN-class F0 estimator (cumulative mean normalized difference)
+## R12C (this session) — KG: Louvain modularity-optimising community detection
+
+**Status: complete -- new module `src/kg/louvain.nova` implements the
+Blondel 2008 ("Fast unfolding of communities in large networks") two-
+phase greedy modularity optimiser, complementing R11F's label-
+propagation detector.** Where R11F's LPA shipped a streaming-friendly
+O(V+E) neighbour-vote heuristic, Louvain ships the gold-standard
+modularity-optimiser: each Phase 1 sweep picks moves analytically by
+maximising the modularity gain DQ, then Phase 2 aggregates communities
+into super-nodes and recurses. R11F stays available unchanged
+(`/communities`); Louvain dispatches through the parallel `/louvain`
+chat command.
+
+### Algorithm (Louvain, two-phase iterative)
+
+1. **Phase 1 (local modularity optimisation).** Each node starts in
+   its own community. Repeat until no improvement:
+   - For each node u (deterministic-shuffled order):
+     - For each candidate community C in u's neighbourhood, compute
+       the modularity gain DQ of moving u into C analytically.
+     - Move u to the best STRICTLY POSITIVE DQ candidate, else stay.
+   - DQ in integer milli units (no FP weights):
+     `gain_scaled = 2m * k_u_in_C - k_u * Sigma_tot_C`
+     where `2m = sum(weighted degrees)`, `k_u_in_C` = sum of weights
+     from u to C, and `Sigma_tot_C` = sum of degrees of nodes in C
+     (with `k_u` subtracted when C == u's current community).
+2. **Phase 2 (community aggregation).** Build a new (smaller) graph
+   where each Phase-1 community becomes a single super-node. Inter-
+   community edges sum to weighted super-edges; intra-community edges
+   sum to self-loops on the new super-node.
+3. **Recurse.** Re-run Phase 1 on the aggregated graph. Stop when a
+   Phase-1 sweep produces zero merges OR max_iter levels were used
+   (default 10).
+
+### Public API
+
+- `louvain_communities(kg, max_iter) -> louvain_result`
+- `louvain_communities_seeded(kg, max_iter, seed)` (default seed = 0)
+- `louvain_label_at(r, atom_id) -> int community id` (-1 if missing)
+- `louvain_community_count(r) -> int`
+- `louvain_community_members(r, community_id) -> list[atom_id]`
+- `louvain_largest_community(r) -> [community_id, size]`
+- `louvain_modularity(kg, r) -> int milli` (matches R11F's
+  `gc_modularity` formula so Louvain vs LPA modularity is directly
+  comparable)
+- `louvain_levels(r) -> int` (number of Louvain levels run)
+- `louvain_dendrogram(r) -> list[[n_communities, labels...]]` (the
+  hierarchical merge tree captured per level, finest -> coarsest)
+- `louvain_communities_cmd(kg) -> 1` (chat dispatcher emitting one
+  `LOUVAIN n=N largest=L modularity=M milli edges=E depth=D` line)
+
+### Results (default seed = 0)
+
+| Fixture                | Edges | Louvain Q (milli) | LPA (R11F) Q (milli) | Louvain comms | LPA comms |
+| ---------------------- | ----- | ----------------- | -------------------- | ------------- | --------- |
+| Barbell (4+4+bridge)   | 13    | 423               | 423                  | 2             | 2         |
+| 3 disjoint triangles   | 9     | 667               | 667                  | 3             | 3         |
+| Zachary karate (1977)  | 78    | **399**           | **256**              | 3             | 2         |
+
+On the small/clean fixtures both algorithms find the same global
+optimum (Q matches exactly). On the Zachary 1977 karate-club
+benchmark -- the real-world community-detection gold standard --
+Louvain wins by **+143 milli** (56% relative improvement) and finds
+3 communities versus LPA's 2. The brief's threshold (`> 350 milli`)
+is cleared by a comfortable margin.
+
+### Determinism
+
+Same KG snapshot + same seed -> bit-identical clustering. Order of
+node visits comes from a 15-bit shift-xor mixer (the same NOVA
+codegen-bug-safe pattern R11F uses; see NOVA_BUG_THRESHOLD.md).
+Different seeds may settle on different valid partitions on graphs
+with multiple local optima -- the unit tests assert idempotence on
+the default seed (`test_idempotent_modularity` re-runs three times,
+each call returning the same modularity).
+
+### Files
+
+- New: `src/kg/louvain.nova` (~600 LOC, integer-only).
+- New: `tests/unit/test_louvain.nova` (~67 assertions, 72 checks
+  fired, all PASS).
+- New: `tests/integration/scenario_zz_louvain.sh` + tracked driver
+  `tests/integration/_scenario_zz_louvain_driver/louvain_driver.nova`
+  (~19 assertions, all PASS).
+- Updated: `examples/crossengin_chat.nova` (+3 lines: import + help +
+  dispatch for `/louvain`).
+- Module count: 147 -> 148.
+
+### What's next
+
+- Resolution-limit aware Louvain (Reichardt-Bornholdt 2006 + Arenas
+  2008): the original Louvain merges small communities into giant
+  super-clusters on dense graphs; a tunable resolution parameter `r`
+  exposes the multi-scale community structure.
+- Leiden algorithm (Traag 2019): refines Louvain's local move with a
+  "refinement" sub-phase that fixes Louvain's known badly-connected
+  community bug.
+- Cross-KG Louvain: walk xrefs across KG boundaries and cluster the
+  union graph. Currently single-KG only (mirrors R11F's scope).
+
+## R11B (previous session) — Audio: YIN-class F0 estimator (cumulative mean normalized difference)
 
 **Status: complete -- extended `src/io/transducers/audio_pitch.nova`
 (R10F's file) with parallel YIN-class entry points that cure R10F's
