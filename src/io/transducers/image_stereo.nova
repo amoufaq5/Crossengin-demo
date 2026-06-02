@@ -271,6 +271,64 @@ fn stereo_sad_block(left_ptr, right_ptr, width, x_l, x_r, y, win_size) {
     return sad
 }
 
+// ---- R12A: SIMD-accelerated SAD (uses R11D simd_sum_abs_diff) -----------
+//
+// stereo_sad_block_simd(left, right, width, x_l, x_r, y, win_size,
+//                       l_buf, r_buf) -> int
+//   Stages the WIN_SIZE x WIN_SIZE window into i32 lane buffers (l_buf,
+//   r_buf) row-major, then invokes simd_sum_abs_diff() which lowers to:
+//     Linux x86-64   -> AVX2 vpaddd/vpsubd/vpabsd (8 i32 lanes per insn)
+//     Linux ARM64    -> NEON 2x 128-bit add/sub/abs
+//     other targets  -> R11D scalar fallback (8-iter loop)
+//   Caller allocs l_buf and r_buf via alloc((win*win + 8) * 4) ONCE and
+//   reuses across (x_l, x_r) pairs in a scanline. Bit-identical to
+//   stereo_sad_block (each |l - r| <= 255; sum over WIN_SIZE^2 fits in
+//   i32 for the maximum 15x15 window: 225 * 255 = 57375 << 2^31).
+
+fn _stereo_store_i32_le(buf, idx, v) {
+    let off = int_mul(idx, 4)
+    let u = v
+    if v < 0 { u = int_sub(4294967296, int_sub(0, v)) }
+    store8(int_add(buf, off),                     u % 256)
+    store8(int_add(buf, int_add(off, 1)),         int_div(u, 256) % 256)
+    store8(int_add(buf, int_add(off, 2)),         int_div(u, 65536) % 256)
+    store8(int_add(buf, int_add(off, 3)),         int_div(u, 16777216) % 256)
+}
+
+fn stereo_sad_block_simd(left_ptr, right_ptr, width, x_l, x_r, y, win_size,
+                         l_buf, r_buf) {
+    let half = win_size / 2
+    let n = int_mul(win_size, win_size)
+    let i = 0
+    let dy = 0 - half
+    while dy <= half {
+        let row_off = int_mul(int_add(y, dy), width)
+        let dx = 0 - half
+        while dx <= half {
+            let l_val = load8(left_ptr  + int_add(row_off, int_add(x_l, dx)))
+            let r_val = load8(right_ptr + int_add(row_off, int_add(x_r, dx)))
+            _stereo_store_i32_le(l_buf, i, l_val)
+            _stereo_store_i32_le(r_buf, i, r_val)
+            i = int_add(i, 1)
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    return simd_sum_abs_diff(l_buf, r_buf, n)
+}
+
+// _stereo_simd_enabled() -> 1 if CE_STEREO_SIMD env var is unset or "on"
+//   (default-on), 0 if set to "off". A/B toggle for the bench script.
+fn _stereo_simd_enabled() {
+    let env = getenv("CE_STEREO_SIMD")
+    if env == 0       { return 1 }
+    if len(env) == 0  { return 1 }
+    if str_eq(env, "off") == 1 { return 0 }
+    if str_eq(env, "0")   == 1 { return 0 }
+    if str_eq(env, "no")  == 1 { return 0 }
+    return 1
+}
+
 // ---- normalisation helpers ----------------------------------------------
 
 fn _stereo_clamp_win_size(win_size) {
@@ -317,6 +375,14 @@ fn stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp) {
     // disparity offset to test on the right side.
     if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
     if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+
+    // R12A: SIMD wiring. Default-on (CE_STEREO_SIMD unset or "on") routes
+    // through the bit-identical AVX2/NEON path; CE_STEREO_SIMD=off
+    // preserves the scalar inner loop for A/B benchmarking.
+    if _stereo_simd_enabled() == 1 {
+        return _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
+                                            ws, md, area, half)
+    }
 
     let map = _stereo_zero_map(area)
     let valid_count = 0
@@ -371,6 +437,95 @@ fn stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp) {
         density_milli = int_mul(nonzero_count, 1000) / valid_count
     }
     return _stereo_result(map, mean, density_milli, area)
+}
+
+// ---- R12A: SIMD disparity inner loop ------------------------------------
+//
+// _stereo_disparity_simd_inner: shared SIMD inner-loop body, called by
+//   both `stereo_disparity_simd` (always SIMD) and `stereo_disparity`
+//   (default SIMD; CE_STEREO_SIMD=off opts out at dispatch). Caller has
+//   already validated dims + clamped ws / md.
+fn _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
+                                 ws, md, area, half) {
+    // Allocate the SIMD lane buffers ONCE per call and reuse for every
+    // SAD evaluation. Size = win*win + 8 lanes of slack at 4 B each.
+    let n_lanes = int_mul(ws, ws)
+    let buf_bytes = int_mul(int_add(n_lanes, 8), 4)
+    let l_buf = alloc(buf_bytes)
+    let r_buf = alloc(buf_bytes)
+
+    let map = _stereo_zero_map(area)
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block_simd(left_ptr, right_ptr, width,
+                                                x, int_sub(x, d), y, ws,
+                                                l_buf, r_buf)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            store8(map + int_add(row_off, x), best_d)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, best_d)
+            if best_d > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// stereo_disparity_simd(left, right, w, h, win_size, max_disp)
+//   -> same shape as stereo_disparity. Explicit SIMD entry-point. Falls
+//   back to scalar stereo_disparity when CE_STEREO_SIMD=off.
+fn stereo_disparity_simd(left_ptr, right_ptr, width, height, win_size, max_disp) {
+    if width <= 0   { return _stereo_fail() }
+    if height <= 0  { return _stereo_fail() }
+    if left_ptr == 0  { return _stereo_fail() }
+    if right_ptr == 0 { return _stereo_fail() }
+    if width > STEREO_MAX_DIM  { return _stereo_fail() }
+    if height > STEREO_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_fail() }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let half = ws / 2
+    if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if _stereo_simd_enabled() == 0 {
+        return stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+    }
+    return _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
+                                        ws, md, area, half)
 }
 
 // ---- depth from disparity ------------------------------------------------
