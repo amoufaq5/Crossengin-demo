@@ -1,0 +1,995 @@
+// CrossEngin io/transducers: SLIC superpixel segmentation (R12B).
+//
+// Purpose
+//   R11E shipped spatial k-means (image_segmentation.nova) -- a textbook
+//   Lloyd's iteration that partitions an image into K coherent regions
+//   under a (intensity, x, y) joint distance. K-means works for large-
+//   scale clustering but it has ONE structural blind spot: cluster
+//   lines cross intensity edges. A boundary between two distinct
+//   objects can run THROUGH a single k-means region because the
+//   spatial weight does not know about gradients. For higher-level CV
+//   (semantic segmentation, region-based features, contour proposals)
+//   we want superpixels that ADHERE TO image boundaries -- compact
+//   patches whose perimeter follows the visible structure.
+//
+//   SLIC (Simple Linear Iterative Clustering, Achanta 2012) is the
+//   standard answer. The idea is a localised k-means: each cluster
+//   center only competes for pixels in a 2S x 2S window around it
+//   (S being the grid step), which makes the algorithm O(N) regardless
+//   of K. The combined distance metric weights intensity and spatial
+//   separately with a compactness factor m -- larger m -> tighter,
+//   blockier superpixels; smaller m -> better boundary adherence at
+//   the cost of irregular shape. The paper recommends m=10 as the
+//   balanced default.
+//
+//   This is a SISTER module to R11E's image_segmentation.nova, not a
+//   replacement: R11E does global k-means (coarse "where are the
+//   regions?"); R12B does localised SLIC (fine "what are the boundary-
+//   adherent superpixels?"). Both produce per-pixel labels + cluster
+//   centers; the consumer picks based on whether boundary adherence
+//   matters.
+//
+// Algorithm (integer-only, no floats):
+//
+//   Inputs: grayscale image I (W x H), desired # superpixels K,
+//   compactness factor m (default 10), max_iter (default 10).
+//
+//   1. Step size S = isqrt(W * H / K). For a 256x256 image with
+//      K=256 -> S=16. For a 64x64 image with K=16 -> S=16. We
+//      require S >= 2 (otherwise the 2S window is too tight); on
+//      tiny images K is automatically clamped down.
+//   2. Initialize K cluster centers on a regular grid spaced S pixels
+//      apart. Cell (gx, gy) center sits at (gx*S + S/2, gy*S + S/2)
+//      clipped to the image interior. The grid runs in row-major
+//      order until K centers are placed.
+//   3. Perturb each center to the lowest-gradient pixel in a 3x3
+//      neighbourhood -- this avoids initialising on top of an edge,
+//      which would split one object into two superpixels. Gradient
+//      proxy: |I(x+1,y) - I(x-1,y)| + |I(x,y+1) - I(x,y-1)| (Sobel-
+//      style L1; pure integer).
+//   4. Iterate:
+//        Assignment: for each cluster k, examine the 2S x 2S window
+//          centered at its current (cx, cy). For each pixel p in
+//          that window, compute the SCALED squared distance
+//             D2 = di * di * S * S + (dx * dx + dy * dy) * m * m
+//          (this is the integer form of the paper's
+//             D = sqrt(d_int^2 + (d_spat/S)^2 * m^2)
+//           after multiplying both sides by S^2). The pixel keeps
+//          the cluster id whose D2 is smallest. Ties go to the LOWER
+//          cluster id for deterministic behaviour. Pixels outside
+//          every 2S window keep their previous label (which is what
+//          the paper does -- the windows ARE the search region).
+//        Update: recompute each center as the integer mean of its
+//          assigned pixels' (I, x, y). Empty clusters keep their
+//          previous center (mirrors R11E's stale-centroid handling).
+//      Stop when no pixel changed label OR max_iter reached.
+//
+//   5. Output: a per-pixel label list of length W*H, plus the final
+//      list of K cluster centers, plus iteration / convergence flags.
+//
+//   Boundary detection: a pixel is a "boundary pixel" iff at least
+//   one of its 4-neighbours has a different label. For the chat
+//   render we draw the boundaries in white (255) over the original
+//   intensity image, producing an overlay that visualises how well
+//   the superpixels hug the visible edges.
+//
+// Public API
+//   slic_segment(data_ptr, width, height, k, m, max_iter) -> slic_result
+//   slic_segment_default(data_ptr, width, height, k) -> slic_result
+//     (m = SLIC_DEFAULT_M, max_iter = SLIC_DEFAULT_MAX_ITER)
+//   slic_label_at(result, x, y) -> int cluster id (or SLIC_LABEL_OOB)
+//   slic_center_at(result, k) -> list [I_center, x_center, y_center]
+//   slic_center_count(result) -> int (K placed; <= requested K)
+//   slic_iterations(result) -> int (1..max_iter)
+//   slic_converged(result)  -> int (1 if assignments stable, else 0)
+//   slic_width(result) / slic_height(result) / slic_step(result)
+//   slic_boundaries(result) -> list of (x, y) pairs at superpixel borders
+//   slic_boundary_count(result) -> int total
+//   slic_render_pgm(result, data_ptr) -> int byte buffer ptr
+//                                         (PGM P5 bytes, boundary overlay)
+//   slic_render_pgm_size(result) -> int total length of the render
+//   slic_render_to_file(result, data_ptr, path) -> 1 on success
+//   slic_boundary_count_label(n) -> string atom label
+//   slic_pgm_args(arg) -> string for chat /slic dispatch
+//   slic_append_features(feats, data_ptr, width, height) -> 1 on emit
+//
+// Caps:
+//   * Dimensions <= 256 per axis (max area = 65536).
+//   * K in [SLIC_MIN_K=16, SLIC_MAX_K=1024]. K is auto-clamped to
+//     min(K, W*H / 4) so every superpixel has at least 4 pixels of
+//     working area on tiny fixtures.
+//   * m in [1, 40]. Outside this range -> default 10.
+//   * max_iter <= SLIC_MAX_ITER = 20.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, int_to_str.
+//   syscall: sys_open, sys_write, sys_fsync, sys_close, O_WRONLY,
+//   O_CREAT, O_TRUNC (for slic_render_to_file).
+// CrossEngin dependencies: image_pgm.nova ONLY (chat helper uses it
+//   for PGM-from-disk decode). image_segmentation.nova is NOT a
+//   dependency -- SLIC is a sibling module. visual_perception.nova
+//   imports THIS module, not the other way around.
+
+import "std/syscall"
+import "image_pgm.nova"
+
+// ---- format constants ----------------------------------------------------
+
+// Dimension cap. Same 256x256 ceiling as R11E -- the NOVA codegen
+// pointer-threshold gotcha applies here too (#11 / NOVA #6+).
+let SLIC_MAX_DIM        = 256
+let SLIC_MAX_PIXEL_AREA = 65536
+
+// K caps. The brief specifies K in [16, 1024]. On a 64x64 image with
+// K=16 the step S=16; on 256x256 with K=1024 the step S=8. Below S=8
+// the 3x3 perturbation neighbourhood would dominate the cluster size
+// and superpixels become noisy.
+let SLIC_MIN_K = 16
+let SLIC_MAX_K = 1024
+
+// Compactness factor. Achanta 2012 recommends m=10 for typical
+// natural images; m=20 produces blockier patches good for downstream
+// region features; m=5 sticks tightly to edges at the cost of
+// irregular shapes.
+let SLIC_DEFAULT_M = 10
+let SLIC_MIN_M     = 1
+let SLIC_MAX_M     = 40
+
+// Iteration cap. The paper notes SLIC converges in <= 10 iterations
+// on typical images; 20 is the operator escape valve.
+let SLIC_DEFAULT_MAX_ITER = 10
+let SLIC_MAX_ITER         = 20
+
+// Minimum step (S). Below this the 2S window has too few pixels for
+// the localised k-means to be meaningful; we clamp K so S >= 4.
+let SLIC_MIN_STEP = 4
+
+// Sentinel returned by slic_label_at on out-of-bounds and used during
+// initialization (every pixel starts unassigned).
+let SLIC_LABEL_OOB    = -1
+let SLIC_LABEL_UNSET  = -1
+
+// Boundary overlay intensity (white).
+let SLIC_BOUNDARY_INTENSITY = 255
+
+// Result tuple slot indices. Exposed for accessors and tests.
+let SLIC_R_LABELS     = 0   // list of int (length area), per-pixel cluster id
+let SLIC_R_CENTERS    = 1   // list of [I, x, y] triples (length K_actual)
+let SLIC_R_WIDTH      = 2
+let SLIC_R_HEIGHT     = 3
+let SLIC_R_K          = 4   // number of centers actually placed
+let SLIC_R_M          = 5
+let SLIC_R_STEP       = 6   // step size S
+let SLIC_R_ITER       = 7   // iterations actually run
+let SLIC_R_CONVERGED  = 8   // 1 if assignments stable on last iter
+
+// ---- result helpers ------------------------------------------------------
+
+fn _slic_result(labels, centers, w, h, k, m, step, iters, converged) {
+    let r = list_new()
+    push(r, labels)
+    push(r, centers)
+    push(r, w)
+    push(r, h)
+    push(r, k)
+    push(r, m)
+    push(r, step)
+    push(r, iters)
+    push(r, converged)
+    return r
+}
+
+fn _slic_fail() {
+    return _slic_result(list_new(), list_new(), 0, 0, 0, 0, 0, 0, 0)
+}
+
+fn _slic_center(intensity, x, y) {
+    let c = list_new()
+    push(c, intensity)
+    push(c, x)
+    push(c, y)
+    return c
+}
+
+// ---- isqrt helper --------------------------------------------------------
+//
+// Integer floor sqrt. Linear scan -- K is bounded so the iteration
+// count stays under sqrt(65536) = 256.
+
+fn _slic_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n <= 1 { return 1 }
+    let i = 1
+    while int_mul(int_add(i, 1), int_add(i, 1)) <= n {
+        i = int_add(i, 1)
+    }
+    return i
+}
+
+// ---- gradient perturbation ----------------------------------------------
+//
+// Move a center to the lowest-gradient pixel in its 3x3 neighbourhood.
+// The gradient proxy is the L1 sum of horizontal and vertical
+// finite-difference magnitudes -- a pure integer Sobel-style measure.
+// This is the standard SLIC initialisation trick: starting on a
+// gradient peak (an edge) would split one object into two superpixels.
+
+fn _slic_gradient_at(data_ptr, width, height, x, y) {
+    // Bounds: needs (x-1, y), (x+1, y), (x, y-1), (x, y+1). Refuse
+    // to evaluate on the image border -- caller should clamp.
+    if x <= 0 { return 0 }
+    if y <= 0 { return 0 }
+    if x >= int_sub(width, 1)  { return 0 }
+    if y >= int_sub(height, 1) { return 0 }
+    let row = int_mul(y, width)
+    let i_xm1 = load8(data_ptr + int_sub(int_add(row, x), 1))
+    let i_xp1 = load8(data_ptr + int_add(int_add(row, x), 1))
+    let i_ym1 = load8(data_ptr + int_add(int_mul(int_sub(y, 1), width), x))
+    let i_yp1 = load8(data_ptr + int_add(int_mul(int_add(y, 1), width), x))
+    let dx = int_sub(i_xp1, i_xm1)
+    let dy = int_sub(i_yp1, i_ym1)
+    if dx < 0 { dx = int_sub(0, dx) }
+    if dy < 0 { dy = int_sub(0, dy) }
+    return int_add(dx, dy)
+}
+
+fn _slic_perturb_to_low_gradient(data_ptr, width, height, x, y) {
+    // 3x3 neighbourhood search; return [best_x, best_y]. Skip the
+    // perturbation if the center is on the image border (the 3x3
+    // would go out of bounds and the gradient proxy already returns
+    // 0 on the edges).
+    let result = list_new()
+    push(result, x)
+    push(result, y)
+    if x <= 1 { return result }
+    if y <= 1 { return result }
+    if x >= int_sub(width, 2)  { return result }
+    if y >= int_sub(height, 2) { return result }
+    let best_g = _slic_gradient_at(data_ptr, width, height, x, y)
+    let best_x = x
+    let best_y = y
+    let dy = -1
+    while dy <= 1 {
+        let dx = -1
+        while dx <= 1 {
+            let nx = int_add(x, dx)
+            let ny = int_add(y, dy)
+            let g  = _slic_gradient_at(data_ptr, width, height, nx, ny)
+            if g < best_g {
+                best_g = g
+                best_x = nx
+                best_y = ny
+            }
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    list_set(result, 0, best_x)
+    list_set(result, 1, best_y)
+    return result
+}
+
+// ---- center initialization ----------------------------------------------
+//
+// Lay centers on a regular grid spaced S pixels apart. Cell (gx, gy)
+// nominally lives at ((gx + 0.5) * S, (gy + 0.5) * S); we use the
+// integer form S/2 + gx*S. The grid runs in row-major order until K
+// centers are placed (or the image runs out). Each center is then
+// perturbed to the lowest-gradient pixel in its 3x3 neighbourhood.
+
+fn _slic_init_centers(data_ptr, width, height, k, step) {
+    let centers = list_new()
+    if k <= 0 { return centers }
+    if step <= 0 { return centers }
+    let half = step / 2
+    if half <= 0 { half = 1 }
+    let placed = 0
+    let gy = 0
+    let cy = half
+    while cy < height {
+        if placed >= k { return centers }
+        let cx = half
+        let gx = 0
+        while cx < width {
+            if placed < k {
+                // Clip to image interior (one pixel margin so the 3x3
+                // perturbation does not read past the buffer).
+                let px = cx
+                let py = cy
+                if px < 1 { px = 1 }
+                if py < 1 { py = 1 }
+                if px > int_sub(width, 2)  { px = int_sub(width, 2) }
+                if py > int_sub(height, 2) { py = int_sub(height, 2) }
+                let perturbed = _slic_perturb_to_low_gradient(
+                    data_ptr, width, height, px, py)
+                let fx = perturbed[0]
+                let fy = perturbed[1]
+                let i_cent = load8(data_ptr + int_add(int_mul(fy, width), fx))
+                push(centers, _slic_center(i_cent, fx, fy))
+                placed = int_add(placed, 1)
+            }
+            cx = int_add(cx, step)
+            gx = int_add(gx, 1)
+        }
+        cy = int_add(cy, step)
+        gy = int_add(gy, 1)
+    }
+    return centers
+}
+
+// ---- localized distance metric ------------------------------------------
+//
+// Scaled squared distance:
+//   D2 = (I_p - I_c)^2 * S^2 + ((px - cx)^2 + (py - cy)^2) * m^2
+//
+// This is the integer form of the paper's
+//   D = sqrt((I_p - I_c)^2 + ((px - cx)^2 + (py - cy)^2) * (m / S)^2)
+// after multiplying both sides by S^2. Pure integer; no sqrt needed
+// because we only care about argmin. The worst-case value at
+// W=H=256, S=16, m=10 is:
+//   intensity term: 255^2 * 256 = ~16.6M
+//   spatial term:   2 * 16^2 * 100 = ~51k
+// Both fit comfortably in int (well under 2^31).
+//
+// We pass step_sq and m_sq pre-computed by the caller.
+
+fn _slic_distance_scaled(p_int, px, py, center, step_sq, m_sq) {
+    let di = int_sub(p_int, center[0])
+    let dx = int_sub(px, center[1])
+    let dy = int_sub(py, center[2])
+    let d_int_sq = int_mul(di, di)
+    let d_spat_sq = int_add(int_mul(dx, dx), int_mul(dy, dy))
+    return int_add(int_mul(d_int_sq, step_sq), int_mul(d_spat_sq, m_sq))
+}
+
+// ---- assignment step ----------------------------------------------------
+//
+// For each cluster center, scan a 2S x 2S window centered on (cx, cy).
+// For each pixel in that window, compute the scaled distance to this
+// center and update the pixel's tentative label IF the distance is
+// strictly smaller than its current best. This is the localized
+// k-means trick that makes SLIC O(N) regardless of K.
+//
+// We maintain a parallel `best_dist` list of the same length as labels;
+// when a pixel is "unassigned" (best_dist == -1) we accept any cluster
+// center that examines it.
+
+fn _slic_assign(data_ptr, labels, best_dist, centers, width, height,
+                step, step_sq, m_sq) {
+    let area = int_mul(width, height)
+    let k = len(centers)
+    // Reset best_dist to "unassigned" so each iteration starts fresh
+    // (SLIC re-evaluates every pixel each iter).
+    let p = 0
+    while p < area {
+        list_set(best_dist, p, -1)
+        p = int_add(p, 1)
+    }
+    let kk = 0
+    while kk < k {
+        let center = centers[kk]
+        let cx = center[1]
+        let cy = center[2]
+        let y_lo = int_sub(cy, step)
+        let y_hi = int_add(cy, step)
+        let x_lo = int_sub(cx, step)
+        let x_hi = int_add(cx, step)
+        if y_lo < 0 { y_lo = 0 }
+        if x_lo < 0 { x_lo = 0 }
+        if y_hi > int_sub(height, 1) { y_hi = int_sub(height, 1) }
+        if x_hi > int_sub(width,  1) { x_hi = int_sub(width,  1) }
+        let y = y_lo
+        while y <= y_hi {
+            let row_off = int_mul(y, width)
+            let x = x_lo
+            while x <= x_hi {
+                let off = int_add(row_off, x)
+                let p_int = load8(data_ptr + off)
+                let d = _slic_distance_scaled(p_int, x, y, center,
+                                              step_sq, m_sq)
+                let cur = best_dist[off]
+                if cur < 0 {
+                    list_set(labels,    off, kk)
+                    list_set(best_dist, off, d)
+                } else {
+                    if d < cur {
+                        list_set(labels,    off, kk)
+                        list_set(best_dist, off, d)
+                    }
+                }
+                x = int_add(x, 1)
+            }
+            y = int_add(y, 1)
+        }
+        kk = int_add(kk, 1)
+    }
+    // Any pixel still at -1 (no center examined it -- can happen on
+    // the image corners when no window covers them) gets snapped to
+    // the nearest center by linear scan over the K centers. This is
+    // rare on the 64x64 / 256x256 dimensions we cap at, but it keeps
+    // the label array valid.
+    let q = 0
+    while q < area {
+        if best_dist[q] < 0 {
+            let py = q / width
+            let px = int_sub(q, int_mul(py, width))
+            let p_int = load8(data_ptr + q)
+            let best_k = 0
+            let best_d = _slic_distance_scaled(p_int, px, py,
+                                               centers[0],
+                                               step_sq, m_sq)
+            let kn = 1
+            while kn < k {
+                let d = _slic_distance_scaled(p_int, px, py,
+                                              centers[kn],
+                                              step_sq, m_sq)
+                if d < best_d {
+                    best_d = d
+                    best_k = kn
+                }
+                kn = int_add(kn, 1)
+            }
+            list_set(labels,    q, best_k)
+            list_set(best_dist, q, best_d)
+        }
+        q = int_add(q, 1)
+    }
+    return 1
+}
+
+// Count pixels whose label CHANGED compared to a snapshot. Used as
+// the convergence criterion (0 changes -> converged).
+fn _slic_count_changes(labels, prev_labels) {
+    let n = len(labels)
+    if n != len(prev_labels) { return n }
+    let i = 0
+    let changes = 0
+    while i < n {
+        if labels[i] != prev_labels[i] {
+            changes = int_add(changes, 1)
+        }
+        i = int_add(i, 1)
+    }
+    return changes
+}
+
+// Snapshot the labels into a parallel list so the next iter can
+// compare for convergence.
+fn _slic_snapshot(labels) {
+    let snap = list_new()
+    let n = len(labels)
+    let i = 0
+    while i < n {
+        push(snap, labels[i])
+        i = int_add(i, 1)
+    }
+    return snap
+}
+
+// ---- update step --------------------------------------------------------
+//
+// Recompute every center as the integer mean of its assigned pixels'
+// (I, x, y). Empty clusters keep their previous center (SLIC's
+// equivalent of Lloyd's stale-centroid handling).
+
+fn _slic_update(data_ptr, labels, centers, width, height) {
+    let area = int_mul(width, height)
+    let k = len(centers)
+    let sums_i = list_new()
+    let sums_x = list_new()
+    let sums_y = list_new()
+    let counts = list_new()
+    let i = 0
+    while i < k {
+        push(sums_i, 0)
+        push(sums_x, 0)
+        push(sums_y, 0)
+        push(counts, 0)
+        i = int_add(i, 1)
+    }
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let off = int_add(row_off, x)
+            let c = labels[off]
+            if c >= 0 {
+                if c < k {
+                    list_set(sums_i, c, int_add(sums_i[c], load8(data_ptr + off)))
+                    list_set(sums_x, c, int_add(sums_x[c], x))
+                    list_set(sums_y, c, int_add(sums_y[c], y))
+                    list_set(counts, c, int_add(counts[c], 1))
+                }
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let kk = 0
+    while kk < k {
+        let n = counts[kk]
+        if n > 0 {
+            let new_i = sums_i[kk] / n
+            let new_x = sums_x[kk] / n
+            let new_y = sums_y[kk] / n
+            list_set(centers, kk, _slic_center(new_i, new_x, new_y))
+        }
+        kk = int_add(kk, 1)
+    }
+    return 1
+}
+
+// ---- public: slic_segment -----------------------------------------------
+
+fn slic_segment(data_ptr, width, height, k, m, max_iter) {
+    if width <= 0   { return _slic_fail() }
+    if height <= 0  { return _slic_fail() }
+    if data_ptr == 0 { return _slic_fail() }
+    if width  > SLIC_MAX_DIM { return _slic_fail() }
+    if height > SLIC_MAX_DIM { return _slic_fail() }
+    let area = int_mul(width, height)
+    if area > SLIC_MAX_PIXEL_AREA { return _slic_fail() }
+    if k < SLIC_MIN_K { return _slic_fail() }
+    if k > SLIC_MAX_K { return _slic_fail() }
+    if m < SLIC_MIN_M { m = SLIC_DEFAULT_M }
+    if m > SLIC_MAX_M { m = SLIC_DEFAULT_M }
+    if max_iter <= 0 { return _slic_fail() }
+    if max_iter > SLIC_MAX_ITER { max_iter = SLIC_MAX_ITER }
+
+    // Compute step size S. Auto-clamp K so S >= SLIC_MIN_STEP -- on
+    // very small images we cannot honor an arbitrary K.
+    let step = _slic_isqrt(area / k)
+    if step < SLIC_MIN_STEP {
+        // Recompute K to honor the minimum step.
+        let max_k_for_step = area / int_mul(SLIC_MIN_STEP, SLIC_MIN_STEP)
+        if max_k_for_step < SLIC_MIN_K { return _slic_fail() }
+        k = max_k_for_step
+        if k > SLIC_MAX_K { k = SLIC_MAX_K }
+        step = _slic_isqrt(area / k)
+        if step < SLIC_MIN_STEP { step = SLIC_MIN_STEP }
+    }
+
+    // Initialize per-pixel labels + best_dist.
+    let labels = list_new()
+    let best_dist = list_new()
+    let p = 0
+    while p < area {
+        push(labels, SLIC_LABEL_UNSET)
+        push(best_dist, -1)
+        p = int_add(p, 1)
+    }
+
+    // Place + perturb cluster centers.
+    let centers = _slic_init_centers(data_ptr, width, height, k, step)
+    let k_actual = len(centers)
+    if k_actual <= 0 { return _slic_fail() }
+
+    // Pre-compute the scaling factors.
+    let step_sq = int_mul(step, step)
+    let m_sq    = int_mul(m, m)
+
+    let iters = 0
+    let converged = 0
+    let keep = 1
+    let prev_snapshot = list_new()
+    let pp = 0
+    while pp < area {
+        push(prev_snapshot, SLIC_LABEL_UNSET)
+        pp = int_add(pp, 1)
+    }
+    while keep == 1 {
+        _slic_assign(data_ptr, labels, best_dist, centers, width, height,
+                     step, step_sq, m_sq)
+        iters = int_add(iters, 1)
+        let changes = _slic_count_changes(labels, prev_snapshot)
+        if changes == 0 {
+            converged = 1
+            keep = 0
+        } else {
+            _slic_update(data_ptr, labels, centers, width, height)
+            if iters >= max_iter {
+                keep = 0
+            } else {
+                // Snapshot for next-iter comparison.
+                let s = 0
+                while s < area {
+                    list_set(prev_snapshot, s, labels[s])
+                    s = int_add(s, 1)
+                }
+            }
+        }
+    }
+    return _slic_result(labels, centers, width, height, k_actual,
+                        m, step, iters, converged)
+}
+
+// slic_segment_default -- m + max_iter default convenience.
+fn slic_segment_default(data_ptr, width, height, k) {
+    return slic_segment(data_ptr, width, height, k,
+                        SLIC_DEFAULT_M, SLIC_DEFAULT_MAX_ITER)
+}
+
+// ---- result accessors ---------------------------------------------------
+
+fn slic_center_count(result) {
+    if len(result) <= SLIC_R_K { return 0 }
+    return result[SLIC_R_K]
+}
+
+fn slic_center_at(result, k) {
+    let centers = result[SLIC_R_CENTERS]
+    if k < 0 { return _slic_center(0, 0, 0) }
+    if k >= len(centers) { return _slic_center(0, 0, 0) }
+    return centers[k]
+}
+
+fn slic_iterations(result) {
+    if len(result) <= SLIC_R_ITER { return 0 }
+    return result[SLIC_R_ITER]
+}
+
+fn slic_converged(result) {
+    if len(result) <= SLIC_R_CONVERGED { return 0 }
+    return result[SLIC_R_CONVERGED]
+}
+
+fn slic_width(result) {
+    if len(result) <= SLIC_R_WIDTH { return 0 }
+    return result[SLIC_R_WIDTH]
+}
+
+fn slic_height(result) {
+    if len(result) <= SLIC_R_HEIGHT { return 0 }
+    return result[SLIC_R_HEIGHT]
+}
+
+fn slic_step(result) {
+    if len(result) <= SLIC_R_STEP { return 0 }
+    return result[SLIC_R_STEP]
+}
+
+fn slic_compactness(result) {
+    if len(result) <= SLIC_R_M { return 0 }
+    return result[SLIC_R_M]
+}
+
+// slic_label_at: bounds-checked per-pixel cluster id. Returns
+// SLIC_LABEL_OOB (-1) on any out-of-range coordinate.
+fn slic_label_at(result, x, y) {
+    let w = slic_width(result)
+    let h = slic_height(result)
+    if w <= 0 { return SLIC_LABEL_OOB }
+    if h <= 0 { return SLIC_LABEL_OOB }
+    if x < 0 { return SLIC_LABEL_OOB }
+    if y < 0 { return SLIC_LABEL_OOB }
+    if x >= w { return SLIC_LABEL_OOB }
+    if y >= h { return SLIC_LABEL_OOB }
+    let labels = result[SLIC_R_LABELS]
+    let off = int_add(int_mul(y, w), x)
+    if off < 0 { return SLIC_LABEL_OOB }
+    if off >= len(labels) { return SLIC_LABEL_OOB }
+    return labels[off]
+}
+
+// ---- boundary detection -------------------------------------------------
+//
+// A pixel is a "boundary pixel" iff at least one of its 4-neighbours
+// has a different label. Returns a list of (x, y) pairs; useful for
+// overlay rendering AND for the VP wiring (count of boundary pixels
+// gives a coarse "how complex is the segmentation?" signal).
+
+fn _slic_is_boundary(labels, width, height, x, y) {
+    let off = int_add(int_mul(y, width), x)
+    let me = labels[off]
+    if me < 0 { return 0 }
+    if x > 0 {
+        if labels[int_sub(off, 1)] != me { return 1 }
+    }
+    if x < int_sub(width, 1) {
+        if labels[int_add(off, 1)] != me { return 1 }
+    }
+    if y > 0 {
+        if labels[int_sub(off, width)] != me { return 1 }
+    }
+    if y < int_sub(height, 1) {
+        if labels[int_add(off, width)] != me { return 1 }
+    }
+    return 0
+}
+
+fn slic_boundaries(result) {
+    let pairs = list_new()
+    let w = slic_width(result)
+    let h = slic_height(result)
+    if w <= 0 { return pairs }
+    if h <= 0 { return pairs }
+    let labels = result[SLIC_R_LABELS]
+    let y = 0
+    while y < h {
+        let x = 0
+        while x < w {
+            if _slic_is_boundary(labels, w, h, x, y) == 1 {
+                let pt = list_new()
+                push(pt, x)
+                push(pt, y)
+                push(pairs, pt)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return pairs
+}
+
+// slic_boundary_count -- O(W*H) counter that avoids allocating the
+// pair list. The unit + integration paths both want a count for the
+// VP atom; allocating an x/y pair per boundary pixel is wasteful.
+fn slic_boundary_count(result) {
+    let w = slic_width(result)
+    let h = slic_height(result)
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    let labels = result[SLIC_R_LABELS]
+    let count = 0
+    let y = 0
+    while y < h {
+        let x = 0
+        while x < w {
+            if _slic_is_boundary(labels, w, h, x, y) == 1 {
+                count = int_add(count, 1)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return count
+}
+
+// ---- VP label helpers ---------------------------------------------------
+
+// slic_boundary_count_label: bucket the boundary-pixel count into
+// low/mid/high based on the image area. The thresholds are relative
+// (3 milli, 30 milli) so a 64x64 image and a 256x256 image both fall
+// in the right bucket for the same segmentation density.
+fn slic_boundary_count_label(boundary_count, area) {
+    if area <= 0 { return "image_slic_boundary_count_low" }
+    let milli = int_mul(boundary_count, 1000) / area
+    if milli < 30  { return "image_slic_boundary_count_low" }
+    if milli < 100 { return "image_slic_boundary_count_mid" }
+    return "image_slic_boundary_count_high"
+}
+
+// ---- PGM rendering ------------------------------------------------------
+//
+// Render the segmentation as a boundary-overlay PGM-P5: every pixel
+// gets its ORIGINAL intensity, then every boundary pixel is replaced
+// with white (255). The result visualises the superpixel mesh over
+// the source image -- the standard SLIC validation render.
+
+fn _slic_int_digits(n) {
+    if n <= 0 { return 1 }
+    let d = 0
+    let v = n
+    while v > 0 {
+        d = int_add(d, 1)
+        v = v / 10
+    }
+    return d
+}
+
+fn _slic_header_len(width, height) {
+    // "P5\n<w> <h>\n255\n" -- 9 fixed bytes + digits(w) + digits(h).
+    return int_add(9, int_add(_slic_int_digits(width), _slic_int_digits(height)))
+}
+
+fn slic_render_pgm_size(result) {
+    let w = slic_width(result)
+    let h = slic_height(result)
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    return int_add(_slic_header_len(w, h), int_mul(w, h))
+}
+
+fn _slic_write_int_dec(buf, off, n) {
+    if n <= 0 {
+        store8(buf + off, 48)
+        return int_add(off, 1)
+    }
+    let d = _slic_int_digits(n)
+    let v = n
+    let i = int_sub(d, 1)
+    while i >= 0 {
+        store8(buf + off + i, int_add(48, v - int_mul(v / 10, 10)))
+        v = v / 10
+        i = int_sub(i, 1)
+    }
+    return int_add(off, d)
+}
+
+fn slic_render_pgm(result, data_ptr) {
+    let w = slic_width(result)
+    let h = slic_height(result)
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    let labels = result[SLIC_R_LABELS]
+    let total = slic_render_pgm_size(result)
+    let buf = alloc(total + 1)
+    let off = 0
+    store8(buf + off, 80) off = int_add(off, 1)     // 'P'
+    store8(buf + off, 53) off = int_add(off, 1)     // '5'
+    store8(buf + off, 10) off = int_add(off, 1)
+    off = _slic_write_int_dec(buf, off, w)
+    store8(buf + off, 32) off = int_add(off, 1)
+    off = _slic_write_int_dec(buf, off, h)
+    store8(buf + off, 10) off = int_add(off, 1)
+    store8(buf + off, 50) off = int_add(off, 1)     // '2'
+    store8(buf + off, 53) off = int_add(off, 1)     // '5'
+    store8(buf + off, 53) off = int_add(off, 1)     // '5'
+    store8(buf + off, 10) off = int_add(off, 1)
+    // Pixel payload: original intensity + white overlay on boundaries.
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let pos = int_add(row_off, x)
+            let v = load8(data_ptr + pos)
+            if _slic_is_boundary(labels, w, h, x, y) == 1 {
+                v = SLIC_BOUNDARY_INTENSITY
+            }
+            if v < 0 { v = 0 }
+            if v > 255 { v = 255 }
+            store8(buf + off, v)
+            off = int_add(off, 1)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    store8(buf + total, 0)
+    return buf
+}
+
+let _SLIC_FILE_MODE = 420   // 0644 rw-r--r--
+
+fn slic_render_to_file(result, data_ptr, path) {
+    let total = slic_render_pgm_size(result)
+    if total <= 0 { return 0 }
+    let buf = slic_render_pgm(result, data_ptr)
+    if buf == 0 { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, _SLIC_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, total)
+    if written != total {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// ---- chat admin helper --------------------------------------------------
+//
+// `/slic <pgm> [k]` -- decode PGM, run SLIC, render the boundary-
+// overlay, write to SLIC_OUTPUT_PATH.
+
+let SLIC_OUTPUT_PATH = "/tmp/slic_overlay.pgm"
+let SLIC_CHAT_DEFAULT_K = 64
+
+fn _slic_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn _slic_str_to_int_default(s, default_v) {
+    if len(s) == 0 { return default_v }
+    let v = 0
+    let i = 0
+    let n = len(s)
+    let ok = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 48 {
+            if c <= 57 {
+                v = int_add(int_mul(v, 10), int_sub(c, 48))
+                ok = 1
+                i = int_add(i, 1)
+            } else {
+                return default_v
+            }
+        } else {
+            return default_v
+        }
+    }
+    if ok == 0 { return default_v }
+    return v
+}
+
+fn slic_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/slic needs PATH -- usage: /slic /tmp/test.pgm [k])"
+    }
+    let parts = _slic_split_two(arg)
+    let path = parts[0]
+    let k = _slic_str_to_int_default(parts[1], SLIC_CHAT_DEFAULT_K)
+    if k < SLIC_MIN_K { k = SLIC_MIN_K }
+    if k > SLIC_MAX_K { k = SLIC_MAX_K }
+    let r_p = pgm_parse_file(path)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(slic FAILED on " + path + ": " + err_p + ")"
+    }
+    let w = pgm_result_width(r_p)
+    let h = pgm_result_height(r_p)
+    let data = pgm_result_data(r_p)
+    if w > SLIC_MAX_DIM {
+        return "(slic FAILED: width " + int_to_str(w)
+            + " > " + int_to_str(SLIC_MAX_DIM) + " cap; downsample first)"
+    }
+    if h > SLIC_MAX_DIM {
+        return "(slic FAILED: height " + int_to_str(h)
+            + " > " + int_to_str(SLIC_MAX_DIM) + " cap; downsample first)"
+    }
+    let result = slic_segment_default(data, w, h, k)
+    let detected_k = slic_center_count(result)
+    if detected_k <= 0 {
+        return "(slic FAILED: kmeans rejected input -- check K / dims)"
+    }
+    let iters = slic_iterations(result)
+    let converged = slic_converged(result)
+    let step = slic_step(result)
+    let boundary = slic_boundary_count(result)
+    let wrote = slic_render_to_file(result, data, SLIC_OUTPUT_PATH)
+    let conv_str = "no"
+    if converged == 1 { conv_str = "yes" }
+    let wrote_str = "no"
+    if wrote == 1 { wrote_str = "yes" }
+    return "(slic " + int_to_str(w) + "x" + int_to_str(h)
+        + " k=" + int_to_str(detected_k)
+        + " step=" + int_to_str(step)
+        + " iterations=" + int_to_str(iters)
+        + " converged=" + conv_str
+        + " boundary_px=" + int_to_str(boundary)
+        + " wrote=" + wrote_str + " path=" + SLIC_OUTPUT_PATH + ")"
+}
+
+// ---- visual-perception integration --------------------------------------
+//
+// slic_append_features(feats, data_ptr, width, height)
+//   Runs slic_segment with K=SLIC_VP_DEFAULT_K and appends the
+//   boundary-count bucket atom. Called from visual_perception's
+//   structural-feature path when the image is at least 64x64.
+
+let SLIC_VP_MIN_DIM = 64
+let SLIC_VP_DEFAULT_K = 64
+let SLIC_VP_MAX_ITER = 5
+
+fn slic_append_features(feats, data_ptr, width, height) {
+    if width  < SLIC_VP_MIN_DIM { return 0 }
+    if height < SLIC_VP_MIN_DIM { return 0 }
+    if width  > SLIC_MAX_DIM { return 0 }
+    if height > SLIC_MAX_DIM { return 0 }
+    let r = slic_segment(data_ptr, width, height, SLIC_VP_DEFAULT_K,
+                         SLIC_DEFAULT_M, SLIC_VP_MAX_ITER)
+    let k = slic_center_count(r)
+    if k <= 0 { return 0 }
+    let bcount = slic_boundary_count(r)
+    let area = int_mul(width, height)
+    push(feats, slic_boundary_count_label(bcount, area))
+    return 1
+}
