@@ -1,0 +1,654 @@
+// Unit tests for src/persistence/snapshot_delta.nova (R13F).
+//
+// Verifies the incremental delta-snapshot path:
+//   - delta writer accumulates ops in order
+//   - serialised delta round-trips through the parser
+//   - empty / single-op / multi-op cases produce the expected blob shapes
+//   - applying ADD / MOD / DEL to a live KG reproduces the post-mutation
+//     state
+//   - parent-fingerprint mismatch refuses the apply with a clear failure
+//   - sibling-delta enumeration finds the right files
+//   - snap_delta_compact replays deltas and prunes them
+//   - R8E schema migration sees the post-delta KG correctly (each new atom
+//     gets stamped with SCHEMA_CURRENT_VERSION)
+//   - R6F episodic state survives the delta + compact round-trip
+//
+// ADRs touched: ADR-0048 (persistence container -- the delta is a sibling
+// of the same container).
+
+import "../ce_test.nova"
+import "../../src/persistence/snapshot_disk.nova"
+import "../../src/persistence/snapshot_delta.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Build a tiny KG registry with a single 'reasoning' KG that has the
+// given atoms (each described by [label, kind, alpha, beta]).
+fn _mk_registry(atom_specs) {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "reasoning")
+    let i = 0
+    while i < len(atom_specs) {
+        let s = atom_specs[i]
+        let a = kg_add_atom(kg, s[1], s[0], 0)
+        let b = atom_belief(a)
+        list_set(b, 0, s[2])
+        list_set(b, 1, s[3])
+        i = i + 1
+    }
+    return reg
+}
+
+// Build a minimal full snapshot whose KGS section reflects the KG `kg`.
+// SOUL stub so snap_to_text accepts the frame.
+fn _mk_snap_for_kg(kg, now) {
+    let s = snap_new(1, now)
+    let sb = list_new()
+    push(sb, "Aurora")
+    push(sb, 0)
+    snap_put_section(s, SEC_SOUL, sb)
+    snap_put_section(s, SEC_KGS, kg_section_build(kg))
+    return s
+}
+
+// Path roots for the on-disk tests; each test cleans up its own files.
+fn _test_parent_path(tag) {
+    return "/tmp/ce_test_delta_" + tag + ".snap"
+}
+
+fn _cleanup(parent_path) {
+    sys_unlink(parent_path)
+    // Try to remove up to 200 deltas; safe if they're absent.
+    let i = 0
+    while i < 200 {
+        sys_unlink(delta_path_for(parent_path, i))
+        i = i + 1
+    }
+}
+
+// ---- writer accumulation --------------------------------------------------
+
+fn test_writer_starts_empty() {
+    let w = delta_writer_new("fp:1:100", 1000)
+    ce_eq("fresh writer op_count = 0", delta_writer_op_count(w), 0)
+    ce_str_eq("writer carries parent fingerprint",
+        delta_writer_parent_fingerprint(w), "fp:1:100")
+    ce_eq("writer carries timestamp", delta_writer_timestamp(w), 1000)
+}
+
+fn test_writer_records_add() {
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let a = kg_add_atom(kg, ATOM_FACT, "alpha", 0)
+    let w = delta_writer_new("fp:1:100", 1000)
+    delta_writer_record_add(w, a, "reasoning")
+    ce_eq("after one ADD op_count = 1", delta_writer_op_count(w), 1)
+}
+
+fn test_writer_records_three_ops() {
+    let w = delta_writer_new("fp:1:100", 1000)
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let a = kg_add_atom(kg, ATOM_FACT, "alpha", 0)
+    delta_writer_record_add(w, a, "reasoning")
+    delta_writer_record_mod(w, 0, "reasoning", "alpha", 2500)
+    delta_writer_record_del(w, 1, "reasoning")
+    ce_eq("after ADD+MOD+DEL op_count = 3", delta_writer_op_count(w), 3)
+}
+
+// ---- text round-trip ------------------------------------------------------
+
+fn test_empty_round_trip() {
+    let w = delta_writer_new("fp:abc", 1234)
+    let text = delta_writer_to_text(w)
+    ce_check("empty delta text non-empty", len(text) > 0)
+    let r = delta_parse(text)
+    ce_check("empty delta parses", r != 0)
+    ce_str_eq("parsed parent_fp matches",
+        delta_reader_parent_fingerprint(r), "fp:abc")
+    ce_eq("parsed timestamp matches", delta_reader_timestamp(r), 1234)
+    ce_eq("parsed op_count = 0", delta_reader_op_count(r), 0)
+}
+
+fn test_add_round_trip() {
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let a = kg_add_atom(kg, ATOM_CONCEPT, "widget", 0)
+    let b = atom_belief(a)
+    list_set(b, 0, 1500)
+    list_set(b, 1, 500)
+    let w = delta_writer_new("fp:1:100", 2000)
+    delta_writer_record_add(w, a, "reasoning")
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    ce_check("round-tripped reader non-zero", r != 0)
+    ce_eq("op_count after add round-trip = 1", delta_reader_op_count(r), 1)
+    let op = delta_reader_op(r, 0)
+    ce_eq("op tag = ADD", op[0], DELTA_OP_ADD)
+    ce_eq("op id matches", op[1], atom_id(a))
+    ce_str_eq("op kg matches", op[2], "reasoning")
+    ce_eq("op kind matches", op[3], ATOM_CONCEPT)
+    ce_str_eq("op label matches", op[4], "widget")
+    ce_eq("op alpha matches", op[5], 1500)
+    ce_eq("op beta matches", op[6], 500)
+}
+
+fn test_mod_round_trip() {
+    let w = delta_writer_new("fp:x:y:z", 3000)
+    delta_writer_record_mod(w, 7, "reasoning", "alpha", 2500)
+    delta_writer_record_mod(w, 7, "reasoning", "beta", 1500)
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    ce_eq("two MOD ops parsed", delta_reader_op_count(r), 2)
+    let op0 = delta_reader_op(r, 0)
+    ce_eq("MOD[0] tag", op0[0], DELTA_OP_MOD)
+    ce_eq("MOD[0] id", op0[1], 7)
+    ce_str_eq("MOD[0] field", op0[3], "alpha")
+    ce_eq("MOD[0] value (int-parsed)", op0[4], 2500)
+    let op1 = delta_reader_op(r, 1)
+    ce_str_eq("MOD[1] field", op1[3], "beta")
+    ce_eq("MOD[1] value", op1[4], 1500)
+}
+
+fn test_del_round_trip() {
+    let w = delta_writer_new("fp:1:100", 4000)
+    delta_writer_record_del(w, 42, "reasoning")
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    ce_eq("DEL parsed", delta_reader_op_count(r), 1)
+    let op = delta_reader_op(r, 0)
+    ce_eq("DEL tag", op[0], DELTA_OP_DEL)
+    ce_eq("DEL id", op[1], 42)
+    ce_str_eq("DEL kg", op[2], "reasoning")
+}
+
+fn test_parse_rejects_missing_trailer() {
+    // A delta blob missing the `end_delta` trailer must be rejected
+    // (partial-write detection).
+    let bad = "crossengin-delta v1\ntimestamp 100\nparent_snapshot fp\noperations 0\n"
+    let r = delta_parse(bad)
+    ce_check("missing trailer rejected", r == 0)
+}
+
+fn test_parse_rejects_bad_header() {
+    let bad = "not-a-delta-header\nend_delta\n"
+    let r = delta_parse(bad)
+    ce_check("bad header rejected", r == 0)
+}
+
+// ---- apply to KG ----------------------------------------------------------
+
+fn test_apply_add_creates_new_atom() {
+    let reg = _mk_registry(list_new())
+    let w = delta_writer_new("", 100)
+    // Synthesise an ADD op for a brand-new atom.
+    let dummy_reg = _mk_registry(list_new())
+    let dummy_kg = kg_find(dummy_reg, "reasoning")
+    let a = kg_add_atom(dummy_kg, ATOM_FACT, "widget", 0)
+    let b = atom_belief(a)
+    list_set(b, 0, 1500)
+    list_set(b, 1, 500)
+    delta_writer_record_add(w, a, "reasoning")
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    // Apply onto the empty target registry.
+    let res = delta_reader_apply(r, reg, "")
+    ce_check("apply result non-zero", res != 0)
+    ce_eq("one ADD applied", res[0], 1)
+    let target = kg_find(reg, "reasoning")
+    let installed = kg_find_atom(target, "widget")
+    ce_check("widget atom created", installed != 0)
+    ce_eq("widget alpha matches", atom_belief(installed)[0], 1500)
+    ce_eq("widget beta matches", atom_belief(installed)[1], 500)
+}
+
+fn test_apply_mod_updates_belief() {
+    let specs = list_new()
+    let s0 = list_new() push(s0, "alpha") push(s0, ATOM_FACT) push(s0, 1000) push(s0, 1000) push(specs, s0)
+    let reg = _mk_registry(specs)
+    let kg = kg_find(reg, "reasoning")
+    let a = kg_atom(kg, 0)
+    let w = delta_writer_new("", 200)
+    delta_writer_record_mod(w, 0, "reasoning", "alpha", 2500)
+    delta_writer_record_mod(w, 0, "reasoning", "beta", 750)
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    let res = delta_reader_apply(r, reg, "")
+    ce_eq("two MOD ops applied", res[0], 2)
+    ce_eq("alpha after MOD", atom_belief(a)[0], 2500)
+    ce_eq("beta after MOD", atom_belief(a)[1], 750)
+}
+
+fn test_apply_del_removes_atom() {
+    let specs = list_new()
+    let s0 = list_new() push(s0, "alpha") push(s0, ATOM_FACT) push(s0, 1000) push(s0, 1000) push(specs, s0)
+    let reg = _mk_registry(specs)
+    let kg = kg_find(reg, "reasoning")
+    let w = delta_writer_new("", 300)
+    delta_writer_record_del(w, 0, "reasoning")
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    let res = delta_reader_apply(r, reg, "")
+    ce_eq("DEL applied", res[0], 1)
+    // After kg_remove_atom, kg_find_atom returns 0 (label is removed from index).
+    ce_check("alpha no longer findable by label",
+        kg_find_atom(kg, "alpha") == 0)
+}
+
+fn test_apply_skips_unknown_kg() {
+    let reg = _mk_registry(list_new())   // only has "reasoning"
+    let w = delta_writer_new("", 400)
+    let dummy_reg = _mk_registry(list_new())
+    let dummy_kg = kg_find(dummy_reg, "reasoning")
+    let a = kg_add_atom(dummy_kg, ATOM_FACT, "ghost", 0)
+    // Record an ADD against an unknown KG label.
+    let op = list_new()
+    push(op, DELTA_OP_ADD)
+    push(op, atom_id(a))
+    push(op, "nonexistent_kg")
+    push(op, ATOM_FACT)
+    push(op, "ghost")
+    push(op, 1000)
+    push(op, 1000)
+    push(delta_writer_ops(w), op)
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    let res = delta_reader_apply(r, reg, "")
+    ce_eq("unknown-KG ADD skipped (applied = 0)", res[0], 0)
+    ce_eq("unknown-KG ADD counted as skipped", res[1], 1)
+}
+
+// ---- parent-fingerprint mismatch -----------------------------------------
+
+fn test_apply_rejects_fp_mismatch() {
+    let reg = _mk_registry(list_new())
+    let w = delta_writer_new("fp:original", 500)
+    // Add a benign op so parse doesn't shortcut.
+    delta_writer_record_mod(w, 0, "reasoning", "alpha", 1234)
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    let res = delta_reader_apply(r, reg, "fp:DIFFERENT")
+    ce_check("mismatched fingerprint returns 0", res == 0)
+}
+
+fn test_apply_accepts_matching_fp() {
+    let reg = _mk_registry(list_new())
+    let w = delta_writer_new("fp:matching", 600)
+    delta_writer_record_add(w,
+        _mk_dummy_atom("widget", ATOM_FACT, 1500, 500),
+        "reasoning")
+    let text = delta_writer_to_text(w)
+    let r = delta_parse(text)
+    let res = delta_reader_apply(r, reg, "fp:matching")
+    ce_check("matching fingerprint accepts apply", res != 0)
+    ce_eq("one op applied", res[0], 1)
+}
+
+fn _mk_dummy_atom(label, kind, alpha, beta) {
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let a = kg_add_atom(kg, kind, label, 0)
+    let b = atom_belief(a)
+    list_set(b, 0, alpha)
+    list_set(b, 1, beta)
+    return a
+}
+
+// ---- multi-delta sequencing ----------------------------------------------
+
+fn test_multiple_deltas_apply_in_order() {
+    let reg = _mk_registry(list_new())
+    // Delta 1: ADD "alpha"
+    let w1 = delta_writer_new("", 100)
+    let a1 = _mk_dummy_atom("alpha", ATOM_FACT, 1000, 1000)
+    delta_writer_record_add(w1, a1, "reasoning")
+    let r1 = delta_parse(delta_writer_to_text(w1))
+    delta_reader_apply(r1, reg, "")
+    // Delta 2: MOD "alpha"'s alpha field to 2500
+    // (after ADD, atom_id is 0 in the target reg)
+    let w2 = delta_writer_new("", 200)
+    delta_writer_record_mod(w2, 0, "reasoning", "alpha", 2500)
+    let r2 = delta_parse(delta_writer_to_text(w2))
+    delta_reader_apply(r2, reg, "")
+    // Delta 3: ADD "beta"
+    let w3 = delta_writer_new("", 300)
+    let a3 = _mk_dummy_atom("beta", ATOM_FACT, 800, 200)
+    delta_writer_record_add(w3, a3, "reasoning")
+    let r3 = delta_parse(delta_writer_to_text(w3))
+    delta_reader_apply(r3, reg, "")
+    // Inspect the post-state.
+    let kg = kg_find(reg, "reasoning")
+    ce_eq("two atoms in KG after 3 deltas", kg_atom_count(kg), 2)
+    let alpha = kg_find_atom(kg, "alpha")
+    ce_eq("alpha's alpha-belief after MOD", atom_belief(alpha)[0], 2500)
+    let beta = kg_find_atom(kg, "beta")
+    ce_check("beta atom installed", beta != 0)
+    ce_eq("beta's alpha-belief from ADD", atom_belief(beta)[0], 800)
+}
+
+// ---- file enumeration / path layout --------------------------------------
+
+fn test_delta_path_layout() {
+    ce_str_eq("delta_path_for 0", delta_path_for("/tmp/foo.snap", 0),
+        "/tmp/foo.snap.delta.000")
+    ce_str_eq("delta_path_for 1", delta_path_for("/tmp/foo.snap", 1),
+        "/tmp/foo.snap.delta.001")
+    ce_str_eq("delta_path_for 99", delta_path_for("/tmp/foo.snap", 99),
+        "/tmp/foo.snap.delta.099")
+    ce_str_eq("delta_path_for 123", delta_path_for("/tmp/foo.snap", 123),
+        "/tmp/foo.snap.delta.123")
+}
+
+fn test_enumeration_finds_contiguous_range() {
+    let path = _test_parent_path("enum")
+    _cleanup(path)
+    // Write three deltas.
+    let i = 0
+    while i < 3 {
+        let w = delta_writer_new("fp:x", 100 + i)
+        delta_writer_record_mod(w, 0, "reasoning", "alpha", 1000 + i)
+        delta_writer_flush(w, delta_path_for(path, i))
+        i = i + 1
+    }
+    let paths = delta_paths_for_parent(path)
+    ce_eq("found 3 sibling deltas", len(paths), 3)
+    ce_eq("next index = 3", delta_next_index_for_parent(path), 3)
+    _cleanup(path)
+}
+
+fn test_enumeration_stops_at_gap() {
+    let path = _test_parent_path("gap")
+    _cleanup(path)
+    // Write deltas 0, 1, 3 (skip 2). Enumeration stops at 2.
+    let w0 = delta_writer_new("fp:x", 100)
+    delta_writer_record_mod(w0, 0, "reasoning", "alpha", 1000)
+    delta_writer_flush(w0, delta_path_for(path, 0))
+    let w1 = delta_writer_new("fp:x", 200)
+    delta_writer_record_mod(w1, 0, "reasoning", "alpha", 1001)
+    delta_writer_flush(w1, delta_path_for(path, 1))
+    let w3 = delta_writer_new("fp:x", 400)
+    delta_writer_record_mod(w3, 0, "reasoning", "alpha", 1003)
+    delta_writer_flush(w3, delta_path_for(path, 3))
+    let paths = delta_paths_for_parent(path)
+    ce_eq("enumeration stops at gap (= 2 paths)", len(paths), 2)
+    _cleanup(path)
+}
+
+// ---- full disk round-trip: write parent + delta, reload --------------------
+
+fn test_disk_round_trip_parent_only() {
+    let path = _test_parent_path("parent_only")
+    _cleanup(path)
+    let specs = list_new()
+    let s0 = list_new() push(s0, "alpha") push(s0, ATOM_FACT) push(s0, 2000) push(s0, 500) push(specs, s0)
+    let reg = _mk_registry(specs)
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    let saved = snap_save(snap, path)
+    ce_eq("parent snapshot saved", saved, 1)
+    // Reload and verify.
+    let reg2 = kg_registry_new()
+    kg_spawn(reg2, "reasoning")
+    let stats = list_new()
+    push(stats, 0)
+    push(stats, 0)
+    push(stats, 0)
+    let loaded = snap_load_with_deltas(path, reg2, stats)
+    ce_check("snap_load_with_deltas returns snapshot",
+        loaded != 0)
+    ce_eq("zero deltas applied when none on disk", stats[0], 0)
+    // Apply the KGS blob to populate the reloaded reg.
+    let blob = snap_section(loaded, SEC_KGS)
+    kg_section_apply(reg2, blob, 0)
+    let kg2 = kg_find(reg2, "reasoning")
+    let a = kg_find_atom(kg2, "alpha")
+    ce_check("alpha rehydrated", a != 0)
+    ce_eq("alpha alpha = 2000", atom_belief(a)[0], 2000)
+    _cleanup(path)
+}
+
+fn test_disk_round_trip_one_delta() {
+    let path = _test_parent_path("one_delta")
+    _cleanup(path)
+    // Parent: empty KG.
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    snap_save(snap, path)
+    // Write one delta that adds a "widget" atom.
+    let w = snap_make_delta_writer(snap, 2000)
+    let dummy = _mk_dummy_atom("widget", ATOM_FACT, 1500, 500)
+    delta_writer_record_add(w, dummy, "reasoning")
+    let idx = snap_delta_save(path, w)
+    ce_eq("delta index after first save = 0", idx, 0)
+    // Reload into a fresh registry.
+    let reg2 = kg_registry_new()
+    kg_spawn(reg2, "reasoning")
+    let stats = list_new()
+    push(stats, 0)
+    push(stats, 0)
+    push(stats, 0)
+    let loaded = snap_load_with_deltas(path, reg2, stats)
+    let blob = snap_section(loaded, SEC_KGS)
+    kg_section_apply(reg2, blob, 0)
+    // Re-apply the deltas explicitly now that the KG is populated, since
+    // snap_load_with_deltas does the delta apply BEFORE kg_section_apply
+    // in this test's order. (In the chat's load path, the order is the
+    // same -- parent KGS first, then deltas -- so we just replicate that.)
+    delta_apply_all_for_parent(path,
+        reg2,
+        snap_parent_fingerprint(loaded, len(snap_to_text(loaded))))
+    let kg2 = kg_find(reg2, "reasoning")
+    let widget = kg_find_atom(kg2, "widget")
+    ce_check("widget rehydrated through delta", widget != 0)
+    ce_eq("widget alpha through delta", atom_belief(widget)[0], 1500)
+    _cleanup(path)
+}
+
+fn test_disk_round_trip_three_deltas() {
+    let path = _test_parent_path("three_deltas")
+    _cleanup(path)
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    snap_save(snap, path)
+    let fp = snap_parent_fingerprint(snap, len(snap_to_text(snap)))
+    // Three deltas: add 'a', add 'b', add 'c'.
+    let labels = list_new()
+    push(labels, "a") push(labels, "b") push(labels, "c")
+    let i = 0
+    while i < len(labels) {
+        let w = delta_writer_new(fp, 2000 + i)
+        let dummy = _mk_dummy_atom(labels[i], ATOM_FACT, 1000 + i * 100, 500)
+        delta_writer_record_add(w, dummy, "reasoning")
+        snap_delta_save(path, w)
+        i = i + 1
+    }
+    ce_eq("three deltas on disk", snap_delta_count_for(path), 3)
+    // Reload into fresh registry, apply parent KGS blob, then deltas.
+    let reg2 = kg_registry_new()
+    kg_spawn(reg2, "reasoning")
+    let loaded = snap_load(path)
+    kg_section_apply(reg2, snap_section(loaded, SEC_KGS), 0)
+    let res = delta_apply_all_for_parent(path, reg2,
+        snap_parent_fingerprint(loaded, len(snap_to_text(loaded))))
+    ce_eq("three deltas applied", res[0], 3)
+    let kg2 = kg_find(reg2, "reasoning")
+    ce_eq("three atoms after delta-replay", kg_atom_count(kg2), 3)
+    ce_check("atom 'b' present", kg_find_atom(kg2, "b") != 0)
+    _cleanup(path)
+}
+
+// ---- compaction ----------------------------------------------------------
+
+fn test_compaction_below_threshold_is_noop() {
+    let path = _test_parent_path("compact_noop")
+    _cleanup(path)
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    snap_save(snap, path)
+    // No deltas; compaction should be a no-op.
+    let removed = snap_delta_compact(path, snap, 10)
+    ce_eq("compact returns 0 with no deltas", removed, 0)
+    _cleanup(path)
+}
+
+fn test_compaction_collapses_deltas() {
+    let path = _test_parent_path("compact_basic")
+    _cleanup(path)
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    snap_save(snap, path)
+    let fp = snap_parent_fingerprint(snap, len(snap_to_text(snap)))
+    // Write 10 deltas that each ADD a unique atom.
+    let i = 0
+    while i < 10 {
+        let w = delta_writer_new(fp, 2000 + i)
+        let dummy = _mk_dummy_atom("atom_" + int_to_str(i),
+            ATOM_FACT, 1000, 1000)
+        delta_writer_record_add(w, dummy, "reasoning")
+        snap_delta_save(path, w)
+        i = i + 1
+    }
+    ce_eq("10 deltas pending pre-compact", snap_delta_count_for(path), 10)
+    // Replay onto live reg, then compact.
+    let res = delta_apply_all_for_parent(path, reg, fp)
+    ce_eq("10 deltas applied to live reg", res[0], 10)
+    let new_snap = _mk_snap_for_kg(kg, 3000)
+    let removed = snap_delta_compact(path, new_snap, 1)
+    ce_eq("compact returned 10", removed, 10)
+    ce_eq("0 deltas after compact", snap_delta_count_for(path), 0)
+    // Reload and confirm the 10 atoms are in the new parent.
+    let reg2 = kg_registry_new()
+    kg_spawn(reg2, "reasoning")
+    let loaded = snap_load(path)
+    kg_section_apply(reg2, snap_section(loaded, SEC_KGS), 0)
+    let kg2 = kg_find(reg2, "reasoning")
+    ce_eq("10 atoms in compacted parent", kg_atom_count(kg2), 10)
+    _cleanup(path)
+}
+
+// ---- R8E schema migration interop ----------------------------------------
+
+fn test_schema_migration_runs_after_delta_apply() {
+    // A parent at schema v1 (no atoms_version), one delta with an ADD.
+    // After load + delta + post_load_migrate, the new atom must be
+    // stamped at SCHEMA_CURRENT_VERSION.
+    let path = _test_parent_path("schema_mig")
+    _cleanup(path)
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    // Strip the atoms_version slot so the parent looks pre-R8E.
+    snap_meta_set_atoms_version(snap, SCHEMA_LEGACY_VERSION)
+    snap_save(snap, path)
+    let fp = snap_parent_fingerprint(snap, len(snap_to_text(snap)))
+    // Delta with an ADD.
+    let w = delta_writer_new(fp, 2000)
+    let dummy = _mk_dummy_atom("widget", ATOM_CONCEPT, 1500, 500)
+    delta_writer_record_add(w, dummy, "reasoning")
+    snap_delta_save(path, w)
+    // Reload + apply parent KGS + apply deltas + post-load migrate.
+    let reg2 = kg_registry_new()
+    kg_spawn(reg2, "reasoning")
+    let loaded = snap_load(path)
+    kg_section_apply(reg2, snap_section(loaded, SEC_KGS), 0)
+    delta_apply_all_for_parent(path, reg2,
+        snap_parent_fingerprint(loaded, len(snap_to_text(loaded))))
+    let touched = snap_post_load_migrate(loaded, reg2)
+    ce_check("migration sweep touched non-zero atoms", touched >= 1)
+    let kg2 = kg_find(reg2, "reasoning")
+    let widget = kg_find_atom(kg2, "widget")
+    ce_check("widget rehydrated after delta", widget != 0)
+    ce_eq("widget schema version = CURRENT after migrate",
+        atom_schema_version(widget), SCHEMA_CURRENT_VERSION)
+    _cleanup(path)
+}
+
+// ---- R6F episodic preservation -------------------------------------------
+
+fn test_episodic_survives_delta_round_trip() {
+    // Build a parent with an episodic blob, write a delta that adds an
+    // atom, reload, verify the episodic blob is still intact.
+    let path = _test_parent_path("episodic")
+    _cleanup(path)
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 1000)
+    // Populate an episodic blob with one moment.
+    let ep_blob = list_new()
+    let moments = list_new()
+    let mom = list_new()
+    push(mom, 500)              // ts
+    push(mom, 1)                // lifecycle
+    push(mom, 750)              // valence
+    push(mom, list_new())       // atoms (empty)
+    push(moments, mom)
+    push(ep_blob, moments)
+    push(ep_blob, list_new())   // episodes (empty)
+    snap_put_section(snap, SEC_EPISODIC, ep_blob)
+    snap_save(snap, path)
+    // Write one delta.
+    let fp = snap_parent_fingerprint(snap, len(snap_to_text(snap)))
+    let w = delta_writer_new(fp, 2000)
+    let dummy = _mk_dummy_atom("post_delta_atom", ATOM_FACT, 1500, 500)
+    delta_writer_record_add(w, dummy, "reasoning")
+    snap_delta_save(path, w)
+    // Reload and inspect the episodic section.
+    let loaded = snap_load(path)
+    ce_check("episodic section present after reload",
+        snap_has_section(loaded, SEC_EPISODIC) == 1)
+    let reloaded_ep = snap_section(loaded, SEC_EPISODIC)
+    ce_eq("one moment preserved through delta path", len(reloaded_ep[0]), 1)
+    ce_eq("moment timestamp preserved", reloaded_ep[0][0][0], 500)
+    _cleanup(path)
+}
+
+// ---- snap_make_delta_writer ----------------------------------------------
+
+fn test_make_delta_writer_stamps_fingerprint() {
+    let reg = _mk_registry(list_new())
+    let kg = kg_find(reg, "reasoning")
+    let snap = _mk_snap_for_kg(kg, 9999)
+    let w = snap_make_delta_writer(snap, 10000)
+    let fp = delta_writer_parent_fingerprint(w)
+    ce_check("fingerprint non-empty", len(fp) > 0)
+    let expected = snap_parent_fingerprint(snap, len(snap_to_text(snap)))
+    ce_str_eq("fingerprint matches snap_parent_fingerprint", fp, expected)
+}
+
+// ---- driver -------------------------------------------------------------
+
+fn main() {
+    test_writer_starts_empty()
+    test_writer_records_add()
+    test_writer_records_three_ops()
+    test_empty_round_trip()
+    test_add_round_trip()
+    test_mod_round_trip()
+    test_del_round_trip()
+    test_parse_rejects_missing_trailer()
+    test_parse_rejects_bad_header()
+    test_apply_add_creates_new_atom()
+    test_apply_mod_updates_belief()
+    test_apply_del_removes_atom()
+    test_apply_skips_unknown_kg()
+    test_apply_rejects_fp_mismatch()
+    test_apply_accepts_matching_fp()
+    test_multiple_deltas_apply_in_order()
+    test_delta_path_layout()
+    test_enumeration_finds_contiguous_range()
+    test_enumeration_stops_at_gap()
+    test_disk_round_trip_parent_only()
+    test_disk_round_trip_one_delta()
+    test_disk_round_trip_three_deltas()
+    test_compaction_below_threshold_is_noop()
+    test_compaction_collapses_deltas()
+    test_schema_migration_runs_after_delta_apply()
+    test_episodic_survives_delta_round_trip()
+    test_make_delta_writer_stamps_fingerprint()
+    ce_summary("snapshot_delta")
+}
+main()

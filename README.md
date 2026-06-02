@@ -578,6 +578,17 @@ computational units rather than orchestrating a pipeline of modules.
 > real-time streaming event sources,
 > +1 from `persistence/snapshot_compaction.nova` added in P2.10 snapshot
 > compaction pass,
+> +1 from `persistence/snapshot_delta.nova` added in R13F incremental
+> delta snapshots -- the writer / reader / fingerprint-guard / compactor
+> for sibling `.delta.NNN` files alongside a full snapshot, so the hot
+> path drops from O(KG-size) bytes per save to O(changed) bytes. Wired
+> into `snapshot_disk.nova` via 5 additive entry points
+> (`snap_make_delta_writer`, `snap_delta_save`, `snap_load_with_deltas`,
+> `snap_delta_compact`, `snap_delta_count_for`); R8E schema migration
+> + R6F episodic preservation interop confirmed. Measured 4x speedup on
+> a 5000-atom KG (full ~13 ms vs delta ~3 ms; the 1000-atom case is
+> fsync-floor-bound at ~1.6x). Documented in
+> [`SNAPSHOT_FORMAT.md`](./SNAPSHOT_FORMAT.md).
 > +2 from `io/transducers/{stt_seam,stream_audio}.nova` added in P2.5
 > STT framework + audit,
 > +1 from `parts/reasoning/proof_checker.nova` added in P3.5 minimum

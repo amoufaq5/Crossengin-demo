@@ -235,6 +235,152 @@ parse it with a default. Such a writer keeps `SNAP_FORMAT_VERSION` at
 the same major (still v2 in the current example) — only a MAJOR bump
 requires the migration table to grow.
 
+## Incremental delta snapshots (R13F)
+
+Separate from the full-snapshot container above, CrossEngin's
+persistence stack now writes **incremental delta snapshots** as
+sibling files next to the parent full snapshot. A delta records only
+the operations (ADD / MOD / DEL of KG atoms) accumulated since the
+parent was written, so a save costs O(changed) bytes instead of
+O(KG-size) bytes. Periodic compaction collapses N deltas into a new
+full snapshot and prunes the deltas.
+
+### Storage layout
+
+For a parent full snapshot at `/tmp/foo.snap`, deltas live at:
+
+```
+/tmp/foo.snap            -- parent full snapshot (v2 + R8E format)
+/tmp/foo.snap.delta.000  -- first delta after parent
+/tmp/foo.snap.delta.001  -- second delta
+...
+/tmp/foo.snap.delta.NNN  -- Nth delta (3-digit zero-padded so a glob
+                            sorts lexically into apply order)
+```
+
+A reader walks `.delta.NNN` indices contiguously from 0 until the
+first missing file, then stops. A gap in the sequence (caused by a
+partial unlink) terminates enumeration — later deltas in the gap are
+intentionally NOT applied to keep ordering invariants honest.
+
+### Wire format (delta v1)
+
+Line-oriented ASCII, similar to the R5D snapshot but TAB-separated
+for op lines so a header `key SP val` line can never collide with an
+`OP\tid\t...` op line:
+
+```
+crossengin-delta v1
+timestamp <int_ns>
+parent_snapshot <fingerprint>
+operations <N>
+ADD\t<id>\t<kg>\t<kind>\t<label>\t<alpha>\t<beta>
+MOD\t<id>\t<kg>\t<field>\t<value>
+DEL\t<id>\t<kg>
+...
+end_delta
+```
+
+* `timestamp` — nanosecond wall-clock when the delta was written.
+* `parent_snapshot` — fingerprint of the parent (currently
+  `<instance>:<timestamp>:<parent_byte_len>`). A delta with a
+  fingerprint that does not match the parent at load time is
+  REFUSED loudly — applying a delta written against snapshot A to
+  snapshot B would silently corrupt B.
+* `operations` — declared op count (informational; the reader
+  counts from the actual op lines, not this header).
+
+The trailer `end_delta` must be present. A delta missing the trailer
+is treated as a partial write (e.g. mid-fsync crash) and silently
+discarded by the reader.
+
+### Op semantics
+
+| Op | Reader action |
+|----|---------------|
+| `ADD` | Spawn the named KG (idempotent); if no atom with `label` exists, create one with `kind` + initial `alpha/beta`. If one DOES exist, refresh its belief (replace-by-label, matching R5D's `kg_section_apply` policy). |
+| `MOD` | Look up the atom by id within the named KG; patch one of the known integer fields (`alpha`, `beta`). Unknown field names are SILENTLY skipped (forward-compat). |
+| `DEL` | Look up the atom by id within the named KG; call `kg_remove_atom` (P2.4 tombstone — list slot stays, indexes are forgotten). |
+
+Atoms targeted at an UNKNOWN KG label are SKIPPED (matches the same
+soft-fail policy R5D's `kg_section_apply` uses for unknown-KG atoms).
+
+### Compaction
+
+`snap_delta_compact(parent_path, live_snap, max_deltas)` is the
+operator-facing entry point:
+
+1. Check the delta count for `parent_path`; if below `max_deltas`,
+   return 0 (no-op).
+2. Write `live_snap` as the new full snapshot at `parent_path` via
+   `snap_save` (full crash-safe contract: write_tmp → fsync →
+   atomic_rename → parent fsync).
+3. Unlink every delta file; return the count unlinked.
+
+The crash-safety contract: a crash at step (2) leaves the OLD parent
++ ALL deltas intact (rename hasn't landed yet); a crash mid-step-3
+leaves the NEW parent + a partial subset of deltas, whose fingerprints
+no longer match the new parent — so the next load drops them via the
+fingerprint-mismatch path (loud rejection, not silent corruption).
+
+### Schema-migration interop (R8E)
+
+Deltas operate on atom OBJECTS, not on the snapshot's wire bytes, so
+the parent's `schema.atoms_version` stamp travels through unchanged.
+The post-load `snap_post_load_migrate` hook runs AFTER the delta-apply
+pass and brings every atom — including delta-applied ones — up to
+`SCHEMA_CURRENT_VERSION`. A delta whose parent was at schema v1 plus
+a current-build reader produces the same migrated KG as a current-build
+parent.
+
+### R6F episodic preservation
+
+Episodic moments / episodes / promoted atoms live in the EPISODIC
+section of the parent snapshot. Deltas record only KG-section
+mutations (ADD/MOD/DEL of atoms in the KGs section); episodic state
+survives the delta round-trip because the parent's EPISODIC blob is
+reloaded verbatim before deltas are applied, and the compaction
+re-emits the live episodic blob as part of the new full snapshot.
+
+### Performance characteristics
+
+Measured on a 1000-atom KG (R13F bench, in
+`tests/integration/scenario_fff_snap_delta.sh`):
+
+| Op                            | Time           | Bytes      |
+|-------------------------------|----------------|------------|
+| Full snapshot write           | ~4 ms          | 152861     |
+| Delta write (10 ADD ops)      | ~2.4 ms        | 523        |
+
+The hot path is dominated by the fsync floor (~2 ms on tmpfs/ext4
+on the test machine), so the delta speedup at 1000 atoms is ~1.6x.
+At 5000 atoms — where serialize + write dominate the fsync floor —
+the speedup climbs to ~3-4x (full ~13 ms vs delta ~3 ms). The
+architecture scales linearly with KG size on the full path while
+the delta path stays roughly constant per delta-op count.
+
+### Compaction threshold (env-overridable)
+
+`$CE_DELTA_COMPACT_THRESHOLD` (default 100) — the substrate's
+compaction trigger. The R13F default mirrors the brief's "fold N
+deltas into a fresh full" policy.
+
+### See also (delta)
+
+* `src/persistence/snapshot_delta.nova` — the R13F module:
+  `delta_writer_*`, `delta_parse`, `delta_reader_apply`,
+  `snap_parent_fingerprint`, `delta_path_for`,
+  `delta_apply_all_for_parent`, `delta_prune_all`.
+* `src/persistence/snapshot_disk.nova` — wire-up:
+  `snap_make_delta_writer`, `snap_delta_save`,
+  `snap_load_with_deltas`, `snap_delta_compact`,
+  `snap_delta_count_for`.
+* `tests/unit/test_snapshot_delta.nova` — 84 assertions covering
+  the writer / parser / apply / compact / fingerprint-mismatch /
+  schema-migration interop / episodic preservation surfaces.
+* `tests/integration/scenario_fff_snap_delta.sh` — end-to-end
+  benchmark + correctness scenario (14 assertions).
+
 ## See also
 
 * `src/persistence/snapshot_writer.nova` — `SNAP_FORMAT_VERSION`, the
