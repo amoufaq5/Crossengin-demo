@@ -439,6 +439,38 @@ re-seeding, no connectivity constraint (a single cluster may span
 disconnected regions of equal intensity). SLIC superpixels + graph-cut
 remain future follow-ups for true region-segmentation.
 
+### R12B — SLIC superpixel boundary-adherent segmentation (DONE)
+
+`src/io/transducers/image_superpixels.nova` (R12B) implements Achanta
+2012 SLIC: a localised k-means where each cluster only competes for
+pixels in a `2S x 2S` window around its center (S = isqrt(W*H/K) is
+the grid step). The combined distance metric weighs intensity vs.
+spatial via compactness `m` (default 10); the integer form scales by
+S^2 to avoid floats AND sqrt: `D^2_scaled = d_int^2 * S^2 + d_spat^2
+* m^2`. Centers are gradient-perturbed in their 3x3 neighbourhood
+(L1 finite-difference proxy) to avoid initialising on top of edges.
+The convergence loop snapshots labels and stops on zero changes
+(default <= 10 iters, capped at 20). Boundary pixels are detected by
+4-neighbour label difference and rendered white over the original
+intensity (the standard SLIC validation overlay). Public API:
+`slic_segment` (full knobs), `slic_segment_default` (m=10, max_iter
+=10), `slic_label_at`, `slic_center_at`, `slic_boundaries`,
+`slic_boundary_count`, `slic_render_pgm`, `slic_render_to_file`.
+Per-image atom: `image_slic_boundary_count_<low|mid|high>` (bucketed
+by boundary pixels / image area in milli; <30 low, 30..100 mid,
+>100 high). Caps: dims <= 256, K in [16, 1024] (auto-clamped to
+keep `S >= 4`), m in [1, 40], max_iter <= 20. Chat: `/slic PATH
+[K]` (default K=64) writes the boundary-overlay PGM to
+`/tmp/slic_overlay.pgm`. Coexists with R11E (sibling, not
+replacement): k-means asks "where are the regions?" (coarse);
+SLIC asks "what are the boundary-adherent superpixels?" (fine).
+Limitations: grayscale only (Lab/RGB deferred); no connectivity
+post-pass (a noisy image could leave isolated single-pixel orphans
+-- on the capped fixtures clusters stay connected naturally); the
+fallback nearest-center snap for pixels outside every 2S window is
+worst-case O(N*K) but only fires on image corners when K is sized
+correctly.
+
 ## Mapping features to atoms
 
 Each detected feature becomes an atom of the form
