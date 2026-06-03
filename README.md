@@ -39,7 +39,7 @@ computational units rather than orchestrating a pipeline of modules.
 > peer-table convergence within 8s, observes DEAD-marking within 2s
 > of killing a soul, confirms KG-delta propagation A → B / C). All
 > prior federation suites (R6C/R7C scenario_gg_noise_kg) remain
-> green. Module count: 170. R18C adds `src/io/transducers/audio_wakeword.nova` — a
+> green. Module count: 171. R18C adds `src/io/transducers/audio_wakeword.nova` — a
 > wake-word matched filter built on R17B's MFCC + R7F's VAD via
 > Dynamic Time Warping ("Hey Nova", "Computer", etc.). DTW lattice
 > `D[i][j] = local(input[i], reference[j]) + min(D[i-1][j],
@@ -122,7 +122,89 @@ computational units rather than orchestrating a pipeline of modules.
 > `tmp_relation(A, B) == BEFORE` iff `tmp_relation(B, A) == AFTER`.
 > 80 unit assertions (`tests/unit/test_kg_temporal.nova`) + 21
 > integration assertions (`tests/integration/scenario_xxx_temporal.sh`);
-> all green. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
+> all green. R19D adds `src/io/transducers/audio_speaker_id.nova` — the
+> voice analog of R18D's LBP-gallery face recognition. R17B shipped
+> MFCC; R18C shipped DTW on a single template (wake-word matched
+> filter); R18D shipped a labelled gallery + nearest-neighbour
+> classifier for visual identity. R19D closes the analogous shape
+> for audio: a labelled gallery of enrolled speaker MFCC
+> fingerprints + a DTW NN classifier that returns the closest
+> enrolled label or "unknown" when no entry passes the configured
+> threshold. Per-pair scoring reuses R18C's `wake_dtw_distance` so
+> the integer-only DTW math is shared (skip coef 0, path-normalize
+> by N+M, length-tolerant warp). Classification: per query, run
+> DTW against every alive entry; if `min_dist < threshold` return
+> `[argmin_label, min_dist]`, else `["unknown", -1]`. Caps:
+> `SPK_GALLERY_MAX_ENTRIES = 64`, `SPK_LABEL_MAX = 64` bytes,
+> per-entry frames capped at 256 (mirrors R18C). Default threshold
+> = 30000 milli² (matches R18C). Persistence is ASCII line-oriented
+> (`CE_SPK_GALLERY 1` magic + `n_entries N` + per-entry metadata +
+> `frame <c0> <c1> ... <c12>` lines); round-trip bit-identical for
+> the 3-speaker gallery. Public API: `spk_gallery_new`,
+> `spk_gallery_enroll[_from_pcm]`, `spk_gallery_recognize[_from_pcm]`,
+> `spk_gallery_save`, `spk_gallery_load`, `spk_gallery_size`,
+> `spk_gallery_clear`, `spk_gallery_label_at`,
+> `spk_gallery_default_threshold`. New chat admins:
+> `/spk_enroll LABEL PATH.wav` registers a speaker, prints
+> `(spk_enroll OK label=LABEL size=N)`;
+> `/spk_recognize PATH.wav` matches and prints
+> `(spk_recognize matched=LABEL distance=D threshold=T)` or
+> `(spk_recognize unknown distance=-1 threshold=T)`. On
+> Klatt /iy ae iy/ self-match: distance = 0 (DTW perfect
+> alignment). Cross-speaker (alice `/iy ae iy/` vs dave
+> `/a ah a/`) lands well above the 30000 threshold, so dave
+> recognized against an alice-only gallery returns "unknown".
+> 53 unit assertions (`tests/unit/test_speaker_id.nova`) + 22
+> integration assertions
+> (`tests/integration/scenario_yyy_speaker_id.sh`); all green.
+> All prior audio suites (R6E Klatt, R7F VAD, R8B/R10B STT,
+> R10F/R11B pitch, R12D PSOLA, R13D voice clone, R14E DSP, R16E
+> STFT, R17B MFCC, R18C wakeword) remain bit-identically green.
+> R18A.2 EXTENDS `src/io/transducers/image_optical_flow.nova`
+> with byte mul-acc SIMD wired into the 5 Lucas-Kanade accumulator
+> sums (Σ Ix², Σ Iy², Σ IxIy, Σ IxIt, Σ IyIt) -- closes R17C's
+> 0.80x ceiling at **3.69x absolute speedup** on full LK (256x256
+> ws=5 smooth-quadratic). The new
+> `simd_mul_acc_signed_signed_byte(a_i8, b_i8, n)` NOVA codegen
+> primitive (R18A, commit `db34532`) is the structural fit R17C
+> documented as the missing piece: AVX2 `vpmovsxbw + vpmaddwd`
+> inline, ARM64 NEON `sshll + smull/smull2`, WASM v128
+> `i32x4.dot_i16x8_s`, scalar fallback elsewhere. The 5 accumulators
+> map to 7 SIMD calls per pixel: 3 direct (Σ Ix², Σ Iy², Σ IxIy --
+> all i8×i8) + 4 for the It two-piece split. It in [-255, 255] is
+> outside i8, so we decompose `It = 2 * It_lo + It_hi` where
+> `It_lo = It / 2` (NOVA truncate-toward-0, range [-127, 127]) and
+> `It_hi = It - 2*It_lo` (range {-1, 0, 1}), both i8. Then
+> `Σ Ix*It = 2 * Σ(Ix*It_lo) + Σ(Ix*It_hi)` cell-by-cell -- bit-
+> identical to scalar because integer add is associative. The
+> load-bearing optimization: pre-compute the 4 gradient i8 buffers
+> across the WHOLE IMAGE in one pass before the per-pixel scan,
+> so per-pixel staging becomes 20 `memcpy_raw` calls (R15A pack
+> pattern) + 7 SIMD calls instead of 75 scalar gradient calls.
+> Without the pre-compute the small `n_cells = 25` doesn't let
+> AVX2's 16-byte vector iter amortize the staging (initial cut
+> measured 0.67x). New API: `lk_optical_flow_mulacc_u8(prev, next,
+> w, h, win_size)` (env-var dispatch `CE_LK_MULACC_SIMD=on`,
+> default off; falls back to scalar `lk_optical_flow` otherwise),
+> `lk_optical_flow_mulacc_pyramid` (R11A pyramidal with mul-acc
+> inner solve at every level), `lk_optical_flow_mulacc_perpixel`
+> (R13B per-pixel pyramidal with mul-acc inner solve). 28 new
+> assertions in `tests/unit/test_lk_mulacc_simd.nova` (whole-image
+> bit-identical sweep -- mismatch count == 0 across all interior
+> pixels; textured h-shift / v-shift / identical-frames; high-
+> contrast-bands exercising the |It| > 127 path; pyramid + per-
+> pixel dispatch-off bit-identical; env-var dispatch; input
+> validation). Bench script
+> (`scripts/bench_simd_production.sh`) extends the flow bench to
+> 4 paths (scalar / R12A i32 SIMD / R17C u8 packed-scan / R18A.2
+> mul-acc) and FAILs on any disagreement. Headline numbers:
+> scalar = 67 ms, i32 SIMD = 368 ms (0.18x -- byte→i32 staging),
+> u8 packed-scan = 73 ms (0.91x -- locality only), mul-acc = 18 ms
+> (**3.69x absolute**, 4.03x vs R17C u8). All prior optical-flow
+> suites (R10D `test_optical_flow.nova` 53 assertions, R11A
+> `test_optical_flow_pyramid.nova` 52, R13B
+> `test_optical_flow_perpixel.nova` 34, R17C `test_lk_u8_simd.nova`
+> 34) remain bit-identically green. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
 > Short-Time Fourier Transform / spectrogram built on an integer-only
 > radix-2 Cooley-Tukey FFT, closing the frequency-domain gap in the
 > audio chain (every prior audio module — R6E Klatt, R7F VAD, R7F

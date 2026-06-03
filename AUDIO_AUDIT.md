@@ -1765,3 +1765,166 @@ different-utterance distance comes in at > 1e8 with a wide margin).
   detection -- same future-work bullet as R17B; the wake-word
   path benefits from it doubly because the detection thresholds
   become invariant to recording channel.
+
+## R19D -- speaker identification via MFCC gallery + DTW NN classifier
+
+Status: **DONE (`src/io/transducers/audio_speaker_id.nova`).**
+The natural voice analog of R18D's LBP-gallery face recognition.
+R17B shipped MFCC; R18C shipped DTW on a single template (wake-word
+matched filter); R18D shipped a labelled gallery + chi-squared
+nearest-neighbour classifier for visuals (face identity). R19D
+closes the same shape for audio: a labelled gallery of enrolled
+speaker MFCC fingerprints + a DTW nearest-neighbour classifier
+that returns either the closest enrolled label or "unknown" when
+no entry passes the configured threshold.
+
+The pipeline mirrors the textbook classical speaker-ID setup used
+from the 80s GMM-UBM era forward (per Reynolds & Rose). DTW-based
+variants survive in today's on-device speaker-verification
+baselines that don't ship a DNN front end:
+
+```
+ENROLLMENT (per known speaker):     QUERY:
+  reference WAV                       query WAV
+     |                                   |
+     v                                   v
+  MFCC sequence (R17B)              MFCC sequence (R17B)
+     |                                   |
+     v                                   v
+  [label, frames] --+                frames
+                    |                   |
+                    v                   v
+                gallery --- DTW(gallery, query)
+                                        |
+                                        v
+                             argmin -> label | "unknown"
+```
+
+### Algorithm
+
+Per-pair scoring reuses R18C's `wake_dtw_distance`: path-length
+normalized DTW with squared-L2 local cost on 13-dim MFCC vectors
+(skipping coef 0, the energy term). For an N-frame query and
+M-frame reference:
+
+```
+D[i][j] = local_distance(query[i], reference[j])
+       + min(D[i-1][j], D[i][j-1], D[i-1][j-1])
+```
+
+with the boundary rows/columns taking only available neighbours.
+Final distance = `D[N-1][M-1] / (N + M)`. Identical sequences
+DTW to exactly 0 (the diagonal walk picks zero local costs);
+length-mismatched but content-identical sequences still DTW to 0
+(the lattice finds the warp); spectrally-distinct sequences land
+at distances >> 30000 (the default threshold), giving wide margin
+between same-speaker and cross-speaker pairs on the Klatt
+vowel-triple fixtures.
+
+Classification: per query, run DTW against every alive gallery
+entry. If the minimum distance is strictly less than the
+threshold, return `[argmin_label, min_distance]`. Otherwise
+return `["unknown", -1]`. Ties resolve to the first match in
+enrollment order; same-PCM enrollments always hit at distance 0.
+
+### Public surface
+
+- `spk_gallery_new()` -> empty gallery (NOVA list).
+- `spk_gallery_enroll(gallery, label, wav_path)` -> 1 on success,
+  0 on parse/build failure. Idempotent on label (re-enrolling
+  the same label OVERWRITES the prior entry).
+- `spk_gallery_enroll_from_pcm(gallery, label, pcm, sample_rate)`
+  -- I/O-free variant for unit tests.
+- `spk_gallery_recognize(gallery, query_wav_path, threshold)`
+  -> `[label, distance]` on a match within threshold;
+     `["unknown", -1]` on empty-gallery / parse-failure /
+     no-match.
+- `spk_gallery_recognize_from_pcm(...)` -- I/O-free variant.
+- `spk_gallery_save(gallery, path)` /
+  `spk_gallery_load(path)` -- ASCII line-oriented persistence.
+- `spk_gallery_size(gallery)` -- live-entries count (post-clear
+  safe).
+- `spk_gallery_clear(gallery)` -- drop all entries (uses dead-
+  sentinel slots so re-enroll doesn't grow the underlying list).
+- `spk_gallery_default_threshold()` -- 30000 milli^2 (matches
+  R18C wake default; same DTW units).
+- `spk_enroll_chat_args(arg)` /
+  `spk_recognize_chat_args(arg)` -- chat dispatchers; use a
+  per-process singleton gallery.
+
+Caps: `SPK_GALLERY_MAX_ENTRIES = 64`, `SPK_LABEL_MAX = 64` bytes
+per identity, per-entry MFCC capped at 256 frames (mirrors R18C).
+
+### Chat surface
+
+- `/spk_enroll LABEL PATH.wav` -- register a speaker. Output:
+  `(spk_enroll OK label=LABEL size=N)` or
+  `(spk_enroll FAILED on PATH: ...)`.
+- `/spk_recognize PATH.wav` -- nearest-neighbour against the
+  per-process gallery. Output:
+  `(spk_recognize matched=LABEL distance=D threshold=T)` or
+  `(spk_recognize unknown distance=-1 threshold=T)` or
+  `(spk_recognize FAILED: gallery empty -- /spk_enroll first)`.
+
+### Verification snapshot
+
+- 53 unit assertions in `tests/unit/test_speaker_id.nova` (well
+  above the ~25 floor in the brief). 22 integration assertions
+  in `tests/integration/scenario_yyy_speaker_id.sh`. All green.
+- **3-speaker gallery correctness:** enrolling alice (Klatt
+  `/iy ae iy/`), bob (`/ae uw ae/`), carol (`/uw ow uw/`)
+  succeeds; recognizing each fixture's own utterance returns
+  its label at distance 0 (identical MFCC sequences DTW to 0).
+- **Unknown rejection on 4th speaker:** dave (`/a ah a/`, NOT
+  enrolled) returns "unknown distance=-1 threshold=30000" --
+  no enrolled entry passes the default threshold for the
+  spectrally-distinct fixture.
+- **Save + load round-trip:** a 3-speaker gallery saved + reloaded
+  reproduces identical recognize results for each fixture
+  (each at distance 0 against the loaded entry).
+- **Clear:** post-clear gallery size = 0; recognize returns
+  "unknown"; re-enroll reuses dead-sentinel slots so the
+  underlying list doesn't grow.
+- **Duplicate enrollment overwrites:** re-enrolling alice with
+  bob's PCM keeps size = 1 and re-aims the alice slot at the
+  new MFCC.
+- **Threshold extremes:** threshold = 0 always rejects (strict
+  `<`); threshold = 999e9 always returns the nearest-neighbour
+  regardless of distance.
+- 188/188 existing unit tests + every audio scenario still pass
+  (R6E synth, R7F VAD, R8B/R10B STT, R10F/R11B pitch, R12D
+  PSOLA, R13D voice clone, R14E DSP, R16E STFT, R17B MFCC,
+  R18C wake-word).
+
+### Future work
+
+- **Speaker-conditional thresholds** -- per-label thresholds
+  tuned from a tiny accept/reject set (mirrors the R18C bullet);
+  the trainer would enumerate distance distributions on a
+  held-out set and pick each speaker's EER point.
+- **Multi-utterance enrolment** -- store K reference utterances
+  per speaker and recognize on min over K DTW distances. The
+  integer-only path costs K times more per query but the math
+  stays bit-deterministic and the false-reject rate drops
+  sharply on real-mic recordings whose channel varies between
+  enrolment and query.
+- **GMM-UBM speaker-verification head** -- the classical
+  follow-up that the open-source SIDEKIT toolchain shipped for
+  TIMIT speaker-verification benchmarks. The k-means baseline
+  trainer is integer-only; the universal background model is
+  the same diagonal-covariance Gaussian mixture used by
+  classical phoneme classifiers.
+- **i-vector / x-vector embedding head** -- the modern DNN-free
+  alternative (i-vectors are factor-analysis-based and survive
+  in low-resource setups). The factor-analysis math is
+  iterative but stays integer-only with milli fixed-point.
+- **Cepstral mean / variance normalization (CMVN)** -- same
+  future-work bullet as R17B and R18C; the speaker-ID path
+  benefits doubly because the recognize threshold becomes
+  invariant to recording channel.
+- **DTW path-recovery + interval scoring** -- for tagging
+  "which words in the query matched the gallery entry best",
+  recover the back-pointer trace through the DTW lattice (we
+  already compute the min argument per cell, but currently
+  drop it). Useful for forced alignment + speaker-diarization
+  follow-ups.

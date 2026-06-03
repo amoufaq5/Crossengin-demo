@@ -3,6 +3,279 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R19D (this session) -- speaker identification via MFCC gallery + DTW NN classifier
+
+**Status: complete -- `src/io/transducers/audio_speaker_id.nova`
+(NEW, ~580 lines) ships the voice analog of R18D's LBP-gallery
+face recognition. R17B shipped MFCC; R18C shipped DTW on a
+single template (wake-word matched filter); R18D shipped a
+labelled gallery + chi-squared nearest-neighbour classifier
+for visual identity. R19D closes the analogous shape for audio:
+a labelled gallery of enrolled speaker MFCC fingerprints + DTW
+nearest-neighbour that returns either the closest enrolled label
+or "unknown" when no entry passes the configured threshold. The
+pipeline is the textbook classical speaker-ID setup (Reynolds &
+Rose; DTW-based variants survive in today's on-device speaker-
+verification baselines that don't ship a DNN front end).**
+
+### What R19D delivers
+
+1. **New module** `src/io/transducers/audio_speaker_id.nova` --
+   `spk_gallery_new()`, `spk_gallery_enroll(gallery, label, wav_path)`,
+   `spk_gallery_enroll_from_pcm(gallery, label, pcm, sample_rate)`
+   (I/O-free for unit tests), `spk_gallery_recognize(gallery,
+   wav_path, threshold)`, `spk_gallery_recognize_from_pcm(...)`,
+   `spk_gallery_save(gallery, path)` / `spk_gallery_load(path)`,
+   `spk_gallery_size(gallery)`, `spk_gallery_clear(gallery)`,
+   `spk_gallery_label_at(gallery, idx)` accessors, and the chat
+   wrappers `spk_enroll_chat_args(arg)` /
+   `spk_recognize_chat_args(arg)` that use a per-process
+   singleton gallery.
+2. **Per-pair scoring reuses R18C** -- `wake_dtw_distance(query,
+   ref)` is called per gallery entry; the integer-only DTW math
+   is shared with the wake-word path so contract semantics are
+   identical (length-tolerant warp; skip coef 0; same caps).
+3. **Persistence** -- ASCII line-oriented format with magic
+   `CE_SPK_GALLERY 1` + `n_entries N` header, then per-entry
+   `entry <label>` / `sample_rate` / `frame_size` / `n_mfcc` /
+   `n_frames` / `frame <c0> <c1> ... <c{n_mfcc-1}>` blocks.
+   Round-trip bit-identical for the 3-speaker gallery.
+4. **Caps** -- `SPK_GALLERY_MAX_ENTRIES = 64`, `SPK_LABEL_MAX =
+   64` bytes per identity label, per-entry MFCC frames capped at
+   256 (mirrors R18C `WAKE_TEMPLATE_MAX_FRAMES`). Default
+   threshold = 30000 milli^2 (matches R18C wake default; same
+   DTW units).
+5. **Verification** -- 53 unit assertions in
+   `tests/unit/test_speaker_id.nova` (NEW), 22 integration
+   assertions in `tests/integration/scenario_yyy_speaker_id.sh`
+   (NEW).
+
+### Algorithm
+
+```
+ENROLLMENT (per known speaker):     QUERY:
+  reference WAV                       query WAV
+     |                                   |
+     v                                   v
+  MFCC sequence (R17B)              MFCC sequence (R17B)
+     |                                   |
+     v                                   v
+  [label, frames] --+                frames
+                    |                   |
+                    v                   v
+                gallery --- DTW(gallery, query) (R18C)
+                                        |
+                                        v
+                             argmin -> label | "unknown"
+```
+
+Classification: per query, run DTW against every alive gallery
+entry. If the minimum distance is strictly less than the
+threshold, return `[argmin_label, min_distance]`. Otherwise
+return `["unknown", -1]`. Ties resolve to the first enrolled
+match. Identical-PCM enrollments always hit at distance 0.
+
+### Integration scenario report (scenario_yyy_speaker_id.sh)
+
+```
+== scenario YYY: R19D speaker identification MFCC+DTW gallery chat round-trip ==
+  PASS  alice fixture WAV written by driver
+  PASS  bob fixture WAV written by driver
+  PASS  carol fixture WAV written by driver
+  PASS  dave fixture WAV written by driver
+  PASS  alice WAV exists on disk
+  PASS  bob WAV exists on disk
+  PASS  carol WAV exists on disk
+  PASS  dave WAV exists on disk
+  PASS  /help advertises /spk_enroll + /spk_recognize
+  PASS  /spk_enroll with no arg prints usage
+  PASS  /spk_recognize with no arg prints usage
+  PASS  /spk_recognize on empty gallery prints gallery-empty error
+  PASS  /spk_enroll on missing WAV prints parser error gracefully
+  PASS  alice enrolled: gallery size = 1
+  PASS  bob enrolled: gallery size = 2
+  PASS  carol enrolled: gallery size = 3
+  PASS  /spk_recognize alice utterance -> alice with distance 0
+  PASS  /spk_recognize bob utterance -> bob with distance 0
+  PASS  /spk_recognize carol utterance -> carol with distance 0
+  PASS  /spk_recognize dave utterance (NOT enrolled) -> unknown (correct rejection)
+  PASS  chat reaches /quit cleanly after /spk_enroll + /spk_recognize probing
+  PASS  fixture driver did not emit FAIL lines
+integration scenario_yyy_speaker_id: pass=22 fail=0
+```
+
+3-speaker gallery correctness: enrolling alice (Klatt
+`/iy ae iy/`), bob (`/ae uw ae/`), carol (`/uw ow uw/`)
+succeeds; recognizing each fixture's own utterance returns
+its label at distance 0 (identical MFCC sequences DTW to 0).
+
+Unknown rejection on 4th speaker: dave (`/a ah a/`, NOT
+enrolled) returns `(spk_recognize unknown distance=-1
+threshold=30000)` -- no enrolled entry passes the default
+threshold for the spectrally-distinct fixture.
+
+Save / load preserved: a 3-speaker gallery saved + reloaded
+reproduces identical recognize results for each fixture
+(each at distance 0 against the loaded entry) -- the unit test
+`test_save_load_round_trip_preserves_results` covers all three
+identities.
+
+### Module count: +1 (audio_speaker_id.nova new)
+
+189 unit tests pass after the R19D addition (including the new
+`tests/unit/test_speaker_id.nova` with 53 assertions). All
+existing audio tests pass (R6E synth, R7F VAD, R8B/R10B STT,
+R10F/R11B pitch, R12D PSOLA, R13D voice clone, R14E DSP, R16E
+STFT, R17B MFCC, R18C wakeword).
+
+### Files touched / added
+
+- NEW: `src/io/transducers/audio_speaker_id.nova` (~580 lines)
+- NEW: `tests/unit/test_speaker_id.nova` (53 assertions)
+- NEW: `tests/integration/scenario_yyy_speaker_id.sh`
+  (22 assertions)
+- `examples/crossengin_chat.nova` -- 4 lines added in the
+  prior session's rebase (1 import, 1 packed help line, 2
+  dispatches); now in HEAD.
+- `AUDIO_AUDIT.md` -- R19D section appended
+- `NEXT_SESSION.md` -- this section
+- `README.md` -- module count + one-line highlight bumped
+
+### Gaps for R20+
+
+1. Speaker-conditional thresholds -- per-label thresholds tuned
+   from a tiny accept/reject set; the trainer would enumerate
+   distance distributions on a held-out set and pick each
+   speaker's EER point. Still integer-only via histogram math.
+2. Multi-utterance enrolment -- store K reference utterances per
+   speaker and recognize on min over K DTW distances. The
+   integer-only path costs K times more per query but the math
+   stays bit-deterministic and the false-reject rate drops
+   sharply on real-mic recordings.
+3. GMM-UBM speaker-verification head (the classical follow-up the
+   open-source SIDEKIT toolchain ships for TIMIT benchmarks). The
+   k-means baseline trainer is integer-only; the UBM is the same
+   diagonal-covariance Gaussian mixture used by classical phoneme
+   classifiers.
+4. i-vector / x-vector embedding head (the modern DNN-free
+   alternative; i-vectors are factor-analysis-based and survive
+   in low-resource setups).
+5. CMVN (cepstral mean / variance normalization) at training and
+   recognition (same future-work bullet as R17B / R18C; the
+   speaker-ID path benefits doubly because the recognize
+   threshold becomes invariant to recording channel).
+6. DTW path-recovery + interval scoring -- for tagging "which
+   words in the query matched the gallery entry best", recover
+   the back-pointer trace through the DTW lattice. Useful for
+   forced alignment + speaker-diarization follow-ups.
+
+## R18A.2 (prior session) -- byte mul-acc SIMD wired into optical-flow LK -- 3.69x absolute speedup (closes R17C's 0.80x ceiling)
+
+**Status: complete -- `src/io/transducers/image_optical_flow.nova`
+EXTENDED with `_lk_optical_flow_mulacc_inner` + public entry
+`lk_optical_flow_mulacc_u8` + pyramidal / per-pixel variants
+that route the inner solve through the new mul-acc SIMD path.
+Wires R18A's new `simd_mul_acc_signed_signed_byte(a_i8, b_i8, n)`
+NOVA codegen primitive (commit `db34532`) into the 5 LK
+accumulator sums. Closes R17C's 0.80x ceiling and R13A's 1.42x
+ceiling on full optical-flow LK with bit-identical output.**
+
+### Headline measurement (256x256 ws=5, smooth-quadratic + h-shift-2)
+
+  | Path                                | Wallclock | Speedup vs scalar |
+  |-------------------------------------|----------:|------------------:|
+  | scalar (R10D)                       |  ~67 ms   |             1.00x |
+  | R12A i32 SIMD                       | ~368 ms   |             0.18x |
+  | R17C u8 packed-scan                 |  ~73 ms   |             0.91x |
+  | **R18A.2 mul-acc SIMD**             |  **~18 ms** | **3.69x absolute** |
+  | R18A.2 vs R17C u8                   |        -- |              4.03x |
+
+3.69x absolute is inside the brief's 2-3x target band. Closes the
+0.80x cap R17C reported. Pattern mirrors R15A's stereo SAD wire-in
+(5.5x absolute) -- the right SIMD primitive shipped in its own
+round (R18A), the CE wire-in in the follow-up (R18A.2).
+
+### How the 5 accumulators map to the primitive
+
+The primitive `simd_mul_acc_signed_signed_byte(a_i8, b_i8, n) -> int`
+sums `a[i] * b[i]` over n bytes with BOTH operands as signed i8.
+AVX2: `vpmovsxbw` widens i8 to i16, `vpmaddwd` pair-multiplies +
+adds to i32, `vpaddd` accumulates. 16 bytes per vector iter; scalar
+tail for `n % 16`. ARM64 NEON: `sshll` + `smull/smull2` + `add`.
+WASM v128: `i32x4.dot_i16x8_s`. Bit-identical to scalar Σ a[i]*b[i].
+
+The 5 sums:
+* Σ Ix² / Σ Iy² / Σ Ix*Iy : Ix, Iy in i8 [-127, 127] (gradients = (u8 - u8) / 2). One SIMD call each.
+* Σ Ix*It and Σ Iy*It : It in [-255, 255] -- outside i8. We split:
+  `It_lo = It / 2` (truncate toward 0, range [-127, 127])
+  `It_hi = It - 2 * It_lo` (range {-1, 0, 1})
+  both fit i8. Then `Σ Ix*It = 2 * Σ(Ix * It_lo) + Σ(Ix * It_hi)`
+  cell-by-cell because `Ix * (2 * It_lo + It_hi) = 2 * Ix * It_lo + Ix * It_hi`.
+  Two SIMD calls each.
+
+Total: 7 SIMD calls per pixel replacing 5 * 25 = 125 scalar
+int_mul + int_add ops. Bit-identical because integer add is
+associative + commutative and the two-piece decomposition is exact.
+
+### Load-bearing optimization: image-wide gradient pre-compute
+
+Initial implementation: per-pixel staging (75 scalar gradient calls
++ 100 byte stores per pixel) -- measured 0.67x absolute. The 25-cell
+inner loop is too small for the SIMD vector iter (16 bytes -> 1
+vector iter + 9-byte scalar tail) to amortize the staging cost.
+
+Fix: pre-compute the 4 gradient i8 buffers across the WHOLE IMAGE
+ONCE before the per-pixel scan. Per-pixel staging then reduces to
+4 buffers * `ws` rows = 20 `memcpy_raw` calls per pixel (the R15A
+pack pattern -- `rep movsb` one row at a time). This amortizes the
+65,536 gradient calls (256 * 256 area) across all interior pixels
+instead of paying 75 per pixel. Per-pixel inner loop: 20 memcpy_raw +
+7 SIMD calls + the 2x2 inverse. **18 ms vs 67 ms scalar = 3.69x**.
+
+### Files touched / added
+
+* `src/io/transducers/image_optical_flow.nova` (EXTENDED, +~580 lines).
+  Adds `_lk_mulacc_simd_enabled` (CE_LK_MULACC_SIMD env-var, opt-in),
+  `_lk_store_i8` (signed-byte two's-complement store),
+  `_lk_optical_flow_mulacc_inner` (the image-wide pre-compute +
+  per-pixel memcpy_raw pack + 7 SIMD calls),
+  `lk_optical_flow_mulacc_u8` (public entry, env-var dispatch),
+  `lk_optical_flow_mulacc_pyramid` (R11A pyramidal with mul-acc
+  inner solve at every level),
+  `lk_optical_flow_mulacc_perpixel` (R13B per-pixel pyramidal with
+  mul-acc inner solve).
+* `tests/unit/test_lk_mulacc_simd.nova` (NEW, 28 assertions).
+  Whole-image-sweep bit-identical (mismatch count == 0 across all
+  interior pixels), textured h-shift-3, v-shift-2, identical-frames,
+  high-contrast-bands (the |It| > 127 path), pyramid dispatch-off,
+  perpixel dispatch-off, env-var dispatch, input validation.
+* `scripts/bench_simd_production.sh` (extended flow bench with
+  mul-acc path + bit-identical assertions across all 4 paths).
+* `IMAGE_AUDIT.md`, `NEXT_SESSION.md`, `README.md` (this entry +
+  the 3.69x speedup writeup + structural diagram).
+
+### Verification
+
+* 28 new assertions (`tests/unit/test_lk_mulacc_simd.nova`) -- all PASS.
+* All prior optical-flow tests preserved: `test_optical_flow.nova`
+  (53 assertions), `test_optical_flow_pyramid.nova` (52),
+  `test_optical_flow_perpixel.nova` (34), `test_lk_u8_simd.nova` (34).
+* Full unit-test sweep: all green.
+* Bench script asserts scalar vs mul-acc bit-identical on
+  mean_magnitude + valid_count; FAILs the run on any disagreement.
+
+### Honest perf read
+
+Target was 2-3x absolute; delivered 3.69x. The two enablers were
+(a) the structurally-correct primitive R18A shipped (signed mul-acc,
+not SAD), and (b) the image-wide pre-compute pattern that amortizes
+the gradient staging cost across all interior pixels. Without (b)
+the small `n_cells = 25` doesn't give AVX2's 16-byte vector iter
+enough work to overcome the staging overhead (initial cut measured
+0.67x). The 4.03x speedup vs R17C's packed-scan path matches the
+structural argument: R18A.2 vectorizes the accumulator MATH,
+R17C only vectorized the It-load LOCALITY.
+
 ## R19C (this session) -- KG temporal reasoning: Allen's interval algebra over atom timestamps
 
 **Status: complete -- `src/kg/temporal.nova` (NEW, ~350 lines)

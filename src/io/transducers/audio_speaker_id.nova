@@ -1,0 +1,843 @@
+// CrossEngin io/transducers: integer-only speaker identification via
+// MFCC gallery + DTW nearest-neighbour lookup (R19D).
+//
+// Purpose
+//   R17B shipped the MFCC front end. R18C built wake-word detection
+//   on top of it as a single-template DTW matched filter. R18D
+//   closed the analogous LBP-gallery face-recognition pipeline for
+//   visuals. R19D (this module) is the natural voice analog of
+//   R18D: a GALLERY of enrolled speaker MFCC fingerprints, plus a
+//   DTW-based nearest-neighbour classifier that returns the label
+//   of the closest enrolled speaker (or "unknown" when no entry
+//   passes the threshold).
+//
+//   The pipeline is the textbook classical speaker-ID setup used
+//   from the 80s GMM-UBM era forward (per the Reynolds + Rose
+//   speaker-recognition literature; DTW-based variants survive in
+//   today's on-device speaker-verification baselines that don't
+//   ship a DNN front end). The structure is:
+//
+//     ENROLLMENT:                  QUERY:
+//       reference WAV                 query WAV
+//          |                              |
+//          v                              v
+//       MFCC sequence (R17B)         MFCC sequence (R17B)
+//          |                              |
+//          v                              v
+//       [label, mfcc_frames] -+           mfcc_frames
+//                             |              |
+//                             v              v
+//                         gallery --- DTW(gallery, query)
+//                                            |
+//                                            v
+//                                argmin -> label | "unknown"
+//
+//   The module is intentionally an orthogonal sibling of
+//   `audio_wakeword.nova` (which is single-template wake-word
+//   matched filtering): a gallery of K templates, each labelled,
+//   with a unified nearest-neighbour classifier on top. We REUSE
+//   R18C's `wake_dtw_distance` as the per-pair scorer so the
+//   integer-only DTW math is shared and the contract behaviours
+//   are identical (length-tolerant warp; skip coef 0; same caps).
+//
+//   CrossEngin's no-training-data design forbids shipping a
+//   pre-trained speaker gallery -- the gallery is OPERATOR-
+//   MAINTAINED state. /spk_enroll registers a new identity from a
+//   reference WAV; /spk_recognize queries against the current
+//   gallery; spk_gallery_save / spk_gallery_load round-trip the
+//   gallery to disk so an operator can pre-load a known-identities
+//   table at boot.
+//
+// Algorithm
+//
+//   1. ENROLLMENT (per known speaker):
+//        frames = mfcc_compute(pcm, sr, ...)  // R17B
+//        gallery_append([label, frames, sr, frame_size, n_mfcc])
+//      If a label already exists, the new MFCC frame list
+//      OVERWRITES the old one -- enrollment is idempotent on
+//      label so re-enrolling with a fresher reference is a single
+//      command. The implementation reuses dead-sentinel slots
+//      after a clear (mirrors face_recognize) so clear + re-enroll
+//      doesn't grow the underlying list unboundedly.
+//
+//   2. QUERY:
+//        q_frames = mfcc_compute(query_pcm, sr, ...)
+//        for each [label, frames, ...] in gallery:
+//            d = wake_dtw_distance(q_frames, frames)
+//            track (label, d) with the minimum d
+//        if min_d < threshold_milli: return [argmin_label, min_d]
+//        else: return ["unknown", -1]
+//
+//      The threshold is in cumulative L2-squared milli units (the
+//      same convention as R18C's wake_default_threshold). Distinct
+//      Klatt speaker fixtures (different vowels, hence different
+//      formants) sit at distances >> 30000 against each other;
+//      same-speaker self-match sits at exactly 0 (MFCC of identical
+//      PCM is bit-identical; DTW of identical sequences is 0).
+//
+// Gallery storage layout (in-memory):
+//   gallery = [entry, entry, ...]
+//   entry   = [label, frames, sample_rate, frame_size, n_mfcc]
+//             where frames is a list of MFCC coefficient lists.
+//   A dead sentinel entry (post-clear) has label = "" and empty
+//   frames; the size + recognize helpers skip dead entries.
+//
+// Gallery storage layout (on disk):
+//   ASCII line-oriented for inspectability + portability across
+//   NOVA builds. Header magic + version + live entry count, then
+//   per-entry the label, metadata, frame count, and one frame per
+//   line ("frame <c0> <c1> ... <c{n_mfcc-1}>").
+//
+//     CE_SPK_GALLERY 1
+//     n_entries <int>
+//     entry <label>
+//     sample_rate <int>
+//     frame_size <int>
+//     n_mfcc <int>
+//     n_frames <int>
+//     frame <c0> <c1> ... <c{n_mfcc-1}>
+//     ...
+//
+//   Empty gallery: the file holds the magic + version + "n_entries 0".
+//
+// Public API
+//   spk_gallery_new() -> gallery_t
+//   spk_gallery_enroll(gallery, label, wav_path) -> 1 (ok) | 0 (error)
+//   spk_gallery_enroll_from_pcm(gallery, label, pcm, sample_rate)
+//       -> 1 (ok) | 0 (error)  -- I/O-free variant for unit tests
+//   spk_gallery_recognize(gallery, query_wav_path, threshold_milli)
+//       -> [label, distance_milli] | ["unknown", -1]
+//   spk_gallery_recognize_from_pcm(gallery, pcm, sample_rate,
+//                                  threshold_milli)
+//       -> [label, distance_milli] | ["unknown", -1]
+//   spk_gallery_save(gallery, path) -> 1 | 0
+//   spk_gallery_load(path) -> gallery_t
+//   spk_gallery_size(gallery) -> int (live entries, post-clear safe)
+//   spk_gallery_clear(gallery) -> 1
+//   spk_gallery_label_at(gallery, idx) -> string ("" on OOB / dead)
+//   spk_gallery_default_threshold() -> int
+//   spk_enroll_chat_args(arg) / spk_recognize_chat_args(arg) -- the
+//       chat dispatchers; thin wrappers around the per-process
+//       singleton gallery + the default threshold.
+//
+// Caps
+//   SPK_GALLERY_MAX_ENTRIES = 64    in-memory + on-disk cap. Each
+//                                   entry holds up to 256 MFCC
+//                                   frames (R18C cap) of 13 ints
+//                                   each = ~3.3 KB; gallery ceiling
+//                                   ~210 KB even when full.
+//   SPK_LABEL_MAX           = 64    bytes per identity label.
+//   SPK_DEFAULT_THRESHOLD   = 30000 milli^2 (matches R18C's wake
+//                                   threshold; same DTW units; same
+//                                   typical Klatt margin).
+//
+// ADRs: ADR-0014 (modality bridge, frequency-domain leg, classifier
+//   layer).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new,
+//   push, list_set, len, int_add, int_sub, int_mul, int_div,
+//   int_shr, int_shl, str_eq, char_at, substr, int_to_str,
+//   str_to_int, sys_open, sys_write, sys_read, sys_close,
+//   sys_fsync, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC.
+// CrossEngin dependencies: audio_mfcc (R17B -- MFCC sequence
+//   builder), audio_wakeword (R18C -- wake_dtw_distance core),
+//   audio_capture (R6E -- WAV loader for the chat helpers).
+
+import "std/syscall"
+import "audio_capture.nova"
+import "audio_mfcc.nova"
+import "audio_wakeword.nova"
+
+// ---- public caps + defaults ----------------------------------------------
+
+let SPK_GALLERY_MAX_ENTRIES = 64
+let SPK_LABEL_MAX           = 64
+let SPK_DEFAULT_THRESHOLD   = 30000   // milli^2, matches R18C wake default
+
+// Persistence: ASCII magic + version line.
+let SPK_GALLERY_MAGIC   = "CE_SPK_GALLERY"
+let SPK_GALLERY_VERSION = 1
+
+// File mode (0644) and read cap (~4 MB; comfortably above any 64-entry x 256-frame
+// x 13-coef gallery).
+let _SPK_FILE_MODE       = 420
+let _SPK_MAX_FILE_BYTES  = 4194304
+
+// Default chat-side on-disk gallery path. Mirrors the
+// /tmp/wakeword.template convention.
+let SPK_DEFAULT_GALLERY_PATH = "/tmp/speaker_gallery.txt"
+
+// ---- public constant accessors -------------------------------------------
+
+fn spk_gallery_max_entries()    { return SPK_GALLERY_MAX_ENTRIES }
+fn spk_label_max()              { return SPK_LABEL_MAX }
+fn spk_gallery_default_threshold() { return SPK_DEFAULT_THRESHOLD }
+fn spk_default_gallery_path()   { return SPK_DEFAULT_GALLERY_PATH }
+
+// ---- comparison helpers --------------------------------------------------
+//
+// Same arithmetic-shift sign-bit pattern as audio_wakeword / audio_dsp --
+// guards against NOVA's smart `<` / `>` dispatching to _nova_strcmp when
+// both operands exceed the pointer threshold.
+
+fn _spk_int_lt(a, b) {
+    let d = int_sub(a, b)
+    let sign = int_shr(d, 63)
+    if sign == 0 { return 0 }
+    return 1
+}
+
+fn _spk_int_gt(a, b) { return _spk_int_lt(b, a) }
+
+// ---- entry struct --------------------------------------------------------
+//
+// Each gallery entry is a 5-cell list:
+//   [0] label         (string; empty string = dead sentinel slot)
+//   [1] frames        (list of MFCC coefficient lists; each length n_mfcc)
+//   [2] sample_rate   (Hz; preserved so the loader can pin matching audio)
+//   [3] frame_size    (FFT frame size used to build the MFCC)
+//   [4] n_mfcc        (cepstral coefs per frame; 13 by R17B default)
+
+let _SPK_E_LABEL  = 0
+let _SPK_E_FRAMES = 1
+let _SPK_E_RATE   = 2
+let _SPK_E_FSIZE  = 3
+let _SPK_E_NMFCC  = 4
+
+fn _spk_entry_new(label, frames, sample_rate, frame_size, n_mfcc) {
+    let e = list_new()
+    push(e, label)
+    push(e, frames)
+    push(e, sample_rate)
+    push(e, frame_size)
+    push(e, n_mfcc)
+    return e
+}
+
+fn _spk_entry_alive(e) {
+    if e == 0 { return 0 }
+    if len(e) < 5 { return 0 }
+    let lab = e[_SPK_E_LABEL]
+    if len(lab) == 0 { return 0 }
+    return 1
+}
+
+// ---- constructor / accessors ---------------------------------------------
+
+fn spk_gallery_new() {
+    return list_new()
+}
+
+// Walk the gallery and count entries with non-empty labels (alive
+// after enroll / overwrite; dead after clear).
+fn spk_gallery_size(gallery) {
+    if gallery == 0 { return 0 }
+    let n = len(gallery)
+    let live = 0
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _spk_entry_alive(e) == 1 {
+            live = int_add(live, 1)
+        }
+        i = int_add(i, 1)
+    }
+    return live
+}
+
+fn spk_gallery_label_at(gallery, idx) {
+    if gallery == 0 { return "" }
+    if idx < 0 { return "" }
+    if idx >= len(gallery) { return "" }
+    let e = gallery[idx]
+    if _spk_entry_alive(e) == 0 { return "" }
+    return e[_SPK_E_LABEL]
+}
+
+fn spk_gallery_frames_at(gallery, idx) {
+    if gallery == 0 { return list_new() }
+    if idx < 0 { return list_new() }
+    if idx >= len(gallery) { return list_new() }
+    let e = gallery[idx]
+    if _spk_entry_alive(e) == 0 { return list_new() }
+    return e[_SPK_E_FRAMES]
+}
+
+fn spk_gallery_rate_at(gallery, idx) {
+    if gallery == 0 { return 0 }
+    if idx < 0 { return 0 }
+    if idx >= len(gallery) { return 0 }
+    let e = gallery[idx]
+    if _spk_entry_alive(e) == 0 { return 0 }
+    return e[_SPK_E_RATE]
+}
+
+// ---- clear ---------------------------------------------------------------
+//
+// Mirrors face_gallery_clear: NOVA lists can't be truncated, so we
+// overwrite every slot with a dead-sentinel entry (empty label, empty
+// frames list). Subsequent size() / recognize() / save() skip the
+// dead entries; subsequent enroll() reuses the slots before pushing
+// new ones.
+
+fn spk_gallery_clear(gallery) {
+    if gallery == 0 { return 1 }
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let dead = list_new()
+        push(dead, "")           // dead label
+        push(dead, list_new())   // empty frames
+        push(dead, 0)            // sample rate
+        push(dead, 0)            // frame size
+        push(dead, 0)            // n_mfcc
+        list_set(gallery, i, dead)
+        i = int_add(i, 1)
+    }
+    return 1
+}
+
+// ---- find-label-by-index -------------------------------------------------
+
+fn _spk_find_label(gallery, label) {
+    if gallery == 0 { return 0 - 1 }
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _spk_entry_alive(e) == 1 {
+            if str_eq(e[_SPK_E_LABEL], label) == 1 {
+                return i
+            }
+        }
+        i = int_add(i, 1)
+    }
+    return 0 - 1
+}
+
+// ---- MFCC reference build ------------------------------------------------
+//
+// _spk_mfcc_from_pcm(pcm, sample_rate) -> [frames, sample_rate, frame_size, n_mfcc]
+//
+//   Picks frame_size / hop_size matching the wakeword module's
+//   convention so the DTW lattice is commensurable with R18C's
+//   detection path (caller code that already trained a wake-word
+//   template doesn't have to fight a mismatched MFCC front end).
+//   Returns 0 on empty PCM or invalid sample rate.
+
+fn _spk_mfcc_from_pcm(pcm, sample_rate) {
+    if len(pcm) == 0 { return 0 }
+    if sample_rate <= 0 { return 0 }
+    let N = stft_frame_size_default()
+    let H = stft_hop_size_default()
+    if sample_rate <= 8000 { N = 256; H = 128 }
+    let m = mfcc_compute(pcm, sample_rate, N, H, mfcc_n_mfcc_default())
+    let frames = mfcc_frames(m)
+    if len(frames) == 0 { return 0 }
+    // Cap frames at R18C's WAKE_TEMPLATE_MAX_FRAMES so the DTW
+    // lattice cells stay within wake_dtw_distance's clip range.
+    let cap = wake_template_max_frames()
+    let kept = list_new()
+    let f = 0
+    while f < len(frames) {
+        if f >= cap { f = len(frames) } else {
+            push(kept, frames[f])
+            f = f + 1
+        }
+    }
+    let out = list_new()
+    push(out, kept)
+    push(out, mfcc_rate(m))
+    push(out, mfcc_frame_size(m))
+    push(out, mfcc_n_mfcc(m))
+    return out
+}
+
+// ---- enroll --------------------------------------------------------------
+//
+// spk_gallery_enroll_from_pcm(gallery, label, pcm, sample_rate) -> 1 | 0
+//
+//   Compute the MFCC sequence of the reference utterance and stash
+//   it under the label. If the label already exists, OVERWRITE the
+//   old entry (idempotent re-enroll). If the gallery is at the
+//   SPK_GALLERY_MAX_ENTRIES capacity and the label is new, reject.
+//   Returns 1 on success, 0 on any validation / build failure.
+//
+// spk_gallery_enroll(gallery, label, wav_path) -> 1 | 0
+//
+//   Thin WAV-loading wrapper: loads via R6E audio_capture_to_pcm,
+//   delegates to spk_gallery_enroll_from_pcm. Returns 0 on parse
+//   failure / empty WAV / invalid label.
+
+fn spk_gallery_enroll_from_pcm(gallery, label, pcm, sample_rate) {
+    if gallery == 0 { return 0 }
+    if label == 0 { return 0 }
+    if len(label) == 0 { return 0 }
+    if len(label) > SPK_LABEL_MAX { return 0 }
+    let built = _spk_mfcc_from_pcm(pcm, sample_rate)
+    if built == 0 { return 0 }
+    let entry = _spk_entry_new(label, built[0], built[1], built[2], built[3])
+    let existing = _spk_find_label(gallery, label)
+    if existing >= 0 {
+        // OVERWRITE: replace at the existing slot.
+        list_set(gallery, existing, entry)
+        return 1
+    }
+    // APPEND new identity (subject to cap on LIVE entries).
+    if spk_gallery_size(gallery) >= SPK_GALLERY_MAX_ENTRIES { return 0 }
+    // Slot into a dead-sentinel position first if available.
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _spk_entry_alive(e) == 0 {
+            list_set(gallery, i, entry)
+            return 1
+        }
+        i = int_add(i, 1)
+    }
+    push(gallery, entry)
+    return 1
+}
+
+fn spk_gallery_enroll(gallery, label, wav_path) {
+    if gallery == 0 { return 0 }
+    if wav_path == 0 { return 0 }
+    if len(wav_path) == 0 { return 0 }
+    let r = audio_capture_to_pcm(wav_path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 { return 0 }
+    if sr <= 0 { return 0 }
+    return spk_gallery_enroll_from_pcm(gallery, label, pcm, sr)
+}
+
+// ---- recognize -----------------------------------------------------------
+//
+// spk_gallery_recognize_from_pcm(gallery, pcm, sample_rate,
+//                                threshold_milli)
+//   -> [label, distance_milli] on a match within threshold;
+//      ["unknown", -1] on empty-gallery / build-failure / no-match.
+//
+//   Compute the query's MFCC sequence and run wake_dtw_distance
+//   against every ALIVE gallery entry, tracking the minimum DTW
+//   distance + its label. The thresholding mirrors R18C: if the
+//   minimum distance is STRICTLY LESS than threshold_milli, return
+//   the label; otherwise return ["unknown", -1].
+
+fn _spk_unknown_result() {
+    let r = list_new()
+    push(r, "unknown")
+    push(r, 0 - 1)
+    return r
+}
+
+fn spk_gallery_recognize_from_pcm(gallery, pcm, sample_rate, threshold_milli) {
+    if gallery == 0 { return _spk_unknown_result() }
+    if spk_gallery_size(gallery) == 0 { return _spk_unknown_result() }
+    let built = _spk_mfcc_from_pcm(pcm, sample_rate)
+    if built == 0 { return _spk_unknown_result() }
+    let q_frames = built[0]
+    if len(q_frames) == 0 { return _spk_unknown_result() }
+    let n = len(gallery)
+    let best_label = ""
+    let best_dist = 0 - 1
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _spk_entry_alive(e) == 1 {
+            let d = wake_dtw_distance(q_frames, e[_SPK_E_FRAMES])
+            if best_dist < 0 {
+                best_dist = d
+                best_label = e[_SPK_E_LABEL]
+            } else {
+                if _spk_int_lt(d, best_dist) == 1 {
+                    best_dist = d
+                    best_label = e[_SPK_E_LABEL]
+                }
+            }
+        }
+        i = int_add(i, 1)
+    }
+    if best_dist < 0 { return _spk_unknown_result() }
+    if _spk_int_lt(best_dist, threshold_milli) == 0 {
+        return _spk_unknown_result()
+    }
+    let r = list_new()
+    push(r, best_label)
+    push(r, best_dist)
+    return r
+}
+
+fn spk_gallery_recognize(gallery, wav_path, threshold_milli) {
+    if gallery == 0 { return _spk_unknown_result() }
+    if wav_path == 0 { return _spk_unknown_result() }
+    if len(wav_path) == 0 { return _spk_unknown_result() }
+    let r = audio_capture_to_pcm(wav_path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 { return _spk_unknown_result() }
+    if sr <= 0 { return _spk_unknown_result() }
+    return spk_gallery_recognize_from_pcm(gallery, pcm, sr, threshold_milli)
+}
+
+// ---- persistence: save ---------------------------------------------------
+//
+// Text format mirrors the wake-word template but extends to a
+// multi-entry block. Only LIVE entries are written; dead sentinel
+// slots are dropped.
+
+fn _spk_emit_str(buf, off, s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        store8(buf + int_add(off, i), char_at(s, i))
+        i = int_add(i, 1)
+    }
+    return int_add(off, n)
+}
+
+fn _spk_emit_int(buf, off, v) {
+    return _spk_emit_str(buf, off, int_to_str(v))
+}
+
+fn _spk_emit_nl(buf, off) {
+    store8(buf + off, 10)        // '\n'
+    return int_add(off, 1)
+}
+
+fn spk_gallery_save(gallery, path) {
+    if gallery == 0 { return 0 }
+    if path == 0 { return 0 }
+    if len(path) == 0 { return 0 }
+    let buf = alloc(_SPK_MAX_FILE_BYTES + 1)
+    let off = 0
+    // Header.
+    off = _spk_emit_str(buf, off, SPK_GALLERY_MAGIC)
+    off = _spk_emit_str(buf, off, " ")
+    off = _spk_emit_int(buf, off, SPK_GALLERY_VERSION)
+    off = _spk_emit_nl(buf, off)
+    // Entry count.
+    let live = spk_gallery_size(gallery)
+    off = _spk_emit_str(buf, off, "n_entries ")
+    off = _spk_emit_int(buf, off, live)
+    off = _spk_emit_nl(buf, off)
+    // Each live entry.
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _spk_entry_alive(e) == 1 {
+            off = _spk_emit_str(buf, off, "entry ")
+            off = _spk_emit_str(buf, off, e[_SPK_E_LABEL])
+            off = _spk_emit_nl(buf, off)
+            off = _spk_emit_str(buf, off, "sample_rate ")
+            off = _spk_emit_int(buf, off, e[_SPK_E_RATE])
+            off = _spk_emit_nl(buf, off)
+            off = _spk_emit_str(buf, off, "frame_size ")
+            off = _spk_emit_int(buf, off, e[_SPK_E_FSIZE])
+            off = _spk_emit_nl(buf, off)
+            off = _spk_emit_str(buf, off, "n_mfcc ")
+            off = _spk_emit_int(buf, off, e[_SPK_E_NMFCC])
+            off = _spk_emit_nl(buf, off)
+            let frames = e[_SPK_E_FRAMES]
+            let nf = len(frames)
+            off = _spk_emit_str(buf, off, "n_frames ")
+            off = _spk_emit_int(buf, off, nf)
+            off = _spk_emit_nl(buf, off)
+            let f = 0
+            while f < nf {
+                let row = frames[f]
+                off = _spk_emit_str(buf, off, "frame")
+                let k = 0
+                while k < len(row) {
+                    off = _spk_emit_str(buf, off, " ")
+                    off = _spk_emit_int(buf, off, row[k])
+                    k = int_add(k, 1)
+                }
+                off = _spk_emit_nl(buf, off)
+                f = int_add(f, 1)
+            }
+        }
+        i = int_add(i, 1)
+    }
+    if off > _SPK_MAX_FILE_BYTES { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, _SPK_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, off)
+    if written != off {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// ---- persistence: load --------------------------------------------------
+//
+// Returns a fully-populated gallery on success, or an empty gallery
+// (NOT a sentinel int) on open/read/parse failure -- the caller can
+// always call spk_gallery_size on the result to distinguish.
+
+fn _spk_find_byte(s, start, byte) {
+    let n = len(s)
+    let i = start
+    while i < n {
+        if char_at(s, i) == byte { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn _spk_next_line(text, pos) {
+    let nl = _spk_find_byte(text, pos, 10)
+    let pair = list_new()
+    if nl < 0 {
+        push(pair, substr(text, pos, len(text) - pos))
+        push(pair, len(text))
+        return pair
+    }
+    push(pair, substr(text, pos, nl - pos))
+    push(pair, nl + 1)
+    return pair
+}
+
+fn _spk_split_space(line) {
+    let toks = list_new()
+    let n = len(line)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(line, i) == 32 {
+            if i > start { push(toks, substr(line, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if n > start { push(toks, substr(line, start, n - start)) }
+    return toks
+}
+
+fn _spk_line_key(line) {
+    let sp = _spk_find_byte(line, 0, 32)
+    if sp < 0 { return line }
+    return substr(line, 0, sp)
+}
+
+fn _spk_line_val(line) {
+    let sp = _spk_find_byte(line, 0, 32)
+    if sp < 0 { return "" }
+    return substr(line, sp + 1, len(line) - sp - 1)
+}
+
+fn _spk_line_val_int(line) {
+    return str_to_int(_spk_line_val(line))
+}
+
+fn _spk_read_text(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let chunk = 4096
+    let buf = alloc(chunk + 1)
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        let m = sys_read(fd, buf, chunk)
+        if m <= 0 {
+            done = 1
+        } else {
+            store8(buf + m, 0)
+            acc = acc + buf
+            if m < chunk { done = 1 }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// Push the in-flight accumulator into the gallery if it's a valid
+// well-formed entry (non-empty label + matching frame count). Used
+// at every "entry" line boundary and at end-of-file. Returns 1 if
+// pushed, 0 if skipped.
+fn _spk_flush_accum(gallery, cur_label, cur_frames, cur_rate, cur_fsize, cur_nmfcc, cur_nframes) {
+    if len(cur_label) == 0 { return 0 }
+    if len(cur_frames) != cur_nframes { return 0 }
+    let entry = _spk_entry_new(cur_label, cur_frames, cur_rate, cur_fsize, cur_nmfcc)
+    push(gallery, entry)
+    return 1
+}
+
+fn spk_gallery_load(path) {
+    let empty = spk_gallery_new()
+    if path == 0 { return empty }
+    if len(path) == 0 { return empty }
+    let text = _spk_read_text(path)
+    if text == 0 { return empty }
+    if len(text) == 0 { return empty }
+    let pos = 0
+    let total = len(text)
+    let gallery = spk_gallery_new()
+    let header_seen = 0
+    // Per-entry accumulators.
+    let cur_label = ""
+    let cur_rate = 0
+    let cur_fsize = 0
+    let cur_nmfcc = 0
+    let cur_nframes = 0
+    let cur_frames = list_new()
+    let in_entry = 0
+    while pos < total {
+        let pair = _spk_next_line(text, pos)
+        let line = pair[0]
+        pos = pair[1]
+        if len(line) == 0 {
+            // skip blank lines (trailing newline produces an empty tail)
+        } else {
+            let key = _spk_line_key(line)
+            if str_eq(key, SPK_GALLERY_MAGIC) == 1 {
+                let ver = _spk_line_val_int(line)
+                if ver != SPK_GALLERY_VERSION { return empty }
+                header_seen = 1
+            } else {
+                if header_seen == 0 { return empty }
+                // n_entries is informational; the loader walks the body.
+                if str_eq(key, "entry") == 1 {
+                    // New entry boundary: flush any in-flight accumulator.
+                    if in_entry == 1 {
+                        _spk_flush_accum(gallery, cur_label, cur_frames,
+                                         cur_rate, cur_fsize, cur_nmfcc,
+                                         cur_nframes)
+                    }
+                    cur_label = _spk_line_val(line)
+                    cur_rate = 0
+                    cur_fsize = 0
+                    cur_nmfcc = 0
+                    cur_nframes = 0
+                    cur_frames = list_new()
+                    in_entry = 1
+                }
+                if str_eq(key, "sample_rate") == 1 {
+                    cur_rate = _spk_line_val_int(line)
+                }
+                if str_eq(key, "frame_size") == 1 {
+                    cur_fsize = _spk_line_val_int(line)
+                }
+                if str_eq(key, "n_mfcc") == 1 {
+                    cur_nmfcc = _spk_line_val_int(line)
+                }
+                if str_eq(key, "n_frames") == 1 {
+                    cur_nframes = _spk_line_val_int(line)
+                }
+                if str_eq(key, "frame") == 1 {
+                    let toks = _spk_split_space(line)
+                    let row = list_new()
+                    let k = 1
+                    while k < len(toks) {
+                        push(row, str_to_int(toks[k]))
+                        k = k + 1
+                    }
+                    push(cur_frames, row)
+                }
+            }
+        }
+    }
+    // Flush final entry if present.
+    if in_entry == 1 {
+        _spk_flush_accum(gallery, cur_label, cur_frames, cur_rate,
+                         cur_fsize, cur_nmfcc, cur_nframes)
+    }
+    if header_seen == 0 { return empty }
+    return gallery
+}
+
+// ---- chat-side singleton gallery ----------------------------------------
+//
+// Same pattern as image_face_recognize: a module-level holder list
+// so the chat dispatchers see the same per-process gallery without
+// adding a global let to the chat module.
+
+let _spk_chat_holder = list_new()
+
+fn _spk_chat_gallery() {
+    if len(_spk_chat_holder) == 0 {
+        push(_spk_chat_holder, spk_gallery_new())
+    }
+    return _spk_chat_holder[0]
+}
+
+// ---- chat orchestration helpers -----------------------------------------
+//
+// /spk_enroll <label> <wav>   register a speaker by name
+// /spk_recognize <wav>        return the closest enrolled label
+
+fn _spk_split_label_path(arg) {
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {     // ASCII space
+            let lab = substr(arg, 0, i)
+            let path = substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1)))
+            let out = list_new()
+            push(out, lab)
+            push(out, path)
+            return out
+        }
+        i = int_add(i, 1)
+    }
+    let out = list_new()
+    push(out, "")
+    push(out, "")
+    return out
+}
+
+fn spk_enroll_chat_args(arg) {
+    if len(arg) == 0 {
+        return "(/spk_enroll needs LABEL PATH.wav)"
+    }
+    let parts = _spk_split_label_path(arg)
+    let label = parts[0]
+    let path = parts[1]
+    if len(label) == 0 {
+        return "(/spk_enroll needs LABEL PATH.wav -- got 1 arg)"
+    }
+    if len(path) == 0 {
+        return "(/spk_enroll needs LABEL PATH.wav -- got 1 arg)"
+    }
+    if len(label) > SPK_LABEL_MAX {
+        return "(spk_enroll FAILED: label exceeds 64-byte cap)"
+    }
+    let gallery = _spk_chat_gallery()
+    let ok = spk_gallery_enroll(gallery, label, path)
+    if ok == 0 {
+        return "(spk_enroll FAILED on " + path + ": could not parse WAV or build MFCC)"
+    }
+    let size = spk_gallery_size(gallery)
+    return "(spk_enroll OK label=" + label
+        + " size=" + int_to_str(size) + ")"
+}
+
+fn spk_recognize_chat_args(arg) {
+    if len(arg) == 0 {
+        return "(/spk_recognize needs PATH.wav)"
+    }
+    let path = str_trim(arg)
+    if len(path) == 0 {
+        return "(/spk_recognize needs PATH.wav)"
+    }
+    let gallery = _spk_chat_gallery()
+    if spk_gallery_size(gallery) == 0 {
+        return "(spk_recognize FAILED: gallery empty -- /spk_enroll first)"
+    }
+    let thr = SPK_DEFAULT_THRESHOLD
+    let r = spk_gallery_recognize(gallery, path, thr)
+    let label = r[0]
+    let dist = r[1]
+    if str_eq(label, "unknown") == 1 {
+        return "(spk_recognize unknown distance=-1 threshold="
+            + int_to_str(thr) + ")"
+    }
+    return "(spk_recognize matched=" + label
+        + " distance=" + int_to_str(dist)
+        + " threshold=" + int_to_str(thr) + ")"
+}
