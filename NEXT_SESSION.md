@@ -3,6 +3,34 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R27F (this session) -- 26-round sprint retrospective
+
+**Status: complete** -- new `RETROSPECTIVE_26_ROUNDS.md` (~7600 words,
+1180 lines) distils the institutional knowledge from 26 rounds and ~156
+parallel-agent dispatches into a unified cross-repo retrospective.
+Sections cover: round-by-round headlines (all 26 rounds with
+commit-SHA-verified summaries), the ten cross-agent coordination
+patterns that worked, the five cross-agent failure modes (and their
+mitigations), the five canonical honest engineering disclosures
+(R12A, R17C, R21D, R22F, R26F), the three realization-of-perf chains
+(SIMD i32x8 -> u8 -> mul-acc; stereo SAD; HOG amortization), the NOVA
+language evolution arc (R17A enums through R26A update-syntax), the
+federation layer evolution (R7C kg_sync v3 through R26E gossip relay),
+and the round-N.2 ledger of follow-ups still open after 26 rounds. A
+shorter NOVA-side pointer is in `/home/user/NOVA/RETROSPECTIVE_26_
+ROUNDS.md`. No source modules touched; no tests added; this is a
+docs-only round.
+
+### Files touched (R27F)
+
+* NEW: `RETROSPECTIVE_26_ROUNDS.md` (7600 words, 1180 lines).
+* NEW: `/home/user/NOVA/RETROSPECTIVE_26_ROUNDS.md` (NOVA-side pointer
+  + focused arc summary).
+* MOD: `NEXT_SESSION.md` (this entry).
+* MOD: `/home/user/NOVA/NEXT_SESSION.md` (parallel entry).
+
+---
+
 ## R26C (this session) -- Audio noise reduction (spectral-subtraction Wiener)
 
 **Status: complete -- new `src/io/transducers/audio_noise_reduce.nova`
