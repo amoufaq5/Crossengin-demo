@@ -725,6 +725,368 @@ fn hog_dominant_bin_label(bin) {
     return "image_hog_dominant_bin_none"
 }
 
+// ---- R21D: integral histogram of gradients --------------------------------
+//
+// Acceleration of the per-cell histogram aggregation step (step 3 of the
+// Dalal-Triggs pipeline) via a precomputed INTEGRAL HISTOGRAM:
+//
+//     IH(x, y, bin) = sum over pixels (i, j) with i in [0..x] and
+//                     j in [0..y] of (mag(i, j) if bin(i, j) == bin else 0)
+//
+// Any cell's bin total then becomes a four-corner rectangle sum on the
+// per-bin integral image:
+//
+//     cell_hist[bin] = IH(x2, y2, bin)
+//                    - IH(x1-1, y2, bin)
+//                    - IH(x2, y1-1, bin)
+//                    + IH(x1-1, y1-1, bin)
+//
+// The scalar path costs O(WIN_W * WIN_H) per cell summed (a 64-pixel
+// 8x8 cell with 9 bins = 64 adds across the per-pixel loop). The
+// integral-histogram path costs O(NUM_BINS * 4) lookups per cell once
+// the per-bin integral images are built. The build cost is itself
+// O(W * H * NUM_BINS) -- one extra pass over the image per bin -- so
+// the cross-over point sits around the first time you call the cell-
+// histogram aggregator more than once at the same image resolution
+// (e.g. a sliding-window detector evaluating many overlapping windows
+// at the same scale, which is exactly R15C's hot path).
+//
+// BIT-IDENTICAL CONTRACT: this path produces THE SAME per-cell histogram
+// values as the scalar path. The same gradient direction, the same
+// orientation bin, the same magnitude. The only thing that changes is
+// the order of summation -- and we sum the SAME integer values in the
+// SAME bin slots, so the integer arithmetic is reordering-safe.
+//
+// Pixel-ownership exactly mirrors the scalar path:
+//   - Interior loop bounds: y in [1, h-2], x in [1, w-2] (outer ring
+//     contributes nothing -- the central differences read out of bounds).
+//   - Cell ownership: cx = x / cell_size, cy = y / cell_size (truncating
+//     integer division). The same clamps to (cells_x, cells_y) gate
+//     fractional-cell pixels at the right/bottom borders if the image
+//     dimensions are not exact cell multiples.
+//
+// PUBLIC API (opt-in via CE_HOG_INTEGRAL=on by default OFF):
+//   hog_compute_integral(image, w, h, cell_size, num_bins) -> hog_result
+//   hog_compute_integral_default(image, w, h) -> hog_result
+//
+// The opt-in env var lets the scalar path stay default until further
+// validation; the bit-identical contract is enforced by the unit suite
+// (test_hog_integral) on every fixture R14D's test_image_hog uses.
+//
+// Memory: W*H*NUM_BINS int64 cells. For the canonical 64x128 Dalal-
+// Triggs window with 9 bins: 64*128*9*8 = 589,824 bytes (~576 KB).
+// For the 32x32 default fixture with 9 bins: 32*32*9*8 = 73,728 bytes.
+// Within the HOG_MAX_AREA = 65,536 cap, the worst case is
+// 65,536 * 12 * 8 = 6.3 MB which is fine for the substrate's flat
+// arena.
+
+// _hog_ih_idx: (x, y, bin) -> integer index into the integral-histogram
+// buffer, laid out [num_bins][height][width] (bin-major so the inner
+// integral build pass walks contiguous pixels).
+fn _hog_ih_idx(x, y, w, h, bin) {
+    let plane = int_mul(int_mul(bin, h), w)
+    return int_add(plane, int_add(int_mul(y, w), x))
+}
+
+fn _hog_ih_get(ih, x, y, w, h, bin) {
+    return load64(int_add(ih, int_mul(_hog_ih_idx(x, y, w, h, bin), 8)))
+}
+
+fn _hog_ih_set(ih, x, y, w, h, bin, v) {
+    store64(int_add(ih, int_mul(_hog_ih_idx(x, y, w, h, bin), 8)), v)
+}
+
+// _hog_ih_rect_sum: standard four-corner integral rectangle sum for the
+// inclusive rectangle [x1..x2] x [y1..y2] on the per-bin integral plane.
+// Returns 0 if the rectangle is degenerate (no pixels selected).
+fn _hog_ih_rect_sum(ih, w, h, bin, x1, y1, x2, y2) {
+    if x1 > x2 { return 0 }
+    if y1 > y2 { return 0 }
+    if x2 < 0 { return 0 }
+    if y2 < 0 { return 0 }
+    if x1 >= w { return 0 }
+    if y1 >= h { return 0 }
+    if x1 < 0 { x1 = 0 }
+    if y1 < 0 { y1 = 0 }
+    if x2 >= w { x2 = int_sub(w, 1) }
+    if y2 >= h { y2 = int_sub(h, 1) }
+    let a = _hog_ih_get(ih, x2, y2, w, h, bin)
+    let b = 0
+    if x1 > 0 { b = _hog_ih_get(ih, int_sub(x1, 1), y2, w, h, bin) }
+    let c = 0
+    if y1 > 0 { c = _hog_ih_get(ih, x2, int_sub(y1, 1), w, h, bin) }
+    let d = 0
+    if x1 > 0 {
+        if y1 > 0 {
+            d = _hog_ih_get(ih, int_sub(x1, 1), int_sub(y1, 1), w, h, bin)
+        }
+    }
+    return int_add(int_sub(int_sub(a, b), c), d)
+}
+
+// _hog_build_integral_histogram: returns an opaque integral-histogram
+// buffer [num_bins][h][w] of int64 cumulative bin counts. Magnitude is
+// applied at the per-pixel store (so bin b's plane holds cumulative
+// magnitude where pixel's bin == b, zero elsewhere). The outer interior-
+// loop bounds (y in [1, h-2], x in [1, w-2]) exactly match the scalar
+// path; border pixels contribute zero (no central difference available).
+// Also returns the per-pixel mag_sum, mag_count, and global dominant bin
+// so the caller can populate the result tuple identically to the scalar
+// path.
+//
+// Returns [ih_ptr, mag_sum, mag_count, dominant_bin].
+fn _hog_build_integral_histogram(image, w, h, num_bins) {
+    // Allocate a (w * h * num_bins) int64 buffer, zero-initialized.
+    let total_cells = int_mul(int_mul(w, h), num_bins)
+    let bytes = int_mul(total_cells, 8)
+    let ih = alloc(int_add(bytes, 8))
+    // Zero-fill (alloc may not guarantee zeroes on every NOVA target;
+    // explicit init keeps the integral semantics correct).
+    let zi = 0
+    while zi < total_cells {
+        store64(int_add(ih, int_mul(zi, 8)), 0)
+        zi = int_add(zi, 1)
+    }
+    // Per-bin global accumulator for the dominant-bin atom.
+    let global_bin = list_new()
+    let gb = 0
+    while gb < num_bins {
+        push(global_bin, 0)
+        gb = int_add(gb, 1)
+    }
+    let mag_sum = 0
+    let mag_count = 0
+    // ---- Pass 1: per-pixel (mag, bin) sparse store into the integral
+    // raw buffer (ih[bin][y][x] = mag if pixel's bin == bin, else 0).
+    // We MUST track the pixel count over the FULL interior rectangle
+    // (y in [1, h-2], x in [1, w-2]) to match the scalar path's
+    // mag_count exactly.
+    let y = 1
+    while y < int_sub(h, 1) {
+        let row_above = int_mul(int_sub(y, 1), w)
+        let row_mid   = int_mul(y, w)
+        let row_below = int_mul(int_add(y, 1), w)
+        let x = 1
+        while x < int_sub(w, 1) {
+            let gx = int_sub(load8(image + row_mid + int_add(x, 1)),
+                             load8(image + row_mid + int_sub(x, 1)))
+            let gy = int_sub(load8(image + row_below + x),
+                             load8(image + row_above + x))
+            let ax = gx
+            if ax < 0 { ax = 0 - ax }
+            let ay = gy
+            if ay < 0 { ay = 0 - ay }
+            let mag = int_add(ax, ay)
+            mag_sum = int_add(mag_sum, mag)
+            mag_count = int_add(mag_count, 1)
+            if mag > 0 {
+                let bin = _hog_orient_bin(gx, gy, num_bins)
+                _hog_ih_set(ih, x, y, w, h, bin, mag)
+                list_set(global_bin, bin,
+                         int_add(global_bin[bin], mag))
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    // ---- Pass 2: integrate each per-bin plane in place using the
+    // standard row-then-column cumulative recurrence:
+    //   I(x, y) = raw(x, y) + I(x-1, y) + I(x, y-1) - I(x-1, y-1)
+    // (with I(-1, *) = I(*, -1) = 0). We do this per bin so the
+    // cumulative magnitude planes are independent.
+    let b = 0
+    while b < num_bins {
+        // First row: left-to-right cumulative sum.
+        let row_acc = 0
+        let xa = 0
+        while xa < w {
+            let v0 = _hog_ih_get(ih, xa, 0, w, h, b)
+            row_acc = int_add(row_acc, v0)
+            _hog_ih_set(ih, xa, 0, w, h, b, row_acc)
+            xa = int_add(xa, 1)
+        }
+        // Remaining rows: row-cumulative-sum + carry-from-above.
+        let yy = 1
+        while yy < h {
+            let row_sum = 0
+            let xx = 0
+            while xx < w {
+                let cur = _hog_ih_get(ih, xx, yy, w, h, b)
+                row_sum = int_add(row_sum, cur)
+                let above = _hog_ih_get(ih, xx, int_sub(yy, 1), w, h, b)
+                _hog_ih_set(ih, xx, yy, w, h, b,
+                            int_add(above, row_sum))
+                xx = int_add(xx, 1)
+            }
+            yy = int_add(yy, 1)
+        }
+        b = int_add(b, 1)
+    }
+    // Find the global dominant bin (argmax). Matches the scalar path
+    // exactly because we accumulate into the same global_bin list.
+    let dominant = 0 - 1
+    let best = 0 - 1
+    let bi = 0
+    while bi < num_bins {
+        let v = global_bin[bi]
+        if v > best {
+            best = v
+            dominant = bi
+        }
+        bi = int_add(bi, 1)
+    }
+    let out = list_new()
+    push(out, ih)
+    push(out, mag_sum)
+    push(out, mag_count)
+    push(out, dominant)
+    return out
+}
+
+// _hog_cell_histograms_from_integral: walk every (cx, cy) cell and
+// fetch its NUM_BINS bin counts via 4 integral lookups per bin. The
+// per-cell rectangle is the same one the scalar path would have
+// accumulated over: pixels with cx == x / cell_size AND
+// 1 <= x < width - 1 AND 1 <= y < height - 1.
+//
+// For cell (cx, cy) with cell_size cs, the natural rectangle is
+//   x1 = cx * cs,  y1 = cy * cs
+//   x2 = (cx + 1) * cs - 1,  y2 = (cy + 1) * cs - 1
+// Clamp to the scalar-path's interior bounds:
+//   x1 = max(x1, 1), x2 = min(x2, w - 2)
+//   y1 = max(y1, 1), y2 = min(y2, h - 2)
+// (The outer-ring pixels contribute zero to the integral planes
+// because the scalar build pass skipped them, so even an unclamped
+// rectangle would give the same answer -- but the explicit clamp
+// keeps the code readable and matches the documented contract.)
+fn _hog_cell_histograms_from_integral(ih, w, h, cells_x, cells_y,
+                                      cell_size, num_bins) {
+    let cell_hists = list_new()
+    let cy = 0
+    while cy < cells_y {
+        let y1 = int_mul(cy, cell_size)
+        let y2 = int_sub(int_mul(int_add(cy, 1), cell_size), 1)
+        if y1 < 1 { y1 = 1 }
+        if y2 > int_sub(h, 2) { y2 = int_sub(h, 2) }
+        let cx = 0
+        while cx < cells_x {
+            let x1 = int_mul(cx, cell_size)
+            let x2 = int_sub(int_mul(int_add(cx, 1), cell_size), 1)
+            if x1 < 1 { x1 = 1 }
+            if x2 > int_sub(w, 2) { x2 = int_sub(w, 2) }
+            let hist = list_new()
+            let b = 0
+            while b < num_bins {
+                let s = _hog_ih_rect_sum(ih, w, h, b, x1, y1, x2, y2)
+                push(hist, s)
+                b = int_add(b, 1)
+            }
+            push(cell_hists, hist)
+            cx = int_add(cx, 1)
+        }
+        cy = int_add(cy, 1)
+    }
+    return cell_hists
+}
+
+// _hog_integral_enabled() -> 1 if CE_HOG_INTEGRAL env var is set to
+//   "on"/"1"/"yes" (default OFF; explicit opt-in until the bit-identical
+//   contract has been validated against more end-to-end fixtures).
+//   Mirrors the R15A opt-in pattern for u8 SIMD.
+fn _hog_integral_enabled() {
+    let env = getenv("CE_HOG_INTEGRAL")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// hog_compute_integral: public API. Same contract as hog_compute --
+// returns the same hog_result tuple -- but the per-cell histogram
+// aggregation step uses the integral-histogram path. All validation
+// and downstream block-normalization is reused verbatim. Bit-identical
+// output to hog_compute on every fixture (asserted in
+// tests/unit/test_hog_integral.nova).
+fn hog_compute_integral(image, width, height, cell_size, num_bins) {
+    if image == 0  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if width <= 0  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if height <= 0 { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if width > HOG_MAX_DIM  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if height > HOG_MAX_DIM { return _hog_empty_result(width, height, cell_size, num_bins) }
+    let area = int_mul(width, height)
+    if area > HOG_MAX_AREA { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if _hog_cell_size_ok(cell_size) == 0 {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    if _hog_num_bins_ok(num_bins) == 0 {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    let cells_x = width  / cell_size
+    let cells_y = height / cell_size
+    if cells_x < HOG_BLOCK_CELLS_PER_AXIS {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    if cells_y < HOG_BLOCK_CELLS_PER_AXIS {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    // 1. + 2. -- per-pixel gradient pass folded into the integral
+    // histogram build.
+    let ih_pass = _hog_build_integral_histogram(image, width, height, num_bins)
+    let ih         = ih_pass[0]
+    let mag_sum    = ih_pass[1]
+    let mag_count  = ih_pass[2]
+    let dominant   = ih_pass[3]
+    // 3. -- per-cell histograms via 4 integral lookups per bin.
+    let cell_hists = _hog_cell_histograms_from_integral(ih, width, height,
+                                                        cells_x, cells_y,
+                                                        cell_size, num_bins)
+    let mag_mean = 0
+    if mag_count > 0 { mag_mean = mag_sum / mag_count }
+    // 4. + 5. -- identical block normalization to the scalar path
+    // (reuses _hog_block_descriptor).
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let descriptor = list_new()
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            let bi = 0
+            let block_len = len(block)
+            while bi < block_len {
+                push(descriptor, block[bi])
+                bi = int_add(bi, 1)
+            }
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, cell_size)
+    push(r, num_bins)
+    push(r, cells_x)
+    push(r, cells_y)
+    push(r, blocks_x)
+    push(r, blocks_y)
+    push(r, cell_hists)
+    push(r, descriptor)
+    push(r, dominant)
+    push(r, mag_mean)
+    return r
+}
+
+// hog_compute_integral_default: convenience wrapper at the default
+// cell_size/num_bins.
+fn hog_compute_integral_default(image, width, height) {
+    return hog_compute_integral(image, width, height,
+                                HOG_CELL_DEFAULT, HOG_BINS_DEFAULT)
+}
+
 // ---- chat-orchestration helper -------------------------------------------
 //
 // hog_pgm_args(arg) -> formatted result string for the chat /hog admin

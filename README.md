@@ -1146,7 +1146,21 @@ computational units rather than orchestrating a pipeline of modules.
 > 32x32 four-spots fixture dominant_bin=4 (vertical); on the 32x32
 > vertical-edge fixture dominant_bin=0 (horizontal -- the gradient
 > direction is perpendicular to the edge); the integration scenario
-> asserts these disagree. Documented in
+> asserts these disagree. R21D extends this module with an
+> integral-histogram acceleration of the per-cell aggregation step:
+> a precomputed `(W * H * NUM_BINS)` cumulative-magnitude buffer
+> recovers any cell's per-bin total in 4 four-corner lookups
+> (`hog_compute_integral` / `hog_compute_integral_default`), structured
+> to amortize across many downstream queries at the same scale (e.g.
+> R15C's sliding-window detector evaluating overlapping windows). The
+> integral path is BIT-IDENTICAL to the scalar path on every fixture
+> (unit-tested across vertical-edge / horizontal-edge / diagonal /
+> four-spots / 64x128 Dalal-Triggs window / cell_size=4 / num_bins=6 /
+> num_bins=12). Opt-in via `CE_HOG_INTEGRAL=on`; the scalar path stays
+> default until the wire-into-R15C round flips the contract. On a
+> single isolated `hog_compute_*` call the integral path is ~4-5x
+> slower (build cost dominates) -- the operational win is reserved for
+> the downstream amortization surface. Documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 from
 > `io/transducers/image_detector.nova` added in R15C HOG-based

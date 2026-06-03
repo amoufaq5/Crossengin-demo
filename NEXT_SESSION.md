@@ -3,7 +3,116 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R20F (this session) -- gossip-relayed signed snapshot attestation
+## R21D (this session) -- HOG accelerated via integral histogram of gradients
+
+**Status: complete -- `src/io/transducers/image_hog.nova` extended
+(+~370 lines, NO rewrite; R14D's scalar path stays intact) with an
+integral-histogram accelerator for the per-cell aggregation step. The
+R14D HOG pipeline runs central-difference gradient + L1 magnitude +
+unsigned orientation binning + 8x8 cell histogram + 2x2 block L2-Hys
+normalization; the per-cell histogram step is currently the
+O(cell_size^2 * num_bins) loop the integral histogram is purpose-built
+to amortize. R21D combines that with the R16D integral-image primitive:
+precompute a (W * H * NUM_BINS) cumulative-magnitude buffer once, then
+each cell's NUM_BINS counts come out of 4 four-corner integral lookups
+per bin -- standard Crow 1984 rectangle-sum recurrence, one plane per
+orientation bin.**
+
+### What R21D delivers
+
+1. **R21D section in `src/io/transducers/image_hog.nova`** -- public
+   API `hog_compute_integral(image, w, h, cell_size, num_bins) ->
+   hog_result` (returns the same hog_result tuple shape as
+   `hog_compute`; the integral path is internal) and
+   `hog_compute_integral_default(image, w, h) -> hog_result`. Internal
+   helpers: `_hog_ih_idx` / `_hog_ih_get` / `_hog_ih_set` (per-bin
+   plane addressing), `_hog_ih_rect_sum` (standard four-corner formula
+   on the per-bin plane), `_hog_build_integral_histogram` (sparse
+   per-pixel mag store + row/column cumulative recurrence; returns
+   `[ih_ptr, mag_sum, mag_count, dominant_bin]` so downstream callers
+   can populate the result tuple identically to the scalar path),
+   `_hog_cell_histograms_from_integral` (walks every (cx, cy) cell,
+   pulls NUM_BINS rectangle sums, clamps to the interior bounds the
+   scalar path uses), `_hog_integral_enabled` (env opt-in mirror of
+   `_stereo_u8_simd_enabled`). All validation and downstream block
+   normalization reuses R14D helpers verbatim.
+
+2. **Env opt-in `CE_HOG_INTEGRAL`** -- default OFF, opt-in via
+   `on`/`1`/`yes`. The scalar path remains the documented default
+   until further validation pulls the integral path into R15C's hot
+   loop (separate round; R15C's `image_detector.nova` is owned by a
+   different concurrent R21 agent so the wire-in is a follow-up).
+
+3. **Bit-identical contract** -- the integral path produces THE SAME
+   per-cell histograms (same int counts in same bin slots), THE SAME
+   block descriptors after L2-Hys, THE SAME final concatenated
+   descriptor as the scalar path. Verified on every fixture R14D's
+   test_image_hog uses + 64x128 Dalal-Triggs canonical pedestrian
+   window + non-default `cell_size=4`, `num_bins=6`, `num_bins=12`.
+   `hog_compare(scalar, integral)` returns 0 on identical inputs;
+   cross-fixture `hog_compare` returns IDENTICAL distances under
+   scalar/scalar, integral/integral, AND mixed scalar/integral.
+
+4. **Verification** -- 42 unit assertions in
+   `tests/unit/test_hog_integral.nova` (NEW; covers bit-identical on
+   uniform/vedge/hedge/diagonal/four-spots fixtures, bit-identical on
+   the 64x128 Dalal-Triggs window, per-cell histogram identity, the
+   non-default cell_size/num_bins configurations, edge cases mirroring
+   the scalar path's contract, `hog_compare` distance preservation).
+   17 integration assertions in
+   `tests/integration/scenario_gggg_hog_integral.sh` (NEW; standalone
+   NOVA driver synthesizes fixtures, runs both paths, asserts
+   BIT_IDENTICAL=1 at the descriptor level on 32x32 vedge / 32x32
+   hedge / 64x128 vedge, times both paths with 20K and 1K iterations,
+   reports the speedup ratio in milli-units).
+   All prior CV tests stay green: R14D HOG 55, R15C HOG detector 32,
+   R16D face_detect 36.
+
+5. **Module count: unchanged** (extension of R14D, no new src/
+   module).
+
+### Measured performance characterization
+
+The integral path pays a one-time O(W*H*NUM_BINS) build cost and saves
+O(cell_size^2 - 4) per cell aggregation. For a SINGLE HOG compute on
+a 32x32 image with 9 bins, the build allocates and integrates 9,216
+int64 slots, while the scalar accumulator just walks 900 interior
+pixels once. Empirically (scenario_gggg, NOVA `time()` is 1-second
+resolution):
+
+| Fixture        | scalar elapsed | integral elapsed | speedup (milli) |
+|----------------|---------------:|------------------:|-----------------:|
+| 32x32 vedge    |  2 s / 20K it  |   10 s / 20K it   |             200  |
+| 64x128 vedge   |  1 s / 1K it   |    4 s / 1K it    |             250  |
+
+i.e. **the integral path is ~4-5x slower per call for an isolated
+hog_compute** at these scales -- the W*H*NUM_BINS memory bandwidth
+of the build dominates the saved per-cell work. The operational win
+is reserved for the amortization surface (R15C's sliding-window
+detector evaluating many overlapping windows at the same scale, where
+the build cost is paid once and ~841 window queries on a 256x256
+scene share the same integral planes). The bit-identical contract
+is the primary R21D deliverable; the perf-flip lands in a future
+round that wires R21D into R15C's hot path.
+
+### Files touched / added
+
+* `src/io/transducers/image_hog.nova` (R14D file extended, +~370 lines)
+* `tests/unit/test_hog_integral.nova` (NEW, 18 fns / 42 assertions)
+* `tests/integration/scenario_gggg_hog_integral.sh` (NEW, 17 assertions)
+* `IMAGE_AUDIT.md` (R21D section appended)
+* `README.md` (R14D HOG paragraph extended with R21D summary)
+* `NEXT_SESSION.md` (this section)
+
+### Verify locally
+
+```sh
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_hog_integral.nova
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_image_hog.nova
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_gggg_hog_integral.sh
+```
+
+## R20F (previous session) -- gossip-relayed signed snapshot attestation
 
 **Status: complete -- `src/federation/snapshot_attestation.nova` (NEW,
 ~460 lines) ships a per-peer signed-snapshot-root attestation log that

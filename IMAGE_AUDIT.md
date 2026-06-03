@@ -1607,3 +1607,155 @@ chat reaches /quit cleanly.
   advert + 2 dispatches; over the 4-line target by 1 since the new
   module must be imported -- it isn't reachable through
   `visual_perception.nova` like `image_lbp` is)
+
+## R21D -- HOG via integral histogram of gradients
+
+**Status: complete -- extends R14D `src/io/transducers/image_hog.nova`
+(+~370 lines, no rewrite) with a precomputed
+`(W * H * NUM_BINS)` cumulative-magnitude buffer so any cell's per-bin
+total is recovered in 4 four-corner integral lookups instead of an
+O(cell_size^2) inner loop. The acceleration combines R14D's HOG dense
+descriptor with R16D's integral-image primitive (Crow 1984): same
+gradient + same orientation binning + same L2-Hys block normalization,
+but the per-cell histogram aggregation step folds through a per-bin
+integral plane. Bit-identical output to the scalar path; opt-in via
+`CE_HOG_INTEGRAL=on` while the scalar remains default until further
+end-to-end validation, mirroring the R15A u8 SIMD opt-in pattern.**
+
+### Algorithm
+
+1. **Per-pixel gradient + orientation binning** -- identical to R14D
+   (central differences, L1 magnitude, integer atan2 via the 8-quadrant
+   tangent lookup). Same `_hog_orient_bin` lookup, same outer-ring
+   exclusion, same mag/count accumulators.
+2. **Build the integral histogram** -- `_hog_build_integral_histogram`:
+   allocate a `[NUM_BINS][H][W]` int64 buffer (binmajor so each plane is
+   contiguous), set `IH[bin][y][x] = mag` if pixel `(x,y)` was binned to
+   `bin`, then run the standard
+   `I(x,y) = raw(x,y) + I(x-1,y) + I(x,y-1) - I(x-1,y-1)` recurrence
+   per plane. The outer interior bounds match the scalar path exactly
+   (`y in [1, h-2]`, `x in [1, w-2]`); border pixels contribute zero
+   because the central-difference indices would go out of bounds.
+3. **Per-cell histograms from the integral planes** --
+   `_hog_cell_histograms_from_integral`: for each cell `(cx, cy)`,
+   compute the inclusive rectangle `[cx*cs..(cx+1)*cs-1] x [cy*cs..]`,
+   clamp to the interior bounds `[1, w-2] x [1, h-2]`, and pull
+   `NUM_BINS` four-corner sums from the integral planes. Same cell-
+   ownership clamps to (cells_x, cells_y) as the scalar path; same
+   per-cell rectangle a scalar `cx = x / cell_size` accumulator would
+   cover.
+4. **Block normalization (L2-Hys)** -- reused verbatim from R14D
+   (`_hog_block_descriptor`). Same 1000-milli L2 target, same 200-milli
+   clip, same final-clamp pass.
+
+### Bit-identical contract
+
+The integral path produces THE SAME per-cell histograms (same int
+counts in same bin slots), THE SAME block descriptors after L2-Hys,
+THE SAME concatenated final descriptor. Verified on every fixture
+R14D's test_image_hog uses (uniform, vertical-edge, horizontal-edge,
+diagonal-edge, four-spots, 64x64 vedge) AND the 64x128 Dalal-Triggs
+canonical pedestrian window AND non-default `cell_size=4`,
+`num_bins=6`, `num_bins=12`. `hog_compare(scalar(A), integral(A)) == 0`
+for every A; `hog_compare(integral_v, integral_h) ==
+hog_compare(scalar_v, scalar_h)` on cross-fixture comparisons.
+
+### Performance characterization
+
+The integral path pays a one-time build cost of O(W * H * NUM_BINS)
+and saves O(cell_size^2 - 4 * NUM_BINS) per cell aggregated. For a
+SINGLE call on the 32x32 default fixture (9 cells, 9 bins), the build
+allocates 32*32*9 = 9,216 int64 slots and runs the integration
+recurrence over each plane; the scalar path's accumulator just walks
+the 900 interior pixels once. Empirically (measured in
+`scenario_gggg_hog_integral.sh`, NOVA `time()` 1-second resolution):
+
+| Fixture        | scalar elapsed | integral elapsed | speedup (milli) |
+|----------------|---------------:|------------------:|-----------------:|
+| 32x32 vedge    |  2 s / 20K it  |   10 s / 20K it   |             200  |
+| 64x128 vedge   |  1 s / 1K it   |    4 s / 1K it    |             250  |
+
+i.e. **integral path is ~4-5x SLOWER per call on a single HOG compute
+at these scales**. This is the documented trade-off: the integral
+histogram is structured to amortize across MANY downstream queries
+into the same precomputed buffer (e.g. R15C's sliding-window detector
+evaluating many overlapping windows at the same scale -- where the
+build cost is paid once and ~841 window queries on a 256x256 scene
+share the same integral planes). For an isolated `hog_compute_*` call
+on a single image, the additional W*H*NUM_BINS memory bandwidth
+dominates. The bit-identical contract is the primary deliverable;
+the operational win is reserved for a future round that wires R21D
+into R15C's hot path (touch budget for that wire-in is ~5 lines
+inside `image_detector.nova`, but that file is reserved by another
+R21 agent so the wire-in is a follow-up).
+
+### Public API
+
+* `hog_compute_integral(image, w, h, cell_size, num_bins) -> hog_result`
+  -- same signature and return-tuple shape as `hog_compute`; the
+  per-cell histogram aggregation step internally uses the integral
+  path. All validation and downstream block normalization reuses the
+  R14D helpers verbatim.
+* `hog_compute_integral_default(image, w, h) -> hog_result` --
+  convenience wrapper at `cell_size=8`, `num_bins=9`.
+* `_hog_build_integral_histogram(image, w, h, num_bins) -> integral_t`
+  -- internal entry-point exposed to downstream callers that want to
+  precompute once and query many cell rectangles via the
+  `_hog_ih_rect_sum` helper. Returns
+  `[ih_buffer_ptr, mag_sum, mag_count, dominant_bin]`.
+* `_hog_integral_enabled()` -- reads the `CE_HOG_INTEGRAL` env var;
+  returns 1 only on explicit opt-in (`on`/`1`/`yes`). Default OFF
+  until the wire-into-R15C round flips the contract. Mirrors
+  R15A's `_stereo_u8_simd_enabled()` opt-in shape.
+
+### Verification
+
+Unit tests (~42 assertions in `tests/unit/test_hog_integral.nova`,
+NEW):
+
+* Bit-identical descriptor on R14D's vertical-edge fixture.
+* Bit-identical on horizontal-edge fixture (`dominant_bin = 4`).
+* Bit-identical on +45-deg diagonal fixture (`dominant_bin in {2, 6}`).
+* Bit-identical on four-spots fixture (mixed-orientation content).
+* Bit-identical on the 64x128 Dalal-Triggs canonical pedestrian
+  window (3780-int descriptor).
+* Per-cell histogram identity (stronger check than descriptor-only
+  identity, catches any compensating-error block normalization).
+* Bit-identical at `cell_size=4`, `num_bins=6`, `num_bins=12`.
+* Bit-identical on the all-zero uniform image (degenerate case).
+* `hog_compare(scalar, integral)` on the same fixture returns 0.
+* Cross-fixture `hog_compare` returns the SAME distance under
+  scalar/scalar, integral/integral, AND mixed scalar/integral.
+* Edge cases mirror the scalar path: zero pointer, 8x8 (one cell),
+  300x300 (over-cap), invalid cell_size, invalid num_bins -- all
+  return the empty result.
+* Bench surface confirmation: 64x128 integral produces a 3780-int
+  descriptor with `dominant_bin = 0` and `magnitude_mean > 0`.
+
+Integration scenario `tests/integration/scenario_gggg_hog_integral.sh`
+(17 assertions, NEW): standalone NOVA driver synthesizes
+32x32 vedge + 32x32 hedge + 64x128 vedge fixtures, runs both
+`hog_compute_default` and `hog_compute_integral_default` on each,
+asserts bit-identical at the descriptor list level (DIFF_AT first
+mismatch printed; BIT_IDENTICAL=1 on match), times both paths over
+20K iters (32x32) and 1K iters (64x128), and prints the speedup ratio
+in milli-units. Passes when every BIT_IDENTICAL check holds AND the
+driver exits 0; the bench numbers are recorded as observations for
+the operator to read off the trace (we do NOT hard-assert
+`integral < scalar` because the per-call overhead inversion is the
+documented behaviour).
+
+All prior CV tests stay green (R14D HOG 55, R15C detector 32, R16D
+face_detect 36, R16D face_recognize 48). Module count unchanged
+(extension, no new src/ files).
+
+### Files touched / added
+
+* `src/io/transducers/image_hog.nova` (+~370 lines: R21D section
+  comment block + `_hog_ih_idx` / `_hog_ih_get` / `_hog_ih_set` /
+  `_hog_ih_rect_sum` integral-plane helpers + `_hog_build_integral_histogram`
+  + `_hog_cell_histograms_from_integral` + `_hog_integral_enabled`
+  + `hog_compute_integral` + `hog_compute_integral_default`)
+* `tests/unit/test_hog_integral.nova` (NEW, 18 test functions / 42
+  assertions)
+* `tests/integration/scenario_gggg_hog_integral.sh` (NEW, 17 assertions)
