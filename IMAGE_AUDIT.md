@@ -1070,6 +1070,112 @@ Yes. 34 new assertions in `tests/unit/test_lk_u8_simd.nova`:
 * `tests/unit/test_lk_u8_simd.nova` (NEW, 34 assertions)
 * `scripts/bench_simd_production.sh` (extended flow bench)
 
+## R18A.2 -- byte mul-acc SIMD wired into optical-flow LK -- 3.69x absolute speedup (closes R17C's 0.80x ceiling)
+
+R17C documented the structural mismatch that capped its u8 packed-scan
+path at 0.80x scalar on full LK: the 5 accumulator sums (Σ Ix*Ix,
+Σ Iy*Iy, Σ Ix*Iy, Σ Ix*It, Σ Iy*It) are byte * byte SIGNED mul-acc,
+NOT |a - b| SAD, so `simd_sad_u8` could not vectorize the inner
+products. R17C's only structural win was the It-load locality from
+the packed buffer; the strided Ix and Iy loads + the scalar
+accumulator math remained the per-pixel hot loop.
+
+R18A (NOVA codegen commit `db34532`) shipped the missing primitive:
+
+  `simd_mul_acc_signed_signed_byte(a_i8_ptr, b_i8_ptr, n_bytes) -> int`
+    Σ a[i] * b[i] over n bytes with BOTH operands interpreted as
+    signed i8 in [-128, 127]. AVX2 inline at the call site:
+    `vpmovsxbw` widens i8 → i16, `vpmaddwd` pair-multiplies +
+    adds adjacent i16 → i32, `vpaddd` into the running accumulator.
+    16 bytes per vector iter; scalar tail for `n % 16`. ARM64 NEON
+    via `sshll` + `smull/smull2` + `add` (8 bytes/iter, scalar
+    tail). WASM v128 via `i32x4.dot_i16x8_s`. Bit-identical to
+    scalar `Σ a[i] * b[i]` because integer add is associative.
+
+R18A.2 wires this into LK. The five accumulator sums map as:
+
+  | Sum         | Operand range            | SIMD calls         |
+  |-------------|--------------------------|--------------------|
+  | Σ Ix * Ix   | Ix in i8 [-127, 127]     | 1 (direct)         |
+  | Σ Iy * Iy   | Iy in i8                 | 1 (direct)         |
+  | Σ Ix * Iy   | Ix, Iy in i8             | 1 (direct)         |
+  | Σ Ix * It   | It in [-255, 255]        | 2 (two-piece split)|
+  | Σ Iy * It   | It in [-255, 255]        | 2 (two-piece split)|
+
+It's two-piece split: `It_lo = It / 2` (NOVA truncates toward 0,
+range [-127, 127]) and `It_hi = It - 2 * It_lo` (range {-1, 0, 1}).
+Both fit i8. Then `Σ Ix * It = 2 * Σ(Ix * It_lo) + Σ(Ix * It_hi)`
+holds cell-by-cell because `Ix * It = Ix * (2 * It_lo + It_hi) =
+2 * (Ix * It_lo) + (Ix * It_hi)`. Bit-identical to scalar.
+
+### The load-bearing optimization: image-wide gradient pre-compute
+
+A naive per-pixel staging path (compute Ix, Iy, It_lo, It_hi at each
+of the 25 window cells, then 7 SIMD calls) measured **0.67x absolute**
+on the first cut -- the 75 scalar gradient calls per pixel + the
+4 * 25 byte stores per pixel overwhelmed the SIMD reduction win for
+the small `n_cells = 25` (one vector iter + 9-byte scalar tail).
+
+The fix: pre-compute the 4 gradient i8 buffers across the WHOLE
+IMAGE in one pass before the per-pixel scan. Per-pixel staging then
+reduces to 4 buffers * `ws` rows = 20 `memcpy_raw` calls per pixel
+(R15A's pack pattern -- `rep movsb`, one byte-row at a time). This
+amortizes the 65,536 gradient calls (256 * 256 area) across all
+65,536 interior pixels instead of paying 75 per pixel. The per-pixel
+inner loop becomes 20 memcpy_raw + 7 SIMD calls + the 2x2 inverse.
+
+Measured impact: **18 ms vs 67 ms scalar = 3.69x absolute speedup**.
+
+### Measured speedup (256x256 ws=5, smooth-quadratic + h-shift-2)
+
+  | Path                                | Wallclock | Speedup vs scalar |
+  |-------------------------------------|----------:|------------------:|
+  | scalar (R10D)                       |  ~67 ms   |             1.00x |
+  | R12A i32 SIMD                       | ~368 ms   |             0.18x |
+  | R17C u8 packed-scan                 |  ~73 ms   |             0.91x |
+  | **R18A.2 mul-acc SIMD**             |  **~18 ms** | **3.69x absolute** |
+  | R18A.2 vs R17C u8                   |        -- |              4.03x |
+  | image-SAD residual scalar           | ~399 us   |             1.00x |
+  | image-SAD residual u8 SIMD per row  |  ~3.6 us  |          ~110x    |
+
+The 3.69x absolute closes R17C's 0.80x ceiling AND the R13A 1.42x /
+R12A 0.20x prior ceilings. R15A's stereo SAD wire-in landed 5.5x
+absolute; R18A.2's LK wire-in lands 3.69x absolute -- both within
+the same order, both validating the "ship primitive + wire-in in
+the next round" pattern.
+
+### Bit-identical preserved (whole-image sweep, not just summary stats)
+
+Yes. 28 new assertions in `tests/unit/test_lk_mulacc_simd.nova`:
+- `_lk_optical_flow_mulacc_inner` vs scalar `lk_optical_flow` on
+  R10D's textured h-shift-3, v-shift-2, identical-frames, and
+  high-contrast-bands (the |It| > 127 path that exercises the
+  It two-piece decomposition).
+- Whole-image-sweep test: every interior pixel's (u_milli, v_milli,
+  valid) bytes must match scalar exactly. Mismatch count == 0.
+- `lk_optical_flow_mulacc_pyramid` vs scalar `lk_optical_flow_pyramid`
+  on 8-px shift (dispatch-off route -- pyramid orchestrator IS the
+  R11A scalar code path when CE_LK_MULACC_SIMD is unset).
+- `lk_optical_flow_mulacc_perpixel` vs scalar `lk_optical_flow_pyramid_perpixel`
+  on 4-px shift (dispatch-off route).
+- Env-var dispatch (CE_LK_MULACC_SIMD unset/off -> scalar fallback).
+- Input validation: zero pointers, oversize dims rejected.
+- Bench script FAILs on any scalar vs mul-acc disagreement (mean
+  mag + valid count).
+
+### Files touched / added (R18A.2)
+
+* `src/io/transducers/image_optical_flow.nova` (+~580 lines:
+  `_lk_mulacc_simd_enabled`, `_lk_store_i8`,
+  `_lk_optical_flow_mulacc_inner` with image-wide gradient pre-
+  compute + per-pixel memcpy_raw pack + 7 SIMD calls,
+  `lk_optical_flow_mulacc_u8` public entry with env-var dispatch,
+  `lk_optical_flow_mulacc_pyramid` + `lk_optical_flow_mulacc_perpixel`
+  that route through the mul-acc inner solve at every level)
+* `tests/unit/test_lk_mulacc_simd.nova` (NEW, 28 assertions)
+* `scripts/bench_simd_production.sh` (extended flow bench with
+  mul-acc path measurement + bit-identical assertions)
+
 ## R16D -- Viola-Jones-style Haar cascade face detector (STRUCTURAL only -- see scope)
 
 **Status: complete -- new `src/io/transducers/image_face_detect.nova`

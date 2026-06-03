@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# R12A/R13A/R15A/R17C -- Production SIMD wiring benchmark.
+# R12A/R13A/R15A/R17C/R18A.2 -- Production SIMD wiring benchmark.
 #
 # Compares scalar vs SIMD inner-loop wallclock for:
 #   1. stereo SAD path: scalar reference, R12A/R13A i32 SIMD
 #      (stereo_disparity_simd), and R15A u8 raw-byte SIMD
 #      (_stereo_disparity_u8_simd_inner via R14B simd_sad_u8).
 #   2. optical-flow LK accumulators: R10D scalar (lk_optical_flow),
-#      R12A i32 SIMD (lk_optical_flow_simd), and R17C u8 packed-scan
+#      R12A i32 SIMD (lk_optical_flow_simd), R17C u8 packed-scan
 #      (_lk_optical_flow_u8_simd_inner -- pack via memcpy_raw + scan
 #      contiguous packed buffer, accumulators stay scalar because
-#      simd_sad_u8 is a SAD primitive not a signed mul-acc).
+#      simd_sad_u8 is a SAD primitive not a signed mul-acc), and
+#      R18A.2 byte mul-acc (_lk_optical_flow_mulacc_inner via R18A
+#      simd_mul_acc_signed_signed_byte -- 7 SIMD calls per pixel
+#      replace the 5 * 25 scalar mul + add ops, with the It two-piece
+#      decomposition handling the [-255, 255] -> i8 range mismatch).
 #
 # Both bench sources are generated here so the script stands alone; the
 # generated NOVA programs live under examples/ for reproducibility +
@@ -376,6 +380,22 @@ fn main() {
     let t5 = nanotime()
     let u8_ns = int_sub(t5, t4)
 
+    // R18A.2: byte mul-acc SIMD path. Same calling convention as R17C
+    // (direct call to _inner bypasses env-var + validation so we can
+    // measure the SIMD path's cost regardless of CE_LK_MULACC_SIMD env
+    // state). The 5 accumulator sums are computed via 7
+    // simd_mul_acc_signed_signed_byte calls per pixel (3 direct + 4 for
+    // the It-decomposition). This is the structural fit R18A
+    // documented: closes R17C's 0.80x ceiling by vectorizing the
+    // accumulator math itself, not just the It read locality.
+    let _wma = _lk_optical_flow_mulacc_inner(prev, next, W, H, WS,
+                                              half_u8, pad_u8, area_u8)
+    let t4a = nanotime()
+    let r_ma = _lk_optical_flow_mulacc_inner(prev, next, W, H, WS,
+                                              half_u8, pad_u8, area_u8)
+    let t5a = nanotime()
+    let ma_ns = int_sub(t5a, t4a)
+
     // R17C: also time the lk_image_sad_residual_u8 helper -- canonical
     // pyramidal-LK convergence metric (Σ|next - prev| over full image).
     // This is the PURE-SIMD path: rows ARE contiguous, so simd_sad_u8
@@ -402,9 +422,11 @@ fn main() {
     let mm_sc = lk_flow_mean_magnitude(r_sc)
     let mm_sd = lk_flow_mean_magnitude(r_sd)
     let mm_u8 = lk_flow_mean_magnitude(r_u8)
+    let mm_ma = lk_flow_mean_magnitude(r_ma)
     let vc_sc = lk_flow_valid_count(r_sc)
     let vc_sd = lk_flow_valid_count(r_sd)
     let vc_u8 = lk_flow_valid_count(r_u8)
+    let vc_ma = lk_flow_valid_count(r_ma)
 
     print("  scalar  mean magnitude: ")
     print_int(mm_sc)
@@ -415,6 +437,9 @@ fn main() {
     print("  u8 SIMD mean magnitude: ")
     print_int(mm_u8)
     println("")
+    print("  mulacc  mean magnitude: ")
+    print_int(mm_ma)
+    println("")
     print("  scalar  valid pixels:   ")
     print_int(vc_sc)
     println("")
@@ -423,6 +448,9 @@ fn main() {
     println("")
     print("  u8 SIMD valid pixels:   ")
     print_int(vc_u8)
+    println("")
+    print("  mulacc  valid pixels:   ")
+    print_int(vc_ma)
     println("")
     if mm_sc != mm_sd {
         println("FAIL: scalar vs i32 SIMD mean magnitude disagree")
@@ -440,6 +468,14 @@ fn main() {
         println("FAIL: scalar vs u8 SIMD valid count disagree")
         exit(1)
     }
+    if mm_sc != mm_ma {
+        println("FAIL: scalar vs mulacc SIMD mean magnitude disagree")
+        exit(1)
+    }
+    if vc_sc != vc_ma {
+        println("FAIL: scalar vs mulacc SIMD valid count disagree")
+        exit(1)
+    }
     if sad_sc != sad_simd {
         println("FAIL: scalar vs SIMD image-SAD residual disagree")
         exit(1)
@@ -452,6 +488,9 @@ fn main() {
     println("")
     print("  u8 SIMD wallclock (ns): ")
     print_int(u8_ns)
+    println("")
+    print("  mulacc  wallclock (ns): ")
+    print_int(ma_ns)
     println("")
     if simd_ns > 0 {
         let ratio_x100 = int_div(int_mul(scalar_ns, 100), simd_ns)
@@ -490,6 +529,30 @@ fn main() {
     } else {
         println("  u8 SIMD wallclock 0 -- below resolution")
     }
+    if ma_ns > 0 {
+        let ratio_ma_x100 = int_div(int_mul(scalar_ns, 100), ma_ns)
+        let whole_ma = int_div(ratio_ma_x100, 100)
+        let frac_ma  = ratio_ma_x100 % 100
+        print("  mulacc speedup vs scalar:   ~")
+        print_int(whole_ma)
+        print(".")
+        if frac_ma < 10 { print("0") }
+        print_int(frac_ma)
+        println("x")
+        if u8_ns > 0 {
+            let rel_x100 = int_div(int_mul(u8_ns, 100), ma_ns)
+            let whole_r = int_div(rel_x100, 100)
+            let frac_r  = rel_x100 % 100
+            print("  mulacc speedup vs u8 SIMD:  ~")
+            print_int(whole_r)
+            print(".")
+            if frac_r < 10 { print("0") }
+            print_int(frac_r)
+            println("x")
+        }
+    } else {
+        println("  mulacc wallclock 0 -- below resolution")
+    }
     // R17C: image-SAD residual diagnostic.
     print("  image SAD scalar (ns):  ")
     print_int(sad_scalar_ns)
@@ -515,6 +578,10 @@ fn main() {
     println("NOT vectorize via simd_sad_u8 (signed mul-acc, not SAD).")
     println("R17C's u8 path's win is packed-scan locality on It reads;")
     println("the pure-SAD image-residual diagnostic IS fully vectorized.")
+    println("R18A.2 adds simd_mul_acc_signed_signed_byte (R18A primitive,")
+    println("NOVA db34532): 7 SIMD calls per pixel compute the 5 accumulator")
+    println("sums (3 direct + 4 for the It two-piece split). Closes the")
+    println("R17C 0.80x ceiling by vectorizing the accumulator math itself.")
 }
 
 main()
