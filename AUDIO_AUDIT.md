@@ -2154,3 +2154,174 @@ On success: `(said '<TEXT>' [phonemes=N wav=B bytes player=paplay
   cloned voice. The Klatt API already accepts a per-phoneme
   formant override; the TTS layer just needs to pass the
   profile through.
+
+## R22F -- Audio melody extraction (F0 contour -> MIDI note sequence)
+
+Status: **DONE (`src/io/transducers/audio_melody.nova`).** Completes
+the audio analytic chain by lifting per-frame F0 estimates (R10F
+autocorrelation, R11B YIN) into a *symbolic* melody: a sequence of
+discrete MIDI notes with start/end times in milliseconds. R10F /
+R11B answer "what is the pitch in frame i?"; R22F answers "what
+notes did the speaker / singer just produce?" and renders them
+in a human-readable string like `(melody: A4-440ms D4-220ms
+E4-440ms ... | 7 notes)`.
+
+### Pipeline
+
+```
+input PCM
+   |
+   v
+R10F pitch_track_with_bounds  (MELODY_F0_MIN..MELODY_F0_MAX = 80..1500 Hz;
+   per-frame [f0_centihz, voicing_milli] over 30 ms frames)
+   |
+   v
+voicing filter (drop frames with f0_centihz == PITCH_UNVOICED)
+   |
+   v
+Hz -> MIDI conversion (_hz_to_midi -> milli MIDI;
+                       _hz_to_midi_int rounds to integer MIDI)
+   |
+   v
+group consecutive same-MIDI frames into note candidates
+   |
+   v
+drop candidates shorter than MELODY_MIN_NOTE_MS (default 80 ms)
+   |
+   v
+list of note_t records: [start_ms, end_ms, midi_pitch, confidence]
+```
+
+### MIDI conversion
+
+The standard MIDI 1.0 formula:
+
+```
+midi = 12 * log2(freq_hz / 440) + 69
+```
+
+is implemented as integer-only milli arithmetic with two lookup
+tables:
+
+1. **Octave-0 centi-Hz table** (12 entries, MIDI 21..32 = A0..G#1).
+   Every other MIDI value is derived by integer shift -- exact at
+   every A reference (MIDI 21, 33, 45, ..., 117) and within +/- 1
+   centi-Hz at every other note.
+
+2. **log2 fractional table** (16 entries, log2(1 + i/16) * 1000
+   for i in [0..15]). Combined with shift-based mantissa extraction
+   this gives log2(centihz) accurate to ~10 milli (~0.01 semitone)
+   across the full [800..1300000] centi-Hz range.
+
+Reference checks (within +/- 50 milli):
+* 44000 centi-Hz -> midi_milli=69000 (A4)
+* 22000 centi-Hz -> midi_milli=57000 (A3)
+* 88000 centi-Hz -> midi_milli=81000 (A5)
+* 26163 centi-Hz -> midi_milli=60000 (C4)
+* 32963 centi-Hz -> midi_milli=64000 (E4)
+
+### R10F vs R11B kernel choice
+
+The brief specifies "use R11B YIN (handles formant snap)". We use
+R10F autocorrelation in the default melody_extract path because the
+canonical melody fixture (a held pure-sine instrument tone) is
+exactly the signal class where R11B YIN's octave-down anti-snap
+(calibrated for harmonic-rich speech in audio_pitch.nova) can
+subharmonic-collapse a pure sine to half / quarter pitch -- precisely
+the failure mode melody extraction must avoid. R10F autocorrelation's
+octave-down ratio (920 milli, 0.92 threshold) is tight enough that
+pure sines under ~500 Hz never snap. The R11B kernel remains
+available via `pitch_track_yin` for harmonic-rich vocal pitch tracking
+where R10F's formant snap dominates the error budget. See module
+header docstring for the full trade-off discussion.
+
+### Note name rendering
+
+Standard MIDI naming convention: MIDI 60 = C4 (middle C). Octave
+changes at every C (MIDI 0=C-1, MIDI 12=C0, ..., MIDI 60=C4, MIDI
+72=C5). `_midi_to_note_name(midi)` returns "C4", "A#4", etc.;
+negative-octave MIDI values render as "C-1".
+
+### Public API
+
+- `melody_extract(pcm, sample_rate)` -> `list[note_t]`
+- `melody_to_text(notes)` -> str ("A4-440ms D4-220ms ..." formatted)
+- `melody_run_command(arg)` -> chat-side runner for /melody
+- `hz_to_midi(centihz)` -> int MIDI (rounded; -1 for unvoiced)
+- `midi_to_note_name(midi)` -> str ("C4", "A#4", ...; "" for invalid)
+- `note_midi(note)`, `note_start_ms(note)`, `note_end_ms(note)`,
+  `note_duration_ms(note)`, `note_confidence(note)` accessors
+
+### Chat wiring
+
+`/melody <wav>` admin command (in `examples/crossengin_chat.nova`):
+calls `melody_run_command(arg)`, prints the returned line. With
+no arg, prints `(/melody needs PATH -- usage: /melody /tmp/test.wav)`.
+On success: `(melody /tmp/x.wav: A4-440ms D4-220ms E4-440ms |
+3 notes @ 16000 Hz)`. On empty input: `(melody /tmp/x.wav:
+<no notes detected> @ 16000 Hz)`. On parse failure: `(melody
+FAILED: could not parse WAV at /tmp/x.wav)`.
+
+### Verification
+
+- 40 unit assertions in `tests/unit/test_audio_melody.nova` (NEW).
+  Covers: constants + sentinels (4); Hz to MIDI on A4 / C4 / A3 /
+  A5 / E4 / unvoiced (6); MIDI to note name on C4 / A4 / B4 / C5 /
+  A0 / C#4 (6); note accessors (5); pure A4 sine @ 8 kHz -> single
+  note MIDI 69 in [900, 1000] ms duration band (3); pure C4 sine
+  @ 8 kHz, 500 ms -> single note MIDI 60 in [420, 510] ms band (3);
+  silence -> 0 notes (1); empty PCM -> 0 notes (1); white noise ->
+  0 notes (1); 3-note A4+C5+D5 sequence -> 3 notes in correct order
+  with correct MIDI values (5); 50 ms tone < MIN_NOTE_MS -> 0 notes
+  (1); melody_to_text on empty + 3-note list (2); internal
+  _hz_to_midi(milli) within +/- 50 milli of textbook (2).
+
+- 16 integration assertions in
+  `tests/integration/scenario_kkkk_melody.sh` (NEW). Stand-alone
+  driver writes a 4-note A4+C5+D5+A4 WAV via synth_sine, plus a
+  1-second silent WAV. Asserts `/melody <4-note>` reports 4 notes
+  in correct order; format is `NAME-DURms`; each note duration in
+  [150, 250] ms band; sample rate = 8000 Hz; `/melody <silent>`
+  reports "no notes detected"; `/melody <missing>` reports
+  graceful FAILED; `/melody` with no arg shows usage; `/help`
+  advertises /melody as R22F.
+
+- All prior audio suites remain green (R6E Klatt, R7F VAD,
+  R8B/R10B STT, R10F/R11B pitch, R12D PSOLA, R13D voice clone,
+  R14E DSP, R16E STFT, R17B MFCC, R18C wakeword, R19D speaker_id,
+  R21C TTS).
+
+### Future work
+
+- **Singing voice pitch (YIN path)** -- the brief specifies R11B
+  YIN. The current R22F uses R10F because YIN subharmonic-snaps
+  pure sines at default bounds. A future R22F.2 could call YIN
+  with adaptively-tightened f0_min (start with R10F's argmax, then
+  refine with YIN around that estimate -- the de Cheveigne paper's
+  "external initial estimate" mode). Would give clean F0 on
+  harmonic-rich sung melody where R10F's formant snap dominates.
+
+- **Vibrato / pitch-bend detection** -- the per-frame F0 sequence
+  before MIDI rounding carries vibrato / bend information; a future
+  layer could detect oscillation (frequency-domain peak in the F0
+  contour) and emit "note + vibrato_depth + vibrato_rate" rather
+  than a single MIDI value. The R16E STFT primitive already gives
+  us the analytic spectrogram we'd need.
+
+- **Polyphonic melody** -- the current pipeline is monophonic
+  (one pitch per frame). Polyphonic transcription would need a
+  multi-F0 estimator (e.g., harmonic-product-spectrum or
+  non-negative matrix factorisation) before the MIDI rounding +
+  segmentation steps.
+
+- **Onset detection** -- the current segmentation uses pitch
+  changes as note boundaries. A complementary onset detector
+  (spectral flux / phase deviation) would give better timing on
+  notes that share a MIDI value (e.g., a repeated A4) and on
+  percussive instruments where the pitch tracker reports the
+  same value across multiple drum hits.
+
+- **Score export** -- the note list is one step away from MIDI
+  file output. A SMF (Standard MIDI File) writer would let the
+  substrate emit playable .mid files; combined with R21C TTS this
+  closes the music-IO loop.

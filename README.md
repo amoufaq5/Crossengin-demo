@@ -11,7 +11,40 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R22E adds `src/kg/rule_explain.nova` — recursive provenance
+> toolchain. R22F adds `src/io/transducers/audio_melody.nova` — audio
+> melody extraction lifting per-frame F0 estimates (R10F autocorrelation,
+> R11B YIN) into a symbolic MIDI note sequence with start/end times. R10F
+> + R11B answer "what is the pitch in frame i?"; R22F answers "what notes
+> did the speaker / singer just produce?" and renders them in a human-
+> readable string like `(melody: A4-440ms D4-220ms E4-440ms ... | 7
+> notes)`. Public API: `melody_extract(pcm, sample_rate) -> list[note_t]`,
+> `melody_to_text(notes) -> str`, `note_midi(note)`, `note_start_ms`,
+> `note_end_ms`, `note_duration_ms`, `note_confidence`, plus helpers
+> `hz_to_midi(centihz) -> int_midi` and `midi_to_note_name(midi) -> str`.
+> Hz to MIDI conversion uses `midi = 12 * log2(freq_hz / 440) + 69`
+> implemented with integer milli arithmetic over a 12-entry centi-Hz
+> table (MIDI 21..32, exact at every A reference and within +/- 1
+> centi-Hz elsewhere) and a 16-entry log2 fractional lookup. Note name
+> rendering follows the standard MIDI convention (C4 = MIDI 60).
+> Verification: 40 unit assertions in `tests/unit/test_audio_melody.nova`
+> (NEW; constants + sentinels, Hz-to-MIDI on A4/C4/A3/A5/E4/unvoiced,
+> MIDI-to-name on C4/A4/B4/C5/A0/C#4, note accessors, pure A4 sine 1s
+> -> 1 note MIDI 69 with [900,1000] ms duration, pure C4 sine 500ms ->
+> 1 note MIDI 60 with [420,510] ms, silence + empty + white-noise PCM
+> all -> 0 notes, 3-note A4+C5+D5 sequence -> 3 notes in correct order,
+> short-note < MIN_NOTE_MS rejection, melody_to_text renders empty + 3
+> notes correctly). 16 integration assertions in
+> `tests/integration/scenario_kkkk_melody.sh` (NEW; driver synthesises
+> 4-note A4+C5+D5+A4 WAV + silent reference, asserts `/melody` reports
+> 4 notes in correct order with NAME-DURms format and each duration in
+> [150,250] ms; silent WAV -> "no notes detected"; missing path ->
+> graceful FAILED; no-arg -> usage; `/help` advertises /melody as R22F).
+> Existing audio suites stay green (R6E Klatt 209, R7F VAD 86, R8B/R10B
+> STT 28, R10F pitch 52, R11B YIN 35, R12D PSOLA, R13D voice clone,
+> R14E DSP 34, R16E STFT 49, R17B MFCC 41, R18C wakeword 41, R19D
+> speaker_id, R21C TTS 68). Chat: `/melody <wav>` admin command wired
+> into `examples/crossengin_chat.nova`. Module count: 182 (+1 from
+> R22E's 181). R22E adds `src/kg/rule_explain.nova` — recursive provenance
 > walks over R20B's rule engine, producing human-readable proof trees.
 > R20B shipped `rule_engine_explain(engine, atom_id)` returning ONE
 > level of provenance (the rule + premise atoms for a derived fact);

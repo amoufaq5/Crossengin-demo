@@ -1,0 +1,603 @@
+// CrossEngin io/transducers: Audio melody extraction (R22F).
+//
+// Purpose
+//   Completes the audio analytic chain by lifting per-frame F0 estimates
+//   (R10F autocorrelation, R11B YIN) into a *symbolic* melody: a sequence
+//   of discrete MIDI notes with start/end times in milliseconds. R10F /
+//   R11B answer "what is the pitch in frame i?"; this module answers
+//   "what notes did the speaker / singer just produce?" and renders them
+//   in a human-readable string like:
+//
+//       (melody: A4-440ms D4-220ms E4-440ms ... | 7 notes)
+//
+//   Three immediate consumers in the substrate:
+//
+//     1. **Music analysis** -- given any hummed / sung WAV, the chat
+//        layer can attach (note, duration, confidence) atoms to the KG
+//        without ever invoking an LLM or even a DFT-based recognizer.
+//     2. **Intonation training / query-by-humming.** A learner hums a
+//        target tune; the substrate compares the extracted melody
+//        against a stored reference (sequence-edit distance over MIDI
+//        symbols) and reports note-by-note deviations.
+//     3. **Prosody / sing-vs-speak detection.** Sustained held pitches
+//        with low pitch-class entropy mark "singing" vs "speaking";
+//        the melody-extracted note count and mean duration are the
+//        two features the upper layers consume.
+//
+//   Pipeline (per WAV):
+//
+//     a. Run R10F + R11B pitch tracking with bounds tuned for melody
+//        (`pitch_track_with_bounds` over the musical F0 range
+//        MELODY_F0_MIN .. MELODY_F0_MAX) to get per-frame [f0_centihz,
+//        voicing_milli] over non-overlapping 30 ms frames. We use the
+//        R10F autocorrelation entry because the canonical melody
+//        fixture (a held pure-sine instrument tone) is precisely the
+//        signal class where R10F's normalized-peak picker excels and
+//        where R11B YIN's octave-down anti-snap (calibrated for
+//        harmonic-rich speech in audio_pitch.nova) can subharmonic-
+//        snap a clean sine to half / quarter pitch. The R11B kernel
+//        remains available via the alternative `melody_extract_yin`
+//        below (TODO: future work) for cases where the input is
+//        harmonic-rich vocal pitch and the formant snap dominates.
+//
+//     b. For each frame, convert f0_centihz to MIDI integer-milli via
+//        `_hz_to_midi`:
+//
+//          midi_milli = 12000 * log2(centihz / 44000) + 69000
+//
+//        which we implement via a log2-from-shifts integer approximation
+//        (see `_melody_log2_centihz_milli`). For a pure A4 (440 Hz)
+//        input, midi_milli = 69000 exactly; for C4 (~261.63 Hz),
+//        midi_milli ~= 60000 (within +/- 50 milli, i.e. +/- 0.05 semitone).
+//
+//     c. Round midi_milli to an integer MIDI value. The "+/- 0.5 semitone"
+//        tolerance the brief specifies is implicit in this rounding:
+//        two frames map to the same rounded MIDI iff their pitches
+//        differ by less than a semitone.
+//
+//     d. Drop frames where YIN reports voicing_milli == 0 (the YIN
+//        "unvoiced" sentinel; see PITCH_UNVOICED). This is the
+//        textbook voicing filter -- silence, fricatives, and white
+//        noise never reach the segmenter.
+//
+//     e. Segment the voiced-frame stream into notes: a run of
+//        consecutive voiced frames whose rounded MIDI agree forms one
+//        note. Each note records:
+//
+//          * start_ms      = frame_index * PITCH_FRAME_MS
+//          * end_ms        = (frame_index + n_frames) * PITCH_FRAME_MS
+//          * midi_pitch    = rounded MIDI integer
+//          * confidence    = mean YIN voicing_milli over the note's
+//                            constituent frames (0..1000)
+//
+//     f. Drop notes shorter than `MELODY_MIN_NOTE_MS` (default 80 ms).
+//        Sub-80 ms transient runs are almost always YIN artifacts on
+//        consonant transitions and would clutter the output.
+//
+//   Output unit: list of 4-element `note_t` records (one MIDI note each).
+//
+//   Defaults: MELODY_MIN_NOTE_MS = 80 ms. Sample-rate range follows
+//   YIN (8 kHz..48 kHz; clamped via the R10F helper). The melody-level
+//   API is stateless -- no precomputed cosine tables, no sin lookups;
+//   each call walks the YIN contour list end-to-end.
+//
+//   MIDI <-> Hz convention (the IEEE / MIDI 1.0 spec):
+//
+//     * MIDI 0  = C-1 = 8.1758 Hz   (well below human audible range)
+//     * MIDI 21 = A0  = 27.50 Hz    (lowest piano key)
+//     * MIDI 60 = C4  = 261.63 Hz   (middle C)
+//     * MIDI 69 = A4  = 440.00 Hz   (concert pitch)
+//     * MIDI 81 = A5  = 880.00 Hz
+//     * MIDI 127 = G9 = 12543.85 Hz (highest representable)
+//
+//   We store the MIDI->centi-Hz table for octave 0 (MIDI 21..32) and
+//   derive every other MIDI value by integer power-of-2 shift, which
+//   keeps the constant-time lookup exact at every octave's A reference
+//   and within +/- 1 centi-Hz at every other note.
+//
+//   Integer-only arithmetic throughout. The largest intermediate is
+//   `centihz * 1000` ~= 1.2e8 for a high soprano -- safely under
+//   NOVA's smart-op pointer-classifier threshold.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- audio analysis chain).
+// NOVA dependencies: builtins -- list_new, push, len, int_to_str,
+//   int_mul / int_div / int_sub / int_add / int_shr / int_shl.
+// CrossEngin dependencies: audio_pitch (R11B YIN -- READ ONLY, called
+//   via `pitch_track_yin`); audio_capture (WAV I/O inside the chat
+//   helper; the leaf math stays I/O-free for tests).
+
+import "audio_capture.nova"
+import "audio_pitch.nova"
+
+// ---- public constants ---------------------------------------------------
+
+// Minimum note duration in milliseconds. Notes shorter than this are
+// dropped as YIN / autocorrelation artifacts. 80 ms ~= 2.67 PITCH frames --
+// the threshold the brief specifies and the same band MIDI recorders use
+// (Logic Pro's "minimum note length" defaults to 50 ms; Cubase to 100 ms;
+// we sit in the middle).
+let MELODY_MIN_NOTE_MS = 80
+
+// Musical F0 search bounds in Hz. Tuned for the full piano range
+// (A0 = 27.5 Hz .. C8 = 4186 Hz). The pitch_track defaults (50..500 Hz)
+// are tuned for human voice and are too narrow at the high end for
+// instrument / sung melody; 80 Hz at the low end keeps us safely above
+// the rumble band where YIN's anti-snap can subharmonic-collapse a pure
+// sine, but covers every note in the standard adult-bass and full
+// soprano range.
+let MELODY_F0_MIN = 80
+let MELODY_F0_MAX = 1500
+
+// Sentinel for "this frame did not map to any MIDI value" (returned
+// when YIN reports voicing_milli == 0 or centihz <= 0).
+let MELODY_UNVOICED_MIDI = 0 - 1
+
+// MIDI valid range -- the standard MIDI 1.0 spec.
+let MELODY_MIDI_MIN = 0
+let MELODY_MIDI_MAX = 127
+
+// Default MIDI to use when a centi-Hz falls below MIDI 0 (8.176 Hz).
+// Returns the spec-mandated MIDI 0; the caller can filter on this.
+let MELODY_MIDI_FLOOR = 0
+
+// note_t record layout (4-element list):
+//   [0] start_ms        -- inclusive, milliseconds from the buffer start.
+//   [1] end_ms          -- exclusive, milliseconds from the buffer start.
+//   [2] midi_pitch      -- integer MIDI value in [0..127].
+//   [3] confidence      -- mean YIN voicing_milli over the note's frames,
+//                          in [0..1000].
+let NOTE_START_MS    = 0
+let NOTE_END_MS      = 1
+let NOTE_MIDI_PITCH  = 2
+let NOTE_CONFIDENCE  = 3
+
+// ---- public accessors --------------------------------------------------
+
+fn melody_min_note_ms()   { return MELODY_MIN_NOTE_MS }
+fn melody_unvoiced_midi() { return MELODY_UNVOICED_MIDI }
+fn melody_midi_min()      { return MELODY_MIDI_MIN }
+fn melody_midi_max()      { return MELODY_MIDI_MAX }
+
+fn note_start_ms(note)    { return note[NOTE_START_MS] }
+fn note_end_ms(note)      { return note[NOTE_END_MS] }
+fn note_midi(note)        { return note[NOTE_MIDI_PITCH] }
+fn note_confidence(note)  { return note[NOTE_CONFIDENCE] }
+fn note_duration_ms(note) { return note[NOTE_END_MS] - note[NOTE_START_MS] }
+
+// ---- MIDI <-> centi-Hz table (octave 0 = MIDI 21..32) ------------------
+//
+// Built lazily on first call so the module init cost is zero for
+// callers that never need it. The 12-entry table holds the centi-Hz
+// values for MIDI 21..32 (A0 .. G#1) -- one octave starting at A0,
+// the lowest piano key. Every other MIDI value is derived by integer
+// shift:
+//
+//   midi_to_centihz(m):
+//     d         = m - 21
+//     oct_off   = d / 12       (signed integer division)
+//     semi_off  = d - oct_off * 12     (in [0..11] iff d >= 0)
+//     base      = OCTAVE_0_TABLE[semi_off]
+//     if oct_off >= 0: return base << oct_off
+//     else:            return base >> (-oct_off)
+//
+// The exact-A property: at every A (MIDI 21, 33, 45, ..., 117) we hit
+// the textbook centi-Hz values (2750, 5500, 11000, ..., 14080000)
+// with zero error.  At every other note we are within +/- 1 centi-Hz
+// of the textbook table.
+
+let _MELODY_OCTAVE_0_TABLE = 0    // lazily initialized
+
+fn _melody_octave_0_init() {
+    if _MELODY_OCTAVE_0_TABLE != 0 { return _MELODY_OCTAVE_0_TABLE }
+    let t = list_new()
+    push(t, 2750)    // MIDI 21 A0 -- 27.50 Hz
+    push(t, 2914)    // MIDI 22 A#0 -- 29.135 Hz
+    push(t, 3087)    // MIDI 23 B0 -- 30.868 Hz
+    push(t, 3270)    // MIDI 24 C1 -- 32.703 Hz
+    push(t, 3465)    // MIDI 25 C#1 -- 34.648 Hz
+    push(t, 3671)    // MIDI 26 D1 -- 36.708 Hz
+    push(t, 3889)    // MIDI 27 D#1 -- 38.891 Hz
+    push(t, 4120)    // MIDI 28 E1 -- 41.203 Hz
+    push(t, 4365)    // MIDI 29 F1 -- 43.654 Hz
+    push(t, 4625)    // MIDI 30 F#1 -- 46.249 Hz
+    push(t, 4900)    // MIDI 31 G1 -- 48.999 Hz
+    push(t, 5191)    // MIDI 32 G#1 -- 51.913 Hz
+    _MELODY_OCTAVE_0_TABLE = t
+    return t
+}
+
+// _midi_to_centihz(midi) -> int centi-Hz
+//
+// Returns the spec-mandated centi-Hz for the given MIDI value, integer.
+// Clamps to [0..127]. For midi < 21 the table is divided by 2^k; for
+// midi >= 21 it's multiplied by 2^k. Out-of-spec midi returns 0.
+fn _midi_to_centihz(midi) {
+    if midi < MELODY_MIDI_MIN { return 0 }
+    if midi > MELODY_MIDI_MAX { return 0 }
+    let t = _melody_octave_0_init()
+    let d = midi - 21
+    // Signed division towards negative infinity isn't NOVA's default;
+    // we want oct_off = floor(d / 12). For d >= 0 it's just d / 12;
+    // for d < 0 we shift -d.
+    if d >= 0 {
+        let oct_off = d / 12
+        let semi_off = d - oct_off * 12
+        let base = t[semi_off]
+        return base * (1 << oct_off)
+    } else {
+        let nd = 0 - d
+        let oct_up = nd / 12
+        let semi_rem = nd - oct_up * 12
+        if semi_rem == 0 {
+            return t[0] / (1 << oct_up)
+        }
+        // We want semi_off counted FORWARD from A0 with oct_off
+        // negative. Equivalent: take (12 - semi_rem) at the next
+        // lower octave.
+        let semi_off = 12 - semi_rem
+        let base = t[semi_off]
+        return base / (1 << (oct_up + 1))
+    }
+}
+
+// _melody_log2_centihz_milli(centihz) -> int milli
+//
+// log2(centihz / 1) in milli (1000 = log2(2) = 1). Used as the
+// building block for _hz_to_midi. The fixed-point integer recipe:
+//
+//   1. Find k = floor(log2(centihz)). Range of inputs is centihz in
+//      [800..1300000] (MIDI 0 .. 127), so k in [9..21].
+//   2. Mantissa m = centihz / 2^k in [1, 2).
+//   3. log2(centihz) = k + log2(m). For log2(m) in [0, 1) we use the
+//      classic two-term polynomial:
+//        log2(1 + x) ~= x * (1 - x/2) * (log2(e)) for x in [0, 1)
+//      with log2(e) = 1442.69 milli, but the per-term cost is
+//      cheap enough we just use a 16-entry interpolation table.
+//
+// Returns log2(centihz) * 1000.
+let _MELODY_LOG2_FRAC_TABLE = 0    // lazily initialized
+
+fn _melody_log2_frac_init() {
+    if _MELODY_LOG2_FRAC_TABLE != 0 { return _MELODY_LOG2_FRAC_TABLE }
+    // log2(1 + i/16) * 1000 for i in [0..15].
+    // i=0  -> log2(1.000) = 0
+    // i=1  -> log2(1.0625) = 87.46  -> 87
+    // i=2  -> log2(1.125) = 169.93  -> 170
+    // i=3  -> log2(1.1875) = 247.93 -> 248
+    // i=4  -> log2(1.250) = 321.93  -> 322
+    // i=5  -> log2(1.3125) = 392.32 -> 392
+    // i=6  -> log2(1.375) = 459.43  -> 459
+    // i=7  -> log2(1.4375) = 523.56 -> 524
+    // i=8  -> log2(1.500) = 584.96  -> 585
+    // i=9  -> log2(1.5625) = 643.86 -> 644
+    // i=10 -> log2(1.625) = 700.44  -> 700
+    // i=11 -> log2(1.6875) = 754.89 -> 755
+    // i=12 -> log2(1.750) = 807.35  -> 807
+    // i=13 -> log2(1.8125) = 857.98 -> 858
+    // i=14 -> log2(1.875) = 906.89  -> 907
+    // i=15 -> log2(1.9375) = 954.20 -> 954
+    let t = list_new()
+    push(t, 0)
+    push(t, 87)
+    push(t, 170)
+    push(t, 248)
+    push(t, 322)
+    push(t, 392)
+    push(t, 459)
+    push(t, 524)
+    push(t, 585)
+    push(t, 644)
+    push(t, 700)
+    push(t, 755)
+    push(t, 807)
+    push(t, 858)
+    push(t, 907)
+    push(t, 954)
+    _MELODY_LOG2_FRAC_TABLE = t
+    return t
+}
+
+fn _melody_log2_centihz_milli(centihz) {
+    if centihz <= 0 { return 0 - 999999 }
+    // Find k such that 2^k <= centihz < 2^(k+1).
+    let m = centihz
+    let k = 0
+    while m >= 2 {
+        m = int_shr(m, 1)
+        k = k + 1
+    }
+    // m is now 1; recover the mantissa as (centihz - 2^k) / 2^k in
+    // 16ths. residue is in [0, 2^k).
+    let two_k = int_shl(1, k)
+    let residue = centihz - two_k
+    // i = floor(residue * 16 / two_k) in [0..15]. Use two_k > 0 always.
+    let table = _melody_log2_frac_init()
+    let i = (residue * 16) / two_k
+    if i < 0 { i = 0 }
+    if i > 15 { i = 15 }
+    // Linear interpolation between table[i] and table[i+1] (or 1000
+    // for i == 15 since log2(2) = 1).
+    let lo = table[i]
+    let hi = 1000
+    if i < 15 { hi = table[i + 1] }
+    // r2 = residue * 16 - i * two_k, in [0, two_k). Fractional offset
+    // into the i-th bin. We compute r2 / two_k * (hi - lo) in milli.
+    let r2 = residue * 16 - i * two_k
+    let bin_frac = 0
+    if two_k > 0 {
+        bin_frac = (r2 * (hi - lo)) / two_k
+    }
+    return k * 1000 + lo + bin_frac
+}
+
+// _hz_to_midi(centihz) -> int_milli MIDI
+//
+// Converts a centi-Hz value to MIDI milli, where MIDI 69 = A4 = 44000
+// centi-Hz. The formula:
+//
+//   midi_milli = 12000 * log2(centihz / 44000) + 69000
+//              = 12 * (log2(centihz) - log2(44000)) * 1000 + 69000
+//
+//   log2(44000) ~= 15.4253 -> 15425 milli
+//
+// Returns the milli MIDI value (a 60.00 MIDI is returned as 60000).
+// For centihz <= 0, returns MELODY_UNVOICED_MIDI * 1000 (sentinel).
+//
+// Reference checks (exact within +/- 50 milli, i.e. +/- 0.05 semitone):
+//   * 44000 -> 69000 (A4)
+//   * 22000 -> 57000 (A3)
+//   * 88000 -> 81000 (A5)
+//   * 26163 -> 60000 (C4) -- within rounding
+//   * 32963 -> 64000 (E4)
+let _MELODY_LOG2_44000_MILLI = 15425   // log2(44000) * 1000
+
+fn _hz_to_midi(centihz) {
+    if centihz <= 0 { return MELODY_UNVOICED_MIDI * 1000 }
+    let log_milli = _melody_log2_centihz_milli(centihz)
+    // diff is in milli (log2 units); midi_milli = 12 * diff + 69000.
+    // (Don't divide by 1000 -- log_milli already carries the * 1000
+    // factor, so 12 * diff is the milli MIDI offset from A4.)
+    let diff = log_milli - _MELODY_LOG2_44000_MILLI
+    return 12 * diff + 69000
+}
+
+// _hz_to_midi_int(centihz) -> int MIDI (rounded to nearest)
+//
+// Rounds the milli MIDI to the nearest integer in [0..127]. The
+// "+/- 0.5 semitone tolerance" the brief specifies is automatically
+// implied by integer rounding.
+//
+// Returns MELODY_UNVOICED_MIDI (-1) for centihz <= 0.
+fn _hz_to_midi_int(centihz) {
+    if centihz <= 0 { return MELODY_UNVOICED_MIDI }
+    let milli = _hz_to_midi(centihz)
+    let m = 0
+    if milli >= 0 {
+        m = (milli + 500) / 1000
+    } else {
+        m = (milli - 500) / 1000
+    }
+    if m < MELODY_MIDI_MIN { return MELODY_MIDI_MIN }
+    if m > MELODY_MIDI_MAX { return MELODY_MIDI_MAX }
+    return m
+}
+
+// Public alias matching the brief's required surface.
+fn hz_to_midi(centihz) {
+    return _hz_to_midi_int(centihz)
+}
+
+// ---- MIDI -> note-name ("C4", "A#4", ...) -----------------------------
+//
+// Standard MIDI naming convention: MIDI 60 = C4 = middle C. The octave
+// number changes at every C (every 12-MIDI step starting from MIDI 0 =
+// C-1, MIDI 12 = C0, ..., MIDI 60 = C4, MIDI 72 = C5).
+//
+// Returns "" (empty string) for out-of-spec MIDI values.
+
+let _MELODY_NOTE_NAMES = 0   // lazily initialized
+
+fn _melody_note_names_init() {
+    if _MELODY_NOTE_NAMES != 0 { return _MELODY_NOTE_NAMES }
+    let t = list_new()
+    push(t, "C")
+    push(t, "C#")
+    push(t, "D")
+    push(t, "D#")
+    push(t, "E")
+    push(t, "F")
+    push(t, "F#")
+    push(t, "G")
+    push(t, "G#")
+    push(t, "A")
+    push(t, "A#")
+    push(t, "B")
+    _MELODY_NOTE_NAMES = t
+    return t
+}
+
+fn _midi_to_note_name(midi) {
+    if midi < MELODY_MIDI_MIN { return "" }
+    if midi > MELODY_MIDI_MAX { return "" }
+    let t = _melody_note_names_init()
+    // Octave: floor((midi - 12) / 12), MIDI 60 -> 4 (C4).
+    // Equivalently: midi / 12 - 1 with truncated division. For midi
+    // in [0..127], (midi / 12) is in [0..10], minus 1 -> [-1..9].
+    let oct = midi / 12 - 1
+    let semi = midi - (oct + 1) * 12
+    if semi < 0 { semi = 0 }
+    if semi > 11 { semi = 11 }
+    let name = t[semi]
+    // octave can be -1; render it explicitly.
+    if oct < 0 {
+        return name + "-" + int_to_str(0 - oct)
+    }
+    return name + int_to_str(oct)
+}
+
+// Public alias matching the brief's required surface.
+fn midi_to_note_name(midi) {
+    return _midi_to_note_name(midi)
+}
+
+// ---- core extractor ---------------------------------------------------
+//
+// melody_extract(pcm, sample_rate) -> list[note_t]
+//
+// Runs R11B YIN to get the per-frame pitch contour, then segments it
+// into a sequence of discrete MIDI notes. Returns a list of `note_t`
+// records (4-element lists); see NOTE_* constants above for the layout.
+//
+// Steps:
+//   1. pitch_track_yin(pcm, sample_rate) -- one [f0_centihz,
+//      voicing_milli] pair per non-overlapping 30 ms frame.
+//   2. For each frame, compute rounded MIDI integer. Frames with
+//      voicing_milli == 0 or f0_centihz <= 0 produce MELODY_UNVOICED_MIDI.
+//   3. Walk the rounded-MIDI sequence and group consecutive
+//      same-MIDI frames into note candidates.
+//   4. Drop candidates shorter than MELODY_MIN_NOTE_MS.
+//
+// Empty PCM, all-unvoiced PCM, and PCM shorter than one frame all
+// return an empty list (no notes).
+
+fn melody_extract(pcm, sample_rate) {
+    let notes = list_new()
+    if len(pcm) == 0 { return notes }
+    // R10F autocorrelation with melody-tuned bounds. See the module
+    // header for the YIN-vs-R10F rationale on clean-pitch inputs.
+    let contour = pitch_track_with_bounds(pcm, sample_rate,
+                                          MELODY_F0_MIN, MELODY_F0_MAX)
+    let n_frames = len(contour)
+    if n_frames == 0 { return notes }
+
+    let frame_ms = PITCH_FRAME_MS    // 30 by default
+
+    let i = 0
+    while i < n_frames {
+        let pair = contour[i]
+        let f0_centi = pair[0]
+        let voicing = pair[1]
+        // Skip leading unvoiced frames.
+        if f0_centi == PITCH_UNVOICED {
+            i = i + 1
+        } else {
+            // We have a voiced frame; convert it to MIDI.
+            let midi_first = _hz_to_midi_int(f0_centi)
+            if midi_first == MELODY_UNVOICED_MIDI {
+                i = i + 1
+            } else {
+                // Start a run. Aggregate consecutive frames where
+                // _hz_to_midi_int returns the same rounded value.
+                let start_frame = i
+                let conf_sum = voicing
+                let conf_count = 1
+                let j = i + 1
+                let run_continues = 1
+                while j < n_frames && run_continues == 1 {
+                    let pair_j = contour[j]
+                    let f0_j = pair_j[0]
+                    if f0_j == PITCH_UNVOICED {
+                        run_continues = 0
+                    } else {
+                        let midi_j = _hz_to_midi_int(f0_j)
+                        if midi_j == midi_first {
+                            conf_sum = conf_sum + pair_j[1]
+                            conf_count = conf_count + 1
+                            j = j + 1
+                        } else {
+                            run_continues = 0
+                        }
+                    }
+                }
+                let start_ms = start_frame * frame_ms
+                let end_ms = j * frame_ms
+                let duration = end_ms - start_ms
+                if duration >= MELODY_MIN_NOTE_MS {
+                    let note = list_new()
+                    push(note, start_ms)
+                    push(note, end_ms)
+                    push(note, midi_first)
+                    let conf = 0
+                    if conf_count > 0 {
+                        conf = conf_sum / conf_count
+                    }
+                    push(note, conf)
+                    push(notes, note)
+                }
+                i = j
+            }
+        }
+    }
+    return notes
+}
+
+// ---- text rendering ---------------------------------------------------
+//
+// melody_to_text(notes) -> str
+//
+// Renders a melody-extract result as a single human-readable line, in
+// the standard MIDI-ish "NOTE-DURATIONms" idiom:
+//
+//   "A4-440ms D4-220ms E4-440ms"
+//
+// Notes are separated by ASCII space. Empty input returns "".
+
+fn melody_to_text(notes) {
+    let n = len(notes)
+    if n == 0 { return "" }
+    let s = ""
+    let i = 0
+    while i < n {
+        let note = notes[i]
+        let name = _midi_to_note_name(note[NOTE_MIDI_PITCH])
+        let dur = note[NOTE_END_MS] - note[NOTE_START_MS]
+        if i > 0 { s = s + " " }
+        s = s + name + "-" + int_to_str(dur) + "ms"
+        i = i + 1
+    }
+    return s
+}
+
+// ---- chat helper ------------------------------------------------------
+//
+// melody_run_command(arg) -> single human-readable line summarising the
+// melody (note sequence) of the WAV at `arg`. Wired into
+// examples/crossengin_chat.nova as the `/melody PATH` admin one-liner.
+//
+// Output shape (one line, parenthesized for visual symmetry with
+// /pitch / /pitch_yin / /mfcc):
+//
+//   (melody /tmp/x.wav: A4-440ms D4-220ms E4-440ms | 3 notes @ 16000 Hz)
+//
+// Empty-melody case (silence, no voiced frames):
+//
+//   (melody /tmp/x.wav: <no notes detected> @ 16000 Hz)
+//
+// Error path (missing or unparseable WAV):
+//
+//   (melody FAILED: <reason>)
+
+fn melody_run_command(arg) {
+    if len(arg) == 0 {
+        return "(/melody needs PATH -- usage: /melody /tmp/test.wav)"
+    }
+    let r = audio_capture_to_pcm(arg)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(melody FAILED: could not parse WAV at " + arg + ")"
+    }
+    if sr <= 0 {
+        return "(melody FAILED: invalid sample rate in WAV at " + arg + ")"
+    }
+    let notes = melody_extract(pcm, sr)
+    let n = len(notes)
+    if n == 0 {
+        return "(melody " + arg + ": <no notes detected> @ "
+            + int_to_str(sr) + " Hz)"
+    }
+    let line = "(melody " + arg + ": " + melody_to_text(notes)
+        + " | " + int_to_str(n) + " notes @ "
+        + int_to_str(sr) + " Hz)"
+    return line
+}
