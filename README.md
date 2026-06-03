@@ -44,7 +44,30 @@ computational units rather than orchestrating a pipeline of modules.
 > input/output RMS) and `/gate PATH [THRESHOLD_MILLI]` (writes
 > `<PATH>.gate.wav`, same diagnostic). 34 unit assertions + 23
 > integration assertions; all green. All R6E/R7F/R9B/R8B/R10F/R11B/
-> R12D/R13D audio tests pass unchanged. R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
+> R12D/R13D audio tests pass unchanged. R15A wires R14B's
+> `simd_sad_u8(a_ptr, b_ptr, n_bytes)` raw-byte SAD primitive (AVX2
+> `vpsadbw`, 32 bytes -> 4 i64 partials per instruction) into the
+> stereo block-matching disparity path, closing R13A's 1.93x absolute
+> ceiling that was bounded by the byte->i32 staging overhead of R12A's
+> `simd_sum_abs_diff` wrapper. Adds `stereo_sad_block_u8` and
+> `stereo_disparity_u8_simd` (with `CE_STEREO_U8_SIMD=on` env-var
+> dispatch from the public `stereo_disparity` API), using
+> `_stereo_pack_block_u8` to pack a `WIN_SIZE x WIN_SIZE` window into
+> a contiguous byte buffer (one `memcpy_raw` per row) before the
+> single-call SAD reduction. PGM data is stored as raw byte buffers
+> (alloc + store8 + load8) so the byte SIMD path is a direct fit
+> without representation conversion. **256x256 ws=7 max_disp=16
+> textured pair: scalar ~850 ms, R12A/R13A i32 SIMD ~795 ms (~1.07x),
+> R15A u8 SIMD ~150 ms — a ~5.5x absolute speedup vs scalar and
+> ~5.3x vs the i32 SIMD path, comfortably above the 3-4x target.**
+> Bit-identical: u8 SIMD vs scalar = 0 pixel mismatches on the bench
+> fixture; 25 new unit assertions verify byte-wise identity across
+> ws ∈ {3, 5, 7, 9, 11}, the shifted-by-8 R7E fixture, a four-spot
+> pattern, and a vertical-edge fixture. All existing stereo /
+> optical-flow regression suites green (`test_stereo` 54,
+> `test_stereo_quality` 42, `test_stereo_sgm` 39, `test_simd_production`
+> 35). `scripts/bench_simd_production.sh` extended to time all three
+> paths back-to-back with bit-identical assertions. R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
 > Ed25519 digital-signature primitive on top of the existing `bn256_*`
 > Montgomery REDC stack, closing the signature gap in the crypto suite
 > (alongside ChaCha20-Poly1305 AEAD, Curve25519/G14 DH, Noise XK mutual

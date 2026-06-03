@@ -839,3 +839,108 @@ Files touched / added:
 * `tests/unit/test_simd_production.nova` (NEW, 35 assertions)
 * `scripts/bench_simd_production.sh` (NEW)
 
+## R15A u8 raw-byte SIMD wiring -- realizes 3-4x absolute speedup (landed)
+
+R15A wires R14B's `simd_sad_u8(a_ptr, b_ptr, n_bytes) -> int` raw-byte
+SAD primitive (AVX2 `vpsadbw`, 32 bytes -> 4 i64 partials per
+instruction; NEON `uabd` + `uaddlp` on ARM64; scalar fallback on
+macOS / Windows / WASM) into the stereo block-matching disparity
+path. R12A/R13A's `simd_sum_abs_diff` wrapper operated on packed i32
+lanes (8 lanes per `vpaddd`); for byte image data that meant a 4x
+staging-buffer write bandwidth overhead -- 4 `store8` per pixel into
+each lane's low byte, with the upper 3 bytes left as padding. R14B
+landed the byte-native primitive but explicitly deferred the CE
+wire-in (5-line strict cap + concurrent agents at the time); R15A
+is the realization, analogous to R7B's bn256 Mont realization of R6B.
+
+* Public API additions (parallel to existing scalar + i32 SIMD):
+  - `stereo_sad_block_u8(left, right, w, x_l, x_r, y, ws, l_buf, r_buf)`
+    packs both windows into contiguous byte buffers via
+    `_stereo_pack_block_u8` (one `memcpy_raw` per row) and reduces
+    via `simd_sad_u8` in one call. Bit-identical to scalar SAD.
+  - `stereo_disparity_u8_simd(left, right, w, h, ws, max_disp)` is
+    the explicit u8-SIMD entry point; honors `CE_STEREO_U8_SIMD=on`
+    (opt-in; default off until the u8 path has more end-to-end
+    validation -- the i32 path stays default-on).
+  - `stereo_disparity` (R7E public API) auto-routes to the u8 inner
+    loop when `CE_STEREO_U8_SIMD=on`, ahead of the R12A i32 routing.
+    `stereo_disparity_simd` (the explicit SIMD entry-point) honors
+    the same opt-in so the bench harness + `/depth` chat admin pick
+    the byte path without a separate dispatch.
+
+* Why u8 SIMD beats i32 SIMD here:
+  - The i32 path stages 4 bytes per pixel (1 store8 to lane low byte
+    + upper 3 stay zero from one-time buffer zero) and reduces 8 i32
+    lanes per `vpsadbw` chain. The bandwidth cost is 4x per pixel.
+  - The u8 path stages 1 byte per pixel (via `memcpy_raw` per row,
+    which is `rep movsb` -- uop-fused on modern x86) and reduces 32
+    bytes per `vpsadbw` -- 4x more lanes per single SIMD instruction.
+  - Net: 4x staging bandwidth saving + 4x lane density per instruction
+    + amortized LEFT pack across the d-loop = ~5x absolute speedup
+    vs scalar on textured 256x256 fixtures.
+
+* Bit-identical correctness:
+  - `vpsadbw` is unsigned absolute difference. Pixels are 0..255
+    (unsigned by construction), so the byte-treated-as-unsigned
+    semantics agree with scalar `|l - r|` (the test confirms via the
+    100-vs-50 symmetric fixture: 49 * 50 = 2450 in both directions).
+  - The LEFT/RIGHT pack writes WIN_SIZE * WIN_SIZE bytes per call
+    (49 for ws=7); SAD over that buffer plus the scalar tail in
+    `simd_sad_u8` matches the scalar `stereo_sad_block` exactly.
+
+* `tests/unit/test_stereo_u8_simd.nova` (NEW, 25 assertions):
+  `stereo_sad_block_u8` vs scalar SAD bit-identical on flat /
+  known-diff / negative-diff and across ws ∈ {3, 5, 7, 9, 11};
+  `stereo_disparity_u8_simd` byte-wise == locally-recomputed scalar
+  reference on a 48x32 textured pair; SHIFT=8 correctness on R7E's
+  shifted fixture; cross-fixture identity on four-spot and
+  vertical-edge patterns; identical-input invariant (mean 0) and
+  input-validation rejection (zero ptr / oversize dims).
+
+* `scripts/bench_simd_production.sh` extended to time all three
+  paths back-to-back with bit-identical assertions for each.
+  Measured on the bench host (256x256 ws=7 max_disp=16 textured
+  pair, runs stable across 3 invocations):
+
+  | Path                  | Wallclock | Speedup vs scalar |
+  |-----------------------|----------:|------------------:|
+  | scalar (R7E)          | ~850 ms   |             1.00x |
+  | R12A/R13A i32 SIMD    | ~795 ms   |             1.07x |
+  | R15A u8 SIMD          | ~150 ms   |          **5.5x** |
+
+  Above the 3-4x absolute target the brief set. The i32 path is
+  ~1.07x on this NOVA codegen host (was 0.86x on R12A; codegen
+  fluctuations dominate the i32 path's small per-call edge); the u8
+  path's win is robust because the per-call staging-bandwidth save
+  is structural rather than codegen-dependent.
+
+* PGM access strategy: pack-inline (one `memcpy_raw` per window
+  row into a contiguous byte buffer). PGM pixel data is already
+  stored as raw byte buffers (alloc + store8 + load8 via
+  `image_pgm.nova`), so the byte SIMD primitive is a direct
+  representational fit -- no list[int] -> byte conversion needed.
+  The pack pays one row-copy of `ws` bytes per (window, side)
+  evaluation; for ws=7 that's 7 bytes per memcpy_raw lowered to a
+  single `rep movsb`. LEFT is packed once per pixel and reused
+  across the d-loop (the d-shift only moves RIGHT).
+
+* Out-of-scope follow-ups (R15A):
+  - Optical-flow LK accumulators stay on the i32 SIMD path. LK
+    sums products of central-difference gradients in [-128, 128]
+    range; the products do not fit in u8, so the byte primitive
+    doesn't apply directly. Future work: a `simd_mul_i16x16`
+    primitive would let LK's product step go SIMD.
+  - SGM cost-volume aggregation (R9A) still scalar -- the 4-path
+    DP accumulator works on i32 cost bins, not u8 inputs.
+  - Stereo LR-check (R8D), sub-pixel (R8D), and SGM-quality
+    (R9A) still call `stereo_sad_block` (scalar) in their re-walk
+    passes. Wiring them through the u8 path is straightforward
+    follow-up (same primitive, smaller re-walk loops).
+
+Files touched / added:
+* `src/io/transducers/image_stereo.nova` (+~175 lines: pack helper,
+  block_u8, env-var, inner, public entry-point, dispatch wiring)
+* `tests/unit/test_stereo_u8_simd.nova` (NEW, 25 assertions)
+* `scripts/bench_simd_production.sh` (extended bench reports all
+  three paths + dual bit-identical assertions)
+

@@ -346,6 +346,183 @@ fn _stereo_simd_enabled() {
     return 1
 }
 
+// ---- R15A: u8 raw-byte SIMD SAD (uses R14B simd_sad_u8) ------------------
+//
+// R12A/R13A's stereo_sad_block_simd stages each pixel into a 4-byte i32
+// lane (1 store8 per pixel + zeroed top 3 bytes) and reduces via
+// `simd_sum_abs_diff`. That cuts the inner-loop SAD reduction cost but
+// leaves a 4x staging-bandwidth overhead vs the raw-byte width the data
+// actually has -- pixels are 0..255 so the upper 3 bytes of each i32 lane
+// are pure padding.
+//
+// R14B (NOVA codegen) lands `simd_sad_u8(a_ptr, b_ptr, n_bytes) -> int`,
+// a primitive that operates DIRECTLY on raw u8 byte buffers via AVX2
+// `vpsadbw` (32 bytes -> 4 i64 partials per instruction; tail is a 1-byte
+// scalar loop). This eliminates the i32 staging entirely -- one byte per
+// pixel into a contiguous buffer, period.
+//
+// The block-shape complication: a WIN_SIZE x WIN_SIZE block in a `width`-
+// strided image is NOT contiguous in memory; the 7 rows of 7 bytes sit
+// `width - 7` bytes apart. We can't just point simd_sad_u8 at the image
+// origin -- it would SAD over `n_bytes` of contiguous pixels including
+// the wrong intermediate columns. So we PACK the WIN_SIZE^2 bytes of
+// each block into a contiguous byte buffer, then call simd_sad_u8 once
+// on the packed buffers. The packing pays one store8 per cell (vs R12A's
+// also-one store8 per cell, but only the low byte of an i32 lane); the
+// win is the lane width -- 32 byte SAD per AVX2 instruction vs 8 i32
+// lanes per instruction in the R12A i32x8 path. That's 4x fewer
+// instructions over the inner loop on top of the staging-bandwidth saving.
+//
+// Optimization: the LEFT window at (x_l, y) is CONSTANT across the
+// disparity search at that pixel, so we pack LEFT ONCE per (x_l, y) and
+// reuse the packed buffer across all `d` iterations. Only the RIGHT
+// window changes with d. Saves ~md packs per pixel.
+//
+// stereo_sad_block_u8(left, right, width, x_l, x_r, y, ws, l_buf, r_buf)
+//   -> int
+//     Pack the win_size x win_size LEFT and RIGHT windows into l_buf /
+//     r_buf as contiguous bytes (row-major), then SAD via simd_sad_u8.
+//     Caller pre-allocs both buffers as alloc(ws * ws + 8) (the +8 is
+//     scratch headroom matching the i32 path's convention). For the
+//     callers that pack LEFT once per pixel, the public _block_u8 helper
+//     keeps the same contract as _block_simd -- pack both -- to stay
+//     useful in standalone unit tests.
+
+// Pack the WIN_SIZE x WIN_SIZE window centered at (x_center, y_center)
+// into the contiguous byte buffer `buf` (row-major). Uses NOVA's
+// `memcpy_raw` builtin (`rep movsb`) one row at a time -- ws bytes per
+// row -- which is materially faster than the obvious 49x (load8,
+// store8) double loop the i32 path needed for byte-into-int4 staging.
+// Each `memcpy_raw` lowers to a single tight CPU `rep movsb`; on
+// modern x86-64 this is uop-fused for the chunk-loop, so 7 bytes is
+// effectively one micro-coded instruction.
+fn _stereo_pack_block_u8(src_ptr, width, x_center, y_center, half, ws, buf) {
+    let row_bytes = ws
+    let dy = 0 - half
+    let dst = buf
+    while dy <= half {
+        let src_row = src_ptr + int_mul(int_add(y_center, dy), width)
+                              + int_sub(x_center, half)
+        memcpy_raw(dst, src_row, row_bytes)
+        dst = int_add(dst, row_bytes)
+        dy = int_add(dy, 1)
+    }
+}
+
+fn stereo_sad_block_u8(left_ptr, right_ptr, width, x_l, x_r, y, win_size,
+                       l_buf, r_buf) {
+    let half = win_size / 2
+    let n = int_mul(win_size, win_size)
+    _stereo_pack_block_u8(left_ptr,  width, x_l, y, half, win_size, l_buf)
+    _stereo_pack_block_u8(right_ptr, width, x_r, y, half, win_size, r_buf)
+    return simd_sad_u8(l_buf, r_buf, n)
+}
+
+// _stereo_u8_simd_enabled() -> 1 if CE_STEREO_U8_SIMD env var is set to
+//   "on"/"1"/"yes" (default OFF; opt-in for the bench script + future
+//   default-on flip when we have wider end-to-end validation). Separate
+//   from CE_STEREO_SIMD so the i32 path and the u8 path can be A/B'd
+//   independently.
+fn _stereo_u8_simd_enabled() {
+    let env = getenv("CE_STEREO_U8_SIMD")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// _stereo_disparity_u8_simd_inner: same inner-loop shape as the i32
+//   variant, but uses the packed-byte SAD primitive. Packs LEFT ONCE per
+//   (x_l, y) and reuses across the d-loop (the LEFT window is constant
+//   while d shifts the RIGHT window). The RIGHT pack runs once per d.
+fn _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                    ws, md, area, half) {
+    let n = int_mul(ws, ws)
+    // 8-byte scratch headroom past the actual win_size^2 footprint to
+    // mirror the i32-buf convention and give vpsadbw's 32-byte chunk
+    // loop a safe over-read landing zone on tail iterations.
+    let buf_bytes = int_add(n, 8)
+    let l_buf = alloc(buf_bytes)
+    let r_buf = alloc(buf_bytes)
+
+    let map = _stereo_zero_map(area)
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            // Pack LEFT window ONCE per pixel; constant across the d loop.
+            _stereo_pack_block_u8(left_ptr, width, x, y, half, ws, l_buf)
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                _stereo_pack_block_u8(right_ptr, width, int_sub(x, d), y, half, ws, r_buf)
+                let sad = simd_sad_u8(l_buf, r_buf, n)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            store8(map + int_add(row_off, x), best_d)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, best_d)
+            if best_d > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// stereo_disparity_u8_simd(left, right, w, h, win_size, max_disp)
+//   -> same shape as stereo_disparity. Explicit u8-SIMD entry-point.
+//   Falls back to stereo_disparity (which itself may route through the
+//   i32 SIMD path or scalar) when CE_STEREO_U8_SIMD is not "on".
+fn stereo_disparity_u8_simd(left_ptr, right_ptr, width, height, win_size, max_disp) {
+    if width <= 0   { return _stereo_fail() }
+    if height <= 0  { return _stereo_fail() }
+    if left_ptr == 0  { return _stereo_fail() }
+    if right_ptr == 0 { return _stereo_fail() }
+    if width > STEREO_MAX_DIM  { return _stereo_fail() }
+    if height > STEREO_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_fail() }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let half = ws / 2
+    if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if _stereo_u8_simd_enabled() == 0 {
+        return stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+    }
+    return _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                            ws, md, area, half)
+}
+
 // ---- normalisation helpers ----------------------------------------------
 
 fn _stereo_clamp_win_size(win_size) {
@@ -393,6 +570,15 @@ fn stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp) {
     if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
     if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
 
+    // R15A: u8 raw-byte SIMD wiring. Opt-in via CE_STEREO_U8_SIMD=on
+    // (default OFF until wider end-to-end validation). When enabled, routes
+    // through the simd_sad_u8 primitive (AVX2 vpsadbw on 32-byte chunks)
+    // and bypasses the R12A i32 staging entirely. Same bit-identical
+    // disparity map; expected 3-4x absolute speedup on textured fixtures.
+    if _stereo_u8_simd_enabled() == 1 {
+        return _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                                ws, md, area, half)
+    }
     // R12A: SIMD wiring. Default-on (CE_STEREO_SIMD unset or "on") routes
     // through the bit-identical AVX2/NEON path; CE_STEREO_SIMD=off
     // preserves the scalar inner loop for A/B benchmarking.
@@ -544,6 +730,13 @@ fn stereo_disparity_simd(left_ptr, right_ptr, width, height, win_size, max_disp)
     if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
     if _stereo_simd_enabled() == 0 {
         return stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+    }
+    // R15A: honor CE_STEREO_U8_SIMD=on even on this explicit SIMD entry-
+    // point so /depth and the bench harness can pick the byte path
+    // without a separate API.
+    if _stereo_u8_simd_enabled() == 1 {
+        return _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                                ws, md, area, half)
     }
     return _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
                                         ws, md, area, half)

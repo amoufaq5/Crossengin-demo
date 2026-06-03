@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# R12A — Production SIMD wiring benchmark.
+# R12A/R13A/R15A -- Production SIMD wiring benchmark.
 #
 # Compares scalar vs SIMD inner-loop wallclock for:
-#   1. stereo SAD path (R7E stereo_disparity / stereo_disparity_simd)
+#   1. stereo SAD path: scalar reference, R12A/R13A i32 SIMD
+#      (stereo_disparity_simd), and R15A u8 raw-byte SIMD
+#      (_stereo_disparity_u8_simd_inner via R14B simd_sad_u8).
 #   2. optical-flow LK accumulators (R10D lk_optical_flow /
-#      lk_optical_flow_simd)
+#      lk_optical_flow_simd).
 #
 # Both bench sources are generated here so the script stands alone; the
 # generated NOVA programs live under examples/ for reproducibility +
@@ -15,10 +17,13 @@
 # wallclock under a minute on typical x86-64 hosts; optical-flow uses
 # the R10D default win_size=5.
 #
-# Speedup ratio is reported as scalar_ns / simd_ns. R11D's SAD micro-
+# Speedup ratio is reported as scalar_ns / SIMD_ns. R11D's SAD micro-
 # benchmark showed 335-450x on the SIMD primitive itself; the realized
 # end-to-end speedup is lower because per-pixel staging + byte-store
-# overhead competes with the SIMD inner loop's win.
+# overhead competes with the SIMD inner loop's win. R15A's u8 path
+# eliminates the byte->i32 staging (one byte per pixel into a packed
+# buffer vs four bytes per pixel into an i32 lane), targeting the
+# 3-4x absolute speedup R13A's i32 path plateaued at 1.93x absolute.
 #
 # Skips cleanly if the NOVA compiler is missing.
 
@@ -114,6 +119,21 @@ fn main() {
     let mean_simd = stereo_result_mean(r_simd)
     let dens_simd = stereo_result_density(r_simd)
 
+    // R15A: u8 raw-byte SIMD path. _stereo_disparity_u8_simd_inner is
+    // called by stereo_disparity_u8_simd when CE_STEREO_U8_SIMD=on; we
+    // call it directly here so the bench reports the u8 path's cost
+    // regardless of how the caller's env is configured. Bypasses the
+    // dispatch + input validation -- inputs are well-formed.
+    let area_u8 = int_mul(W, H)
+    let half_u8 = WS / 2
+    let _wu8 = _stereo_disparity_u8_simd_inner(lft, rgt, W, H, WS, MD, area_u8, half_u8)
+    let t0_u8 = nanotime()
+    let r_u8 = _stereo_disparity_u8_simd_inner(lft, rgt, W, H, WS, MD, area_u8, half_u8)
+    let t1_u8 = nanotime()
+    let u8_ns = int_sub(t1_u8, t0_u8)
+    let mean_u8 = stereo_result_mean(r_u8)
+    let dens_u8 = stereo_result_density(r_u8)
+
     // Scalar reference inline -- uses stereo_sad_block (canonical
     // scalar SAD). Pre-R12A stereo_disparity inner loop.
     let area = int_mul(W, H)
@@ -172,42 +192,84 @@ fn main() {
         if load8(map + mi) != load8(m_simd + mi) { mism = int_add(mism, 1) }
         mi = int_add(mi, 1)
     }
+    // R15A: also assert u8 SIMD bit-identical to scalar.
+    let mism_u8 = 0
+    let mu8 = 0
+    let m_u8 = stereo_result_map(r_u8)
+    while mu8 < area {
+        if load8(map + mu8) != load8(m_u8 + mu8) { mism_u8 = int_add(mism_u8, 1) }
+        mu8 = int_add(mu8, 1)
+    }
     let scalar_mean = 0
     if scalar_valid_count > 0 { scalar_mean = scalar_mean_sum / scalar_valid_count }
-    print("  scalar mean disparity:  ")
+    print("  scalar  mean disparity:  ")
     print_int(scalar_mean)
     println("")
-    print("  SIMD   mean disparity:  ")
+    print("  i32SIMD mean disparity:  ")
     print_int(mean_simd)
     println("")
-    print("  SIMD   density (milli): ")
-    print_int(dens_simd)
+    print("  u8 SIMD mean disparity:  ")
+    print_int(mean_u8)
     println("")
-    print("  bit-mismatched pixels:  ")
+    print("  u8 SIMD density (milli): ")
+    print_int(dens_u8)
+    println("")
+    print("  i32 vs scalar mismatch:  ")
     print_int(mism)
     println("")
+    print("  u8  vs scalar mismatch:  ")
+    print_int(mism_u8)
+    println("")
     if mism > 0 {
-        println("FAIL: scalar vs SIMD disparity disagree at pixel level")
+        println("FAIL: scalar vs i32 SIMD disparity disagree at pixel level")
         exit(1)
     }
-    print("  scalar wallclock (ns):  ")
+    if mism_u8 > 0 {
+        println("FAIL: scalar vs u8 SIMD disparity disagree at pixel level")
+        exit(1)
+    }
+    print("  scalar  wallclock (ns):  ")
     print_int(scalar_ns)
     println("")
-    print("  SIMD   wallclock (ns):  ")
+    print("  i32SIMD wallclock (ns):  ")
     print_int(simd_ns)
+    println("")
+    print("  u8 SIMD wallclock (ns):  ")
+    print_int(u8_ns)
     println("")
     if simd_ns > 0 {
         let ratio_x100 = int_div(int_mul(scalar_ns, 100), simd_ns)
         let whole = int_div(ratio_x100, 100)
         let frac  = ratio_x100 % 100
-        print("  speedup: ~")
+        print("  i32 SIMD speedup vs scalar: ~")
         print_int(whole)
         print(".")
         if frac < 10 { print("0") }
         print_int(frac)
         println("x")
+    }
+    if u8_ns > 0 {
+        let ratio_u8_x100 = int_div(int_mul(scalar_ns, 100), u8_ns)
+        let whole_u8 = int_div(ratio_u8_x100, 100)
+        let frac_u8  = ratio_u8_x100 % 100
+        print("  u8  SIMD speedup vs scalar: ~")
+        print_int(whole_u8)
+        print(".")
+        if frac_u8 < 10 { print("0") }
+        print_int(frac_u8)
+        println("x")
+        // R15A target: 3-4x absolute (vs the R13A 1.93x i32 ceiling).
+        let rel_x100 = int_div(int_mul(simd_ns, 100), u8_ns)
+        let whole_r = int_div(rel_x100, 100)
+        let frac_r  = rel_x100 % 100
+        print("  u8 SIMD speedup vs i32 SIMD: ~")
+        print_int(whole_r)
+        print(".")
+        if frac_r < 10 { print("0") }
+        print_int(frac_r)
+        println("x")
     } else {
-        println("  SIMD wallclock 0 -- below resolution")
+        println("  u8 SIMD wallclock 0 -- below resolution")
     }
 }
 
