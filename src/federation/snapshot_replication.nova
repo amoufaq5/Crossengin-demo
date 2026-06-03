@@ -1,0 +1,564 @@
+// CrossEngin federation: snapshot replication via gossip (R23C).
+//
+// Purpose
+//   R23C. R20F (`src/federation/snapshot_attestation.nova`) ships
+//   gossip-relayed signed snapshot ATTESTATION tuples: a peer can
+//   tell the mesh "at ts T I sealed a snapshot with Merkle root R,
+//   here is my signature over (soul_id || ts || root)". That is
+//   enough to PROVE a snapshot existed (any later mismatch tells
+//   the operator a rollback happened) but it does NOT carry the
+//   snapshot bytes themselves. If peer A's disk dies after it
+//   broadcast its attestation, the federation has the receipt but
+//   not the goods -- the snapshot is gone.
+//
+//   This module closes that gap. When a peer broadcasts an
+//   ATTESTATION via R20F, every other peer that hears it AND does
+//   not already hold the snapshot for that root issues a SNAP_FETCH
+//   <root> request to the originator over the gossip transport.
+//   The originator answers with the snapshot bytes (the same text
+//   representation `snap_to_text` produces); the receiver verifies
+//   the bytes against the SIGNED root (the snapshot's
+//   `meta.merkle_root` line MUST equal the attestation's root_hex,
+//   header / end-line framing MUST be intact) and stores the bytes
+//   in a per-peer local replica directory the operator can rsync
+//   to off-host backup or restore from on disaster.
+//
+//   The replica is also re-serveable: peer B that fetched peer A's
+//   snapshot can ANSWER SNAP_FETCH requests for that root from
+//   peer C, so the federation gets gossip-style propagation of
+//   snapshot durability with O(log N) fan-out without any
+//   coordinator.
+//
+// Trust model
+//
+//   The gossip mesh is UNTRUSTED. R20F's ATTESTATION verification
+//   already gates this module: sr_observe_attestation is called
+//   ONLY by gossip's attestation handler AFTER att_verify has
+//   returned 1, so the root_hex we record in the known-roots table
+//   is signed by a known peer's Ed25519 key. The SNAP_RESP bytes
+//   arrive over the mesh too and could be MITM-rewritten; the
+//   wire-layer defence is the `meta.merkle_root` line equivalence
+//   check (the originator computes that line BEFORE signing the
+//   attestation, so a tampered meta-line is detectably wrong
+//   against the signed root). Defence-in-depth: when the receiver
+//   later LOADS the replica via `snap_load_with_deltas` with
+//   `CE_SNAPSHOT_VERIFY_MERKLE=1`, the per-atom Merkle re-derivation
+//   in the persistence layer catches atom-level tampering that
+//   left the meta line untouched.
+//
+//   Threats this layer DOES NOT defend against:
+//     * Replay of an old (signed) snapshot by the originator
+//       (R20F's "ts_ns is informational" caveat applies here too).
+//     * A malicious originator broadcasting a valid attestation +
+//       valid snapshot whose CONTENTS are policy-violating.
+//     * A peer refusing to serve. SNAP_FETCH is best-effort.
+//
+// Wire shape
+//
+//   Two new gossip message types (additive to R18E, dispatched in
+//   gossip.nova's parser table alongside ATTESTATION / DELTA /
+//   DQUERY):
+//     SNAP_FETCH <root_hex>\n
+//     SNAP_DATA <body_line>\n         (zero or more)
+//     SNAP_END\n
+//
+//   * SNAP_FETCH is a request -- "send me the snapshot for root R".
+//     The responder looks up its local replica for the root and
+//     answers with SNAP_DATA lines (the snapshot text body, one
+//     line per SNAP_DATA wire line) terminated by SNAP_END. A bare
+//     SNAP_END (no data) signals "I don't have this root".
+//   * SNAP_DATA carries one line of the snapshot text body; the
+//     receiver re-adds the \n the line-oriented gossip wire
+//     stripped. This keeps the gossip line buffer (1024 bytes) the
+//     hard upper bound on any single snapshot line.
+//   * SNAP_END terminates the stream.
+//
+// Public API
+//
+//   sr_init(gossip_state, local_snap_dir) -> sr_state
+//   sr_observe_attestation(sr, att)       -> 1 newly tracked | 0
+//   sr_fetch_pending(sr)                  -> count of pending fetches
+//   sr_local_snapshots(sr)                -> list[(root_hex, peer_id, ts_ns)]
+//   sr_serve_snap_request(sr, root_hex)   -> snapshot_bytes | 0
+//   sr_observe_snap_response(sr, root_hex, bytes) -> 1 stored | 0
+//   sr_register_local(sr, root_hex, peer_id, ts_ns, bytes) -> 1
+//
+// Diagnostics:
+//
+//   sr_known_root_count, sr_replica_count, sr_pending_count,
+//   sr_stats_fetched, sr_stats_verify_fail, sr_status_line,
+//   sr_pending_fetch_tasks, sr_known_roots, sr_replica_lines.
+//
+// Wire codec:
+//
+//   sr_make_fetch_line(root_hex)              -> "SNAP_FETCH <root>"
+//   sr_parse_fetch_line(line)                 -> root_hex | ""
+//
+// ADRs: registers ADR-0081 (federation snapshot replication via gossip).
+// CrossEngin dependencies:
+//   src/federation/snapshot_attestation.nova (root_hex source),
+//   src/persistence/merkle.nova           (READ-only),
+//   src/persistence/merkle_signing.nova   (READ-only),
+//   src/persistence/snapshot_writer.nova  (READ-only).
+//
+//   Note: deliberately does NOT import snapshot_disk.nova -- its
+//   internal helper `_starts_with` collides on the assembler with
+//   kg_sync.nova's same-named helper when both are pulled into the
+//   gossip TU. The verifier walks the snapshot text directly
+//   (header check, meta-root line equivalence, `end`-line presence)
+//   rather than going through snap_from_text; the strict per-atom
+//   Merkle re-derivation runs at LOAD time via snapshot_disk.
+
+import "std/io"
+import "./snapshot_attestation.nova"
+import "../persistence/merkle.nova"
+import "../persistence/merkle_signing.nova"
+import "../persistence/snapshot_writer.nova"
+
+// ---- wire constants ------------------------------------------------------
+
+let SR_FETCH_PREFIX = "SNAP_FETCH "
+let SR_ROOT_HEX_LEN = 64
+
+// ---- state slot indices --------------------------------------------------
+
+let SR_S_GOSSIP     = 0
+let SR_S_LOCAL_DIR  = 1
+let SR_S_KNOWN      = 2
+let SR_S_REPLICAS   = 3
+let SR_S_STATS_FETCHED     = 4
+let SR_S_STATS_VERIFY_FAIL = 5
+let SR_S_STATS_OBSERVED    = 6
+
+let SR_K_ROOT_HEX = 0
+let SR_K_PEER_ID  = 1
+let SR_K_TS_NS    = 2
+let SR_K_STATUS   = 3
+
+let SR_R_ROOT_HEX = 0
+let SR_R_PEER_ID  = 1
+let SR_R_TS_NS    = 2
+let SR_R_BYTES    = 3
+
+let SR_STATUS_PENDING = 0
+let SR_STATUS_FETCHED = 1
+let SR_STATUS_SELF    = 2
+
+let _SR_SNAP_HEADER_V1 = "crossengin-snapshot v1"
+let _SR_SNAP_HEADER_V2 = "crossengin-snapshot v2"
+let _SR_END_LINE       = "end"
+let _SR_META_ROOT_KEY  = "meta.merkle_root "
+
+// ---- low-level helpers ---------------------------------------------------
+
+fn _sr_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _sr_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _sr_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sr_starts_with(s, prefix) {
+    if len(s) < len(prefix) { return 0 }
+    let i = 0
+    while i < len(prefix) {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sr_split_spaces(s) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            if i > start { push(out, substr(s, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(s, start, i - start)) }
+    return out
+}
+
+fn _sr_is_lc_hex_char(c) {
+    if c >= 48 {
+        if c <= 57 { return 1 }
+    }
+    if c >= 97 {
+        if c <= 102 { return 1 }
+    }
+    return 0
+}
+
+fn _sr_is_lc_hex_string(s, expect_len) {
+    if len(s) != expect_len { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _sr_is_lc_hex_char(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sr_find_byte(s, start, b) {
+    let i = start
+    while i < len(s) {
+        if char_at(s, i) == b { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _sr_first_line(text) {
+    if len(text) == 0 { return "" }
+    let nl = _sr_find_byte(text, 0, 10)
+    if nl < 0 { return text }
+    return substr(text, 0, nl)
+}
+
+fn _sr_extract_meta_root(text) {
+    let pos = 0
+    while pos < len(text) {
+        let nl = _sr_find_byte(text, pos, 10)
+        let line = ""
+        let next_pos = pos
+        if nl < 0 {
+            line = substr(text, pos, len(text) - pos)
+            next_pos = len(text)
+        } else {
+            line = substr(text, pos, nl - pos)
+            next_pos = nl + 1
+        }
+        if _sr_starts_with(line, _SR_META_ROOT_KEY) == 1 {
+            let vstart = len(_SR_META_ROOT_KEY)
+            return substr(line, vstart, len(line) - vstart)
+        }
+        pos = next_pos
+    }
+    return ""
+}
+
+fn _sr_has_end_line(text) {
+    if len(text) == 0 { return 0 }
+    let pos = 0
+    let last = ""
+    while pos < len(text) {
+        let nl = _sr_find_byte(text, pos, 10)
+        let line = ""
+        let next_pos = pos
+        if nl < 0 {
+            line = substr(text, pos, len(text) - pos)
+            next_pos = len(text)
+        } else {
+            line = substr(text, pos, nl - pos)
+            next_pos = nl + 1
+        }
+        if len(line) > 0 { last = line }
+        pos = next_pos
+    }
+    if str_eq(last, _SR_END_LINE) == 1 { return 1 }
+    return 0
+}
+
+// ---- constructors --------------------------------------------------------
+
+fn sr_init(gossip_state, local_snap_dir) {
+    let st = list_new()
+    push(st, gossip_state)
+    push(st, local_snap_dir)
+    push(st, list_new())
+    push(st, list_new())
+    push(st, 0)
+    push(st, 0)
+    push(st, 0)
+    return st
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn sr_gossip(sr)             { return sr[SR_S_GOSSIP] }
+fn sr_local_dir(sr)          { return sr[SR_S_LOCAL_DIR] }
+fn sr_known_root_count(sr)   { return len(sr[SR_S_KNOWN]) }
+fn sr_replica_count(sr)      { return len(sr[SR_S_REPLICAS]) }
+fn sr_stats_fetched(sr)      { return sr[SR_S_STATS_FETCHED] }
+fn sr_stats_verify_fail(sr)  { return sr[SR_S_STATS_VERIFY_FAIL] }
+fn sr_stats_observed(sr)     { return sr[SR_S_STATS_OBSERVED] }
+
+// ---- lookups -------------------------------------------------------------
+
+fn _sr_find_known(sr, root_hex) {
+    let kn = sr[SR_S_KNOWN]
+    let i = 0
+    while i < len(kn) {
+        if str_eq(kn[i][SR_K_ROOT_HEX], root_hex) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _sr_find_replica(sr, root_hex) {
+    let rp = sr[SR_S_REPLICAS]
+    let i = 0
+    while i < len(rp) {
+        if str_eq(rp[i][SR_R_ROOT_HEX], root_hex) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sr_have_root(sr, root_hex) {
+    if _sr_find_replica(sr, root_hex) >= 0 { return 1 }
+    return 0
+}
+
+// ---- observe attestation -------------------------------------------------
+
+fn sr_observe_attestation(sr, att) {
+    if sr == 0 { return 0 }
+    if att == 0 { return 0 }
+    if len(att) < 4 { return 0 }
+    let root_hex = att_root_hex(att)
+    if _sr_is_lc_hex_string(root_hex, SR_ROOT_HEX_LEN) == 0 { return 0 }
+    if _sr_find_known(sr, root_hex) >= 0 { return 0 }
+    let status = SR_STATUS_PENDING
+    if sr_have_root(sr, root_hex) == 1 { status = SR_STATUS_FETCHED }
+    let entry = list_new()
+    push(entry, root_hex)
+    push(entry, att_soul_id(att))
+    push(entry, att_ts_ns(att))
+    push(entry, status)
+    push(sr[SR_S_KNOWN], entry)
+    sr[SR_S_STATS_OBSERVED] = sr[SR_S_STATS_OBSERVED] + 1
+    return 1
+}
+
+// ---- fetch policy --------------------------------------------------------
+
+fn sr_pending_count(sr) {
+    if sr == 0 { return 0 }
+    let kn = sr[SR_S_KNOWN]
+    let i = 0
+    let n = 0
+    while i < len(kn) {
+        if kn[i][SR_K_STATUS] == SR_STATUS_PENDING {
+            if sr_have_root(sr, kn[i][SR_K_ROOT_HEX]) == 1 {
+                kn[i][SR_K_STATUS] = SR_STATUS_FETCHED
+            } else {
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn sr_fetch_pending(sr) {
+    return sr_pending_count(sr)
+}
+
+fn sr_pending_fetch_tasks(sr) {
+    let out = list_new()
+    if sr == 0 { return out }
+    let kn = sr[SR_S_KNOWN]
+    let i = 0
+    while i < len(kn) {
+        if kn[i][SR_K_STATUS] == SR_STATUS_PENDING {
+            if sr_have_root(sr, kn[i][SR_K_ROOT_HEX]) == 0 {
+                let task = list_new()
+                push(task, kn[i][SR_K_ROOT_HEX])
+                push(task, kn[i][SR_K_PEER_ID])
+                push(out, task)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- enumeration helpers ------------------------------------------------
+
+fn sr_local_snapshots(sr) {
+    let out = list_new()
+    if sr == 0 { return out }
+    let rp = sr[SR_S_REPLICAS]
+    let i = 0
+    while i < len(rp) {
+        let entry = list_new()
+        push(entry, rp[i][SR_R_ROOT_HEX])
+        push(entry, rp[i][SR_R_PEER_ID])
+        push(entry, rp[i][SR_R_TS_NS])
+        push(out, entry)
+        i = i + 1
+    }
+    return out
+}
+
+fn sr_known_roots(sr) {
+    let out = list_new()
+    if sr == 0 { return out }
+    let kn = sr[SR_S_KNOWN]
+    let i = 0
+    while i < len(kn) {
+        let entry = list_new()
+        push(entry, kn[i][SR_K_ROOT_HEX])
+        push(entry, kn[i][SR_K_PEER_ID])
+        push(entry, kn[i][SR_K_TS_NS])
+        push(entry, kn[i][SR_K_STATUS])
+        push(out, entry)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- serve / observe response -------------------------------------------
+
+fn sr_serve_snap_request(sr, root_hex) {
+    if sr == 0 { return 0 }
+    if _sr_is_lc_hex_string(root_hex, SR_ROOT_HEX_LEN) == 0 { return 0 }
+    let idx = _sr_find_replica(sr, root_hex)
+    if idx < 0 { return 0 }
+    return sr[SR_S_REPLICAS][idx][SR_R_BYTES]
+}
+
+fn _sr_verify_snap_bytes(expected_root_hex, bytes) {
+    if bytes == 0 { return 0 }
+    if len(bytes) == 0 { return 0 }
+    let first = _sr_first_line(bytes)
+    let header_ok = 0
+    if str_eq(first, _SR_SNAP_HEADER_V1) == 1 { header_ok = 1 }
+    if str_eq(first, _SR_SNAP_HEADER_V2) == 1 { header_ok = 1 }
+    if header_ok == 0 { return 0 }
+    if _sr_has_end_line(bytes) == 0 { return 0 }
+    let meta_root = _sr_extract_meta_root(bytes)
+    if len(meta_root) == 0 { return 0 }
+    if str_eq(meta_root, expected_root_hex) == 0 { return 0 }
+    return 1
+}
+
+fn sr_observe_snap_response(sr, root_hex, bytes) {
+    if sr == 0 { return 0 }
+    if _sr_is_lc_hex_string(root_hex, SR_ROOT_HEX_LEN) == 0 { return 0 }
+    let kn_idx = _sr_find_known(sr, root_hex)
+    if kn_idx < 0 {
+        sr[SR_S_STATS_VERIFY_FAIL] = sr[SR_S_STATS_VERIFY_FAIL] + 1
+        return 0
+    }
+    if _sr_verify_snap_bytes(root_hex, bytes) == 0 {
+        sr[SR_S_STATS_VERIFY_FAIL] = sr[SR_S_STATS_VERIFY_FAIL] + 1
+        return 0
+    }
+    if sr_have_root(sr, root_hex) == 1 {
+        sr[SR_S_KNOWN][kn_idx][SR_K_STATUS] = SR_STATUS_FETCHED
+        return 1
+    }
+    let peer_id = sr[SR_S_KNOWN][kn_idx][SR_K_PEER_ID]
+    let ts_ns   = sr[SR_S_KNOWN][kn_idx][SR_K_TS_NS]
+    let rec = list_new()
+    push(rec, root_hex)
+    push(rec, peer_id)
+    push(rec, ts_ns)
+    push(rec, bytes)
+    push(sr[SR_S_REPLICAS], rec)
+    sr[SR_S_KNOWN][kn_idx][SR_K_STATUS] = SR_STATUS_FETCHED
+    sr[SR_S_STATS_FETCHED] = sr[SR_S_STATS_FETCHED] + 1
+    return 1
+}
+
+fn sr_register_local(sr, root_hex, peer_id, ts_ns, bytes) {
+    if sr == 0 { return 0 }
+    if _sr_is_lc_hex_string(root_hex, SR_ROOT_HEX_LEN) == 0 { return 0 }
+    if bytes == 0 { return 0 }
+    if len(bytes) == 0 { return 0 }
+    if sr_have_root(sr, root_hex) == 0 {
+        let rec = list_new()
+        push(rec, root_hex)
+        push(rec, peer_id)
+        push(rec, ts_ns)
+        push(rec, bytes)
+        push(sr[SR_S_REPLICAS], rec)
+    }
+    if _sr_find_known(sr, root_hex) < 0 {
+        let entry = list_new()
+        push(entry, root_hex)
+        push(entry, peer_id)
+        push(entry, ts_ns)
+        push(entry, SR_STATUS_SELF)
+        push(sr[SR_S_KNOWN], entry)
+    } else {
+        let idx = _sr_find_known(sr, root_hex)
+        sr[SR_S_KNOWN][idx][SR_K_STATUS] = SR_STATUS_SELF
+    }
+    return 1
+}
+
+// ---- wire codec ----------------------------------------------------------
+
+fn sr_make_fetch_line(root_hex) {
+    return SR_FETCH_PREFIX + root_hex
+}
+
+fn sr_parse_fetch_line(line) {
+    if line == 0 { return "" }
+    if _sr_starts_with(line, SR_FETCH_PREFIX) == 0 { return "" }
+    let toks = _sr_split_spaces(line)
+    if len(toks) != 2 { return "" }
+    if str_eq(toks[0], "SNAP_FETCH") == 0 { return "" }
+    let root_hex = toks[1]
+    if _sr_is_lc_hex_string(root_hex, SR_ROOT_HEX_LEN) == 0 { return "" }
+    return root_hex
+}
+
+// ---- admin status line ---------------------------------------------------
+
+fn sr_status_line(sr) {
+    if sr == 0 {
+        return "sr: not initialised"
+    }
+    let known    = sr_known_root_count(sr)
+    let replicas = sr_replica_count(sr)
+    let pending  = sr_pending_count(sr)
+    return "sr: known=" + int_to_str(known)
+        + " replicas=" + int_to_str(replicas)
+        + " pending=" + int_to_str(pending)
+        + " fetched=" + int_to_str(sr_stats_fetched(sr))
+        + " verify_fail=" + int_to_str(sr_stats_verify_fail(sr))
+}
+
+fn sr_replica_lines(sr, max_n) {
+    let out = list_new()
+    if sr == 0 { return out }
+    let rp = sr[SR_S_REPLICAS]
+    let i = 0
+    let emitted = 0
+    while i < len(rp) {
+        if emitted >= max_n {
+            i = len(rp)
+        } else {
+            let r = rp[i]
+            let root_hex = r[SR_R_ROOT_HEX]
+            let short = substr(root_hex, 0, 8)
+            let blen = 0
+            if r[SR_R_BYTES] != 0 { blen = len(r[SR_R_BYTES]) }
+            let line = "  root=" + short
+                + " peer=" + int_to_str(r[SR_R_PEER_ID])
+                + " ts="   + int_to_str(r[SR_R_TS_NS])
+                + " bytes=" + int_to_str(blen)
+            push(out, line)
+            emitted = emitted + 1
+            i = i + 1
+        }
+    }
+    return out
+}
