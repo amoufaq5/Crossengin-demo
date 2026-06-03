@@ -3,6 +3,140 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R17E (this session) -- mini-SPARQL aggregates: COUNT, SUM, AVG, MIN, MAX, GROUP BY
+
+**Status: complete -- `src/kg/query.nova` (R15D's mini-SPARQL parser +
+executor, EXTENDED in place again) now ships the full SPARQL 1.1
+analytical-query subset.** R15D shipped SELECT / WHERE { triples +
+FILTERs } / LIMIT; R16F added OPTIONAL + UNION + ORDER BY; R17E closes
+the analytical-query gap with aggregate functions and GROUP BY. No new
+module count; everything lives in the single R15D module.
+
+### What the new keywords accept
+
+```
+SELECT (COUNT(?a) AS ?n) WHERE { ?a kind FACT . }
+-- one row, one column: n = number of FACT atoms in the KG.
+```
+
+```
+SELECT (SUM(?a alpha) AS ?total) WHERE { ?a kind FACT . }
+-- one row: total = sum of alpha over all FACT atoms.
+```
+
+```
+SELECT (AVG(?a alpha) AS ?mean) WHERE { ?a kind FACT . }
+SELECT (MIN(?a alpha) AS ?lo) (MAX(?a alpha) AS ?hi) WHERE { ?a kind FACT . }
+-- single-row aggregates can be stacked in a single SELECT.
+```
+
+```
+SELECT ?kind (COUNT(?a) AS ?n) WHERE { ?a kind ?kind . } GROUP BY ?kind
+-- one row PER distinct ?kind value:
+--   { kind: ATOM_FACT,    n: 5 }
+--   { kind: ATOM_CONCEPT, n: 5 }
+-- on R15D's 10-atom fixture.
+```
+
+### Semantics
+
+1. **Aggregate functions:**
+   - `COUNT(?var)` — number of rows in the (group); does not read a field.
+   - `SUM(?var field)` — sum of `field` values from the atom bound to `?var`.
+   - `AVG(?var field)` — mean (integer division: SUM / COUNT).
+   - `MIN(?var field)` / `MAX(?var field)` — extrema.
+   - All integer-valued; AVG uses NOVA's `/` (toward-zero truncation).
+2. **FILTER applies BEFORE aggregation** — the BGP is fully resolved
+   first; aggregates then reduce the surviving binding rows.
+3. **Without GROUP BY:** exactly one output row aggregating over all
+   bindings (still 1 row even if the binding set is empty — the
+   empty-set sentinel is COUNT=SUM=0, AVG=MIN=MAX=`QRY_AGG_EMPTY` =
+   `-1`, per the brief).
+4. **With GROUP BY ?var:** the binding set partitions by the int value
+   bound to `?var` in each row; one output row per non-empty group.
+   Group-discovery order is deterministic (first-seen-key wins).
+5. **LIMIT applies AFTER aggregation** — the brief's example
+   `SELECT (COUNT(?a) AS ?n) … LIMIT 10` still emits 1 row.
+
+### Parser additions
+
+- 7 new keywords (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP`, `AS`).
+  `BY` was already a R16F keyword (ORDER BY); GROUP BY reuses it.
+- 2 new parsed_query_t slots: `QRY_AGGS` (`q[5]`) and `QRY_GROUPBY` (`q[6]`).
+- 5 new aggregate-function codes (`QRY_AGG_COUNT` .. `QRY_AGG_MAX`).
+- 1 new empty-set sentinel (`QRY_AGG_EMPTY = -1`).
+- SELECT list now accepts a parenthesised aggregate item alongside
+  bare `?var`s. Aggregate items push the ALIAS onto `kg_query_vars`
+  (so the emit-line helper renders `n=5`, `total=15000` etc.) AND a
+  descriptor `[code, src_var, src_field, alias]` onto `kg_query_aggs`.
+
+### Executor additions
+
+- `_qry_agg_value(kg, agg, row)` — single-row contribution (with
+  contributes-flag for SPARQL NULL semantics on unbound vars).
+- `_qry_agg_compute(kg, agg, rows)` — reduce one aggregate over a row set.
+- `_qry_build_agg_row(kg, vars, aggs, group_var, group_val, rows)` —
+  build one output row (binds group var + every aggregate alias).
+- `_qry_apply_aggregates(kg, parsed_query, bindings)` — top-level driver:
+  partition by group var if present, then emit one aggregated row per
+  group; without GROUP BY, one row aggregating the full set.
+- `kg_query_execute` interleaves the aggregate pass between pattern
+  resolution and ORDER BY / LIMIT.
+
+### Verification
+
+- Unit `tests/unit/test_kg_query_agg.nova`: 67 assertions, all green.
+- Unit (regression) `tests/unit/test_kg_query.nova`: 55 assertions,
+  bit-identically green.
+- Unit (regression) `tests/unit/test_kg_query_ext.nova`: 60 assertions,
+  bit-identically green.
+- Integration `tests/integration/scenario_sss_query_agg.sh`: 24
+  assertions, all green.
+- Integration (regression) `tests/integration/scenario_kkk_query.sh`:
+  18 assertions, all green.
+- Integration (regression) `tests/integration/scenario_ppp_query_ext.sh`:
+  22 assertions, all green.
+
+### Behavior on the R15D 10-atom fixture
+
+- `SELECT (COUNT(?a) AS ?n) WHERE { ?a kind FACT . }` → 1 row, `n=5`.
+- `SELECT (SUM(?a alpha) AS ?total) WHERE { ?a kind FACT . }` → `total=15000`.
+- `SELECT (AVG(?a alpha) AS ?mean) WHERE { ?a kind FACT . }` → `mean=3000`.
+- `SELECT (MIN(?a alpha) AS ?lo) (MAX(?a alpha) AS ?hi) WHERE { ?a kind FACT . }`
+  → `lo=1000 hi=5000`.
+- `SELECT ?kind (COUNT(?a) AS ?n) WHERE { ?a kind ?kind . } GROUP BY ?kind`
+  → 2 rows: `{ kind=ATOM_FACT (1), n=5 }`, `{ kind=ATOM_CONCEPT (3), n=5 }`.
+- `SELECT ?kind (COUNT(?a) AS ?n) WHERE { ?a kind ?kind . FILTER alpha > 2500 . } GROUP BY ?kind`
+  → 1 row (FACT only, count=3 — CONCEPTs all have alpha=1000 so they're
+  filtered out).
+- `SELECT (COUNT(?a) AS ?n) WHERE { ?a kind FACT . FILTER alpha > 999999 . }`
+  → 1 row, `n=0` (aggregate over empty set still emits a row).
+
+### Out of scope (defer)
+
+- HAVING (filter on aggregates after grouping).
+- DISTINCT in aggregates (`COUNT(DISTINCT ?a)`).
+- Nested aggregates / aggregate expressions in subqueries.
+- Multiple GROUP BY vars (we restrict to a single grouping variable).
+- ORDER BY on aggregate aliases — ORDER BY still scores via the most-
+  recently-bound atom path; the aggregate row has no atom in scope so
+  ORDER BY falls back to 0 for all rows (the ties preserve discovery
+  order). A future round can add an aggregate-alias scoring path.
+
+### File touch summary
+
+- `src/kg/query.nova` (R15D + R16F's module, EXTENDED in place — no new module)
+- NEW `tests/unit/test_kg_query_agg.nova` (67 assertions)
+- NEW `tests/integration/scenario_sss_query_agg.sh` (24 assertions)
+- `README.md` (status banner extended for R17E)
+- `NEXT_SESSION.md` (this section)
+
+### Not touched
+
+- `examples/crossengin_chat.nova` (no chat-side changes needed — `/query`
+  routes through the same `kg_query_cmd` entry point; the new keywords
+  flow through the existing dispatch verbatim).
+
 ## R16E (this session) -- STFT / Cooley-Tukey FFT spectrogram (frequency-domain audio)
 
 **Status: complete -- `src/io/transducers/audio_spectrogram.nova`

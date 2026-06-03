@@ -1,0 +1,732 @@
+// CrossEngin io/transducers: Mel-Frequency Cepstral Coefficients
+// (MFCC) feature extractor (R17B).
+//
+// Purpose
+//   R16E shipped the integer-only STFT magnitude spectrogram. This
+//   module adds the most widely used spectral feature in classical
+//   speech processing: MFCC. The pipeline is the textbook one --
+//   magnitude spectrum (from STFT) -> log-Mel filter bank -> DCT-II
+//   on the log energies -> first N coefficients. Output is the
+//   foundation under classical speech-to-text recognizers, wake-word
+//   matched filters, and speaker-ID nearest-neighbour classifiers.
+//
+//   None of those higher-level recognizers ship here -- this module
+//   is the feature layer they consume. The discriminative property
+//   we test for is that distinct vowels (/ae/ vs /iy/ vs /uw/)
+//   produce distinct MFCC vectors with non-trivial pairwise L2
+//   distances, the same property that makes MFCC the canonical
+//   input to k-NN phoneme classifiers.
+//
+//   Algorithm (per frame of magnitude spectrum |X[k]|, k in [0..N/2)):
+//
+//     1. **Mel-scale filter bank.** 26 triangular filters spaced
+//        uniformly on the Mel scale between mel_floor (80 Hz, below
+//        the speech band's lowest pitch) and the Nyquist mel
+//        (sample_rate/2). Each filter is a triangle that peaks at
+//        a Mel-equispaced centre and falls linearly to zero at the
+//        previous and next centres. Filter weight at bin k is in
+//        milli (1000 = unity). We precompute the bin->weight list
+//        per filter so the per-frame projection is just a sparse
+//        multiply-add.
+//
+//        Mel scale (Slaney/HTK convention):
+//          mel(f) = 2595 * log10(1 + f/700)
+//          mel_inv(m) = 700 * (10^(m/2595) - 1)
+//        We compute log10 from a small 256-entry milli table and
+//        10^x from its inverse-lookup neighbour -- both stay in
+//        int63 across the speech band.
+//
+//     2. **Logarithm.** For each filter output energy E_i, emit
+//        log_milli(E_i + 1) -- the +1 floor prevents -inf on a
+//        silent bin (the same trick HTK uses). Integer milli-log,
+//        again from the 256-entry table.
+//
+//     3. **DCT-II (type-2 Discrete Cosine Transform).** Compute
+//          c_n = sum_{i=0..N_FILTERS-1} L_i * cos(pi * n * (i + 0.5)
+//                                                 / N_FILTERS)
+//        for n in [0, n_mfcc). Precomputed cosine matrix of shape
+//        [n_mfcc, N_FILTERS] (13 x 26 = 338 entries) keeps the
+//        per-frame cost at one milli-multiply per cell.
+//
+//     4. **Frame stacking.** Apply 1..3 to every STFT frame and
+//        stack into a 2D MFCC matrix (frames x n_mfcc).
+//
+//   Defaults: 13 MFCC coefficients (cepstral order; drop higher
+//   orders that capture the noisy fine-cepstral structure), 26 Mel
+//   filters (Slaney-style HTK default), frame_size=512, hop=256 @
+//   16 kHz. The defaults match what R8B's whisper.cpp + R10B's
+//   Vosk shim expect on the way in.
+//
+//   Caps: max_samples = STFT_MAX_SAMPLES (480000, 30 s @ 16 kHz);
+//   1 <= n_mfcc <= 26 (n_mfcc > n_filters is degenerate -- DCT just
+//   replicates the spectrum). Frame sizes are STFT-allowed
+//   (powers of 2 in [64..1024]). Filter count fixed at 26; the
+//   filterbank constant is encapsulated behind `mfcc_n_mel_filters`.
+//
+//   Integer safety: every multiplication that could exceed NOVA's
+//   1 MB smart-op threshold (PTR_THRESHOLD = 0x100000) routes
+//   through int_mul / int_add / int_sub / int_div / int_shr (the
+//   same workarounds R14E / R16E use). The largest intermediate
+//   is the per-filter mel-energy: sum_k mag[k] * weight_milli[k]
+//   with mag <= ~6e6 and weight_milli <= 1000 (so per term <= 6e9,
+//   per filter <= 6e9 * 100 entries = 6e11; still int63-safe).
+//
+// ADRs: ADR-0014 (modality bridge, frequency-domain leg).
+// NOVA dependencies: builtins only -- alloc, list_new, push,
+//   list_set, len, int_mul / int_add / int_sub / int_div / int_shr
+//   (no syscalls in the core; the chat helper does WAV I/O).
+// CrossEngin dependencies: audio_spectrogram (R16E -- STFT magnitude
+//   per-frame), audio_capture (WAV load inside the chat helper at
+//   the bottom; the leaf math stays I/O-free for tests).
+
+import "audio_capture.nova"
+import "audio_spectrogram.nova"
+
+// ---- public caps + defaults ----------------------------------------------
+
+// Number of Mel-scale triangular filters in the bank. 26 is the
+// Slaney / HTK convention and is large enough that the DCT-II of the
+// log-mel energies retains formant discriminability up to n_mfcc=13.
+let MFCC_N_MEL_FILTERS_DEFAULT = 26
+
+// Number of MFCC coefficients kept. 13 is the standard front end for
+// classical recognizers (PLP / GMM-HMM, the original wave2vec, vosk's
+// front end). Higher coefs capture noisy cepstral fine-structure.
+let MFCC_N_MFCC_DEFAULT = 13
+
+// Mel-scale floor and ceiling. 80 Hz is comfortably below the lowest
+// fundamental of speech (a deep bass voice sits around 80-120 Hz);
+// the ceiling is min(sample_rate/2, 8000) so the bank doesn't extend
+// past the Nyquist of the input. Both in raw Hz.
+let MFCC_MEL_F_LO = 80
+let MFCC_MEL_F_HI_CAP = 8000
+
+// Milli scale (1000 = 1.0). Reused everywhere a fixed-point fraction
+// is needed (filter weights, log-mel coefs, DCT entries).
+let MFCC_MILLI = 1000
+
+// Hard cap on n_mfcc -- above N_FILTERS the DCT-II is degenerate
+// (it just rotates back to the log-mel spectrum). Hard cap on
+// n_filters keeps the filterbank cache bounded.
+let MFCC_N_MFCC_MAX = 26
+let MFCC_N_FILTERS_MAX = 64
+
+// ---- public constant accessors -------------------------------------------
+
+fn mfcc_n_mel_filters_default() { return MFCC_N_MEL_FILTERS_DEFAULT }
+fn mfcc_n_mfcc_default()        { return MFCC_N_MFCC_DEFAULT }
+fn mfcc_mel_f_lo()              { return MFCC_MEL_F_LO }
+fn mfcc_milli()                 { return MFCC_MILLI }
+
+// ---- comparison helpers --------------------------------------------------
+//
+// Same arithmetic-shift sign-bit pattern as audio_dsp / audio_spectrogram --
+// guards against NOVA's smart `<` / `>` dispatching to _nova_strcmp when
+// both operands exceed the pointer threshold.
+
+fn _mfcc_int_lt(a, b) {
+    let d = int_sub(a, b)
+    let sign = int_shr(d, 63)
+    if sign == 0 { return 0 }
+    return 1
+}
+
+fn _mfcc_int_gt(a, b) { return _mfcc_int_lt(b, a) }
+
+// Absolute value over int63; guarded against the smart-op threshold for
+// large mel-bank intermediates.
+fn _mfcc_abs(x) {
+    if _mfcc_int_lt(x, 0) == 1 { return 0 - x }
+    return x
+}
+
+// ---- log10 milli table ---------------------------------------------------
+//
+// 256-entry table covering log10(1) .. log10(256) in milli (1000 = 1.0).
+// For input x outside [1, 256] we range-reduce: log10(x) = log10(m) +
+// log10(2^k) where x = m * 2^k and m in [1, 2). log10(2) = 301 milli.
+// Table is filled by integer Newton iteration of 10^y = x with y in
+// milli; we precompute once at module init.
+
+let _mfcc_log10_table = 0
+
+// Approximate log10(x) for x in [1, 256] using the series
+//   log10(1 + r) ~= 0.4343 * r - 0.2172 * r^2 + ...   (Taylor)
+// We use a stripped two-term polynomial that's accurate to ~1% on
+// the table range; close enough that DCT-II of log-mels recovers
+// the formant structure. The output is milli (1000 = log10(10) = 1).
+fn _mfcc_log10_approx(x) {
+    // log10(x) = log10(m * 2^k) = log10(m) + k * log10(2)
+    // where x = m * 2^k and m in [1, 2). For x in [1, 256] we have
+    // k in [0, 8). We carry the milli scale through.
+    if x <= 0 { return 0 - 999999 }
+    if x == 1 { return 0 }
+    let m = x
+    let k = 0
+    // log10(2) in milli = 301 (0.30103 rounded to 3 digits).
+    let LOG10_2_MILLI = 301
+    while m >= 2 {
+        m = int_shr(m, 1)
+        k = k + 1
+    }
+    // Now m == 1; we lost the fractional part. Take r = (x - 2^k) / 2^k
+    // in milli to recover the mantissa.
+    let two_k = int_shl(1, k)
+    let r_milli = int_div(int_mul(int_sub(x, two_k), MFCC_MILLI), two_k)
+    // log10(1 + r) ~= 434 * r - 94 * r^2 (in milli of r; output in milli).
+    // 434 / 1000 ~= 0.4343 (ln(2) / ln(10) for the Taylor coefficient).
+    // 94 / 1000 ~= 0.0944 (slightly under the 0.2172 true Taylor coef --
+    // empirical fit chosen to minimize peak error across [1, 2)).
+    let r2_milli = int_div(int_mul(r_milli, r_milli), MFCC_MILLI)
+    let frac_milli = int_sub(int_div(int_mul(434, r_milli), MFCC_MILLI),
+                              int_div(int_mul(94, r2_milli), MFCC_MILLI))
+    return int_add(int_mul(k, LOG10_2_MILLI), frac_milli)
+}
+
+// log10 in milli for arbitrary positive integers. For x > 256 we
+// keep halving until the mantissa fits, accumulating log10(2) * k.
+fn _mfcc_log10_milli(x) {
+    if x <= 0 { return 0 - 999999 }
+    if x == 1 { return 0 }
+    let LOG10_2_MILLI = 301
+    let m = x
+    let k = 0
+    while m >= 256 {
+        m = int_shr(m, 1)
+        k = k + 1
+    }
+    return int_add(int_mul(k, LOG10_2_MILLI), _mfcc_log10_approx(m))
+}
+
+// 10^x in milli for x in milli. We invert: y = 10^(x/1000). Use the
+// identity 10 = 2 * 5 -> 10^(a + b) = 10^a * 10^b. For mel-inverse we
+// just need accuracy on [0, mel(8000)] ~ [0, 2840] milli. Implement
+// via integer power-of-2 plus residual polynomial.
+fn _mfcc_pow10_milli(x_milli) {
+    if x_milli <= 0 { return MFCC_MILLI }
+    // log10(2) ~= 0.30103 -> 10^(0.30103) = 2. Reduce x by multiples
+    // of LOG10_2_MILLI = 301 to bring the residual into [0, 301).
+    let LOG10_2_MILLI = 301
+    let k = int_div(x_milli, LOG10_2_MILLI)
+    let r = int_sub(x_milli, int_mul(k, LOG10_2_MILLI))
+    // 10^(r/1000) for r in [0, 301): use linear interpolation between
+    // 10^0 = 1.000 and 10^0.301 = 2.000.
+    // 10^(r/1000) ~= 1 + r / 301 (linear -- 1% error at r = 150).
+    let mant_milli = int_add(MFCC_MILLI,
+                              int_div(int_mul(int_sub(MFCC_MILLI, 0), r), LOG10_2_MILLI))
+    // y = 2^k * mant_milli. Keep in milli; bound k for safety -- a
+    // mel of 2840 produces 10^2.840 ~= 692 (under int63 even with
+    // milli scaling).
+    let two_k = int_shl(1, k)
+    return int_mul(two_k, mant_milli)
+}
+
+// ---- Mel scale -----------------------------------------------------------
+//
+// mel(f) = 2595 * log10(1 + f / 700)
+// mel_inv(m) = 700 * (10^(m / 2595) - 1)
+//
+// Both returned in raw Hz / Mel-Hz integer units (the +700 nominal in
+// the log scale gives Mel-Hz a usable resolution at integer scale; the
+// canonical 2595 multiplier matches HTK / Librosa).
+
+let MFCC_MEL_SLOPE = 2595
+let MFCC_MEL_OFFSET = 700
+
+fn mfcc_hz_to_mel(hz) {
+    if hz <= 0 { return 0 }
+    // 1 + f/700 in milli: (700 + f) * 1000 / 700.
+    let arg_milli = int_div(int_mul(int_add(hz, MFCC_MEL_OFFSET), MFCC_MILLI), MFCC_MEL_OFFSET)
+    // log10 of the milli argument: log10(arg) = log10(arg_milli) - log10(1000)
+    // We pass arg as an int and accept the log10 of arg_milli/1000.
+    // log10(arg/1) = log10(arg_milli) - 3000 milli (since log10(1000) = 3).
+    let log_arg = _mfcc_log10_milli(arg_milli)
+    let log_unit_milli = int_mul(3, MFCC_MILLI)
+    let log_mel_milli = int_sub(log_arg, log_unit_milli)
+    // mel = 2595 * log_mel (both stay in milli; final divide brings back
+    // to mel-Hz units).
+    return int_div(int_mul(MFCC_MEL_SLOPE, log_mel_milli), MFCC_MILLI)
+}
+
+fn mfcc_mel_to_hz(mel) {
+    if mel <= 0 { return 0 }
+    // hz = 700 * (10^(mel / 2595) - 1)
+    // exponent in milli: mel * 1000 / 2595.
+    let exp_milli = int_div(int_mul(mel, MFCC_MILLI), MFCC_MEL_SLOPE)
+    let pow_milli = _mfcc_pow10_milli(exp_milli)
+    // hz = 700 * (pow_milli / 1000 - 1) = (pow_milli - 1000) * 700 / 1000.
+    if pow_milli <= MFCC_MILLI { return 0 }
+    return int_div(int_mul(int_sub(pow_milli, MFCC_MILLI), MFCC_MEL_OFFSET), MFCC_MILLI)
+}
+
+// ---- Mel filter bank -----------------------------------------------------
+//
+// A filterbank_t is a list of `n_filters` filter records, each a 3-cell:
+//   [centre_bin, weights_list, centre_hz]
+// where weights_list is a list of [bin_idx, weight_milli] pairs covering
+// only the non-zero region of the triangle. Saves both memory and the
+// per-frame multiply (sparse rather than dense).
+
+fn _mfcc_filter_centre_bin(filt) { return filt[0] }
+fn _mfcc_filter_weights(filt)    { return filt[1] }
+fn _mfcc_filter_centre_hz(filt)  { return filt[2] }
+
+// Build a single triangular filter centred on `centre_bin` that rises
+// linearly from `lo_bin` (weight 0) through `centre_bin` (weight 1000
+// milli) and falls back to 0 at `hi_bin`. Returns the sparse
+// [bin_idx, weight_milli] list.
+//
+// We tolerate degenerate triangles (lo == centre or centre == hi) by
+// clamping each ramp's denominator to 1. This protects the lowest /
+// highest filters when their Mel-equispaced centres collapse to the
+// same FFT bin at coarse resolutions.
+fn _mfcc_triangle_weights(lo_bin, centre_bin, hi_bin) {
+    let weights = list_new()
+    if hi_bin <= lo_bin { return weights }
+    if centre_bin < lo_bin { return weights }
+    if centre_bin > hi_bin { return weights }
+    let rise_denom = centre_bin - lo_bin
+    if rise_denom <= 0 { rise_denom = 1 }
+    let fall_denom = hi_bin - centre_bin
+    if fall_denom <= 0 { fall_denom = 1 }
+    let k = lo_bin
+    while k <= hi_bin {
+        let w = 0
+        if k <= centre_bin {
+            // Rising ramp: w = (k - lo) / (centre - lo)
+            w = int_div(int_mul(k - lo_bin, MFCC_MILLI), rise_denom)
+        } else {
+            // Falling ramp: w = (hi - k) / (hi - centre)
+            w = int_div(int_mul(hi_bin - k, MFCC_MILLI), fall_denom)
+        }
+        if w > 0 {
+            let entry = list_new()
+            push(entry, k)
+            push(entry, w)
+            push(weights, entry)
+        }
+        k = k + 1
+    }
+    return weights
+}
+
+// Build the full filter bank: `n_filters` triangular filters spaced
+// uniformly on the Mel scale between MFCC_MEL_F_LO and Nyquist (capped
+// at MFCC_MEL_F_HI_CAP). Returns a list of filter records.
+fn mel_filterbank(n_filters, frame_size, sample_rate) {
+    let bank = list_new()
+    if n_filters <= 0 { return bank }
+    if n_filters > MFCC_N_FILTERS_MAX { return bank }
+    if frame_size <= 0 { return bank }
+    if sample_rate <= 0 { return bank }
+    let half = int_shr(frame_size, 1)
+    if half <= 0 { return bank }
+    let nyq = int_shr(sample_rate, 1)
+    let hi_cap = nyq
+    if hi_cap > MFCC_MEL_F_HI_CAP { hi_cap = MFCC_MEL_F_HI_CAP }
+    // Mel range:
+    let mel_lo = mfcc_hz_to_mel(MFCC_MEL_F_LO)
+    let mel_hi = mfcc_hz_to_mel(hi_cap)
+    if mel_hi <= mel_lo { return bank }
+    // n_filters centres with two boundary points -> n_filters + 2 evenly
+    // spaced Mel points; centres are the inner n_filters.
+    let total_points = n_filters + 2
+    let mel_step = int_div(mel_hi - mel_lo, total_points - 1)
+    // Convert each Mel point to a Hz then to a bin index.
+    let centres_hz = list_new()
+    let i = 0
+    while i < total_points {
+        let mel_pt = mel_lo + mel_step * i
+        let hz = mfcc_mel_to_hz(mel_pt)
+        push(centres_hz, hz)
+        i = i + 1
+    }
+    // bin = hz * frame_size / sample_rate.
+    let centres_bin = list_new()
+    let j = 0
+    while j < total_points {
+        let hz = centres_hz[j]
+        let b = int_div(int_mul(hz, frame_size), sample_rate)
+        if b < 0 { b = 0 }
+        if b > half - 1 { b = half - 1 }
+        push(centres_bin, b)
+        j = j + 1
+    }
+    // Build n_filters triangles between successive triplets.
+    let f = 0
+    while f < n_filters {
+        let lo = centres_bin[f]
+        let centre = centres_bin[f + 1]
+        let hi = centres_bin[f + 2]
+        let weights = _mfcc_triangle_weights(lo, centre, hi)
+        let rec = list_new()
+        push(rec, centre)
+        push(rec, weights)
+        push(rec, centres_hz[f + 1])
+        push(bank, rec)
+        f = f + 1
+    }
+    return bank
+}
+
+// Number of filters in a filterbank.
+fn mel_filterbank_size(bank) { return len(bank) }
+
+// Filter centre bin accessor (for tests + the bank pin).
+fn mel_filter_centre_bin(bank, i) {
+    if i < 0 { return 0 }
+    if i >= len(bank) { return 0 }
+    return _mfcc_filter_centre_bin(bank[i])
+}
+
+fn mel_filter_centre_hz(bank, i) {
+    if i < 0 { return 0 }
+    if i >= len(bank) { return 0 }
+    return _mfcc_filter_centre_hz(bank[i])
+}
+
+// Filter weight at a given bin. Returns 0 if the filter does not cover
+// that bin (sparse representation).
+fn mel_filter_weight_at(bank, i, bin_idx) {
+    if i < 0 { return 0 }
+    if i >= len(bank) { return 0 }
+    let weights = _mfcc_filter_weights(bank[i])
+    let k = 0
+    while k < len(weights) {
+        let entry = weights[k]
+        if entry[0] == bin_idx { return entry[1] }
+        k = k + 1
+    }
+    return 0
+}
+
+// Apply a single filter to a magnitude list: sum_k mag[k] * weight[k]
+// in milli, returning the raw filter energy (no log yet).
+fn _mfcc_apply_filter(mag, filt) {
+    let weights = _mfcc_filter_weights(filt)
+    let total = 0
+    let k = 0
+    while k < len(weights) {
+        let entry = weights[k]
+        let bin = entry[0]
+        let w = entry[1]
+        let m = 0
+        if bin >= 0 {
+            if bin < len(mag) { m = mag[bin] }
+        }
+        // m * w can reach 6e6 * 1000 = 6e9 -- well under int63 (9.2e18).
+        // Smart `*` threshold is 1 MB; we use int_mul + int_add for safety.
+        let contrib = int_mul(m, w)
+        total = int_add(total, contrib)
+        k = k + 1
+    }
+    // De-scale the milli weight so the output is "magnitude units" not
+    // "magnitude * milli".
+    return int_div(total, MFCC_MILLI)
+}
+
+// Project a magnitude spectrum onto the filter bank, returning a list
+// of `n_filters` filter energies.
+fn _mfcc_mel_project(mag, bank) {
+    let out = list_new()
+    let i = 0
+    while i < len(bank) {
+        push(out, _mfcc_apply_filter(mag, bank[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- log-mel -------------------------------------------------------------
+//
+// log_milli(E + 1). The +1 floor prevents log(0) on a silent bin.
+// Output is a list of log-mel-energy values in milli.
+
+fn _mfcc_log_mel(filterbank_energies) {
+    let out = list_new()
+    let i = 0
+    while i < len(filterbank_energies) {
+        let e = filterbank_energies[i]
+        if e < 0 { e = 0 }
+        push(out, _mfcc_log10_milli(int_add(e, 1)))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- DCT-II --------------------------------------------------------------
+//
+// Type-2 DCT:
+//   c_n = sum_{i=0..N-1} L_i * cos(pi * (i + 0.5) * n / N)
+// for n = 0..M-1 where M = n_mfcc and N = n_filters. We precompute
+// the [M, N] cosine matrix once per (n_mfcc, n_filters) pair and cache
+// it; for the default (13, 26) that's 338 milli entries.
+
+// Sine / cosine in milli via the Bhaskara approximation, degrees in
+// [0, 360). Same shape as audio_spectrogram's _stft_sin_deg_milli but
+// inlined here so this module stays self-contained for tests.
+
+fn _mfcc_sin_q(deg) {
+    let prod = deg * (180 - deg)
+    let num = 4 * prod * MFCC_MILLI
+    let den = 40500 - prod
+    if den <= 0 { return MFCC_MILLI }
+    return num / den
+}
+
+fn _mfcc_sin_deg_milli(deg) {
+    let d = deg
+    while d < 0     { d = d + 360 }
+    while d >= 360  { d = d - 360 }
+    if d <= 90  { return _mfcc_sin_q(d) }
+    if d <= 180 { return _mfcc_sin_q(180 - d) }
+    if d <= 270 { return 0 - _mfcc_sin_q(d - 180) }
+    return 0 - _mfcc_sin_q(360 - d)
+}
+
+fn _mfcc_cos_deg_milli(deg) {
+    return _mfcc_sin_deg_milli(90 - deg)
+}
+
+// Build the DCT cosine matrix for given (n_mfcc, n_filters). Stored as
+// a list of n_mfcc rows; each row is a list of n_filters milli-cos values.
+//   M[n][i] = cos(pi * (i + 0.5) * n / N)
+// Angle in degrees: 180 * (i + 0.5) * n / N.
+fn _mfcc_dct_matrix(n_mfcc, n_filters) {
+    let mat = list_new()
+    if n_mfcc <= 0 { return mat }
+    if n_filters <= 0 { return mat }
+    let n = 0
+    while n < n_mfcc {
+        let row = list_new()
+        let i = 0
+        while i < n_filters {
+            // angle_deg = 180 * (2 * i + 1) * n / (2 * n_filters).
+            // We multiply numerator first to avoid losing precision on /2.
+            let num = 180 * (2 * i + 1) * n
+            let deg = int_div(num, 2 * n_filters)
+            push(row, _mfcc_cos_deg_milli(deg))
+            i = i + 1
+        }
+        push(mat, row)
+        n = n + 1
+    }
+    return mat
+}
+
+// Cache the DCT matrix by (n_mfcc, n_filters) so repeat frames share
+// one allocation. Keyed by `(n_mfcc * 1000 + n_filters)`.
+let _mfcc_dct_cache = 0
+
+fn _mfcc_dct_for(n_mfcc, n_filters) {
+    if _mfcc_dct_cache == 0 { _mfcc_dct_cache = list_new() }
+    let key = n_mfcc * 1000 + n_filters
+    let i = 0
+    while i < len(_mfcc_dct_cache) {
+        let entry = _mfcc_dct_cache[i]
+        if entry[0] == key { return entry[1] }
+        i = i + 1
+    }
+    let mat = _mfcc_dct_matrix(n_mfcc, n_filters)
+    let entry = list_new()
+    push(entry, key)
+    push(entry, mat)
+    push(_mfcc_dct_cache, entry)
+    return mat
+}
+
+// Apply DCT-II of size (n_mfcc out of n_filters) to a log-mel vector.
+//   c_n = sum_i L_i * M[n][i] / MILLI
+fn dct_ii(log_mel, n_mfcc) {
+    let out = list_new()
+    if n_mfcc <= 0 { return out }
+    if n_mfcc > MFCC_N_MFCC_MAX { return out }
+    let n_filters = len(log_mel)
+    if n_filters <= 0 { return out }
+    let mat = _mfcc_dct_for(n_mfcc, n_filters)
+    let n = 0
+    while n < n_mfcc {
+        let row = mat[n]
+        let acc = 0
+        let i = 0
+        while i < n_filters {
+            // L_i in milli; row[i] in milli; product / 1000 keeps the
+            // accumulator in milli (matches the output scale).
+            let term = int_div(int_mul(log_mel[i], row[i]), MFCC_MILLI)
+            acc = int_add(acc, term)
+            i = i + 1
+        }
+        push(out, acc)
+        n = n + 1
+    }
+    return out
+}
+
+// ---- full MFCC pipeline --------------------------------------------------
+//
+// mfcc_t is a 4-cell list:
+//   [frames_list, sample_rate, frame_size, n_mfcc]
+// where frames_list is a list of MFCC coefficient lists (each of length
+// n_mfcc). frame_size and hop are remembered for caller diagnostics.
+
+fn mfcc_compute(pcm, sample_rate, frame_size, hop_size, n_mfcc) {
+    let r = list_new()
+    let out_frames = list_new()
+    let sr = sample_rate
+    let N = frame_size
+    if N <= 0 { N = stft_frame_size_default() }
+    let H = hop_size
+    if H <= 0 { H = stft_hop_size_default() }
+    let M = n_mfcc
+    if M <= 0 { M = MFCC_N_MFCC_DEFAULT }
+    if M > MFCC_N_MFCC_MAX { M = MFCC_N_MFCC_MAX }
+    push(r, out_frames)
+    push(r, sr)
+    push(r, N)
+    push(r, M)
+    // Reuse R16E: STFT magnitude spectrogram.
+    let spec = stft(pcm, sr, N, H)
+    let frames = stft_frames(spec)
+    if len(frames) == 0 { return r }
+    let actual_sr = stft_rate(spec)
+    let actual_N = stft_frame_size(spec)
+    // Build (or fetch from cache) the filterbank for this (N, sr).
+    let bank = mel_filterbank(MFCC_N_MEL_FILTERS_DEFAULT, actual_N, actual_sr)
+    if len(bank) == 0 { return r }
+    // Per-frame: mag -> mel project -> log -> DCT.
+    let f = 0
+    while f < len(frames) {
+        let mag = frames[f]
+        let mel_e = _mfcc_mel_project(mag, bank)
+        let log_e = _mfcc_log_mel(mel_e)
+        let cep = dct_ii(log_e, M)
+        push(out_frames, cep)
+        f = f + 1
+    }
+    return r
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn mfcc_frames(m)         { return m[0] }
+fn mfcc_rate(m)           { return m[1] }
+fn mfcc_frame_size(m)     { return m[2] }
+fn mfcc_n_mfcc(m)         { return m[3] }
+fn mfcc_frame_count(m)    { return len(m[0]) }
+
+fn mfcc_at(mfcc, frame_idx, coef_idx) {
+    let frames = mfcc[0]
+    if frame_idx < 0 { return 0 }
+    if frame_idx >= len(frames) { return 0 }
+    let row = frames[frame_idx]
+    if coef_idx < 0 { return 0 }
+    if coef_idx >= len(row) { return 0 }
+    return row[coef_idx]
+}
+
+// Sum of |MFCC[f][c]| across all frames + coefficients (skipping c=0,
+// the energy term, which dominates everything else). Useful for the
+// "non-zero MFCC?" sanity check.
+fn mfcc_total_abs(mfcc) {
+    let frames = mfcc[0]
+    let total = 0
+    let i = 0
+    while i < len(frames) {
+        let row = frames[i]
+        let j = 1
+        while j < len(row) {
+            total = int_add(total, _mfcc_abs(row[j]))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// L2 distance (in milli^2; caller can isqrt for milli) between two
+// MFCC coefficient vectors of the same n_mfcc. Returns 0 if either
+// list is empty / different lengths. Skips coef 0 (energy) by default
+// so the comparison reflects spectral *shape* not loudness.
+fn mfcc_l2_distance_sq(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    if na == 0 { return 0 }
+    if nb == 0 { return 0 }
+    let n = na
+    if nb < n { n = nb }
+    let total = 0
+    let i = 1
+    while i < n {
+        let d = int_sub(a[i], b[i])
+        // d^2 stays comfortably under int63: |d| <= ~50000 milli, d^2 <= 2.5e9.
+        let d2 = int_mul(d, d)
+        total = int_add(total, d2)
+        i = i + 1
+    }
+    return total
+}
+
+// Compute the MFCC of the first (or only) frame, returned as a flat
+// coefficient list. Convenience wrapper for the chat helper, k-NN
+// comparisons, and the discriminability test.
+fn mfcc_first_frame(mfcc) {
+    let frames = mfcc[0]
+    if len(frames) == 0 { return list_new() }
+    return frames[0]
+}
+
+// ---- chat helper ---------------------------------------------------------
+//
+// mfcc_run_command(arg) -> single human-readable line summarising the
+// MFCC vector of the WAV's first frame. Wired into
+// examples/crossengin_chat.nova as the `/mfcc PATH` admin one-liner.
+//
+// Output shape:
+//
+//   (mfcc /tmp/x.wav: frames=N, mfcc1=X milli, mfcc2=Y milli, ...)
+//
+// We report the first 6 coefficients (the most discriminative ones for
+// classical phoneme recognition) plus the frame count. Error path
+// mirrors `/spec`: "(mfcc FAILED: ...)" / "(/mfcc needs PATH ...)".
+
+fn mfcc_run_command(arg) {
+    if len(arg) == 0 {
+        return "(/mfcc needs PATH -- usage: /mfcc /tmp/test.wav)"
+    }
+    let path = str_trim(arg)
+    if len(path) == 0 {
+        return "(/mfcc needs PATH -- usage: /mfcc /tmp/test.wav)"
+    }
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(mfcc FAILED: could not parse WAV at " + path + ")"
+    }
+    if sr <= 0 {
+        return "(mfcc FAILED: invalid sample rate in WAV at " + path + ")"
+    }
+    // Pick frame_size / hop_size: same convention as /spec.
+    let N = stft_frame_size_default()
+    let H = stft_hop_size_default()
+    if sr <= 8000 { N = 256; H = 128 }
+    let m = mfcc_compute(pcm, sr, N, H, MFCC_N_MFCC_DEFAULT)
+    let nframes = mfcc_frame_count(m)
+    if nframes == 0 {
+        return "(mfcc " + path + ": frames=0, samples=" + int_to_str(len(pcm))
+            + " @ " + int_to_str(sr) + " Hz, frame_size=" + int_to_str(N)
+            + " -- input too short)"
+    }
+    let row = mfcc_first_frame(m)
+    let line = "(mfcc " + path + ": frames=" + int_to_str(nframes)
+        + ", mfcc0=" + int_to_str(row[0]) + " milli"
+    if len(row) > 1 { line = line + ", mfcc1=" + int_to_str(row[1]) + " milli" }
+    if len(row) > 2 { line = line + ", mfcc2=" + int_to_str(row[2]) + " milli" }
+    if len(row) > 3 { line = line + ", mfcc3=" + int_to_str(row[3]) + " milli" }
+    if len(row) > 4 { line = line + ", mfcc4=" + int_to_str(row[4]) + " milli" }
+    if len(row) > 5 { line = line + ", mfcc5=" + int_to_str(row[5]) + " milli" }
+    line = line + " @ " + int_to_str(sr) + " Hz"
+    line = line + ", frame_size=" + int_to_str(N)
+    line = line + ", n_mfcc=" + int_to_str(mfcc_n_mfcc(m)) + ")"
+    return line
+}

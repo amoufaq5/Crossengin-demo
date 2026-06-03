@@ -58,7 +58,32 @@ computational units rather than orchestrating a pipeline of modules.
 > (`tests/unit/test_kg_query_ext.nova`) + 22 integration assertions
 > (`tests/integration/scenario_ppp_query_ext.sh`); all green.
 > All 55 R15D `test_kg_query.nova` assertions remain bit-identically
-> green (the BGP+FILTER+LIMIT surface is untouched). R16A adds
+> green (the BGP+FILTER+LIMIT surface is untouched). R17E completes the
+> mini-SPARQL "SPARQL 1.1 analytical" subset by extending
+> `src/kg/query.nova` once more with **aggregate functions** (`COUNT`,
+> `SUM`, `AVG`, `MIN`, `MAX`) and **GROUP BY**. Each aggregate SELECT
+> item is a parenthesised `(AGGFN(?var [field]) AS ?alias)` tuple --
+> `COUNT(?a)` counts the rows in the binding set; `SUM(?a alpha)`,
+> `AVG(?a alpha)`, `MIN(?a alpha)`, `MAX(?a alpha)` read the `field`
+> off the atom bound to `?var` and reduce. Without `GROUP BY`,
+> aggregates fold the WHERE-clause output into a single row; with
+> `GROUP BY ?var`, the binding set partitions by the int value bound
+> to `?var` (e.g. `?a kind ?kind . GROUP BY ?kind` partitions by atom
+> kind code) and emits one row per non-empty group. Empty-set
+> sentinels: COUNT=SUM=0, AVG=MIN=MAX=`QRY_AGG_EMPTY` (-1). Integer
+> arithmetic throughout (AVG = SUM / COUNT, truncating). FILTER
+> applies before aggregation; LIMIT applies after. On R15D's 10-atom
+> fixture: `COUNT(?a)` over FACTs = 5; `SUM(?a alpha)` = 15000;
+> `AVG(?a alpha)` = 3000; `MIN/MAX` = 1000 / 5000; `GROUP BY ?kind`
+> returns two rows (FACT count=5, CONCEPT count=5). The parser gains
+> 7 new keywords (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP`, `AS`),
+> two new parsed_query_t slots (`QRY_AGGS`, `QRY_GROUPBY`), and new
+> accessors `kg_query_aggs / _aggs_has / _groupby_has / _groupby_var`.
+> 67 unit assertions (`tests/unit/test_kg_query_agg.nova`) + 24
+> integration assertions (`tests/integration/scenario_sss_query_agg.sh`);
+> all green. The 55 R15D + 60 R16F unit assertions remain
+> bit-identically green; R15D/R16F integration scenarios likewise
+> pass unchanged. R16A adds
 > `src/persistence/merkle_signing.nova` — an
 > Ed25519 sign + verify wrap of the R15E Merkle root, closing the
 > last gap in the snapshot attestation chain. R15E shipped tamper

@@ -1446,3 +1446,172 @@ R14E:
 - **Larger FFT sizes** -- 2048 / 4096 / 8192 for HD audio analysis
   at 48 kHz; the twiddle table re-uses the same milli precision
   but needs a bigger base or per-N rebuild.
+
+## R17B -- MFCC (Mel-Frequency Cepstral Coefficients)
+
+Module: `src/io/transducers/audio_mfcc.nova` (~520 lines)
+Tests:  `tests/unit/test_audio_mfcc.nova` (41 assertions),
+        `tests/integration/scenario_qqq_mfcc.sh` (21 assertions)
+Chat:   `/mfcc PATH`
+
+R17B builds the **canonical front-end for classical speech tasks** on
+top of R16E's STFT magnitude spectrogram. MFCC is the standard input
+to GMM-HMM speech-to-text, DTW/k-NN wake-word matched filters, GMM
+speaker-ID classifiers, and most pre-deep-learning phoneme recognizers.
+The discriminative property is that perceptually distinct sounds (/ae/
+vs /iy/ vs /uw/) map to MFCC vectors with non-trivial pairwise L2
+distances -- the property every k-NN classifier relies on.
+
+### Algorithm
+
+Per STFT magnitude frame `|X[k]|` for k in `[0, N/2)`:
+
+1. **Mel-scale filter bank.** 26 triangular filters spaced uniformly
+   on the Mel scale (perceptually-weighted Hz) between `mel_floor =
+   mel(80 Hz)` (below the lowest speech pitch) and `mel(min(Nyquist,
+   8000 Hz))`. Each filter is a triangle peaking at a Mel-equispaced
+   centre with weight 1000 milli, falling linearly to 0 at the
+   previous and next centres. Filter weights are precomputed per
+   filter as sparse `[bin, weight_milli]` pairs at filterbank build
+   time.
+
+   Mel scale (HTK / Slaney convention):
+       mel(f) = 2595 * log10(1 + f / 700)
+       mel_inv(m) = 700 * (10^(m / 2595) - 1)
+
+   Both directions computed via an integer milli `log10` (a
+   2-term Taylor polynomial on the mantissa after power-of-2
+   range reduction) and its inverse `pow10` (linear interpolation
+   on the residual after dividing by `log10(2)`). Accuracy is
+   ~5% on the speech band, plenty for the integer-quantized
+   filter bins.
+
+2. **Logarithm.** For each filter output energy `E_i`, emit
+   `log10_milli(E_i + 1)` -- the `+1` floor prevents
+   `log(0) = -inf` on a silent bin (the HTK trick). Output is in
+   milli.
+
+3. **DCT-II (Type-2 Discrete Cosine Transform).**
+   ```
+   c_n = sum_{i=0..N_FILTERS-1} L_i * cos(pi * (i + 0.5) * n / N_FILTERS)
+   ```
+   for n in `[0, n_mfcc)`. Precomputed cosine matrix of shape
+   `[n_mfcc, N_FILTERS] = [13, 26] = 338` milli entries; cached by
+   `(n_mfcc, n_filters)` key so repeat frames share one allocation.
+
+4. **Frame stacking.** Apply steps 1..3 to every STFT frame and
+   stack into a `frames x n_mfcc` MFCC matrix.
+
+### Defaults / caps
+
+- Defaults: `n_mfcc = 13`, `n_mel_filters = 26`, frame_size /
+  hop_size inherited from R16E (`512 / 256` @ 16 kHz; `256 / 128`
+  @ 8 kHz to match `/spec`). The defaults match what whisper.cpp
+  + Vosk consume on their way in.
+- 1 <= `n_mfcc` <= 26 (above 26 the DCT is degenerate -- it just
+  rotates back to the log-mel spectrum). `n_filters` fixed at 26.
+- Frame sizes: powers of 2 in `{64..1024}` (inherits R16E radix-2
+  constraint). Sample rate: clamped to `[8000, 48000]` Hz. Max
+  samples: 480000 (30 s @ 16 kHz, R12D / R14E / R16E parity).
+
+### Public API (`audio_mfcc.nova`)
+
+- `mfcc_compute(pcm, sample_rate, frame_size, hop_size, n_mfcc)
+  -> mfcc_t` -- 4-cell `[frames_list, sample_rate, frame_size,
+  n_mfcc]`. Pass `0` for any of frame_size, hop_size, n_mfcc to
+  get the default. Reuses R16E's `stft(...)` internally.
+- `mfcc_at(mfcc, frame_idx, coef_idx) -> int_milli` --
+  bounds-checked coefficient access (returns 0 out-of-range).
+- `mfcc_frame_count(mfcc) -> int`
+- `mfcc_first_frame(mfcc) -> list_of_int_milli`
+- `mfcc_l2_distance_sq(vec_a, vec_b) -> int` -- pairwise L2-squared
+  distance over coefs 1..n (skipping the c_0 energy term so the
+  comparison reflects spectral SHAPE not loudness).
+- `mel_filterbank(n_filters, frame_size, sample_rate) ->
+  filterbank_t` -- exposed for testability + reuse by the future
+  matched-filter / spectral-mask paths.
+- `dct_ii(log_mel_energies, n_mfcc) -> list[int_milli]` -- exposed
+  for testability + reuse by any cepstral-domain code (formant
+  tracker, etc.).
+- `mfcc_hz_to_mel(hz) -> mel`, `mfcc_mel_to_hz(mel) -> hz` --
+  the perceptual scale conversions, exposed for callers that want
+  to compute filter centre frequencies directly.
+
+### Chat wiring (2 net lines in `crossengin_chat.nova`)
+
+```
+/mfcc PATH         MFCC vector (first frame) of PATH WAV (26 Mel filters + DCT-13, R17B)
+```
+
+`/mfcc <wav>` parses the WAV via the shared `audio_capture_to_pcm`,
+picks the same `frame_size / hop_size` as `/spec` (256/128 at 8 kHz,
+512/256 otherwise), computes MFCC, and reports the first frame's
+coefficients:
+
+```
+(mfcc PATH: frames=N, mfcc0=X milli, mfcc1=Y milli, ..., mfcc5=Z milli
+ @ SR Hz, frame_size=N, n_mfcc=13)
+```
+
+Error paths mirror `/spec`: missing path -> `(mfcc FAILED: could
+not parse WAV at PATH)`; empty argument -> `(/mfcc needs PATH --
+usage: /mfcc /tmp/test.wav)`.
+
+### Verification snapshot (latest run)
+
+- 41 unit assertions in `tests/unit/test_audio_mfcc.nova` (above
+  the 30 floor in the brief). 21 integration assertions in
+  `tests/integration/scenario_qqq_mfcc.sh`. All green.
+- **Mel scale:** `mel(1000 Hz) = 999` milli (HTK reference: 1000);
+  `mel(8000 Hz) = 2885`. Monotone across [0, Nyquist].
+- **Filter bank:** 26 filters @ 8 kHz / N=256 lay out from centre
+  bin 5 (174 Hz) to centre bin 127 (4099 Hz). All centres
+  monotonically non-decreasing.
+- **Filter triangle shape:** middle filter peak weight = 1000 milli
+  at centre, near-zero at neighbour centres.
+- **DCT-II:** constant input -> c_0 dominant, c_n>0 ~= 0 (under
+  5% of c_0). Step-wave at DCT frequency 3 -> peak coef in `[2, 6]`
+  (integer phase rounding).
+- **MFCC vowel discriminability:** the property every downstream
+  classifier relies on.
+  - `mfcc1(/ae/)` = -322
+  - `mfcc1(/iy/)` = 2084
+  - `mfcc1(/uw/)` = 6506
+  - L2_sq(/ae/, /iy/) ~ 4.9e8 (L2 ~ 22000 milli)
+  - L2_sq(/ae/, /uw/) ~ 3.9e8 (L2 ~ 19700 milli)
+  - L2_sq(/iy/, /uw/) ~ 1.9e8 (L2 ~ 13800 milli)
+  - All pairwise distances substantial (> 1e6 squared = > 1000
+    milli L2). MFCC captures phoneme identity even in this
+    integer-only impl.
+- **MFCC on JFK 16 kHz WAV** (whisper.cpp bundled sample, 176000
+  samples): 686 frames, n_mfcc=13, 684/686 frames have non-zero
+  coefs (the first 2 frames are silence -> all-zero log-mel ->
+  all-zero DCT; the remainder of the clip has full cepstral
+  structure).
+- **MFCC on silence:** all coefs exactly 0 (the log-floor `+1` in
+  `log10(E + 1)` gives `log10(1) = 0`, so silence projects to a
+  zero vector -- the cleanest possible silent fingerprint).
+- 182/182 existing unit tests + every audio scenario still pass
+  (R6E synth, R7F VAD, R8B / R10B STT, R10F / R11B pitch,
+  R12D PSOLA, R13D voice clone, R14E DSP, R16E STFT).
+
+### Future work
+
+- **Delta + delta-delta MFCC** -- 1st and 2nd derivative of the
+  MFCC time series; standard for HMM-based recognizers (3x feature
+  expansion, 13 -> 39 coefs).
+- **Cepstral mean / variance normalization (CMVN)** -- subtract
+  the running mean from each coef across the utterance to remove
+  channel + speaker bias; standard pre-classifier step.
+- **Wake-word matched filter** -- store a per-user MFCC template
+  for a wake-word ("Aurora") and run DTW against incoming MFCC
+  frames; decide on the peak confidence.
+- **Speaker-ID k-NN classifier** -- nearest-neighbour over a
+  database of stored speaker MFCC vectors; the L2 distances we
+  ship are exactly the right metric.
+- **Filter-bank tweaks** -- per-filter triangle area normalization
+  (Slaney's recipe) so wider Mel-bands at high frequency don't
+  over-contribute relative to narrow low-frequency bands.
+- **Higher-order log** -- our two-term Taylor polynomial is good
+  to ~5% on the speech band; a 4-term polynomial or a 256-entry
+  table would tighten it to <1%.
