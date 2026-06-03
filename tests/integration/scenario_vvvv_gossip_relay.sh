@@ -137,16 +137,16 @@ fn main() {
     println("$letter: role=$role")
     println("$letter: " + relay_stats_line(rstate))
 
-    // Warmup ticks so the mesh's PING/ACK rounds register every soul
-    // as ALIVE in the others' peer tables BEFORE the relay logic
-    // attempts to pick an intermediate. Without this the alive set
-    // would only contain bootstrap peers AT THE MOMENT relay_send
-    // is called, which races the first PING/ACK round on a busy
-    // host. 25 ticks * 150ms = 3.75s gives 3 full ping cycles
-    // (ping_interval = 1s) so even if the first round-trip times
-    // out on a slow host the second and third converge.
+    // Warmup ticks: just bind + listen + drain inbound conns. We
+    // do NOT call gossip_step here so that bootstrap peers stay
+    // ALIVE (they would get marked DEAD if PING/ACK race-fails
+    // against a peer that is still mid-bind on a slow host).
+    // 15 ticks * 150ms = 2.25s gives every peer enough time to
+    // finish gossip_listen + enter the accept loop. Bootstrap-
+    // populated peers retain their initial ALIVE status because no
+    // outbound PING is attempted yet.
     let warm = 0
-    while warm < 25 {
+    while warm < 15 {
         let drained = 0
         while drained < 4 {
             let conn_fd = gossip_try_accept(server_fd)
@@ -158,49 +158,34 @@ fn main() {
             }
         }
         relay_drain_inbound(rstate)
-        gossip_step(gstate, kg)
         sleep_ms(150)
         warm = warm + 1
     }
 
     // Originator (A): mark target unreachable, send two relay
-    // messages. Retry the first send up to 10 times across
-    // gossip ticks if the alive set hasn't converged yet (the
-    // first PING/ACK round can miss when the responder is still
-    // mid-bind on a slow host; subsequent rounds converge
-    // deterministically). The second send must hit the cache.
+    // messages. Bootstrap peers stay ALIVE through warmup (no
+    // PING attempts means no false-DEAD marks), so relay_send
+    // sees a populated alive list and picks an intermediate
+    // deterministically.
     if str_eq("$role", "originator") == 1 {
         relay_mark_unreachable(rstate, "$target")
-        let attempt = 0
-        let rc1 = 0
-        while attempt < 10 {
-            if rc1 == 0 {
-                rc1 = relay_send(rstate, "$target", "hello-from-A-1")
-                if rc1 == 0 {
-                    // Run a few gossip ticks to let the mesh
-                    // converge before retrying.
-                    let inner = 0
-                    while inner < 3 {
-                        let conn_fd = gossip_try_accept(server_fd)
-                        if conn_fd >= 0 {
-                            gossip_handle_conn_kg(gstate, conn_fd, kg)
-                        }
-                        relay_drain_inbound(rstate)
-                        gossip_step(gstate, kg)
-                        sleep_ms(200)
-                        inner = inner + 1
-                    }
-                }
-            }
-            attempt = attempt + 1
-        }
+        let rc1 = relay_send(rstate, "$target", "hello-from-A-1")
         println("$letter: send1 rc=" + int_to_str(rc1)
             + " sent_via=" + int_to_str(relay_stats_sent_via_relay(rstate)))
         let via1 = relay_chosen_via(rstate, "$target")
         let via1s = ""
         if via1 != -1 { via1s = via1 }
         println("$letter: cache via=" + via1s)
-        sleep_ms(500)
+        // Inter-send pause so the relay path (RELAY_REQ ->
+        // RELAY_DATA -> RELAY_ACK round-trip) has fully completed
+        // before we issue the second send. C's relay_drain_inbound
+        // dispatches a forward dial to B which can hold C's main
+        // loop for up to ~700ms on the slow path (3-retry connect +
+        // 3000ms RCVTIMEO ceiling) -- a 1500ms sleep here covers
+        // the happy path with a margin for jitter. The cache short-
+        // circuit means send2 reuses the cached via=C with no peer
+        // walk; only the C-side accept needs to be free.
+        sleep_ms(1500)
         let rc2 = relay_send(rstate, "$target", "hello-from-A-2")
         println("$letter: send2 rc=" + int_to_str(rc2)
             + " sent_via=" + int_to_str(relay_stats_sent_via_relay(rstate)))
