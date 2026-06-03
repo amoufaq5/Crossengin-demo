@@ -2495,3 +2495,56 @@ prints a multi-line summary:
   assertions).
 * `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
   help line.
+
+## R24C -- OCR via character template matching
+
+CrossEngin's CV pipeline already lands feature matching (R5C SIFT,
+R6D ORB), dense descriptors (R14D HOG, R17D LBP), and sliding-window
+detection (R15C HOG / R22A integral). R24C lands the next obvious
+primitive: **OCR** -- recognizing characters in an image. The
+algorithm is the textbook template-matching recipe:
+
+1. A gallery of (char, template) pairs is built; every template
+   shares the same w x h shape so the slide step + NMS overlap
+   arithmetic stay uniform.
+2. For each top-left position in the image, compute the L2 (sum of
+   squared differences) distance against every template; pick the
+   template with the smallest distance. Convert distance to a
+   `[0..1000]` "milli-score" via
+   `score = 1000 - dist * 1000 / max_dist` where
+   `max_dist = 255 * 255 * tw * th`.
+3. Drop detections whose score is below the caller-supplied threshold.
+4. NMS across all detections (in descending-score order): a higher-
+   score detection suppresses any overlapping lower-score detection
+   regardless of character class -- so a perfect "H" match at x=0
+   blocks a partial-T "match" at x=1 even though they're different
+   characters.
+5. Sort the surviving detections into reading order (top-to-bottom
+   by row bucket, then left-to-right within each row) and concatenate
+   the character codes.
+
+A built-in 8x8 bitmap font ships with the module covering uppercase
+A-Z + digits 0-9 (= 36 glyphs). Each glyph is a hand-drawn 8-bit
+mask per row -- low-resolution but enough to demonstrate end-to-end
+recognition of synthetic text. The chat `/ocr PATH` admin uses this
+default font at a 950-milli (strict) threshold.
+
+### Honest scope (R24C)
+
+Template-matching OCR works PERFECTLY for clean rendered text that
+matches the gallery font; it falls apart on real photographs
+(variable lighting, perspective, fonts, sizes, anti-aliasing). The
+R24C surface is the STRUCTURAL primitive -- correct on synthetic +
+clean rendered text. Real-world OCR requires CNN-based models
+(Tesseract, EAST, CRNN) which CrossEngin cannot do without a learned
+model. The public `ocr_gallery_add_char` API accepts richer template
+galleries at any moment so callers can ship trained-by-hand
+multi-font galleries on top of the same surface.
+
+### Files touched / added (R24C)
+
+* `src/io/transducers/image_ocr.nova` -- NEW (~640 lines).
+* `tests/unit/test_image_ocr.nova` -- NEW (40 assertions).
+* `tests/integration/scenario_pppp_ocr.sh` -- NEW (10 assertions).
+* `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line.
