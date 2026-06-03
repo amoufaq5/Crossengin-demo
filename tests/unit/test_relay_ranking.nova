@@ -1,0 +1,309 @@
+// Unit tests for the R26E.2 ranked relay candidate selection added to
+// src/federation/gossip_relay.nova. The ranker prefers peers most
+// likely to be reachable (open > cone > unknown > symmetric > blocked),
+// with least-recently-used tie-breaking so load spreads across
+// equally-ranked relays. The existing first-alive-peer picker
+// (relay_pick_intermediate) is left untouched -- the ranked variant
+// is opt-in via the CE_RELAY_RANK_NAT env var, picked up by
+// relay_send when it dispatches the intermediate selection.
+//
+// Coverage (~26 assertions):
+//   - NAT-rank table: 4 / 3 / 2 / 1 / 0 for open / cone / unknown /
+//     symmetric / blocked; unrecognised strings collapse to unknown.
+//   - relay_set / get_peer_nat_type: registry round-trip + overwrite.
+//   - relay_rank_candidates: 3 candidates with NAT types
+//     [open, cone, symmetric] -> ranked list [open, cone, symmetric]
+//     (per the brief's example).
+//   - relay_rank_candidates: unknown peer ranked BETWEEN cone and
+//     symmetric (rank=2, strictly less than cone's 3, strictly more
+//     than symmetric's 1).
+//   - relay_rank_candidates: blocked peers omitted from the pool
+//     entirely (never chosen, not just ranked last).
+//   - relay_choose_candidate_ranked: 3 cone candidates -> LRU
+//     rotation across consecutive calls (each call returns the
+//     next peer in round-robin order).
+//   - relay_choose_candidate_ranked: empty pool -> -1.
+//   - relay_choose_candidate_ranked: skips target + self + marked-
+//     unreachable.
+//   - relay_mark_relay_failed: invalidates cache entries whose via
+//     matches the failed peer (and leaves others intact).
+//   - relay_rank_nat_enabled: env-gated dispatch reads the env var
+//     correctly (the test cannot set env at runtime but verifies the
+//     accessor returns 0 by default).
+
+import "../ce_test.nova"
+import "../../src/federation/gossip.nova"
+import "../../src/federation/gossip_relay.nova"
+
+// ---- NAT-rank table -----------------------------------------------------
+
+fn test_nat_rank_table() {
+    ce_eq("open -> 4",       relay_nat_rank_of("open"),       4)
+    ce_eq("cone -> 3",       relay_nat_rank_of("cone"),       3)
+    ce_eq("unknown -> 2",    relay_nat_rank_of("unknown"),    2)
+    ce_eq("symmetric -> 1",  relay_nat_rank_of("symmetric"),  1)
+    ce_eq("blocked -> 0",    relay_nat_rank_of("blocked"),    0)
+    // Unrecognised string -> unknown (rank 2). The brief says
+    // "unknown — rank 2 (better than symmetric, worse than known
+    // cone)"; a typo in a caller must not silently demote the peer
+    // below symmetric.
+    ce_eq("garbage -> unknown",   relay_nat_rank_of("garbage"),    2)
+    ce_eq("empty -> unknown",     relay_nat_rank_of(""),           2)
+}
+
+// ---- NAT-type registry --------------------------------------------------
+
+fn test_nat_type_registry_round_trip() {
+    let g = gossip_init("127.0.0.1:9000", 0)
+    let r = relay_init(g)
+    // Default lookup is "unknown" -- unprofiled peers still rank
+    // (they just sit at rank 2 by default).
+    ce_str_eq("default type is unknown",
+              relay_get_peer_nat_type(r, "127.0.0.1:9001"),
+              "unknown")
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "cone")
+    ce_str_eq("set + get round-trip",
+              relay_get_peer_nat_type(r, "127.0.0.1:9001"),
+              "cone")
+    ce_eq("nat-type count = 1", relay_nat_type_count(r), 1)
+    // Overwrite -- the registry stores a single record per peer.
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "symmetric")
+    ce_str_eq("overwrite reflects newest",
+              relay_get_peer_nat_type(r, "127.0.0.1:9001"),
+              "symmetric")
+    ce_eq("nat-type count still 1 after overwrite",
+          relay_nat_type_count(r), 1)
+}
+
+// ---- ranking: open + cone + symmetric ---------------------------------
+
+fn test_rank_open_cone_symmetric() {
+    // The brief's headline example: 3 candidates with NAT types
+    // [open, cone, symmetric] -> ranked output [open, cone,
+    // symmetric]. We seed peers in REVERSE order to confirm the
+    // ranker doesn't just preserve input order.
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9003")  // symmetric
+    gossip_add_peer(g, "127.0.0.1:9002")  // cone
+    gossip_add_peer(g, "127.0.0.1:9001")  // open
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "open")
+    relay_set_peer_nat_type(r, "127.0.0.1:9002", "cone")
+    relay_set_peer_nat_type(r, "127.0.0.1:9003", "symmetric")
+    let ranked = relay_rank_candidates(r, "127.0.0.1:9999")
+    ce_eq("3 candidates ranked", len(ranked), 3)
+    ce_str_eq("rank[0] is open peer",     ranked[0], "127.0.0.1:9001")
+    ce_str_eq("rank[1] is cone peer",     ranked[1], "127.0.0.1:9002")
+    ce_str_eq("rank[2] is symmetric peer", ranked[2], "127.0.0.1:9003")
+}
+
+// ---- ranking: unknown sits between cone and symmetric ------------------
+
+fn test_rank_unknown_between_cone_and_symmetric() {
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9001")  // cone
+    gossip_add_peer(g, "127.0.0.1:9002")  // unprofiled -> unknown
+    gossip_add_peer(g, "127.0.0.1:9003")  // symmetric
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "cone")
+    // 9002 deliberately NOT registered -- the ranker treats it as
+    // unknown (rank 2) per the brief.
+    relay_set_peer_nat_type(r, "127.0.0.1:9003", "symmetric")
+    let ranked = relay_rank_candidates(r, "127.0.0.1:9999")
+    ce_eq("3 candidates ranked", len(ranked), 3)
+    ce_str_eq("rank[0] cone",      ranked[0], "127.0.0.1:9001")
+    ce_str_eq("rank[1] unknown",   ranked[1], "127.0.0.1:9002")
+    ce_str_eq("rank[2] symmetric", ranked[2], "127.0.0.1:9003")
+}
+
+// ---- ranking: blocked peers omitted entirely ---------------------------
+
+fn test_rank_blocked_omitted_from_pool() {
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9001")  // cone
+    gossip_add_peer(g, "127.0.0.1:9002")  // blocked -- skip
+    gossip_add_peer(g, "127.0.0.1:9003")  // open
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "cone")
+    relay_set_peer_nat_type(r, "127.0.0.1:9002", "blocked")
+    relay_set_peer_nat_type(r, "127.0.0.1:9003", "open")
+    let ranked = relay_rank_candidates(r, "127.0.0.1:9999")
+    ce_eq("blocked peer dropped -> pool of 2", len(ranked), 2)
+    ce_str_eq("rank[0] open",  ranked[0], "127.0.0.1:9003")
+    ce_str_eq("rank[1] cone",  ranked[1], "127.0.0.1:9001")
+    // And the chosen picker confirms: never picks the blocked peer.
+    let pick1 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    ce_check("first pick is not the blocked peer",
+             str_eq(pick1, "127.0.0.1:9002") == 0)
+    let pick2 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    ce_check("second pick is not the blocked peer",
+             str_eq(pick2, "127.0.0.1:9002") == 0)
+}
+
+// ---- LRU rotation across equally-ranked peers --------------------------
+
+fn test_lru_rotates_equal_rank_peers() {
+    // Three peers all classified as cone -- no NAT-rank
+    // differentiation. Successive calls should rotate through them
+    // via LRU: pick A, bump A in the tracker; pick B (next never-
+    // used); pick C; pick A again (LRU position 0).
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9001")
+    gossip_add_peer(g, "127.0.0.1:9002")
+    gossip_add_peer(g, "127.0.0.1:9003")
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "cone")
+    relay_set_peer_nat_type(r, "127.0.0.1:9002", "cone")
+    relay_set_peer_nat_type(r, "127.0.0.1:9003", "cone")
+    let pick1 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    let pick2 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    let pick3 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    // The three picks should cover all three peers (no duplicates)
+    // because LRU rotation pulls a fresh peer each time when the
+    // ranks are equal.
+    let distinct = 0
+    if str_eq(pick1, pick2) == 0 { distinct = distinct + 1 }
+    if str_eq(pick2, pick3) == 0 { distinct = distinct + 1 }
+    if str_eq(pick1, pick3) == 0 { distinct = distinct + 1 }
+    ce_eq("3 consecutive picks are all distinct", distinct, 3)
+    // A 4th pick wraps back to the first (LRU position 0 = oldest
+    // = preferred).
+    let pick4 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    ce_str_eq("4th pick rotates back to 1st", pick4, pick1)
+    // LRU tracker now has 3 entries (one per peer).
+    ce_eq("LRU tracks 3 peers", relay_lru_count(r), 3)
+}
+
+// ---- LRU is BELOW NAT rank in the comparison key -----------------------
+
+fn test_lru_does_not_outrank_nat_type() {
+    // Confirm that even after the open peer has been the most-
+    // recently-used, it's still picked over a never-used cone peer.
+    // The brief's ranking is strictly hierarchical: NAT rank
+    // dominates; LRU is only a tie-break within equal-rank peers.
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9001")  // open
+    gossip_add_peer(g, "127.0.0.1:9002")  // cone
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "open")
+    relay_set_peer_nat_type(r, "127.0.0.1:9002", "cone")
+    let p1 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    let p2 = relay_choose_candidate_ranked(r, "127.0.0.1:9999")
+    ce_str_eq("1st pick is open (rank 4)",   p1, "127.0.0.1:9001")
+    ce_str_eq("2nd pick STILL open (NAT rank > LRU)",
+              p2, "127.0.0.1:9001")
+}
+
+// ---- empty / degenerate cases -----------------------------------------
+
+fn test_empty_candidate_list_returns_negative_one() {
+    // No alive peers at all -> the brief says "Empty candidate list
+    // -> -1". The base picker returns 0 by historical convention;
+    // the new ranked variant returns -1 per the brief.
+    let g = gossip_init("127.0.0.1:9000", 0)
+    let r = relay_init(g)
+    ce_eq("empty mesh -> -1",
+          relay_choose_candidate_ranked(r, "127.0.0.1:9999"), -1)
+    let ranked = relay_rank_candidates(r, "127.0.0.1:9999")
+    ce_eq("rank_candidates len 0 on empty mesh", len(ranked), 0)
+}
+
+fn test_all_blocked_returns_negative_one() {
+    // Two peers, both classified as blocked. After filtering, the
+    // pool is empty and the picker returns -1 even though peers
+    // are present.
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9001")
+    gossip_add_peer(g, "127.0.0.1:9002")
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "blocked")
+    relay_set_peer_nat_type(r, "127.0.0.1:9002", "blocked")
+    ce_eq("all blocked -> -1",
+          relay_choose_candidate_ranked(r, "127.0.0.1:9999"), -1)
+}
+
+fn test_ranked_skips_target_and_self_and_unreachable() {
+    // The ranker reuses the same exclusion rules as the legacy
+    // picker: target, self, and marked-unreachable peers are all
+    // filtered. Set up 4 peers (incl. target) where target = 9001;
+    // 9002 is marked unreachable; 9003 is open; 9004 is cone. The
+    // pick should be 9003.
+    let g = gossip_init("127.0.0.1:9000", 0)
+    gossip_add_peer(g, "127.0.0.1:9001")  // target
+    gossip_add_peer(g, "127.0.0.1:9002")  // unreachable
+    gossip_add_peer(g, "127.0.0.1:9003")  // open
+    gossip_add_peer(g, "127.0.0.1:9004")  // cone
+    let r = relay_init(g)
+    relay_set_peer_nat_type(r, "127.0.0.1:9001", "open")
+    relay_set_peer_nat_type(r, "127.0.0.1:9002", "open")
+    relay_set_peer_nat_type(r, "127.0.0.1:9003", "open")
+    relay_set_peer_nat_type(r, "127.0.0.1:9004", "cone")
+    relay_mark_unreachable(r, "127.0.0.1:9002")
+    let pick = relay_choose_candidate_ranked(r, "127.0.0.1:9001")
+    ce_str_eq("picks the open non-target non-self non-unreachable peer",
+              pick, "127.0.0.1:9003")
+}
+
+// ---- cache invalidation on relay failure -------------------------------
+
+fn test_mark_relay_failed_drops_cache_entries() {
+    // Two cache entries: target_B routed via C; target_D routed via E.
+    // mark_relay_failed(C) drops only the B-entry; the D-entry
+    // survives.
+    let g = gossip_init("127.0.0.1:9000", 0)
+    let r = relay_init(g)
+    relay_cache_via(r, "127.0.0.1:9001", "127.0.0.1:9002")
+    relay_cache_via(r, "127.0.0.1:9003", "127.0.0.1:9004")
+    ce_eq("2 cache entries before fail", relay_cache_count(r), 2)
+    let removed = relay_mark_relay_failed(r, "127.0.0.1:9002")
+    ce_eq("removed 1 entry", removed, 1)
+    ce_eq("1 cache entry remains", relay_cache_count(r), 1)
+    ce_eq("invalidated lookup returns -1",
+          relay_chosen_via(r, "127.0.0.1:9001"), -1)
+    ce_str_eq("surviving entry intact",
+              relay_chosen_via(r, "127.0.0.1:9003"),
+              "127.0.0.1:9004")
+}
+
+fn test_mark_relay_failed_unknown_peer_is_noop() {
+    let g = gossip_init("127.0.0.1:9000", 0)
+    let r = relay_init(g)
+    relay_cache_via(r, "127.0.0.1:9001", "127.0.0.1:9002")
+    let removed = relay_mark_relay_failed(r, "127.0.0.1:9999")
+    ce_eq("no-op removed 0", removed, 0)
+    ce_eq("cache untouched", relay_cache_count(r), 1)
+}
+
+// ---- env-gated dispatch ------------------------------------------------
+
+fn test_rank_nat_enabled_default_off() {
+    // Without setting the env var we cannot verify the "on" path
+    // from inside the unit test (NOVA programs can't call setenv).
+    // We do confirm the default is OFF so a stale env in CI doesn't
+    // silently flip the ranking on for unrelated tests.
+    // (The integration scenario, which CAN set the env from bash,
+    // covers the "on" path end-to-end.)
+    ce_eq("default ranking off",
+          relay_rank_nat_enabled(), 0)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_nat_rank_table()
+    test_nat_type_registry_round_trip()
+    test_rank_open_cone_symmetric()
+    test_rank_unknown_between_cone_and_symmetric()
+    test_rank_blocked_omitted_from_pool()
+    test_lru_rotates_equal_rank_peers()
+    test_lru_does_not_outrank_nat_type()
+    test_empty_candidate_list_returns_negative_one()
+    test_all_blocked_returns_negative_one()
+    test_ranked_skips_target_and_self_and_unreachable()
+    test_mark_relay_failed_drops_cache_entries()
+    test_mark_relay_failed_unknown_peer_is_noop()
+    test_rank_nat_enabled_default_off()
+    ce_summary("relay_ranking")
+}
+
+main()

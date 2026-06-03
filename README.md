@@ -85,16 +85,50 @@ computational units rather than orchestrating a pipeline of modules.
 > (cache diagnostics), `relay_drain_inbound(relay) -> count` (called
 > per tick to process inbound queues populated by gossip dispatchers).
 > Honest scope: TCP-based relay over pre-known mesh peers; any alive
-> peer can serve as relay. Full STUN-like relay discovery (rank
-> candidate relays by observed NAT topology) and Noise-XK wrapping of
-> the relay segments are R26E.2. Verification: 61 unit assertions in
+> peer can serve as relay. Noise-XK wrapping of the relay segments is
+> still R26E.2 follow-up; STUN-like relay discovery shipped as R27B
+> (see below). Verification: 61 unit assertions in
 > `tests/unit/test_gossip_relay.nova` (wire codec round-trips, parse
 > rejection on bad shapes, intermediate selection, cache idempotence,
 > received-queue annotations); 13 integration assertions in
 > `tests/integration/scenario_vvvv_gossip_relay.sh` (3-soul A->C->B
 > mesh, test hook simulates partition without iptables, asserts
 > via=ADDR\_C from=ADDR\_A annotation round-trips, cache hit on
-> second send). R22F.2 extends `src/io/transducers/audio_pitch.nova` (R10F +
+> second send).
+>
+> R27B (R26E.2 follow-up) extends `src/federation/gossip_relay.nova`
+> with NAT-type-aware ranked relay selection. The base R26E picker
+> walked alive peers in gossip-table order and returned the first
+> non-target non-self non-unreachable candidate -- ignoring observed
+> NAT topology. R27B ranks candidates by R23E NAT type (open=4,
+> cone=3, unknown=2, symmetric=1, blocked=0; blocked peers are
+> skipped entirely rather than ranked last). Tie-break is least-
+> recently-used (LRU): two peers with the same NAT rank rotate
+> across consecutive calls so load spreads. Public API:
+> `relay_set_peer_nat_type(state, peer, type) -> 1` (souls feed
+> from R23E `nat_detect_type` results),
+> `relay_get_peer_nat_type(state, peer) -> str` (defaults to
+> "unknown" for unprofiled peers),
+> `relay_rank_candidates(state, target) -> list` (sorted
+> best->worst), `relay_choose_candidate_ranked(state, target) ->
+> peer_addr | -1` (top of rank list; bumps LRU on selection),
+> `relay_mark_relay_failed(state, peer) -> removed_count`
+> (invalidates cache entries pointing at a failed relay). The
+> ranked picker is OPT-IN via `CE_RELAY_RANK_NAT=on` -- when set,
+> `relay_send`'s intermediate-selection step dispatches to the
+> ranked picker; otherwise the legacy first-alive picker runs (so
+> existing call sites see no behaviour change). Verification: 42
+> unit assertions in `tests/unit/test_relay_ranking.nova`
+> (NAT-rank table, registry round-trip, the brief's headline
+> `[open, cone, symmetric] -> [open, cone, symmetric]`, unknown
+> placement between cone and symmetric, blocked filtering, LRU
+> rotation across 3 cone peers, NAT-rank dominates LRU, empty pool
+> returns -1, all-blocked returns -1, target/self/unreachable
+> exclusion, cache invalidation on failure) and 11 integration
+> assertions in `tests/integration/scenario_wwww_relay_rank.sh`
+> (single-driver 4-peer mock mesh: 1 open + 1 cone + 1 symmetric +
+> 1 blocked; asserts ranking + LRU + back-compat + dispatch
+> integration). R22F.2 extends `src/io/transducers/audio_pitch.nova` (R10F +
 > R11B's file) with a harmonicity-driven auto-switch between R10F
 > autocorrelation and R11B YIN. R22F (audio_melody) chose R10F by default
 > because R11B YIN's octave-down anti-snap subharmonic-collapses pure sines;

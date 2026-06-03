@@ -3,6 +3,97 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R27B (this session) -- STUN-like relay candidate ranking (R26E.2 follow-up)
+
+**Status: complete -- extended `src/federation/gossip_relay.nova` with
+NAT-type-aware ranked relay selection. R26E shipped TCP gossip relay
+with a "first-alive non-target peer" picker; R26E.2 ranks candidates
+by R23E NAT type (open > cone > unknown > symmetric, blocked
+skipped) so the originator prefers peers most likely to be reachable.
+Tie-break by least-recently-used so load spreads across equally-
+ranked peers. Cache invalidates when a chosen relay fails. The
+existing `relay_pick_intermediate` API is unchanged for back-compat;
+the ranked picker is opt-in via `CE_RELAY_RANK_NAT=on`.**
+
+### What R27B delivers
+
+1. **NAT-type registry per relay** -- new slot 14 in relay\_state
+   holds a list of `[peer_addr, nat_type_str]` records. Souls feed
+   it via `relay_set_peer_nat_type(state, peer, type)` (typically
+   after R23E's `nat_detect_type` resolves). Lookups default to
+   `"unknown"` for unprofiled peers so the ranker treats them as
+   the midpoint rather than rejecting them.
+
+2. **Ranked candidate picker** -- `relay_choose_candidate_ranked(
+   state, target) -> peer_addr | -1` returns the top of
+   `relay_rank_candidates(state, target)` (a fresh sorted list,
+   selection-sort against `_relay_rank_before` which is NAT-rank
+   descending + LRU-position ascending for ties). Brand-new peers
+   (LRU pos -1) outrank everything already in the LRU because they
+   haven't had a chance yet.
+
+3. **LRU tracker** -- new slot 15. Bumped on every successful
+   `relay_choose_candidate_ranked`; tail = most-recently-used.
+   `relay_lru_count` + `relay_lru_position` exposed for diagnostics.
+
+4. **Cache invalidation on failure** --
+   `relay_mark_relay_failed(state, peer)` walks the relay's
+   `S_CACHE` slot and removes every entry whose via=peer. Returns
+   the number of entries removed. Called by the originator when it
+   observes a still-unreachable target AFTER a relayed send.
+
+5. **Env-gated dispatch** -- `relay_rank_nat_enabled()` reads
+   `CE_RELAY_RANK_NAT`; returns 1 when value is exactly `"on"`,
+   else 0. `relay_send`'s intermediate-selection step now calls
+   `_relay_pick_dispatch(state, target)` which routes to the
+   ranked picker when the env is on, the legacy picker otherwise.
+   This preserves the R26E call shape (no signature changed).
+
+### Verification
+
+* **42 unit assertions** in `tests/unit/test_relay_ranking.nova`
+  covering NAT-rank table mapping, registry round-trip + overwrite,
+  the brief's headline `[open, cone, symmetric] -> ranked output
+  [open, cone, symmetric]`, unknown placement between cone and
+  symmetric, blocked-peer filtering, LRU rotation across 3 equally-
+  ranked peers (3 distinct picks, 4th wraps to 1st), NAT-rank
+  dominates LRU (open always beats cone), empty/all-blocked
+  returns -1, target/self/unreachable exclusion, and
+  `relay_mark_relay_failed` cache invalidation. Overshoots the
+  brief's "~20 assertions" target by design (each leg of the
+  ranking + LRU policy needs its own assertion to surface
+  regressions).
+
+* **11 integration assertions** in
+  `tests/integration/scenario_wwww_relay_rank.sh` (letter `wwww`
+  free; vvvv = R26E). Single-driver in-process test against a 4-
+  peer mocked mesh (1 open + 1 cone + 1 symmetric + 1 blocked),
+  run under `CE_RELAY_RANK_NAT=on`. Asserts: env observed, first
+  pick is open, blocked peer absent, full ranked list correct,
+  unknown placement, LRU rotation across 3 cone peers, 4th wraps,
+  legacy picker untouched, mark\_relay\_failed invalidates cache,
+  `relay_send` dispatch smoke (no crash on env-on path).
+
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- 215 unit
+  tests pass (1 new). The 5 federation baselines hold their
+  counts: gossip\_relay 61, nat\_traversal 53, gossip 34,
+  distributed\_query 36, leader\_election 40. The R26E vvvv
+  integration scenario still passes 13/13.
+
+### Files touched (R27B)
+
+* MOD: `src/federation/gossip_relay.nova` (+2 state slots, +~10
+  public functions for ranking + LRU + failure invalidation,
+  +1 env helper, +1 dispatch helper, +1 call-site change in
+  `relay_send`).
+* NEW: `tests/unit/test_relay_ranking.nova` (42 assertions).
+* NEW: `tests/integration/scenario_wwww_relay_rank.sh` (11
+  assertions).
+* MOD: `FEDERATED_AUDIT.md` (new R26E.2 section), `README.md`,
+  `NEXT_SESSION.md` (this).
+
+---
+
 ## R27F (this session) -- 26-round sprint retrospective
 
 **Status: complete** -- new `RETROSPECTIVE_26_ROUNDS.md` (~7600 words,

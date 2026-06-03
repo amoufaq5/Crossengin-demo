@@ -1741,3 +1741,148 @@ GOSSIP_S_STATS_RELAY_ACK_RX   = 38  // RELAY_ACK wire-level rx counter
    back to A on successful forward; A's stats record the ACK
    when it arrives. The cache update happens at send-time, not
    at ack-time, so ACK loss does not break the per-target cache.
+
+## R26E.2 extension: STUN-like relay candidate ranking
+
+R26E picked the FIRST non-target alive peer as the relay. That
+ignores observed NAT topology: a peer behind a symmetric NAT (per-
+destination outbound mapping) is a poor relay choice because its
+forward dial to the terminal target B will usually fail in the same
+way A's direct dial did. R26E.2 ranks candidates by R23E NAT type
+so the originator prefers peers most likely to be reachable.
+
+### Ranking key
+
+| NAT type | rank | reasoning |
+|---|---|---|
+| `open` | 4 | no NAT -- definitely reachable |
+| `cone` | 3 | one consistent mapping per session; inbound on the existing mapping works |
+| `unknown` | 2 | unprofiled peer; default for souls that haven't observed a NAT-type detection result yet |
+| `symmetric` | 1 | per-destination mapping; the relay's outbound to B will fail in the usual case |
+| `blocked` | 0 | STUN couldn't reach the peer at all -- skip entirely |
+
+A rank-0 peer is omitted from the candidate pool, NOT just ranked
+last. The brief is explicit: blocked candidates are unusable; the
+ranker should never propose them.
+
+### LRU tie-break
+
+Two peers with the same NAT rank (the common case: 5 alive cone-
+NAT peers in a typical home-network mesh) need a deterministic
+tie-break so load spreads across the equally-ranked relays rather
+than always punishing the same peer. The ranker walks a per-relay
+LRU tracker (slot 15 of relay\_state); peers with a lower LRU
+position (older = less recently used) sort BEFORE peers with
+higher positions. Brand-new peers (never used) outrank everything
+already in the LRU because they deserve a chance.
+
+The LRU is bumped only on `relay_choose_candidate_ranked` (the top
+pick), not on every `relay_rank_candidates` inspection. That keeps
+diagnostic walks idempotent.
+
+### Cache invalidation
+
+R26E caches `(target -> via)` so the second send to the same target
+short-circuits the alive-peer walk. R26E.2 adds
+`relay_mark_relay_failed(via)` to invalidate any cache entry
+pointing at a failed relay: when the originator observes a target
+still unreachable AFTER a successful relay dial (the relay forwarded
+but the terminal target dropped the line), the originator calls
+`relay_mark_relay_failed(via)` so the next send re-ranks.
+
+### Opt-in dispatch
+
+The ranking is OFF by default. Souls + tests opt in via
+`CE_RELAY_RANK_NAT=on`. `relay_send`'s intermediate-selection step
+calls `_relay_pick_dispatch(state, target)` which consults the env;
+when on, the ranked picker runs; when off, the original
+`relay_pick_intermediate` runs. This preserves R26E call-site
+compatibility (no caller signature changed; the ADR-0090 wire
+protocol is unchanged) while letting deployments that have
+R23E NAT-type data turn ranking on for the production benefit.
+
+### NAT-type registry
+
+Souls that have observed a peer's NAT type (typically via R23E's
+`nat_detect_type` after a couple of STUN probes) feed the result
+into the relay via `relay_set_peer_nat_type(state, peer, type)`.
+The registry sits in relay\_state slot 14 as a list of
+`[peer_addr, nat_type_str]` records. Looking up an unregistered
+peer returns "unknown" so the ranker treats unprofiled peers as
+the midpoint rather than rejecting them.
+
+This is the cleanest factoring under the R23E ownership boundary:
+`nat_traversal.nova` exposes detection; `gossip_relay.nova` owns
+the relay's view of NAT-type-per-peer for ranking. A future
+revision may pin the slot in `nat_state` directly and have
+`relay_get_peer_nat_type` indirect through it, removing the
+double-bookkeeping. For now the registry is local to the relay.
+
+### Verification
+
+* **42 unit assertions** in `tests/unit/test_relay_ranking.nova`
+  covering: NAT-rank table mapping (open=4, cone=3, unknown=2,
+  symmetric=1, blocked=0; garbage strings collapse to unknown);
+  registry round-trip + overwrite; `relay_rank_candidates` on
+  [open, cone, symmetric] -> [open, cone, symmetric] (the brief's
+  headline example); unknown ranks BETWEEN cone and symmetric;
+  blocked omitted from the pool entirely; LRU rotation across 3
+  equally-ranked cone peers (3 distinct picks then wrap to 1st on
+  the 4th); LRU NEVER outranks NAT type (open peer always wins
+  over cone, even after the open peer has been used); empty pool
+  returns -1; all-blocked returns -1; ranked picker skips target +
+  self + unreachable; `relay_mark_relay_failed` drops the matching
+  cache entry + leaves others intact; default
+  `relay_rank_nat_enabled()` is 0 when env unset.
+
+* **11 integration assertions** in
+  `tests/integration/scenario_wwww_relay_rank.sh` (letter `wwww`
+  free in the alphabetic sequence; vvvv was R26E). Single-driver
+  in-process test of the ranker against a 4-peer mocked mesh: 1
+  open + 1 cone + 1 symmetric + 1 blocked. The driver runs under
+  `CE_RELAY_RANK_NAT=on` and asserts: env observed; first pick is
+  the open peer; blocked peer absent from rank list; ranked
+  output = [open=8004, cone=8003, symmetric=8002]; unknown
+  placement between cone and symmetric; LRU rotation gives 3
+  distinct picks across 3 cone peers; 4th pick wraps to 1st; legacy
+  `relay_pick_intermediate` still returns the first alive peer
+  (back-compat); `relay_mark_relay_failed` invalidates the matching
+  cache entry; `relay_send` dispatch smoke (env-on path runs to
+  completion without crash). All 11 PASS.
+
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- 215 unit
+  tests pass (1 new). The 5 federation baselines hold their
+  counts: gossip\_relay 61, nat\_traversal 53, gossip 34,
+  distributed\_query 36, leader\_election 40.
+
+### Files touched (R26E.2)
+
+* MOD: `src/federation/gossip_relay.nova` (+2 state slots, ~10
+  public functions for ranking + LRU + failure invalidation,
+  +1 env helper, +1 dispatch helper, +1 call-site change in
+  `relay_send`'s intermediate-selection step). The R26E API is
+  unchanged; new functions are additive.
+* NEW: `tests/unit/test_relay_ranking.nova` (42 assertions).
+* NEW: `tests/integration/scenario_wwww_relay_rank.sh` (11
+  assertions; reuses `_lib.sh`).
+* MOD: `FEDERATED_AUDIT.md` (this section), `NEXT_SESSION.md`,
+  `README.md`.
+
+### Future work (R26E.3+)
+
+1. **`relay_send`-side failure feedback.** Today
+   `relay_mark_relay_failed` is a public API but the originator
+   must call it explicitly on observing failure. A future
+   revision could wire it automatically when `relay_send`
+   observes a still-unreachable target after the relay path
+   completed (likely requires per-send timeouts + RELAY\_NACK
+   wire support).
+2. **Pin NAT-type in `nat_state` directly.** Today the relay
+   keeps its own registry. The cleaner factoring (pending
+   coordination with the R23E owner) is to have
+   `relay_get_peer_nat_type` indirect through
+   `nat_get_peer_type(nat_state, peer)`.
+3. **Per-relay reachability score.** NAT type is a proxy; the
+   real signal is observed successful round-trips. A future
+   ranker could weight by an EMA of recent success/fail
+   counts per peer, with NAT type as the prior.
