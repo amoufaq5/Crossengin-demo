@@ -1,0 +1,595 @@
+// CrossEngin perception: cross-modal sensor fusion (R20C).
+//
+// Purpose
+//   Independent vision + audio pipelines already perceive the world in
+//   their own modalities:
+//     * Vision (`io/transducers/visual_perception.nova`, R3.1 + R3.3 +
+//       R7E + R10D + R11E + R12B + R14D + R15C + R16D + R17D + R18D)
+//       produces image observations (decoded PGM/PNG/JPEG, edges, corners,
+//       SIFT/ORB/HOG/LBP descriptors, face detection + LBP-gallery
+//       recognition).
+//     * Audio (`io/transducers/audio_capture.nova`,
+//       `io/transducers/stt_seam.nova`, `audio_speaker_id.nova` R19D,
+//       `audio_wakeword.nova` R18C, etc.) produces audio observations
+//       (PCM, VAD segments, STT transcripts, F0 pitch, MFCC, wake words,
+//       speaker ID).
+//
+//   R20C closes the cross-modal binding gap: when an event happens
+//   (someone speaks while their face is on camera) both pipelines fire
+//   independently and produce two un-linked observations. R20C provides
+//   the FUSION PRIMITIVE that ties those two observations together into a
+//   single "fused atom" the substrate can consume as one event:
+//     * Same timestamp (within a temporal window),
+//     * Same agent identity (if recognized cross-modally),
+//     * Joint provenance back to the two source observations.
+//
+//   This is the cross-modal binding step described in Treisman's feature
+//   integration theory (1980) applied to substrate observations: the
+//   independent feature streams (visual labels, audio labels) need a
+//   binding mechanism so the agent's downstream learner can form
+//   associations between (visual_feature, audio_feature, identity)
+//   triples instead of treating them as independent atoms.
+//
+//   R20C ships the PRIMITIVE: the data structure for a fused observation,
+//   the correlation logic (temporal window + identity matching), and the
+//   provenance trace. Driving it from live capture streams is a follow-up
+//   (R20C.2 -- the daemon's perception loop needs to maintain ring buffers
+//   of recent observations per modality and call the fusion primitive
+//   when both rings have a fresh entry). The unit suite + integration
+//   scenario demonstrate the primitive on synthetic observation lists.
+//
+// Public API
+//   * `fuse_observation(image_atoms, audio_atoms, ts_ns) -> fused_atom_t`
+//       Build a single fused atom from one image observation list +
+//       one audio observation list at the same timestamp. Always
+//       succeeds (no failure mode -- caller decides whether to call it).
+//   * `fuse_correlate_by_time(image_observations, audio_observations,
+//                              window_ns) -> list[fused_atom_t]`
+//       Walk both observation streams; for each image observation,
+//       find the audio observation whose timestamp is within `window_ns`
+//       (default FUSE_DEFAULT_WINDOW_NS = 100ms = 100_000_000 ns) and
+//       emit a fused atom. Default greedy O(N*M) match (the streams are
+//       short on the timescales involved). Unmatched observations do NOT
+//       produce a fused atom -- this is fusion, not "least-bad" pairing.
+//   * `fuse_correlate_by_identity(image_face_label, audio_speaker_label)
+//                                  -> 1 | 0`
+//       True iff both labels are non-empty + non-"unknown" and match
+//       (string equality). Used by fuse_observation to decide
+//       FUSE_BINDING_STRONG vs FUSE_BINDING_WEAK.
+//   * `fuse_provenance(fused_atom) -> list[source_atom_id]`
+//       Return the [image_source_id, audio_source_id] provenance pair
+//       attached at fusion time. (Source IDs are caller-supplied; in
+//       practice the caller is the perception loop which has already
+//       birthed the source atoms into the KG.)
+//   * Helpers: observation constructors (build the per-modality
+//     observation struct so callers can synthesise streams for tests +
+//     for the /fuse admin command's synthetic demonstration), accessors
+//     (binding strength, timestamps, labels), label utilities.
+//
+// Strategy
+//   1. fuse_observation(img, aud, ts): always build a fused atom. If
+//      both image-face-label and audio-speaker-label are recognized AND
+//      match (fuse_correlate_by_identity == 1), emit FUSE_BINDING_STRONG.
+//      Otherwise emit FUSE_BINDING_WEAK (temporal binding only).
+//   2. fuse_correlate_by_time(imgs, auds, window): greedy nearest-time
+//      match. For each image observation, find the audio observation
+//      whose |ts_img - ts_aud| is minimal AND <= window. If found, emit
+//      a fused atom; mark the audio observation as consumed so it does
+//      not match a second image (the cross-modal binding is 1-to-1 per
+//      window; if a single audio span covers multiple visual frames the
+//      caller should pre-aggregate).
+//   3. fuse_correlate_by_identity: string equality on non-empty + non-
+//      "unknown" labels.
+//   4. fuse_provenance: trivial accessor.
+//
+//   The window default of 100ms covers typical human conversational
+//   reaction time (the visual onset of a speaking mouth ~ the audio
+//   onset of speech is < 100ms in normal speech) while being tight
+//   enough that two utterances from different speakers do not collide.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- cross-modal binding leg).
+// NOVA dependencies: builtins -- list_new, push, list_set, len, str_eq,
+//   int_to_str, int_add. No std/* imports (the module is integer-only +
+//   list-based; no syscall path).
+// CrossEngin dependencies: none (intentional -- leaf module so tests can
+//   exercise fusion without dragging visual_perception or audio_capture
+//   into the unit compilation unit. The chat / daemon wires the live
+//   visual_perception + audio_capture observation streams to this module
+//   via the public accessors).
+
+// ---- binding strength sentinels -----------------------------------------
+
+// Strong binding: both modalities independently identified the same
+// agent (face label == speaker label, both non-empty + non-"unknown").
+// Strong binding is the "this is alice speaking" event the substrate
+// can hang both visual and audio associations on a single concept.
+let FUSE_BINDING_STRONG = 2
+
+// Weak binding: temporal coincidence only -- the two observations
+// happened within the window, but at most one modality identified
+// the agent. The substrate still gets a fused event but cannot make
+// identity claims without further evidence.
+let FUSE_BINDING_WEAK = 1
+
+// No binding: the two observations are too far apart in time.
+// Used as the sentinel value when fuse_correlate_by_time skips an
+// image observation that has no audio match within the window.
+let FUSE_BINDING_NONE = 0
+
+// ---- default temporal window (nanoseconds) -----------------------------
+
+// 100 milliseconds in nanoseconds. The typical cross-modal binding
+// window: cinematic audio-video sync tolerance is +/- 22ms (TV
+// engineering standard ATSC IS-191), human perceptual tolerance is
+// ~80-100ms (McGurk effect window), and conversational reaction-time
+// between visible mouth-onset and speech-onset is ~50-150ms. 100ms is
+// the conservative ceiling.
+let FUSE_DEFAULT_WINDOW_NS = 100000000
+
+// ---- per-modality observation struct ------------------------------------
+//
+// Both modalities feed `fuse_observation` and `fuse_correlate_by_time` a
+// uniform observation tuple. Callers (the chat / daemon perception loop,
+// or unit tests) build observations via the constructors below; this
+// keeps the cross-modal contract small and lets each pipeline keep its
+// own internal observation shape without leaking into the fusion layer.
+//
+// Shape (8 slots):
+//   [0] tag             (FUSE_OBS_TAG)
+//   [1] modality        (FUSE_MOD_IMAGE | FUSE_MOD_AUDIO)
+//   [2] timestamp_ns    (int, monotonic nanoseconds since session start)
+//   [3] labels          (list of feature-label strings)
+//   [4] identity_label  (string -- "alice" | "" | "unknown")
+//   [5] source_atom_id  (int -- the substrate-side atom id that owns
+//                        this observation, or -1 if synthetic / pre-birth)
+//   [6] confidence_milli (int 0..1000 -- mirrors visual_perception +
+//                         stt_seam confidence reporting)
+//   [7] modality_hint    (free string -- e.g. "vp_pgm" / "stt_whisper")
+
+let FUSE_OBS_TAG = 7320
+
+let FUSE_OBS_TAG_IDX     = 0
+let FUSE_OBS_MODALITY    = 1
+let FUSE_OBS_TS          = 2
+let FUSE_OBS_LABELS      = 3
+let FUSE_OBS_IDENTITY    = 4
+let FUSE_OBS_SOURCE_ID   = 5
+let FUSE_OBS_CONFIDENCE  = 6
+let FUSE_OBS_HINT        = 7
+
+let FUSE_MOD_IMAGE = 1
+let FUSE_MOD_AUDIO = 2
+
+// Construct an image observation. `labels` is the feature-label list
+// (from vp_features_for_image or vp_seam_last_features). `identity_label`
+// is the result of a face_recognize call ("" if no recognition ran).
+// `source_atom_id` is the kg id of the observation atom (-1 if pre-birth).
+fn fuse_image_observation(timestamp_ns, labels, identity_label, source_atom_id,
+                          confidence_milli) {
+    let o = list_new()
+    push(o, FUSE_OBS_TAG)
+    push(o, FUSE_MOD_IMAGE)
+    push(o, timestamp_ns)
+    push(o, labels)
+    push(o, identity_label)
+    push(o, source_atom_id)
+    push(o, confidence_milli)
+    push(o, "image")
+    return o
+}
+
+// Construct an audio observation. `labels` is the feature-label list
+// (e.g. transcript tokens, MFCC bucket atoms). `identity_label` is the
+// result of a speaker_id recognize call ("" if no recognition ran).
+fn fuse_audio_observation(timestamp_ns, labels, identity_label, source_atom_id,
+                          confidence_milli) {
+    let o = list_new()
+    push(o, FUSE_OBS_TAG)
+    push(o, FUSE_MOD_AUDIO)
+    push(o, timestamp_ns)
+    push(o, labels)
+    push(o, identity_label)
+    push(o, source_atom_id)
+    push(o, confidence_milli)
+    push(o, "audio")
+    return o
+}
+
+// Accessors -- public for unit tests and the chat helper.
+fn fuse_obs_modality(o)       { return o[FUSE_OBS_MODALITY] }
+fn fuse_obs_timestamp(o)      { return o[FUSE_OBS_TS] }
+fn fuse_obs_labels(o)         { return o[FUSE_OBS_LABELS] }
+fn fuse_obs_identity(o)       { return o[FUSE_OBS_IDENTITY] }
+fn fuse_obs_source_id(o)      { return o[FUSE_OBS_SOURCE_ID] }
+fn fuse_obs_confidence(o)     { return o[FUSE_OBS_CONFIDENCE] }
+fn fuse_obs_hint(o)           { return o[FUSE_OBS_HINT] }
+
+// ---- fused atom struct --------------------------------------------------
+//
+// The output of a fusion event: a single observation that ties together
+// the visual + audio half. Shape (10 slots):
+//   [0]  tag               (FUSE_ATOM_TAG)
+//   [1]  timestamp_ns      (int -- the "binding moment"; uses the
+//                            image observation's ts if both present,
+//                            falling back to audio's)
+//   [2]  binding           (FUSE_BINDING_STRONG | _WEAK | _NONE)
+//   [3]  image_obs         (the image observation that contributed, or 0)
+//   [4]  audio_obs         (the audio observation that contributed, or 0)
+//   [5]  identity_label    (string -- the cross-modally agreed identity,
+//                             or "" if no agreement)
+//   [6]  fused_labels      (list of all labels from both observations,
+//                             image labels first)
+//   [7]  provenance        (list of source atom ids: [img_src, aud_src])
+//   [8]  time_delta_ns     (int -- |img_ts - aud_ts|; 0 if same time
+//                             or only one side present)
+//   [9]  confidence_milli  (int -- min of the two observation confidences
+//                             when both present; the single confidence
+//                             when only one is present)
+
+let FUSE_ATOM_TAG = 7321
+
+let FUSE_A_TAG        = 0
+let FUSE_A_TS         = 1
+let FUSE_A_BINDING    = 2
+let FUSE_A_IMG_OBS    = 3
+let FUSE_A_AUD_OBS    = 4
+let FUSE_A_IDENTITY   = 5
+let FUSE_A_LABELS     = 6
+let FUSE_A_PROVENANCE = 7
+let FUSE_A_DELTA      = 8
+let FUSE_A_CONF       = 9
+
+// ---- identity correlation -----------------------------------------------
+//
+// Returns 1 iff both labels are non-empty AND non-"unknown" AND equal.
+// "unknown" is the sentinel face_recognize / speaker_id return value when
+// the gallery had no match below the chi-squared / DTW threshold; we
+// treat it as "no identity claim" rather than "an identity called unknown".
+fn fuse_correlate_by_identity(image_face_label, audio_speaker_label) {
+    if image_face_label == 0 { return 0 }
+    if audio_speaker_label == 0 { return 0 }
+    if len(image_face_label) == 0 { return 0 }
+    if len(audio_speaker_label) == 0 { return 0 }
+    if str_eq(image_face_label, "unknown") == 1 { return 0 }
+    if str_eq(audio_speaker_label, "unknown") == 1 { return 0 }
+    if str_eq(image_face_label, audio_speaker_label) == 1 { return 1 }
+    return 0
+}
+
+// ---- single-event fusion ------------------------------------------------
+//
+// `fuse_observation` builds a fused atom from the two passed-in
+// observations + an authoritative timestamp. Both observations may be 0
+// (a "single-modality" fused atom is still a valid binding -- it carries
+// only one half of the provenance but lets the substrate see the event).
+// The default policy: if BOTH observations are non-zero AND
+// fuse_correlate_by_identity agrees -> STRONG; if BOTH non-zero but
+// identity doesn't agree -> WEAK; if EXACTLY ONE non-zero -> WEAK with
+// provenance only on that side; if BOTH zero -> NONE binding (the atom
+// is still constructed -- a degenerate sentinel the caller can detect
+// via fuse_atom_binding).
+fn fuse_observation(image_obs, audio_obs, ts_ns) {
+    let fused = list_new()
+    push(fused, FUSE_ATOM_TAG)
+    push(fused, ts_ns)
+    // Binding strength.
+    let binding = FUSE_BINDING_NONE
+    if image_obs != 0 {
+        if audio_obs != 0 {
+            binding = FUSE_BINDING_WEAK
+            let img_id = fuse_obs_identity(image_obs)
+            let aud_id = fuse_obs_identity(audio_obs)
+            if fuse_correlate_by_identity(img_id, aud_id) == 1 {
+                binding = FUSE_BINDING_STRONG
+            }
+        } else {
+            binding = FUSE_BINDING_WEAK
+        }
+    } else {
+        if audio_obs != 0 {
+            binding = FUSE_BINDING_WEAK
+        }
+    }
+    push(fused, binding)
+    push(fused, image_obs)
+    push(fused, audio_obs)
+    // Cross-modal identity. STRONG -> the agreed label; WEAK with one
+    // side identifying -> propagate that single-side label as a hint
+    // (still WEAK because cross-modal corroboration is missing); else "".
+    let identity = ""
+    if binding == FUSE_BINDING_STRONG {
+        identity = fuse_obs_identity(image_obs)
+    } else {
+        if image_obs != 0 {
+            let img_id = fuse_obs_identity(image_obs)
+            if len(img_id) > 0 {
+                if str_eq(img_id, "unknown") == 0 {
+                    identity = img_id
+                }
+            }
+        }
+        if len(identity) == 0 {
+            if audio_obs != 0 {
+                let aud_id = fuse_obs_identity(audio_obs)
+                if len(aud_id) > 0 {
+                    if str_eq(aud_id, "unknown") == 0 {
+                        identity = aud_id
+                    }
+                }
+            }
+        }
+    }
+    push(fused, identity)
+    // Fused label list -- image labels first, then audio labels. Pure
+    // concatenation; deduplication is the caller's job (the substrate
+    // already has atom-store-level deduplication via label_hash).
+    let fused_labels = list_new()
+    if image_obs != 0 {
+        let img_labels = fuse_obs_labels(image_obs)
+        let i = 0
+        while i < len(img_labels) {
+            push(fused_labels, img_labels[i])
+            i = int_add(i, 1)
+        }
+    }
+    if audio_obs != 0 {
+        let aud_labels = fuse_obs_labels(audio_obs)
+        let j = 0
+        while j < len(aud_labels) {
+            push(fused_labels, aud_labels[j])
+            j = int_add(j, 1)
+        }
+    }
+    push(fused, fused_labels)
+    // Provenance: [image_src_atom_id, audio_src_atom_id]. Either may
+    // be -1 (sentinel) when the corresponding observation is missing
+    // or the source atom is not yet birthed.
+    let prov = list_new()
+    if image_obs != 0 {
+        push(prov, fuse_obs_source_id(image_obs))
+    } else {
+        push(prov, 0 - 1)
+    }
+    if audio_obs != 0 {
+        push(prov, fuse_obs_source_id(audio_obs))
+    } else {
+        push(prov, 0 - 1)
+    }
+    push(fused, prov)
+    // Time delta between the two source observations.
+    let delta = 0
+    if image_obs != 0 {
+        if audio_obs != 0 {
+            let dt = fuse_obs_timestamp(image_obs) - fuse_obs_timestamp(audio_obs)
+            if dt < 0 { dt = 0 - dt }
+            delta = dt
+        }
+    }
+    push(fused, delta)
+    // Confidence: min(img, aud) when both present, else the single side.
+    let conf = 0
+    if image_obs != 0 {
+        if audio_obs != 0 {
+            let ci = fuse_obs_confidence(image_obs)
+            let ca = fuse_obs_confidence(audio_obs)
+            if ci < ca { conf = ci } else { conf = ca }
+        } else {
+            conf = fuse_obs_confidence(image_obs)
+        }
+    } else {
+        if audio_obs != 0 {
+            conf = fuse_obs_confidence(audio_obs)
+        }
+    }
+    push(fused, conf)
+    return fused
+}
+
+// ---- fused atom accessors -----------------------------------------------
+
+fn fuse_atom_timestamp(a)   { return a[FUSE_A_TS] }
+fn fuse_atom_binding(a)     { return a[FUSE_A_BINDING] }
+fn fuse_atom_image_obs(a)   { return a[FUSE_A_IMG_OBS] }
+fn fuse_atom_audio_obs(a)   { return a[FUSE_A_AUD_OBS] }
+fn fuse_atom_identity(a)    { return a[FUSE_A_IDENTITY] }
+fn fuse_atom_labels(a)      { return a[FUSE_A_LABELS] }
+fn fuse_atom_time_delta(a)  { return a[FUSE_A_DELTA] }
+fn fuse_atom_confidence(a)  { return a[FUSE_A_CONF] }
+
+// Human-readable binding tag. Used by the /fuse admin command and the
+// unit tests' assertion messages.
+fn fuse_binding_label(b) {
+    if b == FUSE_BINDING_STRONG { return "strong" }
+    if b == FUSE_BINDING_WEAK   { return "weak" }
+    return "none"
+}
+
+// Provenance accessor (per the public-API contract). Returns the
+// list [image_source_id, audio_source_id]; either may be -1.
+fn fuse_provenance(fused_atom) {
+    if fused_atom == 0 { return list_new() }
+    return fused_atom[FUSE_A_PROVENANCE]
+}
+
+// Convenience: return ONLY the non-sentinel (>= 0) source ids. Callers
+// that want to walk the provenance trace as a list of "real" KG atom
+// ids use this; the test suite uses it to assert provenance correctness.
+fn fuse_provenance_atoms(fused_atom) {
+    let out = list_new()
+    let prov = fuse_provenance(fused_atom)
+    let i = 0
+    while i < len(prov) {
+        if prov[i] >= 0 {
+            push(out, prov[i])
+        }
+        i = int_add(i, 1)
+    }
+    return out
+}
+
+// ---- correlation by time ------------------------------------------------
+//
+// Walk both observation streams; for each image observation, find the
+// audio observation whose timestamp delta is minimal AND within the
+// window. Emit one fused atom per successful match; mark the audio
+// observation as consumed (greedy 1-to-1 pairing). Unmatched
+// observations are NOT emitted -- this is fusion, not "least-bad"
+// pairing. Default window: FUSE_DEFAULT_WINDOW_NS (100ms).
+//
+// Algorithm: O(N*M) but N + M are typically tiny (a perception ring
+// buffer holds < 100 entries). A future optimization (R20C.2) could
+// sort both streams and walk them with a two-pointer sweep.
+fn fuse_correlate_by_time(image_obs_list, audio_obs_list, window_ns) {
+    let fused_list = list_new()
+    if image_obs_list == 0 { return fused_list }
+    if audio_obs_list == 0 { return fused_list }
+    let n_img = len(image_obs_list)
+    let n_aud = len(audio_obs_list)
+    if n_img == 0 { return fused_list }
+    if n_aud == 0 { return fused_list }
+    let win = window_ns
+    if win <= 0 { win = FUSE_DEFAULT_WINDOW_NS }
+    // Build a "consumed" flag list for the audio side -- a parallel
+    // list of 0/1 flags. NOVA's list_set lets us mark a slot in place.
+    let consumed = list_new()
+    let k = 0
+    while k < n_aud {
+        push(consumed, 0)
+        k = int_add(k, 1)
+    }
+    // Walk image observations. For each, find the nearest non-consumed
+    // audio observation within the window.
+    let i = 0
+    while i < n_img {
+        let img = image_obs_list[i]
+        if img != 0 {
+            let img_ts = fuse_obs_timestamp(img)
+            let best_j = 0 - 1
+            let best_delta = 0 - 1
+            let j = 0
+            while j < n_aud {
+                if consumed[j] == 0 {
+                    let aud = audio_obs_list[j]
+                    if aud != 0 {
+                        let aud_ts = fuse_obs_timestamp(aud)
+                        let dt = img_ts - aud_ts
+                        if dt < 0 { dt = 0 - dt }
+                        if dt <= win {
+                            if best_j < 0 {
+                                best_j = j
+                                best_delta = dt
+                            } else {
+                                if dt < best_delta {
+                                    best_j = j
+                                    best_delta = dt
+                                }
+                            }
+                        }
+                    }
+                }
+                j = int_add(j, 1)
+            }
+            if best_j >= 0 {
+                let aud_match = audio_obs_list[best_j]
+                let ts = img_ts
+                // The binding's "moment" timestamp: take the image side
+                // (visual onset typically anchors the cross-modal binding
+                // event in the substrate's downstream learner).
+                let fused_atom = fuse_observation(img, aud_match, ts)
+                push(fused_list, fused_atom)
+                list_set(consumed, best_j, 1)
+            }
+        }
+        i = int_add(i, 1)
+    }
+    return fused_list
+}
+
+// Convenience entry point: temporal correlation using the default window.
+fn fuse_correlate_default(image_obs_list, audio_obs_list) {
+    return fuse_correlate_by_time(image_obs_list, audio_obs_list,
+                                    FUSE_DEFAULT_WINDOW_NS)
+}
+
+// ---- counting / summary helpers (used by /fuse admin command) -----------
+
+// Count fused atoms by binding strength. Returns [strong, weak, n_none].
+fn fuse_count_by_binding(fused_list) {
+    let strong = 0
+    let weak = 0
+    let n_none = 0
+    let i = 0
+    while i < len(fused_list) {
+        let b = fuse_atom_binding(fused_list[i])
+        if b == FUSE_BINDING_STRONG { strong = int_add(strong, 1) }
+        if b == FUSE_BINDING_WEAK   { weak = int_add(weak, 1) }
+        if b == FUSE_BINDING_NONE   { n_none = int_add(n_none, 1) }
+        i = int_add(i, 1)
+    }
+    let out = list_new()
+    push(out, strong)
+    push(out, weak)
+    push(out, n_none)
+    return out
+}
+
+// Operator-readable summary line for a single fused atom. Format:
+//   "<binding> ts=<ts_ns> identity=<id|none> delta_ns=<dt> labels=<n>"
+fn fuse_atom_summary(a) {
+    let bind = fuse_binding_label(fuse_atom_binding(a))
+    let ident = fuse_atom_identity(a)
+    if len(ident) == 0 { ident = "none" }
+    let labels = fuse_atom_labels(a)
+    return bind + " ts=" + int_to_str(fuse_atom_timestamp(a))
+        + " identity=" + ident
+        + " delta_ns=" + int_to_str(fuse_atom_time_delta(a))
+        + " labels=" + int_to_str(len(labels))
+}
+
+// One-line summary for a whole fused-list -- "fused=N strong=S weak=W".
+fn fuse_list_summary(fused_list) {
+    let counts = fuse_count_by_binding(fused_list)
+    return "fused=" + int_to_str(len(fused_list))
+        + " strong=" + int_to_str(counts[0])
+        + " weak=" + int_to_str(counts[1])
+}
+
+// ---- chat helper: /fuse admin command -----------------------------------
+//
+// The /fuse admin command is exposed by the chat (examples/crossengin_chat.nova)
+// and prints the most recently fused atoms. This module ships the
+// formatting helper; the chat wires it to the live observation streams
+// from visual_perception + audio_capture via the accessors
+// `_vp_recent_observations()` and `_audio_recent_observations()`.
+//
+// The helper accepts a pre-built fused-list (no live state -- the chat
+// owns the per-process buffer). It returns a multi-line string suitable
+// for io_println.
+fn fuse_chat_format(fused_list) {
+    if fused_list == 0 {
+        return "(no fused observations available)"
+    }
+    if len(fused_list) == 0 {
+        return "(no fused observations -- visual + audio streams have not coincided yet)"
+    }
+    let out = fuse_list_summary(fused_list) + "\n"
+    let i = 0
+    while i < len(fused_list) {
+        out = out + "  [" + int_to_str(i) + "] "
+            + fuse_atom_summary(fused_list[i])
+        if i + 1 < len(fused_list) {
+            out = out + "\n"
+        }
+        i = int_add(i, 1)
+    }
+    return out
+}
+
+// ---- sentinel / constants accessors (test helpers) ----------------------
+
+fn fuse_default_window_ns()        { return FUSE_DEFAULT_WINDOW_NS }
+fn fuse_binding_strong_sentinel()  { return FUSE_BINDING_STRONG }
+fn fuse_binding_weak_sentinel()    { return FUSE_BINDING_WEAK }
+fn fuse_binding_none_sentinel()    { return FUSE_BINDING_NONE }
+fn fuse_modality_image_sentinel()  { return FUSE_MOD_IMAGE }
+fn fuse_modality_audio_sentinel()  { return FUSE_MOD_AUDIO }
