@@ -892,6 +892,27 @@ computational units rather than orchestrating a pipeline of modules.
 > and `image_lbp_texture_<peaked|mid|distributed>` (emitted in the
 > structural-features path when image >= 32x32). Documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+>
+> `io/transducers/image_face_recognize.nova` added in R18D LBP-
+> gallery face RECOGNITION (identity matching). Where R16D answers
+> "is there a face?" (Viola-Jones detection) and R17D's LBP
+> describes "what does this face look like?" as a 4096-int feature
+> vector, R18D answers "which face is this?" by chi-squared
+> comparing the query descriptor against a small operator-maintained
+> gallery of enrolled identities. Public API:
+> `face_gallery_new / face_gallery_enroll / face_gallery_recognize /
+> face_gallery_save / face_gallery_load / face_gallery_size /
+> face_gallery_clear`. Gallery cap = 128 entries; chat default
+> threshold = 500 chi-squared units. Save/load uses an ASCII
+> line-oriented format (`CE_FACE_GALLERY_V1` magic + entry count +
+> per-entry label/desc_len/desc_values) that is bit-identical round-
+> trip safe. New chat admins: `/face_enroll <label> <pgm>` enrolls
+> a face under a label (idempotent on label -- re-enrollment
+> overwrites); `/face_recognize <pgm>` runs the nearest-neighbor
+> match and prints either `(face_recognize matched=<label>
+> distance=<D> threshold=500)` or `(face_recognize unknown
+> distance=-1 threshold=500)`. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > unchanged from the snapshot
 > v1 -> v2 migration session -- the bump landed inside the existing
 > `persistence/snapshot_{writer,disk,reader}.nova` trio +

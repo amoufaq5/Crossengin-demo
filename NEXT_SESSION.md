@@ -3,6 +3,120 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R18D (this session) -- LBP-gallery face RECOGNITION (identity matching)
+
+**Status: complete -- `src/io/transducers/image_face_recognize.nova`
+(NEW, ~600 lines) closes the canonical Ahonen et al. 2006
+LBP face-recognition pipeline by building the GALLERY + nearest-
+neighbor matcher on top of R17D's LBP descriptor + chi-squared
+distance.** R16D's Viola-Jones cascade answers "is there a face
+here?" (DETECTION); R17D's LBP descriptor turns a face into a
+4096-int feature vector; R18D answers "which face is this?"
+(IDENTIFICATION) by chi-squared comparing the query descriptor
+against a small operator-maintained gallery of enrolled identities.
+
+### Algorithm
+
+1. **Enrollment** (per known identity): compute the LBP descriptor
+   with 4x4 cells (4096 ints) and append (or overwrite) under the
+   given label. Idempotent on label -- re-enrolling the same label
+   replaces the descriptor.
+2. **Query**: compute the LBP descriptor of the unknown face,
+   chi-squared compare against every alive gallery entry, track
+   the argmin. If the minimum distance is below the operator-
+   tunable threshold, return that label; otherwise "unknown".
+
+The gallery is operator-maintained state. The chat default
+threshold is 500 chi-squared units (calibrated against the
+fixture suite: closely-related descriptors land 50..200,
+unrelated ones land 1000+).
+
+### Save / load (round-trip safe)
+
+ASCII line-oriented format with header magic `CE_FACE_GALLERY_V1`,
+entry count, and per-entry label + descriptor length + descriptor
+values (one int per line). Bit-identical round-trip safe because
+LBP descriptor values are small non-negative ints.
+
+### Public API (`image_face_recognize.nova`)
+
+* `face_gallery_new()` -> empty gallery
+* `face_gallery_enroll(g, label, image, w, h)` -> 1 | 0
+* `face_gallery_recognize(g, query, w, h, threshold)` ->
+  `[label, distance]` | `["unknown", -1]`
+* `face_gallery_save(g, path)` / `face_gallery_load(path)`
+* `face_gallery_size(g)`, `face_gallery_live_size(g)`,
+  `face_gallery_clear(g)`
+* `face_enroll_chat_args` / `face_recognize_chat_args` -- chat
+  wrappers around a per-process singleton gallery + default
+  threshold
+
+Caps: gallery 128 entries, label 64 bytes, image dim 256x256
+(inherits R17D), descriptor 4x4 cells = 4096 ints.
+
+### Chat wiring (2 dispatch + 2 help + 1 import = 5 net lines)
+
+```
+/face_enroll L PGM  enroll face L from PGM into the per-process LBP gallery (R18D)
+/face_recognize PGM nearest-neighbor identity match against the gallery
+```
+
+Output shapes:
+
+```
+(face_enroll OK label=alice size=1)
+(face_recognize matched=alice distance=0 threshold=500)
+(face_recognize unknown distance=-1 threshold=500)
+```
+
+### Verification snapshot
+
+* 48 unit assertions (`tests/unit/test_face_recognize.nova`), all PASS:
+  - Empty gallery: size=0, recognize returns "unknown" distance -1.
+  - Enroll 1 face self-match: returns enrolled label, distance 0.
+  - 3-face gallery (vertical / four-spots / horizontal): each
+    recognized with distance 0.
+  - 4th face (tight threshold) -> "unknown".
+  - Duplicate enrollment overwrites: live_size stays 1.
+  - Clear: live_size -> 0; recognize -> "unknown".
+  - Clear-then-reenroll reuses dead-sentinel slots.
+  - Argument validation: empty label / 4x4 image / etc. fail cleanly.
+  - Save 3-face gallery + load: bit-identical recognize results.
+  - Save empty gallery + load: empty gallery.
+  - Load on missing file: empty gallery (graceful failure).
+* 14 integration assertions (`scenario_vvv_face_recognize.sh`),
+  all PASS:
+  - /help adverts, /face_enroll + /face_recognize usage lines.
+  - Empty-gallery rejection on /face_recognize without enrollment.
+  - Missing-PGM graceful failure on /face_enroll.
+  - Enroll alice (face_a) / bob (face_b) / carol (face_c) with
+    monotonically-growing size.
+  - Recognize each of the 3 enrolled fixtures with distance 0.
+  - 4th high-entropy texture fixture -> "unknown" (correct
+    rejection, the canonical unknown-rejection probe).
+  - Chat reaches /quit cleanly.
+* All 186 prior unit tests still pass (R17D LBP, R16D face_detect,
+  R14D HOG, R15C HOG detector, plus everything before).
+
+### Files touched / added
+
+* `src/io/transducers/image_face_recognize.nova` (NEW, ~600 lines)
+* `tests/unit/test_face_recognize.nova` (NEW, 19 test fns / 48 assertions)
+* `tests/integration/scenario_vvv_face_recognize.sh` (NEW, 14 assertions)
+* `examples/crossengin_chat.nova` (+5 lines: 1 import + 2 help
+  adverts + 2 dispatches)
+* `IMAGE_AUDIT.md`, `README.md`, `NEXT_SESSION.md` (R18D entries)
+
+### Module count: +1 (image_face_recognize.nova new)
+
+Verify locally:
+
+```sh
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_face_recognize.nova
+NOVA_ROOT=/home/user/NOVA make install
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_vvv_face_recognize.sh
+```
+
 ## R18B (this session) -- link prediction (Common Neighbors, Jaccard, Adamic-Adar) over the KG xref graph
 
 **Status: complete -- the KG read story now covers link prediction

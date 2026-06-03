@@ -101,6 +101,7 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 | SIFT-like 128-D descriptor       | DONE (P3.3 cont. v2)|
 | ORB (FAST + rBRIEF, patent-free) | DONE (P3.3 cont. v3)|
 | LBP texture descriptor (Ojala'96)| DONE (R17D)         |
+| LBP-gallery face RECOGNITION     | DONE (R18D)         |
 | Color histograms (HSV / Lab)     | 2-3 weeks           |
 | Spatial k-means segmentation     | DONE (R11E)         |
 | CNN feature vector (untrained)   | 4-8 weeks           |
@@ -1338,3 +1339,165 @@ the substrate ever needs to bind face identity to atoms.
   R17D wire-in comment + 1 dispatch line)
 * `examples/crossengin_chat.nova` (+2 lines: `/help` advert +
   `/lbp` dispatch)
+
+
+## R18D -- LBP-gallery face RECOGNITION (identity matching)
+
+R16D shipped the Viola-Jones face DETECTOR (finds *where* a face is);
+R17D shipped the LBP face DESCRIPTOR (computes the 4096-int chi-
+squared-comparable feature vector for one face). R18D closes the
+canonical Ahonen et al. 2006 LBP face-recognition pipeline by
+adding the GALLERY + nearest-neighbor matcher: given a set of
+ENROLLED descriptors (one per known identity) and an unknown query
+face, return the nearest-neighbor identity if the chi-squared
+distance is below an operator-tunable threshold; otherwise return
+"unknown".
+
+### Algorithm
+
+```
+ENROLL:                        QUERY:
+  face_image                     face_image
+     |                              |
+     v                              v
+  lbp_descriptor                 lbp_descriptor
+     |                              |
+     v                              v
+  [label, desc] -----+              desc
+                     |               |
+                     v               v
+                  gallery <-- chi2(gallery, desc)
+                                       |
+                                       v
+                                  argmin -> label | "unknown"
+```
+
+The gallery is operator-maintained state: there is no pre-trained
+identity table. `/face_enroll <label> <pgm>` registers a new
+identity (or overwrites an existing label idempotently);
+`/face_recognize <pgm>` queries against the current gallery using
+a default chi-squared threshold of 500.
+
+### Why LBP for face recognition (vs HOG for face detection)
+
+HOG / Viola-Jones answer "is there a face here?"; LBP answers
+"which face is this?". Ahonen 2006 demonstrated that a flat
+chi-squared distance over per-cell LBP histograms beat the
+eigenfaces / Fisherfaces baselines on FERET and remained the
+dominant non-DL face-recognition method for nearly a decade.
+CrossEngin's pipeline uses the 4x4 cell grid (4096-int descriptor)
+matching R17D's default rather than the canonical 8x8 cells
+(16,384-int); the weighted-cell variant (where ocular regions
+receive higher weight than peripheral cells) is a documented
+follow-up.
+
+### Public API (`image_face_recognize.nova`)
+
+* `face_gallery_new() -> gallery_t` -- empty gallery.
+* `face_gallery_enroll(gallery, label, image, w, h) -> 1 | 0` --
+  compute LBP descriptor + insert/overwrite under `label`. Returns
+  0 on invalid label / oversize / over-cap (128-entry max). Idempotent
+  on label (re-enrollment overwrites).
+* `face_gallery_recognize(gallery, query_image, w, h, threshold) ->`
+  `[label, distance]` on match within threshold; `["unknown", -1]`
+  otherwise (empty gallery / descriptor build failure / no entry
+  passes the cutoff).
+* `face_gallery_save(gallery, path) -> 1 | 0` -- serialize to an
+  ASCII line-oriented file (`CE_FACE_GALLERY_V1` magic + entry count
+  + per-entry label/desc_len/desc_values).
+* `face_gallery_load(path) -> gallery_t` -- read + parse the file
+  format; returns an empty gallery on any read/parse failure.
+* `face_gallery_size(gallery) -> int` -- raw underlying-list size.
+* `face_gallery_live_size(gallery) -> int` -- live entries (clear
+  marks dead-sentinel slots so size > live_size after clear).
+* `face_gallery_clear(gallery) -> 1` -- drops every live entry
+  (overwrites with dead-sentinel slots that re-enroll reuses).
+* `face_gallery_label_at(gallery, idx) -> string`.
+* `face_gallery_descriptor_at(gallery, idx) -> list[int]`.
+* `face_enroll_pgm_args(gallery, arg) -> string` -- chat helper.
+* `face_recognize_pgm_args(gallery, arg, threshold) -> string`.
+* `face_enroll_chat_args(arg)` / `face_recognize_chat_args(arg)` --
+  chat-side wrappers using the per-process singleton gallery.
+
+Caps: gallery <= 128 entries (FACE_REC_MAX_ENTRIES); descriptor
+uses 4x4 cells = 4096 ints (FACE_REC_CELLS); label <= 64 bytes
+(FACE_REC_LABEL_MAX); image dimensions inherit R17D's 256x256
+LBP_MAX_DIM. Default chat threshold = 500 chi-squared units.
+
+### Save / load format
+
+Line-oriented ASCII for inspectability + portability:
+
+```
+CE_FACE_GALLERY_V1
+<n_entries>
+<label_1>
+<desc_len_1>
+<desc_1[0]>
+...
+<desc_1[desc_len_1 - 1]>
+<label_2>
+...
+```
+
+The format is bit-identical round-trip safe because LBP descriptor
+values are small non-negative ints (histogram counts bounded by
+the cell pixel area). Operators wanting atomicity write to a
+tmp path and rename outside the module (the module itself
+issues a non-atomic write + fsync).
+
+### Chat wiring (2 dispatch + 2 help lines)
+
+```
+/face_enroll L PGM  enroll face L from PGM into the per-process LBP gallery (R18D)
+/face_recognize PGM nearest-neighbor identity match against the LBP gallery;
+                    returns label or 'unknown' (R18D)
+```
+
+Output shapes:
+
+```
+(face_enroll OK label=alice size=1)
+(face_recognize matched=alice distance=0 threshold=500)
+(face_recognize unknown distance=-1 threshold=500)
+```
+
+### Verification
+
+Unit tests (~48 assertions in `tests/unit/test_face_recognize.nova`):
+* Empty gallery: size = 0, recognize -> "unknown" distance -1.
+* Enroll 1 face, self-match: returns enrolled label, distance 0.
+* Enroll 3 distinct faces (vertical / four-spots / horizontal):
+  each query returns the matching label with distance 0.
+* Unknown rejection: a 4th distinct face under a TIGHT threshold
+  returns "unknown".
+* Duplicate enrollment overwrites: re-enroll under same label
+  keeps live_size = 1, recognize returns new descriptor's match.
+* Clear: live_size reverts to 0; recognize returns "unknown".
+* Clear-then-reenroll reuses dead-sentinel slots.
+* Empty label / 4x4 too-small image / null gallery all fail
+  cleanly.
+* Save 3-face gallery + load: recognize results bit-identical
+  (alice/bob/carol all return distance 0 against their fixtures).
+* Save empty gallery + load: empty gallery (live_size = 0).
+* Load on missing file: empty gallery (graceful failure).
+* Chat helper formatting probes: enroll usage / single-arg usage /
+  recognize empty-gallery / recognize empty-arg.
+
+Integration scenario `tests/integration/scenario_vvv_face_recognize.sh`
+(14 assertions): /help adverts, /face_enroll + /face_recognize
+usage lines, empty-gallery rejection, missing-PGM graceful failure,
+enroll alice/bob/carol with monotonically-growing size, recognize
+each of the 3 enrolled fixtures with distance 0, recognize a 4th
+high-entropy texture fixture -> "unknown" (correct rejection),
+chat reaches /quit cleanly.
+
+### Files touched / added
+
+* `src/io/transducers/image_face_recognize.nova` (NEW, ~600 lines)
+* `tests/unit/test_face_recognize.nova` (NEW, 19 test functions / 48 assertions)
+* `tests/integration/scenario_vvv_face_recognize.sh` (NEW, 14 assertions)
+* `examples/crossengin_chat.nova` (+5 lines: 1 import + 2 `/help`
+  advert + 2 dispatches; over the 4-line target by 1 since the new
+  module must be imported -- it isn't reachable through
+  `visual_perception.nova` like `image_lbp` is)
