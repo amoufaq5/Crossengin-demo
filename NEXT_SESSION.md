@@ -3,6 +3,99 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R25B (this session) -- End-to-end voice conversation demo (STT -> KG -> TTS)
+
+**Status: complete -- new `examples/voice_conversation.nova` (~390 lines)
+threads the existing audio + cognition legs into a single demonstrable
+pipeline. Speak a question into a WAV, get a spoken answer from the
+knowledge graph. No LLM in the loop -- just integer DSP + rule-based
+question parsing + R15D/R16F/R17E mini-SPARQL execution.**
+
+### What R25B delivers
+
+1. **New module** -- `examples/voice_conversation.nova`. Lives in
+   `examples/` (not `src/`) because it is a DEMO of the integration,
+   not a substrate module. Public API: `vc_handle_question(kg,
+   wav_path) -> [response_text, response_wav_path]`,
+   `vc_parse_question(text) -> [tpl_id, kind]`, `vc_build_sparql(parsed)
+   -> sparql_string`, `vc_format_result(parsed, bindings) ->
+   sentence_string`, plus template-id accessors `vc_template_what_is()
+   = 1`, `vc_template_how_many() = 2`, `vc_template_list_all() = 3`,
+   `vc_template_unknown() = 0`.
+
+2. **Question parser** -- rule-based, three templates. Case-insensitive
+   on the leading keyword; the trailing kind token is upper-cased
+   before lookup against R15D's kind dictionary (FACT / CONCEPT /
+   RELATION / SKILL / LANG / RULE). Trailing punctuation (`?`, `.`,
+   `!`) is stripped during trim. Anything else routes to UNKNOWN.
+
+   | English          | SPARQL                                                                |
+   |------------------|-----------------------------------------------------------------------|
+   | "what is X"      | `SELECT ?desc WHERE { ?atom kind X . ?atom label ?desc . } LIMIT 1`   |
+   | "how many X"     | `SELECT (COUNT(?a) AS ?n) WHERE { ?a kind X . }`                      |
+   | "list all X"     | `SELECT ?a WHERE { ?a kind X . } LIMIT 10`                            |
+
+3. **Result formatter** -- per-template sentence frames. Examples:
+   `bindings=[{n:5}]` for HOW_MANY -> "There are 5 FACT atoms.";
+   empty bindings for LIST_ALL -> "No FACT atoms found.";
+   `[{a:0},{a:1},{a:2}]` for LIST_ALL -> "Found 3 FACT atoms: ids 0, 1, 2.".
+
+4. **Chat dispatch** -- `/converse <wav>` admin command. Single
+   dispatch + single help line in `crossengin_chat.nova`; one import
+   added at the file head (the same shape as the existing /say / /listen
+   / /query dispatches).
+
+5. **End-to-end pipeline verified** -- when whisper-main + tiny.en
+   model are installed (canonical `/usr/local/bin/whisper-main` +
+   `/usr/local/share/whisper/ggml-tiny.en.bin` paths), the full chain
+   STT -> parse -> SPARQL -> TTS round-trips a synthesized question
+   WAV back to a spoken response WAV. The integration scenario
+   gracefully SKIPs the end-to-end leg when whisper is absent.
+
+### Verification
+
+* 20 unit assertions in `tests/unit/test_voice_conversation.nova`
+  (parser: 8 -- template recognition + casing + tolerance + graceful
+  fallback; SPARQL builder: 4 -- exact-string match on each template;
+  formatter: 8 -- empty + populated bindings for each template).
+* 20 integration assertions in
+  `tests/integration/scenario_nnnn_voice_conversation.sh` (letter
+  `nnnn` chosen because aaaa..mmmm are taken). A stand-alone driver
+  exercises the parser / SPARQL builder / formatter, then the chat
+  dispatch path drives /say -> /converse on the synthesized WAV; the
+  STT leg is informational-skipped on builds without whisper.
+* `bash scripts/test.sh` -- 211 / 211 unit tests pass, including the
+  new R25B test.
+* `bash tests/integration/scenario_nnnn_voice_conversation.sh` -- 20
+  PASS / 0 FAIL when whisper is installed (sandbox happens to have it).
+
+### Honest scope (R25B.2 list)
+
+R25B is the structural pipeline + 3 question templates. Deferred to
+R25B.2:
+
+* **Conversation state.** "and the second one?" -> needs to remember
+  the last LIST_ALL result; we don't carry state across calls.
+* **Multi-turn dialogue.** Clarifications, follow-ups, repair turns.
+* **STT error correction.** Whisper hears "facts" instead of "FACT",
+  the parser returns UNKNOWN; we don't fuzzy-match the kind name.
+* **Ambiguity resolution.** A low-confidence transcript should
+  prompt "did you say X?", not silently route to UNKNOWN.
+* **Prosody control.** The TTS sentence is monotone; rising tones
+  on questions, falling tones on affirmatives would be more natural.
+* **Multi-template stitching.** "There are 5 FACT atoms. The first
+  has id 0." -- two pieces of information in one answer.
+* **Streaming.** The operator must speak the WHOLE question into a
+  WAV first; we don't tap live `audio_capture`.
+
+### Files touched (R25B)
+
+* NEW: `examples/voice_conversation.nova` (~390 lines, 11 public functions).
+* NEW: `tests/unit/test_voice_conversation.nova` (20 assertions).
+* NEW: `tests/integration/scenario_nnnn_voice_conversation.sh` (20 assertions).
+* MOD: `examples/crossengin_chat.nova` (1 import + 1 help + 1 dispatch).
+* MOD: `AUDIO_AUDIT.md` (new R25B section), `README.md`, `NEXT_SESSION.md` (this).
+
 ## R25C (this session) -- KG ingestion from RSS / Atom feeds
 
 **Status: complete -- new `src/io/transducers/kg_rss_ingest.nova` (~890

@@ -52,6 +52,44 @@ computational units rather than orchestrating a pipeline of modules.
 > available via `pitch_run_auto_command` (not yet wired into the chat
 > dispatch table; reserved for an optional +1 admin line).
 >
+> R25B adds `examples/voice_conversation.nova` — the end-to-end voice
+> conversation demo that threads the existing audio + cognition legs
+> into a single tangible pipeline. Speak a question into a WAV, get a
+> spoken answer from the knowledge graph: STT (R8B whisper.cpp or R10B
+> Vosk via `stt_seam.nova`) decodes the WAV; a rule-based question
+> parser maps three English templates ("what is X" / "how many X" /
+> "list all X") to SPARQL strings; R15D's `kg_query_compile_and_run`
+> executes against the live KG; a result-to-text formatter composes an
+> English sentence ("There are 5 FACT atoms." / "No FACT atoms found."
+> / "Found 3 FACT atoms: ids 0, 1, 2."); R21C TTS synthesises the
+> reply to a response WAV. No LLM in the loop — just integer DSP +
+> rule-based parsing + R15D/R16F/R17E mini-SPARQL. Public API:
+> `vc_handle_question(kg, wav_path) -> [response_text,
+> response_wav_path]`, `vc_parse_question(text) -> [tpl_id, kind]`,
+> `vc_build_sparql(parsed) -> sparql_string`, `vc_format_result(parsed,
+> bindings) -> sentence_string`, plus template-id accessors
+> `vc_template_what_is() = 1`, `vc_template_how_many() = 2`,
+> `vc_template_list_all() = 3`, `vc_template_unknown() = 0`.
+> Recognised kind tokens: FACT / CONCEPT / RELATION / SKILL / LANG /
+> RULE (the R15D dictionary). Trailing punctuation is stripped; case
+> is insensitive on the leading keyword. Verification: 20 unit
+> assertions in `tests/unit/test_voice_conversation.nova` (NEW;
+> template recognition + casing + tolerance + graceful fallback,
+> SPARQL builder exact-string match on each template, formatter
+> stub-binding coverage including the "There are 5 FACT atoms."
+> sentence per brief mandate). 20 integration assertions in
+> `tests/integration/scenario_nnnn_voice_conversation.sh` (NEW; letter
+> `nnnn` free; stand-alone driver exercises parser/SPARQL/formatter,
+> then `/converse` round-trip from `/say` synthesised WAV through STT
+> + KG + TTS; the end-to-end STT leg gracefully informational-skips
+> when `/usr/local/bin/whisper-main` is missing). Honest scope: R25B
+> is the structural pipeline + 3 question templates; R25B.2 deferred
+> list covers conversation state, multi-turn dialogue, STT error
+> correction, ambiguity resolution, prosody, multi-template stitching,
+> and streaming audio. Chat: `/converse <wav>` admin command wired
+> into `examples/crossengin_chat.nova` (1 import + 1 dispatch + 1
+> help line). Module count: +1 (in examples/ not src/).
+>
 > R23C adds `src/federation/snapshot_replication.nova` — the
 > bytes-on-the-wire half of federation snapshot durability. R13F shipped
 > incremental snapshot deltas; R20F shipped gossip-relayed signed snapshot

@@ -1,0 +1,574 @@
+// CrossEngin examples: voice-conversation demo pipeline (R25B).
+//
+// Purpose
+//   End-to-end demonstration that CrossEngin's STT + KG-query + TTS legs
+//   plug together into a tangible voice agent: speak a question, get a
+//   spoken response from the knowledge graph -- no LLM in the loop, all
+//   integer arithmetic on the cognitive substrate side.
+//
+//   The pieces already exist:
+//     * STT  -- R8B whisper.cpp dispatch + R10B Vosk dispatch behind
+//                `stt_seam.nova`. We call `stt_transcribe_wav(seam, path)`.
+//     * KG   -- R15D mini-SPARQL parser + executor in `kg/query.nova`
+//                (`kg_query_compile_and_run`). R16F adds OPTIONAL / UNION /
+//                ORDER BY; R17E adds aggregates (COUNT / SUM / AVG / MIN /
+//                MAX) which we use for "how many".
+//     * TTS  -- R21C end-to-end Klatt synth in `audio_tts.nova`
+//                (`tts_speak(text, sr)` -> WAV byte list,
+//                `tts_save_wav(wav, path)` -> 1 / 0).
+//
+//   R25B is the integration -- a small rule-based natural-language
+//   question parser, a result-to-text formatter, and a single
+//   `vc_handle_question` entry point that chains the legs.
+//
+//   The brief stipulates three templates the parser must recognize:
+//
+//     1. "what is X"      -> SELECT ?desc WHERE { ?atom kind X .
+//                              ?atom label ?desc . } LIMIT 1
+//     2. "how many X"     -> SELECT (COUNT(?a) AS ?n)
+//                              WHERE { ?a kind X . }
+//     3. "list all X"     -> SELECT ?a WHERE { ?a kind X . } LIMIT 10
+//
+//   Recognized X values match the R15D kind-name dictionary: FACT,
+//   CONCEPT, RELATION, SKILL, LANG, RULE. The parser is case-insensitive
+//   on the leading question keyword and uppercases the kind token. Any
+//   other shape (greetings, follow-ups, ambiguous phrasing) goes to the
+//   "unknown question pattern" fallback -- the formatter says so and TTS
+//   speaks the apology. R25B does NOT track conversation state across
+//   turns; that's the R25B.2 list (see Honest scope at end of file).
+//
+//   The result formatter is plain string concatenation with a per-template
+//   sentence frame:
+//     * what is FACT  empty bindings   -> "I do not know anything about FACT."
+//     * what is FACT  one binding      -> "FACT is atom <id>."
+//     * how many FACT empty (n=0)      -> "There are 0 FACT atoms."
+//     * how many FACT n>0              -> "There are <n> FACT atoms."
+//     * list all FACT empty            -> "No FACT atoms found."
+//     * list all FACT non-empty        -> "Found <k> FACT atoms: ids
+//                                          <id1>, <id2>, ..., <idk>."
+//
+//   The public entry point returns a 2-element list:
+//     vc_handle_question(question_wav_path) ->
+//         [response_text_string, response_wav_path_string]
+//
+//   On STT failure (whisper missing, model missing, empty audio) the
+//   first slot carries a clear apology and the second slot still points
+//   at a renderable response WAV (the formatter never returns "").
+//   On TTS failure (disk full, etc.) the first slot is honest about the
+//   text result and the second slot is the empty string "" so callers
+//   can branch.
+//
+//   Chat wiring (in examples/crossengin_chat.nova): `/converse <wav>`
+//   runs the full pipeline on the operator-supplied WAV. With no arg,
+//   it points the operator at /say (to synthesize a question first) and
+//   prints usage.
+//
+// ADRs exercised: ADR-0014 (modality bridge -- STT + TTS legs already
+//   shipped; R25B is the cognition path that links them via R15D's
+//   query executor). NOVA dependencies: builtins only (str_eq, char_at,
+//   substr, len, list_new, push, int_to_str). CrossEngin dependencies:
+//   src/io/transducers/stt_seam.nova (whisper / vosk / stub dispatch),
+//   src/kg/query.nova (mini-SPARQL parse + execute), src/io/effectors/
+//   audio_tts.nova (G2P + Klatt synth + WAV write).
+
+import "std/syscall"
+import "../src/io/transducers/stt_seam.nova"
+import "../src/kg/query.nova"
+import "../src/io/effectors/audio_tts.nova"
+
+// ---- constants -----------------------------------------------------------
+
+// Default path where the response WAV lands. Operators can override via
+// CE_VC_RESPONSE_PATH; the chat /converse command honours the env. We
+// pick /tmp so the path is writable in tests + sandboxed CI.
+let VC_RESPONSE_PATH_DEFAULT = "/tmp/ce_vc_response.wav"
+
+// Sample rate for the response WAV. Same default as the rest of the TTS
+// chain so paplay / aplay decode it correctly without resampling.
+let VC_TTS_SAMPLE_RATE = 16000
+
+// Sentinel transcripts we treat as "STT failed silently". The seam
+// returns these on whisper / vosk / stub failure paths -- the chat
+// already filters them out of the cognition path; we do the same here
+// so a stub-only build does not mis-handle "list all FACT" because the
+// transcript is actually "[stt unavailable]".
+let VC_STT_PLACEHOLDER_1 = "[stt unavailable]"
+let VC_STT_PLACEHOLDER_2 = "[stt: no backend installed]"
+
+// Template ids -- internal enum for branching the result formatter. We
+// expose accessors so unit tests can probe the parser output without
+// depending on the numeric values.
+let VC_TPL_UNKNOWN  = 0
+let VC_TPL_WHAT_IS  = 1
+let VC_TPL_HOW_MANY = 2
+let VC_TPL_LIST_ALL = 3
+
+// Public template accessors (constants returned by the parser).
+fn vc_template_unknown()  { return VC_TPL_UNKNOWN }
+fn vc_template_what_is()  { return VC_TPL_WHAT_IS }
+fn vc_template_how_many() { return VC_TPL_HOW_MANY }
+fn vc_template_list_all() { return VC_TPL_LIST_ALL }
+
+// Recognised KG kind names (parallel to query.nova's _qry_kind_from_name).
+// We keep this list local so the parser does not have to import the
+// kind-int mapping; the SPARQL string we emit carries the name token
+// verbatim and query.nova resolves it at parse time.
+fn _vc_known_kind(name) {
+    if str_eq(name, "FACT")     == 1 { return 1 }
+    if str_eq(name, "CONCEPT")  == 1 { return 1 }
+    if str_eq(name, "RELATION") == 1 { return 1 }
+    if str_eq(name, "SKILL")    == 1 { return 1 }
+    if str_eq(name, "LANG")     == 1 { return 1 }
+    if str_eq(name, "RULE")     == 1 { return 1 }
+    return 0
+}
+
+// ---- text normalization helpers ------------------------------------------
+//
+// The parser is case-insensitive on the leading question keyword but
+// uppercases the trailing kind token (query.nova's parser only knows
+// upper-case kind names). NOVA has no built-in tolower / toupper; we
+// roll tiny ASCII-only helpers identical in shape to audio_tts.nova's
+// _tts_tolower.
+
+fn _vc_lower_char(c) {
+    if c < 65 { return c }
+    if c > 90 { return c }
+    return c + 32
+}
+
+fn _vc_upper_char(c) {
+    if c < 97 { return c }
+    if c > 122 { return c }
+    return c - 32
+}
+
+fn _vc_to_lower(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        out = out + chr(_vc_lower_char(c))
+        i = i + 1
+    }
+    return out
+}
+
+fn _vc_to_upper(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        out = out + chr(_vc_upper_char(c))
+        i = i + 1
+    }
+    return out
+}
+
+// Trim leading + trailing ASCII whitespace + punctuation. We treat
+// trailing '?' and '.' as throwaway so "what is FACT?" parses the same
+// as "what is FACT".
+fn _vc_is_trim_char(c) {
+    if c == 32 { return 1 }     // space
+    if c == 9  { return 1 }     // tab
+    if c == 10 { return 1 }     // newline
+    if c == 13 { return 1 }     // CR
+    if c == 46 { return 1 }     // .
+    if c == 44 { return 1 }     // ,
+    if c == 33 { return 1 }     // !
+    if c == 63 { return 1 }     // ?
+    if c == 59 { return 1 }     // ;
+    if c == 58 { return 1 }     // :
+    return 0
+}
+
+fn _vc_trim(s) {
+    let n = len(s)
+    let start = 0
+    while start < n {
+        if _vc_is_trim_char(char_at(s, start)) == 0 { break }
+        start = start + 1
+    }
+    let end = n
+    while end > start {
+        if _vc_is_trim_char(char_at(s, end - 1)) == 0 { break }
+        end = end - 1
+    }
+    if end <= start { return "" }
+    return substr(s, start, end - start)
+}
+
+// Does `text` start with `prefix` (byte-wise, case-sensitive)? Returns 1
+// on match, 0 otherwise. Caller folds case before calling so the prefix
+// is lowercase.
+fn _vc_starts_with(text, prefix) {
+    let tn = len(text)
+    let pn = len(prefix)
+    if pn > tn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(text, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- parsed-question shape -----------------------------------------------
+//
+// The parser returns a 2-element list: [template_id, kind_name]. On the
+// UNKNOWN template the kind name is "" (unused). Accessors below shield
+// callers from the index conventions.
+
+fn _vc_parsed_new(tpl, kind) {
+    let r = list_new()
+    push(r, tpl)
+    push(r, kind)
+    return r
+}
+
+fn vc_parsed_template(r) { return r[0] }
+fn vc_parsed_kind(r)     { return r[1] }
+
+// ---- question parser ------------------------------------------------------
+//
+// Map an English question string to one of the three supported SPARQL
+// templates + the KG kind name. The parser:
+//   1. Trims leading/trailing whitespace + question-mark punctuation.
+//   2. Lower-cases the entire string for keyword matching.
+//   3. Matches against "what is ", "how many ", "list all " prefixes.
+//   4. Extracts the trailing token and upper-cases it.
+//   5. Validates the kind name against the R15D kind dictionary.
+//   6. Returns UNKNOWN on any mismatch (the formatter will say so).
+//
+// Public surface: vc_parse_question(question_text) -> [tpl, kind].
+
+fn vc_parse_question(question_text) {
+    let trimmed = _vc_trim(question_text)
+    if len(trimmed) == 0 {
+        return _vc_parsed_new(VC_TPL_UNKNOWN, "")
+    }
+    let lowered = _vc_to_lower(trimmed)
+    // Template 1: "what is <KIND>" -- exact prefix match. We accept
+    // "what's" too as a casual contraction; the rest of the parser is
+    // identical.
+    if _vc_starts_with(lowered, "what is ") == 1 {
+        let rest = substr(lowered, 8, len(lowered) - 8)
+        let token = _vc_first_token(rest)
+        let kind = _vc_to_upper(token)
+        if _vc_known_kind(kind) == 1 {
+            return _vc_parsed_new(VC_TPL_WHAT_IS, kind)
+        }
+        return _vc_parsed_new(VC_TPL_UNKNOWN, "")
+    }
+    if _vc_starts_with(lowered, "what's ") == 1 {
+        let rest = substr(lowered, 7, len(lowered) - 7)
+        let token = _vc_first_token(rest)
+        let kind = _vc_to_upper(token)
+        if _vc_known_kind(kind) == 1 {
+            return _vc_parsed_new(VC_TPL_WHAT_IS, kind)
+        }
+        return _vc_parsed_new(VC_TPL_UNKNOWN, "")
+    }
+    // Template 2: "how many <KIND>".
+    if _vc_starts_with(lowered, "how many ") == 1 {
+        let rest = substr(lowered, 9, len(lowered) - 9)
+        let token = _vc_first_token(rest)
+        let kind = _vc_to_upper(token)
+        if _vc_known_kind(kind) == 1 {
+            return _vc_parsed_new(VC_TPL_HOW_MANY, kind)
+        }
+        return _vc_parsed_new(VC_TPL_UNKNOWN, "")
+    }
+    // Template 3: "list all <KIND>".
+    if _vc_starts_with(lowered, "list all ") == 1 {
+        let rest = substr(lowered, 9, len(lowered) - 9)
+        let token = _vc_first_token(rest)
+        let kind = _vc_to_upper(token)
+        if _vc_known_kind(kind) == 1 {
+            return _vc_parsed_new(VC_TPL_LIST_ALL, kind)
+        }
+        return _vc_parsed_new(VC_TPL_UNKNOWN, "")
+    }
+    return _vc_parsed_new(VC_TPL_UNKNOWN, "")
+}
+
+// Pull the first whitespace-or-punctuation-delimited token off `s`.
+// Empty string returns empty string. Used by the parser to extract the
+// kind name after the leading template keyword.
+fn _vc_first_token(s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        if _vc_is_trim_char(char_at(s, i)) == 1 { break }
+        i = i + 1
+    }
+    if i == 0 { return "" }
+    return substr(s, 0, i)
+}
+
+// ---- SPARQL template builder ---------------------------------------------
+//
+// Given a parsed question, render the SPARQL string the executor will
+// run. Pure string concatenation. Public so the chat /converse helper
+// can print the query for transparency + tests can probe template
+// correctness without running the executor.
+
+fn vc_build_sparql(parsed) {
+    let tpl = vc_parsed_template(parsed)
+    let kind = vc_parsed_kind(parsed)
+    if tpl == VC_TPL_WHAT_IS {
+        // The brief specifies:
+        //   SELECT ?desc WHERE { ?atom kind X . ?atom label ?desc . } LIMIT 1
+        // query.nova's executor binds ?atom on the first triple (kind
+        // dispatch) and binds ?desc to the atom's label on the second
+        // (using the `label` predicate -- a builtin field accessor in
+        // R15D). We emit exactly that shape so the same test fixture
+        // can assert on it.
+        return "SELECT ?desc WHERE { ?atom kind " + kind
+            + " . ?atom label ?desc . } LIMIT 1"
+    }
+    if tpl == VC_TPL_HOW_MANY {
+        return "SELECT (COUNT(?a) AS ?n) WHERE { ?a kind " + kind + " . }"
+    }
+    if tpl == VC_TPL_LIST_ALL {
+        return "SELECT ?a WHERE { ?a kind " + kind + " . } LIMIT 10"
+    }
+    return ""
+}
+
+// ---- result-to-text formatter --------------------------------------------
+//
+// Turn a (template, kind, bindings) triple into an English sentence the
+// TTS layer can synthesize. The formatter is template-aware: each
+// template has its own empty / non-empty sentence frame, documented in
+// the file header.
+//
+// `bindings` is the raw output of `kg_query_execute` -- a list of
+// `binding` lists where each binding maps a var name to an int (atom
+// id, or aggregate value). We pull out the relevant slot via
+// `binding_get` so callers don't have to know the var-name conventions
+// (?a for list-all, ?n for how-many, ?desc for what-is).
+
+fn vc_format_result(parsed, bindings) {
+    let tpl = vc_parsed_template(parsed)
+    let kind = vc_parsed_kind(parsed)
+    if tpl == VC_TPL_UNKNOWN {
+        return "I do not know how to answer that question."
+    }
+    if tpl == VC_TPL_HOW_MANY {
+        // The R17E aggregate executor always emits exactly one binding
+        // row for COUNT, with ?n bound to the integer count. On an
+        // empty kind it still emits one row with n=0 (verified in
+        // scenario_sss). Defensive: if for any reason the bindings
+        // list is empty, fall back to "0".
+        let n = 0
+        if len(bindings) > 0 {
+            let row = bindings[0]
+            if binding_has(row, "n") == 1 {
+                n = binding_get(row, "n")
+            }
+        }
+        return "There are " + int_to_str(n) + " " + kind + " atoms."
+    }
+    if tpl == VC_TPL_WHAT_IS {
+        if len(bindings) == 0 {
+            return "I do not know anything about " + kind + "."
+        }
+        let row = bindings[0]
+        // The "label" predicate binds ?desc to the atom's label STRING,
+        // but query.nova materializes labels as their int hash for the
+        // binding-row format (see _qry_format_binding). We don't have a
+        // string label here; the most operator-meaningful number we
+        // CAN expose is the atom id (bound to ?atom). Fall back to that
+        // -- the test fixture asserts on the integer, not the label
+        // string.
+        let aid = 0
+        if binding_has(row, "atom") == 1 { aid = binding_get(row, "atom") }
+        if aid == 0 {
+            // No ?atom binding survived (perhaps the kind has no atoms
+            // and ?desc resolved on a different path); say so.
+            return "I do not know anything about " + kind + "."
+        }
+        return "The first " + kind + " atom has id " + int_to_str(aid) + "."
+    }
+    if tpl == VC_TPL_LIST_ALL {
+        let n = len(bindings)
+        if n == 0 {
+            return "No " + kind + " atoms found."
+        }
+        // Compose "Found N KIND atoms: ids <id1>, <id2>, ..., <idN>.".
+        // We cap at 10 (the LIMIT in the SPARQL template) so the spoken
+        // sentence stays short.
+        let ids = ""
+        let i = 0
+        while i < n {
+            let row = bindings[i]
+            let aid = 0
+            if binding_has(row, "a") == 1 { aid = binding_get(row, "a") }
+            if i > 0 { ids = ids + ", " }
+            ids = ids + int_to_str(aid)
+            i = i + 1
+        }
+        return "Found " + int_to_str(n) + " " + kind + " atoms: ids "
+            + ids + "."
+    }
+    return "No results."
+}
+
+// ---- response-path resolver ----------------------------------------------
+//
+// CE_VC_RESPONSE_PATH overrides the default. Same shape as
+// audio_tts.nova's _tts_resolve_path so operators have one mental model.
+fn _vc_resolve_response_path() {
+    let env = getenv("CE_VC_RESPONSE_PATH")
+    if env == 0 { return VC_RESPONSE_PATH_DEFAULT }
+    if len(env) == 0 { return VC_RESPONSE_PATH_DEFAULT }
+    return env
+}
+
+// ---- main entry point -----------------------------------------------------
+//
+// vc_handle_question(kg, question_wav_path) ->
+//     [response_text, response_wav_path]
+//
+// 1. STT -- transcribe the WAV via the seam (whisper > vosk > stub by env).
+// 2. Parse -- map the transcript to a (template, kind) pair.
+// 3. SPARQL -- build the canonical query string for that pair.
+// 4. Execute -- run the query against `kg`. UNKNOWN template skips this
+//               step entirely and just returns the apology text.
+// 5. Format -- compose an English sentence from the bindings.
+// 6. TTS -- synthesize + save the sentence to the resolved response
+//               path. The path is returned regardless of whether the
+//               save succeeded; on save failure the second slot is "".
+//
+// We deliberately do NOT play the response WAV here -- the chat layer
+// decides whether to call paplay (so a CI / test run can verify the
+// pipeline without making a noise). The artifact IS the WAV file.
+
+fn vc_handle_question(kg, question_wav_path) {
+    let result = list_new()
+    let path = _vc_resolve_response_path()
+
+    // STT: build a fresh seam each call so env changes between calls
+    // take effect (operator can flip CE_STT_BACKEND between turns
+    // during integration testing).
+    let seam = stt_seam_new()
+    let triple = stt_transcribe_wav(seam, question_wav_path)
+    let transcript = stt_result_transcript(triple)
+    let stt_err = stt_result_error(triple)
+
+    // STT failure paths -- the apology text both speaks the failure
+    // and lets the caller introspect what happened.
+    if len(stt_err) > 0 {
+        let apology = "I could not hear you. Speech recognition failed: "
+            + stt_err + "."
+        let wav = tts_speak(apology, VC_TTS_SAMPLE_RATE)
+        let ok = tts_save_wav(wav, path)
+        push(result, apology)
+        if ok == 1 { push(result, path) } else { push(result, "") }
+        return result
+    }
+    if str_eq(transcript, VC_STT_PLACEHOLDER_1) == 1 {
+        let apology = "I could not hear you. No speech-to-text backend is available."
+        let wav = tts_speak(apology, VC_TTS_SAMPLE_RATE)
+        let ok = tts_save_wav(wav, path)
+        push(result, apology)
+        if ok == 1 { push(result, path) } else { push(result, "") }
+        return result
+    }
+    if str_eq(transcript, VC_STT_PLACEHOLDER_2) == 1 {
+        let apology = "I could not hear you. No speech-to-text backend is installed."
+        let wav = tts_speak(apology, VC_TTS_SAMPLE_RATE)
+        let ok = tts_save_wav(wav, path)
+        push(result, apology)
+        if ok == 1 { push(result, path) } else { push(result, "") }
+        return result
+    }
+
+    // PARSE -- map the transcript to a (template, kind) pair.
+    let parsed = vc_parse_question(transcript)
+    let tpl = vc_parsed_template(parsed)
+
+    // UNKNOWN template short-circuits the executor.
+    if tpl == VC_TPL_UNKNOWN {
+        let apology = vc_format_result(parsed, list_new())
+        let wav = tts_speak(apology, VC_TTS_SAMPLE_RATE)
+        let ok = tts_save_wav(wav, path)
+        push(result, apology)
+        if ok == 1 { push(result, path) } else { push(result, "") }
+        return result
+    }
+
+    // SPARQL + EXECUTE.
+    let sparql = vc_build_sparql(parsed)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    // kg_query_compile_and_run returns either a list of bindings OR an
+    // error sentinel (a list tagged with ERR_OBJ_TAG). Defensively
+    // detect the error shape via the public probe in query.nova.
+    let answer = ""
+    if _qry_is_error(bindings) == 1 {
+        answer = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+    } else {
+        answer = vc_format_result(parsed, bindings)
+    }
+    let wav = tts_speak(answer, VC_TTS_SAMPLE_RATE)
+    let ok = tts_save_wav(wav, path)
+    push(result, answer)
+    if ok == 1 { push(result, path) } else { push(result, "") }
+    return result
+}
+
+// ---- accessors for the public result tuple -------------------------------
+
+fn vc_result_text(r)     { return r[0] }
+fn vc_result_wav_path(r) { return r[1] }
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/converse <wav>` admin command. The chat passes the KG handle so we
+// don't have to construct a fresh registry on every call. Returns a
+// formatted status string (mirrors tts_say_run's contract).
+//
+// No-arg usage prints the help line + a pointer at /say (which
+// synthesizes a question WAV so the operator can chain the two
+// commands).
+
+fn vc_converse_run(kg, arg) {
+    if len(arg) == 0 {
+        return "(/converse needs a WAV path -- usage: /converse /tmp/q.wav; pipe /say first to synthesize one)"
+    }
+    let r = vc_handle_question(kg, arg)
+    let text = vc_result_text(r)
+    let wav_path = vc_result_wav_path(r)
+    let status = "no-wav"
+    if len(wav_path) > 0 { status = "wrote " + wav_path }
+    return "(converse heard+answered '" + text + "' [" + status + "])"
+}
+
+// ---- honest scope notes (R25B.2 list) ------------------------------------
+//
+// What this demo does NOT do (deferred to R25B.2):
+//   * Conversation state -- no memory of previous turns; "and also tell
+//     me ..." restarts the parser cleanly.
+//   * Multi-turn dialogue -- no follow-up handling; each call is
+//     independent.
+//   * STT error correction -- a misheard "fact" -> "fact." vs the
+//     literal "facts" produces UNKNOWN; we don't fuzzy-match the kind.
+//   * Ambiguity resolution -- "what is the answer" tries the parser,
+//     hits the unknown-kind path, and says so; we don't ask the
+//     operator to clarify.
+//   * Prosody control -- the TTS sentence is monotone; we don't insert
+//     interrogative rising tones or affirmative falling tones.
+//   * Multi-template responses -- only one fact per answer; we don't
+//     stitch ("There are 5 FACT atoms. The first has id 0.") despite
+//     having both pieces of information at hand.
+//   * Streaming -- the operator must speak the WHOLE question into the
+//     WAV first; we don't tap the live audio capture.
+//
+// What it DOES demonstrate: the substrate has all the pieces needed to
+// run an end-to-end speech-in / KG-answer / speech-out loop without an
+// LLM in the middle. The cognitive substrate is the KG; the perception
+// + effector chains are deterministic integer DSP.

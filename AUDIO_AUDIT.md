@@ -2624,3 +2624,134 @@ path's own voicing decision will mark the frame unvoiced anyway).
   chat helper currently reports only the per-method counts; a future
   enhancement would report the score distribution for downstream
   diagnostics.
+
+## R25B -- end-to-end voice conversation demo (STT -> KG -> TTS)
+
+R25B threads the existing audio + cognition legs into a single
+demonstrable pipeline: speak a question, get a spoken answer from the
+knowledge graph -- no LLM in the loop, just integer DSP + rule-based
+parsing + R15D/R16F/R17E mini-SPARQL.
+
+### Pipeline shape
+
+```
+question.wav --[R8B/R10B stt_seam]--> transcript text
+                      |
+                      v
+            [rule-based question parser]
+                      |
+                      v
+                 [SPARQL string]
+                      |
+                      v
+          [R15D kg_query_compile_and_run]
+                      |
+                      v
+                  [bindings]
+                      |
+                      v
+            [result-to-text formatter]
+                      |
+                      v
+       [R21C tts_speak + tts_save_wav]
+                      |
+                      v
+                 response.wav
+```
+
+The new demo module `examples/voice_conversation.nova` is the
+integration layer; the 4 cognition / IO modules underneath are
+unchanged.
+
+### Question parser
+
+Rule-based, three templates. Pattern matching is case-insensitive on
+the leading keyword, case-folded to upper for the kind token (which
+must be one of FACT / CONCEPT / RELATION / SKILL / LANG / RULE -- the
+R15D kind dictionary). Trailing punctuation (`?`, `.`) is stripped.
+Anything that doesn't match routes to UNKNOWN with a graceful
+apology.
+
+| Template       | English                  | SPARQL emitted                                                                       |
+|----------------|--------------------------|--------------------------------------------------------------------------------------|
+| WHAT_IS  (1)   | "what is X" / "what's X" | `SELECT ?desc WHERE { ?atom kind X . ?atom label ?desc . } LIMIT 1`                  |
+| HOW_MANY (2)   | "how many X"             | `SELECT (COUNT(?a) AS ?n) WHERE { ?a kind X . }`                                     |
+| LIST_ALL (3)   | "list all X"             | `SELECT ?a WHERE { ?a kind X . } LIMIT 10`                                           |
+| UNKNOWN  (0)   | anything else            | (no SPARQL emitted -- formatter says "I do not know how to answer that question.")   |
+
+### Result-to-text formatter
+
+Template-aware. Each template has its own empty / non-empty sentence
+frame, all pure string concatenation:
+
+| Template | bindings shape       | English emitted                                                |
+|----------|----------------------|----------------------------------------------------------------|
+| HOW_MANY | `[{n: 5}]`           | `"There are 5 FACT atoms."` (n=0 still emits "There are 0 ...")|
+| HOW_MANY | `[]` (defensive)     | `"There are 0 FACT atoms."`                                    |
+| WHAT_IS  | empty                | `"I do not know anything about FACT."`                         |
+| WHAT_IS  | `[{atom: 42}]`       | `"The first FACT atom has id 42."`                             |
+| LIST_ALL | empty                | `"No FACT atoms found."`                                       |
+| LIST_ALL | `[{a:0},{a:1},{a:2}]`| `"Found 3 FACT atoms: ids 0, 1, 2."`                           |
+| UNKNOWN  | (ignored)            | `"I do not know how to answer that question."`                 |
+
+### Public surface
+
+`examples/voice_conversation.nova` exposes:
+
+* `vc_parse_question(text) -> [tpl_id, kind]`
+* `vc_build_sparql(parsed) -> sparql_string`
+* `vc_format_result(parsed, bindings) -> sentence_string`
+* `vc_handle_question(kg, wav_path) -> [response_text, response_wav_path]`
+* `vc_converse_run(kg, arg)` -- chat-side wrapper for the `/converse`
+  admin command (1 dispatch line in `crossengin_chat.nova`).
+* Template accessors: `vc_template_what_is()`, `vc_template_how_many()`,
+  `vc_template_list_all()`, `vc_template_unknown()`.
+
+### Honest scope (R25B.2 list)
+
+R25B is the structural pipeline + 3 question templates. A real voice
+agent needs:
+
+* Conversation state across turns ("and the second one?" -> needs to
+  remember the last LIST_ALL result).
+* Multi-turn dialogue (clarifications, follow-ups).
+* STT error correction (whisper hears "facts" not "FACT"; we don't
+  fuzzy-match the kind name).
+* Ambiguity resolution (a low-confidence transcript should prompt
+  "did you say X?").
+* Prosody control (the TTS sentence is monotone; rising tones on
+  questions would be more natural).
+* Multi-template responses (stitching "There are 5 FACT atoms. The
+  first has id 0." despite having both pieces at hand).
+* Streaming audio (we still require the whole question pre-recorded
+  to a WAV; live capture would tap `audio_capture` directly).
+
+All of these are tracked in the R25B.2 deferred list at the bottom
+of `voice_conversation.nova`.
+
+### Verification
+
+* 20 unit assertions in `tests/unit/test_voice_conversation.nova`
+  cover the parser (8), SPARQL builder (4), and formatter (6) +
+  fallback (2). Build via `make test`.
+* 20 integration assertions in
+  `tests/integration/scenario_nnnn_voice_conversation.sh` drive both
+  the stand-alone driver and the chat `/converse` round-trip. The
+  end-to-end STT leg is gracefully SKIPed (informational note, not a
+  hard fail) when `/usr/local/bin/whisper-main` is missing -- the
+  stub-backend path still writes a response WAV (the apology line)
+  so the structural shape is verifiable in CI without the 75 MB
+  whisper install.
+
+### Files touched (R25B)
+
+* NEW: `examples/voice_conversation.nova` (~390 lines incl. header +
+  honest-scope footer; 11 public functions).
+* NEW: `tests/unit/test_voice_conversation.nova` (20 unit assertions).
+* NEW: `tests/integration/scenario_nnnn_voice_conversation.sh` (20
+  integration assertions, letter `nnnn` is free).
+* MOD: `examples/crossengin_chat.nova` (1 import + 1 help + 1 dispatch
+  line). The dispatch passes `kg` so `/converse` operates on the
+  current session's KG (same shape as `/query`).
+* MOD: `AUDIO_AUDIT.md` (this section), `README.md`,
+  `NEXT_SESSION.md`.
