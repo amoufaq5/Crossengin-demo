@@ -11,7 +11,48 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R23C adds `src/federation/snapshot_replication.nova` — the
+> toolchain. R22F.2 extends `src/io/transducers/audio_pitch.nova` (R10F +
+> R11B's file) with a harmonicity-driven auto-switch between R10F
+> autocorrelation and R11B YIN. R22F (audio_melody) chose R10F by default
+> because R11B YIN's octave-down anti-snap subharmonic-collapses pure sines;
+> but for harmonic-rich speech / instrument content R11B YIN avoids the
+> formant snap that R10F suffers. R22F.2 picks per frame: a single-frame
+> STFT magnitude spectrum is computed via R16E, gated on spectral
+> peakiness (max_bin / avg_bin >= 5x to reject broadband noise), then the
+> count of DISTINCT prominent peaks (above 30% of the dominant, with
+> adjacent-bin leakage neighbours merged) drives the harmonicity score
+> (350 milli * num_distinct, capped at 1000). Above
+> PITCH_HARMONIC_THRESHOLD_MILLI (600 default) -> YIN; below -> R10F.
+> Pure 200 Hz sine scores 350 (one peak after leakage merging) -> AC.
+> Harmonic 200 Hz with 2nd + 3rd harmonics scores 1000 -> YIN. Klatt /ae/
+> vowel (F1 + F2 formants) scores 700 -> YIN. White noise gates to 0 ->
+> AC (autocorrelation then marks it unvoiced). Public API:
+> `pitch_harmonicity_score(pcm_frame, sample_rate) -> int_milli`,
+> `pitch_estimate_frame_auto(pcm_frame, sample_rate) -> [f0_centihz,
+> voicing_milli, method_used]`, `pitch_track_auto(pcm_buffer, sample_rate)
+> -> list[[f0, voicing, method]]`, plus `pitch_auto_method_count(contour,
+> method)` and the method-label accessors `pitch_method_autocorr() = 0`,
+> `pitch_method_yin() = 1`, `pitch_method_none() = 2`. Verification: 31
+> unit assertions in `tests/unit/test_pitch_auto.nova` (NEW; constants +
+> accessors, harmonicity_score on pure sine / harmonic / noise / silence
+> / Klatt /ae/ / short buffer, pitch_estimate_frame_auto routing across
+> all 5 fixtures, pitch_track_auto on harmonic-all-YIN + mixed sine-and-
+> harmonic + short input, pitch_result_method accessor, method_count on
+> empty contour). 11 integration assertions in
+> `tests/integration/scenario_qqqq_pitch_auto.sh` (NEW; pure sine: every
+> frame routes to AC, F0 ~ 200 Hz; harmonic-rich: majority routes to YIN,
+> F0 ~ 200 Hz; mixed sine + Klatt /ae/ + harmonic + silence: both AC and
+> YIN frames present in same contour; JFK natural-speech sample: 311/366
+> frames routed to YIN (85% majority), mean F0 178.57 Hz lies in plausible
+> voice band, much lower than R10F's standalone formant-snap ~220 Hz).
+> All prior audio suites stay green (R6E Klatt 209, R7F VAD 86, R8B/R10B
+> STT 28, R10F pitch 52, R11B YIN 35, R12D PSOLA, R13D voice clone, R14E
+> DSP 34, R16E STFT 49, R17B MFCC 41, R18C wakeword, R19D speaker_id,
+> R21C TTS 68, R22F melody 40). Chat: `/pitch_auto <wav>` admin command
+> available via `pitch_run_auto_command` (not yet wired into the chat
+> dispatch table; reserved for an optional +1 admin line).
+>
+> R23C adds `src/federation/snapshot_replication.nova` — the
 > bytes-on-the-wire half of federation snapshot durability. R13F shipped
 > incremental snapshot deltas; R20F shipped gossip-relayed signed snapshot
 > attestations ("at ts T I sealed root R"). R23C closes the gap: when peer
@@ -167,7 +208,41 @@ computational units rather than orchestrating a pipeline of modules.
 > missing dir -> graceful FAILED; /help advertises /smooth and
 > labels it R24F). Existing CV suites stay green (R23D tracker 40
 > checks). Chat: `/smooth <video_dir>` admin command wired into
-> `examples/crossengin_chat.nova`. Module count: +1. R23B adds `src/perception/lipsync.nova` — audio-vision
+> `examples/crossengin_chat.nova`. Module count: +1.
+> R24C adds `src/io/transducers/image_ocr.nova` — image OCR via
+> character template matching. A gallery of (char, template) pairs is
+> slid across the image; at each position the best-matching template
+> above a threshold is emitted as a (char, x, y, score) detection;
+> cross-character NMS collapses overlapping detections; survivors are
+> sorted into reading order and concatenated to recover the text
+> string. Score is `1000 - dist * 1000 / max_dist` where `dist` is the
+> L2 sum-of-squared-differences and `max_dist = 255 * 255 * tw * th`.
+> A built-in 8x8 bitmap font ships covering uppercase A-Z + digits 0-9
+> (36 hand-drawn glyphs encoded as row masks). Public API:
+> `ocr_template_gallery_new()`, `ocr_gallery_add_char(gallery,
+> char_code, image, w, h) -> ok`, `ocr_gallery_size`,
+> `ocr_recognize_text(image, w, h, gallery, threshold_milli) ->
+> list[[char, x, y, score, tw, th]]`, `ocr_to_text(detections) ->
+> str`, `ocr_default_gallery() -> 36-glyph 8x8 ASCII font`,
+> `ocr_render_text(text, gallery) -> [image_ptr, w, h]`,
+> `ocr_pgm_args(arg) -> chat admin string`. Verification: 40 unit
+> assertions in `tests/unit/test_image_ocr.nova` (NEW; empty gallery,
+> 5-template add, uniform-shape rule, self-match score=1000,
+> noisy-match score>800 with one pixel flipped, wrong-character picks
+> correct template, confidence threshold drops low-score detections,
+> NMS collapses 3 overlapping same-char detections to 1, empty image
+> -> 0 detections, "HELLO" round-trip rendering then OCR -> "HELLO",
+> default gallery has 36 entries, 8x8 each). 10 integration
+> assertions in `tests/integration/scenario_pppp_ocr.sh` (NEW;
+> "HI"/"HELLO"/"ABC" synth fixtures recognized with correct
+> detection counts, uniform-grey gibberish -> text="" detections=0,
+> missing file -> graceful FAILED, /help advertises /ocr).
+> Existing CV suites stay green. Honest scope: template-matching OCR
+> works PERFECTLY for clean rendered text matching the gallery font;
+> real-world text in photographs requires CNN-based OCR which CE
+> can't do without a learned model. Chat: `/ocr <pgm>` admin command
+> wired into `examples/crossengin_chat.nova`. Module count: +1.
+> R23B adds `src/perception/lipsync.nova` — audio-vision
 > lip sync detection. Given a sequence of PGM video frames + an audio WAV,
 > the detector reports whether the speaker on screen is actually saying the
 > words in the audio. Per-frame mouth-open score: lower-third of R16D Haar

@@ -3,7 +3,201 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R24F (this session) -- Video temporal smoothing: Kalman over R23D tracker outputs
+## R22F.2 (this session) -- Audio pitch harmonic auto-switch (R10F autocorrelation <-> R11B YIN)
+
+**Status: complete -- extension to `src/io/transducers/audio_pitch.nova`
+(R10F + R11B's file). Adds per-frame harmonicity scoring + dynamic
+detector selection between R10F autocorrelation and R11B YIN. R22F
+(commit 33b6e059) shipped audio_melody with R10F as the default
+because YIN subharmonic-snaps pure sines; but harmonic-rich vocal /
+instrument content benefits from YIN to avoid R10F's formant snap.
+R22F.2 picks per frame.**
+
+### What R22F.2 delivers
+
+1. **Extension** -- `src/io/transducers/audio_pitch.nova` (R10F + R11B's
+   file; EXTEND only -- the original R10F autocorrelation and R11B YIN
+   entry points are unchanged). +~500 lines comprising the harmonicity
+   heuristic, single-frame STFT wrapper, distinct-peak counter, and
+   per-frame / contour-level auto-switch entry points.
+
+2. **Public API** -- `pitch_harmonicity_score(pcm_frame, sample_rate)
+   -> int_milli (0..1000)`, `pitch_estimate_frame_auto(pcm_frame,
+   sample_rate) -> [f0_centihz, voicing_milli, method_used]`,
+   `pitch_track_auto(pcm_buffer, sample_rate) -> list[[f0, voicing,
+   method]]`, plus `pitch_auto_method_count(contour, method) -> int`
+   helper and method-label accessors `pitch_method_autocorr() = 0`,
+   `pitch_method_yin() = 1`, `pitch_method_none() = 2`. Tunable
+   constants exposed via `pitch_harmonic_threshold() = 600`,
+   `pitch_harmonic_max_peaks() = 5`. Chat helper
+   `pitch_run_auto_command(arg)` renders the per-method frame split.
+
+3. **Heuristic** -- Two-pass:
+
+   * **Pass 1 -- Peakiness gate.** Single-frame STFT (R16E) over the
+     largest-power-of-2 prefix of the PCM frame (128 bins @ 8 kHz pitch
+     frame, 256 bins @ 16 kHz). Compute max_bin_mag / avg_bin_mag. Gate
+     at >= 5x (5000 milli). Below the gate: score 0 (broadband / noise).
+   * **Pass 2 -- Distinct-peak counting.** Walk the magnitude spectrum,
+     collect local maxima above 30% of the strongest bin, merge
+     adjacent-bin neighbours (spectral leakage of a single carrier),
+     cap at 5 peaks. Score = min(1000, 350 * num_distinct). Threshold
+     at 600 milli (>= 2 distinct peaks) routes to YIN; below routes to
+     R10F.
+
+   Calibration table:
+
+   | Signal              | peakiness | n_distinct | score | method   |
+   |---------------------|----------:|-----------:|------:|----------|
+   | Pure 200 Hz sine    |     56516 |          1 |   350 | AUTOCORR |
+   | Harmonic 200 Hz     |     29690 |          3 |  1000 | YIN      |
+   | Klatt /ae/ vowel    |     11947 |          2 |   700 | YIN      |
+   | White noise         |      2327 |  gate-fail |     0 | AUTOCORR |
+   | Silence             |         0 |        ---|      0 | AUTOCORR |
+
+4. **JFK natural-speech calibration** -- bundled whisper.cpp jfk.wav
+   @ 16 kHz: 366 total frames -> 311 YIN (85% majority) + 55 AC.
+   Mean F0 across voiced frames = 17857 centi (= 178.57 Hz). R10F
+   standalone reports ~220 Hz on the same input (first-formant snap);
+   R11B standalone reports ~140-150 Hz (full F0 cure). The auto-switch
+   sits in between, dominated by YIN on voiced frames and accepting
+   AC for silent / unvoiced regions where AC's own voicing decision
+   marks the frame unvoiced anyway.
+
+5. **Verification** -- 31 unit assertions
+   (`tests/unit/test_pitch_auto.nova` -- NEW): constants + accessors,
+   pitch_harmonicity_score on 6 fixtures (pure sine / harmonic /
+   noise / silence / Klatt /ae/ / short buffer), pitch_estimate_frame_
+   auto routing on each + method = NONE on short buffer,
+   pitch_track_auto on harmonic-all-YIN + mixed sine-and-harmonic +
+   short input, pitch_result_method accessor, method_count on empty
+   contour. 11 integration assertions
+   (`tests/integration/scenario_qqqq_pitch_auto.sh` -- NEW):
+   stand-alone driver covers pure sine (every frame to AC, F0 in
+   [19500, 20500] centi), harmonic-rich (yin majority, F0 ~ 20000),
+   4-section mixed sequence (24 frames, both AC and YIN > 0 -- detector
+   switched), JFK conditional (yin strict majority 311/366, mean F0
+   in plausible voice band [8000, 23000] centi-Hz).
+
+### What is left (deferred to R22F.3 / R22F.4)
+
+* **Adaptive YIN bounds.** Currently when the auto-switch picks YIN
+  it uses the module-default f0_min / f0_max (50..500 Hz). R22F's
+  original "Future work" proposal was to use R10F's argmax as an
+  initial estimate, then refine with YIN around that range. R22F.3
+  would combine the switch-the-algorithm approach of R22F.2 with the
+  narrow-the-search-range refinement -- tighter f0 bounds on the
+  YIN path would shorten the worst-case per-frame cost.
+
+* **Voicing-aware short-circuit.** The harmonicity STFT runs
+  unconditionally per frame. An unvoiced frame doesn't benefit from
+  either kernel; running the cheap R10F energy + voicing check
+  first and only computing the harmonicity STFT when the frame is
+  voiced would cut the average per-frame cost roughly in half on
+  speech-like input.
+
+* **Cross-frame smoothing.** Per-frame method switches can oscillate
+  at section boundaries (last frame of sustained sine + first frame
+  of vowel both near the 600-milli threshold). A 3-frame median
+  filter on the score would stabilise the method label.
+
+* **Chat dispatch.** `pitch_run_auto_command` is implemented but
+  NOT yet wired into `examples/crossengin_chat.nova`'s admin command
+  table (the brief allowed at most +1 line; deferred to keep the
+  chat layer's dispatch table unchanged this round since R24C's OCR
+  already added a /ocr dispatch entry on the same line and chat-side
+  churn should be minimised).
+
+## R24C (this session) -- Image OCR via character template matching
+
+**Status: complete -- new module `src/io/transducers/image_ocr.nova`
+(+~640 lines) ships the structural template-matching OCR primitive.
+A gallery of (char, template) pairs is slid across an input image;
+at each position the best-matching template above a threshold is
+emitted as a (char, x, y, score) detection; cross-character NMS
+collapses overlapping detections; the survivors are sorted into
+reading order and concatenated to recover the text string. A
+built-in 8x8 bitmap font ships covering uppercase A-Z + digits 0-9
+(36 glyphs) so the chat `/ocr PATH` admin works out of the box on
+synthetic text rendered from the same font.**
+
+### What R24C delivers
+
+1. **Module** -- `src/io/transducers/image_ocr.nova` (NEW).
+   Public API: `ocr_template_gallery_new`,
+   `ocr_gallery_add_char(gallery, char_code, image, w, h)`,
+   `ocr_gallery_size`, `ocr_gallery_template_width`,
+   `ocr_gallery_template_height`, `ocr_recognize_text(image, w, h,
+   gallery, threshold_milli) -> list[[char, x, y, score, tw, th]]`,
+   `ocr_to_text(detections) -> str`,
+   `ocr_default_gallery() -> 36-glyph 8x8 ASCII font`,
+   `ocr_render_text(text, gallery) -> [image_ptr, w, h]`,
+   `ocr_pgm_args(arg) -> chat admin string`.
+
+2. **Built-in font** -- 36 hand-drawn 8x8 stencils (uppercase A-Z +
+   digits 0-9) encoded as 8-bit row masks. Low resolution but
+   sufficient for end-to-end recognition of synthetic rendered text.
+
+3. **Chat dispatch** -- one new admin command `/ocr <pgm>`. Decodes
+   the PGM via `image_pgm.nova`, runs `ocr_recognize_text` against
+   the built-in font at the 950-milli (strict) threshold, returns:
+
+   ```
+   (ocr /tmp/hi.pgm: text="HI" detections=2)
+   (ocr /tmp/hello.pgm: text="HELLO" detections=5)
+   (ocr /tmp/gibberish.pgm: text="" detections=0)
+   ```
+
+   No-arg: `(/ocr needs a PATH -- usage: /ocr /tmp/test.pgm)`.
+   Missing file: `(ocr FAILED on PATH: pgm: cannot open file)`.
+
+### Verification snapshot
+
+- **40 unit assertions** in `tests/unit/test_image_ocr.nova` (NEW).
+  All PASS. Covers: empty-gallery shape; 5-template add; uniform-
+  shape rule (mismatched dims rejected); self-match score=1000;
+  noisy-match (1 pixel flipped) stays >800 score; wrong-character
+  picks correct template (B-image -> B, not A); confidence threshold
+  drops low-score detections; NMS collapses 3 overlapping same-char
+  detections to 1; empty-image / image-smaller-than-template -> 0
+  detections; empty-gallery -> 0 detections; "HELLO" round-trip
+  (render then OCR) -> "HELLO"; `ocr_to_text` on empty list ->
+  empty string; default gallery has 36 entries, 8x8 each.
+
+- **10 integration assertions** in
+  `tests/integration/scenario_pppp_ocr.sh` (NEW). All PASS. Driver
+  synthesises "HI", "HELLO", "ABC" PGM fixtures from the same masks
+  the module's default gallery ships, plus a 16x8 uniform mid-grey
+  gibberish fixture. Asserts `/help` advertises `/ocr`, `/ocr` no
+  arg -> usage, "HI" recognized with 2 detections, "HELLO" with 5,
+  "ABC" with 3, gibberish -> text="" detections=0, missing file ->
+  graceful FAILED, chat reaches /quit cleanly.
+
+- **Existing CV suites stay green** (R15C HOG detector 32, R16D
+  face_detect 36, R17D LBP 45, R18D face_recognize 48, R22D
+  panorama 59, R23D tracker 40; full 208-test suite PASS).
+
+### Honest scope (R24C)
+
+Template-matching OCR works PERFECTLY for clean rendered text whose
+glyphs match the gallery font; it falls apart on real photographs
+(variable lighting, perspective, fonts, sizes, anti-aliasing).
+R24C is the structural primitive -- correct on synthetic + clean
+rendered text. Real-world OCR requires CNN-based models which CE
+cannot do without a learned model. The public
+`ocr_gallery_add_char` API accepts richer template galleries at
+any moment.
+
+### Files touched (R24C)
+
+- `src/io/transducers/image_ocr.nova` -- NEW (~640 lines).
+- `tests/unit/test_image_ocr.nova` -- NEW (40 assertions).
+- `tests/integration/scenario_pppp_ocr.sh` -- NEW (10 assertions).
+- `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line.
+- `IMAGE_AUDIT.md`, `README.md`, `NEXT_SESSION.md` -- updated.
+
+## R24F -- Video temporal smoothing: Kalman over R23D tracker outputs
 
 **Status: complete -- new module `src/io/transducers/video_smooth.nova`
 (+~320 lines) builds scene-level smoothing on top of the R23D

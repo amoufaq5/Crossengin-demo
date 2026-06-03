@@ -66,6 +66,7 @@
 //   without dragging WAV-parse code into the unit compilation unit).
 
 import "audio_capture.nova"
+import "audio_spectrogram.nova"
 
 // ---- public constants ----------------------------------------------------
 
@@ -905,4 +906,520 @@ fn pitch_run_yin_command(arg) {
         + " [mean=" + int_to_str(mean_c) + " centi"
         + ", voiced=" + int_to_str(voiced) + "/" + int_to_str(total)
         + " frames @ " + int_to_str(sr) + " Hz])"
+}
+
+// R22F.2: Harmonicity-driven auto-switch between R10F autocorrelation and
+// R11B YIN.
+//
+// Motivation: R22F (audio_melody) chose R10F autocorrelation by default
+// because R11B YIN's octave-down anti-snap collapses pure sines to
+// sub-multiples of their fundamental (a known YIN-on-pure-sine pathology
+// noted in the R22F module header). But for harmonic-rich vocal or
+// instrument content R11B YIN avoids the formant snap that R10F suffers
+// on natural speech. The right default depends on the signal:
+//
+//   * Pure-sine / low-harmonic content  -> R10F autocorrelation
+//   * Harmonic-rich speech / instrument -> R11B YIN
+//
+// R22F.2 picks dynamically per frame. The harmonicity heuristic operates
+// in TWO passes:
+//
+//   Pass 1 -- Spectral peakiness gate. Compute max_bin_mag / avg_bin_mag
+//   ratio across the (sub-Nyquist half of the) STFT magnitude spectrum.
+//   For broadband / noise-like inputs this ratio sits at ~2..3 (the loudest
+//   bin is barely brighter than the average). For any spectrum with even
+//   one prominent peak it shoots up to 10000+ milli (= 10x+). Below the
+//   PITCH_HARMONIC_PEAKINESS_MIN_MILLI gate the score is 0 -- the frame
+//   is broadband noise and YIN has no advantage over autocorrelation
+//   (both will end up declaring it unvoiced anyway).
+//
+//   Pass 2 -- Distinct-peak counting. After confirming the spectrum has
+//   at least one prominent peak, we count how many DISTINCT peaks exist
+//   above a fractional floor of the strongest peak. Adjacent-bin
+//   neighbours of an existing peak are NOT counted again (this is FFT
+//   spectral leakage of a single carrier -- a Hann-windowed pure sine
+//   typically smears across ~3 bins at the fundamental). Two distinct
+//   peaks well-separated in bin index = structured / multi-component
+//   spectrum = YIN is preferred. The output score is:
+//
+//     score = min(1000, PITCH_HARMONIC_PER_PEAK_MILLI * num_distinct_peaks)
+//
+//   At PITCH_HARMONIC_PER_PEAK_MILLI = 350: 1 peak -> 350 milli
+//   (autocorrelation), 2 peaks -> 700, 3 -> 1000 (capped). The default
+//   PITCH_HARMONIC_THRESHOLD_MILLI = 600 is crossed at >= 2 distinct
+//   peaks. Pure sines have 1 peak -> 350 -> below threshold ->
+//   autocorrelation. Klatt vowels have 2 distinct formant peaks
+//   (F1 + F2) -> 700 -> YIN. Harmonic-rich tones with >= 2 harmonics
+//   above the floor -> 700+ -> YIN.
+//
+// Why peakiness gating + distinct-peak counting (and not strict
+// integer-multiple-ratio fitting as a first draft used): Klatt vowels
+// are TWO PURE COSINES at the formant frequencies (no glottal source
+// in R6E's synth). F1=660 and F2=1720 for /ae/ have ratio 2.61, which
+// does NOT fit any integer multiple within sensible tolerance. The
+// brief calls Klatt /ae/ "harmonic-rich" by analogy with natural-speech
+// vowel formants -- a signal class where R10F's autocorrelation
+// formant-snap is known to fail. A formant-counting (distinct-peaks)
+// heuristic captures both strict harmonic series AND formant structure
+// at the same time, mapping each to the YIN path.
+//
+// Side benefit: the peakiness gate cleanly rejects white noise, which
+// the strict integer-ratio approach over-accepted (5 random peaks
+// happen to fit some sub-multiple of one by chance ~50% of the time
+// at any sensible tolerance).
+//
+// Output unit: milli (0..1000) so the score composes with the other
+// milli-fixed-point quantities in this file (voicing_milli,
+// PITCH_OCTAVE_RATIO_MILLI, PITCH_YIN_THRESHOLD_MILLI).
+
+// Threshold above which a frame is treated as harmonic-rich (-> YIN).
+// 600 milli matches the brief default. Combined with the score formula
+// `min(1000, PITCH_HARMONIC_PER_PEAK_MILLI * num_distinct_peaks)` and
+// the 350 milli per-peak increment this means YIN fires at >= 2
+// distinct prominent peaks (covers harmonic-rich tones, Klatt vowels
+// with F1 + F2, and natural-speech formants).
+let PITCH_HARMONIC_THRESHOLD_MILLI = 600
+
+// Spectral peakiness gate (milli). The ratio max_bin_mag / avg_bin_mag
+// must be >= 5000 milli (= 5x) for the score to be > 0. Tuned against
+// the white-noise fixture (ratio ~2-3) and clean sine / Klatt fixtures
+// (ratio 10x+). Without this gate the noise spectrum scores high by
+// accident when its random local maxima land near integer-multiple
+// relationships.
+let PITCH_HARMONIC_PEAKINESS_MIN_MILLI = 5000
+
+// Peak-floor ratio (milli). A spectral local maximum counts as a "peak"
+// only if its magnitude is >= PITCH_HARMONIC_PEAK_FLOOR_MILLI / 1000 of
+// the strongest peak. 300 milli = 30%: catches Klatt's F2 (which is
+// ~98% of F1 in /ae/) and the 2nd harmonic of a 3:2:1 harmonic stack
+// (~63%) but rejects FFT spectral leakage of a pure sine (the dominant-
+// bin neighbours sit around 67% of the peak -- close, but we use
+// adjacent-bin merging below to handle that case independently).
+let PITCH_HARMONIC_PEAK_FLOOR_MILLI = 300
+
+// Adjacent-bin merge radius. When walking local maxima, any peak within
+// PITCH_HARMONIC_MERGE_RADIUS bins of a previously-accepted peak is
+// treated as the SAME peak (spectral leakage). For a Hann-windowed
+// pure sine the main lobe is ~3 bins wide; we merge within 2 to be
+// safe.
+let PITCH_HARMONIC_MERGE_RADIUS = 2
+
+// Cap on detected peaks per frame. Bounds the worst-case cost of the
+// counting loop. 5 covers F0 + 4 harmonics in vocal speech; more peaks
+// add cost without meaningfully improving the score.
+let PITCH_HARMONIC_MAX_PEAKS = 5
+
+// Per-distinct-peak score increment (milli). 1 peak -> 350, 2 -> 700,
+// 3 -> 1000 (capped). Combined with the 600-milli threshold above this
+// maps "structured spectrum with >= 2 prominent peaks" to YIN. The
+// 350 value (rather than e.g. 250) is what lets Klatt vowels (2
+// formants, no F0 source) cross the threshold without the strict
+// integer-multiple ratio check that the early draft used.
+let PITCH_HARMONIC_PER_PEAK_MILLI = 350
+
+// Minimum number of detected peaks required to even attempt a harmonic
+// score. With 1 peak (pure sine fundamental) the spectrum has no
+// multi-component structure -- the score becomes 250 (below the 600
+// threshold) and the autocorrelation path is taken. This constant is
+// retained for backward compatibility with callers / unit tests that
+// query the public threshold accessor.
+let PITCH_HARMONIC_MIN_PEAKS = 2
+
+// Method labels returned in the auto-switch tuple's third slot. The
+// integer encoding keeps the API integer-only (no string allocations
+// per frame in the hot path).
+let PITCH_METHOD_AUTOCORR = 0
+let PITCH_METHOD_YIN      = 1
+let PITCH_METHOD_NONE     = 2   // frame too short or invalid -> no method
+
+fn pitch_harmonic_threshold() { return PITCH_HARMONIC_THRESHOLD_MILLI }
+fn pitch_harmonic_max_peaks() { return PITCH_HARMONIC_MAX_PEAKS }
+fn pitch_method_autocorr()    { return PITCH_METHOD_AUTOCORR }
+fn pitch_method_yin()         { return PITCH_METHOD_YIN }
+fn pitch_method_none()        { return PITCH_METHOD_NONE }
+
+// Result-tuple accessor for the auto-switch tuple.
+fn pitch_result_method(r) { return r[2] }
+
+// Largest power-of-2 <= n, but at least 64 (the R16E STFT minimum frame
+// size). Returns 0 if n < 64 -- caller must check this case before
+// indexing into samples.
+//
+// Used to pick the STFT frame size for the auto-switch heuristic: the
+// pitch frame is 240 (@8 kHz) or 480 (@16 kHz) samples, neither of which
+// is a power of 2. The STFT requires N = 2^k in [64..1024] (R16E's
+// _stft_is_allowed_frame_size). We pick 128 for 8 kHz pitch frames and
+// 256 for 16 kHz pitch frames automatically.
+fn _pitch_pow2_floor(n) {
+    if n < 64 { return 0 }
+    let p = 64
+    while p * 2 <= n {
+        p = p * 2
+    }
+    if p > 1024 { p = 1024 }
+    return p
+}
+
+// Build a single-frame STFT magnitude spectrum for the harmonic-content
+// heuristic. The R16E `stft` call expects pcm length >= frame_size and
+// produces ceil((total - N) / H) + 1 frames; we set H = N so exactly
+// one frame is produced for the canonical 30 ms pitch-frame input.
+//
+// Returns the magnitude list (one bin per FFT bin) on success, or an
+// empty list on input too short / invalid sample rate. Caller must
+// handle the empty-list case.
+fn _pitch_harmonic_mag_spectrum(samples, sample_rate) {
+    let sr = _pitch_clamp_rate(sample_rate)
+    let n = len(samples)
+    let empty = list_new()
+    if n < 64 { return empty }
+    let fft_n = _pitch_pow2_floor(n)
+    if fft_n < 64 { return empty }
+    if fft_n > n { return empty }
+    // Build a view of exactly fft_n samples from the head of samples.
+    // R16E's stft consumes the full buffer's prefix and walks with hop=N
+    // so a single frame is produced.
+    let view = list_new()
+    let i = 0
+    while i < fft_n {
+        push(view, samples[i])
+        i = i + 1
+    }
+    let spec = stft(view, sr, fft_n, fft_n)
+    let frames = stft_frames(spec)
+    if len(frames) == 0 { return empty }
+    return frames[0]
+}
+
+// Compute the spectral peakiness ratio (max_bin_mag * 1000 / avg_bin_mag).
+// Used as the Pass-1 gate against broadband / noise inputs. The DC bin
+// (index 0) is excluded from both the max and the average since DC
+// reflects window leakage, not signal structure.
+//
+// Returns a milli ratio. White noise: ~2000-3000 (max ~1.2x avg).
+// Klatt /ae/: ~12000 (max ~12x avg). Pure sine: ~50000+ (max ~50x avg).
+// Empty / silent spectrum returns 0.
+fn _pitch_spectral_peakiness_milli(mag) {
+    let n = len(mag)
+    if n < 4 { return 0 }
+    let max_m = 0
+    let sum = 0
+    let bin = 1
+    while bin < n {
+        let v = mag[bin]
+        if v > max_m { max_m = v }
+        sum = sum + v
+        bin = bin + 1
+    }
+    if sum <= 0 { return 0 }
+    // Average over (n - 1) bins (bin 0 excluded).
+    let denom = n - 1
+    if denom <= 0 { return 0 }
+    let avg = int_div(sum, denom)
+    if avg <= 0 { return 0 }
+    // max_m and avg can reach 1e7 on loud signals. The product max_m *
+    // 1000 stays below 1e10 -- above the 1 MB smart-op ptr threshold but
+    // below 16 GiB. int_mul keeps it safe regardless of where the
+    // operand sits on NOVA's smart-op dispatch threshold table.
+    return int_div(int_mul(max_m, 1000), avg)
+}
+
+// Find DISTINCT prominent local maxima in the magnitude spectrum and
+// return them as [bin_idx, magnitude] pairs sorted in ASCENDING bin
+// order. A bin counts if:
+//   (a) Its magnitude > both immediate neighbours (strict local max).
+//   (b) Its magnitude >= floor_milli/1000 of the strongest bin
+//       (PITCH_HARMONIC_PEAK_FLOOR_MILLI, 30% default).
+//   (c) It is NOT within PITCH_HARMONIC_MERGE_RADIUS bins of an
+//       already-accepted peak (spectral-leakage neighbours of a single
+//       sine fundamental are merged into one peak).
+//
+// Iteration order: by descending magnitude. We start with the strongest
+// local max and accept subsequent maxima only if they are far enough in
+// bin index from all already-accepted peaks. This is the simplest way
+// to avoid double-counting the leakage shoulder of a single carrier
+// while still admitting genuinely-distinct formant / harmonic peaks.
+//
+// Bin 0 (DC) and bin 1 (low-frequency leakage of any DC drift) are
+// excluded. Up to PITCH_HARMONIC_MAX_PEAKS peaks are returned.
+fn _pitch_find_distinct_peaks(mag) {
+    let out = list_new()
+    let n = len(mag)
+    if n < 4 { return out }
+    // Find the strongest bin (excluding DC + bin 1).
+    let max_m = 0
+    let b = 2
+    while b < n - 1 {
+        let v = mag[b]
+        if v > max_m { max_m = v }
+        b = b + 1
+    }
+    if max_m <= 0 { return out }
+    let floor = int_div(int_mul(max_m, PITCH_HARMONIC_PEAK_FLOOR_MILLI), 1000)
+    // Gather all local maxima above the floor.
+    let cand = list_new()
+    b = 2
+    while b < n - 1 {
+        let v = mag[b]
+        if v >= floor {
+            let prev_v = mag[b - 1]
+            let next_v = mag[b + 1]
+            if v > prev_v && v > next_v {
+                let p = list_new()
+                push(p, b)
+                push(p, v)
+                push(cand, p)
+            }
+        }
+        b = b + 1
+    }
+    // Greedily accept candidates in descending magnitude order, rejecting
+    // any that fall within MERGE_RADIUS bins of an already-accepted peak.
+    let accepted = list_new()
+    let radius = PITCH_HARMONIC_MERGE_RADIUS
+    let k_cap = PITCH_HARMONIC_MAX_PEAKS
+    let used = list_new()
+    let ii = 0
+    while ii < len(cand) {
+        push(used, 0)
+        ii = ii + 1
+    }
+    let loop_n = len(cand)
+    let picked = 0
+    let _stop = 0
+    while picked < k_cap && _stop == 0 {
+        let best_idx = 0 - 1
+        let best_mag = 0
+        let j = 0
+        while j < loop_n {
+            if used[j] == 0 {
+                let m = cand[j][1]
+                if m > best_mag {
+                    best_mag = m
+                    best_idx = j
+                }
+            }
+            j = j + 1
+        }
+        if best_idx < 0 {
+            _stop = 1
+        } else {
+            // Check distance to already-accepted peaks.
+            let p = cand[best_idx]
+            let b_idx = p[0]
+            let too_close = 0
+            let aa = 0
+            while aa < len(accepted) {
+                let a_bin = accepted[aa][0]
+                let diff = b_idx - a_bin
+                if diff < 0 { diff = 0 - diff }
+                if diff <= radius { too_close = 1 }
+                aa = aa + 1
+            }
+            list_set(used, best_idx, 1)
+            if too_close == 0 {
+                push(accepted, p)
+                picked = picked + 1
+            }
+        }
+    }
+    // Sort accepted ascending by bin (selection sort -- list is tiny).
+    let n_acc = len(accepted)
+    let s = 0
+    while s < n_acc {
+        let min_j = s
+        let tt = s + 1
+        while tt < n_acc {
+            if accepted[tt][0] < accepted[min_j][0] { min_j = tt }
+            tt = tt + 1
+        }
+        if min_j != s {
+            let tmp = accepted[s]
+            list_set(accepted, s, accepted[min_j])
+            list_set(accepted, min_j, tmp)
+        }
+        s = s + 1
+    }
+    return accepted
+}
+
+// pitch_harmonicity_score(pcm_frame, sample_rate) -> int_milli (0..1000).
+//
+// Two-pass heuristic (see the R22F.2 prologue for full justification):
+//
+//   Pass 1: spectral peakiness gate. If max_mag / avg_mag < 5x the
+//           spectrum is too flat to call structured; return 0.
+//
+//   Pass 2: count DISTINCT prominent peaks (with spectral-leakage
+//           neighbours merged). The score is
+//             min(1000, PITCH_HARMONIC_PER_PEAK_MILLI * num_distinct)
+//           giving 250 for 1 peak, 500 for 2, 750 for 3, 1000 for 4+.
+//
+// Returns 0 on:
+//   * len(samples) too small for any FFT
+//   * Silence / zero spectrum
+//   * Broadband / noise (peakiness gate)
+fn pitch_harmonicity_score(samples, sample_rate) {
+    let mag = _pitch_harmonic_mag_spectrum(samples, sample_rate)
+    if len(mag) == 0 { return 0 }
+    let peakiness = _pitch_spectral_peakiness_milli(mag)
+    if peakiness < PITCH_HARMONIC_PEAKINESS_MIN_MILLI { return 0 }
+    let peaks = _pitch_find_distinct_peaks(mag)
+    let n_peaks = len(peaks)
+    if n_peaks <= 0 { return 0 }
+    let score = PITCH_HARMONIC_PER_PEAK_MILLI * n_peaks
+    if score > 1000 { score = 1000 }
+    if score < 0 { score = 0 }
+    return score
+}
+
+// pitch_estimate_frame_auto(samples, sample_rate) ->
+//     [f0_centihz, voicing_milli, method_used]
+//
+// Computes the harmonicity score for the input frame and routes to
+// R11B YIN (PITCH_METHOD_YIN) or R10F autocorrelation
+// (PITCH_METHOD_AUTOCORR) based on the score relative to
+// PITCH_HARMONIC_THRESHOLD_MILLI.
+//
+// The chosen detector runs with the module-default f0_min/f0_max and
+// (for YIN) the module-default yin_threshold. A short-buffer or
+// invalid-rate frame returns [0, 0, PITCH_METHOD_NONE].
+fn pitch_estimate_frame_auto(samples, sample_rate) {
+    let sr = _pitch_clamp_rate(sample_rate)
+    let frame_size = (sr * PITCH_FRAME_MS) / 1000
+    let total = len(samples)
+    let r = list_new()
+    if total < frame_size {
+        push(r, PITCH_UNVOICED)
+        push(r, 0)
+        push(r, PITCH_METHOD_NONE)
+        return r
+    }
+    let score = pitch_harmonicity_score(samples, sr)
+    let method = PITCH_METHOD_AUTOCORR
+    if score >= PITCH_HARMONIC_THRESHOLD_MILLI {
+        method = PITCH_METHOD_YIN
+    }
+    let pair = list_new()
+    if method == PITCH_METHOD_YIN {
+        pair = pitch_estimate_frame_yin(samples, sr,
+                                        PITCH_F0_MIN_DEFAULT,
+                                        PITCH_F0_MAX_DEFAULT,
+                                        PITCH_YIN_THRESHOLD_MILLI)
+    } else {
+        pair = pitch_estimate_frame(samples, sr,
+                                    PITCH_F0_MIN_DEFAULT,
+                                    PITCH_F0_MAX_DEFAULT)
+    }
+    push(r, pair[0])
+    push(r, pair[1])
+    push(r, method)
+    return r
+}
+
+// pitch_track_auto(samples, sample_rate) ->
+//     list[[f0_centihz, voicing_milli, method_used]]
+//
+// Walks the PCM buffer in non-overlapping frame_size chunks. Each
+// frame independently selects R10F or R11B based on its harmonicity
+// score. Tail < frame_size samples is dropped (mirrors pitch_track).
+fn pitch_track_auto(samples, sample_rate) {
+    let sr = _pitch_clamp_rate(sample_rate)
+    let frame_size = (sr * PITCH_FRAME_MS) / 1000
+    let total = len(samples)
+    let out = list_new()
+    let off = 0
+    while off + frame_size <= total {
+        let view = list_new()
+        let i = off
+        let end = off + frame_size
+        while i < end {
+            push(view, samples[i])
+            i = i + 1
+        }
+        let res = pitch_estimate_frame_auto(view, sr)
+        push(out, res)
+        off = off + frame_size
+    }
+    return out
+}
+
+// Count frames in an auto contour that used a particular method.
+// Useful for tests that assert "majority frames used YIN".
+fn pitch_auto_method_count(contour, method) {
+    let n = len(contour)
+    let i = 0
+    let count = 0
+    while i < n {
+        let entry = contour[i]
+        if entry[2] == method { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+// /pitch_auto chat helper. Mirrors pitch_run_command but routes via
+// pitch_track_auto and reports the per-method frame split.
+fn pitch_run_auto_command(arg) {
+    if len(arg) == 0 {
+        return "(/pitch_auto needs PATH -- usage: /pitch_auto /tmp/test.wav)"
+    }
+    let r = audio_capture_to_pcm(arg)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(pitch_auto FAILED: could not parse WAV at " + arg + ")"
+    }
+    if sr <= 0 {
+        return "(pitch_auto FAILED: invalid sample rate in WAV at " + arg + ")"
+    }
+    let contour = pitch_track_auto(pcm, sr)
+    let total = len(contour)
+    if total == 0 {
+        return "(pitch_auto " + arg + ": no frames @ "
+            + int_to_str(sr) + " Hz)"
+    }
+    // Reuse pitch_voiced_count / mean / range by stripping the method
+    // field. The R10F-style accessors only read indices [0] and [1].
+    let voiced = 0
+    let sum = 0
+    let min_c = 0
+    let max_c = 0
+    let yin_n = 0
+    let ac_n  = 0
+    let i = 0
+    while i < total {
+        let entry = contour[i]
+        if entry[2] == PITCH_METHOD_YIN { yin_n = yin_n + 1 }
+        if entry[2] == PITCH_METHOD_AUTOCORR { ac_n = ac_n + 1 }
+        let f0 = entry[0]
+        if f0 != PITCH_UNVOICED {
+            if voiced == 0 {
+                min_c = f0
+                max_c = f0
+            } else {
+                if f0 < min_c { min_c = f0 }
+                if f0 > max_c { max_c = f0 }
+            }
+            sum = sum + f0
+            voiced = voiced + 1
+        }
+        i = i + 1
+    }
+    if voiced == 0 {
+        return "(pitch_auto " + arg + ": no voiced frames @ "
+            + int_to_str(sr) + " Hz, total=" + int_to_str(total)
+            + " frames, yin=" + int_to_str(yin_n)
+            + ", autocorr=" + int_to_str(ac_n) + ")"
+    }
+    let mean_c = sum / voiced
+    let mean_hz = pitch_centihz_to_hz(mean_c)
+    let lo_hz = pitch_centihz_to_hz(min_c)
+    let hi_hz = pitch_centihz_to_hz(max_c)
+    return "(pitch_auto " + arg + ": f0_mean=" + int_to_str(mean_hz) + " Hz"
+        + ", f0_range=" + int_to_str(lo_hz) + "-" + int_to_str(hi_hz) + " Hz"
+        + " [voiced=" + int_to_str(voiced) + "/" + int_to_str(total)
+        + " frames, yin=" + int_to_str(yin_n)
+        + ", autocorr=" + int_to_str(ac_n)
+        + " @ " + int_to_str(sr) + " Hz])"
 }

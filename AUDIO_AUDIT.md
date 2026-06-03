@@ -2414,3 +2414,213 @@ threshold) and ignores the state machine.
   The correlator currently treats both streams as instantaneous;
   a future revision could pre-shift the audio by +/- N frames and
   pick the lag that maximises correlation.
+
+## R22F.2 -- Audio pitch harmonic auto-switch (R10F autocorrelation <-> R11B YIN)
+
+Status: **DONE (extension to `src/io/transducers/audio_pitch.nova`).**
+R22F (audio_melody, commit 33b6e059) shipped with R10F autocorrelation
+as the default pitch kernel because R11B YIN's octave-down anti-snap
+subharmonic-collapses pure sines at default bounds (a known YIN-on-
+pure-sine pathology documented in the R22F module header). The brief
+called this out as a follow-up: the right default depends on the signal's
+harmonicity. R22F.2 picks the better detector per frame.
+
+### The trade-off this resolves
+
+R22F's "Future work" section notes:
+
+> **Singing voice pitch (YIN path)** -- the brief specifies R11B
+> YIN. The current R22F uses R10F because YIN subharmonic-snaps
+> pure sines at default bounds. A future R22F.2 could call YIN
+> with adaptively-tightened f0_min (start with R10F's argmax, then
+> refine with YIN around that estimate -- the de Cheveigne paper's
+> "external initial estimate" mode). Would give clean F0 on
+> harmonic-rich sung melody where R10F's formant snap dominates.
+
+R22F.2 implements a simpler resolution than the adaptive-bounds
+proposal: a per-frame harmonicity score classifies each frame as
+"harmonic-rich" or "pure-tone-like" and routes it to the appropriate
+kernel:
+
+  * Pure / low-harmonic content      -> R10F (no YIN sub-multiple snap)
+  * Harmonic / multi-formant content -> R11B (no AC formant snap)
+
+### The harmonicity heuristic (two-pass)
+
+**Pass 1 -- Spectral peakiness gate.** Compute a single-frame STFT
+(R16E) on the input PCM frame. Take the magnitude spectrum and compute
+
+```
+peakiness_milli = (max_bin_mag * 1000) / avg_bin_mag    ; excluding DC
+```
+
+Calibration on the test fixtures:
+
+| Signal              | peakiness_milli |
+|---------------------|----------------:|
+| Pure 200 Hz sine    |          56516  |
+| Harmonic 200 Hz     |          29690  |
+| Klatt /ae/ vowel    |          11947  |
+| White noise         |           2327  |
+
+A 5000-milli (= 5x) gate cleanly rejects broadband noise. Below the
+gate the score is 0; above it Pass 2 runs. This is what makes the
+heuristic robust against the brief's white-noise fixture (the strict
+integer-multiple-ratio interpretation of the brief's algorithm
+over-accepts noise about 50% of the time: 5 random peaks happen to
+fit some sub-multiple of one by chance at any sensible tolerance).
+
+**Pass 2 -- Distinct-peak counting.** Walk the magnitude array,
+collect all local maxima above 30% of the strongest peak (the
+PITCH_HARMONIC_PEAK_FLOOR_MILLI floor). Adjacent-bin neighbours of
+an already-accepted peak are merged out (a Hann-windowed pure sine
+smears across ~3 bins at its fundamental). The score is
+
+```
+score_milli = min(1000, 350 * num_distinct_peaks)
+```
+
+mapping:
+
+| num_distinct | score |
+|-------------:|------:|
+|            1 |   350 |
+|            2 |   700 |
+|            3 |  1000 |
+|           4+ |  1000 |
+
+The default PITCH_HARMONIC_THRESHOLD_MILLI = 600 is therefore crossed
+at >= 2 distinct peaks. Pure sines (1 peak) -> 350 -> AC. Klatt vowels
+(F1 + F2) -> 700 -> YIN. Harmonic-rich tones (>= 2 harmonics above the
+floor) -> 700+ -> YIN.
+
+### Why distinct-peak counting (not strict integer-multiple fitting)
+
+The brief's described algorithm ("Check if peaks form harmonic series
+(2nd peak ≈ 2× first, 3rd ≈ 3× first, etc.). Harmonic ratio score =
+num peaks fitting integer multiples / total peaks") is a strict
+integer-harmonic-series fit. The brief also states "Klatt vowel
+(R6E /ae/): high harmonicity expected (formant structure) -> YIN".
+
+These two are in tension. R6E's Klatt /ae/ synthesizes F1 = 660 Hz +
+F2 = 1720 Hz as PURE COSINES with no glottal source. The ratio
+1720/660 = 2.61 does NOT fit any integer multiple within sensible
+tolerance (< 15%). A strict integer-multiple fit would score Klatt
+/ae/ at 1/2 = 500 milli, just below the 600 threshold, routing it to
+AC -- contradicting the brief's mapping for Klatt.
+
+A formant / distinct-peak counter resolves the tension: both
+"harmonic series" inputs AND "formant structure" inputs share the
+property of having multiple distinct prominent spectral peaks above
+a noise floor. AC's failure mode (formant snapping at low F0) is
+also triggered by exactly this signal class, so routing all of these
+inputs to YIN is the right call. The distinct-peak count is a
+simpler heuristic and matches the brief's behavioural specification.
+
+### Public API
+
+```nova
+fn pitch_harmonicity_score(pcm_frame, sample_rate) -> int_milli         // 0..1000
+fn pitch_estimate_frame_auto(pcm_frame, sample_rate)
+       -> [f0_centihz, voicing_milli, method_used]
+fn pitch_track_auto(pcm_buffer, sample_rate)
+       -> list[[f0_centihz, voicing_milli, method_used]]
+fn pitch_auto_method_count(contour, method) -> int                       // count helper
+fn pitch_result_method(r) -> int                                          // r[2]
+
+// Method labels (integer):
+fn pitch_method_autocorr() -> 0
+fn pitch_method_yin()      -> 1
+fn pitch_method_none()     -> 2          // frame too short / invalid
+
+// Tunable constants:
+fn pitch_harmonic_threshold() -> 600   // milli; > this -> YIN
+fn pitch_harmonic_max_peaks() -> 5     // cap on distinct peaks counted
+```
+
+The chat helper `pitch_run_auto_command(arg)` mirrors R10F's
+`pitch_run_command` / R11B's `pitch_run_yin_command` but additionally
+reports the per-method frame split:
+
+```
+(pitch_auto /tmp/jfk.wav: f0_mean=178 Hz, f0_range=80-280 Hz
+[voiced=311/366 frames, yin=311, autocorr=55 @ 16000 Hz])
+```
+
+### Calibration on the JFK fixture (16 kHz adult-male voice)
+
+Running `pitch_track_auto` on the bundled whisper.cpp jfk.wav:
+
+| Metric              | Value                          |
+|---------------------|-------------------------------:|
+| Total frames        | 366                            |
+| YIN frames          | 311 (85% majority)             |
+| AC frames           | 55                             |
+| Voiced frames       | 311                            |
+| Mean F0 (centi-Hz)  | 17857 (= 178.57 Hz)            |
+
+For comparison: R10F standalone reports ~220 Hz on the same fixture
+(its first-formant snap), R11B standalone reports ~140-150 Hz (full
+F0 cure). The auto-switch sits at ~178 Hz, dominated by YIN on the
+voiced frames but accepting some AC frames where the harmonicity
+score is below threshold (silent / unvoiced regions where the AC
+path's own voicing decision will mark the frame unvoiced anyway).
+
+### Verification
+
+- 31 unit assertions in `tests/unit/test_pitch_auto.nova` (NEW).
+  Covers: constants + accessors (5); pitch_harmonicity_score on pure
+  200 Hz sine / harmonic 200 Hz / white noise / silence / Klatt /ae/
+  / short buffer (7); pitch_estimate_frame_auto routing across all 5
+  fixtures + method = NONE on short buffer (11); pitch_track_auto on
+  harmonic-all-YIN + mixed sine-and-harmonic + short input (6);
+  pitch_result_method accessor (1); pitch_auto_method_count on empty
+  contour (2).
+
+- 11 integration assertions in
+  `tests/integration/scenario_qqqq_pitch_auto.sh` (NEW). Stand-alone
+  driver runs pitch_track_auto on synthesized pure sine (1.5 s),
+  harmonic-rich 200 Hz (1.5 s), and a concatenated 24-frame mixed
+  sequence (sine + Klatt /ae/ + harmonic + silence, 6 frames each).
+  Asserts: pure sine has yin=0 / ac=frames (every frame to AC),
+  mean_f0 in [19500, 20500] centi; harmonic-rich has yin majority
+  (yin*2 >= frames), mean_f0 ~ 20000 centi; mixed has both yin > 0
+  and ac > 0 (detector switched). Plus JFK head-to-head (conditional
+  on /tmp/whisper.cpp/samples/jfk.wav): yin*2 > frames (strict
+  majority), mean_f0 in plausible voice band [8000, 23000] centi.
+
+- All prior audio suites remain green (R6E Klatt 209, R7F VAD 86,
+  R8B/R10B STT 28, R10F pitch 52, R11B YIN 35, R12D PSOLA, R13D voice
+  clone, R14E DSP 34, R16E STFT 49, R17B MFCC 41, R18C wakeword,
+  R19D speaker_id, R21C TTS 68, R22F melody 40).
+
+### Future work
+
+- **Adaptive YIN bounds.** R22F's "Future work" originally proposed
+  using R10F's argmax as an initial F0 estimate, then refining with
+  YIN around that estimate. R22F.2 takes a coarser switch-the-
+  algorithm approach. A future R22F.3 could combine the two: when
+  the auto-switch picks YIN, narrow YIN's f0_min/f0_max around the
+  R10F estimate. Would tighten the search range on the YIN path,
+  reducing the worst-case cost per frame.
+
+- **Voicing-aware switching.** Currently the harmonicity score is
+  computed unconditionally per frame. A frame already known to be
+  unvoiced (no glottal source) doesn't benefit from either kernel;
+  a future tweak could short-circuit by running the cheap R10F
+  energy + voicing check first and only computing the harmonicity
+  STFT when the frame is voiced.
+
+- **Score smoothing across frames.** Per-frame method switches can
+  oscillate at section boundaries (e.g., the last frame of a sustained
+  sine + first frame of a held vowel may both score around the
+  threshold). A 3-frame median filter on the score would stabilise
+  the method label.
+
+- **Confidence reporting.** The score itself is informative beyond
+  the binary YIN-vs-AC decision: a low score (< 200 milli) on a
+  voiced frame indicates "AC is confident in the call"; a borderline
+  score (550..650) indicates "either kernel could be wrong". The
+  chat helper currently reports only the per-method counts; a future
+  enhancement would report the score distribution for downstream
+  diagnostics.
