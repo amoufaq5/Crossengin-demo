@@ -1,0 +1,677 @@
+// CrossEngin federation: NAT traversal -- STUN-like external address
+// discovery + gossip-piggyback advertisement (R23E).
+//
+// Purpose
+//   R18E (`src/federation/gossip.nova`) ships a SWIM-style gossip mesh
+//   that assumes every peer can directly reach every other peer's TCP
+//   port. Real-world federation across home networks, mobile devices,
+//   and corporate firewalls violates this assumption: peers behind a
+//   NAT can OUT-connect (the NAT creates a temporary mapping at egress)
+//   but cannot accept INBOUND connections on their internal addr/port.
+//   The canonical fix is the STUN/TURN/ICE stack -- discover the
+//   external addr via a rendezvous server, advertise it to peers, and
+//   hole-punch to establish reciprocal flows.
+//
+//   R23E ships the discovery + advertisement half on TCP. UDP
+//   hole-punching is documented but stubbed: NOVA exposes only TCP
+//   (`socket(AF_INET, SOCK_STREAM, 0)` shape; `sendto/recvfrom` are
+//   not wired into the compiler today). TCP hole-punching exists
+//   (Ford et al. 2005) but needs SO_REUSEPORT + simultaneous connect
+//   which is fiddly. R23E.2 is the planned UDP sequel once NOVA gains
+//   sendto/recvfrom.
+//
+// Protocol
+//
+//   1. External address discovery -- the peer dials a STUN-like
+//      rendezvous server. Wire:
+//
+//          dialer >> STUN_REQUEST\n
+//          server >> EXTERNAL <ip>:<port>\n
+//
+//      The server learns the dialer's external addr from the kernel
+//      via `accept_conn(server_fd, sa_buf, sa_len_ptr)`: the
+//      `struct sockaddr_in` slot the kernel fills carries the peer's
+//      IP + port AS OBSERVED ON THE SERVER SIDE -- which for a NATed
+//      dialer is the public mapping. In sandbox tests with
+//      127.0.0.1, the server sees `127.0.0.1:<ephemeral>`.
+//
+//   2. Gossip-piggyback advertisement:
+//          EXTADDR <self_internal_addr> <external_addr>\n
+//
+//      Receivers update their per-peer external-addr table. The gossip
+//      handler's EXTADDR parser branch (gossip.nova) writes into
+//      nat_state via the pinned cross-module slot.
+//
+//   3. NAT type detection (heuristic): query TWO STUN servers, compare:
+//          two queries same external port  -> "cone" NAT
+//          two queries different ext ports -> "symmetric" NAT
+//          ext addr == one of local addrs  -> "open" (no NAT)
+//          query fails entirely            -> "blocked"
+//
+//   4. Hole punching (STUB, R23E.2) -- nat_hole_punch returns 0.
+//
+// Public API
+//
+//   nat_init()                                   -> nat_state_t
+//   nat_query_stun(addr)                         -> ext_addr | 0
+//   nat_query_stun_with_state(state, addr)       -> ext_addr | 0
+//   nat_serve_stun_conn(conn_fd, peer_ip, peer_port) -> 1 | 0
+//   nat_serve_stun_conn_sa(conn_fd, sa_buf)      -> 1 | 0
+//   nat_serve_stun_one_shot(bind_addr)           -> 1 | 0
+//   nat_advertise(gossip_state, nat_state, ext_addr)  -> int
+//   nat_peer_external_addrs(state)               -> list of [internal, external]
+//   nat_local_addrs()                            -> list of addr strings
+//   nat_detect_type(addr1, addr2)                -> str
+//   nat_detect_type_from_replies(reply1, reply2) -> str
+//   nat_hole_punch(state, addr)                  -> 0 (stub)
+//   nat_status_line(state)                       -> one-line summary
+//
+//   Plus helpers exercised by the unit tests: nat_parse_stun_response,
+//   nat_format_stun_response, nat_extract_peer_addr, nat_alloc_sa_buf,
+//   nat_alloc_sa_len, nat_set_external, nat_get_external,
+//   nat_set_peer_external, nat_get_peer_external,
+//   nat_record_inbound_extaddr, nat_query_count, nat_query_ok_count,
+//   nat_advertise_count, nat_inbound_ad_count.
+//
+// ADRs implemented: registers ADR-0086 (NAT traversal substrate).
+// NOVA dependencies: socket(2,1,0), bind/listen/accept/connect,
+// send/recv, close_fd, getenv, alloc/load8/store8/store64.
+// CrossEngin dependencies: src/federation/gossip.nova.
+
+import "std/io"
+import "./gossip.nova"
+
+// ---- protocol constants ---------------------------------------------------
+
+let NAT_DEFAULT_STUN_PORT  = 8770
+let NAT_LINE_MAX           = 1024
+let NAT_CONNECT_RETRIES    = 3
+let NAT_CONNECT_DELAY_MS   = 50
+let NAT_QUERY_TIMEOUT_MS   = 500
+
+let NAT_STUN_REQUEST_LINE  = "STUN_REQUEST"
+let NAT_EXTERNAL_PREFIX    = "EXTERNAL "
+let NAT_EXTADDR_PREFIX     = "EXTADDR "
+
+let NAT_TYPE_OPEN      = "open"
+let NAT_TYPE_CONE      = "cone"
+let NAT_TYPE_SYMMETRIC = "symmetric"
+let NAT_TYPE_BLOCKED   = "blocked"
+
+// ---- nat_state_t record indices ------------------------------------------
+
+let NAT_S_MY_EXTERNAL    = 0
+let NAT_S_PEER_EXT_TABLE = 1
+let NAT_S_TYPE_GUESS     = 2
+let NAT_S_QUERIES        = 3
+let NAT_S_QUERIES_OK     = 4
+let NAT_S_ADVERTS        = 5
+let NAT_S_INBOUND_ADS    = 6
+let NAT_S_HOLE_PUNCHES   = 7
+let NAT_S_LAST_ERROR     = 8
+
+// ---- low-level string helpers --------------------------------------------
+
+fn _nat_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _nat_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _nat_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _nat_starts_with(s, prefix) {
+    if len(s) < len(prefix) { return 0 }
+    let i = 0
+    while i < len(prefix) {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _nat_strip_eol(s) {
+    let n = len(s)
+    while n > 0 {
+        let c = char_at(s, n - 1)
+        if c == 10 { n = n - 1 } else {
+            if c == 13 { n = n - 1 } else { return substr(s, 0, n) }
+        }
+    }
+    return ""
+}
+
+fn _nat_parse_addr(addr) {
+    let i = 0
+    while i < len(addr) {
+        if char_at(addr, i) == 58 {
+            let host = substr(addr, 0, i)
+            let port_s = substr(addr, i + 1, len(addr) - i - 1)
+            if len(host) == 0 { return 0 }
+            if _nat_is_digits(port_s) == 0 { return 0 }
+            let port = str_to_int(port_s)
+            if port <= 0 { return 0 }
+            if port > 65535 { return 0 }
+            let rec = list_new()
+            push(rec, host)
+            push(rec, port)
+            return rec
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _nat_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _nat_is_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    return a + b * k256 + c * k256 * k256 + d * k256 * k256 * k256
+}
+
+// ---- state constructors ---------------------------------------------------
+
+fn nat_init() {
+    let st = list_new()
+    push(st, "")
+    push(st, list_new())
+    push(st, "")
+    push(st, 0)
+    push(st, 0)
+    push(st, 0)
+    push(st, 0)
+    push(st, 0)
+    push(st, "")
+    return st
+}
+
+// ---- external-addr setters / accessors -----------------------------------
+
+fn nat_set_external(state, addr) { state[NAT_S_MY_EXTERNAL] = addr; return state }
+fn nat_get_external(state)       { return state[NAT_S_MY_EXTERNAL] }
+fn nat_set_type(state, type_str) { state[NAT_S_TYPE_GUESS] = type_str; return state }
+fn nat_get_type(state)           { return state[NAT_S_TYPE_GUESS] }
+fn nat_set_last_error(state, msg) { state[NAT_S_LAST_ERROR] = msg; return state }
+fn nat_last_error(state)         { return state[NAT_S_LAST_ERROR] }
+fn nat_query_count(state)        { return state[NAT_S_QUERIES] }
+fn nat_query_ok_count(state)     { return state[NAT_S_QUERIES_OK] }
+fn nat_advertise_count(state)    { return state[NAT_S_ADVERTS] }
+fn nat_inbound_ad_count(state)   { return state[NAT_S_INBOUND_ADS] }
+
+// ---- peer external-addr table operations ---------------------------------
+
+fn nat_set_peer_external(state, internal_addr, external_addr) {
+    let tbl = state[NAT_S_PEER_EXT_TABLE]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], internal_addr) == 1 {
+            tbl[i][1] = external_addr
+            return state
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, internal_addr)
+    push(rec, external_addr)
+    push(tbl, rec)
+    return state
+}
+
+fn nat_get_peer_external(state, internal_addr) {
+    let tbl = state[NAT_S_PEER_EXT_TABLE]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], internal_addr) == 1 { return tbl[i][1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn nat_peer_external_addrs(state) { return state[NAT_S_PEER_EXT_TABLE] }
+fn nat_peer_count(state) { return len(state[NAT_S_PEER_EXT_TABLE]) }
+
+// ---- STUN-response parser ------------------------------------------------
+
+fn nat_parse_stun_response(line) {
+    let stripped = _nat_strip_eol(line)
+    if _nat_starts_with(stripped, NAT_EXTERNAL_PREFIX) == 0 { return 0 }
+    let rest = substr(stripped, len(NAT_EXTERNAL_PREFIX),
+                      len(stripped) - len(NAT_EXTERNAL_PREFIX))
+    if len(rest) == 0 { return 0 }
+    let parsed = _nat_parse_addr(rest)
+    if parsed == 0 { return 0 }
+    if _nat_ip_str_to_int(parsed[0]) < 0 { return 0 }
+    return rest
+}
+
+fn nat_format_stun_response(ip, port) {
+    return NAT_EXTERNAL_PREFIX + ip + ":" + int_to_str(port)
+}
+
+// ---- sockaddr_in peer-addr extraction ------------------------------------
+//
+// struct sockaddr_in (16 bytes):
+//   bytes 0-1: sin_family (AF_INET = 2), little-endian
+//   bytes 2-3: sin_port, big-endian
+//   bytes 4-7: sin_addr (4 bytes, network byte order)
+//   bytes 8-15: pad
+
+fn nat_extract_peer_addr(sa_buf) {
+    if sa_buf == 0 { return 0 }
+    let family_lo = load8(sa_buf + 0)
+    let family_hi = load8(sa_buf + 1)
+    let family = family_lo + family_hi * 256
+    if family != 2 { return 0 }
+    let port_hi = load8(sa_buf + 2)
+    let port_lo = load8(sa_buf + 3)
+    let port = port_hi * 256 + port_lo
+    let b0 = load8(sa_buf + 4)
+    let b1 = load8(sa_buf + 5)
+    let b2 = load8(sa_buf + 6)
+    let b3 = load8(sa_buf + 7)
+    let ip_str = int_to_str(b0) + "." + int_to_str(b1) + "."
+        + int_to_str(b2) + "." + int_to_str(b3)
+    let out = list_new()
+    push(out, ip_str)
+    push(out, port)
+    return out
+}
+
+fn nat_alloc_sa_buf() {
+    let buf = alloc(16)
+    let i = 0
+    while i < 16 { store8(buf + i, 0); i = i + 1 }
+    return buf
+}
+
+fn nat_alloc_sa_len() {
+    let buf = alloc(4)
+    store8(buf + 0, 16)
+    store8(buf + 1, 0)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    return buf
+}
+
+// ---- low-level wire helpers ----------------------------------------------
+
+fn _nat_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _nat_recv_line(fd) {
+    let buf = alloc(NAT_LINE_MAX)
+    let n = 0
+    while n < NAT_LINE_MAX - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return _nat_strip_eol(buf)
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return _nat_strip_eol(buf)
+        }
+    }
+    store8(buf + n, 0)
+    return _nat_strip_eol(buf)
+}
+
+fn _nat_setsockopt(fd, level, optname, optval, optlen) {
+    asm {
+        "mov rax, 54"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "mov r10, [rbp-32]"
+        "mov r8, [rbp-40]"
+        "syscall"
+    }
+}
+
+fn _nat_set_rcvtimeo_ms(fd, ms) {
+    let tv = alloc(16)
+    let i = 0
+    while i < 16 { store8(tv + i, 0); i = i + 1 }
+    let secs = ms / 1000
+    let rem_ms = ms - secs * 1000
+    let usec = rem_ms * 1000
+    let vs = secs
+    let k = 0
+    while k < 8 {
+        store8(tv + k, vs - (vs / 256) * 256)
+        vs = vs / 256
+        k = k + 1
+    }
+    let v = usec
+    let j = 0
+    while j < 8 {
+        store8(tv + 8 + j, v - (v / 256) * 256)
+        v = v / 256
+        j = j + 1
+    }
+    _nat_setsockopt(fd, 1, 20, tv, 16)
+    _nat_setsockopt(fd, 1, 21, tv, 16)
+    return 0
+}
+
+fn _nat_dial(addr) {
+    let parsed = _nat_parse_addr(addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _nat_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let sa = make_sockaddr_in(port, ip)
+    let attempt = 0
+    while attempt < NAT_CONNECT_RETRIES {
+        let fd = socket(2, 1, 0)
+        if fd < 0 { return -1 }
+        _nat_set_rcvtimeo_ms(fd, NAT_QUERY_TIMEOUT_MS)
+        if connect_socket(fd, sa, 16) >= 0 {
+            return fd
+        }
+        close_fd(fd)
+        sleep_ms(NAT_CONNECT_DELAY_MS)
+        attempt = attempt + 1
+    }
+    return -1
+}
+
+// ---- public API: STUN query (client side) --------------------------------
+
+fn nat_query_stun_with_state(state, stun_addr) {
+    if state != 0 {
+        state[NAT_S_QUERIES] = state[NAT_S_QUERIES] + 1
+    }
+    let fd = _nat_dial(stun_addr)
+    if fd < 0 {
+        if state != 0 { nat_set_last_error(state, "dial-failed") }
+        return 0
+    }
+    if _nat_send_all(fd, NAT_STUN_REQUEST_LINE + "\n") == 0 {
+        if state != 0 { nat_set_last_error(state, "send-failed") }
+        close_fd(fd)
+        return 0
+    }
+    let reply = _nat_recv_line(fd)
+    close_fd(fd)
+    if reply == 0 {
+        if state != 0 { nat_set_last_error(state, "recv-failed") }
+        return 0
+    }
+    let ext = nat_parse_stun_response(reply)
+    if ext == 0 {
+        if state != 0 { nat_set_last_error(state, "malformed-response") }
+        return 0
+    }
+    if state != 0 {
+        state[NAT_S_QUERIES_OK] = state[NAT_S_QUERIES_OK] + 1
+        nat_set_last_error(state, "")
+    }
+    return ext
+}
+
+fn nat_query_stun(stun_addr) { return nat_query_stun_with_state(0, stun_addr) }
+
+// ---- public API: STUN server side ----------------------------------------
+
+fn nat_serve_stun_conn(conn_fd, peer_ip, peer_port) {
+    let line = _nat_recv_line(conn_fd)
+    if line == 0 { close_fd(conn_fd); return 0 }
+    if str_eq(line, NAT_STUN_REQUEST_LINE) == 0 {
+        close_fd(conn_fd)
+        return 0
+    }
+    let reply = nat_format_stun_response(peer_ip, peer_port) + "\n"
+    let ok = _nat_send_all(conn_fd, reply)
+    close_fd(conn_fd)
+    return ok
+}
+
+fn nat_serve_stun_conn_sa(conn_fd, sa_buf) {
+    let parsed = nat_extract_peer_addr(sa_buf)
+    if parsed == 0 { close_fd(conn_fd); return 0 }
+    return nat_serve_stun_conn(conn_fd, parsed[0], parsed[1])
+}
+
+fn nat_serve_stun_one_shot(bind_addr) {
+    let parsed = _nat_parse_addr(bind_addr)
+    if parsed == 0 { return 0 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _nat_ip_str_to_int(host)
+    if ip < 0 { return 0 }
+    let fd = socket(2, 1, 0)
+    if fd < 0 { return 0 }
+    let one_buf = alloc(4)
+    store8(one_buf, 1)
+    store8(one_buf + 1, 0)
+    store8(one_buf + 2, 0)
+    store8(one_buf + 3, 0)
+    _nat_setsockopt(fd, 1, 2, one_buf, 4)
+    let sa = make_sockaddr_in(port, ip)
+    if bind_socket(fd, sa, 16) < 0 { close_fd(fd); return 0 }
+    if listen_socket(fd, 4) < 0 { close_fd(fd); return 0 }
+    let sa_buf = nat_alloc_sa_buf()
+    let sa_len = nat_alloc_sa_len()
+    let conn_fd = accept_conn(fd, sa_buf, sa_len)
+    if conn_fd < 0 { close_fd(fd); return 0 }
+    let ok = nat_serve_stun_conn_sa(conn_fd, sa_buf)
+    close_fd(fd)
+    return ok
+}
+
+// ---- public API: advertise via gossip ------------------------------------
+
+fn nat_advertise_to(state, peer_addr, self_internal, my_external) {
+    if state != 0 {
+        state[NAT_S_ADVERTS] = state[NAT_S_ADVERTS] + 1
+    }
+    let fd = _nat_dial(peer_addr)
+    if fd < 0 { return 0 }
+    if _nat_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _nat_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    let line = NAT_EXTADDR_PREFIX + self_internal + " " + my_external + "\n"
+    if _nat_send_all(fd, line) == 0 { close_fd(fd); return 0 }
+    _nat_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+fn nat_advertise(gossip_state, nat_state, my_external) {
+    if my_external == 0 { return 0 }
+    if len(my_external) == 0 { return 0 }
+    if nat_state != 0 {
+        nat_set_external(nat_state, my_external)
+    }
+    let alive = gossip_alive_peers(gossip_state)
+    let self_internal = gossip_self_addr(gossip_state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if nat_advertise_to(nat_state, alive[i], self_internal, my_external) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// ---- public API: record inbound EXTADDR ----------------------------------
+
+fn nat_record_inbound_extaddr(state, internal_addr, external_addr) {
+    if state == 0 { return 0 }
+    if len(internal_addr) == 0 { return 0 }
+    if len(external_addr) == 0 { return 0 }
+    let parsed = _nat_parse_addr(external_addr)
+    if parsed == 0 { return 0 }
+    if _nat_ip_str_to_int(parsed[0]) < 0 { return 0 }
+    nat_set_peer_external(state, internal_addr, external_addr)
+    state[NAT_S_INBOUND_ADS] = state[NAT_S_INBOUND_ADS] + 1
+    return 1
+}
+
+// ---- public API: local-address enumeration -------------------------------
+
+fn nat_local_addrs() {
+    let out = list_new()
+    push(out, "127.0.0.1")
+    let env = getenv("CE_NAT_LOCAL_ADDRS")
+    if env != 0 {
+        if len(env) > 0 {
+            let i = 0
+            let start = 0
+            while i < len(env) {
+                if char_at(env, i) == 44 {
+                    if i > start {
+                        let tok = substr(env, start, i - start)
+                        let seen = 0
+                        let j = 0
+                        while j < len(out) {
+                            if str_eq(out[j], tok) == 1 { seen = 1 }
+                            j = j + 1
+                        }
+                        if seen == 0 { push(out, tok) }
+                    }
+                    start = i + 1
+                }
+                i = i + 1
+            }
+            if i > start {
+                let tok2 = substr(env, start, i - start)
+                let seen2 = 0
+                let k = 0
+                while k < len(out) {
+                    if str_eq(out[k], tok2) == 1 { seen2 = 1 }
+                    k = k + 1
+                }
+                if seen2 == 0 { push(out, tok2) }
+            }
+        }
+    }
+    return out
+}
+
+fn nat_local_addr_count() { return len(nat_local_addrs()) }
+
+// ---- public API: NAT-type detection --------------------------------------
+
+fn _nat_local_addr_in(ip_str, local_addrs) {
+    let i = 0
+    while i < len(local_addrs) {
+        if str_eq(local_addrs[i], ip_str) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn nat_detect_type_from_replies(reply1, reply2) {
+    if reply1 == 0 { return NAT_TYPE_BLOCKED }
+    if reply2 == 0 { return NAT_TYPE_BLOCKED }
+    if len(reply1) == 0 { return NAT_TYPE_BLOCKED }
+    if len(reply2) == 0 { return NAT_TYPE_BLOCKED }
+    let p1 = _nat_parse_addr(reply1)
+    let p2 = _nat_parse_addr(reply2)
+    if p1 == 0 { return NAT_TYPE_BLOCKED }
+    if p2 == 0 { return NAT_TYPE_BLOCKED }
+    let locals = nat_local_addrs()
+    if str_eq(p1[0], p2[0]) == 1 {
+        if p1[1] == p2[1] {
+            if _nat_local_addr_in(p1[0], locals) == 1 {
+                return NAT_TYPE_OPEN
+            }
+            return NAT_TYPE_CONE
+        }
+    }
+    return NAT_TYPE_SYMMETRIC
+}
+
+fn nat_detect_type(stun_addr_1, stun_addr_2) {
+    let r1 = nat_query_stun(stun_addr_1)
+    let r2 = nat_query_stun(stun_addr_2)
+    return nat_detect_type_from_replies(r1, r2)
+}
+
+// ---- public API: hole punching (STUB) -----------------------------------
+
+fn nat_hole_punch(state, peer_external_addr) {
+    if state != 0 {
+        state[NAT_S_HOLE_PUNCHES] = state[NAT_S_HOLE_PUNCHES] + 1
+        nat_set_last_error(state, "hole-punch-not-implemented")
+    }
+    return 0
+}
+
+// ---- env helpers ---------------------------------------------------------
+
+fn nat_stun_server_from_env() {
+    let env = getenv("CE_NAT_STUN_SERVER")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return ""
+}
+
+// ---- chat helpers --------------------------------------------------------
+
+fn nat_status_line(state) {
+    if state == 0 { return "nat: <no state>" }
+    let ext = state[NAT_S_MY_EXTERNAL]
+    if len(ext) == 0 { ext = "<unknown>" }
+    let type_str = state[NAT_S_TYPE_GUESS]
+    if len(type_str) == 0 { type_str = "<undetected>" }
+    return "nat: external=" + ext
+        + " type=" + type_str
+        + " peers=" + int_to_str(nat_peer_count(state))
+        + " queries=" + int_to_str(state[NAT_S_QUERIES])
+        + " queries_ok=" + int_to_str(state[NAT_S_QUERIES_OK])
+        + " adverts=" + int_to_str(state[NAT_S_ADVERTS])
+        + " inbound_ads=" + int_to_str(state[NAT_S_INBOUND_ADS])
+        + " hole_punches=" + int_to_str(state[NAT_S_HOLE_PUNCHES])
+}
