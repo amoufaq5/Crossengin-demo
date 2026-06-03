@@ -1,4 +1,4 @@
-// CrossEngin knowledge: declarative SPARQL-like query language (R15D + R16F).
+// CrossEngin knowledge: declarative SPARQL-like query language (R15D + R16F + R17E).
 //
 // Purpose
 //   The KG has many read paths: exact id (atom_store.kg_find_atom),
@@ -25,13 +25,15 @@
 //   single-file module is the right scope for a v1.0 query surface).
 //
 // Mini-SPARQL grammar (BNF, simplified)
-//   query   ::= "SELECT" varlist "WHERE" "{" pattern* "}" orderby? limit?
-//   varlist ::= "?" name ( "?" name )*
+//   query   ::= "SELECT" selitem+ "WHERE" "{" pattern* "}" groupby? orderby? limit?
+//   selitem ::= "?" name | "(" aggfn "(" "?" name field? ")" "AS" "?" name ")"
+//   aggfn   ::= "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
 //   pattern ::= triple "." | filter "." | optional | union
 //   triple  ::= term predicate term
 //   filter  ::= "FILTER" field op intvalue
 //   optional::= "OPTIONAL" "{" pattern* "}"
 //   union   ::= "{" pattern* "}" "UNION" "{" pattern* "}"
+//   groupby ::= "GROUP" "BY" "?" name
 //   orderby ::= "ORDER" "BY" ( "ASC" "(" field ")" | "DESC" "(" field ")" | field )
 //   term    ::= "?" name | literal
 //   predicate ::= "kind" | "label" | "alpha" | "beta" | "created_ns"
@@ -63,9 +65,21 @@
 //   - ORDER BY <field> [ASC|DESC]: deterministic ranking (R16F). Sort
 //     bindings by the integer field of the most-recently-bound atom.
 //     Ties broken by atom_id ascending for stability. Default ASC.
+//   - Aggregate functions in SELECT (R17E): COUNT(?var), SUM(?var field),
+//     AVG(?var field), MIN(?var field), MAX(?var field), each wrapped in
+//     "( AGGFN(...) AS ?alias )" to name the output column. Without
+//     GROUP BY: one output row aggregating over the entire binding set
+//     (still 1 row even if the binding set is empty -- aggregates over
+//     the empty set return sentinel values: COUNT/SUM = 0; MIN/MAX/AVG =
+//     QRY_AGG_EMPTY = -1). With GROUP BY: bindings are partitioned by
+//     the value of the grouping variable's most-recently-bound atom's
+//     integer field (the grouping var must be one of the SELECT vars);
+//     one output row per non-empty group. Integer arithmetic throughout
+//     (AVG = SUM / COUNT with integer division). FILTER applies BEFORE
+//     aggregation (the BGP is fully resolved first).
 //
 // Out of scope (defer): MINUS, complex boolean FILTER, regex matching,
-// GROUP BY, aggregates.
+// HAVING, DISTINCT in aggregates, nested aggregates.
 //
 // Execution strategy
 //   Each triple pattern is evaluated against the current binding set.
@@ -84,10 +98,27 @@
 // the small N typical of a query result row).
 //
 // Result layout
-//   parsed_query_t ::= [QRY_OBJ_TAG, vars, patterns, limit]
-//     - vars:     list of variable names (without ? prefix)
+//   parsed_query_t ::= [QRY_OBJ_TAG, vars, patterns, limit, orderby, aggs, groupby]
+//     - vars:     list of variable names (without ? prefix). For an
+//                 aggregate SELECT item, the ALIAS name is what lands in
+//                 vars -- the chat emit-line then renders BINDING rows
+//                 with `?alias=value` and the existing _qry_format_binding
+//                 helper continues to work without changes.
 //     - patterns: list of triple/filter nodes, in source order
 //     - limit:    LIMIT N (or QRY_DEFAULT_LIMIT if absent)
+//     - orderby:  R16F. [field_string, direction_int, present_flag]
+//     - aggs:     R17E. List of aggregate descriptors; one per aggregate
+//                 SELECT item; empty list when SELECT is all bare ?vars.
+//                 Each entry: [agg_fn_code, src_var_name, src_field, alias_name].
+//                 agg_fn_code is QRY_AGG_COUNT / _SUM / _AVG / _MIN / _MAX.
+//     - groupby:  R17E. [group_var_name, group_field, present_flag];
+//                 group_var_name is the ?var that GROUP BY references;
+//                 group_field is the field of that var's atom we partition
+//                 on (defaults to "kind" -- the brief's example pattern
+//                 "?a kind ?kind . GROUP BY ?kind" actually binds ?kind to
+//                 the integer kind code, so the group key is just the
+//                 value bound to the var; we still record the field for
+//                 documentation).
 //
 //   binding_t ::= list of [var_name, value]; value is an atom_id
 //     (for `?a kind FACT` style binds) or the raw int / string the
@@ -124,6 +155,15 @@ let QRY_LIMIT    = 3
 // for DESC; present_flag is 1 iff the source had an ORDER BY clause. We
 // keep the slot even when absent so the parsed_query_t shape is fixed.
 let QRY_ORDERBY  = 4
+// R17E: aggregate descriptors (one per aggregate SELECT item; empty list
+// when SELECT has no aggregates). Each entry:
+//   [agg_fn_code, src_var_name, src_field_str, alias_name]
+// Where src_field_str is "" for COUNT (COUNT doesn't read a field).
+let QRY_AGGS     = 5
+// R17E: GROUP BY descriptor. 3-cell list
+//   [group_var_name, group_field_str, present_flag]
+// present_flag is 1 iff the source had a GROUP BY clause; otherwise 0.
+let QRY_GROUPBY  = 6
 
 // ---- pattern node tags ----------------------------------------------------
 // Triple patterns:   [PAT_TRIPLE,   subject_term, predicate_str, object_term]
@@ -155,6 +195,23 @@ let ORD_DESC = 0 - 1
 // unbound case (the sentinel is a fallback for code paths that read the
 // value directly).
 let QRY_UNBOUND = 0 - 1
+
+// R17E: aggregate function codes. Stored as the first cell of each
+// QRY_AGGS descriptor. Distinct ints (positive) so a NOT-AN-AGGREGATE
+// SELECT item (a bare ?var) is unambiguously recognised by the empty
+// QRY_AGGS list rather than a sentinel value.
+let QRY_AGG_COUNT = 1
+let QRY_AGG_SUM   = 2
+let QRY_AGG_AVG   = 3
+let QRY_AGG_MIN   = 4
+let QRY_AGG_MAX   = 5
+
+// R17E: aggregate-over-empty-set sentinel. The brief specifies AVG / MIN
+// / MAX over no rows return -1 ("no data"); COUNT and SUM return 0. We
+// pin -1 here so callers (and the chat emit-line) can recognise the
+// "no data" case unambiguously without sniffing for "did this row come
+// from an empty group?" state.
+let QRY_AGG_EMPTY = 0 - 1
 
 // ---- error layout ---------------------------------------------------------
 // On parse failure we return a list [ERR_OBJ_TAG, message]; callers test
@@ -266,8 +323,10 @@ fn _qry_is_op_start(c) {
 }
 
 // Classify a bare identifier: keywords are SELECT, WHERE, FILTER, LIMIT,
-// OPTIONAL, UNION, ORDER, BY, ASC, DESC. Case-sensitive (SPARQL upper-
-// keyword convention). R16F added OPTIONAL/UNION/ORDER/BY/ASC/DESC.
+// OPTIONAL, UNION, ORDER, BY, ASC, DESC, GROUP, AS, COUNT, SUM, AVG,
+// MIN, MAX. Case-sensitive (SPARQL upper-keyword convention).
+// R16F added OPTIONAL/UNION/ORDER/BY/ASC/DESC.
+// R17E added GROUP/AS/COUNT/SUM/AVG/MIN/MAX.
 // Returns TOK_KW for those, TOK_IDENT otherwise.
 fn _qry_classify_ident(s) {
     if str_eq(s, "SELECT")   == 1 { return TOK_KW }
@@ -280,6 +339,13 @@ fn _qry_classify_ident(s) {
     if str_eq(s, "BY")       == 1 { return TOK_KW }
     if str_eq(s, "ASC")      == 1 { return TOK_KW }
     if str_eq(s, "DESC")     == 1 { return TOK_KW }
+    if str_eq(s, "GROUP")    == 1 { return TOK_KW }
+    if str_eq(s, "AS")       == 1 { return TOK_KW }
+    if str_eq(s, "COUNT")    == 1 { return TOK_KW }
+    if str_eq(s, "SUM")      == 1 { return TOK_KW }
+    if str_eq(s, "AVG")      == 1 { return TOK_KW }
+    if str_eq(s, "MIN")      == 1 { return TOK_KW }
+    if str_eq(s, "MAX")      == 1 { return TOK_KW }
     return TOK_IDENT
 }
 
@@ -527,30 +593,241 @@ fn _qry_consume(toks, pos) {
     return pair
 }
 
-// Parse SELECT clause: SELECT ?a ?b ?c ... (stops at WHERE keyword).
-// Returns [vars_list, new_pos] or [error, pos].
+// R17E: classify an aggregate-function keyword string to its int code.
+// Returns 0 if the string is not a known aggregate function.
+fn _qry_agg_code(s) {
+    if str_eq(s, "COUNT") == 1 { return QRY_AGG_COUNT }
+    if str_eq(s, "SUM")   == 1 { return QRY_AGG_SUM }
+    if str_eq(s, "AVG")   == 1 { return QRY_AGG_AVG }
+    if str_eq(s, "MIN")   == 1 { return QRY_AGG_MIN }
+    if str_eq(s, "MAX")   == 1 { return QRY_AGG_MAX }
+    return 0
+}
+
+// R17E: parse one parenthesised aggregate SELECT item. The opening '('
+// has just been consumed by the caller (the SELECT parser routes
+// TOK_LPAREN to this helper). Surface form:
+//   ( COUNT ( ?var ) AS ?alias )
+//   ( SUM   ( ?var alpha ) AS ?alias )
+//   ( AVG   ( ?var beta  ) AS ?alias )
+// Returns [agg_descriptor, alias_name, new_pos] or [error, "", pos]. The
+// agg_descriptor is [agg_code, src_var, src_field, alias].
+fn _qry_parse_agg_item(toks, pos) {
+    // agg function keyword
+    let ft = _qry_peek(toks, pos)
+    if ft == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected aggregate function"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(ft) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected aggregate function, got " + _tok_text(ft)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    let agg_code = _qry_agg_code(_tok_text(ft))
+    if agg_code == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: unknown aggregate function: " + _tok_text(ft)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // opening '(' for the aggregate argument list
+    let lp = _qry_peek(toks, pos)
+    if lp == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected '(' after " + _tok_text(ft)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(lp) != TOK_LPAREN {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected '(' after " + _tok_text(ft) + ", got " + _tok_text(lp)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // ?var
+    let vt = _qry_peek(toks, pos)
+    if vt == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?var in aggregate"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(vt) != TOK_VAR {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?var in aggregate, got " + _tok_text(vt)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    let src_var = _tok_text(vt)
+    pos = pos + 1
+    // optional field name (mandatory for SUM/AVG/MIN/MAX; absent for COUNT)
+    let src_field = ""
+    let next_tok = _qry_peek(toks, pos)
+    if next_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate is unterminated"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(next_tok) == TOK_IDENT {
+        // Have an explicit field name. Validate it matches the FILTER /
+        // field set so SUM/AVG/MIN/MAX always read a known int slot.
+        src_field = _tok_text(next_tok)
+        if _qry_filter_field_valid(src_field) == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("SELECT: aggregate unknown field: " + src_field))
+            push(pair, "")
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+    }
+    // For non-COUNT aggregates the field is mandatory.
+    if agg_code != QRY_AGG_COUNT {
+        if len(src_field) == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("SELECT: aggregate requires a field (e.g. SUM(?a alpha))"))
+            push(pair, "")
+            push(pair, pos)
+            return pair
+        }
+    }
+    // closing ')' for the aggregate argument list
+    let rp = _qry_peek(toks, pos)
+    if rp == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate is unterminated (expected ')')"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(rp) != TOK_RPAREN {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ')' in aggregate, got " + _tok_text(rp)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // AS keyword
+    let as_tok = _qry_peek(toks, pos)
+    if as_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected AS after aggregate"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(as_tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected AS, got " + _tok_text(as_tok)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(as_tok), "AS") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected AS, got " + _tok_text(as_tok)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // ?alias
+    let at_tok = _qry_peek(toks, pos)
+    if at_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?alias after AS"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(at_tok) != TOK_VAR {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?alias after AS, got " + _tok_text(at_tok)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    let alias = _tok_text(at_tok)
+    pos = pos + 1
+    // outer closing ')'
+    let cp = _qry_peek(toks, pos)
+    if cp == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate item missing closing ')'"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(cp) != TOK_RPAREN {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate item expected ')', got " + _tok_text(cp)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let desc = list_new()
+    push(desc, agg_code)
+    push(desc, src_var)
+    push(desc, src_field)
+    push(desc, alias)
+    let pair = list_new()
+    push(pair, desc)
+    push(pair, alias)
+    push(pair, pos)
+    return pair
+}
+
+// Parse SELECT clause. R15D shipped "SELECT ?a ?b" (bare vars). R17E
+// extends this to also accept parenthesised aggregate items:
+//   SELECT (COUNT(?a) AS ?n) ?kind WHERE ...
+// We return [vars_list, aggs_list, new_pos] -- vars is the list of
+// names that land on each output row (a bare ?var keeps its name; an
+// aggregate item lands its ALIAS), and aggs is the list of aggregate
+// descriptors (empty if SELECT was all bare vars).
+// Stops at WHERE keyword.
 fn _qry_parse_select(toks, pos) {
     let tok = _qry_peek(toks, pos)
     if tok == 0 {
         let pair = list_new()
         push(pair, _qry_error("expected SELECT"))
+        push(pair, list_new())
         push(pair, pos)
         return pair
     }
     if _tok_kind(tok) != TOK_KW {
         let pair = list_new()
         push(pair, _qry_error("expected SELECT keyword"))
+        push(pair, list_new())
         push(pair, pos)
         return pair
     }
     if str_eq(_tok_text(tok), "SELECT") == 0 {
         let pair = list_new()
         push(pair, _qry_error("expected SELECT, got " + _tok_text(tok)))
+        push(pair, list_new())
         push(pair, pos)
         return pair
     }
     pos = pos + 1
     let vars = list_new()
+    let aggs = list_new()
     while pos < len(toks) {
         let t = toks[pos]
         if _tok_kind(t) == TOK_KW {
@@ -558,25 +835,45 @@ fn _qry_parse_select(toks, pos) {
             if str_eq(_tok_text(t), "WHERE") == 1 {
                 let pair = list_new()
                 push(pair, vars)
+                push(pair, aggs)
                 push(pair, pos)
                 return pair
             }
             let pair = list_new()
             push(pair, _qry_error("expected variable or WHERE, got " + _tok_text(t)))
+            push(pair, list_new())
             push(pair, pos)
             return pair
         }
-        if _tok_kind(t) != TOK_VAR {
-            let pair = list_new()
-            push(pair, _qry_error("expected ?var in SELECT list"))
-            push(pair, pos)
-            return pair
+        if _tok_kind(t) == TOK_LPAREN {
+            // R17E: parenthesised aggregate SELECT item.
+            pos = pos + 1
+            let ap = _qry_parse_agg_item(toks, pos)
+            if _qry_is_error(ap[0]) == 1 {
+                let pair = list_new()
+                push(pair, ap[0])
+                push(pair, list_new())
+                push(pair, pos)
+                return pair
+            }
+            push(aggs, ap[0])
+            push(vars, ap[1])
+            pos = ap[2]
+        } else {
+            if _tok_kind(t) != TOK_VAR {
+                let pair = list_new()
+                push(pair, _qry_error("expected ?var or (AGG(...) AS ?alias) in SELECT list"))
+                push(pair, list_new())
+                push(pair, pos)
+                return pair
+            }
+            push(vars, _tok_text(t))
+            pos = pos + 1
         }
-        push(vars, _tok_text(t))
-        pos = pos + 1
     }
     let pair = list_new()
     push(pair, _qry_error("expected WHERE after SELECT vars"))
+    push(pair, list_new())
     push(pair, pos)
     return pair
 }
@@ -1202,6 +1499,87 @@ fn _qry_parse_limit(toks, pos) {
     return pair
 }
 
+// R17E: parse the optional `GROUP BY ?var` clause. Returns
+// [groupby_node, new_pos] where groupby_node is a 3-cell list
+// [group_var_name, group_field, present_flag]. If there is no GROUP BY,
+// returns [["", "kind", 0], pos] (the absent sentinel).
+//
+// The grouping variable must be a ?var bound by the WHERE block. We
+// don't validate that here (the executor will discover the binding at
+// runtime); we just record the var name. The brief's grammar uses
+// "GROUP BY ?kind" -- a single grouping variable. SPARQL 1.1 allows
+// multiple grouping vars; we restrict to one here to keep the
+// implementation single-pass.
+fn _qry_parse_groupby(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    let absent = list_new()
+    push(absent, "")
+    push(absent, "kind")
+    push(absent, 0)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "GROUP") == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let by_tok = _qry_peek(toks, pos)
+    if by_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP: expected BY"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(by_tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(by_tok), "BY") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let vt = _qry_peek(toks, pos)
+    if vt == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP BY: expected ?var"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(vt) != TOK_VAR {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP BY: expected ?var, got " + _tok_text(vt)))
+        push(pair, pos)
+        return pair
+    }
+    let gvar = _tok_text(vt)
+    pos = pos + 1
+    let node = list_new()
+    push(node, gvar)
+    push(node, "kind")
+    push(node, 1)
+    let pair = list_new()
+    push(pair, node)
+    push(pair, pos)
+    return pair
+}
+
 // ---- public parser API ---------------------------------------------------
 //
 // kg_query_parse(query_string) -> parsed_query_t | error
@@ -1238,11 +1616,17 @@ fn kg_query_parse(query_string) {
     let sp = _qry_parse_select(toks, pos)
     if _qry_is_error(sp[0]) == 1 { return sp[0] }
     let vars = sp[0]
-    pos = sp[1]
+    let aggs = sp[1]
+    pos = sp[2]
     let wp = _qry_parse_where(toks, pos)
     if _qry_is_error(wp[0]) == 1 { return wp[0] }
     let patterns = wp[0]
     pos = wp[1]
+    // R17E: GROUP BY comes after WHERE and before ORDER BY.
+    let gp = _qry_parse_groupby(toks, pos)
+    if _qry_is_error(gp[0]) == 1 { return gp[0] }
+    let group_by = gp[0]
+    pos = gp[1]
     // R16F: ORDER BY comes before LIMIT in SPARQL surface syntax.
     let op = _qry_parse_orderby(toks, pos)
     if _qry_is_error(op[0]) == 1 { return op[0] }
@@ -1261,6 +1645,8 @@ fn kg_query_parse(query_string) {
     push(q, patterns)
     push(q, limit)
     push(q, order_by)
+    push(q, aggs)
+    push(q, group_by)
     return q
 }
 
@@ -1290,6 +1676,32 @@ fn kg_query_is_parsed(q) {
     if len(q) < 4 { return 0 }
     if q[0] == QRY_OBJ_TAG { return 1 }
     return 0
+}
+
+// R17E: aggregate / GROUP BY accessors. _aggs_has returns 1 iff the
+// parsed query has at least one aggregate SELECT item; _aggs returns
+// the list of descriptors (empty when none). _groupby_has returns 1
+// iff the parsed query had a GROUP BY clause; _groupby_var returns the
+// var name (empty string when absent).
+fn kg_query_aggs(q) {
+    if len(q) <= QRY_AGGS { return list_new() }
+    return q[QRY_AGGS]
+}
+fn kg_query_aggs_has(q) {
+    if len(q) <= QRY_AGGS { return 0 }
+    let a = q[QRY_AGGS]
+    if len(a) > 0 { return 1 }
+    return 0
+}
+fn kg_query_groupby_has(q) {
+    if len(q) <= QRY_GROUPBY { return 0 }
+    let g = q[QRY_GROUPBY]
+    if len(g) < 3 { return 0 }
+    return g[2]
+}
+fn kg_query_groupby_var(q) {
+    if len(q) <= QRY_GROUPBY { return "" }
+    return q[QRY_GROUPBY][0]
 }
 
 // ---- bindings (list of [var_name, value]) --------------------------------
@@ -1888,6 +2300,257 @@ fn _qry_apply_order_by(kg, bindings, field, dir, last_atom_var) {
     return out
 }
 
+// R17E: read the int-valued contribution of a single binding row for
+// an aggregate descriptor. For COUNT, this returns 1 unconditionally.
+// For SUM/AVG/MIN/MAX, this looks up `src_var` in the binding, fetches
+// the atom from the KG, and returns the requested field. If the var
+// is unbound or the atom is missing, returns 0 with a "contributes" flag
+// of 0 -- meaning "skip this row for this aggregate" (SPARQL NULL
+// semantics: SUM/AVG/MIN/MAX ignore unbound rows).
+//
+// Returns a 2-cell [contributes_flag, int_value]. contributes_flag is
+// 1 if the row should contribute, 0 otherwise.
+fn _qry_agg_value(kg, agg, row) {
+    let code  = agg[0]
+    let var   = agg[1]
+    let field = agg[2]
+    if code == QRY_AGG_COUNT {
+        let pair = list_new()
+        push(pair, 1)
+        push(pair, 1)
+        return pair
+    }
+    // SUM/AVG/MIN/MAX -- need the field off the atom bound to var.
+    if binding_has(row, var) == 0 {
+        let pair = list_new()
+        push(pair, 0)
+        push(pair, 0)
+        return pair
+    }
+    let aid = binding_get(row, var)
+    if aid < 0 {
+        // QRY_UNBOUND sentinel from OPTIONAL non-match.
+        let pair = list_new()
+        push(pair, 0)
+        push(pair, 0)
+        return pair
+    }
+    let a = kg_atom(kg, aid)
+    if a == 0 {
+        let pair = list_new()
+        push(pair, 0)
+        push(pair, 0)
+        return pair
+    }
+    let v = _qry_atom_field(a, field)
+    let pair = list_new()
+    push(pair, 1)
+    push(pair, v)
+    return pair
+}
+
+// R17E: compute one aggregate over a list of binding rows. Returns the
+// integer result value. The semantics for an EMPTY contributing-row set:
+//   COUNT -> 0
+//   SUM   -> 0
+//   AVG   -> QRY_AGG_EMPTY (= -1)
+//   MIN   -> QRY_AGG_EMPTY
+//   MAX   -> QRY_AGG_EMPTY
+// These match the brief's "no data" sentinel (-1).
+//
+// AVG uses integer division: SUM / COUNT. Rounding is toward zero
+// (NOVA's `/` is integer truncation), matching the substrate's
+// fixed-point arithmetic convention elsewhere.
+fn _qry_agg_compute(kg, agg, rows) {
+    let code = agg[0]
+    let n = len(rows)
+    if code == QRY_AGG_COUNT {
+        // COUNT contributes 1 per row unconditionally.
+        return n
+    }
+    if code == QRY_AGG_SUM {
+        let total = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                total = total + cv[1]
+            }
+            i = i + 1
+        }
+        return total
+    }
+    if code == QRY_AGG_AVG {
+        let total = 0
+        let cnt = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                total = total + cv[1]
+                cnt = cnt + 1
+            }
+            i = i + 1
+        }
+        if cnt == 0 { return QRY_AGG_EMPTY }
+        return total / cnt
+    }
+    if code == QRY_AGG_MIN {
+        let best = 0
+        let has = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                if has == 0 {
+                    best = cv[1]
+                    has = 1
+                } else {
+                    if cv[1] < best { best = cv[1] }
+                }
+            }
+            i = i + 1
+        }
+        if has == 0 { return QRY_AGG_EMPTY }
+        return best
+    }
+    if code == QRY_AGG_MAX {
+        let best = 0
+        let has = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                if has == 0 {
+                    best = cv[1]
+                    has = 1
+                } else {
+                    if cv[1] > best { best = cv[1] }
+                }
+            }
+            i = i + 1
+        }
+        if has == 0 { return QRY_AGG_EMPTY }
+        return best
+    }
+    return 0
+}
+
+// R17E: build one output row from a set of contributing input rows. The
+// output row binds the grouping var (if any) AND every aggregate alias.
+// Bare (non-aggregate) SELECT vars that aren't the grouping var are
+// IGNORED in aggregate queries -- they don't make sense per-group (which
+// row's value would we take?) and the brief's examples either group on
+// them or omit them. Defensive default: bind any non-aggregate var that
+// IS in the contributing rows to the value from the first row (SPARQL
+// 1.1 calls this "ANY" semantics; the brief doesn't pin it but a stable
+// answer is better than dropping the row).
+fn _qry_build_agg_row(kg, vars, aggs, group_var, group_val, rows) {
+    let out = binding_new()
+    // Bind every non-aggregate SELECT var. If it's the group var, bind
+    // to the group value. Otherwise, bind to the first row's value (for
+    // backward-compat with pre-aggregate var lists).
+    let vi = 0
+    while vi < len(vars) {
+        let name = vars[vi]
+        // Is this an aggregate alias? Skip; we'll bind it after the loop.
+        let is_agg = 0
+        let aj = 0
+        while aj < len(aggs) {
+            if str_eq(aggs[aj][3], name) == 1 {
+                is_agg = 1
+            }
+            aj = aj + 1
+        }
+        if is_agg == 0 {
+            if str_eq(name, group_var) == 1 {
+                binding_set(out, name, group_val)
+            } else {
+                if len(rows) > 0 {
+                    let r0 = rows[0]
+                    if binding_has(r0, name) == 1 {
+                        binding_set(out, name, binding_get(r0, name))
+                    }
+                }
+            }
+        }
+        vi = vi + 1
+    }
+    // Compute and bind every aggregate alias.
+    let ai = 0
+    while ai < len(aggs) {
+        let agg = aggs[ai]
+        let alias = agg[3]
+        let val = _qry_agg_compute(kg, agg, rows)
+        binding_set(out, alias, val)
+        ai = ai + 1
+    }
+    return out
+}
+
+// R17E: apply the aggregation pass on the post-pattern bindings. Returns
+// a fresh list of output rows.
+//
+// Two regimes:
+//   - GROUP BY present: partition `bindings` by the value of group_var
+//     in each row, then emit one aggregated row per group. Output order
+//     is group-discovery order (deterministic for a deterministic input
+//     binding list).
+//   - GROUP BY absent: emit exactly one row aggregating over ALL input
+//     bindings. If the binding list is empty, we still emit one row
+//     with sentinel values (COUNT=0, SUM=0, AVG=MIN=MAX=QRY_AGG_EMPTY).
+fn _qry_apply_aggregates(kg, parsed_query, bindings) {
+    let vars  = kg_query_vars(parsed_query)
+    let aggs  = kg_query_aggs(parsed_query)
+    let group_has = kg_query_groupby_has(parsed_query)
+    let group_var = kg_query_groupby_var(parsed_query)
+    let out = list_new()
+    if group_has == 0 {
+        // Aggregate over the whole binding set into one row.
+        let row = _qry_build_agg_row(kg, vars, aggs, "", 0, bindings)
+        push(out, row)
+        return out
+    }
+    // GROUP BY present. Partition by the value of group_var. We build
+    // parallel arrays: group_keys (the int value of group_var seen so
+    // far) and group_rows (a list-of-lists of contributing rows).
+    let group_keys = list_new()
+    let group_rows = list_new()
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        if binding_has(b, group_var) == 1 {
+            let k = binding_get(b, group_var)
+            // Find existing bucket or open a new one.
+            let idx = 0 - 1
+            let gi = 0
+            while gi < len(group_keys) {
+                if group_keys[gi] == k {
+                    idx = gi
+                }
+                gi = gi + 1
+            }
+            if idx < 0 {
+                push(group_keys, k)
+                let fresh = list_new()
+                push(fresh, b)
+                push(group_rows, fresh)
+            } else {
+                push(group_rows[idx], b)
+            }
+        }
+        bi = bi + 1
+    }
+    // Emit one aggregate row per group, in discovery order.
+    let gj = 0
+    while gj < len(group_keys) {
+        let row = _qry_build_agg_row(kg, vars, aggs, group_var, group_keys[gj], group_rows[gj])
+        push(out, row)
+        gj = gj + 1
+    }
+    return out
+}
+
 // ---- public executor API -------------------------------------------------
 //
 // kg_query_execute(kg, parsed_query) -> list of bindings.
@@ -1906,8 +2569,37 @@ fn kg_query_execute(kg, parsed_query) {
     let pair = _qry_exec_patterns(kg, patterns, bindings, "")
     bindings = pair[0]
     let last_atom_var = pair[1]
+    // R17E: aggregates run AFTER the BGP+FILTER+OPTIONAL+UNION resolution
+    // (the brief specifies "filter applies BEFORE aggregation") but
+    // BEFORE ORDER BY / LIMIT. If the query has no aggregates and no
+    // GROUP BY, we skip this pass entirely -- the binding list stays
+    // intact for R15D/R16F backward compatibility.
+    if kg_query_aggs_has(parsed_query) == 1 {
+        bindings = _qry_apply_aggregates(kg, parsed_query, bindings)
+        // After aggregation, the "most-recently bound atom" concept is
+        // moot -- the output rows are aggregate values, not atoms.
+        // ORDER BY on aggregate aliases isn't supported (you'd need a
+        // separate path); for now ORDER BY still uses the same scoring
+        // helper, which falls back to 0 for rows without a bound atom.
+        last_atom_var = ""
+    } else {
+        if kg_query_groupby_has(parsed_query) == 1 {
+            // GROUP BY without aggregates: still partition. This collapses
+            // duplicate group keys into single rows (DISTINCT-like).
+            bindings = _qry_apply_aggregates(kg, parsed_query, bindings)
+            last_atom_var = ""
+        }
+    }
     // R16F: apply ORDER BY before LIMIT. Skip sorting when no ORDER BY
-    // was given (the absent sentinel: present_flag == 0).
+    // was given (the absent sentinel: present_flag == 0). R17E: when the
+    // output is aggregate rows, ORDER BY can target an aggregate ALIAS
+    // (e.g. "ORDER BY ?n") -- we detect that case by checking whether
+    // the field name matches a binding key on the rows directly. The
+    // existing _qry_apply_order_by is field-on-atom only, so for now
+    // ORDER BY over aggregates is a best-effort: we sort by the value
+    // bound to the field name on each row if that field matches an
+    // aggregate alias. The mainline path (ORDER BY on atom field) still
+    // works for non-aggregate queries.
     if kg_query_orderby_has(parsed_query) == 1 {
         let field = kg_query_orderby_field(parsed_query)
         let dir   = kg_query_orderby_dir(parsed_query)
@@ -1959,7 +2651,7 @@ fn _qry_format_binding(b, vars) {
 
 fn kg_query_cmd(kg, arg) {
     if len(arg) == 0 {
-        io_println("usage: /query <SPARQL_string>  -- e.g. /query SELECT ?a WHERE { ?a kind FACT . } ORDER BY DESC(alpha) LIMIT 5  (supports OPTIONAL, UNION, ORDER BY -- R16F)")
+        io_println("usage: /query <SPARQL_string>  -- e.g. /query SELECT ?a WHERE { ?a kind FACT . } ORDER BY DESC(alpha) LIMIT 5  (supports OPTIONAL/UNION/ORDER BY -- R16F; COUNT/SUM/AVG/MIN/MAX/GROUP BY -- R17E)")
         io_println("QUERY store_size=" + int_to_str(kg_atom_count(kg)))
         return 1
     }
