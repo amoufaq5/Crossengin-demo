@@ -3,6 +3,217 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R17C (this session) -- u8 raw-byte SIMD on optical-flow LK (HONEST: structural mismatch on accumulators; ships wiring + the SAD diagnostics that DO fit)
+
+**Status: complete -- R15A's `simd_sad_u8` u8 SIMD pattern applied to
+optical-flow LK with HONEST findings (mirrors R12A precedent: agent
+shipped wiring at 0.84x/0.20x and documented the limitation).** R15A
+brought stereo SAD from ~1x to **5.5x absolute** by wiring R14B's
+`simd_sad_u8` + `memcpy_raw` pack pattern. The brief asked whether the
+same pattern could close R13A's optical-flow LK ceiling at 1.42x
+absolute. R17C investigated, found a structural mismatch, and shipped
+the wiring + the parts of the pattern that DO fit.
+
+### Structural finding (documented to spare R18+ the same investigation)
+
+LK's inner-loop accumulators are five sums of byte * byte SIGNED
+products (Σ Ix·Ix, Σ Iy·Iy, Σ Ix·Iy, Σ Ix·It, Σ Iy·It). `simd_sad_u8`
+(AVX2 `vpsadbw`) computes Σ|a[i] - b[i]| over UNSIGNED bytes -- it is
+NOT a mul-acc primitive. It cannot vectorize the LK accumulators
+regardless of how the data is packed. To close R13A's ceiling at the
+accumulator level NOVA would need a different primitive (SSSE3's
+`pmaddubsw` or `simd_mul_i16x16`), already-flagged out-of-scope in
+R15A's "Known limitations" and re-flagged here.
+
+### What R17C ships (the SIMD pieces that DO match the primitive)
+
+1. **`lk_sad_block_u8(prev, next, w, x, y, ws, p_buf, n_buf)`**: pack
+   the WIN x WIN window of `prev` and `next` into contiguous byte
+   buffers via `_lk_pack_block_u8` (one `memcpy_raw` per row --
+   mirrors R15A's `_stereo_pack_block_u8` exactly), reduce via
+   `simd_sad_u8` in one call. Returns Σ|It| over the window: a
+   textureless-region / motion-magnitude diagnostic. Bit-identical
+   to scalar Σ|next - prev|.
+
+2. **`lk_image_sad_residual_u8(prev, next, w, h)`**: per-row
+   `simd_sad_u8` across the FULL image (PGM rows ARE contiguous in
+   memory, so no packing is needed). Returns Σ|next - prev| over all
+   pixels -- the canonical pyramidal-LK convergence metric.
+
+3. **`_lk_optical_flow_u8_simd_inner` + `lk_optical_flow_u8_simd`**
+   (with `CE_LK_U8_SIMD=on` opt-in, mirrors R15A exactly): full LK
+   with pack-then-scan locality. Per pixel, pack the WIN x WIN
+   windows of `prev` and `next` via `memcpy_raw`, then run the
+   5-accumulator scalar inner loop reading It from the packed
+   buffer. The Ix / Iy reads stay on the source pointer (they reach
+   outside the packed window). Bit-identical to scalar; routes via
+   env-var.
+
+### Measured performance (256x256 ws=5, smooth-quadratic + h-shift-2)
+
+| Path                                | Wallclock | Speedup vs scalar |
+|-------------------------------------|----------:|------------------:|
+| scalar (R10D)                       |  ~58 ms   |             1.00x |
+| R12A i32 SIMD                       | ~362 ms   |             0.15x |
+| **R17C u8 packed-scan**             |  ~71 ms   |          **0.80x** |
+| **R17C u8 vs R12A i32**             |       --  |          **5.09x** |
+| image-SAD residual scalar           | ~392 us   |             1.00x |
+| image-SAD residual u8 SIMD per row  |   ~7 us   |          **58.2x** |
+
+**Honest read** (R12A precedent): full LK at u8 packed-scan is 0.80x
+scalar -- pack overhead exceeds the It-load locality saving on this
+fixture / codegen. The u8 path is 5.09x faster than R12A's i32 SIMD
+path. The pure-SAD image-residual helper hits 58.2x absolute speedup.
+Stretch goal "2-3x absolute speedup" met on image-residual; NOT met
+on full LK because of the structural mismatch. Wiring is in place
+for future `simd_mul_i16x16` to amplify.
+
+### Bit-identical preserved: YES
+
+34 new assertions in `tests/unit/test_lk_u8_simd.nova` cover all three
+helpers vs scalar references; bench script FAILs on any disagreement.
+All concurrent LK suites green: R10D `test_optical_flow` (53), R11A
+`test_optical_flow_pyramid` (52), R13B `test_optical_flow_perpixel`
+(34). All stereo suites unchanged green.
+
+### Files touched (R17C)
+
+- `src/io/transducers/image_optical_flow.nova` (+~285 lines)
+- `tests/unit/test_lk_u8_simd.nova` (NEW, 34 assertions)
+- `scripts/bench_simd_production.sh` (extended flow bench)
+- `IMAGE_AUDIT.md`, `NEXT_SESSION.md` (this), `README.md`
+
+### Known limitations / future work (R17C)
+
+- LK inner-loop accumulators need a NOVA byte-mul-acc primitive
+  (`pmaddubsw` / `simd_mul_i16x16`) to close the ceiling.
+- `CE_LK_U8_SIMD` defaults OFF (mirrors R15A's CE_STEREO_U8_SIMD).
+- R11A / R13B's pyramidal LK orchestrators don't currently call
+  `lk_image_sad_residual_u8` -- wiring it as a convergence metric is
+  a follow-up.
+
+## R17D (this session) -- LBP (Local Binary Patterns, Ojala 1996) texture descriptor
+
+**Status: complete -- `src/io/transducers/image_lbp.nova`
+(NEW, ~550 lines) closes the classifier-input gap in CrossEngin's
+classical CV chain.** R16D shipped the structural face DETECTOR
+(Viola-Jones-style Haar cascade -- finds *where* a face is); R17D
+ships the canonical non-DL face / texture DESCRIPTOR (the input a
+face-recognition classifier would consume to identify *which*
+face it is). The descriptor is also the workhorse of classical
+texture classification, age / gender estimation, facial expression
+recognition, and dynamic texture analysis -- any task where
+"summarize a small image patch's texture" is the right
+abstraction.
+
+### Algorithm
+
+1. **Per-pixel 3x3 neighborhood comparison.** For each interior
+   pixel, threshold its 8 neighbors against the center; equality
+   maps to 1 (matching the uniform-field-yields-0xFF invariant).
+2. **Pack clockwise from top-left** into a single byte:
+   `lbp(x,y) = b7*128 + b0*64 + b1*32 + b2*16 + b3*8 + b4*4 +
+                b5*2 + b6*1`. Each pixel produces an 8-bit code
+   in [0, 255].
+3. **Histogram** of LBP codes over a rectangular ROI -> 256-bin
+   integer list.
+4. **Descriptor** = tile the image into cells_x x cells_y cells;
+   concatenate per-cell histograms -> cells_x * cells_y * 256
+   ints. Canonical Ahonen 2006 face descriptor uses 8x8 cells =
+   16,384-bin vector; CrossEngin's default 4x4 yields 4096.
+5. **Compare** = chi-squared distance
+   `sum_i (a_i - b_i)^2 / (a_i + b_i + 1)`. Self-match = 0;
+   larger = more dissimilar.
+
+### Rotation non-invariance (documented limitation)
+
+Basic LBP is NOT rotation-invariant. Rotating the input by 90
+degrees permutes the neighbor labels (P0 -> P2, P1 -> P3, etc.)
+so the packed code changes. The unit suite demonstrates this
+explicitly. The standard `LBP_ri` and `LBP_uniform` variants are
+documented follow-ups. SIFT (R5C) and ORB (R6D) ARE
+rotation-invariant; HOG (R14D) is NOT, and basic LBP shares HOG's
+limitation. In face recognition the face IS pose-normalized first
+(e.g., eyes aligned) so rotation invariance is not needed at the
+descriptor layer.
+
+### Caps / defaults
+
+* Dimensions <= 256x256 per axis (LBP_MAX_DIM); total area capped
+  at 65536 (LBP_MAX_AREA).
+* cells_x and cells_y in [2, 16].
+
+### Public API (`image_lbp.nova`)
+
+* `lbp_compute_image(image, w, h)` -> per-pixel LBP code buffer.
+* `lbp_at(lbp_img, x, y)` -> bounds-checked code; 0 on OOB.
+* `lbp_histogram(lbp_img, x1, y1, x2, y2)` -> 256-bin list.
+* `lbp_descriptor(image, w, h, cells_x, cells_y)` -> list[int].
+* `lbp_compare(desc_a, desc_b)` -> chi-squared (0 = identical).
+* `lbp_compare_intersection(desc_a, desc_b)` -> sum-of-mins.
+* `lbp_dominant_code(image, w, h)` -> argmax over per-image hist.
+* `lbp_texture_entropy_milli(image, w, h)` -> Shannon entropy
+  in milli-bits (uniform ~0; random ~8000).
+* `lbp_pgm_args(arg)` -> chat /lbp admin formatted string.
+
+### Chat wiring (2 net lines in `crossengin_chat.nova`)
+
+```
+/lbp PATH    LBP texture descriptor; prints dominant_code / entropy
+```
+
+### visual_perception wire-in (3 net lines)
+
+Emits two atoms per image >= 32x32:
+* `image_lbp_dominant_code_<uniform_bright|uniform_dark|bright|dark|mixed|none>`
+* `image_lbp_texture_<peaked|mid|distributed>`
+
+### Verification snapshot
+
+* 45 unit assertions (`tests/unit/test_lbp.nova`), all PASS:
+  * Uniform 8x8 image -> every interior code = 0xFF.
+  * Center darker than all 8 neighbors -> code 0xFF (LBP_CODE_ALL_DARK=255).
+  * Center brighter than all 8 neighbors -> code 0x00.
+  * Vertical-edge on-bright-side -> code 124 (4 right-leaning bits).
+  * Uniform 16x16 ROI hist -> bin 255 = 196 (14*14), every other 0.
+  * Random texture -> >= 30 distinct codes (spread across hist).
+  * 32x32 cells=4x4 descriptor length = 4096.
+  * Self-match chi-squared = 0; intersection = 1024 (32*32).
+  * Vertical vs rotated horizontal: distance 52 (NOT rotation-inv).
+  * 1-px translation: distance 0 (much < rotation).
+  * Uniform-field dominant code = 0xFF; entropy = 0.
+  * Random texture entropy >= 4000 milli-bits (~half of log2(256)).
+  * Incompatible-length compare returns -1; OOB safe.
+* 10 integration assertions (`scenario_rrr_lbp.sh`), all PASS:
+  * /lbp on face_a (vertical edge): dominant_code=255 entropy=228.
+  * /lbp on face_a_shift (1-px shift): SAME dominant_code=255
+    (the "low-distance pair" case).
+  * /lbp on face_b (four spots): same dominant_code, entropy=481 --
+    the descriptors DIFFER in entropy (the "high-distance pair").
+  * Graceful errors on missing-file + too-small-image.
+* All 182 prior unit tests still pass.
+
+### Files touched / added
+
+* `src/io/transducers/image_lbp.nova` (NEW, ~550 lines)
+* `tests/unit/test_lbp.nova` (NEW, 22 test functions / 45 assertions)
+* `tests/integration/scenario_rrr_lbp.sh` (NEW, 10 assertions)
+* `src/io/transducers/visual_perception.nova` (+3 lines)
+* `examples/crossengin_chat.nova` (+2 lines)
+* `IMAGE_AUDIT.md`, `README.md`, `NEXT_SESSION.md` (R17D entries)
+
+### Module count: +1 (image_lbp.nova new)
+
+Verify locally:
+
+```sh
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_lbp.nova
+NOVA_ROOT=/home/user/NOVA make install
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_rrr_lbp.sh
+```
+
+---
+
 ## R17E (this session) -- mini-SPARQL aggregates: COUNT, SUM, AVG, MIN, MAX, GROUP BY
 
 **Status: complete -- `src/kg/query.nova` (R15D's mini-SPARQL parser +

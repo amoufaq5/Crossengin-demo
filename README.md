@@ -247,7 +247,26 @@ computational units rather than orchestrating a pipeline of modules.
 > optical-flow regression suites green (`test_stereo` 54,
 > `test_stereo_quality` 42, `test_stereo_sgm` 39, `test_simd_production`
 > 35). `scripts/bench_simd_production.sh` extended to time all three
-> paths back-to-back with bit-identical assertions. R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
+> paths back-to-back with bit-identical assertions. R17C applies the
+> same u8 SIMD pattern to optical-flow LK with HONEST findings (mirrors
+> R12A's precedent of shipping wiring at 0.84x/0.20x and documenting
+> the limitation). LK's inner-loop accumulators are five sums of byte
+> * byte SIGNED products which are structurally NOT a SAD primitive —
+> `simd_sad_u8` returns Σ|a - b|, not a vector of products. R17C ships
+> the parts of the pattern that DO fit: `lk_sad_block_u8` (window SAD
+> via `_lk_pack_block_u8` + `simd_sad_u8`), `lk_image_sad_residual_u8`
+> (per-row `simd_sad_u8` across the FULL image; canonical pyramidal-LK
+> convergence metric; **~58x absolute speedup** on 256x256), and
+> `lk_optical_flow_u8_simd` (full LK with pack-then-scan locality on
+> It reads; opt-in via `CE_LK_U8_SIMD=on`). Full LK measured: scalar
+> ~58 ms, R12A i32 SIMD ~362 ms (0.15x), R17C u8 packed-scan ~71 ms
+> (0.80x scalar but **5.09x faster than R12A's i32 path**). Bit-
+> identical preserved (34 new assertions; `test_lk_u8_simd.nova`).
+> All existing LK regression suites green (`test_optical_flow` 53,
+> `test_optical_flow_pyramid` 52, `test_optical_flow_perpixel` 34).
+> Closing R13A's accumulator ceiling requires a NOVA `pmaddubsw` /
+> `simd_mul_i16x16` byte-mul-acc primitive (flagged out-of-scope in
+> R15A's known limitations and re-flagged here). R14F adds `src/safety/ed25519.nova` — a pure-NOVA RFC 8032
 > Ed25519 digital-signature primitive on top of the existing `bn256_*`
 > Montgomery REDC stack, closing the signature gap in the crypto suite
 > (alongside ChaCha20-Poly1305 AEAD, Curve25519/G14 DH, Noise XK mutual
@@ -825,6 +844,28 @@ computational units rather than orchestrating a pipeline of modules.
 > `CE_VP_FACE_DETECT=1`). The integration scenario asserts >= 1
 > detection on a synthetic dark/light/dark horizontal-band fixture
 > and 0 on uniform-gray. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from
+> `io/transducers/image_lbp.nova` added in R17D LBP (Local Binary
+> Patterns, Ojala 1996) texture descriptor -- the classic non-DL
+> face / texture DESCRIPTOR (Ahonen et al. 2006, "Face Recognition
+> with Local Binary Patterns") that complements R16D's Viola-Jones
+> face DETECTOR. Per-pixel 3x3 neighborhood comparison packs 8
+> threshold bits clockwise from top-left into a single byte; the
+> histogram of those bytes over a region is the descriptor. Public
+> API: `lbp_compute_image / lbp_at / lbp_histogram / lbp_descriptor /
+> lbp_compare` (chi-squared) `/ lbp_compare_intersection /
+> lbp_dominant_code / lbp_texture_entropy_milli`. Descriptor on a
+> 32x32 image with cells=4x4 returns 4096 ints (4 x 4 cells x 256
+> bins); self-match chi-squared distance is 0; rotation produces a
+> DIFFERENT descriptor (basic LBP is NOT rotation-invariant,
+> documented in the algorithm header and unit-tested -- contrast
+> with SIFT / ORB which ARE rotation-invariant). New chat admin:
+> `/lbp PATH.pgm` -> `(lbp WxH dominant_code=C entropy=E_milli)`.
+> New per-image atoms:
+> `image_lbp_dominant_code_<uniform_bright|uniform_dark|bright|dark|mixed|none>`
+> and `image_lbp_texture_<peaked|mid|distributed>` (emitted in the
+> structural-features path when image >= 32x32). Documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > unchanged from the snapshot
 > v1 -> v2 migration session -- the bump landed inside the existing

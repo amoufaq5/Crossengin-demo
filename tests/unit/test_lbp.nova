@@ -1,0 +1,531 @@
+// Unit tests for src/io/transducers/image_lbp.nova (R17D).
+//
+// Hermetic coverage of the LBP (Local Binary Patterns) descriptor:
+// per-pixel 3x3 neighborhood code (8 bits packed clockwise from
+// top-left), region histogram, multi-cell face descriptor, and
+// chi-squared / intersection comparison.
+//
+// All fixtures are built in-memory (alloc + store8). The integration
+// scenario (scenario_rrr_lbp.sh) exercises the chat /lbp wiring;
+// this unit suite covers the algorithm contract: code-packing
+// correctness on the cardinal "all-neighbors-bright" / "all-dark" /
+// half-and-half cases, histogram concentration vs spread, descriptor
+// length + self-match invariant, rotation NON-invariance (the
+// documented limitation of basic LBP -- contrast with SIFT R5C /
+// ORB R6D which ARE rotation-invariant), and OOB safety.
+//
+// Assertion targets (~25):
+//   * Uniform image -> every interior code = 0xFF (Ojala's
+//     equality-maps-to-1 convention).
+//   * Center darker than all 8 neighbors -> code = 0xFF.
+//   * Center brighter than all 8 neighbors -> code = 0x00.
+//   * Half-and-half neighborhood -> bit pattern reflects which
+//     neighbors are bright (specific 4-bit-set codes).
+//   * Histogram on uniform 8x8 region -> spike at single code.
+//   * Histogram on a noisy region -> distributed across codes.
+//   * Descriptor on 32x32 with cells=4x4 -> 4096 ints.
+//   * Self-match: descriptor compared to itself -> 0 chi-sq distance.
+//   * Rotation: rotated image has DIFFERENT descriptor (basic LBP
+//     is NOT rotation-invariant; documented contrast with SIFT).
+//   * Compare on different-length descriptors -> -1 sentinel.
+//   * Intersection metric: identical descriptors -> total pixel count.
+//   * Dominant code on uniform field -> 0xFF.
+//   * Texture entropy on uniform field -> ~0; on random texture -> high.
+//   * Label round-trip for dominant_code + texture buckets.
+//   * OOB safety: lbp_at out-of-range -> 0; oversized image -> error.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_lbp.nova"
+
+// ---- fixture builders ---------------------------------------------------
+
+fn _flat_fixture(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Single bright pixel at the center of a dark field. The 3x3
+// neighborhood AROUND that pixel sees a center much darker than
+// its bright neighbor at exactly one position.
+fn _center_dark_neighbors_bright_fixture(width, height) {
+    // Background bright (200), center pixel dark (50). The dark
+    // pixel's neighborhood will all be brighter -> code 0xFF.
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, 200)
+        i = i + 1
+    }
+    // Set the center pixel dark.
+    let cx = width / 2
+    let cy = height / 2
+    store8(buf + cy * width + cx, 50)
+    store8(buf + area, 0)
+    return buf
+}
+
+// Inverse: bright center on a dark background.
+fn _center_bright_neighbors_dark_fixture(width, height) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, 50)
+        i = i + 1
+    }
+    let cx = width / 2
+    let cy = height / 2
+    store8(buf + cy * width + cx, 200)
+    store8(buf + area, 0)
+    return buf
+}
+
+// Vertical-edge fixture: left half dark, right half bright. At every
+// pixel on the boundary, half the neighborhood is dark and half is
+// bright -- yielding specific 4-bit-set codes (the right-side
+// neighbors get the 1 bits).
+fn _vertical_edge_fixture(width, height, low, high) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let half = width / 2
+    let y = 0
+    while y < height {
+        let row = y * width
+        let x = 0
+        while x < width {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Rotated copy: same content but 90-deg rotated. Implemented by
+// swapping the half-and-half axis (horizontal edge instead of
+// vertical). The descriptor MUST be different (basic LBP is NOT
+// rotation-invariant).
+fn _horizontal_edge_fixture(width, height, low, high) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let half = height / 2
+    let y = 0
+    while y < height {
+        let row = y * width
+        let v = low
+        if y >= half { v = high }
+        let x = 0
+        while x < width {
+            store8(buf + row + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Translated copy: vertical edge shifted by `shift` columns.
+fn _translated_vertical_edge_fixture(width, height, low, high, shift) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let half = width / 2 + shift
+    if half < 1      { half = 1 }
+    if half >= width { half = width - 1 }
+    let y = 0
+    while y < height {
+        let row = y * width
+        let x = 0
+        while x < width {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Pseudo-random-ish texture: a deterministic checkerboard-with-noise
+// pattern built from small per-pixel arithmetic only (no LCG product
+// that would trip NOVA's smart-op pointer threshold). The fixture
+// alternates intensity by parity of (x + y) and modulates by small
+// per-position offsets so the LBP codes are spread across many bins
+// rather than concentrated in 0x00 / 0xFF.
+fn _random_texture_fixture(width, height, seed) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row = y * width
+        let x = 0
+        while x < width {
+            // Build a deterministic 8-bit value from x, y, seed using
+            // only small bounded operations.
+            let mix = int_add(int_add(int_mul(x, 17), int_mul(y, 31)), seed)
+            // Modulate by parity + a per-position offset so consecutive
+            // pixels differ wildly in their 3x3 neighborhoods (which
+            // is what spreads the LBP codes).
+            let p = mix - mix / 256 * 256
+            if p < 0 { p = p + 256 }
+            if (x + y) - (x + y) / 2 * 2 == 0 {
+                p = int_add(p, int_mul(x, 7))
+            } else {
+                p = int_add(p, int_mul(y, 11))
+            }
+            p = p - p / 256 * 256
+            if p < 0 { p = p + 256 }
+            if p > 255 { p = 255 }
+            store8(buf + row + x, p)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- per-pixel LBP code tests -------------------------------------------
+
+fn test_uniform_image_all_codes_ff() {
+    // Uniform 200-value field: every interior pixel's neighborhood
+    // has center == neighbors. Equality maps to 1 -> code 0xFF.
+    let buf = _flat_fixture(8, 8, 200)
+    let img = lbp_compute_image(buf, 8, 8)
+    ce_str_eq("uniform image: no error",
+              lbp_image_error(img), "")
+    ce_eq("uniform image: width preserved",
+          lbp_image_width(img), 8)
+    // Spot-check a few interior pixels.
+    ce_eq("uniform image: center pixel code = 0xFF",
+          lbp_at(img, 4, 4), 255)
+    ce_eq("uniform image: (1,1) code = 0xFF",
+          lbp_at(img, 1, 1), 255)
+    ce_eq("uniform image: (6,6) code = 0xFF",
+          lbp_at(img, 6, 6), 255)
+    // Border pixel: outermost ring is 0.
+    ce_eq("uniform image: border (0, 0) code = 0",
+          lbp_at(img, 0, 0), 0)
+    ce_eq("uniform image: border (7, 7) code = 0",
+          lbp_at(img, 7, 7), 0)
+}
+
+fn test_center_dark_all_neighbors_bright_code_ff() {
+    // Center pixel dark (50), all 8 neighbors bright (200).
+    // Every neighbor >= center -> code 0xFF.
+    let buf = _center_dark_neighbors_bright_fixture(8, 8)
+    let img = lbp_compute_image(buf, 8, 8)
+    let cx = 4
+    let cy = 4
+    ce_eq("center darker than all 8 neighbors -> code 0xFF",
+          lbp_at(img, cx, cy), 255)
+}
+
+fn test_center_bright_all_neighbors_dark_code_00() {
+    // Center pixel bright (200), all 8 neighbors dark (50).
+    // No neighbor >= center -> code 0x00.
+    let buf = _center_bright_neighbors_dark_fixture(8, 8)
+    let img = lbp_compute_image(buf, 8, 8)
+    let cx = 4
+    let cy = 4
+    ce_eq("center brighter than all 8 neighbors -> code 0x00",
+          lbp_at(img, cx, cy), 0)
+}
+
+fn test_vertical_edge_half_and_half_codes() {
+    // 8x8 vertical edge: left half value 50, right half value 200.
+    // Consider pixel (3, 4) -- the cell just LEFT of the boundary.
+    //   center = 50.
+    //   Left neighbors (col 2): all 50 -- equal -> b = 1.
+    //   Center col (col 3): center 50; above/below 50 -> b = 1.
+    //   Right neighbors (col 4): all 200 -- > center -> b = 1.
+    // Every neighbor is >= 50, so the code is 0xFF.
+    let buf = _vertical_edge_fixture(8, 8, 50, 200)
+    let img = lbp_compute_image(buf, 8, 8)
+    ce_eq("vertical-edge left-of-boundary code = 0xFF (all >= 50)",
+          lbp_at(img, 3, 4), 255)
+    // Pixel (4, 4) -- ON the bright side. center = 200.
+    //   Left col (col 3): all 50 -- < center -> b = 0.
+    //   Center col (col 4): center 200; above/below 200 -> b = 1.
+    //   Right col (col 5): all 200 -- equal -> b = 1.
+    // P7=top-left=50->0, P0=top=200->1, P1=top-right=200->1,
+    // P2=right=200->1, P3=bot-right=200->1, P4=bot=200->1,
+    // P5=bot-left=50->0, P6=left=50->0.
+    // code = b7*128 + b0*64 + b1*32 + b2*16 + b3*8 + b4*4 + b5*2 + b6*1
+    //      =   0*128 + 1*64 + 1*32 + 1*16 + 1*8 + 1*4 + 0*2 + 0*1
+    //      = 0 + 64 + 32 + 16 + 8 + 4 + 0 + 0
+    //      = 124
+    ce_eq("vertical-edge on-bright-side code = 124 (4 right-leaning bits)",
+          lbp_at(img, 4, 4), 124)
+}
+
+// ---- histogram tests ----------------------------------------------------
+
+fn test_histogram_uniform_region_spike() {
+    // 16x16 uniform 128 field -> every interior pixel code is 0xFF.
+    // Histogram over the interior should show a spike at bin 255 and
+    // zero elsewhere; the border ring contributes 0-codes if the ROI
+    // includes the border.
+    let buf = _flat_fixture(16, 16, 128)
+    let img = lbp_compute_image(buf, 16, 16)
+    // ROI = interior block 1..15 x 1..15 (excludes border ring).
+    let hist = lbp_histogram(img, 1, 1, 15, 15)
+    ce_eq("histogram length = 256", len(hist), 256)
+    // Bin 255 should hold every interior pixel: 14 * 14 = 196.
+    ce_eq("uniform 16x16 interior: bin 255 = 196 (14*14)",
+          hist[255], 196)
+    // Every other bin should be 0.
+    let i = 0
+    let nonzero_others = 0
+    while i < 255 {
+        if hist[i] != 0 { nonzero_others = nonzero_others + 1 }
+        i = i + 1
+    }
+    ce_eq("uniform 16x16 interior: no other bins nonzero",
+          nonzero_others, 0)
+}
+
+fn test_histogram_noisy_region_distributed() {
+    // Pseudo-random texture spreads codes across many bins.
+    let buf = _random_texture_fixture(32, 32, 1)
+    let img = lbp_compute_image(buf, 32, 32)
+    let hist = lbp_histogram(img, 1, 1, 31, 31)
+    // Count how many bins have at least 1 hit. A truly random field
+    // hits most of the 256 codes; we require at least 30 distinct
+    // codes show up (the random fixture is small so not every code
+    // can appear, but a degenerate spike is well below 30).
+    let distinct = 0
+    let i = 0
+    while i < 256 {
+        if hist[i] > 0 { distinct = distinct + 1 }
+        i = i + 1
+    }
+    ce_check("random texture spreads across at least 30 distinct codes",
+             distinct >= 30)
+}
+
+fn test_histogram_oob_returns_zero_list() {
+    let buf = _flat_fixture(8, 8, 200)
+    let img = lbp_compute_image(buf, 8, 8)
+    // Inverted ROI (x1 > x2): all zero.
+    let hist = lbp_histogram(img, 5, 0, 1, 8)
+    ce_eq("inverted ROI: hist length still 256", len(hist), 256)
+    let i = 0
+    let nonzero = 0
+    while i < 256 {
+        if hist[i] != 0 { nonzero = nonzero + 1 }
+        i = i + 1
+    }
+    ce_eq("inverted ROI: every bin == 0", nonzero, 0)
+}
+
+// ---- descriptor tests --------------------------------------------------
+
+fn test_descriptor_32x32_cells_4x4_returns_4096_ints() {
+    // 32x32 image with 4x4 cells -> 16 cells * 256 bins = 4096 ints.
+    let buf = _vertical_edge_fixture(32, 32, 50, 200)
+    let desc = lbp_descriptor(buf, 32, 32, 4, 4)
+    ce_eq("32x32 cells=4x4 descriptor length = 4096",
+          len(desc), 4096)
+}
+
+fn test_descriptor_self_match_distance_zero() {
+    // chi2(d, d) should be zero -- every term has numerator 0.
+    let buf = _vertical_edge_fixture(32, 32, 50, 200)
+    let d_a = lbp_descriptor(buf, 32, 32, 4, 4)
+    let d_b = lbp_descriptor(buf, 32, 32, 4, 4)
+    ce_eq("self-match chi-squared distance == 0",
+          lbp_compare(d_a, d_b), 0)
+}
+
+fn test_descriptor_self_match_intersection_equals_total_pixels() {
+    // Intersection of identical histograms = total samples.
+    // 32x32 -> 1024 pixels in the union of all cell ROIs.
+    let buf = _vertical_edge_fixture(32, 32, 50, 200)
+    let d_a = lbp_descriptor(buf, 32, 32, 4, 4)
+    let d_b = lbp_descriptor(buf, 32, 32, 4, 4)
+    ce_eq("self-match intersection == 1024 (32*32 sampled)",
+          lbp_compare_intersection(d_a, d_b), 1024)
+}
+
+fn test_descriptor_rotation_non_invariance() {
+    // Vertical edge vs horizontal edge: same image content, 90-deg
+    // rotated. Basic LBP is NOT rotation-invariant -> descriptors
+    // must DIFFER (chi-squared distance > 0).
+    let buf_v = _vertical_edge_fixture(32, 32, 50, 200)
+    let buf_h = _horizontal_edge_fixture(32, 32, 50, 200)
+    let d_v = lbp_descriptor(buf_v, 32, 32, 4, 4)
+    let d_h = lbp_descriptor(buf_h, 32, 32, 4, 4)
+    let d = lbp_compare(d_v, d_h)
+    ce_check("vertical vs rotated horizontal: distance > 0",
+             d > 0)
+    // The distance should be substantial -- the rotated edge places
+    // its specific 4-bit-set codes in a different bin (bits along
+    // a different axis of the 3x3 neighborhood). We expect tens of
+    // chi-sq units at minimum.
+    ce_check("rotation distance >= 5 chi-sq units (NOT rotation-invariant)",
+             d >= 5)
+}
+
+fn test_descriptor_translation_lower_than_rotation() {
+    // Translation by 1 pixel should produce a SMALLER distance than
+    // the 90-deg rotation -- LBP is moderately translation-invariant
+    // within a cell boundary.
+    let buf_v = _vertical_edge_fixture(32, 32, 50, 200)
+    let buf_t = _translated_vertical_edge_fixture(32, 32, 50, 200, 1)
+    let buf_h = _horizontal_edge_fixture(32, 32, 50, 200)
+    let d_v = lbp_descriptor(buf_v, 32, 32, 4, 4)
+    let d_t = lbp_descriptor(buf_t, 32, 32, 4, 4)
+    let d_h = lbp_descriptor(buf_h, 32, 32, 4, 4)
+    let d_trans = lbp_compare(d_v, d_t)
+    let d_rot   = lbp_compare(d_v, d_h)
+    ce_check("translation distance < rotation distance",
+             d_trans < d_rot)
+}
+
+fn test_compare_incompatible_lengths_returns_minus_one() {
+    let buf_a = _vertical_edge_fixture(32, 32, 50, 200)
+    let buf_b = _vertical_edge_fixture(32, 32, 50, 200)
+    let d_a = lbp_descriptor(buf_a, 32, 32, 4, 4)
+    let d_b = lbp_descriptor(buf_b, 32, 32, 8, 8)
+    ce_eq("incompatible lengths -> chi-squared = -1",
+          lbp_compare(d_a, d_b), 0 - 1)
+    ce_eq("incompatible lengths -> intersection = -1",
+          lbp_compare_intersection(d_a, d_b), 0 - 1)
+}
+
+// ---- dominant-code + entropy ------------------------------------------
+
+fn test_dominant_code_uniform_field_is_ff() {
+    let buf = _flat_fixture(16, 16, 128)
+    let dom = lbp_dominant_code(buf, 16, 16)
+    ce_eq("uniform field dominant code = 0xFF",
+          dom, 255)
+}
+
+fn test_texture_entropy_uniform_is_zero() {
+    let buf = _flat_fixture(16, 16, 128)
+    let ent = lbp_texture_entropy_milli(buf, 16, 16)
+    ce_eq("uniform field entropy ~= 0 milli-bits",
+          ent, 0)
+}
+
+fn test_texture_entropy_random_is_high() {
+    let buf = _random_texture_fixture(32, 32, 7)
+    let ent = lbp_texture_entropy_milli(buf, 32, 32)
+    // log2(256) = 8 bits = 8000 milli-bits is the upper bound.
+    // A random texture should clear at least half of that.
+    ce_check("random texture entropy >= 4000 milli-bits",
+             ent >= 4000)
+    ce_check("entropy bounded above by 8000 milli-bits (log2(256))",
+             ent <= 8200)
+}
+
+// ---- labels + buckets ------------------------------------------------
+
+fn test_dominant_code_label_round_trip() {
+    ce_str_eq("code 0xFF (8 bits set) -> uniform_bright label",
+              lbp_dominant_code_label(255),
+              "image_lbp_dominant_code_uniform_bright")
+    ce_str_eq("code 0x00 (0 bits set) -> uniform_dark label",
+              lbp_dominant_code_label(0),
+              "image_lbp_dominant_code_uniform_dark")
+    ce_str_eq("code -1 -> none label",
+              lbp_dominant_code_label(0 - 1),
+              "image_lbp_dominant_code_none")
+    // 0xF0 = 11110000 -> 4 bits set -> mixed.
+    ce_str_eq("code 0xF0 (4 bits set) -> mixed label",
+              lbp_dominant_code_label(240),
+              "image_lbp_dominant_code_mixed")
+}
+
+fn test_texture_label_round_trip() {
+    ce_str_eq("entropy 1000 -> peaked",
+              lbp_texture_label(1000),
+              "image_lbp_texture_peaked")
+    ce_str_eq("entropy 4500 -> mid",
+              lbp_texture_label(4500),
+              "image_lbp_texture_mid")
+    ce_str_eq("entropy 7000 -> distributed",
+              lbp_texture_label(7000),
+              "image_lbp_texture_distributed")
+}
+
+// ---- OOB + caps -----------------------------------------------------
+
+fn test_lbp_at_oob_returns_zero() {
+    let buf = _flat_fixture(8, 8, 128)
+    let img = lbp_compute_image(buf, 8, 8)
+    ce_eq("lbp_at(-1, 0) returns 0", lbp_at(img, 0 - 1, 0), 0)
+    ce_eq("lbp_at(0, -1) returns 0", lbp_at(img, 0, 0 - 1), 0)
+    ce_eq("lbp_at(99, 0) returns 0", lbp_at(img, 99, 0), 0)
+    ce_eq("lbp_at(0, 99) returns 0", lbp_at(img, 0, 99), 0)
+}
+
+fn test_oversized_image_returns_error() {
+    let dummy = alloc(16)
+    let img = lbp_compute_image(dummy, 300, 300)
+    ce_check("oversized 300x300 image -> error string non-empty",
+             len(lbp_image_error(img)) > 0)
+    ce_eq("oversized -> data pointer = 0",
+          lbp_image_data(img), 0)
+}
+
+fn test_null_pointer_returns_error() {
+    let img = lbp_compute_image(0, 8, 8)
+    ce_check("null pointer -> error string non-empty",
+             len(lbp_image_error(img)) > 0)
+}
+
+fn test_invalid_cells_returns_empty_descriptor() {
+    let buf = _flat_fixture(16, 16, 128)
+    let d1 = lbp_descriptor(buf, 16, 16, 1, 4)
+    ce_eq("cells_x=1 (< LBP_CELLS_MIN) -> empty descriptor",
+          len(d1), 0)
+    let d2 = lbp_descriptor(buf, 16, 16, 4, 20)
+    ce_eq("cells_y=20 (> LBP_CELLS_MAX) -> empty descriptor",
+          len(d2), 0)
+}
+
+// ---- main -----------------------------------------------------------
+
+fn main() {
+    test_uniform_image_all_codes_ff()
+    test_center_dark_all_neighbors_bright_code_ff()
+    test_center_bright_all_neighbors_dark_code_00()
+    test_vertical_edge_half_and_half_codes()
+    test_histogram_uniform_region_spike()
+    test_histogram_noisy_region_distributed()
+    test_histogram_oob_returns_zero_list()
+    test_descriptor_32x32_cells_4x4_returns_4096_ints()
+    test_descriptor_self_match_distance_zero()
+    test_descriptor_self_match_intersection_equals_total_pixels()
+    test_descriptor_rotation_non_invariance()
+    test_descriptor_translation_lower_than_rotation()
+    test_compare_incompatible_lengths_returns_minus_one()
+    test_dominant_code_uniform_field_is_ff()
+    test_texture_entropy_uniform_is_zero()
+    test_texture_entropy_random_is_high()
+    test_dominant_code_label_round_trip()
+    test_texture_label_round_trip()
+    test_lbp_at_oob_returns_zero()
+    test_oversized_image_returns_error()
+    test_null_pointer_returns_error()
+    test_invalid_cells_returns_empty_descriptor()
+    ce_summary("image_lbp")
+}
+
+main()

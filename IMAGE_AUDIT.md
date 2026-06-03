@@ -100,6 +100,7 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 | HOG sliding-window detector      | DONE (R15C)         |
 | SIFT-like 128-D descriptor       | DONE (P3.3 cont. v2)|
 | ORB (FAST + rBRIEF, patent-free) | DONE (P3.3 cont. v3)|
+| LBP texture descriptor (Ojala'96)| DONE (R17D)         |
 | Color histograms (HSV / Lab)     | 2-3 weeks           |
 | Spatial k-means segmentation     | DONE (R11E)         |
 | CNN feature vector (untrained)   | 4-8 weeks           |
@@ -990,6 +991,84 @@ Files touched / added:
 * `scripts/bench_simd_production.sh` (extended bench reports all
   three paths + dual bit-identical assertions)
 
+## R17C -- u8 raw-byte SIMD on optical-flow LK (HONEST: structural mismatch on accumulators; ships wiring + the SAD diagnostics that DO fit)
+
+R15A's u8 SIMD pattern delivered 5.5x absolute speedup on stereo SAD. The
+brief asked whether the same pattern could close R13A's optical-flow LK
+ceiling. R17C investigated the structural shape and shipped the wiring
+with HONEST findings -- mirroring R12A's precedent (agent shipped at
+0.84x/0.20x and documented the limitation).
+
+### Findings (after investigation -- documented to spare R18+ the same trip)
+
+LK's inner-loop accumulators are five sums of byte * byte SIGNED products:
+
+  Σ Ix * Ix    Σ Iy * Iy    Σ Ix * Iy    Σ Ix * It    Σ Iy * It
+
+`simd_sad_u8` (AVX2 `vpsadbw`) computes Σ|a[i] - b[i]| over UNSIGNED
+bytes. It is structurally NOT a mul-acc primitive: it returns the SAD,
+not a vector of products. The LK accumulators need signed byte * byte ->
+i32 mul-acc, which would require a different builtin (e.g. SSSE3's
+`pmaddubsw` or an `simd_mul_i16x16`). Direct vectorization of LK via
+`simd_sad_u8` is impossible regardless of how the data is packed.
+
+### What R17C ships (the parts that DO match `simd_sad_u8`)
+
+R17C lands three useful pieces of the pattern, all bit-identical:
+
+1. **`lk_sad_block_u8(prev, next, w, x, y, ws, p_buf, n_buf)`**: pack
+   the WIN x WIN window of `prev` and `next` into contiguous byte
+   buffers via `_lk_pack_block_u8` (one `memcpy_raw` per row, mirrors
+   R15A), reduce via `simd_sad_u8`. Returns Σ|It| over the window: a
+   diagnostic. Bit-identical to scalar Σ|next - prev|.
+
+2. **`lk_image_sad_residual_u8(prev, next, w, h)`**: per-row
+   `simd_sad_u8` across the FULL image (PGM rows ARE contiguous, no
+   packing needed). Returns Σ|next - prev| over all pixels -- the
+   canonical pyramidal-LK convergence metric.
+
+3. **`_lk_optical_flow_u8_simd_inner` + `lk_optical_flow_u8_simd`**
+   (`CE_LK_U8_SIMD=on` opt-in, mirrors R15A): full LK with pack-then-
+   scan locality. Per pixel, pack windows via `memcpy_raw`, then run
+   the 5-accumulator scalar inner loop reading It from the packed
+   buffer. Bit-identical to scalar.
+
+### Measured speedup (256x256 ws=5, smooth-quadratic + h-shift-2)
+
+  | Path                                | Wallclock | Speedup vs scalar |
+  |-------------------------------------|----------:|------------------:|
+  | scalar (R10D)                       |  ~58 ms   |             1.00x |
+  | R12A i32 SIMD                       | ~362 ms   |             0.15x |
+  | **R17C u8 packed-scan**             |  ~71 ms   |          **0.80x** |
+  | R17C u8 vs R12A i32                 |       --  |          **5.09x** |
+  | image-SAD residual scalar           | ~392 us   |             1.00x |
+  | image-SAD residual u8 SIMD per row  |   ~7 us   |          **58.2x** |
+
+**Honest read** (R12A precedent): full LK at u8 packed-scan is 0.80x
+scalar -- pack overhead exceeds locality saving. The u8 path is 5.09x
+faster than R12A's i32 path. The pure-SAD image-residual helper hits
+58.2x absolute speedup. To close R13A's ceiling at the accumulator
+level, NOVA would need `simd_mul_i16x16` (or `pmaddubsw`-shaped) byte-
+mul-acc.
+
+### Bit-identical preserved
+
+Yes. 34 new assertions in `tests/unit/test_lk_u8_simd.nova`:
+- `lk_sad_block_u8` vs scalar Σ|next - prev| (ws in {3, 5, 7, 9, 11}).
+- `lk_image_sad_residual_u8` vs scalar Σ|a - b|.
+- `_lk_optical_flow_u8_simd_inner` vs `lk_optical_flow` on R10D's
+  textured h-shift-3 (mean magnitude, valid count, per-pixel flow).
+- Identical-frames invariant; env-var dispatch; input validation.
+- Bench script FAILs on any scalar vs SIMD disagreement.
+
+### Files touched / added (R17C)
+
+* `src/io/transducers/image_optical_flow.nova` (+~285 lines: pack
+  helper, sad_block_u8, image_sad_residual_u8, env-var, inner LK,
+  public entry-point with dispatch)
+* `tests/unit/test_lk_u8_simd.nova` (NEW, 34 assertions)
+* `scripts/bench_simd_production.sh` (extended flow bench)
+
 ## R16D -- Viola-Jones-style Haar cascade face detector (STRUCTURAL only -- see scope)
 
 **Status: complete -- new `src/io/transducers/image_face_detect.nova`
@@ -1127,3 +1206,135 @@ Files touched / added:
 * `examples/crossengin_chat.nova` (+2 lines: `/help` advert +
   `/faces` dispatch)
 
+
+## R17D -- LBP (Local Binary Patterns, Ojala 1996) texture descriptor
+
+R16D shipped the structural face DETECTOR (Viola-Jones-style Haar
+cascade -- finds *where* a face is). R17D ships the classic non-DL
+face / texture **DESCRIPTOR** (finds *which* face it is by texture
+signature): Local Binary Patterns. Where HOG (R14D) summarizes
+gradient ORIENTATION in cells, LBP summarizes LOCAL TEXTURE -- per
+pixel, compare it against its 8 neighbors, pack the 8 comparison
+bits into a single byte; the histogram of those bytes over a
+region is the descriptor.
+
+### Algorithm
+
+For each pixel (x, y), inspect the 3x3 neighborhood:
+
+```
+  P7 P0 P1
+  P6  C P2
+  P5 P4 P3
+```
+
+Threshold each neighbor against the center C (equality maps to 1
+to keep the uniform-field-yields-0xFF invariant), then pack
+clockwise from top-left:
+
+  lbp(x,y) = b7*128 + b0*64 + b1*32 + b2*16 + b3*8 + b4*4 + b5*2 + b6*1
+
+Each pixel produces an 8-bit LBP code (256 possible values). For a
+face descriptor: tile the image into cells_x x cells_y cells,
+compute the 256-bin LBP histogram per cell, concatenate ->
+cells_x * cells_y * 256-bin descriptor (e.g., 4x4 cells = 4096
+ints; the canonical Ahonen 2006 8x8 = 16,384 ints).
+
+### Why LBP for face RECOGNITION (vs HOG for face DETECTION)
+
+HOG and Viola-Jones are both detection-oriented (find the face);
+LBP is the canonical non-DL DESCRIPTOR (identify which face). The
+2006 Ahonen et al. paper "Face Recognition with Local Binary
+Patterns" beat the prior eigenfaces / Fisherfaces baselines on
+FERET and remained the dominant non-DL face-rec method for nearly
+a decade. The descriptor is also broadly used in texture
+classification, age / gender estimation, and dynamic texture
+analysis.
+
+### Rotation non-invariance (documented limitation)
+
+Basic LBP is NOT rotation-invariant. Rotating the input by 90
+degrees permutes the neighbor labels (P0 -> P2, P1 -> P3, etc.) so
+the packed code changes. The unit suite demonstrates this
+explicitly:
+
+* `test_descriptor_rotation_non_invariance`: vertical-edge vs
+  horizontal-edge (= rotated vertical-edge) -> chi-squared
+  distance > 0, well above the noise floor.
+* SIFT (R5C) and ORB (R6D) ARE rotation-invariant; HOG (R14D) is
+  NOT, and basic LBP shares HOG's limitation.
+
+The standard rotation-invariant variant LBP_ri remaps each code
+to its minimum rotation (a 256 -> 36 lookup) and the "uniform"
+LBP variant further reduces to 59 distinct patterns; both are
+documented follow-ups. In face recognition the face IS
+pose-normalized first (e.g., eyes aligned) so rotation invariance
+is not needed at the descriptor layer.
+
+### Public API
+
+* `lbp_compute_image(image, w, h) -> lbp_image_t` -- per-pixel
+  LBP codes; sentinel error on cap violation / null pointer.
+* `lbp_at(lbp_img, x, y) -> int` -- bounds-checked code at (x, y);
+  returns 0 on OOB or border pixel.
+* `lbp_histogram(lbp_img, x1, y1, x2, y2) -> list[256]` --
+  histogram of codes within the half-open ROI [x1, x2) x [y1, y2).
+* `lbp_descriptor(image, w, h, cells_x, cells_y) -> list[int]` --
+  cells_x * cells_y * 256-bin concatenated descriptor.
+* `lbp_compare(desc_a, desc_b) -> int` -- chi-squared distance;
+  0 = identical, larger = more dissimilar, -1 on length mismatch.
+* `lbp_compare_intersection(desc_a, desc_b) -> int` --
+  histogram-intersection similarity; LARGER = MORE SIMILAR.
+* `lbp_dominant_code(image, w, h) -> int` -- argmax over the
+  whole-image LBP histogram.
+* `lbp_texture_entropy_milli(image, w, h) -> int` -- Shannon
+  entropy over the 256-bin histogram in milli-bits (uniform
+  field ~0; random texture ~8000).
+
+Caps: dimensions <= 256x256 per axis (LBP_MAX_DIM); cells_x and
+cells_y in [LBP_CELLS_MIN, LBP_CELLS_MAX] = [2, 16].
+
+### Verification
+
+Unit tests (~45 assertions in `tests/unit/test_lbp.nova`):
+* Uniform image -> every interior code = 0xFF (Ojala's
+  equality-maps-to-1 convention).
+* Center darker than all 8 neighbors -> code 0xFF.
+* Center brighter than all 8 neighbors -> code 0x00.
+* Half-and-half neighborhood -> specific 4-bit-set codes.
+* Histogram on uniform 16x16 region -> spike at single bin (255).
+* Histogram on noisy texture -> distributed across >=30 codes.
+* Descriptor on 32x32 with 4x4 cells -> 4096 ints.
+* Self-match chi-squared = 0; self-match intersection = pixel count.
+* Rotation -> non-zero distance (the rotation-non-invariance test).
+* Translation by 1 px -> smaller distance than rotation.
+* OOB safety for `lbp_at`; cap rejection for oversized images;
+  invalid cells_x / cells_y rejection.
+
+Integration scenario `tests/integration/scenario_rrr_lbp.sh`
+(10 assertions): /help advert, /lbp usage, missing-file error,
+too-small-image error, valid summary tuple on a 32x32 vertical-edge
+"face" fixture, same dominant_code on a 1-px-shifted face (the
+"low-distance" pair), differing entropy on a four-spots fixture
+(the "high-distance" pair), chat reaches /quit.
+
+### Recognition system (deferred)
+
+LBP-for-face-recognition normally consumes the descriptor into a
+SVM, KNN, or nearest-template lookup. For CrossEngin's non-LLM
+substrate the simplest use is template comparison (similar to the
+R15C HOG sliding-window detector): match a query face's LBP
+descriptor against a small gallery of known faces, return the
+nearest match. This round ships the DESCRIPTOR + COMPARISON
+primitives; "build a recognition system" can be a future round if
+the substrate ever needs to bind face identity to atoms.
+
+### Files touched / added
+
+* `src/io/transducers/image_lbp.nova` (NEW, ~550 lines)
+* `tests/unit/test_lbp.nova` (NEW, 22 test functions / 45 assertions)
+* `tests/integration/scenario_rrr_lbp.sh` (NEW, 10 assertions)
+* `src/io/transducers/visual_perception.nova` (+3 lines: import +
+  R17D wire-in comment + 1 dispatch line)
+* `examples/crossengin_chat.nova` (+2 lines: `/help` advert +
+  `/lbp` dispatch)
