@@ -11,7 +11,32 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R16A adds `src/persistence/merkle_signing.nova` — an
+> toolchain. R16F extends R15D's `src/kg/query.nova` mini-SPARQL with
+> the three remaining "SPARQL 1.0 core" surface features: **OPTIONAL**
+> (left-outer-join semantics — keep the binding even when the inner
+> block doesn't match; the introduced vars render as `?` in the
+> emit-line), **UNION** (alternation — `{ left } UNION { right }`
+> concatenates each branch's bindings with SPARQL bag semantics), and
+> **ORDER BY** (`[ASC|DESC]` + `(field)` — sort by the integer field
+> of the most-recently-bound atom; ties broken by atom_id ASCENDING
+> for stability; LIMIT applies after the sort). The parser gains 6
+> new keywords (`OPTIONAL`, `UNION`, `ORDER`, `BY`, `ASC`, `DESC`),
+> two new structural tokens (`TOK_LPAREN` / `TOK_RPAREN` for the
+> `DESC(alpha)` paren form), and two new AST node tags
+> (`PAT_OPTIONAL` / `PAT_UNION`); the executor's pattern loop is
+> lifted into an `_qry_exec_patterns` recursive helper so OPTIONAL
+> and UNION compose freely inside their inner brace groups. ORDER
+> BY runs an in-place stable insertion sort over the binding list
+> (keyed on the atom's integer field, tiebroken by atom_id ASC)
+> before LIMIT applies. R15D's `kg_query_parse / _execute /
+> _compile_and_run` public API is unchanged; new accessors
+> `kg_query_orderby_has / _field / _dir` round out the
+> parsed_query_t surface. 60 unit assertions
+> (`tests/unit/test_kg_query_ext.nova`) + 22 integration assertions
+> (`tests/integration/scenario_ppp_query_ext.sh`); all green.
+> All 55 R15D `test_kg_query.nova` assertions remain bit-identically
+> green (the BGP+FILTER+LIMIT surface is untouched). R16A adds
+> `src/persistence/merkle_signing.nova` — an
 > Ed25519 sign + verify wrap of the R15E Merkle root, closing the
 > last gap in the snapshot attestation chain. R15E shipped tamper
 > detection against an operator who edits a single atom byte (the

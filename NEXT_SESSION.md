@@ -3,7 +3,104 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R16D (this session) -- Viola-Jones-style Haar cascade face detector (STRUCTURAL)
+## R16F (this session) -- mini-SPARQL extensions: OPTIONAL, UNION, ORDER BY
+
+**Status: complete -- `src/kg/query.nova` (R15D's mini-SPARQL parser +
+executor, EXTENDED in place) now supports the three remaining
+"SPARQL 1.0 core" surface features. R15D shipped the SELECT / WHERE
+{ triples + FILTERs } / LIMIT base; R16F adds OPTIONAL (left-outer-
+join), UNION (alternation), and ORDER BY (deterministic sort).** No
+new module count; everything lives in the single R15D module.
+
+### What the new keywords accept
+
+```
+SELECT ?a ?b WHERE {
+  ?a kind FACT .
+  OPTIONAL { ?a links ?b . }
+}
+```
+
+```
+SELECT ?a WHERE {
+  { ?a kind FACT . } UNION { ?a kind CONCEPT . }
+}
+```
+
+```
+SELECT ?a WHERE { ?a kind FACT . } ORDER BY DESC(alpha) LIMIT 5
+```
+
+### Algorithm
+
+1. **OPTIONAL `{ ... }`** -- left-outer-join. For each input binding
+   row, run the inner pattern list on a single-row input set. If at
+   least one extended row emerges, emit those (preserves any newly
+   introduced vars); if none, emit the ORIGINAL row unchanged --
+   `binding_has` returns 0 for the OPTIONAL's introduced vars; the
+   emit-line helper renders them as `?`. This is the textbook SPARQL
+   semantic.
+2. **`{ left } UNION { right }`** -- alternation. Each side
+   evaluates independently against a fresh copy of the input
+   bindings; the two result sets are concatenated. SPARQL bag
+   semantics (no implicit dedupe; `{ X } UNION { X }` doubles).
+3. **ORDER BY** -- collect all bindings, score each by an integer
+   field of the most-recently bound atom, then stable-sort with
+   ties broken by atom_id ASC. Insertion sort over a parallel
+   `[(score, atom_id, binding)]` list; O(n^2) but n is bounded by
+   LIMIT (default 100).
+4. **LIMIT** runs LAST -- it slices the post-sort binding list.
+
+### Parser additions
+
+- 6 new keywords (`OPTIONAL`, `UNION`, `ORDER`, `BY`, `ASC`, `DESC`).
+- 2 new structural tokens: `TOK_LPAREN` `(`, `TOK_RPAREN` `)`.
+- 2 new pattern AST tags: `PAT_OPTIONAL`, `PAT_UNION`.
+- 1 new query AST slot: `QRY_ORDERBY` (`q[4]`).
+- Accepts both `ORDER BY DESC(alpha)` and `ORDER BY DESC alpha`.
+
+### Executor additions
+
+- `_qry_exec_patterns(kg, patterns, bindings, last_atom_var_in)` --
+  recursive helper that OPTIONAL/UNION reuse for inner blocks.
+- `_qry_exec_optional`, `_qry_exec_union`, `_qry_apply_order_by`.
+
+### Verification
+
+- Unit `tests/unit/test_kg_query_ext.nova`: 60 assertions, all green.
+- Unit (regression) `tests/unit/test_kg_query.nova`: 55 assertions,
+  bit-identically green.
+- Integration `tests/integration/scenario_ppp_query_ext.sh`: 22
+  assertions, all green.
+- Integration (regression) `tests/integration/scenario_kkk_query.sh`:
+  18 assertions, all green.
+
+### Behavior on the R15D 10-atom fixture
+
+- `SELECT ?a ?b WHERE { ?a kind FACT . OPTIONAL { ?a links ?b . } }`
+  -> 5 bindings; ?b BOUND for all 5 (every FACT links to a CONCEPT).
+- Same query against a no-xrefs clone -> 5 bindings; ?b UNBOUND for all 5.
+- `SELECT ?a WHERE { { ?a kind FACT . } UNION { ?a kind CONCEPT . } }`
+  -> 10 bindings (5 FACT + 5 CONCEPT).
+- `SELECT ?a WHERE { ?a kind FACT . } ORDER BY DESC(alpha) LIMIT 3`
+  -> 3 bindings; atom_id sequence [4, 3, 2] (alphas 5000, 4000, 3000).
+
+### File touch summary
+
+- `src/kg/query.nova` (R15D's module, EXTENDED in place -- no new module)
+- NEW `tests/unit/test_kg_query_ext.nova`
+- NEW `tests/integration/scenario_ppp_query_ext.sh`
+- `README.md` (status banner extended for R16F)
+- `NEXT_SESSION.md` (this section)
+
+### Not touched
+
+- `examples/crossengin_chat.nova` (no new admin command; /query
+  was already dispatched by R15D, and the new keywords route
+  through the same `kg_query_cmd` entry point with no chat-side
+  change needed).
+
+## R16D (last session) -- Viola-Jones-style Haar cascade face detector (STRUCTURAL)
 
 **Status: complete -- new `src/io/transducers/image_face_detect.nova`
 adds the integral-image primitive (Crow 1984) + Haar two-/three-/

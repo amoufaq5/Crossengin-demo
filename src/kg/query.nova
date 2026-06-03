@@ -1,4 +1,4 @@
-// CrossEngin knowledge: declarative SPARQL-like query language (R15D).
+// CrossEngin knowledge: declarative SPARQL-like query language (R15D + R16F).
 //
 // Purpose
 //   The KG has many read paths: exact id (atom_store.kg_find_atom),
@@ -25,11 +25,14 @@
 //   single-file module is the right scope for a v1.0 query surface).
 //
 // Mini-SPARQL grammar (BNF, simplified)
-//   query   ::= "SELECT" varlist "WHERE" "{" pattern* "}" limit?
+//   query   ::= "SELECT" varlist "WHERE" "{" pattern* "}" orderby? limit?
 //   varlist ::= "?" name ( "?" name )*
-//   pattern ::= triple "." | filter "."
+//   pattern ::= triple "." | filter "." | optional | union
 //   triple  ::= term predicate term
 //   filter  ::= "FILTER" field op intvalue
+//   optional::= "OPTIONAL" "{" pattern* "}"
+//   union   ::= "{" pattern* "}" "UNION" "{" pattern* "}"
+//   orderby ::= "ORDER" "BY" ( "ASC" "(" field ")" | "DESC" "(" field ")" | field )
 //   term    ::= "?" name | literal
 //   predicate ::= "kind" | "label" | "alpha" | "beta" | "created_ns"
 //              | "links"
@@ -48,9 +51,21 @@
 //     created_ns, version, kind)
 //   - Implicit AND across multiple patterns
 //   - LIMIT N (default 100, max 10000)
+//   - OPTIONAL { patterns }: left-outer-join semantics (R16F). If the
+//     inner patterns extend a binding, keep the extension; if they
+//     don't, keep the original binding with the OPTIONAL's introduced
+//     vars left unbound (binding_has -> 0; binding_get -> 0; the
+//     emit-line helper renders them as "?").
+//   - { patterns } UNION { patterns }: alternation (R16F). Both
+//     branches run independently against the current binding set; the
+//     results are concatenated (no dedupe of overlapping rows -- SPARQL
+//     bag semantics by default).
+//   - ORDER BY <field> [ASC|DESC]: deterministic ranking (R16F). Sort
+//     bindings by the integer field of the most-recently-bound atom.
+//     Ties broken by atom_id ascending for stability. Default ASC.
 //
-// Out of scope (defer): OPTIONAL, UNION, MINUS, complex boolean
-// FILTER, regex matching, ORDER BY, GROUP BY, aggregates.
+// Out of scope (defer): MINUS, complex boolean FILTER, regex matching,
+// GROUP BY, aggregates.
 //
 // Execution strategy
 //   Each triple pattern is evaluated against the current binding set.
@@ -104,16 +119,42 @@ let QRY_TAG      = 0
 let QRY_VARS     = 1
 let QRY_PATTERNS = 2
 let QRY_LIMIT    = 3
+// R16F: optional ORDER BY clause. Stored as a 3-cell list
+// [field_string, direction_int, present_flag]. direction is +1 for ASC, -1
+// for DESC; present_flag is 1 iff the source had an ORDER BY clause. We
+// keep the slot even when absent so the parsed_query_t shape is fixed.
+let QRY_ORDERBY  = 4
 
 // ---- pattern node tags ----------------------------------------------------
-// Triple patterns: [PAT_TRIPLE, subject_term, predicate_str, object_term]
-// FILTER patterns: [PAT_FILTER, field_str, op_str, intvalue]
-let PAT_TRIPLE = 1
-let PAT_FILTER = 2
+// Triple patterns:   [PAT_TRIPLE,   subject_term, predicate_str, object_term]
+// FILTER patterns:   [PAT_FILTER,   field_str, op_str, intvalue]
+// OPTIONAL patterns: [PAT_OPTIONAL, inner_pattern_list]  -- R16F
+// UNION patterns:    [PAT_UNION,    left_pattern_list, right_pattern_list]
+//   R16F. Both lists evaluate independently against the current bindings;
+//   results concatenate. UNION ALWAYS appears as a single top-level
+//   pattern in the WHERE block -- it consumes a `{` ... `}` UNION `{`
+//   ... `}` sequence (so the parser sees a literal `{` open in the
+//   pattern position).
+let PAT_TRIPLE   = 1
+let PAT_FILTER   = 2
+let PAT_OPTIONAL = 3
+let PAT_UNION    = 4
 
 // term: [TERM_VAR, var_name] or [TERM_LIT, literal_value]
 let TERM_VAR = 1
 let TERM_LIT = 2
+
+// R16F: ORDER BY direction codes. The default (no direction keyword) is
+// ASC. Stored as the second cell of the QRY_ORDERBY field.
+let ORD_ASC  = 1
+let ORD_DESC = 0 - 1
+
+// R16F: unbound sentinel for OPTIONAL non-match. We use -1 as the value
+// stored on the binding entry when an OPTIONAL pattern fails to match;
+// callers should use binding_has(b, name) to discriminate the bound and
+// unbound case (the sentinel is a fallback for code paths that read the
+// value directly).
+let QRY_UNBOUND = 0 - 1
 
 // ---- error layout ---------------------------------------------------------
 // On parse failure we return a list [ERR_OBJ_TAG, message]; callers test
@@ -149,7 +190,7 @@ fn qry_error_message(x) {
 // ---- tokenizer ------------------------------------------------------------
 //
 // Token kinds:
-//   TOK_KW       SELECT|WHERE|FILTER|LIMIT
+//   TOK_KW       SELECT|WHERE|FILTER|LIMIT|OPTIONAL|UNION|ORDER|BY|ASC|DESC
 //   TOK_VAR      ?identifier (the leading ? is dropped, just the name)
 //   TOK_IDENT    bare identifier (a keyword position OR a literal kind name)
 //   TOK_INT      decimal integer literal (raw digits, may be negative)
@@ -157,8 +198,10 @@ fn qry_error_message(x) {
 //   TOK_LBRACE   {
 //   TOK_RBRACE   }
 //   TOK_STR      "quoted string" (quotes stripped)
+//   TOK_LPAREN   ( -- R16F, for ORDER BY DESC(field) syntax
+//   TOK_RPAREN   ) -- R16F
 //
-// We split on whitespace and on the structural characters {, }, ., ?, "
+// We split on whitespace and on the structural characters {, }, ., ?, ", (, )
 // We DO NOT lowercase identifiers: keyword matching is case-sensitive
 // (SPARQL is upper-keyword by convention).
 let TOK_KW     = 1
@@ -169,6 +212,8 @@ let TOK_OP     = 5
 let TOK_LBRACE = 6
 let TOK_RBRACE = 7
 let TOK_STR    = 8
+let TOK_LPAREN = 9
+let TOK_RPAREN = 10
 
 fn _tok_new(kind, text) {
     let t = list_new()
@@ -196,13 +241,18 @@ fn _qry_is_digit(c) {
     return 1
 }
 
-// Is `c` a structural single-char token? { } . ? "
+// Is `c` a structural single-char token? { } . ? " ( )
+// R16F: ( and ) added for ORDER BY DESC(field) syntax. They terminate
+// the current word in the same way { } do, so they slot into the
+// existing tokenizer state-machine without changing the word-reader.
 fn _qry_is_struct(c) {
     if c == 123 { return 1 }   // {
     if c == 125 { return 1 }   // }
     if c == 46  { return 1 }   // .
     if c == 63  { return 1 }   // ?
     if c == 34  { return 1 }   // "
+    if c == 40  { return 1 }   // (
+    if c == 41  { return 1 }   // )
     return 0
 }
 
@@ -215,13 +265,21 @@ fn _qry_is_op_start(c) {
     return 0
 }
 
-// Classify a bare identifier: keywords are SELECT, WHERE, FILTER, LIMIT.
+// Classify a bare identifier: keywords are SELECT, WHERE, FILTER, LIMIT,
+// OPTIONAL, UNION, ORDER, BY, ASC, DESC. Case-sensitive (SPARQL upper-
+// keyword convention). R16F added OPTIONAL/UNION/ORDER/BY/ASC/DESC.
 // Returns TOK_KW for those, TOK_IDENT otherwise.
 fn _qry_classify_ident(s) {
-    if str_eq(s, "SELECT") == 1 { return TOK_KW }
-    if str_eq(s, "WHERE")  == 1 { return TOK_KW }
-    if str_eq(s, "FILTER") == 1 { return TOK_KW }
-    if str_eq(s, "LIMIT")  == 1 { return TOK_KW }
+    if str_eq(s, "SELECT")   == 1 { return TOK_KW }
+    if str_eq(s, "WHERE")    == 1 { return TOK_KW }
+    if str_eq(s, "FILTER")   == 1 { return TOK_KW }
+    if str_eq(s, "LIMIT")    == 1 { return TOK_KW }
+    if str_eq(s, "OPTIONAL") == 1 { return TOK_KW }
+    if str_eq(s, "UNION")    == 1 { return TOK_KW }
+    if str_eq(s, "ORDER")    == 1 { return TOK_KW }
+    if str_eq(s, "BY")       == 1 { return TOK_KW }
+    if str_eq(s, "ASC")      == 1 { return TOK_KW }
+    if str_eq(s, "DESC")     == 1 { return TOK_KW }
     return TOK_IDENT
 }
 
@@ -399,6 +457,16 @@ fn _qry_tokenize(s) {
                     push(toks, _tok_new(TOK_RBRACE, "}"))
                     i = i + 1
                 } else {
+                    if c == 40 {
+                        // R16F: '(' for ORDER BY DESC(field) syntax.
+                        push(toks, _tok_new(TOK_LPAREN, "("))
+                        i = i + 1
+                    } else {
+                    if c == 41 {
+                        // R16F: ')' for ORDER BY DESC(field) syntax.
+                        push(toks, _tok_new(TOK_RPAREN, ")"))
+                        i = i + 1
+                    } else {
                     if c == 46 {
                         push(toks, _tok_new(TOK_OP, "."))
                         i = i + 1
@@ -424,6 +492,8 @@ fn _qry_tokenize(s) {
                                 }
                             }
                         }
+                    }
+                    }
                     }
                 }
             }
@@ -623,7 +693,52 @@ fn _qry_op_valid(op) {
     return 0
 }
 
-// Parse one pattern (triple or FILTER) terminated by ".".
+// R16F: parse a brace-delimited pattern list: `{ pattern* }`. Returns
+// [patterns_list, new_pos] or [error, pos]. Used by OPTIONAL and by each
+// side of UNION; the outermost WHERE block still has its own parser
+// (_qry_parse_where) because that one is keyword-anchored on WHERE.
+fn _qry_parse_brace_group(toks, pos) {
+    let lb = _qry_peek(toks, pos)
+    if lb == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected '{' to open pattern group"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(lb) != TOK_LBRACE {
+        let pair = list_new()
+        push(pair, _qry_error("expected '{' to open pattern group"))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let patterns = list_new()
+    while pos < len(toks) {
+        let t = toks[pos]
+        if _tok_kind(t) == TOK_RBRACE {
+            pos = pos + 1
+            let pair = list_new()
+            push(pair, patterns)
+            push(pair, pos)
+            return pair
+        }
+        let pp = _qry_parse_pattern(toks, pos)
+        if _qry_is_error(pp[0]) == 1 {
+            return pp
+        }
+        push(patterns, pp[0])
+        pos = pp[1]
+    }
+    let pair = list_new()
+    push(pair, _qry_error("unterminated pattern group (expected '}')"))
+    push(pair, pos)
+    return pair
+}
+
+// Parse one pattern (triple, FILTER, OPTIONAL, or a brace-group that may
+// be the left side of a UNION). Triple/FILTER are terminated by ".";
+// OPTIONAL is terminated by its inner `}`; UNION sees the two brace
+// groups consume themselves.
 // Returns [pattern, new_pos] or [error, pos].
 fn _qry_parse_pattern(toks, pos) {
     let tok = _qry_peek(toks, pos)
@@ -632,6 +747,65 @@ fn _qry_parse_pattern(toks, pos) {
         push(pair, _qry_error("expected pattern, hit EOF"))
         push(pair, pos)
         return pair
+    }
+    // R16F: a brace-group at the pattern position is the left side of a
+    // UNION. After the group closes, we MUST see UNION and a second
+    // group; otherwise it's a parse error (a bare brace-group isn't a
+    // legal pattern in SPARQL outside of UNION / OPTIONAL).
+    if _tok_kind(tok) == TOK_LBRACE {
+        let lgp = _qry_parse_brace_group(toks, pos)
+        if _qry_is_error(lgp[0]) == 1 { return lgp }
+        let left_patterns = lgp[0]
+        pos = lgp[1]
+        let ut = _qry_peek(toks, pos)
+        if ut == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("expected UNION after brace group"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(ut) != TOK_KW {
+            let pair = list_new()
+            push(pair, _qry_error("expected UNION after brace group"))
+            push(pair, pos)
+            return pair
+        }
+        if str_eq(_tok_text(ut), "UNION") == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("expected UNION, got " + _tok_text(ut)))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+        let rgp = _qry_parse_brace_group(toks, pos)
+        if _qry_is_error(rgp[0]) == 1 { return rgp }
+        let right_patterns = rgp[0]
+        pos = rgp[1]
+        let node = list_new()
+        push(node, PAT_UNION)
+        push(node, left_patterns)
+        push(node, right_patterns)
+        let pair = list_new()
+        push(pair, node)
+        push(pair, pos)
+        return pair
+    }
+    // R16F: OPTIONAL { ... }
+    if _tok_kind(tok) == TOK_KW {
+        if str_eq(_tok_text(tok), "OPTIONAL") == 1 {
+            pos = pos + 1
+            let ogp = _qry_parse_brace_group(toks, pos)
+            if _qry_is_error(ogp[0]) == 1 { return ogp }
+            let inner = ogp[0]
+            pos = ogp[1]
+            let node = list_new()
+            push(node, PAT_OPTIONAL)
+            push(node, inner)
+            let pair = list_new()
+            push(pair, node)
+            push(pair, pos)
+            return pair
+        }
     }
     // FILTER
     if _tok_kind(tok) == TOK_KW {
@@ -842,6 +1016,146 @@ fn _qry_parse_where(toks, pos) {
     return pair
 }
 
+// R16F: parse the optional `ORDER BY [ASC|DESC] (field) | ORDER BY field`
+// clause. Returns [order_by_node, new_pos] where order_by_node is a 3-cell
+// list [field_string, direction, present_flag]. If there is no ORDER BY,
+// returns [["", ORD_ASC, 0], pos] (the absent sentinel).
+//
+// We accept these surface forms (all equivalent except for direction):
+//   ORDER BY alpha           -> ["alpha", ORD_ASC, 1]
+//   ORDER BY ASC(alpha)      -> ["alpha", ORD_ASC, 1]
+//   ORDER BY DESC(alpha)     -> ["alpha", ORD_DESC, 1]
+//   ORDER BY ASC alpha       -> ["alpha", ORD_ASC, 1]
+//   ORDER BY DESC alpha      -> ["alpha", ORD_DESC, 1]
+//
+// Parens after the direction are optional; the substrate operator pool
+// runs the gamut from "I copy-pasted from W3C" to "I just want it to
+// work", so we accept either spelling. The field must be one of the
+// recognised int fields (alpha, beta, count, created_ns, version, kind).
+fn _qry_parse_orderby(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    let absent = list_new()
+    push(absent, "")
+    push(absent, ORD_ASC)
+    push(absent, 0)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        // Not an ORDER keyword at this position -- leave for the next stage
+        // (LIMIT) to consume or report as a trailing-token error.
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "ORDER") == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let by_tok = _qry_peek(toks, pos)
+    if by_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER: expected BY"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(by_tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(by_tok), "BY") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // Optional ASC/DESC keyword.
+    let dir = ORD_ASC
+    let dir_tok = _qry_peek(toks, pos)
+    if dir_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: expected field"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(dir_tok) == TOK_KW {
+        if str_eq(_tok_text(dir_tok), "ASC") == 1 {
+            dir = ORD_ASC
+            pos = pos + 1
+        } else {
+            if str_eq(_tok_text(dir_tok), "DESC") == 1 {
+                dir = ORD_DESC
+                pos = pos + 1
+            }
+        }
+    }
+    // Optional '('.
+    let saw_lparen = 0
+    let lp_tok = _qry_peek(toks, pos)
+    if lp_tok != 0 {
+        if _tok_kind(lp_tok) == TOK_LPAREN {
+            saw_lparen = 1
+            pos = pos + 1
+        }
+    }
+    // Field identifier.
+    let ft = _qry_peek(toks, pos)
+    if ft == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: expected field identifier"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(ft) != TOK_IDENT {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: expected field identifier, got " + _tok_text(ft)))
+        push(pair, pos)
+        return pair
+    }
+    let field = _tok_text(ft)
+    if _qry_filter_field_valid(field) == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: unknown field: " + field))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    if saw_lparen == 1 {
+        let rp_tok = _qry_peek(toks, pos)
+        if rp_tok == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("ORDER BY: expected ')'"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(rp_tok) != TOK_RPAREN {
+            let pair = list_new()
+            push(pair, _qry_error("ORDER BY: expected ')', got " + _tok_text(rp_tok)))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+    }
+    let node = list_new()
+    push(node, field)
+    push(node, dir)
+    push(node, 1)
+    let pair = list_new()
+    push(pair, node)
+    push(pair, pos)
+    return pair
+}
+
 // Parse optional LIMIT N. Returns [limit, new_pos]. If no LIMIT present,
 // returns [QRY_DEFAULT_LIMIT, pos]. Caps at QRY_MAX_LIMIT.
 fn _qry_parse_limit(toks, pos) {
@@ -929,6 +1243,11 @@ fn kg_query_parse(query_string) {
     if _qry_is_error(wp[0]) == 1 { return wp[0] }
     let patterns = wp[0]
     pos = wp[1]
+    // R16F: ORDER BY comes before LIMIT in SPARQL surface syntax.
+    let op = _qry_parse_orderby(toks, pos)
+    if _qry_is_error(op[0]) == 1 { return op[0] }
+    let order_by = op[0]
+    pos = op[1]
     let lp = _qry_parse_limit(toks, pos)
     if _qry_is_error(lp[0]) == 1 { return lp[0] }
     let limit = lp[0]
@@ -941,6 +1260,7 @@ fn kg_query_parse(query_string) {
     push(q, vars)
     push(q, patterns)
     push(q, limit)
+    push(q, order_by)
     return q
 }
 
@@ -948,6 +1268,23 @@ fn kg_query_parse(query_string) {
 fn kg_query_vars(q)     { return q[QRY_VARS] }
 fn kg_query_patterns(q) { return q[QRY_PATTERNS] }
 fn kg_query_limit(q)    { return q[QRY_LIMIT] }
+// R16F: ORDER BY accessors. _has returns 1 iff the parsed query had an
+// ORDER BY clause; _field is "" when absent; _dir is the ORD_ASC/ORD_DESC
+// constant when present and ORD_ASC by default.
+fn kg_query_orderby_has(q) {
+    if len(q) <= QRY_ORDERBY { return 0 }
+    let ob = q[QRY_ORDERBY]
+    if len(ob) < 3 { return 0 }
+    return ob[2]
+}
+fn kg_query_orderby_field(q) {
+    if len(q) <= QRY_ORDERBY { return "" }
+    return q[QRY_ORDERBY][0]
+}
+fn kg_query_orderby_dir(q) {
+    if len(q) <= QRY_ORDERBY { return ORD_ASC }
+    return q[QRY_ORDERBY][1]
+}
 fn kg_query_is_parsed(q) {
     if q == 0 { return 0 }
     if len(q) < 4 { return 0 }
@@ -1315,6 +1652,242 @@ fn _qry_exec_filter(kg, node, bindings, last_atom_var) {
     return out
 }
 
+// R16F: execute a list of pattern nodes against a seed binding set,
+// returning [new_bindings, last_atom_var]. This was inlined in
+// kg_query_execute pre-R16F; lifting it makes OPTIONAL / UNION able to
+// recurse on their own pattern lists with the same machinery.
+//
+// `last_atom_var_in` is the var name that names the most-recently bound
+// atom from the OUTER scope (passed in so OPTIONAL's inner patterns can
+// reference vars bound before the OPTIONAL began).
+fn _qry_exec_patterns(kg, patterns, bindings, last_atom_var_in) {
+    let last_atom_var = last_atom_var_in
+    let pi = 0
+    while pi < len(patterns) {
+        let node = patterns[pi]
+        let kind = node[0]
+        if kind == PAT_TRIPLE {
+            let pair = _qry_exec_triple(kg, node, bindings, last_atom_var)
+            bindings = pair[0]
+            if len(pair[1]) > 0 { last_atom_var = pair[1] }
+        }
+        if kind == PAT_FILTER {
+            bindings = _qry_exec_filter(kg, node, bindings, last_atom_var)
+        }
+        if kind == PAT_OPTIONAL {
+            let pair = _qry_exec_optional(kg, node, bindings, last_atom_var)
+            bindings = pair[0]
+            if len(pair[1]) > 0 { last_atom_var = pair[1] }
+        }
+        if kind == PAT_UNION {
+            let pair = _qry_exec_union(kg, node, bindings, last_atom_var)
+            bindings = pair[0]
+            if len(pair[1]) > 0 { last_atom_var = pair[1] }
+        }
+        pi = pi + 1
+    }
+    let out = list_new()
+    push(out, bindings)
+    push(out, last_atom_var)
+    return out
+}
+
+// R16F: OPTIONAL { patterns } executor. Left-outer-join semantics --
+// for each input binding, try executing the inner patterns; if at
+// least one match emerges, emit those extended bindings; if none, emit
+// the ORIGINAL binding with the OPTIONAL's introduced vars left
+// unbound. We DO NOT use the input bindings as a fan-out source for
+// the inner patterns directly; instead we iterate per-row so the
+// "match or fall back" decision is per-row, not per-batch.
+//
+// "Introduced var" set: any vars the inner patterns mention as ?vars
+// (subject/object of a triple) that aren't in the parent binding. We
+// don't try to detect this dynamically -- the binding_has() check on
+// the OUT side handles it: if the inner match succeeds for this row,
+// the binding gains the new vars; if it fails, the row passes through
+// without them. The format helper renders unbound vars as "?".
+fn _qry_exec_optional(kg, node, bindings, last_atom_var_in) {
+    let inner = node[1]
+    let out_bindings = list_new()
+    let out_last = last_atom_var_in
+    let bi = 0
+    while bi < len(bindings) {
+        let row = bindings[bi]
+        // Run the inner patterns over a single-row binding set.
+        let one = list_new()
+        push(one, _binding_copy(row))
+        let pair = _qry_exec_patterns(kg, inner, one, last_atom_var_in)
+        let extended = pair[0]
+        if len(pair[1]) > 0 { out_last = pair[1] }
+        if len(extended) == 0 {
+            // No match: keep the original binding unextended. The
+            // OPTIONAL's introduced vars are simply NOT in this row
+            // (binding_has returns 0; binding_get returns 0).
+            push(out_bindings, row)
+        } else {
+            // At least one match: emit all extended copies.
+            let xi = 0
+            while xi < len(extended) {
+                push(out_bindings, extended[xi])
+                xi = xi + 1
+            }
+        }
+        bi = bi + 1
+    }
+    let result = list_new()
+    push(result, out_bindings)
+    push(result, out_last)
+    return result
+}
+
+// R16F: UNION executor. Each side runs independently over the SAME
+// input bindings; the results are CONCATENATED (SPARQL bag semantics).
+// `last_atom_var` is whichever side last set one; if neither does, we
+// keep the outer scope's var.
+fn _qry_exec_union(kg, node, bindings, last_atom_var_in) {
+    let left = node[1]
+    let right = node[2]
+    // Each side gets a fresh copy of the input bindings so they don't
+    // see each other's mutations.
+    let left_in = list_new()
+    let bi = 0
+    while bi < len(bindings) {
+        push(left_in, _binding_copy(bindings[bi]))
+        bi = bi + 1
+    }
+    let right_in = list_new()
+    let bj = 0
+    while bj < len(bindings) {
+        push(right_in, _binding_copy(bindings[bj]))
+        bj = bj + 1
+    }
+    let lpair = _qry_exec_patterns(kg, left, left_in, last_atom_var_in)
+    let rpair = _qry_exec_patterns(kg, right, right_in, last_atom_var_in)
+    let merged = list_new()
+    let li = 0
+    while li < len(lpair[0]) {
+        push(merged, lpair[0][li])
+        li = li + 1
+    }
+    let ri = 0
+    while ri < len(rpair[0]) {
+        push(merged, rpair[0][ri])
+        ri = ri + 1
+    }
+    let last_var = last_atom_var_in
+    if len(rpair[1]) > 0 { last_var = rpair[1] }
+    if len(lpair[1]) > 0 { last_var = lpair[1] }
+    let result = list_new()
+    push(result, merged)
+    push(result, last_var)
+    return result
+}
+
+// R16F: ORDER BY scorer. Reads the int-valued `field` off the
+// most-recently bound atom in row `b`. Atoms that don't have the
+// field defined fall back to 0 (the default sort key); rows with no
+// atom in scope (last_atom_var == "") return 0 -- they all sort
+// equal, leaving the original insertion order intact for them.
+fn _qry_order_score(kg, b, last_atom_var, field) {
+    if len(last_atom_var) == 0 { return 0 }
+    if binding_has(b, last_atom_var) == 0 { return 0 }
+    let aid = binding_get(b, last_atom_var)
+    let a = kg_atom(kg, aid)
+    if a == 0 { return 0 }
+    return _qry_atom_field(a, field)
+}
+
+// R16F: stable insertion sort over bindings, sorting by the named
+// field. Direction is ORD_ASC for ascending, ORD_DESC for descending.
+// Ties are broken by atom_id ASCENDING (smaller id first) so the sort
+// is deterministic regardless of input order. We use insertion sort
+// because the typical result set is small (<= LIMIT, default 100) and
+// the implementation is simple enough to audit.
+fn _qry_order_atom_id(b, last_atom_var) {
+    // Tiebreaker: the bound atom's id. If no atom is in scope, fall
+    // back to 0 (every row ties at 0 -- preserving insertion order).
+    if len(last_atom_var) == 0 { return 0 }
+    if binding_has(b, last_atom_var) == 0 { return 0 }
+    return binding_get(b, last_atom_var)
+}
+
+fn _qry_apply_order_by(kg, bindings, field, dir, last_atom_var) {
+    let n = len(bindings)
+    if n <= 1 { return bindings }
+    // Build a parallel array of [score, atom_id, binding] tuples so we
+    // sort once. Use insertion sort -- O(n^2) but n is tiny (<= LIMIT,
+    // default 100). Stable for tied (score, atom_id) pairs.
+    let keyed = list_new()
+    let i = 0
+    while i < n {
+        let b = bindings[i]
+        let s = _qry_order_score(kg, b, last_atom_var, field)
+        let t = _qry_order_atom_id(b, last_atom_var)
+        let cell = list_new()
+        push(cell, s)
+        push(cell, t)
+        push(cell, b)
+        push(keyed, cell)
+        i = i + 1
+    }
+    // Insertion sort. Standard pattern: shift entries that are larger
+    // (smaller for DESC) than cur to the right; then drop cur into the
+    // gap. Stable for tied (score, atom_id) pairs because we only
+    // shift on STRICT precedence -- ties never trigger a swap.
+    let k = 1
+    while k < n {
+        let cur = keyed[k]
+        let j = k - 1
+        let placed = 0
+        while placed == 0 {
+            if j < 0 {
+                list_set(keyed, 0, cur)
+                placed = 1
+            } else {
+                let prev = keyed[j]
+                // Does prev DOMINATE cur (i.e. prev should be earlier
+                // than cur in the sorted output)? If so, cur drops in
+                // at j+1 and we're done.
+                let prev_dominates = 0
+                if dir == ORD_DESC {
+                    if prev[0] > cur[0] {
+                        prev_dominates = 1
+                    } else {
+                        if prev[0] == cur[0] {
+                            // Tiebreak: smaller atom_id earlier.
+                            if prev[1] <= cur[1] { prev_dominates = 1 }
+                        }
+                    }
+                } else {
+                    if prev[0] < cur[0] {
+                        prev_dominates = 1
+                    } else {
+                        if prev[0] == cur[0] {
+                            if prev[1] <= cur[1] { prev_dominates = 1 }
+                        }
+                    }
+                }
+                if prev_dominates == 1 {
+                    list_set(keyed, j + 1, cur)
+                    placed = 1
+                } else {
+                    // Shift prev right; keep walking left.
+                    list_set(keyed, j + 1, prev)
+                    j = j - 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    let out = list_new()
+    let m = 0
+    while m < n {
+        push(out, keyed[m][2])
+        m = m + 1
+    }
+    return out
+}
+
 // ---- public executor API -------------------------------------------------
 //
 // kg_query_execute(kg, parsed_query) -> list of bindings.
@@ -1330,20 +1903,15 @@ fn kg_query_execute(kg, parsed_query) {
     // row to extend from).
     let bindings = list_new()
     push(bindings, binding_new())
-    let last_atom_var = ""
-    let pi = 0
-    while pi < len(patterns) {
-        let node = patterns[pi]
-        let kind = node[0]
-        if kind == PAT_TRIPLE {
-            let pair = _qry_exec_triple(kg, node, bindings, last_atom_var)
-            bindings = pair[0]
-            if len(pair[1]) > 0 { last_atom_var = pair[1] }
-        }
-        if kind == PAT_FILTER {
-            bindings = _qry_exec_filter(kg, node, bindings, last_atom_var)
-        }
-        pi = pi + 1
+    let pair = _qry_exec_patterns(kg, patterns, bindings, "")
+    bindings = pair[0]
+    let last_atom_var = pair[1]
+    // R16F: apply ORDER BY before LIMIT. Skip sorting when no ORDER BY
+    // was given (the absent sentinel: present_flag == 0).
+    if kg_query_orderby_has(parsed_query) == 1 {
+        let field = kg_query_orderby_field(parsed_query)
+        let dir   = kg_query_orderby_dir(parsed_query)
+        bindings = _qry_apply_order_by(kg, bindings, field, dir, last_atom_var)
     }
     // Apply LIMIT.
     if limit < len(bindings) {
@@ -1391,7 +1959,7 @@ fn _qry_format_binding(b, vars) {
 
 fn kg_query_cmd(kg, arg) {
     if len(arg) == 0 {
-        io_println("usage: /query <SPARQL_string>  -- e.g. /query SELECT ?a WHERE { ?a kind FACT . } LIMIT 5")
+        io_println("usage: /query <SPARQL_string>  -- e.g. /query SELECT ?a WHERE { ?a kind FACT . } ORDER BY DESC(alpha) LIMIT 5  (supports OPTIONAL, UNION, ORDER BY -- R16F)")
         io_println("QUERY store_size=" + int_to_str(kg_atom_count(kg)))
         return 1
     }
