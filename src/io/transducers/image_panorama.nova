@@ -1,0 +1,1082 @@
+// CrossEngin io/transducers: image-pair panorama stitching (R22D).
+//
+// Purpose
+//   CrossEngin's CV pipeline already lands feature DETECTION + MATCHING
+//   (R5C SIFT 128-D + Lowe ratio, R6D ORB 256-bit BRIEF + Hamming ratio)
+//   and a host of structural extractors (Harris corners, Sobel/Canny
+//   edges, HOG dense descriptor, LBP texture, segmentation). What was
+//   missing is a downstream APPLICATION the matched features feed into:
+//   given two overlapping photographs, recover the homography that maps
+//   one image's pixels into the other's frame and combine them into a
+//   single seamless mosaic. R22D ships the single-pair version of this
+//   pipeline -- the classical 4-step CV recipe:
+//
+//     1. feature matching   -- pano_match_features (delegates to R5C/R6D)
+//     2. RANSAC homography  -- pano_ransac_homography
+//     3. forward warp       -- pano_warp (bilinear from homography^-1)
+//     4. linear blend       -- pano_blend (feather across overlap)
+//
+//   The full convenience entry is `pano_stitch(left, right, w, h)` which
+//   composes all four stages and emits PGM-P5 bytes.
+//
+// Algorithm (textbook, integer-only)
+//   * pano_match_features: run ORB-detect or SIFT-detect on both images,
+//     run the matching ratio test (Lowe), and re-emit each surviving
+//     match as a 4-tuple [x_a, y_a, x_b, y_b] in the original image
+//     coordinate frames. The descriptor space is hidden from the caller.
+//   * pano_ransac_homography (DLT + RANSAC):
+//       for max_iterations iterations:
+//         - sample 4 random correspondence indices
+//         - solve the 8x8 linear system for the 8 homography parameters
+//           (h33 fixed to 1000 in milli-units; everything else floats)
+//         - score the candidate by counting matches within threshold_px
+//           reprojection error
+//         - keep the candidate with the largest inlier count
+//       Return [H_milli (9-int row-major matrix), inlier_count].
+//   * pano_warp (backward warp + bilinear sampling): for every pixel in
+//     the OUTPUT frame compute its source coordinate via the
+//     inverse homography, then bilinear-sample the source image at that
+//     fractional source coordinate. Border = 0 (black).
+//   * pano_blend: weighted average per pixel. When BOTH inputs have a
+//     valid sample at (x, y) we average 50/50 (linear blend); when only
+//     one has a valid sample we pass it through verbatim.
+//   * pano_stitch: builds an OUTPUT canvas the union of (image_a in its
+//     native frame) + (image_b warped into image_a's frame), runs the
+//     stage-2 homography (defaulting to "image_b is to the right of image_a"
+//     when feature matching collapses), blends, emits PGM-P5 bytes.
+//
+// Public API
+//   pano_match_features(image_a, image_b, w, h, use_orb_or_sift) ->
+//       list of [xa, ya, xb, yb] correspondences in IMAGE coordinates.
+//       use_orb_or_sift: PANO_USE_ORB (=1, default) or PANO_USE_SIFT (=2).
+//   pano_ransac_homography(matches, threshold_px, max_iterations) ->
+//       [H_milli_9, inlier_count] where H_milli_9 is a 9-int row-major
+//       3x3 matrix (each cell scaled by 1000 milli-units; identity is
+//       [1000,0,0, 0,1000,0, 0,0,1000]).
+//   pano_warp(image, w, h, H_milli, out_w, out_h) ->
+//       int byte buffer (caller-frees) of size out_w*out_h, raw grayscale.
+//   pano_blend(image_a, image_b_warped, w, h) ->
+//       PGM-P5 bytes (header + pixels) of size pano_pgm_size(w, h).
+//   pano_stitch(image_a, image_b, w, h) ->
+//       PGM-P5 bytes of the stitched mosaic (or 0 on failure).
+//   pano_pgm_size(width, height) -> int
+//   pano_save_pgm(pgm_bytes, total_len, path) -> 1 on success, 0 on fail
+//   pano_pgm_args(arg) -> chat admin string for "/pano <left> <right>"
+//   pano_homography_identity() -> the milli-unit identity homography
+//   pano_homography_translation(tx, ty) -> milli-unit translation
+//   pano_inlier_count(result) / pano_homography(result) -- accessors
+//
+// Caps
+//   * Max input dim 256 per axis (matches the R5C SIFT + R6D ORB caps).
+//   * Max output dim 512 per axis (a single overlap pair can produce a
+//     2x-wide mosaic when image_b sits beside image_a).
+//   * RANSAC max iterations capped at PANO_RANSAC_MAX_ITERS (=500).
+//   * Reprojection threshold capped at PANO_RANSAC_MAX_THRESHOLD (=20px).
+//
+// Honest scope note
+//   Real panorama stitching benchmarks use bundle adjustment +
+//   multi-band blending + cylindrical/spherical warping. R22D ships the
+//   SINGLE-PAIR homography + LINEAR blend -- the core pipeline.
+//   Multi-image panoramas (N > 2) and multi-band blending are R22D.2
+//   follow-ups.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, int_to_str, char_at,
+//   substr, str_eq, sys_open, sys_write, sys_fsync, sys_close.
+// CrossEngin dependencies: image_pgm.nova (PGM-P5 decode + helpers),
+//   image_sift.nova (SIFT keypoints + descriptors + matcher),
+//   image_orb.nova (ORB keypoints + descriptors + matcher).
+
+import "std/syscall"
+import "image_pgm.nova"
+import "image_sift.nova"
+import "image_orb.nova"
+
+// ---- format constants ----------------------------------------------------
+
+// Caps. The input image cap matches the R5C SIFT + R6D ORB caps so the
+// detector half cannot trip a different per-axis limit. The output cap
+// is 2x larger so the stitched mosaic can hold two side-by-side inputs
+// at their native resolution.
+let PANO_MAX_DIM         = 256
+let PANO_MAX_OUT_DIM     = 512
+let PANO_MAX_PIXEL_AREA  = 65536        // 256*256 -- input
+let PANO_MAX_OUT_AREA    = 262144       // 512*512 -- output
+
+// Detector selector. 1 = ORB (faster, integer-only descriptor), 2 = SIFT.
+let PANO_USE_ORB  = 1
+let PANO_USE_SIFT = 2
+
+// RANSAC bounds.
+let PANO_RANSAC_MAX_ITERS     = 500
+let PANO_RANSAC_MAX_THRESHOLD = 20      // pixels
+let PANO_RANSAC_MIN_SAMPLES   = 4       // a 3x3 homography needs >= 4 pts
+let PANO_RANSAC_DEFAULT_ITERS = 200
+let PANO_RANSAC_DEFAULT_THRESH = 3
+
+// Homography fixed-point scale. All H matrix cells are stored in
+// "milli" units: identity has H[0]=1000, H[4]=1000, H[8]=1000.
+let PANO_H_MILLI = 1000
+
+// Default save path for the stitched mosaic.
+let PANO_OUTPUT_PATH = "/tmp/stitched.pgm"
+let PANO_FILE_MODE   = 420   // 0644
+
+// Output canvas geometry: image_a goes in the left half, image_b warped
+// into the right half. The canvas is 2*W - overlap wide; we keep the
+// horizontal stride simple and lay out the canvas as a side-by-side
+// 2*W-wide buffer (and clamp to PANO_MAX_OUT_DIM).
+let PANO_DEFAULT_OVERLAP_PX = 10
+
+// ---- match-pair record slot indices --------------------------------------
+
+let PANO_MP_XA = 0
+let PANO_MP_YA = 1
+let PANO_MP_XB = 2
+let PANO_MP_YB = 3
+
+// ---- result-tuple slot indices -------------------------------------------
+
+let PANO_R_H        = 0
+let PANO_R_INLIERS  = 1
+
+// ---- homography helpers (milli-unit 3x3 matrices) -----------------------
+
+// pano_homography_identity: returns the 9-element milli-unit identity
+// matrix. Row-major: [m00 m01 m02 m10 m11 m12 m20 m21 m22] where
+// m00=m11=m22=1000.
+fn pano_homography_identity() {
+    let h = list_new()
+    push(h, PANO_H_MILLI)   ; push(h, 0)              ; push(h, 0)
+    push(h, 0)              ; push(h, PANO_H_MILLI)   ; push(h, 0)
+    push(h, 0)              ; push(h, 0)              ; push(h, PANO_H_MILLI)
+    return h
+}
+
+// pano_homography_translation: returns the 9-element milli-unit
+// translation matrix. Mathematically:
+//   [ 1  0  tx ]
+//   [ 0  1  ty ]
+//   [ 0  0  1  ]
+// in milli-units: m00=m11=m22=1000, m02=tx*1000 (because pixel
+// coordinates are stored as plain ints, the translation offset stays
+// in pixel * milli units).
+fn pano_homography_translation(tx, ty) {
+    let h = list_new()
+    push(h, PANO_H_MILLI)   ; push(h, 0)              ; push(h, int_mul(tx, PANO_H_MILLI))
+    push(h, 0)              ; push(h, PANO_H_MILLI)   ; push(h, int_mul(ty, PANO_H_MILLI))
+    push(h, 0)              ; push(h, 0)              ; push(h, PANO_H_MILLI)
+    return h
+}
+
+// pano_homography_apply(H_milli, x, y) -> [x', y']
+// Apply the 3x3 homography to the integer pixel coordinate (x, y) and
+// return the resulting pixel coordinate (also integer; the milli-unit
+// scaling is folded out by dividing back through PANO_H_MILLI).
+//   [x'*w]   [ m00 m01 m02 ] [x]
+//   [y'*w] = [ m10 m11 m12 ] [y]
+//   [   w]   [ m20 m21 m22 ] [1]
+// Result is divided by w (the homogeneous denominator). Both numerator
+// and denominator are in milli; the ratio is plain pixel ints again.
+fn pano_homography_apply(H, x, y) {
+    let m00 = H[0] ; let m01 = H[1] ; let m02 = H[2]
+    let m10 = H[3] ; let m11 = H[4] ; let m12 = H[5]
+    let m20 = H[6] ; let m21 = H[7] ; let m22 = H[8]
+    // Numerator: m00*x + m01*y + m02 (each component in milli, sum stays
+    // in milli). int_mul is the Bug-A-safe path; coordinates can reach
+    // 256 and matrix cells reach ~1e6 in milli so the product can clear
+    // 2^20 (gotcha #11 trap).
+    let nx = int_add(int_add(int_mul(m00, x), int_mul(m01, y)), m02)
+    let ny = int_add(int_add(int_mul(m10, x), int_mul(m11, y)), m12)
+    let nw = int_add(int_add(int_mul(m20, x), int_mul(m21, y)), m22)
+    let out = list_new()
+    if nw == 0 {
+        // Degenerate -- the homography projects this point to infinity.
+        // Return (0, 0) so callers can defensively skip the pixel.
+        push(out, 0) ; push(out, 0)
+        return out
+    }
+    // We divide a milli numerator by a milli denominator: the
+    // PANO_H_MILLI cancels exactly (so we never lose precision to a
+    // double-divide).
+    let xr = nx / nw
+    let yr = ny / nw
+    push(out, xr)
+    push(out, yr)
+    return out
+}
+
+// pano_homography_invert(H_milli) -> H_milli^-1
+// Compute the inverse of a 3x3 homography in milli-units via the
+// classical adjugate / determinant formula. Returns a 9-element list of
+// milli-unit ints (same scale as the input). On a degenerate / singular
+// homography we return identity (a safe fallback the caller can detect
+// via determinant == 0 if it cares to check).
+fn pano_homography_invert(H) {
+    let a = H[0] ; let b = H[1] ; let c = H[2]
+    let d = H[3] ; let e = H[4] ; let f = H[5]
+    let g = H[6] ; let h = H[7] ; let i = H[8]
+    // Cofactors (each one in milli^2 -- two milli-scaled multiplies).
+    let A = int_sub(int_mul(e, i), int_mul(f, h))
+    let B = int_sub(int_mul(f, g), int_mul(d, i))
+    let C = int_sub(int_mul(d, h), int_mul(e, g))
+    let D = int_sub(int_mul(c, h), int_mul(b, i))
+    let E = int_sub(int_mul(a, i), int_mul(c, g))
+    let F = int_sub(int_mul(b, g), int_mul(a, h))
+    let G = int_sub(int_mul(b, f), int_mul(c, e))
+    let HH = int_sub(int_mul(c, d), int_mul(a, f))
+    let I = int_sub(int_mul(a, e), int_mul(b, d))
+    // Determinant in milli^3 (we'll divide back through one
+    // PANO_H_MILLI factor to land in milli^2 alongside the cofactors,
+    // then again at the end to land back at milli).
+    let det_milli3 = int_add(int_add(int_mul(a, A), int_mul(b, B)), int_mul(c, C))
+    if det_milli3 == 0 {
+        return pano_homography_identity()
+    }
+    // The inverse is (1/det) * adjugate. Cofactors are in milli^2,
+    // determinant is in milli^3. To land the result in milli we
+    // multiply each cofactor by milli^2 then divide by det_milli3:
+    //   invH[i]_milli = (cofactor_milli2 * PANO_H_MILLI^2) / det_milli3.
+    // Both factors are bounded (cofactor up to ~(1000*1000)*4 = 4e6,
+    // milli^2 = 1e6, so the product reaches ~4e12 -- well above 2^20,
+    // so the int_mul Bug-A path is REQUIRED).
+    let scale_sq = int_mul(PANO_H_MILLI, PANO_H_MILLI)
+    let out = list_new()
+    push(out, int_mul(A, scale_sq) / det_milli3)
+    push(out, int_mul(D, scale_sq) / det_milli3)
+    push(out, int_mul(G, scale_sq) / det_milli3)
+    push(out, int_mul(B, scale_sq) / det_milli3)
+    push(out, int_mul(E, scale_sq) / det_milli3)
+    push(out, int_mul(HH, scale_sq) / det_milli3)
+    push(out, int_mul(C, scale_sq) / det_milli3)
+    push(out, int_mul(F, scale_sq) / det_milli3)
+    push(out, int_mul(I, scale_sq) / det_milli3)
+    return out
+}
+
+// ---- match-pair construction --------------------------------------------
+
+fn _pano_make_match(xa, ya, xb, yb) {
+    let m = list_new()
+    push(m, xa) ; push(m, ya) ; push(m, xb) ; push(m, yb)
+    return m
+}
+
+// pano_match_features(image_a, image_b, w, h, use_orb_or_sift) ->
+//   list of [xa, ya, xb, yb] correspondences. Internally runs the
+//   selected detector + descriptor pipeline on BOTH images and
+//   re-emits the matches with the descriptor space hidden from the
+//   caller.
+//
+// On any degenerate input (zero pointers, out-of-bounds dims, < 32
+// per axis, etc.) returns an empty list -- the same shape downstream
+// callers see when feature matching collapses on a uniform image.
+fn pano_match_features(image_a, image_b, w, h, use_orb_or_sift) {
+    let empty = list_new()
+    if image_a == 0 { return empty }
+    if image_b == 0 { return empty }
+    if w <= 0 { return empty }
+    if h <= 0 { return empty }
+    if w > PANO_MAX_DIM { return empty }
+    if h > PANO_MAX_DIM { return empty }
+    let area = int_mul(w, h)
+    if area > PANO_MAX_PIXEL_AREA { return empty }
+    let mode = use_orb_or_sift
+    if mode != PANO_USE_SIFT { mode = PANO_USE_ORB }
+    if mode == PANO_USE_ORB {
+        // R6D ORB path -- the integer-only descriptor + Hamming matcher.
+        let ra = orb_detect(image_a, w, h, ORB_HARD_MAX)
+        let rb = orb_detect(image_b, w, h, ORB_HARD_MAX)
+        let kps_a = orb_result_keypoints(ra)
+        let kps_b = orb_result_keypoints(rb)
+        let descs_a = orb_result_descriptors(ra)
+        let descs_b = orb_result_descriptors(rb)
+        let matches = orb_match(kps_a, descs_a, kps_b, descs_b,
+                                ORB_DEFAULT_RATIO_MILLI)
+        // Re-emit as [xa, ya, xb, yb] in image coordinates.
+        let out = list_new()
+        let i = 0
+        let nm = len(matches)
+        while i < nm {
+            let m = matches[i]
+            let ia = m[0]
+            let ib = m[1]
+            let kpa = kps_a[ia]
+            let kpb = kps_b[ib]
+            push(out, _pano_make_match(orb_kp_x(kpa), orb_kp_y(kpa),
+                                       orb_kp_x(kpb), orb_kp_y(kpb)))
+            i = int_add(i, 1)
+        }
+        return out
+    }
+    // R5C SIFT path. Detect on both, describe on both, match A->B.
+    let kps_a = sift_keypoints(image_a, w, h, SIFT_HARD_MAX)
+    let kps_b = sift_keypoints(image_b, w, h, SIFT_HARD_MAX)
+    let descs_a = sift_describe_all(image_a, w, h, kps_a)
+    let descs_b = sift_describe_all(image_b, w, h, kps_b)
+    // sift_match_keypoints expects parallel descriptor-VECTOR lists,
+    // but sift_describe_all returns [vec, valid] pairs. Unwrap the
+    // vec slot here so we hand the matcher raw 128-int vectors.
+    let vecs_a = list_new()
+    let i = 0
+    let n_a = len(descs_a)
+    while i < n_a {
+        push(vecs_a, sift_descriptor_vec(descs_a[i]))
+        i = int_add(i, 1)
+    }
+    let vecs_b = list_new()
+    i = 0
+    let n_b = len(descs_b)
+    while i < n_b {
+        push(vecs_b, sift_descriptor_vec(descs_b[i]))
+        i = int_add(i, 1)
+    }
+    let matches = sift_match_keypoints(kps_a, vecs_a, kps_b, vecs_b,
+                                       SIFT_DESC_DEFAULT_RATIO)
+    let out = list_new()
+    let j = 0
+    let nm = len(matches)
+    while j < nm {
+        let m = matches[j]
+        let ia = m[0]
+        let ib = m[1]
+        let kpa = kps_a[ia]
+        let kpb = kps_b[ib]
+        push(out, _pano_make_match(sift_kp_x(kpa), sift_kp_y(kpa),
+                                   sift_kp_x(kpb), sift_kp_y(kpb)))
+        j = int_add(j, 1)
+    }
+    return out
+}
+
+// ---- RANSAC ---------------------------------------------------------------
+//
+// Linear-congruential PRNG (Numerical Recipes constants). The RANSAC
+// 4-sample picker needs a deterministic but well-distributed integer
+// stream; NOVA's `time()` provides only second resolution so we walk
+// our own LCG state from a small seed.
+
+fn _pano_lcg_step(state) {
+    return int_add(int_mul(state, 1103515245), 12345)
+}
+
+// Pick a random index in [0, n). state is the LCG state going in;
+// returned tuple is [index, new_state]. We extract a 31-bit non-negative
+// value via the standard `(state >> 16) & 0x7FFF` shape but using a
+// modulo instead of a shift (NOVA has no native shift operator at the
+// boundary cap that matters here).
+fn _pano_lcg_pick(state, n) {
+    let s = _pano_lcg_step(state)
+    let s_pos = s
+    if s_pos < 0 { s_pos = 0 - s_pos }
+    let idx = s_pos % n
+    if idx < 0 { idx = 0 }
+    let pair = list_new()
+    push(pair, idx)
+    push(pair, s)
+    return pair
+}
+
+// Solve a 3x3 homography from 4 correspondences via the Direct Linear
+// Transform (DLT). The standard 8x9 system Ax = 0 reduces to 8 linear
+// equations in 8 unknowns when we fix h33 = 1 (h33 != 0 for any
+// non-degenerate homography). We solve via Gaussian elimination on the
+// 8x9 augmented matrix [A | 0] with h33 substituted out, then back-
+// substitute. All arithmetic is in milli-units; we work in milli^N as
+// the elimination proceeds and normalize at the end.
+//
+// Inputs: pts -- a 4-element list of [xa, ya, xb, yb] correspondences.
+//         The match maps (xa, ya) -> (xb, yb) (image_a points map to
+//         image_b points).
+// Output: 9-element milli-unit homography (or identity if the system is
+//         degenerate / co-linear sample).
+fn _pano_solve_homography_dlt(pts) {
+    if len(pts) < 4 {
+        return pano_homography_identity()
+    }
+    // Build the 8x9 matrix. Row layout per correspondence (xa,ya)->(xb,yb):
+    //   [ xa   ya    1   0    0   0   -xb*xa  -xb*ya   xb ]
+    //   [  0    0    0   xa   ya   1   -yb*xa  -yb*ya   yb ]
+    // Final column is the right-hand side (= 0 form, but we want to
+    // solve for the 8 unknowns h0..h7 with h8 = 1, so we keep the 9th
+    // column as the RHS by negating the (xb / yb) term and moving it
+    // across). Equivalently we use the 8x9 augmented system:
+    //   [ xa   ya    1   0    0   0   -xb*xa  -xb*ya  |  xb ]
+    //   [  0    0    0   xa   ya   1   -yb*xa  -yb*ya  |  yb ]
+    let A = list_new()
+    let i = 0
+    while i < 4 {
+        let p = pts[i]
+        let xa = p[0]
+        let ya = p[1]
+        let xb = p[2]
+        let yb = p[3]
+        // First row: 9 ints.
+        let row1 = list_new()
+        push(row1, xa)
+        push(row1, ya)
+        push(row1, 1)
+        push(row1, 0)
+        push(row1, 0)
+        push(row1, 0)
+        push(row1, int_sub(0, int_mul(xb, xa)))
+        push(row1, int_sub(0, int_mul(xb, ya)))
+        push(row1, xb)
+        push(A, row1)
+        // Second row: 9 ints.
+        let row2 = list_new()
+        push(row2, 0)
+        push(row2, 0)
+        push(row2, 0)
+        push(row2, xa)
+        push(row2, ya)
+        push(row2, 1)
+        push(row2, int_sub(0, int_mul(yb, xa)))
+        push(row2, int_sub(0, int_mul(yb, ya)))
+        push(row2, yb)
+        push(A, row2)
+        i = int_add(i, 1)
+    }
+    // Gaussian elimination. We carry the rows in milli-units throughout;
+    // the elimination only does add / sub / mul / div with constant
+    // factors, so the relative scale stays consistent.
+    //
+    // We use a milli-fixed-point scratchpad so the division during
+    // elimination preserves resolution. Multiply every row by
+    // PANO_H_MILLI once at the start.
+    let M = list_new()
+    let r = 0
+    while r < 8 {
+        let row = A[r]
+        let scaled = list_new()
+        let c = 0
+        while c < 9 {
+            push(scaled, int_mul(row[c], PANO_H_MILLI))
+            c = int_add(c, 1)
+        }
+        push(M, scaled)
+        r = int_add(r, 1)
+    }
+    // Forward elimination with partial pivoting.
+    let k = 0
+    while k < 8 {
+        // Find pivot row (max |M[r][k]| for r >= k).
+        let pivot = k
+        let pivot_v = M[k][k]
+        if pivot_v < 0 { pivot_v = 0 - pivot_v }
+        let r2 = int_add(k, 1)
+        while r2 < 8 {
+            let v = M[r2][k]
+            if v < 0 { v = 0 - v }
+            if v > pivot_v {
+                pivot = r2
+                pivot_v = v
+            }
+            r2 = int_add(r2, 1)
+        }
+        if pivot_v == 0 {
+            // Singular system (e.g., co-linear correspondences). Fall back
+            // to identity so the caller can detect via inlier count.
+            return pano_homography_identity()
+        }
+        if pivot != k {
+            // Swap rows k and pivot.
+            let tmp = M[k]
+            list_set(M, k, M[pivot])
+            list_set(M, pivot, tmp)
+        }
+        // Eliminate column k from rows > k.
+        let pk = M[k][k]
+        let r3 = int_add(k, 1)
+        while r3 < 8 {
+            let row_r3 = M[r3]
+            let factor = row_r3[k]
+            if factor != 0 {
+                // Subtract (factor/pk) * row_k from row_r3. To stay in
+                // integer math we multiply BOTH operands by pk, eliminate
+                // column k, then we've effectively scaled the row by pk.
+                let row_k = M[k]
+                let c2 = k
+                while c2 < 9 {
+                    let new_val = int_sub(int_mul(row_r3[c2], pk),
+                                          int_mul(factor, row_k[c2]))
+                    // Divide back by pk to undo the scaling for this row.
+                    // pk is non-zero by the pivot check above.
+                    list_set(row_r3, c2, new_val / pk)
+                    c2 = int_add(c2, 1)
+                }
+            }
+            r3 = int_add(r3, 1)
+        }
+        k = int_add(k, 1)
+    }
+    // Back substitution.
+    let x_milli = list_new()
+    let q = 0
+    while q < 8 {
+        push(x_milli, 0)
+        q = int_add(q, 1)
+    }
+    let row_idx = 7
+    while row_idx >= 0 {
+        let row = M[row_idx]
+        let acc = row[8]
+        let c3 = int_add(row_idx, 1)
+        while c3 < 8 {
+            acc = int_sub(acc, int_mul(row[c3], x_milli[c3]) / PANO_H_MILLI)
+            c3 = int_add(c3, 1)
+        }
+        let diag = row[row_idx]
+        if diag == 0 {
+            return pano_homography_identity()
+        }
+        list_set(x_milli, row_idx, int_mul(acc, PANO_H_MILLI) / diag)
+        row_idx = int_sub(row_idx, 1)
+    }
+    // Pack the 8 solved unknowns + h22 = 1 (in milli, 1000) into the
+    // 9-element homography. The 8 unknowns we just solved ARE in milli
+    // already.
+    let H = list_new()
+    let k2 = 0
+    while k2 < 8 {
+        push(H, x_milli[k2])
+        k2 = int_add(k2, 1)
+    }
+    push(H, PANO_H_MILLI)
+    return H
+}
+
+// Count inliers for the given homography over the match list. An inlier
+// is a match (xa, ya) -> (xb, yb) such that |H*(xa,ya) - (xb,yb)| <
+// threshold_px in EITHER axis (Chebyshev distance, since computing L2
+// would require sqrt per match).
+fn _pano_count_inliers(H, matches, threshold_px) {
+    let count = 0
+    let i = 0
+    let n = len(matches)
+    while i < n {
+        let m = matches[i]
+        let pred = pano_homography_apply(H, m[0], m[1])
+        let dx = int_sub(pred[0], m[2])
+        if dx < 0 { dx = 0 - dx }
+        let dy = int_sub(pred[1], m[3])
+        if dy < 0 { dy = 0 - dy }
+        if dx <= threshold_px {
+            if dy <= threshold_px {
+                count = int_add(count, 1)
+            }
+        }
+        i = int_add(i, 1)
+    }
+    return count
+}
+
+// pano_ransac_homography(matches, threshold_px, max_iterations)
+// -> [H_milli, inlier_count]
+// Standard RANSAC: sample 4 random correspondences per iteration, fit
+// a candidate homography via DLT, score by inlier count, keep the best.
+// When the best candidate covers ALL matches (perfect fit) we early-
+// exit. Returns identity + 0 inliers when fewer than 4 matches are
+// available (the floor below which DLT is unsolvable).
+fn pano_ransac_homography(matches, threshold_px, max_iterations) {
+    let result = list_new()
+    let n = len(matches)
+    if n < PANO_RANSAC_MIN_SAMPLES {
+        push(result, pano_homography_identity())
+        push(result, 0)
+        return result
+    }
+    // Clamp inputs into safe ranges.
+    let thr = threshold_px
+    if thr < 0 { thr = 0 }
+    if thr > PANO_RANSAC_MAX_THRESHOLD { thr = PANO_RANSAC_MAX_THRESHOLD }
+    let iters = max_iterations
+    if iters < 1 { iters = PANO_RANSAC_DEFAULT_ITERS }
+    if iters > PANO_RANSAC_MAX_ITERS { iters = PANO_RANSAC_MAX_ITERS }
+    let best_inliers = 0
+    let best_H = pano_homography_identity()
+    // Seed the LCG. Use a small constant so the unit tests are
+    // deterministic; mixing in `time()` would be tempting but would
+    // make reproducing failures painful.
+    let state = 19937
+    let it = 0
+    let perfect = 0
+    while it < iters {
+        if perfect == 0 {
+            // Pick 4 distinct indices via rejection sampling. For tiny
+            // n we just walk i, j, k, l in order to guarantee we don't
+            // spin on duplicate-avoidance.
+            let i0 = 0
+            let i1 = 0
+            let i2 = 0
+            let i3 = 0
+            if n == 4 {
+                i0 = 0
+                i1 = 1
+                i2 = 2
+                i3 = 3
+            } else {
+                let r0 = _pano_lcg_pick(state, n)
+                i0 = r0[0]
+                state = r0[1]
+                let r1 = _pano_lcg_pick(state, n)
+                i1 = r1[0]
+                state = r1[1]
+                // Avoid duplicates by walking forward modulo n.
+                if i1 == i0 { i1 = int_add(i1, 1) % n }
+                let r2 = _pano_lcg_pick(state, n)
+                i2 = r2[0]
+                state = r2[1]
+                if i2 == i0 { i2 = int_add(i2, 1) % n }
+                if i2 == i1 { i2 = int_add(i2, 1) % n }
+                if i2 == i0 { i2 = int_add(i2, 1) % n }
+                let r3 = _pano_lcg_pick(state, n)
+                i3 = r3[0]
+                state = r3[1]
+                if i3 == i0 { i3 = int_add(i3, 1) % n }
+                if i3 == i1 { i3 = int_add(i3, 1) % n }
+                if i3 == i2 { i3 = int_add(i3, 1) % n }
+                if i3 == i0 { i3 = int_add(i3, 1) % n }
+            }
+            let sample = list_new()
+            push(sample, matches[i0])
+            push(sample, matches[i1])
+            push(sample, matches[i2])
+            push(sample, matches[i3])
+            let H = _pano_solve_homography_dlt(sample)
+            let inl = _pano_count_inliers(H, matches, thr)
+            if inl > best_inliers {
+                best_inliers = inl
+                best_H = H
+                if inl == n {
+                    // Perfect fit -- no need to keep sampling.
+                    perfect = 1
+                }
+            }
+        }
+        it = int_add(it, 1)
+    }
+    push(result, best_H)
+    push(result, best_inliers)
+    return result
+}
+
+// ---- result accessors -----------------------------------------------------
+
+fn pano_homography(result)   { return result[PANO_R_H] }
+fn pano_inlier_count(result) { return result[PANO_R_INLIERS] }
+
+// ---- warp (backward warp + bilinear sampling) -----------------------------
+//
+// pano_warp(image, w, h, H_milli, out_w, out_h) -> int byte buffer ptr
+// of size out_w*out_h. For every pixel (xo, yo) in the OUTPUT frame we
+// compute the SOURCE coordinate via the INVERSE of H, then bilinear-
+// sample the source image at the fractional source coordinate. Out-of-
+// bounds source coordinates emit pixel value 0 (black).
+
+fn _pano_bilinear_sample(image, w, h, x_milli, y_milli) {
+    // x_milli, y_milli are milli-pixel coordinates. Split into integer
+    // pixel + fractional remainder for the 4-tap interpolation.
+    if x_milli < 0 { return 0 }
+    if y_milli < 0 { return 0 }
+    let xi = x_milli / PANO_H_MILLI
+    let yi = y_milli / PANO_H_MILLI
+    // Out-of-bounds floor / ceil -- bail to black for any partial coverage.
+    if xi < 0 { return 0 }
+    if yi < 0 { return 0 }
+    if xi >= w { return 0 }
+    if yi >= h { return 0 }
+    let x_frac = int_sub(x_milli, int_mul(xi, PANO_H_MILLI))
+    let y_frac = int_sub(y_milli, int_mul(yi, PANO_H_MILLI))
+    let xi1 = int_add(xi, 1)
+    let yi1 = int_add(yi, 1)
+    if xi1 >= w { xi1 = int_sub(w, 1) }
+    if yi1 >= h { yi1 = int_sub(h, 1) }
+    let row0 = int_mul(yi, w)
+    let row1 = int_mul(yi1, w)
+    let p00 = load8(image + int_add(row0, xi))
+    let p10 = load8(image + int_add(row0, xi1))
+    let p01 = load8(image + int_add(row1, xi))
+    let p11 = load8(image + int_add(row1, xi1))
+    let one_minus_xf = int_sub(PANO_H_MILLI, x_frac)
+    let one_minus_yf = int_sub(PANO_H_MILLI, y_frac)
+    // (1-xf)(1-yf)*p00 + xf*(1-yf)*p10 + (1-xf)*yf*p01 + xf*yf*p11
+    let top = int_add(int_mul(one_minus_xf, p00), int_mul(x_frac, p10))
+    let bot = int_add(int_mul(one_minus_xf, p01), int_mul(x_frac, p11))
+    let v = int_add(int_mul(one_minus_yf, top), int_mul(y_frac, bot))
+    // Divide by milli^2 (we multiplied two milli factors).
+    let result = v / int_mul(PANO_H_MILLI, PANO_H_MILLI)
+    if result < 0 { return 0 }
+    if result > 255 { return 255 }
+    return result
+}
+
+fn pano_warp(image, w, h, H, out_w, out_h) {
+    if image == 0 { return 0 }
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    if w > PANO_MAX_DIM { return 0 }
+    if h > PANO_MAX_DIM { return 0 }
+    if out_w <= 0 { return 0 }
+    if out_h <= 0 { return 0 }
+    if out_w > PANO_MAX_OUT_DIM { return 0 }
+    if out_h > PANO_MAX_OUT_DIM { return 0 }
+    let out_area = int_mul(out_w, out_h)
+    if out_area > PANO_MAX_OUT_AREA { return 0 }
+    // We need H_inv so the output pixel maps back to a source pixel.
+    let H_inv = pano_homography_invert(H)
+    let out = alloc(out_area + 1)
+    // Pre-fill output with 0 (black) so any unmapped pixels stay black.
+    let i = 0
+    while i < out_area {
+        store8(out + i, 0)
+        i = int_add(i, 1)
+    }
+    store8(out + out_area, 0)
+    // For each output pixel (xo, yo), compute source (xs, ys) via H_inv.
+    let yo = 0
+    while yo < out_h {
+        let row_off = int_mul(yo, out_w)
+        let xo = 0
+        while xo < out_w {
+            // Apply H_inv to (xo, yo). The result is a (xs, ys) integer
+            // pair; we want sub-pixel precision so we compute in milli.
+            let m00 = H_inv[0] ; let m01 = H_inv[1] ; let m02 = H_inv[2]
+            let m10 = H_inv[3] ; let m11 = H_inv[4] ; let m12 = H_inv[5]
+            let m20 = H_inv[6] ; let m21 = H_inv[7] ; let m22 = H_inv[8]
+            let nx = int_add(int_add(int_mul(m00, xo), int_mul(m01, yo)), m02)
+            let ny = int_add(int_add(int_mul(m10, xo), int_mul(m11, yo)), m12)
+            let nw = int_add(int_add(int_mul(m20, xo), int_mul(m21, yo)), m22)
+            if nw != 0 {
+                // nx, ny are in milli; nw is in milli too. To stay in
+                // milli-coordinates for the bilinear sample we need
+                // (nx * PANO_H_MILLI) / nw -- but that pushes us through
+                // 2^20. We have to do it via int_mul to dodge gotcha #11.
+                let xs_milli = int_mul(nx, PANO_H_MILLI) / nw
+                let ys_milli = int_mul(ny, PANO_H_MILLI) / nw
+                let v = _pano_bilinear_sample(image, w, h, xs_milli, ys_milli)
+                store8(out + int_add(row_off, xo), v)
+            }
+            xo = int_add(xo, 1)
+        }
+        yo = int_add(yo, 1)
+    }
+    return out
+}
+
+// ---- blend ----------------------------------------------------------------
+//
+// pano_blend(image_a, image_b_warped, w, h) -> PGM-P5 bytes
+// Linear blend in the OVERLAP region: when both inputs have a valid
+// (non-zero) sample at (x, y) we average 50/50; when only one is non-
+// zero we pass it through; when both are zero the output is zero.
+//
+// "valid" is defined as "pixel > 0" for the simple case (because both
+// warp + caller-side fixture have black border = 0). A more nuanced
+// blend would maintain a separate alpha-mask buffer; that lift is the
+// natural R22D.2 follow-up.
+
+fn pano_blend(image_a, image_b_warped, w, h) {
+    if image_a == 0 { return 0 }
+    if image_b_warped == 0 { return 0 }
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    if w > PANO_MAX_OUT_DIM { return 0 }
+    if h > PANO_MAX_OUT_DIM { return 0 }
+    let area = int_mul(w, h)
+    if area > PANO_MAX_OUT_AREA { return 0 }
+    let total = pano_pgm_size(w, h)
+    let buf = alloc(total + 1)
+    let off = _pano_write_pgm_header(buf, 0, w, h)
+    let i = 0
+    while i < area {
+        let a = load8(image_a + i)
+        let b = load8(image_b_warped + i)
+        let v = 0
+        if a > 0 {
+            if b > 0 {
+                // Both valid -- 50/50 average.
+                v = int_add(a, b) / 2
+            } else {
+                v = a
+            }
+        } else {
+            if b > 0 {
+                v = b
+            }
+        }
+        if v < 0 { v = 0 }
+        if v > 255 { v = 255 }
+        store8(buf + off, v)
+        off = int_add(off, 1)
+        i = int_add(i, 1)
+    }
+    store8(buf + total, 0)
+    return buf
+}
+
+// ---- stitch (full pipeline) -----------------------------------------------
+//
+// pano_stitch(image_a, image_b, w, h) -> PGM-P5 bytes of the stitched
+// panorama. Pipeline: match features (ORB) -> RANSAC homography (with
+// the default-when-no-matches translation H=[1,0,w-overlap;0,1,0;0,0,1])
+// -> warp B into A's canvas (2*W - overlap wide) -> blend.
+//
+// When the feature matcher finds < 4 correspondences (e.g., uniform
+// inputs), the pipeline falls back to a known translation that
+// places B to the right of A with PANO_DEFAULT_OVERLAP_PX of overlap.
+// This is the operator-friendly behaviour the brief specifies: a
+// graceful empty-feature result should still produce a recognisable
+// side-by-side mosaic, not a black canvas or a failure.
+
+fn pano_stitch(image_a, image_b, w, h) {
+    if image_a == 0 { return 0 }
+    if image_b == 0 { return 0 }
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    if w > PANO_MAX_DIM { return 0 }
+    if h > PANO_MAX_DIM { return 0 }
+    let area = int_mul(w, h)
+    if area > PANO_MAX_PIXEL_AREA { return 0 }
+    let overlap = PANO_DEFAULT_OVERLAP_PX
+    if overlap > w / 2 { overlap = w / 2 }
+    if overlap < 1 { overlap = 1 }
+    let out_w = int_sub(int_mul(w, 2), overlap)
+    if out_w > PANO_MAX_OUT_DIM { out_w = PANO_MAX_OUT_DIM }
+    let out_h = h
+    if out_h > PANO_MAX_OUT_DIM { out_h = PANO_MAX_OUT_DIM }
+    let out_area = int_mul(out_w, out_h)
+    if out_area > PANO_MAX_OUT_AREA { return 0 }
+
+    // Stage 1: feature match (ORB).
+    let matches = pano_match_features(image_a, image_b, w, h, PANO_USE_ORB)
+    let nm = len(matches)
+
+    // Stage 2: RANSAC homography. When < 4 matches, fall back to a
+    // pure translation (image_b lives to the right of image_a, offset
+    // by w - overlap pixels).
+    let H = pano_homography_identity()
+    if nm >= PANO_RANSAC_MIN_SAMPLES {
+        let rh = pano_ransac_homography(matches, PANO_RANSAC_DEFAULT_THRESH,
+                                        PANO_RANSAC_DEFAULT_ITERS)
+        H = pano_homography(rh)
+        // If the inlier count is degenerate (=0 or 1), fall back to
+        // the translation as well -- a single inlier is just noise.
+        if pano_inlier_count(rh) < PANO_RANSAC_MIN_SAMPLES {
+            H = pano_homography_translation(int_sub(w, overlap), 0)
+        }
+    } else {
+        // Fallback: B is to the right of A by (w - overlap) px.
+        // In the OUTPUT canvas, B's pixel (xb, yb) lives at
+        // (xb + w - overlap, yb). The warp's H must map SOURCE coords
+        // (in B's frame) to OUTPUT coords (canvas frame), and the warp
+        // internally inverts H to walk the output->source direction.
+        // So H = translation(+(w-overlap), 0).
+        H = pano_homography_translation(int_sub(w, overlap), 0)
+    }
+
+    // Stage 3: warp B into the output canvas. H maps a B-frame pixel
+    // (xb, yb) to the canvas pixel (xb + w - overlap, yb); the warp
+    // internally walks output pixels backwards through H_inv to recover
+    // each source coordinate and bilinear-samples B there.
+    let warped_b = pano_warp(image_b, w, h, H, out_w, out_h)
+    if warped_b == 0 { return 0 }
+
+    // Build the A canvas: A's pixels copied into the output canvas at
+    // (0, 0), all other pixels zero.
+    let a_canvas = alloc(out_area + 1)
+    let i = 0
+    while i < out_area {
+        store8(a_canvas + i, 0)
+        i = int_add(i, 1)
+    }
+    let y = 0
+    while y < h {
+        let src_row = int_mul(y, w)
+        let dst_row = int_mul(y, out_w)
+        let x = 0
+        while x < w {
+            store8(a_canvas + int_add(dst_row, x),
+                   load8(image_a + int_add(src_row, x)))
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    store8(a_canvas + out_area, 0)
+
+    // Stage 4: blend.
+    return pano_blend(a_canvas, warped_b, out_w, out_h)
+}
+
+// ---- PGM-P5 writing helpers ----------------------------------------------
+
+fn _pano_int_digits(n) {
+    if n <= 0 { return 1 }
+    let d = 0
+    let v = n
+    while v > 0 {
+        d = int_add(d, 1)
+        v = v / 10
+    }
+    return d
+}
+
+fn _pano_write_int_dec(buf, off, n) {
+    if n <= 0 {
+        store8(buf + off, 48)
+        return int_add(off, 1)
+    }
+    let d = _pano_int_digits(n)
+    let v = n
+    let i = int_sub(d, 1)
+    while i >= 0 {
+        store8(buf + off + i, int_add(48, int_sub(v, int_mul(v / 10, 10))))
+        v = v / 10
+        i = int_sub(i, 1)
+    }
+    return int_add(off, d)
+}
+
+fn _pano_pgm_header_len(width, height) {
+    // "P5\n<w> <h>\n255\n":
+    //   "P5"   = 2
+    //   "\n"   = 1
+    //   digits(w)
+    //   " "    = 1
+    //   digits(h)
+    //   "\n"   = 1
+    //   "255"  = 3
+    //   "\n"   = 1
+    return int_add(9, int_add(_pano_int_digits(width), _pano_int_digits(height)))
+}
+
+fn pano_pgm_size(width, height) {
+    if width <= 0 { return 0 }
+    if height <= 0 { return 0 }
+    return int_add(_pano_pgm_header_len(width, height),
+                   int_mul(width, height))
+}
+
+fn _pano_write_pgm_header(buf, off, w, h) {
+    // "P5\n"
+    store8(buf + off, 80) ; off = int_add(off, 1)   // 'P'
+    store8(buf + off, 53) ; off = int_add(off, 1)   // '5'
+    store8(buf + off, 10) ; off = int_add(off, 1)   // '\n'
+    off = _pano_write_int_dec(buf, off, w)
+    store8(buf + off, 32) ; off = int_add(off, 1)   // ' '
+    off = _pano_write_int_dec(buf, off, h)
+    store8(buf + off, 10) ; off = int_add(off, 1)   // '\n'
+    store8(buf + off, 50) ; off = int_add(off, 1)   // '2'
+    store8(buf + off, 53) ; off = int_add(off, 1)   // '5'
+    store8(buf + off, 53) ; off = int_add(off, 1)   // '5'
+    store8(buf + off, 10) ; off = int_add(off, 1)   // '\n'
+    return off
+}
+
+fn pano_save_pgm(pgm_bytes, total_len, path) {
+    if pgm_bytes == 0 { return 0 }
+    if total_len <= 0 { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, PANO_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, pgm_bytes, total_len)
+    if written != total_len {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// ---- chat admin entry point ----------------------------------------------
+//
+// `/pano <left.pgm> <right.pgm>` admin. The chat dispatch calls
+// pano_pgm_args(arg) directly (one io_println); this function does the
+// PGM parse + stitch + save round-trip and emits a single-line result
+// string suitable for io_println.
+
+fn _pano_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn pano_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/pano needs two PATHs -- usage: /pano left.pgm right.pgm)"
+    }
+    let parts = _pano_split_two(arg)
+    let path_a = parts[0]
+    let path_b = parts[1]
+    if len(path_a) == 0 {
+        return "(/pano needs two PATHs -- usage: /pano left.pgm right.pgm)"
+    }
+    if len(path_b) == 0 {
+        return "(/pano needs TWO paths -- got 1)"
+    }
+    let r_a = pgm_parse_file(path_a)
+    let err_a = pgm_result_error(r_a)
+    if len(err_a) > 0 {
+        return "(pano FAILED on left: " + err_a + ")"
+    }
+    let r_b = pgm_parse_file(path_b)
+    let err_b = pgm_result_error(r_b)
+    if len(err_b) > 0 {
+        return "(pano FAILED on right: " + err_b + ")"
+    }
+    let w_a = pgm_result_width(r_a)
+    let h_a = pgm_result_height(r_a)
+    let d_a = pgm_result_data(r_a)
+    let w_b = pgm_result_width(r_b)
+    let h_b = pgm_result_height(r_b)
+    let d_b = pgm_result_data(r_b)
+    // R22D requires equal-shape inputs (the canvas geometry assumes
+    // both images share width + height).
+    if w_a != w_b {
+        return "(pano FAILED: left and right images must have equal width)"
+    }
+    if h_a != h_b {
+        return "(pano FAILED: left and right images must have equal height)"
+    }
+    if w_a > PANO_MAX_DIM {
+        return "(pano FAILED: width " + int_to_str(w_a)
+            + " > " + int_to_str(PANO_MAX_DIM) + " cap; downsample first)"
+    }
+    if h_a > PANO_MAX_DIM {
+        return "(pano FAILED: height " + int_to_str(h_a)
+            + " > " + int_to_str(PANO_MAX_DIM) + " cap; downsample first)"
+    }
+    let matches = pano_match_features(d_a, d_b, w_a, h_a, PANO_USE_ORB)
+    let nm = len(matches)
+    let stitched = pano_stitch(d_a, d_b, w_a, h_a)
+    if stitched == 0 {
+        return "(pano FAILED: stitch returned 0 -- caps tripped or alloc failed)"
+    }
+    let overlap = PANO_DEFAULT_OVERLAP_PX
+    if overlap > w_a / 2 { overlap = w_a / 2 }
+    let out_w = int_sub(int_mul(w_a, 2), overlap)
+    if out_w > PANO_MAX_OUT_DIM { out_w = PANO_MAX_OUT_DIM }
+    let out_h = h_a
+    if out_h > PANO_MAX_OUT_DIM { out_h = PANO_MAX_OUT_DIM }
+    let total = pano_pgm_size(out_w, out_h)
+    let wrote = pano_save_pgm(stitched, total, PANO_OUTPUT_PATH)
+    let wrote_str = "no"
+    if wrote == 1 { wrote_str = "yes" }
+    return "(pano " + int_to_str(w_a) + "x" + int_to_str(h_a)
+        + " -> " + int_to_str(out_w) + "x" + int_to_str(out_h)
+        + " matches=" + int_to_str(nm)
+        + " wrote=" + wrote_str + " path=" + PANO_OUTPUT_PATH + ")"
+}
