@@ -3,6 +3,92 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R18C (this session) -- wake-word detection via DTW on MFCC sequences
+
+**Status: complete -- `src/io/transducers/audio_wakeword.nova` (NEW,
+~530 lines) wires R17B's MFCC + R7F's VAD into the classical
+DTW-against-template wake-word matched filter ("Hey Nova",
+"Computer", etc.).** R17B's `mfcc_compute` produces a frame-by-frame
+13-dim cepstral fingerprint; R18C stores that fingerprint as a
+reference template, runs Dynamic Time Warping (DTW) against it at
+detection time, and gates the result on R7F VAD so pure-silence /
+pure-noise buffers can never trip a false positive even when the
+MFCC distance happens to round to zero.
+
+### Algorithm
+
+`D[i][j] = local_distance(input[i], reference[j]) + min(D[i-1][j],
+D[i][j-1], D[i-1][j-1])` with `D[0][0] = local_distance(input[0],
+reference[0])` and the boundary rows / columns taking only the
+available neighbour. Final distance `= D[N-1][M-1] / (N + M)`,
+path-length normalized so the threshold knob is invariant to
+utterance duration. Local distance is L2² between two 13-dim MFCC
+vectors, **skipping coef 0** (the energy term, so loudness doesn't
+dominate the spectral match) -- the same `mfcc_l2_distance_sq` R17B
+already ships. Everything stays in milli (1000 = 1.0); the final
+DTW distance is in milli² (squared L2 cumulative).
+
+### Public API
+
+- `wake_train_template(wav_path)` -- WAV-to-template (calls R6E
+  capture + R17B MFCC; returns 0 on parse failure).
+- `wake_train_template_from_pcm(pcm, sample_rate)` -- I/O-free variant.
+- `wake_template_save(template, path)` / `wake_template_load(path)`
+  -- text-format persistence (text header + per-frame coefficient
+  rows). Round-trip yields a bit-identical template.
+- `wake_detect(template, audio, sample_rate, threshold_milli)`
+  -> `[detected_bool, dtw_distance_milli, end_frame]`.
+- `wake_dtw_distance(mfcc_a, mfcc_b)` -- exposed primitive.
+- `wake_smooth(detections)` -- 5-frame moving-average for streaming
+  callers.
+
+### Verification (latest run)
+
+- 41 unit assertions in `tests/unit/test_audio_wakeword.nova` (well
+  above the ~25 floor). 20 integration assertions in
+  `tests/integration/scenario_uuu_wakeword.sh`. All green.
+- DTW identical sequences -> 0. DTW length-mismatched but identical
+  content -> 0 (warp path stays on diagonal+horizontal at zero
+  cost). DTW Klatt /ay ey/ vs /uw ow/ -> 202356690 milli².
+- Train + detect on /ay ey/ Klatt fixture: train -> 17 frames @
+  n_mfcc=13 @ 8 kHz. Detect on same audio -> detected=true,
+  distance=0 (DTW perfect alignment). Detect on /uw ow/ ->
+  detected=false, distance=202356690 milli² (6700x safety margin
+  above the 30000 default threshold). Detect on silence -> VAD
+  interlock fires, detected=false.
+- Template save / load: bit-identical round-trip (per-coef
+  comparison across all frames in the unit test).
+- All R6E / R7F / R8B / R10B / R10F / R11B / R12D / R13D / R14E /
+  R16E / R17B audio tests still pass. 226/226 unit tests green
+  after the R18C addition.
+
+### Files touched (R18C)
+
+- NEW: `src/io/transducers/audio_wakeword.nova` (~530 lines).
+- NEW: `tests/unit/test_audio_wakeword.nova` (~290 lines, 41
+  assertions).
+- NEW: `tests/integration/scenario_uuu_wakeword.sh` (~190 lines,
+  20 assertions).
+- `examples/crossengin_chat.nova` (+4 lines: 1 import, 1 help, 2
+  dispatches for `/wake_train` and `/wake`).
+- `AUDIO_AUDIT.md`, `NEXT_SESSION.md`, `README.md` (R18C entries).
+
+### Known limitations / future work (R18C)
+
+- One-shot detection only. Streaming would slide a window across
+  continuous audio and run DTW per-window with `wake_smooth`
+  reducing single-frame chatter; `wake_smooth` already lives in
+  the public API for that purpose.
+- Single template only. A speaker-personalisation path would store
+  K templates per wake-word (different prosodies / speakers) and
+  detect on min over all K DTW distances.
+- Adaptive VAD calibration is **disabled** in the detection path
+  (R7F's calibration window assumes leading silence; wake-words by
+  definition lead with speech). The fixed-floor VAD path is
+  preserved and is more than adequate for the audible-voice gate
+  we need; the trade-off only matters in extremely noisy
+  environments.
+
 ## R18D (this session) -- LBP-gallery face RECOGNITION (identity matching)
 
 **Status: complete -- `src/io/transducers/image_face_recognize.nova`

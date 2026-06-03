@@ -11,7 +11,36 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R18B adds `src/kg/link_prediction.nova` — three classical
+> toolchain. R18C adds `src/io/transducers/audio_wakeword.nova` — a
+> wake-word matched filter built on R17B's MFCC + R7F's VAD via
+> Dynamic Time Warping ("Hey Nova", "Computer", etc.). DTW lattice
+> `D[i][j] = local(input[i], reference[j]) + min(D[i-1][j],
+> D[i][j-1], D[i-1][j-1])` with `D[0][0] = local(input[0],
+> reference[0])` and the boundary rows / columns taking only the
+> available neighbour; final distance `= D[N-1][M-1] / (N + M)`
+> path-normalized. Local distance is L2² between two 13-dim MFCC
+> vectors via R17B's `mfcc_l2_distance_sq` (skipping coef 0 so
+> loudness doesn't dominate the spectral match). VAD interlock
+> (R7F adaptive mode disabled — wake-words lead with speech, not
+> silence) prevents pure-noise / silence buffers from ever firing.
+> Caps: 256 frames per template / input (4 s @ 16 kHz hop=256); DTW
+> lattice 256×256 = 65536 int63 cells. Public API:
+> `wake_train_template[_from_pcm]`, `wake_template_save/load`,
+> `wake_detect`, `wake_dtw_distance`, `wake_smooth`. New chat
+> admin: `/wake_train PATH` saves the template to
+> `/tmp/wakeword.template`; `/wake PATH` loads + detects, prints
+> `(wake PATH: detected={true|false} distance=N milli
+> (threshold=30000), end_frame=K)`. On Klatt /ay ey/ vs /ay ey/:
+> distance = 0 milli² (DTW perfect alignment), detected=true. On
+> /ay ey/ vs /uw ow/: distance = 202356690 milli² — 6700× safety
+> margin above the 30000 default threshold — detected=false.
+> Save/load is bit-identical (per-coef equality across every
+> frame). 41 unit assertions
+> (`tests/unit/test_audio_wakeword.nova`) + 20 integration
+> assertions (`tests/integration/scenario_uuu_wakeword.sh`); all
+> green. All prior audio suites (R6E Klatt, R7F VAD, R8B/R10B STT,
+> R10F/R11B pitch, R12D PSOLA, R13D voice clone, R14E DSP, R16E
+> STFT, R17B MFCC) remain bit-identically green. R18B adds `src/kg/link_prediction.nova` — three classical
 > link-prediction scores over the KG xref graph (Common Neighbors;
 > Jaccard, in milli; Adamic-Adar, in milli with integer log2 hub
 > down-weight). Companion to clustering (R11F LPA + R12C Louvain) and

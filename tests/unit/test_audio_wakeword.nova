@@ -1,0 +1,385 @@
+// Unit tests for src/io/transducers/audio_wakeword.nova (R18C).
+//
+// Hermetic coverage of the integer-only DTW wake-word detector:
+// DTW distance properties (zero on same input, large on dissimilar
+// input, length-tolerant), template train + save + load round-trip,
+// per-utterance detect on Klatt vowel-pair fixtures, threshold tuning,
+// VAD interlock against pure-silence / empty audio.
+//
+// Coverage targets:
+//
+//   * Constants + accessors (caps, default threshold)              (~3)
+//   * DTW on identical sequence -> 0 distance                      (~2)
+//   * DTW on disjoint sequences -> non-zero, substantial           (~2)
+//   * DTW handles different sequence lengths (truncation tolerance) (~2)
+//   * DTW on empty inputs -> 0                                     (~2)
+//   * Train template from Klatt utterance -> non-zero frames       (~3)
+//   * Save + load round-trip yields identical template             (~4)
+//   * Detect on identical utterance -> detected=true, low distance (~3)
+//   * Detect on different utterance -> detected=false, high dist   (~2)
+//   * Threshold tuning: very high threshold -> always detects      (~1)
+//   * Threshold tuning: very low threshold -> never detects        (~1)
+//   * Empty audio -> detected=false (no false positive)            (~2)
+//   * VAD interlock: pure silence rejected                         (~1)
+//   * Smoothing helper basic correctness                           (~2)
+//
+// Total: ~30 assertions (well above the ~25 floor in the brief).
+
+import "../ce_test.nova"
+import "../../src/io/transducers/audio_wakeword.nova"
+import "../../src/io/effectors/audio_synth.nova"
+
+// ---- fixture builders ---------------------------------------------------
+
+fn _wake_zero_buf(n) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        push(b, 0)
+        i = i + 1
+    }
+    return b
+}
+
+// Concatenate Klatt vowel buffers to make a longer "utterance" (the
+// wake-word reference). 4 successive Klatt /ay/ /ey/ phonemes provides
+// 4800 samples @ 8 kHz (600 ms) -- well above the MFCC minimum frame
+// count.
+fn _wake_klatt_utterance(labels) {
+    let pcm = list_new()
+    let i = 0
+    while i < len(labels) {
+        let v = synth_phoneme_klatt(labels[i])
+        let j = 0
+        while j < len(v) {
+            push(pcm, v[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return pcm
+}
+
+// Build a synthetic MFCC sequence with `n` frames, each `m` coefs of
+// the given constant value -- used for DTW property tests that don't
+// care about real spectral content.
+fn _wake_synthetic_mfcc(n, m, v) {
+    let frames = list_new()
+    let i = 0
+    while i < n {
+        let row = list_new()
+        let j = 0
+        while j < m {
+            push(row, v)
+            j = j + 1
+        }
+        push(frames, row)
+        i = i + 1
+    }
+    return frames
+}
+
+// ---- constants + accessors ----------------------------------------------
+
+fn test_defaults_accessors() {
+    ce_eq("wake_template_max_frames = 256", wake_template_max_frames(), 256)
+    ce_eq("wake_input_max_frames = 256", wake_input_max_frames(), 256)
+    ce_check("wake_default_threshold > 0", wake_default_threshold() > 0)
+    ce_eq("wake_smooth_window = 5", wake_smooth_window(), 5)
+}
+
+// ---- DTW: identical sequences --------------------------------------------
+
+fn test_dtw_identical_sequences() {
+    // Build a 10-frame synthetic MFCC sequence and DTW-compare it to
+    // itself. Since L2(a[i], a[i]) = 0 for every i, the path along the
+    // diagonal accumulates 0 -- final distance must be 0.
+    let frames = _wake_synthetic_mfcc(10, 13, 500)
+    let d = wake_dtw_distance(frames, frames)
+    ce_eq("DTW identical synthetic sequences -> 0", d, 0)
+}
+
+fn test_dtw_klatt_identical() {
+    // Identical Klatt utterances -- should DTW to 0 (every cell's
+    // local cost is L2(x, x) = 0).
+    let labels = list_new()
+    push(labels, "ay")
+    push(labels, "ey")
+    let pcm = _wake_klatt_utterance(labels)
+    let m_a = mfcc_compute(pcm, 8000, 256, 128, 13)
+    let m_b = mfcc_compute(pcm, 8000, 256, 128, 13)
+    let d = wake_dtw_distance(mfcc_frames(m_a), mfcc_frames(m_b))
+    ce_eq("DTW identical Klatt MFCC -> 0", d, 0)
+}
+
+// ---- DTW: dissimilar sequences ------------------------------------------
+
+fn test_dtw_dissimilar_sequences() {
+    // Two synthetic sequences with disjoint constant-value rows
+    // have L2(a, b) = (v_a - v_b)^2 * (n_mfcc - 1) per cell.
+    // For 5000 vs 0 over 12 coefs: 5000^2 * 12 = 3e8 per cell.
+    // 10 cells along the diagonal -> 3e9 total / 20 (N+M) = 1.5e8.
+    let a = _wake_synthetic_mfcc(10, 13, 5000)
+    let b = _wake_synthetic_mfcc(10, 13, 0)
+    let d = wake_dtw_distance(a, b)
+    ce_check("DTW distinct synthetic sequences -> > 0", d > 0)
+    ce_check("DTW distinct sequences (5000 vs 0) -> substantial (> 1e6)",
+             d > 1000000)
+}
+
+fn test_dtw_klatt_vowel_pair_distinct() {
+    // /ay/ vs /uw/ are spectrally distinct (different formants).
+    // Their MFCC sequences should DTW to a substantial non-zero distance.
+    let ay = synth_phoneme_klatt("ay")
+    let uw = synth_phoneme_klatt("uw")
+    let m_ay = mfcc_compute(ay, 8000, 256, 128, 13)
+    let m_uw = mfcc_compute(uw, 8000, 256, 128, 13)
+    let d = wake_dtw_distance(mfcc_frames(m_ay), mfcc_frames(m_uw))
+    ce_check("DTW /ay/ vs /uw/ Klatt -> > 0", d > 0)
+}
+
+// ---- DTW: handles different sequence lengths ----------------------------
+
+fn test_dtw_handles_different_lengths() {
+    // A 10-frame sequence vs a 20-frame sequence of the SAME content
+    // (the second is just the first replicated): DTW path can stay on
+    // matching cells, so distance should still be 0 (or near-0).
+    let short_seq = _wake_synthetic_mfcc(10, 13, 500)
+    // long_seq is the same 500-valued frames but 20 frames -- exactly
+    // matching every frame of short_seq, just repeated. L2 between two
+    // 500-valued rows is 0 (skips coef 0; remaining coefs identical).
+    let long_seq = _wake_synthetic_mfcc(20, 13, 500)
+    let d = wake_dtw_distance(short_seq, long_seq)
+    ce_eq("DTW unequal-length identical-content -> 0 (length tolerant)", d, 0)
+    // Asymmetric ordering: DTW is not strictly symmetric (the lattice
+    // walk can be lopsided), but for identical row values the result
+    // must still be 0.
+    let d2 = wake_dtw_distance(long_seq, short_seq)
+    ce_eq("DTW reversed-order unequal-length identical-content -> 0",
+          d2, 0)
+}
+
+// ---- DTW: empty inputs ---------------------------------------------------
+
+fn test_dtw_empty_inputs() {
+    let empty = list_new()
+    let frames = _wake_synthetic_mfcc(5, 13, 500)
+    ce_eq("DTW empty vs frames -> 0", wake_dtw_distance(empty, frames), 0)
+    ce_eq("DTW frames vs empty -> 0", wake_dtw_distance(frames, empty), 0)
+}
+
+// ---- train template -----------------------------------------------------
+
+fn test_train_template_from_klatt() {
+    let labels = list_new()
+    push(labels, "ay")
+    push(labels, "ey")
+    let pcm = _wake_klatt_utterance(labels)
+    let tpl = wake_train_template_from_pcm(pcm, 8000)
+    ce_check("trained template is non-zero", tpl != 0)
+    ce_check("template valid (passes wake_template_valid)",
+             wake_template_valid(tpl) == 1)
+    ce_check("template has >= 3 frames (utterance covered)",
+             wake_template_frame_count(tpl) >= 3)
+    ce_eq("template n_mfcc = 13", wake_template_n_mfcc(tpl), 13)
+    ce_eq("template sample_rate = 8000", wake_template_rate(tpl), 8000)
+}
+
+fn test_train_template_empty_pcm() {
+    let empty = list_new()
+    let tpl = wake_train_template_from_pcm(empty, 8000)
+    ce_check("empty PCM -> template = 0 (sentinel)", tpl == 0)
+    let tpl2 = wake_train_template_from_pcm(empty, 0)
+    ce_check("zero sample rate -> template = 0 (sentinel)", tpl2 == 0)
+}
+
+// ---- save + load round-trip ---------------------------------------------
+
+fn test_save_load_roundtrip() {
+    let labels = list_new()
+    push(labels, "ay")
+    push(labels, "ey")
+    let pcm = _wake_klatt_utterance(labels)
+    let tpl1 = wake_train_template_from_pcm(pcm, 8000)
+    ce_check("trained template is non-zero", tpl1 != 0)
+    let path = "/tmp/ce_test_wake_template_rt.template"
+    let ok = wake_template_save(tpl1, path)
+    ce_eq("template save returns 1 on success", ok, 1)
+    let tpl2 = wake_template_load(path)
+    ce_check("loaded template is non-zero", tpl2 != 0)
+    ce_eq("loaded n_mfcc matches", wake_template_n_mfcc(tpl2),
+          wake_template_n_mfcc(tpl1))
+    ce_eq("loaded sample_rate matches", wake_template_rate(tpl2),
+          wake_template_rate(tpl1))
+    ce_eq("loaded frame_size matches", wake_template_frame_size(tpl2),
+          wake_template_frame_size(tpl1))
+    ce_eq("loaded frame_count matches", wake_template_frame_count(tpl2),
+          wake_template_frame_count(tpl1))
+    // Bit-identical frame contents.
+    let nfr = wake_template_frame_count(tpl1)
+    let nmfcc = wake_template_n_mfcc(tpl1)
+    let all_match = 1
+    let i = 0
+    while i < nfr {
+        let r1 = wake_template_frame_at(tpl1, i)
+        let r2 = wake_template_frame_at(tpl2, i)
+        let j = 0
+        while j < nmfcc {
+            if r1[j] != r2[j] { all_match = 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ce_eq("loaded frames bit-identical to saved frames", all_match, 1)
+}
+
+fn test_load_missing_template() {
+    let tpl = wake_template_load("/tmp/ce_definitely_does_not_exist_w18c.template")
+    ce_check("missing template -> load returns 0 sentinel", tpl == 0)
+}
+
+// ---- wake_detect: positive case ----------------------------------------
+
+fn test_detect_same_utterance() {
+    // Train + detect on the same utterance. With DTW = 0 and the default
+    // threshold = 30000 milli^2, this MUST detect.
+    let labels = list_new()
+    push(labels, "ay")
+    push(labels, "ey")
+    let pcm = _wake_klatt_utterance(labels)
+    let tpl = wake_train_template_from_pcm(pcm, 8000)
+    ce_check("template trained", tpl != 0)
+    let res = wake_detect(tpl, pcm, 8000, wake_default_threshold())
+    ce_eq("same utterance -> detected = true", wake_result_detected(res), 1)
+    ce_eq("same utterance -> distance = 0", wake_result_distance(res), 0)
+}
+
+// ---- wake_detect: negative case (different utterance) -------------------
+
+fn test_detect_different_utterance() {
+    // Train on /ay ey/, detect on /uw ow/. Their MFCC vectors come from
+    // different formants -> DTW distance >> threshold.
+    let labels_ref = list_new()
+    push(labels_ref, "ay")
+    push(labels_ref, "ey")
+    let labels_alt = list_new()
+    push(labels_alt, "uw")
+    push(labels_alt, "ow")
+    let pcm_ref = _wake_klatt_utterance(labels_ref)
+    let pcm_alt = _wake_klatt_utterance(labels_alt)
+    let tpl = wake_train_template_from_pcm(pcm_ref, 8000)
+    let res = wake_detect(tpl, pcm_alt, 8000, wake_default_threshold())
+    ce_eq("different utterance -> detected = false",
+          wake_result_detected(res), 0)
+    ce_check("different utterance -> distance > 0",
+             wake_result_distance(res) > 0)
+}
+
+// ---- threshold tuning ---------------------------------------------------
+
+fn test_threshold_very_high_always_detects() {
+    // With threshold = int63-near-max, any finite distance is below it.
+    let labels_ref = list_new()
+    push(labels_ref, "ay")
+    let labels_alt = list_new()
+    push(labels_alt, "uw")
+    let pcm_ref = _wake_klatt_utterance(labels_ref)
+    let pcm_alt = _wake_klatt_utterance(labels_alt)
+    let tpl = wake_train_template_from_pcm(pcm_ref, 8000)
+    let res = wake_detect(tpl, pcm_alt, 8000, 999999999999)
+    ce_eq("very high threshold -> detected = true",
+          wake_result_detected(res), 1)
+}
+
+fn test_threshold_zero_never_detects() {
+    // With threshold = 0, only distance < 0 would pass -- impossible for
+    // L2-squared cumulative metric. So distinct utterances must NOT detect.
+    let labels_ref = list_new()
+    push(labels_ref, "ay")
+    let labels_alt = list_new()
+    push(labels_alt, "uw")
+    let pcm_ref = _wake_klatt_utterance(labels_ref)
+    let pcm_alt = _wake_klatt_utterance(labels_alt)
+    let tpl = wake_train_template_from_pcm(pcm_ref, 8000)
+    let res = wake_detect(tpl, pcm_alt, 8000, 0)
+    ce_eq("zero threshold on distinct utterance -> detected = false",
+          wake_result_detected(res), 0)
+}
+
+// ---- empty / silent audio -----------------------------------------------
+
+fn test_detect_empty_audio() {
+    let labels = list_new()
+    push(labels, "ay")
+    let pcm = _wake_klatt_utterance(labels)
+    let tpl = wake_train_template_from_pcm(pcm, 8000)
+    let empty = list_new()
+    let res = wake_detect(tpl, empty, 8000, wake_default_threshold())
+    ce_eq("empty audio -> detected = false (no false positive)",
+          wake_result_detected(res), 0)
+    ce_eq("empty audio -> distance = 0", wake_result_distance(res), 0)
+}
+
+fn test_detect_silence_audio() {
+    // Pure-zero buffer: VAD interlock must reject it (no detected
+    // speech segments). Even though MFCC of silence is all-zero (so
+    // DTW would otherwise come out as 0), the wake_detect API gates
+    // on R7F VAD and must report detected=false.
+    let labels = list_new()
+    push(labels, "ay")
+    let pcm = _wake_klatt_utterance(labels)
+    let tpl = wake_train_template_from_pcm(pcm, 8000)
+    let silence = _wake_zero_buf(8000)
+    let res = wake_detect(tpl, silence, 8000, wake_default_threshold())
+    ce_eq("pure silence -> detected = false (VAD interlock fires)",
+          wake_result_detected(res), 0)
+}
+
+// ---- smoothing helper ---------------------------------------------------
+
+fn test_smooth_majority_window() {
+    // Single isolated detection should be smoothed away (1 out of 5 is
+    // below the majority threshold of 3).
+    let dets = list_new()
+    push(dets, 0); push(dets, 0); push(dets, 1); push(dets, 0); push(dets, 0)
+    push(dets, 0); push(dets, 0)
+    let sm = wake_smooth(dets)
+    ce_eq("smooth: isolated detection -> all zeros in window",
+          sm[4], 0)
+}
+
+fn test_smooth_majority_sustained() {
+    // Sustained detection over 4 frames should fire in the smoothed
+    // output once the rolling window has 3+ ones.
+    let dets = list_new()
+    push(dets, 0); push(dets, 1); push(dets, 1); push(dets, 1); push(dets, 1)
+    push(dets, 1); push(dets, 0)
+    let sm = wake_smooth(dets)
+    ce_eq("smooth: sustained 4-frame detection -> 1 at window 5",
+          sm[5], 1)
+}
+
+fn main() {
+    test_defaults_accessors()
+    test_dtw_identical_sequences()
+    test_dtw_klatt_identical()
+    test_dtw_dissimilar_sequences()
+    test_dtw_klatt_vowel_pair_distinct()
+    test_dtw_handles_different_lengths()
+    test_dtw_empty_inputs()
+    test_train_template_from_klatt()
+    test_train_template_empty_pcm()
+    test_save_load_roundtrip()
+    test_load_missing_template()
+    test_detect_same_utterance()
+    test_detect_different_utterance()
+    test_threshold_very_high_always_detects()
+    test_threshold_zero_never_detects()
+    test_detect_empty_audio()
+    test_detect_silence_audio()
+    test_smooth_majority_window()
+    test_smooth_majority_sustained()
+    ce_summary("audio_wakeword")
+}
+
+main()

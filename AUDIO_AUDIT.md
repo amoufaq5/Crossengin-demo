@@ -1615,3 +1615,153 @@ usage: /mfcc /tmp/test.wav)`.
 - **Higher-order log** -- our two-term Taylor polynomial is good
   to ~5% on the speech band; a 4-term polynomial or a 256-entry
   table would tighten it to <1%.
+
+
+## R18C -- wake-word DTW matched filter on MFCC sequences
+
+Status: **DONE (`src/io/transducers/audio_wakeword.nova`).**
+Closes the wake-word matched-filter future-work bullet above. The
+algorithm is the textbook DTW-on-MFCC pipeline used by every classical
+keyword-spotter from the late-80s GMM-HMM era through modern
+DTW-based on-device wake-word systems (Snowboy's pre-DNN path, Picovoice's
+"classical" mode): take one reference utterance, extract its MFCC
+sequence at training time, persist it; at detection time MFCC the
+incoming audio and dynamic-time-warp against the reference template.
+DTW handles the inevitable speech-rate variation between the
+enrollment utterance and a live one (someone says the wake word a bit
+faster or slower) without needing per-frame phoneme alignment.
+
+### Algorithm
+
+For an N-frame input MFCC sequence and an M-frame reference MFCC
+sequence, fill the [N x M] DTW lattice:
+
+```
+D[i][j] = local_distance(input[i], reference[j])
+       + min(D[i-1][j], D[i][j-1], D[i-1][j-1])
+```
+
+with D[0][0] = local_distance(input[0], reference[0]) and the boundary
+rows / columns taking only the available neighbour. The final
+distance is `D[N-1][M-1] / (N + M)` -- path-length normalized so a
+short / long utterance pair is commensurable with a same-length pair.
+
+Local distance is the per-frame squared L2 between two 13-dim MFCC
+vectors, **skipping coef 0** (the energy term -- otherwise loud
+non-matches would inflate D faster than spectrally-aligned matches).
+We reuse R17B's `mfcc_l2_distance_sq` for the per-cell cost so the
+integer-only contract is preserved.
+
+VAD interlock: `wake_detect` calls into R7F's `vad_state_new` /
+`vad_process_pcm` with the adaptive noise-floor calibration disabled
+(adaptive mode assumes leading silence; wake words by definition lead
+with speech). The detection refuses to fire when the buffer holds no
+detected speech segment, so pure-silence and white-noise buffers
+short-circuit to `detected=false` even when the MFCC distance happens
+to round to zero (silence projects to an all-zero MFCC vector ->
+DTW = 0 against any template that also has a zero leading frame; the
+VAD short-circuit prevents that false positive).
+
+### Public surface
+
+- `wake_train_template(wav_path)` -> `template_t` -- WAV-to-PCM via
+  R6E, MFCC via R17B, packed into a 5-cell template
+  `[tag, frames, sample_rate, frame_size, n_mfcc]`. Returns 0 on
+  parse failure / silence.
+- `wake_train_template_from_pcm(pcm, sample_rate)` -- the I/O-free
+  variant used by the unit tests; same return shape.
+- `wake_template_save(template, path)` / `wake_template_load(path)`
+  -- text-format persistence. Round-trip is bit-identical: same
+  frames, same metadata. Format:
+  ```
+  WAKE_TEMPLATE 1
+  sample_rate 8000
+  frame_size 256
+  n_mfcc 13
+  n_frames 17
+  frame <c0> <c1> ... <c12>
+  ...
+  ```
+- `wake_detect(template, audio, sample_rate, threshold_milli)`
+  -> `[detected_bool, dtw_distance_milli, end_frame]` (3-cell list).
+- `wake_dtw_distance(mfcc_a, mfcc_b)` -- exposed for downstream
+  matchers (k-NN over a per-user template gallery, multi-template
+  voting ensembles).
+- `wake_smooth(detections)` -- 5-frame majority-vote moving-average
+  for streaming wrappers.
+
+Caps: `WAKE_TEMPLATE_MAX_FRAMES = 256` (4.1 s @ 16 kHz),
+`WAKE_INPUT_MAX_FRAMES = 256`, default threshold 30000 milli^2 (tuned
+against Klatt vowel-pair fixtures; same-utterance DTW comes in at 0,
+different-utterance distance comes in at > 1e8 with a wide margin).
+
+### Chat surface
+
+- `/wake_train PATH` -- trains a template from a WAV and persists it
+  to `/tmp/wakeword.template`. Output:
+  `(wake_train PATH: frames=N, n_mfcc=13, sr=8000 Hz -> saved to ...)`.
+- `/wake PATH` -- loads the template, runs `wake_detect`. Output:
+  `(wake PATH: detected={true|false} distance=N milli (threshold=30000), end_frame=K)`.
+- Error paths: `(/wake[_train] needs PATH ...)`,
+  `(wake[_train] FAILED: could not parse WAV at PATH)`,
+  `(wake FAILED: no template at /tmp/wakeword.template; run /wake_train first)`.
+
+### Verification snapshot (latest run)
+
+- 41 unit assertions in `tests/unit/test_audio_wakeword.nova` (well
+  above the ~25 floor in the brief). 20 integration assertions in
+  `tests/integration/scenario_uuu_wakeword.sh`. All green.
+- **DTW on identical sequences:** 0 (mandatory baseline -- if the
+  local distance is 0 everywhere along the diagonal, the lattice
+  fills with 0, and the path-normalized final distance is 0).
+- **DTW handles length mismatch:** a 10-frame and 20-frame sequence
+  of the same content both DTW to 0 (the lattice finds the
+  diagonal+horizontal warp that matches each input frame to one or
+  more reference frames at zero cost).
+- **DTW on Klatt /ay ey/ vs /uw ow/ wake fixtures:** distance =
+  202356690 milli^2 -- six orders of magnitude above the same-utterance
+  baseline (0). The chat output for this case:
+  `(wake .../nonwake.wav: detected=false distance=202356690 milli (threshold=30000), end_frame=16)`.
+- **Detection on training audio:** detected=true, distance=0 milli^2
+  (the trainer and detector produce bit-identical MFCC sequences and
+  DTW between identical sequences is 0).
+- **Detection on different audio:** detected=false at the default
+  threshold of 30000 milli^2; the actual distance for the Klatt
+  /uw ow/ vs /ay ey/ trained pair is 202356690 -- a 6700x safety
+  margin above the threshold.
+- **Detection on noise / silence:** detected=false. The VAD interlock
+  fires first (the buffer has zero detected speech segments) so the
+  DTW lattice never runs. The chat output:
+  `(wake .../noise.wav: detected=false distance=0 milli (threshold=30000), end_frame=0)`.
+- **Save + load round-trip:** bit-identical template (n_frames,
+  n_mfcc, frame contents). The unit test enumerates every coefficient
+  of every frame and asserts equality.
+- **Threshold-tuning extremes:** very high threshold (999e9) ->
+  always detects regardless of distance. Threshold 0 -> never detects
+  (cumulative L2-squared is non-negative).
+- 226/226 existing unit tests + every audio scenario still pass
+  (R6E synth, R7F VAD, R8B / R10B STT, R10F / R11B pitch, R12D
+  PSOLA, R13D voice clone, R14E DSP, R16E STFT, R17B MFCC).
+
+### Future work
+
+- **Streaming detection** -- the current `wake_detect` is one-shot
+  over a fixed buffer. A streaming wrapper would slide a window
+  across continuous audio and run DTW per-window, applying the
+  5-frame moving-average smoothing already exposed via `wake_smooth`.
+- **Multi-template ensembles** -- store K templates per wake-word
+  (different prosodies, different speakers) and detect on min over
+  all K DTW distances; the integer-only path costs K times more
+  per-frame but the math stays bit-deterministic.
+- **Speaker-conditional thresholds** -- per-template thresholds
+  trained from a tiny accept / reject set; the trainer would
+  enumerate distance distributions on a held-out set and pick the
+  EER point. Still integer-only via histogram math.
+- **Tail-MFCC fingerprint** -- some keyword-spotters compress the
+  reference into a smaller "tail" of the most variant frames (the
+  consonant-cluster frames that distinguish "Hey Nova" from
+  "Hi Nova"); reduces DTW work and template-storage footprint.
+- **Cepstral mean / variance normalization (CMVN)** at training and
+  detection -- same future-work bullet as R17B; the wake-word
+  path benefits from it doubly because the detection thresholds
+  become invariant to recording channel.
