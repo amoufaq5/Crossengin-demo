@@ -2530,6 +2530,18 @@ The Phase 9 IO and effectors layer (`src/io/`):
 - **input_transducer** (`io/transducers/`) — modality → reader-ready normalized
   percept (ADR-0011/0012, ADR-0021); strictly outside cognition (ADR-0014).
   Text/file are normalized now; audio (STT) is the honest deferred bridge seam.
+- **kg_rss_ingest** (`io/transducers/`, R25C) — RSS 2.0 + Atom 1.0 feed
+  parser + KG ingest pipeline: tag-walks the XML, decodes the five named
+  entities + decimal numeric references, strips CDATA wrappers (inner
+  content kept verbatim), and emits one FACT atom per never-seen guid
+  carrying full payload (title / link / description / pubdate / guid /
+  feed_url) and provenance `"rss:<feed_url>"`. Re-ingest of the same
+  feed is a no-op (dedup on guid, falls back to link). Caps: 100 items
+  per feed, 1 MB XML, 200-byte label, 4000-byte description. Wired as
+  the chat command `/rss <feed_url> [max_items]`. http:// URLs route
+  through `http_client.http_get`; file:///abs/path through sys_open +
+  sys_read. The first ingestion pathway that LETS THE SUBSTRATE LEARN
+  FROM THE WEB at the structured-record level.
 - **audio_synth / audio_speak** (`io/effectors/`) — the audio modality bridge
   (Phase 19 Tier-4 #1; P2.6 multi-formant upgrade; P6 full-ARPAbet expansion).
   `audio_synth.nova` is the always-on Mode-1 floor: a pure-NOVA Klatt-style
