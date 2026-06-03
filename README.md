@@ -11,7 +11,90 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R22A wires R21D's HOG integral histogram into R15C's
+> toolchain. R22E adds `src/kg/rule_explain.nova` — recursive provenance
+> walks over R20B's rule engine, producing human-readable proof trees.
+> R20B shipped `rule_engine_explain(engine, atom_id)` returning ONE
+> level of provenance (the rule + premise atoms for a derived fact);
+> R21B shipped `dr_derivation_provenance` for the federated case;
+> R22E walks the chain BACKWARD: when an atom was derived from atoms
+> that were themselves derived, follow the recursion to ground facts
+> and assemble a complete proof tree. Public API: `explain_atom(kg,
+> engine, atom_id) -> proof_tree_t`, `proof_render_text(tree,
+> max_depth) -> str`, `proof_render_structured(tree) -> nested_list`,
+> `proof_height(tree) -> int`, `proof_ground_facts(tree) ->
+> list[atom_id]`, `proof_node_count(tree) -> int`, plus
+> `explain_atom_with_depth(kg, engine, atom_id, max_depth)` for
+> caller-controlled truncation. Depth cap at 50 (`EXPLAIN_MAX_DEPTH`)
+> defends against pathological cycles; a per-branch visited-set
+> short-circuits any reentry to a CYCLE sentinel; missing atoms
+> resolve to a MISSING sentinel; depth-cap leaves render as
+> TRUNCATED sentinels. For the canonical 5-link transitive ancestor
+> chain (parent(0,1)..parent(4,5)) the engine derives 15 ancestors;
+> the proof tree for `ancestor(0, 4)` has height 5, 8 nodes, and
+> bottoms out at 4 distinct parent ground facts. Text render is the
+> classic two-space indented list:
+> `- atom 17 "ancestor|0|4" via ancestor (rule #1)` at the root with
+> `- atom 0 "parent|0|1" GROUND` at the leaves. Verification: 54
+> unit assertions in `tests/unit/test_rule_explain.nova` (NEW;
+> covers ground-fact leaf, 1-step + 2-step derivations, 5-link
+> transitive ancestor chain, max_depth truncation, cycle-via-dedupe
+> handling, missing-atom sentinel, text + structured renderings
+> with snapshot match, ground-fact deduplication, node-count
+> utility, chat-engine bridge). 21 integration assertions in
+> `tests/integration/scenario_jjjj_rule_explain.sh` (NEW; standalone
+> driver seeds the 5-parent chain, runs the classical ancestor
+> rules, walks ancestor(0, 4) and asserts height + grounds + root
+> rule + text-render tokens + structured shape; ground parent fact
+> is a height-1 GROUND leaf; missing atom_id resolves to MISSING;
+> chat dispatch lists /explain in /help + usage on no-arg). Chat:
+> `/explain <atom_id>` admin command wired into
+> `examples/crossengin_chat.nova`. All prior KG suites remain green
+> (R20B rule_inference 47 checks, R21B distributed_rules 42
+> checks). Module count: +1.
+> R22D adds `src/io/transducers/image_panorama.nova` — image-pair
+> panorama stitching, the classical 4-step CV recipe (feature
+> matching + RANSAC homography + warp + linear blend) consuming
+> CrossEngin's existing R5C SIFT + R6D ORB matchers. Given two
+> overlapping PGM images, `pano_match_features` (default ORB) emits
+> correspondence pairs, `pano_ransac_homography` solves a 3x3
+> homography via the Direct Linear Transform (DLT) on 4 sampled
+> correspondences per iteration with inlier scoring by Chebyshev
+> reprojection distance, `pano_warp` backward-warps the second image
+> via the inverse homography + bilinear sampling, and `pano_blend`
+> averages the overlap 50/50. Convenience wrapper `pano_stitch(a, b,
+> w, h)` composes all four stages and emits PGM-P5 bytes; when
+> feature matching collapses (< 4 matches, e.g. uniform images), the
+> pipeline gracefully falls back to a known translation that places
+> B beside A with `PANO_DEFAULT_OVERLAP_PX` (=10) overlap. All
+> arithmetic is integer (milli-fixed-point homography cells; identity
+> is `[1000,0,0,0,1000,0,0,0,1000]`); LCG-deterministic RANSAC
+> sampler (seed 19937) yields the same H across runs given the same
+> match list. Caps: max input dim 256/axis, max output dim 512/axis,
+> max RANSAC iterations 500. Public API: `pano_match_features`,
+> `pano_ransac_homography`, `pano_warp`, `pano_blend`, `pano_stitch`,
+> `pano_pgm_args` (chat dispatch), `pano_homography_identity`,
+> `pano_homography_translation`, `pano_homography_invert`,
+> `pano_homography_apply`, `pano_inlier_count`, `pano_homography`
+> (accessors). Verification: 18 test functions / 59 unit assertions
+> in `tests/unit/test_image_panorama.nova` (NEW; identity +
+> translation homography apply, invert round-trip, identity warp
+> preserves image, translation warp shifts pixel, warp input
+> validation, RANSAC with 4 inliers + 0 outliers recovers exact H
+> within 1 px, RANSAC with 4 inliers + 4 outliers rejects outliers,
+> blend 100%-A in A-only region + 50/50 in overlap + 100%-B in
+> B-only region, uniform-image stitch returns valid PGM via
+> fallback, checkerboard-halves stitch covers full canvas width
+> with non-zero pixels at both edges). 17 integration assertions in
+> `tests/integration/scenario_iiii_panorama.sh` (NEW; 36x32
+> checkerboard pair fixture with 10-pixel overlap, `/pano` echoes
+> dims + matches + wrote=yes + output 62x32, stitched.pgm exists +
+> size 1997 bytes > 1024 + begins with P5 magic, no-arg usage
+> prompt, missing-file graceful FAILED). All prior CV suites stay
+> green (R5C SIFT 25, R6D ORB 34, R14D HOG 55, R15C HOG detector
+> 32, R16D face_detect 36, R17D LBP 45, R21D HOG integral 42). Chat:
+> `/pano LEFT RIGHT` admin command wired into
+> `examples/crossengin_chat.nova`. Module count: +1.
+> R22A wires R21D's HOG integral histogram into R15C's
 > sliding-window object detector: `det_sliding_window` now builds the
 > per-image integral planes ONCE per scale and queries every
 > candidate window's per-cell histograms via four-corner rectangle

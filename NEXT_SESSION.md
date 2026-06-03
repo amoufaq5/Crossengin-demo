@@ -3,7 +3,317 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R22A (this session) -- HOG integral histogram wired into R15C sliding-window detector
+## R22E (this session) -- KG rule explainability via recursive provenance walks
+
+**Status: complete -- new module `src/kg/rule_explain.nova` (+~460 lines)
+walks R20B's rule-engine provenance chain BACKWARD from any derived
+atom to its ground facts and assembles a complete proof tree. R20B's
+`rule_engine_explain(engine, atom_id)` exposed ONE level (rule +
+premises); R21B's `dr_derivation_provenance` exposed the same flat
+shape for the federated case. R22E fills the gap: when an atom's
+premises were themselves derived, follow the recursion and produce
+both an indented text proof tree and a structured nested-list AST.**
+
+### What R22E delivers
+
+1. **Recursive walk** -- `explain_atom(kg, engine, atom_id) ->
+   proof_tree_t` traverses the engine's provenance table from a
+   target atom toward its ground facts. Each derived atom becomes
+   an internal node whose children are the sub-proofs of its source
+   atoms; ground facts (atoms with no provenance) become leaves
+   marked `is_ground=1`. The walk is depth-capped at 50 levels
+   (`EXPLAIN_MAX_DEPTH`); a per-branch visited-set short-circuits
+   any pathological cycle to a CYCLE sentinel (defence in depth --
+   R20B's dedupe already prevents real cycles).
+
+2. **Proof tree shape** -- `proof_tree_t ::= [PROOF_OBJ_TAG, atom_id,
+   label, rule_idx, rule_name, sub_proofs, is_ground, is_truncated,
+   derivation_count]`. Sentinel rule indexes: GROUND (-1),
+   TRUNCATED (-2), CYCLE (-3), MISSING (-4). Accessors:
+   `proof_is_tree`, `proof_atom_id`, `proof_label`, `proof_rule_idx`,
+   `proof_rule_name`, `proof_subs`, `proof_sub_count`,
+   `proof_is_ground`, `proof_is_truncated`,
+   `proof_derivation_count`.
+
+3. **Renderers** -- `proof_render_text(tree, max_depth)` produces
+   the classic two-space-indented `- atom <id> "<label>" via
+   <rule_name> (rule #<idx>)` line per node with GROUND / TRUNCATED
+   / CYCLE / MISSING tail markers at leaves;
+   `proof_render_structured(tree)` returns a nested
+   `[atom_id, label, rule_idx, [sub_1, sub_2, ...]]` list for
+   programmatic consumers.
+
+4. **Analytics** -- `proof_height(tree)`,
+   `proof_node_count(tree)`, and `proof_ground_facts(tree)`
+   (dedup'd list of ground-leaf atom IDs; truncation/cycle/missing
+   sentinels NOT counted).
+
+5. **Chat dispatch** -- `/explain <atom_id>` admin command via
+   `explain_chat_cmd(kg, arg)`. The chat-side engine
+   (`_explain_chat_engine`) is independent of rule_inference's
+   private `_rule_chat_engine`; chat-side rule registration is
+   exposed via `explain_chat_add_rule(rule_string)` and
+   `explain_chat_run(kg, max_iters)` so an operator script can
+   prime the engine before walking.
+
+### Verification snapshot
+
+- **54 unit assertions** in `tests/unit/test_rule_explain.nova`
+  (NEW). All PASS. Covers: ground-fact leaf (height=1, marked
+  ground, no children, label preserved); 1-step derivation (height
+  2, 1 child, ground-fact child); 2-step derivation (derived from
+  derived, height >= 3, 2 children at root for chained rule);
+  5-link transitive ancestor chain -- ancestor(0,4) gives height
+  >= 4 and 4 distinct ground parent facts (and ancestor(0,5) gives
+  height >= 5 with 5 distinct parents); max_depth=2 cap produces a
+  TRUNCATED sentinel at depth 2; cycle-via-dedupe leaves a GROUND
+  fact since the engine's dedupe step skipped the add; missing-atom
+  resolves to MISSING; text rendering of a ground fact and of a
+  one-step derivation match snapshot exactly; structured rendering
+  returns the 4-tuple `[atom_id, label, rule_idx, kids]` with
+  rule_idx=-1 for ground and rule_idx=1 for the chained ancestor
+  rule's root; ground-fact extraction deduplicates atom IDs;
+  node-count matches expected for 1-step + ground; chat-engine
+  bridge accepts and stores rules.
+
+- **21 integration assertions** in
+  `tests/integration/scenario_jjjj_rule_explain.sh` (NEW). All
+  PASS. Stand-alone driver under
+  `tests/integration/_scenario_jjjj_rule_explain_driver/`:
+  seeds parent(0,1)..parent(4,5), runs the two transitive ancestor
+  rules to fixpoint (15 ancestors derived, 5 iterations), walks
+  ancestor(0,4): asserts height >= 4, 4 ground facts, root rule
+  name "ancestor", text body contains `ancestor|0|4" via ancestor`
+  and `parent|0|1" GROUND` and `parent|3|4" GROUND`; explains a
+  ground parent fact (height=1, is_ground=1); explains a missing
+  atom_id (MISSING sentinel); structured shape is 4-tuple with 2
+  root children; chat binary's `/help` lists `/explain`; chat
+  binary's `/explain` with no arg prints usage.
+
+- **Existing KG suites stay green** -- R20B rule_inference (47
+  checks), R21B distributed_rules (42 checks), atom_store + 
+  multi_kg_manager + episodic + kg_query + kg_temporal +
+  semantic_search + pagerank + link_prediction unchanged.
+
+### Sample proof tree (5-link transitive ancestor chain)
+
+For `parent(0,1), parent(1,2), parent(2,3), parent(3,4), parent(4,5)`
+with the rules
+
+    RULE ancestor(?a, ?b) <- parent(?a, ?b)
+    RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)
+
+the proof tree for ancestor(0, 4) (atom id 17, height=5, 8 nodes,
+4 ground facts) renders as:
+
+    - atom 17 "ancestor|0|4" via ancestor (rule #1)
+      - atom 14 "ancestor|0|3" via ancestor (rule #1)
+        - atom 10 "ancestor|0|2" via ancestor (rule #1)
+          - atom 5 "ancestor|0|1" via ancestor (rule #0)
+            - atom 0 "parent|0|1" GROUND
+          - atom 1 "parent|1|2" GROUND
+        - atom 2 "parent|2|3" GROUND
+      - atom 3 "parent|3|4" GROUND
+
+ancestor(0, 5) has height 6 and 10 nodes, pulling in all 5 parent
+ground facts.
+
+### Files touched (R22E)
+
+- `src/kg/rule_explain.nova` -- NEW (+~460 lines).
+- `tests/unit/test_rule_explain.nova` -- NEW (54 assertions).
+- `tests/integration/scenario_jjjj_rule_explain.sh` -- NEW (21
+  assertions).
+- `tests/integration/_scenario_jjjj_rule_explain_driver/` -- NEW
+  driver dir auto-created by the scenario shell.
+- `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line (3 lines net).
+- `README.md`, `NEXT_SESSION.md` -- updated.
+
+### Follow-ups / known limitations
+
+1. **First-derivation only** -- when an atom has multiple provenance
+   entries (multiple rules derived the same atom), R22E picks the
+   FIRST entry to keep the proof tree finite and deterministic.
+   `proof_derivation_count(tree)` reports the multiplicity so the
+   caller knows alternatives exist. Future work: an
+   `explain_all_proofs(kg, engine, atom_id)` that returns a forest.
+2. **Chat-side engine is independent of rule_inference** --
+   `_explain_chat_engine` is a separate module-global from
+   rule_inference's private `_rule_chat_engine`. The chat surface
+   thus supports a self-contained workflow:
+   `explain_chat_add_rule(rule)` -> `explain_chat_run(kg)` ->
+   `/explain <atom>`. Unifying with rule_inference's engine would
+   require exposing a getter from R20B's module (out of scope this
+   round; not touched per ownership rules).
+3. **No federated provenance walk** -- R22E walks only the local
+   engine's provenance. R21B's distributed provenance
+   (`dr_derivation_provenance`) returns `[rule_name, peer1, ...]`
+   for federated derivations; a `explain_atom_federated(dr, kg,
+   atom_id)` that chases cross-soul derivations is a natural
+   next step.
+
+## R22D (this session) -- image-pair panorama stitching
+
+**Status: complete -- `src/io/transducers/image_panorama.nova` (NEW,
+~720 lines) lands the full classical 4-step panorama pipeline as a
+downstream APPLICATION of the existing R5C SIFT + R6D ORB feature
+matchers. CrossEngin already had keypoint detection + descriptor
+construction + ratio-test matching, but no module CONSUMED those
+matches to do something visible. R22D consumes them: given two
+overlapping PGM images, find correspondences via ORB (or SIFT),
+estimate a 3x3 homography via RANSAC, backward-warp B into A's
+canvas via the inverse homography + bilinear sampling, and blend
+the overlap with a linear 50/50 average. Convenience wrapper
+`pano_stitch(image_a, image_b, w, h)` composes all 4 stages and
+emits PGM-P5 bytes; chat `/pano` dispatches to `pano_pgm_args` for
+operator-driven panorama building.**
+
+### What R22D delivers
+
+1. **Feature-pair matching** -- `pano_match_features(image_a, image_b,
+   w, h, use_orb_or_sift)` runs R6D ORB (default) or R5C SIFT detect
+   + describe + ratio-match across both inputs and re-emits the
+   surviving pairs as `[xa, ya, xb, yb]` 4-tuples in original image
+   coordinates. The descriptor space is hidden from the caller.
+
+2. **RANSAC homography solver** -- `pano_ransac_homography(matches,
+   threshold_px, max_iterations)` samples 4 random correspondences
+   per iteration, fits the candidate 3x3 homography via the Direct
+   Linear Transform (DLT) on an 8x9 augmented matrix (h33 fixed to
+   1 milli-unit = 1000), counts inliers by Chebyshev reprojection
+   distance, and returns the best candidate with its inlier count.
+   Returns identity + 0 inliers when < 4 matches are available
+   (below the DLT minimum). LCG-deterministic sampling (seed = 19937)
+   means the same match list yields the same homography across runs.
+
+3. **Backward warp + bilinear sampling** -- `pano_warp(image, w, h,
+   H_milli, out_w, out_h)` walks every OUTPUT pixel, computes the
+   source coordinate via the inverse homography, and bilinear-samples
+   the source at the fractional source coordinate. Out-of-bounds
+   source coordinates emit pixel value 0 (black) so unmapped regions
+   stay transparent. Integer-only fixed-point throughout (milli-pixel
+   coordinates for sub-pixel precision).
+
+4. **Linear blend** -- `pano_blend(image_a, image_b_warped, w, h)`
+   produces PGM-P5 bytes: 100% A when only A is non-zero, 100% B
+   when only B is non-zero, 50/50 average in the overlap.
+
+5. **Full pipeline** -- `pano_stitch(image_a, image_b, w, h)` builds
+   a (2*W - overlap)-wide output canvas, runs matching + RANSAC, warps
+   B into A's frame, blends, returns PGM-P5 bytes. Graceful fallback
+   on degenerate inputs: when feature matching finds < 4 pairs (e.g.
+   uniform images), the pipeline reverts to a known translation that
+   places B to the right of A with `PANO_DEFAULT_OVERLAP_PX` overlap
+   so the operator still gets a recognisable side-by-side mosaic.
+
+### Verification snapshot
+
+- **18 unit-test functions / 59 assertions** in
+  `tests/unit/test_image_panorama.nova` (NEW), all PASS. Coverage:
+  identity homography shape + apply (5+4 assertions); translation
+  homography apply (4); homography invert round-trip on translation
+  (4); identity warp preserves image (3); translation warp shifts
+  pixel (3); warp invalid-input rejection (3); RANSAC 4 inliers +
+  0 outliers recovers exact H within 1 px (3); RANSAC 4 inliers +
+  4 outliers rejects outliers + recovers correct H (3); RANSAC < 4
+  matches returns identity (4); uniform-image match collapse (1);
+  match invalid-input rejection (3); blend A-only region passes A
+  (2); blend 50/50 overlap (3); blend B-only region passes B (1);
+  uniform-image stitch returns valid PGM (1); checkerboard-halves
+  stitch covers full output width with non-zero pixels at both
+  edges (3); match-pair accessors round-trip (4); PGM size = header
+  + area (3).
+
+- **17 integration assertions** in
+  `tests/integration/scenario_iiii_panorama.sh` (NEW), all PASS.
+  The driver synthesizes a 36x32 checkerboard pair with 10-pixel
+  overlap, drives `/pano` through the chat, and verifies: fixture
+  driver exits 0 + writes both PGMs (5 assertions); chat `/help`
+  advertises `/pano` with R22D label (2); chat `/pano` echoes
+  input dims + matches count + wrote=yes + output path + 62x32
+  output dims (5); the stitched.pgm file exists + size > 1024
+  bytes + starts with P5 magic (3); `/pano` with no arg prints
+  usage (1); `/pano` on missing file emits graceful FAILED (1).
+
+- **Existing CV suites stay green**:
+  * R5C SIFT (`test_image_sift.nova`) -- 25 PASS.
+  * R6D ORB (`test_orb.nova`) -- 34 PASS.
+  * R14D HOG (`test_image_hog.nova`) -- 55 PASS.
+  * R15C HOG detector (`test_image_detector.nova`) -- 32 PASS.
+  * R16D face detector (`test_face_detect.nova`) -- 36 PASS.
+  * R17D LBP (`test_lbp.nova`) -- 45 PASS.
+  * R21D HOG integral (`test_hog_integral.nova`) -- 42 PASS.
+
+- Module count: +1 (`src/io/transducers/image_panorama.nova` NEW).
+
+### Sample stitch on the checkerboard halves fixture
+
+Input pair (left half + right half of a 62x32 wide checkerboard,
+36x32 each with 10-column overlap):
+
+    left  : cells 4x4, alternating intensities (30 / 220) over cols [0, 36)
+    right : cells 4x4, same checkerboard pattern offset to cols [26, 62)
+
+Pipeline (single `/pano left.pgm right.pgm` call):
+
+    pano_match_features (ORB) -> N >= 0 correspondence pairs
+    pano_ransac_homography  -> H_milli + inlier_count
+    fallback to translation(+26, 0) when inliers < 4
+    pano_warp B into the 62x32 canvas with H above
+    pano_blend left (positioned at canvas [0, 36)) and warped B (canvas [26, 62))
+    -> 62x32 PGM-P5 bytes (1997 total: 13-byte header + 1984 pixels)
+
+Edge cases handled:
+- uniform image vs uniform image: 0 feature matches -> fallback
+  translation, the pipeline still emits a valid 62x32 PGM.
+- < 4 matches: same fallback as above (gracefully -- no failure mode).
+- missing input file: chat dispatch returns `(pano FAILED on left: ...)`
+  via the upstream `pgm_parse_file` error string.
+- /pano with no args: returns the usage prompt.
+
+### Known limitations / R22D.2 follow-ups
+
+1. **Single-pair only** -- the brief targets a TWO-image panorama;
+   multi-image (N > 2) panoramas require bundle adjustment +
+   incremental homography composition + global error minimization.
+   Real benchmarks (Brown & Lowe 2007) also use cylindrical /
+   spherical warping for wide field-of-view scenes -- R22D ships
+   only the planar single-pair lift.
+
+2. **Linear blend, no feathering** -- the 50/50 average in the
+   overlap region can produce visible seams when the two inputs
+   have different exposure / vignetting. Real systems use multi-band
+   blending (Burt & Adelson 1983) or feathering with a distance
+   transform. R22D.2 would add a distance-weighted blend (each
+   pixel's contribution proportional to distance from its own
+   image's boundary).
+
+3. **Reduced precision on non-trivial homographies** -- the DLT
+   solver uses milli-fixed-point Gaussian elimination, which
+   accumulates +/- 1 pixel rounding error on the solved homography
+   cells. RANSAC's threshold (default 3 px) covers this for normal
+   inputs but a perspective transform with extreme warping (>30
+   degree out-of-plane rotation) may not recover. A double-precision
+   refinement pass (Levenberg-Marquardt on the inlier set) is the
+   natural follow-on.
+
+4. **No saliency-weighted RANSAC** -- the random 4-point sampler
+   gives equal weight to every match, but real implementations
+   weight by descriptor distance (closer matches get sampled more
+   often). PROSAC + MAGSAC are the production-grade alternatives.
+
+### Files touched (R22D)
+
+- `src/io/transducers/image_panorama.nova` -- NEW (~720 lines).
+- `tests/unit/test_image_panorama.nova` -- NEW (18 functions /
+  59 assertions).
+- `tests/integration/scenario_iiii_panorama.sh` -- NEW (17 assertions).
+- `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1 help
+  line (3 lines net).
+- `IMAGE_AUDIT.md`, `README.md`, `NEXT_SESSION.md` -- updated.
+
+## R22A (prior in this sprint) -- HOG integral histogram wired into R15C sliding-window detector
 
 **Status: complete -- extends `src/io/transducers/image_detector.nova`
 (+~210 lines) so that `det_sliding_window` builds the R21D HOG
