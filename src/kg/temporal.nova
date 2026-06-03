@@ -1,0 +1,506 @@
+// CrossEngin knowledge: temporal reasoning via Allen's interval algebra (R19C).
+//
+// Purpose
+//   The KG read story already covers structural / textual / semantic
+//   retrieval and partitioning:
+//     - exact lookup by atom id (atom_store.kg_find_atom),
+//     - episodic retrieval (R6F + R8F: episodic_recall_*),
+//     - TF-IDF semantic ranker over labels (R10C: ss_search),
+//     - label-propagation community detection (R11F: gc_*),
+//     - Louvain greedy modularity-maximising community detection (R12C),
+//     - PageRank centrality (R13E: pagerank_*),
+//     - mini-SPARQL declarative queries (R15D+R16F+R17E: kg_query_*),
+//     - link prediction (R18B: lp_*).
+//   What is missing is TEMPORAL REASONING -- reasoning about WHEN
+//   atoms came into existence relative to each other. This module
+//   fills that gap with Allen's classical 13-relation interval
+//   algebra (Allen 1983, "Maintaining knowledge about temporal
+//   intervals", CACM 26(11)). Every pair of intervals stands in
+//   exactly one of:
+//
+//     before, meets, overlaps, starts, during, finishes, equals,
+//     after, met_by, overlapped_by, started_by, contains, finished_by
+//
+//   These 13 relations are jointly exhaustive and pairwise disjoint;
+//   reasoning over temporal data with them is "Allen's interval
+//   algebra" -- the canonical formal calculus.
+//
+// Algorithm (Allen 1983 -- given two intervals A=[a.first, a.last] and
+// B=[b.first, b.last]):
+//
+//   before(A, B)        : a.last <  b.first                            (A ... B)
+//   meets(A, B)         : a.last == b.first                            (A|B)
+//   overlaps(A, B)      : a.first < b.first && a.last > b.first
+//                         && a.last < b.last                           (A overlaps into B)
+//   starts(A, B)        : a.first == b.first && a.last <  b.last       (A starts B)
+//   during(A, B)        : a.first >  b.first && a.last <  b.last       (A within B)
+//   finishes(A, B)      : a.last  == b.last  && a.first >  b.first     (A finishes B)
+//   equals(A, B)        : a.first == b.first && a.last  == b.last      (A == B)
+//
+//   Each above also has an INVERSE: after = before with args swapped,
+//   etc. We name them as listed in the brief:
+//     after, met_by, overlapped_by, started_by, contains, finished_by
+//
+//   Every pair of intervals matches EXACTLY one of these 13 relations
+//   so the implementation is a top-down decision tree on the four
+//   comparisons (a.first <=> b.first, a.last <=> b.last).
+//
+// Atom timestamps
+//   This module uses an atom's `[created, updated]` window as its
+//   temporal interval: created == first_ns, updated == last_ns. For a
+//   fresh atom these coincide (instant); after an atom_touch/update
+//   they diverge to span the atom's lifetime so far. This is the
+//   canonical "atom was observed from T1 to T2" semantic and matches
+//   the EA_FIRST_NS / EA_LAST_NS pair episodic atoms expose.
+//
+//   The substrate exposes `atom_created(a)` and `atom_updated(a)`
+//   (atom_store.nova A_CREATED / A_UPDATED) -- both monotonic NOVA
+//   tick values. Equal-instant atoms (first == last) compare cleanly:
+//   `before(a, b)` where a is an instant at T and b is the instant at
+//   T+1 holds; `equals(a, b)` where both are instants at T holds.
+//
+// Determinism
+//   No randomness. Same KG snapshot -> bit-identical relation codes.
+//   tmp_query_relation walks atoms in id-ascending order (the same
+//   dense slot order kg_atoms exposes); tmp_chain visits each atom
+//   at most once; tmp_overlap_set returns atoms in id-ascending order.
+//
+// Edge cases
+//   - Atom equal to itself: tmp_relation(a, a) -> ALLEN_EQUALS.
+//   - Missing atom_id (out-of-range or dead slot): all query APIs
+//     return an empty list.
+//   - Empty KG / single atom: tmp_query_relation -> empty;
+//     tmp_chain -> [start_id] (the source itself, no successors);
+//     tmp_overlap_set -> [start_id] (self-overlap).
+//   - Atom whose interval is a single instant (first == last) compares
+//     as expected: `meets(a, b)` holds iff a.last == b.first.
+//   - tmp_chain with max_hops = 0 -> [start_id] (no successors);
+//     max_hops < 0 -> empty.
+//
+// Result layout
+//   - tmp_relation: returns an int_code in 1..13 (see ALLEN_* below).
+//   - tmp_relation_name: returns a short ASCII label (e.g. "before").
+//   - tmp_query_relation: list of atom_ids whose interval stands in
+//     the requested relation to the source. Sorted ASCENDING by id.
+//   - tmp_chain: list of atom_ids forming a maximal "before-chain"
+//     starting at start_id (each step is `before` the next, picking
+//     the earliest-starting successor to maintain determinism).
+//   - tmp_overlap_set: list of atom_ids whose intervals overlap the
+//     source (any of overlaps / overlapped_by / starts / started_by
+//     / during / contains / finishes / finished_by / equals -- i.e.
+//     any relation where the intervals share an instant). Includes
+//     the source itself.
+//
+// ADRs implemented: ADR-0016 (atom design -- created/updated fields),
+//   ADR-0049 (testing). Companion to R11F (LPA), R12C (Louvain),
+//   R13E (PageRank), R18B (link prediction), R15D/R16F/R17E (mini
+//   SPARQL).
+// NOVA dependencies: builtins (lists, push, list_set, len, int_to_str).
+// CrossEngin dependencies: src/kg/atom_store.nova (atom_id, atom_created,
+//   atom_updated), src/kg/multi_kg_manager.nova (kg_atoms, kg_atom,
+//   kg_atom_count).
+
+import "std/io"
+import "std/string"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+
+// ---- Allen 13 relation codes (jointly exhaustive, pairwise disjoint) -----
+//
+// Codes 1..7 are the seven base relations; 8..13 are the six inverses
+// (equals is its own inverse). The unique encoding lets callers compute
+// inverses cheaply and round-trip via tmp_relation_name + tmp_relation_parse.
+let ALLEN_BEFORE         = 1
+let ALLEN_MEETS          = 2
+let ALLEN_OVERLAPS       = 3
+let ALLEN_STARTS         = 4
+let ALLEN_DURING         = 5
+let ALLEN_FINISHES       = 6
+let ALLEN_EQUALS         = 7
+let ALLEN_AFTER          = 8    // inverse of BEFORE
+let ALLEN_MET_BY         = 9    // inverse of MEETS
+let ALLEN_OVERLAPPED_BY  = 10   // inverse of OVERLAPS
+let ALLEN_STARTED_BY     = 11   // inverse of STARTS
+let ALLEN_CONTAINS       = 12   // inverse of DURING
+let ALLEN_FINISHED_BY    = 13   // inverse of FINISHES
+
+// ---- result-tag (distinct from PR=2201, LV=2101, GC=2001, LP=2301) ------
+let TMP_OBJ_TAG = 2401
+
+// ---- interval extraction --------------------------------------------------
+//
+// An atom's temporal interval is [created, updated]. For a fresh atom
+// created == updated; subsequent atom_touch / atom_update bumps the
+// updated tick so the interval widens to the atom's lifetime so far.
+// We expose these as helpers so callers don't have to know which atom
+// field carries which timestamp -- the choice is centralised here.
+fn tmp_first_ns(a) {
+    if a == 0 { return 0 }
+    return atom_created(a)
+}
+
+fn tmp_last_ns(a) {
+    if a == 0 { return 0 }
+    return atom_updated(a)
+}
+
+// ---- the 13-way decision -------------------------------------------------
+//
+// Given two atoms A and B, return one of ALLEN_BEFORE..ALLEN_FINISHED_BY.
+// The decision walks the four comparisons (af<=>bf, al<=>br, al<=>bl,
+// af<=>bl in turn) in the canonical Allen order. Every pair of finite
+// intervals matches EXACTLY one branch; the function is total.
+//
+// Conventional definitions (Allen 1983):
+//   before(A,B)        : al <  bf
+//   meets(A,B)         : al == bf  (and af < bf so they are distinct)
+//   overlaps(A,B)      : af <  bf && al > bf && al < bl
+//   starts(A,B)        : af == bf && al < bl
+//   during(A,B)        : af >  bf && al < bl
+//   finishes(A,B)      : af >  bf && al == bl
+//   equals(A,B)        : af == bf && al == bl
+//
+// Inverses simply swap the operands: after(A,B) iff before(B,A), etc.
+// A self-pair (A == B) yields ALLEN_EQUALS by definition (intervals
+// have identical endpoints).
+fn tmp_relation(a, b) {
+    if a == 0 { return 0 }
+    if b == 0 { return 0 }
+    let af = tmp_first_ns(a)
+    let al = tmp_last_ns(a)
+    let bf = tmp_first_ns(b)
+    let bl = tmp_last_ns(b)
+
+    // STRICT BEFORE: a ends strictly before b begins.
+    if al < bf { return ALLEN_BEFORE }
+    // STRICT AFTER: a begins strictly after b ends.
+    if af > bl { return ALLEN_AFTER }
+
+    // The intervals touch or overlap. Branch on first-endpoint order.
+    if af == bf {
+        // Shared start: equals / starts / started_by.
+        if al == bl { return ALLEN_EQUALS }
+        if al <  bl { return ALLEN_STARTS }
+        return ALLEN_STARTED_BY
+    }
+    if af < bf {
+        // A starts first.
+        if al == bf { return ALLEN_MEETS }
+        if al == bl { return ALLEN_FINISHED_BY }
+        if al >  bl { return ALLEN_CONTAINS }
+        // af < bf, al > bf, al < bl -> classic OVERLAPS.
+        return ALLEN_OVERLAPS
+    }
+    // af > bf -- B starts first.
+    if al == bl { return ALLEN_FINISHES }
+    if al <  bl { return ALLEN_DURING }
+    if af == bl { return ALLEN_MET_BY }
+    // al > bl, af > bf, af < bl -> classic OVERLAPPED_BY.
+    return ALLEN_OVERLAPPED_BY
+}
+
+// ---- human-readable label round-trip -------------------------------------
+//
+// tmp_relation_name(code) returns a stable ASCII label. The labels are
+// the lowercase snake_case names from Allen 1983; they round-trip via
+// tmp_relation_parse(name) -> code (or 0 on unknown).
+fn tmp_relation_name(code) {
+    if code == ALLEN_BEFORE        { return "before" }
+    if code == ALLEN_MEETS         { return "meets" }
+    if code == ALLEN_OVERLAPS      { return "overlaps" }
+    if code == ALLEN_STARTS        { return "starts" }
+    if code == ALLEN_DURING        { return "during" }
+    if code == ALLEN_FINISHES      { return "finishes" }
+    if code == ALLEN_EQUALS        { return "equals" }
+    if code == ALLEN_AFTER         { return "after" }
+    if code == ALLEN_MET_BY        { return "met_by" }
+    if code == ALLEN_OVERLAPPED_BY { return "overlapped_by" }
+    if code == ALLEN_STARTED_BY    { return "started_by" }
+    if code == ALLEN_CONTAINS      { return "contains" }
+    if code == ALLEN_FINISHED_BY   { return "finished_by" }
+    return "?"
+}
+
+// Parse a relation name into its code. Returns 0 on unknown. Accepted
+// inputs: the canonical names returned by tmp_relation_name (lowercase
+// snake_case) plus a few aliases ("met-by" / "metby" / "overlapped-by" /
+// "overlappedby" / "started-by" / "finished-by") so the chat dispatch
+// is permissive in what it accepts.
+fn tmp_relation_parse(name) {
+    if str_eq(name, "before") == 1        { return ALLEN_BEFORE }
+    if str_eq(name, "meets") == 1         { return ALLEN_MEETS }
+    if str_eq(name, "overlaps") == 1      { return ALLEN_OVERLAPS }
+    if str_eq(name, "starts") == 1        { return ALLEN_STARTS }
+    if str_eq(name, "during") == 1        { return ALLEN_DURING }
+    if str_eq(name, "finishes") == 1      { return ALLEN_FINISHES }
+    if str_eq(name, "equals") == 1        { return ALLEN_EQUALS }
+    if str_eq(name, "after") == 1         { return ALLEN_AFTER }
+    if str_eq(name, "met_by") == 1        { return ALLEN_MET_BY }
+    if str_eq(name, "met-by") == 1        { return ALLEN_MET_BY }
+    if str_eq(name, "overlapped_by") == 1 { return ALLEN_OVERLAPPED_BY }
+    if str_eq(name, "overlapped-by") == 1 { return ALLEN_OVERLAPPED_BY }
+    if str_eq(name, "started_by") == 1    { return ALLEN_STARTED_BY }
+    if str_eq(name, "started-by") == 1    { return ALLEN_STARTED_BY }
+    if str_eq(name, "contains") == 1      { return ALLEN_CONTAINS }
+    if str_eq(name, "finished_by") == 1   { return ALLEN_FINISHED_BY }
+    if str_eq(name, "finished-by") == 1   { return ALLEN_FINISHED_BY }
+    return 0
+}
+
+// Return the inverse relation code. equals is its own inverse; the
+// remaining six pairs round-trip via this helper. Useful for callers
+// that want to express "atoms relating to source as X" by querying
+// "source relates to candidate as inverse(X)".
+fn tmp_relation_inverse(code) {
+    if code == ALLEN_BEFORE        { return ALLEN_AFTER }
+    if code == ALLEN_AFTER         { return ALLEN_BEFORE }
+    if code == ALLEN_MEETS         { return ALLEN_MET_BY }
+    if code == ALLEN_MET_BY        { return ALLEN_MEETS }
+    if code == ALLEN_OVERLAPS      { return ALLEN_OVERLAPPED_BY }
+    if code == ALLEN_OVERLAPPED_BY { return ALLEN_OVERLAPS }
+    if code == ALLEN_STARTS        { return ALLEN_STARTED_BY }
+    if code == ALLEN_STARTED_BY    { return ALLEN_STARTS }
+    if code == ALLEN_DURING        { return ALLEN_CONTAINS }
+    if code == ALLEN_CONTAINS      { return ALLEN_DURING }
+    if code == ALLEN_FINISHES      { return ALLEN_FINISHED_BY }
+    if code == ALLEN_FINISHED_BY   { return ALLEN_FINISHES }
+    if code == ALLEN_EQUALS        { return ALLEN_EQUALS }
+    return 0
+}
+
+// ---- public API: query atoms in a given relation to source ---------------
+//
+// Walk every live atom in kg in id-ascending order and emit those whose
+// interval stands in the requested relation to source_atom. Returns a
+// list of atom_ids sorted ASCENDING (the natural walk order). The
+// source atom itself is NOT included (you don't query "atoms related
+// to me as equals" and expect to see yourself); callers that want
+// self-inclusion should pair this with a direct kg_atom check.
+//
+// Returns an empty list when:
+//   - relation_code is out of range (not in ALLEN_*),
+//   - source_atom_id is out of range or dead.
+fn tmp_query_relation(kg, source_atom_id, relation_code) {
+    let out = list_new()
+    if relation_code < ALLEN_BEFORE { return out }
+    if relation_code > ALLEN_FINISHED_BY { return out }
+
+    let src = kg_atom(kg, source_atom_id)
+    if src == 0 { return out }
+
+    let atoms = kg_atoms(kg)
+    let n = len(atoms)
+    let i = 0
+    while i < n {
+        let a = atoms[i]
+        if a != 0 {
+            let aid = atom_id(a)
+            if aid != source_atom_id {
+                // Allen 1983: x R y meaning "x's interval relates to y's
+                // interval as R". We're asking "which atoms a have a R src?"
+                // so we call tmp_relation(a, src) and compare to the code.
+                let rel = tmp_relation(a, src)
+                if rel == relation_code {
+                    push(out, aid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- public API: temporal causal chain ----------------------------------
+//
+// Walk the atoms of kg as a "before-chain" rooted at start_id. Each
+// step picks the live atom WHOSE INTERVAL IS STRICTLY AFTER the current
+// step's (relation BEFORE between current and next) with the EARLIEST
+// first_ns AMONG SUCH CANDIDATES -- ties broken by ASCENDING atom_id.
+// Returns the chain as [start_id, hop_1, hop_2, ...] of length up to
+// max_hops + 1 (the start counts as hop 0). Stops early when no live
+// atom is strictly after the current step.
+//
+// Returns:
+//   - [start_id] when max_hops == 0 (just the source);
+//   - [] when max_hops < 0 or start_id is out of range / dead;
+//   - the full chain otherwise.
+fn tmp_chain(kg, start_id, max_hops) {
+    let out = list_new()
+    if max_hops < 0 { return out }
+    let start = kg_atom(kg, start_id)
+    if start == 0 { return out }
+    push(out, start_id)
+    if max_hops == 0 { return out }
+
+    let atoms = kg_atoms(kg)
+    let n = len(atoms)
+    let cur = start
+    let hops = 0
+    while hops < max_hops {
+        // Find the earliest-first_ns atom strictly AFTER cur.
+        let cur_last = tmp_last_ns(cur)
+        let best_idx = 0 - 1
+        let best_first = 0
+        let i = 0
+        while i < n {
+            let a = atoms[i]
+            if a != 0 {
+                let aid = atom_id(a)
+                if aid != atom_id(cur) {
+                    let af = tmp_first_ns(a)
+                    // Strictly-after: cur.last < a.first (ALLEN_BEFORE
+                    // from cur to a's perspective).
+                    if cur_last < af {
+                        let take = 0
+                        if best_idx == 0 - 1 {
+                            take = 1
+                        } else {
+                            if af < best_first {
+                                take = 1
+                            } else {
+                                if af == best_first {
+                                    if aid < best_idx { take = 1 }
+                                }
+                            }
+                        }
+                        if take == 1 {
+                            best_idx = aid
+                            best_first = af
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if best_idx == 0 - 1 {
+            // No successor -- chain ends here.
+            hops = max_hops
+        } else {
+            push(out, best_idx)
+            cur = kg_atom(kg, best_idx)
+            hops = hops + 1
+        }
+    }
+    return out
+}
+
+// ---- public API: overlap set --------------------------------------------
+//
+// Return the list of all atoms whose intervals overlap (share at least
+// one instant with) the source atom's interval. This is the Allen
+// "shares an instant" set: not BEFORE and not AFTER. The source itself
+// is INCLUDED (an interval trivially overlaps itself; this matches the
+// expected "all 3 of 3" output on a fully-overlapping triad fixture).
+// Returns atom_ids in id-ascending order.
+//
+// Empty when the source atom_id is out of range or dead.
+fn tmp_overlap_set(kg, source_atom_id) {
+    let out = list_new()
+    let src = kg_atom(kg, source_atom_id)
+    if src == 0 { return out }
+
+    let atoms = kg_atoms(kg)
+    let n = len(atoms)
+    let i = 0
+    while i < n {
+        let a = atoms[i]
+        if a != 0 {
+            let aid = atom_id(a)
+            let rel = tmp_relation(a, src)
+            // ALLEN_BEFORE / ALLEN_AFTER are the only relations that
+            // do NOT share an instant. Every other relation has at
+            // least one instant in common -- by definition of Allen's
+            // 13-way decomposition. Include the source itself (the
+            // "trivially overlaps me" entry) per the brief's spec.
+            if rel != ALLEN_BEFORE {
+                if rel != ALLEN_AFTER {
+                    push(out, aid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/temporal <atom_id> <relation>` admin: runs tmp_query_relation for
+// the requested source atom + relation name and emits a single TEMPORAL
+// line. Same emit-line discipline as /predict, /pagerank, /communities.
+//
+// Arg parsing mirrors /predict's _lp_split idiom -- single ASCII-space
+// split. Missing args fall through to a usage line. Unknown relation
+// names print an error.
+
+// Single-space split: returns [first_token, rest]. Duplicated from
+// link_prediction.nova's _lp_split per the "kg/ is a leaf" discipline
+// (temporal.nova must not import link_prediction.nova).
+fn _tmp_split(arg) {
+    let i = 0
+    while i < len(arg) {
+        if char_at(arg, i) == 32 {
+            let pair = list_new()
+            push(pair, substr(arg, 0, i))
+            push(pair, str_trim(substr(arg, i + 1, len(arg) - i - 1)))
+            return pair
+        }
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn tmp_temporal_cmd(kg, arg) {
+    if len(arg) == 0 {
+        io_println("usage: /temporal <atom_id> <relation>"
+            + "  -- relation in {before, after, meets, met_by, overlaps,"
+            + " overlapped_by, starts, started_by, during, contains,"
+            + " finishes, finished_by, equals}")
+        io_println("TEMPORAL store_size=" + int_to_str(kg_atom_count(kg)))
+        return 1
+    }
+
+    let parts1 = _tmp_split(arg)
+    let id_str = parts1[0]
+    let rel_str = parts1[1]
+    let source_id = rt_str_to_int(id_str)
+
+    // Validate the source atom exists.
+    let src = kg_atom(kg, source_id)
+    if src == 0 {
+        io_println("TEMPORAL error=missing source atom_id=" + int_to_str(source_id))
+        return 1
+    }
+
+    if len(rel_str) == 0 {
+        io_println("TEMPORAL error=missing relation source=" + int_to_str(source_id)
+            + " (need one of {before, after, meets, ..., equals})")
+        return 1
+    }
+
+    let rel_code = tmp_relation_parse(rel_str)
+    if rel_code == 0 {
+        io_println("TEMPORAL error=unknown relation='" + rel_str + "' source="
+            + int_to_str(source_id))
+        return 1
+    }
+
+    let hits = tmp_query_relation(kg, source_id, rel_code)
+    let n = len(hits)
+    let buf = "TEMPORAL source=" + int_to_str(source_id)
+        + " relation=" + tmp_relation_name(rel_code)
+        + " hits=" + int_to_str(n)
+        + " ids=["
+    let i = 0
+    while i < n {
+        if i > 0 { buf = buf + " " }
+        buf = buf + int_to_str(hits[i])
+        i = i + 1
+    }
+    buf = buf + "]"
+    io_println(buf)
+    return 1
+}

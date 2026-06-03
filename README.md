@@ -39,7 +39,7 @@ computational units rather than orchestrating a pipeline of modules.
 > peer-table convergence within 8s, observes DEAD-marking within 2s
 > of killing a soul, confirms KG-delta propagation A → B / C). All
 > prior federation suites (R6C/R7C scenario_gg_noise_kg) remain
-> green. Module count: 169. R18C adds `src/io/transducers/audio_wakeword.nova` — a
+> green. Module count: 170. R18C adds `src/io/transducers/audio_wakeword.nova` — a
 > wake-word matched filter built on R17B's MFCC + R7F's VAD via
 > Dynamic Time Warping ("Hey Nova", "Computer", etc.). DTW lattice
 > `D[i][j] = local(input[i], reference[j]) + min(D[i-1][j],
@@ -93,7 +93,36 @@ computational units rather than orchestrating a pipeline of modules.
 > (`tests/integration/scenario_ttt_link_prediction.sh`); all green.
 > All prior KG suites (R6F+R8F episodic, R10C semantic search, R11F
 > LPA, R12C Louvain, R13E PageRank, R15D/R16F/R17E mini-SPARQL)
-> remain bit-identically green. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
+> remain bit-identically green. R19C adds `src/kg/temporal.nova` —
+> Allen's 13-relation interval algebra (Allen 1983, CACM 26(11))
+> over atom `[created, updated]` timestamps. The 13 jointly-exhaustive
+> pairwise-disjoint relations (before, meets, overlaps, starts,
+> during, finishes, equals + their six inverses) are decided by a
+> top-down comparison tree on the four endpoint comparisons; every
+> pair of finite intervals matches exactly one. Public API:
+> `tmp_relation(a, b) -> ALLEN_* code`, `tmp_relation_name(code)`
+> / `tmp_relation_parse(name)` for round-trip,
+> `tmp_relation_inverse(code)` for the symmetric pair,
+> `tmp_query_relation(kg, source_id, relation_code)` for the
+> "atoms in this relation to source" walk (returns ASC by id),
+> `tmp_chain(kg, start_id, max_hops)` for a maximal before-chain
+> picking the earliest-starting successor (ties broken by ASC id),
+> `tmp_overlap_set(kg, atom_id)` for all atoms whose intervals
+> share an instant with the source (includes self). New chat admin:
+> `/temporal <atom_id> <relation>` (relation in `{before, after,
+> meets, met_by, overlaps, overlapped_by, starts, started_by,
+> during, contains, finishes, finished_by, equals}`) prints
+> `TEMPORAL source=X relation=NAME hits=H ids=[A B C ...]`. On a
+> 5-atom temporally-ordered fixture (`[10,20]`, `[30,40]`,
+> `[50,60]`, `[70,80]`, `[90,100]`): `tmp_query_relation(0, AFTER)`
+> returns `{1, 2, 3, 4}`; `tmp_query_relation(2, BEFORE)` returns
+> `{0, 1}`; `tmp_chain(0, 5)` walks `{0, 1, 2, 3, 4}`. On a triadic
+> overlap fixture (`[10,30]`, `[20,40]`, `[25,35]`):
+> `tmp_overlap_set(0)` returns all `{0, 1, 2}`. Inverse pair check:
+> `tmp_relation(A, B) == BEFORE` iff `tmp_relation(B, A) == AFTER`.
+> 80 unit assertions (`tests/unit/test_kg_temporal.nova`) + 21
+> integration assertions (`tests/integration/scenario_xxx_temporal.sh`);
+> all green. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
 > Short-Time Fourier Transform / spectrogram built on an integer-only
 > radix-2 Cooley-Tukey FFT, closing the frequency-domain gap in the
 > audio chain (every prior audio module — R6E Klatt, R7F VAD, R7F

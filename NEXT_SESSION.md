@@ -3,7 +3,132 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R18E (this session) -- federation gossip: SWIM peer discovery + KG delta propagation
+## R19C (this session) -- KG temporal reasoning: Allen's interval algebra over atom timestamps
+
+**Status: complete -- `src/kg/temporal.nova` (NEW, ~350 lines)
+ships the canonical 13-relation interval algebra (Allen 1983,
+"Maintaining knowledge about temporal intervals", CACM 26(11))
+over atom `[created, updated]` timestamps. The KG read story
+already covers structural queries (R15D+R16F+R17E mini-SPARQL),
+retrieval (R6F/R8F episodic, R10C TF-IDF), clustering (R11F LPA,
+R12C Louvain), centrality (R13E PageRank), and link prediction
+(R18B); R19C closes the TEMPORAL-REASONING gap -- reasoning about
+WHEN atoms came into existence relative to each other.**
+
+### What R19C delivers
+
+1. **New module** `src/kg/temporal.nova` -- 13 ALLEN_* relation
+   codes (BEFORE=1, MEETS=2, OVERLAPS=3, STARTS=4, DURING=5,
+   FINISHES=6, EQUALS=7, AFTER=8, MET_BY=9, OVERLAPPED_BY=10,
+   STARTED_BY=11, CONTAINS=12, FINISHED_BY=13); `tmp_relation(a, b)`
+   decides which one via a top-down comparison tree on the four
+   endpoint comparisons; `tmp_relation_name` / `tmp_relation_parse`
+   give a string round-trip; `tmp_relation_inverse` returns the
+   symmetric pair (BEFORE<->AFTER, OVERLAPS<->OVERLAPPED_BY, etc.;
+   EQUALS is self-inverse). Query API:
+   `tmp_query_relation(kg, source_id, relation_code)` returns atoms
+   in that relation to the source (ASC by id); `tmp_chain(kg,
+   start_id, max_hops)` walks a maximal before-chain picking the
+   earliest-starting successor (ties: ASC id); `tmp_overlap_set(kg,
+   atom_id)` returns all atoms whose intervals share an instant
+   with the source (everything except BEFORE / AFTER; includes
+   self). Atom timestamps come from `atom_created` / `atom_updated`
+   (A_CREATED / A_UPDATED slots).
+2. **Chat dispatch** `/temporal <atom_id> <relation>` (+1 import,
+   +1 dispatch, +1 help) prints
+   `TEMPORAL source=X relation=NAME hits=H ids=[A B C ...]`.
+   Missing atom: `TEMPORAL error=missing source atom_id=X`.
+   Unknown relation: `TEMPORAL error=unknown relation='Y'`.
+3. **Verification** -- 80 unit assertions in
+   `tests/unit/test_kg_temporal.nova` (NEW), 21 integration
+   assertions in `tests/integration/scenario_xxx_temporal.sh`
+   (NEW; tracked driver under `_scenario_xxx_temporal_driver/`).
+
+### Integration scenario report
+
+```
+== scenario XXX: Allen interval-algebra temporal reasoning + /temporal command ==
+  PASS  temporal driver source exists
+  PASS  temporal driver exits 0
+  PASS  ordered fixture /temporal 0 after -> 4 atoms
+  PASS  ordered fixture /temporal 0 after -> {1,2,3,4}
+  PASS  ordered fixture /temporal 2 before -> 2 atoms
+  PASS  ordered fixture /temporal 2 before -> {0,1}
+  PASS  tmp_chain(0, 5) length == 5
+  PASS  tmp_chain(0, 5) walks {0,1,2,3,4}
+  PASS  tmp_relation(0, 1) == ALLEN_BEFORE
+  PASS  tmp_relation(1, 0) == ALLEN_AFTER (inverse of BEFORE)
+  PASS  tmp_overlap_set on triadic fixture -> 3 atoms
+  PASS  tmp_overlap_set returns {0,1,2}
+  PASS  TEMPORAL line lands for /temporal 0 after
+  PASS  TEMPORAL line lands for /temporal 2 before
+  PASS  TEMPORAL error= line on missing source
+  PASS  TEMPORAL error= line on unknown relation
+  PASS  /temporal with no arg prints usage
+  PASS  /temporal with no arg prints store_size diagnostic
+  PASS  /temporal 9999 after prints graceful missing-atom error
+  PASS  /temporal 0 after dispatches and emits TEMPORAL line
+  PASS  /help lists /temporal
+integration scenario_xxx_temporal: pass=21 fail=0
+```
+
+All 13 Allen relations are correctly identified on hand-built
+intervals of known geometry (see test cases in
+`tests/unit/test_kg_temporal.nova`):
+
+- BEFORE:        `A=[10,20]`, `B=[30,40]`  (al < bf)
+- MEETS:         `A=[10,20]`, `B=[20,30]`  (al == bf, af < bf)
+- OVERLAPS:      `A=[10,25]`, `B=[20,40]`  (af<bf<al<bl)
+- STARTS:        `A=[10,20]`, `B=[10,30]`  (af==bf, al<bl)
+- DURING:        `A=[15,25]`, `B=[10,30]`  (bf<af, al<bl)
+- FINISHES:      `A=[20,30]`, `B=[10,30]`  (bf<af, al==bl)
+- EQUALS:        `A=[10,20]`, `B=[10,20]`
+- AFTER:         `A=[30,40]`, `B=[10,20]`  (inverse of BEFORE)
+- MET_BY:        `A=[20,30]`, `B=[10,20]`
+- OVERLAPPED_BY: `A=[20,40]`, `B=[10,25]`
+- STARTED_BY:    `A=[10,30]`, `B=[10,20]`
+- CONTAINS:      `A=[10,30]`, `B=[15,25]`
+- FINISHED_BY:   `A=[10,30]`, `B=[20,30]`
+
+Chain test on 5-atom temporally-ordered fixture (`[10,20]`,
+`[30,40]`, `[50,60]`, `[70,80]`, `[90,100]`): `tmp_chain(0, 5)`
+returns `[0, 1, 2, 3, 4]` -- the full causal chain. Pair check:
+`tmp_relation(atom 0, atom 1) == ALLEN_BEFORE = 1`;
+`tmp_relation(atom 1, atom 0) == ALLEN_AFTER = 8` (the brief's
+mandatory inverse-pair check).
+
+### Module count: 170 (was 169; +1 from this agent)
+
+### Files touched
+- NEW: `src/kg/temporal.nova` (~350 lines)
+- NEW: `tests/unit/test_kg_temporal.nova` (80 assertions)
+- NEW: `tests/integration/scenario_xxx_temporal.sh` (21 assertions)
+- NEW: `tests/integration/_scenario_xxx_temporal_driver/temporal_driver.nova`
+- `examples/crossengin_chat.nova` -- 3 lines added
+  (`import "../src/kg/temporal.nova"` + the `/temporal` help line +
+  the dispatch line `if str_eq(cmd, "/temporal") == 1 { return
+  tmp_temporal_cmd(kg, arg) }`)
+- `README.md` -- bumped module count to 170 + R19C highlight block
+- `NEXT_SESSION.md` -- this section
+
+### Gaps for R20+
+
+1. Allen interval-algebra COMPOSITION table (Allen 1983 Table 4):
+   given `X R1 Y` and `Y R2 Z`, derive the disjunction of possible
+   `X R3 Z` relations. This module currently provides only the
+   primitive 13-way decision; the composition table would let
+   reasoning chains compose (e.g. "if A meets B and B starts C,
+   what can we say about A relative to C?").
+2. Path-Consistency algorithm (Allen 1983 §5) for constraint
+   network propagation. Useful for "given partial relation hints,
+   what is the tightest consistent relation between each pair?"
+3. Quantitative time arithmetic on top of the qualitative
+   algebra: "A meets B within 100ms" -- the current module is
+   purely qualitative (no duration thresholds).
+4. Persisting the temporal-query result as a TEMPORAL atom kind
+   so queries become themselves queryable (compose with /query).
+
+## R18E (prior session) -- federation gossip: SWIM peer discovery + KG delta propagation
 
 **Status: complete -- `src/federation/gossip.nova` (NEW, ~750 lines)
 ships SWIM-style (Das et al. 2002, simplified) gossip on top of
