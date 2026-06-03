@@ -11,7 +11,55 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R26E adds `src/federation/gossip_relay.nova` --
+> toolchain. R26C adds `src/io/transducers/audio_noise_reduce.nova` —
+> spectral-subtraction Wiener noise reduction that closes the frequency-
+> domain denoising gap in CrossEngin's audio chain. R14E's noise gate
+> attenuates whole sub-threshold windows wholesale (perfect for chopping
+> inter-utterance silences) but leaves the noise floor that overlaps a
+> speech utterance intact. R26C subtracts the noise in the **per-frame
+> STFT domain** so the bins occupied by speech harmonics stay loud while
+> the broad noise floor between them gets pulled down. Algorithm: estimate
+> per-bin noise PSD `|N(k)|^2` by averaging FFT magnitude-squared across
+> the leading silence frames (first 300 ms by default); for each subsequent
+> frame compute the Wiener gain `H(k) = max(0, |X(k)|^2 - |N(k)|^2) /
+> |X(k)|^2` clamped to `[NR_GAIN_FLOOR_MILLI = 50, NR_GAIN_CEIL_MILLI =
+> 1000]` in milli (Berouti et al. 1979 spectral-floor variant -- the 5%
+> floor avoids "musical noise" artifacts that a hard zero produces);
+> apply the gain to the complex `X(k)` preserving phase; inverse-FFT each
+> frame via R16E `ifft_radix2`; overlap-add with a synthesis Hann window
+> using the standard Griffin-Lim COLA reconstruction `out[t] =
+> sum(time_re_n * h_n) / sum(h_n^2)`. Public API:
+> `nr_estimate_noise(pcm, sample_rate, leading_ms) -> noise_spectrum`,
+> `nr_apply_wiener(pcm, sample_rate, noise_spectrum) -> cleaned_pcm`,
+> `nr_reduce(pcm, sample_rate) -> cleaned_pcm` (convenience: estimate
+> from first 300 ms + apply), plus `nr_rms` / `nr_rms_window` diagnostic
+> helpers. Reuses R16E for the FFT primitives; iSTFT (overlap-add) rolled
+> in this module. Verification: 33 unit assertions in
+> `tests/unit/test_audio_noise_reduce.nova` (NEW; defaults + accessors,
+> noise estimation on noise vs silence, Wiener pass-through on pure
+> signal, silence round-trip, mixed silence-lead + sine + noise drop in
+> noise region while signal region preserved, Klatt /ae/ + LCG noise SNR
+> improvement, length-mismatched noise_spectrum graceful empty return,
+> empty input). 18 integration assertions in
+> `tests/integration/scenario_uuuu_noise_reduce.sh` (NEW; letter `uuuu`
+> free; NOVA driver builds the Klatt + noise fixture, writes both noisy
+> and cleaned WAVs, reports per-region RMS; bash asserts noise-region
+> drop >= 30%, signal-region preserved >= 70%, SNR improved, SNR >= 1.5x
+> improvement; chat /denoise path is driven for /help advertising,
+> bare-usage hint, missing-WAV graceful error, success diagnostic; optional
+> whisper round-trip leg runs when `/usr/local/bin/whisper-main` is
+> present). Calibration on the Klatt /ae/ fixture: noise-region RMS 461 ->
+> 204 (55.7% reduction), signal-region RMS 7703 -> 7607 (99% preserved),
+> SNR 16.7 -> 37.3 (**+6.97 dB, 2.23x improvement**). All prior audio
+> suites stay green. Chat: `/denoise <wav>` admin command wired into
+> `examples/crossengin_chat.nova` (1 import + 1 help + 1 dispatch line).
+> Module count: +1 transducer. Honest scope: R26C ships the classical
+> integer Wiener handling stationary noise; R26C.2 deferred list covers
+> multi-band Wiener, continuous noise re-estimation (R7F VAD-driven),
+> soft-decision Wiener / MMSE-STSA (Ephraim-Malah 1984), DNN-based
+> denoising.
+>
+> R26E adds `src/federation/gossip_relay.nova` --
 > peer-to-peer routing through an intermediary when direct dial
 > isn't possible. R18E shipped SWIM gossip assuming every peer can
 > reach every other peer's TCP port; R23E added NAT-type detection

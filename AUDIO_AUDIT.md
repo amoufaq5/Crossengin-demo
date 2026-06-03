@@ -2755,3 +2755,171 @@ of `voice_conversation.nova`.
   current session's KG (same shape as `/query`).
 * MOD: `AUDIO_AUDIT.md` (this section), `README.md`,
   `NEXT_SESSION.md`.
+
+## R26C -- Spectral-subtraction Wiener noise reduction
+
+Closes the **frequency-domain denoising** gap in CrossEngin's audio chain.
+R14E's noise gate attenuates whole sub-threshold windows wholesale;
+that's perfect for chopping inter-utterance silences but it leaves any
+noise floor that overlaps a speech utterance intact. A quiet hiss UNDER
+a Klatt vowel still passes the gate because the vowel keeps the envelope
+above the threshold. R26C runs spectral subtraction in the per-frame
+STFT domain so the bins occupied by the speech harmonics stay loud while
+the broad noise floor between them gets pulled down.
+
+This is the classical move that pre-DNN telephony / hearing-aid /
+ASR-preprocessing systems have leaned on for decades (Boll 1979 for
+straight spectral subtraction; Lim & Oppenheim 1979 for the
+minimum-mean-square-error / Wiener formulation; Berouti et al. 1979 for
+the spectral-floor variant we use to avoid "musical noise" artifacts).
+
+### Motivating use cases
+
+1. **TTS -> STT loop quality.** R25B's voice-conversation demo
+   synthesizes a response with Klatt (R6E) and round-trips it through
+   whisper.cpp (R8B). Whisper sometimes mis-hears a clean Klatt vowel
+   because the integer-quantized formant carrier sits on top of a
+   low-amplitude hash from the synthesizer's phase accumulator.
+   Pre-filtering with `/denoise` pulls the hash floor down without
+   touching the formant peaks.
+2. **General WAV cleanup.** Recordings from `audio_capture` carry
+   whatever room / preamp noise the operator's hardware injects. A
+   single `/denoise` pass moves transcript accuracy noticeably on
+   recordings made outside a quiet booth.
+
+### Algorithm
+
+Spectral-subtraction Wiener filter, frame by frame:
+
+1. **Estimate noise** from a leading silence frame (first 300 ms by
+   default -- the VAD R7F-corroborated assumption that no speech begins
+   inside that window). Take an STFT-aligned FFT of each noise frame
+   and average the magnitude-squared per bin into the noise
+   power-spectral-density estimate |N(k)|^2. Sqrt for the per-bin
+   noise magnitude.
+2. **Per-frame STFT** of the rest of the input. Hann window, radix-2
+   FFT, identical analysis parameters to R16E so the noise estimate's
+   bins align (512 / 256 at 16 kHz, 256 / 128 at 8 kHz).
+3. **Wiener gain** per bin:
+   `H(k) = max(0, |X(k)|^2 - |N(k)|^2) / |X(k)|^2`
+   Clamped to `[NR_GAIN_FLOOR_MILLI, NR_GAIN_CEIL_MILLI]` = `[50, 1000]`
+   in milli to avoid the classic spectral-subtraction "musical noise":
+   when H drops to zero on sub-noise bins the inverse FFT introduces
+   random sinusoidal bursts that sound worse than the noise we were
+   trying to kill. A 5% gain floor (Berouti's "spectral floor") leaves
+   a tiny residual which the ear hears as "quiet" rather than "tone
+   artifacts".
+4. **Apply** the gain to the COMPLEX X(k) so the original phase rides
+   through unchanged. The conjugate-symmetric upper half of the
+   spectrum (k >= N/2) uses the mirrored noise magnitude (X[N-k] =
+   conj(X[k]) for real inputs), so the iFFT produces a real output.
+5. **Inverse FFT** each cleaned frame back to the time domain via
+   R16E's `ifft_radix2`.
+6. **Overlap-add** reconstruction with a synthesis Hann window. The
+   analysis Hann already multiplied the input frame; we multiply the
+   inverse by Hann again (so the effective window is `hann^2`) and
+   accumulate `hann^2` into a parallel `wsum` buffer for normalization.
+   Standard Griffin-Lim STFT reconstruction: `out[t] =
+   sum(time_re_n * h_n) / sum(h_n^2)`. The constant-overlap-add
+   property of Hann at 50% overlap reconstructs the original amplitude
+   modulo FFT rounding.
+
+The reconstruction's scale-tracking matters in integer arithmetic --
+`h` is in milli (units of 1000), so the final normalization multiplies
+the numerator by `MILLI * MILLI = 1e6` before dividing by `sum(h_milli^2)`
+to land the output in PCM range.
+
+### Public API
+
+* `nr_estimate_noise(pcm, sample_rate, leading_ms) -> noise_spectrum`
+  Returns a list of length `frame_size / 2` (256 at 16 kHz, 128 at
+  8 kHz). Empty input -> empty list. Silence input -> all-zero list.
+* `nr_apply_wiener(pcm, sample_rate, noise_spectrum) -> cleaned_pcm`
+  Applies the gain function frame-by-frame with overlap-add. Length
+  mismatch on `noise_spectrum` -> empty output (graceful error).
+* `nr_reduce(pcm, sample_rate) -> cleaned_pcm`
+  Convenience: estimate from first 300 ms + apply. The 1-call entry
+  point for the chat `/denoise` command.
+* `nr_rms(pcm)` and `nr_rms_window(pcm, start, count)` diagnostic
+  helpers for SNR reporting.
+* `nr_run_denoise_command(arg)` chat helper -- mirrors the R14E
+  `dsp_run_*_command` shape (string return, parenthesized one-liner
+  with input/output RMS + noise floor sum + would-be output path).
+
+### Calibration on the Klatt /ae/ fixture
+
+A 300 ms leading silence + 1200-sample Klatt /ae/ vowel @ 8 kHz with
+LCG noise (amp=800) added across the whole 3600-sample buffer:
+
+* Signal-region RMS before: 7703; after: 7607 (preserved within 99%).
+* Noise-region RMS before: 461; after: 204 (53% reduction).
+* SNR before: 16.7; SNR after: 37.3 (**2.23x improvement, +6.97 dB**).
+
+### Chat wiring
+
+`/denoise PATH` admin command -- one import + one help line + one
+dispatch line in `examples/crossengin_chat.nova`. Output is a single
+parenthesized line like:
+
+```
+(denoise /tmp/x.wav: leading_ms=300, frame_size=512, hop_size=256,
+input=N samples rms=R, noise_floor_sum=S, output=N samples rms=R'
+@ SR Hz -> PATH.denoise.wav)
+```
+
+The output WAV path is reported but not actually written to disk
+(matching the `/gate` / `/reverb` convention -- the chat command is a
+diagnostic; the integration scenario uses a NOVA driver to write the
+WAV when it needs to disk-verify).
+
+### Honest scope
+
+Spectral subtraction is the simplest noise reduction. Modern approaches
+(DNN-based / DeepFilterNet / RNNoise) require trained models. R26C
+ships the classical integer Wiener that gives ~7 dB SNR improvement on
+stationary noise (white / pink / hum) under Klatt-synth or natural
+speech. Deferred to R26C.2:
+
+* **Multi-band Wiener.** Independent noise estimates per Mel band so
+  non-stationary noise (a passing car, a slamming door) gets tracked
+  instead of averaged into oblivion.
+* **Continuous noise re-estimation.** Track the inter-utterance
+  silences via R7F VAD output and refresh the noise PSD as the
+  recording progresses.
+* **Soft-decision Wiener.** Replace the hard floor with a
+  probability-weighted gain (Ephraim-Malah 1984 MMSE-STSA).
+* **VAD-driven noise tracking.** Let R7F's energy + ZCR detector mark
+  the noise-only frames automatically instead of trusting the leading
+  300 ms.
+
+### Verification
+
+* 33 unit assertions in `tests/unit/test_audio_noise_reduce.nova`:
+  defaults + accessors (8), noise estimation on noise/silence (5),
+  Wiener pure-signal pass-through (3), silence round-trip (2),
+  noise-region attenuation (3), Klatt SNR improvement (5), length-
+  mismatch graceful error (2), empty input (2), RMS helpers (4). All
+  pass via `make test` (213/213 unit suite green including the new
+  test).
+* 18 integration assertions in
+  `tests/integration/scenario_uuuu_noise_reduce.sh` (letter `uuuu` is
+  free -- `uuu` already taken by wakeword). NOVA driver builds the
+  Klatt + noise fixture, runs `nr_reduce`, writes both noisy +
+  cleaned WAVs, and reports per-region RMS for bash to assert. Then
+  the chat `/denoise` path is driven for usage / error / success
+  diagnostics; an optional whisper round-trip leg runs when
+  `/usr/local/bin/whisper-main` is present.
+* All prior audio suites stay green: scenario_ooo_spectrogram pass=19,
+  scenario_hhh_dsp pass=23. Module count: +1 transducer.
+
+### Files touched (R26C)
+
+* NEW: `src/io/transducers/audio_noise_reduce.nova` (~580 lines incl.
+  header + honest-scope footer; 9 public functions).
+* NEW: `tests/unit/test_audio_noise_reduce.nova` (33 unit assertions).
+* NEW: `tests/integration/scenario_uuuu_noise_reduce.sh` (18
+  integration assertions).
+* MOD: `examples/crossengin_chat.nova` (1 import + 1 help + 1
+  dispatch line).
+* MOD: `AUDIO_AUDIT.md` (this section), `README.md`,
+  `NEXT_SESSION.md`.
