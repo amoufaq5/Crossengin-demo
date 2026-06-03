@@ -11,7 +11,42 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R22F.2 extends `src/io/transducers/audio_pitch.nova` (R10F +
+> toolchain. R26E adds `src/federation/gossip_relay.nova` --
+> peer-to-peer routing through an intermediary when direct dial
+> isn't possible. R18E shipped SWIM gossip assuming every peer can
+> reach every other peer's TCP port; R23E added NAT-type detection
+> but UDP hole-punching is stubbed pending NOVA `sendto`/`recvfrom`.
+> Until full NAT traversal, peers behind symmetric NATs or strict
+> firewalls cannot reach each other directly. R26E's relay closes
+> that gap: when peer A wants to send to peer B but the direct dial
+> fails, A picks a common-reachable peer C, sends RELAY\_REQ to C,
+> C verifies it can reach B + forwards as RELAY\_DATA with
+> via=C, from=A annotations. B records the relayed payload + the
+> via annotation so diagnostics confirm the A->C->B path; A caches
+> (target=B, via=C) so the second send to B short-circuits straight
+> to the relay path. The wire piggybacks on the existing R18E
+> plaintext v1 gossip listener (HELLO/OK handshake reused; three new
+> message types RELAY\_REQ / RELAY\_DATA / RELAY\_ACK additive to
+> the existing PING/MEMBER/DELTA/ATOM/DQUERY/ATTESTATION/SNAP\_FETCH/
+> RULE/DRFETCH/DERIVATION/EXTADDR set). Public API:
+> `relay_init(gossip_state) -> relay_state`,
+> `relay_send(relay, target, payload) -> 1 ok | 0 error`
+> (auto-routes: direct first, falls back to relay),
+> `relay_handle_request(relay, line) -> 1 forwarded` (peer-relay
+> dispatch), `relay_chosen_via(relay, target) -> peer_addr | -1`
+> (cache diagnostics), `relay_drain_inbound(relay) -> count` (called
+> per tick to process inbound queues populated by gossip dispatchers).
+> Honest scope: TCP-based relay over pre-known mesh peers; any alive
+> peer can serve as relay. Full STUN-like relay discovery (rank
+> candidate relays by observed NAT topology) and Noise-XK wrapping of
+> the relay segments are R26E.2. Verification: 61 unit assertions in
+> `tests/unit/test_gossip_relay.nova` (wire codec round-trips, parse
+> rejection on bad shapes, intermediate selection, cache idempotence,
+> received-queue annotations); 13 integration assertions in
+> `tests/integration/scenario_vvvv_gossip_relay.sh` (3-soul A->C->B
+> mesh, test hook simulates partition without iptables, asserts
+> via=ADDR\_C from=ADDR\_A annotation round-trips, cache hit on
+> second send). R22F.2 extends `src/io/transducers/audio_pitch.nova` (R10F +
 > R11B's file) with a harmonicity-driven auto-switch between R10F
 > autocorrelation and R11B YIN. R22F (audio_melody) chose R10F by default
 > because R11B YIN's octave-down anti-snap subharmonic-collapses pure sines;

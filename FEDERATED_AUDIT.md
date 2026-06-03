@@ -1594,3 +1594,150 @@ Plus diagnostics (`sr_status_line`, `sr_pending_fetch_tasks`,
    pre-line-wraps at ~80-120 chars in practice; large blobs (e.g.
    serialised episodic moments) would need a binary frame or
    chunked text encoding.
+
+## R26E extension: gossip relay -- routing through intermediaries
+
+R18E shipped the SWIM gossip mesh assuming every peer can directly
+TCP-connect to every other peer. R23E added NAT-type detection but
+UDP hole-punching is stubbed (R23E.2). Until full NAT traversal:
+peers behind symmetric NATs or strict firewalls can't reach each
+other directly. R26E closes that gap with a TCP-based relay
+primitive: when peer A wants to send to peer B but the direct dial
+fails, A picks a common-reachable peer C, sends RELAY\_REQ to C, C
+verifies it can reach B + forwards as RELAY\_DATA with via=C, from=A
+annotations. B records the relayed payload + the via annotation
+so diagnostics can confirm the A->C->B path; A caches (target=B,
+via=C) so the second send to B short-circuits straight to the
+relay path.
+
+### Honest scope
+
+True NAT relay needs UDP hole-punching for ad-hoc relay selection
+(measure connectivity rather than relying on prior mesh
+membership). R26E ships the TCP-based relay over pre-known mesh
+peers -- any alive peer can serve as relay. The intermediate
+selection policy is "first non-target alive peer != self that
+isn't currently marked unreachable"; full STUN-like relay
+discovery (rank by observed NAT topology) is R26E.2. ACK
+forwarding back to the originator is best-effort: the relay caches
+the working via on first success so ACK loss does not require
+recomputation.
+
+### Wire shape
+
+Three new gossip message types (additive to R18E):
+
+```
+RELAY_REQ <req_id> <target> <origin> <payload>\n
+RELAY_DATA <req_id> <target> <via> <from> <payload>\n
+RELAY_ACK <req_id> <origin> <via>\n
+```
+
+The payload may contain spaces (the parser rejoins toks beyond the
+fixed positional fields back into one string). req\_id is a per-
+originator monotonic counter; collisions across souls are
+disambiguated by the from= annotation on RELAY\_DATA.
+
+### Public API
+
+```
+relay_init(gossip_state)            -> relay_state
+relay_send(relay, target, payload)  -> 1 ok | 0 error
+    Auto-routes: direct first, falls back to relay via common alive peer
+relay_handle_request(relay, line)   -> 1 forwarded | 0 dropped
+relay_handle_data(relay, line)      -> 1 delivered | 0 dropped
+relay_handle_ack(relay, line)       -> 1 noted | 0 dropped
+relay_chosen_via(relay, target)     -> int_peer_addr | -1
+relay_drain_inbound(relay)          -> count of inbound lines processed
+relay_pick_intermediate(relay, t)   -> peer_addr | 0
+relay_cache_via(relay, target, via) -> 1
+relay_mark_unreachable(relay, peer) -> 1  (test hook for partition simulation)
+```
+
+Plus stats accessors (`relay_stats_sent_direct`,
+`relay_stats_sent_via_relay`, `relay_stats_forwarded`,
+`relay_stats_acked`, `relay_stats_no_relay`, `relay_stats_delivered`)
+and the gossip hook surface (`gossip_set_relay_state`,
+`gossip_relay_state`, `gossip_relay_status_line`, plus per-message-
+type rx counters `gossip_stats_relay_req_rx` / `_data_rx` / `_ack_rx`).
+
+### Import-graph hygiene
+
+The same coordination pattern R21B uses for distributed-rule
+inference: gossip.nova OWNS the wire prefixes + the per-message-
+type inbound dispatchers (`_gossip_serve_relay_req` / `_data` /
+`_ack`). Each dispatcher pushes the raw wire line onto a pinned
+queue inside relay\_state (`RELAY_S_INBOUND_REQS` = 11 / `_DATA` =
+12 / `_ACKS` = 13). The relay's `relay_drain_inbound` is called
+from the daemon loop (or the integration scenario's per-tick body),
+parses each queued line, and invokes the correct handler. This
+keeps the gossip -> relay import direction unidirectional
+(gossip\_relay imports gossip, never the reverse).
+
+### Gossip state slots added
+
+R26E adds 4 new slots to gossip\_state (extending the linear layout
+the R20F / R21B / R21E / R23C / R23E sprints established):
+
+```
+GOSSIP_S_RELAY_STATE          = 35  // relay_state_t or 0
+GOSSIP_S_STATS_RELAY_REQ_RX   = 36  // RELAY_REQ wire-level rx counter
+GOSSIP_S_STATS_RELAY_DATA_RX  = 37  // RELAY_DATA wire-level rx counter
+GOSSIP_S_STATS_RELAY_ACK_RX   = 38  // RELAY_ACK wire-level rx counter
+```
+
+### Verification
+
+* Unit (`tests/unit/test_gossip_relay.nova`): **61 assertions**
+  covering wire format round-trips (request / data / ack format +
+  parse, including spaces-in-payload preservation), parse rejection
+  for malformed lines (bad prefix, non-numeric id, truncated
+  shapes), intermediate selection (skips target + self + unreachable,
+  returns 0 when no candidates), relay\_send behaviours (no peers
+  -> no\_relay+1, cache short-circuit, cache idempotence,
+  relay\_chosen\_via lookup), relay\_handle\_data records inbound
+  with via/from annotations + bumps delivered, relay\_handle\_data
+  drops misrouted, relay\_handle\_request drops self-loop, drain
+  helper processes all three queues + clears them, stats\_line
+  format.
+
+* Integration (`tests/integration/scenario_vvvv_gossip_relay.sh`):
+  **13 assertions** on a 3-soul mesh (random local ports). Souls A,
+  B, C bind + bootstrap; A's relay marks B direct-unreachable
+  (test hook simulates a NAT/firewall partition without
+  iptables); A calls relay\_send(B, payload). The relay layer
+  walks A's alive peers, picks C, sends RELAY\_REQ. C's gossip
+  handler dispatches to its inbound queue; C's drain invokes
+  relay\_handle\_request, which dials B and forwards as RELAY\_DATA
+  with via=C, from=A. B's gossip handler dispatches; B's drain
+  invokes relay\_handle\_data which records the (req\_id, payload,
+  via, from) tuple. Asserts: NOVA pre-flight OK, all 3 souls
+  compile + run, A's first relay\_send returned 1 + sent\_via=1,
+  A's cache via=ADDR\_C, A's second send hit cache + sent\_via=2,
+  C's wire-level req\_rx >= 1, C's forwarded >= 1, B's wire-level
+  data\_rx >= 1, B's received-queue >= 1, B's recv\[0\] annotated
+  via=ADDR\_C from=ADDR\_A (the A->C->B path is confirmed by the
+  annotation round-trip).
+
+### Limitations / future work
+
+1. **No peer-side reachability check before relay selection.** C
+   may forward to B and discover B is unreachable from C too; the
+   originator gets a NACK in the form of a missing RELAY\_ACK and
+   has to retry with a different relay. R26E.2 will add a
+   pre-flight check.
+2. **No multi-hop chains.** R26E ships 2-hop relay (A->C->B).
+   N-hop chains require explicit hop count + loop prevention; the
+   substrate is in place but not exposed.
+3. **No relay-side authentication.** Anyone alive on the mesh can
+   ask C to relay. A future hardening: require origin = peer A
+   has registered C's pubkey for relay duties.
+4. **TCP-only.** The wire is plaintext gossip v1 (HELLO / OK /
+   RELAY\_REQ / BYE). R26E.2 will wrap the relay segments under
+   R21E's Noise XK transport so the relay can be untrusted at
+   the application layer while still preserving end-to-end
+   confidentiality between originator and target.
+5. **ACK forwarding is best-effort.** The relay (C) sends an ACK
+   back to A on successful forward; A's stats record the ACK
+   when it arrives. The cache update happens at send-time, not
+   at ack-time, so ACK loss does not break the per-target cache.

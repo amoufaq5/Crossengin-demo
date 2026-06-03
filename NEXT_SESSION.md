@@ -3,6 +3,232 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R26C (this session) -- Audio noise reduction (spectral-subtraction Wiener)
+
+**Status: complete -- new `src/io/transducers/audio_noise_reduce.nova`
+(~580 lines) closes the frequency-domain denoising gap in CrossEngin's
+audio chain. Public API: `nr_estimate_noise(pcm, sample_rate,
+leading_ms) -> noise_spectrum`, `nr_apply_wiener(pcm, sample_rate,
+noise_spectrum) -> cleaned_pcm`, `nr_reduce(pcm, sample_rate) ->
+cleaned_pcm` (convenience). Reuses R16E's `fft_radix2` /
+`ifft_radix2` for the analysis / synthesis primitives; adds the
+spectral-subtraction gain layer + Hann overlap-add reconstruction on
+top.**
+
+### What R26C delivers
+
+1. **New module** -- `src/io/transducers/audio_noise_reduce.nova`. Spectral-
+   subtraction Wiener filter, frame by frame. Estimates noise PSD from
+   the first 300 ms (default leading_ms) of the input via R16E STFT,
+   computes per-bin Wiener gain `H(k) = max(0, |X|^2 - |N|^2) / |X|^2`
+   clamped to `[NR_GAIN_FLOOR_MILLI = 50, NR_GAIN_CEIL_MILLI = 1000]`
+   in milli to avoid the classic "musical noise" artifact, applies the
+   gain to the complex X(k) (preserving phase), inverse-FFTs each
+   frame, and overlap-adds with a synthesis Hann window. Standard
+   Griffin-Lim STFT reconstruction.
+
+2. **Chat dispatch** -- `/denoise <wav>` admin command. Single dispatch
+   + single help line in `examples/crossengin_chat.nova`; one import
+   added at the file head (same shape as R14E `/gate` and `/reverb`).
+   Output is a parenthesized one-liner like:
+   `(denoise /tmp/x.wav: leading_ms=300, frame_size=512, hop_size=256,
+   input=N samples rms=R, noise_floor_sum=S, output=N samples rms=R'
+   @ 8000 Hz -> /tmp/x.wav.denoise.wav)`. The output WAV path is
+   reported but not written to disk by the chat command -- callers
+   that need the WAV use the public Nova API from a driver (the
+   integration scenario does this).
+
+3. **SNR improvement verified** -- on a fixture of 300 ms leading
+   silence + Klatt /ae/ vowel + LCG-additive noise:
+   * Noise-region RMS dropped 461 -> 204 (-55.7%)
+   * Signal-region RMS preserved 7703 -> 7607 (-1.3%)
+   * **SNR (signal_rms / noise_rms): 16.7 -> 37.3 (+6.97 dB, 2.23x
+     improvement)**
+
+### Verification
+
+* 33 unit assertions in `tests/unit/test_audio_noise_reduce.nova`
+  (NEW): defaults + accessors (8); noise estimation on pure-noise +
+  silence (5); Wiener pass-through on signal-only (3); silence
+  round-trip (2); mixed noise-region attenuation (3); Klatt + noise
+  SNR improvement (5); length-mismatched `noise_spectrum` graceful
+  empty return (2); empty input (2); RMS helpers (4).
+* 18 integration assertions in
+  `tests/integration/scenario_uuuu_noise_reduce.sh` (NEW; letter
+  `uuuu` is free). Driver builds the Klatt + LCG noise fixture,
+  writes both noisy and cleaned WAVs, reports per-region RMS so the
+  bash side can assert: noise-region drop >= 30%; signal-region
+  preserved >= 70%; SNR improved; SNR improvement >= 1.5x. Then the
+  chat path is driven for `/help` advertising, bare-usage hint,
+  missing-WAV graceful error, and a successful round-trip diagnostic
+  on the synthesized fixture. Optional whisper round-trip leg runs
+  when `/usr/local/bin/whisper-main` is present.
+* `bash scripts/test.sh` -- **213 / 213 unit tests pass**, including
+  the new R26C test.
+* `bash tests/integration/scenario_uuuu_noise_reduce.sh` -- **18 PASS
+  / 0 FAIL** with whisper installed.
+* No prior audio scenarios regressed: scenario_ooo_spectrogram (19/0),
+  scenario_hhh_dsp (23/0) verified green.
+
+### Honest scope (R26C.2 list)
+
+Spectral subtraction is the simplest noise reduction. R26C ships the
+classical integer Wiener that handles **stationary** noise (white,
+pink, room hum, electrical hash) under a speech-region that dominates
+the noise floor. Deferred to R26C.2:
+
+* **Multi-band Wiener.** Independent noise estimates per Mel band so
+  non-stationary noise (a passing car, a slamming door) gets tracked
+  per-band rather than averaged into the broadband estimate.
+* **Continuous noise re-estimation.** Track inter-utterance silences
+  via R7F VAD and refresh the noise PSD as the recording progresses,
+  so the algorithm handles drifting room noise across long takes.
+* **Soft-decision Wiener** / **MMSE-STSA** (Ephraim-Malah 1984).
+  Replaces the hard `[floor, ceil]` clamp with a probability-weighted
+  gain conditioned on a speech-presence prior.
+* **DNN-based denoising** (DeepFilterNet, RNNoise). Off-roadmap for
+  a non-LLM substrate; would require either model bundling or an
+  external bridge.
+
+### Files touched (R26C)
+
+* NEW: `src/io/transducers/audio_noise_reduce.nova` (~580 lines).
+* NEW: `tests/unit/test_audio_noise_reduce.nova` (33 unit assertions).
+* NEW: `tests/integration/scenario_uuuu_noise_reduce.sh` (18 integration
+  assertions).
+* MOD: `examples/crossengin_chat.nova` (1 import + 1 help + 1 dispatch
+  line).
+* MOD: `AUDIO_AUDIT.md` (new R26C section), `README.md`,
+  `NEXT_SESSION.md` (this).
+
+## R26E (this session) -- Federation gossip relay (route via intermediary)
+
+**Status: complete -- new `src/federation/gossip_relay.nova` (~540
+lines) closes the R23E NAT-traversal gap on the routing side. When
+peer A wants to send to peer B but can't directly TCP-connect (B is
+behind a symmetric NAT, A is firewalled outbound to B's port, etc.),
+the relay routes via a common-reachable peer C using new wire types
+RELAY_REQ / RELAY_DATA / RELAY_ACK piggybacked on the existing
+gossip v1 listener.**
+
+### What R26E delivers
+
+1. **New module** -- `src/federation/gossip_relay.nova`. Public API:
+   `relay_init(gossip_state) -> relay_state`,
+   `relay_send(relay, target, payload) -> 1 ok | 0 error`
+   (auto-routes: direct dial first, falls back to relay via common
+   alive peer), `relay_handle_request(relay, line) -> 1 forwarded |
+   0 dropped` (peer-relay forwards as RELAY_DATA),
+   `relay_handle_data(relay, line) -> 1 delivered` (terminal
+   receiver records via + from annotations),
+   `relay_chosen_via(relay, target) -> int_peer_addr | -1` (cache
+   diagnostics), `relay_drain_inbound(relay) -> count` (called per
+   tick from the daemon loop to process the per-message-type
+   inbound queues populated by gossip's dispatchers).
+
+2. **gossip.nova extension** -- 4 new state slots
+   (`GOSSIP_S_RELAY_STATE = 35` + 3 per-message-type rx counters),
+   3 new wire prefixes (`RELAY_REQ ` / `RELAY_DATA ` / `RELAY_ACK
+   `), 3 new dispatcher branches in each of `gossip_handle_conn` /
+   `gossip_handle_conn_kg` / `gossip_handle_conn_kg_gconn` (the
+   noise-aware variant). Dispatchers push raw wire lines onto
+   pinned queues inside relay_state (slots 11-13); the relay
+   module's drain helper consumes them. This breaks the would-be
+   import cycle (gossip_relay imports gossip; gossip never imports
+   gossip_relay).
+
+3. **Wire shapes** (additive to R18E):
+   ```
+   RELAY_REQ <req_id> <target> <origin> <payload>\n
+   RELAY_DATA <req_id> <target> <via> <from> <payload>\n
+   RELAY_ACK <req_id> <origin> <via>\n
+   ```
+   Payload may contain spaces (parser rejoins toks after the fixed
+   positional fields). req_id is a per-originator monotonic
+   counter.
+
+4. **Cache short-circuit** -- A's first send walks alive peers,
+   picks C as intermediate, sends, caches (target=B, via=C). A's
+   second send to B looks up the cache first; cache hit jumps
+   directly to the relay path, no peer walk. The integration
+   scenario observes sent_via_relay=1 after first send, =2 after
+   second (cache hit).
+
+5. **Test hook** -- `relay_mark_unreachable(relay, peer)` lets the
+   integration scenario simulate a NAT/firewall partition without
+   needing iptables / SO_REUSEPORT. relay_send consults this set
+   first and skips the direct-dial attempt when the target is
+   marked unreachable.
+
+### Verification
+
+* **61 unit assertions** in `tests/unit/test_gossip_relay.nova`
+  covering: wire format round-trips for all 3 message types
+  (including spaces-in-payload preservation); parse rejection for
+  bad-prefix / non-numeric-id / truncated shapes; intermediate
+  selection (skips target + self + unreachable; returns 0 with no
+  candidates); relay_send returns 0 with no peers + bumps
+  no_relay; relay_chosen_via lookup; cache idempotence (update
+  overwrites); relay_handle_data records inbound with via/from +
+  bumps delivered; relay_handle_data drops misrouted; relay_handle_
+  request drops self-loop; drain helper processes all three
+  queues + clears them; stats_line format.
+
+* **13 integration assertions** in
+  `tests/integration/scenario_vvvv_gossip_relay.sh` (letter `vvvv`
+  free in the alphabetic sequence; aaaa..ttt taken). 3-soul mesh
+  with A as originator, B as receiver, C as intended relay. A
+  marks B direct-unreachable (test hook), calls relay_send twice.
+  Asserts: NOVA socket pre-flight, 3-driver compile + run, A's
+  send1 returned 1 with sent_via=1, A's cache via=ADDR_C, A's
+  send2 used cache with sent_via=2, C's wire-level req_rx >= 1,
+  C's relay forwarded >= 1, B's wire-level data_rx >= 1, B's
+  received-queue >= 1, B's recv[0] annotated via=ADDR_C
+  from=ADDR_A. ALL 13 PASS.
+
+* `bash scripts/test.sh` -- 212 unit tests pass (1 new). All
+  existing federation tests (scenario_www_gossip,
+  scenario_hhhh_gossip_noise, scenario_oooo_nat_traversal,
+  scenario_mmmm_snap_replication) unaffected.
+
+### Honest scope (R26E.2 list)
+
+R26E ships TCP-based relay over pre-known mesh peers. Deferred:
+
+* **Full STUN-like relay discovery.** R26E picks the first
+  non-target alive peer; a proper picker would rank by observed
+  NAT topology (cone > symmetric > blocked) using R23E's nat_state
+  type annotation.
+* **UDP relay path.** TCP-based requires both A and C to be able
+  to OUT-dial. A truly symmetric A would also need to listen for
+  hole-punched UDP; pending NOVA `sendto`/`recvfrom`.
+* **Pre-flight reachability check.** C currently dials B
+  blindly; the originator detects failure via missing ACK only.
+* **Multi-hop chains.** R26E ships 2-hop (A->C->B). N-hop with
+  loop prevention is a substrate extension.
+* **Relay-side auth.** Anyone on the mesh can ask C to relay; a
+  pubkey-gated relay table is a future hardening.
+* **Noise-XK wrapped relay.** R21E protects PING/ACK on the
+  noise transport; R26E.2 extends the wrap to RELAY_*.
+* **ACK forwarding is best-effort.** The relay cache populates at
+  send-time, not at ack-time, so ACK loss does not break the
+  per-target cache.
+
+### Files touched (R26E)
+
+* NEW: `src/federation/gossip_relay.nova` (~540 lines, ~25 public
+  functions).
+* NEW: `tests/unit/test_gossip_relay.nova` (61 assertions).
+* NEW: `tests/integration/scenario_vvvv_gossip_relay.sh` (13
+  assertions).
+* MOD: `src/federation/gossip.nova` (4 new state slots, 3 wire
+  prefixes, 3 dispatcher branches in 3 handlers, 1 setter +
+  4 stats accessors + 1 status line).
+* MOD: `examples/crossengin_chat.nova` (+1 help + 1 dispatch line
+  = 2 lines, within the brief's allowance).
+* MOD: `FEDERATED_AUDIT.md` (new R26E section), `NEXT_SESSION.md`
+  (this), `README.md`.
+
 ## R26F (this session) -- Performance regression hunt against R25E baseline
 
 **Status: complete -- zero regressions found across 5 trials of every
