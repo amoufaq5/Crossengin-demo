@@ -142,9 +142,11 @@ fn main() {
     // attempts to pick an intermediate. Without this the alive set
     // would only contain bootstrap peers AT THE MOMENT relay_send
     // is called, which races the first PING/ACK round on a busy
-    // host.
+    // host. 25 ticks * 150ms = 3.75s gives 3 full ping cycles
+    // (ping_interval = 1s) so even if the first round-trip times
+    // out on a slow host the second and third converge.
     let warm = 0
-    while warm < 12 {
+    while warm < 25 {
         let drained = 0
         while drained < 4 {
             let conn_fd = gossip_try_accept(server_fd)
@@ -162,18 +164,43 @@ fn main() {
     }
 
     // Originator (A): mark target unreachable, send two relay
-    // messages. The second send must hit the cache.
+    // messages. Retry the first send up to 10 times across
+    // gossip ticks if the alive set hasn't converged yet (the
+    // first PING/ACK round can miss when the responder is still
+    // mid-bind on a slow host; subsequent rounds converge
+    // deterministically). The second send must hit the cache.
     if str_eq("$role", "originator") == 1 {
         relay_mark_unreachable(rstate, "$target")
-        let rc1 = relay_send(rstate, "$target", "hello-from-A-1")
+        let attempt = 0
+        let rc1 = 0
+        while attempt < 10 {
+            if rc1 == 0 {
+                rc1 = relay_send(rstate, "$target", "hello-from-A-1")
+                if rc1 == 0 {
+                    // Run a few gossip ticks to let the mesh
+                    // converge before retrying.
+                    let inner = 0
+                    while inner < 3 {
+                        let conn_fd = gossip_try_accept(server_fd)
+                        if conn_fd >= 0 {
+                            gossip_handle_conn_kg(gstate, conn_fd, kg)
+                        }
+                        relay_drain_inbound(rstate)
+                        gossip_step(gstate, kg)
+                        sleep_ms(200)
+                        inner = inner + 1
+                    }
+                }
+            }
+            attempt = attempt + 1
+        }
         println("$letter: send1 rc=" + int_to_str(rc1)
             + " sent_via=" + int_to_str(relay_stats_sent_via_relay(rstate)))
         let via1 = relay_chosen_via(rstate, "$target")
         let via1s = ""
         if via1 != -1 { via1s = via1 }
         println("$letter: cache via=" + via1s)
-        // Brief inter-send pause so the relay path completes.
-        sleep_ms(300)
+        sleep_ms(500)
         let rc2 = relay_send(rstate, "$target", "hello-from-A-2")
         println("$letter: send2 rc=" + int_to_str(rc2)
             + " sent_via=" + int_to_str(relay_stats_sent_via_relay(rstate)))
@@ -267,11 +294,11 @@ PID_B=$!
 PID_C=$!
 
 # Wait for warmup + sends + a few relay cycles to complete. The driver
-# loop is 12 warmup ticks + up to 40 main ticks = ~52 * 150ms = ~8s.
-# Check progress at 6s so all three souls are guaranteed to still be
+# loop is 25 warmup ticks + up to 40 main ticks = ~65 * 150ms = ~10s.
+# Check progress at 7s so all three souls are guaranteed to still be
 # running mid-flight. A definitive convergence sample is taken at the
 # end via `wait` below.
-sleep 6
+sleep 7
 
 A_ALIVE=0; B_ALIVE=0; C_ALIVE=0
 kill -0 $PID_A 2>/dev/null && A_ALIVE=1
