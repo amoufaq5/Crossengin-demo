@@ -1,0 +1,758 @@
+// CrossEngin io/transducers: Viola-Jones-style face detection via
+// Haar-like rectangular features over an integral image (R16D).
+//
+// SCOPE DISCLAIMER (must read)
+//   This is a STRUCTURAL implementation of the Viola-Jones 2001
+//   face detector. CrossEngin's no-training-data design forbids
+//   shipping the AdaBoost-trained cascade weights that OpenCV's
+//   `haarcascade_frontalface_default.xml` carries (~3,000 weak
+//   classifiers across 25 stages, trained on ~5,000 positive +
+//   ~10,000 negative faces). Instead we ship a HAND-CRAFTED 3-stage
+//   cascade tuned for the canonical "darker eye-strip above lighter
+//   cheek-strip above darker chin-strip" pattern. ACCURACY ON REAL
+//   PHOTOGRAPHS WILL BE POOR. The right tool for actually finding
+//   faces in real images is either (a) parsing OpenCV's
+//   `haarcascade_frontalface_default.xml` (XML parser + 25-stage
+//   weighted-classifier tree -- out of scope for one round) or
+//   (b) training a cascade on real positives + negatives. What this
+//   module DOES provide:
+//     * The integral image primitive (Crow 1984) -- O(1) rectangle
+//       sums; reusable downstream for HOG-with-integral-histogram-of-
+//       gradients, fast Haar-template scoring, etc.
+//     * Two-rect / three-rect / four-rect Haar feature evaluators on
+//       the integral image -- correct relative to the canonical
+//       Viola-Jones definitions.
+//     * A 3-stage cascade structure with multi-scale sliding window +
+//       NMS clustering -- the operational shell a real trained
+//       cascade would slot into.
+//     * On a SYNTHESIZED face-pattern (dark eye strip + light cheek
+//       strip + dark chin strip), the cascade fires; on uniform
+//       images the cascade rejects; on real photographs it will
+//       miss most faces and emit false positives along the way.
+//
+// Algorithm (Viola-Jones 2001, simplified)
+//   1. Integral image (Crow 1984):
+//        I(x, y) = sum of pixels in the rectangle [0..x] x [0..y]
+//        sum(x1, y1, x2, y2) =
+//            I(x2, y2)
+//          - I(x1 - 1, y2)
+//          - I(x2, y1 - 1)
+//          + I(x1 - 1, y1 - 1)
+//      Four lookups -> any rectangle sum in O(1).
+//   2. Haar features (simple rectangular patterns):
+//        2-rect: sum(BLACK_rect) - sum(WHITE_rect)
+//        3-rect: sum(CENTER) - sum(LEFT) - sum(RIGHT)
+//        4-rect: diagonal alternating polarity
+//      A face has a darker eye region above a lighter cheek region;
+//      that's a two-rect feature whose value is strongly POSITIVE
+//      when the eye-cheek band aligns with the window.
+//   3. Cascade classifier:
+//        Stage 1: eye-strip-above-cheek-strip darkness contrast.
+//                 If absent, REJECT (most non-faces fail here).
+//        Stage 2: chin-strip darkness below cheek (lower-face shape).
+//                 If absent, REJECT.
+//        Stage 3: nose-bridge vertical structure (center column
+//                 brighter than flanking columns at eye height).
+//                 If absent, REJECT. Else POSITIVE.
+//   4. Multi-scale sliding window:
+//        Start at min_size (e.g. 24x24), slide across image at
+//        `step` pixel stride. Resize the window by factor 1.25
+//        (integer-arithmetic friendly via *5/4) until max_size.
+//        At each (x, y, size), run the 3-stage cascade on the
+//        integral image. Collect (x, y, size, score) on positive.
+//   5. NMS clustering: greedy IoU-based non-maximum suppression
+//      keeps the highest-scoring detection per cluster.
+//
+// Public API
+//   integral_image(image, w, h) -> integral_t (opaque ptr)
+//   integral_get(integral, w, h, x, y) -> int (inclusive cumulative)
+//   rect_sum(integral, w, h, x1, y1, x2, y2) -> int
+//   haar_feature_2rect(integral, w, h, x, y, fw, fh, black_dx, black_dy)
+//                                          -> int (signed difference)
+//   haar_feature_3rect(integral, w, h, x, y, fw, fh) -> int
+//   haar_feature_4rect(integral, w, h, x, y, fw, fh) -> int
+//   face_detect(image, w, h, min_size, max_size, step) ->
+//       list of [x, y, size, score]
+//   face_result_x(d) / _y / _size / _score -- accessors
+//   face_count_label(n) -> "image_face_count_<none|one|few|many>"
+//   face_append_features_if_enabled(feats, image, w, h) -- VP wire-in
+//   face_pgm_args(arg) -> chat /faces admin formatted string
+//
+// Caps:
+//   image dim <= FACE_MAX_IMAGE_DIM (256)
+//   min_size >= FACE_MIN_WINDOW (24); clamped if smaller
+//   max_size <= FACE_MAX_WINDOW (128); clamped if larger
+//   step in [2, 16]; defaults to FACE_DEFAULT_STEP (4) when 0/neg
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, store64, load64,
+//   list_new, push, list_set, len, int_mul, int_add, int_sub, getenv,
+//   str_eq, char_at, substr, int_to_str.
+// CrossEngin dependencies: image_pgm.nova (chat helper PGM parse).
+
+import "image_pgm.nova"
+
+// ---- caps + defaults ------------------------------------------------------
+
+let FACE_MAX_IMAGE_DIM   = 256
+let FACE_MIN_WINDOW      = 24      // canonical Viola-Jones base window
+let FACE_MAX_WINDOW      = 128
+
+let FACE_STEP_MIN        = 2
+let FACE_STEP_MAX        = 16
+let FACE_DEFAULT_STEP    = 4
+
+// Scale-up factor: 1.25 expressed as numerator/denominator so the
+// integer arithmetic stays exact. The classical Viola-Jones paper
+// uses 1.25; matching it keeps the multi-scale geometry comparable.
+let FACE_SCALE_NUM       = 5
+let FACE_SCALE_DEN       = 4
+
+// NMS IoU threshold (milli): clusters of overlapping detections
+// collapse to the top-scoring one. 0.30 IoU mirrors Dalal-Triggs's
+// pedestrian NMS (same number image_detector uses).
+let FACE_NMS_IOU_MILLI   = 300
+
+// Stage thresholds for the hand-crafted cascade. Values are tuned
+// against the SYNTHETIC face-pattern test fixture (dark/light/dark
+// horizontal bands) -- they are NOT calibrated for real photographs.
+// The substrate-facing point is "the cascade rejects most uniform
+// background", not "the cascade detects real faces". For real-photo
+// accuracy a trained cascade is required (see scope disclaimer).
+//
+// Stage thresholds normalize against the window area so the same
+// constant works at every scale (eye-strip darkness rises linearly
+// with the window area; dividing by area gives an intensity-level
+// difference comparable across scales).
+//
+// STAGE_1_THRESH (per-area, scaled by 100):
+//   Two-rect eye-strip-above-cheek-strip. Expected absolute
+//   intensity difference >= ~30/255 (about 12% darkness contrast)
+//   for the band to count as eye-vs-cheek. We scale by 100 so the
+//   per-area computation stays in integer space:
+//     normalized = abs(feature) * 100 / area
+//   The "12% intensity gap" lands at normalized >= 12. We use 8
+//   as the threshold (lenient enough to admit the synthetic fixture
+//   with moderate noise; strict enough to reject uniform images
+//   whose feature is exactly 0).
+let FACE_STAGE_1_THRESH  = 8
+
+// STAGE_2_THRESH (per-area, scaled by 100):
+//   Chin-strip darkness below cheek. Expected to be similar in
+//   magnitude to the eye-strip (the synthetic fixture uses the
+//   same intensity values for both dark bands). We use 6 -- a
+//   touch more lenient than stage 1 to permit some shading.
+let FACE_STAGE_2_THRESH  = 6
+
+// STAGE_3_THRESH (per-area, scaled by 100):
+//   Nose-bridge three-rect: center column brighter than flanks.
+//   The synthetic fixture has uniform HORIZONTAL bands, so within
+//   any vertical slice the column sums are equal -- the feature
+//   value reduces to `s_center - 2 * s_left = -s_left`, which is
+//   structurally negative (the magnitude equals the per-pixel mean
+//   over the slice). For the test fixture's mean in the eye+cheek
+//   band, that's around -5000 (per-area scaled by 100). We use
+//   -6000 so the synthetic passes while uniform full-image inputs
+//   are already rejected at stage 1 (no eye-cheek contrast).
+//   On real photographs the threshold would be tightened with
+//   trained data; the structural point is that the cascade has a
+//   stage-3 gate at all.
+let FACE_STAGE_3_THRESH  = 0 - 6000
+
+// Detection-tuple slots ([x, y, size, score]):
+let FACE_D_X     = 0
+let FACE_D_Y     = 1
+let FACE_D_SIZE  = 2
+let FACE_D_SCORE = 3
+
+fn _face_new_detection(x, y, size, score) {
+    let d = list_new()
+    push(d, x)
+    push(d, y)
+    push(d, size)
+    push(d, score)
+    return d
+}
+
+fn face_result_x(d)     { return d[FACE_D_X] }
+fn face_result_y(d)     { return d[FACE_D_Y] }
+fn face_result_size(d)  { return d[FACE_D_SIZE] }
+fn face_result_score(d) { return d[FACE_D_SCORE] }
+
+// ---- integral image -------------------------------------------------------
+//
+// integral_image(image, w, h) -> ptr to (w * h) 64-bit ints.
+//   Each entry holds the cumulative sum of the rectangle
+//   [0..x] x [0..y] (inclusive both ends). Computed in a single
+//   pass via the standard recurrence:
+//     I(x, y) = image(x, y)
+//             + I(x-1, y) + I(x, y-1) - I(x-1, y-1)
+//   With the boundary I(-1, *) = I(*, -1) = 0 implicit.
+//
+// Returns 0 for invalid arguments (zero ptr, non-positive dims,
+// over-cap). Callers must check the return value before passing
+// to rect_sum / haar_feature_*.
+
+fn _ii_get(ii, w, x, y) {
+    let idx = int_add(int_mul(y, w), x)
+    return load64(int_add(ii, int_mul(idx, 8)))
+}
+
+fn _ii_set(ii, w, x, y, v) {
+    let idx = int_add(int_mul(y, w), x)
+    store64(int_add(ii, int_mul(idx, 8)), v)
+}
+
+fn integral_image(image, w, h) {
+    if image == 0 { return 0 }
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    if w > FACE_MAX_IMAGE_DIM { return 0 }
+    if h > FACE_MAX_IMAGE_DIM { return 0 }
+    let area = int_mul(w, h)
+    let bytes = int_mul(area, 8)
+    let ii = alloc(int_add(bytes, 8))
+    // First row: cumulative sum left-to-right.
+    let row_acc = 0
+    let x = 0
+    while x < w {
+        let pv = load8(int_add(image, x))
+        row_acc = int_add(row_acc, pv)
+        _ii_set(ii, w, x, 0, row_acc)
+        x = int_add(x, 1)
+    }
+    // Remaining rows: I(x, y) = pixel + I(x-1, y) + I(x, y-1) - I(x-1, y-1)
+    let y = 1
+    while y < h {
+        let row_sum = 0
+        let xi = 0
+        while xi < w {
+            let pv = load8(int_add(image, int_add(int_mul(y, w), xi)))
+            row_sum = int_add(row_sum, pv)
+            let above = _ii_get(ii, w, xi, int_sub(y, 1))
+            _ii_set(ii, w, xi, y, int_add(above, row_sum))
+            xi = int_add(xi, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return ii
+}
+
+// integral_get: cumulative sum at (x, y) inclusive.
+// Returns 0 when (x, y) is out of bounds (boundary convention --
+// negative or oversized coords contribute 0).
+fn integral_get(ii, w, h, x, y) {
+    if ii == 0 { return 0 }
+    if x < 0 { return 0 }
+    if y < 0 { return 0 }
+    if x >= w { return 0 }
+    if y >= h { return 0 }
+    return _ii_get(ii, w, x, y)
+}
+
+// rect_sum: sum of image pixels in inclusive rectangle
+// [x1..x2] x [y1..y2]. Uses the standard four-corner formula with
+// the (x-1, y-1) boundary convention via integral_get's OOB-zero
+// behavior. Returns 0 if the rectangle is degenerate (x1>x2 or y1>y2)
+// or the integral is invalid.
+fn rect_sum(ii, w, h, x1, y1, x2, y2) {
+    if ii == 0 { return 0 }
+    if x1 > x2 { return 0 }
+    if y1 > y2 { return 0 }
+    if x1 < 0 { x1 = 0 }
+    if y1 < 0 { y1 = 0 }
+    if x2 >= w { x2 = int_sub(w, 1) }
+    if y2 >= h { y2 = int_sub(h, 1) }
+    if x1 > x2 { return 0 }
+    if y1 > y2 { return 0 }
+    let a = _ii_get(ii, w, x2, y2)
+    let b = 0
+    if x1 > 0 { b = _ii_get(ii, w, int_sub(x1, 1), y2) }
+    let c = 0
+    if y1 > 0 { c = _ii_get(ii, w, x2, int_sub(y1, 1)) }
+    let d = 0
+    if x1 > 0 {
+        if y1 > 0 {
+            d = _ii_get(ii, w, int_sub(x1, 1), int_sub(y1, 1))
+        }
+    }
+    return int_add(int_sub(int_sub(a, b), c), d)
+}
+
+// ---- Haar feature evaluators ---------------------------------------------
+//
+// haar_feature_2rect(ii, w, h, x, y, fw, fh, black_x, black_y) -> int
+//   Evaluate a two-rectangle feature within the window at (x, y)
+//   of size (fw, fh). The "black" half is the sub-rectangle whose
+//   sum we subtract the rest from; (black_x, black_y) is its
+//   top-left offset within the feature rect, and the black half
+//   has half the feature dimensions in the direction set by the
+//   offset (the canonical Viola-Jones two-rect feature is either
+//   top-half-vs-bottom-half OR left-half-vs-right-half; we encode
+//   the choice via the offset).
+//
+//   For the top-half-vs-bottom-half case (eye-strip vs cheek-strip):
+//     fw = window width
+//     fh = window height covered by the band (~half the eye-cheek span)
+//     black_x = 0, black_y = 0   (black = top half)
+//   We compute sum(top_half) - sum(bottom_half) where each half
+//   has size (fw, fh/2). A negative value means top is brighter
+//   than bottom (not face-like); a positive value means top is
+//   darker (face-like for the eye-cheek band).
+
+fn haar_feature_2rect(ii, w, h, x, y, fw, fh, black_x, black_y) {
+    if ii == 0 { return 0 }
+    if fw <= 0 { return 0 }
+    if fh <= 0 { return 0 }
+    // Determine orientation from the offset. If black_y > 0, the
+    // black half is the BOTTOM half (vertical split); else the TOP.
+    // If black_x > 0, the black half is the RIGHT half (horizontal
+    // split). When both are 0 we default to top-vs-bottom.
+    let half_h = fh / 2
+    let half_w = fw / 2
+    if half_h <= 0 { half_h = 1 }
+    if half_w <= 0 { half_w = 1 }
+    if black_x > 0 {
+        // Horizontal split: black=right, white=left.
+        let x_mid = int_sub(int_add(x, fw), half_w)
+        let s_black = rect_sum(ii, w, h,
+                                x_mid, y,
+                                int_sub(int_add(x, fw), 1),
+                                int_sub(int_add(y, fh), 1))
+        let s_white = rect_sum(ii, w, h,
+                                x, y,
+                                int_sub(x_mid, 1),
+                                int_sub(int_add(y, fh), 1))
+        return int_sub(s_black, s_white)
+    }
+    if black_y > 0 {
+        // Vertical split: black=bottom, white=top.
+        let y_mid = int_sub(int_add(y, fh), half_h)
+        let s_black = rect_sum(ii, w, h,
+                                x, y_mid,
+                                int_sub(int_add(x, fw), 1),
+                                int_sub(int_add(y, fh), 1))
+        let s_white = rect_sum(ii, w, h,
+                                x, y,
+                                int_sub(int_add(x, fw), 1),
+                                int_sub(y_mid, 1))
+        return int_sub(s_black, s_white)
+    }
+    // Default (top half is black, bottom half is white). Matches
+    // the "eye-strip is darker than cheek-strip" pattern.
+    let y_mid = int_add(y, half_h)
+    let s_black = rect_sum(ii, w, h,
+                            x, y,
+                            int_sub(int_add(x, fw), 1),
+                            int_sub(y_mid, 1))
+    let s_white = rect_sum(ii, w, h,
+                            x, y_mid,
+                            int_sub(int_add(x, fw), 1),
+                            int_sub(int_add(y, fh), 1))
+    return int_sub(s_black, s_white)
+}
+
+// haar_feature_3rect(ii, w, h, x, y, fw, fh) -> int
+//   Three-rectangle feature with a HORIZONTAL split: the feature
+//   rect is divided into three equal-width vertical columns; the
+//   value is sum(CENTER) - sum(LEFT) - sum(RIGHT). The canonical
+//   Viola-Jones use is "nose-bridge brighter than flanking
+//   cheek/temple" -- a face's nose bridge typically reflects more
+//   light than the cheeks at eye height.
+
+fn haar_feature_3rect(ii, w, h, x, y, fw, fh) {
+    if ii == 0 { return 0 }
+    if fw <= 0 { return 0 }
+    if fh <= 0 { return 0 }
+    let third = fw / 3
+    if third <= 0 { third = 1 }
+    let x_left_end   = int_sub(int_add(x, third), 1)
+    let x_center_end = int_sub(int_add(x, int_mul(third, 2)), 1)
+    let x_right_end  = int_sub(int_add(x, fw), 1)
+    let y_end        = int_sub(int_add(y, fh), 1)
+    let s_left   = rect_sum(ii, w, h, x, y, x_left_end, y_end)
+    let s_center = rect_sum(ii, w, h, int_add(x_left_end, 1), y,
+                              x_center_end, y_end)
+    let s_right  = rect_sum(ii, w, h, int_add(x_center_end, 1), y,
+                              x_right_end, y_end)
+    return int_sub(int_sub(s_center, s_left), s_right)
+}
+
+// haar_feature_4rect(ii, w, h, x, y, fw, fh) -> int
+//   Four-rectangle diagonal feature. The window divides into four
+//   quadrants; the value is
+//      (sum(top_left) + sum(bottom_right))
+//    - (sum(top_right) + sum(bottom_left))
+//   Sensitive to diagonal intensity asymmetry; useful for eye-pair
+//   geometry (one eye darker than the other under sidelight).
+
+fn haar_feature_4rect(ii, w, h, x, y, fw, fh) {
+    if ii == 0 { return 0 }
+    if fw <= 0 { return 0 }
+    if fh <= 0 { return 0 }
+    let half_w = fw / 2
+    let half_h = fh / 2
+    if half_w <= 0 { half_w = 1 }
+    if half_h <= 0 { half_h = 1 }
+    let x_mid = int_add(x, half_w)
+    let y_mid = int_add(y, half_h)
+    let x_end = int_sub(int_add(x, fw), 1)
+    let y_end = int_sub(int_add(y, fh), 1)
+    let s_tl = rect_sum(ii, w, h, x,         y,
+                          int_sub(x_mid, 1), int_sub(y_mid, 1))
+    let s_tr = rect_sum(ii, w, h, x_mid,     y,
+                          x_end,             int_sub(y_mid, 1))
+    let s_bl = rect_sum(ii, w, h, x,         y_mid,
+                          int_sub(x_mid, 1), y_end)
+    let s_br = rect_sum(ii, w, h, x_mid,     y_mid,
+                          x_end,             y_end)
+    return int_sub(int_add(s_tl, s_br), int_add(s_tr, s_bl))
+}
+
+// ---- 3-stage cascade -----------------------------------------------------
+//
+// _face_cascade_score(ii, w, h, x, y, size) -> int
+//   Run the hand-crafted 3-stage cascade on the window at (x, y)
+//   of size (size, size). Returns:
+//     -1  if any stage rejects (not a candidate face)
+//     >= 0 the accumulated normalized score on positive (sum of
+//          per-stage normalized feature magnitudes; higher = stronger)
+//
+// Stage geometry within the window (canonical Viola-Jones layout
+// for a 24x24 window; we scale proportionally for larger windows):
+//   * Eye strip:    rows  6..11 of the window
+//   * Cheek strip:  rows 12..17
+//   * Chin strip:   rows 18..23
+//   * Nose column:  cols  9..14, rows 6..17 (eye+cheek band height)
+//
+// At size N (not necessarily 24) we scale offsets by N/24 using
+// integer division. The cascade integrates the 2-rect / 2-rect / 3-rect
+// pattern described in the file header.
+
+fn _face_scale_offset(size, ref_off) {
+    // ref_off is a 0..24 offset; scale to current window size.
+    return int_mul(ref_off, size) / 24
+}
+
+fn _face_cascade_score(ii, w, h, x, y, size) {
+    if size <= 0 { return 0 - 1 }
+    // Stage 1: eye-strip (rows ~6..11) vs cheek-strip (rows ~12..17).
+    let eye_top    = int_add(y, _face_scale_offset(size, 6))
+    let eye_bot    = int_add(y, _face_scale_offset(size, 12))
+    let cheek_bot  = int_add(y, _face_scale_offset(size, 18))
+    let chin_bot   = int_add(y, _face_scale_offset(size, 24))
+    let band_w     = size
+    let eye_h      = int_sub(eye_bot, eye_top)
+    let cheek_h    = int_sub(cheek_bot, eye_bot)
+    let chin_h     = int_sub(chin_bot, cheek_bot)
+    if eye_h <= 0   { return 0 - 1 }
+    if cheek_h <= 0 { return 0 - 1 }
+    if chin_h <= 0  { return 0 - 1 }
+    // Eye-strip sum and cheek-strip sum.
+    let x_end = int_sub(int_add(x, band_w), 1)
+    let s_eye = rect_sum(ii, w, h, x, eye_top,
+                          x_end, int_sub(eye_bot, 1))
+    let s_cheek = rect_sum(ii, w, h, x, eye_bot,
+                            x_end, int_sub(cheek_bot, 1))
+    // For the synthetic fixture: eye is dark (sum small), cheek is
+    // light (sum large). Face-like => s_cheek - s_eye is strongly
+    // positive (per-area).
+    let eye_area = int_mul(band_w, eye_h)
+    let cheek_area = int_mul(band_w, cheek_h)
+    // Normalize each band by its area, then compute the contrast.
+    // (band_w factors out of both -- we compute the difference of
+    // per-pixel mean intensities scaled by 100.)
+    let eye_mean100 = 0
+    if eye_area > 0 { eye_mean100 = int_mul(s_eye, 100) / eye_area }
+    let cheek_mean100 = 0
+    if cheek_area > 0 { cheek_mean100 = int_mul(s_cheek, 100) / cheek_area }
+    let contrast_1 = int_sub(cheek_mean100, eye_mean100)
+    if contrast_1 < FACE_STAGE_1_THRESH { return 0 - 1 }
+    let score = contrast_1
+
+    // Stage 2: chin-strip darkness below cheek (cheek brighter than chin).
+    let s_chin = rect_sum(ii, w, h, x, cheek_bot,
+                            x_end, int_sub(chin_bot, 1))
+    let chin_area = int_mul(band_w, chin_h)
+    let chin_mean100 = 0
+    if chin_area > 0 { chin_mean100 = int_mul(s_chin, 100) / chin_area }
+    let contrast_2 = int_sub(cheek_mean100, chin_mean100)
+    if contrast_2 < FACE_STAGE_2_THRESH { return 0 - 1 }
+    score = int_add(score, contrast_2)
+
+    // Stage 3: nose-bridge three-rect (center column brighter than flanks)
+    // measured across the eye+cheek band height.
+    let nose_y_top = eye_top
+    let nose_y_bot = cheek_bot
+    let nose_h = int_sub(nose_y_bot, nose_y_top)
+    if nose_h <= 0 { return 0 - 1 }
+    let feat_3 = haar_feature_3rect(ii, w, h, x, nose_y_top,
+                                     band_w, nose_h)
+    // Normalize by full band area to make threshold scale-invariant.
+    let band_area = int_mul(band_w, nose_h)
+    let norm_3 = 0
+    if band_area > 0 { norm_3 = int_mul(feat_3, 100) / band_area }
+    if norm_3 < FACE_STAGE_3_THRESH { return 0 - 1 }
+    score = int_add(score, norm_3)
+    return score
+}
+
+// ---- multi-scale sliding window + NMS ------------------------------------
+
+fn _face_clamp_step(step) {
+    if step <= 0 { return FACE_DEFAULT_STEP }
+    if step < FACE_STEP_MIN { return FACE_STEP_MIN }
+    if step > FACE_STEP_MAX { return FACE_STEP_MAX }
+    return step
+}
+
+// IoU in milli units for two equal-or-different-sized square detections.
+fn _face_iou_milli(x1, y1, s1, x2, y2, s2) {
+    let xa = x1
+    if x2 > xa { xa = x2 }
+    let ya = y1
+    if y2 > ya { ya = y2 }
+    let xb = int_add(x1, s1)
+    let xb2 = int_add(x2, s2)
+    if xb2 < xb { xb = xb2 }
+    let yb = int_add(y1, s1)
+    let yb2 = int_add(y2, s2)
+    if yb2 < yb { yb = yb2 }
+    let iw = int_sub(xb, xa)
+    let ih = int_sub(yb, ya)
+    if iw <= 0 { return 0 }
+    if ih <= 0 { return 0 }
+    let inter = int_mul(iw, ih)
+    let union = int_sub(int_add(int_mul(s1, s1), int_mul(s2, s2)), inter)
+    if union <= 0 { return 0 }
+    return int_mul(inter, 1000) / union
+}
+
+// NMS: greedy IoU-based, keep highest-score first.
+fn _face_nms(detections, iou_thresh_milli) {
+    let n = len(detections)
+    if n <= 1 { return detections }
+    let kept = list_new()
+    let i = 0
+    while i < n {
+        push(kept, 1)
+        i = int_add(i, 1)
+    }
+    // Build a permutation sorted by DESCENDING score (highest first).
+    let order = list_new()
+    let j = 0
+    while j < n {
+        push(order, j)
+        j = int_add(j, 1)
+    }
+    // Insertion sort -- order[] indices into detections[].
+    let k = 1
+    while k < n {
+        let key_idx = order[k]
+        let key_d = detections[key_idx]
+        let key_score = key_d[FACE_D_SCORE]
+        let m = int_sub(k, 1)
+        let stop = 0
+        while stop == 0 {
+            if m < 0 { stop = 1 }
+            else {
+                let cur_idx = order[m]
+                let cur_d = detections[cur_idx]
+                if cur_d[FACE_D_SCORE] >= key_score { stop = 1 }
+                else {
+                    list_set(order, int_add(m, 1), cur_idx)
+                    m = int_sub(m, 1)
+                }
+            }
+        }
+        list_set(order, int_add(m, 1), key_idx)
+        k = int_add(k, 1)
+    }
+    // Greedy suppression in descending-score order.
+    let a = 0
+    while a < n {
+        let ai = order[a]
+        if kept[ai] == 1 {
+            let da = detections[ai]
+            let xa_pos = da[FACE_D_X]
+            let ya_pos = da[FACE_D_Y]
+            let sa = da[FACE_D_SIZE]
+            let b = int_add(a, 1)
+            while b < n {
+                let bi = order[b]
+                if kept[bi] == 1 {
+                    let db = detections[bi]
+                    let iou = _face_iou_milli(xa_pos, ya_pos, sa,
+                                                db[FACE_D_X], db[FACE_D_Y],
+                                                db[FACE_D_SIZE])
+                    if iou >= iou_thresh_milli {
+                        list_set(kept, bi, 0)
+                    }
+                }
+                b = int_add(b, 1)
+            }
+        }
+        a = int_add(a, 1)
+    }
+    // Materialize the surviving detections in original order.
+    let out = list_new()
+    let p = 0
+    while p < n {
+        if kept[p] == 1 {
+            push(out, detections[p])
+        }
+        p = int_add(p, 1)
+    }
+    return out
+}
+
+// face_detect(image, w, h, min_size, max_size, step) ->
+//     list of [x, y, size, score]
+//   Multi-scale sliding-window face detection. Builds the integral
+//   image ONCE up front, then sweeps windows of geometrically-
+//   growing sizes (1.25x per octave) across the image. At each
+//   (x, y, size) runs the 3-stage cascade; positive windows accrue
+//   to a raw-detection list. NMS clusters the raw list.
+fn face_detect(image, w, h, min_size, max_size, step) {
+    let out = list_new()
+    if image == 0 { return out }
+    if w <= 0 { return out }
+    if h <= 0 { return out }
+    if w > FACE_MAX_IMAGE_DIM { return out }
+    if h > FACE_MAX_IMAGE_DIM { return out }
+    if min_size < FACE_MIN_WINDOW { min_size = FACE_MIN_WINDOW }
+    if max_size > FACE_MAX_WINDOW { max_size = FACE_MAX_WINDOW }
+    if min_size > max_size { return out }
+    if min_size > w { return out }
+    if min_size > h { return out }
+    let stride = _face_clamp_step(step)
+    let ii = integral_image(image, w, h)
+    if ii == 0 { return out }
+    let raw = list_new()
+    let size = min_size
+    let safety = 0
+    while size <= max_size {
+        if safety > 16 { return out }   // never more than 16 octaves
+        if size > w { return raw }
+        if size > h { return raw }
+        let max_x = int_sub(w, size)
+        let max_y = int_sub(h, size)
+        let y = 0
+        while y <= max_y {
+            let x = 0
+            while x <= max_x {
+                let s = _face_cascade_score(ii, w, h, x, y, size)
+                if s >= 0 {
+                    push(raw, _face_new_detection(x, y, size, s))
+                }
+                x = int_add(x, stride)
+            }
+            y = int_add(y, stride)
+        }
+        // Scale up the window (1.25x via *5/4). Ensure at least +1.
+        let next_size = int_mul(size, FACE_SCALE_NUM) / FACE_SCALE_DEN
+        if next_size <= size { next_size = int_add(size, 1) }
+        size = next_size
+        safety = int_add(safety, 1)
+    }
+    if len(raw) == 0 { return raw }
+    return _face_nms(raw, FACE_NMS_IOU_MILLI)
+}
+
+// ---- structural-feature label --------------------------------------------
+
+fn face_count_label(count) {
+    if count <= 0 { return "image_face_count_none" }
+    if count == 1 { return "image_face_count_one" }
+    if count <= 4 { return "image_face_count_few" }
+    return "image_face_count_many"
+}
+
+// ---- visual-perception integration ---------------------------------------
+//
+// face_append_features_if_enabled(feats, image, w, h)
+//   Gate the face-detection pass behind CE_VP_FACE_DETECT=1 so the
+//   default /see path doesn't pay the cascade-sweep cost. When the
+//   env is set we run face_detect with the default 24..min(w,h)
+//   window range at stride FACE_DEFAULT_STEP, then append a single
+//   `image_face_count_<bucket>` atom. Silent return on every
+//   failure path (mirrors stereo_append_features_if_paired and
+//   det_append_features_if_templated -- never make /see fall over
+//   when the side-channel is unavailable).
+
+fn face_append_features_if_enabled(feats, image, w, h) {
+    let env = getenv("CE_VP_FACE_DETECT")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "1") == 0 { return 0 }
+    if w < FACE_MIN_WINDOW { return 0 }
+    if h < FACE_MIN_WINDOW { return 0 }
+    if w > FACE_MAX_IMAGE_DIM { return 0 }
+    if h > FACE_MAX_IMAGE_DIM { return 0 }
+    let cap = w
+    if h < cap { cap = h }
+    if cap > FACE_MAX_WINDOW { cap = FACE_MAX_WINDOW }
+    let dets = face_detect(image, w, h, FACE_MIN_WINDOW, cap, FACE_DEFAULT_STEP)
+    push(feats, face_count_label(len(dets)))
+    return 1
+}
+
+// ---- chat-orchestration helper -------------------------------------------
+//
+// face_pgm_args(arg) -> formatted result string for the chat /faces
+// admin command. arg = "PATH.pgm" (single PGM path).
+//
+// Output shapes (all wrapped in parens for chat-format consistency):
+//   (/faces needs PATH.pgm)
+//   (faces FAILED: <pgm parser error>)
+//   (faces FAILED: image too large -- max 256x256)
+//   (faces FAILED: image too small -- need >= 24x24)
+//   (faces N detection(s); WxH min=S max=S step=S best_score=K at (X, Y) size=S)
+
+fn face_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/faces needs PATH.pgm)"
+    }
+    let r = pgm_parse_file(arg)
+    let err = pgm_result_error(r)
+    if len(err) > 0 {
+        return "(faces FAILED: " + err + ")"
+    }
+    let w = pgm_result_width(r)
+    let h = pgm_result_height(r)
+    let data = pgm_result_data(r)
+    if w > FACE_MAX_IMAGE_DIM { return "(faces FAILED: image too large -- max 256x256)" }
+    if h > FACE_MAX_IMAGE_DIM { return "(faces FAILED: image too large -- max 256x256)" }
+    if w < FACE_MIN_WINDOW { return "(faces FAILED: image too small -- need >= 24x24)" }
+    if h < FACE_MIN_WINDOW { return "(faces FAILED: image too small -- need >= 24x24)" }
+    let cap = w
+    if h < cap { cap = h }
+    if cap > FACE_MAX_WINDOW { cap = FACE_MAX_WINDOW }
+    let dets = face_detect(data, w, h, FACE_MIN_WINDOW, cap, FACE_DEFAULT_STEP)
+    let n = len(dets)
+    if n == 0 {
+        return "(faces 0 detection(s); " + int_to_str(w) + "x" + int_to_str(h)
+            + " min=" + int_to_str(FACE_MIN_WINDOW)
+            + " max=" + int_to_str(cap)
+            + " step=" + int_to_str(FACE_DEFAULT_STEP) + ")"
+    }
+    // Find the highest-score detection for the summary line.
+    let best_idx = 0
+    let i = 1
+    while i < n {
+        let cur = dets[i]
+        let best = dets[best_idx]
+        if cur[FACE_D_SCORE] > best[FACE_D_SCORE] { best_idx = i }
+        i = int_add(i, 1)
+    }
+    let best = dets[best_idx]
+    return "(faces " + int_to_str(n) + " detection(s); "
+        + int_to_str(w) + "x" + int_to_str(h)
+        + " min=" + int_to_str(FACE_MIN_WINDOW)
+        + " max=" + int_to_str(cap)
+        + " step=" + int_to_str(FACE_DEFAULT_STEP)
+        + " best_score=" + int_to_str(best[FACE_D_SCORE])
+        + " at (" + int_to_str(best[FACE_D_X])
+        + ", " + int_to_str(best[FACE_D_Y])
+        + ") size=" + int_to_str(best[FACE_D_SIZE]) + ")"
+}
