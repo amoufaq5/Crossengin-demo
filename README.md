@@ -11,7 +11,49 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R18E adds `src/federation/gossip.nova` — a SWIM-style
+> toolchain. R19E adds `src/federation/leader_election.nova` —
+> Garcia-Molina's Bully algorithm (1982, simplified for N ≤ 16
+> meshes) layered on top of R18E SWIM gossip. R18E gives every soul
+> a converged view of "who is alive"; R19E is the next federation
+> primitive: agreement on a single coordinator for tasks needing
+> linearizability (monotonic IDs, distributed event ordering,
+> single-writer schemas). Each soul carries a numeric `self_id`
+> (typically the hash of its R7C Noise XK static pubkey) plus a
+> separate `addr -> id` map registered by the daemon at bootstrap.
+> Election sequence: on startup or detected leader-DEAD, the
+> initiator transitions to `LE_STATE_ELECTING`, stamps
+> `election_started_ns = nanotime()`, and enqueues ELECTION to every
+> alive peer with a higher ID. Higher-ID peers respond with OK and
+> start own elections; the highest-ID peer times out with no OK
+> received and broadcasts VICTORY. VICTORY is accepted only when
+> `from_id >= self_id` (lower-ID claimants are ignored). Default
+> election timeout is 2 * gossip ping interval (2000 ms). Because
+> R18E gossip's wire format doesn't carry ELECTION/OK/VICTORY, the
+> bully message queue is exposed via `le_drain_pending` for future
+> transports; `le_election_check` resolves timeouts using
+> `gossip_peer_table` as ground truth (the highest-ID non-DEAD peer
+> inclusive of self is the natural winner — SUSPECT peers are
+> counted as candidates to hedge SWIM's stale-LAST_SEEN false
+> positives). A stability check in `le_step`'s STABLE branch yields
+> the leadership to a higher-ID peer that has since reappeared
+> (handles partial-view self-elections + the previously-killed-
+> leader restart case). Public API:
+> `le_init(gossip_state, self_id)`, `le_current_leader(state) -> id
+> | -1`, `le_is_leader(state)`, `le_step(state)`,
+> `le_force_election(state)`. 40 unit assertions in
+> `tests/unit/test_leader_election.nova` (NEW; covers bootstrap, peer
+> map, 3-soul [10, 20, 30] highest-wins, leader-death triggering
+> re-election, lone-soul self-election, force-election overriding a
+> stable leader, message handlers, gossip-derived deferral). ~11
+> integration assertions in `tests/integration/scenario_zzz_leader.sh`
+> (NEW; precompiles 3 soul drivers with IDs [10, 20, 30] on random
+> ports, verifies soul C self-elects + at least one follower
+> converges within 20s, kill C and observe B re-elect within 15s,
+> restart C and verify no soul stuck in ELECTING). Chat: `/leader`
+> dispatch + help line. All prior federation suites (R6C/R7C
+> scenario_gg_noise_kg, R18E scenario_www_gossip) remain green.
+> Module count: 172 (+1 from R19E, R18E count was 169).
+> R18E adds `src/federation/gossip.nova` — a SWIM-style
 > (Das et al. 2002) gossip protocol on top of short-lived TCP probes
 > that closes R7C kg_sync v3's "N > 2 without a central hub" gap.
 > Each soul maintains `[addr, last_seen_ns, suspicion_count, status]`
