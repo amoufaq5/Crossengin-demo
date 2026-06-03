@@ -3,6 +3,114 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R25E (this session) -- Unified benchmark harness + regression baseline
+
+**Status: complete -- new `scripts/bench.sh` master harness composes every
+existing `scripts/bench_*.sh` (currently `bench_simd_production.sh`'s three
+sub-benches: stereo SAD, optical-flow LK, HOG detector integral histogram)
+plus the NOVA-side AVX2 microbenches (`tests/bench_simd.sh` SAD,
+`make bench-simd` int32 dot product), parses the per-bench `nanotime()`
+wallclock numbers, and emits a unified JSON report. Adds `bench/baseline.json`
+(15 entries, R25 sandbox numbers), `BENCHMARKS.md` (operator-facing summary
+table + add-new-bench docs), and a `Benchmarks` subsection under README.md's
+`Building and running`. Regression detection via `scripts/bench.sh --compare
+baseline.json` emits a markdown FASTER/NOMINAL/SLOWER/REGRESS table and
+exits 2 on a >50% slowdown.**
+
+### What R25E delivers
+
+1. **New file** -- `scripts/bench.sh` (~560 lines, executable). Discovers
+   benches via `scripts/bench_*.sh` glob, runs each under
+   `NOVA_ROOT/nova`, parses output lines like `scalar wallclock (ns): N`
+   into a per-record TSV, then transforms to JSON via a Python3 inline
+   script. Modes: `--json` (default), `--human` (tee per-bench raw output +
+   summary table), `--quick` (skip slow benches), `--compare baseline.json`
+   (regression report), `--list` (discovery without execution), `--help`.
+
+2. **New file** -- `bench/baseline.json` (174 lines, 15 benchmark records).
+   Captures the R25 sandbox numbers for stereo SAD scalar/i32/u8 SIMD, LK
+   scalar/i32/u8/mul-acc SIMD, image-residual SAD scalar/u8 SIMD, HOG
+   detector scalar/integral, NOVA SAD scalar/SIMD avg, NOVA int32 dot
+   scalar/SIMD. Schema: `crossengin-bench-v1`. Per-record fields: `name`,
+   `source`, `category`, `time_ns`, `time_ms`, `throughput`, `speedup_x100`,
+   `baseline`, `note`.
+
+3. **New file** -- `BENCHMARKS.md` (~167 lines). Operator-facing summary
+   with the full table (all 15 entries with category + time_ms + speedup_x +
+   note), category definitions, "how to add a new bench" walkthrough
+   (NOVA-only via `tests/benchmark/`, shell-level via `scripts/bench_*.sh`,
+   how to regenerate baseline), and the FASTER/NOMINAL/SLOWER/REGRESS
+   verdict scheme.
+
+4. **README extension** -- New `### Benchmarks` subsection under "Building
+   and running" with the 5 headline numbers (stereo SAD u8 SIMD `~5.9x`,
+   LK mul-acc SIMD `~3.4x`, HOG integral `~1.08x typical / ~2.15x peak`,
+   image-SAD u8 SIMD `~107x`, NOVA AVX2 primitive `~141x`). Links to
+   BENCHMARKS.md for the full table.
+
+### Verification
+
+* `scripts/bench.sh --json > bench/baseline.json` runs end-to-end in
+  ~60 seconds on the R25 sandbox VM. Exit 0, 15 benches recorded.
+* `python3 -c 'import json; d=json.load(open("bench/baseline.json"));
+  print(len(d["benchmarks"]))'` -> `15`. Schema = `crossengin-bench-v1`.
+* `scripts/bench.sh --compare bench/baseline.json` re-runs and prints the
+  markdown verdict table. Verifies regression detection works: simulated
+  baseline change (stereo_sad_scalar set to artificial 100ms) -> +757%
+  delta, REGRESS verdict, exit code 2. On the actual baseline, all 15
+  benches are NOMINAL or FASTER (worst delta +4.3%, well under the 50%
+  REGRESS threshold).
+* `scripts/bench.sh --list` enumerates the 1 shell bench, 3 NOVA Make
+  targets, and 4 NOVA tests/benchmark .nova files.
+* All existing benches preserved -- no breakage of
+  `scripts/bench_simd_production.sh` or any NOVA-side bench. Bit-identity
+  checks inside the SIMD-production bench still pass (mismatch = 0 for
+  all four code paths).
+
+### Baseline numbers captured
+
+| bench (category)                        | time_ms | speedup_x |
+|----------------------------------------:|--------:|----------:|
+| stereo_sad_scalar                       | 854.35  |    1.00x  |
+| stereo_sad_i32_simd                     | 799.58  |    1.07x  |
+| stereo_sad_u8_simd                      | 143.92  |    5.94x  |
+| lk_flow_scalar                          |  58.05  |    1.00x  |
+| lk_flow_i32_simd                        | 367.45  |    0.16x  |
+| lk_flow_u8_simd                         |  71.12  |    0.82x  |
+| lk_flow_mulacc_simd                     |  17.31  |    3.35x  |
+| image_sad_scalar                        |   0.38  |    1.00x  |
+| image_sad_u8_simd                       |   0.004 |  106.65x  |
+| hog_detector_scalar                     | 173.16  |    1.00x  |
+| hog_detector_integral                   | 159.63  |    1.08x  |
+| nova_sad_scalar_avg                     |   0.047 |    1.00x  |
+| nova_sad_simd_avg                       |   0.00033| 141.54x  |
+| nova_dot_scalar                         |  39.22  |    1.00x  |
+| nova_dot_simd                           |   0.87  |   45.09x  |
+
+The LK i32 SIMD's 0.16x is honest: R10D's scalar inner loop is tight and
+R12A's per-call setup dominates a single 5x5 window. R15A's u8 path
+recovers most of the gap; R18A.2's mul-acc primitive is the structural
+fix.
+
+### Pointers for future rounds
+
+* When a new SIMD/algorithmic kernel ships and reports a wallclock via
+  `nanotime()`, either:
+  1. Add a new shell harness under `scripts/bench_<NAME>.sh` -- if its
+     output uses the recognized `XXX wallclock (ns): N` substrings, the
+     master harness picks it up automatically through the
+     `parse_simd_production` fallback parser; OR
+  2. Add a new `parse_<NAME>` function in `scripts/bench.sh` for custom
+     line formats.
+* After adding a bench, regenerate the baseline:
+  `scripts/bench.sh --json > bench/baseline.json` and commit alongside.
+* The 5 long-running `tests/benchmark/bench_*.nova` programs (tick rate,
+  KG query, node throughput, ANN query) are deliberately NOT in the master
+  harness -- they exercise minute-long substrate tick loops. Run via
+  `make benchmark` directly.
+
+---
+
 ## R22F.2 (this session) -- Audio pitch harmonic auto-switch (R10F autocorrelation <-> R11B YIN)
 
 **Status: complete -- extension to `src/io/transducers/audio_pitch.nova`

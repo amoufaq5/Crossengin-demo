@@ -2696,6 +2696,49 @@ CE_LOG_JSON=1 ./bin/crossengin
 bash scripts/snap_diff.sh old.snap new.snap
 ```
 
+### Benchmarks
+
+Performance benches live under `scripts/bench_*.sh` (shell harness, NOVA-
+side timing via `nanotime()`) and `tests/benchmark/*.nova` (long-running
+substrate benches behind `make benchmark`). The unified entry point is
+`scripts/bench.sh`, which discovers every shell bench, runs them, parses
+the per-bench wallclock + speedup numbers, and emits a JSON report:
+
+```sh
+# Run every bench, print the JSON report to stdout.
+scripts/bench.sh > /tmp/bench.json
+
+# Human-readable mode (tees per-bench output + a summary table).
+scripts/bench.sh --human
+
+# Regression detection: re-run, compare against a committed baseline.
+scripts/bench.sh --compare bench/baseline.json     # exit 2 on >50% slowdown
+
+# List what would run without executing.
+scripts/bench.sh --list
+
+# Skip the slow SIMD-production bench (~50 seconds).
+scripts/bench.sh --quick
+```
+
+The current baseline lives in [`bench/baseline.json`](./bench/baseline.json);
+[`BENCHMARKS.md`](./BENCHMARKS.md) is the operator-facing summary table
+(15 benches, scalar/SIMD/integral paths across stereo SAD, optical-flow LK,
+HOG detection, and the NOVA-side AVX2 microbenches) and documents how to add
+a new bench so the harness picks it up automatically.
+
+Headline numbers from the R25E baseline (256x256 imagery, x86-64 + AVX2):
+
+* Stereo SAD u8 SIMD: **~5.9x** over scalar
+* Optical-flow LK mul-acc SIMD: **~3.4x** over scalar
+* HOG detector integral-histogram: **~1.08x typical, ~2.15x peak** (R22A amortization)
+* Image-residual SAD u8 SIMD: **~107x** (pure vectorization case)
+* NOVA AVX2 `simd_sum_abs_diff` primitive: **~141x** in isolation
+
+See [`BENCHMARKS.md`](./BENCHMARKS.md) for the full table and column
+definitions, and the FASTER/NOMINAL/SLOWER/REGRESS verdict scheme used by
+`--compare`.
+
 ### Distributed KG sync (publisher / subscriber demo)
 
 Phase 20 / Tier-4 #2 ships the distributed-substrate seam: two or more
@@ -2756,6 +2799,12 @@ Per-topic references: [`docs/runbook/build.md`](./docs/runbook/build.md),
 [`docs/runbook/test.md`](./docs/runbook/test.md),
 [`docs/runbook/run.md`](./docs/runbook/run.md), and
 [`docs/design/overview.md`](./docs/design/overview.md) for the architecture.
+
+**For the system layout, module catalog, and cross-references between
+the ~190 NOVA modules in `src/`, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).**
+That document is the index — the per-subsystem audits (`IMAGE_AUDIT.md`,
+`AUDIO_AUDIT.md`, `FEDERATED_AUDIT.md`, `SECAGG_AUDIT.md`,
+`SNAPSHOT_FORMAT.md`, etc.) are the deep-dives.
 
 ## NOVA dependency and version note
 
