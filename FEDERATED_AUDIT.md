@@ -1446,3 +1446,151 @@ self-corrects when the probe fails.
 5. **Single-address advertisement.** ICE candidate-pair gathering
    (RFC 8445) is the proper multi-homed fix.
 
+
+## R23C extension: federation snapshot replication via gossip
+
+R13F (`src/persistence/snapshot_delta.nova`) shipped incremental
+snapshot deltas; R20F (`src/federation/snapshot_attestation.nova`)
+shipped gossip-relayed signed snapshot attestations. The remaining
+gap: when peer A broadcasts a signed attestation ("at ts T I sealed
+a snapshot with root R, here's my Ed25519 signature"), peer B has
+the receipt but not the goods. If A's disk dies tomorrow the
+federation knows the snapshot existed but cannot restore it.
+
+R23C closes that gap. After peer B's gossip handler verifies an
+inbound ATTESTATION (R20F's existing logic), it also pokes the
+snapshot-replication layer (`src/federation/snapshot_replication.nova`)
+which:
+  1. Records `(root_hex, peer_id, ts_ns)` in a known-roots table
+     marked PENDING.
+  2. The daemon (or the chat REPL via `/snap_replicas`) periodically
+     calls `gossip_drive_snap_fetches(state)` which walks the
+     PENDING entries and dials each peer with `SNAP_FETCH <root_hex>`.
+  3. The responder (peer A in our two-soul case) replies with the
+     snapshot bytes framed as `SNAP_DATA <line>` per snapshot text
+     line, terminated by `SNAP_END`. A miss is a bare `SNAP_END`.
+  4. The receiver assembles the body, runs `sr_observe_snap_response`
+     which:
+       a. Verifies the bytes start with a `crossengin-snapshot v1/v2`
+          header.
+       b. Verifies the bytes terminate with an `end` line.
+       c. Finds the `meta.merkle_root <hex>` line and confirms it
+          equals the EXPECTED root_hex from the signed attestation.
+     If all three pass, the bytes land in the local replica table;
+     `sr_have_root(root_hex)` returns 1 from then on, and peer B can
+     SERVE the same root if peer C later asks for it.
+
+### Trust model
+
+The gossip mesh is UNTRUSTED. R20F already gates the known-roots
+table: only attestations whose Ed25519 signature verifies against
+the originator's registered pubkey are recorded. The wire-layer
+defense for the SNAP_DATA stream is the `meta.merkle_root` line
+equivalence check: the originator computes that line BEFORE signing
+the attestation, so a tampered meta-line is detectably wrong against
+the signed root and the replica is dropped (verify_fail counter
+advances, replica table unchanged).
+
+Defense-in-depth: when the replica is later LOADED via
+`snap_load_with_deltas` under `CE_SNAPSHOT_VERIFY_MERKLE=1`, the
+strict per-atom Merkle re-derivation runs and catches any atom-level
+tampering that left the meta line untouched. The wire layer trusts
+the meta-line; the persistence layer trusts the full atom hash.
+
+Why not re-derive the full Merkle root at receive time? The
+snapshot bytes parse via `snap_from_text` (in
+`src/persistence/snapshot_disk.nova`), but that module's internal
+`_starts_with` helper collides on the assembler with the same-named
+helper in `src/io/transducers/kg_sync.nova` which gossip already
+drags in. So R23C deliberately keeps `snapshot_replication.nova`
+free of the snapshot_disk import; the verifier walks the snapshot
+text inline (header line, meta-root line equivalence, end-line
+presence). Atom-level verification is the LOAD path's job.
+
+### Wire shape
+
+Three new gossip message types (additive to R18E):
+
+```
+SNAP_FETCH <root_hex>\n
+SNAP_DATA <text_line>\n   (zero or more)
+SNAP_END\n
+```
+
+A bare `SNAP_END` (no `SNAP_DATA`) signals "I don't have this root".
+The `SNAP_DATA` framing keeps the gossip line buffer (1024 bytes)
+the hard upper bound on any single snapshot text line; the receiver
+re-adds the `\n` the line-oriented gossip wire stripped.
+
+### Coordination with R23E
+
+R23C and R23E both extend `src/federation/gossip.nova` with new
+wire types + state slots. R23C slots at GOSSIP_S_SR_STATE = 29 + 2
+counters (30, 31); R23E slots at GOSSIP_S_NAT_STATE = 32 + 2
+counters (33, 34). The coordination note is pinned at both blocks
+so the next sprint can extend the layout without renumbering.
+
+### Public API
+
+```
+sr_init(gossip_state, local_snap_dir)        -> sr_state
+sr_observe_attestation(sr, att)              -> 1 newly tracked | 0
+sr_fetch_pending(sr)                         -> count of pending fetches
+sr_local_snapshots(sr)                       -> list[(root, peer, ts)]
+sr_serve_snap_request(sr, root_hex)          -> snapshot_bytes | 0
+sr_observe_snap_response(sr, root_hex, bytes) -> 1 stored | 0
+sr_register_local(sr, root_hex, peer_id, ts_ns, bytes) -> 1
+```
+
+Plus diagnostics (`sr_status_line`, `sr_pending_fetch_tasks`,
+`sr_known_roots`, `sr_replica_lines`) and the gossip hook surface
+(`gossip_set_sr_state`, `gossip_send_snap_fetch`,
+`gossip_drive_snap_fetches`, `gossip_sr_status_line`).
+
+### Verification
+
+* Unit (`tests/unit/test_snapshot_replication.nova`): **73
+  assertions** covering sr_init shape, sr_observe_attestation
+  registration + dedupe, sr_register_local idempotence, replica
+  table serve/miss, sr_observe_snap_response verify+store on legit
+  bytes, REJECT on (tampered, garbage, truncated, unknown-root)
+  bytes, already-have-root short-circuit, sr_local_snapshots
+  enumeration, wire codec round-trip, status line format.
+
+* Integration (`tests/integration/scenario_mmmm_snap_replication.sh`):
+  **11 assertions** on a 2-soul mesh (random local ports). Both
+  souls boot, build a unique snapshot, register it locally + sign
+  + broadcast the attestation. The driver embeds the snapshot text
+  as a literal (precomputed via the snap_to_text + merkle_root_for_kgs_blob
+  pipeline) to avoid the snapshot_disk import in the same TU as
+  gossip. Asserts: pre-flight socket OK, both souls running after
+  warmup, both souls register their own snapshot locally, B's
+  known-roots / replica table grow when A's attestation arrives,
+  tamper-injected snapshot (wrong meta.merkle_root) is rejected
+  without polluting the replica table, /snap_replicas chat dispatch
+  echoes the R23C delegation message.
+
+  Like scenario_dddd (R20F), the mesh-propagation assertions are
+  best-effort on a blocking-accept NOVA host (the 25s window is
+  often too short for both directions of PING/ACK + ATTESTATION
+  + SNAP_FETCH to converge); the high-confidence invariants are
+  in the unit suite. All assertions that DO fire pass.
+
+### Limitations / future work
+
+1. **No durable on-disk replica.** R23C stores replicas in the
+   sr_state record (in-memory list). The daemon could persist to
+   `sr_local_dir` per the operator-provided path; the file-system
+   wiring is a follow-on.
+2. **No peer-id -> addr index.** `gossip_drive_snap_fetches` dials
+   every alive peer (best-effort fan-out); a per-peer addr table
+   would let it dial only the originator.
+3. **No replay defense.** A replayed attestation re-issues the
+   SNAP_FETCH; the receiver's `sr_have_root` check short-circuits
+   the network round-trip but the bandwidth cost of the (re-)dial
+   is wasted.
+4. **No streaming for large snapshots.** A snapshot bigger than ~1KB
+   per line will overflow the gossip line buffer. The text writer
+   pre-line-wraps at ~80-120 chars in practice; large blobs (e.g.
+   serialised episodic moments) would need a binary frame or
+   chunked text encoding.

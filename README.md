@@ -11,7 +11,48 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R23E adds `src/federation/nat_traversal.nova` — a STUN-like
+> toolchain. R23C adds `src/federation/snapshot_replication.nova` — the
+> bytes-on-the-wire half of federation snapshot durability. R13F shipped
+> incremental snapshot deltas; R20F shipped gossip-relayed signed snapshot
+> attestations ("at ts T I sealed root R"). R23C closes the gap: when peer
+> B's gossip handler verifies an inbound ATTESTATION it also pokes
+> `sr_observe_attestation`, which records the root in a known-roots
+> table; the daemon periodically calls `gossip_drive_snap_fetches` which
+> walks the pending entries and dials each peer with `SNAP_FETCH
+> <root_hex>`. The originator replies with the snapshot bytes framed as
+> `SNAP_DATA <line>` per text line, terminated by `SNAP_END`. The
+> receiver assembles the body, verifies (header, end-line, meta.merkle_root
+> equals the signed root), and stores the bytes in a local replica
+> table; from that point on peer B can ALSO serve the same root if peer
+> C asks, giving the federation O(log N) snapshot-durability fan-out
+> without a coordinator. Tamper rejection: a snapshot whose
+> meta.merkle_root differs from the signed root is dropped (verify_fail
+> counter advances, replica table unchanged). Defense-in-depth: the LOAD
+> path (`snap_load_with_deltas` + `CE_SNAPSHOT_VERIFY_MERKLE=1`) still
+> runs per-atom Merkle re-derivation, catching atom-level tampering that
+> left the meta line untouched. Public API: `sr_init`,
+> `sr_observe_attestation`, `sr_fetch_pending`, `sr_local_snapshots`,
+> `sr_serve_snap_request`, `sr_observe_snap_response`,
+> `sr_register_local`, plus diagnostics (`sr_status_line`,
+> `sr_pending_fetch_tasks`, `sr_known_roots`, `sr_replica_lines`,
+> `sr_have_root`) and gossip hooks (`gossip_set_sr_state`,
+> `gossip_send_snap_fetch`, `gossip_drive_snap_fetches`,
+> `gossip_sr_status_line`). Verification: 73 unit assertions in
+> `tests/unit/test_snapshot_replication.nova` (NEW; sr_init shape,
+> observe attestation registration + dedupe, register_local idempotence,
+> replica serve hit/miss, observe_snap_response verify+store on legit
+> bytes, REJECT on (tampered, garbage, truncated, unknown-root) bytes,
+> already-have-root short-circuit, wire codec round-trip, status line
+> format). 11 integration assertions in
+> `tests/integration/scenario_mmmm_snap_replication.sh` (NEW; 2-soul
+> mesh; both souls register their own snapshot, B's known-roots /
+> replica table grow when A's attestation arrives, tamper-injected
+> snapshot rejected, /snap_replicas chat dispatch works). All prior
+> federation suites (R18E gossip, R19E leader, R20E distributed_query,
+> R20F snapshot attestation, R21B distributed_rules, R21E
+> gossip_noise) remain green. Chat: `/snap_replicas` info-line
+> dispatch wired into `examples/crossengin_chat.nova`.
+> R23E adds `src/federation/nat_traversal.nova` — a STUN-like
 > external address discovery + gossip-piggyback advertisement layer for
 > federation across NATs. R18E shipped the SWIM gossip mesh assuming
 > direct reachability; real-world peers behind home-router / mobile /

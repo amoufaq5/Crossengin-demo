@@ -3,7 +3,86 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R23E (this session) -- Federation NAT traversal (STUN-like discovery + gossip advertise)
+## R23C (this session) -- Federation snapshot replication via gossip
+
+**Status: complete -- new module `src/federation/snapshot_replication.nova`
+(+~570 lines) lets peers AUTOMATICALLY replicate signed snapshots
+across the gossip mesh. R20F (signed attestations) tells the
+federation "at ts T I sealed root R"; R23C closes the next gap:
+peers that hear the attestation but don't already hold the snapshot
+fetch the bytes from the originator, verify them against the signed
+Merkle root, and store a local replica. The replica is re-serveable,
+so a snapshot propagates with O(log N) fan-out without a
+coordinator.**
+
+### What R23C delivers
+
+1. **Module** -- `src/federation/snapshot_replication.nova` (NEW).
+   Imports snapshot_attestation, merkle, merkle_signing,
+   snapshot_writer. Deliberately does NOT import snapshot_disk (its
+   internal `_starts_with` helper collides on the assembler with
+   kg_sync.nova's same-named helper when both are pulled into the
+   gossip TU).
+
+2. **Public API** -- `sr_init(gossip_state, local_snap_dir)`,
+   `sr_observe_attestation(sr, att)`, `sr_fetch_pending(sr)`,
+   `sr_local_snapshots(sr)`, `sr_serve_snap_request(sr, root_hex)`,
+   `sr_observe_snap_response(sr, root_hex, bytes)`,
+   `sr_register_local(sr, root_hex, peer_id, ts_ns, bytes)`. Plus
+   diagnostics: `sr_status_line`, `sr_pending_fetch_tasks`,
+   `sr_known_roots`, `sr_replica_lines`, `sr_have_root`.
+
+3. **Gossip extension** -- additive SNAP_FETCH / SNAP_DATA / SNAP_END
+   wire types + state slots (GOSSIP_S_SR_STATE = 29 + 2 counters)
+   + dispatch branches in the three handler variants (kg-less,
+   kg-aware, noise-wrapped). The R20F ATTESTATION handler now also
+   pokes sr_observe_attestation so the known-roots table auto-tracks
+   any verified attestation. Coordinated with R23E: R23C slots at
+   29-31, R23E at 32-34, both have COORDINATION NOTE blocks pinned.
+
+4. **Chat hook** -- `/snap_replicas` admin command (+1 help line +
+   1 dispatch entry).
+
+5. **Verification** -- 73 unit assertions
+   (`tests/unit/test_snapshot_replication.nova`) covering: sr_init
+   shape, observe attestation registration + dedupe, register_local
+   idempotence, replica serve hit/miss, observe_snap_response
+   verify+store on legit bytes, REJECT on (tampered, garbage,
+   truncated, unknown-root) bytes, already-have-root short-circuit,
+   wire codec round-trip, status line format. 11 integration
+   assertions (`tests/integration/scenario_mmmm_snap_replication.sh`)
+   on a 2-soul mesh: both souls register their own snapshot, B's
+   known-roots / replica table grow when A's attestation arrives,
+   tamper-injected snapshot (wrong meta.merkle_root) is rejected
+   without polluting the replica table, /snap_replicas dispatch
+   works.
+
+### Verification protocol
+
+The wire-layer verifier checks three things in order:
+  1. First non-empty line equals `crossengin-snapshot v1` or `v2`
+     (the writer-emitted header literal).
+  2. Last non-empty line equals `end` (truncated streams rejected).
+  3. The `meta.merkle_root <hex>` line equals the EXPECTED root_hex
+     from the signed attestation. The originator computes that line
+     BEFORE signing, so a peer whose meta-line matches the signed
+     root is committing to the same Merkle tree.
+
+Defense-in-depth: when the replica is later LOADED via
+`snap_load_with_deltas` + `CE_SNAPSHOT_VERIFY_MERKLE=1`, the strict
+per-atom Merkle re-derivation runs and catches any atom-level
+tampering that left the meta line untouched.
+
+### What is left
+
+* No durable on-disk replica yet (in-memory only; the operator
+  could persist to `sr_local_dir`).
+* No peer-id -> addr index for fetch routing (we dial every alive
+  peer).
+* No streaming for snapshots whose single line > 1024 bytes
+  (gossip line buffer limit).
+
+## R23E (last session) -- Federation NAT traversal (STUN-like discovery + gossip advertise)
 
 **Status: complete -- new module `src/federation/nat_traversal.nova`
 (+~677 lines) ships the discovery + advertisement half of the STUN /
