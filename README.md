@@ -11,7 +11,49 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R21C adds `src/io/effectors/audio_tts.nova` — the end-to-end
+> toolchain. R21B adds `src/federation/distributed_rules.nova` —
+> federated forward-chaining mini-Datalog rule inference across the R18E
+> gossip mesh. R20B shipped local rule inference on a single KG; R20E
+> shipped distributed SPARQL fan-out; R21B bridges them so a rule's
+> premises can match facts from ANY peer's KG and derived conclusions
+> can be broadcast to the entire mesh. Wire protocol adds three line
+> types over the existing gossip TCP exchange: `RULE <rule_string>`
+> broadcasts the rule on `dr_add_rule` so all peers ingest it on the
+> next round; `DRFETCH <pred>` requests every RELATION atom matching
+> the predicate from one peer (replies as `DRFACT <peer_addr> <pred>
+> <arg1> <arg2> <atom_id>` lines terminated by `DREND`); `DERIVATION
+> <rule_idx> <pred> <arg1> <arg2> <origin_addr> <contrib_csv>`
+> broadcasts a derived fact so peers cache it locally with the
+> originating peers' provenance attached. Each round: drain inbound
+> RULE + DERIVATION queues, then for every rule fetch the federated
+> fact set per premise (local + DRFETCH from each alive peer), run
+> the cross-join, dedupe via `kg_find_atom`, broadcast DERIVATION.
+> Per-atom provenance carries the head predicate name + the unique
+> set of peer addresses that contributed atoms (the "(which rule,
+> which peers)" answer the brief specifies). `dr_run_to_fixpoint(dr,
+> kg, max_rounds)` iterates until natural fixpoint or cap. Public API:
+> `dr_init(gossip, engine)`, `dr_add_rule(dr, rule_string)`,
+> `dr_run_round(dr, kg)`, `dr_run_to_fixpoint(dr, kg, max_rounds)`,
+> `dr_derivation_provenance(dr, atom_id)`. Verification: 42 unit
+> assertions in `tests/unit/test_distributed_rules.nova` (NEW;
+> bootstrap shape, single-soul-equivalent fixpoint matching R20B,
+> rule broadcast on add, inbound RULE queue drained on next round,
+> cross-soul join with provenance, inbound DERIVATION caching +
+> dedupe, max_rounds cap, stats line, chat info-line dispatch). 15
+> integration assertions in
+> `tests/integration/scenario_eeee_distributed_rules.sh` (NEW; 3-soul
+> mesh, partitioned parents A: parent(0,1)+parent(2,3); B: parent(1,2);
+> C: parent(3,4); A originates the two ancestor rules at tick 30,
+> runs dr_run_to_fixpoint at tick 60; observed convergence: **10
+> ancestors derived (full C(5,2) closure), 4 rounds, 24 DRFETCH
+> dispatches, `ancestor|0|4` present with cross-soul provenance
+> recording 2 unique peer contributors**). Chat: `/drule_add <rule>`
+> + `/drule_run` info-only dispatch wired into
+> `examples/crossengin_chat.nova`. All prior federation suites (R18E
+> gossip, R19E leader election, R20E distributed_query, R20F snapshot
+> attestation, R21E gossip_noise) remain green; R20B rule_inference
+> (47 assertions) unchanged. Module count: 174 (+1 from R20F's 173).
+> R21C adds `src/io/effectors/audio_tts.nova` — the end-to-end
 > text-to-speech pipeline that closes the TTS leg of the audio chain. CE
 > already had speech IN (R8B whisper / R10B vosk STT) and a usable
 > speech-synthesis floor (R6E Klatt with the 44-phoneme ARPAbet

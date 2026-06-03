@@ -156,6 +156,95 @@ let GOSSIP_DQERR_PREFIX  = "DQERR "
 // both sides share this literal prefix.
 let GOSSIP_ATTESTATION_PREFIX = "ATTESTATION "
 
+// R21B -- distributed rule inference message types. Rule broadcast +
+// remote fact fetch + derivation broadcast. The originator side lives
+// in distributed_rules.nova; the receiver-side dispatch is inline here
+// (same pattern R20E uses to avoid the gossip <-> distributed_rules
+// import cycle).
+//
+// Wire shapes:
+//   RULE <rule_string>\n
+//       Broadcast when a peer adds a rule via dr_add_rule. The receiver
+//       enqueues the rule string onto dr_state's inbound-rule queue;
+//       distributed_rules.nova drains the queue at the top of every
+//       dr_run_round and appends parsed rules into the local R20B
+//       engine without re-broadcasting (avoids gossip storms).
+//   DRFETCH <pred>\n
+//       Request from the originator: stream every relation fact for
+//       the named predicate from the receiver's KG. Receiver replies
+//       with one DRFACT line per fact, then DREND.
+//   DRFACT <peer_addr> <pred> <arg1> <arg2> <atom_id>\n
+//       One fact returned by DRFETCH. peer_addr is the receiver's
+//       self_addr so the originator can attribute provenance.
+//   DREND\n
+//       End of DRFETCH stream.
+//   DERIVATION <rule_idx> <pred> <arg1> <arg2> <originator_addr> <contrib1>[,<contrib2>...]\n
+//       Broadcast when a peer derives a new fact under dr_run_round.
+//       Receiver caches the fact locally (kg_add_atom on the canonical
+//       label, dedupe via kg_find_atom) and records the contributing
+//       peers in its provenance log. Contributors are addrs of the
+//       peers whose KGs supplied the premise atoms.
+let GOSSIP_RULE_PREFIX        = "RULE "
+let GOSSIP_DRFETCH_PREFIX     = "DRFETCH "
+let GOSSIP_DRFACT_PREFIX      = "DRFACT "
+let GOSSIP_DREND_LINE         = "DREND"
+let GOSSIP_DERIVATION_PREFIX  = "DERIVATION "
+
+// R21B dr_state record indices that the gossip inbound handlers need
+// to know about. The full layout is defined in distributed_rules.nova;
+// these two slots are PINNED as part of the cross-module protocol so
+// the gossip handler can push inbound RULE / DERIVATION messages onto
+// queues without an import cycle. distributed_rules.nova asserts the
+// shape via type tagging.
+let GOSSIP_DR_INBOUND_RULES = 3      // queue of pending rule strings
+let GOSSIP_DR_INBOUND_DERIVS = 4     // queue of pending derivation records
+
+// R21E -- Noise-protected gossip. The R7C Noise XK module
+// (`src/io/transducers/noise_xk.nova`) provides a mutually-authenticated,
+// AEAD-encrypted transport over a TCP fd; this module layers it under
+// the existing line-oriented gossip wire protocol. Operating modes:
+//
+//   * LEGACY (no keypair): peers without a registered static keypair
+//     (the operator never called gossip_set_noise_keys) speak the v1
+//     plaintext wire exactly as R18E shipped. Back-compat path for
+//     souls that boot without a Noise identity.
+//
+//   * NOISE: both ends have static keypairs AND the dialer has the
+//     responder's pubkey pre-registered (the out-of-band XK
+//     assumption, mirroring R7C kg_sync). The dialer sends the
+//     v2-noise HELLO; the responder accepts and both ends run the
+//     three-message XK handshake. Post-Split, every gossip line
+//     (PING / ACK / MEMBER / ...) is sealed with nxk_seal and opened
+//     with nxk_open under the per-direction transport keys.
+//
+//   * STRICT (CE_GOSSIP_REQUIRE_NOISE=1): the responder REFUSES any
+//     dialer that does not produce a v2-noise HELLO with the error
+//     line GOSSIP_ERR_NOISE_REQ. The dialer, when strict, refuses to
+//     talk to a peer whose static pubkey is not registered (no
+//     plaintext fallback).
+//
+// R21E.1 ships the handshake + the PING/ACK/MEMBER wrap (the SWIM
+// core: liveness + membership propagation). R21E.2 (next session)
+// extends the same noise transport to DELTA / ATOM / DQUERY /
+// ATTESTATION -- same primitives, more callers. The wire framing
+// for handshake messages on the gossip TCP fd is `[4 byte BE len ||
+// N bytes]` per message (the noise_xk module itself emits this for
+// post-handshake frames; we mirror the framing for the three
+// handshake messages so the receiver knows exactly how many bytes
+// to await).
+let GOSSIP_HELLO_NOISE_LINE = "HELLO ce-gossip v2 noise"
+let GOSSIP_OK_NOISE_LINE    = "OK v2 noise"
+let GOSSIP_ERR_NOISE_REQ    = "ERR noise-required"
+
+// Per-recv timeout for the Noise handshake. Each `_gnoise_recv_framed`
+// reads a 4-byte BE length then up to NXK_FRAME_MAX bytes; the peer
+// could legitimately be in the middle of a 1-4s modpow before the
+// reply is dispatched. We extend the socket RCVTIMEO to 30s for the
+// handshake window and keep it post-Split so the immediately-
+// following PING/ACK round trip doesn't trip on a peer that is just
+// finishing its own nxk_split.
+let GOSSIP_NOISE_HANDSHAKE_TIMEOUT_MS = 30000
+
 // ---- peer entry record indices --------------------------------------------
 let GOSSIP_PE_ADDR       = 0
 let GOSSIP_PE_LAST_SEEN  = 1
@@ -190,6 +279,34 @@ let GOSSIP_S_ATT_STORE   = 14  // att_store_new() handle or 0
 let GOSSIP_S_ATT_PUBKEYS = 15  // list of [peer_id, pk_bytes] or 0
 let GOSSIP_S_STATS_ATT_RX = 16 // attestations received + verified
 let GOSSIP_S_STATS_ATT_BAD = 17 // attestations dropped (bad sig / unknown peer)
+// R21B: distributed-rule-inference plumbing. dr_state is wired in
+// here so the inbound-line dispatcher can:
+//   - parse RULE lines and add to the local rule engine
+//   - serve DRFETCH from the local KG (predicate -> relation atoms)
+//   - cache DERIVATION facts into the local KG with provenance
+// All slots are 0 by default; a soul that has not opted into R21B
+// short-circuits on inbound. The handler slot is the dr_state record
+// itself (carries the engine + provenance + back-ref to gossip).
+// Slot indices are chosen above R21E's noise slots (18-24) when
+// R21E lands in the same gossip layout; this commit places R21B at
+// 18-21 with a documented coordination note for the next agent.
+let GOSSIP_S_DR_STATE    = 18  // dr_state_t or 0
+let GOSSIP_S_STATS_DR_RULES_RX     = 19  // RULE lines received
+let GOSSIP_S_STATS_DR_DERIVS_RX    = 20  // DERIVATION lines received
+let GOSSIP_S_STATS_DR_FETCHES_RX   = 21  // DRFETCH requests served
+// R21E: Noise-protected gossip slots. All zero by default; populated
+// by gossip_set_noise_keys (own static keypair) and
+// gossip_register_peer_pubkey (per-addr peer pubkey table). A soul
+// that has not opted into Noise (NOISE_PRIV == 0) continues to speak
+// the v1 plaintext wire, preserving R18E back-compat. STRICT, when 1,
+// requires Noise on every connection (both sides).
+let GOSSIP_S_NOISE_PRIV   = 22  // own static priv hex (512 chars) or 0
+let GOSSIP_S_NOISE_PUB    = 23  // own static pub hex (512 chars) or 0
+let GOSSIP_S_NOISE_PEERS  = 24  // list of [peer_addr, pubkey_hex] or 0
+let GOSSIP_S_NOISE_STRICT = 25  // 1 = refuse plaintext, 0 = lenient fallback
+let GOSSIP_S_STATS_NOISE_HS = 26       // successful Noise handshakes
+let GOSSIP_S_STATS_NOISE_HS_FAIL = 27  // failed Noise handshakes (MITM / bad pubkey / mode mismatch)
+let GOSSIP_S_STATS_NOISE_REFUSED = 28  // strict-mode plaintext refusals
 
 // ---- low-level string helpers ---------------------------------------------
 
@@ -346,6 +463,17 @@ fn gossip_init(self_addr, bootstrap_peers) {
     push(st, 0)                      // S_ATT_PUBKEYS (R20F)
     push(st, 0)                      // S_STATS_ATT_RX (R20F)
     push(st, 0)                      // S_STATS_ATT_BAD (R20F)
+    push(st, 0)                      // S_DR_STATE (R21B)
+    push(st, 0)                      // S_STATS_DR_RULES_RX (R21B)
+    push(st, 0)                      // S_STATS_DR_DERIVS_RX (R21B)
+    push(st, 0)                      // S_STATS_DR_FETCHES_RX (R21B)
+    push(st, 0)                      // S_NOISE_PRIV (R21E)
+    push(st, 0)                      // S_NOISE_PUB (R21E)
+    push(st, 0)                      // S_NOISE_PEERS (R21E)
+    push(st, 0)                      // S_NOISE_STRICT (R21E)
+    push(st, 0)                      // S_STATS_NOISE_HS (R21E)
+    push(st, 0)                      // S_STATS_NOISE_HS_FAIL (R21E)
+    push(st, 0)                      // S_STATS_NOISE_REFUSED (R21E)
 
     // Bootstrap peers are addresses; trust them at startup with
     // status=ALIVE and last_seen=nanotime() (the operator just told
@@ -726,7 +854,24 @@ fn _gossip_set_rcvtimeo_ms(fd, ms) {
     let tv = alloc(16)
     let i = 0
     while i < 16 { store8(tv + i, 0); i = i + 1 }
-    let usec = ms * 1000
+    // struct timeval: tv_sec (i64 at offset 0), tv_usec (i64 at offset 8).
+    // Linux requires tv_usec < 1_000_000; for ms >= 1000 we MUST
+    // split into seconds + remainder microseconds. (R21E: the noise
+    // handshake window uses 30s here; the original sub-second-only
+    // implementation wrote tv_usec = 30_000_000 which the kernel
+    // rejects with EINVAL -- timeouts > 999ms silently became zero
+    // and the recv returned EAGAIN immediately.)
+    let secs = ms / 1000
+    let rem_ms = ms - secs * 1000
+    let usec = rem_ms * 1000
+    // Write tv_sec at offset 0 as little-endian 8 bytes.
+    let vs = secs
+    let k = 0
+    while k < 8 {
+        store8(tv + k, vs - (vs / 256) * 256)
+        vs = vs / 256
+        k = k + 1
+    }
     // Write tv_usec at offset 8 as little-endian 8 bytes.
     let v = usec
     let j = 0
@@ -1013,6 +1158,28 @@ fn gossip_handle_conn_kg(state, conn_fd, kg) {
                             // tamper-resistance invariant.
                             if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
                                 _gossip_serve_attestation(state, line)
+                            }
+                            // R21B additive parser branches: distributed-
+                            // rule inference message types. All three
+                            // are no-ops when gossip_set_dr_state has not
+                            // been wired (the dr_state slot is 0). The
+                            // RULE branch enqueues the rule string onto
+                            // the dr_state inbound queue (drained at the
+                            // top of dr_run_round); DRFETCH streams the
+                            // receiver's local relation facts for the
+                            // requested predicate; DERIVATION enqueues a
+                            // peer-derived fact for local caching. The
+                            // dispatch lives HERE so the import graph
+                            // remains acyclic (distributed_rules imports
+                            // gossip, not vice versa).
+                            if _gossip_starts_with(line, GOSSIP_RULE_PREFIX) == 1 {
+                                _gossip_serve_rule(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_DRFETCH_PREFIX) == 1 {
+                                _gossip_serve_drfetch(conn_fd, state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_DERIVATION_PREFIX) == 1 {
+                                _gossip_serve_derivation(state, kg, line)
                             }
                         }
                     }
@@ -1433,4 +1600,246 @@ fn gossip_broadcast_attestation(state, att) {
         i = i + 1
     }
     return ok
+}
+
+// ============================================================================
+// R21B -- distributed-rule inference gossip hooks.
+// ============================================================================
+//
+// All three handlers are no-ops until distributed_rules.nova calls
+// gossip_set_dr_state to wire in a dr_state record. The state object
+// carries the rule engine + provenance log + inbound message queues at
+// pinned slots GOSSIP_DR_INBOUND_RULES (3) and GOSSIP_DR_INBOUND_DERIVS
+// (4) so the gossip handler can push without an import cycle. Inbound
+// RULE / DERIVATION / DRFETCH lines arrive via the parser branches in
+// gossip_handle_conn_kg.
+
+fn gossip_set_dr_state(state, dr_state) {
+    state[GOSSIP_S_DR_STATE] = dr_state
+    return state
+}
+
+fn gossip_dr_state(state) { return state[GOSSIP_S_DR_STATE] }
+
+fn gossip_stats_dr_rules_rx(state)   { return state[GOSSIP_S_STATS_DR_RULES_RX] }
+fn gossip_stats_dr_derivs_rx(state)  { return state[GOSSIP_S_STATS_DR_DERIVS_RX] }
+fn gossip_stats_dr_fetches_rx(state) { return state[GOSSIP_S_STATS_DR_FETCHES_RX] }
+
+// --- DR helpers: tiny self-contained label parser ------------------------
+//
+// The rule engine canonicalises facts as "pred|arg1|arg2" RELATION atoms
+// (RULE_FACT_SEPARATOR = "|"). We mirror that here without importing the
+// rule_inference module (to avoid cycles): scan label, split on the pipe
+// character (ASCII 124), accept only the 3-part shape.
+
+fn _gossip_dr_split_label(label) {
+    let parts = list_new()
+    let n = len(label)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(label, i) == 124 {
+            push(parts, substr(label, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(label, start, n - start))
+    return parts
+}
+
+// Receive a RULE line. Format: `RULE <rule_string>` (trailing newline
+// stripped by the recv-line helper). Enqueues the raw rule string
+// onto the dr_state's inbound-rule queue; distributed_rules.nova drains
+// the queue in dr_run_round (passive ingestion -- no callback cycle).
+// Returns 1 on enqueued, 0 on drop.
+fn _gossip_serve_rule(state, line) {
+    let dr = state[GOSSIP_S_DR_STATE]
+    if dr == 0 { return 0 }
+    if _gossip_starts_with(line, GOSSIP_RULE_PREFIX) == 0 { return 0 }
+    let rest = substr(line, len(GOSSIP_RULE_PREFIX), len(line) - len(GOSSIP_RULE_PREFIX))
+    if len(rest) == 0 { return 0 }
+    let q = dr[GOSSIP_DR_INBOUND_RULES]
+    if q == 0 { return 0 }
+    push(q, rest)
+    state[GOSSIP_S_STATS_DR_RULES_RX] = state[GOSSIP_S_STATS_DR_RULES_RX] + 1
+    return 1
+}
+
+// Receive a DERIVATION line. Format:
+//   `DERIVATION <rule_idx> <pred> <arg1> <arg2> <origin_addr> <contrib1>[,<contrib2>...]`
+// Enqueues the parsed tuple onto the dr_state's inbound-derivation
+// queue; distributed_rules.nova drains the queue in dr_run_round, where
+// it caches the fact into the KG (dedupe via kg_find_atom) and updates
+// the per-atom provenance log with the contributing peers.
+fn _gossip_serve_derivation(state, kg, line) {
+    let dr = state[GOSSIP_S_DR_STATE]
+    if dr == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 7 { return 0 }
+    // toks: DERIVATION, rule_idx, pred, arg1, arg2, origin_addr, contrib_csv
+    let rule_idx_s = toks[1]
+    let pred = toks[2]
+    let arg1 = toks[3]
+    let arg2 = toks[4]
+    let origin_addr = toks[5]
+    let contrib_csv = toks[6]
+    let rule_idx = 0
+    if _gossip_is_digits(rule_idx_s) == 1 { rule_idx = str_to_int(rule_idx_s) }
+    let q = dr[GOSSIP_DR_INBOUND_DERIVS]
+    if q == 0 { return 0 }
+    let rec = list_new()
+    push(rec, rule_idx)
+    push(rec, pred)
+    push(rec, arg1)
+    push(rec, arg2)
+    push(rec, origin_addr)
+    push(rec, contrib_csv)
+    push(q, rec)
+    state[GOSSIP_S_STATS_DR_DERIVS_RX] = state[GOSSIP_S_STATS_DR_DERIVS_RX] + 1
+    return 1
+}
+
+// Receive a DRFETCH request. Format: `DRFETCH <pred>`. Stream every
+// RELATION atom in the local KG whose canonical "pred|arg1|arg2" label
+// matches the requested pred, as DRFACT lines tagged with our self_addr;
+// terminate with DREND.
+fn _gossip_serve_drfetch(conn_fd, state, kg, line) {
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 2 { return 0 }
+    let pred = toks[1]
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    state[GOSSIP_S_STATS_DR_FETCHES_RX] = state[GOSSIP_S_STATS_DR_FETCHES_RX] + 1
+    if kg == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_DREND_LINE + "\n")
+        return 0
+    }
+    let atoms = kg_atoms(kg)
+    let i = 0
+    let sent = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_RELATION {
+                let label = atom_label(a)
+                let parts = _gossip_dr_split_label(label)
+                if len(parts) == 3 {
+                    if str_eq(parts[0], pred) == 1 {
+                        let fact_line = GOSSIP_DRFACT_PREFIX + self_addr
+                            + " " + pred
+                            + " " + parts[1]
+                            + " " + parts[2]
+                            + " " + int_to_str(atom_id(a)) + "\n"
+                        if _gossip_send_all(conn_fd, fact_line) == 0 {
+                            i = len(atoms)
+                        } else {
+                            sent = sent + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    _gossip_send_all(conn_fd, GOSSIP_DREND_LINE + "\n")
+    return sent
+}
+
+// Client-side: broadcast a RULE line to every alive peer.
+fn gossip_broadcast_rule(state, rule_string) {
+    let alive = gossip_alive_peers(state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if _gossip_dr_send_line(state, alive[i], GOSSIP_RULE_PREFIX + rule_string) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// Client-side: broadcast a DERIVATION line to every alive peer.
+// contrib_csv is the comma-joined list of contributing peer addrs (the
+// peers whose KGs supplied the premise atoms for this derivation). The
+// originator's own self_addr is included if any premise came from a
+// local fact.
+fn gossip_broadcast_derivation(state, rule_idx, pred, arg1, arg2, contrib_csv) {
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let line = GOSSIP_DERIVATION_PREFIX + int_to_str(rule_idx)
+        + " " + pred + " " + arg1 + " " + arg2
+        + " " + self_addr + " " + contrib_csv
+    let alive = gossip_alive_peers(state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if _gossip_dr_send_line(state, alive[i], line) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// Client-side: fetch every relation fact for `pred` from one peer.
+// Returns a list of [peer_addr, pred, arg1, arg2, remote_atom_id]
+// records (zero-length if the peer is unreachable / has no facts).
+fn gossip_dr_fetch_from(state, peer_addr, pred) {
+    let out = list_new()
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return out }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return out
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return out }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return out }
+    if _gossip_send_all(fd, GOSSIP_DRFETCH_PREFIX + pred + "\n") == 0 {
+        close_fd(fd); return out
+    }
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_DREND_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_DRFACT_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // DRFACT peer_addr pred arg1 arg2 atom_id
+                    if len(toks) >= 6 {
+                        let rec = list_new()
+                        push(rec, toks[1])     // peer_addr
+                        push(rec, toks[2])     // pred
+                        push(rec, toks[3])     // arg1
+                        push(rec, toks[4])     // arg2
+                        let aid = 0
+                        if _gossip_is_digits(toks[5]) == 1 { aid = str_to_int(toks[5]) }
+                        push(rec, aid)
+                        push(out, rec)
+                    }
+                }
+            }
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return out
+}
+
+// Helper: open a short-lived TCP connection to peer_addr, send one
+// line, expect graceful close. Used for RULE + DERIVATION broadcasts.
+fn _gossip_dr_send_line(state, peer_addr, line) {
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return 0 }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    if _gossip_send_all(fd, line + "\n") == 0 { close_fd(fd); return 0 }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
 }

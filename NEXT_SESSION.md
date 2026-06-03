@@ -3,6 +3,125 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R21B (this session) -- distributed rule inference -- mini-Datalog over the gossip mesh
+
+**Status: complete -- `src/federation/distributed_rules.nova` (NEW,
+~640 lines) ships federated forward-chaining rule inference. R20B
+ships forward-chaining mini-Datalog rule inference on a SINGLE local
+KG; R20E ships distributed SPARQL query fan-out across the R18E
+gossip mesh; R21B is the bridge. A rule's premises can match facts
+from ANY peer's KG, and derived conclusions can be visible to all
+peers via gossip-relayed DERIVATION lines.**
+
+### What R21B delivers
+
+1. **New module** `src/federation/distributed_rules.nova` -- public
+   API: `dr_init(gossip_state, rule_engine)` (wraps the R20B engine
+   + installs the dr_state on the gossip back-reference so inbound
+   RULE / DRFETCH / DERIVATION lines are routed), `dr_add_rule(dr,
+   rule_string)` (parses + appends locally + broadcasts RULE to
+   every alive peer), `dr_run_round(dr, kg)` (drains inbound queues,
+   then for each rule fetches the federated fact set + cross-joins
+   + adds derived atoms locally + broadcasts DERIVATION + records
+   provenance), `dr_run_to_fixpoint(dr, kg, max_rounds)` (iterates
+   until no new local atoms or cap fires; returns
+   `[total_derived, rounds]`), `dr_derivation_provenance(dr,
+   atom_id)` (returns `[rule_head_pred, peer_addrs...]`). Plus
+   helpers: `dr_engine`, `dr_rule_count`, `dr_inbound_rule_count`,
+   `dr_inbound_deriv_count`, `dr_stats_*`.
+
+2. **Gossip extension in `src/federation/gossip.nova`** -- 5 new
+   wire prefixes (`RULE `, `DRFETCH `, `DRFACT `, `DREND`,
+   `DERIVATION `), 4 new state slots (`GOSSIP_S_DR_STATE` + 3
+   stats counters), 2 pinned dr_state slot indices
+   (`GOSSIP_DR_INBOUND_RULES = 3`, `GOSSIP_DR_INBOUND_DERIVS = 4`)
+   the gossip handler pushes onto, 4 new client helpers
+   (`gossip_broadcast_rule`, `gossip_broadcast_derivation`,
+   `gossip_dr_fetch_from`, `_gossip_dr_send_line`), 3 inbound
+   parser branches added to BOTH `gossip_handle_conn_kg` (the
+   plaintext variant) AND its noise-wrapped sibling (R21E's
+   gconn variant) so noise meshes also drive distributed inference.
+
+3. **Chat dispatch** -- two new admin commands `/drule_add <rule>`
+   and `/drule_run` that are INFO-only inside the unified daemon
+   (mirroring how `/gossip`, `/leader`, `/attest_log` work for
+   federation primitives that have no in-REPL state). One help
+   line added. Total chat surface: 3 lines (under the 4-line
+   budget).
+
+### Verification snapshot (latest run)
+
+- 42 unit assertions in `tests/unit/test_distributed_rules.nova`,
+  all PASS -- covers bootstrap shape, rule broadcast on add,
+  inbound RULE queue drained on next round, cross-soul join via
+  the federated fact set, provenance shape (rule_name + unique
+  peer set), inbound DERIVATION caching + dedupe, max_rounds cap,
+  stats line, chat info-line dispatch.
+- 15 integration assertions in
+  `tests/integration/scenario_eeee_distributed_rules.sh`, all PASS
+  on a clean run -- 3-soul mesh with partitioned parent facts
+  (A: parent(0,1)+parent(2,3); B: parent(1,2); C: parent(3,4)),
+  ancestor rules added on A at tick 30, dr_run_to_fixpoint(15)
+  at tick 60. Observed: **10 ancestors derived (full closure),
+  4 rounds, 24 DRFETCH dispatches, `ancestor|0|4` present with
+  cross-soul provenance.**
+- All prior federation suites (R18E gossip 34, R19E leader
+  election 40, R20E distributed_query 36, R20F snapshot
+  attestation 66, R21E gossip_noise 44) remain green.
+- R20B rule_inference suite (47 assertions) is unchanged + still
+  PASSes.
+- Module count: 174 (R20F's 173 + 1 new).
+
+### Cross-soul derivation example
+
+```
+Soul A:  parent(0,1), parent(2,3)
+Soul B:  parent(1,2)
+Soul C:  parent(3,4)
+
+A: dr_add_rule("RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+A: dr_add_rule("RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+A: dr_run_to_fixpoint(dr, kg_a, 15)
+
+Round 1: rule 1 derives (0,1),(2,3) from local + (1,2) via DRFETCH B
+                          + (3,4) via DRFETCH C
+                         rule 2 derives (0,2) [A's parent + B's parent],
+                          (1,3) [B's parent + A's parent], (2,4)
+Round 2: rule 2 derives (0,3),(1,4)
+Round 3: rule 2 derives (0,4) [the longest cross-soul chain]
+Round 4: nothing new. Fixpoint.
+
+Total: 10 ancestors at A. The (0,4) atom's provenance includes
+self_addr + B's addr (the join points along the chain).
+```
+
+### Known limitations / gotchas
+
+- **Round-based DRFETCH is O(rules x premises x N_peers)** per round.
+  Each round opens N TCP connections per rule per premise to refresh
+  the federated fact set. For a 16-soul mesh with 4-premise rules
+  that's 64 dials/round/rule -- typical SWIM-scale meshes (N <= 16)
+  handle this in 2-3s/round.
+- **No DP / DRFACT noise** -- a peer can probe another peer's KG by
+  firing rules whose premise predicates target the other peer's
+  relations and reading the DRFACT stream. Future composition with
+  R3.6 DP could noisify the response.
+- **DRFACT is unfiltered** -- the responder ships every RELATION
+  atom matching the predicate. An operator policy layer
+  (`allow_predicates` / `deny_predicates`) at the responder side
+  is the natural follow-on.
+- **No signed derivations** -- a malicious peer could fabricate
+  DERIVATION lines. R20F-style signing over the DERIVATION
+  pre-image is the obvious next layer (the substrate is ready;
+  the wrap is a follow-on session).
+- **Within-process daemon hook still pending** -- the chat REPL
+  dispatches `/drule_add` and `/drule_run` to info-only lines.
+  A federation-aware daemon variant (similar shape to
+  `crossengin_fed_coordinator.nova`) would drive
+  `dr_run_to_fixpoint` periodically. The integration scenario
+  shows the daemon shape; wiring it into the unified chat is a
+  deployment choice, not a substrate gap.
+
 ## R21C (this session) -- end-to-end text-to-speech pipeline
 
 **Status: complete -- `src/io/effectors/audio_tts.nova` (NEW, ~660

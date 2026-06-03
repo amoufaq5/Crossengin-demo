@@ -937,3 +937,340 @@ store still at 2 (no pollution).
    verified tuple in insertion order. The consumer (operator UI,
    automated check) needs a monotonicity-on-ts pass to flag replays.
    The substrate exposes the data; the policy lives one layer up.
+
+## R21E extension: Noise-protected gossip — mesh-level mutual auth + AEAD
+
+### Why this exists
+
+R18E gossip ships in plaintext over TCP. The R7C Noise XK module
+(`src/io/transducers/noise_xk.nova`) provides a production-grade
+mutually-authenticated AEAD transport (RFC 7919 Group 14 2048-bit DH
+via Montgomery REDC; ChaCha20-Poly1305 AEAD; SHA-256 transcript
+binding). R21E wraps every gossip connection in Noise XK once both
+peers have static keypairs and the dialer knows the responder's
+pubkey out-of-band. The federation mesh now carries PING / ACK /
+MEMBER / DELTA / ATOM / DQUERY* / ATTESTATION lines under AEAD;
+every line is bound to a per-session transcript hash; replay across
+a session is impossible (monotonic per-direction nonce counters);
+replay across sessions is irrelevant (per-session fresh transport
+keys via HKDF Split).
+
+### Operating modes
+
+1. **Legacy plaintext** — a soul that has not called
+   `gossip_set_noise_keys` speaks the R18E v1 wire exactly as before.
+   Back-compat for souls without a Noise identity.
+2. **Noise** — both ends have static keypairs AND the dialer has the
+   responder's pubkey pre-registered via
+   `gossip_register_peer_pubkey(state, peer_addr, pubkey_hex)`. The
+   dialer sends the v2-noise HELLO; the responder accepts and both
+   run the three-message Noise XK handshake. Post-Split, every
+   gossip line is sealed with `nxk_seal` and opened with `nxk_open`.
+3. **Strict** (`CE_GOSSIP_REQUIRE_NOISE=1`, or
+   `gossip_noise_set_strict(state, 1)`) — the responder REFUSES any
+   non-noise hello and emits `ERR noise-required`. The dialer
+   refuses to dial peers with no registered pubkey (no plaintext
+   fallback).
+
+### Wire negotiation
+
+```
+v1 (plaintext, R18E):   HELLO ce-gossip v1    -> OK v1
+v2 (noise, R21E):       HELLO ce-gossip v2 noise
+                        OK v2 noise
+                        [4 byte BE len || nxk msg1 (272 B)]
+                        [4 byte BE len || nxk msg2 (272 B)]
+                        [4 byte BE len || nxk msg3 (288 B)]
+                        (every subsequent line: nxk_seal/nxk_open)
+strict refusal:         HELLO ce-gossip v1    -> ERR noise-required
+```
+
+The three handshake messages reuse the noise_xk module's wire format
+verbatim; the gossip layer adds a 4-byte BE length prefix per
+handshake message so the receiver can `recv_exact` the right number
+of bytes without parsing the noise wire itself.
+
+### Public API (R21E surface)
+
+```
+gossip_set_noise_keys(state, my_priv_hex, my_pub_hex)
+gossip_noise_is_configured(state)             -> 1 iff own keypair set
+gossip_noise_my_pubkey(state)
+gossip_register_peer_pubkey(state, peer_addr, pubkey_hex)
+gossip_noise_lookup_peer_pubkey(state, peer_addr)  -> hex | 0
+gossip_noise_peer_count(state)
+gossip_noise_set_strict(state, strict)
+gossip_noise_strict_mode(state)
+gossip_noise_strict_from_env(state)
+gossip_stats_noise_hs(state)
+gossip_stats_noise_hs_fail(state)
+gossip_stats_noise_refused(state)
+gossip_send_ping_gconn(state, addr)
+gossip_handle_conn_kg_gconn(state, conn_fd, kg)
+gossip_noise_status_line(state)
+```
+
+The historical `gossip_send_ping` / `gossip_handle_conn_kg` entry
+points are preserved for back-compat with the R18E daemon driver.
+The `*_gconn` variants do the negotiation and route through the
+gconn (gossip-connection) abstraction.
+
+### Threat model & guarantees
+
+* **MITM**: a peer that does not hold the registered static priv
+  cannot complete the Noise XK handshake. The `es` DH on the dialer
+  binds to the registered `rs`; if the responder holds a different
+  priv, the AEAD tag in msg1 mismatches and the responder rejects.
+  `tests/unit/test_gossip_noise.nova::test_mitm_wrong_peer_pubkey_rejects_handshake`
+  pins this at the gossip API surface.
+* **Replay (within session)**: per-direction monotonic 64-bit nonce
+  counter; `nxk_open` rejects a frame whose nonce <= last seen.
+  Replay protection inherited verbatim from noise_xk.
+* **Replay (across sessions)**: handshake mixes both sides'
+  ephemerals into `ck`; transport keys are unique per session.
+* **Strict-mode plaintext peer**: responder emits `ERR noise-required`
+  + bumps `stats_noise_refused`; store unchanged.
+* **Lenient + unknown peer pubkey**: dialer falls through to plaintext;
+  the integration shape preserves R18E back-compat.
+
+### Verification
+
+* Unit (`tests/unit/test_gossip_noise.nova`): **44 assertions**
+  covering state setup (defaults, configured flag, my-pubkey
+  accessor), per-peer registry (add / overwrite / unknown / count),
+  strict mode (set / clear / env-driven), in-process handshake
+  completion with matching keys (session-hash agreement, peer-static
+  recovery), PING line round-trip under noise transport, MITM
+  rejection at msg1, strict-mode dial refusal (no socket opened +
+  refused counter advances), lenient-mode dial does not bump refused,
+  gconn structural accessors (plain vs noise; fd, role, peer-pub),
+  and status-line tokens (`configured`, `mode`, hs counters).
+* Integration (`tests/integration/scenario_hhhh_gossip_noise.sh`):
+  ~11 assertions across THREE souls running the noise transport in
+  the lenient mode, a STRICT-mode 4th soul that refuses plaintext,
+  and a MITM 5th driver that registers the WRONG pubkey and is
+  rejected at msg1. Stage 1: 3-soul Noise mesh -- each soul reports
+  `configured=yes`; total `hs_ok` across the mesh >= 1; A's pings
+  and total acks counters > 0; A's peers count = 2. Stage 2 (STRICT):
+  a probe driver dials S with plaintext HELLO; S replies
+  `ERR noise-required` and bumps `stats_noise_refused`. Stage 3
+  (MITM): a probe driver registers a WRONG pubkey for A and dials;
+  the gconn returns 0 (rejected) and A's `stats_noise_hs_fail`
+  advances. Total runtime ~60s because each handshake is ~5-15s
+  (four 2048-bit modpows per side).
+
+### Honest scope
+
+R21E.1 (this session) ships:
+1. Noise XK handshake driven by gossip-level configuration
+   (`gossip_set_noise_keys` + `gossip_register_peer_pubkey`).
+2. The `gconn` abstraction: a unified send/receive surface that
+   routes through plaintext OR Noise based on negotiation outcome.
+3. `gossip_send_ping_gconn` + `gossip_handle_conn_kg_gconn`: the
+   PING / ACK / MEMBER / BYE round-trip under the gconn (which
+   becomes Noise if both ends are configured + registered).
+4. Strict-mode refusal (env-driven + programmatic).
+5. The full v1-plaintext back-compat path.
+6. Inbound dispatch of DELTA / ATOM / DQUERY / ATTESTATION lines is
+   already wired through the gconn (no per-message branching needed
+   -- a `_gconn_recv_line` returning a DQUERY line is dispatched
+   exactly the same as a PING line). So the broader gossip surface
+   ALREADY rides the Noise transport when the gconn is noise; the
+   only thing R21E.2 is left to do is migrate the daemon's
+   `gossip_step` + `gossip_send_delta_request` (currently calls
+   `_gossip_dial` directly, bypassing the gconn) to the gconn path.
+
+R21E.2 (next session) wire-pass items:
+1. `gossip_send_delta_request` -> `gossip_send_delta_request_gconn`
+   (mirrors the ping refactor).
+2. `gossip_send_attestation` -> `gossip_send_attestation_gconn`.
+3. `gossip_step` calls the gconn variants by default when the soul
+   is noise-configured.
+4. Allowlist-by-pubkey on the responder side -- today any peer with
+   a valid static priv whose msg1 verifies is accepted. An
+   `gossip_allow_pubkey` table would let the operator pin a
+   per-pubkey whitelist (subset of the registered pubkey table).
+5. Key rotation: today the static keypair is fixed for the lifetime
+   of the gossip state. A `gossip_rotate_noise_keys` shim with
+   graceful per-peer renegotiation would let an operator rotate
+   without restarting the mesh.
+
+## R21B extension: distributed rule inference — mini-Datalog over the gossip mesh
+
+R20B (`src/kg/rule_inference.nova`) ships forward-chaining mini-
+Datalog rule inference on a SINGLE local KG. R20E
+(`src/federation/distributed_query.nova`) ships distributed SPARQL
+query fan-out across the R18E gossip mesh. R21B is the bridge:
+declarative inference where premises can be satisfied across
+DIFFERENT peers' KGs. The classical case is `parent(alice, bob)` on
+peer A + `parent(bob, carol)` on peer B + the standard transitive
+ancestor rules deriving `ancestor(alice, carol)` by joining premise
+atoms drawn from two different souls.
+
+### Protocol (additive on top of R18E gossip)
+
+Three new line types:
+
+```
+RULE <rule_string>\n
+    Broadcast when a peer adds a rule via dr_add_rule. Receiver
+    enqueues the rule string onto the dr_state inbound-rule queue;
+    distributed_rules.nova drains the queue at the top of every
+    dr_run_round and appends parsed rules into the local R20B
+    engine WITHOUT re-broadcasting (gossip-storm prevention).
+
+DRFETCH <pred>\n
+    Originator request: stream every relation fact for the named
+    predicate from the receiver's KG. Receiver replies:
+        DRFACT <peer_addr> <pred> <arg1> <arg2> <atom_id>\n   (n times)
+        DREND\n
+    Each DRFACT carries the receiver's self_addr so the originator
+    can attribute provenance per row.
+
+DERIVATION <rule_idx> <pred> <arg1> <arg2> <origin_addr> <contrib1>[,<contrib2>...]\n
+    Broadcast when a peer derives a new fact during dr_run_round.
+    Receiver caches the fact locally (kg_add_atom on the canonical
+    "pred|arg1|arg2" label, dedupe via kg_find_atom) and records
+    the contributing peers in its provenance log. This lets a peer
+    with no relevant local facts (e.g. the bystander in a chain)
+    still see the derived conclusions.
+```
+
+The line dispatch lives in `gossip.nova` itself (mirrors R20E's
+DQUERY pattern); the originator side + the federated cross-join +
+the provenance machinery lives in `distributed_rules.nova`. The
+gossip <-> distributed_rules import direction stays acyclic
+(distributed_rules imports gossip, never the reverse) via two
+pinned slots in the dr_state record (`GOSSIP_DR_INBOUND_RULES = 3`,
+`GOSSIP_DR_INBOUND_DERIVS = 4`) that the gossip handler pushes onto.
+
+### Federated forward chaining
+
+`dr_run_round(dr, kg)` does one pass:
+
+1. Drain inbound RULE queue (peers may have just broadcast rules).
+2. Drain inbound DERIVATION queue (peers may have just derived
+   facts; we cache them locally with their broadcast provenance).
+3. For each rule in the local engine:
+   a. For each premise predicate, build the federated fact set:
+      local facts (read from kg directly, tagged with self_addr) +
+      `gossip_dr_fetch_from(peer, pred)` for every alive peer
+      (returns DRFACT records tagged with peer_addr). Each fact
+      gets a 4-tuple `[peer_addr, arg1, arg2, atom_id]`.
+   b. Run the cross-join: for every binding satisfying the previous
+      premise, try each fact in the next premise's federated set.
+      Bindings carry an evolving `peers` set tracking which souls
+      contributed atoms to the in-progress firing.
+   c. For each fully-satisfied binding, instantiate the head;
+      canonicalise; dedupe via `kg_find_atom`; if new, add the atom
+      locally + record `[atom_id, rule_head_pred, [peer_addrs]]`
+      to the provenance log; broadcast DERIVATION so other peers
+      cache the same atom.
+
+`dr_run_to_fixpoint(dr, kg, max_rounds)` iterates `dr_run_round`
+until a round adds zero new local atoms or `max_rounds` fires.
+Returns `[total_derived, rounds]`. The 5-node transitive chain
+verification (4 parents partitioned across 3 peers, classical
+ancestor rules) reaches fixpoint in 4 rounds, deriving all C(5,2) =
+10 ancestor pairs at the originator.
+
+### Provenance shape
+
+`dr_derivation_provenance(dr, atom_id) -> [rule_head_pred, peer1,
+peer2, ...]`. The first element is the head predicate name of the
+rule that produced the atom (R20B's `rule_head_pred`); subsequent
+elements are the unique peer addresses that supplied any premise
+atom for the firing, in the order they were used by the cross-join.
+The originator's own self_addr is included if any premise came
+from the local KG.
+
+For the integration scenario's `ancestor|0|4` atom (the longest
+cross-soul chain: parent(0,1) on A + parent(1,2) on B + parent(2,3)
+on A + parent(3,4) on C):
+
+```
+prov_0_4 = ["ancestor", "127.0.0.1:PORT_A", "127.0.0.1:PORT_B"]
+prov_0_2 = ["ancestor", "127.0.0.1:PORT_A", "127.0.0.1:PORT_B"]
+```
+
+The federation policy is "peer set of unique contributors", not
+"full chain trace" -- longer chains accumulate peer addresses
+linearly until the join saturates the contributor set.
+
+### Trust model
+
+The gossip mesh is the SAME shape R18E ships -- assume mutually
+non-malicious peers (or pair with R7C Noise XK auth + R20F signed
+attestations for adversarial settings). R21B itself adds no new
+cryptographic guarantees beyond what gossip provides; provenance is
+informational, not a signed receipt. A malicious peer could
+fabricate DRFACT or DERIVATION lines -- defense for that threat
+lives one layer up (e.g. signed-fact attestations, similar shape to
+R20F). The R21B substrate ships the inference primitive; auth + DP +
+attestation compose on top.
+
+### Public API
+
+```
+dr_init(gossip_state, rule_engine)        -> dr_state
+dr_add_rule(dr, rule_string)              -> 1 | error
+dr_run_round(dr, kg)                      -> int (atoms derived
+                                             this round)
+dr_run_to_fixpoint(dr, kg, max_rounds)    -> [total_derived, rounds]
+dr_derivation_provenance(dr, atom_id)     -> [rule_name, peer_addrs...]
+```
+
+Plus chat-side conveniences (`dr_stats_line`, `dr_rule_count`,
+`dr_inbound_rule_count`, `dr_inbound_deriv_count`) and the gossip
+hook surface (`gossip_set_dr_state`, `gossip_broadcast_rule`,
+`gossip_broadcast_derivation`, `gossip_dr_fetch_from`).
+
+### Verification
+
+* Unit (`tests/unit/test_distributed_rules.nova`): **42 assertions**
+  covering bootstrap shape; rule broadcast on add; inbound RULE
+  queue drained on next round; cross-soul join via the federated
+  fact set (single-soul case matches R20B exactly + multi-binding
+  case produces the same closure regardless of fact-source
+  partitioning); provenance shape (rule_name + unique peer set);
+  inbound DERIVATION caching + dedupe; max_rounds cap; stats line;
+  chat info-line dispatch.
+
+* Integration (`tests/integration/scenario_eeee_distributed_rules.sh`):
+  **15 assertions** on a 3-soul mesh (3 random local ports). Soul
+  A is seeded with `parent(0,1) + parent(2,3)`; B with `parent(1,2)`;
+  C with `parent(3,4)`. A is the originator: adds the two ancestor
+  rules at tick 30, runs `dr_run_to_fixpoint(15)` at tick 60. The
+  observed convergence: **10 ancestor atoms derived (full closure),
+  4 rounds, 24 DRFETCH dispatches, `ancestor|0|4` present with
+  provenance recording 2 unique peer contributors** (A + B for the
+  cross-soul join). All federation prior suites (R18E gossip, R19E
+  leader election, R20E distributed query, R20F snapshot
+  attestation, R21E noise) remain green; the R20B local rule
+  inference suite (47 assertions) is unchanged.
+
+### Limitations / future work
+
+1. **No DP / DRF noise.** A peer can probe another peer's KG by
+   firing rules whose premise predicates only it cares about and
+   reading the DRFACT stream. R21B's DRFETCH wire is unfiltered.
+   Future composition with R3.6 DP could noisify the per-row count
+   at the DRFETCH responder.
+2. **DRFACT is read-only** -- no schema restrictions yet. The
+   responder ships every RELATION atom matching the predicate; an
+   operator policy layer ("allow_predicates" / "deny_predicates")
+   could filter at the responder side. The substrate exposes the
+   data; the policy lives one layer up.
+3. **No signed derivations.** R20F-style signing over the DERIVATION
+   pre-image would let receivers verify the originator's identity
+   on the cached fact. Substrate is ready (gossip already carries
+   pubkeys for R20F); the wrap is a follow-on session.
+4. **Round-based fact gather is O(rules × premises × N_peers)** per
+   round. For a 16-soul mesh with 4-premise rules, that's 64 TCP
+   handshakes per round per rule. Caching the federated fact set
+   within a single fixpoint pass (refresh only when a peer broadcasts
+   a new fact) is the obvious win.
+5. **No DELTA-fed warm cache.** Today every round re-fetches the
+   relevant predicate set from every alive peer. A future round
+   could ride DELTA's existing belief-mutation stream to keep a
+   local materialised relation cache.
