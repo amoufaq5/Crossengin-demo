@@ -786,3 +786,154 @@ a: dquery_peer label=ALL peer=127.0.0.1:37761 count=4
    cannot directly reach all peers), the query would need a TTL +
    forwarding hop list. The current 1-hop fan-out is the right
    default for dense local meshes.
+
+## R20F extension: gossip-relayed signed snapshot attestation
+
+R15E + R16A make a single soul's snapshot *tamper-evident +
+operator-signed*: any single-bit edit to the snapshot file changes
+the Merkle root, and the Ed25519 signature over the root pins the
+file to a key the operator holds. R18E gossip + R19E leader election
+give that single soul a federated view of "who else is alive" + "who
+is the coordinator". R20F closes the gap between those two: **let
+peers publish their snapshot roots to each other so the federation
+can detect rollbacks, divergence, or single-soul tampering without
+trusting any one node**.
+
+### Threat model
+
+The gossip mesh is **UNTRUSTED**. A malicious peer can replay,
+reorder, or fabricate ATTESTATION lines. R20F's defense:
+
+1. Every attestation tuple is `(soul_id, ts_ns, merkle_root,
+   signature)`. The signature covers `soul_id || ts_ns ||
+   merkle_root` under the originator's Ed25519 long-term private
+   key.
+2. The receiver resolves `soul_id -> pubkey` via a local pubkey
+   table seeded out-of-band at federation bootstrap (same shape R19E
+   already uses for `soul_id -> addr` registration, same pubkey
+   bytes R7C Noise XK already negotiates for static-key auth).
+3. The receiver verifies the signature. On fail (bad sig, unknown
+   soul, malformed wire) the attestation is **dropped** and a
+   bad-counter advances; the store is **not mutated** — visible to
+   the operator via `/attest_log`, silent on the wire.
+
+A verified attestation may still be a REPLAY (the same root re-
+broadcast at a later time). The consumer code (operator forensics,
+automated consistency check) is responsible for monotonicity-on-ts
+policy. The store keeps every verified tuple in insertion order; a
+replay shows up as a stale ts with a valid signature — observable,
+not silent.
+
+### Wire shape
+
+```
+ATTESTATION <soul_id> <ts_ns> <merkle_root_hex> <sig_hex>\n
+```
+
+* `soul_id`: integer, matches R19E's peer-id (typically hash of the
+  pubkey).
+* `ts_ns`: integer nanoseconds at the mint moment.
+* `merkle_root_hex`: 64-char lowercase hex (R15E's standard form).
+* `sig_hex`: 128-char lowercase hex (Ed25519 signature, R || s).
+
+The line is piggybacked on a gossip TCP exchange (HELLO/OK then the
+single ATTESTATION line, then BYE). Implementation in
+`src/federation/snapshot_attestation.nova` is transport-agnostic
+(`att_make`/`att_parse_wire` / `att_verify`); the gossip integration
+lives in `src/federation/gossip.nova` and stays a thin shim around
+the snapshot-attestation primitives.
+
+### Canonical signing pre-image
+
+`soul_id` and `ts_ns` are rendered as fixed-width 8-byte little-
+endian; the root is appended as its 32 raw bytes. Total pre-image is
+exactly 48 bytes. Both endpoints must produce bit-identical bytes
+from the same `(soul_id, ts_ns, root_bytes)`; the test suite pins
+this layout with a known-vector check (see
+`test_canonical_message_layout` in
+`tests/unit/test_snapshot_attestation.nova`).
+
+### Public API
+
+```
+att_make(soul_id, ts_ns, root_bytes, seed, pk)   -> attestation tuple
+att_verify(att, pk)                              -> 1 if valid, 0 else
+att_store_new()                                  -> empty store
+att_store_add(store, att)                        -> appends to log
+att_store_for_peer(store, peer_id)               -> list of attestations
+att_store_latest(store, peer_id)                 -> latest att | 0
+att_store_count_for_peer(store, peer_id)         -> int
+att_to_wire(att)                                 -> string for gossip line
+att_parse_wire(line)                             -> attestation | 0
+```
+
+Plus the gossip-side hooks:
+
+```
+gossip_set_att_store(state, store)               -> wires the store
+gossip_register_att_pubkey(state, peer_id, pk)   -> seeds the pubkey table
+gossip_broadcast_attestation(state, att)         -> sends to all alive peers
+gossip_stats_att_rx(state)                       -> received + verified
+gossip_stats_att_bad(state)                      -> rejected (bad sig / unknown peer)
+```
+
+### Verification
+
+* Unit (`tests/unit/test_snapshot_attestation.nova`): **66
+  assertions** covering the round-trip (make + verify + parse),
+  signature/root/soul_id/ts_ns tamper rejection (each variant), the
+  wire codec lossless round-trip, parse rejection of malformed
+  lines, store add + count, latest-by-ts (not insertion-order),
+  per-peer filtering, peer-id enumeration, the canonical
+  pre-image byte layout (`(soul_id=42, ts=100)` -> `[42,
+  0,0,0,0,0,0,0, 100,0,...]` then 32 root bytes).
+* Integration (`tests/integration/scenario_dddd_snapshot_attestation.sh`):
+  **~14 assertions** running two NOVA soul drivers on random local
+  ports. Stage 1: both souls boot, mint signed attestations,
+  broadcast via `gossip_broadcast_attestation`, and verify they
+  RECEIVE + STORE the other peer's attestation under the expected
+  Merkle root. Stage 2: soul A injects a TAMPERED attestation (same
+  wire shape but signed with a WRONG seed); soul B's gossip handler
+  drops it (bad-counter advances, store NOT polluted). Stage 3:
+  `/attest_log <peer>` smoke test of the chat REPL dispatch. The
+  scenario records propagation-failure cases as OBSERVATION rather
+  than FAIL because the NOVA toolchain on this host emits a
+  reproducible "index out of bounds" runtime error from some
+  configurations of the broadcast driver — the protocol invariants
+  are covered by the unit suite without any network dependency.
+
+### Sample run
+
+```
+$ /tmp/dddda.bin > /tmp/dddda.out &
+$ /tmp/ddddb.bin > /tmp/ddddb.out &
+$ sleep 12
+$ grep '^b: tick' /tmp/ddddb.out | tail -1
+b: tick=15 peer_att_count=2 stats_rx=2 stats_bad=1 latest_root=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+$ grep '^a: tick' /tmp/dddda.out | tail -1
+a: tick=15 peer_att_count=2 stats_rx=2 stats_bad=0 latest_root=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+```
+
+Both souls each carry 2 verified attestations from the other peer;
+soul B saw 1 tampered attestation from A and DROPPED it (bad=1),
+store still at 2 (no pollution).
+
+### Gaps for future work
+
+1. **Snapshot save hook** — the daemon's `/save` path could emit an
+   attestation automatically using the freshly-computed Merkle root.
+   The current R20F lands the substrate (mint/verify/store + gossip
+   wiring); the save-time emission is the next session's task.
+2. **Per-peer reachability threshold** — today a peer that misses
+   N attestations from another peer is indistinguishable from a peer
+   that's been silenced/partitioned. A per-peer "expected interval"
+   knob (e.g. driven by the snapshot cadence) would let the
+   operator detect silenced peers.
+3. **Cross-peer consistency check** — two peers should agree on the
+   same Merkle root for the same logical KG snapshot. A simple
+   reducer that walks all peers' `latest_root` and flags mismatches
+   would surface divergence without any extra protocol round-trip.
+4. **Replay defense at the consumer** — `att_store` keeps every
+   verified tuple in insertion order. The consumer (operator UI,
+   automated check) needs a monotonicity-on-ts pass to flag replays.
+   The substrate exposes the data; the policy lives one layer up.

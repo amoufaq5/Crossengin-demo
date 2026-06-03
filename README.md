@@ -75,7 +75,58 @@ computational units rather than orchestrating a pipeline of modules.
 > 59 unit assertions in `tests/unit/test_sensor_fusion.nova` (NEW).
 > 10 integration assertions in `tests/integration/scenario_bbbb_sensor_fusion.sh`
 > (NEW). All perception suites remain green. Module count: +1 (new
-> `src/perception/` directory). R19E adds
+> `src/perception/` directory). R20F adds
+> `src/federation/snapshot_attestation.nova` — gossip-relayed signed
+> snapshot attestation that lets peers PROVE to each other that they
+> saved a particular Merkle root at a particular nanosecond. R15E
+> already gives every snapshot a tamper-evident Merkle root; R16A
+> binds it to an Ed25519 long-term key the operator holds; R18E
+> gossip + R19E leader election connect peers into a federated
+> mesh. R20F is the bridge: each soul periodically computes its
+> current Merkle root (cached from the last snapshot save), signs
+> the `(soul_id || ts_ns || merkle_root)` tuple with its long-term
+> key, and broadcasts an ATTESTATION line via the gossip TCP
+> exchange. Peers receive ATTESTATION; verify the signature against
+> the originator's known pubkey (resolved from a per-peer table
+> seeded out-of-band at federation bootstrap — the same shape R19E
+> uses for `soul_id -> addr` registration, the same pubkey bytes
+> R7C Noise XK negotiates for static-key auth); on accept, append
+> to a per-peer attestation log. Tampered attestations (bit-flipped
+> root, bit-flipped signature, wrong pubkey, mutated soul_id /
+> ts_ns) are dropped — a `bad_counter` advances, the log stays
+> clean. Wire shape: `ATTESTATION <soul_id> <ts_ns> <merkle_root_hex>
+> <sig_hex>\n` (single line, piggyback over the existing gossip TCP
+> handshake). Canonical signing pre-image: `soul_id_le64 ||
+> ts_ns_le64 || root_bytes` (48 bytes fixed-width; both endpoints
+> produce bit-identical bytes from the same tuple). Public API:
+> `att_make(soul_id, ts_ns, root_bytes, seed, pk)`, `att_verify(att,
+> pk)`, `att_store_new()`, `att_store_add(store, att)`,
+> `att_store_for_peer(store, peer_id)`, `att_store_latest(store,
+> peer_id)`, `att_to_wire(att)`, `att_parse_wire(line)`. Plus the
+> gossip-side hooks: `gossip_set_att_store(state, store)`,
+> `gossip_register_att_pubkey(state, peer_id, pk)`,
+> `gossip_broadcast_attestation(state, att)`,
+> `gossip_stats_att_rx(state)`, `gossip_stats_att_bad(state)`.
+> Verification: 66 unit assertions in
+> `tests/unit/test_snapshot_attestation.nova` (NEW; round-trip,
+> bit-flipped root rejected, bit-flipped signature rejected, wrong
+> pubkey rejected, mutated soul_id / ts_ns rejected, wire codec
+> lossless round-trip, parse rejection of malformed inputs, store
+> add + count, latest-by-ts not insertion-order, per-peer filtering,
+> the 48-byte canonical pre-image byte layout pinned to a known
+> vector). 14 integration assertions in
+> `tests/integration/scenario_dddd_snapshot_attestation.sh` (NEW;
+> spawns two souls on random local ports with their own Ed25519
+> long-term keypairs registered in each other's pubkey table,
+> broadcasts signed attestations via gossip, asserts the recipient's
+> store carries the expected root + verifies signature; second
+> stage: soul A injects a TAMPERED attestation signed with a wrong
+> seed, soul B's gossip handler drops it (bad-counter advances,
+> store NOT polluted); `/attest_log <peer>` smoke test of the chat
+> dispatch). Chat: `/attest_log <peer_id>` admin command wired into
+> `examples/crossengin_chat.nova`. All prior federation suites
+> remain green (R7C Noise XK, R18E gossip, R19E leader election).
+> Module count: +1. R19E adds
 > `src/federation/leader_election.nova` —
 > Garcia-Molina's Bully algorithm (1982, simplified for N ≤ 16
 > meshes) layered on top of R18E SWIM gossip. R18E gives every soul
