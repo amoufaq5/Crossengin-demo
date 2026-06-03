@@ -3,7 +3,102 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R21B (this session) -- distributed rule inference -- mini-Datalog over the gossip mesh
+## R21E (this session) -- Noise-protected gossip (R7C XK over R18E SWIM)
+
+**Status: complete -- `src/federation/gossip.nova` extended (+~660 lines)
+to wrap every gossip TCP connection in the R7C Noise XK transport once
+both peers have static keypairs registered. The federation mesh now
+carries PING / ACK / MEMBER / DELTA / ATOM / DQUERY* / ATTESTATION /
+RULE* / DERIVATION lines under mutually-authenticated AEAD with per-
+direction replay-protected nonce counters. R18E SWIM gossip + R7C Noise
+XK + R20E DQUERY + R20F ATTESTATION + R21B distributed rules are all
+wired through one unified `gconn` (gossip connection) abstraction that
+hides the plaintext-vs-noise distinction from the per-line dispatch
+code.**
+
+### What R21E delivers
+
+1. **State extension** -- 7 new state slots at indices 22-28 (slots
+   18-21 reserved for R21B's distributed-rule plumbing):
+   `GOSSIP_S_NOISE_PRIV` / `_PUB` / `_PEERS` / `_STRICT` plus three
+   counters (`STATS_NOISE_HS` / `_HS_FAIL` / `_REFUSED`). All zero by
+   default; a soul that has not opted into Noise speaks the R18E v1
+   plaintext wire exactly as before. Back-compat preserved.
+
+2. **Public API**: `gossip_set_noise_keys` / `_register_peer_pubkey` /
+   `_noise_lookup_peer_pubkey` / `_noise_set_strict` /
+   `_noise_strict_from_env` (env = `CE_GOSSIP_REQUIRE_NOISE=1`) /
+   `_noise_is_configured` / `_noise_my_pubkey` / `_noise_peer_count` /
+   `_stats_noise_hs` / `_hs_fail` / `_refused` / `_send_ping_gconn` /
+   `_handle_conn_kg_gconn` / `_noise_status_line`.
+
+3. **Wire negotiation**: dialer sends `HELLO ce-gossip v2 noise`;
+   responder accepts and runs the three-message XK handshake;
+   replies `OK v2 noise`. Strict mode + plaintext peer -> `ERR
+   noise-required`. Per-recv socket timeout extends to 30s for the
+   handshake window and stays at 30s post-Split.
+
+4. **gconn abstraction**: a 4-element list `[fd, nxk_state, role,
+   peer_pub]` (or `[fd, 0, 0, 0]` for plaintext). Helpers
+   `_gconn_send_line` / `_gconn_recv_line` route through `nxk_seal` /
+   `nxk_open` when noise is active.
+
+5. **Chat dispatch** -- one new admin command `/gossip_noise`.
+
+6. **`_gossip_set_rcvtimeo_ms` bugfix** -- historical helper only
+   wrote `tv_usec` (no tv_sec); Linux rejects `tv_usec >= 1_000_000`
+   with EINVAL, so ms >= 1000 silently gave zero-timeout sockets.
+   Fixed to split into seconds + remainder microseconds. R18E's
+   PING_TIMEOUT_MS=500 was unaffected; R21E's 30s timeout needs it.
+
+### Verification snapshot (latest run)
+
+- **44 unit assertions** in `tests/unit/test_gossip_noise.nova` (NEW),
+  all PASS in ~27s. Covers state defaults, configured flag, short-
+  priv rejection, per-peer registry round-trip + overwrite + unknown
+  lookup, strict mode toggle + env-driven default, in-process XK
+  handshake completion (session-hash agreement + peer-static
+  recovery), PING line round-trip through nxk_seal + nxk_open, MITM
+  rejection at msg1 with wrong peer pubkey, strict-mode dial refusal
+  without opening a socket, gconn structural accessors, status-line
+  token presence.
+
+- **12 integration assertions** in
+  `tests/integration/scenario_hhhh_gossip_noise.sh` (NEW). All 12
+  PASS. Stage 1: 3-soul Noise mesh; Stage 2: STRICT-mode soul
+  refuses plaintext probe; Stage 3: MITM rejected.
+
+- **Existing federation suites stay green** -- R7C noise_xk (44),
+  R18E gossip (34), R19E leader_election (40), R20E distributed_query
+  (36), R20F snapshot attestation (66) all PASS.
+
+### Known limitations / R21E.2 follow-ups
+
+1. **`gossip_step` + `gossip_send_delta_request` not yet on the gconn
+   path** -- still call `_gossip_dial` + plaintext HELLO. R21E.2
+   will mirror the ping refactor.
+2. **`gossip_send_attestation` plaintext-only path** -- same shape
+   as DELTA. R21B's `_gossip_dr_send_line` (RULE / DERIVATION
+   originator helper) is in the same boat.
+3. **No pubkey allowlist on the responder** -- any peer with a valid
+   static priv whose msg1 verifies completes the handshake. A
+   `gossip_allow_pubkey` whitelist would let the operator pin which
+   static pubkeys are allowed.
+4. **No key rotation** -- the static keypair is fixed for the
+   lifetime of the gossip state.
+5. **Handshake cost** -- each XK handshake is ~5-15s on this sandbox.
+   Churn-heavy meshes would benefit from session resumption / cached-
+   PSK (out of scope for R21E).
+
+### Files touched (R21E)
+
+- `src/federation/gossip.nova` -- extended (+~660 lines).
+- `tests/unit/test_gossip_noise.nova` -- NEW.
+- `tests/integration/scenario_hhhh_gossip_noise.sh` -- NEW.
+- `examples/crossengin_chat.nova` -- one new `/gossip_noise` line.
+- `FEDERATED_AUDIT.md`, `README.md`, `NEXT_SESSION.md` -- updated.
+
+## R21B (parallel session) -- distributed rule inference -- mini-Datalog over the gossip mesh
 
 **Status: complete -- `src/federation/distributed_rules.nova` (NEW,
 ~640 lines) ships federated forward-chaining rule inference. R20B

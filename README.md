@@ -11,7 +11,31 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R21B adds `src/federation/distributed_rules.nova` —
+> toolchain. R21E adds Noise-protected gossip: every R18E gossip
+> connection is now wrapped in R7C Noise XK (mutually authenticated +
+> AEAD-encrypted with RFC 7919 Group 14 2048-bit DH) once both peers
+> have static keypairs registered, with strict-mode plaintext refusal
+> via `CE_GOSSIP_REQUIRE_NOISE=1`. PING / ACK / MEMBER / DELTA / ATOM /
+> DQUERY* / ATTESTATION / RULE* / DERIVATION lines all ride the same
+> `gconn` abstraction that hides plaintext-vs-noise from the per-line
+> dispatch. Public API: `gossip_set_noise_keys`,
+> `gossip_register_peer_pubkey`, `gossip_noise_set_strict`,
+> `gossip_send_ping_gconn`, `gossip_handle_conn_kg_gconn`,
+> `gossip_noise_status_line` plus three stats accessors. Verification:
+> 44 unit assertions in `tests/unit/test_gossip_noise.nova` (NEW; state
+> defaults, configured flag, per-peer registry round-trip + overwrite +
+> unknown lookup, strict-mode toggle + env-driven default, in-process
+> handshake completion + session-hash agreement + peer-static recovery,
+> PING-line seal/open round-trip, MITM rejection at msg1 with wrong
+> peer pubkey, strict-mode dial refusal without opening a socket, gconn
+> structural accessors, status-line tokens). 12 integration assertions
+> in `tests/integration/scenario_hhhh_gossip_noise.sh` (NEW; 3-soul
+> Noise mesh handshake convergence + Stage 2 STRICT refusal of
+> plaintext + Stage 3 MITM rejection with wrong peer pubkey). Existing
+> federation suites stay green (R7C noise_xk 44 checks, R18E gossip 34
+> checks, R19E leader 40 checks, R20E dquery 36 checks, R20F
+> attestation 66 checks). Chat: `/gossip_noise` admin command wired
+> into `examples/crossengin_chat.nova`. R21B adds `src/federation/distributed_rules.nova` —
 > federated forward-chaining mini-Datalog rule inference across the R18E
 > gossip mesh. R20B shipped local rule inference on a single KG; R20E
 > shipped distributed SPARQL fan-out; R21B bridges them so a rule's

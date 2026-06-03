@@ -1843,3 +1843,529 @@ fn _gossip_dr_send_line(state, peer_addr, line) {
     close_fd(fd)
     return 1
 }
+
+// ============================================================================
+// R21E -- Noise-protected gossip plumbing.
+// ============================================================================
+//
+// Wire negotiation:
+//   * Dialer that knows the peer's static pubkey AND has its own
+//     keypair sends `HELLO ce-gossip v2 noise` as the first line.
+//     Responder accepts iff it has its own keypair; runs the
+//     three-message Noise XK handshake; replies `OK v2 noise`. Any
+//     line subsequent to OK is sealed under the post-Split transport
+//     keys.
+//   * Dialer without registered peer pubkey OR strict-mode peer that
+//     receives a non-noise hello falls back per the strict/lenient
+//     policy below.
+//
+//   Strict mode (CE_GOSSIP_REQUIRE_NOISE=1):
+//     - Responder: any non-noise hello -> ERR noise-required + close.
+//     - Dialer: peer without registered pubkey -> abort dial (returns
+//       0; gossip_send_ping treats as a soft timeout).
+//
+//   Lenient mode (default):
+//     - Responder accepts v1 plaintext or v2 noise hellos.
+//     - Dialer falls through to plaintext when peer pubkey unknown.
+
+// --- own keypair registration ---------------------------------------------
+
+fn gossip_set_noise_keys(state, my_priv, my_pub) {
+    state[GOSSIP_S_NOISE_PRIV] = my_priv
+    state[GOSSIP_S_NOISE_PUB] = my_pub
+    return state
+}
+
+fn gossip_noise_is_configured(state) {
+    let priv = state[GOSSIP_S_NOISE_PRIV]
+    if priv == 0 { return 0 }
+    if len(priv) != NXK_DH_HEX_LEN { return 0 }
+    return 1
+}
+
+fn gossip_noise_my_pubkey(state) {
+    return state[GOSSIP_S_NOISE_PUB]
+}
+
+// --- per-peer pubkey registry ---------------------------------------------
+
+fn gossip_register_peer_pubkey(state, peer_addr, pubkey_hex) {
+    let table = state[GOSSIP_S_NOISE_PEERS]
+    if table == 0 {
+        table = list_new()
+        state[GOSSIP_S_NOISE_PEERS] = table
+    }
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][0], peer_addr) == 1 {
+            table[i][1] = pubkey_hex
+            return state
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_addr)
+    push(rec, pubkey_hex)
+    push(table, rec)
+    return state
+}
+
+fn gossip_noise_lookup_peer_pubkey(state, peer_addr) {
+    let table = state[GOSSIP_S_NOISE_PEERS]
+    if table == 0 { return 0 }
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][0], peer_addr) == 1 { return table[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn gossip_noise_peer_count(state) {
+    let table = state[GOSSIP_S_NOISE_PEERS]
+    if table == 0 { return 0 }
+    return len(table)
+}
+
+// --- strict-mode controls -------------------------------------------------
+
+fn gossip_noise_set_strict(state, strict) {
+    state[GOSSIP_S_NOISE_STRICT] = strict
+    return state
+}
+
+fn gossip_noise_strict_mode(state) {
+    return state[GOSSIP_S_NOISE_STRICT]
+}
+
+fn gossip_noise_strict_from_env(state) {
+    let env = getenv("CE_GOSSIP_REQUIRE_NOISE")
+    if env == 0 { return state }
+    if len(env) == 0 { return state }
+    if str_eq(env, "1") == 1 {
+        state[GOSSIP_S_NOISE_STRICT] = 1
+    }
+    return state
+}
+
+// --- stats accessors ------------------------------------------------------
+
+fn gossip_stats_noise_hs(state)       { return state[GOSSIP_S_STATS_NOISE_HS] }
+fn gossip_stats_noise_hs_fail(state)  { return state[GOSSIP_S_STATS_NOISE_HS_FAIL] }
+fn gossip_stats_noise_refused(state)  { return state[GOSSIP_S_STATS_NOISE_REFUSED] }
+
+// --- handshake message framing -------------------------------------------
+
+fn _gnoise_raw_send(fd, buf, n) {
+    let sent = 0
+    while sent < n {
+        let r = send_data(fd, buf + sent, n - sent)
+        if r <= 0 { return 0 }
+        sent = sent + r
+    }
+    return 1
+}
+
+fn _gnoise_send_framed(fd, buf, n) {
+    let hdr = alloc(5)
+    store8(hdr + 0, int_and(int_shr(n, 24), 255))
+    store8(hdr + 1, int_and(int_shr(n, 16), 255))
+    store8(hdr + 2, int_and(int_shr(n, 8), 255))
+    store8(hdr + 3, int_and(n, 255))
+    store8(hdr + 4, 0)
+    if _gnoise_raw_send(fd, hdr, 4) == 0 { return 0 }
+    return _gnoise_raw_send(fd, buf, n)
+}
+
+fn _gnoise_recv_exact(fd, n) {
+    if n <= 0 { return 0 }
+    let buf = alloc(n + 1)
+    let got = 0
+    while got < n {
+        let r = recv_data(fd, buf + got, n - got)
+        if r <= 0 { return 0 }
+        got = got + r
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+fn _gnoise_recv_framed(fd) {
+    let hdr = _gnoise_recv_exact(fd, 4)
+    if hdr == 0 { return 0 }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let b2 = load8(hdr[0] + 2)
+    let b3 = load8(hdr[0] + 3)
+    let body_n = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                int_shl(b2, 8)), b3)
+    if body_n <= 0 { return 0 }
+    if body_n > NXK_FRAME_MAX { return 0 }
+    return _gnoise_recv_exact(fd, body_n)
+}
+
+// --- handshake drivers ----------------------------------------------------
+
+fn _gnoise_handshake_initiator(fd, my_priv, peer_pub) {
+    let st = nxk_initiator_new(my_priv, peer_pub)
+    if st == 0 { return 0 }
+    let m1 = nxk_msg1_send(st)
+    if m1 == 0 { return 0 }
+    if _gnoise_send_framed(fd, m1[0], m1[1]) == 0 { return 0 }
+    let m2 = _gnoise_recv_framed(fd)
+    if m2 == 0 { return 0 }
+    if nxk_msg2_recv(st, m2[0], m2[1]) == 0 { return 0 }
+    let m3 = nxk_msg3_send(st)
+    if m3 == 0 { return 0 }
+    if _gnoise_send_framed(fd, m3[0], m3[1]) == 0 { return 0 }
+    if nxk_split(st) == 0 { return 0 }
+    return st
+}
+
+fn _gnoise_handshake_responder(fd, my_priv) {
+    let st = nxk_responder_new(my_priv)
+    if st == 0 { return 0 }
+    let m1 = _gnoise_recv_framed(fd)
+    if m1 == 0 { return 0 }
+    if nxk_msg1_recv(st, m1[0], m1[1]) == 0 { return 0 }
+    let m2 = nxk_msg2_send(st)
+    if m2 == 0 { return 0 }
+    if _gnoise_send_framed(fd, m2[0], m2[1]) == 0 { return 0 }
+    let m3 = _gnoise_recv_framed(fd)
+    if m3 == 0 { return 0 }
+    if nxk_msg3_recv(st, m3[0], m3[1]) == 0 { return 0 }
+    if nxk_split(st) == 0 { return 0 }
+    return st
+}
+
+// --- gossip-connection abstraction ----------------------------------------
+
+let _GCONN_FD       = 0
+let _GCONN_NXK      = 1
+let _GCONN_ROLE     = 2
+let _GCONN_PEERPK   = 3
+
+fn _gconn_plain(fd) {
+    let g = list_new()
+    push(g, fd)
+    push(g, 0)
+    push(g, 0)
+    push(g, 0)
+    return g
+}
+
+fn _gconn_noise(fd, nxk_state, role, peer_pub_hex) {
+    let g = list_new()
+    push(g, fd)
+    push(g, nxk_state)
+    push(g, role)
+    push(g, peer_pub_hex)
+    return g
+}
+
+fn _gconn_fd(g)    { return g[_GCONN_FD] }
+fn _gconn_is_noise(g) {
+    if g[_GCONN_NXK] == 0 { return 0 }
+    return 1
+}
+fn _gconn_peer_pub(g) { return g[_GCONN_PEERPK] }
+
+fn _gconn_send_line(g, line) {
+    let s = line
+    let n = len(s)
+    if n == 0 { return 0 }
+    if char_at(s, n - 1) != 10 { s = s + "\n"; n = n + 1 }
+    if _gconn_is_noise(g) == 0 {
+        return _gossip_send_all(g[_GCONN_FD], s)
+    }
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let sealed = nxk_seal(g[_GCONN_NXK], g[_GCONN_ROLE], buf, n)
+    if sealed == 0 { return 0 }
+    return _gnoise_raw_send(g[_GCONN_FD], sealed[0], sealed[1])
+}
+
+fn _gconn_recv_line(g) {
+    if _gconn_is_noise(g) == 0 {
+        return _gossip_recv_line(g[_GCONN_FD])
+    }
+    let fd = g[_GCONN_FD]
+    let hdr = _gnoise_recv_exact(fd, 4)
+    if hdr == 0 { return 0 }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let b2 = load8(hdr[0] + 2)
+    let b3 = load8(hdr[0] + 3)
+    let body_n = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                int_shl(b2, 8)), b3)
+    if body_n <= 0 { return 0 }
+    if body_n > NXK_FRAME_MAX { return 0 }
+    let body = _gnoise_recv_exact(fd, body_n)
+    if body == 0 { return 0 }
+    let frame_n = 4 + body_n
+    let frame = alloc(frame_n + 1)
+    let i = 0
+    while i < 4 {
+        store8(frame + i, load8(hdr[0] + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < body_n {
+        store8(frame + 4 + j, load8(body[0] + j))
+        j = j + 1
+    }
+    store8(frame + frame_n, 0)
+    let opened = nxk_open(g[_GCONN_NXK], g[_GCONN_ROLE], frame, frame_n)
+    if opened == 0 { return 0 }
+    let pt_n = opened[1]
+    let s = ""
+    let k = 0
+    while k < pt_n {
+        let c = load8(opened[0] + k)
+        if c == 0 { k = pt_n }
+        else {
+            if c == 10 { k = pt_n }
+            else {
+                s = s + chr(c)
+                k = k + 1
+            }
+        }
+    }
+    return s
+}
+
+// --- dial + accept negotiation -------------------------------------------
+
+fn _gossip_dial_gconn(state, addr) {
+    let peer_pub = gossip_noise_lookup_peer_pubkey(state, addr)
+    let want_noise = 0
+    if peer_pub != 0 {
+        if gossip_noise_is_configured(state) == 1 { want_noise = 1 }
+    }
+    let strict = state[GOSSIP_S_NOISE_STRICT]
+    if strict == 1 {
+        if want_noise == 0 {
+            state[GOSSIP_S_STATS_NOISE_REFUSED] = state[GOSSIP_S_STATS_NOISE_REFUSED] + 1
+            return 0
+        }
+    }
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    if want_noise == 1 {
+        _gossip_set_rcvtimeo_ms(fd, GOSSIP_NOISE_HANDSHAKE_TIMEOUT_MS)
+        if _gossip_send_all(fd, GOSSIP_HELLO_NOISE_LINE + "\n") == 0 {
+            close_fd(fd); return 0
+        }
+        let reply = _gossip_recv_line(fd)
+        if reply == 0 { close_fd(fd); return 0 }
+        if str_eq(reply, GOSSIP_OK_NOISE_LINE) == 0 {
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(fd)
+            return 0
+        }
+        let nxk_state = _gnoise_handshake_initiator(fd,
+            state[GOSSIP_S_NOISE_PRIV], peer_pub)
+        if nxk_state == 0 {
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(fd)
+            return 0
+        }
+        state[GOSSIP_S_STATS_NOISE_HS] = state[GOSSIP_S_STATS_NOISE_HS] + 1
+        return _gconn_noise(fd, nxk_state, NXK_ROLE_INITIATOR, peer_pub)
+    }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 {
+        close_fd(fd); return 0
+    }
+    return _gconn_plain(fd)
+}
+
+fn _gossip_accept_gconn(state, conn_fd) {
+    let hello = _gossip_recv_line(conn_fd)
+    if hello == 0 { close_fd(conn_fd); return 0 }
+    let strict = state[GOSSIP_S_NOISE_STRICT]
+    if str_eq(hello, GOSSIP_HELLO_NOISE_LINE) == 1 {
+        if gossip_noise_is_configured(state) == 0 {
+            _gossip_send_all(conn_fd, GOSSIP_ERR_NOISE_REQ + "\n")
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(conn_fd)
+            return 0
+        }
+        _gossip_set_rcvtimeo_ms(conn_fd, GOSSIP_NOISE_HANDSHAKE_TIMEOUT_MS)
+        if _gossip_send_all(conn_fd, GOSSIP_OK_NOISE_LINE + "\n") == 0 {
+            close_fd(conn_fd); return 0
+        }
+        let nxk_state = _gnoise_handshake_responder(conn_fd,
+            state[GOSSIP_S_NOISE_PRIV])
+        if nxk_state == 0 {
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(conn_fd)
+            return 0
+        }
+        let peer_pub = nxk_peer_static_pub(nxk_state)
+        state[GOSSIP_S_STATS_NOISE_HS] = state[GOSSIP_S_STATS_NOISE_HS] + 1
+        return _gconn_noise(conn_fd, nxk_state, NXK_ROLE_RESPONDER, peer_pub)
+    }
+    if str_eq(hello, GOSSIP_HELLO_LINE) == 1 {
+        if strict == 1 {
+            _gossip_send_all(conn_fd, GOSSIP_ERR_NOISE_REQ + "\n")
+            state[GOSSIP_S_STATS_NOISE_REFUSED] = state[GOSSIP_S_STATS_NOISE_REFUSED] + 1
+            close_fd(conn_fd)
+            return 0
+        }
+        if _gossip_send_all(conn_fd, GOSSIP_OK_LINE + "\n") == 0 {
+            close_fd(conn_fd); return 0
+        }
+        return _gconn_plain(conn_fd)
+    }
+    _gossip_send_all(conn_fd, GOSSIP_ERR_UNKNOWN + "\n")
+    close_fd(conn_fd)
+    return 0
+}
+
+// --- noise-protected PING / ACK / MEMBER round-trip ----------------------
+
+fn gossip_send_ping_gconn(state, addr) {
+    state[GOSSIP_S_STATS_PINGS] = state[GOSSIP_S_STATS_PINGS] + 1
+    let gconn = _gossip_dial_gconn(state, addr)
+    if gconn == 0 {
+        gossip_on_timeout(state, addr)
+        return 0
+    }
+    let fd = _gconn_fd(gconn)
+    let seq = state[GOSSIP_S_PING_SEQ] + 1
+    state[GOSSIP_S_PING_SEQ] = seq
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let ping_line = GOSSIP_PING_PREFIX + int_to_str(seq) + " " + self_addr
+    if _gconn_send_line(gconn, ping_line) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let ack = _gconn_recv_line(gconn)
+    if ack == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_starts_with(ack, GOSSIP_ACK_PREFIX) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let toks = _gossip_split_spaces(ack)
+    if len(toks) < 2 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_is_digits(toks[1]) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let recv_seq = str_to_int(toks[1])
+    if recv_seq != seq {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    gossip_on_ack(state, addr)
+    let pb = gossip_pick_piggyback(state, GOSSIP_MAX_MEMBER_PIGGYBACK, addr)
+    let i = 0
+    while i < len(pb) {
+        let mb_addr = pb[i]
+        let mb_idx = gossip_find_peer(state, mb_addr)
+        let mb_status = GOSSIP_STATUS_ALIVE
+        if mb_idx >= 0 {
+            mb_status = state[GOSSIP_S_PEERS][mb_idx][GOSSIP_PE_STATUS]
+        }
+        let line = GOSSIP_MEMBER_PREFIX + mb_addr + " " + int_to_str(mb_status)
+        if _gconn_send_line(gconn, line) == 0 {
+            i = len(pb)
+        } else {
+            i = i + 1
+        }
+    }
+    _gconn_send_line(gconn, GOSSIP_BYE_LINE)
+    close_fd(fd)
+    return 1
+}
+
+// --- noise-aware inbound handler -----------------------------------------
+
+fn gossip_handle_conn_kg_gconn(state, conn_fd, kg) {
+    let gconn = _gossip_accept_gconn(state, conn_fd)
+    if gconn == 0 { return state }
+    let running = 1
+    while running == 1 {
+        let line = _gconn_recv_line(gconn)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        _gconn_send_line(gconn, GOSSIP_ACK_PREFIX + seq)
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            let dtoks = _gossip_split_spaces(line)
+                            if len(dtoks) >= 3 {
+                                let since_s = dtoks[2]
+                                let since_ns = 0
+                                if _gossip_is_digits(since_s) == 1 {
+                                    since_ns = str_to_int(since_s)
+                                }
+                                _gossip_stream_atoms_since(_gconn_fd(gconn), kg, since_ns)
+                            }
+                            _gconn_send_line(gconn, GOSSIP_DELTA_END_LINE)
+                        } else {
+                            if _gossip_starts_with(line, GOSSIP_DQUERY_PREFIX) == 1 {
+                                _gossip_serve_dquery(_gconn_fd(gconn), state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                                _gossip_serve_attestation(state, line)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_fd(_gconn_fd(gconn))
+    return state
+}
+
+// --- chat status helper ---------------------------------------------------
+
+fn gossip_noise_status_line(state) {
+    let configured = "no"
+    if gossip_noise_is_configured(state) == 1 { configured = "yes" }
+    let strict = "lenient"
+    if state[GOSSIP_S_NOISE_STRICT] == 1 { strict = "strict" }
+    return "gossip_noise: configured=" + configured
+        + " peers=" + int_to_str(gossip_noise_peer_count(state))
+        + " mode=" + strict
+        + " hs_ok=" + int_to_str(state[GOSSIP_S_STATS_NOISE_HS])
+        + " hs_fail=" + int_to_str(state[GOSSIP_S_STATS_NOISE_HS_FAIL])
+        + " refused=" + int_to_str(state[GOSSIP_S_STATS_NOISE_REFUSED])
+}
