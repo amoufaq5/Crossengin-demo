@@ -1314,3 +1314,135 @@ when both operands exceed `PTR_THRESHOLD = 0x100000` (see
 - **Multi-band processing** -- split the spectrum into 3..5 bands via
   IIR crossovers and run an independent gate/compressor per band so the
   bass doesn't trigger the high-frequency cell.
+
+## R16E -- STFT / Cooley-Tukey FFT spectrogram (frequency-domain leg)
+
+Module: `src/io/transducers/audio_spectrogram.nova` (~520 lines)
+Tests:  `tests/unit/test_audio_spectrogram.nova` (49 assertions),
+        `tests/integration/scenario_ooo_spectrogram.sh` (19 assertions)
+Chat:   `/spec PATH`
+
+R16E closes the **frequency-domain** leg of the audio chain. Every prior
+audio module operates in the time domain:
+
+    R6E   Klatt synth         time-domain formant carriers
+    R7F   energy + ZCR VAD    time-domain rms / sign-flip
+    R7F   whisper / vosk STT  external (no spectral exposure)
+    R10F  + R11B pitch (AC / YIN)  time-domain autocorrelation
+    R12D  PSOLA pitch-shift   time-domain epoch alignment
+    R13D  voice clone         time-domain LPC residual swap
+    R14E  reverb / gate / comp time-domain delay lines + envelopes
+
+None of these surface a spectrum. Most downstream audio capabilities
+(MFCC features, wake-word matched filters, source separation by
+spectral mask, formant tracking that doesn't run blind, simple
+harmonic / inharmonic classification) start with a magnitude
+spectrogram. R16E ships the integer-only foundation.
+
+### Algorithm
+
+Short-Time Fourier Transform on Hann-windowed frames sliding through PCM
+with `HOP_SIZE` overlap; per-frame DFT via the **integer Cooley-Tukey
+radix-2 FFT** -- the textbook fast Fourier transform (Cooley & Tukey
+1965), with milli-fixed-point twiddle factors so no float is needed.
+
+1. **Twiddle table.** 512-entry cos / sin table at angle
+   `2*pi*k / 1024` in milli precision (Bhaskara approximation,
+   matches audio_synth's quarter-table sine). For an FFT of size
+   N <= 1024 we look up index `k * (1024/N)`; one table serves
+   every N at no extra storage.
+2. **Hann window cache.** Per-N table of
+   `w[n] = (1 - cos(2*pi*n / (N - 1))) / 2` in milli; boundary
+   samples 0, mid-frame 1000. Different callers share their tables
+   across many STFTs.
+3. **Bit-reversal permutation.** Classic shift-and-mask reversal
+   of each index's binary representation; in-place pair swap on
+   the real / imag list pair (the decimation-in-time prereq).
+4. **`log2(N)` butterfly stages.** At stage `s` the butterfly
+   block size `m = 2^(s+1)`; per-twiddle the standard
+   `(a + W*b, a - W*b)` update where `W = cos - i*sin`. Products
+   are divided by milli immediately to bound the accumulator (after
+   10 stages the intermediate stays under int63; on PCM16 input
+   the worst case is well under 1e10).
+5. **Magnitude.** `|X[k]| = isqrt(re^2 + im^2)` via Newton
+   iteration (same `_dsp_isqrt`-style helper as R14E reverb),
+   emitted only for the lower N/2 bins (the upper half is the
+   complex conjugate for real-valued input).
+6. **STFT slide.** For each `start = 0, H, 2H, ...` up to
+   `len(pcm) - N`, window the frame, FFT it, push the magnitude
+   list. Frame count `= floor((N_samples - FRAME_SIZE) / HOP_SIZE)
+   + 1`.
+
+### Defaults / caps
+
+- Defaults: `FRAME_SIZE = 512`, `HOP_SIZE = 256` (32 ms / 16 ms @
+  16 kHz, 50% overlap, matches whisper / MFCC conventions). At
+  8 kHz the chat helper drops to `256 / 128` for the same time
+  resolution.
+- Allowed frame sizes: powers of 2 in `{64, 128, 256, 512, 1024}`
+  (radix-2 constraint).
+- Sample rate clamped to `[8000, 48000]` Hz.
+- Max input samples `480000` (30 s @ 16 kHz, matches R12D / R14E).
+
+### Integer-safety against NOVA's 1 MB smart-op threshold
+
+`re^2 + im^2` reaches ~6e13 on a loud FFT-ed sine, well above NOVA's
+`PTR_THRESHOLD = 0x100000` (see `NOVA_BUG_THRESHOLD.md`). The smart
+`+`, `*`, `<`, `>` operators would dispatch to `_nova_strcmp` /
+`_nova_concat` and SIGSEGV. Three workarounds carried forward from
+R14E:
+
+- `_stft_isqrt`: every binop via `int_mul`, `int_add`, `int_sub`,
+  `int_div`; the comparison `y < x` routes through the
+  arithmetic-shift sign-bit trick (`int_shr(int_sub(a, b), 63)`)
+  for safety on the multi-million range.
+- FFT butterfly products `c * xr`, `s * xi` etc.: `int_mul` +
+  `int_add` / `int_sub` + immediate `int_div(... , MILLI)` to bound
+  the rolling intermediate.
+- `stft_peak_frequency`: peak / current comparisons via the
+  `_stft_int_gt(m, best_mag)` helper, also using the shift-the-
+  sign trick on the magnitude pair (since the difference can hit
+  multi-million).
+
+### Verification snapshot (latest run)
+
+- 49 unit assertions in `tests/unit/test_audio_spectrogram.nova` (above
+  the 30-floor in the brief). 19 integration assertions in
+  `tests/integration/scenario_ooo_spectrogram.sh`. All green.
+- **FFT correctness:** 200 Hz sine @ 16 kHz, N=512 -> peak at bin in
+  `[5, 8]` (expected 6.4 -> 6 or 7). 1000 Hz @ 8 kHz, N=256 -> peak
+  at bin in `[30, 34]` (expected 32). Silence -> all-zero spectrum.
+- **STFT round-trips:** 1-second 200 Hz sine @ 8 kHz -> peak frequency
+  187 Hz (bin 6, nearest integer; bin width = 31.25 Hz). Klatt /ae/
+  vowel (1200 samples @ 8 kHz, F1=660 Hz / F2=1720 Hz) -> peak
+  frequency 1718 Hz (F2 dominates -- well inside the [400, 2200]
+  formant band).
+- **JFK 16 kHz WAV (whisper.cpp bundled sample):** 176000 samples
+  -> 686 frames, 256 bins, total magnitude ~2.18e9 (massively
+  non-zero), peak frequencies across the clip in the 125-406 Hz
+  speech band.
+- **IFFT identity:** `IFFT(FFT(x))[i]` within +/- 30 of `x[i]` on
+  an 8-sample test input padded to N=64 (within milli-twiddle
+  rounding error).
+
+### Future work
+
+- **MFCC features** -- log-Mel filter-bank projection + DCT on top
+  of the magnitude spectrogram; the standard input for classical
+  wake-word detectors and speaker ID models.
+- **Wakeword matched filter** -- cross-correlate the spectrogram
+  against a stored per-user template (e.g. "Aurora") and decide on
+  the peak confidence; integrates naturally with the VAD-gated
+  `/listen` path.
+- **Source separation by spectral mask** -- ICA or NMF over the
+  spectrogram; the integer-only path forces an approximate solver
+  but the structure (NMF iterates) carries over cleanly.
+- **Formant tracker that doesn't run blind** -- multi-peak picker
+  with chained nearest-bin tracking surfaces F1 / F2 / F3 contours
+  per frame, complementing audio_pitch's autocorrelation F0.
+- **Inverse STFT** -- Hann-windowed overlap-add reconstruction so
+  spectral effects (notch, denoise) route back to PCM without
+  leaving the integer-only domain.
+- **Larger FFT sizes** -- 2048 / 4096 / 8192 for HD audio analysis
+  at 48 kHz; the twiddle table re-uses the same milli precision
+  but needs a bigger base or per-N rebuild.

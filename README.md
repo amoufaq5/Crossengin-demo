@@ -11,7 +11,30 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R16F extends R15D's `src/kg/query.nova` mini-SPARQL with
+> toolchain. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
+> Short-Time Fourier Transform / spectrogram built on an integer-only
+> radix-2 Cooley-Tukey FFT, closing the frequency-domain gap in the
+> audio chain (every prior audio module — R6E Klatt, R7F VAD, R7F
+> STT, R10F/R11B pitch, R12D PSOLA, R13D voice clone, R14E reverb /
+> gate / compressor — operates in the time domain). A 512-entry
+> milli-precision cos/sin twiddle table at the base size 1024, looked
+> up with a stride for smaller N; a Hann window cache keyed by
+> frame_size; in-place bit-reversal permutation; `log2(N)`
+> decimation-in-time butterfly stages; integer Newton sqrt for
+> `|X[k]| = sqrt(re^2 + im^2)`. Defaults `FRAME_SIZE=512` /
+> `HOP_SIZE=256` (32 ms / 16 ms @ 16 kHz, 50% overlap, matching
+> whisper / MFCC conventions); allowed sizes are powers of 2 in
+> `{64, 128, 256, 512, 1024}`; sample-rate range `[8000, 48000]` Hz;
+> input cap `480000` samples (30 s @ 16 kHz). Public API: `stft`,
+> `stft_magnitude`, `stft_bin_to_hz`, `stft_frame_to_ms`,
+> `stft_peak_frequency`, `stft_total_magnitude`, `fft_radix2`,
+> `ifft_radix2`. New chat command `/spec PATH` (2 lines in
+> `examples/crossengin_chat.nova`) runs the STFT and reports
+> `(frames=N, bins=K, peak_frequency_first_frame=F Hz, …)`. 49 unit
+> + 19 integration assertions, all green; FFT peak at bin 6 for a
+> 200 Hz @ 16 kHz / N=512 sine (expected 6.4); Klatt /ae/ peak at
+> 1718 Hz (F2=1720 Hz target); JFK 16 kHz WAV produces 686 frames
+> and ~2.18e9 total magnitude. R16F extends R15D's `src/kg/query.nova` mini-SPARQL with
 > the three remaining "SPARQL 1.0 core" surface features: **OPTIONAL**
 > (left-outer-join semantics — keep the binding even when the inner
 > block doesn't match; the introduced vars render as `?` in the

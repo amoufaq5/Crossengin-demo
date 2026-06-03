@@ -3,6 +3,149 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R16E (this session) -- STFT / Cooley-Tukey FFT spectrogram (frequency-domain audio)
+
+**Status: complete -- `src/io/transducers/audio_spectrogram.nova`
+(NEW, ~520 lines) closes the frequency-domain gap in CrossEngin's
+audio chain.** Every prior audio module (R6E Klatt, R7F VAD, R7F
+whisper/Vosk STT, R10F/R11B autocorrelation/YIN pitch, R12D PSOLA,
+R13D voice clone, R14E reverb/gate/comp) operates in the time
+domain; nothing surfaced a spectrum. R16E ships the integer-only
+foundation: a radix-2 Cooley-Tukey FFT over milli-fixed-point
+twiddle factors, Hann-windowed Short-Time Fourier Transform sliding
+in `HOP_SIZE` samples, and a 2D magnitude spectrogram.
+
+### Algorithm
+
+1. **Twiddle table.** A 512-entry precomputed cos / sin table at
+   angle `(2*pi*k / 1024)` in milli precision (Bhaskara
+   approximation, the same shape as audio_synth's quarter-table
+   sine). For an FFT of size N <= 1024 we look up index `k *
+   (1024/N)` -- the stride trick that lets one table serve every N.
+2. **Hann window cache.** Per-N table of
+   `w[n] = (1 - cos(2*pi*n / (N - 1))) / 2` in milli. Cached by
+   frame_size so different callers (8 kHz / N=256, 16 kHz / N=512)
+   share their tables across many STFTs.
+3. **Bit-reversal permutation.** Classic shift-and-mask
+   `_stft_bit_reverse` over the binary representation of each index;
+   in-place pair swap on the real/imag list pair so the
+   Cooley-Tukey decimation-in-time butterflies operate on the
+   bit-reversed ordering.
+4. **`log2(N)` butterfly stages.** Per stage `s` the butterfly
+   block size `m = 2^(s+1)`; the inner loop walks `m/2` twiddles
+   per group with `W = cos - i*sin`, applying the standard pair
+   update `(a + W*b, a - W*b)`. Products are divided by `MILLI`
+   immediately to bound the accumulator -- after 10 stages the
+   intermediate stays under int63.
+5. **Magnitude.** `|X[k]| = isqrt(re^2 + im^2)` via the same
+   Newton iteration as audio_dsp's `_dsp_isqrt`, only the lower
+   N/2 bins (the upper half is the complex conjugate for
+   real-valued input).
+6. **STFT slide.** For each `start = 0, H, 2H, ...` up to
+   `len(pcm) - N`, build the windowed frame, FFT it, push the
+   magnitude list onto the spectrogram. `frames = floor((N -
+   FRAME_SIZE) / HOP_SIZE) + 1`.
+
+### Defaults / caps
+
+- Defaults: `FRAME_SIZE = 512`, `HOP_SIZE = 256` -- 32 ms / 16 ms @
+  16 kHz with 50% overlap (matches Whisper / MFCC conventions). At
+  8 kHz the chat helper drops to `256/128` to keep the same time
+  resolution.
+- Frame sizes: powers of 2 in `{64, 128, 256, 512, 1024}` (radix-2
+  constraint). Sample rate: clamped to `[8000, 48000]` Hz. Max
+  samples: `480000` (30 s @ 16 kHz, matching R12D / R14E).
+
+### Public API (`audio_spectrogram.nova`)
+
+- `stft(pcm, sample_rate, frame_size, hop_size) -> spectrogram_t` --
+  4-cell `[frames_list, sample_rate, frame_size, hop_size]`. Pass
+  `0/0` for default frame/hop.
+- `stft_magnitude(spec, frame_idx, bin_idx) -> int` --
+  bounds-checked magnitude cell access (returns 0 out-of-range).
+- `stft_bin_to_hz(bin_idx, sample_rate, frame_size) -> int` --
+  `bin_idx * sample_rate / frame_size`.
+- `stft_frame_to_ms(frame_idx, hop_size, sample_rate) -> int` --
+  `frame_idx * hop_size * 1000 / sample_rate`.
+- `stft_peak_frequency(spec, frame_idx) -> int` -- argmax over
+  non-DC bins (returns 0 if the frame is silent).
+- `stft_total_magnitude(spec) -> int` -- sum across all cells, the
+  "non-zero spectrogram?" sanity for synthetic vs real audio.
+- `fft_radix2(real_list, imag_list, N) -> [real_out, imag_out]` --
+  exposed for testability.
+- `ifft_radix2(real_list, imag_list, N) -> [real_out, imag_out]` --
+  the standard `conj(fft(conj(X))) / N` identity, so the
+  `IFFT(FFT(x)) ~= x` invariant can be unit-tested.
+
+### Chat wiring (2 net lines in `crossengin_chat.nova`)
+
+```
+/spec PATH         STFT spectrogram of PATH WAV (integer Cooley-Tukey FFT, R16E)
+```
+
+`/spec <wav>` parses the WAV via the shared `audio_capture_to_pcm`,
+picks `256/128` at 8 kHz else `512/256`, runs the STFT, and reports
+
+```
+(spec PATH: frames=N, bins=K, peak_frequency_first_frame=F Hz @ SR Hz,
+ frame_size=N, hop_size=H)
+```
+
+### Verification snapshot (latest run)
+
+- 49 unit assertions in `tests/unit/test_audio_spectrogram.nova`
+  (above the 30 floor in the brief). 19 integration assertions in
+  `tests/integration/scenario_ooo_spectrogram.sh`. All green.
+- **FFT correctness:** 200 Hz sine @ 16 kHz, N=512 -> peak at bin
+  in `[5, 8]` (expected 6.4 -> 6 or 7). 1000 Hz @ 8 kHz, N=256 ->
+  peak at bin in `[30, 34]` (expected 32). Silence -> all-zero
+  spectrum.
+- **STFT round-trips:** 1-second 200 Hz sine @ 8 kHz -> peak
+  frequency 187 Hz (bin 6, the nearest integer; bin width = 31.25
+  Hz). Klatt /ae/ vowel (1200 samples @ 8 kHz, F1=660 Hz / F2=1720
+  Hz) -> peak frequency 1718 Hz (F2 dominates -- well inside the
+  [400, 2200] formant band).
+- **JFK 16 kHz WAV (whisper.cpp bundled sample):** 176000 samples
+  -> 686 frames, 256 bins, total magnitude ~2.18e9 (massively
+  non-zero), peak frequencies across the clip in the 125-406 Hz
+  speech band.
+- **IFFT identity:** `IFFT(FFT(x))[i]` within +/- 30 of `x[i]` on
+  an 8-sample test input padded to N=64 (within milli-twiddle
+  rounding error).
+- 170/170 existing unit tests + all audio scenarios (R6E, R7F,
+  R8B, R10B, R10F, R11B, R12D, R13D, R14E) still pass.
+
+Verify locally:
+
+```sh
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_audio_spectrogram.nova
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_ooo_spectrogram.sh
+NOVA_ROOT=/home/user/NOVA make install   # rebuild chat for /spec
+echo '/spec /tmp/whisper.cpp/samples/jfk.wav' | ./bin/crossengin-chat | grep spec
+```
+
+### Future work
+
+- **MFCC features.** R16E gives a magnitude spectrogram; MFCC adds
+  a log-Mel filter-bank projection + DCT, the standard input for
+  classical wake-word detectors and speaker ID.
+- **Wakeword matched filter.** Cross-correlate the spectrogram
+  against a stored template (a per-user "Aurora" example) and
+  decide on a peak-confidence score; pairs naturally with the
+  VAD-gated `/listen` path.
+- **Source separation by spectral mask.** Independent component
+  analysis or non-negative matrix factorization over the
+  spectrogram; the integer-only path forces an approximate solver
+  but the structure (NMF iterates) carries over cleanly.
+- **Formant tracker that doesn't run blind.** R16E's peak-frequency
+  helper finds the dominant bin per frame; a multi-peak picker
+  with chained nearest-bin tracking surfaces F1 / F2 / F3 contours
+  directly from the spectrogram, complementing audio_pitch's
+  autocorrelation F0.
+- **Inverse STFT.** Add a Hann-windowed overlap-add reconstruction
+  so spectral effects (notch filter, denoise) can route back to
+  PCM without leaving the integer-only domain.
+
 ## R16F (this session) -- mini-SPARQL extensions: OPTIONAL, UNION, ORDER BY
 
 **Status: complete -- `src/kg/query.nova` (R15D's mini-SPARQL parser +

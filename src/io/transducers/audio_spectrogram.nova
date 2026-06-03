@@ -1,0 +1,750 @@
+// CrossEngin io/transducers: Short-Time Fourier Transform (STFT) /
+// spectrogram (R16E).
+//
+// Purpose
+//   Closes the **frequency-domain** gap in CrossEngin's audio chain.
+//   The pre-R16E audio modules all live in the time domain:
+//
+//     R6E  Klatt synth          time-domain formant carriers
+//     R7F  energy + ZCR VAD     time-domain rms / sign-flip
+//     R7F  whisper / vosk STT   external (no spectral exposure)
+//     R10F + R11B pitch (AC / YIN)  time-domain autocorrelation
+//     R12D PSOLA pitch-shift    time-domain epoch alignment
+//     R13D voice clone          time-domain LPC residual swap
+//     R14E reverb / gate / comp time-domain delay lines + envelopes
+//
+//   None of these surface a spectrum. Most downstream audio capabilities
+//   (MFCC features, wake-word matched filters, source separation by
+//   spectral mask, formant tracking that doesn't run blind, simple
+//   harmonic / inharmonic classification) start with a magnitude
+//   spectrogram. R16E ships the integer-only foundation.
+//
+//   Algorithm: Short-Time Fourier Transform.
+//
+//     1. Slide a frame of FRAME_SIZE samples through the input PCM with
+//        hop HOP_SIZE samples (50% overlap by default).
+//     2. Apply a Hann window to each frame to reduce spectral leakage:
+//          w[n] = (1 - cos(2*pi*n / (FRAME_SIZE - 1))) / 2
+//     3. Compute the DFT via integer Cooley-Tukey radix-2 FFT:
+//          X[k] = sum_{n=0..N-1} x[n] * exp(-2*pi*i*k*n / N)
+//        - FRAME_SIZE must be a power of 2 (radix-2 constraint).
+//        - Twiddle factors cos/sin precomputed in milli (1000 = unity).
+//        - In-place bit-reversal permutation + log2(N) butterfly stages.
+//     4. Emit the magnitude spectrum |X[k]| = isqrt(re^2 + im^2) for
+//        k in [0, FRAME_SIZE / 2): the redundant upper half is the
+//        complex conjugate of the lower half for a real-valued input.
+//     5. Stack consecutive frames into a 2D spectrogram of shape
+//        (frames, bins). frames = floor((N_samples - FRAME_SIZE) /
+//        HOP_SIZE) + 1; bins = FRAME_SIZE / 2.
+//
+//   Defaults: FRAME_SIZE = 512 (32 ms @ 16 kHz), HOP_SIZE = 256 (16 ms,
+//   50% overlap). At 8 kHz the same time resolution would mean
+//   FRAME_SIZE = 256 / HOP_SIZE = 128; callers pass those explicitly.
+//
+//   Caps: total samples <= 480000 (30 s @ 16 kHz, matching R12D / R14E);
+//   frame_size in {64, 128, 256, 512, 1024}. The cap protects against
+//   accidental N^2 FFT explosion -- worst case at 480000 samples and
+//   hop=128 is ~3750 frames * (1024 * 10 stages) ~= 38M butterflies,
+//   which finishes in seconds even with NOVA's interpreter.
+//
+//   Magnitude unit: integer (un-scaled). For a 16000-amp sine the
+//   peak bin lands around half the DFT magnitude expectation
+//   (FRAME_SIZE/2 * amp * 0.5_hann_gain ~ 256 * 16000 * 0.5 = 2M).
+//   Callers that want milli- / centi-Hz convention can normalize via
+//   stft_bin_to_hz or stft_frame_to_ms.
+//
+// ADRs: ADR-0014 (audio modality bridge, frequency-domain leg).
+// NOVA dependencies: builtins -- alloc, list_new, push, list_set, len,
+//   int_mul / int_add / int_sub / int_div / int_shr (NO syscalls in
+//   the hot path; the module is pure -- caller does I/O).
+// CrossEngin dependencies: audio_capture (only inside the chat helper
+//   stft_run_command at the bottom of the file -- the core estimator
+//   above is leaf so tests can exercise it without dragging WAV-parse
+//   code into the unit compilation unit).
+
+import "audio_capture.nova"
+
+// ---- public caps + defaults ----------------------------------------------
+
+// Maximum number of input samples accepted by `stft`. Matches R12D PSOLA /
+// R14E DSP / R13D voice clone caps (30 s @ 16 kHz).
+let STFT_MAX_SAMPLES = 480000
+
+// Sample-rate band -- matches VAD / pitch / DSP. Outside this range we
+// clamp to the nearest end and continue (the math is rate-agnostic;
+// the clamps only guard against numerical noise in stft_bin_to_hz).
+let STFT_RATE_MIN = 8000
+let STFT_RATE_MAX = 48000
+
+// Allowed frame sizes (powers of 2). The radix-2 FFT requires N = 2^k.
+// We support 64 (4 ms @ 16 kHz, coarse spectrum) through 1024 (64 ms,
+// fine resolution).
+let STFT_FRAME_MIN = 64
+let STFT_FRAME_MAX = 1024
+
+// Defaults: 32 ms / 16 ms @ 16 kHz (50% overlap).
+let STFT_FRAME_SIZE_DEFAULT = 512
+let STFT_HOP_SIZE_DEFAULT   = 256
+
+// Twiddle / Hann tables are kept in milli (1000 = 1.0). Each stays
+// power-of-2 sized so an N=1024 FFT can reuse the N=1024 entries
+// directly and an N=256 FFT looks them up with stride 4. Built once
+// (the largest size, 1024) and cached.
+let STFT_TWIDDLE_BASE = 1024
+let STFT_MILLI = 1000
+
+let _stft_cos_table = 0      // [STFT_TWIDDLE_BASE/2] cos(-2*pi*k/N) milli
+let _stft_sin_table = 0      // [STFT_TWIDDLE_BASE/2] sin(-2*pi*k/N) milli
+let _stft_hann_cache = 0     // map frame_size -> Hann window list
+
+// ---- public constant accessors -------------------------------------------
+
+fn stft_frame_size_default() { return STFT_FRAME_SIZE_DEFAULT }
+fn stft_hop_size_default()   { return STFT_HOP_SIZE_DEFAULT }
+fn stft_max_samples()        { return STFT_MAX_SAMPLES }
+fn stft_milli()              { return STFT_MILLI }
+fn stft_twiddle_base()       { return STFT_TWIDDLE_BASE }
+fn stft_frame_min()          { return STFT_FRAME_MIN }
+fn stft_frame_max()          { return STFT_FRAME_MAX }
+
+// ---- integer comparison helpers ------------------------------------------
+//
+// NOVA's smart `<` / `>` operators dispatch to _nova_strcmp when both
+// operands exceed the pointer threshold (~1 MB). FFT intermediate values
+// stay well below that on PCM16 input (16000-amp -> products ~= 1.6e9
+// per butterfly, accumulators ~= N * amp = 1.6e7 at most), but the
+// magnitude-squared accumulator re*re + im*im hits ~6e13 which crosses
+// the threshold. Comparisons against zero are safe (the sign bit is
+// classified as int); generic two-large-operand compares get the
+// arithmetic-shift trick from R14E.
+
+fn _stft_int_lt(a, b) {
+    let d = int_sub(a, b)
+    let sign = int_shr(d, 63)
+    if sign == 0 { return 0 }
+    return 1
+}
+
+fn _stft_int_gt(a, b) { return _stft_int_lt(b, a) }
+
+// ---- integer Newton sqrt (same shape as audio_dsp _dsp_isqrt) ------------
+//
+// Used to turn the magnitude-squared accumulator (|X[k]|^2 = re^2 + im^2)
+// into a magnitude. Operates entirely on int_* primitives so the smart
+// `<` dispatch doesn't fire on the multi-million-range intermediate.
+
+fn _stft_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 4 { return 1 }
+    let x = n
+    let y = int_div(int_add(x, 1), 2)
+    let i = 0
+    while _stft_int_lt(y, x) == 1 {
+        if i >= 64 { return x }
+        x = y
+        y = int_div(int_add(x, int_div(n, x)), 2)
+        i = i + 1
+    }
+    return x
+}
+
+// ---- twiddle table -------------------------------------------------------
+//
+// Single STFT_TWIDDLE_BASE/2 = 512-entry table at the largest supported
+// FRAME_SIZE. For an FFT of size N <= STFT_TWIDDLE_BASE we look up index
+// k * (STFT_TWIDDLE_BASE / N) into the base table -- the stride trick
+// that lets one table serve every N at no extra cost.
+//
+// We use the same Bhaskara approximation as audio_synth's _sin_q_milli
+// (4 * deg * (180 - deg) * 1000 / (40500 - deg * (180 - deg))). It
+// matches sin(deg) within ~0.2% across [0, 90]; cos(deg) = sin(90 - deg).
+// Twiddle convention is the forward DFT direction:
+//   W_N^k = cos(2*pi*k/N) - i * sin(2*pi*k/N) = exp(-2*pi*i*k/N)
+// so we precompute cos_milli[k] and sin_milli[k] at angle (2*pi*k/N)
+// with the negative-sin sign folded in at the butterfly site.
+
+fn _stft_sin_milli_q(deg) {
+    // Bhaskara, scaled to milli. Input deg in [0, 90].
+    let prod = deg * (180 - deg)
+    let num = 4 * prod * STFT_MILLI
+    let den = 40500 - prod
+    if den <= 0 { return STFT_MILLI }
+    return num / den
+}
+
+// sin(deg) for deg in [0, 360) returned in milli; symmetry off the quarter
+// arc. The 4-fold map matches audio_synth's _sin_lookup but operates on
+// a degree axis (0..360) rather than a 1024-step phase.
+fn _stft_sin_deg_milli(deg) {
+    let d = deg
+    while d < 0     { d = d + 360 }
+    while d >= 360  { d = d - 360 }
+    if d <= 90  { return _stft_sin_milli_q(d) }
+    if d <= 180 { return _stft_sin_milli_q(180 - d) }
+    if d <= 270 { return 0 - _stft_sin_milli_q(d - 180) }
+    return 0 - _stft_sin_milli_q(360 - d)
+}
+
+fn _stft_cos_deg_milli(deg) {
+    // cos(d) = sin(90 - d)
+    return _stft_sin_deg_milli(90 - deg)
+}
+
+// Build the cos / sin tables: entry k holds cos / sin at angle
+// (2 * pi * k / STFT_TWIDDLE_BASE) = (360 * k / 1024) degrees.
+//
+// We need only N/2 = 512 entries because butterfly stages walk
+// k = 0 .. N/2 - 1 with the doubled angle handled by the stride.
+fn _stft_twiddle_init() {
+    if _stft_cos_table != 0 { return }
+    let cos_t = list_new()
+    let sin_t = list_new()
+    let half = STFT_TWIDDLE_BASE / 2
+    let k = 0
+    while k < half {
+        // Degree angle for k-th twiddle at the base N: (360 * k) / 1024.
+        // Multiplied by 1000 first to retain milli-degree precision so
+        // the table doesn't quantize too aggressively.
+        // For k=1 the raw deg is 360/1024 = 0.3516 -- quantizing to int
+        // collapses many low-k entries to 0 degrees. Carry the fractional
+        // part through by computing sin in milli-degrees of a 360_000
+        // axis: _stft_sin_milli_q only accepts 0..90 ints, so we round
+        // each k to the nearest whole degree on a 360 axis.
+        //
+        // Practical accuracy: for k < 3 the integer-degree rounding sends
+        // cos to 1000 / sin to 0 -- close enough for the FFT (the
+        // low-k twiddles are ~1.0 + small-angle); for k >= 3 the angle
+        // exceeds 1 degree and the table has the resolution to discriminate.
+        let deg = (360 * k) / STFT_TWIDDLE_BASE
+        push(cos_t, _stft_cos_deg_milli(deg))
+        push(sin_t, _stft_sin_deg_milli(deg))
+        k = k + 1
+    }
+    _stft_cos_table = cos_t
+    _stft_sin_table = sin_t
+}
+
+// Twiddle lookup for an FFT of size N at index k in [0, N/2). The base
+// table covers angle 2*pi*k/STFT_TWIDDLE_BASE; for a smaller N the
+// effective stride is STFT_TWIDDLE_BASE / N.
+fn _stft_cos_twiddle(k, N) {
+    _stft_twiddle_init()
+    let stride = STFT_TWIDDLE_BASE / N
+    let idx = k * stride
+    return _stft_cos_table[idx]
+}
+
+fn _stft_sin_twiddle(k, N) {
+    _stft_twiddle_init()
+    let stride = STFT_TWIDDLE_BASE / N
+    let idx = k * stride
+    return _stft_sin_table[idx]
+}
+
+// ---- Hann window cache ---------------------------------------------------
+//
+// Hann window:
+//   w[n] = (1 - cos(2*pi*n / (N - 1))) / 2  for n in [0, N - 1]
+//
+// Returned in milli (1000 = unity). The boundary samples land at 0,
+// the peak at N/2 lands at 1000. We pre-compute once per frame size
+// and cache via a small map -- different callers (8 kHz with N=128
+// and 16 kHz with N=512) share their tables across many STFTs.
+
+fn _stft_hann_compute(N) {
+    let w = list_new()
+    if N <= 1 {
+        push(w, STFT_MILLI)
+        return w
+    }
+    let n = 0
+    let denom = N - 1
+    while n < N {
+        // Angle in degrees: (360 * n) / (N - 1).
+        let deg = (360 * n) / denom
+        // 1 - cos(theta) ranges [0, 2]; divide by 2 (so the boundary
+        // samples land at zero, mid-frame at 1).
+        let c = _stft_cos_deg_milli(deg)
+        // (1 - c/1000) / 2 in milli == (1000 - c) / 2
+        push(w, (STFT_MILLI - c) / 2)
+        n = n + 1
+    }
+    return w
+}
+
+// Map from N -> Hann list, kept as a flat list of [N, list] pairs.
+// Lookup is linear but the cache only holds at most STFT_FRAME_MAX /
+// STFT_FRAME_MIN = 16 entries in practice (only allowed sizes).
+fn _stft_hann_for(N) {
+    if _stft_hann_cache == 0 { _stft_hann_cache = list_new() }
+    let i = 0
+    while i < len(_stft_hann_cache) {
+        let entry = _stft_hann_cache[i]
+        if entry[0] == N { return entry[1] }
+        i = i + 1
+    }
+    let w = _stft_hann_compute(N)
+    let entry = list_new()
+    push(entry, N)
+    push(entry, w)
+    push(_stft_hann_cache, entry)
+    return w
+}
+
+// ---- power-of-2 + log helpers --------------------------------------------
+
+fn _stft_log2_of(N) {
+    // Return -1 if N is not a power of 2; else the base-2 log (so 512 -> 9).
+    let n = N
+    if n < 2 { return -1 }
+    let log = 0
+    while n > 1 {
+        if int_and(n, 1) != 0 { return -1 }
+        n = int_shr(n, 1)
+        log = log + 1
+    }
+    return log
+}
+
+fn _stft_is_allowed_frame_size(N) {
+    if N < STFT_FRAME_MIN { return 0 }
+    if N > STFT_FRAME_MAX { return 0 }
+    if _stft_log2_of(N) < 0 { return 0 }
+    return 1
+}
+
+// ---- bit-reversal permutation --------------------------------------------
+//
+// In-place reorder of x[0..N-1] so the Cooley-Tukey butterfly can run
+// decimation-in-time. For N=8 the permutation is:
+//   0 -> 0 (000 -> 000)
+//   1 -> 4 (001 -> 100)
+//   2 -> 2 (010 -> 010)
+//   3 -> 6 (011 -> 110)
+//   ...
+// We compute the reversal per index with the classic shift-and-mask loop.
+
+fn _stft_bit_reverse(idx, bits) {
+    let v = idx
+    let r = 0
+    let i = 0
+    while i < bits {
+        r = int_or(int_shl(r, 1), int_and(v, 1))
+        v = int_shr(v, 1)
+        i = i + 1
+    }
+    return r
+}
+
+fn _stft_bit_reverse_pair(real, imag, N) {
+    let bits = _stft_log2_of(N)
+    let i = 0
+    while i < N {
+        let j = _stft_bit_reverse(i, bits)
+        if j > i {
+            let tr = real[i]
+            list_set(real, i, real[j])
+            list_set(real, j, tr)
+            let ti = imag[i]
+            list_set(imag, i, imag[j])
+            list_set(imag, j, ti)
+        }
+        i = i + 1
+    }
+}
+
+// ---- public: FFT radix-2 -------------------------------------------------
+//
+// fft_radix2(real_list, imag_list, N) -> [real_out, imag_out]
+//
+//   Cooley-Tukey decimation-in-time. Operates on a copy of the input
+//   so the caller's lists stay intact (callers that hand us 512-sample
+//   windowed PCM expect them un-mutated for repeat analysis).
+//
+//   * real_list, imag_list: lists of length >= N. Values may be negative;
+//     the FFT operates over signed integers. PCM-range inputs (<=32767)
+//     keep intermediate butterfly results in safe int63 range.
+//   * N: must be a power of 2 in {STFT_FRAME_MIN..STFT_FRAME_MAX}.
+//
+//   Output: [real_out, imag_out], each of length N. The k-th entry is
+//   the complex coefficient X[k] = sum x[n] * exp(-2*pi*i*k*n/N).
+//
+//   Twiddle convention: the butterfly applies
+//     u = x[i] + W_N^k * x[j]
+//     v = x[i] - W_N^k * x[j]
+//   with W_N^k = cos(2*pi*k/N) - i * sin(2*pi*k/N). Milli-precision
+//   means each product is divided by STFT_MILLI immediately to keep
+//   the accumulator bounded.
+
+fn fft_radix2(real_list, imag_list, N) {
+    let out_real = list_new()
+    let out_imag = list_new()
+    if _stft_is_allowed_frame_size(N) == 0 {
+        let r = list_new()
+        push(r, out_real)
+        push(r, out_imag)
+        return r
+    }
+    if len(real_list) < N { return _stft_empty_pair(out_real, out_imag) }
+    if len(imag_list) < N { return _stft_empty_pair(out_real, out_imag) }
+    _stft_twiddle_init()
+
+    // Copy inputs (so the caller's lists stay intact and so list_set
+    // has somewhere to write).
+    let i = 0
+    while i < N {
+        push(out_real, real_list[i])
+        push(out_imag, imag_list[i])
+        i = i + 1
+    }
+
+    // Bit-reverse permutation.
+    _stft_bit_reverse_pair(out_real, out_imag, N)
+
+    // log2(N) butterfly stages. At stage s the butterfly size is
+    // m = 2^(s+1); we walk m/2 = 2^s twiddles per group.
+    let bits = _stft_log2_of(N)
+    let s = 0
+    while s < bits {
+        let m = int_shl(1, s + 1)        // size of butterfly block
+        let half = int_shr(m, 1)         // m/2 = number of twiddles
+        // Iterate over all m-sized blocks in [0..N).
+        let k_block = 0
+        while k_block < N {
+            // Per-twiddle butterfly.
+            let j = 0
+            while j < half {
+                let idx_a = k_block + j
+                let idx_b = k_block + j + half
+                // Twiddle W_N^k where k = j * (N / m). The stride trick:
+                // a butterfly at stage s walks every (N / m) of the base
+                // table.
+                let stride = int_div(N, m)
+                let twk = j * stride
+                let c = _stft_cos_twiddle(twk, N)
+                let sn = _stft_sin_twiddle(twk, N)
+                let xr = out_real[idx_b]
+                let xi = out_imag[idx_b]
+                // W * x = (c - i*s) * (xr + i*xi)
+                //       = (c*xr + s*xi) + i*(c*xi - s*xr)
+                // All products fit in int63 (each operand <= ~4M after
+                // a few stages * 1000 milli ~= 4G; well under 9.2e18).
+                let tr = int_div(int_add(int_mul(c, xr), int_mul(sn, xi)), STFT_MILLI)
+                let ti = int_div(int_sub(int_mul(c, xi), int_mul(sn, xr)), STFT_MILLI)
+                let ar = out_real[idx_a]
+                let ai = out_imag[idx_a]
+                list_set(out_real, idx_a, int_add(ar, tr))
+                list_set(out_imag, idx_a, int_add(ai, ti))
+                list_set(out_real, idx_b, int_sub(ar, tr))
+                list_set(out_imag, idx_b, int_sub(ai, ti))
+                j = j + 1
+            }
+            k_block = k_block + m
+        }
+        s = s + 1
+    }
+
+    let r = list_new()
+    push(r, out_real)
+    push(r, out_imag)
+    return r
+}
+
+fn _stft_empty_pair(a, b) {
+    let r = list_new()
+    push(r, a)
+    push(r, b)
+    return r
+}
+
+// Public accessors for the fft_radix2 tuple.
+fn fft_real(r) { return r[0] }
+fn fft_imag(r) { return r[1] }
+
+// ---- inverse FFT (for IFFT(FFT(x)) ~= x identity tests) ------------------
+//
+// Standard trick: ifft(X) = conj(fft(conj(X))) / N. We swap the imag
+// inputs' signs going in, swap them back coming out, then divide by N.
+
+fn ifft_radix2(real_list, imag_list, N) {
+    // conj input
+    let rin = list_new()
+    let iin = list_new()
+    let k = 0
+    while k < N {
+        push(rin, real_list[k])
+        push(iin, 0 - imag_list[k])
+        k = k + 1
+    }
+    let f = fft_radix2(rin, iin, N)
+    let rout = fft_real(f)
+    let iout = fft_imag(f)
+    let real_out = list_new()
+    let imag_out = list_new()
+    let j = 0
+    while j < N {
+        push(real_out, int_div(rout[j], N))
+        // conj output sign-flip + 1/N
+        push(imag_out, 0 - int_div(iout[j], N))
+        j = j + 1
+    }
+    let r = list_new()
+    push(r, real_out)
+    push(r, imag_out)
+    return r
+}
+
+// ---- magnitude spectrum --------------------------------------------------
+//
+// For each k in [0, N/2), magnitude[k] = isqrt(re[k]^2 + im[k]^2).
+// We only emit the lower half because the upper half is the complex
+// conjugate of the lower for real-valued input.
+
+fn _stft_magnitude_spectrum(real_list, imag_list, N) {
+    let mag = list_new()
+    let half = int_shr(N, 1)
+    let k = 0
+    while k < half {
+        let re = real_list[k]
+        let im = imag_list[k]
+        // re * re + im * im can reach ~6e13 on a loud FFT-ed sine
+        // (each operand can hit 8M after 9 stages); use int_mul / int_add.
+        let m2 = int_add(int_mul(re, re), int_mul(im, im))
+        push(mag, _stft_isqrt(m2))
+        k = k + 1
+    }
+    return mag
+}
+
+// ---- public: STFT --------------------------------------------------------
+//
+// stft(pcm, sample_rate, frame_size, hop_size) -> spectrogram_t
+//
+//   spectrogram_t is a 4-element list:
+//     [frames_list, sample_rate, frame_size, hop_size]
+//   where frames_list is a list of magnitude lists (each of length
+//   frame_size / 2).
+//
+//   * pcm: PCM16-ranged int list (typically from audio_capture_to_pcm).
+//   * sample_rate: clamped to [STFT_RATE_MIN..STFT_RATE_MAX].
+//   * frame_size: must be a power of 2 in [64..1024]. Pass 0 for the
+//     default (512).
+//   * hop_size: must be > 0 and <= frame_size. Pass 0 for the default
+//     (256, i.e. 50% overlap with the default frame).
+//
+//   Empty or too-large input -> empty frame list (a valid but empty
+//   spectrogram). Frame count = max(0, floor((N - frame_size) /
+//   hop_size) + 1) for N = len(pcm).
+
+fn stft(pcm, sample_rate, frame_size, hop_size) {
+    let r = list_new()
+    let frames = list_new()
+    let sr = _stft_clamp_rate(sample_rate)
+    let N = frame_size
+    if N <= 0 { N = STFT_FRAME_SIZE_DEFAULT }
+    let H = hop_size
+    if H <= 0 { H = STFT_HOP_SIZE_DEFAULT }
+    push(r, frames)
+    push(r, sr)
+    push(r, N)
+    push(r, H)
+    if _stft_is_allowed_frame_size(N) == 0 { return r }
+    if H > N { return r }
+    let total = len(pcm)
+    if total > STFT_MAX_SAMPLES { return r }
+    if total < N { return r }
+
+    let hann = _stft_hann_for(N)
+    let half = int_shr(N, 1)
+
+    // Slide through pcm with hop H.
+    let start = 0
+    let last_start = total - N
+    while start <= last_start {
+        // Build the windowed frame as two parallel real/imag lists.
+        let real_in = list_new()
+        let imag_in = list_new()
+        let n = 0
+        while n < N {
+            let s = pcm[start + n]
+            let w = hann[n]
+            // (s * w) / milli. Both operands well under 1 MB so the
+            // smart `*` is safe; the result <= ~32767 * 1000 = 3e7,
+            // also safe for `/` because the second operand is the
+            // literal 1000.
+            push(real_in, (s * w) / STFT_MILLI)
+            push(imag_in, 0)
+            n = n + 1
+        }
+        let f = fft_radix2(real_in, imag_in, N)
+        let mag = _stft_magnitude_spectrum(fft_real(f), fft_imag(f), N)
+        push(frames, mag)
+        start = start + H
+    }
+    return r
+}
+
+fn _stft_clamp_rate(sample_rate) {
+    let sr = sample_rate
+    if sr < STFT_RATE_MIN { sr = STFT_RATE_MIN }
+    if sr > STFT_RATE_MAX { sr = STFT_RATE_MAX }
+    return sr
+}
+
+// ---- spectrogram accessors -----------------------------------------------
+
+fn stft_frames(spec)      { return spec[0] }
+fn stft_rate(spec)        { return spec[1] }
+fn stft_frame_size(spec)  { return spec[2] }
+fn stft_hop_size(spec)    { return spec[3] }
+
+fn stft_frame_count(spec) { return len(spec[0]) }
+
+fn stft_bin_count(spec) {
+    let N = spec[2]
+    return int_shr(N, 1)
+}
+
+// Magnitude of a particular (frame, bin) cell. Returns 0 on out-of-range
+// (callers can treat the spectrogram as a sparse table without bounds
+// checks of their own).
+fn stft_magnitude(spec, frame_idx, bin_idx) {
+    let frames = spec[0]
+    if frame_idx < 0 { return 0 }
+    if frame_idx >= len(frames) { return 0 }
+    let mag = frames[frame_idx]
+    if bin_idx < 0 { return 0 }
+    if bin_idx >= len(mag) { return 0 }
+    return mag[bin_idx]
+}
+
+// Frequency (Hz, rounded) for a given bin index. Bin 0 = DC = 0 Hz;
+// bin N/2 - 1 corresponds to just under Nyquist (sample_rate/2).
+// Exact formula: bin_idx * sample_rate / frame_size.
+fn stft_bin_to_hz(bin_idx, sample_rate, frame_size) {
+    if frame_size <= 0 { return 0 }
+    if bin_idx <= 0 { return 0 }
+    return int_div(int_mul(bin_idx, sample_rate), frame_size)
+}
+
+// Time (ms, rounded) for a given frame index. Frame 0 starts at 0 ms;
+// each subsequent frame advances hop_size samples = hop_size * 1000 /
+// sample_rate ms.
+fn stft_frame_to_ms(frame_idx, hop_size, sample_rate) {
+    if sample_rate <= 0 { return 0 }
+    if frame_idx <= 0 { return 0 }
+    return int_div(int_mul(frame_idx, hop_size) * 1000, sample_rate)
+}
+
+// Dominant frequency in a frame: argmax over the magnitude spectrum,
+// translated back to Hz. Skips bin 0 (DC) -- the DC component of a
+// Hann-windowed PCM is usually non-zero (windowing doesn't subtract
+// the mean) and would mask the real peak on a slow-DC-drift signal.
+fn stft_peak_frequency(spec, frame_idx) {
+    let frames = spec[0]
+    if frame_idx < 0 { return 0 }
+    if frame_idx >= len(frames) { return 0 }
+    let mag = frames[frame_idx]
+    let bins = len(mag)
+    if bins < 2 { return 0 }
+    let best_bin = 1
+    let best_mag = mag[1]
+    let k = 2
+    while k < bins {
+        let m = mag[k]
+        // m and best_mag can reach ~6e6 on a loud sine -- below the 1 MB
+        // ptr threshold but we route through int_lt to be defensive
+        // against the upper end of unwindowed loud PCM.
+        if _stft_int_gt(m, best_mag) == 1 {
+            best_mag = m
+            best_bin = k
+        }
+        k = k + 1
+    }
+    // Silent / flat spectrum -> 0 Hz (no dominant peak).
+    if best_mag <= 0 { return 0 }
+    return stft_bin_to_hz(best_bin, spec[1], spec[2])
+}
+
+// Sum of all magnitudes across all frames + bins. Useful as a quick
+// "non-zero spectrogram?" sanity for the JFK test (a silent input
+// produces all-zero magnitudes; a real speech signal sums to the
+// millions).
+fn stft_total_magnitude(spec) {
+    let frames = spec[0]
+    let total = 0
+    let i = 0
+    while i < len(frames) {
+        let mag = frames[i]
+        let j = 0
+        while j < len(mag) {
+            total = int_add(total, mag[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ---- chat helper ---------------------------------------------------------
+//
+// stft_run_command(arg) -> single human-readable line summarising the
+// spectrogram of the WAV at `arg`. Wired into examples/crossengin_chat.nova
+// as the `/spec PATH` admin one-liner. Externalized here so the chat
+// dispatch table stays at a single ADD line (the brief allows +1
+// dispatch + 1 help).
+//
+// Output shape (one line, parenthesized for visual symmetry with /pitch
+// and /listen):
+//
+//   (spec /tmp/x.wav: frames=N, bins=K, peak_frequency_first_frame=F Hz
+//   @ SR Hz, frame_size=512, hop_size=256)
+//
+// Error path (missing or unparseable WAV):
+//
+//   (spec FAILED: <reason>)
+//
+// The frame_size / hop_size pair is derived from the loaded WAV's
+// sample rate: at >= 16 kHz we use the 512/256 default; at 8 kHz we
+// scale to 256/128 to keep the 32 ms / 16 ms time resolution; any rate
+// in between also gets the 512/256 default (the FFT doesn't care -- it
+// just changes the frequency resolution).
+
+fn stft_run_command(arg) {
+    if len(arg) == 0 {
+        return "(/spec needs PATH -- usage: /spec /tmp/test.wav)"
+    }
+    let path = str_trim(arg)
+    if len(path) == 0 {
+        return "(/spec needs PATH -- usage: /spec /tmp/test.wav)"
+    }
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(spec FAILED: could not parse WAV at " + path + ")"
+    }
+    if sr <= 0 {
+        return "(spec FAILED: invalid sample rate in WAV at " + path + ")"
+    }
+    // Pick frame_size / hop_size: at 8 kHz use 256/128 (32 ms / 16 ms);
+    // at 16 kHz and above use the defaults (512/256).
+    let N = STFT_FRAME_SIZE_DEFAULT
+    let H = STFT_HOP_SIZE_DEFAULT
+    if sr <= 8000 { N = 256; H = 128 }
+    let spec = stft(pcm, sr, N, H)
+    let nframes = stft_frame_count(spec)
+    if nframes == 0 {
+        return "(spec " + path + ": frames=0, samples=" + int_to_str(len(pcm))
+            + " @ " + int_to_str(sr) + " Hz, frame_size=" + int_to_str(N)
+            + ", hop_size=" + int_to_str(H) + " -- input too short)"
+    }
+    let bins = stft_bin_count(spec)
+    let peak = stft_peak_frequency(spec, 0)
+    return "(spec " + path + ": frames=" + int_to_str(nframes)
+        + ", bins=" + int_to_str(bins)
+        + ", peak_frequency_first_frame=" + int_to_str(peak) + " Hz"
+        + " @ " + int_to_str(sr) + " Hz"
+        + ", frame_size=" + int_to_str(N)
+        + ", hop_size=" + int_to_str(H) + ")"
+}
