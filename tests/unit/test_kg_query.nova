@@ -1,0 +1,306 @@
+// Unit tests for src/kg/query.nova (R15D).
+//
+// Covers the mini-SPARQL declarative query language: tokenizer +
+// recursive-descent parser, executor over a small KG with atoms +
+// xrefs, FILTER predicates on int fields, LIMIT clause, error
+// handling for malformed input, and the convenience public APIs
+// (kg_query_compile_and_run, kg_query_cmd's emit-line shape via
+// _qry_format_binding).
+//
+// Total assertions: ~35. Helpers are integer-only; comparisons exact.
+//
+// ADRs: ADR-0016 (atoms + xrefs are the query surface), ADR-0049
+// (testing + benchmarks).
+
+import "../ce_test.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/cross_kg_references.nova"
+import "../../src/kg/query.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Build a KG with 5 FACT atoms + 5 CONCEPT atoms. The FACT atoms have
+// ascending alpha values (1000, 2000, ..., 5000 milli) so the FILTER
+// alpha > 500 / > 2500 / etc tests have a predictable cut.
+fn _fixture_kg() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "test_query")
+    // 5 FACTs at ids 0..4 with alpha = 1000..5000
+    let i = 0
+    while i < 5 {
+        let a = kg_add_atom(kg, ATOM_FACT, "fact_" + int_to_str(i), 1000 + i * 100)
+        // alpha bumps: bel_observe uses sign>0 to add FP_SCALE (1000) to
+        // alpha. Start at the prior (1000); we want alpha = 1000 +
+        // 1000 * i, so call bel_observe i times.
+        let j = 0
+        while j < i {
+            atom_observe(a, 1)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // 5 CONCEPTs at ids 5..9; alpha stays at prior (1000)
+    let k = 0
+    while k < 5 {
+        kg_add_atom(kg, ATOM_CONCEPT, "concept_" + int_to_str(k), 1500 + k * 100)
+        k = k + 1
+    }
+    // Link FACT 0 -> CONCEPT 5, FACT 1 -> CONCEPT 6, ..., FACT 4 -> CONCEPT 9
+    let m = 0
+    while m < 5 {
+        let f = kg_atom(kg, m)
+        let c = kg_atom(kg, m + 5)
+        let x = xref_new(f, c, XREF_SIMILAR, 900, 0)
+        atom_add_xref(f, x)
+        m = m + 1
+    }
+    return kg
+}
+
+// ---- parser tests ---------------------------------------------------------
+
+fn test_parse_simple_select() {
+    // Minimal valid query.
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . }")
+    ce_check("simple query parses", kg_query_is_parsed(q) == 1)
+    ce_eq("one variable selected", len(kg_query_vars(q)), 1)
+    ce_str_eq("var name is 'a'", kg_query_vars(q)[0], "a")
+    ce_eq("one pattern in WHERE", len(kg_query_patterns(q)), 1)
+    ce_eq("default LIMIT", kg_query_limit(q), QRY_DEFAULT_LIMIT)
+}
+
+fn test_parse_multi_var_select() {
+    let q = kg_query_parse("SELECT ?a ?b WHERE { ?a kind FACT . ?a links ?b . }")
+    ce_check("multi-var query parses", kg_query_is_parsed(q) == 1)
+    ce_eq("two variables selected", len(kg_query_vars(q)), 2)
+    ce_str_eq("first var", kg_query_vars(q)[0], "a")
+    ce_str_eq("second var", kg_query_vars(q)[1], "b")
+    ce_eq("two patterns", len(kg_query_patterns(q)), 2)
+}
+
+fn test_parse_with_limit() {
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . } LIMIT 3")
+    ce_check("query with LIMIT parses", kg_query_is_parsed(q) == 1)
+    ce_eq("LIMIT 3", kg_query_limit(q), 3)
+}
+
+fn test_parse_with_filter() {
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . FILTER alpha > 500 . }")
+    ce_check("query with FILTER parses", kg_query_is_parsed(q) == 1)
+    ce_eq("two patterns (triple + filter)", len(kg_query_patterns(q)), 2)
+    // FILTER node shape: [PAT_FILTER, field, op, val]
+    let f = kg_query_patterns(q)[1]
+    ce_eq("filter tag", f[0], PAT_FILTER)
+    ce_str_eq("filter field", f[1], "alpha")
+    ce_str_eq("filter op", f[2], ">")
+    ce_eq("filter value", f[3], 500)
+}
+
+fn test_parse_bad_syntax_missing_brace() {
+    // Missing closing brace.
+    let r = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . ")
+    ce_eq("missing-brace returns error", _qry_is_error(r), 1)
+}
+
+fn test_parse_bad_syntax_missing_select() {
+    // No SELECT keyword.
+    let r = kg_query_parse("WHERE { ?a kind FACT . }")
+    ce_eq("missing-SELECT returns error", _qry_is_error(r), 1)
+}
+
+fn test_parse_bad_syntax_missing_dot() {
+    // Triple without terminating .
+    let r = kg_query_parse("SELECT ?a WHERE { ?a kind FACT }")
+    ce_eq("missing-dot returns error", _qry_is_error(r), 1)
+}
+
+fn test_parse_empty_string_errors() {
+    let r = kg_query_parse("")
+    ce_eq("empty query is an error", _qry_is_error(r), 1)
+}
+
+fn test_parse_unknown_predicate() {
+    let r = kg_query_parse("SELECT ?a WHERE { ?a frobnicate FACT . }")
+    ce_eq("unknown predicate is an error", _qry_is_error(r), 1)
+}
+
+// ---- executor tests -------------------------------------------------------
+
+fn test_execute_5_facts() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("5 FACT atoms returned", len(results), 5)
+}
+
+fn test_execute_5_concepts() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind CONCEPT . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("5 CONCEPT atoms returned", len(results), 5)
+}
+
+fn test_execute_two_pattern_links() {
+    // ?a kind FACT . ?a links ?b -> 5 (one per FACT, each linking to one concept)
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a ?b WHERE { ?a kind FACT . ?a links ?b . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("5 (FACT, CONCEPT) pairs via links", len(results), 5)
+    // Each binding has both ?a and ?b set.
+    let i = 0
+    while i < len(results) {
+        ce_eq("binding has ?a", binding_has(results[i], "a"), 1)
+        ce_eq("binding has ?b", binding_has(results[i], "b"), 1)
+        i = i + 1
+    }
+}
+
+fn test_execute_filter_alpha_gt_500() {
+    // alpha values: FACT 0..4 have alpha = 1000, 2000, 3000, 4000, 5000.
+    // Filter alpha > 500 keeps all 5.
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . FILTER alpha > 500 . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("alpha > 500 -> all 5 FACTs (each has alpha >= 1000)", len(results), 5)
+}
+
+fn test_execute_filter_alpha_gt_2500() {
+    // Filter alpha > 2500 keeps FACTs with alpha in {3000, 4000, 5000} -> 3
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . FILTER alpha > 2500 . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("alpha > 2500 -> 3 FACTs", len(results), 3)
+}
+
+fn test_execute_filter_alpha_lt() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . FILTER alpha < 2500 . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("alpha < 2500 -> 2 FACTs (alpha=1000, alpha=2000)", len(results), 2)
+}
+
+fn test_execute_filter_alpha_eq() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . FILTER alpha = 3000 . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("alpha = 3000 -> 1 FACT", len(results), 1)
+}
+
+fn test_execute_filter_alpha_neq() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . FILTER alpha != 3000 . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("alpha != 3000 -> 4 FACTs (5 minus 1)", len(results), 4)
+}
+
+fn test_execute_limit_clamps_result() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . } LIMIT 3")
+    let results = kg_query_execute(kg, q)
+    ce_eq("LIMIT 3 returns 3", len(results), 3)
+}
+
+fn test_execute_limit_larger_than_results() {
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . } LIMIT 100")
+    let results = kg_query_execute(kg, q)
+    ce_eq("LIMIT 100 with 5 atoms returns 5", len(results), 5)
+}
+
+fn test_execute_impossible_match() {
+    // ?a kind FACT . ?a kind CONCEPT -- impossible (an atom has one kind)
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . ?a kind CONCEPT . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("impossible match returns empty", len(results), 0)
+}
+
+fn test_execute_compile_and_run_convenience() {
+    let kg = _fixture_kg()
+    let r = kg_query_compile_and_run(kg, "SELECT ?a WHERE { ?a kind FACT . }")
+    ce_check("compile-and-run returns non-error", _qry_is_error(r) == 0)
+    ce_eq("compile-and-run returns 5 bindings", len(r), 5)
+}
+
+fn test_execute_compile_and_run_error() {
+    let kg = _fixture_kg()
+    let r = kg_query_compile_and_run(kg, "SELECT bogus syntax")
+    ce_eq("compile-and-run of bad syntax returns error", _qry_is_error(r), 1)
+}
+
+// ---- binding helpers ------------------------------------------------------
+
+fn test_binding_set_and_get() {
+    let b = binding_new()
+    binding_set(b, "x", 42)
+    ce_eq("binding has x", binding_has(b, "x"), 1)
+    ce_eq("binding get x = 42", binding_get(b, "x"), 42)
+    ce_eq("binding does not have y", binding_has(b, "y"), 0)
+    // Overwrite
+    binding_set(b, "x", 99)
+    ce_eq("binding get x = 99 after overwrite", binding_get(b, "x"), 99)
+}
+
+// ---- error message accessor ----------------------------------------------
+
+fn test_error_message_extraction() {
+    let r = kg_query_parse("")
+    ce_eq("empty query is an error", _qry_is_error(r), 1)
+    let m = qry_error_message(r)
+    ce_check("error message is non-empty", len(m) > 0)
+}
+
+// ---- empty KG edge case ---------------------------------------------------
+
+fn test_execute_on_empty_kg() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "test_empty")
+    let q = kg_query_parse("SELECT ?a WHERE { ?a kind FACT . }")
+    let results = kg_query_execute(kg, q)
+    ce_eq("empty KG returns 0 bindings", len(results), 0)
+}
+
+// ---- binding values from atoms -------------------------------------------
+
+fn test_execute_filter_after_links() {
+    // Multi-pattern: FILTER applies to the most-recently-bound atom (?b).
+    // ?a links ?b means ?b is bound last; then FILTER on ?b.
+    let kg = _fixture_kg()
+    let q = kg_query_parse("SELECT ?a ?b WHERE { ?a kind FACT . ?a links ?b . FILTER kind = 3 . }")
+    // CONCEPT = 3; every linked ?b is a CONCEPT, so all 5 pass.
+    let results = kg_query_execute(kg, q)
+    ce_eq("filter on linked CONCEPT -> 5 bindings", len(results), 5)
+}
+
+fn main() {
+    test_parse_simple_select()
+    test_parse_multi_var_select()
+    test_parse_with_limit()
+    test_parse_with_filter()
+    test_parse_bad_syntax_missing_brace()
+    test_parse_bad_syntax_missing_select()
+    test_parse_bad_syntax_missing_dot()
+    test_parse_empty_string_errors()
+    test_parse_unknown_predicate()
+    test_execute_5_facts()
+    test_execute_5_concepts()
+    test_execute_two_pattern_links()
+    test_execute_filter_alpha_gt_500()
+    test_execute_filter_alpha_gt_2500()
+    test_execute_filter_alpha_lt()
+    test_execute_filter_alpha_eq()
+    test_execute_filter_alpha_neq()
+    test_execute_limit_clamps_result()
+    test_execute_limit_larger_than_results()
+    test_execute_impossible_match()
+    test_execute_compile_and_run_convenience()
+    test_execute_compile_and_run_error()
+    test_binding_set_and_get()
+    test_error_message_extraction()
+    test_execute_on_empty_kg()
+    test_execute_filter_after_links()
+    ce_summary("kg_query")
+}
+
+main()

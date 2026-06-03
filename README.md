@@ -11,7 +11,72 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R14E adds `src/io/transducers/audio_dsp.nova` — classical DSP
+> toolchain. R15E adds `src/persistence/merkle.nova` — a SHA-256
+> Merkle-tree tamper-evident atom-hash chain over the v2 snapshot's
+> KGS section, closing the integrity gap that lived between R5D's
+> crash-safe writer and R14F's Ed25519 signing primitive. Without it
+> an operator could `vim` a snapshot file on disk, flip a single bit
+> in any atom, and the next `/load` would happily install the mutated
+> state with no indication anything was off. The Merkle root is a
+> 32-byte SHA-256 summary built bottom-up over canonical
+> per-atom-record bytes (`kg=<label>|id=<id>|kind=<kind>|label=<label>|alpha=<a>|beta=<b>`,
+> field order fixed); pair-and-hash with last-leaf duplication on odd
+> counts (Bitcoin convention); root emitted as an OPTIONAL
+> `meta.merkle_root <hex>` line in the v2 meta block (pre-R15E readers
+> ignore the line — additive, no major bump). The new chat command
+> `/snap_verify [PATH]` recomputes the root over the loaded KGS and
+> reports `verified | TAMPERED | no Merkle commitment`. With
+> `CE_SNAPSHOT_VERIFY_MERKLE=1` the normal `/load` path becomes a
+> tripwire that refuses any file whose recomputed root disagrees with
+> the meta claim. Inclusion proofs (`merkle_proof` →
+> direction-tagged sibling-hash list, `merkle_verify_proof` ↔ in
+> O(log N) hash ops) round out the public API for a future
+> federation-peer attestation surface. The module ships its OWN
+> SHA-256 (FIPS 180-4, byte-identical to noise_xk's `sha256_buf`) to
+> keep the persistence import graph minimal — no chacha20 / poly1305
+> / bignum_2048 transit just for an integrity check. **Tamper
+> detection verified live: flipping a single byte in
+> `kgs.atoms[0].label` changes the root, `/snap_verify` reports
+> TAMPERED, and `CE_SNAPSHOT_VERIFY_MERKLE=1 /load` refuses the
+> file.** Determinism verified live too: two `/save` calls on an
+> unchanged KG produce bit-identical `meta.merkle_root` hex. 60 unit
+> assertions + 13 integration assertions; all green. All existing
+> snapshot tests pass unchanged: `test_snapshot_writer` 27,
+> `test_snapshot_disk` 31, `test_snapshot_episodic` 51,
+> `test_snapshot_synapses` 89, `test_snapshot_selfmodel` 38,
+> `test_snapshot_compaction` 48, `test_snapshot_reader` 25,
+> `test_snapshot_migrate` 37, `test_snapshot_disk_full` 72,
+> `test_snapshot_delta` 84, `test_schema_migration` 78. R15D adds
+> `src/kg/query.nova` — a mini-SPARQL declarative
+> query language over the KG: text-based triple patterns + FILTER + LIMIT
+> that compose for arbitrary atom queries, closing the long-standing
+> "operator wants a declarative query surface" gap left by R6F/R8F
+> episodic, R10C TF-IDF search, R11F/R12C clustering, and R13E PageRank
+> (all PROGRAMMATIC read paths -- pick which `_cmd` to call). Operators
+> who know SPARQL can now write `SELECT ?a WHERE { ?a kind FACT . ?a
+> links ?b . FILTER alpha > 500 . } LIMIT 5` and have it tokenize ->
+> recursive-descent parse -> iterate triple patterns over `kg_atoms` ->
+> accumulate / extend / filter bindings -> return up to LIMIT rows.
+> Supports: triple patterns (subject predicate object .), variables
+> (`?var` matches any value and binds), literal predicates (kind, label,
+> alpha, beta, created_ns, links), FILTER predicates (>, <, =, != on
+> int fields alpha/beta/count/created_ns/version/kind, scoped to the
+> most-recently-bound atom), implicit AND across multiple patterns,
+> LIMIT N (default 100, max 10000). Out of scope: OPTIONAL / UNION /
+> MINUS / boolean FILTER composition / regex / ORDER BY / GROUP BY /
+> aggregates. Lex-error sniff (sentinels look like `<unterm-string>`)
+> and parse-error sentinels (`[ERR_OBJ_TAG, msg]`) surface as
+> `QUERY error=...` lines on the chat dispatch path -- malformed
+> input never crashes the process. Public API: `kg_query_parse(qs)`,
+> `kg_query_execute(kg, parsed)`, `kg_query_compile_and_run(kg, qs)`,
+> + accessors `kg_query_vars / _patterns / _limit / _is_parsed`. New
+> chat admin: `/query <SPARQL_string>` -- prints `QUERY bindings=N
+> vars=V limit=L` + up to first 5 `BINDING i: a=X b=Y` rows +
+> `QUERY_END`. 55 unit assertions (`tests/unit/test_kg_query.nova`) +
+> 18 integration assertions (`tests/integration/scenario_kkk_query.sh`);
+> all green. All existing KG tests (R6F/R8F episodic, R10C semantic,
+> R11F/R12C clustering, R13E PageRank) remain bit-identically green.
+> R14E adds `src/io/transducers/audio_dsp.nova` — classical DSP
 > effects (Schroeder 1962 reverb + level-dependent noise gate + symmetric
 > compressor), closing the *effects* leg of the audio chain next to R6E
 > synth, R7F/R9B VAD, R8B/R10B STT, R10F/R11B pitch, R12D PSOLA, and
@@ -598,6 +663,30 @@ computational units rather than orchestrating a pipeline of modules.
 > direction is perpendicular to the edge); the integration scenario
 > asserts these disagree. Documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from
+> `io/transducers/image_detector.nova` added in R15C HOG-based
+> sliding-window object detector -- the canonical Dalal-Triggs
+> (CVPR 2005) pedestrian pipeline built on R14D's HOG descriptor.
+> A linear-SVM classifier is the original Dalal-Triggs choice;
+> CrossEngin's no-training-data design substitutes TEMPLATE
+> MATCHING via the existing `hog_compare` L1 distance: every
+> candidate window's HOG is compared against a single template HOG
+> (extracted from a positive example), and windows within a
+> distance threshold are accepted. `det_train_template(image, w, h,
+> win_w, win_h)` returns the template HOG; `det_sliding_window(
+> image, w, h, template, threshold_milli, stride)` walks (x, y) at
+> the requested stride (4..32, default 8); `det_nms(detections,
+> box_size, iou_milli)` sorts by ascending distance and greedily
+> drops overlapping windows (default IoU = 300 milli, Dalal-Triggs's
+> 0.30); `det_detect(...)` ties them together using the template's
+> dimensions for NMS box geometry. New chat admin: `/detect
+> TEMPLATE.pgm SCENE.pgm` -> `(detect N detection(s); T=WxH S=WxH
+> stride=S best=DIST at (X, Y))`. New per-image atom:
+> `image_detector_count_<none|one|few|many>` (emitted when
+> `CE_VP_DETECT_TEMPLATE` env points at a template PGM). The
+> integration scenario asserts detection at a known (16, 16) offset
+> within +/- stride accuracy and 0 detections on a uniform-gray
+> scene. Documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > unchanged from the snapshot
 > v1 -> v2 migration session -- the bump landed inside the existing
 > `persistence/snapshot_{writer,disk,reader}.nova` trio +

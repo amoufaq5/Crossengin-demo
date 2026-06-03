@@ -3,6 +3,281 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R15D (this session) -- mini-SPARQL declarative query language over the KG
+
+**Status: complete -- `src/kg/query.nova` (NEW) lands a text-based
+SPARQL-style query language that composes triple patterns + FILTER +
+LIMIT, the declarative companion to the substrate's existing
+programmatic read paths (R6F+R8F episodic recall, R10C TF-IDF
+semantic search, R11F+R12C clustering, R13E PageRank).** Every
+existing read path required the operator to know which `_cmd` to
+call; R15D adds a single uniform surface that arbitrarily composes
+patterns:
+
+```
+SELECT ?a ?b WHERE {
+  ?a kind FACT .
+  ?a links ?b .
+  ?b kind CONCEPT .
+  FILTER alpha > 500 .
+} LIMIT 5
+```
+
+### Grammar (mini-SPARQL, BNF-simplified)
+
+```
+query     ::= "SELECT" varlist "WHERE" "{" pattern* "}" limit?
+varlist   ::= "?"name ( "?"name )*
+pattern   ::= triple "." | filter "."
+triple    ::= term predicate term
+filter    ::= "FILTER" field op intvalue
+term      ::= "?"name | literal
+predicate ::= kind | label | alpha | beta | created_ns | links
+field     ::= kind | alpha | beta | count | created_ns | version
+op        ::= ">" | "<" | "=" | "!="
+limit     ::= "LIMIT" intliteral
+```
+
+### Implementation
+
+- **Tokenizer**: single-pass scan over the input, splits on whitespace
+  + structural chars (`{`, `}`, `.`, `?`, `"`). Recognizes keywords
+  (case-sensitive: SELECT, WHERE, FILTER, LIMIT), variables (`?name`),
+  identifiers (bare names), integers (digit runs), operators (`>`, `<`,
+  `=`, `!=`), strings (`"..."`).
+- **Parser**: hand-written recursive descent. `_qry_parse_select` ->
+  `_qry_parse_where` -> `_qry_parse_limit`. Each sub-parser returns
+  `[result, new_pos]`; on error returns `[error_sentinel, pos]` where
+  the error sentinel is a list `[ERR_OBJ_TAG, msg]`. The caller
+  discriminates with `_qry_is_error`, which type-checks `x` against
+  NOVA's `type_of(x) == 3` (list) before indexing into it -- so a
+  parse-result that's an int (the limit, for instance) never tries
+  `x[0]` and segfaults.
+- **Executor**: seeds an empty binding-set, walks each pattern in
+  source order, extending bindings. For `?a kind FACT` with `?a`
+  unbound, iterates every atom matching the predicate; for `?a links
+  ?b`, walks the source atom's `atom_xrefs` (single-KG only, per the
+  R13E PageRank precedent). `FILTER` scopes to the most-recently-bound
+  atom variable (the brief calls this out as the v1.0 semantic --
+  single-pass, simple operator model).
+- **LIMIT**: clamps the result list to N rows; default 100, max 10000.
+
+### Public API
+
+- `kg_query_parse(query_string)` -> `parsed_query_t` | error sentinel
+- `kg_query_execute(kg, parsed_query)` -> list of bindings
+- `kg_query_compile_and_run(kg, query_string)` -> list of bindings | error
+- `kg_query_vars(q) / _patterns / _limit / _is_parsed`
+- Bindings: `binding_new / binding_set / binding_get / binding_has`
+- Errors: `_qry_is_error / qry_error_message`
+
+### Headline results
+
+- **5-FACT + 5-CONCEPT fixture (10 atoms, 5 directional FACT->CONCEPT
+  xrefs)**: `SELECT ?a WHERE { ?a kind FACT . }` -> 5 bindings;
+  `SELECT ?a WHERE { ?a kind CONCEPT . }` -> 5 bindings;
+  `SELECT ?a ?b WHERE { ?a kind FACT . ?a links ?b . }` -> 5
+  (FACT, CONCEPT) pairs.
+- **FILTER on alpha works**: with FACTs at alpha=1000..5000 (one
+  observation each beyond the prior),
+  - `FILTER alpha > 500` -> 5 (all FACTs have alpha >= 1000)
+  - `FILTER alpha > 2500` -> 3 ({3000, 4000, 5000})
+  - `FILTER alpha < 2500` -> 2 ({1000, 2000})
+  - `FILTER alpha = 3000` -> 1
+  - `FILTER alpha != 3000` -> 4
+- **Bad syntax produces graceful errors** (no segfault):
+  - `""` -> `QUERY error=empty query`
+  - `WHERE { ?a kind FACT . }` -> `QUERY error=expected SELECT keyword`
+  - `SELECT ?a WHERE { ?a kind FACT . ` (missing brace) -> `QUERY error=
+    unterminated WHERE block (expected '}')`
+  - `SELECT ?a WHERE { ?a frobnicate FACT . }` -> `QUERY error=unknown
+    predicate: frobnicate`
+  - `SELECT ?a WHERE { ?a kind FACT }` (missing dot) -> `QUERY error=
+    expected '.' after triple, got }`
+- **LIMIT clamps**: LIMIT 3 with 5 matching atoms -> 3 bindings;
+  LIMIT 100 with 5 atoms -> 5 bindings (no overrun).
+- **Two-pattern AND semantics**: `?a kind FACT . ?a kind CONCEPT .`
+  (impossible match -- an atom has one kind) -> 0 bindings.
+- **Live KG dispatch**: on the chat's default seed pack,
+  `/query SELECT ?a WHERE { ?a kind CONCEPT . } LIMIT 3` lands 3
+  bindings (`BINDING 1: a=0`, etc.).
+
+### Hardest engineering problem
+
+NOT the parser (the grammar is small enough that recursive descent
+fits in one screen). The real issue was the `_qry_is_error(x)` helper:
+parse_select / parse_where return `[error_list_or_value_list, pos]`,
+but `_qry_parse_limit` legitimately returns `[100, pos]` (the int
+default LIMIT). Calling `_qry_is_error(100)` then hits `len(100)` ->
+segfault. Fix: `_qry_is_error` now first checks `type_of(x) == 3`
+(NOVA's runtime tag for list) before any indexing. The other gotcha
+was the lex-error sentinel: I originally tagged unrecognised input
+with the byte `<`, but `<` is also a legitimate FILTER operator, so
+the parser was treating every `<` as a lexer error. Tightened the
+sentinel check to require `txt[0] == '<' && txt[-1] == '>' &&
+len(txt) >= 3` -- the legitimate ops are all length 1 or 2 (`<`, `>`,
+`=`, `!=`), so the new pattern only matches actual sentinel strings
+like `<unterm-string>` and `<bad-op>`.
+
+### Out of scope for v1.0 (future rounds)
+
+- OPTIONAL, UNION, MINUS clauses
+- Boolean FILTER composition (`AND`/`OR`/`NOT` inside FILTER)
+- Regex matching (`REGEX(?label, "...")`)
+- ORDER BY, GROUP BY, DISTINCT
+- Aggregates (`COUNT`, `SUM`, `AVG`)
+- Query plan optimization (pattern reordering for selectivity)
+
+### Chat wiring
+
+- 1 import line + 1 dispatch line in `examples/crossengin_chat.nova`
+  (within the +2-line chat budget; help line deferred to leave room
+  for future SPARQL features).
+- `/query` with no arg prints usage + `QUERY store_size=N`; with a
+  query string parses + executes + prints `QUERY bindings=N vars=V
+  limit=L`, up to first 5 `BINDING i: a=X b=Y` rows, then `QUERY_END`.
+
+### Tests (all green)
+
+- 55 unit assertions (`tests/unit/test_kg_query.nova`): parser cases
+  (simple/multi-var/limit/filter/bad-syntax/empty/unknown-predicate),
+  executor cases (5 FACTs / 5 CONCEPTs / two-pattern links / filter
+  > < = != on alpha / LIMIT clamp / impossible match /
+  compile_and_run / empty KG / filter on linked atom), binding
+  helpers, error message extraction.
+- 18 integration assertions (`tests/integration/scenario_kkk_query.sh`):
+  usage line / CONCEPT query / FACT query / two-pattern / FILTER /
+  bad syntax (graceful error, no segfault) / empty WHERE block /
+  unterminated brace / unknown predicate.
+- All existing KG tests pass unchanged (R6F+R8F episodic, R10C
+  semantic, R11F+R12C clustering, R13E PageRank).
+
+## R15C (this session) -- HOG-based sliding-window object detector
+
+**Status: complete -- `src/io/transducers/image_detector.nova` (NEW)
+lands the canonical Dalal-Triggs (CVPR 2005) sliding-window object
+detection pipeline on top of R14D's HOG dense descriptor.** Dalal-
+Triggs trained a linear SVM on the HOG vector of a 64x128 window and
+slid the classifier across the image; positions clearing threshold
+became detections, then non-maximum suppression collapsed overlapping
+windows. CrossEngin's no-training-data design substitutes the SVM with
+TEMPLATE MATCHING via the existing `hog_compare` L1 distance: every
+candidate window's HOG is compared against a single template HOG
+(extracted from a positive example), and windows within a distance
+threshold are accepted. This is the same algorithm that closes
+IMAGE_AUDIT.md's HOG section -- the standard use case the R14D
+descriptor was built for.
+
+### Algorithm (sliding-window HOG matching)
+
+1. `det_train_template(image, w, h, win_w, win_h)` -- compute
+   `hog_compute_default` on the input image (or a centered crop if
+   the requested window is smaller); return the HOG result tuple.
+2. `det_sliding_window(image, w, h, template, threshold_milli,
+                        stride)` -- walk (x, y) over the image at the
+   requested stride; for each candidate window of the template's
+   dimensions, extract the sub-image (`_det_extract_window` copies
+   the rectangle into a fresh alloc + zero terminator), compute its
+   HOG, compare via `hog_compare` (L1 over the L2-Hys-normalized
+   descriptors), and accept the position if distance < threshold.
+   Returns a list of `[x, y, distance]` triples.
+3. `det_nms(detections, box_size, overlap_iou_milli)` -- sort
+   detections by ascending distance and greedily keep each; discard
+   any whose IoU >= overlap_iou_milli/1000 with a kept one. Uses
+   `_det_iou_milli(x1, y1, w1, h1, x2, y2, w2, h2)` for the
+   intersection-over-union math (no float; pure integer ratio).
+4. `det_detect(image, w, h, template, threshold_milli, stride,
+                nms_iou_milli)` -- convenience wrapper that runs
+   sliding-window then NMS with the template's dimensions for the
+   box geometry.
+
+### Public API
+
+- `det_train_template(image, w, h, win_w, win_h) -> hog_result`
+- `det_sliding_window(image, w, h, template, threshold_milli, stride)
+  -> list of [x, y, distance]`
+- `det_nms(detections, box_size, overlap_iou_milli) -> filtered list`
+- `det_detect(image, w, h, template, threshold_milli, stride,
+              nms_iou_milli) -> filtered list of [x, y, distance]`
+- `det_result_x(d) / _y / _distance` -- detection-triple accessors.
+- `det_count_label(count) -> "image_detector_count_<bucket>"` --
+  per-image atom label (none / one / few / many).
+- `det_append_features_if_templated(feats, image, w, h)` -- visual
+  perception integration hook (silent when `CE_VP_DETECT_TEMPLATE`
+  env is unset).
+- `det_pgm_args(arg) -> string` -- chat-orchestration helper for
+  `/detect TEMPLATE.pgm SCENE.pgm`.
+
+### Caps + thresholds
+
+- Image dim <= 256 (DET_MAX_IMAGE_DIM); template dim 16..128
+  (DET_MIN_TEMPLATE_DIM=16, DET_MAX_TEMPLATE_DIM=128); stride
+  clamped to [4, 32]; default stride 8.
+- `DET_DEFAULT_THRESHOLD_MILLI = 4000`: identical-content matches
+  score 0; uniform-background scenes score ~3000 on simple
+  vertical-edge templates -- 4000 sits in the "near-identical" band.
+- `DET_DEFAULT_NMS_IOU_MILLI = 300`: Dalal-Triggs's 0.30 IoU.
+
+### Wire-in
+
+- `visual_perception.nova`: 3-line addition (`import "image_detector.nova"`
+  + 2 lines in `_vp_append_structural_features`) -- emits an
+  `image_detector_count_<bucket>` atom when `CE_VP_DETECT_TEMPLATE`
+  env points at a template PGM path. Silent on every failure (env
+  unset, parse error, dim mismatch, over-cap image) mirroring
+  `stereo_append_features_if_paired`'s contract.
+- `crossengin_chat.nova`: 2-line addition (1 help line, 1 dispatch
+  line). `/detect TEMPLATE.pgm SCENE.pgm` -> output format
+  `(detect N detection(s); T=WxH S=WxH stride=S best=DIST at (X, Y))`
+  on success, `(detect 0 detection(s); T=WxH S=WxH stride=S)` on no
+  matches, parser/dim errors via `(detect FAILED: ...)`.
+
+### Performance budget
+
+- Brute-force quadratic in the candidate-grid count. For a 256x256
+  scene with a 32x32 template at stride 8 the grid is
+  (256-32)/8+1 = 29 across and 29 down = 841 windows. Each window
+  runs `hog_compute_default` on the 32x32 sub-image. The R14D HOG
+  profile estimated ~100 ms per fixture; actual runtime is
+  considerably faster (the 25-window 64x64 scenario completes
+  end-to-end in <100 ms including chat startup). For a 256x256
+  scene budget ~1-5 s realistically.
+
+### Tests
+
+- New unit suite `tests/unit/test_image_detector.nova` (32 assertions)
+  covers:
+  - `det_train_template` returns the expected 324-int descriptor on a
+    32x32 fixture; oversized / undersized / out-of-image / zero-pointer
+    windows return the empty hog_result.
+  - `det_sliding_window` finds the known template position (16, 16)
+    in a 64x64 scene within +/- stride accuracy.
+  - `det_sliding_window` on a uniform-background scene returns 0
+    detections at the default threshold.
+  - `det_sliding_window` with stride 0 clamps to the default (no
+    infinite loop).
+  - `det_sliding_window` with template > image returns 0 (graceful).
+  - `det_sliding_window` with zero-pointer image returns 0.
+  - `det_nms` collapses 3 overlapping detections at the same location
+    to the single lowest-distance survivor.
+  - `det_nms` keeps both of 2 non-overlapping detections (IoU 0).
+  - `det_nms` on empty / 1-element lists is a no-op.
+  - `det_detect` end-to-end finds the known target after NMS.
+  - `det_count_label` bucket round-trip (none / one / few / many).
+- New integration scenario `tests/integration/scenario_jjj_detector.sh`
+  (10 assertions) covers:
+  - `/help` advertises `/detect`.
+  - Usage / one-arg / missing-template / missing-scene / too-small-
+    template error paths each print the expected bracketed line.
+  - Positive scene reports >= 1 detection with best-match at
+    (16, 16) exactly (matching the fixture offset within +/- stride).
+  - Uniform-gray scene reports 0 detections (tolerant: <= 1).
+  - Chat survives all probing and reaches /quit.
+- All existing CV tests pass (R14D HOG 21, Sobel/Canny/SIFT/ORB/
+  Harris/stereo/LK/segmentation/SLIC suites, plus all 170 prior unit
+  tests).
+- Module count: 159 -> 160 (image_detector.nova new).
+
 ## R15A (this session) -- u8 raw-byte SIMD wired into stereo SAD (realizes 5.5x absolute speedup)
 
 **Status: complete -- R14B's `simd_sad_u8(a_ptr, b_ptr, n_bytes)` is
