@@ -11,7 +11,46 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R22F adds `src/io/transducers/audio_melody.nova` — audio
+> toolchain. R23B adds `src/perception/lipsync.nova` — audio-vision
+> lip sync detection. Given a sequence of PGM video frames + an audio WAV,
+> the detector reports whether the speaker on screen is actually saying the
+> words in the audio. Per-frame mouth-open score: lower-third of R16D Haar
+> face box, intensity gradient between a tight central inner rectangle and
+> the surrounding outer rim (open mouths have a dark oral cavity in the
+> centre; closed mouths are uniform skin tone), score in milli with
+> `darkness_score = (mean_outer - mean_inner) * 1000 / mean_outer`. Per-frame
+> audio voicing: PCM sliced into one chunk per video frame, per-chunk energy
+> + ZCR vs a per-chunk-scaled R7F VAD threshold. Pearson-style milli
+> correlation between the two sequences gates a 1/0 verdict against
+> `SYNC_THRESHOLD_MILLI=400`. Catches the gross failure modes R20C sensor
+> fusion's identity match cannot: pre-recorded audio dubbed over silent
+> video, off-camera voice with matching face on screen, sub-frame sync
+> drift. Public API: `lipsync_mouth_open_score`, `lipsync_correlate`,
+> `lipsync_voicing_per_frame`, `lipsync_detect(video_frames, audio_pcm,
+> sample_rate) -> [sync_score_milli, is_synced_bool]`, `lipsync_pgm_args`
+> (chat /lipsync entry; loads `frame_001.pgm`..`frame_NNN.pgm` from a
+> directory + a WAV). Verification: 41 unit assertions in
+> `tests/unit/test_lipsync.nova` (NEW; mouth-open score on synthesised open
+> / closed / uniform / bright-interior / null / OOB fixtures; correlation
+> on identical=1000, anti-correlated=-1000, random near zero, empty /
+> length-mismatched / zero-variance / single-element SENTINEL; voicing on
+> silence=all zeros, voiced PCM=some ones; lipsync_detect on matched=
+> is_synced=true score=1000, mismatched=is_synced=false score=0, empty /
+> null / bad-rate SENTINEL; chat format on sentinel + well-formed + null;
+> public constants + accessor round-trip). 12 integration assertions in
+> `tests/integration/scenario_llll_lipsync.sh` (NEW; 5-frame PGM fixture
+> open/closed/open/closed/open + matched and mismatched WAVs synthesised by
+> a one-off NOVA driver; matched -> is_synced=true sync_score_milli=1000;
+> mismatched -> is_synced=false sync_score_milli=0; missing dir / WAV /
+> args -> graceful error; threshold printed for operator interpretation).
+> Honest scope: heuristic lower-third mouth ROI + intensity gradient is
+> fragile on real photos (beard / teeth / side-on); R23B.2 follow-up
+> swaps in a learned lip landmark localizer behind the same public API.
+> All prior perception tests stay green (R20C sensor_fusion 25, R16D
+> face_detect 36, R7F VAD 86, R10F pitch 52). Chat: `/lipsync DIR W.wav`
+> admin command wired into `examples/crossengin_chat.nova` (1 import +
+> 1 dispatch + 1 help line). Module count: +1.
+> R22F adds `src/io/transducers/audio_melody.nova` — audio
 > melody extraction lifting per-frame F0 estimates (R10F autocorrelation,
 > R11B YIN) into a symbolic MIDI note sequence with start/end times. R10F
 > + R11B answer "what is the pitch in frame i?"; R22F answers "what notes

@@ -2325,3 +2325,92 @@ FAILED: could not parse WAV at /tmp/x.wav)`.
   file output. A SMF (Standard MIDI File) writer would let the
   substrate emit playable .mid files; combined with R21C TTS this
   closes the music-IO loop.
+
+## R23B -- audio-vision lip sync detection (audio side)
+
+The R23B audio-vision lip sync detector lives under
+`src/perception/lipsync.nova` (the image side carries the same
+prose in IMAGE_AUDIT.md). This entry documents only the AUDIO
+contract -- how the lip sync correlator consumes the existing
+audio stack and what it expects out of the VAD voicing signal.
+
+The audio side of the pipeline:
+
+1. **PCM input.** `lipsync_pgm_args` calls
+   `audio_capture_to_pcm(wav_path)` (R7F module), getting back
+   the canonical [samples_list, sample_rate] pair. Any 8/16/24/32/
+   44.1/48 kHz WAV that audio_capture parses cleanly works as
+   input. The detector requires `len(samples) >= n_frames` (one
+   audio chunk per video frame); shorter WAVs report a graceful
+   "WAV has fewer samples than frames" error.
+
+2. **Per-frame chunking.** The detector slices the PCM into
+   `n_frames` equal-length chunks (where `n_frames = len(video_frames)`).
+   Each chunk's energy + ZCR is classified against a per-chunk
+   threshold scaled from the canonical R7F 30 ms VAD frame
+   threshold (`50000 * frame_size / 240`). The per-chunk re-scaling
+   is what makes lipsync work on short fixtures: a 5-frame video at
+   30 fps means ~167 ms per chunk, well above 30 ms; without the
+   re-scaling the per-frame energy would saturate the threshold
+   and every chunk would land in "speech" regardless of content.
+
+3. **Voicing flag per chunk.** `vad_classify_frame(state, energy, zcr)`
+   contract: speech iff `energy > threshold AND 0 < zcr < zcr_max`.
+   The lip sync correlator wants the 0/1 flag; it does NOT consume
+   the higher-level R7F state machine (which would smear speech /
+   silence across boundaries -- a feature in VAD-gated capture, a
+   bug in per-frame correlation).
+
+### Why the energy + ZCR VAD specifically (vs R10F pitch voicing)
+
+R10F's pitch_track_with_bounds + pitch_result_voicing_milli also
+gives a per-frame voicing flag (this time as a milli confidence,
+not 0/1). Either would work for lipsync correlation. R23B picks
+energy + ZCR because:
+  * It's cheaper (O(n) per chunk vs O(n^2) autocorrelation in
+    R10F).
+  * It fires on unvoiced phonemes (fricatives like /s/ /sh/ /f/),
+    which DO open the mouth even though the larynx is not
+    vibrating. R10F's voicing field would report silence on
+    /s/, missing a real lip-sync event.
+  * The lipsync window is much coarser than R10F's pitch tracking
+    needs to be (~30 fps vs the per-30-ms-frame F0 estimate that
+    R10F + R11B target). The extra resolution from autocorrelation
+    is not useful information for the correlator.
+
+### Why not the R7F state machine
+
+The R7F audio_vad state machine (SILENCE -> SPEECH_CANDIDATE ->
+SPEECH -> SILENCE_CANDIDATE) smears classifications across
+boundaries: a single noisy frame inside a speech segment stays
+classified as "speech" because the state machine's hysteresis
+prefers to maintain the segment. This is correct for VAD-gated
+capture (we don't want to chop one utterance into 50 pieces just
+because one phoneme is quieter than its neighbours) but wrong for
+per-frame correlation: it would put the correlator's voicing
+sequence systematically out of phase with the actual energy /
+zcr signal.
+
+The detector therefore uses `vad_frame_energy` + `vad_frame_zcr`
++ a local `vad_classify_frame`-equivalent (with per-chunk-scaled
+threshold) and ignores the state machine.
+
+### Honest scope -- what R23B does NOT ship (audio side)
+
+* No phoneme-level alignment. A real audio-to-mouth coupling
+  predicts a SPECIFIC mouth shape for each phoneme (a wide-open
+  /aa/ vs a pursed /oo/ vs a closed-lips /m/). R23B's heuristic
+  detector only knows "mouth open vs closed"; it cannot
+  distinguish between an /aa/ vs an /oo/ vs an /uh/ at the same
+  voicing level. The R23B.2 follow-up would replace the binary
+  voicing flag with a per-frame phoneme estimate (a learned
+  audio-visual joint embedding, e.g. SyncNet's bilinear bottleneck)
+  and the binary mouth-open score with a continuous mouth-shape
+  classification.
+* No lip-onset detection. A real lip-sync detector would also
+  measure the LATENCY between audio voicing onset and mouth-
+  opening onset; lip sync drift in a streaming pipeline often
+  appears as a constant +/- 100ms offset between the two streams.
+  The correlator currently treats both streams as instantaneous;
+  a future revision could pre-shift the audio by +/- N frames and
+  pick the lag that maximises correlation.

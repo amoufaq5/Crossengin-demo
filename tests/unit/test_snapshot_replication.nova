@@ -1,0 +1,353 @@
+// Unit tests for src/federation/snapshot_replication.nova (R23C).
+//
+// Coverage:
+//   sr_init produces a clean state (gossip, dir, empty tables, zero
+//     counters).
+//   sr_observe_attestation registers a new root; duplicate is a no-op.
+//   sr_pending_count / sr_fetch_pending count known-but-missing.
+//   sr_local_snapshots empty on fresh state; populated after register.
+//   sr_register_local stores bytes + idempotent on same root.
+//   sr_serve_snap_request hit returns bytes; miss returns 0.
+//   sr_observe_snap_response: legit bytes verify against expected root
+//     -> stored; tampered bytes -> rejected; unknown root -> rejected;
+//     truncated bytes -> rejected; garbage bytes -> rejected.
+//   Already-have-root: sr_have_root true; no fetch generated.
+//   Wire codec: sr_make_fetch_line / sr_parse_fetch_line round-trip.
+//   sr_status_line format.
+
+import "../ce_test.nova"
+import "../../src/federation/snapshot_replication.nova"
+import "../../src/federation/snapshot_attestation.nova"
+import "../../src/safety/ed25519.nova"
+import "../../src/persistence/snapshot_writer.nova"
+import "../../src/persistence/snapshot_disk.nova"
+
+// ---- fixtures ------------------------------------------------------------
+
+// RFC 8032 test vector seed (matches test_snapshot_attestation).
+let _T_SR_SEED_HEX = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+
+fn _t_keypair() {
+    let seed = ed25519_hex_to_bytes(_T_SR_SEED_HEX)
+    let parts = _ed_derive_a_and_prefix(seed)
+    let pk = _ed_pk_from_a(parts[0])
+    let r = list_new()
+    push(r, seed)
+    push(r, pk)
+    return r
+}
+
+// Build a tiny snapshot suitable for replication: empty KGS (root =
+// SHA-256(""), the canonical empty-tree sentinel). The snapshot's
+// text form is what gets transmitted on the wire.
+fn _t_build_snap() {
+    let s = snap_new(1, 1700000000)
+    let sb = list_new()
+    push(sb, "Aurora")
+    push(sb, 0)
+    snap_put_section(s, SEC_SOUL, sb)
+    let kb = list_new()
+    push(kb, 0)
+    push(kb, list_new())
+    snap_put_section(s, SEC_KGS, kb)
+    return s
+}
+
+// The empty-tree Merkle root: SHA-256(""). This is what
+// merkle_root_for_kgs_blob returns for the snapshot built above and
+// what snap_to_text stamps into meta.merkle_root.
+let _T_EMPTY_ROOT_HEX = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+fn _t_attestation(soul_id, ts_ns) {
+    let kp = _t_keypair()
+    return att_make_from_hex(soul_id, ts_ns, _T_EMPTY_ROOT_HEX, kp[0], kp[1])
+}
+
+fn _t_snap_bytes() {
+    let s = _t_build_snap()
+    return snap_to_text(s)
+}
+
+// ---- sr_init -------------------------------------------------------------
+
+fn test_sr_init_empty_state() {
+    let sr = sr_init(0, "/tmp/ce_sr_test")
+    ce_check("sr non-zero", sr != 0)
+    ce_eq("known root count 0", sr_known_root_count(sr), 0)
+    ce_eq("replica count 0", sr_replica_count(sr), 0)
+    ce_eq("pending count 0", sr_pending_count(sr), 0)
+    ce_eq("fetched stat 0", sr_stats_fetched(sr), 0)
+    ce_eq("verify_fail stat 0", sr_stats_verify_fail(sr), 0)
+    ce_eq("observed stat 0", sr_stats_observed(sr), 0)
+    ce_check("local dir stored",
+             str_eq(sr_local_dir(sr), "/tmp/ce_sr_test") == 1)
+    ce_check("local snapshots empty", len(sr_local_snapshots(sr)) == 0)
+}
+
+// ---- sr_observe_attestation ---------------------------------------------
+
+fn test_sr_observe_attestation_registers_root() {
+    let sr = sr_init(0, "/tmp/ce_sr_test")
+    let att = _t_attestation(7, 1700000000000000000)
+    ce_check("att built", att != 0)
+    let newly = sr_observe_attestation(sr, att)
+    ce_eq("newly registered = 1", newly, 1)
+    ce_eq("known count = 1", sr_known_root_count(sr), 1)
+    ce_eq("pending count = 1", sr_pending_count(sr), 1)
+    ce_eq("observed stat = 1", sr_stats_observed(sr), 1)
+    let kr = sr_known_roots(sr)
+    ce_check("known_roots non-empty", len(kr) >= 1)
+    ce_check("known root_hex matches",
+             str_eq(kr[0][0], _T_EMPTY_ROOT_HEX) == 1)
+    ce_eq("known peer_id = 7", kr[0][1], 7)
+    ce_eq("known ts_ns = stamp", kr[0][2], 1700000000000000000)
+}
+
+fn test_sr_observe_duplicate_is_noop() {
+    let sr = sr_init(0, "")
+    let att = _t_attestation(7, 100)
+    sr_observe_attestation(sr, att)
+    let again = sr_observe_attestation(sr, att)
+    ce_eq("duplicate observe returns 0", again, 0)
+    ce_eq("known count stays at 1", sr_known_root_count(sr), 1)
+}
+
+fn test_sr_observe_zero_inputs() {
+    let sr = sr_init(0, "")
+    ce_eq("zero sr => 0", sr_observe_attestation(0, _t_attestation(1, 1)), 0)
+    ce_eq("zero att => 0", sr_observe_attestation(sr, 0), 0)
+}
+
+// ---- sr_fetch_pending / pending_count ------------------------------------
+
+fn test_sr_pending_count_initially_zero() {
+    let sr = sr_init(0, "")
+    ce_eq("fresh state pending = 0", sr_fetch_pending(sr), 0)
+}
+
+fn test_sr_fetch_pending_after_observe() {
+    let sr = sr_init(0, "")
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    ce_eq("after 1 observe, pending = 1", sr_fetch_pending(sr), 1)
+    let tasks = sr_pending_fetch_tasks(sr)
+    ce_eq("1 pending task", len(tasks), 1)
+    ce_check("task root matches",
+             str_eq(tasks[0][0], _T_EMPTY_ROOT_HEX) == 1)
+    ce_eq("task peer_id matches", tasks[0][1], 7)
+}
+
+// ---- sr_register_local ---------------------------------------------------
+
+fn test_sr_register_local_stores_bytes() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    let ok = sr_register_local(sr, _T_EMPTY_ROOT_HEX, 99, 12345, bytes)
+    ce_eq("register returns 1", ok, 1)
+    ce_eq("replica count = 1", sr_replica_count(sr), 1)
+    ce_eq("known count = 1 (self-entry)", sr_known_root_count(sr), 1)
+    let ok2 = sr_register_local(sr, _T_EMPTY_ROOT_HEX, 99, 12345, bytes)
+    ce_eq("second register still returns 1", ok2, 1)
+    ce_eq("replica count stays at 1", sr_replica_count(sr), 1)
+}
+
+fn test_sr_register_local_bad_root_hex_rejected() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    ce_eq("non-hex root rejected",
+          sr_register_local(sr, "not_a_root_hex", 99, 1, bytes), 0)
+    ce_eq("short root rejected",
+          sr_register_local(sr, "deadbeef", 99, 1, bytes), 0)
+    ce_eq("zero bytes rejected",
+          sr_register_local(sr, _T_EMPTY_ROOT_HEX, 99, 1, 0), 0)
+}
+
+// ---- sr_serve_snap_request -----------------------------------------------
+
+fn test_sr_serve_returns_bytes_on_hit() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    sr_register_local(sr, _T_EMPTY_ROOT_HEX, 99, 1, bytes)
+    let served = sr_serve_snap_request(sr, _T_EMPTY_ROOT_HEX)
+    ce_check("served non-zero", served != 0)
+    ce_eq("served bytes same length", len(served), len(bytes))
+}
+
+fn test_sr_serve_returns_zero_on_miss() {
+    let sr = sr_init(0, "")
+    let served = sr_serve_snap_request(sr, _T_EMPTY_ROOT_HEX)
+    ce_eq("miss returns 0", served, 0)
+    ce_eq("bad hex returns 0", sr_serve_snap_request(sr, "abc"), 0)
+}
+
+// ---- sr_observe_snap_response: verify path -------------------------------
+
+fn test_sr_observe_response_legit_bytes_stored() {
+    let sr = sr_init(0, "")
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    ce_eq("pending = 1 before fetch", sr_pending_count(sr), 1)
+    let bytes = _t_snap_bytes()
+    let stored = sr_observe_snap_response(sr, _T_EMPTY_ROOT_HEX, bytes)
+    ce_eq("legit bytes stored = 1", stored, 1)
+    ce_eq("replica count = 1", sr_replica_count(sr), 1)
+    ce_eq("fetched stat = 1", sr_stats_fetched(sr), 1)
+    ce_eq("verify_fail stat = 0", sr_stats_verify_fail(sr), 0)
+    ce_eq("pending = 0 after fetch", sr_pending_count(sr), 0)
+    ce_eq("have_root = 1", sr_have_root(sr, _T_EMPTY_ROOT_HEX), 1)
+}
+
+fn test_sr_observe_response_tampered_rejected() {
+    let sr = sr_init(0, "")
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    // Build a SHAPE-valid but content-different snapshot whose
+    // meta.merkle_root won't match the expected empty-tree root.
+    let other_snap = snap_new(2, 1700000099)
+    let sb2 = list_new()
+    push(sb2, "Borealis")
+    push(sb2, 0)
+    snap_put_section(other_snap, SEC_SOUL, sb2)
+    let recs = list_new()
+    let atom = list_new()
+    push(atom, "lang")
+    push(atom, 1)
+    push(atom, 1)
+    push(atom, "tampered")
+    push(atom, 1)
+    push(atom, 1)
+    push(recs, atom)
+    let kb2 = list_new()
+    push(kb2, 1)
+    push(kb2, recs)
+    snap_put_section(other_snap, SEC_KGS, kb2)
+    let tampered = snap_to_text(other_snap)
+    let stored = sr_observe_snap_response(sr, _T_EMPTY_ROOT_HEX, tampered)
+    ce_eq("tampered (content-mismatch) bytes => 0", stored, 0)
+    ce_eq("replica count stays 0", sr_replica_count(sr), 0)
+    ce_eq("verify_fail incremented", sr_stats_verify_fail(sr), 1)
+    ce_eq("fetched stat stays 0", sr_stats_fetched(sr), 0)
+}
+
+fn test_sr_observe_response_garbage_bytes_rejected() {
+    let sr = sr_init(0, "")
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    let garbage = "this is not a snapshot it is garbage\n"
+    let stored = sr_observe_snap_response(sr, _T_EMPTY_ROOT_HEX, garbage)
+    ce_eq("garbage bytes => 0", stored, 0)
+    ce_eq("verify_fail incremented for garbage", sr_stats_verify_fail(sr), 1)
+    ce_eq("replica count stays 0 for garbage", sr_replica_count(sr), 0)
+}
+
+fn test_sr_observe_response_truncated_rejected() {
+    let sr = sr_init(0, "")
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    let bytes = _t_snap_bytes()
+    // Chop off the trailing "end\n" (4 bytes) so the end-line check
+    // fails -- a truncated wire stream the receiver must refuse.
+    let truncated = substr(bytes, 0, len(bytes) - 4)
+    let stored = sr_observe_snap_response(sr, _T_EMPTY_ROOT_HEX, truncated)
+    ce_eq("truncated bytes => 0", stored, 0)
+    ce_eq("verify_fail incremented for truncation", sr_stats_verify_fail(sr), 1)
+}
+
+fn test_sr_observe_response_unknown_root_rejected() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    let stored = sr_observe_snap_response(sr, _T_EMPTY_ROOT_HEX, bytes)
+    ce_eq("unknown root => 0", stored, 0)
+    ce_eq("verify_fail incremented", sr_stats_verify_fail(sr), 1)
+    ce_eq("replica count stays 0", sr_replica_count(sr), 0)
+}
+
+// ---- already-have-root: no fetch generated ------------------------------
+
+fn test_sr_already_have_root_no_pending() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    sr_register_local(sr, _T_EMPTY_ROOT_HEX, 99, 1, bytes)
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    ce_eq("known count stays at 1", sr_known_root_count(sr), 1)
+    ce_eq("pending = 0 (we already have it)", sr_pending_count(sr), 0)
+    let tasks = sr_pending_fetch_tasks(sr)
+    ce_eq("0 pending tasks", len(tasks), 0)
+}
+
+// ---- enumeration helpers -------------------------------------------------
+
+fn test_sr_local_snapshots_returns_registered() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    sr_register_local(sr, _T_EMPTY_ROOT_HEX, 42, 1700000001, bytes)
+    let ls = sr_local_snapshots(sr)
+    ce_eq("1 local snapshot", len(ls), 1)
+    ce_check("local root_hex matches",
+             str_eq(ls[0][0], _T_EMPTY_ROOT_HEX) == 1)
+    ce_eq("local peer_id = 42", ls[0][1], 42)
+    ce_eq("local ts_ns matches", ls[0][2], 1700000001)
+}
+
+// ---- wire codec ----------------------------------------------------------
+
+fn test_sr_fetch_line_round_trip() {
+    let line = sr_make_fetch_line(_T_EMPTY_ROOT_HEX)
+    ce_check("line starts with SNAP_FETCH",
+             str_eq(substr(line, 0, 11), "SNAP_FETCH ") == 1)
+    let parsed = sr_parse_fetch_line(line)
+    ce_check("round-trip hex matches",
+             str_eq(parsed, _T_EMPTY_ROOT_HEX) == 1)
+}
+
+fn test_sr_parse_fetch_rejects_bad_shapes() {
+    ce_check("empty fetch line => empty",
+             str_eq(sr_parse_fetch_line(""), "") == 1)
+    ce_check("wrong prefix => empty",
+             str_eq(sr_parse_fetch_line("PING 1 127.0.0.1:9000"), "") == 1)
+    ce_check("too few tokens => empty",
+             str_eq(sr_parse_fetch_line("SNAP_FETCH"), "") == 1)
+    ce_check("non-hex root => empty",
+             str_eq(sr_parse_fetch_line("SNAP_FETCH NOT_HEX_64"), "") == 1)
+}
+
+// ---- status line --------------------------------------------------------
+
+fn test_sr_status_line_shape() {
+    let sr = sr_init(0, "")
+    let line = sr_status_line(sr)
+    ce_check("status starts with 'sr:'",
+             str_eq(substr(line, 0, 3), "sr:") == 1)
+    sr_observe_attestation(sr, _t_attestation(7, 100))
+    let line2 = sr_status_line(sr)
+    let has_known_1 = 0
+    let i = 0
+    while i + 7 < len(line2) {
+        if str_eq(substr(line2, i, 8), "known=1 ") == 1 { has_known_1 = 1 }
+        i = i + 1
+    }
+    ce_eq("status reflects known=1", has_known_1, 1)
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    test_sr_init_empty_state()
+    test_sr_observe_attestation_registers_root()
+    test_sr_observe_duplicate_is_noop()
+    test_sr_observe_zero_inputs()
+    test_sr_pending_count_initially_zero()
+    test_sr_fetch_pending_after_observe()
+    test_sr_register_local_stores_bytes()
+    test_sr_register_local_bad_root_hex_rejected()
+    test_sr_serve_returns_bytes_on_hit()
+    test_sr_serve_returns_zero_on_miss()
+    test_sr_observe_response_legit_bytes_stored()
+    test_sr_observe_response_tampered_rejected()
+    test_sr_observe_response_garbage_bytes_rejected()
+    test_sr_observe_response_truncated_rejected()
+    test_sr_observe_response_unknown_root_rejected()
+    test_sr_already_have_root_no_pending()
+    test_sr_local_snapshots_returns_registered()
+    test_sr_fetch_line_round_trip()
+    test_sr_parse_fetch_rejects_bad_shapes()
+    test_sr_status_line_shape()
+    ce_summary("test_snapshot_replication")
+}
+
+main()

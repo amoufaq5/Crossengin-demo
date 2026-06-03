@@ -2090,3 +2090,154 @@ HOG integral 42). Module count: +1
   checkerboard-halves fixture).
 * `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
   help line (3 lines net).
+
+## R23B -- audio-vision lip sync detection (structural pipeline + heuristic detector)
+
+CrossEngin already independently perceives a face on screen (R16D
+Haar cascade + R18D LBP gallery identity) and independently classifies
+audio voicing (R7F/R9B energy+ZCR VAD, R10F pitch voicing field).
+R20C ships the cross-modal binding primitive (image observation +
+audio observation -> fused atom). Missing leg: does the FACE on
+screen actually drive the AUDIO being heard? R23B closes the gap.
+
+The motivating failure modes:
+  * Pre-recorded audio dubbed over a silent video frame stream
+    (a fixed image with audio voiceover).
+  * A single speaker on camera while an off-camera voice is being
+    recorded (visual identity matches, but the lips do not move
+    when the audio is voiced).
+  * Sync drift in a streaming pipeline (audio buffer lags video
+    buffer by hundreds of milliseconds).
+
+All three of these pass the R20C identity + temporal-window match
+(face=alice, speaker=alice, same timestamp) but the lip movement
+does NOT actually agree with the audio voicing pattern. R23B's
+heuristic correlator catches them.
+
+### Algorithm (heuristic, no learned model)
+
+1. Per-frame mouth detection. For each video frame the R16D Haar
+   cascade locates the face bounding box; the mouth region is
+   heuristically the lower-third of that box (rows
+   `[fy + 2*fs/3 .. fy + fs)`). Mouth landmark localization
+   (corner detection + opening-width via lip-specific texture)
+   requires a learned landmark model and is documented as the
+   R23B.2 follow-up.
+
+2. Mouth-open metric. Open mouths have a dark interior (oral
+   cavity); closed mouths have near-uniform skin tone. Score:
+     `darkness_score = (mean_outer - mean_inner) * 1000 / mean_outer`
+   where "inner" is the central 50% width x 30% height rectangle
+   of the mouth region (a tight box around where lips meet) and
+   "outer" is the surrounding rim (chin + lip surround). Saturates
+   to 0 if the interior is brighter than the rim (not an opening,
+   just a bright lower lip / mustache / lighting artifact).
+
+3. Audio voicing per frame. Slice the PCM into `n_frames` equal
+   chunks (default 30 fps); per chunk compute
+   `vad_frame_energy + vad_frame_zcr` and classify against an
+   energy threshold scaled to the chunk size (the canonical
+   30 ms VAD frame threshold is `50000 * frame_size / 240`; we
+   re-derive per-chunk so a 100 ms chunk is not always classified
+   as silence). Yields a 0/1 voicing flag per video frame.
+
+4. Sliding-window correlation. Pearson-style correlation in milli
+   between the per-frame mouth-open score sequence and the
+   per-frame voicing sequence. Computed via the standard
+   alternative formula with N-scaling so the integer math stays
+   exact through an integer square-root step. Final
+   `sync_score_milli = max(0, corr_milli)` (anti-correlated
+   streams are NOT synced; lip sync wants same-sign agreement,
+   not just statistical dependence).
+
+5. Threshold. `SYNC_THRESHOLD_MILLI = 400` (Pearson r >= 0.40).
+   Matched fixtures score 1000 (perfect); anti-correlated fixtures
+   score 0 (clamped from -1000); randomized fixtures sit near 500
+   uncorrelated baseline. The 400 threshold leaves margin for
+   real-world noise (face detection wobble, VAD borderline frames,
+   sub-frame audio drift).
+
+### Public API
+
+* `lipsync_mouth_open_score(image, w, h, face_bbox) -> int_milli`
+* `lipsync_correlate(video_scores, audio_voicing) -> int_milli`
+* `lipsync_voicing_per_frame(pcm, sample_rate, n_frames) -> [0/1, ...]`
+* `lipsync_detect(video_frames, audio_pcm, sample_rate) -> [sync_score, is_synced]`
+* `lipsync_pgm_args(arg) -> string` (chat /lipsync entry; loads
+  `frame_001.pgm..frame_NNN.pgm` from a directory + a WAV).
+* Constructors: `lipsync_video_frame`, `lipsync_make_bbox`.
+* Accessors: `lipsync_frame_*`, `lipsync_bbox_*`, `lipsync_result_*`.
+* Constants: `lipsync_sync_threshold_milli`, `lipsync_score_max`,
+  `lipsync_default_fps`, `lipsync_corr_sentinel`,
+  `lipsync_score_sentinel`.
+
+### Honest scope -- what R23B does NOT ship
+
+The heuristic mouth-open score is structural, not perceptual. It
+treats the lower-third of every face box as "the mouth" and
+measures intensity-gradient contrast between a tight central box
+and the surrounding rim. This works on synthesised fixtures (a
+bright skin-tone face with a dark interior patch reads as "mouth
+open" with score 1000) but is fragile on real photographs:
+  * A beard / mustache darkens the rim, suppressing the contrast.
+  * A wide-open smile with bright teeth inverts the interior /
+    exterior darkness order (teeth visible in the inner box ->
+    bright interior, score clamps to 0).
+  * Side-on faces violate the lower-third assumption (the mouth
+    sits in the rightmost or leftmost vertical band, not the
+    lower band).
+  * Sub-frame motion blur smears the interior box across multiple
+    intensity bands.
+
+R23B.2 follow-up: replace the lower-third heuristic with a learned
+lip landmark localizer (Praat-style six-landmark mouth model, or a
+distilled MediaPipe FaceLandmarker subset) that gives the actual
+upper-lip / lower-lip / mouth-corner coordinates. The correlator +
+threshold + chat plumbing stay; only the per-frame score helper
+gets swapped.
+
+### Validation
+
+* `tests/unit/test_lipsync.nova` -- 41 assertions across 26 test
+  functions covering: mouth-open score on synthesised open / closed
+  / uniform / bright-interior / null / OOB fixtures; correlation
+  on identical / anti-correlated / random / empty / length-mismatched
+  / zero-variance / single-element sequences; voicing-per-frame on
+  silence / voiced PCM / zero-frame requests; end-to-end
+  `lipsync_detect` on synthesised matched + mismatched fixtures
+  (matched -> is_synced=true at score 1000; mismatched ->
+  is_synced=false at score 0); chat helper formatting on sentinel /
+  well-formed / null inputs; public constant stability; frame +
+  bbox accessor round-trip.
+* `tests/integration/scenario_llll_lipsync.sh` -- 12 assertions
+  exercising the chat /lipsync round-trip against a 5-frame PGM
+  fixture (frames 1, 3, 5 open; frames 2, 4 closed) + matched /
+  mismatched WAVs synthesised via a one-off NOVA fixture writer
+  (250 Hz sawtooth voiced chunks alternated with pure-zero silence
+  chunks). Matched fixture reports `is_synced=true sync_score=1000`;
+  mismatched fixture reports `is_synced=false sync_score=0`.
+* All prior perception tests stay green (R20C sensor_fusion 25,
+  R16D face_detect 36, R7F+R9B VAD, R10F pitch). Module count: +1
+  (`src/perception/lipsync.nova` NEW).
+
+### Files touched / added
+
+* `src/perception/lipsync.nova` -- NEW (~600 lines: module docs +
+  threshold / sentinel / score-max / default-fps constants + video
+  frame tuple constructor + accessors + bbox constructor + accessors
+  + `_lipsync_mean_in_rect` + `_lipsync_sum_in_rect` +
+  `lipsync_mouth_open_score` (heuristic intensity-gradient mouth
+  detector) + `_lipsync_isqrt` (Newton integer sqrt) +
+  `lipsync_correlate` (Pearson-style milli) +
+  `lipsync_voicing_per_frame` (chunk-scaled VAD) + `lipsync_detect`
+  (end-to-end) + `lipsync_chat_format` + `_lipsync_digit` +
+  `_lipsync_frame_path` + `_lipsync_load_pgm_frames` +
+  `_lipsync_split_arg` + `lipsync_pgm_args` chat admin entry).
+* `tests/unit/test_lipsync.nova` -- NEW (26 test functions /
+  41 assertions).
+* `tests/integration/scenario_llll_lipsync.sh` -- NEW (12
+  assertions; chat-driven end-to-end check on synthesised PGM frame
+  fixtures + WAV fixtures generated by a one-off NOVA driver).
+* `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line (3 lines net; matches R22F melody / R22D panorama
+  precedent).
