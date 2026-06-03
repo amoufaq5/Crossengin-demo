@@ -1,0 +1,654 @@
+// CrossEngin persistence: Merkle-tree tamper-evident atom-hash chain (R15E).
+//
+// Purpose
+//   The snapshot pipeline so far emits an addressable, line-oriented v2
+//   container (R5D), supports schema evolution (R8E), persists episodic
+//   atoms (R6F), and writes incremental deltas (R13F). What was missing
+//   from the durability story is TAMPER DETECTION: an operator (friendly
+//   or otherwise) could edit a single byte in a snapshot file on disk and
+//   the substrate would happily rehydrate the modified state with no
+//   indication anything was off.
+//
+//   This module bolts a Merkle tree onto the snapshot pipeline:
+//
+//     leaf_i = SHA-256(canonical_atom_bytes_i)
+//     node   = SHA-256(left_hash || right_hash)     (pairwise hash)
+//     root   = single-element top of the pair-and-hash recursion
+//
+//   For odd leaf counts at any level, the last leaf is duplicated for
+//   pairing (Bitcoin convention; same convention every other production
+//   Merkle in this repo will eventually follow). The root is a 32-byte
+//   tamper-evident summary: ANY single-bit edit to ANY atom changes the
+//   root with overwhelming probability (SHA-256's collision resistance).
+//
+//   An inclusion PROOF for atom i is the list of sibling hashes along
+//   the path from leaf_i up to the root, each tagged with the direction
+//   (left/right) the sibling sits on. A verifier with the proof, the
+//   atom, and the expected root can confirm membership in O(log N) hash
+//   ops without touching the rest of the tree -- the property that makes
+//   Merkle attractive for log shipping, federation, light clients, etc.
+//
+// Wire-in
+//   `snapshot_writer.nova` (snap_to_text) computes the root over the
+//   serialized KGS atom records and emits an OPTIONAL `meta.merkle_root
+//   <hex>` line in the v2 meta block. Older readers ignore the line
+//   (forward-compat). A new reader, when `CE_SNAPSHOT_VERIFY_MERKLE=1`
+//   is set, recomputes the root over the parsed records and bails if
+//   they disagree -- the "load detects tampering" path.
+//
+//   The chat surface adds `/snap_verify [PATH]`, which loads the file,
+//   recomputes the root over the in-memory KG, and reports
+//   `verified | TAMPERED` against the meta line.
+//
+// Self-contained SHA-256
+//   To avoid pulling noise_xk's bignum_2048 / chacha20 / poly1305 chain
+//   into the persistence layer (which the daemon already imports), this
+//   module SHIPS A LOCAL SHA-256 (FIPS 180-4). It is byte-identical to
+//   noise_xk's `sha256_buf` (both are the spec); the duplication is
+//   intentional, keeping persistence's import graph minimal. A unit test
+//   ties the two together by comparing the standard FIPS test vectors.
+//
+// ADRs touched: ADR-0048 (persistence container -- the meta block grows
+//   an optional line, same pattern R8E used). NOVA dependencies:
+//   builtins only (alloc/store8/load8/int_*/list ops). CrossEngin
+//   dependencies: none (intentionally).
+
+import "std/io"
+
+// ============================================================================
+//                          Local SHA-256 (FIPS 180-4)
+// ============================================================================
+//
+// Pure-NOVA SHA-256. Byte-identical to noise_xk's `sha256_buf` -- the
+// duplication is intentional (keeps persistence's import graph minimal).
+// 32-bit unsigned helpers follow the same mask pattern as chacha20.
+
+let _MK_HASH_LEN  = 32
+let _MK_MASK32    = 4294967295
+let _MK_BLOCK_LEN = 64
+
+fn _mk_mask32(x) { return int_and(x, _MK_MASK32) }
+fn _mk_add32(a, b) { return _mk_mask32(int_add(a, b)) }
+fn _mk_xor32(a, b) { return _mk_mask32(int_xor(a, b)) }
+fn _mk_and32(a, b) { return _mk_mask32(int_and(a, b)) }
+fn _mk_or32(a, b)  { return _mk_mask32(int_or(a, b)) }
+fn _mk_not32(x)    { return _mk_mask32(int_xor(x, _MK_MASK32)) }
+
+fn _mk_rotr32(x, n) {
+    let right = int_shr(x, n)
+    let left  = _mk_mask32(int_shl(x, 32 - n))
+    return _mk_mask32(int_or(right, left))
+}
+
+fn _mk_load_be32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return _mk_mask32(v)
+}
+
+fn _mk_store_be32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+// FIPS 180-4 K constants -- first 32 bits of the fractional cube roots
+// of the first 64 primes 2..311.
+fn _mk_k(i) {
+    if i ==  0 { return 1116352408 }
+    if i ==  1 { return 1899447441 }
+    if i ==  2 { return 3049323471 }
+    if i ==  3 { return 3921009573 }
+    if i ==  4 { return 961987163 }
+    if i ==  5 { return 1508970993 }
+    if i ==  6 { return 2453635748 }
+    if i ==  7 { return 2870763221 }
+    if i ==  8 { return 3624381080 }
+    if i ==  9 { return 310598401 }
+    if i == 10 { return 607225278 }
+    if i == 11 { return 1426881987 }
+    if i == 12 { return 1925078388 }
+    if i == 13 { return 2162078206 }
+    if i == 14 { return 2614888103 }
+    if i == 15 { return 3248222580 }
+    if i == 16 { return 3835390401 }
+    if i == 17 { return 4022224774 }
+    if i == 18 { return 264347078 }
+    if i == 19 { return 604807628 }
+    if i == 20 { return 770255983 }
+    if i == 21 { return 1249150122 }
+    if i == 22 { return 1555081692 }
+    if i == 23 { return 1996064986 }
+    if i == 24 { return 2554220882 }
+    if i == 25 { return 2821834349 }
+    if i == 26 { return 2952996808 }
+    if i == 27 { return 3210313671 }
+    if i == 28 { return 3336571891 }
+    if i == 29 { return 3584528711 }
+    if i == 30 { return 113926993 }
+    if i == 31 { return 338241895 }
+    if i == 32 { return 666307205 }
+    if i == 33 { return 773529912 }
+    if i == 34 { return 1294757372 }
+    if i == 35 { return 1396182291 }
+    if i == 36 { return 1695183700 }
+    if i == 37 { return 1986661051 }
+    if i == 38 { return 2177026350 }
+    if i == 39 { return 2456956037 }
+    if i == 40 { return 2730485921 }
+    if i == 41 { return 2820302411 }
+    if i == 42 { return 3259730800 }
+    if i == 43 { return 3345764771 }
+    if i == 44 { return 3516065817 }
+    if i == 45 { return 3600352804 }
+    if i == 46 { return 4094571909 }
+    if i == 47 { return 275423344 }
+    if i == 48 { return 430227734 }
+    if i == 49 { return 506948616 }
+    if i == 50 { return 659060556 }
+    if i == 51 { return 883997877 }
+    if i == 52 { return 958139571 }
+    if i == 53 { return 1322822218 }
+    if i == 54 { return 1537002063 }
+    if i == 55 { return 1747873779 }
+    if i == 56 { return 1955562222 }
+    if i == 57 { return 2024104815 }
+    if i == 58 { return 2227730452 }
+    if i == 59 { return 2361852424 }
+    if i == 60 { return 2428436474 }
+    if i == 61 { return 2756734187 }
+    if i == 62 { return 3204031479 }
+    if i == 63 { return 3329325298 }
+    return 0
+}
+
+fn _mk_init_h() {
+    let h = list_new()
+    push(h, 1779033703)   // 0x6a09e667
+    push(h, 3144134277)   // 0xbb67ae85
+    push(h, 1013904242)   // 0x3c6ef372
+    push(h, 2773480762)   // 0xa54ff53a
+    push(h, 1359893119)   // 0x510e527f
+    push(h, 2600822924)   // 0x9b05688c
+    push(h, 528734635)    // 0x1f83d9ab
+    push(h, 1541459225)   // 0x5be0cd19
+    return h
+}
+
+fn _mk_compress(h, blk) {
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _mk_load_be32(blk, i * 4))
+        i = i + 1
+    }
+    while i < 64 {
+        let w15 = w[i - 15]
+        let w2  = w[i - 2]
+        let s0 = _mk_xor32(_mk_xor32(_mk_rotr32(w15, 7), _mk_rotr32(w15, 18)),
+                           int_shr(w15, 3))
+        let s1 = _mk_xor32(_mk_xor32(_mk_rotr32(w2, 17), _mk_rotr32(w2, 19)),
+                           int_shr(w2, 10))
+        let v = _mk_add32(_mk_add32(_mk_add32(w[i - 16], s0), w[i - 7]), s1)
+        push(w, v)
+        i = i + 1
+    }
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]
+    let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7]
+    let t = 0
+    while t < 64 {
+        let s1 = _mk_xor32(_mk_xor32(_mk_rotr32(e, 6),
+                                     _mk_rotr32(e, 11)),
+                           _mk_rotr32(e, 25))
+        let ch = _mk_xor32(_mk_and32(e, f), _mk_and32(_mk_not32(e), g))
+        let t1 = _mk_add32(_mk_add32(_mk_add32(_mk_add32(hh, s1), ch),
+                                     _mk_k(t)), w[t])
+        let s0 = _mk_xor32(_mk_xor32(_mk_rotr32(a, 2),
+                                     _mk_rotr32(a, 13)),
+                           _mk_rotr32(a, 22))
+        let maj = _mk_xor32(_mk_xor32(_mk_and32(a, b),
+                                      _mk_and32(a, c)),
+                            _mk_and32(b, c))
+        let t2 = _mk_add32(s0, maj)
+        hh = g
+        g = f
+        f = e
+        e = _mk_add32(d, t1)
+        d = c
+        c = b
+        b = a
+        a = _mk_add32(t1, t2)
+        t = t + 1
+    }
+    list_set(h, 0, _mk_add32(h[0], a))
+    list_set(h, 1, _mk_add32(h[1], b))
+    list_set(h, 2, _mk_add32(h[2], c))
+    list_set(h, 3, _mk_add32(h[3], d))
+    list_set(h, 4, _mk_add32(h[4], e))
+    list_set(h, 5, _mk_add32(h[5], f))
+    list_set(h, 6, _mk_add32(h[6], g))
+    list_set(h, 7, _mk_add32(h[7], hh))
+    return 1
+}
+
+// SHA-256 of a byte buffer of length `n`. Returns a freshly alloc'd
+// 33-byte buffer (32 bytes of hash plus a terminating NUL so callers
+// can pass it as a NOVA string when desired).
+fn _mk_sha256_buf(msg_buf, n) {
+    let h = _mk_init_h()
+    let full_blocks = int_shr(n, 6)
+    let i = 0
+    while i < full_blocks {
+        _mk_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    let rem = n - full_blocks * 64
+    let total_bits_lo = _mk_mask32(int_shl(n, 3))
+    let total_bits_hi = _mk_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _mk_store_be32(pad, final_size - 8, total_bits_hi)
+    _mk_store_be32(pad, final_size - 4, total_bits_lo)
+    _mk_compress(h, pad)
+    if need_two == 1 {
+        _mk_compress(h, pad + 64)
+    }
+    let out = alloc(_MK_HASH_LEN + 1)
+    let k = 0
+    while k < 8 {
+        _mk_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + _MK_HASH_LEN, 0)
+    return out
+}
+
+// SHA-256 of a NOVA string (ASCII bytes, no embedded NUL).
+fn _mk_sha256_str(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return _mk_sha256_buf(buf, n)
+}
+
+// ============================================================================
+//                       Byte-buffer / hex helpers
+// ============================================================================
+//
+// `buf` here is the raw alloc'd 33-byte SHA-256 output; `hex` is the
+// 64-char lowercase ASCII rendering. Round-trip via _mk_hex_to_buf /
+// _mk_buf_to_hex; both never allocate beyond the obvious shapes.
+
+fn _mk_nibble_hex(n) {
+    if n < 10 { return 48 + n }      // '0'..'9'
+    return 87 + n                    // 'a'..'f'
+}
+
+fn _mk_hex_nibble(c) {
+    if c >= 48 {
+        if c <= 57 { return c - 48 }
+    }
+    if c >= 97 {
+        if c <= 102 { return c - 87 }
+    }
+    if c >= 65 {
+        if c <= 70 { return c - 55 }
+    }
+    return 0 - 1
+}
+
+// 32-byte buffer -> 64-char lowercase hex string.
+fn merkle_buf_to_hex(buf) {
+    let s = ""
+    let i = 0
+    while i < _MK_HASH_LEN {
+        let b = load8(buf + i)
+        let hi = _mk_nibble_hex(int_and(int_shr(b, 4), 15))
+        let lo = _mk_nibble_hex(int_and(b, 15))
+        s = s + chr(hi) + chr(lo)
+        i = i + 1
+    }
+    return s
+}
+
+// 64-char hex string -> alloc'd 33-byte buffer. Returns 0 on length /
+// charset error so callers can fail loudly.
+fn merkle_hex_to_buf(hex) {
+    if len(hex) != _MK_HASH_LEN * 2 { return 0 }
+    let buf = alloc(_MK_HASH_LEN + 1)
+    let i = 0
+    while i < _MK_HASH_LEN {
+        let hi = _mk_hex_nibble(char_at(hex, i * 2))
+        let lo = _mk_hex_nibble(char_at(hex, i * 2 + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        store8(buf + i, int_or(int_shl(hi, 4), lo))
+        i = i + 1
+    }
+    store8(buf + _MK_HASH_LEN, 0)
+    return buf
+}
+
+// Compare two 32-byte buffers. Returns 1 on equal, 0 otherwise.
+// NOT constant-time -- this is integrity-check code, not crypto-secret
+// material, so an early bail is fine.
+fn _mk_buf_eq(a, b) {
+    if a == 0 { return 0 }
+    if b == 0 { return 0 }
+    let i = 0
+    while i < _MK_HASH_LEN {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Compare two hex strings of length 64. Returns 1 on equal, 0 otherwise.
+fn _mk_hex_eq(a, b) { return str_eq(a, b) }
+
+// ============================================================================
+//                          Canonical atom serialization
+// ============================================================================
+//
+// An atom record is a fixed-shape 6-cell list with exactly the layout
+// `kg_section_build` emits in src/persistence/snapshot_disk.nova:
+//
+//   r[0] = kg_label  (string)
+//   r[1] = id        (int)
+//   r[2] = kind      (int -- ATOM_FACT / ATOM_CONCEPT / ...)
+//   r[3] = label     (string)
+//   r[4] = alpha     (int -- Beta-distribution alpha)
+//   r[5] = beta      (int -- Beta-distribution beta)
+//
+// The canonical form is a SINGLE LINE in the same `key=value` shape as
+// the rest of the wire format, fields separated by `|`, no whitespace.
+// Strings are emitted verbatim (no escaping); the field separator does
+// NOT appear inside any field we serialize today (kg labels are ASCII
+// identifiers, atom labels survive the v2 KGS line format which uses
+// the same character set), so unescaped concatenation is safe. If a
+// future migration ever wants to allow `|` inside a label it has to
+// version-bump THIS function (and the corresponding canonical hash
+// will change for every atom, which is exactly the "schema-version-
+// bumps-the-Merkle-root" tripwire we want).
+//
+//   "kg=<kg_label>|id=<id>|kind=<kind>|label=<label>|alpha=<alpha>|beta=<beta>"
+//
+// Determinism: the field ORDER is fixed by this function, no map
+// iteration anywhere. Same input -> same output, byte-for-byte.
+
+fn merkle_atom_canonical(atom_rec) {
+    if atom_rec == 0 { return "" }
+    if len(atom_rec) < 6 { return "" }
+    let s = "kg=" + atom_rec[0]
+    s = s + "|id=" + int_to_str(atom_rec[1])
+    s = s + "|kind=" + int_to_str(atom_rec[2])
+    s = s + "|label=" + atom_rec[3]
+    s = s + "|alpha=" + int_to_str(atom_rec[4])
+    s = s + "|beta=" + int_to_str(atom_rec[5])
+    return s
+}
+
+// Hash one canonical-serialized atom -> 32-byte buffer.
+fn merkle_leaf_hash(atom_rec) {
+    let s = merkle_atom_canonical(atom_rec)
+    return _mk_sha256_str(s)
+}
+
+// Hash a (left, right) pair of 32-byte node hashes -> 32-byte buffer.
+// Order matters: the pair `(L, R)` hashes to a different node than
+// `(R, L)`. The Merkle-root determinism contract relies on this.
+fn _mk_node_hash(left_buf, right_buf) {
+    let buf = alloc(_MK_HASH_LEN * 2 + 1)
+    let i = 0
+    while i < _MK_HASH_LEN {
+        store8(buf + i, load8(left_buf + i))
+        i = i + 1
+    }
+    i = 0
+    while i < _MK_HASH_LEN {
+        store8(buf + _MK_HASH_LEN + i, load8(right_buf + i))
+        i = i + 1
+    }
+    store8(buf + _MK_HASH_LEN * 2, 0)
+    return _mk_sha256_buf(buf, _MK_HASH_LEN * 2)
+}
+
+// ============================================================================
+//                              Merkle root
+// ============================================================================
+//
+// Build the tree bottom-up:
+//   1. leaves = [leaf_hash(atom_i) for each atom]
+//   2. while len(level) > 1: pair adjacent; if odd, duplicate last
+//      before pairing; emit SHA-256(L || R) as the next level
+//   3. return the single remaining node
+//
+// Empty input: there is no canonical "empty Merkle root" in the spec.
+// We use the sentinel `SHA-256("")` -- a stable, well-known 32-byte
+// value (e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855).
+// A snapshot with zero atoms reproduces this root on every write.
+// Single-leaf input: root == leaf hash (NO extra pair-and-hash; the
+// Bitcoin convention).
+
+// Sentinel root for an empty atom list. Caches the result for repeated
+// calls so we're not re-running SHA-256 on every `/snap_verify` of an
+// atom-free file.
+let _MK_EMPTY_ROOT_CACHE = list_new()
+
+fn _mk_empty_root() {
+    if len(_MK_EMPTY_ROOT_CACHE) > 0 { return _MK_EMPTY_ROOT_CACHE[0] }
+    let h = _mk_sha256_str("")
+    push(_MK_EMPTY_ROOT_CACHE, h)
+    return h
+}
+
+// Public: 32-byte buffer.
+fn merkle_root(atom_records) {
+    if atom_records == 0 { return _mk_empty_root() }
+    let n = len(atom_records)
+    if n == 0 { return _mk_empty_root() }
+    if n == 1 { return merkle_leaf_hash(atom_records[0]) }
+    let level = list_new()
+    let i = 0
+    while i < n {
+        push(level, merkle_leaf_hash(atom_records[i]))
+        i = i + 1
+    }
+    while len(level) > 1 {
+        let next = list_new()
+        let m = len(level)
+        let j = 0
+        while j < m {
+            let l = level[j]
+            let r = level[j]
+            if j + 1 < m {
+                r = level[j + 1]
+            }
+            // Odd count: duplicate last leaf for pairing (Bitcoin).
+            push(next, _mk_node_hash(l, r))
+            j = j + 2
+        }
+        level = next
+    }
+    return level[0]
+}
+
+// Public: 64-char lowercase hex.
+fn merkle_root_hex(atom_records) {
+    return merkle_buf_to_hex(merkle_root(atom_records))
+}
+
+// ============================================================================
+//                          Inclusion proofs
+// ============================================================================
+//
+// A proof for atom at index `target_idx` is a list of (direction,
+// sibling_hex) pairs, smallest-level-first (leaf-adjacent sibling
+// first, root-adjacent sibling last):
+//
+//   direction: 0 = sibling is on the LEFT  (sibling || self)
+//              1 = sibling is on the RIGHT (self || sibling)
+//
+// To verify: start with `hash = leaf(target_atom)`, walk the proof,
+// and at each step combine according to the direction:
+//   if direction == 0: hash = SHA-256(sibling || hash)
+//   if direction == 1: hash = SHA-256(hash || sibling)
+// Compare the final `hash` against `expected_root`.
+//
+// Proof shape is a list of 2-cell sublists `[direction, sibling_hex]`
+// so it round-trips cleanly through the snapshot's `key val` format
+// when we eventually persist proofs (not done in this round -- proofs
+// are computed on demand).
+
+let MERKLE_DIR_LEFT  = 0
+let MERKLE_DIR_RIGHT = 1
+
+fn _mk_proof_step(direction, sibling_buf) {
+    let step = list_new()
+    push(step, direction)
+    push(step, merkle_buf_to_hex(sibling_buf))
+    return step
+}
+
+// Public: proof for the atom at index `target_idx` of `atom_records`.
+// Returns 0 (sentinel) when:
+//   - atom_records is empty (no leaves -> no proof)
+//   - target_idx is out of range
+// Returns the empty list (length-0 proof) for a single-atom tree --
+// the leaf hash IS the root, and there are no siblings to disclose.
+fn merkle_proof(atom_records, target_idx) {
+    if atom_records == 0 { return 0 }
+    let n = len(atom_records)
+    if n == 0 { return 0 }
+    if target_idx < 0 { return 0 }
+    if target_idx >= n { return 0 }
+    let proof = list_new()
+    if n == 1 { return proof }
+    // Materialize the leaf level.
+    let level = list_new()
+    let i = 0
+    while i < n {
+        push(level, merkle_leaf_hash(atom_records[i]))
+        i = i + 1
+    }
+    let idx = target_idx
+    while len(level) > 1 {
+        let m = len(level)
+        // Pairing index of `idx` is idx XOR 1 (low bit). For an odd
+        // tail (idx == m - 1 with idx even), the sibling is the leaf
+        // itself (duplication rule), so the proof step records this
+        // node as its own sibling.
+        let sib_idx = int_xor(idx, 1)
+        if sib_idx >= m { sib_idx = idx }
+        let direction = MERKLE_DIR_RIGHT     // sibling is on the right
+        if int_and(idx, 1) == 1 { direction = MERKLE_DIR_LEFT } // sibling on left
+        push(proof, _mk_proof_step(direction, level[sib_idx]))
+        // Advance to the next level.
+        let next = list_new()
+        let j = 0
+        while j < m {
+            let l = level[j]
+            let r = level[j]
+            if j + 1 < m { r = level[j + 1] }
+            push(next, _mk_node_hash(l, r))
+            j = j + 2
+        }
+        level = next
+        idx = int_shr(idx, 1)
+    }
+    return proof
+}
+
+// Public: verify a proof + target_atom against an expected root.
+//
+// `expected_root_hex` is the 64-char hex form (what the meta block
+// carries). Returns 1 on success, 0 on any mismatch (tampered atom,
+// tampered sibling, wrong target, malformed proof).
+fn merkle_verify_proof(target_atom, proof, expected_root_hex) {
+    if target_atom == 0 { return 0 }
+    if proof == 0 { return 0 }
+    if expected_root_hex == 0 { return 0 }
+    if len(expected_root_hex) != _MK_HASH_LEN * 2 { return 0 }
+    let h = merkle_leaf_hash(target_atom)
+    let i = 0
+    while i < len(proof) {
+        let step = proof[i]
+        if step == 0 { return 0 }
+        if len(step) < 2 { return 0 }
+        let direction = step[0]
+        let sib_buf = merkle_hex_to_buf(step[1])
+        if sib_buf == 0 { return 0 }
+        if direction == MERKLE_DIR_LEFT {
+            h = _mk_node_hash(sib_buf, h)
+        } else {
+            h = _mk_node_hash(h, sib_buf)
+        }
+        i = i + 1
+    }
+    let got_hex = merkle_buf_to_hex(h)
+    if _mk_hex_eq(got_hex, expected_root_hex) == 1 { return 1 }
+    return 0
+}
+
+// ============================================================================
+//                       Snapshot KGS-blob helper
+// ============================================================================
+//
+// The KGS section blob shape is `[atom_count, recs_list]`. This
+// helper threads the Merkle root over the records list -- the
+// snapshot writer / reader pass the KGS blob directly; we don't pull
+// in the snapshot module here to keep merkle.nova self-contained and
+// the persistence import graph acyclic.
+
+// Compute the Merkle root over the records list of a KGS section
+// blob. Returns the 64-char hex form, or the empty-root sentinel hex
+// if the blob is missing / shapeless. Caller is responsible for
+// resolving the blob from a snapshot value via snap_section().
+fn merkle_root_for_kgs_blob(kgs_blob) {
+    if kgs_blob == 0 { return merkle_buf_to_hex(_mk_empty_root()) }
+    if len(kgs_blob) < 2 { return merkle_buf_to_hex(_mk_empty_root()) }
+    let recs = kgs_blob[1]
+    if recs == 0 { return merkle_buf_to_hex(_mk_empty_root()) }
+    return merkle_root_hex(recs)
+}
+
+// ============================================================================
+//                              Bonus: env hook
+// ============================================================================
+//
+// Read `CE_SNAPSHOT_VERIFY_MERKLE`. Returns 1 when set to "1", 0
+// otherwise. Lifted out into a helper so the snapshot reader can use
+// the same check it already uses for CE_AUTO_COMPACT_ON_SAVE.
+fn merkle_verify_on_load_enabled() {
+    let env = getenv("CE_SNAPSHOT_VERIFY_MERKLE")
+    if env == 0 { return 0 }
+    if str_eq(env, "1") == 1 { return 1 }
+    return 0
+}

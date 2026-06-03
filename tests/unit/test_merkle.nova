@@ -1,0 +1,546 @@
+// Unit tests for src/persistence/merkle.nova (R15E).
+//
+// Verifies the Merkle-tree tamper-evident atom-hash chain:
+//   - canonical atom serialization is deterministic + field-ordered
+//   - leaf hash matches SHA-256 of the canonical bytes
+//   - empty atom list -> known sentinel root (SHA-256 of empty string)
+//   - single atom: root == leaf hash
+//   - two atoms: root == SHA-256(leaf1 || leaf2)
+//   - three atoms: odd-count duplication rule (SHA-256(N12 || N33))
+//   - inclusion proofs verify, with proof length <= ceil(log2(N))
+//   - tampered proof / target / sibling rejected
+//   - determinism: same input -> same root, no randomness
+//   - order matters: same atoms in a different order -> DIFFERENT root
+//   - the local SHA-256 matches FIPS 180-4 worked examples (smoke test
+//     tying this module's SHA-256 to the well-known reference output)
+//
+// ADRs touched: ADR-0048 (persistence container -- the meta block grows
+//   an optional `meta.merkle_root` line).
+//
+// NOVA dependencies: ce_test harness only.
+// CrossEngin dependencies: src/persistence/merkle.nova.
+
+import "../ce_test.nova"
+import "../../src/persistence/merkle.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Build an atom record matching the kg_section_build shape:
+//   [kg_label, id, kind, label, alpha, beta]
+fn _atom(kg_label, id, kind, label, alpha, beta) {
+    let r = list_new()
+    push(r, kg_label)
+    push(r, id)
+    push(r, kind)
+    push(r, label)
+    push(r, alpha)
+    push(r, beta)
+    return r
+}
+
+// Build a deterministic atom list of length n. Same n -> same list.
+fn _mk_atom_list(n) {
+    let recs = list_new()
+    let i = 0
+    while i < n {
+        push(recs, _atom("reasoning", i, 1, "atom_" + int_to_str(i),
+                          1000 + i, 500 + i))
+        i = i + 1
+    }
+    return recs
+}
+
+// ---- local SHA-256 smoke test --------------------------------------------
+//
+// Pin the module's local SHA-256 against the two canonical FIPS 180-4
+// worked examples. A future refactor that swaps out _mk_sha256_* must
+// keep these two tests passing -- they catch any byte-level drift in
+// the hash primitive before it corrupts the Merkle root.
+
+fn test_sha256_empty_vector() {
+    let h = _mk_sha256_str("")
+    let hex = merkle_buf_to_hex(h)
+    ce_str_eq("sha256(\"\") matches FIPS reference",
+              hex,
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+fn test_sha256_abc_vector() {
+    let h = _mk_sha256_str("abc")
+    let hex = merkle_buf_to_hex(h)
+    ce_str_eq("sha256(\"abc\") matches FIPS reference",
+              hex,
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+// ---- hex round-trip -------------------------------------------------------
+
+fn test_hex_roundtrip_zero() {
+    let buf = alloc(33)
+    let i = 0
+    while i < 32 { store8(buf + i, 0); i = i + 1 }
+    let hex = merkle_buf_to_hex(buf)
+    ce_str_eq("zero buf hex = 64 zeros",
+              hex,
+              "0000000000000000000000000000000000000000000000000000000000000000")
+    let buf2 = merkle_hex_to_buf(hex)
+    ce_check("hex -> buf round-trip non-null", buf2 != 0)
+    let j = 0
+    let ok = 1
+    while j < 32 {
+        if load8(buf2 + j) != 0 { ok = 0 }
+        j = j + 1
+    }
+    ce_check("hex -> buf round-trips zeros byte-for-byte", ok == 1)
+}
+
+fn test_hex_roundtrip_arbitrary() {
+    // 0xde 0xad 0xbe 0xef ... pattern.
+    let buf = alloc(33)
+    let i = 0
+    while i < 32 {
+        let v = 0
+        if int_and(i, 3) == 0 { v = 222 }    // 0xde
+        if int_and(i, 3) == 1 { v = 173 }    // 0xad
+        if int_and(i, 3) == 2 { v = 190 }    // 0xbe
+        if int_and(i, 3) == 3 { v = 239 }    // 0xef
+        store8(buf + i, v)
+        i = i + 1
+    }
+    let hex = merkle_buf_to_hex(buf)
+    ce_eq("arbitrary buf hex length = 64", len(hex), 64)
+    let buf2 = merkle_hex_to_buf(hex)
+    ce_check("arbitrary hex -> buf round-trip non-null", buf2 != 0)
+    let ok = 1
+    let j = 0
+    while j < 32 {
+        if load8(buf2 + j) != load8(buf + j) { ok = 0 }
+        j = j + 1
+    }
+    ce_check("arbitrary hex -> buf round-trips byte-for-byte", ok == 1)
+}
+
+fn test_hex_to_buf_rejects_bad_length() {
+    let bad = merkle_hex_to_buf("deadbeef")
+    ce_check("63-char prefix length rejected", bad == 0)
+}
+
+fn test_hex_to_buf_rejects_bad_chars() {
+    // 64 chars but with a non-hex char in the middle.
+    let s = "z000000000000000000000000000000000000000000000000000000000000000"
+    let bad = merkle_hex_to_buf(s)
+    ce_check("non-hex char rejected", bad == 0)
+}
+
+// ---- canonical atom serialization ----------------------------------------
+
+fn test_canonical_field_order() {
+    let a = _atom("reasoning", 7, 3, "widget", 1500, 500)
+    let s = merkle_atom_canonical(a)
+    ce_str_eq("canonical follows kg|id|kind|label|alpha|beta order",
+              s,
+              "kg=reasoning|id=7|kind=3|label=widget|alpha=1500|beta=500")
+}
+
+fn test_canonical_distinguishes_label() {
+    let a = _atom("reasoning", 1, 1, "alpha", 1000, 500)
+    let b = _atom("reasoning", 1, 1, "beta",  1000, 500)
+    let sa = merkle_atom_canonical(a)
+    let sb = merkle_atom_canonical(b)
+    ce_check("distinct labels produce distinct canonical bytes",
+             str_eq(sa, sb) == 0)
+}
+
+fn test_canonical_distinguishes_belief() {
+    let a = _atom("reasoning", 1, 1, "widget", 1000, 500)
+    let b = _atom("reasoning", 1, 1, "widget", 1001, 500)
+    let sa = merkle_atom_canonical(a)
+    let sb = merkle_atom_canonical(b)
+    ce_check("alpha-only delta changes canonical bytes",
+             str_eq(sa, sb) == 0)
+}
+
+fn test_canonical_handles_short_record() {
+    // A malformed 3-cell record returns empty string -- the caller is
+    // expected to validate shape; we never crash.
+    let r = list_new()
+    push(r, "reasoning")
+    push(r, 1)
+    push(r, 2)
+    let s = merkle_atom_canonical(r)
+    ce_str_eq("short record yields empty canonical", s, "")
+}
+
+// ---- merkle_root edge cases ----------------------------------------------
+
+fn test_empty_atom_list_root() {
+    // Sentinel = SHA-256("") per the module docstring.
+    let hex = merkle_root_hex(list_new())
+    ce_str_eq("empty atom list -> SHA-256(\"\") sentinel root",
+              hex,
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+fn test_zero_pointer_root() {
+    // 0 sentinel -> empty-root sentinel (safety net against accidental
+    // nil-deref by the snapshot writer when KGS section is absent).
+    let hex = merkle_root_hex(0)
+    ce_str_eq("zero pointer -> sentinel root",
+              hex,
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+fn test_single_atom_root_equals_leaf_hash() {
+    let recs = list_new()
+    push(recs, _atom("reasoning", 1, 1, "alpha", 1000, 500))
+    let root = merkle_root(recs)
+    let leaf = merkle_leaf_hash(recs[0])
+    // Compare byte-for-byte.
+    let ok = 1
+    let i = 0
+    while i < 32 {
+        if load8(root + i) != load8(leaf + i) { ok = 0 }
+        i = i + 1
+    }
+    ce_check("single-atom root == leaf hash (Bitcoin convention)", ok == 1)
+}
+
+fn test_two_atom_root_equals_pair_hash() {
+    let recs = list_new()
+    push(recs, _atom("reasoning", 1, 1, "alpha", 1000, 500))
+    push(recs, _atom("reasoning", 2, 1, "beta",  1100, 600))
+    let root_hex = merkle_root_hex(recs)
+    // Expected: SHA-256(leaf1 || leaf2) -- compute it independently and
+    // check equality.
+    let leaf1 = merkle_leaf_hash(recs[0])
+    let leaf2 = merkle_leaf_hash(recs[1])
+    let combined = alloc(65)
+    let i = 0
+    while i < 32 { store8(combined + i, load8(leaf1 + i)); i = i + 1 }
+    i = 0
+    while i < 32 { store8(combined + 32 + i, load8(leaf2 + i)); i = i + 1 }
+    store8(combined + 64, 0)
+    let expected = _mk_sha256_buf(combined, 64)
+    ce_str_eq("two-atom root == SHA-256(L||R)",
+              root_hex,
+              merkle_buf_to_hex(expected))
+}
+
+fn test_three_atom_root_odd_duplication() {
+    let recs = list_new()
+    push(recs, _atom("reasoning", 1, 1, "a", 1000, 500))
+    push(recs, _atom("reasoning", 2, 1, "b", 1100, 600))
+    push(recs, _atom("reasoning", 3, 1, "c", 1200, 700))
+    let root_hex = merkle_root_hex(recs)
+    // Compute the odd-duplication tree by hand:
+    //   N12 = SHA-256(L1 || L2)
+    //   N33 = SHA-256(L3 || L3)     (last leaf duplicated)
+    //   root = SHA-256(N12 || N33)
+    let l1 = merkle_leaf_hash(recs[0])
+    let l2 = merkle_leaf_hash(recs[1])
+    let l3 = merkle_leaf_hash(recs[2])
+    let buf12 = alloc(65)
+    let i = 0
+    while i < 32 { store8(buf12 + i, load8(l1 + i)); i = i + 1 }
+    i = 0
+    while i < 32 { store8(buf12 + 32 + i, load8(l2 + i)); i = i + 1 }
+    store8(buf12 + 64, 0)
+    let n12 = _mk_sha256_buf(buf12, 64)
+    let buf33 = alloc(65)
+    i = 0
+    while i < 32 { store8(buf33 + i, load8(l3 + i)); i = i + 1 }
+    i = 0
+    while i < 32 { store8(buf33 + 32 + i, load8(l3 + i)); i = i + 1 }
+    store8(buf33 + 64, 0)
+    let n33 = _mk_sha256_buf(buf33, 64)
+    let buf_root = alloc(65)
+    i = 0
+    while i < 32 { store8(buf_root + i, load8(n12 + i)); i = i + 1 }
+    i = 0
+    while i < 32 { store8(buf_root + 32 + i, load8(n33 + i)); i = i + 1 }
+    store8(buf_root + 64, 0)
+    let expected = _mk_sha256_buf(buf_root, 64)
+    ce_str_eq("three-atom root == SHA-256(N12 || N33), N33 duplicates L3",
+              root_hex,
+              merkle_buf_to_hex(expected))
+}
+
+// ---- determinism + order sensitivity --------------------------------------
+
+fn test_determinism_same_input_same_root() {
+    let recs1 = _mk_atom_list(10)
+    let recs2 = _mk_atom_list(10)
+    let hex1 = merkle_root_hex(recs1)
+    let hex2 = merkle_root_hex(recs2)
+    ce_str_eq("same atom list (rebuilt) -> identical root", hex1, hex2)
+}
+
+fn test_determinism_repeated_calls() {
+    let recs = _mk_atom_list(50)
+    let hex1 = merkle_root_hex(recs)
+    let hex2 = merkle_root_hex(recs)
+    let hex3 = merkle_root_hex(recs)
+    ce_str_eq("repeated merkle_root_hex calls return same string (call 2)",
+              hex2, hex1)
+    ce_str_eq("repeated merkle_root_hex calls return same string (call 3)",
+              hex3, hex1)
+}
+
+fn test_order_matters() {
+    // Same atom payloads, opposite order. The canonical serialization is
+    // ORDER-PRESERVING (concatenation, not bag-of-atoms hashing), so
+    // different orders MUST produce different roots. Documented contract
+    // is "the caller chooses + commits to atom order".
+    let a = _atom("reasoning", 1, 1, "alpha", 1000, 500)
+    let b = _atom("reasoning", 2, 1, "beta",  1100, 600)
+    let fwd = list_new()
+    push(fwd, a); push(fwd, b)
+    let rev = list_new()
+    push(rev, b); push(rev, a)
+    let hex_fwd = merkle_root_hex(fwd)
+    let hex_rev = merkle_root_hex(rev)
+    ce_check("reversed atom order -> different root",
+             str_eq(hex_fwd, hex_rev) == 0)
+}
+
+// ---- inclusion proofs -----------------------------------------------------
+
+fn test_single_atom_proof_is_empty() {
+    let recs = list_new()
+    push(recs, _atom("reasoning", 1, 1, "alpha", 1000, 500))
+    let proof = merkle_proof(recs, 0)
+    ce_check("single-atom proof non-null", proof != 0)
+    ce_eq("single-atom proof has zero steps", len(proof), 0)
+    // Verifier should still accept (leaf hash == root).
+    let root_hex = merkle_root_hex(recs)
+    let ok = merkle_verify_proof(recs[0], proof, root_hex)
+    ce_eq("single-atom empty-proof verifies", ok, 1)
+}
+
+fn test_two_atom_proof_one_step_each_side() {
+    let recs = list_new()
+    push(recs, _atom("reasoning", 1, 1, "alpha", 1000, 500))
+    push(recs, _atom("reasoning", 2, 1, "beta",  1100, 600))
+    let root_hex = merkle_root_hex(recs)
+    let p0 = merkle_proof(recs, 0)
+    let p1 = merkle_proof(recs, 1)
+    ce_eq("idx=0 proof has one step", len(p0), 1)
+    ce_eq("idx=1 proof has one step", len(p1), 1)
+    // Sibling directions: idx=0's sibling is on the RIGHT, idx=1's on the LEFT.
+    ce_eq("idx=0 step direction = RIGHT (1)", p0[0][0], MERKLE_DIR_RIGHT)
+    ce_eq("idx=1 step direction = LEFT (0)",  p1[0][0], MERKLE_DIR_LEFT)
+    ce_eq("idx=0 verifies", merkle_verify_proof(recs[0], p0, root_hex), 1)
+    ce_eq("idx=1 verifies", merkle_verify_proof(recs[1], p1, root_hex), 1)
+}
+
+fn test_three_atom_proof_odd_tail() {
+    let recs = list_new()
+    push(recs, _atom("reasoning", 1, 1, "a", 1000, 500))
+    push(recs, _atom("reasoning", 2, 1, "b", 1100, 600))
+    push(recs, _atom("reasoning", 3, 1, "c", 1200, 700))
+    let root_hex = merkle_root_hex(recs)
+    // Every atom must verify.
+    let i = 0
+    while i < 3 {
+        let p = merkle_proof(recs, i)
+        ce_eq("3-atom proof at idx=" + int_to_str(i) + " verifies",
+              merkle_verify_proof(recs[i], p, root_hex), 1)
+        i = i + 1
+    }
+    // Odd tail (idx=2) sibles itself at the leaf level: the first proof
+    // step's sibling hex MUST equal the leaf-2 hex.
+    let p2 = merkle_proof(recs, 2)
+    let leaf2_hex = merkle_buf_to_hex(merkle_leaf_hash(recs[2]))
+    ce_str_eq("odd-tail proof step sibling == own leaf",
+              p2[0][1], leaf2_hex)
+}
+
+fn test_100_atom_proof_logn_bound() {
+    let recs = _mk_atom_list(100)
+    let root_hex = merkle_root_hex(recs)
+    // ceil(log2(100)) = 7.
+    let p = merkle_proof(recs, 42)
+    ce_check("100-atom proof length <= 7", len(p) <= 7)
+    ce_eq("100-atom proof at idx=42 verifies",
+          merkle_verify_proof(recs[42], p, root_hex), 1)
+    // Spot-check a few more indices.
+    let p0 = merkle_proof(recs, 0)
+    ce_eq("idx=0 verifies", merkle_verify_proof(recs[0], p0, root_hex), 1)
+    ce_check("idx=0 proof length <= 7", len(p0) <= 7)
+    let p99 = merkle_proof(recs, 99)
+    ce_eq("idx=99 verifies", merkle_verify_proof(recs[99], p99, root_hex), 1)
+    ce_check("idx=99 proof length <= 7", len(p99) <= 7)
+}
+
+fn test_proof_out_of_range_returns_sentinel() {
+    let recs = _mk_atom_list(5)
+    let p_neg = merkle_proof(recs, 0 - 1)
+    let p_big = merkle_proof(recs, 5)
+    ce_check("idx=-1 -> 0 sentinel", p_neg == 0)
+    ce_check("idx=N -> 0 sentinel",  p_big == 0)
+}
+
+fn test_proof_empty_list_returns_sentinel() {
+    let p = merkle_proof(list_new(), 0)
+    ce_check("empty list proof -> 0 sentinel", p == 0)
+}
+
+// ---- tamper detection -----------------------------------------------------
+
+fn test_verify_rejects_wrong_target_atom() {
+    let recs = _mk_atom_list(8)
+    let root_hex = merkle_root_hex(recs)
+    let p3 = merkle_proof(recs, 3)
+    // Try to convince the verifier that atom #5 sits at index #3.
+    let ok = merkle_verify_proof(recs[5], p3, root_hex)
+    ce_eq("wrong target atom rejected", ok, 0)
+}
+
+fn test_verify_rejects_tampered_target_belief() {
+    let recs = _mk_atom_list(8)
+    let root_hex = merkle_root_hex(recs)
+    let p4 = merkle_proof(recs, 4)
+    // Mutate the alpha of the target atom -- a single integer's worth
+    // of "tampering". The proof was computed against the un-tampered
+    // value, so verification must fail.
+    let tampered = list_new()
+    let j = 0
+    while j < len(recs[4]) {
+        push(tampered, recs[4][j])
+        j = j + 1
+    }
+    list_set(tampered, 4, recs[4][4] + 1)
+    let ok = merkle_verify_proof(tampered, p4, root_hex)
+    ce_eq("tampered alpha rejected", ok, 0)
+}
+
+fn test_verify_rejects_tampered_target_label() {
+    let recs = _mk_atom_list(8)
+    let root_hex = merkle_root_hex(recs)
+    let p2 = merkle_proof(recs, 2)
+    let tampered = list_new()
+    let j = 0
+    while j < len(recs[2]) {
+        push(tampered, recs[2][j])
+        j = j + 1
+    }
+    list_set(tampered, 3, "different_label")
+    let ok = merkle_verify_proof(tampered, p2, root_hex)
+    ce_eq("tampered label rejected", ok, 0)
+}
+
+fn test_verify_rejects_tampered_sibling_hash() {
+    let recs = _mk_atom_list(16)
+    let root_hex = merkle_root_hex(recs)
+    let p = merkle_proof(recs, 5)
+    ce_check("baseline proof has at least one step", len(p) >= 1)
+    // Flip a single bit in the first sibling's hex string.
+    let orig_sib = p[0][1]
+    // Build a mutated copy: bump the first hex digit.
+    let first_char = char_at(orig_sib, 0)
+    let new_first = chr(first_char + 1)
+    if first_char == 102 { new_first = chr(48) }   // 'f' -> '0' wraparound
+    let mutated = new_first + substr(orig_sib, 1, len(orig_sib) - 1)
+    list_set(p[0], 1, mutated)
+    let ok = merkle_verify_proof(recs[5], p, root_hex)
+    ce_eq("tampered sibling hash rejected", ok, 0)
+}
+
+fn test_verify_rejects_tampered_direction_bit() {
+    let recs = _mk_atom_list(8)
+    let root_hex = merkle_root_hex(recs)
+    let p = merkle_proof(recs, 3)
+    ce_check("baseline proof has at least one step", len(p) >= 1)
+    // Flip the direction of the first step.
+    list_set(p[0], 0, int_xor(p[0][0], 1))
+    let ok = merkle_verify_proof(recs[3], p, root_hex)
+    ce_eq("flipped direction rejected", ok, 0)
+}
+
+fn test_verify_rejects_wrong_expected_root() {
+    let recs = _mk_atom_list(4)
+    let p = merkle_proof(recs, 1)
+    // Use a totally different root.
+    let other = "0000000000000000000000000000000000000000000000000000000000000000"
+    let ok = merkle_verify_proof(recs[1], p, other)
+    ce_eq("wrong expected root rejected", ok, 0)
+}
+
+fn test_verify_rejects_malformed_expected_root() {
+    let recs = _mk_atom_list(4)
+    let p = merkle_proof(recs, 1)
+    // Too short.
+    let bad = "deadbeef"
+    let ok = merkle_verify_proof(recs[1], p, bad)
+    ce_eq("short root hex rejected", ok, 0)
+}
+
+fn test_verify_rejects_zero_inputs() {
+    let recs = _mk_atom_list(4)
+    let p = merkle_proof(recs, 1)
+    let root_hex = merkle_root_hex(recs)
+    ce_eq("zero target -> 0", merkle_verify_proof(0, p, root_hex), 0)
+    ce_eq("zero proof  -> 0", merkle_verify_proof(recs[1], 0, root_hex), 0)
+    ce_eq("zero root   -> 0", merkle_verify_proof(recs[1], p, 0), 0)
+}
+
+// ---- KGS-blob helper + env hook ------------------------------------------
+
+fn test_merkle_root_for_kgs_blob_shape() {
+    let recs = _mk_atom_list(7)
+    let blob = list_new()
+    push(blob, 7)        // [0] count
+    push(blob, recs)     // [1] records
+    let hex = merkle_root_for_kgs_blob(blob)
+    ce_str_eq("blob path matches records path",
+              hex, merkle_root_hex(recs))
+}
+
+fn test_merkle_root_for_kgs_blob_zero_safety() {
+    let hex_zero = merkle_root_for_kgs_blob(0)
+    let hex_one  = merkle_root_for_kgs_blob(list_new())   // missing [1]
+    let empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    ce_str_eq("zero blob -> sentinel root",   hex_zero, empty_hex)
+    ce_str_eq("short blob -> sentinel root",  hex_one,  empty_hex)
+}
+
+// ---- driver --------------------------------------------------------------
+
+fn main() {
+    test_sha256_empty_vector()
+    test_sha256_abc_vector()
+    test_hex_roundtrip_zero()
+    test_hex_roundtrip_arbitrary()
+    test_hex_to_buf_rejects_bad_length()
+    test_hex_to_buf_rejects_bad_chars()
+    test_canonical_field_order()
+    test_canonical_distinguishes_label()
+    test_canonical_distinguishes_belief()
+    test_canonical_handles_short_record()
+    test_empty_atom_list_root()
+    test_zero_pointer_root()
+    test_single_atom_root_equals_leaf_hash()
+    test_two_atom_root_equals_pair_hash()
+    test_three_atom_root_odd_duplication()
+    test_determinism_same_input_same_root()
+    test_determinism_repeated_calls()
+    test_order_matters()
+    test_single_atom_proof_is_empty()
+    test_two_atom_proof_one_step_each_side()
+    test_three_atom_proof_odd_tail()
+    test_100_atom_proof_logn_bound()
+    test_proof_out_of_range_returns_sentinel()
+    test_proof_empty_list_returns_sentinel()
+    test_verify_rejects_wrong_target_atom()
+    test_verify_rejects_tampered_target_belief()
+    test_verify_rejects_tampered_target_label()
+    test_verify_rejects_tampered_sibling_hash()
+    test_verify_rejects_tampered_direction_bit()
+    test_verify_rejects_wrong_expected_root()
+    test_verify_rejects_malformed_expected_root()
+    test_verify_rejects_zero_inputs()
+    test_merkle_root_for_kgs_blob_shape()
+    test_merkle_root_for_kgs_blob_zero_safety()
+    ce_summary("merkle")
+}
+main()

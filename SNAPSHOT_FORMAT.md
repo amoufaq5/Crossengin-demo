@@ -192,6 +192,103 @@ line.
 * `examples/migrate_schema.nova` — the runnable schema-migration
   helper.
 
+## Merkle-tree tamper detection (R15E)
+
+Separate from the schema layer, CrossEngin's snapshot also carries an
+**integrity commitment**: a SHA-256 Merkle tree over the KGS atom
+records, with the root hash emitted as an optional v2 meta line. Any
+single-bit edit to any atom flips the root with overwhelming
+probability, so an operator can detect that a snapshot file on disk
+has been tampered with (or corrupted by a partial-write bug). Combined
+with R14F Ed25519 signing of the root, the next round will offer full
+attestation; this round ships the Merkle root only and leaves signing
+as follow-up.
+
+### Wire-format extension
+
+A new optional line in the v2 meta block names the snapshot's KGS-atom
+Merkle root:
+
+```
+meta.merkle_root <hex>           # 64-char SHA-256 (lowercase hex)
+```
+
+A pre-R15E v2 file omits this line; the reader treats absence as
+"no commitment was made" (so `/snap_verify` reports a friendly
+"no Merkle commitment" line rather than a false-positive TAMPERED).
+Other v2 readers that don't know about the line ignore it (same
+forward-compat as the other `meta.*` lines).
+
+### Algorithm
+
+The tree follows the standard pair-and-hash recursion:
+
+1. **Leaf hashes:** `leaf_i = SHA-256(canonical_atom_bytes_i)`, where
+   the canonical form is a deterministic single-line ASCII rendering
+   of the atom record:
+   `"kg=<kg_label>|id=<id>|kind=<kind>|label=<label>|alpha=<alpha>|beta=<beta>"`.
+2. **Tree construction:** pair adjacent nodes,
+   `node = SHA-256(left_hash || right_hash)`. For an odd count at any
+   level the last node is duplicated for pairing (Bitcoin convention).
+3. **Root:** the single node remaining at the top of the recursion.
+4. **Empty input:** the sentinel root is `SHA-256("")` —
+   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+5. **Single-leaf input:** root == leaf hash (no extra pair-and-hash;
+   the Bitcoin convention).
+
+The canonical serialization concatenates fields in a FIXED ORDER (kg,
+id, kind, label, alpha, beta). The Merkle tree is order-sensitive at
+the LEAF LEVEL too: reversing the atom list produces a different root.
+This is by design — the snapshot writer commits to a specific atom
+order and the reader recomputes against that same order. If we ever
+wanted bag-of-atoms semantics, the writer would have to sort
+canonically before hashing.
+
+### Verification surfaces
+
+Three call sites recompute and compare the root:
+
+* **`/snap_verify [PATH]`** — explicit one-shot chat command. Loads
+  the file, recomputes the root over the parsed KGS atoms, compares
+  to the meta line, and prints `verified | TAMPERED | no Merkle
+  commitment`.
+* **`snap_load(path)` with `CE_SNAPSHOT_VERIFY_MERKLE=1`** — the
+  normal rehydrate path becomes a tripwire. A mismatch returns the
+  same 0 sentinel a parse failure already uses (so callers don't
+  need a new error path) and prints a `(load FAILED: ...)` line.
+* **`snap_verify_merkle(s)` / `snap_verify_path(path)`** — module-
+  level APIs for any future federation-peer attestation surface.
+
+### Inclusion proofs
+
+`merkle_proof(atom_records, target_idx)` returns the list of sibling
+hashes from the leaf at `target_idx` up to the root, each tagged with
+its direction (left or right). A verifier with the proof, the
+target atom, and the expected root can confirm membership in
+O(log N) hash ops without seeing the rest of the tree — the property
+that makes Merkle attractive for light clients, log shipping, and
+federation. Today proofs are computed on demand and NOT persisted;
+the wire format reserves room to add them later under a new optional
+meta block.
+
+### See also
+
+* `src/persistence/merkle.nova` — Merkle module: local SHA-256
+  (FIPS 180-4, byte-identical to noise_xk's), canonical atom
+  serialization, `merkle_root`, `merkle_proof`,
+  `merkle_verify_proof`, KGS-blob helpers, env-var hook.
+* `tests/unit/test_merkle.nova` — unit tests covering the SHA-256
+  primitive, canonical serialization, root edge cases (empty /
+  single-leaf / two-leaf / three-leaf odd-duplication), inclusion
+  proofs (length bound, in-tree verification, tamper detection on
+  every input), determinism, and order sensitivity.
+* `tests/integration/scenario_lll_merkle.sh` — end-to-end test:
+  /save emits the meta line, /snap_verify on clean file reports
+  verified, byte-flip in any atom flips the root, determinism on
+  two saves of the same KG, pre-R15E snapshot reports "no
+  commitment" rather than false-positive TAMPERED, env-var verify
+  refuses to /load a tampered file.
+
 ## Migration tools
 
 * **Inline (transparent):** `snap_load(path)` runs the migration chain
