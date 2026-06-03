@@ -11,7 +11,32 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
+> toolchain. R18B adds `src/kg/link_prediction.nova` — three classical
+> link-prediction scores over the KG xref graph (Common Neighbors;
+> Jaccard, in milli; Adamic-Adar, in milli with integer log2 hub
+> down-weight). Companion to clustering (R11F LPA + R12C Louvain) and
+> centrality (R13E PageRank); answers the orthogonal "which UNFORMED
+> edges should exist?" question. `lp_predict_top_k` filters out
+> already-linked atoms so the result is candidate edges only;
+> tie-break is ASCENDING target atom_id. On a 4-clique-minus-one
+> fixture CN(0, 3) = 2, J(0, 3) = 1000 milli, AA(0, 3) = 2000 milli;
+> on a triangle-with-missing-edge {0--1, 1--2} the missing 0--2 edge
+> ranks top-1 by Jaccard at 1000 milli; on a hub-vs-rare fixture
+> Jaccard ties candidates {1, 2} at 500 milli each (ASC tiebreak
+> picks atom 1), while Adamic-Adar strictly prefers atom 2 (rare
+> neighbour weight 1000 vs hub 500) — concrete demonstration that
+> the two methods can rank the same query differently. Public API:
+> `lp_common_neighbors`, `lp_jaccard`, `lp_adamic_adar`,
+> `lp_predict_top_k`, `lp_method_parse`, `lp_method_name`. New chat
+> admin: `/predict <atom_id> [top_k] [method]` (method in
+> `{cn, jaccard, aa}`; default jaccard, top_k=5) prints
+> `PREDICT source=X method=NAME top_k=K hits=H edges=[id=A,score=B
+> ...]`. 77 unit assertions (`tests/unit/test_link_prediction.nova`)
+> + 31 integration assertions
+> (`tests/integration/scenario_ttt_link_prediction.sh`); all green.
+> All prior KG suites (R6F+R8F episodic, R10C semantic search, R11F
+> LPA, R12C Louvain, R13E PageRank, R15D/R16F/R17E mini-SPARQL)
+> remain bit-identically green. R16E adds `src/io/transducers/audio_spectrogram.nova` — a
 > Short-Time Fourier Transform / spectrogram built on an integer-only
 > radix-2 Cooley-Tukey FFT, closing the frequency-domain gap in the
 > audio chain (every prior audio module — R6E Klatt, R7F VAD, R7F

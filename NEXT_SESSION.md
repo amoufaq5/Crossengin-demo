@@ -3,7 +3,128 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R17C (this session) -- u8 raw-byte SIMD on optical-flow LK (HONEST: structural mismatch on accumulators; ships wiring + the SAD diagnostics that DO fit)
+## R18B (this session) -- link prediction (Common Neighbors, Jaccard, Adamic-Adar) over the KG xref graph
+
+**Status: complete -- the KG read story now covers link prediction
+alongside clustering (R11F LPA + R12C Louvain), centrality (R13E
+PageRank), retrieval (R6F/R8F episodic + R10C TF-IDF + P3.4 ANN), and
+the declarative query language (R15D + R16F + R17E SPARQL).** R18B
+ships `src/kg/link_prediction.nova` -- given two atoms u, v that are
+NOT currently linked, the module scores how likely they SHOULD be
+linked based on neighbourhood structure of the link graph. Three
+classical scores from Liben-Nowell + Kleinberg 2003 ("The Link
+Prediction Problem for Social Networks") and Adamic + Adar 2003
+("Friends and neighbors on the Web"), all integer-friendly:
+
+  1. **Common Neighbors**: `CN(u, v) = |N(u) intersect N(v)|`.
+     Raw count of shared neighbours.
+  2. **Jaccard**: `J(u, v) = |intersect| / |union|`, in milli
+     (0..1000). Identical neighbour sets -> 1000; disjoint -> 0.
+  3. **Adamic-Adar**: `AA(u, v) = SUM over w in (intersect) of
+     1000 / max(log2(deg(w)), 1)`, in milli. Inverse-log weight
+     down-weights popular shared neighbours (hubs) -- a colleague
+     who knows only u and v is more informative than a celebrity
+     who knows them and 10k others.
+
+The undirected link graph is extracted from atom xrefs (same single-KG
+restriction as R11F/R12C/R13E -- cross-KG edges are skipped). Dead
+slots in `kg_atoms` (the tombstone path from `kg_remove_atom`) are
+skipped. The neighbour-extraction walks atoms in id-ascending order
+for full determinism; top-K ties are broken by ASCENDING target
+atom_id (matches PR's discipline).
+
+`lp_predict_top_k(kg, source_atom_id, k, score_fn)` filters out:
+  - the source itself,
+  - atoms already linked to the source (so the result surfaces
+    candidate edges, not the existing graph),
+  - dead atoms (zeroed slots),
+  - candidates with score=0 (no neighbourhood overlap).
+
+The result is a list of `[target_atom_id, score]` pairs sorted
+descending by score; method `LP_CN` returns raw counts, `LP_JACCARD`
+and `LP_AA` return milli units.
+
+### Headline results on fixtures
+
+  - **triangle-minus-one** ({0,1,2} with edges 0--1 and 1--2 only):
+    the missing 0--2 edge is predicted via shared neighbour 1.
+    CN(0,2) = 1; J(0,2) = 1000 milli (full overlap on a degenerate
+    1-element union); AA(0,2) = 1000 milli.
+  - **4-clique-minus-one** ({0,1,2,3} with every edge except 0--3):
+    CN(0,3) = 2 (shared {1, 2}); J(0,3) = 1000; AA(0,3) = 2000
+    (two rare shared neighbours each contributing 1000 milli).
+  - **two disjoint triangles**: CN/J/AA between any cross-subgraph
+    pair = 0 (no shared neighbour).
+  - **hub-vs-rare divergence**: a fixture where Jaccard and
+    Adamic-Adar produce DIFFERENT top-1 candidates on the same
+    query. Atom 0 has neighbours {3, 4}; atom 1 has {3}; atom 2
+    has {4}; atom 3 is a hub (deg 5); atom 4 is rare (deg 2).
+    J(0,1) = J(0,2) = 500 milli (tied; tiebreak by ASC id -> atom
+    1 wins). AA(0,1) = 500 milli (hub down-weight 1000/log2(5)=500);
+    AA(0,2) = 1000 milli (rare full weight) -> atom 2 strictly wins.
+
+### Public API
+
+  - `lp_common_neighbors(kg, u, v) -> int_count`
+  - `lp_jaccard(kg, u, v) -> int_milli`
+  - `lp_adamic_adar(kg, u, v) -> int_milli`
+  - `lp_predict_top_k(kg, source_atom_id, k, score_fn) ->
+    list[[target_id, score]]`
+  - `lp_method_parse(name)`, `lp_method_name(code)` for the chat
+    arg parser.
+  - `lp_predict_cmd(kg, arg)` for the `/predict <id> [top_k]
+    [method]` admin command.
+
+Method codes exported: `LP_CN = 1`, `LP_JACCARD = 2`, `LP_AA = 3`.
+
+### Chat surface
+
+New admin command `/predict <atom_id> [top_k] [method]` (method in
+`{cn, jaccard, aa}`; default jaccard; default top_k=5). Emits one
+PREDICT line of the form:
+
+```
+PREDICT source=X method=NAME top_k=K hits=H edges=[id=A,score=B ...]
+```
+
+Graceful error path: `/predict 9999` (no such atom) -> `PREDICT
+error=missing source atom_id=9999`. No-arg `/predict` prints a usage
+line + `PREDICT store_size=N`.
+
+### Verification
+
+  - **77 unit assertions** in `tests/unit/test_link_prediction.nova`
+    covering disconnected/self/missing-atom edge cases, N-shared-
+    neighbour CN, identical/disjoint/partial Jaccard, AA hub
+    down-weighting + multiple-shared-neighbour sum, top_k boundary
+    + tie-break + already-linked filter + invalid source,
+    barbell-with-missing-edge prediction, disjoint subgraphs,
+    method-name parsing, integer log2 helper, and determinism.
+  - **31 integration assertions** in
+    `tests/integration/scenario_ttt_link_prediction.sh` covering
+    driver-emitted DRIVER lines on the four fixtures + PREDICT
+    emit-line shape (both methods + error path) + chat dispatch
+    (`/predict`, `/predict 0`, `/predict 0 3 cn`, `/predict 9999`,
+    `/help`).
+  - All 186 unit tests pass; all existing KG suites
+    (R6F+R8F episodic, R10C semantic search, R11F LPA, R12C Louvain,
+    R13E PageRank, R15D/R16F/R17E mini-SPARQL query) remain
+    bit-identically green.
+
+### Files added
+
+  - `src/kg/link_prediction.nova` (542 lines)
+  - `tests/unit/test_link_prediction.nova` (~350 lines, 77 checks)
+  - `tests/integration/scenario_ttt_link_prediction.sh` (31 assertions)
+  - `tests/integration/_scenario_ttt_link_prediction_driver/link_prediction_driver.nova`
+
+### Files touched
+
+  - `examples/crossengin_chat.nova` (3 lines: 1 import + 1 dispatch +
+    1 help, mirroring the R13E pagerank precedent).
+  - `NEXT_SESSION.md` + `README.md` updated with the R18B entry.
+
+## R17C (last session) -- u8 raw-byte SIMD on optical-flow LK (HONEST: structural mismatch on accumulators; ships wiring + the SAD diagnostics that DO fit)
 
 **Status: complete -- R15A's `simd_sad_u8` u8 SIMD pattern applied to
 optical-flow LK with HONEST findings (mirrors R12A precedent: agent
