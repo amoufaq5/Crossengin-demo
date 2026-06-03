@@ -3,6 +3,199 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R15E (this session) -- Merkle-tree tamper-evident snapshot atom-hash chain
+
+**Status: complete -- `src/persistence/merkle.nova` (NEW) plus a 5-line
+wire-in to `snapshot_writer.nova` and a 25-line wire-in to
+`snapshot_disk.nova` close the integrity gap that lived between R5D's
+crash-safe writer and R14F's Ed25519 signing primitive.** Before
+R15E, an operator (friendly or otherwise) could edit a single byte in
+any atom of a snapshot file on disk and the next `/load` would
+happily install the mutated state with no indication anything was
+off. After R15E, the v2 meta block carries an optional 64-char hex
+Merkle root over the KGS atom records; the new `/snap_verify` chat
+command recomputes it on demand; `CE_SNAPSHOT_VERIFY_MERKLE=1` turns
+the normal `/load` path into a tripwire. Combined with the next-round
+R14F-signing of the Merkle root, the substrate gets full attestation.
+
+### Algorithm (Merkle tree over KGS atom records)
+
+1. **Canonical leaf bytes:** each atom record (the same
+   `[kg_label, id, kind, label, alpha, beta]` shape
+   `kg_section_build` already emits) renders to a single
+   deterministic ASCII line:
+   `"kg=<kg_label>|id=<id>|kind=<kind>|label=<label>|alpha=<a>|beta=<b>"`.
+   Field ORDER is fixed (no map iteration anywhere); fields are
+   concatenated verbatim (no escaping, the `|` separator does not
+   appear inside any field today). A future schema migration that
+   wants to allow `|` in a label has to version-bump
+   `merkle_atom_canonical`, which is the "schema-version-bumps-the-
+   Merkle-root" tripwire we want.
+2. **Leaf hash:** `leaf_i = SHA-256(canonical_bytes_i)`. Output is
+   a 32-byte buffer (the local SHA-256 helper returns an alloc'd
+   33-byte buffer with a trailing NUL).
+3. **Tree construction:** pair adjacent nodes,
+   `node = SHA-256(left_hash || right_hash)` (64-byte input). For
+   an odd count at any level, the last node is duplicated for
+   pairing (Bitcoin convention). Recurse until a single root
+   remains.
+4. **Empty input:** the sentinel root is `SHA-256("")` =
+   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+   the well-known FIPS 180-4 reference output. A snapshot with zero
+   atoms reproduces this hex on every save.
+5. **Single-leaf input:** root == leaf hash (no extra pair-and-
+   hash; the Bitcoin convention; what the unit test pins).
+
+### Inclusion proofs
+
+`merkle_proof(atom_records, target_idx)` returns the list of sibling
+hashes from the leaf at `target_idx` up to the root, each tagged
+with its direction (`MERKLE_DIR_LEFT` = sibling on the LEFT,
+`MERKLE_DIR_RIGHT` = sibling on the RIGHT). Length bound:
+ceil(log2(N)) hashes (= 7 for N=100, asserted in the unit test).
+`merkle_verify_proof(target_atom, proof, expected_root_hex)` runs
+the proof: start with `hash = leaf(target_atom)`, walk the proof,
+combine according to direction (`SHA-256(sibling || hash)` for
+LEFT, `SHA-256(hash || sibling)` for RIGHT), and compare the final
+hash to `expected_root_hex`. Tamper-detection: a flipped sibling
+hex, a flipped direction bit, a wrong target atom, or a wrong
+expected root all cause the verifier to return 0. The odd-tail
+case (e.g. `idx=2` in a 3-leaf tree) records the leaf as its own
+sibling on the first proof step, matching the duplication rule
+the root computation used.
+
+### Public API (src/persistence/merkle.nova)
+
+- `merkle_atom_canonical(atom_rec)` -- canonical ASCII bytes for one
+  atom record (returns "" on malformed records).
+- `merkle_leaf_hash(atom_rec)` -- 32-byte SHA-256 over the canonical
+  bytes (returns the alloc'd buffer).
+- `merkle_root(atom_records)` -- 32-byte buffer; empty list -> the
+  empty-tree sentinel.
+- `merkle_root_hex(atom_records)` -- 64-char lowercase hex form.
+- `merkle_root_for_kgs_blob(kgs_blob)` -- helper that resolves the
+  records list from a snapshot's KGS section blob shape
+  `[atom_count, recs_list]`.
+- `merkle_proof(atom_records, target_idx)` -- proof for the target
+  leaf; returns 0 sentinel for out-of-range / empty inputs.
+- `merkle_verify_proof(target_atom, proof, expected_root_hex)` -- 1
+  on success, 0 on any mismatch.
+- `merkle_buf_to_hex(buf)` / `merkle_hex_to_buf(hex)` -- 32-byte
+  buffer <-> 64-char hex round-trip helpers.
+- `merkle_verify_on_load_enabled()` -- reads
+  `CE_SNAPSHOT_VERIFY_MERKLE`, returns 1 iff "1".
+
+### Wire-in
+
+* **`src/persistence/snapshot_writer.nova`** -- meta block grows to 6
+  cells (was 5 after R8E added `atoms_version`); new slot at offset 5
+  holds the Merkle root hex (default empty = "no commitment").
+  Accessors: `snap_meta_has_merkle_root`, `snap_meta_merkle_root`,
+  `snap_meta_set_merkle_root`. The `_snap_meta_extend` helper pads
+  a pre-R8E (4-cell) or pre-R15E (5-cell) meta block up to
+  SNAP_META_COUNT in place, slot-typed defaults included so the
+  existing accessors keep their offsets.
+* **`src/persistence/snapshot_disk.nova`** -- `snap_to_text`
+  recomputes the root over the KGS records BEFORE emitting the meta
+  block (so the file's `meta.merkle_root` line and the rest of the
+  file match bit-for-bit), then writes
+  `meta.merkle_root <hex>`. `snap_from_text` parses the line into
+  the meta block (absence = empty sentinel, no false-positive
+  TAMPERED on pre-R15E files). `snap_load` becomes a tripwire when
+  `CE_SNAPSHOT_VERIFY_MERKLE=1`: a mismatched root returns the
+  same 0 sentinel a parse failure already uses, with a clear
+  `(load FAILED: Merkle root mismatch ...)` line. New
+  `snap_verify_merkle(s)` and `snap_verify_path(path)` API for the
+  chat command + any future federation-peer attestation surface.
+* **`examples/crossengin_chat.nova`** -- 1-line dispatch
+  (`if str_eq(cmd, "/snap_verify")`) + `_admin_snap_verify` (15
+  lines, calls `snap_verify_path`, formats the four outcomes:
+  verified, TAMPERED, no commitment, load failure) + 2 help lines.
+
+### Self-contained SHA-256
+
+`noise_xk.nova` already has a pure-NOVA SHA-256, but importing it
+into the persistence layer would drag `chacha20`, `poly1305`, and
+`bignum_2048` into the daemon's persistence dependency graph for an
+integrity check that doesn't need any of them. The merkle module
+ships its OWN SHA-256, byte-identical to noise_xk's (both are the
+FIPS 180-4 spec); the duplication is intentional. The unit test
+pins the local SHA-256 against the canonical FIPS reference vectors
+(`SHA-256("")` and `SHA-256("abc")`) so a future refactor that
+swaps either copy can't drift without the test failing first.
+
+### Headline results
+
+- **Tamper detection verified live:** `/save /tmp/x.snap`, then
+  flip a byte in `kgs.atoms[0].label` with a python helper, then
+  `/snap_verify /tmp/x.snap`. Output:
+  `(snap_verify /tmp/x.snap: TAMPERED -- Merkle root mismatch, on-disk
+   file disagrees with the recomputed root)`.
+- **Load-time tripwire verified live:** with
+  `CE_SNAPSHOT_VERIFY_MERKLE=1`, the same `/load /tmp/x.snap`
+  refuses the file:
+  `(load FAILED: Merkle root mismatch -- snapshot /tmp/x.snap is
+   TAMPERED or corrupt)`. The same /load WITHOUT the env-var still
+  rehydrates the file (opt-in until the operator enables it).
+- **Determinism verified live:** two consecutive `/save` calls on
+  an unchanged 584+553-atom seed KG produce bit-identical
+  `meta.merkle_root` lines.
+- **Proof length bound holds:** ceil(log2(100)) = 7 for the
+  100-atom test; the unit test asserts proof length <= 7 at
+  idx=0, 42, 99.
+- **Pre-R15E forward-compat:** a hand-rolled snapshot identical to
+  the writer's output but with the `meta.merkle_root` line stripped
+  reports `no Merkle commitment` rather than false-positive TAMPERED.
+
+### Files touched (R15E)
+
+- `src/persistence/merkle.nova` (NEW, ~470 lines: local SHA-256,
+  hex helpers, canonical atom serialization, root, proof, verify,
+  KGS-blob helper, env-var hook)
+- `src/persistence/snapshot_writer.nova` (+~80 lines: meta block
+  grows by one slot, R15E accessors / setter, `_snap_meta_extend`
+  helper, doc-comment updates)
+- `src/persistence/snapshot_disk.nova` (+~50 lines: import merkle,
+  recompute root in `snap_to_text`, parse meta line in
+  `snap_from_text`, install merkle_root via setter, env-var
+  tripwire in `snap_load`, `snap_verify_merkle` /
+  `snap_verify_path` helpers)
+- `examples/crossengin_chat.nova` (+~25 lines: dispatch line,
+  `_admin_snap_verify` helper, 2 help lines)
+- `tests/unit/test_merkle.nova` (NEW, 60 assertions)
+- `tests/integration/scenario_lll_merkle.sh` (NEW, 13 assertions)
+- `SNAPSHOT_FORMAT.md` (Merkle section after the R8E schema section)
+- `NEXT_SESSION.md` (this section)
+- `README.md` (Status blockquote: R15E paragraph)
+
+### Known limitations / future work (R15E)
+
+- **Ed25519 signing of the root is NOT wired in this round.** The
+  brief calls out `meta.merkle_signature` as a follow-up; the meta
+  block already has room for one more optional slot, and the
+  signing API exists at `src/safety/ed25519.nova`. A
+  ~30-line follow-up will sign the root hex with the daemon's
+  long-lived keypair and verify the signature on load (when set).
+- **Merkle root commits ONLY to the KGS section.** SOUL, EPISODIC,
+  SYNAPSES, and SELFMODEL sections aren't covered by the
+  commitment. Extending coverage is straightforward (canonicalize
+  the section blobs into the leaf stream) but each new section
+  adds a wire-format breakage if the canonical ordering changes
+  between writer / reader. KGS-only is the conservative first
+  cut.
+- **Proofs are computed on demand, not persisted.** The chat
+  surface doesn't expose proof export today; a federation-peer
+  attestation surface that wants to ship a proof over the wire
+  needs a small helper that walks `merkle_proof` and emits
+  `meta.merkle_proof[N].dir / .sibling` lines. The current
+  reader has the slots to consume them.
+- **Order sensitivity is documented + tested as a feature, not
+  fixed.** If two operators independently shuffle the atom
+  ordering between save and verify, they get different roots.
+  Today the writer commits to insertion order and the reader
+  reads in the same order, so this never bites the substrate;
+  future federation will need to standardize a canonical sort.
+
 ## R15D (this session) -- mini-SPARQL declarative query language over the KG
 
 **Status: complete -- `src/kg/query.nova` (NEW) lands a text-based

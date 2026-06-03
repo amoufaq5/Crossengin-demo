@@ -97,6 +97,7 @@ atom. The realistic feature ladder, each rung its own multi-week lift:
 |   space + DoG extrema only)      |                     |
 | Canny edge with hysteresis       | DONE (P3.3 cont.)   |
 | HOG (oriented gradients)         | DONE (R14D)         |
+| HOG sliding-window detector      | DONE (R15C)         |
 | SIFT-like 128-D descriptor       | DONE (P3.3 cont. v2)|
 | ORB (FAST + rBRIEF, patent-free) | DONE (P3.3 cont. v3)|
 | Color histograms (HSV / Lab)     | 2-3 weeks           |
@@ -303,6 +304,51 @@ gradient structure and corner geometry, not just intensity moments:
   `(hog WxH cells=N dominant_bin=K magnitude_mean=M)`. The integer
   Newton's-method sqrt for the L2 norm is bounded at 50 iterations
   (same shape as `_sift_isqrt`).
+- **HOG sliding-window object detector**
+  (`src/io/transducers/image_detector.nova`, R15C -- the canonical
+  Dalal-Triggs pedestrian pipeline built on R14D's dense descriptor).
+  Dalal-Triggs (CVPR 2005) trained a linear SVM on the HOG vector of
+  a 64x128 window and slid that classifier across the image; windows
+  scoring above threshold became detections, then non-maximum
+  suppression collapsed overlapping windows. CrossEngin's no-training-
+  data design substitutes the SVM with TEMPLATE MATCHING via L1
+  distance (`hog_compare`) between every window's HOG and a stored
+  template HOG (the descriptor of a single positive example). The
+  pipeline is: (1) `det_train_template(image, w, h, win_w, win_h)`
+  computes the template HOG, optionally cropping a centered window if
+  the input image is larger than win_w x win_h; (2)
+  `det_sliding_window(image, w, h, template, threshold_milli, stride)`
+  walks (x, y) at the requested stride (4..32, default 8), extracts
+  each window via `_det_extract_window`, computes
+  `hog_compute_default` on the sub-image, and admits the position if
+  `hog_compare < threshold_milli`; (3) `det_nms(detections, box_size,
+  iou_milli)` sorts detections by ascending distance and greedily
+  drops overlapping windows whose IoU >= iou_milli/1000; (4)
+  `det_detect(...)` ties the three together via the template's
+  dimensions for the NMS box geometry. Threshold defaults to 4000
+  milli (identical-content windows score 0; uniform-background
+  windows score ~3000 on simple vertical-edge templates; the 4000
+  threshold sits in the "near-identical" band -- callers may tighten
+  for high-confidence-only matches or loosen to absorb noise).
+  NMS IoU defaults to 300 milli (Dalal-Triggs's 0.30 number).
+  Caps: image dim <= 256, template dim 16..128, stride clamped into
+  [4, 32]. Perf budget: brute force quadratic in the candidate-grid
+  count. For a 256x256 scene with 32x32 template at stride 8 the
+  grid is (256-32)/8+1 = 29 across and 29 down -> 841 windows; each
+  window runs `hog_compute_default(32x32)`. The R14D HOG profile
+  was estimated at ~100 ms per fixture but actual runtime is much
+  faster (sub-millisecond per HOG -- the 32x32 integration scenario
+  completes in <100 ms end-to-end for a 25-window grid). Per-image
+  atom: `image_detector_count_<none|one|few|many>` (emitted via
+  `det_append_features_if_templated` when `CE_VP_DETECT_TEMPLATE`
+  env points at a template PGM; bucket boundaries: 0 none, 1 one,
+  2..4 few, 5+ many). New chat admin: `/detect TEMPLATE.pgm
+  SCENE.pgm` decodes both PGMs, trains the template, runs sliding-
+  window + NMS, and prints `(detect N detection(s); T=WxH S=WxH
+  stride=S best=DIST at (X, Y))`. The integration scenario
+  (`scenario_jjj_detector.sh`) verifies detection at a known offset
+  within +/- stride accuracy and 0 detections on a uniform-background
+  scene.
 - **Stereo block-matching SAD disparity + depth**
   (`src/io/transducers/image_stereo.nova`, R7E -- the missing third
   dimension). The CV pipeline so far operates on a single image:
