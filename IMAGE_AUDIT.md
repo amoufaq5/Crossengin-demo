@@ -2402,3 +2402,96 @@ Error / usage paths:
   assertions).
 * `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
   help line (3 lines net).
+
+## R24F -- Video temporal smoothing: Kalman over R23D tracker outputs
+
+R23D ships per-track Kalman + greedy Hungarian assignment for a single
+frame transition; R24F builds **scene-level smoothing** on top: given
+a sequence of per-frame detection results (possibly noisy / missing /
+false-positive), produce a temporally-smoothed sequence of confirmed
+tracks with predicted positions for missing frames.
+
+The algorithm is mechanically simple because R23D already does the
+hard work: feed per-frame detections to a single shared tracker via
+`tracker_step`; snapshot the tracker's per-track state at end of
+every step; tag each snapshot `was_real = 1` when a detection
+matched this frame or `was_real = 0` when only the Kalman predict
+step ran. Frames with no detection still have a recorded position
+for every active track because `tracker_step` calls `track_predict`
+on every active track at the start of the step (before assignment),
+so the stored position IS the prediction when no detection arrived.
+
+### Public API (`src/io/transducers/video_smooth.nova`, NEW)
+
+* `vsmooth_init() -> vsmooth_state_t` -- wraps a fresh R23D tracker
+  plus a per-frame history list.
+* `vsmooth_step(state, detections, frame_idx)` -- step the wrapped
+  tracker, then snapshot every non-lost track's state into the
+  per-frame history.
+* `vsmooth_dense_field(state, num_frames)` -- list of length
+  `num_frames`, each entry the per-track snapshot list for that
+  frame (empty list for frames the smoother never saw).
+* `vsmooth_track_continuity(state, track_id) -> int_milli` --
+  fraction of frames in which `track_id` had a real detection over
+  the total frames it was present (1000 = perfect; 800 = 4/5; 0 if
+  the track is unknown).
+* `vsmooth_frame_record(state, frame_idx)` -- single-frame lookup.
+* `vsmooth_tracker(state)` -- read-only access to the wrapped
+  tracker for downstream consumers.
+* Per-snapshot accessors: `tat_track_id`, `tat_x_milli`,
+  `tat_y_milli`, `tat_vx_milli`, `tat_vy_milli`, `tat_w`, `tat_h`,
+  `tat_was_real`, `tat_x_px`, `tat_y_px`.
+
+### Chat command
+
+`/smooth <video_dir>` admin scans `frame_NNNN.pgm` for NNNN in
+`[1..VSMOOTH_MAX_FRAMES = 64]`, runs the brightness-centroid
+detector on each frame, feeds detections to the smoother, and
+prints a multi-line summary:
+
+```
+(smooth scanned 5 frame(s), dense field of 5 frame slot(s))
+(tracks_in_field=1)
+(smooth #1 present=5/5 real=4 predicted=1 continuity_milli=800)
+```
+
+### Verification snapshot (R24F)
+
+* **25 unit assertions** in `tests/unit/test_video_smooth.nova`
+  (NEW). All PASS. Covers: init shape (`num_frames_seen=0`,
+  `last_frame=0`, `step_count=0`); 5 consecutive moving frames ->
+  dense field has 5 frame slots with one real-detection snapshot
+  per slot; 5 frames where frame 3 has no detection -> dense field
+  still has a snapshot at frame 3 with `was_real=0`, and the
+  predicted `x_px` lies between the frame-2 and frame-4 positions;
+  5/5 real detections -> `continuity_milli=1000`; 4/5 real ->
+  `continuity_milli=800`; two simultaneous tracks (y=10 and y=80)
+  tracked independently with both reaching continuity 1000 and
+  separated by ~70 px in y; empty step still produces an empty
+  frame record; accessor shape checks.
+
+* **11 integration assertions** in
+  `tests/integration/scenario_rrrr_video_smooth.sh` (NEW). All
+  PASS. Driver synthesises a 5-frame 40x40 PGM fixture: bright
+  6x6 square at (10,10), (15,15), MISSING-FRAME (all-black),
+  (25,25), (30,30). Asserts `/smooth` scans 5 frames, dense field
+  has 5 slots, reports `tracks_in_field=1`, track #1 has
+  `present=5/5 real=4 predicted=1 continuity_milli=800`, no-arg ->
+  usage, missing dir -> graceful FAILED, `/help` advertises
+  `/smooth` and labels it R24F.
+
+* Existing CV suites stay green (R15C HOG detector 32, R16D
+  face_detect 36, R17D LBP 45, R18D face_recognize 48, R21D HOG
+  integral 42, R22A detector integral 22, R22D panorama 59, R23D
+  tracker 40).
+
+* Module count: +1 (`src/io/transducers/video_smooth.nova` NEW).
+
+### Files touched / added (R24F)
+
+* `src/io/transducers/video_smooth.nova` -- NEW (~320 lines).
+* `tests/unit/test_video_smooth.nova` -- NEW (25 assertions).
+* `tests/integration/scenario_rrrr_video_smooth.sh` -- NEW (11
+  assertions).
+* `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line.

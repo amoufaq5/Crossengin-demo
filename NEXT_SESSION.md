@@ -3,7 +3,108 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R23C (this session) -- Federation snapshot replication via gossip
+## R24F (this session) -- Video temporal smoothing: Kalman over R23D tracker outputs
+
+**Status: complete -- new module `src/io/transducers/video_smooth.nova`
+(+~320 lines) builds scene-level smoothing on top of the R23D
+per-track Kalman + greedy Hungarian assignment. Given a sequence of
+per-frame detection results (possibly noisy / missing / false-
+positive), it produces a temporally-smoothed sequence of confirmed
+tracks with predicted positions for missing frames.**
+
+### What R24F delivers
+
+1. **Module** -- `src/io/transducers/video_smooth.nova` (NEW).
+   Wraps a single shared R23D tracker plus a per-frame history
+   list. State slots: `[tracker, frames, frame_indices, last_frame,
+   step_count]`. Per-frame snapshot is a list of
+   `track_at_frame = [track_id, x_milli, y_milli, vx_milli,
+   vy_milli, w, h, was_real]` records, one per active (non-lost)
+   track. `was_real=1` iff the track matched a detection at this
+   step; `was_real=0` if only the R23D `track_predict` step ran
+   (so the stored position IS the Kalman prediction).
+
+2. **Public API**:
+   - `vsmooth_init() -> vsmooth_state_t`
+   - `vsmooth_step(state, detections, frame_idx) -> state`
+   - `vsmooth_dense_field(state, num_frames) ->
+      list[list[track_at_frame]]` (N frames x M tracks; empty
+      list for frame indices never stepped)
+   - `vsmooth_track_continuity(state, track_id) -> int_milli`
+     (1000 = real detection every frame the track was present;
+     800 = 4/5 real; 0 if track absent from history)
+   - `vsmooth_frame_record(state, frame_idx)`,
+     `vsmooth_tracker(state)`,
+     `vsmooth_num_frames_seen(state)`,
+     `vsmooth_last_frame(state)`,
+     `vsmooth_step_count(state)`
+   - Per-snapshot accessors: `tat_track_id`, `tat_x_milli`,
+     `tat_y_milli`, `tat_vx_milli`, `tat_vy_milli`, `tat_w`,
+     `tat_h`, `tat_was_real`, `tat_x_px`, `tat_y_px`
+
+3. **Chat dispatch** -- one new admin command
+   `/smooth <video_dir>`. Probes `frame_NNNN.pgm` for NNNN in
+   `[0001..VSMOOTH_MAX_FRAMES=64]`, parses each PGM with the
+   R23D brightness-centroid fallback detector (threshold=128),
+   feeds detections to `vsmooth_step`, renders summary:
+
+   ```
+   (smooth scanned 5 frame(s), dense field of 5 frame slot(s))
+   (tracks_in_field=1)
+   (smooth #1 present=5/5 real=4 predicted=1 continuity_milli=800)
+   ```
+
+   With no arg: `(/smooth needs VIDEO_DIR -- usage: /smooth
+   /tmp/smooth_frames)`. On missing dir / missing frame_0001.pgm:
+   `(smooth FAILED: <dir> does not contain frame_0001.pgm)`.
+
+### Verification snapshot
+
+- **25 unit assertions** in `tests/unit/test_video_smooth.nova`
+  (NEW). All PASS. Covers: init shape (`num_frames_seen=0`,
+  `last_frame=0`, `step_count=0`); 5 consecutive moving frames ->
+  dense field has 5 frame slots with one real-detection snapshot
+  per slot; 5 frames where frame 3 is missing -> dense field
+  still has a snapshot at frame 3 with `was_real=0`, predicted
+  `x_px` falls between frame-2 (15) and frame-4 (25); 5/5 real ->
+  `continuity_milli=1000`; 4/5 real -> `continuity_milli=800`;
+  two simultaneous tracks (y=10 and y=80) at +2 px/frame stay
+  separate with both reaching continuity 1000 and ~70 px y-gap;
+  empty step still produces an empty frame record; accessor shape
+  checks.
+
+- **11 integration assertions** in
+  `tests/integration/scenario_rrrr_video_smooth.sh` (NEW). All
+  PASS. Driver synthesises a 5-frame 40x40 PGM fixture (bright
+  6x6 square at (10,10), (15,15), ALL-BLACK, (25,25), (30,30)).
+  Asserts `/smooth` scans 5 frames, dense field of 5 slots,
+  `tracks_in_field=1`, track #1 has `present=5/5 real=4
+  predicted=1 continuity_milli=800`; `/smooth` no arg -> usage;
+  missing dir -> graceful FAILED; `/help` advertises /smooth as
+  R24F.
+
+- **Existing CV suites stay green** -- R15C HOG detector 32, R16D
+  face_detect 36, R17D LBP 45, R18D face_recognize 48, R21D HOG
+  integral 42, R22A detector integral 22, R22D panorama 59,
+  R23D tracker 40.
+
+### Files touched (R24F)
+
+- `src/io/transducers/video_smooth.nova` -- NEW (~320 lines).
+- `tests/unit/test_video_smooth.nova` -- NEW (25 assertions).
+- `tests/integration/scenario_rrrr_video_smooth.sh` -- NEW (11
+  assertions).
+- `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line.
+- `IMAGE_AUDIT.md`, `README.md`, `NEXT_SESSION.md` -- updated.
+
+### Slot pivot
+
+The brief specified `scenario_rrrr_video_smooth.sh` -- rrrr was
+free in the integration scenario letter grid; took rrrr as
+specified.
+
+## R23C (last session) -- Federation snapshot replication via gossip
 
 **Status: complete -- new module `src/federation/snapshot_replication.nova`
 (+~570 lines) lets peers AUTOMATICALLY replicate signed snapshots

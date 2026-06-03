@@ -1,0 +1,404 @@
+// CrossEngin io/transducers: Video temporal smoothing -- Kalman over
+// R23D tracker outputs (R24F).
+//
+// R23D ships per-track Kalman + greedy Hungarian assignment for a single
+// frame transition; R24F builds scene-level smoothing on top: given a
+// sequence of per-frame detection results (possibly noisy / missing /
+// false-positive), produce a temporally-smoothed sequence of confirmed
+// tracks with predicted positions for missing frames.
+//
+// Algorithm:
+//   1. For each frame, run detector (R15C HOG or R16D Haar) -> per-frame
+//      detection list.
+//   2. Feed detections into a single shared R23D tracker via tracker_step.
+//   3. Snapshot the tracker's per-track state at end of each step. Every
+//      active track has a position post-step: matched tracks have a
+//      Kalman update applied to a real observation; unmatched active
+//      tracks have only the Kalman predict step applied (so their stored
+//      position IS the prediction).
+//   4. Tag each snapshot with was_real = 1 (matched detection this frame)
+//      or 0 (Kalman-predicted only).
+//   5. The dense field is the recorded history -- frame N missing
+//      detection is automatically filled with the post-predict position.
+//
+// Public API
+//   vsmooth_init() -> vsmooth_state_t
+//   vsmooth_step(state, detections, frame_idx) -> updated_state
+//   vsmooth_dense_field(state, num_frames) -> list[list[track_at_frame]]
+//                                            (N frames x M tracks)
+//   vsmooth_track_continuity(state, track_id) -> int_milli (1000 = always)
+//   vsmooth_tracker(state) -> tracker (read-only access to underlying)
+//   vsmooth_num_frames_seen(state) -> int
+//   vsmooth_frame_record(state, frame_idx) -> list[track_at_frame] | 0
+//   tat_track_id(t), tat_x_milli(t), tat_y_milli(t), tat_vx_milli(t),
+//   tat_vy_milli(t), tat_w(t), tat_h(t), tat_was_real(t),
+//   tat_x_px(t), tat_y_px(t)
+//   vsmooth_run_command(arg) -> str    (chat helper for /smooth)
+//
+// track_at_frame is a list of 8 slots:
+//   [track_id, x_milli, y_milli, vx_milli, vy_milli, w, h, was_real]
+// where was_real = 1 (real detection this frame) or 0 (Kalman predict).
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins only.
+// CrossEngin dependencies: image_pgm.nova, image_tracker.nova.
+
+import "image_pgm.nova"
+import "image_tracker.nova"
+
+let VSMOOTH_MILLI = 1000
+
+// State slot indices.
+let VSMOOTH_S_TRACKER       = 0
+let VSMOOTH_S_FRAMES        = 1
+let VSMOOTH_S_FRAME_INDICES = 2
+let VSMOOTH_S_LAST_FRAME    = 3
+let VSMOOTH_S_STEP_COUNT    = 4
+
+// track_at_frame slot indices.
+let TAT_TRACK_ID  = 0
+let TAT_X_MILLI   = 1
+let TAT_Y_MILLI   = 2
+let TAT_VX_MILLI  = 3
+let TAT_VY_MILLI  = 4
+let TAT_W         = 5
+let TAT_H         = 6
+let TAT_WAS_REAL  = 7
+
+fn tat_track_id(t)   { return t[TAT_TRACK_ID] }
+fn tat_x_milli(t)    { return t[TAT_X_MILLI] }
+fn tat_y_milli(t)    { return t[TAT_Y_MILLI] }
+fn tat_vx_milli(t)   { return t[TAT_VX_MILLI] }
+fn tat_vy_milli(t)   { return t[TAT_VY_MILLI] }
+fn tat_w(t)          { return t[TAT_W] }
+fn tat_h(t)          { return t[TAT_H] }
+fn tat_was_real(t)   { return t[TAT_WAS_REAL] }
+
+fn tat_x_px(t) { return (t[TAT_X_MILLI] + 500) / VSMOOTH_MILLI }
+fn tat_y_px(t) { return (t[TAT_Y_MILLI] + 500) / VSMOOTH_MILLI }
+
+fn vsmooth_tracker(state)         { return state[VSMOOTH_S_TRACKER] }
+fn vsmooth_num_frames_seen(state) { return len(state[VSMOOTH_S_FRAME_INDICES]) }
+fn vsmooth_last_frame(state)      { return state[VSMOOTH_S_LAST_FRAME] }
+fn vsmooth_step_count(state)      { return state[VSMOOTH_S_STEP_COUNT] }
+
+fn vsmooth_init() {
+    let st = list_new()
+    push(st, tracker_new())
+    push(st, list_new())  // frames -- list of frame_records (list[track_at_frame])
+    push(st, list_new())  // frame_indices -- list of int frame_idx (parallel to frames)
+    push(st, 0)           // last_frame
+    push(st, 0)           // step_count
+    return st
+}
+
+// Construct a track_at_frame snapshot from the current state of a track.
+fn _vsmooth_snapshot_track(t, was_real) {
+    let snap = list_new()
+    push(snap, track_id(t))
+    let s = track_state(t)
+    push(snap, s[0])
+    push(snap, s[1])
+    push(snap, s[2])
+    push(snap, s[3])
+    push(snap, s[4])
+    push(snap, s[5])
+    push(snap, was_real)
+    return snap
+}
+
+fn vsmooth_step(state, detections, frame_idx) {
+    let tracker = state[VSMOOTH_S_TRACKER]
+    tracker_step(tracker, detections, frame_idx)
+
+    // Snapshot every track in the tracker whose first_seen <= frame_idx
+    // and which is not lost. was_real = 1 iff last_seen == frame_idx.
+    let frame_record = list_new()
+    let all = tracker_all_tracks(tracker)
+    let i = 0
+    let n = len(all)
+    while i < n {
+        let t = all[i]
+        if track_first_seen(t) <= frame_idx {
+            // Only snapshot non-lost tracks (lost tracks contribute no
+            // smoothing signal beyond their last seen frame).
+            let status = track_status(t)
+            let is_lost = str_eq(status, "lost")
+            if is_lost == 0 {
+                let was_real = 0
+                if track_last_seen(t) == frame_idx { was_real = 1 }
+                let snap = _vsmooth_snapshot_track(t, was_real)
+                push(frame_record, snap)
+            }
+        }
+        i = i + 1
+    }
+
+    push(state[VSMOOTH_S_FRAMES], frame_record)
+    push(state[VSMOOTH_S_FRAME_INDICES], frame_idx)
+    list_set(state, VSMOOTH_S_LAST_FRAME, frame_idx)
+    list_set(state, VSMOOTH_S_STEP_COUNT, state[VSMOOTH_S_STEP_COUNT] + 1)
+    return state
+}
+
+// Return frame record (list[track_at_frame]) for a given frame_idx, or 0
+// if no frame with that index was ever stepped.
+fn vsmooth_frame_record(state, frame_idx) {
+    let indices = state[VSMOOTH_S_FRAME_INDICES]
+    let frames = state[VSMOOTH_S_FRAMES]
+    let i = 0
+    let n = len(indices)
+    while i < n {
+        if indices[i] == frame_idx {
+            return frames[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Build the dense N-frames x M-tracks field. For each frame index in
+// [1..num_frames]:
+//   - If a frame record was stored for that index, use it.
+//   - Otherwise, emit an empty list for that frame (no tracks active).
+// Missing-frame entries for a track that exists either side are
+// already filled by the R23D Kalman predict step (which runs at the
+// start of tracker_step for every active track, matched or not), so
+// any track whose record is present at frame N already has the
+// predicted position when it had no detection.
+fn vsmooth_dense_field(state, num_frames) {
+    let out = list_new()
+    let f = 1
+    while f <= num_frames {
+        let rec = vsmooth_frame_record(state, f)
+        if rec == 0 {
+            push(out, list_new())
+        } else {
+            push(out, rec)
+        }
+        f = f + 1
+    }
+    return out
+}
+
+// Find the slot for `track_id` in the per-frame record. Return the
+// track_at_frame snapshot, or 0 if absent.
+fn _vsmooth_find_in_record(rec, target_id) {
+    let i = 0
+    let n = len(rec)
+    while i < n {
+        let s = rec[i]
+        if s[TAT_TRACK_ID] == target_id {
+            return s
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Continuity score (int_milli): fraction of frames in which the track
+// had a REAL detection over the total number of frames in which it
+// was present (real or predicted). 1000 = every frame the track was
+// in the dense field came from a real observation; below 1000 means
+// some frames were Kalman-predicted only.
+fn vsmooth_track_continuity(state, track_id_q) {
+    let frames = state[VSMOOTH_S_FRAMES]
+    let n_frames = len(frames)
+    let n_present = 0
+    let n_real = 0
+    let i = 0
+    while i < n_frames {
+        let rec = frames[i]
+        let snap = _vsmooth_find_in_record(rec, track_id_q)
+        if snap != 0 {
+            n_present = n_present + 1
+            if snap[TAT_WAS_REAL] == 1 {
+                n_real = n_real + 1
+            }
+        }
+        i = i + 1
+    }
+    if n_present == 0 { return 0 }
+    return (n_real * VSMOOTH_MILLI) / n_present
+}
+
+// Helpers for the /smooth chat command. Mirrors image_tracker's
+// /track helper shape (PGM frame sequence + per-frame summary).
+
+let VSMOOTH_MAX_FRAMES = 64
+
+fn _vsmooth_int_to_padded4(n) {
+    let s = int_to_str(n)
+    let pad = 4 - len(s)
+    let out = ""
+    while pad > 0 {
+        out = out + "0"
+        pad = pad - 1
+    }
+    return out + s
+}
+
+fn _vsmooth_join_path(dir, name) {
+    let n = len(dir)
+    if n == 0 { return name }
+    if char_at(dir, n - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+fn _vsmooth_file_exists(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    sys_close(fd)
+    return 1
+}
+
+fn _vsmooth_centroid_detection(data, w, h) {
+    let out = list_new()
+    let bright_threshold = 128
+    let sum_x = 0
+    let sum_y = 0
+    let count = 0
+    let min_x = w
+    let max_x = 0 - 1
+    let min_y = h
+    let max_y = 0 - 1
+    let y = 0
+    while y < h {
+        let x = 0
+        while x < w {
+            let v = pgm_pixel(data, w, x, y)
+            if v >= bright_threshold {
+                sum_x = sum_x + x
+                sum_y = sum_y + y
+                count = count + 1
+                if x < min_x { min_x = x }
+                if x > max_x { max_x = x }
+                if y < min_y { min_y = y }
+                if y > max_y { max_y = y }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if count == 0 { return out }
+    let cx = sum_x / count
+    let cy = sum_y / count
+    let bw = max_x - min_x + 1
+    let bh = max_y - min_y + 1
+    if bw <= 0 { bw = 1 }
+    if bh <= 0 { bh = 1 }
+    push(out, detection_from_xywh(cx, cy, bw, bh))
+    return out
+}
+
+// Format the dense field as a multi-line summary for /smooth.
+fn _vsmooth_format_summary(state, frames_seen) {
+    let tracker = state[VSMOOTH_S_TRACKER]
+    let dense = vsmooth_dense_field(state, frames_seen)
+    let lines = ""
+    lines = lines + "(smooth scanned " + int_to_str(frames_seen)
+                  + " frame(s), dense field of " + int_to_str(len(dense))
+                  + " frame slot(s))"
+
+    // Collect all track ids that appeared anywhere.
+    let seen_ids = list_new()
+    let f = 0
+    while f < len(dense) {
+        let rec = dense[f]
+        let i = 0
+        while i < len(rec) {
+            let snap = rec[i]
+            let tid = snap[TAT_TRACK_ID]
+            let known = 0
+            let k = 0
+            while k < len(seen_ids) {
+                if seen_ids[k] == tid { known = 1 }
+                k = k + 1
+            }
+            if known == 0 { push(seen_ids, tid) }
+            i = i + 1
+        }
+        f = f + 1
+    }
+
+    lines = lines + "\n(tracks_in_field=" + int_to_str(len(seen_ids)) + ")"
+
+    // Per-track continuity + presence summary.
+    let i = 0
+    while i < len(seen_ids) {
+        let tid = seen_ids[i]
+        let cont = vsmooth_track_continuity(state, tid)
+        let n_present = 0
+        let n_real = 0
+        let n_pred = 0
+        let f2 = 0
+        while f2 < len(dense) {
+            let rec2 = dense[f2]
+            let snap = _vsmooth_find_in_record(rec2, tid)
+            if snap != 0 {
+                n_present = n_present + 1
+                if snap[TAT_WAS_REAL] == 1 {
+                    n_real = n_real + 1
+                } else {
+                    n_pred = n_pred + 1
+                }
+            }
+            f2 = f2 + 1
+        }
+        lines = lines + "\n(smooth #" + int_to_str(tid)
+                      + " present=" + int_to_str(n_present)
+                      + "/" + int_to_str(len(dense))
+                      + " real=" + int_to_str(n_real)
+                      + " predicted=" + int_to_str(n_pred)
+                      + " continuity_milli=" + int_to_str(cont) + ")"
+        i = i + 1
+    }
+
+    return lines
+}
+
+fn vsmooth_run_command(arg) {
+    if len(arg) == 0 {
+        return "(/smooth needs VIDEO_DIR -- usage: /smooth /tmp/smooth_frames)"
+    }
+    let first_path = _vsmooth_join_path(arg, "frame_0001.pgm")
+    if _vsmooth_file_exists(first_path) == 0 {
+        return "(smooth FAILED: " + arg + " does not contain frame_0001.pgm)"
+    }
+    let state = vsmooth_init()
+    let frames_seen = 0
+    let f = 1
+    let keep = 1
+    while keep == 1 {
+        if f > VSMOOTH_MAX_FRAMES { keep = 0 }
+        if keep == 1 {
+            let frame_name = "frame_" + _vsmooth_int_to_padded4(f) + ".pgm"
+            let frame_path = _vsmooth_join_path(arg, frame_name)
+            if _vsmooth_file_exists(frame_path) == 0 {
+                keep = 0
+            } else {
+                let r = pgm_parse_file(frame_path)
+                let err = pgm_result_error(r)
+                if len(err) > 0 {
+                    keep = 0
+                } else {
+                    let w = pgm_result_width(r)
+                    let h = pgm_result_height(r)
+                    let data = pgm_result_data(r)
+                    let dets = _vsmooth_centroid_detection(data, w, h)
+                    vsmooth_step(state, dets, f)
+                    frames_seen = frames_seen + 1
+                    f = f + 1
+                }
+            }
+        }
+    }
+
+    if frames_seen == 0 {
+        return "(smooth FAILED: " + arg + " yielded no usable frames)"
+    }
+
+    return _vsmooth_format_summary(state, frames_seen)
+}

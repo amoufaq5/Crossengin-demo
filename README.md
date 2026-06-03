@@ -130,7 +130,44 @@ computational units rather than orchestrating a pipeline of modules.
 > 32, R16D face_detect 36, R17D LBP 45, R18D face_recognize 48,
 > R21D HOG integral 42, R22A detector integral 22, R22D panorama
 > 59 checks). Chat: `/track <video_dir>` admin command wired
-> into `examples/crossengin_chat.nova`. Module count: +1. R23B adds `src/perception/lipsync.nova` — audio-vision
+> into `examples/crossengin_chat.nova`. Module count: +1.
+> R24F adds `src/io/transducers/video_smooth.nova` — video temporal
+> smoothing on top of R23D. Given a sequence of per-frame detection
+> results (possibly noisy / missing / false-positive), produces a
+> temporally-smoothed sequence of confirmed tracks with predicted
+> positions for missing frames. Wraps a single shared R23D tracker
+> plus a per-frame history list of `track_at_frame = [track_id,
+> x_milli, y_milli, vx_milli, vy_milli, w, h, was_real]` snapshots;
+> `was_real=1` when a detection matched this frame, `was_real=0`
+> when only the R23D `track_predict` step ran (so the stored
+> position IS the Kalman prediction). Public API: `vsmooth_init()`,
+> `vsmooth_step(state, detections, frame_idx)`,
+> `vsmooth_dense_field(state, num_frames) ->
+> list[list[track_at_frame]]` (N frames x M tracks; missing-frame
+> entries already carry the post-predict position),
+> `vsmooth_track_continuity(state, track_id) -> int_milli` (1000 =
+> real detection every frame the track was present; 800 = 4/5;
+> 0 if track unknown), plus `vsmooth_frame_record`,
+> `vsmooth_tracker`, and per-snapshot accessors `tat_track_id`,
+> `tat_x_milli`, `tat_y_milli`, `tat_vx_milli`, `tat_vy_milli`,
+> `tat_w`, `tat_h`, `tat_was_real`, `tat_x_px`, `tat_y_px`.
+> Verification: 25 unit assertions in
+> `tests/unit/test_video_smooth.nova` (NEW; init shape, 5 moving
+> frames -> dense field 5 slots, 5 frames with frame 3 missing ->
+> dense field still has frame-3 snapshot with `was_real=0` and
+> predicted `x_px` between frame-2 and frame-4 positions, 5/5 real
+> -> continuity 1000, 4/5 real -> continuity 800, two simultaneous
+> tracks tracked independently with both continuity 1000 and ~70 px
+> y-gap, empty step -> empty record, accessors). 11 integration
+> assertions in `tests/integration/scenario_rrrr_video_smooth.sh`
+> (NEW; 5-frame 40x40 PGM fixture with bright 6x6 square at (10,10)
+> -> (15,15) -> ALL-BLACK -> (25,25) -> (30,30); asserts /smooth
+> dense field of 5 slots, tracks_in_field=1, track #1 present=5/5
+> real=4 predicted=1 continuity_milli=800; /smooth no arg -> usage;
+> missing dir -> graceful FAILED; /help advertises /smooth and
+> labels it R24F). Existing CV suites stay green (R23D tracker 40
+> checks). Chat: `/smooth <video_dir>` admin command wired into
+> `examples/crossengin_chat.nova`. Module count: +1. R23B adds `src/perception/lipsync.nova` — audio-vision
 > lip sync detection. Given a sequence of PGM video frames + an audio WAV,
 > the detector reports whether the speaker on screen is actually saying the
 > words in the audio. Per-frame mouth-open score: lower-third of R16D Haar
