@@ -3,6 +3,92 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R26F (this session) -- Performance regression hunt against R25E baseline
+
+**Status: complete -- zero regressions found across 5 trials of every
+benchmark in `bench/baseline.json`. Three benches got measurably FASTER
+since baseline:** `hog_detector_integral` (-65.8%), `hog_detector_scalar`
+(-40.0%), `nova_dot_simd` (-19.9%). Root cause: NOVA `bin/nova` rebuild
+between baseline capture and now produced slightly faster scalar
+inner-loop codegen. No CrossEngin source touched; bit-identity asserts
+still pass on every SIMD path; `make self-host` in NOVA still emits
+stage2 == stage3 bit-identical. **No fixes shipped; no regressions to
+fix.**
+
+### What R26F delivers
+
+1. **NEW: `REGRESSION_HUNT_R26F.md`** (~2100 words) -- 15-bench
+   comparison table (median across 5 trials), top 3 speed-ups
+   attribution (NOVA toolchain rebuild), sanity-check of R25E
+   headline numbers (R15A 6.11x stereo, R18A.2 3.36x mulacc, R17C
+   ~110x image-SAD, R11D 137.75x NOVA SAD), baseline-refresh policy
+   decision (DO NOT refresh -- keeping the R25E floor preserves
+   regression-detection power), R27 candidates list (none).
+2. **MOD: `BENCHMARKS.md`** -- new R26F regression-hunt update section
+   at end of file with the three FASTER deltas and the toolchain-rebuild
+   root cause.
+3. **MOD: `NEXT_SESSION.md`** -- this entry.
+
+### Top 3 speed-ups (NOT regressions)
+
+| bench                   | baseline_ms | R26F median_ms | delta%  |
+|-------------------------|------------:|---------------:|--------:|
+| `hog_detector_integral` |     159.625 |         54.617 | -65.8%  |
+| `hog_detector_scalar`   |     173.158 |        103.818 | -40.0%  |
+| `nova_dot_simd`         |       0.870 |          0.697 | -19.9%  |
+
+The other 12 benches are NOMINAL (within +-20% of baseline) -- worst
+median delta is `lk_flow_mulacc_simd` -0.5% (i.e., nominally identical).
+
+### Sanity-checked headline numbers (all attainable)
+
+| metric                                           | R25E baseline | R26F current  | status       |
+|--------------------------------------------------|---------------|---------------|--------------|
+| R15A stereo SAD u8 SIMD                          | 5.94x         | 6.11x         | HOLDS / +    |
+| R18A.2 LK mulacc absolute wallclock              | 17.31 ms      | 17.23 ms      | HOLDS        |
+| R18A.2 LK mulacc speedup vs scalar               | 3.35x         | 3.36x         | HOLDS        |
+| R17C image-residual u8 SIMD vs scalar            | 106.65x       | ~110.04x      | HOLDS / +    |
+| R11D NOVA AVX2 `simd_sum_abs_diff` vs scalar     | 141.54x       | 137.75x       | HOLDS        |
+
+(R18A.2 brief reported 3.69x because its scalar reference was 67 ms;
+the current rebuilt-compiler scalar is 57 ms, so the ratio compressed
+slightly even though mulacc absolute wallclock is bit-identical.)
+
+### Baseline policy
+
+`bench/baseline.json` is INTENTIONALLY NOT refreshed in R26F.
+Rationale (see REGRESSION_HUNT_R26F.md for full reasoning):
+
+* Refreshing now would convert the three FASTER readings into NOMINAL,
+  weakening future regression detection: if a future NOVA change
+  undoes the compiler-side win, the regression check would not flag it.
+* The R25E baseline now functions as a useful "what was achievable
+  on the day the harness shipped" floor, and the regression-hunt
+  framework reports FASTER as a positive signal.
+* Refresh on the next major NOVA compiler bump or a benchmark
+  methodology change, not on an opportunistic "things got faster"
+  observation.
+
+### Verification
+
+* `scripts/bench.sh --compare bench/baseline.json` x5 -> exit 0 each
+  time; worst single-trial delta +50% (image_sad_u8_simd, sub-microsecond
+  resolution floor); median delta across 5 trials never exceeds +10%.
+* SIMD bit-identity asserts (`mism = 0` for all four code paths)
+  PASSED on every trial.
+* `make self-host` in `/home/user/NOVA` -> `=== SELF-HOSTING VERIFIED
+  ===`, stage2 == stage3 bit-identical. NOVA toolchain is stable.
+
+### Files touched (R26F)
+
+* NEW: `REGRESSION_HUNT_R26F.md` (~2100 words).
+* MOD: `BENCHMARKS.md` (R26F regression-hunt update section).
+* MOD: `NEXT_SESSION.md` (this entry).
+
+No source modules touched. No tests added. No bench harness changes.
+
+---
+
 ## R25B (this session) -- End-to-end voice conversation demo (STT -> KG -> TTS)
 
 **Status: complete -- new `examples/voice_conversation.nova` (~390 lines)

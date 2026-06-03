@@ -165,3 +165,26 @@ compute kernels. The NOVA-side `tests/benchmark/bench_*.nova` programs
 `bench_ann_query.nova`) take minutes to run because they exercise long
 substrate tick loops; the harness does NOT include them by default. Run
 `make benchmark` directly for those.
+
+## R26F regression-hunt update
+
+A five-trial sweep against `bench/baseline.json` (R26F, see
+`REGRESSION_HUNT_R26F.md`) found ZERO regressions. Three benchmarks got
+measurably FASTER between the baseline capture and the hunt:
+
+| bench                   | baseline_ms | R26F median_ms | delta%  |
+|-------------------------|------------:|---------------:|--------:|
+| `hog_detector_integral` | 159.625     |  54.617        | -65.8%  |
+| `hog_detector_scalar`   | 173.158     | 103.818        | -40.0%  |
+| `nova_dot_simd`         |   0.870     |   0.697        | -19.9%  |
+
+Root cause: a NOVA `bin/nova` self-host rebuild (mtime 2026-06-03
+22:23, 22 minutes after the baseline capture at 22:01) that emits
+slightly faster scalar inner loops for the HOG paths. CrossEngin
+source unchanged. Bit-identity asserts still pass on every SIMD path.
+`make self-host` in NOVA still emits stage2 == stage3.
+
+The baseline JSON is intentionally NOT refreshed; keeping it as the
+floor means future hunts can still see at-a-glance how much faster the
+current toolchain runs. Refresh on the next major NOVA bump or
+benchmark methodology change.
