@@ -1,0 +1,626 @@
+// CrossEngin io/transducers: Image object tracking via Kalman filter +
+// greedy Hungarian assignment (R23D).
+//
+// R15C HOG sliding-window and R16D Haar face detectors produce per-frame
+// detections; this module associates them across frames into persistent
+// tracks with stable IDs via a per-track Kalman filter (predict + update
+// with per-coordinate variances) plus greedy minimum-L2 Hungarian
+// assignment. Standard track lifecycle: probational -> confirmed after N
+// matched frames; lost after N missed frames (default N=5).
+//
+// Public API
+//   tracker_new() -> tracker_t
+//   tracker_step(tracker, detections, frame_idx) -> tracker
+//   tracker_active_tracks(tracker) -> list[track_t]
+//   tracker_all_tracks(tracker) -> list[track_t]
+//   tracker_confirmed_tracks(tracker) -> list[track_t]
+//   tracker_track_at(tracker, track_id) -> track_t | 0
+//   track_state(track) -> [x_milli, y_milli, vx_milli, vy_milli, w, h]
+//   track_id, track_age, track_status, track_hits, track_missed,
+//   track_variance, track_first_seen, track_last_seen,
+//   track_x_px, track_y_px
+//   detection_from_xywh(x, y, w, h)
+//   tracker_detections_from_det(det_list, bbox_w, bbox_h)
+//   track_predict(track) -> track       (Kalman predict step)
+//   track_run_command(arg) -> str       (chat helper)
+//
+// Coordinate convention: positions stored in MILLI-pixels for sub-pixel
+// accuracy in the integer domain. bbox w, h in whole-px.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins only.
+// CrossEngin dependencies: image_pgm.nova, image_detector.nova.
+
+import "image_pgm.nova"
+import "image_detector.nova"
+
+let TRACKER_CONFIRM_THRESHOLD = 5
+let TRACKER_LOST_THRESHOLD = 5
+let TRACKER_MAX_ASSIGN_DIST_PX = 50
+let TRACKER_PROCESS_NOISE_Q = 1000
+let TRACKER_MEASURE_NOISE_R = 64000
+let TRACKER_INITIAL_VARIANCE = 1000000
+let TRACKER_MILLI = 1000
+let TRACKER_VELOCITY_ALPHA_MILLI = 700
+
+let TRACKER_STATUS_PROBATIONAL = "probational"
+let TRACKER_STATUS_CONFIRMED   = "confirmed"
+let TRACKER_STATUS_LOST        = "lost"
+
+let TRACK_ID            = 0
+let TRACK_X_MILLI       = 1
+let TRACK_Y_MILLI       = 2
+let TRACK_VX_MILLI      = 3
+let TRACK_VY_MILLI      = 4
+let TRACK_W             = 5
+let TRACK_H             = 6
+let TRACK_STATUS        = 7
+let TRACK_AGE           = 8
+let TRACK_HITS          = 9
+let TRACK_MISSED        = 10
+let TRACK_VARIANCE      = 11
+let TRACK_FIRST_SEEN    = 12
+let TRACK_LAST_SEEN     = 13
+
+let TRACK_SLOTS         = 14
+
+let TRACKER_TRACKS         = 0
+let TRACKER_NEXT_ID        = 1
+let TRACKER_LAST_FRAME     = 2
+let TRACKER_STEP_COUNT     = 3
+
+fn tracker_confirm_threshold()    { return TRACKER_CONFIRM_THRESHOLD }
+fn tracker_lost_threshold()       { return TRACKER_LOST_THRESHOLD }
+fn tracker_max_assign_dist_px()   { return TRACKER_MAX_ASSIGN_DIST_PX }
+fn tracker_milli()                { return TRACKER_MILLI }
+
+fn track_id(t)        { return t[TRACK_ID] }
+fn track_age(t)       { return t[TRACK_AGE] }
+fn track_status(t)    { return t[TRACK_STATUS] }
+fn track_hits(t)      { return t[TRACK_HITS] }
+fn track_missed(t)    { return t[TRACK_MISSED] }
+fn track_variance(t)  { return t[TRACK_VARIANCE] }
+fn track_first_seen(t){ return t[TRACK_FIRST_SEEN] }
+fn track_last_seen(t) { return t[TRACK_LAST_SEEN] }
+
+fn track_state(t) {
+    let s = list_new()
+    push(s, t[TRACK_X_MILLI])
+    push(s, t[TRACK_Y_MILLI])
+    push(s, t[TRACK_VX_MILLI])
+    push(s, t[TRACK_VY_MILLI])
+    push(s, t[TRACK_W])
+    push(s, t[TRACK_H])
+    return s
+}
+
+fn track_x_px(t)  { return (t[TRACK_X_MILLI] + 500) / TRACKER_MILLI }
+fn track_y_px(t)  { return (t[TRACK_Y_MILLI] + 500) / TRACKER_MILLI }
+
+fn tracker_step_count(tracker)    { return tracker[TRACKER_STEP_COUNT] }
+fn tracker_next_id(tracker)       { return tracker[TRACKER_NEXT_ID] }
+fn tracker_last_frame(tracker)    { return tracker[TRACKER_LAST_FRAME] }
+fn tracker_all_tracks(tracker)    { return tracker[TRACKER_TRACKS] }
+
+fn tracker_active_tracks(tracker) {
+    let all = tracker[TRACKER_TRACKS]
+    let out = list_new()
+    let i = 0
+    let n = len(all)
+    while i < n {
+        let t = all[i]
+        if str_eq(t[TRACK_STATUS], TRACKER_STATUS_LOST) == 0 {
+            push(out, t)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn tracker_confirmed_tracks(tracker) {
+    let all = tracker[TRACKER_TRACKS]
+    let out = list_new()
+    let i = 0
+    let n = len(all)
+    while i < n {
+        let t = all[i]
+        if str_eq(t[TRACK_STATUS], TRACKER_STATUS_CONFIRMED) == 1 {
+            push(out, t)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn tracker_track_at(tracker, track_id_q) {
+    let all = tracker[TRACKER_TRACKS]
+    let i = 0
+    let n = len(all)
+    while i < n {
+        let t = all[i]
+        if t[TRACK_ID] == track_id_q {
+            return t
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn tracker_new() {
+    let tr = list_new()
+    push(tr, list_new())
+    push(tr, 1)
+    push(tr, 0)
+    push(tr, 0)
+    return tr
+}
+
+fn _track_new(id, x_px, y_px, w, h, frame_idx) {
+    let t = list_new()
+    push(t, id)
+    push(t, int_mul(x_px, TRACKER_MILLI))
+    push(t, int_mul(y_px, TRACKER_MILLI))
+    push(t, 0)
+    push(t, 0)
+    push(t, w)
+    push(t, h)
+    push(t, TRACKER_STATUS_PROBATIONAL)
+    push(t, 1)
+    push(t, 1)
+    push(t, 0)
+    push(t, TRACKER_INITIAL_VARIANCE)
+    push(t, frame_idx)
+    push(t, frame_idx)
+    return t
+}
+
+fn _det_x(d) { return d[0] }
+fn _det_y(d) { return d[1] }
+fn _det_w(d) {
+    if len(d) >= 4 { return d[2] }
+    return 0
+}
+fn _det_h(d) {
+    if len(d) >= 4 { return d[3] }
+    return 0
+}
+
+fn detection_from_xywh(x, y, w, h) {
+    let d = list_new()
+    push(d, x)
+    push(d, y)
+    push(d, w)
+    push(d, h)
+    return d
+}
+
+fn tracker_detections_from_det(det_list, bbox_w, bbox_h) {
+    let out = list_new()
+    let i = 0
+    let n = len(det_list)
+    while i < n {
+        let d = det_list[i]
+        push(out, detection_from_xywh(_det_x(d), _det_y(d), bbox_w, bbox_h))
+        i = i + 1
+    }
+    return out
+}
+
+fn track_predict(t) {
+    let new_x = int_add(t[TRACK_X_MILLI], t[TRACK_VX_MILLI])
+    let new_y = int_add(t[TRACK_Y_MILLI], t[TRACK_VY_MILLI])
+    let new_var = int_add(t[TRACK_VARIANCE], TRACKER_PROCESS_NOISE_Q)
+    list_set(t, TRACK_X_MILLI, new_x)
+    list_set(t, TRACK_Y_MILLI, new_y)
+    list_set(t, TRACK_VARIANCE, new_var)
+    return t
+}
+
+fn _track_update(t, x_obs_px, y_obs_px, w_obs, h_obs) {
+    let var = t[TRACK_VARIANCE]
+    let denom = int_add(var, TRACKER_MEASURE_NOISE_R)
+    let gain_milli = TRACKER_MILLI / 2
+    if denom > 0 {
+        gain_milli = (var * TRACKER_MILLI) / denom
+    }
+    if gain_milli < 0 { gain_milli = 0 }
+    if gain_milli > TRACKER_MILLI { gain_milli = TRACKER_MILLI }
+
+    let x_obs_milli = int_mul(x_obs_px, TRACKER_MILLI)
+    let y_obs_milli = int_mul(y_obs_px, TRACKER_MILLI)
+
+    let x_pred = t[TRACK_X_MILLI]
+    let y_pred = t[TRACK_Y_MILLI]
+
+    let x_residual = int_sub(x_obs_milli, x_pred)
+    let y_residual = int_sub(y_obs_milli, y_pred)
+
+    let x_blend = (x_residual * gain_milli) / TRACKER_MILLI
+    let y_blend = (y_residual * gain_milli) / TRACKER_MILLI
+
+    let x_new = int_add(x_pred, x_blend)
+    let y_new = int_add(y_pred, y_blend)
+
+    let one_minus_gain = TRACKER_MILLI - gain_milli
+    let var_new = (var * one_minus_gain) / TRACKER_MILLI
+
+    list_set(t, TRACK_X_MILLI, x_new)
+    list_set(t, TRACK_Y_MILLI, y_new)
+    list_set(t, TRACK_VARIANCE, var_new)
+
+    list_set(t, TRACK_W, w_obs)
+    list_set(t, TRACK_H, h_obs)
+    return t
+}
+
+fn _track_update_velocity(t, prev_x_milli, prev_y_milli, delta_frames) {
+    if delta_frames <= 0 { return t }
+    let new_x = t[TRACK_X_MILLI]
+    let new_y = t[TRACK_Y_MILLI]
+    let observed_vx = int_div(int_sub(new_x, prev_x_milli), delta_frames)
+    let observed_vy = int_div(int_sub(new_y, prev_y_milli), delta_frames)
+
+    let alpha = TRACKER_VELOCITY_ALPHA_MILLI
+    let beta = TRACKER_MILLI - alpha
+    let old_vx = t[TRACK_VX_MILLI]
+    let old_vy = t[TRACK_VY_MILLI]
+
+    let blended_vx = (observed_vx * alpha + old_vx * beta) / TRACKER_MILLI
+    let blended_vy = (observed_vy * alpha + old_vy * beta) / TRACKER_MILLI
+
+    list_set(t, TRACK_VX_MILLI, blended_vx)
+    list_set(t, TRACK_VY_MILLI, blended_vy)
+    return t
+}
+
+fn _tracker_dist_sq_px(track_x_milli, track_y_milli, det_x_px, det_y_px) {
+    let track_x_px = (track_x_milli + 500) / TRACKER_MILLI
+    let track_y_px = (track_y_milli + 500) / TRACKER_MILLI
+    let dx = int_sub(track_x_px, det_x_px)
+    let dy = int_sub(track_y_px, det_y_px)
+    return int_add(int_mul(dx, dx), int_mul(dy, dy))
+}
+
+fn _tracker_assign(active_tracks, detections, max_dist_px) {
+    let pairs = list_new()
+    let num_tracks = len(active_tracks)
+    let num_dets = len(detections)
+    if num_tracks == 0 { return pairs }
+    if num_dets == 0 { return pairs }
+
+    let used_track = list_new()
+    let i = 0
+    while i < num_tracks { push(used_track, 0) i = i + 1 }
+    let used_det = list_new()
+    i = 0
+    while i < num_dets { push(used_det, 0) i = i + 1 }
+
+    let max_dist_sq = int_mul(max_dist_px, max_dist_px)
+
+    let keep_going = 1
+    while keep_going == 1 {
+        let best_track = 0 - 1
+        let best_det = 0 - 1
+        let best_cost = 0 - 1
+        let ti = 0
+        while ti < num_tracks {
+            if used_track[ti] == 0 {
+                let t = active_tracks[ti]
+                let di = 0
+                while di < num_dets {
+                    if used_det[di] == 0 {
+                        let d = detections[di]
+                        let dist_sq = _tracker_dist_sq_px(
+                            t[TRACK_X_MILLI], t[TRACK_Y_MILLI],
+                            _det_x(d), _det_y(d))
+                        if dist_sq <= max_dist_sq {
+                            if best_cost < 0 {
+                                best_track = ti
+                                best_det = di
+                                best_cost = dist_sq
+                            } else {
+                                if dist_sq < best_cost {
+                                    best_track = ti
+                                    best_det = di
+                                    best_cost = dist_sq
+                                }
+                            }
+                        }
+                    }
+                    di = di + 1
+                }
+            }
+            ti = ti + 1
+        }
+        if best_track < 0 {
+            keep_going = 0
+        } else {
+            list_set(used_track, best_track, 1)
+            list_set(used_det, best_det, 1)
+            let p = list_new()
+            push(p, best_track)
+            push(p, best_det)
+            push(pairs, p)
+        }
+    }
+    return pairs
+}
+
+fn tracker_step(tracker, detections, frame_idx) {
+    let all_tracks = tracker[TRACKER_TRACKS]
+    let active = tracker_active_tracks(tracker)
+    let num_active = len(active)
+    let num_dets = len(detections)
+
+    let prev_x_milli = list_new()
+    let prev_y_milli = list_new()
+    let prev_last_seen = list_new()
+    let i = 0
+    while i < num_active {
+        let t = active[i]
+        push(prev_x_milli, t[TRACK_X_MILLI])
+        push(prev_y_milli, t[TRACK_Y_MILLI])
+        push(prev_last_seen, t[TRACK_LAST_SEEN])
+        track_predict(t)
+        i = i + 1
+    }
+
+    let pairs = _tracker_assign(active, detections, TRACKER_MAX_ASSIGN_DIST_PX)
+
+    let track_matched = list_new()
+    i = 0
+    while i < num_active { push(track_matched, 0) i = i + 1 }
+    let det_matched = list_new()
+    i = 0
+    while i < num_dets { push(det_matched, 0) i = i + 1 }
+
+    let p_idx = 0
+    while p_idx < len(pairs) {
+        let p = pairs[p_idx]
+        let ti = p[0]
+        let di = p[1]
+        let t = active[ti]
+        let d = detections[di]
+        let prev_x = prev_x_milli[ti]
+        let prev_y = prev_y_milli[ti]
+        let prev_seen = prev_last_seen[ti]
+        let delta_frames = frame_idx - prev_seen
+        if delta_frames <= 0 { delta_frames = 1 }
+        _track_update(t, _det_x(d), _det_y(d), _det_w(d), _det_h(d))
+        _track_update_velocity(t, prev_x, prev_y, delta_frames)
+        list_set(t, TRACK_HITS, t[TRACK_HITS] + 1)
+        list_set(t, TRACK_MISSED, 0)
+        list_set(t, TRACK_LAST_SEEN, frame_idx)
+        list_set(track_matched, ti, 1)
+        list_set(det_matched, di, 1)
+        p_idx = p_idx + 1
+    }
+
+    i = 0
+    while i < num_active {
+        let t = active[i]
+        list_set(t, TRACK_AGE, t[TRACK_AGE] + 1)
+        if track_matched[i] == 1 {
+            if str_eq(t[TRACK_STATUS], TRACKER_STATUS_PROBATIONAL) == 1 {
+                if t[TRACK_HITS] >= TRACKER_CONFIRM_THRESHOLD {
+                    list_set(t, TRACK_STATUS, TRACKER_STATUS_CONFIRMED)
+                }
+            }
+        } else {
+            list_set(t, TRACK_MISSED, t[TRACK_MISSED] + 1)
+            if t[TRACK_MISSED] >= TRACKER_LOST_THRESHOLD {
+                list_set(t, TRACK_STATUS, TRACKER_STATUS_LOST)
+            }
+        }
+        i = i + 1
+    }
+
+    i = 0
+    while i < num_dets {
+        if det_matched[i] == 0 {
+            let d = detections[i]
+            let new_id = tracker[TRACKER_NEXT_ID]
+            let t = _track_new(new_id, _det_x(d), _det_y(d),
+                                _det_w(d), _det_h(d), frame_idx)
+            push(all_tracks, t)
+            list_set(tracker, TRACKER_NEXT_ID, new_id + 1)
+        }
+        i = i + 1
+    }
+
+    list_set(tracker, TRACKER_LAST_FRAME, frame_idx)
+    list_set(tracker, TRACKER_STEP_COUNT, tracker[TRACKER_STEP_COUNT] + 1)
+    return tracker
+}
+
+let TRACK_MAX_FRAMES = 64
+
+fn _track_int_to_padded4(n) {
+    let s = int_to_str(n)
+    let pad = 4 - len(s)
+    let out = ""
+    while pad > 0 {
+        out = out + "0"
+        pad = pad - 1
+    }
+    return out + s
+}
+
+fn _track_join_path(dir, name) {
+    let n = len(dir)
+    if n == 0 { return name }
+    if char_at(dir, n - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+fn _track_file_exists(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    sys_close(fd)
+    return 1
+}
+
+fn _track_centroid_detection(data, w, h) {
+    let out = list_new()
+    let bright_threshold = 128
+    let sum_x = 0
+    let sum_y = 0
+    let count = 0
+    let min_x = w
+    let max_x = 0 - 1
+    let min_y = h
+    let max_y = 0 - 1
+    let y = 0
+    while y < h {
+        let x = 0
+        while x < w {
+            let v = pgm_pixel(data, w, x, y)
+            if v >= bright_threshold {
+                sum_x = sum_x + x
+                sum_y = sum_y + y
+                count = count + 1
+                if x < min_x { min_x = x }
+                if x > max_x { max_x = x }
+                if y < min_y { min_y = y }
+                if y > max_y { max_y = y }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if count == 0 { return out }
+    let cx = sum_x / count
+    let cy = sum_y / count
+    let bw = max_x - min_x + 1
+    let bh = max_y - min_y + 1
+    if bw <= 0 { bw = 1 }
+    if bh <= 0 { bh = 1 }
+    push(out, detection_from_xywh(cx, cy, bw, bh))
+    return out
+}
+
+fn _track_format_summary(tracker, frames_seen) {
+    let all = tracker[TRACKER_TRACKS]
+    let n = len(all)
+    let lines = ""
+    lines = lines + "(track scanned " + int_to_str(frames_seen)
+                  + " frame(s), " + int_to_str(n) + " track(s) total)"
+    let n_confirmed = 0
+    let n_prob = 0
+    let n_lost = 0
+    let i = 0
+    while i < n {
+        let t = all[i]
+        let status = t[TRACK_STATUS]
+        if str_eq(status, TRACKER_STATUS_CONFIRMED) == 1 {
+            n_confirmed = n_confirmed + 1
+        }
+        if str_eq(status, TRACKER_STATUS_PROBATIONAL) == 1 {
+            n_prob = n_prob + 1
+        }
+        if str_eq(status, TRACKER_STATUS_LOST) == 1 {
+            n_lost = n_lost + 1
+        }
+        i = i + 1
+    }
+    lines = lines + "\n(confirmed=" + int_to_str(n_confirmed)
+                  + " probational=" + int_to_str(n_prob)
+                  + " lost=" + int_to_str(n_lost) + ")"
+    i = 0
+    while i < n {
+        let t = all[i]
+        let s = track_state(t)
+        let line = "(track #" + int_to_str(t[TRACK_ID])
+                 + " status=" + t[TRACK_STATUS]
+                 + " age=" + int_to_str(t[TRACK_AGE])
+                 + " hits=" + int_to_str(t[TRACK_HITS])
+                 + " missed=" + int_to_str(t[TRACK_MISSED])
+                 + " pos=(" + int_to_str(track_x_px(t))
+                 + ", " + int_to_str(track_y_px(t)) + ")"
+                 + " vel=(" + int_to_str(s[2])
+                 + ", " + int_to_str(s[3]) + ") milli/frame"
+                 + " bbox=" + int_to_str(t[TRACK_W])
+                 + "x" + int_to_str(t[TRACK_H]) + ")"
+        lines = lines + "\n" + line
+        i = i + 1
+    }
+    return lines
+}
+
+fn track_run_command(arg) {
+    if len(arg) == 0 {
+        return "(/track needs VIDEO_DIR -- usage: /track /tmp/track_frames)"
+    }
+    let first_path = _track_join_path(arg, "frame_0001.pgm")
+    if _track_file_exists(first_path) == 0 {
+        return "(track FAILED: " + arg + " does not contain frame_0001.pgm)"
+    }
+    let tracker = tracker_new()
+    let frames_seen = 0
+    let f = 1
+    let template = 0
+    let tpl_w = 0
+    let tpl_h = 0
+    let template_env = getenv("CE_TRACK_TEMPLATE_PGM")
+    if template_env != 0 {
+        if len(template_env) > 0 {
+            let r_t = pgm_parse_file(template_env)
+            let err_t = pgm_result_error(r_t)
+            if len(err_t) == 0 {
+                let w_t = pgm_result_width(r_t)
+                let h_t = pgm_result_height(r_t)
+                if w_t >= 16 {
+                    if h_t >= 16 {
+                        let d_t = pgm_result_data(r_t)
+                        template = det_train_template(d_t, w_t, h_t, w_t, h_t)
+                        tpl_w = w_t
+                        tpl_h = h_t
+                    }
+                }
+            }
+        }
+    }
+
+    let keep = 1
+    while keep == 1 {
+        if f > TRACK_MAX_FRAMES { keep = 0 }
+        if keep == 1 {
+            let frame_name = "frame_" + _track_int_to_padded4(f) + ".pgm"
+            let frame_path = _track_join_path(arg, frame_name)
+            if _track_file_exists(frame_path) == 0 {
+                keep = 0
+            } else {
+                let r = pgm_parse_file(frame_path)
+                let err = pgm_result_error(r)
+                if len(err) > 0 {
+                    keep = 0
+                } else {
+                    let w = pgm_result_width(r)
+                    let h = pgm_result_height(r)
+                    let data = pgm_result_data(r)
+                    let dets = list_new()
+                    if template != 0 {
+                        let raw = det_detect(data, w, h, template,
+                                              DET_DEFAULT_THRESHOLD_MILLI,
+                                              DET_DEFAULT_STRIDE,
+                                              DET_DEFAULT_NMS_IOU_MILLI)
+                        dets = tracker_detections_from_det(raw, tpl_w, tpl_h)
+                    } else {
+                        dets = _track_centroid_detection(data, w, h)
+                    }
+                    tracker_step(tracker, dets, f)
+                    frames_seen = frames_seen + 1
+                    f = f + 1
+                }
+            }
+        }
+    }
+
+    if frames_seen == 0 {
+        return "(track FAILED: " + arg + " yielded no usable frames)"
+    }
+
+    return _track_format_summary(tracker, frames_seen)
+}
