@@ -102,6 +102,7 @@ import "../kg/multi_kg_manager.nova"
 import "../kg/query.nova"
 import "../io/transducers/kg_sync.nova"
 import "./snapshot_attestation.nova"
+import "./snapshot_replication.nova"
 
 // ---- protocol constants ---------------------------------------------------
 
@@ -155,6 +156,62 @@ let GOSSIP_DQERR_PREFIX  = "DQERR "
 // unchanged). The originator side lives in snapshot_attestation.nova;
 // both sides share this literal prefix.
 let GOSSIP_ATTESTATION_PREFIX = "ATTESTATION "
+
+// ============================================================================
+// R23C -- snapshot replication wire types.
+// ============================================================================
+//
+// COORDINATION NOTE for R23 sprint: this block is additive (new
+// prefixes + new state slots + new dispatch entries). R23E (NAT
+// traversal) is also extending gossip.nova for EXTADDR; place R23E
+// state slots adjacent to keep the diff trivial to rebase.
+//
+// R23C extends R20F: after a signed ATTESTATION lands, a peer that
+// does NOT already hold the snapshot for that root dials the
+// originator and issues a SNAP_FETCH; the originator responds with
+// the snapshot bytes (the same text snap_to_text emits) framed as
+// SNAP_DATA lines terminated by SNAP_END. The receiver assembles the
+// body, verifies the meta.merkle_root line equals the signed root,
+// and stores the bytes iff verification passes. The verifier +
+// replica store lives in snapshot_replication.nova; the wire
+// prefixes here keep the import graph acyclic (gossip imports
+// snapshot_replication, not vice versa).
+//
+// Wire shapes:
+//   SNAP_FETCH <root_hex>\n
+//       Request: peer asks for the snapshot whose Merkle root is
+//       <root_hex>. Responder either streams SNAP_DATA + SNAP_END,
+//       or replies with a bare SNAP_END (no data) to signal miss.
+//   SNAP_DATA <text_line>\n
+//       One line of the snapshot's text body (the exact output of
+//       snap_to_text, line by line). The receiver concatenates the
+//       lines (re-adding \n) until SNAP_END arrives.
+//   SNAP_END\n
+//       End-of-response marker.
+let GOSSIP_SNAP_FETCH_PREFIX = "SNAP_FETCH "
+let GOSSIP_SNAP_DATA_PREFIX  = "SNAP_DATA "
+let GOSSIP_SNAP_END_LINE     = "SNAP_END"
+
+// ============================================================================
+// R23E -- NAT traversal external-addr advertisement.
+// ============================================================================
+//
+// A peer that discovered its public/external addr via the STUN-like
+// `nat_query_stun` flow (src/federation/nat_traversal.nova)
+// broadcasts a single EXTADDR line over a short-lived TCP
+// connection. The receiver parses + records the (internal, external)
+// mapping into the local nat_state; without an nat_state registered
+// the line is silently dropped.
+//
+// Wire shape:
+//   EXTADDR <internal_addr> <external_addr>\n
+//
+// nat_state cross-module protocol pins:
+//   slot 1 = peer_ext_table : list of [internal_addr, external_addr]
+//   slot 6 = inbound_ad_count counter
+let GOSSIP_EXTADDR_PREFIX = "EXTADDR "
+let GOSSIP_NAT_PEER_TABLE_SLOT = 1
+let GOSSIP_NAT_INBOUND_AD_SLOT = 6
 
 // R21B -- distributed rule inference message types. Rule broadcast +
 // remote fact fetch + derivation broadcast. The originator side lives
@@ -307,6 +364,19 @@ let GOSSIP_S_NOISE_STRICT = 25  // 1 = refuse plaintext, 0 = lenient fallback
 let GOSSIP_S_STATS_NOISE_HS = 26       // successful Noise handshakes
 let GOSSIP_S_STATS_NOISE_HS_FAIL = 27  // failed Noise handshakes (MITM / bad pubkey / mode mismatch)
 let GOSSIP_S_STATS_NOISE_REFUSED = 28  // strict-mode plaintext refusals
+// R23C -- snapshot replication. sr_state (snapshot_replication.nova)
+// wired here so the SNAP_FETCH / SNAP_DATA / SNAP_END dispatch can:
+//   - serve incoming SNAP_FETCH from our local replica table
+//   - count successful fetches + tamper rejections (verify lives
+//     in snapshot_replication.nova; gossip just bumps the wire-side
+//     counters)
+// The slot is 0 by default; a soul that has not opted into R23C
+// short-circuits on inbound (the parser branch does the nil-check).
+// Slot indices intentionally start at 29 (immediately after R21E) so
+// the layout extends linearly; R23E (NAT traversal) slots adjacent.
+let GOSSIP_S_SR_STATE          = 29  // sr_state_t or 0
+let GOSSIP_S_STATS_SR_FETCH_RX = 30  // SNAP_FETCH requests served
+let GOSSIP_S_STATS_SR_DATA_RX  = 31  // SNAP_DATA lines streamed in
 
 // ---- low-level string helpers ---------------------------------------------
 
@@ -474,6 +544,9 @@ fn gossip_init(self_addr, bootstrap_peers) {
     push(st, 0)                      // S_STATS_NOISE_HS (R21E)
     push(st, 0)                      // S_STATS_NOISE_HS_FAIL (R21E)
     push(st, 0)                      // S_STATS_NOISE_REFUSED (R21E)
+    push(st, 0)                      // S_SR_STATE (R23C)
+    push(st, 0)                      // S_STATS_SR_FETCH_RX (R23C)
+    push(st, 0)                      // S_STATS_SR_DATA_RX (R23C)
 
     // Bootstrap peers are addresses; trust them at startup with
     // status=ALIVE and last_seen=nanotime() (the operator just told
@@ -1070,6 +1143,26 @@ fn gossip_handle_conn(state, conn_fd) {
                         // R20F: handle ATTESTATION inbound here too (kg-less variant).
                         if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
                             _gossip_serve_attestation(state, line)
+                            // R23C: poke the snapshot-replication
+                            // layer so its known-roots table tracks
+                            // this root for a subsequent SNAP_FETCH.
+                            // Skips when sr_state is 0 (back-compat).
+                            let _sr0 = state[GOSSIP_S_SR_STATE]
+                            if _sr0 != 0 {
+                                let _att0 = att_parse_wire(line)
+                                if _att0 != 0 {
+                                    let _pk0 = gossip_lookup_att_pubkey(state, att_soul_id(_att0))
+                                    if _pk0 != 0 {
+                                        if att_verify(_att0, _pk0) == 1 {
+                                            sr_observe_attestation(_sr0, _att0)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // R23C: handle SNAP_FETCH inbound (kg-less variant).
+                        if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                            _gossip_serve_snap_fetch(conn_fd, state, line)
                         }
                     }
                 }
@@ -1158,6 +1251,25 @@ fn gossip_handle_conn_kg(state, conn_fd, kg) {
                             // tamper-resistance invariant.
                             if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
                                 _gossip_serve_attestation(state, line)
+                                // R23C: poke the snapshot-replication
+                                // layer so its known-roots table tracks
+                                // this root for a subsequent SNAP_FETCH.
+                                let _sr_kg = state[GOSSIP_S_SR_STATE]
+                                if _sr_kg != 0 {
+                                    let _att_kg = att_parse_wire(line)
+                                    if _att_kg != 0 {
+                                        let _pk_kg = gossip_lookup_att_pubkey(state, att_soul_id(_att_kg))
+                                        if _pk_kg != 0 {
+                                            if att_verify(_att_kg, _pk_kg) == 1 {
+                                                sr_observe_attestation(_sr_kg, _att_kg)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // R23C: SNAP_FETCH request handler.
+                            if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                                _gossip_serve_snap_fetch(conn_fd, state, line)
                             }
                             // R21B additive parser branches: distributed-
                             // rule inference message types. All three
@@ -2344,6 +2456,24 @@ fn gossip_handle_conn_kg_gconn(state, conn_fd, kg) {
                             }
                             if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
                                 _gossip_serve_attestation(state, line)
+                                // R23C: poke sr observe under the
+                                // noise-wrapped wire too.
+                                let _sr_n = state[GOSSIP_S_SR_STATE]
+                                if _sr_n != 0 {
+                                    let _att_n = att_parse_wire(line)
+                                    if _att_n != 0 {
+                                        let _pk_n = gossip_lookup_att_pubkey(state, att_soul_id(_att_n))
+                                        if _pk_n != 0 {
+                                            if att_verify(_att_n, _pk_n) == 1 {
+                                                sr_observe_attestation(_sr_n, _att_n)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // R23C: SNAP_FETCH parser under noise wire.
+                            if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                                _gossip_serve_snap_fetch(_gconn_fd(gconn), state, line)
                             }
                         }
                     }
