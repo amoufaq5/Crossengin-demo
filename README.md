@@ -11,7 +11,36 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R20B adds `src/kg/rule_inference.nova` — a forward-chaining
+> toolchain. R21C adds `src/io/effectors/audio_tts.nova` — the end-to-end
+> text-to-speech pipeline that closes the TTS leg of the audio chain. CE
+> already had speech IN (R8B whisper / R10B vosk STT) and a usable
+> speech-synthesis floor (R6E Klatt with the 44-phoneme ARPAbet
+> inventory); what was missing was a complete TTS pipeline that takes
+> free-form English text and produces playable WAV. R21C closes that gap
+> with a curated ~120-word dictionary + rule-based G2P (grapheme-to-
+> phoneme) stage in front of the existing Klatt synth and a WAV writer
+> behind it. Pipeline: tokenize on whitespace + punctuation -> per-word
+> G2P (dictionary first, then rule fallback) -> per-phoneme R6E Klatt
+> synthesis -> PCM concat with brief word-break silences -> 44-byte WAV
+> header at the caller-requested sample rate -> sys_write + sys_fsync.
+> Dictionary covers greetings, pronouns, function words, common verbs +
+> nouns, numbers 0-10, and CrossEngin domain terms. Rule fallback
+> handles silent-prefix strip (kn/wr/pn/mn/gn/ps), silent-e CVCe upgrade
+> (cake -> /K EY K/), two-letter digraph greedy match (sh/th/ch/ng/ph/wh
+> /ck/qu + 11 vowel digraphs), single-letter fallback (x -> /K/+/S/;
+> unknown bytes -> /AX/ schwa). Output is byte-deterministic. Public
+> API: `tts_g2p`, `tts_g2p_word`, `tts_g2p_marked`, `tts_tokenize`,
+> `tts_synth_phonemes(phonemes, sample_rate)`,
+> `tts_speak(text, sample_rate)`, `tts_save_wav(wav_bytes, path)`,
+> `tts_phonemes_to_string`, `tts_dict_size()`, `tts_say_run(text)`.
+> Chat: `/say <text>` admin (1 import + 1 dispatch + 1 help). 68 unit
+> assertions in `tests/unit/test_audio_tts.nova` (NEW). 22 integration
+> assertions in `tests/integration/scenario_ffff_tts.sh` (NEW). All
+> prior audio suites remain green (R6E Klatt, R7F VAD, R8B/R10B STT,
+> R10F/R11B pitch, R12D PSOLA, R13D voice clone, R14E DSP, R16E STFT,
+> R17B MFCC, R18C wake-word, R19D speaker_id). Module count: +1 (new
+> `src/io/effectors/audio_tts.nova`). R20B adds
+> `src/kg/rule_inference.nova` — a forward-chaining
 > mini-Datalog rule engine over the KG. The KG had nine READ surfaces
 > (episodic recall, TF-IDF, LSH ANN, LPA + Louvain clustering, PageRank,
 > mini-SPARQL queries, link prediction, temporal reasoning) but no

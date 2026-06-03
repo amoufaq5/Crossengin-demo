@@ -1928,3 +1928,229 @@ per identity, per-entry MFCC capped at 256 frames (mirrors R18C).
   already compute the min argument per cell, but currently
   drop it). Useful for forced alignment + speaker-diarization
   follow-ups.
+
+## R21C -- end-to-end TTS pipeline (text -> G2P -> Klatt -> WAV)
+
+Status: **DONE (`src/io/effectors/audio_tts.nova`).**
+CrossEngin already had speech IN (R8B whisper / R10B vosk STT)
+and a usable speech-synthesis floor (R6E Klatt with 53 dispatches
+covering the 44-phoneme ARPAbet inventory). What was missing was a
+COMPLETE text-to-speech pipeline -- the user-visible TTS path that
+takes free-form English text and produces playable WAV. R21C
+closes that gap with a dictionary + rule-based G2P (grapheme-to-
+phoneme) stage in front of the existing Klatt synth and a WAV
+writer behind it.
+
+### Pipeline
+
+```
+input text
+   |
+   v
+tokenize on whitespace + punctuation
+   |
+   v
+per-word G2P:
+   dictionary lookup (~120 curated entries, case-folded)
+       OR
+   rule-based fallback (digraph greedy match + single-letter +
+                         silent-e CVCe upgrade + silent-prefix
+                         strip)
+   |
+   v
+phoneme list (with "_brk_" sentinels between words)
+   |
+   v
+per-phoneme R6E Klatt synth -> 1200 samples each (vowels via
+formant synthesis, fricatives via LCG pseudo-noise, plosives
+via silence+burst, nasals via damped carrier)
+   |
+   v
+PCM concat + brief silence at word breaks (480 samples)
+   |
+   v
+WAV header (44 bytes, sample_rate parameterised) + PCM body
+   |
+   v
+sys_write + sys_fsync to /tmp/tts_out.wav
+   |
+   v
+best-effort paplay (Mode 3)
+```
+
+### Dictionary (~120 curated entries)
+
+Hand-curated coverage of the high-frequency English vocabulary:
+
+- Greetings + interjections: hello, hi, hey, bye, yes, no, ok,
+  okay, thanks, please, sorry
+- Pronouns: i, me, my, you, your, we, our, he, him, his, she,
+  her, it, they, them, this, that, these, those
+- Function words: a, an, the, and, or, but, not, is, are, was,
+  were, be, been, am, to, of, in, on, at, for, with, from, by,
+  as, if, so, do, did, does, have, had, has, can, will, would,
+  could, should
+- Common nouns + verbs: world, time, day, night, good, bad,
+  test, speak, say, make, take, give, go, come, know, see,
+  look, find, think, want, need, feel, love, like, work, play,
+  stop, start, run, walk, talk, open, close, save, load, name,
+  what, when, where, why, how, who, which, here, there, now,
+  then, all, one, two, three, four, five, six, seven, eight,
+  nine, ten, zero
+- CrossEngin domain: crossengin, nova, agent, kg, atom
+
+Lookup is a single if-chain returning a `list_new` of phoneme
+labels; case is folded to lower at the entry boundary. Total
+table size: `TTS_DICT_ENTRY_COUNT = 122`.
+
+### Rule-based fallback (~30 rules)
+
+Greedy left-to-right walk for unknown words. Order of dispatch:
+
+1. **Silent-prefix strip** at word start: `kn` (knee, knight),
+   `wr` (write, wrong), `pn` (pneumonia), `mn` (mnemonic),
+   `gn` (gnome), `ps` (psalm). The leading consonant is
+   dropped; the remainder enters the rule walk.
+
+2. **Silent-e CVCe upgrade** at the vowel position: when the
+   current letter is a vowel, the next is a consonant, and the
+   next-after-that is a final `e`, swap the vowel's short form
+   for its long form (`cake` -> K + EY + K + (silent e); not
+   K + AE + K + EH).
+
+3. **Two-letter digraphs** matched greedily before single
+   letters: `sh`, `th`, `ch`, `ng`, `ph` (-> /F/),
+   `wh` (-> /W/), `ck` (-> /K/), `qu` (-> /K/+/W/), vowel
+   digraphs `oo` (-> /UW/), `ee` (-> /IY/), `ea` (-> /IY/),
+   `ai`/`ay` (-> /EY/), `ie` (-> /AY/), `ou` (-> /AW/),
+   `ow` (-> /OW/), `oa` (-> /OW/), `oi`/`oy` (-> /OY/),
+   r-coloured `ar` (-> /AA/+/R/), `er`/`ir`/`ur` (-> /ER/),
+   `or` (-> /AO/+/R/).
+
+4. **Single-letter fallback**: consonants map to their
+   single-phoneme namesake (b -> /B/, k -> /K/, etc); vowels
+   to their short form (a -> /AE/, e -> /EH/, i -> /IH/,
+   o -> /AO/, u -> /AH/); `x` expands to /K/+/S/; unknown
+   bytes fall through to schwa (`/AX/`).
+
+The fallback is not high-quality (it can't disambiguate
+heteronyms like "lead" the verb from "lead" the metal) but it
+never crashes and produces audible output for any input.
+Verification: "xyzwz" (gibberish) emits `K S Y Z W Z` via
+the rule path -- exactly what the brief's adversarial
+fixture demands.
+
+### Determinism
+
+`tts_speak(text, sample_rate)` is byte-deterministic at the
+WAV level: same input -> same output. The synth side already
+seeds its LCG at a constant value (R6E's `_lcg_seed`); the
+G2P side is pure dictionary + rule lookup with no randomness.
+The unit test calls `audio_synth_mode_reset()` and
+`audio_lcg_reset()` between the two invocations and asserts
+zero byte mismatches across the whole WAV.
+
+### Sample-rate handling
+
+R6E's `synth_phoneme()` is hardcoded to 8000 Hz internally
+(1200 samples per phoneme at AUDIO_SAMPLE_RATE = 8000). When
+the caller requests a different sample rate for the OUTPUT
+WAV (16000 Hz is the standard ASR target), we still synthesize
+at 8000 Hz but write the REQUESTED rate into the WAV header.
+Most players resample on the fly; the audible effect is that
+the synth plays at a different pitch/rate. A future resampler
+would do proper interpolation here; for now the header field
+is the only thing that varies. Determinism is preserved.
+
+### Public API
+
+- `tts_g2p(text)` -> phoneme list
+- `tts_g2p_word(word)` -> per-word phoneme list
+- `tts_g2p_marked(text)` -> phoneme list with "_brk_" sentinels
+- `tts_tokenize(text)` -> word token list
+- `tts_synth_phonemes(phonemes, sample_rate)` -> WAV byte list
+- `tts_speak(text, sample_rate)` -> WAV byte list
+- `tts_save_wav(wav_bytes, path)` -> 1 on success, 0 on failure
+- `tts_phonemes_to_string(phonemes)` -> space-separated label
+- `tts_dict_size()` -> curated entry count (122)
+- `tts_say_run(text)` -> chat-side runner: G2P + synth + save +
+  best-effort paplay, returns a formatted status string
+
+### Chat wiring
+
+`/say <text>` admin command (in `examples/crossengin_chat.nova`):
+calls `tts_say_run(arg)`, prints the returned status line. With
+no arg, prints `(/say needs TEXT -- usage: /say <text to speak>)`.
+On success: `(said '<TEXT>' [phonemes=N wav=B bytes player=paplay
+| no-player]; wrote /tmp/tts_out.wav)`.
+
+### Verification
+
+- 68 unit assertions in `tests/unit/test_audio_tts.nova` (NEW).
+  Covers: G2P on dictionary words (hello -> /HH EH L OW/,
+  world -> /W ER L D/, the -> /DH AX/), case-insensitivity,
+  G2P on unknown word (xyzwz -> rule fallback), silent-e CVCe
+  (cake -> /K EY K/), silent-kn prefix (knee -> /N IY/),
+  digraph greedy match (sh in shx), text-level G2P (hello
+  world phoneme count in 8..12), punctuation as separator,
+  empty input -> empty phoneme list, single-vowel synth ->
+  44+2400 bytes, WAV starts with RIFF + WAVE markers, sample
+  rate field round-trip, word-break sentinel renders 480
+  zero PCM samples, deterministic output (zero byte mismatch
+  across two invocations), empty input -> 44-byte header-only
+  WAV, save_wav round-trip via sys_open + sys_read,
+  tokenize() handles extra separators, g2p_marked inserts
+  break label between words.
+- 22 integration assertions in `tests/integration/scenario_ffff_tts.sh`
+  (NEW): stand-alone driver runs G2P + tts_speak + tts_save_wav,
+  asserts /tmp/tts_out.wav exists, file size > 1024 bytes,
+  WAV header starts with RIFF + has WAVE marker, sample rate
+  field = 16000 LE, deterministic across two driver runs,
+  empty input -> 44-byte WAV, chat /help advertises /say,
+  chat /help labels /say as R21C, chat /say "hello world"
+  echoes the text + reports the path + reports phoneme count
+  in 8..9, chat /say with no arg shows graceful usage.
+- All prior audio suites remain green (R6E Klatt, R7F VAD,
+  R8B/R10B STT, R10F/R11B pitch, R12D PSOLA, R13D voice clone,
+  R14E DSP, R16E STFT, R17B MFCC, R18C wakeword, R19D
+  speaker_id).
+
+### Future work
+
+- **CMUdict-scale dictionary** -- the canonical 125K-entry
+  table CMU released. CE ships ~120 entries; the full table
+  would let G2P handle the 99% case without the rule fallback.
+  Storage is the only cost (each entry is a string + a 5..10
+  phoneme list); load on first call is O(n) once.
+- **LSTM-free neural G2P fallback** -- the modern stand-in for
+  the rule path is a small sequence-to-sequence model (Phonetisaurus,
+  weighted FST-based; CMUSphinx ships one). The transition is to
+  store the FST as integer arc lists and run the Viterbi-equivalent
+  forward pass in pure NOVA; no floats needed.
+- **Prosody markers** -- the brief mentions "appropriate prosody"
+  but R21C just inserts a fixed 60 ms silence between words.
+  Future work: stressed-syllable lengthening (mark from CMUdict
+  stress digits, multiply the carrier's `n_samples`); intonation
+  contours (pitch trajectory across the utterance, applied via
+  R12D's PSOLA pitch shifter); phrase-final lowering at
+  punctuation (the comma/period tokens are already detected by
+  the tokenizer; promote them to prosody markers).
+- **Sample-rate resampling** -- R21C writes the requested
+  sample_rate into the header but synthesizes at the R6E-fixed
+  8000 Hz internally. A proper polyphase resampler (Kaiser
+  window + sinc kernel; integer fixed-point) would produce
+  authentic-sounding 16000 Hz / 22050 Hz / 44100 Hz output.
+- **Multi-language support** -- the dictionary is English-only.
+  Adding Spanish / French / German would mean a per-language
+  dictionary plus per-language rule fallback (Spanish is
+  near-deterministic, French has more silent letters than
+  English, German has long-vowel doubling). The R6E phoneme
+  inventory already covers most cross-language ARPAbet-ish
+  sounds.
+- **Voice cloning at the TTS layer** -- R13D ships voice
+  cloning at the per-phoneme layer (formant ratios applied at
+  synth time). The TTS path could thread the cloned profile
+  through `tts_speak()` so the whole utterance speaks in the
+  cloned voice. The Klatt API already accepts a per-phoneme
+  formant override; the TTS layer just needs to pass the
+  profile through.

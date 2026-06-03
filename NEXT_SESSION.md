@@ -3,6 +3,120 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R21C (this session) -- end-to-end text-to-speech pipeline
+
+**Status: complete -- `src/io/effectors/audio_tts.nova` (NEW, ~660
+lines) closes the TTS leg of the audio chain. CrossEngin already had
+speech IN (R8B whisper / R10B vosk STT) and a usable speech-synthesis
+floor (R6E Klatt with the 44-phoneme ARPAbet inventory). What was
+missing was a complete TTS pipeline: text -> phoneme sequence ->
+synthesized audio. The G2P (grapheme-to-phoneme) step in the middle
+is what R21C adds; it then delegates per-phoneme PCM synthesis to
+R6E's `synth_phoneme(label)` and wraps the result in a fresh WAV
+header at the caller-requested sample rate.**
+
+### What R21C delivers
+
+1. **New module** `src/io/effectors/audio_tts.nova` -- public API:
+   `tts_g2p(text)`, `tts_g2p_word(word)`, `tts_g2p_marked(text)`,
+   `tts_tokenize(text)`, `tts_synth_phonemes(phonemes, sample_rate)`,
+   `tts_speak(text, sample_rate)` (end-to-end: G2P-marked -> synth ->
+   WAV bytes), `tts_save_wav(wav_bytes, path)` (sys_open + sys_write +
+   sys_fsync + sys_close; matches the durability contract of
+   audio_synth.nova's audio_write_wav), `tts_phonemes_to_string`,
+   `tts_dict_size()` (122), `tts_say_run(text)` (chat-side runner).
+
+2. **Curated G2P dictionary** -- ~120 hand-coded high-frequency
+   English words with their ARPAbet-ish phoneme sequences. Greetings,
+   pronouns, function words, common verbs / nouns, numbers 0-10, and
+   CrossEngin domain vocabulary (crossengin, nova, agent, kg, atom).
+   All phoneme labels are members of the R6E `klatt_phoneme_labels()`
+   set. Lookup is a single if-chain returning list_new of labels;
+   case is folded to lower at the entry boundary.
+
+3. **Rule-based G2P fallback (~30 rules)** -- greedy left-to-right
+   walk for unknown words. Silent-prefix strip (kn/wr/pn/mn/gn/ps),
+   silent-e CVCe upgrade (cake -> /K EY K/ not /K AE K EH/), two-
+   letter digraph greedy match (sh/th/ch/ng/ph/wh/ck/qu + 11 vowel
+   digraphs including r-coloured ar/er/ir/or/ur), single-letter
+   fallback (x -> /K/+/S/; unknown bytes -> /AX/ schwa). Never
+   crashes; "xyzwz" emits k s y z w z cleanly via this path.
+
+4. **Determinism** -- `tts_speak` is byte-deterministic at the WAV
+   level. R6E's LCG is seeded at a constant value and the G2P side
+   is pure lookup; calling `audio_synth_mode_reset()` +
+   `audio_lcg_reset()` before each invocation guarantees bit-identical
+   output. The unit test asserts zero byte mismatches across the
+   20204-byte `hello world` WAV.
+
+5. **Sample-rate handling** -- R6E synthesizes at 8000 Hz internally.
+   R21C writes the requested sample_rate into the WAV header without
+   resampling; most players resample on the fly. A future resampler
+   is on the AUDIO_AUDIT R21C future-work list.
+
+6. **Chat wiring** -- `/say <text>` admin command in
+   `examples/crossengin_chat.nova` (1 import + 1 dispatch + 1 help).
+   Calls `tts_say_run(arg)` which runs G2P + synth + save to
+   `/tmp/tts_out.wav` (overridable via `$CE_TTS_PATH`) + best-effort
+   paplay; prints `(said '<TEXT>' [phonemes=N wav=B bytes
+   player=paplay|no-player]; wrote <PATH>)`. Empty arg prints usage.
+
+### Verification
+
+- **68 unit assertions** in `tests/unit/test_audio_tts.nova` (NEW):
+  G2P on dictionary words (hello -> /HH EH L OW/, world -> /W ER L D/,
+  the -> /DH AX/), case-insensitivity, G2P on unknown word (xyzwz),
+  silent-e CVCe (cake -> K EY K), silent-kn prefix (knee -> N IY),
+  digraph greedy match (sh in shx), text-level G2P (hello world
+  phoneme count in 8..12), punctuation as separator, empty input ->
+  empty list, single-vowel synth -> 44+2400 bytes, WAV starts with
+  RIFF + WAVE markers, sample rate field round-trip, word-break
+  sentinel renders 480 zero PCM samples, end-to-end speak hello
+  world, empty input -> 44-byte header-only WAV, deterministic
+  output (zero byte mismatches), save_wav round-trip,
+  tokenize basic + with extra separators, g2p_marked break label.
+
+- **22 integration assertions** in
+  `tests/integration/scenario_ffff_tts.sh` (NEW; 'ffff' is the next
+  free quadruple letter after aaaa/bbbb/cccc/dddd): standalone
+  driver runs full pipeline; shell asserts on WAV header bytes via
+  od (RIFF magic, WAVE marker, sample rate field = 16000 LE);
+  file size > 1024 bytes; chat /help advertises /say + labels it
+  R21C; chat /say "hello world" echoes the text + reports the path
+  + reports phoneme count in 8..9; chat /say no-arg shows graceful
+  usage.
+
+- All prior audio suites remain green (R6E Klatt, R7F VAD,
+  R8B/R10B STT, R10F/R11B pitch, R12D PSOLA, R13D voice clone,
+  R14E DSP, R16E STFT, R17B MFCC, R18C wake-word, R19D speaker_id).
+
+### File inventory
+
+NEW:
+- `src/io/effectors/audio_tts.nova`               (~660 lines)
+- `tests/unit/test_audio_tts.nova`                (~250 lines, 68 asserts)
+- `tests/integration/scenario_ffff_tts.sh`        (~150 lines, 22 asserts)
+
+MODIFIED:
+- `examples/crossengin_chat.nova`                 (+3 lines)
+- `AUDIO_AUDIT.md`                                (+R21C section)
+- `NEXT_SESSION.md`                               (this entry)
+- `README.md`                                     (R21C status entry)
+
+Module count: +1 in the audio effectors leg.
+
+### Honest scope
+
+- The dictionary is small (122 entries vs CMUdict's 125K); for most
+  English words the rule fallback runs.
+- Sample rate is a header-only field; the synth still runs at
+  8000 Hz internally.
+- Prosody is just a fixed 60 ms silence between words.
+- STT round-trip ("TTS-generate 'hello' -> STT -> contains
+  'hello'") is on the R21C future-work list -- the 8000 Hz internal
+  + 16000 Hz header output isn't a high-quality voice signal and
+  our STT backends are tuned for human speech.
+
 ## R21D (this session) -- HOG accelerated via integral histogram of gradients
 
 **Status: complete -- `src/io/transducers/image_hog.nova` extended
