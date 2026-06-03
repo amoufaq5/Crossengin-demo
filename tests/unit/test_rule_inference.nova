@@ -1,0 +1,355 @@
+// Unit tests for src/kg/rule_inference.nova (R20B).
+//
+// Covers mini-Datalog rule parsing + forward chaining + fixpoint
+// termination + cycle dedupe + multi-rule cooperation + provenance +
+// max-iteration cap. ~32 assertions; helpers are integer-only.
+//
+// ADRs: ADR-0016 (atoms + xrefs are the inference surface),
+//   ADR-0049 (testing + benchmarks).
+
+import "../ce_test.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/rule_inference.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Empty KG (no atoms).
+fn _empty_kg() {
+    let reg = kg_registry_new()
+    return kg_spawn(reg, "test_rule")
+}
+
+// KG seeded with N parent relationships forming a single chain:
+// parent(0, 1), parent(1, 2), ..., parent(n-1, n). Returns the KG.
+// Each fact is a RELATION atom labelled "parent|i|j".
+fn _seed_chain(n) {
+    let kg = _empty_kg()
+    let i = 0
+    while i < n {
+        let label = "parent|" + int_to_str(i) + "|" + int_to_str(i + 1)
+        kg_add_atom(kg, ATOM_RELATION, label, 0)
+        i = i + 1
+    }
+    return kg
+}
+
+// Count how many atoms in `kg` carry a label starting with "pred|".
+// Used to assert on the count of derived facts for a given predicate.
+fn _count_facts(kg, pred) {
+    let n = 0
+    let atoms = kg_atoms(kg)
+    let i = 0
+    let prefix = pred + "|"
+    let plen = len(prefix)
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_RELATION {
+                let label = atom_label(a)
+                if len(label) >= plen {
+                    // Prefix match: first plen chars equal prefix.
+                    let ok = 1
+                    let j = 0
+                    while j < plen {
+                        if ok == 1 {
+                            if char_at(label, j) != char_at(prefix, j) {
+                                ok = 0
+                            }
+                        }
+                        j = j + 1
+                    }
+                    if ok == 1 { n = n + 1 }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ---- parser tests ---------------------------------------------------------
+
+fn test_parse_simple_rule() {
+    let r = rule_parse("RULE foo(?a, ?b) <- bar(?a, ?b)")
+    ce_check("simple rule parses", rule_is_parsed(r) == 1)
+    ce_str_eq("head pred is 'foo'", rule_head_pred(r), "foo")
+    ce_eq("head has 2 args", len(rule_head_args(r)), 2)
+    ce_eq("body has 1 premise", rule_body_size(r), 1)
+}
+
+fn test_parse_two_premise_rule() {
+    let r = rule_parse("RULE ancestor(?a, ?c) <- ancestor(?a, ?b) AND parent(?b, ?c)")
+    ce_check("two-premise rule parses", rule_is_parsed(r) == 1)
+    ce_str_eq("head pred is 'ancestor'", rule_head_pred(r), "ancestor")
+    ce_eq("body has 2 premises", rule_body_size(r), 2)
+}
+
+fn test_parse_comma_conjunction() {
+    let r = rule_parse("RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    ce_check("comma-conjunction rule parses", rule_is_parsed(r) == 1)
+    ce_eq("body has 2 premises via comma", rule_body_size(r), 2)
+}
+
+fn test_parse_amp_conjunction() {
+    let r = rule_parse("RULE ancestor(?a, ?c) <- ancestor(?a, ?b) && parent(?b, ?c)")
+    ce_check("&&-conjunction rule parses", rule_is_parsed(r) == 1)
+    ce_eq("body has 2 premises via &&", rule_body_size(r), 2)
+}
+
+fn test_parse_missing_rule_keyword() {
+    let r = rule_parse("foo(?a, ?b) <- bar(?a, ?b)")
+    ce_eq("missing RULE keyword is an error", _rule_is_error(r), 1)
+}
+
+fn test_parse_missing_arrow() {
+    let r = rule_parse("RULE foo(?a, ?b) bar(?a, ?b)")
+    ce_eq("missing <- is an error", _rule_is_error(r), 1)
+}
+
+fn test_parse_empty_body() {
+    let r = rule_parse("RULE foo(?a, ?b) <-")
+    ce_eq("empty body is an error", _rule_is_error(r), 1)
+}
+
+fn test_parse_empty_string() {
+    let r = rule_parse("")
+    ce_eq("empty string is an error", _rule_is_error(r), 1)
+}
+
+fn test_parse_bad_arity() {
+    let r = rule_parse("RULE foo(?a) <- bar(?a, ?b)")
+    ce_eq("arity mismatch is an error", _rule_is_error(r), 1)
+}
+
+// ---- engine tests ---------------------------------------------------------
+
+fn test_engine_empty() {
+    let e = rule_engine_new()
+    ce_check("engine is recognised", rule_engine_is(e) == 1)
+    ce_eq("empty engine has 0 rules", rule_engine_size(e), 0)
+    let kg = _empty_kg()
+    let r = rule_engine_run(e, kg, 10)
+    ce_eq("empty engine derives 0 atoms", r[1], 0)
+    ce_eq("empty engine takes 1 iteration", r[2], 1)
+}
+
+fn test_engine_add_rule() {
+    let e = rule_engine_new()
+    let ok = rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    ce_eq("add succeeds", ok, 1)
+    ce_eq("engine has 1 rule", rule_engine_size(e), 1)
+}
+
+fn test_engine_add_bad_rule() {
+    let e = rule_engine_new()
+    let ok = rule_engine_add(e, "RULE bogus")
+    ce_eq("bad rule add returns error", _rule_is_error(ok), 1)
+    ce_eq("engine still has 0 rules", rule_engine_size(e), 0)
+}
+
+// Single rule, single fact: derives 1 new fact.
+fn test_single_rule_single_fact() {
+    let kg = _empty_kg()
+    kg_add_atom(kg, ATOM_RELATION, "parent|0|1", 0)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    let before = kg_atom_count(kg)
+    let r = rule_engine_run(e, kg, 100)
+    ce_eq("single fact -> 1 derived ancestor", r[1], 1)
+    ce_eq("KG grows by 1 atom", kg_atom_count(kg), before + 1)
+    ce_eq("1 ancestor fact present", _count_facts(kg, "ancestor"), 1)
+}
+
+// Transitive closure: chain of 5 parent facts -> 10 ancestor facts.
+// For parent chain 0->1->2->3->4->5 (5 facts), the transitive closure
+// has C(6, 2) = 15 ancestor pairs... wait, ancestor pairs are ordered:
+// (i, j) where i < j and there is a path. For 6 nodes in a chain
+// 0->1->2->3->4->5: pairs = 5 + 4 + 3 + 2 + 1 = 15 ordered ancestor
+// pairs. But the brief says "10 ancestor facts" for 5 parents. That
+// suggests 5 nodes (not 6): 5 parents would be 0->1->...->4 (5 atoms)
+// -- no, 5 parent facts connect 6 nodes. The brief's "10" must use a
+// chain of 5 NODES (parents 0->1, 1->2, 2->3, 3->4 = 4 parent facts).
+// 5 nodes -> C(5, 2) = 10 ancestor pairs. So the brief means "chain of
+// 5 *parent atoms* counted as the link count" gives 5 ancestor pairs
+// not 10. Let me reread: "chain of 5 parent facts -> derive 10 ancestor
+// facts". 5 parent facts -> 6 nodes -> C(6, 2) = 15. That's 15.
+// Hmm. Let me think again: the rule set is:
+//   RULE ancestor(?a, ?b) <- parent(?a, ?b)              -- base case
+//   RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)  -- step
+// With 5 parents (6 nodes) and these two rules, the derived set is:
+//   - 5 direct ancestors from rule 1
+//   - then transitively: at each step extend by one
+//   - Total = 5 (length-1 paths) + 4 (length-2) + 3 + 2 + 1 = 15
+// The brief might mean "chain of 5 NODES" = 4 parent facts -> 10
+// ancestors. Or "5 parent facts" = 5 facts (not 6 nodes), structured
+// such that the closure is 10. Without other clarification, the
+// simplest valid reading is "5 nodes / 4 parents" since 10 = C(5, 2).
+//
+// We'll test BOTH: a 4-parent chain (5 nodes -> 10 ancestors) AND a
+// 5-parent chain (6 nodes -> 15 ancestors). The integration scenario
+// uses the 5-parent reading to demonstrate the engine is correct
+// regardless of the precise interpretation.
+fn test_transitive_closure_4_parents() {
+    // parent(0,1), parent(1,2), parent(2,3), parent(3,4): 4 parents,
+    // 5 nodes. Expect C(5,2) = 10 ancestors.
+    let kg = _seed_chain(4)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    rule_engine_add(e, "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    let r = rule_engine_run(e, kg, 100)
+    ce_eq("4-parent chain derives 10 ancestors", _count_facts(kg, "ancestor"), 10)
+}
+
+fn test_transitive_closure_5_parents() {
+    // parent(0,1)..parent(4,5): 5 parents, 6 nodes -> C(6,2) = 15 ancestors.
+    let kg = _seed_chain(5)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    rule_engine_add(e, "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    let r = rule_engine_run(e, kg, 100)
+    ce_eq("5-parent chain derives 15 ancestors", _count_facts(kg, "ancestor"), 15)
+}
+
+// Fixpoint termination: a rule set that produces no new atoms reaches
+// fixpoint quickly (1 outer iteration when the conclusion already
+// exists in the KG; 2 iterations for the trivial single-step case --
+// 1st adds, 2nd confirms no new additions).
+fn test_fixpoint_terminates() {
+    let kg = _empty_kg()
+    kg_add_atom(kg, ATOM_RELATION, "parent|0|1", 0)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    let r = rule_engine_run(e, kg, 100)
+    ce_eq("fixpoint reaches by 2 iterations (add+confirm)", r[2], 2)
+    ce_eq("hit_cap is 0 (natural fixpoint)", rule_engine_hit_cap(e), 0)
+}
+
+// Cycle prevention: a rule `foo(?a) <- foo(?a)` would loop forever if
+// dedupe didn't work. With dedupe, the rule fires but adds nothing new,
+// so the engine terminates after 1 outer iteration with 0 derivations.
+fn test_cycle_prevention() {
+    let kg = _empty_kg()
+    kg_add_atom(kg, ATOM_RELATION, "foo|a|b", 0)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE foo(?x, ?y) <- foo(?x, ?y)")
+    let r = rule_engine_run(e, kg, 50)
+    ce_eq("cycle adds 0 new atoms", r[1], 0)
+    ce_check("cycle terminates well before cap", r[2] < 50)
+    ce_eq("hit_cap is 0 (natural termination)", rule_engine_hit_cap(e), 0)
+}
+
+// Multi-rule: two rules cooperating produce the expected derivations.
+// Setup: parent(0,1), parent(1,2). Rules:
+//   R1: ancestor(?a, ?b) <- parent(?a, ?b)        -- direct
+//   R2: ancestor(?a, ?c) <- parent(?a, ?b), ancestor(?b, ?c)  -- step
+// Expected ancestors: (0,1), (1,2), (0,2) = 3 ancestor facts.
+fn test_multi_rule_cooperation() {
+    let kg = _empty_kg()
+    kg_add_atom(kg, ATOM_RELATION, "parent|0|1", 0)
+    kg_add_atom(kg, ATOM_RELATION, "parent|1|2", 0)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    rule_engine_add(e, "RULE ancestor(?a, ?c) <- parent(?a, ?b), ancestor(?b, ?c)")
+    let r = rule_engine_run(e, kg, 100)
+    ce_eq("multi-rule derives 3 ancestors", _count_facts(kg, "ancestor"), 3)
+    ce_eq("multi-rule derived count is 3", r[1], 3)
+}
+
+// Provenance: derived atom can be traced back to source atoms + rule.
+fn test_provenance_traceback() {
+    let kg = _empty_kg()
+    kg_add_atom(kg, ATOM_RELATION, "parent|0|1", 0)
+    let parent_atom_id = 0   // first atom added
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    rule_engine_run(e, kg, 100)
+    // The derived atom should be at id 1 (second atom added).
+    let derived_id = 1
+    let prov = rule_engine_explain(e, derived_id)
+    ce_eq("provenance has 1 entry for derived atom", len(prov), 1)
+    ce_eq("provenance atom_id matches", prov[0][0], derived_id)
+    ce_eq("provenance rule_index is 0", prov[0][1], 0)
+    ce_eq("provenance source has 1 atom", len(prov[0][2]), 1)
+    ce_eq("provenance source is the parent atom", prov[0][2][0], parent_atom_id)
+}
+
+// Max iterations cap: a rule that keeps generating new atoms (head var
+// not constrained by body in a way that bounds growth -- in our
+// representation, this can only happen if we synthesise new strings,
+// which our pure-substitution model does not do). To simulate runaway,
+// we make a synthetic case: 200 base facts + a rule that derives a new
+// predicate from each. The derived count cap (10000) should NOT fire;
+// the iteration cap fires only if the rule chain never terminates.
+//
+// We instead test the cap mechanism directly: set max_iterations=1 and
+// run a rule that would need 2+ iterations -- the engine STOPS at 1
+// with hit_cap flag set.
+fn test_max_iterations_cap() {
+    let kg = _seed_chain(5)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    rule_engine_add(e, "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    let r = rule_engine_run(e, kg, 1)   // cap to 1 iteration
+    ce_eq("iteration cap enforced", r[2], 1)
+    ce_eq("hit_cap flag set when cap fires", rule_engine_hit_cap(e), 1)
+    // After 1 iteration the first rule fires (adding 5 direct ancestors)
+    // but the second rule has no ancestors to chain from in pass 1's
+    // initial KG snapshot (the engine reads facts at the start of each
+    // rule's evaluation within the pass, so the rule_1 additions ARE
+    // visible to rule_2 in the same pass). Even so, only direct
+    // ancestors come out cleanly -- the chained ones need a 2nd
+    // iteration's outer loop to confirm. With cap=1, derived >= 5.
+    ce_check("derived at least 5 direct ancestors", r[1] >= 5)
+}
+
+fn test_explain_unknown_atom() {
+    let e = rule_engine_new()
+    let prov = rule_engine_explain(e, 999)
+    ce_eq("explain unknown atom returns empty list", len(prov), 0)
+}
+
+// Idempotent run: running the engine twice produces the same KG state
+// after the second call (no further derivations).
+fn test_idempotent_run() {
+    let kg = _empty_kg()
+    kg_add_atom(kg, ATOM_RELATION, "parent|0|1", 0)
+    kg_add_atom(kg, ATOM_RELATION, "parent|1|2", 0)
+    let e = rule_engine_new()
+    rule_engine_add(e, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    rule_engine_add(e, "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    let r1 = rule_engine_run(e, kg, 100)
+    let count1 = kg_atom_count(kg)
+    let r2 = rule_engine_run(e, kg, 100)
+    let count2 = kg_atom_count(kg)
+    ce_eq("second run derives 0 new atoms", r2[1], 0)
+    ce_eq("KG atom count unchanged on second run", count2, count1)
+}
+
+fn main() {
+    test_parse_simple_rule()
+    test_parse_two_premise_rule()
+    test_parse_comma_conjunction()
+    test_parse_amp_conjunction()
+    test_parse_missing_rule_keyword()
+    test_parse_missing_arrow()
+    test_parse_empty_body()
+    test_parse_empty_string()
+    test_parse_bad_arity()
+    test_engine_empty()
+    test_engine_add_rule()
+    test_engine_add_bad_rule()
+    test_single_rule_single_fact()
+    test_transitive_closure_4_parents()
+    test_transitive_closure_5_parents()
+    test_fixpoint_terminates()
+    test_cycle_prevention()
+    test_multi_rule_cooperation()
+    test_provenance_traceback()
+    test_max_iterations_cap()
+    test_explain_unknown_atom()
+    test_idempotent_run()
+    ce_summary("rule_inference")
+}
+
+main()
