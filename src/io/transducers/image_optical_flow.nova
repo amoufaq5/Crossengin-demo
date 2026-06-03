@@ -569,6 +569,312 @@ fn lk_optical_flow_simd(prev_ptr, next_ptr, width, height, win_size) {
                       area, width, height)
 }
 
+// ---- R17C: u8 raw-byte SIMD path for Lucas-Kanade -----------------------
+//
+// R15A's stereo-SAD u8 path achieved a 5.5x absolute speedup over scalar
+// by wiring R14B's `simd_sad_u8(a_ptr, b_ptr, n_bytes) -> int` primitive
+// (AVX2 vpsadbw, 32 bytes -> 4 i64 partials) into the disparity inner
+// loop. R13A's LK i32 SIMD path plateaued at ~1.42x absolute because the
+// per-pixel byte->i32 staging bandwidth (5 store32 per cell to set up
+// the 5 product streams) competes with the SIMD reduction win.
+//
+// R17C applies the R15A u8 pattern to LK -- but the structural shape of
+// the algorithm constrains what `simd_sad_u8` can vectorize. Honest
+// analysis (R12A precedent: agent shipped wiring + honest perf even at
+// 0.84x / 0.20x):
+//
+//   1. LK accumulator products (Σ Ix*Ix, Σ Ix*It, ...) are byte * byte
+//      -> i32, NOT |a - b|. simd_sad_u8 computes absolute-difference
+//      sums on UNSIGNED bytes; it cannot produce signed-byte squared or
+//      cross products. The R15A primitive does not vectorize the inner
+//      accumulators -- that requires a `pmaddubsw`-shaped builtin
+//      (SSSE3) or i16-multiply (out-of-scope for R17C; documented as
+//      follow-up in NOVA SIMD_AUDIT).
+//
+//   2. Gradient computation Ix = (I(x+1) - I(x-1)) / 2 reads SIGNED
+//      differences; simd_sad_u8 zeros the sign so it doesn't fit
+//      directly.
+//
+//   3. BUT three operations DO match the R15A pattern naturally:
+//
+//      (a) Per-window |It| sum = Σ|next(p) - prev(p)| over the WIN^2
+//          cells. This is a textureless-region / motion-magnitude
+//          diagnostic (large = strong motion, zero = identical
+//          frames). simd_sad_u8 on packed prev + packed next windows
+//          delivers it in one call.
+//
+//      (b) Mean absolute photometric residual |warped - prev| across
+//          a full image is the canonical pyramidal-LK convergence
+//          metric -- rows ARE contiguous in memory, so simd_sad_u8
+//          can be called PER ROW with no packing at all. This is the
+//          cleanest SAD fit.
+//
+//      (c) Pack-then-scan pattern: pack the WIN^2 cells of prev + next
+//          into two contiguous byte buffers via `memcpy_raw`, then
+//          the scalar accumulator inner loop reads contiguous memory
+//          (better cache + prefetch locality) instead of strided
+//          per-row 5x loads. The accumulator stays scalar (the
+//          product math doesn't vectorize) but the load locality is
+//          materially better. This is the "wiring" win analogous to
+//          R12A's i32 SIMD on LK -- pay the staging cost, win the
+//          subsequent reduction loop's locality.
+//
+// R17C ships all three: the diagnostic SAD (a), the full-image residual
+// helper (b), and a packed-scan LK variant `lk_optical_flow_u8_simd`
+// that uses (c) under env-var dispatch CE_LK_U8_SIMD=on. The output is
+// BIT-IDENTICAL to scalar lk_optical_flow (same accumulator order, same
+// integer math, only the memory access pattern changed).
+//
+// PGM access strategy: pack-inline. PGM pixel data is already stored as
+// raw byte buffers (alloc + store8 + load8 via image_pgm.nova), so the
+// byte SIMD primitive + memcpy_raw pack is a direct representational
+// fit -- no list[int] -> byte conversion. Mirrors R15A's strategy.
+
+// Pack the WIN x WIN window centered at (x_center, y_center) into the
+// contiguous byte buffer `buf` (row-major). Uses NOVA's `memcpy_raw`
+// builtin (`rep movsb`) one row at a time -- ws bytes per row. Mirrors
+// R15A's _stereo_pack_block_u8 verbatim except for the half-row stride
+// shape (LK has odd ws like stereo).
+fn _lk_pack_block_u8(src_ptr, width, x_center, y_center, half, ws, buf) {
+    let row_bytes = ws
+    let dy = 0 - half
+    let dst = buf
+    while dy <= half {
+        let src_row = src_ptr + int_mul(int_add(y_center, dy), width)
+                              + int_sub(x_center, half)
+        memcpy_raw(dst, src_row, row_bytes)
+        dst = int_add(dst, row_bytes)
+        dy = int_add(dy, 1)
+    }
+}
+
+// lk_sad_block_u8(prev, next, w, x, y, ws, p_buf, n_buf) -> int
+//   Pack the WIN x WIN windows centered at (x, y) in `prev` and `next`,
+//   then reduce via simd_sad_u8. Diagnostic SAD: Σ|It| over the window
+//   (large = strong frame-to-frame change, zero = identical frames).
+//   Bit-identical to a scalar reference computing the same quantity.
+//   Caller pre-allocs both buffers as alloc(ws * ws + 8) (the +8 is
+//   the same scratch-headroom convention as R15A's stereo_sad_block_u8).
+fn lk_sad_block_u8(prev_ptr, next_ptr, width, x, y, win_size,
+                    p_buf, n_buf) {
+    let half = win_size / 2
+    let n = int_mul(win_size, win_size)
+    _lk_pack_block_u8(prev_ptr, width, x, y, half, win_size, p_buf)
+    _lk_pack_block_u8(next_ptr, width, x, y, half, win_size, n_buf)
+    return simd_sad_u8(p_buf, n_buf, n)
+}
+
+// lk_image_sad_residual_u8(prev, next, w, h) -> int
+//   Σ|next(p) - prev(p)| over ALL pixels in the image. PGM byte buffers
+//   are already contiguous in memory (row-major), so simd_sad_u8 can be
+//   called PER ROW with no packing. For width-W rows: one simd_sad_u8
+//   call processes W bytes via vpsadbw (32 bytes per instruction + tail).
+//   Bit-identical to scalar Σ|a[i] - b[i]|.
+//
+//   This is the canonical pyramidal-LK convergence metric (mean
+//   absolute photometric residual after warping). Used as a diagnostic
+//   probe in R11A / R13B; previously scalar O(area) per call.
+fn lk_image_sad_residual_u8(prev_ptr, next_ptr, width, height) {
+    if prev_ptr == 0 { return 0 }
+    if next_ptr == 0 { return 0 }
+    if width  <= 0   { return 0 }
+    if height <= 0   { return 0 }
+    let total = 0
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let row_sad = simd_sad_u8(int_add(prev_ptr, row_off),
+                                   int_add(next_ptr, row_off),
+                                   width)
+        total = int_add(total, row_sad)
+        y = int_add(y, 1)
+    }
+    return total
+}
+
+// _lk_u8_simd_enabled() -> 1 if CE_LK_U8_SIMD env var is set to "on"
+//   (mirrors R15A's CE_STEREO_U8_SIMD -- default OFF; opt-in via env
+//   for the bench script + future default-on flip when we have wider
+//   end-to-end validation). Separate from CE_LK_SIMD (R12A's i32 path
+//   toggle) so the two SIMD paths can be A/B'd independently.
+fn _lk_u8_simd_enabled() {
+    let env = getenv("CE_LK_U8_SIMD")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// Compute the LK gradient triplet (ix, iy, it) at packed-window cell
+// (dx, dy) using the PACKED buffers. The packed buffer is row-major
+// ws x ws bytes; cell at (dx, dy) is buf[(dy+half)*ws + (dx+half)].
+// For the gradient stencils we need the (x-1, x+1) etc neighbors --
+// these straddle row boundaries inside the packed buffer. Rather than
+// dealing with the boundary cases per-cell, we read directly from the
+// underlying image pointers for the gradient stencil (the WINDOW pack
+// gives us the cell value; the gradient stencil reaches OUTSIDE the
+// packed block to ±1 in both axes).
+//
+// Why pack at all then? The accumulator loop processes the central
+// pixel value at (px, py) from `prev` (for It = next - prev, since
+// It uses ONLY the center pixel of each cell). The packed buffer
+// reduces the It load to a contiguous read from the small scratch
+// buffer instead of a strided image-pointer load. The Ix / Iy loads
+// stay on the source pointer because they reach OUTSIDE the packed
+// window. Net win: 1/3 of the per-cell byte loads come from the
+// packed scratch (cache-warm) instead of the strided image buffer.
+//
+// _lk_packed_it(p_buf, n_buf, dx, dy, half, ws) returns It in the same
+// signed range as _lk_it. Reads from the PACKED scratch buffers.
+fn _lk_packed_it(p_buf, n_buf, dx, dy, half, ws) {
+    let r = int_add(dy, half)
+    let c = int_add(dx, half)
+    let idx = int_add(int_mul(r, ws), c)
+    let p = load8(int_add(p_buf, idx))
+    let n = load8(int_add(n_buf, idx))
+    return int_sub(n, p)
+}
+
+// _lk_optical_flow_u8_simd_inner: same inner-loop shape as the R12A i32
+//   SIMD variant, but uses the packed-byte locality strategy. Pack the
+//   WIN x WIN windows of `prev` and `next` per pixel into contiguous
+//   byte scratch buffers via memcpy_raw, then run the 5-accumulator
+//   scalar inner loop reading It from the packed buffer. Bit-identical
+//   to scalar (same integer math, same loop order).
+//
+//   This helper bypasses the env-var check + the input-validation
+//   prologue so unit tests can exercise the SIMD path directly without
+//   depending on env state. Mirrors R15A's
+//   _stereo_disparity_u8_simd_inner. Caller is responsible for
+//   ensuring (width, height, ws, area) are valid (the public entry
+//   point lk_optical_flow_u8_simd handles validation).
+fn _lk_optical_flow_u8_simd_inner(prev_ptr, next_ptr, width, height,
+                                    ws, half, pad, area) {
+    let n_cells  = int_mul(ws, ws)
+    // +8 scratch headroom past the actual ws^2 footprint to mirror the
+    // R15A pack convention and give vpsadbw's 32-byte chunk a safe
+    // over-read landing zone (used by lk_sad_block_u8 callers that
+    // share these buffers).
+    let buf_bytes = int_add(n_cells, 8)
+    let p_buf = alloc(buf_bytes)
+    let n_buf = alloc(buf_bytes)
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Pack the WIN x WIN windows of prev + next centered at
+            // (x, y) into the contiguous byte scratch buffers. This
+            // is the R15A pack-once-per-pixel pattern; the It reads
+            // in the inner loop become cache-warm contiguous loads.
+            _lk_pack_block_u8(prev_ptr, width, x, y, half, ws, p_buf)
+            _lk_pack_block_u8(next_ptr, width, x, y, half, ws, n_buf)
+            // Accumulate the 5 sums over the WIN x WIN window. Same
+            // scalar math + same loop order as lk_optical_flow; the
+            // ONLY change is It reads from the packed buffer instead
+            // of two strided image loads (per cell, saves the
+            // next-image load address arithmetic + boundary check).
+            let sum_ix2  = 0
+            let sum_iy2  = 0
+            let sum_ixiy = 0
+            let sum_ixit = 0
+            let sum_iyit = 0
+            let dy = 0 - half
+            while dy <= half {
+                let py = int_add(y, dy)
+                let dx = 0 - half
+                while dx <= half {
+                    let px = int_add(x, dx)
+                    let ix = _lk_ix(prev_ptr, width, px, py)
+                    let iy = _lk_iy(prev_ptr, width, px, py)
+                    let it = _lk_packed_it(p_buf, n_buf, dx, dy, half, ws)
+                    sum_ix2  = int_add(sum_ix2,  int_mul(ix, ix))
+                    sum_iy2  = int_add(sum_iy2,  int_mul(iy, iy))
+                    sum_ixiy = int_add(sum_ixiy, int_mul(ix, iy))
+                    sum_ixit = int_add(sum_ixit, int_mul(ix, it))
+                    sum_iyit = int_add(sum_iyit, int_mul(iy, it))
+                    dx = int_add(dx, 1)
+                }
+                dy = int_add(dy, 1)
+            }
+            // 2x2 inverse -- identical to lk_optical_flow.
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // No texture / aperture -- leave (0, 0, 0).
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,             u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1), v_milli)
+                _lk_set(valid_buf, pixel_idx,           1)
+                valid_count = int_add(valid_count, 1)
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// lk_optical_flow_u8_simd(prev, next, w, h, win_size)
+//   Same shape as lk_optical_flow. Public entry-point with input
+//   validation; routes to _lk_optical_flow_u8_simd_inner when
+//   CE_LK_U8_SIMD=on, otherwise falls back to scalar lk_optical_flow.
+//   Mirrors R15A's stereo_disparity_u8_simd contract.
+fn lk_optical_flow_u8_simd(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    // CE_LK_U8_SIMD=off / unset routes back through the scalar
+    // implementation (mirrors R15A's stereo_disparity_u8_simd opt-in).
+    if _lk_u8_simd_enabled() == 0 {
+        return lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+    }
+    return _lk_optical_flow_u8_simd_inner(prev_ptr, next_ptr, width, height,
+                                           ws, half, pad, area)
+}
+
 // ---- accessors -----------------------------------------------------------
 
 // lk_flow_at(result, x, y) -> [u_milli, v_milli, valid]
