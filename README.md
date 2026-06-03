@@ -11,7 +11,72 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R19E adds `src/federation/leader_election.nova` —
+> toolchain. R20B adds `src/kg/rule_inference.nova` — a forward-chaining
+> mini-Datalog rule engine over the KG. The KG had nine READ surfaces
+> (episodic recall, TF-IDF, LSH ANN, LPA + Louvain clustering, PageRank,
+> mini-SPARQL queries, link prediction, temporal reasoning) but no
+> DECLARATIVE INFERENCE surface: a rule engine that derives new facts
+> from existing ones by iterating to fixpoint. R20B closes that gap.
+> Rule surface: `RULE head(?a, ?b) <- premise1 AND premise2` where each
+> premise is a binary predicate atom and the conjunction token is any
+> of `AND` / `&&` / `,` / the UTF-8 wedge. Facts live as
+> RELATION-kind atoms with canonical labels "pred|arg1|arg2"; the pipe
+> separator is reserved from identifier tokens so it never collides
+> with predicate names. Dedupe is O(1) amortised via `kg_find_atom`'s
+> label hash. Forward-chaining runs to natural fixpoint (no new atoms
+> derived in a pass) or to one of the runaway caps (default
+> max_iterations=100, max_derived_atoms=10000). Each derivation is
+> recorded in the engine's provenance table; `rule_engine_explain(
+> engine, atom_id)` returns the list of `[atom_id, rule_index,
+> source_atom_ids]` entries that produced the atom. Public API:
+> `rule_parse(rule_string)`, `rule_engine_new()`, `rule_engine_add(
+> engine, rule_string)`, `rule_engine_run(engine, kg, max_iterations)
+> -> [augmented_kg, derived_count, iterations]`, `rule_engine_explain(
+> engine, atom_id)`. Verification: 47 unit assertions in
+> `tests/unit/test_rule_inference.nova` (NEW; covers parser shape +
+> error cases for every conjunction token + arity mismatch + missing
+> arrow + empty body; engine construction, single-rule single-fact
+> derivation, multi-rule cooperation, transitive closure on 4-parent
+> + 5-parent chains, fixpoint termination, cycle prevention via
+> dedupe, provenance traceback to source atoms, max-iterations cap,
+> idempotent re-run). 21 integration assertions in
+> `tests/integration/scenario_aaaa_rule_inference.sh` (NEW; standalone
+> driver seeds the classical 5-parent chain, runs to fixpoint, asserts
+> 15 derived ancestor pairs by C(6, 2) + fixpoint in 5 iterations +
+> no cap hit + cycle rule terminates + idempotency + provenance shape
+> + chat wiring through the chat binary). Chat: `/rule_add <rule>` +
+> `/rule_run [max_iters]` admin commands wired into
+> `examples/crossengin_chat.nova`. All prior KG suites remain green
+> (R6F+R8F episodic, R10C semantic search, R11F LPA + R12C Louvain,
+> R13E PageRank, R15D+R16F+R17E mini-SPARQL, R18B link prediction,
+> R19C temporal reasoning). Module count: 173 (+1 from R19E's 172).
+> R20C adds `src/perception/sensor_fusion.nova` — the cross-modal
+> binding primitive that ties independent visual + audio observations into a
+> single fused atom. The vision pipeline (`io/transducers/visual_perception.nova`
+> R3.1 onward; R18D LBP-gallery face recognition) and audio pipeline
+> (`audio_capture.nova` + `stt_seam.nova` + R19D MFCC-gallery speaker ID) each
+> perceived the world in their own modalities; before R20C there was no
+> mechanism to bind a visual face observation to a temporally-coincident audio
+> speech observation from the same identity. R20C closes that gap with
+> temporal-window correlation (default 100ms, the McGurk-effect cross-modal
+> binding window in nanoseconds = 100_000_000) + cross-modal identity matching
+> (face_label == speaker_label → FUSE_BINDING_STRONG; else temporal-only
+> FUSE_BINDING_WEAK; "unknown" sentinel suppressed) + joint provenance
+> (`fuse_provenance(fused_atom)` returns `[image_source_atom_id,
+> audio_source_atom_id]`). Public API: `fuse_observation(image_atoms,
+> audio_atoms, ts_ns)`, `fuse_correlate_by_time(image_obs, audio_obs,
+> window_ns)`, `fuse_correlate_by_identity(face_label, speaker_label)`,
+> `fuse_provenance(fused_atom)`. Greedy 1-to-1 audio consumption (one
+> audio observation matches at most one image observation per
+> correlation pass). Honest scope: R20C ships the fusion PRIMITIVE; the
+> live capture-stream driver (per-modality ring buffers + ring-update
+> callbacks into `fuse_correlate_by_time`) is R20C.2. Demonstrated on
+> synthetic streams via the `/fuse` admin chat command. Verification:
+> 59 unit assertions in `tests/unit/test_sensor_fusion.nova` (NEW).
+> 10 integration assertions in `tests/integration/scenario_bbbb_sensor_fusion.sh`
+> (NEW). All perception suites remain green. Module count: +1 (new
+> `src/perception/` directory). R19E adds
+> `src/federation/leader_election.nova` —
 > Garcia-Molina's Bully algorithm (1982, simplified for N ≤ 16
 > meshes) layered on top of R18E SWIM gossip. R18E gives every soul
 > a converged view of "who is alive"; R19E is the next federation

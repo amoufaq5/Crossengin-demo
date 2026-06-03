@@ -99,6 +99,7 @@
 import "std/io"
 import "../kg/atom_store.nova"
 import "../kg/multi_kg_manager.nova"
+import "../kg/query.nova"
 import "../io/transducers/kg_sync.nova"
 
 // ---- protocol constants ---------------------------------------------------
@@ -130,6 +131,20 @@ let GOSSIP_ATOM_PREFIX   = "ATOM "
 let GOSSIP_DELTA_END_LINE = "DELTA_END"
 let GOSSIP_BYE_LINE      = "BYE"
 let GOSSIP_ERR_UNKNOWN   = "ERR unknown"
+
+// R20E -- distributed-query message prefixes. The gossip handler
+// dispatches DQUERY lines to a minimal inline handler that calls
+// kg_query_compile_and_run on the local KG and streams DQRES / DQBIND* /
+// DQEND back. The receiver side is intentionally implemented HERE (in
+// gossip.nova) rather than as a callback into distributed_query.nova to
+// avoid an import cycle (distributed_query imports gossip for the
+// alive-peer + dial helpers). The originator side lives in
+// distributed_query.nova; both sides share these literal prefixes.
+let GOSSIP_DQUERY_PREFIX = "DQUERY "
+let GOSSIP_DQRES_PREFIX  = "DQRES "
+let GOSSIP_DQBIND_PREFIX = "DQBIND "
+let GOSSIP_DQEND_PREFIX  = "DQEND "
+let GOSSIP_DQERR_PREFIX  = "DQERR "
 
 // ---- peer entry record indices --------------------------------------------
 let GOSSIP_PE_ADDR       = 0
@@ -308,6 +323,10 @@ fn gossip_init(self_addr, bootstrap_peers) {
     push(st, 0)                      // S_STATS_ACKS
     push(st, 0)                      // S_STATS_TIMEOUTS
     push(st, 0)                      // S_STATS_DELTAS
+    push(st, 0)                      // S_ATT_STORE (R20F)
+    push(st, 0)                      // S_ATT_PUBKEYS (R20F)
+    push(st, 0)                      // S_STATS_ATT_RX (R20F)
+    push(st, 0)                      // S_STATS_ATT_BAD (R20F)
 
     // Bootstrap peers are addresses; trust them at startup with
     // status=ALIVE and last_seen=nanotime() (the operator just told
@@ -949,6 +968,17 @@ fn gossip_handle_conn_kg(state, conn_fd, kg) {
                                 _gossip_stream_atoms_since(conn_fd, kg, since_ns)
                             }
                             _gossip_send_all(conn_fd, GOSSIP_DELTA_END_LINE + "\n")
+                        } else {
+                            // R20E: distributed-query dispatch. Minimal
+                            // inline handler that evaluates the SPARQL
+                            // against the local KG and streams the
+                            // standard DQRES / DQBIND / DQEND stanza.
+                            // Implemented HERE (rather than as a hook
+                            // into distributed_query.nova) to keep the
+                            // import graph acyclic.
+                            if _gossip_starts_with(line, GOSSIP_DQUERY_PREFIX) == 1 {
+                                _gossip_serve_dquery(conn_fd, state, kg, line)
+                            }
                         }
                     }
                 }
@@ -957,6 +987,72 @@ fn gossip_handle_conn_kg(state, conn_fd, kg) {
     }
     close_fd(conn_fd)
     return state
+}
+
+// R20E -- serve a single DQUERY line. Parses `DQUERY <id> <originator>
+// <ts_ns> <query_string...>` (the query_string is everything from the
+// 5th wire token to end-of-line, joined by single spaces -- preserving
+// the originator's exact spacing is impossible across the tokenizer but
+// SPARQL whitespace is collapse-tolerant). Evaluates the query against
+// kg, writes the response stream:
+//
+//   DQRES <id> <self_addr> <count>\n
+//   DQBIND <self_addr> <var1>=<val1> <var2>=<val2> ...\n   (n times)
+//   DQEND <id>\n
+//
+// On parse error, writes a DQERR line instead of DQRES and a DQEND
+// after. The originator detects the DQERR and bumps its bad_query
+// counter without aborting the rest of the fan-out.
+fn _gossip_serve_dquery(conn_fd, state, kg, line) {
+    let toks = _gossip_split_spaces(line)
+    // Expected shape: ["DQUERY", "<id>", "<originator>", "<ts_ns>", "<rest...>"]
+    if len(toks) < 5 { return 0 }
+    let id_s = toks[1]
+    let qid = 0
+    if _gossip_is_digits(id_s) == 1 { qid = str_to_int(id_s) }
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    // Reassemble the query string from toks[4..]. The originator
+    // sends the SPARQL with single spaces between tokens; our
+    // line-split also splits on single space so the join is faithful.
+    let qs = toks[4]
+    let i = 5
+    while i < len(toks) {
+        qs = qs + " " + toks[i]
+        i = i + 1
+    }
+    let parsed = kg_query_parse(qs)
+    if _qry_is_error(parsed) == 1 {
+        let err_msg = qry_error_message(parsed)
+        let err_line = GOSSIP_DQERR_PREFIX + int_to_str(qid) + " " + err_msg + "\n"
+        _gossip_send_all(conn_fd, err_line)
+        _gossip_send_all(conn_fd, GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
+        return 0
+    }
+    let vars = kg_query_vars(parsed)
+    let bindings = kg_query_execute(kg, parsed)
+    let n = len(bindings)
+    let res_line = GOSSIP_DQRES_PREFIX + int_to_str(qid) + " " + self_addr
+        + " " + int_to_str(n) + "\n"
+    if _gossip_send_all(conn_fd, res_line) == 0 { return -1 }
+    let k = 0
+    while k < n {
+        let row = GOSSIP_DQBIND_PREFIX + self_addr
+        let v = 0
+        while v < len(vars) {
+            let name = vars[v]
+            if binding_has(bindings[k], name) == 1 {
+                let val = binding_get(bindings[k], name)
+                row = row + " " + name + "=" + int_to_str(val)
+            } else {
+                row = row + " " + name + "=?"
+            }
+            v = v + 1
+        }
+        if _gossip_send_all(conn_fd, row + "\n") == 0 { return -1 }
+        k = k + 1
+    }
+    _gossip_send_all(conn_fd, GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
+    return n
 }
 
 // Walk the KG and send ATOM lines for every atom whose updated_ns > since_ns.

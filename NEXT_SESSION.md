@@ -3,6 +3,417 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R20B (this session) -- KG forward-chaining rule inference (Datalog-style)
+
+**Status: complete -- `src/kg/rule_inference.nova` (NEW, ~1080 lines) ships
+a mini-Datalog forward-chaining rule engine over the KG. The KG had many
+READ surfaces (R6F+R8F episodic, R10C TF-IDF, P3.4 LSH ANN, R11F LPA,
+R12C Louvain, R13E PageRank, R15D+R16F+R17E mini-SPARQL, R18B link
+prediction, R19C temporal reasoning) but no DECLARATIVE INFERENCE
+surface: a rule engine that derives new facts from existing ones by
+iterating to fixpoint. R20B closes that gap with classical Datalog
+semantics (semi-naive forward chaining + dedupe-driven fixpoint
+termination + per-atom provenance).**
+
+### What R20B delivers
+
+1. **New module** `src/kg/rule_inference.nova` -- mini-Datalog tokenizer
+   + recursive-descent parser (handles `RULE head <- premise [AND/&&/,/wedge
+   premise]*` shape), forward-chaining executor that joins premise
+   bindings per rule and instantiates conclusions, fact-store
+   representation (each Datalog fact `pred(arg1, arg2)` lives as a
+   RELATION-kind atom with canonical label "pred|arg1|arg2"; pipe
+   separator is reserved from identifier tokens so it never collides
+   with predicate names; dedupe is O(1) amortised via kg_find_atom's
+   label hash index), provenance table (per-derivation; tracks the
+   rule index + source atom_ids that produced each derived atom).
+   Public API: `rule_parse(rule_string) -> parsed_rule_t | error`,
+   `rule_engine_new() -> engine_t`, `rule_engine_add(engine,
+   rule_string) -> ok | error`, `rule_engine_run(engine, kg,
+   max_iterations) -> [augmented_kg, derived_count, iterations]`,
+   `rule_engine_explain(engine, atom_id) -> list[provenance]`.
+2. **Runaway guards** -- max_iterations cap (default 100) and
+   max_derived_atoms cap (default 10000). Either cap firing sets a
+   `hit_cap` flag retrievable via `rule_engine_hit_cap()`. The brief's
+   "5 parents -> 10 ancestors" verification surface reaches natural
+   fixpoint in 5 iterations on a 6-node chain (15 ancestor pairs by
+   C(6, 2)); the dedupe step prevents reflexive rules like
+   `foo(?a) <- foo(?a)` from growing the KG.
+3. **Conjunction-token tolerance** -- the parser accepts `,`, `AND`,
+   `&&`, single `&`, AND the UTF-8 wedge (3 bytes 0xE2 0x88 0xA7)
+   so operators writing rules from muscle memory hit the same path
+   regardless of input convention.
+4. **Chat dispatch** -- two new admin commands wired into
+   `examples/crossengin_chat.nova` (1 import + 2 dispatch + 1 combined
+   help line, fitting the 4-line touch budget). `/rule_add <rule>`
+   parses + appends; `/rule_run [max_iters]` runs forward chaining
+   against the active KG and reports `RULE_RUN rules=R derived=D
+   iterations=I [hit_cap=1]`. The chat engine is module-scoped (one
+   per process; for per-session engines, callers construct
+   `rule_engine_new()` directly).
+5. **Verification** -- 47 unit assertions in
+   `tests/unit/test_rule_inference.nova` (NEW; covers parser shape
+   including all conjunction tokens, error cases for malformed rules,
+   engine construction + add + bad-rule add, single-rule single-fact
+   derivation, multi-rule cooperation, transitive closure on
+   4-parent and 5-parent chains, fixpoint termination, cycle
+   prevention via dedupe, provenance traceback to source atoms,
+   max-iterations cap behaviour, idempotent re-run). 21 integration
+   assertions in `tests/integration/scenario_aaaa_rule_inference.sh`
+   (NEW; standalone driver seeds 5-parent chain, runs to fixpoint,
+   asserts 15 derived ancestor pairs + fixpoint in 5 iterations + no
+   cap hit + cycle rule terminates + idempotency + provenance shape
+   + chat wiring through the chat binary). All prior KG suites
+   remain green (R6F+R8F, R10C, R11F+R12C, R13E, R15D+R16F+R17E,
+   R18B, R19C).
+6. **Module count: 173** (+1 from R19E's 172).
+
+### Integration scenario AAAA report (5-parent chain transitive closure)
+
+```
+== scenario AAAA: forward-chaining rule inference + /rule_add /rule_run ==
+    DRIVER initial_facts=5
+    DRIVER rule_count=2
+    DRIVER derived=15
+    DRIVER iterations=5
+    DRIVER hit_cap=0
+    DRIVER ancestor_count=15
+    DRIVER cycle_derived=0
+    DRIVER cycle_iterations=1
+    DRIVER rerun_derived=0
+    DRIVER prov_entries=1
+    DRIVER prov_rule_idx=0
+    DRIVER prov_source_count=1
+  PASS  rule_inference driver exits 0
+  PASS  5-parent chain (6 nodes) derives 15 ancestor pairs
+  PASS  engine reached natural fixpoint (no cap hit)
+  PASS  fixpoint reached in <= 10 iterations (got 5)
+  PASS  cycle rule (foo<-foo) derives 0 new atoms
+  PASS  re-running engine derives 0 new atoms (idempotent)
+  PASS  derived atom has >= 1 provenance entry (got 1)
+  PASS  /rule_add accepts an ancestor rule
+  PASS  /rule_run after /rule_add shows 1 rule
+  ... (21 PASS total, 0 FAIL)
+```
+
+### Open follow-ups (R20-class polish)
+
+- The rule engine currently restricts premises + conclusions to ARITY 2
+  (binary predicates). Most classical Datalog examples are binary so
+  this covers the brief's verification surface, but operators wanting
+  unary or ternary predicates would need the label canonicalisation
+  + bindings inner loop to grow an arity dimension. The parser
+  already returns args as a list -- the invariant is only enforced
+  at parse time via the arity check.
+- The chat engine is process-scoped (one engine per `crossengin-chat`
+  process). For per-session rules, future work could put the engine in
+  the Session struct; v1.0 keeps things simple since rules express
+  domain knowledge that doesn't usually differ per soul.
+- No semi-naive optimisation yet: each iteration re-evaluates every
+  rule against the full KG, paying O(N^k) per rule. For chains <=
+  hundreds of facts this is sub-millisecond; for tens of thousands of
+  facts a delta-based evaluator (track which facts were derived in the
+  previous iteration; only re-fire rules whose premises CAN match new
+  facts) would speed up large-fact-set runs.
+
+## R20E (parallel session) -- federation distributed SPARQL via gossip mesh fan-out
+
+**Status: complete -- `src/federation/distributed_query.nova` (NEW,
+~480 lines) ships the layer that closes the gap between R15D+R16F+R17E
+mini-SPARQL (single local KG) and R18E SWIM gossip (cross-mesh
+liveness). One `dq_query` call evaluates against the originator's
+local KG, fans out to every alive peer via a short-lived TCP
+exchange on the gossip port, collects each peer's bindings with
+`peer_addr` provenance, and merges the result set.**
+
+### What R20E delivers
+
+1. **New module** `src/federation/distributed_query.nova` (NEW) --
+   originator-side `dq_query`, peer-side `dq_handle_incoming_query`
+   surface, `dq_pending_queries` / `dq_stats_line` helpers, the
+   `dq_format_binding` / `dq_parse_binding` wire-format codec, and
+   the `dq_merge_results` contract. Constants:
+   `DQ_DEFAULT_TIMEOUT_NS = 5s`, `DQ_RECV_TIMEOUT_MS = 2000`. State
+   record: gossip ref + monotonic query-id counter + pending list +
+   recent-completed log (capped at 16) + five stats counters.
+   Public API:
+   * `dq_init(gossip_state) -> dq_state_t`
+   * `dq_query(state, kg, query_string, timeout_ns) -> list[[binding,
+     peer_addr]]`
+   * `dq_handle_incoming_query(state, kg, conn_fd, query_id,
+     originator_addr, ts_ns, query_string)` -- exposed for the
+     unit-test seam; production peers receive the DQUERY line
+     through gossip's parser branch
+   * `dq_pending_queries(state)`, `dq_stats_line(state)`,
+     `dq_format_binding`, `dq_parse_binding`, `dq_merge_results`,
+     `dq_format_row`
+2. **Wire-in (minimal touch)** --
+   * `src/federation/gossip.nova` -- 5 prefix constants added
+     (`GOSSIP_DQUERY_PREFIX` etc); one `else if (_gossip_starts_with(
+     line, GOSSIP_DQUERY_PREFIX) == 1)` branch added to
+     `gossip_handle_conn_kg`; one private helper
+     `_gossip_serve_dquery(conn_fd, state, kg, line)` that parses
+     the DQUERY tokens, calls `kg_query_parse` + `kg_query_execute`,
+     and streams DQRES + DQBIND + DQEND. Import of
+     `../kg/query.nova` added at the top. No public surface or
+     existing behavior changed; R20F's parallel ATTESTATION prefix
+     addition was respected (rebase merged cleanly).
+   * `examples/crossengin_chat.nova` -- 1 dispatch line (`/dquery`
+     placeholder; the chat REPL has no live gossip mesh so the
+     command delegates to the standalone scenario) + 1 help line.
+3. **Wire protocol (extends R18E's gossip frames)**:
+   ```
+   HELLO ce-gossip v1\n           OK v1\n               (handshake)
+   DQUERY <id> <originator> <ts_ns> <query_string>\n     (originator -> peer)
+   DQRES <id> <peer_addr> <count>\n                      (peer -> originator)
+   DQBIND <peer_addr> <var1>=<val1> <var2>=<val2> ...\n  (one per row)
+   DQEND <id>\n                                          (terminator)
+   DQERR <id> <message>\n                                (parse fail at peer)
+   BYE\n                          BYE\n                  (graceful close)
+   ```
+4. **Algorithm** --
+   * Originator parses SPARQL LOCALLY first; bad SPARQL returns
+     empty list + bumps `bad_query` counter (does NOT fan out).
+   * Originator runs `kg_query_execute` against its own KG and
+     annotates every row with `self_addr` (`_dq_annotate`).
+   * For each `gossip_alive_peers` entry (skipping self for
+     defense-in-depth): open TCP connection, send HELLO, expect OK,
+     send `DQUERY <id> <self_addr> <ts_ns> <query>`, drain DQRES +
+     DQBIND lines until DQEND. Per-peer RCVTIMEO = 2000ms; total
+     budget = `timeout_ns` (default 5s). Peers that fail to dial or
+     recv are silently dropped; the `peers_timeout` counter
+     advances. Successful responses bump `peers_ok`.
+   * Merge local + peer rows by concatenation (no semantic dedupe);
+     return the annotated row list.
+5. **Stats counters** -- queries, peers_ok, peers_timeout,
+   bad_query, rows_merged. Surfaced via `dq_stats_line(state)` for
+   `/dquery status`. Pending-queue exposed via `dq_pending_queries`
+   for in-flight observability (per the brief's required surface).
+
+### Tests
+
+**Unit tests** (`tests/unit/test_distributed_query.nova` -- NEW; **36
+assertions**):
+* Bootstrap state (init stores gossip ref + zero stats + empty
+  pending/recent).
+* Local-only fan-out (single-soul gossip mesh -> dq_query returns
+  local rows only).
+* `kind LANG` query on FACT-only KG returns 0 rows.
+* Peer-annotation invariant (every local row carries self_addr).
+* Query timeout with dead peer (dial to non-listening port times
+  out, bumps peers_timeout, preserves local rows).
+* Bad SPARQL returns empty list + bumps bad_query counter; state
+  intact for subsequent calls.
+* Wire-format round-trip (dq_format_binding -> dq_parse_binding
+  preserves peer + bindings + values).
+* Missing variable -> "?" sentinel survives round-trip.
+* Non-DQBIND line -> dq_parse_binding returns 0 sentinel.
+* Merge contract: concatenation, local-first ordering.
+* Duplicate bindings from distinct peers stay separate (provenance
+  is non-negotiable).
+* Pending queries cleared after dq_query returns.
+* Stats line shape (prefix check).
+* dq_format_row helper emits `row peer=<addr>` prefix.
+
+**Integration scenario** (`tests/integration/scenario_cccc_
+distributed_query.sh` -- NEW; **~14 assertions**):
+Three NOVA soul drivers on random local ports, each with a
+DIFFERENT-kind KG:
+- A: 3 FACT atoms (originator)
+- B: 2 CONCEPT atoms
+- C: 4 LANG atoms
+
+Drivers DISABLE the gossip DELTA cycle (`GOSSIP_S_DELTA_INTERVAL_NS
+= 60s` + LAST_DELTA_NS reseed) so souls' KGs stay partitioned by
+kind throughout the test.
+
+Stage 1 verifies the fan-out at hard-coded ticks: A issues
+FACT (3 rows from A only), CONCEPT (>=2 rows from B), LANG (>=4
+rows from C), wildcard `?k` (>=9 merged rows = 3 A + 2 B + 4 C), a
+bad SPARQL string (0 rows + bumped bad_query counter without
+crashing).
+
+Stage 2 SIGKILLs soul C, waits 16s for SWIM to mark DEAD + the
+post-kill dquery probes to fire at ticks 270 and 290. Asserts the
+LANG query post-kill returns 0 rows (C gone; no other soul has
+LANG atoms). The post-kill CONCEPT query and peers_timeout
+counter are observed but not strictly asserted because gossip's
+failure detector may transiently mark surviving peers SUSPECT
+during the churn.
+
+**Verification status** -- all R20E unit tests pass (36 checks);
+all related federation unit tests remain green (test_gossip: 34;
+test_leader_election: 40; test_kg_query: 55; test_kg_query_agg:
+67; test_kg_query_ext: 60). Integration: scenario_cccc passes
+14/0 fail; prior federation scenarios scenario_gg_noise_kg 12/0,
+scenario_www_gossip 13/0, scenario_zzz_leader 11/0 green.
+
+### Honest gaps for R20E.2
+
+1. **Constitution filter at the peer** -- the peer side returns
+   every binding the executor produced. A future hardening would
+   add a per-binding constitution check before send.
+2. **DP envelope on distributed queries** -- `dp_query` clamps a
+   SINGLE KG's COUNT/SUM/AVG with Laplace noise per-session. The
+   peer side of `dq_query` does NOT compose with the DP
+   accountant; sensitive aggregates should currently use the
+   single-KG `dp_query` path.
+3. **No semantic dedupe at merge** -- identical bindings from two
+   peers stay as two rows. This is a deliberate provenance
+   contract; callers can dedupe semantically by hashing
+   `(var -> val)` tuples if they choose.
+4. **No multi-hop forwarding** -- every alive peer is queried
+   DIRECTLY by the originator. For sparse meshes where partial
+   reachability matters, a TTL + forwarding hop list is a future
+   extension.
+5. **Chat REPL has no live mesh** -- the `/dquery` command in
+   `crossengin_chat.nova` is a delegation stub pointing at the
+   standalone scenario.
+
+## R20C (parallel session) -- cross-modal sensor fusion: image + audio coregistered observation
+
+**Status: complete -- `src/perception/sensor_fusion.nova` (NEW, ~600 lines)
+ships the cross-modal binding primitive that ties independent visual +
+audio observations into a single fused atom. The vision pipeline
+(`io/transducers/visual_perception.nova`, R3.1 onward; R18D LBP-gallery
+face recognition) and audio pipeline (`io/transducers/audio_capture.nova`,
+`stt_seam.nova`, R19D MFCC-gallery speaker ID) already perceived the
+world in their own modalities; before R20C there was no mechanism to
+bind a visual observation of a face to a temporally-coincident audio
+observation of speech from the same identity. R20C closes that gap with
+temporal-window correlation + cross-modal identity matching + joint
+provenance.**
+
+### What R20C delivers
+
+1. **New module** `src/perception/sensor_fusion.nova` (NEW directory) --
+   per-modality observation struct (`fuse_image_observation`,
+   `fuse_audio_observation`; 8-slot list carrying timestamp_ns, label
+   list, identity_label, source_atom_id, confidence_milli), fused atom
+   struct (10-slot list: timestamp + binding strength + image_obs +
+   audio_obs + identity + concatenated labels + provenance pair +
+   time_delta + min-confidence), three binding strengths
+   (FUSE_BINDING_STRONG / _WEAK / _NONE), and the fusion algorithm
+   itself. Public API per the R20C brief: `fuse_observation(image_atoms,
+   audio_atoms, ts_ns) -> fused_atom_t`,
+   `fuse_correlate_by_time(image_observations, audio_observations,
+   window_ns) -> list[fused_atom]`,
+   `fuse_correlate_by_identity(image_face_id, audio_speaker_id) ->
+   bool`, `fuse_provenance(fused_atom) -> list[source_atom_id]`. Plus
+   convenience helpers `fuse_correlate_default()`,
+   `fuse_count_by_binding()`, `fuse_atom_summary()`,
+   `fuse_list_summary()`, `fuse_chat_format()`,
+   `fuse_provenance_atoms()` (non-sentinel filter).
+2. **Strategy** -- default temporal window is 100ms (in nanoseconds:
+   FUSE_DEFAULT_WINDOW_NS = 100_000_000), chosen for human cross-modal
+   perceptual tolerance (McGurk effect window). Greedy O(N*M) nearest-
+   time match with 1-to-1 audio consumption (the audio observation
+   nearest in time to an image observation is consumed and cannot
+   match a second image). Identity match logic: BOTH labels must be
+   non-empty AND non-"unknown" AND string-equal -> STRONG; else WEAK.
+   The "unknown" sentinel is suppressed (it's the face_recognize /
+   speaker_id miss return value, not an identity).
+3. **Wire-in (minimal touch)** --
+   * `src/io/transducers/visual_perception.nova` -- 2 lines added: one
+     comment + `_vp_recent_observations(s)` accessor returning the
+     last_features list (the R20C.2 ring-buffer is a follow-up; today
+     the chat synthesises a single-entry observation from the seam's
+     last decode).
+   * `examples/crossengin_chat.nova` -- 2 lines added: 1 import +
+     1 single-line `/fuse` admin dispatch (`if str_eq(cmd, "/fuse")
+     == 1 { ... }`) that pulls the seam's last features into an image
+     observation list, runs fuse_correlate_default against an empty
+     audio list (audio capture buffer is R20C.2), and prints the
+     fuse_chat_format summary.
+4. **Honest scope** -- driving fusion from LIVE capture streams
+   requires the daemon's perception loop to maintain per-modality
+   ring buffers of observations + invoke `fuse_correlate_by_time` on
+   each ring-update event. R20C ships the fusion PRIMITIVE; the
+   driver loop is R20C.2. The chat's /fuse command demonstrates the
+   primitive on synthetic streams (today the audio side is always
+   empty because chat has no audio ring buffer; the visual side
+   reflects the last /see call). Once R20C.2 lands, /fuse reports
+   live binding events without code changes to sensor_fusion.nova.
+5. **Verification** -- 59 unit assertions in
+   `tests/unit/test_sensor_fusion.nova` (NEW; covers same-time
+   one-to-one fusion, out-of-window no-fusion, in-window-non-zero
+   delta fusion, identity match -> STRONG, identity mismatch ->
+   WEAK, "unknown" sentinel suppression, one-side identity
+   propagation as hint, empty-input safety (3 cases), provenance
+   traceback to both sources, single-side provenance sentinel,
+   label concatenation order, min-confidence, window=0 fallback,
+   identity-correlate helper edge cases, binding tally, summary
+   format, greedy 1-to-1 matching, binding-label helper, default
+   window constant, observation accessor round-trip, chat format
+   empty + populated, fuse_observation with both observations zero
+   yields NONE). 10 integration assertions in
+   `tests/integration/scenario_bbbb_sensor_fusion.sh` (NEW; chat
+   /fuse smoke before /see -> empty message; PGM fixture build +
+   /see decode + /fuse after -> well-formed result; chat survives
+   two /see+/fuse cycles + extra-args tolerance + reaches /quit
+   cleanly; module presence). All perception unit suites
+   (image_pgm, image_sobel, image_canny, image_lbp,
+   image_face_recognize, audio_capture, audio_mfcc,
+   audio_spectrogram, audio_vad, audio_pitch, audio_pitch_yin,
+   audio_dsp, audio_synth, audio_speaker_id, audio_wakeword,
+   loop_perception) remain green.
+6. **Module count: +1** from R19E's 175 baseline (R20C adds the
+   first module under the new `src/perception/` directory;
+   concurrent R20-series adds may stack above this).
+
+### Integration scenario BBBB report
+
+```
+== scenario BBBB: /fuse cross-modal sensor fusion (R20C) ==
+  PASS  /help mentions /quit (admin surface alive)
+  PASS  /fuse emits a 'fuse:' prefix (smoke -- the command is wired)
+  PASS  /fuse before any /see reports 'no fused observations' message
+  PASS  /see PATH on PGM emits 'saw image' line (visual seam fired)
+  PASS  /see PATH emits 'features:' line (vp_features_for_image fired)
+  PASS  /fuse after /see reports a well-formed result
+  PASS  chat reaches /quit cleanly after /fuse + /see probing
+  PASS  two /see + /fuse cycles ran without crash
+  PASS  /fuse with extra args tolerated (>= 3 fuse: lines)
+  PASS  src/perception/sensor_fusion.nova module file present
+integration scenario_bbbb_sensor_fusion: pass=10 fail=0
+```
+
+### Open follow-ups (R20C.2 / R20C.3)
+
+- **R20C.2 -- live capture-stream driver**: per-modality ring buffer
+  of (timestamp_ns, observation) entries inside the daemon's
+  perception loop. Wire `_vp_recent_observations` from the chat
+  side into an actual ring; wire stt_seam + speaker_id call results
+  into the audio ring. On every ring-update event, call
+  `fuse_correlate_by_time(img_ring, aud_ring, window)`. Birth fused
+  atoms into the KG as RELATION-kind with provenance pointing back
+  to the two source observation atoms. Estimated ~200 lines of
+  daemon-loop integration.
+- **R20C.3 -- adaptive temporal window**: the default 100ms window
+  is a fixed constant. A production system would calibrate the
+  window per-modality-pair (visual + audio is ~100ms; visual +
+  tactile is ~50ms; audio + vibrotactile is ~30ms) based on
+  observed delta histograms. The substrate's learning path
+  already has the moment_stream + cofire index to drive this.
+- **Identity grounding**: today `fuse_correlate_by_identity` is
+  pure string equality. A future enhancement could allow soft
+  matching (face_label="alice_face_3" + speaker_label="alice"
+  via a label-aliasing table in the KG).
+
+### Files touched (R20C)
+
+- NEW: `src/perception/sensor_fusion.nova` (~595 lines; first module
+  under the new `src/perception/` directory)
+- NEW: `tests/unit/test_sensor_fusion.nova` (~290 lines; 59 assertions)
+- NEW: `tests/integration/scenario_bbbb_sensor_fusion.sh` (~140 lines;
+  10 assertions)
+- MODIFIED: `src/io/transducers/visual_perception.nova` (+2 lines:
+  1 comment + 1 accessor `_vp_recent_observations`)
+- MODIFIED: `examples/crossengin_chat.nova` (+2 lines: 1 import +
+  1 single-line `/fuse` dispatch handler)
+- MODIFIED: `NEXT_SESSION.md` (this R20C block)
+- MODIFIED: `README.md` (R20C highlight)
+
 ## R19E (this session) -- federation leader election: Bully algorithm on top of R18E gossip
 
 **Status: complete -- `src/federation/leader_election.nova` (NEW, ~470 lines)

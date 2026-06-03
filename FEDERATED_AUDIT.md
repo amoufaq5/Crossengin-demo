@@ -599,3 +599,190 @@ b: tick=145 leader: leader=20 self_id=20 is_leader=yes state=stable peers=2 \
    distributed scheduling, single-writer schema). The LE module is
    the substrate; the workload that consumes the leader is the
    next session's frontier.
+
+## R20E extension: distributed SPARQL via gossip-mesh fan-out
+
+R15D + R16F + R17E ship the mini-SPARQL surface against a SINGLE
+local KG. R18E gives every soul a converged view of who is alive on
+the mesh. R20E closes the obvious next gap: **run ONE SPARQL query
+that fans out across the live mesh, every soul evaluates against its
+own KG, results merge at the originator with per-row provenance
+(which soul produced each binding)**.
+
+### Why fan-out + merge (not a centralized index)
+
+CrossEngin is a federation of souls, NOT a sharded database. Each
+soul carries its own KG — its lived experience: episodic events,
+teach-pinned facts, learned concepts, language atoms — and has every
+right to keep that KG private. A distributed query has to RESPECT
+those local decisions: it evaluates at the peer, sends back only the
+BINDINGS the peer chose to return, and the originator never sees raw
+atoms it wasn't already entitled to. The merge is purely additive on
+rows the peers AGREE to share.
+
+Provenance is non-negotiable: every returned row MUST carry the
+peer's gossip self_addr. A row from soul A and an identical row
+from soul B are kept SEPARATE — the originator gets two rows with
+distinct `__peer` annotations, NOT one merged row. The caller
+decides whether to dedupe semantically; the federation layer cannot
+guess the right policy.
+
+### Wire protocol
+
+One short-lived TCP connection per peer per query, layered on top of
+the existing R18E gossip port. Constants live next to
+`GOSSIP_DELTA_PREFIX` in `src/federation/gossip.nova`; the server-side
+parser is an additive `else if` branch inside `gossip_handle_conn_kg`
+so peers automatically learn the new opcode without a recompile of
+older soul drivers (graceful: an older driver simply ignores the
+unknown line).
+
+```
+DQUERY <query_id> <originator_addr> <ts_ns> <query_string>\n
+DQRES  <query_id> <peer_addr> <count>\n
+DQBIND <peer_addr> <var1>=<val1> <var2>=<val2> ...\n   (n times)
+DQEND  <query_id>\n
+DQERR  <query_id> <message>\n                          (on parse fail)
+```
+
+The server reads the DQUERY line off a HELLO-handshaken gossip
+connection, parses the query string, calls `kg_query_parse` and
+`kg_query_execute` against the local KG, and streams DQRES + DQBIND
+lines back. Originator collects responses up to a budget (default
+5s, overridable via `dq_query`'s timeout_ns argument), then merges
+with its own local rows.
+
+### Algorithm
+
+1. `dq_query(state, kg, query_string, timeout_ns)` issues a query:
+   * Parse SPARQL locally first. If parse fails, return empty list,
+     bump `bad_query` counter, do NOT fan out.
+   * Run `kg_query_execute` against the originator's own KG
+     immediately, annotate every row with `self_addr`. The originator
+     ALWAYS sees its own rows regardless of mesh liveness.
+   * For each `gossip_alive_peers` entry: open a short-lived TCP
+     connection, send `HELLO`/wait `OK`/send DQUERY line, drain
+     DQRES + DQBIND + DQEND. A peer that fails to respond within
+     its per-peer budget is silently dropped (rows just aren't
+     included); the originator's `peers_timeout` counter advances.
+   * Merge local rows + peer rows in stable order: locals first,
+     then peers in alive-list iteration order. No semantic dedupe.
+2. `dq_handle_incoming_query` is the server-side helper exposed for
+   the unit test seam — production peers receive the DQUERY line
+   through gossip's parser branch (which calls a private
+   `_gossip_serve_dquery` helper in `gossip.nova` rather than
+   crossing the import-cycle boundary).
+3. `dq_pending_queries(state)` returns the in-flight queries
+   (originator-side bookkeeping; the peer side keeps no per-query
+   state because responses are sent inline before close).
+
+### Stats counters
+
+Each `dq_state_t` carries:
+- `stats_queries`: # queries dispatched
+- `stats_peers_ok`: # peer responses received
+- `stats_peers_timeout`: # peers that failed to respond (dial or recv)
+- `stats_bad_query`: # parse errors (originator-side OR DQERR from a peer)
+- `stats_rows_merged`: total rows in merged result sets (sum across queries)
+
+Surfaced via `dq_stats_line(state)` for `/dquery status`.
+
+### What R20E does NOT do
+
+* **No constitution filter** — peers return every binding the
+  executor produced. A future hardening could add a per-binding
+  constitution check before send.
+* **No DP noise** — distributed queries are NOT
+  privacy-budget-accounted; for sensitive queries the caller should
+  use the existing `dp_query` admin path which clamps a single KG's
+  output with Laplace noise.
+* **No semantic dedupe** — identical bindings from two peers stay
+  separate, each carrying its source peer_addr. This is a feature,
+  not a bug: provenance is the cheaper-to-have-and-throw-away than
+  the impossible-to-recover.
+* **No multi-hop forwarding** — every alive peer is queried
+  DIRECTLY by the originator. Peers do NOT proxy queries onward.
+  For sparse meshes where partial reachability matters (only soul A
+  can reach soul C; only soul C has the answer), a future version
+  would add a TTL and forwarding hop list.
+
+### Tests
+
+* Unit (`tests/unit/test_distributed_query.nova`): **~36 assertions**
+  covering bootstrap state, local-only fan-out on a single-soul
+  mesh, peer annotation invariant, dead-peer timeout handling,
+  bad-SPARQL handling (empty result + bumped bad_query counter +
+  no state corruption), wire-format round-trip
+  (`dq_format_binding` ↔ `dq_parse_binding`), missing-var
+  produces `?`, merge concatenation preserves local-first ordering,
+  duplicate-binding-from-distinct-peer rows kept separate,
+  pending-queue clears after dq_query returns,
+  stats_line emits expected prefix, dq_format_row helper.
+* Integration (`tests/integration/scenario_cccc_distributed_query.sh`):
+  **~14 assertions** running three NOVA soul drivers on random local
+  ports. Each soul holds a DIFFERENT-kind KG:
+  - A: 3 FACT atoms
+  - B: 2 CONCEPT atoms
+  - C: 4 LANG atoms
+
+  Stage 1 verifies the fan-out: A issues FACT (3 rows, A's locals
+  only), CONCEPT (2 rows from B), LANG (4 rows from C), wildcard
+  `?k` (>= 9 merged rows), and a bad SPARQL string (0 rows + bumped
+  bad_query counter). Stage 2 SIGKILLs soul C, waits 16s for SWIM
+  to mark DEAD + the post-kill dquery probes to fire, then verifies
+  the LANG query post-kill returns 0 rows (C is gone; no other soul
+  has LANG atoms). The post-kill CONCEPT query and peers_timeout
+  counter are observed but not strictly asserted because gossip's
+  failure detector may transiently mark surviving peers SUSPECT
+  during the churn.
+
+  The integration driver disables the gossip DELTA cycle
+  (`gs[GOSSIP_S_DELTA_INTERVAL_NS] = 60s`, plus a `LAST_DELTA_NS`
+  reseed) so the souls' KGs stay partitioned by kind. Without this,
+  the DELTA path would auto-replicate atoms between peers within
+  ~2s of mesh boot, and the fan-out test would be meaningless
+  (every soul would have every kind locally).
+
+### Sample run
+
+```
+$ /tmp/cccc_a.bin > /tmp/a.out &
+$ /tmp/cccc_b.bin > /tmp/b.out &
+$ /tmp/cccc_c.bin > /tmp/c.out &
+$ sleep 9     # 2s pre-loop sleep + 6s warmup + 1s margin
+$ grep dquery_result /tmp/a.out
+a: dquery_result label=FACT total=3
+a: dquery_result label=CONCEPT total=2
+a: dquery_result label=LANG total=4
+a: dquery_result label=ALL total=9
+a: dquery_result label=BAD total=0
+$ grep dquery_peer /tmp/a.out
+a: dquery_peer label=FACT peer=127.0.0.1:37759 count=3
+a: dquery_peer label=CONCEPT peer=127.0.0.1:37760 count=2
+a: dquery_peer label=LANG peer=127.0.0.1:37761 count=4
+a: dquery_peer label=ALL peer=127.0.0.1:37759 count=3
+a: dquery_peer label=ALL peer=127.0.0.1:37760 count=2
+a: dquery_peer label=ALL peer=127.0.0.1:37761 count=4
+```
+
+### Gaps for future work
+
+1. **Constitution filter at the peer** — before sending DQBIND lines
+   the peer should run each binding through its constitution check
+   (the same module `policy/constitution.nova` already used by the
+   chat speaker). The federation layer would expose a hook; the
+   constitution policy decides whether the binding can be shared.
+2. **DP envelope** — the existing `dp_query` path adds Laplace noise
+   to a single KG's COUNT/SUM/AVG output. The peer side of
+   distributed_query could compose with the per-session DP
+   accountant so cross-soul aggregates are still privacy-bounded.
+3. **Coordinator-driven planning** — the R19E elected leader could
+   become the query coordinator (today every soul that calls
+   `dq_query` is its own coordinator). A leader-coordinated query
+   could batch multiple in-flight queries into one round-trip per
+   peer, and would naturally fit with the leader-renewal heartbeat
+   gap noted in R19E.
+4. **Multi-hop forwarding** — for sparse meshes (e.g. originator
+   cannot directly reach all peers), the query would need a TTL +
+   forwarding hop list. The current 1-hop fan-out is the right
+   default for dense local meshes.
