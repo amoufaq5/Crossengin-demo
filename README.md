@@ -11,7 +11,43 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R23D adds `src/io/transducers/image_tracker.nova` — image
+> toolchain. R23E adds `src/federation/nat_traversal.nova` — a STUN-like
+> external address discovery + gossip-piggyback advertisement layer for
+> federation across NATs. R18E shipped the SWIM gossip mesh assuming
+> direct reachability; real-world peers behind home-router / mobile /
+> corporate NATs can only OUT-connect, so they need an external way to
+> learn their public addr and advertise it. R23E ships the canonical
+> STUN flow on TCP: `nat_query_stun(addr)` connects to any well-connected
+> peer (any CE soul with a publicly reachable port can serve
+> `STUN_REQUEST`) and reads back `EXTERNAL ip:port`. The server side
+> learns the dialer's external addr via the kernel's
+> `accept_conn(fd, sa_buf, sa_len_buf)` sockaddr_in fill.
+> `nat_advertise(gossip_state, nat_state, ext_addr)` broadcasts an
+> `EXTADDR <internal> <external>` line to every alive gossip peer via
+> the SWIM connection; the receiver's gossip parser dispatches into
+> nat_state's peer-ext table. NAT-type heuristic
+> (`nat_detect_type_from_replies`) classifies "open" / "cone" /
+> "symmetric" / "blocked" from two STUN responses. UDP hole-punching
+> is documented but stubbed (R23E.2 — requires NOVA `sendto/recvfrom`,
+> not yet exposed by the compiler). Public API: `nat_init`,
+> `nat_query_stun`, `nat_advertise`, `nat_detect_type`,
+> `nat_local_addrs`, `nat_peer_external_addrs`, `nat_set_external`,
+> `nat_get_external`, `nat_hole_punch` (stub), `nat_status_line`, plus
+> wire helpers `nat_parse_stun_response`, `nat_format_stun_response`,
+> `nat_extract_peer_addr`, `nat_serve_stun_conn_sa`,
+> `nat_record_inbound_extaddr`, `nat_serve_stun_one_shot`.
+> Verification: 53 unit assertions in `tests/unit/test_nat_traversal.nova`
+> (NEW; parse + format round-trip, sockaddr_in extraction, peer table
+> set / get / update, local-addrs enumeration, type heuristic on cone /
+> symmetric / open / blocked / malformed inputs, hole-punch stub
+> bumps counter + returns 0); 12 integration assertions in
+> `tests/integration/scenario_oooo_nat_traversal.sh` (NEW; 2-soul mesh
+> with A as STUN-like rendezvous + B as querier-advertiser). All prior
+> federation suites (R18E gossip, R19E leader election, R20E
+> distributed_query, R20F snapshot attestation, R21B distributed_rules,
+> R21E gossip_noise, R23C snapshot replication) remain green. Chat:
+> `/nat` info-line dispatch wired into `examples/crossengin_chat.nova`.
+> R23D adds `src/io/transducers/image_tracker.nova` — image
 > object tracking via per-track Kalman filter (predict + update with
 > per-coordinate variance) plus greedy minimum-L2 Hungarian assignment
 > over per-frame detections from R15C HOG sliding-window or R16D Haar
