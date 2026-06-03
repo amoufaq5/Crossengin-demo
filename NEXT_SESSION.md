@@ -3,6 +3,62 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R25D (this session) -- Architecture documentation refresh + module catalog
+
+**Status: complete -- new `ARCHITECTURE.md` documents the layout-and-
+orientation guide for the ~190 NOVA modules in `src/`. Sections:
+30-second view + ASCII top-level diagram, top-level repository layout,
+`src/` tree, core substrate (kernel + scheduler + parts), knowledge
+graph + KG analytics (19 modules), perception (vision + audio +
+cross-modal with ASCII pipeline diagrams), federation (gossip / leader
+/ distributed-query / distributed-rules / NAT / attestation / snapshot
+replication), safety + crypto (bignum / ChaCha20-Poly1305 / Curve25519
+/ RFC 7919 DH / Ed25519 / DP), persistence (Merkle / snapshot-disk /
+delta / compaction / schema-migration), reader pipeline, memory +
+federated learning, soul + constitution + reasoning + imagination +
+goals + meta, entry-point binaries, NOVA cross-reference (which NOVA
+features each CE module relies on). The full module catalog at the end
+pins every CE module to its introducing round + commit SHA, verified
+via `git log --diff-filter=A` — 17 catalog subsections, 188+ rows.
+Cross-links to `IMAGE_AUDIT.md`, `AUDIO_AUDIT.md`,
+`FEDERATED_AUDIT.md`, `SECAGG_AUDIT.md`, `SNAPSHOT_FORMAT.md`, etc.
+README.md updated with an `ARCHITECTURE.md` link in the "Building and
+running" section.**
+
+### What R25D delivers
+
+1. **New file** -- `ARCHITECTURE.md` (~1,094 lines, ~6,754 words,
+   24 top-level sections, ASCII diagrams for top-level / vision /
+   audio / federation flow).
+2. **Catalog of every src/ module** with round-introduced + commit SHA,
+   grouped by subsystem (substrate kernel, scheduler, KG, vision
+   transducers, audio transducers, audio effectors, network / streaming,
+   cross-modal perception, federation, safety+crypto, persistence,
+   learning, reader+language, parts subsystem bodies, agent loops,
+   audit+session+chat, seed). 17 catalog subsections, 188+ rows.
+3. **README.md updated** -- added a paragraph in the "Building and
+   running" section linking to `ARCHITECTURE.md` and the per-subsystem
+   audit deep-dives.
+4. **Companion NOVA architecture** -- see `/home/user/NOVA/ARCHITECTURE.md`,
+   cross-referenced from this file's §20 (`NOVA primitives that
+   CrossEngin depends on`).
+
+### Files touched (R25D)
+
+- NEW: `ARCHITECTURE.md`
+- MODIFIED: `README.md` (one paragraph added linking to ARCHITECTURE.md)
+- MODIFIED: `NEXT_SESSION.md` (this entry)
+
+### Untouched by R25D (per-agent ownership rules)
+
+- No source `*.nova` modules touched
+- No tests touched
+- No audit docs touched (IMAGE_AUDIT, AUDIO_AUDIT, FEDERATED_AUDIT,
+  SECAGG_AUDIT, SNAPSHOT_FORMAT, TLS_AUDIT, DP_AUDIT, STT_AUDIT,
+  JPEG_AUDIT, VIDEO_AUDIT — referenced from ARCHITECTURE.md, never
+  edited)
+- R25E's benchmark consolidation work not touched
+
 ## R25E (this session) -- Unified benchmark harness + regression baseline
 
 **Status: complete -- new `scripts/bench.sh` master harness composes every
