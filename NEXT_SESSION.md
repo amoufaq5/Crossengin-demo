@@ -3,7 +3,252 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R15E (this session) -- Merkle-tree tamper-evident snapshot atom-hash chain
+## R16D (this session) -- Viola-Jones-style Haar cascade face detector (STRUCTURAL)
+
+**Status: complete -- new `src/io/transducers/image_face_detect.nova`
+adds the integral-image primitive (Crow 1984) + Haar two-/three-/
+four-rect feature evaluators + a hand-crafted 3-stage cascade +
+multi-scale sliding window + NMS clustering. Wired into the visual-
+perception pipeline behind `CE_VP_FACE_DETECT=1` and exposed via the
+chat `/faces PATH` admin command.**
+
+### Scope disclaimer (LOUD)
+
+This is a STRUCTURAL implementation of Viola-Jones 2001. Without a
+real trained cascade (OpenCV's `haarcascade_frontalface_default.xml`
+ships 25 AdaBoost stages with ~3000 weak classifiers; CrossEngin's
+no-training-data design cannot bundle those weights), accuracy on
+REAL PHOTOGRAPHS WILL BE POOR. The right tool for actually finding
+faces is either (a) parsing OpenCV's XML cascade (XML parser +
+25-stage classifier tree -- out of scope for one round) or (b)
+training a cascade on real positive + negative examples. What this
+module DOES provide is the integral-image primitive (reusable
+downstream for HOG-with-integral-histogram-of-gradients), the Haar
+feature evaluators (canonical Viola-Jones definitions), and the
+operational cascade shell + multi-scale + NMS pipeline a trained
+classifier would slot into.
+
+### Detection rates on the structural fixtures
+
+* Synthetic 64x64 face-pattern (dark/light/dark horizontal bands):
+  **2 detections** at default settings.
+* Synthetic 96x96 SMALLER face-pattern (rows 20..50): **>= 1
+  detection** at multi-scale windows.
+* Uniform-gray 32x32 / 64x64 images: **0 detections** (stage 1
+  rejects on no eye/cheek contrast).
+* Real photographs: not tested; expected POOR per scope disclaimer.
+
+### Wire-in surface
+
+* `face_detect(image, w, h, min_size, max_size, step)` -> list of
+  `[x, y, size, score]`. Multi-scale with 1.25x scale-up, 24x24
+  base window, IoU 0.30 NMS.
+* `face_append_features_if_enabled(feats, image, w, h)` emits
+  `image_face_count_<none|one|few|many>` when `CE_VP_FACE_DETECT=1`.
+* `/faces PATH.pgm` chat admin prints
+  `(faces N detection(s); WxH min=S max=S step=S best_score=K at (X, Y) size=S)`.
+
+### Verification
+
+* Unit tests: `tests/unit/test_face_detect.nova` (36 assertions,
+  NEW): integral-image correctness on 4x4 known image (full-sum =
+  136, single-pixel rect sums, 2x2 sub-region sums); Haar 2-rect
+  zero on uniform / strongly nonzero on dark-on-light; Haar 3-rect
+  structurally negative on uniform (canonical formula); Haar 4-rect
+  zero on uniform; face_detect = 0 on uniform / >= 1 on synthetic /
+  multi-scale on shrunk synthetic; OOB safety on null image /
+  oversized dims / min > max; face_count_label boundaries;
+  detection-tuple accessors.
+* Integration scenario: `tests/integration/scenario_nnn_face_detect.sh`
+  (11 assertions): `/help` advertises `/faces`; usage / missing-
+  file / too-small-image error paths; synthetic returns >= 1 with
+  best_score > 0 and `at (X, Y) size=S` format; uniform reports 0
+  detections; chat survives all probing and reaches `/quit`.
+* All existing CV tests pass (177+ unit tests, including the new
+  R16D suite).
+* Module count: 161 -> 162 (image_face_detect.nova new).
+
+## R16A (this session) -- Ed25519 sign + verify of the Merkle snapshot root
+
+**Status: complete -- `src/persistence/merkle_signing.nova` (NEW) plus
+a 16-line wire-in to `snapshot_writer.nova` (signature slot + setter
++ accessor + extend pad) and ~50-line wire-in to `snapshot_disk.nova`
+(emit on save, parse on load, verify tripwire, sign-status helper)
+close the last gap in the snapshot attestation chain.** R15E's
+Merkle root closes the "single-byte tamper" gap but NOT the
+"attacker-controls-the-whole-file" gap: such an attacker can tamper
+an atom AND rewrite the meta.merkle_root line so both sides match.
+R16A binds the root to an offline Ed25519 long-term key -- the
+verifier holds only the pubkey out-of-band, so an attacker who
+doesn't control the priv key cannot forge a fresh signature.
+
+### Algorithm (Ed25519 sign + verify over the Merkle root bytes)
+
+1. **Sign:** `sig = ed25519_sign(root_bytes_32, priv_seed_32, pk_32)`.
+   The signed message is the CANONICAL 32-byte SHA-256 Merkle root AS
+   BYTES (NOT the 64-char hex rendering). Ed25519 is deterministic
+   (RFC 8032 PureEdDSA -- no per-signature randomness), so signing
+   the same root twice produces the same signature -- the property
+   snapshot determinism inherits.
+2. **Verify:** `ed25519_verify(root_bytes_32, sig_64, pk_32)` returns
+   1 / 0. The verify path recomputes the root over the in-memory KGS
+   records (NOT the meta.merkle_root claim -- the whole point of R16A
+   is that the signature binds to the actual atom contents), then
+   asks Ed25519 to verify against the trusted pubkey.
+
+### Wire-format extension
+
+A new optional line in the v2 meta block carries the signature:
+
+```
+meta.merkle_signature <128-char hex>
+```
+
+The meta block grows from 6 cells (R15E) to 7 cells; pre-R16A
+readers ignore the new line. Forward-compat with the R8E + R15E
+additive pattern.
+
+### Keypair on-disk format
+
+```
+<base>.priv  -- 32 raw bytes (the Ed25519 seed; mode 0600)
+<base>.pub   -- 32 raw bytes (the Ed25519 pubkey; mode 0644)
+```
+
+Exactly 32 bytes each. We store the SEED (NOT the derived scalar)
+for the private file because that's what `ed25519_sign` takes as
+input. Helper `examples/snap_keygen.nova` generates fresh pairs via
+`CE_SNAP_KEY_BASE=<base>` -- single env-var entry-point matching the
+existing migrate_snap.nova pattern.
+
+### Env-var contract
+
+| Variable                            | Effect                                                  |
+|-------------------------------------|---------------------------------------------------------|
+| `CE_SNAPSHOT_SIGN_KEY=<priv>`       | On /save: reads `<priv>.priv` + `<priv>.pub`, signs the recomputed root, emits the line. |
+| `CE_SNAPSHOT_VERIFY_PUBKEY=<pub>`   | On /load + /snap_sign_status: reads the 32-byte pubkey, verifies; mismatch refuses load. |
+| `CE_SNAPSHOT_REQUIRE_SIGNATURE=1`   | Strict mode: unsigned snapshot with verify-pubkey set is REFUSED. Default = lenient. |
+
+The writer reads the priv on every save (not held in memory between
+writes) so the memory-disclosure blast radius stays minimal.
+
+### Public API (src/persistence/merkle_signing.nova)
+
+- `merkle_sign(root_bytes, seed_bytes, pk_bytes)` -- 64-byte sig list,
+  or 0 on shape error.
+- `merkle_verify_signature(root_bytes, sig_bytes, pk_bytes)` -- 1
+  verified, 0 rejected.
+- `merkle_sign_hex(root_hex, seed_bytes, pk_bytes)` -- 128-char
+  signature hex (the wire form).
+- `merkle_verify_signature_hex(root_hex, sig_hex, pk_hex)` -- 1/0.
+- `merkle_signing_keypair_save(seed, pk, base_path)` -- writes
+  `<base>.priv` (0600) + `<base>.pub` (0644).
+- `merkle_signing_keypair_load(base_path)` -- returns
+  [seed, pk] or 0 on missing/wrong-length.
+- `merkle_signing_pubkey_save(pk, full_path)` /
+  `merkle_signing_pubkey_load(full_path)` -- verifier-side
+  artefacts (one file, full path; no .priv companion).
+- `merkle_root_bytes_from_hex(root_hex)` -- 32-byte list, or 0
+  on bad shape.
+- `merkle_signing_sign_root_via_env(root_hex)` -- the env-driven
+  signer used by snapshot_writer; "" when no key configured.
+- `merkle_signing_verify_via_env(root_hex, sig_hex)` -- env-driven
+  verifier; returns 1 verified, 0 tampered, -1 no commitment / no
+  pubkey configured.
+- `merkle_signing_sign_key_path()` /
+  `merkle_signing_verify_pubkey_path()` /
+  `merkle_signing_require_signature()` -- env-var readers.
+
+### Wire-in
+
+* **`src/persistence/snapshot_writer.nova`** -- meta block grows to
+  7 cells (was 6 after R15E). Slot 6 is `SNAP_META_MERKLE_SIGNATURE`
+  (128-char hex or ""). Accessors:
+  `snap_meta_has_merkle_signature`, `snap_meta_merkle_signature`,
+  `snap_meta_set_merkle_signature`. `_snap_meta_extend` pads to the
+  new slot. v1->v2 migration also pushes the new default.
+* **`src/persistence/snapshot_disk.nova`** -- `snap_to_text`
+  recomputes the root, then asks `merkle_signing_sign_root_via_env`
+  for a signature. Empty result = "no key configured" = no line
+  emitted. The reader parses `meta.merkle_signature` into the meta
+  block. `snap_load` calls `snap_verify_signature(s)` after the
+  R15E Merkle tripwire; mismatch refuses the load. New helpers:
+  `snap_verify_signature(s)` returns 1/0/-1/-2,
+  `snap_sign_status_for_path(path)` returns
+  [has_sig, pubkey_set, last_verify, sig_hex] for the chat status.
+* **`examples/crossengin_chat.nova`** -- 1 new admin handler,
+  1 new dispatch line: `/snap_sign_status [PATH]` prints a single
+  line `(snap_sign_status PATH: signature=present|absent
+  pubkey=set|unset last_verify=verified|TAMPERED|no_signature|
+  no_pubkey|file_missing)`. Read-only; safe to run anytime.
+* **`examples/snap_keygen.nova`** (NEW) -- standalone helper to
+  generate fresh keypairs. `CE_SNAP_KEY_BASE=<base>
+  $NOVA_ROOT/nova run examples/snap_keygen.nova` writes
+  `<base>.priv` + `<base>.pub` and exits.
+
+### Backward-compat policy (LENIENT default)
+
+* A SIGNED snapshot loads cleanly under a pre-R16A reader -- it
+  ignores the line (the standard forward-compat shape).
+* An UNSIGNED snapshot loads cleanly under R16A unless
+  `CE_SNAPSHOT_REQUIRE_SIGNATURE=1` is set. The lenient mode prints
+  `(load: snapshot PATH has no meta.merkle_signature -- skipping
+  signature verify under lenient policy)` and proceeds.
+* Strict mode refuses with `(load FAILED: snapshot PATH has no
+  Merkle signature under CE_SNAPSHOT_REQUIRE_SIGNATURE=1)`.
+
+### Performance
+
+* sign latency: ~241 ms per /save measured on this sandbox
+  (chat /save with signing key set vs without: 756 ms vs 515 ms).
+  Ed25519 sign+verify cost is ~250-1100 ms per the
+  `src/safety/ed25519.nova` preamble.
+* verify latency: ~400-2000 ms per /load when CE_SNAPSHOT_VERIFY_PUBKEY
+  is set. One-shot per snapshot, not per atom.
+* No cost when the env vars are unset (writer skips the sign call;
+  reader skips the verify call).
+
+### Verification + determinism
+
+* Unit tests (`tests/unit/test_merkle_signing.nova`, NEW): 51
+  assertions covering sign-determinism, verify-accepts-legit,
+  verify-rejects-bit-flipped-sig, verify-rejects-wrong-pubkey,
+  verify-rejects-wrong-root, hex round-trip, shape validation,
+  keypair save+load round-trip, pubkey-only round-trip,
+  load-missing-graceful, env-var verify path.
+* Integration scenario (`tests/integration/scenario_mmm_merkle_signing.sh`,
+  NEW): 16 assertions covering keygen, signed save, signature shape
+  (128 hex chars), /snap_sign_status verified, determinism (two
+  signatures bit-identical), tamper detection via /snap_sign_status,
+  /load refuses tampered file with CE_SNAPSHOT_VERIFY_PUBKEY set,
+  unsigned save emits no signature, strict mode refuses unsigned
+  file, lenient default warns and proceeds.
+* All existing snapshot tests pass bit-identical: `test_merkle` 60,
+  `test_snapshot_writer` 27, `test_snapshot_disk` 31,
+  `test_snapshot_episodic` 51, `test_snapshot_synapses` 89,
+  `test_snapshot_selfmodel` 38, `test_snapshot_compaction` 48,
+  `test_snapshot_reader` 25, `test_snapshot_migrate` 37,
+  `test_snapshot_disk_full` 72, `test_snapshot_delta` 84,
+  `test_schema_migration` 78, `test_ed25519` 46.
+
+### Follow-ups
+
+* Rotating the signing key requires a fresh keypair + a fresh
+  /save -- no in-band key-rotation message yet. Operator workflow:
+  `examples/snap_keygen.nova` on a new base, then /save under the
+  new key. Old snapshots verify under their original pubkey; the
+  verifier holds whichever pubkey matches the snapshot's signing
+  key (typical deployment: one signing key per writer, distributed
+  alongside the snapshots).
+* The signature is over the BYTES form of the Merkle root, not
+  the meta block as a whole. A future "sign the meta block plus
+  the section count" extension could add provenance for the
+  encryption / creator fields too; not landed this round.
+* No federation-peer attestation protocol yet -- the primitives
+  are in place (sign + verify + load tripwire) but no message
+  exchange that uses them for peer auth.
+
+## R15E (previous session) -- Merkle-tree tamper-evident snapshot atom-hash chain
 
 **Status: complete -- `src/persistence/merkle.nova` (NEW) plus a 5-line
 wire-in to `snapshot_writer.nova` and a 25-line wire-in to

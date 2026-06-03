@@ -203,6 +203,7 @@ import "snapshot_compaction.nova"
 import "snapshot_delta.nova"
 import "schema_migration.nova"
 import "merkle.nova"
+import "merkle_signing.nova"
 import "../parts/soul/constitution.nova"
 import "../kg/multi_kg_manager.nova"
 import "../language/word_atoms.nova"
@@ -1240,6 +1241,16 @@ fn snap_to_text(s) {
             }
             let root_hex = merkle_root_for_kgs_blob(kgs_blob_for_root)
             snap_meta_set_merkle_root(s, root_hex)
+            // R16A: if CE_SNAPSHOT_SIGN_KEY points at a keypair file,
+            // sign the freshly-computed root and stamp the signature
+            // slot. The sign call reads <path>.priv + <path>.pub,
+            // signs over the 32 raw root bytes, and returns the
+            // 128-char hex; an unset env var, missing file, or sign
+            // failure leaves the slot empty (signals "no signature").
+            // The sign cost (~250-1100 ms per save per ed25519.nova's
+            // preamble) is one-shot per /save, not per atom.
+            let sig_hex = merkle_signing_sign_root_via_env(root_hex)
+            snap_meta_set_merkle_signature(s, sig_hex)
         }
     }
     let lines = list_new()
@@ -1275,6 +1286,17 @@ fn snap_to_text(s) {
             // makes new readers fail loudly when the recomputed root
             // disagrees with the file's claim.
             _push_kv_str(lines, "meta.merkle_root",          snap_meta_merkle_root(s))
+            // R16A: Ed25519 signature over the Merkle ROOT BYTES
+            // (NOT the hex rendering). Emitted ONLY when the signer
+            // succeeded above -- the empty default would emit a line
+            // with no value, which a strict reader could mistake for
+            // "signature explicitly empty". Older (pre-R16A) readers
+            // ignore the line, post-R16A readers verify when
+            // CE_SNAPSHOT_VERIFY_PUBKEY is set.
+            if snap_meta_has_merkle_signature(s) == 1 {
+                _push_kv_str(lines, "meta.merkle_signature",
+                             snap_meta_merkle_signature(s))
+            }
         }
     }
 
@@ -1636,6 +1658,12 @@ fn snap_from_text(text) {
     // sentinel (= no commitment was made, so verification is a no-op).
     let meta_merkle_root      = SNAP_META_MERKLE_ROOT_NONE
     let meta_merkle_root_seen = 0
+    // R16A: Ed25519 signature over the Merkle root. Absent from any
+    // pre-R16A file -- the reader treats absence as the empty
+    // sentinel (= no signature was emitted; CE_SNAPSHOT_VERIFY_PUBKEY
+    // takes the "no signature" branch on load).
+    let meta_merkle_sig       = SNAP_META_MERKLE_SIG_NONE
+    let meta_merkle_sig_seen  = 0
 
     while pos < len(text) {
         let parsed = _next_line(text, pos)
@@ -1711,6 +1739,20 @@ fn snap_from_text(text) {
                     meta_merkle_root      = _line_val(line)
                     meta_merkle_root_seen = 1
                     meta_seen             = 1
+                }
+                // R16A attestation-chain: optional
+                // `meta.merkle_signature` line. Absence = no
+                // signature; presence = the 128-char hex form of the
+                // Ed25519 signature over the 32 root bytes.
+                // CE_SNAPSHOT_VERIFY_PUBKEY turns presence into a
+                // load-time tripwire (verifies under the trusted
+                // pubkey). The line is OPTIONAL even with R15E's
+                // merkle_root present -- some writers don't have a
+                // signing key configured.
+                if str_eq(k, "meta.merkle_signature") == 1 {
+                    meta_merkle_sig      = _line_val(line)
+                    meta_merkle_sig_seen = 1
+                    meta_seen            = 1
                 }
 
                 // Indexed atom keys: kgs.atoms[N].field
@@ -2177,6 +2219,11 @@ fn snap_from_text(text) {
             // extends a pre-R15E meta block to the current cell count
             // in place.
             snap_meta_set_merkle_root(s, meta_merkle_root)
+            // R16A: the parsed Ed25519 signature hex, or the empty
+            // sentinel when the line is missing.
+            // snap_meta_set_merkle_signature extends a pre-R16A meta
+            // block to the current cell count in place.
+            snap_meta_set_merkle_signature(s, meta_merkle_sig)
         }
     }
     return s
@@ -2312,6 +2359,39 @@ fn snap_load(path) {
             return 0
         }
     }
+    // R16A signature tripwire: when CE_SNAPSHOT_VERIFY_PUBKEY points at
+    // a 32-byte pubkey file, verify the signature over the recomputed
+    // Merkle root. Policy:
+    //   * verified (1)    -- load proceeds.
+    //   * tampered (0)    -- load REFUSED loudly.
+    //   * no commitment   -- if CE_SNAPSHOT_REQUIRE_SIGNATURE=1 set,
+    //     (-1)               REFUSE (strict). Otherwise warn + proceed
+    //                        (lenient default, matching R15E's "no
+    //                        commitment" branch).
+    let sig_status = snap_verify_signature(s)
+    if sig_status == 0 {
+        io_println("(load FAILED: Merkle signature mismatch -- snapshot " + path
+            + " is TAMPERED, the on-disk signature does not match the recomputed"
+            + " root under the trusted pubkey)")
+        return 0
+    }
+    if sig_status == 0 - 1 {
+        if merkle_signing_require_signature() == 1 {
+            io_println("(load FAILED: snapshot " + path
+                + " has no Merkle signature under CE_SNAPSHOT_REQUIRE_SIGNATURE=1)")
+            return 0
+        }
+        // Lenient path: pubkey configured but file has no signature.
+        // We warn but proceed -- some operators run the verifier
+        // against a mix of signed and unsigned snapshots during a
+        // rollout. -2 is "no pubkey configured" (silent).
+        let pub_path = merkle_signing_verify_pubkey_path()
+        if str_eq(pub_path, "") == 0 {
+            io_println("(load: snapshot " + path
+                + " has no meta.merkle_signature -- skipping signature verify"
+                + " under lenient policy)")
+        }
+    }
     return s
 }
 
@@ -2348,6 +2428,81 @@ fn snap_verify_path(path) {
     if snap_meta_has_merkle_root(s) == 0 { return 0 - 2 }
     if snap_verify_merkle(s) == 1 { return 1 }
     return 0
+}
+
+// R16A: verify the Merkle SIGNATURE against the recomputed root +
+// trusted pubkey. Returns:
+//   1   -- verified (sig matches under the env-var pubkey)
+//   0   -- tampered (sig present, doesn't verify -- TAMPER ALERT)
+//  -1   -- no signature on file
+//  -2   -- no pubkey configured (CE_SNAPSHOT_VERIFY_PUBKEY unset)
+//          -- in this case the verifier is a no-op, the caller's
+//          policy decides whether to require a signature.
+//
+// The recompute path mirrors snap_verify_merkle: take the in-memory
+// KGS records, run the same merkle_root_for_kgs_blob, then ask
+// merkle_signing_verify_via_env to do the Ed25519 verify under the
+// pubkey loaded from CE_SNAPSHOT_VERIFY_PUBKEY. We DO NOT verify the
+// signature against the meta-block's CLAIMED root, only the
+// recomputed root -- that's the whole point of R16A. An attacker who
+// rewrites the meta.merkle_root line cannot ALSO produce a fresh
+// signature unless they hold the private key.
+fn snap_verify_signature(s) {
+    if s == 0 { return 0 - 2 }
+    let pub_path = merkle_signing_verify_pubkey_path()
+    if str_eq(pub_path, "") == 1 { return 0 - 2 }
+    if snap_meta_has_merkle_signature(s) == 0 { return 0 - 1 }
+    let sig_hex = snap_meta_merkle_signature(s)
+    // Recompute the root over the in-memory KGS records (NOT the
+    // meta.merkle_root claim -- the whole point of R16A is that the
+    // signature binds to the actual atom contents).
+    let kgs_blob = 0
+    if snap_has_section(s, SEC_KGS) == 1 {
+        kgs_blob = snap_section(s, SEC_KGS)
+    }
+    let actual_root = merkle_root_for_kgs_blob(kgs_blob)
+    return merkle_signing_verify_via_env(actual_root, sig_hex)
+}
+
+// R16A: convenience reporter for the chat's `/snap_sign_status`.
+// Returns a 4-element list [has_signature, pubkey_configured,
+// last_verify_result, sig_hex_or_empty]. The chat formats the
+// human-readable line; we just gather the facts.
+//
+// last_verify_result:
+//    1 -- verified
+//    0 -- tampered
+//   -1 -- no signature
+//   -2 -- no pubkey configured
+//   -3 -- file missing / unparseable
+fn snap_sign_status_for_path(path) {
+    let out = list_new()
+    let text = snap_read_text(path)
+    if text == 0 {
+        push(out, 0); push(out, 0); push(out, 0 - 3); push(out, "")
+        return out
+    }
+    if len(text) == 0 {
+        push(out, 0); push(out, 0); push(out, 0 - 3); push(out, "")
+        return out
+    }
+    let s = snap_from_text(text)
+    if s == 0 {
+        push(out, 0); push(out, 0); push(out, 0 - 3); push(out, "")
+        return out
+    }
+    let has_sig = snap_meta_has_merkle_signature(s)
+    let pub_path = merkle_signing_verify_pubkey_path()
+    let pub_set = 0
+    if str_eq(pub_path, "") == 0 { pub_set = 1 }
+    let verify = snap_verify_signature(s)
+    let sig_hex = ""
+    if has_sig == 1 { sig_hex = snap_meta_merkle_signature(s) }
+    push(out, has_sig)
+    push(out, pub_set)
+    push(out, verify)
+    push(out, sig_hex)
+    return out
 }
 
 // ---- R13F: incremental delta-snapshot integration -------------------------

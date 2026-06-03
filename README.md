@@ -11,7 +11,49 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R15E adds `src/persistence/merkle.nova` — a SHA-256
+> toolchain. R16A adds `src/persistence/merkle_signing.nova` — an
+> Ed25519 sign + verify wrap of the R15E Merkle root, closing the
+> last gap in the snapshot attestation chain. R15E shipped tamper
+> detection against an operator who edits a single atom byte (the
+> recomputed root disagrees with the stored claim); R16A closes the
+> gap against an attacker who controls the WHOLE file (such an
+> attacker can rewrite both the atom AND the meta.merkle_root claim
+> to match). With R16A, the writer optionally signs the recomputed
+> Merkle root with a long-term Ed25519 key
+> (`CE_SNAPSHOT_SIGN_KEY=<priv>` env), emitting
+> `meta.merkle_signature <128-char hex>` as another optional v2
+> meta-block line. The verifier holds ONLY the matching pubkey
+> out-of-band (`CE_SNAPSHOT_VERIFY_PUBKEY=<pub>`); on /load it
+> recomputes the root and asks Ed25519 to verify the file's
+> signature against the recomputed root under the trusted pubkey.
+> An attacker who tampers the file but does NOT control the priv
+> key cannot forge a fresh signature — load fails loudly. New chat
+> command `/snap_sign_status` reports whether the file carries a
+> signature, whether the pubkey is configured, and the last verify
+> result (`verified | TAMPERED | no_signature | no_pubkey |
+> file_missing`). New helper `examples/snap_keygen.nova` produces a
+> fresh 32-byte priv (mode 0600) + 32-byte pub (mode 0644). Strict
+> mode `CE_SNAPSHOT_REQUIRE_SIGNATURE=1` REFUSES an unsigned file
+> when a verify pubkey is configured; lenient default warns +
+> proceeds (the same opt-in shape R15E's verify env uses). Sign
+> latency ~241 ms per /save measured on this sandbox (~one
+> ed25519_sign per snapshot save, NOT per atom — linear in saves,
+> not KG size). Determinism verified live: two /save calls on an
+> unchanged KG produce bit-identical `meta.merkle_signature` hex
+> (Ed25519 is deterministic, not probabilistic). Tamper detection
+> verified live: flipping `kgs.atoms[0].label` makes
+> /snap_sign_status report `last_verify=TAMPERED`, and
+> CE_SNAPSHOT_VERIFY_PUBKEY=<pub> /load refuses the file with
+> `(load FAILED: Merkle signature mismatch...)`. 51 unit
+> assertions + 16 integration assertions; all green. All existing
+> snapshot tests pass unchanged: `test_merkle` 60,
+> `test_snapshot_writer` 27, `test_snapshot_disk` 31,
+> `test_snapshot_episodic` 51, `test_snapshot_synapses` 89,
+> `test_snapshot_selfmodel` 38, `test_snapshot_compaction` 48,
+> `test_snapshot_reader` 25, `test_snapshot_migrate` 37,
+> `test_snapshot_disk_full` 72, `test_snapshot_delta` 84,
+> `test_schema_migration` 78. R15E added
+> `src/persistence/merkle.nova` — a SHA-256
 > Merkle-tree tamper-evident atom-hash chain over the v2 snapshot's
 > KGS section, closing the integrity gap that lived between R5D's
 > crash-safe writer and R14F's Ed25519 signing primitive. Without it
@@ -687,6 +729,30 @@ computational units rather than orchestrating a pipeline of modules.
 > integration scenario asserts detection at a known (16, 16) offset
 > within +/- stride accuracy and 0 detections on a uniform-gray
 > scene. Documented in [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
+> +1 from
+> `io/transducers/image_face_detect.nova` added in R16D Viola-Jones-
+> style Haar cascade face detector (STRUCTURAL only -- see scope
+> disclaimer). Adds the integral-image primitive (Crow 1984) -- O(1)
+> rectangle sums via the four-corner formula, reusable downstream
+> for HOG-with-integral-histogram-of-gradients -- plus two-/three-/
+> four-rect Haar feature evaluators (canonical Viola-Jones
+> definitions) + a hand-crafted 3-stage cascade tuned for the
+> "dark eye-strip / light cheek-strip / dark chin-strip" pattern +
+> multi-scale sliding window (1.25x scale-up per octave) + IoU-0.30
+> NMS clustering. Without a real trained cascade (OpenCV's
+> `haarcascade_frontalface_default.xml` ships ~3,000 weak
+> classifiers across 25 AdaBoost stages, untrainable in CrossEngin's
+> no-training-data design), accuracy on REAL PHOTOGRAPHS will be
+> POOR -- the structural-implementation purpose is to provide the
+> integral-image primitive + cascade shell a trained classifier
+> would slot into. New chat admin: `/faces PATH.pgm` ->
+> `(faces N detection(s); WxH min=S max=S step=S best_score=K at
+> (X, Y) size=S)`. New per-image atom:
+> `image_face_count_<none|one|few|many>` (emitted when
+> `CE_VP_FACE_DETECT=1`). The integration scenario asserts >= 1
+> detection on a synthetic dark/light/dark horizontal-band fixture
+> and 0 on uniform-gray. Documented in
+> [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > unchanged from the snapshot
 > v1 -> v2 migration session -- the bump landed inside the existing
 > `persistence/snapshot_{writer,disk,reader}.nova` trio +

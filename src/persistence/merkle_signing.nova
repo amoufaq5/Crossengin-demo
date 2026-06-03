@@ -1,0 +1,547 @@
+// CrossEngin persistence: Ed25519 sign + verify of the Merkle root (R16A).
+//
+// Purpose
+//   R15E (commit 994fc0b) shipped a Merkle root over the KGS atom
+//   records, emitted as an OPTIONAL `meta.merkle_root <hex>` line in
+//   the v2 meta block, with an opt-in `CE_SNAPSHOT_VERIFY_MERKLE=1`
+//   tripwire that recomputes the root on /load and bails on mismatch.
+//   That closes the integrity gap against an attacker who flips a byte
+//   in a single atom: the recompute disagrees with the stored root, the
+//   load is refused.
+//
+//   It does NOT close the gap against an attacker who controls the
+//   whole snapshot file. Such an attacker can tamper an atom AND
+//   recompute + re-emit the Merkle root line so the recompute / claim
+//   comparison matches: the stored root and the recomputed root are
+//   both the attacker-chosen value. The R15E tripwire does not detect
+//   this.
+//
+//   R16A binds the Merkle root to an OFF-LINE long-term Ed25519 key.
+//   The signer holds the private key; the verifier holds the public
+//   key out-of-band (typed in, environment-distributed, or read from a
+//   protected file). The on-disk snapshot carries a second optional
+//   meta line:
+//
+//     meta.merkle_signature <128-char hex>     (= 64-byte Ed25519 sig)
+//
+//   On load, the verifier recomputes the Merkle root over the parsed
+//   KGS records (R15E), then asks Ed25519 to verify the signature over
+//   those 32 root bytes under the trusted public key. An attacker who
+//   tampers the file but does NOT control the private key cannot
+//   forge a fresh signature -- the load fails. This is the substrate's
+//   full attestation chain: Merkle root commits to the KG contents,
+//   signature commits to the Merkle root.
+//
+// Algorithm
+//   Sign:   sig = ed25519_sign(root_bytes_32, private_seed_32, pubkey_32)
+//   Verify: ed25519_verify(root_bytes_32, sig_64, pubkey_32) -> 0/1
+//
+//   The signed message is the canonical 32-byte SHA-256 Merkle root
+//   AS BYTES (NOT the 64-char hex rendering). Two reasons:
+//
+//     1. Ed25519 is deterministic, so signing the same root twice
+//        produces the same signature -- this is property the integration
+//        scenario asserts (sign A, sign A again, bytes match).
+//
+//     2. Signing the raw bytes is the standard shape; signing the hex
+//        rendering would tie the signature to one specific text
+//        representation and break attestation interoperability with
+//        any future binary container.
+//
+// Keypair on-disk format (CRITICAL: don't bikeshed this)
+//
+//   /tmp/snap_key.priv   -- 32-byte raw seed (binary; mode 0600)
+//   /tmp/snap_key.pub    -- 32-byte raw pubkey (binary; mode 0644)
+//
+//   We store the seed (NOT the derived scalar) for the private file
+//   because that's what ed25519_sign takes as input -- the derivation
+//   from seed to (scalar, prefix) happens inside the sign function.
+//
+//   Both files are EXACTLY 32 bytes. A trailing newline / hex / PEM
+//   wrap would force per-format parsing; a raw 32-byte file with a
+//   stat-driven length check is the simplest possible format that
+//   round-trips bit-identical.
+//
+//   Higher-level operators may layer PEM / age / yubikey on top of
+//   these primitives -- those are orthogonal to the substrate's
+//   attestation contract. The substrate ONLY cares that the file is
+//   32 raw bytes and that the file's mode protects the private half.
+//
+// Backward-compat policy (LENIENT)
+//
+//   When CE_SNAPSHOT_VERIFY_PUBKEY is set but the loaded snapshot
+//   carries NO meta.merkle_signature line, this module returns -1
+//   ("no signature, can't verify"). The load policy in snapshot_disk
+//   surfaces this as an op-controlled choice via
+//   CE_SNAPSHOT_REQUIRE_SIGNATURE: with the env var unset, an
+//   unsigned snapshot loads with a warning; with it set to 1, an
+//   unsigned snapshot is REFUSED (strict).
+//
+//   When CE_SNAPSHOT_VERIFY_PUBKEY is NOT set, the verifier is a
+//   no-op -- a signed snapshot still loads cleanly (the signature
+//   line travels through; just nothing checks it). This mirrors R15E's
+//   "no commitment, no check" branch and the existing CE_SNAPSHOT_*
+//   opt-in pattern across the persistence stack.
+//
+// Public API
+//   merkle_sign(root_bytes, seed_bytes, pk_bytes)         -> sig_64B (list)
+//   merkle_verify_signature(root_bytes, sig_64B, pk_bytes) -> 0/1
+//   merkle_sign_hex(root_hex, seed_bytes, pk_bytes)        -> sig_hex_128
+//   merkle_verify_signature_hex(root_hex, sig_hex, pk_hex) -> 0/1
+//   merkle_signing_keypair_save(seed_bytes, pk_bytes, base_path) -> 0/1
+//   merkle_signing_keypair_load(base_path) -> [seed, pk] | 0
+//   merkle_signing_pubkey_load(path) -> pk_bytes | 0
+//   merkle_root_bytes_from_hex(root_hex) -> 32-byte byte list
+//   merkle_signing_verify_pubkey_path() -> string (or "" when unset)
+//   merkle_signing_sign_key_path()     -> string (or "" when unset)
+//   merkle_signing_require_signature() -> 1 when CE_SNAPSHOT_REQUIRE_SIGNATURE=1
+//
+// Env-var contract
+//
+//   CE_SNAPSHOT_SIGN_KEY=/path/to/snap_key.priv
+//     When set on /save, the writer reads the 32-byte seed file,
+//     ALSO reads the sibling .pub file (same path with .priv -> .pub),
+//     signs the recomputed Merkle root, and emits the
+//     meta.merkle_signature line.
+//
+//   CE_SNAPSHOT_VERIFY_PUBKEY=/path/to/snap_key.pub
+//     When set on /load, the reader reads the 32-byte pubkey file,
+//     verifies the file's meta.merkle_signature against the recomputed
+//     root, and refuses the load on mismatch.
+//
+//   CE_SNAPSHOT_REQUIRE_SIGNATURE=1
+//     Forces strict mode: a load with verify-pubkey set BUT no
+//     signature in the file is REFUSED. Default is lenient (warn
+//     only), matching the R15E "no commitment" policy.
+//
+// ADRs touched: ADR-0048 (the v2 meta block grows one more optional
+//   slot, same pattern R8E + R15E used). NOVA dependencies: builtins
+//   only (alloc / store8 / load8 / sys_open / sys_write / sys_close /
+//   sys_read / list ops). CrossEngin dependencies:
+//   src/safety/ed25519.nova for the RFC 8032 primitive; the Merkle
+//   tree itself lives in src/persistence/merkle.nova (R15E).
+//
+// Performance
+//   One ed25519_sign per /save (only when the env var points at a
+//   keypair). Per the ed25519.nova preamble: ~250-1100 ms per sign
+//   on this sandbox. That's the cost of attestation. /load with the
+//   pubkey set runs one ed25519_verify (~400-2000 ms) -- also one-
+//   shot per snapshot, not per-atom.
+
+import "std/syscall"
+import "std/io"
+import "../safety/ed25519.nova"
+import "merkle.nova"
+
+// ============================================================================
+//                            Constants + small helpers
+// ============================================================================
+
+let _MS_ROOT_LEN       = 32      // SHA-256 hash length / Ed25519 message length
+let _MS_PRIV_LEN       = 32      // Ed25519 seed length
+let _MS_PUB_LEN        = 32      // Ed25519 public-key length
+let _MS_SIG_LEN        = 64      // Ed25519 signature length
+let _MS_SIG_HEX_LEN    = 128     // 64-byte signature as lowercase hex
+
+let _MS_FILE_MODE_PRIV = 384     // 0600 -- rw------- (operator-only)
+let _MS_FILE_MODE_PUB  = 420     // 0644 -- rw-r--r--
+
+// ----- nibble + hex helpers (mirrors merkle.nova / ed25519.nova) ------------
+
+fn _ms_hex_nibble(c) {
+    if c >= 48 {
+        if c <= 57 { return c - 48 }
+    }
+    if c >= 97 {
+        if c <= 102 { return c - 87 }
+    }
+    if c >= 65 {
+        if c <= 70 { return c - 55 }
+    }
+    return 0 - 1
+}
+
+fn _ms_nibble_hex(n) {
+    if n < 10 { return 48 + n }
+    return 87 + n
+}
+
+// Convert a NOVA byte-LIST (the ed25519 module's representation) to
+// lowercase hex.
+fn _ms_bytes_to_hex(bytes) {
+    let n = len(bytes)
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = bytes[i]
+        s = s + chr(_ms_nibble_hex(int_and(int_shr(b, 4), 15)))
+        s = s + chr(_ms_nibble_hex(int_and(b, 15)))
+        i = i + 1
+    }
+    return s
+}
+
+// Convert a lowercase hex string to a NOVA byte LIST. Returns 0 on
+// malformed input (wrong length, non-hex char). Lengths are unchecked
+// here -- callers pass _MS_SIG_HEX_LEN / 64 / 128 -depending strings
+// and own the validation.
+fn _ms_hex_to_bytes(hex) {
+    let n = len(hex)
+    if int_and(n, 1) != 0 { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < n {
+        let hi = _ms_hex_nibble(char_at(hex, i))
+        let lo = _ms_hex_nibble(char_at(hex, i + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        push(out, int_or(int_shl(hi, 4), lo))
+        i = i + 2
+    }
+    return out
+}
+
+// Convert the 33-byte SHA-256 BUFFER (the merkle.nova representation)
+// into a 32-element NOVA byte LIST (the ed25519 representation). The
+// trailing NUL of the buffer is dropped.
+fn _ms_buf_to_bytes_list(buf) {
+    let out = list_new()
+    if buf == 0 { return out }
+    let i = 0
+    while i < _MS_ROOT_LEN {
+        push(out, load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+// Convert a 32-element byte LIST to a freshly alloc'd 33-byte BUFFER
+// (32 bytes + trailing NUL). Useful when an ed25519-style byte list
+// needs to be fed back through a merkle.nova primitive.
+fn _ms_bytes_list_to_buf(bytes) {
+    let buf = alloc(_MS_ROOT_LEN + 1)
+    let i = 0
+    let n = len(bytes)
+    if n > _MS_ROOT_LEN { n = _MS_ROOT_LEN }
+    while i < n {
+        store8(buf + i, bytes[i])
+        i = i + 1
+    }
+    while i < _MS_ROOT_LEN {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    store8(buf + _MS_ROOT_LEN, 0)
+    return buf
+}
+
+// ============================================================================
+//                          Public root-bytes helpers
+// ============================================================================
+
+// Convert a 64-char Merkle-root hex string into a 32-element byte LIST
+// suitable for ed25519_sign / ed25519_verify. Returns 0 on shape error.
+fn merkle_root_bytes_from_hex(root_hex) {
+    if root_hex == 0 { return 0 }
+    if len(root_hex) != _MS_ROOT_LEN * 2 { return 0 }
+    return _ms_hex_to_bytes(root_hex)
+}
+
+// ============================================================================
+//                          Sign / verify primitives
+// ============================================================================
+
+// Sign a 32-byte Merkle-root BYTE LIST (NOT a buffer) under
+// (seed, pubkey). Returns a 64-byte signature as a NOVA byte LIST,
+// or 0 on input-shape error.
+//
+// This is a THIN wrapper over ed25519_sign -- the wrapper exists so
+// the call site doesn't have to know that ed25519 takes byte lists
+// while merkle returns buffers, and so the integration code has a
+// single named entry point to look up.
+fn merkle_sign(root_bytes, seed_bytes, pk_bytes) {
+    if root_bytes == 0 { return 0 }
+    if seed_bytes == 0 { return 0 }
+    if pk_bytes == 0 { return 0 }
+    if len(root_bytes) != _MS_ROOT_LEN { return 0 }
+    if len(seed_bytes) != _MS_PRIV_LEN { return 0 }
+    if len(pk_bytes) != _MS_PUB_LEN { return 0 }
+    return ed25519_sign(root_bytes, seed_bytes, pk_bytes)
+}
+
+// Verify a 64-byte signature against a 32-byte Merkle root + 32-byte
+// pubkey. Returns 1 on valid, 0 on any mismatch (tampered root,
+// tampered sig, wrong pubkey, wrong shape).
+fn merkle_verify_signature(root_bytes, sig_bytes, pk_bytes) {
+    if root_bytes == 0 { return 0 }
+    if sig_bytes == 0 { return 0 }
+    if pk_bytes == 0 { return 0 }
+    if len(root_bytes) != _MS_ROOT_LEN { return 0 }
+    if len(sig_bytes) != _MS_SIG_LEN { return 0 }
+    if len(pk_bytes) != _MS_PUB_LEN { return 0 }
+    return ed25519_verify(root_bytes, sig_bytes, pk_bytes)
+}
+
+// Convenience: sign the 64-char hex root and return a 128-char hex
+// signature. Returns "" on input-shape error. Used by the snapshot
+// writer (the meta block already carries the root as hex; the
+// signature line is the same shape for consistency).
+fn merkle_sign_hex(root_hex, seed_bytes, pk_bytes) {
+    let root_bytes = merkle_root_bytes_from_hex(root_hex)
+    if root_bytes == 0 { return "" }
+    let sig = merkle_sign(root_bytes, seed_bytes, pk_bytes)
+    if sig == 0 { return "" }
+    if len(sig) != _MS_SIG_LEN { return "" }
+    return _ms_bytes_to_hex(sig)
+}
+
+// Convenience: verify a 128-char hex signature against a 64-char hex
+// root + 64-char hex pubkey. Returns 1 on valid, 0 on any mismatch.
+fn merkle_verify_signature_hex(root_hex, sig_hex, pk_hex) {
+    if root_hex == 0 { return 0 }
+    if sig_hex == 0 { return 0 }
+    if pk_hex == 0 { return 0 }
+    if len(sig_hex) != _MS_SIG_HEX_LEN { return 0 }
+    if len(pk_hex) != _MS_PUB_LEN * 2 { return 0 }
+    let root_bytes = merkle_root_bytes_from_hex(root_hex)
+    if root_bytes == 0 { return 0 }
+    let sig_bytes = _ms_hex_to_bytes(sig_hex)
+    if sig_bytes == 0 { return 0 }
+    let pk_bytes = _ms_hex_to_bytes(pk_hex)
+    if pk_bytes == 0 { return 0 }
+    return merkle_verify_signature(root_bytes, sig_bytes, pk_bytes)
+}
+
+// ============================================================================
+//                       Keypair on-disk read / write
+// ============================================================================
+//
+// The on-disk format is the simplest one that round-trips:
+//   <base_path>.priv  -- 32 raw bytes (the Ed25519 seed; mode 0600)
+//   <base_path>.pub   -- 32 raw bytes (the Ed25519 pubkey; mode 0644)
+//
+// `merkle_signing_keypair_load(base_path)` and `merkle_signing_keypair_save`
+// take the BASE path (no extension) and read/write both halves. A
+// caller that has only one half (e.g. the verifier holds only the
+// pubkey) calls `merkle_signing_pubkey_load(path)` -- which takes a
+// FULL path, not a base, because the verifier's pubkey file is
+// typically named with its own conventions.
+
+// Write `bytes` to `path` durably (write_tmp + fsync + atomic rename).
+// `bytes` is a NOVA byte list (the ed25519 representation). Mode is
+// the integer file mode; we use 0600 for priv, 0644 for pub.
+fn _ms_write_bytes_durable(bytes, path, mode) {
+    if bytes == 0 { return 0 }
+    let n = len(bytes)
+    if n == 0 { return 0 }
+    // Materialize the byte list as an alloc'd buffer; sys_write
+    // takes a pointer, not a list. The buffer carries a trailing
+    // NUL even though sys_write only consumes `n` bytes -- defensive
+    // in case any chain treats it as a string.
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, bytes[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let tmp = path + ".tmp"
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(tmp, flags, mode)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, n)
+    if written != n {
+        sys_close(fd)
+        sys_unlink(tmp)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    let rr = sys_rename(tmp, path)
+    if rr != 0 {
+        sys_unlink(tmp)
+        return 0
+    }
+    return 1
+}
+
+// Read up to `max_bytes` from `path` and return as a NOVA byte list.
+// Returns 0 if the file cannot be opened OR if its length is not
+// EXACTLY `expect_len` (we want strict shape because a partial /
+// padded keypair file is a security smell).
+fn _ms_read_bytes_strict(path, expect_len) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let buf = alloc(expect_len + 16 + 1)
+    // Read enough to detect overlong as well. We read in one go; a
+    // 32-byte file is never short on Linux's read(2).
+    let m = sys_read(fd, buf, expect_len + 1)
+    sys_close(fd)
+    if m != expect_len { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < expect_len {
+        push(out, load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+// Save a keypair to disk under `base_path`:
+//   <base_path>.priv  (32 bytes, mode 0600)
+//   <base_path>.pub   (32 bytes, mode 0644)
+// Returns 1 on success, 0 if either half fails.
+fn merkle_signing_keypair_save(seed_bytes, pk_bytes, base_path) {
+    if seed_bytes == 0 { return 0 }
+    if pk_bytes == 0 { return 0 }
+    if len(seed_bytes) != _MS_PRIV_LEN { return 0 }
+    if len(pk_bytes) != _MS_PUB_LEN { return 0 }
+    let priv_path = base_path + ".priv"
+    let pub_path  = base_path + ".pub"
+    if _ms_write_bytes_durable(seed_bytes, priv_path, _MS_FILE_MODE_PRIV) == 0 {
+        return 0
+    }
+    if _ms_write_bytes_durable(pk_bytes, pub_path, _MS_FILE_MODE_PUB) == 0 {
+        return 0
+    }
+    return 1
+}
+
+// Load a keypair from disk. Returns [seed_bytes, pk_bytes] on
+// success, 0 on any failure (either file missing, wrong length).
+fn merkle_signing_keypair_load(base_path) {
+    let priv_path = base_path + ".priv"
+    let pub_path  = base_path + ".pub"
+    let seed = _ms_read_bytes_strict(priv_path, _MS_PRIV_LEN)
+    if seed == 0 { return 0 }
+    let pk = _ms_read_bytes_strict(pub_path, _MS_PUB_LEN)
+    if pk == 0 { return 0 }
+    let pair = list_new()
+    push(pair, seed)
+    push(pair, pk)
+    return pair
+}
+
+// Load JUST a pubkey from a FULL path. Returns the 32-byte byte list
+// on success, 0 on any failure. The verifier-side helper -- the
+// verifier typically doesn't hold the priv half.
+fn merkle_signing_pubkey_load(path) {
+    return _ms_read_bytes_strict(path, _MS_PUB_LEN)
+}
+
+// Save JUST a pubkey to a FULL path. Returns 1 on success, 0 on
+// failure. Pair with merkle_signing_pubkey_load -- the verifier-
+// distribution side.
+fn merkle_signing_pubkey_save(pk_bytes, path) {
+    return _ms_write_bytes_durable(pk_bytes, path, _MS_FILE_MODE_PUB)
+}
+
+// ============================================================================
+//                          Env-var hook helpers
+// ============================================================================
+//
+// Three operator-facing env vars surface the signing functionality:
+//
+//   CE_SNAPSHOT_SIGN_KEY=/path/to/snap_key.priv
+//     The writer looks for the sibling .pub at <path>.pub (the path
+//     here is the FULL .priv path, but we strip the suffix to find
+//     the base).
+//
+//   CE_SNAPSHOT_VERIFY_PUBKEY=/path/to/snap_key.pub
+//     A full path to a 32-byte pubkey file the verifier should use.
+//
+//   CE_SNAPSHOT_REQUIRE_SIGNATURE=1
+//     Strict-mode flip. Defaults to 0 (lenient).
+//
+// All three return a string ("" when unset) or an int -- the
+// snapshot_disk / snapshot_writer wiring tests them and conditionally
+// signs / verifies.
+
+// Return the CE_SNAPSHOT_SIGN_KEY env value, or "" when unset.
+fn merkle_signing_sign_key_path() {
+    let v = getenv("CE_SNAPSHOT_SIGN_KEY")
+    if v == 0 { return "" }
+    return v
+}
+
+// Return the CE_SNAPSHOT_VERIFY_PUBKEY env value, or "" when unset.
+fn merkle_signing_verify_pubkey_path() {
+    let v = getenv("CE_SNAPSHOT_VERIFY_PUBKEY")
+    if v == 0 { return "" }
+    return v
+}
+
+// Return 1 when CE_SNAPSHOT_REQUIRE_SIGNATURE=1 is set, 0 otherwise.
+// When set, a /load with verify-pubkey set BUT no signature in the
+// file is REFUSED (strict). Default 0 = lenient (warn only).
+fn merkle_signing_require_signature() {
+    let v = getenv("CE_SNAPSHOT_REQUIRE_SIGNATURE")
+    if v == 0 { return 0 }
+    if str_eq(v, "1") == 1 { return 1 }
+    return 0
+}
+
+// ============================================================================
+//             High-level: sign-on-save, verify-on-load (env-driven)
+// ============================================================================
+//
+// Two single-call entry points used by snapshot_disk.nova:
+//
+//   merkle_signing_sign_root_via_env(root_hex)
+//     Read the env-var-pointed priv file (and sibling .pub), sign
+//     the root, return the 128-char hex signature. Returns "" when
+//     the env var is unset OR any file read / sign step fails.
+//
+//   merkle_signing_verify_via_env(root_hex, sig_hex)
+//     Read the env-var-pointed pubkey file, verify the signature
+//     over the root. Returns:
+//        1 -- verified
+//        0 -- tampered (sig present, doesn't match)
+//       -1 -- no pubkey file configured / unreadable / no signature
+//             in file (the caller's policy decides whether this is
+//             a refuse vs. warn)
+//
+// Reading the priv every save is intentional -- the substrate doesn't
+// hold the key in memory between saves (smaller blast radius if a
+// memory disclosure happens between writes).
+
+// Returns the 128-char hex signature, or "" when not configured /
+// failure.
+fn merkle_signing_sign_root_via_env(root_hex) {
+    let priv_path = merkle_signing_sign_key_path()
+    if str_eq(priv_path, "") == 1 { return "" }
+    let base = _ms_strip_priv_suffix(priv_path)
+    let pair = merkle_signing_keypair_load(base)
+    if pair == 0 { return "" }
+    let seed = pair[0]
+    let pk = pair[1]
+    return merkle_sign_hex(root_hex, seed, pk)
+}
+
+// Verify policy: 1 verified, 0 tampered, -1 no commitment / no pubkey
+// configured / unreadable.
+fn merkle_signing_verify_via_env(root_hex, sig_hex) {
+    let pub_path = merkle_signing_verify_pubkey_path()
+    if str_eq(pub_path, "") == 1 { return 0 - 1 }
+    if sig_hex == 0 { return 0 - 1 }
+    if str_eq(sig_hex, "") == 1 { return 0 - 1 }
+    if len(sig_hex) != _MS_SIG_HEX_LEN { return 0 - 1 }
+    let pk = merkle_signing_pubkey_load(pub_path)
+    if pk == 0 { return 0 - 1 }
+    let pk_hex = _ms_bytes_to_hex(pk)
+    return merkle_verify_signature_hex(root_hex, sig_hex, pk_hex)
+}
+
+// Strip a trailing `.priv` suffix to recover the base path used by
+// merkle_signing_keypair_save / _load. If the suffix is absent we
+// return the input verbatim -- the caller can pass a base directly.
+fn _ms_strip_priv_suffix(path) {
+    let n = len(path)
+    if n < 5 { return path }
+    let tail_start = n - 5
+    let tail = substr(path, tail_start, 5)
+    if str_eq(tail, ".priv") == 1 {
+        return substr(path, 0, tail_start)
+    }
+    return path
+}
