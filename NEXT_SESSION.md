@@ -3,6 +3,134 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R23D (this session) -- Image object tracking (Kalman filter + greedy Hungarian)
+
+**Status: complete -- new module `src/io/transducers/image_tracker.nova`
+(+~580 lines) wraps R15C HOG sliding-window and R16D Haar face
+detector outputs in a per-track Kalman filter (position + velocity
++ bbox, per-coordinate variance) plus greedy minimum-L2 Hungarian
+assignment. R15C and R16D produce per-frame detections; R23D
+associates those detections across video frames into persistent
+tracks with stable IDs and the textbook lifecycle (probational ->
+confirmed -> lost).**
+
+### What R23D delivers
+
+1. **Module** -- `src/io/transducers/image_tracker.nova` (NEW).
+   Per-track state record `[id, x_milli, y_milli, vx_milli,
+   vy_milli, w, h, status, age, hits, missed, variance,
+   first_seen_frame, last_seen_frame]` (14 slots). Tracker holds
+   the master list of every track ever spawned plus a monotone
+   id counter and the step / last-frame counters.
+
+2. **Kalman filter (integer-only, per-coordinate variance)**:
+   - PREDICT: x' = x + vx; y' = y + vy; var' = var + Q (Q = 1000
+     milli^2).
+   - UPDATE: gain = var / (var + R); x_new = x_pred + gain *
+     (x_obs - x_pred); var_new = (1 - gain) * var (R = 64000
+     milli^2 = 8 px^2, matching HOG default stride).
+   - Velocity uses a separate EMA blend (alpha = 700 milli =
+     70% new) over per-frame position deltas.
+
+3. **Greedy Hungarian assignment** -- iteratively pick the
+   lowest-cost (track, detection) pair below
+   TRACKER_MAX_ASSIGN_DIST_PX = 50, mark both as used, repeat.
+   Brief explicitly authorises greedy over Munkres-Kuhn; sparse
+   cost matrices make greedy = optimal.
+
+4. **Lifecycle**:
+   - Unmatched detection -> new probational track (age 1, hits 1).
+   - Matched track: hits += 1, missed = 0. Hits >= 5 ->
+     "confirmed".
+   - Unmatched active track: missed += 1. Missed >= 5 -> "lost"
+     and excluded from `tracker_active_tracks`.
+
+5. **Public API** -- `tracker_new()`, `tracker_step(tracker,
+   detections, frame_idx)`, `tracker_active_tracks`,
+   `tracker_confirmed_tracks`, `tracker_all_tracks`,
+   `tracker_track_at(tracker, id)`, `track_state(t) -> [x_milli,
+   y_milli, vx_milli, vy_milli, w, h]`, plus accessors
+   `track_id`, `track_age`, `track_status`, `track_hits`,
+   `track_missed`, `track_variance`, `track_first_seen`,
+   `track_last_seen`, `track_x_px`, `track_y_px`. Detection
+   helpers `detection_from_xywh(x, y, w, h)` and
+   `tracker_detections_from_det(det_list, bbox_w, bbox_h)`
+   (the latter wraps R15C `det_sliding_window` output).
+
+6. **Chat dispatch** -- one new admin command
+   `/track <video_dir>`. Probes `frame_NNNN.pgm` for NNNN = 0001
+   .. TRACK_MAX_FRAMES = 64, parses each PGM, runs HOG detection
+   when `CE_TRACK_TEMPLATE_PGM` is set (otherwise a brightness-
+   centroid fallback that picks pixels >= 128), feeds detections
+   to `tracker_step`, renders multi-line summary:
+
+   ```
+   (track scanned 5 frame(s), 1 track(s) total)
+   (confirmed=1 probational=0 lost=0)
+   (track #1 status=confirmed age=5 hits=5 missed=0 pos=(29, 29)
+    vel=(4806, 4806) milli/frame bbox=7x7)
+   ```
+
+   With no arg: `(/track needs VIDEO_DIR -- usage: /track
+   /tmp/track_frames)`. On missing dir / missing frame_0001.pgm:
+   `(track FAILED: <dir> does not contain frame_0001.pgm)`.
+
+### Verification snapshot
+
+- **40 unit assertions** in `tests/unit/test_image_tracker.nova`
+  (NEW). All PASS. Covers: constants (TRACKER_CONFIRM_THRESHOLD,
+  TRACKER_LOST_THRESHOLD, TRACKER_MILLI); single detection ->
+  probational; 5 consecutive frames -> confirmed (hits=5); 5
+  moving frames at (+5, +5) -> velocity vx, vy in [2000, 6000]
+  milli/frame with correct sign; 5 confirm + 5 empty -> lost;
+  two parallel tracks (y=10 / y=80) stay associated across 6
+  frames; crossing-tracks scenario preserves identity via greedy
+  assignment; empty detections -> 0 spawned but step_count
+  advances; Kalman predict advances by exactly +vx, +vy milli;
+  detection_from_xywh / track_state / tracker_track_at shape +
+  sentinel tests.
+
+- **13 integration assertions** in
+  `tests/integration/scenario_mmmm_tracker.sh` (NEW). All PASS.
+  Driver synthesises a 5-frame 40x40 PGM fixture (bright 6x6
+  square at (10,10), (15,15), ..., (30,30)) and a 10-frame lost
+  fixture (5 moving + 5 black). Asserts: `/track` no arg ->
+  usage; missing dir -> graceful FAILED; moving fixture scans 5
+  frames, reports 1 confirmed track; velocity vx=4806, vy=4806
+  (both in [2000, 6000] band); final position (29, 29) (within
+  +/- 10 of (30, 30)); lost fixture scans 10 frames, lost=1;
+  `/help` advertises /track as R23D.
+
+- **Existing CV suites stay green** -- R15C HOG detector 32, R16D
+  face_detect 36, R17D LBP 45, R18D face_recognize 48, R21D HOG
+  integral 42, R22A detector integral 22, R22D panorama 59.
+
+### Velocity convergence
+
+Brief target: velocity ~= (5000, 5000) milli/frame. Actual at
+end of frame 5: (4806, 4806). Convergence shape reflects alpha
+= 0.7 EMA + Kalman gain (~0.134 at spawn-state variance), so
+the first per-frame delta is attenuated. By frame 5 the
+observed velocity sits at ~96% of ground truth, well within
+the [2000, 6000] tolerance the brief calls "~=".
+
+### Slot pivot
+
+The brief specified `scenario_nnnn_tracker.sh` ("pick free
+letter"). R23B grabbed `scenario_llll_lipsync.sh` while I was
+working; I pivoted to `scenario_mmmm_tracker.sh` (next free
+4-letter slot).
+
+### Files touched (R23D)
+
+- `src/io/transducers/image_tracker.nova` -- NEW (~580 lines).
+- `tests/unit/test_image_tracker.nova` -- NEW (40 assertions).
+- `tests/integration/scenario_mmmm_tracker.sh` -- NEW (13
+  assertions).
+- `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line (3 lines net).
+- `IMAGE_AUDIT.md`, `README.md`, `NEXT_SESSION.md` -- updated.
+
 ## R23B (this session) -- Audio-vision lip sync detection (heuristic correlator)
 
 **Status: complete -- new module `src/perception/lipsync.nova`

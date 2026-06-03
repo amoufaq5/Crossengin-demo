@@ -11,7 +11,49 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R23B adds `src/perception/lipsync.nova` — audio-vision
+> toolchain. R23D adds `src/io/transducers/image_tracker.nova` — image
+> object tracking via per-track Kalman filter (predict + update with
+> per-coordinate variance) plus greedy minimum-L2 Hungarian assignment
+> over per-frame detections from R15C HOG sliding-window or R16D Haar
+> face detectors. State is [x, y, vx, vy, w, h] with positions in
+> milli-pixels for sub-pixel accuracy in the integer domain. Per
+> frame: predict pushes position forward by velocity; greedy assignment
+> matches detections to predicted tracks below a 50-pixel L2 cap;
+> Kalman update blends prediction with observation via gain = var /
+> (var + R); unmatched detections spawn probational tracks; unmatched
+> tracks age out to "lost" after 5 consecutive misses; matched
+> probational tracks promote to "confirmed" after 5 hits. Public
+> API: `tracker_new() -> tracker_t`, `tracker_step(tracker,
+> detections, frame_idx) -> tracker`, `tracker_active_tracks(tracker)
+> -> list[track_t]`, `tracker_confirmed_tracks(tracker)`,
+> `tracker_all_tracks(tracker)`, `tracker_track_at(tracker,
+> track_id) -> track_t | 0`, plus per-track accessors `track_state(t)
+> -> [x_milli, y_milli, vx_milli, vy_milli, w, h]`, `track_id`,
+> `track_age`, `track_status`, `track_hits`, `track_missed`,
+> `track_x_px`, `track_y_px`, and `track_predict(track)` for the
+> Kalman predict step in isolation. Verification: 40 unit assertions
+> in `tests/unit/test_image_tracker.nova` (NEW; constants, single
+> detection -> probational track, 5 consecutive frames -> confirmed,
+> 5 moving frames -> velocity (+vx, +vy) with correct sign in
+> [2000, 6000] milli/frame, detection disappears for 5 frames ->
+> lost, two parallel tracks correctly associated across 6 frames,
+> crossing-tracks scenario preserves identity via greedy assignment,
+> empty detections -> no spawn, Kalman predict advances position
+> by exactly +vx +vy, accessor and detection-helper shape checks).
+> 13 integration assertions in
+> `tests/integration/scenario_mmmm_tracker.sh` (NEW; bash driver
+> writes a 5-frame 40x40 PGM fixture with a bright 6x6 square
+> moving from (10,10) to (30,30) at +5/+5 per frame and a
+> 10-frame lost fixture; asserts `/track` scans 5 frames, reports
+> 1 confirmed track, velocity ~ (5000, 5000) milli/frame (actual
+> ~4806), final position near (30, 30) (actual (29, 29)); lost
+> fixture (5 moving + 5 black) marks track lost; `/track` with no
+> arg -> usage; missing dir -> graceful FAILED; `/help` advertises
+> /track as R23D). Existing CV suites stay green (R15C HOG detector
+> 32, R16D face_detect 36, R17D LBP 45, R18D face_recognize 48,
+> R21D HOG integral 42, R22A detector integral 22, R22D panorama
+> 59 checks). Chat: `/track <video_dir>` admin command wired
+> into `examples/crossengin_chat.nova`. Module count: +1. R23B adds `src/perception/lipsync.nova` — audio-vision
 > lip sync detection. Given a sequence of PGM video frames + an audio WAV,
 > the detector reports whether the speaker on screen is actually saying the
 > words in the audio. Per-frame mouth-open score: lower-third of R16D Haar

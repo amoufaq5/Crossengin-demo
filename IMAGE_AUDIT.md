@@ -2241,3 +2241,164 @@ gets swapped.
 * `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
   help line (3 lines net; matches R22F melody / R22D panorama
   precedent).
+
+## R23D -- image object tracking via Kalman filter + greedy Hungarian assignment
+
+CrossEngin already lands per-frame detectors (R15C HOG sliding-window,
+R16D Haar face) but every detection was an independent event -- nothing
+told the substrate "this is the SAME object I saw a frame ago". R23D
+closes that gap with the classical Kalman-predict + greedy-assignment
+tracker (`src/io/transducers/image_tracker.nova`) that lives one level
+above the detectors and produces persistent tracks with stable IDs
+across a video sequence.
+
+### Algorithm (Kalman + greedy Hungarian, per frame)
+
+1. **PREDICT.** For every active track, push state forward by one
+   frame using the constant-velocity motion model:
+     `x' = x + vx`, `y' = y + vy` (in milli-pixel units),
+     `var' = var + Q` (process noise; Q = 1000 milli^2).
+
+2. **ASSIGN.** Build the (num_active_tracks x num_detections) cost
+   matrix of squared L2 distances. Greedy assignment: repeatedly
+   pick the lowest-cost eligible pair below
+   `TRACKER_MAX_ASSIGN_DIST_PX = 50`, mark both as used, repeat
+   until no eligible pair remains. The brief explicitly authorises
+   greedy over O(n^3) Munkres-Kuhn; in sparse cost matrices the
+   two are equivalent.
+
+3. **UPDATE.** For each matched (track, detection) pair:
+     `gain = var / (var + R)` (Kalman gain, per-coordinate)
+     `x_new = x_pred + gain * (x_obs - x_pred)`
+     `var_new = (1 - gain) * var`
+   with measurement noise `R = 64000 milli^2 = 8 px^2` (HOG stride).
+   Velocity is updated as a velocity-EMA (alpha = 700 milli = 0.7
+   new + 0.3 old). Bbox size copies the observation directly.
+
+4. **SPAWN.** Every unmatched detection becomes a NEW track in
+   "probational" status with zero velocity, age 1, hits 1.
+
+5. **AGE.** Every unmatched active track increments its missed
+   counter. >= `TRACKER_LOST_THRESHOLD = 5` missed frames -> "lost"
+   (excluded from active list). >= `TRACKER_CONFIRM_THRESHOLD = 5`
+   total hits -> "probational" -> "confirmed".
+
+### Coordinate convention
+
+All positions and velocities are stored in MILLI-pixels (1 px = 1000
+milli) so the Kalman blending preserves sub-pixel accuracy in the
+integer domain. `track_state(t) -> [x_milli, y_milli, vx_milli,
+vy_milli, w, h]` is the public surface; convenience wrappers
+`track_x_px`, `track_y_px` round to nearest pixel.
+
+### Track state record (14 slots)
+
+```
+[0]  id              -- monotone, never reused; starts at 1
+[1]  x_milli
+[2]  y_milli
+[3]  vx_milli        -- milli-px / frame
+[4]  vy_milli
+[5]  w               -- bbox width in whole pixels
+[6]  h               -- bbox height in whole pixels
+[7]  status          -- "probational" | "confirmed" | "lost"
+[8]  age             -- frames since spawn
+[9]  hits            -- total matched frames
+[10] missed          -- consecutive missed frames (resets on match)
+[11] variance        -- per-coordinate position variance (milli^2)
+[12] first_seen_frame
+[13] last_seen_frame
+```
+
+### Tuning constants
+
+* `TRACKER_CONFIRM_THRESHOLD = 5` -- hits before probational -> confirmed.
+* `TRACKER_LOST_THRESHOLD    = 5` -- missed frames before active -> lost.
+* `TRACKER_MAX_ASSIGN_DIST_PX = 50` -- L2 distance cap for assignment.
+* `TRACKER_PROCESS_NOISE_Q   = 1000 milli^2` -- per-step variance bump.
+* `TRACKER_MEASURE_NOISE_R   = 64000 milli^2` -- detector observation noise.
+* `TRACKER_INITIAL_VARIANCE  = 1000000 milli^2` -- spawn variance.
+* `TRACKER_VELOCITY_ALPHA_MILLI = 700` -- velocity-EMA blend factor.
+
+### Public API
+
+* `tracker_new() -> tracker_t`.
+* `tracker_step(tracker, detections, frame_idx) -> tracker` -- one
+  predict + assign + update + spawn + age round. `detections` is a
+  list of `[x, y, w, h]` entries; use `detection_from_xywh` to
+  construct or `tracker_detections_from_det(det_list, bbox_w,
+  bbox_h)` to wrap R15C `det_sliding_window` output.
+* `tracker_active_tracks(tracker)`, `tracker_confirmed_tracks
+  (tracker)`, `tracker_all_tracks(tracker)`.
+* `tracker_track_at(tracker, track_id) -> track_t | 0`.
+* `track_state(t)`, `track_id`, `track_age`, `track_status`,
+  `track_hits`, `track_missed`, `track_variance`,
+  `track_first_seen`, `track_last_seen`, `track_x_px`,
+  `track_y_px`.
+* `track_predict(track) -> track` -- Kalman predict step in
+  isolation (used in unit tests).
+
+### Chat command
+
+`/track <video_dir>` probes `frame_NNNN.pgm` for NNNN = 0001..
+TRACK_MAX_FRAMES = 64, parses each PGM, runs HOG detection when
+`CE_TRACK_TEMPLATE_PGM` is set (otherwise falls back to a
+brightness-centroid detector that picks the centre of pixels >=
+128), feeds detections to `tracker_step`, renders a multi-line
+summary:
+
+```
+(track scanned 5 frame(s), 1 track(s) total)
+(confirmed=1 probational=0 lost=0)
+(track #1 status=confirmed age=5 hits=5 missed=0 pos=(29, 29)
+ vel=(4806, 4806) milli/frame bbox=7x7)
+```
+
+Error / usage paths:
+* No arg: `(/track needs VIDEO_DIR -- usage: /track /tmp/track_frames)`
+* Missing dir: `(track FAILED: <dir> does not contain frame_0001.pgm)`
+
+### Verification
+
+* 12 unit-test functions / 40 assertions in
+  `tests/unit/test_image_tracker.nova` (NEW). All PASS. Covers:
+  constants (TRACKER_CONFIRM_THRESHOLD, TRACKER_LOST_THRESHOLD,
+  TRACKER_MILLI); single detection -> 1 probational track with id=1;
+  5 consecutive same-detection frames -> 1 confirmed track with
+  hits=5; 5 moving-detection frames at (+5, +5) -> velocity vx, vy
+  in [2000, 6000] milli/frame band with correct sign; 5 confirm
+  + 5 empty frames -> track marked lost and excluded from active
+  list; two parallel tracks (y=10 / y=80) stay correctly associated
+  across 6 frames; crossing-tracks scenario preserves identity via
+  greedy assignment; empty detections list spawns no new tracks but
+  advances step_count; Kalman predict step advances position by
+  exactly +vx, +vy milli; detection_from_xywh shape; track_state
+  6-element shape; tracker_track_at lookup with sentinel.
+
+* 13 integration assertions in
+  `tests/integration/scenario_mmmm_tracker.sh` (NEW). All PASS.
+  Driver synthesizes a 5-frame 40x40 PGM fixture with a bright
+  6x6 square moving (+5, +5) per frame from (10,10) to (30,30)
+  and a 10-frame lost fixture (5 moving + 5 black). Asserts:
+  `/track` no arg -> usage; missing dir -> graceful FAILED;
+  moving fixture scans 5 frames, reports 1 total track with
+  status=confirmed; velocity vx, vy both in [2000, 6000]
+  milli/frame (ground truth = 5000; actual = 4806); final
+  position within +/- 10 of (30, 30) (actual = (29, 29));
+  lost fixture scans 10 frames, lost=1; `/help` advertises
+  /track and labels it R23D.
+
+* Existing CV suites stay green (R15C HOG detector 32 checks,
+  R16D face_detect 36, R17D LBP 45, R18D face_recognize 48, R21D
+  HOG integral 42, R22A detector integral 22, R22D panorama 59).
+
+* Module count: +1 (`src/io/transducers/image_tracker.nova` NEW).
+
+### Files touched / added (R23D)
+
+* `src/io/transducers/image_tracker.nova` -- NEW (~580 lines).
+* `tests/unit/test_image_tracker.nova` -- NEW (40 assertions).
+* `tests/integration/scenario_mmmm_tracker.sh` -- NEW (13
+  assertions).
+* `examples/crossengin_chat.nova` -- 1 import + 1 dispatch + 1
+  help line (3 lines net).
