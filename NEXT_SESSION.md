@@ -3,7 +3,83 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R23D (this session) -- Image object tracking (Kalman filter + greedy Hungarian)
+## R23E (this session) -- Federation NAT traversal (STUN-like discovery + gossip advertise)
+
+**Status: complete -- new module `src/federation/nat_traversal.nova`
+(+~677 lines) ships the discovery + advertisement half of the STUN /
+TURN / ICE stack on top of NOVA's TCP transport. R18E gossip assumes
+direct reachability; R23E provides what NATed peers need: a way to
+learn their external addr from a rendezvous and broadcast it via
+gossip.**
+
+### What R23E delivers
+
+1. **Module** -- `src/federation/nat_traversal.nova` (NEW). Imports
+   gossip.nova for the alive-peer accessor + wire helpers.
+
+2. **Public API** -- `nat_init`, `nat_query_stun(addr)`,
+   `nat_query_stun_with_state(state, addr)`,
+   `nat_advertise(gossip_state, nat_state, ext_addr)`,
+   `nat_detect_type(addr1, addr2)`, `nat_detect_type_from_replies`,
+   `nat_local_addrs`, `nat_peer_external_addrs`, `nat_set_external`,
+   `nat_get_external`, `nat_set_peer_external`, `nat_get_peer_external`,
+   `nat_hole_punch(state, addr)` -> 0 (STUB), `nat_status_line`,
+   `nat_parse_stun_response`, `nat_format_stun_response`,
+   `nat_extract_peer_addr`, `nat_alloc_sa_buf`, `nat_alloc_sa_len`,
+   `nat_serve_stun_conn`, `nat_serve_stun_conn_sa`,
+   `nat_serve_stun_one_shot`, `nat_record_inbound_extaddr`.
+
+3. **STUN wire** -- `STUN_REQUEST\n` -> server replies `EXTERNAL
+   <ip>:<port>\n`. Server reads peer addr from `accept_conn(fd,
+   sa_buf, sa_len_buf)`'s sockaddr_in fill (LE family, BE port +
+   addr).
+
+4. **Gossip EXTADDR wire** (additive to R18E) -- `EXTADDR <internal>
+   <external>\n`. Receiver parser in gossip.nova validates + writes
+   to nat_state peer-ext table via pinned slot
+   `GOSSIP_NAT_PEER_TABLE_SLOT = 1`.
+
+5. **NAT-type heuristic** -- "open" / "cone" / "symmetric" /
+   "blocked" from two STUN replies.
+
+6. **Hole-punching stub** -- `nat_hole_punch` returns 0. R23E.2
+   ships UDP variant once NOVA exposes sendto/recvfrom.
+
+7. **Chat dispatch** -- `/nat` info-line dispatch + help line.
+
+### Verification snapshot (latest run)
+
+- **53 unit assertions** in `tests/unit/test_nat_traversal.nova`
+  (NEW). All PASS. Covers init state, STUN parse + format,
+  sockaddr_in extraction, peer table operations, local addrs
+  enumeration, NAT type heuristic on cone / symmetric / open /
+  blocked / malformed inputs, hole-punch stub, inbound record,
+  status line.
+
+- **12 integration assertions** in `tests/integration/scenario_oooo_nat_traversal.sh`
+  (NEW). 2-soul mesh: A as STUN rendezvous, B as querier-advertiser.
+
+- **All existing federation suites stay green** -- R18E gossip (34),
+  R19E leader_election (40), R20F snapshot_attestation (66), R21E
+  gossip_noise (44). Module count: +1.
+
+### Honest scope note
+
+TCP hole-punching needs SYN coordination. CE's TCP-only stack means
+full bidirectional hole-punching needs UDP. R23E ships discovery +
+advertisement; UDP hole-punching is R23E.2 (needs sendto/recvfrom
+in NOVA).
+
+### Files touched (R23E)
+
+- `src/federation/nat_traversal.nova` -- NEW (~677 lines).
+- `src/federation/gossip.nova` -- additive EXTADDR.
+- `tests/unit/test_nat_traversal.nova` -- NEW (53 assertions).
+- `tests/integration/scenario_oooo_nat_traversal.sh` -- NEW (12 assertions).
+- `examples/crossengin_chat.nova` -- 1 help line + 1 dispatch.
+- `README.md`, `FEDERATED_AUDIT.md`, `NEXT_SESSION.md` -- R23E section.
+
+## R23D (last session) -- Image object tracking (Kalman filter + greedy Hungarian)
 
 **Status: complete -- new module `src/io/transducers/image_tracker.nova`
 (+~580 lines) wraps R15C HOG sliding-window and R16D Haar face

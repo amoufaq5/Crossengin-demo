@@ -1274,3 +1274,175 @@ hook surface (`gossip_set_dr_state`, `gossip_broadcast_rule`,
    relevant predicate set from every alive peer. A future round
    could ride DELTA's existing belief-mutation stream to keep a
    local materialised relation cache.
+
+## R23E extension: NAT traversal -- STUN-like external addr discovery + gossip-piggyback advertisement
+
+### Why this exists
+
+R18E's SWIM gossip assumes every peer is directly reachable on its
+listed `host:port`. That assumption holds inside one trusted datacenter
+or on loopback, but fails the moment a peer sits behind any common
+middlebox: home routers (NAT44), mobile networks (CGNAT), corporate
+firewalls, and public-cloud security groups all deny inbound
+connections by default. Peers can OUT-connect (the NAT opens an
+egress mapping) but cannot accept inbound, so R18E's PING / DELTA /
+EXTADDR initiator pattern is correct, but the responder side of the
+mesh needs the peer's *external* mapping to even know where to dial.
+
+The canonical fix is the **STUN / TURN / ICE** stack (RFC 8489 et al.):
+the peer learns its external `(public_ip, public_port)` from a
+**rendezvous server** that echoes back what it observed on its accept
+side; the peer then advertises that pair to mesh peers, who use it as
+the destination for hole-punching probes.
+
+R23E ships **discovery + advertisement** on the TCP transport NOVA
+already exposes. UDP hole-punching is the next step (R23E.2) -- it
+requires `sendto/recvfrom` syscalls that NOVA does not currently
+expose to user code.
+
+### Protocol
+
+1. **External address discovery.**
+   Wire shape:
+   ```
+   dialer >> STUN_REQUEST\n
+   server >> EXTERNAL <ip>:<port>\n
+   ```
+   The server side calls `accept_conn(server_fd, sa_buf, sa_len_buf)`
+   with a non-zero 16-byte sockaddr_in buffer so the kernel fills in
+   the peer's source `(sin_addr, sin_port)`. Those are the
+   *post-NAT* values -- the public mapping. The server formats them
+   as `EXTERNAL <dotted-quad>:<decimal-port>` and writes the line
+   back. CE does not ship a dedicated STUN server: ANY well-
+   connected CE peer answers `STUN_REQUEST`, so the federation
+   bootstrap node doubles as the rendezvous.
+
+2. **Gossip-piggyback advertisement.**
+   The R23E additive wire line is:
+   ```
+   EXTADDR <internal_addr> <external_addr>\n
+   ```
+   Sent over a regular gossip TCP connection (HELLO + OK first).
+   The receiver dispatches `_gossip_serve_extaddr` (in gossip.nova)
+   which validates both addrs, writes `(internal, external)` to the
+   nat_state peer-ext table via the pinned cross-module slot
+   `GOSSIP_NAT_PEER_TABLE_SLOT`, and bumps counters
+   (`gossip_stats_nat_extaddr_rx` + `nat_inbound_ad_count`).
+
+3. **NAT-type heuristic.**
+   `nat_detect_type(stun_addr_1, stun_addr_2)` queries TWO STUN
+   servers; the pure form `nat_detect_type_from_replies(r1, r2)`
+   classifies based on the parsed `(ip, port)` pairs:
+
+   | r1 ip+port | r2 ip+port            | Local IP? | Classification |
+   |------------|-----------------------|-----------|----------------|
+   | parsed     | parsed, same ip+port  | yes       | `open`         |
+   | parsed     | parsed, same ip+port  | no        | `cone`         |
+   | parsed     | parsed, diff port     | -         | `symmetric`    |
+   | 0 / empty  | anything              | -         | `blocked`      |
+
+   "Open" = no NAT (external == local). "Cone" NATs reuse the same
+   egress mapping for any destination -- basic hole-punching works.
+   "Symmetric" NATs allocate a fresh source port per destination --
+   hole-punching cannot survive without a relay. "Blocked" reflects
+   a failed query.
+
+4. **Hole-punching stub.**
+   `nat_hole_punch(state, peer_external)` records the attempt in
+   the counter and returns 0 (not implemented). The TCP-only
+   implementation needs SO_REUSEPORT + simultaneous-connect (Ford
+   et al. 2005); the real fix is to add UDP support to NOVA and
+   ship the simpler UDP variant in R23E.2.
+
+### Public API
+
+```nova
+// Discovery (client side)
+nat_query_stun(addr)                       -> ext_addr | 0
+nat_query_stun_with_state(state, addr)     -> ext_addr | 0
+
+// Discovery (server side)
+nat_serve_stun_conn(conn_fd, ip, port)     -> 1 | 0
+nat_serve_stun_conn_sa(conn_fd, sa_buf)    -> 1 | 0
+nat_serve_stun_one_shot(bind_addr)         -> 1 | 0
+
+// Advertisement
+nat_advertise(gossip_state, nat_state, ext)  -> int (peers reached)
+nat_advertise_to(state, peer, internal, ext) -> 1 | 0
+
+// Heuristic
+nat_detect_type(addr1, addr2)              -> str
+nat_detect_type_from_replies(r1, r2)       -> str
+nat_local_addrs()                          -> list[addr_str]
+
+// State management
+nat_init()                                 -> nat_state_t
+nat_set_external(state, addr)              -> state
+nat_get_external(state)                    -> str
+nat_peer_external_addrs(state)             -> list of [internal, external]
+nat_get_peer_external(state, internal)     -> str
+nat_set_peer_external(state, internal, ext) -> state
+
+// Stub + status
+nat_hole_punch(state, peer_external)       -> 0 (R23E.2)
+nat_status_line(state)                     -> str
+```
+
+Gossip integration:
+```nova
+gossip_set_nat_state(gossip_state, nat_state) -> gossip_state
+gossip_stats_nat_extaddr_rx(state)            -> int
+gossip_stats_nat_extaddr_bad(state)           -> int
+```
+
+### Trust model
+
+The STUN response is **untrusted**: a malicious rendezvous server
+can lie about the dialer's external addr. R23E's defense is to
+query at least TWO STUN servers via `nat_detect_type` and disagree
+loudly when they disagree. For production deployment, the
+rendezvous side SHOULD be wired through the R21E Noise XK transport;
+that wiring lives one layer up.
+
+The advertisement side is symmetric: a peer can lie about its own
+external addr. The receiver records the mapping but does NOT trust
+it for any future operation; the intended consumer is the hole-
+puncher (R23E.2), which will probe the advertised addr -- a lie
+self-corrects when the probe fails.
+
+### Verification
+
+* **`tests/unit/test_nat_traversal.nova`** (NEW): 53 assertions on
+  the parse / format / peer-table / type-heuristic surface. Cone vs.
+  symmetric vs. open vs. blocked all confirmed against canned replies;
+  malformed input fails closed; the sockaddr_in extractor reads
+  little-endian family + big-endian port correctly.
+
+* **`tests/integration/scenario_oooo_nat_traversal.sh`** (NEW): 12
+  assertions on a 2-soul mesh. A binds + acts as STUN-like rendezvous;
+  B dials A, parses the response (in sandbox: `127.0.0.1:<ephemeral>`),
+  classifies NAT type, advertises via `nat_advertise` over the gossip
+  wire, and exits cleanly. Asserts A's `gossip_stats_nat_extaddr_rx`
+  counter advanced AND A's nat_state peer-ext table grew.
+
+### Honest scope
+
+- **R23E ships discovery + advertisement only.** Hole-punching is
+  documented but stubbed.
+- **No TURN relay fallback.** Symmetric NATs are correctly detected.
+- **Sandbox loopback is the test reality.** Same code path on real
+  hosts.
+- **CE_NAT_LOCAL_ADDRS is operator-supplied.** `nat_local_addrs`
+  returns `["127.0.0.1"]` plus whatever the operator pins. NOVA
+  does not expose `getifaddrs(3)` today.
+
+### Limitations / future work
+
+1. **No UDP hole-punching.** R23E.2 once NOVA exposes sendto/recvfrom.
+2. **STUN-server trust.** Defense is N-rendezvous voting at the
+   operator layer.
+3. **No TURN relay.** R23F or later.
+4. **No keepalive.** R23E.2 will add `nat_keepalive_tick`.
+5. **Single-address advertisement.** ICE candidate-pair gathering
+   (RFC 8445) is the proper multi-homed fix.
+
