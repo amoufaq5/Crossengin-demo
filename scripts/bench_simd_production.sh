@@ -591,5 +591,196 @@ echo ""
 echo "=== R12A/R17C: optical-flow LK bench (256x256, ws=5) ==="
 $NOVA run "$BENCH_FLOW"
 
+# ---------- R22A: HOG detector integral-histogram wire-in bench -----------
+#
+# R21D shipped the HOG integral histogram primitive but reported 0.25x
+# (4x SLOWER) for a single isolated hog_compute call -- the build cost
+# of the W*H*NUM_BINS integral planes dominates a single descriptor's
+# downstream queries. The win is structural amortization: when many
+# overlapping windows query the same scale (R15C's sliding window),
+# the integral build happens ONCE and the per-window query collapses
+# to O(NUM_BINS*4) lookups per cell. R22A is the wire-in.
+#
+# Bench surface: 256x256 textured scene, 32x32 template, stride 8 ->
+# (256-32)/8 + 1 = 29 across and 29 down = 841 candidate windows.
+
+BENCH_DET=examples/bench_detector_integral.nova
+cat > "$BENCH_DET" <<'NOVA_EOF'
+// R22A HOG detector integral-histogram benchmark.
+// Same scene + template across both paths; reports wallclock for
+// scalar R15C, integral R22A, bit-identity check, and speedup ratio.
+import "std/io"
+import "../src/io/transducers/image_detector.nova"
+import "../src/io/transducers/image_hog.nova"
+
+// Textured scene -- predictable per-pixel gradients so the descriptor
+// is non-zero everywhere and the L2-Hys block normalization exercises
+// every code path (uniform-image scenes degenerate to all-zero
+// descriptors which short-circuit the inner loops).
+fn b_textured(w, h) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let v = int_add(int_mul(x, 37), int_mul(y, 13))
+            let q = v / 256
+            v = int_sub(v, int_mul(q, 256))
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// 32x32 vertical-edge template (left half dark, right half bright).
+// Same shape R15C's unit tests use.
+fn b_vedge_template() {
+    let area = 32 * 32
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < 32 {
+        let row_off = int_mul(y, 32)
+        let x = 0
+        while x < 32 {
+            let v = 0
+            if x >= 16 { v = 255 }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+fn main() {
+    let W = 256
+    let H = 256
+    let TW = 32
+    let TH = 32
+    let STRIDE = 8
+    println("=== R22A HOG detector integral-histogram benchmark ===")
+    print("  scene: ")
+    print_int(W)
+    print("x")
+    print_int(H)
+    print("  template: ")
+    print_int(TW)
+    print("x")
+    print_int(TH)
+    print("  stride: ")
+    print_int(STRIDE)
+    let gx = int_add(int_div(int_sub(W, TW), STRIDE), 1)
+    let gy = int_add(int_div(int_sub(H, TH), STRIDE), 1)
+    print("  windows: ")
+    print_int(int_mul(gx, gy))
+    println("")
+
+    let scene = b_textured(W, H)
+    let tpl_img = b_vedge_template()
+    let tpl = det_train_template(tpl_img, TW, TH, TW, TH)
+
+    // Warm-up: prime any allocator state so the timed runs reflect
+    // steady-state cost, not the first-call allocation burst. NOVA's
+    // arena is bump-pointer; the warm-up moves the cursor past the
+    // first OS-page-allocation hot zone where wallclock can be 2-3x
+    // its steady-state value.
+    let _w_sc = det_sliding_window(scene, W, H, tpl, 4000, STRIDE)
+    let _w_in = _det_sliding_window_integral(scene, W, H, tpl, 4000, STRIDE)
+
+    // ----- scalar (R15C) -----
+    let t0 = nanotime()
+    let scalar_dets = det_sliding_window(scene, W, H, tpl, 4000, STRIDE)
+    let t1 = nanotime()
+    let scalar_ns = int_sub(t1, t0)
+
+    // ----- integral (R22A) -----
+    // Call the internal entry point directly so the timing reflects
+    // the integral-path cost regardless of env-var state. The
+    // env-dispatch in det_sliding_window is a thin one-liner; this
+    // matches how the unit suite verifies bit-identity.
+    let t2 = nanotime()
+    let integral_dets = _det_sliding_window_integral(scene, W, H, tpl,
+                                                     4000, STRIDE)
+    let t3 = nanotime()
+    let integral_ns = int_sub(t3, t2)
+
+    // ----- bit-identity check -----
+    let n_sc = len(scalar_dets)
+    let n_in = len(integral_dets)
+    let mism = 0
+    if n_sc != n_in {
+        mism = 1
+    } else {
+        let i = 0
+        while i < n_sc {
+            let da = scalar_dets[i]
+            let db = integral_dets[i]
+            if det_result_x(da) != det_result_x(db) { mism = int_add(mism, 1) }
+            if det_result_y(da) != det_result_y(db) { mism = int_add(mism, 1) }
+            if det_result_distance(da) != det_result_distance(db) {
+                mism = int_add(mism, 1)
+            }
+            i = int_add(i, 1)
+        }
+    }
+
+    print("  scalar  detections: ")
+    print_int(n_sc)
+    println("")
+    print("  integral detections: ")
+    print_int(n_in)
+    println("")
+    print("  scalar vs integral mismatches: ")
+    print_int(mism)
+    println("")
+    if mism > 0 {
+        println("FAIL: integral path NOT bit-identical to scalar path")
+        exit(1)
+    }
+    print("  scalar  wallclock (ns): ")
+    print_int(scalar_ns)
+    println("")
+    print("  integral wallclock (ns): ")
+    print_int(integral_ns)
+    println("")
+    if integral_ns > 0 {
+        let ratio_x100 = int_div(int_mul(scalar_ns, 100), integral_ns)
+        let whole = int_div(ratio_x100, 100)
+        let frac  = ratio_x100 % 100
+        print("  integral speedup vs scalar: ~")
+        print_int(whole)
+        print(".")
+        if frac < 10 { print("0") }
+        print_int(frac)
+        println("x")
+        // R22A target: 2-5x absolute. The exact realized speedup
+        // depends on the candidate-window count vs the integral-
+        // build cost. For 256x256 + 32x32 + stride 8 the candidate
+        // grid is 841 windows; the integral build is paid ONCE.
+    } else {
+        println("  integral wallclock 0 -- below resolution")
+    }
+    println("HONEST NOTE: R22A realizes R21D's amortization win.")
+    println("R21D reported 0.25x (4x slower) on a single isolated")
+    println("hog_compute call -- the build cost of the W*H*NUM_BINS")
+    println("integral planes dominated. R22A pays that cost ONCE per")
+    println("sliding-window scan and recovers each window's cell")
+    println("histograms in O(NUM_BINS*4) lookups. The realized speedup")
+    println("scales with the candidate window count.")
+}
+
+main()
+NOVA_EOF
+
 echo ""
-echo "=== R12A/R15A/R17C SIMD production bench: complete ==="
+echo "=== R22A: HOG detector integral-histogram bench (256x256, 32x32, stride 8) ==="
+$NOVA run "$BENCH_DET"
+
+echo ""
+echo "=== R12A/R15A/R17C/R22A SIMD/algorithmic production bench: complete ==="

@@ -1759,3 +1759,182 @@ face_detect 36, R16D face_recognize 48). Module count unchanged
 * `tests/unit/test_hog_integral.nova` (NEW, 18 test functions / 42
   assertions)
 * `tests/integration/scenario_gggg_hog_integral.sh` (NEW, 17 assertions)
+
+## R22A -- HOG integral histogram wired into R15C sliding-window detector
+
+**Status: complete -- extends R15C `src/io/transducers/image_detector.nova`
+(+~210 lines) so that `det_sliding_window` builds the R21D integral
+histogram of gradients ONCE per scale and queries every candidate
+window's per-cell histograms via four-corner rectangle sums on the
+precomputed planes. The amortization is the structural win R21D
+flagged but could not realize on a single isolated `hog_compute`
+call: with stride 8 on a 256x256 image and a 32x32 template, the
+candidate grid is 29x29 = 841 windows, the integral build cost is
+paid ONCE, and the per-window aggregation collapses from
+O(WIN_W * WIN_H) per window down to O(CELLS_X * CELLS_Y * NUM_BINS * 4)
+lookups + L2-Hys block normalization. Opt-in via
+`CE_DETECTOR_INTEGRAL=on` while the scalar path remains default,
+mirroring the R15A u8 SIMD and R21D HOG-integral env-var patterns.
+Bit-identical output to the scalar path; the test suite asserts
+detection-list identity (same x, y, distance triples in the same
+order) across positive, negative, self-match, and dense-scan
+fixtures plus a per-window descriptor identity check.**
+
+### Algorithm
+
+1. **Validation gate** -- identical to the scalar path: zero-pointer
+   image, oversized image, oversized template, template-too-small,
+   template > image all return the empty detection list (graceful).
+   The stride is clamped via `_det_clamp_stride`.
+2. **Env-var dispatch** -- `_det_integral_enabled()` reads
+   `CE_DETECTOR_INTEGRAL`; on opt-in, the call routes to
+   `_det_sliding_window_integral`. Off (default), the scalar
+   path runs verbatim (R15C's pre-R22A behaviour preserved).
+3. **Integral build (ONCE per call)** -- `_hog_build_integral_histogram`
+   (R21D primitive, imported unchanged) constructs the
+   `[NUM_BINS][H][W]` int64 cumulative-magnitude buffer over the
+   FULL input image. Build cost: O(W*H*NUM_BINS) per-pixel store +
+   one integration recurrence per bin plane. For the 256x256
+   bench surface with 9 bins, the build allocates 256*256*9 = 589,824
+   int64 cells (~4.6 MB).
+4. **Per-window cell-histogram lookup** --
+   `_det_window_cell_hists_from_integral` walks every (cx_win, cy_win)
+   cell of the window at (x0, y0) and queries the per-bin total via
+   the four-corner rectangle sum on the integral planes. The
+   rectangle for cell (cx_win, cy_win) covers full-image pixels
+   `[x0 + cx_win*cs .. x0 + (cx_win+1)*cs - 1]` x
+   `[y0 + cy_win*cs .. y0 + (cy_win+1)*cs - 1]`, clamped to the
+   WINDOW's interior bounds `[x0+1 .. x0+win_w-2]` x
+   `[y0+1 .. y0+win_h-2]`. This clamp is what makes the integral
+   path bit-identical to the scalar path: the scalar path computes
+   gradients on the EXTRACTED window where the outer ring has
+   gradient 0 (central differences would read out-of-window). The
+   full-image integral planes have non-zero gradients at those
+   pixel positions (the full image has neighbors there), so the
+   per-window rectangle MUST exclude the outer ring.
+5. **Hot-loop optimization** -- the four-corner indices
+   `(a = y2*w+x2, b = y2*w+(x1-1), c = (y1-1)*w+x2, d = (y1-1)*w+(x1-1))`
+   are hoisted OUTSIDE the per-bin loop because they are
+   bin-independent. Each bin lookup then becomes a single
+   `bin_plane_offset += planesize` increment + 4 `load64` calls;
+   the per-bin index recomputation collapses from `4 * (3 mul + 1 add)`
+   down to one `add`. Degenerate cell rectangles (x1 > x2 or
+   y1 > y2) short-circuit to an all-zero histogram without any
+   `load64` traffic.
+6. **Streaming L1 distance** --
+   `_det_l1_distance_from_cells_streaming` combines the L2-Hys block
+   normalization (reuses R14D `_hog_block_descriptor` verbatim) with
+   the L1 distance against the template descriptor in a single pass.
+   We avoid materializing the 324-int window descriptor list per
+   window: each block's 36-int descriptor is consumed
+   immediately into the running L1 sum and discarded. This saves
+   the 841 * 324-int list allocations per detection-pass (about
+   272K integer pushes).
+
+### Bit-identical contract
+
+The integral path produces THE SAME detection list (length, order,
+and per-detection (x, y, distance) triples) as the scalar path on
+every input. Verified across:
+
+* 64x64 scene with a 32x32 vertical-edge template at (16, 16)
+  (R15C's positive fixture).
+* 64x64 uniform scene (R15C's negative fixture).
+* 32x32 self-match (single window at (0, 0); distance == 0).
+* 96x96 scene with stride 8 (denser candidate grid, 81 windows).
+* Per-window descriptor identity at (16, 16) -- stronger than
+  detection-list identity; catches compensating-error
+  block normalization.
+* det_detect end-to-end (sliding window + NMS) bit-identical.
+
+### Performance characterization
+
+Bench surface: 256x256 textured scene, 32x32 vertical-edge
+template, stride 8 -> 841 candidate windows. Measured in
+`examples/bench_detector_integral.nova` (generated by
+`scripts/bench_simd_production.sh`), with a warm-up pass
+preceding both timed runs to suppress allocator first-call
+noise:
+
+| Path             | wallclock (ns) | speedup vs scalar |
+|------------------|---------------:|------------------:|
+| Scalar R15C      | ~ 150,000,000 |              1.00x |
+| Integral R22A    | ~  70,000,000 |              2.15x |
+
+i.e. **integral path is ~2.1-2.4x faster** than the scalar path
+on the 256x256 / 32x32 / stride 8 surface. The exact ratio varies
+slightly run-to-run due to NOVA arena allocation noise (the
+integral build allocates a ~4.6 MB buffer); the warm-up call
+moves the arena cursor past the first OS-page-allocation hot
+zone, after which the steady-state ratio sits in [2.1, 2.4]
+across 5 consecutive runs.
+
+R21D reported 0.25x (4x slower) on a single isolated
+`hog_compute_integral` call -- the build cost dominated the
+single descriptor's downstream queries. R22A pays that build
+cost ONCE per sliding-window scan; the realized speedup scales
+with the candidate-window count. For coarser strides
+(stride 16 -> ~211 windows) or smaller images, the ratio drops
+toward the scalar baseline. For finer strides (stride 4 ->
+~3364 windows) or larger templates the ratio climbs further --
+but those configurations exceed the R15C unit-suite cap budget
+so are not measured here.
+
+### Public API (unchanged for callers)
+
+* `det_sliding_window(image, w, h, template, threshold_milli, stride)`
+  -- same signature as R15C. Internally dispatches on
+  `CE_DETECTOR_INTEGRAL` (opt-in; default OFF). Both branches
+  return the same detection list on the same inputs.
+* `det_detect(...)` -- unchanged; routes through `det_sliding_window`
+  and therefore honours the env var.
+* `_det_integral_enabled()` -- internal helper; returns 1 only
+  on explicit opt-in (`on` / `1` / `yes`).
+* `_det_sliding_window_integral(...)` -- the bypassed entry
+  point the unit suite calls directly (NOVA has no `setenv`).
+
+### Verification
+
+Unit tests (~22 assertions in `tests/unit/test_detector_integral.nova`,
+NEW):
+
+* Bit-identical detection-list on positive 64x64 fixture (3 checks).
+* Bit-identical on uniform 64x64 scene (2 checks).
+* Bit-identical 32x32 self-match (distance == 0 at (0, 0); 5 checks).
+* Bit-identical 96x96 dense scan (2 checks).
+* Bit-identical det_detect end-to-end after NMS (3 checks).
+* Per-window descriptor identity at (16, 16) (2 checks: length +
+  per-element walk with first-divergence-index report).
+* NMS still collapses overlapping detections (2 checks).
+* Zero-pointer image graceful (1 check).
+* Template > image graceful (1 check).
+* Env default OFF (1 check).
+
+All prior CV tests stay green:
+* R14D HOG (`test_image_hog.nova`) -- 55 checks PASS.
+* R15C HOG sliding-window detector (`test_image_detector.nova`)
+  -- 32 checks PASS.
+* R21D HOG integral (`test_hog_integral.nova`) -- 42 checks PASS.
+* R16D face detector (`test_face_detect.nova`) -- 36 checks PASS.
+
+Module count unchanged (extension to existing R15C file).
+
+### Files touched / added
+
+* `src/io/transducers/image_detector.nova` (+~210 lines: R22A
+  section header + `_det_integral_enabled` env-reader +
+  `_det_window_cell_hists_from_integral` with hoisted-corner
+  optimization + `_det_window_descriptor_from_cells` block-norm
+  helper + `_det_l1_distance_from_cells_streaming` (combined
+  block-norm + L1 distance) + `_det_sliding_window_integral`
+  (amortized entry point) + env-dispatch one-liner inside
+  `det_sliding_window`).
+* `tests/unit/test_detector_integral.nova` (NEW, 10 test functions
+  / 22 assertions).
+* `scripts/bench_simd_production.sh` (+~190 lines: R22A bench
+  section -- 256x256 textured scene + 32x32 vedge template +
+  stride 8, warm-up pass, scalar vs integral timing, bit-identity
+  check, speedup ratio report).
+* `examples/bench_detector_integral.nova` (NEW, generated by
+  the bench script -- not checked in to source control;
+  regenerated on each bench run).

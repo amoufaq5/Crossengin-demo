@@ -1,0 +1,366 @@
+// Unit tests for the R22A integral-histogram wire-in of R15C's
+// HOG sliding-window detector (src/io/transducers/image_detector.nova).
+//
+// R21D's integral histogram primitive lives in image_hog.nova; R22A
+// wires it into det_sliding_window so that the per-image integral
+// build cost is paid ONCE (rather than once per overlapping window)
+// and each candidate window position recovers its per-cell histograms
+// in O(NUM_BINS * 4) lookups per cell. The amortization is the
+// structural win R21D flagged but could not realize on a single
+// isolated hog_compute call.
+//
+// BIT-IDENTICAL CONTRACT: the integral path
+// (_det_sliding_window_integral) returns the SAME detection list
+// (same x, y, distance values, same length, same order) as the
+// scalar path (det_sliding_window when CE_DETECTOR_INTEGRAL is off).
+// Verified across:
+//   * 64x64 scene with a 32x32 template at offset (16, 16) +
+//     stride 8 (mirrors test_image_detector's positive fixture).
+//   * 64x64 uniform scene (mirrors the negative fixture).
+//   * 32x32 self-match (single window at (0, 0); distance == 0).
+//   * 96x96 scene with stride 8 (denser window grid: 9x9 = 81
+//     windows; exercises the amortization win at a small scale
+//     keeping the unit suite hermetic).
+//   * Per-window descriptor identity at a single candidate
+//     position (stronger than detection-list identity; catches
+//     compensating-error block normalization).
+//   * NMS still works correctly with detections from the integral
+//     path.
+//   * det_detect wrapper bit-identical after NMS.
+//
+// NOVA has no `setenv`, so the test invokes the integral entry
+// point (`_det_sliding_window_integral`) DIRECTLY rather than
+// toggling the env var. The env-dispatch in `det_sliding_window`
+// is a thin one-liner over the same function; exercising the
+// internal entry point is the stronger check (it does not depend
+// on the env-reader). Mirrors test_hog_integral.nova's pattern.
+//
+// Coverage: 9 test functions / ~17 assertions. The bench surface
+// (256x256, 841 windows) is exercised via the extension to
+// scripts/bench_simd_production.sh -- the unit suite stays at
+// 64x64 / 96x96 to keep wallclock under a second.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_detector.nova"
+
+// ---- fixture builders (mirror test_image_detector.nova so the
+// ---- bit-identical check covers the SAME content shapes) ----------------
+
+fn _flat_image(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+fn _scene_with_vertical_edge_at(width, height, bg, ox, oy, tw, th, low, high) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, bg)
+        i = i + 1
+    }
+    let half = tw / 2
+    let y = 0
+    while y < th {
+        let row = (oy + y) * width
+        let x = 0
+        while x < tw {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row + (ox + x), v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+fn _vertical_edge_template(low, high) {
+    let area = 32 * 32
+    let buf = alloc(area + 1)
+    let half = 16
+    let y = 0
+    while y < 32 {
+        let row = y * 32
+        let x = 0
+        while x < 32 {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- compare two detection lists for bit-identical match ---------------
+//
+// Returns 1 iff lengths agree AND every (x, y, distance) triple is
+// equal at the SAME index. The detection lists are produced by the
+// same y-major then x-major scan, so the natural order is
+// deterministic across paths -- no sort needed.
+
+fn _dets_eq(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    if na != nb { return 0 }
+    let i = 0
+    while i < na {
+        let da = a[i]
+        let db = b[i]
+        if det_result_x(da) != det_result_x(db) { return 0 }
+        if det_result_y(da) != det_result_y(db) { return 0 }
+        if det_result_distance(da) != det_result_distance(db) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- bit-identical: positive fixture (64x64 + 32x32 template at (16,16)) -
+
+fn test_integral_matches_scalar_positive_fixture() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _scene_with_vertical_edge_at(64, 64, 128, 16, 16, 32, 32, 0, 255)
+    let scalar_dets = det_sliding_window(scene, 64, 64, tpl, 4000, 8)
+    let integral_dets = _det_sliding_window_integral(scene, 64, 64, tpl, 4000, 8)
+    ce_eq("integral path detection-list length matches scalar (positive)",
+          len(integral_dets), len(scalar_dets))
+    ce_check("integral path detection list bit-identical to scalar (positive)",
+             _dets_eq(integral_dets, scalar_dets) == 1)
+    // Sanity: the positive fixture should produce at least 1 detection
+    // on BOTH paths (the fixture is calibrated for the 4000-milli
+    // threshold against the (16,16) vertical-edge target).
+    ce_check("integral path finds >= 1 detection on positive fixture",
+             len(integral_dets) >= 1)
+}
+
+// ---- bit-identical: negative fixture (uniform scene) -------------------
+
+fn test_integral_matches_scalar_uniform_scene() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _flat_image(64, 64, 128)
+    let scalar_dets = det_sliding_window(scene, 64, 64, tpl, 2000, 8)
+    let integral_dets = _det_sliding_window_integral(scene, 64, 64, tpl, 2000, 8)
+    ce_eq("integral path on uniform scene -> 0 detections (matches scalar)",
+          len(integral_dets), len(scalar_dets))
+    ce_eq("integral path on uniform scene -> 0 detections (absolute)",
+          len(integral_dets), 0)
+}
+
+// ---- bit-identical: self-match (template-sized scene == template) -----
+
+fn test_integral_self_match_zero_distance() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scalar_dets = det_sliding_window(tpl_img, 32, 32, tpl, 4000, 8)
+    let integral_dets = _det_sliding_window_integral(tpl_img, 32, 32, tpl, 4000, 8)
+    ce_eq("integral self-match -> 1 detection (matches scalar)",
+          len(integral_dets), len(scalar_dets))
+    ce_eq("integral self-match -> 1 detection (absolute)",
+          len(integral_dets), 1)
+    if len(integral_dets) > 0 {
+        let d = integral_dets[0]
+        ce_eq("integral self-match x == 0", det_result_x(d), 0)
+        ce_eq("integral self-match y == 0", det_result_y(d), 0)
+        ce_eq("integral self-match distance == 0 (bit-identical descriptor)",
+              det_result_distance(d), 0)
+    }
+}
+
+// ---- bit-identical: denser 96x96 scan ----------------------------------
+
+fn test_integral_matches_scalar_dense_96x96() {
+    // 96x96 scene with the vertical edge template at offset (32, 32).
+    // At stride 8 the candidate grid is (96 - 32) / 8 + 1 = 9 across
+    // and 9 down -> 81 windows. This exercises the amortization
+    // surface at a unit-suite-friendly scale while preserving the
+    // bit-identical-detection-list contract.
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _scene_with_vertical_edge_at(96, 96, 128, 32, 32, 32, 32, 0, 255)
+    let scalar_dets = det_sliding_window(scene, 96, 96, tpl, 4000, 8)
+    let integral_dets = _det_sliding_window_integral(scene, 96, 96, tpl, 4000, 8)
+    ce_eq("integral path 96x96 detection-list length matches scalar",
+          len(integral_dets), len(scalar_dets))
+    ce_check("integral path 96x96 detection list bit-identical to scalar",
+             _dets_eq(integral_dets, scalar_dets) == 1)
+}
+
+// ---- bit-identical: det_detect end-to-end (with NMS) ------------------
+//
+// det_detect routes through det_sliding_window which honours the
+// env var. We exercise the end-to-end shape (sliding window -> NMS)
+// by calling the integral entry point manually, then feeding its
+// detection list into the SAME NMS helper det_detect would have
+// used. The NMS step is path-independent (purely geometric on the
+// detection-tuple shape), so this is a check that the integral
+// path's detections pass cleanly through the downstream pipeline.
+
+fn test_integral_det_detect_end_to_end_matches_scalar() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _scene_with_vertical_edge_at(64, 64, 128, 16, 16, 32, 32, 0, 255)
+    let scalar_raw = det_sliding_window(scene, 64, 64, tpl, 4000, 8)
+    let integral_raw = _det_sliding_window_integral(scene, 64, 64, tpl, 4000, 8)
+    // Pass both through NMS via det_nms (32x32 box, 300-milli IoU).
+    let scalar_final = det_nms(scalar_raw, 32, 300)
+    let integral_final = det_nms(integral_raw, 32, 300)
+    ce_eq("integral det_detect end-to-end length matches scalar",
+          len(integral_final), len(scalar_final))
+    ce_check("integral det_detect end-to-end bit-identical to scalar (after NMS)",
+             _dets_eq(integral_final, scalar_final) == 1)
+    // The end-to-end positive fixture should produce >= 1 detection.
+    ce_check("integral det_detect end-to-end finds >= 1 detection",
+             len(integral_final) >= 1)
+}
+
+// ---- per-window descriptor identity (single candidate position) -------
+//
+// Stronger than detection-list identity: assert that the descriptor
+// the integral path computes for a SPECIFIC candidate window is
+// bit-identical to the scalar path's hog_compute_default on the
+// extracted sub-image. Catches compensating-error block
+// normalization (a defect where two cell histograms differ but the
+// L2-Hys norm rotates them to the same final values).
+
+fn test_integral_per_window_descriptor_identical() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let scene = _scene_with_vertical_edge_at(64, 64, 128, 16, 16, 32, 32, 0, 255)
+    // Pick the (16, 16) candidate window -- the positive-fixture target.
+    let x0 = 16
+    let y0 = 16
+    // Scalar window descriptor: extract sub-image and run hog_compute.
+    let win_buf = _det_extract_window(scene, 64, 64, x0, y0, 32, 32)
+    let scalar_r = hog_compute_default(win_buf, 32, 32)
+    let scalar_desc = hog_descriptor(scalar_r)
+    // Integral window descriptor: build the integral on the full
+    // image, query the (16, 16) window's cell rectangles, run L2-Hys
+    // on the resulting cell histograms.
+    let ih_pass = _hog_build_integral_histogram(scene, 64, 64, 9)
+    let ih = ih_pass[0]
+    let cell_hists = _det_window_cell_hists_from_integral(
+                       ih, 64, 64, x0, y0, 32, 32,
+                       4, 4, 8, 9)
+    let integral_desc = _det_window_descriptor_from_cells(
+                          cell_hists, 4, 4, 9)
+    // Bit-identical descriptor lengths.
+    ce_eq("per-window descriptor length identical",
+          len(integral_desc), len(scalar_desc))
+    // Walk every element; pass one consolidated check.
+    let n = len(scalar_desc)
+    let k = 0
+    let first_diff = 0 - 1
+    while k < n {
+        if scalar_desc[k] != integral_desc[k] {
+            if first_diff < 0 { first_diff = k }
+        }
+        k = k + 1
+    }
+    if first_diff < 0 {
+        ce_check("per-window descriptor bit-identical across all "
+                 + int_to_str(n) + " bytes", 1)
+    } else {
+        ce_check("per-window descriptor first divergence at "
+                 + int_to_str(first_diff)
+                 + " scalar=" + int_to_str(scalar_desc[first_diff])
+                 + " integral=" + int_to_str(integral_desc[first_diff]),
+                 0)
+    }
+}
+
+// ---- NMS still works with integral-path detections --------------------
+
+fn test_integral_nms_on_overlapping_detections() {
+    // Synthesize 3 overlapping detections at nearly the same location
+    // (mirrors test_image_detector's NMS test) and run det_nms on them.
+    // NMS is purely geometric -- it does not care which path produced
+    // the detections -- so this is a regression check that the integral
+    // path's detection-tuple shape ([x, y, distance]) is preserved.
+    let dets = list_new()
+    let d0 = list_new()
+    push(d0, 10) push(d0, 10) push(d0, 8000)
+    push(dets, d0)
+    let d1 = list_new()
+    push(d1, 12) push(d1, 12) push(d1, 5000)
+    push(dets, d1)
+    let d2 = list_new()
+    push(d2, 14) push(d2, 14) push(d2, 11000)
+    push(dets, d2)
+    let kept = det_nms(dets, 32, 300)
+    ce_eq("NMS still collapses 3 overlapping detections to 1",
+          len(kept), 1)
+    if len(kept) > 0 {
+        let surv = kept[0]
+        ce_eq("NMS survivor distance == 5000 (lowest)",
+              det_result_distance(surv), 5000)
+    }
+}
+
+// ---- edge case: zero-pointer image returns empty on integral path -----
+
+fn test_integral_zero_pointer_image_returns_empty() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    // Skip _det_sliding_window_integral directly (it assumes
+    // non-null image; the env-dispatched wrapper does the validation).
+    // Exercise via the public entry point with the env unset (scalar
+    // path validation triggers regardless -- the integral path is
+    // only reached after validation passes).
+    let dets = det_sliding_window(0, 64, 64, tpl, 4000, 8)
+    ce_eq("dispatch on zero-pointer image -> 0 detections (graceful)",
+          len(dets), 0)
+}
+
+// ---- edge case: template larger than image returns empty ---------------
+
+fn test_integral_template_larger_than_image_returns_empty() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let small_scene = _flat_image(16, 16, 200)
+    let dets = det_sliding_window(small_scene, 16, 16, tpl, 4000, 8)
+    ce_eq("dispatch template > image -> 0 detections (graceful)",
+          len(dets), 0)
+}
+
+// ---- env-dispatch presence ---------------------------------------------
+//
+// _det_integral_enabled() should return 0 when CE_DETECTOR_INTEGRAL
+// is unset (the default). The full setenv-based dispatch path is
+// exercised in the integration scenario where the test runner can
+// set the env var; the unit suite asserts only the default-OFF
+// fallback (NOVA has no setenv primitive in user-space).
+
+fn test_integral_env_default_off() {
+    ce_eq("CE_DETECTOR_INTEGRAL default OFF -> dispatch falls back to scalar",
+          _det_integral_enabled(), 0)
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    test_integral_matches_scalar_positive_fixture()
+    test_integral_matches_scalar_uniform_scene()
+    test_integral_self_match_zero_distance()
+    test_integral_matches_scalar_dense_96x96()
+    test_integral_det_detect_end_to_end_matches_scalar()
+    test_integral_per_window_descriptor_identical()
+    test_integral_nms_on_overlapping_detections()
+    test_integral_zero_pointer_image_returns_empty()
+    test_integral_template_larger_than_image_returns_empty()
+    test_integral_env_default_off()
+    ce_summary("detector_integral")
+}
+
+main()

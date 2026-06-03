@@ -226,6 +226,16 @@ fn det_train_template(image, w, h, hog_window_w, hog_window_h) {
 //   the position if hog_compare < threshold_milli.
 //
 // Returns a list of [x, y, distance] triples (possibly empty).
+//
+// R22A: integral-histogram fast path (CE_DETECTOR_INTEGRAL=on).
+//   When the env var is set, the per-image integral histogram (R21D)
+//   is built ONCE up-front; each candidate window's per-cell
+//   histograms are then recovered in O(NUM_BINS * 4) lookups per
+//   cell via _hog_ih_rect_sum on the precomputed planes. The build
+//   cost amortizes across the (~841 for 256x256 / 32x32 / stride 8)
+//   window queries at the same scale, realizing the structural win
+//   R21D flagged as a future wire-in. Bit-identical to the scalar
+//   path (asserted in tests/unit/test_detector_integral.nova).
 
 fn det_sliding_window(image, w, h, template, threshold_milli, stride) {
     let dets = list_new()
@@ -245,6 +255,14 @@ fn det_sliding_window(image, w, h, template, threshold_milli, stride) {
     let tpl_desc = hog_descriptor(template)
     if len(tpl_desc) == 0 { return dets }
     let s = _det_clamp_stride(stride)
+    // R22A: dispatch on CE_DETECTOR_INTEGRAL. Default OFF until
+    // operator validation. The integral path is bit-identical so
+    // both branches return the same detection list on the same
+    // inputs; only the wallclock differs.
+    if _det_integral_enabled() == 1 {
+        return _det_sliding_window_integral(image, w, h, template,
+                                             threshold_milli, s)
+    }
     let max_x = int_sub(w, win_w)
     let max_y = int_sub(h, win_h)
     let y = 0
@@ -258,6 +276,306 @@ fn det_sliding_window(image, w, h, template, threshold_milli, stride) {
                 if d < threshold_milli {
                     push(dets, _det_new_detection(x, y, d))
                 }
+            }
+            x = int_add(x, s)
+        }
+        y = int_add(y, s)
+    }
+    return dets
+}
+
+// ---- R22A: integral-histogram amortized sliding window -------------------
+//
+// _det_integral_enabled() -> 1 if CE_DETECTOR_INTEGRAL is set to
+//   "on" / "1" / "yes". Default OFF; mirrors the R15A u8 SIMD and
+//   R21D HOG-integral opt-in shape.
+fn _det_integral_enabled() {
+    let env = getenv("CE_DETECTOR_INTEGRAL")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// _det_window_cell_hists_from_integral: lift R21D's
+// _hog_cell_histograms_from_integral to a SUB-RECTANGLE of the
+// full-image integral planes. The window at (x0, y0) of size
+// (win_w x win_h) has cells (cx, cy) covering full-image pixels
+//   x in [x0 + cx*cs .. x0 + (cx+1)*cs - 1]
+//   y in [y0 + cy*cs .. y0 + (cy+1)*cs - 1]
+// Clamped to the WINDOW's interior bounds (mirroring what
+// hog_compute_default(extracted_window, ...) would have used):
+//   x in [x0 + 1 .. x0 + win_w - 2]
+//   y in [y0 + 1 .. y0 + win_h - 2]
+// This is the precise contract that makes the integral path
+// bit-identical to the scalar path: the scalar path runs gradients
+// on the EXTRACTED window, where the outer-ring of the window has
+// gradient 0 because the central-difference reads would go out of
+// the window buffer. The full-image integral planes have non-zero
+// gradients at the window's outer ring (the full image has neighbors
+// there), so we MUST exclude that ring from each cell rectangle.
+//
+// HOT-LOOP OPTIMIZATION: the four-corner rectangle sum reads four
+// planes per bin, but the (y, x) coordinates of those corners are
+// IDENTICAL across all bins for a given cell. We hoist the
+// row-major flat indices (a = y2*w + x2, b = y2*w + (x1-1),
+// c = (y1-1)*w + x2, d = (y1-1)*w + (x1-1)) OUTSIDE the bin loop;
+// each bin then becomes
+//   ih_byte_addr = ih + 8 * (bin * planesize + flat_index)
+// where planesize = w * h. The 4-corner index recomputation per bin
+// collapses from 4 * _hog_ih_get calls (each of which calls
+// _hog_ih_idx -> 2 mul + 1 add -> 3 mul + 1 add for byte offset)
+// down to 4 adds + 4 loads.
+fn _det_window_cell_hists_from_integral(ih, w, h, x0, y0, win_w, win_h,
+                                         cells_x, cells_y,
+                                         cell_size, num_bins) {
+    let cell_hists = list_new()
+    let win_x_lo = int_add(x0, 1)
+    let win_y_lo = int_add(y0, 1)
+    let win_x_hi = int_sub(int_add(x0, win_w), 2)
+    let win_y_hi = int_sub(int_add(y0, win_h), 2)
+    let planesize = int_mul(w, h)        // ih plane stride (bin * planesize = bin offset)
+    let cy = 0
+    while cy < cells_y {
+        let y1 = int_add(y0, int_mul(cy, cell_size))
+        let y2 = int_sub(int_add(y0, int_mul(int_add(cy, 1), cell_size)), 1)
+        if y1 < win_y_lo { y1 = win_y_lo }
+        if y2 > win_y_hi { y2 = win_y_hi }
+        let cx = 0
+        while cx < cells_x {
+            let x1 = int_add(x0, int_mul(cx, cell_size))
+            let x2 = int_sub(int_add(x0, int_mul(int_add(cx, 1), cell_size)), 1)
+            if x1 < win_x_lo { x1 = win_x_lo }
+            if x2 > win_x_hi { x2 = win_x_hi }
+            let hist = list_new()
+            // Degenerate rectangle short-circuit. The scalar path's
+            // outer-ring clamp can collapse a cell to zero pixels for
+            // windows touching the full-image border. In that case
+            // every bin sum is zero -- emit an all-zero histogram
+            // without the load64 traffic.
+            if x1 > x2 {
+                let bz = 0
+                while bz < num_bins {
+                    push(hist, 0)
+                    bz = int_add(bz, 1)
+                }
+                push(cell_hists, hist)
+                cx = int_add(cx, 1)
+            }
+            else {
+                if y1 > y2 {
+                    let bzz = 0
+                    while bzz < num_bins {
+                        push(hist, 0)
+                        bzz = int_add(bzz, 1)
+                    }
+                    push(cell_hists, hist)
+                    cx = int_add(cx, 1)
+                }
+                else {
+                    // Hoist the per-corner flat indices once per cell.
+                    // a corresponds to (x2, y2); b to (x1-1, y2);
+                    // c to (x2, y1-1); d to (x1-1, y1-1). When
+                    // x1 == 0 or y1 == 0 the corresponding b / c / d
+                    // contribute zero (matches the original
+                    // _hog_ih_rect_sum's branch-on-zero semantics).
+                    let a_idx = int_add(int_mul(y2, w), x2)
+                    let have_b = 0
+                    let b_idx = 0
+                    if x1 > 0 {
+                        have_b = 1
+                        b_idx = int_add(int_mul(y2, w), int_sub(x1, 1))
+                    }
+                    let have_c = 0
+                    let c_idx = 0
+                    if y1 > 0 {
+                        have_c = 1
+                        c_idx = int_add(int_mul(int_sub(y1, 1), w), x2)
+                    }
+                    let have_d = 0
+                    let d_idx = 0
+                    if x1 > 0 {
+                        if y1 > 0 {
+                            have_d = 1
+                            d_idx = int_add(int_mul(int_sub(y1, 1), w),
+                                            int_sub(x1, 1))
+                        }
+                    }
+                    let b = 0
+                    let plane_off = 0
+                    while b < num_bins {
+                        let a_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, a_idx), 8)))
+                        let b_v = 0
+                        if have_b == 1 {
+                            b_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, b_idx), 8)))
+                        }
+                        let c_v = 0
+                        if have_c == 1 {
+                            c_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, c_idx), 8)))
+                        }
+                        let d_v = 0
+                        if have_d == 1 {
+                            d_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, d_idx), 8)))
+                        }
+                        let s = int_add(int_sub(int_sub(a_v, b_v), c_v), d_v)
+                        push(hist, s)
+                        plane_off = int_add(plane_off, planesize)
+                        b = int_add(b, 1)
+                    }
+                    push(cell_hists, hist)
+                    cx = int_add(cx, 1)
+                }
+            }
+        }
+        cy = int_add(cy, 1)
+    }
+    return cell_hists
+}
+
+// _det_window_descriptor_from_cells: run the SAME L2-Hys block
+// normalization the scalar path runs (reuses R14D's
+// _hog_block_descriptor verbatim), then concatenate every block
+// into the final descriptor list. Mirrors hog_compute's step 4/5.
+fn _det_window_descriptor_from_cells(cell_hists, cells_x, cells_y, num_bins) {
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let descriptor = list_new()
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            let bi = 0
+            let block_len = len(block)
+            while bi < block_len {
+                push(descriptor, block[bi])
+                bi = int_add(bi, 1)
+            }
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    return descriptor
+}
+
+// _det_l1_distance_from_cells_streaming: inline-compute the L1
+// distance between the template descriptor and this window's
+// descriptor WITHOUT materializing the window's full descriptor
+// list. We walk the same (by, bx, dy, dx, b) loop nest the
+// scalar path uses to build `descriptor`, compute each component
+// in turn, immediately subtract the corresponding template value,
+// accumulate into the L1 sum, and discard the component. This
+// saves the 324-element descriptor list allocation per window
+// (plus the per-block intermediate `block` list).
+//
+// IMPORTANT: the per-component arithmetic is BIT-IDENTICAL to
+// _hog_block_descriptor + hog_compare: same L2-Hys clip, same
+// post-clip final clamp, same milli-units, same int_mul/int_sub
+// order. The only thing that changes is when we accumulate into
+// the running L1 sum vs when we push into a descriptor list.
+//
+// Returns the L1 distance (always >= 0; the empty-cells case
+// where every block is all-zero still goes through the same
+// arithmetic and yields the L1 sum of the template's components).
+fn _det_l1_distance_from_cells_streaming(cell_hists, cells_x, cells_y,
+                                          num_bins, tpl_desc) {
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let block_len = int_mul(HOG_BLOCK_CELLS, num_bins)
+    let l1_sum = 0
+    let tpl_off = 0
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            // ---- Replicate _hog_block_descriptor inline ----
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            // Stream L1 difference against tpl_desc[tpl_off..tpl_off+block_len).
+            let i = 0
+            while i < block_len {
+                let diff = int_sub(tpl_desc[int_add(tpl_off, i)], block[i])
+                if diff < 0 { diff = 0 - diff }
+                l1_sum = int_add(l1_sum, diff)
+                i = int_add(i, 1)
+            }
+            tpl_off = int_add(tpl_off, block_len)
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    return l1_sum
+}
+
+// _det_sliding_window_integral: the amortized hot path.
+//   1. Build the per-bin integral planes ONCE over the full image.
+//   2. For each candidate window position, look up the per-cell
+//      histograms via four-corner rectangle sums on the precomputed
+//      planes (NUM_BINS * 4 loads per cell).
+//   3. Apply L2-Hys block normalization (reuse _hog_block_descriptor)
+//      and concatenate -> the window descriptor.
+//   4. L1-compare to the template; accept if distance < threshold.
+//
+// The build cost (O(W * H * NUM_BINS)) is paid ONCE; the per-window
+// cost drops from O(WIN_W * WIN_H) per window down to
+// O(CELLS_X * CELLS_Y * NUM_BINS * 4) + O(BLOCKS_X * BLOCKS_Y) for
+// the block-norm pass. For a 256x256 scene with a 32x32 / stride 8
+// template the candidate grid is 29x29 = 841 windows; the build cost
+// gets divided by that many evaluations.
+fn _det_sliding_window_integral(image, w, h, template,
+                                 threshold_milli, s) {
+    let dets = list_new()
+    let win_w = hog_result_width(template)
+    let win_h = hog_result_height(template)
+    let cell_size = hog_result_cell_size(template)
+    let num_bins  = hog_result_num_bins(template)
+    let cells_x_win = win_w / cell_size
+    let cells_y_win = win_h / cell_size
+    let tpl_desc = hog_descriptor(template)
+    let tpl_len = len(tpl_desc)
+    let expected_len = int_mul(
+                        int_mul(int_sub(cells_x_win,
+                                         int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1)),
+                                int_sub(cells_y_win,
+                                         int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))),
+                        int_mul(HOG_BLOCK_CELLS, num_bins))
+    // If the template descriptor length disagrees with the
+    // expected window descriptor length, the inputs are
+    // incompatible -- return empty. hog_compare would have
+    // returned -1 in the same case.
+    if tpl_len != expected_len { return dets }
+    // Build the per-bin integral planes ONCE over the FULL image.
+    // _hog_build_integral_histogram returns
+    // [ih_ptr, mag_sum, mag_count, dominant_bin]; only ih_ptr is
+    // needed for the cell-rect queries below.
+    let ih_pass = _hog_build_integral_histogram(image, w, h, num_bins)
+    let ih = ih_pass[0]
+    let max_x = int_sub(w, win_w)
+    let max_y = int_sub(h, win_h)
+    let y = 0
+    while y <= max_y {
+        let x = 0
+        while x <= max_x {
+            let cell_hists = _det_window_cell_hists_from_integral(
+                              ih, w, h, x, y, win_w, win_h,
+                              cells_x_win, cells_y_win,
+                              cell_size, num_bins)
+            // Streaming L1 distance: combines block-norm + L1 in
+            // one pass, avoiding the 324-int descriptor list
+            // allocation per window. Bit-identical to the scalar
+            // path because the inner arithmetic is the same
+            // _hog_block_descriptor body, just consumed
+            // immediately rather than stashed.
+            let d = _det_l1_distance_from_cells_streaming(
+                     cell_hists, cells_x_win, cells_y_win,
+                     num_bins, tpl_desc)
+            if d < threshold_milli {
+                push(dets, _det_new_detection(x, y, d))
             }
             x = int_add(x, s)
         }

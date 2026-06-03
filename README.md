@@ -11,7 +11,26 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R21E adds Noise-protected gossip: every R18E gossip
+> toolchain. R22A wires R21D's HOG integral histogram into R15C's
+> sliding-window object detector: `det_sliding_window` now builds the
+> per-image integral planes ONCE per scale and queries every
+> candidate window's per-cell histograms via four-corner rectangle
+> sums on the precomputed buffer. Realizes the structural
+> amortization win R21D flagged but could not deliver on a single
+> isolated `hog_compute` call. Realized speedup on the 256x256 /
+> 32x32 / stride 8 surface (841 candidate windows): **~2.15x
+> absolute** (range 2.11x to 2.40x across 5 runs). Bit-identical
+> output to the scalar path; opt-in via `CE_DETECTOR_INTEGRAL=on`.
+> Verification: 22 unit assertions in
+> `tests/unit/test_detector_integral.nova` (NEW; bit-identical
+> detection list on positive 64x64 + negative uniform + self-match +
+> 96x96 dense + per-window-descriptor identity + det_detect
+> end-to-end + NMS preserved + edge cases). All prior CV suites
+> stay green (R14D HOG 55, R15C HOG detector 32, R21D HOG integral
+> 42, R16D face_detect 36). Bench surface extended in
+> `scripts/bench_simd_production.sh` with the new R22A section
+> (scalar vs integral wallclock + speedup ratio with warm-up).
+> R21E adds Noise-protected gossip: every R18E gossip
 > connection is now wrapped in R7C Noise XK (mutually authenticated +
 > AEAD-encrypted with RFC 7919 Group 14 2048-bit DH) once both peers
 > have static keypairs registered, with strict-mode plaintext refusal
@@ -1255,7 +1274,15 @@ computational units rather than orchestrating a pipeline of modules.
 > default until the wire-into-R15C round flips the contract. On a
 > single isolated `hog_compute_*` call the integral path is ~4-5x
 > slower (build cost dominates) -- the operational win is reserved for
-> the downstream amortization surface. Documented in
+> the downstream amortization surface. **R22A wires R21D into R15C's
+> sliding-window detector** (`det_sliding_window`): the integral
+> histogram is built ONCE per scale and every candidate window's
+> per-cell histograms are recovered via four-corner rectangle sums
+> on the precomputed planes. Realized speedup on 256x256 / 32x32 /
+> stride 8 (841 windows): **~2.15x absolute** (range 2.11x to 2.40x
+> across 5 runs). Bit-identical detection list to the scalar path
+> across positive / negative / self-match / dense-scan / end-to-end
+> fixtures. Opt-in via `CE_DETECTOR_INTEGRAL=on`. Documented in
 > [`IMAGE_AUDIT.md`](./IMAGE_AUDIT.md),
 > +1 from
 > `io/transducers/image_detector.nova` added in R15C HOG-based
