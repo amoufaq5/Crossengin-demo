@@ -11,7 +11,35 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R18C adds `src/io/transducers/audio_wakeword.nova` — a
+> toolchain. R18E adds `src/federation/gossip.nova` — a SWIM-style
+> (Das et al. 2002) gossip protocol on top of short-lived TCP probes
+> that closes R7C kg_sync v3's "N > 2 without a central hub" gap.
+> Each soul maintains `[addr, last_seen_ns, suspicion_count, status]`
+> per known peer; every PING_INTERVAL ms (default 1000) the soul
+> picks a random alive peer, dials TCP, sends `PING <seq>
+> <self_addr>`, awaits `ACK <seq>` within PING_TIMEOUT ms (default
+> 500). On 3 missed PINGs the peer is marked DEAD; ACK resets
+> suspicion. Each PING piggybacks 2-3 random `MEMBER <addr>
+> <status>` lines so the receiver learns about peers it has not
+> directly probed. Periodic `DELTA <self_addr> <last_synced_ns>`
+> requests stream every atom whose `updated_ns > since_ns` as ATOM
+> lines (kg_sync v2 wire format) to keep KGs converged. Listening fd
+> is `O_NONBLOCK` via fcntl; client fds get
+> `SO_RCVTIMEO/SO_SNDTIMEO = 500ms` via setsockopt -- without those
+> the 3-soul mesh deadlocks on tick 0 when every soul tries to ping
+> simultaneously. Membership merge respects the no-resurrect
+> invariant: gossip claims about ALIVE cannot override a local
+> suspicion > 0, so 3 missed PINGs always reach DEAD. Public API:
+> `gossip_init(self_addr, bootstrap_peers)`, `gossip_step(state,
+> kg)`, `gossip_peer_table(state)`, `gossip_alive_peers(state)` plus
+> the helper surface exercised by the unit tests. 34 unit
+> assertions in `tests/unit/test_gossip.nova` + 13 integration
+> assertions in `tests/integration/scenario_www_gossip.sh` (NEW;
+> precompiles 3 soul drivers, spawns the 3-process mesh, verifies
+> peer-table convergence within 8s, observes DEAD-marking within 2s
+> of killing a soul, confirms KG-delta propagation A → B / C). All
+> prior federation suites (R6C/R7C scenario_gg_noise_kg) remain
+> green. Module count: 169. R18C adds `src/io/transducers/audio_wakeword.nova` — a
 > wake-word matched filter built on R17B's MFCC + R7F's VAD via
 > Dynamic Time Warping ("Hey Nova", "Computer", etc.). DTW lattice
 > `D[i][j] = local(input[i], reference[j]) + min(D[i-1][j],

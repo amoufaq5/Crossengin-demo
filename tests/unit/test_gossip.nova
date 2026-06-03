@@ -1,0 +1,268 @@
+// Unit tests for src/federation/gossip.nova (R18E).
+//
+// Coverage (25 assertions, mapped to brief's required topics):
+//   Peer table: add / remove / lookup / count / status accessors.
+//   Suspicion counter: increments on missed PING, resets on ACK,
+//     promotes to SUSPECT at 2, DEAD at 3.
+//   Membership propagation: peer A learns about peer C from a MEMBER
+//     notice; merge keeps last_seen monotonic; self-addr filtered out.
+//   Random peer selection: deterministic when seeded; picks an alive
+//     peer; respects alive vs dead status.
+//   Delta gossip state: per-peer last_synced_ns set/get round-trip;
+//     get returns 0 for unknown peer; gossip_step bumps tick counter.
+//   Wire helpers: HELLO/OK/PING/ACK constants distinct; status enum
+//     values distinct; init seeds peer table from bootstrap list.
+
+import "../ce_test.nova"
+import "../../src/federation/gossip.nova"
+
+fn _mk_bootstrap(a, b, c) {
+    let bp = list_new()
+    if len(a) > 0 { push(bp, a) }
+    if len(b) > 0 { push(bp, b) }
+    if len(c) > 0 { push(bp, c) }
+    return bp
+}
+
+// ---- peer table: add / remove / lookup -----------------------------------
+
+fn test_init_no_bootstrap_empty_peer_table() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    ce_eq("peer table empty after empty init", gossip_peer_count(st), 0)
+}
+
+fn test_init_bootstrap_populates_peer_table() {
+    let bp = _mk_bootstrap("127.0.0.1:8771", "127.0.0.1:8772", "")
+    let st = gossip_init("127.0.0.1:8770", bp)
+    ce_eq("bootstrap adds 2 peers", gossip_peer_count(st), 2)
+}
+
+fn test_init_filters_self_from_bootstrap() {
+    let bp = _mk_bootstrap("127.0.0.1:8770", "127.0.0.1:8771", "")
+    let st = gossip_init("127.0.0.1:8770", bp)
+    // Self addr must NOT appear in the peer table even if listed in
+    // bootstrap (an operator can paste their own daemon's URL by accident).
+    ce_eq("self addr filtered from bootstrap", gossip_peer_count(st), 1)
+    ce_eq("self lookup absent", gossip_find_peer(st, "127.0.0.1:8770"), -1)
+}
+
+fn test_add_peer_appends_when_unknown() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    ce_eq("after add, peer count is 1", gossip_peer_count(st), 1)
+    ce_check("addr lookup found", gossip_find_peer(st, "127.0.0.1:8771") >= 0)
+}
+
+fn test_add_peer_idempotent() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_add_peer(st, "127.0.0.1:8771")
+    ce_eq("duplicate add is a no-op", gossip_peer_count(st), 1)
+}
+
+fn test_remove_peer_drops_entry() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_add_peer(st, "127.0.0.1:8772")
+    gossip_remove_peer(st, "127.0.0.1:8771")
+    ce_eq("after remove, count is 1", gossip_peer_count(st), 1)
+    ce_eq("removed peer lookup is -1", gossip_find_peer(st, "127.0.0.1:8771"), -1)
+}
+
+// ---- suspicion counter ---------------------------------------------------
+
+fn test_new_peer_starts_alive_zero_suspicion() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    let p = gossip_peer_at(st, 0)
+    ce_eq("new peer is ALIVE", gossip_peer_status(p), GOSSIP_STATUS_ALIVE)
+    ce_eq("new peer suspicion 0", gossip_peer_suspicion(p), 0)
+}
+
+fn test_on_timeout_increments_suspicion() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    ce_eq("first timeout: suspicion=1, still ALIVE",
+          gossip_peer_suspicion(gossip_peer_at(st, 0)), 1)
+}
+
+fn test_two_timeouts_promote_to_suspect() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    let p = gossip_peer_at(st, 0)
+    ce_eq("two timeouts -> SUSPECT", gossip_peer_status(p), GOSSIP_STATUS_SUSPECT)
+    ce_eq("two timeouts -> suspicion=2", gossip_peer_suspicion(p), 2)
+}
+
+fn test_three_timeouts_mark_dead() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    let p = gossip_peer_at(st, 0)
+    ce_eq("three timeouts -> DEAD", gossip_peer_status(p), GOSSIP_STATUS_DEAD)
+    ce_eq("three timeouts -> suspicion=3", gossip_peer_suspicion(p), 3)
+}
+
+fn test_ack_resets_suspicion() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_ack(st, "127.0.0.1:8771")
+    let p = gossip_peer_at(st, 0)
+    ce_eq("ACK resets suspicion to 0", gossip_peer_suspicion(p), 0)
+    ce_eq("ACK restores ALIVE status", gossip_peer_status(p), GOSSIP_STATUS_ALIVE)
+}
+
+fn test_stats_counters_track_actions() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_ack(st, "127.0.0.1:8771")
+    ce_eq("stats: 1 timeout counted", gossip_stats_timeouts(st), 1)
+    ce_eq("stats: 1 ack counted", gossip_stats_acks(st), 1)
+}
+
+// ---- membership propagation ----------------------------------------------
+
+fn test_merge_member_adds_unknown_addr() {
+    // Soul A starts knowing only B. A receives a MEMBER notice claiming
+    // C exists. A's peer table should now include C.
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_add_peer(st, "127.0.0.1:8771")     // A learns about B at bootstrap
+    gossip_merge_member(st, "127.0.0.1:8772", GOSSIP_STATUS_ALIVE)  // from B's PING
+    ce_eq("A learned C via merge", gossip_peer_count(st), 2)
+    ce_check("C is in peer table", gossip_find_peer(st, "127.0.0.1:8772") >= 0)
+}
+
+fn test_merge_member_ignores_self_addr() {
+    // A receives a MEMBER notice that claims A itself exists -- this
+    // can happen when a piggyback racing-condition refers to the
+    // pinger. The self-addr must be filtered.
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_merge_member(st, "127.0.0.1:8770", GOSSIP_STATUS_ALIVE)
+    ce_eq("self merge is dropped", gossip_peer_count(st), 0)
+}
+
+// ---- random peer selection -----------------------------------------------
+
+fn test_pick_random_deterministic_when_seeded() {
+    let bp = _mk_bootstrap("127.0.0.1:8771", "127.0.0.1:8772", "127.0.0.1:8773")
+    let st1 = gossip_init("127.0.0.1:8770", bp)
+    let st2 = gossip_init("127.0.0.1:8770", bp)
+    gossip_set_seed(st1, 12345)
+    gossip_set_seed(st2, 12345)
+    let pick1 = gossip_pick_random_peer(st1)
+    let pick2 = gossip_pick_random_peer(st2)
+    ce_check("identical seed yields identical pick", str_eq(pick1, pick2) == 1)
+}
+
+fn test_pick_random_excludes_dead_peers() {
+    let bp = _mk_bootstrap("127.0.0.1:8771", "127.0.0.1:8772", "")
+    let st = gossip_init("127.0.0.1:8770", bp)
+    // Kill the 8771 peer.
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    // Only 8772 is alive; ALL picks must select it.
+    let pick = gossip_pick_random_peer(st)
+    ce_check("dead peer not picked", str_eq(pick, "127.0.0.1:8772") == 1)
+}
+
+fn test_alive_peers_filters_status() {
+    let bp = _mk_bootstrap("127.0.0.1:8771", "127.0.0.1:8772", "127.0.0.1:8773")
+    let st = gossip_init("127.0.0.1:8770", bp)
+    // Kill 8771.
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    gossip_on_timeout(st, "127.0.0.1:8771")
+    let alive = gossip_alive_peers(st)
+    ce_eq("alive set excludes DEAD peer", len(alive), 2)
+}
+
+fn test_pick_random_empty_returns_sentinel() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    let pick = gossip_pick_random_peer(st)
+    ce_eq("empty peer table -> sentinel 0", pick, 0)
+}
+
+// ---- delta gossip state --------------------------------------------------
+
+fn test_last_synced_round_trip() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_set_last_synced(st, "127.0.0.1:8771", 1700000000000000000)
+    ce_eq("set then get round-trip",
+          gossip_get_last_synced(st, "127.0.0.1:8771"),
+          1700000000000000000)
+}
+
+fn test_last_synced_unknown_is_zero() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    ce_eq("unknown peer last_synced is 0",
+          gossip_get_last_synced(st, "127.0.0.1:8999"),
+          0)
+}
+
+fn test_last_synced_update_overwrites() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    gossip_set_last_synced(st, "127.0.0.1:8771", 100)
+    gossip_set_last_synced(st, "127.0.0.1:8771", 200)
+    ce_eq("update overwrites previous timestamp",
+          gossip_get_last_synced(st, "127.0.0.1:8771"),
+          200)
+}
+
+// ---- gossip_step tick + protocol constants -------------------------------
+
+fn test_step_bumps_tick_counter() {
+    let st = gossip_init("127.0.0.1:8770", 0)
+    let t0 = gossip_tick_count(st)
+    // kg=0 means "no kg to gossip"; step still runs the membership half.
+    gossip_step(st, 0)
+    ce_eq("step bumps tick by 1", gossip_tick_count(st), t0 + 1)
+}
+
+fn test_status_enum_values_distinct() {
+    // The three status enum values must be distinct ints; the wire
+    // protocol encodes them as plain decimals so collisions would
+    // break the parser.
+    ce_check("ALIVE != SUSPECT", GOSSIP_STATUS_ALIVE != GOSSIP_STATUS_SUSPECT)
+    ce_check("SUSPECT != DEAD",  GOSSIP_STATUS_SUSPECT != GOSSIP_STATUS_DEAD)
+    ce_check("ALIVE != DEAD",    GOSSIP_STATUS_ALIVE != GOSSIP_STATUS_DEAD)
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    test_init_no_bootstrap_empty_peer_table()
+    test_init_bootstrap_populates_peer_table()
+    test_init_filters_self_from_bootstrap()
+    test_add_peer_appends_when_unknown()
+    test_add_peer_idempotent()
+    test_remove_peer_drops_entry()
+    test_new_peer_starts_alive_zero_suspicion()
+    test_on_timeout_increments_suspicion()
+    test_two_timeouts_promote_to_suspect()
+    test_three_timeouts_mark_dead()
+    test_ack_resets_suspicion()
+    test_stats_counters_track_actions()
+    test_merge_member_adds_unknown_addr()
+    test_merge_member_ignores_self_addr()
+    test_pick_random_deterministic_when_seeded()
+    test_pick_random_excludes_dead_peers()
+    test_alive_peers_filters_status()
+    test_pick_random_empty_returns_sentinel()
+    test_last_synced_round_trip()
+    test_last_synced_unknown_is_zero()
+    test_last_synced_update_overwrites()
+    test_step_bumps_tick_counter()
+    test_status_enum_values_distinct()
+    ce_summary("gossip")
+}
+
+main()

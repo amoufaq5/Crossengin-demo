@@ -302,3 +302,140 @@ comfortably out of reach.
 - The fallback random path (when `secure_random` syscall returns -1)
   is a nanotime+LCG stretch and is NOT cryptographically secure;
   the production path is OS getrandom via the R5B builtin.
+
+## R18E extension: SWIM gossip — peer discovery + KG delta propagation
+
+R7C kg_sync v3 ships authenticated point-to-point delta exchange. The
+remaining federation gap before this session was **N > 2 without a
+central hub**: how do peers find each other without an operator pre-
+wiring every pair, and how do KG deltas propagate through a mesh
+opportunistically?
+
+`src/federation/gossip.nova` answers both with a SWIM-style (Das et al.
+2002, simplified) protocol on top of short-lived TCP probes. The
+module is purely additive — kg_sync.nova is unchanged and the FED\_\*
+secure-aggregation path is untouched.
+
+### Algorithm
+
+1. **Peer table** — every soul maintains a list of
+   `[addr, last_seen_ns, suspicion_count, status]`. Status is one of
+   `ALIVE` (suspicion 0–1), `SUSPECT` (suspicion ≥ 2),
+   `DEAD` (suspicion ≥ 3). Membership is symmetric: every node both
+   probes and is probed.
+2. **Heartbeat** — every `PING_INTERVAL` ms (default 1000), each soul
+   picks a random alive peer, dials TCP, sends
+   `PING <seq> <self_addr>`, awaits `ACK <seq>` within
+   `PING_TIMEOUT` ms (default 500). On success: reset suspicion,
+   refresh `last_seen`. On timeout: increment suspicion. The TCP
+   socket gets `SO_RCVTIMEO + SO_SNDTIMEO` set to `PING_TIMEOUT` so a
+   stuck peer can't hang the loop (a critical fix — without it, a
+   3-soul mesh deadlocks on tick 0 when every soul tries to ping
+   simultaneously).
+3. **Membership propagation** — after each successful PING, the
+   pinger sends 2–3 `MEMBER <addr> <status>` lines drawn at random
+   from its peer table. Receiver merges: unknown addrs are added;
+   known addrs are honored ONLY when suspicion is 0 — a stale
+   gossiper cannot resurrect a peer the local failure detector has
+   directly observed as dead.
+4. **Delta gossip** — every `DELTA_INTERVAL` ms (default 2000), pick
+   a random alive peer, send `DELTA <self_addr> <last_synced_ns>`.
+   The receiver streams `ATOM` lines (same wire format as kg_sync v2)
+   for every atom whose `updated_ns > since_ns`, then `DELTA_END`.
+   The gossiper applies via `sync_apply_atom` (reusing the existing
+   merge-by-id-or-label policy in kg_sync) and bumps
+   `last_synced_ns[peer]` to its pre-request `nanotime()`.
+
+### Wire protocol (line-oriented over TCP)
+
+```
+HELLO ce-gossip v1\n                     handshake (sender)
+OK v1\n                                  handshake reply
+PING <seq> <self_addr>\n                 liveness probe
+ACK <seq>\n                              liveness response
+MEMBER <addr> <status>\n                 piggybacked membership
+DELTA <self_addr> <last_synced_ns>\n     request KG delta
+ATOM <kg> <id> <kind> <alpha> <beta> <label>\n   delta payload
+DELTA_END\n                              end of delta stream
+BYE\n                                    graceful close
+```
+
+The HELLO line disambiguates gossip from kg_sync: a misdialed gossip
+probe to a kg_sync port gets `ERR unknown` from kg_sync's parser, and
+vice-versa, both fail closed.
+
+### Why TCP (not UDP)?
+
+The SWIM paper specifies UDP for the probe path (no connection setup,
+lower overhead). The NOVA compiler exposes `send_data` / `recv_data`
+on top of the TCP `send`/`recv` syscalls but does NOT currently
+expose `sendto`/`recvfrom` (which UDP needs to preserve source
+addresses on receive). Until that lands, gossip uses short-lived TCP
+connections — the connection itself is the liveness probe, and the
+2-RTT handshake/send/ack overhead is acceptable for a 1Hz heartbeat
+on a small mesh. A switch to UDP is a transport-only change inside
+`_gossip_dial` + `gossip_listen`; the state machine is unchanged.
+
+### Concurrency model
+
+NOVA is single-threaded; the gossip module is driven by a single
+`gossip_step(state, kg)` call per tick. The daemon owns the listen fd
+(set to `O_NONBLOCK` via fcntl) and calls `gossip_try_accept` each
+tick to drain inbound connections, then `gossip_step` to send one
+ping + one membership broadcast + one delta request as the timers
+fire. No threads, no goroutines, no scheduler magic.
+
+### Verification
+
+- Unit (`tests/unit/test_gossip.nova`): **34 assertions** covering
+  peer table add/remove/lookup; suspicion counter increments on
+  timeout + promote to SUSPECT at 2 + DEAD at 3 + reset on ACK;
+  membership merge respects self-filtering and the no-resurrect
+  invariant; random peer selection deterministic when seeded;
+  alive-set filter excludes DEAD peers; delta tracking round-trip;
+  step bumps tick counter; status enum values distinct.
+- Integration (`tests/integration/scenario_www_gossip.sh`): **13
+  assertions** running three NOVA soul drivers on three local ports.
+  Stage 1: 3-soul mesh boots, each soul knows 2 peers within 8s,
+  pings and ACKs exchanged. Stage 2: kill one soul, observe the
+  surviving 2 mark it DEAD via 3 missed PINGs within 2s of the kill.
+  Stage 3: an atom birthed on soul A propagates to soul B's KG via
+  the DELTA path within the warmup window.
+
+### Sample run (post-R18E)
+
+```
+$ /tmp/wwa.bin > /tmp/wwa.out 2>&1 &
+$ /tmp/wwb.bin > /tmp/wwb.out 2>&1 &
+$ /tmp/wwc.bin > /tmp/wwc.out 2>&1 &
+$ sleep 5
+$ tail -1 /tmp/wwa.out
+a: tick=24 gossip: self=127.0.0.1:37000 peers=2 alive=2 suspect=0 dead=0 \
+   pings=7 acks=6 timeouts=1 deltas=2 kg_atoms=1
+$ kill -9 $(pgrep wwc.bin)
+$ sleep 10 ; tail -1 /tmp/wwa.out
+a: tick=70 gossip: self=127.0.0.1:37000 peers=2 alive=1 suspect=0 dead=1 \
+   pings=15 acks=8 timeouts=7 deltas=4 kg_atoms=1
+```
+
+### Gaps for future work
+
+1. **UDP transport** — needs NOVA `sendto`/`recvfrom` builtins, or an
+   inline asm syscall wrapper. TCP works; UDP would drop per-probe
+   cost from 4 RTTs to 2.
+2. **Cryptographic auth on gossip** — reuse the Noise XK channel from
+   kg_sync v3 (R6C/R7C) so a passive observer on the gossip path
+   cannot enumerate the mesh topology. The state machine is already
+   layered above the transport so this is a tunnel-the-line change
+   inside `_gossip_send_all` / `_gossip_recv_line`.
+3. **Indirect probes** — full SWIM probes a dead-suspect via a third
+   peer before marking DEAD (drops false positives from transient
+   network partitions). Today we trust the direct PING result.
+4. **Anti-entropy delta sync** — today the delta request streams every
+   atom newer than `last_synced_ns`; a Merkle-tree comparison would
+   make the per-tick cost O(log N) instead of O(N). The kg_sync v2
+   `since_atom_id` cursor is the simpler half of this.
+5. **Bootstrap registry** — every soul today is hand-wired to its
+   bootstrap peers via the constructor. A DNS-style `SRV` lookup or
+   a multicast discovery line on the boot LAN would remove the
+   operator step.

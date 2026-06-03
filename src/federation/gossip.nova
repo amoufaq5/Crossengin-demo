@@ -1,0 +1,1177 @@
+// CrossEngin federation: SWIM-style gossip protocol for peer discovery + KG delta sync.
+//
+// Purpose
+//   R18E. R6C/R7C kg_sync v3 carries Noise-XK-authed ATOM/PROMOTE events
+//   between TWO endpoints (publisher + subscriber). The remaining gap
+//   is N>2 federation without a central hub: peers must DISCOVER each
+//   other and gossip KG deltas opportunistically. This module ships
+//   that piece as a SWIM-style (Das et al. 2002) protocol layered on
+//   top of short-lived TCP probes (NOVA's send_data/recv_data builtins
+//   are TCP-shaped; UDP would require sendto/recvfrom, which the
+//   compiler does not currently expose).
+//
+// SWIM (Scalable Weakly-consistent Infection-style Membership)
+//
+//   1. Peer table -- each soul maintains `[addr, last_seen_ns,
+//      suspicion_count, status]` per known peer. status is one of
+//      ALIVE / SUSPECT / DEAD.
+//   2. Heartbeat (every PING_INTERVAL ms, default 1000) -- pick a
+//      random alive peer, open a short-lived TCP connection, send
+//      `PING <seq> <self_addr>\n`, await `ACK <seq>\n` within
+//      PING_TIMEOUT ms. On timeout / send error, increment the
+//      peer's suspicion_count. Status follows:
+//          suspicion 0..1  -> ALIVE
+//          suspicion 2     -> SUSPECT
+//          suspicion >=3   -> DEAD
+//      A successful ACK resets suspicion to 0 and bumps last_seen_ns
+//      to nanotime().
+//   3. Membership propagation (piggyback on PING) -- after the ACK,
+//      the pinger sends 2-3 `MEMBER <addr> <status>\n` lines drawn
+//      uniformly at random from its peer table (excluding the
+//      destination). Receiver merges into its own peer table:
+//          - unknown addr -> add as ALIVE with last_seen=now
+//          - known addr   -> update last_seen if newer
+//   4. Delta gossip (every DELTA_INTERVAL ms, default 2000) -- the
+//      gossiper picks a random alive peer, opens a short-lived TCP
+//      connection, sends `DELTA <self_addr> <last_synced_ns>\n`.
+//      The receiver replies with `ATOM <kg> <id> <kind> <alpha>
+//      <beta> <label>\n` for every atom whose updated_ns >
+//      last_synced_ns, then `DELTA_END\n`. The gossiper applies
+//      each ATOM via the existing sync_apply_atom path. After the
+//      exchange, gossiper bumps last_synced_ns[peer] to its
+//      pre-request nanotime() (the timestamp it included in the
+//      DELTA request).
+//
+//   The "step" function `gossip_step(state, kg) -> new_state` runs
+//   ONE tick of the loop above: it decides whether to ping
+//   (tick_count % ping_every == 0) and whether to gossip
+//   (tick_count % delta_every == 0), executes any due action, and
+//   returns the updated state. This shape keeps the daemon loop in
+//   control of the scheduler (no background threads).
+//
+// Wire protocol (line-oriented over TCP, port 8770 default; the same
+// kg_sync TCP machinery is REUSED for delta gossip when a peer is
+// known-alive). Lines are 1024 bytes max; '\n' is the terminator.
+//
+//   HELLO ce-gossip v1\n                    handshake (sender side)
+//   OK v1\n                                 handshake reply
+//   PING <seq> <self_addr>\n                liveness probe (sender)
+//   ACK <seq>\n                             liveness response
+//   MEMBER <addr> <status>\n                piggybacked membership
+//   DELTA <self_addr> <last_synced_ns>\n    request KG delta
+//   ATOM <kg> <id> <kind> <alpha> <beta> <label>\n   delta payload
+//   DELTA_END\n                             end of delta stream
+//   BYE\n                                   graceful close
+//
+//   The HELLO / OK lines disambiguate a gossip connection from a kg_sync
+//   v2 connection on the same host (a misdialed gossip probe to a kg_sync
+//   port gets `ERR unknown` from the kg_sync parser; a misdialed kg_sync
+//   probe to a gossip port gets `ERR unknown` from this parser; both fail
+//   closed instead of corrupting state).
+//
+// Public API
+//
+//   gossip_init(self_addr, bootstrap_peers) -> gossip_state_t
+//   gossip_step(state, kg)                  -> updated gossip_state_t
+//   gossip_peer_table(state)                -> list of peer entries
+//   gossip_alive_peers(state)               -> list of addrs with status=ALIVE
+//
+//   Plus helpers exercised by the unit tests:
+//   gossip_add_peer(state, addr)            -> updated state
+//   gossip_remove_peer(state, addr)         -> updated state
+//   gossip_find_peer(state, addr)           -> idx (-1 if absent)
+//   gossip_on_ack(state, addr)              -> reset suspicion, bump last_seen
+//   gossip_on_timeout(state, addr)          -> ++suspicion, maybe mark DEAD
+//   gossip_merge_member(state, addr, status) -> merge a membership notice
+//   gossip_pick_random_peer(state)          -> picks a peer using rng_state
+//   gossip_set_last_synced(state, addr, ns) -> tracking helper
+//   gossip_get_last_synced(state, addr)     -> last_synced_ns for peer (0 if absent)
+//
+// ADRs implemented: gossip-protocol (this module is the first SWIM impl
+//   in the tree, registers ADR-0078 in the audit log). NOVA dependencies:
+//   socket builtins (same set as kg_sync), nanotime, sleep_ms, getenv,
+//   alloc, store8, load8. CrossEngin dependencies: src/kg/atom_store.nova
+//   (read-only -- delta gossip needs atom_id / atom_updated / atom_label
+//   accessors), src/io/transducers/kg_sync.nova (read-only -- reuse the
+//   IP parsing helper conceptually; the gossip module reimplements the
+//   tiny subset it needs to avoid a hard dep cycle).
+
+import "std/io"
+import "../kg/atom_store.nova"
+import "../kg/multi_kg_manager.nova"
+import "../io/transducers/kg_sync.nova"
+
+// ---- protocol constants ---------------------------------------------------
+
+let GOSSIP_VERSION         = 1
+let GOSSIP_DEFAULT_PORT    = 8770
+let GOSSIP_LINE_MAX        = 1024
+let GOSSIP_PING_INTERVAL_MS = 1000
+let GOSSIP_PING_TIMEOUT_MS  = 500
+let GOSSIP_DELTA_INTERVAL_MS = 2000
+let GOSSIP_MAX_MEMBER_PIGGYBACK = 3
+let GOSSIP_SUSPICION_DEAD  = 3
+let GOSSIP_CONNECT_RETRIES = 3
+let GOSSIP_CONNECT_DELAY_MS = 50
+
+// Peer status enum.
+let GOSSIP_STATUS_ALIVE   = 0
+let GOSSIP_STATUS_SUSPECT = 1
+let GOSSIP_STATUS_DEAD    = 2
+
+// Wire op prefixes / lines.
+let GOSSIP_HELLO_LINE    = "HELLO ce-gossip v1"
+let GOSSIP_OK_LINE       = "OK v1"
+let GOSSIP_PING_PREFIX   = "PING "
+let GOSSIP_ACK_PREFIX    = "ACK "
+let GOSSIP_MEMBER_PREFIX = "MEMBER "
+let GOSSIP_DELTA_PREFIX  = "DELTA "
+let GOSSIP_ATOM_PREFIX   = "ATOM "
+let GOSSIP_DELTA_END_LINE = "DELTA_END"
+let GOSSIP_BYE_LINE      = "BYE"
+let GOSSIP_ERR_UNKNOWN   = "ERR unknown"
+
+// ---- peer entry record indices --------------------------------------------
+let GOSSIP_PE_ADDR       = 0
+let GOSSIP_PE_LAST_SEEN  = 1
+let GOSSIP_PE_SUSPICION  = 2
+let GOSSIP_PE_STATUS     = 3
+
+// ---- delta-tracking record indices ----------------------------------------
+let GOSSIP_DT_ADDR       = 0
+let GOSSIP_DT_LAST_SYNC  = 1
+
+// ---- gossip_state_t record indices ----------------------------------------
+let GOSSIP_S_SELF_ADDR   = 0   // string "host:port"
+let GOSSIP_S_PEERS       = 1   // list of peer entries
+let GOSSIP_S_DELTAS      = 2   // list of delta-tracking entries
+let GOSSIP_S_RNG         = 3   // deterministic RNG state (int)
+let GOSSIP_S_TICK        = 4   // tick counter
+let GOSSIP_S_PING_SEQ    = 5   // monotonic ping sequence
+let GOSSIP_S_LAST_PING_NS = 6  // nanotime of last ping action
+let GOSSIP_S_LAST_DELTA_NS = 7 // nanotime of last delta-gossip action
+let GOSSIP_S_PING_INTERVAL_NS = 8
+let GOSSIP_S_DELTA_INTERVAL_NS = 9
+let GOSSIP_S_STATS_PINGS = 10  // counters for /gossip status
+let GOSSIP_S_STATS_ACKS  = 11
+let GOSSIP_S_STATS_TIMEOUTS = 12
+let GOSSIP_S_STATS_DELTAS = 13
+
+// ---- low-level string helpers ---------------------------------------------
+
+fn _gossip_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _gossip_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _gossip_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _gossip_starts_with(s, prefix) {
+    if len(s) < len(prefix) { return 0 }
+    let i = 0
+    while i < len(prefix) {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _gossip_strip_eol(s) {
+    let n = len(s)
+    while n > 0 {
+        let c = char_at(s, n - 1)
+        if c == 10 { n = n - 1 } else {
+            if c == 13 { n = n - 1 } else { return substr(s, 0, n) }
+        }
+    }
+    return ""
+}
+
+fn _gossip_split_spaces(s) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            if i > start { push(out, substr(s, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(s, start, i - start)) }
+    return out
+}
+
+// Parse "host:port" -> [host, port_int]. Returns 0 on parse failure.
+fn _gossip_parse_addr(addr) {
+    let i = 0
+    while i < len(addr) {
+        if char_at(addr, i) == 58 {
+            let host = substr(addr, 0, i)
+            let port_s = substr(addr, i + 1, len(addr) - i - 1)
+            if len(host) == 0 { return 0 }
+            if _gossip_is_digits(port_s) == 0 { return 0 }
+            let port = str_to_int(port_s)
+            if port <= 0 { return 0 }
+            if port > 65535 { return 0 }
+            let rec = list_new()
+            push(rec, host)
+            push(rec, port)
+            return rec
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Convert a dotted-quad to the 32-bit value make_sockaddr_in expects.
+fn _gossip_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _gossip_is_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    return a + b * k256 + c * k256 * k256 + d * k256 * k256 * k256
+}
+
+// ---- deterministic RNG (xorshift32) ---------------------------------------
+//
+// SWIM specifies "pick a peer uniformly at random". Tests require the
+// selection to be deterministic when seeded so they can assert specific
+// peer picks. xorshift32 (Marsaglia 2003, period 2^32 - 1) is the
+// minimum-viable rng; quality is not load-bearing here.
+
+// Glibc LCG (a=1103515245, c=12345, m=2^31). Deterministic, full period
+// over 2^31. Quality is not load-bearing -- the tests just need the
+// selection to be reproducible from a fixed seed.
+fn _gossip_rng_next(seed) {
+    let x = seed
+    if x <= 0 { x = 2463534242 }
+    let m31 = 2147483648
+    let v = (x * 1103515245 + 12345) - ((x * 1103515245 + 12345) / m31) * m31
+    if v < 0 { v = 0 - v }
+    return v
+}
+
+fn _gossip_rng_in_range(seed, n) {
+    if n <= 0 { return 0 }
+    let next = _gossip_rng_next(seed)
+    let r = next - (next / n) * n
+    if r < 0 { r = 0 - r }
+    return r
+}
+
+// ---- state constructors ---------------------------------------------------
+
+fn gossip_init(self_addr, bootstrap_peers) {
+    let st = list_new()
+    push(st, self_addr)              // S_SELF_ADDR
+    push(st, list_new())             // S_PEERS
+    push(st, list_new())             // S_DELTAS
+    push(st, 2463534242)             // S_RNG (xorshift seed default)
+    push(st, 0)                      // S_TICK
+    push(st, 0)                      // S_PING_SEQ
+    push(st, 0)                      // S_LAST_PING_NS
+    push(st, 0)                      // S_LAST_DELTA_NS
+    push(st, GOSSIP_PING_INTERVAL_MS * 1000000)   // S_PING_INTERVAL_NS
+    push(st, GOSSIP_DELTA_INTERVAL_MS * 1000000)  // S_DELTA_INTERVAL_NS
+    push(st, 0)                      // S_STATS_PINGS
+    push(st, 0)                      // S_STATS_ACKS
+    push(st, 0)                      // S_STATS_TIMEOUTS
+    push(st, 0)                      // S_STATS_DELTAS
+
+    // Bootstrap peers are addresses; trust them at startup with
+    // status=ALIVE and last_seen=nanotime() (the operator just told
+    // us they exist; the next PING tick will either confirm or fall
+    // into the suspicion path).
+    if bootstrap_peers != 0 {
+        let bp = bootstrap_peers
+        let i = 0
+        while i < len(bp) {
+            let addr = bp[i]
+            if str_eq(addr, self_addr) == 0 {
+                gossip_add_peer(st, addr)
+            }
+            i = i + 1
+        }
+    }
+    return st
+}
+
+// Accessors --------------------------------------------------------------
+
+fn gossip_self_addr(state)  { return state[GOSSIP_S_SELF_ADDR] }
+fn gossip_peer_table(state) { return state[GOSSIP_S_PEERS] }
+fn gossip_tick_count(state) { return state[GOSSIP_S_TICK] }
+fn gossip_ping_seq(state)   { return state[GOSSIP_S_PING_SEQ] }
+fn gossip_stats_pings(state)    { return state[GOSSIP_S_STATS_PINGS] }
+fn gossip_stats_acks(state)     { return state[GOSSIP_S_STATS_ACKS] }
+fn gossip_stats_timeouts(state) { return state[GOSSIP_S_STATS_TIMEOUTS] }
+fn gossip_stats_deltas(state)   { return state[GOSSIP_S_STATS_DELTAS] }
+
+// Deterministic-seed setter so tests can pin peer selection.
+fn gossip_set_seed(state, seed) {
+    state[GOSSIP_S_RNG] = seed
+    return state
+}
+
+// ---- peer table operations -------------------------------------------------
+
+// Find idx of `addr` in the peer table, or -1.
+fn gossip_find_peer(state, addr) {
+    let peers = state[GOSSIP_S_PEERS]
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if str_eq(p[GOSSIP_PE_ADDR], addr) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gossip_peer_count(state) {
+    return len(state[GOSSIP_S_PEERS])
+}
+
+fn gossip_peer_at(state, idx) {
+    return state[GOSSIP_S_PEERS][idx]
+}
+
+fn gossip_peer_addr(entry)   { return entry[GOSSIP_PE_ADDR] }
+fn gossip_peer_status(entry) { return entry[GOSSIP_PE_STATUS] }
+fn gossip_peer_suspicion(entry) { return entry[GOSSIP_PE_SUSPICION] }
+fn gossip_peer_last_seen(entry) { return entry[GOSSIP_PE_LAST_SEEN] }
+
+// Add a peer with status=ALIVE, suspicion=0, last_seen=nanotime().
+// No-op if the peer is already known.
+fn gossip_add_peer(state, addr) {
+    if gossip_find_peer(state, addr) >= 0 { return state }
+    let entry = list_new()
+    push(entry, addr)                  // PE_ADDR
+    push(entry, nanotime())            // PE_LAST_SEEN
+    push(entry, 0)                     // PE_SUSPICION
+    push(entry, GOSSIP_STATUS_ALIVE)   // PE_STATUS
+    push(state[GOSSIP_S_PEERS], entry)
+    return state
+}
+
+fn gossip_remove_peer(state, addr) {
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 { return state }
+    let peers = state[GOSSIP_S_PEERS]
+    // Compact: replace idx with last, drop last.
+    let last = len(peers) - 1
+    if idx != last { peers[idx] = peers[last] }
+    pop(peers)
+    return state
+}
+
+// Mark addr as having ACKed a ping. Resets suspicion to 0, bumps
+// last_seen to nanotime(), restores status to ALIVE.
+fn gossip_on_ack(state, addr) {
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 { return state }
+    let entry = state[GOSSIP_S_PEERS][idx]
+    entry[GOSSIP_PE_LAST_SEEN] = nanotime()
+    entry[GOSSIP_PE_SUSPICION] = 0
+    entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_ALIVE
+    state[GOSSIP_S_STATS_ACKS] = state[GOSSIP_S_STATS_ACKS] + 1
+    return state
+}
+
+// Mark addr as having timed out on a ping. Increments suspicion;
+// promotes status to SUSPECT at suspicion=2, DEAD at suspicion>=3.
+fn gossip_on_timeout(state, addr) {
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 { return state }
+    let entry = state[GOSSIP_S_PEERS][idx]
+    let s = entry[GOSSIP_PE_SUSPICION] + 1
+    entry[GOSSIP_PE_SUSPICION] = s
+    if s >= GOSSIP_SUSPICION_DEAD {
+        entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_DEAD
+    } else {
+        if s >= 2 { entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_SUSPECT }
+    }
+    state[GOSSIP_S_STATS_TIMEOUTS] = state[GOSSIP_S_STATS_TIMEOUTS] + 1
+    return state
+}
+
+// Merge a membership notice from a peer. Adds the addr if unknown.
+// Updates last_seen if the addr is known.
+fn gossip_merge_member(state, addr, status) {
+    if str_eq(addr, state[GOSSIP_S_SELF_ADDR]) == 1 { return state }
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 {
+        gossip_add_peer(state, addr)
+        // The membership notice claims a status; respect it for new peers.
+        if status >= 0 {
+            let new_idx = gossip_find_peer(state, addr)
+            if new_idx >= 0 {
+                state[GOSSIP_S_PEERS][new_idx][GOSSIP_PE_STATUS] = status
+            }
+        }
+        return state
+    }
+    // Known peer: a gossiped MEMBER notice is a WEAK signal -- the
+    // gossiper is reporting THEIR view, which may be stale relative
+    // to our direct PING observations. We honor:
+    //   * an ALIVE notice ONLY when local suspicion == 0 (refreshes
+    //     last_seen but otherwise no-op). If local suspicion > 0 we
+    //     IGNORE the alive claim: our own failed PINGs are direct
+    //     evidence and outrank a third-party gossip.
+    //   * a SUSPECT/DEAD notice is corroborating evidence: when our
+    //     local status is ALIVE with suspicion == 0, it nudges
+    //     suspicion +1; if local suspicion is already >0 it does
+    //     nothing (we already have local evidence; we don't want
+    //     gossip storms to compound it).
+    // This keeps the SWIM property: failure detection is driven by
+    // DIRECT probes, gossip propagates discoveries but cannot fake
+    // them.
+    let entry = state[GOSSIP_S_PEERS][idx]
+    if status == GOSSIP_STATUS_ALIVE {
+        if entry[GOSSIP_PE_SUSPICION] == 0 {
+            if entry[GOSSIP_PE_STATUS] != GOSSIP_STATUS_DEAD {
+                entry[GOSSIP_PE_LAST_SEEN] = nanotime()
+                entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_ALIVE
+            }
+        }
+    } else {
+        if entry[GOSSIP_PE_STATUS] == GOSSIP_STATUS_ALIVE {
+            if entry[GOSSIP_PE_SUSPICION] == 0 {
+                entry[GOSSIP_PE_SUSPICION] = 1
+            }
+        }
+    }
+    return state
+}
+
+// Return list of addrs whose status == ALIVE.
+fn gossip_alive_peers(state) {
+    let out = list_new()
+    let peers = state[GOSSIP_S_PEERS]
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if p[GOSSIP_PE_STATUS] == GOSSIP_STATUS_ALIVE {
+            push(out, p[GOSSIP_PE_ADDR])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Return list of addrs regardless of status.
+fn gossip_all_peers(state) {
+    let out = list_new()
+    let peers = state[GOSSIP_S_PEERS]
+    let i = 0
+    while i < len(peers) {
+        push(out, peers[i][GOSSIP_PE_ADDR])
+        i = i + 1
+    }
+    return out
+}
+
+// Pick a random peer from the alive set, advancing the RNG. Returns 0
+// (sentinel) if there are no alive peers.
+fn gossip_pick_random_peer(state) {
+    let alive = gossip_alive_peers(state)
+    if len(alive) == 0 { return 0 }
+    let seed = state[GOSSIP_S_RNG]
+    let r = _gossip_rng_in_range(seed, len(alive))
+    state[GOSSIP_S_RNG] = _gossip_rng_next(seed)
+    return alive[r]
+}
+
+// Pick up to k random peer addrs for piggyback membership, excluding
+// `exclude_addr`. Returns a list of addr strings (possibly shorter than k).
+fn gossip_pick_piggyback(state, k, exclude_addr) {
+    let peers = state[GOSSIP_S_PEERS]
+    let out = list_new()
+    if len(peers) == 0 { return out }
+    let n = len(peers)
+    let max_tries = n * 2
+    let tried = 0
+    let seed = state[GOSSIP_S_RNG]
+    while len(out) < k {
+        if tried >= max_tries { return out }
+        let r = _gossip_rng_in_range(seed, n)
+        seed = _gossip_rng_next(seed)
+        let cand = peers[r][GOSSIP_PE_ADDR]
+        if str_eq(cand, exclude_addr) == 0 {
+            // dedupe within the output set
+            let dupe = 0
+            let i = 0
+            while i < len(out) {
+                if str_eq(out[i], cand) == 1 { dupe = 1 }
+                i = i + 1
+            }
+            if dupe == 0 { push(out, cand) }
+        }
+        tried = tried + 1
+    }
+    state[GOSSIP_S_RNG] = seed
+    return out
+}
+
+// ---- delta tracking -------------------------------------------------------
+
+fn _gossip_find_delta(state, addr) {
+    let dt = state[GOSSIP_S_DELTAS]
+    let i = 0
+    while i < len(dt) {
+        if str_eq(dt[i][GOSSIP_DT_ADDR], addr) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gossip_set_last_synced(state, addr, ns) {
+    let idx = _gossip_find_delta(state, addr)
+    if idx >= 0 {
+        state[GOSSIP_S_DELTAS][idx][GOSSIP_DT_LAST_SYNC] = ns
+        return state
+    }
+    let rec = list_new()
+    push(rec, addr)
+    push(rec, ns)
+    push(state[GOSSIP_S_DELTAS], rec)
+    return state
+}
+
+fn gossip_get_last_synced(state, addr) {
+    let idx = _gossip_find_delta(state, addr)
+    if idx < 0 { return 0 }
+    return state[GOSSIP_S_DELTAS][idx][GOSSIP_DT_LAST_SYNC]
+}
+
+// ---- wire helpers ---------------------------------------------------------
+
+fn _gossip_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _gossip_recv_line(fd) {
+    let buf = alloc(GOSSIP_LINE_MAX)
+    let n = 0
+    while n < GOSSIP_LINE_MAX - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return _gossip_strip_eol(buf)
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return _gossip_strip_eol(buf)
+        }
+    }
+    store8(buf + n, 0)
+    return _gossip_strip_eol(buf)
+}
+
+// Dial a peer's gossip port. Returns fd or -1 on failure. The returned
+// fd has SO_RCVTIMEO and SO_SNDTIMEO set to GOSSIP_PING_TIMEOUT_MS so a
+// stuck peer can't hang us indefinitely (e.g. tick-zero deadlock in a
+// fully-meshed N-soul boot).
+fn _gossip_dial(addr) {
+    let parsed = _gossip_parse_addr(addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _gossip_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let sa = make_sockaddr_in(port, ip)
+    let attempt = 0
+    while attempt < GOSSIP_CONNECT_RETRIES {
+        let fd = socket(2, 1, 0)
+        if fd < 0 { return -1 }
+        _gossip_set_rcvtimeo_ms(fd, GOSSIP_PING_TIMEOUT_MS)
+        if connect_socket(fd, sa, 16) >= 0 {
+            return fd
+        }
+        close_fd(fd)
+        sleep_ms(GOSSIP_CONNECT_DELAY_MS)
+        attempt = attempt + 1
+    }
+    return -1
+}
+
+// fcntl(2) wrapper -- used to set O_NONBLOCK on the listening fd so
+// accept() can be polled without blocking the gossip step loop.
+fn _gossip_fcntl(fd, cmd, arg) {
+    asm {
+        "mov rax, 72"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// setsockopt(2) wrapper. Used to set SO_REUSEADDR so an integration
+// scenario can rebind quickly after a previous run held the port
+// in TIME_WAIT.
+fn _gossip_setsockopt(fd, level, optname, optval, optlen) {
+    asm {
+        "mov rax, 54"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "mov r10, [rbp-32]"
+        "mov r8, [rbp-40]"
+        "syscall"
+    }
+}
+
+// Apply SO_REUSEADDR = 1 to the listening fd.
+fn _gossip_set_reuseaddr(fd) {
+    let one_buf = alloc(4)
+    store8(one_buf, 1)
+    store8(one_buf + 1, 0)
+    store8(one_buf + 2, 0)
+    store8(one_buf + 3, 0)
+    // SOL_SOCKET = 1, SO_REUSEADDR = 2 on Linux x86-64.
+    return _gossip_setsockopt(fd, 1, 2, one_buf, 4)
+}
+
+// Apply SO_RCVTIMEO = 500ms to a client socket. Without this, every
+// PING blocks until the peer's accept loop runs (or forever if the
+// peer's accept is itself stuck waiting on us -- a trivial deadlock
+// in a 3-soul mesh on tick 0). With a 500ms timeout the PING fails
+// fast on no-response, the suspicion counter advances, the inbound
+// drain runs next tick, and the mesh unsticks.
+//
+// struct timeval layout: { tv_sec :: i64, tv_usec :: i64 } -- 16 bytes
+// little-endian. For sub-second timeouts (the only case we use) the
+// tv_sec word is zero and tv_usec carries the value.
+fn _gossip_set_rcvtimeo_ms(fd, ms) {
+    let tv = alloc(16)
+    let i = 0
+    while i < 16 { store8(tv + i, 0); i = i + 1 }
+    let usec = ms * 1000
+    // Write tv_usec at offset 8 as little-endian 8 bytes.
+    let v = usec
+    let j = 0
+    while j < 8 {
+        store8(tv + 8 + j, v - (v / 256) * 256)
+        v = v / 256
+        j = j + 1
+    }
+    // SOL_SOCKET = 1, SO_RCVTIMEO = 20, SO_SNDTIMEO = 21.
+    _gossip_setsockopt(fd, 1, 20, tv, 16)
+    _gossip_setsockopt(fd, 1, 21, tv, 16)
+    return 0
+}
+
+// Make fd non-blocking via fcntl(fd, F_SETFL, O_NONBLOCK).
+// F_GETFL=3, F_SETFL=4, O_NONBLOCK=2048 on Linux x86-64.
+fn _gossip_set_nonblock(fd) {
+    let flags = _gossip_fcntl(fd, 3, 0)
+    if flags < 0 { return -1 }
+    return _gossip_fcntl(fd, 4, flags + 2048)
+}
+
+// Bind + listen on the gossip port derived from self_addr. Returns server
+// fd or -1 on failure. The fd is set to O_NONBLOCK so the daemon's
+// gossip_try_accept can poll it without stalling the step loop.
+fn gossip_listen(self_addr) {
+    let parsed = _gossip_parse_addr(self_addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _gossip_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let fd = socket(2, 1, 0)
+    if fd < 0 { return -1 }
+    _gossip_set_reuseaddr(fd)
+    let sa = make_sockaddr_in(port, ip)
+    if bind_socket(fd, sa, 16) < 0 {
+        close_fd(fd)
+        return -1
+    }
+    if listen_socket(fd, 8) < 0 {
+        close_fd(fd)
+        return -1
+    }
+    _gossip_set_nonblock(fd)
+    return fd
+}
+
+// Non-blocking accept poll: returns conn_fd >= 0 if a peer dialed in,
+// or -1 if no pending connection (EAGAIN). Daemons call this each tick.
+fn gossip_try_accept(server_fd) {
+    let conn_fd = accept_conn(server_fd, 0, 0)
+    return conn_fd
+}
+
+// ---- client side: PING + piggyback ---------------------------------------
+//
+// Send a PING to addr, await ACK, then send up to k piggyback MEMBER
+// lines drawn from this state's peer table. Returns 1 on a clean
+// exchange (ACK received with matching seq), 0 on any failure.
+// Side effects: bumps PING_SEQ; updates STATS_PINGS / STATS_ACKS /
+// STATS_TIMEOUTS via gossip_on_ack / gossip_on_timeout.
+
+fn gossip_send_ping(state, addr) {
+    state[GOSSIP_S_STATS_PINGS] = state[GOSSIP_S_STATS_PINGS] + 1
+    let fd = _gossip_dial(addr)
+    if fd < 0 {
+        gossip_on_timeout(state, addr)
+        return 0
+    }
+    // Optional handshake -- a misdialed kg_sync peer rejects this.
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let hello_ack = _gossip_recv_line(fd)
+    if hello_ack == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if str_eq(hello_ack, GOSSIP_OK_LINE) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+
+    let seq = state[GOSSIP_S_PING_SEQ] + 1
+    state[GOSSIP_S_PING_SEQ] = seq
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let ping_line = GOSSIP_PING_PREFIX + int_to_str(seq) + " " + self_addr + "\n"
+    if _gossip_send_all(fd, ping_line) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_starts_with(ack, GOSSIP_ACK_PREFIX) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let toks = _gossip_split_spaces(ack)
+    if len(toks) < 2 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_is_digits(toks[1]) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let recv_seq = str_to_int(toks[1])
+    if recv_seq != seq {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    // Clean ACK -- record liveness.
+    gossip_on_ack(state, addr)
+
+    // Piggyback membership: pick up to k=3 peers and broadcast.
+    let pb = gossip_pick_piggyback(state, GOSSIP_MAX_MEMBER_PIGGYBACK, addr)
+    let i = 0
+    while i < len(pb) {
+        let mb_addr = pb[i]
+        let mb_idx = gossip_find_peer(state, mb_addr)
+        let mb_status = GOSSIP_STATUS_ALIVE
+        if mb_idx >= 0 {
+            mb_status = state[GOSSIP_S_PEERS][mb_idx][GOSSIP_PE_STATUS]
+        }
+        let line = GOSSIP_MEMBER_PREFIX + mb_addr + " " + int_to_str(mb_status) + "\n"
+        if _gossip_send_all(fd, line) == 0 {
+            // Best-effort; if send fails the receiver simply learns less.
+            i = len(pb)
+        } else {
+            i = i + 1
+        }
+    }
+    // Graceful close.
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// ---- server side: handle one inbound connection -------------------------
+//
+// A handler called by the daemon loop after accept_conn() returns a
+// connection fd. Reads the HELLO, runs the PING/ACK/MEMBER... protocol,
+// returns when the client sends BYE or the socket closes. Updates the
+// caller's state with any learned membership.
+
+fn gossip_handle_conn(state, conn_fd) {
+    let hello = _gossip_recv_line(conn_fd)
+    if hello == 0 { close_fd(conn_fd); return state }
+    if str_eq(hello, GOSSIP_HELLO_LINE) == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_ERR_UNKNOWN + "\n")
+        close_fd(conn_fd)
+        return state
+    }
+    if _gossip_send_all(conn_fd, GOSSIP_OK_LINE + "\n") == 0 {
+        close_fd(conn_fd); return state
+    }
+
+    // Process lines until BYE or EOF.
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(conn_fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        // Learn the sender via implicit membership.
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        _gossip_send_all(conn_fd, GOSSIP_ACK_PREFIX + seq + "\n")
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            // Receiver of a DELTA request: stream every atom
+                            // in our KG with updated_ns > since_ns, then
+                            // DELTA_END. The caller passes a KG via a
+                            // separate handler entry point; here we have no
+                            // KG so we just send DELTA_END (the integration
+                            // scenario tests the full path via gossip_serve_delta).
+                            _gossip_send_all(conn_fd, GOSSIP_DELTA_END_LINE + "\n")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_fd(conn_fd)
+    return state
+}
+
+// Variant that knows about the local KG, used by the daemon to serve
+// DELTA requests. The handler honors PING/ACK identically but also
+// streams ATOM lines for the delta path.
+fn gossip_handle_conn_kg(state, conn_fd, kg) {
+    let hello = _gossip_recv_line(conn_fd)
+    if hello == 0 { close_fd(conn_fd); return state }
+    if str_eq(hello, GOSSIP_HELLO_LINE) == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_ERR_UNKNOWN + "\n")
+        close_fd(conn_fd)
+        return state
+    }
+    if _gossip_send_all(conn_fd, GOSSIP_OK_LINE + "\n") == 0 {
+        close_fd(conn_fd); return state
+    }
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(conn_fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        _gossip_send_all(conn_fd, GOSSIP_ACK_PREFIX + seq + "\n")
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            let dtoks = _gossip_split_spaces(line)
+                            if len(dtoks) >= 3 {
+                                let since_s = dtoks[2]
+                                let since_ns = 0
+                                if _gossip_is_digits(since_s) == 1 {
+                                    since_ns = str_to_int(since_s)
+                                }
+                                // Stream every atom whose updated_ns > since_ns.
+                                _gossip_stream_atoms_since(conn_fd, kg, since_ns)
+                            }
+                            _gossip_send_all(conn_fd, GOSSIP_DELTA_END_LINE + "\n")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_fd(conn_fd)
+    return state
+}
+
+// Walk the KG and send ATOM lines for every atom whose updated_ns > since_ns.
+// The wire format mirrors kg_sync's ATOM line so the receiver can hand the
+// parsed payload straight to sync_apply_atom().
+fn _gossip_stream_atoms_since(conn_fd, kg, since_ns) {
+    if kg == 0 { return 0 }
+    let n = kg_atom_count(kg)
+    let i = 0
+    let sent = 0
+    while i < n {
+        let a = kg_atom(kg, i)
+        if a != 0 {
+            let updated = atom_updated(a)
+            if updated > since_ns {
+                // Belief is [alpha, beta] in milli; expose both in the
+                // wire form so the receiver can rebuild it.
+                let bel = atom_belief(a)
+                let alpha = bel[0]
+                let beta = bel[1]
+                let label = atom_label(a)
+                let kg_label_str = kg_label(kg)
+                let line = GOSSIP_ATOM_PREFIX + kg_label_str + " "
+                    + int_to_str(atom_id(a)) + " "
+                    + int_to_str(atom_kind(a)) + " "
+                    + int_to_str(alpha) + " "
+                    + int_to_str(beta) + " "
+                    + label + "\n"
+                if _gossip_send_all(conn_fd, line) == 0 { return sent }
+                sent = sent + 1
+            }
+        }
+        i = i + 1
+    }
+    return sent
+}
+
+// ---- delta gossip client side --------------------------------------------
+//
+// Dial a peer, request KG deltas since last_synced_ns, apply received
+// ATOM lines, bump last_synced_ns to the request timestamp. Returns the
+// number of atoms applied, or -1 on failure.
+
+fn gossip_send_delta_request(state, addr, kg) {
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return -1 }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return -1
+    }
+    let ok = _gossip_recv_line(fd)
+    if ok == 0 { close_fd(fd); return -1 }
+    if str_eq(ok, GOSSIP_OK_LINE) == 0 { close_fd(fd); return -1 }
+
+    let since_ns = gossip_get_last_synced(state, addr)
+    let request_ns = nanotime()
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let req = GOSSIP_DELTA_PREFIX + self_addr + " " + int_to_str(since_ns) + "\n"
+    if _gossip_send_all(fd, req) == 0 { close_fd(fd); return -1 }
+
+    let applied = 0
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_DELTA_END_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_ATOM_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // ATOM <kg> <id> <kind> <alpha> <beta> <label>
+                    if len(toks) >= 7 {
+                        let remote_id = str_to_int(toks[2])
+                        let kind = str_to_int(toks[3])
+                        let alpha = str_to_int(toks[4])
+                        let beta = str_to_int(toks[5])
+                        // label may contain spaces; rejoin trailing toks.
+                        let label = toks[6]
+                        let li = 7
+                        while li < len(toks) {
+                            label = label + " " + toks[li]
+                            li = li + 1
+                        }
+                        sync_apply_atom(kg, remote_id, kind, alpha, beta, label)
+                        applied = applied + 1
+                    }
+                }
+            }
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    gossip_set_last_synced(state, addr, request_ns)
+    state[GOSSIP_S_STATS_DELTAS] = state[GOSSIP_S_STATS_DELTAS] + 1
+    return applied
+}
+
+// ---- step function --------------------------------------------------------
+//
+// One tick of the gossip protocol. Caller drives at whatever cadence is
+// appropriate (1Hz works for the integration scenario).
+//
+//   - bumps tick counter
+//   - if (now - last_ping_ns) >= ping_interval, picks a peer and pings
+//   - if (now - last_delta_ns) >= delta_interval and there is an alive
+//     peer, requests a delta from a random alive peer
+//
+// This does NOT accept inbound connections -- the daemon owns the
+// listen fd and calls gossip_handle_conn_kg() per accepted conn. The
+// step function is the OUTBOUND clock.
+
+fn gossip_step(state, kg) {
+    state[GOSSIP_S_TICK] = state[GOSSIP_S_TICK] + 1
+    let now = nanotime()
+    let ping_due = 0
+    let delta_due = 0
+    if now - state[GOSSIP_S_LAST_PING_NS] >= state[GOSSIP_S_PING_INTERVAL_NS] {
+        ping_due = 1
+    }
+    if now - state[GOSSIP_S_LAST_DELTA_NS] >= state[GOSSIP_S_DELTA_INTERVAL_NS] {
+        delta_due = 1
+    }
+    if ping_due == 1 {
+        let target = gossip_pick_random_peer(state)
+        if target != 0 {
+            gossip_send_ping(state, target)
+        }
+        // Also run a suspicion sweep over peers we haven't seen in a while.
+        _gossip_suspicion_sweep(state, now)
+        state[GOSSIP_S_LAST_PING_NS] = now
+    }
+    if delta_due == 1 {
+        let target2 = gossip_pick_random_peer(state)
+        if target2 != 0 {
+            if kg != 0 { gossip_send_delta_request(state, target2, kg) }
+        }
+        state[GOSSIP_S_LAST_DELTA_NS] = now
+    }
+    return state
+}
+
+// Peers whose last_seen is older than 3 * ping_interval and have not
+// already been pinged in this tick are auto-incremented in suspicion.
+// This catches peers that the random pinger has been failing to select.
+fn _gossip_suspicion_sweep(state, now) {
+    let peers = state[GOSSIP_S_PEERS]
+    let stale_threshold = state[GOSSIP_S_PING_INTERVAL_NS] * GOSSIP_SUSPICION_DEAD
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if p[GOSSIP_PE_STATUS] != GOSSIP_STATUS_DEAD {
+            let age = now - p[GOSSIP_PE_LAST_SEEN]
+            if age > stale_threshold {
+                let s = p[GOSSIP_PE_SUSPICION] + 1
+                p[GOSSIP_PE_SUSPICION] = s
+                if s >= GOSSIP_SUSPICION_DEAD {
+                    p[GOSSIP_PE_STATUS] = GOSSIP_STATUS_DEAD
+                } else {
+                    if s >= 2 { p[GOSSIP_PE_STATUS] = GOSSIP_STATUS_SUSPECT }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return state
+}
+
+// ---- env helpers + chat-side conveniences --------------------------------
+
+fn gossip_self_addr_from_env() {
+    let env = getenv("CE_GOSSIP_SELF")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return "127.0.0.1:8770"
+}
+
+fn gossip_bootstrap_from_env() {
+    let env = getenv("CE_GOSSIP_PEERS")
+    if env == 0 { return list_new() }
+    if len(env) == 0 { return list_new() }
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(env) {
+        if char_at(env, i) == 44 {
+            if i > start { push(out, substr(env, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(env, start, i - start)) }
+    return out
+}
+
+// One-liner status line for /gossip status in the chat.
+fn gossip_status_line(state) {
+    let peers = state[GOSSIP_S_PEERS]
+    let alive = 0
+    let suspect = 0
+    let dead = 0
+    let i = 0
+    while i < len(peers) {
+        let s = peers[i][GOSSIP_PE_STATUS]
+        if s == GOSSIP_STATUS_ALIVE { alive = alive + 1 }
+        if s == GOSSIP_STATUS_SUSPECT { suspect = suspect + 1 }
+        if s == GOSSIP_STATUS_DEAD { dead = dead + 1 }
+        i = i + 1
+    }
+    return "gossip: self=" + state[GOSSIP_S_SELF_ADDR]
+        + " peers=" + int_to_str(len(peers))
+        + " alive=" + int_to_str(alive)
+        + " suspect=" + int_to_str(suspect)
+        + " dead=" + int_to_str(dead)
+        + " pings=" + int_to_str(state[GOSSIP_S_STATS_PINGS])
+        + " acks=" + int_to_str(state[GOSSIP_S_STATS_ACKS])
+        + " timeouts=" + int_to_str(state[GOSSIP_S_STATS_TIMEOUTS])
+        + " deltas=" + int_to_str(state[GOSSIP_S_STATS_DELTAS])
+}

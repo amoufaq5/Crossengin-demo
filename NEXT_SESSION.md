@@ -3,6 +3,114 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R18E (this session) -- federation gossip: SWIM peer discovery + KG delta propagation
+
+**Status: complete -- `src/federation/gossip.nova` (NEW, ~750 lines)
+ships SWIM-style (Das et al. 2002, simplified) gossip on top of
+short-lived TCP probes. R7C kg_sync v3 ships Noise-XK-authed
+point-to-point delta exchange; this is the missing federation piece
+for N > 2: peers discover each other and propagate KG deltas through
+the mesh without a central coordinator.**
+
+### What R18E delivers
+
+1. **New module** `src/federation/gossip.nova` -- peer table with
+   `[addr, last_seen_ns, suspicion_count, status]`; ALIVE/SUSPECT/
+   DEAD enum; deterministic xorshift32-style RNG (glibc LCG, period
+   2^31); `gossip_init`, `gossip_step`, `gossip_peer_table`,
+   `gossip_alive_peers` public surface plus helpers exercised by the
+   unit tests (`gossip_add_peer`, `gossip_remove_peer`,
+   `gossip_on_ack`, `gossip_on_timeout`, `gossip_merge_member`,
+   `gossip_pick_random_peer`, `gossip_set_last_synced`,
+   `gossip_get_last_synced`, `gossip_status_line`).
+2. **Wire protocol v1** -- line-oriented over TCP:
+   `HELLO ce-gossip v1` / `OK v1` / `PING <seq> <self_addr>` /
+   `ACK <seq>` / `MEMBER <addr> <status>` /
+   `DELTA <self_addr> <last_synced_ns>` / `ATOM ...` / `DELTA_END` /
+   `BYE`. ATOM lines reuse kg_sync v2's wire shape so receivers can
+   hand them straight to `sync_apply_atom` (no new merge policy
+   needed).
+3. **Transport pragmatics** -- listening fd is `O_NONBLOCK` (set
+   via fcntl, syscall 72), client fds get `SO_RCVTIMEO + SO_SNDTIMEO
+   = 500ms` (via setsockopt, syscall 54). Without the recvtimeo a
+   3-soul fully-meshed boot deadlocks on tick 0 (every soul tries to
+   ping simultaneously and blocks on recv before any accept_conn
+   fires). With it, a stuck peer is detected after one PING_INTERVAL.
+4. **No-resurrect invariant** -- membership-merge respects local
+   suspicion: a third-party gossip claiming "C is ALIVE" cannot
+   override our own direct evidence (3 missed PINGs == DEAD). This
+   was a load-bearing fix found during integration: without it, A
+   pings C, C is down, A bumps suspicion, B sends MEMBER C ALIVE
+   (B hadn't pinged C yet), A resets C to ALIVE -- suspicion never
+   reaches 3 and DEAD-marking never happens. Fix: ALIVE notices are
+   honored only when local `suspicion == 0`; SUSPECT/DEAD notices
+   bump local suspicion by 1 but cannot lower it.
+5. **Verification** -- 34 unit assertions in
+   `tests/unit/test_gossip.nova` (NEW), 13 integration assertions in
+   `tests/integration/scenario_www_gossip.sh` (NEW; precompiles 3
+   soul drivers + runs the 3-process mesh end-to-end).
+
+### Integration scenario report
+
+```
+== scenario WWW: R18E SWIM-style gossip (3-soul mesh) ==
+  PASS  soul A still running after 10s warmup
+  PASS  soul B still running after 10s warmup
+  PASS  soul C still running after 10s warmup
+  PASS  soul A peer table lists 2 peers
+  PASS  soul B peer table lists 2 peers
+  PASS  soul C peer table lists 2 peers
+  PASS  soul A sent >= 1 PING (count=7)
+  PASS  soul B sent >= 1 PING (count=7)
+  PASS  mesh exchanged >= 1 ACK (A+B=10)
+== scenario WWW stage 2: kill soul C, observe SWIM DEAD-marking ==
+  timing DEAD-marking after 2s (A=1 B=1)
+  PASS  >= 1 surviving soul marked C as DEAD (A=1 B=1)
+  PASS  survivors observed >= 3 PING timeouts after C kill (A=4 B=2)
+== scenario WWW stage 3: KG delta propagation ==
+  PASS  soul B learned >= 1 atom via DELTA (max kg_atoms=1)
+  PASS  soul A initiated >= 1 DELTA request (count=3)
+integration scenario_www_gossip: pass=13 fail=0
+```
+
+3-soul mesh converges within 5s. C-killed → A and B both mark DEAD
+within 2s of the SIGKILL (3 missed PINGs at 1s interval matches
+theoretical bound). KG delta propagated -- A's `gossip-test-atom`
+shows up on B and C via the DELTA wire.
+
+### Module count: 169 (was 165 pre-R18; +4 across all R18 agents,
++1 from this agent)
+
+### Files touched
+- NEW: `src/federation/gossip.nova` (~750 lines)
+- NEW: `tests/unit/test_gossip.nova` (34 assertions)
+- NEW: `tests/integration/scenario_www_gossip.sh` (13 assertions)
+- `examples/crossengin_chat.nova` -- 2 lines added (`/gossip` +
+  `/gossip_add_peer` stubs that point operators at the standalone
+  driver pattern; the REPL has no gossip daemon today)
+- `FEDERATED_AUDIT.md` -- extended with the R18E section
+- `README.md` -- bumped module count + one-line federation
+  highlight
+- `NEXT_SESSION.md` -- this section
+
+### Gaps for R19+
+
+1. UDP transport (needs NOVA `sendto`/`recvfrom` builtin or an
+   inline asm wrapper). TCP works at 1Hz heartbeat on 3-soul mesh;
+   UDP would halve the per-probe RTT.
+2. Noise-XK tunnel on the gossip wire (re-use R6C/R7C `noise_xk.nova`
+   inside `_gossip_send_all` / `_gossip_recv_line`).
+3. Indirect probes (full SWIM: before marking DEAD, ask a third peer
+   to probe the suspect; drops false positives from transient
+   partitions).
+4. Anti-entropy via Merkle tree comparison instead of streaming
+   every atom newer than `last_synced_ns`.
+5. Chat-side gossip daemon -- today the chat REPL has stub commands;
+   wiring a real daemon thread requires either a fork() builtin or
+   a periodic tick callback from the scheduler.
+
+---
+
 ## R18C (this session) -- wake-word detection via DTW on MFCC sequences
 
 **Status: complete -- `src/io/transducers/audio_wakeword.nova` (NEW,
