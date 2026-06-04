@@ -3390,6 +3390,259 @@ R8B / R15D / R21C / R25B / R25B.2 / R25B.3 / R25B.4 / R28D
 modules and tests are untouched -- R25B.5 is purely additive
 on top of R25B.4's dialog layer.
 
+## R25B.6 -- Voice dialog multi-kind clarifying question (R32F / R31F.2)
+
+Closes the **R31F-documented multi-kind ambiguous remainder** edge
+case. R31F's exit report explicitly named the deferred fix:
+"multi-kind ambiguous remainder ('more facts and rules' after
+CONCEPT finds TWO known kinds). `_vd_remainder_known_kind` returns
+the FIRST match in tokeniser order... future fix would add a
+confidence threshold or an explicit disambiguation turn." R32F
+lands that fix as a NEW classifier output `VC_FOLLOWUP_CLARIFY`
+(value 5) distinct from KIND_PIVOT, plus a pending-clarify session
+slot, a kind-selector parser, and a give-up-after-2-attempts
+fallback.
+
+### What R25B.6 changes inside `voice_dialog.nova`
+
+* **New classifier constant + accessor**:
+  `VC_FOLLOWUP_CLARIFY = 5`; `vc_followup_clarify()` accessor
+  matches the shape of the other five enum probes.
+  `VC_DIALOG_CLARIFY_MAX_ATTEMPTS = 2` cap exposed via
+  `vc_dialog_clarify_max_attempts()`.
+* **New multi-kind detector
+  `_vd_remainder_known_kinds_all(now, exclude_kind_upper)`**:
+  walks the stemmed remainder content set, upcases each token,
+  consults `_vd_known_kind`, and returns the deduplicated
+  UPPER-CASE list of ALL kinds found (preserving tokeniser order;
+  dropping kinds equal to the prior). Public probe
+  `vc_remainder_known_kinds_all` for tests / integration. The
+  R31F single-return helper `_vd_remainder_known_kind` is left
+  intact for the env-opt-out fallback path so callers that
+  prefer R31F's deterministic byte-identical behaviour can keep
+  it.
+* **Pending-clarify session slots** (4 new slots, indices 6-9):
+  `pending_clarify_kinds` (list of candidate UPPER-CASE kinds;
+  empty when no clarify pending), `pending_clarify_template`
+  (target template for resolution dispatch; LIST_ALL by default),
+  `pending_clarify_attempts` (round counter; incremented on each
+  failed resolution), `pending_clarify_raw` (the original
+  transcript that triggered the clarify, kept for history
+  annotation). Accessors: `vc_session_pending_clarify_kinds`,
+  `_template`, `_attempts`, `_raw`, `vc_session_is_pending_clarify`.
+  `vc_session_new` initialises them empty; `vc_session_reset`
+  clears them (so explicit topic-shift markers cancel a pending
+  clarify).
+* **Kind-selector parser
+  `_vd_resolve_clarify_selector(lowered, candidates)`**: maps a
+  freshly-received user transcript to one of the pending
+  candidate kinds. Resolution order: (1) bare kind name
+  ("RULE" / "rule") case-insensitive; (2) `_vd_is_both_selector`
+  ("both" / "either" / "all") -> FIRST candidate (documented
+  fallback rationale below); (3) `_vd_content_words` tokenise
+  + stem + scan for first surviving kind-named token. Returns
+  the chosen UPPER-CASE kind on success, "" on failure. Public
+  probe `vc_resolve_clarify_selector(query, candidates)`.
+* **Clarify-question renderer `_vd_render_clarify_question(
+  candidates)`**: builds "Did you mean RULE or FACT atoms?" for
+  2 candidates; "Did you mean A, B, or C atoms?" for 3+. Kept as
+  a dedicated helper so tests can assert byte-identical text.
+  Public probe `vc_render_clarify_question`.
+* **`voice_followup_classify` extension**: in the more-cue path,
+  after R31F's single-kind KIND_PIVOT detection, the new
+  multi-kind detector splits routing:
+    - 0 matches -> generic PIVOT (R30F fallback).
+    - 1 match  -> KIND_PIVOT (R31F path).
+    - 2+ matches -> CLARIFY when `CE_VOICE_NO_CLARIFY` is unset;
+      KIND_PIVOT (first-match via the R31F helper) when the env
+      opt-out is set. The env-opt-out path is BYTE-IDENTICAL to
+      R31F's behaviour -- the env probe and the single-kind
+      helper are the only inputs to the dispatcher.
+* **New public probe `voice_followup_clarify_candidates(session,
+  query)`**: returns the deduplicated UPPER-CASE candidate list
+  on CLARIFY inputs, an empty list otherwise. Used by the
+  dispatcher to build the clarify question and stash the
+  candidates in the pending slot. Returns empty when no prior,
+  when the query doesn't take the more-cue path, when the
+  remainder names fewer than 2 known kinds, or when the env
+  opt-out is active.
+* **`vc_session_turn` dispatcher extension**:
+    - Early branch (after empty-transcript check): if the
+      session is mid-clarify (pending kinds non-empty), call
+      `_vd_handle_pending_clarify`. Explicit topic-shift markers
+      still take priority (the topic-shift remainder check runs
+      first so "actually" / "never mind" can cancel a pending
+      clarify mid-flight).
+    - New CLARIFY classifier branch: stashes candidates +
+      template + attempts=1 + raw in the pending slots and
+      emits the rendered question. NO history entry is appended
+      for the CLARIFY emit itself (the pending state IS the
+      carry-forward signal).
+* **`_vd_handle_pending_clarify(kg, session, raw, lowered)`
+  helper**: drives the resolution flow. On hit -> clear pending
+  state, dispatch as KIND_PIVOT via `_vd_pivot_turn` with the
+  stashed template against the chosen kind. On miss: bump
+  attempts; if post-bump count <= MAX (2), re-emit the clarify
+  with a reduced-patience prefix ("Please answer with the kind
+  name. ..."). If post-bump count > MAX (3 in the rare 4-turn
+  ambiguity), clear pending state, dispatch first-match
+  KIND_PIVOT (the operator gets a real answer), and prepend an
+  apologetic sentence ("Sorry, I could not tell which kind you
+  meant. Showing FACT atoms by default. Found 3 FACT atoms:
+  ids 0, 1, 2.").
+
+### "both" / "either" / "all" handling
+
+We shipped the **first-candidate-wins** path (option a from the
+brief). The operator's "both" reply resolves to the FIRST stashed
+candidate kind. Rationale:
+
+  * The dialog layer dispatches ONE query at a time -- running
+    BOTH would require an extended response shape, a dispatcher
+    loop, and history bookkeeping for the second query. That's
+    a structural change that touches every public API in the
+    module.
+  * The multi-turn loop already gives the operator a clean way
+    to follow up on the second kind: after the first-candidate
+    dispatch resolves (e.g. shows FACT atoms), they say "what
+    about RULE" and the existing KIND_PIVOT path handles it.
+  * First-match honours R31F's "never silently drop user intent"
+    principle: the operator gets a real answer, not just an
+    apology.
+
+The alternative -- emit a "I can only do one at a time" error --
+was REJECTED because it punishes the common case where the
+operator's "both" is shorthand for "I don't have a strong
+preference, pick one".
+
+### Verification
+
+* **40+ new unit assertions across 25 new test functions** in
+  `tests/unit/test_voice_dialog.nova`. R31F's 167 prior
+  assertions: 166 pass byte-identical; 1 assertion (the
+  "multi-kind ambiguous picks first" classifier label) was
+  RELABELED from `vc_followup_kind_pivot()` to
+  `vc_followup_clarify()` -- the END-STATE behaviour of the
+  helper `voice_followup_kind_pivot_target` is unchanged
+  (still returns "FACT" via R31F's first-match helper), only
+  the classifier label moves to CLARIFY. Coverage:
+    - Classifier output enum: VC_FOLLOWUP_CLARIFY = 5;
+      MAX_ATTEMPTS = 2.
+    - Multi-kind detector unit tests: 2-kind / 3-kind /
+      dedup / exclude-prior / no-match shapes.
+    - Classifier CLARIFY: "more facts and rules" after
+      CONCEPT (headline brief case); "and facts and rules"
+      after SKILL (cue variation).
+    - Classifier preservation: single-kind remainder still
+      KIND_PIVOT; no-kind remainder still PIVOT; same-kind
+      multi-mention ("more rules and rule atoms" after FACT)
+      stays KIND_PIVOT (detector dedups -> single kind).
+    - Render: 2-candidate question "Did you mean X or Y
+      atoms?"; 3-candidate "Did you mean X, Y, or Z atoms?".
+    - Kind-selector resolver: bare upper-case + lower-case;
+      morphology phrase ("the rules"); "both" / "either" /
+      "all" -> first candidate; non-kind fall-through; kind
+      not in candidates -> "".
+    - Session bookkeeping: vc_session_new initialises pending
+      slots empty; reset clears them; mid-clarify session is
+      pending.
+    - Dispatch: CLARIFY emits the question text + stashes
+      candidates + sets attempts=1; "RULE" reply resolves +
+      dispatches LIST_ALL RULE; "the facts" reply resolves
+      via morphology + dispatches LIST_ALL FACT; "both" reply
+      picks FIRST candidate; "cats" reply doesn't resolve +
+      re-emits with reduced patience + bumps attempts to 2;
+      a second non-resolution reply gives up + dispatches
+      first-match with apology prefix; "never mind" mid-
+      clarify cancels via vc_session_reset.
+    - Full chain: list all CONCEPT -> CLARIFY -> RULE -> new
+      query (the headline brief scenario).
+    - History: NO history entry on CLARIFY emit; +1 on
+      resolution.
+    - Env opt-out probe `vc_clarify_suppressed_by_env` returns
+      0 by default (clarify path active).
+
+* **R31F / R30F / R29C parity: 166 of the 167 prior assertions
+  still pass byte-identical**. The single relabel:
+
+  | # | Test                                       | Input                                          | Prior expected | New expected | Rationale                                                             |
+  |---|--------------------------------------------|------------------------------------------------|----------------|--------------|-----------------------------------------------------------------------|
+  | 1 | `test_kind_pivot_multi_kind_ambiguous_picks_first` | `'more facts and rules'` after CONCEPT | KIND_PIVOT     | CLARIFY      | R32F's headline path -- 2+ known kinds in remainder now route CLARIFY. The companion target-probe assertion (`= FACT`) is UNCHANGED. |
+
+  All other CLARIFY-adjacent assertions in the prior suite are
+  inputs the new path EXPLICITLY classifies as KIND_PIVOT
+  (single known kind) or PIVOT (no known kind) -- they stay
+  byte-identical.
+
+### Honest design caveat -- clarify-attempt counter persistence
+
+The clarify-attempt counter (slot
+`_VC_SESS_PENDING_ATTEMPTS`) persists across topic changes if
+the user PIVOTS during ambiguity through a path other than the
+explicit topic-shift markers. Explicit topic-shift markers
+("actually" / "never mind") DO clear pending state via
+`vc_session_reset`, but a more-cue PIVOT that lands mid-
+ambiguity (e.g. operator answers "tell me about cats" to a
+RULE/FACT clarify) is interpreted by
+`_vd_handle_pending_clarify` as a non-resolution. The counter
+bumps and we re-emit the clarify rather than restarting the
+ambiguity budget for the new topic. This is correct in the
+ambiguity-resolution context (the operator hasn't clearly told
+us they're shifting topic), but a 3-turn `FACT -> CLARIFY -> "actually CONCEPT"`
+interaction does lose the attempt counter due to the reset,
+which is the correct semantic.
+
+The mid-clarify response that NAMES a third known kind ("tell
+me more about CONCEPT" while RULE/FACT are pending) does NOT
+re-classify through the multi-kind detector either. We treat
+it as a non-resolution + bump the attempt counter. The
+argument for re-classification would be that the operator
+clearly shifted to CONCEPT; the argument against is that it's
+a semantic guess in a disambiguation context. We chose the
+simpler path; the multi-turn loop covers the gap (the operator
+can follow up with "actually CONCEPT" or wait for the give-up
+turn).
+
+### Concurrency note + stash discipline
+
+Followed the brief's strict ownership rules:
+
+  * `git stash push -m "R32F-preflight" -- <owned-paths>` (no
+    `-u`) was issued; sibling-agent untracked files were left
+    alone. Stash returned "No local changes to save" -- my
+    owned paths were clean at session start.
+  * Modified ONLY: `examples/voice_dialog.nova`,
+    `tests/unit/test_voice_dialog.nova`, `AUDIO_AUDIT.md`,
+    `NEXT_SESSION.md`, `README.md`. `voice_conversation.nova`,
+    `crossengin_chat.nova`, federation/safety modules
+    untouched.
+  * The sibling agent's WIP in `src/federation/nat_traversal.nova`
+    was preserved (not stashed, not committed).
+
+### Files touched (R25B.6 / R32F)
+
+* MOD: `examples/voice_dialog.nova` -- additive (~280 lines:
+  `VC_FOLLOWUP_CLARIFY` constant + accessor; `MAX_ATTEMPTS`
+  constant + accessor; `_vd_remainder_known_kinds_all` helper +
+  public probe; pending-clarify session slots + accessors;
+  `_vd_clarify_suppressed_by_env` probe + public wrapper;
+  `_vd_resolve_clarify_selector` parser + public probe;
+  `_vd_is_both_selector` helper; `_vd_render_clarify_question`
+  + public probe; classifier extension; CLARIFY dispatcher
+  branch; `_vd_handle_pending_clarify` resolution helper).
+  R28D / R29C / R30F / R31F code blocks unchanged (only
+  docstrings amended).
+* MOD: `tests/unit/test_voice_dialog.nova` -- additive (+40
+  assertions across +25 new test functions; 1 prior assertion
+  RELABELED to expect `vc_followup_clarify()` -- byte-identical
+  end-state for the companion target-probe assertion).
+* MOD: `AUDIO_AUDIT.md` (this section), `NEXT_SESSION.md`,
+  `README.md`.
+
+R8B / R15D / R21C / R25B / R25B.2 / R25B.3 / R25B.4 / R25B.5 /
+R28D / R29C / R30F / R31F modules and tests are untouched --
+R25B.6 is purely additive on top of R25B.5's dialog layer.
+
 ## R26C -- Spectral-subtraction Wiener noise reduction
 
 Closes the **frequency-domain denoising** gap in CrossEngin's audio chain.

@@ -3,6 +3,101 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R32B -- DTLS anti-replay sliding window per RFC 6347 §4.1.2.6 (R31B.2)
+
+**Status: complete** -- closes R31B's "no anti-replay sliding window
+yet" caveat. R31B (commit `af8e47c`) wired real P-256 ECDHE +
+AES-128-GCM into DTLS records but noted: "RECV\_SEQ advances
+monotonically on success only; the open path will NOT reject a
+replayed sealed record." R32B extends `src/federation/dtls12.nova`
+with the canonical RFC 6347 §4.1.2.6 algorithm.
+
+### What R32B delivers
+
+* **Four new state slots** at indices 32..35 (layout 0..31 stays
+  byte-identical):
+  * `DTLS_S_SLOT_RECV_HIGH_WATERMARK` (u64) -- highest validated seq.
+  * `DTLS_S_SLOT_RECV_REPLAY_MASK` (u64) -- 64-bit sliding bitmap,
+    bit i (LSB) represents seq `(high_watermark - i)`.
+  * `DTLS_S_SLOT_STATS_REPLAY` -- replay-rejected count.
+  * `DTLS_S_SLOT_STATS_TOO_OLD` -- too-old-rejected count.
+* **Two new error tags**: `DTLS_REPLAY` (replay within window),
+  `DTLS_TOO_OLD` (seq below `high_watermark - 63`). Both are
+  distinct from `DTLS_DECRYPT_FAIL` so a caller can tell pre-AEAD
+  rejection from AEAD oracle.
+* **Pure-function helpers**: `_dtls_anti_replay_check(state, seq)`
+  returns `DTLS_AR_OK` / `DTLS_AR_REPLAY` / `DTLS_AR_TOO_OLD`
+  without mutating state; `_dtls_anti_replay_update(state, seq)`
+  slides the window + sets the bit, called ONLY after AEAD passes.
+* **`dtls_open_record` integration**: anti-replay check fires
+  BEFORE the AEAD decrypt -- a replay short-circuits without
+  touching `gcm_open` (cheap reject + no AEAD oracle exposure).
+  Window mutation happens only AFTER the AEAD tag check passes,
+  so a forged record at `hw + N` with a bad MAC cannot advance
+  the watermark and lock out the legitimate next packet.
+* **Four new accessors**: `dtls_recv_high_watermark`,
+  `dtls_recv_replay_mask`, `dtls_stats_replay`, `dtls_stats_too_old`.
+* **`dtls_stats_line` extended** with `hi_watermark=`, `replay=`,
+  `too_old=` (additive -- prefix unchanged).
+
+### Verification
+
+* **66 new R32B unit assertions** in `tests/unit/test_dtls12.nova`
+  (extends additively; total 297; R31B's 84 + R29B's 147 = 231
+  prior assertions pass byte-identical).
+* `dtls12: OK (297 checks)`.
+* Coverage: sequential 1..4 accepted (watermark==4); replay seq=2
+  -> `DTLS_REPLAY` + STATS\_REPLAY bumps + watermark/mask
+  unchanged + aead\_in NOT bumped; big-jump 1->100 slides window
+  + clears mask + then seq=1 returns `DTLS_TOO_OLD`; out-of-order
+  1,5,3 -> 3 accepted, replay 3 -> `DTLS_REPLAY`; too-old
+  1,200,50 -> `DTLS_TOO_OLD` (delta 150 > 63); watermark=64
+  boundary (seq=1 in, seq=0 out); tamper-does-not-advance-window
+  (forge seq=10 with flipped tag byte -> AEAD fails -> watermark
+  + mask unchanged -> legitimate seq=1 still passes); replay
+  short-circuits before AEAD (no TAMPER\_\* counter bumps);
+  pure-helper synthetic-state probe; update-helper big-jump +
+  in-window-set; **end-to-end ECDHE round-trip**: Alice seals one
+  32B payload, Bob's first open returns plaintext byte-identical,
+  same sealed bytes replayed return `DTLS_REPLAY`.
+
+### Honest caveats
+
+1. **Cross-epoch handling deferred.** DTLS 1.2 ChangeCipherSpec
+   (epoch transition) must reset the replay window per RFC 6347
+   §4.1.2.6. R32B does NOT reset the slots on epoch change -- the
+   wire driver that issues CCS hasn't landed yet (still in
+   R31B.2's "no handshake state-machine integration" caveat).
+   When that lands it MUST clear `RECV_HIGH_WATERMARK` + `RECV_
+   REPLAY_MASK`.
+2. **64-bit window only.** RFC 6347 permits up to 256 bits; R32B
+   picks 64 to match OpenSSL's default. Sufficient for unicast
+   over UDP; high-rate out-of-order paths (e.g. SCTP-over-DTLS)
+   may want wider.
+3. **No constant-time bit-check.** `int_and(int_shr(mask, delta),
+   1)` cost depends on `delta` -- a timing-channel attacker could
+   distinguish replay-vs-accept latency. The leak is "this seq
+   was already seen", identical to what the `DTLS_REPLAY` return
+   exposes at the API level.
+4. **No epoch-aware sequence space.** A peer that re-keys via CCS
+   gets a fresh epoch + fresh seq=0 sequence space; until cross-
+   epoch reset lands, the window state from the OLD epoch would
+   reject the new epoch's seq=0 if hw was non-zero. Wire driver
+   must reset on every epoch boundary.
+
+### Files touched (R32B)
+
+* MOD: `src/federation/dtls12.nova` (+4 slots, 4 accessors, 2
+  error tags, 2 anti-replay helpers, anti-replay integration in
+  `dtls_open_record`, stats-line extension).
+* MOD: `tests/unit/test_dtls12.nova` (+14 functions, +66
+  assertions). R29B's 35 + R31B's 23 test functions stay byte-
+  identical and are still invoked from `main()`.
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
+
+R32B does NOT modify `p256.nova`, `aes_gcm.nova`, `webrtc.nova`,
+or any other federation module. Module count delta: 0.
+
 ## R32A -- nat\_traversal RFC 8489 UDP dispatch (R31C.2 / R28C consumer)
 
 **Status: complete** -- closes R31C's deferred R31C.2 by wiring
@@ -406,6 +501,124 @@ docs. R31C does NOT touch `stun_rfc8489.nova`, `ice.nova`,
 * MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md` (this),
   `README.md`.
 * `/home/user/NOVA` files NOT touched.
+
+---
+
+## R25B.6 -- voice dialog multi-kind clarifying question (R32F / R31F.2)
+
+**Status: complete -- `examples/voice_dialog.nova` extended additively
+(~280 lines: a new `VC_FOLLOWUP_CLARIFY` enum value, a new
+`_vd_remainder_known_kinds_all` multi-kind helper, a new pending-
+clarify session-slot quadruple, a new `_vd_resolve_clarify_selector`
+parser, a new `_vd_render_clarify_question` text builder, a new
+`_vd_handle_pending_clarify` resolution helper, a new
+`_vd_clarify_suppressed_by_env` env-opt-out probe, and a new
+`VC_FOLLOWUP_CLARIFY` dispatcher branch + early pending-resolution
+branch in `vc_session_turn`) + extended test file (+40 assertions
+across +25 new test functions; 1 prior assertion RELABELED from
+`vc_followup_kind_pivot()` to `vc_followup_clarify()` -- the
+"multi-kind ambiguous picks first" classifier expectation; the
+companion target-probe assertion `= FACT` is unchanged because
+the R31F single-kind helper still returns first-match).**
+
+### What R32F delivers
+
+* **New classifier output `VC_FOLLOWUP_CLARIFY = 5`** distinct from
+  KIND_PIVOT. Fires only when the more-cue path's remainder names
+  2+ known kinds AND the env opt-out `CE_VOICE_NO_CLARIFY` is
+  unset. Single-kind remainders still route KIND_PIVOT (R31F
+  byte-identical); no-kind remainders still route PIVOT (R30F
+  byte-identical).
+* **`_vd_remainder_known_kinds_all(now, exclude_kind_upper)`** -- the
+  multi-kind detector. Walks the stemmed remainder content set,
+  upcases each token, consults `_vd_known_kind`, dedups, returns
+  the UPPER-CASE list in tokeniser order. Public probe
+  `vc_remainder_known_kinds_all`.
+* **Pending-clarify session state** -- 4 new slots (kinds /
+  template / attempts / raw). Initialized empty by
+  `vc_session_new`; cleared by `vc_session_reset`. Public
+  accessors `vc_session_pending_clarify_*` + the boolean
+  `vc_session_is_pending_clarify`.
+* **`_vd_resolve_clarify_selector(lowered, candidates)`** -- the
+  kind-selector parser. Tries: (1) bare upper/lower-case kind
+  name; (2) "both" / "either" / "all" -> first candidate; (3)
+  morphology-scanned content words -> first surviving kind-named
+  token. Public probe `vc_resolve_clarify_selector`.
+* **`_vd_render_clarify_question(candidates)`** -- builds "Did
+  you mean RULE or FACT atoms?" for 2 candidates, "Did you mean
+  A, B, or C atoms?" for 3+. Public probe.
+* **`vc_session_turn` early branch** -- when mid-clarify, routes
+  the incoming transcript through `_vd_handle_pending_clarify`
+  FIRST (after the empty-transcript and topic-shift checks).
+  On hit: dispatch as KIND_PIVOT against chosen kind. On miss
+  with attempts < MAX (2): re-emit with reduced patience
+  ("Please answer with the kind name. ..."). On miss after MAX
+  retries: give up + first-match dispatch + apology prefix.
+* **CLARIFY dispatcher branch** -- stashes candidates + template
+  + attempts=1 + raw in the pending slots; emits the rendered
+  question. NO history entry is appended for the CLARIFY emit
+  (pending state IS the carry-forward signal).
+* **`CE_VOICE_NO_CLARIFY=1` env opt-out** -- when set, classifier
+  returns KIND_PIVOT on multi-kind (with first-match target via
+  R31F's helper) instead of CLARIFY. Byte-identical to R31F's
+  behaviour for callers / fixtures that prefer the older shape.
+
+### "both" handling
+
+Shipped: **first-candidate-wins** (option a from the brief).
+Rationale documented inline in `_vd_handle_pending_clarify`:
+the dialog layer dispatches one query at a time, the multi-turn
+loop covers the second-kind follow-up, first-match honours
+"never silently drop user intent". Rejected alternatives:
+multi-dispatch return shape (touches every public API);
+"I can only do one at a time" error (punishes the common
+"don't care, pick one" case).
+
+### Verification
+
+* **+40 unit assertions across +25 new test functions** in
+  `tests/unit/test_voice_dialog.nova`. R31F's 167 prior
+  assertions: 166 byte-identical, 1 RELABELED (the multi-kind
+  classifier expectation; companion target-probe unchanged).
+  Coverage spans the classifier directly + the dispatch +
+  the session bookkeeping + the kind-selector resolver + the
+  render helper + the env opt-out probe + the full
+  headline-brief chain (CONCEPT -> "more facts and rules" ->
+  CLARIFY -> "RULE" -> LIST_ALL RULE).
+
+### Honest caveat
+
+The clarify-attempt counter persists across non-explicit topic
+shifts (a non-resolution reply that names a third unrelated
+kind bumps the counter rather than restarting the ambiguity
+budget for the new topic). The explicit "actually" /
+"never mind" markers DO reset the session and cancel pending
+state. A mid-clarify response that names a THIRD known kind
+("tell me more about CONCEPT" while RULE/FACT are pending) is
+NOT re-classified through the multi-kind detector -- it's
+treated as a non-resolution + bump. Documented in
+`voice_dialog.nova` and `AUDIO_AUDIT.md` (R25B.6 section).
+
+### Concurrency + stash discipline
+
+* `git stash push -m "R32F-preflight" -- examples/voice_dialog.nova
+  tests/unit/test_voice_dialog.nova AUDIO_AUDIT.md
+  NEXT_SESSION.md README.md` (NO `-u`). Stash returned
+  "No local changes to save" -- my owned paths were clean
+  at session start. Sibling agent WIP in
+  `src/federation/nat_traversal.nova` left untouched.
+
+### Files touched (R32F)
+
+* MOD: `examples/voice_dialog.nova` (~280 additive lines).
+* MOD: `tests/unit/test_voice_dialog.nova` (+40 assertions
+  across +25 new test functions; 1 RELABELED).
+* MOD: `AUDIO_AUDIT.md` (new R25B.6 section).
+* MOD: `NEXT_SESSION.md` (this section).
+* MOD: `README.md` (short R25B.6 callout).
+* `voice_conversation.nova`, `crossengin_chat.nova`, any
+  federation / safety module NOT touched. R32F is purely
+  additive on top of R31F's dialog layer.
 
 ---
 

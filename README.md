@@ -13,6 +13,55 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R32B closes R31B's "no anti-replay sliding window yet" caveat by
+> extending `src/federation/dtls12.nova` with the canonical RFC 6347
+> §4.1.2.6 algorithm. R31B (commit `af8e47c`) wired real P-256 ECDHE
+> + AES-128-GCM into DTLS records but left `RECV_SEQ` advancing
+> monotonically on success only -- the open path would NOT reject a
+> replayed sealed record. R32B now does. Four new state slots
+> appended at indices 32..35 (preserving byte-identical layout of
+> slots 0..31): `RECV_HIGH_WATERMARK` (u64 highest validated seq),
+> `RECV_REPLAY_MASK` (64-bit sliding bitmap, bit i = "seq hw-i has
+> been seen"), `STATS_REPLAY`, `STATS_TOO_OLD`. Two new error tags
+> `DTLS_REPLAY` + `DTLS_TOO_OLD` distinct from `DTLS_DECRYPT_FAIL`
+> so callers can tell pre-AEAD rejection from AEAD oracle failure.
+> The anti-replay check runs BEFORE the AEAD decrypt -- a replay
+> short-circuits without calling `gcm_open`, both because it would
+> be wasted crypto work and (critically) because we do NOT want to
+> give an attacker an oracle on bogus seq numbers. The window
+> updates only AFTER the AEAD tag check passes, so a forged record
+> at `high_watermark + N` with a bad MAC cannot advance the
+> watermark and lock out the legitimate next packet. Algorithm:
+> S > hw -> tentatively accept (slide window after AEAD), S in
+> window with bit clear -> accept (set bit after AEAD), S in
+> window with bit set -> `DTLS_REPLAY`, S < hw-63 -> `DTLS_TOO_OLD`.
+> Verification: **66 new R32B unit assertions** in
+> `tests/unit/test_dtls12.nova` (total now 297; R31B's 84 + R29B's
+> 147 = 231 prior assertions pass byte-identical;
+> `dtls12: OK (297 checks)`). Coverage includes sequential
+> seq=1..4 (watermark advances to 4); replay seq=2 returns
+> `DTLS_REPLAY` and watermark/mask are unchanged; big-jump seq=1
+> then seq=100 slides window + clears mask + then seq=1 is
+> `DTLS_TOO_OLD`; out-of-order seq=1,5,3 -> 3 accepted, replay 3
+> -> `DTLS_REPLAY`; too-old seq=1,200,50 -> `DTLS_TOO_OLD`;
+> watermark=64 boundary; **tamper-does-not-advance-window**
+> (forge seq=10 with flipped tag -> AEAD fails -> watermark/mask
+> stay -> legitimate seq=1 still passes); replay short-circuits
+> before AEAD (no `TAMPER_*` counter bumps); end-to-end with
+> R31B's full ECDHE round-trip (Alice seals one 32B payload, Bob
+> opens cleanly, the SAME sealed bytes replayed return
+> `DTLS_REPLAY`). `dtls_stats_line` extended with `hi_watermark=`,
+> `replay=`, `too_old=` fields. Honest caveats: (a) cross-epoch
+> reset deferred -- DTLS 1.2 ChangeCipherSpec MUST reset the
+> window per RFC 6347 §4.1.2.6 and R32B does not yet do that
+> (wire driver landing in R31B.2's "no handshake state-machine
+> integration" follow-up); (b) 64-bit window only (RFC permits
+> 256; R32B matches the OpenSSL default); (c) no constant-time
+> bit-check (replay-vs-accept latency leaks the same fact the
+> distinct return code already does). R32B does NOT modify
+> `p256.nova`, `aes_gcm.nova`, `webrtc.nova`, or any other
+> federation module. Module count delta: 0.
+>
 > R32A closes R31C's deferred R31C.2 by wiring
 > `src/federation/nat_traversal.nova`'s RFC 8489 path to actual UDP
 > sockets via R28C's `sys_socket_udp` / `sys_sendto` /
@@ -797,6 +846,41 @@ computational units rather than orchestrating a pipeline of modules.
 > R21C TTS 68, R22F melody 40). Chat: `/pitch_auto <wav>` admin command
 > available via `pitch_run_auto_command` (not yet wired into the chat
 > dispatch table; reserved for an optional +1 admin line).
+>
+> R25B.6 closes R31F's deferred multi-kind ambiguity gap. A new
+> classifier output `VC_FOLLOWUP_CLARIFY` (the SIXTH class) fires
+> when the more-cue path's remainder names 2+ known kinds (e.g.
+> "more facts and rules" after CONCEPT). The dispatcher emits a
+> "Did you mean RULE or FACT atoms?" turn, stashes the candidate
+> kinds in a new session slot (`pending_clarify_kinds`), and
+> parses the NEXT user turn as a kind-selector FIRST. Bare kind
+> names ("RULE"), morphology-routed phrases ("the rules"), and the
+> "both" / "either" / "all" -> first-match shortcut all resolve to
+> a chosen kind which is then dispatched as KIND_PIVOT (prior
+> template against new kind, LIMIT reset). After 2 failed
+> resolution turns we give up: emit an apologetic message and
+> dispatch first-match KIND_PIVOT so the operator still gets a
+> usable answer. Env opt-out `CE_VOICE_NO_CLARIFY=1` preserves
+> R31F's deterministic "first kind wins" behaviour byte-identically.
+> New public probes: `vc_followup_clarify()`,
+> `voice_followup_clarify_candidates(session, query)`,
+> `vc_resolve_clarify_selector(query, candidates)`,
+> `vc_render_clarify_question(candidates)`,
+> `vc_clarify_suppressed_by_env()`, plus session accessors
+> `vc_session_pending_clarify_kinds`, `_template`, `_attempts`,
+> `_raw`, `vc_session_is_pending_clarify`. Honest design caveat:
+> the clarify-attempt counter persists across non-explicit topic
+> shifts (a non-resolution reply that names a third unrelated kind
+> bumps the counter rather than restarting the ambiguity budget;
+> the explicit "actually" / "never mind" markers DO reset the
+> session and cancel pending state). "both" shipped as
+> first-candidate-wins, rejecting the multi-dispatch shape that
+> would have touched every public API. Verification: +40 assertions
+> across +25 new test functions (test_voice_dialog now ~207 total),
+> 166 of the 167 prior assertions pass byte-identical, 1 prior
+> assertion RELABELED from `vc_followup_kind_pivot()` to
+> `vc_followup_clarify()` (the multi-kind classifier label; its
+> companion target-probe `= FACT` assertion is unchanged).
 >
 > R25B.5 closes R30F's deferred kind-pivot routing gap. A new
 > classifier output `VC_FOLLOWUP_KIND_PIVOT` (alongside CONTINUE /
