@@ -205,6 +205,16 @@ let DTLS_ERR_STUB       = "dtls: R29B2 stub"
 // the only legal external signal).
 let DTLS_DECRYPT_FAIL   = "dtls: decrypt fail"
 
+// R32B anti-replay failure tags. Per RFC 6347 §4.1.2.6 the receiver
+// maintains a sliding window of the most recent 64 sequence numbers
+// and rejects records that fall outside the window (DTLS_TOO_OLD) or
+// whose bit is already set (DTLS_REPLAY). Both rejections happen
+// BEFORE the AEAD decrypt attempt -- replays / too-old records are
+// cheap to drop, and we explicitly do NOT want to feed attacker-
+// controlled bytes to the AEAD oracle.
+let DTLS_REPLAY         = "dtls: replay"
+let DTLS_TOO_OLD        = "dtls: too old"
+
 // ============================================================================
 //                              Protocol constants
 // ============================================================================
@@ -365,6 +375,50 @@ let DTLS_S_SLOT_TAMPER_AAD         = 29  // int -- AAD-mismatch rejects
 let DTLS_S_SLOT_AEAD_RECORDS_OUT   = 30  // int -- successful seals
 let DTLS_S_SLOT_AEAD_RECORDS_IN    = 31  // int -- successful opens
 
+// ----------------------------------------------------------------------------
+// R32B anti-replay sliding window (RFC 6347 §4.1.2.6). Per-direction
+// receive-side state appended at the tail to preserve byte-identical
+// layout of slots 0..31 for any caller / test that indexes by slot.
+//
+// High-level algorithm:
+//   * `RECV_HIGH_WATERMARK` (u64) -- the largest sequence number we
+//     have ever VALIDATED (i.e. that survived the AEAD tag check).
+//     Bit 0 of `RECV_REPLAY_MASK` represents this seq.
+//   * `RECV_REPLAY_MASK` (u64) -- bitmap of the most recent 64 seqs.
+//     Bit i (LSB-indexed) represents whether seq (high_watermark - i)
+//     has been validated.
+//
+// On a received record with seq S:
+//   1. If S > high_watermark           -> ABOVE-WINDOW; tentatively
+//      accept (window will slide AFTER the AEAD tag check passes).
+//   2. If S <= high_watermark and (high_watermark - S) < 64 -> WITHIN
+//      WINDOW; check bit. If set -> REPLAY. If clear -> tentatively
+//      accept (will set bit AFTER AEAD passes).
+//   3. If S < high_watermark - 63      -> TOO_OLD; reject.
+//
+// The "tentative accept" + "window update only on AEAD success"
+// split is critical (deliverable 5): an attacker who forges a record
+// at seq high_watermark+1 with a bad MAC must NOT be able to advance
+// the window and thereby cause the legitimate next packet to be
+// dropped. The check is cheap (a shift + bit test) so doing it
+// before the AEAD call avoids spending crypto cycles on replays.
+//
+// Special case: at startup `RECV_HIGH_WATERMARK == 0` AND `RECV_
+// REPLAY_MASK == 0`. The convention is that bit 0 = 0 means "seq 0
+// not yet seen", so seq=0 is acceptable on the first open call and
+// rejected as a replay on the second.
+//
+// `RECV_STATS_REPLAY` / `RECV_STATS_TOO_OLD` are independent
+// counters bumped on the corresponding rejection path -- they let
+// the test suite assert which path was taken without inspecting
+// last_err strings (a stable telemetry surface).
+// ----------------------------------------------------------------------------
+
+let DTLS_S_SLOT_RECV_HIGH_WATERMARK = 32  // u64 -- highest validated seq
+let DTLS_S_SLOT_RECV_REPLAY_MASK    = 33  // u64 bitmap (LSB = high_watermark)
+let DTLS_S_SLOT_STATS_REPLAY        = 34  // int -- replay-rejected count
+let DTLS_S_SLOT_STATS_TOO_OLD       = 35  // int -- too-old-rejected count
+
 fn dtls_init() {
     let st = list_new()
     push(st, DTLS_S_INIT)        // state
@@ -400,6 +454,11 @@ fn dtls_init() {
     push(st, 0)                  // tamper_aad
     push(st, 0)                  // aead_records_out
     push(st, 0)                  // aead_records_in
+    // R32B anti-replay slots; all zero (no records validated yet).
+    push(st, 0)                  // recv_high_watermark
+    push(st, 0)                  // recv_replay_mask
+    push(st, 0)                  // stats_replay
+    push(st, 0)                  // stats_too_old
     return st
 }
 
@@ -1286,6 +1345,10 @@ fn dtls_aead_records_in(state)  { return state[DTLS_S_SLOT_AEAD_RECORDS_IN] }
 fn dtls_tamper_ct_count(state)  { return state[DTLS_S_SLOT_TAMPER_CT] }
 fn dtls_tamper_tag_count(state) { return state[DTLS_S_SLOT_TAMPER_TAG] }
 fn dtls_tamper_aad_count(state) { return state[DTLS_S_SLOT_TAMPER_AAD] }
+fn dtls_recv_high_watermark(state) { return state[DTLS_S_SLOT_RECV_HIGH_WATERMARK] }
+fn dtls_recv_replay_mask(state)    { return state[DTLS_S_SLOT_RECV_REPLAY_MASK] }
+fn dtls_stats_replay(state)        { return state[DTLS_S_SLOT_STATS_REPLAY] }
+fn dtls_stats_too_old(state)       { return state[DTLS_S_SLOT_STATS_TOO_OLD] }
 fn dtls_master_secret(state)    { return state[DTLS_S_SLOT_MASTER_SECRET] }
 fn dtls_key_block(state)        { return state[DTLS_S_SLOT_KEY_BLOCK] }
 fn dtls_local_pub(state)        { return state[DTLS_S_SLOT_LOCAL_PUB] }
@@ -1631,6 +1694,86 @@ fn dtls_seal_record(state, type_byte, plaintext_buf, pt_n) {
 }
 
 // ----------------------------------------------------------------------------
+// R32B anti-replay sliding window (RFC 6347 §4.1.2.6).
+//
+// `_dtls_anti_replay_check(state, seq)` is PURE-FUNCTION: it inspects
+// the current `RECV_HIGH_WATERMARK` + `RECV_REPLAY_MASK` and returns:
+//   0 -- accept (caller must call AEAD; on AEAD success, then call
+//        `_dtls_anti_replay_update`)
+//   1 -- REPLAY (seq is within the window AND bit was already set)
+//   2 -- TOO_OLD (seq is more than 63 below the high watermark)
+// No state mutation -- this is critical for the "tamper does not
+// advance the window" property: if AEAD fails after the pre-check,
+// the window stays where it was so the legitimate next packet still
+// validates.
+//
+// `_dtls_anti_replay_update(state, seq)` is called ONLY when both
+// the pre-check returned 0 AND the AEAD tag check succeeded. It
+// slides the window (if seq > high_watermark) and sets the bit
+// for seq, then writes both slots back.
+//
+// The bit-shift / mask arithmetic uses Nova's arbitrary-precision
+// integers; we still mask the result back into the low 64 bits
+// after each shift so the bitmap genuinely represents a 64-bit
+// window (sliding bits off the top would be wrong if Nova ints
+// grew unboundedly past 64).
+// ----------------------------------------------------------------------------
+
+let _DTLS_REPLAY_WINDOW = 64
+let _DTLS_REPLAY_MASK64 = 18446744073709551615   // (1 << 64) - 1
+
+let DTLS_AR_OK      = 0
+let DTLS_AR_REPLAY  = 1
+let DTLS_AR_TOO_OLD = 2
+
+fn _dtls_anti_replay_check(state, seq) {
+    let hw = state[DTLS_S_SLOT_RECV_HIGH_WATERMARK]
+    let mask = state[DTLS_S_SLOT_RECV_REPLAY_MASK]
+    if seq > hw {
+        // Above the window. Tentatively accept; the slide happens
+        // in `_dtls_anti_replay_update` after the AEAD passes.
+        return DTLS_AR_OK
+    }
+    // seq <= hw. Within window iff (hw - seq) < 64.
+    let delta = hw - seq
+    if delta >= _DTLS_REPLAY_WINDOW {
+        return DTLS_AR_TOO_OLD
+    }
+    // Within window. Bit `delta` (LSB-indexed) represents seq.
+    let bit = int_and(int_shr(mask, delta), 1)
+    if bit == 1 {
+        return DTLS_AR_REPLAY
+    }
+    return DTLS_AR_OK
+}
+
+fn _dtls_anti_replay_update(state, seq) {
+    let hw = state[DTLS_S_SLOT_RECV_HIGH_WATERMARK]
+    let mask = state[DTLS_S_SLOT_RECV_REPLAY_MASK]
+    if seq > hw {
+        // Slide the window: shift the mask left by (seq - hw) so
+        // existing bits move further into the past. If the shift is
+        // >= 64 the old bits all leave the window -- mask is cleared.
+        let shift = seq - hw
+        if shift >= _DTLS_REPLAY_WINDOW {
+            mask = 0
+        } else {
+            mask = int_and(int_shl(mask, shift), _DTLS_REPLAY_MASK64)
+        }
+        // Bit 0 now represents the new high watermark.
+        mask = int_or(mask, 1)
+        state[DTLS_S_SLOT_RECV_HIGH_WATERMARK] = seq
+    } else {
+        // Within-window accept: just set the bit for this seq.
+        let delta = hw - seq
+        let bit_pos = int_shl(1, delta)
+        mask = int_and(int_or(mask, bit_pos), _DTLS_REPLAY_MASK64)
+    }
+    state[DTLS_S_SLOT_RECV_REPLAY_MASK] = mask
+    return 1
+}
+
+// ----------------------------------------------------------------------------
 // dtls_open_record(state, buf, n)
 //
 // Reverse of dtls_seal_record. Parses the 13-byte header, recovers the
@@ -1638,14 +1781,30 @@ fn dtls_seal_record(state, type_byte, plaintext_buf, pt_n) {
 // receive key/IV. Computes pt_n = body_n - 8 - 16, builds AAD with
 // pt_n as the length, hands ciphertext+tag to gcm_open.
 //
+// R32B order of operations:
+//   1. Parse the header and extract `seq`.
+//   2. Run `_dtls_anti_replay_check(state, seq)` BEFORE the AEAD
+//      decrypt. A replay or too-old record is rejected here without
+//      ever touching gcm_open -- both because it would be wasted
+//      crypto work and (critically) because we do NOT want to give
+//      an attacker an oracle on bogus seq numbers.
+//   3. On accept, run gcm_open. If the tag fails, the window state
+//      is NOT updated (the high_watermark and replay_mask stay
+//      where they were).
+//   4. On tag success, call `_dtls_anti_replay_update(state, seq)`
+//      which slides the window / sets the bit, then bumps the
+//      legacy `RECV_SEQ` + records-in counters.
+//
 // On success: returns [type_byte, pt_buf, pt_n, seq], bumps recv_seq +
 // recv counters.
-// On failure: returns DTLS_DECRYPT_FAIL, bumps the appropriate tamper
-// counter (ciphertext vs tag vs AAD vs other). We CANNOT distinguish
-// ct-tamper from tag-tamper at this layer without re-running gcm_open
-// twice -- so the counter assignment is heuristic: callers that want
-// to track distinct paths construct distinct test calls and check the
-// counter that bumped after each call.
+// On REPLAY: returns DTLS_REPLAY, bumps STATS_REPLAY.
+// On TOO_OLD: returns DTLS_TOO_OLD, bumps STATS_TOO_OLD.
+// On AEAD failure: returns DTLS_DECRYPT_FAIL, bumps the appropriate
+// tamper counter (ciphertext vs tag vs AAD vs other). We CANNOT
+// distinguish ct-tamper from tag-tamper at this layer without re-
+// running gcm_open twice -- so the counter assignment is heuristic:
+// callers that want to track distinct paths construct distinct test
+// calls and check the counter that bumped after each call.
 // ----------------------------------------------------------------------------
 fn dtls_open_record(state, buf, n) {
     if state[DTLS_S_SLOT_CIPHER_ACTIVE] == 0 { return DTLS_DECRYPT_FAIL }
@@ -1657,6 +1816,24 @@ fn dtls_open_record(state, buf, n) {
     let body_n    = _dtls_get_u16(buf, 11)
     if DTLS_RECORD_HDR_LEN + body_n > n { return DTLS_DECRYPT_FAIL }
     if body_n < 8 + 16 { return DTLS_DECRYPT_FAIL }
+    // R32B anti-replay sliding window (RFC 6347 §4.1.2.6). The check
+    // runs BEFORE the AEAD attempt so a replay is rejected cheaply and
+    // without giving an attacker the chance to feed crafted bytes to
+    // the AEAD primitive. The window is mutated only AFTER the AEAD
+    // tag check passes -- a forged record at seq=hw+N with a bad MAC
+    // must not be able to advance the window and lock out the
+    // legitimate next packet.
+    let ar = _dtls_anti_replay_check(state, seq)
+    if ar == DTLS_AR_REPLAY {
+        state[DTLS_S_SLOT_STATS_REPLAY] = state[DTLS_S_SLOT_STATS_REPLAY] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_REPLAY
+        return DTLS_REPLAY
+    }
+    if ar == DTLS_AR_TOO_OLD {
+        state[DTLS_S_SLOT_STATS_TOO_OLD] = state[DTLS_S_SLOT_STATS_TOO_OLD] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_TOO_OLD
+        return DTLS_TOO_OLD
+    }
     let ct_n = body_n - 8 - 16
     let pt_n_expected = ct_n        // GCM is a stream cipher: ct_n == pt_n.
     let key = _dtls_open_key(state)
@@ -1682,11 +1859,20 @@ fn dtls_open_record(state, buf, n) {
         // Default: bump TAG (the most common gcm_open failure mode in
         // practice). Specialized callers use the tamper-bucket
         // helpers below to attribute correctly.
+        //
+        // R32B: AEAD failure does NOT advance the replay window.
+        // High watermark + replay mask are LEFT UNTOUCHED here so a
+        // tampered packet cannot lock out the legitimate next packet
+        // (deliverable 5 of the R32B brief).
         state[DTLS_S_SLOT_TAMPER_TAG] = state[DTLS_S_SLOT_TAMPER_TAG] + 1
         return DTLS_DECRYPT_FAIL
     }
     let pt_buf = opened[0]
     let pt_n   = opened[1]
+    // AEAD passed -- only NOW do we commit the window update. The
+    // anti-replay state cannot be advanced by attacker-forged bytes
+    // because gcm_open rejected them above.
+    _dtls_anti_replay_update(state, seq)
     state[DTLS_S_SLOT_RECV_SEQ] = seq + 1
     state[DTLS_S_SLOT_RECORDS_IN]      = state[DTLS_S_SLOT_RECORDS_IN] + 1
     state[DTLS_S_SLOT_AEAD_RECORDS_IN] = state[DTLS_S_SLOT_AEAD_RECORDS_IN] + 1
@@ -1788,6 +1974,9 @@ fn dtls_stats_line(state) {
         + " hs_in=" + int_to_str(state[DTLS_S_SLOT_HS_IN])
         + " rtx=" + int_to_str(state[DTLS_S_SLOT_FLIGHT_RTX])
         + " suite=" + int_to_str(state[DTLS_S_SLOT_CIPHER_SUITE])
+        + " hi_watermark=" + int_to_str(state[DTLS_S_SLOT_RECV_HIGH_WATERMARK])
+        + " replay=" + int_to_str(state[DTLS_S_SLOT_STATS_REPLAY])
+        + " too_old=" + int_to_str(state[DTLS_S_SLOT_STATS_TOO_OLD])
 }
 
 // ============================================================================

@@ -1254,6 +1254,416 @@ fn test_open_rejects_short_buffer() {
 }
 
 // ============================================================================
+//   R32B -- anti-replay sliding window (RFC 6347 §4.1.2.6)
+// ============================================================================
+//
+// R31B (commit `af8e47c`) noted in its exit caveat: "no anti-replay
+// sliding window yet -- RECV_SEQ advances monotonically on success
+// only; the open path does NOT reject a replayed sealed record". The
+// tests below close that R31B.2 item.
+//
+// The window-driven tests need to feed `dtls_open_record` records
+// with arbitrary seq numbers. The R31B path runs send_seq off the
+// state itself (starts at 0, +1 per seal), so to get a seq=N record
+// we either bump SEND_SEQ before sealing, or seal repeatedly. We use
+// the SEND_SEQ-poke approach since it's far cheaper -- the state
+// slot is public-by-list-index and overwriting it just steers the
+// next seal at a chosen seq.
+
+// --------------------------------------------------------------------
+// Helper: seal a fresh APPLICATION_DATA record from `alice` at a chosen
+// send_seq. Returns [buf, total] like dtls_seal_record.
+// --------------------------------------------------------------------
+fn _tdtls_seal_at_seq(alice, seq, payload_buf, payload_n) {
+    // Poke SEND_SEQ so the next seal stamps the chosen seq.
+    alice[25] = seq           // DTLS_S_SLOT_SEND_SEQ
+    return dtls_seal_record(alice, DTLS_CT_APPLICATION_DATA,
+                            payload_buf, payload_n)
+}
+
+// --------------------------------------------------------------------
+// 24) Initial state of the anti-replay window is zero.
+// --------------------------------------------------------------------
+fn test_anti_replay_init_state_zero() {
+    let st = dtls_init()
+    ce_eq("init recv_high_watermark == 0",
+          dtls_recv_high_watermark(st), 0)
+    ce_eq("init recv_replay_mask == 0",
+          dtls_recv_replay_mask(st), 0)
+    ce_eq("init stats_replay == 0", dtls_stats_replay(st), 0)
+    ce_eq("init stats_too_old == 0", dtls_stats_too_old(st), 0)
+}
+
+// --------------------------------------------------------------------
+// 25) Sequential seq 1, 2, 3, 4 all accepted; watermark advances to 4.
+// --------------------------------------------------------------------
+fn test_anti_replay_sequential_accept() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    let s1 = _tdtls_seal_at_seq(alice, 1, pt, 16)
+    let s2 = _tdtls_seal_at_seq(alice, 2, pt, 16)
+    let s3 = _tdtls_seal_at_seq(alice, 3, pt, 16)
+    let s4 = _tdtls_seal_at_seq(alice, 4, pt, 16)
+    let o1 = dtls_open_record(bob, s1[0], s1[1])
+    let o2 = dtls_open_record(bob, s2[0], s2[1])
+    let o3 = dtls_open_record(bob, s3[0], s3[1])
+    let o4 = dtls_open_record(bob, s4[0], s4[1])
+    ce_check("seq=1 accepted", str_eq(o1, DTLS_REPLAY) == 0)
+    ce_check("seq=2 accepted", str_eq(o2, DTLS_REPLAY) == 0)
+    ce_check("seq=3 accepted", str_eq(o3, DTLS_REPLAY) == 0)
+    ce_check("seq=4 accepted", str_eq(o4, DTLS_REPLAY) == 0)
+    ce_eq("watermark == 4 after sequential 1..4",
+          dtls_recv_high_watermark(bob), 4)
+    ce_eq("stats_replay == 0 after sequential",
+          dtls_stats_replay(bob), 0)
+    ce_eq("stats_too_old == 0 after sequential",
+          dtls_stats_too_old(bob), 0)
+}
+
+// --------------------------------------------------------------------
+// 26) Replay seq=2 after watermark=4 -> DTLS_REPLAY; counter bumps,
+//     watermark + mask UNCHANGED.
+// --------------------------------------------------------------------
+fn test_anti_replay_replay_rejected() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    // Drive bob's watermark to 4 first.
+    let s1 = _tdtls_seal_at_seq(alice, 1, pt, 16)
+    let s2 = _tdtls_seal_at_seq(alice, 2, pt, 16)
+    let s3 = _tdtls_seal_at_seq(alice, 3, pt, 16)
+    let s4 = _tdtls_seal_at_seq(alice, 4, pt, 16)
+    dtls_open_record(bob, s1[0], s1[1])
+    dtls_open_record(bob, s2[0], s2[1])
+    dtls_open_record(bob, s3[0], s3[1])
+    dtls_open_record(bob, s4[0], s4[1])
+    let hw_before = dtls_recv_high_watermark(bob)
+    let mask_before = dtls_recv_replay_mask(bob)
+    let before_replay = dtls_stats_replay(bob)
+    let before_aead_in = dtls_aead_records_in(bob)
+    // Replay seq=2 (we still have the sealed bytes from above).
+    let opened = dtls_open_record(bob, s2[0], s2[1])
+    ce_check("replayed seq=2 returns DTLS_REPLAY",
+             str_eq(opened, DTLS_REPLAY) == 1)
+    ce_eq("stats_replay bumped exactly once",
+          dtls_stats_replay(bob) - before_replay, 1)
+    ce_eq("watermark unchanged by replay",
+          dtls_recv_high_watermark(bob), hw_before)
+    ce_eq("replay mask unchanged by replay",
+          dtls_recv_replay_mask(bob), mask_before)
+    ce_eq("aead_records_in NOT bumped by replay",
+          dtls_aead_records_in(bob) - before_aead_in, 0)
+    ce_check("last_err == DTLS_REPLAY",
+             str_eq(dtls_last_error(bob), DTLS_REPLAY) == 1)
+}
+
+// --------------------------------------------------------------------
+// 27) Big jump: seq=1 then seq=100. Window slides to 100, mask
+//     cleared of all old bits, bit 0 set.
+// --------------------------------------------------------------------
+fn test_anti_replay_big_jump_slides_window() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    let s1   = _tdtls_seal_at_seq(alice, 1,   pt, 16)
+    let s100 = _tdtls_seal_at_seq(alice, 100, pt, 16)
+    let o1   = dtls_open_record(bob, s1[0], s1[1])
+    let o100 = dtls_open_record(bob, s100[0], s100[1])
+    ce_check("seq=1 accepted", str_eq(o1, DTLS_REPLAY) == 0)
+    ce_check("seq=100 accepted", str_eq(o100, DTLS_REPLAY) == 0)
+    ce_eq("watermark slides to 100",
+          dtls_recv_high_watermark(bob), 100)
+    // After the big jump (>=64), the prior mask bits all shifted out.
+    // Only bit 0 (for seq=100) is set.
+    ce_eq("mask == 1 (only new high set)",
+          dtls_recv_replay_mask(bob), 1)
+    // Now seq=1 is too old: 100 - 1 = 99 > 63.
+    let s1b = _tdtls_seal_at_seq(alice, 1, pt, 16)
+    let before_too_old = dtls_stats_too_old(bob)
+    let replay_attempt = dtls_open_record(bob, s1b[0], s1b[1])
+    ce_check("seq=1 after watermark=100 is TOO_OLD",
+             str_eq(replay_attempt, DTLS_TOO_OLD) == 1)
+    ce_eq("stats_too_old bumped",
+          dtls_stats_too_old(bob) - before_too_old, 1)
+}
+
+// --------------------------------------------------------------------
+// 28) Out-of-order delivery within window:
+//     seq=1, seq=5, then seq=3 (which is in window since 5-3=2 < 64).
+//     Bit for seq=3 was clear -> accept. Replay seq=3 -> REPLAY.
+// --------------------------------------------------------------------
+fn test_anti_replay_out_of_order_within_window() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    let s1 = _tdtls_seal_at_seq(alice, 1, pt, 16)
+    let s5 = _tdtls_seal_at_seq(alice, 5, pt, 16)
+    let s3 = _tdtls_seal_at_seq(alice, 3, pt, 16)
+    dtls_open_record(bob, s1[0], s1[1])
+    dtls_open_record(bob, s5[0], s5[1])
+    ce_eq("watermark == 5 after 1,5", dtls_recv_high_watermark(bob), 5)
+    let before_replay = dtls_stats_replay(bob)
+    let o3 = dtls_open_record(bob, s3[0], s3[1])
+    ce_check("seq=3 (in window, bit clear) accepted",
+             str_eq(o3, DTLS_REPLAY) == 0)
+    ce_eq("watermark still 5 (3 < 5)",
+          dtls_recv_high_watermark(bob), 5)
+    ce_eq("stats_replay unchanged", dtls_stats_replay(bob), before_replay)
+    // Replay seq=3 -> REPLAY (bit was set by previous accept).
+    let s3b = _tdtls_seal_at_seq(alice, 3, pt, 16)
+    let o3b = dtls_open_record(bob, s3b[0], s3b[1])
+    ce_check("replayed seq=3 returns DTLS_REPLAY",
+             str_eq(o3b, DTLS_REPLAY) == 1)
+    ce_eq("stats_replay bumped on second seq=3",
+          dtls_stats_replay(bob) - before_replay, 1)
+}
+
+// --------------------------------------------------------------------
+// 29) Too-old rejection:
+//     seq=1, seq=200, then seq=50 (200-50=150 > 63) -> TOO_OLD.
+// --------------------------------------------------------------------
+fn test_anti_replay_too_old_rejected() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    let s1   = _tdtls_seal_at_seq(alice, 1,   pt, 16)
+    let s200 = _tdtls_seal_at_seq(alice, 200, pt, 16)
+    let s50  = _tdtls_seal_at_seq(alice, 50,  pt, 16)
+    dtls_open_record(bob, s1[0], s1[1])
+    dtls_open_record(bob, s200[0], s200[1])
+    ce_eq("watermark == 200", dtls_recv_high_watermark(bob), 200)
+    let before_too_old = dtls_stats_too_old(bob)
+    let before_aead_in = dtls_aead_records_in(bob)
+    let o50 = dtls_open_record(bob, s50[0], s50[1])
+    ce_check("seq=50 too old returns DTLS_TOO_OLD",
+             str_eq(o50, DTLS_TOO_OLD) == 1)
+    ce_eq("stats_too_old bumped",
+          dtls_stats_too_old(bob) - before_too_old, 1)
+    ce_eq("aead_records_in NOT bumped by too-old reject",
+          dtls_aead_records_in(bob) - before_aead_in, 0)
+    ce_check("last_err == DTLS_TOO_OLD",
+             str_eq(dtls_last_error(bob), DTLS_TOO_OLD) == 1)
+}
+
+// --------------------------------------------------------------------
+// 30) Edge boundary: with watermark=64, seq=0 is still in window
+//     (64 - 0 = 64 -- equals window width, so OUT of window per the
+//     RFC's strict `< 64`). seq=1 is in window (64-1=63 < 64).
+// --------------------------------------------------------------------
+fn test_anti_replay_boundary_window_edge() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    // Drive watermark to 64.
+    let s64 = _tdtls_seal_at_seq(alice, 64, pt, 16)
+    dtls_open_record(bob, s64[0], s64[1])
+    ce_eq("watermark == 64", dtls_recv_high_watermark(bob), 64)
+    // seq=1: 64-1=63 < 64 -> in window, bit clear -> accept.
+    let s1 = _tdtls_seal_at_seq(alice, 1, pt, 16)
+    let o1 = dtls_open_record(bob, s1[0], s1[1])
+    ce_check("seq=1 (in window edge) accepted",
+             str_eq(o1, DTLS_REPLAY) == 0)
+    // seq=0: 64-0=64 >= 64 -> TOO_OLD per the strict <64 check.
+    let s0 = _tdtls_seal_at_seq(alice, 0, pt, 16)
+    let o0 = dtls_open_record(bob, s0[0], s0[1])
+    ce_check("seq=0 at exact boundary is TOO_OLD",
+             str_eq(o0, DTLS_TOO_OLD) == 1)
+}
+
+// --------------------------------------------------------------------
+// 31) Tamper-does-not-advance-window: forge a record at seq=10 with a
+//     flipped tag byte. The pre-check accepts (10 > 0), AEAD fails,
+//     watermark + mask MUST stay at their pre-call values so the
+//     legitimate next packet at seq=1 still passes.
+// --------------------------------------------------------------------
+fn test_anti_replay_tamper_does_not_advance_window() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    let s10 = _tdtls_seal_at_seq(alice, 10, pt, 16)
+    // Flip the LAST byte (within the tag) -> AEAD will reject.
+    let buf10 = s10[0]
+    let total10 = s10[1]
+    store8(buf10 + total10 - 1, int_xor(load8(buf10 + total10 - 1), 1))
+    let hw_before = dtls_recv_high_watermark(bob)
+    let mask_before = dtls_recv_replay_mask(bob)
+    let before_aead_in = dtls_aead_records_in(bob)
+    let opened = dtls_open_record(bob, buf10, total10)
+    ce_check("tampered seq=10 fails -> DTLS_DECRYPT_FAIL",
+             str_eq(opened, DTLS_DECRYPT_FAIL) == 1)
+    ce_eq("watermark unchanged after AEAD-fail",
+          dtls_recv_high_watermark(bob), hw_before)
+    ce_eq("replay mask unchanged after AEAD-fail",
+          dtls_recv_replay_mask(bob), mask_before)
+    ce_eq("aead_records_in NOT bumped by AEAD-fail",
+          dtls_aead_records_in(bob) - before_aead_in, 0)
+    // Now the legitimate next packet at seq=1 must still pass.
+    let s1 = _tdtls_seal_at_seq(alice, 1, pt, 16)
+    let o1 = dtls_open_record(bob, s1[0], s1[1])
+    ce_check("legitimate seq=1 still passes after tamper",
+             str_eq(o1, DTLS_REPLAY) == 0)
+    ce_eq("seq=1 advanced watermark to 1",
+          dtls_recv_high_watermark(bob), 1)
+}
+
+// --------------------------------------------------------------------
+// 32) Replay short-circuits BEFORE AEAD: the heuristic TAMPER_TAG
+//     counter is NOT bumped by a replay rejection (only by an AEAD
+//     fail). This is the key cheap-reject property.
+// --------------------------------------------------------------------
+fn test_anti_replay_short_circuits_before_aead() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(16, 7)
+    let s5 = _tdtls_seal_at_seq(alice, 5, pt, 16)
+    dtls_open_record(bob, s5[0], s5[1])
+    let before_tag = dtls_tamper_tag_count(bob)
+    let before_ct  = dtls_tamper_ct_count(bob)
+    let before_aad = dtls_tamper_aad_count(bob)
+    // Replay seq=5.
+    let opened = dtls_open_record(bob, s5[0], s5[1])
+    ce_check("replay returns DTLS_REPLAY",
+             str_eq(opened, DTLS_REPLAY) == 1)
+    ce_eq("TAMPER_TAG NOT bumped (AEAD not called)",
+          dtls_tamper_tag_count(bob), before_tag)
+    ce_eq("TAMPER_CT NOT bumped (AEAD not called)",
+          dtls_tamper_ct_count(bob), before_ct)
+    ce_eq("TAMPER_AAD NOT bumped (AEAD not called)",
+          dtls_tamper_aad_count(bob), before_aad)
+}
+
+// --------------------------------------------------------------------
+// 33) Anti-replay check internals on a synthetic state. Direct probe
+//     of `_dtls_anti_replay_check` against known watermark + mask
+//     values to verify the algorithm independent of the AEAD path.
+// --------------------------------------------------------------------
+fn test_anti_replay_pure_check_helper() {
+    let st = dtls_init()
+    // Synth state: watermark=10, mask = bits 0, 2 set (i.e. seqs 10
+    // and 8 already seen).
+    st[32] = 10                  // DTLS_S_SLOT_RECV_HIGH_WATERMARK
+    st[33] = 5                   // bits 0 + 2 -> 0b101
+    // seq=11 (above watermark) -> ACCEPT (0).
+    ce_eq("check seq=11 above-window -> OK",
+          _dtls_anti_replay_check(st, 11), 0)
+    // seq=10 (= watermark, bit 0 set) -> REPLAY (1).
+    ce_eq("check seq=10 == hw bit set -> REPLAY",
+          _dtls_anti_replay_check(st, 10), 1)
+    // seq=9 (delta=1, bit 1 clear) -> ACCEPT (0).
+    ce_eq("check seq=9 in window bit clear -> OK",
+          _dtls_anti_replay_check(st, 9), 0)
+    // seq=8 (delta=2, bit 2 set) -> REPLAY (1).
+    ce_eq("check seq=8 in window bit set -> REPLAY",
+          _dtls_anti_replay_check(st, 8), 1)
+    // seq=0 -- delta=10 -- bit 10 clear (mask = 5) -> ACCEPT (0).
+    ce_eq("check seq=0 delta=10 bit clear -> OK",
+          _dtls_anti_replay_check(st, 0), 0)
+}
+
+// --------------------------------------------------------------------
+// 34) Anti-replay update helper: shifts mask correctly on a jump
+//     larger than the window (clears mask, sets bit 0).
+// --------------------------------------------------------------------
+fn test_anti_replay_update_big_jump_clears_mask() {
+    let st = dtls_init()
+    // Initial state hw=5, mask=0b11 (bits for seq=5 and seq=4 set).
+    st[32] = 5
+    st[33] = 3
+    _dtls_anti_replay_update(st, 200)
+    ce_eq("hw updated to 200", st[32], 200)
+    ce_eq("mask cleared then bit 0 set after big jump", st[33], 1)
+}
+
+// --------------------------------------------------------------------
+// 35) Anti-replay update helper: in-window set bit at the right
+//     position without disturbing other bits.
+// --------------------------------------------------------------------
+fn test_anti_replay_update_in_window_sets_bit() {
+    let st = dtls_init()
+    st[32] = 10
+    st[33] = 1               // only bit 0 (seq=10) set
+    _dtls_anti_replay_update(st, 8)
+    ce_eq("hw unchanged on in-window update", st[32], 10)
+    // bits 0 + 2 set -> 0b101 = 5
+    ce_eq("mask now has bits 0 + 2 set", st[33], 5)
+}
+
+// --------------------------------------------------------------------
+// 36) End-to-end with R31B's ECDHE round-trip: replay one of Alice's
+//     sealed records to Bob; second open returns DTLS_REPLAY.
+//
+// This is the cross-cut acceptance test for the brief's deliverable
+// 7 -- it mirrors R31B's `test_seal_open_roundtrip_16B` (which uses
+// `_tdtls_setup_ecdhe_pair` for the full ECDHE pipeline) and then
+// asserts that the SAME sealed bytes replayed to Bob are rejected.
+// --------------------------------------------------------------------
+fn test_end_to_end_replay_after_ecdhe() {
+    let pair = _tdtls_setup_ecdhe_pair()
+    let alice = pair[0]
+    let bob   = pair[1]
+    let pt = _tdtls_make_payload(32, 99)
+    let sealed = dtls_seal_record(alice, DTLS_CT_APPLICATION_DATA, pt, 32)
+    ce_check("alice seal ok (e2e)", sealed != 0)
+    // First open succeeds.
+    let first = dtls_open_record(bob, sealed[0], sealed[1])
+    ce_check("bob first open succeeds",
+             str_eq(first, DTLS_REPLAY) == 0)
+    ce_check("first open not DECRYPT_FAIL",
+             str_eq(first, DTLS_DECRYPT_FAIL) == 0)
+    ce_check("first open plaintext byte-identical",
+             _tdtls_buf_eq(first[1], pt, 32) == 1)
+    let before_replay = dtls_stats_replay(bob)
+    let before_aead_in = dtls_aead_records_in(bob)
+    // Replay the exact same sealed bytes.
+    let second = dtls_open_record(bob, sealed[0], sealed[1])
+    ce_check("bob second open returns DTLS_REPLAY",
+             str_eq(second, DTLS_REPLAY) == 1)
+    ce_eq("stats_replay bumped exactly once on e2e replay",
+          dtls_stats_replay(bob) - before_replay, 1)
+    ce_eq("aead_records_in NOT bumped on e2e replay",
+          dtls_aead_records_in(bob) - before_aead_in, 0)
+}
+
+// --------------------------------------------------------------------
+// 37) Stats line includes the new R32B fields.
+// --------------------------------------------------------------------
+fn test_stats_line_includes_replay_fields() {
+    let st = dtls_init()
+    let line = dtls_stats_line(st)
+    // We don't pin the exact format, just that the new keys exist.
+    let has_hi = 0
+    let has_replay = 0
+    let has_too_old = 0
+    let i = 0
+    while i + 12 < len(line) {
+        if str_eq(substr(line, i, 12), "hi_watermark") == 1 { has_hi = 1 }
+        i = i + 1
+    }
+    i = 0
+    while i + 6 < len(line) {
+        if str_eq(substr(line, i, 6), "replay") == 1 { has_replay = 1 }
+        i = i + 1
+    }
+    i = 0
+    while i + 7 < len(line) {
+        if str_eq(substr(line, i, 7), "too_old") == 1 { has_too_old = 1 }
+        i = i + 1
+    }
+    ce_eq("stats line mentions hi_watermark", has_hi, 1)
+    ce_eq("stats line mentions replay", has_replay, 1)
+    ce_eq("stats line mentions too_old", has_too_old, 1)
+}
+
+// ============================================================================
 //                          main
 // ============================================================================
 
@@ -1317,6 +1727,21 @@ fn main() {
     test_cross_side_bidirectional_smoke()
     test_seal_rejects_oversize()
     test_open_rejects_short_buffer()
+    // R32B -- anti-replay sliding window (RFC 6347 §4.1.2.6).
+    test_anti_replay_init_state_zero()
+    test_anti_replay_sequential_accept()
+    test_anti_replay_replay_rejected()
+    test_anti_replay_big_jump_slides_window()
+    test_anti_replay_out_of_order_within_window()
+    test_anti_replay_too_old_rejected()
+    test_anti_replay_boundary_window_edge()
+    test_anti_replay_tamper_does_not_advance_window()
+    test_anti_replay_short_circuits_before_aead()
+    test_anti_replay_pure_check_helper()
+    test_anti_replay_update_big_jump_clears_mask()
+    test_anti_replay_update_in_window_sets_bit()
+    test_end_to_end_replay_after_ecdhe()
+    test_stats_line_includes_replay_fields()
     ce_summary("dtls12")
 }
 
