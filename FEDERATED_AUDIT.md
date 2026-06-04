@@ -2031,3 +2031,368 @@ srl_stats_line(srl)
   recv\[0\] plaintext equals the originator's input "ciphertext-from-A"
   (E2E round-trip through unreading C confirmed), B's
   decrypt\_failed >= 1 (the tampered second frame was rejected).
+
+## R28E extension: WebRTC data-channel signaling for browser-to-soul federation
+
+CrossEngin federation up to R27 is native-only: every transport is a
+raw TCP socket (R18E gossip, R26E relay) or a stubbed-pending UDP
+hole-punch (R23E NAT traversal). Browsers cannot open arbitrary
+AF\_INET sockets -- the only federation-eligible transport from a
+browser tab is WebRTC. R28E ships the **signaling half** of WebRTC
+data-channel support so a browser participant can complete the SDP
+offer/answer handshake against a NOVA soul; the data plane (DTLS +
+SRTP + SCTP-over-DTLS + ICE) is a documented stub that the R28E.2
+follow-up will fill in.
+
+### Architecture
+
+```
+   +--- offerer (browser or soul) ---+   HTTP signaling   +--- answerer (soul) ---+
+   |                                 |  -----------       |                       |
+   |  rtc_create_offer(state)        |  POST /rtc/offer   |  rtc_receive_offer    |
+   |    -> SDP offer string          +------------------> |    -> SDP answer      |
+   |                                 |  body = SDP offer  |       string          |
+   |                                 |                    |    -> registers       |
+   |                                 |  <-----------------+       session record  |
+   |  rtc_receive_answer(state, ans) |  HTTP 200 body =   |                       |
+   |    -> 1 ok                      |       SDP answer   |                       |
+   |                                 |                    |                       |
+   |  rtc_send(state, ch, payload)   |                    |                       |
+   |    -> RTC_ERR_NEEDS_DTLS  <-----+---STUB---+         |                       |
+   |  rtc_recv(state, ch)            |                    |                       |
+   |    -> RTC_ERR_NEEDS_DTLS  <-----+---STUB---+         |                       |
+   +---------------------------------+   (R28E.2)         +-----------------------+
+```
+
+The SDP shape the module emits + accepts is the minimum-viable
+data-channel skeleton:
+
+```
+v=0
+o=- <session_id> 1 IN IP4 0.0.0.0
+s=-
+t=0 0
+m=application 9 DTLS/SCTP webrtc-datachannel
+c=IN IP4 0.0.0.0
+a=ice-ufrag:<placeholder>
+a=ice-pwd:<placeholder>
+a=fingerprint:sha-256 <32 bytes placeholder>
+a=setup:<actpass|active>
+a=mid:0
+a=sctp-port:5000
+a=max-message-size:262144
+```
+
+The fingerprint / ice-ufrag / ice-pwd attribute values are wire-shape
+PLACEHOLDERS in R28E -- the real values require a DTLS X.509 self-
+signed cert (whose SHA-256 hash becomes the fingerprint) and an ICE
+agent (which assigns ufrag/pwd). The SDP passes syntax checks
+(rtc\_parse\_sdp validates v=0 / o= / s= + presence of m=application);
+a real browser attempting to actually negotiate a DTLS session against
+an R28E peer would see the handshake fail at the DTLS layer, which is
+the correct stub semantics (signaling succeeded; data-plane is
+honestly unimplemented).
+
+### Public API
+
+```
+rtc_init()                                    -> rtc_state
+rtc_create_offer(state)                       -> sdp_offer_string
+rtc_receive_offer(state, sdp_offer)           -> sdp_answer_string |
+                                                 RTC_ERR_BAD_SDP
+rtc_receive_answer(state, sdp_answer)         -> 1 ok | RTC_ERR_BAD_SDP
+rtc_send(state, channel, payload)             -> RTC_ERR_NEEDS_DTLS |
+                                                 RTC_ERR_NO_CHANNEL
+rtc_recv(state, channel)                      -> RTC_ERR_NEEDS_DTLS |
+                                                 RTC_ERR_NO_CHANNEL
+rtc_signaling_register(http_state, rtc_state) -> 0 (stub; R28E.2)
+rtc_channel_open(state, session_id)           -> channel | 0
+rtc_session_count(state)                      -> int
+rtc_stats_offers_created / _offers_received / _answers_received /
+   _bad_sdp / _send_attempts / _recv_attempts
+rtc_stats_line(state)                         -> one-liner
+
+# parser helpers
+rtc_parse_sdp(sdp)                            -> list of [k,v] | 0
+rtc_sdp_field(parsed, key)                    -> first value | ""
+rtc_sdp_has_media_app(parsed)                 -> 1 | 0
+rtc_sdp_attrs(parsed)                         -> list of a= values
+rtc_sdp_has_attr_prefix(parsed, prefix)       -> 1 | 0
+rtc_format_sdp(lines)                         -> CRLF-joined string
+rtc_alloc_session_id(state)                   -> monotonic uint string
+```
+
+### Honest scope (R28E.2 follow-up list)
+
+The R28E commit honestly stubs four substantial sub-systems. Each
+must land before browser-to-soul WebRTC federation is functional
+end-to-end:
+
+1. **DTLS 1.2 / 1.3 client + server.** The bulk of the missing
+   work. Requires:
+   * X.509 cert generation (self-signed) + SHA-256 fingerprint for
+     the SDP `a=fingerprint:` attribute.
+   * Full DTLS record layer (epoch, sequence number, MAC).
+   * DTLS handshake state machine (ClientHello / ServerHello /
+     Certificate / ServerKeyExchange / CertificateRequest /
+     CertificateVerify / Finished / retransmission timers).
+   * Cipher-suite negotiation (ECDHE-ECDSA-AES128-GCM-SHA256 at
+     minimum for current browser interop).
+   * SRTP master-key extraction via RFC 5705 `extractor`.
+
+2. **ICE agent (RFC 8445 + RFC 8839).** Required for the SDP
+   `ice-ufrag` / `ice-pwd` attributes + the actual UDP path the
+   data channel rides over:
+   * STUN client compliant with RFC 8489 (R23E ships a STUN-LIKE
+     wire that's NOT RFC 8489 -- it's a CrossEngin internal
+     two-line text protocol). The ICE agent needs the real STUN
+     wire format with magic cookie + transaction id + attribute
+     TLVs.
+   * Candidate gathering: host candidates (every local interface),
+     server-reflexive candidates (via STUN binding), relayed
+     candidates (via TURN).
+   * Connectivity checks: priority-ordered candidate-pair tests
+     with STUN binding requests; nominated-pair selection;
+     consent-freshness checks.
+   * Trickle ICE (RFC 8838) so candidates can be sent as they're
+     gathered rather than batched into the SDP.
+
+3. **SRTP (RFC 3711).** Master keys extracted from DTLS-SRTP key
+   derivation feed an SRTP context per data-channel stream:
+   * AES-128-GCM encryption + HMAC-SHA1 / GCM tag.
+   * Per-packet sequence number + roll-over counter.
+   * SRTP -> SCTP framing on top.
+
+4. **STUN / TURN server interaction.** Even with the client side
+   working, ICE needs an external STUN server (Google's
+   stun:stun.l.google.com:19302 is the canonical public one) for
+   server-reflexive candidates, and ideally a TURN server for
+   relayed candidates when both ends are behind symmetric NATs.
+   R28E.2 can either ship CrossEngin's own STUN/TURN server (RFC
+   5389 / RFC 5766) or document configuring an external one. The
+   ICE agent needs to learn server addresses from a config + drive
+   them.
+
+Additional smaller follow-ups:
+
+* **HTTP signaling endpoint integration.** R28E's
+  `rtc_signaling_register` is a stub -- it doesn't actually wire the
+  REST endpoints into `src/io/transducers/stream_http.nova` because
+  that listener accepts only `POST /api/event` and was not designed
+  for path routing. R28E.2 needs to either (a) extend stream\_http
+  with a dispatch table on path, or (b) ship a dedicated `/rtc/*`
+  listener on a separate port.
+* **SCTP framing.** WebRTC data channels actually ride SCTP framed
+  inside DTLS records. R28E.2 can either ship the SCTP layer
+  (RFC 4960) or get away with a CrossEngin-internal framing if the
+  use-case is soul-to-soul only (not browser-to-soul).
+* **WebSocket signaling fallback.** Some signaling deployments use
+  WebSocket instead of REST. R28E.2 may want to add a WS shim on
+  top of the same `rtc_create_offer` / `rtc_receive_offer` API so
+  the same module serves both transports.
+
+### Verification
+
+* Unit (`tests/unit/test_webrtc.nova`): **59 assertions** -- init
+  zero-state (8); session-id monotonicity (2); offer SDP shape (10:
+  begins with v=0, parseable, has o= / s= / m=application,
+  carries setup:actpass + fingerprint: + ice-ufrag: attributes,
+  bumps offers\_created, registers a session); SDP parser tolerance
+  + rejection (5 LF/CRLF + 4 malformed-input cases: empty, missing
+  v=0, missing o=, missing s=); receive\_offer happy path (6 emits
+  answer, parseable, m=application, setup:active, bumps offers\_rx,
+  registers session); receive\_offer malformed (3: bumps bad\_sdp +
+  no session created); receive\_offer rejects audio-only (2);
+  receive\_answer happy path (2); receive\_answer malformed (2);
+  rtc\_send / rtc\_recv return RTC\_ERR\_NEEDS\_DTLS (4: incl.
+  stats counters bumped); null-channel handling (2);
+  rtc\_signaling\_register returns 0 (stub; 2 calls); stats-line
+  shape (2); offer/answer round-trip across two states alice + bob
+  (5: each side ends up with a registered session + the expected
+  counters).
+
+* Integration: documented in this audit but not run end-to-end.
+  A real browser-to-soul WebRTC test requires a real browser
+  driving the JS WebRTC API + a NOVA soul running the signaling
+  endpoint, plus the R28E.2 DTLS / ICE / SRTP layers to actually
+  complete the connection. The R28E codepath that CAN be
+  exercised in CI (the SDP parse + format round-trip + the stub
+  error returns) IS exercised by the unit suite.
+
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- 217 unit
+  tests pass (1 new in R28E). All 5 federation baselines hold:
+  gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
+  leader\_election 40. Module count +1.
+
+## R28A extension: async DRFETCH dispatch + adaptive timeout (R21B follow-up)
+
+### Why this exists
+
+R27E (commit `ada38e1`) shipped the scenario\_yyyy convergence-stress
+suite that runs R21B's distributed rule inference under realistic CI
+jitter: 5 souls, 10-edge parent chain split 2-per-soul, hard latency
+budget. The empirical finding documented in that round: R21B
+**converges algorithmically** (the 3-soul scenario\_eeee proves it)
+but **behaviourally degrades on loaded hosts**. R21B's per-round
+DRFETCH fan-out is synchronous: the originator dials peer 1, waits
+for the DRFACT stream + DREND, then dials peer 2, etc. Each TCP
+socket carries the gossip module's default `GOSSIP_PING_TIMEOUT_MS =
+500` RCVTIMEO. A peer that takes > 500 ms to send DREND triggers
+recv-EAGAIN; subsequent rounds see fewer peers in the alive set
+(because gossip's PING/ACK cadence and DRFETCH share the
+`gossip_on_timeout` codepath in spirit -- a slow peer accumulates
+suspicion across both probe types); the federated parent set
+shrinks; the chain extension stops short of full closure. R27E's
+empirical numbers: 5-soul stable mesh derives 20-40 of the 55
+ancestor pairs under realistic jitter rather than the algorithmic
+55.
+
+### What R28A delivers
+
+1. **Adaptive per-peer DRFETCH timeout.** Every successful DRFETCH
+   records a round-trip latency sample (start = post-OK send of
+   `DRFETCH <pred>`; end = receipt of `DREND`). Each peer carries a
+   rolling window of the most recent `DR_LATENCY_WINDOW = 5`
+   samples; the median is recomputed on every push. The next
+   DRFETCH to that peer uses
+   `timeout_ms = min(DR_FETCH_MAX_TIMEOUT_MS, max(DR_FETCH_MIN_TIMEOUT_MS, 2 × median + DR_FETCH_TIMEOUT_PAD_MS))`
+   with MAX = 5000 ms, MIN = 200 ms, PAD = 200 ms. With no samples
+   yet (the first round after `dr_init`) we fall back to the legacy
+   500 ms default so the cold-start behaviour is identical to R21B.
+
+2. **Pipelined dispatch (fan-out then collect).** The synchronous
+   loop interleaves dial+send+recv-DREND per peer. R28A separates
+   the dispatch and collect phases:
+
+   * **Phase 1 (dispatch).** For every alive peer != self, open a
+     TCP connection, run the HELLO/OK handshake, record `start_ns =
+     nanotime()`, send `DRFETCH <pred>`. Failed dials and failed
+     HELLOs are silently skipped (no SUSPECT propagation).
+     Accumulate a list of `[fd, start_ns, peer_addr]` handles. The
+     dials happen back-to-back without waiting for ACKs in between,
+     so kernel-level TCP handshakes overlap with the time spent in
+     user-space serializing the DRFETCH lines.
+
+   * **Phase 2 (collect).** For each open handle, set the per-peer
+     adaptive `_gossip_set_rcvtimeo_ms`, drain `DRFACT` lines until
+     `DREND` or the timer fires, append facts to the output. On
+     `DREND` the observed round-trip is pushed onto the peer's
+     latency window; on timeout the `STATS_LATE_DROPS` counter is
+     incremented and the peer's existing latency window is left
+     untouched (so a one-off jitter doesn't poison the median).
+
+   NOVA's socket builtins are blocking with `SO_RCVTIMEO`; there is
+   no `poll(2)` / `select(2)` primitive. The "async" name describes
+   the dispatch shape (fan-out then collect) not the wire-level
+   concurrency. The win is materially measurable even on a
+   loopback mesh: the 4-peer dispatch pass completes in ~ tens of
+   milliseconds (just the latency of 4 connect + send sequences)
+   while the legacy synchronous path stalls a 4-peer round on the
+   first slow peer for up to 4 × 500 ms = 2 s worst case.
+
+3. **Late-ACK isolation.** When the adaptive RCVTIMEO fires before
+   `DREND`, the collect path closes the fd, increments
+   `STATS_LATE_DROPS`, and continues. It does **not** call
+   `gossip_on_timeout` -- the gossip layer's PING/ACK liveness probe
+   remains the only source of `SUSPECT` marks. R21B's existing
+   `gossip_dr_fetch_from` already had this property; R28A preserves
+   it for the pipelined path.
+
+4. **Opt-in via `CE_DR_ASYNC_FETCH` env var.** Values `on`, `1`,
+   `yes` (any case) enable the pipelined path; everything else / unset
+   leaves R21B's synchronous loop in place. The env var is read once
+   in `dr_init` and cached on the dr\_state record at
+   `DR_S_ASYNC_FETCH_OPT`; a test/operator hook `dr_set_async_fetch(dr,
+   on)` flips the flag at runtime without re-reading the environment.
+
+### dr\_state slot additions (R21B layout extended additively)
+
+   | Slot | Index | Type | Purpose |
+   |------|-------|------|---------|
+   | `DR_S_PEER_LATENCIES` | 14 | list of `[addr, [ms...], median]` | per-peer rolling DRFETCH RTT |
+   | `DR_S_ASYNC_FETCH_OPT` | 15 | int (0/1) | `CE_DR_ASYNC_FETCH` cache |
+   | `DR_S_STATS_ASYNC_RX` | 16 | int | # peers DREND'd via async path |
+   | `DR_S_STATS_LATE_DROPS` | 17 | int | # peers whose adaptive RCVTIMEO fired |
+   | `DR_S_STATS_TIMEOUT_ADJ` | 18 | int | # times calculator clamped at MAX |
+
+   `dr_is_state` still requires `len >= 14` so a pre-R28A
+   stub-constructed dr\_state still type-checks. `dr_init` always
+   populates the full 19-slot layout.
+
+### New public API
+
+   * `dr_async_fetch_opt(dr)` -> 0 / 1
+   * `dr_set_async_fetch(dr, on)` -> 0 / 1 (the accepted value)
+   * `dr_stats_async_rx(dr)`, `dr_stats_late_drops(dr)`,
+     `dr_stats_timeout_adj(dr)` -- counter accessors
+   * `dr_peer_median_ms(dr, peer_addr)` -> int ms, -1 if no samples
+   * `dr_peer_latency_count(dr, peer_addr)` -> int (0..5)
+   * `dr_adaptive_timeout_for(dr, peer_addr)` -> ms (defaults to 500
+     with no samples, clamped to [200, 5000] otherwise)
+   * `dr_peer_latency_table(dr)` -> list of records (diagnostic)
+   * `dr_inject_peer_latency_sample(dr, addr, lat_ms)` -- test hook
+     to drive the median calculator without live sockets
+
+### Verification
+
+* Unit (`tests/unit/test_dr_async_fetch.nova`): **35 assertions**
+  across 16 tests. Bootstrap shape + env-var cache + slot defaults
+  (4); `dr_set_async_fetch` toggle (3); `dr_adaptive_timeout_for`
+  return-value invariants (default with no samples, median × 2 +
+  PAD, floor clamp at 200 ms, ceiling clamp at 5000 ms, handles
+  zero-valued samples, 5-sample median) (12); per-peer latency
+  table rolling-window cap (3); per-peer median independence (2);
+  `STATS_TIMEOUT_ADJ` purity of the calculator helper (the counter
+  bumps in `_dr_collect_one`, not in the read-only accessor) (2);
+  stats line includes `async= async_rx= late_drops= timeout_adj=`
+  tokens (2); async flag ON + no peers produces local-only closure
+  with no spurious late-drop bumps (3); async flag OFF preserves
+  R21B's 3-ancestor closure on a local 2-edge chain (4); late-ACK
+  bump does not propagate to the gossip `SUSPECT` counter (2);
+  latency table accessor returns the right shape (2).
+
+* Re-running R21B's existing unit (`test_distributed_rules.nova`):
+  **42 assertions unchanged**; all green.
+
+* Re-running R27E's integration scenario
+  (`tests/integration/scenario_yyyy_rule_convergence.sh`) with
+  `CE_DR_ASYNC_FETCH=on` exported: STABLE 5-soul sub-scenario
+  derives **the full 55 ancestor closure** rather than the 20-40
+  partial R27E documented; DROP sub-scenario remains within
+  [12, 25] (post-cut reachability closure); REJOIN sub-scenario
+  recovers full closure post-rejoin; LATENCY sub-scenarios at peer
+  counts 2..5 stay sub-quadratic. The scenario\_yyyy script itself
+  is unchanged; the env var propagates via the parent shell's
+  environment into every `launch_soul` child process.
+
+* All other federation suites (R18E gossip, R19E leader, R20B rule
+  inference, R20E distributed query, R20F snapshot attestation,
+  R21E noise gossip, R26E gossip relay, R27C relay-secure) remain
+  green; module count unchanged at 191 (R28A is purely additive
+  inside `src/federation/distributed_rules.nova`).
+
+### Limitations / future work
+
+1. **No poll(2)/select(2) so dispatch is pipelined not parallel.**
+   When NOVA grows a multi-fd readiness primitive, the collect phase
+   should walk fds in ACK-arrival order rather than dispatch order.
+   The current order is "fast peers ACKed before the loop runs", so
+   the dispatch order is a reasonable approximation but the worst
+   case is still N × adaptive\_timeout when every peer holds out
+   until their timer fires.
+2. **Median is a coarse summary.** A peer that swings between 50 ms
+   and 800 ms has a 425 ms median that's neither prompt nor patient
+   for the actual workload. P95 with EWMA would be more responsive;
+   the R28A median is the cheapest thing that beats a hardcoded 500
+   ms ceiling.
+3. **No per-rule-evaluation budget.** A pathological mesh where
+   every peer hits the MAX timeout drives a single fixpoint round to
+   `N × 5 s`. A higher-level "give up this fixpoint pass after T
+   seconds" budget would bound the worst case more aggressively;
+   the driver in `scenario_yyyy_rule_convergence_driver` already
+   takes this shape (4 fixpoint passes of <= 15 rounds each) but
+   the underlying gather doesn't yet honor a deadline.
+4. **No DELTA-fed warm cache.** Same item as R21B's open list.
+   A subsequent round could ride DELTA's existing belief-mutation
+   stream to keep a local materialised relation cache + only
+   DRFETCH on cache miss.

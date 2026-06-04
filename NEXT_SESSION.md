@@ -3,7 +3,83 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R25B.2 (this session) -- Multi-turn voice dialogue (conversation state)
+## R28E (this session) -- WebRTC data-channel signaling (browser-to-soul federation)
+
+**Status: complete -- new `src/federation/webrtc.nova` (~648 lines)
+ships the SIGNALING half of WebRTC. SDP offer/answer round-trip works
+end-to-end; the data plane (DTLS + ICE + SRTP + SCTP-over-DTLS) is a
+documented STUB returning `RTC_ERR_NEEDS_DTLS` until R28E.2.**
+
+### What R28E delivers
+
+* New module `src/federation/webrtc.nova` -- leaf, no CrossEngin
+  imports. Public API: `rtc_init`, `rtc_create_offer`,
+  `rtc_receive_offer`, `rtc_receive_answer`, `rtc_send` (stub),
+  `rtc_recv` (stub), `rtc_signaling_register` (stub), plus
+  `rtc_parse_sdp` / `rtc_sdp_field` / `rtc_sdp_has_media_app` /
+  `rtc_sdp_attrs` / `rtc_sdp_has_attr_prefix` / `rtc_format_sdp` /
+  `rtc_alloc_session_id` / `rtc_channel_open` /
+  `rtc_channel_session` plus 7 stats accessors +
+  `rtc_stats_line`.
+* SDP shape: `v=0`, `o=- <sid> 1 IN IP4 0.0.0.0`, `s=-`, `t=0 0`,
+  `m=application 9 DTLS/SCTP webrtc-datachannel`,
+  `c=IN IP4 0.0.0.0`, placeholder `a=ice-ufrag:` / `a=ice-pwd:` /
+  `a=fingerprint:sha-256`, `a=setup:actpass` (offer) or
+  `a=setup:active` (answer), `a=mid:0`, `a=sctp-port:5000`,
+  `a=max-message-size:262144`. CRLF line endings on emit; parser
+  accepts both CRLF and LF.
+* Honest stub: `rtc_send` / `rtc_recv` bump attempt counters then
+  return `RTC_ERR_NEEDS_DTLS = "rtc: needs DTLS (R28E.2 stub)"`.
+
+### Verification
+
+* **59 unit assertions** in `tests/unit/test_webrtc.nova` (NEW;
+  19 tests). Coverage: init zero-state, session-id monotonicity,
+  offer SDP shape, SDP parser tolerance + rejection (malformed /
+  missing-v / missing-o / missing-s / audio-only),
+  receive\_offer + receive\_answer happy + malformed paths,
+  send/recv return needs-DTLS + counter bumps, null-channel
+  handling, signaling\_register stub, stats line, full alice<->bob
+  round-trip.
+* Integration scenario stub documented in FEDERATED\_AUDIT.md
+  but NOT run end-to-end (real browser required + R28E.2 layers).
+* All 217 unit tests pass (+1 new). Federation baselines hold:
+  gossip\_relay 61, gossip 34, noise\_xk 44, nat\_traversal 53,
+  leader\_election 40.
+
+### Honest scope (R28E.2 follow-up list)
+
+1. **DTLS 1.2 / 1.3 client + server** -- bulk of missing work:
+   X.509 self-signed cert + SHA-256 fingerprint, full record
+   layer, handshake state machine, cipher-suite negotiation
+   (ECDHE-ECDSA-AES128-GCM-SHA256 minimum for browser interop),
+   SRTP master-key extraction via RFC 5705.
+2. **ICE agent (RFC 8445 + RFC 8839)** -- RFC-8489 STUN client
+   (R23E ships a STUN-LIKE wire that's NOT RFC 8489); candidate
+   gathering (host / srflx / relay); connectivity checks; nominated-
+   pair selection; ideally Trickle ICE.
+3. **SRTP (RFC 3711)** -- AES-128-GCM + per-packet seq# / ROC on
+   DTLS-derived keys; SRTP -> SCTP framing on top.
+4. **STUN / TURN server** -- either ship CE's own (RFC 5389 /
+   5766) or document configuring an external one (canonical
+   `stun:stun.l.google.com:19302`).
+
+Smaller items: wire `rtc_signaling_register` into
+`src/io/transducers/stream_http.nova` (currently accepts only
+`/api/event`; needs path routing or a `/rtc/*` listener); SCTP
+framing; optional WebSocket signaling alongside REST.
+
+### Files touched (R28E)
+
+* NEW: `src/federation/webrtc.nova` (~648 lines, 17 public fns).
+* NEW: `tests/unit/test_webrtc.nova` (59 assertions, 19 tests).
+* MOD: `examples/crossengin_chat.nova` (+1 help line +1 dispatch line).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md` (this), `README.md`.
+* `/home/user/NOVA` files NOT touched.
+
+---
+
+## R25B.2 (previous session) -- Multi-turn voice dialogue (conversation state)
 
 **Status: complete -- new `examples/voice_dialog.nova` (~600 lines)
 closes the conversation-state hole at the top of R25B's deferred list.

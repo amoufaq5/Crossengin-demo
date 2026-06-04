@@ -11,7 +11,56 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R27E stress-tests R21B distributed rule inference (commit
+> toolchain. R28E lands `src/federation/webrtc.nova` -- the SIGNALING
+> half of WebRTC data-channel support for browser-to-soul federation.
+> CrossEngin federation up to R27 is native-only (TCP/UDP raw sockets);
+> browsers cannot open arbitrary AF\_INET sockets, so a browser
+> participant in a CE federation needs WebRTC. R28E ships the
+> HTTP-signaled SDP offer/answer exchange: `rtc_create_offer(state)`
+> emits a well-formed `v=0` / `o=` / `s=` /
+> `m=application 9 DTLS/SCTP webrtc-datachannel` SDP with placeholder
+> ice-ufrag / ice-pwd / fingerprint / setup attributes (the values
+> are wire-shape-only; real values require the R28E.2 DTLS + ICE
+> work); `rtc_receive_offer(state, sdp_offer)` parses + emits an
+> answer with `a=setup:active`; `rtc_receive_answer(state,
+> sdp_answer)` accepts the answer + patches the matching offer's
+> remote\_id slot. The data plane is the documented R28E.2 STUB:
+> `rtc_send(state, channel, payload)` and `rtc_recv(state, channel)`
+> both return the sentinel
+> `RTC_ERR_NEEDS_DTLS = "rtc: needs DTLS (R28E.2 stub)"`. R28E.2
+> follow-up list: (1) **DTLS 1.2 / 1.3 client + server** (X.509
+> self-signed cert + SHA-256 fingerprint, full record layer,
+> handshake state machine, cipher-suite negotiation
+> ECDHE-ECDSA-AES128-GCM-SHA256 minimum for browser interop, SRTP
+> master-key extraction via RFC 5705); (2) **ICE agent** (RFC 8445 /
+> 8839) -- RFC-8489 STUN client (R23E ships a STUN-LIKE wire that's
+> NOT RFC 8489), candidate gathering (host / srflx / relay),
+> connectivity checks, nominated-pair selection; (3) **SRTP**
+> (RFC 3711) AES-128-GCM + per-packet seq# on DTLS-derived keys; (4)
+> **STUN / TURN server interaction** (ship CE's own RFC 5389 / 5766
+> or document configuring `stun:stun.l.google.com:19302`). Smaller
+> follow-ups: wire `rtc_signaling_register` into
+> `src/io/transducers/stream_http.nova` (today accepts only
+> `/api/event`; needs path routing or `/rtc/*` listener); SCTP
+> framing on top of DTLS records; optional WebSocket signaling
+> alongside REST. Verification: **59-assertion unit suite** in
+> `tests/unit/test_webrtc.nova` (NEW; 19 tests) covers init defaults,
+> session-id monotonicity, offer SDP shape (v=0 first +
+> m=application + setup:actpass + fingerprint + ice-ufrag),
+> CRLF-vs-LF parser tolerance, rejection of empty / missing-v /
+> missing-o / missing-s / audio-only SDP, receive\_offer happy +
+> rejection paths, receive\_answer happy + malformed, rtc\_send /
+> rtc\_recv return `RTC_ERR_NEEDS_DTLS` + bump attempt counters,
+> null-channel returns `RTC_ERR_NO_CHANNEL`, signaling\_register
+> stub, stats line, full alice<->bob round-trip. Integration scenario
+> documented in FEDERATED\_AUDIT.md but NOT run end-to-end (a real
+> browser-to-soul test needs a real browser + the R28E.2 DTLS / ICE /
+> SRTP stack). All 217 unit tests pass (+1 new); federation
+> baselines hold: gossip\_relay 61, gossip 34, noise\_xk 44,
+> nat\_traversal 53, leader\_election 40. Module count +1
+> (`src/federation/webrtc.nova`).
+>
+> R27E stress-tests R21B distributed rule inference (commit
 > `d752b9b`, federation/distributed\_rules.nova) under realistic network
 > jitter: peer drops mid-fixpoint, peer rejoin via gossip rediscovery,
 > and convergence latency growth as the soul count scales 1->5. R21B's
