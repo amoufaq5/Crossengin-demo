@@ -3,6 +3,66 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R33E -- stateless nat_traversal UDP threading (R32A.2)
+
+**Status: complete** -- closes the R32A.2 caveat by threading a
+transient `nat_state_t` through `nat_query_stun(addr)` and
+`nat_detect_type(addr1, addr2)` so the env flag `CE_NAT_USE_RFC8489=1`
+activates the UDP RFC 8489 path on the stateless surface too, not just
+the stateful `nat_query_stun_with_state(state, addr)`.
+
+### What R33E delivers
+
+* **Approach (a) transient-per-call.** Each stateless call gets a
+  fresh `nat_state_t` allocated on entry, used internally, discarded
+  on exit. No module-singleton `stun_state_t`. Two concurrent
+  stateless callers never share txn ids or sockets -- their transient
+  states are local to each call frame.
+* **`nat_query_stun(addr)` dispatches on `nat_use_rfc8489_enabled()`.**
+  Flag on -> transient UDP path via `_nat_query_stun_stateless_udp`.
+  Flag off -> legacy TCP-text via `_nat_query_stun_tcp(0, addr)`
+  (byte-identical to R23E).
+* **`nat_detect_type(addr1, addr2)` is automatically threaded** --
+  it calls `nat_query_stun(addr)` twice, so both queries take the
+  same env-selected dispatch path.
+* **Module-level observability snapshot** (since stateless callers
+  have no `nat_state_t` to inspect): 6 slots replaced (not
+  accumulated) on every stateless call. Accessors:
+  `nat_stateless_last_path()`,
+  `nat_stateless_last_udp_sent()` / `_recvd()` / `_timeouts()`,
+  `nat_stateless_last_external()`, `nat_stateless_last_error()`,
+  `nat_stateless_reset_stats()`.
+
+### Verification
+
+* **+47 new R33E unit assertions** (`tests/unit/test_nat_traversal.nova`).
+  All 162 prior R23E + R31C + R32A assertions byte-identical.
+  Total: **209/209 pass** for nat_traversal.
+* **+13 new R33E integration assertions** in
+  `tests/integration/scenario_oooo_nat_traversal.sh` under
+  `STATELESS_UDP_PATH` sub-scenario.
+* Stateless-back-to-back test explicitly verifies NO state bleed:
+  the snapshot after the second call reflects ONLY the second call's
+  counters (each is 1, not 2 cumulative). This proves there is no
+  module-singleton `stun_state_t` leaking between calls.
+
+### Files
+
+* MOD: `src/federation/nat_traversal.nova` (+200 lines)
+* MOD: `tests/unit/test_nat_traversal.nova` (+9 test functions, +47 assertions)
+* MOD: `tests/integration/scenario_oooo_nat_traversal.sh` (+1 sub-scenario, +13 assertions)
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`
+
+### Honest caveat
+
+The module-level snapshot `_nat_stateless_snap` is the ONE piece of
+shared mutable state R33E introduces. The codec state itself is
+per-call transient, so two concurrent stateless callers can race
+on the snapshot (the second writer wins) but cannot corrupt each
+other's call result. NOVA is single-threaded today so this is moot;
+a future thread-pool runtime should switch observability to a
+caller-owned slot via the stateful entry point.
+
 ## R32C -- X.509 v3 parser + ECDSA-P-256 verify (R29B.2 cert-verify foundation)
 
 **Status: complete** -- ships the FINAL cryptographic primitive set

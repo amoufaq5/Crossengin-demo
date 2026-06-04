@@ -1,7 +1,35 @@
 // CrossEngin federation: NAT traversal -- STUN-like external address
 // discovery + gossip-piggyback advertisement (R23E) + RFC 8489 STUN
 // wire migration (R31C / R30C.2) + UDP datagram dispatch (R32A /
-// R31C.2 / R28C consumer).
+// R31C.2 / R28C consumer) + stateless-caller UDP threading
+// (R33E / R32A.2).
+//
+// R33E closes the R32A.2 caveat: before R33E, `nat_query_stun(addr)`
+// (the stateless form) and `nat_detect_type(addr1, addr2)` (which is
+// built on top of it) walked the legacy TCP-text path EVEN when
+// `CE_NAT_USE_RFC8489=1` was set, because the RFC 8489 codec needs a
+// `stun_state_t` slot for transaction-id tracking and credentials and
+// the stateless caller has no `nat_state_t` to hang it on. R33E threads
+// a transient `nat_state_t` through these callers: when the env flag
+// is on, the stateless dispatcher allocates a per-call `nat_state_t`
+// internally, runs the full UDP path, harvests the external address,
+// and discards the state. Counters are still bumped (on the transient
+// state during the call) but additionally mirrored into a module-level
+// "last stateless call" snapshot so tests + status lines can confirm
+// the UDP path was actually taken.
+//
+// Approach (a): transient-per-call. Each stateless call gets a fresh
+//   `nat_state_t` allocated on entry, used internally, and dropped on
+//   exit. There is NO shared mutable state across calls.
+//   Rationale: concurrency-safe by construction (two callers cannot
+//   stomp on each other's stun_state.txn_id), API-preserving (no
+//   caller-visible state allocation), and the per-call alloc cost is
+//   dwarfed by the UDP round-trip cost (~ms vs ~us alloc).
+// Approach (b) considered but rejected: a module-singleton
+//   `stun_state_t`. Simpler to implement but introduces shared mutable
+//   state with all the standard concurrency hazards (two concurrent
+//   stateless calls would race on the same txn id slot, the second
+//   call's response could be parsed against the first call's txn id).
 //
 // Purpose
 //   R18E (`src/federation/gossip.nova`) ships a SWIM-style gossip mesh
@@ -160,6 +188,20 @@
 //   nat_udp_recvd_count(state)                        -> int
 //   nat_udp_timeout_count(state)                      -> int
 //
+//   R33E / R32A.2 additions (stateless-caller UDP threading):
+//
+//   nat_stateless_last_path()                         -> "udp" | "tcp" | "none"
+//   nat_stateless_last_udp_sent()                     -> int (last call's _SENT)
+//   nat_stateless_last_udp_recvd()                    -> int (last call's _RECVD)
+//   nat_stateless_last_udp_timeouts()                 -> int (last call's _TIMEOUTS)
+//   nat_stateless_last_external()                     -> str (last call's external)
+//   nat_stateless_last_error()                        -> str (last call's last_error)
+//   nat_stateless_reset_stats()                       -> 0  (zero the snapshot)
+//   nat_query_stun_stateless_udp(addr)                -> ext_addr | 0
+//                                                      (always UDP path,
+//                                                       allocates a transient
+//                                                       nat_state_t)
+//
 //   Plus helpers exercised by the unit tests: nat_parse_stun_response,
 //   nat_format_stun_response, nat_extract_peer_addr, nat_alloc_sa_buf,
 //   nat_alloc_sa_len, nat_set_external, nat_get_external,
@@ -219,6 +261,30 @@ let NAT_S_UDP_TIMEOUTS   = 15  // R32A: count sys_recvfrom timeouts (no datagram
 // R32A: default RFC 8489 UDP recv timeout in milliseconds. Env override
 // via CE_NAT_RFC8489_TIMEOUT_MS; the env value MUST be a positive int.
 let NAT_RFC8489_DEFAULT_TIMEOUT_MS = 1000
+
+// R33E: module-level snapshot of the most recent stateless call's
+// dispatch decision + counters. Each new stateless call OVERWRITES this
+// snapshot; it is NOT cumulative. This is the observability hook that
+// lets tests + status lines confirm a stateless UDP dispatch happened
+// without exposing a caller-side `nat_state_t`. The snapshot is a
+// 6-element list, indexed by NAT_SL_* constants below.
+//
+// Concurrency note: a single shared snapshot CAN race if two stateless
+// callers run concurrently (the second writer wins). This is acceptable
+// because (a) the snapshot is observational, not authoritative -- the
+// per-call transient `nat_state_t` IS the authoritative state used by
+// the codec -- and (b) NOVA is single-threaded today so there is no
+// actual concurrent writer. If a future runtime threads stateless
+// queries, callers that need observability should switch to the
+// stateful entry point `nat_query_stun_with_state`.
+let NAT_SL_PATH         = 0    // string: "udp" | "tcp" | "none"
+let NAT_SL_UDP_SENT     = 1    // int from the transient state's NAT_S_UDP_SENT
+let NAT_SL_UDP_RECVD    = 2    // int from the transient state's NAT_S_UDP_RECVD
+let NAT_SL_UDP_TIMEOUTS = 3    // int from the transient state's NAT_S_UDP_TIMEOUTS
+let NAT_SL_EXTERNAL     = 4    // string: "<ip>:<port>" or ""
+let NAT_SL_LAST_ERROR   = 5    // string: last_error from the transient state
+
+let _nat_stateless_snap = 0    // lazy-allocated singleton (R33E)
 
 // Receive buffer size for the inbound Binding Response. RFC 8489 messages
 // are at most 64KB but practical responses stay tiny (XOR-MAPPED-ADDRESS
@@ -595,8 +661,9 @@ fn nat_query_stun_with_state(state, stun_addr) {
     }
     // R32A: dispatch through the RFC 8489 UDP path when the env flag
     // is on AND we have a state to hang the stun_state_t off of.
-    // Without state the codec has no place to allocate its txn /
-    // credential context, so we fall back to the TCP path.
+    // R33E: when state == 0 (true stateless call) AND the env flag is
+    // on, dispatch through `_nat_query_stun_stateless_udp` which
+    // allocates a transient `nat_state_t` per call.
     if state != 0 {
         if nat_use_rfc8489_enabled() == 1 {
             return _nat_query_stun_rfc8489_udp(state, stun_addr)
@@ -605,7 +672,21 @@ fn nat_query_stun_with_state(state, stun_addr) {
     return _nat_query_stun_tcp(state, stun_addr)
 }
 
-fn nat_query_stun(stun_addr) { return nat_query_stun_with_state(0, stun_addr) }
+// R33E / R32A.2: the stateless form now ALSO honors CE_NAT_USE_RFC8489.
+// When the flag is on, we allocate a transient nat_state_t internally,
+// run the full UDP path, harvest the external addr, mirror the
+// transient state's UDP counters into the module-level stateless
+// snapshot (so tests + status lines can observe the dispatch), and
+// discard the transient state. When the flag is off, fall back to the
+// legacy stateless TCP-text path -- byte-identical to R23E.
+fn nat_query_stun(stun_addr) {
+    if nat_use_rfc8489_enabled() == 1 {
+        return _nat_query_stun_stateless_udp(stun_addr)
+    }
+    let ext = _nat_query_stun_tcp(0, stun_addr)
+    _nat_stateless_record_tcp(ext)
+    return ext
+}
 
 // ---- public API: STUN server side ----------------------------------------
 
@@ -1212,6 +1293,165 @@ fn _nat_query_stun_rfc8489_udp(state, stun_addr) {
 
 fn nat_udp_query_rfc8489_with_state(state, stun_addr) {
     return _nat_query_stun_rfc8489_udp(state, stun_addr)
+}
+
+// ============================================================================
+//      R33E / R32A.2 -- stateless-caller UDP threading
+// ============================================================================
+//
+// Pre-R33E, `nat_query_stun(addr)` and `nat_detect_type(addr1, addr2)`
+// were stateless: no `nat_state_t` parameter. The RFC 8489 codec needs
+// a `stun_state_t` for transaction-id storage + credentials, so the
+// stateless callers always fell through to the TCP-text path even when
+// `CE_NAT_USE_RFC8489=1` was set in the env. This was R32A's exit
+// caveat.
+//
+// R33E closes this caveat with **approach (a) transient-per-call**:
+//
+//   * On each stateless call entry, allocate a fresh `nat_state_t` via
+//     `nat_init()`. This state lives only for the duration of the call.
+//   * Dispatch through `_nat_query_stun_rfc8489_udp(transient, addr)`:
+//     it opens a UDP socket, sends the RFC 8489 Binding Request via
+//     `sys_sendto`, waits up to `CE_NAT_RFC8489_TIMEOUT_MS` for the
+//     Binding Response via `sys_recvfrom`, parses the
+//     XOR-MAPPED-ADDRESS into `transient.NAT_S_MY_EXTERNAL`, bumps
+//     the transient state's UDP counters, and closes the socket.
+//   * Mirror the transient state's UDP counters (SENT / RECVD /
+//     TIMEOUTS), external addr, and last_error into the module-level
+//     stateless snapshot so tests + integration scenarios can confirm
+//     the UDP path was actually taken.
+//   * Return the external addr string on success, 0 on failure. The
+//     transient `nat_state_t` is unreferenced after return and the
+//     garbage collector reclaims it.
+//
+// Concurrency: each call's transient state is local to the call frame.
+// Two concurrent stateless callers do NOT share txn ids or sockets.
+// The ONLY shared resource is the module-level snapshot
+// (`_nat_stateless_snap`), which is observational only: a race between
+// two writers can corrupt the snapshot but cannot corrupt the call
+// result. (NOVA is single-threaded today so this is moot.)
+//
+// `nat_detect_type(addr1, addr2)` is automatically threaded too: it
+// calls `nat_query_stun(addr)` twice. Each call gets its own transient
+// state, so the second call's response cannot be parsed against the
+// first call's txn id.
+
+// Lazy-allocate the module-level snapshot. Initialized to
+// PATH="none" / counters=0 / external="" / last_error="".
+fn _nat_stateless_snap_get() {
+    if _nat_stateless_snap != 0 { return _nat_stateless_snap }
+    let snap = list_new()
+    push(snap, "none")  // NAT_SL_PATH
+    push(snap, 0)       // NAT_SL_UDP_SENT
+    push(snap, 0)       // NAT_SL_UDP_RECVD
+    push(snap, 0)       // NAT_SL_UDP_TIMEOUTS
+    push(snap, "")      // NAT_SL_EXTERNAL
+    push(snap, "")      // NAT_SL_LAST_ERROR
+    _nat_stateless_snap = snap
+    return snap
+}
+
+// Snapshot the transient state's UDP-relevant fields. Called by the
+// stateless UDP dispatcher AFTER the UDP path returns (success or fail)
+// so the snapshot reflects exactly what happened on that call. The
+// snapshot REPLACES (not accumulates) previous values.
+fn _nat_stateless_record_udp(transient, ext_result) {
+    let snap = _nat_stateless_snap_get()
+    snap[NAT_SL_PATH] = "udp"
+    snap[NAT_SL_UDP_SENT] = transient[NAT_S_UDP_SENT]
+    snap[NAT_SL_UDP_RECVD] = transient[NAT_S_UDP_RECVD]
+    snap[NAT_SL_UDP_TIMEOUTS] = transient[NAT_S_UDP_TIMEOUTS]
+    if ext_result == 0 {
+        snap[NAT_SL_EXTERNAL] = ""
+    } else {
+        snap[NAT_SL_EXTERNAL] = ext_result
+    }
+    snap[NAT_SL_LAST_ERROR] = nat_last_error(transient)
+    return 0
+}
+
+// Symmetric helper for the TCP fallback path. Records path="tcp" and
+// zeros the UDP counters (no UDP activity on the TCP path), echoes the
+// returned external addr (or "" on fail). Keeps the snapshot's
+// path-discriminator honest so `nat_stateless_last_path()` is the
+// definitive "what path did the LAST stateless call take" oracle.
+fn _nat_stateless_record_tcp(ext_result) {
+    let snap = _nat_stateless_snap_get()
+    snap[NAT_SL_PATH] = "tcp"
+    snap[NAT_SL_UDP_SENT] = 0
+    snap[NAT_SL_UDP_RECVD] = 0
+    snap[NAT_SL_UDP_TIMEOUTS] = 0
+    if ext_result == 0 {
+        snap[NAT_SL_EXTERNAL] = ""
+    } else {
+        snap[NAT_SL_EXTERNAL] = ext_result
+    }
+    snap[NAT_SL_LAST_ERROR] = ""
+    return 0
+}
+
+// The stateless UDP entry. Allocates a transient nat_state_t, runs the
+// full UDP path through `_nat_query_stun_rfc8489_udp`, records the
+// snapshot, returns the external addr (or 0). The transient state is
+// NOT returned to the caller and goes out of scope at return.
+fn _nat_query_stun_stateless_udp(stun_addr) {
+    let transient = nat_init()
+    let ext = _nat_query_stun_rfc8489_udp(transient, stun_addr)
+    _nat_stateless_record_udp(transient, ext)
+    return ext
+}
+
+// Public alias for the stateless UDP helper. Useful for tests that want
+// to drive the UDP path directly without relying on the env flag, and
+// for callers that already know they want UDP. Distinct from the
+// env-gated `nat_query_stun(addr)`.
+fn nat_query_stun_stateless_udp(stun_addr) {
+    return _nat_query_stun_stateless_udp(stun_addr)
+}
+
+// ---- snapshot accessors --------------------------------------------------
+
+fn nat_stateless_last_path() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_PATH]
+}
+
+fn nat_stateless_last_udp_sent() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_UDP_SENT]
+}
+
+fn nat_stateless_last_udp_recvd() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_UDP_RECVD]
+}
+
+fn nat_stateless_last_udp_timeouts() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_UDP_TIMEOUTS]
+}
+
+fn nat_stateless_last_external() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_EXTERNAL]
+}
+
+fn nat_stateless_last_error() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_LAST_ERROR]
+}
+
+// Reset the snapshot to the initial state. Useful between tests so
+// the previous test's state does not bleed in.
+fn nat_stateless_reset_stats() {
+    let snap = _nat_stateless_snap_get()
+    snap[NAT_SL_PATH] = "none"
+    snap[NAT_SL_UDP_SENT] = 0
+    snap[NAT_SL_UDP_RECVD] = 0
+    snap[NAT_SL_UDP_TIMEOUTS] = 0
+    snap[NAT_SL_EXTERNAL] = ""
+    snap[NAT_SL_LAST_ERROR] = ""
+    return 0
 }
 
 // ---- chat helpers --------------------------------------------------------

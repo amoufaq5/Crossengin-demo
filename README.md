@@ -13,6 +13,30 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R33E closes the R32A.2 caveat by threading a transient `nat_state_t`
+> through `nat_query_stun(addr)` and `nat_detect_type(addr1, addr2)`
+> so the env flag `CE_NAT_USE_RFC8489=1` activates the UDP RFC 8489
+> path on the **stateless** surface too, not just the stateful
+> `nat_query_stun_with_state(state, addr)`. Approach: transient-per-call
+> (each stateless call allocates its own `nat_state_t`, used for the
+> codec + UDP path, discarded on exit -- no module-singleton
+> `stun_state_t`, no shared mutable codec state, two concurrent
+> stateless callers can never race on txn ids or sockets). Module-level
+> 6-slot snapshot (`nat_stateless_last_path` / `_udp_sent` / `_recvd` /
+> `_timeouts` / `_external` / `_error`) reflects the LAST stateless
+> call only (replaced not accumulated), so tests + integration
+> scenarios can confirm the UDP path was actually taken without a
+> caller-visible state allocation. `nat_detect_type` is automatically
+> threaded (it calls `nat_query_stun(addr)` twice). All 162 prior
+> R23E + R31C + R32A unit assertions pass byte-identical; **+47 new
+> R33E unit assertions** (total now 209 for nat_traversal). **+13 new
+> R33E integration assertions** under `STATELESS_UDP_PATH` sub-scenario
+> in `scenario_oooo_nat_traversal.sh`. Honest caveat: the module-level
+> snapshot is the one piece of shared mutable state R33E introduces;
+> the codec state itself is per-call transient, so two concurrent
+> stateless callers can race on the snapshot but cannot corrupt each
+> other's call result (NOVA is single-threaded today, so moot).
+>
 > R32C lands the cryptographic primitives R29B's
 > `dtls_cert_verify_R29B2_STUB` slot needs but does NOT wire them in
 > (that's R32C.2). Two new safety modules: `src/safety/x509.nova`

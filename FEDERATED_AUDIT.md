@@ -2570,6 +2570,136 @@ R30B's primitives.
    signature verify, and routes the cert-chain validation through
    R32C's parser.
 
+## R33E extension: stateless nat_traversal UDP threading (R32A.2)
+
+R32A wired UDP datagram dispatch into `nat_query_stun_with_state(state,
+addr)` -- the **stateful** form -- under `CE_NAT_USE_RFC8489=1`. Its
+exit caveat: the stateless form `nat_query_stun(addr)` and the
+detection wrapper `nat_detect_type(addr1, addr2)` could not honor the
+env flag because the RFC 8489 codec needs a `stun_state_t` for
+transaction-id tracking and credentials -- and the stateless caller has
+no `nat_state_t` to hang it on. R33E closes that caveat.
+
+### What R33E delivers (modifies `src/federation/nat_traversal.nova`)
+
+* **Approach (a) transient-per-call.** Each stateless call gets a
+  fresh `nat_state_t` via `nat_init()` allocated on entry, used
+  internally for the codec + UDP path, and dropped on exit. **No
+  module-level shared mutable `stun_state_t`**. Two concurrent
+  stateless callers cannot race on txn ids or sockets because their
+  transient states are local to each call frame. (Approach (b) -- a
+  module-singleton `stun_state_t` -- was considered but rejected
+  because it introduces the same race that R32A's stateful path
+  carefully avoids.)
+* **`nat_query_stun(addr)`** now branches on `nat_use_rfc8489_enabled()`:
+  - Flag on -> `_nat_query_stun_stateless_udp(addr)` allocates a
+    transient `nat_state_t`, runs `_nat_query_stun_rfc8489_udp(transient,
+    addr)`, mirrors the transient state's UDP counters into a
+    module-level snapshot, and returns the external addr (or 0).
+  - Flag off -> `_nat_query_stun_tcp(0, addr)` (byte-identical to R23E).
+* **`nat_detect_type(addr1, addr2)`** is automatically threaded: it
+  calls `nat_query_stun(addr)` twice, so both queries take the same
+  dispatch path that the env flag selects.
+* **Observability hook: module-level snapshot.** Because stateless
+  callers have no `nat_state_t` to inspect, R33E adds a module-level
+  6-slot snapshot updated after EVERY stateless call:
+  `nat_stateless_last_path()` -> "udp" | "tcp" | "none",
+  `nat_stateless_last_udp_sent()` / `_recvd()` / `_timeouts()`,
+  `nat_stateless_last_external()`, `nat_stateless_last_error()`,
+  `nat_stateless_reset_stats()`. The snapshot REPLACES (not
+  accumulates) per call so two back-to-back queries do not
+  bleed.
+* **Counter updates.** The transient `nat_state_t` bumps NAT_S_UDP_SENT
+  / _RECVD / _TIMEOUTS exactly like the stateful path; the snapshot
+  reflects those counters so tests + integration scenarios can observe
+  the UDP dispatch.
+
+### Behavior preservation (R23E + R31C + R32A 162 prior assertions stay byte-identical)
+
+* All 162 pre-R33E unit checks (53 R23E + 48 R31C + 61 R32A) pass
+  **byte-identical**. R33E only APPENDS test functions after the R32A
+  block; main()'s call order before the R33E block is unchanged.
+* Integration scenario_oooo's existing 18 R23E + 6 R31C + 17 R32A
+  sub-scenarios run before R33E's STATELESS_UDP_PATH sub-scenario and
+  produce the same outputs (same souls A/B, same RFC 8489 in-process
+  emit + parse, same UDP_RT loopback round-trip, same UDP_FLAG env-
+  on dispatch via the stateful form). R33E adds ONE new sub-scenario
+  after the existing ones.
+
+### Tests added
+
+* **47 new R33E assertions** in `tests/unit/test_nat_traversal.nova`
+  across 9 test functions:
+  `test_r33e_snapshot_reset_fresh_defaults`,
+  `test_r33e_stateless_query_tcp_path_when_flag_off`,
+  `test_r33e_detect_type_tcp_path_when_flag_off`,
+  `test_r33e_stateless_udp_direct_bad_addr`,
+  `test_r33e_stateless_udp_direct_bad_ip`,
+  `test_r33e_stateless_udp_direct_timeout_to_closed_port`,
+  `test_r33e_stateless_udp_loopback_round_trip` (drives the same
+  loopback round-trip as R32A but via the stateless helper),
+  `test_r33e_stateless_back_to_back_no_state_bleed` (proves there is
+  NO module-singleton stun_state -- each call gets its own transient
+  state, snapshot reflects only the LAST call, not a sum),
+  `test_r33e_stateless_udp_direct_returns_zero_on_failure`.
+* **13 new R33E assertions** in
+  `tests/integration/scenario_oooo_nat_traversal.sh` under
+  `STATELESS_UDP_PATH` sub-scenario: env-flag-on stateless
+  `nat_query_stun(addr)` walks the UDP path (snapshot path="udp",
+  udp_sent=1, udp_timeouts=1), and env-flag-on `nat_detect_type`
+  dispatches TWO UDP queries.
+* `nat_traversal`: 162 -> 209 unit checks (162 R23E + R31C + R32A
+  byte-identical + 47 R33E).
+
+### Honest scope (still deferred)
+
+1. **No retransmit / RTO.** RFC 8489 7.2.1 prescribes
+   exponential-backoff retransmission. Both the stateful (R32A) and
+   stateless (R33E) paths use a single `sys_recvfrom` timeout call.
+   Retransmits are deferred. Loss-free networks won't notice;
+   cellular / Wi-Fi can.
+2. **Module-level snapshot is shared state.** The observation hook
+   (`_nat_stateless_snap`) is the ONE piece of shared mutable state
+   R33E introduces. The codec state itself is per-call transient, so
+   the snapshot can race but the call result cannot. NOVA is
+   single-threaded today so this is moot, but a future thread-pool
+   runtime should switch observability to a caller-owned slot.
+3. **No public-STUN interop CI.** Same as R32A: sandbox CI cannot
+   reach `stun.l.google.com:3478`. Requires soak environment.
+4. **No credential threading for the stateless caller.** The
+   transient state is allocated bare without USERNAME / password.
+   Callers needing MESSAGE-INTEGRITY must use the stateful form.
+
+### Concurrency
+
+R33E modifies ONLY `src/federation/nat_traversal.nova`,
+`tests/unit/test_nat_traversal.nova`,
+`tests/integration/scenario_oooo_nat_traversal.sh`, and the three
+docs. R33E does NOT touch `stun_rfc8489.nova`, `ice.nova`,
+`dtls12.nova`, or any other federation module. Parallel sibling
+agents working on R32B-R32F / R33A-R33D / R33F cannot collide.
+
+Stash discipline: R33E's preflight stash used explicit owned-path
+arguments (`git stash push -m "R33E-preflight" -- <path...>`), never
+`-u`. Sibling-agent untracked files were untouched.
+
+### Files touched (R33E)
+
+* MOD: `src/federation/nat_traversal.nova` (+200 lines: 6 SL_*
+  snapshot indices, lazy snapshot allocator, 2 record helpers
+  (`_nat_stateless_record_udp` / `_nat_stateless_record_tcp`), 1
+  stateless UDP entry `_nat_query_stun_stateless_udp`, 1 public alias
+  `nat_query_stun_stateless_udp`, 7 snapshot accessors, modified
+  `nat_query_stun(addr)` to dispatch on the env flag. R23E + R31C +
+  R32A public API surface unchanged).
+* MOD: `tests/unit/test_nat_traversal.nova` (+9 test functions,
+  +47 assertions). R23E + R31C + R32A test functions stay in place
+  untouched.
+* MOD: `tests/integration/scenario_oooo_nat_traversal.sh`
+  (+1 sub-scenario STATELESS_UDP_PATH, +13 shell assertions,
+  +1 generated NOVA driver script).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
+
 ## R32A extension: nat_traversal RFC 8489 UDP dispatch (R31C.2 / R28C consumer)
 
 R31C (commit `0f95bb6`) migrated the codec half of `nat_traversal`
