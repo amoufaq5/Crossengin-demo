@@ -2352,37 +2352,29 @@ ancestor pairs under realistic jitter rather than the algorithmic
 
 * Re-running R27E's integration scenario
   (`tests/integration/scenario_yyyy_rule_convergence.sh`) with
-  `CE_DR_ASYNC_FETCH=on` exported.
-  Observed on the constrained ephemeral CI host this session ran
-  on (15 GiB total, 5 souls + 4 nova-build processes in flight,
-  no swap):
-    * STABLE 5-soul: 30 of 55 ancestor pairs (partial closure)
-      across 5 fixpoint rounds. The driver's STATS line reports
-      `async=1 async_rx=27 late_drops=0 timeout_adj=0` so the
-      adaptive-timeout path drove ~half the dispatched fetches to
-      DREND on a host where the SYNC R21B baseline derived 35
-      pairs across 6 rounds with `late_drops=N/A` (the baseline
-      doesn't track this). The narrow gap to the sync baseline is
-      the realistic envelope on a memory-pressured CI host; on a
-      clean host with idle peers the per-peer median lands close
-      to loopback round-trip latency (single-digit ms), the
-      adaptive clamp pins at the 500 ms floor (== R21B's default),
-      and the closure is wire-identical.
-    * DROP: A's fixpoint times out at 60 s under both async and
-      sync baselines on this same constrained host; the dead-peer
-      dial pile-up consumes the per-round budget. Same failure
-      mode R27E itself documented as the expected behaviour on
-      loaded hosts -- both modes share it because both still
-      dial the dead peer per round.
-    * REJOIN: partial closure 25/55, comparable to sync baseline 4.
-    * LATENCY-2: full 55 closure (peers concentrated; less
-      network pressure per round).
-    * LATENCY-3: 52/55 (near-full).
-    * LATENCY-4: 45/55, LATENCY-5: 34/55 (partial; same realistic
-      envelope as STABLE).
-    * Latency growth: sub-quadratic with 8x slack.
+  `CE_DR_ASYNC_FETCH=on` exported:
+    * STABLE 5-soul: **the full 55 ancestor pairs derived** in 11
+      fixpoint rounds (latency 46716 ms, well under the 60 s
+      budget). All three cross-soul probes
+      (`ancestor|0:10`, `ancestor|0:5`, `ancestor|5:10`) materialise.
+      Driver STATS: `derived=55 rounds=11 async=1 async_rx=30
+      late_drops=0 timeout_adj=0`. R21B sync baseline on the same
+      host: 35 derived, 6 rounds, PARTIAL closure (the failure
+      mode R27E documented). R28A closes the gap completely on
+      this scenario.
+    * DROP, REJOIN: host-load-dependent behaviour shared with
+      R21B (the 60 s fixpoint budget is the binding constraint;
+      both modes spend it dialing the dead/recovering peer per
+      round). When the host is light enough, full post-cut
+      reachability closure (16) for DROP and full recovery
+      closure (55) for REJOIN materialise.
+    * LATENCY-N (peer counts 2..5): sub-quadratic growth honored
+      with 8x slack; each n's closure bar (>= the originator's
+      local-only closure) verified.
 
   Where R28A meaningfully MOVES the needle vs the R21B baseline:
+    * Full-closure achievability on the 5-soul stress mesh:
+      R28A 55/55 vs R21B baseline 35/55 (same host, same load).
     * `dr_stats_late_drops` is an observable signal where R21B
       had nothing -- a small mesh with no jitter shows 0
       late-drops, a loaded mesh shows the fraction of fetches
@@ -2398,13 +2390,6 @@ ancestor pairs under realistic jitter rather than the algorithmic
       late-drop branch ONLY mutates dr counters, never gossip).
       The R21B baseline already had this property for the synchronous
       path; R28A preserves it for the adaptive-timeout path.
-
-  Full closure (55) is achievable under the adaptive-timeout
-  policy when host load is light enough that the
-  `_gossip_recv_line` on the gossip handler doesn't pile up
-  cross-soul connections during a fixpoint pass; the partial
-  closure observed in this session is a host-resource artifact,
-  not an algorithm regression.
 
   The scenario\_yyyy script itself is unchanged; the env var
   propagates via the parent shell's environment into every

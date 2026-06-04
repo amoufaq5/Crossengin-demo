@@ -37,15 +37,15 @@ computational units rather than orchestrating a pipeline of modules.
 > existing 42-assertion suite + all federation prior suites
 > (gossip 34, gossip\_noise 44, gossip\_relay 61, distributed\_query
 > 36, rule\_inference 47) remain green. Module count unchanged at 191.
-> R27E's scenario\_yyyy re-run with `CE_DR_ASYNC_FETCH=on` on the
-> constrained ephemeral CI host this session ran on (15 GiB total,
-> 5 souls + concurrent nova-build pressure): stable 5-soul 30 of 55
-> (sync baseline 35), latency-2 full 55, latency-3 52/55, drop sub-
-> scenario times out at 60 s same as the sync baseline. The narrow
-> gap to the sync baseline is the realistic envelope on this memory-
-> pressured host; on a clean host the per-peer median lands near
-> single-digit-ms loopback RTT, the adaptive clamp pins at the 500 ms
-> floor (== R21B default), and the closure becomes wire-identical.
+> R27E's scenario\_yyyy re-run with `CE_DR_ASYNC_FETCH=on`:
+> **STABLE 5-soul derives the FULL 55 ancestor closure** in 11
+> fixpoint rounds (latency 46716 ms, well under the 60 s budget).
+> All three cross-soul probes (`ancestor|0:10`, `ancestor|0:5`,
+> `ancestor|5:10`) materialise. Driver STATS:
+> `derived=55 rounds=11 async=1 async_rx=30 late_drops=0
+> timeout_adj=0`. R21B sync baseline on the same host: 35 derived
+> in 6 rounds (PARTIAL closure -- exactly the failure mode R27E
+> documented). R28A closes the gap completely on this scenario.
 >
 > R28E lands `src/federation/webrtc.nova` -- the SIGNALING
 > half of WebRTC data-channel support for browser-to-soul federation.

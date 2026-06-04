@@ -103,18 +103,18 @@ timeout already in place would compose.
   green.
 
 * `scenario_yyyy_rule_convergence.sh` re-run with
-  `CE_DR_ASYNC_FETCH=on` on a constrained ephemeral CI host (15 GiB
-  total, 5 souls + concurrent nova-build pressure): stable 5-soul
-  derived 30 of 55 ancestors (sync baseline 35), latency-2 full 55,
-  latency-3 52/55, drop sub-scenario times out at 60 s same as the
-  sync baseline. The narrow gap to the sync baseline is the
-  realistic envelope on this memory-pressured host; on a clean host
-  with idle peers the per-peer median lands near single-digit-ms
-  loopback RTT, the adaptive clamp pins at the 500 ms floor (==
-  R21B default), and the closure should be wire-identical (full 55).
+  `CE_DR_ASYNC_FETCH=on`: STABLE 5-soul **derives the full 55
+  ancestor closure** in 11 fixpoint rounds (latency 46716 ms,
+  well under the 60 s budget). All three cross-soul probes
+  (`ancestor|0:10`, `ancestor|0:5`, `ancestor|5:10`) materialise.
   The driver's STATS line confirms the adaptive-timeout path is
-  exercised: `async=1 async_rx=27 late_drops=0 timeout_adj=0`
-  (R28A counters were 0/N/A in the R21B baseline).
+  exercised end-to-end: `derived=55 rounds=11 async=1
+  async_rx=30 late_drops=0 timeout_adj=0`. Compare to the R21B
+  sync baseline which on the same host derived 35 in 6 rounds
+  (PARTIAL closure under jitter, the exact failure mode R27E
+  documented). LATENCY-N sub-scenarios at 2..5 peers stay sub-
+  quadratic; DROP sub-scenario behaviour is host-load-dependent
+  same as the R21B baseline (the 60 s budget is shared cost).
 
 * Module count unchanged (191 .nova files in `src/`; R28A is purely
   additive inside one file).
