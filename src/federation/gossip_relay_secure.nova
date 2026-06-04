@@ -93,11 +93,79 @@
 //   srl_has_session(srl, peer_id)                  -> 1 | 0
 //   srl_stats_line(srl)                            -> one-liner
 //
-// Honest scope
+// R27C.2 binary bulk path
 //
-//   * The relay wire is HEX-encoded, doubling the per-frame on-wire
-//     size. Bulk transfer would need a binary-clean wire (separate
-//     extension to gossip v1 framing).
+//   The hex wire above doubles the per-frame on-wire size. For bulk
+//   payloads (KG delta packs, snapshot fragments) the 2x overhead is
+//   wasted bandwidth. R27C.2 adds a binary-clean RELAY_BIN wire shape
+//   gated by a ciphertext-size threshold (default 1024 bytes); small
+//   control-plane traffic still rides the hex path so the bulk
+//   extension does not perturb the bulk's well-tested format.
+//
+//   Wire shape:
+//     RELAY_BIN <req_id> <target> <via> <from> <total_len>\n
+//     [total_len raw binary bytes of the AEAD frame]
+//
+//   The header line lives on the existing line-oriented gossip wire
+//   (still terminated by \n so _gossip_recv_line returns it intact).
+//   After the header the dispatcher switches to raw recv_data for
+//   total_len bytes (using _gnoise_recv_exact from gossip.nova,
+//   already exposed for the Noise handshake's framed reads). The
+//   originator's srl_send_secure_binary builds the same shape and
+//   writes header+bytes through a short-lived TCP probe (no relay
+//   layer parsing of the payload -- the payload is opaque bytes from
+//   srl's perspective above and from the relay's perspective below).
+//
+//   New public API:
+//     srl_send_secure_binary(srl, target, pt_buf, pt_n) -> 1 ok | 0
+//         Sealed-then-binary-routed. Refuses on missing session
+//         (same contract as srl_send_secure). Routes A -> target
+//         direct when reachable; on direct failure picks an alive
+//         intermediate via the gossip table (same fallback policy
+//         as relay_send) and forwards as RELAY_BIN to the relay,
+//         which forwards to the target.
+//     srl_send_secure_auto(srl, target, pt_buf, pt_n) -> 1 ok | 0
+//         Auto-routing: ciphertext size > SRL_BIN_THRESHOLD (1024)
+//         -> binary; else hex. Drop-in replacement for callers that
+//         do not want to think about which wire is cheaper.
+//     srl_recv_secure_binary(srl) -> drained recv list
+//         Alias for srl_recv_secure (the recv queue is shared
+//         between hex and binary path; binary records produce the
+//         same [from, pt_buf, pt_n] shape).
+//     srl_inject_binary_record(srl, req_id, from, frame_buf, frame_n)
+//         Unit-test injection: pretends a RELAY_BIN frame just
+//         arrived on B's gossip dispatcher. Bypasses the socket
+//         read so unit tests run in the no-network sandbox.
+//     srl_drain_relay_recv_binary(srl) -> int processed
+//         Drains the binary inbound queue (records the gossip
+//         dispatcher pushes after a successful RELAY_BIN read).
+//         srl_drain_relay_recv calls this transparently so
+//         existing daemon loops need no change.
+//     srl_stats_bin_sent / _bin_delivered / _bin_decrypt_fail
+//
+//   Honest scope (the binary path):
+//     * The binary wire does NOT extend through the R21E Noise-
+//       protected gossip transport (gossip_handle_conn_kg_gconn).
+//       The srl AEAD wrap already encrypts payload end-to-end; the
+//       additional R21E transport wrap is redundant for relayed
+//       payloads. Dispatcher wiring lives in the plaintext gossip
+//       handlers (gossip_handle_conn + gossip_handle_conn_kg).
+//     * The threshold is a constant, not env-tunable. Most KG
+//       delta packs are kilobytes -- well above the 1024-byte
+//       cutoff -- and small acks stay on the hex path. A future
+//       extension could expose CE_SRL_BIN_THRESHOLD.
+//     * The relay still sees per-frame routing metadata
+//       (target / via / from in the header line). End-to-end
+//       metadata privacy is a separate follow-up (mixnet shape).
+//     * Tamper detection is identical to the hex path: a single
+//       bit flip anywhere in the binary tail fails Poly1305 on B
+//       and the frame is dropped (no plaintext exposure).
+//
+// Honest scope (overall)
+//
+//   * The hex relay wire still doubles the per-frame on-wire size
+//     for payloads under the bin threshold. Above the threshold the
+//     binary path eliminates the 2x overhead.
 //   * The session-key exchange (out-of-band or via kg_sync v3 handshake)
 //     is the caller's responsibility. R7C noise_xk.nova ships the
 //     handshake primitives; this module consumes the post-Split state.
@@ -141,6 +209,20 @@ let SRL_S_STATS_SENT          = 4
 let SRL_S_STATS_DELIVERED     = 5
 let SRL_S_STATS_DECRYPT_FAIL  = 6
 let SRL_S_STATS_NO_SESSION    = 7
+// R27C.2 binary bulk path slots. Pinned indices 8-12 so the cross-
+// module contract with gossip.nova (which pushes inbound RELAY_BIN
+// records onto SRL_S_INBOUND_BIN without importing srl) is stable.
+let SRL_S_INBOUND_BIN         = 8   // queue of [req_id, from, frame_buf, frame_n]
+let SRL_S_STATS_BIN_SENT      = 9   // binary-path send completions
+let SRL_S_STATS_BIN_DELIVERED = 10  // binary-path open+queue events
+let SRL_S_STATS_BIN_DECRYPT_FAIL = 11 // binary-path tag mismatches
+let SRL_S_STATS_BIN_NO_SESSION   = 12 // binary-path no-session drops
+
+// Binary-inbound-record slot indices.
+let SRL_BIN_R_REQ_ID  = 0
+let SRL_BIN_R_FROM    = 1
+let SRL_BIN_R_BUF     = 2
+let SRL_BIN_R_N       = 3
 
 // Session record slot indices.
 let SRL_SESS_PEER             = 0
@@ -151,6 +233,23 @@ let SRL_SESS_ROLE             = 2
 let SRL_R_FROM                = 0
 let SRL_R_PT_BUF              = 1
 let SRL_R_PT_N                = 2
+
+// R27C.2 binary path: ciphertext-size threshold for srl_send_secure_auto.
+// Above this size (in ciphertext bytes, i.e. nxk_seal frame length) the
+// auto-router picks the binary path; at or below, the hex path. The
+// crossover is set so a ~ 500-byte plaintext (typical control message)
+// stays on the hex path -- ciphertext after Noise framing is
+// 4 + pt + 16, so the ciphertext crosses 1024 around pt ~ 1004 bytes.
+let SRL_BIN_THRESHOLD = 1024
+
+// Binary wire prefix. Mirrored in gossip.nova as GOSSIP_RELAY_BIN_PREFIX
+// to let the dispatcher recognise the line without importing this module.
+let SRL_BIN_PREFIX = "RELAY_BIN "
+
+// Header-line field count after the prefix:
+//   RELAY_BIN <req_id> <target> <via> <from> <total_len>
+//   tok[0]    tok[1]   tok[2]   tok[3] tok[4] tok[5]
+let SRL_BIN_HDR_TOKS = 6
 
 // ---- state constructor ---------------------------------------------------
 
@@ -164,6 +263,11 @@ fn srl_init(relay_state) {
     push(st, 0)               // S_STATS_DELIVERED
     push(st, 0)               // S_STATS_DECRYPT_FAIL
     push(st, 0)               // S_STATS_NO_SESSION
+    push(st, list_new())      // S_INBOUND_BIN (R27C.2)
+    push(st, 0)               // S_STATS_BIN_SENT (R27C.2)
+    push(st, 0)               // S_STATS_BIN_DELIVERED (R27C.2)
+    push(st, 0)               // S_STATS_BIN_DECRYPT_FAIL (R27C.2)
+    push(st, 0)               // S_STATS_BIN_NO_SESSION (R27C.2)
     return st
 }
 
@@ -176,6 +280,13 @@ fn srl_stats_sent(state)          { return state[SRL_S_STATS_SENT] }
 fn srl_stats_delivered(state)     { return state[SRL_S_STATS_DELIVERED] }
 fn srl_stats_decrypt_failed(state){ return state[SRL_S_STATS_DECRYPT_FAIL] }
 fn srl_stats_no_session(state)    { return state[SRL_S_STATS_NO_SESSION] }
+// R27C.2 binary-path counters.
+fn srl_stats_bin_sent(state)         { return state[SRL_S_STATS_BIN_SENT] }
+fn srl_stats_bin_delivered(state)    { return state[SRL_S_STATS_BIN_DELIVERED] }
+fn srl_stats_bin_decrypt_failed(state){ return state[SRL_S_STATS_BIN_DECRYPT_FAIL] }
+fn srl_stats_bin_no_session(state)   { return state[SRL_S_STATS_BIN_NO_SESSION] }
+fn srl_bin_inbound_count(state)      { return len(state[SRL_S_INBOUND_BIN]) }
+fn srl_bin_threshold()               { return SRL_BIN_THRESHOLD }
 
 // Linear scan -- session count is expected to be small (a few mesh
 // peers, not thousands). Returns the session record or 0 if missing.
@@ -394,6 +505,418 @@ fn srl_stats_line(state) {
         + " delivered=" + int_to_str(state[SRL_S_STATS_DELIVERED])
         + " decrypt_fail=" + int_to_str(state[SRL_S_STATS_DECRYPT_FAIL])
         + " no_session=" + int_to_str(state[SRL_S_STATS_NO_SESSION])
+        + " bin_sent=" + int_to_str(state[SRL_S_STATS_BIN_SENT])
+        + " bin_delivered=" + int_to_str(state[SRL_S_STATS_BIN_DELIVERED])
+        + " bin_decrypt_fail=" + int_to_str(state[SRL_S_STATS_BIN_DECRYPT_FAIL])
+        + " bin_no_session=" + int_to_str(state[SRL_S_STATS_BIN_NO_SESSION])
+}
+
+// ============================================================================
+// R27C.2 -- binary bulk path
+// ============================================================================
+//
+// The R27C hex wire doubles every byte on the wire. For bulk payloads
+// (KG delta packs, snapshot fragments, multi-KB messages) that
+// overhead is wasted bandwidth. The binary path replaces hex transport
+// with raw bytes after a length-prefixed header line; the AEAD frame
+// itself is unchanged (we still nxk_seal then nxk_open under the same
+// session). Tamper detection is identical -- the frame's Poly1305 tag
+// catches any in-flight bit flip and the recipient drops the frame.
+//
+// Wire shape:
+//
+//     RELAY_BIN <req_id> <target> <via> <from> <total_len>\n
+//     [total_len bytes of raw AEAD frame]
+//
+// The header line still terminates with \n so the existing
+// _gossip_recv_line returns it intact. After the dispatcher
+// recognises the prefix, it parses the 5 routing tokens + the
+// payload length, then calls _gnoise_recv_exact(fd, total_len) (an
+// already-public helper in gossip.nova used for the Noise handshake
+// framing) to drain the raw bytes off the same fd.
+//
+// Routing (originator side):
+//   1. Direct dial first: short-lived TCP, send header line +
+//      raw bytes. via = self_addr.
+//   2. On direct failure: pick an alive intermediate via gossip
+//      (matches relay_send's policy). via = intermediate.
+//
+// Routing (intermediate side):
+//   * If target == self -> queue as deliverable record.
+//   * Else -> forward by dialling target, writing the same header
+//     with via=self_addr, from=originator preserved.
+
+// ---- binary header format helpers --------------------------------------
+
+// Serialise a u32 big-endian into a 4-byte buffer at offset off.
+fn _srl_put_u32_be(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+fn _srl_get_u32_be(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    return int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                  int_shl(b2, 8)), b3)
+}
+
+// Build the header LINE (no trailing \n -- caller adds the newline
+// before pushing raw bytes). Returns the formatted string.
+fn srl_bin_format_header(req_id, target, via, from, total_len) {
+    return SRL_BIN_PREFIX + int_to_str(req_id)
+        + " " + target + " " + via + " " + from
+        + " " + int_to_str(total_len)
+}
+
+// Parse a RELAY_BIN header line. Returns [req_id, target, via, from,
+// total_len] on success, 0 on malformed input.
+fn srl_bin_parse_header(line) {
+    if _gossip_starts_with(line, SRL_BIN_PREFIX) == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < SRL_BIN_HDR_TOKS { return 0 }
+    let id_s = toks[1]
+    if _gossip_is_digits(id_s) == 0 { return 0 }
+    let req_id = str_to_int(id_s)
+    let target = toks[2]
+    let via    = toks[3]
+    let from   = toks[4]
+    let len_s  = toks[5]
+    if len(target) == 0 { return 0 }
+    if len(via) == 0    { return 0 }
+    if len(from) == 0   { return 0 }
+    if _gossip_is_digits(len_s) == 0 { return 0 }
+    let total_len = str_to_int(len_s)
+    if total_len < 0 { return 0 }
+    let out = list_new()
+    push(out, req_id)
+    push(out, target)
+    push(out, via)
+    push(out, from)
+    push(out, total_len)
+    return out
+}
+
+// ---- short-lived TCP send: header line + raw binary --------------------
+//
+// Open a short-lived gossip TCP connection, run HELLO/OK, send the
+// RELAY_BIN header line (terminated by \n), then push raw payload
+// bytes via _gnoise_raw_send (a public helper in gossip.nova used by
+// the Noise handshake framing -- safe to reuse here for binary
+// transport). Caller passes the address (target or relay) and the
+// header tokens; we do not bake direct-vs-relay routing here so the
+// callsite can choose. Returns 1 on a clean write, 0 on any error.
+
+fn _srl_send_bin_to(addr, header_line, payload_buf, payload_n) {
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    _gossip_set_rcvtimeo_ms(fd, 5000)
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    if _gossip_send_all(fd, header_line + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    if payload_n > 0 {
+        if _gnoise_raw_send(fd, payload_buf, payload_n) == 0 {
+            close_fd(fd); return 0
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// ---- originator: srl_send_secure_binary --------------------------------
+//
+// Look up session for target, nxk_seal the plaintext, build a
+// RELAY_BIN header carrying the routing tuple + total_len, then write
+// header+frame bytes through a short-lived TCP probe to either target
+// (direct) or an alive intermediate (relay). Bumps the bin_sent
+// counter on success. Refuses with bin_no_session bumped if no
+// session is registered (mirrors srl_send_secure's strict policy).
+
+fn srl_send_secure_binary(state, target_peer, pt_buf, pt_n) {
+    let sess = _srl_find_session(state, target_peer)
+    if sess == 0 {
+        state[SRL_S_STATS_BIN_NO_SESSION] = state[SRL_S_STATS_BIN_NO_SESSION] + 1
+        return 0
+    }
+    let nxk_st = sess[SRL_SESS_STATE]
+    let role = sess[SRL_SESS_ROLE]
+    let sealed = nxk_seal(nxk_st, role, pt_buf, pt_n)
+    if sealed == 0 { return 0 }
+    let frame_buf = sealed[0]
+    let frame_n = sealed[1]
+    let relay = state[SRL_S_RELAY]
+    if relay == 0 { return 0 }
+    let g = relay[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let self_addr = gossip_self_addr(g)
+    let req_id = _relay_next_req_id(relay)
+
+    // 1. If target is marked unreachable AND we have a cached via,
+    //    short-circuit to the cached relay.
+    if relay_is_unreachable(relay, target_peer) == 1 {
+        let cached_via = relay_chosen_via(relay, target_peer)
+        if cached_via != -1 {
+            let hdr_c = srl_bin_format_header(req_id, target_peer,
+                                               cached_via, self_addr, frame_n)
+            if _srl_send_bin_to(cached_via, hdr_c, frame_buf, frame_n) == 1 {
+                state[SRL_S_STATS_BIN_SENT] = state[SRL_S_STATS_BIN_SENT] + 1
+                return 1
+            }
+        }
+    }
+
+    // 2. Direct dial. via=self_addr signals "no intermediate".
+    if relay_is_unreachable(relay, target_peer) == 0 {
+        let hdr_d = srl_bin_format_header(req_id, target_peer,
+                                           self_addr, self_addr, frame_n)
+        if _srl_send_bin_to(target_peer, hdr_d, frame_buf, frame_n) == 1 {
+            state[SRL_S_STATS_BIN_SENT] = state[SRL_S_STATS_BIN_SENT] + 1
+            return 1
+        }
+    }
+
+    // 3. Pick an intermediate via the same dispatcher relay_send uses.
+    let via = _relay_pick_dispatch(relay, target_peer)
+    if via == 0 { return 0 }
+    let hdr_r = srl_bin_format_header(req_id, target_peer,
+                                       via, self_addr, frame_n)
+    if _srl_send_bin_to(via, hdr_r, frame_buf, frame_n) == 1 {
+        relay_cache_via(relay, target_peer, via)
+        state[SRL_S_STATS_BIN_SENT] = state[SRL_S_STATS_BIN_SENT] + 1
+        return 1
+    }
+    return 0
+}
+
+// ---- auto-routing: srl_send_secure_auto -------------------------------
+//
+// Pick hex vs binary based on the size of the sealed ciphertext. We
+// nxk_seal once and inspect frame_n; below threshold -> route through
+// the existing hex wire (small control-plane), above threshold ->
+// binary path. This means a single send call does at most one Noise
+// seal: the auto-router consumes the same sealed frame for whichever
+// path it picks. Refuses on missing session (mirrors srl_send_secure).
+
+fn srl_send_secure_auto(state, target_peer, pt_buf, pt_n) {
+    let sess = _srl_find_session(state, target_peer)
+    if sess == 0 {
+        state[SRL_S_STATS_NO_SESSION] = state[SRL_S_STATS_NO_SESSION] + 1
+        return 0
+    }
+    let nxk_st = sess[SRL_SESS_STATE]
+    let role = sess[SRL_SESS_ROLE]
+    let sealed = nxk_seal(nxk_st, role, pt_buf, pt_n)
+    if sealed == 0 { return 0 }
+    let frame_buf = sealed[0]
+    let frame_n = sealed[1]
+    let relay = state[SRL_S_RELAY]
+    if relay == 0 { return 0 }
+    let g = relay[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let self_addr = gossip_self_addr(g)
+
+    if frame_n > SRL_BIN_THRESHOLD {
+        // Binary path: header + raw bytes.
+        let req_id = _relay_next_req_id(relay)
+        if relay_is_unreachable(relay, target_peer) == 1 {
+            let cached_via = relay_chosen_via(relay, target_peer)
+            if cached_via != -1 {
+                let hdr_c = srl_bin_format_header(req_id, target_peer,
+                                                   cached_via, self_addr, frame_n)
+                if _srl_send_bin_to(cached_via, hdr_c, frame_buf, frame_n) == 1 {
+                    state[SRL_S_STATS_BIN_SENT] = state[SRL_S_STATS_BIN_SENT] + 1
+                    return 1
+                }
+            }
+        }
+        if relay_is_unreachable(relay, target_peer) == 0 {
+            let hdr_d = srl_bin_format_header(req_id, target_peer,
+                                               self_addr, self_addr, frame_n)
+            if _srl_send_bin_to(target_peer, hdr_d, frame_buf, frame_n) == 1 {
+                state[SRL_S_STATS_BIN_SENT] = state[SRL_S_STATS_BIN_SENT] + 1
+                return 1
+            }
+        }
+        let via = _relay_pick_dispatch(relay, target_peer)
+        if via == 0 { return 0 }
+        let hdr_r = srl_bin_format_header(req_id, target_peer,
+                                           via, self_addr, frame_n)
+        if _srl_send_bin_to(via, hdr_r, frame_buf, frame_n) == 1 {
+            relay_cache_via(relay, target_peer, via)
+            state[SRL_S_STATS_BIN_SENT] = state[SRL_S_STATS_BIN_SENT] + 1
+            return 1
+        }
+        return 0
+    }
+
+    // Hex path: encode + relay_send (same as srl_send_secure).
+    let hex_payload = cc_hex_encode_buf(frame_buf, frame_n)
+    let rc = relay_send(relay, target_peer, hex_payload)
+    if rc == 1 {
+        state[SRL_S_STATS_SENT] = state[SRL_S_STATS_SENT] + 1
+        return 1
+    }
+    return 0
+}
+
+// ---- inbound: srl_inject_binary_record ---------------------------------
+//
+// Called by the gossip dispatcher (in gossip.nova's parser branch for
+// RELAY_BIN) after it has parsed the header line + drained total_len
+// raw bytes off the fd. The caller passes the frame buffer + length;
+// we push a queued record for srl_drain_relay_recv_binary to process
+// on the next tick.
+//
+// Test injection: unit tests bypass the socket entirely by calling
+// this directly with a frame they sealed earlier.
+
+fn srl_inject_binary_record(state, req_id, from_peer, frame_buf, frame_n) {
+    let rec = list_new()
+    push(rec, req_id)
+    push(rec, from_peer)
+    push(rec, frame_buf)
+    push(rec, frame_n)
+    push(state[SRL_S_INBOUND_BIN], rec)
+    return 1
+}
+
+// ---- drain: srl_drain_relay_recv_binary -------------------------------
+//
+// Pop every binary record off the inbound queue, decrypt with the
+// from-peer's session, push plaintext to the unified recv queue
+// (shared with the hex path). Tag-mismatch -> bin_decrypt_fail++,
+// drop. Missing session -> bin_no_session++, drop. Returns the count
+// of records processed.
+
+fn srl_drain_relay_recv_binary(state) {
+    let q = state[SRL_S_INBOUND_BIN]
+    let processed = 0
+    let i = 0
+    while i < len(q) {
+        let rec = q[i]
+        if rec != 0 {
+            let from_peer = rec[SRL_BIN_R_FROM]
+            let frame_buf = rec[SRL_BIN_R_BUF]
+            let frame_n   = rec[SRL_BIN_R_N]
+            let sess = _srl_find_session(state, from_peer)
+            if sess == 0 {
+                state[SRL_S_STATS_BIN_NO_SESSION] = state[SRL_S_STATS_BIN_NO_SESSION] + 1
+            } else {
+                let nxk_st = sess[SRL_SESS_STATE]
+                let role = sess[SRL_SESS_ROLE]
+                let opened = nxk_open(nxk_st, role, frame_buf, frame_n)
+                if opened == 0 {
+                    state[SRL_S_STATS_BIN_DECRYPT_FAIL] = state[SRL_S_STATS_BIN_DECRYPT_FAIL] + 1
+                } else {
+                    let entry = list_new()
+                    push(entry, from_peer)
+                    push(entry, opened[0])
+                    push(entry, opened[1])
+                    push(state[SRL_S_RECEIVED], entry)
+                    state[SRL_S_STATS_BIN_DELIVERED] = state[SRL_S_STATS_BIN_DELIVERED] + 1
+                }
+            }
+            processed = processed + 1
+        }
+        i = i + 1
+    }
+    // Empty the queue (mirrors relay_drain_inbound pattern).
+    while len(q) > 0 { pop(q) }
+    return processed
+}
+
+// Alias: callers that want a "drain everything" entrypoint can call
+// srl_drain_all instead of remembering to invoke both paths each tick.
+// srl_drain_relay_recv handles the hex path (via the relay's
+// received-queue cursor) while srl_drain_relay_recv_binary handles
+// the bin path (via the SRL_S_INBOUND_BIN queue). Returns the
+// total count drained across both paths.
+fn srl_drain_all(state) {
+    let h = srl_drain_relay_recv(state)
+    let b = srl_drain_relay_recv_binary(state)
+    return h + b
+}
+
+// Alias: srl_recv_secure already drain-and-clears the unified recv
+// queue (both hex and binary entries land there). srl_recv_secure_binary
+// is a named pointer for callers that want to express intent.
+fn srl_recv_secure_binary(state) {
+    return srl_recv_secure(state)
+}
+
+// ---- gossip-side dispatcher entry point --------------------------------
+//
+// Called by the gossip dispatcher in gossip.nova when it has just read
+// a RELAY_BIN header line off `fd`. We parse the header, drain
+// total_len bytes off the fd, and either:
+//   (a) target == self_addr -> queue locally for srl_drain_recv_binary,
+//       OR
+//   (b) target != self_addr -> forward as RELAY_BIN to target with
+//       via=self_addr (relay-intermediate path).
+//
+// Reachable from gossip.nova via the pinned slot
+// GOSSIP_S_SRL_STATE -> srl_state -> this function. (gossip.nova
+// passes srl_state directly so we do not import gossip from here.)
+//
+// Returns 1 on a clean dispatch (read OR forward), 0 otherwise.
+
+fn srl_dispatch_bin_inbound(state, fd, header_line) {
+    let parsed = srl_bin_parse_header(header_line)
+    if parsed == 0 { return 0 }
+    let req_id    = parsed[0]
+    let target    = parsed[1]
+    let via       = parsed[2]
+    let from      = parsed[3]
+    let total_len = parsed[4]
+    // Drain raw bytes off the fd into a freshly allocated buffer.
+    // _gnoise_recv_exact (public in gossip.nova) reads exactly N
+    // bytes, returning [buf, n] or 0 on EOF / timeout / short read.
+    let rxd = 0
+    if total_len > 0 {
+        rxd = _gnoise_recv_exact(fd, total_len)
+        if rxd == 0 { return 0 }
+    } else {
+        rxd = list_new()
+        push(rxd, 0)
+        push(rxd, 0)
+    }
+    let frame_buf = rxd[0]
+    let frame_n   = rxd[1]
+    let relay = state[SRL_S_RELAY]
+    if relay == 0 { return 0 }
+    let g = relay[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let self_addr = gossip_self_addr(g)
+    if str_eq(target, self_addr) == 1 {
+        // Terminal delivery: enqueue for drain.
+        return srl_inject_binary_record(state, req_id, from,
+                                         frame_buf, frame_n)
+    }
+    // Intermediate: forward to target, preserving from.
+    let fwd_hdr = srl_bin_format_header(req_id, target, self_addr,
+                                         from, frame_n)
+    if _srl_send_bin_to(target, fwd_hdr, frame_buf, frame_n) == 1 {
+        // Bump the underlying relay's forwarded counter so
+        // diagnostics + integration assertions see the relay
+        // route activity. We deliberately reuse the relay's
+        // existing counter rather than minting a new bin-specific
+        // one -- forwarding is forwarding.
+        relay[RELAY_S_STATS_FORWARDED] = relay[RELAY_S_STATS_FORWARDED] + 1
+        return 1
+    }
+    return 0
 }
 
 // ---- test-only helpers --------------------------------------------------

@@ -225,6 +225,23 @@ let GOSSIP_NAT_INBOUND_AD_SLOT = 6
 let GOSSIP_RELAY_REQ_PREFIX  = "RELAY_REQ "
 let GOSSIP_RELAY_DATA_PREFIX = "RELAY_DATA "
 let GOSSIP_RELAY_ACK_PREFIX  = "RELAY_ACK "
+// R27C.2 -- bulk binary path for srl-wrapped payloads. Mirrors
+// SRL_BIN_PREFIX from gossip_relay_secure.nova. Distinct from
+// every other RELAY_* prefix so the dispatch in
+// gossip_handle_conn / gossip_handle_conn_kg can route to the
+// binary-read codepath without ambiguity. The dispatcher reads
+// the rest of the header line (target/via/from/total_len),
+// drains total_len raw bytes off the fd, and either queues a
+// terminal-deliverable record onto the srl_state's pinned
+// SRL_S_INBOUND_BIN queue (slot 8) or forwards to the target.
+let GOSSIP_RELAY_BIN_PREFIX  = "RELAY_BIN "
+// Pinned cross-module slot indices. The srl_state record
+// (src/federation/gossip_relay_secure.nova) pins SRL_S_INBOUND_BIN
+// at slot 8 + SRL_S_RELAY at slot 0; gossip.nova reads + writes
+// those slots without importing the srl module so the import graph
+// stays acyclic.
+let GOSSIP_SRL_S_RELAY       = 0   // mirrors SRL_S_RELAY
+let GOSSIP_SRL_S_INBOUND_BIN = 8   // mirrors SRL_S_INBOUND_BIN
 
 // R21B -- distributed rule inference message types. Rule broadcast +
 // remote fact fetch + derivation broadcast. The originator side lives
@@ -407,6 +424,18 @@ let GOSSIP_S_RELAY_STATE            = 35  // relay_state_t or 0
 let GOSSIP_S_STATS_RELAY_REQ_RX     = 36  // RELAY_REQ lines forwarded
 let GOSSIP_S_STATS_RELAY_DATA_RX    = 37  // RELAY_DATA lines delivered
 let GOSSIP_S_STATS_RELAY_ACK_RX     = 38  // RELAY_ACK lines noted
+// R27C.2 -- bulk binary path for srl. srl_state_t back-ref + per-
+// message-type counters. The slot is 0 by default; a soul that has
+// not opted into R27C.2 sees RELAY_BIN lines arrive but drops them
+// (the parser branch nil-checks the slot). The dispatcher uses
+// the slot to push terminal records onto the srl's pinned binary-
+// inbound queue (SRL_S_INBOUND_BIN). Forwarding (target != self)
+// requires no srl wiring; the dispatcher writes binary bytes
+// directly to the next hop using the gossip.nova send helpers.
+let GOSSIP_S_SRL_STATE              = 39  // srl_state_t or 0
+let GOSSIP_S_STATS_RELAY_BIN_RX     = 40  // RELAY_BIN lines successfully read
+let GOSSIP_S_STATS_RELAY_BIN_FWD    = 41  // RELAY_BIN forwarded to next hop
+let GOSSIP_S_STATS_RELAY_BIN_BAD    = 42  // RELAY_BIN dropped (bad header / short read)
 
 // ---- low-level string helpers ---------------------------------------------
 
@@ -584,6 +613,10 @@ fn gossip_init(self_addr, bootstrap_peers) {
     push(st, 0)                      // S_STATS_RELAY_REQ_RX (R26E)
     push(st, 0)                      // S_STATS_RELAY_DATA_RX (R26E)
     push(st, 0)                      // S_STATS_RELAY_ACK_RX (R26E)
+    push(st, 0)                      // S_SRL_STATE (R27C.2)
+    push(st, 0)                      // S_STATS_RELAY_BIN_RX (R27C.2)
+    push(st, 0)                      // S_STATS_RELAY_BIN_FWD (R27C.2)
+    push(st, 0)                      // S_STATS_RELAY_BIN_BAD (R27C.2)
 
     // Bootstrap peers are addresses; trust them at startup with
     // status=ALIVE and last_seen=nanotime() (the operator just told
@@ -1215,6 +1248,13 @@ fn gossip_handle_conn(state, conn_fd) {
                         if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
                             _gossip_serve_relay_ack(state, line)
                         }
+                        // R27C.2: handle RELAY_BIN bulk binary frames.
+                        // The header line carries routing tokens +
+                        // total_len; the dispatcher reads the raw
+                        // payload bytes off the fd before returning.
+                        if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 1 {
+                            _gossip_serve_relay_bin(state, conn_fd, line)
+                        }
                     }
                 }
             }
@@ -1357,6 +1397,11 @@ fn gossip_handle_conn_kg(state, conn_fd, kg) {
                             }
                             if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
                                 _gossip_serve_relay_ack(state, line)
+                            }
+                            // R27C.2: bulk binary path under kg variant.
+                            // Same shape as the kg-less branch above.
+                            if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 1 {
+                                _gossip_serve_relay_bin(state, conn_fd, line)
                             }
                         }
                     }
@@ -2934,4 +2979,189 @@ fn gossip_relay_status_line(state) {
         + " req_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_REQ_RX])
         + " data_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_DATA_RX])
         + " ack_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_ACK_RX])
+        + " bin_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_BIN_RX])
+        + " bin_fwd=" + int_to_str(state[GOSSIP_S_STATS_RELAY_BIN_FWD])
+        + " bin_bad=" + int_to_str(state[GOSSIP_S_STATS_RELAY_BIN_BAD])
+}
+
+// ============================================================================
+// R27C.2 -- bulk binary path dispatcher
+// ============================================================================
+//
+// gossip_set_srl_state -- the caller registers the srl_state record so
+// the binary-path dispatcher knows where to push inbound terminal
+// records (the SRL_S_INBOUND_BIN queue at the pinned slot 8). The slot
+// is 0 by default; a soul that has not opted into R27C.2 sees
+// RELAY_BIN lines arrive, reads the bytes off the fd (so the
+// connection doesn't desync), bumps GOSSIP_S_STATS_RELAY_BIN_BAD, and
+// drops them.
+
+fn gossip_set_srl_state(state, srl_state) {
+    state[GOSSIP_S_SRL_STATE] = srl_state
+    return state
+}
+
+fn gossip_srl_state(state)            { return state[GOSSIP_S_SRL_STATE] }
+fn gossip_stats_relay_bin_rx(state)   { return state[GOSSIP_S_STATS_RELAY_BIN_RX] }
+fn gossip_stats_relay_bin_fwd(state)  { return state[GOSSIP_S_STATS_RELAY_BIN_FWD] }
+fn gossip_stats_relay_bin_bad(state)  { return state[GOSSIP_S_STATS_RELAY_BIN_BAD] }
+
+// Parse a `RELAY_BIN <req_id> <target> <via> <from> <total_len>` line.
+// Returns [req_id, target, via, from, total_len] on success, 0 on
+// malformed input. Mirror of srl_bin_parse_header (the srl module owns
+// the canonical implementation; we duplicate the few lines here so
+// gossip.nova does not import the srl module -- the same pattern
+// gossip uses for the relay parser branches).
+fn _gossip_parse_bin_hdr(line) {
+    if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 6 { return 0 }
+    let id_s = toks[1]
+    if _gossip_is_digits(id_s) == 0 { return 0 }
+    let req_id = str_to_int(id_s)
+    let target = toks[2]
+    let via    = toks[3]
+    let from   = toks[4]
+    let len_s  = toks[5]
+    if len(target) == 0 { return 0 }
+    if len(via) == 0    { return 0 }
+    if len(from) == 0   { return 0 }
+    if _gossip_is_digits(len_s) == 0 { return 0 }
+    let total_len = str_to_int(len_s)
+    if total_len < 0 { return 0 }
+    let out = list_new()
+    push(out, req_id)
+    push(out, target)
+    push(out, via)
+    push(out, from)
+    push(out, total_len)
+    return out
+}
+
+// Build the RELAY_BIN header line (no trailing newline -- caller
+// appends "\n" before raw bytes). Duplicates srl_bin_format_header to
+// keep the gossip <-> srl import graph one-way.
+fn _gossip_format_bin_hdr(req_id, target, via, from, total_len) {
+    return GOSSIP_RELAY_BIN_PREFIX + int_to_str(req_id)
+        + " " + target + " " + via + " " + from
+        + " " + int_to_str(total_len)
+}
+
+// Forward a binary frame to the next hop (the relay role). Opens a
+// short-lived TCP connection to `addr`, runs HELLO/OK, sends the
+// header + raw frame bytes, sends BYE, closes. Returns 1 on success
+// 0 on any error. Reuses _gossip_dial + _gossip_send_all +
+// _gnoise_raw_send (already public in this module). Used by the
+// dispatcher's intermediate-forwarding branch.
+fn _gossip_forward_bin(addr, header_line, frame_buf, frame_n) {
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    _gossip_set_rcvtimeo_ms(fd, 5000)
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    if _gossip_send_all(fd, header_line + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    if frame_n > 0 {
+        if _gnoise_raw_send(fd, frame_buf, frame_n) == 0 {
+            close_fd(fd); return 0
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// Dispatch a RELAY_BIN inbound line. Two cases:
+//   * target == self_addr: enqueue terminal record onto the srl's
+//     SRL_S_INBOUND_BIN queue; srl_drain_relay_recv_binary picks it
+//     up next tick. Bump STATS_RELAY_BIN_RX.
+//   * target != self_addr: forward as RELAY_BIN to target with
+//     via=self_addr, from preserved. Bump STATS_RELAY_BIN_FWD on
+//     successful forward.
+//
+// On parse failure, short fd read, or zero srl_state when terminal,
+// bumps STATS_RELAY_BIN_BAD and returns 0. The fd has already been
+// progressed by `recv_data` for the binary tail; we cannot rewind so
+// the connection is implicitly drained even on a drop.
+//
+// Returns 1 on a clean dispatch, 0 otherwise.
+fn _gossip_serve_relay_bin(state, fd, line) {
+    let parsed = _gossip_parse_bin_hdr(line)
+    if parsed == 0 {
+        state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+        return 0
+    }
+    let req_id    = parsed[0]
+    let target    = parsed[1]
+    let via       = parsed[2]
+    let from      = parsed[3]
+    let total_len = parsed[4]
+    // Drain raw bytes off the fd. _gnoise_recv_exact returns [buf, n]
+    // or 0 on EOF / timeout / short read. Same helper used by the
+    // R21E Noise handshake's framed reader.
+    let rxd = 0
+    if total_len > 0 {
+        rxd = _gnoise_recv_exact(fd, total_len)
+        if rxd == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+    }
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    if str_eq(target, self_addr) == 1 {
+        // Terminal delivery: push onto srl's binary inbound queue.
+        let srl = state[GOSSIP_S_SRL_STATE]
+        if srl == 0 {
+            // Soul not opted into R27C.2; bytes arrived, bump bad,
+            // drop. The TCP connection has been drained so subsequent
+            // PING/MEMBER lines parse cleanly.
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        let q = srl[GOSSIP_SRL_S_INBOUND_BIN]
+        if q == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        let rec = list_new()
+        push(rec, req_id)
+        push(rec, from)
+        if total_len > 0 {
+            push(rec, rxd[0])
+            push(rec, rxd[1])
+        } else {
+            push(rec, 0)
+            push(rec, 0)
+        }
+        push(q, rec)
+        state[GOSSIP_S_STATS_RELAY_BIN_RX] = state[GOSSIP_S_STATS_RELAY_BIN_RX] + 1
+        return 1
+    }
+    // Intermediate: forward to target.
+    let frame_buf = 0
+    let frame_n = 0
+    if total_len > 0 {
+        frame_buf = rxd[0]
+        frame_n   = rxd[1]
+    }
+    let fwd_hdr = _gossip_format_bin_hdr(req_id, target, self_addr,
+                                          from, frame_n)
+    if _gossip_forward_bin(target, fwd_hdr, frame_buf, frame_n) == 1 {
+        state[GOSSIP_S_STATS_RELAY_BIN_FWD] = state[GOSSIP_S_STATS_RELAY_BIN_FWD] + 1
+        // Bump the underlying relay's forwarded counter too so
+        // diagnostics reflect activity at the relay layer (matches
+        // the way RELAY_REQ -> RELAY_DATA forwarding bumps it).
+        let r0 = state[GOSSIP_S_RELAY_STATE]
+        if r0 != 0 {
+            r0[7] = r0[7] + 1  // RELAY_S_STATS_FORWARDED is slot 7
+        }
+        return 1
+    }
+    state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+    return 0
 }

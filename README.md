@@ -292,6 +292,44 @@ computational units rather than orchestrating a pipeline of modules.
 > All federation tests stay green: gossip\_relay 61, gossip 34,
 > gossip\_noise 44, noise\_xk 44.
 >
+> R27C.2 (R28B follow-up) closes the documented hex-overhead hole
+> in R27C: extends `src/federation/gossip_relay_secure.nova` with a
+> bulk binary path so a 10KB payload moves at half the wire bytes.
+> New wire prefix `RELAY_BIN <req_id> <target> <via> <from>
+> <total_len>\n[total_len raw binary bytes]`; the gossip
+> dispatcher in `gossip.nova` recognises the prefix, drains the
+> binary tail via `_gnoise_recv_exact` (the same helper R21E uses
+> for handshake framing), and either pushes a terminal record onto
+> the srl's pinned binary inbound queue or forwards to the next
+> hop. New API:  `srl_send_secure_binary(srl, target, pt_buf,
+> pt_n)`, `srl_send_secure_auto(...)` (auto-routes hex vs binary on
+> a 1024-byte ciphertext threshold so callers do not have to think
+> about it), `srl_drain_relay_recv_binary(srl)`, `srl_drain_all`
+> convenience drain, `srl_bin_format_header / _parse_header` test
+> helpers, `srl_inject_binary_record` (unit-test bypass for the
+> socket). Wiring on `gossip.nova` side: `GOSSIP_RELAY_BIN_PREFIX`,
+> `GOSSIP_S_SRL_STATE`, `gossip_set_srl_state`,
+> `_gossip_serve_relay_bin` dispatcher; parser branches in the
+> plaintext kg-less and kg-aware `gossip_handle_conn` variants.
+> Honest scope: binary path not wired to the R21E noise-wrapped
+> transport (the srl AEAD wrap is sufficient confidentiality for
+> bulk frames; doubling the encryption costs CPU for no security
+> gain); threshold is a constant (1024 bytes); same
+> per-frame routing metadata exposed (target / via / from in the
+> header line). Verification: 51 unit assertions in
+> `tests/unit/test_relay_secure_binary.nova` (header round-trip,
+> send refuses without session, full inject + drain happy path,
+> tampered AEAD body rejected, 5KB + 10KB byte-pattern
+> round-trips, wire-size win observed) + 10 integration
+> assertions in `tests/integration/scenario_zzzz_relay_binary.sh`
+> (3-soul A->C->B mesh, 10KB binary frame routed through C, C's
+> gossip bin_fwd=2, B's gossip bin_rx=2, B's srl bin_delivered=1,
+> recv\[0\] 10240-byte plaintext matches the originator's
+> deterministic byte pattern, tamper detection bin_decrypt_fail=1
+> on a single-byte flip, binary wire-size = 0.50x hex wire-size
+> on the 10KB payload). R27C scenario_xxxx still passes 11/11
+> (the hex path is unchanged); 219 / 219 unit tests pass.
+>
 > R27B (R26E.2 follow-up) extends `src/federation/gossip_relay.nova`
 > with NAT-type-aware ranked relay selection. The base R26E picker
 > walked alive peers in gossip-table order and returned the first

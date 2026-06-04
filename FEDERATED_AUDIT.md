@@ -2032,6 +2032,170 @@ srl_stats_line(srl)
   (E2E round-trip through unreading C confirmed), B's
   decrypt\_failed >= 1 (the tampered second frame was rejected).
 
+## R27C.2 / R28B extension: bulk binary path for Noise-XK relay payloads
+
+R27C documented the open item R27C.2: the hex-encoded relay wire
+doubled the per-frame on-wire bytes, fine for control-plane traffic
+(PINGs, /chat commands) but wasteful for bulk payloads (KG delta
+packs, snapshot fragments, multi-KB messages). R27C.2 (R28B sprint)
+closes that hole by introducing a length-prefixed binary path: when
+the AEAD ciphertext crosses a threshold (1024 bytes by default),
+srl_send_secure_binary routes through a new RELAY_BIN wire shape
+instead of relay_send's hex; the gossip dispatcher recognises the
+prefix, reads the raw binary tail off the same fd, and either
+queues the terminal record OR forwards as binary to the next hop.
+
+### Wire shape
+
+```
+RELAY_BIN <req_id> <target> <via> <from> <total_len>\n
+[total_len raw binary bytes of the AEAD frame]
+```
+
+The header line still terminates with `\n` so the existing
+`_gossip_recv_line` returns it intact. After dispatch recognises the
+prefix, `_gnoise_recv_exact(fd, total_len)` (the helper R21E uses
+for its Noise handshake framing) drains the binary tail. The AEAD
+frame itself is unchanged: the same nxk_seal output that the hex
+path encodes to ASCII is written straight to the wire instead.
+
+### What R27C.2 delivers
+
+1. **Module extension** -- `src/federation/gossip_relay_secure.nova`
+   grows ~ 480 lines (state slots 8-12 + binary path code).
+   New public API:
+
+   ```
+   srl_send_secure_binary(srl, target, pt_buf, pt_n) -> 1 ok | 0
+       Sealed-then-binary-routed. Refuses on missing session
+       (mirror of srl_send_secure's strict policy). Routes
+       direct, falls back via an alive intermediate (same
+       picker as relay_send), or via a cached relay if target
+       is marked unreachable.
+   srl_send_secure_auto(srl, target, pt_buf, pt_n) -> 1 ok | 0
+       Auto-router: ciphertext > SRL_BIN_THRESHOLD (1024)
+       picks binary; else hex. Drop-in replacement.
+   srl_inject_binary_record(srl, req_id, from, buf, n)
+       Test injection: bypasses the socket so unit tests run
+       in the no-network sandbox.
+   srl_drain_relay_recv_binary(srl) -> int processed
+       Drains the binary inbound queue (records the gossip
+       dispatcher pushed after a successful RELAY_BIN read).
+   srl_drain_all(srl) -> hex_drained + bin_drained
+       Convenience: drains both paths in one call.
+   srl_recv_secure_binary(srl) -> drained recv list
+       Alias for srl_recv_secure (the recv queue is shared
+       between hex and binary; entries land in the same place).
+   srl_bin_format_header / srl_bin_parse_header (test helpers)
+   srl_stats_bin_sent / _bin_delivered / _bin_decrypt_failed /
+       _bin_no_session / srl_bin_inbound_count
+   ```
+
+2. **Gossip dispatcher** -- `src/federation/gossip.nova` adds:
+
+   * `GOSSIP_RELAY_BIN_PREFIX = "RELAY_BIN "` constant.
+   * `GOSSIP_S_SRL_STATE` (slot 39) + `_BIN_RX/_FWD/_BAD` counter
+     slots (40-42) populated in `gossip_init`.
+   * `gossip_set_srl_state(state, srl_state)` setter wiring the
+     srl_state back-ref so the dispatcher can push terminal
+     records onto srl's pinned binary inbound queue
+     (`SRL_S_INBOUND_BIN` = slot 8) without importing srl
+     (preserves the gossip <-> gossip_relay_secure one-way import
+     graph).
+   * `_gossip_serve_relay_bin(state, fd, header_line)` -- parses
+     the 5-token header, drains `total_len` raw bytes via
+     `_gnoise_recv_exact`. If `target == self_addr` -> push
+     terminal record. Else -> forward as RELAY_BIN to target,
+     bumping the underlying relay's forwarded counter so
+     diagnostics reflect the route activity.
+   * Parser branches in `gossip_handle_conn` and
+     `gossip_handle_conn_kg` (the two plaintext-wire handlers).
+
+### Auto-routing threshold
+
+`SRL_BIN_THRESHOLD = 1024` bytes (in ciphertext / nxk_seal frame
+length). Most control messages produce sub-1KB ciphertext after
+Noise framing (4-byte length + plaintext + 16-byte tag) and stay on
+the hex path for back-compat with R27C scenarios. Bulk payloads
+(KG delta packs ~ 5-50KB, snapshot fragments ~ 10-100KB) cross the
+threshold and ride binary. The threshold is a constant rather than
+env-tunable; a future revision could expose `CE_SRL_BIN_THRESHOLD`
+if a deployment wants finer control.
+
+### Wire-size win
+
+* Hex path: 2 × frame_n hex chars + ~ 90-byte header line
+  (`RELAY_REQ <id> <target> <origin> <hex...>\n`).
+* Binary path: frame_n raw bytes + ~ 80-byte header line
+  (`RELAY_BIN <id> <target> <via> <from> <total_len>\n`).
+
+For a 10 KB plaintext (frame_n = 10260 after Noise framing):
+
+| Path   | On-wire bytes | Ratio |
+|--------|---------------|-------|
+| Hex    | 20520 + ~90  | 1.00x |
+| Binary | 10260 + ~80  | 0.50x |
+
+The binary path saves ~ 10 KB per 10 KB payload (the 2x hex
+overhead is eliminated outright). Header overhead is < 1% even
+on the binary path for any payload above ~ 8 KB.
+
+### Honest scope (R27C.2)
+
+* **Plaintext gossip wire only.** The binary dispatch wires into
+  `gossip_handle_conn` and `gossip_handle_conn_kg`. The R21E
+  Noise-protected gossip transport (`gossip_handle_conn_kg_gconn`)
+  uses an encrypted line-wrapper that is incompatible with the
+  raw-bytes tail of RELAY_BIN. The srl AEAD wrap already encrypts
+  the payload end-to-end so the binary path's lack of an outer
+  R21E transport wrap is not a confidentiality regression --
+  defense in depth is sacrificed for bulk efficiency.
+* **No automatic chunking.** A frame larger than the dispatcher's
+  inbound buffer / nxk_seal's frame limit would be rejected. Bulk
+  payloads above the nxk_seal cap need application-level
+  chunking + sequencing; that lives above the srl layer.
+* **Same metadata exposure.** The header line still carries
+  `target / via / from` in cleartext (the dispatcher needs them
+  to route). End-to-end metadata privacy is a separate follow-up
+  (same gap as R27C).
+* **Threshold tuning.** `SRL_BIN_THRESHOLD = 1024` is a heuristic.
+  A workload with a strong bias toward 500-byte messages would
+  see no benefit; a workload with a strong bias toward 5KB
+  messages benefits maximally. The threshold being non-tunable
+  is a known limitation.
+
+### Verification
+
+* Unit (`tests/unit/test_relay_secure_binary.nova`):
+  **51 assertions** -- binary slots zero on init (6); header
+  format + parse round-trip (6) + malformed reject (2); send
+  refuses without session (3); inject + drain happy path on a
+  short message (15); tamper in AEAD body -> decrypt_fail bump,
+  recv stays empty (4); drain drops unpaired from-peer (3); 5KB
+  payload wire-size: binary < 0.6x hex (3); 10KB payload full
+  round-trip with byte-pattern match (5); recv_secure_binary
+  alias drains (2); srl_drain_all unifies both paths (2); stats
+  line carries bin_sent= field (1).
+
+* Integration (`tests/integration/scenario_zzzz_relay_binary.sh`):
+  **10 assertions** on a 3-soul A/B/C mesh. A sends two 10KB
+  binary payloads through C to B via `srl_send_secure_binary`.
+  The receiver-side harness MITM-tampers a single byte deep in
+  the second frame's AEAD body before drain. Asserts: NOVA
+  pre-flight, 3 souls compile + mid-flight liveness, A's binary
+  send returned 1 + bin_sent counter bumped, C's gossip
+  `bin_fwd >= 1` (the dispatcher forwarded raw bytes), B's
+  gossip `bin_rx >= 1` (terminal frame received), B's srl
+  `bin_delivered >= 1` (frame decrypted + queued), B's recv[0]
+  full 10240 plaintext bytes match the deterministic pattern
+  the originator built, B's srl `bin_decrypt_fail >= 1`
+  (tampered frame detected via Poly1305), 10KB binary wire size
+  (~ 10340 bytes) is < 0.55x the hex wire size (~ 20520 bytes)
+  -- the bulk-bandwidth saving is observed end-to-end.
+
+* Regression: scenario_xxxx_relay_secure (R27C) still passes
+  11/11 (the hex path is unchanged); all 219 unit tests pass.
+
 ## R28E extension: WebRTC data-channel signaling for browser-to-soul federation
 
 CrossEngin federation up to R27 is native-only: every transport is a

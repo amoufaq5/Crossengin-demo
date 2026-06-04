@@ -3,6 +3,151 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R28B (this session) -- bulk binary path for R27C secure relay
+
+**Status: complete -- `src/federation/gossip_relay_secure.nova` extended
+purely additively (~480 lines appended at the bottom + 5 new srl_state
+slots) + minimal `src/federation/gossip.nova` addition (one prefix
+constant + 4 new state slots + `gossip_set_srl_state` setter + a
+`_gossip_serve_relay_bin` dispatcher + parser branches in two of the
+three handle_conn variants). R27C (commit `dc8b00d`) shipped Noise-XK
+end-to-end wrap of relay payloads but documented R27C.2: the wire
+encoded ciphertext as hex (2x overhead) because the relay v1 wire
+is text/line-based. For bulk payloads (KG delta packs, snapshot
+fragments) that overhead is wasted bandwidth. R27C.2 introduces a
+length-prefixed RELAY_BIN wire shape that fits inside the existing
+line-oriented dispatcher: the prefix line carries routing tokens +
+total_len; the dispatcher reads the raw binary tail off the same fd
+via the public `_gnoise_recv_exact` helper R21E already uses for its
+handshake framing.**
+
+### What R28B delivers
+
+1. **`srl_send_secure_binary(srl, target, pt_buf, pt_n)`** -- seals
+   under the registered session for `target`, builds a RELAY_BIN
+   header carrying req_id / target / via / from / total_len, and
+   writes header+frame bytes through a short-lived TCP probe. Routing
+   policy mirrors `relay_send`: direct dial first; on direct failure
+   or `target` marked unreachable, fall back through an alive
+   intermediate (the same `_relay_pick_dispatch` used by R26E.2
+   ranked selection). The intermediate's gossip dispatcher recognises
+   the RELAY_BIN prefix, drains the raw bytes, and forwards to the
+   target. Refuses with `bin_no_session++` if no session is
+   registered (mirror of `srl_send_secure`'s strict policy --
+   missing session is a config error, not a fallthrough to
+   plaintext).
+
+2. **`srl_send_secure_auto(srl, target, pt_buf, pt_n)`** -- one
+   seal, then dispatches on `frame_n > SRL_BIN_THRESHOLD` (1024
+   bytes). Above threshold -> binary path; at or below -> hex path
+   via the existing `relay_send`. Drop-in for callers that want the
+   library to pick the cheaper wire automatically.
+
+3. **`srl_drain_relay_recv_binary(srl)`** -- pops every binary
+   record off the inbound queue (records the gossip dispatcher
+   pushed), decrypts under the from-peer's session, queues
+   plaintext on the unified recv queue (shared with the hex
+   path). `srl_drain_all(srl)` is a convenience wrapper that
+   drains BOTH paths in one call so daemon loops do not need to
+   remember which path is active.
+
+4. **Wire shape**
+
+   ```
+   RELAY_BIN <req_id> <target> <via> <from> <total_len>\n
+   [total_len raw binary bytes of the AEAD frame]
+   ```
+
+   The dispatcher in `gossip.nova` (`_gossip_serve_relay_bin`)
+   parses the header tokens, calls `_gnoise_recv_exact(fd,
+   total_len)` for the raw tail, then either:
+     - target == self -> push `[req_id, from, buf, n]` onto the
+       srl's pinned `SRL_S_INBOUND_BIN` queue (slot 8).
+     - target != self -> rebuild header with via=self_addr and
+       forward via `_gossip_forward_bin` (short-lived TCP, raw
+       bytes, BYE close). The underlying relay's forwarded
+       counter bumps so diagnostics reflect the route activity.
+
+5. **Tamper detection** -- identical to the hex path. A single bit
+   flip anywhere in the binary tail fails Poly1305 on the
+   receiver's `nxk_open`; `bin_decrypt_fail` increments; the recv
+   queue does not grow. The integration scenario MITMs a byte
+   at offset 10 of the second 10KB frame and observes the drop.
+
+### Wire-size win observed
+
+10KB plaintext sealed with `nxk_seal` produces a frame_n of 10260
+bytes (4-byte length + 10240 plaintext + 16-byte tag).
+
+| Path   | On-wire bytes | Ratio |
+|--------|---------------|-------|
+| Hex    | 20520 + ~90  | 1.00x |
+| Binary | 10260 + ~80  | 0.50x |
+
+The integration scenario asserts `binary_wire < 0.55 * hex_wire`
+with margin for the header line difference (binary saves 10180
+bytes on a 10KB payload). For sub-1KB control messages the hex
+path is unchanged so existing R27C scenarios show no behaviour
+change.
+
+### Files
+
+* `src/federation/gossip_relay_secure.nova` -- extended (~ 480
+  lines appended).
+* `src/federation/gossip.nova` -- extended (~ 180 lines for the
+  prefix constant, slots, setter, dispatcher helper, parser
+  branches).
+* `tests/unit/test_relay_secure_binary.nova` -- NEW (51 assertions
+  across 12 test fns).
+* `tests/integration/scenario_zzzz_relay_binary.sh` -- NEW (10
+  assertions on a 3-soul A/B/C mesh).
+* `FEDERATED_AUDIT.md` -- R27C.2/R28B section added.
+* `README.md` -- one-line update under R26 family.
+
+### Module count
+
+Unchanged at 192 source modules (extensions to two existing files;
+no new src/ module).
+
+### Verification snapshot
+
+* `bash scripts/test.sh` -- **219 / 219 unit tests pass** including
+  the new `test_relay_secure_binary.nova`.
+* `bash tests/integration/scenario_xxxx_relay_secure.sh` --
+  R27C scenario still passes **11 / 11**.
+* `bash tests/integration/scenario_zzzz_relay_binary.sh` -- new R28B
+  scenario passes **10 / 10** (NOVA pre-flight, drivers compile,
+  liveness, A's binary send rc=1 + bin_sent=2, C's gossip
+  bin_fwd=2, B's gossip bin_rx=2, B's srl bin_delivered=1, B's
+  recv[0] 10240-byte plaintext matches the originator's
+  byte-pattern, B's srl bin_decrypt_fail=1 after tamper, wire-size
+  ratio ~ 0.50x).
+
+### Verify locally
+
+```sh
+NOVA_ROOT=/home/user/NOVA /home/user/NOVA/nova run tests/unit/test_relay_secure_binary.nova
+NOVA_ROOT=/home/user/NOVA bash tests/integration/scenario_zzzz_relay_binary.sh
+NOVA_ROOT=/home/user/NOVA bash scripts/test.sh
+```
+
+### Known follow-ups
+
+* The R21E Noise-protected gossip transport (`gossip_handle_conn_kg_gconn`)
+  is NOT wired with RELAY_BIN -- its line wrapper is incompatible
+  with the raw-bytes tail. The srl AEAD wrap already encrypts
+  end-to-end, so dropping the outer R21E transport wrap for
+  binary frames is a deliberate scope trade for bulk
+  efficiency. Wiring R21E-friendly bulk transport would require
+  a chunked-binary mode inside the gconn wrapper -- separate
+  follow-up.
+* `SRL_BIN_THRESHOLD` is a hard-coded constant. A future revision
+  could read `CE_SRL_BIN_THRESHOLD` from env for workload-specific
+  tuning.
+* The binary path uses the same direct-or-relay routing dispatcher
+  as the hex path. R26E.2 ranked-relay selection (LRU tie-break by
+  NAT type) automatically applies when `CE_RELAY_RANK_NAT=on`.
+
 ## R28A (this session) -- R21B DRFETCH adaptive timeout + late-ACK isolation
 
 **Status: complete -- `src/federation/distributed_rules.nova` extended
