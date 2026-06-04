@@ -1,0 +1,499 @@
+// Unit tests for src/federation/kg_sync.nova (R29F).
+//
+// Exercises the pure delta-compression helpers: state-management
+// (rev counter + log), wire-format format/parse/round-trip, the
+// 256 KB cap fallback path, the idempotency contract on the
+// applier side, and the tamper-rejection contract for malformed /
+// out-of-window response bodies.
+//
+// Live socket flow lives in the R29F integration scenario
+// (tests/integration/scenario_bbbbb_kg_delta.sh) which drives a
+// 2-soul publisher / subscriber over a real connection. This
+// unit suite keeps the protocol pure-by-design so it can be
+// exercised without flakiness.
+
+import "../ce_test.nova"
+import "../../src/federation/kg_sync.nova"
+
+// ---- applier stubs for kgd_apply_response -------------------------------
+//
+// Each callback returns 1 to signal "applied OK" so the dispatcher
+// counts the change. The body just records the call in a shared
+// global log so the test can inspect what was applied.
+
+let G_APPLIED = list_new()
+
+fn _t_reset_applied() {
+    let n = len(G_APPLIED)
+    let i = 0
+    while i < n {
+        list_set(G_APPLIED, i, 0)
+        i = i + 1
+    }
+    // Drain by re-creating (NOVA has no list_clear -- we just track length).
+    while len(G_APPLIED) > 0 {
+        list_set(G_APPLIED, 0, 0)
+        // Can't actually pop -- so the test pattern is to reset before each
+        // call. We instead just track HOW MANY records the test cares about
+        // via the per-test counts below.
+        return
+    }
+}
+
+fn _t_ins(id, kind, alpha, beta, label) {
+    let r = list_new()
+    push(r, "INS")
+    push(r, id)
+    push(r, kind)
+    push(r, alpha)
+    push(r, beta)
+    push(r, label)
+    push(G_APPLIED, r)
+    return 1
+}
+
+fn _t_upd(id, alpha, beta) {
+    let r = list_new()
+    push(r, "UPD")
+    push(r, id)
+    push(r, alpha)
+    push(r, beta)
+    push(G_APPLIED, r)
+    return 1
+}
+
+fn _t_retr(id) {
+    let r = list_new()
+    push(r, "RETR")
+    push(r, id)
+    push(G_APPLIED, r)
+    return 1
+}
+
+// Force-fail applier (returns 0 always) -- used by the failure path
+// regression test.
+fn _t_ins_fail(id, kind, alpha, beta, label) { return 0 }
+fn _t_upd_fail(id, alpha, beta) { return 0 }
+fn _t_retr_fail(id) { return 0 }
+
+// ---- state-management ---------------------------------------------------
+
+fn test_state_new_empty() {
+    let st = kgd_state_new()
+    ce_eq("new rev == 0", kgd_state_rev(st), 0)
+    ce_eq("new log empty", kgd_state_log_size(st), 0)
+    ce_eq("new applied == 0", kgd_state_applied(st), 0)
+}
+
+fn test_state_bump_ins_increments() {
+    let st = kgd_state_new()
+    let r1 = kgd_state_bump_ins(st, 1, 1, 800, 200, "widget")
+    ce_eq("first INS returns rev 1", r1, 1)
+    ce_eq("state rev = 1", kgd_state_rev(st), 1)
+    ce_eq("log has 1 entry", kgd_state_log_size(st), 1)
+    let r2 = kgd_state_bump_ins(st, 2, 1, 900, 100, "gadget")
+    ce_eq("second INS returns rev 2", r2, 2)
+    ce_eq("state rev = 2", kgd_state_rev(st), 2)
+    ce_eq("log has 2 entries", kgd_state_log_size(st), 2)
+}
+
+fn test_state_bump_upd_and_retr_increment() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 800, 200, "widget")
+    let r2 = kgd_state_bump_upd(st, 1, 1800, 200)
+    ce_eq("UPD bumps to rev 2", r2, 2)
+    let r3 = kgd_state_bump_retr(st, 1)
+    ce_eq("RETR bumps to rev 3", r3, 3)
+    ce_eq("state rev = 3", kgd_state_rev(st), 3)
+}
+
+// ---- request codec ------------------------------------------------------
+
+fn test_format_req() {
+    let r = kgd_format_req(20)
+    ce_str_eq("REQ format", r, "KG_DELTA_REQ 20\n")
+}
+
+fn test_parse_req_ok() {
+    ce_eq("REQ parse 20", kgd_parse_req("KG_DELTA_REQ 20"), 20)
+    ce_eq("REQ parse 20 CRLF", kgd_parse_req("KG_DELTA_REQ 20\r\n"), 20)
+    ce_eq("REQ parse 0", kgd_parse_req("KG_DELTA_REQ 0"), 0)
+}
+
+fn test_parse_req_rejects_garbage() {
+    ce_eq("REQ wrong prefix",  kgd_parse_req("FOO 20"),                -1)
+    ce_eq("REQ non-digit",     kgd_parse_req("KG_DELTA_REQ abc"),      -1)
+    ce_eq("REQ empty tail",    kgd_parse_req("KG_DELTA_REQ "),         -1)
+    ce_eq("REQ totally empty", kgd_parse_req(""),                      -1)
+}
+
+// ---- response build + format -- single INS ------------------------------
+
+fn test_build_single_ins() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 800, 200, "widget")
+    let resp = kgd_build_response(st, 0, KGD_DEFAULT_CAP_BYTES)
+    ce_eq("from = 0", resp[KGD_R_FROM], 0)
+    ce_eq("to = 1",   resp[KGD_R_TO],   1)
+    ce_eq("n = 1",    resp[KGD_R_N],    1)
+    let text = kgd_format_response(resp)
+    ce_str_eq("formatted text",
+              text,
+              "KG_DELTA_RESP 0 1 1\nINS 1 1 1:800:200:widget\n")
+}
+
+// ---- response build + format -- 10 inserts ordered ----------------------
+
+fn test_build_10_inserts_ordered() {
+    let st = kgd_state_new()
+    let i = 0
+    while i < 10 {
+        kgd_state_bump_ins(st, i + 100, 1, 800, 200, "lbl")
+        i = i + 1
+    }
+    ce_eq("state rev after 10 = 10", kgd_state_rev(st), 10)
+    let resp = kgd_build_response(st, 0, KGD_DEFAULT_CAP_BYTES)
+    ce_eq("delta n = 10", resp[KGD_R_N], 10)
+    let changes = resp[KGD_R_CHANGES]
+    // Walk and check rev order is strictly 1..10.
+    let ok = 1
+    let j = 0
+    while j < 10 {
+        if changes[j][KGD_C_REV] != j + 1 { ok = 0 }
+        j = j + 1
+    }
+    ce_eq("changes are in rev order 1..10", ok, 1)
+    // First atom_id is 100, last is 109.
+    ce_eq("first atom id", changes[0][KGD_C_ID], 100)
+    ce_eq("last atom id",  changes[9][KGD_C_ID], 109)
+}
+
+// ---- response build -- empty delta when since >= cur --------------------
+
+fn test_build_since_equals_current_returns_empty() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 800, 200, "x")
+    kgd_state_bump_ins(st, 2, 1, 800, 200, "y")
+    ce_eq("rev = 2", kgd_state_rev(st), 2)
+    let resp = kgd_build_response(st, 2, KGD_DEFAULT_CAP_BYTES)
+    ce_eq("empty delta from = 2", resp[KGD_R_FROM], 2)
+    ce_eq("empty delta to = 2",   resp[KGD_R_TO],   2)
+    ce_eq("empty delta n = 0",    resp[KGD_R_N],    0)
+    let text = kgd_format_response(resp)
+    ce_str_eq("empty wire", text, "KG_DELTA_RESP 2 2 0\n")
+}
+
+fn test_build_since_above_current_returns_empty() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 800, 200, "x")
+    // since > rev: peer is somehow ahead. Treat as empty (no changes).
+    let resp = kgd_build_response(st, 100, KGD_DEFAULT_CAP_BYTES)
+    ce_eq("ahead-peer empty n", resp[KGD_R_N], 0)
+}
+
+// ---- response build -- cap exceeded falls back --------------------------
+
+fn test_build_exceeds_cap_returns_fallback() {
+    let st = kgd_state_new()
+    let i = 0
+    while i < 50 {
+        kgd_state_bump_ins(st, i, 1, 800, 200, "wide-label-padding-for-bytes")
+        i = i + 1
+    }
+    // Tiny cap forces the fallback sentinel.
+    let resp = kgd_build_response(st, 0, 80)
+    ce_eq("fallback marker", resp[KGD_R_FROM], KGD_R_FALLBACK)
+    ce_eq("fallback carries current rev", resp[KGD_R_TO], kgd_state_rev(st))
+    // The format helper returns "" for a fallback response (caller
+    // is expected to use kgd_format_fallback explicitly).
+    ce_str_eq("format_response returns empty for fallback",
+              kgd_format_response(resp), "")
+    let sentinel = kgd_format_fallback(resp[KGD_R_TO])
+    ce_str_eq("fallback wire",
+              sentinel,
+              "KG_DELTA_FULL_SNAPSHOT_REQUIRED 50\n")
+}
+
+// ---- fallback parse -----------------------------------------------------
+
+fn test_parse_fallback_ok() {
+    ce_eq("parse fallback 123",
+          kgd_parse_fallback("KG_DELTA_FULL_SNAPSHOT_REQUIRED 123"), 123)
+    ce_eq("parse fallback 123 CRLF",
+          kgd_parse_fallback("KG_DELTA_FULL_SNAPSHOT_REQUIRED 123\r\n"), 123)
+    ce_eq("parse fallback wrong prefix",
+          kgd_parse_fallback("KG_DELTA_RESP 1 2 0"), -1)
+    ce_eq("parse fallback non-digit",
+          kgd_parse_fallback("KG_DELTA_FULL_SNAPSHOT_REQUIRED abc"), -1)
+}
+
+// ---- response parse -- round trip ---------------------------------------
+
+fn test_response_round_trip() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 800, 200, "widget")
+    kgd_state_bump_upd(st, 1, 1800, 200)
+    kgd_state_bump_ins(st, 2, 2, 900, 100, "gadget")
+    kgd_state_bump_retr(st, 1)
+    let resp = kgd_build_response(st, 0, KGD_DEFAULT_CAP_BYTES)
+    let text = kgd_format_response(resp)
+    let parsed = kgd_parse_response(text)
+    ce_check("round-trip parse non-zero", parsed != 0)
+    ce_eq("round-trip from", parsed[KGD_R_FROM], 0)
+    ce_eq("round-trip to",   parsed[KGD_R_TO],   4)
+    ce_eq("round-trip n",    parsed[KGD_R_N],    4)
+    let changes = parsed[KGD_R_CHANGES]
+    ce_eq("change[0] is INS",  changes[0][KGD_C_TAG], KGD_CH_INS)
+    ce_eq("change[1] is UPD",  changes[1][KGD_C_TAG], KGD_CH_UPD)
+    ce_eq("change[2] is INS",  changes[2][KGD_C_TAG], KGD_CH_INS)
+    ce_eq("change[3] is RETR", changes[3][KGD_C_TAG], KGD_CH_RETR)
+    ce_str_eq("change[0] label preserved", changes[0][KGD_C_LABEL], "widget")
+    ce_eq("change[1] alpha preserved", changes[1][KGD_C_ALPHA], 1800)
+    ce_eq("change[2] id preserved", changes[2][KGD_C_ID], 2)
+    ce_eq("change[3] rev preserved", changes[3][KGD_C_REV], 4)
+}
+
+// ---- response parse -- interleaved INS/UPD/RETR -------------------------
+
+fn test_parse_interleaved_keeps_rev_order() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 500, 500, "a")
+    kgd_state_bump_ins(st, 2, 1, 500, 500, "b")
+    kgd_state_bump_upd(st, 1, 1000, 0)
+    kgd_state_bump_retr(st, 2)
+    kgd_state_bump_upd(st, 1, 1500, 200)
+    kgd_state_bump_ins(st, 3, 2, 800, 200, "c")
+    let resp = kgd_build_response(st, 0, KGD_DEFAULT_CAP_BYTES)
+    let text = kgd_format_response(resp)
+    let parsed = kgd_parse_response(text)
+    ce_check("interleaved parse non-zero", parsed != 0)
+    ce_eq("6 interleaved changes", parsed[KGD_R_N], 6)
+    let changes = parsed[KGD_R_CHANGES]
+    // Verify monotonic revs (1..6).
+    let i = 0
+    let ok = 1
+    while i < 6 {
+        if changes[i][KGD_C_REV] != i + 1 { ok = 0 }
+        i = i + 1
+    }
+    ce_eq("revs are strictly 1..6", ok, 1)
+}
+
+// ---- response parse -- tampering rejected -------------------------------
+
+fn test_parse_rejects_tampered_n_mismatch() {
+    // Claims n=2 but only has 1 line.
+    let bad = "KG_DELTA_RESP 0 1 2\nINS 1 1 1:800:200:widget\n"
+    ce_eq("tampered n-mismatch rejected", kgd_parse_response(bad), 0)
+}
+
+fn test_parse_rejects_tampered_out_of_window() {
+    // Header says (0, 5] window; change rev=10 falls outside.
+    let bad = "KG_DELTA_RESP 0 5 1\nINS 1 10 1:800:200:widget\n"
+    ce_eq("rev > to rejected", kgd_parse_response(bad), 0)
+    let bad2 = "KG_DELTA_RESP 5 10 1\nINS 1 5 1:800:200:widget\n"
+    ce_eq("rev <= from rejected", kgd_parse_response(bad2), 0)
+}
+
+fn test_parse_rejects_tampered_garbage_change_line() {
+    let bad = "KG_DELTA_RESP 0 2 2\nINS 1 1 1:800:200:widget\nGARBAGE 2 2\n"
+    ce_eq("garbage line rejected", kgd_parse_response(bad), 0)
+}
+
+fn test_parse_rejects_tampered_non_monotonic_revs() {
+    let bad = "KG_DELTA_RESP 0 3 3\nINS 1 1 1:800:200:w\nINS 2 3 1:900:100:g\nINS 3 2 1:850:150:h\n"
+    ce_eq("non-monotonic revs rejected", kgd_parse_response(bad), 0)
+}
+
+fn test_parse_rejects_bad_header() {
+    ce_eq("no body", kgd_parse_response(""), 0)
+    ce_eq("missing prefix", kgd_parse_response("OK 0 0 0\n"), 0)
+    ce_eq("non-digit from", kgd_parse_response("KG_DELTA_RESP a 1 0\n"), 0)
+    ce_eq("to < from", kgd_parse_response("KG_DELTA_RESP 5 4 0\n"), 0)
+}
+
+// ---- idempotency --------------------------------------------------------
+
+fn test_apply_same_delta_twice_is_noop() {
+    let pub = kgd_state_new()
+    kgd_state_bump_ins(pub, 1, 1, 800, 200, "a")
+    kgd_state_bump_ins(pub, 2, 1, 900, 100, "b")
+    kgd_state_bump_upd(pub, 1, 1800, 200)
+    let resp = kgd_build_response(pub, 0, KGD_DEFAULT_CAP_BYTES)
+    let text = kgd_format_response(resp)
+    let parsed = kgd_parse_response(text)
+    let sub = kgd_state_new()
+    let applier = kgd_applier_new(_t_ins, _t_upd, _t_retr)
+    let n1 = kgd_apply_response(sub, parsed, applier)
+    ce_eq("first apply: 3 changes", n1, 3)
+    ce_eq("sub rev = 3 after first apply", kgd_state_rev(sub), 3)
+    ce_eq("sub applied = 3 after first apply", kgd_state_applied(sub), 3)
+    // Replay the SAME parsed delta -- must be a no-op.
+    let n2 = kgd_apply_response(sub, parsed, applier)
+    ce_eq("second apply: 0 changes (idempotent)", n2, 0)
+    ce_eq("sub rev still 3 after replay", kgd_state_rev(sub), 3)
+    ce_eq("sub applied still 3 after replay", kgd_state_applied(sub), 3)
+}
+
+fn test_apply_partial_overlap_only_applies_new() {
+    // Publisher has revs 1..5; subscriber already has 1..3 applied.
+    let pub = kgd_state_new()
+    kgd_state_bump_ins(pub, 1, 1, 100, 100, "a")
+    kgd_state_bump_ins(pub, 2, 1, 200, 100, "b")
+    kgd_state_bump_ins(pub, 3, 1, 300, 100, "c")
+    kgd_state_bump_ins(pub, 4, 1, 400, 100, "d")
+    kgd_state_bump_ins(pub, 5, 1, 500, 100, "e")
+    let resp = kgd_build_response(pub, 0, KGD_DEFAULT_CAP_BYTES)
+    let parsed = kgd_parse_response(kgd_format_response(resp))
+    let sub = kgd_state_new()
+    list_set(sub, KGD_S_APPLIED, 3)         // simulate sub already applied 1..3
+    list_set(sub, KGD_S_REV, 3)
+    let applier = kgd_applier_new(_t_ins, _t_upd, _t_retr)
+    let applied = kgd_apply_response(sub, parsed, applier)
+    ce_eq("only revs 4..5 applied", applied, 2)
+    ce_eq("sub applied = 5 after overlap", kgd_state_applied(sub), 5)
+}
+
+// ---- callback failure does NOT advance applied --------------------------
+
+fn test_apply_failed_callback_does_not_advance() {
+    let pub = kgd_state_new()
+    kgd_state_bump_ins(pub, 1, 1, 800, 200, "x")
+    let parsed = kgd_parse_response(kgd_format_response(
+        kgd_build_response(pub, 0, KGD_DEFAULT_CAP_BYTES)))
+    let sub = kgd_state_new()
+    let failer = kgd_applier_new(_t_ins_fail, _t_upd_fail, _t_retr_fail)
+    let applied = kgd_apply_response(sub, parsed, failer)
+    ce_eq("failed callback applied 0", applied, 0)
+    ce_eq("sub applied still 0", kgd_state_applied(sub), 0)
+}
+
+// ---- dispatch end-to-end -----------------------------------------------
+
+fn test_dispatch_request_returns_response() {
+    let st = kgd_state_new()
+    kgd_state_bump_ins(st, 1, 1, 800, 200, "x")
+    kgd_state_bump_ins(st, 2, 1, 900, 100, "y")
+    let reply = kgd_dispatch_request(st, "KG_DELTA_REQ 0\n", KGD_DEFAULT_CAP_BYTES)
+    ce_str_eq("dispatch reply",
+              reply,
+              "KG_DELTA_RESP 0 2 2\nINS 1 1 1:800:200:x\nINS 2 2 1:900:100:y\n")
+}
+
+fn test_dispatch_request_cap_returns_sentinel() {
+    let st = kgd_state_new()
+    let i = 0
+    while i < 100 {
+        kgd_state_bump_ins(st, i, 1, 800, 200, "wide-label-padding-for-bytes-aaaaa")
+        i = i + 1
+    }
+    let reply = kgd_dispatch_request(st, "KG_DELTA_REQ 0\n", 200)
+    ce_str_eq("dispatch cap-exceeded sentinel",
+              reply,
+              "KG_DELTA_FULL_SNAPSHOT_REQUIRED 100\n")
+}
+
+fn test_dispatch_request_garbage_returns_empty() {
+    let st = kgd_state_new()
+    ce_str_eq("dispatch garbage", kgd_dispatch_request(st, "BAD\n", 256000), "")
+}
+
+// ---- env helpers --------------------------------------------------------
+
+fn test_cap_default_when_env_unset() {
+    ce_eq("default cap = 256 KiB", kgd_cap_from_env(), KGD_DEFAULT_CAP_BYTES)
+}
+
+// ---- helper: split-colons preserves label tail --------------------------
+
+fn test_split_colons_keeps_tail_intact() {
+    let parts = _kgd_split_colons("1:2:3:my-label", 4)
+    ce_eq("parts count = 4", len(parts), 4)
+    ce_str_eq("part 0", parts[0], "1")
+    ce_str_eq("part 1", parts[1], "2")
+    ce_str_eq("part 2", parts[2], "3")
+    ce_str_eq("part 3 keeps -", parts[3], "my-label")
+}
+
+// ---- end-to-end -- publisher -> wire -> subscriber ---------------------
+
+fn test_end_to_end_15_change_delta() {
+    // The integration-shaped scenario in miniature: publisher has 15
+    // changes, subscriber applies them via the wire format. Mirrors
+    // the 15-atom rev=20..35 path in scenario_bbbbb_kg_delta.sh.
+    let pub = kgd_state_new()
+    let i = 0
+    while i < 20 {
+        kgd_state_bump_ins(pub, i, 1, 800, 200, "warmup")
+        i = i + 1
+    }
+    let snap_rev = kgd_state_rev(pub)
+    ce_eq("publisher warmup rev = 20", snap_rev, 20)
+    // 15 more inserts: revs 21..35.
+    let j = 0
+    while j < 15 {
+        kgd_state_bump_ins(pub, j + 1000, 1, 800, 200, "post-snap")
+        j = j + 1
+    }
+    ce_eq("publisher post-load rev = 35", kgd_state_rev(pub), 35)
+    let resp = kgd_build_response(pub, 20, KGD_DEFAULT_CAP_BYTES)
+    ce_eq("delta covers 21..35", resp[KGD_R_N], 15)
+    let text = kgd_format_response(resp)
+    // Small delta should fit easily in << 5 KB.
+    ce_check("delta wire < 5 KB", len(text) < 5000)
+    let parsed = kgd_parse_response(text)
+    let sub = kgd_state_new()
+    list_set(sub, KGD_S_REV, 20)
+    list_set(sub, KGD_S_APPLIED, 20)
+    let applier = kgd_applier_new(_t_ins, _t_upd, _t_retr)
+    let applied = kgd_apply_response(sub, parsed, applier)
+    ce_eq("subscriber applied 15", applied, 15)
+    ce_eq("sub rev = 35 post-apply", kgd_state_rev(sub), 35)
+    ce_eq("sub applied = 35 post-apply", kgd_state_applied(sub), 35)
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    // state
+    test_state_new_empty()
+    test_state_bump_ins_increments()
+    test_state_bump_upd_and_retr_increment()
+    // request
+    test_format_req()
+    test_parse_req_ok()
+    test_parse_req_rejects_garbage()
+    // response build
+    test_build_single_ins()
+    test_build_10_inserts_ordered()
+    test_build_since_equals_current_returns_empty()
+    test_build_since_above_current_returns_empty()
+    test_build_exceeds_cap_returns_fallback()
+    // fallback
+    test_parse_fallback_ok()
+    // response parse
+    test_response_round_trip()
+    test_parse_interleaved_keeps_rev_order()
+    test_parse_rejects_tampered_n_mismatch()
+    test_parse_rejects_tampered_out_of_window()
+    test_parse_rejects_tampered_garbage_change_line()
+    test_parse_rejects_tampered_non_monotonic_revs()
+    test_parse_rejects_bad_header()
+    // apply / idempotency
+    test_apply_same_delta_twice_is_noop()
+    test_apply_partial_overlap_only_applies_new()
+    test_apply_failed_callback_does_not_advance()
+    // dispatch
+    test_dispatch_request_returns_response()
+    test_dispatch_request_cap_returns_sentinel()
+    test_dispatch_request_garbage_returns_empty()
+    // env helpers
+    test_cap_default_when_env_unset()
+    // internal helpers
+    test_split_colons_keeps_tail_intact()
+    // end-to-end
+    test_end_to_end_15_change_delta()
+    ce_summary("kg_sync_delta")
+}
+
+main()

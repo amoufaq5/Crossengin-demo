@@ -47,6 +47,37 @@ computational units rather than orchestrating a pipeline of modules.
 > in 6 rounds (PARTIAL closure -- exactly the failure mode R27E
 > documented). R28A closes the gap completely on this scenario.
 >
+> R29F adds `src/federation/kg_sync.nova` -- a delta-compression path
+> on top of R23C's snapshot replication. R23C's `SNAP_FETCH <root>`
+> recovers full snapshots over gossip; that's the right shape for a
+> peer that lost its disk, but a peer that's just been offline for a
+> few minutes pays a full-snapshot cost (~1 MiB on a 10k-atom KG) to
+> recover what is often a handful of atom-insertions. R29F closes that
+> gap: every insert / update / retract bumps a monotonic `kg_rev`
+> counter; a stale peer reports its `since_rev` via
+> `KG_DELTA_REQ <since>` and the source returns
+> `KG_DELTA_RESP <from> <to> <n>\n[changes]` covering only the
+> missed window. Each change is `INS|UPD|RETR <atom_id> <rev>
+> <payload>` so the applier can dedupe by rev. A 256 KB cap
+> (env-override `CE_KGSYNC_DELTA_CAP`) bounds the response size;
+> over-cap requests get the `KG_DELTA_FULL_SNAPSHOT_REQUIRED
+> <current_rev>` sentinel and the caller falls back to R23C. The
+> applier tracks `applied_rev` so replaying the same delta is a
+> no-op; the parser rejects malformed shape, non-digit revs,
+> n-mismatch, out-of-window revs, and non-monotonic revs. Bytes
+> saving on a 15-change handoff at rev=35: **delta = 503 bytes,
+> equivalent text snapshot = 970 bytes** (1.9x; the absolute saving
+> grows with KG size). Bytes saving at the cap-fallback boundary
+> (500 changes, rev=535 KG): **sentinel = 36 bytes, equivalent
+> snapshot = 21,290 bytes** (591x -- the snapshot path is the only
+> viable shape at that scale, which is why the fallback exists).
+> Verification: **93-assertion unit suite** in
+> `tests/unit/test_kg_sync_delta.nova` (NEW; covers state-management,
+> wire codec round-trip, idempotency, cap fallback, four tamper
+> rejection cases) + **26-assertion integration scenario** in
+> `tests/integration/scenario_bbbbb_kg_delta.sh` (NEW; 2-soul
+> handoff with wire-byte assertions). All prior tests remain green.
+>
 > R28E lands `src/federation/webrtc.nova` -- the SIGNALING
 > half of WebRTC data-channel support for browser-to-soul federation.
 > CrossEngin federation up to R27 is native-only (TCP/UDP raw sockets);
@@ -403,6 +434,23 @@ computational units rather than orchestrating a pipeline of modules.
 > available via `pitch_run_auto_command` (not yet wired into the chat
 > dispatch table; reserved for an optional +1 admin line).
 >
+> R25B.3 extends R25B.2's dialog manager with topic-shift detection:
+> a content-word Jaccard heuristic distinguishes "tell me more"
+> continuations from "tell me more about cats" PIVOTs. New public
+> classifier `voice_followup_classify(session, query) -> i32` returns
+> one of `VC_FOLLOWUP_NONE` / `_CONTINUE` / `_PIVOT` / `_ANAPHORA`;
+> anaphora keeps priority so "describe the first one" still resolves
+> to `last_ids[0]`. Stopword stripping covers cue words, R25B template
+> keywords, pronouns, determiners, ordinals, common verbs of saying;
+> Jaccard threshold 0.2 (encoded as 2/10 in NOVA integer arithmetic).
+> When a more-cue with unrelated remainder fires, the session is
+> reset and the remainder is re-parsed fresh; history STILL records
+> the pivot turn even on UNKNOWN parse so the operator sees the
+> shift. R25B.2 behaviour is byte-identical for non-pivot transcripts
+> -- the existing 44-assertion R28D fixture passes unchanged.
+> Verification: +55 assertions (test_voice_dialog now 99 total),
+> brief's 4 fixtures classified 4/4 correctly, full unit suite 219/219.
+>
 > R25B.2 adds `examples/voice_dialog.nova` — the multi-turn cousin of
 > R25B's single-turn `/converse`. A session object accumulates the last
 > 5 turns + most recent template / kind / entity-id list across calls;
@@ -430,10 +478,12 @@ computational units rather than orchestrating a pipeline of modules.
 > `tests/integration/scenario_aaaaa_dialog.sh` (NEW; 5-turn fixture
 > exercises the full follow-up state machine, then chat `/dialog
 > reset` path). Full unit suite: 219/219 pass; all R25B tests stay
-> green (27 unit + 20 integration). Honest scope (R25B.3+ deferred):
+> green (27 unit + 20 integration). Honest scope (R25B.4+ deferred):
 > real label lookup (returns "atom has id 42" not "atom labelled
 > foo"), cross-pronoun gender/number tracking, conversational repair
-> ("no, the OTHER one"), fuzzy intent matching, backchannel handling.
+> ("no, the OTHER one"), backchannel handling. (R25B.3 handles
+> fuzzy intent matching / topic-shift detection -- see paragraph
+> above.)
 >
 > R25B adds `examples/voice_conversation.nova` — the end-to-end voice
 > conversation demo that threads the existing audio + cognition legs

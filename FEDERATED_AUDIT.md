@@ -2601,3 +2601,110 @@ ancestor pairs under realistic jitter rather than the algorithmic
    A subsequent round could ride DELTA's existing belief-mutation
    stream to keep a local materialised relation cache + only
    DRFETCH on cache miss.
+
+## R29F -- kg\_sync delta-compression on top of R23C snapshot replication
+
+**Module:** `src/federation/kg_sync.nova` (NEW, ~470 lines, self-contained)
+
+R23C (`src/federation/snapshot_replication.nova`) ships gossip-relayed
+fetch of full snapshots: a peer broadcasts a signed Merkle-attestation
+and any peer that needs the snapshot bytes issues `SNAP_FETCH` over
+gossip. That closes the "lost a node, need to restore" gap but it has
+a sharp edge: a peer that's been offline for a few minutes -- say
+because of a quick restart -- has to pull the FULL snapshot even if
+it's only behind by a handful of atom-insertions. On a 10k-atom KG
+that's >1 MiB of wire for what could be 200 bytes of mutations.
+
+R29F adds a delta-compression path:
+
+1. **Per-atom monotonic revision counter** (`kg_rev` in `kgd_state`).
+   Bumps on every insert / update / retract. Each change is logged
+   with its rev so the publisher can replay any window.
+2. **`KG_DELTA_REQ <since_rev>` request.** The peer reports its
+   latest-known revision; the source returns every change with
+   rev > since.
+3. **`KG_DELTA_RESP <from_rev> <to_rev> <n_changes>` response,**
+   followed by `<n_changes>` lines of `INS|UPD|RETR <atom_id>
+   <rev> <payload>`. The payload is `<kind>:<alpha>:<beta>:<label>`
+   for INS, `<alpha>:<beta>` for UPD, empty for RETR.
+4. **`KG_DELTA_FULL_SNAPSHOT_REQUIRED <current_rev>` sentinel.**
+   When the delta would exceed the 256 KiB cap (env-override
+   `CE_KGSYNC_DELTA_CAP`), the source returns this line and the
+   caller falls back to R23C's snapshot path.
+5. **Idempotent apply.** Each change carries its rev; the applier
+   tracks `applied_rev` and silently drops any rev <= applied. Same
+   delta applied twice is a no-op.
+6. **Tamper rejection.** The parser rejects: malformed shape,
+   non-digit revs, claimed n-changes mismatching delivered lines,
+   a change whose rev falls OUTSIDE the negotiated `(from, to]`
+   window, or non-monotonic revs within a single response.
+
+### Decision: why a separate file from `src/io/transducers/kg_sync.nova`
+
+The existing transducer is the LIVE-update path (broadcast on insert,
+ack per event). R29F is the CATCH-UP path (request a window after
+being offline). Keeping them in separate files matches the wire
+protocol -- a peer can speak v2 broadcasts OR v3 delta requests
+independently -- and avoids dragging the socket-bound transducer
+into pure-codec tests. The new module re-implements only the small
+helpers it needs (`_kgd_starts_with`, `_kgd_split_spaces`,
+`_kgd_strip_eol`, `_kgd_is_digits`) so it does not collide with the
+transducer's internal `_starts_with` family on the same assembler TU
+(a problem R23C already documented with snapshot\_disk).
+
+### Wire-byte savings
+
+For a 35-atom KG synced to a peer at rev=20 with 15 new insertions:
+
+| Path | Wire bytes |
+|---|---|
+| R29F delta (15 changes) | 503 |
+| R23C full snapshot at rev=35 | 970 (equivalent text shape) |
+| R29F fallback sentinel | 36 |
+| R23C snapshot at rev=535 (post-cap-burst) | 21290 |
+
+At the small-delta scale (15 changes / 35 atoms) the saving is ~1.9x
+in bytes -- the absolute saving matters more than the ratio. At the
+cap-fallback boundary (500-row delta, 535 atoms) the snapshot wire is
+~590x the size of the sentinel that triggers the fallback, so the
+delta path is exactly what you want for "I have 15 mutations to
+ship" and the snapshot path is exactly what you want for "the peer
+is more than a window behind." Picking the right path per request is
+the heart of R29F.
+
+### Limitations / future work
+
+1. **256 KB cap is a guess.** A KG with mostly tiny atoms can fit
+   thousands of changes in 256 KB; a KG with long label payloads
+   maxes out at a few hundred. Per-deployment tuning via
+   `CE_KGSYNC_DELTA_CAP` is the escape hatch; an adaptive cap
+   based on observed payload-size distribution would be more
+   principled but is deferred.
+2. **No multi-window resumability.** If the publisher truncates
+   its log (say, after a snapshot compaction), an old peer's
+   `KG_DELTA_REQ since=5` falls off the front of the log and we
+   serve the empty-delta response by accident (the log only has
+   rev > 100 changes; since=5 + scan finds nothing new in those
+   higher revs, but we DO emit the higher revs). Mitigation: the
+   peer's `applied_rev` advances correctly so it eventually catches
+   up; but the right fix is a per-publisher "minimum servable rev"
+   advertised in an extra slot of the response header. Deferred.
+3. **No on-the-wire authentication of the delta itself.** R29F
+   relies on the transport (Noise XK / TLS) for confidentiality
+   and authenticity; the body parser only rejects mal-shape and
+   out-of-window revs. A Merkle-of-the-delta could be added but
+   would duplicate R20F's signing layer; deferred until we hit a
+   threat model where the transport guarantees are not enough.
+4. **No batched apply.** Each change is applied one-at-a-time
+   through the per-kind callback. For a 1000-change delta on a
+   large KG the per-call overhead dominates over the actual
+   mutation; a `kgd_apply_response_batched` that hands the whole
+   change list to a single batched-INS callback would be ~10x
+   faster on cold inserts.
+5. **Local log grows unbounded.** Every insert/update/retract
+   pushes a record onto the publisher's `kgd_state` log; nothing
+   compacts it. A long-running publisher will accumulate every
+   mutation since boot. Mitigation: periodically rotate by
+   resetting the state with `kgd_state_new()` and re-deriving
+   from a snapshot; the right shape is a `kgd_state_compact(st,
+   keep_since_rev)` that drops older log entries. Deferred.

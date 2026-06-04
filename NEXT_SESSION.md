@@ -3,7 +3,292 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
-## R28B (this session) -- bulk binary path for R27C secure relay
+## R29F (this session) -- kg\_sync delta-compression on R23C snapshot replication
+
+**Status: complete -- `src/federation/kg_sync.nova` NEW (~470 lines,
+self-contained -- no imports beyond `std/io`). R23C
+`src/federation/snapshot_replication.nova` ships gossip-relayed
+fetch of full snapshots; that is the right shape for "I lost my
+disk" but the wrong shape for "I just restarted and missed 15 atom
+insertions". R29F closes that gap with a per-atom monotonic
+`kg_rev` counter + a wire protocol that lets a peer request only
+the changes it missed (the `KG_DELTA_REQ <since_rev>` /
+`KG_DELTA_RESP <from> <to> <n>\n[changes]` shape) with a 256 KB
+cap that falls back to R23C's snapshot path when the delta would
+be too big (`KG_DELTA_FULL_SNAPSHOT_REQUIRED <current_rev>`
+sentinel). The applier dedupes by rev so the same delta applied
+twice is a no-op, and the parser rejects malformed shape /
+out-of-window revs / n-mismatch / non-monotonic revs to defend
+against a tampered body on top of whatever the transport
+(Noise XK in v3) provides.**
+
+### What R29F delivers
+
+1. **`kgd_state_new`** — `[rev, log, applied_rev]` triple. Pure
+   data; the higher layer drives it from the call site as it
+   mutates the local atom store.
+2. **`kgd_state_bump_ins / _upd / _retr`** — bump the rev counter
+   and push a per-kind change record onto the log. Returns the
+   new rev so the caller can stamp its own atom-store record.
+3. **`kgd_format_req(since_rev)` / `kgd_parse_req(line)`** — text
+   wire codec for the request line. Round-trips cleanly; rejects
+   garbage / wrong-prefix / non-digit tails.
+4. **`kgd_build_response(st, since_rev, cap_bytes)`** — walks the
+   log for changes with rev > since, sums their serialised size
+   against `cap_bytes`, and either returns the response record
+   (header + change list) OR the fallback sentinel marker
+   (caller should switch to R23C's snapshot path).
+5. **`kgd_format_response(resp)` / `kgd_parse_response(text)`** —
+   wire codec for the response body. Parser validates header
+   shape, n-changes match delivered line count, each change's
+   rev is in `(from, to]`, and revs are strictly monotonic
+   across the change list.
+6. **`kgd_apply_response(st, parsed, applier)`** — applies each
+   change via per-kind callbacks, advances `applied_rev` only on
+   successful callbacks, silently skips revs <= `applied_rev`.
+   The callbacks return 1 on success / 0 on failure; failure
+   does NOT advance applied so a future redelivery retries.
+7. **`kgd_dispatch_request(st, line, cap)`** — one-shot helper
+   the wire-loop calls: parse the request, build the response,
+   return the bytes to send (or "" for unrecognised lines).
+8. **`kgd_format_fallback / kgd_parse_fallback`** — sentinel
+   line codec.
+
+### Wire-byte savings
+
+| Path | Wire bytes |
+|---|---|
+| R29F delta (15 changes / KG at rev=35) | 503 |
+| Equivalent text snapshot (35 atoms)    | 970 |
+| R29F fallback sentinel (cap exceeded)  | 36 |
+| R23C snapshot at rev=535 (post-burst)  | 21,290 |
+
+At the small-handoff scale (~2x absolute saving) the win is the
+absolute byte count, not the ratio. At the cap-fallback boundary
+the snapshot is 591x the sentinel, which is the whole point of
+the fallback: the source signals "snapshot would be cheaper than
+this delta" and the caller switches transports.
+
+### Verification
+
+- **`tests/unit/test_kg_sync_delta.nova` (NEW)** — 93 assertions
+  covering state-management, request/response codec, the 10-change
+  ordered build, the empty-delta path (since=cur), the cap-fallback
+  trigger, four tamper rejection cases (n-mismatch, out-of-window
+  rev, garbage line, non-monotonic revs), the idempotency
+  contract (replay = 0), the partial-overlap apply (revs 4..5
+  applied of revs 1..5 with applied_rev=3), the failed-callback
+  contract (applied_rev not advanced), the dispatch round trip,
+  and the end-to-end 15-change shape.
+- **`tests/integration/scenario_bbbbb_kg_delta.sh` (NEW)** —
+  26 assertions: the 2-soul handoff at rev=20 -> rev=35 +
+  wire-byte assertions on the 15-change delta vs the equivalent
+  snapshot text, the idempotent replay path, the
+  cap-fallback sentinel, the tamper rejection cases, and the
+  since=cur fast path.
+
+### Files touched (R29F)
+
+- `src/federation/kg_sync.nova` (NEW, ~470 lines)
+- `tests/unit/test_kg_sync_delta.nova` (NEW, ~310 lines)
+- `tests/integration/scenario_bbbbb_kg_delta.sh` (NEW, ~280 lines)
+- `FEDERATED_AUDIT.md`, `README.md`, `NEXT_SESSION.md` (R29F sections)
+
+### Open items / caveats
+
+1. **256 KB cap is one-size-fits-all.** Per-deployment override
+   via `CE_KGSYNC_DELTA_CAP`. An adaptive cap based on observed
+   payload-size distribution is deferred.
+2. **No log compaction.** The publisher's `kgd_state.log` grows
+   unbounded; long-running publishers should periodically
+   re-derive from a snapshot. A `kgd_state_compact(st, keep_since)`
+   helper is the right shape; deferred.
+3. **No multi-window resumability.** If the publisher's log gets
+   truncated, a peer requesting `since_rev` < log\[0\].rev gets a
+   misleading empty-delta. Mitigation: advertise a per-publisher
+   "minimum servable rev" in an extra response header slot;
+   deferred.
+4. **Per-change callback overhead.** Each change is dispatched
+   one-at-a-time through the applier. A batched apply
+   (`kgd_apply_response_batched`) would speed up cold-insert
+   workloads ~10x; deferred.
+5. **No delta-of-delta signing.** R29F leans on the transport
+   (Noise XK / TLS) for confidentiality and authenticity.
+   Per-delta Merkle signatures would duplicate R20F's signing
+   layer; deferred.
+
+## R25B.3 (this session) -- voice dialog topic-shift detection (pivot vs continue)
+
+**Status: complete -- `examples/voice_dialog.nova` extended additively
+(~350 lines of new code inserted after R28D's `_vd_known_kind`
+helper) + extended test file (55 new assertions, total 99). R28D
+(commit `6989cc3`) shipped multi-turn voice dialogue that assumed
+every "tell me more" was a continuation -- but the user can say
+"tell me more about cats" right after "list all FACT" and the prior
+intent's content set ("fact") has zero overlap with the new
+remainder ("cats"). R25B.3 adds a content-word Jaccard heuristic
+(threshold 0.2) that recognises that case as a PIVOT, resets the
+session, and re-parses the remainder as a fresh turn. Anaphora
+resolution keeps priority over pivot detection so "describe the
+first one" still resolves to last_ids[0]; pivot detection only
+runs on the more / and / also cue family and on the explicit
+`what / how about KIND` shape.**
+
+### What R25B.3 delivers
+
+1. **Classifier** -- `voice_followup_classify(session, query) -> i32`.
+   Pure: no KG calls, no session mutation. Returns
+   `VC_FOLLOWUP_NONE` (no prior turn or no recognised cue),
+   `VC_FOLLOWUP_CONTINUE` (cue with content-overlap above threshold
+   or empty remainder), `VC_FOLLOWUP_PIVOT` (cue with unrelated
+   remainder OR explicit `what / how about KIND`), or
+   `VC_FOLLOWUP_ANAPHORA` (`describe it` / `the second one` / etc).
+   Public accessors `vc_followup_none()` / `vc_followup_continue()` /
+   `vc_followup_pivot()` / `vc_followup_anaphora()` shield callers
+   from the raw int constants (matches the shape of R25B's
+   `vc_template_*` accessors in voice_conversation.nova).
+
+2. **Stopword + content-word tokeniser** -- `_vd_is_stopword(tok)`
+   covers the dialog-cue words (`tell`, `me`, `more`, `about`,
+   `also`, `and`), R25B template keywords (`list`, `all`, `what`,
+   `how`, `many`, `is`), pronouns (`it` / `him` / `her` / `they`),
+   determiners (`the` / `a` / `an` / `this` / `that`), the ordinals
+   (`first` / `second` / `third` / ... / `fifth` / `last`) so
+   anaphora cues do NOT leak into the content set, plus common
+   verbs of saying (`describe`, `give`).
+   `_vd_content_words(lowered)` tokenises on non-alphanumeric chars,
+   strips apostrophes (so "what's" tokenises as "whats"), drops
+   stopwords. `_vd_set_add` / `_vd_dedup` build a deduplicated set
+   on top.
+
+3. **Jaccard in tenths** -- `_vd_jaccard_tenths(a, b)` returns
+   `10 * |A intersect B| / |A union B|`. NOVA is integer-only so
+   we work in tenths; threshold `VC_DIALOG_PIVOT_THRESHOLD = 2` is
+   the brief-suggested 0.2. Empty-on-both-sides returns 10
+   (perfect overlap -- bare cue case can't disagree).
+   Empty-on-one-side returns 0 (no shared signal).
+
+4. **Prior-content projection** -- `_vd_prior_content(session)`
+   tokenises the LAST history turn's question text + folds the
+   canonical kind name (lower-cased). So "how many FACT"
+   contributes `["fact"]`, "list all CONCEPT" contributes
+   `["concept"]`. The stopword filter handles the leading template
+   keyword.
+
+5. **Cue parser** -- `_vd_more_cue_remainder(lowered)` recognises
+   `tell me more` / `tell me more about X` / `more` / `more X` /
+   `more about X` / `and` / `and X` / `and also X` / `also` /
+   `also X`. Returns the remainder after the cue, or `0` (int)
+   when no cue. Deliberately excludes `what / how about X` --
+   those go through `_vd_pivot_kind_no_and` so the cue family
+   stays partitioned and double-classification is impossible.
+
+6. **Dispatcher** -- `vc_session_turn` routes on the classifier
+   output. PIVOT with a `what / how about KIND` cue goes to the
+   existing `_vd_pivot_turn` (template-preserving kind pivot). PIVOT
+   with a more-cue + unrelated remainder resets the session and
+   calls the new `_vd_pivot_fresh_turn` helper, which differs from
+   `_vd_fresh_turn` ONLY in that it records the pivot turn in
+   history even on UNKNOWN parse (so the operator sees what they
+   asked, even though "cats" isn't a known kind). CONTINUE goes to
+   `_vd_more_turn` (LIMIT escalation) or `_vd_pivot_turn` (for
+   "and KIND" with known KIND, matches R25B.2 backwards-compat).
+   ANAPHORA goes to the existing describe / ordinal handlers.
+   NONE with no cue falls through to `_vd_fresh_turn`. The
+   no-prior + cue case is handled with the same complaint strings
+   R28D published.
+
+7. **Backwards compat** -- all 44 R28D test assertions remain
+   byte-identical. The original `test_more_request_escalates_limit`,
+   `test_pivot_what_about_concept`,
+   `test_topic_shift_actually_resets_and_parses_rest` etc. produce
+   the exact same response strings, same session-state transitions.
+   Verified by running R28D's existing test file unchanged: 44/44
+   pass after the dispatcher rewrite.
+
+### Verification
+
+* **55 new unit assertions** in `tests/unit/test_voice_dialog.nova`
+  (R28D's 44 retained + 55 R25B.3 = 99 total). 14 new test
+  functions covering:
+  - Classifier on empty session -- 4 NONE assertions.
+  - Bare more-cue + prior -- 3 CONTINUE assertions.
+  - More-cue with unrelated remainder -- 2 PIVOT assertions.
+  - `what about KIND` / `how about KIND` -- 3 PIVOT assertions.
+  - Anaphora priority over pivot -- 5 ANAPHORA assertions.
+  - Same-kind remainder -- 2 CONTINUE assertions.
+  - 3-turn CONTINUE fixture (extends R28D) -- 6 byte-identical
+    state-transition assertions.
+  - 3-turn PIVOT (unrelated remainder) -- 7 assertions: response
+    text, limit reset, template cleared, kind cleared, history
+    size, history captures the pivot question.
+  - 3-turn PIVOT (what about RULE) -- 5 assertions: classifier
+    vote, response text, kind preserved as RULE, template
+    LIST_ALL, history holds both turns.
+  - 3-turn ANAPHORA -- 3 assertions: classifier vote, response
+    text, template WHAT_IS, kind FACT preserved.
+  - `also X` / `and X` unrelated remainder -- 2 PIVOT assertions.
+  - Pivot resets limit escalation -- 2 assertions.
+  - R28D parity smoke (chain of 4 turns) -- 4 assertions.
+* **Headline pivot-detection accuracy on the brief's 4 fixtures: 4/4.**
+* **All 219 unit tests pass.** R28D's `test_voice_dialog` 44
+  assertions remain byte-identical.
+
+### Classifier accuracy + honest failure mode
+
+* **Easy case (clear separation).** Single-word unrelated remainder
+  ("cats" / "dogs") + prior with single content word ("fact" via
+  kind) -> Jaccard 0/2 = 0 tenths, well below threshold 2 tenths.
+  PIVOT fires reliably.
+* **Brittle case (could over-trigger).** "tell me more about that
+  atom in the rule engine" after `list all RULE` -- prior content
+  set is `{"rule"}`; remainder content after stopword strip is
+  approximately `{"atom", "rule", "engine"}`. Intersection 1, union
+  3, Jaccard = 3 tenths >= threshold -> CONTINUE. Good. But the
+  same utterance after `list all FACT` gives intersection 0,
+  Jaccard 0 -> PIVOT, which loses the "more rows" intent the user
+  may have wanted on the (unrelated) RULE topic the new remainder
+  names. Honest mitigation: the heuristic is best when prior intent
+  is conveyed by ONE word (the kind); long-form prior text with
+  multiple content words shrinks Jaccard mechanically. Future
+  R25B.4 should weight kind matches more than general content
+  matches; we keep the simple uniform Jaccard here so the failure
+  mode is observable.
+* **Under-trigger (false CONTINUE).** Morphological variants like
+  "facts" vs "fact" do NOT match in this minimal tokeniser; a
+  remainder "more facts" with prior "list all FACT" produces
+  `{"facts"}` vs prior `{"fact"}` -> Jaccard 0 -> PIVOT. Realistic
+  STT transcripts rarely emit plurals where the user spoke the
+  kind word, but a Porter-stemmer pre-pass would catch the
+  remaining cases. Deferred.
+
+### Files touched (R25B.3)
+
+* MOD: `examples/voice_dialog.nova` -- +~350 lines (stopword list,
+  tokeniser, jaccard helper, classifier, two-cue dispatcher
+  rewrite, new `_vd_pivot_fresh_turn` helper). R28D code unchanged
+  -- additions only.
+* MOD: `tests/unit/test_voice_dialog.nova` -- +55 assertions
+  across 14 new test functions, plus main() additions.
+* MOD: `AUDIO_AUDIT.md` -- new R25B.3 section after R25B.2.
+* MOD: `NEXT_SESSION.md` -- this section.
+* MOD: `README.md` -- one-line R25B.3 callout.
+
+### Concurrency note
+
+The classifier is **pure** -- it reads `vc_session_history` /
+`vc_session_last_template` / `vc_session_last_kind` /
+`vc_session_last_ids` but never writes the session. So concurrent
+classification calls on the same session are safe. The DISPATCH
+path (`vc_session_turn`) is NOT concurrency-safe: the existing R28D
+contract assumed a single caller per session, and R25B.3 inherits
+that. Chat's `_vc_default_session` slot is module-level so
+concurrent `/dialog` calls would race on the FIFO history append,
+the `last_*` field writes, and the new pivot-path session reset.
+Future R25B.4 would need an atomic compare-and-swap on
+`_VC_SESS_COUNT` if multi-tab chat is enabled.
+
+## R28B (previous session) -- bulk binary path for R27C secure relay
 
 **Status: complete -- `src/federation/gossip_relay_secure.nova` extended
 purely additively (~480 lines appended at the bottom + 5 new srl_state
