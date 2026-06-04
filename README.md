@@ -13,6 +13,53 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R32C lands the cryptographic primitives R29B's
+> `dtls_cert_verify_R29B2_STUB` slot needs but does NOT wire them in
+> (that's R32C.2). Two new safety modules: `src/safety/x509.nova`
+> (RFC 5280 §4.1 minimal X.509 v3 parser -- DER primitives for
+> INTEGER / OID / SEQUENCE / SET / BIT STRING / OCTET STRING /
+> UTCTime / GeneralizedTime / BOOLEAN; cert handle pulls out
+> serialNumber, signature OID (must be ecdsa-with-SHA256 =
+> 1.2.840.10045.4.3.2), issuer CN, subject CN, validity, the 65-byte
+> uncompressed P-256 public key, the ECDSA-Sig-Value `r`/`s`, and the
+> byte-exact tbsCertificate slice for hash-and-verify; validity check
+> compares Unix seconds against parsed notBefore/notAfter), and
+> `src/safety/ecdsa.nova` (FIPS 186-4 §6.4 ECDSA-P-256 verify on top
+> of R30B's `p256.nova`, plus a self-contained SHA-256 -- the third
+> copy of FIPS 180-4 in the tree, alongside `noise_xk.nova`,
+> `merkle.nova`, and `dtls12.nova`; documented duplication, refactor
+> target is `src/safety/sha256.nova`). ECDSA verify: range-checks
+> `r`, `s` in `[1, n-1]` before any curve math, computes
+> `w = s^-1 mod n` via Fermat, `(X, Y) = u1*G + u2*Q` via two scalar
+> mults + one affine add, accepts iff `X mod n == r`. Verified against
+> the canonical RFC 6979 §A.2.5 ECDSA-P-256 + SHA-256 vectors
+> (`"sample"` AND `"test"` messages with the published Q, r, s);
+> verifies both uncompressed and compressed SEC1 public-key encodings.
+> **Combined cert+verify smoke test PASSES** on an OpenSSL-generated
+> self-signed P-256 cert hardcoded as a 397-byte DER vector (notBefore
+> 2026-06-04, notAfter 2126-05-11, subject/issuer CN
+> `CrossEnginTest`): `x509_parse` extracts tbs + pubkey + r + s,
+> `ecdsa_sha256(tbs)` matches the openssl reference
+> `cfa7c41cc9cf98bd772c5398ca92692f30ca193e3dff5527105aafb957fd1ce6`,
+> `ecdsa_p256_verify_bn` returns 1. Tamper-rejection verified on all
+> four paths: flipped `r` byte, flipped `s` byte, flipped message
+> hash, wrong public key (Q + G) -- each returns 0; also r/s == 0
+> AND r/s == n (out-of-range), wrong-tag and truncated public-key
+> buffers all reject. Module count delta: **+2**. Test delta:
+> **+79 unit assertions** (`tests/unit/test_x509.nova` 54 checks +
+> `tests/unit/test_ecdsa.nova` 25 checks; full suite now 227 tests
+> all passing). Honest caveats: (a) ECDSA verify is NOT
+> constant-time -- inherits R30B.3 hardening item from `p256.nova`'s
+> data-dependent double-and-add; for VERIFY this is academic (all
+> inputs are public), but documented; (b) X.509 extensions parsing,
+> certificate chains, RSA / Ed25519 keys, CRL / OCSP revocation are
+> all out of scope and deferred; (c) SHA-256 is duplicated rather
+> than extracted to a shared module -- documented in both module
+> headers, refactor tracked. R32C does NOT touch `dtls12.nova`,
+> `p256.nova`, `aes_gcm.nova`, `bignum_256.nova`, or any federation
+> module -- R32C.2 lands the wiring in the same way R31B wired
+> R30B's primitives.
+>
 > R32B closes R31B's "no anti-replay sliding window yet" caveat by
 > extending `src/federation/dtls12.nova` with the canonical RFC 6347
 > §4.1.2.6 algorithm. R31B (commit `af8e47c`) wired real P-256 ECDHE

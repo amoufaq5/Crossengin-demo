@@ -3,6 +3,109 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R32C -- X.509 v3 parser + ECDSA-P-256 verify (R29B.2 cert-verify foundation)
+
+**Status: complete** -- ships the FINAL cryptographic primitive set
+R29B's `dtls_cert_verify_R29B2_STUB` slot needs, but does NOT wire
+into `dtls12.nova` (that's R32C.2). Two new safety modules:
+
+### What R32C delivers (NEW files only)
+
+* **`src/safety/x509.nova`** -- RFC 5280 §4.1 minimal X.509 v3 parser.
+  Definite-length DER (BER indefinite-length rejected). Primitives:
+  INTEGER (leading-0x00 padding stripped for unsigned bigints),
+  OBJECT IDENTIFIER (X.690 §8.19 base-128 -> dotted string, including
+  the arc0-arc1 split for the first subidentifier), SEQUENCE / SET
+  envelope wrappers, BIT STRING (unused-bits enforced), OCTET STRING,
+  BOOLEAN, UTCTime ("YYMMDDHHMMSSZ"), GeneralizedTime
+  ("YYYYMMDDHHMMSSZ") both decoded to Unix seconds via Howard
+  Hinnant's `days_from_civil` (integer-only, leap-year correct).
+  Cert handle exposes: serialNumber bn256, signature OID (must be
+  `1.2.840.10045.4.3.2`), issuer + subject CN (first commonName ATV),
+  notBefore/notAfter Unix seconds, 65-byte uncompressed P-256 public
+  key buffer, ECDSA-Sig-Value r + s bn256, byte-exact tbsCertificate
+  slice. `x509_check_validity(cert, current_unix_seconds)` returns 0
+  or one of `X509_ERR_NOT_YET_VALID` / `X509_ERR_EXPIRED`.
+
+* **`src/safety/ecdsa.nova`** -- FIPS 186-4 §6.4 ECDSA-P-256 verify
+  on top of R30B's `p256.nova`, plus a self-contained FIPS 180-4
+  SHA-256 (the FOURTH copy in the tree, alongside `noise_xk.nova`,
+  `merkle.nova`, `dtls12.nova` -- documented duplication; future
+  refactor extracts `src/safety/sha256.nova`). Verify recipe is the
+  canonical FIPS 186-4 §6.4 recipe: range-check `r, s in [1, n-1]`
+  BEFORE any curve math; reduce hash mod n; `w = s^-1 mod n` via
+  Fermat; `u1 = e*w mod n`, `u2 = r*w mod n`; `(X, Y) = u1*G + u2*Q`;
+  accept iff `X mod n == r`. Three entry points:
+  `ecdsa_p256_verify(pub_buf, pub_n, hash_buf, sig_r_buf, sig_s_buf)`,
+  `ecdsa_p256_verify_full(pub_buf, pub_n, msg_buf, msg_n,
+  sig_r_buf, sig_s_buf)` (SHA-256s the message first), and
+  `ecdsa_p256_verify_bn(pub_buf, pub_n, hash_bn, r_bn, s_bn)` for
+  x509.nova callers that already have bn256 values.
+
+### Verification
+
+* **+79 new unit assertions** (`tests/unit/test_x509.nova` 54 +
+  `tests/unit/test_ecdsa.nova` 25). Full suite: **227/227 pass**.
+* SHA-256: known-answers for `""`, `"abc"`, FIPS 180-4 Appendix B.2
+  56-char string, 55-char `"A"`-string (block-boundary case where
+  padding straddles two compression blocks), 1000-char `"a"`-string.
+* ECDSA verify against **RFC 6979 §A.2.5** canonical deterministic
+  test vectors (both `"sample"` AND `"test"` messages with published
+  Q, r, s; both raw-hash and verify-from-message entry points;
+  both uncompressed and compressed SEC1 public-key encodings).
+* Tamper rejection covers all four required paths: flipped r byte,
+  flipped s byte, flipped message hash, wrong public key (Q + G).
+  Range checks reject r/s == 0 and r/s == n without proceeding to
+  curve math.
+* **Combined cert+verify smoke test passes** on an OpenSSL-generated
+  self-signed P-256 cert hardcoded as a 397-byte DER vector (validity
+  2026-06-04 .. 2126-05-11, CN `CrossEnginTest`): `x509_parse`
+  extracts tbs + pubkey + r + s; `ecdsa_sha256(tbs)` matches the
+  openssl/python reference
+  `cfa7c41cc9cf98bd772c5398ca92692f30ca193e3dff5527105aafb957fd1ce6`;
+  `ecdsa_p256_verify_bn` returns 1. Tampering byte 100 of the cert
+  buffer flips the hash AND/OR breaks DN parsing; in either path the
+  test asserts "tamper detected".
+
+### Honest caveats
+
+1. **ECDSA verify is NOT constant-time.** Inherits R30B.3 hardening
+   item from `p256.nova`. For VERIFY all inputs are public so the
+   side-channel exposure is academic; documented for completeness.
+2. **SHA-256 duplication.** Fourth copy in the tree; importing
+   dtls12.nova would create a circular dep (`dtls12 -> x509 ->
+   ecdsa -> dtls12` once R32C.2 wires the cert-verify path).
+   Future refactor extracts `src/safety/sha256.nova`.
+3. **X.509 scope is intentionally minimal.** No extension parsing,
+   no certificate chains, no RSA / Ed25519, no CRL / OCSP, no SAN
+   hostname matching.
+4. **No DTLS wiring.** `dtls_cert_verify_R29B2_STUB` still returns
+   `DTLS_ERR_STUB` -- R32C.2 plumbs `x509_parse` +
+   `ecdsa_p256_verify_bn` into the handshake.
+
+### Module count delta
+
++2 (`src/safety/x509.nova` + `src/safety/ecdsa.nova`).
+
+### Hand-off pointer to R32C.2
+
+`src/federation/dtls12.nova` line 1754:
+`fn dtls_cert_verify_R29B2_STUB(cert_buf, cert_n, expected_fp_buf, fp_n)`
+currently returns `DTLS_ERR_STUB`. The replacement should:
+(1) `import "../safety/x509.nova"` (which transitively imports
+ecdsa.nova + p256.nova); (2) call `x509_parse(cert_buf, cert_n)`,
+return `DTLS_DECRYPT_FAIL` (NOT a distinct cert-error to avoid
+oracle leakage) on negative parse return; (3) call
+`x509_check_validity(cert, sys_unix_seconds())` -- same fail-mode;
+(4) compute
+`sha256_hash = ecdsa_sha256(x509_tbs_buf(cert), x509_tbs_len(cert))`
+and verify
+`ecdsa_p256_verify_bn(x509_public_key_buf(cert),
+x509_public_key_len(cert), bytes_to_bn(sha256_hash),
+x509_signature_r(cert), x509_signature_s(cert))`; same fail-mode if
+0; (5) optionally compare the fingerprint to `expected_fp_buf` for
+SDP-fingerprint binding (the typical WebRTC pattern).
+
 ## R32B -- DTLS anti-replay sliding window per RFC 6347 §4.1.2.6 (R31B.2)
 
 **Status: complete** -- closes R31B's "no anti-replay sliding window

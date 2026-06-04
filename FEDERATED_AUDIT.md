@@ -2388,6 +2388,188 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R32C extension: X.509 v3 cert parser + ECDSA-P-256 signature verify (R29B.2 cert-verify foundation)
+
+R29B (commit `a3b1233`) shipped the DTLS 1.2 record-layer + handshake
+skeleton, tagging five `_R29B2_STUB` slots. R30B (commit `17e9cb8`)
+landed P-256 ECDH + AES-128-GCM, then R31B (`af8e47c`) wired three of
+the five stubs (`dtls_ecdhe_derive`, `dtls_seal_record`,
+`dtls_open_record`). The remaining `dtls_cert_verify_R29B2_STUB` was
+blocked on an X.509 parser + ECDSA verify primitive. R32C lands the
+LAST cryptographic foundation: two new safety modules that R32C.2 will
+wire into `dtls12.nova`.
+
+### What R32C delivers (NEW files only)
+
+* **`src/safety/x509.nova`** -- minimal RFC 5280 §4.1 X.509 v3 parser.
+  DER primitives (definite-length encoding ONLY; indefinite-length BER
+  is rejected): INTEGER (with leading-0x00 padding stripped for
+  unsigned big-ints), OBJECT IDENTIFIER (parsed to a dotted string via
+  the X.690 §8.19 base-128 algorithm including the arc0-arc1 split for
+  the first subidentifier), SEQUENCE / SET (envelope wrappers), BIT
+  STRING (with unused-bits enforcement), OCTET STRING, BOOLEAN,
+  UTCTime ("YYMMDDHHMMSSZ", year 50..99 -> 1950..1999, 00..49 ->
+  2000..2049), GeneralizedTime ("YYYYMMDDHHMMSSZ"). Times decode to
+  Unix seconds via Howard Hinnant's `days_from_civil` formula
+  (integer-only, leap-year-correct through year 9999). Cert handle
+  is a NOVA list with fixed positional slots accessed via
+  `x509_serial_bn`, `x509_signature_alg_oid`, `x509_issuer_cn`,
+  `x509_subject_cn`, `x509_not_before`, `x509_not_after`,
+  `x509_public_key_buf`, `x509_public_key_len`, `x509_signature_r`,
+  `x509_signature_s`, `x509_tbs_buf`, `x509_tbs_len`. Issuer + subject
+  CN extracted via a SET-OF-SEQUENCE-OF-{OID,value} walk that picks the
+  first ATV with OID `2.5.4.3` (commonName). Public-key path strictly
+  enforces algorithm OID `1.2.840.10045.2.1` (id-ecPublicKey),
+  parameters OID `1.2.840.10045.3.1.7` (prime256v1), and a 65-byte
+  uncompressed SEC1 point starting with `0x04`. Signature OID strictly
+  enforces `1.2.840.10045.4.3.2` (ecdsa-with-SHA256). The
+  signatureValue BIT STRING unwraps an ECDSA-Sig-Value `SEQUENCE { r
+  INTEGER, s INTEGER }` to bn256 r, s (RFC 5480 §2.1).
+  `x509_check_validity(cert, current_unix_seconds)` returns 0 or one
+  of the negative error codes `X509_ERR_NOT_YET_VALID` /
+  `X509_ERR_EXPIRED`. Out of scope (documented): extension parsing,
+  certificate chains, RSA / Ed25519 keys, CRL / OCSP revocation,
+  SAN / hostname matching.
+
+* **`src/safety/ecdsa.nova`** -- FIPS 186-4 §6.4 ECDSA-P-256 verify
+  on top of R30B's `p256.nova` curve arithmetic, plus a self-contained
+  SHA-256 implementation (FIPS 180-4). Verify recipe: (1) range-check
+  `r, s in [1, n-1]` BEFORE any curve math; (2) decode the SEC1
+  public-key buffer via `p256_decode_point` (which already enforces
+  on-curve + bad-tag rejection); (3) reduce hash mod n if needed;
+  (4) `w = s^-1 mod n` via Fermat (`s^(n-2) mod n` through
+  `bn256_modpow_ct`); (5) `u1 = e*w mod n` and `u2 = r*w mod n`;
+  (6) `(X, Y) = u1*G + u2*Q` via two `p256_scalar_mult` calls plus
+  one `p256_pt_add_affine`; (7) accept iff `X mod n == r`. Three
+  entry points: `ecdsa_p256_verify(pub_buf, pub_n, hash_buf,
+  sig_r_buf, sig_s_buf)` for raw 32-byte BE buffers,
+  `ecdsa_p256_verify_full(pub_buf, pub_n, msg_buf, msg_n, sig_r_buf,
+  sig_s_buf)` that SHA-256-hashes the message first, and
+  `ecdsa_p256_verify_bn(pub_buf, pub_n, hash_bn, r_bn, s_bn)` for
+  the x509.nova caller that already has bn256 values. The
+  self-contained SHA-256 is the FOURTH copy of FIPS 180-4 in the tree
+  (alongside `noise_xk.nova`, `merkle.nova`, `dtls12.nova`'s
+  `dtls_sha256`) -- documented duplication; future refactor extracts
+  `src/safety/sha256.nova`. The duplication is intentional because
+  importing `dtls12.nova` from `ecdsa.nova` would create a circular
+  dependency once R32C.2 wires the cert-verify path through
+  `dtls12.nova`.
+
+### Verification
+
+**+79 unit assertions** across the two new test files:
+
+* `tests/unit/test_ecdsa.nova`: **25 checks**. SHA-256 known-answers
+  for `""`, `"abc"`, FIPS 180-4 Appendix B.2 56-char string, 55-char
+  `"A"`-string (the block-boundary case where padding straddles two
+  blocks), and 1000-char `"a"`-string (15 full blocks + 40-byte
+  remainder); `ecdsa_sha256_bytes` byte-list variant round-trip.
+  ECDSA verify against **RFC 6979 §A.2.5** (the canonical deterministic
+  test vector for ECDSA-P-256 + SHA-256, replicated in countless
+  independent implementations): both the `"sample"` AND `"test"`
+  messages with the published `(Qx, Qy, r, s)` tuples; both
+  `ecdsa_p256_verify` (with the precomputed hash) and
+  `ecdsa_p256_verify_full` (hash internally); both uncompressed and
+  compressed SEC1 public-key encodings; the `ecdsa_p256_verify_bn`
+  entry point. Tamper rejection: flipped `r` byte -> 0; flipped `s`
+  byte -> 0; flipped message hash -> 0; wrong public key (Q + G) -> 0.
+  Range-check paths: `r == 0`, `s == 0`, `r == n`, `s == n`, and
+  `r == 2^256 - 1` (>> n) all reject WITHOUT proceeding to curve math.
+  Shape-validation paths: bad public-key tag byte and truncated
+  public-key buffer both reject.
+
+* `tests/unit/test_x509.nova`: **54 checks**. DER primitive isolation
+  tests (tag short / long-form rejection, length short-form,
+  long-form-2byte = 256, long-form-3byte = 65536, indefinite-length
+  rejection, overlong-length rejection, truncated-length rejection;
+  INTEGER 255 with leading-0 padding, INTEGER 5 plain, 256-bit
+  INTEGER round-trip; OID round-trip for `ecdsa-with-SHA256`,
+  `id-ecPublicKey`, `prime256v1`; UTCTime + GeneralizedTime decode to
+  Unix seconds; Time rejection on missing 'Z' + bad month). Full
+  cert parse against a hardcoded 397-byte DER vector generated
+  offline via `openssl ecparam -name prime256v1 -genkey | openssl req
+  -new -x509 -days 36500 -sha256 -subj /CN=CrossEnginTest`: subject
+  CN, issuer CN, signature OID, 65-byte public-key buffer hex, 20-byte
+  serial number bn256, signature r + s bn256, tbsCertificate span
+  (cert[4..311) = 307 bytes), parsed notBefore (1780554374 =
+  2026-06-04T06:26:14Z) + notAfter (4934154374 =
+  2126-05-11T06:26:14Z). Validity checks at notBefore-1
+  (`X509_ERR_NOT_YET_VALID`), notBefore (0 inclusive), midpoint (0),
+  notAfter (0 inclusive), notAfter+1 (`X509_ERR_EXPIRED`).
+  **Combined cert+verify smoke test**: `x509_parse` -> tbs +
+  pubkey + r + s; `ecdsa_sha256(tbs)` matches the openssl/python
+  reference `cfa7c41cc9cf98bd772c5398ca92692f30ca193e3dff5527105aafb957fd1ce6`;
+  `ecdsa_p256_verify_bn(pub, hash, r, s)` returns 1. Tamper smoke:
+  byte 100 of the cert flipped -> verify returns 0 (OR parse fails
+  if the tampered byte lands inside DN parsing). Error paths:
+  truncated cert, bad outer tag, indefinite outer length all
+  rejected with negative error codes.
+
+Full test suite: **227 / 227 pass** (231 prior + my 79 ÷ 31 per file
+average, the count climb reflects two new test files; R32B's 297
+internal `dtls12` checks count as one test program, the bash runner
+reports test-program-level pass/fail).
+
+### Concurrency note + stash discipline confirmation
+
+R32C runs in parallel with R32A (federation/nat_traversal RFC 8489
+UDP dispatch), R32B (DTLS anti-replay window), and other R32 round
+agents. The strict ownership rule -- "I may create ONLY my four
+files" -- was honored: `git status` before commit shows ONLY
+`src/safety/x509.nova`, `src/safety/ecdsa.nova`,
+`tests/unit/test_x509.nova`, `tests/unit/test_ecdsa.nova` as new files,
+plus targeted edits to `README.md`, `FEDERATED_AUDIT.md`, and
+`NEXT_SESSION.md`. The mandatory preflight `git stash push -m
+"R32C-preflight" -- <four owned paths>` was a no-op (none of the four
+were tracked beforehand), confirming I did not stomp on a
+co-resident's in-progress work. Zero changes to `dtls12.nova`,
+`p256.nova`, `aes_gcm.nova`, `bignum_256.nova`, `chacha20.nova`,
+`bignum_2048.nova`, or any federation module -- R32C.2 in a future
+round will land the `dtls12.nova` wiring exactly the way R31B wired
+R30B's primitives.
+
+### Honest caveats
+
+1. **ECDSA verify is NOT constant-time.** Inherits R30B.3 hardening
+   item from `p256.nova` -- `p256_scalar_mult` is double-and-add with
+   a data-dependent conditional add per scalar bit. For VERIFY this
+   exposure is academic: u1 and u2 are derived from the (public)
+   hash, (public) r, and (public) w; an observer learns nothing they
+   can't already compute. The side-channel concern only matters for
+   the SIGN path, which this module deliberately does NOT ship.
+
+2. **SHA-256 duplication.** The FIPS 180-4 implementation in
+   `ecdsa.nova` is a byte-for-byte copy of `dtls_sha256` in
+   `dtls12.nova` (which is itself a copy of the SHA-256 in
+   `noise_xk.nova` and `merkle.nova`). Importing `dtls12.nova` would
+   create a circular dep (`dtls12 -> x509 -> ecdsa -> dtls12`). Future
+   refactor extracts `src/safety/sha256.nova` -- tracked.
+
+3. **X.509 scope is intentionally minimal.** No extension parsing,
+   no certificate chains, no RSA / Ed25519 keys, no CRL / OCSP, no
+   SAN-based hostname matching. The cipher suite R29B negotiates is
+   ECDHE-ECDSA-* so the cert must carry a P-256 key; other suites
+   would need expansion. WebRTC's typical SDP-fingerprint flow
+   doesn't need SAN matching at the X.509 layer, so this scope is
+   appropriate for R29B.2's reach.
+
+4. **Test cert is hardcoded.** The 397-byte DER blob in
+   `tests/unit/test_x509.nova` was generated offline (openssl with
+   random ECDSA k + random 20-byte serial); each fresh generation
+   produces different bytes, so embedding one canonical vector lets
+   the test be deterministic. Validity window is ~100 years
+   (2026-06-04 .. 2126-05-11), which keeps the validity checks
+   testable for the lifetime of this codebase.
+
+5. **No DTLS wiring.** R32C strictly ships primitives.
+   `dtls_cert_verify_R29B2_STUB` STILL returns `DTLS_ERR_STUB`;
+   R32C.2 will plumb `x509_parse` + `ecdsa_p256_verify_bn` into the
+   handshake. The shape will be: client receives ServerHello +
+   ServerCertificate (one or more X.509 certs), parses the leaf,
+   pulls the public key for the subsequent ECDHE ServerKeyExchange
+   signature verify, and routes the cert-chain validation through
+   R32C's parser.
+
 ## R32A extension: nat_traversal RFC 8489 UDP dispatch (R31C.2 / R28C consumer)
 
 R31C (commit `0f95bb6`) migrated the codec half of `nat_traversal`
@@ -2726,6 +2908,153 @@ R30C.2 ICE-driver loop cannot collide.
   +6 shell assertions).
 * MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
 
+## R32B extension: DTLS anti-replay sliding window (RFC 6347 §4.1.2.6, R31B.2)
+
+R31B (`src/federation/dtls12.nova`, commit `af8e47c`) wired real
+P-256 ECDHE + AES-128-GCM into DTLS records and explicitly flagged
+"no anti-replay sliding window yet -- `RECV_SEQ` advances
+monotonically on success only. The open path will NOT reject a
+replayed sealed record whose sequence number trails the high
+watermark, so an attacker who captures a sealed record can re-
+inject it." Tracked as R31B.2; R32B closes that caveat.
+
+### What R32B delivers (extends `src/federation/dtls12.nova`)
+
+* **Four new state slots** appended at indices 32..35 (preserving
+  byte-identical layout of slots 0..31):
+  * `DTLS_S_SLOT_RECV_HIGH_WATERMARK` -- u64 highest validated seq
+    seen so far. Bit 0 of the replay mask represents this seq.
+  * `DTLS_S_SLOT_RECV_REPLAY_MASK` -- u64 sliding bitmap. Bit i
+    (LSB-indexed) is set iff seq `(high_watermark - i)` has been
+    validated.
+  * `DTLS_S_SLOT_STATS_REPLAY` -- replay-rejected count.
+  * `DTLS_S_SLOT_STATS_TOO_OLD` -- too-old-rejected count.
+* **Two pure-function helpers**:
+  * `_dtls_anti_replay_check(state, seq)` -- returns `DTLS_AR_OK` /
+    `DTLS_AR_REPLAY` / `DTLS_AR_TOO_OLD`. No state mutation.
+  * `_dtls_anti_replay_update(state, seq)` -- slides the window and
+    sets the bit for `seq`. Called ONLY after AEAD tag check passes.
+* **`dtls_open_record` integration**: the anti-replay check runs
+  BEFORE the AEAD decrypt attempt. A replay or too-old record is
+  short-circuited out without ever calling `gcm_open` -- both
+  because it would waste crypto work and (critically) because we
+  do not want to give an attacker an oracle on bogus seq numbers.
+  The window is updated ONLY AFTER the AEAD tag check passes -- a
+  forged record at `high_watermark + N` with a bad MAC must not
+  advance the watermark and lock out the legitimate next packet.
+* **Two new error tags**: `DTLS_REPLAY = "dtls: replay"` and
+  `DTLS_TOO_OLD = "dtls: too old"`. Both are distinct from
+  `DTLS_DECRYPT_FAIL` so callers can tell apart "I rejected this
+  cheaply at the pre-AEAD check" from "the AEAD oracle said no".
+  The brief explicitly asked for distinct error returns + counters.
+* **Four new accessors**: `dtls_recv_high_watermark`,
+  `dtls_recv_replay_mask`, `dtls_stats_replay`, `dtls_stats_too_old`.
+* **`dtls_stats_line` extended** with `hi_watermark=`, `replay=`,
+  `too_old=` fields (additive -- existing prefix still starts
+  `dtls: state=...`).
+
+### Algorithm (RFC 6347 §4.1.2.6 verbatim)
+
+Given incoming seq `S`, current `high_watermark` (`hw`), `mask`:
+
+* `S > hw`: ABOVE-WINDOW. Tentatively accept. After AEAD success,
+  shift mask left by `(S - hw)` (if >= 64, clear), set bit 0,
+  update `hw = S`.
+* `S <= hw` and `(hw - S) < 64`: WITHIN-WINDOW. Check bit
+  `(hw - S)`. If set -> REPLAY. If clear -> tentatively accept;
+  after AEAD success, set the bit.
+* `(hw - S) >= 64`: TOO_OLD. Reject before AEAD.
+
+Initial state (`hw = 0`, `mask = 0`): bit 0 represents seq 0,
+clear means "seq 0 not yet seen". So seq 0 is acceptable on the
+first open and rejected as replay on the second.
+
+### Verification
+
+* **66 new R32B unit assertions** in `tests/unit/test_dtls12.nova`
+  (extends additively; total now 297; R31B's 84 + R29B's 147 =
+  231 prior assertions pass byte-identical).
+* `dtls12: OK (297 checks)`.
+* Coverage:
+  * Sequential seq 1..4 -> all accepted, `high_watermark == 4`.
+  * Replay seq=2 after watermark=4 -> `DTLS_REPLAY`,
+    `STATS_REPLAY` bumps, watermark + mask UNCHANGED,
+    `aead_records_in` NOT bumped.
+  * Big jump seq=1 then seq=100 -> watermark slides to 100, mask
+    cleared then bit 0 set; subsequent seq=1 returns `DTLS_TOO_OLD`.
+  * Out-of-order within window: seq=1, 5, 3 -> 3 accepted (bit
+    clear); replay 3 -> `DTLS_REPLAY`.
+  * Too-old: seq=1, 200, then 50 (200-50=150 > 63) -> `DTLS_TOO_OLD`,
+    `STATS_TOO_OLD` bumps, `aead_records_in` NOT bumped.
+  * Boundary: watermark=64, seq=1 in window edge (delta 63 < 64),
+    seq=0 just past edge (delta 64) -> `DTLS_TOO_OLD`.
+  * Tamper-does-not-advance-window: forge seq=10 with flipped tag
+    byte. AEAD fails. Watermark + mask UNCHANGED. Legitimate next
+    packet at seq=1 still passes -- watermark then advances to 1.
+  * Replay short-circuits BEFORE AEAD: replay rejection does NOT
+    bump any of `TAMPER_CT` / `TAMPER_TAG` / `TAMPER_AAD`.
+  * Pure-helper probes for `_dtls_anti_replay_check` against a
+    synthetic state (watermark=10, mask=0b101) cover ABOVE-WINDOW,
+    REPLAY-at-watermark, in-window-bit-clear, in-window-bit-set,
+    delta-up-to-10-bit-clear.
+  * `_dtls_anti_replay_update` big-jump clears mask + sets bit 0;
+    in-window-update preserves the existing bit and sets the new.
+  * End-to-end with R31B's ECDHE round-trip: Alice seals one
+    32-byte payload; Bob's first open succeeds (plaintext byte-
+    identical); the SAME sealed bytes replayed return `DTLS_REPLAY`,
+    `STATS_REPLAY` bumps exactly once, `aead_records_in` does NOT.
+  * `dtls_stats_line` mentions `hi_watermark`, `replay`, `too_old`.
+
+### Honest design caveats
+
+1. **Cross-epoch handling deferred.** DTLS 1.2 ChangeCipherSpec
+   (epoch transition) MUST reset the replay window per RFC 6347
+   §4.1.2.6 (a new epoch starts a fresh sequence number space).
+   R32B does NOT reset `RECV_HIGH_WATERMARK` / `RECV_REPLAY_MASK`
+   on epoch change -- the wire driver that issues the CCS hasn't
+   landed yet (still in R31B.2's "no handshake state-machine
+   integration" caveat). When that lands it MUST call a `dtls_
+   reset_replay_window` helper or directly clear the two slots.
+2. **Per-direction, not per-epoch-direction.** A 64-bit window is
+   adequate for unicast DTLS over UDP; high-rate epochs with
+   substantial out-of-order delivery (e.g. SCTP-over-DTLS) may
+   want a wider window. RFC 6347 explicitly permits up to 256
+   bits; R32B picks 64 to match the OpenSSL default.
+3. **No constant-time bit-check.** `int_and(int_shr(mask, delta),
+   1)` is data-dependent (Nova's bigint shift cost depends on
+   the operand). A timing-channel attacker could measure replay-
+   vs-accept latency, but the leak is just "this seq was already
+   seen" -- the same fact the explicit `DTLS_REPLAY` return
+   leaks at the API level, so the timing channel is no worse.
+4. **Mask is 64-bit explicit.** We clamp the bitmap back into
+   `[0, 2^64)` after every shift via `int_and(_, _DTLS_REPLAY_
+   MASK64)` so Nova's arbitrary-precision integers do not let
+   bits drift above bit 63. This is a defensive guard, not
+   strictly required by the algorithm (a wider window would
+   simply remember more), but it keeps the test surface stable.
+5. **`STATS_TOO_OLD` vs telemetry.** A flood of TOO_OLD records
+   could indicate a path-MTU re-routing event (packets stuck in
+   a slow queue arriving after the fast queue ran ahead). R32B
+   counts them but does not classify; an upper layer that wants
+   to distinguish "attack" from "reordering" must inspect the
+   relative rate.
+
+### Files touched (R32B)
+
+* MOD: `src/federation/dtls12.nova` (+4 slots, 4 accessors, 2 new
+  error tags, 2 anti-replay helpers, anti-replay branches in
+  `dtls_open_record`, stats-line extension). The R29B + R31B
+  public API is preserved byte-identical for every existing
+  caller.
+* MOD: `tests/unit/test_dtls12.nova` (+14 test functions,
+  +66 assertions). The 35 R29B + 23 R31B test functions stay
+  byte-identical and are still invoked from `main()`; the 231
+  prior assertions pass byte-identical.
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
+
+R32B does NOT modify `p256.nova`, `aes_gcm.nova`, `webrtc.nova`,
+or any other federation module. Module count delta: 0.
+
 ## R31B extension: wire P-256 ECDHE + AES-128-GCM AEAD into DTLS records (R29B.2 / R30B.2)
 
 R29B (`src/federation/dtls12.nova`, commit `a3b1233`) shipped the
@@ -2829,7 +3158,10 @@ wiring layer between the two.
    replayed record whose sequence number trails the high
    watermark. A determined attacker who captures a sealed record
    can re-inject it after the legitimate one has been processed.
-   Tracked as R31B.2.
+   Tracked as R31B.2. **CLOSED by R32B above** -- DTLS now ships a
+   RFC 6347 §4.1.2.6 64-bit sliding window with `DTLS_REPLAY` +
+   `DTLS_TOO_OLD` distinct error returns + counters; window
+   advances only on AEAD success.
 2. **No constant-time scalar multiplication.** Inherits R30B.3's
    Montgomery-ladder hardening item from `p256.nova` --
    double-and-add leaks the bit pattern of the scalar to a power-

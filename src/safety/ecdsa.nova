@@ -1,0 +1,521 @@
+// CrossEngin safety: pure-NOVA ECDSA-P-256 signature verification + SHA-256.
+//
+// Purpose
+//   The DTLS 1.2 record-layer + handshake skeleton in
+//   `src/federation/dtls12.nova` (R29B) leaves `dtls_cert_verify_R29B2_STUB`
+//   as the last unfilled cryptographic stub. The ECDHE-ECDSA-AES128-GCM-
+//   SHA256 cipher suite (0xC02B) it negotiates needs server-side X.509
+//   certificate signature validation: hash the tbsCertificate, then
+//   verify the ECDSA-P256 signature pulled from the certificate envelope.
+//   R30B (commit 17e9cb8) shipped P-256 ECDH using the same curve
+//   arithmetic but with the ECDH algorithm (scalar * peer point). This
+//   module reuses `src/safety/p256.nova`'s field + group primitives and
+//   adds the ECDSA verify algorithm on top: the underlying curve math is
+//   shared, only the high-level recipe differs.
+//
+//   R32C ships the FOUNDATION (this module + `src/safety/x509.nova`).
+//   R32C.2 (future round) wires both into `dtls12.nova` to retire the
+//   `dtls_cert_verify_R29B2_STUB` slot. R32C does NOT touch
+//   `dtls12.nova` -- that's a parallel-agent ownership rule, mirroring
+//   how R30B did not touch `dtls12.nova` when it shipped the ECDH
+//   primitive that R31B later wired in.
+//
+// Algorithm references
+//   * FIPS 186-4 section 6.4 -- "ECDSA Signature Verification". The
+//     canonical recipe:
+//       Input: pub Q, msg hash e (truncated to bitlen(n)), signature (r, s)
+//       1. Reject if r or s not in [1, n-1].
+//       2. w = s^-1 mod n.
+//       3. u1 = e * w mod n; u2 = r * w mod n.
+//       4. (x, y) = u1 * G + u2 * Q   (point addition on the curve)
+//       5. Reject if (x, y) is the identity.
+//       6. Accept iff (x mod n) == r.
+//   * RFC 6979 section 2.4 -- the same recipe, with a note that the
+//     hash `e` is the LEFTMOST bitlen(n) bits of the digest. For
+//     P-256 and SHA-256, the hash is exactly 256 bits long, so the
+//     truncation step is a no-op: `e = SHA-256(message) mod 2^256`,
+//     then we reduce mod n inside the multiplications.
+//   * FIPS 180-4 -- SHA-256, used to hash the TBS bytes before verify.
+//
+// SHA-256 duplication (intentional, documented refactor target)
+//   The DTLS module already ships a pure-NOVA SHA-256 implementation
+//   (`dtls_sha256` in `src/federation/dtls12.nova`). Importing dtls12.nova
+//   from this safety module would create a circular dependency
+//   (dtls12.nova will eventually import ecdsa.nova when R32C.2 wires the
+//   cert-verify path through). To avoid the cycle we re-implement the
+//   same FIPS 180-4 SHA-256 here under a private `_ecdsa_sha256_*` name
+//   prefix. The same K-table and initial hash values are inlined; the
+//   compression function is byte-for-byte identical to dtls12.nova's so
+//   any future cross-suite test vector will agree. A future refactor
+//   should extract a shared `src/safety/sha256.nova` and have both
+//   call sites import it; tracked as the third duplicated SHA-256 (the
+//   first lives in `src/io/transducers/noise_xk.nova`, the second in
+//   `src/persistence/merkle.nova`, both noted in those modules'
+//   headers).
+//
+// Reuse of p256.nova
+//   * `p256_curve_n()` -- the subgroup order n (used to bound r, s).
+//   * `p256_base_point()` -- the base point G as [Gx, Gy] affine.
+//   * `p256_decode_point()` -- decode an SEC1 uncompressed/compressed
+//     public-key buffer into an affine (X, Y).
+//   * `p256_scalar_mult()` -- compute scalar * affine -> affine.
+//   * `p256_pt_add_affine()` -- add two affine points -> affine.
+//   * `_p256_bytes_to_bn()` -- big-endian 32-byte -> bn256.
+//
+// Scalar arithmetic mod n
+//   For modular inverse we use Fermat's little theorem (n is prime):
+//   s^-1 = s^(n-2) mod n, via `bn256_modpow_ct` against n. For modular
+//   multiplication we use `bn256_modmul(a, b, n)` -- the Montgomery
+//   context is built per-call; the ~3-call overhead for a single verify
+//   is dominated by the two scalar multiplications on the curve, so the
+//   ctx caching that p256 does for the FIELD prime is not duplicated
+//   here for the GROUP prime.
+//
+// Constant-time / side-channel caveats (R32C.3 hardening followup)
+//   * `ecdsa_p256_verify` is NOT constant-time. The inner
+//     `p256_scalar_mult` uses double-and-add (data-dependent conditional
+//     add per scalar bit -- inherited from p256.nova's R30B.3 hardening
+//     item). For VERIFY this exposure is academic: the scalar inputs
+//     (u1, u2) and the public key are all PUBLIC values; an attacker
+//     observing timing learns nothing they don't already know. The
+//     side-channel concern only matters for the SIGN path, which this
+//     module does NOT ship (DTLS server-side certificate-based auth
+//     verifies the peer's signature; the local key is the long-term
+//     identity loaded via `ed25519` for snapshot signing, not ECDSA).
+//   * Comparison `x mod n == r` does early-exit on first mismatch via
+//     bn256_eq -- again, both operands are public.
+//   * `r in [1, n-1]` and `s in [1, n-1]` range checks short-circuit
+//     BEFORE any curve math, which protects against malformed sig
+//     length attacks but doesn't leak secret-dependent state.
+//
+// Public API
+//   ecdsa_sha256(msg_buf, n)              -> 33-byte buffer (32B digest +
+//                                            trailing NUL byte, mirror of
+//                                            dtls_sha256's allocator slack)
+//   ecdsa_sha256_bytes(byte_list)         -> 32-element byte list (variant
+//                                            for callers holding a NOVA
+//                                            byte list rather than a
+//                                            buffer + length pair)
+//   ecdsa_p256_verify(pub_buf, pub_n,
+//                     hash_buf,
+//                     sig_r_buf, sig_s_buf)
+//                                         -> 1 if signature valid,
+//                                            0 otherwise
+//     `pub_buf` is the SEC1 uncompressed or compressed public-key
+//     encoding (65 or 33 bytes). `pub_n` is its length. `hash_buf` is
+//     the 32-byte big-endian message hash (SHA-256 output). `sig_r_buf`
+//     and `sig_s_buf` are the 32-byte big-endian r and s scalars.
+//   ecdsa_p256_verify_full(pub_buf, pub_n,
+//                          msg_buf, msg_n,
+//                          sig_r_buf, sig_s_buf)
+//                                         -> 1 if SHA-256(msg) + ECDSA
+//                                            verify matches, 0 otherwise
+//   ecdsa_p256_verify_bn(pub_buf, pub_n,
+//                        hash_bn, r_bn, s_bn)
+//                                         -> 1 if signature valid, 0
+//                                            otherwise; pre-decoded
+//                                            bn256 variant used by
+//                                            x509.nova which already
+//                                            parsed the ASN.1 INTEGERs
+//                                            into bn256.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R32C cert-verify foundation,
+//   prepares R29B's dtls_cert_verify_R29B2_STUB for R32C.2 wiring).
+// NOVA dependencies: builtins (alloc, store8, load8, int_*, list_*,
+//   secure_random unused but available).
+// CrossEngin dependencies:
+//   * src/safety/p256.nova -- field + group primitives, SEC1 codec,
+//     scalar mult on the NIST P-256 curve.
+//   * src/safety/bignum_256.nova -- transitively via p256.nova, used
+//     directly for bn256_modmul / bn256_modpow_ct / bn256_cmp against n.
+
+import "../safety/p256.nova"
+
+// ============================================================================
+//                  SHA-256 (FIPS 180-4) -- pure NOVA
+// ============================================================================
+//
+// This is the third copy of SHA-256 in the codebase (the first lives in
+// `src/io/transducers/noise_xk.nova`, the second in
+// `src/persistence/merkle.nova`, plus `dtls_sha256` in dtls12.nova). All
+// four share the same FIPS 180-4 algorithm; the duplication is the cost
+// of "no cross-federation imports". A future refactor should extract a
+// shared `src/safety/sha256.nova` and have every call site import it.
+// Documented in this module's header.
+
+let _ECDSA_MASK32  = 4294967295
+let _ECDSA_HASH_LEN = 32
+let _ECDSA_BLOCK_LEN = 64
+
+fn _ecdsa_mask32(x) { return int_and(x, _ECDSA_MASK32) }
+fn _ecdsa_add32(a, b) { return _ecdsa_mask32(int_add(a, b)) }
+fn _ecdsa_xor32(a, b) { return _ecdsa_mask32(int_xor(a, b)) }
+fn _ecdsa_and32(a, b) { return _ecdsa_mask32(int_and(a, b)) }
+fn _ecdsa_or32(a, b)  { return _ecdsa_mask32(int_or(a, b)) }
+fn _ecdsa_not32(x)    { return _ecdsa_mask32(int_xor(x, _ECDSA_MASK32)) }
+
+fn _ecdsa_rotr32(x, n) {
+    let right = int_shr(x, n)
+    let left  = _ecdsa_mask32(int_shl(x, 32 - n))
+    return _ecdsa_mask32(int_or(right, left))
+}
+
+fn _ecdsa_load_be32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return _ecdsa_mask32(v)
+}
+
+fn _ecdsa_store_be32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+// FIPS 180-4 K constants: first 32 bits of the fractional cube roots
+// of the first 64 primes. Byte-identical to dtls12.nova's _dtls_sha_k.
+fn _ecdsa_sha_k(i) {
+    if i ==  0 { return 1116352408 }
+    if i ==  1 { return 1899447441 }
+    if i ==  2 { return 3049323471 }
+    if i ==  3 { return 3921009573 }
+    if i ==  4 { return 961987163 }
+    if i ==  5 { return 1508970993 }
+    if i ==  6 { return 2453635748 }
+    if i ==  7 { return 2870763221 }
+    if i ==  8 { return 3624381080 }
+    if i ==  9 { return 310598401 }
+    if i == 10 { return 607225278 }
+    if i == 11 { return 1426881987 }
+    if i == 12 { return 1925078388 }
+    if i == 13 { return 2162078206 }
+    if i == 14 { return 2614888103 }
+    if i == 15 { return 3248222580 }
+    if i == 16 { return 3835390401 }
+    if i == 17 { return 4022224774 }
+    if i == 18 { return 264347078 }
+    if i == 19 { return 604807628 }
+    if i == 20 { return 770255983 }
+    if i == 21 { return 1249150122 }
+    if i == 22 { return 1555081692 }
+    if i == 23 { return 1996064986 }
+    if i == 24 { return 2554220882 }
+    if i == 25 { return 2821834349 }
+    if i == 26 { return 2952996808 }
+    if i == 27 { return 3210313671 }
+    if i == 28 { return 3336571891 }
+    if i == 29 { return 3584528711 }
+    if i == 30 { return 113926993 }
+    if i == 31 { return 338241895 }
+    if i == 32 { return 666307205 }
+    if i == 33 { return 773529912 }
+    if i == 34 { return 1294757372 }
+    if i == 35 { return 1396182291 }
+    if i == 36 { return 1695183700 }
+    if i == 37 { return 1986661051 }
+    if i == 38 { return 2177026350 }
+    if i == 39 { return 2456956037 }
+    if i == 40 { return 2730485921 }
+    if i == 41 { return 2820302411 }
+    if i == 42 { return 3259730800 }
+    if i == 43 { return 3345764771 }
+    if i == 44 { return 3516065817 }
+    if i == 45 { return 3600352804 }
+    if i == 46 { return 4094571909 }
+    if i == 47 { return 275423344 }
+    if i == 48 { return 430227734 }
+    if i == 49 { return 506948616 }
+    if i == 50 { return 659060556 }
+    if i == 51 { return 883997877 }
+    if i == 52 { return 958139571 }
+    if i == 53 { return 1322822218 }
+    if i == 54 { return 1537002063 }
+    if i == 55 { return 1747873779 }
+    if i == 56 { return 1955562222 }
+    if i == 57 { return 2024104815 }
+    if i == 58 { return 2227730452 }
+    if i == 59 { return 2361852424 }
+    if i == 60 { return 2428436474 }
+    if i == 61 { return 2756734187 }
+    if i == 62 { return 3204031479 }
+    if i == 63 { return 3329325298 }
+    return 0
+}
+
+fn _ecdsa_sha_init_h() {
+    let h = list_new()
+    push(h, 1779033703)   // 0x6a09e667
+    push(h, 3144134277)   // 0xbb67ae85
+    push(h, 1013904242)   // 0x3c6ef372
+    push(h, 2773480762)   // 0xa54ff53a
+    push(h, 1359893119)   // 0x510e527f
+    push(h, 2600822924)   // 0x9b05688c
+    push(h, 528734635)    // 0x1f83d9ab
+    push(h, 1541459225)   // 0x5be0cd19
+    return h
+}
+
+fn _ecdsa_sha_compress(h, blk) {
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _ecdsa_load_be32(blk, i * 4))
+        i = i + 1
+    }
+    while i < 64 {
+        let w15 = w[i - 15]
+        let w2  = w[i - 2]
+        let s0 = _ecdsa_xor32(_ecdsa_xor32(_ecdsa_rotr32(w15, 7),
+                                           _ecdsa_rotr32(w15, 18)),
+                              int_shr(w15, 3))
+        let s1 = _ecdsa_xor32(_ecdsa_xor32(_ecdsa_rotr32(w2, 17),
+                                           _ecdsa_rotr32(w2, 19)),
+                              int_shr(w2, 10))
+        let v = _ecdsa_add32(_ecdsa_add32(_ecdsa_add32(w[i - 16], s0),
+                                          w[i - 7]), s1)
+        push(w, v)
+        i = i + 1
+    }
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]
+    let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7]
+    let t = 0
+    while t < 64 {
+        let s1 = _ecdsa_xor32(_ecdsa_xor32(_ecdsa_rotr32(e, 6),
+                                           _ecdsa_rotr32(e, 11)),
+                              _ecdsa_rotr32(e, 25))
+        let ch = _ecdsa_xor32(_ecdsa_and32(e, f),
+                              _ecdsa_and32(_ecdsa_not32(e), g))
+        let t1 = _ecdsa_add32(_ecdsa_add32(_ecdsa_add32(_ecdsa_add32(hh, s1), ch),
+                                           _ecdsa_sha_k(t)), w[t])
+        let s0 = _ecdsa_xor32(_ecdsa_xor32(_ecdsa_rotr32(a, 2),
+                                           _ecdsa_rotr32(a, 13)),
+                              _ecdsa_rotr32(a, 22))
+        let maj = _ecdsa_xor32(_ecdsa_xor32(_ecdsa_and32(a, b),
+                                            _ecdsa_and32(a, c)),
+                               _ecdsa_and32(b, c))
+        let t2 = _ecdsa_add32(s0, maj)
+        hh = g
+        g = f
+        f = e
+        e = _ecdsa_add32(d, t1)
+        d = c
+        c = b
+        b = a
+        a = _ecdsa_add32(t1, t2)
+        t = t + 1
+    }
+    list_set(h, 0, _ecdsa_add32(h[0], a))
+    list_set(h, 1, _ecdsa_add32(h[1], b))
+    list_set(h, 2, _ecdsa_add32(h[2], c))
+    list_set(h, 3, _ecdsa_add32(h[3], d))
+    list_set(h, 4, _ecdsa_add32(h[4], e))
+    list_set(h, 5, _ecdsa_add32(h[5], f))
+    list_set(h, 6, _ecdsa_add32(h[6], g))
+    list_set(h, 7, _ecdsa_add32(h[7], hh))
+    return 1
+}
+
+// SHA-256 of n bytes at msg_buf. Returns 33-byte buffer (32B digest +
+// trailing NUL byte for allocator slack). Identical recipe to
+// dtls12.nova's `dtls_sha256`; documented duplication.
+fn ecdsa_sha256(msg_buf, n) {
+    let h = _ecdsa_sha_init_h()
+    let full_blocks = int_shr(n, 6)
+    let i = 0
+    while i < full_blocks {
+        _ecdsa_sha_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    let rem = n - full_blocks * 64
+    let total_bits_lo = _ecdsa_mask32(int_shl(n, 3))
+    let total_bits_hi = _ecdsa_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _ecdsa_store_be32(pad, final_size - 8, total_bits_hi)
+    _ecdsa_store_be32(pad, final_size - 4, total_bits_lo)
+    _ecdsa_sha_compress(h, pad)
+    if need_two == 1 {
+        _ecdsa_sha_compress(h, pad + 64)
+    }
+    let out = alloc(_ECDSA_HASH_LEN + 1)
+    let k = 0
+    while k < 8 {
+        _ecdsa_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + _ECDSA_HASH_LEN, 0)
+    return out
+}
+
+// SHA-256 of a NOVA byte list (each element a 0..255 integer). Returns
+// a 32-element byte list. Convenience wrapper for callers that hold a
+// byte list rather than a buffer + length pair.
+fn ecdsa_sha256_bytes(byte_list) {
+    let n = len(byte_list)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, byte_list[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let digest = ecdsa_sha256(buf, n)
+    let out = list_new()
+    let k = 0
+    while k < _ECDSA_HASH_LEN {
+        push(out, load8(digest + k))
+        k = k + 1
+    }
+    return out
+}
+
+// ============================================================================
+//                  ECDSA-P-256 verify (FIPS 186-4 §6.4)
+// ============================================================================
+//
+// Given a public key Q (decoded into an affine point), a 32-byte hash e,
+// and signature scalars (r, s):
+//   1. Reject if r or s not in [1, n-1].
+//   2. w = s^-1 mod n.
+//   3. u1 = e * w mod n; u2 = r * w mod n.
+//   4. (X, Y) = u1 * G + u2 * Q on the curve.
+//   5. Reject if the result is the identity (point at infinity).
+//   6. Accept iff (X mod n) == r.
+
+// Modular inverse of x mod the SUBGROUP order n via Fermat (n is prime).
+// w = x^(n-2) mod n. Returns 0 if x is zero (caller must check).
+fn _ecdsa_n_inv(x) {
+    let n = p256_curve_n()
+    if bn256_zero(x) != 0 { return bn256_new() }
+    let two = bn256_from_int(2)
+    let exp = bn256_sub(n, two)             // n - 2
+    return bn256_modpow_ct(x, exp, n)
+}
+
+// Range check: 1 <= x < n. Returns 1 if in range, 0 otherwise.
+fn _ecdsa_in_range_n(x) {
+    let n = p256_curve_n()
+    if bn256_zero(x) != 0 { return 0 }
+    if bn256_cmp(x, n) >= 0 { return 0 }
+    return 1
+}
+
+// ECDSA verify with pre-decoded bn256 inputs. Used by `x509_parse` ->
+// `ecdsa_p256_verify_bn` (the ASN.1 INTEGER decode already produced
+// bn256 r, s). Returns 1 if the signature is valid for the public key
+// + message hash, 0 otherwise.
+//
+// Verify recipe (FIPS 186-4 §6.4):
+//   1. Range-check r, s in [1, n-1].
+//   2. Compute e = hash_bn (reduced mod n if needed).
+//   3. w = s^-1 mod n.
+//   4. u1 = e * w mod n; u2 = r * w mod n.
+//   5. (X, Y) = u1 * G + u2 * Q.
+//   6. Reject identity; accept iff X mod n == r.
+fn ecdsa_p256_verify_bn(pub_buf, pub_n, hash_bn, r_bn, s_bn) {
+    // Step 1: range checks BEFORE any curve math (defense vs malformed sig).
+    if _ecdsa_in_range_n(r_bn) == 0 { return 0 }
+    if _ecdsa_in_range_n(s_bn) == 0 { return 0 }
+    // Decode the public-key point. Q must be on the curve; p256_decode_point
+    // already enforces that, plus rejects bad tag / length / X >= p.
+    let Q = p256_decode_point(pub_buf, pub_n)
+    if Q == 0 { return 0 }
+    // Step 2: e = hash mod n (RFC 6979 §2.4 says leftmost bitlen(n) bits;
+    // for P-256 with SHA-256 the digest is exactly 256 bits, so reduce
+    // mod n is enough -- equivalent to "take all 256 bits as a big-endian
+    // integer, reduce mod n").
+    let n = p256_curve_n()
+    let e = hash_bn
+    if bn256_cmp(e, n) >= 0 {
+        e = bn256_mod(e, n)
+    }
+    // Step 3: w = s^-1 mod n.
+    let w = _ecdsa_n_inv(s_bn)
+    if bn256_zero(w) != 0 { return 0 }
+    // Step 4: u1, u2 mod n.
+    let u1 = bn256_modmul(e, w, n)
+    let u2 = bn256_modmul(r_bn, w, n)
+    // Step 5: (X, Y) = u1 * G + u2 * Q. We compute the two scalar mults
+    // independently via p256_scalar_mult, then add them via
+    // p256_pt_add_affine. Both inner calls return 0 sentinel on identity.
+    let G = p256_base_point()
+    let P1 = p256_scalar_mult(u1, G[0], G[1])
+    let P2 = p256_scalar_mult(u2, Q[0], Q[1])
+    // If either intermediate is identity, the sum is whichever non-zero
+    // term remains (since 0 + P = P in the group).
+    let X = 0
+    if P1 == 0 {
+        if P2 == 0 { return 0 }
+        X = P2[0]
+    } else {
+        if P2 == 0 {
+            X = P1[0]
+        } else {
+            let S = p256_pt_add_affine(P1[0], P1[1], P2[0], P2[1])
+            if S == 0 { return 0 }
+            X = S[0]
+        }
+    }
+    // Step 6: x mod n == r.
+    let x_mod_n = X
+    if bn256_cmp(x_mod_n, n) >= 0 {
+        x_mod_n = bn256_mod(x_mod_n, n)
+    }
+    return bn256_eq(x_mod_n, r_bn)
+}
+
+// ECDSA-P-256 verify with raw 32-byte big-endian buffers for the hash
+// and signature scalars. Public-key buffer is SEC1 (uncompressed 65B or
+// compressed 33B). Returns 1 on valid signature, 0 otherwise.
+fn ecdsa_p256_verify(pub_buf, pub_n, hash_buf, sig_r_buf, sig_s_buf) {
+    let hash_bn = _p256_bytes_to_bn(hash_buf, 0)
+    let r_bn = _p256_bytes_to_bn(sig_r_buf, 0)
+    let s_bn = _p256_bytes_to_bn(sig_s_buf, 0)
+    return ecdsa_p256_verify_bn(pub_buf, pub_n, hash_bn, r_bn, s_bn)
+}
+
+// One-shot: SHA-256 the message, then ECDSA-verify. Returns 1 / 0.
+fn ecdsa_p256_verify_full(pub_buf, pub_n, msg_buf, msg_n, sig_r_buf, sig_s_buf) {
+    let digest = ecdsa_sha256(msg_buf, msg_n)
+    return ecdsa_p256_verify(pub_buf, pub_n, digest, sig_r_buf, sig_s_buf)
+}
+
+// ============================================================================
+//                  Hex codec (mirror of p256_hex_decode)
+// ============================================================================
+//
+// Re-exported under an ecdsa_* prefix so the unit tests can decode hex
+// vectors without importing p256 directly (the import IS transitive via
+// p256.nova, but the symbolic re-export keeps the test file's
+// dependencies legible). Internally these just forward to the p256
+// helpers.
+
+fn ecdsa_hex_decode(hex_str) {
+    return p256_hex_decode(hex_str)
+}
+
+fn ecdsa_hex_encode_buf(buf, n) {
+    return p256_hex_encode_buf(buf, n)
+}
