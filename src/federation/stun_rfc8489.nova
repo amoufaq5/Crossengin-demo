@@ -1,0 +1,1299 @@
+// CrossEngin federation: RFC 8489 STUN client (R30C / R28E.2 follow-up).
+//
+// Purpose
+//
+//   R28E (`src/federation/webrtc.nova`, commit `8c566fb`) shipped the
+//   SIGNALING half of browser-to-soul WebRTC and flagged FOUR R28E.2
+//   sub-systems blocking the end-to-end data plane: DTLS 1.2/1.3 (R29B
+//   landed the record-layer skeleton in `dtls12.nova`), ICE, SRTP, and
+//   the proper STUN/TURN stack. R30C closes the ICE half of the gap:
+//   this module ships an RFC 8489-compliant STUN client wire codec
+//   that browsers will actually interoperate with, and the sister
+//   `ice.nova` ships the RFC 8445 agent on top of it.
+//
+//   R23E shipped `src/federation/nat_traversal.nova` -- a STUN-LIKE
+//   newline-text wire (`STUN_REQUEST\n` / `EXTERNAL <ip>:<port>\n`)
+//   that is convenient for CrossEngin-to-CrossEngin federation but
+//   NOT a real RFC 8489 binding message. A browser asked to send STUN
+//   to that server will time out: the binding-request type word
+//   (0x0001), the 4-byte magic cookie (0x2112A442), the 12-byte
+//   transaction id, the TLV attribute block, the XOR-MAPPED-ADDRESS
+//   port/address XOR with the cookie -- none of that is on the wire.
+//
+//   R30C does NOT modify `nat_traversal.nova` (R23E ownership). It
+//   provides a clean parallel module so future R30C.2 work can migrate
+//   the existing callers over without churning the gossip-piggyback
+//   advertisement layer that sits on top of R23E.
+//
+// Wire format (RFC 8489 section 5)
+//
+//   STUN message =
+//      20-byte header
+//      + zero-or-more attributes (each TLV with 4-byte header)
+//
+//   Header (20 bytes, all multi-byte fields BIG-ENDIAN):
+//      bytes  0..1   message type      (14-bit; top 2 bits MUST be 00)
+//      bytes  2..3   message length    (payload bytes after header)
+//      bytes  4..7   magic cookie      (always 0x2112A442)
+//      bytes  8..19  transaction id    (12 random bytes)
+//
+//   Attribute TLV (4-byte header + value, padded to a 4-byte boundary):
+//      bytes  0..1   attribute type
+//      bytes  2..3   value length      (UNPADDED; padding is implicit)
+//      bytes  4..L   value
+//      bytes L..L+pad pad zeros (so attribute total bytes is multiple of 4)
+//
+//   The `length` field in the header is the SUM of (4 + padded_value_len)
+//   across all attributes.
+//
+// Message types we ship (RFC 8489 sections 5 + 6.3):
+//   * Binding Request          0x0001  (request)
+//   * Binding Success Response 0x0101  (success class)
+//   * Binding Error Response   0x0111  (error class)
+//
+// Attributes we ship (RFC 8489 section 14):
+//   * 0x0001 MAPPED-ADDRESS         -- legacy, parsed for compat only
+//   * 0x0006 USERNAME               -- long-term credential username
+//   * 0x0008 MESSAGE-INTEGRITY      -- HMAC-SHA1(key, msg-prefix-with-fake-len)
+//   * 0x0009 ERROR-CODE             -- class*100 + number + reason phrase
+//   * 0x0020 XOR-MAPPED-ADDRESS     -- IPv4 + IPv6 (port XOR top16 cookie,
+//                                       v4 addr XOR cookie, v6 addr XOR cookie||txnid)
+//   * 0x8022 SOFTWARE               -- ASCII identifier (comprehension-optional)
+//   * 0x8028 FINGERPRINT            -- CRC32(msg-prefix) XOR 0x5354554E
+//
+// Public client API
+//
+//   stun_init()                                       -> state
+//   stun_send_binding_request(state, remote_addr, software)
+//                                                     -> [pkt_buf, n, txn_id_buf]
+//   stun_recv(state, pkt_buf, pkt_n)                  -> result list
+//     result on success:    [STUN_RES_OK,  mapped_ip, mapped_port,
+//                            xor_family, txn_match]
+//     result on error-code: [STUN_RES_ERR, err_code, reason, txn_match]
+//     result on bad parse:  [STUN_RES_BAD]
+//   stun_set_credentials(state, username, password)   -> 0
+//
+// Crypto primitives (re-implemented in-module so this file is a LEAF):
+//
+//   stun_sha1(buf, n)                                 -> 20-byte digest buf
+//   stun_hmac_sha1(key, key_n, msg, msg_n)            -> 20-byte mac buf
+//   stun_crc32(buf, n)                                -> int (low 32 bits)
+//
+// Why this is a leaf module
+//
+//   R29B (`dtls12.nova`) re-implemented SHA-256 / HMAC-SHA256 / HKDF
+//   bundled in-module for the same reason: parallel R28E.2 agents
+//   ICE / SRTP / STUN-TURN must not collide via shared crypto. R30C
+//   imports nothing from `dtls12.nova` and re-implements SHA-1 +
+//   HMAC-SHA1 + CRC32 fresh per RFC 3174 (~120 lines for SHA-1) so
+//   this module compiles + links in isolation.
+//
+// ADRs touched: registers ADR-0094 (RFC 8489 STUN client wire codec,
+//   R28E.2 sub-system).
+// NOVA dependencies: builtins (alloc, store8, load8, list_new, push,
+//   int_and, int_or, int_xor, int_shl, int_shr, int_to_str, len,
+//   substr, char_at, str_eq, str_to_int, chr).
+// CrossEngin dependencies: NONE.
+
+// ============================================================================
+//                              Error tags
+// ============================================================================
+
+let STUN_ERR_BAD_HEADER     = "stun: bad header"
+let STUN_ERR_BAD_LENGTH     = "stun: bad length"
+let STUN_ERR_BAD_COOKIE     = "stun: bad magic cookie"
+let STUN_ERR_BAD_ATTR       = "stun: malformed attribute"
+let STUN_ERR_TXN_MISMATCH   = "stun: transaction id mismatch"
+let STUN_ERR_INTEGRITY      = "stun: MESSAGE-INTEGRITY failed"
+let STUN_ERR_FINGERPRINT    = "stun: FINGERPRINT failed"
+let STUN_ERR_NO_ATTR        = "stun: required attribute missing"
+let STUN_ERR_UNKNOWN_FAMILY = "stun: unknown address family"
+
+// ============================================================================
+//                              Protocol constants
+// ============================================================================
+
+// 0x2112A442 = 554869826 (hand-decoded).
+let STUN_MAGIC_COOKIE = 554869826              // 0x2112A442
+
+let STUN_HDR_LEN     = 20
+let STUN_ATTR_HDR_LEN = 4
+let STUN_TXN_ID_LEN  = 12
+
+// Message types (RFC 8489 section 5).
+let STUN_TYPE_BINDING_REQUEST          = 1     // 0x0001
+let STUN_TYPE_BINDING_INDICATION       = 17    // 0x0011
+let STUN_TYPE_BINDING_SUCCESS_RESPONSE = 257   // 0x0101
+let STUN_TYPE_BINDING_ERROR_RESPONSE   = 273   // 0x0111
+
+// Attribute types (RFC 8489 section 14).
+let STUN_ATTR_MAPPED_ADDRESS     = 1
+let STUN_ATTR_USERNAME           = 6
+let STUN_ATTR_MESSAGE_INTEGRITY  = 8
+let STUN_ATTR_ERROR_CODE         = 9
+let STUN_ATTR_UNKNOWN_ATTRIBUTES = 10
+let STUN_ATTR_REALM              = 20
+let STUN_ATTR_NONCE              = 21
+let STUN_ATTR_XOR_MAPPED_ADDRESS = 32
+let STUN_ATTR_SOFTWARE           = 32802
+let STUN_ATTR_ALTERNATE_SERVER   = 32803
+let STUN_ATTR_FINGERPRINT        = 32808
+
+let STUN_FAMILY_IPV4 = 1
+let STUN_FAMILY_IPV6 = 2
+
+// 0x5354554E = 1398035790 (hand-decoded).
+let STUN_FINGERPRINT_XOR = 1398035790          // 0x5354554E
+
+let STUN_INTEGRITY_LEN = 20
+let STUN_FINGERPRINT_LEN = 4
+
+let STUN_RES_OK  = 0
+let STUN_RES_ERR = 1
+let STUN_RES_BAD = 2
+
+// ============================================================================
+//                         Byte arithmetic helpers
+// ============================================================================
+
+let _STUN_MASK32 = 4294967295
+
+fn _stun_mask32(x) { return int_and(x, _STUN_MASK32) }
+fn _stun_xor32(a, b) { return _stun_mask32(int_xor(a, b)) }
+fn _stun_add32(a, b) { return _stun_mask32(int_add(a, b)) }
+fn _stun_and32(a, b) { return _stun_mask32(int_and(a, b)) }
+fn _stun_or32(a, b)  { return _stun_mask32(int_or(a, b)) }
+fn _stun_not32(x)    { return _stun_mask32(int_xor(x, _STUN_MASK32)) }
+
+fn _stun_rotl32(x, n) {
+    let left  = _stun_mask32(int_shl(x, n))
+    let right = int_shr(x, 32 - n)
+    return _stun_mask32(int_or(left, right))
+}
+
+fn _stun_put_u16(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 1, int_and(v, 255))
+    return 1
+}
+
+fn _stun_put_u32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+fn _stun_get_u16(buf, off) {
+    let hi = load8(buf + off + 0)
+    let lo = load8(buf + off + 1)
+    return int_or(int_shl(hi, 8), lo)
+}
+
+fn _stun_get_u32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return _stun_mask32(v)
+}
+
+// Round n up to the next multiple of 4.
+fn _stun_pad4(n) {
+    let r = n - int_shl(int_shr(n, 2), 2)
+    if r == 0 { return n }
+    return n + (4 - r)
+}
+
+// ============================================================================
+//                         SHA-1  (RFC 3174 / FIPS 180-4)
+// ============================================================================
+
+let _STUN_SHA1_HASH_LEN  = 20
+let _STUN_SHA1_BLOCK_LEN = 64
+
+fn _stun_sha1_init_h() {
+    let h = list_new()
+    push(h, 1732584193)   // 0x67452301
+    push(h, 4023233417)   // 0xEFCDAB89
+    push(h, 2562383102)   // 0x98BADCFE
+    push(h, 271733878)    // 0x10325476
+    push(h, 3285377520)   // 0xC3D2E1F0
+    return h
+}
+
+fn _stun_sha1_k(t) {
+    if t < 20 { return 1518500249 }
+    if t < 40 { return 1859775393 }
+    if t < 60 { return 2400959708 }
+    return 3395469782
+}
+
+fn _stun_sha1_f(t, b, c, d) {
+    if t < 20 {
+        return _stun_or32(_stun_and32(b, c),
+                          _stun_and32(_stun_not32(b), d))
+    }
+    if t < 40 {
+        return _stun_xor32(_stun_xor32(b, c), d)
+    }
+    if t < 60 {
+        return _stun_or32(_stun_or32(_stun_and32(b, c),
+                                     _stun_and32(b, d)),
+                          _stun_and32(c, d))
+    }
+    return _stun_xor32(_stun_xor32(b, c), d)
+}
+
+fn _stun_sha1_compress(h, blk) {
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _stun_get_u32(blk, i * 4))
+        i = i + 1
+    }
+    while i < 80 {
+        let v = _stun_xor32(_stun_xor32(_stun_xor32(w[i - 3], w[i - 8]),
+                                        w[i - 14]),
+                            w[i - 16])
+        push(w, _stun_rotl32(v, 1))
+        i = i + 1
+    }
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]; let e = h[4]
+    let t = 0
+    while t < 80 {
+        let temp = _stun_add32(_stun_add32(_stun_add32(_stun_add32(
+                       _stun_rotl32(a, 5), _stun_sha1_f(t, b, c, d)),
+                       e), w[t]), _stun_sha1_k(t))
+        e = d
+        d = c
+        c = _stun_rotl32(b, 30)
+        b = a
+        a = temp
+        t = t + 1
+    }
+    list_set(h, 0, _stun_add32(h[0], a))
+    list_set(h, 1, _stun_add32(h[1], b))
+    list_set(h, 2, _stun_add32(h[2], c))
+    list_set(h, 3, _stun_add32(h[3], d))
+    list_set(h, 4, _stun_add32(h[4], e))
+    return 1
+}
+
+fn stun_sha1(msg_buf, n) {
+    let h = _stun_sha1_init_h()
+    let full_blocks = int_shr(n, 6)
+    let i = 0
+    while i < full_blocks {
+        _stun_sha1_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    let rem = n - full_blocks * 64
+    let total_bits_lo = _stun_mask32(int_shl(n, 3))
+    let total_bits_hi = _stun_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _stun_put_u32(pad, final_size - 8, total_bits_hi)
+    _stun_put_u32(pad, final_size - 4, total_bits_lo)
+    _stun_sha1_compress(h, pad)
+    if need_two == 1 {
+        _stun_sha1_compress(h, pad + 64)
+    }
+    let out = alloc(_STUN_SHA1_HASH_LEN + 1)
+    let k = 0
+    while k < 5 {
+        _stun_put_u32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + _STUN_SHA1_HASH_LEN, 0)
+    return out
+}
+
+// ============================================================================
+//                         HMAC-SHA1  (RFC 2104)
+// ============================================================================
+
+fn stun_hmac_sha1(key_buf, key_n, msg_buf, msg_n) {
+    let k_block = alloc(_STUN_SHA1_BLOCK_LEN + 1)
+    let i = 0
+    while i < _STUN_SHA1_BLOCK_LEN {
+        store8(k_block + i, 0)
+        i = i + 1
+    }
+    if key_n > _STUN_SHA1_BLOCK_LEN {
+        let h = stun_sha1(key_buf, key_n)
+        let j = 0
+        while j < _STUN_SHA1_HASH_LEN {
+            store8(k_block + j, load8(h + j))
+            j = j + 1
+        }
+    } else {
+        let j = 0
+        while j < key_n {
+            store8(k_block + j, load8(key_buf + j))
+            j = j + 1
+        }
+    }
+    let ipad = alloc(_STUN_SHA1_BLOCK_LEN + 1)
+    let opad = alloc(_STUN_SHA1_BLOCK_LEN + 1)
+    i = 0
+    while i < _STUN_SHA1_BLOCK_LEN {
+        store8(ipad + i, int_xor(load8(k_block + i), 54))
+        store8(opad + i, int_xor(load8(k_block + i), 92))
+        i = i + 1
+    }
+    let inner_in = alloc(_STUN_SHA1_BLOCK_LEN + msg_n + 1)
+    i = 0
+    while i < _STUN_SHA1_BLOCK_LEN {
+        store8(inner_in + i, load8(ipad + i))
+        i = i + 1
+    }
+    let m = 0
+    while m < msg_n {
+        store8(inner_in + _STUN_SHA1_BLOCK_LEN + m, load8(msg_buf + m))
+        m = m + 1
+    }
+    let inner = stun_sha1(inner_in, _STUN_SHA1_BLOCK_LEN + msg_n)
+    let outer_in = alloc(_STUN_SHA1_BLOCK_LEN + _STUN_SHA1_HASH_LEN + 1)
+    i = 0
+    while i < _STUN_SHA1_BLOCK_LEN {
+        store8(outer_in + i, load8(opad + i))
+        i = i + 1
+    }
+    i = 0
+    while i < _STUN_SHA1_HASH_LEN {
+        store8(outer_in + _STUN_SHA1_BLOCK_LEN + i, load8(inner + i))
+        i = i + 1
+    }
+    return stun_sha1(outer_in,
+                     _STUN_SHA1_BLOCK_LEN + _STUN_SHA1_HASH_LEN)
+}
+
+// ============================================================================
+//                         CRC32  (IEEE 802.3)
+// ============================================================================
+
+fn _stun_crc32_byte(c, b) {
+    let v = _stun_xor32(c, b)
+    let i = 0
+    while i < 8 {
+        let mask = 0
+        if int_and(v, 1) == 1 { mask = 3988292384 }
+        v = _stun_xor32(int_shr(v, 1), mask)
+        i = i + 1
+    }
+    return v
+}
+
+fn stun_crc32(buf, n) {
+    let c = 4294967295
+    let i = 0
+    while i < n {
+        c = _stun_crc32_byte(c, load8(buf + i))
+        i = i + 1
+    }
+    return _stun_xor32(c, 4294967295)
+}
+
+// ============================================================================
+//                         Transaction-id helpers
+// ============================================================================
+
+let _STUN_TXN_COUNTER_START = 305419896
+
+fn _stun_txn_alloc_counter(state) {
+    let cnt = state[_STUN_S_TXN_COUNTER]
+    state[_STUN_S_TXN_COUNTER] = cnt + 1
+    let buf = alloc(STUN_TXN_ID_LEN + 1)
+    let i = 0
+    while i < STUN_TXN_ID_LEN {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    let v = cnt
+    let k = 0
+    while k < 8 {
+        store8(buf + STUN_TXN_ID_LEN - 1 - k, int_and(v, 255))
+        v = int_shr(v, 8)
+        k = k + 1
+    }
+    store8(buf + STUN_TXN_ID_LEN, 0)
+    return buf
+}
+
+fn stun_txn_id_copy(src) {
+    let buf = alloc(STUN_TXN_ID_LEN + 1)
+    let i = 0
+    while i < STUN_TXN_ID_LEN {
+        store8(buf + i, load8(src + i))
+        i = i + 1
+    }
+    store8(buf + STUN_TXN_ID_LEN, 0)
+    return buf
+}
+
+fn stun_txn_id_eq(a, b) {
+    let i = 0
+    while i < STUN_TXN_ID_LEN {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                         stun_state_t record
+// ============================================================================
+
+let _STUN_S_TXN_COUNTER     = 0
+let _STUN_S_USERNAME        = 1
+let _STUN_S_PASSWORD        = 2
+let _STUN_S_PENDING         = 3
+let _STUN_S_LAST_ERROR      = 4
+let _STUN_S_REQUESTS_SENT   = 5
+let _STUN_S_RESPONSES_OK    = 6
+let _STUN_S_RESPONSES_ERR   = 7
+let _STUN_S_RESPONSES_BAD   = 8
+
+fn stun_init() {
+    let st = list_new()
+    push(st, _STUN_TXN_COUNTER_START)
+    push(st, "")
+    push(st, "")
+    push(st, list_new())
+    push(st, "")
+    push(st, 0)
+    push(st, 0)
+    push(st, 0)
+    push(st, 0)
+    return st
+}
+
+fn stun_set_credentials(state, username, password) {
+    state[_STUN_S_USERNAME] = username
+    state[_STUN_S_PASSWORD] = password
+    return 0
+}
+
+fn stun_state_get_last_error(state) { return state[_STUN_S_LAST_ERROR] }
+fn stun_state_requests_sent(state)  { return state[_STUN_S_REQUESTS_SENT] }
+fn stun_state_responses_ok(state)   { return state[_STUN_S_RESPONSES_OK] }
+fn stun_state_responses_err(state)  { return state[_STUN_S_RESPONSES_ERR] }
+fn stun_state_responses_bad(state)  { return state[_STUN_S_RESPONSES_BAD] }
+fn stun_state_pending_count(state)  { return len(state[_STUN_S_PENDING]) }
+
+// ============================================================================
+//                         Attribute builders
+// ============================================================================
+
+fn _stun_emit_attr_str(buf, off, attr_type, value, value_n) {
+    _stun_put_u16(buf, off, attr_type)
+    _stun_put_u16(buf, off + 2, value_n)
+    let i = 0
+    while i < value_n {
+        store8(buf + off + 4 + i, char_at(value, i))
+        i = i + 1
+    }
+    let pad_to = _stun_pad4(value_n)
+    let j = value_n
+    while j < pad_to {
+        store8(buf + off + 4 + j, 0)
+        j = j + 1
+    }
+    return off + 4 + pad_to
+}
+
+fn _stun_emit_xor_mapped_address(buf, off, family, port, addr_buf, txn_id_buf) {
+    if family == STUN_FAMILY_IPV4 {
+        _stun_put_u16(buf, off + 0, STUN_ATTR_XOR_MAPPED_ADDRESS)
+        _stun_put_u16(buf, off + 2, 8)
+        store8(buf + off + 4, 0)
+        store8(buf + off + 5, STUN_FAMILY_IPV4)
+        let cookie_hi = int_and(int_shr(STUN_MAGIC_COOKIE, 16), 65535)
+        _stun_put_u16(buf, off + 6, int_xor(port, cookie_hi))
+        let i = 0
+        while i < 4 {
+            let cookie_byte = int_and(int_shr(STUN_MAGIC_COOKIE, (3 - i) * 8), 255)
+            store8(buf + off + 8 + i,
+                   int_xor(load8(addr_buf + i), cookie_byte))
+            i = i + 1
+        }
+        return off + 12
+    }
+    if family == STUN_FAMILY_IPV6 {
+        _stun_put_u16(buf, off + 0, STUN_ATTR_XOR_MAPPED_ADDRESS)
+        _stun_put_u16(buf, off + 2, 20)
+        store8(buf + off + 4, 0)
+        store8(buf + off + 5, STUN_FAMILY_IPV6)
+        let cookie_hi = int_and(int_shr(STUN_MAGIC_COOKIE, 16), 65535)
+        _stun_put_u16(buf, off + 6, int_xor(port, cookie_hi))
+        let i = 0
+        while i < 4 {
+            let cookie_byte = int_and(int_shr(STUN_MAGIC_COOKIE, (3 - i) * 8), 255)
+            store8(buf + off + 8 + i,
+                   int_xor(load8(addr_buf + i), cookie_byte))
+            i = i + 1
+        }
+        let j = 0
+        while j < 12 {
+            store8(buf + off + 12 + j,
+                   int_xor(load8(addr_buf + 4 + j), load8(txn_id_buf + j)))
+            j = j + 1
+        }
+        return off + 24
+    }
+    return off
+}
+
+// ============================================================================
+//                         Header builders + patchers
+// ============================================================================
+
+fn _stun_put_header(buf, msg_type, msg_length, txn_id_buf) {
+    _stun_put_u16(buf, 0, msg_type)
+    _stun_put_u16(buf, 2, msg_length)
+    _stun_put_u32(buf, 4, STUN_MAGIC_COOKIE)
+    let i = 0
+    while i < STUN_TXN_ID_LEN {
+        store8(buf + 8 + i, load8(txn_id_buf + i))
+        i = i + 1
+    }
+    return 1
+}
+
+fn _stun_patch_length(buf, new_len) {
+    _stun_put_u16(buf, 2, new_len)
+    return 1
+}
+
+// ============================================================================
+//                         Build: Binding Request
+// ============================================================================
+
+fn _stun_attr_size(value_len) {
+    return 4 + _stun_pad4(value_len)
+}
+
+fn _stun_str_to_buf(s, n) {
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+fn stun_msg_build_request(software, txn_id_buf, username, password,
+                          add_fingerprint) {
+    let software_n = len(software)
+    let username_n = len(username)
+    let password_n = len(password)
+    let has_software = 0
+    if software_n > 0 { has_software = 1 }
+    let has_username = 0
+    if username_n > 0 { has_username = 1 }
+    let has_integrity = 0
+    if has_username == 1 {
+        if password_n > 0 { has_integrity = 1 }
+    }
+    let has_fp = 0
+    if add_fingerprint != 0 { has_fp = 1 }
+    let body = 0
+    if has_software == 1   { body = body + _stun_attr_size(software_n) }
+    if has_username == 1   { body = body + _stun_attr_size(username_n) }
+    if has_integrity == 1  { body = body + _stun_attr_size(STUN_INTEGRITY_LEN) }
+    if has_fp == 1         { body = body + _stun_attr_size(STUN_FINGERPRINT_LEN) }
+    let total = STUN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    let z = 0
+    while z < total {
+        store8(buf + z, 0)
+        z = z + 1
+    }
+    _stun_put_header(buf, STUN_TYPE_BINDING_REQUEST, body, txn_id_buf)
+    let off = STUN_HDR_LEN
+    if has_software == 1 {
+        off = _stun_emit_attr_str(buf, off, STUN_ATTR_SOFTWARE,
+                                  software, software_n)
+    }
+    if has_username == 1 {
+        off = _stun_emit_attr_str(buf, off, STUN_ATTR_USERNAME,
+                                  username, username_n)
+    }
+    if has_integrity == 1 {
+        let mi_attr_size = _stun_attr_size(STUN_INTEGRITY_LEN)
+        let mi_len_field = (off - STUN_HDR_LEN) + mi_attr_size
+        _stun_patch_length(buf, mi_len_field)
+        _stun_put_u16(buf, off + 0, STUN_ATTR_MESSAGE_INTEGRITY)
+        _stun_put_u16(buf, off + 2, STUN_INTEGRITY_LEN)
+        let key_buf = _stun_str_to_buf(password, password_n)
+        let mac = stun_hmac_sha1(key_buf, password_n, buf, off)
+        let i = 0
+        while i < STUN_INTEGRITY_LEN {
+            store8(buf + off + 4 + i, load8(mac + i))
+            i = i + 1
+        }
+        off = off + mi_attr_size
+    }
+    if has_fp == 1 {
+        let fp_attr_size = _stun_attr_size(STUN_FINGERPRINT_LEN)
+        let fp_len_field = (off - STUN_HDR_LEN) + fp_attr_size
+        _stun_patch_length(buf, fp_len_field)
+        let crc = stun_crc32(buf, off)
+        let value = _stun_xor32(crc, STUN_FINGERPRINT_XOR)
+        _stun_put_u16(buf, off + 0, STUN_ATTR_FINGERPRINT)
+        _stun_put_u16(buf, off + 2, STUN_FINGERPRINT_LEN)
+        _stun_put_u32(buf, off + 4, value)
+        off = off + fp_attr_size
+    }
+    _stun_patch_length(buf, off - STUN_HDR_LEN)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                         Build: Binding Success Response
+// ============================================================================
+
+fn stun_msg_build_success_response_ipv4(txn_id_buf, ipv4_buf, port,
+                                        software, username, password,
+                                        add_fingerprint) {
+    return _stun_build_response(STUN_TYPE_BINDING_SUCCESS_RESPONSE,
+                                txn_id_buf, STUN_FAMILY_IPV4,
+                                ipv4_buf, port, software, username,
+                                password, add_fingerprint)
+}
+
+fn stun_msg_build_success_response_ipv6(txn_id_buf, ipv6_buf, port,
+                                        software, username, password,
+                                        add_fingerprint) {
+    return _stun_build_response(STUN_TYPE_BINDING_SUCCESS_RESPONSE,
+                                txn_id_buf, STUN_FAMILY_IPV6,
+                                ipv6_buf, port, software, username,
+                                password, add_fingerprint)
+}
+
+fn _stun_build_response(msg_type, txn_id_buf, family, addr_buf, port,
+                        software, username, password, add_fingerprint) {
+    let software_n = len(software)
+    let username_n = len(username)
+    let password_n = len(password)
+    let has_software = 0
+    if software_n > 0 { has_software = 1 }
+    let has_username = 0
+    if username_n > 0 { has_username = 1 }
+    let has_integrity = 0
+    if has_username == 1 {
+        if password_n > 0 { has_integrity = 1 }
+    }
+    let has_fp = 0
+    if add_fingerprint != 0 { has_fp = 1 }
+    let xor_addr_size = 12
+    if family == STUN_FAMILY_IPV6 { xor_addr_size = 24 }
+    let body = xor_addr_size
+    if has_software == 1  { body = body + _stun_attr_size(software_n) }
+    if has_username == 1  { body = body + _stun_attr_size(username_n) }
+    if has_integrity == 1 { body = body + _stun_attr_size(STUN_INTEGRITY_LEN) }
+    if has_fp == 1        { body = body + _stun_attr_size(STUN_FINGERPRINT_LEN) }
+    let total = STUN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    let z = 0
+    while z < total {
+        store8(buf + z, 0)
+        z = z + 1
+    }
+    _stun_put_header(buf, msg_type, body, txn_id_buf)
+    let off = STUN_HDR_LEN
+    off = _stun_emit_xor_mapped_address(buf, off, family, port,
+                                        addr_buf, txn_id_buf)
+    if has_software == 1 {
+        off = _stun_emit_attr_str(buf, off, STUN_ATTR_SOFTWARE,
+                                  software, software_n)
+    }
+    if has_username == 1 {
+        off = _stun_emit_attr_str(buf, off, STUN_ATTR_USERNAME,
+                                  username, username_n)
+    }
+    if has_integrity == 1 {
+        let mi_attr_size = _stun_attr_size(STUN_INTEGRITY_LEN)
+        let mi_len_field = (off - STUN_HDR_LEN) + mi_attr_size
+        _stun_patch_length(buf, mi_len_field)
+        _stun_put_u16(buf, off + 0, STUN_ATTR_MESSAGE_INTEGRITY)
+        _stun_put_u16(buf, off + 2, STUN_INTEGRITY_LEN)
+        let key_buf = _stun_str_to_buf(password, password_n)
+        let mac = stun_hmac_sha1(key_buf, password_n, buf, off)
+        let i = 0
+        while i < STUN_INTEGRITY_LEN {
+            store8(buf + off + 4 + i, load8(mac + i))
+            i = i + 1
+        }
+        off = off + mi_attr_size
+    }
+    if has_fp == 1 {
+        let fp_attr_size = _stun_attr_size(STUN_FINGERPRINT_LEN)
+        let fp_len_field = (off - STUN_HDR_LEN) + fp_attr_size
+        _stun_patch_length(buf, fp_len_field)
+        let crc = stun_crc32(buf, off)
+        let value = _stun_xor32(crc, STUN_FINGERPRINT_XOR)
+        _stun_put_u16(buf, off + 0, STUN_ATTR_FINGERPRINT)
+        _stun_put_u16(buf, off + 2, STUN_FINGERPRINT_LEN)
+        _stun_put_u32(buf, off + 4, value)
+        off = off + fp_attr_size
+    }
+    _stun_patch_length(buf, off - STUN_HDR_LEN)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+fn stun_msg_build_error_response(txn_id_buf, class_num, number, reason) {
+    let reason_n = len(reason)
+    if reason_n > 256 { reason_n = 256 }
+    let err_value_n = 4 + reason_n
+    let body = _stun_attr_size(err_value_n)
+    let total = STUN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    let z = 0
+    while z < total {
+        store8(buf + z, 0)
+        z = z + 1
+    }
+    _stun_put_header(buf, STUN_TYPE_BINDING_ERROR_RESPONSE, body, txn_id_buf)
+    let off = STUN_HDR_LEN
+    _stun_put_u16(buf, off + 0, STUN_ATTR_ERROR_CODE)
+    _stun_put_u16(buf, off + 2, err_value_n)
+    store8(buf + off + 4, 0)
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, int_and(class_num, 7))
+    store8(buf + off + 7, int_and(number, 255))
+    let i = 0
+    while i < reason_n {
+        store8(buf + off + 8 + i, char_at(reason, i))
+        i = i + 1
+    }
+    let total_off = off + _stun_attr_size(err_value_n)
+    _stun_patch_length(buf, total_off - STUN_HDR_LEN)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, total_off)
+    return out
+}
+
+// ============================================================================
+//                         Parse: STUN message
+// ============================================================================
+
+fn stun_msg_get_type(buf)   { return _stun_get_u16(buf, 0) }
+fn stun_msg_get_length(buf) { return _stun_get_u16(buf, 2) }
+fn stun_msg_get_cookie(buf) { return _stun_get_u32(buf, 4) }
+fn stun_msg_get_txn_id(buf) { return buf + 8 }
+
+fn stun_msg_parse(buf, n) {
+    if n < STUN_HDR_LEN { return STUN_ERR_BAD_HEADER }
+    let msg_type = _stun_get_u16(buf, 0)
+    if int_and(msg_type, 49152) != 0 { return STUN_ERR_BAD_HEADER }
+    let length = _stun_get_u16(buf, 2)
+    let cookie = _stun_get_u32(buf, 4)
+    if cookie != STUN_MAGIC_COOKIE { return STUN_ERR_BAD_COOKIE }
+    if length + STUN_HDR_LEN > n { return STUN_ERR_BAD_LENGTH }
+    if int_and(length, 3) != 0 { return STUN_ERR_BAD_LENGTH }
+    let txn_id_ptr = buf + 8
+    let attrs = list_new()
+    let off = STUN_HDR_LEN
+    let end = STUN_HDR_LEN + length
+    while off < end {
+        if off + STUN_ATTR_HDR_LEN > end { return STUN_ERR_BAD_ATTR }
+        let attr_type = _stun_get_u16(buf, off + 0)
+        let attr_len  = _stun_get_u16(buf, off + 2)
+        let pad_attr_len = _stun_pad4(attr_len)
+        if off + STUN_ATTR_HDR_LEN + pad_attr_len > end {
+            return STUN_ERR_BAD_ATTR
+        }
+        let attr_rec = list_new()
+        push(attr_rec, attr_type)
+        push(attr_rec, buf + off + STUN_ATTR_HDR_LEN)
+        push(attr_rec, attr_len)
+        push(attrs, attr_rec)
+        off = off + STUN_ATTR_HDR_LEN + pad_attr_len
+    }
+    let out = list_new()
+    push(out, msg_type)
+    push(out, length)
+    push(out, txn_id_ptr)
+    push(out, attrs)
+    return out
+}
+
+fn stun_msg_find_attr(parsed, attr_type) {
+    let attrs = parsed[3]
+    let i = 0
+    while i < len(attrs) {
+        if attrs[i][0] == attr_type { return attrs[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn stun_decode_xor_mapped_address(value_ptr, value_n, txn_id_ptr) {
+    if value_n < 8 { return 0 }
+    let family = load8(value_ptr + 1)
+    let cookie_hi = int_and(int_shr(STUN_MAGIC_COOKIE, 16), 65535)
+    let x_port = _stun_get_u16(value_ptr, 2)
+    let port = int_xor(x_port, cookie_hi)
+    if family == STUN_FAMILY_IPV4 {
+        if value_n != 8 { return 0 }
+        let b0 = int_xor(load8(value_ptr + 4),
+                         int_and(int_shr(STUN_MAGIC_COOKIE, 24), 255))
+        let b1 = int_xor(load8(value_ptr + 5),
+                         int_and(int_shr(STUN_MAGIC_COOKIE, 16), 255))
+        let b2 = int_xor(load8(value_ptr + 6),
+                         int_and(int_shr(STUN_MAGIC_COOKIE, 8), 255))
+        let b3 = int_xor(load8(value_ptr + 7),
+                         int_and(STUN_MAGIC_COOKIE, 255))
+        let ip = int_to_str(b0) + "." + int_to_str(b1) + "."
+            + int_to_str(b2) + "." + int_to_str(b3)
+        let out = list_new()
+        push(out, family)
+        push(out, ip)
+        push(out, port)
+        return out
+    }
+    if family == STUN_FAMILY_IPV6 {
+        if value_n != 20 { return 0 }
+        let raw = alloc(17)
+        let i = 0
+        while i < 4 {
+            let cookie_byte = int_and(int_shr(STUN_MAGIC_COOKIE, (3 - i) * 8), 255)
+            store8(raw + i, int_xor(load8(value_ptr + 4 + i), cookie_byte))
+            i = i + 1
+        }
+        let j = 0
+        while j < 12 {
+            store8(raw + 4 + j,
+                   int_xor(load8(value_ptr + 8 + j), load8(txn_id_ptr + j)))
+            j = j + 1
+        }
+        store8(raw + 16, 0)
+        let ip = _stun_ipv6_to_string(raw)
+        let out = list_new()
+        push(out, family)
+        push(out, ip)
+        push(out, port)
+        return out
+    }
+    return 0
+}
+
+fn _stun_hex_nibble(n) {
+    if n < 10 { return n + 48 }
+    return n + 87
+}
+
+fn _stun_ipv6_to_string(addr_buf) {
+    let s = ""
+    let group = 0
+    while group < 8 {
+        let hi = load8(addr_buf + group * 2 + 0)
+        let lo = load8(addr_buf + group * 2 + 1)
+        let v = int_or(int_shl(hi, 8), lo)
+        if v == 0 {
+            s = s + "0"
+        } else {
+            let n3 = int_and(int_shr(v, 12), 15)
+            let n2 = int_and(int_shr(v, 8), 15)
+            let n1 = int_and(int_shr(v, 4), 15)
+            let n0 = int_and(v, 15)
+            let seen = 0
+            if n3 != 0 { s = s + chr(_stun_hex_nibble(n3)); seen = 1 }
+            if seen == 1 { s = s + chr(_stun_hex_nibble(n2)) }
+            if seen == 0 { if n2 != 0 { s = s + chr(_stun_hex_nibble(n2)); seen = 1 } }
+            if seen == 1 { s = s + chr(_stun_hex_nibble(n1)) }
+            if seen == 0 { if n1 != 0 { s = s + chr(_stun_hex_nibble(n1)); seen = 1 } }
+            s = s + chr(_stun_hex_nibble(n0))
+        }
+        if group < 7 { s = s + ":" }
+        group = group + 1
+    }
+    return s
+}
+
+fn stun_decode_error_code(value_ptr, value_n) {
+    if value_n < 4 { return 0 }
+    let class_num = int_and(load8(value_ptr + 2), 7)
+    let number    = load8(value_ptr + 3)
+    let code = class_num * 100 + number
+    let reason = ""
+    let i = 4
+    while i < value_n {
+        reason = reason + chr(load8(value_ptr + i))
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, code)
+    push(out, reason)
+    return out
+}
+
+// ============================================================================
+//                         MESSAGE-INTEGRITY verify
+// ============================================================================
+
+fn stun_verify_message_integrity(buf, n, password) {
+    let parsed = stun_msg_parse(buf, n)
+    if str_eq(parsed, STUN_ERR_BAD_HEADER)  == 1 { return 0 }
+    if str_eq(parsed, STUN_ERR_BAD_COOKIE)  == 1 { return 0 }
+    if str_eq(parsed, STUN_ERR_BAD_LENGTH)  == 1 { return 0 }
+    if str_eq(parsed, STUN_ERR_BAD_ATTR)    == 1 { return 0 }
+    let length = _stun_get_u16(buf, 2)
+    let mi_off = -1
+    let off = STUN_HDR_LEN
+    let end = STUN_HDR_LEN + length
+    while off < end {
+        let attr_type = _stun_get_u16(buf, off + 0)
+        let attr_len  = _stun_get_u16(buf, off + 2)
+        if attr_type == STUN_ATTR_MESSAGE_INTEGRITY {
+            mi_off = off
+            off = end
+        } else {
+            off = off + STUN_ATTR_HDR_LEN + _stun_pad4(attr_len)
+        }
+    }
+    if mi_off < 0 { return 0 }
+    let orig_length = _stun_get_u16(buf, 2)
+    let patched_len = (mi_off - STUN_HDR_LEN) + _stun_attr_size(STUN_INTEGRITY_LEN)
+    _stun_patch_length(buf, patched_len)
+    let password_n = len(password)
+    let key_buf = _stun_str_to_buf(password, password_n)
+    let mac = stun_hmac_sha1(key_buf, password_n, buf, mi_off)
+    _stun_patch_length(buf, orig_length)
+    let i = 0
+    while i < STUN_INTEGRITY_LEN {
+        if load8(buf + mi_off + STUN_ATTR_HDR_LEN + i) != load8(mac + i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                         FINGERPRINT verify
+// ============================================================================
+
+fn stun_verify_fingerprint(buf, n) {
+    let parsed = stun_msg_parse(buf, n)
+    if str_eq(parsed, STUN_ERR_BAD_HEADER)  == 1 { return 0 }
+    if str_eq(parsed, STUN_ERR_BAD_COOKIE)  == 1 { return 0 }
+    if str_eq(parsed, STUN_ERR_BAD_LENGTH)  == 1 { return 0 }
+    if str_eq(parsed, STUN_ERR_BAD_ATTR)    == 1 { return 0 }
+    let length = _stun_get_u16(buf, 2)
+    let fp_off = -1
+    let off = STUN_HDR_LEN
+    let end = STUN_HDR_LEN + length
+    while off < end {
+        let attr_type = _stun_get_u16(buf, off + 0)
+        let attr_len  = _stun_get_u16(buf, off + 2)
+        if attr_type == STUN_ATTR_FINGERPRINT {
+            fp_off = off
+            off = end
+        } else {
+            off = off + STUN_ATTR_HDR_LEN + _stun_pad4(attr_len)
+        }
+    }
+    if fp_off < 0 { return 0 }
+    let crc = stun_crc32(buf, fp_off)
+    let expected = _stun_xor32(crc, STUN_FINGERPRINT_XOR)
+    let on_wire = _stun_get_u32(buf, fp_off + STUN_ATTR_HDR_LEN)
+    if expected != on_wire { return 0 }
+    return 1
+}
+
+// ============================================================================
+//                         Public client API
+// ============================================================================
+
+fn stun_send_binding_request(state, remote_addr, software) {
+    let txn_id = _stun_txn_alloc_counter(state)
+    let username = state[_STUN_S_USERNAME]
+    let password = state[_STUN_S_PASSWORD]
+    let pkt = stun_msg_build_request(software, txn_id, username, password, 1)
+    let rec = list_new()
+    push(rec, txn_id)
+    push(rec, remote_addr)
+    push(state[_STUN_S_PENDING], rec)
+    state[_STUN_S_REQUESTS_SENT] = state[_STUN_S_REQUESTS_SENT] + 1
+    let out = list_new()
+    push(out, pkt[0])
+    push(out, pkt[1])
+    push(out, txn_id)
+    return out
+}
+
+fn stun_recv(state, pkt_buf, pkt_n) {
+    let parsed = stun_msg_parse(pkt_buf, pkt_n)
+    if str_eq(parsed, STUN_ERR_BAD_HEADER)  == 1 {
+        state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+        state[_STUN_S_LAST_ERROR] = STUN_ERR_BAD_HEADER
+        let r = list_new()
+        push(r, STUN_RES_BAD)
+        return r
+    }
+    if str_eq(parsed, STUN_ERR_BAD_COOKIE)  == 1 {
+        state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+        state[_STUN_S_LAST_ERROR] = STUN_ERR_BAD_COOKIE
+        let r = list_new()
+        push(r, STUN_RES_BAD)
+        return r
+    }
+    if str_eq(parsed, STUN_ERR_BAD_LENGTH)  == 1 {
+        state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+        state[_STUN_S_LAST_ERROR] = STUN_ERR_BAD_LENGTH
+        let r = list_new()
+        push(r, STUN_RES_BAD)
+        return r
+    }
+    if str_eq(parsed, STUN_ERR_BAD_ATTR)    == 1 {
+        state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+        state[_STUN_S_LAST_ERROR] = STUN_ERR_BAD_ATTR
+        let r = list_new()
+        push(r, STUN_RES_BAD)
+        return r
+    }
+    let msg_type = parsed[0]
+    let txn_ptr = parsed[2]
+    let pending = state[_STUN_S_PENDING]
+    let match_idx = -1
+    let i = 0
+    while i < len(pending) {
+        if stun_txn_id_eq(pending[i][0], txn_ptr) == 1 {
+            match_idx = i
+            i = len(pending)
+        } else {
+            i = i + 1
+        }
+    }
+    if match_idx < 0 {
+        state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+        state[_STUN_S_LAST_ERROR] = STUN_ERR_TXN_MISMATCH
+        let r = list_new()
+        push(r, STUN_RES_BAD)
+        return r
+    }
+    let new_pending = list_new()
+    let j = 0
+    while j < len(pending) {
+        if j != match_idx { push(new_pending, pending[j]) }
+        j = j + 1
+    }
+    state[_STUN_S_PENDING] = new_pending
+    if msg_type == STUN_TYPE_BINDING_SUCCESS_RESPONSE {
+        let xma = stun_msg_find_attr(parsed, STUN_ATTR_XOR_MAPPED_ADDRESS)
+        if xma == 0 {
+            state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+            state[_STUN_S_LAST_ERROR] = STUN_ERR_NO_ATTR
+            let r = list_new()
+            push(r, STUN_RES_BAD)
+            return r
+        }
+        let dec = stun_decode_xor_mapped_address(xma[1], xma[2], txn_ptr)
+        if dec == 0 {
+            state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+            state[_STUN_S_LAST_ERROR] = STUN_ERR_UNKNOWN_FAMILY
+            let r = list_new()
+            push(r, STUN_RES_BAD)
+            return r
+        }
+        state[_STUN_S_RESPONSES_OK] = state[_STUN_S_RESPONSES_OK] + 1
+        let r = list_new()
+        push(r, STUN_RES_OK)
+        push(r, dec[1])
+        push(r, dec[2])
+        push(r, dec[0])
+        push(r, 1)
+        return r
+    }
+    if msg_type == STUN_TYPE_BINDING_ERROR_RESPONSE {
+        let ec = stun_msg_find_attr(parsed, STUN_ATTR_ERROR_CODE)
+        if ec == 0 {
+            state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+            state[_STUN_S_LAST_ERROR] = STUN_ERR_NO_ATTR
+            let r = list_new()
+            push(r, STUN_RES_BAD)
+            return r
+        }
+        let dec = stun_decode_error_code(ec[1], ec[2])
+        state[_STUN_S_RESPONSES_ERR] = state[_STUN_S_RESPONSES_ERR] + 1
+        let r = list_new()
+        push(r, STUN_RES_ERR)
+        push(r, dec[0])
+        push(r, dec[1])
+        push(r, 1)
+        return r
+    }
+    state[_STUN_S_RESPONSES_BAD] = state[_STUN_S_RESPONSES_BAD] + 1
+    state[_STUN_S_LAST_ERROR] = STUN_ERR_BAD_HEADER
+    let r = list_new()
+    push(r, STUN_RES_BAD)
+    return r
+}
+
+// ============================================================================
+//                         IP / hex string helpers
+// ============================================================================
+
+fn _stun_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn stun_ipv4_str_to_buf(ip_str) {
+    let n = len(ip_str)
+    let parts = list_new()
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(ip_str, i) == 46 {
+            push(parts, substr(ip_str, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(ip_str, start, n - start))
+    if len(parts) != 4 { return 0 }
+    let buf = alloc(5)
+    let j = 0
+    while j < 4 {
+        let s = parts[j]
+        let s_n = len(s)
+        if s_n == 0 { return 0 }
+        let k = 0
+        while k < s_n {
+            if _stun_is_digit(char_at(s, k)) == 0 { return 0 }
+            k = k + 1
+        }
+        let v = str_to_int(s)
+        if v < 0 { return 0 }
+        if v > 255 { return 0 }
+        store8(buf + j, v)
+        j = j + 1
+    }
+    store8(buf + 4, 0)
+    return buf
+}
+
+fn stun_ipv6_groups_to_buf(groups) {
+    if len(groups) != 8 { return 0 }
+    let buf = alloc(17)
+    let i = 0
+    while i < 8 {
+        let v = groups[i]
+        store8(buf + i * 2 + 0, int_and(int_shr(v, 8), 255))
+        store8(buf + i * 2 + 1, int_and(v, 255))
+        i = i + 1
+    }
+    store8(buf + 16, 0)
+    return buf
+}
+
+fn _stun_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87
+}
+
+fn stun_hex_encode(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = load8(buf + i)
+        let hi = _stun_nibble_hex(int_and(int_shr(b, 4), 15))
+        let lo = _stun_nibble_hex(int_and(b, 15))
+        s = s + chr(hi) + chr(lo)
+        i = i + 1
+    }
+    return s
+}
+
+fn _stun_hex_nibble_in(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }
+    if c >= 97 { if c <= 102 { return c - 87 } }
+    if c >= 65 { if c <= 70  { return c - 55 } }
+    return 0 - 1
+}
+
+fn stun_hex_decode(s) {
+    let n = len(s)
+    if n == 0 { return 0 }
+    if int_shl(int_shr(n, 1), 1) != n { return 0 }
+    let half = int_shr(n, 1)
+    let buf = alloc(half + 1)
+    let i = 0
+    while i < half {
+        let hi_c = char_at(s, i * 2)
+        let lo_c = char_at(s, i * 2 + 1)
+        let hi = _stun_hex_nibble_in(hi_c)
+        let lo = _stun_hex_nibble_in(lo_c)
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        store8(buf + i, int_or(int_shl(hi, 4), lo))
+        i = i + 1
+    }
+    store8(buf + half, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, half)
+    return out
+}
+
+// ============================================================================
+//                         Diagnostic / status line
+// ============================================================================
+
+fn stun_status_line(state) {
+    if state == 0 { return "stun: <no state>" }
+    return "stun: pending=" + int_to_str(len(state[_STUN_S_PENDING]))
+        + " sent=" + int_to_str(state[_STUN_S_REQUESTS_SENT])
+        + " ok=" + int_to_str(state[_STUN_S_RESPONSES_OK])
+        + " err=" + int_to_str(state[_STUN_S_RESPONSES_ERR])
+        + " bad=" + int_to_str(state[_STUN_S_RESPONSES_BAD])
+}
+
+// ============================================================================
+//                  Test-only shims (exposed for the unit suite)
+// ============================================================================
+
+fn _stun_test_put_u16(buf, off, v) { return _stun_put_u16(buf, off, v) }
+fn _stun_test_get_u16(buf, off)    { return _stun_get_u16(buf, off) }
+fn _stun_test_put_u32(buf, off, v) { return _stun_put_u32(buf, off, v) }
+fn _stun_test_get_u32(buf, off)    { return _stun_get_u32(buf, off) }
+fn _stun_test_pad4(n)              { return _stun_pad4(n) }
+fn _stun_test_attr_size(value_len) { return _stun_attr_size(value_len) }
+fn _stun_test_str_to_buf(s, n)     { return _stun_str_to_buf(s, n) }
+fn _stun_test_alloc_txn(state)     { return _stun_txn_alloc_counter(state) }

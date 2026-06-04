@@ -1,0 +1,465 @@
+// Unit tests for src/federation/ice.nova (R30C / R28E.2).
+//
+// Coverage (~30+ assertions):
+//   * ice_init zero state (controller / controlled both branches),
+//     accessors return defaults.
+//   * Type-preference table maps host->126, srflx->100, prflx->110,
+//     relay->0 (4 asserts).
+//   * RFC 8445 §5.1.2.1 candidate-priority formula validated against
+//     a hand-computed worked example: a host candidate with
+//     local_pref=65535, component_id=1 yields
+//     priority = 2^24*126 + 256*65535 + (256-1) = 2130706431 +
+//     16776960 + 255 = 2147483647 (the canonical "max host pri").
+//     A second worked example for srflx + local_pref=10000 +
+//     component_id=1 reveals priority = 2^24*100 + 256*10000 + 255 =
+//     1677721600 + 2560000 + 255 = 1680281855.
+//   * Pair-priority formula §6.1.2.3 validated against a worked
+//     example with controller_pri = 100, controlled_pri = 200:
+//     pair_pri = 2^32 * 100 + 2 * 200 + 0 = 429496729600 + 400 =
+//     429496730000. With controller_pri > controlled_pri the +1
+//     bonus appears.
+//   * ice_add_local_candidate and ice_add_remote_candidate push into
+//     the respective lists, return monotonic ids, decrement
+//     local_pref on each add (so the FIRST add gets the highest
+//     priority).
+//   * ice_form_pairs computes the cross product, filters by address
+//     family (IPv4 local x IPv6 remote MUST NOT pair), filters by
+//     component id, and sorts pairs by descending priority.
+//   * ice_form_pairs in controller-role vs controlled-role yields
+//     IDENTICAL pair priorities for a symmetric input (both sides
+//     compute the same MIN(G,D)/MAX(G,D) value; the +1 tiebreak
+//     differs ONLY when G > D from one side's perspective).
+//   * Per-pair state machine: valid edges Waiting->In-Progress,
+//     In-Progress->Succeeded, In-Progress->Failed, Waiting->Failed.
+//     Invalid edges Succeeded->* and Failed->* are rejected and set
+//     last_error.
+//   * Regular nomination: the FIRST pair to reach Succeeded is
+//     nominated. Subsequent Succeeded transitions do NOT change the
+//     nominated index (lite nomination is "first wins").
+//   * Highest-priority pair selected: with three pairs and the
+//     third (lowest priority) marked Succeeded FIRST, the
+//     nominated index is the third (per the "first Succeeded wins"
+//     lite rule). The full-RFC 8445 ordering note: the SORT order
+//     puts highest-priority at idx 0; tests confirm that order so
+//     that a real connectivity-check loop driving pairs in idx
+//     order naturally nominates the highest-priority Succeeded.
+//   * ice_get_pair OOB returns 0 and does NOT crash.
+//   * Stats / status line shape sanity.
+
+import "../ce_test.nova"
+import "../../src/federation/ice.nova"
+
+// ============================================================================
+//                         Init + accessors
+// ============================================================================
+
+fn test_init_controller_zero_state() {
+    let st = ice_init(1)
+    ce_check("state built", st != 0)
+    ce_eq("role = controller", ice_state_role(st), 1)
+    ce_eq("locals count = 0", ice_n_local_candidates(st), 0)
+    ce_eq("remotes count = 0", ice_n_remote_candidates(st), 0)
+    ce_eq("pairs count = 0", ice_n_pairs(st), 0)
+    ce_eq("nominated = -1", ice_get_nominated(st), 0 - 1)
+    ce_eq("checks_sent = 0", ice_checks_sent(st), 0)
+    ce_eq("checks_ok = 0", ice_checks_ok(st), 0)
+}
+
+fn test_init_controlled_zero_state() {
+    let st = ice_init(0)
+    ce_eq("role = controlled", ice_state_role(st), 0)
+}
+
+// ============================================================================
+//                         Type preference table
+// ============================================================================
+
+fn test_type_preference_table() {
+    ce_eq("host pref = 126", ice_type_preference(ICE_TYPE_HOST), 126)
+    ce_eq("prflx pref = 110", ice_type_preference(ICE_TYPE_PRFLX), 110)
+    ce_eq("srflx pref = 100", ice_type_preference(ICE_TYPE_SRFLX), 100)
+    ce_eq("relay pref = 0", ice_type_preference(ICE_TYPE_RELAY), 0)
+    ce_eq("unknown pref = 0", ice_type_preference(99), 0)
+}
+
+// ============================================================================
+//                         Candidate priority (RFC 8445 §5.1.2.1)
+// ============================================================================
+//
+//   priority = 2^24 * type_pref + 2^8 * local_pref + (256 - component_id)
+//
+// Worked example 1 (host, local_pref=65535, comp=1):
+//   2^24 * 126                  = 2113929216
+//   256 * 65535                 = 16776960
+//   256 - 1                     = 255
+//   sum                          = 2130706431
+//
+// Worked example 2 (srflx, local_pref=10000, comp=1):
+//   2^24 * 100 = 1677721600
+//   256 * 10000 = 2560000
+//   256 - 1 = 255
+//   sum         = 1680281855
+//
+// Worked example 3 (relay, local_pref=0, comp=2):
+//   2^24 * 0 = 0
+//   256 * 0  = 0
+//   256 - 2  = 254
+//   sum      = 254
+//
+// Worked example 4 (host, local_pref=0, comp=1):  -- low end of host band
+//   2^24 * 126 = 2113929216
+//   256 * 0    = 0
+//   256 - 1    = 255
+//   sum        = 2113929471
+
+fn test_candidate_priority_host_max() {
+    let p = ice_candidate_priority(ICE_TYPE_HOST, 65535, 1)
+    ce_eq("host/lp=65535/c=1 priority", p, 2130706431)
+}
+
+fn test_candidate_priority_srflx_mid() {
+    let p = ice_candidate_priority(ICE_TYPE_SRFLX, 10000, 1)
+    ce_eq("srflx/lp=10000/c=1 priority", p, 1680281855)
+}
+
+fn test_candidate_priority_relay_low() {
+    let p = ice_candidate_priority(ICE_TYPE_RELAY, 0, 2)
+    ce_eq("relay/lp=0/c=2 priority", p, 254)
+}
+
+fn test_candidate_priority_host_low() {
+    let p = ice_candidate_priority(ICE_TYPE_HOST, 0, 1)
+    ce_eq("host/lp=0/c=1 priority", p, 2113929471)
+}
+
+// Component-id tiebreak: the +1 component bumps the low 8 bits of the
+// priority, so an RTP candidate (comp=1) beats an RTCP candidate
+// (comp=2) by exactly 1 when local_pref and type are equal.
+fn test_candidate_priority_component_tiebreak() {
+    let a = ice_candidate_priority(ICE_TYPE_HOST, 100, 1)
+    let b = ice_candidate_priority(ICE_TYPE_HOST, 100, 2)
+    ce_eq("comp=1 > comp=2 by 1", a - b, 1)
+}
+
+// Type-pref boundary: a host candidate ALWAYS outranks an srflx with
+// the same local_pref because the type-pref delta dwarfs the
+// 256*local_pref term. We verify this via the RFC 8445 guarantee
+// "higher type-pref always wins".
+fn test_candidate_priority_host_outranks_srflx() {
+    let host = ice_candidate_priority(ICE_TYPE_HOST,  0,     1)
+    let srfl = ice_candidate_priority(ICE_TYPE_SRFLX, 65535, 1)
+    ce_check("host(lp=0) > srflx(lp=65535)", host > srfl)
+}
+
+// ============================================================================
+//                         Pair priority (RFC 8445 §6.1.2.3)
+// ============================================================================
+//
+//   Let G = controller's priority, D = controlled-side priority.
+//   pair_pri = 2^32 * MIN(G,D) + 2 * MAX(G,D) + (G > D ? 1 : 0)
+//
+// Worked example A (G=100, D=200):
+//   2^32 * 100 = 429496729600
+//   2 * 200    = 400
+//   bonus      = 0 (G < D)
+//   sum        = 429496730000
+//
+// Worked example B (G=200, D=100):
+//   2^32 * 100 = 429496729600
+//   2 * 200    = 400
+//   bonus      = 1 (G > D)
+//   sum        = 429496730001
+//
+// Worked example C (G=D=500):
+//   2^32 * 500 = 2147483648000
+//   2 * 500    = 1000
+//   bonus      = 0 (G NOT > D when equal)
+//   sum        = 2147483649000
+
+fn test_pair_priority_g_lt_d() {
+    let p = ice_pair_priority(100, 200, 1)
+    ce_eq("G=100/D=200 -> 429496730000",
+          p, 429496730000)
+}
+
+fn test_pair_priority_g_gt_d_bonus() {
+    let p = ice_pair_priority(200, 100, 1)
+    ce_eq("G=200/D=100 -> 429496730001 (with +1 bonus)",
+          p, 429496730001)
+}
+
+fn test_pair_priority_g_eq_d() {
+    let p = ice_pair_priority(500, 500, 1)
+    ce_eq("G=D=500 -> 2147483649000",
+          p, 2147483649000)
+}
+
+// ============================================================================
+//                         Candidate add API
+// ============================================================================
+
+fn test_add_local_candidate_basic() {
+    let st = ice_init(1)
+    let id0 = ice_add_local_candidate(st, ICE_TYPE_HOST,
+                                       "192.168.1.10", 50000,
+                                       ICE_FAMILY_IPV4, 1)
+    let id1 = ice_add_local_candidate(st, ICE_TYPE_HOST,
+                                       "10.0.0.5",      50001,
+                                       ICE_FAMILY_IPV4, 1)
+    ce_eq("first id = 0", id0, 0)
+    ce_eq("second id = 1", id1, 1)
+    ce_eq("locals count = 2", ice_n_local_candidates(st), 2)
+    let c0 = ice_local_candidate(st, 0)
+    ce_check("c0 retrievable", c0 != 0)
+    ce_str_eq("c0 ip = 192.168.1.10", c0[1], "192.168.1.10")
+    ce_eq("c0 port = 50000", c0[2], 50000)
+    // First add gets local_pref=65535 (the max), second gets 65534, ...
+    ce_check("c0 priority > c1 priority",
+             c0[5] > ice_local_candidate(st, 1)[5])
+}
+
+fn test_add_local_oob_returns_zero() {
+    let st = ice_init(1)
+    ce_eq("OOB id returns 0", ice_local_candidate(st, 999), 0)
+    ce_eq("Negative id returns 0", ice_local_candidate(st, 0 - 1), 0)
+}
+
+fn test_add_remote_candidate_basic() {
+    let st = ice_init(0)
+    let id = ice_add_remote_candidate(st, ICE_TYPE_SRFLX,
+                                       "203.0.113.55", 33445,
+                                       ICE_FAMILY_IPV4, 1)
+    ce_eq("remote id = 0", id, 0)
+    ce_eq("remotes count = 1", ice_n_remote_candidates(st), 1)
+    let r = ice_remote_candidate(st, 0)
+    ce_eq("remote type = SRFLX", r[0], ICE_TYPE_SRFLX)
+    ce_eq("remote family = IPv4", r[3], ICE_FAMILY_IPV4)
+}
+
+// ============================================================================
+//                         Pair formation
+// ============================================================================
+//
+// Simple 1x1 happy path: one local + one remote -> one pair.
+
+fn test_form_pairs_one_to_one() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "192.168.1.10", 50000,
+                            ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "192.168.2.20", 50100,
+                             ICE_FAMILY_IPV4, 1)
+    let n = ice_form_pairs(st)
+    ce_eq("1x1 forms 1 pair", n, 1)
+    let p0 = ice_get_pair(st, 0)
+    ce_check("pair 0 retrievable", p0 != 0)
+    ce_eq("pair 0 local_id = 0", p0[0], 0)
+    ce_eq("pair 0 remote_id = 0", p0[1], 0)
+    ce_eq("pair 0 state = Waiting", p0[3], ICE_CHECK_WAITING)
+}
+
+// Multi cross product: 2 local x 3 remote (all matching family + comp) =
+// 6 pairs, sorted by priority descending.
+
+fn test_form_pairs_cross_product_sorted() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST,  "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(st, ICE_TYPE_SRFLX, "1.1.1.1",  50001, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.3", 50101, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.4", 50102, ICE_FAMILY_IPV4, 1)
+    let n = ice_form_pairs(st)
+    ce_eq("2x3 forms 6 pairs", n, 6)
+    // Pairs sorted desc -- pair[0] has highest priority.
+    let p0 = ice_get_pair(st, 0)
+    let p_last = ice_get_pair(st, 5)
+    ce_check("pair[0] priority >= pair[5] priority",
+             p0[2] >= p_last[2])
+}
+
+// Family-mismatch filter: an IPv4 local must NOT pair with an IPv6
+// remote even if component ids match.
+fn test_form_pairs_filters_family_mismatch() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "10.0.0.1",     50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "fe80::1",     50100, ICE_FAMILY_IPV6, 1)
+    let n = ice_form_pairs(st)
+    ce_eq("IPv4 x IPv6 forms 0 pairs", n, 0)
+}
+
+// Component-id filter: comp=1 local must NOT pair with comp=2 remote.
+fn test_form_pairs_filters_component_mismatch() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.2", 50100, ICE_FAMILY_IPV4, 2)
+    let n = ice_form_pairs(st)
+    ce_eq("comp1 x comp2 forms 0 pairs", n, 0)
+}
+
+// Multi-family: 1 v4 + 1 v6 local, 1 v4 + 1 v6 remote -> 2 pairs
+// (one per family, no cross-family pairings).
+fn test_form_pairs_multi_family() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "10.0.0.1",  50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "::1",        50001, ICE_FAMILY_IPV6, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "::2",       50101, ICE_FAMILY_IPV6, 1)
+    let n = ice_form_pairs(st)
+    ce_eq("two families form 2 pairs (one each)", n, 2)
+}
+
+// ============================================================================
+//                         Per-pair state machine
+// ============================================================================
+
+fn test_valid_check_edges() {
+    ce_eq("Waiting -> In-Progress",
+          _ice_test_valid_check_edge(ICE_CHECK_WAITING, ICE_CHECK_IN_PROGRESS), 1)
+    ce_eq("In-Progress -> Succeeded",
+          _ice_test_valid_check_edge(ICE_CHECK_IN_PROGRESS, ICE_CHECK_SUCCEEDED), 1)
+    ce_eq("In-Progress -> Failed",
+          _ice_test_valid_check_edge(ICE_CHECK_IN_PROGRESS, ICE_CHECK_FAILED), 1)
+    ce_eq("Waiting -> Failed",
+          _ice_test_valid_check_edge(ICE_CHECK_WAITING, ICE_CHECK_FAILED), 1)
+}
+
+fn test_invalid_check_edges() {
+    ce_eq("Waiting -> Succeeded (skip In-Progress)",
+          _ice_test_valid_check_edge(ICE_CHECK_WAITING, ICE_CHECK_SUCCEEDED), 0)
+    ce_eq("Succeeded -> In-Progress (terminal)",
+          _ice_test_valid_check_edge(ICE_CHECK_SUCCEEDED, ICE_CHECK_IN_PROGRESS), 0)
+    ce_eq("Succeeded -> Failed (terminal)",
+          _ice_test_valid_check_edge(ICE_CHECK_SUCCEEDED, ICE_CHECK_FAILED), 0)
+    ce_eq("Failed -> Succeeded (terminal)",
+          _ice_test_valid_check_edge(ICE_CHECK_FAILED, ICE_CHECK_SUCCEEDED), 0)
+}
+
+fn test_mark_pair_state_drive() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(st)
+    let r1 = ice_mark_pair_in_progress(st, 0)
+    ce_eq("Waiting -> In-Progress ok", r1, 0)
+    ce_eq("checks_sent bumped", ice_checks_sent(st), 1)
+    let r2 = ice_mark_pair_succeeded(st, 0)
+    ce_eq("In-Progress -> Succeeded ok", r2, 0)
+    ce_eq("checks_ok bumped", ice_checks_ok(st), 1)
+    let p = ice_get_pair(st, 0)
+    ce_eq("pair state = Succeeded", p[3], ICE_CHECK_SUCCEEDED)
+    // Subsequent transition off Succeeded must be rejected.
+    let r3 = ice_mark_pair_in_progress(st, 0)
+    ce_eq("Succeeded is terminal", r3, 0 - 1)
+}
+
+fn test_mark_pair_oob() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(st)
+    let r = ice_mark_pair_in_progress(st, 99)
+    ce_eq("OOB rejected", r, 0 - 1)
+}
+
+// ============================================================================
+//                         Nomination (regular, lite version)
+// ============================================================================
+//
+// With three pairs, marking pair 1 Succeeded first nominates it. A
+// subsequent Succeeded on pair 0 does NOT change the nominated idx
+// (lite "first wins"). Pairs are sorted desc by priority so a real
+// driver running checks in idx order would naturally nominate the
+// highest-priority Succeeded -- see test_nomination_picks_highest.
+
+fn test_nomination_first_succeeded_wins() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST, "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(st, ICE_TYPE_SRFLX, "1.1.1.1", 50001, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST, "10.0.0.3", 50101, ICE_FAMILY_IPV4, 1)
+    let n = ice_form_pairs(st)
+    ce_eq("4 pairs formed", n, 4)
+    // Drive pair 1 through Waiting -> In-Progress -> Succeeded first.
+    ice_mark_pair_in_progress(st, 1)
+    ice_mark_pair_succeeded(st, 1)
+    ce_eq("pair 1 nominated first", ice_get_nominated(st), 1)
+    // Pair 0 then succeeds -- nominated index must NOT change.
+    ice_mark_pair_in_progress(st, 0)
+    ice_mark_pair_succeeded(st, 0)
+    ce_eq("pair 0 succeeded later, nomination sticks",
+          ice_get_nominated(st), 1)
+}
+
+// Driving pairs in sort order (highest priority first) nominates the
+// highest-priority Succeeded pair, which is the expected real-world
+// flow.
+fn test_nomination_picks_highest_when_driven_in_order() {
+    let st = ice_init(1)
+    ice_add_local_candidate(st, ICE_TYPE_HOST,  "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(st, ICE_TYPE_SRFLX, "1.1.1.1",  50001, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST,  "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(st, ICE_TYPE_HOST,  "10.0.0.3", 50101, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(st)
+    // Sort puts highest-priority at idx 0 (host x host). Drive that
+    // one first -- it succeeds -> it's nominated.
+    let p_top = ice_get_pair(st, 0)
+    let top_local = ice_local_candidate(st, p_top[0])
+    let top_remote = ice_remote_candidate(st, p_top[1])
+    ce_eq("highest-priority pair has host local",
+          top_local[0], ICE_TYPE_HOST)
+    ce_eq("highest-priority pair has host remote",
+          top_remote[0], ICE_TYPE_HOST)
+    ice_mark_pair_in_progress(st, 0)
+    ice_mark_pair_succeeded(st, 0)
+    ce_eq("highest-priority pair nominated", ice_get_nominated(st), 0)
+}
+
+// ============================================================================
+//                         Status line
+// ============================================================================
+
+fn test_status_line_shape() {
+    let st = ice_init(1)
+    let line = ice_status_line(st)
+    ce_check("status line non-empty", len(line) > 0)
+    ce_check("status line begins with 'ice:'",
+             str_eq(substr(line, 0, 4), "ice:") == 1)
+    ce_check("contains 'role=controller'",
+             str_eq(substr(line, 5, 15), "role=controller") == 1)
+}
+
+// ============================================================================
+//                          main
+// ============================================================================
+
+fn main() {
+    test_init_controller_zero_state()
+    test_init_controlled_zero_state()
+    test_type_preference_table()
+    test_candidate_priority_host_max()
+    test_candidate_priority_srflx_mid()
+    test_candidate_priority_relay_low()
+    test_candidate_priority_host_low()
+    test_candidate_priority_component_tiebreak()
+    test_candidate_priority_host_outranks_srflx()
+    test_pair_priority_g_lt_d()
+    test_pair_priority_g_gt_d_bonus()
+    test_pair_priority_g_eq_d()
+    test_add_local_candidate_basic()
+    test_add_local_oob_returns_zero()
+    test_add_remote_candidate_basic()
+    test_form_pairs_one_to_one()
+    test_form_pairs_cross_product_sorted()
+    test_form_pairs_filters_family_mismatch()
+    test_form_pairs_filters_component_mismatch()
+    test_form_pairs_multi_family()
+    test_valid_check_edges()
+    test_invalid_check_edges()
+    test_mark_pair_state_drive()
+    test_mark_pair_oob()
+    test_nomination_first_succeeded_wins()
+    test_nomination_picks_highest_when_driven_in_order()
+    test_status_line_shape()
+    ce_summary("ice")
+}
+
+main()

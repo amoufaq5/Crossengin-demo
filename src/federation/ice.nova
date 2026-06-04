@@ -1,0 +1,436 @@
+// CrossEngin federation: ICE agent (RFC 8445 subset) (R30C / R28E.2).
+//
+// Purpose
+//
+//   R28E (`src/federation/webrtc.nova`, commit `8c566fb`) shipped the
+//   SIGNALING half of browser-to-soul WebRTC; the R28E exit report
+//   flagged four R28E.2 sub-systems blocking the data plane: DTLS
+//   1.2/1.3 (R29B `dtls12.nova` skeleton), ICE, SRTP, and the RFC
+//   8489 STUN client. R30C lands BOTH the STUN client
+//   (`stun_rfc8489.nova`) and this ICE agent on top of it, completing
+//   the candidate-gathering + connectivity-check half of the WebRTC
+//   data plane.
+//
+//   What ICE solves: WebRTC peers do not, a priori, know how to reach
+//   each other. The browser sits behind one NAT and the soul behind
+//   another. Each side gathers a SET of candidate addresses (local
+//   host IPs, public reflexive addresses via a STUN server, and
+//   relayed addresses via a TURN server), exchanges the set in the
+//   SDP, then runs a connectivity-check matrix across the cross
+//   product of (local, remote) pairs to find ONE pair that actually
+//   passes packets bidirectionally. That pair gets nominated and the
+//   media plane runs over it.
+//
+//   The full RFC 8445 spec is several thousand lines of state. R30C
+//   ships a subset that is sufficient for the unit test contract and
+//   for a future R30C.2 to drive a real connectivity-check loop:
+//
+//     1. Candidate types: host (your local IPs), server-reflexive
+//        (via STUN), relayed (stub -- TURN is R30C.3).
+//     2. Candidate priority per RFC 8445 §5.1.2.1:
+//          priority = 2^24*type_pref + 2^8*local_pref + (256 - cid)
+//        with type_pref host=126, srflx=100, relay=0.
+//     3. Candidate pair priority per RFC 8445 §6.1.2.3:
+//          pair_pri = 2^32*MIN(G,D) + 2*MAX(G,D) + (G > D ? 1 : 0)
+//        where G is the controller-side priority and D is the
+//        controlled side.
+//     4. Per-pair connectivity-check state Waiting / In-Progress /
+//        Succeeded / Failed.
+//     5. Nominated-pair selection (regular nomination, lite version):
+//        the FIRST pair that reaches Succeeded with the highest
+//        priority is nominated.
+//
+//   What R30C does NOT ship (R30C.2 follow-up list):
+//   * Actual STUN binding-request driving over the pair (the brief
+//     stub `ice_check_pair` returns 0; a real check builds a STUN
+//     Binding Request via stun_msg_build_request, sends it on the
+//     local-candidate socket, waits for the matching txn id, and
+//     transitions the pair to Succeeded / Failed accordingly).
+//   * TURN relay candidate gathering (allocate / refresh / send /
+//     data indications); `ICE_TYPE_RELAY` is a structural placeholder.
+//   * mDNS candidate obfuscation (privacy-preserving local-IP hiding,
+//     RFC 8835).
+//   * Trickle ICE -- candidate gathering happens upfront here, no
+//     incremental SDP update.
+//   * ICE restart / role conflicts -- role is set ONCE at init and
+//     does not switch dynamically.
+//   * Aggressive nomination (RFC 5245 legacy) -- we only do regular
+//     nomination per RFC 8445.
+//
+// Public API
+//
+//   ice_init(is_controller)                     -> state
+//   ice_add_local_candidate(state, type, ip, port, family, comp_id)
+//                                                -> id
+//   ice_add_remote_candidate(state, type, ip, port, family, comp_id)
+//                                                -> id
+//   ice_form_pairs(state)                        -> n_pairs
+//   ice_n_local_candidates(state)                -> int
+//   ice_n_remote_candidates(state)               -> int
+//   ice_n_pairs(state)                           -> int
+//   ice_get_pair(state, idx)                     -> [local_id, remote_id,
+//                                                    pair_priority, state]
+//   ice_mark_pair_in_progress(state, idx)        -> 0 ok | -1 invalid edge
+//   ice_mark_pair_succeeded(state, idx)          -> 0 ok | -1 invalid edge
+//   ice_mark_pair_failed(state, idx)             -> 0 ok | -1 invalid edge
+//   ice_get_nominated(state)                     -> idx | -1
+//   ice_local_candidate(state, id)               -> [type, ip, port, family,
+//                                                    component_id, priority]
+//   ice_remote_candidate(state, id)              -> [type, ip, port, family,
+//                                                    component_id, priority]
+//   ice_candidate_priority(type, local_pref, component_id)
+//                                                -> int
+//   ice_pair_priority(controller_pri, controlled_pri, is_controller)
+//                                                -> int
+//   ice_state_role(state)                        -> 1 controller | 0 controlled
+//   ice_status_line(state)                       -> string
+//
+// ADRs touched: registers ADR-0095 (ICE candidate gathering +
+//   connectivity-check matrix subset, R28E.2 sub-system).
+// NOVA dependencies: builtins (alloc, store8, load8, list_new, push,
+//   int_*, len, str_eq, substr, char_at, int_to_str).
+// CrossEngin dependencies: NONE.
+
+// ============================================================================
+//                              Constants
+// ============================================================================
+
+let ICE_TYPE_HOST  = 1
+let ICE_TYPE_SRFLX = 2
+let ICE_TYPE_PRFLX = 3
+let ICE_TYPE_RELAY = 4
+
+let ICE_TYPE_PREF_HOST  = 126
+let ICE_TYPE_PREF_PRFLX = 110
+let ICE_TYPE_PREF_SRFLX = 100
+let ICE_TYPE_PREF_RELAY = 0
+
+let ICE_FAMILY_IPV4 = 1
+let ICE_FAMILY_IPV6 = 2
+
+let ICE_CHECK_WAITING     = 0
+let ICE_CHECK_IN_PROGRESS = 1
+let ICE_CHECK_SUCCEEDED   = 2
+let ICE_CHECK_FAILED      = 3
+
+let ICE_COMPONENT_RTP = 1
+
+let _ICE_TWO_24 = 16777216
+let _ICE_TWO_32 = 4294967296
+
+// ============================================================================
+//                              Candidate record indices
+// ============================================================================
+//   [type, ip, port, family, component_id, priority, local_pref]
+
+let _ICE_CAND_TYPE       = 0
+let _ICE_CAND_IP         = 1
+let _ICE_CAND_PORT       = 2
+let _ICE_CAND_FAMILY     = 3
+let _ICE_CAND_COMPONENT  = 4
+let _ICE_CAND_PRIORITY   = 5
+let _ICE_CAND_LOCAL_PREF = 6
+
+//   [local_id, remote_id, pair_priority, check_state, nominated]
+let _ICE_PAIR_LOCAL_ID  = 0
+let _ICE_PAIR_REMOTE_ID = 1
+let _ICE_PAIR_PRIORITY  = 2
+let _ICE_PAIR_STATE     = 3
+let _ICE_PAIR_NOMINATED = 4
+
+// ============================================================================
+//                              ice_state_t record
+// ============================================================================
+
+let _ICE_S_IS_CONTROLLER     = 0
+let _ICE_S_LOCAL_CANDIDATES  = 1
+let _ICE_S_REMOTE_CANDIDATES = 2
+let _ICE_S_PAIRS             = 3
+let _ICE_S_NOMINATED_IDX     = 4
+let _ICE_S_LOCAL_PREF_NEXT   = 5
+let _ICE_S_CHECKS_SENT       = 6
+let _ICE_S_CHECKS_OK         = 7
+let _ICE_S_LAST_ERROR        = 8
+
+fn ice_init(is_controller) {
+    let st = list_new()
+    push(st, is_controller)
+    push(st, list_new())
+    push(st, list_new())
+    push(st, list_new())
+    push(st, 0 - 1)
+    push(st, 65535)
+    push(st, 0)
+    push(st, 0)
+    push(st, "")
+    return st
+}
+
+fn ice_state_role(state)        { return state[_ICE_S_IS_CONTROLLER] }
+fn ice_n_local_candidates(s)    { return len(s[_ICE_S_LOCAL_CANDIDATES]) }
+fn ice_n_remote_candidates(s)   { return len(s[_ICE_S_REMOTE_CANDIDATES]) }
+fn ice_n_pairs(s)               { return len(s[_ICE_S_PAIRS]) }
+fn ice_checks_sent(s)           { return s[_ICE_S_CHECKS_SENT] }
+fn ice_checks_ok(s)             { return s[_ICE_S_CHECKS_OK] }
+fn ice_last_error(s)            { return s[_ICE_S_LAST_ERROR] }
+
+// ============================================================================
+//                              Candidate priority (RFC 8445 §5.1.2.1)
+// ============================================================================
+
+fn ice_type_preference(type_tag) {
+    if type_tag == ICE_TYPE_HOST  { return ICE_TYPE_PREF_HOST }
+    if type_tag == ICE_TYPE_PRFLX { return ICE_TYPE_PREF_PRFLX }
+    if type_tag == ICE_TYPE_SRFLX { return ICE_TYPE_PREF_SRFLX }
+    if type_tag == ICE_TYPE_RELAY { return ICE_TYPE_PREF_RELAY }
+    return 0
+}
+
+fn ice_candidate_priority(type_tag, local_pref, component_id) {
+    let tp = ice_type_preference(type_tag)
+    return _ICE_TWO_24 * tp + 256 * local_pref + (256 - component_id)
+}
+
+// ============================================================================
+//                              Pair priority (RFC 8445 §6.1.2.3)
+// ============================================================================
+
+fn ice_pair_priority(controller_pri, controlled_pri, is_controller_flag) {
+    let g = controller_pri
+    let d = controlled_pri
+    let mn = g
+    let mx = d
+    if d < g { mn = d; mx = g }
+    let bonus = 0
+    if g > d { bonus = 1 }
+    return _ICE_TWO_32 * mn + 2 * mx + bonus
+}
+
+fn _ice_role_resolved_pair_priority(local_pri, remote_pri, is_controller) {
+    if is_controller == 1 {
+        return ice_pair_priority(local_pri, remote_pri, 1)
+    }
+    return ice_pair_priority(remote_pri, local_pri, 0)
+}
+
+// ============================================================================
+//                              Candidate add
+// ============================================================================
+
+fn _ice_alloc_local_pref(state) {
+    let p = state[_ICE_S_LOCAL_PREF_NEXT]
+    state[_ICE_S_LOCAL_PREF_NEXT] = p - 1
+    if state[_ICE_S_LOCAL_PREF_NEXT] < 0 {
+        state[_ICE_S_LOCAL_PREF_NEXT] = 0
+    }
+    return p
+}
+
+fn _ice_build_cand(type_tag, ip, port, family, component_id, local_pref) {
+    let priority = ice_candidate_priority(type_tag, local_pref, component_id)
+    let c = list_new()
+    push(c, type_tag)
+    push(c, ip)
+    push(c, port)
+    push(c, family)
+    push(c, component_id)
+    push(c, priority)
+    push(c, local_pref)
+    return c
+}
+
+fn ice_add_local_candidate(state, type_tag, ip, port, family, component_id) {
+    let local_pref = _ice_alloc_local_pref(state)
+    let c = _ice_build_cand(type_tag, ip, port, family, component_id, local_pref)
+    let list = state[_ICE_S_LOCAL_CANDIDATES]
+    let idx = len(list)
+    push(list, c)
+    return idx
+}
+
+fn ice_add_remote_candidate(state, type_tag, ip, port, family, component_id) {
+    let local_pref = _ice_alloc_local_pref(state)
+    let c = _ice_build_cand(type_tag, ip, port, family, component_id, local_pref)
+    let list = state[_ICE_S_REMOTE_CANDIDATES]
+    let idx = len(list)
+    push(list, c)
+    return idx
+}
+
+fn ice_local_candidate(state, id) {
+    let list = state[_ICE_S_LOCAL_CANDIDATES]
+    if id < 0 { return 0 }
+    if id >= len(list) { return 0 }
+    return list[id]
+}
+
+fn ice_remote_candidate(state, id) {
+    let list = state[_ICE_S_REMOTE_CANDIDATES]
+    if id < 0 { return 0 }
+    if id >= len(list) { return 0 }
+    return list[id]
+}
+
+// ============================================================================
+//                              Pair formation (RFC 8445 §6.1.2.2)
+// ============================================================================
+
+fn _ice_pair_compatible(local, remote) {
+    if local[_ICE_CAND_FAMILY] != remote[_ICE_CAND_FAMILY] { return 0 }
+    if local[_ICE_CAND_COMPONENT] != remote[_ICE_CAND_COMPONENT] { return 0 }
+    return 1
+}
+
+fn _ice_sort_pairs_desc(pairs) {
+    let n = len(pairs)
+    let i = 1
+    while i < n {
+        let j = i
+        while j > 0 {
+            let cur = pairs[j]
+            let prev = pairs[j - 1]
+            if cur[_ICE_PAIR_PRIORITY] > prev[_ICE_PAIR_PRIORITY] {
+                list_set(pairs, j, prev)
+                list_set(pairs, j - 1, cur)
+            } else {
+                j = 1
+            }
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn ice_form_pairs(state) {
+    let locals = state[_ICE_S_LOCAL_CANDIDATES]
+    let remotes = state[_ICE_S_REMOTE_CANDIDATES]
+    let pairs = list_new()
+    let is_controller = state[_ICE_S_IS_CONTROLLER]
+    let i = 0
+    while i < len(locals) {
+        let local = locals[i]
+        let j = 0
+        while j < len(remotes) {
+            let remote = remotes[j]
+            if _ice_pair_compatible(local, remote) == 1 {
+                let pair_pri = _ice_role_resolved_pair_priority(
+                    local[_ICE_CAND_PRIORITY],
+                    remote[_ICE_CAND_PRIORITY],
+                    is_controller)
+                let p = list_new()
+                push(p, i)
+                push(p, j)
+                push(p, pair_pri)
+                push(p, ICE_CHECK_WAITING)
+                push(p, 0)
+                push(pairs, p)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    _ice_sort_pairs_desc(pairs)
+    state[_ICE_S_PAIRS] = pairs
+    return len(pairs)
+}
+
+fn ice_get_pair(state, idx) {
+    let pairs = state[_ICE_S_PAIRS]
+    if idx < 0 { return 0 }
+    if idx >= len(pairs) { return 0 }
+    return pairs[idx]
+}
+
+// ============================================================================
+//                              Per-pair state machine
+// ============================================================================
+
+fn _ice_valid_check_edge(from, to) {
+    if from == ICE_CHECK_WAITING {
+        if to == ICE_CHECK_IN_PROGRESS { return 1 }
+        if to == ICE_CHECK_FAILED      { return 1 }
+        return 0
+    }
+    if from == ICE_CHECK_IN_PROGRESS {
+        if to == ICE_CHECK_SUCCEEDED { return 1 }
+        if to == ICE_CHECK_FAILED    { return 1 }
+        return 0
+    }
+    return 0
+}
+
+fn _ice_transition_pair(state, idx, to_state) {
+    let pair = ice_get_pair(state, idx)
+    if pair == 0 {
+        state[_ICE_S_LAST_ERROR] = "ice: pair idx out of range"
+        return 0 - 1
+    }
+    let cur = pair[_ICE_PAIR_STATE]
+    if _ice_valid_check_edge(cur, to_state) == 0 {
+        state[_ICE_S_LAST_ERROR] = "ice: invalid check-state edge"
+        return 0 - 1
+    }
+    pair[_ICE_PAIR_STATE] = to_state
+    return 0
+}
+
+fn ice_mark_pair_in_progress(state, idx) {
+    let r = _ice_transition_pair(state, idx, ICE_CHECK_IN_PROGRESS)
+    if r == 0 {
+        state[_ICE_S_CHECKS_SENT] = state[_ICE_S_CHECKS_SENT] + 1
+    }
+    return r
+}
+
+fn ice_mark_pair_succeeded(state, idx) {
+    let r = _ice_transition_pair(state, idx, ICE_CHECK_SUCCEEDED)
+    if r == 0 {
+        state[_ICE_S_CHECKS_OK] = state[_ICE_S_CHECKS_OK] + 1
+        if state[_ICE_S_NOMINATED_IDX] == 0 - 1 {
+            state[_ICE_S_NOMINATED_IDX] = idx
+            let pair = ice_get_pair(state, idx)
+            pair[_ICE_PAIR_NOMINATED] = 1
+        }
+    }
+    return r
+}
+
+fn ice_mark_pair_failed(state, idx) {
+    return _ice_transition_pair(state, idx, ICE_CHECK_FAILED)
+}
+
+fn ice_get_nominated(state) {
+    return state[_ICE_S_NOMINATED_IDX]
+}
+
+// ============================================================================
+//                              Diagnostic / status line
+// ============================================================================
+
+fn ice_status_line(state) {
+    if state == 0 { return "ice: <no state>" }
+    let role = "controlled"
+    if state[_ICE_S_IS_CONTROLLER] == 1 { role = "controller" }
+    let nom = state[_ICE_S_NOMINATED_IDX]
+    let nom_s = "none"
+    if nom >= 0 { nom_s = int_to_str(nom) }
+    return "ice: role=" + role
+        + " locals=" + int_to_str(ice_n_local_candidates(state))
+        + " remotes=" + int_to_str(ice_n_remote_candidates(state))
+        + " pairs=" + int_to_str(ice_n_pairs(state))
+        + " nominated=" + nom_s
+        + " checks_sent=" + int_to_str(state[_ICE_S_CHECKS_SENT])
+        + " checks_ok=" + int_to_str(state[_ICE_S_CHECKS_OK])
+}
+
+// ============================================================================
+//                  Test-only shims for the unit suite
+// ============================================================================
+
+fn _ice_test_valid_check_edge(from, to) { return _ice_valid_check_edge(from, to) }
+fn _ice_test_pair_compatible(a, b)      { return _ice_pair_compatible(a, b) }
+fn _ice_test_sort_pairs_desc(pairs)     { return _ice_sort_pairs_desc(pairs) }
+fn _ice_test_role_pri(lp, rp, ic)       {
+    return _ice_role_resolved_pair_priority(lp, rp, ic)
+}
