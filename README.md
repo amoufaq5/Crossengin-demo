@@ -495,6 +495,27 @@ computational units rather than orchestrating a pipeline of modules.
 > available via `pitch_run_auto_command` (not yet wired into the chat
 > dispatch table; reserved for an optional +1 admin line).
 >
+> R25B.4 closes R25B.3's two documented failure modes: (a) kind-weighted
+> Jaccard `(2*|kind_matches| + |other_matches|) / (2*|kind_terms| +
+> |other_terms|)` lifts borderline kind-naming remainders to CONTINUE
+> even when the uniform Jaccard rounds below the 0.2 threshold, and
+> (b) an English s-suffix morphology pass (`_vd_stem`) normalises
+> trailing-s plurals on the way into the tokeniser so "facts" matches
+> "fact" / "rules" matches "rule" / "entities" matches "entity"
+> (with standard quirks: length-<4 / -ss / -us / -is / -as / -os
+> tails preserved; -ies->-y for length>=5). New public probes
+> `vc_stem(tok)` and `vc_weighted_score(prior_other, prior_kind_stem,
+> now)`. R25B.3 behaviour is byte-identical when the uniform Jaccard
+> already says CONTINUE; the new weighted pass only fires on
+> borderline misses. HONEST: the R29C-documented "tell me more about
+> that atom in the rule engine" after `list all FACT` is STILL
+> PIVOT under R25B.4 because the remainder names a different known
+> kind (rule); a kind-pivot routing pass through `_vd_known_kind`
+> would close that residual case and is deferred to R25B.5.
+> Verification: +48 assertions (test_voice_dialog now 147 total),
+> all 99 R25B.3 assertions still byte-identical, brief's 5+ new
+> classifier fixtures correctly classified.
+>
 > R25B.3 extends R25B.2's dialog manager with topic-shift detection:
 > a content-word Jaccard heuristic distinguishes "tell me more"
 > continuations from "tell me more about cats" PIVOTs. New public

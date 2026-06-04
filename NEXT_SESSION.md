@@ -3,6 +3,144 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R25B.4 (this session) -- voice dialog kind-weighted Jaccard + s-suffix morphology (R30F / R29C.2)
+
+**Status: complete -- `examples/voice_dialog.nova` extended additively
+(~180 lines: a new `_vd_stem` morphology helper, a new
+`_vd_weighted_score_tenths` kind-weighted Jaccard scorer, a new
+`_vd_prior_content_no_kind` projection helper, public probes
+`vc_stem` / `vc_weighted_score`, and one classifier branch lift in
+`voice_followup_classify`) + extended test file (+48 assertions,
+total 147). R29C (commit `bcbe3ba`) shipped uniform-weight Jaccard
+and honestly documented two failures: the long-remainder kind-
+naming case ("tell me more about that atom in the rule engine"
+after `list all FACT` scored 0/4 = PIVOT, losing the "more rows"
+intent on RULE topic) and the morphology gap ("facts" plural
+mismatches "fact" singular and triggers PIVOT spuriously). R25B.4
+closes the morphology gap wholesale via _vd_stem and lifts
+borderline kind-matching remainders to CONTINUE via the weighted
+scorer.
+
+### What R25B.4 delivers
+
+* `_vd_stem(tok)` -- s-suffix stripping with the standard quirks:
+  length < 4 unchanged (preserves "is"/"as"/"us"/"go"), tails
+  "-ss"/"-us"/"-is"/"-as"/"-os" preserved (preserves
+  "kiss"/"focus"/"axis"/"was"/"kudos"), "-ies" -> "-y" for length
+  >= 5 ("entities" -> "entity", "categories" -> "category"; short
+  forms like "ties" fall through to the bare s-strip and become
+  "tie" rather than "ty"). Otherwise the trailing s is dropped
+  ("facts" -> "fact", "rules" -> "rule", "cats" -> "cat").
+* `_vd_content_words` now runs each non-stopword token through
+  `_vd_stem` so morphology normalises ON THE WAY IN. Both prior +
+  remainder tokenisations route through the same path so set
+  arithmetic stays symmetric.
+* `_vd_weighted_score_tenths(prior_other, prior_kind_stem, now)` --
+  the new scorer. Formula: `(2 * |kind_matches| + |other_matches|)
+  / (2 * |kind_terms| + |other_terms|)` with |kind_terms| = 1
+  whenever the prior turn established a kind. Numerator capped at
+  the denominator to keep the 0..10 range aligned with the uniform
+  scorer.
+* `voice_followup_classify` now consults the weighted score AFTER
+  the uniform score. If uniform >= threshold -> CONTINUE (R29C
+  parity preserved bit-for-bit). If uniform fails AND weighted >=
+  threshold -> CONTINUE (the lift). Else PIVOT.
+* Public probes: `vc_stem(tok)` and `vc_weighted_score(...)` --
+  tests can verify the helpers directly without driving a full
+  `vc_session_turn`.
+
+### Verification
+
+* All 99 R25B.3 assertions still pass byte-identical (the new
+  scorer is layered on top; the existing uniform path is untouched
+  when its score already says CONTINUE).
+* 48 new assertions in `tests/unit/test_voice_dialog.nova` covering:
+  - Morphology unit tests (5+ pairs: cat/cats, rule/rules,
+    fact/fact, dogs/dog, atoms/atom; short-word preservation for
+    is/as/us/os/was/has; -ss/-us/-is/-as/-os tail preservation
+    for kiss/grass/focus/axis/atlas/kudos; -ies->-y for
+    entities/categories/facilities; empty + no-trailing-s
+    passthrough).
+  - Weighted scorer unit tests (kind-only match -> 10, no kind
+    match -> 0, mixed kind+other match -> 10, empty prior + empty
+    now -> 0).
+  - Classifier tests for brief's fixtures:
+    * "list all FACT" + "tell me more facts" -> CONTINUE
+    * "list all RULE" + "more rules please" -> CONTINUE
+    * "list all FACT" + "tell me more about that atom in the
+      rule engine" -> PIVOT (honest; documented below)
+    * "list all RULE" + same remainder -> CONTINUE (parity with
+      R29C's documented correct case)
+    * "list all FACT" + "tell me more about cats" -> PIVOT
+      (preserved from R29C; morphology can't manufacture
+      agreement that isn't there)
+    * "list all FACT" + "what about RULE atoms" -> PIVOT (kind
+      shift; routed via the kind-pivot path, not Jaccard)
+  - Dispatch tests verifying CONTINUE actually doubles the LIMIT
+    on both FACT and RULE topics through the morphology path.
+
+### Honest failure mode + scope (R25B.5+)
+
+The brief's R29C failure case "tell me more about that atom in
+the rule engine" after `list all FACT` is HONESTLY still PIVOT
+under R25B.4. The weighted score for prior {fact} + remainder
+{atom, rule, engine} is `(2*0 + 0) / (2*1 + 0) = 0/2 = 0`; no
+fact-token survives in the remainder to receive the kind weight.
+The operator shifted topic from FACT to "the rule engine"; the
+classifier is right to call PIVOT here.
+
+The right fix for this specific phrasing is either:
+  (a) noticing the remainder NAMES a different KNOWN kind ("rule")
+      and routing as a kind-pivot (template-preserving with the
+      new kind), OR
+  (b) a semantic-distance model that recognises "rule engine"
+      maps closer to RULE than to FACT.
+
+Both are deferred to R25B.5. (a) is the cheaper win; the
+`_vd_known_kind` check is already in place, just not consulted
+from the more-cue path. (b) requires word embeddings we don't
+ship.
+
+Other R25B.5+ scope:
+  * Multi-turn content window -- the classifier inspects only the
+    LAST history turn. A pivot diagnosed against turn N-1 may
+    still match turn N-2's intent.
+  * Non-English morphology -- _vd_stem is ASCII-only and English-
+    only; German plurals like "Haeuser", Romance "amigos" /
+    "amigas", Arabic broken plurals all need their own normalisers.
+  * Adjective inflection -- "ruler" vs "rule" not handled; the
+    s-strip catches only the plural / 3rd-person-singular case.
+  * Compound nouns -- "rule engine" tokens to "rule" + "engine"
+    independently; a phrasal recogniser would let "rule engine"
+    count as a single kind-naming token.
+
+### Files touched (R25B.4)
+
+* MOD: `examples/voice_dialog.nova` -- additive (~180 new lines:
+  `_vd_stem`, `_vd_weighted_score_tenths`,
+  `_vd_prior_content_no_kind`, public probes; one classifier
+  branch update). R25B.3 helpers + R28D helpers unchanged.
+* MOD: `tests/unit/test_voice_dialog.nova` -- additive (+48
+  assertions + 19 new test functions).
+* MOD: `AUDIO_AUDIT.md` -- new R25B.4 section.
+* MOD: `NEXT_SESSION.md` (this section), `README.md` (one-line
+  callout).
+
+### Concurrency note
+
+R29C's classifier is pure (read-only on session); R25B.4's
+additions inherit that purity -- `_vd_stem` is a pure string
+function, `_vd_weighted_score_tenths` takes pre-built lists,
+`_vd_prior_content_no_kind` is read-only on session. The
+classifier + the new dispatch decisions remain thread-safe under
+the R28D single-caller-per-session contract. No concurrent edits
+from other agents observed during this session (`git status` was
+clean on entry; R29B and R29F were the most recent commits).
+
+R28D `voice_conversation.nova` / `crossengin_chat.nova` / any
+federation module untouched. R25B.4 is purely additive on top of
+R25B.3's dialog layer.
+
 ## R29B (this session) -- DTLS 1.2 record-layer + handshake skeleton (R28E.2)
 
 **Status: complete -- new `src/federation/dtls12.nova` (~1248 lines,

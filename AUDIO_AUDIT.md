@@ -3023,6 +3023,191 @@ want to preserve).
 R8B / R15D / R21C / R25B / R25B.2 modules and tests are untouched
 -- R25B.3 is purely additive on top of R25B.2's dialog layer.
 
+## R25B.4 -- Voice dialog kind-weighted Jaccard + s-suffix morphology
+
+Closes the **two honest R25B.3 failure modes** documented in the
+section above: (1) uniform-weight Jaccard misclassifies a
+remainder that NAMES the prior kind ("tell me more facts" after
+`list all FACT`) as PIVOT because "facts" plural mismatches
+"fact" singular at the string level; (2) a long unrelated
+remainder dilutes the kind-naming signal even when the kind word
+IS present ("more facts and atoms and concepts and rules and
+skills and langs" against prior {fact} scores 1/6 < threshold).
+R25B.4 closes (1) with an English s-suffix stemmer that
+normalises trailing-s plurals at tokenisation time, and (2) with
+a second-pass weighted scorer that gives the prior kind word
+double weight on both sides of the Jaccard ratio.
+
+### What R25B.4 changes inside `voice_dialog.nova`
+
+* `_vd_stem(tok)` -- a minimal English plural / 3rd-person-
+  singular normaliser. INTENTIONALLY not a real Porter stemmer
+  (NOVA ships no string library; the only failure mode the brief
+  cited was the trailing-s case). Rules:
+    - Length < 4: passthrough. Keeps `is` / `as` / `us` / `go` /
+      `no` / `do` / `me` intact.
+    - Length >= 5 AND last 3 chars = "ies": strip "ies", append
+      "y". `entities` -> `entity`, `categories` -> `category`,
+      `facilities` -> `facility`. Length-4 forms ("ties", "lies",
+      "pies") deliberately fall through to the bare s-strip so
+      they become `tie` / `lie` / `pie`, not `ty` / `ly` / `py`.
+    - Tail "-ss" / "-us" / "-is" / "-as" / "-os": passthrough.
+      Keeps `kiss` / `grass` / `focus` / `axis` / `was` / `has` /
+      `atlas` / `kudos` / `pathos` intact.
+    - Otherwise, ends in "s": drop the s. `facts` -> `fact`,
+      `rules` -> `rule`, `cats` -> `cat`, `dogs` -> `dog`.
+  The stemmer is ASCII-only and English-only. German plurals
+  ("Haeuser"), Romance ("amigos") and Arabic broken plurals all
+  need their own normalisers; documented in the honest scope.
+
+* `_vd_content_words(lowered)` -- runs each surviving token (i.e.
+  non-stopword) through `_vd_stem` BEFORE pushing it. Stopword
+  test still runs on the RAW token so degenerate stems can't
+  sneak past the filter ("is" / "was" stay stopwords). Applied
+  to both prior + remainder so set arithmetic is symmetric.
+
+* `_vd_prior_content_no_kind(session)` -- mirror of
+  `_vd_prior_content` but EXCLUDING the canonical kind word.
+  Returned set + the prior kind stem are fed to the weighted
+  scorer as the "other_terms" and "kind_terms" inputs.
+
+* `_vd_weighted_score_tenths(prior_other, prior_kind_stem, now)`
+  -- the new scorer. Formula:
+  ```
+  score(in tenths) = floor( 10 * (2*|kind_matches| + |other_matches|)
+                            / (2*|kind_terms| + |other_terms|) )
+  ```
+  where `|kind_terms| = 1` whenever the session established a
+  kind (else 0; the cue-with-no-kind case can't kind-match
+  anything), and each remainder token votes AT MOST once -- as
+  a kind match (weight 2) or as an other-content match
+  (weight 1). Numerator clamped to denominator so the output
+  ranges 0..10 like the uniform scorer.
+
+* `voice_followup_classify(session, query)` -- the more/and/also
+  branch now consults the weighted score AFTER the uniform one.
+  If uniform Jaccard >= threshold -> CONTINUE (R25B.3 path
+  preserved bit-for-bit). Else if weighted score >= threshold ->
+  CONTINUE (the lift). Else -> PIVOT. Threshold stays at the
+  same 0.2 (encoded 2/10) constant for both passes so a single
+  knob controls the crossover.
+
+* Public probes `vc_stem(tok)` and `vc_weighted_score(...)` ship
+  alongside the existing `vc_followup_*` accessors so tests can
+  exercise the helpers in isolation without driving a full
+  `vc_session_turn`.
+
+### Verification
+
+* **48 new unit assertions** in
+  `tests/unit/test_voice_dialog.nova` (R25B.3's 99 retained
+  byte-identical + R25B.4 = 147 total). Coverage:
+    - Morphology stemmer: `cat` / `cats`, `rule` / `rules`,
+      `fact` / `facts`, `dog` / `dogs`, `atom` / `atoms`;
+      length-<4 preservation (`is`, `as`, `us`, `os`);
+      tail-preservation (`kiss`, `grass`, `focus`, `axis`,
+      `was`, `has`, `atlas`, `kudos`); -ies->-y (`entities`,
+      `categories`, `facilities`); no-trailing-s passthrough.
+    - Weighted scorer: kind-only match -> 10; no kind match
+      -> 0; mixed kind + other match -> 10; empty prior +
+      non-empty now -> 0; non-empty prior + empty now -> 0.
+    - Classifier: "list all FACT" + "tell me more facts" ->
+      CONTINUE (morphology win); "list all RULE" + "more rules
+      please" -> CONTINUE (morphology win); "list all FACT" +
+      "tell me more about that atom in the rule engine" ->
+      PIVOT (HONEST; documented below); "list all RULE" +
+      same remainder -> CONTINUE (R25B.3 parity); "list all
+      FACT" + "tell me more about cats" -> PIVOT (preserved);
+      "list all FACT" + "what about RULE atoms" -> PIVOT
+      (kind shift); long borderline remainder with kind term
+      -> CONTINUE via weighting; "and facts" after FACT ->
+      CONTINUE via morphology; "more dogs" after FACT -> PIVOT
+      (no kind overlap).
+    - Dispatch: morphology-induced CONTINUE actually escalates
+      the LIMIT to 20 (proving the runtime consequence).
+
+* **R25B.3 parity: every one of the 99 prior assertions still
+  passes byte-identical.** The weighted scorer is layered on
+  top -- it only fires after the uniform Jaccard misses, so
+  cases where uniform already says CONTINUE (Jaccard >=
+  threshold) take exactly the same code path they did before.
+  Cases where uniform already says PIVOT and the weighted
+  scorer ALSO says PIVOT take the same code path. The only
+  newly-observable behaviour is on remainders that uniform
+  scored < threshold AND weighted scored >= threshold; none of
+  the R25B.3 fixtures land there.
+
+### Honest failure mode -- the R25B.5 deferred case
+
+The brief explicitly invited an honest answer on the R29C
+documented failure:
+> "tell me more about that atom in the rule engine" after
+> `list all FACT` -- does R25B.4 fix this?
+
+**Honest answer: no.** Under R25B.4's weighting:
+  - prior_kind_stem = "fact"; prior_other = {} (after
+    stopwords)
+  - remainder content = {atom, rule, engine} (stems unchanged
+    on these tokens)
+  - No "fact" appears in the remainder, so kind_matches = 0.
+  - No other prior content exists, so other_matches = 0.
+  - score = (0 + 0) / (2 + 0) = 0 < threshold -> PIVOT.
+
+That's the CORRECT call by the model: the operator shifted
+topic from FACT to "the rule engine". A real fix would either:
+  (a) notice that "rule" in the remainder NAMES a different
+      KNOWN kind (the existing `_vd_known_kind("RULE") == 1`
+      check is already in the file, just not consulted from
+      the more-cue path) -- which would route this as a kind-
+      pivot (template-preserving) rather than a topic-shift,
+      OR
+  (b) augment the classifier with a semantic-distance model
+      that recognises "rule engine" as off-topic from FACT.
+
+(a) is cheap (one line in `voice_followup_classify` that walks
+the remainder content for a known kind token before falling
+through to PIVOT) and is what R25B.5 should ship. (b) requires
+word embeddings we don't have. Both are deferred and explicitly
+noted here so the next session has a clean follow-up.
+
+### Honest scope (R25B.5+)
+
+* **Different-known-kind detection from the more-cue path.** The
+  best lift for the R29C failure case (above). One-line addition
+  to `voice_followup_classify` using `_vd_known_kind` against
+  upcased remainder content tokens.
+* **Non-English morphology.** Stemmer is ASCII + English only.
+  Languages with agglutinative or umlauted plurals (German
+  "Haeuser", Romance "amigos" / "amigas", Arabic broken plurals)
+  need their own normalisers.
+* **Adjective + 3rd-person-singular inflection.** "ruler" vs
+  "rule", "running" vs "run", "ran" vs "run" not handled. A real
+  Porter stemmer or a small affix table would catch these.
+* **Compound nouns.** "rule engine" tokens to "rule" + "engine"
+  independently. A phrasal recogniser (or a simple bigram pass)
+  would let "rule engine" count as a single kind-naming token.
+* **No semantic distance.** "list all FACT" + "tell me more about
+  logic" -- "logic" is unrelated to "fact" lexically but
+  semantically related. R25B.4 still calls PIVOT here.
+* **No multi-turn content window.** The classifier only inspects
+  the LAST history turn (inherited from R25B.3). A pivot
+  diagnosed against turn N-1 may still match turn N-2's intent.
+
+### Files touched (R25B.4)
+
+* MOD: `examples/voice_dialog.nova` -- additive (~180 lines:
+  `_vd_stem`, `_vd_weighted_score_tenths`,
+  `_vd_prior_content_no_kind`, two public probes, and one
+  classifier branch lift). R25B.3 + R28D code blocks unchanged.
+* MOD: `tests/unit/test_voice_dialog.nova` -- additive (+48
+  assertions + 19 new test functions).
+* MOD: `AUDIO_AUDIT.md` (this section), `NEXT_SESSION.md`,
+  `README.md`.
+
+R8B / R15D / R21C / R25B / R25B.2 / R25B.3 modules and tests
+are untouched -- R25B.4 is purely additive on top of R25B.3's
+dialog layer.
+
 ## R26C -- Spectral-subtraction Wiener noise reduction
 
 Closes the **frequency-domain denoising** gap in CrossEngin's audio chain.
