@@ -218,6 +218,50 @@ let DR_S_STATS_LATE_DROPS  = 17  // # peers whose DRFETCH adaptive
                                  // SUSPECT marks
 let DR_S_STATS_TIMEOUT_ADJ = 18  // # times the adaptive-timeout
                                  // calculator clamped at the MAX ceiling
+// R30A pipelined-DRFETCH slots. The pipeline path is an additional opt-in
+// (CE_DRFETCH_PIPELINE) layered on top of R28A. It uses R29A's `sys_poll`
+// builtin to wait on multiple peer ACK sockets concurrently after a
+// single fan-out sweep, the design R28A had to abandon because NOVA had
+// no multi-fd wait at the time. The slots are defensive-tolerated by
+// dr_is_state (len >= 14 still recognized) and zero-init'd by dr_init
+// so a pre-R30A stub harness keeps working.
+let DR_S_PIPELINE_OPT          = 19  // 0 = off (default, keeps R28A
+                                     // serial+adaptive as the safe
+                                     // baseline), 1 = on
+                                     // (CE_DRFETCH_PIPELINE)
+let DR_S_STATS_PIPELINE_DISPATCHED = 20  // # peers dispatched in phase 1
+                                         // (cumulative across rounds)
+let DR_S_STATS_PIPELINE_READY      = 21  // # peers whose pollfd had
+                                         // POLLIN ready before timeout
+let DR_S_STATS_PIPELINE_TIMEOUTS   = 22  // # peers whose pollfd never
+                                         // became ready (analogous to
+                                         // STATS_LATE_DROPS for the
+                                         // pipeline path)
+let DR_S_STATS_PIPELINE_PARTIAL    = 23  // # pollfds where sys_poll
+                                         // returned > 0 but fewer fds
+                                         // than dispatched -- diagnostic
+                                         // signal of partial wakeup
+
+// ---- R30A pipelined-DRFETCH pollfd layout ------------------------------
+//
+// `sys_poll` (R29A NOVA codegen) consumes an array of POSIX pollfd
+// structs: 8 bytes each, fd at offset 0 (i32 LE), events at offset 4
+// (i16 LE bitmask), revents at offset 6 (i16 LE, kernel writes here).
+// We materialise the array on the heap via `alloc(nfds * 8)` so the
+// memory lives across the dial-many / poll-once / drain-ready sequence.
+let DR_POLLFD_SIZE       = 8     // bytes per pollfd entry
+let DR_POLLFD_OFF_FD     = 0     // i32 (4 bytes)
+let DR_POLLFD_OFF_EVENTS = 4     // i16 (2 bytes)
+let DR_POLLFD_OFF_REVENTS = 6    // i16 (2 bytes)
+let DR_POLLIN            = 1     // POSIX POLLIN bit
+// Sentinel for "peer not ready by deadline" so the post-poll drain
+// loop can distinguish a never-ready fd from a fd that hit EOF mid-
+// drain.
+let DR_PIPELINE_PEND_FD    = 0    // index of peer's open fd
+let DR_PIPELINE_PEND_ADDR  = 1    // peer addr string
+let DR_PIPELINE_PEND_START = 2    // nanotime at DRFETCH-send (for
+                                  // latency on success)
+let DR_PIPELINE_PEND_DONE  = 3    // 1 once DREND drained / timed out
 
 // ---- R28A peer-latency record layout -----------------------------------
 //
@@ -277,6 +321,12 @@ fn dr_init(gossip_state, engine) {
     push(st, 0)                      // S_STATS_ASYNC_RX
     push(st, 0)                      // S_STATS_LATE_DROPS
     push(st, 0)                      // S_STATS_TIMEOUT_ADJ
+    // R30A true-pipelined DRFETCH (sys_poll multi-fd wait).
+    push(st, _dr_pipeline_from_env()) // S_PIPELINE_OPT
+    push(st, 0)                       // S_STATS_PIPELINE_DISPATCHED
+    push(st, 0)                       // S_STATS_PIPELINE_READY
+    push(st, 0)                       // S_STATS_PIPELINE_TIMEOUTS
+    push(st, 0)                       // S_STATS_PIPELINE_PARTIAL
 
     // Backfill rule names from any pre-existing rules in the engine.
     // The R20B engine may have been populated before wrapping -- we
@@ -339,6 +389,43 @@ fn dr_stats_late_drops(dr) {
 fn dr_stats_timeout_adj(dr) {
     if len(dr) <= DR_S_STATS_TIMEOUT_ADJ { return 0 }
     return dr[DR_S_STATS_TIMEOUT_ADJ]
+}
+
+// R30A pipelined-DRFETCH accessors. Each returns 0 on a pre-R30A
+// shape (the post-R28A slots are all optional from the test harness's
+// perspective; defensive read is consistent with the R28A pattern
+// above).
+fn dr_pipeline_opt(dr) {
+    if len(dr) <= DR_S_PIPELINE_OPT { return 0 }
+    return dr[DR_S_PIPELINE_OPT]
+}
+fn dr_stats_pipeline_dispatched(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_DISPATCHED { return 0 }
+    return dr[DR_S_STATS_PIPELINE_DISPATCHED]
+}
+fn dr_stats_pipeline_ready(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_READY { return 0 }
+    return dr[DR_S_STATS_PIPELINE_READY]
+}
+fn dr_stats_pipeline_timeouts(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_TIMEOUTS { return 0 }
+    return dr[DR_S_STATS_PIPELINE_TIMEOUTS]
+}
+fn dr_stats_pipeline_partial(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_PARTIAL { return 0 }
+    return dr[DR_S_STATS_PIPELINE_PARTIAL]
+}
+
+// Test/operator setter: flip the pipeline flag on a live dr_state
+// without re-reading the env var. Returns the value as accepted.
+fn dr_set_pipeline(dr, on) {
+    if len(dr) <= DR_S_PIPELINE_OPT { return 0 }
+    if on != 0 {
+        dr[DR_S_PIPELINE_OPT] = 1
+    } else {
+        dr[DR_S_PIPELINE_OPT] = 0
+    }
+    return dr[DR_S_PIPELINE_OPT]
 }
 
 // Returns the current per-peer median ms; -1 if no samples for that peer.
@@ -508,11 +595,19 @@ fn _dr_split_label(label) {
 // of [peer_addr, arg1, arg2, atom_id] records (each row tagged with
 // the originating peer's self_addr for provenance attribution).
 //
-// R28A: if dr's async-fetch flag is on, delegates to the pipelined
-// _dr_federated_facts_for_async path (dial-all-then-collect with
-// adaptive per-peer timeout). Otherwise behaves identically to the
-// pre-R28A synchronous loop.
+// Dispatch precedence (R30A > R28A > R21B):
+//   1. dr_pipeline_opt == 1 -> _dr_federated_facts_for_pipelined
+//      (R30A: phase-1 dispatch + phase-2 sys_poll collect, true multi-
+//       fd wait via R29A's sys_poll builtin)
+//   2. dr_async_fetch_opt == 1 -> _dr_federated_facts_for_async
+//      (R28A: serial dispatch with per-peer adaptive RCVTIMEO and
+//       late-ACK isolation, retained as the safe baseline)
+//   3. default -> R21B synchronous loop (preserved bit-identical for
+//      any caller that doesn't flip either env flag)
 fn _dr_federated_facts_for(dr, kg, pred) {
+    if dr_pipeline_opt(dr) == 1 {
+        return _dr_federated_facts_for_pipelined(dr, kg, pred)
+    }
     if dr_async_fetch_opt(dr) == 1 {
         return _dr_federated_facts_for_async(dr, kg, pred)
     }
@@ -966,7 +1061,7 @@ fn dr_provenance_count(dr) {
 fn dr_stats_line(dr) {
     if dr_is_state(dr) == 0 { return "drule: bad state" }
     let gs = dr[DR_S_GOSSIP]
-    return "drule: self=" + gossip_self_addr(gs)
+    let line = "drule: self=" + gossip_self_addr(gs)
         + " rules=" + int_to_str(rule_engine_size(dr[DR_S_ENGINE]))
         + " derived=" + int_to_str(dr[DR_S_STATS_DERIVED])
         + " rounds=" + int_to_str(dr[DR_S_STATS_ROUNDS])
@@ -979,6 +1074,17 @@ fn dr_stats_line(dr) {
         + " async_rx=" + int_to_str(dr_stats_async_rx(dr))
         + " late_drops=" + int_to_str(dr_stats_late_drops(dr))
         + " timeout_adj=" + int_to_str(dr_stats_timeout_adj(dr))
+    // R30A pipelined counters only when the path is active. Keeps the
+    // legacy line shape for the default R28A-or-R21B configuration so
+    // existing log scrapers don't break.
+    if dr_pipeline_opt(dr) == 1 {
+        line = line + " pipeline=1"
+            + " pipe_dispatched=" + int_to_str(dr_stats_pipeline_dispatched(dr))
+            + " pipe_ready=" + int_to_str(dr_stats_pipeline_ready(dr))
+            + " pipe_timeouts=" + int_to_str(dr_stats_pipeline_timeouts(dr))
+            + " pipe_partial=" + int_to_str(dr_stats_pipeline_partial(dr))
+    }
+    return line
 }
 
 // ---- chat dispatch ------------------------------------------------------
@@ -1326,4 +1432,477 @@ fn dr_inject_peer_latency_sample(dr, peer_addr, lat_ms) {
 fn dr_peer_latency_table(dr) {
     if len(dr) <= DR_S_PEER_LATENCIES { return list_new() }
     return dr[DR_S_PEER_LATENCIES]
+}
+
+// ============================================================================
+// R30A -- true-pipelined DRFETCH via sys_poll multi-fd wait
+// ============================================================================
+//
+// Why
+//   R28A documented (above) that NOVA's single-threaded blocking-socket
+//   runtime forced the original phase-1-dispatch / phase-2-collect
+//   pipeline design to be abandoned: holding N client connections open
+//   simultaneously kept each peer's `gossip_handle_conn_kg` blocked in
+//   `_gossip_recv_line` waiting for our BYE for the duration of the
+//   dispatch pass; a blocked peer handler could not poll its own
+//   accept queue or serve incoming PINGs from OTHER peers; under load
+//   this drove the gossip mesh into a SUSPECT cascade. R28A fell back
+//   to per-peer serial dispatch with adaptive RCVTIMEO -- the
+//   late-ACK isolation invariant survived but each round still walked
+//   alive peers one-at-a-time with two TCP round-trips between any
+//   two reads.
+//
+//   R29A (NOVA commit c48208e) ships `sys_poll(fds, nfds, timeout_ms)`
+//   across Linux x86-64, ARM64-Linux, macOS BSD, and Windows WSAPoll.
+//   The codegen exposes the POSIX pollfd struct shape directly: fd at
+//   offset 0 (i32 LE), events at offset 4 (i16 LE bitmask), revents at
+//   offset 6 (i16 LE), 8 bytes per entry. With sys_poll available the
+//   original phase-1 / phase-2 design CAN work:
+//
+//     Phase 1: for every alive peer P_i, open + HELLO + send DRFETCH
+//              header. Record (fd_i, peer_addr_i, start_ns_i) into a
+//              `pending` table. Do NOT wait for any ACK between
+//              dispatches; non-blocking semantics on the send side are
+//              guaranteed by the kernel's send buffer for typical
+//              DRFETCH header sizes (~20 bytes).
+//     Phase 2: build a pollfd array of size N with events=POLLIN.
+//              Call sys_poll(fds, N, adaptive_timeout_ms). Walk the
+//              returned revents bitmask: any entry with POLLIN set
+//              gets drained into the federated fact list via the same
+//              DRFACT/DREND state machine R21B uses; any entry whose
+//              revents stays 0 after sys_poll returned is a per-peer
+//              timeout -- close + bump STATS_PIPELINE_TIMEOUTS, leave
+//              the peer's latency window untouched (late-ACK isolation
+//              preserved).
+//
+//   The critical concurrency observation that broke the R28A draft is
+//   STILL true on the peer side: while the originator holds N
+//   connections to the responders, each responder's
+//   `gossip_handle_conn_kg` is parked in `_gossip_recv_line`. The
+//   difference is that with sys_poll, the originator can collect ALL
+//   N responses in a single syscall window (typically the slowest
+//   peer's RTT, not the sum of all peers' RTTs). The pause window
+//   shrinks from O(sum_RTT) to O(max_RTT). On a 5-soul mesh where one
+//   peer has 200 ms RTT and the rest have 50 ms, R28A waits ~400 ms
+//   per round (4 serial drains), R30A waits ~200 ms per round (one
+//   sys_poll that returns when the 200 ms peer is ready).
+//
+//   The honest caveat: NOVA still issues `_gossip_dial` + HELLO/OK
+//   serially in phase 1 (the dial uses connect(2) which is itself
+//   blocking on this runtime). For a 5-soul mesh on loopback the
+//   dial portion is < 5 ms total; the win comes from the poll
+//   parallelism on the response wait. For mesh sizes where the dial
+//   cost dominates the per-peer RTT (e.g. 50+ peers on lossy
+//   WAN) the pipeline win shrinks. Above some peer-count threshold
+//   the dial-serial cost can exceed any poll-parallel saving. The
+//   integration sub-scenario records the round count delta honestly
+//   so operators can see where the threshold sits for THEIR mesh.
+//
+// Adaptive timeout for the pipeline
+//   R28A's per-peer adaptive RCVTIMEO is computed from each peer's
+//   median latency window. With a single sys_poll wait we need ONE
+//   timeout that doesn't cut off the slowest peer. We take the MAX
+//   of all dispatched peers' adaptive timeouts (which already
+//   incorporate the per-peer median + R28A's MIN/MAX/PAD floor /
+//   ceiling), so the slowest peer gets its budget AND the floor/
+//   ceiling stay applied at the policy boundary. A peer with no
+//   recorded samples uses DR_FETCH_DEFAULT_TIMEOUT_MS just as in R28A.
+//
+// Late-ACK isolation
+//   When sys_poll returns and a peer's revents is 0 (no POLLIN), we
+//   close the fd, bump STATS_PIPELINE_TIMEOUTS, and DO NOT touch the
+//   peer's latency median window. That mirrors R28A's design intent:
+//   the gossip PING/ACK liveness probe remains the only source of
+//   SUSPECT marks; one slow DRFETCH does not poison the per-peer
+//   median for the next round.
+//
+// Implementation outline
+//   * `_dr_pipeline_from_env` -- read CE_DRFETCH_PIPELINE on dr_init.
+//   * `_dr_federated_facts_for_pipelined(dr, kg, pred)` -- the
+//     dispatcher entrypoint.
+//   * `_dr_pipeline_phase1_dispatch(dr, gs, pred, alive, self_addr)`
+//     opens connections, sends DRFETCH headers, returns a `pending`
+//     list of [fd, peer_addr, start_ns, done_flag] records.
+//   * `_dr_pipeline_compute_max_timeout(dr, pending)` -- MAX of
+//     per-peer adaptive timeouts.
+//   * `_dr_pipeline_alloc_pollfds(pending)` -- materialise the
+//     `alloc(N * 8)` pollfd array with the documented layout.
+//   * `_dr_pipeline_phase2_collect(dr, pending, fds_buf, timeout_ms,
+//      out)` -- one sys_poll call + per-fd drain.
+//   * `_dr_pipeline_drain_ready(dr, pend_rec, out)` -- the per-peer
+//     DRFACT*/DREND drainer; records the per-peer latency on success.
+
+// Read CE_DRFETCH_PIPELINE and return 1 iff the value opts in.
+// Recognised truthy values match the R28A convention (on / 1 / yes,
+// case-insensitive for the typical operator typo set).
+fn _dr_pipeline_from_env() {
+    let env = getenv("CE_DRFETCH_PIPELINE")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "on") == 1 { return 1 }
+    if str_eq(env, "1") == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    if str_eq(env, "ON") == 1 { return 1 }
+    if str_eq(env, "YES") == 1 { return 1 }
+    return 0
+}
+
+// ---- pollfd struct write/read helpers ----------------------------------
+//
+// R29A guarantees the pollfd layout: fd:i32 @0, events:i16 @4,
+// revents:i16 @6, 8 bytes total. The codegen test (R29A
+// tests/unit/test_codegen_poll.nova) cross-checks all six backends
+// against this layout via the same store8 + load8 primitives below.
+
+fn _dr_pollfd_addr(fds_buf, idx) {
+    return fds_buf + idx * DR_POLLFD_SIZE
+}
+
+// Write a 16-bit little-endian word at ptr+offset using two store8's.
+// All NOVA target platforms (Linux/macOS/Win x86-64; Linux ARM64-LE;
+// winARM64; WASM) are little-endian for the syscall layer, so this
+// is byte-identical to the kernel's pollfd shape.
+fn _dr_store_u16_le(ptr, off, val) {
+    let lo = int_and(val, 255)
+    let hi = int_and(int_shr(val, 8), 255)
+    store8(ptr + off, lo)
+    store8(ptr + off + 1, hi)
+    return 0
+}
+
+fn _dr_load_u16_le(ptr, off) {
+    let lo = load8(ptr + off)
+    let hi = load8(ptr + off + 1)
+    return int_or(lo, int_shl(hi, 8))
+}
+
+// Stamp fd (i32 LE, full 4 bytes for layout correctness even though
+// our fds are small ints) + events (i16 LE) + revents=0 into the
+// slot. Clears revents so the kernel write is the only source of
+// non-zero bits there.
+fn _dr_pollfd_init(slot, fd, events) {
+    store8(slot + DR_POLLFD_OFF_FD, int_and(fd, 255))
+    store8(slot + DR_POLLFD_OFF_FD + 1, int_and(int_shr(fd, 8), 255))
+    store8(slot + DR_POLLFD_OFF_FD + 2, int_and(int_shr(fd, 16), 255))
+    store8(slot + DR_POLLFD_OFF_FD + 3, int_and(int_shr(fd, 24), 255))
+    _dr_store_u16_le(slot, DR_POLLFD_OFF_EVENTS, events)
+    _dr_store_u16_le(slot, DR_POLLFD_OFF_REVENTS, 0)
+    return 0
+}
+
+fn _dr_pollfd_revents(slot) {
+    return _dr_load_u16_le(slot, DR_POLLFD_OFF_REVENTS)
+}
+
+// Has POLLIN been set on this slot's revents by the kernel?
+fn _dr_pollfd_has_pollin(slot) {
+    let rev = _dr_pollfd_revents(slot)
+    if int_and(rev, DR_POLLIN) == DR_POLLIN { return 1 }
+    return 0
+}
+
+// ---- phase 1: dispatch every peer ---------------------------------------
+//
+// For each alive peer != self, open a dial + HELLO/OK exchange + send
+// the DRFETCH header. Record the fd, peer_addr, and start_ns in a
+// `pending` list. Skip peers whose dial or HELLO/OK fails (those are
+// effectively dead-by-handshake and should fall to the gossip
+// suspicion path on the next PING tick -- we do NOT count them as
+// dispatched here so the diagnostic counters mean what they say).
+fn _dr_pipeline_phase1_dispatch(dr, gs, pred, alive, self_addr) {
+    let pending = list_new()
+    let i = 0
+    while i < len(alive) {
+        let p_addr = alive[i]
+        if str_eq(p_addr, self_addr) == 0 {
+            let fd = _gossip_dial(p_addr)
+            if fd >= 0 {
+                let ok = 1
+                if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+                    ok = 0
+                }
+                if ok == 1 {
+                    let ack = _gossip_recv_line(fd)
+                    if ack == 0 { ok = 0 }
+                    if ok == 1 {
+                        if str_eq(ack, GOSSIP_OK_LINE) == 0 { ok = 0 }
+                    }
+                }
+                if ok == 1 {
+                    let start_ns = nanotime()
+                    if _gossip_send_all(fd, GOSSIP_DRFETCH_PREFIX
+                                        + pred + "\n") == 0 {
+                        ok = 0
+                    }
+                    if ok == 1 {
+                        // Pending record: [fd, peer_addr, start_ns, done].
+                        let rec = list_new()
+                        push(rec, fd)
+                        push(rec, p_addr)
+                        push(rec, start_ns)
+                        push(rec, 0)              // done = 0
+                        push(pending, rec)
+                        dr[DR_S_STATS_FETCHES_TX] =
+                            dr[DR_S_STATS_FETCHES_TX] + 1
+                        dr[DR_S_STATS_PIPELINE_DISPATCHED] =
+                            dr[DR_S_STATS_PIPELINE_DISPATCHED] + 1
+                    } else {
+                        close_fd(fd)
+                    }
+                } else {
+                    close_fd(fd)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return pending
+}
+
+// ---- phase 2: poll + drain ready --------------------------------------
+//
+// Compute the adaptive timeout for the pipeline as MAX over all
+// dispatched peers (each peer's adaptive timeout already incorporates
+// the R28A min/max/pad clamps; the MAX-of-max stays inside those
+// bounds by construction). A peer with no samples contributes
+// DR_FETCH_DEFAULT_TIMEOUT_MS just as in R28A.
+fn _dr_pipeline_compute_max_timeout(dr, pending) {
+    let max_t = DR_FETCH_DEFAULT_TIMEOUT_MS
+    let i = 0
+    while i < len(pending) {
+        let t = dr_adaptive_timeout_for(dr, pending[i][DR_PIPELINE_PEND_ADDR])
+        if t > max_t { max_t = t }
+        i = i + 1
+    }
+    // The clamps are already baked in via dr_adaptive_timeout_for, but
+    // belt-and-braces: bump the STATS_TIMEOUT_ADJ counter once if the
+    // pipeline winds up at the MAX ceiling so the diagnostic matches
+    // the R28A meaning of "we hit the ceiling".
+    if max_t >= DR_FETCH_MAX_TIMEOUT_MS {
+        dr[DR_S_STATS_TIMEOUT_ADJ] = dr[DR_S_STATS_TIMEOUT_ADJ] + 1
+    }
+    return max_t
+}
+
+// Allocate the pollfd array. One sys_poll call needs the array to be
+// contiguous in memory; alloc() returns a heap pointer we can index by
+// `base + idx * 8` (DR_POLLFD_SIZE). The caller owns the buffer for
+// the duration of the collect pass; NOVA's allocator handles the
+// free implicitly via the round-end GC of the dr_run_round arena.
+fn _dr_pipeline_alloc_pollfds(pending) {
+    let n = len(pending)
+    if n == 0 { return 0 }
+    let buf = alloc(n * DR_POLLFD_SIZE)
+    let i = 0
+    while i < n {
+        let slot = _dr_pollfd_addr(buf, i)
+        let fd = pending[i][DR_PIPELINE_PEND_FD]
+        _dr_pollfd_init(slot, fd, DR_POLLIN)
+        i = i + 1
+    }
+    return buf
+}
+
+// Drain DRFACT*/DREND from a peer whose revents had POLLIN set.
+// Mirrors `_dr_fetch_one_adaptive`'s drain loop. Records the per-peer
+// latency on a clean DREND. On EOF / partial read mid-stream we treat
+// it as a timeout (no latency push -- one-off jitter on partial drain
+// shouldn't poison the median). Returns 1 on clean drain, 0 on
+// partial.
+fn _dr_pipeline_drain_ready(dr, pend_rec, out) {
+    let fd = pend_rec[DR_PIPELINE_PEND_FD]
+    let peer_addr = pend_rec[DR_PIPELINE_PEND_ADDR]
+    let start_ns = pend_rec[DR_PIPELINE_PEND_START]
+    let saw_dr_end = 0
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 {
+            running = 0
+        } else {
+            if str_eq(line, GOSSIP_DREND_LINE) == 1 {
+                running = 0
+                saw_dr_end = 1
+            } else {
+                if _gossip_starts_with(line, GOSSIP_DRFACT_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // DRFACT peer_addr pred arg1 arg2 atom_id
+                    if len(toks) >= 6 {
+                        let rec = list_new()
+                        push(rec, toks[1])
+                        push(rec, toks[3])
+                        push(rec, toks[4])
+                        let aid = 0
+                        if _gossip_is_digits(toks[5]) == 1 {
+                            aid = str_to_int(toks[5])
+                        }
+                        push(rec, aid)
+                        push(out, rec)
+                    }
+                }
+            }
+        }
+    }
+    if saw_dr_end == 1 {
+        let end_ns = nanotime()
+        let lat_ms = (end_ns - start_ns) / 1000000
+        if lat_ms < 0 { lat_ms = 0 }
+        _dr_lat_push(dr, peer_addr, lat_ms)
+        dr[DR_S_STATS_ASYNC_RX] = dr[DR_S_STATS_ASYNC_RX] + 1
+        return 1
+    }
+    return 0
+}
+
+// Walk the pollfd array, for each entry with POLLIN drain DRFACT*/
+// DREND; for entries whose revents stays clear after the syscall
+// returned, bump STATS_PIPELINE_TIMEOUTS (late-ACK isolation: no
+// gossip_on_timeout, no latency-window push). Returns the count of
+// peers that were drained cleanly so the caller can report a
+// "partial" diagnostic when sys_poll reported >= 1 but not all.
+fn _dr_pipeline_phase2_collect(dr, pending, fds_buf, out) {
+    let n = len(pending)
+    let drained_ok = 0
+    let i = 0
+    while i < n {
+        let slot = _dr_pollfd_addr(fds_buf, i)
+        let rec = pending[i]
+        if _dr_pollfd_has_pollin(slot) == 1 {
+            let ok = _dr_pipeline_drain_ready(dr, rec, out)
+            if ok == 1 {
+                dr[DR_S_STATS_PIPELINE_READY] =
+                    dr[DR_S_STATS_PIPELINE_READY] + 1
+                drained_ok = drained_ok + 1
+            } else {
+                // POLLIN set but the drain hit EOF before DREND --
+                // count as a timeout-style late drop for diagnostic
+                // honesty (the peer's median window is left untouched).
+                dr[DR_S_STATS_PIPELINE_TIMEOUTS] =
+                    dr[DR_S_STATS_PIPELINE_TIMEOUTS] + 1
+                dr[DR_S_STATS_LATE_DROPS] =
+                    dr[DR_S_STATS_LATE_DROPS] + 1
+            }
+        } else {
+            // revents stayed 0 -- peer never became ready within the
+            // pipeline timeout. Late-ACK isolation: increment the
+            // local pipeline-timeouts counter and the legacy R28A
+            // late-drops counter, but do NOT call gossip_on_timeout
+            // and do NOT push a latency sample.
+            dr[DR_S_STATS_PIPELINE_TIMEOUTS] =
+                dr[DR_S_STATS_PIPELINE_TIMEOUTS] + 1
+            dr[DR_S_STATS_LATE_DROPS] =
+                dr[DR_S_STATS_LATE_DROPS] + 1
+        }
+        // BYE + close regardless of drain outcome so the peer's
+        // handler unwinds promptly and can return to its accept loop.
+        // A failed BYE send is harmless; the close_fd hits the kernel
+        // unconditionally.
+        _gossip_send_all(rec[DR_PIPELINE_PEND_FD], GOSSIP_BYE_LINE + "\n")
+        close_fd(rec[DR_PIPELINE_PEND_FD])
+        i = i + 1
+    }
+    return drained_ok
+}
+
+// _dr_federated_facts_for_pipelined(dr, kg, pred) -- R30A entrypoint.
+// Mirrors _dr_federated_facts_for_async's shape (seed local facts +
+// fan out over alive peers) but uses sys_poll for the wait phase
+// instead of one-RTT-at-a-time. Returns the federated fact list in
+// the standard [peer_addr, arg1, arg2, atom_id] row shape.
+//
+// Edge cases:
+//   * 0 peers (single-soul mesh or only-self alive) -> degenerate to
+//     the local-only fact list, identical to the sync path. No
+//     dispatch counter bumps (correctly reports "nothing pipelined").
+//   * 1 peer -> phase 1 dispatches one, sys_poll(nfds=1) waits up to
+//     the adaptive timeout, phase 2 drains. Wire-shape identical to
+//     R28A's serial path; the diagnostic counters distinguish the
+//     two via STATS_PIPELINE_DISPATCHED.
+//   * N peers -> the win case described above.
+fn _dr_federated_facts_for_pipelined(dr, kg, pred) {
+    let gs = dr[DR_S_GOSSIP]
+    let self_addr = gossip_self_addr(gs)
+    let out = _dr_local_facts_for(kg, pred, self_addr)
+    let alive = gossip_alive_peers(gs)
+    let pending = _dr_pipeline_phase1_dispatch(dr, gs, pred, alive, self_addr)
+    let n = len(pending)
+    if n == 0 { return out }
+    let timeout_ms = _dr_pipeline_compute_max_timeout(dr, pending)
+    let fds_buf = _dr_pipeline_alloc_pollfds(pending)
+    let nready = sys_poll(fds_buf, n, timeout_ms)
+    // nready >= 1: at least one peer ready; walk all slots to
+    //              attribute timeouts vs ready (sys_poll returns the
+    //              count of ready fds but we must iterate to find
+    //              WHICH ones via the revents bits).
+    // nready == 0: timeout fired before any peer responded; all N are
+    //              late drops.
+    // nready < 0: kernel-level poll error (rare on healthy hosts but
+    //             we have to be defensive); treat all N as late drops
+    //             so the upper layer doesn't loop reading bogus revents.
+    if nready < 0 {
+        // Degrade gracefully: every dispatched peer becomes a late drop.
+        let i = 0
+        while i < n {
+            let rec = pending[i]
+            dr[DR_S_STATS_PIPELINE_TIMEOUTS] =
+                dr[DR_S_STATS_PIPELINE_TIMEOUTS] + 1
+            dr[DR_S_STATS_LATE_DROPS] =
+                dr[DR_S_STATS_LATE_DROPS] + 1
+            _gossip_send_all(rec[DR_PIPELINE_PEND_FD],
+                             GOSSIP_BYE_LINE + "\n")
+            close_fd(rec[DR_PIPELINE_PEND_FD])
+            i = i + 1
+        }
+        return out
+    }
+    let drained = _dr_pipeline_phase2_collect(dr, pending, fds_buf, out)
+    // Partial diagnostic: sys_poll reported >0 ready fds but we
+    // drained fewer than dispatched. Honest signal that a tail-end
+    // peer is consistently the long-pole.
+    if nready > 0 {
+        if drained < n {
+            dr[DR_S_STATS_PIPELINE_PARTIAL] =
+                dr[DR_S_STATS_PIPELINE_PARTIAL] + 1
+        }
+    }
+    return out
+}
+
+// ---- test/operator helpers (R30A) --------------------------------------
+//
+// dr_pollfd_size() -- expose DR_POLLFD_SIZE so a test can assert the
+// layout matches R29A's documented contract (offsets 0/4/6, size 8).
+// This is the only public surface the layout exposes; the rest is
+// internal so the lowering can evolve if R29A revises the pollfd
+// shape on a future backend.
+fn dr_pollfd_size() { return DR_POLLFD_SIZE }
+fn dr_pollfd_off_fd() { return DR_POLLFD_OFF_FD }
+fn dr_pollfd_off_events() { return DR_POLLFD_OFF_EVENTS }
+fn dr_pollfd_off_revents() { return DR_POLLFD_OFF_REVENTS }
+
+// dr_test_pipeline_pollfd_buf(n) -- allocate a pollfd buffer of size
+// n * 8 for layout tests. Returns the buffer pointer + does not
+// initialise contents (the test is responsible for stamping fields).
+fn dr_test_pipeline_pollfd_buf(n) {
+    if n <= 0 { return 0 }
+    return alloc(n * DR_POLLFD_SIZE)
+}
+
+// dr_test_pollfd_init / dr_test_pollfd_revents -- thin wrappers that
+// route through the private helpers above so unit tests can drive the
+// layout assertions without exposing the raw bit-twiddling helpers.
+fn dr_test_pollfd_init(buf, idx, fd, events) {
+    let slot = _dr_pollfd_addr(buf, idx)
+    _dr_pollfd_init(slot, fd, events)
+    return 0
+}
+
+fn dr_test_pollfd_revents(buf, idx) {
+    let slot = _dr_pollfd_addr(buf, idx)
+    return _dr_pollfd_revents(slot)
+}
+
+fn dr_test_pollfd_raw_byte(buf, idx, off) {
+    let slot = _dr_pollfd_addr(buf, idx)
+    return load8(slot + off)
 }

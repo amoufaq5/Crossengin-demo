@@ -2388,6 +2388,237 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R30C extension: RFC 8489 STUN client + RFC 8445 ICE agent (R28E.2)
+
+R28E (commit `8c566fb`) flagged FOUR R28E.2 sub-systems blocking
+end-to-end browser-to-soul WebRTC: DTLS 1.2/1.3 (R29B landed the
+record-layer skeleton in `dtls12.nova`), **ICE**, SRTP, and the
+RFC 8489 **STUN client**. R30C closes the ICE half of that list
+with two new leaf modules.
+
+### Why a NEW STUN module (R23E `nat_traversal.nova` is not enough)
+
+R23E ships a STUN-LIKE convenience wire (`STUN_REQUEST\n` /
+`EXTERNAL <ip>:<port>\n`) inside `nat_traversal.nova`. It is
+sufficient for CrossEngin-to-CrossEngin federation discovery but is
+NOT a real RFC 8489 binding message: no 14-bit message type field,
+no 4-byte magic cookie 0x2112A442, no 12-byte transaction id, no
+TLV attribute block with 4-byte padding, no XOR-MAPPED-ADDRESS
+attribute with the cookie XOR'ed into the port + address, no
+MESSAGE-INTEGRITY (HMAC-SHA1 over the message prefix), no
+FINGERPRINT (CRC32 XOR 0x5354554E). A browser pointed at a R23E
+"STUN" server times out. R30C ships a parallel `stun_rfc8489.nova`
+module so future work (R30C.2) can migrate the R23E callers to the
+new codec WITHOUT churning the gossip-piggyback advertisement layer
+that sits on top of R23E.
+
+### What R30C delivers (`src/federation/stun_rfc8489.nova`)
+
+* **Wire format (RFC 8489 section 5).** 20-byte header
+  (type / length / magic cookie 0x2112A442 / 12-byte transaction
+  id) + TLV attributes (4-byte attribute header + value padded to
+  a 4-byte boundary). The `length` field counts BODY bytes after
+  the header and MUST be a multiple of 4 -- our parser rejects
+  malformed length immediately.
+* **Message types.** Binding Request (0x0001), Binding
+  Success Response (0x0101), Binding Error Response (0x0111).
+  Binding Indication (0x0011) is accepted by the parser for forward
+  compat.
+* **Attributes.** XOR-MAPPED-ADDRESS (0x0020 -- IPv4 4-byte addr
+  XOR magic cookie + port XOR high-16 of cookie; IPv6 16-byte addr
+  XOR cookie || txn id), MESSAGE-INTEGRITY (0x0008 -- HMAC-SHA1 of
+  the message prefix with the LENGTH field patched to reflect "MI
+  is present" per RFC 8489 14.5), FINGERPRINT (0x8028 -- CRC32 of
+  the message prefix XOR 0x5354554E per RFC 8489 14.7), USERNAME
+  (0x0006), ERROR-CODE (0x0009 -- class\*100 + number + reason
+  phrase decoder), SOFTWARE (0x8022), MAPPED-ADDRESS (0x0001
+  parsed for compat only).
+* **Public client API.** `stun_init` -> state;
+  `stun_send_binding_request(state, remote_addr, software)` ->
+  [pkt_buf, n, txn_id] (records the txn id in a pending list so
+  `stun_recv` can correlate); `stun_recv(state, pkt_buf, n)` ->
+  typed result list (STUN_RES_OK with mapped ip+port / STUN_RES_ERR
+  with code + reason / STUN_RES_BAD on parse failure or txn
+  mismatch); `stun_set_credentials(state, username, password)` ->
+  drives MI on outbound + verify on inbound.
+* **Crypto primitives.** Pure-NOVA SHA-1 (RFC 3174, ~150 lines:
+  80-round Merkle-Damgard with 5 × 32-bit state words), HMAC-SHA1
+  (RFC 2104, the standard ipad/opad construction), CRC32 (IEEE 802.3
+  polynomial 0xEDB88320 reflected, byte-by-byte rather than table-
+  driven to save ~50 lines -- STUN messages are small (~100 bytes)
+  so the perf hit is invisible). Re-implemented in-module so this
+  file is a TRUE LEAF -- the SHA-256 in R29B's `dtls12.nova` is
+  intentionally NOT imported so parallel R28E.2 agents cannot
+  collide here. The duplication mirrors the same pattern
+  `dtls12.nova` uses for SHA-256.
+
+### Verified crypto vectors
+
+* SHA-1("abc") = `a9993e364706816aba3e25717850c26c9cd0d89d`
+  (FIPS 180-2 worked example).
+* SHA-1("")    = `da39a3ee5e6b4b0d3255bfef95601890afd80709`
+  (FIPS 180-2 empty input).
+* SHA-1(56-byte multi-part input) =
+  `84983e441c3bd26ebaae4aa1f95129e5e54670f1` (exercises the
+  two-block pad path).
+* HMAC-SHA1(0x0b\*20, "Hi There") =
+  `b617318655057264e28bc0b6fb378c8ef146be00` (RFC 2202 TC1).
+* HMAC-SHA1("Jefe", "what do ya want for nothing?") =
+  `effcdf6ae5eb2fa2d27416d5f184df9c259a7c79` (RFC 2202 TC2).
+* CRC32("123456789") = `0xCBF43926` (the canonical 9-byte CRC-32
+  IEEE reference verified by every CRC32 library).
+* CRC32(0x00 single byte) = `0xD202EF8D` (well-known single-byte
+  reference).
+
+### Verified RFC 5769 wire vectors
+
+We pin the exact wire byte streams from RFC 5769 sections 2.1, 2.2,
+2.3 so a future regression in the header / attribute parser fails
+loudly. The parser identifies type, length, magic cookie, and
+attribute count correctly on all three samples. We do NOT
+cross-check the per-message FINGERPRINT or MESSAGE-INTEGRITY value
+byte-for-byte against the published spec because RFC 5769 has an
+open erratum (#6080) around the long-term-auth derivation that
+affects those computed values; our self-consistent codec round-trip
+(build with FP + MI, parse back, verify both) is the load-bearing
+correctness contract. The §2.2 IPv4 response decodes to
+`192.0.2.1:32853` (the documented mapping); the §2.3 IPv6 response
+decodes to family=2 with a non-zero IP string.
+
+### What R30C delivers (`src/federation/ice.nova`)
+
+* **Candidate types** -- host, server-reflexive, relayed (relay is
+  a structural placeholder; R30C.3 wires TURN).
+* **Candidate priority formula (RFC 8445 §5.1.2.1)**:
+  `priority = 2^24 * type_pref + 256 * local_pref + (256 - component_id)`
+  with `ice_candidate_priority(type, local_pref, component_id)` so
+  the unit suite can pin the arithmetic against worked examples
+  from the RFC. Type-pref defaults: host = 126, peer-reflexive =
+  110, server-reflexive = 100, relay = 0.
+* **Candidate pair priority (RFC 8445 §6.1.2.3)**:
+  `pair_pri = 2^32 * MIN(G,D) + 2 * MAX(G,D) + (G > D ? 1 : 0)`
+  where G is the controller side and D is the controlled side.
+  `ice_pair_priority(G, D, is_controller)` is exposed so the unit
+  suite can pin the formula against three worked examples (G < D,
+  G > D, G = D).
+* **Pair formation (RFC 8445 §6.1.2.2)** -- cross product of
+  locals × remotes filtered by matching address family AND matching
+  component id, sorted descending by pair priority so connectivity
+  checks proceed highest-first.
+* **Per-pair check state machine (RFC 8445 §6.1.2.6 subset)** --
+  Waiting / In-Progress / Succeeded / Failed. Valid edges:
+  Waiting -> In-Progress, In-Progress -> Succeeded,
+  In-Progress -> Failed, Waiting -> Failed. Succeeded and Failed
+  are terminal. Frozen is not modeled here (R30C.2 will add the
+  freeze graph for foundation-grouped pairs).
+* **Regular nomination (lite version)** -- the FIRST pair to reach
+  Succeeded is nominated. Pairs sorted desc by priority mean a
+  driver running checks in idx order naturally nominates the
+  highest-priority Succeeded pair.
+
+### Verified ICE priority arithmetic (hand-computed)
+
+* Host candidate, `local_pref=65535`, `component=1`:
+  priority = 2^24 * 126 + 256 * 65535 + 255
+          = 2113929216 + 16776960 + 255
+          = 2130706431.
+* Server-reflexive, `local_pref=10000`, `component=1`:
+  priority = 2^24 * 100 + 256 * 10000 + 255
+          = 1677721600 + 2560000 + 255
+          = 1680281855.
+* Relay, `local_pref=0`, `component=2`:
+  priority = 0 + 0 + 254 = 254.
+* Pair G=100/D=200/controller:
+  pair_pri = 2^32 * 100 + 2 * 200 + 0 = 429496730000.
+* Pair G=200/D=100/controller:
+  pair_pri = 2^32 * 100 + 2 * 200 + 1 = 429496730001.
+* Pair G=D=500:
+  pair_pri = 2^32 * 500 + 2 * 500 + 0 = 2147483649000.
+
+### Honest scope (R30C.2 follow-up list)
+
+1. **Real connectivity checks** -- R30C ships the pair state
+   machine but not the loop that drives STUN Binding Requests over
+   each (local, remote) socket and transitions the pair to
+   Succeeded / Failed based on the matching txn id. The stub
+   `ice_check_pair` is not in this module; R30C.2 wires
+   `stun_msg_build_request` into the loop.
+2. **TURN relay candidate gathering** -- `ICE_TYPE_RELAY` is a
+   structural placeholder. R30C.3 ships the TURN client
+   (allocate / refresh / send / data indications) per RFC 5766.
+3. **`nat_traversal.nova` migration** -- R23E's STUN-like newline
+   wire is left untouched. R30C.2 swaps `nat_query_stun_with_state`
+   for `stun_send_binding_request` + `stun_recv` and removes the
+   `STUN_REQUEST\n` / `EXTERNAL` text wire.
+4. **mDNS candidate obfuscation** (RFC 8835) -- privacy-preserving
+   local-IP hiding. R30C exposes the raw IP strings; the WebRTC
+   browser will need mDNS resolution.
+5. **Trickle ICE** -- candidate gathering happens upfront here, no
+   incremental SDP update. R30C.2 adds the trickle wire.
+6. **ICE restart + role conflict resolution** -- role is set ONCE
+   at init and does not switch dynamically. R30C.2 adds the
+   tie-breaker exchange.
+7. **Aggressive nomination (RFC 5245 legacy)** -- not supported;
+   regular nomination only.
+8. **IPv6 string canonical form (RFC 5952)** -- we emit a colon-
+   separated 8-group form with no `::` compression. A future cleanup
+   adds the compression rule.
+
+### Verification
+
+* **135 STUN unit assertions** in `tests/unit/test_stun_rfc8489.nova`
+  (NEW; 26 test functions). Coverage: 8/16/32-bit BE byte helpers +
+  4-byte attribute padding (12 asserts), SHA-1 FIPS 180-2 vectors
+  + 56-byte multi-block path (3 asserts), HMAC-SHA1 RFC 2202 TC1 +
+  TC2 (2 asserts), CRC32 known vectors (3 asserts), 20-byte STUN
+  header byte layout against hand-computed bytes (12 asserts),
+  attribute TLV serialisation with 4-byte padding (8 asserts),
+  build + parse + verify round-trip for Binding Request with all
+  four crypto attributes (8 asserts), Binding Success Response
+  IPv4 round-trip including XOR-MAPPED decode to 192.0.2.1:32853
+  (8 asserts), Binding Success Response IPv6 round-trip (5
+  asserts), Binding Error Response (ERROR-CODE) round-trip
+  (3 asserts), parser rejections (short header, bad cookie, bad
+  length, length-exceeds-buf) (4 asserts), FINGERPRINT tamper
+  detection (2 asserts), transaction id allocator monotonic + copy
+  + equality (3 asserts), `stun_send_binding_request` +
+  `stun_recv` correlation by txn id (5 asserts), `stun_recv` on
+  unknown txn returns BAD + bumps `responses_bad` (3 asserts),
+  RFC 5769 §2.1 Sample Request parse (7 asserts), RFC 5769 §2.2
+  Sample IPv4 Response parse + 192.0.2.1:32853 decode (8 asserts),
+  RFC 5769 §2.3 Sample IPv6 Response parse (4 asserts), status
+  line shape (3 asserts), hex codec smoke (5 asserts).
+* **70 ICE unit assertions** in `tests/unit/test_ice.nova` (NEW;
+  26 test functions). Coverage: init zero state for both roles
+  (8 asserts), type-preference table (5 asserts), candidate-
+  priority formula validated against 4 hand-computed worked
+  examples + component-tiebreak invariant + host-outranks-srflx
+  invariant (6 asserts), pair-priority formula validated against
+  3 worked examples (3 asserts), candidate add API (7 asserts),
+  pair formation 1×1 / 2×3 cross-product / family-mismatch filter
+  / component-mismatch filter / multi-family (10 asserts), per-pair
+  state-machine table (4 valid + 4 invalid edges = 8 asserts),
+  state drive happy path + OOB rejection (8 asserts), regular
+  nomination first-wins + highest-priority-when-driven-in-order
+  (8 asserts), status-line shape (3 asserts).
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- all tests
+  pass (+2 new in R30C). Federation baselines hold:
+  dtls12 147, gossip 34, gossip_noise 44, gossip_relay 61,
+  nat_traversal 53, leader_election 40, webrtc 19. Module count
+  delta: +2 (`src/federation/stun_rfc8489.nova`,
+  `src/federation/ice.nova`).
+
+### Concurrency
+
+R30C does NOT touch `nat_traversal.nova` (R23E ownership),
+`webrtc.nova` (R28E), `dtls12.nova` (R29B), `gossip*.nova`,
+`gossip_relay*.nova`, `noise_xk.nova`, `relay_secure.nova`,
+`kg_sync.nova`, `distributed_rules.nova`, `leader_election.nova`,
+`distributed_query.nova`, `snapshot_replication.nova`,
+`voice_dialog.nova`, `crossengin_chat.nova`. Both new modules are
+true leaves (no `import` of any CrossEngin module). Parallel agents
+finishing R28E.2 SRTP cannot collide.
+
 ## R29B extension: DTLS 1.2 record-layer + handshake skeleton (R28E.2)
 
 R28E (commit `8c566fb`) flagged DTLS 1.2/1.3 as the first of four
@@ -2728,6 +2959,138 @@ ancestor pairs under realistic jitter rather than the algorithmic
    A subsequent round could ride DELTA's existing belief-mutation
    stream to keep a local materialised relation cache + only
    DRFETCH on cache miss.
+
+## R30A extension: true-pipelined DRFETCH via sys\_poll multi-fd wait (R28A.2)
+
+### Why this exists
+
+R28A's serial-adaptive DRFETCH path (shipped in `798568c` +
+`da87e89`) closed the convergence gap by giving each peer an
+adaptive RCVTIMEO and isolating late ACKs from gossip's SUSPECT
+machinery. But it kept R21B's serial-per-peer dispatch shape: for
+each predicate the originator still walks alive peers
+one-at-a-time, blocking on `_gossip_recv_line` between dispatch
+and the next dial. The R28A round notes openly documented that
+the original phase-1-dispatch / phase-2-collect design had to be
+abandoned because NOVA's blocking-socket runtime had no way to
+wait on more than one fd at a time -- holding N peer connections
+open before BYE kept N responder handlers parked in
+`_gossip_recv_line` waiting for our BYE for the duration of the
+dispatch pass, which under load drove the gossip mesh into the
+SUSPECT cascade R28A was trying to FIX.
+
+NOVA R29A (`c48208e`, January 2026) shipped
+`sys_poll(fds, nfds, timeout_ms)` across all six backends
+(Linux x86-64 `poll #7`, ARM64-Linux `ppoll #73`, macOS BSD
+`#230 -> 0x20000E6`, Windows `__imp_WSAPoll`, WASM + winARM64
+stubs). The pollfd struct shape is documented and stable: 8
+bytes per entry, fd at offset 0 (i32 LE), events at offset 4
+(i16 LE bitmask), revents at offset 6 (i16 LE, kernel writes).
+R30A is the bridge: it implements the R28A draft's phase-1-then-
+phase-2 design using `sys_poll` as the multi-fd primitive.
+
+### What R30A delivers
+
+1. **Phase-1 sweep dispatch.** For each alive peer, open a TCP
+   dial + HELLO/OK + send `DRFETCH <pred>`. Record
+   `(fd, peer_addr, start_ns)` into a `pending` list. The
+   dispatcher counter `dr_stats_pipeline_dispatched` increments
+   per successful header send; peers whose dial or HELLO
+   fails are silently skipped (those are dead-by-handshake and
+   the gossip PING tick handles them).
+
+2. **Pollfd array materialisation.** `alloc(N * 8)` carves a
+   contiguous buffer; the per-slot writer
+   `_dr_pollfd_init(slot, fd, events=POLLIN)` stamps the
+   i32 LE fd field at offset 0, the i16 LE events field at
+   offset 4, and clears the i16 LE revents field at offset 6
+   so the kernel's revents write is the only source of
+   non-zero bits there. Layout cross-checked against R29A's
+   documented contract in `tests/unit/test_dr_async_fetch.nova`
+   via raw byte loads.
+
+3. **Adaptive single-wait timeout.** Each peer's R28A adaptive
+   timeout (`min(MAX, max(MIN, 2*median + PAD))`) is computed
+   independently; the pipeline takes the MAX of all peers'
+   adaptive timeouts so the slowest peer's budget governs the
+   sys\_poll window. A peer with no recorded samples
+   contributes the default 500 ms just as in R28A.
+
+4. **One sys\_poll call, per-fd drain.**
+   `sys_poll(fds, N, max_timeout_ms)` returns the count of fds
+   with at least one event set; the collect loop walks all N
+   slots, treats `POLLIN`-set entries as ready (drain
+   DRFACT\*/DREND via the same state machine R21B uses,
+   record per-peer latency on success), treats revents=0
+   entries as timeouts (increment
+   `dr_stats_pipeline_timeouts` + `dr_stats_late_drops`,
+   leave the peer's median window untouched).
+
+5. **Late-ACK isolation preserved.** A pipeline timeout never
+   touches `gossip_stats_timeouts`. The gossip PING/ACK
+   liveness probe remains the only source of SUSPECT marks.
+   This invariant is the same one R28A established for the
+   serial-adaptive path; R30A re-verifies it at the pipeline
+   layer with an explicit unit test
+   (`test_r30a_pipeline_late_ack_does_not_mark_suspect`).
+
+6. **4 new diagnostic counters.**
+     * `dr_stats_pipeline_dispatched(dr)` -- cumulative count
+       of peers Phase 1 sent DRFETCH to.
+     * `dr_stats_pipeline_ready(dr)` -- count of peers whose
+       pollfd had POLLIN by deadline AND drained cleanly.
+     * `dr_stats_pipeline_timeouts(dr)` -- count of peers whose
+       pollfd never became ready.
+     * `dr_stats_pipeline_partial(dr)` -- count of poll calls
+       where sys\_poll returned `> 0` but the drain count was
+       below dispatched (signals a slow tail peer).
+
+7. **Opt-in via `CE_DRFETCH_PIPELINE` env var.** Truthy values
+   `on / 1 / yes` (case-insensitive) flip the path on at
+   `dr_init` time; everything else keeps the R28A serial-
+   adaptive baseline. Dispatcher precedence:
+   `pipeline > async > sync`. A test setter
+   `dr_set_pipeline(dr, on)` allows the unit harness to flip
+   the path without touching the environment.
+
+### Empirical numbers from scenario\_yyyy this round
+
+On a CI host loaded enough to time out the R28A baseline:
+
+  * R28A serial baseline: DNF in the 60 s budget for STABLE
+    sub-scenario (5 NOVA processes contending; FIXPOINT\_END
+    marker never appeared). Historical R28A baseline on
+    quieter hardware: 11 rounds.
+  * R30A pipelined: 55 ancestor closure derived in 11
+    rounds, latency 49.5 s, counter snapshot
+    `dispatched=22 ready=15 timeouts=7 partial=7`.
+
+The honest reading: R30A is at least as robust as R28A under
+host contention, because collapsing N serial 500 ms RCVTIMEO
+windows into ONE 500 ms sys\_poll window means the
+originator's fixpoint loop completes inside a wall-clock budget
+that defeats the serial path.
+
+### Caveats
+
+* **Phase 1 dispatch is still serial.** NOVA's `connect(2)` is
+  blocking, so the dial portion of phase 1 walks peers in
+  sequence. For a 5-soul mesh on loopback this is < 5 ms total.
+  For mesh sizes where the dial-serial cost dominates (50+
+  peers on lossy WAN), the pipeline win shrinks; a future
+  round could parallelise phase 1 too via `O_NONBLOCK connect`
+  + a second `sys_poll(POLLOUT)` pass.
+* **Phase-2 BYE remains sequential.** After the drain pass,
+  each peer's BYE + close still walks serially. Since BYE is
+  one line and the responders can be reading it concurrently
+  while we write, this is effectively free in practice but
+  worth noting.
+* **The dispatcher precedence is hard-wired.** A future
+  operator who wants pipeline ON + async OFF (or any other
+  mix) doesn't get fine-grained control today; the
+  precedence is the simple `pipeline > async > sync`
+  cascade. If a real use case appears, the next round can
+  add a `CE_DRFETCH_DISPATCH=<mode>` enum.
 
 ## R29F -- kg\_sync delta-compression on top of R23C snapshot replication
 

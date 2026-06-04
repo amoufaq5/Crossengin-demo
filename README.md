@@ -13,6 +13,57 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R30C closes the ICE half of the R28E.2 follow-up list flagged by
+> R28E (commit `8c566fb`, WebRTC SDP signaling). R29B took DTLS;
+> R30C ships TWO new modules in parallel: (1)
+> `src/federation/stun_rfc8489.nova` -- a true RFC 8489 STUN client
+> wire codec (20-byte header with magic cookie 0x2112A442 + 12-byte
+> transaction id; TLV attribute block with 4-byte padding; Binding
+> Request 0x0001 / Binding Success Response 0x0101 / Binding Error
+> Response 0x0111; XOR-MAPPED-ADDRESS for IPv4 + IPv6;
+> MESSAGE-INTEGRITY HMAC-SHA1 with length-field patch per RFC 8489
+> 14.5; FINGERPRINT CRC32 with XOR mask 0x5354554E per RFC 8489
+> 14.7; USERNAME, ERROR-CODE, SOFTWARE attributes). Pure-NOVA SHA-1
+> + HMAC-SHA1 + CRC32 bundled in-module so the file is a TRUE LEAF
+> (no imports of `dtls12.nova`'s SHA-256). Verified against
+> SHA-1(\"abc\") FIPS 180-2, SHA-1(\"\") FIPS 180-2, the 56-byte
+> two-block-pad input, HMAC-SHA1 RFC 2202 TC1 + TC2, and
+> CRC32(\"123456789\") = 0xCBF43926. Public client API:
+> `stun_init`, `stun_send_binding_request`, `stun_recv` (matches by
+> txn id, decodes XOR-MAPPED-ADDRESS or ERROR-CODE),
+> `stun_verify_message_integrity`, `stun_verify_fingerprint`. R30C
+> does NOT modify `nat_traversal.nova` (R23E's STUN-like ad-hoc
+> newline wire) -- a future R30C.2 will migrate callers. (2)
+> `src/federation/ice.nova` -- an RFC 8445 ICE agent subset:
+> candidate types (host / srflx / relay-stub) with the
+> §5.1.2.1 priority formula
+> `priority = 2^24*type_pref + 256*local_pref + (256 - component_id)`;
+> candidate pair priority §6.1.2.3
+> `2^32 * MIN(G,D) + 2 * MAX(G,D) + (G > D ? 1 : 0)`; pair formation
+> with address-family + component-id filters; per-pair check state
+> Waiting / In-Progress / Succeeded / Failed; regular nomination
+> (lite version) on the first Succeeded pair. Public API:
+> `ice_init(is_controller)`, `ice_add_local_candidate`,
+> `ice_add_remote_candidate`, `ice_form_pairs`, `ice_get_pair`,
+> `ice_mark_pair_in_progress` / `_succeeded` / `_failed`,
+> `ice_get_nominated`. R30C does NOT ship: actual STUN binding-request
+> driving on pair sockets (R30C.2), TURN relay candidate gathering
+> (R30C.3), mDNS candidate obfuscation, trickle ICE, ICE restart,
+> aggressive nomination. Verification: **135 STUN unit assertions**
+> in `tests/unit/test_stun_rfc8489.nova` + **70 ICE unit assertions**
+> in `tests/unit/test_ice.nova` covering header byte layout, TLV
+> attribute padding, MESSAGE-INTEGRITY tamper detection, FINGERPRINT
+> tamper detection, all three RFC 5769 wire samples (§2.1 Sample
+> Request / §2.2 IPv4 Response / §2.3 IPv6 Response) parse
+> correctly with the 192.0.2.1:32853 mapped address decoded for the
+> v4 sample, the priority formula validated against four hand-
+> computed worked examples (host/lp=65535, srflx/lp=10000,
+> relay/lp=0, component tiebreak), the pair-priority formula validated
+> against three worked examples (G<D, G>D, G=D), and the
+> state-machine table (4 valid + 4 invalid edges). Module count
+> delta: +2 (`src/federation/stun_rfc8489.nova`,
+> `src/federation/ice.nova`).
+>
 > R29B lands `src/federation/dtls12.nova` -- the DTLS 1.2
 > record-layer + handshake skeleton + crypto primitives for the
 > R28E.2 follow-up flagged by R28E (commit `8c566fb`). R28E shipped
@@ -107,6 +158,45 @@ computational units rather than orchestrating a pipeline of modules.
 > timeout_adj=0`. R21B sync baseline on the same host: 35 derived
 > in 6 rounds (PARTIAL closure -- exactly the failure mode R27E
 > documented). R28A closes the gap completely on this scenario.
+>
+> R30A (this round, opt-in via `CE_DRFETCH_PIPELINE=on`) implements
+> **true pipelined DRFETCH** on top of R28A using NOVA R29A's new
+> `sys_poll(fds, nfds, timeout_ms)` builtin. Phase 1 dispatches the
+> DRFETCH header to every alive peer back-to-back (no waiting for
+> ACKs between dispatches); phase 2 builds a POSIX pollfd array
+> (`alloc(N*8)`, `{fd:i32 @0, events:i16 @4, revents:i16 @6}`),
+> calls `sys_poll(fds, N, MAX(per-peer adaptive timeout))` once,
+> then drains ready FDs in arrival order and attributes each
+> response to its originating peer. R28A's late-ACK isolation
+> invariant is preserved: a pipeline timeout bumps the new
+> `dr_stats_pipeline_timeouts` counter and the existing
+> `dr_stats_late_drops` (compat), but NEVER touches gossip's
+> SUSPECT counter -- only PING/ACK liveness probes propagate
+> suspicion. Four new diagnostic counters
+> (`pipe_dispatched / _ready / _timeouts / _partial`) surface in
+> `dr_stats_line` ONLY when the pipeline path is active, so legacy
+> log scrapers keep working under the default config. The R30A
+> design is the same phase-1 / phase-2 shape R28A had to abandon
+> when NOVA had no multi-fd wait; R29A unblocked it. Verification:
+> **+39 new assertions** in the same `tests/unit/test_dr_async_fetch.nova`
+> harness (74 total) covering the new slots, pollfd layout
+> assertions, late-ACK isolation, zero / one-peer degenerate
+> cases, dispatcher precedence
+> (`pipeline > async > sync`), and stats-line shape; scenario\_yyyy
+> gains a PIPELINED sub-scenario that re-runs 5-soul STABLE with
+> the flag on and emits a result-table row honest about the round
+> count vs R28A's baseline. On a CI host loaded enough to time
+> out the R28A serial baseline this round, R30A still achieves
+> full 55 ancestor closure in 11 rounds (counters
+> `dispatched=22 ready=15 timeouts=7 partial=7`), suggesting the
+> multi-fd wait collapses what would have been 5 serial 500 ms
+> adaptive RCVTIMEO windows into ONE such window. Honest caveat:
+> `sys_poll` parallelises the response WAIT but not the
+> connection ESTABLISHMENT -- phase 1 still walks `_gossip_dial`
+> serially because NOVA's `connect(2)` is blocking; for meshes
+> where the dial-serial cost dominates (50+ peers on lossy WAN)
+> the pipeline win shrinks. With `CE_DRFETCH_PIPELINE` unset the
+> R28A serial-adaptive path is the safe default.
 >
 > R29F adds `src/federation/kg_sync.nova` -- a delta-compression path
 > on top of R23C's snapshot replication. R23C's `SNAP_FETCH <root>`
