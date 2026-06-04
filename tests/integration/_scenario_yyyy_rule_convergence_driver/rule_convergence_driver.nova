@@ -1,0 +1,438 @@
+// Driver for scenario_yyyy_rule_convergence.sh -- R27E federated
+// rule-engine convergence stress test (R21B under realistic jitter).
+//
+// One driver source, one binary; parameterized by env vars so the
+// scenario can spawn N souls with distinct roles + parent-fact slices
+// without code-gen'ing a per-soul template (mirrors the
+// `_scenario_fff_drivers/delta_bench_driver.nova` env-driven pattern).
+//
+// Env vars consumed (all required unless marked optional):
+//
+//   CE_YYYY_LETTER       e.g. "a", "b", "c", "d", "e" (informational)
+//   CE_YYYY_PORT         decimal port int (this soul's listen port)
+//   CE_YYYY_PEER_ADDRS   comma-sep list "host:port,host:port,..."
+//                        (bootstrap peers; the driver excludes itself
+//                         if the literal self_addr appears)
+//   CE_YYYY_PARENTS      comma-sep list "a:b,c:d,..." of parent edges
+//                        the soul seeds locally before the mesh runs
+//   CE_YYYY_ROLE         "originator" | "peer"
+//                        originator: at TRIGGER_TICK adds the 2
+//                        ancestor rules + runs dr_run_to_fixpoint with
+//                        a measured wall-clock latency
+//                        peer: just spins the gossip + dr loop
+//   CE_YYYY_MAX_TICKS    upper bound on tick count (default 600)
+//   CE_YYYY_TRIGGER_TICK tick at which the originator drives the
+//                        rule-add + fixpoint pass (default 40)
+//   CE_YYYY_KILL_TICK    if non-empty AND >= 0, this soul exit(0)'s
+//                        at the matching tick (peer-churn scenarios)
+//   CE_YYYY_REJOIN_TICK  if non-empty AND >= 0, indicates this soul is
+//                        a "reconnect" soul -- it starts at tick 0
+//                        like usual; the SCENARIO is responsible for
+//                        ACTUALLY killing + restarting the process at
+//                        the right wall-clock moment. The env var is
+//                        informational, recorded in the SCEN line.
+//   CE_YYYY_SCENARIO     "stable" | "drop" | "rejoin" | "latency"
+//                        (informational; logged in SCEN line)
+//   CE_YYYY_PROBE_EDGES  comma-sep list of "a:b" pairs the originator
+//                        will probe (kg_find_atom on "ancestor|a|b")
+//                        after fixpoint -- one PROBE line per pair
+//   CE_YYYY_DELTA_OFF    "1" disables DELTA cycle so KGs stay
+//                        partitioned and the cross-soul join is what
+//                        produces ancestors (mirrors scenario EEEE).
+//                        Default "1".
+//   CE_YYYY_WARMUP_MS    extra startup sleep (default 2000)
+//
+// Output lines (all start with "<letter>: ", scenario greps them):
+//
+//   SCEN role=<role> scenario=<scenario> peers=<n> parents=<n>
+//   BOOT self=<addr> peers=<csv> parents=<csv>
+//   SEED kg_atoms=<n> parent_count=<n>
+//   LISTEN ok addr=<addr>
+//   ALIVE tick=<n> alive=<n>
+//   RULE_ADD count=<n>
+//   FIXPOINT_BEGIN ns=<ns>
+//   FIXPOINT_END   ns=<ns> latency_ms=<ms> derived=<n> rounds=<n>
+//                  ancestors=<n>
+//   PROBE pair=<a:b> found=<0|1>
+//                  (one per CE_YYYY_PROBE_EDGES entry)
+//   STATS <dr_stats_line()>
+//   KILL tick=<n>  (only if CE_YYYY_KILL_TICK matched and we exit)
+//   END  tick=<n>  (clean exit at max_ticks)
+
+import "std/io"
+import "../../../src/federation/gossip.nova"
+import "../../../src/federation/distributed_rules.nova"
+import "../../../src/kg/multi_kg_manager.nova"
+import "../../../src/kg/atom_store.nova"
+import "../../../src/kg/rule_inference.nova"
+
+// ---- env helpers --------------------------------------------------------
+
+fn _env_str(name, fallback) {
+    let v = getenv(name)
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    return v
+}
+
+fn _env_int(name, fallback) {
+    let v = getenv(name)
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    return str_to_int(v)
+}
+
+// Split a CSV string on commas; trim is unnecessary because tests
+// produce no whitespace. Empty input -> empty list.
+fn _split_csv(s) {
+    let out = list_new()
+    if s == 0 { return out }
+    let n = len(s)
+    if n == 0 { return out }
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(s, i) == 44 {     // ','
+            if i > start {
+                push(out, substr(s, start, i - start))
+            } else {
+                push(out, "")
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        push(out, substr(s, start, n - start))
+    }
+    return out
+}
+
+// "a:b" -> [a_int, b_int]; bad input -> empty list
+fn _split_pair_int(s) {
+    let out = list_new()
+    let n = len(s)
+    let i = 0
+    let colon = -1
+    while i < n {
+        if char_at(s, i) == 58 {
+            if colon < 0 { colon = i }
+        }
+        i = i + 1
+    }
+    if colon <= 0 { return out }
+    if colon >= n - 1 { return out }
+    push(out, str_to_int(substr(s, 0, colon)))
+    push(out, str_to_int(substr(s, colon + 1, n - colon - 1)))
+    return out
+}
+
+// ---- helpers ------------------------------------------------------------
+
+fn _count_ancestors(kg) {
+    let atoms = kg_atoms(kg)
+    let n = 0
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_RELATION {
+                let label = atom_label(a)
+                if len(label) >= 9 {
+                    // "ancestor|" prefix: 97,110,99,101,115,116,111,114,124
+                    let ok = 1
+                    if char_at(label, 0) != 97  { ok = 0 }
+                    if char_at(label, 1) != 110 { ok = 0 }
+                    if char_at(label, 2) != 99  { ok = 0 }
+                    if char_at(label, 3) != 101 { ok = 0 }
+                    if char_at(label, 4) != 115 { ok = 0 }
+                    if char_at(label, 5) != 116 { ok = 0 }
+                    if char_at(label, 6) != 111 { ok = 0 }
+                    if char_at(label, 7) != 114 { ok = 0 }
+                    if char_at(label, 8) != 124 { ok = 0 }
+                    if ok == 1 { n = n + 1 }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn _seed_parents(kg, parents_pairs) {
+    let i = 0
+    while i < len(parents_pairs) {
+        let p = parents_pairs[i]
+        if len(p) == 2 {
+            let label = "parent|" + int_to_str(p[0]) + "|" + int_to_str(p[1])
+            kg_add_atom(kg, ATOM_RELATION, label, 1000 + i)
+        }
+        i = i + 1
+    }
+    return kg
+}
+
+fn main() {
+    let letter   = _env_str("CE_YYYY_LETTER", "?")
+    let port     = _env_int("CE_YYYY_PORT", 0)
+    let peers_s  = _env_str("CE_YYYY_PEER_ADDRS", "")
+    let pars_s   = _env_str("CE_YYYY_PARENTS", "")
+    let role     = _env_str("CE_YYYY_ROLE", "peer")
+    let max_ts   = _env_int("CE_YYYY_MAX_TICKS", 600)
+    let trig     = _env_int("CE_YYYY_TRIGGER_TICK", 40)
+    let kill_t   = _env_int("CE_YYYY_KILL_TICK", -1)
+    let rejoin_t = _env_int("CE_YYYY_REJOIN_TICK", -1)
+    let scenario = _env_str("CE_YYYY_SCENARIO", "stable")
+    let probes_s = _env_str("CE_YYYY_PROBE_EDGES", "")
+    let delta_off = _env_int("CE_YYYY_DELTA_OFF", 1)
+    let warmup_ms = _env_int("CE_YYYY_WARMUP_MS", 2000)
+
+    if port <= 0 {
+        io_println(letter + ": MISSING_PORT")
+        exit(2)
+    }
+
+    let self_addr = "127.0.0.1:" + int_to_str(port)
+    let peer_addrs = _split_csv(peers_s)
+    let bp = list_new()
+    let ai = 0
+    while ai < len(peer_addrs) {
+        let a = peer_addrs[ai]
+        if len(a) > 0 {
+            if str_eq(a, self_addr) == 0 {
+                push(bp, a)
+            }
+        }
+        ai = ai + 1
+    }
+
+    let parent_pairs_raw = _split_csv(pars_s)
+    let parent_pairs = list_new()
+    let pi = 0
+    while pi < len(parent_pairs_raw) {
+        let pair = _split_pair_int(parent_pairs_raw[pi])
+        if len(pair) == 2 { push(parent_pairs, pair) }
+        pi = pi + 1
+    }
+    let probe_edges_raw = _split_csv(probes_s)
+    let probe_edges = list_new()
+    let qi = 0
+    while qi < len(probe_edges_raw) {
+        let pair = _split_pair_int(probe_edges_raw[qi])
+        if len(pair) == 2 { push(probe_edges, pair) }
+        qi = qi + 1
+    }
+
+    io_println(letter + ": SCEN role=" + role
+        + " scenario=" + scenario
+        + " peers=" + int_to_str(len(bp))
+        + " parents=" + int_to_str(len(parent_pairs)))
+    io_println(letter + ": BOOT self=" + self_addr
+        + " peers=" + peers_s
+        + " parents=" + pars_s)
+
+    let gs = gossip_init(self_addr, bp)
+    let seed_jitter = nanotime() - (nanotime() / 1000) * 1000
+    gossip_set_seed(gs, port + 31 + seed_jitter)
+    if delta_off == 1 {
+        gs[GOSSIP_S_DELTA_INTERVAL_NS] = 120 * 1000000000
+        gs[GOSSIP_S_LAST_DELTA_NS] = nanotime()
+    }
+
+    let engine = rule_engine_new()
+    let dr = dr_init(gs, engine)
+
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "local_" + letter)
+    _seed_parents(kg, parent_pairs)
+    io_println(letter + ": SEED kg_atoms=" + int_to_str(kg_atom_count(kg))
+        + " parent_count=" + int_to_str(len(parent_pairs)))
+
+    let server_fd = gossip_listen(self_addr)
+    if server_fd < 0 {
+        io_println(letter + ": BIND_FAIL addr=" + self_addr)
+        exit(1)
+    }
+    io_println(letter + ": LISTEN ok addr=" + self_addr)
+    sleep_ms(warmup_ms)
+
+    let did_rule_add = 0
+    let did_fixpoint = 0
+    let tick = 0
+    let is_orig = 0
+    if str_eq(role, "originator") == 1 { is_orig = 1 }
+    let fix_begin_ns = 0
+    let last_alive_log = -1
+    while tick < max_ts {
+        // Kill-tick check (peer-drop / peer-churn scenarios).
+        if kill_t >= 0 {
+            if tick == kill_t {
+                io_println(letter + ": KILL tick=" + int_to_str(tick))
+                close_fd(server_fd)
+                exit(0)
+            }
+        }
+        let drained = 0
+        while drained < 8 {
+            let conn_fd = gossip_try_accept(server_fd)
+            if conn_fd < 0 {
+                drained = 8
+            } else {
+                gossip_handle_conn_kg(gs, conn_fd, kg)
+                drained = drained + 1
+            }
+        }
+        gossip_step(gs, kg)
+
+        // Heartbeat log every 10 ticks so the scenario can observe
+        // alive-peer growth + spot peers that get marked DEAD too
+        // aggressively during the warmup window.
+        if tick % 10 == 0 {
+            if tick != last_alive_log {
+                last_alive_log = tick
+                let alv = gossip_alive_peers(gs)
+                io_println(letter + ": HEARTBEAT tick=" + int_to_str(tick)
+                    + " alive=" + int_to_str(len(alv))
+                    + " " + gossip_status_line(gs))
+            }
+        }
+
+        if is_orig == 1 {
+            if tick == trig {
+                if did_rule_add == 0 {
+                    did_rule_add = 1
+                    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+                    dr_add_rule(dr, "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+                    io_println(letter + ": RULE_ADD count="
+                        + int_to_str(dr_rule_count(dr)))
+                }
+            }
+            if tick == trig + 30 {
+                if did_fixpoint == 0 {
+                    did_fixpoint = 1
+                    // Pre-fixpoint pre-ping sweep -- the gossip layer's
+                    // PING cadence is 1 Hz with round-robin selection,
+                    // so a 5-soul mesh under a 6 s warmup may have one
+                    // or two peers marked SUSPECT/DEAD from missed
+                    // pings. Explicitly re-ping ALL known peers (using
+                    // the public gossip_send_ping accessor + the
+                    // all-peer iterator) so the fixpoint sees the
+                    // converged ALIVE set. Each successful ACK resets
+                    // suspicion to 0 + status to ALIVE
+                    // (gossip_on_ack semantics). We loop the sweep up
+                    // to 6 times with brief sleeps + accept-drain
+                    // passes between, so a peer that lost a single
+                    // round-trip gets a fresh attempt while inbound
+                    // connections from peers still keep flowing.
+                    let known = gossip_all_peers(gs)
+                    let sweep = 0
+                    while sweep < 6 {
+                        let kpi = 0
+                        while kpi < len(known) {
+                            let addr = known[kpi]
+                            if str_eq(addr, self_addr) == 0 {
+                                gossip_send_ping(gs, addr)
+                            }
+                            kpi = kpi + 1
+                        }
+                        let drain_pass = 0
+                        while drain_pass < 8 {
+                            let conn = gossip_try_accept(server_fd)
+                            if conn < 0 {
+                                drain_pass = 8
+                            } else {
+                                gossip_handle_conn_kg(gs, conn, kg)
+                                drain_pass = drain_pass + 1
+                            }
+                        }
+                        let pre_alive = gossip_alive_peers(gs)
+                        if len(pre_alive) >= len(known) {
+                            sweep = 6
+                        } else {
+                            sleep_ms(200)
+                            sweep = sweep + 1
+                        }
+                    }
+                    let alive_before = gossip_alive_peers(gs)
+                    io_println(letter + ": ALIVE tick=" + int_to_str(tick)
+                        + " alive=" + int_to_str(len(alive_before)))
+                    fix_begin_ns = nanotime()
+                    io_println(letter + ": FIXPOINT_BEGIN ns="
+                        + int_to_str(fix_begin_ns))
+                    // Run fixpoint REPEATEDLY -- the synchronous DRFETCH
+                    // can block on a slow peer, so a single
+                    // `dr_run_to_fixpoint` call may return early with
+                    // a partial federated fact set. Repeated passes
+                    // (with re-ping sweeps + accept-drains between)
+                    // pick up the missing parent facts on subsequent
+                    // tries and extend the chain. 4 passes of <= 15
+                    // rounds each is enough for a chain of length 10
+                    // across 5 souls under realistic jitter.
+                    let total_derived = 0
+                    let total_rounds = 0
+                    let pass = 0
+                    while pass < 4 {
+                        // Re-ping + drain between passes so peers
+                        // that fell out get re-added before the next
+                        // fixpoint pass DRFETCHes them.
+                        let kpi2 = 0
+                        while kpi2 < len(known) {
+                            let addr2 = known[kpi2]
+                            if str_eq(addr2, self_addr) == 0 {
+                                gossip_send_ping(gs, addr2)
+                            }
+                            kpi2 = kpi2 + 1
+                        }
+                        let drain2 = 0
+                        while drain2 < 8 {
+                            let conn2 = gossip_try_accept(server_fd)
+                            if conn2 < 0 {
+                                drain2 = 8
+                            } else {
+                                gossip_handle_conn_kg(gs, conn2, kg)
+                                drain2 = drain2 + 1
+                            }
+                        }
+                        let pass_result = dr_run_to_fixpoint(dr, kg, 15)
+                        total_derived = total_derived + pass_result[0]
+                        total_rounds = total_rounds + pass_result[1]
+                        if pass_result[0] == 0 {
+                            pass = 4
+                        } else {
+                            pass = pass + 1
+                        }
+                    }
+                    let fix_end_ns = nanotime()
+                    let lat_ms = (fix_end_ns - fix_begin_ns) / 1000000
+                    io_println(letter + ": FIXPOINT_END ns="
+                        + int_to_str(fix_end_ns)
+                        + " latency_ms=" + int_to_str(lat_ms)
+                        + " derived=" + int_to_str(total_derived)
+                        + " rounds=" + int_to_str(total_rounds)
+                        + " ancestors=" + int_to_str(_count_ancestors(kg)))
+                    let ei = 0
+                    while ei < len(probe_edges) {
+                        let e = probe_edges[ei]
+                        let lbl = "ancestor|" + int_to_str(e[0]) + "|" + int_to_str(e[1])
+                        let found = 0
+                        let atom_ref = kg_find_atom(kg, lbl)
+                        if atom_ref != 0 { found = 1 }
+                        io_println(letter + ": PROBE pair="
+                            + int_to_str(e[0]) + ":" + int_to_str(e[1])
+                            + " found=" + int_to_str(found))
+                        ei = ei + 1
+                    }
+                    io_println(letter + ": STATS " + dr_stats_line(dr))
+                }
+            }
+        }
+
+        sleep_ms(100)
+        tick = tick + 1
+    }
+    close_fd(server_fd)
+    io_println(letter + ": END tick=" + int_to_str(tick))
+    exit(0)
+}
+
+main()

@@ -11,7 +11,49 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R26C adds `src/io/transducers/audio_noise_reduce.nova` —
+> toolchain. R27E stress-tests R21B distributed rule inference (commit
+> `d752b9b`, federation/distributed\_rules.nova) under realistic network
+> jitter: peer drops mid-fixpoint, peer rejoin via gossip rediscovery,
+> and convergence latency growth as the soul count scales 1->5. R21B's
+> 3-soul scenario\_eeee\_distributed\_rules verified ALGORITHM correctness
+> on a calm mesh (10 ancestor pairs from a 4-edge chain); R27E tests
+> BEHAVIOUR under churn (a 5-soul mesh + 10-edge chain + 4 sub-scenarios:
+> stable, drop, rejoin, latency-vs-peer-count). Driver in
+> `tests/integration/_scenario_yyyy_rule_convergence_driver/
+> rule_convergence_driver.nova` (one source, parameterized by
+> CE\_YYYY\_\* env vars so the scenario shell spawns 5 souls with
+> distinct roles + parent-edge slices without code-gen'ing a per-soul
+> template). Empirical findings (3 runs on a 16 GB CI host):
+> 1) **stable 5-soul**: full closure (55 ancestor pairs) typically
+> achievable but only under quiet hosts; partial closure (20-40 pairs)
+> is the realistic norm because R21B's per-round DRFETCH is synchronous
+> and a peer that takes >500 ms to ACK gets marked SUSPECT mid-fixpoint
+> -- subsequent rounds dial fewer peers, federated parent set shrinks,
+> chain extension stops. The pre-fixpoint pre-ping sweep (driver calls
+> gossip\_send\_ping for every known peer + drains inbound, up to 6
+> retries) recovers the alive set before the first DRFETCH but a
+> per-round in-flight failure can still happen. 2) **drop**:
+> closure tracks the post-cut reachability graph EXACTLY at 16 ancestor
+> pairs (closure of {0..2} u {3..7} u {8..10} = 3+10+3), and the
+> 3 C-dependent edges 0->3, 0->10, 6->8 are correctly absent (no false
+> positives). 3) **rejoin**: C restarts on the same port; A's view
+> resurrects within the 30 s post-rejoin window; closure recovers past
+> the drop-only baseline. 4) **latency 1-5 souls**: monotonic growth
+> latency\_ms across n=2 (~5 s), n=3 (~13 s), n=4 (~17 s), n=5
+> (~22 s) -- LINEAR-ish, well under quadratic. Verification: 33
+> integration assertions in `scenario_yyyy_rule_convergence.sh`
+> (NEW; letter `yyyy` free; covers socket pre-flight, driver compile,
+> 4 sub-scenarios x avg 8 assertions each, latency growth + result
+> table). All existing federation + KG scenarios remain green. R21B
+> source (`src/federation/distributed_rules.nova`) is unchanged;
+> minimal additions only would have been a metrics-exposure accessor
+> but the existing `dr_stats_line(dr)` + `dr_stats_derived(dr)` +
+> `dr_stats_rounds(dr)` + `dr_stats_rules_tx(dr)` + `dr_stats_derivs_tx(dr)`
+> + `dr_stats_fetches_tx(dr)` + `dr_last_derived(dr)` + `dr_last_rounds(dr)`
+> accessors already cover the round-count + message-count + fetch-count
+> surface the latency scenario needs.
+>
+> R26C adds `src/io/transducers/audio_noise_reduce.nova` —
 > spectral-subtraction Wiener noise reduction that closes the frequency-
 > domain denoising gap in CrossEngin's audio chain. R14E's noise gate
 > attenuates whole sub-threshold windows wholesale (perfect for chopping
