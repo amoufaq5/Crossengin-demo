@@ -3,6 +3,85 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R33A -- canonical `src/safety/sha256.nova` + dedup 3 of 4 copies
+
+**Status: complete** -- extracts the FIPS 180-4 SHA-256 + RFC 2104
+HMAC-SHA256 spec into `src/safety/sha256.nova` (the canonical primitive)
+and refactors `noise_xk.nova`, `merkle.nova`, and `ecdsa.nova` to
+import it. `dtls12.nova`'s `dtls_sha256` is intentionally untouched in
+this round -- a parallel agent (R33B) owns the dtls12 dedup; the
+follow-up that retires the fourth copy lands after both R33A + R33B
+merge. R32C's exit-report-flagged refactor target is now landed.
+
+### What R33A delivers
+
+* **NEW `src/safety/sha256.nova`** (~520 lines). Canonical FIPS 180-4
+  SHA-256 + RFC 2104 HMAC-SHA256, lifted from R32C's `ecdsa_sha256`
+  family (the cleanest of the four copies). API:
+  - `sha256_oneshot(buf, n) -> 33-byte buffer` (32B digest + NUL slack)
+  - `sha256_oneshot_bytes(byte_list) -> 32-byte list`
+  - `sha256_oneshot_str(s) -> 33-byte buffer`
+  - `sha256_init() / sha256_update(st, buf, n) / sha256_final(st)`
+    streaming triple (FIPS 180-4 padding deferred to `final`)
+  - `hmac_sha256(key_buf, key_n, msg_buf, msg_n) -> 33-byte buffer`
+* **Three modules refactored** to import the canonical and keep their
+  pre-existing public symbols as thin wrappers:
+  - `src/io/transducers/noise_xk.nova`: `sha256_buf` / `sha256_str` /
+    `hmac_sha256_buf` are now one-liners forwarding to the canonical.
+    All 44 prior unit assertions byte-identical.
+  - `src/persistence/merkle.nova`: `_mk_sha256_buf` / `_mk_sha256_str`
+    are now adapters; 60 prior assertions byte-identical.
+  - `src/safety/ecdsa.nova`: `ecdsa_sha256` / `ecdsa_sha256_bytes` are
+    now adapters; 25 prior assertions byte-identical.
+
+### Verification
+
+* **NEW `tests/unit/test_sha256.nova`**: 20 assertions covering FIPS
+  180-4 vectors (`"abc"`, `""`, 56-char Appendix B.2, 55-byte
+  one-block-boundary, `"a" * 1000`), streaming vs oneshot equivalence
+  on 5 distinct splitting strategies (single update, byte-at-a-time,
+  block-aligned, straddle-boundary, 7-mixed-update), and RFC 4231
+  HMAC-SHA256 TC1 + TC2 + TC4 + long-key normalization branch.
+* All 25 ecdsa + 60 merkle + 44 noise_xk + 297 dtls12 prior
+  assertions remain green; sha256 adds 20 new ones.
+
+### Subtle API differences encountered
+
+* `ecdsa_sha256(buf, n)` returns a 33-byte buffer (32B + NUL slack).
+* `ecdsa_sha256_bytes(byte_list)` returns a 32-element byte LIST.
+* `_mk_sha256_buf` (merkle) returns the same 33-byte buffer shape.
+* `_mk_sha256_str` (merkle) takes a string, returns the same buffer.
+* `sha256_buf` (noise_xk) returns the 33-byte buffer.
+* `sha256_str` (noise_xk) takes a string, returns the 33-byte buffer.
+* `hmac_sha256_buf` (noise_xk) returns the 33-byte buffer.
+
+All four pre-R33A implementations produced byte-identical bits but
+exposed them under module-specific names. The canonical module
+provides `sha256_oneshot` / `sha256_oneshot_bytes` /
+`sha256_oneshot_str` / `hmac_sha256` and each consumer keeps a thin
+wrapper preserving its prior public symbol -- callers don't have to
+learn a new name and the existing tests compile unchanged.
+
+### Files
+
+* NEW: `src/safety/sha256.nova` (~520 lines)
+* NEW: `tests/unit/test_sha256.nova` (20 assertions)
+* MOD: `src/io/transducers/noise_xk.nova` (-300 lines inlined SHA-256;
+       +16 lines wrappers + import)
+* MOD: `src/persistence/merkle.nova` (-240 lines inlined SHA-256;
+       +13 lines wrappers + import)
+* MOD: `src/safety/ecdsa.nova` (-250 lines inlined SHA-256; +13 lines
+       wrappers + import)
+* MOD: `NEXT_SESSION.md`, `README.md`, `FEDERATED_AUDIT.md`
+
+### Deferred: dtls12.nova dedup
+
+`src/federation/dtls12.nova` still ships `dtls_sha256` + its inline
+copy; R33B is refactoring dtls12 in parallel and a future round
+(R33B follow-up) will swap that copy for `sha256_oneshot` once
+both R33A and R33B have landed. Module count delta this round: +1
+(`sha256.nova`).
+
 ## R33E -- stateless nat_traversal UDP threading (R32A.2)
 
 **Status: complete** -- closes the R32A.2 caveat by threading a

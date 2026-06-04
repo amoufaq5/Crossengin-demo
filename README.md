@@ -13,6 +13,30 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R33A lands the canonical `src/safety/sha256.nova` (FIPS 180-4
+> SHA-256 + RFC 2104 HMAC-SHA256) and refactors three of four
+> previously-duplicated copies (`noise_xk.nova`, `merkle.nova`,
+> `ecdsa.nova`) to import it. R32C's exit report flagged the SHA-256
+> dedup as the fourth duplicated cryptographic primitive in the tree;
+> R33A closes that loop for three of the four. `dtls12.nova` is left
+> alone in this round -- R33B owns the dtls12 dedup in parallel, and
+> a follow-up round retires the fourth copy once both land. Lines
+> removed (~800 inlined SHA-256 across the 3 modules) vs lines added
+> (~520 canonical module + ~42 wrapper-and-import lines across the
+> 3 consumers): net -240 lines. API exported from the canonical:
+> `sha256_oneshot(buf, n)` / `sha256_oneshot_bytes(byte_list)` /
+> `sha256_oneshot_str(s)` / streaming
+> `sha256_init` / `sha256_update` / `sha256_final` / and
+> `hmac_sha256(key_buf, key_n, msg_buf, msg_n)`. Each consumer keeps
+> its pre-existing public symbol shape (`sha256_buf` /
+> `_mk_sha256_buf` / `ecdsa_sha256` etc.) as a thin one-line wrapper
+> so existing tests and call sites compile unchanged. All prior 44
+> noise_xk + 60 merkle + 25 ecdsa + 297 dtls12 unit assertions remain
+> green; `tests/unit/test_sha256.nova` adds 20 new assertions covering
+> FIPS 180-4 known-answer vectors, streaming-vs-oneshot equivalence
+> (5 splitting strategies), and RFC 4231 HMAC-SHA256 TC1 + TC2 + TC4
+> + the long-key normalization branch.
+>
 > R33E closes the R32A.2 caveat by threading a transient `nat_state_t`
 > through `nat_query_stun(addr)` and `nat_detect_type(addr1, addr2)`
 > so the env flag `CE_NAT_USE_RFC8489=1` activates the UDP RFC 8489

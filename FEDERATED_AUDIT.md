@@ -2388,6 +2388,70 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R33A extension: canonical `src/safety/sha256.nova` + dedup 3 of 4 copies
+
+R32C's exit report (the round before this one) noted: "SHA-256 is the
+fourth duplicated copy in the tree (alongside noise_xk.nova,
+merkle.nova, dtls12.nova); refactor target src/safety/sha256.nova
+tracked." Each copy was the same byte-identical FIPS 180-4 SHA-256
+implementation; the maintenance asymmetry (a bug-fix or constant-time
+tweak in one copy silently leaving the other three on a stale
+implementation) was the real cost. R33A extracts the canonical
+primitive and refactors three of the four consumers.
+
+### What R33A delivers
+
+* **NEW `src/safety/sha256.nova`** -- canonical FIPS 180-4 SHA-256 +
+  RFC 2104 HMAC-SHA256, lifted from R32C's `ecdsa_sha256` family
+  (the cleanest source copy of the four). Public API:
+  * `sha256_oneshot(buf, n) -> 33-byte buffer` (32B digest + NUL slack)
+  * `sha256_oneshot_bytes(byte_list) -> 32-element byte list`
+  * `sha256_oneshot_str(s) -> 33-byte buffer`
+  * `sha256_init() / sha256_update(st, buf, n) / sha256_final(st)` --
+    streaming triple, FIPS 180-4 padding deferred to `final`.
+  * `hmac_sha256(key_buf, key_n, msg_buf, msg_n) -> 33-byte buffer`
+* **`src/io/transducers/noise_xk.nova` refactored**: ~300 lines of
+  inlined SHA-256 + HMAC removed, replaced with `import "../../safety
+  /sha256.nova"` plus 3 one-line wrappers (`sha256_buf`, `sha256_str`,
+  `hmac_sha256_buf`) preserving the pre-existing public symbols.
+  All 44 prior unit assertions byte-identical.
+* **`src/persistence/merkle.nova` refactored**: ~240 lines of inlined
+  SHA-256 removed, replaced with `import "../safety/sha256.nova"`
+  plus 2 one-line wrappers (`_mk_sha256_buf`, `_mk_sha256_str`).
+  All 60 prior unit assertions byte-identical.
+* **`src/safety/ecdsa.nova` refactored**: ~250 lines of inlined
+  SHA-256 removed, replaced with `import "../safety/sha256.nova"`
+  plus 2 one-line wrappers (`ecdsa_sha256`, `ecdsa_sha256_bytes`).
+  All 25 prior unit assertions byte-identical.
+* **NEW `tests/unit/test_sha256.nova`** -- 20 assertions covering FIPS
+  180-4 KAT vectors (`"abc"`, `""`, Appendix B.2 56-char, 55-byte
+  one-block-boundary, 1000-byte input), streaming-vs-oneshot
+  equivalence (5 distinct splitting strategies), and RFC 4231
+  HMAC-SHA256 TC1 + TC2 + TC4 + long-key normalization.
+
+### Deferred to follow-up
+
+`src/federation/dtls12.nova` still ships `dtls_sha256` and its inline
+SHA-256 copy. R33B owns the dtls12 dedup in a parallel agent track;
+the follow-up round retires the fourth copy once both R33A + R33B
+have landed. Module count delta this round: **+1** (`sha256.nova`).
+Lines removed (~800 inlined SHA-256 + HMAC across the 3 modules) vs
+lines added (~520 canonical + ~42 wrapper/import lines across the
+3 consumers): net **-240** lines.
+
+### Subtle API differences encountered
+
+All three pre-R33A implementations produced byte-identical output but
+exposed it under module-specific names: `sha256_buf` /
+`hmac_sha256_buf` (noise_xk), `_mk_sha256_buf` / `_mk_sha256_str`
+(merkle), `ecdsa_sha256` / `ecdsa_sha256_bytes` (ecdsa). The
+canonical module provides `sha256_oneshot` / `_str` / `_bytes` and
+`hmac_sha256`; each consumer keeps a thin wrapper preserving its
+prior public symbol so callers don't have to learn a new name and
+the existing tests compile unchanged. `_mk_sha256_str` (used by
+`test_merkle.nova` to pin FIPS reference vectors) and the underscore
+helpers retain their prior shape.
+
 ## R32C extension: X.509 v3 cert parser + ECDSA-P-256 signature verify (R29B.2 cert-verify foundation)
 
 R29B (commit `a3b1233`) shipped the DTLS 1.2 record-layer + handshake
