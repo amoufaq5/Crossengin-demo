@@ -1,0 +1,756 @@
+// Unit tests for src/federation/dtls12.nova (R29B / R28E.2).
+//
+// Coverage (~50 assertions):
+//   * dtls_init returns a zero-state struct (epoch=0, seq=0, INIT, ...).
+//   * Big-endian byte serialization helpers round-trip
+//     (u16 / u24 / u48).
+//   * Record-layer byte layout against three hand-constructed wire
+//     vectors (handshake / alert / application_data content types).
+//   * dtls_record_parse rejects short headers + bogus content-type +
+//     truncated bodies.
+//   * Handshake envelope round-trip + parser rejects malformed
+//     (frag_off != 0 / frag_len != length / short header).
+//   * Handshake msg_seq increments monotonically on dtls_msg_seq_next.
+//   * State machine: all 5 valid forward edges + any-to-FAILED, plus
+//     3 invalid edges (backward / skip / FAILED-to-ESTABLISHED).
+//   * dtls_client_init emits a serialized record containing a
+//     ClientHello envelope, advances state to CLIENT_HELLO_SENT,
+//     bumps records_out + hs_out + msg_seq.
+//   * Cipher-suite gate accepts 0xC02B (ECDHE-ECDSA-AES128-GCM-SHA256)
+//     and rejects any other suite list with DTLS_ERR_NO_CIPHER.
+//   * SHA-256("abc") matches FIPS 180-2 worked example.
+//   * HMAC-SHA256(0x0b*20, "Hi There") matches RFC 4231 test case 1.
+//   * HKDF-Extract + HKDF-Expand match RFC 5869 test vector 1.
+//   * TLS 1.2 PRF self-consistent round-trip + PRF length budget
+//     (multi-A() iteration: nbytes > 32 forces a second A(i) round).
+//   * R29B.2 stubs return DTLS_ERR_STUB (regression guard against
+//     accidental real-impl swap without renaming).
+//   * Stats line shape sanity.
+//
+// All assertions run in the unit sandbox: no sockets, no real DTLS
+// handshake, no AES-GCM, no ECDHE. The skeleton's contract is byte-
+// layout + state-machine + crypto-primitive correctness. R29B.2
+// extends the harness with key-exchange and AEAD integration tests.
+
+import "../ce_test.nova"
+import "../../src/federation/dtls12.nova"
+
+// ============================================================================
+//                         Small reusable helpers
+// ============================================================================
+
+// Build a fresh byte buffer of n zero bytes.
+fn _tdtls_zero_buf(n) {
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+// Compare two byte buffers; 1 if equal, 0 otherwise.
+fn _tdtls_buf_eq(a, b, n) {
+    let i = 0
+    while i < n {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ASCII string -> byte buffer (no NUL termination interfering).
+fn _tdtls_str_to_buf(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+// ============================================================================
+//                         Init / accessors
+// ============================================================================
+
+fn test_init_zero_state() {
+    let st = dtls_init()
+    ce_check("dtls_state built", st != 0)
+    ce_eq("init state == INIT", dtls_state_get(st), 0)
+    ce_eq("init epoch == 0", dtls_record_epoch(st), 0)
+    ce_eq("init rec_seq == 0", dtls_record_seq(st), 0)
+    ce_eq("init flight_rtx == 0", dtls_flight_retransmit_count(st), 0)
+    ce_eq("init suite == 0", dtls_negotiated_suite(st), 0)
+    ce_eq("init records_out == 0", dtls_records_out(st), 0)
+    ce_eq("init records_in == 0", dtls_records_in(st), 0)
+    ce_eq("init hs_out == 0", dtls_hs_out(st), 0)
+    ce_eq("init hs_in == 0", dtls_hs_in(st), 0)
+}
+
+// ============================================================================
+//                         BE byte helpers round-trip
+// ============================================================================
+
+fn test_be_helpers_roundtrip() {
+    let buf = _tdtls_zero_buf(16)
+    // u24
+    _dtls_test_put_u24(buf, 0, 16777215)        // 0xFFFFFF
+    ce_eq("u24 max round-trips", _dtls_test_get_u24(buf, 0), 16777215)
+    _dtls_test_put_u24(buf, 4, 0)
+    ce_eq("u24 zero round-trips", _dtls_test_get_u24(buf, 4), 0)
+    _dtls_test_put_u24(buf, 8, 1193046)         // 0x123456
+    ce_eq("u24 mid-value round-trips", _dtls_test_get_u24(buf, 8), 1193046)
+    // u48
+    _dtls_test_put_u48(buf, 0, 281474976710655) // (1<<48)-1
+    ce_eq("u48 max round-trips",
+          _dtls_test_get_u48(buf, 0), 281474976710655)
+    _dtls_test_put_u48(buf, 0, 0)
+    ce_eq("u48 zero round-trips", _dtls_test_get_u48(buf, 0), 0)
+    _dtls_test_put_u48(buf, 0, 5000)
+    ce_eq("u48 small round-trips", _dtls_test_get_u48(buf, 0), 5000)
+}
+
+// ============================================================================
+//                Record-layer byte-layout vectors (3 patterns)
+// ============================================================================
+//
+// Vector 1: handshake / epoch=0 / seq=0 / 10-byte zero fragment.
+// Expected wire (13B hdr + 10B fragment):
+//   22 fe fd 00 00 00 00 00 00 00 00 00 0a 00 00 ... 00
+fn test_record_vector_handshake_zero_seq() {
+    let frag = _tdtls_zero_buf(10)
+    let r = dtls_record_serialize(DTLS_CT_HANDSHAKE, DTLS_VERSION_WORD,
+                                  0, 0, frag, 10)
+    ce_check("serialize ok", r != 0)
+    let buf = r[0]
+    let total = r[1]
+    ce_eq("total = hdr(13) + frag(10) = 23", total, 23)
+    ce_eq("byte 0 = type (22)", load8(buf + 0), 22)
+    ce_eq("byte 1 = ver major (0xfe)", load8(buf + 1), 254)
+    ce_eq("byte 2 = ver minor (0xfd)", load8(buf + 2), 253)
+    ce_eq("byte 3..4 epoch hi=0", load8(buf + 3), 0)
+    ce_eq("byte 3..4 epoch lo=0", load8(buf + 4), 0)
+    ce_eq("byte 5..10 seq hi5=0", load8(buf + 5), 0)
+    ce_eq("byte 5..10 seq mid=0", load8(buf + 8), 0)
+    ce_eq("byte 5..10 seq lo=0", load8(buf + 10), 0)
+    ce_eq("byte 11 length hi = 0", load8(buf + 11), 0)
+    ce_eq("byte 12 length lo = 10", load8(buf + 12), 10)
+    // Parse back round-trips into [type, ver, epoch, seq, length, frag_ptr, frag_n].
+    let p = dtls_record_parse(buf, total)
+    ce_check("parse returned list", p != DTLS_ERR_BAD_RECORD)
+    ce_eq("parsed type", p[0], DTLS_CT_HANDSHAKE)
+    ce_eq("parsed version", p[1], DTLS_VERSION_WORD)
+    ce_eq("parsed epoch", p[2], 0)
+    ce_eq("parsed seq", p[3], 0)
+    ce_eq("parsed length", p[4], 10)
+    ce_eq("parsed frag_n", p[6], 10)
+}
+
+// Vector 2: alert / epoch=1 / seq=0x0000000000FF / 2-byte fragment 0x02 0x28
+// (close_notify; the value choice exercises non-zero seq + non-zero
+// epoch + non-zero fragment bytes).
+fn test_record_vector_alert_nonzero_seq() {
+    let frag = alloc(3)
+    store8(frag + 0, 2)
+    store8(frag + 1, 40)        // 0x28
+    store8(frag + 2, 0)
+    let r = dtls_record_serialize(DTLS_CT_ALERT, DTLS_VERSION_WORD,
+                                  1, 255, frag, 2)
+    ce_check("alert serialize ok", r != 0)
+    let buf = r[0]
+    ce_eq("alert total = 13 + 2", r[1], 15)
+    ce_eq("byte 0 = alert type (21)", load8(buf + 0), 21)
+    ce_eq("epoch hi byte", load8(buf + 3), 0)
+    ce_eq("epoch lo byte", load8(buf + 4), 1)
+    // seq = 255 -> last byte = 0xFF, all upper = 0.
+    ce_eq("seq byte5 = 0", load8(buf + 5), 0)
+    ce_eq("seq byte10 = 0xFF", load8(buf + 10), 255)
+    ce_eq("length lo = 2", load8(buf + 12), 2)
+    ce_eq("frag byte 0 = 2", load8(buf + 13), 2)
+    ce_eq("frag byte 1 = 0x28", load8(buf + 14), 40)
+}
+
+// Vector 3: application_data / epoch=2 / seq=0x010203040506 / empty fragment.
+// Tests zero-length fragment + non-trivial seq packing.
+fn test_record_vector_app_data_empty() {
+    let r = dtls_record_serialize(DTLS_CT_APPLICATION_DATA, DTLS_VERSION_WORD,
+                                  2, 1108152157446, 0, 0)
+    // 0x010203040506 = 1*256^5 + 2*256^4 + 3*256^3 + 4*256^2 + 5*256 + 6
+    //               = 1099511627776 + 8589934592 + 50331648 + 262144 + 1280 + 6
+    //               = 1108152157446
+    ce_check("app_data empty serialize ok", r != 0)
+    let buf = r[0]
+    ce_eq("app_data total = 13", r[1], 13)
+    ce_eq("byte 0 = app_data type (23)", load8(buf + 0), 23)
+    ce_eq("epoch lo = 2", load8(buf + 4), 2)
+    ce_eq("seq byte5 = 1", load8(buf + 5), 1)
+    ce_eq("seq byte6 = 2", load8(buf + 6), 2)
+    ce_eq("seq byte7 = 3", load8(buf + 7), 3)
+    ce_eq("seq byte8 = 4", load8(buf + 8), 4)
+    ce_eq("seq byte9 = 5", load8(buf + 9), 5)
+    ce_eq("seq byte10 = 6", load8(buf + 10), 6)
+    ce_eq("length = 0", load8(buf + 11) * 256 + load8(buf + 12), 0)
+    // Round-trip parse.
+    let p = dtls_record_parse(buf, 13)
+    ce_check("empty-frag parse ok", p != DTLS_ERR_BAD_RECORD)
+    ce_eq("round-tripped epoch", p[2], 2)
+    ce_eq("round-tripped seq", p[3], 1108152157446)
+}
+
+// ============================================================================
+//                  Record-parser rejection cases
+// ============================================================================
+
+fn test_record_parse_rejects_short_header() {
+    let buf = _tdtls_zero_buf(12)        // one byte short of the 13B header
+    let p = dtls_record_parse(buf, 12)
+    ce_check("short header rejected",
+             str_eq(p, DTLS_ERR_BAD_RECORD) == 1)
+}
+
+fn test_record_parse_rejects_bad_content_type() {
+    // Construct a 13-byte header with content type = 99 (not a known type).
+    let buf = _tdtls_zero_buf(14)
+    store8(buf + 0, 99)
+    store8(buf + 1, 254)
+    store8(buf + 2, 253)
+    let p = dtls_record_parse(buf, 13)
+    ce_check("bad content-type rejected",
+             str_eq(p, DTLS_ERR_BAD_RECORD) == 1)
+}
+
+fn test_record_parse_rejects_truncated_fragment() {
+    // Header says length=10 but we only pass 13 bytes (no fragment).
+    let frag = _tdtls_zero_buf(10)
+    let r = dtls_record_serialize(DTLS_CT_HANDSHAKE, DTLS_VERSION_WORD,
+                                  0, 0, frag, 10)
+    let buf = r[0]
+    // Re-parse claiming only 13 bytes available (the bare header) so the
+    // declared length-10 fragment cannot fit.
+    let p = dtls_record_parse(buf, 13)
+    ce_check("truncated fragment rejected",
+             str_eq(p, DTLS_ERR_BAD_RECORD) == 1)
+}
+
+// ============================================================================
+//              Handshake envelope serialize / parse + rejections
+// ============================================================================
+
+fn test_handshake_envelope_roundtrip() {
+    // Build a body of 5 bytes [aa, bb, cc, dd, ee].
+    let body = alloc(6)
+    store8(body + 0, 170)        // 0xAA
+    store8(body + 1, 187)        // 0xBB
+    store8(body + 2, 204)        // 0xCC
+    store8(body + 3, 221)        // 0xDD
+    store8(body + 4, 238)        // 0xEE
+    store8(body + 5, 0)
+    let hs = dtls_handshake_serialize(DTLS_HS_CLIENT_HELLO, 7, body, 5)
+    ce_check("hs serialize ok", hs != 0)
+    let buf = hs[0]
+    let total = hs[1]
+    ce_eq("hs total = 12 hdr + 5 body", total, 17)
+    ce_eq("hs byte 0 = msg_type (1)", load8(buf + 0), DTLS_HS_CLIENT_HELLO)
+    // length (3 bytes BE) = 5
+    ce_eq("hs length byte 1 hi", load8(buf + 1), 0)
+    ce_eq("hs length byte 2 mid", load8(buf + 2), 0)
+    ce_eq("hs length byte 3 lo = 5", load8(buf + 3), 5)
+    // message_seq (2B BE) = 7
+    ce_eq("hs msg_seq lo = 7", load8(buf + 5), 7)
+    // fragment_offset (3B) = 0
+    ce_eq("hs frag_off byte 6 = 0", load8(buf + 6), 0)
+    ce_eq("hs frag_off byte 8 = 0", load8(buf + 8), 0)
+    // fragment_length (3B) = 5
+    ce_eq("hs frag_len byte 11 lo = 5", load8(buf + 11), 5)
+    // body bytes
+    ce_eq("hs body byte 0 = 0xAA", load8(buf + 12), 170)
+    ce_eq("hs body byte 4 = 0xEE", load8(buf + 16), 238)
+    // Parse back.
+    let p = dtls_handshake_parse(buf, total)
+    ce_check("hs parse ok", p != DTLS_ERR_BAD_HS)
+    ce_eq("parsed hs type", p[0], DTLS_HS_CLIENT_HELLO)
+    ce_eq("parsed hs length", p[1], 5)
+    ce_eq("parsed hs msg_seq", p[2], 7)
+    ce_eq("parsed hs frag_off", p[3], 0)
+    ce_eq("parsed hs frag_len", p[4], 5)
+}
+
+fn test_handshake_parse_rejects_short() {
+    let buf = _tdtls_zero_buf(11)        // one byte short of HS header
+    let p = dtls_handshake_parse(buf, 11)
+    ce_check("hs short header rejected",
+             str_eq(p, DTLS_ERR_BAD_HS) == 1)
+}
+
+fn test_handshake_parse_rejects_nonzero_frag_off() {
+    // Build a 12-byte header with non-zero frag_off but matching frag_len.
+    let buf = _tdtls_zero_buf(13)
+    store8(buf + 0, DTLS_HS_CLIENT_HELLO)
+    // length = 5
+    store8(buf + 3, 5)
+    // frag_off bytes 6..8 set to 4 (non-zero, R29B rejects)
+    store8(buf + 8, 4)
+    // frag_len = 5 to be valid
+    store8(buf + 11, 5)
+    let p = dtls_handshake_parse(buf, 13)
+    ce_check("nonzero frag_off rejected",
+             str_eq(p, DTLS_ERR_BAD_HS) == 1)
+}
+
+fn test_handshake_parse_rejects_mismatched_frag_len() {
+    // length=10 but frag_len=5 in the SAME message envelope -- the R29B
+    // skeleton ships the unfragmented happy path only.
+    let buf = _tdtls_zero_buf(13)
+    store8(buf + 0, DTLS_HS_CLIENT_HELLO)
+    store8(buf + 3, 10)        // length = 10
+    store8(buf + 11, 5)        // frag_len = 5
+    let p = dtls_handshake_parse(buf, 13)
+    ce_check("mismatched frag_len rejected",
+             str_eq(p, DTLS_ERR_BAD_HS) == 1)
+}
+
+// ============================================================================
+//              Handshake message_seq monotonic increment
+// ============================================================================
+
+fn test_msg_seq_increments_monotonic() {
+    let st = dtls_init()
+    let a = dtls_msg_seq_next(st)
+    let b = dtls_msg_seq_next(st)
+    let c = dtls_msg_seq_next(st)
+    ce_eq("first seq = 0", a, 0)
+    ce_eq("second seq = 1", b, 1)
+    ce_eq("third seq = 2", c, 2)
+}
+
+fn test_flight_retransmit_counter() {
+    let st = dtls_init()
+    ce_eq("retx 0 before", dtls_flight_retransmit_count(st), 0)
+    dtls_record_retransmit(st)
+    dtls_record_retransmit(st)
+    ce_eq("retx 2 after two bumps",
+          dtls_flight_retransmit_count(st), 2)
+}
+
+// ============================================================================
+//              State machine: valid + invalid edges
+// ============================================================================
+
+fn test_state_machine_valid_edges() {
+    // 5 valid forward edges:
+    ce_eq("INIT -> CLIENT_HELLO_SENT",
+          _dtls_test_valid_edge(DTLS_S_INIT,
+                                DTLS_S_CLIENT_HELLO_SENT), 1)
+    ce_eq("CLIENT_HELLO_SENT -> SERVER_HELLO_RECVD",
+          _dtls_test_valid_edge(DTLS_S_CLIENT_HELLO_SENT,
+                                DTLS_S_SERVER_HELLO_RECVD), 1)
+    ce_eq("SERVER_HELLO_RECVD -> CERTIFICATE_RECVD",
+          _dtls_test_valid_edge(DTLS_S_SERVER_HELLO_RECVD,
+                                DTLS_S_CERTIFICATE_RECVD), 1)
+    ce_eq("CERTIFICATE_RECVD -> FINISHED",
+          _dtls_test_valid_edge(DTLS_S_CERTIFICATE_RECVD,
+                                DTLS_S_FINISHED), 1)
+    ce_eq("FINISHED -> ESTABLISHED",
+          _dtls_test_valid_edge(DTLS_S_FINISHED,
+                                DTLS_S_ESTABLISHED), 1)
+    // Any-to-FAILED is always permitted (we want hard-fail reachable).
+    ce_eq("INIT -> FAILED ok",
+          _dtls_test_valid_edge(DTLS_S_INIT, DTLS_S_FAILED), 1)
+    ce_eq("ESTABLISHED -> FAILED ok",
+          _dtls_test_valid_edge(DTLS_S_ESTABLISHED,
+                                DTLS_S_FAILED), 1)
+}
+
+fn test_state_machine_invalid_edges() {
+    // Backward edge.
+    ce_eq("ESTABLISHED -> INIT rejected",
+          _dtls_test_valid_edge(DTLS_S_ESTABLISHED, DTLS_S_INIT), 0)
+    // Skip-ahead.
+    ce_eq("INIT -> ESTABLISHED rejected",
+          _dtls_test_valid_edge(DTLS_S_INIT, DTLS_S_ESTABLISHED), 0)
+    // FAILED is a dead end (cannot rejoin happy path).
+    ce_eq("FAILED -> ESTABLISHED rejected",
+          _dtls_test_valid_edge(DTLS_S_FAILED, DTLS_S_ESTABLISHED), 0)
+    // Sideways: CLIENT_HELLO_SENT can't jump to CERTIFICATE_RECVD.
+    ce_eq("CLIENT_HELLO_SENT -> CERTIFICATE_RECVD rejected",
+          _dtls_test_valid_edge(DTLS_S_CLIENT_HELLO_SENT,
+                                DTLS_S_CERTIFICATE_RECVD), 0)
+}
+
+fn test_dtls_transition_applies_state() {
+    let st = dtls_init()
+    let ok1 = dtls_transition(st, DTLS_S_CLIENT_HELLO_SENT)
+    ce_eq("transition INIT->CHS ok", ok1, 1)
+    ce_eq("state advanced", dtls_state_get(st),
+          DTLS_S_CLIENT_HELLO_SENT)
+    let bad = dtls_transition(st, DTLS_S_ESTABLISHED)
+    ce_eq("transition CHS->ESTABLISHED rejected", bad, 0)
+    ce_eq("state unchanged after reject",
+          dtls_state_get(st), DTLS_S_CLIENT_HELLO_SENT)
+    ce_check("last_err set to BAD_STATE",
+             str_eq(dtls_last_error(st), DTLS_ERR_BAD_STATE) == 1)
+}
+
+fn test_state_name_strings() {
+    ce_str_eq("name INIT", dtls_state_name(DTLS_S_INIT), "INIT")
+    ce_str_eq("name CHS",
+              dtls_state_name(DTLS_S_CLIENT_HELLO_SENT),
+              "CLIENT_HELLO_SENT")
+    ce_str_eq("name ESTABLISHED",
+              dtls_state_name(DTLS_S_ESTABLISHED), "ESTABLISHED")
+}
+
+// ============================================================================
+//              dtls_client_init emits a real CH wrapped in a record
+// ============================================================================
+
+fn test_client_init_emits_record_and_advances() {
+    let st = dtls_init()
+    let rec = dtls_client_init(st, "example.com")
+    ce_check("dtls_client_init returned record", rec != 0)
+    let buf = rec[0]
+    let total = rec[1]
+    // Record header must announce handshake content type.
+    ce_eq("client_init wire byte 0 = handshake type",
+          load8(buf + 0), DTLS_CT_HANDSHAKE)
+    ce_eq("client_init wire byte 1 = 0xfe",
+          load8(buf + 1), DTLS_VERSION_MAJOR)
+    ce_eq("client_init wire byte 2 = 0xfd",
+          load8(buf + 2), DTLS_VERSION_MINOR)
+    // State machine moved forward.
+    ce_eq("state == CLIENT_HELLO_SENT after init",
+          dtls_state_get(st), DTLS_S_CLIENT_HELLO_SENT)
+    // Counters bumped.
+    ce_eq("records_out bumped", dtls_records_out(st), 1)
+    ce_eq("hs_out bumped", dtls_hs_out(st), 1)
+    // msg_seq advanced past the CH (CH consumes seq=0; next is 1).
+    let next_seq = dtls_msg_seq_next(st)
+    ce_eq("msg_seq advanced past CH", next_seq, 1)
+    // Parse the inner handshake envelope and confirm it's a CLIENT_HELLO.
+    let rec_parsed = dtls_record_parse(buf, total)
+    ce_check("client_init record parses",
+             rec_parsed != DTLS_ERR_BAD_RECORD)
+    let hs_buf = rec_parsed[5]
+    let hs_n = rec_parsed[6]
+    let hs = dtls_handshake_parse(hs_buf, hs_n)
+    ce_check("inner handshake parses", hs != DTLS_ERR_BAD_HS)
+    ce_eq("inner handshake type == ClientHello",
+          hs[0], DTLS_HS_CLIENT_HELLO)
+    // Inner body length = 42 (matches the fixed CH body we emit).
+    ce_eq("inner CH body length = 42", hs[1], 42)
+}
+
+fn test_client_init_rejects_when_not_init() {
+    let st = dtls_init()
+    // Force-advance past INIT first.
+    dtls_transition(st, DTLS_S_CLIENT_HELLO_SENT)
+    let rec = dtls_client_init(st, "example.com")
+    ce_eq("client_init from non-INIT rejected", rec, 0)
+    ce_check("last_err set after non-INIT call",
+             str_eq(dtls_last_error(st),
+                    DTLS_ERR_BAD_STATE) == 1)
+}
+
+// ============================================================================
+//              Cipher-suite negotiation gate
+// ============================================================================
+
+fn test_cipher_suite_accepts_ecdhe_ecdsa() {
+    let offered = list_new()
+    push(offered, DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256)
+    let chosen = dtls_select_cipher_suite(offered)
+    ce_eq("0xC02B accepted", chosen,
+          DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256)
+}
+
+fn test_cipher_suite_rejects_others() {
+    let offered = list_new()
+    push(offered, 47)            // 0x002F TLS_RSA_WITH_AES_128_CBC_SHA
+    push(offered, 53)            // 0x0035 TLS_RSA_WITH_AES_256_CBC_SHA
+    push(offered, 49199)         // 0xC02F TLS_ECDHE_RSA_AES128_GCM_SHA256
+    let chosen = dtls_select_cipher_suite(offered)
+    ce_check("non-ECDHE-ECDSA suites rejected",
+             str_eq(chosen, DTLS_ERR_NO_CIPHER) == 1)
+}
+
+fn test_cipher_suite_accepts_in_mixed_list() {
+    let offered = list_new()
+    push(offered, 47)
+    push(offered, DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256)
+    push(offered, 49199)
+    let chosen = dtls_select_cipher_suite(offered)
+    ce_eq("accepts when in mid of list", chosen,
+          DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256)
+}
+
+fn test_cipher_suite_rejects_empty() {
+    let empty = list_new()
+    let chosen = dtls_select_cipher_suite(empty)
+    ce_check("empty suite list rejected",
+             str_eq(chosen, DTLS_ERR_NO_CIPHER) == 1)
+}
+
+// ============================================================================
+//                SHA-256("abc") (FIPS 180-2 worked example)
+// ============================================================================
+//
+//   SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223
+//                    b00361a396177a9cb410ff61f20015ad
+
+fn test_sha256_abc_fips_vector() {
+    let pair = _tdtls_str_to_buf("abc")
+    let digest = dtls_sha256(pair[0], pair[1])
+    let hex = dtls_hex_encode(digest, 32)
+    ce_str_eq("SHA-256(\"abc\") matches FIPS 180-2", hex,
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+// SHA-256("") = e3b0c44298fc1c149afbf4c8996fb924
+//               27ae41e4649b934ca495991b7852b855
+fn test_sha256_empty_vector() {
+    let zero = _tdtls_zero_buf(0)
+    let digest = dtls_sha256(zero, 0)
+    let hex = dtls_hex_encode(digest, 32)
+    ce_str_eq("SHA-256(\"\") matches FIPS 180-2", hex,
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+// ============================================================================
+//                HMAC-SHA256 (RFC 4231 test case 1)
+// ============================================================================
+//
+//   Key   = 0x0b * 20
+//   Data  = "Hi There"
+//   MAC   = b0344c61d8db38535ca8afceaf0bf12b
+//           881dc200c9833da726e9376c2e32cff7
+
+fn test_hmac_sha256_rfc4231_tc1() {
+    let key = alloc(21)
+    let i = 0
+    while i < 20 { store8(key + i, 11); i = i + 1 }
+    store8(key + 20, 0)
+    let msg_pair = _tdtls_str_to_buf("Hi There")
+    let mac = dtls_hmac_sha256(key, 20, msg_pair[0], msg_pair[1])
+    let hex = dtls_hex_encode(mac, 32)
+    ce_str_eq("HMAC-SHA256 RFC 4231 TC1", hex,
+              "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+}
+
+// ============================================================================
+//                HKDF (RFC 5869 test vector 1)
+// ============================================================================
+//
+//   IKM   = 0x0b * 22
+//   salt  = 0x00 0x01 ... 0x0c (13 bytes)
+//   info  = 0xf0 0xf1 ... 0xf9 (10 bytes)
+//   L     = 42
+//   PRK   = 077709362c2e32df0ddc3f0dc47bba63
+//           90b6c73bb50f9c3122ec844ad7c2b3e5
+//   OKM   = 3cb25f25faacd57a90434f64d0362f2a
+//           2d2d0a90cf1a5a4c5db02d56ecc4c5bf
+//           34007208d5b887185865
+
+fn test_hkdf_rfc5869_vector1_extract() {
+    let ikm = alloc(23)
+    let i = 0
+    while i < 22 { store8(ikm + i, 11); i = i + 1 }
+    store8(ikm + 22, 0)
+    let salt = alloc(14)
+    i = 0
+    while i < 13 { store8(salt + i, i); i = i + 1 }
+    store8(salt + 13, 0)
+    let prk = dtls_hkdf_extract(salt, 13, ikm, 22)
+    let hex = dtls_hex_encode(prk, 32)
+    ce_str_eq("HKDF-Extract RFC 5869 TV1 PRK", hex,
+              "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+}
+
+fn test_hkdf_rfc5869_vector1_expand() {
+    // Re-derive PRK from TV1 inputs.
+    let ikm = alloc(23)
+    let i = 0
+    while i < 22 { store8(ikm + i, 11); i = i + 1 }
+    store8(ikm + 22, 0)
+    let salt = alloc(14)
+    i = 0
+    while i < 13 { store8(salt + i, i); i = i + 1 }
+    store8(salt + 13, 0)
+    let prk = dtls_hkdf_extract(salt, 13, ikm, 22)
+    // info = 0xf0..0xf9
+    let info = alloc(11)
+    i = 0
+    while i < 10 {
+        store8(info + i, 240 + i)        // 0xf0..0xf9
+        i = i + 1
+    }
+    store8(info + 10, 0)
+    let okm = dtls_hkdf_expand(prk, info, 10, 42)
+    let hex = dtls_hex_encode(okm, 42)
+    ce_str_eq("HKDF-Expand RFC 5869 TV1 OKM", hex,
+              "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+}
+
+// ============================================================================
+//                TLS 1.2 PRF self-consistent + length budget
+// ============================================================================
+//
+// RFC 5246 section 5 doesn't ship a public test vector, but we can:
+//  a) verify the function is DETERMINISTIC (same inputs -> same bytes),
+//  b) verify the OUTPUT LENGTH matches the request,
+//  c) verify that DIFFERENT secrets / labels produce DIFFERENT outputs
+//     (smoke test against accidental "always returns the same buffer"
+//     impl mistakes),
+//  d) verify the multi-A() iteration path (nbytes > 32 forces a second
+//     HMAC round).
+
+fn test_prf_sha256_deterministic_and_length() {
+    let secret_pair = _tdtls_str_to_buf("supersecret")
+    let seed_pair   = _tdtls_str_to_buf("0123456789abcdef")
+    let out1 = dtls_prf_sha256(secret_pair[0], secret_pair[1],
+                               "master secret",
+                               seed_pair[0], seed_pair[1], 48)
+    let out2 = dtls_prf_sha256(secret_pair[0], secret_pair[1],
+                               "master secret",
+                               seed_pair[0], seed_pair[1], 48)
+    ce_check("PRF deterministic", _tdtls_buf_eq(out1, out2, 48) == 1)
+    // Length check: byte 47 should be readable (in-bounds), byte 48
+    // is the trailing NUL we wrote.
+    ce_eq("PRF byte 48 is trailing NUL", load8(out1 + 48), 0)
+}
+
+fn test_prf_sha256_label_changes_output() {
+    let secret_pair = _tdtls_str_to_buf("supersecret")
+    let seed_pair   = _tdtls_str_to_buf("0123456789abcdef")
+    let out_a = dtls_prf_sha256(secret_pair[0], secret_pair[1],
+                                "master secret",
+                                seed_pair[0], seed_pair[1], 16)
+    let out_b = dtls_prf_sha256(secret_pair[0], secret_pair[1],
+                                "key expansion",
+                                seed_pair[0], seed_pair[1], 16)
+    ce_check("PRF different label -> different output",
+             _tdtls_buf_eq(out_a, out_b, 16) == 0)
+}
+
+fn test_prf_sha256_multi_block_path() {
+    // 65 bytes > 32 forces 3 HMAC rounds (ceil(65/32) = 3) -- exercises
+    // the A(i) loop body more than once.
+    let secret_pair = _tdtls_str_to_buf("kkk")
+    let seed_pair   = _tdtls_str_to_buf("sss")
+    let out = dtls_prf_sha256(secret_pair[0], secret_pair[1],
+                              "test label",
+                              seed_pair[0], seed_pair[1], 65)
+    ce_check("PRF returns non-null for 65 bytes", out != 0)
+    // Two runs identical (full determinism, including across A(i)
+    // boundaries).
+    let out2 = dtls_prf_sha256(secret_pair[0], secret_pair[1],
+                               "test label",
+                               seed_pair[0], seed_pair[1], 65)
+    ce_check("PRF 65-byte run is deterministic",
+             _tdtls_buf_eq(out, out2, 65) == 1)
+}
+
+// ============================================================================
+//                R29B.2 stub regression guards
+// ============================================================================
+//
+// If a future agent accidentally turns a stub into a real impl WITHOUT
+// renaming the function, these tests fail loudly -- it's much easier
+// to debug than a silently-incomplete handshake.
+
+fn test_stubs_return_DTLS_ERR_STUB() {
+    let r = dtls_ecdhe_derive_R29B2_STUB(0, 0, 0, 0)
+    ce_check("ecdhe_derive is a stub",
+             str_eq(r, DTLS_ERR_STUB) == 1)
+    let c = dtls_cert_verify_R29B2_STUB(0, 0, 0, 0)
+    ce_check("cert_verify is a stub",
+             str_eq(c, DTLS_ERR_STUB) == 1)
+    let s = dtls_seal_record_R29B2_STUB(0, 22, 0, 0)
+    ce_check("seal_record is a stub",
+             str_eq(s, DTLS_ERR_STUB) == 1)
+    let o = dtls_open_record_R29B2_STUB(0, 0, 0)
+    ce_check("open_record is a stub",
+             str_eq(o, DTLS_ERR_STUB) == 1)
+    let e = dtls_extract_srtp_keys_R29B2_STUB(0)
+    ce_check("extract_srtp_keys is a stub",
+             str_eq(e, DTLS_ERR_STUB) == 1)
+}
+
+// ============================================================================
+//                Stats line shape
+// ============================================================================
+
+fn test_stats_line_well_formed() {
+    let st = dtls_init()
+    let line = dtls_stats_line(st)
+    ce_check("stats line non-empty", len(line) > 0)
+    ce_check("stats line begins with 'dtls:'",
+             str_eq(substr(line, 0, 5), "dtls:") == 1)
+}
+
+// ============================================================================
+//                Hex codec smoke (used by the test harness itself)
+// ============================================================================
+
+fn test_hex_codec_roundtrip() {
+    let h = "deadbeef"
+    let pair = dtls_hex_decode(h)
+    ce_check("hex_decode ok", pair != 0)
+    ce_eq("decoded length 4 bytes", pair[1], 4)
+    ce_eq("byte 0 = 0xDE", load8(pair[0] + 0), 222)
+    ce_eq("byte 3 = 0xEF", load8(pair[0] + 3), 239)
+    let re = dtls_hex_encode(pair[0], 4)
+    ce_str_eq("hex round-trip", re, "deadbeef")
+}
+
+// ============================================================================
+//                          main
+// ============================================================================
+
+fn main() {
+    test_init_zero_state()
+    test_be_helpers_roundtrip()
+    test_record_vector_handshake_zero_seq()
+    test_record_vector_alert_nonzero_seq()
+    test_record_vector_app_data_empty()
+    test_record_parse_rejects_short_header()
+    test_record_parse_rejects_bad_content_type()
+    test_record_parse_rejects_truncated_fragment()
+    test_handshake_envelope_roundtrip()
+    test_handshake_parse_rejects_short()
+    test_handshake_parse_rejects_nonzero_frag_off()
+    test_handshake_parse_rejects_mismatched_frag_len()
+    test_msg_seq_increments_monotonic()
+    test_flight_retransmit_counter()
+    test_state_machine_valid_edges()
+    test_state_machine_invalid_edges()
+    test_dtls_transition_applies_state()
+    test_state_name_strings()
+    test_client_init_emits_record_and_advances()
+    test_client_init_rejects_when_not_init()
+    test_cipher_suite_accepts_ecdhe_ecdsa()
+    test_cipher_suite_rejects_others()
+    test_cipher_suite_accepts_in_mixed_list()
+    test_cipher_suite_rejects_empty()
+    test_sha256_abc_fips_vector()
+    test_sha256_empty_vector()
+    test_hmac_sha256_rfc4231_tc1()
+    test_hkdf_rfc5869_vector1_extract()
+    test_hkdf_rfc5869_vector1_expand()
+    test_prf_sha256_deterministic_and_length()
+    test_prf_sha256_label_changes_output()
+    test_prf_sha256_multi_block_path()
+    test_stubs_return_DTLS_ERR_STUB()
+    test_stats_line_well_formed()
+    test_hex_codec_roundtrip()
+    ce_summary("dtls12")
+}
+
+main()

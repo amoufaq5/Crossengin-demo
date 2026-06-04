@@ -1,0 +1,1248 @@
+// CrossEngin federation: DTLS 1.2 record-layer + handshake skeleton
+// (R29B / R28E.2 follow-up).
+//
+// Purpose
+//
+//   R28E (`src/federation/webrtc.nova`, commit `8c566fb`) shipped the
+//   SIGNALING half of browser-to-soul WebRTC -- SDP offer/answer
+//   round-trip works, the data plane returns the documented sentinel
+//   `RTC_ERR_NEEDS_DTLS`. The R28E exit report flagged four R28E.2
+//   sub-systems: DTLS 1.2/1.3, ICE, SRTP, STUN/TURN. R29B owns the
+//   DTLS half.
+//
+//   The full DTLS stack (record-layer AEAD, X.509 cert verification,
+//   ECDHE key exchange, retransmission timers, anti-replay window,
+//   SRTP key extractor) is multi-thousand-lines; one round of a
+//   parallel-agent sprint cannot land all of it without cutting
+//   corners on correctness. R29B instead lands the SKELETON: the
+//   record-layer byte layout (RFC 6347 section 4.1) and the
+//   handshake message envelope (RFC 6347 section 4.2) with
+//   cryptographic primitives verified against published test
+//   vectors. R29B.2 will plug in actual key exchange + AEAD record
+//   encryption + certificate parsing on top of this scaffold.
+//
+//   This module is a LEAF -- it imports nothing from other CrossEngin
+//   federation modules. SHA-256 / HMAC-SHA256 / HKDF-Expand / TLS 1.2
+//   PRF are reimplemented in-module so parallel agents working on
+//   other federation modules cannot collide here. The duplication is
+//   intentional and mirrors the same pattern `src/persistence/
+//   merkle.nova` uses (which also bundles its own SHA-256 rather
+//   than importing from noise_xk.nova).
+//
+// Scope (what R29B ships)
+//
+//   1. Record layer (RFC 6347 section 4.1):
+//        struct DTLSPlaintext {
+//          ContentType  type;            // 1 byte
+//          ProtocolVersion version;      // 2 bytes (0xfefd for DTLS 1.2)
+//          uint16       epoch;           // 2 bytes (big-endian)
+//          uint48       sequence_number; // 6 bytes (big-endian)
+//          uint16       length;          // 2 bytes (big-endian)
+//          opaque       fragment[length];
+//        }
+//      Serialize / parse functions verified against a hand-constructed
+//      test vector (see `_dtls_test_record_vector` and the unit suite).
+//
+//   2. Handshake message envelope (RFC 6347 section 4.2):
+//        struct Handshake {
+//          HandshakeType msg_type;       // 1 byte
+//          uint24        length;         // 3 bytes (big-endian)
+//          uint16        message_seq;    // 2 bytes (big-endian)
+//          uint24        fragment_offset;// 3 bytes
+//          uint24        fragment_length;// 3 bytes
+//          opaque        body[fragment_length];
+//        }
+//      Per-flight message_seq increments tracked in state. Flight
+//      retransmission counter incremented on resend (R29B tracks
+//      but does NOT actually retransmit; that is R29B.2).
+//
+//   3. State machine skeleton:
+//        DTLS_INIT -> DTLS_CLIENT_HELLO_SENT -> DTLS_SERVER_HELLO_RECVD
+//        -> DTLS_CERTIFICATE_RECVD -> DTLS_FINISHED -> DTLS_ESTABLISHED
+//        Failure transitions to DTLS_FAILED from any state.
+//      `dtls_client_init(state)` emits a serialized ClientHello record
+//      and advances state to CLIENT_HELLO_SENT.
+//
+//   4. HKDF-SHA256 + TLS 1.2 PRF (P_SHA256 of RFC 5246 section 5).
+//      HKDF verified against RFC 5869 test vector 1 (the IETF
+//      reference). PRF verified via self-consistent round-trip + a
+//      documented test approach (see the unit suite).
+//
+//   5. Cipher-suite negotiation gate: ONLY
+//      ECDHE-ECDSA-AES128-GCM-SHA256 (0xC02B, RFC 5289) is accepted.
+//      Any other suite ID returned by `dtls_select_cipher_suite` is
+//      `DTLS_ERR_NO_CIPHER`. This is intentionally narrow -- it
+//      matches the bare minimum WebRTC interop suite browsers use
+//      with ECDSA self-signed certs.
+//
+// Scope (what R29B does NOT ship; R29B.2)
+//
+//   * Actual ECDHE key exchange (need P-256 scalar mul; the existing
+//     `src/safety/bignum_2048.nova` ships RFC 7919 Group 14 only --
+//     NOT a NIST P-256 curve). All key-exchange functions are stubs
+//     suffixed `_R29B2_STUB`.
+//   * Certificate (X.509) parsing + signature verification.
+//   * AEAD encryption / decryption of records under the negotiated
+//     keys. `dtls_seal_record_R29B2_STUB` returns 0.
+//   * Cookie exchange (HelloVerifyRequest) for DoS mitigation.
+//   * Real anti-replay sliding window. Sequence numbers are tracked
+//     monotonically but not validated against a window.
+//   * Actual retransmission scheduling (the timer + flight resend).
+//     A counter is kept; the wire is not driven.
+//   * SRTP master-key extraction via RFC 5705 EKM.
+//
+// Public API
+//
+//   dtls_init()                                  -> dtls_state
+//   dtls_client_init(state, server_name)         -> bytes_buf (record)
+//   dtls_state_get(state)                        -> int (DTLS_S_* constant)
+//   dtls_state_name(s)                           -> string
+//   dtls_transition(state, next)                 -> 1 ok | 0 invalid
+//   dtls_select_cipher_suite(suites_list)        -> 0xC02B | DTLS_ERR_NO_CIPHER
+//   dtls_record_serialize(type, ver, epoch, seq, fragment, frag_n)
+//                                                -> [buf, total_n]
+//   dtls_record_parse(buf, n)                    -> [type, ver, epoch, seq,
+//                                                   length, frag_buf, frag_n]
+//                                                   | DTLS_ERR_BAD_RECORD
+//   dtls_handshake_serialize(type, msg_seq, body, body_n)
+//                                                -> [buf, total_n]
+//   dtls_handshake_parse(buf, n)                 -> [type, length, msg_seq,
+//                                                   frag_off, frag_len,
+//                                                   body_buf, body_n]
+//                                                   | DTLS_ERR_BAD_HS
+//   dtls_msg_seq_next(state)                     -> int (post-increment)
+//   dtls_flight_retransmit_count(state)          -> int
+//   dtls_record_epoch(state)                     -> int
+//   dtls_record_seq(state)                       -> int (low 48 bits)
+//
+//   Crypto primitives (RFC 5869 + RFC 5246):
+//     dtls_sha256(buf, n)                        -> 32-byte digest buf
+//     dtls_hmac_sha256(key, key_n, msg, msg_n)   -> 32-byte mac buf
+//     dtls_hkdf_extract(salt, salt_n, ikm, ikm_n) -> 32-byte PRK buf
+//     dtls_hkdf_expand(prk, info, info_n, nbytes) -> nbytes buf
+//     dtls_prf_sha256(secret, sec_n, label, seed, seed_n, nbytes)
+//                                                -> nbytes buf (RFC 5246 PRF)
+//
+//   R29B.2 stubs (always return 0; tagged for `grep _R29B2_STUB`):
+//     dtls_ecdhe_derive_R29B2_STUB
+//     dtls_cert_verify_R29B2_STUB
+//     dtls_seal_record_R29B2_STUB
+//     dtls_open_record_R29B2_STUB
+//     dtls_extract_srtp_keys_R29B2_STUB
+//
+//   Error tags:
+//     DTLS_ERR_BAD_RECORD  -- malformed record (short header / bad
+//                             length / unknown content type).
+//     DTLS_ERR_BAD_HS      -- malformed handshake envelope.
+//     DTLS_ERR_NO_CIPHER   -- no acceptable suite in the offered list.
+//     DTLS_ERR_BAD_STATE   -- transition request rejected.
+//     DTLS_ERR_STUB        -- generic stub return.
+//
+// ADRs touched: registers ADR-0093 (DTLS 1.2 record-layer + handshake
+//   skeleton, R28E.2 sub-system).
+// NOVA dependencies: builtins (alloc, store8, load8, list_new, push,
+//   int_*, len, str_eq).
+// CrossEngin dependencies: NONE. This module is a leaf -- it is safe
+//   to land in parallel with other R28E.2 follow-ups (ICE / SRTP /
+//   STUN-TURN) because it imports no other CE module.
+
+// ============================================================================
+//                              Error tags
+// ============================================================================
+
+let DTLS_ERR_BAD_RECORD = "dtls: bad record"
+let DTLS_ERR_BAD_HS     = "dtls: bad handshake"
+let DTLS_ERR_NO_CIPHER  = "dtls: no acceptable cipher suite"
+let DTLS_ERR_BAD_STATE  = "dtls: invalid state transition"
+let DTLS_ERR_STUB       = "dtls: R29B2 stub"
+
+// ============================================================================
+//                              Protocol constants
+// ============================================================================
+
+// DTLS 1.2 wire version per RFC 6347 section 4.1.
+//   major = 254 (0xfe), minor = 253 (0xfd) -- the off-by-one inversion
+//   relative to TLS 1.2 (3.3) is historical: DTLS picks numbers that
+//   collate AFTER TLS so an intermediary that key-orders versions
+//   prefers TLS over DTLS by default.
+let DTLS_VERSION_MAJOR = 254     // 0xfe
+let DTLS_VERSION_MINOR = 253     // 0xfd
+let DTLS_VERSION_WORD  = 65277   // 0xfefd  (major<<8 | minor)
+
+// ContentType (RFC 5246 section 6.2.1 / RFC 6347 section 4.1):
+//   change_cipher_spec(20), alert(21), handshake(22), application_data(23).
+let DTLS_CT_CCS              = 20
+let DTLS_CT_ALERT            = 21
+let DTLS_CT_HANDSHAKE        = 22
+let DTLS_CT_APPLICATION_DATA = 23
+
+// HandshakeType (RFC 5246 section 7.4):
+let DTLS_HS_HELLO_REQUEST       = 0
+let DTLS_HS_CLIENT_HELLO        = 1
+let DTLS_HS_SERVER_HELLO        = 2
+let DTLS_HS_HELLO_VERIFY_REQ    = 3    // DTLS-specific (RFC 6347 4.2.1)
+let DTLS_HS_CERTIFICATE         = 11
+let DTLS_HS_SERVER_KEY_EXCHANGE = 12
+let DTLS_HS_CERT_REQUEST        = 13
+let DTLS_HS_SERVER_HELLO_DONE   = 14
+let DTLS_HS_CERT_VERIFY         = 15
+let DTLS_HS_CLIENT_KEY_EXCHANGE = 16
+let DTLS_HS_FINISHED            = 20
+
+// Cipher suites (RFC 5289). We accept exactly ONE:
+//   TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = { 0xC0, 0x2B }
+let DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256 = 49195   // 0xC02B
+
+// Record-header fixed length (RFC 6347 4.1): 13 bytes
+//   1B type + 2B version + 2B epoch + 6B seq + 2B length.
+let DTLS_RECORD_HDR_LEN = 13
+
+// Handshake-envelope header length (RFC 6347 4.2): 12 bytes
+//   1B msg_type + 3B length + 2B message_seq + 3B frag_off + 3B frag_len.
+let DTLS_HS_HDR_LEN = 12
+
+// Per-record fragment max -- RFC 6347 (2^14 plaintext). For the
+// skeleton we cap any single serialize call at this limit so the
+// 16-bit length field cannot overflow.
+let DTLS_RECORD_MAX_FRAGMENT = 16384
+
+// ============================================================================
+//                         State machine
+// ============================================================================
+//
+// Linear progression from INIT through ESTABLISHED. ANY state -> FAILED
+// is permitted (we want hard-fail to be reachable from anywhere). No
+// other backward transitions are allowed: a handshake that takes the
+// wrong fork must restart from scratch (a fresh `dtls_init` state).
+
+let DTLS_S_INIT                = 0
+let DTLS_S_CLIENT_HELLO_SENT   = 1
+let DTLS_S_SERVER_HELLO_RECVD  = 2
+let DTLS_S_CERTIFICATE_RECVD   = 3
+let DTLS_S_FINISHED            = 4
+let DTLS_S_ESTABLISHED         = 5
+let DTLS_S_FAILED              = 6
+
+fn dtls_state_name(s) {
+    if s == DTLS_S_INIT               { return "INIT" }
+    if s == DTLS_S_CLIENT_HELLO_SENT  { return "CLIENT_HELLO_SENT" }
+    if s == DTLS_S_SERVER_HELLO_RECVD { return "SERVER_HELLO_RECVD" }
+    if s == DTLS_S_CERTIFICATE_RECVD  { return "CERTIFICATE_RECVD" }
+    if s == DTLS_S_FINISHED           { return "FINISHED" }
+    if s == DTLS_S_ESTABLISHED        { return "ESTABLISHED" }
+    if s == DTLS_S_FAILED             { return "FAILED" }
+    return "UNKNOWN"
+}
+
+// Valid transitions: linear forward + any-to-FAILED.
+// Caller drives the state machine; we validate the edge.
+fn _dtls_valid_edge(from, to) {
+    if to == DTLS_S_FAILED { return 1 }
+    if from == DTLS_S_INIT               { if to == DTLS_S_CLIENT_HELLO_SENT  { return 1 } }
+    if from == DTLS_S_CLIENT_HELLO_SENT  { if to == DTLS_S_SERVER_HELLO_RECVD { return 1 } }
+    if from == DTLS_S_SERVER_HELLO_RECVD { if to == DTLS_S_CERTIFICATE_RECVD  { return 1 } }
+    if from == DTLS_S_CERTIFICATE_RECVD  { if to == DTLS_S_FINISHED           { return 1 } }
+    if from == DTLS_S_FINISHED           { if to == DTLS_S_ESTABLISHED        { return 1 } }
+    return 0
+}
+
+// ============================================================================
+//                         dtls_state record
+// ============================================================================
+//
+// Flat list-of-slots record. Pinned constants keep the layout stable
+// when R29B.2 adds slots for the per-direction AEAD context + the
+// retransmission timer state at the tail.
+
+let DTLS_S_SLOT_STATE          = 0   // int (DTLS_S_*)
+let DTLS_S_SLOT_MSG_SEQ        = 1   // int -- next handshake message_seq
+let DTLS_S_SLOT_EPOCH          = 2   // int -- current epoch
+let DTLS_S_SLOT_REC_SEQ        = 3   // int -- low 48 bits of seq counter
+let DTLS_S_SLOT_FLIGHT_RTX     = 4   // int -- retransmit counter
+let DTLS_S_SLOT_CIPHER_SUITE   = 5   // int -- negotiated suite (0 until set)
+let DTLS_S_SLOT_SERVER_NAME    = 6   // string -- SNI carried in CH
+let DTLS_S_SLOT_LAST_ERR       = 7   // string -- most recent err tag
+let DTLS_S_SLOT_RECORDS_OUT    = 8   // int -- serialize counter
+let DTLS_S_SLOT_RECORDS_IN     = 9   // int -- parse counter
+let DTLS_S_SLOT_HS_OUT         = 10  // int -- handshake msgs emitted
+let DTLS_S_SLOT_HS_IN          = 11  // int -- handshake msgs parsed
+
+fn dtls_init() {
+    let st = list_new()
+    push(st, DTLS_S_INIT)        // state
+    push(st, 0)                  // msg_seq
+    push(st, 0)                  // epoch
+    push(st, 0)                  // rec_seq
+    push(st, 0)                  // flight_rtx
+    push(st, 0)                  // cipher_suite
+    push(st, "")                 // server_name
+    push(st, "")                 // last_err
+    push(st, 0)                  // records_out
+    push(st, 0)                  // records_in
+    push(st, 0)                  // hs_out
+    push(st, 0)                  // hs_in
+    return st
+}
+
+fn dtls_state_get(state)               { return state[DTLS_S_SLOT_STATE] }
+fn dtls_record_epoch(state)            { return state[DTLS_S_SLOT_EPOCH] }
+fn dtls_record_seq(state)              { return state[DTLS_S_SLOT_REC_SEQ] }
+fn dtls_flight_retransmit_count(state) { return state[DTLS_S_SLOT_FLIGHT_RTX] }
+fn dtls_negotiated_suite(state)        { return state[DTLS_S_SLOT_CIPHER_SUITE] }
+fn dtls_last_error(state)              { return state[DTLS_S_SLOT_LAST_ERR] }
+fn dtls_records_out(state)             { return state[DTLS_S_SLOT_RECORDS_OUT] }
+fn dtls_records_in(state)              { return state[DTLS_S_SLOT_RECORDS_IN] }
+fn dtls_hs_out(state)                  { return state[DTLS_S_SLOT_HS_OUT] }
+fn dtls_hs_in(state)                   { return state[DTLS_S_SLOT_HS_IN] }
+
+// Drive a transition. Returns 1 on success, 0 if the edge is rejected.
+// On reject, `last_err` is set to DTLS_ERR_BAD_STATE.
+fn dtls_transition(state, next) {
+    let cur = state[DTLS_S_SLOT_STATE]
+    if _dtls_valid_edge(cur, next) == 0 {
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_ERR_BAD_STATE
+        return 0
+    }
+    state[DTLS_S_SLOT_STATE] = next
+    return 1
+}
+
+// Post-increment the handshake message_seq counter. RFC 6347 4.2.2:
+// each NEW handshake message (not retransmission) gets a fresh seq.
+// Returns the value used (pre-increment).
+fn dtls_msg_seq_next(state) {
+    let s = state[DTLS_S_SLOT_MSG_SEQ]
+    state[DTLS_S_SLOT_MSG_SEQ] = s + 1
+    return s
+}
+
+// Bump the flight retransmit counter (without actually resending).
+fn dtls_record_retransmit(state) {
+    state[DTLS_S_SLOT_FLIGHT_RTX] = state[DTLS_S_SLOT_FLIGHT_RTX] + 1
+    return state[DTLS_S_SLOT_FLIGHT_RTX]
+}
+
+// Post-increment the record sequence number. The wire field is 48 bits;
+// we mask after the bump so values cycle if they ever wrap (a wrap
+// during a single connection requires re-key per RFC 6347 4.1, which is
+// part of R29B.2's epoch-management story -- not enforced here).
+let _DTLS_SEQ_MASK = 281474976710655   // (1 << 48) - 1 = 0xFFFFFFFFFFFF
+
+fn _dtls_seq_next(state) {
+    let s = state[DTLS_S_SLOT_REC_SEQ]
+    let n = int_and(s + 1, _DTLS_SEQ_MASK)
+    state[DTLS_S_SLOT_REC_SEQ] = n
+    return s
+}
+
+// ============================================================================
+//                         Cipher-suite gate
+// ============================================================================
+//
+// `suites` is a list of integers (each a 16-bit suite ID). Returns the
+// FIRST suite we accept, or DTLS_ERR_NO_CIPHER if none match. R29B
+// accepts exactly one suite (the WebRTC interop minimum); a R29B.2
+// extension can broaden the table without changing this signature.
+
+fn dtls_select_cipher_suite(suites) {
+    if suites == 0 { return DTLS_ERR_NO_CIPHER }
+    let i = 0
+    while i < len(suites) {
+        if suites[i] == DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256 {
+            return DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256
+        }
+        i = i + 1
+    }
+    return DTLS_ERR_NO_CIPHER
+}
+
+// ============================================================================
+//                  Big-endian byte serialization helpers
+// ============================================================================
+//
+// DTLS / TLS is BIG-ENDIAN on the wire. All multi-byte integers are
+// network byte order. We provide 8 / 16 / 24 / 48 / 64-bit packers
+// against a raw alloc'd byte buffer.
+
+fn _dtls_put_u8(buf, off, v) {
+    store8(buf + off, int_and(v, 255))
+    return 1
+}
+
+fn _dtls_put_u16(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 1, int_and(v, 255))
+    return 1
+}
+
+fn _dtls_put_u24(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 2, int_and(v, 255))
+    return 1
+}
+
+fn _dtls_put_u48(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 40), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 32), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 3, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 4, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 5, int_and(v, 255))
+    return 1
+}
+
+fn _dtls_get_u8(buf, off)  { return load8(buf + off) }
+
+fn _dtls_get_u16(buf, off) {
+    let hi = load8(buf + off + 0)
+    let lo = load8(buf + off + 1)
+    return int_or(int_shl(hi, 8), lo)
+}
+
+fn _dtls_get_u24(buf, off) {
+    let a = load8(buf + off + 0)
+    let b = load8(buf + off + 1)
+    let c = load8(buf + off + 2)
+    return int_or(int_or(int_shl(a, 16), int_shl(b, 8)), c)
+}
+
+fn _dtls_get_u48(buf, off) {
+    let a = load8(buf + off + 0)
+    let b = load8(buf + off + 1)
+    let c = load8(buf + off + 2)
+    let d = load8(buf + off + 3)
+    let e = load8(buf + off + 4)
+    let f = load8(buf + off + 5)
+    let hi = int_or(int_shl(a, 8), b)             // top 16
+    let mid = int_or(int_shl(c, 8), d)            // mid 16
+    let lo  = int_or(int_shl(e, 8), f)            // low 16
+    return int_or(int_or(int_shl(hi, 32), int_shl(mid, 16)), lo)
+}
+
+// Copy `n` bytes from src to dst at the given offsets.
+fn _dtls_copy_bytes(dst, dst_off, src, src_off, n) {
+    let i = 0
+    while i < n {
+        store8(dst + dst_off + i, load8(src + src_off + i))
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                      Record-layer serialize / parse
+// ============================================================================
+//
+// RFC 6347 section 4.1:
+//
+//   struct {
+//     ContentType type;             // 1 byte
+//     ProtocolVersion version;      // 2 bytes (major/minor)
+//     uint16 epoch;                 // 2 bytes
+//     uint48 sequence_number;       // 6 bytes
+//     uint16 length;                // 2 bytes
+//     opaque fragment[length];      // length bytes
+//   } DTLSPlaintext;
+//
+// Total header: 13 bytes. We pass `fragment` as a (buf, n) pair so the
+// caller can pre-allocate the wire image without an intermediate copy.
+// Output: [serialized_buf, total_len] -- caller takes ownership.
+
+fn dtls_record_serialize(type_byte, version_word, epoch, seq, fragment_buf, frag_n) {
+    if frag_n < 0 { return 0 }
+    if frag_n > DTLS_RECORD_MAX_FRAGMENT { return 0 }
+    let total = DTLS_RECORD_HDR_LEN + frag_n
+    let out = alloc(total + 1)
+    _dtls_put_u8(out, 0, type_byte)
+    _dtls_put_u16(out, 1, version_word)
+    _dtls_put_u16(out, 3, epoch)
+    _dtls_put_u48(out, 5, seq)
+    _dtls_put_u16(out, 11, frag_n)
+    if frag_n > 0 {
+        _dtls_copy_bytes(out, DTLS_RECORD_HDR_LEN, fragment_buf, 0, frag_n)
+    }
+    store8(out + total, 0)
+    let result = list_new()
+    push(result, out)
+    push(result, total)
+    return result
+}
+
+// Parse a record image into its constituent fields. Returns either a
+// list [type, version, epoch, seq, length, frag_buf, frag_n] or the
+// error tag DTLS_ERR_BAD_RECORD. The returned fragment buffer points
+// INTO the input buffer (no copy) -- caller must not free buf while
+// using frag_buf.
+fn dtls_record_parse(buf, n) {
+    if n < DTLS_RECORD_HDR_LEN { return DTLS_ERR_BAD_RECORD }
+    let type_byte = _dtls_get_u8(buf, 0)
+    // Gate on known content types. Reject unknowns up front (a defensive
+    // parser stance per RFC 6347 4.1.2.7 -- the alert behaviour at
+    // runtime is a separate layer; here we just reject the bytes).
+    if type_byte != DTLS_CT_CCS {
+        if type_byte != DTLS_CT_ALERT {
+            if type_byte != DTLS_CT_HANDSHAKE {
+                if type_byte != DTLS_CT_APPLICATION_DATA {
+                    return DTLS_ERR_BAD_RECORD
+                }
+            }
+        }
+    }
+    let version_word = _dtls_get_u16(buf, 1)
+    let epoch = _dtls_get_u16(buf, 3)
+    let seq = _dtls_get_u48(buf, 5)
+    let length = _dtls_get_u16(buf, 11)
+    // Buffer sanity: header + length must fit in n.
+    if DTLS_RECORD_HDR_LEN + length > n { return DTLS_ERR_BAD_RECORD }
+    if length > DTLS_RECORD_MAX_FRAGMENT { return DTLS_ERR_BAD_RECORD }
+    let frag_buf = buf + DTLS_RECORD_HDR_LEN
+    let out = list_new()
+    push(out, type_byte)
+    push(out, version_word)
+    push(out, epoch)
+    push(out, seq)
+    push(out, length)
+    push(out, frag_buf)
+    push(out, length)
+    return out
+}
+
+// Convenience: emit a record from `state` -- bumps epoch/seq counters.
+// Returns the serialized [buf, total] pair on success, 0 on alloc fail.
+fn dtls_record_emit(state, type_byte, fragment_buf, frag_n) {
+    let seq = _dtls_seq_next(state)
+    let epoch = state[DTLS_S_SLOT_EPOCH]
+    let rec = dtls_record_serialize(type_byte, DTLS_VERSION_WORD,
+                                    epoch, seq, fragment_buf, frag_n)
+    if rec == 0 { return 0 }
+    state[DTLS_S_SLOT_RECORDS_OUT] = state[DTLS_S_SLOT_RECORDS_OUT] + 1
+    return rec
+}
+
+// Convenience: parse an inbound record AND bump the inbound counter.
+fn dtls_record_recv(state, buf, n) {
+    let r = dtls_record_parse(buf, n)
+    if r == DTLS_ERR_BAD_RECORD { return r }
+    state[DTLS_S_SLOT_RECORDS_IN] = state[DTLS_S_SLOT_RECORDS_IN] + 1
+    return r
+}
+
+// ============================================================================
+//                  Handshake envelope serialize / parse
+// ============================================================================
+//
+// RFC 6347 section 4.2.2:
+//
+//   struct {
+//     HandshakeType msg_type;        // 1 byte
+//     uint24 length;                 // 3 bytes -- TOTAL body length
+//     uint16 message_seq;            // 2 bytes -- per-message counter
+//     uint24 fragment_offset;        // 3 bytes -- offset into body
+//     uint24 fragment_length;        // 3 bytes -- this fragment's length
+//     opaque body[fragment_length];  // fragment bytes
+//   } Handshake;
+//
+// For R29B we ship ONLY the unfragmented happy path: fragment_offset=0,
+// fragment_length=length. R29B.2 will add reassembly across fragments.
+// `length` is the total handshake-message body length (i.e. the
+// post-fragmentation pre-fragmentation logical body length).
+
+fn dtls_handshake_serialize(msg_type, msg_seq, body_buf, body_n) {
+    if body_n < 0 { return 0 }
+    let total = DTLS_HS_HDR_LEN + body_n
+    let out = alloc(total + 1)
+    _dtls_put_u8(out, 0, msg_type)
+    _dtls_put_u24(out, 1, body_n)              // length
+    _dtls_put_u16(out, 4, msg_seq)
+    _dtls_put_u24(out, 6, 0)                   // fragment_offset
+    _dtls_put_u24(out, 9, body_n)              // fragment_length
+    if body_n > 0 {
+        _dtls_copy_bytes(out, DTLS_HS_HDR_LEN, body_buf, 0, body_n)
+    }
+    store8(out + total, 0)
+    let result = list_new()
+    push(result, out)
+    push(result, total)
+    return result
+}
+
+fn dtls_handshake_parse(buf, n) {
+    if n < DTLS_HS_HDR_LEN { return DTLS_ERR_BAD_HS }
+    let msg_type = _dtls_get_u8(buf, 0)
+    let length = _dtls_get_u24(buf, 1)
+    let msg_seq = _dtls_get_u16(buf, 4)
+    let frag_off = _dtls_get_u24(buf, 6)
+    let frag_len = _dtls_get_u24(buf, 9)
+    // For the R29B skeleton, frag_off==0 and frag_len==length is the
+    // only well-formed unfragmented case.
+    if frag_off != 0 { return DTLS_ERR_BAD_HS }
+    if frag_len != length { return DTLS_ERR_BAD_HS }
+    if DTLS_HS_HDR_LEN + frag_len > n { return DTLS_ERR_BAD_HS }
+    let body_buf = buf + DTLS_HS_HDR_LEN
+    let out = list_new()
+    push(out, msg_type)
+    push(out, length)
+    push(out, msg_seq)
+    push(out, frag_off)
+    push(out, frag_len)
+    push(out, body_buf)
+    push(out, frag_len)
+    return out
+}
+
+// ============================================================================
+//                         ClientHello body builder
+// ============================================================================
+//
+// RFC 5246 section 7.4.1.2:
+//
+//   struct {
+//     ProtocolVersion client_version;        // 2 bytes
+//     Random random;                          // 32 bytes (4B time + 28B rand)
+//     SessionID session_id<0..32>;            // 1B len + bytes
+//     opaque cookie<0..2^8-1>;                // (DTLS only, RFC 6347 4.2.2)
+//     CipherSuite cipher_suites<2..2^16-2>;   // 2B len + 2B per suite
+//     CompressionMethod compression_methods<1..2^8-1>;  // 1B len + 1B per
+//     Extension extensions<0..2^16-1>;        // optional
+//   } ClientHello;
+//
+// R29B emits the MINIMUM viable ClientHello: empty session_id, empty
+// cookie (server will reply with HelloVerifyRequest if cookie required,
+// per RFC 6347 4.2.1 -- the cookie response is R29B.2), one cipher
+// suite (0xC02B), one compression method (null=0), no extensions.
+//
+// The Random is a 32-byte buffer of zero bytes in this skeleton; a real
+// build would fill it with a secure_random pull. We comment the slot
+// clearly so future agents see it; the skeleton's purpose is byte-
+// layout correctness, not unpredictability.
+
+fn _dtls_build_client_hello_body() {
+    // 2 (ver) + 32 (random) + 1 (sid len=0) + 1 (cookie len=0) +
+    // 2 (suites len) + 2 (one suite) + 1 (compr len=1) + 1 (null compr) = 42
+    let body_n = 42
+    let body = alloc(body_n + 1)
+    let off = 0
+    _dtls_put_u16(body, off, DTLS_VERSION_WORD); off = off + 2
+    // 32-byte zero Random (R29B placeholder; secure_random in R29B.2).
+    let i = 0
+    while i < 32 {
+        store8(body + off + i, 0)
+        i = i + 1
+    }
+    off = off + 32
+    _dtls_put_u8(body, off, 0); off = off + 1           // session_id length = 0
+    _dtls_put_u8(body, off, 0); off = off + 1           // cookie length = 0
+    _dtls_put_u16(body, off, 2); off = off + 2          // cipher_suites length (bytes)
+    _dtls_put_u16(body, off, DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256)
+    off = off + 2
+    _dtls_put_u8(body, off, 1); off = off + 1           // compression methods length
+    _dtls_put_u8(body, off, 0); off = off + 1           // null compression
+    store8(body + body_n, 0)
+    let result = list_new()
+    push(result, body)
+    push(result, body_n)
+    return result
+}
+
+// dtls_client_init: build a ClientHello, wrap it in a Handshake envelope,
+// wrap that in a record, and advance state to CLIENT_HELLO_SENT.
+// `server_name` is recorded for SNI -- the SNI extension itself is a
+// R29B.2 item (extensions wire format).
+fn dtls_client_init(state, server_name) {
+    if state[DTLS_S_SLOT_STATE] != DTLS_S_INIT {
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_ERR_BAD_STATE
+        return 0
+    }
+    state[DTLS_S_SLOT_SERVER_NAME] = server_name
+    let body_pair = _dtls_build_client_hello_body()
+    if body_pair == 0 { return 0 }
+    let body = body_pair[0]
+    let body_n = body_pair[1]
+    let msg_seq = dtls_msg_seq_next(state)
+    let hs_pair = dtls_handshake_serialize(DTLS_HS_CLIENT_HELLO,
+                                           msg_seq, body, body_n)
+    if hs_pair == 0 { return 0 }
+    let hs_buf = hs_pair[0]
+    let hs_n = hs_pair[1]
+    state[DTLS_S_SLOT_HS_OUT] = state[DTLS_S_SLOT_HS_OUT] + 1
+    let rec = dtls_record_emit(state, DTLS_CT_HANDSHAKE, hs_buf, hs_n)
+    if rec == 0 { return 0 }
+    // Advance the state machine.
+    state[DTLS_S_SLOT_STATE] = DTLS_S_CLIENT_HELLO_SENT
+    return rec
+}
+
+// ============================================================================
+//                     SHA-256  (FIPS 180-4)  -- pure NOVA
+// ============================================================================
+//
+// Bundled in-module so this file remains a true leaf. Byte-identical to
+// the SHA-256 in `src/io/transducers/noise_xk.nova` and
+// `src/persistence/merkle.nova`; the duplication is the cost of "no
+// cross-federation imports".
+
+let _DTLS_MASK32  = 4294967295
+let _DTLS_HASH_LEN = 32
+let _DTLS_BLOCK_LEN = 64
+
+fn _dtls_mask32(x) { return int_and(x, _DTLS_MASK32) }
+fn _dtls_add32(a, b) { return _dtls_mask32(int_add(a, b)) }
+fn _dtls_xor32(a, b) { return _dtls_mask32(int_xor(a, b)) }
+fn _dtls_and32(a, b) { return _dtls_mask32(int_and(a, b)) }
+fn _dtls_or32(a, b)  { return _dtls_mask32(int_or(a, b)) }
+fn _dtls_not32(x)    { return _dtls_mask32(int_xor(x, _DTLS_MASK32)) }
+
+fn _dtls_rotr32(x, n) {
+    let right = int_shr(x, n)
+    let left  = _dtls_mask32(int_shl(x, 32 - n))
+    return _dtls_mask32(int_or(right, left))
+}
+
+fn _dtls_load_be32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return _dtls_mask32(v)
+}
+
+fn _dtls_store_be32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+// FIPS 180-4 K constants -- first 32 bits of the fractional cube roots
+// of the first 64 primes.
+fn _dtls_sha_k(i) {
+    if i ==  0 { return 1116352408 }
+    if i ==  1 { return 1899447441 }
+    if i ==  2 { return 3049323471 }
+    if i ==  3 { return 3921009573 }
+    if i ==  4 { return 961987163 }
+    if i ==  5 { return 1508970993 }
+    if i ==  6 { return 2453635748 }
+    if i ==  7 { return 2870763221 }
+    if i ==  8 { return 3624381080 }
+    if i ==  9 { return 310598401 }
+    if i == 10 { return 607225278 }
+    if i == 11 { return 1426881987 }
+    if i == 12 { return 1925078388 }
+    if i == 13 { return 2162078206 }
+    if i == 14 { return 2614888103 }
+    if i == 15 { return 3248222580 }
+    if i == 16 { return 3835390401 }
+    if i == 17 { return 4022224774 }
+    if i == 18 { return 264347078 }
+    if i == 19 { return 604807628 }
+    if i == 20 { return 770255983 }
+    if i == 21 { return 1249150122 }
+    if i == 22 { return 1555081692 }
+    if i == 23 { return 1996064986 }
+    if i == 24 { return 2554220882 }
+    if i == 25 { return 2821834349 }
+    if i == 26 { return 2952996808 }
+    if i == 27 { return 3210313671 }
+    if i == 28 { return 3336571891 }
+    if i == 29 { return 3584528711 }
+    if i == 30 { return 113926993 }
+    if i == 31 { return 338241895 }
+    if i == 32 { return 666307205 }
+    if i == 33 { return 773529912 }
+    if i == 34 { return 1294757372 }
+    if i == 35 { return 1396182291 }
+    if i == 36 { return 1695183700 }
+    if i == 37 { return 1986661051 }
+    if i == 38 { return 2177026350 }
+    if i == 39 { return 2456956037 }
+    if i == 40 { return 2730485921 }
+    if i == 41 { return 2820302411 }
+    if i == 42 { return 3259730800 }
+    if i == 43 { return 3345764771 }
+    if i == 44 { return 3516065817 }
+    if i == 45 { return 3600352804 }
+    if i == 46 { return 4094571909 }
+    if i == 47 { return 275423344 }
+    if i == 48 { return 430227734 }
+    if i == 49 { return 506948616 }
+    if i == 50 { return 659060556 }
+    if i == 51 { return 883997877 }
+    if i == 52 { return 958139571 }
+    if i == 53 { return 1322822218 }
+    if i == 54 { return 1537002063 }
+    if i == 55 { return 1747873779 }
+    if i == 56 { return 1955562222 }
+    if i == 57 { return 2024104815 }
+    if i == 58 { return 2227730452 }
+    if i == 59 { return 2361852424 }
+    if i == 60 { return 2428436474 }
+    if i == 61 { return 2756734187 }
+    if i == 62 { return 3204031479 }
+    if i == 63 { return 3329325298 }
+    return 0
+}
+
+fn _dtls_sha_init_h() {
+    let h = list_new()
+    push(h, 1779033703)   // 0x6a09e667
+    push(h, 3144134277)   // 0xbb67ae85
+    push(h, 1013904242)   // 0x3c6ef372
+    push(h, 2773480762)   // 0xa54ff53a
+    push(h, 1359893119)   // 0x510e527f
+    push(h, 2600822924)   // 0x9b05688c
+    push(h, 528734635)    // 0x1f83d9ab
+    push(h, 1541459225)   // 0x5be0cd19
+    return h
+}
+
+fn _dtls_sha_compress(h, blk) {
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _dtls_load_be32(blk, i * 4))
+        i = i + 1
+    }
+    while i < 64 {
+        let w15 = w[i - 15]
+        let w2  = w[i - 2]
+        let s0 = _dtls_xor32(_dtls_xor32(_dtls_rotr32(w15, 7),
+                                         _dtls_rotr32(w15, 18)),
+                             int_shr(w15, 3))
+        let s1 = _dtls_xor32(_dtls_xor32(_dtls_rotr32(w2, 17),
+                                         _dtls_rotr32(w2, 19)),
+                             int_shr(w2, 10))
+        let v = _dtls_add32(_dtls_add32(_dtls_add32(w[i - 16], s0),
+                                        w[i - 7]), s1)
+        push(w, v)
+        i = i + 1
+    }
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]
+    let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7]
+    let t = 0
+    while t < 64 {
+        let s1 = _dtls_xor32(_dtls_xor32(_dtls_rotr32(e, 6),
+                                         _dtls_rotr32(e, 11)),
+                             _dtls_rotr32(e, 25))
+        let ch = _dtls_xor32(_dtls_and32(e, f),
+                             _dtls_and32(_dtls_not32(e), g))
+        let t1 = _dtls_add32(_dtls_add32(_dtls_add32(_dtls_add32(hh, s1), ch),
+                                         _dtls_sha_k(t)), w[t])
+        let s0 = _dtls_xor32(_dtls_xor32(_dtls_rotr32(a, 2),
+                                         _dtls_rotr32(a, 13)),
+                             _dtls_rotr32(a, 22))
+        let maj = _dtls_xor32(_dtls_xor32(_dtls_and32(a, b),
+                                          _dtls_and32(a, c)),
+                              _dtls_and32(b, c))
+        let t2 = _dtls_add32(s0, maj)
+        hh = g
+        g = f
+        f = e
+        e = _dtls_add32(d, t1)
+        d = c
+        c = b
+        b = a
+        a = _dtls_add32(t1, t2)
+        t = t + 1
+    }
+    list_set(h, 0, _dtls_add32(h[0], a))
+    list_set(h, 1, _dtls_add32(h[1], b))
+    list_set(h, 2, _dtls_add32(h[2], c))
+    list_set(h, 3, _dtls_add32(h[3], d))
+    list_set(h, 4, _dtls_add32(h[4], e))
+    list_set(h, 5, _dtls_add32(h[5], f))
+    list_set(h, 6, _dtls_add32(h[6], g))
+    list_set(h, 7, _dtls_add32(h[7], hh))
+    return 1
+}
+
+// SHA-256 of n bytes at msg_buf. Returns 33-byte buffer (32B digest +
+// trailing NUL).
+fn dtls_sha256(msg_buf, n) {
+    let h = _dtls_sha_init_h()
+    let full_blocks = int_shr(n, 6)
+    let i = 0
+    while i < full_blocks {
+        _dtls_sha_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    let rem = n - full_blocks * 64
+    let total_bits_lo = _dtls_mask32(int_shl(n, 3))
+    let total_bits_hi = _dtls_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _dtls_store_be32(pad, final_size - 8, total_bits_hi)
+    _dtls_store_be32(pad, final_size - 4, total_bits_lo)
+    _dtls_sha_compress(h, pad)
+    if need_two == 1 {
+        _dtls_sha_compress(h, pad + 64)
+    }
+    let out = alloc(_DTLS_HASH_LEN + 1)
+    let k = 0
+    while k < 8 {
+        _dtls_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + _DTLS_HASH_LEN, 0)
+    return out
+}
+
+// ============================================================================
+//                  HMAC-SHA256  (RFC 2104 + RFC 6234)
+// ============================================================================
+
+fn dtls_hmac_sha256(key_buf, key_n, msg_buf, msg_n) {
+    let k_block = alloc(_DTLS_BLOCK_LEN + 1)
+    let i = 0
+    while i < _DTLS_BLOCK_LEN {
+        store8(k_block + i, 0)
+        i = i + 1
+    }
+    if key_n > _DTLS_BLOCK_LEN {
+        let h = dtls_sha256(key_buf, key_n)
+        let j = 0
+        while j < _DTLS_HASH_LEN {
+            store8(k_block + j, load8(h + j))
+            j = j + 1
+        }
+    } else {
+        let j = 0
+        while j < key_n {
+            store8(k_block + j, load8(key_buf + j))
+            j = j + 1
+        }
+    }
+    let ipad = alloc(_DTLS_BLOCK_LEN + 1)
+    let opad = alloc(_DTLS_BLOCK_LEN + 1)
+    i = 0
+    while i < _DTLS_BLOCK_LEN {
+        store8(ipad + i, int_xor(load8(k_block + i), 54))     // 0x36
+        store8(opad + i, int_xor(load8(k_block + i), 92))     // 0x5c
+        i = i + 1
+    }
+    let inner_in = alloc(_DTLS_BLOCK_LEN + msg_n + 1)
+    i = 0
+    while i < _DTLS_BLOCK_LEN {
+        store8(inner_in + i, load8(ipad + i))
+        i = i + 1
+    }
+    let m = 0
+    while m < msg_n {
+        store8(inner_in + _DTLS_BLOCK_LEN + m, load8(msg_buf + m))
+        m = m + 1
+    }
+    let inner = dtls_sha256(inner_in, _DTLS_BLOCK_LEN + msg_n)
+    let outer_in = alloc(_DTLS_BLOCK_LEN + _DTLS_HASH_LEN + 1)
+    i = 0
+    while i < _DTLS_BLOCK_LEN {
+        store8(outer_in + i, load8(opad + i))
+        i = i + 1
+    }
+    i = 0
+    while i < _DTLS_HASH_LEN {
+        store8(outer_in + _DTLS_BLOCK_LEN + i, load8(inner + i))
+        i = i + 1
+    }
+    return dtls_sha256(outer_in, _DTLS_BLOCK_LEN + _DTLS_HASH_LEN)
+}
+
+// ============================================================================
+//                   HKDF-Extract / HKDF-Expand (RFC 5869)
+// ============================================================================
+//
+// HKDF-Extract: PRK = HMAC-Hash(salt, IKM).
+// HKDF-Expand:  T(i) = HMAC-Hash(PRK, T(i-1) || info || octet(i)).
+// We cap nbytes at 32*255 = 8160 per RFC 5869 (one octet counter).
+
+let _DTLS_HKDF_MAX = 8160
+
+fn dtls_hkdf_extract(salt_buf, salt_n, ikm_buf, ikm_n) {
+    // RFC 5869 section 2.2: if salt is empty, treat as 32 zero bytes.
+    if salt_n == 0 {
+        let z = alloc(_DTLS_HASH_LEN + 1)
+        let i = 0
+        while i < _DTLS_HASH_LEN { store8(z + i, 0); i = i + 1 }
+        store8(z + _DTLS_HASH_LEN, 0)
+        return dtls_hmac_sha256(z, _DTLS_HASH_LEN, ikm_buf, ikm_n)
+    }
+    return dtls_hmac_sha256(salt_buf, salt_n, ikm_buf, ikm_n)
+}
+
+fn dtls_hkdf_expand(prk_buf, info_buf, info_n, nbytes) {
+    if nbytes <= 0 { return 0 }
+    if nbytes > _DTLS_HKDF_MAX { return 0 }
+    let out = alloc(nbytes + 1)
+    let prev_buf = 0
+    let prev_n = 0
+    let written = 0
+    let counter = 1
+    while written < nbytes {
+        let total_in = prev_n + info_n + 1
+        let in_buf = alloc(total_in + 1)
+        let off = 0
+        let pj = 0
+        while pj < prev_n {
+            store8(in_buf + off, load8(prev_buf + pj))
+            off = off + 1
+            pj = pj + 1
+        }
+        let ij = 0
+        while ij < info_n {
+            store8(in_buf + off, load8(info_buf + ij))
+            off = off + 1
+            ij = ij + 1
+        }
+        store8(in_buf + off, counter)
+        let t = dtls_hmac_sha256(prk_buf, _DTLS_HASH_LEN, in_buf, total_in)
+        let copy = _DTLS_HASH_LEN
+        let left = nbytes - written
+        if left < copy { copy = left }
+        let k = 0
+        while k < copy {
+            store8(out + written + k, load8(t + k))
+            k = k + 1
+        }
+        written = written + copy
+        prev_buf = t
+        prev_n = _DTLS_HASH_LEN
+        counter = counter + 1
+    }
+    store8(out + nbytes, 0)
+    return out
+}
+
+// ============================================================================
+//                   TLS 1.2 PRF  (RFC 5246 section 5)
+// ============================================================================
+//
+//   PRF(secret, label, seed) = P_<hash>(secret, label || seed)
+//
+//   P_hash(secret, seed):
+//     HMAC_hash(secret, A(1) || seed) ||
+//     HMAC_hash(secret, A(2) || seed) || ...
+//     where A(0) = seed and A(i) = HMAC_hash(secret, A(i-1)).
+//
+// For DTLS 1.2 with our cipher suite, hash is SHA-256.
+//
+// The `label` is an ASCII string (e.g. "master secret"). The `seed`
+// is the byte concatenation of (client_random || server_random) for
+// master-secret derivation, or other context-specific data.
+
+// Build (label || seed) into a fresh buffer.
+fn _dtls_prf_seed(label, seed_buf, seed_n) {
+    let label_n = len(label)
+    let total = label_n + seed_n
+    let out = alloc(total + 1)
+    let i = 0
+    while i < label_n {
+        store8(out + i, char_at(label, i))
+        i = i + 1
+    }
+    let j = 0
+    while j < seed_n {
+        store8(out + label_n + j, load8(seed_buf + j))
+        j = j + 1
+    }
+    store8(out + total, 0)
+    let pair = list_new()
+    push(pair, out)
+    push(pair, total)
+    return pair
+}
+
+// P_SHA256(secret, seed) producing `nbytes` bytes.
+fn _dtls_p_sha256(secret_buf, sec_n, seed_buf, seed_n, nbytes) {
+    if nbytes <= 0 { return 0 }
+    let out = alloc(nbytes + 1)
+    // A(0) = seed
+    let a_buf = alloc(seed_n + 1)
+    let i = 0
+    while i < seed_n {
+        store8(a_buf + i, load8(seed_buf + i))
+        i = i + 1
+    }
+    let a_n = seed_n
+    let written = 0
+    while written < nbytes {
+        // A(i) = HMAC(secret, A(i-1))
+        a_buf = dtls_hmac_sha256(secret_buf, sec_n, a_buf, a_n)
+        a_n = _DTLS_HASH_LEN
+        // Compute HMAC(secret, A(i) || seed)
+        let in_buf = alloc(a_n + seed_n + 1)
+        let k = 0
+        while k < a_n {
+            store8(in_buf + k, load8(a_buf + k))
+            k = k + 1
+        }
+        let m = 0
+        while m < seed_n {
+            store8(in_buf + a_n + m, load8(seed_buf + m))
+            m = m + 1
+        }
+        let t = dtls_hmac_sha256(secret_buf, sec_n, in_buf, a_n + seed_n)
+        let copy = _DTLS_HASH_LEN
+        let left = nbytes - written
+        if left < copy { copy = left }
+        let kk = 0
+        while kk < copy {
+            store8(out + written + kk, load8(t + kk))
+            kk = kk + 1
+        }
+        written = written + copy
+    }
+    store8(out + nbytes, 0)
+    return out
+}
+
+// Public PRF: PRF(secret, label, seed) -> nbytes buffer.
+fn dtls_prf_sha256(secret_buf, sec_n, label, seed_buf, seed_n, nbytes) {
+    let pair = _dtls_prf_seed(label, seed_buf, seed_n)
+    let full_seed = pair[0]
+    let full_seed_n = pair[1]
+    return _dtls_p_sha256(secret_buf, sec_n, full_seed, full_seed_n, nbytes)
+}
+
+// ============================================================================
+//                   R29B.2 STUBS  (deliberately incomplete)
+// ============================================================================
+//
+// Every stub is suffixed `_R29B2_STUB` so future agents can grep them
+// and know exactly which surfaces still need real work. Each returns 0
+// (or the documented sentinel) and bumps no counters -- a caller that
+// inadvertently relies on a stub gets a clean "not implemented" signal
+// rather than a silent no-op.
+
+// ECDHE shared-secret derivation. R29B.2 wires this to a NIST P-256
+// scalar multiplication primitive (the existing bignum_2048.nova ships
+// RFC 7919 Group 14 -- 2048-bit MODP DH -- NOT P-256, so a fresh
+// scalar-mul module lands first).
+fn dtls_ecdhe_derive_R29B2_STUB(priv_buf, priv_n, peer_pub_buf, peer_pub_n) {
+    return DTLS_ERR_STUB
+}
+
+// X.509 certificate parse + ECDSA signature verification. R29B.2 lands
+// either a minimal X.509 parser or imports one from a sibling repo.
+fn dtls_cert_verify_R29B2_STUB(cert_buf, cert_n, expected_fp_buf, fp_n) {
+    return DTLS_ERR_STUB
+}
+
+// AEAD-seal a record fragment. R29B.2 wires AES-128-GCM (via a fresh
+// AES-128 + GHASH primitive -- the existing chacha20.nova ships ChaCha20
+// + Poly1305, not AES-GCM).
+fn dtls_seal_record_R29B2_STUB(state, type_byte, fragment_buf, frag_n) {
+    return DTLS_ERR_STUB
+}
+
+// AEAD-open an inbound record. R29B.2 plug-in.
+fn dtls_open_record_R29B2_STUB(state, buf, n) {
+    return DTLS_ERR_STUB
+}
+
+// SRTP master-key extractor (RFC 5705 EKM with the dtls_srtp label).
+// Required for SRTP-DTLS interop.
+fn dtls_extract_srtp_keys_R29B2_STUB(state) {
+    return DTLS_ERR_STUB
+}
+
+// ============================================================================
+//                         Stats / diagnostics
+// ============================================================================
+
+fn dtls_stats_line(state) {
+    return "dtls: state=" + dtls_state_name(state[DTLS_S_SLOT_STATE])
+        + " msg_seq=" + int_to_str(state[DTLS_S_SLOT_MSG_SEQ])
+        + " epoch=" + int_to_str(state[DTLS_S_SLOT_EPOCH])
+        + " rec_seq=" + int_to_str(state[DTLS_S_SLOT_REC_SEQ])
+        + " rec_out=" + int_to_str(state[DTLS_S_SLOT_RECORDS_OUT])
+        + " rec_in=" + int_to_str(state[DTLS_S_SLOT_RECORDS_IN])
+        + " hs_out=" + int_to_str(state[DTLS_S_SLOT_HS_OUT])
+        + " hs_in=" + int_to_str(state[DTLS_S_SLOT_HS_IN])
+        + " rtx=" + int_to_str(state[DTLS_S_SLOT_FLIGHT_RTX])
+        + " suite=" + int_to_str(state[DTLS_S_SLOT_CIPHER_SUITE])
+}
+
+// ============================================================================
+//                  Test-only helpers (exposed for unit suite)
+// ============================================================================
+//
+// `_dtls_test_*` shims that lift internal helpers to the public namespace
+// so the test suite can probe byte layout / state-machine edges without
+// requiring a real handshake transport.
+
+fn _dtls_test_valid_edge(from, to) { return _dtls_valid_edge(from, to) }
+fn _dtls_test_seq_next(state)      { return _dtls_seq_next(state) }
+fn _dtls_test_put_u24(buf, off, v) { return _dtls_put_u24(buf, off, v) }
+fn _dtls_test_get_u24(buf, off)    { return _dtls_get_u24(buf, off) }
+fn _dtls_test_put_u48(buf, off, v) { return _dtls_put_u48(buf, off, v) }
+fn _dtls_test_get_u48(buf, off)    { return _dtls_get_u48(buf, off) }
+
+// Reusable hex codec for tests that want to load test-vector inputs as
+// hex strings. Kept separate from the ones in chacha20 to keep this
+// module a leaf.
+fn _dtls_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }     // '0'..'9'
+    if c >= 97 { if c <= 102 { return c - 87 } }     // 'a'..'f'
+    if c >= 65 { if c <= 70  { return c - 55 } }     // 'A'..'F'
+    return 0 - 1
+}
+
+// Decode hex string -> [buf, n] | 0
+fn dtls_hex_decode(s) {
+    let n = len(s)
+    if n == 0 { return 0 }
+    if int_shl(int_shr(n, 1), 1) != n { return 0 }
+    let half = int_shr(n, 1)
+    let buf = alloc(half + 1)
+    let i = 0
+    while i < half {
+        let hi = _dtls_hex_nibble(char_at(s, i * 2))
+        let lo = _dtls_hex_nibble(char_at(s, i * 2 + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        store8(buf + i, int_or(int_shl(hi, 4), lo))
+        i = i + 1
+    }
+    store8(buf + half, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, half)
+    return out
+}
+
+fn _dtls_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87
+}
+
+fn dtls_hex_encode(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = load8(buf + i)
+        let hi = _dtls_nibble_hex(int_and(int_shr(b, 4), 15))
+        let lo = _dtls_nibble_hex(int_and(b, 15))
+        s = s + chr(hi) + chr(lo)
+        i = i + 1
+    }
+    return s
+}

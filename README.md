@@ -11,7 +11,68 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R28A closes the BEHAVIOURAL gap R27E (commit `ada38e1`)
+> toolchain.
+>
+> R29B lands `src/federation/dtls12.nova` -- the DTLS 1.2
+> record-layer + handshake skeleton + crypto primitives for the
+> R28E.2 follow-up flagged by R28E (commit `8c566fb`). R28E shipped
+> WebRTC SDP signaling and stubbed the data plane with the sentinel
+> `RTC_ERR_NEEDS_DTLS`; R29B starts closing that gap. The new module
+> is a TRUE LEAF (no imports of other CrossEngin modules) so parallel
+> R28E.2 agents (ICE / SRTP / STUN-TURN) cannot collide with it.
+> Delivers: (1) RFC 6347 section 4.1 record layer
+> (`DTLSPlaintext { type, version=0xfefd, epoch, sequence_number(48b),
+> length, fragment }`) with `dtls_record_serialize` /
+> `dtls_record_parse` round-tripping byte-identical to the spec;
+> (2) RFC 6347 section 4.2.2 handshake envelope
+> (`Handshake { msg_type, length(24b), message_seq,
+> fragment_offset(24b), fragment_length(24b), body }`) -- R29B ships
+> the unfragmented happy path only, parser rejects fragmented
+> envelopes; (3) state machine skeleton INIT ->
+> CLIENT\_HELLO\_SENT -> SERVER\_HELLO\_RECVD -> CERTIFICATE\_RECVD
+> -> FINISHED -> ESTABLISHED + any-state-to-FAILED;
+> (4) `dtls_client_init(state, server_name)` builds a 42-byte
+> ClientHello body (32-byte zero-Random placeholder, empty
+> session\_id + cookie, one cipher suite, null compression), wraps
+> in handshake envelope, wraps in DTLSPlaintext record, advances
+> state; (5) cipher-suite gate accepts ONLY
+> ECDHE-ECDSA-AES128-GCM-SHA256 (0xC02B, RFC 5289 -- the WebRTC
+> browser-interop minimum), all others return `DTLS_ERR_NO_CIPHER`;
+> (6) pure-NOVA SHA-256 + HMAC-SHA256 + HKDF-Extract + HKDF-Expand +
+> TLS 1.2 PRF (P\_SHA256) bundled in-module. Verified against:
+> SHA-256("abc") FIPS 180-2 vector, SHA-256("") FIPS 180-2 vector,
+> HMAC-SHA256 RFC 4231 test case 1
+> (`b0344c61...e32cff7`), HKDF RFC 5869 test vector 1 PRK
+> (`077709362c2e32df...7c2b3e5`) + 42-byte OKM
+> (`3cb25f25...887185865`), and a self-consistent PRF round-trip
+> with determinism + length-budget + label-discrimination +
+> multi-A() iteration coverage. R29B does NOT ship: real ECDHE
+> P-256 key exchange (needs `src/safety/p256.nova` -- bignum\_2048
+> ships only RFC 7919 Group 14), X.509 cert parsing + ECDSA verify,
+> AES-128-GCM record AEAD (chacha20.nova ships ChaCha20+Poly1305
+> only), HelloVerifyRequest cookie exchange, anti-replay sliding
+> window, retransmission scheduling (counter tracked, no timer
+> driven), SRTP master-key extractor (RFC 5705 EKM with
+> `dtls_srtp` label), DTLS 1.3. Every stub is suffixed
+> `_R29B2_STUB` so future agents can grep them. Verification:
+> **147-assertion unit suite** in `tests/unit/test_dtls12.nova`
+> (NEW; 35 tests) covers record-layer byte-layout across 3 hand-
+> constructed wire vectors (handshake/alert/application\_data,
+> varying epoch + 48-bit seq), record-parser rejections (short
+> header / bogus content-type / truncated fragment), handshake
+> envelope round-trip + 3 rejection paths (short / nonzero
+> frag\_off / mismatched frag\_len), msg\_seq monotonicity +
+> flight retransmit counter, state-machine edge table (5 valid
+> forward + any-to-FAILED + 4 invalid edges), `dtls_client_init`
+> end-to-end + non-INIT rejection, cipher-suite gate (accept /
+> reject / mixed / empty), 5 RFC test vectors above,
+> PRF determinism + multi-block path, and 5 R29B.2 stub regression
+> guards. All **221 unit tests pass** (+1 new in R29B); federation
+> baselines hold (gossip 34, gossip\_noise 44, gossip\_relay 61,
+> nat\_traversal 53, leader\_election 40, webrtc 19). Module count
+> +1 (`src/federation/dtls12.nova`).
+>
+> R28A closes the BEHAVIOURAL gap R27E (commit `ada38e1`)
 > documented in R21B distributed rule inference: the per-round DRFETCH
 > fan-out was synchronous with a hardcoded 500 ms ACK timeout, so a slow
 > peer caused subsequent rounds to dial fewer peers and the chain

@@ -2388,6 +2388,133 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R29B extension: DTLS 1.2 record-layer + handshake skeleton (R28E.2)
+
+R28E (commit `8c566fb`) flagged DTLS 1.2/1.3 as the first of four
+R28E.2 sub-systems blocking end-to-end browser-to-soul WebRTC. The
+full DTLS stack -- record layer with AEAD, handshake state machine,
+ECDHE key exchange, certificate verification, retransmission timers,
+anti-replay window, SRTP key extractor -- is multi-thousand-lines;
+R29B carves out the **record-layer + handshake skeleton + crypto
+primitives** so R29B.2 can plug actual key exchange + AEAD encryption
+on top of an already-verified byte-layout scaffold.
+
+### What R29B delivers (`src/federation/dtls12.nova`, leaf module)
+
+* **Record layer (RFC 6347 section 4.1).** 13-byte header (1B
+  type / 2B version=0xfefd / 2B epoch / 6B sequence_number / 2B
+  length) + variable fragment. `dtls_record_serialize` /
+  `dtls_record_parse` round-trip byte-identical to the spec.
+  `dtls_record_emit(state, ...)` post-increments the 48-bit record
+  sequence counter and bumps the records_out diagnostic.
+* **Handshake envelope (RFC 6347 section 4.2.2).** 12-byte header
+  (1B msg_type / 3B length / 2B message_seq / 3B fragment_offset /
+  3B fragment_length) + body. R29B ships the UNFRAGMENTED happy
+  path only (frag_off == 0, frag_len == length); the parser
+  REJECTS fragmented envelopes with `DTLS_ERR_BAD_HS` so callers
+  that build the reassembly logic in R29B.2 fail loudly until that
+  code lands.
+* **State machine skeleton.** Linear forward chain INIT ->
+  CLIENT_HELLO_SENT -> SERVER_HELLO_RECVD -> CERTIFICATE_RECVD ->
+  FINISHED -> ESTABLISHED, plus any-state-to-FAILED. Backward
+  edges + skip-ahead edges + post-FAILED resurrection are
+  rejected by `_dtls_valid_edge` (5 valid forward + any-to-FAILED;
+  4 of the 7 invalid edges exercised in the unit suite).
+* **`dtls_client_init(state, server_name)`.** Builds a 42-byte
+  ClientHello body (DTLS 1.2 version, 32-byte zero Random placeholder,
+  empty session_id, empty cookie, single cipher suite =
+  ECDHE-ECDSA-AES128-GCM-SHA256, null compression), wraps in a
+  Handshake envelope (msg_seq = 0), wraps that in a DTLSPlaintext
+  record (epoch = 0, seq = 0), advances state to CLIENT_HELLO_SENT.
+  This is the entry point the R29B.2 ECDHE / certificate code
+  builds on top of.
+* **Cipher-suite gate.** `dtls_select_cipher_suite(suites)`
+  accepts the single suite 0xC02B; everything else returns
+  `DTLS_ERR_NO_CIPHER`. R29B.2 will broaden the table to include
+  the other browser-interop suites (0xC02C ECDHE-ECDSA-AES256,
+  0xC02F ECDHE-RSA-AES128, ...).
+* **HKDF-SHA256 + TLS 1.2 PRF.** Pure-NOVA SHA-256 + HMAC-SHA256 +
+  HKDF-Extract + HKDF-Expand + P_SHA256 PRF. The duplication of
+  SHA-256 with `src/io/transducers/noise_xk.nova` and
+  `src/persistence/merkle.nova` is intentional: the brief required
+  R29B to remain a TRUE LEAF with no cross-federation imports so
+  parallel R28E.2 agents (ICE / SRTP / STUN-TURN) cannot collide
+  here. Cost: ~150 lines for SHA-256 / HMAC; benefit: the module
+  builds and links in isolation.
+
+### Verified crypto vectors
+
+* SHA-256("abc") = `ba7816bf...f20015ad` (FIPS 180-2 worked example).
+* SHA-256("")    = `e3b0c442...52b855`    (FIPS 180-2 empty input).
+* HMAC-SHA256(0x0b\*20, "Hi There") =
+  `b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7`
+  (RFC 4231 test case 1).
+* HKDF-Extract (RFC 5869 TV1) PRK =
+  `077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5`.
+* HKDF-Expand  (RFC 5869 TV1) OKM (42 bytes) =
+  `3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865`.
+* TLS 1.2 PRF: verified for determinism (two runs identical), length
+  budget (48-byte and 65-byte requests fill bytes), and discrimination
+  (different labels produce different outputs across the same secret /
+  seed).
+
+### Honest scope: what R29B does NOT ship (R29B.2 todo list)
+
+Every stub is suffixed `_R29B2_STUB` so future agents can `grep` them:
+
+1. **ECDHE-P256 key exchange.** R29B.2 needs a NIST P-256 scalar-mul
+   primitive (the existing `src/safety/bignum_2048.nova` ships only
+   RFC 7919 Group 14 / 2048-bit MODP DH, NOT short-Weierstrass
+   curves). A fresh `src/safety/p256.nova` lands first; then
+   `dtls_ecdhe_derive_R29B2_STUB` becomes real.
+2. **X.509 certificate parse + ECDSA signature verify.** Either a
+   minimal ASN.1 DER parser lands inside DTLS, or one imports from
+   a sibling repo. `dtls_cert_verify_R29B2_STUB` is the hook.
+3. **AES-128-GCM record AEAD.** The negotiated suite needs AES + GHASH.
+   `src/safety/chacha20.nova` ships ChaCha20 + Poly1305, NOT AES-GCM.
+   `dtls_seal_record_R29B2_STUB` / `dtls_open_record_R29B2_STUB`
+   become real once an AES-128 + GHASH module lands.
+4. **Cookie exchange (HelloVerifyRequest).** RFC 6347 section
+   4.2.1 -- DoS mitigation. R29B does NOT emit the cookie round-trip;
+   a real server would reply HelloVerifyRequest before
+   ServerHello, and R29B's ClientHello carries cookie_length=0.
+5. **Anti-replay sliding window.** R29B tracks sequence numbers
+   monotonically but does not validate inbound seq against a window.
+6. **Retransmission scheduling.** A retransmit counter is bumped via
+   `dtls_record_retransmit(state)`, but no timer is driven and no
+   flight is actually resent. R29B.2 wires this to a periodic timer.
+7. **SRTP master-key extractor (RFC 5705 EKM with `dtls_srtp`
+   label).** Required for the SRTP layer once ECDHE + AEAD land.
+   `dtls_extract_srtp_keys_R29B2_STUB` is the hook.
+8. **DTLS 1.3.** R29B targets 1.2 only; browsers still ship 1.2 as
+   the WebRTC interop floor in 2025. 1.3 is a separate sequel
+   (R29B.3) with a substantially different record layer.
+
+### Verification
+
+* **147 unit assertions** in `tests/unit/test_dtls12.nova` (NEW;
+  35 test functions). Coverage: init zero-state (9 asserts),
+  BE byte helper round-trip u16/u24/u48 (6 asserts), record-layer
+  byte-layout across 3 hand-constructed vectors (handshake / alert /
+  application_data with varying epoch and seq) (~30 asserts),
+  record-parser rejections (short header / bogus content-type /
+  truncated fragment) (3 asserts), handshake envelope serialize /
+  parse round-trip + 3 rejection paths (15 asserts), msg_seq
+  monotonic + flight retransmit counter (4 asserts), state-machine
+  edge table (5 valid forward + 2 any-to-FAILED + 4 invalid edges)
+  (11 asserts), `dtls_client_init` end-to-end + non-INIT rejection
+  (10 asserts), cipher-suite gate (4 cases) (5 asserts), SHA-256
+  ("abc" + empty) FIPS vectors (2 asserts), HMAC-SHA256 RFC 4231 TC1
+  (1 assert), HKDF RFC 5869 TV1 PRK + OKM (2 asserts), PRF
+  determinism + length budget + label discrimination + multi-A()
+  path (5 asserts), R29B.2 stub regression guards (5 asserts),
+  stats line + hex codec smoke (5 asserts).
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- **221 unit
+  tests pass** (+1 new in R29B). All federation baselines hold:
+  gossip 34, gossip\_noise 44, gossip\_relay 61, nat\_traversal 53,
+  leader\_election 40, webrtc 19. Module count delta: +1
+  (`src/federation/dtls12.nova`).
+
 ## R28A extension: async DRFETCH dispatch + adaptive timeout (R21B follow-up)
 
 ### Why this exists

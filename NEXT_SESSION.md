@@ -3,6 +3,130 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R29B (this session) -- DTLS 1.2 record-layer + handshake skeleton (R28E.2)
+
+**Status: complete -- new `src/federation/dtls12.nova` (~1248 lines,
+leaf module, no CrossEngin imports). R28E (commit `8c566fb`) shipped
+WebRTC SDP signaling and flagged DTLS 1.2/1.3 as the first of four
+R28E.2 sub-systems blocking end-to-end browser-to-soul WebRTC. R29B
+lands the RECORD-LAYER + HANDSHAKE SKELETON + CRYPTO PRIMITIVES so
+R29B.2 can plug actual key exchange + AEAD encryption on top of an
+already-verified byte-layout scaffold.**
+
+### What R29B delivers
+
+* **Record layer (RFC 6347 section 4.1)** -- 13-byte header
+  (1B type / 2B version=0xfefd / 2B epoch / 6B sequence_number /
+  2B length) + variable fragment. `dtls_record_serialize` /
+  `dtls_record_parse` round-trip byte-identical to the spec;
+  `dtls_record_emit(state, ...)` post-increments the 48-bit
+  record sequence counter.
+* **Handshake envelope (RFC 6347 section 4.2.2)** -- 12-byte header
+  (1B msg_type / 3B length / 2B message_seq / 3B fragment_offset /
+  3B fragment_length) + body. R29B ships the UNFRAGMENTED happy
+  path only; parser rejects fragmented envelopes with
+  `DTLS_ERR_BAD_HS` so callers building reassembly logic in R29B.2
+  fail loudly until that code lands.
+* **State machine skeleton** -- linear forward chain INIT ->
+  CLIENT_HELLO_SENT -> SERVER_HELLO_RECVD -> CERTIFICATE_RECVD ->
+  FINISHED -> ESTABLISHED, plus any-state-to-FAILED. Backward edges,
+  skip-ahead edges, and post-FAILED resurrection are rejected by
+  `_dtls_valid_edge`.
+* **`dtls_client_init(state, server_name)`** -- builds the 42-byte
+  ClientHello body (DTLS 1.2 version, 32-byte zero Random placeholder,
+  empty session_id, empty cookie, single cipher suite
+  ECDHE-ECDSA-AES128-GCM-SHA256, null compression), wraps in
+  Handshake envelope (msg_seq = 0), wraps in DTLSPlaintext record
+  (epoch = 0, seq = 0), advances state to CLIENT_HELLO_SENT.
+* **Cipher-suite gate** -- `dtls_select_cipher_suite(suites)` accepts
+  ONLY 0xC02B (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, RFC 5289);
+  any other suite returns `DTLS_ERR_NO_CIPHER`. R29B.2 broadens the
+  table for other browser-interop suites.
+* **HKDF-SHA256 + TLS 1.2 PRF (P_SHA256)** -- pure-NOVA SHA-256 +
+  HMAC-SHA256 + HKDF-Extract + HKDF-Expand + PRF. Bundled in-module
+  so the file is a TRUE LEAF (no cross-federation imports) -- safe
+  to land in parallel with other R28E.2 follow-ups (ICE / SRTP /
+  STUN-TURN). The duplication of SHA-256 with `noise_xk.nova` /
+  `merkle.nova` is intentional (~150 lines cost).
+
+### Verified crypto vectors
+
+* SHA-256("abc") matches FIPS 180-2: `ba7816bf...f20015ad`.
+* SHA-256("")    matches FIPS 180-2: `e3b0c442...52b855`.
+* HMAC-SHA256(0x0b\*20, "Hi There") matches RFC 4231 TC1:
+  `b0344c61...e32cff7`.
+* HKDF (RFC 5869 TV1) PRK: `077709362c2e32df...7c2b3e5`; OKM (42B):
+  `3cb25f25...5887185865`.
+* TLS 1.2 PRF: determinism + length budget (48 + 65 bytes) + label
+  discrimination + multi-A() iteration path verified self-
+  consistently (RFC 5246 ships no public byte vectors).
+
+### Verification
+
+* **147 unit assertions** in `tests/unit/test_dtls12.nova` (NEW;
+  35 test functions). Coverage breakdown in FEDERATED\_AUDIT.md.
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- **221 unit
+  tests pass** (+1 new in R29B). All federation baselines hold:
+  gossip 34, gossip\_noise 44, gossip\_relay 61, nat\_traversal 53,
+  leader\_election 40, webrtc 19. Module count delta: +1
+  (`src/federation/dtls12.nova`).
+
+### Honest scope (R29B.2 follow-up list)
+
+Every stub is suffixed `_R29B2_STUB` so future agents can grep:
+
+1. **ECDHE P-256 key exchange** -- needs a NIST P-256 scalar-mul
+   primitive (`src/safety/bignum_2048.nova` ships RFC 7919 Group 14
+   only). Land `src/safety/p256.nova` first; then
+   `dtls_ecdhe_derive_R29B2_STUB` -> real.
+2. **X.509 cert parse + ECDSA signature verify** --
+   `dtls_cert_verify_R29B2_STUB`. Needs ASN.1 DER parser + ECDSA
+   verification routine.
+3. **AES-128-GCM record AEAD** -- the negotiated suite needs AES
+   + GHASH. `chacha20.nova` ships ChaCha20 + Poly1305 only.
+   `dtls_seal_record_R29B2_STUB` / `dtls_open_record_R29B2_STUB`
+   are the hooks.
+4. **Cookie exchange (HelloVerifyRequest, RFC 6347 4.2.1)** -- DoS
+   mitigation. R29B ClientHello carries cookie_length=0; R29B.2 adds
+   the round-trip.
+5. **Anti-replay sliding window** -- sequence numbers tracked
+   monotonically; not validated against a window.
+6. **Retransmission scheduling** -- counter bumped via
+   `dtls_record_retransmit(state)`; no timer driven, no flight
+   resent. R29B.2 wires this to a periodic timer.
+7. **SRTP master-key extractor (RFC 5705 EKM, `dtls_srtp` label)**
+   -- `dtls_extract_srtp_keys_R29B2_STUB`.
+8. **DTLS 1.3** -- separate sequel (R29B.3); browsers still ship 1.2
+   as WebRTC interop floor in 2025.
+
+Adjacent R28E.2 follow-ups (still wide open, OTHER agents):
+**ICE agent** (RFC 8445 / 8489 STUN client, candidate gathering,
+connectivity checks); **SRTP** (RFC 3711 AES-128-GCM + per-packet
+seq + ROC); **STUN / TURN server** (RFC 5389 / 5766 or external).
+R29B has no integration with any of these yet -- the DTLS module is
+fully self-contained.
+
+### Concurrency
+
+R29B does NOT touch `webrtc.nova`, `gossip*.nova`, `noise_xk.nova`,
+`gossip_relay*.nova`, `relay_secure.nova`, `kg_sync.nova`,
+`distributed_rules.nova`, `nat_traversal.nova`, `leader_election.nova`,
+`distributed_query.nova`, `snapshot_replication.nova`,
+`voice_dialog.nova`, `crossengin_chat.nova`, `stream_http.nova`. The
+DTLS module is a true leaf: no `import` of any CrossEngin module.
+Parallel agents finishing R28E.2 ICE / SRTP / STUN-TURN cannot
+collide.
+
+### Files touched (R29B)
+
+* NEW: `src/federation/dtls12.nova` (1248 lines, 35 public fns +
+  internal helpers + bundled SHA-256/HMAC/HKDF/PRF).
+* NEW: `tests/unit/test_dtls12.nova` (756 lines, 147 assertions, 35 tests).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md` (this), `README.md`.
+* `/home/user/NOVA` files NOT touched.
+
+---
+
 ## R29F (this session) -- kg\_sync delta-compression on R23C snapshot replication
 
 **Status: complete -- `src/federation/kg_sync.nova` NEW (~470 lines,
