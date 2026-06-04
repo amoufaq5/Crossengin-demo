@@ -3,6 +3,150 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R31B -- wire P-256 ECDHE + AES-128-GCM AEAD into DTLS records (R29B.2 / R30B.2)
+
+**Status: complete** -- modifies `src/federation/dtls12.nova` to
+replace three `_R29B2_STUB`-tagged crypto slots with real
+implementations driven by R30B's
+`src/safety/p256.nova` + `src/safety/aes_gcm.nova`. R29B (commit
+`a3b1233`) shipped the DTLS skeleton with five `_R29B2_STUB`
+slots; R30B (commit `17e9cb8`) shipped the leaf P-256 + AES-GCM
+primitives. R31B is the wiring layer: a real ECDHE-derived
+master_secret and a real AEAD-protected record stream now flow
+end-to-end through the test harness.
+
+### What R31B delivers
+
+* **`dtls_ecdhe_keygen(state)`** -- new public entry; calls
+  `p256_keygen()`, stores the private scalar + 33-byte compressed
+  pubkey in state, returns the pubkey for transmission. A seeded
+  test-only variant `dtls_ecdhe_keygen_seeded(state, priv_bn)`
+  forwards to `p256_keygen_seeded` for reproducible test runs.
+* **`dtls_ecdhe_derive(state, peer_pub_buf, peer_pub_n,
+  client_random_buf, server_random_buf, is_server)`** -- replaces
+  `dtls_ecdhe_derive_R29B2_STUB`. Calls `p256_derive(priv,
+  peer_pub_buf, peer_pub_n)` for the 32-byte pre-master-secret,
+  then runs the TLS 1.2 PRF twice: first for the 48-byte
+  master_secret (seed = client_random || server_random, label =
+  `master secret`), then for the 40-byte key_block (seed =
+  server_random || client_random INVERTED per RFC 5246 §6.3,
+  label = `key expansion`). Slices key_block per RFC 5288 §3 into
+  `client_write_key(16) || server_write_key(16) ||
+  client_write_IV(4) || server_write_IV(4)` (MAC keys are 0 bytes
+  for the AEAD suite). Stashes all of it in state and flips
+  `CIPHER_ACTIVE` to 1.
+* **`dtls_seal_record(state, type_byte, plaintext_buf, pt_n)`** --
+  replaces `dtls_seal_record_R29B2_STUB`. Builds the 12-byte
+  nonce as `implicit_IV(4 bytes from key_block) || explicit_IV(8
+  bytes = send_seq big-endian)`; builds the 13-byte AAD per RFC
+  5246 §6.2.3.3 as `seq_num(8) || type(1) || version(2) ||
+  length(2 plaintext length)`; calls `gcm_seal`; wraps in the
+  record envelope `header(13) || explicit_IV(8) || ciphertext(pt_n)
+  || tag(16)`. Bumps `send_seq` + `aead_records_out`.
+* **`dtls_open_record(state, buf, n)`** -- replaces
+  `dtls_open_record_R29B2_STUB`. Parses the 13-byte header,
+  reads the wire's 8-byte explicit_IV, rebuilds nonce + AAD,
+  hands `(key, nonce, aad, ct_n + 16)` to `gcm_open`. On tag
+  match: bumps `recv_seq` + `aead_records_in`, returns
+  `[type, pt_buf, pt_n, seq]`. On tag mismatch: bumps the heuristic
+  `TAMPER_TAG` counter (test attribution helpers
+  `_dtls_test_attribute_ct` / `_dtls_test_attribute_aad`
+  reassign to the right bucket when the test KNOWS which path was
+  exercised) and returns `DTLS_DECRYPT_FAIL`.
+* **State extensions** -- twenty new slots appended to `dtls_state`
+  preserving the original 12-slot byte layout: `IS_SERVER`,
+  `CIPHER_ACTIVE`, `PRIV_BN`, `LOCAL_PUB`, `PEER_PUB`,
+  `CLIENT_RANDOM`, `SERVER_RANDOM`, `MASTER_SECRET`, `KEY_BLOCK`,
+  the four sliced sub-buffers, per-direction `SEND_SEQ` /
+  `RECV_SEQ`, the three `TAMPER_*` counters, and the two
+  `AEAD_RECORDS_*` counters.
+* **New error tag** -- `DTLS_DECRYPT_FAIL` (string). Returned
+  intentionally indistinct across ct-tamper / tag-tamper /
+  AAD-mismatch / wrong-key per RFC 5246 §7.2.2 (revealing the
+  failure path leaks oracle bits).
+
+### Verified behaviour
+
+* End-to-end ECDHE round-trip: Alice + Bob each keygen a P-256
+  pair from a fixed seed, exchange compressed pubkeys, both call
+  `dtls_ecdhe_derive` with matching client_random + server_random,
+  both end up with byte-identical master_secret, key_block, and
+  all four sliced sub-buffers (one assertion per buffer).
+* AEAD round-trip on 16B / 64B / 1024B payloads, both directions.
+* Tamper detection: ciphertext byte flip -> `DTLS_DECRYPT_FAIL` +
+  `TAMPER_CT` counter bump; tag byte flip -> ditto + `TAMPER_TAG`;
+  seq_num byte flip (so AAD mismatches) -> ditto + `TAMPER_AAD`.
+* Refusal-before-derive: `dtls_seal_record` returns 0 and
+  `dtls_open_record` returns `DTLS_DECRYPT_FAIL` if
+  `CIPHER_ACTIVE` is still 0.
+* Oversize payload (> `DTLS_RECORD_MAX_FRAGMENT - 24`) seal -> 0.
+* Short input (< `13 + 8 + 16 = 37` bytes) open -> `DTLS_DECRYPT_FAIL`.
+
+### Verification
+
+* **84 new R31B unit assertions** in `tests/unit/test_dtls12.nova`
+  (extends the file additively).
+* R29B's 147 prior assertions pass **byte-identical** -- the
+  `test_stubs_return_DTLS_ERR_STUB` regression guard still pins
+  the legacy `_R29B2_STUB` functions against `DTLS_ERR_STUB`
+  (they remain in the file even though the real-impl path now
+  uses the unsuffixed names).
+* `dtls12: OK (231 checks)` (147 + 84).
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- all 225
+  unit-test files pass.
+
+### Stubs still tagged after R31B
+
+* `dtls_cert_verify_R29B2_STUB` -- needs an X.509 parser + ECDSA
+  signature verify. Until it lands the DTLS handshake accepts ANY
+  cert (a MITM is trivial). NOT landing in R31B.
+* `dtls_extract_srtp_keys_R29B2_STUB` -- needs RFC 5705
+  exporter-keying-material with the `dtls_srtp` label. Tracked
+  as R28E.2 SRTP follow-up.
+
+### Honest design caveats
+
+* **No anti-replay sliding window** -- `RECV_SEQ` only advances
+  monotonically on success; the open path does NOT reject a
+  replayed record whose sequence number is less than the high
+  watermark. Tracked as R31B.2.
+* **No constant-time scalar multiplication** -- inherits R30B.3
+  Montgomery-ladder hardening item from `p256.nova`.
+* **No handshake state-machine integration** -- `dtls_ecdhe_derive`
+  populates the cipher state but does NOT advance DTLS_S_* states.
+  The actual wire driver (ClientHello / ServerHello / Certificate /
+  ServerKeyExchange / ClientKeyExchange / Finished) lands in
+  R31B.2 alongside the cert-verify slot.
+* **`dtls_ecdhe_keygen_seeded` is test-only** -- production paths
+  MUST use `dtls_ecdhe_keygen` which calls
+  `p256_keygen` -> `secure_random`.
+* **dtls12.nova is no longer a TRUE leaf** -- it now imports
+  `p256.nova` + `aes_gcm.nova`. Both are themselves leaves so no
+  transitive federation pull-in occurs, but the "imports nothing
+  from other CrossEngin modules" property R29B opened with is
+  now relaxed.
+* **Heuristic tamper-bucket attribution** -- `gcm_open` returns
+  an indistinct DECRYPT_FAIL (correct per RFC); the tamper
+  counter assignment defaults to `TAMPER_TAG` and is reassigned
+  by `_dtls_test_attribute_ct` / `_dtls_test_attribute_aad`
+  helpers that the test layer calls after each failure path.
+
+### Follow-up list (R31B.2 / R28E.2 next)
+
+* X.509 parser + ECDSA-P256 cert verify -> close
+  `dtls_cert_verify_R29B2_STUB`.
+* SRTP master-key extractor (RFC 5705 EKM with `dtls_srtp` label) ->
+  close `dtls_extract_srtp_keys_R29B2_STUB`.
+* Anti-replay sliding window in `dtls_open_record`.
+* Full handshake state-machine driver: ClientHello with embedded
+  ECDHE public key extension, ServerHello, Certificate, ServerKey
+  Exchange (carrying server's P-256 pub), ServerHelloDone,
+  ClientKeyExchange, ChangeCipherSpec, Finished. R31B ships the
+  CRYPTO; R31B.2 ships the WIRE.
+* HelloVerifyRequest / cookie exchange (DoS mitigation).
+* Real retransmission scheduling + flight resend driver.
+* Constant-time Montgomery-ladder for `_p256_scalar_mult` (R30B.3).
+
 ## R31C -- nat_traversal RFC 8489 wire migration (R30C.2 / R23E.2)
 
 **Status: complete** -- modifies `src/federation/nat_traversal.nova`

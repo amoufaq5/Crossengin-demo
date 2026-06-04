@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Scenario OOOO -- R23E: NAT traversal -- STUN-like external addr
-# discovery + gossip-piggyback advertisement.
+# discovery + gossip-piggyback advertisement (R23E)
+# + R31C / R30C.2 RFC 8489 wire verification.
 #
 # Two souls (A, B). A acts as a STUN-like rendezvous (its TCP
 # listener handles STUN_REQUEST lines via accept_conn's sa_buf to
@@ -8,12 +9,25 @@
 # addr, advertises via gossip EXTADDR, and demonstrates the
 # nat_hole_punch stub.
 #
-# Assertions (~12): NOVA pre-flight, both souls bind, STUN query
-# succeeds, external addr is 127.0.0.1:<ephemeral> (sandbox),
-# nat-type heuristic classifies, local-addrs nonempty + contains
-# loopback, hole-punch stub returns 0, advertise reaches >= 1 peer,
-# A receives EXTADDR (extaddr_rx counter), A's nat_state peer table
-# grows, B's query counters advance.
+# R31C extension: B additionally drives an in-process RFC 8489
+# emit + parse cycle through the new `nat_emit_rfc8489_binding_request`
+# / `nat_parse_rfc8489_binding_response` helpers (which route through
+# R30C's `stun_rfc8489.nova`). The verification confirms that the
+# emitted Binding Request has the right type / magic cookie /
+# FINGERPRINT and that a hand-built Binding Success Response
+# round-trips XOR-MAPPED-ADDRESS IP+port. This is unit-level
+# verification inside an integration scenario -- the actual UDP
+# datagram round-trip across two souls is deferred to R31C.2 (NOVA
+# does not expose sendto/recvfrom yet).
+#
+# Assertions (~18): NOVA pre-flight, both souls bind, STUN query
+# succeeds (legacy TCP text wire), external addr is 127.0.0.1:<ephemeral>
+# (sandbox), nat-type heuristic classifies, local-addrs nonempty +
+# contains loopback, hole-punch stub returns 0, RFC 8489 emit type +
+# cookie + FINGERPRINT all valid, RFC 8489 parse XOR-MAPPED-ADDRESS
+# IP+port+family round-trip, advertise reaches >= 1 peer, A receives
+# EXTADDR (extaddr_rx counter), A's nat_state peer table grows, B's
+# query counters advance.
 
 . "$(dirname "$0")/_lib.sh"
 
@@ -177,6 +191,7 @@ cat > "$DRV_B" <<NOVA
 import "std/io"
 import "../../../src/federation/gossip.nova"
 import "../../../src/federation/nat_traversal.nova"
+import "../../../src/federation/stun_rfc8489.nova"
 import "../../../src/kg/multi_kg_manager.nova"
 import "../../../src/kg/atom_store.nova"
 
@@ -221,6 +236,35 @@ fn main() {
 
     let hp = nat_hole_punch(nstate, "$ADDR_A")
     println("b: hole-punch-stub returned=" + int_to_str(hp))
+
+    // R31C / R30C.2 -- verify the RFC 8489 wire path works in-process.
+    // The legacy STUN-LIKE TCP text wire above still runs (so the
+    // existing scenario_oooo invariants hold byte-identical); here we
+    // additionally drive an RFC 8489 Binding Request through the new
+    // helper and verify it round-trips via stun_rfc8489.parse.
+    let rfc_req = nat_emit_rfc8489_binding_request(nstate, "ce/r31c")
+    let rfc_pkt = rfc_req[0]
+    let rfc_n = rfc_req[1]
+    let rfc_txn = rfc_req[2]
+    let rfc_type = stun_msg_get_type(rfc_pkt)
+    let rfc_cookie = stun_msg_get_cookie(rfc_pkt)
+    let rfc_fp_ok = stun_verify_fingerprint(rfc_pkt, rfc_n)
+    println("b: rfc8489-emit type=" + int_to_str(rfc_type)
+        + " cookie_ok=" + int_to_str(rfc_cookie == STUN_MAGIC_COOKIE)
+        + " fp_ok=" + int_to_str(rfc_fp_ok)
+        + " n=" + int_to_str(rfc_n))
+    // Hand-build a Binding Success Response to round-trip the parse.
+    let v4 = stun_ipv4_str_to_buf("198.51.100.7")
+    let resp = stun_msg_build_success_response_ipv4(rfc_txn, v4, 33445,
+                                                    "server/r31c", "", "", 1)
+    let triple = nat_parse_rfc8489_binding_response(nstate, resp[0], resp[1])
+    if triple == 0 {
+        println("b: rfc8489-parse FAILED last_error=" + nat_last_error(nstate))
+    } else {
+        println("b: rfc8489-parse ip=" + triple[0]
+            + " port=" + int_to_str(triple[1])
+            + " family=" + int_to_str(triple[2]))
+    }
 
     gossip_send_ping(gstate, "$ADDR_A")
     sleep_ms(100)
@@ -341,6 +385,17 @@ assert_match "$LOCAL_FIRST" "127\.0\.0\.1" "local-addr[0] contains 127.0.0.1"
 # Hole-punch stub returned 0.
 HP_LINE=$(grep '^b: hole-punch-stub' "$OUT_B" 2>/dev/null | head -1)
 assert_match "$HP_LINE" "returned=0" "hole-punch stub returns 0 (R23E.2 placeholder)"
+
+# R31C / R30C.2 -- RFC 8489 wire emit + parse verification in-process.
+RFC_EMIT=$(grep '^b: rfc8489-emit' "$OUT_B" 2>/dev/null | head -1)
+assert_match "$RFC_EMIT" "type=1 " "RFC 8489 emit type = Binding Request (0x0001)"
+assert_match "$RFC_EMIT" "cookie_ok=1" "RFC 8489 emit cookie = 0x2112A442 (verified)"
+assert_match "$RFC_EMIT" "fp_ok=1" "RFC 8489 emit FINGERPRINT verifies"
+
+RFC_PARSE=$(grep '^b: rfc8489-parse' "$OUT_B" 2>/dev/null | head -1)
+assert_match "$RFC_PARSE" "ip=198.51.100.7" "RFC 8489 parse: XOR-MAPPED-ADDRESS IP round-trip"
+assert_match "$RFC_PARSE" "port=33445" "RFC 8489 parse: XOR-MAPPED-ADDRESS port round-trip"
+assert_match "$RFC_PARSE" "family=1" "RFC 8489 parse: XOR-MAPPED-ADDRESS family = IPv4"
 
 # Advertise sent to >= 1 peer.
 ADV_LINE=$(grep '^b: advertise sent_to=' "$OUT_B" 2>/dev/null | head -1)

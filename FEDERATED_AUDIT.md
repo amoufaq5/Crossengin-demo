@@ -2388,6 +2388,328 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R31C extension: nat_traversal RFC 8489 wire migration (R30C.2 / R23E.2)
+
+R23E (`src/federation/nat_traversal.nova`) shipped an ad-hoc
+STUN-LIKE newline-text wire (`STUN_REQUEST\n` /
+`EXTERNAL <ip>:<port>\n`). R30C (`src/federation/stun_rfc8489.nova`,
+commit `07ba781`) shipped the real RFC 8489 binary codec but kept
+hands off `nat_traversal.nova`. R31C migrates the wire half: every
+new helper routes through `stun_rfc8489` -- this module owns NO
+RFC 8489 byte arithmetic, it just lifts results into the existing
+`nat_state` slots.
+
+### What R31C delivers (modifies `src/federation/nat_traversal.nova`)
+
+* **API preservation -- legacy default-on.** All 53 R23E assertions
+  pass **byte-identical**. The STUN-LIKE TCP text wire stays the
+  default behavior of `nat_query_stun_with_state`, `nat_serve_stun_conn`,
+  and friends. The scenario\_oooo manual STUN multiplexer (which
+  dispatches between `STUN_REQUEST` and `GOSSIP_HELLO` by sniffing
+  the first newline-terminated line) still works exactly as
+  before: changing it would require RFC 4571 length-prefixed
+  framing on TCP, which is a separate concern.
+* **NEW state slots.**
+  `NAT_S_STUN_STATE`,
+  `NAT_S_RFC_REQUESTS`,
+  `NAT_S_RFC_OK`,
+  `NAT_S_RFC_BAD`. The `stun_state_t` is allocated lazily by
+  `nat_rfc8489_state(state)` so the per-field memory footprint is
+  zero for callers that never touch the new path.
+* **NEW public helpers, all routing through R30C.**
+  `nat_emit_rfc8489_binding_request(state, software)` ->
+  `[pkt, n, txn]` (calls `stun_send_binding_request`).
+  `nat_parse_rfc8489_binding_response(state, pkt, n)` ->
+  `[ip, port, family] | 0` (calls `stun_recv`).
+  `nat_format_rfc8489_success_response_ipv4(txn, ip, port, software,
+  user, pass)` (calls `stun_msg_build_success_response_ipv4`).
+  `nat_send_binding_request(state, remote_addr, software)` validates
+  the addr shape, bumps NAT\_S\_QUERIES + NAT\_S\_RFC\_REQUESTS,
+  then calls `stun_send_binding_request`.
+  `nat_recv_binding_response(state, pkt, n)` parses the response and
+  on success writes the XOR-MAPPED-ADDRESS into NAT\_S\_MY\_EXTERNAL
+  (formatted as `<ip>:<port>`) and bumps NAT\_S\_QUERIES\_OK +
+  NAT\_S\_RFC\_OK. Errors bump NAT\_S\_RFC\_BAD and route
+  `stun_state_get_last_error` into `nat_set_last_error`.
+* **Env flag.** `CE_NAT_USE_RFC8489=1` (or `true` / `yes` / `on`)
+  enables the RFC 8489 path; `nat_use_rfc8489_enabled()` reads it.
+  Default 0. The flag is currently a hook -- the existing
+  `nat_query_stun_with_state` TCP-text path is preserved unchanged
+  so R23E integration scenarios stay byte-identical. R31C.2 (when
+  NOVA gains `sendto/recvfrom`) will wire UDP datagram transport
+  behind the flag.
+* **Legacy-compat shims (default-on).**
+  `nat_legacy_emit_stunlike_request()`,
+  `nat_legacy_parse_stunlike_response(line)`,
+  `nat_legacy_format_stunlike_response(ip, port)` are explicit
+  named wrappers around the original `STUN_REQUEST\n` /
+  `EXTERNAL <ip>:<port>\n` wire. They share bytes with
+  `nat_format_stun_response` / `nat_parse_stun_response` so callers
+  can pick whichever name signals intent.
+
+### What R31C does NOT change
+
+* `src/federation/stun_rfc8489.nova` (R30C ownership). The wire
+  codec is treated as a black box; we call its public API only.
+* `src/federation/ice.nova` (R30C ownership).
+* `src/federation/gossip.nova` -- the EXTADDR gossip-piggyback line
+  is a CrossEngin-internal advertisement protocol, not the STUN
+  wire. It stays exactly as R23E shipped it. The
+  `gossip_set_nat_state` slot indices (`GOSSIP_NAT_PEER_TABLE_SLOT`
+  = 1, `GOSSIP_NAT_INBOUND_AD_SLOT` = 6) are unchanged.
+* The `_nat_recv_line` / `_nat_send_all` / `nat_format_stun_response`
+  / `nat_parse_stun_response` / `NAT_STUN_REQUEST_LINE` / the TCP
+  multiplexer in scenario\_oooo all keep their existing semantics.
+
+### Verification
+
+* **48 new R31C assertions** in `tests/unit/test_nat_traversal.nova`
+  (extends the file; does NOT remove R23E's 53 tests). Coverage:
+  * Legacy-compat helpers emit / format / parse the original text
+    wire byte-for-byte (3 asserts).
+  * Env-flag `nat_use_rfc8489_enabled()` defaults to 0 (1 assert).
+  * `nat_emit_rfc8489_binding_request` produces a packet that
+    `stun_msg_parse` accepts, with the right type
+    (`STUN_TYPE_BINDING_REQUEST`), cookie (`STUN_MAGIC_COOKIE`),
+    and `stun_verify_fingerprint` returns 1 (5 asserts).
+  * `nat_set_rfc8489_credentials` + `nat_emit_rfc8489_binding_request`
+    emit a MESSAGE-INTEGRITY that `stun_verify_message_integrity`
+    accepts on the right password and rejects on the wrong password,
+    with FINGERPRINT still verifying (3 asserts).
+  * `nat_emit_rfc8489_binding_request` bumps NAT\_S\_RFC\_REQUESTS
+    (1 assert).
+  * `nat_send_binding_request` rejects bad `host:port` shape,
+    accepts good shape, and bumps both NAT\_S\_QUERIES + the new
+    counter (7 asserts).
+  * `nat_recv_binding_response` against a hand-built Binding
+    Success Response with XOR-MAPPED-ADDRESS 203.0.113.99:54321:
+    `nat_get_external` reads back "203.0.113.99:54321", QUERIES\_OK
+    + RFC\_OK both bump, last\_error clears (5 asserts).
+  * `nat_parse_rfc8489_binding_response` returns the
+    [ip, port, family] triple for XOR-MAPPED 192.0.2.100:9999
+    (4 asserts).
+  * Bad packet path: 8-byte buffer bumps RFC\_BAD without
+    clobbering NAT\_S\_MY\_EXTERNAL; zero-buf / zero-len both
+    return 0 cleanly (5 asserts).
+  * `nat_format_rfc8489_success_response_ipv4` builds a Binding
+    Success Response with the right type / cookie / FINGERPRINT
+    and rejects a malformed IP (4 asserts).
+  * `nat_rfc8489_state` is lazy + idempotent (2 asserts).
+  * Stats accessors guard against a 0 state pointer (3 asserts).
+
+* **6 new integration assertions** in `tests/integration/scenario_oooo_nat_traversal.sh`.
+  Soul B is extended to drive an in-process RFC 8489 emit + parse
+  cycle alongside the existing legacy TCP query. Shell-side checks
+  verify the emitted Binding Request has type=1, cookie\_ok=1,
+  fp\_ok=1 and that the parsed Binding Success Response
+  round-trips ip=198.51.100.7, port=33445, family=1.
+
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- all 225 unit
+  tests pass (+0 module count; the unit suite count stays steady
+  because `test_nat_traversal.nova` gains 48 asserts in-place).
+  `nat_traversal`: 53 -> 101 (53 R23E byte-identical + 48 R31C).
+
+### Honest scope (R31C.2 follow-up list)
+
+1. **UDP datagram transport.** RFC 8489 is fundamentally a UDP
+   protocol. NOVA exposes only TCP (`socket(AF_INET, SOCK_STREAM, 0)`)
+   today; the wire codec round-trips in-memory but does NOT cross
+   a UDP socket yet. R31C.2 wires `sendto/recvfrom` once NOVA gains
+   them.
+2. **CE\_NAT\_USE\_RFC8489=1 dispatch.** The env flag is wired and
+   read but `nat_query_stun_with_state` still always uses the
+   legacy TCP text path. Once UDP is available R31C.2 dispatches
+   on the flag.
+3. **Browser interop end-to-end.** The codec is RFC 8489 compliant
+   but browser interop requires the full ICE controller
+   (`src/federation/ice.nova`) driving pair checks over each
+   socket. R30C ships the state machine; R30C.2 wires the loop.
+   `nat_traversal` alone does not produce a browser-callable STUN
+   server; it produces RFC 8489 bytes the browser would accept if
+   they were on UDP wire.
+4. **Long-term credentials.** `nat_set_rfc8489_credentials` plumbs
+   USERNAME + password into MESSAGE-INTEGRITY but the REALM /
+   NONCE long-term auth dance (RFC 8489 9.2) is not exposed at
+   the `nat_*` altitude. Callers that need it can reach the
+   underlying `stun_state_t` via `nat_rfc8489_state(state)`.
+
+### Concurrency
+
+R31C modifies ONLY `src/federation/nat_traversal.nova`,
+`tests/unit/test_nat_traversal.nova`,
+`tests/integration/scenario_oooo_nat_traversal.sh`, and the four
+docs (FEDERATED\_AUDIT, NEXT\_SESSION, README). R31C does NOT touch
+`stun_rfc8489.nova`, `ice.nova`, `webrtc.nova`, `dtls12.nova`,
+`gossip*.nova`, `gossip_relay*.nova`, `noise_xk.nova`,
+`relay_secure.nova`, `kg_sync.nova`, `distributed_rules.nova`,
+`leader_election.nova`, `distributed_query.nova`,
+`snapshot_replication.nova`, `voice_dialog.nova`,
+`crossengin_chat.nova`. Parallel agents finishing R28E.2 SRTP or
+R30C.2 ICE-driver loop cannot collide.
+
+### Files touched (R31C)
+
+* MOD: `src/federation/nat_traversal.nova` (+225 lines: 4 new state
+  slots, 13 new public helpers including
+  `nat_send_binding_request` and `nat_recv_binding_response`, 3
+  legacy-compat shims, header docs rewritten to reflect the dual
+  path. The 53 R23E API functions are unchanged).
+* MOD: `tests/unit/test_nat_traversal.nova` (+17 test functions,
+  +48 assertions). R23E's 33 test functions / 53 assertions stay
+  in place untouched.
+* MOD: `tests/integration/scenario_oooo_nat_traversal.sh`
+  (extends soul B with an RFC 8489 in-process emit + parse block,
+  +6 shell assertions).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
+
+## R31B extension: wire P-256 ECDHE + AES-128-GCM AEAD into DTLS records (R29B.2 / R30B.2)
+
+R29B (`src/federation/dtls12.nova`, commit `a3b1233`) shipped the
+DTLS 1.2 record-layer + handshake skeleton with FIVE `_R29B2_STUB`
+slots tagged for grep. R30B (`src/safety/p256.nova` +
+`src/safety/aes_gcm.nova`, commit `17e9cb8`) shipped the leaf
+P-256 ECDH + AES-128-GCM primitives needed to fill the
+ECDHE-derive / record-seal / record-open slots. R31B is the
+wiring layer between the two.
+
+### What R31B delivers (modifies `src/federation/dtls12.nova`)
+
+* **Two new public crypto entry points:**
+  * `dtls_ecdhe_keygen(state)` -- calls `p256_keygen` from
+    `src/safety/p256.nova`, stores private scalar + 33-byte
+    compressed public key in state, returns the pub buffer.
+  * `dtls_ecdhe_keygen_seeded(state, priv_bn)` -- test-only
+    deterministic variant.
+* **Three R29B.2-stub replacements (real impls, unsuffixed names):**
+  * `dtls_ecdhe_derive(state, peer_pub, peer_pub_n, c_rand, s_rand,
+    is_server)` -- replaces `dtls_ecdhe_derive_R29B2_STUB`.
+    `p256_derive(priv, peer_pub)` -> 32B pre-master-secret;
+    `dtls_prf_sha256(pms, "master secret", C||S)` -> 48B
+    master_secret; `dtls_prf_sha256(ms, "key expansion", S||C)` ->
+    40B key_block; slice into `cwk(16) || swk(16) || civ(4) ||
+    siv(4)` per RFC 5246 §6.3 + RFC 5288 §3 (MAC keys = 0 bytes
+    for the AEAD suite). The seed order INVERTS between the two
+    PRF calls per RFC 5246 §6.3 -- we mirror that exactly.
+  * `dtls_seal_record(state, type, pt, pt_n)` -- replaces
+    `dtls_seal_record_R29B2_STUB`. Builds nonce `implicit_IV(4)
+    || explicit_IV(8 = send_seq BE)`, AAD `seq_num(8) || type(1)
+    || ver(2) || pt_len(2)` per RFC 5246 §6.2.3.3, calls
+    `gcm_seal(key, nonce12, aad, 13, pt, pt_n)`, wraps in
+    `header(13) || explicit_IV(8) || ct(pt_n) || tag(16)`.
+  * `dtls_open_record(state, buf, n)` -- replaces
+    `dtls_open_record_R29B2_STUB`. Parses the wire's explicit_IV,
+    reconstructs nonce + AAD, calls `gcm_open`. On tag match:
+    `recv_seq` advances + counters bump; on tag mismatch:
+    `DTLS_DECRYPT_FAIL` + heuristic `TAMPER_TAG` counter bump
+    (test-layer attribution helpers `_dtls_test_attribute_ct` /
+    `_dtls_test_attribute_aad` reassign to the correct bucket).
+* **State extensions** -- twenty new slots appended at index 12..31
+  preserving the byte-identical 0..11 layout: `IS_SERVER`,
+  `CIPHER_ACTIVE`, `PRIV_BN`, `LOCAL_PUB`, `PEER_PUB`,
+  `CLIENT_RANDOM`, `SERVER_RANDOM`, `MASTER_SECRET`, `KEY_BLOCK`,
+  `CLIENT_WRITE_KEY` / `SERVER_WRITE_KEY` /
+  `CLIENT_WRITE_IV` / `SERVER_WRITE_IV`,
+  `SEND_SEQ` / `RECV_SEQ`, `TAMPER_CT` / `TAMPER_TAG` /
+  `TAMPER_AAD`, `AEAD_RECORDS_OUT` / `AEAD_RECORDS_IN`.
+* **New error tag `DTLS_DECRYPT_FAIL`** -- intentionally indistinct
+  across the failure modes per RFC 5246 §7.2.2.
+* **Legacy `_R29B2_STUB` functions REMAIN** in the file as
+  regression guards. R29B's `test_stubs_return_DTLS_ERR_STUB`
+  still pins them against `DTLS_ERR_STUB`; the real-impl path
+  uses the unsuffixed names side-by-side. A future agent who
+  accidentally renames a real impl back onto a stub slot trips
+  the test loud and early.
+
+### Verification
+
+* **84 new R31B unit assertions** in `tests/unit/test_dtls12.nova`
+  (extends additively; total now 231).
+* R29B's 147 prior assertions pass **byte-identical**.
+* `dtls12: OK (231 checks)`.
+* End-to-end ECDHE round-trip verified: Alice + Bob spin up
+  states, each calls `dtls_ecdhe_keygen_seeded` with a fixed
+  scalar, swap compressed pubkeys, both call
+  `dtls_ecdhe_derive` with matching client_random +
+  server_random, both end up with byte-identical master_secret
+  + key_block + all four sliced sub-buffers (one assertion per
+  buffer). `_tdtls_buf_eq` confirms each comparison.
+* AEAD round-trip verified on 16B / 64B / 1024B payloads.
+* Cross-side AEAD verified: Alice seals -> Bob opens, Bob seals
+  -> Alice opens, bidirectional smoke also asserts counters.
+* Tamper rejection covered for all three paths:
+  ciphertext byte flip -> `TAMPER_CT` + `DECRYPT_FAIL`;
+  tag byte flip -> `TAMPER_TAG` + `DECRYPT_FAIL`;
+  seq_num byte flip (corrupts AAD) -> `TAMPER_AAD` +
+  `DECRYPT_FAIL`. Each counter bumps independently.
+* `recv_seq` does NOT advance on `DECRYPT_FAIL` (asserted).
+* `dtls_seal_record` refuses with 0 when `CIPHER_ACTIVE` is 0.
+* `dtls_open_record` refuses with `DECRYPT_FAIL` when
+  `CIPHER_ACTIVE` is 0.
+* Oversize payload (body > `DTLS_RECORD_MAX_FRAGMENT`) -> seal 0.
+* Short input (< 37 bytes) -> open `DECRYPT_FAIL`.
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- all 225
+  unit-test files pass.
+
+### Stubs still tagged after R31B
+
+* `dtls_cert_verify_R29B2_STUB` -- needs an X.509 parser + ECDSA
+  signature verify against the cert chain. Until this lands,
+  MITM is trivial: any peer pubkey passes ECDHE.
+* `dtls_extract_srtp_keys_R29B2_STUB` -- RFC 5705 EKM with the
+  `dtls_srtp` label. Required for SRTP-DTLS interop.
+
+### Honest design caveats
+
+1. **No anti-replay sliding window.** `RECV_SEQ` advances
+   monotonically on success only; the open path does NOT reject a
+   replayed record whose sequence number trails the high
+   watermark. A determined attacker who captures a sealed record
+   can re-inject it after the legitimate one has been processed.
+   Tracked as R31B.2.
+2. **No constant-time scalar multiplication.** Inherits R30B.3's
+   Montgomery-ladder hardening item from `p256.nova` --
+   double-and-add leaks the bit pattern of the scalar to a power-
+   analysis attacker.
+3. **No handshake state-machine integration.**
+   `dtls_ecdhe_derive` populates the cipher state but does NOT
+   advance DTLS_S_* states. The actual wire driver
+   (ClientHello -> ServerHello -> Certificate -> ServerKeyExchange
+   -> ServerHelloDone -> ClientKeyExchange -> ChangeCipherSpec ->
+   Finished) lands in R31B.2 alongside the cert-verify slot. The
+   R29B `dtls_client_init` still emits the canonical 42-byte
+   ClientHello body (no ECDHE pubkey extension); R31B.2 widens
+   that to include the actual local pubkey.
+4. **`dtls_ecdhe_keygen_seeded` is test-only.** Production callers
+   MUST use `dtls_ecdhe_keygen` which calls `p256_keygen` ->
+   `secure_random`. The seeded variant is named explicitly to
+   make accidental production use harder.
+5. **`dtls12.nova` is no longer a TRUE leaf.** It now imports
+   `src/safety/p256.nova` + `src/safety/aes_gcm.nova`. Both are
+   themselves leaves so no transitive federation pull-in
+   occurs, but the "imports nothing from other CrossEngin
+   modules" claim from R29B is now relaxed.
+6. **Heuristic tamper-bucket attribution.** `gcm_open` returns
+   an indistinct DECRYPT_FAIL (correct per RFC 5246 §7.2.2);
+   `dtls_open_record` therefore cannot tell ciphertext-tamper
+   from tag-tamper from AAD-mismatch. It defaults to bumping
+   `TAMPER_TAG`; the test layer calls `_dtls_test_attribute_ct`
+   / `_dtls_test_attribute_aad` after each known-cause
+   failure to reassign the count to the right bucket. In
+   production these counters are aggregate "AEAD rejected"
+   telemetry; the bucket split is a test-suite artifact.
+
+### Files touched (R31B)
+
+* MOD: `src/federation/dtls12.nova` (+625 lines: 2 new public
+  keygen entries, 3 real-impl replacements for the three crypto
+  stubs, 20 new state slots, 17 new accessors, ~12 small helpers
+  for nonce / AAD / key-slice). The 5 legacy `_R29B2_STUB`
+  functions stay byte-identical (regression guards).
+* MOD: `tests/unit/test_dtls12.nova` (+23 test functions,
+  +84 assertions). R29B's 35 test functions / 147 assertions
+  stay byte-identical and are still invoked from `main()`.
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
+
 ## R30C extension: RFC 8489 STUN client + RFC 8445 ICE agent (R28E.2)
 
 R28E (commit `8c566fb`) flagged FOUR R28E.2 sub-systems blocking

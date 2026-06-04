@@ -282,6 +282,244 @@ fn str_has(hay, needle) {
     return 0
 }
 
+// ============================================================================
+// R31C / R30C.2 -- RFC 8489 STUN wire migration tests
+//
+// These verify that:
+//   1. The legacy STUN-LIKE text wire is preserved (helpers exist
+//      under the nat_legacy_* names + the original names).
+//   2. The new wire emits an RFC 8489 Binding Request that
+//      `stun_msg_parse` (R30C) accepts as well-formed.
+//   3. FINGERPRINT + MESSAGE-INTEGRITY emit on the new wire and
+//      `stun_verify_fingerprint` / `stun_verify_message_integrity`
+//      both verify.
+//   4. The high-level `nat_send_binding_request` /
+//      `nat_recv_binding_response` round-trip a Binding Request
+//      against a hand-built Binding Success Response: the mapped
+//      IP+port flow back into `NAT_S_MY_EXTERNAL`.
+//   5. The env flag `CE_NAT_USE_RFC8489` controls
+//      `nat_use_rfc8489_enabled()`.
+//   6. Stats counters bump correctly on send + recv (RFC and legacy
+//      paths share NAT_S_QUERIES + NAT_S_QUERIES_OK).
+//   7. A bad packet (short / no XOR-MAPPED-ADDRESS) bumps NAT_S_RFC_BAD
+//      and does NOT mutate NAT_S_MY_EXTERNAL.
+
+// ---- legacy-compat helpers --------------------------------------------
+
+fn test_r31c_legacy_emit_request_matches_old_wire() {
+    let req = nat_legacy_emit_stunlike_request()
+    ce_str_eq("legacy emit produces STUN_REQUEST\\n",
+              req, "STUN_REQUEST\n")
+}
+
+fn test_r31c_legacy_format_response_matches_old_wire() {
+    let line = nat_legacy_format_stunlike_response("203.0.113.7", 4000)
+    ce_str_eq("legacy format response shape",
+              line, "EXTERNAL 203.0.113.7:4000\n")
+}
+
+fn test_r31c_legacy_parse_round_trip() {
+    let line = nat_legacy_format_stunlike_response("198.51.100.1", 33444)
+    let parsed = nat_legacy_parse_stunlike_response(line)
+    ce_str_eq("legacy parse round-trip", parsed, "198.51.100.1:33444")
+}
+
+// ---- env flag ---------------------------------------------------------
+
+fn test_r31c_env_flag_default_off() {
+    // CE_NAT_USE_RFC8489 not in env: 0
+    ce_eq("default env flag is off", nat_use_rfc8489_enabled(), 0)
+}
+
+// ---- RFC 8489 emit + parse against stun_rfc8489 ----------------------
+
+fn test_r31c_emit_request_parses_as_rfc8489() {
+    let st = nat_init()
+    let result = nat_emit_rfc8489_binding_request(st, "crossengin/r31c")
+    let pkt = result[0]
+    let n = result[1]
+    ce_check("emit returned a buf", pkt != 0)
+    ce_check("emit returned positive length", n >= 20)
+    // Header parse must succeed and identify a Binding Request.
+    let parsed = stun_msg_parse(pkt, n)
+    ce_check("packet parses as RFC 8489 (not error tag)",
+             str_eq(parsed, STUN_ERR_BAD_HEADER) == 0)
+    ce_eq("emit type = Binding Request",
+          stun_msg_get_type(pkt), STUN_TYPE_BINDING_REQUEST)
+    ce_eq("emit cookie = 0x2112A442",
+          stun_msg_get_cookie(pkt), STUN_MAGIC_COOKIE)
+    // RFC 8489 14.7: FINGERPRINT must verify on emitted requests.
+    ce_eq("emit FINGERPRINT verifies",
+          stun_verify_fingerprint(pkt, n), 1)
+}
+
+fn test_r31c_emit_request_with_credentials_has_mi() {
+    let st = nat_init()
+    nat_set_rfc8489_credentials(st, "alice", "secretpass")
+    let result = nat_emit_rfc8489_binding_request(st, "crossengin/r31c")
+    let pkt = result[0]
+    let n = result[1]
+    ce_eq("emit with creds MI verifies (right pwd)",
+          stun_verify_message_integrity(pkt, n, "secretpass"), 1)
+    ce_eq("emit with creds MI rejects wrong pwd",
+          stun_verify_message_integrity(pkt, n, "wrong"), 0)
+    ce_eq("emit with creds FINGERPRINT verifies",
+          stun_verify_fingerprint(pkt, n), 1)
+}
+
+fn test_r31c_emit_request_bumps_rfc_counter() {
+    let st = nat_init()
+    nat_emit_rfc8489_binding_request(st, "ce")
+    nat_emit_rfc8489_binding_request(st, "ce")
+    ce_eq("RFC requests counter advanced", nat_rfc8489_requests_sent(st), 2)
+}
+
+// ---- send_binding_request high-level wrapper -------------------------
+
+fn test_r31c_send_binding_request_validates_addr() {
+    let st = nat_init()
+    let bad = nat_send_binding_request(st, "not-an-addr", "ce")
+    ce_eq("send with bad addr returns 0", bad, 0)
+    ce_str_eq("bad addr sets last_error",
+              nat_last_error(st), "bad-remote-addr")
+    ce_eq("bad addr does NOT bump queries counter",
+          nat_query_count(st), 0)
+}
+
+fn test_r31c_send_binding_request_good_addr() {
+    let st = nat_init()
+    let res = nat_send_binding_request(st, "203.0.113.5:3478", "ce")
+    ce_check("send with good addr returns list", res != 0)
+    ce_eq("send bumps NAT_S_QUERIES", nat_query_count(st), 1)
+    ce_eq("send bumps NAT_S_RFC_REQUESTS",
+          nat_rfc8489_requests_sent(st), 1)
+    // The emitted packet must be parseable by stun_rfc8489.
+    let pkt = res[0]
+    let n = res[1]
+    ce_eq("sent request type = Binding Request",
+          stun_msg_get_type(pkt), STUN_TYPE_BINDING_REQUEST)
+    ce_eq("sent request FP verifies",
+          stun_verify_fingerprint(pkt, n), 1)
+}
+
+// ---- recv_binding_response: round-trip a hand-built success response ----
+
+fn test_r31c_recv_binding_response_round_trip_ipv4() {
+    let st = nat_init()
+    // Drive the send first to record a pending txn id.
+    let sent = nat_send_binding_request(st, "203.0.113.5:3478", "ce")
+    let pkt_req = sent[0]
+    let n_req = sent[1]
+    let txn_id = sent[2]
+    // Build a Binding Success Response with XOR-MAPPED 203.0.113.99:54321.
+    let v4 = stun_ipv4_str_to_buf("203.0.113.99")
+    let resp = stun_msg_build_success_response_ipv4(txn_id, v4, 54321,
+                                                    "server", "", "", 1)
+    let pkt_resp = resp[0]
+    let n_resp = resp[1]
+    // Sanity: the resp itself parses + FP verifies.
+    ce_eq("resp FP verifies", stun_verify_fingerprint(pkt_resp, n_resp), 1)
+    // Now feed it through nat_recv_binding_response.
+    let ok = nat_recv_binding_response(st, pkt_resp, n_resp)
+    ce_eq("recv returns 1 on success", ok, 1)
+    ce_str_eq("recv mapped NAT_S_MY_EXTERNAL slot",
+              nat_get_external(st), "203.0.113.99:54321")
+    ce_eq("recv bumps NAT_S_QUERIES_OK", nat_query_ok_count(st), 1)
+    ce_eq("recv bumps NAT_S_RFC_OK", nat_rfc8489_responses_ok(st), 1)
+    ce_str_eq("recv clears last_error", nat_last_error(st), "")
+}
+
+// ---- nat_parse_rfc8489_binding_response: same flow, returns the triple ---
+
+fn test_r31c_parse_rfc8489_returns_triple() {
+    let st = nat_init()
+    let sent = nat_send_binding_request(st, "203.0.113.5:3478", "ce")
+    let txn_id = sent[2]
+    let v4 = stun_ipv4_str_to_buf("192.0.2.100")
+    let resp = stun_msg_build_success_response_ipv4(txn_id, v4, 9999,
+                                                    "", "", "", 1)
+    let triple = nat_parse_rfc8489_binding_response(st, resp[0], resp[1])
+    ce_check("triple is non-zero", triple != 0)
+    ce_str_eq("triple ip", triple[0], "192.0.2.100")
+    ce_eq("triple port", triple[1], 9999)
+    ce_eq("triple family = IPv4", triple[2], STUN_FAMILY_IPV4)
+}
+
+// ---- bad packet path -------------------------------------------------
+
+fn test_r31c_recv_bad_packet_bumps_bad_counter() {
+    let st = nat_init()
+    // 8 bytes is too short to be a STUN header.
+    let buf = alloc(9)
+    let i = 0
+    while i < 8 { store8(buf + i, 0); i = i + 1 }
+    store8(buf + 8, 0)
+    let ok = nat_recv_binding_response(st, buf, 8)
+    ce_eq("recv on short pkt returns 0", ok, 0)
+    ce_eq("recv on short pkt bumps NAT_S_RFC_BAD",
+          nat_rfc8489_responses_bad(st), 1)
+    ce_str_eq("short pkt leaves external unset",
+              nat_get_external(st), "")
+}
+
+fn test_r31c_recv_zero_buf_returns_zero() {
+    let st = nat_init()
+    ce_eq("recv with 0 buf returns 0",
+          nat_recv_binding_response(st, 0, 100), 0)
+    ce_eq("recv with 0 len returns 0",
+          nat_recv_binding_response(st, 1, 0), 0)
+}
+
+// ---- nat_format_rfc8489_success_response_ipv4 -------------------------
+
+fn test_r31c_format_success_response_ipv4() {
+    let st = nat_init()
+    let sent = nat_send_binding_request(st, "203.0.113.5:3478", "ce")
+    let txn = sent[2]
+    let resp = nat_format_rfc8489_success_response_ipv4(txn, "10.0.0.5", 1234,
+                                                        "server", "", "")
+    ce_check("format returned list", resp != 0)
+    let buf = resp[0]
+    let n = resp[1]
+    ce_eq("response type = Binding Success",
+          stun_msg_get_type(buf), STUN_TYPE_BINDING_SUCCESS_RESPONSE)
+    ce_eq("response cookie", stun_msg_get_cookie(buf),
+          STUN_MAGIC_COOKIE)
+    ce_eq("response FP verifies", stun_verify_fingerprint(buf, n), 1)
+}
+
+fn test_r31c_format_success_response_rejects_bad_ip() {
+    let st = nat_init()
+    let sent = nat_send_binding_request(st, "203.0.113.5:3478", "ce")
+    let txn = sent[2]
+    ce_eq("format with bad IP returns 0",
+          nat_format_rfc8489_success_response_ipv4(txn, "999.0.0.1", 80,
+                                                    "", "", ""), 0)
+}
+
+// ---- nat_rfc8489_state lazy alloc + idempotent ----------------------
+
+fn test_r31c_rfc8489_state_lazy_idempotent() {
+    let st = nat_init()
+    ce_eq("fresh state has no stun_state",
+          st[NAT_S_STUN_STATE], 0)
+    let s1 = nat_rfc8489_state(st)
+    ce_check("lazy alloc returns non-zero", s1 != 0)
+    let s2 = nat_rfc8489_state(st)
+    ce_check("second call returns same handle", s1 == s2)
+}
+
+// ---- stats accessors guard against 0-state -------------------------
+
+fn test_r31c_stats_accessors_guard_zero_state() {
+    ce_eq("rfc_requests on 0 state -> 0",
+          nat_rfc8489_requests_sent(0), 0)
+    ce_eq("rfc_ok on 0 state -> 0",
+          nat_rfc8489_responses_ok(0), 0)
+    ce_eq("rfc_bad on 0 state -> 0",
+          nat_rfc8489_responses_bad(0), 0)
+}
+
 // ---- main -------------------------------------------------------------
 
 fn main() {
@@ -319,6 +557,24 @@ fn main() {
     test_record_inbound_extaddr_rejects_empty_internal()
     test_status_line_fresh_state()
     test_status_line_with_data()
+    // R31C / R30C.2 -- RFC 8489 wire migration.
+    test_r31c_legacy_emit_request_matches_old_wire()
+    test_r31c_legacy_format_response_matches_old_wire()
+    test_r31c_legacy_parse_round_trip()
+    test_r31c_env_flag_default_off()
+    test_r31c_emit_request_parses_as_rfc8489()
+    test_r31c_emit_request_with_credentials_has_mi()
+    test_r31c_emit_request_bumps_rfc_counter()
+    test_r31c_send_binding_request_validates_addr()
+    test_r31c_send_binding_request_good_addr()
+    test_r31c_recv_binding_response_round_trip_ipv4()
+    test_r31c_parse_rfc8489_returns_triple()
+    test_r31c_recv_bad_packet_bumps_bad_counter()
+    test_r31c_recv_zero_buf_returns_zero()
+    test_r31c_format_success_response_ipv4()
+    test_r31c_format_success_response_rejects_bad_ip()
+    test_r31c_rfc8489_state_lazy_idempotent()
+    test_r31c_stats_accessors_guard_zero_state()
     ce_summary("nat_traversal")
 }
 
