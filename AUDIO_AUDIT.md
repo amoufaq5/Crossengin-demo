@@ -2881,6 +2881,148 @@ chat-side wiring is 2 lines: one import + one dispatch entry.
 R8B (whisper), R15D (query), R21C (TTS) modules untouched -- the
 dialog layer is purely additive on top.
 
+## R25B.3 -- Voice dialog topic-shift detection (pivot vs continue)
+
+R28D shipped R25B.2's multi-turn dispatcher assuming every
+"tell me more" is a continuation. R25B.3 closes the OBVIOUS
+follow-up-mis-classification hole: when the user says
+"tell me more about cats" right after "list all FACT", the
+"cats" tail has zero overlap with the prior intent ("fact"),
+so it's a PIVOT, not a continuation. The R25B.2 dispatcher
+would escalate LIMIT on the wrong topic; R25B.3 resets the
+session and re-parses the remainder as a fresh turn.
+
+The classifier is a content-word Jaccard heuristic over four
+classes:
+
+| Class                  | Trigger                                                       |
+|------------------------|---------------------------------------------------------------|
+| `VC_FOLLOWUP_NONE`     | No prior turn, or no recognised cue at all.                   |
+| `VC_FOLLOWUP_CONTINUE` | Cue match + remainder content overlaps prior (Jaccard >= 0.2). |
+| `VC_FOLLOWUP_PIVOT`    | Cue match + remainder unrelated, OR explicit `what about KIND`. |
+| `VC_FOLLOWUP_ANAPHORA` | `describe it` / `the second one` / ordinal+verb shape.        |
+
+Anaphora wins over pivot. "describe the first one" classifies
+as ANAPHORA even though "first" could read as a content word --
+the stopword list excludes the ordinals so they never become
+pivot signal.
+
+### Stopword + content-word extraction
+
+`_vd_is_stopword(tok)` covers, at a minimum:
+
+* Dialog-cue family: `tell`, `me`, `more`, `about`, `also`,
+  `and`, `or`, `but`.
+* R25B template keywords: `list`, `all`, `what`, `whats`,
+  `how`, `many`, `much`, `is`, `are`, `was`, `were`, `be`,
+  `to`, `do`, `does`, `did`.
+* Pronouns + determiners: `it`, `its`, `he`, `him`, `his`,
+  `she`, `her`, `they`, `them`, `that`, `this`, `those`,
+  `these`, `the`, `a`, `an`, `one`, `ones`.
+* Ordinals + position: `first`, `second`, `third`, `fourth`,
+  `fifth`, `last`, `next`.
+* Verbs of saying: `describe`, `give`, `show`.
+* Discourse glue: `now`, `any`, `some`, `else`, `please`,
+  `thanks`.
+
+`_vd_content_words(lowered)`:
+
+1. Strip apostrophes (`what's` -> `whats`).
+2. Walk char-by-char: skip non-`[a-z0-9]` chars; collect runs.
+3. Drop stopwords; preserve order.
+4. Caller dedupes via `_vd_set_add` for Jaccard arithmetic.
+
+### Jaccard threshold
+
+Brief suggests ~0.2. NOVA is integer-only so the implementation
+works in tenths: `_vd_jaccard_tenths` returns
+`10 * |A intersect B| / |A union B|`; threshold
+`VC_DIALOG_PIVOT_THRESHOLD = 2`. Below threshold -> PIVOT.
+
+Edge cases:
+
+* Both sides empty -> 10 (bare cue + empty prior content can't
+  disagree; CONTINUE).
+* One side empty -> 0 (no signal; PIVOT if classifier reaches
+  the comparison, but cue+empty-remainder short-circuits to
+  CONTINUE before we get there).
+
+### Dispatcher routing
+
+```
+                    +----------------------------+
+                    | classifier on (state, raw) |
+                    +-------------+--------------+
+                                  |
+        +---------------+---------+---------+----------------+
+        |               |                   |                |
+        v               v                   v                v
+   ANAPHORA          PIVOT              CONTINUE           NONE
+   describe         what/how         more / and        complaint
+   ordinal           about            empty rem.        fall-through
+   path           +  template       + LIMIT escalate     to R25B
+                    pivot              (same as R28D)    parser
+                  OR
+                  more+unrelated
+                    -> reset session
+                    + _vd_pivot_fresh_turn
+                      (records turn even on UNKNOWN)
+```
+
+`_vd_pivot_fresh_turn` is the new helper. Same parse / execute /
+format chain as `_vd_fresh_turn` but with one difference: on
+UNKNOWN parse it STILL appends the turn to history (with
+empty ids and UNKNOWN template), so the operator sees the pivot
+they just made. R25B.2 dropped UNKNOWN fresh turns from history
+to avoid pushing useful older turns out of the 5-cap; the pivot
+case is the opposite intent (the topic shift IS the signal we
+want to preserve).
+
+### Verification
+
+* **55 new unit assertions** in
+  `tests/unit/test_voice_dialog.nova` (R25B.2's 44 retained + 55
+  R25B.3 = 99 total). Coverage spans the classifier directly
+  (returning each of the 4 enum values) AND the runtime
+  dispatcher (verifying that PIVOT actually resets the session,
+  CONTINUE actually escalates the LIMIT, ANAPHORA actually
+  resolves to last_ids[0]).
+* **Brief's 4 fixtures: 4/4 classified correctly.**
+  - "list all FACT" + "tell me more" -> CONTINUE.
+  - "list all FACT" + "tell me more about cats" -> PIVOT.
+  - "list all FACT" + "what about RULE atoms" -> PIVOT.
+  - "list all FACT" + "describe the first one" -> ANAPHORA.
+* **All 219 unit tests pass.**
+
+### Honest scope (R25B.4+)
+
+* **Uniform-weight Jaccard.** Kind-word matches should dominate
+  general content matches; today every word is weighted 1.
+  Long-form prior text with multiple content words shrinks the
+  ratio mechanically and can flip a CONTINUE to a PIVOT spuriously.
+* **No morphology.** "fact" vs "facts" do not match. A Porter
+  stemmer would help.
+* **No semantic distance.** "list all FACT" + "tell me more
+  about logic" -- "logic" is unrelated to "fact" lexically but
+  semantically related. We have no word2vec / GloVe; deferred.
+* **No multi-turn content window.** The classifier only inspects
+  the LAST history turn. A pivot diagnosed against turn N-1 may
+  still match turn N-2's intent ("we were talking about FACT,
+  pivoted to CONCEPT, and now back to FACT"). Future improvement
+  walks the full window.
+
+### Files touched (R25B.3)
+
+* MOD: `examples/voice_dialog.nova` -- additive (~350 lines of
+  new code; R28D code is unchanged).
+* MOD: `tests/unit/test_voice_dialog.nova` -- additive (+55
+  assertions + 14 new test functions).
+* MOD: `AUDIO_AUDIT.md` (this section), `NEXT_SESSION.md`,
+  `README.md`.
+
+R8B / R15D / R21C / R25B / R25B.2 modules and tests are untouched
+-- R25B.3 is purely additive on top of R25B.2's dialog layer.
+
 ## R26C -- Spectral-subtraction Wiener noise reduction
 
 Closes the **frequency-domain denoising** gap in CrossEngin's audio chain.
