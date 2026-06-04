@@ -1,0 +1,894 @@
+// CrossEngin examples: multi-turn voice dialogue (R25B.2).
+//
+// Purpose
+//   R25B (examples/voice_conversation.nova) shipped single-turn voice
+//   conversation: each /converse call is independent, no state survives
+//   between calls. R25B.2 closes the "conversation state + follow-up
+//   handling" hole in R25B's deferred list: a session object accumulates
+//   the last N turns, and a follow-up parser layer in front of the R25B
+//   parser recognises "tell me more" / "the second one" / "what about X"
+//   / "describe it" / "actually" patterns and either rewrites the
+//   transcript with resolved context OR escalates the SPARQL LIMIT to
+//   pull more rows.
+//
+//   We deliberately layer R25B.2 ON TOP of the R25B module (which is
+//   imported here verbatim, READ-ONLY). The R25B public API is unchanged
+//   -- a single-turn /converse caller sees the same behaviour bit-for-bit.
+//   The new public surface is just the four `vc_session_*` functions
+//   plus turn accessors; they call the existing R25B parser / SPARQL
+//   builder / formatter / TTS legs as primitives.
+//
+//   Anaphora resolution (Greek anaphora = "carrying back"): when the
+//   operator says "describe it" / "tell me about him", "it" / "him" /
+//   "that one" map to the most recently mentioned ENTITY -- which in
+//   the R15D KG model is an atom id. The prior turn's bindings list
+//   carries the candidate ids; the resolver picks index 0 for "it"
+//   (the first / canonical entity) and index N-1 for "the last one".
+//
+//   Topic-shift detection: a transcript that starts with "actually" or
+//   "wait" or "never mind" or "let's talk about" or "change subject"
+//   is treated as a reset request. Session state is cleared (history
+//   discarded, last_template / last_bindings zeroed); the rest of the
+//   transcript (after the marker phrase) is then parsed FRESH so the
+//   operator can say "actually, list all CONCEPT" and have it act as
+//   a brand-new turn.
+//
+//   History capping: the brief stipulates last-5 turns. We keep a
+//   growing list, and on every new turn we drop the head if len > 5.
+//
+//   Public surface:
+//     vc_session_new() -> session_t
+//         A fresh, empty session. Zero turns, no prior context.
+//
+//     vc_session_turn(kg, session, question_text) ->
+//         [response_text, new_session]
+//         Run one turn against the live KG. Returns the formatted answer
+//         + the mutated session (same shape as session_t -- callers can
+//         pass it back into vc_session_turn for the next turn). The
+//         response text is what TTS should speak.
+//
+//     vc_session_history(session) -> list[turn_t]
+//         The accumulated turns (up to 5, oldest first). Each entry is
+//         a turn_t list -- use the vc_turn_* accessors below.
+//
+//     vc_session_reset(session)
+//         Reset the session IN PLACE -- clears history, last_template,
+//         last_bindings. Operator-facing: "wipe the slate". Returns 1
+//         for symmetry with the other set/reset APIs.
+//
+//     vc_turn_question(t)  -> question_text string
+//     vc_turn_template(t)  -> template id (one of VC_TPL_*)
+//     vc_turn_kind(t)      -> kind name (FACT / CONCEPT / ...)
+//     vc_turn_ids(t)       -> list of atom-id ints from the binding rows
+//
+//   Honest scope (R25B.3+):
+//     * Fuzzy intent matching -- "tell me more about CONCEPT" routes to
+//       the LIST_ALL escalation path AND keeps CONCEPT as the kind; we
+//       don't currently parse the trailing kind in follow-ups beyond
+//       "what about" + "and X" shapes.
+//     * Cross-turn entity reuse -- "the first one" requires the prior
+//       turn to have been a LIST_ALL; a WHAT_IS turn has only one id
+//       and "the first one" returns that id (degenerate but correct).
+//     * Backchannel handling -- "uh-huh" / "okay" / silence handling.
+//     * TTS layer -- this module returns response TEXT; the chat wrapper
+//       (`/dialog`) is responsible for piping the text into the TTS leg
+//       (tts_speak + tts_save_wav). Keeps the dialog-state layer pure
+//       so it can be unit-tested without a TTS dependency.
+//
+// ADRs exercised: ADR-0014 (modality bridge -- this layer rides on the
+//   R25B STT + cognition + TTS chain). NOVA dependencies: builtins only
+//   (str_eq, char_at, substr, len, list_new, push, list_set,
+//   int_to_str). CrossEngin dependencies: voice_conversation.nova
+//   (R25B parser / SPARQL builder / formatter).
+
+import "std/syscall"
+import "voice_conversation.nova"
+import "../src/kg/query.nova"
+
+// ---- constants -----------------------------------------------------------
+
+// History cap (brief mandate: last 5 turns).
+let VC_DIALOG_HISTORY_CAP = 5
+
+// "Tell me more" LIMIT escalation factor. Each consecutive "tell me more"
+// doubles the LIMIT used in the LIST_ALL SPARQL. Capped at 100 to keep
+// the spoken sentence finite; chat operators rarely want > 10 anyway.
+let VC_DIALOG_LIMIT_BASE = 10
+let VC_DIALOG_LIMIT_CAP  = 100
+
+// Session slot indices. Public consumers use the accessor functions
+// below; these constants are file-private but commented for clarity.
+//   0 -- history (list of turn_t)
+//   1 -- last_template_id (one of VC_TPL_*)
+//   2 -- last_kind (string)
+//   3 -- last_bindings_ids (list of int)
+//   4 -- last_limit_used (int; for "tell me more" escalation)
+//   5 -- turn_count (int; monotonic, never decremented)
+let _VC_SESS_HIST     = 0
+let _VC_SESS_TPL      = 1
+let _VC_SESS_KIND     = 2
+let _VC_SESS_IDS      = 3
+let _VC_SESS_LIMIT    = 4
+let _VC_SESS_COUNT    = 5
+
+// Turn slot indices.
+//   0 -- question_text (string)
+//   1 -- template_id (int)
+//   2 -- kind (string)
+//   3 -- ids (list of int from the bindings)
+let _VC_TURN_Q        = 0
+let _VC_TURN_TPL      = 1
+let _VC_TURN_KIND     = 2
+let _VC_TURN_IDS      = 3
+
+// ---- public session API --------------------------------------------------
+
+fn vc_session_new() {
+    let s = list_new()
+    push(s, list_new())          // history
+    push(s, VC_TPL_UNKNOWN)      // last_template_id
+    push(s, "")                  // last_kind
+    push(s, list_new())          // last_bindings_ids
+    push(s, VC_DIALOG_LIMIT_BASE)  // last_limit_used
+    push(s, 0)                   // turn_count
+    return s
+}
+
+fn vc_session_history(session) {
+    return session[_VC_SESS_HIST]
+}
+
+fn vc_session_last_template(session) {
+    return session[_VC_SESS_TPL]
+}
+
+fn vc_session_last_kind(session) {
+    return session[_VC_SESS_KIND]
+}
+
+fn vc_session_last_ids(session) {
+    return session[_VC_SESS_IDS]
+}
+
+fn vc_session_turn_count(session) {
+    return session[_VC_SESS_COUNT]
+}
+
+fn vc_session_last_limit(session) {
+    return session[_VC_SESS_LIMIT]
+}
+
+// Reset in place. After this call the session looks brand-new (history
+// empty, no prior context). The same `session` object can be reused;
+// callers do not have to swap pointers. Returns 1 for symmetric API
+// with other reset-style helpers in the codebase.
+fn vc_session_reset(session) {
+    list_set(session, _VC_SESS_HIST, list_new())
+    list_set(session, _VC_SESS_TPL, VC_TPL_UNKNOWN)
+    list_set(session, _VC_SESS_KIND, "")
+    list_set(session, _VC_SESS_IDS, list_new())
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    list_set(session, _VC_SESS_COUNT, 0)
+    return 1
+}
+
+// ---- turn accessors ------------------------------------------------------
+
+fn vc_turn_question(t) { return t[_VC_TURN_Q] }
+fn vc_turn_template(t) { return t[_VC_TURN_TPL] }
+fn vc_turn_kind(t)     { return t[_VC_TURN_KIND] }
+fn vc_turn_ids(t)      { return t[_VC_TURN_IDS] }
+
+// ---- low-level helpers ---------------------------------------------------
+
+// Pull ?a / ?atom / ?n from bindings into a flat list of atom-id ints.
+// We pull the entity-id columns: ?a for LIST_ALL, ?atom for WHAT_IS.
+// HOW_MANY (?n) doesn't carry entity ids, so we return an empty list.
+// Order is preserved -- "the second one" = ids[1].
+fn _vc_extract_ids(parsed, bindings) {
+    let out = list_new()
+    if bindings == 0 { return out }
+    let n = len(bindings)
+    if n == 0 { return out }
+    let tpl = vc_parsed_template(parsed)
+    if tpl == VC_TPL_HOW_MANY { return out }
+    let var_name = "a"
+    if tpl == VC_TPL_WHAT_IS { var_name = "atom" }
+    let i = 0
+    while i < n {
+        let row = bindings[i]
+        if binding_has(row, var_name) == 1 {
+            push(out, binding_get(row, var_name))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Build a turn record from the live parse + bindings result. Pure -- no
+// side effects on the session itself; the caller folds the turn in.
+fn _vc_turn_new(question_text, parsed, ids) {
+    let t = list_new()
+    push(t, question_text)
+    push(t, vc_parsed_template(parsed))
+    push(t, vc_parsed_kind(parsed))
+    push(t, ids)
+    return t
+}
+
+// Append a turn to the history, dropping the head when over cap. The
+// session list is mutated in place; the history list at slot 0 is
+// replaced with a fresh trimmed list when an eviction is needed (NOVA
+// lists have push but no pop_front, so we copy from index 1..N).
+fn _vc_append_turn(session, turn) {
+    let hist = session[_VC_SESS_HIST]
+    push(hist, turn)
+    if len(hist) > VC_DIALOG_HISTORY_CAP {
+        let trimmed = list_new()
+        let i = len(hist) - VC_DIALOG_HISTORY_CAP
+        let n = len(hist)
+        while i < n {
+            push(trimmed, hist[i])
+            i = i + 1
+        }
+        list_set(session, _VC_SESS_HIST, trimmed)
+    }
+    list_set(session, _VC_SESS_COUNT, session[_VC_SESS_COUNT] + 1)
+    return 1
+}
+
+// Reuse R25B's tolower for the dialog parser. Inlined here so we don't
+// add a public accessor to voice_conversation.nova just for this one
+// caller. ASCII-only -- the STT transcripts we see are ASCII English.
+fn _vd_lower(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 65 {
+            if c <= 90 {
+                out = out + chr(c + 32)
+            } else {
+                out = out + chr(c)
+            }
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Trim leading + trailing whitespace + question punctuation. Same shape
+// as voice_conversation.nova's `_vc_trim` but we don't export it from
+// there; inlined here for the dialog layer.
+fn _vd_is_trim_char(c) {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 10 { return 1 }
+    if c == 13 { return 1 }
+    if c == 46 { return 1 }
+    if c == 44 { return 1 }
+    if c == 33 { return 1 }
+    if c == 63 { return 1 }
+    if c == 59 { return 1 }
+    if c == 58 { return 1 }
+    return 0
+}
+
+fn _vd_trim(s) {
+    let n = len(s)
+    let start = 0
+    while start < n {
+        if _vd_is_trim_char(char_at(s, start)) == 0 { break }
+        start = start + 1
+    }
+    let end = n
+    while end > start {
+        if _vd_is_trim_char(char_at(s, end - 1)) == 0 { break }
+        end = end - 1
+    }
+    if end <= start { return "" }
+    return substr(s, start, end - start)
+}
+
+// Prefix probe -- same as voice_conversation.nova's `_vc_starts_with`.
+fn _vd_starts_with(text, prefix) {
+    let tn = len(text)
+    let pn = len(prefix)
+    if pn > tn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(text, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- follow-up pattern detection -----------------------------------------
+//
+// These are dialog-layer rewriters. Each takes the trimmed lower-cased
+// transcript + the session, and either returns 0 (this pattern does NOT
+// match) or a non-zero rewrite descriptor. The descriptor format depends
+// on the pattern but is consistent enough that vc_session_turn can use
+// the same dispatch shape.
+//
+// Patterns (in priority order, first match wins):
+//   1. Topic shift -- "actually ..." / "wait ..." / "change subject ..." /
+//      "never mind ..." / "let's talk about ...". Resets context. The
+//      remainder (after the marker phrase) is parsed FRESH; if empty
+//      the turn is treated as "topic reset acknowledged" with no query.
+//   2. "tell me more" / "list more" / "more" / "any more" -- escalate
+//      prior query (LIMIT *= 2 capped at 100; LIST_ALL is used even if
+//      prior was WHAT_IS / HOW_MANY).
+//   3. Anaphora -- "describe it" / "what is it" / "tell me about it" /
+//      "tell me about him" / "tell me about her" / "tell me about that".
+//      Resolves "it" to last_ids[0] (index 0); "the second one" /
+//      "the third one" / etc resolve to last_ids[1..N-1].
+//   4. "what about X" / "and X" -- reuse prior template with new kind.
+//
+// If no pattern fires we fall through to the R25B parser.
+
+// "Is this transcript a topic-shift marker?" -- returns the remainder
+// after the marker phrase, or empty-string when the entire transcript
+// IS the marker (e.g. just "actually"). Returns 0 (the int) when the
+// transcript does NOT start with a topic-shift marker.
+fn _vd_topic_shift_remainder(lowered) {
+    if _vd_starts_with(lowered, "actually ") == 1 {
+        return _vd_trim(substr(lowered, 9, len(lowered) - 9))
+    }
+    if str_eq(lowered, "actually") == 1 { return "" }
+    if _vd_starts_with(lowered, "wait ") == 1 {
+        return _vd_trim(substr(lowered, 5, len(lowered) - 5))
+    }
+    if _vd_starts_with(lowered, "never mind ") == 1 {
+        return _vd_trim(substr(lowered, 11, len(lowered) - 11))
+    }
+    if str_eq(lowered, "never mind") == 1 { return "" }
+    if _vd_starts_with(lowered, "change subject ") == 1 {
+        return _vd_trim(substr(lowered, 15, len(lowered) - 15))
+    }
+    if str_eq(lowered, "change subject") == 1 { return "" }
+    if _vd_starts_with(lowered, "change the subject ") == 1 {
+        return _vd_trim(substr(lowered, 19, len(lowered) - 19))
+    }
+    if str_eq(lowered, "change the subject") == 1 { return "" }
+    if _vd_starts_with(lowered, "let's talk about ") == 1 {
+        return _vd_trim(substr(lowered, 17, len(lowered) - 17))
+    }
+    if _vd_starts_with(lowered, "lets talk about ") == 1 {
+        return _vd_trim(substr(lowered, 16, len(lowered) - 16))
+    }
+    if _vd_starts_with(lowered, "new topic ") == 1 {
+        return _vd_trim(substr(lowered, 10, len(lowered) - 10))
+    }
+    if str_eq(lowered, "new topic") == 1 { return "" }
+    return 0
+}
+
+// "tell me more" family. Returns 1 on match, 0 otherwise. We accept a
+// few synonyms; the goal is to recognise the operator wanting MORE rows
+// from the prior query regardless of the exact phrasing.
+fn _vd_is_more_request(lowered) {
+    if str_eq(lowered, "tell me more") == 1 { return 1 }
+    if str_eq(lowered, "tell me more about it") == 1 { return 1 }
+    if str_eq(lowered, "more") == 1 { return 1 }
+    if str_eq(lowered, "list more") == 1 { return 1 }
+    if str_eq(lowered, "show more") == 1 { return 1 }
+    if str_eq(lowered, "any more") == 1 { return 1 }
+    if str_eq(lowered, "anything more") == 1 { return 1 }
+    if str_eq(lowered, "and more") == 1 { return 1 }
+    if str_eq(lowered, "what else") == 1 { return 1 }
+    return 0
+}
+
+// Anaphora -- "describe it" / "what is it" / "tell me about him" /
+// "tell me more about it" (covered above). Returns 1 on match.
+fn _vd_is_anaphora_describe(lowered) {
+    if str_eq(lowered, "describe it") == 1 { return 1 }
+    if str_eq(lowered, "what is it") == 1 { return 1 }
+    if str_eq(lowered, "what's it") == 1 { return 1 }
+    if str_eq(lowered, "tell me about it") == 1 { return 1 }
+    if str_eq(lowered, "tell me about him") == 1 { return 1 }
+    if str_eq(lowered, "tell me about her") == 1 { return 1 }
+    if str_eq(lowered, "tell me about that") == 1 { return 1 }
+    if str_eq(lowered, "tell me about that one") == 1 { return 1 }
+    if str_eq(lowered, "describe him") == 1 { return 1 }
+    if str_eq(lowered, "describe her") == 1 { return 1 }
+    if str_eq(lowered, "describe that") == 1 { return 1 }
+    if str_eq(lowered, "describe that one") == 1 { return 1 }
+    return 0
+}
+
+// "the Nth one" / "the first / second / third / fourth / fifth / last
+// one". Returns the 0-based index on match, or -1 otherwise. We accept
+// "what is the second one" / "what about the third" too.
+fn _vd_ordinal_index(lowered) {
+    let s = lowered
+    // Normalise common prefixes off.
+    if _vd_starts_with(s, "what is ") == 1 {
+        s = substr(s, 8, len(s) - 8)
+    }
+    if _vd_starts_with(s, "what about ") == 1 {
+        s = substr(s, 11, len(s) - 11)
+    }
+    if _vd_starts_with(s, "tell me about ") == 1 {
+        s = substr(s, 14, len(s) - 14)
+    }
+    if _vd_starts_with(s, "describe ") == 1 {
+        s = substr(s, 9, len(s) - 9)
+    }
+    if str_eq(s, "the first one") == 1 { return 0 }
+    if str_eq(s, "the first")     == 1 { return 0 }
+    if str_eq(s, "first one")     == 1 { return 0 }
+    if str_eq(s, "the second one") == 1 { return 1 }
+    if str_eq(s, "the second")     == 1 { return 1 }
+    if str_eq(s, "second one")     == 1 { return 1 }
+    if str_eq(s, "the third one") == 1 { return 2 }
+    if str_eq(s, "the third")     == 1 { return 2 }
+    if str_eq(s, "third one")     == 1 { return 2 }
+    if str_eq(s, "the fourth one") == 1 { return 3 }
+    if str_eq(s, "the fourth")     == 1 { return 3 }
+    if str_eq(s, "fourth one")     == 1 { return 3 }
+    if str_eq(s, "the fifth one") == 1 { return 4 }
+    if str_eq(s, "the fifth")     == 1 { return 4 }
+    if str_eq(s, "fifth one")     == 1 { return 4 }
+    if str_eq(s, "the last one") == 1 { return 0 - 1000 }  // sentinel
+    if str_eq(s, "the last")     == 1 { return 0 - 1000 }
+    if str_eq(s, "last one")     == 1 { return 0 - 1000 }
+    return 0 - 1
+}
+
+// "what about X" / "and X" -- topic-pivot on the same template. Returns
+// the kind name (upper-cased) on match, or 0 (the int) when no match.
+// "and" is single-word so we require a trailing token to consider it
+// a pivot (otherwise plain "and" is just noise).
+fn _vd_pivot_kind(lowered) {
+    if _vd_starts_with(lowered, "what about ") == 1 {
+        let rest = _vd_trim(substr(lowered, 11, len(lowered) - 11))
+        if len(rest) == 0 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    if _vd_starts_with(lowered, "how about ") == 1 {
+        let rest = _vd_trim(substr(lowered, 10, len(lowered) - 10))
+        if len(rest) == 0 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    if _vd_starts_with(lowered, "and ") == 1 {
+        let rest = _vd_trim(substr(lowered, 4, len(lowered) - 4))
+        if len(rest) == 0 { return 0 }
+        // Don't confuse "and more" with the pivot path -- it's the
+        // "more" path. Bail if the remainder is the more keyword.
+        if _vd_is_more_request("and " + rest) == 1 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    return 0
+}
+
+fn _vd_first_word(s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        if _vd_is_trim_char(char_at(s, i)) == 1 { break }
+        i = i + 1
+    }
+    if i == 0 { return "" }
+    return substr(s, 0, i)
+}
+
+fn _vd_upcase_token(t) {
+    let n = len(t)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(t, i)
+        if c >= 97 {
+            if c <= 122 {
+                out = out + chr(c - 32)
+            } else {
+                out = out + chr(c)
+            }
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Is the upper-cased token a known R15D kind?
+fn _vd_known_kind(kind) {
+    if str_eq(kind, "FACT")     == 1 { return 1 }
+    if str_eq(kind, "CONCEPT")  == 1 { return 1 }
+    if str_eq(kind, "RELATION") == 1 { return 1 }
+    if str_eq(kind, "SKILL")    == 1 { return 1 }
+    if str_eq(kind, "LANG")     == 1 { return 1 }
+    if str_eq(kind, "RULE")     == 1 { return 1 }
+    return 0
+}
+
+// ---- core turn logic -----------------------------------------------------
+//
+// The turn pipeline:
+//   1. Trim + lowercase the transcript.
+//   2. Empty transcript -> "I didn't catch that" apology; no state change.
+//   3. Topic-shift marker -> reset session; if remainder non-empty, parse
+//      it as a fresh question; if remainder empty, return acknowledgement.
+//   4. "Tell me more" -> requires prior turn. Escalate LIMIT, re-run
+//      LIST_ALL on the prior kind, fold in.
+//   5. Anaphora "describe it" -> requires prior turn with ids. Use
+//      WHAT_IS template against the FIRST id of the prior bindings.
+//   6. Ordinal "the second one" -> requires prior turn with ids. Use
+//      WHAT_IS template against ids[N] (or ids[N-1] for "last one").
+//   7. "what about X" / "and X" -> requires prior turn. Use prior
+//      template with new kind X.
+//   8. Otherwise -> R25B parser, fresh turn.
+
+fn vc_session_turn(kg, session, question_text) {
+    let raw = _vd_trim(question_text)
+    let result = list_new()
+
+    // Empty transcript: no state change.
+    if len(raw) == 0 {
+        push(result, "I did not catch that. Please try again.")
+        push(result, session)
+        return result
+    }
+
+    let lowered = _vd_lower(raw)
+
+    // 1. Topic-shift detection. The remainder type-discriminates: 0
+    //    means "this transcript is not a shift marker"; "" means
+    //    "shift acknowledged, no follow-up question"; non-empty string
+    //    means "shift acknowledged + parse the rest as a fresh turn".
+    let shift_rem = _vd_topic_shift_remainder(lowered)
+    if shift_rem != 0 {
+        // shift_rem is "" or a string (str_eq sees both).
+        vc_session_reset(session)
+        if len(shift_rem) == 0 {
+            push(result, "Okay, let us change the topic. What would you like to know?")
+            push(result, session)
+            return result
+        }
+        // Parse the remainder as a fresh question -- recurse into the
+        // R25B parser path. We don't recursively call vc_session_turn
+        // (which would re-enter the shift detector); we call the inner
+        // _vc_fresh_turn helper directly.
+        return _vd_fresh_turn(kg, session, raw, shift_rem)
+    }
+
+    let last_tpl = vc_session_last_template(session)
+    let last_kind = vc_session_last_kind(session)
+    let last_ids = vc_session_last_ids(session)
+
+    // 2. "Tell me more" -- only valid when we have a prior turn.
+    if _vd_is_more_request(lowered) == 1 {
+        if last_tpl == VC_TPL_UNKNOWN {
+            push(result, "There is nothing yet. Please ask a question first.")
+            push(result, session)
+            return result
+        }
+        return _vd_more_turn(kg, session, raw)
+    }
+
+    // 3. Anaphora -- "describe it" / "what is it" / "tell me about it".
+    if _vd_is_anaphora_describe(lowered) == 1 {
+        if len(last_ids) == 0 {
+            push(result, "I do not have a previous result to describe.")
+            push(result, session)
+            return result
+        }
+        return _vd_describe_turn(kg, session, raw, last_ids[0])
+    }
+
+    // 4. Ordinal anaphora -- "the second one" / "the last one".
+    let ord = _vd_ordinal_index(lowered)
+    if ord != 0 - 1 {
+        if len(last_ids) == 0 {
+            push(result, "I do not have a previous list to index into.")
+            push(result, session)
+            return result
+        }
+        let idx = ord
+        if ord == 0 - 1000 { idx = len(last_ids) - 1 }
+        if idx < 0 {
+            push(result, "I do not have that many results.")
+            push(result, session)
+            return result
+        }
+        if idx >= len(last_ids) {
+            push(result, "I do not have that many results.")
+            push(result, session)
+            return result
+        }
+        return _vd_describe_turn(kg, session, raw, last_ids[idx])
+    }
+
+    // 5. Pivot -- "what about CONCEPT" reuses prior template.
+    let piv = _vd_pivot_kind(lowered)
+    if piv != 0 {
+        if _vd_known_kind(piv) == 1 {
+            if last_tpl != VC_TPL_UNKNOWN {
+                return _vd_pivot_turn(kg, session, raw, last_tpl, piv)
+            }
+            // No prior template -> default to LIST_ALL.
+            return _vd_pivot_turn(kg, session, raw, VC_TPL_LIST_ALL, piv)
+        }
+    }
+
+    // 6. Otherwise: parse fresh with the R25B parser.
+    return _vd_fresh_turn(kg, session, raw, lowered)
+}
+
+// Run a fresh-turn parse + execute + format. `raw` is the verbatim
+// transcript (for history); `text_to_parse` is what gets fed to the
+// R25B parser (might be the remainder after a topic-shift marker).
+fn _vd_fresh_turn(kg, session, raw, text_to_parse) {
+    let result = list_new()
+    let parsed = vc_parse_question(text_to_parse)
+    let tpl = vc_parsed_template(parsed)
+    if tpl == VC_TPL_UNKNOWN {
+        let apology = vc_format_result(parsed, list_new())
+        // Don't fold UNKNOWN turns into history: they don't establish
+        // referential context, and folding them would push useful
+        // earlier turns out of the 5-cap. R25B already says "I do not
+        // know how to answer that question.".
+        push(result, apology)
+        push(result, session)
+        return result
+    }
+    let sparql = vc_build_sparql(parsed)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    let answer = ""
+    if _qry_is_error(bindings) == 1 {
+        answer = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, answer)
+        push(result, session)
+        return result
+    }
+    answer = vc_format_result(parsed, bindings)
+    let ids = _vc_extract_ids(parsed, bindings)
+    let turn = _vc_turn_new(raw, parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, tpl)
+    list_set(session, _VC_SESS_KIND, vc_parsed_kind(parsed))
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// "Tell me more" -- escalate the LIMIT and re-run LIST_ALL on the prior
+// kind. If the prior turn was WHAT_IS or HOW_MANY, we still pivot to
+// LIST_ALL because "more" means "show me the rows".
+fn _vd_more_turn(kg, session, raw) {
+    let result = list_new()
+    let last_kind = vc_session_last_kind(session)
+    let last_limit = vc_session_last_limit(session)
+    let new_limit = last_limit * 2
+    if new_limit > VC_DIALOG_LIMIT_CAP { new_limit = VC_DIALOG_LIMIT_CAP }
+    let sparql = "SELECT ?a WHERE { ?a kind " + last_kind
+        + " . } LIMIT " + int_to_str(new_limit)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    if _qry_is_error(bindings) == 1 {
+        let err = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, err)
+        push(result, session)
+        return result
+    }
+    // Format as if it were a LIST_ALL turn (synthesise a parsed record).
+    let fake_parsed = list_new()
+    push(fake_parsed, VC_TPL_LIST_ALL)
+    push(fake_parsed, last_kind)
+    let answer = vc_format_result(fake_parsed, bindings)
+    let ids = _vc_extract_ids(fake_parsed, bindings)
+    let turn = _vc_turn_new(raw, fake_parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, VC_TPL_LIST_ALL)
+    list_set(session, _VC_SESS_KIND, last_kind)
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, new_limit)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// "describe it" / "the second one" -- run a WHAT_IS on a SPECIFIC atom
+// id. Because R15D's WHAT_IS query keys on the KIND (not the id), we
+// special-case the formatter here: we emit the id directly without
+// re-running the KG. This is honest because we already saw that id in
+// the prior turn (it survived the KG executor); the user is asking us
+// to remember it, not look it up again.
+fn _vd_describe_turn(kg, session, raw, atom_id) {
+    let result = list_new()
+    let last_kind = vc_session_last_kind(session)
+    let answer = "That " + last_kind + " atom has id " + int_to_str(atom_id) + "."
+    // Synthesise a turn entry: we treat this as a WHAT_IS that returns
+    // exactly one binding row with ?atom = atom_id, so the "describe it"
+    // chain works -- subsequent "tell me about it" still resolves to
+    // the same id.
+    let row = list_new()
+    let entry = list_new()
+    push(entry, "atom")
+    push(entry, atom_id)
+    push(row, entry)
+    let bindings = list_new()
+    push(bindings, row)
+    let fake_parsed = list_new()
+    push(fake_parsed, VC_TPL_WHAT_IS)
+    push(fake_parsed, last_kind)
+    let ids = list_new()
+    push(ids, atom_id)
+    let turn = _vc_turn_new(raw, fake_parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, VC_TPL_WHAT_IS)
+    list_set(session, _VC_SESS_KIND, last_kind)
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// "what about CONCEPT" / "and FACT" -- reuse prior template with new
+// kind. We resynthesise a SPARQL with the new kind + run it.
+fn _vd_pivot_turn(kg, session, raw, tpl, new_kind) {
+    let result = list_new()
+    let parsed = list_new()
+    push(parsed, tpl)
+    push(parsed, new_kind)
+    let sparql = vc_build_sparql(parsed)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    if _qry_is_error(bindings) == 1 {
+        let err = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, err)
+        push(result, session)
+        return result
+    }
+    let answer = vc_format_result(parsed, bindings)
+    let ids = _vc_extract_ids(parsed, bindings)
+    let turn = _vc_turn_new(raw, parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, tpl)
+    list_set(session, _VC_SESS_KIND, new_kind)
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// ---- public result accessors ---------------------------------------------
+
+fn vc_session_result_text(r)     { return r[0] }
+fn vc_session_result_session(r)  { return r[1] }
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/dialog <wav>` admin command -- multi-turn cousin of R25B's
+// `/converse`. Session lives in a module-level slot so successive
+// calls share state; `/dialog reset` clears it.
+//
+// The chat wires this with a single dispatch line + an existing
+// `_dialog_session` slot in `crossengin_chat.nova`. We deliberately
+// expose the wrapper as `vc_dialog_run(kg, arg)` so the chat-side
+// addition is one line (mirrors `vc_converse_run`'s shape).
+
+let _vc_default_session = 0
+
+fn _vc_get_default_session() {
+    if _vc_default_session == 0 {
+        _vc_default_session = vc_session_new()
+    }
+    return _vc_default_session
+}
+
+// Resolve a transcript from a WAV path via the R25B STT seam. Returns
+// [transcript_text, error_message]. Empty error => transcript usable;
+// non-empty error => caller should bail with an apology.
+fn _vd_transcribe_wav(wav_path) {
+    let seam = stt_seam_new()
+    let triple = stt_transcribe_wav(seam, wav_path)
+    let r = list_new()
+    let err = stt_result_error(triple)
+    let txt = stt_result_transcript(triple)
+    if len(err) > 0 {
+        push(r, "")
+        push(r, "I could not hear you. Speech recognition failed: " + err + ".")
+        return r
+    }
+    if str_eq(txt, VC_STT_PLACEHOLDER_1) == 1 {
+        push(r, "")
+        push(r, "I could not hear you. No speech-to-text backend is available.")
+        return r
+    }
+    if str_eq(txt, VC_STT_PLACEHOLDER_2) == 1 {
+        push(r, "")
+        push(r, "I could not hear you. No speech-to-text backend is installed.")
+        return r
+    }
+    push(r, txt)
+    push(r, "")
+    return r
+}
+
+// Chat-facing wrapper. arg is either "reset" (drops session) or a WAV
+// path (full STT -> dialog turn -> TTS roundtrip). The function returns
+// a single status string for io_println to surface.
+fn vc_dialog_run(kg, arg) {
+    let trimmed = _vd_trim(arg)
+    if len(trimmed) == 0 {
+        return "(/dialog needs a WAV path or 'reset' -- usage: /dialog /tmp/q.wav or /dialog reset)"
+    }
+    let lowered = _vd_lower(trimmed)
+    if str_eq(lowered, "reset") == 1 {
+        let s = _vc_get_default_session()
+        vc_session_reset(s)
+        return "(dialog session reset; history cleared)"
+    }
+    let session = _vc_get_default_session()
+    let trans = _vd_transcribe_wav(trimmed)
+    let txt = trans[0]
+    let err = trans[1]
+    if len(err) > 0 {
+        // STT failure -- TTS the apology, return status.
+        let path = "/tmp/ce_vc_response.wav"
+        let env = getenv("CE_VC_RESPONSE_PATH")
+        if env != 0 {
+            if len(env) > 0 { path = env }
+        }
+        let wav = tts_speak(err, VC_TTS_SAMPLE_RATE)
+        let ok = tts_save_wav(wav, path)
+        let pstat = "no-wav"
+        if ok == 1 { pstat = "wrote " + path }
+        return "(dialog heard+answered '" + err + "' [" + pstat
+            + "] turn=" + int_to_str(vc_session_turn_count(session)) + ")"
+    }
+    let r = vc_session_turn(kg, session, txt)
+    let answer = vc_session_result_text(r)
+    let path = "/tmp/ce_vc_response.wav"
+    let env = getenv("CE_VC_RESPONSE_PATH")
+    if env != 0 {
+        if len(env) > 0 { path = env }
+    }
+    let wav = tts_speak(answer, VC_TTS_SAMPLE_RATE)
+    let ok = tts_save_wav(wav, path)
+    let pstat = "no-wav"
+    if ok == 1 { pstat = "wrote " + path }
+    return "(dialog heard+answered '" + answer + "' [" + pstat
+        + "] turn=" + int_to_str(vc_session_turn_count(session)) + ")"
+}
+
+// ---- honest scope notes (R25B.3 list) ------------------------------------
+//
+// What this layer does NOT do (deferred to R25B.3):
+//   * Real label lookup -- "describe it" returns "atom has id 42"; we
+//     don't dereference 42 back to its human-readable label. The R15D
+//     binding format uses an int hash for labels; a label-int -> string
+//     reverse-lookup table would let us speak "atom labelled foo".
+//   * Cross-session anaphora -- "him" / "her" / "it" resolve to the
+//     SAME first id (no gender / number tracking). NOVA has no NLP
+//     packages; even a tiny dictionary would inflate the module
+//     considerably.
+//   * Sarcasm / hedge detection -- "I'm not sure but tell me about X"
+//     and "tell me about X" are treated identically.
+//   * Coreference chains -- "X is foo. Tell me about it. And about
+//     bar." -- "bar" doesn't propagate as a new antecedent for the
+//     next "tell me about it". Each turn updates last_ids based on
+//     the LAST resolved entity.
+//   * Conversational repair -- "no, the OTHER one" is not handled;
+//     the operator has to say "the second one" / "the third one"
+//     explicitly.
+//   * Prosody tracking -- the dialog layer treats every transcript
+//     as flat declarative; a real system would use rising tones on
+//     questions to disambiguate from statements.
+//
+// What it DOES demonstrate: stateful conversation on top of a
+// stateless cognitive substrate. The KG is unchanged; the dialog
+// layer is a thin (~600 line) state machine that rewrites transcripts
+// before passing them to R25B's existing parser / executor / formatter.

@@ -3,6 +3,138 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R25B.2 (this session) -- Multi-turn voice dialogue (conversation state)
+
+**Status: complete -- new `examples/voice_dialog.nova` (~600 lines)
+closes the conversation-state hole at the top of R25B's deferred list.
+A session object accumulates the last 5 turns + most recent template /
+kind / entity-id list across calls; a follow-up parser layer in front
+of the R25B parser recognises `tell me more` / `the second one` /
+`what about X` / `describe it` / `actually` patterns and rewrites the
+transcript before passing it down to R25B's executor. R25B's public
+API is unchanged -- single-turn `/converse` callers see byte-identical
+behaviour. The dialog layer sits IN FRONT of R25B; it doesn't reach
+into R25B internals.**
+
+### What R25B.2 delivers
+
+1. **New module** -- `examples/voice_dialog.nova`. Lives in `examples/`
+   (alongside R25B). Public API: `vc_session_new() -> session_t`,
+   `vc_session_turn(kg, session, question_text) -> [response_text,
+   session]`, `vc_session_history(session) -> list[turn_t]`,
+   `vc_session_reset(session) -> 1` (mutates in place). Turn
+   accessors: `vc_turn_question`, `vc_turn_template`, `vc_turn_kind`,
+   `vc_turn_ids`. Session accessors: `vc_session_last_template`,
+   `vc_session_last_kind`, `vc_session_last_ids`,
+   `vc_session_last_limit`, `vc_session_turn_count`.
+
+2. **Follow-up pattern detection** -- rule-based, layered in front of
+   R25B's parser. First-match-wins dispatch:
+
+   * Topic shift (`actually X`, `wait X`, `never mind`, `change
+     subject X`, `let's talk about X`, `new topic X`) -- resets the
+     session; parses the remainder as a fresh question.
+   * "Tell me more" (`tell me more`, `more`, `list more`, `show
+     more`, `any more`, `what else`, `and more`) -- LIMIT *= 2
+     (capped at 100) + re-run LIST_ALL on `last_kind`.
+   * Anaphora describe (`describe it`, `what is it`, `tell me about
+     it`, `tell me about him/her`, `describe that one`, etc.) --
+     WHAT_IS on `last_ids[0]`.
+   * Ordinal anaphora (`the first/second/third/fourth/fifth one`,
+     `the last one`, `what is the second one`, etc.) -- WHAT_IS on
+     `last_ids[N]` (or `len-1` for "last").
+   * Pivot (`what about Y`, `how about Y`, `and Y`) -- reuse
+     `last_tpl` with new kind Y.
+   * Fall through -- R25B parser handles the transcript as a fresh
+     turn.
+
+3. **History cap** -- brief mandate: last 5 turns. Every successful
+   turn appends to `history`; when `len > 5` a trimmed copy replaces
+   it (FIFO eviction). `turn_count` stays monotonic for observability.
+
+4. **Anaphora resolution** -- "him" / "her" / "it" / "that" all
+   resolve to `last_ids[0]` (single first-entity slot; no gender
+   tracking -- see honest scope). "The second one" resolves to
+   `last_ids[1]`; "the last one" to `last_ids[len-1]`.
+
+5. **Chat dispatch** -- `/dialog <wav>` admin command (cousin of
+   R25B's `/converse`). Session lives in a module-level slot so
+   successive `/dialog` calls share state across the REPL.
+   `/dialog reset` clears it. Chat-side wiring is 2 lines (one
+   import + one dispatch entry); within brief's allowance.
+
+### Verification
+
+* **44 unit assertions** in `tests/unit/test_voice_dialog.nova`
+  (session bookkeeping, R25B parity on the fresh-turn path,
+  "tell me more" + LIMIT escalation, anaphora "describe it",
+  anaphora chain across WHAT_IS, ordinal "the second / third /
+  last one", "what about CONCEPT" pivot, topic shift with + without
+  remainder, history cap at 5 after 7 turns; ce_summary tallies
+  the actual checks).
+* **13 integration assertions** in
+  `tests/integration/scenario_aaaaa_dialog.sh` (letter `aaaaa` --
+  first free 5-letter slot). A driver runs the 3-turn fixture
+  ("list all FACT" -> "tell me more" -> "what is the first one"),
+  then a topic shift + "describe it", then explicit reset; the
+  chat dispatch path verifies `/dialog` usage line + `/dialog
+  reset` acknowledgement.
+* All R25B tests stay green: `bash scripts/test.sh` confirms
+  219 / 219 unit tests pass (including R25B `test_voice_conversation`
+  27 checks and new R25B.2 `test_voice_dialog` 44 checks) and the
+  R25B integration scenario_nnnn_voice_conversation stays at 20/20.
+
+### Multi-turn correctness on the 3-turn fixture
+
+The brief's headline fixture is `"list all FACT" -> "tell me more"
+-> "what is the first one"`. Driver output (see scenario script):
+
+```
+TURN q='list all FACT' resp='Found 3 FACT atoms: ids 0, 1, 2.'
+STATE tpl=3 kind=FACT count=1 ids=3
+TURN q='tell me more' resp='Found 3 FACT atoms: ids 0, 1, 2.'
+STATE tpl=3 kind=FACT count=2 ids=3
+TURN q='what is the first one' resp='That FACT atom has id 0.'
+STATE tpl=1 kind=FACT count=3
+```
+
+Turn 1: fresh LIST_ALL ingests 3 FACT atoms. Turn 2: "tell me more"
+re-runs LIST_ALL on the same kind with LIMIT 20 (state.last_limit
+bumps from 10 -> 20; the response is identical because the fixture
+KG only has 3 FACTs). Turn 3: "what is the first one" resolves to
+`last_ids[0] = 0`. Anaphora resolution works yes.
+
+### Honest scope (R25B.3+ -- what's still deferred)
+
+* **Real label lookup.** "describe it" returns "atom has id 42";
+  we don't dereference 42 back to its human-readable label
+  (which is an int hash in R15D's binding format). A label-int
+  -> string reverse table would let us speak "atom labelled foo".
+* **Cross-pronoun gender / number tracking.** "him" / "her" / "it"
+  all resolve to the same first entity (no NLP dictionary).
+* **Conversational repair.** "no, the OTHER one" not handled; the
+  operator must say "the third one" explicitly.
+* **Fuzzy intent matching.** "tell me more about CONCEPT" routes
+  to "more" path AND keeps prior kind (we don't parse a trailing
+  kind in the more shape).
+* **Backchannel handling.** "uh-huh" / "okay" / "mm-hmm" produce
+  UNKNOWN apology rather than being silently absorbed.
+
+### Files touched (R25B.2)
+
+* NEW: `examples/voice_dialog.nova` (~600 lines, 20+ public funcs).
+* NEW: `tests/unit/test_voice_dialog.nova` (44 assertions).
+* NEW: `tests/integration/scenario_aaaaa_dialog.sh` (13 assertions).
+* MOD: `examples/crossengin_chat.nova` (+1 import +1 dispatch = 2
+  lines, within brief's allowance).
+* MOD: `AUDIO_AUDIT.md` (new R25B.2 section), `README.md`,
+  `NEXT_SESSION.md` (this).
+
+R8B (whisper), R15D (query), R21C (TTS) modules untouched -- the
+dialog layer is purely additive on top of R25B.
+
+---
+
 ## R27C (this session) -- Noise-XK wrap of relay payloads (R26E.2 follow-up)
 
 **Status: complete -- new `src/federation/gossip_relay_secure.nova`

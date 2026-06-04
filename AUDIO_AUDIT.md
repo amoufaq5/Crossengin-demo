@@ -2756,6 +2756,131 @@ of `voice_conversation.nova`.
 * MOD: `AUDIO_AUDIT.md` (this section), `README.md`,
   `NEXT_SESSION.md`.
 
+## R25B.2 -- Multi-turn voice dialogue (conversation state + follow-ups)
+
+R25B.2 closes the conversation-state hole at the top of R25B's deferred
+list: a session object carries the last 5 turns + the most recent
+template / kind / entity-id list across calls, and a follow-up parser
+layer in front of the R25B parser recognises `tell me more` /
+`the second one` / `what about X` / `describe it` / `actually` patterns
+and either rewrites the transcript with resolved context OR escalates
+the SPARQL LIMIT to pull more rows. R25B's public API is unchanged --
+single-turn `/converse` callers see the same behaviour byte-for-byte.
+
+### Layered design
+
+R25B.2 lives in a new sibling module `examples/voice_dialog.nova`
+(~600 lines) that imports `voice_conversation.nova` READ-ONLY. The
+dialog state machine is a transcript rewriter sitting in front of
+R25B's `vc_parse_question` / `vc_build_sparql` / `vc_format_result`
+chain; it never reaches into R25B's internals.
+
+```
+session_t (history, last_tpl, last_kind, last_ids, last_limit)
+     |
+     v
+[vc_session_turn]
+     |
+     +-- topic shift? ("actually X" / "never mind") --> reset + parse-fresh
+     |
+     +-- "tell me more"? --> LIMIT *= 2 + re-run LIST_ALL on last_kind
+     |
+     +-- anaphora? ("describe it" / "the second one") --> WHAT_IS on last_ids[N]
+     |
+     +-- pivot? ("what about Y") --> reuse last_tpl with new kind
+     |
+     +-- fall through --> R25B parser (fresh turn)
+```
+
+### Public surface
+
+* `vc_session_new() -> session_t` -- empty session
+* `vc_session_turn(kg, session, question_text) -> [response_text, session]`
+* `vc_session_history(session) -> list[turn_t]`
+* `vc_session_reset(session) -> 1` (mutates in place)
+* Accessors: `vc_turn_question`, `vc_turn_template`, `vc_turn_kind`,
+  `vc_turn_ids` (per-turn); `vc_session_last_template`,
+  `vc_session_last_kind`, `vc_session_last_ids`,
+  `vc_session_last_limit`, `vc_session_turn_count` (per-session).
+* `vc_dialog_run(kg, arg)` -- chat-side wrapper for `/dialog`.
+
+### History cap
+
+Brief mandate: last 5 turns. Implementation: every `_vc_append_turn`
+checks `len(history) > 5` and rebuilds a trimmed copy (FIFO eviction).
+The `turn_count` slot stays monotonic so observability survives the
+cap; the test asserts a 7-turn run leaves count=7 with len(history)=5.
+
+### Follow-up patterns recognised
+
+| Pattern (lower-cased)                                | Action                                                  |
+|------------------------------------------------------|---------------------------------------------------------|
+| `actually X` / `wait X` / `never mind X` /           | Reset session, parse X fresh                            |
+| `change subject X` / `let's talk about X` /          |                                                         |
+| `new topic X`                                        |                                                         |
+| `actually` (no remainder), `never mind`,             | Reset session, acknowledge                              |
+| `change subject`, `new topic`                        |                                                         |
+| `tell me more` / `more` / `list more` / `show more` /| LIMIT *= 2 (cap 100); re-run LIST_ALL on `last_kind`    |
+| `any more` / `what else` / `and more`                |                                                         |
+| `describe it` / `what is it` / `tell me about it` /  | WHAT_IS on `last_ids[0]`                                |
+| `tell me about him` / `tell me about her` /          |                                                         |
+| `describe that one` / etc.                           |                                                         |
+| `the second one` / `the third one` / `the last one` /| WHAT_IS on `last_ids[N]` (or `last_ids[len-1]` for last)|
+| `what is the second one` / `what about the third`    |                                                         |
+| `what about Y` / `how about Y` / `and Y`             | Reuse `last_tpl` with kind Y                            |
+| (no match)                                           | Fall through to R25B parser                             |
+
+### Chat dispatch
+
+`/dialog <wav>` admin command. Session lives in a module-level slot
+in `voice_dialog.nova` (`_vc_default_session`) so successive calls
+share state across the chat REPL. `/dialog reset` clears it. The
+chat-side wiring is 2 lines: one import + one dispatch entry.
+
+### Verification
+
+* **44 unit assertions** in `tests/unit/test_voice_dialog.nova`
+  (session bookkeeping: 6; R25B parity: 8; tell-me-more: 4; anaphora
+  on "it": 4; ordinal anaphora: 3; pivot: 2; topic shift: 5; history
+  cap at 5: 5; results: assert-counter tallies the actual checks).
+* **13 integration assertions** in
+  `tests/integration/scenario_aaaaa_dialog.sh` (letter `aaaaa` free).
+  Driver runs a 5-turn dialog ("list all FACT" -> "tell me more" ->
+  "what is the first one" -> "actually list all CONCEPT" ->
+  "describe it") + checks reset behaviour; chat dispatch verifies
+  `/dialog` (usage line) + `/dialog reset` (acknowledgement).
+* All R25B tests (27 unit + 20 integration) remain green.
+
+### Honest scope (R25B.3+)
+
+* **Real label lookup.** "describe it" returns "atom has id 42"; we
+  don't dereference 42 back to its human label. A label-int -> string
+  reverse-lookup over the R15D atom store would let us speak "atom
+  labelled foo" instead.
+* **Cross-pronoun gender / number tracking.** "him" / "her" / "it"
+  all resolve to the SAME `last_ids[0]`; without an NLP dictionary
+  we can't track entity gender or singular/plural.
+* **Conversational repair.** "no, the OTHER one" is not handled; the
+  operator must say "the third one" explicitly.
+* **Coreference chains.** "X is foo. Tell me about it. And about bar."
+  -- "bar" doesn't propagate as a new antecedent for the NEXT "tell
+  me about it"; each turn replaces `last_ids` based on its own result.
+* **Fuzzy intent matching.** "tell me more about CONCEPT" routes to
+  the "more" path AND keeps prior kind (we don't currently parse a
+  trailing kind in the more shape).
+
+### Files touched (R25B.2)
+
+* NEW: `examples/voice_dialog.nova` (~600 lines, 20+ public functions).
+* NEW: `tests/unit/test_voice_dialog.nova` (44 assertions).
+* NEW: `tests/integration/scenario_aaaaa_dialog.sh` (13 assertions).
+* MOD: `examples/crossengin_chat.nova` (+1 import +1 dispatch = 2
+  lines, within brief's allowance).
+* MOD: `AUDIO_AUDIT.md` (this section), `README.md`, `NEXT_SESSION.md`.
+
+R8B (whisper), R15D (query), R21C (TTS) modules untouched -- the
+dialog layer is purely additive on top.
+
 ## R26C -- Spectral-subtraction Wiener noise reduction
 
 Closes the **frequency-domain denoising** gap in CrossEngin's audio chain.

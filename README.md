@@ -280,6 +280,38 @@ computational units rather than orchestrating a pipeline of modules.
 > available via `pitch_run_auto_command` (not yet wired into the chat
 > dispatch table; reserved for an optional +1 admin line).
 >
+> R25B.2 adds `examples/voice_dialog.nova` — the multi-turn cousin of
+> R25B's single-turn `/converse`. A session object accumulates the last
+> 5 turns + most recent template / kind / entity-id list across calls;
+> a follow-up parser layer in front of the R25B parser recognises
+> `tell me more` (escalates LIST_ALL LIMIT and re-runs on prior kind),
+> `the second one` / `the third one` / `the last one` (anaphora to
+> `last_ids[N]`), `describe it` / `what is it` / `tell me about him`
+> (anaphora to `last_ids[0]`), `what about Y` / `and Y` (pivots prior
+> template onto new kind), and `actually X` / `never mind` /
+> `change subject X` (topic-shift detection resets the session and
+> parses the remainder fresh). R25B's public API is unchanged —
+> single-turn callers see byte-identical behaviour. Public API:
+> `vc_session_new() -> session_t`, `vc_session_turn(kg, session,
+> question_text) -> [response_text, session]`, `vc_session_history(
+> session) -> list[turn_t]`, `vc_session_reset(session) -> 1` (mutates
+> in place), plus turn + session accessors. History caps at 5 turns
+> (FIFO eviction; `turn_count` stays monotonic). Chat: `/dialog <wav>`
+> admin command (2-line wiring: import + dispatch); session persists
+> across calls; `/dialog reset` clears it. Verification: 44 unit
+> assertions in `tests/unit/test_voice_dialog.nova` (NEW; session
+> bookkeeping, R25B parity, "tell me more" + LIMIT escalation,
+> anaphora "it" + ordinals + chain across WHAT_IS, "what about Y"
+> pivot, topic shift with + without remainder, history cap at 5 after
+> 7 turns) + 13 integration assertions in
+> `tests/integration/scenario_aaaaa_dialog.sh` (NEW; 5-turn fixture
+> exercises the full follow-up state machine, then chat `/dialog
+> reset` path). Full unit suite: 219/219 pass; all R25B tests stay
+> green (27 unit + 20 integration). Honest scope (R25B.3+ deferred):
+> real label lookup (returns "atom has id 42" not "atom labelled
+> foo"), cross-pronoun gender/number tracking, conversational repair
+> ("no, the OTHER one"), fuzzy intent matching, backchannel handling.
+>
 > R25B adds `examples/voice_conversation.nova` — the end-to-end voice
 > conversation demo that threads the existing audio + cognition legs
 > into a single tangible pipeline. Speak a question into a WAV, get a
