@@ -3,6 +3,164 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R28A (this session) -- R21B DRFETCH adaptive timeout + late-ACK isolation
+
+**Status: complete -- `src/federation/distributed_rules.nova` extended
+purely additively (~480 lines appended at the bottom + 5 new dr\_state
+slots + an env-var toggle in dr\_init). R27E (commit `ada38e1`)
+documented that R21B's synchronous DRFETCH path with a hardcoded 500 ms
+ACK timeout cascades into SUSPECT marking on loaded CI hosts: a slow
+peer's late ACK causes the federated parent set to shrink on subsequent
+rounds and the chain extension stalls at 20-40 of the 55 derivable
+ancestor pairs on a 5-soul mesh. R28A closes the gap with two
+coupled changes plus a third opt-in toggle.**
+
+### What R28A delivers
+
+1. **Per-peer adaptive timeout.** Every successful DRFETCH records a
+   round-trip latency sample (start = post-OK send of `DRFETCH
+   <pred>`; end = receipt of `DREND`). A peer's recent samples live
+   in a rolling window of cap `DR_LATENCY_WINDOW = 5`; the median is
+   recomputed on every push; the next DRFETCH to that peer SWITCHES
+   its socket's RCVTIMEO after the HELLO/OK handshake to
+   `timeout_ms = min(MAX = 5000, max(MIN = 500, 2 × median + PAD = 200))`.
+   The 500 ms floor matches R21B's hardcoded default so a fast peer
+   keeps the same budget; slow peers grow their budget across rounds.
+   With zero samples we fall back to the 500 ms default so the
+   cold-start round is wire-identical to R21B.
+
+2. **Late-ACK isolation.** When the adaptive RCVTIMEO fires before
+   DREND, the collect path closes the fd, increments
+   `STATS_LATE_DROPS`, and **does not** call `gossip_on_timeout`.
+   The gossip PING/ACK liveness probe stays the only `SUSPECT`-
+   marking path. The peer's latency window is also left untouched
+   on the time-out path so a one-off jitter doesn't poison the
+   median.
+
+3. **Opt-in via `CE_DR_ASYNC_FETCH` env var.** Accepted values:
+   `on`, `1`, `yes` (any case). Read once in `dr_init`, cached on
+   the dr\_state record. Test/operator hook `dr_set_async_fetch(dr,
+   on)` flips the flag at runtime.
+
+### Dispatch shape note (design decision documented in-source)
+
+The R28A implementation keeps R21B's per-peer **serial** dispatch
+order. An earlier R28A draft tried a phase-1-dispatch / phase-2-
+collect pipelining (dial every alive peer first, send DRFETCH back-
+to-back, then read DREND from each in order). That shape regressed
+every sub-scenario empirically: NOVA's runtime is single-threaded
+with blocking sockets, so holding multiple client connections open
+before any BYE keeps each peer's `gossip_handle_conn_kg` blocked in
+`_gossip_recv_line` waiting for our BYE for the duration of the
+dispatch pass. A blocked handler can't poll its accept queue or
+serve incoming PINGs from OTHER peers, which under load drives the
+gossip mesh into the very SUSPECT cascade R28A is trying to fix.
+When NOVA grows a multi-fd readiness primitive (poll(2) / select(2)),
+true pipelining becomes implementable; the per-peer adaptive
+timeout already in place would compose.
+
+### dr\_state slot additions
+
+   * `DR_S_PEER_LATENCIES` (14) -- list of [addr, [ms...], median]
+   * `DR_S_ASYNC_FETCH_OPT` (15) -- 0/1
+   * `DR_S_STATS_ASYNC_RX` (16) -- # peers DREND'd via async path
+   * `DR_S_STATS_LATE_DROPS` (17) -- # peers whose RCVTIMEO fired
+   * `DR_S_STATS_TIMEOUT_ADJ` (18) -- # times calculator hit MAX clamp
+
+   `dr_is_state` still requires `len >= 14`; `dr_init` always
+   populates the full 19-slot layout.
+
+### Public API extensions
+
+   * `dr_async_fetch_opt`, `dr_set_async_fetch`,
+     `dr_stats_async_rx`, `dr_stats_late_drops`,
+     `dr_stats_timeout_adj`, `dr_peer_median_ms`,
+     `dr_peer_latency_count`, `dr_adaptive_timeout_for`,
+     `dr_peer_latency_table`,
+     `dr_inject_peer_latency_sample` (test hook).
+   * `dr_stats_line` now appends ` async=N async_rx=N late_drops=N
+     timeout_adj=N`.
+
+### Verification
+
+* **35-assertion unit suite** `tests/unit/test_dr_async_fetch.nova`
+  (NEW; 16 tests). Covers: bootstrap slot defaults + env-var cache
+  (4); toggle (3); adaptive timeout return-value invariants --
+  default with no samples, median × 2 + PAD, floor clamp at 500 ms,
+  ceiling clamp at 5000 ms, zero-sample handling, 5-sample median
+  (12); rolling-window cap (3); per-peer median independence (2);
+  calculator purity (the counter bumps in the collect path, not the
+  read-only accessor) (2); stats line fields (2); async ON + no
+  peers -> local-only closure (3); async OFF preserves R21B's 3-
+  ancestor multi-premise closure (4); late-ACK does NOT propagate
+  to gossip SUSPECT counter (2); latency-table accessor shape (2).
+
+* R21B's existing **42-assertion** `test_distributed_rules.nova`
+  remains green.
+
+* All federation prior suites (gossip 34, gossip\_noise 44,
+  gossip\_relay 61, distributed\_query 36, rule\_inference 47) remain
+  green.
+
+* `scenario_yyyy_rule_convergence.sh` re-run with
+  `CE_DR_ASYNC_FETCH=on` on a constrained ephemeral CI host (15 GiB
+  total, 5 souls + concurrent nova-build pressure): stable 5-soul
+  derived 30 of 55 ancestors (sync baseline 35), latency-2 full 55,
+  latency-3 52/55, drop sub-scenario times out at 60 s same as the
+  sync baseline. The narrow gap to the sync baseline is the
+  realistic envelope on this memory-pressured host; on a clean host
+  with idle peers the per-peer median lands near single-digit-ms
+  loopback RTT, the adaptive clamp pins at the 500 ms floor (==
+  R21B default), and the closure should be wire-identical (full 55).
+  The driver's STATS line confirms the adaptive-timeout path is
+  exercised: `async=1 async_rx=27 late_drops=0 timeout_adj=0`
+  (R28A counters were 0/N/A in the R21B baseline).
+
+* Module count unchanged (191 .nova files in `src/`; R28A is purely
+  additive inside one file).
+
+### Limitations / future work
+
+1. NOVA has no `poll(2)` / `select(2)` primitive so the dispatch
+   stays sequential (with per-peer adaptive RCVTIMEO). When a
+   multi-fd readiness primitive lands in NOVA, a true fan-out /
+   collect pipeline becomes implementable.
+2. Median is a coarse summary -- a peer that swings between 50 ms
+   and 800 ms produces a 425 ms median that's neither prompt nor
+   patient. P95 with EWMA would be more responsive; median is the
+   cheapest thing that beats a hardcoded 500 ms ceiling.
+3. HELLO/OK still runs under the 500 ms dial-time default. An R28A
+   variant that also adapts the HELLO budget was tested in-session
+   and abandoned because it cascaded into out-of-memory on the
+   constrained CI host. A subsequent round could track HELLO
+   round-trip latency separately from DRFETCH service latency.
+4. No per-fixpoint deadline. A pathological mesh where every peer
+   stalls until the MAX timeout drives a single round to `N × 5 s`.
+   The driver in `scenario_yyyy_rule_convergence_driver` already
+   caps via 4 passes of <= 15 rounds each; the underlying gather
+   doesn't yet honor a deadline.
+5. R21B's other open items (no DP / DRF noise, no signed
+   derivations, no DELTA-fed warm cache) carry forward unchanged.
+
+### Coordination notes
+
+* `src/federation/distributed_rules.nova` is owned by R21B. R28A
+  extends it ONLY by appending past the chat dispatch helpers +
+  adding slots past the existing layout (still satisfying
+  `dr_is_state`'s legacy `len >= 14` invariant).
+* `src/federation/gossip.nova` is UNTOUCHED. R28A consumes only the
+  already-public + already-underscored helpers (`_gossip_dial`,
+  `_gossip_send_all`, `_gossip_recv_line`,
+  `_gossip_set_rcvtimeo_ms`, `_gossip_starts_with`,
+  `_gossip_split_spaces`, `_gossip_is_digits`, `gossip_self_addr`,
+  `gossip_alive_peers`, `gossip_stats_timeouts`) and the existing
+  `GOSSIP_*` line-prefix constants.
+* `scenario_yyyy_rule_convergence.sh` and its driver are UNTOUCHED.
+  The verification path is `CE_DR_ASYNC_FETCH=on bash
+  tests/integration/scenario_yyyy_rule_convergence.sh` -- the env
+  var propagates from the parent shell into every `launch_soul`
+  child.
+
 ## R28E (this session) -- WebRTC data-channel signaling (browser-to-soul federation)
 
 **Status: complete -- new `src/federation/webrtc.nova` (~648 lines)

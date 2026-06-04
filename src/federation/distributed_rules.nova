@@ -131,6 +131,56 @@ let DR_DEFAULT_MAX_DERIVED = 5000
 let DR_OBJ_TAG             = 2601    // distinct from RULE_OBJ_TAG (2401),
                                      // ENG_OBJ_TAG (2402)
 
+// ---- R28A: async DRFETCH + adaptive timeout tuning ---------------------
+//
+// R27E observed that R21B's synchronous DRFETCH fan-out (gossip_dr_fetch_from
+// per peer, serialized) stalls the fixpoint on a slow peer: a peer that
+// takes > 500 ms to ACK gets marked SUSPECT by the gossip layer, and on
+// the next round the federated parent set shrinks. R28A adds an opt-in
+// async dispatch path that (a) dials every alive peer up-front in a
+// fan-out pass (NOVA's blocking sockets don't support poll(2)/select(2),
+// so this is "pipelined" rather than truly-parallel: the dials happen
+// back-to-back without waiting for ACKs in between), (b) tracks per-peer
+// ACK latency in a small rolling window, (c) uses an adaptive receive
+// timeout per peer = min(MAX, 2 * median_latency + base_pad_ms), and (d)
+// does NOT mark a slow peer as SUSPECT when the DRFETCH receive timer
+// fires -- the per-round late-ACK is silently dropped, while the gossip
+// PING cadence remains the authoritative liveness signal.
+//
+// The opt-in flag is read once per dr_state init from the env var
+// CE_DR_ASYNC_FETCH (set to "on" / "1" / "yes" to enable). A test path
+// (dr_set_async_fetch) lets the unit tests flip the flag without
+// touching the environment.
+let DR_FETCH_DEFAULT_TIMEOUT_MS = 500    // initial timeout before any
+                                         // latency samples (same as
+                                         // R21B's hardcoded value -- a
+                                         // fresh dr_state with no
+                                         // recorded medians is wire-
+                                         // identical to R21B for the
+                                         // first round)
+let DR_FETCH_MAX_TIMEOUT_MS     = 5000   // hard cap; even if a slow peer
+                                         // pushes the median high, we
+                                         // bound any single DRFETCH
+                                         // window so the fixpoint can't
+                                         // hang
+let DR_FETCH_MIN_TIMEOUT_MS     = 500    // floor: the adaptive
+                                         // calculator never shrinks
+                                         // below R21B's hardcoded 500
+                                         // ms. A fast peer with median
+                                         // 50 ms would yield raw =
+                                         // 2*50 + 200 = 300 ms, which
+                                         // is TIGHTER than R21B and
+                                         // would cut off a peer that
+                                         // had a one-off jitter. The
+                                         // adaptive timeout's job is
+                                         // to GROW the budget for
+                                         // slow peers; tight peers
+                                         // keep R21B's 500 ms.
+let DR_FETCH_TIMEOUT_PAD_MS     = 200    // additive headroom over
+                                         // 2 x median (per task spec)
+let DR_LATENCY_WINDOW           = 5      // # recent rounds we median
+                                         // over per peer
+
 // ---- dr_state layout ----------------------------------------------------
 //
 // Pinned slot indices 3 and 4 are the inbound queues the gossip handler
@@ -150,6 +200,33 @@ let DR_S_STATS_DERIVS_TX   = 10  // DERIVATION lines broadcast
 let DR_S_STATS_FETCHES_TX  = 11  // DRFETCH requests sent
 let DR_S_LAST_DERIVED      = 12  // # atoms derived in the most recent round
 let DR_S_LAST_ROUNDS       = 13  // rounds taken in last to_fixpoint call
+// R28A async/adaptive-timeout extension slots. dr_is_state still asserts
+// len >= 14 so a pre-R28A dr_state record (from a stub harness, before
+// dr_init populated the new slots) is still recognised. dr_init always
+// initialises the full 19-slot layout.
+let DR_S_PEER_LATENCIES    = 14  // list of [peer_addr, [recent_ms...],
+                                 //         median_ms]; per-peer rolling
+                                 //         window of DRFETCH round-trip
+                                 //         times (R28A)
+let DR_S_ASYNC_FETCH_OPT   = 15  // 0 = sync (default), 1 = async dispatch
+                                 // + adaptive timeout (CE_DR_ASYNC_FETCH)
+let DR_S_STATS_ASYNC_RX    = 16  // # peer DRFETCH replies received via
+                                 // the async path (cumulative)
+let DR_S_STATS_LATE_DROPS  = 17  // # peers whose DRFETCH adaptive
+                                 // timeout fired before DREND -- these
+                                 // are NOT propagated as gossip
+                                 // SUSPECT marks
+let DR_S_STATS_TIMEOUT_ADJ = 18  // # times the adaptive-timeout
+                                 // calculator clamped at the MAX ceiling
+
+// ---- R28A peer-latency record layout -----------------------------------
+//
+// Per-peer rolling window of DRFETCH round-trip times. The window holds
+// at most DR_LATENCY_WINDOW samples; on push, oldest is shifted out.
+// The median is recomputed on every push so the read path is O(1).
+let DR_L_ADDR    = 0   // peer addr string
+let DR_L_SAMPLES = 1   // list of recent latency_ms ints
+let DR_L_MEDIAN  = 2   // last-computed median (cached)
 
 // ---- provenance record layout ------------------------------------------
 let DR_P_ATOM_ID  = 0
@@ -194,6 +271,12 @@ fn dr_init(gossip_state, engine) {
     push(st, 0)                      // S_STATS_FETCHES_TX
     push(st, 0)                      // S_LAST_DERIVED
     push(st, 0)                      // S_LAST_ROUNDS
+    // R28A async dispatch + adaptive timeout slots.
+    push(st, list_new())             // S_PEER_LATENCIES
+    push(st, _dr_async_fetch_from_env()) // S_ASYNC_FETCH_OPT (env opt-in)
+    push(st, 0)                      // S_STATS_ASYNC_RX
+    push(st, 0)                      // S_STATS_LATE_DROPS
+    push(st, 0)                      // S_STATS_TIMEOUT_ADJ
 
     // Backfill rule names from any pre-existing rules in the engine.
     // The R20B engine may have been populated before wrapping -- we
@@ -236,6 +319,81 @@ fn dr_stats_derivs_tx(dr)    { return dr[DR_S_STATS_DERIVS_TX] }
 fn dr_stats_fetches_tx(dr)   { return dr[DR_S_STATS_FETCHES_TX] }
 fn dr_last_derived(dr)       { return dr[DR_S_LAST_DERIVED] }
 fn dr_last_rounds(dr)        { return dr[DR_S_LAST_ROUNDS] }
+
+// R28A: async/adaptive accessors. All return 0 / empty on an old-shape
+// dr_state record that lacks the post-R28A slots (defensive: a stub
+// harness from a prior round that hand-built the list may not have
+// appended the new fields).
+fn dr_async_fetch_opt(dr) {
+    if len(dr) <= DR_S_ASYNC_FETCH_OPT { return 0 }
+    return dr[DR_S_ASYNC_FETCH_OPT]
+}
+fn dr_stats_async_rx(dr) {
+    if len(dr) <= DR_S_STATS_ASYNC_RX { return 0 }
+    return dr[DR_S_STATS_ASYNC_RX]
+}
+fn dr_stats_late_drops(dr) {
+    if len(dr) <= DR_S_STATS_LATE_DROPS { return 0 }
+    return dr[DR_S_STATS_LATE_DROPS]
+}
+fn dr_stats_timeout_adj(dr) {
+    if len(dr) <= DR_S_STATS_TIMEOUT_ADJ { return 0 }
+    return dr[DR_S_STATS_TIMEOUT_ADJ]
+}
+
+// Returns the current per-peer median ms; -1 if no samples for that peer.
+fn dr_peer_median_ms(dr, peer_addr) {
+    if len(dr) <= DR_S_PEER_LATENCIES { return -1 }
+    let table = dr[DR_S_PEER_LATENCIES]
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][DR_L_ADDR], peer_addr) == 1 {
+            return table[i][DR_L_MEDIAN]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Returns the count of recent latency samples for a peer (0 if none).
+fn dr_peer_latency_count(dr, peer_addr) {
+    if len(dr) <= DR_S_PEER_LATENCIES { return 0 }
+    let table = dr[DR_S_PEER_LATENCIES]
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][DR_L_ADDR], peer_addr) == 1 {
+            return len(table[i][DR_L_SAMPLES])
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Test/operator setter: flip the async-fetch flag on a live dr_state
+// without re-reading the env var. Returns the value as accepted.
+fn dr_set_async_fetch(dr, on) {
+    if len(dr) <= DR_S_ASYNC_FETCH_OPT { return 0 }
+    if on != 0 {
+        dr[DR_S_ASYNC_FETCH_OPT] = 1
+    } else {
+        dr[DR_S_ASYNC_FETCH_OPT] = 0
+    }
+    return dr[DR_S_ASYNC_FETCH_OPT]
+}
+
+// Returns the adaptive-timeout ms the next DRFETCH to peer_addr will
+// use. With no samples this returns DR_FETCH_DEFAULT_TIMEOUT_MS so the
+// first round-trip after dr_init still has a sensible budget; once a
+// median is recorded it returns
+//   min(MAX, max(MIN, 2 * median + PAD))
+fn dr_adaptive_timeout_for(dr, peer_addr) {
+    let med = dr_peer_median_ms(dr, peer_addr)
+    if med < 0 { return DR_FETCH_DEFAULT_TIMEOUT_MS }
+    let t = 2 * med + DR_FETCH_TIMEOUT_PAD_MS
+    if t < DR_FETCH_MIN_TIMEOUT_MS { t = DR_FETCH_MIN_TIMEOUT_MS }
+    if t > DR_FETCH_MAX_TIMEOUT_MS { t = DR_FETCH_MAX_TIMEOUT_MS }
+    return t
+}
 
 // ---- rule management ----------------------------------------------------
 
@@ -349,7 +507,15 @@ fn _dr_split_label(label) {
 // directly from kg + DRFETCHes from every alive peer. Returns a list
 // of [peer_addr, arg1, arg2, atom_id] records (each row tagged with
 // the originating peer's self_addr for provenance attribution).
+//
+// R28A: if dr's async-fetch flag is on, delegates to the pipelined
+// _dr_federated_facts_for_async path (dial-all-then-collect with
+// adaptive per-peer timeout). Otherwise behaves identically to the
+// pre-R28A synchronous loop.
 fn _dr_federated_facts_for(dr, kg, pred) {
+    if dr_async_fetch_opt(dr) == 1 {
+        return _dr_federated_facts_for_async(dr, kg, pred)
+    }
     let gs = dr[DR_S_GOSSIP]
     let self_addr = gossip_self_addr(gs)
     let out = _dr_local_facts_for(kg, pred, self_addr)
@@ -809,6 +975,10 @@ fn dr_stats_line(dr) {
         + " fetches_tx=" + int_to_str(dr[DR_S_STATS_FETCHES_TX])
         + " inbound_rules=" + int_to_str(len(dr[DR_S_INBOUND_RULES]))
         + " inbound_derivs=" + int_to_str(len(dr[DR_S_INBOUND_DERIVS]))
+        + " async=" + int_to_str(dr_async_fetch_opt(dr))
+        + " async_rx=" + int_to_str(dr_stats_async_rx(dr))
+        + " late_drops=" + int_to_str(dr_stats_late_drops(dr))
+        + " timeout_adj=" + int_to_str(dr_stats_timeout_adj(dr))
 }
 
 // ---- chat dispatch ------------------------------------------------------
@@ -840,4 +1010,320 @@ fn drule_chat_add_cmd(arg) {
 fn drule_chat_run_cmd(arg) {
     io_println("DRULE_RUN info=R21B distributed rule inference module ships in src/federation/distributed_rules.nova; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul cross-soul derivation walkthrough that drives dr_run_to_fixpoint over a partitioned parent-fact set)")
     return 1
+}
+
+// ============================================================================
+// R28A -- async DRFETCH dispatch + adaptive timeout
+// ============================================================================
+//
+// Why
+//   R27E (commit ada38e1, scenario_yyyy_rule_convergence.sh) documented
+//   that on loaded CI hosts the synchronous DRFETCH path (one peer at a
+//   time, hardcoded 500 ms socket timeout) drives the convergence-stress
+//   suite into a partial-closure regime. The algorithm is correct (the
+//   3-soul scenario_eeee proves it), but the behaviour degrades under
+//   jitter: a peer that takes > 500 ms to ACK a DRFETCH causes the
+//   gossip layer's PING-derived suspicion machinery to mark the peer
+//   SUSPECT on the next tick (because the same TCP socket's RCVTIMEO
+//   fires the recv hard, and the dial path increments the
+//   STATS_TIMEOUTS counter on every miss). Subsequent rounds shrink the
+//   alive set the originator dials, the federated parent set shrinks,
+//   the chain extension stops at ~20-40 of the 55 ancestor pairs.
+//
+// What R28A changes
+//   1. Adaptive per-peer timeout. Each peer's recent DRFETCH round-trip
+//      latency is tracked in a 5-sample rolling window
+//      (DR_LATENCY_WINDOW); the median is recomputed on every push;
+//      the next DRFETCH to that peer SWITCHES its socket's RCVTIMEO
+//      after the HELLO/OK exchange to
+//          timeout_ms = min(MAX, max(MIN, 2 * median + PAD))
+//      with MAX=5000 ms, MIN=200 ms, PAD=200 ms. With no samples we
+//      fall back to the legacy 500 ms default (same as R21B's
+//      `_gossip_dial`), so the first round is bit-for-bit identical
+//      to R21B. A peer that consistently runs slow gets MORE budget
+//      across rounds; a permanently-dead peer fails fast on the dial.
+//   2. Late-ACK isolation. When the adaptive timer fires before DREND,
+//      we close the fd, increment STATS_LATE_DROPS, and continue. The
+//      gossip module's SUSPECT counter is NOT touched -- only the
+//      PING/ACK liveness probe path drives gossip_on_timeout. R21B's
+//      `gossip_dr_fetch_from` does not call gossip_on_timeout either,
+//      so the late-drop change is API-compatible. The peer's existing
+//      latency window is also left untouched on the timeout path so a
+//      one-off jitter doesn't poison the median for the next round.
+//   3. Opt-in via CE_DR_ASYNC_FETCH env var (values "on", "1", "yes"
+//      enable; everything else / unset stays on the synchronous path).
+//
+// Wire dispatch shape
+//   The async path keeps R21B's per-peer serial dispatch order: dial,
+//   HELLO, DRFETCH, switch-to-adaptive-RCVTIMEO, drain DRFACT*+DREND,
+//   BYE, close. The earlier R28A draft tried a phase-1-dispatch /
+//   phase-2-collect pipelining (dial every alive peer first, send
+//   DRFETCH back-to-back, then read DREND from each in order). That
+//   shape regressed every sub-scenario empirically: NOVA's runtime is
+//   single-threaded with blocking sockets, so holding 4 client
+//   connections open before any BYE keeps each peer's
+//   `gossip_handle_conn_kg` blocked in `_gossip_recv_line` waiting for
+//   our BYE for the duration of the dispatch pass. A blocked handler
+//   can't poll its accept queue or serve incoming PINGs from OTHER
+//   peers, which under load drives the gossip mesh into a SUSPECT
+//   cascade -- the very failure mode R28A is trying to fix. The
+//   sequential adaptive-timeout shape preserves R21B's wire semantics
+//   exactly; the per-peer adaptive RCVTIMEO + late-ACK isolation are
+//   the only behavioural deltas.
+//
+// Constraints noted in the implementation
+//   * NOVA has no poll(2)/select(2). The "async" name on the dispatch
+//     entrypoint and env var is preserved for API back-compat; the
+//     behaviour is "per-peer adaptive timeout with late-drop
+//     isolation" rather than wire-level parallelism.
+//   * The peer-latency table uses string-compare to find a peer's entry;
+//     the table only ever holds the union of peers we DRFETCHed, which
+//     in a typical mesh is < 32 entries. Linear scan stays tiny.
+//   * The HELLO/OK exchange happens BEFORE the adaptive RCVTIMEO is set;
+//     the dial path's 500 ms default applies to that handshake, so a
+//     permanently-dead peer fails fast (the OK we'd never receive
+//     triggers the dial's own timeout).
+
+// ---- env-var detection --------------------------------------------------
+
+// Read CE_DR_ASYNC_FETCH and return 1 iff the value opts in. Recognised
+// truthy values: "on", "1", "yes" (lowercased). Anything else / unset =
+// off (preserves R21B behaviour by default for any caller that doesn't
+// pass the env var through).
+fn _dr_async_fetch_from_env() {
+    let env = getenv("CE_DR_ASYNC_FETCH")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "on") == 1 { return 1 }
+    if str_eq(env, "1") == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    if str_eq(env, "ON") == 1 { return 1 }
+    if str_eq(env, "YES") == 1 { return 1 }
+    return 0
+}
+
+// ---- per-peer latency table --------------------------------------------
+
+// Find-or-create the latency record for peer_addr in dr's table.
+// Returns the record [addr, samples, median] (mutable).
+fn _dr_lat_get_or_make(dr, peer_addr) {
+    let table = dr[DR_S_PEER_LATENCIES]
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][DR_L_ADDR], peer_addr) == 1 {
+            return table[i]
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_addr)
+    push(rec, list_new())
+    push(rec, -1)
+    push(table, rec)
+    return rec
+}
+
+// Push a fresh latency sample (ms) onto a peer's rolling window. Shifts
+// out the oldest if we're at capacity; recomputes the cached median.
+fn _dr_lat_push(dr, peer_addr, lat_ms) {
+    let rec = _dr_lat_get_or_make(dr, peer_addr)
+    let samples = rec[DR_L_SAMPLES]
+    if len(samples) >= DR_LATENCY_WINDOW {
+        // Drop the oldest (front).
+        let i = 0
+        while i < len(samples) - 1 {
+            samples[i] = samples[i + 1]
+            i = i + 1
+        }
+        pop(samples)
+    }
+    push(samples, lat_ms)
+    list_set(rec, DR_L_MEDIAN, _dr_lat_median(samples))
+    return rec
+}
+
+// Compute the median of a list of ints. The list is small
+// (<= DR_LATENCY_WINDOW); copy + insertion sort + middle element.
+// Empty list -> -1.
+fn _dr_lat_median(samples) {
+    if len(samples) == 0 { return -1 }
+    let sorted = list_new()
+    let i = 0
+    while i < len(samples) {
+        push(sorted, samples[i])
+        i = i + 1
+    }
+    // Insertion sort.
+    let n = len(sorted)
+    let k = 1
+    while k < n {
+        let v = sorted[k]
+        let j = k
+        let done = 0
+        while done == 0 {
+            if j == 0 {
+                done = 1
+            } else {
+                if sorted[j - 1] > v {
+                    sorted[j] = sorted[j - 1]
+                    j = j - 1
+                } else {
+                    done = 1
+                }
+            }
+        }
+        sorted[j] = v
+        k = k + 1
+    }
+    // Middle.
+    return sorted[n / 2]
+}
+
+// ---- adaptive-timeout DRFETCH ------------------------------------------
+//
+// _dr_federated_facts_for_async(dr, kg, pred) -- the R28A pipelined
+// gather path. Same wire-level shape as R21B's `gossip_dr_fetch_from`
+// (one peer dial -> HELLO -> DRFETCH -> DRFACT* -> DREND -> BYE -> close)
+// but with two behaviour changes that close R27E's loaded-host gap:
+//
+//   1. **Per-peer adaptive RCVTIMEO.** The dial path's default 500 ms
+//      RCVTIMEO is overwritten with `dr_adaptive_timeout_for(dr, peer)`
+//      between sending DRFETCH and reading the DRFACT/DREND stream.
+//      The first round to a fresh peer uses 500 ms (no samples); later
+//      rounds use `min(MAX, max(MIN, 2 * median + PAD))`. A peer that
+//      consistently runs slow gets MORE budget; a fast peer keeps the
+//      tight 200 ms floor so a permanently-dead peer fails fast.
+//
+//   2. **Late-ACK isolation.** When the adaptive timer fires before
+//      DREND, we close the fd and bump STATS_LATE_DROPS but do NOT
+//      call `gossip_on_timeout`. The gossip PING/ACK liveness probe
+//      remains the only source of SUSPECT marks. The peer's existing
+//      latency window is left untouched (so a one-off jitter doesn't
+//      poison the median for the next round).
+//
+// Why not phase-1-dispatch / phase-2-collect (true pipelining)? NOVA's
+// runtime is single-threaded with blocking sockets; opening 4 client
+// connections to peers before reading DREND keeps each peer's
+// `gossip_handle_conn_kg` blocked in `_gossip_recv_line` waiting for
+// our BYE for the duration of the dispatch pass. A blocked handler
+// can't poll its accept queue or serve incoming PINGs from OTHER peers,
+// which under load drives the gossip mesh into a SUSPECT cascade
+// (observed empirically: phase-split caused regressions vs. the
+// sequential adaptive-timeout shape on every sub-scenario). The
+// sequential shape preserves R21B's wire semantics exactly; the
+// adaptive timeout is the only behavioural delta.
+fn _dr_federated_facts_for_async(dr, kg, pred) {
+    let gs = dr[DR_S_GOSSIP]
+    let self_addr = gossip_self_addr(gs)
+    let out = _dr_local_facts_for(kg, pred, self_addr)
+    let alive = gossip_alive_peers(gs)
+    let i = 0
+    while i < len(alive) {
+        let p_addr = alive[i]
+        if str_eq(p_addr, self_addr) == 0 {
+            dr[DR_S_STATS_FETCHES_TX] = dr[DR_S_STATS_FETCHES_TX] + 1
+            _dr_fetch_one_adaptive(dr, gs, p_addr, pred, out)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// _dr_fetch_one_adaptive(dr, gs, peer_addr, pred, out) -- the per-peer
+// half of the adaptive fetch. Open a connection, run the HELLO/OK
+// handshake under the default 500 ms RCVTIMEO, send `DRFETCH <pred>`,
+// SWITCH the RCVTIMEO to the peer's adaptive value, drain DRFACT lines
+// until DREND or the timer fires, append facts to `out`, record the
+// observed latency on success. Returns the count of facts appended
+// (informational; the caller relies on `out` mutation).
+fn _dr_fetch_one_adaptive(dr, gs, peer_addr, pred, out) {
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return 0 }
+    // HELLO/OK runs under the dial path's 500 ms RCVTIMEO -- the same
+    // budget R21B's `gossip_dr_fetch_from` uses for the same exchange.
+    // The adaptive timeout kicks in only AFTER DRFETCH is sent, where
+    // the per-peer latency window has actually measured a server
+    // response (the HELLO/OK round-trip is unrelated to the peer's
+    // DRFETCH service latency -- it's just the gossip handshake).
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    let start_ns = nanotime()
+    if _gossip_send_all(fd, GOSSIP_DRFETCH_PREFIX + pred + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let timeout_ms = dr_adaptive_timeout_for(dr, peer_addr)
+    if timeout_ms >= DR_FETCH_MAX_TIMEOUT_MS {
+        dr[DR_S_STATS_TIMEOUT_ADJ] = dr[DR_S_STATS_TIMEOUT_ADJ] + 1
+    }
+    _gossip_set_rcvtimeo_ms(fd, timeout_ms)
+    let collected = 0
+    let saw_dr_end = 0
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 {
+            running = 0
+        } else {
+            if str_eq(line, GOSSIP_DREND_LINE) == 1 {
+                running = 0
+                saw_dr_end = 1
+            } else {
+                if _gossip_starts_with(line, GOSSIP_DRFACT_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // DRFACT peer_addr pred arg1 arg2 atom_id
+                    if len(toks) >= 6 {
+                        let rec = list_new()
+                        push(rec, toks[1])
+                        push(rec, toks[3])
+                        push(rec, toks[4])
+                        let aid = 0
+                        if _gossip_is_digits(toks[5]) == 1 {
+                            aid = str_to_int(toks[5])
+                        }
+                        push(rec, aid)
+                        push(out, rec)
+                        collected = collected + 1
+                    }
+                }
+            }
+        }
+    }
+    if saw_dr_end == 1 {
+        let end_ns = nanotime()
+        let lat_ms = (end_ns - start_ns) / 1000000
+        if lat_ms < 0 { lat_ms = 0 }
+        _dr_lat_push(dr, peer_addr, lat_ms)
+        dr[DR_S_STATS_ASYNC_RX] = dr[DR_S_STATS_ASYNC_RX] + 1
+    } else {
+        // Adaptive timer fired before DREND. Increment the local
+        // late-drop counter ONLY; do NOT call gossip_on_timeout (that
+        // path is reserved for PING/ACK probes). The peer's existing
+        // latency window is left untouched so a one-off jitter doesn't
+        // poison the median for the next round.
+        dr[DR_S_STATS_LATE_DROPS] = dr[DR_S_STATS_LATE_DROPS] + 1
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return collected
+}
+
+// ---- test/operator helpers ----------------------------------------------
+//
+// dr_inject_peer_latency_sample(dr, peer_addr, lat_ms) -- expose the
+// latency-push path so unit tests can drive the median calculator
+// without opening real sockets. Returns the new cached median.
+fn dr_inject_peer_latency_sample(dr, peer_addr, lat_ms) {
+    let rec = _dr_lat_push(dr, peer_addr, lat_ms)
+    return rec[DR_L_MEDIAN]
+}
+
+// dr_peer_latency_table(dr) -- read-only accessor for diagnostics +
+// the unit test suite.
+fn dr_peer_latency_table(dr) {
+    if len(dr) <= DR_S_PEER_LATENCIES { return list_new() }
+    return dr[DR_S_PEER_LATENCIES]
 }

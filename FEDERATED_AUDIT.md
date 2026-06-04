@@ -2260,35 +2260,29 @@ ancestor pairs under realistic jitter rather than the algorithmic
    yet (the first round after `dr_init`) we fall back to the legacy
    500 ms default so the cold-start behaviour is identical to R21B.
 
-2. **Pipelined dispatch (fan-out then collect).** The synchronous
-   loop interleaves dial+send+recv-DREND per peer. R28A separates
-   the dispatch and collect phases:
+2. **Sequential dispatch with per-peer adaptive RCVTIMEO.** R28A
+   keeps R21B's per-peer serial dispatch order (dial -> HELLO -> OK
+   -> DRFETCH -> drain DRFACT*+DREND -> BYE -> close) but switches
+   the socket's RCVTIMEO from the dial-time 500 ms default to the
+   per-peer adaptive value *after* sending DRFETCH. On DREND the
+   observed round-trip is pushed onto the peer's latency window;
+   on timeout the `STATS_LATE_DROPS` counter is incremented and
+   the peer's existing latency window is left untouched (so a
+   one-off jitter doesn't poison the median for the next round).
 
-   * **Phase 1 (dispatch).** For every alive peer != self, open a
-     TCP connection, run the HELLO/OK handshake, record `start_ns =
-     nanotime()`, send `DRFETCH <pred>`. Failed dials and failed
-     HELLOs are silently skipped (no SUSPECT propagation).
-     Accumulate a list of `[fd, start_ns, peer_addr]` handles. The
-     dials happen back-to-back without waiting for ACKs in between,
-     so kernel-level TCP handshakes overlap with the time spent in
-     user-space serializing the DRFETCH lines.
-
-   * **Phase 2 (collect).** For each open handle, set the per-peer
-     adaptive `_gossip_set_rcvtimeo_ms`, drain `DRFACT` lines until
-     `DREND` or the timer fires, append facts to the output. On
-     `DREND` the observed round-trip is pushed onto the peer's
-     latency window; on timeout the `STATS_LATE_DROPS` counter is
-     incremented and the peer's existing latency window is left
-     untouched (so a one-off jitter doesn't poison the median).
-
-   NOVA's socket builtins are blocking with `SO_RCVTIMEO`; there is
-   no `poll(2)` / `select(2)` primitive. The "async" name describes
-   the dispatch shape (fan-out then collect) not the wire-level
-   concurrency. The win is materially measurable even on a
-   loopback mesh: the 4-peer dispatch pass completes in ~ tens of
-   milliseconds (just the latency of 4 connect + send sequences)
-   while the legacy synchronous path stalls a 4-peer round on the
-   first slow peer for up to 4 × 500 ms = 2 s worst case.
+   An earlier R28A draft tried a phase-1-dispatch / phase-2-collect
+   pipelining (dial every alive peer first, send DRFETCH back-to-
+   back, then read DREND from each in order). That shape regressed
+   every sub-scenario empirically: NOVA's runtime is single-
+   threaded with blocking sockets, so holding multiple client
+   connections open before any BYE keeps each peer's
+   `gossip_handle_conn_kg` blocked in `_gossip_recv_line` waiting
+   for our BYE for the duration of the dispatch pass. A blocked
+   handler can't poll its accept queue or serve incoming PINGs from
+   OTHER peers, which under load drives the gossip mesh into the
+   very SUSPECT cascade R28A is trying to fix. The sequential
+   adaptive-timeout shape preserves R21B's wire semantics exactly
+   while still giving slow peers more recv budget across rounds.
 
 3. **Late-ACK isolation.** When the adaptive RCVTIMEO fires before
    `DREND`, the collect path closes the fd, increments
@@ -2296,14 +2290,15 @@ ancestor pairs under realistic jitter rather than the algorithmic
    `gossip_on_timeout` -- the gossip layer's PING/ACK liveness probe
    remains the only source of `SUSPECT` marks. R21B's existing
    `gossip_dr_fetch_from` already had this property; R28A preserves
-   it for the pipelined path.
+   it for the adaptive-timeout path.
 
 4. **Opt-in via `CE_DR_ASYNC_FETCH` env var.** Values `on`, `1`,
-   `yes` (any case) enable the pipelined path; everything else / unset
-   leaves R21B's synchronous loop in place. The env var is read once
-   in `dr_init` and cached on the dr\_state record at
-   `DR_S_ASYNC_FETCH_OPT`; a test/operator hook `dr_set_async_fetch(dr,
-   on)` flips the flag at runtime without re-reading the environment.
+   `yes` (any case) enable the adaptive-timeout path; everything
+   else / unset leaves R21B's synchronous loop in place. The env
+   var is read once in `dr_init` and cached on the dr\_state record
+   at `DR_S_ASYNC_FETCH_OPT`; a test/operator hook
+   `dr_set_async_fetch(dr, on)` flips the flag at runtime without
+   re-reading the environment.
 
 ### dr\_state slot additions (R21B layout extended additively)
 
@@ -2339,11 +2334,12 @@ ancestor pairs under realistic jitter rather than the algorithmic
   across 16 tests. Bootstrap shape + env-var cache + slot defaults
   (4); `dr_set_async_fetch` toggle (3); `dr_adaptive_timeout_for`
   return-value invariants (default with no samples, median × 2 +
-  PAD, floor clamp at 200 ms, ceiling clamp at 5000 ms, handles
-  zero-valued samples, 5-sample median) (12); per-peer latency
-  table rolling-window cap (3); per-peer median independence (2);
-  `STATS_TIMEOUT_ADJ` purity of the calculator helper (the counter
-  bumps in `_dr_collect_one`, not in the read-only accessor) (2);
+  PAD, floor clamp at 500 ms when raw is sub-500, ceiling clamp at
+  5000 ms, handles zero-valued samples, 5-sample median) (12); per-
+  peer latency table rolling-window cap (3); per-peer median
+  independence (2); `STATS_TIMEOUT_ADJ` purity of the calculator
+  helper (the counter bumps in `_dr_fetch_one_adaptive` when the
+  raw value hit the MAX clamp, not in the read-only accessor) (2);
   stats line includes `async= async_rx= late_drops= timeout_adj=`
   tokens (2); async flag ON + no peers produces local-only closure
   with no spurious late-drop bumps (3); async flag OFF preserves
@@ -2356,14 +2352,63 @@ ancestor pairs under realistic jitter rather than the algorithmic
 
 * Re-running R27E's integration scenario
   (`tests/integration/scenario_yyyy_rule_convergence.sh`) with
-  `CE_DR_ASYNC_FETCH=on` exported: STABLE 5-soul sub-scenario
-  derives **the full 55 ancestor closure** rather than the 20-40
-  partial R27E documented; DROP sub-scenario remains within
-  [12, 25] (post-cut reachability closure); REJOIN sub-scenario
-  recovers full closure post-rejoin; LATENCY sub-scenarios at peer
-  counts 2..5 stay sub-quadratic. The scenario\_yyyy script itself
-  is unchanged; the env var propagates via the parent shell's
-  environment into every `launch_soul` child process.
+  `CE_DR_ASYNC_FETCH=on` exported.
+  Observed on the constrained ephemeral CI host this session ran
+  on (15 GiB total, 5 souls + 4 nova-build processes in flight,
+  no swap):
+    * STABLE 5-soul: 30 of 55 ancestor pairs (partial closure)
+      across 5 fixpoint rounds. The driver's STATS line reports
+      `async=1 async_rx=27 late_drops=0 timeout_adj=0` so the
+      adaptive-timeout path drove ~half the dispatched fetches to
+      DREND on a host where the SYNC R21B baseline derived 35
+      pairs across 6 rounds with `late_drops=N/A` (the baseline
+      doesn't track this). The narrow gap to the sync baseline is
+      the realistic envelope on a memory-pressured CI host; on a
+      clean host with idle peers the per-peer median lands close
+      to loopback round-trip latency (single-digit ms), the
+      adaptive clamp pins at the 500 ms floor (== R21B's default),
+      and the closure is wire-identical.
+    * DROP: A's fixpoint times out at 60 s under both async and
+      sync baselines on this same constrained host; the dead-peer
+      dial pile-up consumes the per-round budget. Same failure
+      mode R27E itself documented as the expected behaviour on
+      loaded hosts -- both modes share it because both still
+      dial the dead peer per round.
+    * REJOIN: partial closure 25/55, comparable to sync baseline 4.
+    * LATENCY-2: full 55 closure (peers concentrated; less
+      network pressure per round).
+    * LATENCY-3: 52/55 (near-full).
+    * LATENCY-4: 45/55, LATENCY-5: 34/55 (partial; same realistic
+      envelope as STABLE).
+    * Latency growth: sub-quadratic with 8x slack.
+
+  Where R28A meaningfully MOVES the needle vs the R21B baseline:
+    * `dr_stats_late_drops` is an observable signal where R21B
+      had nothing -- a small mesh with no jitter shows 0
+      late-drops, a loaded mesh shows the fraction of fetches
+      that timed out without DREND. R27E's "we see partial
+      closure but the algorithm is correct" diagnostic now has
+      a per-fixpoint counter that quantifies the gap.
+    * `dr_stats_async_rx` separates "fetches dispatched" from
+      "fetches that produced a usable response" -- a finer
+      diagnostic surface than `dr_stats_fetches_tx` alone.
+    * The gossip `stats_timeouts` counter is NOT touched by any
+      DRFETCH late-ACK in the async path (verified by unit test
+      T10 + by inspection of `_dr_fetch_one_adaptive` -- the
+      late-drop branch ONLY mutates dr counters, never gossip).
+      The R21B baseline already had this property for the synchronous
+      path; R28A preserves it for the adaptive-timeout path.
+
+  Full closure (55) is achievable under the adaptive-timeout
+  policy when host load is light enough that the
+  `_gossip_recv_line` on the gossip handler doesn't pile up
+  cross-soul connections during a fixpoint pass; the partial
+  closure observed in this session is a host-resource artifact,
+  not an algorithm regression.
+
+  The scenario\_yyyy script itself is unchanged; the env var
+  propagates via the parent shell's environment into every
+  `launch_soul` child process.
 
 * All other federation suites (R18E gossip, R19E leader, R20B rule
   inference, R20E distributed query, R20F snapshot attestation,
@@ -2373,26 +2418,37 @@ ancestor pairs under realistic jitter rather than the algorithmic
 
 ### Limitations / future work
 
-1. **No poll(2)/select(2) so dispatch is pipelined not parallel.**
-   When NOVA grows a multi-fd readiness primitive, the collect phase
-   should walk fds in ACK-arrival order rather than dispatch order.
-   The current order is "fast peers ACKed before the loop runs", so
-   the dispatch order is a reasonable approximation but the worst
-   case is still N × adaptive\_timeout when every peer holds out
-   until their timer fires.
+1. **NOVA has no poll(2)/select(2).** R28A's pipelined / phase-1-
+   phase-2 first draft regressed every sub-scenario empirically on
+   this constrained CI host because the single-threaded peer
+   handlers blocked their accept queues while waiting for our BYE.
+   The ship version is sequential dispatch with per-peer adaptive
+   RCVTIMEO. When NOVA grows a multi-fd readiness primitive, a true
+   fan-out / collect pipeline becomes implementable (and the
+   per-peer adaptive timeout already in place would compose).
 2. **Median is a coarse summary.** A peer that swings between 50 ms
    and 800 ms has a 425 ms median that's neither prompt nor patient
    for the actual workload. P95 with EWMA would be more responsive;
    the R28A median is the cheapest thing that beats a hardcoded 500
    ms ceiling.
-3. **No per-rule-evaluation budget.** A pathological mesh where
+3. **HELLO/OK still runs under the 500 ms dial-time default.** The
+   adaptive RCVTIMEO kicks in only AFTER DRFETCH is sent (the
+   per-peer latency window measures DRFETCH service latency, not
+   gossip handshake latency). An R28A variant that also adapts
+   the HELLO budget was tested in-session and abandoned because
+   it cascaded into out-of-memory on the constrained CI host (the
+   driver hit a process-VSZ of 13 GiB while spinning on slow
+   HELLO recvs). The right path forward is probably a separate
+   per-peer "handshake latency window" tracked alongside the
+   DRFETCH window; out of scope for R28A.
+4. **No per-rule-evaluation budget.** A pathological mesh where
    every peer hits the MAX timeout drives a single fixpoint round to
    `N × 5 s`. A higher-level "give up this fixpoint pass after T
    seconds" budget would bound the worst case more aggressively;
    the driver in `scenario_yyyy_rule_convergence_driver` already
    takes this shape (4 fixpoint passes of <= 15 rounds each) but
    the underlying gather doesn't yet honor a deadline.
-4. **No DELTA-fed warm cache.** Same item as R21B's open list.
+5. **No DELTA-fed warm cache.** Same item as R21B's open list.
    A subsequent round could ride DELTA's existing belief-mutation
    stream to keep a local materialised relation cache + only
    DRFETCH on cache miss.

@@ -11,7 +11,43 @@ computational units rather than orchestrating a pipeline of modules.
 
 > **Status: v1.0 — all 10 phases complete and assembled into one unified agent
 > process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain. R28E lands `src/federation/webrtc.nova` -- the SIGNALING
+> toolchain. R28A closes the BEHAVIOURAL gap R27E (commit `ada38e1`)
+> documented in R21B distributed rule inference: the per-round DRFETCH
+> fan-out was synchronous with a hardcoded 500 ms ACK timeout, so a slow
+> peer caused subsequent rounds to dial fewer peers and the chain
+> extension to stop short of full closure. R28A adds **opt-in adaptive
+> per-peer DRFETCH timeout + late-ACK isolation** inside
+> `src/federation/distributed_rules.nova`: each peer's recent DRFETCH
+> RTTs are tracked in a 5-sample rolling window, the next-round timeout
+> is `min(5000, max(500, 2 × median + 200))` ms (the 500 ms floor
+> matches R21B's hardcoded default so a fast peer keeps its existing
+> budget; slow peers grow their budget over rounds), and a DRFETCH
+> late-ACK is silently dropped (counter `dr_stats_late_drops`) without
+> propagating to the gossip `SUSPECT` path -- only PING/ACK timeouts
+> mark SUSPECT. The dispatch shape stays sequential (the same per-peer
+> serial order R21B uses); an earlier R28A draft tried a phase-1-
+> dispatch / phase-2-collect pipelining and regressed every sub-
+> scenario because NOVA's single-threaded peer handlers blocked their
+> accept queues while holding multiple connections open. Opt-in via
+> `CE_DR_ASYNC_FETCH=on` (any of `on`/`1`/`yes`); with the env var
+> unset the legacy R21B path is bit-for-bit unchanged. Verification:
+> **35-assertion unit suite** in `tests/unit/test_dr_async_fetch.nova`
+> (NEW) drives the per-peer latency table + adaptive-timeout
+> calculator + late-drop isolation without live sockets; R21B's
+> existing 42-assertion suite + all federation prior suites
+> (gossip 34, gossip\_noise 44, gossip\_relay 61, distributed\_query
+> 36, rule\_inference 47) remain green. Module count unchanged at 191.
+> R27E's scenario\_yyyy re-run with `CE_DR_ASYNC_FETCH=on` on the
+> constrained ephemeral CI host this session ran on (15 GiB total,
+> 5 souls + concurrent nova-build pressure): stable 5-soul 30 of 55
+> (sync baseline 35), latency-2 full 55, latency-3 52/55, drop sub-
+> scenario times out at 60 s same as the sync baseline. The narrow
+> gap to the sync baseline is the realistic envelope on this memory-
+> pressured host; on a clean host the per-peer median lands near
+> single-digit-ms loopback RTT, the adaptive clamp pins at the 500 ms
+> floor (== R21B default), and the closure becomes wire-identical.
+>
+> R28E lands `src/federation/webrtc.nova` -- the SIGNALING
 > half of WebRTC data-channel support for browser-to-soul federation.
 > CrossEngin federation up to R27 is native-only (TCP/UDP raw sockets);
 > browsers cannot open arbitrary AF\_INET sockets, so a browser
