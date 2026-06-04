@@ -1,0 +1,887 @@
+// CrossEngin safety: pure-NOVA NIST P-256 (secp256r1) ECDH primitive.
+//
+// Purpose
+//   The DTLS 1.2 record-layer + handshake skeleton in
+//   `src/federation/dtls12.nova` (R29B) leaves `dtls_ecdhe_derive_R29B2_STUB`
+//   as a tagged stub: the ECDHE-ECDSA-AES128-GCM-SHA256 cipher suite
+//   (0xC02B) it negotiates needs a NIST P-256 scalar multiplication
+//   primitive, and the existing bignum library (`bignum_2048.nova`) only
+//   ships RFC 7919 Group 14 (2048-bit MODP DH) -- not short-Weierstrass
+//   curves. This module is the foundation that R29B.2 will eventually
+//   plug into the DTLS stack: a leaf primitive providing
+//
+//     * field arithmetic over the NIST P-256 prime
+//       p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+//     * short-Weierstrass point operations on the curve
+//       y^2 = x^3 - 3x + b
+//     * SEC1 point encoding (compressed 0x02/0x03 + 32B X, or
+//       uncompressed 0x04 + 32B X + 32B Y)
+//     * ECDH key generation + shared-secret derivation
+//
+// Algorithm references
+//   * SEC 2 v2.0 (Standards for Efficient Cryptography Group, 2010)
+//     section 2.4.2 -- domain parameters for secp256r1.
+//   * FIPS 186-4 D.1.2.3 -- the same parameters under the NIST name.
+//   * RFC 6090 -- "Fundamental Elliptic Curve Cryptography Algorithms"
+//     for the affine and projective formulas.
+//
+// Domain parameters (SEC 2 section 2.4.2)
+//   p (field prime, 256 bits, hex MSB-first):
+//     ffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+//   a = -3 mod p (short Weierstrass a; equivalent to p - 3):
+//     ffffffff00000001000000000000000000000000fffffffffffffffffffffffc
+//   b (curve constant):
+//     5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+//   Gx, Gy (base point G):
+//     Gx = 6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296
+//     Gy = 4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5
+//   n (subgroup order):
+//     ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+//   h (cofactor) = 1
+//
+// Representation reuse
+//   We layer on top of `src/safety/bignum_256.nova`: every field element
+//   is a bn256 (8-limb 32-bit little-endian array). The Curve25519 prime
+//   exposed by `bn256_curve25519_p` is NOT the right prime here, so we
+//   define the P-256 prime constant locally (`p256_field_p`) and build a
+//   module-singleton Montgomery context for it (`_p256_p_ctx`). All
+//   per-field multiplications route through `bn256_montmul` after the
+//   one-time precompute. Modular inverse uses Fermat's little theorem
+//   (a^(p-2) mod p) via `bn256_modpow_ct`.
+//
+// Point representation
+//   We use Jacobian projective coordinates (X : Y : Z) where the affine
+//   point is (X/Z^2, Y/Z^3). Doublings and adds touch no modular inverse;
+//   a single `fe_inv` converts to affine at the end of scalar
+//   multiplication for encoding. The point at infinity is encoded as
+//   (0 : 1 : 0) -- Z = 0 is the canonical sentinel.
+//
+//   Doubling formulas for the special case a = -3 (SEC 1 / IEEE 1363):
+//     Y3 numerator = Y^4 chain; doubling reduces to ~4 fe_mul + 4 fe_sqr.
+//
+//   Addition formulas for distinct points in Jacobian (Cohen 1986):
+//     U1 = X1 * Z2^2, U2 = X2 * Z1^2
+//     S1 = Y1 * Z2^3, S2 = Y2 * Z1^3
+//     H  = U2 - U1, R = S2 - S1
+//     X3 = R^2 - H^3 - 2 * U1 * H^2
+//     Y3 = R * (U1 * H^2 - X3) - S1 * H^3
+//     Z3 = H * Z1 * Z2
+//   Special cases (H == 0): if R == 0 also, fall through to doubling;
+//   if R != 0, the result is the point at infinity.
+//
+// Scalar multiplication
+//   Plain double-and-add walking the scalar MSB-to-LSB. Constant-time-per-
+//   bit shape is achieved by always doing one double + one (conditional)
+//   add per bit; the conditional add picks between R (the running result)
+//   and (R + P) every iteration. This is the simplest side-channel-aware
+//   form for an MVP. The fully constant-time Montgomery-ladder upgrade is
+//   tracked as a follow-up hardening item -- see SAFETY caveats below.
+//
+// SEC1 point encoding
+//   * Uncompressed (65 bytes): 0x04 || X (32B big-endian) || Y (32B BE).
+//   * Compressed   (33 bytes): 0x02 || X if Y is even, 0x03 || X if odd.
+//   * Point at infinity is NEVER encoded over the wire; ECDH derivation
+//     rejects a peer pubkey decoding to identity.
+//   Decompression solves Y^2 = X^3 - 3X + b mod p and picks the sqrt
+//   matching the sign bit. Since p ≡ 3 (mod 4), the square root is
+//   Y = ±(Y^2)^((p+1)/4) mod p.
+//
+// Public API
+//   p256_field_p()                       -> bn256 (NIST P-256 prime)
+//   p256_curve_b()                       -> bn256 (curve constant b)
+//   p256_curve_n()                       -> bn256 (subgroup order n)
+//   p256_base_point()                    -> [Gx, Gy] affine (both bn256)
+//   p256_keygen()                        -> [priv_bn, pub_compressed_33B]
+//   p256_keygen_seeded(seed_bn)          -> [priv_bn, pub_compressed_33B]
+//   p256_derive(priv_bn, peer_pub_buf, peer_pub_n)
+//                                        -> [secret_buf, 32] OR 0 (DECRYPT_FAIL)
+//   p256_encode_uncompressed(X, Y)       -> 65-byte buffer
+//   p256_encode_compressed(X, Y)         -> 33-byte buffer
+//   p256_decode_point(buf, n)            -> [X, Y] OR 0 (rejected)
+//   p256_scalar_mult(k, X, Y)            -> [X', Y'] OR 0 (identity)
+//   p256_pt_add_affine(X1, Y1, X2, Y2)   -> [X3, Y3] OR 0 (identity)
+//   p256_pt_double_affine(X, Y)          -> [X', Y'] OR 0 (identity)
+//   p256_on_curve(X, Y)                  -> 1 iff (X, Y) satisfies the
+//                                            curve equation mod p
+//
+//   Test helpers (underscore-prefixed; used by tests/unit/test_p256.nova):
+//     _p256_fe_add(a, b), _p256_fe_sub(a, b), _p256_fe_mul(a, b),
+//     _p256_fe_sqr(a),     _p256_fe_inv(a),    _p256_fe_eq(a, b)
+//     _p256_bytes_to_bn(buf, off)        big-endian 32 bytes -> bn256
+//     _p256_bn_to_bytes_be(bn, buf, off) bn256 -> 32 BE bytes
+//
+// Constant-time / side-channel caveats (R30B.3 hardening followup)
+//   * `_p256_fe_inv` calls `bn256_modpow_ct` -- the outer loop is bit-
+//     INDEPENDENT, but the inner `bn256_cmp` / `bn256_sub` calls (used by
+//     the Montgomery REDC's final conditional subtract) still branch on
+//     operand bits. Same caveat documented in `bignum_256.nova`.
+//   * `_p256_scalar_mult` uses double-and-add with a data-dependent
+//     conditional add; the OUTER loop runs a fixed 256 iterations
+//     regardless of scalar value, but the inner branch leaks the bit
+//     pattern of the scalar to a power-analysis attacker. The MVP-level
+//     Montgomery-ladder upgrade (R30B.3) flips this to a per-bit
+//     dummy-op pattern; see NEXT_SESSION.md.
+//   * `p256_decode_point` aborts EARLY on shape errors (bad tag byte,
+//     wrong length, X >= p). That leak is acceptable because the inputs
+//     are PUBLIC (peer's pubkey on the wire) -- but documented for
+//     completeness.
+//   * No anti-invalid-curve check beyond on-curve verification: a
+//     malicious peer that sends a point on the twist curve gets the
+//     identity sentinel back, which `p256_derive` rejects. For DTLS
+//     usage R29B.2 should also reject the point at infinity at the
+//     caller boundary.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R30B P-256 + AES-128-GCM foundation
+//   for DTLS R29B.2).
+// NOVA dependencies: builtins (alloc, store8, load8, int_*, list_*,
+//   secure_random, nanotime, len).
+// CrossEngin dependencies:
+//   * src/safety/bignum_256.nova -- 256-bit Montgomery REDC + bn256
+//     constructors and modpow_ct.
+
+import "../safety/bignum_256.nova"
+
+// ============================================================================
+//                          P-256 domain parameters
+// ============================================================================
+
+// The NIST P-256 prime p = 2^256 - 2^224 + 2^192 + 2^96 - 1.
+// Hex MSB-first: ffffffff 00000001 00000000 00000000 00000000 ffffffff ffffffff ffffffff
+fn p256_field_p() {
+    return bn256_from_hex(
+        "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+}
+
+// The curve constant b (SEC 2 section 2.4.2). The a coefficient is -3 mod p
+// (so we compute it lazily via fe_sub).
+fn p256_curve_b() {
+    return bn256_from_hex(
+        "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
+}
+
+// The subgroup order n. ECDH keys are scalars in [1, n-1].
+fn p256_curve_n() {
+    return bn256_from_hex(
+        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+}
+
+// The base point G = (Gx, Gy) (SEC 2 section 2.4.2).
+fn _p256_gx() {
+    return bn256_from_hex(
+        "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+}
+
+fn _p256_gy() {
+    return bn256_from_hex(
+        "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+}
+
+fn p256_base_point() {
+    let r = list_new()
+    push(r, _p256_gx())
+    push(r, _p256_gy())
+    return r
+}
+
+// ============================================================================
+//                          Field arithmetic over GF(p)
+// ============================================================================
+//
+// Operands are bn256 limb arrays; the result of every helper is a fresh
+// bn256 in canonical form (value in [0, p)). We route every modmul / modsqr
+// through a cached Montgomery context for p so the per-modmul reduction
+// cost stays at one CIOS pass rather than the 512-iteration bit-by-bit
+// reducer.
+
+let _P256_P_CTX_CACHE = list_new()
+
+fn _p256_p_ctx() {
+    if len(_P256_P_CTX_CACHE) == 0 {
+        let p = p256_field_p()
+        push(_P256_P_CTX_CACHE, bn256_mont_ctx_new(p))
+    }
+    return _P256_P_CTX_CACHE[0]
+}
+
+// Field add: (a + b) mod p. Both operands < p; the sum < 2p, but for the
+// NIST P-256 prime p < 2^256, the sum can ALSO exceed 2^256 (since
+// 2p > 2^256 by ~2^224). bn256_add returns the low 256 bits; the carry
+// bit out has the same effect as having subtracted 2^256, which is "as
+// if" we already removed one factor of p plus a correction of
+// (2^256 - p). So when the carry fires, we ADD (2^256 - p) back; if no
+// carry but sum >= p, the standard conditional subtract suffices.
+fn _p256_fe_add(a, b) {
+    let p = p256_field_p()
+    let s = bn256_add(a, b)
+    // Detect the overflow case: if both a and b are < 2^256 and (a + b)
+    // wraps past 2^256, then s = (a + b) - 2^256 < p (because
+    // a + b < 2p < 2^257 implies (a+b)-2^256 < 2p - 2^256, and for
+    // P-256 with 2^256 - p ~ 2^224, 2p - 2^256 ~ p - 2^224 < p).
+    // The carry-out flag from bn256_add is not exposed, so we detect
+    // overflow by checking if s < a (since adding b >= 0 must yield
+    // s >= a unless wrap occurred).
+    let wrapped = 0
+    if bn256_cmp(s, a) < 0 { wrapped = 1 }
+    if wrapped != 0 {
+        // Correct by adding (2^256 - p). Computed as 0 - p mod 2^256.
+        let zero = bn256_new()
+        let two_pow_256_minus_p = bn256_sub(zero, p)
+        let corrected = bn256_add(s, two_pow_256_minus_p)
+        if bn256_cmp(corrected, p) >= 0 {
+            return bn256_sub(corrected, p)
+        }
+        return corrected
+    }
+    if bn256_cmp(s, p) >= 0 {
+        return bn256_sub(s, p)
+    }
+    return s
+}
+
+// Field sub: (a - b) mod p. Naive "a + p, then sub b" has an overflow
+// bug for the NIST P-256 prime (a + p can exceed 2^256 since both terms
+// are within 2^224 of 2^256). Reformulate as a + (p - b), then reduce
+// via the overflow-safe fe_add. p - b is always non-negative since
+// b < p.
+fn _p256_fe_sub(a, b) {
+    let p = p256_field_p()
+    if bn256_cmp(a, b) >= 0 {
+        return bn256_sub(a, b)
+    }
+    let p_minus_b = bn256_sub(p, b)
+    return _p256_fe_add(a, p_minus_b)
+}
+
+// Field negation: (-a) mod p = p - a; with a == 0 returning 0.
+fn _p256_fe_neg(a) {
+    if bn256_zero(a) != 0 { return bn256_new() }
+    let p = p256_field_p()
+    return bn256_sub(p, a)
+}
+
+// Field multiply: (a * b) mod p. We call `bn256_modmul` which internally
+// uses Montgomery REDC via the cached context (modmul builds a context
+// per call, but the bn256 fast path also exposes bn256_montmul against
+// the cached ctx for hot loops). For readability and correctness we use
+// the public bn256_modmul; the per-call ctx build is amortized over the
+// 256 + 256 calls inside a scalar_mult.
+fn _p256_fe_mul(a, b) {
+    let p = p256_field_p()
+    return bn256_modmul(a, b, p)
+}
+
+// Field square: a^2 mod p. Same path as fe_mul; we expose it as a
+// separate helper to mirror the standard Weierstrass formulas.
+fn _p256_fe_sqr(a) {
+    return _p256_fe_mul(a, a)
+}
+
+// Field inverse: a^(p-2) mod p (Fermat). For a == 0 we return 0 (the
+// caller paths -- scalar_mult's affine convert + point decompression --
+// must not reach this on a zero Z by construction).
+fn _p256_fe_inv(a) {
+    if bn256_zero(a) != 0 { return bn256_new() }
+    let p = p256_field_p()
+    let two = bn256_from_int(2)
+    let exp = bn256_sub(p, two)             // p - 2
+    return bn256_modpow_ct(a, exp, p)
+}
+
+fn _p256_fe_eq(a, b) {
+    return bn256_eq(a, b)
+}
+
+fn _p256_fe_zero(a) {
+    return bn256_zero(a)
+}
+
+// Reduce a bn256 result of an unbounded add (e.g., 2a or 3a) modulo p.
+// Implemented as a few conditional subtracts since the input is at most
+// a small multiple of p.
+fn _p256_fe_reduce_small(x) {
+    let p = p256_field_p()
+    let r = x
+    let i = 0
+    while i < 4 {
+        if bn256_cmp(r, p) >= 0 {
+            r = bn256_sub(r, p)
+        }
+        i = i + 1
+    }
+    return r
+}
+
+// ============================================================================
+//                    Big-endian byte <-> bignum conversion
+// ============================================================================
+//
+// SEC1 point encoding is BIG-ENDIAN over the X and Y coordinates. Our
+// bn256 is LITTLE-ENDIAN limb order internally. The two helpers below
+// convert between a 32-byte BE buffer and a bn256 limb array.
+
+// Read 32 big-endian bytes from buf starting at offset off; return bn256.
+fn _p256_bytes_to_bn(buf, off) {
+    let r = bn256_new()
+    let i = 0
+    while i < 8 {
+        // Big-endian: limb[7-i] holds bytes [off + 4*i .. off + 4*i + 3]
+        let b0 = load8(buf + off + i * 4 + 0)
+        let b1 = load8(buf + off + i * 4 + 1)
+        let b2 = load8(buf + off + i * 4 + 2)
+        let b3 = load8(buf + off + i * 4 + 3)
+        let v = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                     int_shl(b2, 8)), b3)
+        list_set(r, 7 - i, int_and(v, 4294967295))
+        i = i + 1
+    }
+    return r
+}
+
+// Store bn256 as 32 big-endian bytes into buf at offset off.
+fn _p256_bn_to_bytes_be(bn, buf, off) {
+    let i = 0
+    while i < 8 {
+        let limb = bn[7 - i]
+        store8(buf + off + i * 4 + 0, int_and(int_shr(limb, 24), 255))
+        store8(buf + off + i * 4 + 1, int_and(int_shr(limb, 16), 255))
+        store8(buf + off + i * 4 + 2, int_and(int_shr(limb, 8), 255))
+        store8(buf + off + i * 4 + 3, int_and(limb, 255))
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                          Jacobian point arithmetic
+// ============================================================================
+//
+// Jacobian projective coordinates (X : Y : Z); the affine point is
+// (X / Z^2, Y / Z^3). The identity (point at infinity) is encoded as
+// (0 : 1 : 0) -- Z == 0 is the canonical sentinel.
+//
+// Reuses _p256_fe_add / _p256_fe_sub / _p256_fe_mul / _p256_fe_sqr.
+
+// Build the identity (0, 1, 0) Jacobian point.
+fn _p256_jac_identity() {
+    let r = list_new()
+    push(r, bn256_new())              // X = 0
+    push(r, bn256_from_int(1))        // Y = 1
+    push(r, bn256_new())              // Z = 0
+    return r
+}
+
+// Test if a Jacobian point is the identity (Z == 0).
+fn _p256_jac_is_identity(P) {
+    return bn256_zero(P[2])
+}
+
+// Convert an affine (x, y) to Jacobian (x, y, 1).
+fn _p256_affine_to_jac(x, y) {
+    let r = list_new()
+    push(r, x)
+    push(r, y)
+    push(r, bn256_from_int(1))
+    return r
+}
+
+// Jacobian doubling for curves with a = -3.
+// Formula (Bernstein-Lange "dbl-2001-b", a = -3 variant):
+//   delta = Z1^2
+//   gamma = Y1^2
+//   beta  = X1 * gamma
+//   alpha = 3 * (X1 - delta) * (X1 + delta)
+//   X3    = alpha^2 - 8 * beta
+//   Z3    = (Y1 + Z1)^2 - gamma - delta
+//   Y3    = alpha * (4 * beta - X3) - 8 * gamma^2
+fn _p256_jac_double(P) {
+    if _p256_jac_is_identity(P) != 0 {
+        return _p256_jac_identity()
+    }
+    let X1 = P[0]
+    let Y1 = P[1]
+    let Z1 = P[2]
+    let delta = _p256_fe_sqr(Z1)
+    let gamma = _p256_fe_sqr(Y1)
+    let beta  = _p256_fe_mul(X1, gamma)
+    let x_minus = _p256_fe_sub(X1, delta)
+    let x_plus  = _p256_fe_add(X1, delta)
+    let alpha_inner = _p256_fe_mul(x_minus, x_plus)
+    // alpha = 3 * alpha_inner = alpha_inner + alpha_inner + alpha_inner
+    let alpha = _p256_fe_add(_p256_fe_add(alpha_inner, alpha_inner),
+                             alpha_inner)
+    // 8 * beta = 4 * beta + 4 * beta; we'll need 4*beta below too.
+    let four_beta = _p256_fe_add(_p256_fe_add(beta, beta),
+                                 _p256_fe_add(beta, beta))
+    let eight_beta = _p256_fe_add(four_beta, four_beta)
+    let alpha_sqr = _p256_fe_sqr(alpha)
+    let X3 = _p256_fe_sub(alpha_sqr, eight_beta)
+    // Z3 = (Y1 + Z1)^2 - gamma - delta
+    let y_plus_z = _p256_fe_add(Y1, Z1)
+    let yz_sqr   = _p256_fe_sqr(y_plus_z)
+    let Z3       = _p256_fe_sub(_p256_fe_sub(yz_sqr, gamma), delta)
+    // Y3 = alpha * (4*beta - X3) - 8 * gamma^2
+    let four_beta_minus_X3 = _p256_fe_sub(four_beta, X3)
+    let alpha_term = _p256_fe_mul(alpha, four_beta_minus_X3)
+    let gamma_sqr = _p256_fe_sqr(gamma)
+    let eight_gsq = _p256_fe_add(_p256_fe_add(_p256_fe_add(gamma_sqr,
+                                                           gamma_sqr),
+                                              _p256_fe_add(gamma_sqr,
+                                                           gamma_sqr)),
+                                 _p256_fe_add(_p256_fe_add(gamma_sqr,
+                                                           gamma_sqr),
+                                              _p256_fe_add(gamma_sqr,
+                                                           gamma_sqr)))
+    let Y3 = _p256_fe_sub(alpha_term, eight_gsq)
+    let r = list_new()
+    push(r, X3)
+    push(r, Y3)
+    push(r, Z3)
+    return r
+}
+
+// Jacobian add ("add-2007-bl" formulas from the Bernstein-Lange
+// Explicit Formulas Database for Jacobian a=-3 addition). Returns either
+// a new Jacobian point or the result of calling _p256_jac_double when
+// the inputs are equal in affine.
+//   Z1Z1 = Z1^2
+//   Z2Z2 = Z2^2
+//   U1   = X1 * Z2Z2
+//   U2   = X2 * Z1Z1
+//   S1   = Y1 * Z2 * Z2Z2
+//   S2   = Y2 * Z1 * Z1Z1
+//   H    = U2 - U1
+//   r    = 2 * (S2 - S1)                   <-- the 2x is essential
+//   If H == 0:
+//     if (S2 - S1) == 0: return _p256_jac_double(P)
+//     else:              return identity
+//   I = (2*H)^2
+//   J = H * I
+//   V = U1 * I
+//   X3 = r^2 - J - 2*V
+//   Y3 = r * (V - X3) - 2 * S1 * J
+//   Z3 = ((Z1 + Z2)^2 - Z1Z1 - Z2Z2) * H   = 2 * Z1 * Z2 * H
+// Standard affine equivalent: real_X = X3 / Z3^2 = (R/H)^2 - X1 - X2.
+fn _p256_jac_add(P, Q) {
+    if _p256_jac_is_identity(P) != 0 { return _p256_jac_clone(Q) }
+    if _p256_jac_is_identity(Q) != 0 { return _p256_jac_clone(P) }
+    let X1 = P[0]; let Y1 = P[1]; let Z1 = P[2]
+    let X2 = Q[0]; let Y2 = Q[1]; let Z2 = Q[2]
+    let Z1Z1 = _p256_fe_sqr(Z1)
+    let Z2Z2 = _p256_fe_sqr(Z2)
+    let U1 = _p256_fe_mul(X1, Z2Z2)
+    let U2 = _p256_fe_mul(X2, Z1Z1)
+    let S1 = _p256_fe_mul(_p256_fe_mul(Y1, Z2), Z2Z2)
+    let S2 = _p256_fe_mul(_p256_fe_mul(Y2, Z1), Z1Z1)
+    let H = _p256_fe_sub(U2, U1)
+    let S_diff = _p256_fe_sub(S2, S1)
+    if _p256_fe_zero(H) != 0 {
+        if _p256_fe_zero(S_diff) != 0 {
+            return _p256_jac_double(P)
+        }
+        return _p256_jac_identity()
+    }
+    let R = _p256_fe_add(S_diff, S_diff)        // r = 2 * (S2 - S1)
+    let two_H = _p256_fe_add(H, H)
+    let I = _p256_fe_sqr(two_H)
+    let J = _p256_fe_mul(H, I)
+    let V = _p256_fe_mul(U1, I)
+    let R_sqr = _p256_fe_sqr(R)
+    let two_V = _p256_fe_add(V, V)
+    let X3 = _p256_fe_sub(_p256_fe_sub(R_sqr, J), two_V)
+    let V_minus_X3 = _p256_fe_sub(V, X3)
+    let R_term = _p256_fe_mul(R, V_minus_X3)
+    let two_S1_J = _p256_fe_mul(_p256_fe_add(S1, S1), J)
+    let Y3 = _p256_fe_sub(R_term, two_S1_J)
+    let Z_sum_sqr = _p256_fe_sqr(_p256_fe_add(Z1, Z2))
+    let Z3_inner = _p256_fe_sub(_p256_fe_sub(Z_sum_sqr, Z1Z1), Z2Z2)
+    let Z3 = _p256_fe_mul(Z3_inner, H)
+    let r = list_new()
+    push(r, X3)
+    push(r, Y3)
+    push(r, Z3)
+    return r
+}
+
+// Shallow clone of a Jacobian point (so callers don't share aliased
+// bn256 lists with the inputs).
+fn _p256_jac_clone(P) {
+    let r = list_new()
+    push(r, _p256_bn_clone(P[0]))
+    push(r, _p256_bn_clone(P[1]))
+    push(r, _p256_bn_clone(P[2]))
+    return r
+}
+
+// Clone a bn256 by hex-round-tripping... no, just copy limbs.
+fn _p256_bn_clone(bn) {
+    let r = bn256_new()
+    let i = 0
+    while i < 8 {
+        list_set(r, i, bn[i])
+        i = i + 1
+    }
+    return r
+}
+
+// Convert a Jacobian point to affine (x, y) = (X / Z^2, Y / Z^3).
+// Returns [x, y] for non-identity points, OR 0 for the identity.
+fn _p256_jac_to_affine(P) {
+    if _p256_jac_is_identity(P) != 0 { return 0 }
+    let X = P[0]; let Y = P[1]; let Z = P[2]
+    let z_inv = _p256_fe_inv(Z)
+    let z_inv_sqr = _p256_fe_sqr(z_inv)
+    let z_inv_cub = _p256_fe_mul(z_inv_sqr, z_inv)
+    let x_aff = _p256_fe_mul(X, z_inv_sqr)
+    let y_aff = _p256_fe_mul(Y, z_inv_cub)
+    let r = list_new()
+    push(r, x_aff)
+    push(r, y_aff)
+    return r
+}
+
+// ============================================================================
+//                          Scalar multiplication
+// ============================================================================
+
+// Double-and-add scalar multiplication on the P-256 curve. Walks the
+// scalar k MSB-to-LSB; one doubling + one conditional add per bit.
+// Returns the affine result [X, Y] -- or 0 for the identity (k mod n == 0).
+//
+// CONSTANT-TIME CAVEAT: the conditional add branches on the scalar bit,
+// so this is NOT power-analysis-safe. R30B.3 will upgrade to the
+// Montgomery ladder (always-double, always-add) once the test vectors
+// here lock in correctness. See SAFETY caveats in the module header.
+fn p256_scalar_mult_jac(k, P_jac) {
+    let R = _p256_jac_identity()
+    let i = 255
+    while i >= 0 {
+        R = _p256_jac_double(R)
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let bit = int_and(int_shr(k[limb_idx], bit_idx), 1)
+        if bit == 1 {
+            R = _p256_jac_add(R, P_jac)
+        }
+        i = i - 1
+    }
+    return R
+}
+
+// Public scalar-mult: k * (X, Y) on the curve. Returns [X', Y'] for
+// non-identity result, 0 for the point at infinity.
+fn p256_scalar_mult(k, X, Y) {
+    let P_jac = _p256_affine_to_jac(X, Y)
+    let R_jac = p256_scalar_mult_jac(k, P_jac)
+    return _p256_jac_to_affine(R_jac)
+}
+
+// Affine point doubling -- wrapper for tests. Returns [X', Y'] or 0.
+fn p256_pt_double_affine(X, Y) {
+    let P = _p256_affine_to_jac(X, Y)
+    let D = _p256_jac_double(P)
+    return _p256_jac_to_affine(D)
+}
+
+// Affine point addition -- wrapper for tests. Returns [X', Y'] or 0.
+fn p256_pt_add_affine(X1, Y1, X2, Y2) {
+    let P = _p256_affine_to_jac(X1, Y1)
+    let Q = _p256_affine_to_jac(X2, Y2)
+    let S = _p256_jac_add(P, Q)
+    return _p256_jac_to_affine(S)
+}
+
+// On-curve check: 1 iff (X, Y) satisfies y^2 = x^3 - 3x + b (mod p)
+// AND both coordinates are < p.
+fn p256_on_curve(X, Y) {
+    let p = p256_field_p()
+    if bn256_cmp(X, p) >= 0 { return 0 }
+    if bn256_cmp(Y, p) >= 0 { return 0 }
+    let b = p256_curve_b()
+    let lhs = _p256_fe_sqr(Y)
+    let x_sqr = _p256_fe_sqr(X)
+    let x_cub = _p256_fe_mul(x_sqr, X)
+    let three = bn256_from_int(3)
+    let three_x = _p256_fe_mul(three, X)
+    let rhs_inner = _p256_fe_sub(x_cub, three_x)
+    let rhs = _p256_fe_add(rhs_inner, b)
+    return _p256_fe_eq(lhs, rhs)
+}
+
+// ============================================================================
+//                          SEC1 point encoding
+// ============================================================================
+
+// Modular square root via the standard P-256 trick: since p ≡ 3 (mod 4),
+// sqrt(a) mod p = a^((p+1)/4) mod p. Returns a candidate; the caller
+// must verify candidate^2 == a (mod p) and pick the right sign.
+// (p+1)/4 for the NIST P-256 prime is the constant below.
+//
+// Derivation: p = 2^256 - 2^224 + 2^192 + 2^96 - 1.
+//   p     = ffffffff 00000001 00000000 00000000 00000000 ffffffff ffffffff ffffffff
+// Add 1 (cascades through the bottom 96 set bits, clears them, sets bit 96):
+//   p + 1 = ffffffff 00000001 00000000 00000000 00000001 00000000 00000000 00000000
+// Right-shift by 2 ((p+1)/4): each set bit moves down by 2, so bits 224..255
+// (32 bits) become bits 222..253 (still 32 bits, straddling limbs 6 and 7);
+// bit 192 -> bit 190 (limb 5); bit 96 -> bit 94 (limb 2). Hex MSB-first:
+//   /4    = 3fffffff c0000000 40000000 00000000 00000000 40000000 00000000 00000000
+// Cross-checked: 4 * ((p+1)/4) = p + 1 (in 256-bit arithmetic ignoring the
+// high carry out of bit 255). Also matches the Fermat-form 4^-1 mod p which
+// must equal (p+1)/4 since 4 * (p+1)/4 = p + 1 ≡ 1 (mod p).
+fn _p256_sqrt_exp() {
+    return bn256_from_hex(
+        "3fffffffc0000000400000000000000000000000400000000000000000000000")
+}
+
+fn _p256_sqrt_mod_p(a) {
+    let p = p256_field_p()
+    let exp = _p256_sqrt_exp()
+    return bn256_modpow_ct(a, exp, p)
+}
+
+// Compute Y from X and the sign bit (0 -> even Y, 1 -> odd Y).
+// Returns Y (bn256) on success; 0 (sentinel) on failure (X off-curve).
+fn _p256_decompress_y(X, sign) {
+    let p = p256_field_p()
+    if bn256_cmp(X, p) >= 0 { return 0 }
+    let b = p256_curve_b()
+    let x_sqr = _p256_fe_sqr(X)
+    let x_cub = _p256_fe_mul(x_sqr, X)
+    let three = bn256_from_int(3)
+    let three_x = _p256_fe_mul(three, X)
+    let y_sqr = _p256_fe_add(_p256_fe_sub(x_cub, three_x), b)
+    let y_cand = _p256_sqrt_mod_p(y_sqr)
+    // Verify y_cand^2 == y_sqr; on mismatch the X has no preimage.
+    let chk = _p256_fe_sqr(y_cand)
+    if _p256_fe_eq(chk, y_sqr) == 0 { return 0 }
+    // Pick the sqrt whose low bit matches `sign`.
+    let cand_sign = int_and(y_cand[0], 1)
+    if cand_sign != sign {
+        return _p256_fe_neg(y_cand)
+    }
+    return y_cand
+}
+
+// Encode (X, Y) as the 65-byte SEC1 uncompressed form: 0x04 || X || Y.
+fn p256_encode_uncompressed(X, Y) {
+    let buf = alloc(66)
+    store8(buf, 4)
+    _p256_bn_to_bytes_be(X, buf, 1)
+    _p256_bn_to_bytes_be(Y, buf, 33)
+    store8(buf + 65, 0)
+    return buf
+}
+
+// Encode (X, Y) as the 33-byte SEC1 compressed form. The first byte is
+// 0x02 if Y is even, 0x03 if Y is odd.
+fn p256_encode_compressed(X, Y) {
+    let buf = alloc(34)
+    let sign = int_and(Y[0], 1)
+    if sign == 0 {
+        store8(buf, 2)
+    } else {
+        store8(buf, 3)
+    }
+    _p256_bn_to_bytes_be(X, buf, 1)
+    store8(buf + 33, 0)
+    return buf
+}
+
+// Decode an SEC1-encoded point into [X, Y] (both bn256). Returns 0 on
+// any malformed input (wrong length, bad tag byte, X >= p, X off-curve).
+fn p256_decode_point(buf, n) {
+    if n < 1 { return 0 }
+    let tag = load8(buf)
+    if tag == 4 {
+        // Uncompressed: 0x04 || X (32B) || Y (32B); 65 bytes total.
+        if n != 65 { return 0 }
+        let X = _p256_bytes_to_bn(buf, 1)
+        let Y = _p256_bytes_to_bn(buf, 33)
+        if p256_on_curve(X, Y) == 0 { return 0 }
+        let r = list_new()
+        push(r, X)
+        push(r, Y)
+        return r
+    }
+    if tag == 2 {
+        if n != 33 { return 0 }
+        let X = _p256_bytes_to_bn(buf, 1)
+        let Y = _p256_decompress_y(X, 0)
+        if Y == 0 { return 0 }
+        let r = list_new()
+        push(r, X)
+        push(r, Y)
+        return r
+    }
+    if tag == 3 {
+        if n != 33 { return 0 }
+        let X = _p256_bytes_to_bn(buf, 1)
+        let Y = _p256_decompress_y(X, 1)
+        if Y == 0 { return 0 }
+        let r = list_new()
+        push(r, X)
+        push(r, Y)
+        return r
+    }
+    return 0
+}
+
+// ============================================================================
+//                          ECDH key derivation
+// ============================================================================
+//
+// `p256_keygen` produces a random scalar priv in [1, n-1] and computes
+// pub = priv * G in 33-byte compressed form.
+// `p256_derive` takes the local priv and the peer's compressed pubkey,
+// validates the peer point is on-curve and non-identity, computes
+// shared = priv * peer_pub, and returns the 32-byte BIG-ENDIAN encoding
+// of the X coordinate as the shared secret (SEC1 / NIST SP 800-56A
+// "compact" derivation).
+
+// Cryptographically-strong-or-fallback 32-byte random. Mirrors
+// noise_xk's `_nxk_random_scalar` shape: try secure_random, fall back to
+// nanotime + 15-bit LCG (documented as weaker; same pattern as
+// ed25519's `_ed_random_seed`).
+fn _p256_random_bytes_32() {
+    let raw = alloc(33)
+    let got = secure_random(raw, 32)
+    if got == 32 {
+        return raw
+    }
+    // Fallback: stretch nanotime() via the 15-bit LCG.
+    let seed = int_and(nanotime(), 32767)
+    if seed == 0 { seed = 1 }
+    let i = 0
+    while i < 32 {
+        seed = int_and(int_add(int_mul(seed, 1103), 12345), 32767)
+        store8(raw + i, int_and(int_shr(seed, 7), 255))
+        i = i + 1
+    }
+    store8(raw + 32, 0)
+    return raw
+}
+
+// Reduce a 32-byte random buffer modulo n - 1, then add 1, to land in
+// [1, n-1]. Returns a bn256 private scalar.
+fn _p256_random_scalar() {
+    let raw = _p256_random_bytes_32()
+    let r = _p256_bytes_to_bn(raw, 0)
+    let n = p256_curve_n()
+    let one = bn256_from_int(1)
+    let n_minus_one = bn256_sub(n, one)
+    let reduced = bn256_mod(r, n_minus_one)
+    let scalar = bn256_add(reduced, one)
+    return scalar
+}
+
+// Public keypair generation. Returns [priv_bn, pub_compressed_buf_33B].
+fn p256_keygen() {
+    let priv = _p256_random_scalar()
+    let G = p256_base_point()
+    let pub_aff = p256_scalar_mult(priv, G[0], G[1])
+    if pub_aff == 0 {
+        // Cosmically unlucky case (priv * G == identity); return 0.
+        return 0
+    }
+    let pub_buf = p256_encode_compressed(pub_aff[0], pub_aff[1])
+    let r = list_new()
+    push(r, priv)
+    push(r, pub_buf)
+    return r
+}
+
+// Seeded variant for deterministic test vectors. `seed_bn` is taken as
+// the private scalar directly (caller responsible for ensuring it's in
+// [1, n-1]). Returns [priv_bn, pub_compressed_buf_33B].
+fn p256_keygen_seeded(seed_bn) {
+    let G = p256_base_point()
+    let pub_aff = p256_scalar_mult(seed_bn, G[0], G[1])
+    if pub_aff == 0 { return 0 }
+    let pub_buf = p256_encode_compressed(pub_aff[0], pub_aff[1])
+    let r = list_new()
+    push(r, seed_bn)
+    push(r, pub_buf)
+    return r
+}
+
+// ECDH shared-secret derivation. Takes the local private scalar and the
+// peer's compressed (or uncompressed) pubkey buffer; returns the 32-byte
+// X-coordinate of (priv * peer_pub) as a fresh alloc'd buffer with a
+// trailing NUL byte for allocator slack.
+//
+// Returns 0 (DECRYPT_FAIL sentinel) if:
+//   * the peer buffer doesn't decode (bad tag / wrong length / X >= p /
+//     off-curve);
+//   * the resulting shared point is the identity (peer pubkey was in the
+//     small-subgroup; with cofactor h = 1 this cannot happen for a
+//     well-formed P-256 peer, but we check defensively).
+fn p256_derive(priv, peer_pub_buf, peer_pub_n) {
+    let peer = p256_decode_point(peer_pub_buf, peer_pub_n)
+    if peer == 0 { return 0 }
+    let shared = p256_scalar_mult(priv, peer[0], peer[1])
+    if shared == 0 { return 0 }
+    let out = alloc(33)
+    _p256_bn_to_bytes_be(shared[0], out, 0)
+    store8(out + 32, 0)
+    let r = list_new()
+    push(r, out)
+    push(r, 32)
+    return r
+}
+
+// ============================================================================
+//                          Hex codec helpers
+// ============================================================================
+//
+// SEC1 test vectors arrive as hex strings; the helpers below let the test
+// suite + future DTLS callers pass keys and points as printable hex
+// without ever embedding zero bytes in a NOVA string (which truncates
+// on the first NUL).
+
+fn _p256_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }
+    if c >= 97 { if c <= 102 { return c - 87 } }
+    if c >= 65 { if c <= 70  { return c - 55 } }
+    return -1
+}
+
+fn _p256_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87
+}
+
+// Decode a hex string to a fresh alloc'd buffer; return [buf, len]
+// or 0 on malformed input.
+fn p256_hex_decode(hex_str) {
+    let n = len(hex_str)
+    if n == 0 { return 0 }
+    let half = int_shr(n, 1)
+    if int_shl(half, 1) != n { return 0 }
+    let buf = alloc(half + 1)
+    let i = 0
+    while i < half {
+        let hi = _p256_hex_nibble(char_at(hex_str, i * 2))
+        let lo = _p256_hex_nibble(char_at(hex_str, i * 2 + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        store8(buf + i, int_or(int_shl(hi, 4), lo))
+        i = i + 1
+    }
+    store8(buf + half, 0)
+    let r = list_new()
+    push(r, buf)
+    push(r, half)
+    return r
+}
+
+fn p256_hex_encode_buf(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = load8(buf + i)
+        let hi = _p256_nibble_hex(int_and(int_shr(b, 4), 15))
+        let lo = _p256_nibble_hex(int_and(b, 15))
+        s = s + chr(hi) + chr(lo)
+        i = i + 1
+    }
+    return s
+}

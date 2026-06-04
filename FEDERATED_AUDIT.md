@@ -2619,6 +2619,205 @@ R30C does NOT touch `nat_traversal.nova` (R23E ownership),
 true leaves (no `import` of any CrossEngin module). Parallel agents
 finishing R28E.2 SRTP cannot collide.
 
+## R30B extension: NIST P-256 ECDH + AES-128-GCM AEAD primitives (R29B.2 foundation)
+
+R29B (commit `a3b1233`) shipped the DTLS 1.2 record-layer +
+handshake skeleton in `src/federation/dtls12.nova` with five
+explicitly-tagged `_R29B2_STUB` slots: `dtls_ecdhe_derive_R29B2_STUB`,
+`dtls_cert_verify_R29B2_STUB`, `dtls_seal_record_R29B2_STUB`,
+`dtls_open_record_R29B2_STUB`, `dtls_extract_srtp_keys_R29B2_STUB`.
+The published R29B.2 todo list flagged TWO crypto primitives as
+prerequisites: a NIST P-256 scalar multiplication module (the
+existing `bignum_2048.nova` ships only RFC 7919 Group 14 2048-bit
+MODP DH, not short-Weierstrass curves) and an AES-128 + GHASH module
+(the existing `chacha20.nova` + `poly1305.nova` are ChaCha20-Poly1305,
+not AES-GCM). R30B lands BOTH as leaf modules. R30B.2 (a future
+round) will wire the stubs.
+
+### Why two NEW modules instead of extending an existing crypto file
+
+* `src/safety/bignum_256.nova` already ships a 256-bit Montgomery
+  REDC + `bn256_modmul` / `bn256_modpow_ct`. We reuse it for the
+  P-256 field arithmetic (the prime modulus + Mont context singleton
+  + Fermat-form inverse) but the curve-specific point arithmetic
+  (Jacobian doubling + add formulas for a = -3) doesn't belong inside
+  a generic bignum module. A parallel `p256.nova` is the right
+  altitude.
+* `src/safety/chacha20.nova` is a stream cipher with a quarter-round
+  algorithm; AES is a block cipher with an S-box and a 10-round
+  schedule. Co-locating the two cipher families would mix two
+  unrelated reusable building blocks. A parallel `aes_gcm.nova`
+  keeps both modules small and focused.
+
+### What R30B delivers (`src/safety/p256.nova`, leaf primitive)
+
+* **Field arithmetic over GF(p) where p = 2^256 - 2^224 + 2^192 + 2^96 - 1**:
+  `_p256_fe_add`, `_p256_fe_sub`, `_p256_fe_mul`, `_p256_fe_sqr`,
+  `_p256_fe_inv` (Fermat via `bn256_modpow_ct`). The `fe_add` /
+  `fe_sub` helpers correctly handle the carry case where `a + b`
+  exceeds 2^256 (the NIST P-256 prime is within 2^224 of 2^256, so
+  the sum of two field elements routinely overflows the 256-bit
+  container; a naive `bn256_add + conditional subtract p` silently
+  produces a wrong-by-2^224 answer). The carry-aware correction
+  adds (2^256 - p) back when the bn256_add overflows.
+* **Short-Weierstrass point arithmetic** on `y^2 = x^3 - 3x + b` in
+  Jacobian projective coordinates (X : Y : Z) where the affine point
+  is (X / Z^2, Y / Z^3). Doublings + adds touch no modular inverse;
+  a single `fe_inv` at the end of scalar-mult converts to affine for
+  encoding. The doubling formula is "dbl-2001-b" (a = -3 variant)
+  and the addition formula is "add-2007-bl" -- both from the
+  Bernstein-Lange Explicit Formulas Database. The identity (point
+  at infinity) is encoded as Z = 0.
+* **Scalar multiplication** via double-and-add walking the scalar
+  MSB-to-LSB. The outer loop is fixed at 256 iterations regardless
+  of scalar value, but the conditional add leaks the scalar bit
+  pattern (R30B.3 hardening will swap this for the always-add
+  Montgomery ladder).
+* **SEC1 point encoding**: 33-byte compressed (0x02 / 0x03 + 32B X)
+  and 65-byte uncompressed (0x04 + 32B X + 32B Y). Decompression
+  solves Y via the sqrt-mod-p trick a^((p+1)/4) since p ≡ 3 (mod 4).
+* **ECDH**: `p256_keygen` (random scalar in [1, n-1], compressed pub
+  out), `p256_derive(priv, peer_pub, n)` (validates peer's
+  compressed/uncompressed encoding, scalar-multiplies, returns the
+  32-byte big-endian X as the shared secret -- the SEC1 / NIST
+  SP 800-56A "compact" derivation). Returns 0 (DECRYPT_FAIL
+  sentinel) on bad peer encoding, off-curve peer, or identity
+  result.
+
+### What R30B delivers (`src/safety/aes_gcm.nova`, leaf primitive)
+
+* **AES-128 block cipher** (FIPS 197): 256-byte forward S-box,
+  10-round key schedule, encrypt-only (GCM uses encrypt-only). The
+  state is laid out column-major; ShiftRows operates on the
+  appropriate byte indices directly (no transpose). MixColumns uses
+  xtime (multiply by x mod the AES polynomial).
+* **GHASH over GF(2^128)** (NIST SP 800-38D): bit-reversed
+  convention with the reduction polynomial 0xe1 || 0^15 (= bit-
+  reversed of 0x87 = x^7 + x^2 + x + 1). Multiplication is the
+  standard 128-iteration shift-and-XOR; correct + readable rather
+  than fastest possible. The right-shift direction has byte 0's
+  memory-LSB carry INTO byte 1's memory-MSB (across-byte propagation
+  in the NIST bit-numbering direction).
+* **GCM mode** (SP 800-38D, 12-byte-IV path): `J_0 = IV || 0x00000001`;
+  CTR encryption with low-32-bit counter; tag = `GHASH_H(AAD || CT ||
+  len64(AAD bits) || len64(CT bits))` XOR `E_K(J_0)`. `gcm_open`
+  computes the expected tag BEFORE decrypting and compares with a
+  16-iteration XOR-fold (no short-circuit on the first mismatched
+  byte) so a bad tag never releases plaintext.
+
+### Verified vectors
+
+P-256:
+
+* SEC 2 §2.4.2 domain parameters: p, b, n, G hex-round-trip
+  canonical.
+* Base point G is on the curve (Gy^2 == Gx^3 - 3*Gx + b mod p).
+* Spot-check 2G, 3G, 5G, 7G against the standard published P-256
+  reference affine coordinates (these multiples are widely
+  reproduced in independent libraries' test suites).
+* **RFC 5903 §8.1 ECDH NIST P-256 Test Vector**
+  (https://datatracker.ietf.org/doc/html/rfc5903#section-8.1):
+  given `priv_i = c88f01f5...1433`, verifies both
+  `priv_i * G == (gix, giy)` and
+  `priv_i * (grx, gry) == Z = d6840f6b...442de`. Byte-identical
+  match.
+* Round-trip self-consistency: 5-scalar sweep of deterministic
+  pseudo-random `(priv_a, priv_b)` pairs, each round derives
+  `A * B` and `B * A` and confirms equality.
+* Encoding round-trip: compressed + uncompressed both round-trip
+  back to G.
+* Rejection: bad tag byte, wrong length, X >= p, off-curve point.
+
+AES-128-GCM:
+
+* AES-128 single-block encrypt against FIPS 197 Appendix C.1
+  (`PT = 00112233...ddeeff`, `K = 00010203...0e0f` →
+  `CT = 69c4e0d8...c55a`).
+* AES-128 with all-zero key + all-zero PT yields
+  `66e94bd4ef8a2c3b884cfa59ca342b2e` -- the canonical GHASH H
+  subkey for SP 800-38D Test Case 1.
+* GHASH multiplication: `H * 0 = 0` and `0 * H = 0`.
+* NIST SP 800-38D Appendix B Test Cases 1, 2, 3, 4: byte-identical
+  ciphertext + tag against the published vectors (TC1 = empty
+  PT empty AAD; TC2 = single-block PT empty AAD; TC3 = 64-byte PT
+  empty AAD; TC4 = AAD-present canonical vector).
+* Round-trip: `gcm_seal` followed by `gcm_open` returns the
+  original plaintext byte-identical on every test case.
+* Tamper rejection: flipping any byte of the ciphertext, of the
+  tag, or of the AAD makes `gcm_open` return `AES_GCM_DECRYPT_FAIL`.
+  Wrong key → same. Too-short ciphertext-plus-tag (< 16 bytes) →
+  same.
+
+### Honest scope: what R30B does NOT ship (R30B.2 / R30B.3 todo list)
+
+1. **Wire the DTLS stubs (R30B.2 / R29B.2).** R30B is foundation-
+   only. The five `_R29B2_STUB` slots in `dtls12.nova` stay
+   untouched in this round; R30B.2 will:
+   * Replace `dtls_ecdhe_derive_R29B2_STUB` with `p256_derive`.
+   * Replace `dtls_seal_record_R29B2_STUB` with `gcm_seal`.
+   * Replace `dtls_open_record_R29B2_STUB` with `gcm_open`.
+   * (`dtls_cert_verify_R29B2_STUB` is a separate ECDSA + X.509
+     ASN.1 follow-up.)
+2. **Constant-time scalar multiplication (R30B.3).** The current
+   double-and-add walks the scalar with a data-dependent
+   conditional add: the OUTER loop is fixed at 256 iterations
+   regardless of scalar value, but the inner branch leaks the
+   bit pattern to a power-analysis attacker. R30B.3 will swap
+   this for the always-add Montgomery ladder. Documented in the
+   module header alongside the same caveat about `bn256_cmp` /
+   `bn256_sub` that `bignum_256.nova` inherits.
+3. **AES bitsliced or T-table-with-side-channel-mitigation
+   (R30B.3).** The current AES uses a 256-entry NOVA-list S-box;
+   the data-dependent indexing leaks via the cache. A bitsliced
+   variant removes this exposure (at ~300 lines additional cost).
+4. **ECDSA sign/verify.** R29B.2's certificate-verify hook needs
+   ECDSA. R30B exposes the curve arithmetic; the ECDSA scheme on
+   top is straightforward but separate.
+5. **Compact x-coordinate ECDH per SEC1 §3.3.1.** Some peers ship
+   a 32-byte x-only DH; we currently return the 32-byte BE X
+   coordinate directly which IS x-only, but the input side
+   (decoding an x-only peer pubkey) is not yet wired.
+
+### Verification
+
+* **52 P-256 unit assertions** in `tests/unit/test_p256.nova` (NEW;
+  24 test functions). Coverage: domain parameter hex (4 asserts),
+  G on curve (1), field arithmetic round-trips (3), field inverse
+  on small values (2), sqrt-mod-p round-trip (1), encoding round-
+  trip + rejection (8), `scalar_mult(0/1/2/3, G)` consistency with
+  doubling + add (8), RFC 5903 §8.1 ECDH vector both halves (5),
+  ECDH A*B == B*A round-trip on two distinct scalar pairs over
+  compressed + uncompressed wire (4), 5-scalar sweep
+  self-consistency (1), `p256_derive` rejection on off-curve +
+  bad-tag peer (2). Concrete test vector verified byte-exact:
+  RFC 5903 §8.1.
+* **45 AES-128-GCM unit assertions** in `tests/unit/test_aes_gcm.nova`
+  (NEW; 18 test functions). Coverage: hex codec round-trip + edge
+  cases (5 asserts), FIPS 197 Appendix C.1 single-block (3), AES
+  with zero key (2), GHASH `H * 0` + `0 * H` (2), SP 800-38D
+  Test Cases 1 / 2 / 3 / 4 with full open round-trip (16), tamper
+  rejection on CT byte / tag byte / AAD / wrong key (4), too-short
+  open rejection (1), random round-trip on a non-block-aligned
+  plaintext (3). Concrete test vectors verified byte-exact:
+  FIPS 197 Appendix C.1; SP 800-38D Appendix B Test Cases
+  1-2-3-4.
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- all 223
+  pre-existing unit tests pass + 2 new (p256 + aes_gcm) = **225
+  unit tests pass**. All federation baselines hold: dtls12 147,
+  gossip 34, gossip_noise 44, gossip_relay 61, nat_traversal 53,
+  leader_election 40, webrtc 19. Module count delta: +2
+  (`src/safety/p256.nova`, `src/safety/aes_gcm.nova`).
+
+### Concurrency
+
+R30B does NOT touch `dtls12.nova` (R29B), `chacha20.nova`,
+`poly1305.nova`, `bignum_2048.nova`, `bignum.nova`, `ed25519.nova`,
+`webrtc.nova` (R28E), or any federation module. R30B reads from
+`bignum_256.nova` via `import` but does not modify it. Both new
+files are leaves at the `src/safety/` altitude. R30C's STUN + ICE
+work touches `src/federation/` and is fully orthogonal; the two
+rounds can ship independently.
+
 ## R29B extension: DTLS 1.2 record-layer + handshake skeleton (R28E.2)
 
 R28E (commit `8c566fb`) flagged DTLS 1.2/1.3 as the first of four

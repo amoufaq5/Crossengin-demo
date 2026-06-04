@@ -148,6 +148,141 @@ true leaves -- no `import` of any CrossEngin module.
 
 ---
 
+## R30B (this session) -- NIST P-256 ECDH + AES-128-GCM AEAD primitives (R29B.2 foundation)
+
+**Status: complete** -- two NEW leaf modules:
+`src/safety/p256.nova` (~700 lines) +
+`src/safety/aes_gcm.nova` (~810 lines). R29B (commit `a3b1233`)
+shipped DTLS 1.2 record-layer + handshake skeleton with five
+explicitly-tagged `_R29B2_STUB` slots: ECDHE derivation,
+certificate verify, record seal, record open, SRTP key extract.
+The R29B.2 todo list flagged TWO crypto prerequisites: a NIST P-256
+scalar multiplication primitive (the existing `bignum_2048.nova`
+ships RFC 7919 G14 MODP DH only, NOT short-Weierstrass curves) and
+an AES-128 + GHASH primitive (the existing `chacha20.nova` +
+`poly1305.nova` are ChaCha20-Poly1305, NOT AES-GCM). R30B lands
+BOTH as leaves. R30B.2 (a future round) will wire the stubs.
+
+### Why NEW modules instead of extending existing crypto files
+
+* `src/safety/bignum_256.nova` already ships a 256-bit Montgomery
+  REDC + `bn256_modmul` / `bn256_modpow_ct`. R30B reuses it for the
+  P-256 field arithmetic (prime modulus + Mont context singleton +
+  Fermat-form inverse) but the curve-specific Jacobian doubling +
+  add formulas don't belong inside a generic bignum module.
+* `src/safety/chacha20.nova` is ARX over 32-bit words; AES is an
+  S-box block cipher with a 10-round schedule. Different shape,
+  different file.
+
+### What R30B delivers (`src/safety/p256.nova`)
+
+* Field arithmetic over GF(p), p = 2^256 - 2^224 + 2^192 + 2^96 - 1.
+  Carry-aware `fe_add` + `fe_sub` that correctly handle the case
+  where the sum exceeds 2^256 (P-256 prime is within 2^224 of
+  2^256; naive bn256_add + cond-sub-p silently produces a
+  wrong-by-2^224 answer).
+* Jacobian point arithmetic on y^2 = x^3 - 3x + b. Doubling formula
+  "dbl-2001-b" (a = -3 variant); addition formula "add-2007-bl" --
+  both from the Bernstein-Lange Explicit Formulas Database.
+* Scalar multiplication via double-and-add walking the scalar
+  MSB-to-LSB. Outer loop fixed at 256 iterations; inner branch is
+  data-dependent (R30B.3 hardening will swap for Mont ladder).
+* SEC1 point encoding: 33-byte compressed (0x02/0x03 + 32B X) and
+  65-byte uncompressed (0x04 + 32B X + 32B Y). Decompression solves
+  Y via the sqrt-mod-p trick a^((p+1)/4) since p ≡ 3 (mod 4).
+  Precomputed `(p+1)/4 = 3fffffff_c0000000_40000000_0...40000000_...`
+  cross-checked against the Fermat form `4^(p-2) mod p` (which must
+  equal `(p+1)/4` since `4 * (p+1)/4 ≡ 1 mod p`).
+* ECDH: `p256_keygen` (random scalar in [1, n-1], compressed pub),
+  `p256_derive(priv, peer_pub, n)` (validates peer encoding,
+  scalar-multiplies, returns 32-byte BE X as shared secret per
+  SEC1 / NIST SP 800-56A compact derivation). Returns 0
+  (DECRYPT_FAIL sentinel) on bad peer / off-curve peer / identity.
+
+### What R30B delivers (`src/safety/aes_gcm.nova`)
+
+* AES-128 block cipher (FIPS 197). Encrypt-only (GCM uses
+  encrypt-only). 256-byte forward S-box, 10-round key schedule,
+  ShiftRows / MixColumns / AddRoundKey hot path.
+* GHASH over GF(2^128) (NIST SP 800-38D). Bit-reversed convention
+  with reduction polynomial 0xe1 || 0^15. 128-iteration
+  shift-and-XOR multiplication; correct + readable rather than
+  fastest.
+* GCM mode (12-byte-IV path; the standard browser / DTLS path).
+  J_0 = IV || 0x00000001; CTR encryption + GHASH-over-(AAD || CT
+  || lengths) tag. `gcm_open` computes the expected tag BEFORE
+  decrypting and compares with 16-iteration XOR-fold (no
+  short-circuit on first mismatch) so a bad tag never releases
+  plaintext.
+
+### Verified vectors
+
+* P-256 SEC 2 §2.4.2 domain parameters (p, b, n, G hex).
+* G on curve, 2G / 3G / 5G / 7G match standard published reference
+  affine coordinates.
+* **RFC 5903 §8.1 ECDH NIST P-256 Test Vector**
+  (https://datatracker.ietf.org/doc/html/rfc5903#section-8.1) --
+  byte-identical both halves: `priv_i * G == (gix, giy)` AND
+  `priv_i * (grx, gry) == Z = d6840f6b...442de`.
+* 5-scalar ECDH self-consistency sweep: A * B == B * A.
+* AES-128 FIPS 197 Appendix C.1 single-block
+  (`69c4e0d8...c55a`).
+* AES with all-zero K and all-zero PT yields
+  `66e94bd4ef8a2c3b884cfa59ca342b2e` (the canonical GHASH H subkey).
+* **NIST SP 800-38D Appendix B Test Cases 1, 2, 3, 4** byte-
+  identical ciphertext + tag against published vectors.
+* `gcm_seal` / `gcm_open` round-trip on every test case + a
+  random non-block-aligned payload.
+* Tamper rejection: CT byte, tag byte, AAD, wrong key, too-short
+  ciphertext all return `AES_GCM_DECRYPT_FAIL`.
+
+### Honest scope (R30B.2 / R30B.3 follow-up list)
+
+1. **Wire the DTLS stubs (R30B.2 / R29B.2).** R30B is foundation-
+   only. The five `_R29B2_STUB` slots in `dtls12.nova` are
+   untouched; R30B.2 will swap `p256_derive` into
+   `dtls_ecdhe_derive_R29B2_STUB`, `gcm_seal` into
+   `dtls_seal_record_R29B2_STUB`, `gcm_open` into
+   `dtls_open_record_R29B2_STUB`.
+2. **Constant-time scalar multiplication (R30B.3).** Today's
+   double-and-add walks the scalar with a data-dependent
+   conditional add; the outer loop is fixed at 256 iterations but
+   the inner branch leaks bits to a power-analysis attacker.
+   R30B.3 will swap for the always-add Montgomery ladder.
+3. **AES bitsliced / S-box side-channel hardening (R30B.3).** The
+   current AES uses a 256-entry NOVA-list S-box with data-dependent
+   indexing -- cache-line side-channel exposed.
+4. **ECDSA sign/verify (separate round).** R29B.2's certificate
+   verify hook needs ECDSA; R30B exposes the curve arithmetic, the
+   scheme on top is straightforward but separate.
+5. **Compact x-only ECDH input (SEC1 §3.3.1).** We return the
+   32-byte BE X (which IS x-only) but decoding an x-only peer
+   pubkey is not yet wired.
+
+### Files touched (R30B)
+
+* NEW: `src/safety/p256.nova` (~700 lines).
+* NEW: `src/safety/aes_gcm.nova` (~810 lines).
+* NEW: `tests/unit/test_p256.nova` (~310 lines, 52 assertions,
+  24 tests).
+* NEW: `tests/unit/test_aes_gcm.nova` (~330 lines, 45 assertions,
+  18 tests).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md` (this),
+  `README.md`.
+* `/home/user/NOVA` files NOT touched.
+
+### Concurrency
+
+R30B does NOT touch `dtls12.nova` (R29B), `chacha20.nova`,
+`poly1305.nova`, `bignum_2048.nova`, `bignum.nova`, `ed25519.nova`,
+`webrtc.nova`, or any federation module. Reads `bignum_256.nova`
+via `import` but does not modify it. R30B was developed in parallel
+with R30A (DRFETCH pipeline at the `src/federation/` altitude) and
+R30C (STUN + ICE at `src/federation/`); all three rounds touch
+disjoint files.
+
+---
+
 ## R30A (this session) -- true-pipelined DRFETCH via sys_poll multi-fd wait
 
 **Status: complete** -- `src/federation/distributed_rules.nova` extended

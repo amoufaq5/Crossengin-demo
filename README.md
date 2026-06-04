@@ -13,6 +13,44 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R30B lands the leaf cryptography primitives R29B.2 needs to
+> de-stub the DTLS record-layer + handshake skeleton: a NIST P-256
+> ECDH module (`src/safety/p256.nova`) and an AES-128-GCM AEAD
+> module (`src/safety/aes_gcm.nova`). R29B (commit `a3b1233`)
+> tagged five `_R29B2_STUB` slots in `dtls12.nova` and called out
+> two crypto prerequisites: P-256 scalar multiplication (the
+> existing `bignum_2048.nova` ships only RFC 7919 G14 2048-bit
+> MODP DH, NOT short-Weierstrass curves) and AES-128 + GHASH (the
+> existing `chacha20.nova` + `poly1305.nova` are ChaCha20-Poly1305,
+> NOT AES-GCM). R30B ships BOTH. `p256.nova` provides field
+> arithmetic over GF(p) with p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+> (Mont-REDC-backed via the existing `bignum_256.nova`), Jacobian
+> point arithmetic using the Bernstein-Lange dbl-2001-b doubling +
+> add-2007-bl addition formulas for a = -3, double-and-add scalar
+> multiplication, SEC1 compressed (0x02/0x03 + 32B X) and
+> uncompressed (0x04 + 32B X + 32B Y) point encoding with
+> decompression via the sqrt-mod-p trick a^((p+1)/4), and the public
+> ECDH API `p256_keygen` + `p256_derive(priv, peer_pub, n)`.
+> `aes_gcm.nova` provides FIPS 197 AES-128 encrypt-only (S-box, key
+> schedule, round function), NIST SP 800-38D GHASH over GF(2^128)
+> with the bit-reversed convention and 0xe1 || 0^15 reduction
+> polynomial, and the public AEAD API `gcm_seal(key, iv12, aad,
+> aad_n, pt, pt_n)` + `gcm_open(key, iv12, aad, aad_n, ct_tag,
+> ct_tag_n)`. Verified against RFC 5903 §8.1 ECDH NIST P-256 Test
+> Vector byte-identical both halves (priv * G = (gix, giy) AND
+> priv * peer = expected Z), FIPS 197 Appendix C.1 AES single-block,
+> SP 800-38D Appendix B Test Cases 1-2-3-4 (empty / single-block /
+> multi-block with and without AAD), GHASH H*0 sanity, 5-scalar
+> ECDH self-consistency sweep (A*B == B*A), `gcm_open` tamper
+> rejection on ciphertext byte / tag byte / AAD / wrong key, and a
+> non-block-aligned `gcm_seal`/`gcm_open` round-trip. **52 P-256
+> assertions + 45 AES-GCM assertions = 97 new unit assertions.**
+> R30B does NOT modify `dtls12.nova` -- the `_R29B2_STUB` slots
+> stay tagged; R30B.2 will wire them. R30B does NOT ship constant-
+> time scalar multiplication (double-and-add leaks bit pattern;
+> tracked as R30B.3 Montgomery-ladder hardening). Module count
+> delta: +2 (`src/safety/p256.nova`, `src/safety/aes_gcm.nova`).
+>
 > R30C closes the ICE half of the R28E.2 follow-up list flagged by
 > R28E (commit `8c566fb`, WebRTC SDP signaling). R29B took DTLS;
 > R30C ships TWO new modules in parallel: (1)
