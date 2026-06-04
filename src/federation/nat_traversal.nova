@@ -1,6 +1,7 @@
 // CrossEngin federation: NAT traversal -- STUN-like external address
 // discovery + gossip-piggyback advertisement (R23E) + RFC 8489 STUN
-// wire migration (R31C / R30C.2).
+// wire migration (R31C / R30C.2) + UDP datagram dispatch (R32A /
+// R31C.2 / R28C consumer).
 //
 // Purpose
 //   R18E (`src/federation/gossip.nova`) ships a SWIM-style gossip mesh
@@ -89,11 +90,34 @@
 //      NAT_S_MY_EXTERNAL slot), and bumps the same counters
 //      `nat_query_count` / `nat_query_ok_count` so the R23E status
 //      line stays the source of truth.
-//   3. RFC 8489 is a UDP datagram protocol. NOVA's compiler exposes
-//      only TCP today (`socket(AF_INET, SOCK_STREAM, 0)`); the actual
-//      UDP datagram round-trip is deferred to R31C.2. The wire codec
-//      is exercised in-memory (build a request, hand-craft a response,
-//      verify round-trip) so the byte contract is load-bearing.
+//   3. RFC 8489 is a UDP datagram protocol. R32A wires the actual UDP
+//      datagram round-trip through R28C's `sys_socket_udp`,
+//      `sys_sendto`, and `sys_recvfrom` builtins. When
+//      `CE_NAT_USE_RFC8489=1` is set in the env,
+//      `nat_query_stun_with_state` opens a UDP socket, dispatches the
+//      Binding Request through the R30C codec, waits up to
+//      `CE_NAT_RFC8489_TIMEOUT_MS` (default 1000ms) for a Binding
+//      Success Response, and reflects the XOR-MAPPED-ADDRESS into
+//      `NAT_S_MY_EXTERNAL`. When the env flag is unset / 0, the TCP
+//      text path is bit-identical with R23E + R31C.
+//
+// Protocol (R32A / R31C.2 UDP dispatch path)
+//
+//   1. `nat_query_stun_with_state(state, stun_addr)`:
+//          * If `CE_NAT_USE_RFC8489=1` -> dispatch through
+//            `nat_udp_query_rfc8489_with_state(state, stun_addr)`.
+//          * Otherwise -> legacy TCP text path.
+//   2. `nat_udp_query_rfc8489_with_state` internally calls split
+//      helpers `nat_udp_open()`, `nat_udp_send_binding_request_at(...)`,
+//      `nat_udp_recv_binding_response(...)`, `close_fd(fd)`. The
+//      same helpers are reusable for tests that drive both sides
+//      manually inside one process (loopback UDP echo).
+//   3. The UDP-specific counters are
+//      `NAT_S_UDP_SENT`  -- successful `sys_sendto` calls
+//      `NAT_S_UDP_RECVD` -- successful `sys_recvfrom` parses
+//      `NAT_S_UDP_TIMEOUTS` -- `sys_recvfrom` timeouts
+//      Accessors: `nat_udp_sent_count`, `nat_udp_recvd_count`,
+//      `nat_udp_timeout_count`. Mirrors R31C convention.
 //
 // Public API
 //
@@ -122,6 +146,19 @@
 //                                            user, pass) -> [pkt, n]
 //   nat_send_binding_request(state, remote_addr, software) -> [pkt, n, txn]
 //   nat_recv_binding_response(state, pkt, n)         -> 1 | 0 (updates state)
+//
+//   R32A / R31C.2 / R28C consumer additions:
+//
+//   nat_rfc8489_timeout_ms_from_env()                 -> ms (default 1000)
+//   nat_udp_open()                                    -> fd | -1
+//   nat_udp_send_binding_request_at(fd, state, ip,
+//                                   port, software)   -> [pkt, n, txn] | 0
+//   nat_udp_recv_binding_response(fd, state,
+//                                 timeout_ms)         -> 1 | 0 (-1 timeout)
+//   nat_udp_query_rfc8489_with_state(state, addr)     -> ext_addr | 0
+//   nat_udp_sent_count(state)                         -> int
+//   nat_udp_recvd_count(state)                        -> int
+//   nat_udp_timeout_count(state)                      -> int
 //
 //   Plus helpers exercised by the unit tests: nat_parse_stun_response,
 //   nat_format_stun_response, nat_extract_peer_addr, nat_alloc_sa_buf,
@@ -175,6 +212,19 @@ let NAT_S_STUN_STATE     = 9   // R31C: lazy stun_rfc8489 state, 0 until request
 let NAT_S_RFC_REQUESTS   = 10  // R31C: count RFC 8489 binding requests emitted
 let NAT_S_RFC_OK         = 11  // R31C: count RFC 8489 success responses parsed
 let NAT_S_RFC_BAD        = 12  // R31C: count RFC 8489 bad / mismatched responses
+let NAT_S_UDP_SENT       = 13  // R32A: count successful sys_sendto dispatches
+let NAT_S_UDP_RECVD      = 14  // R32A: count successful sys_recvfrom + parses
+let NAT_S_UDP_TIMEOUTS   = 15  // R32A: count sys_recvfrom timeouts (no datagram)
+
+// R32A: default RFC 8489 UDP recv timeout in milliseconds. Env override
+// via CE_NAT_RFC8489_TIMEOUT_MS; the env value MUST be a positive int.
+let NAT_RFC8489_DEFAULT_TIMEOUT_MS = 1000
+
+// Receive buffer size for the inbound Binding Response. RFC 8489 messages
+// are at most 64KB but practical responses stay tiny (XOR-MAPPED-ADDRESS
+// + SOFTWARE + MESSAGE-INTEGRITY + FINGERPRINT < 200 bytes). 1500 covers
+// any sane interop with margin (matches Ethernet MTU).
+let NAT_RFC8489_UDP_BUF_LEN = 1500
 
 // ---- low-level string helpers --------------------------------------------
 
@@ -282,6 +332,9 @@ fn nat_init() {
     push(st, 0)              // NAT_S_RFC_REQUESTS (R31C)
     push(st, 0)              // NAT_S_RFC_OK (R31C)
     push(st, 0)              // NAT_S_RFC_BAD (R31C)
+    push(st, 0)              // NAT_S_UDP_SENT (R32A)
+    push(st, 0)              // NAT_S_UDP_RECVD (R32A)
+    push(st, 0)              // NAT_S_UDP_TIMEOUTS (R32A)
     return st
 }
 
@@ -490,11 +543,24 @@ fn _nat_dial(addr) {
 }
 
 // ---- public API: STUN query (client side) --------------------------------
+//
+// `nat_query_stun_with_state` is the public entry point. When the env
+// flag `CE_NAT_USE_RFC8489=1` is set AND the caller passes a non-zero
+// state (so the lazy stun_state can be allocated), dispatch hands off
+// to the RFC 8489 UDP path implemented in
+// `nat_udp_query_rfc8489_with_state` further down. Otherwise the
+// legacy R23E TCP text path runs.
+//
+// Behavior contract preserved across both paths:
+//   * NAT_S_QUERIES bumps on every entry, regardless of which path
+//     handled the call.
+//   * NAT_S_QUERIES_OK bumps only on a successful external-addr parse.
+//   * NAT_S_MY_EXTERNAL is left untouched on failure (caller decides
+//     whether to overwrite via `nat_set_external`).
+//   * Return value: the formatted `<ip>:<port>` string on success, or
+//     0 on any failure (with `nat_last_error` set).
 
-fn nat_query_stun_with_state(state, stun_addr) {
-    if state != 0 {
-        state[NAT_S_QUERIES] = state[NAT_S_QUERIES] + 1
-    }
+fn _nat_query_stun_tcp(state, stun_addr) {
     let fd = _nat_dial(stun_addr)
     if fd < 0 {
         if state != 0 { nat_set_last_error(state, "dial-failed") }
@@ -521,6 +587,22 @@ fn nat_query_stun_with_state(state, stun_addr) {
         nat_set_last_error(state, "")
     }
     return ext
+}
+
+fn nat_query_stun_with_state(state, stun_addr) {
+    if state != 0 {
+        state[NAT_S_QUERIES] = state[NAT_S_QUERIES] + 1
+    }
+    // R32A: dispatch through the RFC 8489 UDP path when the env flag
+    // is on AND we have a state to hang the stun_state_t off of.
+    // Without state the codec has no place to allocate its txn /
+    // credential context, so we fall back to the TCP path.
+    if state != 0 {
+        if nat_use_rfc8489_enabled() == 1 {
+            return _nat_query_stun_rfc8489_udp(state, stun_addr)
+        }
+    }
+    return _nat_query_stun_tcp(state, stun_addr)
 }
 
 fn nat_query_stun(stun_addr) { return nat_query_stun_with_state(0, stun_addr) }
@@ -928,6 +1010,208 @@ fn nat_legacy_parse_stunlike_response(line) {
 
 fn nat_legacy_format_stunlike_response(ip, port) {
     return nat_format_stun_response(ip, port) + "\n"
+}
+
+// ============================================================================
+//        R32A / R31C.2 / R28C consumer -- UDP datagram dispatch path
+// ============================================================================
+//
+// This block wires the R30C wire codec to actual UDP sockets through the
+// R28C builtins:
+//   sys_socket_udp()                               -> fd | -1
+//   sys_sendto(fd, buf, len, ip_int, port)         -> bytes_sent | -1
+//   sys_recvfrom(fd, buf, max_len, timeout_ms)
+//                  -> [bytes_read, sender_ip, sender_port]
+//   sys_setsockopt_so_reuseaddr(fd)                -> 0 | -1
+//
+// The IP integer encoding is the same as `make_sockaddr_in`'s expectation:
+// the four address octets packed little-endian into a 32-bit int so the
+// kernel's `sockaddr_in.sin_addr.s_addr` (network byte order on the wire)
+// receives them. `_nat_ip_str_to_int` already produces this encoding;
+// reuse it.
+//
+// Public helpers (state-aware):
+//
+//   nat_udp_open()
+//     Open a fresh UDP socket. Returns fd >= 0 or -1 on sandbox deny /
+//     stub target. No bind: source port stays kernel-assigned which is
+//     standard STUN client behavior.
+//
+//   nat_udp_send_binding_request_at(fd, state, ip_str, port, software)
+//     Emit an RFC 8489 Binding Request through the R30C codec and
+//     send it via `sys_sendto`. Bumps NAT_S_RFC_REQUESTS and on a
+//     successful send NAT_S_UDP_SENT. Returns [pkt, n, txn] on success
+//     so the caller can match the response to the request, or 0 on
+//     bad IP / socket failure / sendto failure (with `nat_last_error`
+//     set).
+//
+//   nat_udp_recv_binding_response(fd, state, timeout_ms)
+//     Wait up to `timeout_ms` milliseconds for a Binding Response on
+//     `fd` via `sys_recvfrom`. On parse success the XOR-MAPPED-ADDRESS
+//     is written into NAT_S_MY_EXTERNAL, NAT_S_QUERIES_OK / NAT_S_RFC_OK
+//     / NAT_S_UDP_RECVD all bump, and 1 returned. On timeout
+//     NAT_S_UDP_TIMEOUTS bumps, `nat_last_error` set to "udp-timeout",
+//     and 0 returned. On bad / mismatched parse NAT_S_RFC_BAD bumps,
+//     `nat_last_error` set from `nat_recv_binding_response`, and 0
+//     returned.
+//
+//   nat_udp_query_rfc8489_with_state(state, stun_addr)
+//     End-to-end client: open UDP socket, dispatch Binding Request,
+//     wait for response with `CE_NAT_RFC8489_TIMEOUT_MS` timeout
+//     (default 1000ms), close socket. Returns the discovered external
+//     address string "<ip>:<port>" on success, or 0 on any failure.
+//     This is what `nat_query_stun_with_state` dispatches to when
+//     `CE_NAT_USE_RFC8489=1`.
+
+fn nat_rfc8489_timeout_ms_from_env() {
+    let env = getenv("CE_NAT_RFC8489_TIMEOUT_MS")
+    if env == 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    if len(env) == 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    if _nat_is_digits(env) == 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    let ms = str_to_int(env)
+    if ms <= 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    return ms
+}
+
+fn nat_udp_open() {
+    let fd = sys_socket_udp()
+    if fd < 0 { return -1 }
+    // SO_REUSEADDR is harmless on a kernel-assigned source port but
+    // helps when callers pre-bind to a fixed test port. We ignore the
+    // result -- on stub targets it returns -1 but the fd is still
+    // unusable (sys_socket_udp would have returned -1 too).
+    sys_setsockopt_so_reuseaddr(fd)
+    return fd
+}
+
+fn nat_udp_sent_count(state) {
+    if state == 0 { return 0 }
+    return state[NAT_S_UDP_SENT]
+}
+
+fn nat_udp_recvd_count(state) {
+    if state == 0 { return 0 }
+    return state[NAT_S_UDP_RECVD]
+}
+
+fn nat_udp_timeout_count(state) {
+    if state == 0 { return 0 }
+    return state[NAT_S_UDP_TIMEOUTS]
+}
+
+fn nat_udp_send_binding_request_at(fd, state, ip_str, port, software) {
+    if state == 0 { return 0 }
+    if fd < 0 {
+        nat_set_last_error(state, "udp-bad-fd")
+        return 0
+    }
+    let ip_int = _nat_ip_str_to_int(ip_str)
+    if ip_int < 0 {
+        nat_set_last_error(state, "bad-remote-addr-ip")
+        return 0
+    }
+    if port <= 0 {
+        nat_set_last_error(state, "bad-remote-addr-port")
+        return 0
+    }
+    if port > 65535 {
+        nat_set_last_error(state, "bad-remote-addr-port")
+        return 0
+    }
+    // Emit through R30C. The result is [pkt_buf, n, txn_id_buf].
+    let emitted = nat_emit_rfc8489_binding_request(state, software)
+    if emitted == 0 {
+        nat_set_last_error(state, "rfc8489-emit-failed")
+        return 0
+    }
+    let pkt = emitted[0]
+    let n = emitted[1]
+    if pkt == 0 {
+        nat_set_last_error(state, "rfc8489-emit-failed")
+        return 0
+    }
+    if n <= 0 {
+        nat_set_last_error(state, "rfc8489-emit-failed")
+        return 0
+    }
+    let sent = sys_sendto(fd, pkt, n, ip_int, port)
+    if sent < 0 {
+        nat_set_last_error(state, "udp-sendto-failed")
+        return 0
+    }
+    if sent != n {
+        nat_set_last_error(state, "udp-sendto-short")
+        return 0
+    }
+    state[NAT_S_UDP_SENT] = state[NAT_S_UDP_SENT] + 1
+    nat_set_last_error(state, "")
+    return emitted
+}
+
+fn nat_udp_recv_binding_response(fd, state, timeout_ms) {
+    if state == 0 { return 0 }
+    if fd < 0 {
+        nat_set_last_error(state, "udp-bad-fd")
+        return 0
+    }
+    let buf = alloc(NAT_RFC8489_UDP_BUF_LEN)
+    let i = 0
+    while i < NAT_RFC8489_UDP_BUF_LEN { store8(buf + i, 0); i = i + 1 }
+    let rx = sys_recvfrom(fd, buf, NAT_RFC8489_UDP_BUF_LEN, timeout_ms)
+    let bytes_read = rx[0]
+    if bytes_read < 0 {
+        state[NAT_S_UDP_TIMEOUTS] = state[NAT_S_UDP_TIMEOUTS] + 1
+        nat_set_last_error(state, "udp-timeout")
+        return 0
+    }
+    if bytes_read == 0 {
+        state[NAT_S_UDP_TIMEOUTS] = state[NAT_S_UDP_TIMEOUTS] + 1
+        nat_set_last_error(state, "udp-timeout")
+        return 0
+    }
+    let ok = nat_recv_binding_response(state, buf, bytes_read)
+    if ok == 1 {
+        state[NAT_S_UDP_RECVD] = state[NAT_S_UDP_RECVD] + 1
+        return 1
+    }
+    return 0
+}
+
+fn _nat_query_stun_rfc8489_udp(state, stun_addr) {
+    if state == 0 { return 0 }
+    let parsed = _nat_parse_addr(stun_addr)
+    if parsed == 0 {
+        nat_set_last_error(state, "bad-remote-addr")
+        return 0
+    }
+    let ip_str = parsed[0]
+    let port = parsed[1]
+    if _nat_ip_str_to_int(ip_str) < 0 {
+        nat_set_last_error(state, "bad-remote-addr-ip")
+        return 0
+    }
+    let fd = nat_udp_open()
+    if fd < 0 {
+        nat_set_last_error(state, "udp-socket-failed")
+        return 0
+    }
+    let timeout_ms = nat_rfc8489_timeout_ms_from_env()
+    let sent = nat_udp_send_binding_request_at(fd, state, ip_str, port,
+                                               "crossengin/r32a")
+    if sent == 0 {
+        close_fd(fd)
+        return 0
+    }
+    let ok = nat_udp_recv_binding_response(fd, state, timeout_ms)
+    close_fd(fd)
+    if ok == 1 {
+        return nat_get_external(state)
+    }
+    return 0
+}
+
+fn nat_udp_query_rfc8489_with_state(state, stun_addr) {
+    return _nat_query_stun_rfc8489_udp(state, stun_addr)
 }
 
 // ---- chat helpers --------------------------------------------------------

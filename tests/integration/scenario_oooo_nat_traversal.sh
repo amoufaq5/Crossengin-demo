@@ -450,4 +450,220 @@ else
     printf "  ${C_RED}FAIL${C_RST}  B's NAT_S_QUERIES_OK counter still 0\n"
 fi
 
+# ============================================================================
+# R32A / R31C.2 / R28C consumer -- UDP datagram dispatch sub-scenario
+# ============================================================================
+#
+# This sub-scenario exercises the UDP transport that R32A wired
+# through R28C's `sys_socket_udp` / `sys_sendto` / `sys_recvfrom`
+# builtins. Two NOVA programs run in one process each:
+#
+#   UDP_RT     -- a single-process loopback round-trip: a responder
+#                 binds a UDP port, the client emits an RFC 8489
+#                 Binding Request through `nat_udp_send_binding_request_at`,
+#                 the responder receives + builds + replies with a
+#                 Binding Success Response built by R30C, and the
+#                 client's `nat_udp_recv_binding_response` extracts
+#                 the XOR-MAPPED-ADDRESS into NAT_S_MY_EXTERNAL.
+#                 Proves: full UDP path codec + transport + state
+#                 reflection. Echoes one line marking each milestone
+#                 so the shell can grep them.
+#
+#   UDP_FLAG   -- spawn a NOVA program with CE_NAT_USE_RFC8489=1
+#                 set in env and a closed STUN target. Verify that
+#                 `nat_query_stun_with_state` actually walks the
+#                 UDP path (NAT_S_UDP_SENT > 0, NAT_S_UDP_TIMEOUTS > 0)
+#                 NOT the legacy TCP path. This is the load-bearing
+#                 env-flag dispatch test.
+#
+# If the test sandbox forbids UDP (sys_socket_udp returns -1), both
+# sub-scenarios are skipped with SKIP markers and the failure is
+# logged as informational, not a fail. This keeps the scenario
+# portable across native and stub targets.
+
+# ---- UDP_RT: single-process loopback round-trip ------------------------
+DRV_UDP="$DRV_DIR/udp_rt.nova"
+UDP_PORT=$((BASE_PORT + 50))
+cat > "$DRV_UDP" <<NOVA
+import "std/io"
+import "../../../src/federation/nat_traversal.nova"
+import "../../../src/federation/stun_rfc8489.nova"
+
+fn main() {
+    let probe = nat_udp_open()
+    if probe < 0 {
+        println("udp_rt: SKIP sys_socket_udp returned -1")
+        exit(0)
+    }
+    close_fd(probe)
+
+    let LOOPBACK = 16777343
+    let RESP_PORT = $UDP_PORT
+
+    let resp_fd = nat_udp_open()
+    if resp_fd < 0 { println("udp_rt: ERROR resp_fd"); exit(1) }
+    let resp_sa = make_sockaddr_in(RESP_PORT, LOOPBACK)
+    if bind_socket(resp_fd, resp_sa, 16) != 0 {
+        println("udp_rt: ERROR bind RESP_PORT=" + int_to_str(RESP_PORT))
+        close_fd(resp_fd)
+        exit(1)
+    }
+    println("udp_rt: responder-bound port=" + int_to_str(RESP_PORT))
+
+    let cli_fd = nat_udp_open()
+    if cli_fd < 0 { println("udp_rt: ERROR cli_fd"); exit(1) }
+    let st = nat_init()
+    st[NAT_S_QUERIES] = st[NAT_S_QUERIES] + 1
+
+    let emitted = nat_udp_send_binding_request_at(cli_fd, st,
+                                                  "127.0.0.1", RESP_PORT,
+                                                  "ce/r32a-scenario")
+    if emitted == 0 {
+        println("udp_rt: ERROR send last_error=" + nat_last_error(st))
+        exit(1)
+    }
+    println("udp_rt: client-sent bytes=" + int_to_str(emitted[1])
+        + " udp_sent=" + int_to_str(nat_udp_sent_count(st)))
+
+    let rbuf = alloc(NAT_RFC8489_UDP_BUF_LEN)
+    let ri = 0
+    while ri < NAT_RFC8489_UDP_BUF_LEN { store8(rbuf + ri, 0); ri = ri + 1 }
+    let rx = sys_recvfrom(resp_fd, rbuf, NAT_RFC8489_UDP_BUF_LEN, 2000)
+    let rx_n = rx[0]
+    let rx_ip = rx[1]
+    let rx_port = rx[2]
+    if rx_n <= 0 {
+        println("udp_rt: ERROR responder-recv n=" + int_to_str(rx_n))
+        exit(1)
+    }
+    println("udp_rt: responder-got n=" + int_to_str(rx_n)
+        + " from " + int_to_str(rx_ip) + ":" + int_to_str(rx_port))
+
+    let txn = emitted[2]
+    let v4 = stun_ipv4_str_to_buf("198.51.100.250")
+    let resp_msg = stun_msg_build_success_response_ipv4(txn, v4, 43210,
+                                                        "ce/r32a-scen-resp",
+                                                        "", "", 1)
+    let resp_pkt = resp_msg[0]
+    let resp_n = resp_msg[1]
+    let s_sent = sys_sendto(resp_fd, resp_pkt, resp_n, rx_ip, rx_port)
+    if s_sent != resp_n {
+        println("udp_rt: ERROR responder-sendto")
+        exit(1)
+    }
+    println("udp_rt: responder-sent n=" + int_to_str(resp_n))
+
+    let ok = nat_udp_recv_binding_response(cli_fd, st, 2000)
+    if ok != 1 {
+        println("udp_rt: ERROR client-recv last_error=" + nat_last_error(st))
+        exit(1)
+    }
+    println("udp_rt: client-parsed external=" + nat_get_external(st)
+        + " udp_recvd=" + int_to_str(nat_udp_recvd_count(st))
+        + " udp_timeouts=" + int_to_str(nat_udp_timeout_count(st)))
+
+    close_fd(cli_fd)
+    close_fd(resp_fd)
+    println("udp_rt: PASS")
+    exit(0)
+}
+main()
+NOVA
+
+it_section "scenario OOOO sub: R32A / R31C.2 UDP datagram dispatch round-trip"
+
+UDP_RT_OUT="/tmp/ce_int_oooo_udp_rt.out"
+"$NOVA_BIN" run "$DRV_UDP" >"$UDP_RT_OUT" 2>&1
+UDP_RT_RC=$?
+
+if grep -q '^udp_rt: SKIP' "$UDP_RT_OUT"; then
+    printf "  ${C_YEL}SKIP${C_RST}  UDP_RT: sandbox sys_socket_udp returned -1\n"
+    PASS=$((PASS+1))
+elif [ "$UDP_RT_RC" -ne 0 ]; then
+    printf "  ${C_RED}FAIL${C_RST}  UDP_RT: subprogram exited non-zero (rc=%s)\n" "$UDP_RT_RC"
+    sed 's/^/      /' "$UDP_RT_OUT" | tail -20
+    FAIL=$((FAIL+1))
+else
+    UDP_RT_RESP_BOUND=$(grep '^udp_rt: responder-bound' "$UDP_RT_OUT" | head -1)
+    UDP_RT_CLI_SENT=$(grep '^udp_rt: client-sent' "$UDP_RT_OUT" | head -1)
+    UDP_RT_RESP_GOT=$(grep '^udp_rt: responder-got' "$UDP_RT_OUT" | head -1)
+    UDP_RT_RESP_SENT=$(grep '^udp_rt: responder-sent' "$UDP_RT_OUT" | head -1)
+    UDP_RT_CLI_PARSED=$(grep '^udp_rt: client-parsed' "$UDP_RT_OUT" | head -1)
+    UDP_RT_PASS=$(grep '^udp_rt: PASS' "$UDP_RT_OUT" | head -1)
+
+    assert_match "$UDP_RT_RESP_BOUND" "responder-bound port=$UDP_PORT" "UDP_RT: responder bound on expected port"
+    assert_match "$UDP_RT_CLI_SENT" "udp_sent=1" "UDP_RT: client sendto returned + NAT_S_UDP_SENT bumped"
+    assert_match "$UDP_RT_RESP_GOT" "responder-got n=[0-9]+" "UDP_RT: responder received a datagram"
+    assert_match "$UDP_RT_RESP_SENT" "responder-sent n=[0-9]+" "UDP_RT: responder sent a success response"
+    assert_match "$UDP_RT_CLI_PARSED" "external=198.51.100.250:43210" "UDP_RT: client parsed XOR-MAPPED-ADDRESS"
+    assert_match "$UDP_RT_CLI_PARSED" "udp_recvd=1" "UDP_RT: NAT_S_UDP_RECVD bumped on parse"
+    assert_match "$UDP_RT_CLI_PARSED" "udp_timeouts=0" "UDP_RT: zero timeouts on happy-path"
+    assert_match "$UDP_RT_PASS" "PASS" "UDP_RT: end-to-end PASS marker"
+fi
+
+# ---- UDP_FLAG: env-flag dispatch reaches UDP path ---------------------
+
+DRV_FLAG="$DRV_DIR/udp_flag.nova"
+UDP_FLAG_PORT=$((BASE_PORT + 51))
+cat > "$DRV_FLAG" <<NOVA
+import "std/io"
+import "../../../src/federation/nat_traversal.nova"
+
+fn main() {
+    let probe = nat_udp_open()
+    if probe < 0 {
+        println("udp_flag: SKIP sys_socket_udp returned -1")
+        exit(0)
+    }
+    close_fd(probe)
+    if nat_use_rfc8489_enabled() != 1 {
+        println("udp_flag: ERROR env-flag not on -- got "
+            + int_to_str(nat_use_rfc8489_enabled()))
+        exit(1)
+    }
+    println("udp_flag: env-flag-on")
+    let st = nat_init()
+    let r = nat_query_stun_with_state(st, "127.0.0.1:$UDP_FLAG_PORT")
+    println("udp_flag: dispatch-returned=" + int_to_str(r)
+        + " queries=" + int_to_str(nat_query_count(st))
+        + " queries_ok=" + int_to_str(nat_query_ok_count(st))
+        + " udp_sent=" + int_to_str(nat_udp_sent_count(st))
+        + " udp_recvd=" + int_to_str(nat_udp_recvd_count(st))
+        + " udp_timeouts=" + int_to_str(nat_udp_timeout_count(st))
+        + " last_error=" + nat_last_error(st)
+        + " external='" + nat_get_external(st) + "'")
+    exit(0)
+}
+main()
+NOVA
+
+it_section "scenario OOOO sub: R32A env-flag dispatch CE_NAT_USE_RFC8489=1"
+
+UDP_FLAG_OUT="/tmp/ce_int_oooo_udp_flag.out"
+CE_NAT_USE_RFC8489=1 CE_NAT_RFC8489_TIMEOUT_MS=200 "$NOVA_BIN" run "$DRV_FLAG" >"$UDP_FLAG_OUT" 2>&1
+UDP_FLAG_RC=$?
+
+if grep -q '^udp_flag: SKIP' "$UDP_FLAG_OUT"; then
+    printf "  ${C_YEL}SKIP${C_RST}  UDP_FLAG: sandbox sys_socket_udp returned -1\n"
+    PASS=$((PASS+1))
+elif [ "$UDP_FLAG_RC" -ne 0 ]; then
+    printf "  ${C_RED}FAIL${C_RST}  UDP_FLAG: subprogram exited non-zero (rc=%s)\n" "$UDP_FLAG_RC"
+    sed 's/^/      /' "$UDP_FLAG_OUT" | tail -20
+    FAIL=$((FAIL+1))
+else
+    UDP_FLAG_ON=$(grep '^udp_flag: env-flag-on' "$UDP_FLAG_OUT" | head -1)
+    UDP_FLAG_DISPATCH=$(grep '^udp_flag: dispatch-returned' "$UDP_FLAG_OUT" | head -1)
+    assert_match "$UDP_FLAG_ON" "env-flag-on" "UDP_FLAG: nat_use_rfc8489_enabled reads env=1"
+    assert_match "$UDP_FLAG_DISPATCH" "dispatch-returned=0" "UDP_FLAG: dispatch returns 0 on timeout"
+    assert_match "$UDP_FLAG_DISPATCH" "queries=1" "UDP_FLAG: top-level NAT_S_QUERIES bumped"
+    assert_match "$UDP_FLAG_DISPATCH" "queries_ok=0" "UDP_FLAG: NAT_S_QUERIES_OK stays 0 on timeout"
+    assert_match "$UDP_FLAG_DISPATCH" "udp_sent=1" "UDP_FLAG: NAT_S_UDP_SENT bumped (proves UDP path taken)"
+    assert_match "$UDP_FLAG_DISPATCH" "udp_recvd=0" "UDP_FLAG: NAT_S_UDP_RECVD stays 0"
+    assert_match "$UDP_FLAG_DISPATCH" "udp_timeouts=1" "UDP_FLAG: NAT_S_UDP_TIMEOUTS bumped"
+    assert_match "$UDP_FLAG_DISPATCH" "last_error=udp-timeout" "UDP_FLAG: last_error udp-timeout"
+    assert_match "$UDP_FLAG_DISPATCH" "external=''" "UDP_FLAG: NAT_S_MY_EXTERNAL stays empty"
+fi
+
+rm -f "$UDP_RT_OUT" "$UDP_FLAG_OUT" 2>/dev/null
+
 summary "scenario_oooo_nat_traversal"

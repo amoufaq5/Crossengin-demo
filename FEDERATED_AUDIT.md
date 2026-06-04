@@ -2388,6 +2388,170 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R32A extension: nat_traversal RFC 8489 UDP dispatch (R31C.2 / R28C consumer)
+
+R31C (commit `0f95bb6`) migrated the codec half of `nat_traversal`
+to RFC 8489 but left `nat_query_stun_with_state` on the TCP-text
+path because at write time UDP syscalls were assumed unavailable.
+R28C had already shipped `sys_socket_udp`, `sys_sendto`,
+`sys_recvfrom`, and `sys_setsockopt_so_reuseaddr` across 6
+codegen backends. R32A wires `nat_traversal` through to those
+builtins so `CE_NAT_USE_RFC8489=1` produces actual RFC 8489
+datagrams on the wire.
+
+### What R32A delivers (modifies `src/federation/nat_traversal.nova`)
+
+* **Top-level dispatch.** `nat_query_stun_with_state(state, addr)`
+  now checks `nat_use_rfc8489_enabled()` (which already reads
+  `CE_NAT_USE_RFC8489`). When enabled AND `state != 0` (so the
+  lazy `stun_state_t` can be allocated), the function dispatches
+  to `_nat_query_stun_rfc8489_udp`. Otherwise the legacy R23E TCP
+  text path runs, bit-identical.
+
+* **`_nat_query_stun_rfc8489_udp`.** End-to-end UDP client:
+  parses `addr`, opens a UDP socket via `sys_socket_udp`, dispatches
+  the Binding Request through R30C, blocks on `sys_recvfrom` up
+  to `CE_NAT_RFC8489_TIMEOUT_MS` (default 1000ms), parses the
+  response, and on success returns the formatted
+  `<ip>:<port>` external address. On timeout / bad parse / bad
+  addr returns 0 with `nat_last_error` set.
+
+* **Split helpers** for tests / advanced callers:
+  `nat_udp_open()`, `nat_udp_send_binding_request_at(fd, state, ip,
+  port, software)`, `nat_udp_recv_binding_response(fd, state,
+  timeout_ms)`, `nat_udp_query_rfc8489_with_state(state, addr)`.
+  These are the building blocks the unit-test loopback round-trip
+  drives both halves of in one process.
+
+* **Env helper.** `nat_rfc8489_timeout_ms_from_env()` parses
+  `CE_NAT_RFC8489_TIMEOUT_MS`; default is `NAT_RFC8489_DEFAULT_TIMEOUT_MS`
+  = 1000ms. Non-numeric / non-positive values fall back to the
+  default.
+
+* **Three new stats slots** with R31C-shape accessors:
+    - `NAT_S_UDP_SENT` (13) -- bumps on successful `sys_sendto`.
+      `nat_udp_sent_count(state)`.
+    - `NAT_S_UDP_RECVD` (14) -- bumps on successful parse of a
+      Binding Success Response received via `sys_recvfrom`.
+      `nat_udp_recvd_count(state)`.
+    - `NAT_S_UDP_TIMEOUTS` (15) -- bumps when `sys_recvfrom`
+      returns `-1` / `0` bytes (timeout shape).
+      `nat_udp_timeout_count(state)`.
+  All three accessors guard a `state == 0` argument and return 0
+  in that case, matching R31C convention.
+
+### Behavior preservation (R23E + R31C tests stay byte-identical)
+
+* `nat_query_stun_with_state` keeps its existing return-value
+  contract (formatted `<ip>:<port>` on success, 0 on failure),
+  still bumps `NAT_S_QUERIES` once per call regardless of
+  dispatch path, and still bumps `NAT_S_QUERIES_OK` only on a
+  successful external-addr parse.
+* `NAT_S_MY_EXTERNAL` is the only slot that mirrors the
+  discovered address; both paths target it through
+  `nat_set_external`.
+* The 101 pre-R32A unit checks (53 R23E + 48 R31C) pass
+  byte-identical -- no test functions touched or removed; only
+  R32A test functions appended after the R31C block.
+* Integration scenario_oooo's existing 18 R23E + 6 R31C
+  shell assertions remain unchanged (same `assert_match`
+  patterns, same milestones, same sub-scenarios run first); R32A
+  adds 17 PASS assertions in two new sub-sections appended
+  after.
+
+### Wire-side verification
+
+In one process: the loopback round-trip subscenario binds a UDP
+responder socket, the client emits a Binding Request through the
+real R30C codec, the responder reads a 40-byte datagram (RFC 8489
+Binding Request type 0x0001 with magic cookie + FINGERPRINT) and
+crafts a 56-byte Binding Success Response with a XOR-MAPPED-ADDRESS
+attribute, the client `sys_recvfrom`s that response and the parse
+extracts `198.51.100.250:43210` into `NAT_S_MY_EXTERNAL`. All eight
+milestone lines (`responder-bound`, `client-sent`, `responder-got`,
+`responder-sent`, `client-parsed`, plus three counter checks) PASS
+in the sandbox.
+
+### Env-flag dispatch verification
+
+The `UDP_FLAG` sub-scenario spawns a child NOVA program with
+`CE_NAT_USE_RFC8489=1 CE_NAT_RFC8489_TIMEOUT_MS=200` against a
+closed UDP port. The dispatch reports `NAT_S_UDP_SENT=1`,
+`NAT_S_UDP_TIMEOUTS=1`, `NAT_S_UDP_RECVD=0`, `NAT_S_QUERIES=1`,
+`NAT_S_QUERIES_OK=0`, `last_error=udp-timeout`,
+`external=''`. This proves the env flag actually routes through
+UDP rather than the legacy TCP path (a TCP attempt against port 200
+would have produced `dial-failed` instead).
+
+### Test counts
+
+* **61 new R32A assertions** in `tests/unit/test_nat_traversal.nova`
+  across 14 test functions (`test_r32a_*`). Round-trip + timeout
+  branches both skip-via-early-return when `nat_udp_open()`
+  returns -1 (stub target / sandbox-deny), so the suite still
+  passes on UDP-less targets with reduced coverage.
+* **17 new R32A assertions** in
+  `tests/integration/scenario_oooo_nat_traversal.sh` across two
+  sub-sections (`UDP_RT` and `UDP_FLAG`).
+* `nat_traversal`: 101 -> 162 unit checks (101 R23E + R31C
+  byte-identical + 61 R32A).
+
+### Honest scope (still deferred)
+
+1. **NAT type detection over UDP.** `nat_detect_type` calls
+   `nat_query_stun` twice. The R32A dispatch flows through
+   `nat_query_stun_with_state` only when `state != 0`; the
+   stateless `nat_query_stun(addr)` still uses TCP. A R32A.2
+   could thread a state through `nat_detect_type` so the
+   detection path also uses UDP under the env flag.
+2. **Retransmit / RTO.** RFC 8489 7.2.1 prescribes
+   exponential-backoff retransmission (initial RTO 500ms, doubled
+   up to 7 attempts). R32A uses a single `sys_recvfrom` timeout
+   call; retransmits are deferred to R32A.2. Loss-free networks
+   (corporate LAN, sandbox) won't notice; cellular / Wi-Fi can.
+3. **Real-internet end-to-end interop.** The codec is RFC 8489
+   compliant and `198.51.100.250:43210` round-trips in the
+   sandbox, but interop with public STUN servers (stun.l.google.com
+   etc) requires either CI that allows outbound UDP/3478 or a
+   dedicated soak test. Sandbox CI cannot exercise that.
+4. **`nat_query_stun` (stateless) does not dispatch.** Because
+   the codec needs a `stun_state_t` to hang txn id / credentials
+   off of, the stateless `nat_query_stun(addr)` form still uses
+   the TCP path. Callers wanting UDP must pass a state.
+
+### Concurrency
+
+R32A modifies ONLY `src/federation/nat_traversal.nova`,
+`tests/unit/test_nat_traversal.nova`,
+`tests/integration/scenario_oooo_nat_traversal.sh`, and the three
+docs (FEDERATED\_AUDIT, NEXT\_SESSION, README). R32A does NOT
+touch `stun_rfc8489.nova`, `ice.nova`, `dtls12.nova`, or any
+other federation module. Parallel agents finishing R32B / R32C /
+R32D / R32E / R32F cannot collide.
+
+Stash discipline: R32A's preflight stash used explicit owned-path
+arguments (`git stash push -m "R32A-preflight" -- <path...>`),
+never `-u`. The R30A / R31C disasters that swept sibling-agent
+untracked files were avoided.
+
+### Files touched (R32A)
+
+* MOD: `src/federation/nat_traversal.nova` (+225 lines: 3 new
+  state slots + accessors, 5 new public helpers including
+  `nat_udp_query_rfc8489_with_state` and the split
+  `nat_udp_open` / `nat_udp_send_binding_request_at` /
+  `nat_udp_recv_binding_response`, top-level
+  `nat_query_stun_with_state` dispatch refactor preserving the
+  TCP path verbatim under `_nat_query_stun_tcp`. The 53 R23E +
+  R31C public API surface is unchanged).
+* MOD: `tests/unit/test_nat_traversal.nova` (+14 test functions,
+  +61 assertions). R23E's 33 + R31C's 17 test functions stay in
+  place untouched.
+* MOD: `tests/integration/scenario_oooo_nat_traversal.sh`
+  (+2 sub-sections, +17 shell assertions, +2 generated NOVA
+  driver scripts).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md`, `README.md`.
+
 ## R31C extension: nat_traversal RFC 8489 wire migration (R30C.2 / R23E.2)
 
 R23E (`src/federation/nat_traversal.nova`) shipped an ad-hoc

@@ -3,6 +3,76 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R32A -- nat\_traversal RFC 8489 UDP dispatch (R31C.2 / R28C consumer)
+
+**Status: complete** -- closes R31C's deferred R31C.2 by wiring
+`CE_NAT_USE_RFC8489=1` to actually dispatch RFC 8489 Binding
+Requests over UDP through R28C's `sys_socket_udp`, `sys_sendto`,
+`sys_recvfrom` builtins. R31C had migrated the codec but kept
+`nat_query_stun_with_state` on the TCP-text wire because UDP was
+believed unavailable; R28C had in fact shipped the UDP syscalls
+across 6 codegen backends, so the wire-up was already unblocked.
+
+### What R32A delivers
+
+* Top-level `nat_query_stun_with_state(state, addr)` now
+  dispatches to a new `_nat_query_stun_rfc8489_udp` helper when
+  `nat_use_rfc8489_enabled()` returns 1 AND `state != 0`.
+  Otherwise the original R23E TCP path runs verbatim (the body
+  lifted into a `_nat_query_stun_tcp` private helper -- same
+  bytes, same return value, same counter updates).
+* `_nat_query_stun_rfc8489_udp` opens a UDP socket
+  (`nat_udp_open` -> `sys_socket_udp` + `sys_setsockopt_so_reuseaddr`),
+  sends the Binding Request via `nat_udp_send_binding_request_at`,
+  waits for the response with `nat_udp_recv_binding_response`,
+  parses through the R30C codec, reflects XOR-MAPPED-ADDRESS into
+  `NAT_S_MY_EXTERNAL`, and closes the fd.
+* Three new stat slots `NAT_S_UDP_SENT` / `NAT_S_UDP_RECVD` /
+  `NAT_S_UDP_TIMEOUTS` with R31C-shape accessors
+  `nat_udp_sent_count`, `nat_udp_recvd_count`,
+  `nat_udp_timeout_count`.
+* `nat_rfc8489_timeout_ms_from_env()` reads
+  `CE_NAT_RFC8489_TIMEOUT_MS`; default = 1000ms; non-numeric or
+  non-positive values fall back to the default.
+* +61 unit assertions in `tests/unit/test_nat_traversal.nova`
+  across 14 new test functions (`test_r32a_*`). Includes:
+  stats accessors zero-state + fresh-state, env default
+  timeout, `nat_udp_open` shape, TCP-path-preserved-when-flag-off,
+  UDP loopback round-trip (real `sys_sendto` + `sys_recvfrom`
+  in one process), timeout path (counter bumps + `NAT_S_MY_EXTERNAL`
+  preservation), and validation of bad-fd / bad-ip / bad-port
+  in the lower-level helpers.
+* +17 shell assertions in
+  `tests/integration/scenario_oooo_nat_traversal.sh` across two
+  new sub-sections: `UDP_RT` (full single-process round-trip
+  with milestone log lines) and `UDP_FLAG` (spawn a child NOVA
+  program with `CE_NAT_USE_RFC8489=1 CE_NAT_RFC8489_TIMEOUT_MS=200`
+  and verify the env-flag dispatch routes through UDP, not TCP).
+
+### How to run
+
+```
+cd /home/user/Crossengin-demo
+/home/user/NOVA/nova run tests/unit/test_nat_traversal.nova
+# Expected: nat_traversal: OK (162 checks)
+
+bash tests/integration/scenario_oooo_nat_traversal.sh
+# Expected: 17 UDP_RT / UDP_FLAG PASS lines appended to the
+# existing scenario_oooo output. Pre-existing failures in the
+# legacy TCP path (sandbox timing artifacts; reproducible on
+# the unmodified parent commit) are unchanged.
+```
+
+### Honest caveats (R32A.2 follow-up list)
+
+1. `nat_query_stun(addr)` (stateless form) still uses TCP because
+   the codec needs a `stun_state_t` for txn-id / credential
+   storage. Stateful callers reach UDP.
+2. RFC 8489 7.2.1 retransmission with exponential backoff is
+   not implemented; R32A uses a single recvfrom with timeout.
+3. NAT-type detection (`nat_detect_type`) goes through the
+   stateless query and so still uses TCP.
+
 ## R31A -- non-blocking connect + sys\_poll(POLLOUT) for DRFETCH phase-1 parallelism (R30A.2)
 
 **Status: complete** -- extends `src/federation/distributed_rules.nova`

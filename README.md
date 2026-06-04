@@ -13,6 +13,52 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R32A closes R31C's deferred R31C.2 by wiring
+> `src/federation/nat_traversal.nova`'s RFC 8489 path to actual UDP
+> sockets via R28C's `sys_socket_udp` / `sys_sendto` /
+> `sys_recvfrom` builtins. R31C had migrated the codec but kept
+> `nat_query_stun_with_state` on the TCP-text wire because UDP was
+> believed unavailable at write time; R28C had in fact already
+> shipped the UDP syscalls across 6 codegen backends. When
+> `CE_NAT_USE_RFC8489=1` is set in the env, `nat_query_stun_with_state`
+> now opens a UDP socket, dispatches the RFC 8489 Binding Request
+> through R30C's codec, waits up to `CE_NAT_RFC8489_TIMEOUT_MS`
+> (default 1000ms) for a Binding Success Response on `sys_recvfrom`,
+> parses the XOR-MAPPED-ADDRESS into `NAT_S_MY_EXTERNAL`, and closes
+> the fd. When the env flag is unset / 0, the legacy R23E TCP text
+> path runs **bit-identical** -- the original body lifted into a
+> private `_nat_query_stun_tcp` helper, no byte changes. Three new
+> state slots `NAT_S_UDP_SENT`, `NAT_S_UDP_RECVD`,
+> `NAT_S_UDP_TIMEOUTS` track the UDP-layer activity with R31C-shape
+> accessors `nat_udp_sent_count`, `nat_udp_recvd_count`,
+> `nat_udp_timeout_count`. NEW split helpers `nat_udp_open`,
+> `nat_udp_send_binding_request_at`, `nat_udp_recv_binding_response`,
+> `nat_udp_query_rfc8489_with_state` expose the layers so tests can
+> drive both sides of a loopback round-trip in one process.
+> Verification: **+61 unit assertions** in
+> `tests/unit/test_nat_traversal.nova` across 14 new
+> `test_r32a_*` functions (R23E's 33 + R31C's 17 test functions
+> stay byte-identical; pre-R32A 101 -> R32A 162). The loopback
+> round-trip test binds a real UDP responder socket, sends a real
+> Binding Request, receives + parses a real Binding Success Response,
+> and verifies XOR-MAPPED-ADDRESS round-trips through to
+> `NAT_S_MY_EXTERNAL`. The timeout test verifies `sys_recvfrom`
+> returning -1 bumps `NAT_S_UDP_TIMEOUTS` and does NOT corrupt the
+> existing external addr. **+17 integration assertions** in
+> `tests/integration/scenario_oooo_nat_traversal.sh` across two
+> sub-scenarios: `UDP_RT` runs the full loopback round-trip in a
+> child NOVA process; `UDP_FLAG` spawns a child with
+> `CE_NAT_USE_RFC8489=1` against a closed UDP port and verifies
+> the dispatch actually walks the UDP path
+> (`NAT_S_UDP_SENT=1, NAT_S_UDP_TIMEOUTS=1, last_error=udp-timeout`)
+> rather than the legacy TCP path (which would have produced
+> `dial-failed`). R32A modifies ONLY
+> `src/federation/nat_traversal.nova`,
+> `tests/unit/test_nat_traversal.nova`, the scenario script, and
+> the three docs. It does NOT touch `stun_rfc8489.nova`,
+> `ice.nova`, `dtls12.nova`, or any other federation module.
+> Module count delta: 0.
+>
 > R31C migrates `src/federation/nat_traversal.nova` (R23E) to route
 > the wire half through R30C's `src/federation/stun_rfc8489.nova`,
 > while preserving every R23E public API function byte-identical.
