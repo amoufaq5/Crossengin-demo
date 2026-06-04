@@ -13,6 +13,111 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R31C migrates `src/federation/nat_traversal.nova` (R23E) to route
+> the wire half through R30C's `src/federation/stun_rfc8489.nova`,
+> while preserving every R23E public API function byte-identical.
+> R23E shipped an ad-hoc STUN-LIKE TCP text wire (`STUN_REQUEST\n` /
+> `EXTERNAL <ip>:<port>\n`) -- great for soul-to-soul federation,
+> NOT RFC 8489 compliant (no 20-byte header, magic cookie, txn id,
+> TLV attributes, XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY,
+> FINGERPRINT). R30C shipped the real RFC 8489 codec. R31C migrates:
+> NEW public helpers `nat_send_binding_request`,
+> `nat_recv_binding_response`, `nat_emit_rfc8489_binding_request`,
+> `nat_parse_rfc8489_binding_response`,
+> `nat_format_rfc8489_success_response_ipv4` ALL route through
+> `stun_rfc8489` exclusively -- this module owns NO RFC 8489 byte
+> arithmetic. NEW state slots `NAT_S_STUN_STATE` (lazy),
+> `NAT_S_RFC_REQUESTS`, `NAT_S_RFC_OK`, `NAT_S_RFC_BAD`.
+> `nat_recv_binding_response` writes the decoded XOR-MAPPED-ADDRESS
+> back into the existing `NAT_S_MY_EXTERNAL` slot so the R23E
+> status line stays the source of truth. Legacy STUN-LIKE TCP text
+> wire stays **default-on** (the scenario\_oooo manual STUN /
+> GOSSIP\_HELLO multiplexer dispatches on the first newline-
+> terminated text line; binary RFC 8489 would break that dispatcher
+> -- separate concern). Env flag `CE_NAT_USE_RFC8489=1`
+> + `nat_use_rfc8489_enabled()` are wired; R31C.2 wires actual UDP
+> dispatch once NOVA exposes `sendto/recvfrom`. Explicit legacy-
+> compat shims `nat_legacy_emit_stunlike_request`,
+> `nat_legacy_parse_stunlike_response`,
+> `nat_legacy_format_stunlike_response` are named for callers that
+> hardcoded the old wire. Verification: **48 new R31C unit
+> assertions** in `tests/unit/test_nat_traversal.nova` (extends the
+> file additively; R23E's 53 asserts pass byte-identical, total
+> 101). Coverage: emitted Binding Request parses as RFC 8489 with
+> right type / cookie / FINGERPRINT (`stun_msg_parse`,
+> `stun_verify_fingerprint`); MESSAGE-INTEGRITY round-trip across
+> right + wrong passwords; high-level send/recv round-trip writes
+> 203.0.113.99:54321 back into `NAT_S_MY_EXTERNAL`; bad-packet path
+> bumps `NAT_S_RFC_BAD` without clobbering the external slot; the
+> three legacy-compat shims emit / parse the original text wire
+> byte-for-byte; the env flag defaults to off. **+6 integration
+> assertions** in `tests/integration/scenario_oooo_nat_traversal.sh`
+> -- soul B drives an in-process RFC 8489 emit + parse cycle
+> alongside the legacy TCP text query so the integration test
+> witnesses both wires. R31C does NOT modify `stun_rfc8489.nova`,
+> `ice.nova`, `gossip*.nova`, or any other federation module.
+> Module count delta: 0.
+>
+> R31B wires R30B's P-256 ECDH + AES-128-GCM AEAD primitives into
+> R29B's DTLS 1.2 record-layer + handshake skeleton -- the three
+> cryptographic `_R29B2_STUB`-tagged slots in
+> `src/federation/dtls12.nova` now have real implementations.
+> Replaced: `dtls_ecdhe_derive_R29B2_STUB` -> `dtls_ecdhe_derive`
+> (generates a P-256 keypair via `p256_keygen`, derives the
+> shared secret via `p256_derive(priv, peer_pub_compressed)`,
+> runs the TLS 1.2 PRF over `(pms, "master secret", C_rand ||
+> S_rand)` for the 48-byte master_secret, runs PRF again over
+> `(master_secret, "key expansion", S_rand || C_rand)` for the
+> 40-byte key_block, slices into `client_write_key(16) ||
+> server_write_key(16) || client_write_IV(4) ||
+> server_write_IV(4)` per RFC 5246 §6.3 + RFC 5288 §3 (MAC keys
+> are 0 bytes for the AEAD suite)). Replaced:
+> `dtls_seal_record_R29B2_STUB` -> `dtls_seal_record` (builds the
+> 12-byte nonce as `implicit_IV(4) || explicit_IV(8 = seq_num
+> big-endian)`, builds the 13-byte AAD per RFC 5246 §6.2.3.3 as
+> `seq_num(8) || type(1) || version(2) || length(2 PLAINTEXT
+> length)`, calls `gcm_seal`, wraps in record header || explicit_IV
+> || ciphertext || tag(16)). Replaced:
+> `dtls_open_record_R29B2_STUB` -> `dtls_open_record` (parses
+> header + explicit_IV, reconstructs nonce + AAD, calls `gcm_open`,
+> increments `recv_seq` ONLY on tag-validated success). The legacy
+> `_R29B2_STUB` functions remain in the file as regression guards
+> (the R29B unit test `test_stubs_return_DTLS_ERR_STUB` still
+> pins them against DTLS_ERR_STUB). New `dtls_state` slots:
+> `IS_SERVER` (drives which key/IV pair seal vs open uses),
+> `CIPHER_ACTIVE` (set 0->1 once derive finishes), `PRIV_BN`,
+> `LOCAL_PUB`, `PEER_PUB`, `CLIENT_RANDOM`, `SERVER_RANDOM`,
+> `MASTER_SECRET`, `KEY_BLOCK`, the four sliced sub-buffers,
+> per-direction `SEND_SEQ` / `RECV_SEQ`, `TAMPER_CT` / `TAMPER_TAG`
+> / `TAMPER_AAD` rejection counters, and `AEAD_RECORDS_OUT` /
+> `AEAD_RECORDS_IN`. New error tag `DTLS_DECRYPT_FAIL` (returned
+> by `dtls_open_record` on any failure mode -- intentionally
+> indistinct per RFC 5246 §7.2.2 to avoid leaking oracle bits).
+> Verification: **84 new R31B unit assertions** in
+> `tests/unit/test_dtls12.nova` (total now 231); R29B's 147
+> assertions pass byte-identical. End-to-end ECDHE round-trip
+> verified (Alice + Bob derive matching master_secret + key_block
+> + sliced keys + IVs byte-identically). AEAD round-trip
+> verified on 16B / 64B / 1024B payloads. Cross-side AEAD
+> verified (Alice seals -> Bob opens, Bob seals -> Alice opens).
+> Tamper detection covered for all three paths (ciphertext byte
+> flip, tag byte flip, seq_num bump that corrupts AAD); each
+> tamper counter bumps independently. Stubs still tagged:
+> `dtls_cert_verify_R29B2_STUB` (R31B does not land X.509 parsing
+> + ECDSA verify -- MITM is trivial without that),
+> `dtls_extract_srtp_keys_R29B2_STUB` (R28E.2 follow-up: RFC 5705
+> EKM for SRTP-DTLS interop). Honest design caveats: (a) no
+> anti-replay sliding window yet -- `RECV_SEQ` only advances
+> monotonically (R31B.2); (b) no constant-time scalar
+> multiplication (inherits R30B.3 hardening item from p256.nova);
+> (c) no handshake state-machine integration -- `dtls_ecdhe_derive`
+> does not advance DTLS_S_* states (the wire driver does that in
+> R31B.2); (d) `dtls_ecdhe_keygen_seeded` is test-only (production
+> callers must use `dtls_ecdhe_keygen` which pulls from
+> `secure_random`). dtls12.nova is no longer a TRUE leaf: it now
+> imports `src/safety/p256.nova` + `src/safety/aes_gcm.nova`.
+> Module count delta: 0.
+>
 > R30B lands the leaf cryptography primitives R29B.2 needs to
 > de-stub the DTLS record-layer + handshake skeleton: a NIST P-256
 > ECDH module (`src/safety/p256.nova`) and an AES-128-GCM AEAD
@@ -623,6 +728,31 @@ computational units rather than orchestrating a pipeline of modules.
 > available via `pitch_run_auto_command` (not yet wired into the chat
 > dispatch table; reserved for an optional +1 admin line).
 >
+> R25B.5 closes R30F's deferred kind-pivot routing gap. A new
+> classifier output `VC_FOLLOWUP_KIND_PIVOT` (alongside CONTINUE /
+> PIVOT / ANAPHORA / NONE) fires when the more-cue path's remainder
+> NAMES a known R15D kind (case-insensitive after `_vd_stem`
+> morphology) different from the prior turn's kind. The explicit
+> "what about KIND" / "how about KIND" path also routes through
+> KIND_PIVOT when the named kind differs from the prior. The
+> handler in `vc_session_turn` dispatches the prior template
+> (LIST_ALL by default) against the new kind via the existing
+> `_vd_pivot_turn`, RESETTING the LIMIT to the baseline 10 (no
+> escalation -- this is a kind shift, not a "more rows" request).
+> New public probe `voice_followup_kind_pivot_target(session,
+> query) -> string` returns the target kind name on KIND_PIVOT
+> inputs ("" otherwise). THE R29C/R30F-documented headline case
+> ("tell me more about that atom in the rule engine" after
+> `list all FACT`) is now correctly classified as KIND_PIVOT and
+> dispatched as LIST_ALL on RULE. Honest design caveat: multi-kind
+> ambiguous remainders ("more facts and rules" after CONCEPT)
+> return the FIRST match in tokeniser order; the multi-turn
+> do-over loop is the safety net. Verification: +20 assertions
+> (test_voice_dialog now 167 total), 141 of the 147 prior
+> assertions pass byte-identical, 6 PIVOT->KIND_PIVOT relabels
+> (all on inputs R25B.5 explicitly captures as kind-pivots; no
+> dispatch/end-state assertion was changed).
+>
 > R25B.4 closes R25B.3's two documented failure modes: (a) kind-weighted
 > Jaccard `(2*|kind_matches| + |other_matches|) / (2*|kind_terms| +
 > |other_terms|)` lifts borderline kind-naming remainders to CONTINUE
@@ -636,10 +766,10 @@ computational units rather than orchestrating a pipeline of modules.
 > now)`. R25B.3 behaviour is byte-identical when the uniform Jaccard
 > already says CONTINUE; the new weighted pass only fires on
 > borderline misses. HONEST: the R29C-documented "tell me more about
-> that atom in the rule engine" after `list all FACT` is STILL
-> PIVOT under R25B.4 because the remainder names a different known
-> kind (rule); a kind-pivot routing pass through `_vd_known_kind`
-> would close that residual case and is deferred to R25B.5.
+> that atom in the rule engine" after `list all FACT` was STILL
+> PIVOT under R25B.4 because the remainder named a different known
+> kind (rule); the kind-pivot routing pass through `_vd_known_kind`
+> closing that residual case is now R25B.5 (see above).
 > Verification: +48 assertions (test_voice_dialog now 147 total),
 > all 99 R25B.3 assertions still byte-identical, brief's 5+ new
 > classifier fixtures correctly classified.

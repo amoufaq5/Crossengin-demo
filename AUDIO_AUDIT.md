@@ -3208,6 +3208,188 @@ R8B / R15D / R21C / R25B / R25B.2 / R25B.3 modules and tests
 are untouched -- R25B.4 is purely additive on top of R25B.3's
 dialog layer.
 
+## R25B.5 -- Voice dialog kind-pivot routing (R31F / R30F.2)
+
+Closes the **R30F-documented PIVOT misclassification** for
+remainders that name a known second kind. R30F's exit report
+explicitly named the deferred fix: "consult `_vd_known_kind`
+against remainder tokens from the more-cue path and route as a
+kind-pivot when the remainder names a known kind != prior." R31F
+lands that fix as a new classifier output `VC_FOLLOWUP_KIND_PIVOT`
+distinct from `VC_FOLLOWUP_PIVOT`, plus a handler in
+`vc_session_turn` that treats the kind-pivot like a fresh
+template-preserving query against the new kind (LIMIT reset to
+baseline -- NOT escalated).
+
+### What R25B.5 changes inside `voice_dialog.nova`
+
+* **New classifier constant + accessor**:
+  `VC_FOLLOWUP_KIND_PIVOT = 4`; `vc_followup_kind_pivot()` accessor
+  matches the shape of the other four enum probes.
+* **New helper `_vd_remainder_known_kind(now, exclude_kind_upper)`**:
+  iterates the stemmed remainder content set; on each token, upcases
+  and consults `_vd_known_kind`. The FIRST match that DIFFERS from
+  the prior kind is returned (case-insensitive after morphology +
+  upcase). Returns "" when no remainder token names a known kind
+  OR every match equals the prior kind. The "first match wins" rule
+  is documented honestly: a remainder like "more facts and rules"
+  after CONCEPT has two candidates; we pick "facts" (FACT) because
+  it appears first in tokeniser order.
+* **New public probe `voice_followup_kind_pivot_target(session,
+  query)`**: returns the target kind name on KIND_PIVOT inputs, ""
+  otherwise. The handler uses this to look up the target kind for
+  dispatch without re-running tokenisation.
+* **`voice_followup_classify` extension**: in the more-cue path,
+  after uniform Jaccard misses AND weighted Jaccard misses, scans
+  the remainder for a known second kind via
+  `_vd_remainder_known_kind`. On hit -> KIND_PIVOT. On miss -> PIVOT
+  (R30F honest fallback). The explicit "what/how about KIND" path
+  also now returns KIND_PIVOT when the named kind differs from the
+  prior kind; returns CONTINUE when the named kind EQUALS the prior
+  (the operator is restating the same topic).
+* **`vc_session_turn` dispatcher extension**: handles
+  `VC_FOLLOWUP_KIND_PIVOT` between the ANAPHORA case and the PIVOT
+  case. Calls `voice_followup_kind_pivot_target` to look up the
+  target, then dispatches `_vd_pivot_turn(kg, session, raw,
+  last_tpl_or_LIST_ALL, target_kind)`. That helper already resets
+  LIMIT to baseline and records the turn in history without
+  resetting the session (preserves the prior FACT/RULE/... turn
+  for context).
+
+### Verification
+
+* **20 new unit assertions across 15 new test functions** in
+  `tests/unit/test_voice_dialog.nova` (R30F's 48 + R29C's 99 +
+  R25B.5's 20 = 167 total before regression updates; see below
+  for the 6 R29C/R30F assertions whose expected value was
+  RELABELED to KIND_PIVOT -- those still pass, just with the
+  updated label). Coverage:
+    - Classifier KIND_PIVOT: "list all FACT" + "tell me more about
+      RULE atoms" (literal kind match); same prior + "tell me more
+      about that atom in the rule engine" (the R29C-documented
+      failure case; morphology-routed match via `_vd_stem`); "list
+      all RULE" + "tell me more about facts" (symmetric morphology
+      win in the other direction); "list all FACT" + "and CONCEPT"
+      (more-cue + "and" path); "list all CONCEPT" + "more facts
+      and rules" (multi-kind ambiguous remainder; honest "first
+      kind wins" lookup).
+    - Negative cases that STAY PIVOT: "tell me more about cats"
+      (no known kind), "and dogs" (no known kind).
+    - Stay CONTINUE: bare "tell me more" (no remainder), "tell me
+      more about facts" after FACT (same-kind match -- weighted
+      Jaccard fires before KIND_PIVOT scan), "tell me more about
+      it" (empty content after stopword strip).
+    - Anaphora paths unchanged: "describe it" / "the first one" /
+      "describe the first one" still ANAPHORA.
+    - Public probe `voice_followup_kind_pivot_target`: returns ""
+      when no prior, on CONTINUE inputs, on anaphora inputs, on
+      generic PIVOT inputs; returns the matched UPPER-CASE kind
+      name on KIND_PIVOT inputs.
+    - Dispatch: KIND_PIVOT re-runs prior template against new kind,
+      LIMIT resets to baseline 10 (NOT escalated -- even after an
+      intervening "tell me more" escalation), history captures the
+      pivot turn WITHOUT a session reset.
+    - End-state byte-identity: "list all FACT" + "what about
+      CONCEPT" still emits "Found 2 CONCEPT atoms: ids 3, 4."
+      with kind=CONCEPT, template=LIST_ALL, limit=10.
+    - Morphology-routed dispatch: "list all FACT" + "tell me more
+      about that atom in the rule engine" dispatches LIST_ALL on
+      RULE; the response is "No RULE atoms found." (the fixture
+      KG has 0 RULE atoms) -- proving the deferred R25B.5 case
+      from R30F is now closed.
+
+* **R30F / R29C parity: 141 of the 147 prior assertions still
+  pass byte-identical**. 6 prior assertions had their expected
+  value RELABELED from `vc_followup_pivot()` to
+  `vc_followup_kind_pivot()` -- the underlying inputs are exactly
+  cases R25B.5 explicitly captures as kind-pivots (different
+  known kind in remainder). Rationale for each relabel:
+
+  | # | Test                                                            | Input                                                          | Prior expected | New expected | Rationale                                                                                                    |
+  |---|-----------------------------------------------------------------|----------------------------------------------------------------|----------------|--------------|--------------------------------------------------------------------------------------------------------------|
+  | 1 | `test_classify_what_about_kind_is_pivot`                        | `'what about RULE atoms'` after FACT                           | PIVOT          | KIND_PIVOT   | Explicit "what about KIND" with known kind != prior; semantically a kind shift.                              |
+  | 2 | `test_classify_what_about_kind_is_pivot`                        | `'what about CONCEPT'` after FACT                              | PIVOT          | KIND_PIVOT   | Same path; explicit known second kind.                                                                       |
+  | 3 | `test_classify_what_about_kind_is_pivot`                        | `'how about SKILL'` after FACT                                 | PIVOT          | KIND_PIVOT   | "how about" mirror of "what about"; same routing.                                                            |
+  | 4 | `test_three_turn_pivot_what_about_kind`                         | `'what about RULE atoms'` after FACT                           | PIVOT          | KIND_PIVOT   | End-state response + kind + template unchanged; only the classifier label moves.                             |
+  | 5 | `test_classify_r29c_failure_case_after_fact_is_pivot`           | `'tell me more about that atom in the rule engine'` after FACT | PIVOT          | KIND_PIVOT   | The R30F-deferred case; R25B.5 closes it. Remainder names "rule" via morphology -> RULE != FACT.             |
+  | 6 | `test_classify_what_about_rule_atoms_after_fact_is_pivot`       | `'what about RULE atoms'` after FACT                           | PIVOT          | KIND_PIVOT   | Duplicate-coverage assertion from R30F's section; relabels for consistency.                                  |
+
+  All other assertions (including all dispatch assertions on
+  end-state response text + kind + template + LIMIT) pass
+  byte-identical because the KIND_PIVOT handler dispatches the
+  SAME `_vd_pivot_turn` helper that PIVOT used for the
+  "what about KIND" path.
+
+### Honest design caveat -- multi-kind ambiguous remainder
+
+The brief explicitly invited an honest answer on multi-kind
+remainders ("tell me more about RULE and FACT"). R25B.5's
+`_vd_remainder_known_kind` returns the FIRST matching token in
+tokeniser order: "RULE and FACT" -> RULE wins. The honest
+alternatives we considered + rejected:
+
+  (a) **Bail with an apology** ("which one did you mean?"). The
+      multi-turn loop already gives the operator a do-over and
+      this would punish the common case where the operator
+      genuinely IS shifting to RULE and "and FACT" is incidental
+      ("more RULE atoms and FACT examples too" probably wants
+      RULE first).
+  (b) **Run both as separate KIND_PIVOTs**. Would require an
+      extended return shape (list of kinds + a multi-dispatch
+      handler); the current single-kind return shape is the
+      load-bearing simplicity.
+  (c) **Confidence threshold** (require at least 2 mentions of
+      the same kind to fire KIND_PIVOT). Would silently drop
+      single-mention KIND_PIVOTs which are the headline case.
+
+We chose (the implemented) "first kind wins" because it's
+deterministic, never silently drops user intent, and the
+multi-turn do-over loop covers the rare miss. Documented as
+honest scope in `voice_dialog.nova`.
+
+### Honest scope (R25B.6+)
+
+* **Same-kind multi-mention disambiguation.** "tell me more about
+  RULE and RULE atoms" -- `_vd_remainder_known_kind` happily
+  returns RULE (idempotent on duplicate matches); good.
+* **Kind synonyms.** "more axioms" doesn't match the FACT kind
+  even though axioms are facts in domain ontology. A synonym
+  table would close this.
+* **Compound noun NER.** "rule engine" tokenises to "rule" +
+  "engine" independently; R25B.5 catches the "rule" token, but a
+  phrasal recogniser would let "rule engine" count as a single
+  domain-named token (and could route to a future KIND_PIVOT with
+  kind=ENGINE if we added an ENGINE kind).
+* **Multi-turn kind-pivot diff.** A 5-turn conversation that
+  bounces FACT -> RULE -> FACT -> RULE -> FACT exercises only
+  pairwise diff (prior vs current); no history-aware "you've
+  been on RULE for the last three turns, this might be a
+  CONTINUE not a pivot" heuristic.
+* **Same-as-prior kind probe.** When the operator says "what
+  about FACT" after FACT, we route as CONTINUE (refresh of the
+  same topic). A subtle alternative would be "no-op" / "you're
+  already on FACT" -- but the LIST_ALL re-execution is
+  side-effect-free and the current label is simpler.
+
+### Files touched (R25B.5)
+
+* MOD: `examples/voice_dialog.nova` -- additive (~90 lines:
+  `VC_FOLLOWUP_KIND_PIVOT` constant + accessor;
+  `_vd_remainder_known_kind` helper; `voice_followup_kind_pivot_target`
+  public probe; classifier extension; dispatcher branch).
+  R28D / R29C / R30F code blocks unchanged (only docstrings
+  amended).
+* MOD: `tests/unit/test_voice_dialog.nova` -- additive (+20
+  assertions + 15 new test functions; 6 prior assertions
+  RELABELED to expect `vc_followup_kind_pivot()` -- byte-
+  identical end-state otherwise).
+* MOD: `AUDIO_AUDIT.md` (this section), `NEXT_SESSION.md`,
+  `README.md`.
+
+R8B / R15D / R21C / R25B / R25B.2 / R25B.3 / R25B.4 / R28D
+modules and tests are untouched -- R25B.5 is purely additive
+on top of R25B.4's dialog layer.
+
 ## R26C -- Spectral-subtraction Wiener noise reduction
 
 Closes the **frequency-domain denoising** gap in CrossEngin's audio chain.

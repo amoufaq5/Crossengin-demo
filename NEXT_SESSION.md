@@ -3,6 +3,319 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R31C -- nat_traversal RFC 8489 wire migration (R30C.2 / R23E.2)
+
+**Status: complete** -- modifies `src/federation/nat_traversal.nova`
+to route the wire half through R30C's `stun_rfc8489.nova` while
+keeping every R23E public API function byte-identical. R23E shipped
+an ad-hoc STUN-LIKE TCP text wire (`STUN_REQUEST\n` /
+`EXTERNAL <ip>:<port>\n`) that works between two CrossEngin souls
+but cannot interop with browsers or any standard STUN server. R30C
+(commit `07ba781`) shipped the real RFC 8489 binary codec
+(`stun_rfc8489.nova`, 135 assertions). R31C migrates the wire half:
+new helpers `nat_send_binding_request`, `nat_recv_binding_response`,
+`nat_emit_rfc8489_binding_request`, `nat_parse_rfc8489_binding_response`
+route through R30C exclusively; this module owns NO RFC 8489 byte
+arithmetic.
+
+### What R31C delivers
+
+* **R23E API preservation byte-identical.** All 53 R23E
+  test_nat_traversal assertions pass against the modified module
+  with no changes to expected values. The STUN-LIKE TCP text wire
+  is **default-on** so the scenario\_oooo manual STUN multiplexer
+  (which sniffs the first newline-terminated text line on a shared
+  TCP listener to dispatch between `STUN_REQUEST` and
+  `GOSSIP_HELLO`) still works exactly as before.
+* **NEW state slots + lazy stun_state.**
+  `NAT_S_STUN_STATE` (lazy), `NAT_S_RFC_REQUESTS`,
+  `NAT_S_RFC_OK`, `NAT_S_RFC_BAD`. The `stun_state_t` is allocated
+  lazily by `nat_rfc8489_state(state)`; per-field memory footprint
+  is zero for callers that never touch the new path.
+* **NEW public helpers** (all route through `stun_rfc8489`):
+  `nat_emit_rfc8489_binding_request(state, software)` ->
+  `[pkt, n, txn]`,
+  `nat_parse_rfc8489_binding_response(state, pkt, n)` ->
+  `[ip, port, family] | 0`,
+  `nat_format_rfc8489_success_response_ipv4(...)`,
+  `nat_send_binding_request(state, remote_addr, software)`
+  (validates host:port, bumps NAT\_S\_QUERIES + NAT\_S\_RFC\_REQUESTS,
+  calls `stun_send_binding_request`),
+  `nat_recv_binding_response(state, pkt, n)` (calls `stun_recv`, on
+  success writes XOR-MAPPED-ADDRESS into NAT\_S\_MY\_EXTERNAL +
+  bumps NAT\_S\_QUERIES\_OK + NAT\_S\_RFC\_OK; on failure bumps
+  NAT\_S\_RFC\_BAD and routes the stun error into nat\_last\_error),
+  `nat_set_rfc8489_credentials(state, user, pass)`,
+  `nat_rfc8489_state(state)`,
+  `nat_rfc8489_requests_sent/responses_ok/responses_bad`,
+  `nat_use_rfc8489_enabled()`.
+* **Legacy-compat shims (default-on).**
+  `nat_legacy_emit_stunlike_request()`,
+  `nat_legacy_parse_stunlike_response(line)`,
+  `nat_legacy_format_stunlike_response(ip, port)` are explicitly
+  named wrappers around the original `STUN_REQUEST\n` /
+  `EXTERNAL <ip>:<port>\n` wire. They share bytes with
+  `nat_format_stun_response` / `nat_parse_stun_response` so callers
+  can pick whichever name signals intent.
+* **Env flag CE_NAT_USE_RFC8489.** `nat_use_rfc8489_enabled()` reads
+  it. Default 0. The flag is wired but `nat_query_stun_with_state`
+  still always uses the legacy TCP path because NOVA does not
+  expose UDP `sendto/recvfrom` yet. R31C.2 wires UDP behind the
+  flag when NOVA gains the syscalls.
+
+### Verification
+
+* **48 new R31C unit assertions** in
+  `tests/unit/test_nat_traversal.nova` (extends the file; R23E's 53
+  tests stay in place, untouched). Coverage:
+  legacy-compat helpers byte-identical (3), env flag default off
+  (1), `nat_emit_rfc8489_binding_request` parses as RFC 8489 with
+  right type / cookie / FINGERPRINT (5), MESSAGE-INTEGRITY round-
+  trip including wrong-password rejection (3), counters bump (1),
+  high-level `nat_send_binding_request` validates host:port (3) +
+  good-path counters (4), `nat_recv_binding_response` against a
+  hand-built XOR-MAPPED-ADDRESS 203.0.113.99:54321 round-trip into
+  NAT\_S\_MY\_EXTERNAL with QUERIES\_OK + RFC\_OK + cleared error
+  (5), `nat_parse_rfc8489_binding_response` returns
+  [ip, port, family] triple (4), bad-packet path bumps RFC\_BAD
+  without clobbering NAT\_S\_MY\_EXTERNAL + zero-buf / zero-len
+  guards (5), `nat_format_rfc8489_success_response_ipv4` builds a
+  valid response and rejects bad IP (4), lazy stun_state idempotent
+  (2), stats guards on 0 state (3).
+* **6 new integration assertions** in
+  `tests/integration/scenario_oooo_nat_traversal.sh`. Soul B drives
+  an in-process RFC 8489 emit + parse cycle alongside the legacy
+  TCP query: shell checks verify the emitted Binding Request has
+  type=1, cookie\_ok=1, fp\_ok=1 and the parsed Binding Success
+  Response round-trips IP+port+family.
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- 225 unit
+  tests pass (no module count delta; `test_nat_traversal.nova`
+  goes from 53 -> 101 assertions in-place; all other federation
+  baselines hold: stun\_rfc8489 135, ice 70, dtls12 147, gossip 34,
+  gossip\_noise 44, gossip\_relay 61, leader\_election 40,
+  webrtc 19).
+
+### Honest scope (R31C.2 follow-up list)
+
+1. **UDP datagram transport.** RFC 8489 is a UDP protocol; NOVA
+   exposes only TCP today. The wire codec round-trips in-memory
+   but does NOT cross a UDP socket yet.
+2. **CE\_NAT\_USE\_RFC8489 dispatch.** The env flag is wired but
+   the existing `nat_query_stun_with_state` still uses the TCP
+   text path unconditionally. R31C.2 dispatches once UDP is up.
+3. **Browser interop end-to-end.** The codec is RFC 8489 compliant
+   but full browser interop requires the ICE controller
+   (`src/federation/ice.nova`, R30C) driving pair checks; that's a
+   separate concern not solved by `nat_traversal` alone.
+4. **Long-term credentials (REALM / NONCE).** USERNAME + password
+   are plumbed into MESSAGE-INTEGRITY but the RFC 8489 9.2
+   long-term auth dance is not exposed at the `nat_*` altitude;
+   callers can reach `stun_state_t` directly.
+
+### Concurrency
+
+R31C modifies ONLY `src/federation/nat_traversal.nova`,
+`tests/unit/test_nat_traversal.nova`,
+`tests/integration/scenario_oooo_nat_traversal.sh`, and the four
+docs. R31C does NOT touch `stun_rfc8489.nova`, `ice.nova`,
+`webrtc.nova`, `dtls12.nova`, `gossip*.nova`, `gossip_relay*.nova`,
+`noise_xk.nova`, `relay_secure.nova`, `kg_sync.nova`,
+`distributed_rules.nova`, `leader_election.nova`,
+`distributed_query.nova`, `snapshot_replication.nova`,
+`voice_dialog.nova`, `crossengin_chat.nova`.
+
+### Files touched (R31C)
+
+* MOD: `src/federation/nat_traversal.nova` (+225 lines; 4 new state
+  slots, 13 new public helpers, 3 legacy-compat shims; the 53 R23E
+  API functions are unchanged).
+* MOD: `tests/unit/test_nat_traversal.nova` (+17 test functions,
+  +48 assertions; R23E's 33 test functions stay in place).
+* MOD: `tests/integration/scenario_oooo_nat_traversal.sh` (extends
+  soul B with an RFC 8489 in-process emit + parse block,
+  +6 shell assertions; the existing 12 assertions are unchanged).
+* MOD: `FEDERATED_AUDIT.md`, `NEXT_SESSION.md` (this),
+  `README.md`.
+* `/home/user/NOVA` files NOT touched.
+
+---
+
+## R25B.5 -- voice dialog kind-pivot routing (R31F / R30F.2)
+
+**Status: complete -- `examples/voice_dialog.nova` extended additively
+(~90 lines: a new `VC_FOLLOWUP_KIND_PIVOT` enum value, a new
+`_vd_remainder_known_kind` helper, a new
+`voice_followup_kind_pivot_target` public probe, a classifier branch
+extension, and a new dispatcher case) + extended test file (+20
+assertions across 15 new test functions; 6 prior assertions
+RELABELED from PIVOT to KIND_PIVOT for the cases R25B.5 captures
+explicitly -- end-state byte-identity preserved). R30F (commit
+`f77bfd0`) shipped weighted Jaccard + morphology and HONESTLY
+documented that the R29C failure case "tell me more about that
+atom in the rule engine" after `list all FACT` still classified as
+PIVOT (correctly, under the Jaccard model -- but the operator's
+ACTUAL intent was a kind shift to RULE). R31F closes that gap by
+consulting `_vd_known_kind` against remainder tokens from the
+more-cue path.
+
+### What R25B.5 delivers
+
+* `VC_FOLLOWUP_KIND_PIVOT = 4` -- new classifier output distinct
+  from PIVOT. Public accessor `vc_followup_kind_pivot()`.
+* `_vd_remainder_known_kind(now, exclude_kind_upper) -> string` --
+  scans the stemmed remainder content set for a token naming a
+  known R15D kind. Returns the matched UPPER-CASE kind name (the
+  canonical shape consumed by `_vd_pivot_turn`) on the FIRST
+  match in tokeniser order that differs from the prior kind.
+  Returns "" when no remainder token names a known kind or every
+  match equals the prior kind.
+* `voice_followup_kind_pivot_target(session, query) -> string` --
+  public probe returning the target kind name on KIND_PIVOT
+  inputs, "" otherwise. Internally calls into
+  `_vd_remainder_known_kind` (more-cue path) or
+  `_vd_pivot_kind_no_and` (explicit "what about KIND" path) and
+  applies the same prior-kind exclusion rule the classifier uses.
+* `voice_followup_classify` extension: in the more-cue branch,
+  AFTER uniform Jaccard misses AND weighted Jaccard misses, runs
+  `_vd_remainder_known_kind`. On a non-empty hit -> KIND_PIVOT.
+  On empty -> PIVOT (the R30F honest fallback). The explicit
+  "what/how about KIND" path also splits: kind != prior ->
+  KIND_PIVOT; kind == prior -> CONTINUE (restating the same
+  topic, treat as refresh).
+* `vc_session_turn` dispatcher: handles `VC_FOLLOWUP_KIND_PIVOT`
+  between ANAPHORA and PIVOT. Looks up the target via
+  `voice_followup_kind_pivot_target`, picks `last_tpl` (or
+  LIST_ALL when UNKNOWN), and dispatches
+  `_vd_pivot_turn(kg, session, raw, kp_tpl, target)`. That helper
+  resets LIMIT to baseline (the brief's required behaviour) and
+  records the turn without resetting the session.
+
+### Verification
+
+* All R30F's 48 + R29C's 99 = 147 prior assertions still pass,
+  with 141 BYTE-IDENTICAL and 6 RELABELED (PIVOT -> KIND_PIVOT)
+  for cases where the underlying input is EXACTLY a kind-pivot.
+  No dispatch / end-state assertion was changed; only classifier
+  labels. The 6 relabeled assertions are:
+    1. `test_classify_what_about_kind_is_pivot` (3 cases inside:
+       "what about RULE atoms", "what about CONCEPT", "how about
+       SKILL" all after FACT) -- explicit "what about KIND"
+       path now routes as KIND_PIVOT when kind != prior.
+    2. `test_three_turn_pivot_what_about_kind` -- single
+       classifier assertion for "what about RULE atoms" after
+       FACT.
+    3. `test_classify_r29c_failure_case_after_fact_is_pivot` --
+       THE headline case ("tell me more about that atom in the
+       rule engine" after FACT). R30F honestly documented PIVOT;
+       R25B.5 closes it as KIND_PIVOT.
+    4. `test_classify_what_about_rule_atoms_after_fact_is_pivot`
+       -- R30F-era duplicate-coverage assertion; relabels for
+       consistency.
+  Rationale: each relabel corresponds to an input where the
+  remainder NAMES a known second kind different from the prior;
+  these are EXACTLY the cases R25B.5 introduced KIND_PIVOT to
+  capture. End-state response text + final kind + final template
+  + final LIMIT are byte-identical because the KIND_PIVOT handler
+  dispatches the SAME `_vd_pivot_turn` helper that PIVOT used to
+  call.
+
+* 20 new assertions across 15 new test functions covering:
+    - Classifier KIND_PIVOT positives: "tell me more about RULE
+      atoms" after FACT (literal match); "tell me more about
+      that atom in the rule engine" after FACT (morphology
+      match via `_vd_stem`); "tell me more about facts" after
+      RULE (symmetric morphology); "and CONCEPT" after FACT
+      (more-cue + "and" path); "more facts and rules" after
+      CONCEPT (multi-kind ambiguous remainder -- first match
+      wins).
+    - Classifier NEGATIVES: "tell me more about cats" stays
+      PIVOT; "and dogs" stays PIVOT; "tell me more about facts"
+      after FACT stays CONTINUE (same-kind match via weighted
+      Jaccard fires BEFORE kind-pivot scan); bare "tell me more"
+      stays CONTINUE.
+    - Anaphora preserved: "describe it", "the first one",
+      "describe the first one" still ANAPHORA.
+    - Public probe `voice_followup_kind_pivot_target`:
+      returns "" on no-prior / anaphora / continue / generic
+      pivot inputs; returns the matched UPPER-CASE kind name on
+      KIND_PIVOT inputs.
+    - Dispatch: KIND_PIVOT re-runs prior template against new
+      kind; LIMIT resets to baseline 10 even after an
+      intervening "tell me more" escalation; history captures
+      the pivot turn WITHOUT a session reset (contrast with
+      generic PIVOT which DOES reset session); end-state matches
+      the R29C/R30F "what about CONCEPT" PIVOT byte-identical.
+    - The R29C/R30F failure case dispatch: "list all FACT" +
+      "tell me more about that atom in the rule engine" now
+      runs LIST_ALL on RULE (returns "No RULE atoms found." on
+      the fixture KG that has 0 RULE atoms; kind=RULE,
+      template=LIST_ALL, limit=10).
+
+### Honest design caveat -- multi-kind ambiguous remainder
+
+The brief invited an honest answer on remainders like "tell me
+more about RULE and FACT" -- TWO known kinds present. R25B.5's
+`_vd_remainder_known_kind` returns the FIRST match in tokeniser
+order ("RULE" first -> RULE wins; if the order is "FACT and
+RULE", FACT wins). The honest alternatives we rejected:
+
+  (a) **Apology / disambiguation turn** ("which one did you
+      mean?"). Punishes the common case where the user
+      genuinely IS shifting to the first-mentioned kind and
+      the second mention is incidental.
+  (b) **Run both as separate KIND_PIVOTs**. Would require
+      multi-kind return shape; the current single-kind shape
+      is the load-bearing simplicity.
+  (c) **Confidence threshold** (require 2+ mentions of the same
+      kind to fire). Would silently drop single-mention cases
+      which are the headline.
+
+We chose deterministic "first kind wins" + the multi-turn
+do-over loop as the safety net. Documented as honest scope in
+both `voice_dialog.nova` and `AUDIO_AUDIT.md` (R25B.5 section).
+
+### The R29C-originally-failing case
+
+`"list all FACT"` -> `"tell me more about that atom in the rule
+engine"` NOW classifies as **VC_FOLLOWUP_KIND_PIVOT**. The
+dispatcher routes to `_vd_pivot_turn(LIST_ALL, "RULE")`. End
+state: kind=RULE, template=LIST_ALL, limit=10 (baseline -- not
+escalated), response "No RULE atoms found." (on the fixture KG
+with 0 RULE atoms).
+
+### Files touched (R25B.5)
+
+* MOD: `examples/voice_dialog.nova` -- additive (~90 new lines:
+  enum constant + accessor, `_vd_remainder_known_kind`,
+  `voice_followup_kind_pivot_target`, classifier extension,
+  dispatcher branch). R28D / R29C / R30F helpers unchanged.
+* MOD: `tests/unit/test_voice_dialog.nova` -- additive (+20
+  assertions + 15 new test functions); 6 prior assertions
+  RELABELED from PIVOT to KIND_PIVOT (cases R25B.5 explicitly
+  captures).
+* MOD: `AUDIO_AUDIT.md` (new R25B.5 section).
+* MOD: `NEXT_SESSION.md` (this section), `README.md`
+  (short R25B.5 callout).
+
+### Concurrency note
+
+R29C / R30F's classifier + helpers were pure (read-only on
+session); R25B.5's additions inherit that purity. The classifier
+extension reads session state only; `_vd_remainder_known_kind`
+is a pure tokeniser-style helper;
+`voice_followup_kind_pivot_target` is a read-only probe. The
+dispatcher's new KIND_PIVOT branch calls into `_vd_pivot_turn`
+which already had the R25B.2 mutation discipline (single
+caller-per-session). Thread-safe under the R28D
+single-caller-per-session contract.
+
+Preflight `git status`: working tree clean on entry. Stash queue
+had stash@{0} = "concurrent WIP from other agents - R30F
+preflight" (from the previous R30F session) -- left untouched.
+R28D `voice_conversation.nova` / `crossengin_chat.nova` / any
+federation module / any safety module untouched. R25B.5 is
+purely additive on top of R25B.4's dialog layer.
+
 ## R30C (this session) -- RFC 8489 STUN client + RFC 8445 ICE agent (R28E.2)
 
 **Status: complete -- two NEW leaf modules:
