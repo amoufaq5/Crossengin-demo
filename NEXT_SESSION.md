@@ -3,6 +3,61 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R31A -- non-blocking connect + sys\_poll(POLLOUT) for DRFETCH phase-1 parallelism (R30A.2)
+
+**Status: complete** -- extends `src/federation/distributed_rules.nova`
+to parallelise the dial portion of R30A's pipelined DRFETCH path
+when `CE_DRFETCH_PIPELINE=1`. R30A's exit caveat called out that
+`sys_poll` only parallelised the response WAIT, not the connection
+ESTABLISHMENT; R31A flips connect(2) to non-blocking via two new
+NOVA builtins (`sys_fcntl_setfl_nonblock` + `sys_getsockopt_so_error`,
+shipped in the NOVA-side commit this CrossEngin commit depends on),
+opens all peer sockets at once, kicks N parallel connects, and
+waits for POLLOUT via a single `sys_poll` call before the per-peer
+HELLO/OK + DRFETCH-header send.
+
+### What R31A delivers
+
+* `_dr_connect_async(peer_addr) -> fd_or_neg` non-blocking connect
+  wrapper. Returns the fd in EINPROGRESS state on success, or a
+  negative diagnostic code (-1 for hard local failure, -2 for
+  synchronous kernel reject).
+* `_dr_clear_nonblock(fd)` inline-asm helper that restores blocking
+  I/O for the application-protocol exchange (HELLO/OK / DRFETCH
+  header / DREND drain).
+* `_dr_pipeline_phase1_dispatch` refactored into 1a (parallel dial
+  + POLLOUT wait + SO\_ERROR check) and 1b (serial HELLO/OK +
+  DRFETCH header on the post-dial fleet).
+* Four new stat slots & accessors: `dr_stats_connect_dispatched`,
+  `dr_stats_connect_ready`, `dr_stats_connect_timeouts`,
+  `dr_stats_connect_so_error`. Stats line emits the `conn_*`
+  tokens only when the pipeline path is active.
+* +23 unit assertions in `tests/unit/test_dr_async_fetch.nova`
+  covering counter init, wrapper happy-path, SO\_ERROR readback,
+  unparseable-addr rejection, partial-counter distribution, and
+  CE\_DRFETCH\_PIPELINE=0 bit-identical-to-R30A guarantee.
+* PHASE1\_PARALLEL sub-scenario added to
+  `tests/integration/scenario_yyyy_rule_convergence.sh` with
+  honest round-count delta reporting vs R30A's pipelined-only path.
+
+### Honest expectations
+
+The brief explicitly invited an honest "5-soul STABLE shows no
+improvement" outcome: at 5 peers on loopback the dial-RTT is
+~10us so the parallel-dial win is invisible relative to HELLO/OK
++ ACK\_RTT. The R31A win materialises above ~50 peers on lossy
+WAN. The round-count delta is reported truthfully either way.
+
+### Caveats / future work
+
+`_dr_clear_nonblock` is Linux-x86-64-only (hardcodes syscall 72,
+same precedent as gossip.nova's `_gossip_fcntl`); multi-arch
+coverage is R31A.2. HELLO/OK is still serial in phase 1b; a
+second `sys_poll(POLLIN)` wait for the OK frames would close
+that gap if profiling shows it as the new long pole. Single-
+attempt dial (no retry like `_gossip_dial`'s 3x retry loop) —
+mid-startup-race peers fall to the next gossip round naturally.
+
 ## R31B -- wire P-256 ECDHE + AES-128-GCM AEAD into DTLS records (R29B.2 / R30B.2)
 
 **Status: complete** -- modifies `src/federation/dtls12.nova` to

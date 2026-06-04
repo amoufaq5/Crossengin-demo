@@ -302,7 +302,31 @@ computational units rather than orchestrating a pipeline of modules.
 > in 6 rounds (PARTIAL closure -- exactly the failure mode R27E
 > documented). R28A closes the gap completely on this scenario.
 >
-> R30A (this round, opt-in via `CE_DRFETCH_PIPELINE=on`) implements
+> R31A (this round, layered on top of R30A under the same
+> `CE_DRFETCH_PIPELINE=on` switch) closes R30A's
+> "`sys_poll` parallelises the response WAIT but not the connection
+> ESTABLISHMENT" caveat by making the dial pass non-blocking too.
+> Two new NOVA builtins (shipped on the NOVA side this round:
+> `sys_fcntl_setfl_nonblock` + `sys_getsockopt_so_error`) provide
+> the POSIX recipe — `socket()` + `fcntl(F_SETFL, O_NONBLOCK)` +
+> `connect()` returning `-EINPROGRESS=-115` + `sys_poll(POLLOUT)` +
+> `getsockopt(SO_ERROR)`. Phase 1 of the pipelined DRFETCH path is
+> now two sub-phases: (1a) every peer's TCP handshake races in
+> parallel via one `sys_poll(POLLOUT)` call, (1b) post-dial
+> HELLO/OK + DRFETCH-header sends walk serially over the survivors
+> after `O_NONBLOCK` is cleared. Four new diagnostic counters
+> (`conn_dispatched / _ready / _timeouts / _so_error`) join the
+> R30A `pipe_*` family in `dr_stats_line` when the pipeline is on.
+> Honest expectation: at 5 peers on loopback the dial cost is
+> ~10us so the parallel-dial win is invisible; the win materialises
+> above ~50 peers on lossy WAN where each dial costs 50-150 ms.
+> Verification: **+23 new R31A assertions** layered on top of R30A's
+> 74 in `tests/unit/test_dr_async_fetch.nova` (97 total) covering
+> the new counters, wrapper API, SO\_ERROR readback semantics, and
+> CE\_DRFETCH\_PIPELINE=0 bit-identical-to-R30A guarantee; scenario\_yyyy
+> gains a PHASE1\_PARALLEL sub-scenario.
+>
+> R30A (prior round, opt-in via `CE_DRFETCH_PIPELINE=on`) implements
 > **true pipelined DRFETCH** on top of R28A using NOVA R29A's new
 > `sys_poll(fds, nfds, timeout_ms)` builtin. Phase 1 dispatches the
 > DRFETCH header to every alive peer back-to-back (no waiting for

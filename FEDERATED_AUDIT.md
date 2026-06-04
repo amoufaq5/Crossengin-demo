@@ -3719,3 +3719,102 @@ the heart of R29F.
    resetting the state with `kgd_state_new()` and re-deriving
    from a snapshot; the right shape is a `kgd_state_compact(st,
    keep_since_rev)` that drops older log entries. Deferred.
+
+## R31A extension: non-blocking connect + sys\_poll(POLLOUT) parallelises DRFETCH phase-1 dial (R30A.2)
+
+**Why R31A?** R30A's exit caveat: "`sys_poll` parallelises the
+response WAIT but not the connection ESTABLISHMENT — phase 1
+still walks `_gossip_dial` + HELLO/OK serially because NOVA's
+`connect(2)` is blocking." For a 5-soul mesh on loopback the
+serial dial cost is negligible (~10us per peer) so R30A's win
+is real, but for mesh sizes >= 50 peers on lossy WAN where a
+single dial costs 50-150 ms, the serial walk dominates the
+round time. R31A closes that gap.
+
+### What R31A delivers
+
+* **Two new NOVA builtins** (committed separately in
+  `amoufaq5/NOVA`):
+  - `sys_fcntl_setfl_nonblock(fd) -> 0 | -1` — POSIX
+    `fcntl(fd, F_SETFL=4, O_NONBLOCK=2048)`, Linux x86-64
+    syscall 72, ARM64-Linux syscall 25, macOS BSD 92, Win
+    `__imp_ioctlsocket` with FIONBIO, winARM64 / WASM stub.
+  - `sys_getsockopt_so_error(fd) -> int` — POSIX
+    `getsockopt(fd, SOL_SOCKET, SO_ERROR, &val, &vlen)`,
+    returns the SO\_ERROR int (not the rc), Linux x86-64
+    syscall 55, ARM64-Linux 209, macOS 118, Win
+    `__imp_getsockopt` with WinSock numbering.
+* **CrossEngin non-blocking connect wrapper** (`_dr_connect_async`):
+  opens a TCP socket, sets `O_NONBLOCK`, calls `connect(2)`,
+  returns the fd in `EINPROGRESS` state (or a negative diagnostic
+  code).
+* **Phase-1 parallelisation**: under `CE_DRFETCH_PIPELINE=1` the
+  phase-1 dispatcher now does TWO sub-phases:
+  1. *1a. Parallel non-blocking dial.* Open ALL peer sockets
+     non-blocking, kick connects, build a pollfd `POLLOUT` array,
+     `sys_poll` until every peer's TCP handshake completes or
+     the dial budget expires. SO\_ERROR check distinguishes
+     successful dial from deferred ECONNREFUSED / ETIMEDOUT.
+  2. *1b. Per-peer HELLO/OK + DRFETCH header.* After clearing
+     `O_NONBLOCK` so the gossip send/recv loops block normally,
+     walk the post-dial fleet serially for the application-
+     level handshake. R30A's phase 2 (POLLIN-wait + drain)
+     stays unchanged.
+* **Four new stat counters** emitted on `dr_stats_line` when
+  the pipeline is active:
+  - `dr_stats_connect_dispatched` — # connects kicked off
+  - `dr_stats_connect_ready` — # peers whose POLLOUT fired AND
+    SO\_ERROR readback returned 0
+  - `dr_stats_connect_timeouts` — # peers whose POLLOUT never
+    fired within the dial budget
+  - `dr_stats_connect_so_error` — # peers with deferred connect
+    errno (typically ECONNREFUSED on a peer-mid-startup race)
+
+### Verified
+
+* Unit tests (`tests/unit/test_dr_async_fetch.nova`): 97 OK,
+  +23 new R31A assertions covering counter init, wrapper open-fd
+  / SO\_ERROR / unparseable-addr / partial-counter-distribution
+  / pipeline-OFF-bit-identical paths, and stats-line conn\_\*
+  token emission.
+* Integration scenario YYYY (`scenario_yyyy_rule_convergence.sh`)
+  extended with PHASE1\_PARALLEL sub-scenario that re-runs the
+  5-soul STABLE closure with `CE_DRFETCH_PIPELINE=1` and reports
+  round-count delta vs R30A's pipeline-only path.
+
+### Honest expectations
+
+The brief explicitly invited an honest "5-soul STABLE shows no
+improvement" outcome: at 5 peers on loopback the dial-RTT is
+~10us so the parallel-dial win is invisible relative to the
+HELLO/OK + ACK\_RTT. The R31A win materialises above ~50 peers
+on lossy WAN where every dial costs 50-150 ms; that scale is
+not exercised by the YYYY scenario suite. The round-count delta
+is reported truthfully either way.
+
+### Caveats / future work
+
+1. **`_dr_clear_nonblock` is Linux-x86-64-only**. The inline
+   `asm` block hardcodes syscall 72. ARM64-Linux uses syscall
+   25; macOS BSD uses 92. Same Linux-first precedent as
+   `gossip.nova`'s `_gossip_fcntl` wrapper — multi-arch
+   coverage is a follow-up R31A.2.
+2. **No GETFL preserve**. We `F_SETFL` with flags=0 to clear
+   `O_NONBLOCK`. If a future change adds other flags (e.g.
+   `O_ASYNC`, `O_CLOEXEC`), this would wipe them. Switch to
+   `F_GETFL` then `F_SETFL` with `flags & ~O_NONBLOCK` if that
+   matters.
+3. **Phase 1b HELLO/OK is still serial**. Parallelising it
+   would need a per-peer state-machine with `sys_poll(POLLIN)`
+   for the OK frame and `sys_poll(POLLOUT)` for the next-write
+   readiness. Deferred to R31A.2 if profiling shows it as the
+   new long pole; current measurements suggest phase 2 (peer
+   compute + DREND drain) is still the bottleneck on
+   moderate-mesh runs.
+4. **Single-attempt dial**. `_dr_connect_async` does NOT retry
+   like `_gossip_dial` (which does up to
+   `GOSSIP_CONNECT_RETRIES=3` with `GOSSIP_CONNECT_DELAY_MS=50`
+   between attempts). A peer mid-startup race that's not yet
+   listening will be counted as a `CONNECT_SO_ERROR` and fall
+   to the next gossip round naturally — matching R28A's late-ACK
+   isolation principle.
