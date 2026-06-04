@@ -3,6 +3,145 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R27C (this session) -- Noise-XK wrap of relay payloads (R26E.2 follow-up)
+
+**Status: complete -- new `src/federation/gossip_relay_secure.nova`
+(~330 lines) closes the second-to-last hole in the R26E.2 list. R26E
+shipped TCP gossip relay where the intermediary peer C reads + can
+tamper with every byte it forwards. R27C wraps the relay payload in a
+Noise-XK AEAD frame end-to-end between A and B: A pre-registers a
+session for B (initiator role), nxk_seals the plaintext under
+k_init_to_resp, hex-encodes the resulting [4B len || ct || 16B tag]
+frame, and hands the hex string to R26E `relay_send`. C forwards
+opaque hex bytes (no key, no decrypt). B receives via the R26E
+inbound-queue, hex-decodes, nxk_opens (responder role), and pushes
+plaintext to a new srl recv queue. Tamper anywhere in transit →
+Poly1305 tag mismatch on B → frame dropped.**
+
+### What R27C delivers
+
+1. **New module** -- `src/federation/gossip_relay_secure.nova`.
+   Public API: `srl_init(relay_state) -> srl_state`,
+   `srl_register_peer_session(srl, peer_id, nxk_state, role) -> 1 ok |
+   0` (pre-register the post-Split nxk_state; role is THIS soul's
+   role in the Noise XK handshake -- INITIATOR or RESPONDER),
+   `srl_send_secure(srl, target, pt_buf, pt_n) -> 1 ok | 0`
+   (refuses to send if no session for target -- a missing session
+   is a configuration error, not a silent fallthrough to
+   plaintext), `srl_drain_relay_recv(srl) -> count` (called per
+   tick from the daemon loop; walks the underlying relay's
+   received-queue from a monotonic cursor, hex-decodes payloads,
+   opens AEAD frames under the from-peer's session, queues
+   plaintext on a per-record [from, pt_buf, pt_n] entry),
+   `srl_recv_secure(srl)` (drain-and-clear semantics on the
+   plaintext recv queue), `srl_received_at(srl, idx)` /
+   `srl_received_from` / `srl_received_pt_buf` / `srl_received_pt_n`
+   / `srl_received_pt_str` (inspectors). Plus `srl_str_to_buf` /
+   `srl_buf_to_str` convenience converters and `srl_stats_*`
+   accessors (sessions / sent / delivered / decrypt_failed /
+   no_session).
+
+2. **Wire wrap shape** -- nxk_seal produces a binary
+   `[4B BE len || ct || 16B tag]` frame. The relay wire (R18E v1
+   gossip) is text/line-based, so the srl module hex-encodes the
+   frame before relay_send and hex-decodes on recv. 2x overhead is
+   acceptable for control-plane traffic; bulk transfer would need a
+   binary-clean wire extension to R18E (out of R27C scope).
+
+3. **Cross-module direction**:
+   srl -> relay (calls `relay_send` + `relay_received_at` etc.);
+   srl -> noise_xk (calls `nxk_seal` / `nxk_open` + role constants);
+   srl -> chacha20 (calls `cc_hex_encode_buf` / `cc_hex_decode`).
+   The gossip_relay module is UNCHANGED. The noise_xk module is
+   UNCHANGED. New module is a leaf above both.
+
+4. **Test helper `_srl_test_forge_nxk(role, k_ir_hex, k_ri_hex)`** --
+   builds a post-Split nxk_state with caller-supplied transport
+   keys, skipping the real ~5-15s Noise XK handshake (four
+   2048-bit modpows per side). This lets the unit + integration
+   tests exercise the seal/open AEAD codepath without the
+   handshake latency. In production the post-Split state comes
+   out of `nxk_split` after the three-message handshake (R7C
+   noise_xk).
+
+### Verification
+
+* **44 unit assertions** in `tests/unit/test_relay_secure.nova`:
+  init zero-state (7); session registration + idempotent rekey +
+  null-state rejection (6); send refuses without session (3);
+  round-trip wrap/unwrap (10); tampered ciphertext rejected -- one
+  nibble flip in the hex frame, AEAD tag mismatch, decrypt_failed
+  bumps, recv queue empty (5); wrong peer's session decrypt fails
+  (3); drain drops unpaired from-peer (3); recv_secure drain-and-
+  clear (3); buf<->str round-trip (2); stats line shape (2).
+
+* **11 integration assertions** in
+  `tests/integration/scenario_xxxx_relay_secure.sh` (letter `xxxx`
+  free; vvvv = R26E, wwww = R27B). 3-soul mesh A / B / C; A and B
+  pre-share Noise-XK session keys (forged via `_srl_test_forge_nxk`
+  to skip the ~15s real handshake; the seal/open AEAD codepath is
+  exercised on real nxk_seal/nxk_open). A marks B unreachable +
+  calls `srl_send_secure` twice. C MITM-tampers the second forwarded
+  payload by flipping one nibble of the hex. Asserts: NOVA pre-flight
+  + 3 souls compile + mid-flight liveness, A's secure send returned
+  1, A's underlying relay routed via=C, C forwarded both wrapped
+  frames, C's srl delivered=0 (no session -- blind), C explicitly
+  attempts decrypt with a stranger session and ALL attempts fail
+  (peek_attempts=2, peek_fail=2), B's srl delivered=1 (the clean
+  first frame), B's recv[0] plaintext exactly equals
+  `ciphertext-from-A` (E2E round-trip confirmed), B's decrypt_failed
+  >= 1 (the tampered second frame was dropped).
+
+* `NOVA_ROOT=/home/user/NOVA bash scripts/test.sh` -- **215 unit
+  tests pass** (1 new from this round; R27B's 1 new also present).
+  Federation baselines hold: gossip_relay 61, gossip 34,
+  gossip_noise 44, noise_xk 44.
+
+* `bash tests/integration/scenario_xxxx_relay_secure.sh` -- 11/0.
+  Bash `tests/integration/scenario_vvvv_gossip_relay.sh` (R26E
+  base) -- 13/0, no regression.
+
+### Honest scope (R27C.2 list)
+
+* **Hex on the wire** -- doubles every relay segment's wire size.
+  A binary-clean RELAY_DATA variant (R26E.2.bin) would halve the
+  byte count for bulk transfer. Control-plane traffic (KG sync
+  commands, gossip-piggybacked snapshot deltas) sits comfortably
+  inside the 2x overhead.
+
+* **Session-key bootstrap** -- the brief allows pre-registered
+  sessions via out-of-band exchange OR R7C kg_sync v3 handshake.
+  The unit + integration tests both use pre-registered sessions
+  via the `_srl_test_forge_nxk` helper. Wiring the actual R7C
+  handshake into the srl_register_peer_session pipeline (so peers
+  auto-handshake on first sight of each other in the gossip table)
+  is a follow-up.
+
+* **Forward secrecy** -- the post-Split nxk_state holds long-lived
+  k_init_to_resp / k_resp_to_init. Per-message ratchet (à la
+  Signal Double Ratchet) would limit the window if a key is
+  exfiltrated. R7C noise_xk already provides nonce monotonicity
+  for replay protection; ratchet is a strict upgrade.
+
+* **Group sessions** -- one nxk_state per peer pair. A 100-peer
+  mesh would need 100 * 99 / 2 = 4950 sessions. A pubkey-cert-
+  signed group key (like MLS) would scale better; out of R27C
+  scope.
+
+### Files touched (R27C)
+
+* NEW: `src/federation/gossip_relay_secure.nova` (~330 lines, 16
+  public functions + 1 test helper).
+* NEW: `tests/unit/test_relay_secure.nova` (44 assertions).
+* NEW: `tests/integration/scenario_xxxx_relay_secure.sh` (11
+  assertions).
+* MOD: `examples/crossengin_chat.nova` (+1 help line +1 dispatch
+  stub line = 2 lines, within the brief's allowance).
+* MOD: `FEDERATED_AUDIT.md` (new R26E.2 / R27C section),
+  `NEXT_SESSION.md` (this), `README.md`.
+
+---
+
 ## R27B (this session) -- STUN-like relay candidate ranking (R26E.2 follow-up)
 
 **Status: complete -- extended `src/federation/gossip_relay.nova` with

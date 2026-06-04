@@ -96,6 +96,75 @@ computational units rather than orchestrating a pipeline of modules.
 > via=ADDR\_C from=ADDR\_A annotation round-trips, cache hit on
 > second send).
 >
+> R27C (R26E.2 follow-up) closes the second-to-last hole in the R26E.2
+> list: end-to-end Noise-XK wrap around the R26E relay payload. The
+> base R26E relay forwards plaintext bytes through the intermediary
+> peer C -- C can read AND tamper with every payload it forwards.
+> New module `src/federation/gossip_relay_secure.nova` (~330 lines)
+> layers a Noise-XK AEAD frame on top: A and B pre-share a post-Split
+> nxk_state (out-of-band or via R7C kg\_sync v3 handshake) with the
+> two transport keys k\_init\_to\_resp + k\_resp\_to\_init and per-
+> direction monotonic 64-bit nonce counters. A nxk\_seals the
+> plaintext under its k\_init\_to\_resp; the resulting binary frame
+> `[4B BE len || ct || 16B Poly1305 tag]` is hex-encoded for transit
+> over the R18E line-based gossip wire and handed to R26E
+> `relay_send`. C forwards opaque hex (no key, no decrypt). B's
+> `srl_drain_relay_recv` walks the underlying relay's received-queue
+> from a monotonic cursor, hex-decodes, nxk\_opens under its
+> responder role (which picks k\_init\_to\_resp on the recv side via
+> R7C's `_nxk_role_recv_picks(responder)`), and pushes the plaintext
+> onto a per-record `[from, pt_buf, pt_n]` srl recv queue. Any
+> tampered byte anywhere in transit yields a Poly1305 tag mismatch
+> on B, the frame is dropped, decrypt\_failed bumps; the bad bytes
+> never reach the recv queue. Public API:
+> `srl_init(relay_state) -> srl_state`,
+> `srl_register_peer_session(srl, peer_id, nxk_state, role) -> 1 ok`
+> (pre-register the post-Split nxk\_state with the role THIS soul
+> played in the Noise XK handshake -- INITIATOR or RESPONDER),
+> `srl_send_secure(srl, target, pt_buf, pt_n) -> 1 ok | 0 error`
+> (refuses to send when no session for target -- a missing session
+> is a configuration error, not a silent fallthrough to plaintext
+> through the relay), `srl_drain_relay_recv(srl) -> count` (per-
+> tick drain that decrypts inbound + enqueues plaintext),
+> `srl_recv_secure(srl)` (drain-and-clear the plaintext recv
+> queue), inspectors `srl_received_at` / `srl_received_from` /
+> `srl_received_pt_buf` / `srl_received_pt_n` /
+> `srl_received_pt_str`, helpers `srl_str_to_buf` /
+> `srl_buf_to_str`, stats `srl_stats_sent` / `_delivered` /
+> `_decrypt_failed` / `_no_session`, status line `srl_stats_line`.
+> The R26E `gossip_relay.nova` module is UNCHANGED -- srl is a leaf
+> above it. The R7C `noise_xk.nova` module is UNCHANGED -- srl
+> calls `nxk_seal` / `nxk_open` + role constants. Honest scope: hex
+> wire doubles per-frame on-the-wire size (acceptable for control-
+> plane traffic; bulk transfer would need a binary-clean RELAY\_DATA
+> variant); session-key bootstrap (the post-Split state) is the
+> caller's responsibility; per-message ratchet and group sessions
+> are R27C.2 follow-ups. Verification: 44 unit assertions in
+> `tests/unit/test_relay_secure.nova` (init zero-state, session
+> registration + idempotent rekey, send refuses without session,
+> round-trip wrap/unwrap, tampered ciphertext rejected, wrong
+> peer's session decrypt fails, drain drops unpaired from-peer,
+> recv\_secure drain-and-clear, buf<->str round-trip, stats line);
+> 11 integration assertions in
+> `tests/integration/scenario_xxxx_relay_secure.sh` (letter `xxxx`
+> free; vvvv = R26E, wwww = R27B). 3-soul mesh A/B/C; A + B
+> pre-share Noise-XK session keys (forged via `_srl_test_forge_nxk`
+> to skip the ~5-15s real handshake; the seal/open AEAD codepath is
+> exercised on real `nxk_seal` / `nxk_open`). A calls
+> `srl_send_secure` twice; C MITM-tampers the second forwarded hex
+> payload by flipping one nibble. Asserts NOVA pre-flight + 3 souls
+> compile + mid-flight liveness, A's secure send returned 1, A's
+> underlying relay routed via=C, C forwarded both wrapped frames,
+> C's srl delivered=0 (no session -- blind), C explicitly attempts
+> decrypt with a stranger session and ALL 2 attempts fail
+> (peek\_attempts=2, peek\_fail=2), B's srl delivered=1 (the clean
+> first frame), B's recv\[0\] plaintext exactly equals the
+> originator's input string (E2E round-trip confirmed through an
+> unreading relay), B's decrypt\_failed >= 1 (the tampered second
+> frame was rejected and dropped before reaching the recv queue).
+> All federation tests stay green: gossip\_relay 61, gossip 34,
+> gossip\_noise 44, noise\_xk 44.
+>
 > R27B (R26E.2 follow-up) extends `src/federation/gossip_relay.nova`
 > with NAT-type-aware ranked relay selection. The base R26E picker
 > walked alive peers in gossip-table order and returned the first

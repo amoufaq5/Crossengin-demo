@@ -1,0 +1,441 @@
+// CrossEngin federation: Noise-XK end-to-end wrap around the R26E gossip
+// relay (R26E.2 follow-up).
+//
+// Purpose
+//
+//   R26E (`src/federation/gossip_relay.nova`) ships TCP-based relay
+//   forwarding: when peer A cannot directly dial peer B, A asks
+//   intermediary peer C to forward the payload as RELAY_DATA. The
+//   relay's wire is plaintext gossip v1, which means peer C can READ
+//   and TAMPER WITH the bytes it forwards. The R26E.2 honest-scope
+//   item flagged this as the open hole: a relay node sees every byte
+//   it passes through.
+//
+//   This module closes that hole by wrapping the relay payload in a
+//   Noise-XK AEAD frame. A and B establish a Noise-XK session
+//   out-of-band (or via R7C kg_sync v3 handshake) sharing static
+//   pubkeys; once both ends have a post-Split nxk_state both directions
+//   have an AEAD key + a monotonic nonce counter. A encrypts the
+//   payload with `nxk_seal` (initiator role, k_init_to_resp), hex-
+//   encodes the resulting frame, and pushes it through R26E
+//   `relay_send`. Relay node C forwards the hex string as opaque
+//   payload, never reaching for the key (it doesn't have it). B
+//   receives via the R26E inbound-queue, hex-decodes back to bytes,
+//   and `nxk_open`s (responder role) to recover the plaintext. A
+//   tampered byte anywhere in transit produces a Poly1305 tag
+//   mismatch on `nxk_open`, the frame is dropped, and the recv queue
+//   never sees the bad bytes.
+//
+//   Mutual-auth contract: identical to R7C noise_xk. The Noise XK
+//   handshake transcript-binds both static pubkeys; sessions are
+//   bound to the (A, B) pair. A misrouted frame whose underlying
+//   relay annotation says from=A but is actually signed by a different
+//   pubkey fails the AEAD tag because the AEAD key is derived from
+//   the genuine A<->B handshake.
+//
+// Architecture
+//
+//   * A and B each maintain an `nxk_state` post-Split. A took the
+//     INITIATOR role in the handshake; B took the RESPONDER role.
+//     Both sides know which role THEY played: when A seals to B, A
+//     passes NXK_ROLE_INITIATOR to nxk_seal (uses k_init_to_resp).
+//     When B opens, B passes NXK_ROLE_RESPONDER to nxk_open (which
+//     also selects k_init_to_resp on the recv side via
+//     _nxk_role_recv_picks(responder) == K_IR -- see noise_xk.nova).
+//   * The session is keyed by the peer_id string (the relay's
+//     int_peer_addr from `gossip_self_addr`). A single soul can
+//     register many sessions, one per peer it can talk to securely.
+//   * Wire wrap: nxk_seal produces a binary frame [4B BE len || ct ||
+//     16B tag]. The relay wire is text (RELAY_DATA is space-delimited
+//     with payload as the final field, no embedded NUL OK but binary
+//     0x20 / 0x0a would break the line framing). So we hex-encode the
+//     frame bytes before relay_send and hex-decode on recv. The
+//     overhead is 2x payload size on the wire -- acceptable for
+//     control-plane traffic (KG syncs, commands). Bulk transfer would
+//     need a dedicated binary framing extension to R18E gossip; out of
+//     R26E.2 scope.
+//
+// Public API
+//
+//   srl_init(relay_state)                          -> srl_state
+//   srl_register_peer_session(srl, peer_id, nxk_state, role) -> 1 ok | 0
+//       Pre-register the end-to-end nxk_state for `peer_id`. `role`
+//       is NXK_ROLE_INITIATOR or NXK_ROLE_RESPONDER -- the role THIS
+//       soul played in the handshake. Idempotent: a second call with
+//       the same peer_id replaces the session (for re-keying).
+//   srl_send_secure(srl, target_peer, pt_buf, pt_n) -> 1 ok | 0 error
+//       Encrypts `pt_buf` with the session for `target_peer`, hex-
+//       encodes, calls relay_send. Returns 0 if no session is
+//       registered for `target_peer` (refuse to send plaintext via
+//       relay -- a missing session must be a configuration error,
+//       not a fallthrough to unencrypted).
+//   srl_drain_relay_recv(srl)                      -> int processed
+//       Drains the underlying relay's received-queue: for each
+//       RELAY_DATA record received by this soul, decode the payload
+//       hex, decrypt with the session for the `from` peer, push
+//       [from_peer, plaintext_buf, plaintext_n] onto our recv queue.
+//       Tag-mismatch frames bump the tampered counter and are
+//       dropped. Frames without a session for the from-peer bump
+//       no_session and are dropped (defensive -- relay shouldn't
+//       carry traffic from an un-paired peer).
+//   srl_recv_secure(srl)                           -> drained recv list
+//       Returns the current recv queue (list of [from, pt_buf, pt_n])
+//       and resets the queue. Caller takes ownership of the entries.
+//   srl_recv_count(srl)                            -> int
+//   srl_received_at(srl, idx)                      -> [from, pt_buf, pt_n] | 0
+//
+//   Stats + diagnostics
+//   srl_stats_sent(srl)                            -> count of seal+send
+//   srl_stats_delivered(srl)                       -> count of open+queue
+//   srl_stats_decrypt_failed(srl)                  -> count of bad-tag
+//   srl_stats_no_session(srl)                      -> count of refusals
+//   srl_session_count(srl)                         -> registered sessions
+//   srl_has_session(srl, peer_id)                  -> 1 | 0
+//   srl_stats_line(srl)                            -> one-liner
+//
+// Honest scope
+//
+//   * The relay wire is HEX-encoded, doubling the per-frame on-wire
+//     size. Bulk transfer would need a binary-clean wire (separate
+//     extension to gossip v1 framing).
+//   * The session-key exchange (out-of-band or via kg_sync v3 handshake)
+//     is the caller's responsibility. R7C noise_xk.nova ships the
+//     handshake primitives; this module consumes the post-Split state.
+//   * Replay protection across relay nodes: the Noise XK nonce counter
+//     is per-session monotonic, so a relay that captures a frame and
+//     replays it after a fresh send fails the nonce check on B (B's
+//     recv counter is past the replayed counter). This is the same
+//     replay protection as R21E gossip Noise transport.
+//   * If A's seal fails (e.g. handshake state is corrupt), the wrap
+//     returns 0 BEFORE calling relay_send -- the relay never sees
+//     plaintext.
+//
+// ADRs touched: registers ADR-0091 (Noise-XK wrap of relay payloads,
+//   federation gap closer for R26E.2).
+// NOVA dependencies: builtins from R7C noise_xk + R26E gossip_relay.
+// CrossEngin dependencies:
+//   src/federation/gossip_relay.nova    (R26E -- READ only; uses
+//     relay_send / relay_received_count / relay_received_at /
+//     relay_received_from / relay_received_payload + RELAY_S_RECEIVED
+//     slot for drain-and-clear semantics).
+//   src/io/transducers/noise_xk.nova    (R7C -- READ only; uses
+//     nxk_seal / nxk_open + NXK_ROLE_* constants).
+//   src/safety/chacha20.nova            (cc_hex_encode_buf /
+//     cc_hex_decode for binary <-> text wire transcoding).
+
+import "std/io"
+import "./gossip_relay.nova"
+import "../io/transducers/noise_xk.nova"
+import "../safety/chacha20.nova"
+
+// ---- state record slots --------------------------------------------------
+//
+// srl_state is a flat list; slot constants are pinned for forward-
+// compatible additions (new stats go at the tail).
+
+let SRL_S_RELAY               = 0   // R26E relay_state back-ref
+let SRL_S_SESSIONS            = 1   // list of [peer_id, nxk_state, role]
+let SRL_S_RECEIVED            = 2   // list of [from, pt_buf, pt_n]
+let SRL_S_NEXT_RECV_IDX       = 3   // cursor into relay's received-queue
+let SRL_S_STATS_SENT          = 4
+let SRL_S_STATS_DELIVERED     = 5
+let SRL_S_STATS_DECRYPT_FAIL  = 6
+let SRL_S_STATS_NO_SESSION    = 7
+
+// Session record slot indices.
+let SRL_SESS_PEER             = 0
+let SRL_SESS_STATE            = 1
+let SRL_SESS_ROLE             = 2
+
+// Received-record slot indices.
+let SRL_R_FROM                = 0
+let SRL_R_PT_BUF              = 1
+let SRL_R_PT_N                = 2
+
+// ---- state constructor ---------------------------------------------------
+
+fn srl_init(relay_state) {
+    let st = list_new()
+    push(st, relay_state)     // S_RELAY
+    push(st, list_new())      // S_SESSIONS
+    push(st, list_new())      // S_RECEIVED
+    push(st, 0)               // S_NEXT_RECV_IDX
+    push(st, 0)               // S_STATS_SENT
+    push(st, 0)               // S_STATS_DELIVERED
+    push(st, 0)               // S_STATS_DECRYPT_FAIL
+    push(st, 0)               // S_STATS_NO_SESSION
+    return st
+}
+
+// ---- accessors ----------------------------------------------------------
+
+fn srl_relay_state(state)         { return state[SRL_S_RELAY] }
+fn srl_session_count(state)       { return len(state[SRL_S_SESSIONS]) }
+fn srl_recv_count(state)          { return len(state[SRL_S_RECEIVED]) }
+fn srl_stats_sent(state)          { return state[SRL_S_STATS_SENT] }
+fn srl_stats_delivered(state)     { return state[SRL_S_STATS_DELIVERED] }
+fn srl_stats_decrypt_failed(state){ return state[SRL_S_STATS_DECRYPT_FAIL] }
+fn srl_stats_no_session(state)    { return state[SRL_S_STATS_NO_SESSION] }
+
+// Linear scan -- session count is expected to be small (a few mesh
+// peers, not thousands). Returns the session record or 0 if missing.
+fn _srl_find_session(state, peer_id) {
+    let sessions = state[SRL_S_SESSIONS]
+    let i = 0
+    while i < len(sessions) {
+        if str_eq(sessions[i][SRL_SESS_PEER], peer_id) == 1 {
+            return sessions[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn srl_has_session(state, peer_id) {
+    if _srl_find_session(state, peer_id) == 0 { return 0 }
+    return 1
+}
+
+// Idempotent register: a second call with the same peer_id replaces
+// the existing session record (for re-keying). Returns 1 on success,
+// 0 on invalid input (null nxk_state).
+fn srl_register_peer_session(state, peer_id, nxk_state, role) {
+    if nxk_state == 0 { return 0 }
+    if len(peer_id) == 0 { return 0 }
+    let sessions = state[SRL_S_SESSIONS]
+    let i = 0
+    while i < len(sessions) {
+        if str_eq(sessions[i][SRL_SESS_PEER], peer_id) == 1 {
+            sessions[i][SRL_SESS_STATE] = nxk_state
+            sessions[i][SRL_SESS_ROLE] = role
+            return 1
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_id)
+    push(rec, nxk_state)
+    push(rec, role)
+    push(sessions, rec)
+    return 1
+}
+
+// ---- buffer helpers ----------------------------------------------------
+//
+// The seal/open path operates on byte buffers (allocated with `alloc`)
+// of a known length. Callers that have plaintext strings convert via
+// these helpers.
+
+fn srl_str_to_buf(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+fn srl_buf_to_str(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        s = s + chr(load8(buf + i))
+        i = i + 1
+    }
+    return s
+}
+
+// ---- public API: srl_send_secure --------------------------------------
+//
+// 1. Look up the session for target_peer; refuse (return 0) if missing.
+// 2. Seal the plaintext with nxk_seal under THIS soul's role.
+// 3. Hex-encode the resulting frame (the relay wire is text-based).
+// 4. Call relay_send(relay, target_peer, hex_payload).
+// Returns 1 on a successful relay_send (whether the relay went direct
+// or fell back via an intermediate), 0 on any failure step.
+
+fn srl_send_secure(state, target_peer, pt_buf, pt_n) {
+    let sess = _srl_find_session(state, target_peer)
+    if sess == 0 {
+        state[SRL_S_STATS_NO_SESSION] = state[SRL_S_STATS_NO_SESSION] + 1
+        return 0
+    }
+    let nxk_st = sess[SRL_SESS_STATE]
+    let role = sess[SRL_SESS_ROLE]
+    let sealed = nxk_seal(nxk_st, role, pt_buf, pt_n)
+    if sealed == 0 { return 0 }
+    let hex_payload = cc_hex_encode_buf(sealed[0], sealed[1])
+    let relay = state[SRL_S_RELAY]
+    if relay == 0 { return 0 }
+    let rc = relay_send(relay, target_peer, hex_payload)
+    if rc == 1 {
+        state[SRL_S_STATS_SENT] = state[SRL_S_STATS_SENT] + 1
+        return 1
+    }
+    return 0
+}
+
+// Convenience: caller passes a plain string. Wraps str_to_buf + send.
+fn srl_send_secure_str(state, target_peer, plaintext_str) {
+    let pkt = srl_str_to_buf(plaintext_str)
+    return srl_send_secure(state, target_peer, pkt[0], pkt[1])
+}
+
+// ---- public API: srl_drain_relay_recv ---------------------------------
+//
+// Walks the relay's received-queue from our cursor onward. For each
+// new RELAY_DATA record:
+//   * find the session for the `from` peer (the originator);
+//   * hex-decode the payload string back to bytes;
+//   * nxk_open under our role (which selects the correct recv key).
+// On success: push [from, pt_buf, pt_n] onto our recv queue + bump
+// delivered. On tag mismatch: bump decrypt_failed + drop. On missing
+// session: bump no_session + drop. Returns the number of records
+// processed (delivered + dropped) this round.
+//
+// Cursor advances monotonically so re-draining is idempotent.
+
+fn srl_drain_relay_recv(state) {
+    let relay = state[SRL_S_RELAY]
+    if relay == 0 { return 0 }
+    let total = relay_received_count(relay)
+    let idx = state[SRL_S_NEXT_RECV_IDX]
+    let processed = 0
+    while idx < total {
+        let rec = relay_received_at(relay, idx)
+        if rec != 0 {
+            let from_peer = relay_received_from(rec)
+            let hex_payload = relay_received_payload(rec)
+            let sess = _srl_find_session(state, from_peer)
+            if sess == 0 {
+                state[SRL_S_STATS_NO_SESSION] = state[SRL_S_STATS_NO_SESSION] + 1
+            } else {
+                let dec = cc_hex_decode(hex_payload)
+                if dec == 0 {
+                    state[SRL_S_STATS_DECRYPT_FAIL] = state[SRL_S_STATS_DECRYPT_FAIL] + 1
+                } else {
+                    let frame_buf = dec[0]
+                    let frame_n = dec[1]
+                    let nxk_st = sess[SRL_SESS_STATE]
+                    let role = sess[SRL_SESS_ROLE]
+                    let opened = nxk_open(nxk_st, role, frame_buf, frame_n)
+                    if opened == 0 {
+                        state[SRL_S_STATS_DECRYPT_FAIL] = state[SRL_S_STATS_DECRYPT_FAIL] + 1
+                    } else {
+                        let entry = list_new()
+                        push(entry, from_peer)
+                        push(entry, opened[0])
+                        push(entry, opened[1])
+                        push(state[SRL_S_RECEIVED], entry)
+                        state[SRL_S_STATS_DELIVERED] = state[SRL_S_STATS_DELIVERED] + 1
+                    }
+                }
+            }
+            processed = processed + 1
+        }
+        idx = idx + 1
+    }
+    state[SRL_S_NEXT_RECV_IDX] = idx
+    return processed
+}
+
+// ---- public API: srl_recv_secure ---------------------------------------
+//
+// Return the current recv queue (list of [from, pt_buf, pt_n] entries)
+// and clear it. Callers iterate the list; the buffers are now owned by
+// the caller. The queue is rebuilt empty.
+
+fn srl_recv_secure(state) {
+    let cur = state[SRL_S_RECEIVED]
+    state[SRL_S_RECEIVED] = list_new()
+    return cur
+}
+
+// Non-destructive inspector (for unit tests + diagnostics).
+fn srl_received_at(state, idx) {
+    if idx < 0 { return 0 }
+    let q = state[SRL_S_RECEIVED]
+    if idx >= len(q) { return 0 }
+    return q[idx]
+}
+
+fn srl_received_from(entry) {
+    if entry == 0 { return "" }
+    return entry[SRL_R_FROM]
+}
+
+fn srl_received_pt_buf(entry) {
+    if entry == 0 { return 0 }
+    return entry[SRL_R_PT_BUF]
+}
+
+fn srl_received_pt_n(entry) {
+    if entry == 0 { return 0 }
+    return entry[SRL_R_PT_N]
+}
+
+// Decode the received entry's plaintext as a NOVA string.
+fn srl_received_pt_str(entry) {
+    if entry == 0 { return "" }
+    return srl_buf_to_str(entry[SRL_R_PT_BUF], entry[SRL_R_PT_N])
+}
+
+// ---- diagnostics --------------------------------------------------------
+
+fn srl_stats_line(state) {
+    return "srl: sessions=" + int_to_str(srl_session_count(state))
+        + " sent=" + int_to_str(state[SRL_S_STATS_SENT])
+        + " delivered=" + int_to_str(state[SRL_S_STATS_DELIVERED])
+        + " decrypt_fail=" + int_to_str(state[SRL_S_STATS_DECRYPT_FAIL])
+        + " no_session=" + int_to_str(state[SRL_S_STATS_NO_SESSION])
+}
+
+// ---- test-only helpers --------------------------------------------------
+//
+// Forge a post-Split nxk_state with known transport keys + counters.
+// Avoids the slow real handshake in unit tests. Mirrors the shape of
+// nxk_initiator_new + nxk_responder_new but skips the four modpows
+// and the three handshake message round-trips. `role` is which side
+// the FORGED state plays in the synthetic session: when role=INITIATOR,
+// k_init_to_resp is the SEND key. The caller supplies both transport
+// keys (typically the same byte string on the two paired forged
+// states so seal-on-one + open-on-other agrees on the AEAD key).
+//
+// k_ir_hex / k_ri_hex must each be 64 lowercase-hex chars (32 bytes).
+
+fn _srl_test_forge_nxk(role, k_ir_hex, k_ri_hex) {
+    let s = list_new()
+    // Slot 0..16 must mirror NXK_S_H..NXK_S_PHASE.
+    push(s, alloc(33))                  // NXK_S_H (unused post-split)
+    store8(s[0] + 32, 0)
+    push(s, alloc(33))                  // NXK_S_CK (unused)
+    store8(s[1] + 32, 0)
+    push(s, 0)                          // NXK_S_K
+    push(s, 0)                          // NXK_S_HAS_K
+    push(s, 0)                          // NXK_S_N
+    push(s, role)                       // NXK_S_ROLE
+    push(s, 0)                          // NXK_S_E_PRIV
+    push(s, 0)                          // NXK_S_E_PUB
+    push(s, 0)                          // NXK_S_S_PRIV
+    push(s, 0)                          // NXK_S_S_PUB
+    push(s, 0)                          // NXK_S_RE_PUB
+    push(s, 0)                          // NXK_S_RS_PUB
+    let k_ir_dec = cc_hex_decode(k_ir_hex)
+    if k_ir_dec == 0 { return 0 }
+    if k_ir_dec[1] != 32 { return 0 }
+    push(s, k_ir_dec[0])                // NXK_S_K_IR
+    let k_ri_dec = cc_hex_decode(k_ri_hex)
+    if k_ri_dec == 0 { return 0 }
+    if k_ri_dec[1] != 32 { return 0 }
+    push(s, k_ri_dec[0])                // NXK_S_K_RI
+    push(s, 0)                          // NXK_S_N_IR
+    push(s, 0)                          // NXK_S_N_RI
+    push(s, 4)                          // NXK_S_PHASE = 4 (post-split)
+    return s
+}

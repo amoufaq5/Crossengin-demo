@@ -1886,3 +1886,148 @@ double-bookkeeping. For now the registry is local to the relay.
    real signal is observed successful round-trips. A future
    ranker could weight by an EMA of recent success/fail
    counts per peer, with NAT type as the prior.
+
+## R26E.2 / R27C extension: Noise-XK end-to-end wrap of relay payloads
+
+R26E ships TCP gossip relay where the intermediary peer C reads + can
+tamper with every byte it forwards (`src/federation/gossip_relay.nova`
+RELAY\_REQ + RELAY\_DATA wire is plaintext gossip v1). R26E's
+honest-scope list flagged this as the open hole: the relay node is
+trusted with payload content. R27C closes the hole with an end-to-end
+AEAD wrap layered above R26E: A and B share a Noise-XK session
+out-of-band (or via R7C kg\_sync v3 handshake); A encrypts the payload
+with `nxk_seal` BEFORE handing it to `relay_send`; C forwards opaque
+hex; B decrypts with `nxk_open` on receive. The relay is now
+authenticated-untrusted: it cannot read payloads + any tamper attempt
+fails the Poly1305 tag on B and is dropped.
+
+### Architecture
+
+```
+   +--- A (initiator role) ----+      relay forwarders     +--- B (responder) ---+
+   |                           |   +------------------+   |                     |
+   |  plaintext "hello"        |   |                  |   |  recv queue:        |
+   |    -> srl_send_secure     |   |       C          |   |   [from=A,          |
+   |    -> nxk_seal(I, k_IR)   +---+  RELAY_REQ /     +---+    pt="hello", n=5] |
+   |    -> hex(frame)          |   |  RELAY_DATA      |   |                     |
+   |    -> relay_send(B, hex)  |   |  via=C, from=A   |   |  <- srl_drain_relay |
+   |                           |   |  payload=hex     |   |  <- nxk_open(R)     |
+   |                           |   |  (cannot decrypt)|   |  <- cc_hex_decode   |
+   +---------------------------+   +------------------+   +---------------------+
+```
+
+The wire wrap is:
+
+  1. `nxk_seal(state, role, pt_buf, pt_n)` produces a binary frame
+     `[4B BE len(ct||tag) || ct || 16B Poly1305 tag]` (per R7C
+     noise\_xk.nova).
+  2. `cc_hex_encode_buf(frame, len)` -> ASCII-safe hex string.
+  3. `relay_send(relay, target, hex)` routes the hex string via the
+     R26E relay wire (RELAY\_REQ payload = hex; the relay's
+     space-delimited parser treats the hex as the final positional
+     field).
+  4. C forwards as RELAY\_DATA with `via=C`, `from=A`, payload = hex.
+  5. B's gossip handler dispatches RELAY\_DATA to the relay's
+     received-queue. `relay_handle_data` records `[req_id, payload,
+     via, from]`.
+  6. `srl_drain_relay_recv(srl)` walks the relay's received-queue
+     from a monotonic cursor. For each record:
+     * find the session for `from` (the originator);
+     * `cc_hex_decode(payload)` -> bytes;
+     * `nxk_open(nxk_state, role, frame, frame_n)` -> plaintext;
+     * push `[from, pt_buf, pt_n]` onto the srl recv queue.
+  7. `srl_recv_secure(srl)` returns the recv queue + clears it.
+
+### Roles and key direction
+
+This module re-uses R7C noise\_xk's role+counter convention exactly:
+
+* A took the INITIATOR role in the handshake; when sending to B, A
+  passes `NXK_ROLE_INITIATOR` to `nxk_seal`. `_nxk_role_send_picks`
+  returns `(k_IR, NXK_S_N_IR)`.
+* B took the RESPONDER role; when receiving from A, B passes
+  `NXK_ROLE_RESPONDER` to `nxk_open`. `_nxk_role_recv_picks` selects
+  `(k_IR, NXK_S_N_IR)` (i.e. the recv-side picks the OTHER party's
+  send key + counter).
+
+Symmetrically, B sending to A would seal under RESPONDER (`k_RI`); A
+receiving from B opens under INITIATOR (also `k_RI` on the recv side).
+The srl module stores ONE role per session record -- the role THIS
+soul played during the handshake -- and threads it into both
+`nxk_seal` and `nxk_open` calls. This matches the same convention
+R21E uses for Noise-protected gossip.
+
+### Public API
+
+```
+srl_init(relay_state)                                -> srl_state
+srl_register_peer_session(srl, peer_id, nxk_state, role) -> 1 ok | 0
+    Idempotent. Replaces the existing session for re-keying.
+srl_send_secure(srl, target_peer, pt_buf, pt_n)      -> 1 ok | 0 error
+    Refuses to send when no session for target (no fallthrough to
+    plaintext via the relay).
+srl_send_secure_str(srl, target_peer, plaintext_str) -> 1 ok | 0
+srl_drain_relay_recv(srl)                            -> count
+srl_recv_secure(srl)                                 -> drained list
+srl_received_at(srl, idx)                            -> entry | 0
+srl_received_from(entry)                             -> peer_id
+srl_received_pt_buf(entry)                           -> buf
+srl_received_pt_n(entry)                             -> n
+srl_received_pt_str(entry)                           -> str
+srl_str_to_buf(s) / srl_buf_to_str(buf, n)
+srl_session_count(srl) / srl_recv_count(srl)
+srl_has_session(srl, peer_id)
+srl_stats_sent / _delivered / _decrypt_failed / _no_session
+srl_stats_line(srl)
+```
+
+### Honest scope
+
+* **Hex on the wire.** The relay v1 wire is text-based, so the
+  Noise frame is hex-encoded for transit (2x overhead). Bulk
+  transfer would need a binary-clean RELAY\_DATA variant; out of
+  R27C scope.
+* **Session-key bootstrap.** R7C `noise_xk.nova` ships the three-
+  message handshake; this module consumes the post-Split state. The
+  test helpers use `_srl_test_forge_nxk` to skip the ~5-15s real
+  handshake (four 2048-bit modpows per side). Wiring the actual
+  handshake into the `srl_register_peer_session` pipeline (so peers
+  auto-handshake on first gossip-table sight) is a follow-up.
+* **No per-message ratchet.** The post-Split nxk\_state holds long-
+  lived k\_init\_to\_resp / k\_resp\_to\_init. Per-message ratchet (à
+  la Signal Double Ratchet) would limit the window if a key is
+  exfiltrated. R7C already provides nonce monotonicity for replay
+  protection.
+* **No group sessions.** One nxk\_state per peer pair. An N-peer
+  mesh needs N*(N-1)/2 sessions. Group-key schemes (MLS, signal
+  Sender Keys) would scale better.
+* **The relay still sees metadata.** `via=C, from=A` annotations on
+  RELAY\_DATA are NOT encrypted; the relay can observe which souls
+  talked + when. Metadata privacy (mixnet-style) is a separate
+  follow-up.
+
+### Verification
+
+* Unit (`tests/unit/test_relay_secure.nova`): **44 assertions**
+  -- init zero-state (7); session register + idempotent rekey +
+  null-rejection (6); send refuses without session (3); round-trip
+  wrap/unwrap (10); tampered ciphertext -> drop on B (5); wrong
+  peer's session -> decrypt fails (3); drain drops unpaired
+  from-peer (3); recv_secure drain-and-clear (3); buf<->str
+  round-trip (2); stats line shape (2).
+
+* Integration (`tests/integration/scenario_xxxx_relay_secure.sh`):
+  **11 assertions** on a 3-soul A/B/C mesh. A and B pre-share
+  Noise-XK session keys (forged via `_srl_test_forge_nxk`; the AEAD
+  codepath is exercised via real nxk\_seal / nxk\_open). A marks B
+  unreachable + calls `srl_send_secure` twice. C MITM-tampers the
+  second forwarded hex payload by flipping one nibble before drain.
+  Asserts: NOVA pre-flight + 3 souls compile + mid-flight liveness,
+  A's secure send returned 1 + bumped sent counter, A's underlying
+  relay routed via=C, C forwarded both wrapped frames, C's srl
+  delivered=0 (no session -- blind), C explicitly attempts decrypt
+  with a stranger session and ALL attempts fail (peek\_attempts=2,
+  peek\_fail=2), B's srl delivered=1 (the clean first frame), B's
+  recv\[0\] plaintext equals the originator's input "ciphertext-from-A"
+  (E2E round-trip through unreading C confirmed), B's
+  decrypt\_failed >= 1 (the tampered second frame was rejected).
