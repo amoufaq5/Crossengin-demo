@@ -501,6 +501,51 @@ let DTLS_S_SLOT_STATS_CERT_FP_MISMATCH = 40  // int -- fingerprint mismatches
 let DTLS_S_SLOT_CURRENT_TIME_UNIX      = 41  // int -- caller-supplied wall-clock
 let DTLS_S_SLOT_RECV_EPOCH             = 42  // int -- per-side recv epoch
 
+// ----------------------------------------------------------------------------
+// R36B (R35A.2 / R33B.3): cached DTLS-SRTP keying material slot. R35A's
+// `dtls_export_srtp_keying_material(state)` runs the TLS 1.2 PRF (two
+// HMAC-SHA256 iterations to expand 60 bytes) on every call. R35A's exit
+// caveat said per-call recompute is fine because the function is invoked
+// exactly once per session post-handshake -- but a future use case might
+// poll the exporter (e.g. a wire-driver that re-extracts keys on a
+// recovery path) and the recompute is wasted work. R36B caches the
+// 60-byte buf in a fresh tail-appended slot and serves cache hits
+// instead of re-running the PRF.
+//
+// `DTLS_S_SLOT_SRTP_KM_CACHED` holds either:
+//   * 0           -- no cache; the next exporter call computes + stores.
+//   * non-zero    -- pointer to the 60-byte buf returned by the most
+//                    recent compute. Subsequent calls return THIS pointer
+//                    verbatim (not a fresh copy) so callers that pin the
+//                    pointer for equality (e.g. cache-hit assertions in
+//                    tests) get a stable identity.
+//
+// `DTLS_S_SLOT_STATS_SRTP_KM_HITS` is a cumulative cache-hit counter; the
+// first compute does NOT bump it, but every subsequent serve-from-cache
+// does. The accessor `dtls_stats_srtp_km_hits(state)` reads it.
+//
+// Cache invalidation: `dtls_advance_epoch(state)` (the R33B
+// CCS-on-epoch-change hook) clears this slot back to 0. The rationale:
+// although the SRTP exporter is anchored to the `master_secret` (which
+// does NOT change on a CCS that re-derives only the AEAD key block),
+// RFC 5764 §4.2 leaves the door open for a DTLS re-handshake (epoch
+// advance with a fresh PRF expansion) to feed new SRTP keys. The safe
+// default is to invalidate on epoch advance: if the master_secret
+// genuinely is the same, the next exporter call recomputes the SAME
+// 60 bytes (idempotent re-derivation) and the cost is at most one
+// extra PRF expansion per epoch transition. The opposite default
+// (never invalidate) would silently serve stale keys after a real
+// re-handshake -- a security footgun. Invalidate-on-epoch-advance is
+// the correct + cheap choice.
+//
+// The hits counter is NOT reset on epoch advance: it is cumulative
+// telemetry across the connection lifetime, mirroring the R32B
+// `STATS_REPLAY` / `STATS_TOO_OLD` and R33B `STATS_CERT_*` patterns.
+// ----------------------------------------------------------------------------
+
+let DTLS_S_SLOT_SRTP_KM_CACHED      = 43  // 60B buf | 0 -- memoized PRF expand
+let DTLS_S_SLOT_STATS_SRTP_KM_HITS  = 44  // int -- cache-hit count
+
 fn dtls_init() {
     let st = list_new()
     push(st, DTLS_S_INIT)        // state
@@ -549,6 +594,9 @@ fn dtls_init() {
     push(st, 0)                  // stats_cert_fp_mismatch
     push(st, 0)                  // current_time_unix (caller pins via setter)
     push(st, 0)                  // recv_epoch
+    // R36B SRTP keying-material cache + hit counter.
+    push(st, 0)                  // srtp_km_cached (no cache; first call computes)
+    push(st, 0)                  // stats_srtp_km_hits
     return st
 }
 
@@ -1215,6 +1263,15 @@ fn dtls_current_time(state)           { return state[DTLS_S_SLOT_CURRENT_TIME_UN
 fn dtls_recv_epoch(state)             { return state[DTLS_S_SLOT_RECV_EPOCH] }
 fn dtls_send_epoch(state)             { return state[DTLS_S_SLOT_EPOCH] }
 
+// R36B: cumulative cache-hit counter for the SRTP keying-material
+// exporter. Bumped each time `dtls_export_srtp_keying_material(state)`
+// serves a memoized 60-byte buf instead of running the PRF expand.
+// First compute (cache miss) does NOT bump -- only HITS do. The
+// counter is cumulative across the connection lifetime and NOT
+// reset on `dtls_advance_epoch` (mirrors the R32B / R33B telemetry
+// pattern; only the cache pointer is cleared on epoch advance).
+fn dtls_stats_srtp_km_hits(state)     { return state[DTLS_S_SLOT_STATS_SRTP_KM_HITS] }
+
 // Caller-pinned wall-clock used by `dtls_cert_verify`. The caller is
 // expected to set this just before invoking cert verify (typically the
 // wire driver reads `sys_unix_seconds()` once per handshake). Returns
@@ -1861,6 +1918,16 @@ fn dtls_advance_epoch(state) {
     state[DTLS_S_SLOT_RECV_SEQ]   = 0
     state[DTLS_S_SLOT_RECV_HIGH_WATERMARK] = 0
     state[DTLS_S_SLOT_RECV_REPLAY_MASK]    = 0
+    // R36B: invalidate the SRTP keying-material cache on epoch advance.
+    // Although the SRTP exporter is anchored to the master_secret (which
+    // does NOT change on a plain CCS-only key-block re-derivation), RFC
+    // 5764 §4.2 leaves the door open for a DTLS re-handshake that feeds
+    // fresh SRTP keys. The safe default is to invalidate the cache: if
+    // the master_secret is genuinely unchanged the next export
+    // recomputes the SAME 60 bytes (idempotent), and if it has changed
+    // we MUST recompute or we'd serve stale keys. The hits counter
+    // (`STATS_SRTP_KM_HITS`) is cumulative and is NOT reset here.
+    state[DTLS_S_SLOT_SRTP_KM_CACHED] = 0
     return 0
 }
 
@@ -2070,12 +2137,30 @@ fn dtls_extract_srtp_keys_R29B2_STUB(state) {
 // SHA256 iterations (each iter emits 32 bytes; ceil(60/32) = 2). The
 // caller typically invokes this exactly once per session right after
 // the handshake completes -- it is not on the per-packet hot path,
-// so a per-call recompute is fine. A future hardening could cache the
-// 60-byte buf in a fresh state slot if a session ever needs to re-key
-// SRTP without re-running DTLS (RFC 5764 §4.2 does not require that;
-// each rekey ordinarily renegotiates DTLS).
+// so a per-call recompute would be fine. R36B (R35A.2) nonetheless
+// caches the 60-byte buf in `DTLS_S_SLOT_SRTP_KM_CACHED` so any
+// subsequent call serves it from the slot without re-running the
+// PRF. The cached pointer IS the pointer returned on the miss path
+// (not a fresh copy each time) so callers can pin pointer-equality
+// for cache-hit assertions. `dtls_advance_epoch` clears the cache
+// (see the rationale above the slot declaration). On a cache hit
+// `DTLS_S_SLOT_STATS_SRTP_KM_HITS` increments; the first compute
+// (miss) does NOT bump.
 fn dtls_export_srtp_keying_material(state) {
     if state[DTLS_S_SLOT_CIPHER_ACTIVE] == 0 { return 0 }
+    // R36B fast path: cache hit. Serve the memoized buf verbatim and
+    // bump the cumulative hit counter. NOTE we do NOT re-validate the
+    // randoms / master_secret slots on a hit -- the cache invariant is
+    // that we ONLY populate the slot AFTER the PRF compute succeeded
+    // against those slots, so a non-zero cache implies the inputs were
+    // valid at compute time. The only legitimate way to invalidate is
+    // `dtls_advance_epoch` (or a fresh `dtls_init` state).
+    let cached = state[DTLS_S_SLOT_SRTP_KM_CACHED]
+    if cached != 0 {
+        state[DTLS_S_SLOT_STATS_SRTP_KM_HITS] =
+            state[DTLS_S_SLOT_STATS_SRTP_KM_HITS] + 1
+        return cached
+    }
     let cr = state[DTLS_S_SLOT_CLIENT_RANDOM]
     let sr = state[DTLS_S_SLOT_SERVER_RANDOM]
     let ms = state[DTLS_S_SLOT_MASTER_SECRET]
@@ -2101,7 +2186,14 @@ fn dtls_export_srtp_keying_material(state) {
     // master_secret is 48 bytes (RFC 5246 §8.1); pass that fixed
     // length so the PRF runs against the same 48-byte secret the
     // record-layer key_block derivation used.
-    return dtls_prf_sha256(ms, 48, "EXTRACTOR-dtls_srtp", seed, 64, 60)
+    let km = dtls_prf_sha256(ms, 48, "EXTRACTOR-dtls_srtp", seed, 64, 60)
+    // R36B: stash the computed buf so subsequent calls hit the cache.
+    // We deliberately store the EXACT pointer the PRF returned (not a
+    // copy) -- the caller-visible identity contract is "first compute
+    // wins, all subsequent calls see the same bytes via the same
+    // pointer until epoch advance invalidates".
+    state[DTLS_S_SLOT_SRTP_KM_CACHED] = km
+    return km
 }
 
 // ============================================================================
@@ -2128,6 +2220,7 @@ fn dtls_stats_line(state) {
         + " cert_expired=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_EXPIRED])
         + " cert_sig_fail=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL])
         + " cert_fp_mismatch=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH])
+        + " srtp_km_hits=" + int_to_str(state[DTLS_S_SLOT_STATS_SRTP_KM_HITS])
 }
 
 // ============================================================================
