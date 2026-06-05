@@ -3,6 +3,177 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R38D (R36A.alt) -- SCRAM-SHA-256 authentication for TURN (RFC 7635)
+
+**Status: complete** -- closes R36A's exit caveat ("MD5 is
+cryptographically broken... but RFC 5389 §15.4 mandates it for the
+long-term-credential mechanism. R36A remains on-spec; SCRAM-SHA1 /
+SCRAM-SHA256 (RFC 7635) is the modern replacement and is deferred").
+R38D ships SCRAM-SHA-256 alongside MD5 -- both auth paths coexist;
+clients negotiate via the new SECURITY-FEATURES attribute.
+
+### What R38D delivers
+
+* **`src/safety/scram.nova`** (NEW, ~600 lines + 130-line header) --
+  the SCRAM primitives leaf module:
+  * `pbkdf2_hmac_sha256(pwd, pwd_n, salt, salt_n, iter, dkLen) ->
+    buf` -- RFC 8018 §5.2 F-loop (`U_1 = HMAC(pwd, salt || INT(i))`;
+    `U_j = HMAC(pwd, U_{j-1})`; output = XOR of all U_j).
+  * `scram_base64_encode(buf, n) -> string` /
+    `scram_base64_decode(s) -> [buf, n] | 0` -- RFC 4648 §4
+    standard alphabet with '=' padding; inline (no separate
+    `safety/base64.nova` -- future R38D.2 can extract).
+  * Four RFC 5802 §5.1 message constructors:
+    `scram_client_first(user, nonce)`,
+    `scram_server_first(c_nonce, s_nonce, salt_b64, iter)`,
+    `scram_client_final(cb_b64, nonce, proof_b64)`,
+    `scram_server_final(sig_b64)`. Plus
+    `scram_auth_message(cfb, sf, cfnp)` for the AuthMessage
+    concatenation per RFC 5802 §3.
+  * Six SCRAM proof / signature primitives:
+    `scram_salted_password(pwd, salt, salt_n, iter)`,
+    `scram_client_key(sp)`, `scram_stored_key(ck)`,
+    `scram_server_key(sp)`, `scram_client_proof(sp, am, am_n)`,
+    `scram_server_signature(sp, am, am_n)`.
+  * Two convenience wrappers:
+    `scram_build_client_final(user, pwd, c_nonce, s_nonce, salt_b64,
+    iter) -> "c=biws,r=NONCE,p=PROOF"` and
+    `scram_compute_server_signature_b64(...)` for server-final
+    verification.
+  * `scram_nonce_from_counter(counter, n)` -- deterministic
+    counter+SHA-256 nonce for testability.
+  * `scram_random_nonce(n)` -- production CSPRNG stub that returns
+    0 to force callers through an OS-entropy seam they must wire
+    (NOVA's runtime does not currently expose `sys_getrandom`;
+    deterministic helper is the test-time path).
+
+* **`src/federation/turn.nova` extension (PURELY ADDITIVE)** --
+  R34B / R35B / R36A exports preserved BYTE-IDENTICAL. New surface:
+  * `TURN_ATTR_USERHASH = 0x001E` (RFC 7635 §3.1.1)
+  * `TURN_ATTR_MESSAGE_INTEGRITY_SHA256 = 0x001C` (RFC 7635 §3.2)
+  * `TURN_ATTR_SECURITY_FEATURES = 0x802A` (RFC 7635 §4)
+  * SECURITY-FEATURES flag bits: `TURN_SECFEAT_PWD = 1` (MD5),
+    `TURN_SECFEAT_SCRAM = 2` (SCRAM-SHA-256),
+    `TURN_SECFEAT_TLS_BIND = 4` (reserved -- not implemented).
+  * `turn_userhash(user, realm) -> 32B buf` = SHA-256(user + ":"
+    + realm) per RFC 7635 §3.1.1.
+  * `turn_negotiate_security_features(server_flags) -> client_flags`
+    -- "pick strongest available"; SCRAM wins over PWD when both
+    advertised; falls back to PWD otherwise.
+  * `turn_emit_allocate_request_scram(txn, lifetime, transport,
+    user, password, realm, c_nonce, s_nonce, salt_b64, iter) ->
+    [buf, n]` -- the SCRAM-authed Allocate Request:
+    `LIFETIME + REQUESTED-TRANSPORT + USERNAME + USERHASH + REALM +
+    NONCE + SECURITY-FEATURES + MESSAGE-INTEGRITY-SHA256` (the
+    NONCE attr carries the SCRAM server-first text
+    `"r=COMBINED,s=SALT,i=ITER"` so the client + server compute the
+    same AuthMessage). MI-SHA-256 key = SCRAM `StoredKey` =
+    SHA-256(HMAC(PBKDF2(password, salt, iter, 32), "Client Key"));
+    MAC computed over the prefix `[0..MI_attr_start)` per the
+    RFC 5389 §15.4 + RFC 7635 §3.2 rule.
+  * `turn_parse_scram_challenge(buf, n) ->
+    [combined_nonce_str, salt_b64_str, iter, realm_str] |
+    TURN_ERR_*` -- extracts the SCRAM challenge text from a 401
+    Unauthorized response's NONCE attribute.
+  * `turn_emit_scram_challenge_response(txn, realm, c_nonce,
+    s_nonce, salt_b64, iter, server_features) -> [buf, n]` --
+    builds a 401 with the canonical RFC 5802 §5.1 server-first
+    text (test-facing; a future server-side validator can lift it).
+  * `turn_verify_message_integrity_sha256(buf, n, stored_key) -> 1 | 0`
+    -- verifies the MI-SHA-256 attribute against a re-derived
+    StoredKey.
+
+### Verification
+
+* `tests/unit/test_scram.nova` (NEW) -- **43 assertions**, all
+  passing. RFC 4648 §10 base64 vectors, binary round-trip,
+  invalid-length rejection, alphabet boundaries; RFC 7914 §11
+  PBKDF2-HMAC-SHA256 at c=1 dkLen=64 (the canonical 128-hex-char
+  known output) + dkLen=32 truncation check + c=0 rejection;
+  SCRAM key schedule shape (ClientKey != ServerKey, StoredKey
+  deterministic, ClientProof XOR ClientSignature = ClientKey);
+  the headline RFC 7677 §3 SCRAM-SHA-256 canonical round-trip at
+  c=4096 (~16K SHA-256 compressions / ~100ms in NOVA bytecode)
+  matching the published
+  `ClientProof = "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="`
+  and
+  `ServerSignature = "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="`
+  vectors; the `scram_build_client_final` wrapper emits the
+  complete `"c=biws,r=...,p=..."` line per RFC 5802 §5.1; SCRAM
+  message constructors round-trip; nonce determinism (same
+  counter -> same nonce; different counter -> different nonce);
+  CSPRNG stub returns 0.
+
+* `tests/unit/test_turn.nova` -- **46 new assertions** (turn:
+  OK 451 checks, vs R36A's 405 baseline; **405 prior assertions
+  BYTE-IDENTICAL** per the additive-only contract). New SCRAM
+  block covers: attribute constants; USERHASH matches direct
+  SHA-256; negotiation prefers SCRAM, falls back to MD5 when only
+  PWD or TLS-binding advertised; SCRAM challenge response emit +
+  parse round-trip (combined_nonce / salt_b64 / iter / realm
+  extracted from NONCE attr text); SCRAM challenge parse rejects
+  non-401 codes; field-extraction helper; SCRAM Allocate Request
+  walks back to 8 attributes in the canonical order with the
+  expected lengths; MI-SHA-256 self-verify succeeds with the
+  correctly-derived StoredKey; MI-SHA-256 wrong-key verify returns
+  0 (no crash); R36A MD5 path still emits 6 attributes ending in
+  the 20-byte HMAC-SHA1 MI (vs R38D's 32-byte HMAC-SHA-256 MI) --
+  the two auth paths produce distinguishable wire bytes; "server
+  advertises only MD5" negative path: parse 401 -> observe
+  SECURITY-FEATURES bit 0 only -> negotiate to PWD -> caller falls
+  back to R36A's MD5 path.
+
+* 142 prior `test_ice_turn.nova` assertions BYTE-IDENTICAL.
+  R38C's 111 `test_turn_server.nova` assertions BYTE-IDENTICAL
+  (R38C's read-only turn.nova import remains compatible).
+  All R38D commits touch ONLY R38D-owned paths.
+
+### Honest design caveats
+
+* **PBKDF2 at the RFC 5802 §5.1 minimum of 4096 iterations is
+  SLOW** (~16K SHA-256 compressions per derive). The canonical
+  RFC 7677 §3 round-trip runs in ~100ms in the NOVA bytecode
+  runtime. A real client SHOULD cache `SaltedPassword` keyed on
+  (password, salt, iter); R38D does NOT ship that cache. A future
+  R38D.2 can add a SaltedPassword cache slot to the client state
+  (mirroring R36B's DTLS-SRTP keying material cache).
+
+* **Base64 helpers are INLINE in scram.nova** rather than extracted
+  to `src/safety/base64.nova`. The brief allows this for the
+  current round; a future R38D.2 could extract alongside an
+  x509 BER consumer that needs base64 of its own (DER-from-PEM).
+
+* **CSPRNG nonce is a STUB** -- `scram_random_nonce(n)` returns
+  0. The deterministic `scram_nonce_from_counter` is the test-time
+  path; it is NOT secret-sharing-safe (same counter -> same nonce
+  -> catastrophic for prod). NOVA's runtime needs to expose an
+  OS-entropy primitive before production nonce generation is
+  wired.
+
+* **TLS channel binding (RFC 7635 §3 + RFC 5929) is NOT shipped**
+  even though `TURN_SECFEAT_TLS_BIND` is defined. The SCRAM `c=`
+  attribute is hard-coded to "biws" (no binding). Adding binding
+  requires a hash of the TLS server cert which lives in R31B's
+  DTLS state -- future R38D.2.
+
+* **R38D verification surface is the CLIENT side.** R38D ships
+  `turn_verify_message_integrity_sha256` for server-side
+  validators to use, but does NOT ship a live SCRAM auth flow
+  on the SERVER side of turn_server.nova (R38C's territory). A
+  future round can layer the server-side validator on top.
+
+### Files touched
+
+* NEW: `src/safety/scram.nova`, `tests/unit/test_scram.nova`
+* EXTEND (additive only): `src/federation/turn.nova`,
+  `tests/unit/test_turn.nova`
+* DOCS: `NEXT_SESSION.md` (this section), `FEDERATED_AUDIT.md`
+  (R38D extension), `README.md` (R38D banner + status-table cell)
+
+R38B (DTLS PRF rekey, `2344514`) and R38C (TURN server-side state
+machine, `1bea868`) landed on the branch during R38D's session;
+both are unrelated to R38D's surface and remain untouched.
+
 ## R38C (R34B.3 / R35B.3) -- TURN SERVER-side state machine
 
 **Status: complete** -- closes R35B's exit caveat: "This is a CLIENT-

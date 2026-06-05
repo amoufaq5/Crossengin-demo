@@ -22,8 +22,8 @@ computational units rather than orchestrating a pipeline of modules.
 | Track | Latest round | What landed |
 |---|---|---|
 | Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
-| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B / R38C | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat); R38C TURN SERVER-side state machine (allocations + permissions + channels + tick). |
-| Safety / crypto leaves | R33A / R34A / R37C | Canonical `safety/sha256.nova` (R33A/R34A) + canonical `safety/md5.nova` + `safety/sha1.nova` (R37C); dedup of inline copies across noise_xk, merkle, ecdsa, dtls12, turn, srtp. |
+| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B / R38C / R38D | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat); R38C TURN SERVER-side state machine (allocations + permissions + channels + tick); R38D SCRAM-SHA-256 auth (RFC 7635) coexisting with the R36A MD5 auth path. |
+| Safety / crypto leaves | R33A / R34A / R37C / R38D | Canonical `safety/sha256.nova` (R33A/R34A) + canonical `safety/md5.nova` + `safety/sha1.nova` (R37C) + canonical `safety/scram.nova` (R38D: SCRAM-SHA-256 + PBKDF2-HMAC-SHA256 + base64); dedup of inline copies across noise_xk, merkle, ecdsa, dtls12, turn, srtp. |
 | Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
 | Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
 | NOVA toolchain | external | `stage2.s == stage3.s` self-host invariant treated as a load-bearing CI gate. |
@@ -35,6 +35,74 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > **R35A note.** v1.0 -- all 10 phases complete and assembled into one
 > unified agent process. Implemented in NOVA and verified against the
 > real self-hosting toolchain.
+>
+> R38D (R36A.alt) ships SCRAM-SHA-256 authentication (RFC 5802 /
+> RFC 7677 / RFC 7635) for TURN, alongside R36A's MD5-based
+> long-term-credential mechanism (RFC 5389 §15.4). Closes R36A's exit
+> caveat ("MD5 is cryptographically broken... but RFC 5389 §15.4
+> mandates it... SCRAM is the modern replacement and is deferred").
+> Both auth paths COEXIST -- clients negotiate via the new
+> SECURITY-FEATURES attribute (RFC 7635 §4): SCRAM (bit 1) is
+> preferred when servers advertise it, MD5 (bit 0) is the legacy
+> fallback. New leaf module `src/safety/scram.nova` (~600 lines + 130-
+> line header) hosts the PBKDF2-HMAC-SHA256 implementation
+> (RFC 8018 §5.2 F-loop), inline Base64 (RFC 4648 §4 with '='
+> padding), the four SCRAM message constructors (client-first /
+> server-first / client-final / server-final per RFC 5802 §5.1), the
+> SCRAM key schedule (`SaltedPassword = PBKDF2(pwd, salt, iter, 32)`,
+> `ClientKey = HMAC(SaltedPassword, "Client Key")`,
+> `StoredKey = SHA256(ClientKey)`,
+> `ServerKey = HMAC(SaltedPassword, "Server Key")`,
+> `ClientProof = ClientKey XOR HMAC(StoredKey, AuthMessage)`,
+> `ServerSignature = HMAC(ServerKey, AuthMessage)`), and a
+> deterministic counter+SHA-256 nonce helper for testability. A
+> `scram_random_nonce` stub returns 0 to force callers through an
+> OS-entropy seam they must wire (NOVA's runtime does not currently
+> expose `sys_getrandom`). Additive turn.nova surface adds 3 new
+> attribute constants (USERHASH=0x001E, MI-SHA-256=0x001C,
+> SECURITY-FEATURES=0x802A), 3 flag bits, the USERHASH helper
+> (SHA-256(user+":"+realm) per RFC 7635 §3.1.1), the negotiator
+> (`turn_negotiate_security_features` -- pick strongest available),
+> the SCRAM Allocate emitter (`turn_emit_allocate_request_scram`
+> emits 8 attrs ending in MI-SHA-256, keyed on SCRAM StoredKey,
+> HMAC over [0..MI_attr_start) per RFC 5389 §15.4 + RFC 7635 §3.2),
+> the challenge parser (`turn_parse_scram_challenge` returns
+> [combined_nonce, salt_b64, iter, realm] from the NONCE attr's
+> RFC 5802 §5.1 text encoding), and the MI-SHA-256 verifier.
+> R34B / R35B / R36A exports remain BYTE-IDENTICAL; R38C's
+> read-only turn_server.nova import remains compatible. **89 new
+> assertions**: 43 scram (RFC 4648 §10 base64 vectors, RFC 7914 §11
+> PBKDF2 c=1 dkLen=64/32 known outputs, the headline RFC 7677 §3
+> SCRAM-SHA-256 canonical round-trip at c=4096 confirming
+> `ClientProof = "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="`
+> and
+> `ServerSignature = "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="`,
+> XOR identity ClientProof XOR ClientSignature recovers ClientKey,
+> nonce determinism, CSPRNG stub) + 46 turn (constants, USERHASH
+> byte-equality, negotiation prefers SCRAM / falls back to MD5 /
+> ignores TLS-binding, challenge emit + parse round-trip, non-401
+> rejection, field-extraction helper, Allocate Request walks back
+> to 8 attrs in canonical order with USERHASH=32B + MI-SHA-256=32B
+> + SECURITY-FEATURES top byte = SCRAM, MI-SHA-256 self-verify
+> succeeds, MI-SHA-256 wrong-key returns 0, R36A MD5 path still
+> emits 6 attrs ending in 20-byte HMAC-SHA1 MI -- the two paths
+> produce distinguishable wire bytes, "server only advertises MD5"
+> negative path negotiates back to PWD). **405 prior turn assertions
+> BYTE-IDENTICAL** (R38D appends after R36A's block; main()
+> invocations extended in order). Honest caveats: PBKDF2 at the
+> RFC 5802 §5.1 minimum of 4096 iterations costs ~16K SHA-256
+> compressions per derive (~100ms in NOVA bytecode); a future
+> R38D.2 can add a SaltedPassword cache slot mirroring R36B's
+> DTLS-SRTP keying-material cache. Base64 helpers are inlined in
+> scram.nova rather than extracted to `src/safety/base64.nova`
+> (allowed for this round; future R38D.2 can extract). TLS channel
+> binding (RFC 7635 §3 + RFC 5929) is NOT shipped even though
+> `TURN_SECFEAT_TLS_BIND` is defined; `c=` is hard-coded to "biws"
+> (no binding). USERHASH is emitted alongside USERNAME so a server
+> consulting either field finds the user record. R38D ships the
+> CLIENT-side surface + a server-side MI verifier; a live SCRAM
+> server-side auth flow on turn_server.nova is future work (R38C
+> territory).
 >
 > R38C (R34B.3 / R35B.3) adds the SERVER-side TURN state machine that
 > closes R35B's exit caveat ("the TURN server's allocation pool, peer-

@@ -166,6 +166,13 @@
 // prior consumer assertions remain byte-identical.
 import "../safety/md5.nova"
 import "../safety/sha1.nova"
+// R38D (R36A.alt): SCRAM-SHA-256 auth path lives alongside R36A's
+// MD5-based long-term-credential auth. The new module is a leaf
+// safety primitive (PBKDF2-HMAC-SHA256 + base64 + SCRAM proof math)
+// imported as a thin additive helper; R36A's exports are preserved
+// byte-identical. R38C's `turn_server.nova` (concurrent) imports
+// turn.nova read-only and depends on the additive contract.
+import "../safety/scram.nova"
 
 // ============================================================================
 //                              Error tags (negative ints)
@@ -2247,4 +2254,503 @@ fn turn_client_restamp_last_permission(state, current_time_unix) {
 // Test shim for the channel-expiry-aware append.
 fn _turn_test_record_channel_r36a(state, current_time_unix) {
     return _turn_record_channel_r36a(state, current_time_unix)
+}
+
+// ============================================================================
+// ============================================================================
+//        SCRAM-SHA-256 auth path (R38D / R36A.alt -- RFC 7635)
+// ============================================================================
+// ============================================================================
+//
+// R36A's `turn_emit_allocate_request_authed` ships the RFC 5389 §15.4
+// MD5(user:realm:pass) long-term-credential mechanism. MD5 is
+// cryptographically broken for collision resistance (Wang 2004 /
+// FastColl 2007 / MD5SHATTERED 2009); RFC 5389 §15.4 nonetheless
+// MANDATES it for the long-term-credential mechanism so R36A remains
+// on-spec. R38D ships the modern replacement -- SCRAM-SHA-256 per
+// RFC 7635 / RFC 7677 -- alongside R36A so callers can negotiate the
+// authentication mechanism with the server via the new
+// SECURITY-FEATURES attribute (RFC 7635 §4).
+//
+// PURELY ADDITIVE -- the R34B wire codec, the R35B client state
+// machine, the R36A MD5 auth path, and all R34B/R35B/R36A exports
+// remain BYTE-IDENTICAL. R38D adds:
+//   * SECURITY-FEATURES attribute constants (RFC 7635 §4)
+//   * USERHASH attribute constant (RFC 7635 §3.1.1)
+//   * `turn_emit_allocate_request_scram` -- a SCRAM-authed Allocate
+//   * `turn_parse_scram_challenge` -- parses server's SCRAM challenge
+//   * `turn_userhash` -- the SHA-256-based USERHASH per RFC 7635 §3.1.1
+//   * Negotiation helpers -- given a server's SECURITY-FEATURES
+//     advertisement, the client picks SCRAM if available, else MD5.
+//
+// Honest design caveats
+// ---------------------
+// (1) PBKDF2 at the RFC 5802 §5.1 minimum of 4096 iterations costs
+//     ~16K SHA-256 compressions per derive. The unit test exercises
+//     the canonical RFC 7677 §3 vector at c=4096 (~100ms in NOVA);
+//     the SCRAM Allocate emit path also runs PBKDF2 once per request.
+//     A real client SHOULD cache `SaltedPassword` keyed on
+//     (password, salt, iterations) across re-issued Allocate requests
+//     so the cost is paid once per allocation cycle. R38D does NOT
+//     ship that cache; callers compute the proof fresh each time. A
+//     future R38D.2 can add a SaltedPassword cache slot to the
+//     client state.
+//
+// (2) The SCRAM protocol is text-mode (RFC 5802 §5) -- the
+//     client-first / server-first / client-final / server-final
+//     messages are ASCII strings. STUN/TURN is a binary protocol
+//     (RFC 8489 §5). RFC 7635 §3 defines the binding by carrying
+//     the SCRAM client-final string AS THE VALUE of new TLV
+//     attributes inside the STUN message. R38D's
+//     `turn_emit_allocate_request_scram` lays out the binding as:
+//       USERNAME       -- the original (non-saslprep) username string
+//       USERHASH       -- SHA-256(username + ":" + realm) per
+//                          RFC 7635 §3.1.1 (32-byte buf)
+//       REALM          -- echoed from the server's 401 challenge
+//       NONCE          -- echoed from the server's 401 challenge
+//                          (carries the SCRAM server-nonce concatenated
+//                          with a base64 salt and the iteration count;
+//                          see `turn_parse_scram_challenge` below)
+//       SECURITY-FEATURES -- 4-byte attr, top byte bit 1 = SCRAM-SHA-256
+//       MESSAGE-INTEGRITY-SHA256 -- 32-byte HMAC-SHA-256 keyed on the
+//                          SCRAM ClientProof bytes (the binding via
+//                          MI-SHA-256, RFC 7635 §3.2 -- a parallel
+//                          attribute to RFC 5389's MI which uses
+//                          HMAC-SHA-1).
+//     R38D ships the codec; the live server-side validation flow
+//     is left to a future round (RFC 8489 §17 fully specifies the
+//     validator; R38D mirrors the structure but is not a relay).
+//
+// (3) USERHASH is OPTIONAL per RFC 7635 §3.1.1 -- the wire format
+//     can carry USERNAME OR USERHASH, with the bit 0 of
+//     SECURITY-FEATURES choosing which. R38D's emitter ships both
+//     so a server that consults either will find it; the
+//     SECURITY-FEATURES bit 0 = 0 (USERNAME, not USERHASH-only mode)
+//     in the default path.
+//
+// (4) The SCRAM channel-binding ("cb") attribute is set to "biws"
+//     (base64 of "n,,") -- no TLS channel binding. RFC 7635 §3
+//     allows TLS binding via SECURITY-FEATURES bit 2; R38D's emitter
+//     leaves bit 2 clear (no TLS binding). TLS-binding support is
+//     future work.
+//
+// (5) Negotiation: R38D's `turn_negotiate_security_features` is the
+//     simple "pick the strongest available" helper. Given a server-
+//     advertised feature byte, returns the highest bit the client
+//     supports. Falls back to MD5 (bit 0) if SCRAM is unavailable.
+
+// ============================================================================
+//                          New attribute constants (RFC 7635)
+// ============================================================================
+//
+// Comprehension-optional attributes per the RFC 7635 §3 binding.
+//
+// SECURITY-FEATURES (0x802A) and USERHASH (0x001E) and
+// MESSAGE-INTEGRITY-SHA256 (0x001C) sit in the comprehension-required
+// (0x0000-0x7FFF) and comprehension-optional (0x8000-0xFFFF) ranges
+// per RFC 8489 §14 / §17. USERHASH + MI-SHA-256 are comprehension-
+// required (RFC 8489 §14.6 / §14.7); SECURITY-FEATURES is
+// comprehension-optional (RFC 7635 §4).
+
+let TURN_ATTR_USERHASH                = 30      // 0x001E
+let TURN_ATTR_MESSAGE_INTEGRITY_SHA256 = 28      // 0x001C
+let TURN_ATTR_SECURITY_FEATURES        = 32810   // 0x802A
+
+// SECURITY-FEATURES bit flags (RFC 7635 §4). The attribute value is
+// a single byte; the top three bits carry the flag set, the lower
+// 5 bits are reserved (must be zero on emit; ignored on parse).
+//
+// Bit 0 (0x01) -- PWD: password-based long-term credential (MD5)
+// Bit 1 (0x02) -- SCRAM-SHA-256
+// Bit 2 (0x04) -- TLS channel binding (not implemented; reserved)
+//
+// R38D emits SECURITY-FEATURES as a 4-byte attr (8-bit flags + 24-bit
+// RFFU) to keep the byte layout aligned with the other STUN attrs that
+// pad to a multiple of 4.
+
+let TURN_SECFEAT_PWD       = 1      // bit 0 -- MD5 long-term-credential
+let TURN_SECFEAT_SCRAM     = 2      // bit 1 -- SCRAM-SHA-256
+let TURN_SECFEAT_TLS_BIND  = 4      // bit 2 -- TLS channel binding
+
+let _TURN_MI_SHA256_LEN    = 32      // RFC 7635 §3.2 -- 32-byte HMAC-SHA-256
+
+// ============================================================================
+//                          USERHASH (RFC 7635 §3.1.1)
+// ============================================================================
+//
+// USERHASH = SHA-256(username + ":" + realm). 32 bytes. Used in place
+// of (or alongside) the plaintext USERNAME attribute so a server can
+// reference a user record without ever observing the raw username on
+// the wire.
+
+fn turn_userhash(username, realm) {
+    let un = len(username)
+    let rn = len(realm)
+    let total = un + 1 + rn
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < un {
+        store8(buf + i, char_at(username, i))
+        i = i + 1
+    }
+    store8(buf + un, 58)        // ':'
+    let j = 0
+    while j < rn {
+        store8(buf + un + 1 + j, char_at(realm, j))
+        j = j + 1
+    }
+    store8(buf + total, 0)
+    return sha256_oneshot(buf, total)
+}
+
+// ============================================================================
+//                          SECURITY-FEATURES negotiation
+// ============================================================================
+//
+// `turn_negotiate_security_features(server_features) -> chosen_features`
+//
+// Given the server's advertised SECURITY-FEATURES byte, returns the
+// CLIENT'S choice (a SECURITY-FEATURES byte to echo back). The client
+// strictly prefers SCRAM-SHA-256 over MD5 -- if the server advertises
+// SCRAM, the client picks SCRAM; otherwise it falls back to MD5.
+// TLS-binding is currently NOT chosen by R38D's emitter (bit 2 left
+// clear) even if the server advertises it.
+//
+// Returns:
+//   TURN_SECFEAT_SCRAM     when server advertises SCRAM
+//   TURN_SECFEAT_PWD       when server advertises only MD5 (or nothing)
+
+fn turn_negotiate_security_features(server_features) {
+    if int_and(server_features, TURN_SECFEAT_SCRAM) != 0 {
+        return TURN_SECFEAT_SCRAM
+    }
+    return TURN_SECFEAT_PWD
+}
+
+// ============================================================================
+//                          SECURITY-FEATURES emit
+// ============================================================================
+
+fn _turn_emit_security_features(buf, off, flags) {
+    _turn_put_u16(buf, off + 0, TURN_ATTR_SECURITY_FEATURES)
+    _turn_put_u16(buf, off + 2, 4)
+    store8(buf + off + 4, int_and(flags, 255))
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, 0)
+    store8(buf + off + 7, 0)
+    return off + 8
+}
+
+// ============================================================================
+//                          turn_emit_allocate_request_scram
+// ============================================================================
+//
+// Builds an Allocate Request with the RFC 7635 SCRAM-SHA-256 attribute
+// set:
+//   STUN header (20B, length field counts the FULL body)
+//   LIFETIME (8B)
+//   REQUESTED-TRANSPORT (8B)
+//   USERNAME (4 + pad4(len(username)))
+//   USERHASH (4 + 32)
+//   REALM    (4 + pad4(len(realm)))
+//   NONCE    (4 + pad4(len(nonce))) -- carries the SCRAM challenge
+//                                       (server_nonce, salt_b64, iter)
+//                                       in the canonical RFC 5802 §5.1
+//                                       text encoding
+//   SECURITY-FEATURES (4 + 4) -- flags = SCRAM
+//   MESSAGE-INTEGRITY-SHA256 (4 + 32) -- HMAC-SHA-256 keyed on the
+//                                        SCRAM-derived StoredKey,
+//                                        computed over the prefix
+//                                        [0..MI_attr_start) -- RFC 7635
+//                                        §3.2 / RFC 5389 §15.4 rule
+//
+// Inputs:
+//   txn_id_buf      -- 12-byte transaction id (caller-supplied)
+//   lifetime_sec    -- Allocate lifetime per RFC 5766 §6.2
+//   transport       -- protocol number (17 = UDP per IANA)
+//   username        -- saslprep'd username (caller is responsible for
+//                      saslprep; R38D treats it as opaque ASCII)
+//   password        -- the plaintext password (used to derive
+//                      SaltedPassword via PBKDF2)
+//   realm           -- realm string echoed from the server's challenge
+//   client_nonce    -- the client-side nonce (printable ASCII per
+//                      RFC 5802 §5.1)
+//   server_nonce    -- the server's nonce (from challenge)
+//   salt_b64        -- base64-encoded salt (from challenge)
+//   iterations      -- PBKDF2 iteration count (from challenge;
+//                      MUST be >= 4096 per RFC 5802 §5.1)
+// Returns [buf, n] (the wire bytes + their length).
+
+fn turn_emit_allocate_request_scram(txn_id_buf, lifetime_sec, transport,
+                                    username, password, realm,
+                                    client_nonce, server_nonce,
+                                    salt_b64, iterations) {
+    let un = len(username)
+    let rn = len(realm)
+    // The NONCE attribute value carries the RFC 5802 §5.1 server-first
+    // challenge text -- "r=<combined-nonce>,s=<salt-b64>,i=<iter>" --
+    // so the client can derive the exact AuthMessage the server will
+    // compute (idempotent re-derivation: the same bytes go on the wire
+    // and into the proof).
+    let nonce_str = scram_server_first(client_nonce, server_nonce,
+                                        salt_b64, iterations)
+    let nn = len(nonce_str)
+    let body = _turn_attr_size(4)          // LIFETIME
+              + _turn_attr_size(4)          // REQUESTED-TRANSPORT
+              + _turn_attr_size(un)         // USERNAME
+              + _turn_attr_size(32)         // USERHASH (32B fixed)
+              + _turn_attr_size(rn)         // REALM
+              + _turn_attr_size(nn)         // NONCE (carries challenge)
+              + _turn_attr_size(4)          // SECURITY-FEATURES
+              + _turn_attr_size(_TURN_MI_SHA256_LEN)  // MI-SHA-256
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_ALLOCATE, TURN_CLASS_REQUEST)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_lifetime(buf, off, lifetime_sec)
+    off = _turn_emit_requested_transport(buf, off, transport)
+    off = _turn_emit_str_attr(buf, off, TURN_ATTR_USERNAME, username)
+    let uh = turn_userhash(username, realm)
+    off = _turn_emit_var_attr(buf, off, TURN_ATTR_USERHASH, uh, 32)
+    off = _turn_emit_str_attr(buf, off, TURN_ATTR_REALM, realm)
+    off = _turn_emit_str_attr(buf, off, TURN_ATTR_NONCE, nonce_str)
+    off = _turn_emit_security_features(buf, off, TURN_SECFEAT_SCRAM)
+    // Compute the MESSAGE-INTEGRITY-SHA256 key per RFC 7635 §3.2.
+    // The key is the SCRAM `StoredKey` = SHA-256(ClientKey), where
+    // ClientKey = HMAC(SaltedPassword, "Client Key") and
+    // SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, iter, 32).
+    let salt = scram_base64_decode(salt_b64)
+    let sp = scram_salted_password(password, salt[0], salt[1], iterations)
+    let ck = scram_client_key(sp)
+    let sk = scram_stored_key(ck)
+    // The MI attr starts at `off`. HMAC input is the bytes [0..off).
+    let mi_off = off
+    let mac = hmac_sha256(sk, SCRAM_SHA256_KEY_LEN, buf, mi_off)
+    _turn_put_u16(buf, mi_off + 0, TURN_ATTR_MESSAGE_INTEGRITY_SHA256)
+    _turn_put_u16(buf, mi_off + 2, _TURN_MI_SHA256_LEN)
+    let mi_val = mi_off + 4
+    let k = 0
+    while k < _TURN_MI_SHA256_LEN {
+        store8(buf + mi_val + k, load8(mac + k))
+        k = k + 1
+    }
+    off = mi_off + 4 + _TURN_MI_SHA256_LEN
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                          turn_parse_scram_challenge
+// ============================================================================
+//
+// Extracts the SCRAM challenge from a TURN 401 response. The challenge
+// data lives in the NONCE attribute, in the RFC 5802 §5.1 server-first
+// text form: "r=<combined-nonce>,s=<salt-b64>,i=<iter>".
+//
+// Returns a 4-element list on success:
+//   [combined_nonce_str, salt_b64_str, iterations, realm_str]
+// or a negative TURN_ERR_* on framing failure.
+//
+// The combined_nonce is the SCRAM `r=` field which is the
+// CONCATENATION of the client-nonce (which the server echoes back)
+// and the server-generated nonce -- so callers can split it at the
+// known client-nonce length to recover the server-nonce alone.
+//
+// REALM is returned because callers need it for the USERHASH derivation
+// in the follow-up SCRAM-authed Allocate.
+
+fn _turn_scram_find_field(s, field_eq) {
+    // Find a substring of the form "<f>=...,?" (comma-terminated or
+    // end-of-string-terminated) inside the SCRAM challenge text.
+    // Returns the value between '=' and ',' (or end), or "" on absent.
+    let n = len(s)
+    let fn_len = len(field_eq)        // e.g. "r=" has length 2
+    let i = 0
+    while i <= n - fn_len {
+        // Check if `field_eq` starts at i.
+        let m = 0
+        let matched = 1
+        while m < fn_len {
+            if char_at(s, i + m) != char_at(field_eq, m) { matched = 0 }
+            m = m + 1
+        }
+        // Field must be at start-of-string or follow a comma to count
+        // (avoids matching "=" inside a value).
+        if matched == 1 {
+            if i > 0 {
+                if char_at(s, i - 1) != 44 { matched = 0 }   // ',' boundary
+            }
+        }
+        if matched == 1 {
+            let start = i + fn_len
+            // Find the next ',' from `start` (or end of string).
+            let cur = start
+            let end = n
+            let found = 0
+            while cur < n {
+                if found == 0 {
+                    if char_at(s, cur) == 44 {
+                        end = cur
+                        found = 1
+                    }
+                }
+                cur = cur + 1
+            }
+            let out = ""
+            let k = start
+            while k < end {
+                out = out + chr(char_at(s, k))
+                k = k + 1
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _turn_attr_to_str(value_ptr, value_n) {
+    let s = ""
+    let i = 0
+    while i < value_n {
+        s = s + chr(load8(value_ptr + i))
+        i = i + 1
+    }
+    return s
+}
+
+fn turn_parse_scram_challenge(buf, n) {
+    let r = _turn_walk_attrs(buf, n)
+    if r[0] < 0 { return r[0] }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(buf, 0))
+    if mc[1] != TURN_CLASS_ERROR_RESP { return TURN_ERR_METHOD }
+    let ec = _turn_find_attr(attrs, TURN_ATTR_ERROR_CODE)
+    if ec == 0 { return TURN_ERR_NO_ATTR }
+    let dec = _turn_decode_error_code(ec[1], ec[2])
+    if dec == 0 { return TURN_ERR_ATTR }
+    if dec[0] != 401 { return TURN_ERR_METHOD }
+    let realm = _turn_find_attr(attrs, TURN_ATTR_REALM)
+    if realm == 0 { return TURN_ERR_NO_ATTR }
+    let nonce = _turn_find_attr(attrs, TURN_ATTR_NONCE)
+    if nonce == 0 { return TURN_ERR_NO_ATTR }
+    let nonce_str = _turn_attr_to_str(nonce[1], nonce[2])
+    // SCRAM server-first format: "r=<combined>,s=<salt-b64>,i=<iter>".
+    let combined = _turn_scram_find_field(nonce_str, "r=")
+    let salt_b64 = _turn_scram_find_field(nonce_str, "s=")
+    let iter_str = _turn_scram_find_field(nonce_str, "i=")
+    if len(combined) == 0 { return TURN_ERR_NO_ATTR }
+    if len(salt_b64) == 0 { return TURN_ERR_NO_ATTR }
+    if len(iter_str) == 0 { return TURN_ERR_NO_ATTR }
+    let iter = str_to_int(iter_str)
+    if iter < 1 { return TURN_ERR_ATTR }
+    let realm_str = _turn_attr_to_str(realm[1], realm[2])
+    let out = list_new()
+    push(out, combined)
+    push(out, salt_b64)
+    push(out, iter)
+    push(out, realm_str)
+    return out
+}
+
+// ============================================================================
+//                          SCRAM challenge emit (test-only helper)
+// ============================================================================
+//
+// Build a 401 response whose NONCE attribute carries the SCRAM
+// challenge text. Used by tests to drive the parse path without a
+// live TURN server.
+
+fn turn_emit_scram_challenge_response(txn_id_buf, realm, client_nonce,
+                                      server_nonce, salt_b64,
+                                      iterations, server_features) {
+    let nonce_str = scram_server_first(client_nonce, server_nonce,
+                                        salt_b64, iterations)
+    let nn = len(nonce_str)
+    let rn = len(realm)
+    let reason = "Unauthorized"
+    let reason_n = len(reason)
+    let err_value_n = 4 + reason_n
+    let body = _turn_attr_size(err_value_n)        // ERROR-CODE 401
+              + _turn_attr_size(rn)                  // REALM
+              + _turn_attr_size(nn)                  // NONCE (challenge)
+              + _turn_attr_size(4)                   // SECURITY-FEATURES
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_ALLOCATE,
+                                   TURN_CLASS_ERROR_RESP)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    _turn_put_u16(buf, off + 0, TURN_ATTR_ERROR_CODE)
+    _turn_put_u16(buf, off + 2, err_value_n)
+    store8(buf + off + 4, 0)
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, 4)      // class = 4 (4xx)
+    store8(buf + off + 7, 1)      // number = 1 -> 401
+    let i = 0
+    while i < reason_n {
+        store8(buf + off + 8 + i, char_at(reason, i))
+        i = i + 1
+    }
+    off = off + _turn_attr_size(err_value_n)
+    off = _turn_emit_str_attr(buf, off, TURN_ATTR_REALM, realm)
+    off = _turn_emit_str_attr(buf, off, TURN_ATTR_NONCE, nonce_str)
+    off = _turn_emit_security_features(buf, off, server_features)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                          Verify MI-SHA-256 on emitted SCRAM Allocate
+// ============================================================================
+//
+// Mirror of `turn_verify_message_integrity` but for the 32-byte
+// HMAC-SHA-256 MI attribute (RFC 7635 §3.2). The key is the SCRAM
+// `StoredKey` = SHA-256(HMAC(SaltedPassword, "Client Key")). Returns
+// 1 on match, 0 otherwise (also 0 on missing MI).
+
+fn turn_verify_message_integrity_sha256(buf, n, stored_key) {
+    let r = _turn_walk_attrs(buf, n)
+    if r[0] < 0 { return 0 }
+    let attrs = r[1]
+    let mi = _turn_find_attr(attrs, TURN_ATTR_MESSAGE_INTEGRITY_SHA256)
+    if mi == 0 { return 0 }
+    if mi[2] != _TURN_MI_SHA256_LEN { return 0 }
+    let mi_attr_start = mi[1] - 4 - buf
+    if mi_attr_start < TURN_HDR_LEN { return 0 }
+    let computed = hmac_sha256(stored_key, SCRAM_SHA256_KEY_LEN,
+                                buf, mi_attr_start)
+    let i = 0
+    let diff = 0
+    while i < _TURN_MI_SHA256_LEN {
+        if load8(computed + i) != load8(mi[1] + i) { diff = 1 }
+        i = i + 1
+    }
+    if diff == 0 { return 1 }
+    return 0
+}
+
+// ============================================================================
+//                          Test-only shims for SCRAM path
+// ============================================================================
+
+fn _turn_test_userhash(username, realm) {
+    return turn_userhash(username, realm)
+}
+
+fn _turn_test_negotiate_security_features(server_features) {
+    return turn_negotiate_security_features(server_features)
+}
+
+fn _turn_test_scram_find_field(s, field_eq) {
+    return _turn_scram_find_field(s, field_eq)
 }
