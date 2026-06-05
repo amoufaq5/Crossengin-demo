@@ -58,6 +58,53 @@ computational units rather than orchestrating a pipeline of modules.
 > `OK (323 checks)` -- 200 original R34B assertions plus R35B's
 > 123 state-machine extension assertions in the same suite.
 >
+> R35B lands the TURN client-side allocation state machine on top of
+> R34B's wire codec. Extension to `src/federation/turn.nova`
+> (~500 lines added; the wire codec block 1..1052 unchanged
+> byte-for-byte). Six-state lifecycle (`TURN_STATE_IDLE` ->
+> `_PENDING` -> `_ACTIVE` -> `_REFRESHING` -> `_EXPIRED` / `_FAILED`),
+> 24-slot positional state list (state, current txn_id, relayed +
+> mapped IP/port, lifetime + expiry, last_err_code, permissions_list,
+> channels_list, 9 counter slots, in-flight method, pending peer for
+> in-flight perm/chanbind). Public API: `turn_client_init`,
+> `turn_client_send_allocate` (IDLE -> PENDING), `turn_client_send_
+> refresh` (ACTIVE -> REFRESHING), `turn_client_send_permission` (must
+> be ACTIVE; stamps the peer for the response handler to append),
+> `turn_client_send_channel_bind` (must be ACTIVE; rejects channel_num
+> outside `[0x4000, 0x7FFE]` per RFC 5766 §11 BEFORE emit),
+> `turn_client_recv(state, buf, n, now)` dispatches to one of
+> `TURN_RECV_ALLOCATED` / `_ALLOCATE_FAILED` / `_REFRESHED` /
+> `_REFRESH_FAILED` / `_REFRESH_DELETED` / `_PERMITTED` /
+> `_PERM_FAILED` / `_CHANNEL_BOUND` / `_CHANNEL_FAILED` / `_DATA` /
+> `_IGNORED`, and `turn_client_tick(state, now)` transitions ACTIVE
+> -> EXPIRED when `expiry < now`. Mismatched txn_ids on incoming
+> responses are IGNORED per RFC 8489 §6.3.3. CreatePermission success
+> appends `[peer_ip, peer_port, now+300]` (RFC 5766 §8 default) to
+> `permissions_list`; ChannelBind success appends `[chan_num,
+> peer_ip, peer_port]` to `channels_list`. Refresh with `lifetime=0`
+> transitions ACTIVE -> EXPIRED (RFC 5766 §7 server-initiated delete).
+> `tests/unit/test_turn.nova` extended to **323 assertions total** --
+> the prior 200 R34B assertions are byte-identical (lines 1..852
+> unchanged), plus 123 new R35B assertions covering: initial state
+> IDLE + all 9 counters zero, send_allocate / send_refresh /
+> send_permission / send_channel_bind state transitions and counter
+> bumps, recv of Allocate success / Allocate error (401) / Refresh
+> success / Refresh delete (lifetime=0) / Refresh error / perm
+> success+error / chanbind success+error / Data Indication / mismatched
+> txn / truncated buf, tick before/after expiry, channel_num band
+> enforcement (0x3FFF / 0x7FFF / 0x8000 rejected, 0x4000 boundary
+> accepted), multi-peer permissions (3 peers added in sequence), full
+> lifecycle walk IDLE->PENDING->ACTIVE->REFRESHING->EXPIRED->PENDING
+> (re-allocate after EXPIRED), ACTIVE->EXPIRED via tick. Deferred:
+> server-side allocation pool (RFC 5766 §6.2 -- a future round if
+> anyone needs to RUN a relay), per-permission refresh cadence (the
+> data structure carries expiry stamps but `tick` only reports
+> allocation expiry), 401-retry credential composition, IPv6.
+> Honest caveat: permission expiry is a CLIENT-side estimate
+> (`now+300` per RFC §8 default) because the CreatePermission success
+> response does NOT echo a permission lifetime; clients should re-issue
+> CreatePermission well inside the 5-minute window.
+>
 > R34B lands the TURN protocol wire codec (RFC 5766 / 8656) -- the
 > last R28E.2 deferred item. New module `src/federation/turn.nova`
 > (~700 lines, leaf) implements parse + emit for the six TURN
