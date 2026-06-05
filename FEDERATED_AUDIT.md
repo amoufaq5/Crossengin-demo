@@ -2388,6 +2388,152 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R37C extension (R36A.2 / R34C.2): canonical `src/safety/md5.nova` + `src/safety/sha1.nova`; dedup turn + srtp
+
+R36A (`1f15e02`) shipped TURN long-term-credential auth with inline
+RFC 1321 MD5 (~80 lines) + FIPS 180-4 SHA-1 + RFC 2104 HMAC-SHA1
+(~120 lines) bundled into `src/federation/turn.nova`, deferring
+canonicalization to a future R36A.2 because R34C's
+`_srtp_hmac_sha1` was underscore-prefixed (private) -- breaking
+R34C's sealed module to un-mangle would have been a parallel-
+ownership violation. R34C (`9a23da2`) shipped SRTP with inline
+SHA-1 + HMAC-SHA1 (~150 lines) bundled into
+`src/federation/srtp.nova`, documenting the duplication as an
+R34A.3-style follow-up candidate -- no canonical `sha1.nova`
+existed yet. R37C closes both follow-ups in a single bundle,
+applying the `safety/sha256.nova` dedup pattern R33A (3 of 4
+consumers) and R34A (the 4th consumer, dtls12) established.
+
+### What R37C delivers
+
+* **`src/safety/md5.nova` (NEW, 536 lines)** -- canonical pure-NOVA
+  RFC 1321 MD5. Standard K-table (64 sin-derived T-values),
+  S-table (per-round shift counts), g-index (message-schedule
+  indices), F/G/H/I round functions, IV (A,B,C,D), and LITTLE-
+  endian output. API:
+  * `md5_oneshot(buf, n) -> 17-byte buffer` (16B digest + NUL slack)
+  * `md5_oneshot_str(s) -> 17-byte buffer`
+  * `md5_init() / md5_update / md5_final` streaming
+  Constants `MD5_HASH_LEN = 16`, `MD5_BLOCK_LEN = 64`. Module
+  docstring documents the Wang 2004 / FastColl 2007 /
+  MD5SHATTERED 2009 attacks but justifies the implementation per
+  RFC 5389 §15.4 (the canonical STUN long-term-credential
+  derivation), RFC 5849 (OAuth 1.0 HMAC-MD5), and legacy IPsec
+  variants.
+
+* **`src/safety/sha1.nova` (NEW, 509 lines)** -- canonical pure-NOVA
+  FIPS 180-4 SHA-1 + RFC 2104 HMAC-SHA1. Standard 5-word IV, K
+  constants (four 32-bit values spanning rounds 0..19, 20..39,
+  40..59, 60..79), 80-round compression function with the four
+  (b,c,d) non-linear functions, BIG-endian output. API:
+  * `sha1_oneshot(buf, n) -> 21-byte buffer` (20B digest + NUL slack)
+  * `sha1_oneshot_str(s) -> 21-byte buffer`
+  * `sha1_init() / sha1_update / sha1_final` streaming
+  * `hmac_sha1(key, key_n, msg, msg_n) -> 21-byte buffer`
+  Constants `SHA1_HASH_LEN = 20`, `SHA1_BLOCK_LEN = 64`. Module
+  docstring documents the SHAttered 2017 collision attack but
+  justifies the implementation per RFC 3174 / RFC 5389 / RFC 3711
+  legacy specs that mandate SHA-1.
+
+* **`src/federation/turn.nova` refactored**: the inline MD5
+  (`_turn_md5_*` family) + inline SHA-1 (`_turn_sha1_*` family) +
+  inline HMAC-SHA1 (`_turn_hmac_sha1`) -- ~410 lines of inline
+  implementation -- are replaced with two `import` lines + four
+  thin wrappers (`_turn_md5_oneshot`, `_turn_hmac_sha1`,
+  `_turn_test_md5`, `_turn_test_hmac_sha1`) that forward to the
+  canonical primitives. `turn_hmac_sha1_key` unchanged (still
+  formats `"username:realm:password"` then calls
+  `_turn_md5_oneshot`). The MI byte-position rule (RFC 5389 §15.4
+  -- HMAC over bytes before the MI attribute) is unchanged.
+
+* **`src/federation/srtp.nova` refactored**: the inline SHA-1
+  (`_srtp_sha1_*` family) + inline HMAC-SHA1 (`_srtp_hmac_sha1`)
+  -- ~150 lines -- are replaced with one `import` line + two
+  thin wrappers that forward to the canonical primitives. The
+  `srtp_authenticate` truncation to 10 bytes (RFC 3711 §4.2 80-bit
+  tag) is unchanged.
+
+* **`_TURN_MD5_HASH_LEN = 16` retained** in turn.nova because two
+  call sites pass it as the `key_n` arg to `_turn_hmac_sha1` to
+  indicate the 16-byte MD5-derived MESSAGE-INTEGRITY key length
+  per RFC 5389 §15.4. All other prefixed constants are removed.
+
+### Verification
+
+* **All 359 prior turn assertions remain byte-identical** through
+  the wrapper pattern. The wrapper-preservation contract: a
+  wrapper that forwards every byte-buffer arg unchanged + returns
+  the canonical's return value is by construction
+  byte-equivalent. Test shims `_turn_test_md5` /
+  `_turn_test_hmac_sha1` are unchanged; the 359-assertion
+  `tests/unit/test_turn.nova` is byte-untouched.
+* **All 131 prior srtp assertions remain byte-identical** through
+  the wrapper pattern. The underscore-prefixed private symbols
+  `_srtp_sha1_oneshot` / `_srtp_hmac_sha1` are preserved as
+  wrappers; the 131-assertion `tests/unit/test_srtp.nova` is
+  byte-untouched.
+* **`tests/unit/test_md5.nova` (NEW, 16 assertions)** pins MD5
+  against RFC 1321 §A.5 KAT vectors (empty, "a", "abc", "message
+  digest", lowercase alphabet) + 55B/56B/100B boundary cases +
+  streaming-vs-oneshot equivalence across 4 splitting strategies
+  + string-wrapper round-trip + constants.
+* **`tests/unit/test_sha1.nova` (NEW, 17 assertions)** pins SHA-1
+  against FIPS 180-4 Appendix A / RFC 3174 KAT vectors (empty,
+  "abc", FIPS Appendix B.2 56-char input, 'a' * 1000) +
+  streaming-vs-oneshot equivalence across 5 splitting strategies +
+  HMAC-SHA1 RFC 2202 TC1 + TC2 + TC4 + long-key normalization +
+  string wrapper + constants.
+
+### Subtle differences between the two inline source copies
+
+* **MD5 source: only R36A's `_turn_md5_*` was available** (R34C's
+  srtp.nova doesn't use MD5). Promoted verbatim with the prefixes
+  mechanically renamed `_turn_md5_*` -> `_md5_*` and
+  `_TURN_MASK32` -> `_MD5_MASK32`. K-table, S-table, g-index,
+  F/G/H/I round functions, IV, and LE byte order are byte-for-
+  byte identical to RFC 1321 §3.4.
+* **SHA-1 source: picked R34C's `_srtp_sha1_*` family** over
+  R36A's `_turn_sha1_*` family. R36A's copy aliased the SHA-1
+  helpers onto MD5's helpers (e.g. `_turn_sha1_rotl32` called
+  `_turn_md5_mask32`) -- a micro-optimization that worked but
+  tangled the two algorithms' namespaces. R34C's `_srtp_sha1_*`
+  family is cleanly separated from any MD5 path (SRTP doesn't use
+  MD5), more closely mirrors the `src/safety/sha256.nova` shape,
+  and is therefore the cleaner-to-canonicalize source. Both
+  copies produce byte-identical outputs (proved indirectly via
+  the per-consumer test KAT vectors).
+* **Output byte order**: MD5 is LITTLE-endian per RFC 1321 §3.5;
+  SHA-1 is BIG-endian per FIPS 180-4 §6.1.2. Both consumers'
+  call sites consume the raw digest bytes directly without re-
+  encoding; the wrapper does NOT need a byte-order conversion.
+* **HMAC-SHA1 signature parity**: both `_turn_hmac_sha1` and
+  `_srtp_hmac_sha1` use `(key_buf, key_n, msg_buf, msg_n)` --
+  return is a freshly alloc'd 21B buffer, no output-buffer arg.
+  The canonical `hmac_sha1` exposes the same signature; wrappers
+  are one-line `return hmac_sha1(...)` forwards.
+
+### Files modified
+
+* NEW: `src/safety/md5.nova` (536 lines).
+* NEW: `src/safety/sha1.nova` (509 lines).
+* NEW: `tests/unit/test_md5.nova` (280 lines, 16 assertions).
+* NEW: `tests/unit/test_sha1.nova` (347 lines, 17 assertions).
+* MOD: `src/federation/turn.nova` (-420 net lines: removed
+  ~410 inline MD5 + SHA-1 + HMAC-SHA1, added 2 imports + 2
+  wrappers + header doc updates; kept `_TURN_MD5_HASH_LEN`).
+* MOD: `src/federation/srtp.nova` (-194 net lines: removed
+  ~230 inline SHA-1 + HMAC-SHA1, added 1 import + 2 wrappers +
+  header doc updates).
+* UNCHANGED: `tests/unit/test_turn.nova` (359 assertions byte-
+  identical to 1f15e02 / R36A's commit).
+* UNCHANGED: `tests/unit/test_srtp.nova` (131 assertions byte-
+  identical to 9a23da2 / R34C's commit).
+
+### Module count delta: +2 (`src/safety/md5.nova` + `src/safety/sha1.nova`).
+
+### Inline-MD5 copy count: **1 -> 0** (canonical is now the single authoritative source for RFC 1321 MD5 across the tree).
+### Inline-SHA-1 copy count: **2 -> 0** (canonical is now the single authoritative source for FIPS 180-4 SHA-1 + RFC 2104 HMAC-SHA1 across the tree).
+
 ## R34A extension (R33A.2): dtls12 SHA-256 dedup -> canonical `src/safety/sha256.nova`
 
 R33A landed the canonical `src/safety/sha256.nova` (FIPS 180-4 SHA-256

@@ -23,7 +23,7 @@ computational units rather than orchestrating a pipeline of modules.
 |---|---|---|
 | Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
 | Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry. |
-| Safety / crypto leaves | R33A / R34A | Canonical `safety/sha256.nova` + dedup of inline copies across noise_xk, merkle, ecdsa, dtls12. |
+| Safety / crypto leaves | R33A / R34A / R37C | Canonical `safety/sha256.nova` (R33A/R34A) + canonical `safety/md5.nova` + `safety/sha1.nova` (R37C); dedup of inline copies across noise_xk, merkle, ecdsa, dtls12, turn, srtp. |
 | Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
 | Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
 | NOVA toolchain | external | `stage2.s == stage3.s` self-host invariant treated as a load-bearing CI gate. |
@@ -76,6 +76,34 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > rotation the function returns 401; the JWT-with-public-key
 > upgrade path in `ARCHITECTURE.md` lifts that limitation but is not
 > shipped here.
+>
+> R37C (R36A.2 / R34C.2) retires both remaining inline MD5 + SHA-1 +
+> HMAC-SHA1 copies in the tree. R36A re-inlined MD5 + SHA-1 +
+> HMAC-SHA1 into `src/federation/turn.nova` (~200 lines) because
+> R34C's `_srtp_hmac_sha1` was underscore-prefixed (private);
+> un-mangling on R34C's side would have broken a sealed module.
+> R34C re-inlined SHA-1 + HMAC-SHA1 into `src/federation/srtp.nova`
+> (~150 lines) and documented the duplication as an R34A.3-style
+> follow-up candidate. R37C ships the canonical `src/safety/md5.nova`
+> (lifted from R36A's `_turn_md5_*` -- the only inline source) and
+> `src/safety/sha1.nova` (lifted from R34C's `_srtp_sha1_*` -- the
+> cleaner of the two source copies; R36A's SHA-1 aliased its helpers
+> onto MD5's helpers in a namespace tangle). Both consumers now
+> `import` the canonicals and expose their underscore-prefixed local
+> symbols as thin one-line wrappers; all 359 prior turn assertions +
+> 131 prior srtp assertions hold byte-identical (the same wrapper-
+> preservation contract R33A + R34A used for SHA-256). New tests
+> `tests/unit/test_md5.nova` (16 assertions; RFC 1321 §A.5 KAT) and
+> `tests/unit/test_sha1.nova` (17 assertions; FIPS 180-4 Appendix A
+> + RFC 3174 + RFC 2202 HMAC-SHA1 KAT) pin the canonicals against
+> the published vectors. Module count delta: +2; net line delta:
+> -227 (+536 md5 + +509 sha1 + +280 test_md5 + +347 test_sha1 -
+> 420 turn - 194 srtp). Honest caveat: MD5 is LITTLE-endian per
+> RFC 1321 §3.5 while SHA-1 + SHA-256 are BIG-endian; the
+> implementations bake this in via `_md5_store_le32` vs
+> `_sha1_store_be32`. Both consumers' call sites consume digest
+> bytes directly without re-encoding so the byte-order asymmetry
+> never escapes the canonical.
 >
 > R36A (R34B.2 / R35B.2 / R35D.2) closes three TURN-related deferrals
 > in one bundle: long-term-credential authentication (RFC 5389 §10 /
