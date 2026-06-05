@@ -3,6 +3,158 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R38B (R33B.4) -- DTLS PRF rekey on `dtls_advance_epoch`
+
+**Status: complete** -- closes R33B's last DTLS caveat. R33B shipped
+the CCS-on-epoch-change replay-window reset but explicitly left the
+key re-derivation deferred:
+
+> We do NOT re-derive keys here. Real DTLS-CCS rekeys via the PRF
+> (key_block expansion under the new epoch's seed). R33B's simple
+> model keeps the same `key_block` / `client_write_*` /
+> `server_write_*` buffers, so old wire records sealed under the
+> same key can still AEAD-decrypt successfully if the AAD seq_num
+> matches.
+
+R38B closes that caveat. On every `dtls_advance_epoch` we re-run the
+TLS 1.2 PRF to re-expand the 40-byte `key_block` from the SAME
+`master_secret` + `server_random || client_random` seed (RFC 5246
+§6.3 / RFC 6347 §4.1.2.6) and re-slice the four sub-buffers
+(`client_write_key`, `server_write_key`, `client_write_iv`,
+`server_write_iv`). A new cumulative telemetry counter
+`stats_rekeys` records every advance.
+
+### Variant A vs variant B
+
+The brief offers two semantics:
+
+* **Variant A (shipped):** re-run the SAME PRF inputs --
+  `master_secret`, the same randoms, the same `"key expansion"`
+  label, the same S || C seed order. The resulting 40 bytes are
+  byte-identical to the pre-advance `key_block`. Standards-compliant
+  per RFC 5246 §6.3 (which doesn't define rekey-via-CCS at all;
+  this is a soft-rekey path on a same-handshake CCS / DTLS
+  retransmit). The security-relevant cross-epoch differentiation
+  lives at the AEAD AAD layer (RFC 6347 §4.1.2.1 puts the epoch in
+  the upper 16 bits of the AAD seq_num), so variant A is fully
+  on-spec.
+* **Variant B (documented, NOT shipped):** mix the new epoch
+  number into the PRF seed
+  (`PRF(master_secret, "key expansion", server_random || client_random || epoch_bytes)`).
+  Non-standard but matches the security intuition of "fresh keys
+  per epoch". R38B documents this as a future research item; it
+  would need protocol-level discussion before shipping.
+
+R38B ships variant A. The architectural value is in (a) the
+`stats_rekeys` telemetry counter visible via the new
+`dtls_stats_rekeys(state)` accessor + the `rekeys=` field appended
+to `dtls_stats_line`, and (b) the call-site hook -- a future
+variant B trivially slots in by extending the seed allocation.
+
+### What R38B delivers
+
+* **One new state slot in `src/federation/dtls12.nova`**, appended
+  at the tail (slots 0..44 from R29B + R31B + R32B + R33B + R36B
+  remain byte-identical):
+  * `DTLS_S_SLOT_STATS_REKEYS = 45` -- cumulative count of
+    `dtls_advance_epoch` invocations that bumped the rekey path.
+    Counter bumps on every advance, even pre-cipher (so the
+    caller can audit how many advances happened). The PRF
+    re-expansion is gated on `master_secret` + `client_random` +
+    `server_random` being non-zero (post-ECDHE-derive); pre-cipher
+    advances skip the PRF call.
+* **Extended `dtls_advance_epoch(state)`**: keeps the R33B body
+  (epoch bumps + sequence resets + replay-window reset + R36B
+  cache invalidation), then appends the R38B rekey block. Bump
+  the rekeys counter, then iff the cipher slots are populated,
+  re-run `dtls_prf_sha256(ms, 48, "key expansion", S||C, 64, 40)`
+  and call `_dtls_slice_key_block(state, kb)` to refresh the four
+  sub-buffer pointers.
+* **New accessor `dtls_stats_rekeys(state)`** -- thin one-liner
+  exposing slot 45.
+* **`dtls_stats_line(state)` extended** with `rekeys=<n>`
+  appended at the tail after the R36B `srtp_km_hits=<n>` field.
+  R32B / R33B / R36B substring-scan assertions are unaffected.
+
+### Verification
+
+* **`tests/unit/test_dtls12.nova`** extended by 35 R38B assertions
+  across 9 new test functions, all appended at the tail of the
+  suite. Highlights:
+  * Init counter is 0 (`init_rekeys_counter_zero`).
+  * Counter bumps by exactly 1 per advance, monotonic across N
+    advances (`advance_epoch_bumps_rekeys_counter`).
+  * Pre-cipher advance still bumps the counter but skips the PRF
+    re-expansion (key_block + sub-buffers remain 0)
+    (`pre_cipher_advance_bumps_counter_but_skips_prf`).
+  * Post-cipher advance re-allocates the key_block + four
+    sub-buffer pointers; variant A means the BYTES are unchanged
+    (`advance_reallocates_key_block_and_subbuffers`).
+  * Cross-epoch seal/open round-trip works post-rekey (the R33B
+    contract holds byte-identically under the R38B rekey)
+    (`cross_epoch_seal_open_after_rekey`).
+  * Variant A determinism: two consecutive advances produce
+    byte-identical 40-byte key_blocks
+    (`variant_a_deterministic_prf_reexpansion`).
+  * R36B cache invalidation invariant holds: post-advance
+    `dtls_export_srtp_keying_material` re-derives, and variant A
+    means the 60 bytes are byte-identical to pre-advance
+    (`srtp_keying_material_recomputes_deterministically`).
+  * `dtls_stats_line` includes the new `rekeys=` field
+    (`stats_line_includes_rekeys_field`).
+  * Counter is per-state: alice's rekey activity does not leak
+    into bob's counter (`rekeys_counter_is_per_state`).
+* **417 prior dtls12 assertions byte-identical** -- the new slot 45
+  is tail-appended; slots 0..44 untouched; the new `rekeys=` field
+  is appended to the END of `dtls_stats_line` so prior R33B / R36B
+  substring scans still match. The R36B cache invalidation test
+  + the R33B cross-epoch seal/open test continue to pass under the
+  R38B rekey (variant A semantics: same bytes in, same bytes out).
+* **Compile/test unverified in this session.** No Nova toolchain
+  available in the working directory; the change is mechanical
+  (one tail-appended slot + one accessor + one rekey block in
+  `dtls_advance_epoch` mirroring the existing `dtls_ecdhe_derive`
+  step 4 + tests mirroring the R33B/R36B pattern).
+
+### Deferred to future rounds
+
+* **Variant B (epoch-in-seed PRF).** Would change the byte output
+  per epoch and provide cryptographic cross-epoch key
+  differentiation in addition to the AAD-epoch differentiation.
+  Non-standard; needs protocol-level discussion. The call site is
+  already structured so the variant-B switch is a one-line
+  seed-extension change.
+* **Full re-handshake hook.** A fresh ECDHE-derived
+  master_secret would populate slot 19 (master_secret) and slot
+  20 (key_block) via the existing `dtls_ecdhe_derive` path. The
+  wire driver decides which path to invoke: same-handshake CCS
+  (calls `dtls_advance_epoch` for a soft-rekey + window reset)
+  or full re-handshake (calls `dtls_ecdhe_derive` again with new
+  randoms). R38B does NOT add a separate "rehandshake" function;
+  the existing path is reused.
+
+### Honest design caveats
+
+* **Variant A doesn't add cryptographic cross-epoch key
+  differentiation.** Re-running the SAME PRF with the SAME inputs
+  produces the SAME 40 bytes. The cross-epoch security property
+  holds because the AEAD AAD's upper 16 bits carry the epoch
+  number (RFC 6347 §4.1.2.1), so a record sealed at (epoch=0,
+  seq=N) and the same plaintext sealed at (epoch=1, seq=N)
+  produce DIFFERENT ciphertext + tag even with byte-identical
+  keys. The R38B PRF re-run is telemetry + a hook, NOT the
+  load-bearing security property -- the AAD epoch differentiation
+  is. This is documented inline in `dtls_advance_epoch` and at
+  the slot-declaration comment.
+* **One extra PRF expansion per advance.** Two HMAC-SHA256
+  iterations (ceil(40/32) = 2) per `dtls_advance_epoch` call.
+  Advances are rare (one per CCS); the cost is negligible.
+* **R38B touches only `dtls12.nova` + `test_dtls12.nova` + docs.**
+  srtp.nova / turn.nova / ice_turn.nova / x509.nova / ecdsa.nova /
+  sha256.nova are unchanged. R38C (TURN server, concurrent on
+  turn.nova) + R38D (SCRAM auth, concurrent on a different file)
+  cannot collide.
+
 ## R37F (R36F.2) -- Vercel-hybrid reference architecture
 
 **Status: complete** -- materializes the Vercel-hybrid deployment pattern

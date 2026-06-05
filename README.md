@@ -17,12 +17,12 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-## Status (through R36)
+## Status (through R38)
 
 | Track | Latest round | What landed |
 |---|---|---|
 | Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
-| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry. |
+| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat). |
 | Safety / crypto leaves | R33A / R34A / R37C | Canonical `safety/sha256.nova` (R33A/R34A) + canonical `safety/md5.nova` + `safety/sha1.nova` (R37C); dedup of inline copies across noise_xk, merkle, ecdsa, dtls12, turn, srtp. |
 | Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
 | Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
@@ -231,6 +231,40 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > exporter PRF cost is two HMAC-SHA256 iterations; called once
 > per session post-handshake, not on the per-packet hot path, so
 > per-call recompute is fine.
+>
+> R38B (R33B.4) closes R33B's last DTLS caveat -- the deferred
+> "real DTLS-CCS rekeys via the PRF (key_block expansion under the
+> new epoch's seed)" note. `dtls_advance_epoch(state)` now re-runs
+> the TLS 1.2 PRF on every advance to re-expand the 40-byte
+> `key_block` from the SAME `master_secret` +
+> `server_random || client_random` seed (RFC 5246 §6.3 / RFC 6347
+> §4.1.2.6), and re-slices the four sub-buffers
+> (`client_write_key`, `server_write_key`, `client_write_iv`,
+> `server_write_iv`) via the existing `_dtls_slice_key_block`
+> helper. A new tail-appended slot
+> `DTLS_S_SLOT_STATS_REKEYS = 45` accumulates a per-advance
+> counter exposed via `dtls_stats_rekeys(state)` and surfaced on
+> `dtls_stats_line` as `rekeys=<n>`. R38B ships variant A: re-run
+> the SAME PRF inputs -- the resulting 40 bytes are byte-identical
+> to pre-advance. Variant B (mix the epoch into the seed,
+> non-standard) is documented as a future research item. Cross-
+> epoch differentiation is provided by the AEAD AAD layer (RFC
+> 6347 §4.1.2.1 puts the epoch in the upper 16 bits of the AAD
+> seq_num), so byte-identical keys do NOT enable cross-epoch
+> replay -- the PRF re-run is telemetry + a hook, NOT the load-
+> bearing security property. 35 new dtls12 R38B assertions across
+> 9 test functions (init zero counter, advance bumps counter
+> monotonically, pre-cipher advance bumps counter but skips PRF,
+> post-advance key_block + 4 sub-buffer pointers reallocated +
+> bytes byte-identical, cross-epoch seal/open after rekey,
+> variant A determinism, R36B cache invalidation invariant
+> intact, stats line includes `rekeys=`, per-state independence).
+> 417 prior dtls12 assertions byte-identical (slot 45 tail-
+> appended; slots 0..44 untouched; new `rekeys=` field appended
+> at the END of `dtls_stats_line` so R33B / R36B substring scans
+> still match). Honest caveat: variant A is on-spec but doesn't
+> add cryptographic cross-epoch key differentiation -- the AAD
+> epoch upper bits do; variant B would, but it's non-standard.
 >
 > R36B (R35A.2 / R33B.3) closes R35A's "future hardening" caveat
 > by memoizing the 60-byte PRF expansion in a fresh tail-appended

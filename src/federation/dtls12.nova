@@ -546,6 +546,62 @@ let DTLS_S_SLOT_RECV_EPOCH             = 42  // int -- per-side recv epoch
 let DTLS_S_SLOT_SRTP_KM_CACHED      = 43  // 60B buf | 0 -- memoized PRF expand
 let DTLS_S_SLOT_STATS_SRTP_KM_HITS  = 44  // int -- cache-hit count
 
+// R38B (R33B.4): PRF rekey counter on CCS / epoch advance.
+//
+// `DTLS_S_SLOT_STATS_REKEYS` is a cumulative count of `dtls_advance_epoch`
+// invocations that successfully re-ran the TLS 1.2 PRF to re-derive the
+// 40-byte `key_block` (and re-slice the four sub-buffers
+// `client_write_key`, `server_write_key`, `client_write_iv`,
+// `server_write_iv`). R33B's exit caveat explicitly deferred this:
+//
+//   > We do NOT re-derive keys here. Real DTLS-CCS rekeys via the PRF
+//   > (key_block expansion under the new epoch's seed). R33B's simple
+//   > model keeps the same `key_block` / `client_write_*` /
+//   > `server_write_*` buffers, so old wire records sealed under the
+//   > same key can still AEAD-decrypt successfully if the AAD seq_num
+//   > matches.
+//
+// R38B closes that caveat. On every `dtls_advance_epoch` we re-expand
+// the 40-byte `key_block` from the SAME `master_secret` +
+// `server_random || client_random` seed (RFC 5246 §6.3 / RFC 6347
+// §4.1.2.6) and re-slice the four sub-buffers. We call this the
+// "soft-rekey" path -- the master_secret is unchanged (the ECDHE-derived
+// secret survives the CCS), so re-running the SAME PRF inputs produces
+// the SAME 40 bytes. The semantic value is in (a) the telemetry: a
+// monitor can watch `dtls_stats_rekeys(state)` to know how many times
+// the key_block was re-expanded across the connection lifetime, and
+// (b) the architectural hook: a future variant that mixes the new
+// epoch number into the PRF seed (non-standard, but matches the
+// security intuition of "fresh keys per epoch") slots in at the same
+// call site. R38B ships variant A (the standards-compliant version);
+// variant B is documented as a research item.
+//
+// Cross-epoch differentiation: because the AEAD AAD's upper 16 bits
+// carry the epoch number (RFC 6347 §4.1.2.1), a record sealed at
+// (epoch=0, seq=N) and the SAME plaintext sealed at (epoch=1, seq=N)
+// produce DIFFERENT AEAD inputs -- the AAD differs in the epoch
+// field -- so the resulting ciphertext + tag are NOT byte-identical
+// even when the key_block bytes are. Cross-epoch replay protection
+// therefore holds at the AAD layer; the PRF re-run by itself is
+// telemetry + a hook, not the load-bearing security property.
+//
+// The counter is cumulative across the connection lifetime; it is
+// NOT reset on `dtls_advance_epoch` (mirrors the R32B / R33B
+// `STATS_REPLAY` / `STATS_CERT_*` / R36B `STATS_SRTP_KM_HITS`
+// patterns). Accessor: `dtls_stats_rekeys(state)`.
+//
+// Pre-cipher case: if `dtls_advance_epoch` runs BEFORE
+// `dtls_ecdhe_derive` has populated `master_secret` /
+// `client_random` / `server_random`, there is no PRF input to
+// expand. We detect that condition (any of the three slots == 0)
+// and SKIP the re-derivation -- the counter still bumps so the
+// caller sees that the advance happened, but the cipher slots are
+// left untouched (they were 0 anyway). This keeps the function
+// total: it never fails, mirroring the R33B contract.
+// ----------------------------------------------------------------------------
+
+let DTLS_S_SLOT_STATS_REKEYS        = 45  // int -- key_block re-expand count
+
 fn dtls_init() {
     let st = list_new()
     push(st, DTLS_S_INIT)        // state
@@ -597,6 +653,8 @@ fn dtls_init() {
     // R36B SRTP keying-material cache + hit counter.
     push(st, 0)                  // srtp_km_cached (no cache; first call computes)
     push(st, 0)                  // stats_srtp_km_hits
+    // R38B PRF-rekey counter on epoch advance.
+    push(st, 0)                  // stats_rekeys
     return st
 }
 
@@ -1272,6 +1330,15 @@ fn dtls_send_epoch(state)             { return state[DTLS_S_SLOT_EPOCH] }
 // pattern; only the cache pointer is cleared on epoch advance).
 fn dtls_stats_srtp_km_hits(state)     { return state[DTLS_S_SLOT_STATS_SRTP_KM_HITS] }
 
+// R38B: cumulative count of `dtls_advance_epoch` invocations that
+// re-expanded the key_block via the TLS 1.2 PRF. Variant A (re-run
+// the SAME PRF inputs) is the standards-compliant default; the
+// counter bumps regardless of whether the resulting bytes changed,
+// since the security-relevant event is "a rekey HAPPENED" not "the
+// bytes are different". See the slot-declaration comment for the
+// full rationale + the variant-B future-research note.
+fn dtls_stats_rekeys(state)           { return state[DTLS_S_SLOT_STATS_REKEYS] }
+
 // Caller-pinned wall-clock used by `dtls_cert_verify`. The caller is
 // expected to set this just before invoking cert verify (typically the
 // wire driver reads `sys_unix_seconds()` once per handshake). Returns
@@ -1896,18 +1963,35 @@ fn _dtls_test_attribute_aad(state) {
 // `STATS_REPLAY`, `STATS_TOO_OLD`) -- those are cumulative telemetry
 // across the connection lifetime, not per-epoch.
 //
-// We do NOT re-derive keys here. Real DTLS-CCS rekeys via the PRF
-// (key_block expansion under the new epoch's seed). R33B's simple model
-// keeps the same `key_block` / `client_write_*` / `server_write_*`
-// buffers, so old wire records sealed under the same key can still
-// AEAD-decrypt successfully if the AAD seq_num matches. This is the
-// "different AAD; not a replay in the new key context" semantics
-// documented in the R33B brief deliverable (b)3: cross-epoch replay
-// protection at the WINDOW layer is reset, but cross-epoch replay
-// protection at the AEAD layer (via the AAD's epoch upper-bits) holds
-// only because the AAD seq_num for a record at (epoch=0, seq=N) differs
-// from (epoch=1, seq=N). Future hardening: pair `dtls_advance_epoch`
-// with a fresh PRF expansion (R33C or later).
+// R38B (R33B.4) closes the rekey caveat. On every advance we re-run
+// the TLS 1.2 PRF to re-expand the 40-byte `key_block` from the SAME
+// `master_secret` + `server_random || client_random` seed (RFC 5246
+// §6.3 / RFC 6347 §4.1.2.6) and re-slice the four sub-buffers. This
+// is the "soft-rekey" path: the master_secret is unchanged across a
+// plain CCS (no fresh ECDHE), so re-running the SAME PRF inputs
+// produces the SAME 40 bytes -- but a `STATS_REKEYS` counter bumps
+// to record that the rekey happened, and the architecture supports a
+// future variant B (mix the epoch into the seed, non-standard) that
+// would actually change the bytes. R38B ships variant A; variant B
+// is documented as a research item in the slot-declaration comment.
+//
+// Cross-epoch replay protection therefore holds at TWO independent
+// layers: (a) the WINDOW layer (reset here, so a record at seq=N in
+// the old epoch cannot replay against seq=N in the new epoch -- the
+// watermark is now 0), and (b) the AEAD AAD layer (the AAD's upper
+// 16 bits carry the epoch number per RFC 6347 §4.1.2.1, so a record
+// sealed at (epoch=0, seq=N) produces a different ciphertext + tag
+// from the same plaintext sealed at (epoch=1, seq=N)). The R38B PRF
+// re-run is telemetry + a hook, NOT the load-bearing security
+// property -- the AAD epoch differentiation is.
+//
+// Pre-cipher case: if `dtls_advance_epoch` runs before
+// `dtls_ecdhe_derive` has populated `master_secret` /
+// `client_random` / `server_random`, the PRF has no input to
+// expand. We detect that condition (any of the three slots == 0)
+// and skip the re-derivation; the counter still bumps so the caller
+// sees the advance happened. This keeps the function total: it
+// never fails.
 //
 // Returns 0 (no diagnostic codes -- this function never fails).
 // ----------------------------------------------------------------------------
@@ -1928,6 +2012,51 @@ fn dtls_advance_epoch(state) {
     // we MUST recompute or we'd serve stale keys. The hits counter
     // (`STATS_SRTP_KM_HITS`) is cumulative and is NOT reset here.
     state[DTLS_S_SLOT_SRTP_KM_CACHED] = 0
+    // R38B: PRF rekey. Bump the cumulative counter unconditionally so
+    // the caller can audit how many advances have happened, then re-
+    // expand the key_block iff the cipher slots are populated (post-
+    // ECDHE-derive). The re-expansion uses the SAME formula as
+    // `dtls_ecdhe_derive` step 4: PRF(master_secret, "key expansion",
+    // server_random || client_random)[0..39]. RFC 5246 §6.3 fixes the
+    // label + seed order (S || C, inverted vs the master_secret
+    // derivation). Variant A: re-run the same inputs -- the resulting
+    // 40 bytes are byte-identical to the pre-advance key_block. The
+    // value is in (a) telemetry visibility and (b) the structural
+    // hook for variant B (epoch-in-seed, non-standard, future
+    // research). See `DTLS_S_SLOT_STATS_REKEYS` for the full design
+    // rationale.
+    state[DTLS_S_SLOT_STATS_REKEYS] = state[DTLS_S_SLOT_STATS_REKEYS] + 1
+    let ms = state[DTLS_S_SLOT_MASTER_SECRET]
+    let cr = state[DTLS_S_SLOT_CLIENT_RANDOM]
+    let sr = state[DTLS_S_SLOT_SERVER_RANDOM]
+    if ms != 0 {
+        if cr != 0 {
+            if sr != 0 {
+                // Build the 64-byte seed = server_random || client_random
+                // (S || C order per RFC 5246 §6.3 for key_block).
+                let kb_seed = alloc(65)
+                let i = 0
+                while i < 32 {
+                    store8(kb_seed + 0  + i, load8(sr + i))
+                    store8(kb_seed + 32 + i, load8(cr + i))
+                    i = i + 1
+                }
+                store8(kb_seed + 64, 0)
+                // master_secret is 48 bytes (RFC 5246 §8.1); key_block
+                // is 40 bytes for the AES-128-GCM suite (2 * 16B keys
+                // + 2 * 4B implicit IVs). Same call shape as the
+                // initial derivation in `dtls_ecdhe_derive`.
+                let kb = dtls_prf_sha256(ms, 48, "key expansion",
+                                         kb_seed, 64, 40)
+                state[DTLS_S_SLOT_KEY_BLOCK] = kb
+                // Re-slice into the four sub-buffers. The slice helper
+                // overwrites the per-key/iv slots with fresh
+                // allocations, so subsequent seal/open call sites
+                // automatically pick up the new buffers.
+                _dtls_slice_key_block(state, kb)
+            }
+        }
+    }
     return 0
 }
 
@@ -2221,6 +2350,7 @@ fn dtls_stats_line(state) {
         + " cert_sig_fail=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL])
         + " cert_fp_mismatch=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH])
         + " srtp_km_hits=" + int_to_str(state[DTLS_S_SLOT_STATS_SRTP_KM_HITS])
+        + " rekeys=" + int_to_str(state[DTLS_S_SLOT_STATS_REKEYS])
 }
 
 // ============================================================================
