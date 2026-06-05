@@ -36,6 +36,47 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > unified agent process. Implemented in NOVA and verified against the
 > real self-hosting toolchain.
 >
+> R37F (R36F.2) materializes the Vercel-hybrid reference architecture
+> R36F's `docs/GETTING_STARTED.md` Section 5 named but deferred. Lands
+> `infra/vercel-proxy/` as a complete scaffold: a Next.js 14 App Router
+> app (`web/`) with a streamed chat UI (`app/page.tsx`) and a single
+> Vercel Function (`app/api/chat/route.ts`) that forwards `/api/chat`
+> POSTs to `${CROSSENGIN_URL}/chat` with `Authorization: Bearer
+> ${CROSSENGIN_TOKEN}`; a Python HTTP wrapper (`backend/server.py`)
+> that listens `:8080`, validates the bearer in constant time
+> (`hmac.compare_digest`), and routes per `session_id` to a persistent
+> `bin/crossengin-chat` child (the `scripts/web.py` pattern -- LRU cap
+> `CE_MAX_SESSIONS=8`, eviction sends `/quit`); a Dockerfile
+> (`ubuntu:24.04`) that clones NOVA + CrossEngin, runs `bootstrap.sh`,
+> `make install`s the binaries, and exposes `:8080`; a
+> `docker-compose.yml` for one-command local dev (volume mount
+> `./data:/data` for persistence; `entrypoint.sh` refuses to start
+> with the dev-default token unless `CE_ALLOW_DEV_TOKEN=1`); deploy
+> recipes (`backend/README.md`) for Fly.io / Hetzner VPS / Render;
+> `ARCHITECTURE.md` (end-to-end flow + latency budget + ~5 EUR/mo
+> single-user cost model + JWT upgrade path for v2); `SECURITY.md`
+> (six-threat walkthrough: token leakage / DoS via expensive prompts
+> / backend exposure / session-id spoofing / stdin interleave /
+> container escape, with code-level mitigations); two smoke tests
+> (`tests/test_backend_health.py` -- `/health` 200 + `/chat` 401
+> without auth; `tests/test_chat_route.ts` -- mocks fetch, validates
+> request-shape pass-through across the 500/400/413/502 + happy-path
+> cases). `docs/GETTING_STARTED.md` Section 5.3 replaces the "TODO
+> reference architecture" pointer with the full scaffold layout,
+> local + production deploy commands, and a configuration env-vars
+> table. R37F.2 candidates (documented but unshipped): a `chat.sh
+> --batch` mode that takes input on stdin and emits the reply on
+> stdout in a single process per call (removes the
+> `/tmp/crossengin_input` choreography); per-IP rate-limiting at the
+> Vercel function via Upstash Redis; an `infra/vercel-proxy/proxy/`
+> Caddyfile template with Vercel-IP-range filtering for public-VPS
+> deploys; Dockerfile hardening (non-root user, read-only rootfs,
+> `cap_drop: [ALL]`). Honest caveat: the v0.1 token-rotation flow
+> has no overlap window -- between backend rotation and Vercel
+> rotation the function returns 401; the JWT-with-public-key
+> upgrade path in `ARCHITECTURE.md` lifts that limitation but is not
+> shipped here.
+>
 > R36A (R34B.2 / R35B.2 / R35D.2) closes three TURN-related deferrals
 > in one bundle: long-term-credential authentication (RFC 5389 §10 /
 > RFC 5766 §4), per-permission refresh cadence, and a permission-

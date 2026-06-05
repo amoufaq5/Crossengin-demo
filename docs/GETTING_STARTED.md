@@ -280,11 +280,78 @@ environment variables.
   - Persistence (`src/persistence/`) lives on the VM's local disk;
     back up to S3-compatible storage on a schedule.
 
-### 5.3 Reference architecture -- TODO
+### 5.3 Reference architecture -- `infra/vercel-proxy/`
 
-A worked example of `infra/vercel-proxy/` (Next.js app + Caddy config
-+ Fly.io deploy manifest) is planned for a future round. Track in the
-issue tracker; not yet in this repo.
+R37F ships the complete scaffold under [`infra/vercel-proxy/`](../infra/vercel-proxy/):
+
+```
+infra/vercel-proxy/
+  web/                     # Next.js 14 App Router project (deploys to Vercel)
+    app/page.tsx           # streamed chat UI
+    app/api/chat/route.ts  # POST handler; forwards to backend with Bearer token
+    vercel.json            # function runtime + maxDuration pin
+    .env.example           # CROSSENGIN_URL / CROSSENGIN_TOKEN reference
+    README.md              # deploy steps for Vercel
+  backend/                 # Python HTTP wrapper + Docker image
+    server.py              # listens :8080, validates bearer, spawns bin/crossengin-chat
+    Dockerfile             # ubuntu:24.04, builds NOVA + CrossEngin from source
+    docker-compose.yml     # one-command local dev (./data:/data persistence)
+    entrypoint.sh          # refuses to start without a real token
+    README.md              # deploy recipes (Fly.io / Hetzner / Render)
+  ARCHITECTURE.md          # end-to-end diagram + latency + cost model
+  SECURITY.md              # threat model (token leakage, DoS, exposure, escape)
+  tests/
+    test_backend_health.py # /health 200 + /chat 401 smoke test
+    test_chat_route.ts     # mocks fetch; validates request-shape pass-through
+```
+
+Quick-start (local dev, both halves on one laptop):
+
+```bash
+# Backend in one terminal:
+cd infra/vercel-proxy/backend
+docker-compose up --build     # http://localhost:8080 + ./data volume
+
+# Frontend in another:
+cd infra/vercel-proxy/web
+cp .env.example .env.local
+# edit .env.local: CROSSENGIN_URL=http://localhost:8080
+#                  CROSSENGIN_TOKEN=local-dev-token
+pnpm install
+pnpm dev                      # http://localhost:3000
+```
+
+Production deploy (Vercel + a Linux backend):
+
+```bash
+# Provision the backend (Fly.io / Hetzner / Render -- see backend/README.md).
+# Configure CROSSENGIN_TOKEN there; grab the public hostname.
+
+cd infra/vercel-proxy/web
+vercel link
+vercel env add CROSSENGIN_URL production    # https://your-backend.example
+vercel env add CROSSENGIN_TOKEN production  # paste the same value
+vercel deploy --prod
+```
+
+Configuration env vars:
+
+| Variable           | Side    | Default                | Purpose                                    |
+|--------------------|---------|------------------------|--------------------------------------------|
+| `CROSSENGIN_URL`   | Vercel  | (required)             | Backend base URL (HTTPS in prod).          |
+| `CROSSENGIN_TOKEN` | both    | (required)             | Shared bearer; `openssl rand -hex 32`.     |
+| `CE_BIN`           | backend | `bin/crossengin-chat`  | Binary to spawn (one-shot fallback set to `bin/crossengin`). |
+| `CE_PORT`          | backend | `8080`                 | Listen port.                               |
+| `CE_BIND`          | backend | `0.0.0.0`              | Listen interface (set `127.0.0.1` behind a reverse proxy). |
+| `CE_MAX_SESSIONS`  | backend | `8`                    | LRU cap for per-session chat children.     |
+| `CE_REQUEST_TIMEOUT_S` | backend | `30.0`             | Per-turn read timeout.                     |
+
+For the end-to-end flow diagram, latency / cost models, and the
+authentication-upgrade path (JWT + key rotation), see
+[`infra/vercel-proxy/ARCHITECTURE.md`](../infra/vercel-proxy/ARCHITECTURE.md).
+For threats + mitigations (token leakage, DoS, backend exposure,
+container escape), see
+[`infra/vercel-proxy/SECURITY.md`](../infra/vercel-proxy/SECURITY.md).
 
 ### 5.4 Honest notes on the hybrid pattern
 

@@ -3,6 +3,178 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R37F (R36F.2) -- Vercel-hybrid reference architecture
+
+**Status: complete** -- materializes the Vercel-hybrid deployment pattern
+R36F's `docs/GETTING_STARTED.md` Section 5 named but explicitly deferred
+("infra/vercel-proxy/ reference architecture deferred"). Lands a
+working skeleton: a Next.js-on-Vercel front end + a Python HTTP wrapper
+around `bin/crossengin-chat` + a Docker / docker-compose backend that
+any Linux host can run.
+
+### What R37F delivers
+
+* **`infra/vercel-proxy/web/`** -- Next.js 14 App Router project. Chat
+  UI in `app/page.tsx` (text input + Send + streamed-render conversation
+  history; stable per-tab `session_id` via `crypto.randomUUID()`);
+  `app/api/chat/route.ts` is the Vercel Function (Node runtime,
+  `maxDuration=60`) that reads `CROSSENGIN_URL` + `CROSSENGIN_TOKEN`
+  from env, validates the body shape (8KB input cap; 413 above),
+  forwards `POST /chat` with `Authorization: Bearer ${TOKEN}` +
+  `x-crossengin-session: ${session_id}`, and pipes the upstream
+  `Response.body` back unmodified (memory-flat regardless of payload
+  size). Error envelope: 500 if env missing, 400 on empty/oversize
+  input, 502 on network failure, pass-through for backend 4xx/5xx.
+  `vercel.json` pins the runtime + max duration; `.env.example`
+  documents the env vars.
+
+* **`infra/vercel-proxy/backend/server.py`** -- Python HTTP wrapper.
+  Listens `:8080` (`CE_BIND=0.0.0.0` by default; reverse-proxy
+  pattern uses `127.0.0.1`). `GET /health` is unauthenticated (200
+  + JSON `{status, binary, oneshot, sessions}` for orchestrator
+  probes). `POST /chat` validates the bearer with
+  `hmac.compare_digest` (constant-time), parses
+  `{session_id, input}`, and dispatches to a per-`session_id`
+  persistent `bin/crossengin-chat` child -- the
+  `scripts/web.py` LRU pattern with `CE_MAX_SESSIONS=8`; eviction
+  sends `/quit` then reaps. `request_lock` serializes concurrent
+  `stdin.write` + prompt-wait on the same child. One-shot fallback
+  via `CE_BIN=bin/crossengin` runs the `scripts/chat.sh` shape
+  (`/tmp/crossengin_input` -> spawn -> grep `agent>` line).
+
+* **`infra/vercel-proxy/backend/Dockerfile`** -- `ubuntu:24.04`,
+  installs `build-essential` + `binutils` + `gdb` + `git` +
+  `python3`, clones NOVA + CrossEngin (build-args `NOVA_REF` +
+  `CROSSENGIN_REF`), runs `make && make self-host` on NOVA (cannot
+  ship the image without the self-host invariant; R36F's CI gate),
+  then `bash scripts/bootstrap.sh && make install` for CrossEngin,
+  copies `server.py` + `entrypoint.sh`, declares `VOLUME /data`,
+  exposes `:8080`, and adds a `HEALTHCHECK` that hits `/health`.
+
+* **`infra/vercel-proxy/backend/docker-compose.yml`** -- one-command
+  local dev. Maps `8080:8080`, mounts `./data:/data` for cognitive
+  state persistence (decision log + KG snapshots), sets the dev-
+  default `CROSSENGIN_TOKEN=local-dev-token` + `CE_ALLOW_DEV_TOKEN=1`
+  (the entrypoint refuses the dev default without the bypass flag).
+
+* **`infra/vercel-proxy/backend/entrypoint.sh`** -- preflight + exec.
+  Verifies `CE_BIN` exists + is executable, refuses to start with an
+  empty or dev-default `CROSSENGIN_TOKEN` (clear error message,
+  exit-2 / exit-3), then `exec python3 server.py` so PID-1 signals
+  propagate cleanly.
+
+* **`infra/vercel-proxy/ARCHITECTURE.md`** -- end-to-end flow
+  diagram, per-turn timeline, components table, authentication
+  model (bearer in v0.1 + JWT upgrade path for v2), token rotation
+  procedure (with the honest "no overlap window" caveat), latency
+  budget table (browser->Vercel edge 20-80ms; cold function
+  100-300ms; backend hop 10-150ms; substrate tick >=10ms; target
+  <1s warm, <2s cold), cost model (~5 EUR/mo total with Hetzner +
+  Vercel Hobby for single-user), and an explicit "what this
+  scaffold does NOT do" list (no K8s/Terraform; no multi-tenant;
+  no partial-token streaming; no Edge runtime).
+
+* **`infra/vercel-proxy/SECURITY.md`** -- threat-by-threat
+  walkthrough. T1 token leakage (mitigations: no-log access logs,
+  `.env.local` gitignored, `hmac.compare_digest`, distinct
+  per-env tokens, dev-default refusal). T2 DoS via expensive
+  prompts (8KB input cap at the function; `maxDuration=60`; 30s
+  backend per-turn read timeout; LRU eviction). T3 backend
+  exposure (mitigations: Fly 6PN private network, WireGuard,
+  Vercel-IP-range filtering). T4 session-id spoofing (informational
+  for v0.1 single-user; v2 plan = JWT `sub`). T5 stdin interleave
+  (mitigation: `request_lock` per child). T6 container escape
+  (documented hardening: non-root user, read-only rootfs,
+  `cap_drop: [ALL]`, seccomp profile; v0.1 docker-compose ships
+  permissive defaults).
+
+* **`infra/vercel-proxy/tests/`** -- two smoke tests. Python
+  `test_backend_health.py` validates `/health` returns 200 + the
+  JSON shape orchestrator probes expect AND `/chat` without a
+  bearer returns 401 (stdlib-only; exits 0 on pass, 1 on fail; CI
+  gate-ready). TypeScript `test_chat_route.ts` imports the route
+  module, stubs a minimal `NextRequest.json()`, mocks `global.fetch`,
+  and validates the five canonical paths: 500 when env vars
+  missing, 400 on empty input, 413 on oversize input, 502 when
+  fetch throws, and the happy path (correct upstream URL with
+  trailing-slash normalization, bearer header, session header,
+  body shape pass-through, streamed body returned).
+
+* **`docs/GETTING_STARTED.md` Section 5.3** -- replaces the
+  "TODO reference architecture" pointer with the full scaffold
+  layout (tree diagram of `infra/vercel-proxy/`), quick-start
+  commands for local dev (backend `docker-compose up` + frontend
+  `pnpm dev`) and production (`vercel link` + `vercel env add` +
+  `vercel deploy --prod`), the configuration env-vars table
+  (CROSSENGIN_URL / CROSSENGIN_TOKEN / CE_BIN / CE_PORT / CE_BIND /
+  CE_MAX_SESSIONS / CE_REQUEST_TIMEOUT_S with side + default +
+  purpose columns), and cross-references to ARCHITECTURE.md +
+  SECURITY.md.
+
+### chat.sh invocation strategy
+
+Researched `scripts/chat.sh` and `scripts/web.py` first. The repo ships
+two chat surfaces:
+
+* `bin/crossengin` -- one-shot daemon driven by `scripts/chat.sh`. Reads
+  `/tmp/crossengin_input`, prints one `agent>` line, exits. Stateless
+  across turns.
+* `bin/crossengin-chat` -- persistent REPL with admin commands. Driven
+  by `scripts/web.py` (per-cookie LRU store). Holds cognitive state
+  across turns.
+
+The wrapper defaults to `bin/crossengin-chat` because cross-turn state
+is what makes a chat UI useful. Set `CE_BIN=bin/crossengin` and the
+wrapper falls back to the `scripts/chat.sh` algorithm (write input file
+-> spawn -> grep `agent>` line). A future `R37F.2` could add a
+`scripts/chat.sh --batch` mode (stdin -> agent reply on stdout in a
+single subprocess) to remove the `/tmp/crossengin_input` file-system
+choreography -- documented in `backend/README.md` but not implemented.
+
+### What R37F does NOT do
+
+* **No Kubernetes / Terraform.** docker-compose is the only deployment
+  artifact.
+* **No partial-token streaming.** The agent surface is line-shaped;
+  `Response.body` piping keeps memory flat but the body is the full
+  `agent>` line + trace per turn, not SSE-style deltas.
+* **No multi-tenant routing.** `session_id` is opaque; v0.1 is
+  single-user per the CrossEngin v1 positioning.
+* **No automated bearer rotation.** v0.1 has no overlap window; the JWT
+  upgrade path is documented in `ARCHITECTURE.md` but not shipped.
+* **No `chat.sh --batch` mode.** The wrapper works around the existing
+  invocation shapes; a cleaner stdin/stdout protocol is a follow-up.
+* **No Caddyfile / nginx template** for the public-VPS deploy.
+  `backend/README.md` describes the pattern but the proxy config is
+  not codified.
+* **No CI integration.** The TS smoke test is written but not auto-run
+  in this sandbox -- requires `tsx` (the README documents
+  `pnpm add -D tsx`).
+
+### Verification
+
+* Python smoke test (`tests/test_backend_health.py`) is stdlib-only +
+  written-but-not-run-in-the-sandbox (no docker-compose to run
+  against). Designed for `python3 tests/test_backend_health.py
+  http://localhost:8080` after `docker compose up` succeeds.
+* TS route smoke test (`tests/test_chat_route.ts`) covers the five
+  canonical paths; needs `tsx` installed in `web/` to run.
+* `tsc --noEmit` (via `pnpm typecheck`) is the recommended pre-deploy
+  check; the route + page are written in strict mode.
+
+### R37F.2 candidates (deferred)
+
+* `scripts/chat.sh --batch` flag (stdin/stdout protocol; removes the
+  `/tmp/crossengin_input` file dance).
+* Per-IP rate-limiting at the Vercel function via Upstash Redis or
+  Vercel KV (`@upstash/ratelimit`).
+* `infra/vercel-proxy/proxy/` Caddyfile template with Vercel-IP-range
+  filtering for public-VPS deploys.
+* Dockerfile hardening pass: non-root user, `read_only: true` in
+  docker-compose, `cap_drop: [ALL]`, generated seccomp profile.
+* JWT bearer (Vercel-side signed; backend verifies with public half)
+  to enable rotation with an overlap window.
+
 ## R36A (R34B.2 / R35B.2 / R35D.2) -- TURN long-term-credential auth + per-permission tick
 
 **Status: complete** -- closes three TURN-related deferrals from
