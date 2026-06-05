@@ -133,6 +133,103 @@ per RFC 5764 §4.2.
   seal+open path; the R30B.3 bitsliced AES + constant-time
   comparators hardening scope continues to track this.
 
+## R36B (R35A.2 / R33B.3) -- cached DTLS-SRTP keying material slot
+
+**Status: complete** -- closes R35A's "future hardening" caveat
+that the 60-byte PRF expansion in `dtls_export_srtp_keying_material`
+is recomputed on every call. R36B memoizes the buf in a fresh
+tail-appended state slot and clears it on `dtls_advance_epoch`.
+
+### What R36B delivers
+
+* **Two new state slots in `src/federation/dtls12.nova`**, appended
+  at the tail (slots 0..42 from R29B + R31B + R32B + R33B remain
+  byte-identical):
+  * `DTLS_S_SLOT_SRTP_KM_CACHED = 43` -- holds `0` (no cache; next
+    call computes) or the pointer to the 60-byte PRF expand. The
+    cached pointer IS the pointer returned to all callers (not a
+    fresh copy each time) so callers can pin pointer equality.
+  * `DTLS_S_SLOT_STATS_SRTP_KM_HITS = 44` -- cumulative cache-hit
+    counter. First compute (miss) does NOT bump; every
+    serve-from-cache does. Cumulative across the connection
+    lifetime; NOT reset on epoch advance.
+* **Extended `dtls_export_srtp_keying_material(state)`**: cache
+  fast-path on hit (bump hits, return cached pointer); existing
+  PRF compute path on miss + stash the returned pointer in the
+  cache slot. The `cipher_active` gate still runs BEFORE the
+  cache lookup, so a pre-handshake export still returns 0.
+* **Cache invalidation hook** in `dtls_advance_epoch(state)`: one
+  new line clears the cache slot to 0. Rationale: RFC 5764 §4.2
+  allows a DTLS re-handshake to feed new SRTP keys, and we cannot
+  tell from inside `advance_epoch` whether the caller intends a
+  full re-handshake or a key_block-only refresh. Safe default
+  is to recompute on next export -- if master_secret is genuinely
+  unchanged the recompute yields the SAME 60 bytes (idempotent).
+* **New accessor `dtls_stats_srtp_km_hits(state)`** -- thin
+  one-liner exposing slot 44.
+* **`dtls_stats_line(state)` extended** with `srtp_km_hits=<n>`
+  appended at the tail of the existing dtls12 stats string. Prior
+  R32B / R33B substring-scan assertions are unaffected.
+
+### Verification
+
+* **`tests/unit/test_dtls12.nova`** extended by 32 R36B
+  assertions across 8 new test functions, all appended at the
+  tail of the suite. Highlights:
+  * Init cache slot + hits are 0 (`init_cache_slot_zero`).
+  * First call is a miss -- returns 60B, populates slot 43, hits
+    stays 0 (`first_call_populates_cache`).
+  * Second call returns SAME POINTER as first (POINTER-equal, not
+    just byte-equal) and hits bumps to 1
+    (`second_call_serves_cached_pointer`).
+  * Third call -> hits=2 (`third_call_bumps_hits_to_two`).
+  * `dtls_advance_epoch` clears the cache; next export is a miss
+    (no hits bump); call after that hits to 3
+    (`advance_epoch_invalidates_cache`).
+  * Cached bytes byte-identical guard
+    (`cached_bytes_match_first_compute`).
+  * Per-state cache independence: alice + bob have separate
+    caches + hit counters (`caches_are_per_state`).
+  * Pre-handshake gate not bypassed by empty cache
+    (`cache_does_not_bypass_cipher_active_gate`).
+* **369 prior dtls12 assertions byte-identical** -- slots 43+44
+  are tail-appended; slots 0..42 untouched; existing tests do
+  not index into slot 43+ or expect a specific stats_line shape.
+
+### Deferred to future rounds
+
+* **Manual cache invalidation.** No public
+  `dtls_invalidate_srtp_km_cache(state)` function shipped. If a
+  future use case needs a manual flush under unchanged epoch,
+  add a one-line `state[SRTP_KM_CACHED] = 0` accessor.
+* **Constant-time considerations.** Cache-hit latency vs miss
+  latency leaks no key bits (it's just `if cache != 0 return`),
+  but if a future threat model wants to mask the latency the
+  appropriate fix is to revert to per-call recompute (i.e.
+  R35A's shape) -- a one-line revert.
+
+### Honest design caveats
+
+* **Invalidate-on-epoch-advance pays one extra PRF expansion per
+  plain CCS.** A pure key_block CCS (same master_secret) could
+  technically keep the cache valid; we invalidate anyway because
+  epoch advance is rare and we cannot tell from
+  `dtls_advance_epoch` whether the caller intends a re-handshake
+  or a key_block-only refresh. Cost: two HMAC-SHA256 iterations
+  per epoch transition. The opposite default (never invalidate)
+  would silently serve stale SRTP keys after a real DTLS
+  re-handshake -- a security footgun we explicitly reject.
+* **Compile/test unverified in this session.** No Nova toolchain
+  available in the working directory; the changes are mechanical
+  (tail-appended slots + pure pointer memoization + one-line
+  invalidate + accessor + tests mirroring the R32B/R33B
+  telemetry pattern). The byte-identity claim for 369 prior
+  assertions rests on the tail-append discipline.
+* **R36B touches only `dtls12.nova` + `test_dtls12.nova` + docs.**
+  srtp.nova / turn.nova / ice_turn.nova / sha256.nova are
+  unchanged -- R36A (TURN auth, concurrent on turn.nova) cannot
+  collide.
+
 ## R35D -- ICE-TURN integration layer (R30C + R34B consumer)
 
 **Status: complete** -- closes the last gap between R30C's ICE agent

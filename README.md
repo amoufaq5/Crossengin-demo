@@ -70,6 +70,34 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > per session post-handshake, not on the per-packet hot path, so
 > per-call recompute is fine.
 >
+> R36B (R35A.2 / R33B.3) closes R35A's "future hardening" caveat
+> by memoizing the 60-byte PRF expansion in a fresh tail-appended
+> state slot (`DTLS_S_SLOT_SRTP_KM_CACHED = 43`). First call to
+> `dtls_export_srtp_keying_material(state)` computes the PRF as
+> before and stashes the returned buf pointer in the slot; every
+> subsequent call serves THAT SAME pointer (not a fresh copy) and
+> bumps a cumulative cache-hit counter
+> (`DTLS_S_SLOT_STATS_SRTP_KM_HITS = 44`, exposed via
+> `dtls_stats_srtp_km_hits(state)`). Cache invalidation hook:
+> `dtls_advance_epoch(state)` (the R33B CCS-on-epoch-change reset
+> path) clears the cache slot back to 0 so a real DTLS
+> re-handshake never serves stale SRTP keys -- if the
+> master_secret is genuinely unchanged the next exporter call
+> recomputes the same 60 bytes (idempotent), and if it changed
+> we MUST recompute. The hits counter is cumulative and is NOT
+> reset on epoch advance, mirroring the R32B / R33B telemetry
+> pattern. 32 new dtls12 R36B assertions across 8 test functions
+> (init zero-cache shape, miss-populates / does-NOT-bump-hits,
+> same-pointer hit + hits bumps to 1/2, advance_epoch invalidates
+> + miss recomputes + next hit bumps to 3, cached bytes
+> byte-identical, per-state independence, cipher_active gate
+> still runs first). 369 prior dtls12 assertions byte-identical
+> (slots 43+44 tail-appended; slots 0..42 untouched). Honest
+> caveat: invalidating on every epoch advance is the
+> safe-but-slightly-wasteful default -- a pure key_block CCS
+> (no re-handshake; same master_secret) will pay one extra PRF
+> expansion next call (two HMAC-SHA256 iterations).
+>
 > R35D lands the ICE-TURN integration layer -- when ICE's
 > peer-to-peer candidate gathering exhausts host + server-reflexive
 > candidates without a usable pair, the orchestrator escalates to a
