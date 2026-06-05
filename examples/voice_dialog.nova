@@ -246,6 +246,11 @@ let VC_DIALOG_PIVOT_THRESHOLD = 2
 //   9 -- pending_clarify_raw (the original raw transcript that
 //        triggered the clarify, kept for history annotation on the
 //        give-up path). R25B.6.
+//  10 -- last_stt_confidence (milli 0..1000; -1 if unknown / not set).
+//        R34D. Telemetry slot for the most recent STT result's
+//        confidence as plumbed through `vc_session_turn_with_confidence`.
+//        The legacy `vc_session_turn` (which has no STT-side
+//        confidence to plumb) leaves it at -1.
 let _VC_SESS_HIST            = 0
 let _VC_SESS_TPL             = 1
 let _VC_SESS_KIND            = 2
@@ -256,6 +261,7 @@ let _VC_SESS_PENDING_KINDS   = 6
 let _VC_SESS_PENDING_TPL     = 7
 let _VC_SESS_PENDING_ATTEMPTS = 8
 let _VC_SESS_PENDING_RAW     = 9
+let _VC_SESS_LAST_STT_CONF   = 10
 
 // Turn slot indices.
 //   0 -- question_text (string)
@@ -281,6 +287,7 @@ fn vc_session_new() {
     push(s, VC_TPL_UNKNOWN)      // pending_clarify_template (R25B.6)
     push(s, 0)                   // pending_clarify_attempts (R25B.6)
     push(s, "")                  // pending_clarify_raw (R25B.6)
+    push(s, 0 - 1)               // last_stt_confidence milli (-1 = unset) R34D
     return s
 }
 
@@ -330,6 +337,15 @@ fn vc_session_pending_clarify_raw(session) {
     return session[_VC_SESS_PENDING_RAW]
 }
 
+// R34D -- last STT confidence in milli (0..1000), or -1 when no STT
+// result has been threaded through this session (the legacy
+// `vc_session_turn` path leaves it at -1; only `vc_session_turn_with_
+// confidence` populates it). Tests / telemetry use this to inspect the
+// most recent transcription's confidence without re-running STT.
+fn vc_session_last_stt_confidence(session) {
+    return session[_VC_SESS_LAST_STT_CONF]
+}
+
 fn vc_session_is_pending_clarify(session) {
     if len(session[_VC_SESS_PENDING_KINDS]) > 0 { return 1 }
     return 0
@@ -350,6 +366,7 @@ fn vc_session_reset(session) {
     list_set(session, _VC_SESS_PENDING_TPL, VC_TPL_UNKNOWN)
     list_set(session, _VC_SESS_PENDING_ATTEMPTS, 0)
     list_set(session, _VC_SESS_PENDING_RAW, "")
+    list_set(session, _VC_SESS_LAST_STT_CONF, 0 - 1)
     return 1
 }
 
@@ -1634,6 +1651,151 @@ fn _vd_pivot_kind_no_and(lowered) {
     return 0
 }
 
+// ---- R34D: STT confidence threshold + clarifying-question fallback -------
+//
+// Purpose
+//   R34D adds a "did I hear you?" gate in front of the dialog state
+//   machine. Each turn the STT seam reports a confidence score (milli,
+//   0..1000) alongside the transcript; when that score is below
+//   threshold the dialog asks the operator to repeat themselves rather
+//   than feeding a probably-misheard string into the R31F kind-pivot /
+//   R32F multi-kind clarify routing.
+//
+//   The headline `vc_session_turn` path is UNCHANGED -- callers that
+//   don't have an STT confidence to plumb (chat fixtures, integration
+//   scripts that bypass real STT) still call it directly and get the
+//   pre-R34D behaviour byte-identically. The new
+//   `vc_session_turn_with_confidence(kg, session, text, conf_milli)`
+//   adds the confidence gate on top.
+//
+//   Threshold:
+//     * Default: 500 milli (= 0.5). Documented in the brief.
+//     * Env override: `CE_VOICE_STT_CONF_THRESHOLD` parsed as an
+//       integer "tenths-of-a-percent" -- the operator types a value
+//       in the range 0..100 representing percent (so "50" = 0.5,
+//       "70" = 0.7, "80" = 0.8). We multiply by 10 to convert to
+//       milli (0..1000). NOVA has no floats, so the env contract is
+//       integer-percent; the brief calls this out explicitly.
+//     * Anything outside [0, 100] clamps to the default 50% (500
+//       milli) -- defensive, since a typo'd env shouldn't silently
+//       disable the gate.
+//
+//   On a low-confidence turn:
+//     * The session's `last_stt_confidence` slot updates to the
+//       reported value (so telemetry / tests can see what we heard).
+//     * The dialog state machine is NOT advanced -- no parser run,
+//       no history append, no pending-clarify mutation. The next
+//       turn re-runs from the same dialog state.
+//     * The response text is the canonical "I didn't catch that
+//       clearly -- could you repeat?" sentence.
+//
+//   On a high-confidence turn:
+//     * Confidence is mirrored into the session slot (same as low).
+//     * The transcript flows through `vc_session_turn` unchanged, so
+//       all R25B / R25B.2 / R25B.3 / R25B.4 / R25B.5 / R25B.6 paths
+//       (R31F kind-pivot, R32F multi-kind clarify, etc.) work
+//       exactly as before.
+//
+//   Honest scope (R34D.2+ deferred):
+//     * No calibration step (comparing whisper's confidence to ground
+//       truth across a held-out set to learn the "true" threshold).
+//       The 0.5 default is the brief's intuitive cut; future work
+//       could plumb a calibration table per (acoustic-environment,
+//       model) pair.
+//     * No per-language threshold -- whisper's tiny.en model is the
+//       canonical install; other models (multi-lingual) may report
+//       systematically different confidence distributions, and a
+//       single global threshold won't be optimal for all of them.
+//     * No two-stage gating (confidence + content-word check) -- a
+//       high-confidence misparse ("list all FACTS." -> stops at
+//       trailing dot, parses fine) won't trip the gate today.
+
+let VC_STT_CONF_THRESHOLD_DEFAULT = 500   // milli, = 0.5
+let VC_STT_CONF_CLARIFY_TEXT = "I did not catch that clearly. Could you repeat?"
+
+// _vd_parse_threshold_env(env) -- pure helper, exposed as `vc_voice_
+// stt_threshold_milli` for tests. `env` is the env-string (or 0 / "");
+// returns the milli threshold in 0..1000. Out-of-range / parse-failure
+// returns the documented default 500.
+fn _vd_parse_threshold_env(env) {
+    if env == 0 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    let n = len(env)
+    if n == 0 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    // Parse a non-negative ASCII decimal integer up to 3 digits;
+    // anything weird falls back to the default. We don't accept
+    // negative numbers ("a threshold below zero is incoherent") or
+    // float-like inputs ("0.7") -- the integer-percent contract is
+    // documented above.
+    let val = 0
+    let i = 0
+    while i < n {
+        let c = char_at(env, i)
+        if c < 48 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+        if c > 57 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+        val = val * 10 + (c - 48)
+        if val > 1000 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+        i = i + 1
+    }
+    if val < 0 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    if val > 100 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    // Multiply by 10 to convert percent (0..100) -> milli (0..1000).
+    return val * 10
+}
+
+// Public probe -- exposes the env-resolved threshold so tests can
+// verify the env override path without driving a full turn.
+fn vc_voice_stt_threshold_milli() {
+    let env = getenv("CE_VOICE_STT_CONF_THRESHOLD")
+    return _vd_parse_threshold_env(env)
+}
+
+// Public probe -- exposes the canonical clarify-question text so
+// callers (and the integration scenario) can assert against the
+// exact string. Kept as a function rather than a let so future
+// localisation hooks can override it cleanly.
+fn vc_voice_stt_clarify_text() {
+    return VC_STT_CONF_CLARIFY_TEXT
+}
+
+// vc_session_turn_with_confidence(kg, session, transcript, conf_milli) ->
+//     [response_text, session]
+//
+// The R34D-aware turn entry. `conf_milli` is the STT confidence in
+// 0..1000 (the same milli encoding the seam emits). When conf_milli is
+// below the env-resolved threshold the dialog returns the clarifying
+// question without touching the state machine; otherwise the call
+// delegates to the existing `vc_session_turn` so all pre-R34D paths
+// (R31F kind-pivot, R32F multi-kind clarify, anaphora, ...) run as
+// they did before. The session's `last_stt_confidence` slot is updated
+// in BOTH branches so callers can introspect "what did STT report on
+// the most recent turn?" deterministically.
+//
+// Special-case: an empty transcript with conf_milli == 0 routes to the
+// clarify path (the seam returns this for whisper-cli's "empty
+// transcript" + the stub backend's placeholder). This keeps the
+// clarify-question response from being misclassified as a query through
+// the parser.
+fn vc_session_turn_with_confidence(kg, session, transcript, conf_milli) {
+    let result = list_new()
+    let threshold = vc_voice_stt_threshold_milli()
+    // Update the telemetry slot FIRST so a clarify-routed turn still
+    // reflects what STT reported -- inspection during a low-conf turn
+    // should see the actual milli value, not the "-1 unknown" sentinel.
+    list_set(session, _VC_SESS_LAST_STT_CONF, conf_milli)
+    if conf_milli < threshold {
+        // Confidence below threshold: emit clarification, do NOT
+        // advance the dialog state machine. No history append, no
+        // parser run, no pending-clarify mutation. The next turn
+        // re-enters from the same state.
+        push(result, VC_STT_CONF_CLARIFY_TEXT)
+        push(result, session)
+        return result
+    }
+    // High enough: delegate to the existing turn pipeline. The
+    // confidence is already mirrored to the session slot above.
+    return vc_session_turn(kg, session, transcript)
+}
+
 // ---- core turn logic -----------------------------------------------------
 //
 // The turn pipeline:
@@ -2240,31 +2402,40 @@ fn _vc_get_default_session() {
 }
 
 // Resolve a transcript from a WAV path via the R25B STT seam. Returns
-// [transcript_text, error_message]. Empty error => transcript usable;
-// non-empty error => caller should bail with an apology.
+// [transcript_text, error_message, confidence_milli]. Empty error =>
+// transcript usable; non-empty error => caller should bail with an
+// apology. R34D appends the confidence_milli slot so callers can plumb
+// it into the dialog policy via `vc_session_turn_with_confidence`. The
+// confidence is 0 on any STT-error path (matching the seam's
+// `STT_CONFIDENCE_NONE` contract).
 fn _vd_transcribe_wav(wav_path) {
     let seam = stt_seam_new()
     let triple = stt_transcribe_wav(seam, wav_path)
     let r = list_new()
     let err = stt_result_error(triple)
     let txt = stt_result_transcript(triple)
+    let conf = stt_result_confidence(triple)
     if len(err) > 0 {
         push(r, "")
         push(r, "I could not hear you. Speech recognition failed: " + err + ".")
+        push(r, 0)
         return r
     }
     if str_eq(txt, VC_STT_PLACEHOLDER_1) == 1 {
         push(r, "")
         push(r, "I could not hear you. No speech-to-text backend is available.")
+        push(r, 0)
         return r
     }
     if str_eq(txt, VC_STT_PLACEHOLDER_2) == 1 {
         push(r, "")
         push(r, "I could not hear you. No speech-to-text backend is installed.")
+        push(r, 0)
         return r
     }
     push(r, txt)
     push(r, "")
+    push(r, conf)
     return r
 }
 
@@ -2286,6 +2457,7 @@ fn vc_dialog_run(kg, arg) {
     let trans = _vd_transcribe_wav(trimmed)
     let txt = trans[0]
     let err = trans[1]
+    let conf = trans[2]
     if len(err) > 0 {
         // STT failure -- TTS the apology, return status.
         let path = "/tmp/ce_vc_response.wav"
@@ -2300,7 +2472,12 @@ fn vc_dialog_run(kg, arg) {
         return "(dialog heard+answered '" + err + "' [" + pstat
             + "] turn=" + int_to_str(vc_session_turn_count(session)) + ")"
     }
-    let r = vc_session_turn(kg, session, txt)
+    // R34D: route through the confidence-aware path so a low-confidence
+    // transcript yields the clarify question rather than acting on a
+    // probably-misheard string. Pre-R34D code paths reading
+    // `vc_session_turn` directly are unchanged; only this wrapper opts
+    // into the gate.
+    let r = vc_session_turn_with_confidence(kg, session, txt, conf)
     let answer = vc_session_result_text(r)
     let path = "/tmp/ce_vc_response.wav"
     let env = getenv("CE_VC_RESPONSE_PATH")

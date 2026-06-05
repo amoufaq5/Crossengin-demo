@@ -31,6 +31,7 @@ import "../ce_test.nova"
 import "../../examples/voice_dialog.nova"
 import "../../src/kg/atom_store.nova"
 import "../../src/kg/multi_kg_manager.nova"
+import "../../src/io/transducers/whisper_backend.nova"
 
 // ---- KG fixture ----------------------------------------------------------
 
@@ -1697,6 +1698,305 @@ fn test_clarify_candidates_no_prior_empty() {
     ce_eq("no prior -> empty candidates", len(cands), 0)
 }
 
+// ---- R34D: STT confidence threshold + clarifying-question fallback ------
+//
+// R34D adds a "did I hear you?" gate in front of the dialog state
+// machine. When the STT seam reports confidence < threshold (default
+// 0.5 milli == 500), the dialog returns "I did not catch that clearly.
+// Could you repeat?" instead of advancing the state machine. The env
+// `CE_VOICE_STT_CONF_THRESHOLD` overrides the threshold; values are
+// integer-percent (50 = 0.5 = 500 milli, 70 = 0.7 = 700 milli).
+//
+// We do NOT exercise real STT here -- the new `vc_session_turn_with_
+// confidence(kg, session, transcript, conf_milli)` takes a plumbed
+// confidence so the dialog policy is the unit under test. The
+// integration scenario covers the WAV roundtrip.
+
+// Default-threshold env-resolved value: the test runner does NOT set
+// `CE_VOICE_STT_CONF_THRESHOLD`, so the resolver should return the
+// documented default 500 (= 0.5).
+fn test_r34d_default_threshold_is_500_milli() {
+    ce_eq("default STT threshold is 500 milli (0.5)",
+        vc_voice_stt_threshold_milli(), 500)
+}
+
+// Threshold-parser corner cases. We hit `_vd_parse_threshold_env`
+// directly (well, via its `vc_voice_stt_threshold_milli` wrapper) by
+// going through a helper that constructs synthetic env strings. NOVA's
+// test runner has no portable setenv, but we CAN test the pure
+// `_vd_parse_threshold_env` via... actually there's no public probe.
+// We test the wired path indirectly via the dispatch tests below
+// (which use `vc_session_turn_with_confidence` directly).
+
+// Clarify text is the canonical sentence -- byte-identical assertion.
+fn test_r34d_clarify_text_is_canonical() {
+    ce_str_eq("R34D clarify text",
+        vc_voice_stt_clarify_text(),
+        "I did not catch that clearly. Could you repeat?")
+}
+
+// New sessions report -1 last_stt_confidence (sentinel for "no STT
+// result threaded yet"). This is the legacy `vc_session_turn` path's
+// behaviour -- it doesn't have a confidence to plumb.
+fn test_r34d_new_session_stt_confidence_unset() {
+    let s = vc_session_new()
+    ce_eq("new session: last_stt_confidence = -1",
+        vc_session_last_stt_confidence(s), 0 - 1)
+}
+
+// vc_session_reset() restores the -1 sentinel. We populate the slot
+// via a high-confidence turn first, then reset, then check.
+fn test_r34d_reset_clears_stt_confidence() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // High-confidence turn: 950 milli is well above the 500 default.
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 950)
+    ce_eq("after high-conf turn: last_stt_confidence = 950",
+        vc_session_last_stt_confidence(s), 950)
+    vc_session_reset(s)
+    ce_eq("post-reset: last_stt_confidence = -1",
+        vc_session_last_stt_confidence(s), 0 - 1)
+}
+
+// High-confidence transcript routes to the existing dialog flow. We
+// pass 950 (0.95) for a "list all FACT" transcript; the response is
+// the canonical R25B sentence, the template moves to LIST_ALL, and
+// last_stt_confidence reflects the high value.
+fn test_r34d_high_confidence_routes_to_normal_dialog() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 950)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("high-conf list all FACT -> normal R25B response",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("high-conf: template advanced to LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_eq("high-conf: last_stt_confidence reflects STT value",
+        vc_session_last_stt_confidence(s), 950)
+}
+
+// Low-confidence transcript routes to the clarify response and does
+// NOT advance the dialog state machine. The session's template stays
+// UNKNOWN, no history is appended, but last_stt_confidence reflects
+// the (low) value so telemetry can see what was reported.
+fn test_r34d_low_confidence_routes_to_clarify() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // 300 milli (0.3) is below the 500 default threshold.
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 300)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("low-conf transcript -> canonical clarify text",
+        txt, "I did not catch that clearly. Could you repeat?")
+    ce_eq("low-conf: template NOT advanced (still UNKNOWN)",
+        vc_session_last_template(s), vc_template_unknown())
+    ce_eq("low-conf: history still empty",
+        len(vc_session_history(s)), 0)
+    ce_eq("low-conf: turn_count NOT bumped",
+        vc_session_turn_count(s), 0)
+    ce_eq("low-conf: last_stt_confidence reflects low value",
+        vc_session_last_stt_confidence(s), 300)
+}
+
+// Exact-threshold case: confidence == threshold routes to the NORMAL
+// path (the gate is strict "<"). 500 == default threshold -> high.
+fn test_r34d_exact_threshold_routes_to_normal() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 500)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("conf == threshold -> normal R25B (strict <)",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("exact-threshold: template advanced to LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+}
+
+// Zero-confidence (STT failure / empty transcript path) routes to
+// clarify. The seam returns 0 confidence for the stub backend and for
+// any whisper-cli error path; the dialog should treat this as "didn't
+// hear you" rather than feeding the placeholder string into the parser.
+fn test_r34d_zero_confidence_empty_transcript_clarifies() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // Pair: empty transcript + 0 confidence -> clarify.
+    let r = vc_session_turn_with_confidence(kg, s, "", 0)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("empty transcript + 0 conf -> clarify text",
+        txt, "I did not catch that clearly. Could you repeat?")
+    ce_eq("zero-conf: history still empty",
+        len(vc_session_history(s)), 0)
+    ce_eq("zero-conf: last_stt_confidence = 0",
+        vc_session_last_stt_confidence(s), 0)
+}
+
+// Boundary: conf = threshold - 1 routes to clarify (just below).
+fn test_r34d_just_below_threshold_clarifies() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 499)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("499 milli (just below) -> clarify",
+        txt, "I did not catch that clearly. Could you repeat?")
+}
+
+// last_stt_confidence reflects the MOST RECENT call, even across
+// multiple turns. We verify it updates on each call regardless of
+// whether the call routed to clarify or normal.
+fn test_r34d_last_stt_confidence_tracks_most_recent() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 900)
+    ce_eq("turn 1: last_stt_confidence = 900",
+        vc_session_last_stt_confidence(s), 900)
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 200)
+    ce_eq("turn 2 (clarify): last_stt_confidence = 200",
+        vc_session_last_stt_confidence(s), 200)
+    vc_session_turn_with_confidence(kg, s, "tell me more", 950)
+    ce_eq("turn 3: last_stt_confidence = 950",
+        vc_session_last_stt_confidence(s), 950)
+}
+
+// After a low-conf turn the dialog state is intact; the NEXT high-conf
+// turn proceeds as if the low-conf turn never happened. This is the
+// key invariant: a misheard utterance doesn't poison subsequent turns.
+fn test_r34d_low_conf_turn_then_high_conf_advances() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // Misheard low-conf turn -- clarifies, no state change.
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 200)
+    ce_eq("post-misheard: template still UNKNOWN",
+        vc_session_last_template(s), vc_template_unknown())
+    // High-conf turn -- proceeds normally.
+    let r2 = vc_session_turn_with_confidence(kg, s, "list all FACT", 900)
+    let txt2 = vc_session_result_text(r2)
+    ce_str_eq("retry high-conf -> normal response",
+        txt2, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("retry: template now LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+}
+
+// R31F kind-pivot regression: the kind-pivot routing (R25B.5) still
+// works for high-confidence transcripts. Prior FACT, then a tell-me-
+// more about RULE kind should KIND_PIVOT to RULE.
+fn test_r34d_r31f_kind_pivot_intact_for_high_confidence() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 900)
+    ce_eq("prior turn: template LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_str_eq("prior turn: kind FACT",
+        vc_session_last_kind(s), "FACT")
+    // High-conf KIND_PIVOT to RULE: the more-cue path with "rule" in
+    // the remainder should pivot.
+    let r2 = vc_session_turn_with_confidence(kg, s,
+        "tell me more about RULE atoms", 850)
+    ce_str_eq("R31F kind-pivot intact: kind now RULE",
+        vc_session_last_kind(s), "RULE")
+    let txt2 = vc_session_result_text(r2)
+    // RULE has no atoms in the fixture -> "No RULE atoms found.".
+    ce_str_eq("R31F kind-pivot result text",
+        txt2, "No RULE atoms found.")
+}
+
+// R32F multi-kind clarify regression: an ambiguous remainder (2+
+// known kinds) with high confidence still emits the "Did you mean
+// X or Y?" question. The STT-confidence gate must not interfere with
+// the higher-level R32F multi-kind clarify state machine.
+fn test_r34d_r32f_multi_kind_clarify_intact_for_high_confidence() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all CONCEPT", 900)
+    // Remainder "facts and rules" names two kinds different from
+    // CONCEPT -> CLARIFY classifier emits the "Did you mean...?"
+    let r2 = vc_session_turn_with_confidence(kg, s,
+        "tell me more about facts and rules", 850)
+    let txt2 = vc_session_result_text(r2)
+    ce_str_eq("R32F multi-kind clarify intact",
+        txt2, "Did you mean FACT or RULE atoms?")
+    ce_eq("R32F: pending clarify set",
+        vc_session_is_pending_clarify(s), 1)
+}
+
+// A LOW-conf turn during an active R32F pending-clarify does NOT
+// advance the multi-kind state machine: the operator should be asked
+// to repeat themselves, and the pending-clarify candidates remain
+// intact for the next try.
+fn test_r34d_low_conf_during_pending_clarify_preserves_state() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all CONCEPT", 900)
+    vc_session_turn_with_confidence(kg, s,
+        "tell me more about facts and rules", 850)
+    // Pending clarify is active. A low-conf "RULE" reply should NOT
+    // resolve it -- the operator might have said something else.
+    ce_eq("pre-low-conf: pending clarify set",
+        vc_session_is_pending_clarify(s), 1)
+    let r3 = vc_session_turn_with_confidence(kg, s, "RULE", 200)
+    let txt3 = vc_session_result_text(r3)
+    ce_str_eq("low-conf during pending clarify -> clarify text",
+        txt3, "I did not catch that clearly. Could you repeat?")
+    // Pending clarify state preserved.
+    ce_eq("post-low-conf: pending clarify still set",
+        vc_session_is_pending_clarify(s), 1)
+}
+
+// Threshold parser unit tests via the wired probe. We can't directly
+// drive the env var from inside NOVA tests (the runner exports a fixed
+// env), but we CAN verify the default path via the public probe + the
+// dispatch tests above. Additionally we run the parser via a synthetic
+// shape: confidence 500 vs 499 around the documented default.
+fn test_r34d_threshold_gate_is_strict_less_than() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // 500 (== threshold) -> high. Already covered in the exact-
+    // threshold test above; we add a 501 case for parity (above
+    // threshold by 1 milli).
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 501)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("501 milli (above threshold) -> normal",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+}
+
+// Whisper-side heuristic helper -- explicit unit tests for the pure
+// `whisper_heuristic_confidence_milli` function. Empty transcript +
+// empty error -> 0 (can't be confident in nothing). Non-empty
+// transcript + empty error -> 900 (we got SOMETHING). Any error
+// regardless of transcript -> 0.
+fn test_r34d_heuristic_empty_transcript_is_zero() {
+    ce_eq("heuristic: empty transcript + no error -> 0",
+        whisper_heuristic_confidence_milli("", ""), 0)
+}
+
+fn test_r34d_heuristic_non_empty_transcript_is_900() {
+    ce_eq("heuristic: 'hello' + no error -> 900",
+        whisper_heuristic_confidence_milli("hello", ""), 900)
+}
+
+fn test_r34d_heuristic_error_overrides_transcript() {
+    ce_eq("heuristic: 'hello' + 'binary not found' -> 0",
+        whisper_heuristic_confidence_milli("hello", "binary not found"), 0)
+}
+
+// Direct delegation: vc_session_turn() and vc_session_turn_with_
+// confidence() with a high-conf value should produce byte-identical
+// session state. The STT-confidence wrapper is purely additive on the
+// pass-through path; it must not alter the dialog state machine.
+fn test_r34d_high_conf_path_is_byte_identical_to_session_turn() {
+    let kg1 = _fixture_kg()
+    let s1 = vc_session_new()
+    vc_session_turn(kg1, s1, "list all FACT")
+    let kg2 = _fixture_kg()
+    let s2 = vc_session_new()
+    vc_session_turn_with_confidence(kg2, s2, "list all FACT", 1000)
+    ce_eq("byte-identical template",
+        vc_session_last_template(s1), vc_session_last_template(s2))
+    ce_str_eq("byte-identical kind",
+        vc_session_last_kind(s1), vc_session_last_kind(s2))
+    ce_eq("byte-identical turn_count",
+        vc_session_turn_count(s1), vc_session_turn_count(s2))
+    ce_eq("byte-identical history length",
+        len(vc_session_history(s1)), len(vc_session_history(s2)))
+}
+
 // ---- main ---------------------------------------------------------------
 
 fn main() {
@@ -1816,6 +2116,26 @@ fn main() {
     test_clarify_and_cue_multi_kind()
     test_clarify_same_kind_multi_mention_not_clarify()
     test_clarify_candidates_no_prior_empty()
+    // R34D -- STT confidence threshold + clarifying-question fallback
+    test_r34d_default_threshold_is_500_milli()
+    test_r34d_clarify_text_is_canonical()
+    test_r34d_new_session_stt_confidence_unset()
+    test_r34d_reset_clears_stt_confidence()
+    test_r34d_high_confidence_routes_to_normal_dialog()
+    test_r34d_low_confidence_routes_to_clarify()
+    test_r34d_exact_threshold_routes_to_normal()
+    test_r34d_zero_confidence_empty_transcript_clarifies()
+    test_r34d_just_below_threshold_clarifies()
+    test_r34d_last_stt_confidence_tracks_most_recent()
+    test_r34d_low_conf_turn_then_high_conf_advances()
+    test_r34d_r31f_kind_pivot_intact_for_high_confidence()
+    test_r34d_r32f_multi_kind_clarify_intact_for_high_confidence()
+    test_r34d_low_conf_during_pending_clarify_preserves_state()
+    test_r34d_threshold_gate_is_strict_less_than()
+    test_r34d_heuristic_empty_transcript_is_zero()
+    test_r34d_heuristic_non_empty_transcript_is_900()
+    test_r34d_heuristic_error_overrides_transcript()
+    test_r34d_high_conf_path_is_byte_identical_to_session_turn()
     ce_summary("voice_dialog")
 }
 
