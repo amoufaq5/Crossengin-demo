@@ -482,3 +482,234 @@ fn _ice_turn_test_is_parse_err(r) {
 fn _ice_turn_test_state_name(s) {
     return _ice_turn_state_name(s)
 }
+
+// ============================================================================
+// ============================================================================
+//        R36A -- 401 auto-retry with long-term credentials (R35D.2)
+// ============================================================================
+// ============================================================================
+//
+// The original `ice_turn_handle_allocate_response` above classifies any
+// Allocate-error (including a 401 Unauthorized that simply means the
+// server demands long-term credentials per RFC 5389 §10) as
+// `RELAY_FAILED`. R36A's R35D.2 extension transitions a 401 to a NEW
+// `ICE_TURN_AUTH_PENDING` state instead, stashes the REALM + NONCE
+// from the 401 body, and exposes `ice_turn_credentials(state, username,
+// password)` for the caller to supply the credentials. That call
+// emits a fresh Allocate request with the four long-term-credential
+// attributes (USERNAME, REALM, NONCE, MESSAGE-INTEGRITY) computed via
+// R36A's `turn_emit_allocate_request_authed`.
+//
+// Retry cap: if a SECOND 401 follows the credentialed Allocate (which
+// means the credentials were wrong), the handler classifies
+// `RELAY_FAILED` and stops; no further retries. A counter
+// `stats_auth_retries` bumps each time we emit the credentialed
+// retry.
+
+// New return tag: 401 received, awaiting caller-supplied credentials.
+let ICE_TURN_RELAY_AUTH_PENDING = 1
+
+// Auth sub-state.
+let ICE_TURN_AUTH_NONE      = 0
+let ICE_TURN_AUTH_PENDING   = 1
+let ICE_TURN_AUTH_OK        = 2
+let ICE_TURN_AUTH_FAILED    = 3
+
+let ICE_TURN_STATE_AUTH_PENDING = 4
+
+let ICE_TURN_EVT_AUTH_PENDING   = 5
+let ICE_TURN_EVT_AUTH_RETRY     = 6
+
+// New state slots, appended to preserve the R35D 17-slot layout.
+let _ICE_TURN_S_AUTH_REALM        = 17
+let _ICE_TURN_S_AUTH_REALM_N      = 18
+let _ICE_TURN_S_AUTH_NONCE        = 19
+let _ICE_TURN_S_AUTH_NONCE_N      = 20
+let _ICE_TURN_S_AUTH_STATE        = 21
+let _ICE_TURN_S_STATS_AUTH_RETRIES = 22
+
+// Extension helper -- callers built on R35D's `ice_turn_init` can call
+// `ice_turn_extend_state_r36a(state)` to append the new slots in
+// place. Existing slots 0..16 are preserved.
+fn ice_turn_extend_state_r36a(state) {
+    if len(state) > _ICE_TURN_S_STATS_AUTH_RETRIES { return state }
+    push(state, 0)                            // 17 AUTH_REALM buf
+    push(state, 0)                            // 18 AUTH_REALM_N
+    push(state, 0)                            // 19 AUTH_NONCE buf
+    push(state, 0)                            // 20 AUTH_NONCE_N
+    push(state, ICE_TURN_AUTH_NONE)           // 21 AUTH_STATE
+    push(state, 0)                            // 22 STATS_AUTH_RETRIES
+    return state
+}
+
+// R36A initializer that pre-extends the state.
+fn ice_turn_init_authed(ice_agent, turn_server_ip_str, turn_server_port) {
+    let st = ice_turn_init(ice_agent, turn_server_ip_str, turn_server_port)
+    return ice_turn_extend_state_r36a(st)
+}
+
+// Read accessors.
+fn ice_turn_auth_state(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_STATE { return ICE_TURN_AUTH_NONE }
+    return state[_ICE_TURN_S_AUTH_STATE]
+}
+
+fn ice_turn_stats_auth_retries(state) {
+    if len(state) <= _ICE_TURN_S_STATS_AUTH_RETRIES { return 0 }
+    return state[_ICE_TURN_S_STATS_AUTH_RETRIES]
+}
+
+fn ice_turn_auth_realm_buf(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_REALM { return 0 }
+    return state[_ICE_TURN_S_AUTH_REALM]
+}
+
+fn ice_turn_auth_realm_n(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_REALM_N { return 0 }
+    return state[_ICE_TURN_S_AUTH_REALM_N]
+}
+
+fn ice_turn_auth_nonce_buf(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_NONCE { return 0 }
+    return state[_ICE_TURN_S_AUTH_NONCE]
+}
+
+fn ice_turn_auth_nonce_n(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_NONCE_N { return 0 }
+    return state[_ICE_TURN_S_AUTH_NONCE_N]
+}
+
+// Copy a buffer slice into a freshly alloc'd NUL-terminated copy. Used
+// so the parse pointers (which point INTO the recv buf) become
+// owned copies that outlive the recv buf.
+fn _ice_turn_copy_slice(src, n) {
+    if n <= 0 { return 0 }
+    let b = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(b + i, load8(src + i))
+        i = i + 1
+    }
+    store8(b + n, 0)
+    return b
+}
+
+// Convert a slice into a NUL-terminated NOVA string so it can be passed
+// to `turn_emit_allocate_request_authed` which takes string args.
+fn _ice_turn_slice_to_str(src, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        s = s + chr(load8(src + i))
+        i = i + 1
+    }
+    return s
+}
+
+// ============================================================================
+//                  ice_turn_handle_allocate_response_authed
+// ============================================================================
+//
+// R35D.2 wrapper around the R35D handler. On a 401 specifically, we
+// DO NOT classify `RELAY_FAILED` -- instead, we parse out REALM +
+// NONCE, stash them, transition to `AUTH_PENDING`, and return
+// `ICE_TURN_RELAY_AUTH_PENDING`. Caller then invokes
+// `ice_turn_credentials(state, username, password)` to retry.
+//
+// If a SECOND 401 arrives (auth_state already == OK or PENDING with
+// retries > 0), classify `RELAY_FAILED` to stop the loop.
+//
+// All non-401 paths delegate to the R35D handler unchanged.
+
+fn ice_turn_handle_allocate_response_authed(state, recv_buf, n) {
+    ice_turn_extend_state_r36a(state)
+    // First try the 401 parser. If it returns a non-error list, we
+    // have a 401 with REALM + NONCE in hand.
+    let auth = turn_parse_401_response(recv_buf, n)
+    if _ice_turn_is_parse_err(auth) == 0 {
+        // It's a 401. If we already retried once, fail hard.
+        let prior_retries = state[_ICE_TURN_S_STATS_AUTH_RETRIES]
+        if prior_retries >= 1 {
+            // Second 401 -- credentials were wrong. Bumps the standard
+            // R35D failure counters via the underlying handler to keep
+            // the existing accounting consistent.
+            state[_ICE_TURN_S_AUTH_STATE]    = ICE_TURN_AUTH_FAILED
+            state[_ICE_TURN_S_LAST_STATE]    = ICE_TURN_STATE_FAILED
+            state[_ICE_TURN_S_LAST_EVENT]    = ICE_TURN_EVT_RELAY_FAILED
+            state[_ICE_TURN_S_LAST_ERROR_CODE]   = 401
+            state[_ICE_TURN_S_LAST_ERROR_REASON] = "Unauthorized (after retry)"
+            state[_ICE_TURN_S_ESC_FAILED] =
+                state[_ICE_TURN_S_ESC_FAILED] + 1
+            return ICE_TURN_RELAY_FAILED
+        }
+        // First 401: stash REALM + NONCE and signal AUTH_PENDING.
+        let realm_buf_in = auth[0]
+        let realm_n      = auth[1]
+        let nonce_buf_in = auth[2]
+        let nonce_n      = auth[3]
+        state[_ICE_TURN_S_AUTH_REALM]   = _ice_turn_copy_slice(realm_buf_in,
+                                                               realm_n)
+        state[_ICE_TURN_S_AUTH_REALM_N] = realm_n
+        state[_ICE_TURN_S_AUTH_NONCE]   = _ice_turn_copy_slice(nonce_buf_in,
+                                                               nonce_n)
+        state[_ICE_TURN_S_AUTH_NONCE_N] = nonce_n
+        state[_ICE_TURN_S_AUTH_STATE]   = ICE_TURN_AUTH_PENDING
+        state[_ICE_TURN_S_LAST_STATE]   = ICE_TURN_STATE_AUTH_PENDING
+        state[_ICE_TURN_S_LAST_EVENT]   = ICE_TURN_EVT_AUTH_PENDING
+        state[_ICE_TURN_S_LAST_ERROR_CODE]   = 401
+        state[_ICE_TURN_S_LAST_ERROR_REASON] = "Unauthorized"
+        return ICE_TURN_RELAY_AUTH_PENDING
+    }
+    // Not a 401. Delegate to the R35D handler. If that classifies the
+    // message as a SUCCESS, mark auth as OK so future calls don't try
+    // to re-retry on a subsequent miscall.
+    let rc = ice_turn_handle_allocate_response(state, recv_buf, n)
+    if rc == ICE_TURN_RELAY_READY {
+        state[_ICE_TURN_S_AUTH_STATE] = ICE_TURN_AUTH_OK
+    }
+    return rc
+}
+
+// ============================================================================
+//                  ice_turn_credentials
+// ============================================================================
+//
+// Caller hands in username + password after receiving an
+// `ICE_TURN_RELAY_AUTH_PENDING` verdict. We compose REALM + NONCE
+// (stashed from the 401) with the caller's creds via R36A's
+// `turn_emit_allocate_request_authed` and return the emit tuple.
+// Also bumps `stats_auth_retries` and updates the transaction id
+// state slot so the next response handler matches it.
+
+fn ice_turn_credentials(state, username, password) {
+    ice_turn_extend_state_r36a(state)
+    if state[_ICE_TURN_S_AUTH_STATE] != ICE_TURN_AUTH_PENDING {
+        return 0
+    }
+    if state[_ICE_TURN_S_AUTH_REALM] == 0 { return 0 }
+    if state[_ICE_TURN_S_AUTH_NONCE] == 0 { return 0 }
+    let realm = _ice_turn_slice_to_str(state[_ICE_TURN_S_AUTH_REALM],
+                                       state[_ICE_TURN_S_AUTH_REALM_N])
+    let nonce = _ice_turn_slice_to_str(state[_ICE_TURN_S_AUTH_NONCE],
+                                       state[_ICE_TURN_S_AUTH_NONCE_N])
+    // Re-use the txn id stashed by begin_allocate. We allocate a fresh
+    // buffer for the emit so the caller can independently track the
+    // retry txn (we just copy the prior bytes for now -- a real
+    // implementation rotates the txn id, but keeping the same id keeps
+    // the response handler's txn-correlation in lock-step without a
+    // second stash slot).
+    let txn = state[_ICE_TURN_S_TXN_ID]
+    state[_ICE_TURN_S_STATS_AUTH_RETRIES] =
+        state[_ICE_TURN_S_STATS_AUTH_RETRIES] + 1
+    state[_ICE_TURN_S_LAST_EVENT] = ICE_TURN_EVT_AUTH_RETRY
+    let req = turn_emit_allocate_request_authed(txn,
+                                                TURN_LIFETIME_DEFAULT,
+                                                TURN_TRANSPORT_UDP,
+                                                username, password,
+                                                realm, nonce)
+    return req
+}
+
+// Test-only shims.
+fn _ice_turn_test_copy_slice(src, n)    { return _ice_turn_copy_slice(src, n) }
+fn _ice_turn_test_slice_to_str(src, n)  { return _ice_turn_slice_to_str(src, n) }

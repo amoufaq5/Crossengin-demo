@@ -17,12 +17,12 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-## Status (through R35)
+## Status (through R36)
 
 | Track | Latest round | What landed |
 |---|---|---|
 | Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
-| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2; TURN client state machine; ICE-TURN escalation. |
+| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry. |
 | Safety / crypto leaves | R33A / R34A | Canonical `safety/sha256.nova` + dedup of inline copies across noise_xk, merkle, ecdsa, dtls12. |
 | Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
 | Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
@@ -35,6 +35,99 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > **R35A note.** v1.0 -- all 10 phases complete and assembled into one
 > unified agent process. Implemented in NOVA and verified against the
 > real self-hosting toolchain.
+>
+> R36A (R34B.2 / R35B.2 / R35D.2) closes three TURN-related deferrals
+> in one bundle: long-term-credential authentication (RFC 5389 §10 /
+> RFC 5766 §4), per-permission refresh cadence, and a permission-
+> lifetime override hook. Extension to `src/federation/turn.nova`
+> (~830 lines added; existing 1669 lines + the R34B / R35B blocks
+> preserved byte-for-byte) and `src/federation/ice_turn.nova` (~230
+> lines added; existing 485 lines preserved). Inline MD5 (RFC 1321)
+> and HMAC-SHA1 (RFC 2104 + RFC 3174) are added LOCAL to `turn.nova`
+> because R34C's `_srtp_hmac_sha1` is underscore-prefixed (private);
+> a future R36A.2 can canonicalize alongside the SHA-256 dedup work
+> R33A established. **Auth flow** (RFC 5389 §15.4):
+> `turn_emit_allocate_request_authed(txn, lifetime, transport,
+> username, password, realm, nonce)` builds an Allocate with
+> USERNAME + REALM + NONCE attributes followed by MESSAGE-INTEGRITY
+> (20-byte HMAC-SHA1 keyed on `MD5(username:realm:password)`). The
+> length field counts the FULL body including MI, but the HMAC is
+> computed over the prefix [0..MI_attr_start) -- RFC 5389 §15.4
+> spec rule. `turn_parse_401_response(buf, n) -> [realm_buf,
+> realm_n, nonce_buf, nonce_n] | TURN_ERR_*` extracts the auth
+> challenge from a 401 Unauthorized response.
+> `turn_verify_message_integrity(buf, n, key)` re-computes the
+> HMAC over the same prefix and compares against the embedded
+> value -- returns 0 (no crash) on missing MI per documented
+> tolerance. **Per-permission cadence** (RFC 5766 §8 / §11):
+> `TURN_PERM_LIFETIME_DEFAULT = 300` (already in R35B) +
+> `TURN_CHANNEL_LIFETIME_DEFAULT = 600`. New
+> `turn_client_tick_perms(state, now) -> [n_perms_expired,
+> n_channels_expired]` walks both lists and removes entries whose
+> `expiry < now`, bumping `stats_perm_expired` +
+> `stats_channel_expired` counters. `turn_client_tick_authed(state,
+> now)` is the composed alloc-expiry + perm-cadence tick callers
+> drop in to replace R35B's `turn_client_tick`. **Lifetime
+> override** (RFC 5766 §8): CreatePermission success responses do
+> NOT echo back a granted lifetime (unlike Allocate which echoes
+> LIFETIME). R35B stamped the client-side estimate at `now + 300`;
+> R36A keeps that default and adds `turn_set_perm_lifetime_default(
+> state, secs)` for non-RFC servers, stored in a new state slot
+> consulted by `turn_client_restamp_last_permission`. State slots
+> 0..23 from R35B preserved byte-for-byte; R36A appends 3 new slots
+> (perm-lifetime default, perm-expired counter, channel-expired
+> counter). **ICE-TURN 401 auto-retry** (R35D.2): the original
+> `ice_turn_handle_allocate_response` classified any 401 as
+> `RELAY_FAILED`; R36A's parallel
+> `ice_turn_handle_allocate_response_authed` parses out REALM +
+> NONCE, transitions to a new `ICE_TURN_AUTH_PENDING` state, and
+> returns `ICE_TURN_RELAY_AUTH_PENDING`. Caller then invokes
+> `ice_turn_credentials(state, username, password)` to supply the
+> creds; we emit a credentialed Allocate via the R36A authed
+> emitter and bump `stats_auth_retries`. A SECOND 401 -- meaning
+> the credentials were wrong -- classifies `RELAY_FAILED` and
+> stops. New ice_turn state slots appended: `auth_realm_buf` /
+> `_n` + `auth_nonce_buf` / `_n` (freshly-alloc'd copies that
+> outlive the recv buf) + `auth_state` (NONE / PENDING / OK /
+> FAILED) + `stats_auth_retries`. **136 new assertions** -- 82
+> turn + 54 ice_turn. Turn coverage: MD5 RFC 1321 §A.5 vectors
+> (empty / "abc" / "message digest"), HMAC-SHA1 RFC 2202 TC1
+> (`0x0b * 20` key + "Hi There") + TC2 ("Jefe" + "what do ya want
+> for nothing?"), `turn_hmac_sha1_key` matches direct MD5,
+> attr-order on the authed emit (LIFETIME / REQUESTED-TRANSPORT /
+> USERNAME / REALM / NONCE / MESSAGE-INTEGRITY), MI-position rule
+> (re-compute HMAC over [0..MI_attr_start) and confirm equality
+> with the embedded value), self-emit MI verify, wrong-key MI
+> fails, no-MI message returns 0 (no crash), parse_401 extracts
+> REALM + NONCE / rejects no-REALM / rejects non-401 codes,
+> `TURN_PERM_LIFETIME_DEFAULT = 300` + `TURN_CHANNEL_LIFETIME_DEFAULT
+> = 600`, tick_perms removes-when-expired / keeps-in-window /
+> mixed-window per-record pruning, channel pruning via
+> `_turn_record_channel_r36a` with 600s default, composed
+> `tick_authed` (alloc + perms in one call), perm lifetime override
+> reflected after recv via `turn_client_restamp_last_permission`,
+> tick_perms on IDLE = `[0, 0]` no-crash, R35B-shape state
+> auto-extends to 27 slots. ICE-TURN coverage: init_authed state
+> shape (23 slots, all auth fields zero), 401 -> AUTH_PENDING
+> (REALM + NONCE stashed as freshly-alloc'd copies), credentialed
+> re-emit is a real Allocate Request with 6 attrs ending in MI,
+> credentialed re-emit success -> ACTIVE + relay candidate
+> injected, second 401 -> RELAY_FAILED + AUTH_FAILED, non-401 errors
+> fall through to the R35D handler unchanged, credentials() refused
+> when not PENDING, first-try success skips the auth path, full
+> end-to-end flow (gather host -> all pairs fail -> escalate ->
+> 401 -> credentials -> success -> relay candidate present in
+> ice_agent), counter does not bump on refused credentials() call.
+> **323 prior turn + 88 prior ice_turn assertions byte-identical**
+> (R36A appends to the tail of each suite). Honest caveat: MD5 is
+> cryptographically broken for collision resistance (Wang 2004),
+> but RFC 5389 §15.4 mandates `MD5(user:realm:pass)` as the
+> HMAC-SHA1 key for the long-term-credential mechanism, so R36A
+> remains on-spec. Modern replacements are SCRAM-SHA1 / SCRAM-SHA256
+> (RFC 7635) -- deferred. The retry uses the SAME txn id as the
+> initial Allocate (keeps response correlation simple); rotating
+> the txn between the two requests would need an additional state
+> slot.
 >
 > R35A (R34C.2) closes the DTLS-SRTP keying loop per RFC 5764 §4.2.
 > Before R35A, the SRTP master key + salt had to be supplied
