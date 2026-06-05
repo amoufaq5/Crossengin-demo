@@ -3,6 +3,49 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R36F -- documentation sweep: ADRs + Getting Started + CONTRIBUTING
+
+**Status: complete** -- user-facing documentation surface refreshed for
+post-R35 state. No code modules touched; this is the documentation
+round.
+
+### What R36F delivers
+  - **6 new ADRs under `docs/adr/r36f-*`** capturing the rounds-up
+    rationale that wasn't previously written down: language choice
+    (NOVA), federated learning shape (DP + EMA pull = 0.1), federation
+    stack (DTLS+ICE+TURN+SRTP), substrate re-ratification, self-host
+    invariant, canonical crypto primitives.
+  - **`docs/GETTING_STARTED.md`** -- Linux native, Windows WSL2, macOS
+    Intel (Docker), macOS Apple Silicon (Docker + Rosetta + honest
+    perf note), Vercel-hybrid pattern (Vercel UI proxies to a Linux
+    box; NOT a native Vercel deployment).
+  - **`docs/CONTRIBUTING.md`** -- round-based development model,
+    file-ownership discipline, stash protocol (`git stash push -m ...
+    -- <paths>` only; `-u` forbidden), commit conventions.
+  - **`README.md` top-of-file**: docs/ link + concise per-track status
+    table.
+
+### Honest caveats
+  - **R36F is documentation, not validation.** The Getting Started
+    guide reflects the existing supported configurations; R36F did
+    not re-run installs on Windows / macOS hardware.
+  - **Vercel pattern is hybrid, not native** -- doc is explicit. A
+    future PR could ship the proxy reference architecture under
+    `infra/vercel-proxy/`.
+  - **Apple Silicon emulation cost is real** (3-5x slowdown). The doc
+    says so.
+  - **TODO marker** in R36F-0002: exact round where the EMA pull
+    strength of 0.1 was decided couldn't be pinned from commit
+    history.
+
+### Deferred to future rounds
+  - Vercel reference architecture (worked Next.js + Caddy + Fly.io
+    example).
+  - ADR consolidation: existing `docs/adr/0001..0050` series + new
+    `r36f-*` series could be re-ordered into a single sequence.
+
+---
+
 ## R35A (R34C.2) -- DTLS-SRTP keying material extraction (RFC 5764 §4.2)
 
 **Status: complete** -- closes the keying loop between R31B's DTLS

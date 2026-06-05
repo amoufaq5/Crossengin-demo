@@ -2,6 +2,14 @@
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/amoufaq5/Crossengin-demo)
 
+> **New here?** Start with [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)
+> (Linux / Windows WSL2 / macOS / Vercel hybrid), then
+> [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for the round-based
+> development model. Architecture decisions live under
+> [`docs/adr/`](docs/adr/) -- the R36F-prefixed series covers the rounds-up
+> rationale (language choice, federation stack, substrate commitment,
+> self-hosting invariant, canonical crypto primitives).
+
 CrossEngin is a non-LLM cognitive **substrate** system, implemented in
 [NOVA](https://github.com/amoufaq5/nova). It targets AGI-relevant capability —
 continuous learning, self-directed skill acquisition, theory of mind,
@@ -9,9 +17,24 @@ initiative, counterfactual reasoning, long-horizon goals, and self-awareness of
 identity, state, and goals over time — by running a fabric of uniform
 computational units rather than orchestrating a pipeline of modules.
 
-> **Status: v1.0 — all 10 phases complete and assembled into one unified agent
-> process.** Implemented in NOVA and verified against the real self-hosting
-> toolchain.
+## Status (through R35)
+
+| Track | Latest round | What landed |
+|---|---|---|
+| Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
+| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2; TURN client state machine; ICE-TURN escalation. |
+| Safety / crypto leaves | R33A / R34A | Canonical `safety/sha256.nova` + dedup of inline copies across noise_xk, merkle, ecdsa, dtls12. |
+| Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
+| Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
+| NOVA toolchain | external | `stage2.s == stage3.s` self-host invariant treated as a load-bearing CI gate. |
+
+See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
+[`docs/adr/r36f-0001-language-choice-nova.md`](docs/adr/r36f-0001-language-choice-nova.md)
+.. R36F-0006 for the rationale behind each track.
+
+> **R35A note.** v1.0 -- all 10 phases complete and assembled into one
+> unified agent process. Implemented in NOVA and verified against the
+> real self-hosting toolchain.
 >
 > R35A (R34C.2) closes the DTLS-SRTP keying loop per RFC 5764 §4.2.
 > Before R35A, the SRTP master key + salt had to be supplied
