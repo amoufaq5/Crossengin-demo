@@ -1050,3 +1050,620 @@ fn _turn_test_decode_xor_addr(value_ptr, value_n) {
 fn _turn_test_decode_error_code(value_ptr, value_n) {
     return _turn_decode_error_code(value_ptr, value_n)
 }
+
+// ============================================================================
+// ============================================================================
+//                  Client-side allocation STATE MACHINE (R34B.2)
+// ============================================================================
+// ============================================================================
+//
+// Everything below the test-only shims is the CLIENT-side TURN allocation
+// state machine that layers on the wire codec above. It tracks the
+// lifecycle of a TURN allocation (PENDING -> ACTIVE -> REFRESHING ->
+// EXPIRED), the list of permitted peer addresses, and the channel-number
+// to peer bindings against a TURN server. It is PURE STATE -- no socket
+// I/O. Callers drive transitions by feeding emit/recv pairs.
+//
+// What's modeled:
+//   * 6-state lifecycle (IDLE / PENDING / ACTIVE / REFRESHING / EXPIRED /
+//     FAILED).
+//   * Allocation expiry tracking against a caller-supplied unix clock.
+//   * Permissions table (list of peer_ip + peer_port + expiry).
+//   * Channel-binding table (list of channel_num + peer_ip + peer_port).
+//   * In-flight transaction tracking: only one outstanding request per
+//     allocation; recv() ignores mismatched txn_ids.
+//   * Counter slots for emit + recv per request kind, for observability.
+//
+// What's NOT modeled:
+//   * The TURN SERVER side: no allocation pool, no per-server permission
+//     enforcement, no data forwarding to peers. RFC 5766 §6.2 describes
+//     the server-side allocator; that's a future round if anyone needs
+//     to RUN a TURN relay.
+//   * Re-issue path with long-term credentials (USERNAME + REALM + NONCE
+//     + MESSAGE-INTEGRITY) on 401 Unauthorized. R34B already documents
+//     this gap; the state machine surfaces the 401 via last_err_code +
+//     FAILED state, and the caller can retry the Allocate after the
+//     auth attrs are computed elsewhere.
+//   * Permission + channel REFRESH cadence (5 min / 10 min per RFC
+//     5766 §8 / §11). The state has per-permission expiry slots; the
+//     tick() function reports the allocation expiry only. A future
+//     round can layer a per-permission tick on top without touching
+//     this module (just iterate permissions_list / channels_list and
+//     compare against current_time_unix).
+//
+// Per-channel-binding rule (RFC 5766 §11): channel_num MUST be in
+// [0x4000, 0x7FFE]. The send_channel_bind entry point REJECTS values
+// outside that range BEFORE emitting -- it returns 0 so callers can
+// distinguish reject-pre-emit from a valid [buf, n] tuple.
+
+// ============================================================================
+//                    State enum (allocation lifecycle)
+// ============================================================================
+
+let TURN_STATE_IDLE       = 0       // no allocation requested
+let TURN_STATE_PENDING    = 1       // Allocate sent, awaiting response
+let TURN_STATE_ACTIVE     = 2       // allocation granted
+let TURN_STATE_REFRESHING = 3       // Refresh in flight
+let TURN_STATE_EXPIRED    = 4       // lifetime elapsed
+let TURN_STATE_FAILED     = 5       // allocation rejected
+
+// ============================================================================
+//                    recv() return tags
+// ============================================================================
+
+let TURN_RECV_IGNORED          = 0       // unknown / mismatched txn_id
+let TURN_RECV_ALLOCATED        = 1       // Allocate success
+let TURN_RECV_ALLOCATE_FAILED  = 2       // Allocate error
+let TURN_RECV_REFRESHED        = 3       // Refresh success (lifetime > 0)
+let TURN_RECV_REFRESH_FAILED   = 4       // Refresh error
+let TURN_RECV_REFRESH_DELETED  = 5       // Refresh success lifetime=0
+                                         // (server-initiated delete)
+let TURN_RECV_PERMITTED        = 6       // CreatePermission success
+let TURN_RECV_PERM_FAILED      = 7       // CreatePermission error
+let TURN_RECV_CHANNEL_BOUND    = 8       // ChannelBind success
+let TURN_RECV_CHANNEL_FAILED   = 9       // ChannelBind error
+let TURN_RECV_DATA             = 10      // Data Indication
+
+// ============================================================================
+//                    tick() return tags
+// ============================================================================
+
+let TURN_TICK_OK      = 0
+let TURN_TICK_EXPIRED = 1
+
+// ============================================================================
+//                    state slot indices (positional list)
+// ============================================================================
+
+let _TURN_ST_STATE              = 0
+let _TURN_ST_TXN_ID             = 1
+let _TURN_ST_RELAYED_IP         = 2
+let _TURN_ST_RELAYED_PORT       = 3
+let _TURN_ST_MAPPED_IP          = 4
+let _TURN_ST_MAPPED_PORT        = 5
+let _TURN_ST_LIFETIME           = 6
+let _TURN_ST_EXPIRY             = 7
+let _TURN_ST_LAST_ERR           = 8
+let _TURN_ST_PERMS              = 9       // list of [peer_ip, port, expiry]
+let _TURN_ST_CHANNELS           = 10      // list of [chan_num, ip, port]
+let _TURN_ST_STATS_ALLOC_SENT   = 11
+let _TURN_ST_STATS_ALLOC_RECV   = 12
+let _TURN_ST_STATS_ALLOC_FAIL   = 13
+let _TURN_ST_STATS_REFR_SENT    = 14
+let _TURN_ST_STATS_REFR_RECV    = 15
+let _TURN_ST_STATS_PERM_SENT    = 16
+let _TURN_ST_STATS_PERM_RECV    = 17
+let _TURN_ST_STATS_CHAN_SENT    = 18
+let _TURN_ST_STATS_CHAN_RECV    = 19
+let _TURN_ST_INFLIGHT_METHOD    = 20      // which method is awaiting reply
+let _TURN_ST_PENDING_PEER_IP    = 21      // for in-flight perm / chanbind
+let _TURN_ST_PENDING_PEER_PORT  = 22
+let _TURN_ST_PENDING_CHANNEL    = 23
+let _TURN_ST_LEN                = 24
+
+// Channel-number band (RFC 5766 §11).
+let TURN_CHANNEL_MIN = 16384        // 0x4000
+let TURN_CHANNEL_MAX = 32766        // 0x7FFE
+
+// Default permission lifetime (RFC 5766 §8: 300 sec / 5 min).
+let TURN_PERM_LIFETIME_DEFAULT = 300
+
+// ============================================================================
+//                    turn_client_init()
+// ============================================================================
+
+fn turn_client_init() {
+    let st = list_new()
+    push(st, TURN_STATE_IDLE)        // 0  STATE
+    push(st, 0)                      // 1  TXN_ID (0 == none)
+    push(st, "")                     // 2  RELAYED_IP
+    push(st, 0)                      // 3  RELAYED_PORT
+    push(st, "")                     // 4  MAPPED_IP
+    push(st, 0)                      // 5  MAPPED_PORT
+    push(st, 0)                      // 6  LIFETIME
+    push(st, 0)                      // 7  EXPIRY
+    push(st, 0)                      // 8  LAST_ERR
+    push(st, list_new())             // 9  PERMS
+    push(st, list_new())             // 10 CHANNELS
+    push(st, 0)                      // 11 ALLOC_SENT
+    push(st, 0)                      // 12 ALLOC_RECV
+    push(st, 0)                      // 13 ALLOC_FAIL
+    push(st, 0)                      // 14 REFR_SENT
+    push(st, 0)                      // 15 REFR_RECV
+    push(st, 0)                      // 16 PERM_SENT
+    push(st, 0)                      // 17 PERM_RECV
+    push(st, 0)                      // 18 CHAN_SENT
+    push(st, 0)                      // 19 CHAN_RECV
+    push(st, 0)                      // 20 INFLIGHT_METHOD (0 = none)
+    push(st, "")                     // 21 PENDING_PEER_IP
+    push(st, 0)                      // 22 PENDING_PEER_PORT
+    push(st, 0)                      // 23 PENDING_CHANNEL
+    return st
+}
+
+// ============================================================================
+//                    Read accessors
+// ============================================================================
+
+fn turn_client_state(state)        { return state[_TURN_ST_STATE] }
+fn turn_client_txn_id(state)       { return state[_TURN_ST_TXN_ID] }
+fn turn_client_relayed_ip(state)   { return state[_TURN_ST_RELAYED_IP] }
+fn turn_client_relayed_port(state) { return state[_TURN_ST_RELAYED_PORT] }
+fn turn_client_mapped_ip(state)    { return state[_TURN_ST_MAPPED_IP] }
+fn turn_client_mapped_port(state)  { return state[_TURN_ST_MAPPED_PORT] }
+fn turn_client_lifetime(state)     { return state[_TURN_ST_LIFETIME] }
+fn turn_client_expiry(state)       { return state[_TURN_ST_EXPIRY] }
+fn turn_client_last_err(state)     { return state[_TURN_ST_LAST_ERR] }
+fn turn_client_perms(state)        { return state[_TURN_ST_PERMS] }
+fn turn_client_channels(state)     { return state[_TURN_ST_CHANNELS] }
+fn turn_client_stats_alloc_sent(state)  { return state[_TURN_ST_STATS_ALLOC_SENT] }
+fn turn_client_stats_alloc_recv(state)  { return state[_TURN_ST_STATS_ALLOC_RECV] }
+fn turn_client_stats_alloc_fail(state)  { return state[_TURN_ST_STATS_ALLOC_FAIL] }
+fn turn_client_stats_refr_sent(state)   { return state[_TURN_ST_STATS_REFR_SENT] }
+fn turn_client_stats_refr_recv(state)   { return state[_TURN_ST_STATS_REFR_RECV] }
+fn turn_client_stats_perm_sent(state)   { return state[_TURN_ST_STATS_PERM_SENT] }
+fn turn_client_stats_perm_recv(state)   { return state[_TURN_ST_STATS_PERM_RECV] }
+fn turn_client_stats_chan_sent(state)   { return state[_TURN_ST_STATS_CHAN_SENT] }
+fn turn_client_stats_chan_recv(state)   { return state[_TURN_ST_STATS_CHAN_RECV] }
+fn turn_client_inflight_method(state)   { return state[_TURN_ST_INFLIGHT_METHOD] }
+
+// ============================================================================
+//                    txn_id compare (12-byte buffers)
+// ============================================================================
+
+fn _turn_txn_eq(a, b) {
+    if a == 0 { return 0 }
+    if b == 0 { return 0 }
+    let i = 0
+    while i < TURN_TXN_ID_LEN {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                    turn_client_send_allocate
+// ============================================================================
+//
+// Transitions IDLE -> PENDING and stamps the current_txn_id. Calls
+// `turn_emit_allocate_request` to produce the wire bytes. If the state
+// is not IDLE / EXPIRED / FAILED, returns 0 (caller cannot start a new
+// allocate while one is in flight or already ACTIVE).
+
+fn turn_client_send_allocate(state, txn_id, lifetime_sec,
+                             requested_transport) {
+    let s = state[_TURN_ST_STATE]
+    // Allowed from IDLE / EXPIRED / FAILED only -- the client must
+    // de-allocate an active allocation via Refresh(lifetime=0) before
+    // requesting a new one.
+    if s == TURN_STATE_PENDING    { return 0 }
+    if s == TURN_STATE_ACTIVE     { return 0 }
+    if s == TURN_STATE_REFRESHING { return 0 }
+    list_set(state, _TURN_ST_STATE, TURN_STATE_PENDING)
+    list_set(state, _TURN_ST_TXN_ID, txn_id)
+    list_set(state, _TURN_ST_INFLIGHT_METHOD, TURN_METHOD_ALLOCATE)
+    list_set(state, _TURN_ST_STATS_ALLOC_SENT,
+             state[_TURN_ST_STATS_ALLOC_SENT] + 1)
+    return turn_emit_allocate_request(txn_id, lifetime_sec,
+                                      requested_transport)
+}
+
+// ============================================================================
+//                    turn_client_send_refresh
+// ============================================================================
+//
+// Must be in ACTIVE state. Transitions to REFRESHING.
+
+fn turn_client_send_refresh(state, txn_id, lifetime_sec) {
+    if state[_TURN_ST_STATE] != TURN_STATE_ACTIVE { return 0 }
+    list_set(state, _TURN_ST_STATE, TURN_STATE_REFRESHING)
+    list_set(state, _TURN_ST_TXN_ID, txn_id)
+    list_set(state, _TURN_ST_INFLIGHT_METHOD, TURN_METHOD_REFRESH)
+    list_set(state, _TURN_ST_STATS_REFR_SENT,
+             state[_TURN_ST_STATS_REFR_SENT] + 1)
+    return turn_emit_refresh_request(txn_id, lifetime_sec)
+}
+
+// ============================================================================
+//                    turn_client_send_permission
+// ============================================================================
+//
+// Must be ACTIVE state. State STAYS ACTIVE -- CreatePermission is a
+// per-peer side effect, not a lifecycle transition. We DO stamp the
+// pending peer so recv() can append it to permissions_list on success.
+
+fn turn_client_send_permission(state, txn_id, peer_ip, peer_port) {
+    if state[_TURN_ST_STATE] != TURN_STATE_ACTIVE { return 0 }
+    let ipbuf = turn_ipv4_str_to_buf(peer_ip)
+    if ipbuf == 0 { return 0 }
+    list_set(state, _TURN_ST_TXN_ID, txn_id)
+    list_set(state, _TURN_ST_INFLIGHT_METHOD, TURN_METHOD_CREATE_PERMISSION)
+    list_set(state, _TURN_ST_PENDING_PEER_IP, peer_ip)
+    list_set(state, _TURN_ST_PENDING_PEER_PORT, peer_port)
+    list_set(state, _TURN_ST_STATS_PERM_SENT,
+             state[_TURN_ST_STATS_PERM_SENT] + 1)
+    return turn_emit_create_permission_request(txn_id, ipbuf, peer_port)
+}
+
+// ============================================================================
+//                    turn_client_send_channel_bind
+// ============================================================================
+//
+// channel_num MUST be in [0x4000, 0x7FFE] per RFC 5766 §11. Out-of-range
+// is REJECTED pre-emit (returns 0). Must be ACTIVE state.
+
+fn turn_client_send_channel_bind(state, txn_id, channel_num, peer_ip,
+                                 peer_port) {
+    if state[_TURN_ST_STATE] != TURN_STATE_ACTIVE { return 0 }
+    if channel_num < TURN_CHANNEL_MIN { return 0 }
+    if channel_num > TURN_CHANNEL_MAX { return 0 }
+    let ipbuf = turn_ipv4_str_to_buf(peer_ip)
+    if ipbuf == 0 { return 0 }
+    list_set(state, _TURN_ST_TXN_ID, txn_id)
+    list_set(state, _TURN_ST_INFLIGHT_METHOD, TURN_METHOD_CHANNEL_BIND)
+    list_set(state, _TURN_ST_PENDING_PEER_IP, peer_ip)
+    list_set(state, _TURN_ST_PENDING_PEER_PORT, peer_port)
+    list_set(state, _TURN_ST_PENDING_CHANNEL, channel_num)
+    list_set(state, _TURN_ST_STATS_CHAN_SENT,
+             state[_TURN_ST_STATS_CHAN_SENT] + 1)
+    return turn_emit_channel_bind_request(txn_id, channel_num, ipbuf,
+                                          peer_port)
+}
+
+// ============================================================================
+//                    turn_client_tick
+// ============================================================================
+//
+// Compares the stored expiry_unix against current_time_unix. If the
+// allocation has expired and no Refresh succeeded in time, transitions
+// ACTIVE -> EXPIRED. PENDING / REFRESHING / IDLE / EXPIRED / FAILED are
+// not affected -- expiry only applies once we have a granted allocation.
+
+fn turn_client_tick(state, current_time_unix) {
+    let s = state[_TURN_ST_STATE]
+    if s != TURN_STATE_ACTIVE { return TURN_TICK_OK }
+    if state[_TURN_ST_EXPIRY] < current_time_unix {
+        list_set(state, _TURN_ST_STATE, TURN_STATE_EXPIRED)
+        return TURN_TICK_EXPIRED
+    }
+    return TURN_TICK_OK
+}
+
+// ============================================================================
+//                    Internal: record a permission entry
+// ============================================================================
+
+fn _turn_record_permission(state, current_time_unix) {
+    let ip   = state[_TURN_ST_PENDING_PEER_IP]
+    let port = state[_TURN_ST_PENDING_PEER_PORT]
+    let rec = list_new()
+    push(rec, ip)
+    push(rec, port)
+    push(rec, current_time_unix + TURN_PERM_LIFETIME_DEFAULT)
+    push(state[_TURN_ST_PERMS], rec)
+    return 1
+}
+
+fn _turn_record_channel(state) {
+    let rec = list_new()
+    push(rec, state[_TURN_ST_PENDING_CHANNEL])
+    push(rec, state[_TURN_ST_PENDING_PEER_IP])
+    push(rec, state[_TURN_ST_PENDING_PEER_PORT])
+    push(state[_TURN_ST_CHANNELS], rec)
+    return 1
+}
+
+// ============================================================================
+//                    turn_client_recv
+// ============================================================================
+//
+// Dispatches an incoming TURN message by method + class against the
+// in-flight transaction id. Mismatched txn_ids are IGNORED (RFC 8489
+// §6.3.3 -- responses to other requests must not be processed). Data
+// Indications carry their own txn_id (uncorrelated) and are accepted
+// regardless of in-flight state, since they arrive from the server
+// asynchronously.
+
+fn turn_client_recv(state, recv_buf, n, current_time_unix) {
+    let cls = turn_classify_message(recv_buf, n)
+    if cls < 0 { return TURN_RECV_IGNORED }
+    let method      = cls[0]
+    let class       = cls[1]
+    let body_length = cls[2]
+    let txn_ptr     = cls[3]
+
+    // Data Indication: server-pushed, no txn correlation.
+    if method == TURN_METHOD_DATA {
+        if class != TURN_CLASS_INDICATION { return TURN_RECV_IGNORED }
+        return TURN_RECV_DATA
+    }
+
+    // For request/response messages, txn_id MUST match the in-flight.
+    let inflight = state[_TURN_ST_INFLIGHT_METHOD]
+    if inflight == 0 { return TURN_RECV_IGNORED }
+    if method != inflight { return TURN_RECV_IGNORED }
+    if _turn_txn_eq(state[_TURN_ST_TXN_ID], txn_ptr) == 0 {
+        return TURN_RECV_IGNORED
+    }
+
+    // --- Allocate response ---
+    if method == TURN_METHOD_ALLOCATE {
+        if class == TURN_CLASS_SUCCESS_RESP {
+            let dec = turn_parse_allocate_success_response(recv_buf, n)
+            if dec < 0 {
+                list_set(state, _TURN_ST_STATE, TURN_STATE_FAILED)
+                list_set(state, _TURN_ST_LAST_ERR, dec)
+                list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+                list_set(state, _TURN_ST_STATS_ALLOC_FAIL,
+                         state[_TURN_ST_STATS_ALLOC_FAIL] + 1)
+                return TURN_RECV_ALLOCATE_FAILED
+            }
+            let relayed_ip   = dec[0]
+            let relayed_port = dec[1]
+            let lifetime_sec = dec[2]
+            let mapped_ip    = dec[3]
+            let mapped_port  = dec[4]
+            list_set(state, _TURN_ST_STATE,        TURN_STATE_ACTIVE)
+            list_set(state, _TURN_ST_RELAYED_IP,   relayed_ip)
+            list_set(state, _TURN_ST_RELAYED_PORT, relayed_port)
+            list_set(state, _TURN_ST_LIFETIME,     lifetime_sec)
+            list_set(state, _TURN_ST_EXPIRY,
+                     current_time_unix + lifetime_sec)
+            list_set(state, _TURN_ST_MAPPED_IP,    mapped_ip)
+            list_set(state, _TURN_ST_MAPPED_PORT,  mapped_port)
+            list_set(state, _TURN_ST_LAST_ERR,     0)
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            list_set(state, _TURN_ST_STATS_ALLOC_RECV,
+                     state[_TURN_ST_STATS_ALLOC_RECV] + 1)
+            return TURN_RECV_ALLOCATED
+        }
+        if class == TURN_CLASS_ERROR_RESP {
+            let derr = turn_parse_allocate_error_response(recv_buf, n)
+            let code = 0
+            if derr < 0 {
+                code = derr
+            } else {
+                code = derr[0]
+            }
+            list_set(state, _TURN_ST_STATE,    TURN_STATE_FAILED)
+            list_set(state, _TURN_ST_LAST_ERR, code)
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            list_set(state, _TURN_ST_STATS_ALLOC_FAIL,
+                     state[_TURN_ST_STATS_ALLOC_FAIL] + 1)
+            return TURN_RECV_ALLOCATE_FAILED
+        }
+        return TURN_RECV_IGNORED
+    }
+
+    // --- Refresh response ---
+    if method == TURN_METHOD_REFRESH {
+        if class == TURN_CLASS_SUCCESS_RESP {
+            let dec = turn_parse_refresh_success_response(recv_buf, n)
+            if dec < 0 {
+                // Malformed success; stay ACTIVE so caller can retry.
+                list_set(state, _TURN_ST_STATE, TURN_STATE_ACTIVE)
+                list_set(state, _TURN_ST_LAST_ERR, dec)
+                list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+                return TURN_RECV_REFRESH_FAILED
+            }
+            let lifetime_sec = dec[0]
+            list_set(state, _TURN_ST_LIFETIME, lifetime_sec)
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            list_set(state, _TURN_ST_STATS_REFR_RECV,
+                     state[_TURN_ST_STATS_REFR_RECV] + 1)
+            if lifetime_sec == 0 {
+                // Server-initiated de-allocate (RFC 5766 §7).
+                list_set(state, _TURN_ST_STATE,  TURN_STATE_EXPIRED)
+                list_set(state, _TURN_ST_EXPIRY, current_time_unix)
+                return TURN_RECV_REFRESH_DELETED
+            }
+            list_set(state, _TURN_ST_STATE, TURN_STATE_ACTIVE)
+            list_set(state, _TURN_ST_EXPIRY,
+                     current_time_unix + lifetime_sec)
+            return TURN_RECV_REFRESHED
+        }
+        if class == TURN_CLASS_ERROR_RESP {
+            // Server denied the refresh. Per RFC 5766 §7, the client
+            // can retry with credentials; we surface the error code
+            // but stay ACTIVE so the caller can decide retry-or-give-up.
+            // If the existing expiry has already passed, the next tick()
+            // will move us to EXPIRED.
+            let derr = turn_parse_allocate_error_response(recv_buf, n)
+            let code = 0
+            if derr < 0 {
+                code = derr
+            } else {
+                code = derr[0]
+            }
+            // Allocate-error parser checks method too -- a refresh
+            // error response will have method REFRESH, which the
+            // allocate-error parser would REJECT with ERR_METHOD.
+            // For now use the lighter approach: pull the ERROR-CODE
+            // attribute directly via the walker.
+            if code == TURN_ERR_METHOD {
+                let r = _turn_walk_attrs(recv_buf, n)
+                if r[0] >= 0 {
+                    let ec = _turn_find_attr(r[1], TURN_ATTR_ERROR_CODE)
+                    if ec != 0 {
+                        let de = _turn_decode_error_code(ec[1], ec[2])
+                        if de != 0 { code = de[0] }
+                    }
+                }
+            }
+            list_set(state, _TURN_ST_LAST_ERR, code)
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            // Server refusal -> FAILED (caller can issue a fresh
+            // Allocate). The brief calls for ACTIVE-or-FAILED per the
+            // error code; for the common 437 / 438 / 441 cases the
+            // allocation is gone server-side, so FAILED is correct.
+            list_set(state, _TURN_ST_STATE, TURN_STATE_FAILED)
+            return TURN_RECV_REFRESH_FAILED
+        }
+        return TURN_RECV_IGNORED
+    }
+
+    // --- CreatePermission response ---
+    if method == TURN_METHOD_CREATE_PERMISSION {
+        if class == TURN_CLASS_SUCCESS_RESP {
+            _turn_record_permission(state, current_time_unix)
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            list_set(state, _TURN_ST_STATS_PERM_RECV,
+                     state[_TURN_ST_STATS_PERM_RECV] + 1)
+            return TURN_RECV_PERMITTED
+        }
+        if class == TURN_CLASS_ERROR_RESP {
+            // Parse ERROR-CODE for last_err_code.
+            let r = _turn_walk_attrs(recv_buf, n)
+            if r[0] >= 0 {
+                let ec = _turn_find_attr(r[1], TURN_ATTR_ERROR_CODE)
+                if ec != 0 {
+                    let de = _turn_decode_error_code(ec[1], ec[2])
+                    if de != 0 {
+                        list_set(state, _TURN_ST_LAST_ERR, de[0])
+                    }
+                }
+            }
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            return TURN_RECV_PERM_FAILED
+        }
+        return TURN_RECV_IGNORED
+    }
+
+    // --- ChannelBind response ---
+    if method == TURN_METHOD_CHANNEL_BIND {
+        if class == TURN_CLASS_SUCCESS_RESP {
+            _turn_record_channel(state)
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            list_set(state, _TURN_ST_STATS_CHAN_RECV,
+                     state[_TURN_ST_STATS_CHAN_RECV] + 1)
+            return TURN_RECV_CHANNEL_BOUND
+        }
+        if class == TURN_CLASS_ERROR_RESP {
+            let r = _turn_walk_attrs(recv_buf, n)
+            if r[0] >= 0 {
+                let ec = _turn_find_attr(r[1], TURN_ATTR_ERROR_CODE)
+                if ec != 0 {
+                    let de = _turn_decode_error_code(ec[1], ec[2])
+                    if de != 0 {
+                        list_set(state, _TURN_ST_LAST_ERR, de[0])
+                    }
+                }
+            }
+            list_set(state, _TURN_ST_INFLIGHT_METHOD, 0)
+            return TURN_RECV_CHANNEL_FAILED
+        }
+        return TURN_RECV_IGNORED
+    }
+
+    return TURN_RECV_IGNORED
+}
+
+// ============================================================================
+//                    Response emitters for the state-machine tests
+// ============================================================================
+//
+// The wire codec above ships build helpers for Allocate / Refresh /
+// Data responses; the permission + chanbind success responses are not
+// there. RFC 5766 §9.4 + §11.3 describe these as empty-body messages
+// (header + zero-length body). Same for the corresponding error
+// responses, which carry ERROR-CODE only. These exist so the unit
+// tests can drive the state machine without spinning up a real TURN
+// relay.
+
+fn turn_emit_create_permission_success_response(txn_id_buf) {
+    let total = TURN_HDR_LEN
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_CREATE_PERMISSION,
+                                   TURN_CLASS_SUCCESS_RESP)
+    _turn_put_header(buf, mtype, 0, txn_id_buf)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, total)
+    return out
+}
+
+fn turn_emit_channel_bind_success_response(txn_id_buf) {
+    let total = TURN_HDR_LEN
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_CHANNEL_BIND,
+                                   TURN_CLASS_SUCCESS_RESP)
+    _turn_put_header(buf, mtype, 0, txn_id_buf)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, total)
+    return out
+}
+
+fn _turn_emit_method_error_response(method, txn_id_buf, class_num,
+                                    number, reason) {
+    let reason_n = len(reason)
+    if reason_n > 256 { reason_n = 256 }
+    let err_value_n = 4 + reason_n
+    let body = _turn_attr_size(err_value_n)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(method, TURN_CLASS_ERROR_RESP)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    _turn_put_u16(buf, off + 0, TURN_ATTR_ERROR_CODE)
+    _turn_put_u16(buf, off + 2, err_value_n)
+    store8(buf + off + 4, 0)
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, int_and(class_num, 7))
+    store8(buf + off + 7, int_and(number, 255))
+    let i = 0
+    while i < reason_n {
+        store8(buf + off + 8 + i, char_at(reason, i))
+        i = i + 1
+    }
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off + _turn_attr_size(err_value_n))
+    return out
+}
+
+fn turn_emit_refresh_error_response(txn_id_buf, class_num, number, reason) {
+    return _turn_emit_method_error_response(TURN_METHOD_REFRESH, txn_id_buf,
+                                            class_num, number, reason)
+}
+
+fn turn_emit_create_permission_error_response(txn_id_buf, class_num,
+                                              number, reason) {
+    return _turn_emit_method_error_response(TURN_METHOD_CREATE_PERMISSION,
+                                            txn_id_buf, class_num, number,
+                                            reason)
+}
+
+fn turn_emit_channel_bind_error_response(txn_id_buf, class_num, number,
+                                         reason) {
+    return _turn_emit_method_error_response(TURN_METHOD_CHANNEL_BIND,
+                                            txn_id_buf, class_num, number,
+                                            reason)
+}
