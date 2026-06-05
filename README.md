@@ -13,6 +13,24 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R33B finalizes DTLS 1.2: cert verify is wired (R29B.3 retires the last
+> `_R29B2_STUB` slot by importing R32C's `x509_parse` +
+> `x509_check_validity` + `ecdsa_p256_verify_bn` -- five distinct
+> failure tags for parse / not-yet-valid / expired / sig / fingerprint
+> mismatch, plus optional SHA-256 fingerprint binding per RFC 4572 §5)
+> and the anti-replay sliding window now resets on
+> `dtls_advance_epoch` per RFC 6347 §4.1.2.6 (the R32B.2 deferral).
+> AAD now stamps the epoch as `(epoch << 48) | seq` per RFC 5246
+> §6.2.3.3, so cross-epoch ciphertexts carry distinguishable AEAD tags
+> even when the window resets. All 297 prior R29B + R31B + R32B
+> assertions remain byte-identical (epoch=0 AAD collapses to plain
+> seq; new state slots are tail-appended). 17 new R33B test functions
+> add 56 assertions covering all five cert outcomes, epoch-reset
+> state transitions, cross-epoch AEAD round-trip, and the six new
+> stats-line fields. Cert chain validation is single-cert only --
+> CrossEngin's actual cert use case is SDP-fingerprint pinning, so
+> CA traversal is deferred to a hardening round if needed.
+>
 > R33A lands the canonical `src/safety/sha256.nova` (FIPS 180-4
 > SHA-256 + RFC 2104 HMAC-SHA256) and refactors three of four
 > previously-duplicated copies (`noise_xk.nova`, `merkle.nova`,

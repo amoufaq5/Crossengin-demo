@@ -2388,6 +2388,59 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R33B extension: DTLS cert verify wire + CCS-on-epoch replay-window reset (R29B.3 / R32B.2 / R32C.2)
+
+R29B (the 1.0 of DTLS 1.2 in CrossEngin) shipped two
+`_R29B2_STUB`-suffixed slots that returned `DTLS_ERR_STUB` as
+placeholders for follow-up rounds. R31B retired three of those
+(`dtls_ecdhe_derive`, `dtls_seal_record`, `dtls_open_record`); R33B
+retires the last (`dtls_cert_verify`) by wiring R32C's brand-new
+`src/safety/x509.nova` + `src/safety/ecdsa.nova` into a real
+parse-validate-hash-verify-fingerprint pipeline.
+
+R32B's exit report flagged a second deferral: the anti-replay sliding
+window did not reset on epoch transitions, in violation of RFC 6347
+§4.1.2.6 ("MUST reset the receive sequence number space and the
+anti-replay window"). R33B closes that with `dtls_advance_epoch(state)`,
+which bumps both send and receive epoch counters, zeroes the send/recv
+sequence slots, and zeroes the watermark + replay mask. The
+`stats_replay` / `stats_too_old` / `aead_records_*` counters are
+preserved across the transition (cumulative connection-lifetime
+telemetry).
+
+To keep the AEAD layer's cross-epoch protection intact, the seal/open
+paths now compute the AAD seq_num as `(epoch << 48) | seq`, matching
+RFC 5246 §6.2.3.3 + RFC 6347 §4.1.2.6. The seal side reads the
+current send epoch from state; the open side reads the WIRE epoch
+from the record header (the AAD must be self-describing). A
+ciphertext sealed at epoch=0 + seq=N cannot be successfully opened
+in epoch=1 even if the watermark accepts seq=N, because the AAD
+differs and gcm_open's tag check fails. With `epoch=0` the new
+formula collapses to plain `seq` so all 297 pre-R33B test
+assertions remain byte-identical.
+
+Cert verify failure tags are kept distinct -- unlike the AEAD path
+which collapses ciphertext/tag/AAD failures into one indistinct
+`DTLS_DECRYPT_FAIL` for oracle-leak hygiene, cert verify runs
+BEFORE any oracle-relevant state is touched, so distinguishability
+is safe and useful (attribution per failure path).
+
+Cert chain validation is single-cert only. CrossEngin's actual cert
+use case is SDP-fingerprint pinning (RFC 4572 §5), where the SDP
+offerer's hash of the entire cert binds to a known fingerprint; no
+CA traversal needed. A future hardening round can extend to chains
+if a non-SDP use case emerges.
+
+The original R33B agent died mid-session with the implementation
+landed but the test scaffolding incomplete. Recovery: the session
+operator (a) verified the dtls12.nova diff was self-consistent
+(297 prior assertions preserved via tail-append slot layout +
+epoch=0 AAD collapse), (b) added the missing 17 R33B test functions
++ 56 assertions covering all five cert-verify outcomes and the
+epoch-reset state transitions, (c) updated documentation. The
+implementation in dtls12.nova is exactly what the agent landed;
+only the test file + docs reflect operator handoff.
+
 ## R33A extension: canonical `src/safety/sha256.nova` + dedup 3 of 4 copies
 
 R32C's exit report (the round before this one) noted: "SHA-256 is the

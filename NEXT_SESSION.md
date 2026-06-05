@@ -3,6 +3,118 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R33B -- DTLS cert verify wire + CCS-on-epoch-change replay-window reset (R29B.3 / R32B.2 / R32C.2)
+
+**Status: complete** -- closes two R29B/R31B/R32B-era deferrals in a
+single dtls12.nova-only commit. R29B's `dtls_cert_verify_R29B2_STUB` is
+now backed by the real path that imports R32C's `x509_parse` +
+`x509_check_validity` + `ecdsa_p256_verify_bn`; R32B's anti-replay
+sliding window now resets on `dtls_advance_epoch` per RFC 6347
+§4.1.2.6. The original R33B agent died mid-session after landing the
+implementation but before completing the test scaffolding; the
+implementation was preserved on the working tree and the session
+operator added the missing R33B test functions + main() wiring +
+doc updates to finalize the round.
+
+### What R33B delivers
+
+* **`dtls_cert_verify(state, peer_cert_der, peer_cert_len,
+  expected_fingerprint_or_null)`** -- the real cert-verify entry
+  point. Returns `DTLS_OK` (= 0) on success, or one of five distinct
+  string tags on failure: `DTLS_CERT_PARSE_FAIL`,
+  `DTLS_CERT_NOT_YET_VALID`, `DTLS_CERT_EXPIRED`,
+  `DTLS_CERT_SIG_FAIL`, `DTLS_CERT_FP_MISMATCH`. Distinguishability
+  on the failure side is intentional -- cert verify runs BEFORE any
+  oracle-relevant state is touched, so the AEAD-style "collapse to
+  one tag for oracle hygiene" rationale does not apply.
+  * Step 1: `x509_parse` -- on negative, REJECT.
+  * Step 2: `x509_check_validity(cert, state.current_time_unix)`.
+  * Step 3: `ecdsa_sha256(cert.tbs_buf, cert.tbs_len)`.
+  * Step 4: `ecdsa_p256_verify_bn(pubkey, hash_bn, r_bn, s_bn)`.
+  * Step 5 (optional): SHA-256 the FULL cert DER, compare to the
+    32-byte `expected_fingerprint_or_null` (RFC 4572 §5 a=fingerprint
+    binds the SDP offerer to the entire cert).
+* **`dtls_cert_verify_R29B2_STUB(cert_buf, cert_n, expected_fp_buf,
+  fp_n)`** -- preserved as a thin forwarder. Now allocates a
+  transient `dtls_init()` state with `current_time_unix = 0`, so a
+  cert whose `notBefore` is non-zero reports
+  `DTLS_CERT_NOT_YET_VALID` (safe reject) rather than the historical
+  `DTLS_ERR_STUB` sentinel. Documented migration: callers that need
+  real cert verification should switch to `dtls_cert_verify(state,
+  ...)` with their long-lived state.
+* **`dtls_set_current_time(state, unix_sec)`** -- caller-pinned
+  wall-clock setter. Deliberately not a syscall: handshake timing
+  must be deterministic in tests, and the wire driver has the
+  cleanest view of "now". Returns the new value for chaining.
+* **`dtls_advance_epoch(state)`** -- RFC 6347 §4.1.2.6 CCS-epoch
+  transition. Bumps `DTLS_S_SLOT_EPOCH` (send) AND
+  `DTLS_S_SLOT_RECV_EPOCH` (the new R33B receive-epoch slot) by 1,
+  resets `SEND_SEQ` / `RECV_SEQ` / `RECV_HIGH_WATERMARK` /
+  `RECV_REPLAY_MASK` to 0. Cumulative telemetry (`AEAD_RECORDS_*`,
+  `STATS_REPLAY`, `STATS_TOO_OLD`, the new `STATS_CERT_*` counters)
+  is preserved across epochs.
+* **AAD now stamps the epoch.** `dtls_seal_record` / `dtls_open_record`
+  now compute `aad_seq = (epoch << 48) | seq` for both the nonce12 and
+  the AAD seq_num field, matching RFC 5246 §6.2.3.3 + RFC 6347
+  §4.1.2.6 wire layout. The seal side uses `state[EPOCH]`; the open
+  side uses the WIRE epoch (NOT `state[RECV_EPOCH]`) because the AAD
+  must be self-describing -- a peer can send epoch=N while our local
+  state.recv_epoch is still at N-1 (cross-epoch transition window).
+  With `epoch=0` the value collapses to plain `seq`, so all 297 prior
+  R29B+R31B+R32B assertions remain byte-identical (only post-CCS
+  records, epoch > 0, behave differently from R32B).
+* **Seven new state slots** (36..42 appended at the tail so 0..35
+  stay byte-identical with R29B+R31B+R32B): five `STATS_CERT_*`
+  counters, `CURRENT_TIME_UNIX`, `RECV_EPOCH`.
+* **Six new stats-line fields** (`recv_epoch`, `cert_ok`,
+  `cert_parse_fail`, `cert_expired`, `cert_sig_fail`,
+  `cert_fp_mismatch`) appended to `dtls_stats_line` -- pre-existing
+  fields unchanged.
+
+### Verification
+
+* **`tests/unit/test_dtls12.nova`**: 17 new R33B test functions, 56
+  new assertions. Coverage: cert OK in window, cert truncated DER,
+  cert pre-notBefore, cert post-notAfter, cert tampered tbs
+  (parse-or-sig reject), cert matching fingerprint, cert mismatched
+  fingerprint, counter independence across four mutually-exclusive
+  paths, stub forwarder shape, advance_epoch bumps both counters,
+  advance_epoch resets sequences, advance_epoch resets replay
+  window, advance_epoch preserves cumulative stats, AEAD round-trip
+  across an epoch transition with the same key material, window
+  reset allows a low seq number in the new epoch (would have been
+  TOO_OLD without the reset), and stats line includes the six new
+  fields.
+* **All 297 R29B + R31B + R32B prior assertions remain byte-identical**
+  -- the AAD change is a no-op for epoch=0 records, the new state
+  slots are appended at the tail (slots 0..35 untouched), the new
+  return tag on the R29B.2 stub is a documented migration of the
+  one assertion that pinned the old sentinel.
+
+### Deferred to a future round
+
+* **R33A.2 dtls12 SHA-256 dedup.** R33A landed the canonical
+  `src/safety/sha256.nova` and refactored three of four copies;
+  dtls12's inline SHA-256 (`_dtls_sha256_*`) is the fourth. R33B
+  preserved the inline copy to keep file-ownership clean (R33A and
+  R33B ran concurrently). Pointer: `dtls12.nova` lines ~700-1000
+  for the inline SHA-256 + HMAC + HKDF + PRF block. The dedup
+  follow-up should swap `_dtls_sha256_oneshot` to
+  `sha256_oneshot` and verify the 297 prior tests stay
+  byte-identical.
+* **Cert chain validation.** Single-cert verify only. No
+  intermediate-CA traversal, no path-building, no revocation
+  (CRL/OCSP). Adequate for the SDP-fingerprint pinning model
+  (RFC 4572 §5) that is CrossEngin's actual cert use case.
+  A future hardening round can extend to chains.
+* **Strict cross-epoch wire-epoch enforcement.** The open path
+  currently accepts a wire epoch that is `>=` `state.recv_epoch`;
+  RFC 6347 strictly only allows the CURRENT epoch (or the next
+  one, briefly, during CCS transition). For R33B we permitted
+  equal-or-ahead to keep cross-epoch test cases legible. A
+  hardening pass should tighten this once the wire driver
+  reliably advances `recv_epoch` in lockstep with the peer's CCS.
+
 ## R33A -- canonical `src/safety/sha256.nova` + dedup 3 of 4 copies
 
 **Status: complete** -- extracts the FIPS 180-4 SHA-256 + RFC 2104

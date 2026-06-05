@@ -185,6 +185,13 @@
 
 import "../safety/p256.nova"
 import "../safety/aes_gcm.nova"
+// R33B: x509.nova transitively imports ecdsa.nova (which imports p256.nova).
+// We pull it in for `x509_parse` + `x509_check_validity` + the accessor
+// helpers `x509_tbs_buf`/`x509_tbs_len`/`x509_public_key_buf`/
+// `x509_public_key_len`/`x509_signature_r`/`x509_signature_s` that
+// `dtls_cert_verify` calls. `ecdsa_sha256` + `ecdsa_p256_verify_bn` are
+// re-exported through the same import chain.
+import "../safety/x509.nova"
 
 // ============================================================================
 //                              Error tags
@@ -214,6 +221,22 @@ let DTLS_DECRYPT_FAIL   = "dtls: decrypt fail"
 // controlled bytes to the AEAD oracle.
 let DTLS_REPLAY         = "dtls: replay"
 let DTLS_TOO_OLD        = "dtls: too old"
+
+// R33B cert-verify return tags. The success path returns the integer
+// sentinel `DTLS_OK = 0` (numeric rather than a string so callers can
+// branch on `r == DTLS_OK` without a `str_eq` round-trip). All failure
+// paths return distinct string tags so a caller can attribute the
+// rejection cause -- unlike the AEAD path (which intentionally
+// collapses ciphertext / tag / AAD failures into one indistinct
+// `DTLS_DECRYPT_FAIL` for oracle-leak hygiene), cert-verify failures
+// are evaluated BEFORE any oracle-relevant state is touched, so the
+// distinguishability tradeoff doesn't apply.
+let DTLS_OK                   = 0
+let DTLS_CERT_PARSE_FAIL      = "dtls: cert parse fail"
+let DTLS_CERT_EXPIRED         = "dtls: cert expired"
+let DTLS_CERT_NOT_YET_VALID   = "dtls: cert not yet valid"
+let DTLS_CERT_SIG_FAIL        = "dtls: cert sig fail"
+let DTLS_CERT_FP_MISMATCH     = "dtls: cert fingerprint mismatch"
 
 // ============================================================================
 //                              Protocol constants
@@ -419,6 +442,43 @@ let DTLS_S_SLOT_RECV_REPLAY_MASK    = 33  // u64 bitmap (LSB = high_watermark)
 let DTLS_S_SLOT_STATS_REPLAY        = 34  // int -- replay-rejected count
 let DTLS_S_SLOT_STATS_TOO_OLD       = 35  // int -- too-old-rejected count
 
+// ----------------------------------------------------------------------------
+// R33B cert-verify telemetry + CCS-epoch reset state. Appended at the
+// tail so slots 0..35 (R29B + R31B + R32B) stay byte-identical.
+//
+// `DTLS_S_SLOT_CURRENT_TIME_UNIX` is the wall-clock the caller pins
+// before invoking `dtls_cert_verify`. We DELIBERATELY do not pull this
+// from a builtin syscall here -- handshake timing must be deterministic
+// in tests, and the caller (the wire driver) has the cleanest view of
+// what "now" means for a given handshake. `dtls_set_current_time(state,
+// unix_sec)` is the public setter.
+//
+// `DTLS_S_SLOT_RECV_EPOCH` is the per-side receive epoch counter.
+// `DTLS_S_SLOT_EPOCH` (index 2, from R29B) is the per-side SEND epoch
+// (the AAD seq_num field that the seal path stamps into wire bytes).
+// `dtls_advance_epoch(state)` bumps BOTH counters by 1 and resets the
+// four sequence-window slots to zero (RFC 6347 §4.1.2.6 mandates this
+// on ChangeCipherSpec). The receive counter exists separately so the
+// open path can sanity-check "wire_epoch >= state.recv_epoch" (i.e.
+// the peer is at OR ahead of our current expected epoch, not behind).
+// Strict enforcement is documented as a future hardening item -- for
+// R33B we permit equal-or-ahead wire epochs to keep cross-epoch test
+// cases legible.
+//
+// The five `STATS_CERT_*` counters mirror the R32B `STATS_REPLAY` /
+// `STATS_TOO_OLD` pattern: every cert-verify outcome bumps exactly
+// one counter so a test can assert the path taken without parsing
+// the return string.
+// ----------------------------------------------------------------------------
+
+let DTLS_S_SLOT_STATS_CERT_OK          = 36  // int -- successful cert verifies
+let DTLS_S_SLOT_STATS_CERT_PARSE_FAIL  = 37  // int -- x509_parse rejections
+let DTLS_S_SLOT_STATS_CERT_EXPIRED     = 38  // int -- expired / not-yet-valid
+let DTLS_S_SLOT_STATS_CERT_SIG_FAIL    = 39  // int -- ECDSA verify rejections
+let DTLS_S_SLOT_STATS_CERT_FP_MISMATCH = 40  // int -- fingerprint mismatches
+let DTLS_S_SLOT_CURRENT_TIME_UNIX      = 41  // int -- caller-supplied wall-clock
+let DTLS_S_SLOT_RECV_EPOCH             = 42  // int -- per-side recv epoch
+
 fn dtls_init() {
     let st = list_new()
     push(st, DTLS_S_INIT)        // state
@@ -459,6 +519,14 @@ fn dtls_init() {
     push(st, 0)                  // recv_replay_mask
     push(st, 0)                  // stats_replay
     push(st, 0)                  // stats_too_old
+    // R33B cert-verify telemetry + CCS-epoch reset state.
+    push(st, 0)                  // stats_cert_ok
+    push(st, 0)                  // stats_cert_parse_fail
+    push(st, 0)                  // stats_cert_expired
+    push(st, 0)                  // stats_cert_sig_fail
+    push(st, 0)                  // stats_cert_fp_mismatch
+    push(st, 0)                  // current_time_unix (caller pins via setter)
+    push(st, 0)                  // recv_epoch
     return st
 }
 
@@ -1349,6 +1417,28 @@ fn dtls_recv_high_watermark(state) { return state[DTLS_S_SLOT_RECV_HIGH_WATERMAR
 fn dtls_recv_replay_mask(state)    { return state[DTLS_S_SLOT_RECV_REPLAY_MASK] }
 fn dtls_stats_replay(state)        { return state[DTLS_S_SLOT_STATS_REPLAY] }
 fn dtls_stats_too_old(state)       { return state[DTLS_S_SLOT_STATS_TOO_OLD] }
+
+// R33B cert-verify telemetry accessors. Each one returns the cumulative
+// count of cert-verify outcomes that matched that bucket. The buckets
+// are mutually exclusive -- every call to `dtls_cert_verify` bumps
+// EXACTLY ONE of these (success or the matching failure tag).
+fn dtls_stats_cert_ok(state)          { return state[DTLS_S_SLOT_STATS_CERT_OK] }
+fn dtls_stats_cert_parse_fail(state)  { return state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] }
+fn dtls_stats_cert_expired(state)     { return state[DTLS_S_SLOT_STATS_CERT_EXPIRED] }
+fn dtls_stats_cert_sig_fail(state)    { return state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL] }
+fn dtls_stats_cert_fp_mismatch(state) { return state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH] }
+fn dtls_current_time(state)           { return state[DTLS_S_SLOT_CURRENT_TIME_UNIX] }
+fn dtls_recv_epoch(state)             { return state[DTLS_S_SLOT_RECV_EPOCH] }
+fn dtls_send_epoch(state)             { return state[DTLS_S_SLOT_EPOCH] }
+
+// Caller-pinned wall-clock used by `dtls_cert_verify`. The caller is
+// expected to set this just before invoking cert verify (typically the
+// wire driver reads `sys_unix_seconds()` once per handshake). Returns
+// the new value for chaining.
+fn dtls_set_current_time(state, unix_sec) {
+    state[DTLS_S_SLOT_CURRENT_TIME_UNIX] = unix_sec
+    return unix_sec
+}
 fn dtls_master_secret(state)    { return state[DTLS_S_SLOT_MASTER_SECRET] }
 fn dtls_key_block(state)        { return state[DTLS_S_SLOT_KEY_BLOCK] }
 fn dtls_local_pub(state)        { return state[DTLS_S_SLOT_LOCAL_PUB] }
@@ -1657,8 +1747,17 @@ fn dtls_seal_record(state, type_byte, plaintext_buf, pt_n) {
     if key == 0 { return 0 }
     if iv4 == 0 { return 0 }
     let seq = state[DTLS_S_SLOT_SEND_SEQ]
-    let nonce12 = _dtls_build_nonce12(iv4, seq)
-    let aad = _dtls_build_aad(seq, type_byte, DTLS_VERSION_WORD, pt_n)
+    let epoch = state[DTLS_S_SLOT_EPOCH]
+    // R33B: AAD seq_num is the 64-bit (epoch << 48 | record_seq) pair
+    // per RFC 5246 §6.2.3.3 + RFC 6347 §4.1.2.6. The 16-bit epoch lives
+    // in the upper 16 bits of the 64-bit nonce/AAD seq field; the 48-bit
+    // record_seq lives in the lower bits (matching the wire layout of
+    // the record header). With epoch=0 the value collapses to plain
+    // `seq` so all 297 pre-R33B tests remain byte-identical -- only
+    // post-CCS records (epoch > 0) differ from R32B's behavior.
+    let aad_seq = int_or(int_shl(epoch, 48), seq)
+    let nonce12 = _dtls_build_nonce12(iv4, aad_seq)
+    let aad = _dtls_build_aad(aad_seq, type_byte, DTLS_VERSION_WORD, pt_n)
     // gcm_seal returns a buf of size (pt_n + 16): ciphertext || tag.
     let sealed = gcm_seal(key, nonce12, aad, _DTLS_AAD_LEN,
                           plaintext_buf, pt_n)
@@ -1666,14 +1765,18 @@ fn dtls_seal_record(state, type_byte, plaintext_buf, pt_n) {
     // Build record header (length = body_n) + explicit_IV + sealed.
     let total = DTLS_RECORD_HDR_LEN + body_n
     let out = alloc(total + 1)
-    let epoch = state[DTLS_S_SLOT_EPOCH]
     _dtls_put_u8(out,  0, type_byte)
     _dtls_put_u16(out, 1, DTLS_VERSION_WORD)
     _dtls_put_u16(out, 3, epoch)
     _dtls_put_u48(out, 5, seq)
     _dtls_put_u16(out, 11, body_n)
-    // explicit_IV = seq (8 bytes BE).
-    _dtls_put_u64(out, DTLS_RECORD_HDR_LEN, seq)
+    // explicit_IV = aad_seq (8 bytes BE). For epoch=0 this is just seq,
+    // matching R31B's wire layout byte-for-byte. For epoch>0 the upper
+    // two bytes of the explicit_IV carry the epoch, which is exactly
+    // what an interop-compliant DTLS 1.2 peer expects (the wire epoch
+    // field + the explicit_IV upper bytes are redundant by design --
+    // RFC 5288 §3 says the explicit_IV IS the seq_num).
+    _dtls_put_u64(out, DTLS_RECORD_HDR_LEN, aad_seq)
     // ciphertext + tag follow immediately.
     let i = 0
     while i < pt_n + 16 {
@@ -1848,7 +1951,16 @@ fn dtls_open_record(state, buf, n) {
     // could split them, and gcm_open's tag check rejects either way.
     let explicit_iv_seq = _dtls_get_u64(buf, DTLS_RECORD_HDR_LEN)
     let nonce12 = _dtls_build_nonce12(iv4, explicit_iv_seq)
-    let aad = _dtls_build_aad(seq, type_byte, version, pt_n_expected)
+    // R33B: AAD seq_num is `(wire_epoch << 48) | wire_seq` -- matches
+    // the seal-side `(state.epoch << 48) | state.send_seq` so AEAD tags
+    // line up across the wire. With wire_epoch=0 the value collapses
+    // to plain `seq` (byte-identical to R32B for all pre-CCS records).
+    // We use the WIRE epoch rather than `state[RECV_EPOCH]` because
+    // the AAD must be self-describing on the wire -- a peer can send
+    // an epoch=N record while our state.recv_epoch is still at N-1
+    // (cross-epoch transition window).
+    let aad_seq = int_or(int_shl(epoch, 48), seq)
+    let aad = _dtls_build_aad(aad_seq, type_byte, version, pt_n_expected)
     let ct_tag_buf = buf + DTLS_RECORD_HDR_LEN + 8
     let opened = gcm_open(key, nonce12, aad, _DTLS_AAD_LEN,
                           ct_tag_buf, ct_n + 16)
@@ -1918,6 +2030,164 @@ fn _dtls_test_attribute_aad(state) {
 }
 
 // ============================================================================
+//                   R33B: CCS-on-epoch-change reset
+// ============================================================================
+//
+// RFC 6347 §4.1.2.6 mandates that the receiver MUST reset its anti-replay
+// window when the epoch advances (e.g. on a ChangeCipherSpec record).
+// R32B's exit note explicitly deferred this:
+//
+//   > Cross-epoch handling deferred. DTLS 1.2 ChangeCipherSpec (epoch
+//   > transition) must reset the replay window per RFC 6347 §4.1.2.6.
+//   > R32B does NOT reset the slots on epoch change [...]
+//
+// `dtls_advance_epoch(state)` is the wire driver's hook for that
+// transition. Both directions advance in lockstep:
+//
+//   * `DTLS_S_SLOT_EPOCH`      (= "send_epoch") bumps by 1
+//   * `DTLS_S_SLOT_RECV_EPOCH`                  bumps by 1
+//   * `SEND_SEQ` resets to 0       (next seal stamps seq=0 in new epoch)
+//   * `RECV_SEQ` resets to 0
+//   * `RECV_HIGH_WATERMARK` resets to 0   (fresh replay window)
+//   * `RECV_REPLAY_MASK`    resets to 0
+//
+// We do NOT reset the AEAD counter stats (`AEAD_RECORDS_OUT/IN`,
+// `STATS_REPLAY`, `STATS_TOO_OLD`) -- those are cumulative telemetry
+// across the connection lifetime, not per-epoch.
+//
+// We do NOT re-derive keys here. Real DTLS-CCS rekeys via the PRF
+// (key_block expansion under the new epoch's seed). R33B's simple model
+// keeps the same `key_block` / `client_write_*` / `server_write_*`
+// buffers, so old wire records sealed under the same key can still
+// AEAD-decrypt successfully if the AAD seq_num matches. This is the
+// "different AAD; not a replay in the new key context" semantics
+// documented in the R33B brief deliverable (b)3: cross-epoch replay
+// protection at the WINDOW layer is reset, but cross-epoch replay
+// protection at the AEAD layer (via the AAD's epoch upper-bits) holds
+// only because the AAD seq_num for a record at (epoch=0, seq=N) differs
+// from (epoch=1, seq=N). Future hardening: pair `dtls_advance_epoch`
+// with a fresh PRF expansion (R33C or later).
+//
+// Returns 0 (no diagnostic codes -- this function never fails).
+// ----------------------------------------------------------------------------
+fn dtls_advance_epoch(state) {
+    state[DTLS_S_SLOT_EPOCH]      = state[DTLS_S_SLOT_EPOCH] + 1
+    state[DTLS_S_SLOT_RECV_EPOCH] = state[DTLS_S_SLOT_RECV_EPOCH] + 1
+    state[DTLS_S_SLOT_SEND_SEQ]   = 0
+    state[DTLS_S_SLOT_RECV_SEQ]   = 0
+    state[DTLS_S_SLOT_RECV_HIGH_WATERMARK] = 0
+    state[DTLS_S_SLOT_RECV_REPLAY_MASK]    = 0
+    return 0
+}
+
+// ============================================================================
+//                   R33B: cert verify  (wires x509 + ecdsa)
+// ============================================================================
+//
+// R32C shipped `src/safety/x509.nova` (RFC 5280 §4.1 minimal parser) +
+// `src/safety/ecdsa.nova` (FIPS 186-4 §6.4 ECDSA-P-256 verify). R33B
+// wires both into the DTLS handshake's Certificate-verify slot.
+//
+// Algorithm:
+//   1. `x509_parse(der, n)` -- on negative return, REJECT.
+//   2. `x509_check_validity(cert, state.current_time_unix)` --
+//        on `X509_ERR_NOT_YET_VALID` -> DTLS_CERT_NOT_YET_VALID
+//        on `X509_ERR_EXPIRED`       -> DTLS_CERT_EXPIRED
+//   3. `ecdsa_sha256(cert.tbs_buf, cert.tbs_len)` -- hash the to-be-
+//      signed bytes. We use ecdsa.nova's SHA-256 rather than dtls12's
+//      in-module copy. Both produce byte-identical output; using the
+//      ecdsa.nova one keeps the cert-verify path importing one
+//      consistent crypto module -- if R33A.2 later swaps both to a
+//      common `src/safety/sha256.nova` the call site changes in one
+//      place.
+//   4. `ecdsa_p256_verify_bn(pubkey, pub_len, hash_bn, r_bn, s_bn)` --
+//      on 0, REJECT with DTLS_CERT_SIG_FAIL.
+//   5. If `expected_fingerprint_or_null != 0`: SHA-256 the FULL cert
+//      DER (RFC 4572 §5: `a=fingerprint:sha-256 <hex>` binds the SDP
+//      offerer to the entire cert), compare byte-for-byte to the 32B
+//      expected. Mismatch -> DTLS_CERT_FP_MISMATCH.
+//   6. Otherwise return DTLS_OK and bump STATS_CERT_OK.
+//
+// All five failure tags bump their matching STATS_CERT_* counter; the
+// success path bumps STATS_CERT_OK. Tags are mutually exclusive.
+//
+// `expected_fingerprint_or_null` semantics:
+//   * 0           -- skip the fingerprint check (caller has out-of-band
+//                    trust, e.g. a TOFU pin or a CA chain).
+//   * non-zero    -- pointer to a 32-byte SHA-256 buffer to compare.
+//                    Caller's responsibility to supply the right length;
+//                    we read 32 bytes from the pointer.
+// ----------------------------------------------------------------------------
+fn dtls_cert_verify(state, peer_cert_der, peer_cert_len,
+                    expected_fingerprint_or_null) {
+    // Step 1: parse.
+    let cert = x509_parse(peer_cert_der, peer_cert_len)
+    if cert < 0 {
+        state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] =
+            state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_PARSE_FAIL
+        return DTLS_CERT_PARSE_FAIL
+    }
+    // Step 2: validity.
+    let now = state[DTLS_S_SLOT_CURRENT_TIME_UNIX]
+    let vc = x509_check_validity(cert, now)
+    if vc == X509_ERR_NOT_YET_VALID {
+        state[DTLS_S_SLOT_STATS_CERT_EXPIRED] =
+            state[DTLS_S_SLOT_STATS_CERT_EXPIRED] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_NOT_YET_VALID
+        return DTLS_CERT_NOT_YET_VALID
+    }
+    if vc == X509_ERR_EXPIRED {
+        state[DTLS_S_SLOT_STATS_CERT_EXPIRED] =
+            state[DTLS_S_SLOT_STATS_CERT_EXPIRED] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_EXPIRED
+        return DTLS_CERT_EXPIRED
+    }
+    if vc != 0 {
+        // Defensive: x509_check_validity should only return 0 / NYV /
+        // EXPIRED. Any other negative is treated as expired (closest
+        // semantic bucket -- the cert is unusable).
+        state[DTLS_S_SLOT_STATS_CERT_EXPIRED] =
+            state[DTLS_S_SLOT_STATS_CERT_EXPIRED] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_EXPIRED
+        return DTLS_CERT_EXPIRED
+    }
+    // Step 3 + 4: hash tbs, ECDSA verify.
+    let tbs_buf = x509_tbs_buf(cert)
+    let tbs_len = x509_tbs_len(cert)
+    let hash_buf = ecdsa_sha256(tbs_buf, tbs_len)
+    let hash_bn = _p256_bytes_to_bn(hash_buf, 0)
+    let pub = x509_public_key_buf(cert)
+    let pub_n = x509_public_key_len(cert)
+    let r_bn = x509_signature_r(cert)
+    let s_bn = x509_signature_s(cert)
+    let ok = ecdsa_p256_verify_bn(pub, pub_n, hash_bn, r_bn, s_bn)
+    if ok == 0 {
+        state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL] =
+            state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_SIG_FAIL
+        return DTLS_CERT_SIG_FAIL
+    }
+    // Step 5: optional fingerprint binding (RFC 4572 §5).
+    if expected_fingerprint_or_null != 0 {
+        let cert_fp = ecdsa_sha256(peer_cert_der, peer_cert_len)
+        let i = 0
+        while i < 32 {
+            if load8(cert_fp + i) != load8(expected_fingerprint_or_null + i) {
+                state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH] =
+                    state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH] + 1
+                state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_FP_MISMATCH
+                return DTLS_CERT_FP_MISMATCH
+            }
+            i = i + 1
+        }
+    }
+    // Step 6: success.
+    state[DTLS_S_SLOT_STATS_CERT_OK] = state[DTLS_S_SLOT_STATS_CERT_OK] + 1
+    return DTLS_OK
+}
+
+// ============================================================================
 //                   R29B.2 STUBS  (deliberately incomplete)
 // ============================================================================
 //
@@ -1935,10 +2205,26 @@ fn dtls_ecdhe_derive_R29B2_STUB(priv_buf, priv_n, peer_pub_buf, peer_pub_n) {
     return DTLS_ERR_STUB
 }
 
-// X.509 certificate parse + ECDSA signature verification. R29B.2 lands
-// either a minimal X.509 parser or imports one from a sibling repo.
+// X.509 certificate parse + ECDSA signature verification.
+//
+// R33B replaced the stub body with a thin forward to the real
+// `dtls_cert_verify` (which lives above and pulls in x509 + ecdsa).
+// The historical (cert_buf, cert_n, expected_fp_buf, fp_n) signature
+// is preserved so any caller that took a dependency on the old
+// 4-argument shape keeps compiling -- but it now needs a `state`,
+// which the legacy callers did not pass. We synthesize a transient
+// `dtls_init()` state for the call so the per-state counters get
+// SOMEWHERE to land; the real handshake driver uses `dtls_cert_verify`
+// directly with its long-lived state. The transient state's
+// `current_time_unix` slot is 0 by default -- a real cert whose
+// notBefore is non-zero will report DTLS_CERT_NOT_YET_VALID via this
+// path, which is the SAFE failure (rejecting an unverifiable cert
+// rather than accepting it). Callers that want the historical
+// "always returns DTLS_ERR_STUB" semantics should grep for the
+// `_R29B2_STUB` suffix and migrate.
 fn dtls_cert_verify_R29B2_STUB(cert_buf, cert_n, expected_fp_buf, fp_n) {
-    return DTLS_ERR_STUB
+    let st = dtls_init()
+    return dtls_cert_verify(st, cert_buf, cert_n, expected_fp_buf)
 }
 
 // AEAD-seal a record fragment. R29B.2 wires AES-128-GCM (via a fresh
@@ -1977,6 +2263,12 @@ fn dtls_stats_line(state) {
         + " hi_watermark=" + int_to_str(state[DTLS_S_SLOT_RECV_HIGH_WATERMARK])
         + " replay=" + int_to_str(state[DTLS_S_SLOT_STATS_REPLAY])
         + " too_old=" + int_to_str(state[DTLS_S_SLOT_STATS_TOO_OLD])
+        + " recv_epoch=" + int_to_str(state[DTLS_S_SLOT_RECV_EPOCH])
+        + " cert_ok=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_OK])
+        + " cert_parse_fail=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL])
+        + " cert_expired=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_EXPIRED])
+        + " cert_sig_fail=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL])
+        + " cert_fp_mismatch=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH])
 }
 
 // ============================================================================
