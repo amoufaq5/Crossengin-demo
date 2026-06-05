@@ -2388,6 +2388,126 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R34B extension: TURN protocol wire codec (RFC 5766 / 8656) (R28E.2)
+
+R28E shipped the SIGNALING half of browser-to-soul WebRTC; the
+R28E.2 exit report flagged four follow-up sub-systems: DTLS (R29B
+/ R31B / R32B / R33B), ICE (R30C), SRTP (R34C), and STUN/TURN.
+R30C closed STUN + ICE; R34B closes the TURN half so an ICE
+agent can speak to a TURN relay when peer-to-peer NAT traversal
+fails and ICE falls back to the relay candidate.
+
+### Module: `src/federation/turn.nova` (~700 lines, leaf)
+
+This is a WIRE CODEC only -- not a relay server. No allocation
+lifecycle, no permission tracking, no channel-data forwarding,
+no DTLS-over-TURN. State machine deferred to a future round
+that builds on this codec.
+
+TURN reuses STUN's 20-byte header + TLV-attributes framing
+(magic cookie 0x2112A442, 12-byte transaction id), adds the six
+TURN message methods (Allocate / Refresh / Send / Data /
+CreatePermission / ChannelBind) and the TURN-specific attribute
+set (CHANNEL-NUMBER, LIFETIME, XOR-PEER-ADDRESS, DATA,
+XOR-RELAYED-ADDRESS, REQUESTED-TRANSPORT, DONT-FRAGMENT,
+RESERVATION-TOKEN).
+
+Public emit API (client side):
+* `turn_emit_allocate_request(txn_id_buf, lifetime_sec,
+  requested_transport_udp17) -> [buf, n]`
+* `turn_emit_refresh_request(txn_id_buf, lifetime_sec) -> [buf, n]`
+* `turn_emit_create_permission_request(txn_id_buf, peer_ip_v4,
+  peer_port) -> [buf, n]` (single peer)
+* `turn_emit_create_permission_request_multi(txn_id_buf, peers)`
+  (multi-peer)
+* `turn_emit_send_indication(peer_ip_v4, peer_port, data_buf,
+  data_n) -> [buf, n]`
+* `turn_emit_channel_bind_request(txn_id_buf, channel_num,
+  peer_ip_v4, peer_port) -> [buf, n]`
+
+Public parse API (server side):
+* `turn_parse_allocate_success_response(buf, n) -> [relayed_ip,
+  relayed_port, lifetime, mapped_ip, mapped_port] | negative err`
+* `turn_parse_allocate_error_response(buf, n) -> [err_code,
+  reason_str] | negative err`
+* `turn_parse_data_indication(buf, n) -> [peer_ip, peer_port,
+  data_buf, data_n] | negative err`
+* `turn_parse_refresh_success_response(buf, n) -> [lifetime] |
+  negative err`
+* `turn_classify_message(buf, n) -> [method, class, length,
+  txn_ptr] | negative err`
+
+Errors are negative-integer sentinels: `TURN_ERR_HEADER`,
+`TURN_ERR_COOKIE`, `TURN_ERR_LENGTH`, `TURN_ERR_ATTR`,
+`TURN_ERR_FAMILY`, `TURN_ERR_NO_ATTR`, `TURN_ERR_METHOD`.
+
+### Verified
+
+* `tests/unit/test_turn.nova`: 35 test functions, 200 assertions
+  all passing. Coverage: byte helpers, pad4, method/class pack
+  + unpack round-trip across all 24 combinations, XOR-address
+  helper round-trip, Allocate request byte layout, Allocate
+  request->success round-trip (LIFETIME + REQUESTED-TRANSPORT
+  + XOR-RELAYED + XOR-MAPPED all decode), Allocate Error 401
+  Unauthorized + 437 Allocation Mismatch, Refresh round-trip
+  with lifetime values 0 (delete) / 60 (one minute) / 600 (RFC
+  5766 §2.2 default), CreatePermission single + multi-peer
+  (three peers, all decode), Send Indication byte layout +
+  large-payload (64-byte data) round-trip via the symmetric
+  Data Indication parser, ChannelBind round-trip (CHANNEL-NUMBER
+  in [0x4000, 0x7FFF] band + XOR-PEER-ADDRESS), malformed
+  message rejections (short header / bad cookie / truncated
+  TLV / unaligned length / length-exceeds-buf / IPv6 family /
+  wrong-method-for-parser / top-2-bits-non-zero), STUN-shared
+  attribute tolerance (SOFTWARE / USERNAME / MESSAGE-INTEGRITY
+  / REALM / NONCE / XOR-MAPPED-ADDRESS / FINGERPRINT injected
+  alongside required attrs -- the codec extracts the right
+  values without choking), auth-required error response with
+  REALM + NONCE injected alongside ERROR-CODE.
+
+### Skipped (documented)
+
+* **RFC 5766 attributes** EVEN-PORT (0x000F),
+  REQUESTED-ADDRESS-FAMILY (0x0017), ADDITIONAL-ADDRESS-FAMILY
+  (RFC 8656) -- not implemented. EVEN-PORT controls port-pair
+  allocation for RTP/RTCP. The address-family extensions cover
+  IPv6 dual-stack allocate.
+* **IPv6** XOR-MAPPED / XOR-PEER / XOR-RELAYED -- this round is
+  IPv4-only. An incoming attribute with family=2 is REJECTED
+  with `TURN_ERR_FAMILY`.
+* **Long-term-credential authentication** (USERNAME /
+  MESSAGE-INTEGRITY / REALM / NONCE per RFC 5766 §3 + RFC 8489
+  §10) -- not implemented on the EMIT side. The PARSE side
+  correctly handles a 401 response that carries REALM + NONCE
+  alongside ERROR-CODE. The re-issue path is deferred: a future
+  round should compose `stun_hmac_sha1` (already shipped in
+  R30C's `stun_rfc8489.nova`) with the REALM/NONCE flow.
+* **Relay state machine** -- no allocation lifecycle, no
+  permission table, no channel bookkeeping, no channel-data
+  framing (RFC 5766 §11.5). The codec emits a CreatePermission
+  Request but does not track which peers have permission for
+  outgoing Send Indications. All deferred.
+
+### Caveats / future work
+
+1. **MESSAGE-INTEGRITY not verified on parse**. R34B tolerates
+   the attribute on incoming messages (must, so 401 + REALM +
+   NONCE responses parse), but does NOT verify the HMAC. A
+   future hardening round should plumb the STUN MI verifier
+   from `stun_rfc8489.nova`.
+2. **CHANNEL-NUMBER range not enforced**. RFC 5766 §11.2 says
+   channels must be in [0x4000, 0x7FFF]. The codec writes
+   whatever 16-bit value the caller passes; callers are
+   responsible for that invariant. A future round can either
+   enforce or document the contract more visibly.
+3. **No FINGERPRINT verification**. Same rationale as MI --
+   tolerated but not checked. STUN already ships the CRC32 +
+   FINGERPRINT verifier.
+4. **No ICE integration yet**. R30C's `ice.nova` has a
+   relay-candidate placeholder in the candidate-gathering path;
+   wiring R34B's emit/parse into that placeholder is the
+   natural next step.
+
 ## R34C extension: SRTP wire codec (RFC 3711) -- AES-CM-128 + HMAC-SHA1-80 + KDF + anti-replay (R28E.2)
 
 R28E shipped the SIGNALING half of browser-to-soul WebRTC; the

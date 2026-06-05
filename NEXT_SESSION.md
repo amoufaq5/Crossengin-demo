@@ -3,6 +3,122 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R34B -- TURN protocol wire codec (RFC 5766 / 8656) (R28E.2)
+
+**Status: complete** -- closes the TURN half of the R28E.2 deferred
+item. R30C had already landed the STUN/ICE half (RFC 8489 + 8445);
+R34B is the parallel codec for RFC 5766/8656 TURN messages so an ICE
+agent can speak to a TURN relay when peer-to-peer NAT traversal fails
+and ICE falls back to the relay candidate.
+
+### What R34B delivers
+
+This is a WIRE CODEC only -- not a relay server. No allocation
+lifecycle, no permission tracking, no channel-data forwarding, no
+DTLS-over-TURN. The state machine sits on a future round.
+
+* **`src/federation/turn.nova`** (NEW, ~700 lines, leaf module):
+  * Six TURN message methods (Allocate, Refresh, Send, Data,
+    CreatePermission, ChannelBind) with method/class pack-unpack of
+    the 14-bit RFC 8489 message-type field.
+  * Eight TURN attributes (CHANNEL-NUMBER, LIFETIME, XOR-PEER-ADDRESS,
+    DATA, XOR-RELAYED-ADDRESS, REQUESTED-TRANSPORT, DONT-FRAGMENT,
+    RESERVATION-TOKEN).
+  * Emit functions for the five client-side messages: Allocate
+    Request, Refresh Request, CreatePermission Request (single +
+    multi-peer variant), Send Indication, ChannelBind Request.
+  * Parse functions for server-side responses: Allocate Success,
+    Allocate Error, Data Indication, Refresh Success.
+  * IPv4 XOR-address codec (RFC 5389 §15.2 + RFC 5766 §14.3).
+  * `turn_classify_message(buf, n) -> [method, class, length, txn_ptr]`
+    for the demuxer side.
+  * Test-side response emitters so the test suite can round-trip
+    Allocate Success / Error / Refresh Success / Data Indication
+    without spinning up a real TURN server.
+* **`tests/unit/test_turn.nova`** (NEW, 35 test functions, 200
+  assertions). Covers: BE byte helpers, pad4, method/class pack-unpack
+  round-trip across all 24 method/class combinations, XOR-address
+  helper round-trip, Allocate request byte layout, Allocate
+  request->success-response round-trip, Allocate Error (401 / 437),
+  Refresh with lifetime 0 (delete) / 60 (one minute) / 600 (RFC
+  default), CreatePermission single + multi-peer, Send Indication
+  byte layout + large-payload round-trip through the symmetric Data
+  Indication parser, ChannelBind round-trip, malformed message
+  rejections (short header / bad cookie / truncated TLV / unaligned
+  length / length-exceeds-buf / IPv6 family / wrong-method-for-parser
+  / top-2-bits-non-zero), STUN-shared attribute tolerance (SOFTWARE,
+  USERNAME, MESSAGE-INTEGRITY, REALM, NONCE, FINGERPRINT injected
+  alongside required attributes -- parse still succeeds), auth-required
+  error response with REALM + NONCE.
+
+### Skipped per the brief (documented)
+
+* **RFC 5766 attributes EVEN-PORT (0x000F), REQUESTED-ADDRESS-FAMILY
+  (0x0017), ADDITIONAL-ADDRESS-FAMILY (RFC 8656)** -- not implemented.
+  EVEN-PORT controls port-pair allocation for RTP/RTCP. ADDITIONAL-
+  ADDRESS-FAMILY is the IPv6 dual-stack extension. Both can be added
+  in a future R34B.2 without churning the existing API.
+* **IPv6 XOR-MAPPED / XOR-PEER / XOR-RELAYED** -- this round is
+  IPv4-only. An incoming attribute with family=2 is REJECTED with
+  `TURN_ERR_FAMILY`. The XOR scheme for IPv6 (port XOR top16 cookie,
+  address XOR cookie||txn_id) is well-defined in RFC 5389 §15.2 and
+  STUN already ships it -- the helper can be copied across when
+  IPv6 support lands.
+* **Long-term-credential authentication** (USERNAME / MESSAGE-INTEGRITY
+  / REALM / NONCE per RFC 5766 §3 + RFC 8489 §10): NOT implemented on
+  the emit side. R34B emits unauthenticated Allocate / Refresh /
+  CreatePermission / ChannelBind requests. An auth-required server
+  will respond 401 Unauthorized with REALM + NONCE; R34B's parse
+  side correctly handles that response (verified by the
+  `test_allocate_error_with_auth_attrs` test). What's missing is the
+  re-issue path: the client should re-issue the same request with
+  USERNAME + REALM + NONCE + MESSAGE-INTEGRITY computed over the
+  long-term-credential key. R30C's `stun_rfc8489.nova` already ships
+  the HMAC-SHA1 primitive; R34B.2 can compose them.
+* **Relay state machine** -- no allocation lifecycle (Allocate ->
+  refresh -> de-allocate timing), no permission table (the codec
+  emits a CreatePermission Request but does not track which peers
+  have permission for outgoing Send Indications), no channel
+  bookkeeping (CHANNEL-NUMBER range 0x4000..0x7FFF, RFC 5766 §11.2),
+  no channel-data framing (RFC 5766 §11.5 4-byte channel header on
+  the data plane). All deferred to a future round that builds on
+  this codec.
+
+### Honest design caveat
+
+The parse side TOLERATES STUN-shared attributes (SOFTWARE, USERNAME,
+MESSAGE-INTEGRITY, REALM, NONCE, FINGERPRINT, ALTERNATE-SERVER) on
+incoming messages -- their presence does NOT reject the message,
+even though R34B does not interpret or verify them. This is
+intentional: an auth-required server's 401 response carries REALM +
+NONCE alongside ERROR-CODE, and the parser must extract the code
+without choking on credential attrs. The tradeoff is that R34B does
+NOT verify MESSAGE-INTEGRITY or FINGERPRINT on incoming messages.
+The CrossEngin federation stack already trusts the gossip layer; a
+future round that hardens the wire against MITM should plumb the
+STUN MESSAGE-INTEGRITY helpers from `stun_rfc8489.nova` here.
+
+### Verification
+
+* **`tests/unit/test_turn.nova`**: 35 test functions, 200 assertions
+  all passing.
+* **No other modules touched.** `stun_rfc8489.nova`, `ice.nova`,
+  `nat_traversal.nova`, `dtls12.nova` byte-identical.
+
+### Pointers for the next session
+
+* Wire R34B into ICE's relay-candidate gathering (R30C's `ice.nova`
+  currently has a TURN-relay placeholder in the candidate-gathering
+  path; that placeholder can now call the real codec).
+* Build the relay state machine on top: allocation lifecycle,
+  permission table, channel mapping, channel-data framing.
+* IPv6 support: extend `_turn_decode_xor_addr` + `_turn_emit_xor_addr_v4`
+  with the 16-byte path (port XOR top16 cookie, first 4 bytes of
+  address XOR cookie, remaining 12 bytes XOR txn_id) -- the STUN
+  module already ships the helper code.
+* Authentication: compose `stun_hmac_sha1` and the REALM/NONCE flow
+  for the 401-retry path.
+
 ## R34C -- SRTP wire codec (RFC 3711) AES-CM-128 + HMAC-SHA1-80 + KDF + anti-replay
 
 **Status: complete** -- closes the SRTP half of R28E.2 (the WebRTC

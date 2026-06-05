@@ -13,6 +13,44 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R34B lands the TURN protocol wire codec (RFC 5766 / 8656) -- the
+> last R28E.2 deferred item. New module `src/federation/turn.nova`
+> (~700 lines, leaf) implements parse + emit for the six TURN
+> message methods (Allocate / Refresh / Send / Data /
+> CreatePermission / ChannelBind) plus eight TURN attributes
+> (CHANNEL-NUMBER, LIFETIME, XOR-PEER-ADDRESS, DATA,
+> XOR-RELAYED-ADDRESS, REQUESTED-TRANSPORT, DONT-FRAGMENT,
+> RESERVATION-TOKEN). Wire format reuses STUN's 20-byte header +
+> TLV-attribute framing (magic cookie 0x2112A442, 12-byte
+> transaction id) from R30C's `src/federation/stun_rfc8489.nova`,
+> adds TURN-specific method/class packing (e.g. Allocate Request =
+> 0x0003, Allocate Success Response = 0x0103). Public emit API
+> covers the five client-side messages; public parse API decodes
+> Allocate Success / Error, Refresh Success, and Data Indication.
+> `turn_classify_message(buf, n) -> [method, class, length,
+> txn_ptr]` for the demuxer. `tests/unit/test_turn.nova` adds 200
+> new assertions: Allocate request->success-response round-trip
+> (LIFETIME + REQUESTED-TRANSPORT + XOR-RELAYED + XOR-MAPPED all
+> decode), Allocate Error 401 / 437, Refresh with lifetime 0
+> (delete) / 60 / 600 (RFC 5766 §2.2 default), CreatePermission
+> single + multi-peer (three peers), Send Indication large-payload
+> round-trip via the symmetric Data Indication parser, ChannelBind
+> round-trip, malformed message rejections (short header / bad
+> cookie / truncated TLV / unaligned length / wrong-method-for-
+> parser / IPv6 family / top-2-bits-non-zero), STUN-shared
+> attribute tolerance (SOFTWARE / USERNAME / MESSAGE-INTEGRITY /
+> REALM / NONCE / FINGERPRINT injected -- codec extracts the
+> right values without choking), auth-required error response.
+> Skipped per the brief: IPv6 XOR addresses (parse rejects family=2
+> with `TURN_ERR_FAMILY`), long-term-credential authentication on
+> the emit side (parse side correctly handles 401 + REALM + NONCE),
+> EVEN-PORT / ADDITIONAL-ADDRESS-FAMILY attributes, relay state
+> machine (allocation lifecycle, permission table, channel
+> bookkeeping, channel-data framing). Honest caveat:
+> MESSAGE-INTEGRITY + FINGERPRINT are TOLERATED on incoming
+> messages (presence does not reject) but NOT verified -- a future
+> hardening round should plumb the STUN MI verifier through.
+>
 > R34C lands the SRTP wire codec (RFC 3711) -- the next federation
 > primitive after R29B/R31B/R32B/R33B's DTLS 1.2 + R30C's ICE.
 > New module `src/federation/srtp.nova`: AES-CM-128 stream cipher

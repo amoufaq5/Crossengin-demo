@@ -1,0 +1,1052 @@
+// CrossEngin federation: RFC 5766/8656 TURN protocol codec (R34B / R28E.2).
+//
+// Purpose
+//
+//   R28E (`src/federation/webrtc.nova`) shipped the SIGNALING half of
+//   browser-to-soul WebRTC and flagged FOUR R28E.2 sub-systems blocking
+//   the end-to-end data plane: DTLS (R29B/R31B/R32B/R33B), ICE (R30C),
+//   SRTP, and proper STUN/TURN. R30C closed STUN + ICE; the TURN half
+//   of the gap is still open.
+//
+//   This module is the TURN protocol WIRE CODEC -- it parses and emits
+//   the on-wire bytes for the six TURN message methods (Allocate,
+//   Refresh, Send, Data, CreatePermission, ChannelBind) plus the TURN
+//   attribute set defined in RFC 5766 section 14. It is NOT a live
+//   relay server -- no allocation lifecycle, no permission tracking,
+//   no DTLS-over-TURN, no channel-data forwarding. Future rounds can
+//   build the relay state machine on top of this codec.
+//
+//   TURN reuses the STUN message framing (20-byte header + TLV
+//   attributes, magic cookie 0x2112A442, 12-byte transaction id),
+//   adds TURN-specific message methods, and adds TURN-specific
+//   attributes (LIFETIME, XOR-PEER-ADDRESS, DATA, XOR-RELAYED-ADDRESS,
+//   REQUESTED-TRANSPORT, CHANNEL-NUMBER, DONT-FRAGMENT,
+//   RESERVATION-TOKEN). ICE / browser STUN clients sit on this stack
+//   when peer-to-peer fails and the ICE agent falls back to the relay
+//   candidate.
+//
+// Wire format (RFC 5766 section 6 + RFC 8489 section 5)
+//
+//   The 14-bit message type field decomposes into:
+//      C1.C0  M11 M10 M9 M8 M7 C0 M6 M5 M4 C1 M3 M2 M1 M0
+//   where M11..M0 are the 12-bit METHOD and C1.C0 is the 2-bit CLASS:
+//      class 0b00 = request,   class 0b01 = indication,
+//      class 0b10 = success,   class 0b11 = error.
+//   Method 0x003..0x009 are the six TURN methods this module ships.
+//
+//   For methods M = 0x003..0x009, the integer message-type word is
+//   simply: (class << 8) | (... low bits ...). The interleaving
+//   matters when M has bits set in positions 4..6 or 7..11. For
+//   M=0x003..0x009 none of those middle / high method bits flip, so
+//   the resulting message-type integers are clean:
+//     Allocate Request          = 0x0003
+//     Allocate Indication       = 0x0013  (unused -- TURN has no
+//                                          allocate-indication; kept
+//                                          for completeness of the
+//                                          class encoder)
+//     Allocate Success Response = 0x0103
+//     Allocate Error Response   = 0x0113
+//   Likewise for 0x004..0x009. The encoder + decoder use a single
+//   `turn_msg_type_pack(method, class) / _unpack` pair to keep the
+//   interleaving in one place.
+//
+// Message methods we ship (RFC 5766 section 13):
+//   * 0x003 Allocate
+//   * 0x004 Refresh
+//   * 0x006 Send (always indication)
+//   * 0x007 Data (always indication)
+//   * 0x008 CreatePermission
+//   * 0x009 ChannelBind
+//
+// Attributes we ship (RFC 5766 section 14):
+//   * 0x000C CHANNEL-NUMBER     (16-bit channel + 16-bit RFFU)
+//   * 0x000D LIFETIME           (32-bit seconds)
+//   * 0x0012 XOR-PEER-ADDRESS   (XOR-mapped peer address, may repeat)
+//   * 0x0013 DATA               (opaque payload)
+//   * 0x0016 XOR-RELAYED-ADDRESS (XOR-mapped server-allocated relay)
+//   * 0x0019 REQUESTED-TRANSPORT (8-bit protocol -- 17 = UDP)
+//   * 0x001A DONT-FRAGMENT      (zero-length flag)
+//   * 0x0022 RESERVATION-TOKEN  (8-byte opaque token)
+//
+// Skipped RFC 5766 attributes (documented for the audit):
+//   * 0x000F EVEN-PORT          -- port allocation control
+//   * 0x0017 REQUESTED-ADDRESS-FAMILY -- IPv6 not supported here
+//   * 0x801A SOFTWARE           -- comprehension-optional, tolerated
+//                                  on parse via skip-over
+//   * USERNAME / MESSAGE-INTEGRITY / REALM / NONCE -- STUN-shared
+//                                  long-term credential attributes,
+//                                  tolerated on parse via skip-over
+//                                  so an auth-required server's
+//                                  401 / 437 responses still parse.
+//   * ADDITIONAL-ADDRESS-FAMILY (RFC 8656) -- IPv6 dual-stack
+//                                  allocate, deferred.
+//
+// IPv6 is not supported in this round. Only the IPv4 XOR mapping
+// applies. An incoming XOR-PEER-ADDRESS / XOR-RELAYED-ADDRESS with
+// family 0x02 (IPv6) is REJECTED on parse with TURN_ERR_FAMILY.
+//
+// Public API surface
+//
+//   Emit:
+//     turn_emit_allocate_request(txn_id_buf, lifetime_sec,
+//                                requested_transport_udp17)
+//                                                  -> [buf, n]
+//     turn_emit_refresh_request(txn_id_buf, lifetime_sec)
+//                                                  -> [buf, n]
+//     turn_emit_create_permission_request(txn_id_buf,
+//                                         peer_ip_v4_buf, peer_port)
+//                                                  -> [buf, n]
+//     turn_emit_send_indication(peer_ip_v4_buf, peer_port,
+//                               data_buf, data_n)  -> [buf, n]
+//     turn_emit_channel_bind_request(txn_id_buf, channel_num,
+//                                    peer_ip_v4_buf, peer_port)
+//                                                  -> [buf, n]
+//
+//   Parse:
+//     turn_parse_allocate_success_response(buf, n)
+//          -> [relayed_ip_str, relayed_port,
+//              lifetime_sec, mapped_ip_str, mapped_port]
+//     turn_parse_allocate_error_response(buf, n)
+//          -> [err_code, err_reason_str]
+//     turn_parse_data_indication(buf, n)
+//          -> [peer_ip_str, peer_port, data_buf, data_n]
+//     turn_parse_refresh_success_response(buf, n)
+//          -> [lifetime_sec]
+//
+//   Helpers:
+//     turn_xor_address_v4(addr_be32, port_be16, txn_id_buf)
+//          -> [xor_addr_be32, xor_port_be16]
+//     turn_classify_message(buf, n)
+//          -> [method, class, length, txn_id_buf]
+//
+// On error, parse functions return a negative integer:
+//   * TURN_ERR_HEADER  = -1   bad / truncated header or bad first 2 bits
+//   * TURN_ERR_COOKIE  = -2   magic cookie mismatch
+//   * TURN_ERR_LENGTH  = -3   length field not multiple of 4 / overflows buf
+//   * TURN_ERR_ATTR    = -4   truncated attribute TLV
+//   * TURN_ERR_FAMILY  = -5   unsupported address family (IPv6 in this round)
+//   * TURN_ERR_NO_ATTR = -6   required attribute missing
+//   * TURN_ERR_METHOD  = -7   wrong message method / class for this parser
+//
+// Why this is a leaf module
+//
+//   This file intentionally re-implements the small handful of BE
+//   byte helpers (`_turn_put_u16` / `_turn_get_u16` / `_turn_pad4`)
+//   so that R34B's parallel agents (DTLS / ICE / SRTP / STUN) do not
+//   collide via shared codec primitives. The byte layout is identical
+//   to STUN's (the underscore-prefixed helpers in `stun_rfc8489.nova`),
+//   so a future R34B.2 can refactor to a shared helpers module if
+//   desired without churning either caller.
+//
+// ADRs touched: registers an entry against the existing R28E.2
+//   ADR-0094 (STUN + TURN wire codec) lineage. No new ADR.
+// NOVA dependencies: builtins (alloc, store8, load8, list_new, push,
+//   int_and, int_or, int_xor, int_shl, int_shr, int_to_str, len,
+//   chr).
+// CrossEngin dependencies: NONE.
+
+// ============================================================================
+//                              Error tags (negative ints)
+// ============================================================================
+
+let TURN_ERR_HEADER  = 0 - 1
+let TURN_ERR_COOKIE  = 0 - 2
+let TURN_ERR_LENGTH  = 0 - 3
+let TURN_ERR_ATTR    = 0 - 4
+let TURN_ERR_FAMILY  = 0 - 5
+let TURN_ERR_NO_ATTR = 0 - 6
+let TURN_ERR_METHOD  = 0 - 7
+
+// ============================================================================
+//                              Protocol constants
+// ============================================================================
+
+// Magic cookie is shared with STUN -- 0x2112A442 = 554869826 (hand-decoded).
+let TURN_MAGIC_COOKIE = 554869826
+
+let TURN_HDR_LEN      = 20
+let TURN_ATTR_HDR_LEN = 4
+let TURN_TXN_ID_LEN   = 12
+
+// Message methods (RFC 5766 section 13).
+let TURN_METHOD_ALLOCATE          = 3      // 0x003
+let TURN_METHOD_REFRESH           = 4      // 0x004
+let TURN_METHOD_SEND              = 6      // 0x006
+let TURN_METHOD_DATA              = 7      // 0x007
+let TURN_METHOD_CREATE_PERMISSION = 8      // 0x008
+let TURN_METHOD_CHANNEL_BIND      = 9      // 0x009
+
+// Message classes (RFC 8489 section 5).
+let TURN_CLASS_REQUEST       = 0
+let TURN_CLASS_INDICATION    = 1
+let TURN_CLASS_SUCCESS_RESP  = 2
+let TURN_CLASS_ERROR_RESP    = 3
+
+// Attribute types (RFC 5766 section 14).
+let TURN_ATTR_CHANNEL_NUMBER       = 12    // 0x000C
+let TURN_ATTR_LIFETIME             = 13    // 0x000D
+let TURN_ATTR_XOR_PEER_ADDRESS     = 18    // 0x0012
+let TURN_ATTR_DATA                 = 19    // 0x0013
+let TURN_ATTR_XOR_RELAYED_ADDRESS  = 22    // 0x0016
+let TURN_ATTR_REQUESTED_TRANSPORT  = 25    // 0x0019
+let TURN_ATTR_DONT_FRAGMENT        = 26    // 0x001A
+let TURN_ATTR_RESERVATION_TOKEN    = 34    // 0x0022
+
+// STUN-shared attributes the parser must TOLERATE on incoming messages
+// even though we do not consume or verify them in this round. These
+// are skip-over only -- their presence does NOT reject the message.
+let TURN_ATTR_USERNAME             = 6     // 0x0006
+let TURN_ATTR_MESSAGE_INTEGRITY    = 8     // 0x0008
+let TURN_ATTR_ERROR_CODE           = 9     // 0x0009
+let TURN_ATTR_REALM                = 20    // 0x0014
+let TURN_ATTR_NONCE                = 21    // 0x0015
+let TURN_ATTR_XOR_MAPPED_ADDRESS   = 32    // 0x0020
+let TURN_ATTR_SOFTWARE             = 32802 // 0x8022
+let TURN_ATTR_FINGERPRINT          = 32808 // 0x8028
+
+let TURN_FAMILY_IPV4 = 1
+let TURN_FAMILY_IPV6 = 2
+
+// Default lifetime per RFC 5766 section 2.2 ("default 10 minutes").
+let TURN_LIFETIME_DEFAULT = 600
+
+// Transport protocol numbers per IANA: UDP = 17.
+let TURN_TRANSPORT_UDP = 17
+
+// ============================================================================
+//                         Byte arithmetic helpers
+// ============================================================================
+
+fn _turn_put_u16(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 1, int_and(v, 255))
+    return 1
+}
+
+fn _turn_put_u32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+fn _turn_get_u16(buf, off) {
+    let hi = load8(buf + off + 0)
+    let lo = load8(buf + off + 1)
+    return int_or(int_shl(hi, 8), lo)
+}
+
+fn _turn_get_u32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return v
+}
+
+// Round n up to the next multiple of 4.
+fn _turn_pad4(n) {
+    let r = n - int_shl(int_shr(n, 2), 2)
+    if r == 0 { return n }
+    return n + (4 - r)
+}
+
+// Total wire size of an attribute given its UNPADDED value length.
+fn _turn_attr_size(value_len) {
+    return TURN_ATTR_HDR_LEN + _turn_pad4(value_len)
+}
+
+// Pack a 12-bit method and 2-bit class into the 14-bit RFC 8489 message-type
+// field. The class bits are at positions 4 (C0) and 8 (C1); method bits
+// 0..3 fall through unchanged, bits 4..6 shift up by 1, bits 7..11 shift up
+// by 2. For the six TURN methods 0x003..0x009 the high method bits stay
+// zero so the encoded type collapses to (class << 8) | method.
+fn turn_msg_type_pack(method, class) {
+    let m0_3  = int_and(method, 15)         // bits 0..3
+    let m4_6  = int_and(int_shr(method, 4), 7)
+    let m7_11 = int_and(int_shr(method, 7), 31)
+    let c0 = int_and(class, 1)
+    let c1 = int_and(int_shr(class, 1), 1)
+    let t = m0_3
+    t = int_or(t, int_shl(c0, 4))
+    t = int_or(t, int_shl(m4_6, 5))
+    t = int_or(t, int_shl(c1, 8))
+    t = int_or(t, int_shl(m7_11, 9))
+    return t
+}
+
+fn turn_msg_type_unpack(t) {
+    let m0_3  = int_and(t, 15)
+    let c0    = int_and(int_shr(t, 4), 1)
+    let m4_6  = int_and(int_shr(t, 5), 7)
+    let c1    = int_and(int_shr(t, 8), 1)
+    let m7_11 = int_and(int_shr(t, 9), 31)
+    let method = m0_3
+    method = int_or(method, int_shl(m4_6, 4))
+    method = int_or(method, int_shl(m7_11, 7))
+    let class = int_or(c0, int_shl(c1, 1))
+    let out = list_new()
+    push(out, method)
+    push(out, class)
+    return out
+}
+
+// ============================================================================
+//                         Header builder
+// ============================================================================
+
+fn _turn_put_header(buf, msg_type, body_length, txn_id_buf) {
+    _turn_put_u16(buf, 0, msg_type)
+    _turn_put_u16(buf, 2, body_length)
+    _turn_put_u32(buf, 4, TURN_MAGIC_COOKIE)
+    let i = 0
+    while i < TURN_TXN_ID_LEN {
+        store8(buf + 8 + i, load8(txn_id_buf + i))
+        i = i + 1
+    }
+    return 1
+}
+
+fn _turn_zero_buf(buf, n) {
+    let i = 0
+    while i < n { store8(buf + i, 0); i = i + 1 }
+    return 1
+}
+
+// ============================================================================
+//                         XOR address codec (RFC 5389 / 8489 section 15.2)
+// ============================================================================
+//
+//   For an IPv4 mapping the encoded port is the host-order port XORed with
+//   the top 16 bits of the magic cookie. The encoded address is the
+//   host-order 32-bit address XORed with the whole magic cookie.
+//
+//   This helper operates on integer-form addr_be32 + port (a u16). The
+//   on-wire bytes are then produced by writing the XORed values in BE.
+
+fn turn_xor_address_v4(addr_be32, port_be16, txn_id_buf) {
+    let cookie_hi = int_and(int_shr(TURN_MAGIC_COOKIE, 16), 65535)
+    let x_port = int_xor(port_be16, cookie_hi)
+    let x_addr = int_xor(addr_be32, TURN_MAGIC_COOKIE)
+    let out = list_new()
+    push(out, x_addr)
+    push(out, x_port)
+    return out
+}
+
+// Emit a single XOR-address attribute (XOR-PEER, XOR-RELAYED, or
+// XOR-MAPPED). family is 1 (IPv4); IPv6 is not supported in this round.
+fn _turn_emit_xor_addr_v4(buf, off, attr_type, ip_v4_buf, port) {
+    _turn_put_u16(buf, off + 0, attr_type)
+    _turn_put_u16(buf, off + 2, 8)              // IPv4 value length
+    store8(buf + off + 4, 0)                    // RFFU
+    store8(buf + off + 5, TURN_FAMILY_IPV4)
+    let cookie_hi = int_and(int_shr(TURN_MAGIC_COOKIE, 16), 65535)
+    _turn_put_u16(buf, off + 6, int_xor(port, cookie_hi))
+    let i = 0
+    while i < 4 {
+        let cookie_byte = int_and(int_shr(TURN_MAGIC_COOKIE, (3 - i) * 8), 255)
+        store8(buf + off + 8 + i,
+               int_xor(load8(ip_v4_buf + i), cookie_byte))
+        i = i + 1
+    }
+    return off + 12
+}
+
+// Decode an XOR-address attribute value. Returns [family, ip_str, port]
+// on IPv4 success, or 0 on family-mismatch / short value. Used by parse
+// helpers for XOR-PEER-ADDRESS / XOR-RELAYED-ADDRESS / XOR-MAPPED-ADDRESS.
+fn _turn_decode_xor_addr(value_ptr, value_n) {
+    if value_n < 8 { return 0 }
+    let family = load8(value_ptr + 1)
+    let cookie_hi = int_and(int_shr(TURN_MAGIC_COOKIE, 16), 65535)
+    let x_port = _turn_get_u16(value_ptr, 2)
+    let port = int_xor(x_port, cookie_hi)
+    if family == TURN_FAMILY_IPV4 {
+        if value_n != 8 { return 0 }
+        let b0 = int_xor(load8(value_ptr + 4),
+                         int_and(int_shr(TURN_MAGIC_COOKIE, 24), 255))
+        let b1 = int_xor(load8(value_ptr + 5),
+                         int_and(int_shr(TURN_MAGIC_COOKIE, 16), 255))
+        let b2 = int_xor(load8(value_ptr + 6),
+                         int_and(int_shr(TURN_MAGIC_COOKIE, 8), 255))
+        let b3 = int_xor(load8(value_ptr + 7),
+                         int_and(TURN_MAGIC_COOKIE, 255))
+        let ip = int_to_str(b0) + "." + int_to_str(b1) + "."
+            + int_to_str(b2) + "." + int_to_str(b3)
+        let out = list_new()
+        push(out, family)
+        push(out, ip)
+        push(out, port)
+        return out
+    }
+    // IPv6 explicitly NOT supported in this round.
+    return 0
+}
+
+// ============================================================================
+//                         IPv4 string -> 4-byte buffer
+// ============================================================================
+//
+//   A tiny copy of the same helper STUN ships. Inlined here so this
+//   module compiles in isolation -- the brief explicitly allows
+//   duplicating helpers rather than refactoring stun_rfc8489.
+
+fn _turn_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _turn_str_split_dots(s) {
+    let parts = list_new()
+    let n = len(s)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(s, i) == 46 {
+            let p = ""
+            let k = start
+            while k < i { p = p + chr(char_at(s, k)); k = k + 1 }
+            push(parts, p)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let tail = ""
+    let k = start
+    while k < n { tail = tail + chr(char_at(s, k)); k = k + 1 }
+    push(parts, tail)
+    return parts
+}
+
+fn turn_ipv4_str_to_buf(ip_str) {
+    let parts = _turn_str_split_dots(ip_str)
+    if len(parts) != 4 { return 0 }
+    let buf = alloc(5)
+    let j = 0
+    while j < 4 {
+        let s = parts[j]
+        let s_n = len(s)
+        if s_n == 0 { return 0 }
+        let k = 0
+        while k < s_n {
+            if _turn_is_digit(char_at(s, k)) == 0 { return 0 }
+            k = k + 1
+        }
+        let v = str_to_int(s)
+        if v < 0 { return 0 }
+        if v > 255 { return 0 }
+        store8(buf + j, v)
+        j = j + 1
+    }
+    store8(buf + 4, 0)
+    return buf
+}
+
+// ============================================================================
+//                         Attribute emit primitives
+// ============================================================================
+
+fn _turn_emit_attr_u32(buf, off, attr_type, value) {
+    _turn_put_u16(buf, off + 0, attr_type)
+    _turn_put_u16(buf, off + 2, 4)
+    _turn_put_u32(buf, off + 4, value)
+    return off + 8
+}
+
+// LIFETIME is a 32-bit unsigned seconds count.
+fn _turn_emit_lifetime(buf, off, seconds) {
+    return _turn_emit_attr_u32(buf, off, TURN_ATTR_LIFETIME, seconds)
+}
+
+// REQUESTED-TRANSPORT layout: 8-bit protocol + 24-bit RFFU.
+fn _turn_emit_requested_transport(buf, off, protocol) {
+    _turn_put_u16(buf, off + 0, TURN_ATTR_REQUESTED_TRANSPORT)
+    _turn_put_u16(buf, off + 2, 4)
+    store8(buf + off + 4, int_and(protocol, 255))
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, 0)
+    store8(buf + off + 7, 0)
+    return off + 8
+}
+
+// CHANNEL-NUMBER layout: 16-bit channel + 16-bit RFFU.
+fn _turn_emit_channel_number(buf, off, channel) {
+    _turn_put_u16(buf, off + 0, TURN_ATTR_CHANNEL_NUMBER)
+    _turn_put_u16(buf, off + 2, 4)
+    _turn_put_u16(buf, off + 4, channel)
+    _turn_put_u16(buf, off + 6, 0)
+    return off + 8
+}
+
+// DATA attribute: arbitrary byte payload, padded to a 4-byte boundary.
+fn _turn_emit_data_attr(buf, off, data_buf, data_n) {
+    _turn_put_u16(buf, off + 0, TURN_ATTR_DATA)
+    _turn_put_u16(buf, off + 2, data_n)
+    let i = 0
+    while i < data_n {
+        store8(buf + off + 4 + i, load8(data_buf + i))
+        i = i + 1
+    }
+    let pad_to = _turn_pad4(data_n)
+    let j = data_n
+    while j < pad_to {
+        store8(buf + off + 4 + j, 0)
+        j = j + 1
+    }
+    return off + 4 + pad_to
+}
+
+// ============================================================================
+//                         Emit: Allocate Request
+// ============================================================================
+//
+//   Allocate Request body = LIFETIME (4-byte val)
+//                         + REQUESTED-TRANSPORT (4-byte val)
+//   Total = 8 + 8 = 16 bytes after the 20-byte header. n = 36.
+
+fn turn_emit_allocate_request(txn_id_buf, lifetime_sec,
+                              requested_transport_udp17) {
+    let body = _turn_attr_size(4) + _turn_attr_size(4)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_ALLOCATE, TURN_CLASS_REQUEST)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_lifetime(buf, off, lifetime_sec)
+    off = _turn_emit_requested_transport(buf, off, requested_transport_udp17)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                         Emit: Refresh Request
+// ============================================================================
+
+fn turn_emit_refresh_request(txn_id_buf, lifetime_sec) {
+    let body = _turn_attr_size(4)              // just LIFETIME
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_REFRESH, TURN_CLASS_REQUEST)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_lifetime(buf, off, lifetime_sec)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                         Emit: CreatePermission Request
+// ============================================================================
+//
+//   CreatePermission Request body = one-or-more XOR-PEER-ADDRESS.
+//   This API emits a single peer address; for multi-peer, callers can
+//   build a manual variant by computing total via repeated attr_size(8).
+
+fn turn_emit_create_permission_request(txn_id_buf, peer_ip_v4, peer_port) {
+    let body = _turn_attr_size(8)              // one XOR-PEER-ADDRESS
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_CREATE_PERMISSION,
+                                   TURN_CLASS_REQUEST)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_xor_addr_v4(buf, off, TURN_ATTR_XOR_PEER_ADDRESS,
+                                 peer_ip_v4, peer_port)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// Variant that emits a list of (ip_v4_buf, port) pairs as multiple
+// XOR-PEER-ADDRESS attributes -- RFC 5766 §9 allows this.
+fn turn_emit_create_permission_request_multi(txn_id_buf, peers) {
+    let n_peers = len(peers)
+    let body = n_peers * _turn_attr_size(8)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_CREATE_PERMISSION,
+                                   TURN_CLASS_REQUEST)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    let i = 0
+    while i < n_peers {
+        let pe = peers[i]
+        off = _turn_emit_xor_addr_v4(buf, off,
+                                     TURN_ATTR_XOR_PEER_ADDRESS,
+                                     pe[0], pe[1])
+        i = i + 1
+    }
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                         Emit: Send Indication
+// ============================================================================
+//
+//   Send Indication body = XOR-PEER-ADDRESS + DATA. Send always uses
+//   the indication class and is unauthenticated (no MESSAGE-INTEGRITY).
+//   The transaction id is fresh per indication but not correlated with
+//   anything -- callers may pass any 12-byte buf.
+//
+//   We allocate a 12-byte zero txn id internally if the caller does not
+//   care; this entry point uses a deterministic-from-payload txn so
+//   tests can pin it. Callers wanting an injected txn should use the
+//   `_with_txn` variant.
+
+fn turn_emit_send_indication_with_txn(txn_id_buf, peer_ip_v4, peer_port,
+                                      data_buf, data_n) {
+    let body = _turn_attr_size(8) + _turn_attr_size(data_n)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_SEND, TURN_CLASS_INDICATION)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_xor_addr_v4(buf, off, TURN_ATTR_XOR_PEER_ADDRESS,
+                                 peer_ip_v4, peer_port)
+    off = _turn_emit_data_attr(buf, off, data_buf, data_n)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+fn turn_emit_send_indication(peer_ip_v4, peer_port, data_buf, data_n) {
+    let txn = alloc(TURN_TXN_ID_LEN + 1)
+    let i = 0
+    while i < TURN_TXN_ID_LEN { store8(txn + i, 0); i = i + 1 }
+    store8(txn + TURN_TXN_ID_LEN, 0)
+    return turn_emit_send_indication_with_txn(txn, peer_ip_v4, peer_port,
+                                              data_buf, data_n)
+}
+
+// ============================================================================
+//                         Emit: ChannelBind Request
+// ============================================================================
+//
+//   ChannelBind Request body = CHANNEL-NUMBER + XOR-PEER-ADDRESS.
+//   The CHANNEL-NUMBER value MUST be in [0x4000, 0x7FFF] per RFC 5766
+//   §11.2. This codec does NOT enforce that range -- it just writes
+//   whatever 16-bit value the caller passes. Callers responsible for
+//   that invariant.
+
+fn turn_emit_channel_bind_request(txn_id_buf, channel_num, peer_ip_v4,
+                                  peer_port) {
+    let body = _turn_attr_size(4) + _turn_attr_size(8)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_CHANNEL_BIND,
+                                   TURN_CLASS_REQUEST)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_channel_number(buf, off, channel_num)
+    off = _turn_emit_xor_addr_v4(buf, off, TURN_ATTR_XOR_PEER_ADDRESS,
+                                 peer_ip_v4, peer_port)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                         Generic header + attribute walker
+// ============================================================================
+//
+//   Validates the 20-byte STUN/TURN header and walks the attribute TLV
+//   block, returning a list of [attr_type, value_ptr, value_len].
+//   Returns one of the negative TURN_ERR_* sentinels on any framing
+//   issue. STUN-shared comprehension-optional attributes (SOFTWARE,
+//   FINGERPRINT, USERNAME, MESSAGE-INTEGRITY, REALM, NONCE,
+//   XOR-MAPPED-ADDRESS, etc.) are walked transparently -- their
+//   presence does NOT reject the message.
+
+// Returns a tagged result list: [err_code, attrs_or_null]
+//   * on success:  [0, attrs_list]
+//   * on failure:  [err_negative_int, 0]
+//
+//   The wrapper avoids relying on type-discrimination between a list
+//   reference and a small negative int (which is implementation-defined
+//   for `==` in NOVA). Callers do:
+//       let r = _turn_walk_attrs(buf, n)
+//       if r[0] < 0 { return r[0] }
+//       let attrs = r[1]
+fn _turn_walk_attrs(buf, n) {
+    let res = list_new()
+    if n < TURN_HDR_LEN {
+        push(res, TURN_ERR_HEADER); push(res, 0); return res
+    }
+    let msg_type = _turn_get_u16(buf, 0)
+    if int_and(msg_type, 49152) != 0 {
+        push(res, TURN_ERR_HEADER); push(res, 0); return res
+    }
+    let length = _turn_get_u16(buf, 2)
+    let cookie = _turn_get_u32(buf, 4)
+    if cookie != TURN_MAGIC_COOKIE {
+        push(res, TURN_ERR_COOKIE); push(res, 0); return res
+    }
+    if length + TURN_HDR_LEN > n {
+        push(res, TURN_ERR_LENGTH); push(res, 0); return res
+    }
+    if int_and(length, 3) != 0 {
+        push(res, TURN_ERR_LENGTH); push(res, 0); return res
+    }
+    let attrs = list_new()
+    let off = TURN_HDR_LEN
+    let end = TURN_HDR_LEN + length
+    while off < end {
+        if off + TURN_ATTR_HDR_LEN > end {
+            push(res, TURN_ERR_ATTR); push(res, 0); return res
+        }
+        let attr_type = _turn_get_u16(buf, off + 0)
+        let attr_len  = _turn_get_u16(buf, off + 2)
+        let pad_attr_len = _turn_pad4(attr_len)
+        if off + TURN_ATTR_HDR_LEN + pad_attr_len > end {
+            push(res, TURN_ERR_ATTR); push(res, 0); return res
+        }
+        let rec = list_new()
+        push(rec, attr_type)
+        push(rec, buf + off + TURN_ATTR_HDR_LEN)
+        push(rec, attr_len)
+        push(attrs, rec)
+        off = off + TURN_ATTR_HDR_LEN + pad_attr_len
+    }
+    push(res, 0)
+    push(res, attrs)
+    return res
+}
+
+// Walk and return a structured classification of the message header
+// without consuming attributes. txn_id_buf is a POINTER into buf
+// (caller must not free buf while using it).
+fn turn_classify_message(buf, n) {
+    if n < TURN_HDR_LEN { return TURN_ERR_HEADER }
+    let msg_type = _turn_get_u16(buf, 0)
+    if int_and(msg_type, 49152) != 0 { return TURN_ERR_HEADER }
+    let length = _turn_get_u16(buf, 2)
+    let cookie = _turn_get_u32(buf, 4)
+    if cookie != TURN_MAGIC_COOKIE { return TURN_ERR_COOKIE }
+    if length + TURN_HDR_LEN > n { return TURN_ERR_LENGTH }
+    if int_and(length, 3) != 0 { return TURN_ERR_LENGTH }
+    let mc = turn_msg_type_unpack(msg_type)
+    let txn_ptr = buf + 8
+    let out = list_new()
+    push(out, mc[0])             // method
+    push(out, mc[1])             // class
+    push(out, length)            // body length
+    push(out, txn_ptr)           // pointer to 12-byte txn id
+    return out
+}
+
+// Find the first attribute of a given type, or 0 if absent.
+fn _turn_find_attr(attrs, attr_type) {
+    let i = 0
+    while i < len(attrs) {
+        if attrs[i][0] == attr_type { return attrs[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Iterate all attributes of a given type. Returns a list of
+// [type, value_ptr, value_len] records.
+fn turn_find_all_attrs(attrs, attr_type) {
+    let out = list_new()
+    let i = 0
+    while i < len(attrs) {
+        if attrs[i][0] == attr_type { push(out, attrs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+//                         Parse: ERROR-CODE attribute
+// ============================================================================
+//
+//   ERROR-CODE value layout (RFC 8489 §14.8):
+//     bytes 0..1   reserved (must be 0)
+//     byte  2      class (3 bits low, 0..7)
+//     byte  3      number (0..99)
+//     bytes 4..L   reason phrase (UTF-8)
+//
+//   Composite code = class * 100 + number. e.g. 401 = (4 * 100) + 1.
+
+fn _turn_decode_error_code(value_ptr, value_n) {
+    if value_n < 4 { return 0 }
+    let class_num = int_and(load8(value_ptr + 2), 7)
+    let number    = load8(value_ptr + 3)
+    let code = class_num * 100 + number
+    let reason = ""
+    let i = 4
+    while i < value_n {
+        reason = reason + chr(load8(value_ptr + i))
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, code)
+    push(out, reason)
+    return out
+}
+
+// ============================================================================
+//                         Parse: Allocate Success Response
+// ============================================================================
+//
+//   Allocate Success Response (RFC 5766 §6.3) MUST contain:
+//     XOR-RELAYED-ADDRESS  -- the relay address the server allocated
+//     LIFETIME             -- granted lifetime (may differ from request)
+//     XOR-MAPPED-ADDRESS   -- the client's reflexive transport address
+//   May ALSO contain RESERVATION-TOKEN and other comprehension-optional
+//   attrs. Caller gets the three required values; reservation tokens
+//   and integrity attrs are silently skipped.
+
+fn turn_parse_allocate_success_response(buf, n) {
+    let r = _turn_walk_attrs(buf, n)
+    if r[0] < 0 { return r[0] }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(buf, 0))
+    if mc[0] != TURN_METHOD_ALLOCATE      { return TURN_ERR_METHOD }
+    if mc[1] != TURN_CLASS_SUCCESS_RESP   { return TURN_ERR_METHOD }
+    let relayed = _turn_find_attr(attrs, TURN_ATTR_XOR_RELAYED_ADDRESS)
+    if relayed == 0 { return TURN_ERR_NO_ATTR }
+    let lifetime = _turn_find_attr(attrs, TURN_ATTR_LIFETIME)
+    if lifetime == 0 { return TURN_ERR_NO_ATTR }
+    let mapped = _turn_find_attr(attrs, TURN_ATTR_XOR_MAPPED_ADDRESS)
+    let relayed_dec = _turn_decode_xor_addr(relayed[1], relayed[2])
+    if relayed_dec == 0 { return TURN_ERR_FAMILY }
+    let lifetime_sec = _turn_get_u32(lifetime[1], 0)
+    let mapped_ip = ""
+    let mapped_port = 0
+    if mapped != 0 {
+        let mapped_dec = _turn_decode_xor_addr(mapped[1], mapped[2])
+        if mapped_dec != 0 {
+            mapped_ip   = mapped_dec[1]
+            mapped_port = mapped_dec[2]
+        }
+    }
+    let out = list_new()
+    push(out, relayed_dec[1])
+    push(out, relayed_dec[2])
+    push(out, lifetime_sec)
+    push(out, mapped_ip)
+    push(out, mapped_port)
+    return out
+}
+
+// ============================================================================
+//                         Parse: Allocate Error Response
+// ============================================================================
+//
+//   Allocate Error Response (RFC 5766 §6.4) MUST contain ERROR-CODE.
+//   Common values:
+//     400 Bad Request, 401 Unauthorized, 403 Forbidden,
+//     437 Allocation Mismatch, 441 Wrong Credentials,
+//     442 Unsupported Transport Protocol, 486 Allocation Quota Reached.
+
+fn turn_parse_allocate_error_response(buf, n) {
+    let r = _turn_walk_attrs(buf, n)
+    if r[0] < 0 { return r[0] }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(buf, 0))
+    if mc[0] != TURN_METHOD_ALLOCATE     { return TURN_ERR_METHOD }
+    if mc[1] != TURN_CLASS_ERROR_RESP    { return TURN_ERR_METHOD }
+    let ec = _turn_find_attr(attrs, TURN_ATTR_ERROR_CODE)
+    if ec == 0 { return TURN_ERR_NO_ATTR }
+    let dec = _turn_decode_error_code(ec[1], ec[2])
+    if dec == 0 { return TURN_ERR_ATTR }
+    return dec
+}
+
+// ============================================================================
+//                         Parse: Data Indication
+// ============================================================================
+//
+//   Data Indication (RFC 5766 §10.3) MUST contain XOR-PEER-ADDRESS
+//   and DATA. Sent FROM server TO client to deliver a UDP datagram
+//   from a permitted peer.
+
+fn turn_parse_data_indication(buf, n) {
+    let r = _turn_walk_attrs(buf, n)
+    if r[0] < 0 { return r[0] }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(buf, 0))
+    if mc[0] != TURN_METHOD_DATA          { return TURN_ERR_METHOD }
+    if mc[1] != TURN_CLASS_INDICATION     { return TURN_ERR_METHOD }
+    let peer = _turn_find_attr(attrs, TURN_ATTR_XOR_PEER_ADDRESS)
+    if peer == 0 { return TURN_ERR_NO_ATTR }
+    let data = _turn_find_attr(attrs, TURN_ATTR_DATA)
+    if data == 0 { return TURN_ERR_NO_ATTR }
+    let dec = _turn_decode_xor_addr(peer[1], peer[2])
+    if dec == 0 { return TURN_ERR_FAMILY }
+    let out = list_new()
+    push(out, dec[1])
+    push(out, dec[2])
+    push(out, data[1])
+    push(out, data[2])
+    return out
+}
+
+// ============================================================================
+//                         Parse: Refresh Success Response
+// ============================================================================
+
+fn turn_parse_refresh_success_response(buf, n) {
+    let r = _turn_walk_attrs(buf, n)
+    if r[0] < 0 { return r[0] }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(buf, 0))
+    if mc[0] != TURN_METHOD_REFRESH       { return TURN_ERR_METHOD }
+    if mc[1] != TURN_CLASS_SUCCESS_RESP   { return TURN_ERR_METHOD }
+    let lt = _turn_find_attr(attrs, TURN_ATTR_LIFETIME)
+    if lt == 0 { return TURN_ERR_NO_ATTR }
+    let lifetime_sec = _turn_get_u32(lt[1], 0)
+    let out = list_new()
+    push(out, lifetime_sec)
+    return out
+}
+
+// ============================================================================
+//                         Build helpers for response messages
+// ============================================================================
+//
+//   These exist primarily so the test suite can construct response
+//   messages to feed back through the parse path without spinning up
+//   a live TURN server. They are NOT a relay implementation -- callers
+//   should not treat them as a "TURN server" because the lifecycle,
+//   permission table, and channel mapping all live elsewhere.
+
+fn turn_emit_allocate_success_response(txn_id_buf, relayed_ip_v4,
+                                       relayed_port, lifetime_sec,
+                                       mapped_ip_v4, mapped_port) {
+    let body = _turn_attr_size(8)     // XOR-RELAYED-ADDRESS
+              + _turn_attr_size(4)     // LIFETIME
+              + _turn_attr_size(8)     // XOR-MAPPED-ADDRESS
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_ALLOCATE,
+                                   TURN_CLASS_SUCCESS_RESP)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_xor_addr_v4(buf, off, TURN_ATTR_XOR_RELAYED_ADDRESS,
+                                 relayed_ip_v4, relayed_port)
+    off = _turn_emit_lifetime(buf, off, lifetime_sec)
+    off = _turn_emit_xor_addr_v4(buf, off, TURN_ATTR_XOR_MAPPED_ADDRESS,
+                                 mapped_ip_v4, mapped_port)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+fn turn_emit_allocate_error_response(txn_id_buf, class_num, number, reason) {
+    let reason_n = len(reason)
+    if reason_n > 256 { reason_n = 256 }
+    let err_value_n = 4 + reason_n
+    let body = _turn_attr_size(err_value_n)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_ALLOCATE,
+                                   TURN_CLASS_ERROR_RESP)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    _turn_put_u16(buf, off + 0, TURN_ATTR_ERROR_CODE)
+    _turn_put_u16(buf, off + 2, err_value_n)
+    store8(buf + off + 4, 0)
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, int_and(class_num, 7))
+    store8(buf + off + 7, int_and(number, 255))
+    let i = 0
+    while i < reason_n {
+        store8(buf + off + 8 + i, char_at(reason, i))
+        i = i + 1
+    }
+    let total_off = off + _turn_attr_size(err_value_n)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, total_off)
+    return out
+}
+
+fn turn_emit_refresh_success_response(txn_id_buf, lifetime_sec) {
+    let body = _turn_attr_size(4)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_REFRESH,
+                                   TURN_CLASS_SUCCESS_RESP)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_lifetime(buf, off, lifetime_sec)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+fn turn_emit_data_indication_with_txn(txn_id_buf, peer_ip_v4, peer_port,
+                                      data_buf, data_n) {
+    let body = _turn_attr_size(8) + _turn_attr_size(data_n)
+    let total = TURN_HDR_LEN + body
+    let buf = alloc(total + 1)
+    _turn_zero_buf(buf, total)
+    let mtype = turn_msg_type_pack(TURN_METHOD_DATA, TURN_CLASS_INDICATION)
+    _turn_put_header(buf, mtype, body, txn_id_buf)
+    let off = TURN_HDR_LEN
+    off = _turn_emit_xor_addr_v4(buf, off, TURN_ATTR_XOR_PEER_ADDRESS,
+                                 peer_ip_v4, peer_port)
+    off = _turn_emit_data_attr(buf, off, data_buf, data_n)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// ============================================================================
+//                         Test-only shims
+// ============================================================================
+
+fn _turn_test_put_u16(buf, off, v) { return _turn_put_u16(buf, off, v) }
+fn _turn_test_get_u16(buf, off)    { return _turn_get_u16(buf, off) }
+fn _turn_test_put_u32(buf, off, v) { return _turn_put_u32(buf, off, v) }
+fn _turn_test_get_u32(buf, off)    { return _turn_get_u32(buf, off) }
+fn _turn_test_pad4(n)              { return _turn_pad4(n) }
+fn _turn_test_attr_size(n)         { return _turn_attr_size(n) }
+fn _turn_test_walk_attrs(buf, n)   { return _turn_walk_attrs(buf, n) }
+fn _turn_test_decode_xor_addr(value_ptr, value_n) {
+    return _turn_decode_xor_addr(value_ptr, value_n)
+}
+fn _turn_test_decode_error_code(value_ptr, value_n) {
+    return _turn_decode_error_code(value_ptr, value_n)
+}
