@@ -13,6 +13,40 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R35A (R34C.2) closes the DTLS-SRTP keying loop per RFC 5764 §4.2.
+> Before R35A, the SRTP master key + salt had to be supplied
+> out-of-band by the caller of R34C's `srtp_derive_keys`; with R35A
+> they are extracted from the completed DTLS handshake's TLS-1.2
+> PRF via the well-known label `"EXTRACTOR-dtls_srtp"` (19 ASCII
+> bytes) and the seed `client_random || server_random`. The
+> 60-byte PRF output is partitioned per §4.2 into client + server
+> SRTP master keys (16B each) and client + server SRTP master
+> salts (14B each), and each peer picks "its" half based on
+> `is_server`. Two new public functions: `dtls_export_srtp_
+> keying_material(state) -> 60-byte buf | 0` in
+> `src/federation/dtls12.nova` (composed over the existing
+> `dtls_prf_sha256`; refuses when `cipher_active == 0`), and
+> `srtp_init_from_dtls(dtls_state, is_server) -> [encr_key (16B),
+> auth_key (20B), salt (14B)] | 0` in `src/federation/srtp.nova`
+> (calls the exporter, slices "our" 16-byte mk + 14-byte ms per
+> `is_server`, forwards to the existing R34C `srtp_derive_keys`).
+> `srtp.nova` gains a one-way import edge to `dtls12.nova`; the
+> reverse direction is intentionally absent so dtls12 stays
+> import-graph-leaf-shaped under safety/. 40 new assertions across
+> the two suites: 16 dtls12 R35A (cipher_active gate, 60-byte
+> output, alice/bob byte-identical exporter output, RFC label
+> length + 4 ASCII spot bytes, per-state repeat determinism) +
+> 24 srtp R35A (pre-handshake gate for both is_server values,
+> 3-element list shape, client/server keys asymmetric -- encr +
+> auth + salt all differ -- repeat determinism, one-direction
+> seal+open round-trip with client-keys, cross-side seal+open
+> returns SRTP_AUTH_FAIL pinning the §4.2 half-selection rule).
+> 353 prior dtls12 + 111 prior srtp assertions byte-identical
+> (R35A appends to the tail of each suite). Honest caveat:
+> exporter PRF cost is two HMAC-SHA256 iterations; called once
+> per session post-handshake, not on the per-packet hot path, so
+> per-call recompute is fine.
+>
 > R35D lands the ICE-TURN integration layer -- when ICE's
 > peer-to-peer candidate gathering exhausts host + server-reflexive
 > candidates without a usable pair, the orchestrator escalates to a

@@ -92,10 +92,15 @@
 //
 // Scope (what R34C does NOT ship)
 //
-//   * DTLS-SRTP key extraction (RFC 5764). The master key + salt
-//     come from caller code; a future round wires DTLS's PRF output
-//     (via `dtls_export_keying_material` once that exists) into
-//     `srtp_derive_keys`.
+//   * (R34C.2 / R35A note) DTLS-SRTP key extraction is now wired
+//     via `srtp_init_from_dtls(dtls_state, is_server)` (see the
+//     R35A section below). The R34C-era note is preserved for
+//     historical context: the master key + salt USED to come from
+//     caller code; with R35A they are extracted from the completed
+//     DTLS handshake's PRF per RFC 5764 §4.2. Callers that still
+//     want to feed (master_key, master_salt) in directly can
+//     continue to call `srtp_derive_keys` -- R35A only ADDS the
+//     DTLS-driven path, it does not remove the direct path.
 //   * SRTCP (the control-plane sibling protocol RFC 3711 §3.4).
 //     SRTCP has its own seq numbering + always-encrypted-tag layout
 //     that is structurally different from SRTP.
@@ -213,6 +218,14 @@
 //   `aes128_encrypt_block_with_schedule`).
 
 import "../safety/aes_gcm.nova"
+// R35A: DTLS-SRTP keying material exporter. Pulled in for
+// `srtp_init_from_dtls`, which calls `dtls_export_srtp_keying_material`
+// to extract the 60-byte RFC 5764 §4.2 block from a completed DTLS
+// handshake's state. The import is a one-way edge (dtls12 does NOT
+// import srtp); transitively pulls in safety/sha256 + safety/p256 +
+// safety/aes_gcm + safety/x509, all of which are LEAVES and do not
+// re-enter the federation tree.
+import "./dtls12.nova"
 
 // ============================================================================
 //                          Public sentinels
@@ -691,6 +704,98 @@ fn srtp_derive_keys(master_key, master_salt) {
     push(r, auth)
     push(r, salt)
     return r
+}
+
+// ============================================================================
+//      R35A: DTLS-SRTP keying-material -> SRTP sub-keys (RFC 5764 §4.2)
+// ============================================================================
+//
+// `srtp_init_from_dtls(dtls_state, is_server)` closes the loop between
+// the DTLS 1.2 handshake (R29B / R31B / R32B / R33B / R34A in the
+// federation/dtls12.nova stack) and the SRTP wire codec (this module).
+// Before R35A, a caller of `srtp_derive_keys(master_key, master_salt)`
+// had to supply the 16-byte master key and 14-byte master salt from
+// some out-of-band source -- the public API was intentionally shaped
+// so a future round could plug DTLS in without a breaking change.
+// R35A is that round.
+//
+// RFC 5764 §4.2 specifies that the SRTP keying material is extracted
+// from the DTLS PRF via the well-known label `"EXTRACTOR-dtls_srtp"`
+// and the seed `client_random || server_random`. The output is a
+// fixed 60-byte block:
+//
+//   bytes  0..15 -- CLIENT SRTP master key   (16B, AES-CM-128 key)
+//   bytes 16..31 -- SERVER SRTP master key   (16B)
+//   bytes 32..45 -- CLIENT SRTP master salt  (14B, AES-CM salt)
+//   bytes 46..59 -- SERVER SRTP master salt  (14B)
+//
+// The "client" half is used by the DTLS client (is_server=0) on its
+// send-side seal; the "server" half is used by the DTLS server
+// (is_server=1) on its send-side seal. Crucially, the keys are
+// ASYMMETRIC across direction: a client's keys are NOT the same as
+// the server's keys, even though both 60-byte blocks are byte-
+// identical (both peers compute the same exporter output -- that is
+// the whole point of a deterministic PRF). The asymmetry comes from
+// each side selecting a different HALF of the 60-byte block. To
+// validate this asymmetry, a test can call
+// `srtp_init_from_dtls(alice_dtls, 0)` and
+// `srtp_init_from_dtls(bob_dtls, 1)` (after a `_tdtls_setup_ecdhe_
+// pair`) and assert the resulting encr_keys differ in at least one
+// byte.
+//
+// The function operates in two steps:
+//   1. Call `dtls_export_srtp_keying_material(dtls_state)` to get
+//      the 60-byte block. If DTLS has not yet completed its
+//      handshake (`cipher_active == 0` in the state), the exporter
+//      returns 0 and we forward that sentinel here.
+//   2. Slice "our" 16-byte master key + 14-byte master salt from
+//      the block based on `is_server`, then forward to the existing
+//      RFC 3711 §4.3.2 wrapper `srtp_derive_keys` to produce the
+//      three §4.3.2 sub-keys.
+//
+// The slicing uses freshly alloc'd buffers so a downstream mutation
+// of the returned encr/auth/salt does not poison the DTLS state
+// slots that backed the exporter output. The 60-byte exporter buf
+// is consumed (read-only) and then discarded once we hold the
+// 16-byte mk + 14-byte ms copies.
+//
+// Returns:
+//   * On success: `[encr_key (16B), auth_key (20B), salt (14B)]`
+//     -- the exact shape `srtp_derive_keys` produces; this is the
+//     drop-in replacement for the manual-master-key path.
+//   * On DTLS not ready: 0 (forwarded from the exporter).
+fn srtp_init_from_dtls(dtls_state, is_server) {
+    let km = dtls_export_srtp_keying_material(dtls_state)
+    if km == 0 { return 0 }
+    // Pick our halves from the 60-byte block per RFC 5764 §4.2.
+    //   client side (is_server == 0): mk = km[0..16);  ms = km[32..46)
+    //   server side (is_server == 1): mk = km[16..32); ms = km[46..60)
+    let mk_off = 0
+    let ms_off = 32
+    if is_server != 0 {
+        mk_off = 16
+        ms_off = 46
+    }
+    // Copy 16 bytes of master key into a fresh buffer.
+    let mk = alloc(SRTP_KEY_LEN + 1)
+    let i = 0
+    while i < SRTP_KEY_LEN {
+        store8(mk + i, load8(km + mk_off + i))
+        i = i + 1
+    }
+    store8(mk + SRTP_KEY_LEN, 0)
+    // Copy 14 bytes of master salt into a fresh buffer.
+    let ms = alloc(SRTP_SALT_LEN + 1)
+    let j = 0
+    while j < SRTP_SALT_LEN {
+        store8(ms + j, load8(km + ms_off + j))
+        j = j + 1
+    }
+    store8(ms + SRTP_SALT_LEN, 0)
+    // Forward to the existing RFC 3711 §4.3.2 derivation. The shape
+    // is `[encr_key (16B), auth_key (20B), salt (14B)]` -- this is
+    // the contract `srtp_state_init(encr, auth, salt, ssrc)` expects.
+    return srtp_derive_keys(mk, ms)
 }
 
 // ============================================================================

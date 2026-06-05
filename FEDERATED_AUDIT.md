@@ -5189,3 +5189,146 @@ response`, `turn_emit_create_permission_error_response`,
    that promotes R35D from "open allocation on ICE exhaustion" to
    "track the allocation lifecycle through its full PENDING ->
    ACTIVE -> REFRESHING / EXPIRED cycle".
+
+## R35A extension: DTLS-SRTP keying material extraction (RFC 5764 §4.2) -- R34C.2
+
+R34C (`9a23da2`) shipped the SRTP wire codec with
+`srtp_derive_keys(master_key, master_salt) -> [encr_key (16B),
+auth_key (20B), salt (14B)]` (RFC 3711 §4.3.2 AES-CM KDF). R31B
+(`af8e47c`) wired P-256 ECDHE + AES-128-GCM into DTLS records and
+populated the cipher-state slots (`master_secret`, `client_random`,
+`server_random`, etc.). R35A wires the two together per RFC 5764 §4.2:
+the SRTP master key + salt now come from the DTLS handshake's
+keying-material exporter rather than being passed in out-of-band.
+
+### Module: `src/federation/dtls12.nova` (extension; cipher-state block unchanged)
+
+One new public function appended after the R29B.2 stub section
+(specifically after the historical `dtls_extract_srtp_keys_R29B2_STUB`,
+which is RETAINED as a regression guard against accidental rename):
+
+* `dtls_export_srtp_keying_material(state) -> 60-byte buf | 0`
+
+The function is a thin composition over the existing `dtls_prf_sha256`
+helper. RFC 5764 §4.2 fixes the label to the 19-byte ASCII string
+`"EXTRACTOR-dtls_srtp"` and the seed to the 64-byte concatenation
+`client_random || server_random`. We allocate a fresh 65-byte seed
+buffer (64 + NUL slack), copy in the two 32-byte halves from the
+existing `CLIENT_RANDOM` / `SERVER_RANDOM` state slots (populated by
+R31B's `dtls_ecdhe_derive`), and call
+`dtls_prf_sha256(master_secret, 48, "EXTRACTOR-dtls_srtp", seed, 64,
+60)`. The PRF helper already takes the label as a Nova string (its
+internal `_dtls_prf_seed` reads ASCII bytes via `char_at`), so no
+ABI changes are needed.
+
+The function refuses to run when `cipher_active == 0` (handshake not
+yet complete -- calling the PRF before the master_secret + randoms
+are populated would yield uninitialized input). Returns the integer
+sentinel `0` in that case.
+
+The 60-byte output is partitioned per RFC 5764 §4.2:
+
+| offset | size | role                                |
+|--------|------|-------------------------------------|
+|  0..16 |  16B | CLIENT SRTP master key (AES-CM-128) |
+| 16..32 |  16B | SERVER SRTP master key              |
+| 32..46 |  14B | CLIENT SRTP master salt (AES-CM)    |
+| 46..60 |  14B | SERVER SRTP master salt             |
+
+### Module: `src/federation/srtp.nova` (extension; codec block unchanged)
+
+Adds one new public entry point right after `srtp_derive_keys` (the
+R34C §4.3.2 wrapper):
+
+* `srtp_init_from_dtls(dtls_state, is_server) -> [encr_key, auth_key,
+  salt] | 0`
+
+Algorithm:
+1. Call `dtls_export_srtp_keying_material(dtls_state)`. On `0`,
+   forward `0` (DTLS not ready).
+2. Pick the per-side master key + salt from the 60-byte block. The
+   "our" half depends on `is_server`:
+   * `is_server == 0` (client side): `mk = km[0..16); ms = km[32..46)`
+   * `is_server != 0` (server side): `mk = km[16..32); ms = km[46..60)`
+3. Copy 16 bytes of mk + 14 bytes of ms into fresh buffers so a
+   downstream mutation of the returned keys does not poison the DTLS
+   state slots that backed the exporter output.
+4. Forward to the existing `srtp_derive_keys(mk, ms)` -- R34C's
+   AES-CM-based RFC 3711 §4.3 KDF -- and return its 3-element list.
+
+The import graph adds a one-way edge `srtp.nova -> dtls12.nova`.
+dtls12 does NOT import srtp; the transitive deps (safety/sha256 +
+safety/p256 + safety/aes_gcm + safety/x509) are all LEAVES and do
+not re-enter the federation tree.
+
+### Tests added
+
+* **`tests/unit/test_dtls12.nova`**: 16 new R35A assertions across 5
+  test functions:
+  1. `dtls_export_srtp_keying_material` returns `0` when
+     `cipher_active == 0` (fresh state, no derive run).
+  2. After `_tdtls_setup_ecdhe_pair`, the exporter returns a non-zero
+     60-byte buffer; probing byte 0 and byte 59 confirms the alloc
+     was large enough.
+  3. Alice and Bob (the two peers from `_tdtls_setup_ecdhe_pair`)
+     extract BYTE-IDENTICAL 60-byte blocks -- proves the PRF is
+     symmetric across the wire when both sides hold the same
+     master_secret + randoms.
+  4. The RFC 5764 label `"EXTRACTOR-dtls_srtp"` is exactly 19 ASCII
+     bytes, with spot-byte checks at offsets 0 / 10 / 14 / 18
+     ('E' / 'd' / 's' / 'p').
+  5. Repeat calls on the same state produce byte-identical output
+     (PRF is pure; exporter does not consume / mutate the
+     master_secret slot).
+
+* **`tests/unit/test_srtp.nova`**: 24 new R35A assertions across 6
+  test functions:
+  1. `srtp_init_from_dtls(fresh_state, 0)` and `(fresh_state, 1)`
+     both return `0` (gate forwarded from the exporter).
+  2. After ECDHE derive, `srtp_init_from_dtls(alice, 0)` returns a
+     3-element list `[encr_key, auth_key, salt]` -- shape matches
+     R34C's `srtp_derive_keys` contract.
+  3. Client side (alice, `is_server=0`) and server side (bob,
+     `is_server=1`) derive DIFFERENT keys: encr keys differ in at
+     least one byte (16B compare returns 0), auth keys differ
+     (20B compare), salts differ (14B compare). This pins the
+     RFC 5764 §4.2 asymmetry.
+  4. Repeat calls on the same DTLS state with the same `is_server`
+     produce byte-identical keys.
+  5. One-direction round-trip (alice's client-keys feed both seal
+     and open): `srtp_seal_packet` + `srtp_open_packet` round-trip
+     with the R35A-derived keys works -- proves the key set is
+     internally consistent with the existing R34C codec.
+  6. Cross-side asymmetry: sealing with alice's client-keys and
+     trying to open with bob's server-keys fails the HMAC and
+     returns `SRTP_AUTH_FAIL` (the auth_fail counter increments).
+     This is the negative test that pins the §4.2 half-selection
+     rule -- if a future refactor broke the half-selection and
+     both sides ended up with the same half, this test would
+     catch it.
+
+### Honest scope limits
+
+1. **PRF cost dominated by the 60-byte expansion.** Two HMAC-SHA256
+   iterations (ceil(60/32) = 2) per exporter call. The function is
+   called exactly once per session right after the handshake
+   completes -- per-call recompute is fine on the
+   not-on-the-hot-path. If a future use case ever needs per-packet
+   rekey (it should not -- SRTP rekey ordinarily renegotiates DTLS),
+   cache the 60-byte buf in a fresh state slot.
+2. **No SRTP rekey-without-DTLS-renegotiate.** RFC 5764 §4.2 does
+   not require it; each rekey ordinarily renegotiates DTLS.
+3. **Label literal embedded.** The 19-byte string lives inline in
+   `dtls_export_srtp_keying_material`. The test in test_dtls12 pins
+   the length + 4 spot-byte ASCII values as a regression guard
+   against typos.
+4. **No constant-time tag compare carve-out.** R35A inherits R34C's
+   byte-by-byte XOR-fold tag comparison via the existing seal+open
+   path; R30B.3's bitsliced AES + constant-time comparators hardening
+   scope continues to track this.
+5. **R35A does not modify any sibling-agent file.** dtls12.nova
+   gains one function below the existing R29B.2 stubs; srtp.nova
+   gains one import line + one function below `srtp_derive_keys`.
+   The codec / PRF / cipher-state blocks above are byte-identical to
+   their pre-R35A form -- the 353 prior dtls12 + 111 prior srtp
+   assertions are preserved exactly.

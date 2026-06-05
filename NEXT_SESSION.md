@@ -3,6 +3,93 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R35A (R34C.2) -- DTLS-SRTP keying material extraction (RFC 5764 §4.2)
+
+**Status: complete** -- closes the keying loop between R31B's DTLS
+1.2 PRF and R34C's `srtp_derive_keys`. Before R35A, the SRTP master
+key + salt had to be supplied out-of-band by the caller; with R35A
+they are extracted from the completed DTLS handshake's TLS-1.2 PRF
+per RFC 5764 §4.2.
+
+### What R35A delivers
+
+* **`dtls_export_srtp_keying_material(state) -> 60-byte buf | 0`**
+  in `src/federation/dtls12.nova`. Calls the existing
+  `dtls_prf_sha256` helper with the well-known label
+  `"EXTRACTOR-dtls_srtp"` (19 ASCII bytes per RFC 5764 §4.2) and
+  the seed `client_random || server_random` (the 32+32 = 64-byte
+  concatenation pulled from the cipher-state slots populated by
+  R31B's `dtls_ecdhe_derive`). Output is the 60-byte block
+  partitioned per §4.2 into:
+  * bytes  0..15 -- client SRTP master key   (16B, AES-CM-128 key)
+  * bytes 16..31 -- server SRTP master key   (16B)
+  * bytes 32..45 -- client SRTP master salt  (14B, AES-CM salt)
+  * bytes 46..59 -- server SRTP master salt  (14B)
+  Returns 0 when `cipher_active == 0` (handshake not yet
+  complete -- calling the PRF before the master_secret +
+  randoms are populated would yield uninitialized PRF input).
+* **`srtp_init_from_dtls(dtls_state, is_server) -> [encr_key,
+  auth_key, salt] | 0`** in `src/federation/srtp.nova`. Calls the
+  DTLS exporter, slices "our" master key + salt per `is_server`
+  (server = bytes 16..32 + 46..60; client = bytes 0..16 + 32..46),
+  then forwards to the existing R34C `srtp_derive_keys` wrapper.
+  Returns the same `[encr_key (16B), auth_key (20B), salt (14B)]`
+  shape R34C produces -- drop-in replacement for the manual-master-
+  key path.
+* **`srtp.nova` now imports `./dtls12.nova`** (one-way edge --
+  dtls12 does NOT import srtp). The transitive dep graph picks up
+  the existing safety/sha256 + safety/p256 + safety/aes_gcm +
+  safety/x509 leaves with no new cycles.
+
+### Verification
+
+* **`tests/unit/test_dtls12.nova`** extended by 16 R35A assertions
+  (across 5 new test functions): cipher_active gate, 60-byte
+  output length probe, alice+bob byte-identical keying material
+  (PRF determinism via shared master_secret + randoms after
+  `_tdtls_setup_ecdhe_pair`), 19-byte label sanity + ASCII spot-
+  checks, per-state determinism on repeat call.
+* **`tests/unit/test_srtp.nova`** extended by 24 R35A assertions
+  (across 6 new test functions): pre-handshake gate (both is_server
+  values return 0), 3-element list shape, client/server keys
+  asymmetric per RFC 5764 §4.2 (encr / auth / salt all differ),
+  same-side determinism, one-direction seal+open round-trip with
+  client keys, CROSS-SIDE asymmetry (seal with alice's client
+  keys + open with bob's server keys -> SRTP_AUTH_FAIL per the
+  §4.2 half-selection rule).
+* **All prior assertions preserved.** 353 dtls12 + 111 srtp
+  baseline counts are reported by `ce_summary` -- the R35A
+  additions append-only at the tail of each suite's `main()`.
+
+### Deferred to future rounds
+
+* **SRTP rekey without DTLS renegotiate.** RFC 5764 §4.2 does
+  not require this; each rekey ordinarily renegotiates DTLS.
+  A future hardening could cache the 60-byte exporter buf in a
+  fresh state slot if real-time rekey ever matters.
+* **Wire driver integration.** R35A ships the keying primitive;
+  the orchestrator that ties webrtc.nova / ice.nova / dtls12 /
+  srtp into one end-to-end call site is follow-up work.
+* **MKI (Master Key Identifier).** R34C ships with `mki_length = 0`
+  (WebRTC interop default); R35A does not change that.
+
+### Honest design caveats
+
+* **PRF cost is dominated by the 60-byte expansion.** Two HMAC-
+  SHA256 iterations (ceil(60/32) = 2) per exporter call. Called
+  exactly once per session right after the handshake completes,
+  so per-call recompute is fine -- but if a future use-case needs
+  per-packet rekey (it shouldn't), cache the buf in a state slot.
+* **Label literal embedded in dtls12.nova.** The 19-byte
+  `"EXTRACTOR-dtls_srtp"` is a literal constant; a future refactor
+  that promotes the label to a top-level `let` should keep the
+  byte spelling exact (the test in test_dtls12 pins the length +
+  4 spot-byte ASCII values as a regression guard).
+* **No constant-time tag compare carve-out.** R35A inherits
+  R34C's byte-by-byte XOR-fold tag comparison via the existing
+  seal+open path; the R30B.3 bitsliced AES + constant-time
+  comparators hardening scope continues to track this.
+
 ## R35D -- ICE-TURN integration layer (R30C + R34B consumer)
 
 **Status: complete** -- closes the last gap between R30C's ICE agent
