@@ -6022,3 +6022,185 @@ suite (slots 0..44 + the 417 prior assertions are NOT touched):
    x509.nova / ecdsa.nova / sha256.nova are untouched -- R38C
    (TURN server, concurrent) + R38D (SCRAM auth, concurrent on
    a different file) cannot collide.
+
+## R38C extension: TURN SERVER-side state machine (R34B.3 / R35B.3)
+
+R34B (`423a352`) shipped the TURN wire codec; R35B (`063824e` +
+`53490bf`) shipped the CLIENT-side allocation state machine that
+drives ONE allocation lifecycle against a TURN server; R36A
+(`1f15e02`) added long-term-credential authentication on top of
+the client path. None of those rounds modeled the TURN SERVER
+side -- R35B's exit caveat: "This is a CLIENT-side state machine.
+The TURN server's allocation pool, peer-side enforcement, and
+data forwarding are NOT modeled. RFC 5766 §6.2 specifies how the
+server allocates ports; that's a future round if anyone needs to
+run a relay." R38C is that future round.
+
+### Server state
+
+`turn_server_init() -> state` returns a positional list with:
+
+* `allocations_list` -- list of per-client allocation records
+  (each: client_addr buf, relayed_port, lifetime_sec, expiry_unix,
+  permissions_list, channels_list, last_activity_unix, auth_realm,
+  auth_nonce).
+* `port_pool` -- list of available relay ports, default
+  49152..65535 (RFC 5766 §6.2 ephemeral). Tests can shrink the
+  range via `turn_server_init_with_port_range(low, high, ip)`.
+* `port_pool_next` -- round-robin allocator cursor; advanced
+  modulo pool size on each pop.
+* `active_allocations_count` -- mirrors `len(allocations_list)`.
+* Eight counter slots: `stats_allocates_received`, `_granted`,
+  `_rejected`, `_refreshes`, `_permissions_granted`,
+  `_channels_bound`, `_data_forwarded`, `_expired`.
+* `realm` (default `"crossengin.local"`) + `nonce_counter` (monotonic).
+* `relay_ip_v4` -- pre-computed 4-byte buf for response composition.
+
+### Request handlers
+
+`turn_server_handle_allocate(state, recv_buf, n, client_addr, now)`
+walks attributes via R34B's `_turn_walk_attrs`, verifies method +
+class, then runs the 7-step decision:
+
+1. USERNAME + MESSAGE-INTEGRITY absent -> emit 401 with REALM +
+   NONCE via `turn_server_emit_401_response`. The nonce is freshly
+   issued (`ce-nonce-N` with monotonic N); the realm is the
+   server-configured string. The 401 is parseable via R34B's
+   `turn_parse_401_response`.
+2. Per-allocation cached nonce doesn't match the supplied NONCE
+   attribute on a same-client retry -> emit 438 Stale Nonce.
+3. REQUESTED-TRANSPORT != 17 (UDP) -> emit 442 Unsupported
+   Transport Protocol.
+4. Port pool empty -> emit 508 Insufficient Capacity.
+5. Same client already has an allocation -> emit 437 Allocation
+   Mismatch (RFC 5766 §6.2 forbids re-allocate without a prior
+   Refresh-with-lifetime=0 delete).
+6. Otherwise: pop a port from the pool, build the allocation
+   record, append to `allocations_list`, bump counters, emit
+   success via R34B's `turn_emit_allocate_success_response` with
+   the relay (IP, port) + client (mapped IP, port).
+
+`turn_server_handle_refresh` -- 437 if no allocation; lifetime=0
+-> delete record + return port to pool, emit success w/
+lifetime=0; lifetime>0 -> extend expiry to `now + lifetime`, emit
+success.
+
+`turn_server_handle_create_permission` -- 437 if no allocation;
+parse all XOR-PEER-ADDRESS attrs; for each peer append (or update
+expiry) in `permissions_list` with expiry = `now + 300` (RFC 5766
+§8); emit success via R34B's empty-body
+`turn_emit_create_permission_success_response`.
+
+`turn_server_handle_channel_bind` -- 437 if no allocation; reject
+channel_num outside [0x4000, 0x7FFE] with 400; reject same-channel-
+different-peer with 400 conflict; same-channel-same-peer is an
+idempotent refresh (stamp new expiry); success appends to
+`channels_list` with expiry = `now + 600` (RFC 5766 §11) AND
+auto-adds a permission (RFC 5766 §11.2 implicit-permission rule).
+Emits success via R34B's `turn_emit_channel_bind_success_response`.
+
+`turn_server_handle_send` -- look up allocation; if none, drop
+silently; parse XOR-PEER-ADDRESS + DATA; check the peer has an
+active permission OR an active channel binding; if neither, drop
+silently (RFC 5766 §10.3); on success return `[peer_ip,
+peer_port, data_buf, data_n]` for the wire driver to forward.
+The data_buf pointer aliases the original recv_buf (the caller
+must keep recv_buf alive while using the result; for tests we
+inspect immediately).
+
+### Tick
+
+`turn_server_tick(state, now)` walks `allocations_list` back-to-
+front (so `list_remove` doesn't shift the live cursor) and:
+
+* Removes any allocation where `expiry_unix < now`, returning its
+  port to the pool and bumping `stats_expired`.
+* Within each surviving allocation, walks `permissions_list`
+  back-to-front and removes entries where `expiry < now`.
+* Likewise for `channels_list`.
+* Returns `[n_alloc_expired, n_perm_expired, n_chan_expired]`.
+
+### R34B "build success response" helpers -- which existed, which duplicated
+
+R34B already ships:
+
+* `turn_emit_allocate_success_response`
+* `turn_emit_allocate_error_response`
+* `turn_emit_refresh_success_response`
+* `turn_emit_refresh_error_response` (via
+  `_turn_emit_method_error_response`)
+* `turn_emit_create_permission_success_response`
+* `turn_emit_create_permission_error_response`
+* `turn_emit_channel_bind_success_response`
+* `turn_emit_channel_bind_error_response`
+
+R38C consumes all eight directly. The SINGLE locally-duplicated
+helper is `turn_server_emit_401_response`, which composes
+ERROR-CODE + REALM + NONCE -- R34B's `turn_emit_allocate_error_response`
+only carries ERROR-CODE, but a 401 Unauthorized response MUST also
+carry REALM + NONCE so the client can build a credentialed retry
+(RFC 5389 §10.1.2). The duplication is documented in the file
+header (~50 lines including TLV header writers, attribute pad,
+and string-attr emit -- the same shape R34B uses internally).
+
+### Verification
+
+* **`tests/unit/test_turn_server.nova`** (NEW, 111 assertions
+  across 27 test functions).
+* **All 405 prior `tests/unit/test_turn.nova` assertions remain
+  byte-identical** (turn.nova not modified by R38C; R38D's
+  concurrent SCRAM additions are independent).
+* **All 142 prior `tests/unit/test_ice_turn.nova` assertions
+  remain byte-identical** (ice_turn.nova not modified by R38C).
+
+### Honest design caveats
+
+1. **No socket I/O.** The wire driver (a future round) hooks up
+   the UDP listener, parses incoming packets, dispatches to
+   these handlers, and sends responses + forwards data to peers.
+   R38C is pure-state -- the state machine could plug into a
+   wire driver.
+2. **No HMAC-SHA1 verification.** Any message with USERNAME +
+   MESSAGE-INTEGRITY attributes is accepted as credentialed; the
+   401 challenge path IS modeled (first allocate w/o creds
+   returns 401 + REALM + NONCE; credentialed retry accepted via
+   R34B/R36A's `turn_emit_allocate_request_authed`). A future
+   round can wire in the server-side credential database + run
+   `turn_verify_message_integrity` (R36A) before granting the
+   allocation. This is the equivalent of R35B's "in-flight
+   transaction tracking" gap on the client side -- structurally
+   supported, not consulted.
+3. **No EVEN-PORT / RESERVATION-TOKEN.** RFC 5766 §6.1 lets
+   clients request even-numbered ports + reservation tokens for
+   the RTP/RTCP pair. R38C always pops the next available port
+   from the pool (round-robin). A future round can extend the
+   port selector.
+4. **No kernel buffer pressure simulation.** Send-to-peer just
+   surfaces the destination + data; a real relay would have to
+   manage UDP send buffers, ICMP unreachable feedback, etc.
+5. **No concurrent-client serialization model.** The handlers are
+   not thread-safe; a real wire driver would serialize via a
+   single event loop or per-allocation lock.
+
+### Concurrency vs. R38D (additive SCRAM extension)
+
+R38D (SCRAM-SHA-256 auth path, RFC 7635) is concurrently
+extending `src/federation/turn.nova` with `src/safety/scram.nova`
+and `tests/unit/test_scram.nova`. The brief explicitly notes the
+additions are additive-only and R34B's exports remain byte-stable.
+R38C imports turn.nova read-only and depends on R34B / R35B / R36A
+surface exclusively; R38D's additions do not affect the R38C
+contract. Pre-commit verification: stashed R38D's WIP via
+`R38C-sibling-quarantine-r38d-scram`, recompiled + re-ran R38C's
+111 assertions clean, then popped the stash back immediately per
+stash discipline.
+
+### R38C does not modify any sibling-agent file
+
+Only `turn_server.nova` (NEW), `test_turn_server.nova` (NEW),
+README.md (R38C banner + status-table cell), NEXT_SESSION.md
+(R38C section), and FEDERATED_AUDIT.md (this section) are touched.
+turn.nova / ice_turn.nova / dtls12.nova / srtp.nova / safety/* /
+ice.nova / stun_rfc8489.nova are untouched. R38B (DTLS PRF rekey),
+R38D (SCRAM), R38E (LSP), and R38F (DAP) all operate on different
+files and cannot collide with R38C.

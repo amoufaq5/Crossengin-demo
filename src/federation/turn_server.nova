@@ -1,0 +1,1284 @@
+// CrossEngin federation: SERVER-side TURN state machine (R38C / R34B.3 / R35B.3).
+//
+// Purpose
+//
+//   R34B (`423a352`) shipped the TURN wire codec -- parse + emit for
+//   the six TURN message methods (Allocate / Refresh / Send / Data /
+//   CreatePermission / ChannelBind). R35B (`063824e` + `53490bf`)
+//   shipped the CLIENT-side allocation state machine that drives a
+//   single allocation lifecycle against a TURN server. R36A
+//   (`1f15e02`) added long-term-credential auth on top of the client
+//   path. None of those rounds modeled the TURN SERVER side -- R35B's
+//   exit caveat: "The TURN server's allocation pool, peer-side
+//   enforcement, and data forwarding are NOT modeled. RFC 5766 §6.2
+//   specifies how the server allocates ports; that's a future round
+//   if anyone needs to run a relay."
+//
+//   R38C is that future round. This module is the SERVER-side state
+//   machine: it accepts client TURN requests, tracks allocations,
+//   enforces per-peer permissions, manages channel bindings, and
+//   forwards data between clients and peers. It is PURE STATE -- no
+//   socket I/O. A wire driver (future round) hooks up the UDP
+//   listener, parses incoming packets, dispatches to these handlers,
+//   and sends responses + forwarded data.
+//
+// Architecture
+//
+//   * Allocations pool: list of allocation records, one per
+//     (client_addr -> relayed_port) tuple. Each record carries the
+//     client's auth realm/nonce, granted lifetime, expiry timestamp,
+//     permissions_list, channels_list, last_activity timestamp.
+//   * Port pool: round-robin allocator across the RFC 5766 §6.2
+//     ephemeral range (49152..65535). When the pool is exhausted
+//     we emit 508 Insufficient Capacity.
+//   * Request dispatch: turn_server_handle_allocate /
+//     _handle_refresh / _handle_create_permission /
+//     _handle_channel_bind / _handle_send. Each parses the incoming
+//     bytes with R34B's wire codec (READ-ONLY -- we do not modify
+//     turn.nova), validates against the current state, and emits a
+//     success or error response via locally-duplicated emit helpers.
+//   * Tick: turn_server_tick(state, current_time_unix) walks the
+//     allocations_list and prunes anything where expiry < now;
+//     within each allocation, prunes expired permissions + channels.
+//     Returns [n_alloc_expired, n_perm_expired, n_chan_expired].
+//
+// Why we duplicate the "success response" emit helpers locally
+//
+//   R34B is primarily a CLIENT codec -- it ships the request emitters
+//   (turn_emit_allocate_request, _refresh_request, etc.) and the
+//   response parsers (turn_parse_allocate_success_response, etc.).
+//   For the success-response emit side R34B ships a small "build
+//   helpers for response messages" section (used by R35B's state-
+//   machine tests to drive responses without spinning up a relay)
+//   that has Allocate / Refresh / CreatePermission / ChannelBind
+//   success + error emit helpers. We REUSE those rather than
+//   duplicating -- this matches the brief's option (a) "duplicate the
+//   inverse helpers locally" only as a fallback. The available
+//   exports from R34B are:
+//     - turn_emit_allocate_success_response(txn, ip_v4, port,
+//                                            lifetime_sec, mapped_ip,
+//                                            mapped_port)
+//     - turn_emit_allocate_error_response(txn, class_num, number,
+//                                         reason)
+//     - turn_emit_refresh_success_response(txn, lifetime_sec)
+//     - turn_emit_refresh_error_response(txn, class_num, number,
+//                                        reason)
+//     - turn_emit_create_permission_success_response(txn)
+//     - turn_emit_create_permission_error_response(txn, class_num,
+//                                                   number, reason)
+//     - turn_emit_channel_bind_success_response(txn)
+//     - turn_emit_channel_bind_error_response(txn, class_num,
+//                                              number, reason)
+//   That covers everything we need. The 401/438/442/508/437/400
+//   error responses for ALLOCATE specifically all go through
+//   turn_emit_allocate_error_response, and the corresponding
+//   refresh / perm / chanbind error responses go through their
+//   method-pinned siblings. We do NOT duplicate any of these locally.
+//
+//   What R34B does NOT export that we still need: a 401 response
+//   that includes REALM + NONCE attributes. R34B's
+//   turn_emit_allocate_error_response only carries ERROR-CODE; the
+//   401 response a client expects has ERROR-CODE + REALM + NONCE so
+//   it can build a credentialed retry. We add
+//   `turn_server_emit_401_response` LOCAL to this module that
+//   composes the base allocate-error-response shape plus the two
+//   extra attributes. This is the SINGLE duplicate path.
+//
+// What we do NOT model (honest expectations, future rounds)
+//
+//   * Socket I/O: no UDP listener, no kernel buffer pressure
+//     simulation, no concurrent-client serialization. The state
+//     machine could plug into a wire driver.
+//   * Concurrent allocations from the same client (TURN allows ONE
+//     allocation per (transport-tuple, server-tuple); this matches).
+//   * EVEN-PORT / RESERVATION-TOKEN attribute consumption (RFC 5766
+//     §6.1). We always pick the next available port from the pool.
+//   * IPv6 (TURN_FAMILY_IPV6) -- R34B explicitly rejects on parse;
+//     we inherit that.
+//   * Real authentication verification (HMAC-SHA1 check): we treat
+//     ANY message with USERNAME + MESSAGE-INTEGRITY attributes as
+//     credentialed and accept (relying on R34B's parse-tolerance).
+//     The 401 challenge path IS modeled: the first allocate without
+//     creds returns 401 + REALM + NONCE; the retry with creds is
+//     accepted. A future round can plumb in `turn_verify_message_integrity`
+//     once the server-side credential database is wired.
+//   * Stale-NONCE rejection (438): NONCE freshness is checked
+//     against the per-allocation cached nonce. If a client retries
+//     with a NONCE we did not issue, we emit 438.
+//   * Permission Refresh (CreatePermission with existing peer just
+//     re-stamps the expiry, RFC 5766 §9): we do this correctly.
+//   * Channel Refresh (ChannelBind for an existing binding just
+//     re-stamps the expiry, RFC 5766 §11): we do this correctly.
+//
+// Public API surface
+//
+//   State:
+//     turn_server_init()                                  -> state
+//     turn_server_set_realm(state, realm)                 -> 1
+//     turn_server_set_nonce_seed(state, seed_str)         -> 1
+//     turn_server_allocations_count(state)                -> int
+//     turn_server_port_pool_size(state)                   -> int
+//     turn_server_lookup_allocation(state, client_addr)   -> alloc | 0
+//     turn_server_stats_allocates_received(state)         -> int
+//     turn_server_stats_allocates_granted(state)          -> int
+//     turn_server_stats_allocates_rejected(state)         -> int
+//     turn_server_stats_refreshes(state)                  -> int
+//     turn_server_stats_permissions_granted(state)        -> int
+//     turn_server_stats_channels_bound(state)             -> int
+//     turn_server_stats_data_forwarded(state)             -> int
+//     turn_server_stats_expired(state)                    -> int
+//
+//   Handlers:
+//     turn_server_handle_allocate(state, recv_buf, n, client_addr,
+//                                 current_time_unix)
+//                                                  -> [resp_buf, resp_n]
+//     turn_server_handle_refresh(state, recv_buf, n, client_addr,
+//                                current_time_unix)
+//                                                  -> [resp_buf, resp_n]
+//     turn_server_handle_create_permission(state, recv_buf, n,
+//                                          client_addr,
+//                                          current_time_unix)
+//                                                  -> [resp_buf, resp_n]
+//     turn_server_handle_channel_bind(state, recv_buf, n,
+//                                     client_addr,
+//                                     current_time_unix)
+//                                                  -> [resp_buf, resp_n]
+//     turn_server_handle_send(state, recv_buf, n, client_addr,
+//                             current_time_unix)
+//                                                  -> [peer_ip, peer_port,
+//                                                      data_buf, data_n] | 0
+//     turn_server_tick(state, current_time_unix)
+//                                                  -> [n_alloc_expired,
+//                                                      n_perm_expired,
+//                                                      n_chan_expired]
+//
+// ADRs touched: registers an entry against the R28E.2 ADR-0094
+//   (STUN + TURN wire codec) lineage. No new ADR -- R38C is the
+//   server-side counterpart to R35B's client-side state machine.
+// NOVA dependencies: builtins (alloc, store8, load8, list_new, push,
+//   len, list_set, list_remove, int_to_str, str_eq, char_at, chr).
+// CrossEngin dependencies: src/federation/turn.nova (READ-ONLY --
+//   we use the wire codec + auth helpers without modifying them).
+
+import "./turn.nova"
+
+// ============================================================================
+//                              Protocol constants
+// ============================================================================
+//
+//   RFC 5766 §6.2 specifies the server's allocation behavior:
+//     * Pick a port from the local ephemeral range. Linux convention
+//       (and most TURN servers) is 49152..65535. Smaller test pools
+//       can be configured via turn_server_init_with_port_range.
+//     * Default lifetime 600 seconds; max 3600. R34B re-pins
+//       TURN_LIFETIME_DEFAULT=600 which we use.
+//     * Permission lifetime 300 seconds (RFC 5766 §8); channel
+//       lifetime 600 seconds (RFC 5766 §11). R34B/R36A re-pin
+//       both as TURN_PERM_LIFETIME_DEFAULT=300 and
+//       TURN_CHANNEL_LIFETIME_DEFAULT=600.
+
+let TURN_SERVER_PORT_RANGE_LOW   = 49152
+let TURN_SERVER_PORT_RANGE_HIGH  = 65535
+
+// Max allocation lifetime per RFC 5766 §6.2 (1 hour).
+let TURN_SERVER_LIFETIME_MAX     = 3600
+
+// Pool size to use when the brief calls for a "small" pool in tests --
+// kept small enough that exhaustion is reachable but large enough to
+// model multi-client. The default init builds the full 49152..65535
+// range; tests can construct a smaller pool via
+// turn_server_init_with_port_range.
+let TURN_SERVER_DEFAULT_REALM    = "crossengin.local"
+
+// Error response code numbers (RFC 5766 §15).
+let TURN_ERR_CODE_BAD_REQUEST           = 400
+let TURN_ERR_CODE_UNAUTHORIZED          = 401
+let TURN_ERR_CODE_ALLOCATION_MISMATCH   = 437
+let TURN_ERR_CODE_STALE_NONCE           = 438
+let TURN_ERR_CODE_UNSUPPORTED_TRANSPORT = 442
+let TURN_ERR_CODE_INSUFFICIENT_CAPACITY = 508
+
+// ============================================================================
+//                              State slot indices (positional list)
+// ============================================================================
+
+let _TS_ALLOCATIONS_LIST            = 0   // list of allocation records
+let _TS_PORT_POOL                   = 1   // list of available ports
+let _TS_PORT_POOL_NEXT              = 2   // round-robin allocator cursor
+let _TS_ACTIVE_ALLOCATIONS_COUNT    = 3
+let _TS_STATS_ALLOC_RECEIVED        = 4
+let _TS_STATS_ALLOC_GRANTED         = 5
+let _TS_STATS_ALLOC_REJECTED        = 6
+let _TS_STATS_REFRESHES             = 7
+let _TS_STATS_PERM_GRANTED          = 8
+let _TS_STATS_CHAN_BOUND            = 9
+let _TS_STATS_DATA_FORWARDED        = 10
+let _TS_STATS_EXPIRED               = 11
+let _TS_REALM                       = 12
+let _TS_NONCE_COUNTER               = 13  // monotonic counter for fresh nonces
+let _TS_RELAY_IP_V4                 = 14  // 4-byte buf of server relay IP
+let _TS_LEN                         = 15
+
+// ============================================================================
+//                              Allocation record slot indices
+// ============================================================================
+
+let _AL_CLIENT_ADDR_BUF      = 0   // 6-byte buf: 4 ip + 2 port
+let _AL_RELAYED_PORT         = 1
+let _AL_LIFETIME_SEC         = 2
+let _AL_EXPIRY_UNIX          = 3
+let _AL_PERMISSIONS_LIST     = 4   // list of [peer_ip_str, peer_port, expiry]
+let _AL_CHANNELS_LIST        = 5   // list of [chan_num, ip, port, expiry]
+let _AL_LAST_ACTIVITY_UNIX   = 6
+let _AL_AUTH_REALM           = 7
+let _AL_AUTH_NONCE           = 8   // string the server issued for this alloc
+let _AL_LEN                  = 9
+
+// ============================================================================
+//                              client_addr helpers
+// ============================================================================
+//
+//   The brief calls for client_addr to be IPv4 (4 bytes) + port (2 bytes)
+//   = 6 bytes. We accept it as a 6-byte buffer. We also accept a packed
+//   string form ("a.b.c.d:port") for test ergonomics. Comparison is
+//   byte-wise over the 6 bytes.
+
+fn _ts_alloc_client_addr_buf(ip_str, port) {
+    let ip_buf = turn_ipv4_str_to_buf(ip_str)
+    if ip_buf == 0 { return 0 }
+    let out = alloc(7)
+    let i = 0
+    while i < 4 { store8(out + i, load8(ip_buf + i)); i = i + 1 }
+    store8(out + 4, int_and(int_shr(port, 8), 255))
+    store8(out + 5, int_and(port, 255))
+    store8(out + 6, 0)
+    return out
+}
+
+fn _ts_client_addr_eq(a, b) {
+    if a == 0 { return 0 }
+    if b == 0 { return 0 }
+    let i = 0
+    while i < 6 {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Public helper: tests + future wire driver build client_addr buffers.
+fn turn_server_make_client_addr(ip_str, port) {
+    return _ts_alloc_client_addr_buf(ip_str, port)
+}
+
+// ============================================================================
+//                              Init
+// ============================================================================
+
+fn turn_server_init_with_port_range(low, high, relay_ip_str) {
+    let st = list_new()
+    push(st, list_new())             // 0  ALLOCATIONS_LIST
+    let pool = list_new()
+    let p = low
+    while p <= high {
+        push(pool, p)
+        p = p + 1
+    }
+    push(st, pool)                   // 1  PORT_POOL
+    push(st, 0)                      // 2  PORT_POOL_NEXT
+    push(st, 0)                      // 3  ACTIVE_ALLOCATIONS_COUNT
+    push(st, 0)                      // 4  STATS_ALLOC_RECEIVED
+    push(st, 0)                      // 5  STATS_ALLOC_GRANTED
+    push(st, 0)                      // 6  STATS_ALLOC_REJECTED
+    push(st, 0)                      // 7  STATS_REFRESHES
+    push(st, 0)                      // 8  STATS_PERM_GRANTED
+    push(st, 0)                      // 9  STATS_CHAN_BOUND
+    push(st, 0)                      // 10 STATS_DATA_FORWARDED
+    push(st, 0)                      // 11 STATS_EXPIRED
+    push(st, TURN_SERVER_DEFAULT_REALM)  // 12 REALM
+    push(st, 0)                      // 13 NONCE_COUNTER
+    // Pre-compute the 4-byte relay-IP buf for response composition.
+    let rb = turn_ipv4_str_to_buf(relay_ip_str)
+    if rb == 0 {
+        // Fall back to 0.0.0.0 -- callers that care should pass a
+        // valid IP; tests rely on this so the init still returns a
+        // usable state even when called without an IP.
+        rb = alloc(5)
+        store8(rb + 0, 0)
+        store8(rb + 1, 0)
+        store8(rb + 2, 0)
+        store8(rb + 3, 0)
+        store8(rb + 4, 0)
+    }
+    push(st, rb)                     // 14 RELAY_IP_V4 (4-byte buf)
+    return st
+}
+
+// Default init: full 49152..65535 ephemeral range, relay IP 127.0.0.1.
+fn turn_server_init() {
+    return turn_server_init_with_port_range(TURN_SERVER_PORT_RANGE_LOW,
+                                            TURN_SERVER_PORT_RANGE_HIGH,
+                                            "127.0.0.1")
+}
+
+// ============================================================================
+//                              Read accessors
+// ============================================================================
+
+fn turn_server_allocations_count(state) {
+    return state[_TS_ACTIVE_ALLOCATIONS_COUNT]
+}
+
+fn turn_server_port_pool_size(state) {
+    return len(state[_TS_PORT_POOL])
+}
+
+fn turn_server_realm(state) { return state[_TS_REALM] }
+
+fn turn_server_stats_allocates_received(state) {
+    return state[_TS_STATS_ALLOC_RECEIVED]
+}
+fn turn_server_stats_allocates_granted(state) {
+    return state[_TS_STATS_ALLOC_GRANTED]
+}
+fn turn_server_stats_allocates_rejected(state) {
+    return state[_TS_STATS_ALLOC_REJECTED]
+}
+fn turn_server_stats_refreshes(state) {
+    return state[_TS_STATS_REFRESHES]
+}
+fn turn_server_stats_permissions_granted(state) {
+    return state[_TS_STATS_PERM_GRANTED]
+}
+fn turn_server_stats_channels_bound(state) {
+    return state[_TS_STATS_CHAN_BOUND]
+}
+fn turn_server_stats_data_forwarded(state) {
+    return state[_TS_STATS_DATA_FORWARDED]
+}
+fn turn_server_stats_expired(state) {
+    return state[_TS_STATS_EXPIRED]
+}
+
+fn turn_server_set_realm(state, realm) {
+    list_set(state, _TS_REALM, realm)
+    return 1
+}
+
+// ============================================================================
+//                              Allocation lookup
+// ============================================================================
+
+fn turn_server_lookup_allocation(state, client_addr) {
+    let allocs = state[_TS_ALLOCATIONS_LIST]
+    let n = len(allocs)
+    let i = 0
+    while i < n {
+        let a = allocs[i]
+        if _ts_client_addr_eq(a[_AL_CLIENT_ADDR_BUF], client_addr) {
+            return a
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _ts_lookup_allocation_index(state, client_addr) {
+    let allocs = state[_TS_ALLOCATIONS_LIST]
+    let n = len(allocs)
+    let i = 0
+    while i < n {
+        let a = allocs[i]
+        if _ts_client_addr_eq(a[_AL_CLIENT_ADDR_BUF], client_addr) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ============================================================================
+//                              Port pool helpers
+// ============================================================================
+
+fn _ts_port_pool_pop_one(state) {
+    let pool = state[_TS_PORT_POOL]
+    let n = len(pool)
+    if n == 0 { return 0 - 1 }
+    // Round-robin: take the entry at PORT_POOL_NEXT, then advance the
+    // cursor mod len. We removeAt the cursor so subsequent allocates
+    // walk forward naturally. Wrap to 0 if we removed the last index.
+    let cursor = state[_TS_PORT_POOL_NEXT]
+    if cursor >= n { cursor = 0 }
+    let port = pool[cursor]
+    list_remove(pool, cursor)
+    // Cursor stays at the same index because we removed; if it now
+    // points past the end, wrap.
+    let new_n = n - 1
+    if cursor >= new_n { cursor = 0 }
+    list_set(state, _TS_PORT_POOL_NEXT, cursor)
+    return port
+}
+
+fn _ts_port_pool_return(state, port) {
+    push(state[_TS_PORT_POOL], port)
+    return 1
+}
+
+// ============================================================================
+//                              Nonce issuance
+// ============================================================================
+//
+// Per RFC 5766 §4, the server SHOULD issue a nonce that is freshly
+// generated for each Allocate. We use a monotonic counter stamped
+// into a deterministic string -- production servers MUST use a CSPRNG
+// + time, but for the state machine the deterministic form is
+// sufficient and testable.
+
+fn _ts_issue_nonce(state) {
+    let c = state[_TS_NONCE_COUNTER]
+    list_set(state, _TS_NONCE_COUNTER, c + 1)
+    return "ce-nonce-" + int_to_str(c)
+}
+
+// ============================================================================
+//                              Attribute extraction helpers
+// ============================================================================
+//
+// Pull a single attribute by type from a freshly-walked attribute list.
+// Returns either the [type, val_ptr, val_n] record or 0 if absent.
+
+fn _ts_find_attr(attrs, attr_type) {
+    let i = 0
+    while i < len(attrs) {
+        if attrs[i][0] == attr_type { return attrs[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _ts_find_all_attrs(attrs, attr_type) {
+    let out = list_new()
+    let i = 0
+    while i < len(attrs) {
+        if attrs[i][0] == attr_type { push(out, attrs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// Convert an attribute value buffer to a NOVA string.
+fn _ts_attr_value_str(attr) {
+    let p = attr[1]
+    let n = attr[2]
+    let s = ""
+    let i = 0
+    while i < n {
+        s = s + chr(load8(p + i))
+        i = i + 1
+    }
+    return s
+}
+
+// Decode an XOR-PEER-ADDRESS attribute value into [ip_str, port]. Uses
+// the same XOR-cookie scheme as R34B's _turn_decode_xor_addr.
+fn _ts_decode_xor_peer(attr) {
+    let p = attr[1]
+    let n = attr[2]
+    if n != 8 { return 0 }
+    let family = load8(p + 1)
+    if family != 1 { return 0 }
+    let cookie_hi = int_and(int_shr(554869826, 16), 65535)
+    let x_port_hi = load8(p + 2)
+    let x_port_lo = load8(p + 3)
+    let x_port = int_or(int_shl(x_port_hi, 8), x_port_lo)
+    let port = int_xor(x_port, cookie_hi)
+    let b0 = int_xor(load8(p + 4),
+                     int_and(int_shr(554869826, 24), 255))
+    let b1 = int_xor(load8(p + 5),
+                     int_and(int_shr(554869826, 16), 255))
+    let b2 = int_xor(load8(p + 6),
+                     int_and(int_shr(554869826, 8), 255))
+    let b3 = int_xor(load8(p + 7),
+                     int_and(554869826, 255))
+    let ip = int_to_str(b0) + "." + int_to_str(b1) + "."
+        + int_to_str(b2) + "." + int_to_str(b3)
+    let out = list_new()
+    push(out, ip)
+    push(out, port)
+    return out
+}
+
+// ============================================================================
+//                              401 response composer (LOCAL)
+// ============================================================================
+//
+// R34B's turn_emit_allocate_error_response only carries ERROR-CODE.
+// A 401 Unauthorized response MUST also carry REALM + NONCE so the
+// client can compose a credentialed retry (RFC 5389 §10.1.2). This is
+// the SINGLE locally-duplicated emit helper -- everything else
+// (refresh-error, perm-error, chanbind-error, allocate-success,
+// refresh-success, etc.) comes through R34B.
+//
+// Wire layout:
+//   STUN header (20 bytes)
+//   ERROR-CODE attribute (4B header + 4B + len(reason), padded)
+//   REALM attribute (4B header + len(realm), padded)
+//   NONCE attribute (4B header + len(nonce), padded)
+
+fn _ts_pad4(n) {
+    let r = n - int_shl(int_shr(n, 2), 2)
+    if r == 0 { return n }
+    return n + (4 - r)
+}
+
+fn _ts_attr_size(value_len) {
+    return 4 + _ts_pad4(value_len)
+}
+
+fn _ts_put_u16(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 1, int_and(v, 255))
+    return 1
+}
+
+fn _ts_put_u32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+fn _ts_put_header(buf, msg_type, body_length, txn_id_buf) {
+    _ts_put_u16(buf, 0, msg_type)
+    _ts_put_u16(buf, 2, body_length)
+    _ts_put_u32(buf, 4, 554869826)        // TURN_MAGIC_COOKIE
+    let i = 0
+    while i < 12 {
+        store8(buf + 8 + i, load8(txn_id_buf + i))
+        i = i + 1
+    }
+    return 1
+}
+
+fn _ts_zero_buf(buf, n) {
+    let i = 0
+    while i < n { store8(buf + i, 0); i = i + 1 }
+    return 1
+}
+
+fn _ts_emit_str_attr(buf, off, attr_type, s) {
+    let n = len(s)
+    _ts_put_u16(buf, off + 0, attr_type)
+    _ts_put_u16(buf, off + 2, n)
+    let i = 0
+    while i < n {
+        store8(buf + off + 4 + i, char_at(s, i))
+        i = i + 1
+    }
+    let pad_to = _ts_pad4(n)
+    let j = n
+    while j < pad_to {
+        store8(buf + off + 4 + j, 0)
+        j = j + 1
+    }
+    return off + 4 + pad_to
+}
+
+// Compose a 401 Unauthorized Allocate Error response with REALM +
+// NONCE. The reason phrase defaults to "Unauthorized".
+fn turn_server_emit_401_response(txn_id_buf, realm, nonce) {
+    let reason = "Unauthorized"
+    let reason_n = len(reason)
+    let err_val_n = 4 + reason_n
+    let body = _ts_attr_size(err_val_n)
+              + _ts_attr_size(len(realm))
+              + _ts_attr_size(len(nonce))
+    let total = 20 + body
+    let buf = alloc(total + 1)
+    _ts_zero_buf(buf, total)
+    // Allocate Error message type = 0x0113.
+    let mtype = turn_msg_type_pack(TURN_METHOD_ALLOCATE, TURN_CLASS_ERROR_RESP)
+    _ts_put_header(buf, mtype, body, txn_id_buf)
+    let off = 20
+    // ERROR-CODE attribute (RFC 8489 §14.8): class*100 + number = 401.
+    _ts_put_u16(buf, off + 0, TURN_ATTR_ERROR_CODE)
+    _ts_put_u16(buf, off + 2, err_val_n)
+    store8(buf + off + 4, 0)
+    store8(buf + off + 5, 0)
+    store8(buf + off + 6, 4)          // class
+    store8(buf + off + 7, 1)          // number
+    let k = 0
+    while k < reason_n {
+        store8(buf + off + 8 + k, char_at(reason, k))
+        k = k + 1
+    }
+    off = off + _ts_attr_size(err_val_n)
+    // REALM attribute.
+    off = _ts_emit_str_attr(buf, off, TURN_ATTR_REALM, realm)
+    // NONCE attribute.
+    off = _ts_emit_str_attr(buf, off, TURN_ATTR_NONCE, nonce)
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, off)
+    return out
+}
+
+// Extract the 12-byte txn id pointer from a recv buffer. Assumes the
+// buffer is at least 20 bytes (the caller has already done a classify).
+fn _ts_txn_id_ptr(recv_buf) {
+    return recv_buf + 8
+}
+
+// Copy 12-byte txn id from the recv buffer so the response buffer can
+// echo it. We copy to be safe in case the recv buffer is freed before
+// the response is sent.
+fn _ts_dup_txn_id(recv_buf) {
+    let dst = alloc(13)
+    let i = 0
+    while i < 12 {
+        store8(dst + i, load8(recv_buf + 8 + i))
+        i = i + 1
+    }
+    store8(dst + 12, 0)
+    return dst
+}
+
+// ============================================================================
+//                              Allocation record construction
+// ============================================================================
+
+fn _ts_alloc_make_record(client_addr_buf, relayed_port, lifetime_sec,
+                         current_time_unix, realm, nonce) {
+    let rec = list_new()
+    // Duplicate the client_addr buf so caller can free its copy.
+    let cab = alloc(7)
+    let i = 0
+    while i < 6 { store8(cab + i, load8(client_addr_buf + i)); i = i + 1 }
+    store8(cab + 6, 0)
+    push(rec, cab)                                      // 0 CLIENT_ADDR_BUF
+    push(rec, relayed_port)                             // 1 RELAYED_PORT
+    push(rec, lifetime_sec)                             // 2 LIFETIME_SEC
+    push(rec, current_time_unix + lifetime_sec)         // 3 EXPIRY_UNIX
+    push(rec, list_new())                               // 4 PERMISSIONS_LIST
+    push(rec, list_new())                               // 5 CHANNELS_LIST
+    push(rec, current_time_unix)                        // 6 LAST_ACTIVITY_UNIX
+    push(rec, realm)                                    // 7 AUTH_REALM
+    push(rec, nonce)                                    // 8 AUTH_NONCE
+    return rec
+}
+
+// ============================================================================
+//                              turn_server_handle_allocate
+// ============================================================================
+//
+// Decision tree:
+//   1. Parse the request. Header bad -> ignore (return 0).
+//   2. Check method=ALLOCATE, class=REQUEST. Otherwise return 0.
+//   3. Check USERNAME + MESSAGE-INTEGRITY presence. If absent ->
+//      issue 401 with REALM + NONCE.
+//   4. If present, look up the per-allocation cached nonce. If the
+//      one the client sent doesn't match -> 438 Stale Nonce.
+//   5. Check REQUESTED-TRANSPORT == 17 (UDP). Else 442.
+//   6. Check the port pool has at least one free port. Else 508.
+//   7. Otherwise: pop a port, build the allocation record, append
+//      to allocations_list, emit success response.
+
+fn turn_server_handle_allocate(state, recv_buf, n, client_addr,
+                               current_time_unix) {
+    list_set(state, _TS_STATS_ALLOC_RECEIVED,
+             state[_TS_STATS_ALLOC_RECEIVED] + 1)
+
+    // Step 1: walk the attributes (also validates the header).
+    let r = _turn_walk_attrs(recv_buf, n)
+    if r[0] < 0 {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return 0
+    }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(recv_buf, 0))
+    if mc[0] != TURN_METHOD_ALLOCATE {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return 0
+    }
+    if mc[1] != TURN_CLASS_REQUEST {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return 0
+    }
+
+    let txn_id = _ts_dup_txn_id(recv_buf)
+
+    // Step 3: check for auth attributes. If absent or incomplete -> 401.
+    let username = _ts_find_attr(attrs, TURN_ATTR_USERNAME)
+    let mi       = _ts_find_attr(attrs, TURN_ATTR_MESSAGE_INTEGRITY)
+    if username == 0 {
+        let nonce = _ts_issue_nonce(state)
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_server_emit_401_response(txn_id, state[_TS_REALM], nonce)
+    }
+    if mi == 0 {
+        let nonce = _ts_issue_nonce(state)
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_server_emit_401_response(txn_id, state[_TS_REALM], nonce)
+    }
+
+    // Step 4: check NONCE freshness. If the client supplied a nonce we
+    // do not recognize for any allocation OR we have no record yet,
+    // we treat it as "first credentialed retry against the issued nonce" --
+    // i.e., accept on the first credentialed attempt because we don't
+    // store pre-allocation nonces (they're issued in the 401 path,
+    // round-trip back, and bound to the allocation record AT ALLOCATE
+    // ACCEPT time). A real server would cache pending-nonces; we
+    // accept any nonce-attribute-present credentialed retry as the
+    // path-forward to allocation.
+    //
+    // For STALE NONCE we check: if an existing allocation for this
+    // client carries an auth_nonce that does NOT match the supplied
+    // nonce attr, that means the client is using an outdated nonce --
+    // 438.
+    let supplied_nonce = _ts_find_attr(attrs, TURN_ATTR_NONCE)
+    let existing = turn_server_lookup_allocation(state, client_addr)
+    if existing != 0 {
+        if supplied_nonce != 0 {
+            let supplied_str = _ts_attr_value_str(supplied_nonce)
+            if str_eq(supplied_str, existing[_AL_AUTH_NONCE]) == 0 {
+                list_set(state, _TS_STATS_ALLOC_REJECTED,
+                         state[_TS_STATS_ALLOC_REJECTED] + 1)
+                return turn_emit_allocate_error_response(txn_id, 4, 38,
+                                                          "Stale Nonce")
+            }
+        }
+    }
+
+    // Step 5: check REQUESTED-TRANSPORT == UDP-17. Reject otherwise.
+    let rt = _ts_find_attr(attrs, TURN_ATTR_REQUESTED_TRANSPORT)
+    if rt == 0 {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_emit_allocate_error_response(txn_id, 4, 42,
+                                                  "Unsupported Transport Protocol")
+    }
+    let transport = load8(rt[1])
+    if transport != TURN_TRANSPORT_UDP {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_emit_allocate_error_response(txn_id, 4, 42,
+                                                  "Unsupported Transport Protocol")
+    }
+
+    // Step 6: check the port pool. If exhausted, 508.
+    if len(state[_TS_PORT_POOL]) == 0 {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_emit_allocate_error_response(txn_id, 5, 8,
+                                                  "Insufficient Capacity")
+    }
+
+    // Step 7: assemble the allocation. Determine lifetime: clamp to
+    // [0, TURN_SERVER_LIFETIME_MAX]; missing -> default 600.
+    let lifetime = TURN_LIFETIME_DEFAULT
+    let lt_attr = _ts_find_attr(attrs, TURN_ATTR_LIFETIME)
+    if lt_attr != 0 {
+        lifetime = _turn_get_u32(lt_attr[1], 0)
+        if lifetime > TURN_SERVER_LIFETIME_MAX {
+            lifetime = TURN_SERVER_LIFETIME_MAX
+        }
+        if lifetime < 0 { lifetime = TURN_LIFETIME_DEFAULT }
+    }
+
+    let port = _ts_port_pool_pop_one(state)
+    if port < 0 {
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_emit_allocate_error_response(txn_id, 5, 8,
+                                                  "Insufficient Capacity")
+    }
+
+    // Bind / rebind the allocation. If one already exists for this
+    // client_addr, we're re-allocating after an Allocate Refresh
+    // delete -- replace its record. The brief calls for ONE allocation
+    // per client; here we honor that by removing the existing entry
+    // before pushing the new one. (RFC 5766 §6.2: 437 Allocation
+    // Mismatch when a second Allocate arrives for the same client; we
+    // diverge by accepting after a delete, since a fresh allocation
+    // with a different relay port is the correct outcome.)
+    let prev_idx = _ts_lookup_allocation_index(state, client_addr)
+    if prev_idx >= 0 {
+        // Same-client re-allocate WITHOUT a prior delete -> 437.
+        // Recover the port we already popped (don't leak it).
+        _ts_port_pool_return(state, port)
+        list_set(state, _TS_STATS_ALLOC_REJECTED,
+                 state[_TS_STATS_ALLOC_REJECTED] + 1)
+        return turn_emit_allocate_error_response(txn_id, 4, 37,
+                                                  "Allocation Mismatch")
+    }
+
+    // Use the nonce attribute the client echoed back; if absent, use
+    // a freshly-issued one (server's choice).
+    let nonce_for_record = ""
+    if supplied_nonce != 0 {
+        nonce_for_record = _ts_attr_value_str(supplied_nonce)
+    } else {
+        nonce_for_record = _ts_issue_nonce(state)
+    }
+
+    let rec = _ts_alloc_make_record(client_addr, port, lifetime,
+                                    current_time_unix, state[_TS_REALM],
+                                    nonce_for_record)
+    push(state[_TS_ALLOCATIONS_LIST], rec)
+    list_set(state, _TS_ACTIVE_ALLOCATIONS_COUNT,
+             state[_TS_ACTIVE_ALLOCATIONS_COUNT] + 1)
+    list_set(state, _TS_STATS_ALLOC_GRANTED,
+             state[_TS_STATS_ALLOC_GRANTED] + 1)
+
+    // Extract client_addr's IP + port for the XOR-MAPPED-ADDRESS
+    // attribute the response carries.
+    let client_ip_buf = alloc(5)
+    let i = 0
+    while i < 4 { store8(client_ip_buf + i, load8(client_addr + i)); i = i + 1 }
+    store8(client_ip_buf + 4, 0)
+    let client_port_hi = load8(client_addr + 4)
+    let client_port_lo = load8(client_addr + 5)
+    let client_port = int_or(int_shl(client_port_hi, 8), client_port_lo)
+
+    return turn_emit_allocate_success_response(txn_id,
+                                                state[_TS_RELAY_IP_V4],
+                                                port, lifetime,
+                                                client_ip_buf, client_port)
+}
+
+// ============================================================================
+//                              turn_server_handle_refresh
+// ============================================================================
+//
+//   Refresh Request body = LIFETIME (4-byte value).
+//   * lifetime = 0  -> delete the allocation, return success with
+//                      lifetime=0 + return port to pool.
+//   * lifetime > 0  -> extend expiry, return success with new lifetime.
+//   * no allocation -> 437 Allocation Mismatch.
+
+fn turn_server_handle_refresh(state, recv_buf, n, client_addr,
+                              current_time_unix) {
+    let r = _turn_walk_attrs(recv_buf, n)
+    if r[0] < 0 { return 0 }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(recv_buf, 0))
+    if mc[0] != TURN_METHOD_REFRESH { return 0 }
+    if mc[1] != TURN_CLASS_REQUEST  { return 0 }
+
+    let txn_id = _ts_dup_txn_id(recv_buf)
+    let idx = _ts_lookup_allocation_index(state, client_addr)
+    if idx < 0 {
+        return _turn_emit_method_error_response(TURN_METHOD_REFRESH,
+                                                txn_id, 4, 37,
+                                                "Allocation Mismatch")
+    }
+
+    let allocs = state[_TS_ALLOCATIONS_LIST]
+    let rec = allocs[idx]
+    let lifetime = TURN_LIFETIME_DEFAULT
+    let lt_attr = _ts_find_attr(attrs, TURN_ATTR_LIFETIME)
+    if lt_attr != 0 {
+        lifetime = _turn_get_u32(lt_attr[1], 0)
+        if lifetime > TURN_SERVER_LIFETIME_MAX {
+            lifetime = TURN_SERVER_LIFETIME_MAX
+        }
+    }
+
+    list_set(state, _TS_STATS_REFRESHES,
+             state[_TS_STATS_REFRESHES] + 1)
+    list_set(rec, _AL_LAST_ACTIVITY_UNIX, current_time_unix)
+
+    if lifetime == 0 {
+        // Server-side delete: return port to pool, drop the record.
+        _ts_port_pool_return(state, rec[_AL_RELAYED_PORT])
+        list_remove(allocs, idx)
+        list_set(state, _TS_ACTIVE_ALLOCATIONS_COUNT,
+                 state[_TS_ACTIVE_ALLOCATIONS_COUNT] - 1)
+        return turn_emit_refresh_success_response(txn_id, 0)
+    }
+
+    // Extend the expiry.
+    list_set(rec, _AL_LIFETIME_SEC, lifetime)
+    list_set(rec, _AL_EXPIRY_UNIX, current_time_unix + lifetime)
+    return turn_emit_refresh_success_response(txn_id, lifetime)
+}
+
+// ============================================================================
+//                              turn_server_handle_create_permission
+// ============================================================================
+//
+// CreatePermission Request body = one or more XOR-PEER-ADDRESS attrs.
+// For each peer, append (or update if already present) an entry in
+// the allocation's permissions_list with expiry = now + 300.
+
+fn _ts_record_permission(perms, peer_ip, peer_port, expiry) {
+    // Update in place if a record already exists for this peer.
+    let i = 0
+    while i < len(perms) {
+        let p = perms[i]
+        if str_eq(p[0], peer_ip) {
+            if p[1] == peer_port {
+                list_set(p, 2, expiry)
+                return 0
+            }
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_ip)
+    push(rec, peer_port)
+    push(rec, expiry)
+    push(perms, rec)
+    return 1
+}
+
+fn turn_server_handle_create_permission(state, recv_buf, n, client_addr,
+                                        current_time_unix) {
+    let r = _turn_walk_attrs(recv_buf, n)
+    if r[0] < 0 { return 0 }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(recv_buf, 0))
+    if mc[0] != TURN_METHOD_CREATE_PERMISSION { return 0 }
+    if mc[1] != TURN_CLASS_REQUEST            { return 0 }
+
+    let txn_id = _ts_dup_txn_id(recv_buf)
+    let rec = turn_server_lookup_allocation(state, client_addr)
+    if rec == 0 {
+        return turn_emit_create_permission_error_response(txn_id, 4, 37,
+                                                           "Allocation Mismatch")
+    }
+
+    let peer_attrs = _ts_find_all_attrs(attrs, TURN_ATTR_XOR_PEER_ADDRESS)
+    if len(peer_attrs) == 0 {
+        return turn_emit_create_permission_error_response(txn_id, 4, 0,
+                                                           "Bad Request")
+    }
+
+    let expiry = current_time_unix + TURN_PERM_LIFETIME_DEFAULT
+    let perms  = rec[_AL_PERMISSIONS_LIST]
+    let i = 0
+    while i < len(peer_attrs) {
+        let dec = _ts_decode_xor_peer(peer_attrs[i])
+        if dec == 0 {
+            // IPv6 or malformed -- bail with 400.
+            return turn_emit_create_permission_error_response(txn_id, 4, 0,
+                                                               "Bad Request")
+        }
+        let added = _ts_record_permission(perms, dec[0], dec[1], expiry)
+        if added != 0 {
+            list_set(state, _TS_STATS_PERM_GRANTED,
+                     state[_TS_STATS_PERM_GRANTED] + 1)
+        }
+        i = i + 1
+    }
+    list_set(rec, _AL_LAST_ACTIVITY_UNIX, current_time_unix)
+    return turn_emit_create_permission_success_response(txn_id)
+}
+
+// ============================================================================
+//                              turn_server_handle_channel_bind
+// ============================================================================
+//
+// ChannelBind Request body = CHANNEL-NUMBER + XOR-PEER-ADDRESS.
+//
+// Rules (RFC 5766 §11):
+//   * channel_num MUST be in [0x4000, 0x7FFE]. Otherwise 400.
+//   * Same channel_num + same peer -> refresh expiry (idempotent).
+//   * Same channel_num + different peer -> 400 (conflict).
+//   * Different channel_num + same peer -> 400 (RFC requires 1:1
+//     mapping between channel and peer). We enforce this.
+//   * Otherwise: append the binding + auto-add an equivalent
+//     permission entry (RFC 5766 §11.2: a channel binding implies a
+//     permission). Expiry = now + 600.
+
+fn _ts_record_channel(chans, chan_num, peer_ip, peer_port, expiry) {
+    // Same channel + same peer -> refresh expiry.
+    // Same channel + different peer -> -1 (conflict).
+    // Different channel + same peer -> -2 (conflict).
+    let i = 0
+    while i < len(chans) {
+        let c = chans[i]
+        if c[0] == chan_num {
+            if str_eq(c[1], peer_ip) {
+                if c[2] == peer_port {
+                    list_set(c, 3, expiry)
+                    return 0
+                }
+            }
+            return 0 - 1
+        }
+        if str_eq(c[1], peer_ip) {
+            if c[2] == peer_port {
+                return 0 - 2
+            }
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, chan_num)
+    push(rec, peer_ip)
+    push(rec, peer_port)
+    push(rec, expiry)
+    push(chans, rec)
+    return 1
+}
+
+fn turn_server_handle_channel_bind(state, recv_buf, n, client_addr,
+                                   current_time_unix) {
+    let r = _turn_walk_attrs(recv_buf, n)
+    if r[0] < 0 { return 0 }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(recv_buf, 0))
+    if mc[0] != TURN_METHOD_CHANNEL_BIND { return 0 }
+    if mc[1] != TURN_CLASS_REQUEST       { return 0 }
+
+    let txn_id = _ts_dup_txn_id(recv_buf)
+    let rec = turn_server_lookup_allocation(state, client_addr)
+    if rec == 0 {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 37,
+                                                      "Allocation Mismatch")
+    }
+
+    let ch_attr = _ts_find_attr(attrs, TURN_ATTR_CHANNEL_NUMBER)
+    let peer_attr = _ts_find_attr(attrs, TURN_ATTR_XOR_PEER_ADDRESS)
+    if ch_attr == 0 {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 0,
+                                                      "Bad Request")
+    }
+    if peer_attr == 0 {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 0,
+                                                      "Bad Request")
+    }
+    // CHANNEL-NUMBER layout: 16-bit channel + 16-bit RFFU. Read the
+    // top 16 bits.
+    let ch_hi = load8(ch_attr[1] + 0)
+    let ch_lo = load8(ch_attr[1] + 1)
+    let chan_num = int_or(int_shl(ch_hi, 8), ch_lo)
+    if chan_num < TURN_CHANNEL_MIN {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 0,
+                                                      "Bad Request")
+    }
+    if chan_num > TURN_CHANNEL_MAX {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 0,
+                                                      "Bad Request")
+    }
+    let dec = _ts_decode_xor_peer(peer_attr)
+    if dec == 0 {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 0,
+                                                      "Bad Request")
+    }
+
+    let expiry = current_time_unix + TURN_CHANNEL_LIFETIME_DEFAULT
+    let chans = rec[_AL_CHANNELS_LIST]
+    let result = _ts_record_channel(chans, chan_num, dec[0], dec[1], expiry)
+    if result < 0 {
+        return turn_emit_channel_bind_error_response(txn_id, 4, 0,
+                                                      "Bad Request")
+    }
+    if result > 0 {
+        list_set(state, _TS_STATS_CHAN_BOUND,
+                 state[_TS_STATS_CHAN_BOUND] + 1)
+        // Auto-add a permission for this peer (RFC 5766 §11.2: a
+        // channel binding implies a permission).
+        let perm_expiry = current_time_unix + TURN_PERM_LIFETIME_DEFAULT
+        let perms = rec[_AL_PERMISSIONS_LIST]
+        let added = _ts_record_permission(perms, dec[0], dec[1], perm_expiry)
+        if added != 0 {
+            list_set(state, _TS_STATS_PERM_GRANTED,
+                     state[_TS_STATS_PERM_GRANTED] + 1)
+        }
+    }
+    list_set(rec, _AL_LAST_ACTIVITY_UNIX, current_time_unix)
+    return turn_emit_channel_bind_success_response(txn_id)
+}
+
+// ============================================================================
+//                              turn_server_handle_send
+// ============================================================================
+//
+// Send Indication body = XOR-PEER-ADDRESS + DATA. The server's
+// behavior is:
+//   1. Look up the allocation for this client. If none, drop silently
+//      (a malicious / orphaned client should NOT be informed).
+//   2. Extract the peer + data attrs. If either is missing, drop.
+//   3. Check the peer has an active permission OR an active channel.
+//      If not, drop silently (RFC 5766 §10.3: "If no permission ...
+//      then the data MUST be silently discarded").
+//   4. Otherwise: return [peer_ip, peer_port, data_buf, data_n].
+//      The caller (wire driver) forwards these bytes to the peer.
+
+fn _ts_has_permission(perms, peer_ip, peer_port, current_time_unix) {
+    let i = 0
+    while i < len(perms) {
+        let p = perms[i]
+        if str_eq(p[0], peer_ip) {
+            if p[1] == peer_port {
+                if p[2] >= current_time_unix {
+                    return 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _ts_has_channel(chans, peer_ip, peer_port, current_time_unix) {
+    let i = 0
+    while i < len(chans) {
+        let c = chans[i]
+        if str_eq(c[1], peer_ip) {
+            if c[2] == peer_port {
+                if c[3] >= current_time_unix {
+                    return 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn turn_server_handle_send(state, recv_buf, n, client_addr,
+                           current_time_unix) {
+    let r = _turn_walk_attrs(recv_buf, n)
+    if r[0] < 0 { return 0 }
+    let attrs = r[1]
+    let mc = turn_msg_type_unpack(_turn_get_u16(recv_buf, 0))
+    if mc[0] != TURN_METHOD_SEND        { return 0 }
+    if mc[1] != TURN_CLASS_INDICATION   { return 0 }
+
+    let rec = turn_server_lookup_allocation(state, client_addr)
+    if rec == 0 { return 0 }       // Drop silently.
+
+    let peer_attr = _ts_find_attr(attrs, TURN_ATTR_XOR_PEER_ADDRESS)
+    if peer_attr == 0 { return 0 }
+    let data_attr = _ts_find_attr(attrs, TURN_ATTR_DATA)
+    if data_attr == 0 { return 0 }
+
+    let dec = _ts_decode_xor_peer(peer_attr)
+    if dec == 0 { return 0 }
+    let peer_ip   = dec[0]
+    let peer_port = dec[1]
+
+    let permitted = _ts_has_permission(rec[_AL_PERMISSIONS_LIST],
+                                       peer_ip, peer_port,
+                                       current_time_unix)
+    if permitted == 0 {
+        // Also check channels (a channel binding implies a permission).
+        let chan_ok = _ts_has_channel(rec[_AL_CHANNELS_LIST],
+                                      peer_ip, peer_port,
+                                      current_time_unix)
+        if chan_ok == 0 {
+            return 0           // Drop silently.
+        }
+    }
+
+    list_set(state, _TS_STATS_DATA_FORWARDED,
+             state[_TS_STATS_DATA_FORWARDED] + 1)
+    list_set(rec, _AL_LAST_ACTIVITY_UNIX, current_time_unix)
+
+    let out = list_new()
+    push(out, peer_ip)
+    push(out, peer_port)
+    push(out, data_attr[1])      // data_buf pointer (lifetime tied to recv_buf)
+    push(out, data_attr[2])      // data_n
+    return out
+}
+
+// ============================================================================
+//                              turn_server_tick
+// ============================================================================
+//
+// Walk the allocations_list and remove anything where expiry < now.
+// Within each surviving allocation, prune expired permissions +
+// channels. Returns a 3-element list:
+//   [n_alloc_expired, n_perm_expired, n_chan_expired]
+//
+// Walks back-to-front so removal does not shift the live cursor.
+
+fn turn_server_tick(state, current_time_unix) {
+    let allocs = state[_TS_ALLOCATIONS_LIST]
+    let n_alloc_expired = 0
+    let n_perm_expired  = 0
+    let n_chan_expired  = 0
+
+    let i = len(allocs) - 1
+    while i >= 0 {
+        let rec = allocs[i]
+        if rec[_AL_EXPIRY_UNIX] < current_time_unix {
+            _ts_port_pool_return(state, rec[_AL_RELAYED_PORT])
+            list_remove(allocs, i)
+            list_set(state, _TS_ACTIVE_ALLOCATIONS_COUNT,
+                     state[_TS_ACTIVE_ALLOCATIONS_COUNT] - 1)
+            n_alloc_expired = n_alloc_expired + 1
+        } else {
+            // Prune expired permissions within this allocation.
+            let perms = rec[_AL_PERMISSIONS_LIST]
+            let pi = len(perms) - 1
+            while pi >= 0 {
+                let pr = perms[pi]
+                if pr[2] < current_time_unix {
+                    list_remove(perms, pi)
+                    n_perm_expired = n_perm_expired + 1
+                }
+                pi = pi - 1
+            }
+            // Prune expired channels.
+            let chans = rec[_AL_CHANNELS_LIST]
+            let ci = len(chans) - 1
+            while ci >= 0 {
+                let cr = chans[ci]
+                if cr[3] < current_time_unix {
+                    list_remove(chans, ci)
+                    n_chan_expired = n_chan_expired + 1
+                }
+                ci = ci - 1
+            }
+        }
+        i = i - 1
+    }
+
+    list_set(state, _TS_STATS_EXPIRED,
+             state[_TS_STATS_EXPIRED] + n_alloc_expired)
+
+    let out = list_new()
+    push(out, n_alloc_expired)
+    push(out, n_perm_expired)
+    push(out, n_chan_expired)
+    return out
+}
+
+// ============================================================================
+//                              Test-only shims
+// ============================================================================
+//
+// The state-machine tests need to construct credentialed Allocate
+// requests, then drive them through the server. R34B exposes
+// turn_emit_allocate_request_authed which is the canonical path; the
+// shim here is a convenience for accessing the realm + nonce the
+// server issued in the 401 response so the test can echo them back.
+
+fn _ts_test_lookup_allocation(state, client_addr) {
+    return turn_server_lookup_allocation(state, client_addr)
+}
+
+fn _ts_test_record_permission(perms, peer_ip, peer_port, expiry) {
+    return _ts_record_permission(perms, peer_ip, peer_port, expiry)
+}
+
+fn _ts_test_decode_xor_peer(attr) {
+    return _ts_decode_xor_peer(attr)
+}
+
+fn _ts_test_issue_nonce(state) {
+    return _ts_issue_nonce(state)
+}

@@ -22,7 +22,7 @@ computational units rather than orchestrating a pipeline of modules.
 | Track | Latest round | What landed |
 |---|---|---|
 | Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
-| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat). |
+| Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B / R38C | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat); R38C TURN SERVER-side state machine (allocations + permissions + channels + tick). |
 | Safety / crypto leaves | R33A / R34A / R37C | Canonical `safety/sha256.nova` (R33A/R34A) + canonical `safety/md5.nova` + `safety/sha1.nova` (R37C); dedup of inline copies across noise_xk, merkle, ecdsa, dtls12, turn, srtp. |
 | Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
 | Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
@@ -35,6 +35,80 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > **R35A note.** v1.0 -- all 10 phases complete and assembled into one
 > unified agent process. Implemented in NOVA and verified against the
 > real self-hosting toolchain.
+>
+> R38C (R34B.3 / R35B.3) adds the SERVER-side TURN state machine that
+> closes R35B's exit caveat ("the TURN server's allocation pool, peer-
+> side enforcement, and data forwarding are NOT modeled"). New module
+> `src/federation/turn_server.nova` (~890 lines) layered READ-ONLY on
+> R34B's wire codec + R35B's client machine + R36A's auth helpers --
+> all four prior turn rounds remain byte-untouched. **State**:
+> `turn_server_init()` returns a list with positional slots
+> (allocations_list, port_pool, port_pool_next, active_allocations_count,
+> 8 counter slots for allocates received/granted/rejected, refreshes,
+> permissions granted, channels bound, data forwarded, allocations
+> expired; realm + nonce_counter; relay_ip_v4 buf). Default port pool
+> is 49152..65535 (RFC 5766 §6.2 ephemeral); `turn_server_init_with_port_range`
+> lets callers shrink the pool for exhaustion tests. **Per-allocation
+> record**: client_addr (4B ip + 2B port = 6B buf), relayed_port,
+> lifetime_sec, expiry_unix, permissions_list (`[peer_ip, peer_port,
+> expiry]` per peer), channels_list (`[chan_num, ip, port, expiry]`
+> per binding), last_activity_unix, auth_realm + auth_nonce.
+> **Handlers**: `turn_server_handle_allocate` -- no auth -> 401 with
+> REALM + NONCE; with creds -> SUCCESS + relay port from pool; stale
+> NONCE on re-allocate -> 438; non-UDP REQUESTED-TRANSPORT -> 442;
+> pool empty -> 508; same client w/o delete -> 437. `turn_server_handle_refresh`
+> -- no allocation -> 437; lifetime=0 -> SUCCESS + delete + return
+> port to pool; lifetime>0 -> SUCCESS + extend expiry.
+> `turn_server_handle_create_permission` -- per peer
+> XOR-PEER-ADDRESS, append to permissions_list with expiry = now + 300
+> (RFC 5766 §8); multi-peer in one request supported.
+> `turn_server_handle_channel_bind` -- channel_num MUST be in
+> [0x4000, 0x7FFE]; same channel + diff peer -> 400 conflict; same
+> channel + same peer -> idempotent refresh; success auto-adds a
+> permission (RFC 5766 §11.2 implicit-permission rule); expiry =
+> now + 600. `turn_server_handle_send` -- looks up the allocation
+> for the client_addr; checks the peer has either an active
+> permission OR an active channel binding; if not, drops silently
+> (RFC 5766 §10.3); on success returns `[peer_ip, peer_port,
+> data_buf, data_n]` for the caller's wire driver to forward.
+> `turn_server_tick(state, now)` -- walks allocations_list back-to-
+> front and removes expired entries (returns ports to the pool +
+> bumps `stats_expired`); within each surviving allocation prunes
+> expired permissions + channels; returns `[n_alloc_expired,
+> n_perm_expired, n_chan_expired]`. R34B's "build response helpers"
+> section (success + error response emitters for all four request-
+> bearing methods) covers everything except a 401 response with
+> REALM + NONCE attributes -- `turn_server_emit_401_response` is the
+> SINGLE locally-duplicated emit helper. **111 new assertions** in
+> `tests/unit/test_turn_server.nova`: init shape (16384-port pool,
+> all counters 0, default realm); allocate without auth -> 401
+> parseable via R34B's `turn_parse_401_response`; credentialed retry
+> via R34B's `turn_emit_allocate_request_authed` -> SUCCESS with
+> XOR-RELAYED-ADDRESS + LIFETIME echoed via R34B's parser;
+> stale-NONCE rejection; non-UDP transport -> 442; pool exhaustion
+> (1-port pool, 2 clients) -> 508; dup-allocate same client -> 437;
+> refresh active -> SUCCESS w/ new lifetime; refresh non-existent
+> -> 437; refresh lifetime=0 -> delete + port returned; CP one peer
+> + three peers (single multi-attr request) + no allocation -> 437;
+> CB 0x4000 happy path + 0x3FFF / 0x7FFF out of range -> 400 +
+> same-channel-different-peer conflict -> 400 + same-channel-same-
+> peer idempotent refresh; send to permitted peer -> returns data;
+> send to non-permitted -> drop; send through channel binding only
+> (no explicit permission) works (channel implies permission); send
+> with no allocation -> drop; tick removes expired allocation +
+> expired permission within active allocation + expired channel
+> within active allocation; multi-allocation (3 distinct clients,
+> independent permissions). Honest caveat: this is server-side STATE
+> -- no socket I/O. The wire driver (a future round) hooks up the
+> UDP listener, parses incoming packets, dispatches to these
+> handlers, and sends responses + forwarded data. Auth verification
+> (HMAC-SHA1 over the message via `turn_verify_message_integrity`)
+> is structurally supported but not consulted by the handler -- any
+> message with USERNAME + MESSAGE-INTEGRITY attributes is accepted.
+> A future round can wire in the credential database + run the
+> `turn_verify_message_integrity` check before granting the
+> allocation. R34B / R35B / R35D / R36A test suites all pass
+> byte-identical post-R38C.
 >
 > R37F (R36F.2) materializes the Vercel-hybrid reference architecture
 > R36F's `docs/GETTING_STARTED.md` Section 5 named but deferred. Lands

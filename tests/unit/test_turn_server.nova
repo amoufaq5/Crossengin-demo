@@ -1,0 +1,789 @@
+// Unit tests for src/federation/turn_server.nova (R38C / R34B.3 / R35B.3).
+//
+// Coverage (50+ assertions):
+//   * Init: empty allocations, port pool populated, all counters 0.
+//   * Init with small port range: pool size matches range width.
+//   * Allocate with no auth (no USERNAME/MI) -> 401 with REALM + NONCE.
+//   * Allocate with auth attrs + valid creds -> SUCCESS, allocations
+//     count bumps, port consumed from pool, XOR-RELAYED-ADDRESS in
+//     response.
+//   * Allocate with stale NONCE (mismatched after first allocate) -> 438.
+//   * Allocate without REQUESTED-TRANSPORT -> 442.
+//   * Allocate when pool is empty -> 508 (forced exhaustion).
+//   * Allocate twice for same client without delete -> 437 Allocation
+//     Mismatch.
+//   * Refresh for active allocation -> SUCCESS with new lifetime.
+//   * Refresh for non-existent client -> 437.
+//   * Refresh with lifetime=0 -> SUCCESS, allocation deleted, port
+//     returned to pool.
+//   * CreatePermission for one peer -> SUCCESS, permissions_list grows
+//     by one, perm-granted counter bumps.
+//   * CreatePermission for 3 peers in one request -> SUCCESS, list
+//     grows by 3.
+//   * CreatePermission with no allocation -> 437.
+//   * ChannelBind with channel=0x4000 -> SUCCESS, channels list grows,
+//     auto-permission added.
+//   * ChannelBind with channel=0x3FFF (out of range) -> 400.
+//   * ChannelBind with channel=0x7FFF (out of range high) -> 400.
+//   * ChannelBind: same channel + different peer -> 400 conflict.
+//   * ChannelBind: same channel + same peer -> SUCCESS (idempotent
+//     refresh).
+//   * Send to permitted peer -> returns [peer_ip, peer_port, data, n].
+//   * Send to non-permitted peer -> silent drop (returns 0).
+//   * Send through channel binding (no explicit permission) -> works.
+//   * Send with no allocation -> drop.
+//   * Tick removes expired allocation -> port returned, expired counter
+//     bumps.
+//   * Tick removes expired permission within active allocation.
+//   * Tick removes expired channel within active allocation.
+//   * Multi-allocation: 3 distinct clients each get independent
+//     allocations from different ports.
+//
+// All tests run in the unit sandbox -- no sockets. We round-trip
+// through R34B's wire codec by emitting requests via R34B's
+// turn_emit_* helpers, passing them into the server handlers, and
+// parsing the responses via R34B's turn_parse_* helpers.
+
+import "../ce_test.nova"
+import "../../src/federation/turn.nova"
+import "../../src/federation/turn_server.nova"
+
+// ============================================================================
+//                         Helpers
+// ============================================================================
+
+fn _tts_zero_buf(n) {
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n { store8(buf + i, 0); i = i + 1 }
+    store8(buf + n, 0)
+    return buf
+}
+
+fn _tts_fixed_txn() {
+    let buf = alloc(13)
+    let i = 0
+    while i < 12 { store8(buf + i, i + 1); i = i + 1 }
+    store8(buf + 12, 0)
+    return buf
+}
+
+fn _tts_alt_txn(seed) {
+    let buf = alloc(13)
+    let i = 0
+    while i < 12 { store8(buf + i, seed + i); i = i + 1 }
+    store8(buf + 12, 0)
+    return buf
+}
+
+fn _tts_client(ip_str, port) {
+    return turn_server_make_client_addr(ip_str, port)
+}
+
+// ============================================================================
+//                         Init
+// ============================================================================
+
+fn test_init_empty_state() {
+    let st = turn_server_init()
+    ce_eq("init: 0 allocations", turn_server_allocations_count(st), 0)
+    // Port pool: 65535 - 49152 + 1 = 16384.
+    ce_eq("init: pool size = 16384", turn_server_port_pool_size(st), 16384)
+    ce_eq("init: allocates_received = 0",
+          turn_server_stats_allocates_received(st), 0)
+    ce_eq("init: allocates_granted = 0",
+          turn_server_stats_allocates_granted(st), 0)
+    ce_eq("init: allocates_rejected = 0",
+          turn_server_stats_allocates_rejected(st), 0)
+    ce_eq("init: refreshes = 0", turn_server_stats_refreshes(st), 0)
+    ce_eq("init: permissions_granted = 0",
+          turn_server_stats_permissions_granted(st), 0)
+    ce_eq("init: channels_bound = 0",
+          turn_server_stats_channels_bound(st), 0)
+    ce_eq("init: data_forwarded = 0",
+          turn_server_stats_data_forwarded(st), 0)
+    ce_eq("init: expired = 0", turn_server_stats_expired(st), 0)
+    ce_str_eq("init: default realm", turn_server_realm(st),
+              "crossengin.local")
+}
+
+fn test_init_small_port_range() {
+    let st = turn_server_init_with_port_range(49152, 49155, "10.0.0.1")
+    ce_eq("small pool: size = 4", turn_server_port_pool_size(st), 4)
+}
+
+// ============================================================================
+//                         Allocate -- no auth -> 401
+// ============================================================================
+
+fn test_allocate_no_auth_emits_401() {
+    let st = turn_server_init()
+    let txn = _tts_fixed_txn()
+    let pkt = turn_emit_allocate_request(txn, 600, TURN_TRANSPORT_UDP)
+    let client = _tts_client("192.0.2.10", 50000)
+    let resp = turn_server_handle_allocate(st, pkt[0], pkt[1], client, 1700000000)
+    ce_check("401 response is a list", len(resp) == 2)
+    ce_check("401 response n > 20", resp[1] > 20)
+    // Parse it as a 401: turn_parse_401_response extracts REALM + NONCE.
+    let dec = turn_parse_401_response(resp[0], resp[1])
+    ce_check("parse_401 returns 4-list", len(dec) == 4)
+    ce_eq("401: realm_n = len('crossengin.local')", dec[1],
+          len("crossengin.local"))
+    ce_check("401: nonce_n > 0", dec[3] > 0)
+    ce_eq("allocates_received = 1",
+          turn_server_stats_allocates_received(st), 1)
+    ce_eq("allocates_rejected = 1",
+          turn_server_stats_allocates_rejected(st), 1)
+    ce_eq("allocates_granted = 0",
+          turn_server_stats_allocates_granted(st), 0)
+    ce_eq("no allocation appended", turn_server_allocations_count(st), 0)
+}
+
+// ============================================================================
+//                         Allocate -- with auth -> SUCCESS
+// ============================================================================
+
+fn _tts_extract_nonce_from_401(resp_buf, resp_n) {
+    let dec = turn_parse_401_response(resp_buf, resp_n)
+    let nonce_buf = dec[2]
+    let nonce_n   = dec[3]
+    let s = ""
+    let i = 0
+    while i < nonce_n { s = s + chr(load8(nonce_buf + i)); i = i + 1 }
+    return s
+}
+
+fn test_allocate_with_auth_succeeds() {
+    let st = turn_server_init()
+    let txn1 = _tts_fixed_txn()
+    let pkt1 = turn_emit_allocate_request(txn1, 600, TURN_TRANSPORT_UDP)
+    let client = _tts_client("192.0.2.20", 50000)
+    let resp1 = turn_server_handle_allocate(st, pkt1[0], pkt1[1], client,
+                                             1700000000)
+    let nonce = _tts_extract_nonce_from_401(resp1[0], resp1[1])
+    // Credentialed retry.
+    let txn2 = _tts_alt_txn(0x10)
+    let pkt2 = turn_emit_allocate_request_authed(txn2, 600, TURN_TRANSPORT_UDP,
+                                                  "alice", "secret",
+                                                  "crossengin.local", nonce)
+    let pool_before = turn_server_port_pool_size(st)
+    let resp2 = turn_server_handle_allocate(st, pkt2[0], pkt2[1], client,
+                                             1700000010)
+    // Parse the success response with R34B's parser.
+    let dec = turn_parse_allocate_success_response(resp2[0], resp2[1])
+    ce_check("allocate success returns >= 3-list", len(dec) >= 3)
+    ce_eq("allocate success lifetime = 600", dec[2], 600)
+    ce_check("relayed_port in pool range (49152..65535)",
+             dec[1] >= 49152)
+    ce_check("relayed_port not above 65535", dec[1] <= 65535)
+    ce_eq("allocation count bumps to 1",
+          turn_server_allocations_count(st), 1)
+    ce_eq("port pool shrinks by 1",
+          turn_server_port_pool_size(st), pool_before - 1)
+    ce_eq("allocates_granted = 1",
+          turn_server_stats_allocates_granted(st), 1)
+}
+
+// ============================================================================
+//                         Allocate -- stale NONCE -> 438
+// ============================================================================
+
+fn test_allocate_stale_nonce_emits_438() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.30", 50000)
+    // First credentialed allocate using a server-issued nonce (valid).
+    let txn1 = _tts_fixed_txn()
+    let pkt1 = turn_emit_allocate_request(txn1, 600, TURN_TRANSPORT_UDP)
+    let resp1 = turn_server_handle_allocate(st, pkt1[0], pkt1[1], client,
+                                             1700000000)
+    let nonce = _tts_extract_nonce_from_401(resp1[0], resp1[1])
+    let txn2 = _tts_alt_txn(0x20)
+    let pkt2 = turn_emit_allocate_request_authed(txn2, 600, TURN_TRANSPORT_UDP,
+                                                  "bob", "shhh",
+                                                  "crossengin.local", nonce)
+    let resp2 = turn_server_handle_allocate(st, pkt2[0], pkt2[1], client,
+                                             1700000010)
+    // Confirm the allocation succeeded.
+    let succ_dec = turn_parse_allocate_success_response(resp2[0], resp2[1])
+    ce_check("first credentialed allocate succeeded", len(succ_dec) >= 3)
+    // Now send a SECOND credentialed allocate with a DIFFERENT nonce.
+    let txn3 = _tts_alt_txn(0x30)
+    let pkt3 = turn_emit_allocate_request_authed(txn3, 600, TURN_TRANSPORT_UDP,
+                                                  "bob", "shhh",
+                                                  "crossengin.local",
+                                                  "stale-nonce-deadbeef")
+    let resp3 = turn_server_handle_allocate(st, pkt3[0], pkt3[1], client,
+                                             1700000020)
+    let err = turn_parse_allocate_error_response(resp3[0], resp3[1])
+    ce_check("438 response is a list", len(err) == 2)
+    ce_eq("stale-nonce code = 438", err[0], 438)
+}
+
+// ============================================================================
+//                         Allocate -- 442 unsupported transport
+// ============================================================================
+
+fn _tts_emit_allocate_no_transport(txn) {
+    // Build an Allocate Request with USERNAME + MI but NO
+    // REQUESTED-TRANSPORT -- we pass an empty username to keep the
+    // wire format minimal. R34B doesn't ship this combination directly;
+    // build it by hand with a credentialed authed emit then patch.
+    // Simpler: use the authed emitter with a known username + drop
+    // RT by overwriting the RT attribute's type to SOFTWARE (an
+    // unrelated attr) and patch in a 16-bit pad. For simplicity here
+    // we use the authed emitter and rely on the auth path; transport=99
+    // would also trip 442, but R34B's authed emitter hard-codes the
+    // RT value the caller passes. Pass transport=99.
+    return turn_emit_allocate_request_authed(txn, 600, 99,
+                                              "alice", "x",
+                                              "crossengin.local",
+                                              "ce-nonce-0")
+}
+
+fn test_allocate_non_udp_transport_emits_442() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.40", 50000)
+    let txn = _tts_alt_txn(0x40)
+    let pkt = _tts_emit_allocate_no_transport(txn)
+    let resp = turn_server_handle_allocate(st, pkt[0], pkt[1], client,
+                                            1700000000)
+    let err = turn_parse_allocate_error_response(resp[0], resp[1])
+    ce_check("442 response is a list", len(err) == 2)
+    ce_eq("non-UDP transport code = 442", err[0], 442)
+}
+
+// ============================================================================
+//                         Allocate -- pool exhausted -> 508
+// ============================================================================
+
+fn test_allocate_pool_exhausted_emits_508() {
+    // Start with a 1-port pool, allocate one, then try a second.
+    let st = turn_server_init_with_port_range(49152, 49152, "10.0.0.1")
+    ce_eq("small pool size = 1", turn_server_port_pool_size(st), 1)
+    let client1 = _tts_client("192.0.2.50", 50000)
+    let txn1 = _tts_fixed_txn()
+    let pkt1 = turn_emit_allocate_request(txn1, 600, TURN_TRANSPORT_UDP)
+    let resp1 = turn_server_handle_allocate(st, pkt1[0], pkt1[1], client1,
+                                             1700000000)
+    let nonce1 = _tts_extract_nonce_from_401(resp1[0], resp1[1])
+    let txn2 = _tts_alt_txn(0x50)
+    let pkt2 = turn_emit_allocate_request_authed(txn2, 600,
+                                                  TURN_TRANSPORT_UDP, "u", "p",
+                                                  "crossengin.local", nonce1)
+    let resp2 = turn_server_handle_allocate(st, pkt2[0], pkt2[1], client1,
+                                             1700000010)
+    let succ = turn_parse_allocate_success_response(resp2[0], resp2[1])
+    ce_check("first allocate succeeds", len(succ) >= 3)
+    ce_eq("pool now empty", turn_server_port_pool_size(st), 0)
+    // Now a DIFFERENT client tries.
+    let client2 = _tts_client("192.0.2.51", 50000)
+    let txn3 = _tts_alt_txn(0x60)
+    let pkt3 = turn_emit_allocate_request(txn3, 600, TURN_TRANSPORT_UDP)
+    let resp3 = turn_server_handle_allocate(st, pkt3[0], pkt3[1], client2,
+                                             1700000020)
+    let nonce3 = _tts_extract_nonce_from_401(resp3[0], resp3[1])
+    let txn4 = _tts_alt_txn(0x70)
+    let pkt4 = turn_emit_allocate_request_authed(txn4, 600,
+                                                  TURN_TRANSPORT_UDP, "u", "p",
+                                                  "crossengin.local", nonce3)
+    let resp4 = turn_server_handle_allocate(st, pkt4[0], pkt4[1], client2,
+                                             1700000030)
+    let err = turn_parse_allocate_error_response(resp4[0], resp4[1])
+    ce_check("508 response is a list", len(err) == 2)
+    ce_eq("pool-exhausted code = 508", err[0], 508)
+}
+
+// ============================================================================
+//                         Allocate -- 437 on second allocate same client
+// ============================================================================
+
+fn test_allocate_dup_same_client_emits_437() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.60", 50000)
+    // First allocate: 401 -> creds -> success.
+    let txn1 = _tts_fixed_txn()
+    let pkt1 = turn_emit_allocate_request(txn1, 600, TURN_TRANSPORT_UDP)
+    let resp1 = turn_server_handle_allocate(st, pkt1[0], pkt1[1], client,
+                                             1700000000)
+    let nonce = _tts_extract_nonce_from_401(resp1[0], resp1[1])
+    let txn2 = _tts_alt_txn(0x80)
+    let pkt2 = turn_emit_allocate_request_authed(txn2, 600,
+                                                  TURN_TRANSPORT_UDP, "u", "p",
+                                                  "crossengin.local", nonce)
+    let resp2 = turn_server_handle_allocate(st, pkt2[0], pkt2[1], client,
+                                             1700000010)
+    let succ = turn_parse_allocate_success_response(resp2[0], resp2[1])
+    ce_check("first allocate succeeds", len(succ) >= 3)
+    // Second allocate (same client, same nonce, no delete) -> 437.
+    let txn3 = _tts_alt_txn(0x90)
+    let pkt3 = turn_emit_allocate_request_authed(txn3, 600,
+                                                  TURN_TRANSPORT_UDP, "u", "p",
+                                                  "crossengin.local", nonce)
+    let resp3 = turn_server_handle_allocate(st, pkt3[0], pkt3[1], client,
+                                             1700000020)
+    let err = turn_parse_allocate_error_response(resp3[0], resp3[1])
+    ce_check("437 response is a list", len(err) == 2)
+    ce_eq("dup-allocate code = 437", err[0], 437)
+}
+
+// ============================================================================
+//                         Refresh -- happy path + delete
+// ============================================================================
+
+fn _tts_seed_allocation(state, client, now) {
+    let txn1 = _tts_fixed_txn()
+    let pkt1 = turn_emit_allocate_request(txn1, 600, TURN_TRANSPORT_UDP)
+    let resp1 = turn_server_handle_allocate(state, pkt1[0], pkt1[1], client,
+                                             now)
+    let nonce = _tts_extract_nonce_from_401(resp1[0], resp1[1])
+    let txn2 = _tts_alt_txn(0xA0)
+    let pkt2 = turn_emit_allocate_request_authed(txn2, 600,
+                                                  TURN_TRANSPORT_UDP, "u", "p",
+                                                  "crossengin.local", nonce)
+    let resp2 = turn_server_handle_allocate(state, pkt2[0], pkt2[1], client,
+                                             now + 1)
+    return resp2
+}
+
+fn test_refresh_active_allocation_extends() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.70", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    // Issue Refresh for lifetime 1200.
+    let txn = _tts_alt_txn(0xB0)
+    let pkt = turn_emit_refresh_request(txn, 1200)
+    let resp = turn_server_handle_refresh(st, pkt[0], pkt[1], client,
+                                           1700000100)
+    let dec = turn_parse_refresh_success_response(resp[0], resp[1])
+    ce_check("refresh success returns 1-list", len(dec) == 1)
+    ce_eq("refresh lifetime echoed = 1200", dec[0], 1200)
+    ce_eq("refresh stats counter = 1",
+          turn_server_stats_refreshes(st), 1)
+}
+
+fn test_refresh_no_allocation_emits_437() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.71", 50000)
+    let txn = _tts_alt_txn(0xC0)
+    let pkt = turn_emit_refresh_request(txn, 600)
+    let resp = turn_server_handle_refresh(st, pkt[0], pkt[1], client,
+                                           1700000000)
+    // The response is a refresh error response; parse via the
+    // generic error-code walker.
+    let walk = _turn_test_walk_attrs(resp[0], resp[1])
+    ce_eq("refresh-no-alloc walk ok", walk[0], 0)
+    let attrs = walk[1]
+    // Look for ERROR-CODE.
+    let i = 0
+    let ec = 0
+    while i < len(attrs) {
+        if attrs[i][0] == TURN_ATTR_ERROR_CODE { ec = attrs[i] }
+        i = i + 1
+    }
+    ce_check("refresh-no-alloc has ERROR-CODE", ec != 0)
+    if ec != 0 {
+        let code_class = int_and(load8(ec[1] + 2), 7)
+        let code_number = load8(ec[1] + 3)
+        ce_eq("refresh-no-alloc code = 437", code_class * 100 + code_number,
+              437)
+    }
+}
+
+fn test_refresh_lifetime_zero_deletes() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.72", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let pool_after_alloc = turn_server_port_pool_size(st)
+    let txn = _tts_alt_txn(0xD0)
+    let pkt = turn_emit_refresh_request(txn, 0)
+    let resp = turn_server_handle_refresh(st, pkt[0], pkt[1], client,
+                                           1700000100)
+    let dec = turn_parse_refresh_success_response(resp[0], resp[1])
+    ce_check("delete-refresh returns 1-list", len(dec) == 1)
+    ce_eq("delete-refresh lifetime = 0", dec[0], 0)
+    ce_eq("allocation count back to 0",
+          turn_server_allocations_count(st), 0)
+    ce_eq("port returned to pool",
+          turn_server_port_pool_size(st), pool_after_alloc + 1)
+}
+
+// ============================================================================
+//                         CreatePermission
+// ============================================================================
+
+fn test_create_permission_one_peer() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.80", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn = _tts_alt_txn(0xE0)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.1")
+    let pkt = turn_emit_create_permission_request(txn, peer_ip, 30000)
+    let resp = turn_server_handle_create_permission(st, pkt[0], pkt[1],
+                                                     client, 1700000100)
+    // Success body is empty.
+    let cls = turn_classify_message(resp[0], resp[1])
+    ce_eq("CP success method = CREATE_PERMISSION", cls[0],
+          TURN_METHOD_CREATE_PERMISSION)
+    ce_eq("CP success class = SUCCESS_RESP", cls[1], TURN_CLASS_SUCCESS_RESP)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_check("allocation still present after CP", rec != 0)
+    ce_eq("permissions_list has 1 entry", len(rec[4]), 1)
+    ce_str_eq("perm peer_ip is 203.0.113.1", rec[4][0][0], "203.0.113.1")
+    ce_eq("perm peer_port = 30000", rec[4][0][1], 30000)
+    ce_eq("permissions_granted counter = 1",
+          turn_server_stats_permissions_granted(st), 1)
+}
+
+fn test_create_permission_three_peers() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.81", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn = _tts_alt_txn(0xF0)
+    let peers = list_new()
+    let pa = list_new()
+    push(pa, turn_ipv4_str_to_buf("203.0.113.10"))
+    push(pa, 30001)
+    push(peers, pa)
+    let pb = list_new()
+    push(pb, turn_ipv4_str_to_buf("203.0.113.20"))
+    push(pb, 30002)
+    push(peers, pb)
+    let pc = list_new()
+    push(pc, turn_ipv4_str_to_buf("203.0.113.30"))
+    push(pc, 30003)
+    push(peers, pc)
+    let pkt = turn_emit_create_permission_request_multi(txn, peers)
+    let resp = turn_server_handle_create_permission(st, pkt[0], pkt[1],
+                                                     client, 1700000100)
+    let cls = turn_classify_message(resp[0], resp[1])
+    ce_eq("CP-multi class = SUCCESS_RESP", cls[1], TURN_CLASS_SUCCESS_RESP)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_eq("permissions_list has 3 entries", len(rec[4]), 3)
+    ce_eq("permissions_granted counter = 3",
+          turn_server_stats_permissions_granted(st), 3)
+}
+
+fn test_create_permission_no_allocation() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.82", 50000)
+    let txn = _tts_alt_txn(0x11)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.40")
+    let pkt = turn_emit_create_permission_request(txn, peer_ip, 30004)
+    let resp = turn_server_handle_create_permission(st, pkt[0], pkt[1],
+                                                     client, 1700000000)
+    let cls = turn_classify_message(resp[0], resp[1])
+    ce_eq("CP-no-alloc method = CREATE_PERMISSION", cls[0],
+          TURN_METHOD_CREATE_PERMISSION)
+    ce_eq("CP-no-alloc class = ERROR_RESP", cls[1], TURN_CLASS_ERROR_RESP)
+}
+
+// ============================================================================
+//                         ChannelBind
+// ============================================================================
+
+fn test_channel_bind_happy_path() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.90", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn = _tts_alt_txn(0x12)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.50")
+    let pkt = turn_emit_channel_bind_request(txn, 0x4000, peer_ip, 30005)
+    let resp = turn_server_handle_channel_bind(st, pkt[0], pkt[1], client,
+                                                1700000100)
+    let cls = turn_classify_message(resp[0], resp[1])
+    ce_eq("CB happy method = CHANNEL_BIND", cls[0], TURN_METHOD_CHANNEL_BIND)
+    ce_eq("CB happy class = SUCCESS_RESP", cls[1], TURN_CLASS_SUCCESS_RESP)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_eq("channels_list has 1 entry", len(rec[5]), 1)
+    ce_eq("channel num = 0x4000", rec[5][0][0], 0x4000)
+    ce_eq("auto-permission added", len(rec[4]), 1)
+    ce_eq("channels_bound counter = 1",
+          turn_server_stats_channels_bound(st), 1)
+}
+
+fn test_channel_bind_out_of_range_low() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.91", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn = _tts_alt_txn(0x13)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.51")
+    let pkt = turn_emit_channel_bind_request(txn, 0x3FFF, peer_ip, 30006)
+    let resp = turn_server_handle_channel_bind(st, pkt[0], pkt[1], client,
+                                                1700000100)
+    let cls = turn_classify_message(resp[0], resp[1])
+    ce_eq("CB-oor-low class = ERROR_RESP", cls[1], TURN_CLASS_ERROR_RESP)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_eq("no channel bound", len(rec[5]), 0)
+}
+
+fn test_channel_bind_out_of_range_high() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.92", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn = _tts_alt_txn(0x14)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.52")
+    let pkt = turn_emit_channel_bind_request(txn, 0x7FFF, peer_ip, 30007)
+    let resp = turn_server_handle_channel_bind(st, pkt[0], pkt[1], client,
+                                                1700000100)
+    let cls = turn_classify_message(resp[0], resp[1])
+    ce_eq("CB-oor-high class = ERROR_RESP", cls[1], TURN_CLASS_ERROR_RESP)
+}
+
+fn test_channel_bind_conflict_same_channel_different_peer() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.93", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    // First binding succeeds.
+    let txn1 = _tts_alt_txn(0x15)
+    let peer1 = turn_ipv4_str_to_buf("203.0.113.60")
+    let pkt1 = turn_emit_channel_bind_request(txn1, 0x4001, peer1, 31001)
+    let resp1 = turn_server_handle_channel_bind(st, pkt1[0], pkt1[1], client,
+                                                 1700000100)
+    let cls1 = turn_classify_message(resp1[0], resp1[1])
+    ce_eq("CB first success", cls1[1], TURN_CLASS_SUCCESS_RESP)
+    // Same channel, different peer -> 400.
+    let txn2 = _tts_alt_txn(0x16)
+    let peer2 = turn_ipv4_str_to_buf("203.0.113.61")
+    let pkt2 = turn_emit_channel_bind_request(txn2, 0x4001, peer2, 31002)
+    let resp2 = turn_server_handle_channel_bind(st, pkt2[0], pkt2[1], client,
+                                                 1700000110)
+    let cls2 = turn_classify_message(resp2[0], resp2[1])
+    ce_eq("CB conflict class = ERROR_RESP", cls2[1], TURN_CLASS_ERROR_RESP)
+}
+
+fn test_channel_bind_refresh_same_channel_same_peer() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.94", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn1 = _tts_alt_txn(0x17)
+    let peer = turn_ipv4_str_to_buf("203.0.113.70")
+    let pkt1 = turn_emit_channel_bind_request(txn1, 0x4002, peer, 31003)
+    turn_server_handle_channel_bind(st, pkt1[0], pkt1[1], client, 1700000100)
+    // Same again -> success (idempotent).
+    let txn2 = _tts_alt_txn(0x18)
+    let pkt2 = turn_emit_channel_bind_request(txn2, 0x4002, peer, 31003)
+    let resp2 = turn_server_handle_channel_bind(st, pkt2[0], pkt2[1], client,
+                                                 1700000200)
+    let cls2 = turn_classify_message(resp2[0], resp2[1])
+    ce_eq("CB idempotent class = SUCCESS_RESP", cls2[1], TURN_CLASS_SUCCESS_RESP)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_eq("channels_list still has 1 entry", len(rec[5]), 1)
+}
+
+// ============================================================================
+//                         Send
+// ============================================================================
+
+fn _tts_data_buf() {
+    // Make a fixed 4-byte payload "ping".
+    let buf = alloc(5)
+    store8(buf + 0, 112)        // 'p'
+    store8(buf + 1, 105)        // 'i'
+    store8(buf + 2, 110)        // 'n'
+    store8(buf + 3, 103)        // 'g'
+    store8(buf + 4, 0)
+    return buf
+}
+
+fn test_send_to_permitted_peer_returns_data() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.100", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    // Add permission for peer.
+    let txn1 = _tts_alt_txn(0x19)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.80")
+    let pkt1 = turn_emit_create_permission_request(txn1, peer_ip, 32000)
+    turn_server_handle_create_permission(st, pkt1[0], pkt1[1], client,
+                                          1700000100)
+    let data = _tts_data_buf()
+    let pkt2 = turn_emit_send_indication(peer_ip, 32000, data, 4)
+    let out = turn_server_handle_send(st, pkt2[0], pkt2[1], client,
+                                       1700000200)
+    ce_check("send to permitted peer returns 4-list", len(out) == 4)
+    ce_str_eq("send: peer_ip = 203.0.113.80", out[0], "203.0.113.80")
+    ce_eq("send: peer_port = 32000", out[1], 32000)
+    ce_eq("send: data_n = 4", out[3], 4)
+    ce_eq("send: data byte 0 = 'p'", load8(out[2] + 0), 112)
+    ce_eq("data_forwarded counter = 1",
+          turn_server_stats_data_forwarded(st), 1)
+}
+
+fn test_send_to_non_permitted_peer_drops() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.101", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.99")
+    let data = _tts_data_buf()
+    let pkt = turn_emit_send_indication(peer_ip, 32001, data, 4)
+    let out = turn_server_handle_send(st, pkt[0], pkt[1], client, 1700000100)
+    ce_eq("send to non-permitted peer drops", out, 0)
+    ce_eq("data_forwarded counter unchanged at 0",
+          turn_server_stats_data_forwarded(st), 0)
+}
+
+fn test_send_through_channel_works_without_permission() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.102", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    // Bind a channel (which auto-adds a permission), then send.
+    let txn1 = _tts_alt_txn(0x1A)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.100")
+    let pkt1 = turn_emit_channel_bind_request(txn1, 0x4003, peer_ip, 33000)
+    turn_server_handle_channel_bind(st, pkt1[0], pkt1[1], client, 1700000100)
+    let data = _tts_data_buf()
+    let pkt2 = turn_emit_send_indication(peer_ip, 33000, data, 4)
+    let out = turn_server_handle_send(st, pkt2[0], pkt2[1], client,
+                                       1700000200)
+    ce_check("send through channel returns 4-list", len(out) == 4)
+    ce_str_eq("send-via-channel peer_ip", out[0], "203.0.113.100")
+    ce_eq("send-via-channel peer_port = 33000", out[1], 33000)
+}
+
+fn test_send_no_allocation_drops() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.103", 50000)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.110")
+    let data = _tts_data_buf()
+    let pkt = turn_emit_send_indication(peer_ip, 33001, data, 4)
+    let out = turn_server_handle_send(st, pkt[0], pkt[1], client, 1700000100)
+    ce_eq("send no-alloc drops to 0", out, 0)
+}
+
+// ============================================================================
+//                         Tick
+// ============================================================================
+
+fn test_tick_removes_expired_allocation() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.110", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let pool_after_alloc = turn_server_port_pool_size(st)
+    ce_eq("alloc count = 1 pre-tick",
+          turn_server_allocations_count(st), 1)
+    // Advance the clock past the lifetime+1.
+    let res = turn_server_tick(st, 1700000000 + 600 + 5)
+    ce_eq("tick: n_alloc_expired = 1", res[0], 1)
+    ce_eq("alloc count = 0 post-tick",
+          turn_server_allocations_count(st), 0)
+    ce_eq("port returned to pool",
+          turn_server_port_pool_size(st), pool_after_alloc + 1)
+    ce_eq("expired counter = 1", turn_server_stats_expired(st), 1)
+}
+
+fn test_tick_removes_expired_permission() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.111", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    // Add a permission.
+    let txn1 = _tts_alt_txn(0x1B)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.120")
+    let pkt1 = turn_emit_create_permission_request(txn1, peer_ip, 34000)
+    turn_server_handle_create_permission(st, pkt1[0], pkt1[1], client,
+                                          1700000100)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_eq("perms pre-tick = 1", len(rec[4]), 1)
+    // Permission expires at 1700000100 + 300 = 1700000400. Allocation
+    // expires at 1700000001 + 600 = 1700000601. So at 1700000500 the
+    // perm is expired but the allocation is still alive.
+    let res = turn_server_tick(st, 1700000500)
+    ce_eq("tick: n_alloc_expired = 0", res[0], 0)
+    ce_eq("tick: n_perm_expired = 1", res[1], 1)
+    ce_eq("perms post-tick = 0", len(rec[4]), 0)
+    ce_eq("allocation still active",
+          turn_server_allocations_count(st), 1)
+}
+
+fn test_tick_removes_expired_channel() {
+    let st = turn_server_init()
+    let client = _tts_client("192.0.2.112", 50000)
+    _tts_seed_allocation(st, client, 1700000000)
+    let txn1 = _tts_alt_txn(0x1C)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.130")
+    let pkt1 = turn_emit_channel_bind_request(txn1, 0x4010, peer_ip, 35000)
+    turn_server_handle_channel_bind(st, pkt1[0], pkt1[1], client, 1700000100)
+    // Channel expires at 1700000100 + 600 = 1700000700.
+    // Allocation expires at 1700000001 + 600 = 1700000601 BUT we
+    // refresh by extending the channel's allocation past that. Use
+    // an explicit refresh.
+    let txn_r = _tts_alt_txn(0x1D)
+    let pkt_r = turn_emit_refresh_request(txn_r, 3000)
+    turn_server_handle_refresh(st, pkt_r[0], pkt_r[1], client, 1700000200)
+    // Now at 1700000800 the channel is expired (expiry 1700000700)
+    // but the allocation expires at 1700000200 + 3000 = 1700003200.
+    let res = turn_server_tick(st, 1700000800)
+    ce_eq("tick: alloc_expired = 0", res[0], 0)
+    ce_eq("tick: chan_expired = 1", res[2], 1)
+    let rec = turn_server_lookup_allocation(st, client)
+    ce_eq("channels list pruned to 0", len(rec[5]), 0)
+}
+
+// ============================================================================
+//                         Multi-client
+// ============================================================================
+
+fn test_three_clients_independent_allocations() {
+    let st = turn_server_init()
+    let c1 = _tts_client("192.0.2.200", 50001)
+    let c2 = _tts_client("192.0.2.201", 50002)
+    let c3 = _tts_client("192.0.2.202", 50003)
+    _tts_seed_allocation(st, c1, 1700000000)
+    _tts_seed_allocation(st, c2, 1700000010)
+    _tts_seed_allocation(st, c3, 1700000020)
+    ce_eq("3 active allocations",
+          turn_server_allocations_count(st), 3)
+    let rec1 = turn_server_lookup_allocation(st, c1)
+    let rec2 = turn_server_lookup_allocation(st, c2)
+    let rec3 = turn_server_lookup_allocation(st, c3)
+    ce_check("rec1 != 0", rec1 != 0)
+    ce_check("rec2 != 0", rec2 != 0)
+    ce_check("rec3 != 0", rec3 != 0)
+    // All distinct ports.
+    ce_check("rec1 port != rec2 port", rec1[1] != rec2[1])
+    ce_check("rec2 port != rec3 port", rec2[1] != rec3[1])
+    ce_check("rec1 port != rec3 port", rec1[1] != rec3[1])
+    // Each allocation has independent permissions_list.
+    let txn = _tts_alt_txn(0x1E)
+    let peer_ip = turn_ipv4_str_to_buf("203.0.113.200")
+    let pkt = turn_emit_create_permission_request(txn, peer_ip, 36000)
+    turn_server_handle_create_permission(st, pkt[0], pkt[1], c2, 1700000100)
+    ce_eq("only c2's permissions list grows", len(rec2[4]), 1)
+    ce_eq("c1's permissions list untouched", len(rec1[4]), 0)
+    ce_eq("c3's permissions list untouched", len(rec3[4]), 0)
+}
+
+// ============================================================================
+//                         main
+// ============================================================================
+
+fn main() {
+    test_init_empty_state()
+    test_init_small_port_range()
+    test_allocate_no_auth_emits_401()
+    test_allocate_with_auth_succeeds()
+    test_allocate_stale_nonce_emits_438()
+    test_allocate_non_udp_transport_emits_442()
+    test_allocate_pool_exhausted_emits_508()
+    test_allocate_dup_same_client_emits_437()
+    test_refresh_active_allocation_extends()
+    test_refresh_no_allocation_emits_437()
+    test_refresh_lifetime_zero_deletes()
+    test_create_permission_one_peer()
+    test_create_permission_three_peers()
+    test_create_permission_no_allocation()
+    test_channel_bind_happy_path()
+    test_channel_bind_out_of_range_low()
+    test_channel_bind_out_of_range_high()
+    test_channel_bind_conflict_same_channel_different_peer()
+    test_channel_bind_refresh_same_channel_same_peer()
+    test_send_to_permitted_peer_returns_data()
+    test_send_to_non_permitted_peer_drops()
+    test_send_through_channel_works_without_permission()
+    test_send_no_allocation_drops()
+    test_tick_removes_expired_allocation()
+    test_tick_removes_expired_permission()
+    test_tick_removes_expired_channel()
+    test_three_clients_independent_allocations()
+    ce_summary("turn_server")
+}
+
+main()
