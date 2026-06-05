@@ -1,0 +1,578 @@
+// Unit tests for src/federation/ice_turn.nova (R35D / R28E.2).
+//
+// Coverage (30+ assertions):
+//   * init: state record built with all-zero counters, ice_agent slot
+//     populated, server addr stashed, txn id buffer pre-zeroed.
+//   * relay candidate priority value matches RFC 8445 §5.1.2.1 formula
+//     for type_pref=0, local_pref=65535, component=1:
+//       priority = 2^24 * 0 + 2^8 * 65535 + (256 - 1) = 16777215
+//     also verified against R30C's `ice_candidate_priority` at the
+//     RELAY type tag.
+//   * check_escalation:
+//       - empty pair list -> NO_ESCALATION (gathering hasn't run yet)
+//       - all pairs FAILED + turn_active=0 -> ESCALATE
+//       - all pairs FAILED + turn_active=1 -> NO_ESCALATION (one-way)
+//       - some pair NOT failed -> NO_ESCALATION
+//   * begin_allocate emits a 36-byte TURN Allocate Request the R34B
+//     parser classifies as method=ALLOCATE, class=REQUEST. Bumps
+//     `attempted` counter and latches `turn_active=1`. Stores the
+//     supplied 12-byte txn id verbatim.
+//   * handle_allocate_response on a stub success response:
+//       - extracts relayed (ip, port) into state slots
+//       - injects a RELAY-typed local candidate into the ice_agent
+//       - bumps `succeeded` counter
+//       - returns ICE_TURN_RELAY_READY
+//   * handle_allocate_response on a 401 Unauthorized error response:
+//       - stores err_code=401 + reason
+//       - bumps `failed` counter
+//       - ice_agent gains NO new candidate (count unchanged)
+//       - returns ICE_TURN_RELAY_FAILED
+//   * handle_allocate_response on a malformed buffer (8 zero bytes):
+//       - both parsers return TURN_ERR_HEADER
+//       - synthetic err code -999 set
+//       - failure counter bumps
+//       - returns ICE_TURN_RELAY_FAILED
+//   * full ICE-to-TURN flow: gather host candidates, mark all pairs
+//     failed, escalate, allocate, success-response handling adds the
+//     relay candidate so the ice_agent now has both host + relay
+//     locals. Re-form pairs to confirm the new relay-typed pair
+//     materializes.
+//
+// Tests rely only on the committed R30C `ice.nova` and committed R34B
+// `turn.nova` public surface. They do NOT touch sibling-agent WIP.
+
+import "../ce_test.nova"
+import "../../src/federation/ice_turn.nova"
+
+// ============================================================================
+//                         Helpers
+// ============================================================================
+
+fn _itt_fixed_txn() {
+    let buf = alloc(13)
+    let i = 0
+    while i < 12 { store8(buf + i, i + 1); i = i + 1 }
+    store8(buf + 12, 0)
+    return buf
+}
+
+fn _itt_alt_txn() {
+    let buf = alloc(13)
+    let i = 0
+    while i < 12 { store8(buf + i, 0xA0 + i); i = i + 1 }
+    store8(buf + 12, 0)
+    return buf
+}
+
+fn _itt_drive_all_failed(ice_agent) {
+    // Walk every pair and drive Waiting -> In-Progress -> Failed.
+    let n = ice_n_pairs(ice_agent)
+    let i = 0
+    while i < n {
+        ice_mark_pair_in_progress(ice_agent, i)
+        ice_mark_pair_failed(ice_agent, i)
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                         Init + accessors
+// ============================================================================
+
+fn test_init_state_shape() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    ce_check("state built", st != 0)
+    ce_eq("turn_active = 0 at init",
+          ice_turn_is_active(st), 0)
+    ce_str_eq("server ip stashed",
+              ice_turn_server_ip(st), "203.0.113.10")
+    ce_eq("server port stashed",
+          ice_turn_server_port(st), 3478)
+    ce_eq("attempted = 0",
+          ice_turn_escalations_attempted(st), 0)
+    ce_eq("succeeded = 0",
+          ice_turn_escalations_succeeded(st), 0)
+    ce_eq("failed = 0",
+          ice_turn_escalations_failed(st), 0)
+    ce_eq("last_state = IDLE",
+          ice_turn_last_state(st), ICE_TURN_STATE_IDLE)
+    ce_eq("last_event = NONE",
+          ice_turn_last_event(st), ICE_TURN_EVT_NONE)
+    ce_eq("granted lifetime = 0",
+          ice_turn_granted_lifetime(st), 0)
+    ce_eq("relay cand id = -1",
+          ice_turn_relay_candidate_id(st), 0 - 1)
+    ce_eq("last error code = 0",
+          ice_turn_last_error_code(st), 0)
+    ce_str_eq("relayed ip empty",
+              ice_turn_relayed_ip(st), "")
+    ce_eq("relayed port = 0",
+          ice_turn_relayed_port(st), 0)
+}
+
+// ============================================================================
+//                         Relay candidate priority (RFC 8445 §5.1.2.1)
+// ============================================================================
+
+fn test_relay_priority_rfc_formula() {
+    // Manual RFC 8445 §5.1.2.1 computation:
+    //   2^24 * 0      = 0
+    //   256  * 65535  = 16776960
+    //   256  - 1      = 255
+    //   sum           = 16777215
+    ce_eq("relay priority = 16777215 (RFC 8445 §5.1.2.1)",
+          ice_turn_relay_priority(), 16777215)
+}
+
+// Cross-check the same value against R30C's `ice_candidate_priority`
+// at the RELAY type tag with local_pref=65535 and component=1. Both
+// must agree by spec.
+fn test_relay_priority_matches_r30c() {
+    let r30c = ice_candidate_priority(ICE_TYPE_RELAY, 65535, 1)
+    ce_eq("R35D priority = R30C priority (RELAY, lp=65535, c=1)",
+          ice_turn_relay_priority(), r30c)
+}
+
+// ============================================================================
+//                         check_escalation logic
+// ============================================================================
+
+fn test_check_escalation_empty_pairs_no_escalate() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    // No candidates added; no pairs formed.
+    ce_eq("empty checklist -> NO_ESCALATION",
+          ice_turn_check_escalation(st),
+          ICE_TURN_NO_ESCALATION)
+}
+
+fn test_check_escalation_some_succeed_no_escalate() {
+    let agent = ice_init(1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(agent)
+    // Pair 0 succeeds.
+    ice_mark_pair_in_progress(agent, 0)
+    ice_mark_pair_succeeded(agent, 0)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    ce_eq("some pair succeeded -> NO_ESCALATION",
+          ice_turn_check_escalation(st),
+          ICE_TURN_NO_ESCALATION)
+}
+
+fn test_check_escalation_some_in_progress_no_escalate() {
+    let agent = ice_init(1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(agent)
+    ice_mark_pair_in_progress(agent, 0)        // still in progress, not failed
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    ce_eq("pair still in progress -> NO_ESCALATION",
+          ice_turn_check_escalation(st),
+          ICE_TURN_NO_ESCALATION)
+}
+
+fn test_check_escalation_all_failed_escalates() {
+    let agent = ice_init(1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(agent, ICE_TYPE_SRFLX,
+                            "203.0.113.5", 50001, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(agent)
+    _itt_drive_all_failed(agent)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    ce_eq("all pairs failed -> ESCALATE",
+          ice_turn_check_escalation(st),
+          ICE_TURN_ESCALATE)
+}
+
+fn test_check_escalation_already_active_no_escalate() {
+    let agent = ice_init(1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(agent)
+    _itt_drive_all_failed(agent)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    // First check escalates...
+    ce_eq("first check ESCALATES",
+          ice_turn_check_escalation(st),
+          ICE_TURN_ESCALATE)
+    // Now begin allocate to latch turn_active=1
+    let txn = _itt_fixed_txn()
+    ice_turn_begin_allocate(st, txn)
+    // Subsequent check must NOT re-escalate (one-way escalation rule).
+    ce_eq("turn active -> NO_ESCALATION",
+          ice_turn_check_escalation(st),
+          ICE_TURN_NO_ESCALATION)
+}
+
+// ============================================================================
+//                         begin_allocate
+// ============================================================================
+
+fn test_begin_allocate_emits_valid_turn_packet() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_fixed_txn()
+    let req = ice_turn_begin_allocate(st, txn)
+    ce_eq("emit size = 36", req[1], 36)
+    // Parse classify the emitted bytes via R34B's API to confirm
+    // method/class are correct.
+    let cls = turn_classify_message(req[0], req[1])
+    ce_eq("classified method = ALLOCATE",
+          cls[0], TURN_METHOD_ALLOCATE)
+    ce_eq("classified class = REQUEST",
+          cls[1], TURN_CLASS_REQUEST)
+    ce_eq("classified body length = 16", cls[2], 16)
+    // Counter + state bumped
+    ce_eq("attempted bumped to 1",
+          ice_turn_escalations_attempted(st), 1)
+    ce_eq("turn_active latched to 1",
+          ice_turn_is_active(st), 1)
+    ce_eq("last_state = ESCALATING",
+          ice_turn_last_state(st), ICE_TURN_STATE_ESCALATING)
+    ce_eq("last_event = BEGIN_ALLOC",
+          ice_turn_last_event(st), ICE_TURN_EVT_BEGIN_ALLOC)
+}
+
+fn test_begin_allocate_txn_id_persisted() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_alt_txn()
+    ice_turn_begin_allocate(st, txn)
+    // The state's internal txn buffer should byte-mirror the input.
+    let stored = st[7]      // _ICE_TURN_S_TXN_ID slot index
+    ce_eq("stored txn byte 0 = 0xA0", load8(stored + 0), 0xA0)
+    ce_eq("stored txn byte 11 = 0xAB", load8(stored + 11), 0xAB)
+}
+
+// ============================================================================
+//                         handle_allocate_response: success
+// ============================================================================
+
+fn test_handle_response_success_relay_ready() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_fixed_txn()
+    ice_turn_begin_allocate(st, txn)
+    // Local cand count before injection (only what the caller already
+    // added via ICE; we added nothing, so 0).
+    let pre = ice_n_local_candidates(agent)
+    ce_eq("pre-injection local count = 0", pre, 0)
+    // Build a stub success response using R34B's emit helper. The
+    // response is for the SAME txn id we passed to begin_allocate.
+    let relayed_buf = turn_ipv4_str_to_buf("198.51.100.50")
+    let mapped_buf  = turn_ipv4_str_to_buf("192.0.2.77")
+    let resp = turn_emit_allocate_success_response(txn,
+                                                   relayed_buf, 50001,
+                                                   600,
+                                                   mapped_buf, 33445)
+    let rc = ice_turn_handle_allocate_response(st, resp[0], resp[1])
+    ce_eq("handler returns RELAY_READY",
+          rc, ICE_TURN_RELAY_READY)
+    ce_str_eq("relayed ip stashed",
+              ice_turn_relayed_ip(st), "198.51.100.50")
+    ce_eq("relayed port stashed",
+          ice_turn_relayed_port(st), 50001)
+    ce_eq("granted lifetime stashed",
+          ice_turn_granted_lifetime(st), 600)
+    ce_eq("succeeded counter bumped",
+          ice_turn_escalations_succeeded(st), 1)
+    ce_eq("failed counter still 0",
+          ice_turn_escalations_failed(st), 0)
+    ce_eq("last_state = ALLOCATED",
+          ice_turn_last_state(st), ICE_TURN_STATE_ALLOCATED)
+    ce_eq("last_event = RELAY_READY",
+          ice_turn_last_event(st), ICE_TURN_EVT_RELAY_READY)
+    // ICE agent gained a new RELAY-typed local candidate.
+    ce_eq("post-injection local count = 1",
+          ice_n_local_candidates(agent), 1)
+    let id = ice_turn_relay_candidate_id(st)
+    ce_eq("relay cand id = 0 (first add)", id, 0)
+    let cand = ice_local_candidate(agent, id)
+    ce_check("relay cand retrievable", cand != 0)
+    ce_eq("relay cand type = RELAY", cand[0], ICE_TYPE_RELAY)
+    ce_str_eq("relay cand ip = relayed ip",
+              cand[1], "198.51.100.50")
+    ce_eq("relay cand port = relayed port",
+          cand[2], 50001)
+    ce_eq("relay cand family = IPv4",
+          cand[3], ICE_FAMILY_IPV4)
+    ce_eq("relay cand component = 1 (RTP)", cand[4], 1)
+}
+
+// ============================================================================
+//                         handle_allocate_response: 401 error
+// ============================================================================
+
+fn test_handle_response_401_failed() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_fixed_txn()
+    ice_turn_begin_allocate(st, txn)
+    let pre = ice_n_local_candidates(agent)
+    // Build a 401 Unauthorized response via R34B's helper.
+    let resp = turn_emit_allocate_error_response(txn, 4, 1, "Unauthorized")
+    let rc = ice_turn_handle_allocate_response(st, resp[0], resp[1])
+    ce_eq("handler returns RELAY_FAILED on 401",
+          rc, ICE_TURN_RELAY_FAILED)
+    ce_eq("last_error_code = 401",
+          ice_turn_last_error_code(st), 401)
+    ce_str_eq("last_error_reason = 'Unauthorized'",
+              ice_turn_last_error_reason(st), "Unauthorized")
+    ce_eq("failed counter bumped",
+          ice_turn_escalations_failed(st), 1)
+    ce_eq("succeeded counter still 0",
+          ice_turn_escalations_succeeded(st), 0)
+    ce_eq("last_state = FAILED",
+          ice_turn_last_state(st), ICE_TURN_STATE_FAILED)
+    ce_eq("last_event = RELAY_FAILED",
+          ice_turn_last_event(st), ICE_TURN_EVT_RELAY_FAILED)
+    // ICE agent unchanged.
+    ce_eq("local count unchanged on error",
+          ice_n_local_candidates(agent), pre)
+    ce_eq("relay cand id remains -1",
+          ice_turn_relay_candidate_id(st), 0 - 1)
+}
+
+fn test_handle_response_437_failed() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_fixed_txn()
+    ice_turn_begin_allocate(st, txn)
+    let resp = turn_emit_allocate_error_response(txn, 4, 37,
+                                                 "Allocation Mismatch")
+    let rc = ice_turn_handle_allocate_response(st, resp[0], resp[1])
+    ce_eq("handler returns RELAY_FAILED on 437",
+          rc, ICE_TURN_RELAY_FAILED)
+    ce_eq("err code = 437",
+          ice_turn_last_error_code(st), 437)
+}
+
+// ============================================================================
+//                         handle_allocate_response: malformed
+// ============================================================================
+
+fn test_handle_response_malformed_short_buffer() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_fixed_txn()
+    ice_turn_begin_allocate(st, txn)
+    // 8-byte zero buffer is too short to be a 20-byte STUN/TURN header.
+    let buf = alloc(9)
+    let i = 0
+    while i < 8 { store8(buf + i, 0); i = i + 1 }
+    store8(buf + 8, 0)
+    let rc = ice_turn_handle_allocate_response(st, buf, 8)
+    ce_eq("malformed -> RELAY_FAILED",
+          rc, ICE_TURN_RELAY_FAILED)
+    ce_eq("synthetic err code = -999",
+          ice_turn_last_error_code(st), 0 - 999)
+    ce_eq("failed counter bumped",
+          ice_turn_escalations_failed(st), 1)
+}
+
+// ============================================================================
+//                         End-to-end ICE -> TURN escalation flow
+// ============================================================================
+
+fn test_end_to_end_escalation_flow() {
+    let agent = ice_init(1)
+    // Step 1: gather host candidates on both sides.
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(agent, ICE_TYPE_SRFLX,
+                            "203.0.113.5", 50001, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.3", 50101, ICE_FAMILY_IPV4, 1)
+    let n_pairs = ice_form_pairs(agent)
+    ce_eq("2x2 forms 4 pairs", n_pairs, 4)
+    // Step 2: drive every pair to FAILED (simulating exhausted host/srflx).
+    _itt_drive_all_failed(agent)
+    // Step 3: orchestrator detects escalation.
+    let st = ice_turn_init(agent, "198.51.100.1", 3478)
+    ce_eq("escalation detected",
+          ice_turn_check_escalation(st),
+          ICE_TURN_ESCALATE)
+    // Step 4: begin_allocate emits an Allocate request.
+    let txn = _itt_fixed_txn()
+    let req = ice_turn_begin_allocate(st, txn)
+    ce_check("req emitted (n=36)", req[1] == 36)
+    // Step 5: stub TURN server replies with the relayed addr.
+    let relayed_buf = turn_ipv4_str_to_buf("198.51.100.100")
+    let mapped_buf  = turn_ipv4_str_to_buf("203.0.113.42")
+    let resp = turn_emit_allocate_success_response(txn,
+                                                   relayed_buf, 60000,
+                                                   600,
+                                                   mapped_buf, 51000)
+    let rc = ice_turn_handle_allocate_response(st, resp[0], resp[1])
+    ce_eq("relay ready", rc, ICE_TURN_RELAY_READY)
+    // Step 6: ICE agent now has a relay candidate; re-forming pairs
+    // creates new relay-typed pairs (one per remote).
+    ce_eq("locals now 3 (host + srflx + relay)",
+          ice_n_local_candidates(agent), 3)
+    let n2 = ice_form_pairs(agent)
+    ce_eq("re-formed pairs = 3 locals x 2 remotes = 6",
+          n2, 6)
+    // At least one of the new pairs has the relay local.
+    let relay_cand_id = ice_turn_relay_candidate_id(st)
+    let found_relay_pair = 0
+    let i = 0
+    while i < ice_n_pairs(agent) {
+        let p = ice_get_pair(agent, i)
+        if p[0] == relay_cand_id {
+            found_relay_pair = 1
+        }
+        i = i + 1
+    }
+    ce_eq("at least one pair uses relay local",
+          found_relay_pair, 1)
+}
+
+// ============================================================================
+//                         _all_pairs_failed internal helper
+// ============================================================================
+
+fn test_all_pairs_failed_helper_empty() {
+    let agent = ice_init(1)
+    ce_eq("empty list -> not all failed",
+          _ice_turn_test_all_pairs_failed(agent), 0)
+}
+
+fn test_all_pairs_failed_helper_one_failed() {
+    let agent = ice_init(1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(agent)
+    ice_mark_pair_in_progress(agent, 0)
+    ice_mark_pair_failed(agent, 0)
+    ce_eq("one-pair-all-failed -> 1",
+          _ice_turn_test_all_pairs_failed(agent), 1)
+}
+
+fn test_all_pairs_failed_helper_mixed() {
+    let agent = ice_init(1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.1", 50000, ICE_FAMILY_IPV4, 1)
+    ice_add_local_candidate(agent, ICE_TYPE_HOST,
+                            "10.0.0.4", 50001, ICE_FAMILY_IPV4, 1)
+    ice_add_remote_candidate(agent, ICE_TYPE_HOST,
+                             "10.0.0.2", 50100, ICE_FAMILY_IPV4, 1)
+    ice_form_pairs(agent)
+    // Pair 0 fails, pair 1 stays Waiting.
+    ice_mark_pair_in_progress(agent, 0)
+    ice_mark_pair_failed(agent, 0)
+    ce_eq("mixed states -> not all failed",
+          _ice_turn_test_all_pairs_failed(agent), 0)
+}
+
+// ============================================================================
+//                         _is_parse_err helper
+// ============================================================================
+
+fn test_is_parse_err_sentinels() {
+    ce_eq("TURN_ERR_HEADER detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_HEADER), 1)
+    ce_eq("TURN_ERR_COOKIE detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_COOKIE), 1)
+    ce_eq("TURN_ERR_LENGTH detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_LENGTH), 1)
+    ce_eq("TURN_ERR_METHOD detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_METHOD), 1)
+    ce_eq("TURN_ERR_FAMILY detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_FAMILY), 1)
+    ce_eq("TURN_ERR_NO_ATTR detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_NO_ATTR), 1)
+    ce_eq("TURN_ERR_ATTR detected",
+          _ice_turn_test_is_parse_err(TURN_ERR_ATTR), 1)
+    // Zero is NOT an error sentinel.
+    ce_eq("0 is NOT a parse error",
+          _ice_turn_test_is_parse_err(0), 0)
+}
+
+// ============================================================================
+//                         Status line shape
+// ============================================================================
+
+fn test_status_line_shape() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let line = ice_turn_status_line(st)
+    ce_check("status line non-empty", len(line) > 0)
+    ce_check("status line begins with 'ice_turn:'",
+             str_eq(substr(line, 0, 9), "ice_turn:") == 1)
+}
+
+fn test_status_line_after_success() {
+    let agent = ice_init(1)
+    let st = ice_turn_init(agent, "203.0.113.10", 3478)
+    let txn = _itt_fixed_txn()
+    ice_turn_begin_allocate(st, txn)
+    let relayed_buf = turn_ipv4_str_to_buf("198.51.100.50")
+    let mapped_buf  = turn_ipv4_str_to_buf("192.0.2.77")
+    let resp = turn_emit_allocate_success_response(txn, relayed_buf, 50001,
+                                                   600, mapped_buf, 33445)
+    ice_turn_handle_allocate_response(st, resp[0], resp[1])
+    let line = ice_turn_status_line(st)
+    ce_check("status line non-empty after success",
+             len(line) > 0)
+}
+
+fn test_state_name_shim() {
+    ce_str_eq("state idle name",
+              _ice_turn_test_state_name(ICE_TURN_STATE_IDLE), "idle")
+    ce_str_eq("state escalating name",
+              _ice_turn_test_state_name(ICE_TURN_STATE_ESCALATING),
+              "escalating")
+    ce_str_eq("state allocated name",
+              _ice_turn_test_state_name(ICE_TURN_STATE_ALLOCATED),
+              "allocated")
+    ce_str_eq("state failed name",
+              _ice_turn_test_state_name(ICE_TURN_STATE_FAILED), "failed")
+}
+
+// ============================================================================
+//                         main
+// ============================================================================
+
+fn main() {
+    test_init_state_shape()
+    test_relay_priority_rfc_formula()
+    test_relay_priority_matches_r30c()
+    test_check_escalation_empty_pairs_no_escalate()
+    test_check_escalation_some_succeed_no_escalate()
+    test_check_escalation_some_in_progress_no_escalate()
+    test_check_escalation_all_failed_escalates()
+    test_check_escalation_already_active_no_escalate()
+    test_begin_allocate_emits_valid_turn_packet()
+    test_begin_allocate_txn_id_persisted()
+    test_handle_response_success_relay_ready()
+    test_handle_response_401_failed()
+    test_handle_response_437_failed()
+    test_handle_response_malformed_short_buffer()
+    test_end_to_end_escalation_flow()
+    test_all_pairs_failed_helper_empty()
+    test_all_pairs_failed_helper_one_failed()
+    test_all_pairs_failed_helper_mixed()
+    test_is_parse_err_sentinels()
+    test_status_line_shape()
+    test_status_line_after_success()
+    test_state_name_shim()
+    ce_summary("ice_turn")
+}
+
+main()

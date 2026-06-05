@@ -13,6 +13,51 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R35D lands the ICE-TURN integration layer -- when ICE's
+> peer-to-peer candidate gathering exhausts host + server-reflexive
+> candidates without a usable pair, the orchestrator escalates to a
+> TURN-relay candidate via R34B's TURN codec. New module
+> `src/federation/ice_turn.nova` (~360 lines, leaf consumer of
+> `ice.nova` + `turn.nova`, modifies NEITHER) implements
+> `ice_turn_init` / `ice_turn_check_escalation` /
+> `ice_turn_begin_allocate` / `ice_turn_handle_allocate_response` /
+> `ice_turn_relay_priority`. Escalation decision: ALL ICE pairs in
+> `ICE_CHECK_FAILED` terminal state AND TURN not already activated
+> -> `ICE_TURN_ESCALATE`. One-way: once `turn_active=1`, subsequent
+> checks return `NO_ESCALATION`. Begin-allocate emits a 36-byte
+> Allocate Request via `turn_emit_allocate_request(txn_id,
+> lifetime=600, transport=UDP17)` and latches `turn_active`. On
+> successful Allocate Response, extracts the relayed (ip, port) and
+> injects it as an `ICE_TYPE_RELAY` local candidate into R30C's
+> agent via existing `ice_add_local_candidate(...)`. On 401 / 437
+> error response, captures err_code + reason and bumps the failure
+> counter; ice_agent stays unchanged. Relay candidate priority
+> (RFC 8445 §5.1.2.1) = `2^24 * 0 + 256 * 65535 + (256 - 1) =
+> 16777215` -- verified hand-computed AND against R30C's
+> `ice_candidate_priority(ICE_TYPE_RELAY, 65535, 1)`.
+> `tests/unit/test_ice_turn.nova` adds 88 new assertions: init
+> shape, relay priority (RFC formula + R30C cross-check),
+> `check_escalation` decision tree (empty / some-succeeded /
+> in-progress / all-failed / already-active), `begin_allocate`
+> classifier round-trip + counter + txn-id mirror,
+> `handle_allocate_response` happy path (relayed addr extracted,
+> RELAY-typed candidate added to ice_agent, all candidate fields
+> correct), 401 / 437 / malformed-bytes error paths (failure
+> counter, ice_agent unchanged), end-to-end flow (gather host+srflx
+> -> drive 4 pairs to FAILED -> escalate -> allocate -> success
+> -> re-form 3x2=6 pairs with relay local present). Out of scope
+> (documented in module header): USERNAME / MESSAGE-INTEGRITY /
+> NONCE / REALM long-term-credential auth handshake (R34B's emit
+> path doesn't generate them; R35D inherits the limitation),
+> downgrade-after-escalation (RFC 8445 allows re-nomination but
+> R35D is one-way escalate), Refresh / Permission / Channel
+> lifecycle (R35B's `turn_client_*` state machine handles those at
+> `063824e`), CreatePermission for each remote peer (follow-up
+> wiring on top of R35D + R35B), multi-relay environments. Prior
+> assertions byte-identical: R30C ice `OK (70 checks)` + R34B turn
+> `OK (323 checks)` -- 200 original R34B assertions plus R35B's
+> 123 state-machine extension assertions in the same suite.
+>
 > R34B lands the TURN protocol wire codec (RFC 5766 / 8656) -- the
 > last R28E.2 deferred item. New module `src/federation/turn.nova`
 > (~700 lines, leaf) implements parse + emit for the six TURN

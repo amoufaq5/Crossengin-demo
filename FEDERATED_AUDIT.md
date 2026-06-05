@@ -4952,3 +4952,125 @@ is reported truthfully either way.
    listening will be counted as a `CONNECT_SO_ERROR` and fall
    to the next gossip round naturally — matching R28A's late-ACK
    isolation principle.
+
+## R35D -- ICE-TURN integration layer
+
+### Why this exists
+
+R30C (`src/federation/ice.nova`) shipped the ICE agent (RFC 8445
+subset) with host + server-reflexive candidate gathering and the
+connectivity-check matrix. R34B (`src/federation/turn.nova`) shipped
+the TURN protocol wire codec -- emit + parse for Allocate / Refresh /
+Send / Data / CreatePermission / ChannelBind. Both were leaf modules
+on purpose: R30C explicitly punted relay-candidate gathering as
+"future work" and R34B explicitly punted the allocation lifecycle
+to its callers.
+
+R35D is the THIN ORCHESTRATOR that composes the two without modifying
+either. It implements the RFC 8445 §5.1.1 escalation rule: when the
+ICE checklist runs out of usable pairs (all in `FAILED` terminal
+state), open a TURN allocation, accept the relayed address back into
+the ICE agent as a new `relay`-typed local candidate, and let ICE's
+existing pair-formation + connectivity-check loop pick the relayed
+addr up naturally.
+
+### Architecture: zero-modification composer
+
+`ice_turn.nova` is a 360-line leaf module. It imports `ice.nova` +
+`turn.nova` and exposes a small public surface:
+
+```
+ice_turn_init(ice_agent, turn_server_ip, turn_server_port) -> state
+ice_turn_check_escalation(state) -> ICE_TURN_NO_ESCALATION | ICE_TURN_ESCALATE
+ice_turn_begin_allocate(state, txn_id_buf) -> [emit_buf, n]
+ice_turn_handle_allocate_response(state, recv_buf, n) -> READY | FAILED
+ice_turn_relay_priority() -> 16777215
+```
+
+Calls into `ice.nova` use ONLY the existing R30C public surface
+(`ice_n_pairs`, `ice_get_pair`, `ice_add_local_candidate`). Calls
+into `turn.nova` use ONLY the existing R34B public surface
+(`turn_emit_allocate_request`, `turn_parse_allocate_success_response`,
+`turn_parse_allocate_error_response`, `turn_ipv4_str_to_buf`).
+R34B's `TURN_LIFETIME_DEFAULT=600` and `TURN_TRANSPORT_UDP=17`
+constants flow through naturally.
+
+### Relay candidate priority (RFC 8445 §5.1.2.1)
+
+For a relay candidate at the canonical RTP component with maximum
+local preference:
+  * type_pref   = 0     (relay is LOWEST -- RFC 8445 §5.1.2.2)
+  * local_pref  = 65535
+  * component   = 1     (RTP)
+
+  priority = 2^24 * 0 + 256 * 65535 + (256 - 1)
+           = 0        + 16776960    + 255
+           = 16777215
+
+Verified two ways: hand-computed in the brief, AND against R30C's
+`ice_candidate_priority(ICE_TYPE_RELAY, 65535, 1)` returning the
+same value. The test does both comparisons.
+
+### Honest design caveats
+
+1. **Long-term-credential auth not implemented.** R34B's emit path
+   doesn't generate USERNAME / REALM / NONCE / MESSAGE-INTEGRITY
+   (RFC 8489 §9.2). R34B's parse path TOLERATES these attributes
+   on incoming responses (they're skipped over) but does NOT
+   verify integrity. A real TURN server returns `401 Unauthorized`
+   on the first Allocate request and expects a second request with
+   credentials -- R35D correctly reports the 401 as
+   `ICE_TURN_RELAY_FAILED` and does NOT auto-retry. This is the
+   same boundary R34B documented; R35D inherits the limitation.
+   Future hardening round must plumb auth through both R34B emit
+   and this orchestrator.
+2. **No downgrade after escalation.** Once `turn_active=1` is
+   latched in `ice_turn_begin_allocate`, subsequent calls to
+   `ice_turn_check_escalation` always return `NO_ESCALATION` even
+   if a higher-priority host / srflx pair later succeeds. This is
+   one-way escalation; RFC 8445 allows re-nomination of a better
+   pair but R35D doesn't implement that. A real ICE driver running
+   R30C's `ice_mark_pair_succeeded` would naturally nominate the
+   higher-priority pair without needing R35D to "clear" the relay.
+3. **Refresh / Permission / Channel lifecycle is R35B's domain.**
+   R35D handles the FIRST `Allocate` only. The Refresh-on-expiry
+   loop, the per-peer Permission table, and the channel-binding
+   bookkeeping live in R35B's `turn_client_*` state machine
+   (`063824e`). R35D and R35B are orthogonal: R35D triggers the
+   first Allocate; R35B drives the lifecycle once the allocation
+   is up.
+4. **CreatePermission for the remote peer is not wired.** Adding
+   the relayed addr as an ICE local candidate is sufficient for
+   `ice_form_pairs` to include it in the checklist, but actually
+   sending application data through the relay requires
+   `CreatePermission` for each remote peer the application wants
+   to reach (RFC 5766 §9). That's a follow-up wiring step on top
+   of R35D + R35B.
+5. **Single TURN server.** The state holds one
+   `(turn_server_ip, turn_server_port)` pair. Multi-relay
+   environments (different TURN servers per region) would need a
+   list in the state and per-server txn id tracking.
+
+### Tests
+
+`tests/unit/test_ice_turn.nova` -- 88 assertions, covering:
+  * init shape + counters zero
+  * relay priority value (RFC formula AND R30C cross-check)
+  * `check_escalation` decision tree: empty / some-succeeded /
+    some-in-progress / all-failed / already-active
+  * `begin_allocate` emit byte size + R34B classifier round-trip +
+    counter bump + txn-id mirror
+  * `handle_allocate_response` happy path: relayed addr extracted,
+    candidate injected into ice_agent, all candidate fields correct
+  * `handle_allocate_response` 401 + 437 error paths: err_code +
+    reason captured, failed counter bumps, ice_agent UNCHANGED
+  * `handle_allocate_response` malformed bytes: synthetic err_code,
+    failed counter bumps
+  * end-to-end flow: 2x2 pairs gathered, all FAILED, escalate,
+    allocate, success, re-form 3x2=6 pairs, relay pair present
+  * internal helpers `_all_pairs_failed` + `_is_parse_err`
+
+### Module count delta
+
+* +1 source module: `src/federation/ice_turn.nova`.
+* +1 test module: `tests/unit/test_ice_turn.nova`.

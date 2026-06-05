@@ -3,6 +3,296 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R35D -- ICE-TURN integration layer (R30C + R34B consumer)
+
+**Status: complete** -- closes the last gap between R30C's ICE agent
+and R34B's TURN wire codec. When ICE's checklist exhausts host +
+server-reflexive candidates without a usable pair, R35D escalates to
+a TURN-relay candidate.
+
+### What R35D delivers
+
+New module `src/federation/ice_turn.nova` (~360 lines, leaf consumer
+of `ice.nova` + `turn.nova` -- modifies NEITHER). It is a thin
+orchestrator:
+
+1. `ice_turn_init(ice_agent, turn_server_ip, turn_server_port) -> state`
+   builds the orchestration record with positional slots:
+   `ice_agent / turn_active / turn_server_addr / relayed_addr /
+   txn_id_buf / last_state / last_event / escalations_attempted /
+   escalations_succeeded / escalations_failed / last_error_code /
+   last_error_reason / granted_lifetime / relay_cand_id`.
+2. `ice_turn_check_escalation(state) -> ICE_TURN_NO_ESCALATION |
+   ICE_TURN_ESCALATE` returns `ESCALATE` iff (a) `turn_active=0`,
+   (b) at least one pair exists, and (c) EVERY pair is in R30C's
+   `ICE_CHECK_FAILED` terminal state. Empty checklist returns
+   `NO_ESCALATION` (gathering hasn't completed). One-way: once
+   `turn_active=1`, subsequent calls always return `NO_ESCALATION`.
+3. `ice_turn_begin_allocate(state, txn_id_buf) -> [emit_buf, n]`
+   invokes R34B's `turn_emit_allocate_request(txn_id, lifetime=600,
+   transport=UDP)` to produce the 36-byte Allocate Request, stashes
+   `txn_id` for response matching, latches `turn_active=1`, bumps
+   `escalations_attempted`.
+4. `ice_turn_handle_allocate_response(state, recv_buf, n) ->
+   ICE_TURN_RELAY_READY | ICE_TURN_RELAY_FAILED` tries R34B's
+   `turn_parse_allocate_success_response` first. On success, extracts
+   the relayed (ip, port) + lifetime, injects the relayed addr as
+   an `ICE_TYPE_RELAY` local candidate via R30C's existing
+   `ice_add_local_candidate(...)`, bumps `escalations_succeeded`,
+   returns `RELAY_READY`. Falls back to
+   `turn_parse_allocate_error_response` -- on success stores
+   `(err_code, reason)`, bumps `escalations_failed`, returns
+   `RELAY_FAILED`. If neither parser recognizes the bytes (malformed
+   header / wrong cookie / etc), stores synthetic err_code `-999`
+   and returns `RELAY_FAILED`.
+5. `ice_turn_relay_priority() -> 16777215` per RFC 8445 §5.1.2.1
+   for relay candidates (type_pref=0, local_pref=65535, component=1):
+   `priority = 2^24 * 0 + 256 * 65535 + (256 - 1) = 16777215`.
+   Verified against R30C's `ice_candidate_priority(ICE_TYPE_RELAY,
+   65535, 1)` -- byte-identical.
+
+### Tests (`tests/unit/test_ice_turn.nova`)
+
+88 new assertions:
+* init shape: state slots populated, all counters zero, txn id
+  buffer pre-zeroed, server addr stashed.
+* relay priority = 16777215 (RFC 8445 §5.1.2.1) verified two ways:
+  hand-computed AND against R30C's `ice_candidate_priority`.
+* `check_escalation`: empty list / some succeeded / some in-progress
+  / all failed / already active -- all five branches.
+* `begin_allocate`: 36-byte emit, R34B classifier confirms
+  method=ALLOCATE class=REQUEST body=16, counters bump, txn id
+  byte-mirrored into state.
+* `handle_allocate_response` on stub success: relayed ip/port/
+  lifetime stashed, RELAY-typed candidate injected into ice_agent
+  (verified via `ice_local_candidate` lookup -- type, ip, port,
+  family, component all correct).
+* `handle_allocate_response` on 401 Unauthorized: err_code=401 +
+  reason stored, failed counter bumps, ice_agent UNCHANGED
+  (n_local_candidates pre == post).
+* `handle_allocate_response` on 437 Allocation Mismatch.
+* `handle_allocate_response` on malformed buffer (8 zero bytes):
+  synthetic err_code -999, failed counter bumps.
+* End-to-end: gather host+srflx, drive all 4 pairs to FAILED,
+  escalate, allocate, success-response, locals grow 2 -> 3,
+  re-form pairs -> 3 x 2 = 6 pairs, at least one uses the relay
+  local.
+* `_all_pairs_failed` helper covers empty / one-failed / mixed.
+* `_is_parse_err` sentinel detection for all 7 TURN_ERR_* codes
+  plus 0 is NOT an error.
+* status line shape + state name shim.
+
+### What R35D does NOT ship (out of scope, documented)
+
+* **USERNAME / MESSAGE-INTEGRITY / NONCE / REALM long-term-credential
+  auth flow.** R34B's emit path doesn't generate these attributes;
+  the parse path TOLERATES them on incoming responses but doesn't
+  verify integrity. A real TURN server returns 401 Unauthorized on
+  the first Allocate -- R35D correctly reports that as
+  `ICE_TURN_RELAY_FAILED` rather than auto-retrying with credentials.
+  Future hardening round must plumb STUN long-term-credential auth
+  (RFC 8489 §9.2) through both R34B's emit path and this orchestrator.
+* **Refresh lifecycle.** TURN allocations have a server-granted
+  lifetime; clients must Refresh periodically (RFC 5766 §7). R35D
+  handles the FIRST Allocate only. The Refresh + Permission + Channel
+  lifecycle is owned by R35B (parallel "TURN allocation state
+  machine" round at `063824e`).
+* **Downgrade.** Once `turn_active=1` is latched, R35D does NOT
+  clear it even if a higher-priority host/srflx pair later succeeds.
+  RFC 8445 allows re-nomination but R35D is "one-way escalate"; a
+  real ICE driver would notice the higher-priority pair via R30C's
+  nomination logic naturally.
+* **CreatePermission + send/data wiring.** The relay candidate is
+  added to ICE so pair formation can include it, but actually
+  SENDING traffic through the relay requires CreatePermission for
+  each remote peer + ChannelBind for efficient delivery. That's a
+  follow-up wiring step on top of R35D.
+
+### Files modified
+
+* NEW: `src/federation/ice_turn.nova` (~360 lines, leaf composer).
+* NEW: `tests/unit/test_ice_turn.nova` (88 assertions).
+* MOD: `NEXT_SESSION.md`, `README.md`, `FEDERATED_AUDIT.md` -- R35D
+  section.
+* UNCHANGED: `src/federation/ice.nova` (byte-identical to `0f95bb6`
+  at commit `35f2637`), `src/federation/turn.nova` (the codec block
+  byte-identical to `423a352`; R35B's state-machine extension at
+  `063824e` is additive below the test-only shims and orthogonal to
+  R35D's call sites). R30C 70 prior assertions + R34B 200 prior
+  assertions preserved byte-identical (verified by running both test
+  files against unmodified imports -- `ice: OK (70 checks)` and
+  the original 200 of `turn: OK (323 checks)` still pass).
+
+### Module count delta
+
+* +1 source module: `src/federation/ice_turn.nova`.
+* +1 test module: `tests/unit/test_ice_turn.nova`.
+
+## R35B (R34B.2) -- TURN client-side allocation state machine
+
+**Status: complete** -- layers a CLIENT-side allocation state machine
+on top of R34B's TURN wire codec. R34B (`423a352`) shipped emit + parse
+for the six TURN message methods (Allocate / Refresh / Send / Data /
+CreatePermission / ChannelBind) but explicitly punted the state
+lifecycle to a future round; R35B closes that gap.
+
+### What R35B delivers
+
+Pure CLIENT-side state -- no socket I/O. Callers drive transitions by
+feeding `recv()` the wire bytes returned by the TURN server and by
+calling the `send_*` entry points which return `[buf, n]` tuples.
+
+* **`src/federation/turn.nova` (extended +~500 lines)** -- the wire
+  codec block (lines 1..1052) is unchanged byte-for-byte; the new
+  state machine sits below the test-only shims.
+  * 6-state lifecycle: `TURN_STATE_IDLE` / `_PENDING` / `_ACTIVE` /
+    `_REFRESHING` / `_EXPIRED` / `_FAILED`.
+  * `turn_client_init() -> state` returns a 24-slot positional list
+    (state, current txn_id, relayed + mapped IP/port, lifetime,
+    expiry, last_err_code, permissions_list, channels_list, 9
+    counter slots, in-flight method, pending peer for in-flight
+    perm/chanbind).
+  * Emit entry points:
+    * `turn_client_send_allocate(state, txn, lifetime, transport)`
+      transitions IDLE/EXPIRED/FAILED -> PENDING; rejects (returns
+      0) from PENDING / ACTIVE / REFRESHING.
+    * `turn_client_send_refresh(state, txn, lifetime)` transitions
+      ACTIVE -> REFRESHING.
+    * `turn_client_send_permission(state, txn, peer_ip, peer_port)`
+      must be ACTIVE; stamps the pending peer so the response handler
+      can append it to `permissions_list` on success.
+    * `turn_client_send_channel_bind(state, txn, channel_num,
+      peer_ip, peer_port)` must be ACTIVE; rejects `channel_num`
+      outside `[0x4000, 0x7FFE]` per RFC 5766 §11 BEFORE emit.
+  * `turn_client_recv(state, buf, n, current_time_unix) -> tag`
+    dispatches by `turn_classify_message`:
+    * Allocate success -> ACTIVE, populates relayed + mapped +
+      lifetime + `expiry = now + lifetime`, returns
+      `TURN_RECV_ALLOCATED`.
+    * Allocate error -> FAILED, `last_err_code` set, returns
+      `TURN_RECV_ALLOCATE_FAILED`.
+    * Refresh success (lifetime > 0) -> ACTIVE, extends `expiry =
+      now + lifetime`, returns `TURN_RECV_REFRESHED`.
+    * Refresh success (lifetime = 0) -> EXPIRED (RFC 5766 §7
+      server-initiated delete), returns `TURN_RECV_REFRESH_DELETED`.
+    * Refresh error -> FAILED, `last_err_code` set, returns
+      `TURN_RECV_REFRESH_FAILED`.
+    * CreatePermission success -> appends `[peer_ip, peer_port,
+      now+300]` (RFC 5766 §8 default) to permissions_list, returns
+      `TURN_RECV_PERMITTED`.
+    * CreatePermission error -> `last_err_code` set, state stays
+      ACTIVE, returns `TURN_RECV_PERM_FAILED`.
+    * ChannelBind success -> appends `[channel_num, peer_ip,
+      peer_port]` to channels_list, returns `TURN_RECV_CHANNEL_BOUND`.
+    * ChannelBind error -> `last_err_code` set, state stays ACTIVE,
+      returns `TURN_RECV_CHANNEL_FAILED`.
+    * Data Indication -> returns `TURN_RECV_DATA` (caller reads peer
+      + payload via R34B's `turn_parse_data_indication`).
+    * Mismatched txn_id / unknown method / truncated buf ->
+      `TURN_RECV_IGNORED`.
+  * `turn_client_tick(state, current_time_unix)` transitions ACTIVE
+    -> EXPIRED when `expiry < now`. Returns `TURN_TICK_OK` or
+    `TURN_TICK_EXPIRED`.
+  * Server-side response emitters added so tests can drive the state
+    machine without a live server:
+    `turn_emit_create_permission_success_response`,
+    `turn_emit_channel_bind_success_response`,
+    `turn_emit_refresh_error_response`,
+    `turn_emit_create_permission_error_response`,
+    `turn_emit_channel_bind_error_response`.
+* **`tests/unit/test_turn.nova` (extended +123 assertions -> 323
+  total)**. The prior 200 R34B assertions are byte-identical (lines
+  1..852 unchanged, `diff` confirms zero changes). New coverage:
+  initial state IDLE + all 9 counters zero + perms/channels empty;
+  `send_allocate` IDLE -> PENDING with counter bump; reject
+  `send_allocate` from PENDING; Allocate success PENDING -> ACTIVE
+  with relayed/mapped/lifetime/expiry populated; Allocate error (401)
+  -> FAILED with `last_err = 401`; mismatched txn -> IGNORED + state
+  unchanged; recv from IDLE -> IGNORED; `send_refresh` ACTIVE ->
+  REFRESHING; reject `send_refresh` from IDLE; Refresh success
+  (lifetime > 0) REFRESHING -> ACTIVE with expiry extended; Refresh
+  lifetime=0 -> EXPIRED; Refresh error -> FAILED with last_err = 437;
+  tick before/after expiry; tick from IDLE no-op; `send_permission`
+  + recv success -> permissions_list grows by 1 with expiry = now+300;
+  `send_channel_bind` + recv success -> channels_list grows by 1;
+  channel band enforcement (0x3FFF / 0x7FFF / 0x8000 rejected, 0x4000
+  boundary accepted); chanbind from IDLE rejected; multi-peer perm
+  scenario with 3 peers in sequence (all 3 appear in list, counters
+  at 3/3); Data Indication tag dispatch; FULL lifecycle walk IDLE ->
+  PENDING -> ACTIVE -> REFRESHING -> EXPIRED -> PENDING (re-allocate
+  after EXPIRED); ACTIVE -> EXPIRED via tick alone; perm error keeps
+  state ACTIVE with last_err = 403; chanbind error keeps state ACTIVE
+  with last_err = 441; short/truncated recv buf -> IGNORED, no crash.
+
+### Verified
+
+* `tests/unit/test_turn.nova`: **323 assertions, all passing** (200
+  prior R34B byte-identical + 123 new R35B).
+* Sibling federation tests unchanged: `test_srtp.nova` (111),
+  `test_ice.nova` (70), `test_stun_rfc8489.nova` (135),
+  `test_nat_traversal.nova` (209) all pass.
+
+### Skipped per the brief (documented)
+
+* **Server-side allocation pool** (RFC 5766 §6.2: port allocation,
+  five-tuple bookkeeping, permission enforcement, data forwarding
+  to peers). R35B is CLIENT-side only.
+* **Permission + channel refresh CADENCE**. The state carries per-
+  permission `expiry_unix` (computed as `now + 300` per RFC 5766
+  §8 default) and channel-binding records, but `turn_client_tick`
+  only reports ALLOCATION expiry -- it does NOT iterate
+  `permissions_list` / `channels_list` and return expired entries.
+  The next round can layer that without touching this module.
+* **Re-auth path on 401**. The state machine surfaces 401 via
+  `last_err_code = 401` + FAILED state; the MESSAGE-INTEGRITY
+  computation over USERNAME + REALM + NONCE remains deferred (same
+  as R34B).
+* **IPv6**. Inherits R34B's IPv4-only contract; family=2 is rejected
+  with `TURN_ERR_FAMILY`.
+
+### Honest caveat
+
+Permission expiry is a CLIENT-side estimate. The CreatePermission
+success response does NOT echo back a permission lifetime (unlike
+Allocate / Refresh which both echo LIFETIME). The state machine
+stamps `now + 300` (RFC 5766 §8 documented default) in
+`permissions_list[i][2]`. If a server uses a non-standard
+permission window, the client estimate drifts. The recommended
+pattern is to re-issue CreatePermission well inside the 5-minute
+window (e.g. every 4 minutes); the cadence is the caller's
+responsibility for now. The data structure already carries the
+hook (`permissions_list[i][2]`).
+
+### Files modified
+
+* MOD: `src/federation/turn.nova` (+~500 lines, state machine
+  layered AFTER the wire codec block; the wire codec section
+  1..1052 is unchanged).
+* MOD: `tests/unit/test_turn.nova` (+123 assertions; prior 200
+  byte-identical in lines 1..852).
+* MOD: `NEXT_SESSION.md`, `FEDERATED_AUDIT.md`, `README.md` -- R35B
+  section.
+* UNCHANGED: `dtls12.nova`, `srtp.nova`, `ice.nova`, `stun_rfc8489.
+  nova`, `nat_traversal.nova`, `ice_turn.nova` (file-ownership rule
+  for the parallel-agent sprint).
+
+### Module count delta: 0 (extension only).
+
+### Pointers for the next session
+
+* Per-permission / per-channel REFRESH cadence: the data structure
+  carries expiry stamps; add a `turn_client_tick_perms` variant that
+  walks `permissions_list` / `channels_list` and returns the
+  expired-but-needed set for caller-driven CreatePermission /
+  ChannelBind re-issue.
+* R35D landed the ICE-TURN integration layer; the state machine
+  surface R35B exposes plugs in cleanly under that layer.
+* Compose `stun_hmac_sha1` (from R30C) with REALM + NONCE on the
+  401 retry path.
+* Channel-data framing (RFC 5766 §11.5 -- 4-byte channel header
+  on the data plane). The state machine knows which channels are
+  bound; a future round can ship the channel-data send/recv path.
+
 ## R34A (R33A.2) -- dtls12 SHA-256 dedup -> canonical sha256.nova
 
 **Status: complete** -- retires the FOURTH and last inline FIPS 180-4
