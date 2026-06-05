@@ -13,6 +13,93 @@ computational units rather than orchestrating a pipeline of modules.
 > process.** Implemented in NOVA and verified against the real self-hosting
 > toolchain.
 >
+> R34C lands the SRTP wire codec (RFC 3711) -- the next federation
+> primitive after R29B/R31B/R32B/R33B's DTLS 1.2 + R30C's ICE.
+> New module `src/federation/srtp.nova`: AES-CM-128 stream cipher
+> (RFC 3711 §4.1.1, salt || ssrc || packet_index XOR construction
+> with per-block counter increment), HMAC-SHA1-80 authenticator
+> (RFC 2104 + truncation to 80 bits per RFC 3711 §4.2, with the
+> 32-bit ROC appended to the AAD), AES-CM-based key derivation
+> (RFC 3711 §4.3 -- master key + salt -> encryption key (16B,
+> label 0x00) + auth key (20B, label 0x01) + SRTP salt (14B,
+> label 0x02)), 64-packet sliding anti-replay window keyed on
+> the 48-bit extended sequence (same pattern R32B used for DTLS
+> 1.2 but on the RTP seq), and the RFC 3711 §3.3.1 ROC estimator
+> for guessing the rollover counter on a wrapping 16-bit seq.
+> Public API: `srtp_state_init` / `srtp_seal_packet` /
+> `srtp_open_packet` / `srtp_kdf` / `srtp_derive_keys` /
+> `srtp_authenticate` / `srtp_encrypt` / `srtp_decrypt`.
+> AES-128 block primitive is reused from R30B's `src/safety/
+> aes_gcm.nova` (no duplication). SHA-1 is inlined locally as
+> `_srtp_sha1_*` -- it is NOT currently in `src/safety/` and the
+> R34C brief deferred the canonical extraction; future R34A.3-style
+> dedup can move it to `src/safety/sha1.nova` when a second
+> consumer needs SHA-1. `tests/unit/test_srtp.nova` adds 111 new
+> assertions: SHA-1 KATs (RFC 3174 Appendix A: "abc", "", FIPS
+> Appendix B.2 56-char, 55-byte one-block boundary), HMAC-SHA1
+> RFC 2202 TC1 + TC2 + TC4 + long-key normalization,
+> AES-CM keystream against published AES-128-ECB vectors,
+> **RFC 3711 §B.3 KDF official test vector verified
+> byte-identical for all three labels**, full seal+open round-trip
+> across header (12B) + 32-byte payload + 10-byte tag, tamper
+> rejection on tag-flip + ct-flip + header-flip (all three flow
+> to SRTP_AUTH_FAIL and do NOT advance the replay window), replay
+> rejection of the same packet_index (-> SRTP_REPLAY), 64-packet
+> jump slides the window (idx=0 -> idx=64 -> replay of idx=0 ->
+> SRTP_TOO_OLD), ROC rollover send-side at seq=65534 -> 65535 -> 0
+> (send_seq wraps, send_roc bumps), ROC rollover recv-side via
+> the §3.3.1 estimator. DTLS-SRTP key extraction (RFC 5764) is
+> NOT in scope -- master key + salt come from the caller; a future
+> round wires DTLS's PRF output into `srtp_derive_keys`. Honest
+> design caveat: the `srtp_open_packet` API takes `hdr_n` from the
+> caller rather than parsing RTP CSRC count + extension header --
+> a real WebRTC caller knows its own header length from RTP byte 0
+> + extension parsing, and exposing this as an explicit parameter
+> keeps the codec layer-agnostic.
+>
+> R34D adds an STT-confidence gate to the voice dialog policy. When
+> whisper-cli's per-utterance confidence (averaged from per-token `"p":`
+> probabilities in the R10B `-ojf` JSON output) is below threshold, the
+> dialog responds "I did not catch that clearly. Could you repeat?"
+> rather than advancing the state machine on a probably-misheard
+> transcript. Default threshold 0.5; configurable per
+> `CE_VOICE_STT_CONF_THRESHOLD` (integer percent, 0..100). New
+> `vc_session_turn_with_confidence(kg, session, transcript, conf_milli)`
+> entry; `last_stt_confidence` telemetry slot in the session state.
+> R31F kind-pivot + R32F multi-kind clarify routing both remain intact
+> for high-confidence transcripts (verified via 5 regression
+> assertions). +42 new voice_dialog unit assertions, +4 new
+> whisper_backend unit assertions. All 319 prior voice_dialog assertions
+> stay byte-identical -- the new gate is strictly additive on top of
+> `vc_session_turn`. Calibration of the confidence threshold against
+> ground truth is deferred (the 0.5 default is the brief's intuitive
+> cut, not a per-environment learned value).
+>
+> R34A (R33A.2) retires the FOURTH and last inline SHA-256 copy in the
+> tree: `src/federation/dtls12.nova`'s `dtls_sha256` + `dtls_hmac_sha256`
+> are now thin one-line wrappers around R33A's canonical
+> `sha256_oneshot` / `hmac_sha256` in `src/safety/sha256.nova`. R33A
+> landed the canonical and refactored 3 of 4 consumers (noise_xk,
+> merkle, ecdsa); dtls12 was held back because R33B was concurrently
+> wiring cert verify into the same file (file-ownership rule). R33B
+> landed at `37706b8`; R34A is the planned follow-up that closes the
+> last duplication. The DTLS-specific composition (HKDF-Extract /
+> HKDF-Expand RFC 5869 + TLS 1.2 PRF P_SHA256 RFC 5246 §5) stays
+> inline because it composes HMAC-SHA256 in recipes that have no
+> analog in the canonical module; it picks up the canonical SHA-256
+> + HMAC transparently through the `dtls_hmac_sha256` wrapper. Lines
+> removed: ~290 inlined FIPS 180-4 SHA-256 + HMAC + 32-bit helpers +
+> K-table + IV + compression. Lines added: 9 (one import + two
+> 1-line wrapper bodies + header doc updates). Net: -216 lines in
+> dtls12.nova. The dedup completes the 4-of-4 retirement R32C's exit
+> report tracked. All 353 prior dtls12 assertions remain
+> byte-identical -- the wrapper pattern (proven on 3 of 4 modules by
+> R33A) preserves wire-level identity by construction; the canonical
+> implementation was lifted from R32C's ecdsa.nova SHA-256 (FIPS
+> 180-4 spec-conformant, bit-equivalent to dtls12's prior inline
+> copy). Module count delta: 0 (no new files); inline-SHA-256 copy
+> count: **4 -> 0** (canonical is now the single authoritative source).
+>
 > R33B finalizes DTLS 1.2: cert verify is wired (R29B.3 retires the last
 > `_R29B2_STUB` slot by importing R32C's `x509_parse` +
 > `x509_check_validity` + `ecdsa_p256_verify_bn` -- five distinct

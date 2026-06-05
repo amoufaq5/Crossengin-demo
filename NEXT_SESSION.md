@@ -3,6 +3,202 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R34C -- SRTP wire codec (RFC 3711) AES-CM-128 + HMAC-SHA1-80 + KDF + anti-replay
+
+**Status: complete** -- closes the SRTP half of R28E.2 (the WebRTC
+data-plane follow-up list: DTLS / ICE / STUN/TURN / SRTP). DTLS
+landed across R29B / R31B / R32B / R33B; ICE + STUN landed across
+R30C / R31C / R33E. R34C is the SRTP packet codec, independent of
+DTLS-SRTP key extraction (which is a future round wiring RFC 5764
+into `srtp_derive_keys`).
+
+### What R34C delivers
+
+* **`src/federation/srtp.nova` (NEW)**. Pure-NOVA RFC 3711 wire
+  codec: AES-CM-128 stream cipher (`_srtp_aes_cm_keystream` +
+  `srtp_encrypt` + `srtp_decrypt`), HMAC-SHA1-80 authenticator
+  (`srtp_authenticate` over `packet || roc[4B]`, truncated to 80
+  bits), AES-CM-based key derivation (`srtp_kdf` per RFC 3711
+  §4.3 + `srtp_derive_keys` wrapper for the three §4.3.2
+  sub-keys), 64-packet sliding anti-replay window keyed on the
+  48-bit extended sequence (`_srtp_replay_check` /
+  `_srtp_replay_update`), RFC 3711 §3.3.1 ROC estimator
+  (`_srtp_estimate_packet_index`), and top-level
+  `srtp_seal_packet` / `srtp_open_packet`.
+* **SHA-1 inlined locally** as `_srtp_sha1_*` (FIPS 180-4 §6.1).
+  SHA-1 is NOT in `src/safety/` today -- if a second consumer
+  appears, an R34A.3-style follow-up can extract
+  `src/safety/sha1.nova` analogously to R33A's canonical
+  SHA-256.
+* **AES-128 block primitive reused unchanged from R30B's
+  `src/safety/aes_gcm.nova`** (`aes128_key_schedule` +
+  `aes128_encrypt_block_with_schedule`). No duplication of AES
+  code.
+* **Public API**: `srtp_state_init(encr_key, auth_key, salt,
+  ssrc) -> state`, `srtp_seal_packet(state, hdr, hdr_n, pt,
+  pt_n) -> [sealed_buf, total_n]`, `srtp_open_packet(state,
+  sealed, n, hdr_n) -> [hdr, hdr_n, pt, pt_n, packet_index] |
+  SRTP_AUTH_FAIL | SRTP_REPLAY | SRTP_TOO_OLD`, `srtp_kdf(mk,
+  ms, label, n) -> n-byte buf`, `srtp_derive_keys(mk, ms) ->
+  [encr_key(16B), auth_key(20B), salt(14B)]`. State accessors:
+  `srtp_state_packet_index`, `srtp_state_roc`,
+  `srtp_state_last_seq`, `srtp_state_send_seq`,
+  `srtp_state_send_roc`, `srtp_state_replay_mask`, five
+  per-counter accessors.
+
+### Verification
+
+* **`tests/unit/test_srtp.nova` (NEW)**: 111 assertions across 31
+  test functions. RFC 3711 §B.3 KDF official test vector
+  verified byte-identical for all three labels (encr / auth /
+  salt). RFC 2202 HMAC-SHA1 TC1 + TC2 + TC4 + long-key
+  normalization. RFC 3174 SHA-1 KAT vectors ("abc", "", 56-char
+  FIPS Appendix B.2, 55-byte one-block boundary). AES-CM
+  keystream against AES-128-ECB published vectors (zero-key
+  counter=0 and counter=1, cross-block boundary). Full seal+open
+  round-trip on 12B header + 32B payload + 10B tag. Tamper
+  rejection: tag-flip + ct-flip + header-flip -> SRTP_AUTH_FAIL
+  (replay window does NOT advance on any tamper path -- R32B
+  invariant preserved). Anti-replay: replay -> SRTP_REPLAY;
+  64-packet jump -> window slides + idx=0 replay -> SRTP_TOO_OLD;
+  out-of-order within window both accept; replay-in-window ->
+  SRTP_REPLAY. ROC rollover send + recv: seq=65534 -> 65535 -> 0
+  wraps send_seq and bumps send_roc; recv-side §3.3.1 estimator
+  picks the right ROC across the wrap.
+* **No existing tests touched.** R34C adds NEW files only.
+
+### Deferred to future rounds
+
+* **DTLS-SRTP key extraction (RFC 5764).** A future round wires
+  DTLS's `dtls_export_keying_material` PRF output (which DTLS 1.2
+  already computes for the application keys via R31B's
+  `dtls_ecdhe_derive`) into `srtp_derive_keys`. The R34C public
+  API is shaped so this is a non-breaking change: callers can
+  feed any (master_key, master_salt) pair through
+  `srtp_state_init`, regardless of where the key material came
+  from.
+* **SRTCP (RFC 3711 §3.4).** Control-plane sibling with different
+  seq numbering + always-encrypted-tag layout. Not in scope
+  here.
+* **AEAD_AES_128_GCM SRTP profile (RFC 7714).** Modern WebRTC
+  profile that replaces HMAC-SHA1 with GCM. R34C ships the RFC
+  3711 default only.
+* **Canonical `src/safety/sha1.nova`.** SHA-1 is inlined in
+  srtp.nova; when a second consumer needs SHA-1 (e.g. some
+  future federation primitive that needs HMAC-SHA1 for legacy
+  interop), extract and dedup analogously to R33A's
+  canonical SHA-256.
+* **MKI (Master Key Identifier, RFC 3711 §3.1).** We ship with
+  mki_length = 0 (WebRTC interop default).
+
+### Honest design caveats
+
+* **SHA-1 inline duplication.** ~150 lines of FIPS 180-4 SHA-1 +
+  HMAC-SHA1 wiring live entirely in srtp.nova. Same trade-off
+  the four pre-R33A SHA-256 copies made: per-module
+  self-contained import graphs at the cost of one canonical
+  source. Future R34A.3 follow-up tracks the dedup pointer.
+* **`srtp_open_packet(state, sealed, n, hdr_n)` takes `hdr_n`
+  from the caller** rather than parsing RTP CSRC count +
+  extension header from byte 0 of the wire. A real caller
+  already knows its own header length; exposing `hdr_n`
+  explicitly keeps the codec layer-agnostic. A future "full
+  RTP header parser" wrapper can sit on top of this layer.
+* **No constant-time tag compare.** Byte-by-byte XOR-fold (same
+  pattern as `gcm_open` in `aes_gcm.nova`). R30B.3's bitsliced
+  AES + constant-time comparators hardening scope now covers
+  SRTP as well.
+
+## R34D -- voice dialog STT confidence threshold + clarifying-question fallback
+
+**Status: complete** -- adds a "did I hear you?" gate in front of the
+voice dialog state machine. When the STT seam reports per-utterance
+confidence below threshold, the dialog returns "I did not catch that
+clearly. Could you repeat?" instead of advancing the dialog state
+machine into the R31F kind-pivot / R32F multi-kind clarify routing
+on a probably-misheard transcript.
+
+### What R34D delivers
+
+* **`vc_session_turn_with_confidence(kg, session, transcript,
+  conf_milli)`** -- new public entry that wraps the existing
+  `vc_session_turn`. Below threshold -> emits the canonical clarify
+  text, does NOT advance the dialog state machine (no parser run, no
+  history append, no pending-clarify mutation). At/above threshold ->
+  delegates to `vc_session_turn` byte-identically.
+* **Threshold env var** `CE_VOICE_STT_CONF_THRESHOLD` parsed as
+  integer-percent (0..100; "50" = 0.5 = 500 milli, "70" = 0.7 = 700
+  milli, "80" = 0.8 = 800 milli). Default 500 milli (= 0.5). Out-of-
+  range / parse-failure clamps to the default. Public probe:
+  `vc_voice_stt_threshold_milli()`.
+* **`last_stt_confidence` session slot** -- new telemetry slot at the
+  tail of the session-state list (index 10). Mirrors the most recent
+  STT confidence threaded through `vc_session_turn_with_confidence`;
+  the legacy `vc_session_turn` path leaves it at -1 (the unset
+  sentinel) so callers can tell the two paths apart. Accessor:
+  `vc_session_last_stt_confidence(session)`.
+* **`whisper_heuristic_confidence_milli(transcript, error_msg)`** --
+  pure-function fallback in `whisper_backend.nova` for the case where
+  the per-segment `-ojf` JSON parse fails AND the caller still wants a
+  rough confidence number. Returns 0 for empty transcript / non-empty
+  error; 900 otherwise. The 900 is deliberately above the R8B 800
+  legacy ballpark so telemetry can distinguish heuristic from real
+  per-segment values.
+* **`_vd_transcribe_wav`** extended to return a 3-element list
+  `[transcript, error, confidence_milli]` so `vc_dialog_run` can
+  thread the seam's confidence directly into the new gate path.
+
+### Whisper confidence source
+
+This round did NOT need to write a new confidence extractor -- the
+R10B `-ojf` JSON parsing path in `whisper_backend.nova` already
+emits a REAL per-utterance confidence by averaging per-token `"p":`
+probabilities from whisper-cli's full-JSON output (see
+`whisper_parse_confidence_milli`). On older whisper-cli releases
+that don't support `-ojf`, the backend falls back to the
+`WHISPER_CONFIDENCE_DEFAULT` 800 milli (the R8B legacy ballpark).
+R34D's heuristic helper is provided for the rare future case where
+even the legacy fallback is unavailable.
+
+### Verification
+
+* `tests/unit/test_voice_dialog.nova`: **+42 new assertions** across 19
+  new R34D test functions. Coverage: default threshold (500 milli),
+  clarify text canonical form, new-session sentinel, reset clears
+  STT confidence, high-conf routes to normal dialog, low-conf routes
+  to clarify, exact-threshold routes to normal (strict `<`), zero-conf
+  empty transcript clarifies, just-below-threshold clarifies,
+  `last_stt_confidence` tracks most recent across turns, low-conf
+  then high-conf advances dialog, R31F kind-pivot intact for high-conf,
+  R32F multi-kind clarify intact for high-conf, low-conf during
+  pending clarify preserves state, strict-less-than gate, heuristic
+  empty/non-empty/error paths, byte-identical-to-legacy `vc_session_
+  turn` for high-confidence pass-through.
+* `tests/unit/test_whisper_backend.nova`: **+4 new assertions** covering
+  the heuristic helper (empty / non-empty / error overrides) + the
+  strict accessor (`whisper_result_confidence_milli_strict`) reading
+  slot 1.
+* **All 319 existing voice_dialog assertions remain byte-identical** --
+  the new code paths are strictly additive; the legacy
+  `vc_session_turn` is unchanged.
+
+### Honest caveats
+
+* **Calibration deferred.** The default 0.5 threshold is the brief's
+  intuitive cut; no held-out-set calibration of whisper-cli's
+  per-utterance confidence distribution against ground truth was
+  performed. Future hardening could plumb a calibration table per
+  (acoustic-environment, model) pair.
+* **Per-language threshold.** Whisper's tiny.en model is the canonical
+  install; multilingual models may report systematically different
+  confidence distributions. The single global threshold won't be
+  optimal for all of them.
+* **No two-stage gating.** A high-confidence MISPARSE ("list all
+  FACTS." -> parser stops at trailing dot, parses fine) won't trip
+  the gate today -- only low-confidence is gated. Content-word
+  cross-checks against the parser's UNKNOWN-template output would
+  be a separate round.
+
 ## R33B -- DTLS cert verify wire + CCS-on-epoch-change replay-window reset (R29B.3 / R32B.2 / R32C.2)
 
 **Status: complete** -- closes two R29B/R31B/R32B-era deferrals in a

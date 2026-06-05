@@ -2388,6 +2388,195 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R34C extension: SRTP wire codec (RFC 3711) -- AES-CM-128 + HMAC-SHA1-80 + KDF + anti-replay (R28E.2)
+
+R28E shipped the SIGNALING half of browser-to-soul WebRTC; the
+R28E.2 exit report flagged four follow-up sub-systems: DTLS 1.2
+(R29B / R31B / R32B / R33B), ICE (R30C), STUN/TURN (R30C /
+R31C / R33E), and SRTP. R34C lands the SRTP wire codec
+independently of DTLS-SRTP key extraction -- the SRTP packet
+authentication / encryption layer needs to exist before a future
+round can wire RFC 5764's "extract SRTP master from DTLS PRF
+output" path.
+
+What R34C delivers in `src/federation/srtp.nova` (NEW module):
+
+* **AES-CM-128 stream cipher (RFC 3711 §4.1.1).** The 16-byte AES
+  counter block is built as `salt[14B] || 00 00`, XORed with
+  `ssrc << 64` at bytes [4..8) and `packet_index << 16` at bytes
+  [8..14). The low 16 bits are the per-block counter; they
+  increment by 1 to produce each subsequent keystream block.
+  Encrypt and decrypt are the same call (XOR is involutive).
+  `_srtp_aes_cm_keystream(key, salt, ssrc, packet_index, n)`
+  generates `n` bytes; `srtp_encrypt(key, salt, ssrc, idx, pt, n)`
+  is the XOR wrapper.
+
+* **HMAC-SHA1-80 authenticator (RFC 2104 + RFC 3174 SHA-1).** SHA-1
+  is inlined locally as `_srtp_sha1_*` (FIPS 180-4 §6.1 -- the
+  same 5-word IV / 80-round compression / 4-zone K table every
+  reference implementation uses); SHA-1 is not in `src/safety/`
+  today, and a future R34A.3-style follow-up can extract a
+  canonical `src/safety/sha1.nova` if another consumer appears.
+  `srtp_authenticate(auth_key, packet, n, roc)` computes
+  HMAC-SHA1 over `(packet || roc[4B])` per RFC 3711 §4.2 ("the
+  ROC SHALL be appended") and truncates to 80 bits (10 bytes).
+  Key normalization follows RFC 2104 (> 64 bytes pre-hashed; <
+  64 bytes zero-padded).
+
+* **AES-CM key derivation (RFC 3711 §4.3).** The KDF input is
+  `x = master_salt XOR (label || r)` where label is one of
+  `SRTP_LABEL_ENCR=0x00`, `SRTP_LABEL_AUTH=0x01`,
+  `SRTP_LABEL_SALT=0x02`; with `r = 0` (the default key-derivation
+  rate KDR=0) the XOR places the label at byte 7 of `x`. AES-CM
+  keystream generation with `master_key` as the AES key, `x` as
+  the CM salt, and `ssrc = packet_index = 0` produces the
+  requested derived key. `srtp_kdf(master_key, master_salt,
+  label, derive_len)` is the single-label entry; `srtp_derive_keys`
+  returns the three §4.3.2 sub-keys in one call.
+
+* **64-packet anti-replay sliding window (RFC 3711 §3.3.2).** Same
+  pattern R32B used for DTLS but keyed on the 48-bit extended
+  sequence `(roc << 16) | seq` rather than the 48-bit DTLS
+  record seq. `_srtp_replay_check(state, packet_index)` is a
+  PURE function -- it returns `SRTP_AR_OK` / `SRTP_AR_REPLAY`
+  / `SRTP_AR_TOO_OLD` without mutating state. The window is
+  updated by `_srtp_replay_update` ONLY after the HMAC verifies,
+  so a forged packet cannot advance the window and lock out the
+  legitimate next packet (R32B's "tamper does not advance"
+  property, preserved here).
+
+* **ROC estimator (RFC 3711 §3.3.1).** The 32-bit rollover counter
+  increments when the 16-bit RTP seq wraps from 65535 -> 0.
+  For an out-of-order packet, `_srtp_estimate_packet_index(roc,
+  last_seq, seq)` picks the most-likely 32-bit ROC: if the wire
+  `seq` is more than 2^15 below `last_seq`, the packet probably
+  came from the NEXT ROC; if more than 2^15 above, from the
+  PREVIOUS ROC; otherwise same ROC. The 48-bit packet_index is
+  then `(guess_roc << 16) | seq`.
+
+* **Top-level seal + open.** `srtp_seal_packet(state, rtp_hdr_buf,
+  hdr_n, payload, pt_n)` stamps `state.send_seq` into header
+  bytes [2..4) (RFC 3550 §5.1), encrypts the payload, appends
+  the HMAC tag, and bumps send_seq (rolling ROC on wrap).
+  `srtp_open_packet(state, sealed_buf, n, hdr_n)` pulls seq
+  from bytes [2..4), runs the ROC estimator, runs the
+  anti-replay pre-check, verifies the HMAC, decrypts, and
+  advances the window + ROC + last_seq on success.
+
+Cryptographic dependencies: `src/safety/aes_gcm.nova` (R30B) for
+the AES-128 block primitive (`aes128_key_schedule` +
+`aes128_encrypt_block_with_schedule`). SRTP and DTLS share the
+AES-128 block layer; only the mode (CM vs GCM) differs. No
+duplication of the AES block code; SHA-1 IS duplicated locally
+in srtp.nova (no canonical sha1.nova exists yet).
+
+What R34C does NOT ship (deferred):
+
+* **DTLS-SRTP key extraction (RFC 5764).** The master key + salt
+  come from caller code; a future round wires DTLS's
+  `dtls_export_keying_material` output into `srtp_derive_keys`.
+  The public API is shaped so that wiring requires no breaking
+  change to the seal/open path.
+* **SRTCP (RFC 3711 §3.4).** The control-plane sibling has its
+  own seq numbering + always-encrypted-tag layout that is
+  structurally different; defer to a follow-up round when a
+  caller needs SRTCP.
+* **MKI (Master Key Identifier, RFC 3711 §3.1).** We ship with
+  `mki_length = 0`, the WebRTC interop default.
+* **AEAD_AES_128_GCM SRTP profile (RFC 7714).** Modern WebRTC
+  profile that replaces HMAC-SHA1 with GCM's GHASH-based tag.
+  R34C ships the default (AES-CM-128 + HMAC-SHA1-80) only; the
+  GCM profile is a future round.
+* **Canonical SHA-1 dedup.** SHA-1 is inlined in srtp.nova; if a
+  future consumer also needs SHA-1, an R34A.3-style follow-up
+  can extract `src/safety/sha1.nova` (analogous to R33A's
+  canonical SHA-256).
+
+### Verification
+
+* **`tests/unit/test_srtp.nova`**: 111 new assertions across 31
+  test functions. Coverage:
+  * SHA-1 KATs (RFC 3174 Appendix A + FIPS 180-4 Appendix B.2):
+    "abc", "", 56-char two-block-padding boundary, 55-byte
+    one-block boundary.
+  * HMAC-SHA1 RFC 2202: TC1 (key=0x0b*20, "Hi There"), TC2
+    (key="Jefe", "what do ya want for nothing?"), TC4
+    (key=0x01..0x19, msg=0xcd*50), long-key normalization.
+  * AES-CM keystream: zero-key + counter=0 (AES_0(0^16)),
+    counter=1 (cross-block boundary), SSRC differentiation,
+    packet_index differentiation, encrypt+decrypt round-trip.
+  * **RFC 3711 §B.3 KDF official test vector**: master key
+    `E1F97A0D3E018BE0D64FA32C06DE4139` + master salt
+    `0EC675AD498AFEEBB6960B3AABE6` -> encryption key
+    `C61E7A93744F39EE10734AFE3FF7A087` (label 0) + auth key
+    `CEBE321F6FF7716B6FD4AB49AF256A156D38BAA4` (label 1) + salt
+    `30CBBC08863D8C85D49DB34A9AE1` (label 2). All three verified
+    byte-identical against the RFC. The auth-key test (20 bytes)
+    forces the counter to increment, so the keystream
+    cross-block boundary is also exercised through the KDF.
+  * Full seal + open round-trip on a 12-byte RTP header + 32-byte
+    payload + 10-byte tag = 54-byte wire packet. Plaintext
+    recovered byte-identical.
+  * Tamper rejection: flip a tag byte -> SRTP_AUTH_FAIL; flip a
+    ciphertext byte -> SRTP_AUTH_FAIL (HMAC is over the
+    ciphertext); flip a header byte -> SRTP_AUTH_FAIL (HMAC is
+    over the header too). All three flow to AUTH_FAIL and do NOT
+    advance the replay window watermark or ROC -- mirrors R32B's
+    "tamper does not advance" property.
+  * Anti-replay: replay of the same packet_index -> SRTP_REPLAY;
+    64-packet jump idx=0 -> idx=64 slides the window so that a
+    replay of idx=0 is now SRTP_TOO_OLD; out-of-order within
+    window (idx=0 then idx=5) both accept; replay of idx=0 after
+    accepting idx=5 -> SRTP_REPLAY (within window with bit set).
+  * ROC rollover send side: seq=65534 -> 65535 -> 0 (send_seq
+    wraps to 0, send_roc bumps to 1) -> 1. ROC rollover recv
+    side: §3.3.1 estimator picks roc=0 for seq=65534+65535 and
+    roc=1 for seq=0 after the wrap. Explicit estimator cases
+    pinned: low last_seq + high seq -> previous ROC; high
+    last_seq + low seq -> next ROC.
+  * State init: all counters + windows + ROC start at 0.
+  * Constants: SRTP_AUTH_TAG_LEN=10, SRTP_KEY_LEN=16,
+    SRTP_AUTH_KEY_LEN=20, SRTP_SALT_LEN=14, distinct
+    AUTH_FAIL / REPLAY / TOO_OLD sentinels.
+
+* **No prior assertions affected.** R34C adds NEW files only;
+  no existing module is touched. The AES-128 block primitive in
+  `src/safety/aes_gcm.nova` is consumed unchanged.
+
+### Honest design caveats
+
+* **SHA-1 inline duplication.** The `_srtp_sha1_*` family is a
+  local copy of the FIPS 180-4 SHA-1 algorithm (~150 lines).
+  This is the same trade-off `dtls12.nova`'s `_dtls_sha256_*`
+  bundled before R33A extracted it: each consumer keeps its
+  import graph minimal at the cost of duplicating the
+  implementation. When a second module needs SHA-1, an
+  R34A.3-style follow-up should extract `src/safety/sha1.nova`
+  -- the refactor pattern is exactly R33A's. Until then, SHA-1
+  has exactly one home (here) and the duplication risk is bounded.
+
+* **`srtp_open_packet` takes `hdr_n` from the caller** rather than
+  parsing the RTP CSRC count + extension header. A real WebRTC
+  caller knows its own header length from RTP byte 0 (CC field)
+  + extension parsing, and exposing `hdr_n` as an explicit
+  parameter keeps the codec layer-agnostic. A future "full RTP
+  header parser" wrapper can sit on top of this layer without
+  modifying it.
+
+* **No constant-time tag comparison.** The HMAC tag compare uses
+  the same byte-by-byte XOR-fold pattern as `gcm_open` in
+  `aes_gcm.nova`. R30B.3 tracked the broader "bitsliced AES +
+  constant-time comparators" hardening follow-up; SRTP joins
+  that scope.
+
+* **HMAC-SHA1 vs MAC security.** SHA-1 is collision-broken
+  (SHAttered, 2017), but HMAC-SHA1 remains MAC-secure: SHA-1
+  collisions do not break the HMAC PRF (NIST SP 800-131A
+  specifies HMAC-SHA1 acceptable for "legacy use" with a 128-bit
+  key; SRTP uses a 160-bit auth key, so the security margin is
+  larger). RFC 7714's AEAD_AES_128_GCM SRTP profile sidesteps
+  the question entirely; it's the eventual migration target.
+
 ## R33B extension: DTLS cert verify wire + CCS-on-epoch replay-window reset (R29B.3 / R32B.2 / R32C.2)
 
 R29B (the 1.0 of DTLS 1.2 in CrossEngin) shipped two
