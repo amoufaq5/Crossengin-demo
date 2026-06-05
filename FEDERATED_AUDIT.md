@@ -2388,6 +2388,88 @@ Additional smaller follow-ups:
   gossip\_relay 61, nat\_traversal 53, gossip 34, noise\_xk 44,
   leader\_election 40. Module count +1.
 
+## R34A extension (R33A.2): dtls12 SHA-256 dedup -> canonical `src/safety/sha256.nova`
+
+R33A landed the canonical `src/safety/sha256.nova` (FIPS 180-4 SHA-256
++ RFC 2104 HMAC-SHA256) and refactored three of four inline copies
+across the tree (`noise_xk.nova`, `merkle.nova`, `ecdsa.nova`). R33A
+deliberately did NOT touch `src/federation/dtls12.nova` because R33B
+was concurrently modifying the same file (cert verify wire-in for
+R29B.3 / R32C.2). R33B landed at `37706b8` -- R34A is the planned
+R33A.2 follow-up that retires the FOURTH and last inline FIPS 180-4
+SHA-256 implementation in the tree.
+
+### What R34A delivers
+
+* `src/federation/dtls12.nova` refactored: the inline FIPS 180-4
+  SHA-256 (`_dtls_mask32`, `_dtls_add32`, ..., `_dtls_sha_k` K-table,
+  `_dtls_sha_init_h` IV, `_dtls_sha_compress` compression,
+  `dtls_sha256` padding) and the inline RFC 2104 HMAC-SHA256
+  (`dtls_hmac_sha256` ipad/opad XOR + inner/outer SHA chained) -- ~270
+  lines of inline implementation -- are replaced with two one-line
+  wrappers forwarding to R33A's canonical `sha256_oneshot` /
+  `hmac_sha256`. `import "../safety/sha256.nova"` added at the top.
+* `_DTLS_HASH_LEN = 32` retained because HKDF + PRF code below
+  references it directly (the constant is FIPS 180-4 -- canonical
+  exposes the same value as `SHA256_HASH_LEN`; we keep the
+  dtls-prefixed local alias so the HKDF + PRF bodies stay
+  byte-identical to their pre-R34A form).
+* `_DTLS_BLOCK_LEN` and `_DTLS_MASK32` (and the matching helper
+  functions) removed -- they were used only by the inline SHA-256 +
+  HMAC bodies, which are now gone.
+* HKDF-Extract / HKDF-Expand (RFC 5869) and TLS 1.2 PRF P_SHA256
+  (RFC 5246 §5) kept inline because they compose HMAC-SHA256 in
+  DTLS-specific recipes that have no analog in the canonical
+  primitive module. They call `dtls_hmac_sha256` which is now itself
+  a wrapper, so the canonical implementation propagates transparently.
+
+### Verification
+
+* All 353 prior dtls12 assertions remain byte-identical (297 R29B +
+  R31B + R32B + 56 R33B). The wrapper pattern (proven by R33A on the
+  three prior consumers: 44 noise_xk + 60 merkle + 25 ecdsa, all
+  preserved) holds wire-level identity by construction. The canonical
+  was lifted from R32C's ecdsa.nova SHA-256 which was FIPS 180-4
+  spec-conformant and bit-equivalent to dtls12's prior inline copy
+  (same K-table, IV, compression, padding rule).
+* `tests/unit/test_dtls12.nova` is byte-untouched -- the proof of no
+  behavioral change. The test pins `dtls_sha256` / `dtls_hmac_sha256`
+  / HKDF / PRF symbols against published vectors (FIPS 180-2 worked
+  example for "abc", RFC 4231 TC1 for HMAC, RFC 5869 vector 1 for
+  HKDF); all pass through the wrappers unchanged.
+* `tests/unit/test_sha256.nova` (R33A's 20 assertions) re-run -- still
+  passes 20/20.
+* Adjacent modules verified: `src/federation/snapshot_attestation.nova`
+  and `src/learning/secure_aggregation.nova` do not reference any of
+  dtls12's SHA-256 / HMAC / HKDF / PRF surface (grep: zero matches in
+  either module). Other dtls12 importers (`ice.nova`,
+  `stun_rfc8489.nova`, `srtp.nova`) reference dtls12.nova only in
+  comments; none import the SHA-256 surface.
+
+### Subtle differences encountered
+
+None. Both implementations were FIPS 180-4 §5.3.3 + §6.2 conformant
+with identical K-table (first 32 bits of fractional cube roots of the
+first 64 primes), identical IV (first 32 bits of fractional square
+roots of the first 8 primes), and identical 64-round compression
+function. The HMAC ipad (0x36) / opad (0x5c) XOR pads, the 64-byte
+block normalization, and the >64-byte pre-hash branch all match RFC
+2104 §2 in both copies. The 33-byte (32B digest + trailing NUL)
+return-buffer shape was the documented common convention every
+previous copy shared; the canonical retained it.
+
+### Files modified
+
+* MOD: `src/federation/dtls12.nova` (-216 net lines).
+* MOD: `NEXT_SESSION.md`, `README.md`, `FEDERATED_AUDIT.md` -- R34A
+  section.
+* UNCHANGED: `tests/unit/test_dtls12.nova` (byte-identical to R33B's
+  commit `37706b8` -- proof that wrapper byte-identity holds).
+
+Module count delta: 0 (no new files). Inline FIPS 180-4 SHA-256 copy
+count in the tree: **4 -> 0** -- the canonical is now the single
+authoritative source.
+
 ## R34B extension: TURN protocol wire codec (RFC 5766 / 8656) (R28E.2)
 
 R28E shipped the SIGNALING half of browser-to-soul WebRTC; the
