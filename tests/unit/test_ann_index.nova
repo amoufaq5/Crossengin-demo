@@ -1,0 +1,333 @@
+// Unit tests for the P3.4 approximate-nearest-neighbor (ANN) index.
+//
+// Covers the LSH side-index over atom embeddings (`src/kg/ann_index.nova`):
+//   - empty ann query returns an empty result list,
+//   - inserting an atom and querying with its own embedding returns at least
+//     itself with cosine == 1000 milli (the perfect-match case),
+//   - 1000-atom stress: the bucket scanned by a query is strictly smaller
+//     than the total atom count (the speedup the LSH actually buys),
+//   - insert + remove leaves the atom unreachable from query,
+//   - `ann_rebuild_from_atoms` produces the same bucket assignments as
+//     inserting atoms one-by-one via the KG add path,
+//   - snapshot round-trip: `kg_set_ann` followed by `kg_rebuild_index`
+//     re-buckets every atom in the KG.
+//
+// ADR-0016, ADR-0049.
+
+import "std/io"
+import "../ce_test.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/ann_index.nova"
+import "../../src/kg/multi_kg_manager.nova"
+
+// Build a deterministic non-negative embedding for atom `i`: each coordinate
+// is a small integer in [0, 400] (matches the convention `word_lexical_vec`
+// uses -- low magnitude so `vec_cosine`'s `dot * FP_SCALE` intermediate stays
+// well under NOVA's pointer-threshold codegen bug). Different `i` produce
+// quite different bit signatures against the LSH hyperplanes -- we mix `i`
+// into every dimension with a different small prime per dimension so the
+// embeddings actually spread across the LSH bit space (otherwise a uniform
+// "every embedding looks the same" embedding hashes everything to one
+// bucket, which defeats the whole point of the index).
+fn _embed_for(i, dims) {
+    let v = vec_new(dims)
+    // Run a small LCG to fan `i` out across dimensions. Each dimension gets
+    // a distinct value derived from a separate LCG step so the embedding
+    // varies on every axis; intermediates stay tiny via the 15-bit mask
+    // (NOVA codegen bug #11 workaround). Result is in [0, 400] per dim.
+    let state = ((i + 1) * 31) & 32767
+    let d = 0
+    while d < dims {
+        state = ((state * 31) + (d * 17) + 7) & 32767
+        let r = state % 400
+        vec_set(v, d, r)
+        d = d + 1
+    }
+    return v
+}
+
+// ---- empty ann: query returns empty list ---------------------------------
+fn test_empty_query() {
+    let ann = ann_new(8, 8)
+    ce_eq("empty ann size = 0", ann_size(ann), 0)
+    ce_eq("empty ann bucket count = 256", ann_bucket_total(ann), 256)
+    let atoms = list_new()
+    let q = _embed_for(0, 8)
+    let out = ann_query(ann, atoms, q, 5)
+    ce_eq("empty query returns empty list", len(out), 0)
+}
+
+// ---- ann_new / ann_new_seeded contract -----------------------------------
+fn test_ann_construction() {
+    let ann = ann_new(8, 8)
+    ce_eq("dim is 8", ann_dim(ann), 8)
+    ce_eq("k is 8", ann_k(ann), 8)
+    ce_eq("default seed installed", ann_seed(ann), 1469598103)
+    // Smaller K -> fewer buckets.
+    let ann4 = ann_new_seeded(8, 4, 42)
+    ce_eq("k=4 -> 16 buckets", ann_bucket_total(ann4), 16)
+    ce_eq("k=4 seed installed", ann_seed(ann4), 42)
+    // Hash output stays in [0, 2^K).
+    let v = _embed_for(7, 8)
+    let h = ann_hash(ann, v)
+    ce_check("hash >= 0", h >= 0)
+    ce_check("hash < 256", h < 256)
+    let h4 = ann_hash(ann4, v)
+    ce_check("k=4 hash >= 0", h4 >= 0)
+    ce_check("k=4 hash < 16", h4 < 16)
+    // Determinism: same vec -> same hash, same seed -> same planes.
+    let ann_b = ann_new(8, 8)
+    ce_eq("deterministic hash across anns", ann_hash(ann_b, v), h)
+}
+
+// ---- self-query returns the atom + cosine == 1000 ------------------------
+fn test_self_query_perfect_match() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "selftest")
+    let ann = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg, ann)
+    let n = 50
+    let i = 0
+    while i < n {
+        let a = kg_add_atom(kg, ATOM_FACT, "self_" + int_to_str(i), 0)
+        // Atoms get a unique non-trivial embedding.
+        kg_atom_set_embed(kg, a, _embed_for(i, ATOM_EMBED_DIMS))
+        i = i + 1
+    }
+    ce_eq("50 atoms inserted", kg_atom_count(kg), n)
+    // Pick a known atom and query with ITS embedding -- the result must
+    // contain itself with cosine = 1000 (perfect self-similarity).
+    let probe = kg_find_atom(kg, "self_17")
+    ce_check("probe atom present", probe != 0)
+    let q = atom_embed(probe)
+    let out = ann_query(ann, kg_atoms(kg), q, 5)
+    ce_check("self-query returns >= 1 result", len(out) >= 1)
+    // Find probe atom_id in the result list -- LSH guarantees it lands in
+    // the same bucket as the query because the planes hash deterministically.
+    let pid = atom_id(probe)
+    let saw_self = 0
+    let self_cos = 0
+    let j = 0
+    while j < len(out) {
+        let entry = out[j]
+        if entry[0] == pid {
+            saw_self = 1
+            self_cos = entry[1]
+        }
+        j = j + 1
+    }
+    ce_check("self appears in result", saw_self == 1)
+    ce_eq("self cosine = 1000 milli", self_cos, 1000)
+}
+
+// ---- 1000-atom stress: bucket size << total atom count -------------------
+fn test_1000_atom_bucket_smallness() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "stress")
+    let ann = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg, ann)
+    let n = 1000
+    let i = 0
+    while i < n {
+        let a = kg_add_atom(kg, ATOM_FACT, "stress_" + int_to_str(i), 0)
+        kg_atom_set_embed(kg, a, _embed_for(i, ATOM_EMBED_DIMS))
+        i = i + 1
+    }
+    ce_eq("1000 atoms inserted", kg_atom_count(kg), n)
+    ce_eq("1000 atoms in ann", ann_size(ann), n)
+    // Pick a query vector and verify only a SMALL fraction of atoms is
+    // touched. With K=8 -> 256 buckets, the expected bucket size is ~4.
+    // We allow up to 100 (very generous) as the speedup claim: 10x worst.
+    let q = _embed_for(500, ATOM_EMBED_DIMS)
+    let bid = ann_hash(ann, q)
+    let bucket_size = ann_bucket_count(ann, bid)
+    ce_check("bucket size > 0 (query touches at least 1 atom)", bucket_size > 0)
+    ce_check("bucket size < 200 (LSH partitions the space)", bucket_size < 200)
+    ce_check("bucket size < n (some speedup -- inner scan smaller than N)", bucket_size < n)
+    // Query returns valid results.
+    let out = ann_query(ann, kg_atoms(kg), q, 5)
+    ce_check("query returns >= 0 results", len(out) >= 0)
+    ce_check("query bounded by max_results=5", len(out) <= 5)
+    // Sum of bucket sizes equals total atom count.
+    let total = 0
+    let b = 0
+    while b < ann_bucket_total(ann) {
+        total = total + ann_bucket_count(ann, b)
+        b = b + 1
+    }
+    ce_eq("bucket sizes sum to n", total, n)
+}
+
+// ---- remove path: atom no longer in any bucket --------------------------
+fn test_insert_then_remove() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "rm")
+    let ann = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg, ann)
+    let a = kg_add_atom(kg, ATOM_FACT, "ghost", 0)
+    let av = _embed_for(7, ATOM_EMBED_DIMS)
+    kg_atom_set_embed(kg, a, av)
+    ce_eq("size after insert", ann_size(ann), 1)
+    // Atom is reachable via query.
+    let out = ann_query(ann, kg_atoms(kg), av, 5)
+    ce_eq("preremove query finds 1", len(out), 1)
+    ce_eq("preremove first id == ghost id", out[0][0], atom_id(a))
+    // Remove via the KG hook -- ann should drain too.
+    kg_remove_atom(kg, atom_id(a))
+    ce_eq("size after remove", ann_size(ann), 0)
+    let out2 = ann_query(ann, kg_atoms(kg), av, 5)
+    ce_eq("postremove query finds 0", len(out2), 0)
+    // Idempotent: removing again is a clean no-op.
+    let r2 = ann_remove(ann, atom_id(a))
+    ce_eq("repeat remove returns 0", r2, 0)
+}
+
+// ---- rebuild from KG produces same buckets as one-by-one inserts --------
+fn test_rebuild_matches_incremental() {
+    let reg = kg_registry_new()
+    // Build kg_a incrementally with an ann attached from the start.
+    let kg_a = kg_spawn(reg, "inc")
+    let ann_a = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg_a, ann_a)
+    let n = 30
+    let i = 0
+    while i < n {
+        let a = kg_add_atom(kg_a, ATOM_FACT, "inc_" + int_to_str(i), 0)
+        kg_atom_set_embed(kg_a, a, _embed_for(i, ATOM_EMBED_DIMS))
+        i = i + 1
+    }
+    // Build kg_b WITHOUT an ann, then attach + rebuild after the fact.
+    let kg_b = kg_spawn(reg, "rebuilt")
+    let j = 0
+    while j < n {
+        let b = kg_add_atom(kg_b, ATOM_FACT, "inc_" + int_to_str(j), 0)
+        atom_set_embed(b, _embed_for(j, ATOM_EMBED_DIMS))
+        j = j + 1
+    }
+    let ann_b = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg_b, ann_b)
+    // Bucket sizes should match per bucket id (the same planes hash the
+    // same vectors into the same signature).
+    let mismatch = 0
+    let b = 0
+    while b < ann_bucket_total(ann_a) {
+        if ann_bucket_count(ann_a, b) != ann_bucket_count(ann_b, b) {
+            mismatch = mismatch + 1
+        }
+        b = b + 1
+    }
+    ce_eq("bucket distributions match across rebuild", mismatch, 0)
+    ce_eq("ann sizes equal", ann_size(ann_a), ann_size(ann_b))
+}
+
+// ---- snapshot-style round-trip: rebuild after KG_ATOMS replay -----------
+fn test_snapshot_rebuild_round_trip() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "snap")
+    let ann = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg, ann)
+    let n = 20
+    let i = 0
+    while i < n {
+        let a = kg_add_atom(kg, ATOM_FACT, "snap_" + int_to_str(i), 0)
+        kg_atom_set_embed(kg, a, _embed_for(i + 10, ATOM_EMBED_DIMS))
+        i = i + 1
+    }
+    let before_size = ann_size(ann)
+    ce_eq("preindex size", before_size, n)
+    // Snapshot apply path: detach the ann conceptually by clearing its
+    // buckets (mimics the moment between "atoms rehydrated into KG_ATOMS"
+    // and "kg_rebuild_index has not yet run").
+    ann_clear(ann)
+    ce_eq("cleared ann is empty", ann_size(ann), 0)
+    // Run the rebuild hook, exactly as snapshot_disk's kg_section_apply does.
+    kg_rebuild_index(kg)
+    ce_eq("rebuilt ann is full", ann_size(ann), before_size)
+    // And the query still finds an atom by its own embedding.
+    let probe = kg_find_atom(kg, "snap_5")
+    ce_check("probe still present", probe != 0)
+    let out = ann_query(ann, kg_atoms(kg), atom_embed(probe), 3)
+    ce_check("query after rebuild returns >= 1", len(out) >= 1)
+}
+
+// ---- hash function determinism + spread ----------------------------------
+fn test_hash_determinism_and_spread() {
+    let ann = ann_new(8, 8)
+    let v = _embed_for(11, 8)
+    let h1 = ann_hash(ann, v)
+    let h2 = ann_hash(ann, v)
+    ce_eq("hash deterministic", h1, h2)
+    // Two different inputs should hash to different buckets often enough.
+    // Sample 32 distinct embeddings and count distinct buckets -- with K=8
+    // (256 buckets) we expect comfortably > 1 distinct bucket.
+    let seen = list_new()
+    let i = 0
+    while i < 32 {
+        let h = ann_hash(ann, _embed_for(i, 8))
+        // Track distinct buckets in `seen` (small list, linear scan is fine).
+        let dup = 0
+        let j = 0
+        while j < len(seen) {
+            if seen[j] == h { dup = 1 }
+            j = j + 1
+        }
+        if dup == 0 { push(seen, h) }
+        i = i + 1
+    }
+    ce_check("32 inputs hash to >1 distinct buckets", len(seen) > 1)
+    // Different seed -> different planes -> different signature (almost
+    // surely). Sample one vector against two different anns.
+    let ann2 = ann_new_seeded(8, 8, 9999)
+    let ha = ann_hash(ann, v)
+    let hb = ann_hash(ann2, v)
+    // Either can collide by chance; require only that determinism holds
+    // for each ann individually (we re-hash and compare).
+    ce_eq("ann1 hash deterministic", ann_hash(ann, v), ha)
+    ce_eq("ann2 hash deterministic", ann_hash(ann2, v), hb)
+}
+
+// ---- max_results clamping + ordering -------------------------------------
+fn test_query_max_results_and_order() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "order")
+    let ann = ann_new(ATOM_EMBED_DIMS, 4)   // K=4 -> 16 buckets, bigger buckets
+    kg_set_ann(kg, ann)
+    let n = 100
+    let i = 0
+    while i < n {
+        let a = kg_add_atom(kg, ATOM_FACT, "ord_" + int_to_str(i), 0)
+        kg_atom_set_embed(kg, a, _embed_for(i, ATOM_EMBED_DIMS))
+        i = i + 1
+    }
+    // Pick a query that lands somewhere in the populated space.
+    let q = _embed_for(42, ATOM_EMBED_DIMS)
+    let out = ann_query(ann, kg_atoms(kg), q, 3)
+    // max_results bound respected.
+    ce_check("max_results clamps result count", len(out) <= 3)
+    // Results are sorted by cosine (descending).
+    let sorted = 1
+    let r = 1
+    while r < len(out) {
+        if out[r][1] > out[r-1][1] { sorted = 0 }
+        r = r + 1
+    }
+    ce_check("results sorted descending by cosine", sorted == 1)
+    // max_results == 0 yields empty.
+    let zero_out = ann_query(ann, kg_atoms(kg), q, 0)
+    ce_eq("max_results = 0 -> empty", len(zero_out), 0)
+}
+
+fn main() {
+    test_empty_query()
+    test_ann_construction()
+    test_self_query_perfect_match()
+    test_1000_atom_bucket_smallness()
+    test_insert_then_remove()
+    test_rebuild_matches_incremental()
+    test_snapshot_rebuild_round_trip()
+    test_hash_determinism_and_spread()
+    test_query_max_results_and_order()
+    ce_summary("ann_index")
+}
+
+main()

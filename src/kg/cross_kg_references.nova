@@ -1,0 +1,199 @@
+// CrossEngin knowledge: cross-KG references and spawn heuristic.
+//
+// Purpose
+//   Cross-KG reference edges link atoms across domain knowledge graphs
+//   (ADR-0017). Two kinds of link form:
+//     - automatic (earned=0): created when two atoms' embeddings exceed
+//       XREF_AUTO similarity; cheap, revocable if similarity later decays.
+//     - earned   (earned=1): promoted only after EARN_K distinct co-activations
+//       without contradiction; weight floored so it resists decay. Earned links
+//       are causal/analogical (relational, not mere surface similarity).
+//   This module also implements the spawn-on-new-domain heuristic: a coherent
+//   cluster of atoms that is dissimilar to every existing KG centroid warrants
+//   a new KG (ADR-0017). The decision is computed here; the actual namespace
+//   allocation is multi_kg_manager.kg_spawn.
+//
+//   All similarities are integer cosine in milli (0..1000); the ADR's float
+//   thresholds are expressed in milli (0.82 -> 820, etc.).
+//
+// ADRs implemented: ADR-0017 (multi-KG cross-references, spawn heuristic),
+//   ADR-0004 (the registry/centroids this routes over).
+// NOVA dependencies: builtins (lists).
+// CrossEngin dependencies: src/kg/multi_kg_manager.nova (and atom_store).
+
+import "multi_kg_manager.nova"
+
+// ---- reference kinds (ADR-0017) -------------------------------------------
+let XREF_SIMILAR    = 1
+let XREF_CAUSAL     = 2
+let XREF_ANALOGICAL = 3
+let XREF_PARTOF     = 4
+
+// ---- thresholds (milli) ---------------------------------------------------
+let XREF_AUTO    = 820   // 0.82 auto-link similarity
+let EARN_K       = 5     // distinct co-activations to earn a link
+let EARN_FLOOR   = 500   // 0.5 weight floor once earned
+let SPAWN_DISSIM = 350   // 0.35 max similarity to existing centroids
+let SPAWN_COHERE = 550   // 0.55 minimum cluster self-coherence
+
+// ---- xref layout ----------------------------------------------------------
+let XR_TAG     = 0
+let XR_SRC_KG  = 1
+let XR_SRC_ATOM= 2
+let XR_DST_KG  = 3
+let XR_DST_ATOM= 4
+let XR_WEIGHT  = 5
+let XR_KIND    = 6
+let XR_EARNED  = 7
+let XR_COACT   = 8
+let XREF_OBJ_TAG = 1801
+
+fn xref_kind_valid(kind) {
+    if kind < XREF_SIMILAR { return 0 }
+    if kind > XREF_PARTOF { return 0 }
+    return 1
+}
+
+fn xref_kind_name(kind) {
+    if kind == XREF_SIMILAR    { return "similar" }
+    if kind == XREF_CAUSAL     { return "causal" }
+    if kind == XREF_ANALOGICAL { return "analogical" }
+    if kind == XREF_PARTOF     { return "partof" }
+    return "invalid"
+}
+
+// Construct a reference from src_atom to dst_atom (both atom objects).
+fn xref_new(src_atom, dst_atom, kind, weight, earned) {
+    let x = list_new()
+    push(x, XREF_OBJ_TAG)
+    push(x, atom_kg(src_atom))
+    push(x, atom_id(src_atom))
+    push(x, atom_kg(dst_atom))
+    push(x, atom_id(dst_atom))
+    push(x, weight)
+    push(x, kind)
+    push(x, earned)
+    push(x, 0)            // co-activation count
+    return x
+}
+
+fn xref_src_kg(x)   { return x[XR_SRC_KG] }
+fn xref_src_atom(x) { return x[XR_SRC_ATOM] }
+fn xref_dst_kg(x)   { return x[XR_DST_KG] }
+fn xref_dst_atom(x) { return x[XR_DST_ATOM] }
+fn xref_weight(x)   { return x[XR_WEIGHT] }
+fn xref_kind(x)     { return x[XR_KIND] }
+fn xref_earned(x)   { return x[XR_EARNED] }
+fn xref_coact(x)    { return x[XR_COACT] }
+
+// Automatic similarity link: if two atoms' embeddings are similar enough,
+// create a revocable XREF_SIMILAR edge on the source and return it; else 0.
+fn xref_auto_link(src_atom, dst_atom) {
+    let sim = vec_cosine(atom_embed(src_atom), atom_embed(dst_atom))
+    if sim < XREF_AUTO { return 0 }
+    let x = xref_new(src_atom, dst_atom, XREF_SIMILAR, sim, 0)
+    atom_add_xref(src_atom, x)
+    return x
+}
+
+// Recompute an automatic edge's weight from current embeddings (lazy decay).
+// Earned edges never fall below the floor.
+fn xref_recompute_weight(x, src_atom, dst_atom) {
+    let sim = vec_cosine(atom_embed(src_atom), atom_embed(dst_atom))
+    if x[XR_EARNED] == 1 {
+        if sim < EARN_FLOOR { sim = EARN_FLOOR }
+    }
+    list_set(x, XR_WEIGHT, sim)
+    return sim
+}
+
+// Record one successful co-activation toward earning the link.
+fn xref_coactivate(x) {
+    list_set(x, XR_COACT, x[XR_COACT] + 1)
+    return x[XR_COACT]
+}
+
+// Promote a causal/analogical edge to earned once it has accumulated EARN_K
+// co-activations. Returns 1 if (now) earned, else 0.
+fn xref_promote_earned(x) {
+    if x[XR_EARNED] == 1 { return 1 }
+    if x[XR_COACT] < EARN_K { return 0 }
+    let k = x[XR_KIND]
+    if k != XREF_CAUSAL {
+        if k != XREF_ANALOGICAL { return 0 }
+    }
+    list_set(x, XR_EARNED, 1)
+    if x[XR_WEIGHT] < EARN_FLOOR { list_set(x, XR_WEIGHT, EARN_FLOOR) }
+    return 1
+}
+
+// ---- spawn-on-new-domain heuristic (ADR-0017) -----------------------------
+
+// Centroid (per-dimension mean) of an arbitrary list of atoms.
+fn cluster_centroid(atoms) {
+    let dims = ATOM_EMBED_DIMS
+    let c = vec_new(dims)
+    let n = len(atoms)
+    if n == 0 { return c }
+    let i = 0
+    while i < n {
+        let e = atom_embed(atoms[i])
+        let d = 0
+        while d < dims {
+            vec_set(c, d, vec_get(c, d) + vec_get(e, d))
+            d = d + 1
+        }
+        i = i + 1
+    }
+    let d2 = 0
+    while d2 < dims {
+        vec_set(c, d2, vec_get(c, d2) / n)
+        d2 = d2 + 1
+    }
+    return c
+}
+
+// Mean pairwise cosine similarity within a cluster (milli). A single atom is
+// trivially coherent (1.0).
+fn cluster_coherence(atoms) {
+    let n = len(atoms)
+    if n < 2 { return FP_SCALE }
+    let total = 0
+    let pairs = 0
+    let i = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            total = total + vec_cosine(atom_embed(atoms[i]), atom_embed(atoms[j]))
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if pairs == 0 { return FP_SCALE }
+    return total / pairs
+}
+
+// Maximum similarity of a centroid to any existing KG's centroid (milli).
+fn max_sim_to_kgs(centroid, reg) {
+    let kgs = reg[KREG_KGS]
+    let best = 0
+    let i = 0
+    while i < len(kgs) {
+        let sim = vec_cosine(centroid, kg_centroid(kgs[i]))
+        if sim > best { best = sim }
+        i = i + 1
+    }
+    return best
+}
+
+// Decide whether a cluster of newly produced atoms warrants a new KG: it must
+// be internally coherent (> SPAWN_COHERE) yet dissimilar to every existing KG
+// centroid (< SPAWN_DISSIM). Returns 1 to spawn, else 0.
+fn spawn_should(cluster_atoms, reg) {
+    if len(cluster_atoms) == 0 { return 0 }
+    if cluster_coherence(cluster_atoms) <= SPAWN_COHERE { return 0 }
+    let centroid = cluster_centroid(cluster_atoms)
+    if max_sim_to_kgs(centroid, reg) >= SPAWN_DISSIM { return 0 }
+    return 1
+}

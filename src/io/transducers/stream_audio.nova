@@ -1,0 +1,390 @@
+// CrossEngin io/transducers: audio-capture streaming source (P2.5).
+//
+// Purpose
+//   The audio leg of the P2.8 streaming event family (peer to
+//   `stream_stdin.nova` / `stream_unix_socket.nova` / `stream_http.nova`).
+//   Periodically polls an external audio-capture command (env
+//   `CE_AUDIO_CAPTURE_CMD`) that writes a WAV to a known path, runs the
+//   pluggable STT seam against that WAV, and posts the transcript as an
+//   `EV_MESSAGE` on the scheduler queue -- so a spoken utterance becomes
+//   an indistinguishable text percept from the daemon's perspective.
+//
+//   Default: NOT enabled. The source activates only when BOTH
+//   `CE_AUDIO_CAPTURE_CMD` and `CE_STT_BACKEND` are set non-empty;
+//   absent either, every poll is a no-op. This protects every existing
+//   integration test from picking up a real microphone and an unfunded
+//   STT install at boot.
+//
+//   The polling shape mirrors `stream_stdin_poll(state, hs)`: the
+//   scheduler calls `stream_audio_poll` once per idle tick; on the first
+//   poll (and once per `CE_AUDIO_POLL_INTERVAL_TICKS` thereafter, default
+//   100 == roughly once per second at 100 Hz active rate) the source
+//   shells out to the capture command, runs the STT seam against the
+//   produced WAV, and posts the transcript -- unless it's the
+//   placeholder "[stt unavailable]" / "[stt: no backend installed]",
+//   in which case the source silently drops it so we don't flood the
+//   scheduler with no-op events.
+//
+//   This module is a framework only. The sandbox the tests run in has
+//   no microphone hardware (`arecord` / `parecord` / `sox` etc. not
+//   installed), so no integration test exercises real audio. The
+//   `STT_AUDIT.md` write-up documents the install commands; the unit
+//   test for this module covers the env-gating, the placeholder-drop
+//   logic, and the poll-interval counter without ever shelling out.
+//
+// ADRs implemented: ADR-0014 (modality bridge), ADR-0037 (event-driven
+//   scheduler -- the source is an event PRODUCER).
+// NOVA dependencies: builtins -- alloc, store64, list_new, push, getenv,
+//   str_eq, char_at, substr, fork_process, exec_program, waitpid.
+// CrossEngin dependencies: src/io/transducers/stt_seam.nova (the STT
+//   surface), src/io/transducers/input_transducer.nova (transduce_text
+//   for normalization), src/scheduler/hybrid_scheduler.nova
+//   (hs_post_event, EV_MESSAGE).
+
+import "stt_seam.nova"
+import "input_transducer.nova"
+import "audio_capture.nova"
+import "../../scheduler/hybrid_scheduler.nova"
+
+// Default WAV path the capture command is expected to produce. Operator
+// can override via `CE_AUDIO_INPUT_PATH=/some/where.wav`.
+let STREAM_AUDIO_DEFAULT_WAV = "/tmp/ce_input.wav"
+
+// Sentinel value for CE_AUDIO_CAPTURE_CMD that routes through the
+// pure-NOVA `audio_capture_record` path (which itself shells out to
+// `scripts/audio_capture.sh`, which auto-detects parecord/arecord/sox
+// and falls back to a silent WAV in a sealed sandbox). This is the
+// path the P2.5 cont. brief wires: operators set
+// `CE_AUDIO_CAPTURE_CMD=auto` instead of a hand-rolled command and
+// the framework handles backend probing + the silent-fallback contract.
+let STREAM_AUDIO_AUTO_TOKEN = "auto"
+
+// Default poll interval: once per 100 ticks (= ~1 sec at 100 Hz active /
+// ~10 sec at the 10 Hz idle rate). Operator can override via
+// `CE_AUDIO_POLL_INTERVAL_TICKS`. Small enough that an utterance is
+// turned around within human-conversational latency; large enough that
+// we don't fork/exec a capture command every single tick.
+let STREAM_AUDIO_DEFAULT_POLL_INTERVAL = 100
+
+// ---- argv builder + sh wrapper (cribbed from audio_speak.nova) -----------
+// Same idiom as the speak path: /bin/sh -c "<command>" to get PATH lookup
+// and shell quoting for free. Both transducers (audio + speak) live with
+// the same fork/exec footprint so we don't introduce a second pattern.
+
+fn _str_argv3(a0, a1, a2) {
+    let p = alloc(4 * 8)
+    store64(p,      a0)
+    store64(p + 8,  a1)
+    store64(p + 16, a2)
+    store64(p + 24, 0)
+    return p
+}
+
+fn _str_run_sh_c(cmd) {
+    let argv = _str_argv3("sh", "-c", cmd)
+    let pid = fork_process()
+    if pid < 0 { return 127 }
+    if pid == 0 {
+        exec_program("/bin/sh", argv)
+        exit(127)
+    }
+    return waitpid(pid)
+}
+
+// ---- stream state ---------------------------------------------------------
+// Shape (parallels stream_stdin.nova / stream_unix_socket.nova):
+//   [0]  tag                (STREAM_AUDIO_TAG)
+//   [1]  enabled            (0|1, set by init_from_env when BOTH envs set)
+//   [2]  initialized        (0|1, reserved for future warm-up step)
+//   [3]  capture_cmd        (resolved CE_AUDIO_CAPTURE_CMD, "" iff use_auto=1)
+//   [4]  wav_path           (resolved CE_AUDIO_INPUT_PATH or default)
+//   [5]  poll_interval      (resolved CE_AUDIO_POLL_INTERVAL_TICKS or default)
+//   [6]  tick_counter       (advances every poll, mod poll_interval)
+//   [7]  utterances_total   (count of EV_MESSAGE posts from this source)
+//   [8]  captures_total     (count of capture-shell invocations -- including
+//                            those that produced placeholders)
+//   [9]  last_transcript    (string)
+//   [10] seam               (the stt_seam used for transcription)
+//   [11] use_auto           (1 iff CE_AUDIO_CAPTURE_CMD == "auto" -- routes
+//                            poll through audio_capture_record(capture_state)
+//                            instead of the user-provided shell command)
+//   [12] capture            (the audio_capture_state_new() struct, used
+//                            only when use_auto=1)
+
+let STREAM_AUDIO_TAG = 6203
+
+let SA_TAG               = 0
+let SA_ENABLED           = 1
+let SA_INITIALIZED       = 2
+let SA_CAPTURE_CMD       = 3
+let SA_WAV_PATH          = 4
+let SA_POLL_INTERVAL     = 5
+let SA_TICK_COUNTER      = 6
+let SA_UTTERANCES_TOTAL  = 7
+let SA_CAPTURES_TOTAL    = 8
+let SA_LAST_TRANSCRIPT   = 9
+let SA_SEAM              = 10
+let SA_USE_AUTO          = 11
+let SA_CAPTURE           = 12
+
+fn stream_audio_new() {
+    let s = list_new()
+    push(s, STREAM_AUDIO_TAG)
+    push(s, 0)
+    push(s, 0)
+    push(s, "")
+    push(s, STREAM_AUDIO_DEFAULT_WAV)
+    push(s, STREAM_AUDIO_DEFAULT_POLL_INTERVAL)
+    push(s, 0)
+    push(s, 0)
+    push(s, 0)
+    push(s, "")
+    push(s, stt_seam_new())
+    push(s, 0)                            // [11] use_auto -- toggled by init_from_env
+    push(s, audio_capture_state_new())    // [12] capture struct (always present)
+    return s
+}
+
+// ---- public accessors -----------------------------------------------------
+
+fn stream_audio_enabled(s)          { return s[SA_ENABLED] }
+fn stream_audio_initialized(s)      { return s[SA_INITIALIZED] }
+fn stream_audio_capture_cmd(s)      { return s[SA_CAPTURE_CMD] }
+fn stream_audio_wav_path(s)         { return s[SA_WAV_PATH] }
+fn stream_audio_poll_interval(s)    { return s[SA_POLL_INTERVAL] }
+fn stream_audio_tick_counter(s)     { return s[SA_TICK_COUNTER] }
+fn stream_audio_utterances_total(s) { return s[SA_UTTERANCES_TOTAL] }
+fn stream_audio_captures_total(s)   { return s[SA_CAPTURES_TOTAL] }
+fn stream_audio_last_transcript(s)  { return s[SA_LAST_TRANSCRIPT] }
+fn stream_audio_seam(s)             { return s[SA_SEAM] }
+fn stream_audio_use_auto(s)         { return s[SA_USE_AUTO] }
+fn stream_audio_capture(s)          { return s[SA_CAPTURE] }
+
+// ---- env gate -------------------------------------------------------------
+// Activation requires BOTH:
+//   CE_AUDIO_CAPTURE_CMD non-empty
+//   CE_STT_BACKEND non-empty
+// Either missing -> source stays disabled, every poll is a no-op.
+
+fn _str_audio_env_says_on() {
+    let cap = getenv("CE_AUDIO_CAPTURE_CMD")
+    if cap == 0 { return 0 }
+    if len(cap) == 0 { return 0 }
+    let stt = getenv("CE_STT_BACKEND")
+    if stt == 0 { return 0 }
+    if len(stt) == 0 { return 0 }
+    if str_eq(stt, "0") == 1 { return 0 }
+    if str_eq(stt, "false") == 1 { return 0 }
+    if str_eq(stt, "no") == 1 { return 0 }
+    return 1
+}
+
+fn _str_audio_env_capture_cmd() {
+    let env = getenv("CE_AUDIO_CAPTURE_CMD")
+    if env == 0 { return "" }
+    return env
+}
+
+fn _str_audio_env_wav_path() {
+    let env = getenv("CE_AUDIO_INPUT_PATH")
+    if env == 0 { return STREAM_AUDIO_DEFAULT_WAV }
+    if len(env) == 0 { return STREAM_AUDIO_DEFAULT_WAV }
+    return env
+}
+
+// poll_interval from env (string like "100"). Parse leading digits;
+// fall back to the default on any unparseable input. Bounded by
+// [1..32767] to keep all arithmetic well below NOVA's pointer
+// threshold (gotcha #11).
+fn _str_audio_env_poll_interval() {
+    let env = getenv("CE_AUDIO_POLL_INTERVAL_TICKS")
+    if env == 0 { return STREAM_AUDIO_DEFAULT_POLL_INTERVAL }
+    if len(env) == 0 { return STREAM_AUDIO_DEFAULT_POLL_INTERVAL }
+    let n = len(env)
+    let i = 0
+    let acc = 0
+    let any = 0
+    while i < n {
+        let c = char_at(env, i)
+        if c >= 48 && c <= 57 {
+            acc = acc * 10 + (c - 48)
+            any = 1
+        } else {
+            // Non-digit -- bail out with whatever we've accumulated.
+            i = n
+        }
+        i = i + 1
+    }
+    if any == 0 { return STREAM_AUDIO_DEFAULT_POLL_INTERVAL }
+    if acc < 1 { return 1 }
+    if acc > 32767 { return 32767 }
+    return acc
+}
+
+// init_from_env: resolves env vars and enables the source iff the gate
+// says on. Mirrors the stream_stdin / stream_unix_socket lifecycle.
+//
+// P2.5 cont.: when CE_AUDIO_CAPTURE_CMD == "auto" the source flips
+// SA_USE_AUTO to 1 and the poll path delegates to audio_capture_record
+// (which itself shells out to scripts/audio_capture.sh, which
+// auto-detects parecord/arecord/sox and falls back to a silent WAV in
+// sealed sandboxes). The CAPTURE_CMD slot is cleared in that case so a
+// later introspection ("which command produced the WAV?") can tell the
+// auto path from a user-provided command.
+fn stream_audio_init_from_env(s) {
+    if _str_audio_env_says_on() == 1 {
+        list_set(s, SA_ENABLED, 1)
+        let cmd = _str_audio_env_capture_cmd()
+        let wav = _str_audio_env_wav_path()
+        list_set(s, SA_WAV_PATH, wav)
+        list_set(s, SA_POLL_INTERVAL, _str_audio_env_poll_interval())
+        if str_eq(cmd, STREAM_AUDIO_AUTO_TOKEN) == 1 {
+            list_set(s, SA_USE_AUTO, 1)
+            list_set(s, SA_CAPTURE_CMD, "")
+            // Sync the audio_capture state's WAV path to the seam's
+            // resolved path so audio_capture_record(state, _, "") lands
+            // on the same file the STT seam then reads back.
+            let cap = s[SA_CAPTURE]
+            list_set(cap, ACAP_WAV_PATH, wav)
+        } else {
+            list_set(s, SA_USE_AUTO, 0)
+            list_set(s, SA_CAPTURE_CMD, cmd)
+        }
+        return 1
+    }
+    list_set(s, SA_ENABLED, 0)
+    list_set(s, SA_USE_AUTO, 0)
+    return 0
+}
+
+// stream_audio_init -- runtime warm-up. Currently a no-op (the capture
+// command is shelled out per poll, not at init), but the symbol exists
+// so the daemon's source-lifecycle loop is uniform across all four
+// stream sources. Returns 1 always.
+fn stream_audio_init(s) {
+    if s[SA_ENABLED] == 0 { return 0 }
+    list_set(s, SA_INITIALIZED, 1)
+    return 1
+}
+
+// ---- transcript filter ---------------------------------------------------
+// The STT seam returns a placeholder string when no real backend is
+// installed (`[stt unavailable]` / `[stt: no backend installed]` / `[stt:
+// input wav missing]`). We don't want to flood the scheduler with these,
+// so the poll path skips posting them. The recognizer is the same
+// bracketed-prefix check `stt_seam._stt_is_placeholder` uses; we recheck
+// here to keep this module a leaf consumer of the seam's public API.
+fn _str_audio_is_placeholder(line) {
+    let n = len(line)
+    if n < 6 { return 0 }
+    if char_at(line, 0) != 91 { return 0 }   // '['
+    if char_at(line, 1) != 115 { return 0 }  // 's'
+    if char_at(line, 2) != 116 { return 0 }  // 't'
+    if char_at(line, 3) != 116 { return 0 }  // 't'
+    return 1
+}
+
+// ---- poll -----------------------------------------------------------------
+// One audio-source advance. The semantics are intentionally simple:
+//   1. Source disabled -> no-op, return 0.
+//   2. Source enabled but the tick counter hasn't hit poll_interval
+//      since the last capture -> tick the counter, return 0.
+//   3. Counter expired -> shell out to CE_AUDIO_CAPTURE_CMD; on its
+//      success run stt_transcribe_wav against the produced WAV;
+//      normalize via transduce_text; post as EV_MESSAGE (unless the
+//      transcript is the placeholder); reset the counter. Return the
+//      number of EV_MESSAGE events posted (0 or 1 in this revision).
+//
+// We never abort the poll on a non-zero exit from the capture command;
+// the brief calls out that the polled environment is fundamentally
+// best-effort (the operator may have unplugged the mic). A failing
+// capture just yields no message this round; the counter still resets
+// so the next attempt happens in another poll_interval ticks.
+
+fn stream_audio_poll(s, hs) {
+    if s[SA_ENABLED] == 0 { return 0 }
+    if s[SA_INITIALIZED] == 0 { return 0 }
+    // Tick gate: only run the expensive shell-out + STT every N polls.
+    let tc = s[SA_TICK_COUNTER] + 1
+    if tc < s[SA_POLL_INTERVAL] {
+        list_set(s, SA_TICK_COUNTER, tc)
+        return 0
+    }
+    list_set(s, SA_TICK_COUNTER, 0)
+
+    // Step 1: produce a WAV at SA_WAV_PATH. Two paths converge on the
+    // same file: either (a) shell out to the user-provided
+    // CE_AUDIO_CAPTURE_CMD via /bin/sh -c, or (b) when SA_USE_AUTO=1
+    // (CE_AUDIO_CAPTURE_CMD=auto), delegate to audio_capture_record
+    // which itself runs scripts/audio_capture.sh + backend-detects
+    // parecord/arecord/sox + falls back to a silent WAV. Either way
+    // the WAV file at SA_WAV_PATH is the load-bearing artifact.
+    if s[SA_USE_AUTO] == 1 {
+        let cap = s[SA_CAPTURE]
+        audio_capture_record(cap, 0, s[SA_WAV_PATH])
+    } else {
+        let cap_cmd = s[SA_CAPTURE_CMD]
+        if len(cap_cmd) > 0 {
+            _str_run_sh_c(cap_cmd)
+        }
+    }
+    list_set(s, SA_CAPTURES_TOTAL, s[SA_CAPTURES_TOTAL] + 1)
+
+    // Step 2: run the STT seam against the produced WAV.
+    let wav = s[SA_WAV_PATH]
+    let result = stt_transcribe_wav(s[SA_SEAM], wav)
+    let transcript = stt_result_transcript(result)
+    list_set(s, SA_LAST_TRANSCRIPT, transcript)
+
+    if len(transcript) == 0 {
+        return 0
+    }
+    if _str_audio_is_placeholder(transcript) == 1 {
+        // Don't post placeholders to the scheduler queue; the operator
+        // who set CE_AUDIO_CAPTURE_CMD without installing a real STT
+        // backend would otherwise see a stream of "[stt unavailable]"
+        // events drowning the daemon. The capture counter still ticked
+        // up so they can introspect via the accessors.
+        return 0
+    }
+
+    // Step 3: normalize + post the transcript exactly like the stdin
+    // streaming source posts a typed line.
+    let norm = transduce_text(transcript)
+    if len(norm) == 0 { return 0 }
+    hs_post_event(hs, EV_MESSAGE, norm)
+    list_set(s, SA_UTTERANCES_TOTAL, s[SA_UTTERANCES_TOTAL] + 1)
+    return 1
+}
+
+// Test-only helpers: force the enabled/initialized flags + bypass the
+// tick-counter gate so a unit test can drive a synthetic poll without
+// touching real envs or shelling out. The shape mirrors
+// `stream_stdin_test_feed` / `stream_stdin_test_reset`.
+
+fn stream_audio_test_set_enabled(s, on) {
+    list_set(s, SA_ENABLED, on)
+    list_set(s, SA_INITIALIZED, on)
+    return 1
+}
+
+fn stream_audio_test_set_interval(s, n) {
+    list_set(s, SA_POLL_INTERVAL, n)
+    return 1
+}
+
+fn stream_audio_test_set_wav_path(s, path) {
+    list_set(s, SA_WAV_PATH, path)
+    return 1
+}
+
+fn stream_audio_test_reset(s) {
+    list_set(s, SA_ENABLED, 0)
+    list_set(s, SA_INITIALIZED, 0)
+    list_set(s, SA_TICK_COUNTER, 0)
+    list_set(s, SA_UTTERANCES_TOTAL, 0)
+    list_set(s, SA_CAPTURES_TOTAL, 0)
+    list_set(s, SA_LAST_TRANSCRIPT, "")
+    list_set(s, SA_USE_AUTO, 0)
+    return 1
+}

@@ -1,0 +1,426 @@
+// CrossEngin session: per-tenant state struct + registry (ADR-0051).
+//
+// Purpose
+//   Today `bin/crossengin` and `bin/crossengin-chat` are single-Aurora processes:
+//   the soul, KG registry, language KG, reflection KG, blackboard ctx, decision
+//   log, goal engine, meta-observer, and scheduler are all top-level `let`s
+//   inside `main()`. Multi-user / multi-persona deployments need to lift those
+//   into a `Session` value keyed by a string ID so one process can serve N
+//   conversational tenants without the cognitive state of tenant A bleeding into
+//   tenant B.
+//
+//   This module is the SHAPE -- a small indexed-list wrapper plus a linear
+//   registry. It deliberately does NOT construct any of the underlying
+//   subsystems. The caller (the daemon, the chat, a future router) constructs
+//   each state object exactly as it does today, then wraps the bundle in one
+//   `session_make(...)` call. The Session module then provides typed accessors
+//   and a registry for lookup by ID, count / list / destroy, and an
+//   "active-since" filter for janitorial passes.
+//
+//   This indirection keeps the module dependency-free (NOVA blocker #10): every
+//   subsystem state object is OPAQUE to the Session layer -- we never read past
+//   the top-level slot, just store and return it. The construction logic stays
+//   in the caller; this module is purely indexing + lifecycle. The follow-up
+//   that routes the daemon / chat per-session is a separate, focused change.
+//
+//   Per-process vs. per-session: the scheduler is held PER-SESSION. That is the
+//   cleaner isolation -- each tenant has its own tick clock, idle counter, and
+//   event queue, and a stuck tenant cannot starve the others. If N gets large
+//   enough that the per-session scheduler becomes the bottleneck (empirically
+//   N >> 1, not anticipated for the v1.x companion use case), a future revision
+//   can move it process-global and route ticks; the Session struct grows /
+//   shrinks one slot.
+//
+// ADRs implemented: ADR-0051 (multi-tenant session foundation). NOVA
+//   dependencies: builtins only (list_new, push, len, list_set, str_eq).
+//   CrossEngin dependencies: NONE -- every subsystem state object is opaque to
+//   the Session module.
+
+// ---- Session struct layout ------------------------------------------------
+// A Session is a flat list of well-known slots. Each slot holds either a
+// scalar (id, name, timestamps) or an opaque subsystem handle constructed by
+// the caller. SES_COUNT is the canonical length of a fully-constructed
+// Session; session_make asserts it implicitly via the push order.
+let SES_ID          = 0    // string -- primary key inside a SessionRegistry
+let SES_NAME        = 1    // string -- display name (passed to soul_new today)
+let SES_CREATED     = 2    // int    -- created_at epoch / tick on session_make
+let SES_LAST_ACTIVE = 3    // int    -- last_active epoch / tick; bumped by session_touch
+let SES_SOUL        = 4    // opaque -- the soul handle (soul_new result)
+let SES_KGREG       = 5    // opaque -- the kg registry (kg_registry_new)
+let SES_KG          = 6    // opaque -- reasoning / "world" concept KG
+let SES_LANG        = 7    // opaque -- language KG (word atoms)
+let SES_IKG         = 8    // opaque -- imagination KG
+let SES_REFL_KG     = 9    // opaque -- reflection KG (or 0 if not used)
+let SES_CTX         = 10   // opaque -- blackboard / loop_coordination ctx
+let SES_LOG         = 11   // opaque -- decision log
+let SES_ENGINE      = 12   // opaque -- goal engine
+let SES_MO          = 13   // opaque -- meta-learning observer
+let SES_HS          = 14   // opaque -- hybrid scheduler
+let SES_DP          = 15   // opaque -- differential-privacy state (P3.6,
+                            //           ADR-0053). Per-session epsilon
+                            //           budget tracker; 0 if DP is not
+                            //           wired (legacy sessions).
+let SES_COUNT       = 16   // canonical slot count for a complete Session
+
+// ---- Constructor ----------------------------------------------------------
+//
+// Build a Session from already-constructed subsystem handles. The caller
+// builds each handle exactly as the daemon's main() does today (soul_new,
+// kg_registry_new, reasoning_kg_init, lang_kg_init, imagination_kg_init,
+// refl_kg_init, ctx_new, dl_new, goal_engine_new, mo_new, hs_new) and passes
+// them in here. No subsystem-aware logic lives in this module; the Session
+// only stores the bundle by named slot for later accessor lookup.
+//
+// All opaque parameters are stored verbatim; pass 0 for any slot a particular
+// caller does not use (e.g. SES_REFL_KG in the daemon prior to refl wiring).
+fn session_make(id, name, created_at, sl, kgreg, kg, lang, ikg, refl_kg,
+                ctx, log, engine, mo, hs) {
+    let s = list_new()
+    push(s, id)                 // SES_ID
+    push(s, name)               // SES_NAME
+    push(s, created_at)         // SES_CREATED
+    push(s, created_at)         // SES_LAST_ACTIVE (initialized to created_at)
+    push(s, sl)                 // SES_SOUL
+    push(s, kgreg)              // SES_KGREG
+    push(s, kg)                 // SES_KG
+    push(s, lang)               // SES_LANG
+    push(s, ikg)                // SES_IKG
+    push(s, refl_kg)            // SES_REFL_KG
+    push(s, ctx)                // SES_CTX
+    push(s, log)                // SES_LOG
+    push(s, engine)             // SES_ENGINE
+    push(s, mo)                 // SES_MO
+    push(s, hs)                 // SES_HS
+    push(s, 0)                  // SES_DP (P3.6 / ADR-0053; 0 == unset.
+                                //          Wire via session_attach_dp().)
+    return s
+}
+
+// ---- Accessors ------------------------------------------------------------
+// One getter per slot, returning the value verbatim. Modifying the returned
+// opaque handle is the normal way the daemon's tick loop runs; the Session
+// module never copies, so all mutations to e.g. the soul's mood happen on the
+// canonical object inside this session and only this session.
+fn session_id(s)          { return s[SES_ID] }
+fn session_name(s)        { return s[SES_NAME] }
+fn session_created_at(s)  { return s[SES_CREATED] }
+fn session_last_active(s) { return s[SES_LAST_ACTIVE] }
+fn session_soul(s)        { return s[SES_SOUL] }
+fn session_kgreg(s)       { return s[SES_KGREG] }
+fn session_kg(s)          { return s[SES_KG] }
+fn session_lang(s)        { return s[SES_LANG] }
+fn session_ikg(s)         { return s[SES_IKG] }
+fn session_refl_kg(s)     { return s[SES_REFL_KG] }
+fn session_ctx(s)         { return s[SES_CTX] }
+fn session_log(s)         { return s[SES_LOG] }
+fn session_engine(s)      { return s[SES_ENGINE] }
+fn session_mo(s)          { return s[SES_MO] }
+fn session_hs(s)          { return s[SES_HS] }
+
+// P3.6: per-session differential-privacy state (ADR-0053). Returns 0 when
+// the slot is not present (a Session built by a pre-P3.6 session_make call
+// that did not yet carry the dp slot, or one explicitly constructed
+// without DP wiring). The caller MUST handle the 0 case -- the kg_atom_count_dp
+// helpers will themselves return DP_REFUSED if asked to consume from a
+// 0 dp_state, but a 0 here also signals "no DP enforcement at all", so
+// admin paths typically check first and print "(DP not configured)".
+fn session_dp(s) {
+    if len(s) <= SES_DP { return 0 }
+    return s[SES_DP]
+}
+
+// P3.6: attach a dp_state to a session AFTER construction. The slot is
+// grown lazily so callers that build a session via the legacy 14-arg
+// session_make() and then bolt on DP don't have to change the
+// constructor signature. Idempotent: setting twice replaces the prior
+// handle (caller's responsibility to not lose the old budget).
+fn session_attach_dp(s, dp) {
+    while len(s) <= SES_DP { push(s, 0) }
+    list_set(s, SES_DP, dp)
+    return 1
+}
+
+// Bump the last_active timestamp. Callers should call this on every event
+// dispatched into the session so sreg_active() can filter idle tenants.
+// The created_at field is immutable.
+fn session_touch(s, now) {
+    list_set(s, SES_LAST_ACTIVE, now)
+    return 1
+}
+
+// ---- SessionRegistry ------------------------------------------------------
+// The registry is a small list of [id_string, session] pairs walked linearly.
+// N is small (1-100 tenants in any realistic v1.x deployment), so a hash map
+// would be premature -- and the NOVA builtin map caps at 16 keys anyway
+// (NEXT_SESSION blocker #1). String compare via builtin str_eq.
+
+let SREG_PAIRS = 0   // list of [id, session]
+let SREG_ID    = 0   // pair[0]
+let SREG_SES   = 1   // pair[1]
+
+fn sreg_new() {
+    let r = list_new()
+    push(r, list_new())   // SREG_PAIRS
+    return r
+}
+
+// Walk the pair list and return the index of the entry matching id, or -1.
+fn _sreg_index(reg, id) {
+    let pairs = reg[SREG_PAIRS]
+    let i = 0
+    while i < len(pairs) {
+        if str_eq(pairs[i][SREG_ID], id) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn sreg_count(reg) { return len(reg[SREG_PAIRS]) }
+
+// Look up a session by ID. Returns the Session, or 0 if no such id is
+// registered. 0 is a safe sentinel because session_make always returns a
+// non-empty list.
+fn sreg_lookup(reg, id) {
+    let idx = _sreg_index(reg, id)
+    if idx < 0 { return 0 }
+    return reg[SREG_PAIRS][idx][SREG_SES]
+}
+
+// Create a new session under `id` with display name `name`. The opaque state
+// handles must already be constructed by the caller and supplied via the
+// extended overload below (sreg_register). This helper builds a SKELETON
+// session with all opaque slots set to 0; it is the "lightweight" path used
+// by callers (and tests) that only need the id / lifecycle plumbing. Callers
+// that need real state should use session_make + sreg_register.
+//
+// Returns the new Session, or 0 if id already exists.
+fn sreg_create(reg, id, name, now) {
+    if _sreg_index(reg, id) >= 0 { return 0 }
+    let s = session_make(id, name, now, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    let pair = list_new()
+    push(pair, id)
+    push(pair, s)
+    push(reg[SREG_PAIRS], pair)
+    return s
+}
+
+// Register a pre-built session value in the registry under its own id. This
+// is the path the daemon / chat will use: build all the state objects, wrap
+// in session_make(...), then sreg_register(reg, sess) to insert.
+//
+// Returns 1 on insert, 0 if a session with that id already exists.
+fn sreg_register(reg, sess) {
+    let id = session_id(sess)
+    if _sreg_index(reg, id) >= 0 { return 0 }
+    let pair = list_new()
+    push(pair, id)
+    push(pair, sess)
+    push(reg[SREG_PAIRS], pair)
+    return 1
+}
+
+// Remove a session by id. Returns 1 if removed, 0 if the id was not present.
+// The opaque state objects are not destroyed (NOVA has no destructor; GC
+// reclaims unreferenced lists). The pair is simply unlinked from the list.
+fn sreg_destroy(reg, id) {
+    let idx = _sreg_index(reg, id)
+    if idx < 0 { return 0 }
+    let pairs = reg[SREG_PAIRS]
+    // Rebuild without the removed entry. The linear copy is fine for the
+    // expected N (<= 100); a swap-with-last is also valid but reorders ids.
+    let kept = list_new()
+    let i = 0
+    while i < len(pairs) {
+        if i != idx { push(kept, pairs[i]) }
+        i = i + 1
+    }
+    list_set(reg, SREG_PAIRS, kept)
+    return 1
+}
+
+// Return all registered session ids in sorted (ascending) order. Sorting
+// makes the output deterministic, which simplifies tests and any "list all
+// tenants" admin command. Sort is selection sort (N small, mirrors the
+// neighborhood module's pattern).
+fn sreg_ids(reg) {
+    let pairs = reg[SREG_PAIRS]
+    let ids = list_new()
+    let i = 0
+    while i < len(pairs) {
+        push(ids, pairs[i][SREG_ID])
+        i = i + 1
+    }
+    // Selection sort, ascending, lexicographic via _str_lt.
+    let n = len(ids)
+    let a = 0
+    while a < n {
+        let best = a
+        let b = a + 1
+        while b < n {
+            if _str_lt(ids[b], ids[best]) == 1 { best = b }
+            b = b + 1
+        }
+        if best != a {
+            let tmp = ids[a]
+            list_set(ids, a, ids[best])
+            list_set(ids, best, tmp)
+        }
+        a = a + 1
+    }
+    return ids
+}
+
+// Return all sessions whose last_active >= (now - max_idle_seconds), in the
+// pair-list's natural (insertion) order. A janitor pass calling
+// `sreg_active(reg, IDLE_TTL, now)` for the complement set (i.e. by walking
+// sreg_ids() and filtering) can evict stale tenants in bulk.
+fn sreg_active(reg, max_idle_seconds, now) {
+    let pairs = reg[SREG_PAIRS]
+    let out = list_new()
+    let cutoff = now - max_idle_seconds
+    let i = 0
+    while i < len(pairs) {
+        let sess = pairs[i][SREG_SES]
+        if session_last_active(sess) >= cutoff { push(out, sess) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- per-session path helpers (P1.2) -------------------------------------
+//
+// Daemon + chat both write a durable snapshot and a durable decision log per
+// tenant. Until P1.2 each binary derived these paths from a single
+// `CE_SNAP_PATH` / `CE_DLOG_PATH` env override, defaulting to a single
+// `/tmp/crossengin.snap` / `/tmp/crossengin.dlog`. That works when ONE
+// process serves ONE session, but it lets a `/switch alice` then `/save`
+// silently clobber the default tenant's snapshot.
+//
+// The fix is per-session disk paths, derived from a single PER-SESSION-ID
+// template under a directory configurable via env. The effective path is
+//
+//     $CE_SNAP_DIR / crossengin.<session_id>.snap     for snapshots
+//     $CE_DLOG_DIR / crossengin.<session_id>.dlog     for decision log
+//
+// with `/tmp` as the default for both directories. The session id "default"
+// (the value `examples/crossengin_daemon.nova` and `examples/crossengin_chat.nova`
+// use when `CE_SESSION_ID` is unset) maps to `/tmp/crossengin.default.snap`
+// / `/tmp/crossengin.default.dlog` -- distinct paths from the pre-P1.2
+// `/tmp/crossengin.snap` / `/tmp/crossengin.dlog` defaults.
+//
+// Backwards-compat: a caller that exports `CE_SNAP_PATH` or `CE_DLOG_PATH`
+// EXPLICITLY (legacy single-file mode) keeps that exact override -- the
+// per-session derivation is skipped. This matters for the test suite, which
+// has scripts that pin a specific path via env.
+//
+// The helpers come in two flavours: a thin env-reading wrapper (callable
+// from the daemon / chat at run time) and a PURE resolver that takes the
+// env-style strings as explicit arguments. The unit suite exercises the
+// pure resolver branch-by-branch -- NOVA exposes `getenv` but not `setenv`
+// / `putenv`, so a test cannot mutate the process env to probe precedence.
+
+// Normalize a session id: treat 0 (NOVA's null sentinel) or "" as "default".
+// Used by the path builders so a missing id never produces a malformed
+// filename like "/tmp/crossengin..snap".
+fn _session_id_or_default(session_id) {
+    if session_id == 0 { return "default" }
+    if len(session_id) == 0 { return "default" }
+    return session_id
+}
+
+// Pure path builder for snapshots: applies the precedence rules to EXPLICIT
+// env-style strings (no `getenv` calls). The wrapper `session_snap_path`
+// reads the env and forwards; tests use this entry point directly so a unit
+// test can exercise every precedence branch without mutating the process
+// environment.
+//
+// Pass 0 or "" for `path_env` / `dir_env` to simulate "unset" -- mirrors the
+// real `getenv` return when the variable is missing or empty.
+fn session_snap_path_resolve(path_env, dir_env, session_id) {
+    if path_env != 0 {
+        if len(path_env) > 0 { return path_env }
+    }
+    let dir = "/tmp"
+    if dir_env != 0 {
+        if len(dir_env) > 0 { dir = dir_env }
+    }
+    return dir + "/crossengin." + _session_id_or_default(session_id) + ".snap"
+}
+
+// Pure path builder for the durable decision log. Same precedence contract
+// as `session_snap_path_resolve`; lives at its own filename suffix + reads
+// its own env namespace at the wrapper site so the snap and dlog paths can
+// be routed to different volumes (ADR-0043 durable-but-separate).
+fn session_dlog_path_resolve(path_env, dir_env, session_id) {
+    if path_env != 0 {
+        if len(path_env) > 0 { return path_env }
+    }
+    let dir = "/tmp"
+    if dir_env != 0 {
+        if len(dir_env) > 0 { dir = dir_env }
+    }
+    return dir + "/crossengin." + _session_id_or_default(session_id) + ".dlog"
+}
+
+// Resolve the durable snapshot path for a given session id.
+//
+// Precedence:
+//   1. $CE_SNAP_PATH (non-empty) -- legacy single-file mode wins.
+//   2. $CE_SNAP_DIR (non-empty) + "/crossengin." + session_id + ".snap".
+//   3. "/tmp/crossengin." + session_id + ".snap".
+fn session_snap_path(session_id) {
+    return session_snap_path_resolve(getenv("CE_SNAP_PATH"),
+                                     getenv("CE_SNAP_DIR"),
+                                     session_id)
+}
+
+// Resolve the durable decision-log path for a given session id. Same
+// precedence + default-dir contract as `session_snap_path`. The dlog file
+// lives in its own directory variable so an operator can route audit
+// history to a separate volume from cognitive snapshots (ADR-0043 keeps
+// them durable-but-separate); both default to `/tmp`.
+fn session_dlog_path(session_id) {
+    return session_dlog_path_resolve(getenv("CE_DLOG_PATH"),
+                                     getenv("CE_DLOG_DIR"),
+                                     session_id)
+}
+
+// Pure resolver for the active session id given an explicit env-style
+// string. Tests exercise this with the inputs that the wrapper would
+// observe; the wrapper just reads CE_SESSION_ID and forwards.
+fn session_id_resolve(env_value) {
+    if env_value != 0 {
+        if len(env_value) > 0 { return env_value }
+    }
+    return "default"
+}
+
+// Resolve the active session id from `$CE_SESSION_ID`, defaulting to
+// "default" when unset or empty. Daemon and chat both call this at boot
+// when they need the id of the session that should drive the loop today.
+fn session_id_from_env() {
+    return session_id_resolve(getenv("CE_SESSION_ID"))
+}
+
+// ---- string comparison helper --------------------------------------------
+// Lexicographic less-than over two strings. Used by sreg_ids() to produce a
+// stable ascending order. NOVA exposes str_eq but not str_lt; we implement
+// it via char_at + len. ASCII byte order is sufficient for tenant ids
+// (typically ASCII; UTF-8 sorts identically below 0x80).
+fn _str_lt(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    let n = la
+    if lb < n { n = lb }
+    let i = 0
+    while i < n {
+        let ca = char_at(a, i)
+        let cb = char_at(b, i)
+        if ca < cb { return 1 }
+        if ca > cb { return 0 }
+        i = i + 1
+    }
+    // Shared prefix; shorter sorts first.
+    if la < lb { return 1 }
+    return 0
+}

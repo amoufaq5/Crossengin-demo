@@ -1,0 +1,564 @@
+// CrossEngin knowledge: recursive provenance walks over the R20B rule
+// engine, producing human-readable proof trees (R22E).
+//
+// Purpose
+//   R20B's `rule_engine_explain(engine, atom_id)` returns ONE level of
+//   provenance: the rule index + the source atom IDs whose conjunction
+//   triggered the derivation. R21B's `dr_derivation_provenance(dr,
+//   atom_id)` exposes the same flat shape for the federated case. What
+//   was missing is a RECURSIVE walk: when an atom was derived from
+//   atoms that were themselves derived, we want to follow the chain
+//   backward to ground facts and assemble a COMPLETE proof tree.
+//
+//   The classical motivating shape: with the standard transitive
+//   ancestor rules over a 5-link parent chain
+//     parent(0,1), parent(1,2), parent(2,3), parent(3,4), parent(4,5)
+//   the derivation of `ancestor(0, 5)` proceeds through several
+//   `ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)` chains. A
+//   complete proof tree for ancestor(0,5) names EVERY parent fact and
+//   ancestor sub-derivation, all the way to the ground facts. R22E
+//   walks that backward chain and renders it as an indented text tree
+//   AND as a structured nested list (JSON-shaped) for programmatic
+//   consumers.
+//
+// Public API
+//   explain_atom(kg, engine, atom_id) -> proof_tree_t
+//     Recursively walks the provenance chain for atom_id and returns
+//     a proof_tree_t. If atom_id is a ground fact (not derived by the
+//     engine), the returned tree is a leaf with is_ground=1.
+//
+//   proof_render_text(tree, max_depth) -> str
+//     Indented text rendering. Each line shows the atom's label, the
+//     rule that produced it (or "GROUND" for leaves), and a depth
+//     prefix of two-space indents. max_depth caps the descent;
+//     deeper subtrees render as TRUNCATED sentinels.
+//
+//   proof_render_structured(tree) -> nested_list
+//     Returns the structured form. Each node is
+//       [atom_id, label, rule_idx, [sub_proof_1, sub_proof_2, ...]]
+//     with rule_idx == -1 for ground facts, -2 for truncation, -3 for
+//     cycle, -4 for missing-atom sentinels; suitable for programmatic
+//     walks (e.g. a UI that wants to render the tree itself).
+//
+//   proof_height(tree) -> int
+//     Returns the height of the tree (1 for a leaf, 2 for a one-step
+//     derivation, etc.).
+//
+//   proof_ground_facts(tree) -> list[atom_id]
+//     Returns the deduplicated list of atom IDs at the GROUND leaves
+//     of the tree (truncation/cycle/missing sentinels are NOT counted).
+//
+// Algorithm
+//   1. For target atom A, call `rule_engine_explain(engine, A)`.
+//      - Empty list -> A is a ground fact: emit a leaf node.
+//      - One or more provenance entries -> use the FIRST entry as the
+//        canonical proof (the brief allows multiple derivations of the
+//        same atom; we pick the first to keep proof trees finite and
+//        deterministic, and report the alternatives as a count on the
+//        node via proof_derivation_count).
+//   2. For each source atom in the chosen provenance, recursively
+//      explain it. Sub-proofs become children of the current node.
+//   3. The recursion is depth-bounded by max_depth (default 50) to
+//      defend against unforeseen cycles. R20B's dedupe step already
+//      prevents the same atom from being re-derived, so genuine cycles
+//      cannot occur in well-formed engines; the cap is defence in
+//      depth. A visited-set ALSO suppresses any pathological re-entry
+//      (in case a test fixture force-adds a duplicate provenance
+//      entry pointing back at a parent).
+//
+// Caps
+//   - EXPLAIN_MAX_DEPTH = 50 (configurable per call via
+//     explain_atom_with_depth).
+//   - Visited-set membership is checked at each recursive descent to
+//     short-circuit any cycle to a sentinel CYCLE subtree.
+//   - The ground-fact set is built via membership-checked push so it
+//     stays bounded by the KG size (no duplicate IDs).
+//
+// ADRs implemented: ADR-0016 (atoms are the inference surface),
+//   ADR-0049 (testing + benchmarks -- 25+ unit assertions).
+// NOVA dependencies: builtins (lists, str_eq, char_at, len, push,
+//   list_set, int_to_str, rt_str_to_int, type_of).
+// CrossEngin dependencies: src/kg/atom_store.nova (atom_label),
+//   src/kg/multi_kg_manager.nova (kg_atom), src/kg/rule_inference.nova
+//   (rule_engine_explain, rule_engine_is, rule_engine_size,
+//   rule_engine_new, rule_engine_add, rule_engine_run, rule_head_pred,
+//   RE_RULES).
+
+import "std/io"
+import "std/string"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+import "rule_inference.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let EXPLAIN_MAX_DEPTH            = 50
+let EXPLAIN_DEFAULT_RENDER_DEPTH = 50
+
+// ---- proof_tree_t layout -------------------------------------------------
+// proof_tree_t ::= [PROOF_OBJ_TAG, atom_id, label, rule_idx, rule_name,
+//                   sub_proofs, is_ground, is_truncated, derivation_count]
+//   - atom_id:          int -- the atom this node explains
+//   - label:            string -- the atom's KG label (for human display)
+//   - rule_idx:         int -- the rule index that produced it (-1 for
+//                       ground facts and truncation/cycle/missing sentinels)
+//   - rule_name:        string -- the rule's head pred ("GROUND" for
+//                       ground facts, "TRUNCATED" / "CYCLE" / "MISSING"
+//                       for sentinels)
+//   - sub_proofs:       list[proof_tree_t] -- child proofs (one per
+//                       source atom of the chosen provenance entry)
+//   - is_ground:        int 0/1 -- 1 iff the atom is a ground fact
+//                       (no provenance recorded in the engine)
+//   - is_truncated:     int 0/1 -- 1 iff this node is a depth-cap or
+//                       cycle sentinel (sub_proofs is empty)
+//   - derivation_count: int -- how many provenance entries existed for
+//                       this atom; we always render the FIRST but the
+//                       count is reported so callers know when an atom
+//                       had multiple paths
+let PROOF_OBJ_TAG = 2501
+let PT_TAG       = 0
+let PT_ATOM_ID   = 1
+let PT_LABEL     = 2
+let PT_RULE_IDX  = 3
+let PT_RULE_NAME = 4
+let PT_SUBS      = 5
+let PT_GROUND    = 6
+let PT_TRUNC     = 7
+let PT_DERIV_CNT = 8
+
+// Sentinel rule indexes / names for non-derived nodes.
+let PROOF_RULE_GROUND    = -1
+let PROOF_RULE_TRUNCATED = -2
+let PROOF_RULE_CYCLE     = -3
+let PROOF_RULE_MISSING   = -4
+
+fn _proof_new(atom_id_in, label_in, rule_idx, rule_name, deriv_cnt) {
+    let t = list_new()
+    push(t, PROOF_OBJ_TAG)
+    push(t, atom_id_in)
+    push(t, label_in)
+    push(t, rule_idx)
+    push(t, rule_name)
+    push(t, list_new())       // sub_proofs (caller appends)
+    push(t, 0)                 // is_ground (caller may set)
+    push(t, 0)                 // is_truncated (caller may set)
+    push(t, deriv_cnt)
+    return t
+}
+
+fn _proof_set_ground(t) {
+    list_set(t, PT_GROUND, 1)
+    return t
+}
+
+fn _proof_set_trunc(t) {
+    list_set(t, PT_TRUNC, 1)
+    return t
+}
+
+// Public predicates / accessors.
+fn proof_is_tree(t) {
+    if t == 0 { return 0 }
+    if type_of(t) != 3 { return 0 }
+    if len(t) < 9 { return 0 }
+    if t[PT_TAG] == PROOF_OBJ_TAG { return 1 }
+    return 0
+}
+
+fn proof_atom_id(t)          { return t[PT_ATOM_ID] }
+fn proof_label(t)            { return t[PT_LABEL] }
+fn proof_rule_idx(t)         { return t[PT_RULE_IDX] }
+fn proof_rule_name(t)        { return t[PT_RULE_NAME] }
+fn proof_subs(t)             { return t[PT_SUBS] }
+fn proof_sub_count(t)        { return len(t[PT_SUBS]) }
+fn proof_is_ground(t)        { return t[PT_GROUND] }
+fn proof_is_truncated(t)     { return t[PT_TRUNC] }
+fn proof_derivation_count(t) { return t[PT_DERIV_CNT] }
+
+// ---- visited-set helpers --------------------------------------------------
+//
+// We track the set of atom_ids already on the current branch via a list of
+// ints; pre-recursion we check membership and short-circuit to a CYCLE
+// sentinel. R20B prevents cycles in the input by construction (the canonical
+// label dedupe means an atom is never derived from itself transitively
+// through the engine), but a malformed test fixture could violate this; the
+// visited-set is defence in depth.
+
+fn _vs_new() { return list_new() }
+
+fn _vs_has(vs, aid) {
+    let i = 0
+    while i < len(vs) {
+        if vs[i] == aid { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Copy `vs` and append `aid`. We copy because each recursive descent forks
+// its own branch; sibling branches should NOT see each other's atoms in
+// the visited set (only the current ancestor chain matters for cycle
+// detection -- a diamond proof tree's two branches converging on a shared
+// ground fact is NOT a cycle).
+fn _vs_push(vs, aid) {
+    let out = list_new()
+    let i = 0
+    while i < len(vs) {
+        push(out, vs[i])
+        i = i + 1
+    }
+    push(out, aid)
+    return out
+}
+
+// ---- engine introspection helper ------------------------------------------
+//
+// Look up the head-predicate name of a rule by index, for human-readable
+// rendering. Returns "?" if the rule index is out of range (defence in
+// depth -- a well-formed engine never produces out-of-range provenance).
+fn _explain_rule_name(engine, rule_idx) {
+    if rule_engine_is(engine) == 0 { return "?" }
+    if rule_idx < 0 { return "?" }
+    let rules = engine[RE_RULES]
+    if rule_idx >= len(rules) { return "?" }
+    return rule_head_pred(rules[rule_idx])
+}
+
+// Look up an atom's KG label by id. Returns "" if the atom is missing
+// (caller renders this as a MISSING sentinel).
+fn _explain_atom_label(kg, atom_id_in) {
+    let a = kg_atom(kg, atom_id_in)
+    if a == 0 { return "" }
+    return atom_label(a)
+}
+
+// ---- recursive walk -------------------------------------------------------
+//
+// The core recursive walk. Returns a proof_tree_t for the given atom.
+//   - depth: current depth (0 at top-level).
+//   - max_depth: cap; when depth >= max_depth we emit a TRUNCATED
+//     sentinel instead of recursing further.
+//   - visited: list of atom_ids already on the current branch.
+
+fn _explain_walk(kg, engine, atom_id_in, depth, max_depth, visited) {
+    // Depth cap.
+    if depth >= max_depth {
+        let label_d = _explain_atom_label(kg, atom_id_in)
+        let t_d = _proof_new(atom_id_in, label_d, PROOF_RULE_TRUNCATED, "TRUNCATED", 0)
+        _proof_set_trunc(t_d)
+        return t_d
+    }
+    // Cycle check.
+    if _vs_has(visited, atom_id_in) == 1 {
+        let label_c = _explain_atom_label(kg, atom_id_in)
+        let t_c = _proof_new(atom_id_in, label_c, PROOF_RULE_CYCLE, "CYCLE", 0)
+        _proof_set_trunc(t_c)
+        return t_c
+    }
+    // Look up the atom's label and existence.
+    let a = kg_atom(kg, atom_id_in)
+    if a == 0 {
+        return _proof_new(atom_id_in, "", PROOF_RULE_MISSING, "MISSING", 0)
+    }
+    let label = atom_label(a)
+    // Ask the engine for this atom's provenance.
+    let provs = rule_engine_explain(engine, atom_id_in)
+    let deriv_cnt = len(provs)
+    if deriv_cnt == 0 {
+        // Ground fact: atom exists in KG but was not derived.
+        let t_g = _proof_new(atom_id_in, label, PROOF_RULE_GROUND, "GROUND", 0)
+        _proof_set_ground(t_g)
+        return t_g
+    }
+    // Pick the first provenance entry. The derivation_count field tells
+    // the caller about alternatives.
+    let first = provs[0]
+    let rule_idx = first[1]
+    let sources  = first[2]
+    let rule_name = _explain_rule_name(engine, rule_idx)
+    let t = _proof_new(atom_id_in, label, rule_idx, rule_name, deriv_cnt)
+    // Extend visited so the descent sees us as on-branch.
+    let next_vs = _vs_push(visited, atom_id_in)
+    // Recurse for each source.
+    let i = 0
+    while i < len(sources) {
+        let child = _explain_walk(kg, engine, sources[i], depth + 1, max_depth, next_vs)
+        push(t[PT_SUBS], child)
+        i = i + 1
+    }
+    return t
+}
+
+// explain_atom(kg, engine, atom_id) -> proof_tree_t
+//
+// Public entry point. Returns a proof tree for the given atom in the KG.
+// If the atom does not exist in the KG, returns a MISSING sentinel.
+// If the atom is a ground fact (no provenance), returns a leaf with
+// is_ground=1. Otherwise returns the full recursive tree, capped at
+// EXPLAIN_MAX_DEPTH levels.
+fn explain_atom(kg, engine, atom_id_in) {
+    return _explain_walk(kg, engine, atom_id_in, 0, EXPLAIN_MAX_DEPTH, _vs_new())
+}
+
+// explain_atom_with_depth(kg, engine, atom_id, max_depth) -> proof_tree_t
+//
+// As above but with a caller-provided depth cap. Useful for tests that
+// want to force truncation, or for very deep proof chains where a
+// shallower walk gives a more readable summary.
+fn explain_atom_with_depth(kg, engine, atom_id_in, max_depth) {
+    let cap = max_depth
+    if cap <= 0 { cap = EXPLAIN_MAX_DEPTH }
+    if cap > EXPLAIN_MAX_DEPTH { cap = EXPLAIN_MAX_DEPTH }
+    return _explain_walk(kg, engine, atom_id_in, 0, cap, _vs_new())
+}
+
+// ---- proof tree analysis --------------------------------------------------
+
+// proof_height(tree) -> int
+//
+// 1 for a leaf; 1 + max(child_heights) for an internal node. An empty tree
+// (proof_is_tree == 0) returns 0.
+fn proof_height(t) {
+    if proof_is_tree(t) == 0 { return 0 }
+    let subs = t[PT_SUBS]
+    if len(subs) == 0 { return 1 }
+    let max_sub = 0
+    let i = 0
+    while i < len(subs) {
+        let h = proof_height(subs[i])
+        if h > max_sub { max_sub = h }
+        i = i + 1
+    }
+    return 1 + max_sub
+}
+
+// Recursive helper for proof_ground_facts. Appends ground-fact atom IDs
+// to `out`, deduping via linear scan.
+fn _ground_collect(t, out) {
+    if proof_is_tree(t) == 0 { return out }
+    let subs = t[PT_SUBS]
+    if len(subs) == 0 {
+        // Leaf: emit iff is_ground=1. Truncation/cycle/missing sentinels
+        // do NOT count as ground facts -- they're a different category.
+        if t[PT_GROUND] == 1 {
+            let aid = t[PT_ATOM_ID]
+            if _vs_has(out, aid) == 0 {
+                push(out, aid)
+            }
+        }
+        return out
+    }
+    let i = 0
+    while i < len(subs) {
+        out = _ground_collect(subs[i], out)
+        i = i + 1
+    }
+    return out
+}
+
+// proof_ground_facts(tree) -> list[atom_id]
+//
+// Deduplicated list of atom IDs at the ground-fact leaves of the tree.
+// (Truncation / cycle / missing sentinels are NOT counted.)
+fn proof_ground_facts(t) {
+    return _ground_collect(t, list_new())
+}
+
+// proof_node_count(tree) -> int
+//
+// Total number of nodes in the tree, including internal nodes and leaves.
+// Useful for summary statistics.
+fn proof_node_count(t) {
+    if proof_is_tree(t) == 0 { return 0 }
+    let n = 1
+    let subs = t[PT_SUBS]
+    let i = 0
+    while i < len(subs) {
+        n = n + proof_node_count(subs[i])
+        i = i + 1
+    }
+    return n
+}
+
+// ---- text rendering -------------------------------------------------------
+//
+// Produces an indented multi-line text rendering. Each line is one
+// proof-tree node, formatted as:
+//
+//   <indent>- atom <id> "<label>" via <rule_name> (rule #<idx>) [<n> derivs]
+//   <indent>- atom <id> "<label>" GROUND
+//   <indent>- atom <id> "<label>" TRUNCATED (max depth)
+//   <indent>- atom <id> "<label>" CYCLE
+//   <indent>- atom <id> "<missing>" MISSING (atom not in KG)
+//
+// The indent is two spaces per depth level. A trailing newline closes each
+// line.
+
+fn _proof_indent(depth) {
+    let s = ""
+    let i = 0
+    while i < depth {
+        s = s + "  "
+        i = i + 1
+    }
+    return s
+}
+
+fn _proof_line_for(t, depth) {
+    let head = _proof_indent(depth) + "- atom " + int_to_str(t[PT_ATOM_ID])
+    let lbl = t[PT_LABEL]
+    if len(lbl) > 0 {
+        head = head + " \"" + lbl + "\""
+    } else {
+        head = head + " \"<missing>\""
+    }
+    if t[PT_GROUND] == 1 {
+        return head + " GROUND"
+    }
+    if t[PT_RULE_IDX] == PROOF_RULE_TRUNCATED {
+        return head + " TRUNCATED (max depth)"
+    }
+    if t[PT_RULE_IDX] == PROOF_RULE_CYCLE {
+        return head + " CYCLE"
+    }
+    if t[PT_RULE_IDX] == PROOF_RULE_MISSING {
+        return head + " MISSING (atom not in KG)"
+    }
+    let extra = ""
+    if t[PT_DERIV_CNT] > 1 {
+        extra = " [" + int_to_str(t[PT_DERIV_CNT]) + " derivs]"
+    }
+    return head + " via " + t[PT_RULE_NAME]
+        + " (rule #" + int_to_str(t[PT_RULE_IDX]) + ")"
+        + extra
+}
+
+fn _render_text_walk(t, depth, max_depth, buf) {
+    if proof_is_tree(t) == 0 { return buf }
+    buf = buf + _proof_line_for(t, depth) + "\n"
+    if depth >= max_depth { return buf }
+    let subs = t[PT_SUBS]
+    let i = 0
+    while i < len(subs) {
+        buf = _render_text_walk(subs[i], depth + 1, max_depth, buf)
+        i = i + 1
+    }
+    return buf
+}
+
+// proof_render_text(tree, max_depth) -> str
+//
+// max_depth==0 (or <0) renders the full tree (up to EXPLAIN_DEFAULT_RENDER_DEPTH
+// which itself sits at EXPLAIN_MAX_DEPTH). Otherwise renders down to the
+// given depth and truncates deeper subtrees from the text output (the in-
+// memory tree retains them).
+fn proof_render_text(t, max_depth) {
+    if proof_is_tree(t) == 0 { return "(invalid proof tree)\n" }
+    let cap = max_depth
+    if cap <= 0 { cap = EXPLAIN_DEFAULT_RENDER_DEPTH }
+    return _render_text_walk(t, 0, cap, "")
+}
+
+// ---- structured rendering -------------------------------------------------
+//
+// Returns the tree as a nested list suitable for programmatic walks:
+//   [atom_id, label, rule_idx, [sub_1, sub_2, ...]]
+// with rule_idx == PROOF_RULE_GROUND (-1) / TRUNCATED (-2) / CYCLE (-3) /
+// MISSING (-4) for the various leaf categories.
+
+fn proof_render_structured(t) {
+    if proof_is_tree(t) == 0 {
+        return list_new()
+    }
+    let out = list_new()
+    push(out, t[PT_ATOM_ID])
+    push(out, t[PT_LABEL])
+    push(out, t[PT_RULE_IDX])
+    let kids = list_new()
+    let subs = t[PT_SUBS]
+    let i = 0
+    while i < len(subs) {
+        push(kids, proof_render_structured(subs[i]))
+        i = i + 1
+    }
+    push(out, kids)
+    return out
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/explain <atom_id>` admin: renders the proof tree for the given atom.
+// The chat REPL has no public accessor for rule_inference's module-global
+// engine (`_rule_chat_engine` is a private let), so we maintain our own
+// module-global engine here that mirrors the rule_inference one for
+// chat-side use. The integration scenario drives /explain through a
+// stand-alone NOVA driver (not the chat REPL) -- this matches the pattern
+// used by R20B's scenario_aaaa and R21B's scenario_eeee for testing the
+// recursive provenance walk on real derivations. The chat command itself
+// remains useful as an inspector: /explain <atom_id> on any KG atom
+// reports its provenance (GROUND if the atom was loaded from the KG and
+// has no rule-engine derivation, or the recursive proof tree if our
+// module-global engine has rules that derived it).
+
+let _explain_chat_engine = rule_engine_new()
+
+fn _explain_cmd_inner(kg, engine, arg) {
+    if rule_engine_is(engine) == 0 {
+        io_println("EXPLAIN error=engine not initialised")
+        return 1
+    }
+    if len(arg) == 0 {
+        io_println("usage: /explain <atom_id>  -- prints proof tree for the given atom (R22E)")
+        return 1
+    }
+    let atom_id_in = rt_str_to_int(arg)
+    if atom_id_in < 0 {
+        io_println("EXPLAIN error=atom_id must be non-negative integer")
+        return 1
+    }
+    let a = kg_atom(kg, atom_id_in)
+    if a == 0 {
+        io_println("EXPLAIN error=atom " + arg + " not in KG")
+        return 1
+    }
+    let tree = explain_atom(kg, engine, atom_id_in)
+    let height = proof_height(tree)
+    let nodes  = proof_node_count(tree)
+    let grounds = proof_ground_facts(tree)
+    io_println("EXPLAIN atom=" + int_to_str(atom_id_in)
+        + " label=\"" + proof_label(tree) + "\""
+        + " height=" + int_to_str(height)
+        + " nodes=" + int_to_str(nodes)
+        + " ground_facts=" + int_to_str(len(grounds)))
+    let txt = proof_render_text(tree, EXPLAIN_DEFAULT_RENDER_DEPTH)
+    io_println(txt)
+    return 1
+}
+
+// Chat-callable: /explain <atom_id>. Drives the module-global
+// _explain_chat_engine (independent from rule_inference's chat engine
+// because that engine is private to rule_inference.nova).
+fn explain_chat_cmd(kg, arg) {
+    return _explain_cmd_inner(kg, _explain_chat_engine, arg)
+}
+
+// Engine-explicit variant: same logic but the caller supplies the engine.
+// Used by integration drivers that build their own engine.
+fn explain_cmd_with_engine(kg, engine, arg) {
+    return _explain_cmd_inner(kg, engine, arg)
+}
+
+// Test/driver hooks for the chat-side engine. The chat command alone is
+// fairly useless without a way to load rules into _explain_chat_engine;
+// these helpers let an integration driver or a future chat session
+// pre-populate the engine for /explain to walk.
+fn explain_chat_add_rule(rule_string) {
+    return rule_engine_add(_explain_chat_engine, rule_string)
+}
+
+fn explain_chat_run(kg, max_iterations) {
+    return rule_engine_run(_explain_chat_engine, kg, max_iterations)
+}
+
+fn explain_chat_engine_size() {
+    return rule_engine_size(_explain_chat_engine)
+}

@@ -1,0 +1,384 @@
+// CrossEngin learning: Byzantine-resilient aggregation (P3.10 / ADR-0056).
+//
+// Purpose
+//   P3.7 + P3.8/9 shipped federated learning with averaging (`fed_acc_averages`)
+//   under a HONEST participant model. Every soul submits a real noised /
+//   masked rate; the coordinator sums + divides by n_participants. A
+//   single malicious participant submitting `1_000_000` instead of a
+//   value in `[0, 1000]` can shift the average arbitrarily -- there is
+//   no defense in the existing path beyond a coarse range clamp.
+//
+//   This module adds two robust aggregation rules that tolerate up to
+//   f malicious participants out of n total without touching the
+//   SecAgg / DP machinery:
+//
+//   1) `byz_trimmed_mean(updates, trim_k)`
+//      Sort each coordinate across participants; drop the top-k AND
+//      the bottom-k extreme values; mean the remainder. Tolerates k
+//      Byzantine participants per coordinate with O(n log n) per
+//      coordinate (we use insertion sort since n is small -- typical
+//      federations are 5..50 participants per round).
+//
+//   2) `byz_coordinate_median(updates)`
+//      For each coordinate, output the median across participants.
+//      Tolerates up to ~n/2 Byzantine in the worst case (a strict
+//      majority of HONEST values still pins the median to the honest
+//      cluster). Slightly more expensive than trimmed mean (still
+//      O(n log n) per coordinate, but no `trim_k` knob to tune).
+//
+//   Both algorithms are PER-COORDINATE (coordinate-wise aggregation),
+//   matching the standard robust-FL literature: Yin et al. 2018
+//   "Byzantine-Robust Distributed Learning" (ICML), Chen et al. 2017
+//   "Distributed Statistical Machine Learning in Adversarial Settings".
+//
+// Update representation
+//   Each "update" is a fixed-length list of integers (a model delta or
+//   a rate vector in milli). The aggregation input is a list of such
+//   updates; all updates MUST be the same length (otherwise we degrade
+//   gracefully to the length of the shortest -- documented per fn).
+//   This matches CrossEngin's existing FED_STAT layout: one rate per
+//   source per soul. The trimmed-mean / median APIs accept arbitrary
+//   D-dim vectors so the same module can serve a future "model delta"
+//   integration.
+//
+// Integration with SecAgg (SECAGG_AUDIT.md walks this in detail)
+//   SecAgg cancels +mask / -mask pairs across souls so the coordinator
+//   only ever sees the SUM of masked submissions. That is a deliberate
+//   privacy property: per-soul values are NOT visible. Byzantine
+//   aggregation, conversely, needs per-soul values to filter outliers.
+//
+//   The TWO are FUNDAMENTALLY in tension at this layer:
+//     - SecAgg-then-Byzantine: aggregator unmasks to per-soul values,
+//       then trims -- defeats SecAgg's privacy guarantee.
+//     - Byzantine-then-SecAgg: each soul filters its own update
+//       before masking -- trivially circumventable by a lying soul.
+//
+//   This module deliberately operates on PLAINTEXT updates (no
+//   SecAgg). For SecAgg-protected rounds, Byzantine resilience
+//   requires more advanced cryptographic protocols (e.g. zero-
+//   knowledge proofs of well-formedness, range proofs, or threshold-
+//   homomorphic verification) which are out of scope for P3.10. The
+//   audit doc surfaces this trade-off explicitly so operators choose
+//   ONE privacy posture per round: SecAgg (privacy, no Byzantine
+//   defense) OR plaintext + Byzantine (no privacy, robust aggregation).
+//
+// API summary
+//   byz_strategy_from_env() -> int (BYZ_NONE | BYZ_TRIMMED_MEAN | BYZ_MEDIAN)
+//   byz_trim_k_from_env(default_k) -> int
+//   byz_strategy_name(strategy) -> string
+//   byz_trimmed_mean(updates, trim_k) -> aggregate
+//   byz_coordinate_median(updates) -> aggregate
+//   byz_aggregate(updates, strategy, trim_k) -> aggregate
+//                                           dispatch on strategy
+//
+// ADRs implemented: ADR-0056 (Byzantine-resilient federated aggregation).
+//   NOVA dependencies: builtins (lists, strings, int math, getenv).
+// CrossEngin dependencies: none (leaf module; consumed by
+//   federated_aggregator.nova through a thin dispatch wrapper).
+
+import "std/io"
+
+// ---- strategy constants --------------------------------------------------
+// Byzantine aggregation strategy enum. Default BYZ_NONE preserves the
+// existing P3.7 averaging behaviour (no regression). The env var
+// CE_FL_BYZ_STRATEGY=trimmed|median|none overrides per-process.
+let BYZ_NONE          = 0
+let BYZ_TRIMMED_MEAN  = 1
+let BYZ_MEDIAN        = 2
+
+// Trimmed-mean default k: trim ONE outlier from each end. Operators
+// override via CE_FL_BYZ_TRIM_K. Setting trim_k to 0 reduces the
+// trimmed mean to the plain mean (the BYZ_NONE path).
+let BYZ_DEFAULT_TRIM_K = 1
+
+// ---- env helpers ---------------------------------------------------------
+// Read CE_FL_BYZ_STRATEGY from env. Recognised tokens (case-insensitive
+// would be nice but NOVA only ships exact str_eq; we accept lowercase
+// canonical forms only to keep parsing predictable):
+//   "none"     -> BYZ_NONE       (default)
+//   "trimmed"  -> BYZ_TRIMMED_MEAN
+//   "median"   -> BYZ_MEDIAN
+// Any other value (or unset env) returns BYZ_NONE.
+fn byz_strategy_from_env() {
+    let env = getenv("CE_FL_BYZ_STRATEGY")
+    if env == 0 { return BYZ_NONE }
+    if len(env) == 0 { return BYZ_NONE }
+    if str_eq(env, "trimmed") == 1 { return BYZ_TRIMMED_MEAN }
+    if str_eq(env, "median") == 1 { return BYZ_MEDIAN }
+    if str_eq(env, "none") == 1 { return BYZ_NONE }
+    return BYZ_NONE
+}
+
+// Read CE_FL_BYZ_TRIM_K from env. Returns the caller's default when
+// the env var is unset / empty / non-numeric. Negative values are
+// rejected (trim_k must be >= 0). Excessively large values (>= n/2)
+// are NOT clamped here -- the caller catches the degenerate case in
+// the trimmed-mean fn itself (where it returns 0 if every element
+// would be trimmed away).
+fn byz_trim_k_from_env(default_k) {
+    let env = getenv("CE_FL_BYZ_TRIM_K")
+    if env == 0 { return default_k }
+    if len(env) == 0 { return default_k }
+    let v = _byz_str_to_int(env)
+    if v < 0 { return default_k }
+    return v
+}
+
+// Pretty name for diagnostic logs. The chat / coordinator print this
+// when reporting "round used strategy=trimmed/median/none". Kept tiny
+// so any consumer can include it without a dispatch table of its own.
+fn byz_strategy_name(strategy) {
+    if strategy == BYZ_TRIMMED_MEAN { return "trimmed" }
+    if strategy == BYZ_MEDIAN       { return "median" }
+    return "none"
+}
+
+// ---- helpers -------------------------------------------------------------
+// Local str-to-int (mirrors the dp / fed local copies). Accepts a
+// leading minus sign; rejects all non-digit body chars by returning 0.
+// Used only by env parsing -- no external callers.
+fn _byz_str_to_int(s) {
+    let n = 0
+    let i = 0
+    let neg = 0
+    if len(s) > 0 {
+        if char_at(s, 0) == 45 { neg = 1 i = 1 }
+    }
+    if i >= len(s) { return 0 }
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    if neg == 1 { return 0 - n }
+    return n
+}
+
+// The minimum vector length across all updates. If any update is
+// shorter than the others, we aggregate only up to the shortest --
+// the caller is responsible for ensuring uniform length when that
+// matters (the federated aggregator guarantees this by construction:
+// every soul reports the same source-tag layout).
+fn _byz_min_vec_len(updates) {
+    let n = len(updates)
+    if n == 0 { return 0 }
+    let m = len(updates[0])
+    let i = 1
+    while i < n {
+        let li = len(updates[i])
+        if li < m { m = li }
+        i = i + 1
+    }
+    return m
+}
+
+// Insertion sort of a fresh COPY of `xs` (we never mutate the caller's
+// list). Returns a new list with the values sorted ascending. n is
+// small in practice (typical federation is 5..50 participants per
+// coord), so insertion sort's O(n^2) is faster than radix sort's
+// constant overhead and avoids the bit-fiddling NOVA quirks. Stable
+// (preserves insertion order for ties) by construction.
+fn _byz_sort_int_list(xs) {
+    let n = len(xs)
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, xs[i])
+        i = i + 1
+    }
+    // Standard insertion sort: for j in 1..n, bubble out[j] down to
+    // the right slot by swapping with predecessors > it.
+    let j = 1
+    while j < n {
+        let cur = out[j]
+        let k = j
+        let done = 0
+        while done == 0 {
+            if k <= 0 { done = 1 }
+            if done == 0 {
+                let prev = out[k - 1]
+                if prev <= cur {
+                    done = 1
+                } else {
+                    list_set(out, k, prev)
+                    k = k - 1
+                }
+            }
+        }
+        list_set(out, k, cur)
+        j = j + 1
+    }
+    return out
+}
+
+// Build the column slice -- the list of i-th coordinate across all n
+// participants. Used by both the trimmed-mean and median paths so the
+// per-coord aggregation logic is shared. Returns a fresh list (the
+// caller will sort + reduce); never mutates `updates`.
+fn _byz_column(updates, coord_idx) {
+    let out = list_new()
+    let n = len(updates)
+    let i = 0
+    while i < n {
+        let v = updates[i]
+        if coord_idx < len(v) {
+            push(out, v[coord_idx])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- API: trimmed mean ---------------------------------------------------
+// Coordinate-wise trimmed mean. For each coordinate i = 0..D-1:
+//   1) collect [participant_0[i], participant_1[i], ..., participant_{n-1}[i]]
+//   2) sort ascending
+//   3) drop the first `trim_k` and the last `trim_k`
+//   4) output the integer mean of the remainder
+//
+// `trim_k = 0` reduces to the plain coordinate-wise mean.
+// `trim_k * 2 >= n` is degenerate (every value trimmed); we return 0
+// for that coordinate -- the caller checks the degenerate config
+// once upstream (in byz_aggregate's safety clamp).
+//
+// Returns a fresh list of length D = _byz_min_vec_len(updates), or
+// the empty list if `updates` is empty. Never mutates the input.
+fn byz_trimmed_mean(updates, trim_k) {
+    let out = list_new()
+    let n = len(updates)
+    if n == 0 { return out }
+    if n == 1 { return _byz_clone_vec(updates[0]) }
+    let d = _byz_min_vec_len(updates)
+    // Degenerate trim_k -> every element would be trimmed; return zeros
+    // of length d so the caller still gets a well-formed vector.
+    let drop_total = trim_k + trim_k
+    if drop_total >= n {
+        let z = 0
+        while z < d {
+            push(out, 0)
+            z = z + 1
+        }
+        return out
+    }
+    let keep = n - drop_total
+    let c = 0
+    while c < d {
+        let col = _byz_column(updates, c)
+        let sorted = _byz_sort_int_list(col)
+        let sum = 0
+        let k = trim_k
+        let end = n - trim_k
+        while k < end {
+            sum = sum + sorted[k]
+            k = k + 1
+        }
+        // Integer division -- the noised / masked rates are milli ints
+        // already; the rounding bias is at most 1 milli per coord.
+        let m = sum / keep
+        push(out, m)
+        c = c + 1
+    }
+    return out
+}
+
+// Clone a vector. Centralised so the n == 1 fast path and the
+// `byz_aggregate` BYZ_NONE fallback don't accidentally share storage
+// with the caller's input.
+fn _byz_clone_vec(v) {
+    let out = list_new()
+    let i = 0
+    while i < len(v) {
+        push(out, v[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- API: coordinate-wise median -----------------------------------------
+// For each coordinate i, output the median of the n participant values
+// at i. For odd n, the median is the single middle element. For even
+// n, we average the two middle elements (integer division -- 1 milli
+// of bias maximum). This matches the standard robust-aggregation
+// convention; the alternative ("lower median" or "upper median") is
+// simpler but introduces a per-round bias that compounds across
+// rounds.
+//
+// Returns a fresh list of length D = _byz_min_vec_len(updates), or
+// the empty list if `updates` is empty.
+fn byz_coordinate_median(updates) {
+    let out = list_new()
+    let n = len(updates)
+    if n == 0 { return out }
+    if n == 1 { return _byz_clone_vec(updates[0]) }
+    let d = _byz_min_vec_len(updates)
+    let c = 0
+    while c < d {
+        let col = _byz_column(updates, c)
+        let sorted = _byz_sort_int_list(col)
+        let mid = n / 2
+        let m = 0
+        // Even n -> average of two middle. Odd n -> single middle.
+        // n / 2 in NOVA int math rounds toward zero; for n=5 that's 2
+        // (the centre index); for n=4 that's 2 and we average idx 1+2.
+        let is_even = 0
+        let half = n / 2
+        if half + half == n { is_even = 1 }
+        if is_even == 1 {
+            m = (sorted[mid - 1] + sorted[mid]) / 2
+        } else {
+            m = sorted[mid]
+        }
+        push(out, m)
+        c = c + 1
+    }
+    return out
+}
+
+// ---- API: dispatch -------------------------------------------------------
+// Single entry point a caller (the FL aggregator) can use without
+// knowing about the algorithm taxonomy. Dispatches on `strategy`:
+//   BYZ_NONE          -> coordinate-wise plain mean
+//   BYZ_TRIMMED_MEAN  -> coordinate-wise trimmed mean with `trim_k`
+//   BYZ_MEDIAN        -> coordinate-wise median
+//
+// The BYZ_NONE path returns the same values the existing
+// `fed_acc_averages` path produces so the caller can switch between
+// strategies without changing downstream consumers.
+fn byz_aggregate(updates, strategy, trim_k) {
+    if strategy == BYZ_TRIMMED_MEAN {
+        return byz_trimmed_mean(updates, trim_k)
+    }
+    if strategy == BYZ_MEDIAN {
+        return byz_coordinate_median(updates)
+    }
+    // BYZ_NONE (and unknown strategies) -- plain coordinate-wise mean.
+    return _byz_plain_mean(updates)
+}
+
+// Internal plain-mean helper -- the BYZ_NONE branch. Kept private to
+// guarantee `byz_aggregate(updates, BYZ_NONE, _)` and `_byz_plain_mean`
+// produce bit-identical results (no path divergence between the
+// "Byzantine disabled" branch and the "Byzantine disabled at compile
+// time" branch).
+fn _byz_plain_mean(updates) {
+    let out = list_new()
+    let n = len(updates)
+    if n == 0 { return out }
+    if n == 1 { return _byz_clone_vec(updates[0]) }
+    let d = _byz_min_vec_len(updates)
+    let c = 0
+    while c < d {
+        let col = _byz_column(updates, c)
+        let sum = 0
+        let i = 0
+        while i < len(col) {
+            sum = sum + col[i]
+            i = i + 1
+        }
+        push(out, sum / n)
+        c = c + 1
+    }
+    return out
+}

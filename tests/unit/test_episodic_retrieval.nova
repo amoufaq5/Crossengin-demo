@@ -1,0 +1,408 @@
+// Unit tests for the R8F retrieval API in src/kg/episodic.nova.
+//
+// Covers the six public retrieval functions added on the READ side of the
+// episodic memory consolidation cycle (R6F shipped the WRITE side):
+//   - episodic_recall_by_member        (atom_id in cluster)
+//   - episodic_recall_by_window        (overlap with [start, end] span)
+//   - episodic_recall_by_pattern       (|cluster intersect members| >= K)
+//   - episodic_recall_top_belief       (alpha/(alpha+beta) desc)
+//   - episodic_recall_most_recent      (last_seen desc)
+//   - episodic_provenance              (full tuple for one episode)
+//
+// Plus the ranking + tiebreak chain: count desc -> last_seen desc -> id asc
+// (with primary swapped for the belief / recent variants), top_k clamping
+// (0 returns empty, > MAX clamped, > store returns all), and the
+// multi-episode rank-order acceptance case from the brief.
+//
+// Uses R6F's canonical fixture (5x (1,2,3) at ts 0/10/20/30/40 +
+// scattered noise) as the single-episode baseline and adds a second
+// {4,5,6} cluster for multi-episode rank verification.
+//
+// ADRs: ADR-0022 (consolidation cycle), ADR-0023 (Bayesian belief).
+
+import "../ce_test.nova"
+import "../../src/kg/episodic.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+fn ids3(a, b, c) {
+    let l = list_new()
+    push(l, a) push(l, b) push(l, c)
+    return l
+}
+
+// Capture one moment with the given atom-id trace at logical ts. Mirrors
+// the helper in test_episodic.nova so the fixtures are identical.
+fn capture(stream, ts, trace) {
+    let m = ms_capture(stream, ts, MODALITY_TEXT, "x", 600, 0)
+    let i = 0
+    while i < len(trace) { moment_add_trace(m, trace[i]); i = i + 1 }
+    return m
+}
+
+// Build R6F's canonical single-episode fixture: 5x (1,2,3) at ts 0/10/.../40
+// plus 4 scattered noise triplets. Returns the consolidated eas.
+fn _fixture_single_episode() {
+    let stream = ms_new()
+    let eas = episodic_atoms_new()
+    capture(stream, 0,  ids3(1, 2, 3))
+    capture(stream, 5,  ids3(7, 8, 9))
+    capture(stream, 10, ids3(1, 2, 3))
+    capture(stream, 15, ids3(11, 12, 13))
+    capture(stream, 20, ids3(1, 2, 3))
+    capture(stream, 25, ids3(21, 22, 23))
+    capture(stream, 30, ids3(1, 2, 3))
+    capture(stream, 35, ids3(31, 32, 33))
+    capture(stream, 40, ids3(1, 2, 3))
+    episodic_consolidate(eas, stream, 0, 0)
+    return eas
+}
+
+// Build a two-episode fixture: 5x (1,2,3) at ts 0..40 then 5x (4,5,6) at
+// ts 200..240 (well outside the COOCCUR_WINDOW boundary so the two
+// clusters consolidate independently). Returns the consolidated eas
+// after a single sweep -- both clusters mint in the same pass.
+fn _fixture_two_episodes() {
+    let stream = ms_new()
+    let eas = episodic_atoms_new()
+    let i = 0
+    while i < 5 {
+        capture(stream, i * 10, ids3(1, 2, 3))
+        i = i + 1
+    }
+    let j = 0
+    while j < 5 {
+        capture(stream, 200 + j * 10, ids3(4, 5, 6))
+        j = j + 1
+    }
+    episodic_consolidate(eas, stream, 0, 0)
+    return eas
+}
+
+// ---- recall_by_member -----------------------------------------------------
+
+fn test_member_hit() {
+    let eas = _fixture_single_episode()
+    let hits = episodic_recall_by_member(eas, 1, 10)
+    ce_eq("member 1 -> 1 hit", len(hits), 1)
+    ce_eq("hit is the {1,2,3} episode", episodic_atom_id(hits[0]), 0)
+    ce_eq("members[0] is 1", episodic_atom_members(hits[0])[0], 1)
+    // Member 2 and member 3 also match (every member fires the same episode).
+    let hits2 = episodic_recall_by_member(eas, 2, 10)
+    ce_eq("member 2 also -> 1 hit", len(hits2), 1)
+    let hits3 = episodic_recall_by_member(eas, 3, 10)
+    ce_eq("member 3 also -> 1 hit", len(hits3), 1)
+}
+
+fn test_member_miss() {
+    let eas = _fixture_single_episode()
+    let hits = episodic_recall_by_member(eas, 99, 10)
+    ce_eq("non-member 99 -> empty", len(hits), 0)
+}
+
+// ---- recall_by_window -----------------------------------------------------
+
+fn test_window_overlap() {
+    let eas = _fixture_single_episode()
+    // Episode span is [first=0, last=40]. Window [0, 50] overlaps.
+    let hits = episodic_recall_by_window(eas, 0, 50, 10)
+    ce_eq("window [0,50] -> 1 hit", len(hits), 1)
+    ce_eq("hit is the {1,2,3} episode", episodic_atom_id(hits[0]), 0)
+}
+
+fn test_window_no_overlap() {
+    let eas = _fixture_single_episode()
+    let hits = episodic_recall_by_window(eas, 100, 200, 10)
+    ce_eq("window [100,200] -> 0 hits", len(hits), 0)
+}
+
+fn test_window_endpoint_inclusive() {
+    let eas = _fixture_single_episode()
+    // Window starts at the episode's last_seen tick (40): inclusive ->
+    // 1 hit. Pure-boundary check guards against off-by-one.
+    let hits = episodic_recall_by_window(eas, 40, 100, 10)
+    ce_eq("window [40,100] (touch last_seen) -> 1 hit", len(hits), 1)
+    // Window ends at the episode's first_seen tick (0): inclusive ->
+    // 1 hit.
+    let hits2 = episodic_recall_by_window(eas, 0 - 10, 0, 10)
+    ce_eq("window [-10,0] (touch first_seen) -> 1 hit", len(hits2), 1)
+}
+
+// ---- recall_by_pattern ----------------------------------------------------
+
+fn test_pattern_hit_2of3() {
+    let eas = _fixture_single_episode()
+    // |{1,2} intersect {1,2,3}| = 2 >= min_overlap=2 -> match.
+    let q = list_new()
+    push(q, 1) push(q, 2)
+    let hits = episodic_recall_by_pattern(eas, q, 2, 10)
+    ce_eq("pattern {1,2} overlap>=2 -> 1 hit", len(hits), 1)
+}
+
+fn test_pattern_miss_below_overlap() {
+    let eas = _fixture_single_episode()
+    // |{1,99} intersect {1,2,3}| = 1 < min_overlap=2 -> no match.
+    let q = list_new()
+    push(q, 1) push(q, 99)
+    let hits = episodic_recall_by_pattern(eas, q, 2, 10)
+    ce_eq("pattern {1,99} overlap=1<2 -> 0 hits", len(hits), 0)
+}
+
+fn test_pattern_min_overlap_1_includes() {
+    let eas = _fixture_single_episode()
+    // Same query but min_overlap=1 admits the episode.
+    let q = list_new()
+    push(q, 1) push(q, 99)
+    let hits = episodic_recall_by_pattern(eas, q, 1, 10)
+    ce_eq("pattern {1,99} overlap>=1 -> 1 hit", len(hits), 1)
+}
+
+fn test_pattern_disjoint() {
+    let eas = _fixture_single_episode()
+    // Disjoint query: |{77,88} intersect {1,2,3}| = 0 -> never matches.
+    let q = list_new()
+    push(q, 77) push(q, 88)
+    let hits = episodic_recall_by_pattern(eas, q, 1, 10)
+    ce_eq("pattern {77,88} disjoint -> 0 hits", len(hits), 0)
+}
+
+// ---- recall_top_belief ----------------------------------------------------
+
+fn test_top_belief_singleton() {
+    let eas = _fixture_single_episode()
+    let hits = episodic_recall_top_belief(eas, 10)
+    ce_eq("top_belief -> 1 hit", len(hits), 1)
+    ce_eq("the episode is id 0", episodic_atom_id(hits[0]), 0)
+}
+
+// ---- recall_most_recent ---------------------------------------------------
+
+fn test_most_recent_singleton() {
+    let eas = _fixture_single_episode()
+    let hits = episodic_recall_most_recent(eas, 10)
+    ce_eq("most_recent -> 1 hit", len(hits), 1)
+    ce_eq("the episode is id 0", episodic_atom_id(hits[0]), 0)
+}
+
+// ---- provenance -----------------------------------------------------------
+
+fn test_provenance_round_trip() {
+    let eas = _fixture_single_episode()
+    let prov = episodic_provenance(eas, 0)
+    ce_check("provenance returns non-zero", prov != 0)
+    // prov = [members, count, first, last, alpha, beta]
+    ce_eq("members len is 3",     len(prov[0]), 3)
+    ce_eq("members[0] is 1",      prov[0][0], 1)
+    ce_eq("members[1] is 2",      prov[0][1], 2)
+    ce_eq("members[2] is 3",      prov[0][2], 3)
+    ce_eq("count is 5",           prov[1], 5)
+    ce_eq("first_ns is 0",        prov[2], 0)
+    ce_eq("last_ns is 40",        prov[3], 40)
+    ce_eq("alpha at prior",       prov[4], BEL_PRIOR)
+    ce_eq("beta at prior",        prov[5], BEL_PRIOR)
+}
+
+fn test_provenance_missing() {
+    let eas = _fixture_single_episode()
+    let prov = episodic_provenance(eas, 99)
+    ce_eq("missing id -> 0", prov, 0)
+}
+
+// ---- top_k clamping -------------------------------------------------------
+
+fn test_top_k_zero_returns_empty() {
+    let eas = _fixture_single_episode()
+    let h1 = episodic_recall_by_member(eas, 1, 0)
+    ce_eq("by_member top_k=0 -> empty",      len(h1), 0)
+    let h2 = episodic_recall_by_window(eas, 0, 100, 0)
+    ce_eq("by_window top_k=0 -> empty",      len(h2), 0)
+    let q = list_new()
+    push(q, 1) push(q, 2)
+    let h3 = episodic_recall_by_pattern(eas, q, 2, 0)
+    ce_eq("by_pattern top_k=0 -> empty",     len(h3), 0)
+    let h4 = episodic_recall_top_belief(eas, 0)
+    ce_eq("top_belief top_k=0 -> empty",     len(h4), 0)
+    let h5 = episodic_recall_most_recent(eas, 0)
+    ce_eq("most_recent top_k=0 -> empty",    len(h5), 0)
+}
+
+fn test_top_k_negative_returns_empty() {
+    let eas = _fixture_single_episode()
+    let h = episodic_recall_by_member(eas, 1, 0 - 5)
+    ce_eq("by_member top_k=-5 -> empty", len(h), 0)
+}
+
+fn test_top_k_huge_no_overflow() {
+    let eas = _fixture_single_episode()
+    // top_k well above the store size and above MAX -- clamped to MAX,
+    // the truncation is a no-op because the store has only 1 atom.
+    let h = episodic_recall_top_belief(eas, 1000000)
+    ce_eq("top_k=1M returns the one stored atom (no overflow)", len(h), 1)
+    let h2 = episodic_recall_most_recent(eas, 1000000)
+    ce_eq("most_recent top_k=1M returns the one stored atom", len(h2), 1)
+}
+
+// ---- multi-episode rank order --------------------------------------------
+
+fn test_multi_episode_consolidation() {
+    let eas = _fixture_two_episodes()
+    ce_eq("two clusters minted", episodic_atoms_count(eas), 2)
+    // The consolidation pass walks the moment stream backwards from
+    // newest to oldest, so the newer {4,5,6} cluster mints id 0 and the
+    // older {1,2,3} cluster mints id 1. Both clusters have count=5.
+    let e0 = episodic_atoms_get(eas, 0)
+    let e1 = episodic_atoms_get(eas, 1)
+    ce_eq("e0 first_ns is 200", episodic_atom_first_seen(e0), 200)
+    ce_eq("e0 last_ns is 240",  episodic_atom_last_seen(e0), 240)
+    ce_eq("e0 members[0] is 4", episodic_atom_members(e0)[0], 4)
+    ce_eq("e1 first_ns is 0",   episodic_atom_first_seen(e1), 0)
+    ce_eq("e1 last_ns is 40",   episodic_atom_last_seen(e1), 40)
+    ce_eq("e1 members[0] is 1", episodic_atom_members(e1)[0], 1)
+    ce_eq("e0 count is 5",      episodic_atom_count(e0), 5)
+    ce_eq("e1 count is 5",      episodic_atom_count(e1), 5)
+}
+
+fn test_multi_episode_most_recent_order() {
+    let eas = _fixture_two_episodes()
+    let hits = episodic_recall_most_recent(eas, 10)
+    ce_eq("most_recent -> 2 hits", len(hits), 2)
+    // Primary key for most_recent is last_seen desc. e0 last_seen is 240,
+    // e1 last_seen is 40, so e0 must come FIRST.
+    ce_eq("first hit is e0 (last_seen=240)", episodic_atom_id(hits[0]), 0)
+    ce_eq("second hit is e1 (last_seen=40)", episodic_atom_id(hits[1]), 1)
+}
+
+fn test_multi_episode_top_belief_tiebreak_recency() {
+    let eas = _fixture_two_episodes()
+    // Both episodes start at the uniform prior alpha = beta = BEL_PRIOR
+    // -> confidence ties at 500. The composite key falls through to
+    // last_seen desc, which orders e0 (240) before e1 (40).
+    let hits = episodic_recall_top_belief(eas, 10)
+    ce_eq("top_belief -> 2 hits", len(hits), 2)
+    ce_eq("tiebreak by last_seen desc -> e0 first", episodic_atom_id(hits[0]), 0)
+    ce_eq("tiebreak by last_seen desc -> e1 second", episodic_atom_id(hits[1]), 1)
+}
+
+fn test_multi_episode_top_belief_promotion() {
+    // After live observations bump the older cluster's alpha three times,
+    // it should outrank the newer cluster on top_belief.
+    let eas = _fixture_two_episodes()
+    let obs = list_new()
+    push(obs, 1) push(obs, 2) push(obs, 3)
+    episodic_observe(eas, obs, 300)
+    episodic_observe(eas, obs, 310)
+    episodic_observe(eas, obs, 320)
+    // e1 is the {1,2,3} episode (older cluster, lower id-internally
+    // because the newer one was tallied first); its alpha gets the bumps.
+    let hits = episodic_recall_top_belief(eas, 10)
+    ce_eq("top_belief -> 2 hits", len(hits), 2)
+    ce_eq("the {1,2,3} episode now wins on confidence", episodic_atom_id(hits[0]), 1)
+    ce_eq("the {4,5,6} episode second", episodic_atom_id(hits[1]), 0)
+}
+
+fn test_multi_episode_by_member_isolation() {
+    let eas = _fixture_two_episodes()
+    // Member 1 belongs only to the {1,2,3} cluster (id=1).
+    let h1 = episodic_recall_by_member(eas, 1, 10)
+    ce_eq("member 1 -> only the {1,2,3} cluster", len(h1), 1)
+    ce_eq("hit is id 1", episodic_atom_id(h1[0]), 1)
+    // Member 4 belongs only to the {4,5,6} cluster (id=0).
+    let h2 = episodic_recall_by_member(eas, 4, 10)
+    ce_eq("member 4 -> only the {4,5,6} cluster", len(h2), 1)
+    ce_eq("hit is id 0", episodic_atom_id(h2[0]), 0)
+}
+
+fn test_multi_episode_window_filter() {
+    let eas = _fixture_two_episodes()
+    // Window entirely inside the older span [0,40] -> just the older
+    // {1,2,3} cluster (id=1).
+    let h1 = episodic_recall_by_window(eas, 0, 50, 10)
+    ce_eq("window [0,50] -> 1 hit", len(h1), 1)
+    ce_eq("hit is id 1 ({1,2,3})", episodic_atom_id(h1[0]), 1)
+    // Window covering both spans -> both, ranked by recency desc -> the
+    // {4,5,6} cluster (id=0) leads.
+    let h2 = episodic_recall_by_window(eas, 0, 1000, 10)
+    ce_eq("window [0,1000] -> 2 hits", len(h2), 2)
+    ce_eq("most recent first (id=0, {4,5,6})", episodic_atom_id(h2[0]), 0)
+}
+
+fn test_multi_episode_top_k_cap() {
+    let eas = _fixture_two_episodes()
+    // top_k=1 admits only the highest-ranked of the two episodes -- the
+    // most recent {4,5,6} cluster (id=0).
+    let h = episodic_recall_most_recent(eas, 1)
+    ce_eq("most_recent top_k=1 -> 1 hit", len(h), 1)
+    ce_eq("the hit is the more recent (id=0)", episodic_atom_id(h[0]), 0)
+}
+
+fn test_multi_episode_pattern_unique_match() {
+    let eas = _fixture_two_episodes()
+    // {1,2,3} overlaps the older cluster by 3 and the newer by 0;
+    // min_overlap=2 -> just the older (id=1).
+    let q1 = list_new()
+    push(q1, 1) push(q1, 2) push(q1, 3)
+    let h1 = episodic_recall_by_pattern(eas, q1, 2, 10)
+    ce_eq("pattern {1,2,3} hits only the older cluster", len(h1), 1)
+    ce_eq("the hit is id 1", episodic_atom_id(h1[0]), 1)
+    // {4,5,6} matches only the newer cluster (id=0).
+    let q2 = list_new()
+    push(q2, 4) push(q2, 5) push(q2, 6)
+    let h2 = episodic_recall_by_pattern(eas, q2, 2, 10)
+    ce_eq("pattern {4,5,6} hits only the newer cluster", len(h2), 1)
+    ce_eq("the hit is id 0", episodic_atom_id(h2[0]), 0)
+    // {1,4} overlaps both by 1; min_overlap=1 -> both.
+    let q3 = list_new()
+    push(q3, 1) push(q3, 4)
+    let h3 = episodic_recall_by_pattern(eas, q3, 1, 10)
+    ce_eq("pattern {1,4} min_overlap=1 -> 2 hits", len(h3), 2)
+}
+
+// ---- empty store ----------------------------------------------------------
+
+fn test_empty_store_returns_empty() {
+    let eas = episodic_atoms_new()
+    let h1 = episodic_recall_by_member(eas, 1, 10)
+    ce_eq("empty store / by_member -> 0", len(h1), 0)
+    let h2 = episodic_recall_by_window(eas, 0, 100, 10)
+    ce_eq("empty store / by_window -> 0", len(h2), 0)
+    let q = list_new() push(q, 1)
+    let h3 = episodic_recall_by_pattern(eas, q, 1, 10)
+    ce_eq("empty store / by_pattern -> 0", len(h3), 0)
+    let h4 = episodic_recall_top_belief(eas, 10)
+    ce_eq("empty store / top_belief -> 0", len(h4), 0)
+    let h5 = episodic_recall_most_recent(eas, 10)
+    ce_eq("empty store / most_recent -> 0", len(h5), 0)
+    let p = episodic_provenance(eas, 0)
+    ce_eq("empty store / provenance -> 0", p, 0)
+}
+
+fn main() {
+    test_member_hit()
+    test_member_miss()
+    test_window_overlap()
+    test_window_no_overlap()
+    test_window_endpoint_inclusive()
+    test_pattern_hit_2of3()
+    test_pattern_miss_below_overlap()
+    test_pattern_min_overlap_1_includes()
+    test_pattern_disjoint()
+    test_top_belief_singleton()
+    test_most_recent_singleton()
+    test_provenance_round_trip()
+    test_provenance_missing()
+    test_top_k_zero_returns_empty()
+    test_top_k_negative_returns_empty()
+    test_top_k_huge_no_overflow()
+    test_multi_episode_consolidation()
+    test_multi_episode_most_recent_order()
+    test_multi_episode_top_belief_tiebreak_recency()
+    test_multi_episode_top_belief_promotion()
+    test_multi_episode_by_member_isolation()
+    test_multi_episode_window_filter()
+    test_multi_episode_top_k_cap()
+    test_multi_episode_pattern_unique_match()
+    test_empty_store_returns_empty()
+    ce_summary("episodic_retrieval")
+}
+
+main()

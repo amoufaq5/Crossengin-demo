@@ -1,0 +1,995 @@
+// CrossEngin federation: SRTP wire codec (RFC 3711) -- AES-CM-128 +
+// HMAC-SHA1-80 + AES-CM key derivation + 64-packet anti-replay window
+// (R34C / R28E.2 follow-up).
+//
+// Purpose
+//
+//   R28E shipped the SIGNALING half of browser-to-soul WebRTC; the
+//   R28E.2 exit report flagged four follow-up sub-systems: DTLS 1.2,
+//   ICE (R30C), STUN/TURN (R30C / R31C / R33E), and SRTP. R29B + R31B
+//   + R32B + R33B landed the DTLS half across four rounds. R34C lands
+//   the SRTP wire codec independently of DTLS-SRTP key extraction --
+//   the SRTP packet authentication / encryption layer needs to exist
+//   before a future round can plug DTLS's PRF output into
+//   `srtp_derive_keys` (RFC 5764).
+//
+//   What SRTP is: RFC 3711 protects RTP packets between two endpoints
+//   that share a master key. Per packet, the sender encrypts the RTP
+//   payload with AES in counter mode under a per-session encryption
+//   key, then appends an 80-bit HMAC-SHA1 truncated tag over the RTP
+//   header + ciphertext. The receiver verifies the tag, checks the
+//   sequence number against a 64-packet sliding window, and decrypts.
+//   The master key is split into three sub-keys (encryption, auth,
+//   salt) by an AES-CM-based KDF defined in RFC 3711 §4.3.
+//
+//   This module sits one layer above the safety primitives in the
+//   dep graph: it imports `src/safety/aes_gcm.nova` (for the underlying
+//   AES-128 block cipher; AES-CM and AES-GCM both build on the same
+//   block fn) and `src/safety/sha1.nova` (for the canonical FIPS 180-4
+//   SHA-1 + RFC 2104 HMAC-SHA1, R37C). Pre-R37C this module shipped
+//   its own ~150-line inline SHA-1 implementation -- the cleaner of
+//   the two inline copies in the tree (the other was in turn.nova,
+//   R36A; both retired by R37C). The R33A/R34A pattern (SHA-256
+//   dedup) applied verbatim.
+//
+// Scope (what R34C ships)
+//
+//   1. AES-CM-128 stream cipher (RFC 3711 §4.1.1):
+//      keystream = AES_K(IV) || AES_K(IV+1) || AES_K(IV+2) || ...
+//      where the 16-byte IV is built as:
+//          IV = salt[14B] || 0[2B]    (zero counter)
+//          XOR (ssrc[4B] at offset 4)
+//          XOR (packet_index[6B] at offset 6, big-endian)
+//      Then the low 16 bits are the per-block counter. SSRC is the
+//      32-bit RTP sync source; packet_index is `(roc << 16) | seq`
+//      i.e. the 48-bit extended sequence number from §3.3.1. Encrypt
+//      and decrypt are identical (XOR with keystream).
+//
+//   2. SHA-1 (FIPS 180-4 §6.1) -- `_srtp_sha1_oneshot` wrapper over
+//      the canonical `sha1_oneshot` (R37C; was inline pre-R37C).
+//      Same shape as `src/safety/sha256.nova` but with the SHA-1
+//      IV, K table, and 80-round compression function. The wrapper
+//      lets the in-module HMAC + KDF callers keep their pre-R37C
+//      names.
+//
+//   3. HMAC-SHA1 (RFC 2104 + RFC 3174) -- `_srtp_hmac_sha1` wrapper
+//      over the canonical `hmac_sha1` (R37C; was inline pre-R37C).
+//      Key normalization per RFC 2104: keys > 64 bytes are pre-hashed,
+//      keys < 64 bytes are zero-padded to 64. Returns a 20-byte tag.
+//      `srtp_authenticate` truncates to the low 10 bytes per RFC
+//      3711 §4.2 + appends the 32-bit ROC to the AAD.
+//
+//   4. AES-CM key derivation (RFC 3711 §4.3): a 16-byte derived key
+//      is computed as AES_K(master_salt XOR label_block XOR index_block),
+//      where label_block embeds an 8-bit label at offset 7 and
+//      index_block embeds the 48-bit packet index at offset 8. For a
+//      key longer than 16 bytes (the 20-byte auth key), the counter
+//      block's low 16 bits run 0, 1, 2, ... and the keystream is
+//      truncated to the requested length. `srtp_derive_keys` produces
+//      the three RFC 3711 §4.3.2 sub-keys with labels 0x00 / 0x01 /
+//      0x02 (encryption / auth / salt).
+//
+//   5. 64-packet anti-replay sliding window (RFC 3711 §3.3.2 -- same
+//      pattern R32B used for DTLS but keyed on the 16-bit RTP seq
+//      rather than the 48-bit DTLS seq). Tracks a high watermark
+//      `recv_packet_index` and a 64-bit replay mask. The window is
+//      mutated ONLY after the HMAC verifies, so a forged packet
+//      cannot advance the window and lock out the legitimate next
+//      packet.
+//
+//   6. ROC management: the 32-bit rollover counter increments when
+//      the 16-bit RTP seq wraps from 65535 -> 0. RFC 3711 §3.3.1
+//      defines an estimator that picks the most-likely ROC for an
+//      out-of-order packet given the current high-watermark seq +
+//      ROC. We implement the spec verbatim: if the wire-seq is more
+//      than 2^15 below the current seq, the packet probably came
+//      from the next ROC; if more than 2^15 above, from the previous
+//      ROC.
+//
+//   7. Top-level seal + open:
+//        srtp_seal_packet(state, rtp_hdr_buf, hdr_n, payload, pt_n)
+//          -> [sealed_buf, total_n]  on success
+//        srtp_open_packet(state, sealed_buf, n)
+//          -> [rtp_hdr_buf, hdr_n, payload_buf, payload_n, packet_index]
+//             on success
+//          -> SRTP_AUTH_FAIL / SRTP_REPLAY / SRTP_TOO_OLD on failure
+//
+// Scope (what R34C does NOT ship)
+//
+//   * (R34C.2 / R35A note) DTLS-SRTP key extraction is now wired
+//     via `srtp_init_from_dtls(dtls_state, is_server)` (see the
+//     R35A section below). The R34C-era note is preserved for
+//     historical context: the master key + salt USED to come from
+//     caller code; with R35A they are extracted from the completed
+//     DTLS handshake's PRF per RFC 5764 §4.2. Callers that still
+//     want to feed (master_key, master_salt) in directly can
+//     continue to call `srtp_derive_keys` -- R35A only ADDS the
+//     DTLS-driven path, it does not remove the direct path.
+//   * SRTCP (the control-plane sibling protocol RFC 3711 §3.4).
+//     SRTCP has its own seq numbering + always-encrypted-tag layout
+//     that is structurally different from SRTP.
+//   * MKI (Master Key Identifier, RFC 3711 §3.1) -- we ship with
+//     mki_length = 0 (the WebRTC interop default).
+//   * Negotiation of non-default cipher / authenticator (RFC 3711
+//     ships the defaults; profiles such as `AEAD_AES_128_GCM` from
+//     RFC 7714 swap them out -- not in scope here).
+//   * Variable-length truncated tags. The HMAC tag is hard-coded
+//     to 10 bytes (80 bits) per RFC 3711 §4.2 default.
+//
+// Public API
+//
+//   srtp_state_init(encr_key, auth_key, salt, ssrc) -> state
+//     Build a fresh per-session SRTP state. encr_key is 16 bytes;
+//     auth_key is 20 bytes; salt is 14 bytes; ssrc is the 32-bit
+//     RTP sync source ID.
+//   srtp_state_packet_index(state) -> int
+//     Current extended-sequence high watermark (48-bit
+//     `(roc << 16) | seq`). Read-only accessor for tests.
+//   srtp_state_roc(state) -> int
+//     Current 32-bit rollover counter.
+//
+//   srtp_seal_packet(state, rtp_hdr_buf, hdr_n, payload, pt_n)
+//     Encrypts payload + appends a 10-byte HMAC-SHA1-80 tag.
+//     Returns [sealed_buf, total_n] where total_n = hdr_n + pt_n + 10.
+//     Bumps the state's send seq (rolling ROC on wrap).
+//   srtp_open_packet(state, sealed_buf, n)
+//     Verifies the tag, checks the replay window, decrypts.
+//     Returns [hdr_buf, hdr_n, pt_buf, pt_n, packet_index] on success
+//     or one of the SRTP_* failure sentinels (all non-list ints).
+//
+//   srtp_kdf(master_key, master_salt, label, derive_len) -> derive_len-byte buf
+//     Single-key RFC 3711 §4.3 derivation. The label is one byte
+//     (0x00 / 0x01 / 0x02 / ...); derive_len is the requested output
+//     length in bytes (16 for the encryption key + salt, 20 for the
+//     auth key). The `roc_index` of §4.3.1 is ignored here (treated
+//     as 0) -- the SRTP profile that varies the index per call is
+//     not in scope for R34C.
+//   srtp_derive_keys(master_key, master_salt) -> [encr_key, auth_key, salt]
+//     One-shot RFC 3711 §4.3.2: returns three freshly-alloc'd buffers
+//     for the encryption (16B), auth (20B), and salt (14B) sub-keys.
+//
+//   srtp_authenticate(auth_key, packet_buf, n, roc) -> 10-byte tag
+//     RFC 3711 §4.2 truncated HMAC-SHA1-80 over (packet || roc[4B]).
+//     The 32-bit ROC is appended big-endian per §4.2 "the ROC SHALL
+//     be appended". Used internally by srtp_seal / srtp_open and
+//     exported for test vectors.
+//
+//   srtp_encrypt(key, salt, ssrc, packet_index, pt_buf, pt_n) -> ct_buf
+//     RFC 3711 §4.1.1 AES-CM-128 stream-cipher encrypt. ct_buf is
+//     freshly alloc'd, pt_n bytes wide. Decrypt is the same call
+//     (XOR with keystream is involutive).
+//
+// Constants / sentinels
+//
+//   SRTP_AUTH_TAG_LEN  = 10   bytes (HMAC-SHA1-80)
+//   SRTP_KEY_LEN       = 16   bytes (AES-128 encryption key)
+//   SRTP_AUTH_KEY_LEN  = 20   bytes (HMAC-SHA1 auth key)
+//   SRTP_SALT_LEN      = 14   bytes (AES-CM salt)
+//
+//   SRTP_OK            =   0  always returned by helpers that don't
+//                              return a list (`srtp_authenticate` is
+//                              a buffer, so this is just for state
+//                              update helpers).
+//   SRTP_AUTH_FAIL     = -10  HMAC verification failed.
+//   SRTP_REPLAY        = -11  Packet index already in replay window.
+//   SRTP_TOO_OLD       = -12  Packet index outside the 64-packet
+//                              window (more than 63 below the high
+//                              watermark).
+//   SRTP_AR_OK         =   0  Anti-replay check accept.
+//   SRTP_AR_REPLAY     =   1  In window + bit was already set.
+//   SRTP_AR_TOO_OLD    =   2  More than 63 below the high watermark.
+//
+// Constant-time / side-channel caveats
+//
+//   * AES-CM keystream generation uses the same AES-128 block path as
+//     `aes_gcm.nova`, with the same S-box-lookup timing exposure.
+//     R30B.3 tracked a future bitsliced AES; that follow-up will
+//     cover SRTP as well.
+//   * The HMAC tag comparison in `srtp_open_packet` is byte-by-byte
+//     XOR-fold (matching `gcm_open`'s convention), not a true
+//     constant-time `int_or` ladder. Same threat-model carve-out.
+//   * SHA-1 is COLLISION-BROKEN (SHAttered, 2017) but HMAC-SHA1
+//     remains MAC-secure in the SRTP authentication setting --
+//     SHA-1 collisions do not break the HMAC PRF (NIST SP 800-131A
+//     specifies that HMAC-SHA1 is acceptable for "legacy use" with
+//     a 128-bit key; SRTP uses a 160-bit auth key so the security
+//     margin is larger). A future SRTP profile (RFC 7714
+//     AEAD_AES_128_GCM) sidesteps the question by replacing
+//     HMAC-SHA1 with GCM's GHASH-based tag.
+//
+// References
+//   * RFC 3711  -- "The Secure Real-time Transport Protocol (SRTP)"
+//     §3.3 (sequence numbers + ROC), §3.3.2 (replay protection),
+//     §4.1.1 (AES-CM keystream), §4.2 (HMAC-SHA1-80), §4.3 (key
+//     derivation), §B.2 (AES-CM keystream test vector), §B.3 (KDF
+//     test vector).
+//   * RFC 2104  -- "HMAC: Keyed-Hashing for Message Authentication"
+//     §2 (HMAC construction).
+//   * RFC 2202  -- "Test Cases for HMAC-MD5 and HMAC-SHA-1" §3
+//     (HMAC-SHA1 known-answer vectors).
+//   * RFC 3174  -- "US Secure Hash Algorithm 1 (SHA1)" Appendix A
+//     (KAT vector).
+//   * FIPS 180-4 §6.1 -- SHA-1 specification.
+//   * FIPS 197  -- AES specification (reused via aes_gcm.nova).
+//   * RFC 5764  -- "DTLS Extension to Establish Keys for SRTP". Not
+//     implemented in R34C but the public API was shaped so a future
+//     round can plug it in without breaking callers.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R34C SRTP wire codec; R37C SHA-1
+//   dedup). NOVA dependencies: builtins only (alloc / store8 / load8 /
+//   int_* / list ops). CrossEngin dependencies (R34C / R35A / R37C):
+//     * src/safety/aes_gcm.nova -- AES-128 block cipher.
+//     * src/safety/sha1.nova    -- canonical SHA-1 + HMAC-SHA1 (R37C
+//                                  landed; retired this module's inline
+//                                  copy alongside R36A's turn.nova
+//                                  inline copy).
+//     * src/federation/dtls12.nova -- DTLS-SRTP keying material exporter
+//                                     (R35A integration).
+
+// R37C (R34A.3): canonical SHA-1 + HMAC-SHA1. Pre-R37C this module
+// shipped its own inline FIPS 180-4 SHA-1 + RFC 2104 HMAC-SHA1
+// family (~150 lines) -- the cleaner of the two inline SHA-1 copies
+// in the tree (the other was in turn.nova, also retired by R37C).
+// `_srtp_sha1_oneshot` and `_srtp_hmac_sha1` are now thin wrappers
+// around `sha1_oneshot` / `hmac_sha1` so the test harness and
+// `srtp_authenticate` call sites do not learn a new name --
+// byte-identity at the wire level is the contract this refactor
+// preserves.
+import "../safety/aes_gcm.nova"
+import "../safety/sha1.nova"
+// R35A: DTLS-SRTP keying material exporter. Pulled in for
+// `srtp_init_from_dtls`, which calls `dtls_export_srtp_keying_material`
+// to extract the 60-byte RFC 5764 §4.2 block from a completed DTLS
+// handshake's state. The import is a one-way edge (dtls12 does NOT
+// import srtp); transitively pulls in safety/sha256 + safety/p256 +
+// safety/aes_gcm + safety/x509, all of which are LEAVES and do not
+// re-enter the federation tree.
+import "./dtls12.nova"
+
+// ============================================================================
+//                          Public sentinels
+// ============================================================================
+
+let SRTP_OK            = 0
+let SRTP_AUTH_FAIL     = 0 - 10
+let SRTP_REPLAY        = 0 - 11
+let SRTP_TOO_OLD       = 0 - 12
+
+let SRTP_AR_OK         = 0
+let SRTP_AR_REPLAY     = 1
+let SRTP_AR_TOO_OLD    = 2
+
+let SRTP_AUTH_TAG_LEN  = 10
+let SRTP_KEY_LEN       = 16
+let SRTP_AUTH_KEY_LEN  = 20
+let SRTP_SALT_LEN      = 14
+
+// RFC 3711 §4.3.2 labels for srtp_derive_keys.
+let SRTP_LABEL_ENCR = 0
+let SRTP_LABEL_AUTH = 1
+let SRTP_LABEL_SALT = 2
+
+// Internal anti-replay window constants -- match R32B's dtls12 anti-replay.
+let _SRTP_REPLAY_WINDOW = 64
+let _SRTP_REPLAY_MASK64 = 18446744073709551615   // (1 << 64) - 1
+
+// 16-bit RTP sequence number wrap point + half-window for ROC estimator.
+let _SRTP_SEQ_MOD       = 65536           // 2^16
+let _SRTP_SEQ_HALF      = 32768           // 2^15
+
+// ============================================================================
+//          SHA-1 + HMAC-SHA1 -- thin adapters over the canonical
+// ============================================================================
+//
+// Pre-R37C (R34A.3) this section carried an inline FIPS 180-4 SHA-1 +
+// RFC 2104 HMAC-SHA1 family (~150 lines: `_srtp_sha1_*` 32-bit
+// arithmetic helpers, K-table, IV, 80-round compression function,
+// padding, oneshot, ipad/opad). R34C documented the duplication as
+// an R34A.3-style follow-up candidate -- no canonical `sha1.nova`
+// existed at R34C-shipping time.
+//
+// R37C closes that follow-up. The cleaner SHA-1 source (this
+// module's `_srtp_sha1_*` family -- which mirrors the sha256.nova
+// shape) was lifted into `src/safety/sha1.nova` and is now the
+// single authoritative source. The pre-R37C inline 32-bit
+// arithmetic helpers, K-table, IV, compression function, padding
+// logic, and ipad/opad construction have all been removed.
+//
+// `_srtp_sha1_oneshot` and `_srtp_hmac_sha1` are kept as
+// underscore-prefixed local wrappers so the test harness
+// (`tests/unit/test_srtp.nova`) and the in-module
+// `srtp_authenticate` call site do not learn a new name --
+// byte-identity at the wire level is the contract this refactor
+// preserves. The implementations are now thin forwards to
+// `sha1_oneshot` / `hmac_sha1` in `src/safety/sha1.nova`.
+
+// SHA-1 oneshot of n bytes at msg_buf. Returns a 21-byte buffer
+// (20B digest + trailing NUL slack). Thin adapter over
+// `sha1_oneshot` (R37C canonical).
+fn _srtp_sha1_oneshot(msg_buf, n) {
+    return sha1_oneshot(msg_buf, n)
+}
+
+// HMAC-SHA1 over (key, msg) byte buffers. Same RFC 2104 recipe SRTP
+// uses for the authentication tag (RFC 3711 §4.2). Returns a freshly
+// alloc'd 21-byte buffer (20B digest + trailing NUL). Thin adapter
+// over `hmac_sha1` (R37C canonical).
+fn _srtp_hmac_sha1(key_buf, key_n, msg_buf, msg_n) {
+    return hmac_sha1(key_buf, key_n, msg_buf, msg_n)
+}
+
+// ============================================================================
+//                          AES-CM keystream (RFC 3711 §4.1.1)
+// ============================================================================
+//
+// The 16-byte AES counter block is built as:
+//   IV[0..14) = salt[0..14)
+//   IV[14..16) = 0  (counter starts at 0 each packet)
+// Then XORed with:
+//   ssrc shifted into bytes [4..8)
+//   packet_index (48 bits) shifted into bytes [8..14)
+// All written big-endian. The low 16 bits of the resulting block
+// are the per-block counter; increment them by 1 to produce each
+// subsequent AES output block.
+//
+// Notation note: RFC 3711 §4.1.1 expresses the IV as a 128-bit
+// integer `IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (i * 2^16)`. Our
+// byte-level construction is equivalent: the salt sits in bytes
+// [0..14), SSRC at bytes [4..8), packet_index `i` (48-bit) at
+// bytes [8..14), counter (initially 0) at [14..16).
+
+// Build the initial counter block for (salt, ssrc, packet_index)
+// into `iv16` (a 16-byte buffer). Equivalent to RFC 3711 §4.1.1 with
+// counter = 0.
+fn _srtp_aes_cm_build_iv(iv16, salt, ssrc, packet_index) {
+    // 1. iv = salt[0..14) || 0[2]
+    let i = 0
+    while i < 14 {
+        store8(iv16 + i, load8(salt + i))
+        i = i + 1
+    }
+    store8(iv16 + 14, 0)
+    store8(iv16 + 15, 0)
+    // 2. XOR in SSRC (32-bit, big-endian) at bytes [4..8).
+    let s0 = int_and(int_shr(ssrc, 24), 255)
+    let s1 = int_and(int_shr(ssrc, 16), 255)
+    let s2 = int_and(int_shr(ssrc, 8), 255)
+    let s3 = int_and(ssrc, 255)
+    store8(iv16 + 4, int_xor(load8(iv16 + 4), s0))
+    store8(iv16 + 5, int_xor(load8(iv16 + 5), s1))
+    store8(iv16 + 6, int_xor(load8(iv16 + 6), s2))
+    store8(iv16 + 7, int_xor(load8(iv16 + 7), s3))
+    // 3. XOR in packet_index (48-bit, big-endian) at bytes [8..14).
+    let p0 = int_and(int_shr(packet_index, 40), 255)
+    let p1 = int_and(int_shr(packet_index, 32), 255)
+    let p2 = int_and(int_shr(packet_index, 24), 255)
+    let p3 = int_and(int_shr(packet_index, 16), 255)
+    let p4 = int_and(int_shr(packet_index, 8), 255)
+    let p5 = int_and(packet_index, 255)
+    store8(iv16 + 8,  int_xor(load8(iv16 + 8), p0))
+    store8(iv16 + 9,  int_xor(load8(iv16 + 9), p1))
+    store8(iv16 + 10, int_xor(load8(iv16 + 10), p2))
+    store8(iv16 + 11, int_xor(load8(iv16 + 11), p3))
+    store8(iv16 + 12, int_xor(load8(iv16 + 12), p4))
+    store8(iv16 + 13, int_xor(load8(iv16 + 13), p5))
+    // Counter bytes [14..16) stay 0 -- caller will increment per block.
+    return 1
+}
+
+// Increment the low 16 bits (counter half) of a 16-byte CTR block.
+// Wrap-around is fine; SRTP packets are limited to 2^16 blocks (~1 MB)
+// per the spec's `n_e` bound.
+fn _srtp_aes_cm_inc_ctr(ctr) {
+    let lo = load8(ctr + 15)
+    let hi = load8(ctr + 14)
+    let next = lo + 1
+    if next > 255 {
+        store8(ctr + 15, 0)
+        let next_hi = hi + 1
+        store8(ctr + 14, int_and(next_hi, 255))
+    } else {
+        store8(ctr + 15, next)
+    }
+    return 1
+}
+
+// Generate `n_bytes` of AES-CM keystream into a fresh buffer. Used
+// by `srtp_encrypt` and the KDF.
+fn _srtp_aes_cm_keystream(key, salt, ssrc, packet_index, n_bytes) {
+    let rk = aes128_key_schedule(key)
+    let ctr = alloc(17)
+    _srtp_aes_cm_build_iv(ctr, salt, ssrc, packet_index)
+    let out = alloc(n_bytes + 1)
+    let block = alloc(17)
+    let off = 0
+    while off < n_bytes {
+        aes128_encrypt_block_with_schedule(rk, ctr, block)
+        let remaining = n_bytes - off
+        let take = 16
+        if remaining < 16 { take = remaining }
+        let j = 0
+        while j < take {
+            store8(out + off + j, load8(block + j))
+            j = j + 1
+        }
+        off = off + take
+        _srtp_aes_cm_inc_ctr(ctr)
+    }
+    store8(out + n_bytes, 0)
+    return out
+}
+
+// Encrypt `pt_n` bytes of plaintext at `pt_buf` under AES-CM-128.
+// Returns a freshly alloc'd `pt_n + 1`-byte buffer (ct + NUL). Decrypt
+// is the same call (XOR is involutive).
+fn srtp_encrypt(key, salt, ssrc, packet_index, pt_buf, pt_n) {
+    let ks = _srtp_aes_cm_keystream(key, salt, ssrc, packet_index, pt_n)
+    let out = alloc(pt_n + 1)
+    let i = 0
+    while i < pt_n {
+        store8(out + i, int_xor(load8(pt_buf + i), load8(ks + i)))
+        i = i + 1
+    }
+    store8(out + pt_n, 0)
+    return out
+}
+
+// Decrypt is XOR with the same keystream -- exposed as a separate
+// function for caller readability.
+fn srtp_decrypt(key, salt, ssrc, packet_index, ct_buf, ct_n) {
+    return srtp_encrypt(key, salt, ssrc, packet_index, ct_buf, ct_n)
+}
+
+// ============================================================================
+//                          SRTP KDF (RFC 3711 §4.3)
+// ============================================================================
+//
+// The SRTP key derivation function takes a 16-byte master key, a
+// 14-byte master salt, and a single-byte label, and produces a
+// `derive_len`-byte derived key. Per §4.3.1, the key-derivation
+// rate `KDR` is the rate at which a new key is rederived from a
+// fresh `r = index DIV KDR` -- with KDR = 0 (the default), there is
+// exactly one derivation per session, with r = 0.
+//
+// The construction (§4.3.1):
+//   x = master_salt XOR (label || r)
+// where (label || r) is a 14-byte block: 7 leading zero bytes, the
+// 1-byte label, then 6 zero bytes (for r = 0). The 14-byte `x` is
+// then used as the AES-CM salt (low 16 bits = counter = 0) and AES-CM
+// keystream generation produces `derive_len` bytes of output.
+//
+// For srtp_derive_keys (the RFC 3711 §4.3.2 wrapper) the three
+// sub-keys use labels:
+//   0x00 -> SRTP encryption key   (16 bytes)
+//   0x01 -> SRTP authentication key (20 bytes)
+//   0x02 -> SRTP salt              (14 bytes)
+
+// One-shot KDF: derive `derive_len` bytes for a given (master_key,
+// master_salt, label). Returns a freshly alloc'd `derive_len + 1`-byte
+// buffer.
+//
+//   AES_key      = master_key   (16 bytes -- the actual AES-128 key)
+//   AES_CM_salt  = x            (14 bytes -- master_salt XOR label block)
+//   ssrc         = 0            (no SSRC XOR for the KDF mode)
+//   packet_index = 0            (no packet-index XOR; r = 0 by default)
+//
+// The label is the single byte at offset 7 of the 14-byte salt-XOR
+// pre-image, per RFC 3711 §4.3.1.
+fn srtp_kdf(master_key, master_salt, label, derive_len) {
+    // 1. Build x = master_salt XOR (label || r). label_block is the
+    //    14-byte pre-image with bytes [0..7) = 0, byte 7 = label,
+    //    bytes [8..14) = 0 (r = 0 default).
+    let x = alloc(15)
+    let i = 0
+    while i < 14 {
+        store8(x + i, load8(master_salt + i))
+        i = i + 1
+    }
+    store8(x + 7, int_xor(load8(x + 7), label))
+    store8(x + 14, 0)
+    // 2. AES-CM keystream: AES_K(x || ctr=0), AES_K(x || ctr=1), ...
+    //    With ssrc=0 and packet_index=0 the SSRC/packet_index XORs
+    //    into bytes [4..14) are no-ops, so the counter block reduces
+    //    to x || 0[2] -- exactly RFC 3711 §4.3.1's pre-image.
+    return _srtp_aes_cm_keystream(master_key, x, 0, 0, derive_len)
+}
+
+// One-shot KDF: derive the three RFC 3711 §4.3.2 sub-keys from a
+// (16-byte master_key, 14-byte master_salt). Returns
+//   [encr_key (16B), auth_key (20B), salt (14B)]
+// each as a freshly alloc'd buffer.
+fn srtp_derive_keys(master_key, master_salt) {
+    let encr = srtp_kdf(master_key, master_salt, SRTP_LABEL_ENCR,
+                        SRTP_KEY_LEN)
+    let auth = srtp_kdf(master_key, master_salt, SRTP_LABEL_AUTH,
+                        SRTP_AUTH_KEY_LEN)
+    let salt = srtp_kdf(master_key, master_salt, SRTP_LABEL_SALT,
+                        SRTP_SALT_LEN)
+    let r = list_new()
+    push(r, encr)
+    push(r, auth)
+    push(r, salt)
+    return r
+}
+
+// ============================================================================
+//      R35A: DTLS-SRTP keying-material -> SRTP sub-keys (RFC 5764 §4.2)
+// ============================================================================
+//
+// `srtp_init_from_dtls(dtls_state, is_server)` closes the loop between
+// the DTLS 1.2 handshake (R29B / R31B / R32B / R33B / R34A in the
+// federation/dtls12.nova stack) and the SRTP wire codec (this module).
+// Before R35A, a caller of `srtp_derive_keys(master_key, master_salt)`
+// had to supply the 16-byte master key and 14-byte master salt from
+// some out-of-band source -- the public API was intentionally shaped
+// so a future round could plug DTLS in without a breaking change.
+// R35A is that round.
+//
+// RFC 5764 §4.2 specifies that the SRTP keying material is extracted
+// from the DTLS PRF via the well-known label `"EXTRACTOR-dtls_srtp"`
+// and the seed `client_random || server_random`. The output is a
+// fixed 60-byte block:
+//
+//   bytes  0..15 -- CLIENT SRTP master key   (16B, AES-CM-128 key)
+//   bytes 16..31 -- SERVER SRTP master key   (16B)
+//   bytes 32..45 -- CLIENT SRTP master salt  (14B, AES-CM salt)
+//   bytes 46..59 -- SERVER SRTP master salt  (14B)
+//
+// The "client" half is used by the DTLS client (is_server=0) on its
+// send-side seal; the "server" half is used by the DTLS server
+// (is_server=1) on its send-side seal. Crucially, the keys are
+// ASYMMETRIC across direction: a client's keys are NOT the same as
+// the server's keys, even though both 60-byte blocks are byte-
+// identical (both peers compute the same exporter output -- that is
+// the whole point of a deterministic PRF). The asymmetry comes from
+// each side selecting a different HALF of the 60-byte block. To
+// validate this asymmetry, a test can call
+// `srtp_init_from_dtls(alice_dtls, 0)` and
+// `srtp_init_from_dtls(bob_dtls, 1)` (after a `_tdtls_setup_ecdhe_
+// pair`) and assert the resulting encr_keys differ in at least one
+// byte.
+//
+// The function operates in two steps:
+//   1. Call `dtls_export_srtp_keying_material(dtls_state)` to get
+//      the 60-byte block. If DTLS has not yet completed its
+//      handshake (`cipher_active == 0` in the state), the exporter
+//      returns 0 and we forward that sentinel here.
+//   2. Slice "our" 16-byte master key + 14-byte master salt from
+//      the block based on `is_server`, then forward to the existing
+//      RFC 3711 §4.3.2 wrapper `srtp_derive_keys` to produce the
+//      three §4.3.2 sub-keys.
+//
+// The slicing uses freshly alloc'd buffers so a downstream mutation
+// of the returned encr/auth/salt does not poison the DTLS state
+// slots that backed the exporter output. The 60-byte exporter buf
+// is consumed (read-only) and then discarded once we hold the
+// 16-byte mk + 14-byte ms copies.
+//
+// Returns:
+//   * On success: `[encr_key (16B), auth_key (20B), salt (14B)]`
+//     -- the exact shape `srtp_derive_keys` produces; this is the
+//     drop-in replacement for the manual-master-key path.
+//   * On DTLS not ready: 0 (forwarded from the exporter).
+fn srtp_init_from_dtls(dtls_state, is_server) {
+    let km = dtls_export_srtp_keying_material(dtls_state)
+    if km == 0 { return 0 }
+    // Pick our halves from the 60-byte block per RFC 5764 §4.2.
+    //   client side (is_server == 0): mk = km[0..16);  ms = km[32..46)
+    //   server side (is_server == 1): mk = km[16..32); ms = km[46..60)
+    let mk_off = 0
+    let ms_off = 32
+    if is_server != 0 {
+        mk_off = 16
+        ms_off = 46
+    }
+    // Copy 16 bytes of master key into a fresh buffer.
+    let mk = alloc(SRTP_KEY_LEN + 1)
+    let i = 0
+    while i < SRTP_KEY_LEN {
+        store8(mk + i, load8(km + mk_off + i))
+        i = i + 1
+    }
+    store8(mk + SRTP_KEY_LEN, 0)
+    // Copy 14 bytes of master salt into a fresh buffer.
+    let ms = alloc(SRTP_SALT_LEN + 1)
+    let j = 0
+    while j < SRTP_SALT_LEN {
+        store8(ms + j, load8(km + ms_off + j))
+        j = j + 1
+    }
+    store8(ms + SRTP_SALT_LEN, 0)
+    // Forward to the existing RFC 3711 §4.3.2 derivation. The shape
+    // is `[encr_key (16B), auth_key (20B), salt (14B)]` -- this is
+    // the contract `srtp_state_init(encr, auth, salt, ssrc)` expects.
+    return srtp_derive_keys(mk, ms)
+}
+
+// ============================================================================
+//                          SRTP authenticate (RFC 3711 §4.2)
+// ============================================================================
+//
+// Build the authentication tag over the wire bytes `[rtp_header ||
+// ciphertext]` plus a trailing 32-bit big-endian ROC. The full
+// 20-byte HMAC-SHA1 output is truncated to the low 10 bytes (80 bits)
+// -- the SRTP default tag width.
+
+// Authenticate the n-byte buffer `packet_buf` (which is the full
+// RTP header + ciphertext, as it will appear on the wire) under
+// `auth_key` with the rollover counter `roc` appended as a 4-byte
+// big-endian suffix. Returns a freshly alloc'd 11-byte buffer
+// (10B tag + trailing NUL slack).
+fn srtp_authenticate(auth_key, packet_buf, n, roc) {
+    // Build (packet_buf[0..n) || roc[0..4)) into a scratch buffer.
+    let in_n = n + 4
+    let in_buf = alloc(in_n + 1)
+    let i = 0
+    while i < n {
+        store8(in_buf + i, load8(packet_buf + i))
+        i = i + 1
+    }
+    store8(in_buf + n + 0, int_and(int_shr(roc, 24), 255))
+    store8(in_buf + n + 1, int_and(int_shr(roc, 16), 255))
+    store8(in_buf + n + 2, int_and(int_shr(roc, 8), 255))
+    store8(in_buf + n + 3, int_and(roc, 255))
+    store8(in_buf + in_n, 0)
+    // HMAC-SHA1, truncate to 10 bytes.
+    let full = _srtp_hmac_sha1(auth_key, SRTP_AUTH_KEY_LEN, in_buf, in_n)
+    let out = alloc(SRTP_AUTH_TAG_LEN + 1)
+    let j = 0
+    while j < SRTP_AUTH_TAG_LEN {
+        store8(out + j, load8(full + j))
+        j = j + 1
+    }
+    store8(out + SRTP_AUTH_TAG_LEN, 0)
+    return out
+}
+
+// ============================================================================
+//                          SRTP state + anti-replay window
+// ============================================================================
+//
+// Per-session SRTP state. Layout (all slots indexed by name to make
+// future slot additions tail-append-safe per the dtls12 convention):
+//
+//   _SRTP_ST_ENCR_KEY   -- 16-byte encryption key buf
+//   _SRTP_ST_AUTH_KEY   -- 20-byte authentication key buf
+//   _SRTP_ST_SALT       -- 14-byte salt buf
+//   _SRTP_ST_SSRC       -- 32-bit RTP SSRC
+//   _SRTP_ST_ROC        -- 32-bit rollover counter
+//   _SRTP_ST_LAST_SEQ   -- 16-bit last accepted seq (for ROC tracking)
+//   _SRTP_ST_HW_INDEX   -- 48-bit replay window high watermark
+//   _SRTP_ST_REPLAY_MASK -- 64-bit replay mask
+//   _SRTP_ST_SEND_SEQ   -- 16-bit next-to-send seq number (rolls)
+//   _SRTP_ST_SEND_ROC   -- 32-bit ROC for the send side
+//   _SRTP_ST_STATS_SEAL -- counter
+//   _SRTP_ST_STATS_OPEN -- counter
+//   _SRTP_ST_STATS_AUTH_FAIL -- counter
+//   _SRTP_ST_STATS_REPLAY    -- counter
+//   _SRTP_ST_STATS_TOO_OLD   -- counter
+
+let _SRTP_ST_ENCR_KEY        = 0
+let _SRTP_ST_AUTH_KEY        = 1
+let _SRTP_ST_SALT            = 2
+let _SRTP_ST_SSRC            = 3
+let _SRTP_ST_ROC             = 4
+let _SRTP_ST_LAST_SEQ        = 5
+let _SRTP_ST_HW_INDEX        = 6
+let _SRTP_ST_REPLAY_MASK     = 7
+let _SRTP_ST_SEND_SEQ        = 8
+let _SRTP_ST_SEND_ROC        = 9
+let _SRTP_ST_STATS_SEAL      = 10
+let _SRTP_ST_STATS_OPEN      = 11
+let _SRTP_ST_STATS_AUTH_FAIL = 12
+let _SRTP_ST_STATS_REPLAY    = 13
+let _SRTP_ST_STATS_TOO_OLD   = 14
+let _SRTP_ST_LEN             = 15
+
+// Build a fresh SRTP state from (encr_key, auth_key, salt, ssrc).
+// The state can be used for BOTH seal and open; in a real WebRTC
+// session each peer keeps two states (one per direction) but the
+// shape is the same.
+fn srtp_state_init(encr_key, auth_key, salt, ssrc) {
+    let st = list_new()
+    push(st, encr_key)        // 0
+    push(st, auth_key)        // 1
+    push(st, salt)            // 2
+    push(st, ssrc)            // 3
+    push(st, 0)               // 4   ROC (receive)
+    push(st, 0)               // 5   LAST_SEQ (receive)
+    push(st, 0)               // 6   HW_INDEX
+    push(st, 0)               // 7   REPLAY_MASK
+    push(st, 0)               // 8   SEND_SEQ
+    push(st, 0)               // 9   SEND_ROC
+    push(st, 0)               // 10  STATS_SEAL
+    push(st, 0)               // 11  STATS_OPEN
+    push(st, 0)               // 12  STATS_AUTH_FAIL
+    push(st, 0)               // 13  STATS_REPLAY
+    push(st, 0)               // 14  STATS_TOO_OLD
+    return st
+}
+
+// Read accessors (test-only -- internal callers index by slot constant).
+fn srtp_state_packet_index(state) { return state[_SRTP_ST_HW_INDEX] }
+fn srtp_state_roc(state)          { return state[_SRTP_ST_ROC] }
+fn srtp_state_last_seq(state)     { return state[_SRTP_ST_LAST_SEQ] }
+fn srtp_state_send_seq(state)     { return state[_SRTP_ST_SEND_SEQ] }
+fn srtp_state_send_roc(state)     { return state[_SRTP_ST_SEND_ROC] }
+fn srtp_state_replay_mask(state)  { return state[_SRTP_ST_REPLAY_MASK] }
+fn srtp_state_stats_seal(state)      { return state[_SRTP_ST_STATS_SEAL] }
+fn srtp_state_stats_open(state)      { return state[_SRTP_ST_STATS_OPEN] }
+fn srtp_state_stats_auth_fail(state) { return state[_SRTP_ST_STATS_AUTH_FAIL] }
+fn srtp_state_stats_replay(state)    { return state[_SRTP_ST_STATS_REPLAY] }
+fn srtp_state_stats_too_old(state)   { return state[_SRTP_ST_STATS_TOO_OLD] }
+
+// Test helper: force the send-side sequence + ROC to specific values.
+// Used by the ROC rollover tests.
+fn srtp_state_set_send_seq(state, seq, roc) {
+    list_set(state, _SRTP_ST_SEND_SEQ, seq)
+    list_set(state, _SRTP_ST_SEND_ROC, roc)
+    return state
+}
+
+// Test helper: force the receive-side ROC + LAST_SEQ to a given pair.
+// Used by the ROC rollover tests on the open side.
+fn srtp_state_set_recv_roc(state, roc, last_seq) {
+    list_set(state, _SRTP_ST_ROC, roc)
+    list_set(state, _SRTP_ST_LAST_SEQ, last_seq)
+    return state
+}
+
+// ----------------------------------------------------------------------------
+// ROC estimator (RFC 3711 §3.3.1).
+//
+// Given the wire 16-bit seq and the local (roc, last_seq) high
+// watermark, pick the most-likely 32-bit ROC for this packet. The
+// algorithm:
+//   if last_seq < 2^15:
+//     if seq - last_seq > 2^15: guess_roc = roc - 1
+//     else:                     guess_roc = roc
+//   else:
+//     if last_seq - 2^15 > seq: guess_roc = roc + 1
+//     else:                     guess_roc = roc
+// And clamp roc - 1 at 0 (no negative ROCs).
+//
+// Then the 48-bit packet_index = (guess_roc << 16) | seq.
+// ----------------------------------------------------------------------------
+
+fn _srtp_estimate_packet_index(roc, last_seq, seq) {
+    let guess_roc = roc
+    if last_seq < _SRTP_SEQ_HALF {
+        if seq - last_seq > _SRTP_SEQ_HALF {
+            if roc > 0 {
+                guess_roc = roc - 1
+            } else {
+                guess_roc = 0
+            }
+        }
+    } else {
+        if last_seq - _SRTP_SEQ_HALF > seq {
+            guess_roc = roc + 1
+        }
+    }
+    return int_or(int_shl(guess_roc, 16), seq)
+}
+
+// Anti-replay window check (RFC 3711 §3.3.2). PURE FUNCTION -- never
+// mutates state; the caller mutates after the HMAC verifies. Returns
+// one of:
+//   SRTP_AR_OK      -- packet is acceptable; window is to be updated
+//                       on auth success
+//   SRTP_AR_REPLAY  -- packet_index falls inside the window AND its
+//                       bit is already set
+//   SRTP_AR_TOO_OLD -- packet_index is more than 63 below the high
+//                       watermark
+fn _srtp_replay_check(state, packet_index) {
+    let hw = state[_SRTP_ST_HW_INDEX]
+    let mask = state[_SRTP_ST_REPLAY_MASK]
+    if packet_index > hw {
+        // Above the window -- tentatively accept.
+        return SRTP_AR_OK
+    }
+    // packet_index <= hw; within window iff (hw - packet_index) < 64.
+    let delta = hw - packet_index
+    if delta >= _SRTP_REPLAY_WINDOW {
+        return SRTP_AR_TOO_OLD
+    }
+    let bit = int_and(int_shr(mask, delta), 1)
+    if bit == 1 {
+        return SRTP_AR_REPLAY
+    }
+    return SRTP_AR_OK
+}
+
+// Anti-replay window update (RFC 3711 §3.3.2). Mutates state. Called
+// ONLY after the HMAC verifies AND the pre-check returned SRTP_AR_OK.
+fn _srtp_replay_update(state, packet_index) {
+    let hw = state[_SRTP_ST_HW_INDEX]
+    let mask = state[_SRTP_ST_REPLAY_MASK]
+    if packet_index > hw {
+        let shift = packet_index - hw
+        if shift >= _SRTP_REPLAY_WINDOW {
+            mask = 0
+        } else {
+            mask = int_and(int_shl(mask, shift), _SRTP_REPLAY_MASK64)
+        }
+        mask = int_or(mask, 1)
+        list_set(state, _SRTP_ST_HW_INDEX, packet_index)
+    } else {
+        let delta = hw - packet_index
+        let bit_pos = int_shl(1, delta)
+        mask = int_and(int_or(mask, bit_pos), _SRTP_REPLAY_MASK64)
+    }
+    list_set(state, _SRTP_ST_REPLAY_MASK, mask)
+    return 1
+}
+
+// ============================================================================
+//                          srtp_seal_packet / srtp_open_packet
+// ============================================================================
+//
+// The wire format produced by srtp_seal_packet is:
+//
+//   [ rtp_header (hdr_n bytes -- caller-provided as-is)
+//   | ciphertext (pt_n bytes -- AES-CM-128 of payload)
+//   | auth_tag (10 bytes -- HMAC-SHA1-80 over hdr || ct || roc) ]
+//
+// The 16-bit RTP sequence number is presumed to live in the LAST two
+// bytes of the RTP header in big-endian -- but we do NOT parse the
+// RTP header to recover it. Callers are expected to set the seq
+// number in the header before calling seal, and to consume it from
+// the header on the receive side. We treat hdr as opaque AAD for the
+// HMAC.
+//
+// For ROC tracking, however, we need the 16-bit seq:
+//   * seal: read from `state.send_seq`, embedded into the hdr by the
+//     caller (or via an internal seq stamp at hdr offset 2-3 below).
+//   * open: read from the wire hdr at offset 2-3 (the standard RTP
+//     header byte 2-3 location, RFC 3550 §5.1).
+//
+// To keep the codec self-contained in tests, srtp_seal_packet ALSO
+// writes the send_seq into hdr_buf[2..4] big-endian BEFORE
+// encrypting -- this matches RFC 3550 §5.1 RTP header layout. A
+// real caller that already maintains its own RTP header layer can
+// simply skip this stamp by setting state.send_seq to whatever the
+// caller already wrote into the header.
+
+// Seal an RTP packet: stamp seq, encrypt payload, append tag.
+// Returns [sealed_buf, total_n] on success.
+fn srtp_seal_packet(state, rtp_hdr_buf, hdr_n, payload, pt_n) {
+    if hdr_n < 4 { return 0 }
+    if pt_n < 0 { return 0 }
+    let ssrc      = state[_SRTP_ST_SSRC]
+    let encr_key  = state[_SRTP_ST_ENCR_KEY]
+    let auth_key  = state[_SRTP_ST_AUTH_KEY]
+    let salt      = state[_SRTP_ST_SALT]
+    let send_seq  = state[_SRTP_ST_SEND_SEQ]
+    let send_roc  = state[_SRTP_ST_SEND_ROC]
+    // 1. Stamp the seq into hdr_buf[2..4] (RFC 3550 §5.1).
+    store8(rtp_hdr_buf + 2, int_and(int_shr(send_seq, 8), 255))
+    store8(rtp_hdr_buf + 3, int_and(send_seq, 255))
+    // 2. Build packet_index = (send_roc << 16) | send_seq.
+    let packet_index = int_or(int_shl(send_roc, 16), send_seq)
+    // 3. Encrypt payload under AES-CM with (encr_key, salt, ssrc, idx).
+    let ct = srtp_encrypt(encr_key, salt, ssrc, packet_index, payload, pt_n)
+    // 4. Build the wire-image-so-far for HMAC: hdr || ct.
+    let pre_n = hdr_n + pt_n
+    let pre = alloc(pre_n + 1)
+    let i = 0
+    while i < hdr_n {
+        store8(pre + i, load8(rtp_hdr_buf + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < pt_n {
+        store8(pre + hdr_n + j, load8(ct + j))
+        j = j + 1
+    }
+    store8(pre + pre_n, 0)
+    // 5. HMAC-SHA1-80 over (pre || roc).
+    let tag = srtp_authenticate(auth_key, pre, pre_n, send_roc)
+    // 6. Build final sealed: hdr || ct || tag.
+    let total = pre_n + SRTP_AUTH_TAG_LEN
+    let out = alloc(total + 1)
+    let k = 0
+    while k < pre_n {
+        store8(out + k, load8(pre + k))
+        k = k + 1
+    }
+    let m = 0
+    while m < SRTP_AUTH_TAG_LEN {
+        store8(out + pre_n + m, load8(tag + m))
+        m = m + 1
+    }
+    store8(out + total, 0)
+    // 7. Bump send_seq + ROC on wrap.
+    let next_seq = send_seq + 1
+    if next_seq >= _SRTP_SEQ_MOD {
+        list_set(state, _SRTP_ST_SEND_SEQ, 0)
+        list_set(state, _SRTP_ST_SEND_ROC, send_roc + 1)
+    } else {
+        list_set(state, _SRTP_ST_SEND_SEQ, next_seq)
+    }
+    list_set(state, _SRTP_ST_STATS_SEAL, state[_SRTP_ST_STATS_SEAL] + 1)
+    // 8. Pack the result.
+    let r = list_new()
+    push(r, out)
+    push(r, total)
+    return r
+}
+
+// Open an SRTP packet. Wire layout:
+//   [ rtp_header (hdr_n bytes)
+//   | ciphertext (n - hdr_n - 10 bytes)
+//   | tag (10 bytes) ]
+//
+// Returns [hdr_buf, hdr_n, pt_buf, pt_n, packet_index] on success or
+// the appropriate SRTP_* failure sentinel.
+//
+// Caller passes hdr_n explicitly because we do not parse the RTP CSRC
+// + extensions stuff at this layer -- a real caller knows its own
+// header length from the RTP byte 0 CC field + extension parsing.
+fn srtp_open_packet(state, sealed_buf, n, hdr_n) {
+    if hdr_n < 4 { return SRTP_AUTH_FAIL }
+    if n < hdr_n + SRTP_AUTH_TAG_LEN {
+        return SRTP_AUTH_FAIL
+    }
+    let ssrc      = state[_SRTP_ST_SSRC]
+    let encr_key  = state[_SRTP_ST_ENCR_KEY]
+    let auth_key  = state[_SRTP_ST_AUTH_KEY]
+    let salt      = state[_SRTP_ST_SALT]
+    let roc       = state[_SRTP_ST_ROC]
+    let last_seq  = state[_SRTP_ST_LAST_SEQ]
+    // 1. Pull seq from hdr_buf[2..4] (RFC 3550 §5.1, big-endian).
+    let seq_hi = load8(sealed_buf + 2)
+    let seq_lo = load8(sealed_buf + 3)
+    let seq    = int_or(int_shl(seq_hi, 8), seq_lo)
+    // 2. Estimate the packet_index via RFC 3711 §3.3.1.
+    let packet_index = _srtp_estimate_packet_index(roc, last_seq, seq)
+    let est_roc = int_shr(packet_index, 16)
+    // 3. Anti-replay PRE-check.
+    let ar = _srtp_replay_check(state, packet_index)
+    if ar == SRTP_AR_REPLAY {
+        list_set(state, _SRTP_ST_STATS_REPLAY,
+                 state[_SRTP_ST_STATS_REPLAY] + 1)
+        return SRTP_REPLAY
+    }
+    if ar == SRTP_AR_TOO_OLD {
+        list_set(state, _SRTP_ST_STATS_TOO_OLD,
+                 state[_SRTP_ST_STATS_TOO_OLD] + 1)
+        return SRTP_TOO_OLD
+    }
+    // 4. Verify HMAC tag over (hdr || ct || roc).
+    let body_n = n - SRTP_AUTH_TAG_LEN
+    let ct_n = body_n - hdr_n
+    if ct_n < 0 { return SRTP_AUTH_FAIL }
+    let expected = srtp_authenticate(auth_key, sealed_buf, body_n, est_roc)
+    let diff = 0
+    let t = 0
+    while t < SRTP_AUTH_TAG_LEN {
+        let got = load8(sealed_buf + body_n + t)
+        let exp_t = load8(expected + t)
+        diff = int_or(diff, int_xor(got, exp_t))
+        t = t + 1
+    }
+    if diff != 0 {
+        list_set(state, _SRTP_ST_STATS_AUTH_FAIL,
+                 state[_SRTP_ST_STATS_AUTH_FAIL] + 1)
+        return SRTP_AUTH_FAIL
+    }
+    // 5. Decrypt the ciphertext.
+    let ct_buf = sealed_buf + hdr_n
+    let pt = srtp_decrypt(encr_key, salt, ssrc, packet_index, ct_buf, ct_n)
+    // 6. Advance the replay window + ROC + last_seq.
+    _srtp_replay_update(state, packet_index)
+    list_set(state, _SRTP_ST_ROC, est_roc)
+    list_set(state, _SRTP_ST_LAST_SEQ, seq)
+    list_set(state, _SRTP_ST_STATS_OPEN, state[_SRTP_ST_STATS_OPEN] + 1)
+    // 7. Pack the result.
+    let r = list_new()
+    push(r, sealed_buf)        // header buf (alias into the input)
+    push(r, hdr_n)
+    push(r, pt)
+    push(r, ct_n)
+    push(r, packet_index)
+    return r
+}

@@ -1,0 +1,359 @@
+// CrossEngin safety: pure-NOVA ChaCha20 stream cipher (RFC 7539 / RFC 8439).
+//
+// Purpose
+//   The arithmetic primitive used by `src/io/transducers/secure_channel.nova`
+//   for the encrypt half of the PSK secure-channel framework (P1.4 +
+//   continuation of the TLS_AUDIT.md roadmap). ChaCha20 was picked over
+//   AES-GCM specifically because it is pure ARX (add-rotate-xor) over
+//   32-bit integers -- no S-boxes, no table lookups, no constant-time
+//   tricks past the masked rotate/add we already need. Every NOVA primitive
+//   is well-trodden ground here: `int_add`, `int_xor`, `int_and`, `int_or`,
+//   `int_shl`, `int_shr`. The 32-bit unsigned wraps are emulated by
+//   ANDing with 0xFFFFFFFF after each addition / shift / rotate; the
+//   rotate-left is `((x << n) | (x >> (32 - n))) & 0xFFFFFFFF`.
+//   Numbers like 0xFFFFFFFF would normally trip NOVA's pointer-threshold
+//   gotcha #11 above 2^20 in loops, but here every step is masked to 32
+//   bits BEFORE the next shift / add, so no intermediate stays above
+//   2^32; products in a quarter-round (the only place multiplies might
+//   appear) are replaced by chained adds, dodging the multiply path
+//   entirely.
+//
+//   The cipher operates on a 512-bit state laid out as 16 little-endian
+//   32-bit words:
+//     constants[4] = "expand 32-byte k" -> [0x61707865, 0x3320646e, ...]
+//     key[8]       = caller's 256-bit key
+//     counter[1]   = block counter (typically starts at 1; 0 reserved for
+//                    Poly1305 key derivation)
+//     nonce[3]     = 96-bit nonce
+//
+//   A single chacha20_block produces 64 bytes of keystream by running 20
+//   rounds (10 column-rounds + 10 diagonal-rounds interleaved as 10
+//   "double rounds") on a working copy, then adding the original state
+//   word-by-word at the end. The public surface produces an arbitrary
+//   keystream of N bytes via repeated blocks with a monotonically
+//   incrementing counter. XOR with this keystream encrypts / decrypts a
+//   plaintext / ciphertext of equal length.
+//
+// API design note -- byte buffers, not NOVA strings
+//   NOVA strings are C-style NUL-terminated; `"a" + chr(0) + "b"`
+//   truncates to length 1. Crypto inputs and outputs are arbitrary 8-bit
+//   data and routinely contain zero bytes. So this module operates on
+//   `(buf_ptr, len)` byte buffer pairs throughout. The hex-encoded helper
+//   `cc_hex_decode(hex_str) -> [buf, len]` lets tests and the
+//   secure_channel handshake pass keys/nonces as printable hex strings
+//   without ever embedding raw zero bytes in a NOVA string.
+//
+// Public API
+//   chacha20_keystream_buf(key_buf, nonce_buf, counter, n_bytes)
+//       -> a fresh alloc()'d byte buffer of size n_bytes (NUL-terminated
+//          to keep the 8-byte allocator slack happy). 0 on bad lengths.
+//   chacha20_xor_buf(key_buf, nonce_buf, counter, msg_buf, msg_len)
+//       -> [out_buf, msg_len]. Encrypt and decrypt are identical (it's a
+//          stream cipher). 0 on bad lengths.
+//   chacha20_block_buf(key_buf, nonce_buf, counter)
+//       -> a fresh 64-byte block buffer. Mostly for tests.
+//
+//   Convenience (hex-string facade) for ASCII-safe wire formats:
+//     cc_hex_decode(hex_str)            -> [buf, len]  ("aabb" -> 2 bytes)
+//     cc_hex_encode_buf(buf, len)       -> hex string  (always lowercase)
+//
+// Test parity
+//   tests/unit/test_chacha20.nova covers the RFC 7539 test vectors:
+//     * 2.1.1 quarter-round sanity (a,b,c,d before/after).
+//     * 2.3.2 block function single block (key=00..1f, nonce=00..09 00 00 00,
+//             counter=1) -- the canonical first-block test.
+//     * 2.4.2 short-message encryption (the "Ladies and Gentlemen..." text)
+//             against the published ciphertext.
+//
+// ADRs touched: TLS_AUDIT.md (PSK-only secure channel above the curl shim).
+// NOVA dependencies: builtins only -- int_add, int_and, int_or, int_xor,
+//   int_shl, int_shr, alloc, store8, load8, char_at, chr, len.
+// CrossEngin dependencies: none -- pure leaf primitive.
+
+// ---- 32-bit unsigned helpers ----------------------------------------------
+//
+// NOVA's int is 64-bit signed under the hood. We emulate 32-bit unsigned
+// by masking with 0xFFFFFFFF = 4294967295 after each operation that could
+// grow past 32 bits. The mask itself is a let-const so it never appears
+// as a smart-op literal inside the hot loop.
+let CC_MASK32 = 4294967295    // 0xFFFFFFFF
+
+fn _cc_mask32(x) {
+    return int_and(x, CC_MASK32)
+}
+
+fn _cc_add32(a, b) {
+    return _cc_mask32(int_add(a, b))
+}
+
+fn _cc_xor32(a, b) {
+    return _cc_mask32(int_xor(a, b))
+}
+
+// 32-bit rotate-left: ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+// `n` must be in 1..31; we never call with 0 or 32 in ChaCha20.
+fn _cc_rotl32(x, n) {
+    let left  = _cc_mask32(int_shl(x, n))
+    let right = int_shr(x, 32 - n)
+    return _cc_mask32(int_or(left, right))
+}
+
+// ---- little-endian byte/word conversions (over alloc'd byte buffers) -----
+//
+// ChaCha20 is little-endian throughout: words on the wire / in the key are
+// stored low-byte-first. We read four bytes from a buffer at offset `off`
+// and assemble a 32-bit word; we write one with four store8s.
+
+fn _cc_load_le32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = b0
+    v = int_or(v, int_shl(b1, 8))
+    v = int_or(v, int_shl(b2, 16))
+    v = int_or(v, int_shl(b3, 24))
+    return _cc_mask32(v)
+}
+
+fn _cc_store_le32(buf, off, w) {
+    store8(buf + off + 0, int_and(w, 255))
+    store8(buf + off + 1, int_and(int_shr(w, 8), 255))
+    store8(buf + off + 2, int_and(int_shr(w, 16), 255))
+    store8(buf + off + 3, int_and(int_shr(w, 24), 255))
+    return 1
+}
+
+// ---- ChaCha20 state setup -------------------------------------------------
+//
+// The 16-word state layout (each entry is a 32-bit word):
+//   [ 0] = "expa"   constant 0x61707865
+//   [ 1] = "nd 3"   constant 0x3320646e
+//   [ 2] = "2-by"   constant 0x79622d32
+//   [ 3] = "te k"   constant 0x6b206574
+//   [ 4..11] = key[0..7]      (8 little-endian words from the 32-byte key)
+//   [12]     = counter
+//   [13..15] = nonce[0..2]    (3 little-endian words from the 12-byte nonce)
+
+let CC_CONST_0 = 1634760805   // 0x61707865 "expa"
+let CC_CONST_1 = 857760878    // 0x3320646e "nd 3"
+let CC_CONST_2 = 2036477234   // 0x79622d32 "2-by"
+let CC_CONST_3 = 1797285236   // 0x6b206574 "te k"
+
+// Build the initial 16-word state list from a 32-byte key buffer + 12-byte
+// nonce buffer + counter. Caller is responsible for buffer sizes (we don't
+// know the lengths from a raw pointer alone).
+fn _cc_state_init(key_buf, nonce_buf, counter) {
+    let s = list_new()
+    push(s, CC_CONST_0)
+    push(s, CC_CONST_1)
+    push(s, CC_CONST_2)
+    push(s, CC_CONST_3)
+    let i = 0
+    while i < 8 {
+        push(s, _cc_load_le32(key_buf, i * 4))
+        i = i + 1
+    }
+    push(s, _cc_mask32(counter))
+    let j = 0
+    while j < 3 {
+        push(s, _cc_load_le32(nonce_buf, j * 4))
+        j = j + 1
+    }
+    return s
+}
+
+// ---- the quarter round ----------------------------------------------------
+//
+// RFC 7539 2.1:
+//   a += b; d ^= a; d <<<= 16
+//   c += d; b ^= c; b <<<= 12
+//   a += b; d ^= a; d <<<=  8
+//   c += d; b ^= c; b <<<=  7
+//
+// We pass the four indices into the state list, mutate in place. Every
+// addition is masked to 32 bits, every rotate is masked inside _cc_rotl32.
+fn _cc_quarter_round(s, ai, bi, ci, di) {
+    let a = s[ai]
+    let b = s[bi]
+    let c = s[ci]
+    let d = s[di]
+    a = _cc_add32(a, b)
+    d = _cc_xor32(d, a)
+    d = _cc_rotl32(d, 16)
+    c = _cc_add32(c, d)
+    b = _cc_xor32(b, c)
+    b = _cc_rotl32(b, 12)
+    a = _cc_add32(a, b)
+    d = _cc_xor32(d, a)
+    d = _cc_rotl32(d, 8)
+    c = _cc_add32(c, d)
+    b = _cc_xor32(b, c)
+    b = _cc_rotl32(b, 7)
+    list_set(s, ai, a)
+    list_set(s, bi, b)
+    list_set(s, ci, c)
+    list_set(s, di, d)
+    return 1
+}
+
+// One double-round: 4 column QRs + 4 diagonal QRs.
+fn _cc_double_round(s) {
+    _cc_quarter_round(s, 0, 4,  8, 12)
+    _cc_quarter_round(s, 1, 5,  9, 13)
+    _cc_quarter_round(s, 2, 6, 10, 14)
+    _cc_quarter_round(s, 3, 7, 11, 15)
+    _cc_quarter_round(s, 0, 5, 10, 15)
+    _cc_quarter_round(s, 1, 6, 11, 12)
+    _cc_quarter_round(s, 2, 7,  8, 13)
+    _cc_quarter_round(s, 3, 4,  9, 14)
+    return 1
+}
+
+// Produce one 64-byte keystream block into a fresh 65-byte buffer (extra
+// trailing NUL so the buffer remains substr/string-friendly when the
+// content is ASCII-safe).
+fn chacha20_block_buf(key_buf, nonce_buf, counter) {
+    let state = _cc_state_init(key_buf, nonce_buf, counter)
+    let orig = list_new()
+    let oi = 0
+    while oi < 16 {
+        push(orig, state[oi])
+        oi = oi + 1
+    }
+    // 10 double-rounds = 20 rounds.
+    let r = 0
+    while r < 10 {
+        _cc_double_round(state)
+        r = r + 1
+    }
+    // Final add (mod 2^32) and serialize little-endian.
+    let out = alloc(65)
+    let i = 0
+    while i < 16 {
+        let w = _cc_add32(state[i], orig[i])
+        _cc_store_le32(out, i * 4, w)
+        i = i + 1
+    }
+    store8(out + 64, 0)
+    return out
+}
+
+// Produce n_bytes of keystream by generating ceil(n_bytes/64) blocks with
+// the counter incrementing by 1 each block, and truncating the last one.
+// Returns a fresh alloc'd buffer of (n_bytes + 1) capacity (NUL-terminated).
+fn chacha20_keystream_buf(key_buf, nonce_buf, counter, n_bytes) {
+    if n_bytes <= 0 { return 0 }
+    let out = alloc(n_bytes + 1)
+    let produced = 0
+    let ctr = counter
+    while produced < n_bytes {
+        let blk = chacha20_block_buf(key_buf, nonce_buf, ctr)
+        let remaining = n_bytes - produced
+        let take = 64
+        if remaining < 64 { take = remaining }
+        let k = 0
+        while k < take {
+            store8(out + produced + k, load8(blk + k))
+            k = k + 1
+        }
+        produced = produced + take
+        ctr = ctr + 1
+    }
+    store8(out + n_bytes, 0)
+    return out
+}
+
+// Encrypt (or decrypt; it's a stream cipher) by XORing each byte of the
+// `msg_buf` (msg_len bytes long) with the keystream byte at the same
+// offset. Returns a fresh alloc'd buffer of (msg_len + 1) capacity.
+fn chacha20_xor_buf(key_buf, nonce_buf, counter, msg_buf, msg_len) {
+    if msg_len <= 0 { return 0 }
+    let ks = chacha20_keystream_buf(key_buf, nonce_buf, counter, msg_len)
+    let out = alloc(msg_len + 1)
+    let i = 0
+    while i < msg_len {
+        let mb = load8(msg_buf + i)
+        let kb = load8(ks + i)
+        store8(out + i, int_xor(mb, kb))
+        i = i + 1
+    }
+    store8(out + msg_len, 0)
+    return out
+}
+
+// ---- hex codec ------------------------------------------------------------
+//
+// Helpers for moving raw bytes through NOVA strings (which can't hold raw
+// zero bytes). Used by the test vectors and the secure_channel PSK setup.
+
+fn _cc_hex_nibble(c) {
+    if c >= 48 { if c <= 57 { return c - 48 } }           // '0'..'9'
+    if c >= 97 { if c <= 102 { return c - 87 } }          // 'a'..'f'
+    if c >= 65 { if c <= 70  { return c - 55 } }          // 'A'..'F'
+    return -1
+}
+
+fn _cc_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87    // 'a'..'f'
+}
+
+// Decode a hex string into a freshly allocated byte buffer. Returns
+// [buf, byte_len] on success, 0 on malformed input (odd length, bad char).
+fn cc_hex_decode(hex_str) {
+    let n = len(hex_str)
+    if n == 0 { return 0 }
+    let half = int_shr(n, 1)
+    if int_shl(half, 1) != n { return 0 }
+    let buf = alloc(half + 1)
+    let i = 0
+    while i < half {
+        let hi = _cc_hex_nibble(char_at(hex_str, i * 2))
+        let lo = _cc_hex_nibble(char_at(hex_str, i * 2 + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        store8(buf + i, int_or(int_shl(hi, 4), lo))
+        i = i + 1
+    }
+    store8(buf + half, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, half)
+    return out
+}
+
+// Encode a byte buffer of length `len` as a lowercase hex string. The
+// output is always ASCII-safe so the standard NOVA string concat works.
+fn cc_hex_encode_buf(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = load8(buf + i)
+        let hi = _cc_nibble_hex(int_and(int_shr(b, 4), 15))
+        let lo = _cc_nibble_hex(int_and(b, 15))
+        s = s + chr(hi) + chr(lo)
+        i = i + 1
+    }
+    return s
+}
+
+// ---- test-helper exports (NOT public) -------------------------------------
+//
+// These names are intentionally underscore-prefixed; the unit test imports
+// the module and reaches in to validate quarter-round + state setup against
+// RFC 7539 section 2.1.1 / 2.3.2 worked examples.
+fn _cc_test_quarter_round(a, b, c, d) {
+    let s = list_new()
+    push(s, a); push(s, b); push(s, c); push(s, d)
+    _cc_quarter_round(s, 0, 1, 2, 3)
+    return s
+}
+
+fn _cc_test_rotl32(x, n) {
+    return _cc_rotl32(x, n)
+}
+
+fn _cc_test_add32(a, b) {
+    return _cc_add32(a, b)
+}

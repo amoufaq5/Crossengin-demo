@@ -1,0 +1,2183 @@
+// CrossEngin io/transducers: stereo block-matching disparity + depth (R7E,
+// P3.3 cont. image structural feature -- the fifth pipeline after Sobel +
+// Harris + SIFT + Canny + ORB).
+//
+// Purpose
+//   The CV pipeline so far operates on a SINGLE image: edge gradients
+//   (Sobel / Canny), corner / keypoint features (Harris / SIFT / ORB),
+//   per-frame motion (video_motion_vectors). None of those recover the
+//   missing third dimension. Stereo block matching is the simplest
+//   integer-only path to a PER-PIXEL DEPTH estimate: feed two
+//   horizontally-separated images of the same scene (left + right,
+//   conventionally captured by a stereo camera rig with a known baseline)
+//   and compute a DISPARITY map -- the per-pixel horizontal shift between
+//   the two views. Disparity converts to metric depth via the well-known
+//   `depth = baseline * focal_length / disparity` similar-triangles
+//   formula; the closer an object, the larger its disparity.
+//
+//   Block matching with Sum-of-Absolute-Differences (SAD) is the
+//   textbook approach: for each pixel (x, y) in the LEFT image, extract a
+//   WIN_SIZE x WIN_SIZE block centered there, then slide that block along
+//   the SAME scanline in the RIGHT image from x down to x - MAX_DISP and
+//   compute the SAD at each offset. The disparity at (x, y) is the offset
+//   that MINIMIZES SAD. The output is a disparity map (same dimensions as
+//   the left image) encoded as 8-bit bytes (disparity values clipped to
+//   0..255 after a configurable scale factor so MAX_DISP = 64 lights up
+//   the full 0..255 range when scale = 4).
+//
+//   SAD was chosen over normalized cross-correlation (NCC) and the more
+//   sophisticated semi-global matching (SGM) for the same reason PGM was
+//   chosen over JPEG: it is the simplest STANDARDIZED algorithm that
+//   produces a structurally interesting feature, with NO division in the
+//   inner loop and NO floating-point operations. The entire thing fits
+//   in ~400 lines of pure-NOVA with no smoothing, no left-right
+//   consistency check, no sub-pixel refinement. SGM + LR check are
+//   follow-ups; see IMAGE_AUDIT.md for the roadmap.
+//
+// Algorithm (per pixel):
+//   for y in [WIN_HALF .. height - WIN_HALF):
+//     for x in [WIN_HALF .. width - WIN_HALF):
+//       best_sad = INT_MAX
+//       best_d   = 0
+//       max_d    = min(MAX_DISP, x - WIN_HALF)
+//       for d in [0 .. max_d]:
+//         sad = sum over (dx, dy) in WIN_SIZE x WIN_SIZE of:
+//                 abs(left(x + dx, y + dy) - right(x + dx - d, y + dy))
+//         if sad < best_sad:
+//           best_sad = sad
+//           best_d   = d
+//       disp_map[y * width + x] = best_d
+//
+// Depth formula (similar triangles, pinhole camera):
+//   depth(mm) = baseline(mm) * focal(px) / disparity(px)
+//   disparity == 0 -> infinity; we clamp at STEREO_MAX_DEPTH_MM (a
+//   sentinel meaning "as far as we can tell, this point is at infinity").
+//
+// Public API
+//   stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+//       -> [disparity_map, mean_disparity, density_milli, total_pixels]
+//          where:
+//            disparity_map -- ptr to width*height bytes (0..MAX_DISP),
+//                             caller frees if needed (we keep it alive
+//                             for accessor calls).
+//            mean_disparity -- int average over VALID interior pixels.
+//            density_milli  -- per-thousand pixels with disparity > 0
+//                              (textured / matchable region count).
+//            total_pixels   -- width * height (cap-respecting).
+//   stereo_depth(disp_map, width, height, baseline_mm, focal_pixels)
+//       -> ptr to width*height ints (depth in mm, clamped at
+//          STEREO_MAX_DEPTH_MM for disparity 0).
+//   stereo_depth_at(depth_map, width, x, y) -> int (mm)
+//   stereo_disparity_at(disp_map, width, x, y) -> int (raw disparity 0..MAX)
+//   stereo_density_label(density_milli) ->
+//       "image_stereo_density_low" / "_mid" / "_high"
+//   stereo_result_map(r)       -> ptr (disparity bytes)
+//   stereo_result_mean(r)      -> int (mean disparity over valid pixels)
+//   stereo_result_density(r)   -> int (milli)
+//   stereo_result_total(r)     -> int (total pixels)
+//   stereo_sad_block(left_ptr, right_ptr, width, x_l, x_r, y, win_size)
+//       -> int (raw SAD over the WIN_SIZE x WIN_SIZE block; exposed for
+//          unit-tests + future SGM extension).
+//
+// Quality API (R8D follow-ups, separate from the back-compat integer path):
+//   stereo_disparity_lr_check(left, right, w, h, win_size, max_disp,
+//                              lr_tolerance)
+//       -> [disparity_map, mean, density_milli, total]
+//          Same shape as stereo_disparity but bytes equal 0 wherever the
+//          left->right and right->left disparities disagree by more than
+//          `lr_tolerance` pixels (textbook default 1). Rejects occlusions,
+//          texture-less regions, and depth discontinuities cleanly. Pass
+//          0 as `lr_tolerance` to use STEREO_DEFAULT_LR_TOLERANCE.
+//   stereo_disparity_subpx(left, right, w, h, win_size, max_disp)
+//       -> [disp_milli_list, mean_milli, density_milli, total]
+//          disp_milli_list is a LIST OF INTS (not bytes) holding
+//          milli-disparity (int(d_subpx * 1000)). Sub-pixel refinement is
+//          a parabolic fit through SAD at d*-1, d*, d*+1; on a degenerate
+//          parabola (denominator 0) we fall back to integer * 1000.
+//   stereo_disparity_quality(left, right, w, h, win_size, max_disp,
+//                            lr_tolerance)
+//       -> [disp_milli_list, mean_milli_valid, density_milli, total]
+//          Combined: LR-check rejects bad matches FIRST (their
+//          milli-disparity reads 0), then sub-pixel refines survivors.
+//   stereo_disparity_milli_at(list, width, x, y) -> int (milli units)
+//   stereo_quality_milli_at(list, width, x, y)   -> int (alias)
+//   stereo_quality_pgm_paths(path_l, path_r)
+//       -> formatted string for the optional /depth_q chat admin (mean
+//          milli-disparity + density bucket).
+//   stereo_quality_pgm_args(arg)
+//       -> dispatch wrapper that splits `arg` on the first space.
+//
+// SGM API (R9A follow-up; cost aggregated along 4 scanline paths):
+//   stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2)
+//       -> [disp_map_bytes, mean, density_milli, total]
+//          Semi-global matching with 4 paths (LR + TB + RL + BT). p1=0
+//          / p2=0 use defaults (8 and 32). Cap dims at 128x128 with
+//          MAX_DISP <= 64 to keep the cost volume under 4MB.
+//   stereo_disparity_sgm_quality(left, right, w, h, win_size, max_disp,
+//                                p1, p2, lr_tolerance)
+//       -> [milli_list, mean_milli, density_milli, total]
+//          SGM + LR-check + sub-pixel parabolic refinement on the
+//          aggregated cost.
+//   stereo_sgm_pgm_paths(path_l, path_r)
+//       -> formatted "(depth_sgm WxH mean_disp=N density=M LABEL)" line
+//          for the optional /depth_sgm chat admin.
+//   stereo_sgm_pgm_args(arg)
+//       -> dispatch wrapper that splits `arg` on the first space.
+//
+// Pixel-area cap: STEREO_MAX_DIM = 256 per axis (max area 65536). The
+// inner loop runs in O(W * H * MAX_DISP * WIN_SIZE^2). With WIN_SIZE=7
+// and MAX_DISP=64 that is 49 * 64 = 3136 ops per pixel. At 256x256
+// that's ~205M ops -- the upper bound for a sane wall-clock on the
+// chat's per-command latency. Real callers downsample first.
+//
+// Density classifier (over VALID interior pixels with non-zero disparity):
+//   low  : density <  100 milli (mostly textureless / no-match scene)
+//   mid  : 100 milli <= density < 500 milli (typical photo)
+//   high : density >= 500 milli (heavily textured / many matches)
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, char_at, substr, int_to_str.
+//   No sys_* (no I/O); the chat-admin helper calls pgm_parse_file from
+//   image_pgm.nova which does the I/O.
+// CrossEngin dependencies: image_pgm.nova for the chat-admin helper
+//   (stereo_pgm_args / stereo_pgm_paths). The core algorithm has no
+//   intra-CrossEngin dependencies.
+
+import "image_pgm.nova"
+
+// ---- format constants ----------------------------------------------------
+
+// Hard cap on pixel area. 256 * 256 = 65536 == 2^16, comfortably under
+// the NOVA codegen pointer-threshold ceiling (#11). Stereo costs more
+// per-pixel than Sobel / Harris (the disparity scan multiplies inner
+// work by MAX_DISP) so the cap is tighter than Sobel's 512 ceiling.
+let STEREO_MAX_DIM        = 256
+let STEREO_MAX_PIXEL_AREA = 65536
+
+// Default block-matching window size. 7x7 is the textbook choice --
+// large enough for SAD to discriminate matching texture from noise,
+// small enough that the inner double loop fits in cache. Callers can
+// override via the `win_size` argument (clamped to 3..15, odd).
+let STEREO_DEFAULT_WIN_SIZE = 7
+
+// Minimum / maximum window size. WIN_SIZE must be odd (so we have a
+// center pixel) and >= 3 (smaller is degenerate). 15 is the cap so
+// the inner loop stays a reasonable size.
+let STEREO_MIN_WIN_SIZE = 3
+let STEREO_MAX_WIN_SIZE = 15
+
+// Default maximum disparity to search. 64 is the textbook ceiling for
+// 256x256 (a disparity-64 shift corresponds to a very close object at
+// typical baseline/focal ratios). Callers can override.
+let STEREO_DEFAULT_MAX_DISP = 64
+
+// Maximum disparity cap. We never search past STEREO_MAX_DISP_CAP
+// regardless of the caller's max_disp argument -- larger values blow
+// past the 65536 inner-loop budget.
+let STEREO_MAX_DISP_CAP = 128
+
+// Depth-formula sentinel: when disparity is zero we say "infinity" and
+// return STEREO_MAX_DEPTH_MM. 100 metres is far enough that downstream
+// code can treat the value as "unknown / no depth" without specialcasing.
+let STEREO_MAX_DEPTH_MM = 100000
+
+// Density bucket boundaries (in milli units = per thousand pixels with
+// non-zero disparity, over the interior of the image).
+let STEREO_DENSITY_MID_MIN  = 100
+let STEREO_DENSITY_HIGH_MIN = 500
+
+// Default left-right consistency tolerance (R8D). Textbook stereo papers
+// use 1 pixel as the threshold past which a left->right vs right->left
+// mismatch is treated as occlusion / depth discontinuity / textureless
+// region. Callers can pass a larger value (e.g. 2) for noisier inputs.
+let STEREO_DEFAULT_LR_TOLERANCE = 1
+let STEREO_MAX_LR_TOLERANCE     = 8
+
+// Milli-disparity sentinel: an "invalid / rejected by LR-check" pixel
+// stores 0, indistinguishable from a true zero-disparity match. That is
+// fine: zero disparity means "object at infinity" which is also unknown
+// depth in practice. The sub-pixel encoding multiplies integer disparity
+// by 1000 so a true integer-10 match reads ~10000 (+- parabola drift).
+let STEREO_MILLI_PER_UNIT = 1000
+
+// Result tuple slot indices.
+let STEREO_R_MAP     = 0
+let STEREO_R_MEAN    = 1
+let STEREO_R_DENSITY = 2
+let STEREO_R_TOTAL   = 3
+
+// Feature-label strings (mirror image_orb / image_canny convention).
+let STEREO_LABEL_DENSITY_LOW  = "image_stereo_density_low"
+let STEREO_LABEL_DENSITY_MID  = "image_stereo_density_mid"
+let STEREO_LABEL_DENSITY_HIGH = "image_stereo_density_high"
+
+// ---- result helpers ------------------------------------------------------
+
+fn _stereo_result(map, mean, density, total) {
+    let r = list_new()
+    push(r, map)
+    push(r, mean)
+    push(r, density)
+    push(r, total)
+    return r
+}
+
+fn _stereo_fail() {
+    return _stereo_result(0, 0, 0, 0)
+}
+
+// Allocate an all-zero map for the failure / degenerate paths. Keeps the
+// accessor contract uniform (`stereo_result_map` always returns a non-zero
+// pointer on a successful call; failure paths return 0 explicitly).
+fn _stereo_zero_map(area) {
+    let m = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(m + i, 0)
+        i = int_add(i, 1)
+    }
+    store8(m + area, 0)
+    return m
+}
+
+// ---- SAD inner loop ------------------------------------------------------
+//
+// stereo_sad_block(left_ptr, right_ptr, width, x_l, x_r, y, win_size) -> int
+//   Sum of absolute differences over the WIN_SIZE x WIN_SIZE block
+//   centered at (x_l, y) in `left_ptr` vs (x_r, y) in `right_ptr`.
+//   The caller is responsible for bounds-checking; we trust that
+//   x_l - half >= 0, x_l + half < width, x_r - half >= 0, x_r + half < width,
+//   y - half >= 0, y + half < height. The disparity-search loop in
+//   stereo_disparity respects these bounds.
+
+fn stereo_sad_block(left_ptr, right_ptr, width, x_l, x_r, y, win_size) {
+    let half = win_size / 2
+    let sad = 0
+    let dy = 0 - half
+    while dy <= half {
+        let row_off = int_mul(int_add(y, dy), width)
+        let dx = 0 - half
+        while dx <= half {
+            let l_val = load8(left_ptr  + int_add(row_off, int_add(x_l, dx)))
+            let r_val = load8(right_ptr + int_add(row_off, int_add(x_r, dx)))
+            let d = int_sub(l_val, r_val)
+            if d < 0 { d = 0 - d }
+            sad = int_add(sad, d)
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    return sad
+}
+
+// ---- R12A: SIMD-accelerated SAD (uses R11D simd_sum_abs_diff) -----------
+//
+// stereo_sad_block_simd(left, right, width, x_l, x_r, y, win_size,
+//                       l_buf, r_buf) -> int
+//   Stages the WIN_SIZE x WIN_SIZE window into i32 lane buffers (l_buf,
+//   r_buf) row-major, then invokes simd_sum_abs_diff() which lowers to:
+//     Linux x86-64   -> AVX2 vpaddd/vpsubd/vpabsd (8 i32 lanes per insn)
+//     Linux ARM64    -> NEON 2x 128-bit add/sub/abs
+//     other targets  -> R11D scalar fallback (8-iter loop)
+//   Caller allocs l_buf and r_buf via alloc((win*win + 8) * 4) ONCE and
+//   reuses across (x_l, x_r) pairs in a scanline. Bit-identical to
+//   stereo_sad_block (each |l - r| <= 255; sum over WIN_SIZE^2 fits in
+//   i32 for the maximum 15x15 window: 225 * 255 = 57375 << 2^31).
+
+fn _stereo_store_i32_le(buf, idx, v) {
+    let off = int_mul(idx, 4)
+    let u = v
+    if v < 0 { u = int_sub(4294967296, int_sub(0, v)) }
+    store8(int_add(buf, off),                     u % 256)
+    store8(int_add(buf, int_add(off, 1)),         int_div(u, 256) % 256)
+    store8(int_add(buf, int_add(off, 2)),         int_div(u, 65536) % 256)
+    store8(int_add(buf, int_add(off, 3)),         int_div(u, 16777216) % 256)
+}
+
+// Zero the first n_lanes i32 lanes (4*n_lanes bytes). Caller invokes
+// once per SIMD scan so per-pixel staging only writes the LOW byte at
+// 4*idx -- the upper 3 bytes stay zero across the buffer's lifetime.
+fn _stereo_zero_i32_buf(buf, n_lanes) {
+    let bytes = int_mul(n_lanes, 4)
+    let i = 0
+    while i < bytes {
+        store8(int_add(buf, i), 0)
+        i = int_add(i, 1)
+    }
+}
+
+fn stereo_sad_block_simd(left_ptr, right_ptr, width, x_l, x_r, y, win_size,
+                         l_buf, r_buf) {
+    let half = win_size / 2
+    let n = int_mul(win_size, win_size)
+    // Pixels are 0..255 so the i32 lane only needs the LOW byte. The
+    // upper 3 bytes were zeroed once by the caller (in
+    // _stereo_disparity_simd_inner) and stay zero, so we skip the
+    // expensive 4-byte store_i32_le per cell.
+    let i = 0
+    let dy = 0 - half
+    while dy <= half {
+        let row_off = int_mul(int_add(y, dy), width)
+        let dx = 0 - half
+        while dx <= half {
+            let l_val = load8(left_ptr  + int_add(row_off, int_add(x_l, dx)))
+            let r_val = load8(right_ptr + int_add(row_off, int_add(x_r, dx)))
+            let lane_off = int_mul(i, 4)
+            store8(int_add(l_buf, lane_off), l_val)
+            store8(int_add(r_buf, lane_off), r_val)
+            i = int_add(i, 1)
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    return simd_sum_abs_diff(l_buf, r_buf, n)
+}
+
+// _stereo_simd_enabled() -> 1 if CE_STEREO_SIMD env var is unset or "on"
+//   (default-on), 0 if set to "off". A/B toggle for the bench script.
+fn _stereo_simd_enabled() {
+    let env = getenv("CE_STEREO_SIMD")
+    if env == 0       { return 1 }
+    if len(env) == 0  { return 1 }
+    if str_eq(env, "off") == 1 { return 0 }
+    if str_eq(env, "0")   == 1 { return 0 }
+    if str_eq(env, "no")  == 1 { return 0 }
+    return 1
+}
+
+// ---- R15A: u8 raw-byte SIMD SAD (uses R14B simd_sad_u8) ------------------
+//
+// R12A/R13A's stereo_sad_block_simd stages each pixel into a 4-byte i32
+// lane (1 store8 per pixel + zeroed top 3 bytes) and reduces via
+// `simd_sum_abs_diff`. That cuts the inner-loop SAD reduction cost but
+// leaves a 4x staging-bandwidth overhead vs the raw-byte width the data
+// actually has -- pixels are 0..255 so the upper 3 bytes of each i32 lane
+// are pure padding.
+//
+// R14B (NOVA codegen) lands `simd_sad_u8(a_ptr, b_ptr, n_bytes) -> int`,
+// a primitive that operates DIRECTLY on raw u8 byte buffers via AVX2
+// `vpsadbw` (32 bytes -> 4 i64 partials per instruction; tail is a 1-byte
+// scalar loop). This eliminates the i32 staging entirely -- one byte per
+// pixel into a contiguous buffer, period.
+//
+// The block-shape complication: a WIN_SIZE x WIN_SIZE block in a `width`-
+// strided image is NOT contiguous in memory; the 7 rows of 7 bytes sit
+// `width - 7` bytes apart. We can't just point simd_sad_u8 at the image
+// origin -- it would SAD over `n_bytes` of contiguous pixels including
+// the wrong intermediate columns. So we PACK the WIN_SIZE^2 bytes of
+// each block into a contiguous byte buffer, then call simd_sad_u8 once
+// on the packed buffers. The packing pays one store8 per cell (vs R12A's
+// also-one store8 per cell, but only the low byte of an i32 lane); the
+// win is the lane width -- 32 byte SAD per AVX2 instruction vs 8 i32
+// lanes per instruction in the R12A i32x8 path. That's 4x fewer
+// instructions over the inner loop on top of the staging-bandwidth saving.
+//
+// Optimization: the LEFT window at (x_l, y) is CONSTANT across the
+// disparity search at that pixel, so we pack LEFT ONCE per (x_l, y) and
+// reuse the packed buffer across all `d` iterations. Only the RIGHT
+// window changes with d. Saves ~md packs per pixel.
+//
+// stereo_sad_block_u8(left, right, width, x_l, x_r, y, ws, l_buf, r_buf)
+//   -> int
+//     Pack the win_size x win_size LEFT and RIGHT windows into l_buf /
+//     r_buf as contiguous bytes (row-major), then SAD via simd_sad_u8.
+//     Caller pre-allocs both buffers as alloc(ws * ws + 8) (the +8 is
+//     scratch headroom matching the i32 path's convention). For the
+//     callers that pack LEFT once per pixel, the public _block_u8 helper
+//     keeps the same contract as _block_simd -- pack both -- to stay
+//     useful in standalone unit tests.
+
+// Pack the WIN_SIZE x WIN_SIZE window centered at (x_center, y_center)
+// into the contiguous byte buffer `buf` (row-major). Uses NOVA's
+// `memcpy_raw` builtin (`rep movsb`) one row at a time -- ws bytes per
+// row -- which is materially faster than the obvious 49x (load8,
+// store8) double loop the i32 path needed for byte-into-int4 staging.
+// Each `memcpy_raw` lowers to a single tight CPU `rep movsb`; on
+// modern x86-64 this is uop-fused for the chunk-loop, so 7 bytes is
+// effectively one micro-coded instruction.
+fn _stereo_pack_block_u8(src_ptr, width, x_center, y_center, half, ws, buf) {
+    let row_bytes = ws
+    let dy = 0 - half
+    let dst = buf
+    while dy <= half {
+        let src_row = src_ptr + int_mul(int_add(y_center, dy), width)
+                              + int_sub(x_center, half)
+        memcpy_raw(dst, src_row, row_bytes)
+        dst = int_add(dst, row_bytes)
+        dy = int_add(dy, 1)
+    }
+}
+
+fn stereo_sad_block_u8(left_ptr, right_ptr, width, x_l, x_r, y, win_size,
+                       l_buf, r_buf) {
+    let half = win_size / 2
+    let n = int_mul(win_size, win_size)
+    _stereo_pack_block_u8(left_ptr,  width, x_l, y, half, win_size, l_buf)
+    _stereo_pack_block_u8(right_ptr, width, x_r, y, half, win_size, r_buf)
+    return simd_sad_u8(l_buf, r_buf, n)
+}
+
+// _stereo_u8_simd_enabled() -> 1 if CE_STEREO_U8_SIMD env var is set to
+//   "on"/"1"/"yes" (default OFF; opt-in for the bench script + future
+//   default-on flip when we have wider end-to-end validation). Separate
+//   from CE_STEREO_SIMD so the i32 path and the u8 path can be A/B'd
+//   independently.
+fn _stereo_u8_simd_enabled() {
+    let env = getenv("CE_STEREO_U8_SIMD")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// _stereo_disparity_u8_simd_inner: same inner-loop shape as the i32
+//   variant, but uses the packed-byte SAD primitive. Packs LEFT ONCE per
+//   (x_l, y) and reuses across the d-loop (the LEFT window is constant
+//   while d shifts the RIGHT window). The RIGHT pack runs once per d.
+fn _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                    ws, md, area, half) {
+    let n = int_mul(ws, ws)
+    // 8-byte scratch headroom past the actual win_size^2 footprint to
+    // mirror the i32-buf convention and give vpsadbw's 32-byte chunk
+    // loop a safe over-read landing zone on tail iterations.
+    let buf_bytes = int_add(n, 8)
+    let l_buf = alloc(buf_bytes)
+    let r_buf = alloc(buf_bytes)
+
+    let map = _stereo_zero_map(area)
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            // Pack LEFT window ONCE per pixel; constant across the d loop.
+            _stereo_pack_block_u8(left_ptr, width, x, y, half, ws, l_buf)
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                _stereo_pack_block_u8(right_ptr, width, int_sub(x, d), y, half, ws, r_buf)
+                let sad = simd_sad_u8(l_buf, r_buf, n)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            store8(map + int_add(row_off, x), best_d)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, best_d)
+            if best_d > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// stereo_disparity_u8_simd(left, right, w, h, win_size, max_disp)
+//   -> same shape as stereo_disparity. Explicit u8-SIMD entry-point.
+//   Falls back to stereo_disparity (which itself may route through the
+//   i32 SIMD path or scalar) when CE_STEREO_U8_SIMD is not "on".
+fn stereo_disparity_u8_simd(left_ptr, right_ptr, width, height, win_size, max_disp) {
+    if width <= 0   { return _stereo_fail() }
+    if height <= 0  { return _stereo_fail() }
+    if left_ptr == 0  { return _stereo_fail() }
+    if right_ptr == 0 { return _stereo_fail() }
+    if width > STEREO_MAX_DIM  { return _stereo_fail() }
+    if height > STEREO_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_fail() }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let half = ws / 2
+    if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if _stereo_u8_simd_enabled() == 0 {
+        return stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+    }
+    return _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                            ws, md, area, half)
+}
+
+// ---- normalisation helpers ----------------------------------------------
+
+fn _stereo_clamp_win_size(win_size) {
+    if win_size < STEREO_MIN_WIN_SIZE { return STEREO_DEFAULT_WIN_SIZE }
+    if win_size > STEREO_MAX_WIN_SIZE { return STEREO_MAX_WIN_SIZE }
+    // Force odd. (win_size & 1 == 0) -> add 1.
+    let r = win_size
+    let two = 2
+    let q = r / two
+    let twice_q = int_mul(two, q)
+    if twice_q == r { r = int_add(r, 1) }
+    if r > STEREO_MAX_WIN_SIZE { r = STEREO_MAX_WIN_SIZE }
+    return r
+}
+
+fn _stereo_clamp_max_disp(max_disp) {
+    if max_disp <= 0 { return STEREO_DEFAULT_MAX_DISP }
+    if max_disp > STEREO_MAX_DISP_CAP { return STEREO_MAX_DISP_CAP }
+    return max_disp
+}
+
+// ---- core: block-matching disparity --------------------------------------
+//
+// stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+//   -> [disp_map, mean, density_milli, total]
+//
+// Border pixels (where the WIN_SIZE x WIN_SIZE block would fall off the
+// image) keep disparity 0. Interior pixels run the SAD search and store
+// the best offset (0..max_disp).
+
+fn stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp) {
+    if width <= 0   { return _stereo_fail() }
+    if height <= 0  { return _stereo_fail() }
+    if left_ptr == 0  { return _stereo_fail() }
+    if right_ptr == 0 { return _stereo_fail() }
+    if width > STEREO_MAX_DIM  { return _stereo_fail() }
+    if height > STEREO_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_fail() }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let half = ws / 2
+    // Image must be big enough to hold the window AND have at least one
+    // disparity offset to test on the right side.
+    if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+
+    // R15A: u8 raw-byte SIMD wiring. Opt-in via CE_STEREO_U8_SIMD=on
+    // (default OFF until wider end-to-end validation). When enabled, routes
+    // through the simd_sad_u8 primitive (AVX2 vpsadbw on 32-byte chunks)
+    // and bypasses the R12A i32 staging entirely. Same bit-identical
+    // disparity map; expected 3-4x absolute speedup on textured fixtures.
+    if _stereo_u8_simd_enabled() == 1 {
+        return _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                                ws, md, area, half)
+    }
+    // R12A: SIMD wiring. Default-on (CE_STEREO_SIMD unset or "on") routes
+    // through the bit-identical AVX2/NEON path; CE_STEREO_SIMD=off
+    // preserves the scalar inner loop for A/B benchmarking.
+    if _stereo_simd_enabled() == 1 {
+        return _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
+                                            ws, md, area, half)
+    }
+
+    let map = _stereo_zero_map(area)
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    // Interior y range: [half .. height - half).
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        // Interior x range in LEFT: [half + max_d .. width - half).
+        // For each x_l we search d in [0 .. min(md, x_l - half)].
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            // Effective max disparity at this x: cannot push x_r below `half`.
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block(left_ptr, right_ptr, width,
+                                           x, int_sub(x, d), y, ws)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            // Clamp best_d to a byte (0..255). The cap above already
+            // bounds md at 128, so best_d <= 128 -- store directly.
+            store8(map + int_add(row_off, x), best_d)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, best_d)
+            if best_d > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// ---- R12A: SIMD disparity inner loop ------------------------------------
+//
+// _stereo_disparity_simd_inner: shared SIMD inner-loop body, called by
+//   both `stereo_disparity_simd` (always SIMD) and `stereo_disparity`
+//   (default SIMD; CE_STEREO_SIMD=off opts out at dispatch). Caller has
+//   already validated dims + clamped ws / md.
+fn _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
+                                 ws, md, area, half) {
+    // Allocate the SIMD lane buffers ONCE per call and reuse for every
+    // SAD evaluation. Size = win*win + 8 lanes of slack at 4 B each.
+    let n_lanes = int_mul(ws, ws)
+    let buf_bytes = int_mul(int_add(n_lanes, 8), 4)
+    let l_buf = alloc(buf_bytes)
+    let r_buf = alloc(buf_bytes)
+    // Zero buffers ONCE -- per-pixel staging only updates the low byte
+    // of each lane, saving 75% of the staging store bandwidth.
+    _stereo_zero_i32_buf(l_buf, int_add(n_lanes, 8))
+    _stereo_zero_i32_buf(r_buf, int_add(n_lanes, 8))
+
+    let map = _stereo_zero_map(area)
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block_simd(left_ptr, right_ptr, width,
+                                                x, int_sub(x, d), y, ws,
+                                                l_buf, r_buf)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            store8(map + int_add(row_off, x), best_d)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, best_d)
+            if best_d > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// stereo_disparity_simd(left, right, w, h, win_size, max_disp)
+//   -> same shape as stereo_disparity. Explicit SIMD entry-point. Falls
+//   back to scalar stereo_disparity when CE_STEREO_SIMD=off.
+fn stereo_disparity_simd(left_ptr, right_ptr, width, height, win_size, max_disp) {
+    if width <= 0   { return _stereo_fail() }
+    if height <= 0  { return _stereo_fail() }
+    if left_ptr == 0  { return _stereo_fail() }
+    if right_ptr == 0 { return _stereo_fail() }
+    if width > STEREO_MAX_DIM  { return _stereo_fail() }
+    if height > STEREO_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_fail() }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let half = ws / 2
+    if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if _stereo_simd_enabled() == 0 {
+        return stereo_disparity(left_ptr, right_ptr, width, height, win_size, max_disp)
+    }
+    // R15A: honor CE_STEREO_U8_SIMD=on even on this explicit SIMD entry-
+    // point so /depth and the bench harness can pick the byte path
+    // without a separate API.
+    if _stereo_u8_simd_enabled() == 1 {
+        return _stereo_disparity_u8_simd_inner(left_ptr, right_ptr, width, height,
+                                                ws, md, area, half)
+    }
+    return _stereo_disparity_simd_inner(left_ptr, right_ptr, width, height,
+                                        ws, md, area, half)
+}
+
+// ---- depth from disparity ------------------------------------------------
+//
+// stereo_depth(disp_map, width, height, baseline_mm, focal_pixels)
+//   -> ptr to width*height ints (depth in mm)
+//
+// We store depth as a LIST of ints (not bytes) because metric depth in mm
+// routinely exceeds 255: a baseline of 60mm and focal of 500px gives
+// depth = 30000 / disparity, so disparity=1 -> 30000mm and disparity=2 ->
+// 15000mm. We use `alloc + store_int_at` via the substrate's int_list
+// pattern is overkill; instead we return a list of ints which the
+// accessors index into.
+
+fn stereo_depth(disp_map, width, height, baseline_mm, focal_pixels) {
+    let depth = list_new()
+    if width <= 0  { return depth }
+    if height <= 0 { return depth }
+    if disp_map == 0 { return depth }
+    if baseline_mm <= 0 { return depth }
+    if focal_pixels <= 0 { return depth }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return depth }
+    let bf = int_mul(baseline_mm, focal_pixels)
+    let i = 0
+    while i < area {
+        let d = load8(disp_map + i)
+        let z = STEREO_MAX_DEPTH_MM
+        if d > 0 {
+            z = bf / d
+            if z > STEREO_MAX_DEPTH_MM { z = STEREO_MAX_DEPTH_MM }
+        }
+        push(depth, z)
+        i = int_add(i, 1)
+    }
+    return depth
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn stereo_disparity_at(disp_map, width, x, y) {
+    if disp_map == 0 { return 0 }
+    if width <= 0    { return 0 }
+    if x < 0         { return 0 }
+    if y < 0         { return 0 }
+    return load8(disp_map + int_add(int_mul(y, width), x))
+}
+
+fn stereo_depth_at(depth_map, width, x, y) {
+    if width <= 0 { return STEREO_MAX_DEPTH_MM }
+    if x < 0      { return STEREO_MAX_DEPTH_MM }
+    if y < 0      { return STEREO_MAX_DEPTH_MM }
+    let idx = int_add(int_mul(y, width), x)
+    if idx >= len(depth_map) { return STEREO_MAX_DEPTH_MM }
+    return depth_map[idx]
+}
+
+fn stereo_result_map(r)     { return r[STEREO_R_MAP] }
+fn stereo_result_mean(r)    { return r[STEREO_R_MEAN] }
+fn stereo_result_density(r) { return r[STEREO_R_DENSITY] }
+fn stereo_result_total(r)   { return r[STEREO_R_TOTAL] }
+
+// stereo_density_label(density_milli) -> label string for the
+// visual_perception seam to emit.
+fn stereo_density_label(density_milli) {
+    if density_milli < STEREO_DENSITY_MID_MIN  { return STEREO_LABEL_DENSITY_LOW }
+    if density_milli < STEREO_DENSITY_HIGH_MIN { return STEREO_LABEL_DENSITY_MID }
+    return STEREO_LABEL_DENSITY_HIGH
+}
+
+// ---- chat admin helpers --------------------------------------------------
+//
+// `/depth L.pgm R.pgm` admin -- the chat dispatches `depth_pgm_args(arg)`
+// directly (one io_println call), so this module owns the full PGM-parse
+// + stereo_disparity + summary pipeline. The image_pgm import lives at
+// the top of the file.
+
+fn _stereo_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+// stereo_pgm_args(arg) -> formatted result string suitable for io_println.
+// Mirrors the orb_match_pgm_args contract so the chat dispatch stays a
+// one-liner.
+fn stereo_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/depth needs two PATHs -- usage: /depth L.pgm R.pgm)"
+    }
+    let parts = _stereo_split_two(arg)
+    return stereo_pgm_paths(parts[0], parts[1])
+}
+
+// stereo_append_features_if_paired(feats, left_ptr, width, height)
+//   Visual-perception integration hook. Reads the CE_VP_STEREO_RIGHT env
+//   var (a path to the companion right PGM); when set, decodes the right
+//   image, validates matching dims + minimum size, runs stereo_disparity,
+//   and appends two atoms to `feats`:
+//     image_stereo_disparity_mean<bucket>  -- bucket of the mean disparity
+//                                             (low/mid/high; see below)
+//     image_stereo_density_<low|mid|high>  -- via stereo_density_label
+//   The labels are silent (no atoms appended) when the env var is unset,
+//   the right PGM fails to decode, or dimensions don't match -- a stereo
+//   seam should never make /see fall over on a regular mono image.
+//
+//   Disparity-mean bucket boundaries (in raw disparity units, the same
+//   integer scale stereo_disparity returns):
+//     low  : mean <  4
+//     mid  : 4 <= mean < 16
+//     high : mean >= 16
+//   These were chosen so a textureless / no-shift pair (mean ~0) reads
+//   "low" and a typical close-object stereo (mean 16-32) reads "high".
+fn stereo_disparity_mean_label(mean) {
+    if mean < 4  { return "image_stereo_disparity_mean_low" }
+    if mean < 16 { return "image_stereo_disparity_mean_mid" }
+    return "image_stereo_disparity_mean_high"
+}
+
+fn stereo_append_features_if_paired(feats, left_ptr, width, height) {
+    let env = getenv("CE_VP_STEREO_RIGHT")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if width  > STEREO_MAX_DIM { return 0 }
+    if height > STEREO_MAX_DIM { return 0 }
+    let r_r = pgm_parse_file(env)
+    let err_r = pgm_result_error(r_r)
+    if len(err_r) > 0 { return 0 }
+    let w_r = pgm_result_width(r_r)
+    let h_r = pgm_result_height(r_r)
+    if w_r != width  { return 0 }
+    if h_r != height { return 0 }
+    let d_r = pgm_result_data(r_r)
+    let s = stereo_disparity(left_ptr, d_r, width, height,
+                             STEREO_DEFAULT_WIN_SIZE, STEREO_DEFAULT_MAX_DISP)
+    let mean = stereo_result_mean(s)
+    let density = stereo_result_density(s)
+    push(feats, stereo_disparity_mean_label(mean))
+    push(feats, stereo_density_label(density))
+    return 1
+}
+
+fn stereo_pgm_paths(path_l, path_r) {
+    if len(path_l) == 0 {
+        return "(/depth needs two PATHs -- usage: /depth L.pgm R.pgm)"
+    }
+    if len(path_r) == 0 {
+        return "(/depth needs TWO paths -- got 1)"
+    }
+    let r_l = pgm_parse_file(path_l)
+    let err_l = pgm_result_error(r_l)
+    if len(err_l) > 0 {
+        return "(depth FAILED on L: " + err_l + ")"
+    }
+    let r_r = pgm_parse_file(path_r)
+    let err_r = pgm_result_error(r_r)
+    if len(err_r) > 0 {
+        return "(depth FAILED on R: " + err_r + ")"
+    }
+    let w_l = pgm_result_width(r_l)
+    let h_l = pgm_result_height(r_l)
+    let w_r = pgm_result_width(r_r)
+    let h_r = pgm_result_height(r_r)
+    if w_l != w_r {
+        return "(depth FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if h_l != h_r {
+        return "(depth FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if w_l > STEREO_MAX_DIM { return "(depth FAILED: L too large -- max 256x256)" }
+    if h_l > STEREO_MAX_DIM { return "(depth FAILED: L too large -- max 256x256)" }
+    let d_l = pgm_result_data(r_l)
+    let d_r = pgm_result_data(r_r)
+    let s = stereo_disparity(d_l, d_r, w_l, h_l,
+                             STEREO_DEFAULT_WIN_SIZE, STEREO_DEFAULT_MAX_DISP)
+    let mean = stereo_result_mean(s)
+    let density = stereo_result_density(s)
+    return "(depth " + int_to_str(w_l) + "x" + int_to_str(h_l)
+        + " mean_disp=" + int_to_str(mean)
+        + " density=" + int_to_str(density)
+        + "milli " + stereo_density_label(density) + ")"
+}
+
+// =========================================================================
+// R8D follow-ups: LR-check + sub-pixel refinement
+// =========================================================================
+//
+// The integer block-matching disparity above (R7E) is correct under the
+// assumption that every interior pixel HAS a true match in the other
+// view. That breaks at: (a) OCCLUSIONS -- a pixel on the foreground edge
+// in LEFT has no corresponding pixel in RIGHT because the foreground
+// occludes the background only on one side; (b) TEXTURELESS REGIONS --
+// flat surfaces produce many equally-good SAD matches; (c) PERIODIC
+// PATTERNS -- repeating texture produces multiple SAD minima at multiples
+// of the period. The LR-check rejects all three classes by ALSO computing
+// the disparity right->left and discarding pixels where the two answers
+// disagree. Sub-pixel refinement fits a parabola through SAD(d*-1, d*,
+// d*+1) to recover fractional-pixel disparity (= fractional-mm depth
+// resolution for the same baseline/focal). Both follow-ups are textbook
+// stereo-vision quality improvements; see Scharstein-Szeliski's
+// "Taxonomy and evaluation of dense two-frame stereo correspondence
+// algorithms" (IJCV 2002) for the canonical treatment.
+
+// ---- LR-tolerance clamp --------------------------------------------------
+
+fn _stereo_clamp_lr_tol(lr_tol) {
+    if lr_tol <= 0 { return STEREO_DEFAULT_LR_TOLERANCE }
+    if lr_tol > STEREO_MAX_LR_TOLERANCE { return STEREO_MAX_LR_TOLERANCE }
+    return lr_tol
+}
+
+// ---- right->left disparity scanner ---------------------------------------
+//
+// _stereo_disparity_right(left_ptr, right_ptr, width, height, ws, md)
+//   For each pixel (x, y) in the RIGHT image, slide the LEFT block from
+//   x to x + max_d (NOT x to x - max_d -- we are scanning the opposite
+//   direction now) and store the offset that minimizes SAD. The result is
+//   a width*height byte buffer. Border pixels keep 0 (same as the
+//   left->right scan in stereo_disparity).
+//
+// Math: if d_L(x, y) = D at a true correspondence point, the matching
+// pixel in the right image sits at x - D. From RIGHT's perspective, its
+// disparity at column (x - D) is also D -- the same physical baseline
+// offset, measured from the right image's column instead of the left's.
+// So a consistent pair satisfies d_L(x, y) == d_R(x - d_L(x, y), y).
+
+fn _stereo_disparity_right(left_ptr, right_ptr, width, height, ws, md) {
+    let area = int_mul(width, height)
+    let map = _stereo_zero_map(area)
+    let half = ws / 2
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            // From RIGHT pixel (x, y) we slide LEFT block from x to x + md,
+            // capped so x + d + half < width.
+            let local_max_d = md
+            let cap = int_sub(int_sub(width, half), int_add(x, 1))
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            let best_sad = -1
+            let best_d   = 0
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block(left_ptr, right_ptr, width,
+                                           int_add(x, d), x, y, ws)
+                if best_sad < 0 {
+                    best_sad = sad
+                    best_d   = d
+                } else {
+                    if sad < best_sad {
+                        best_sad = sad
+                        best_d   = d
+                    }
+                }
+                d = int_add(d, 1)
+            }
+            store8(map + int_add(row_off, x), best_d)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return map
+}
+
+// ---- stereo_disparity_lr_check -------------------------------------------
+//
+// Run the left->right scan (matching stereo_disparity exactly), then the
+// right->left scan, then zero out left-pixels where the two answers
+// disagree by more than `lr_tolerance` pixels.
+
+fn stereo_disparity_lr_check(left_ptr, right_ptr, width, height,
+                             win_size, max_disp, lr_tolerance) {
+    if width <= 0   { return _stereo_fail() }
+    if height <= 0  { return _stereo_fail() }
+    if left_ptr == 0  { return _stereo_fail() }
+    if right_ptr == 0 { return _stereo_fail() }
+    if width > STEREO_MAX_DIM  { return _stereo_fail() }
+    if height > STEREO_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_fail() }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let tol = _stereo_clamp_lr_tol(lr_tolerance)
+    let half = ws / 2
+    if width  < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if height < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+
+    // Left->right disparity (reuse stereo_disparity's contract; we re-walk
+    // the loop here for clarity rather than peel out _do_disparity, but the
+    // logic is byte-for-byte identical to the existing inner loop).
+    let r_l = stereo_disparity(left_ptr, right_ptr, width, height, ws, md)
+    let map_L = stereo_result_map(r_l)
+    let map_R = _stereo_disparity_right(left_ptr, right_ptr, width, height, ws, md)
+
+    // Walk the interior of map_L and zero out inconsistent pixels.
+    let out = _stereo_zero_map(area)
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let dL = load8(map_L + int_add(row_off, x))
+            // Project to right's column.
+            let x_r = int_sub(x, dL)
+            let consistent = 0
+            if x_r >= half {
+                if x_r < int_sub(width, half) {
+                    let dR = load8(map_R + int_add(row_off, x_r))
+                    let diff = int_sub(dL, dR)
+                    if diff < 0 { diff = 0 - diff }
+                    if diff <= tol { consistent = 1 }
+                }
+            }
+            let stored = 0
+            if consistent == 1 { stored = dL }
+            store8(out + int_add(row_off, x), stored)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, stored)
+            if stored > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(out, mean, density_milli, area)
+}
+
+// ---- sub-pixel refinement ------------------------------------------------
+//
+// Parabolic fit: given SAD values (s_m1, s_0, s_p1) at integer offsets
+// (d* - 1, d*, d* + 1), fit f(x) = a x^2 + b x + c. The minimum lies at
+//   x_min = -b / (2a)  =  d* + (s_m1 - s_p1) / (2 * (s_m1 - 2 s_0 + s_p1))
+// We compute milli-disparity = int(x_min * 1000):
+//   denom = s_m1 + s_p1 - 2 s_0
+//   numer = s_m1 - s_p1   (signed)
+//   if denom > 0:           // non-degenerate, true minimum at d*
+//       milli = d* * 1000 + (numer * 500) / denom
+//   else:                   // degenerate -> snap to integer
+//       milli = d* * 1000
+// We tolerate denom == 0 explicitly (which covers the flat-SAD case from
+// textureless regions). A negative denominator would mean d* is actually
+// a LOCAL MAXIMUM rather than minimum -- algorithm bug indicator, so we
+// fall back to the integer answer as well.
+//
+// Sign convention sanity check: if SAD at d-1 is smaller than SAD at d+1
+// (s_m1 < s_p1, numer > 0), the true minimum sits BEFORE d* -- so we
+// want milli < d* * 1000, which means we SUBTRACT. Our formula adds
+// (numer * 500) / denom: numer > 0, so the term is > 0, so milli >
+// d* * 1000 -- WRONG sign. The correct fit is:
+//   x_min = d* - (s_p1 - s_m1) / (2 * (s_m1 - 2 s_0 + s_p1))
+//         = d* + (s_m1 - s_p1) / (2 * (s_m1 - 2 s_0 + s_p1))
+// so numer = s_m1 - s_p1 and we ADD numer * 500 / denom. If s_m1 < s_p1
+// (numer < 0) we ADD a negative -> milli < d* * 1000. Correct.
+
+fn _stereo_subpx_refine(d_star, s_m1, s_0, s_p1) {
+    let base = int_mul(d_star, STEREO_MILLI_PER_UNIT)
+    let denom = int_sub(int_add(s_m1, s_p1), int_mul(2, s_0))
+    if denom <= 0 { return base }
+    let numer = int_sub(s_m1, s_p1)
+    let half_milli = int_mul(numer, 500) / denom
+    return int_add(base, half_milli)
+}
+
+// ---- sub-pixel disparity full scan ---------------------------------------
+//
+// Walks every interior pixel exactly like stereo_disparity, but maintains a
+// 3-slot rolling SAD window so we can refine the integer best with the
+// parabolic interpolant in a single pass. The result is a LIST OF INTS
+// (one milli-disparity per pixel, row-major) rather than a byte buffer --
+// milli values can exceed 255.
+//
+// Per-pixel state machine:
+//   sad_prev = SAD at d-1 (rolling)
+//   sad_curr = SAD at d   (about to be tested)
+//   on new best -> remember sad_m1 = sad_prev, mark "need next"
+//   on the iteration AFTER a new best -> set sad_p1 = sad_curr
+//   at loop end -> if "need next" still set, we ran off the search range
+//                  so set sad_p1 = sad_at_best (denominator goes 0 ->
+//                  fallback to integer).
+
+fn stereo_disparity_subpx(left_ptr, right_ptr, width, height, win_size, max_disp) {
+    let empty = list_new()
+    if width <= 0   { return _stereo_result(empty, 0, 0, 0) }
+    if height <= 0  { return _stereo_result(empty, 0, 0, 0) }
+    if left_ptr == 0  { return _stereo_result(empty, 0, 0, 0) }
+    if right_ptr == 0 { return _stereo_result(empty, 0, 0, 0) }
+    if width > STEREO_MAX_DIM  { return _stereo_result(empty, 0, 0, 0) }
+    if height > STEREO_MAX_DIM { return _stereo_result(empty, 0, 0, 0) }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_result(empty, 0, 0, 0) }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let half = ws / 2
+
+    // Pre-allocate the milli-disparity list to width*height zeros.
+    let milli = list_new()
+    let z = 0
+    while z < area {
+        push(milli, 0)
+        z = int_add(z, 1)
+    }
+    if width  < int_add(ws, 1) { return _stereo_result(milli, 0, 0, area) }
+    if height < ws             { return _stereo_result(milli, 0, 0, area) }
+
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let local_max_d = md
+            let cap = int_sub(x, half)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 }
+            let best_sad = -1
+            let best_d   = 0
+            let sad_at_best_m1 = 0
+            let sad_at_best    = 0
+            let sad_at_best_p1 = -1   // sentinel: not yet captured
+            let prev_sad = 0
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block(left_ptr, right_ptr, width,
+                                           x, int_sub(x, d), y, ws)
+                // First, if we just captured a best on the previous iteration,
+                // this iteration's SAD is its "+1" neighbor.
+                if sad_at_best_p1 < 0 {
+                    if d == int_add(best_d, 1) {
+                        sad_at_best_p1 = sad
+                    }
+                }
+                let became_best = 0
+                if best_sad < 0 {
+                    became_best = 1
+                } else {
+                    if sad < best_sad { became_best = 1 }
+                }
+                if became_best == 1 {
+                    best_sad = sad
+                    best_d   = d
+                    sad_at_best = sad
+                    if d == 0 {
+                        sad_at_best_m1 = sad      // no left neighbor
+                    } else {
+                        sad_at_best_m1 = prev_sad
+                    }
+                    sad_at_best_p1 = -1            // reset; capture on next iter
+                }
+                prev_sad = sad
+                d = int_add(d, 1)
+            }
+            // If sad_at_best_p1 was never captured (best was the last d, or
+            // best is the only d), fall back to sad_at_best so denom == 0 ->
+            // integer milli result. Same with the m1 side when best_d == 0.
+            let s_p1 = sad_at_best_p1
+            if s_p1 < 0 { s_p1 = sad_at_best }
+            let m_disp = _stereo_subpx_refine(best_d, sad_at_best_m1,
+                                              sad_at_best, s_p1)
+            list_set(milli, int_add(row_off, x), m_disp)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, m_disp)
+            if m_disp > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(milli, mean, density_milli, area)
+}
+
+// ---- combined LR-check + sub-pixel ---------------------------------------
+//
+// Run LR-check first to identify consistent pixels; then refine the
+// consistent ones with the sub-pixel parabola. Inconsistent pixels remain
+// 0 in the milli output (matching the integer LR-check contract).
+
+fn stereo_disparity_quality(left_ptr, right_ptr, width, height,
+                            win_size, max_disp, lr_tolerance) {
+    let empty = list_new()
+    if width <= 0   { return _stereo_result(empty, 0, 0, 0) }
+    if height <= 0  { return _stereo_result(empty, 0, 0, 0) }
+    if left_ptr == 0  { return _stereo_result(empty, 0, 0, 0) }
+    if right_ptr == 0 { return _stereo_result(empty, 0, 0, 0) }
+    if width > STEREO_MAX_DIM  { return _stereo_result(empty, 0, 0, 0) }
+    if height > STEREO_MAX_DIM { return _stereo_result(empty, 0, 0, 0) }
+    let area = int_mul(width, height)
+    if area > STEREO_MAX_PIXEL_AREA { return _stereo_result(empty, 0, 0, 0) }
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_clamp_max_disp(max_disp)
+    let tol = _stereo_clamp_lr_tol(lr_tolerance)
+    let half = ws / 2
+
+    let milli = list_new()
+    let z = 0
+    while z < area {
+        push(milli, 0)
+        z = int_add(z, 1)
+    }
+    if width  < int_add(ws, 1) { return _stereo_result(milli, 0, 0, area) }
+    if height < ws             { return _stereo_result(milli, 0, 0, area) }
+
+    // Get the integer LR-check map (consistent pixels survive, rest are 0).
+    let r_lr = stereo_disparity_lr_check(left_ptr, right_ptr, width, height,
+                                         ws, md, tol)
+    let map_lr = stereo_result_map(r_lr)
+
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(height, half)
+    while y < y_max {
+        let row_off = int_mul(y, width)
+        let x = half
+        let x_max = int_sub(width, half)
+        while x < x_max {
+            let dL = load8(map_lr + int_add(row_off, x))
+            let m_disp = 0
+            if dL > 0 {
+                // Re-walk the SAD search for this pixel to recover SAD(d*-1),
+                // SAD(d*), SAD(d*+1). We could pre-cache but the search is
+                // bounded at md=128 * 49 = ~6400 ops per pixel and the
+                // LR-pruned set is sparse on quality fixtures.
+                let local_max_d = md
+                let cap = int_sub(x, half)
+                if local_max_d > cap { local_max_d = cap }
+                let s_0  = stereo_sad_block(left_ptr, right_ptr, width,
+                                            x, int_sub(x, dL), y, ws)
+                let s_m1 = s_0
+                if dL > 0 {
+                    if int_sub(dL, 1) >= 0 {
+                        s_m1 = stereo_sad_block(left_ptr, right_ptr, width,
+                                                x, int_sub(x, int_sub(dL, 1)),
+                                                y, ws)
+                    }
+                }
+                let s_p1 = s_0
+                if int_add(dL, 1) <= local_max_d {
+                    s_p1 = stereo_sad_block(left_ptr, right_ptr, width,
+                                            x, int_sub(x, int_add(dL, 1)),
+                                            y, ws)
+                }
+                m_disp = _stereo_subpx_refine(dL, s_m1, s_0, s_p1)
+            }
+            list_set(milli, int_add(row_off, x), m_disp)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, m_disp)
+            if m_disp > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(milli, mean, density_milli, area)
+}
+
+// ---- milli-disparity accessor --------------------------------------------
+
+fn stereo_disparity_milli_at(milli_list, width, x, y) {
+    if width <= 0 { return 0 }
+    if x < 0      { return 0 }
+    if y < 0      { return 0 }
+    let idx = int_add(int_mul(y, width), x)
+    if idx >= len(milli_list) { return 0 }
+    return milli_list[idx]
+}
+
+fn stereo_quality_milli_at(milli_list, width, x, y) {
+    return stereo_disparity_milli_at(milli_list, width, x, y)
+}
+
+// ---- chat /depth_q helpers -----------------------------------------------
+//
+// Optional quality-mode chat admin. Same shape as stereo_pgm_args /
+// stereo_pgm_paths -- decode two PGMs, validate dims, run
+// stereo_disparity_quality, and emit a single line.
+
+fn stereo_quality_pgm_paths(path_l, path_r) {
+    if len(path_l) == 0 {
+        return "(/depth_q needs two PATHs -- usage: /depth_q L.pgm R.pgm)"
+    }
+    if len(path_r) == 0 {
+        return "(/depth_q needs TWO paths -- got 1)"
+    }
+    let r_l = pgm_parse_file(path_l)
+    let err_l = pgm_result_error(r_l)
+    if len(err_l) > 0 {
+        return "(depth_q FAILED on L: " + err_l + ")"
+    }
+    let r_r = pgm_parse_file(path_r)
+    let err_r = pgm_result_error(r_r)
+    if len(err_r) > 0 {
+        return "(depth_q FAILED on R: " + err_r + ")"
+    }
+    let w_l = pgm_result_width(r_l)
+    let h_l = pgm_result_height(r_l)
+    let w_r = pgm_result_width(r_r)
+    let h_r = pgm_result_height(r_r)
+    if w_l != w_r {
+        return "(depth_q FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if h_l != h_r {
+        return "(depth_q FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if w_l > STEREO_MAX_DIM { return "(depth_q FAILED: L too large -- max 256x256)" }
+    if h_l > STEREO_MAX_DIM { return "(depth_q FAILED: L too large -- max 256x256)" }
+    let d_l = pgm_result_data(r_l)
+    let d_r = pgm_result_data(r_r)
+    let s = stereo_disparity_quality(d_l, d_r, w_l, h_l,
+                                     STEREO_DEFAULT_WIN_SIZE,
+                                     STEREO_DEFAULT_MAX_DISP,
+                                     STEREO_DEFAULT_LR_TOLERANCE)
+    let mean_milli = stereo_result_mean(s)
+    let density = stereo_result_density(s)
+    return "(depth_q " + int_to_str(w_l) + "x" + int_to_str(h_l)
+        + " mean_milli=" + int_to_str(mean_milli)
+        + " density=" + int_to_str(density)
+        + "milli " + stereo_density_label(density) + ")"
+}
+
+fn stereo_quality_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/depth_q needs two PATHs -- usage: /depth_q L.pgm R.pgm)"
+    }
+    let parts = _stereo_split_two(arg)
+    return stereo_quality_pgm_paths(parts[0], parts[1])
+}
+
+// =========================================================================
+// R9A follow-up: Semi-Global Matching (SGM) stereo
+// =========================================================================
+//
+// R7E + R8D run an INDEPENDENT per-pixel SAD minimization. That works on
+// well-textured scenes but produces speckle in low-texture regions and
+// can pick wildly-wrong disparities at occlusion boundaries. Hirschmuller
+// (2008) "Stereo Processing by Semiglobal Matching and Mutual Information"
+// shows that AGGREGATING the matching cost along multiple 1-D scanline
+// paths (left-right, top-bottom, and the reverse pair) approximates a 2-D
+// global energy minimization at 1-D cost. The aggregation enforces local
+// smoothness (small P1 penalty for a 1-pixel disparity jump) while
+// permitting large depth discontinuities at edges (the larger P2 penalty
+// is data-aware in the full paper; we use a constant here for simplicity).
+//
+// Algorithm (simplified, 4-path version):
+//   1. C(x, y, d) = SAD over a WIN_SIZE x WIN_SIZE block of left at (x,y)
+//      against right at (x-d, y); same data term as R7E.
+//   2. For each path direction r in { left->right, top->bottom,
+//      right->left, bottom->top } and each pixel p along that path:
+//        L_r(p, d) = C(p, d) + min(
+//            L_r(p-r, d),
+//            L_r(p-r, d-1) + P1,
+//            L_r(p-r, d+1) + P1,
+//            min_d' L_r(p-r, d') + P2
+//          ) - min_d' L_r(p-r, d')
+//      The subtraction prevents L from growing unbounded; it's a uniform
+//      offset that does not change the argmin.
+//   3. Aggregate: S(p, d) = sum over r of L_r(p, d).
+//   4. Output disparity at p = argmin_d S(p, d).
+//
+// Implementation notes:
+//   * Cost volume C is laid out as W * H * D ints at base addr `cost`.
+//     Access: cost + (y * W + x) * D * 8 + d * 8 (8 bytes per int).
+//   * For the 4 paths we accumulate into a SINGLE S buffer (same layout):
+//     after pass 1 (LR + TB) S is partial; after pass 2 (RL + BT) S is
+//     complete; then argmin yields the final disparity.
+//   * Each path keeps only ONE previous-line buffer of size W * D (for
+//     vertical paths) or D (for horizontal paths) so working memory stays
+//     bounded.
+//   * Window border + invalid columns (where x - d < 0) get cost INFINITY
+//     so SGM never picks them.
+//
+// Memory budget (W*H*D ints, 8 bytes each):
+//   64x64,  D=16  ->  64K ints  ~512KB
+//   64x64,  D=32  -> 131K ints  ~1MB
+//   128x128,D=32  -> 524K ints  ~4MB  (the SGM cap we enforce)
+//   128x128,D=64  ->  1M ints   ~8MB  (rejected)
+//
+// Public API:
+//   stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2)
+//       -> [disp_map_bytes, mean, density_milli, total]
+//          Same shape as stereo_disparity (R7E). Pass p1=0 / p2=0 to use
+//          the default penalties (8 and 32).
+//   stereo_disparity_sgm_quality(left, right, w, h, win_size, max_disp,
+//                                p1, p2, lr_tolerance)
+//       -> [milli_list, mean_milli, density_milli, total]
+//          Adds LR-check + sub-pixel parabolic refinement on top of the
+//          SGM aggregated cost volume. The LR-check uses the integer SGM
+//          map (left->right) compared against an R8D-style right->left
+//          block-matching map (full SGM in both directions would double
+//          the memory budget; the per-pixel LR-check is the same shape
+//          either way and the block-matching right pass is what R8D used).
+//
+// Penalty defaults:
+//   STEREO_SGM_DEFAULT_P1 = 8    -- small step penalty
+//   STEREO_SGM_DEFAULT_P2 = 32   -- large step penalty
+//   The textbook ratio is roughly P2 / P1 ~= 4-8; we pick 4 here.
+
+// SGM-specific caps. Cost volume W*H*D ints must fit in 4MB = 512K ints
+// (8 bytes each). 128x128x32 = 524288 -> exactly at the cap; larger is
+// rejected. We enforce both per-axis (<=128) and the product (<=512K).
+let STEREO_SGM_MAX_DIM       = 128
+let STEREO_SGM_MAX_DISP      = 64
+let STEREO_SGM_MAX_VOLUME    = 524288    // W*H*D
+let STEREO_SGM_INF           = 1000000000
+let STEREO_SGM_DEFAULT_P1    = 8
+let STEREO_SGM_DEFAULT_P2    = 32
+
+// Clamp helpers for the SGM penalty arguments (caller passes 0 to use the
+// default; negative values are treated as the default; very large values
+// are capped to keep arithmetic in range alongside SAD per-window).
+fn _stereo_sgm_clamp_p1(p1) {
+    if p1 <= 0 { return STEREO_SGM_DEFAULT_P1 }
+    if p1 > 10000 { return 10000 }
+    return p1
+}
+
+fn _stereo_sgm_clamp_p2(p2, p1) {
+    if p2 <= 0 { return STEREO_SGM_DEFAULT_P2 }
+    if p2 > 100000 { return 100000 }
+    if p2 < p1 { return p1 }   // P2 must be at least P1 by definition
+    return p2
+}
+
+fn _stereo_sgm_clamp_max_disp(max_disp) {
+    if max_disp <= 0 { return STEREO_DEFAULT_MAX_DISP }
+    if max_disp > STEREO_SGM_MAX_DISP { return STEREO_SGM_MAX_DISP }
+    return max_disp
+}
+
+// ---- raw int buffer accessors -------------------------------------------
+//
+// store64 / load64 give us an 8-byte-per-int packed buffer. We treat
+// `base + idx * 8` as the address for entry `idx`. The buffer is allocated
+// with alloc(num_ints * 8 + 8) -- the trailing 8 keeps store64 in-bounds
+// at idx == num_ints - 1.
+
+fn _sgm_buf_alloc(num_ints, init_value) {
+    let bytes = int_mul(num_ints, 8)
+    let buf = alloc(int_add(bytes, 8))
+    let i = 0
+    while i < num_ints {
+        store64(int_add(buf, int_mul(i, 8)), init_value)
+        i = int_add(i, 1)
+    }
+    return buf
+}
+
+fn _sgm_set(buf, idx, val) {
+    store64(int_add(buf, int_mul(idx, 8)), val)
+}
+
+fn _sgm_get(buf, idx) {
+    return load64(int_add(buf, int_mul(idx, 8)))
+}
+
+// ---- cost-volume build ---------------------------------------------------
+//
+// _stereo_sgm_build_cost(left, right, w, h, ws, md) -> ptr
+//   Returns a packed int buffer of size W*H*D, indexed as
+//   (y * W + x) * D + d. For interior pixels we compute SAD over the
+//   WIN_SIZE x WIN_SIZE block. For border pixels OR offsets where
+//   x - d - half < 0 we write STEREO_SGM_INF so the aggregation never
+//   picks them. Border rows / columns store INF for every d.
+
+fn _stereo_sgm_build_cost(left, right, w, h, ws, md) {
+    let half = ws / 2
+    let area = int_mul(w, h)
+    let volume = int_mul(area, md)
+    let cost = _sgm_buf_alloc(volume, STEREO_SGM_INF)
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let base = int_mul(int_add(int_mul(y, w), x), md)
+            let cap = int_sub(x, half)
+            let local_max_d = int_sub(md, 1)
+            if local_max_d > cap { local_max_d = cap }
+            if local_max_d < 0   { local_max_d = 0 - 1 }  // -1 -> no valid d
+            let d = 0
+            while d <= local_max_d {
+                let sad = stereo_sad_block(left, right, w,
+                                           x, int_sub(x, d), y, ws)
+                _sgm_set(cost, int_add(base, d), sad)
+                d = int_add(d, 1)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return cost
+}
+
+// ---- path aggregation ----------------------------------------------------
+//
+// Each path's recurrence needs L_r(p - r, *) (the previous step along the
+// path) and min_d' L_r(p - r, d'). We keep ONE rolling buffer per path:
+//   * Horizontal paths (LR, RL): a single D-sized buffer of "previous
+//     pixel's L_r" + its scalar min.
+//   * Vertical paths (TB, BT): a W*D-sized buffer of "previous row's L_r"
+//     + a W-sized buffer of per-column scalar mins.
+// We DON'T allocate W*H*D for L_r itself; we accumulate directly into S.
+//
+// Update rule:
+//   m_prev      = min over d' of L_r(p - r, d')
+//   candidate_a = L_r(p - r, d)
+//   candidate_b = L_r(p - r, d - 1) + P1   (if d > 0)
+//   candidate_c = L_r(p - r, d + 1) + P1   (if d < D - 1)
+//   candidate_d = m_prev + P2
+//   L_r(p, d)   = C(p, d) + min(a, b, c, d) - m_prev
+// And we add L_r(p, d) into S(p, d) at the same time.
+
+fn _sgm_min2(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn _sgm_min4(a, b, c, d) {
+    let m = a
+    if b < m { m = b }
+    if c < m { m = c }
+    if d < m { m = d }
+    return m
+}
+
+// LR path: for each row, scan x = 0 .. w-1. Keep one D-sized rolling
+// buffer `prev` + scalar `prev_min`.
+fn _sgm_aggregate_lr(cost, sum, w, h, md, p1, p2) {
+    // prev: L_r at previous pixel for all d; prev_min: scalar min.
+    let prev = _sgm_buf_alloc(md, STEREO_SGM_INF)
+    let y = 0
+    while y < h {
+        // Reset prev for new row (no L_r from the previous row counts here).
+        let i = 0
+        while i < md {
+            _sgm_set(prev, i, STEREO_SGM_INF)
+            i = int_add(i, 1)
+        }
+        let prev_min = STEREO_SGM_INF
+        let x = 0
+        let row_off = int_mul(y, w)
+        while x < w {
+            let base = int_mul(int_add(row_off, x), md)
+            // First pixel in row: L_r = C (no previous to combine with).
+            let curr_min = STEREO_SGM_INF
+            // We need to compute new L for all d into a temp, then sum into S
+            // and roll into prev. Allocate temp per pixel keeps memory bounded.
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if x == 0 {
+                    l_val = c_pd
+                } else {
+                    if prev_min >= STEREO_SGM_INF {
+                        // No valid prev (e.g. first usable pixel after border).
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(prev, d)
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(prev, int_sub(d, 1)), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(prev, int_add(d, 1)), p1)
+                        }
+                        let dd = int_add(prev_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        // Cap c_pd contribution if it's already infinity:
+                        // INF + anything = still treated as INF after the
+                        // subtraction prev_min; we keep it as c_pd to flag.
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_min { curr_min = l_val }
+                d = int_add(d, 1)
+            }
+            // Add temp into sum; copy temp -> prev.
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(prev, d2, l_val)
+                d2 = int_add(d2, 1)
+            }
+            prev_min = curr_min
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return 0
+}
+
+// RL path: each row, scan x = w-1 .. 0.
+fn _sgm_aggregate_rl(cost, sum, w, h, md, p1, p2) {
+    let prev = _sgm_buf_alloc(md, STEREO_SGM_INF)
+    let y = 0
+    while y < h {
+        let i = 0
+        while i < md {
+            _sgm_set(prev, i, STEREO_SGM_INF)
+            i = int_add(i, 1)
+        }
+        let prev_min = STEREO_SGM_INF
+        let x = int_sub(w, 1)
+        let row_off = int_mul(y, w)
+        while x >= 0 {
+            let base = int_mul(int_add(row_off, x), md)
+            let curr_min = STEREO_SGM_INF
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if x == int_sub(w, 1) {
+                    l_val = c_pd
+                } else {
+                    if prev_min >= STEREO_SGM_INF {
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(prev, d)
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(prev, int_sub(d, 1)), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(prev, int_add(d, 1)), p1)
+                        }
+                        let dd = int_add(prev_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_min { curr_min = l_val }
+                d = int_add(d, 1)
+            }
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(prev, d2, l_val)
+                d2 = int_add(d2, 1)
+            }
+            prev_min = curr_min
+            x = int_sub(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return 0
+}
+
+// TB path: scan rows top to bottom. Maintain a W*D rolling buffer of the
+// "previous row's L" and a W-sized vector of per-column scalar mins.
+fn _sgm_aggregate_tb(cost, sum, w, h, md, p1, p2) {
+    let row_buf = _sgm_buf_alloc(int_mul(w, md), STEREO_SGM_INF)
+    let row_min = _sgm_buf_alloc(w, STEREO_SGM_INF)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let base = int_mul(int_add(row_off, x), md)
+            let prev_col_min = _sgm_get(row_min, x)
+            let prev_col_base = int_mul(x, md)
+            let curr_col_min = STEREO_SGM_INF
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if y == 0 {
+                    l_val = c_pd
+                } else {
+                    if prev_col_min >= STEREO_SGM_INF {
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(row_buf, int_add(prev_col_base, d))
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(row_buf,
+                                                  int_add(prev_col_base,
+                                                          int_sub(d, 1))), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(row_buf,
+                                                   int_add(prev_col_base,
+                                                           int_add(d, 1))), p1)
+                        }
+                        let dd = int_add(prev_col_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_col_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_col_min { curr_col_min = l_val }
+                d = int_add(d, 1)
+            }
+            // Add into sum and stash into row_buf for next y.
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(row_buf, int_add(prev_col_base, d2), l_val)
+                d2 = int_add(d2, 1)
+            }
+            _sgm_set(row_min, x, curr_col_min)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return 0
+}
+
+// BT path: scan rows bottom to top.
+fn _sgm_aggregate_bt(cost, sum, w, h, md, p1, p2) {
+    let row_buf = _sgm_buf_alloc(int_mul(w, md), STEREO_SGM_INF)
+    let row_min = _sgm_buf_alloc(w, STEREO_SGM_INF)
+    let y = int_sub(h, 1)
+    while y >= 0 {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let base = int_mul(int_add(row_off, x), md)
+            let prev_col_min = _sgm_get(row_min, x)
+            let prev_col_base = int_mul(x, md)
+            let curr_col_min = STEREO_SGM_INF
+            let temp = _sgm_buf_alloc(md, 0)
+            let d = 0
+            while d < md {
+                let c_pd = _sgm_get(cost, int_add(base, d))
+                let l_val = 0
+                if y == int_sub(h, 1) {
+                    l_val = c_pd
+                } else {
+                    if prev_col_min >= STEREO_SGM_INF {
+                        l_val = c_pd
+                    } else {
+                        let a = _sgm_get(row_buf, int_add(prev_col_base, d))
+                        let b = STEREO_SGM_INF
+                        if d > 0 {
+                            b = int_add(_sgm_get(row_buf,
+                                                  int_add(prev_col_base,
+                                                          int_sub(d, 1))), p1)
+                        }
+                        let cc = STEREO_SGM_INF
+                        if d < int_sub(md, 1) {
+                            cc = int_add(_sgm_get(row_buf,
+                                                   int_add(prev_col_base,
+                                                           int_add(d, 1))), p1)
+                        }
+                        let dd = int_add(prev_col_min, p2)
+                        let m4 = _sgm_min4(a, b, cc, dd)
+                        if c_pd >= STEREO_SGM_INF {
+                            l_val = STEREO_SGM_INF
+                        } else {
+                            l_val = int_sub(int_add(c_pd, m4), prev_col_min)
+                            if l_val > STEREO_SGM_INF { l_val = STEREO_SGM_INF }
+                            if l_val < 0 { l_val = 0 }
+                        }
+                    }
+                }
+                _sgm_set(temp, d, l_val)
+                if l_val < curr_col_min { curr_col_min = l_val }
+                d = int_add(d, 1)
+            }
+            let d2 = 0
+            while d2 < md {
+                let l_val = _sgm_get(temp, d2)
+                let s_old = _sgm_get(sum, int_add(base, d2))
+                let s_new = int_add(s_old, l_val)
+                if s_new > STEREO_SGM_INF { s_new = STEREO_SGM_INF }
+                _sgm_set(sum, int_add(base, d2), s_new)
+                _sgm_set(row_buf, int_add(prev_col_base, d2), l_val)
+                d2 = int_add(d2, 1)
+            }
+            _sgm_set(row_min, x, curr_col_min)
+            x = int_add(x, 1)
+        }
+        y = int_sub(y, 1)
+    }
+    return 0
+}
+
+// ---- argmin to disparity map --------------------------------------------
+//
+// _stereo_sgm_argmin(sum, w, h, ws, md) -> byte buffer (disparity map)
+//   For each interior pixel, walks the D entries in `sum` and picks the
+//   smallest. Border pixels (within `half` of the edge) store 0. The
+//   returned buffer is the standard R7E disparity-map byte layout.
+
+fn _stereo_sgm_argmin(sum, w, h, ws, md) {
+    let area = int_mul(w, h)
+    let map = _stereo_zero_map(area)
+    let half = ws / 2
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let base = int_mul(int_add(row_off, x), md)
+            let best = _sgm_get(sum, base)
+            let best_d = 0
+            let d = 1
+            while d < md {
+                let s = _sgm_get(sum, int_add(base, d))
+                if s < best {
+                    best = s
+                    best_d = d
+                }
+                d = int_add(d, 1)
+            }
+            if best_d > 255 { best_d = 255 }
+            store8(map + int_add(row_off, x), best_d)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return map
+}
+
+// ---- stereo_disparity_sgm ------------------------------------------------
+//
+// Public 4-path SGM entry point. Mirrors stereo_disparity's contract.
+
+fn stereo_disparity_sgm(left, right, w, h, win_size, max_disp, p1, p2) {
+    if w <= 0   { return _stereo_fail() }
+    if h <= 0   { return _stereo_fail() }
+    if left == 0  { return _stereo_fail() }
+    if right == 0 { return _stereo_fail() }
+    if w > STEREO_SGM_MAX_DIM { return _stereo_fail() }
+    if h > STEREO_SGM_MAX_DIM { return _stereo_fail() }
+    let area = int_mul(w, h)
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_sgm_clamp_max_disp(max_disp)
+    let pp1 = _stereo_sgm_clamp_p1(p1)
+    let pp2 = _stereo_sgm_clamp_p2(p2, pp1)
+    let volume = int_mul(area, md)
+    if volume > STEREO_SGM_MAX_VOLUME { return _stereo_fail() }
+    let half = ws / 2
+    if w < int_add(ws, 1) { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+    if h < ws             { return _stereo_result(_stereo_zero_map(area), 0, 0, area) }
+
+    let cost = _stereo_sgm_build_cost(left, right, w, h, ws, md)
+    let sum  = _sgm_buf_alloc(volume, 0)
+
+    // Pass 1: cache-friendly forward sweep (LR + TB).
+    _sgm_aggregate_lr(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_tb(cost, sum, w, h, md, pp1, pp2)
+    // Pass 2: reverse sweep (RL + BT).
+    _sgm_aggregate_rl(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_bt(cost, sum, w, h, md, pp1, pp2)
+
+    let map = _stereo_sgm_argmin(sum, w, h, ws, md)
+
+    // Stats over interior pixels.
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let dv = load8(map + int_add(row_off, x))
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, dv)
+            if dv > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(map, mean, density_milli, area)
+}
+
+// ---- stereo_disparity_sgm_quality ---------------------------------------
+//
+// SGM + LR-check + sub-pixel refinement. We:
+//   1. Build the SGM cost volume and aggregate (same as
+//      stereo_disparity_sgm).
+//   2. Argmin to get the integer SGM disparity map (left->right).
+//   3. Run R8D's right->left block-matching disparity scan.
+//   4. For each interior left pixel, compare the SGM disparity at (x, y)
+//      with the right pass's disparity at (x - d_L, y). If they agree
+//      within tolerance, refine the SGM disparity sub-pixel by fitting
+//      a parabola to S(x, y, d*-1), S(x, y, d*), S(x, y, d*+1).
+//   5. Inconsistent pixels store 0 milli (matching the integer LR contract).
+//
+// We reuse the SGM aggregated sum (which is a smoothed, monotonic-near-min
+// curve in d) for the parabolic fit -- not the raw SAD -- because the
+// SGM-aggregated S(x, y, d) is the actual cost function whose argmin we
+// took, so its parabolic neighborhood reflects the SGM-smoothed minimum.
+
+fn stereo_disparity_sgm_quality(left, right, w, h,
+                                win_size, max_disp,
+                                p1, p2, lr_tolerance) {
+    let empty = list_new()
+    if w <= 0   { return _stereo_result(empty, 0, 0, 0) }
+    if h <= 0   { return _stereo_result(empty, 0, 0, 0) }
+    if left == 0  { return _stereo_result(empty, 0, 0, 0) }
+    if right == 0 { return _stereo_result(empty, 0, 0, 0) }
+    if w > STEREO_SGM_MAX_DIM { return _stereo_result(empty, 0, 0, 0) }
+    if h > STEREO_SGM_MAX_DIM { return _stereo_result(empty, 0, 0, 0) }
+    let area = int_mul(w, h)
+    let ws = _stereo_clamp_win_size(win_size)
+    let md = _stereo_sgm_clamp_max_disp(max_disp)
+    let pp1 = _stereo_sgm_clamp_p1(p1)
+    let pp2 = _stereo_sgm_clamp_p2(p2, pp1)
+    let tol = _stereo_clamp_lr_tol(lr_tolerance)
+    let volume = int_mul(area, md)
+    if volume > STEREO_SGM_MAX_VOLUME { return _stereo_result(empty, 0, 0, 0) }
+    let half = ws / 2
+
+    // Pre-allocate milli list area entries.
+    let milli = list_new()
+    let z = 0
+    while z < area {
+        push(milli, 0)
+        z = int_add(z, 1)
+    }
+    if w < int_add(ws, 1) { return _stereo_result(milli, 0, 0, area) }
+    if h < ws             { return _stereo_result(milli, 0, 0, area) }
+
+    let cost = _stereo_sgm_build_cost(left, right, w, h, ws, md)
+    let sum  = _sgm_buf_alloc(volume, 0)
+    _sgm_aggregate_lr(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_tb(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_rl(cost, sum, w, h, md, pp1, pp2)
+    _sgm_aggregate_bt(cost, sum, w, h, md, pp1, pp2)
+    let map_L = _stereo_sgm_argmin(sum, w, h, ws, md)
+
+    // Right->left block-matching map (R8D style; cheaper than full SGM).
+    let map_R = _stereo_disparity_right(left, right, w, h, ws, md)
+
+    let valid_count = 0
+    let disp_sum = 0
+    let nonzero_count = 0
+    let y = half
+    let y_max = int_sub(h, half)
+    while y < y_max {
+        let row_off = int_mul(y, w)
+        let x = half
+        let x_max = int_sub(w, half)
+        while x < x_max {
+            let dL = load8(map_L + int_add(row_off, x))
+            let x_r = int_sub(x, dL)
+            let consistent = 0
+            if x_r >= half {
+                if x_r < int_sub(w, half) {
+                    let dR = load8(map_R + int_add(row_off, x_r))
+                    let diff = int_sub(dL, dR)
+                    if diff < 0 { diff = 0 - diff }
+                    if diff <= tol { consistent = 1 }
+                }
+            }
+            let m_disp = 0
+            if consistent == 1 {
+                if dL > 0 {
+                    let base = int_mul(int_add(row_off, x), md)
+                    let s_0 = _sgm_get(sum, int_add(base, dL))
+                    let s_m1 = s_0
+                    if dL > 0 {
+                        s_m1 = _sgm_get(sum, int_add(base, int_sub(dL, 1)))
+                    }
+                    let s_p1 = s_0
+                    if int_add(dL, 1) < md {
+                        s_p1 = _sgm_get(sum, int_add(base, int_add(dL, 1)))
+                    }
+                    m_disp = _stereo_subpx_refine(dL, s_m1, s_0, s_p1)
+                } else {
+                    m_disp = 0
+                }
+            }
+            list_set(milli, int_add(row_off, x), m_disp)
+            valid_count = int_add(valid_count, 1)
+            disp_sum = int_add(disp_sum, m_disp)
+            if m_disp > 0 { nonzero_count = int_add(nonzero_count, 1) }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    let mean = 0
+    if valid_count > 0 { mean = disp_sum / valid_count }
+    let density_milli = 0
+    if valid_count > 0 {
+        density_milli = int_mul(nonzero_count, 1000) / valid_count
+    }
+    return _stereo_result(milli, mean, density_milli, area)
+}
+
+// ---- chat /depth_sgm helpers --------------------------------------------
+//
+// Optional SGM-mode chat admin. Same shape as stereo_pgm_args /
+// stereo_quality_pgm_args.
+
+fn stereo_sgm_pgm_paths(path_l, path_r) {
+    if len(path_l) == 0 {
+        return "(/depth_sgm needs two PATHs -- usage: /depth_sgm L.pgm R.pgm)"
+    }
+    if len(path_r) == 0 {
+        return "(/depth_sgm needs TWO paths -- got 1)"
+    }
+    let r_l = pgm_parse_file(path_l)
+    let err_l = pgm_result_error(r_l)
+    if len(err_l) > 0 {
+        return "(depth_sgm FAILED on L: " + err_l + ")"
+    }
+    let r_r = pgm_parse_file(path_r)
+    let err_r = pgm_result_error(r_r)
+    if len(err_r) > 0 {
+        return "(depth_sgm FAILED on R: " + err_r + ")"
+    }
+    let w_l = pgm_result_width(r_l)
+    let h_l = pgm_result_height(r_l)
+    let w_r = pgm_result_width(r_r)
+    let h_r = pgm_result_height(r_r)
+    if w_l != w_r {
+        return "(depth_sgm FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if h_l != h_r {
+        return "(depth_sgm FAILED: dim mismatch L="
+            + int_to_str(w_l) + "x" + int_to_str(h_l)
+            + " R=" + int_to_str(w_r) + "x" + int_to_str(h_r) + ")"
+    }
+    if w_l > STEREO_SGM_MAX_DIM { return "(depth_sgm FAILED: L too large -- max 128x128)" }
+    if h_l > STEREO_SGM_MAX_DIM { return "(depth_sgm FAILED: L too large -- max 128x128)" }
+    let d_l = pgm_result_data(r_l)
+    let d_r = pgm_result_data(r_r)
+    let s = stereo_disparity_sgm(d_l, d_r, w_l, h_l,
+                                 STEREO_DEFAULT_WIN_SIZE,
+                                 32,
+                                 STEREO_SGM_DEFAULT_P1,
+                                 STEREO_SGM_DEFAULT_P2)
+    let mean = stereo_result_mean(s)
+    let density = stereo_result_density(s)
+    return "(depth_sgm " + int_to_str(w_l) + "x" + int_to_str(h_l)
+        + " mean_disp=" + int_to_str(mean)
+        + " density=" + int_to_str(density)
+        + "milli " + stereo_density_label(density) + ")"
+}
+
+fn stereo_sgm_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/depth_sgm needs two PATHs -- usage: /depth_sgm L.pgm R.pgm)"
+    }
+    let parts = _stereo_split_two(arg)
+    return stereo_sgm_pgm_paths(parts[0], parts[1])
+}
+

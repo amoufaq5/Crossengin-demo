@@ -1,0 +1,218 @@
+// CrossEngin substrate: gate router.
+//
+// Purpose
+//   Gates are learned, content-based routers between signals and parts
+//   (ADR-0009). A gate holds a table keyed on signal type; each entry is a set
+//   of destination parts with a routing weight. gate_route returns the parts
+//   whose weight clears the admit threshold. Routes are learned: reinforced
+//   when they contribute to reward / error-reduction, decayed and pruned when
+//   useless -- the same growth/prune discipline as synapses (ADR-0007), applied
+//   to route weights.
+//
+//   Constitutional routing is privileged and NOT learnable (ADR-0009, ADR-0045):
+//   an XSIG_CONST signal always broadcasts to every part at the top priority,
+//   and the gate cannot down-weight, reinforce, or prune that path. It is not
+//   stored in the learnable table at all -- it is computed.
+//
+// ADRs implemented: ADR-0009 (gate design), ADR-0045 (constitutional routing is
+//   immutable). Depends-on note: NOVA enhancement #7 (learned routing tables at
+//   scale) and #4 (SIMD broadcast fan-out) are scale upgrades; the routing
+//   semantics here are complete now.
+// NOVA dependencies: builtins (maps, lists, keys, int_to_str).
+// CrossEngin dependencies: src/substrate/signal_dispatch.nova,
+//   src/substrate/part_registry.nova (and transitively node_pool_manager for
+//   fp_clamp / first_nodes presets used to seed routes).
+
+import "signal_dispatch.nova"
+import "part_registry.nova"
+
+// Routing-weight bounds and thresholds (milli units).
+let GATE_R_MIN  = 0
+let GATE_R_MAX  = 1000
+let GATE_SEED_W = 700   // 0.7 seeded prior for hand-written routes
+let GATE_ADMIT  = 100   // weight must exceed 0.1 for a destination to receive
+let GATE_PRUNE  = 30    // routes at/below 0.03 are pruned
+
+// ---- gate layout ----------------------------------------------------------
+// The routing table is a list indexed by signal type (1..XSIG_MAX), each slot
+// holding that type's list of [dest_part_id, weight] routes. Indexing by type
+// gives the O(1) typed dispatch ADR-0008 calls for, and avoids NOVA's builtin
+// map (hard 16-key cap, < the 18 signal types -- see NEXT_SESSION.md).
+let GATE_TAG   = 0
+let GATE_REG   = 1   // bound registry (destination universe; "all parts")
+let GATE_TABLE = 2   // list indexed by stype -> list of [dest_part_id, weight]
+let GATE_OBJ_TAG = 990
+
+fn gate_clamp_w(w) {
+    return fp_clamp(w, GATE_R_MIN, GATE_R_MAX)
+}
+
+fn gate_new(reg) {
+    let gate = list_new()
+    push(gate, GATE_OBJ_TAG)
+    push(gate, reg)
+    let table = list_new()
+    let i = 0
+    while i <= XSIG_MAX {
+        push(table, list_new())
+        i = i + 1
+    }
+    push(gate, table)
+    return gate
+}
+
+fn _gate_type_valid(stype) {
+    if stype < 1 { return 0 }
+    if stype > XSIG_MAX { return 0 }
+    return 1
+}
+
+fn _gate_routes(gate, stype) {
+    if _gate_type_valid(stype) == 0 { return list_new() }
+    return gate[GATE_TABLE][stype]
+}
+
+// Add or update a learnable route type -> dest with the given weight.
+// Constitutional signals are never tabled (their path is computed, immutable).
+fn gate_add_route(gate, stype, dest, weight) {
+    if xsig_is_constitutional(stype) == 1 { return 0 }
+    let routes = _gate_routes(gate, stype)
+    let i = 0
+    while i < len(routes) {
+        if routes[i][0] == dest {
+            list_set(routes[i], 1, gate_clamp_w(weight))
+            return 1
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, dest)
+    push(entry, gate_clamp_w(weight))
+    push(routes, entry)
+    return 1
+}
+
+// Seed routes from each part's modality preset (ADR-0010 input table). This
+// reproduces the ADR-0009 hand-written priors (SENSORY->perception,
+// GOAL->reasoning+action, RECALL->episodic, ...) and more. CONST is skipped:
+// it is the privileged computed broadcast.
+fn gate_seed_from_parts(gate, reg) {
+    let ids = registry_ids(reg)
+    let i = 0
+    while i < len(ids) {
+        let part = registry_get(reg, ids[i])
+        let types = fn_preset_input_types(part_preset(part))
+        let j = 0
+        while j < len(types) {
+            if xsig_is_constitutional(types[j]) == 0 {
+                gate_add_route(gate, types[j], ids[i], GATE_SEED_W)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Route a signal to the set of destination part ids that should receive it.
+//   - XSIG_CONST: broadcast to ALL parts (privileged, ADR-0045).
+//   - otherwise: parts whose learned route weight exceeds the admit threshold.
+fn gate_route(gate, signal) {
+    let stype = sig_type(signal)
+    if xsig_is_constitutional(stype) == 1 {
+        return registry_ids(gate[GATE_REG])
+    }
+    let dests = list_new()
+    if _gate_type_valid(stype) == 0 { return dests }
+    let routes = gate[GATE_TABLE][stype]
+    let i = 0
+    while i < len(routes) {
+        if routes[i][1] > GATE_ADMIT {
+            push(dests, routes[i][0])
+        }
+        i = i + 1
+    }
+    return dests
+}
+
+// Read the routing weight for type -> dest (0 if no such route).
+fn gate_weight(gate, stype, dest) {
+    if _gate_type_valid(stype) == 0 { return 0 }
+    let routes = gate[GATE_TABLE][stype]
+    let i = 0
+    while i < len(routes) {
+        if routes[i][0] == dest { return routes[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Reinforce (or weaken, with negative delta) a route. Reused by reward and
+// error-reduction signals (ADR-0009). Creating a route requires positive delta.
+// Constitutional routing cannot be reinforced.
+fn gate_reinforce(gate, stype, dest, delta) {
+    if xsig_is_constitutional(stype) == 1 { return 0 }
+    let routes = _gate_routes(gate, stype)
+    let i = 0
+    while i < len(routes) {
+        if routes[i][0] == dest {
+            list_set(routes[i], 1, gate_clamp_w(routes[i][1] + delta))
+            return 1
+        }
+        i = i + 1
+    }
+    if delta > 0 {
+        let entry = list_new()
+        push(entry, dest)
+        push(entry, gate_clamp_w(delta))
+        push(routes, entry)
+        return 1
+    }
+    return 0
+}
+
+// Decay every learnable route weight by a milli rate (e.g. 950 == 0.95).
+fn gate_decay(gate, rate) {
+    let t = gate[GATE_TABLE]
+    let stype = 1
+    while stype <= XSIG_MAX {
+        let routes = t[stype]
+        let j = 0
+        while j < len(routes) {
+            list_set(routes[j], 1, fp_mul(routes[j][1], rate))
+            j = j + 1
+        }
+        stype = stype + 1
+    }
+    return 1
+}
+
+// Prune routes at/below the prune threshold. Returns the count removed.
+// Constitutional routing is never in the table, so it is never pruned.
+fn gate_prune(gate) {
+    let t = gate[GATE_TABLE]
+    let pruned = 0
+    let stype = 1
+    while stype <= XSIG_MAX {
+        let routes = t[stype]
+        let kept = list_new()
+        let j = 0
+        while j < len(routes) {
+            if routes[j][1] > GATE_PRUNE {
+                push(kept, routes[j])
+            } else {
+                pruned = pruned + 1
+            }
+            j = j + 1
+        }
+        list_set(t, stype, kept)
+        stype = stype + 1
+    }
+    return pruned
+}
+
+// Number of destinations currently routed for a signal type.
+fn gate_route_count(gate, stype) {
+    if _gate_type_valid(stype) == 0 { return 0 }
+    return len(gate[GATE_TABLE][stype])
+}

@@ -1,0 +1,381 @@
+// Unit tests for src/io/transducers/image_detector.nova (R15C).
+//
+// HOG-based sliding-window object detector. Each test fixture is
+// constructed in-memory (alloc + store8) so the suite never depends on
+// on-disk PGMs; the integration scenario_jjj_detector.sh exercises the
+// full chat-path wiring.
+//
+// Coverage (~25 assertions):
+//   * det_train_template on a 32x32 fixture returns a HOG result whose
+//     descriptor has the expected length (324 ints for the default
+//     8-cell / 9-bin layout).
+//   * det_train_template with an oversized window returns the empty
+//     hog_result (degenerate sentinel; descriptor length == 0).
+//   * det_train_template with a too-small window also returns empty.
+//   * det_sliding_window across an image containing ONE instance of the
+//     template at a known offset returns >= 1 detection whose (x, y)
+//     is within +/- stride of the expected position.
+//   * det_sliding_window across a UNIFORM image (no instance) returns
+//     0 detections at the default threshold.
+//   * det_sliding_window with stride 0 defaults to 1 (via clamp).
+//   * det_sliding_window with template > image returns 0 detections.
+//   * det_sliding_window with zero-pointer image returns 0 detections.
+//   * det_nms on 3 overlapping detections at the SAME location keeps
+//     the lowest-distance one (1 survivor).
+//   * det_nms on 2 NON-overlapping detections (boxes far apart) keeps
+//     both (2 survivors).
+//   * det_nms on an empty list returns empty.
+//   * det_nms on a 1-detection list returns the same 1.
+//   * det_detect end-to-end: positive fixture -> at least 1 detection
+//     after NMS at the expected (x, y).
+//   * det_count_label round-trip across the bucket boundaries
+//     (0, 1, 4, many).
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_detector.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+// Build a width x height image that is uniformly `value`.
+fn _flat_image(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Build a width x height image filled with `bg`, and stamp a vertical
+// edge (left half = `low`, right half = `high`) of dimensions tw x th
+// at offset (ox, oy). Used for templates and scenes.
+fn _scene_with_vertical_edge_at(width, height, bg, ox, oy, tw, th, low, high) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, bg)
+        i = i + 1
+    }
+    let half = tw / 2
+    let y = 0
+    while y < th {
+        let row = (oy + y) * width
+        let x = 0
+        while x < tw {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row + (ox + x), v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Build a standalone 32x32 vertical-edge template (left half low,
+// right half high).
+fn _vertical_edge_template(low, high) {
+    let area = 32 * 32
+    let buf = alloc(area + 1)
+    let half = 16
+    let y = 0
+    while y < 32 {
+        let row = y * 32
+        let x = 0
+        while x < 32 {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- det_train_template basics ------------------------------------------
+
+fn test_train_template_returns_324_descriptor() {
+    let buf = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(buf, 32, 32, 32, 32)
+    let desc = hog_descriptor(tpl)
+    ce_eq("template HOG descriptor length == 324 (3x3 blocks * 36)",
+          len(desc), 324)
+    ce_eq("template HOG width slot == 32",
+          hog_result_width(tpl), 32)
+    ce_eq("template HOG height slot == 32",
+          hog_result_height(tpl), 32)
+}
+
+fn test_train_template_oversized_window_returns_empty() {
+    let buf = _vertical_edge_template(0, 255)
+    // Window 200x200 > DET_MAX_TEMPLATE_DIM = 128.
+    let tpl = det_train_template(buf, 32, 32, 200, 200)
+    ce_eq("oversized template window -> empty descriptor",
+          len(hog_descriptor(tpl)), 0)
+}
+
+fn test_train_template_too_small_window_returns_empty() {
+    let buf = _vertical_edge_template(0, 255)
+    // Window 8x8 < DET_MIN_TEMPLATE_DIM = 16.
+    let tpl = det_train_template(buf, 32, 32, 8, 8)
+    ce_eq("too-small template window -> empty descriptor",
+          len(hog_descriptor(tpl)), 0)
+}
+
+fn test_train_template_window_larger_than_image_returns_empty() {
+    let buf = _vertical_edge_template(0, 255)
+    // Window 64x64 > image 32x32.
+    let tpl = det_train_template(buf, 32, 32, 64, 64)
+    ce_eq("template window > image -> empty descriptor",
+          len(hog_descriptor(tpl)), 0)
+}
+
+fn test_train_template_zero_pointer_returns_empty() {
+    let tpl = det_train_template(0, 32, 32, 32, 32)
+    ce_eq("zero-pointer template -> empty descriptor",
+          len(hog_descriptor(tpl)), 0)
+}
+
+// ---- det_sliding_window: positive fixture (template present) ------------
+
+fn test_sliding_window_finds_known_position() {
+    // Build a 64x64 scene that contains the 32x32 vertical-edge template
+    // at offset (16, 16). Train template on the standalone 32x32 image,
+    // then slide across the scene at stride 8. We use a 4000-milli
+    // threshold: identical content scores 0 (well below), and uniform
+    // background regions score around 3000 (above our negative-test
+    // threshold of 2000) -- so 4000 catches the (16,16) target without
+    // exploding into the background.
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _scene_with_vertical_edge_at(64, 64, 128, 16, 16, 32, 32, 0, 255)
+    let dets = det_sliding_window(scene, 64, 64, tpl, 4000, 8)
+    let n = len(dets)
+    ce_check("sliding window finds at least 1 detection on positive fixture",
+             n >= 1)
+    // Find the detection nearest to (16, 16) and check it is within stride.
+    let best_x = 0 - 1
+    let best_y = 0 - 1
+    let best_err = 999999
+    let i = 0
+    while i < n {
+        let d = dets[i]
+        let x = det_result_x(d)
+        let y = det_result_y(d)
+        let ex = x - 16
+        if ex < 0 { ex = 0 - ex }
+        let ey = y - 16
+        if ey < 0 { ey = 0 - ey }
+        let err = ex + ey
+        if err < best_err {
+            best_err = err
+            best_x = x
+            best_y = y
+        }
+        i = i + 1
+    }
+    // Within +/- stride (8 pixels per axis -> +/- 16 total).
+    ce_check("best detection within stride of (16, 16)",
+             best_err <= 16)
+    ce_check("best detection x >= 0", best_x >= 0)
+    ce_check("best detection y >= 0", best_y >= 0)
+}
+
+// ---- det_sliding_window: negative fixture (no template content) ---------
+
+fn test_sliding_window_no_template_in_uniform_image() {
+    // Uniform image -- no gradient, HOG descriptor is all zeros. The
+    // template (rich vertical edge) has nonzero L2-Hys-normalized
+    // components; the L1 distance between zero-vector and the template
+    // is the sum of all template components -- for our 32x32 vertical
+    // edge that's around 3000 milli. We use a TIGHTER threshold of
+    // 2000 milli so the uniform-scene case stays cleanly below the
+    // expected "match" band; identical-content matches always score 0
+    // milli so 2000 still admits them.
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _flat_image(64, 64, 128)
+    let dets = det_sliding_window(scene, 64, 64, tpl, 2000, 8)
+    ce_eq("uniform scene -> 0 detections (threshold 2000)",
+          len(dets), 0)
+}
+
+// ---- det_sliding_window: identical-image case ---------------------------
+
+fn test_sliding_window_identical_template_zero_distance() {
+    // When the scene is EXACTLY the template (same dims), the only
+    // candidate window IS the template, with L1 distance 0.
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    // Use the SAME image as the scene (32x32 -> only one window at (0,0)).
+    let dets = det_sliding_window(tpl_img, 32, 32, tpl, 4000, 8)
+    ce_eq("identical scene/template -> 1 detection",
+          len(dets), 1)
+    if len(dets) > 0 {
+        let d = dets[0]
+        ce_eq("identical detection at x=0", det_result_x(d), 0)
+        ce_eq("identical detection at y=0", det_result_y(d), 0)
+        ce_eq("identical detection distance == 0", det_result_distance(d), 0)
+    }
+}
+
+// ---- det_sliding_window: edge cases -------------------------------------
+
+fn test_sliding_window_template_larger_than_image_returns_empty() {
+    // Build a small 16x16 scene and a 32x32 template; the template
+    // cannot fit in any window so the detector returns 0 detections.
+    let small_scene = _flat_image(16, 16, 200)
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let dets = det_sliding_window(small_scene, 16, 16, tpl, 4000, 8)
+    ce_eq("template > image -> 0 detections (graceful)",
+          len(dets), 0)
+}
+
+fn test_sliding_window_zero_pointer_image_returns_empty() {
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let dets = det_sliding_window(0, 64, 64, tpl, 4000, 8)
+    ce_eq("zero-pointer image -> 0 detections",
+          len(dets), 0)
+}
+
+fn test_sliding_window_zero_stride_clamps_to_default() {
+    // Stride 0 should clamp to DET_DEFAULT_STRIDE = 8 (not loop forever).
+    // Verify by checking the detector returns SOMETHING finite (the
+    // assertion is that the call completes; the result list may be
+    // empty depending on the scene).
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _scene_with_vertical_edge_at(64, 64, 128, 16, 16, 32, 32, 0, 255)
+    let dets = det_sliding_window(scene, 64, 64, tpl, 4000, 0)
+    // Should be the same as with stride 8 (>= 1 detection).
+    ce_check("stride=0 clamped to default; produces at least 1 detection",
+             len(dets) >= 1)
+}
+
+// ---- det_nms: overlapping detections ------------------------------------
+
+fn test_nms_overlapping_keeps_lowest_distance() {
+    // Build a fake list of 3 detections at nearly the same location,
+    // with different distances. NMS at IoU 0.3 should keep only the
+    // lowest-distance one.
+    let dets = list_new()
+    let d0 = list_new()
+    push(d0, 10) push(d0, 10) push(d0, 8000)
+    push(dets, d0)
+    let d1 = list_new()
+    push(d1, 12) push(d1, 12) push(d1, 5000)
+    push(dets, d1)
+    let d2 = list_new()
+    push(d2, 14) push(d2, 14) push(d2, 11000)
+    push(dets, d2)
+    // Box size 32, IoU threshold 300 milli = 0.30.
+    let kept = det_nms(dets, 32, 300)
+    ce_eq("3 overlapping detections collapsed to 1 after NMS",
+          len(kept), 1)
+    if len(kept) > 0 {
+        let surv = kept[0]
+        ce_eq("NMS survivor distance == 5000 (lowest)",
+              det_result_distance(surv), 5000)
+        ce_eq("NMS survivor x == 12", det_result_x(surv), 12)
+        ce_eq("NMS survivor y == 12", det_result_y(surv), 12)
+    }
+}
+
+// ---- det_nms: non-overlapping detections --------------------------------
+
+fn test_nms_non_overlapping_keeps_both() {
+    // Two 32x32 boxes far apart (one at (0, 0), one at (100, 100));
+    // IoU is 0 (no spatial overlap). Both should survive.
+    let dets = list_new()
+    let d0 = list_new()
+    push(d0, 0) push(d0, 0) push(d0, 4000)
+    push(dets, d0)
+    let d1 = list_new()
+    push(d1, 100) push(d1, 100) push(d1, 6000)
+    push(dets, d1)
+    let kept = det_nms(dets, 32, 300)
+    ce_eq("2 non-overlapping detections -> both survive NMS",
+          len(kept), 2)
+}
+
+// ---- det_nms: trivial sizes ---------------------------------------------
+
+fn test_nms_empty_list_returns_empty() {
+    let empty = list_new()
+    let kept = det_nms(empty, 32, 300)
+    ce_eq("NMS on empty list returns empty",
+          len(kept), 0)
+}
+
+fn test_nms_single_detection_returns_single() {
+    let dets = list_new()
+    let d0 = list_new()
+    push(d0, 10) push(d0, 20) push(d0, 7000)
+    push(dets, d0)
+    let kept = det_nms(dets, 32, 300)
+    ce_eq("NMS on 1 detection returns 1",
+          len(kept), 1)
+}
+
+// ---- det_detect end-to-end ----------------------------------------------
+
+fn test_det_detect_end_to_end_finds_known_target() {
+    // Same setup as the sliding-window positive test, but go through the
+    // det_detect convenience wrapper (which adds NMS using the template's
+    // dimensions). Expect at least 1 detection (after NMS).
+    let tpl_img = _vertical_edge_template(0, 255)
+    let tpl = det_train_template(tpl_img, 32, 32, 32, 32)
+    let scene = _scene_with_vertical_edge_at(64, 64, 128, 16, 16, 32, 32, 0, 255)
+    let dets = det_detect(scene, 64, 64, tpl, 4000, 8, 300)
+    ce_check("end-to-end det_detect finds at least 1 detection",
+             len(dets) >= 1)
+}
+
+// ---- det_count_label round-trip -----------------------------------------
+
+fn test_count_label_buckets() {
+    ce_str_eq("count 0 -> none", det_count_label(0),
+              "image_detector_count_none")
+    ce_str_eq("count 1 -> one", det_count_label(1),
+              "image_detector_count_one")
+    ce_str_eq("count 3 -> few", det_count_label(3),
+              "image_detector_count_few")
+    ce_str_eq("count 4 -> few (boundary)", det_count_label(4),
+              "image_detector_count_few")
+    ce_str_eq("count 7 -> many", det_count_label(7),
+              "image_detector_count_many")
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_train_template_returns_324_descriptor()
+    test_train_template_oversized_window_returns_empty()
+    test_train_template_too_small_window_returns_empty()
+    test_train_template_window_larger_than_image_returns_empty()
+    test_train_template_zero_pointer_returns_empty()
+    test_sliding_window_finds_known_position()
+    test_sliding_window_no_template_in_uniform_image()
+    test_sliding_window_identical_template_zero_distance()
+    test_sliding_window_template_larger_than_image_returns_empty()
+    test_sliding_window_zero_pointer_image_returns_empty()
+    test_sliding_window_zero_stride_clamps_to_default()
+    test_nms_overlapping_keeps_lowest_distance()
+    test_nms_non_overlapping_keeps_both()
+    test_nms_empty_list_returns_empty()
+    test_nms_single_detection_returns_single()
+    test_det_detect_end_to_end_finds_known_target()
+    test_count_label_buckets()
+    ce_summary("image_detector")
+}
+
+main()

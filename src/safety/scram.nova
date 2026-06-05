@@ -1,0 +1,722 @@
+// CrossEngin safety: SCRAM-SHA-256 authentication primitives (RFC 5802,
+// RFC 7677, RFC 7635) + PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) + inline
+// Base64 (RFC 4648 §4).
+//
+// Purpose
+//
+//   R36A shipped TURN long-term-credential authentication per
+//   RFC 5389 §15.4 -- MD5(user:realm:pass) keyed HMAC-SHA1 over the
+//   STUN/TURN message prefix. R36A's exit caveat documented MD5's
+//   cryptographic break (Wang 2004, FastColl 2007, MD5SHATTERED 2009)
+//   and named SCRAM-SHA1 / SCRAM-SHA256 (RFC 7635) as the modern
+//   replacement -- explicitly deferred. R38D ships SCRAM-SHA-256.
+//
+//   This module is the SCRAM-SHA-256 PRIMITIVES leaf: the four message
+//   constructors of RFC 5802 §5.1, the proof / signature math of
+//   RFC 5802 §3, the PBKDF2-HMAC-SHA256 key-derivation function of
+//   RFC 8018 §5.2, and the Base64 encode/decode helpers of RFC 4648
+//   §4 that the text-form SCRAM protocol needs for binary nonces /
+//   salts / proofs. It is NOT a live TURN client -- the per-method
+//   wire-level SCRAM auth path for the TURN Allocate request (the
+//   thing R36A's `turn_emit_allocate_request_authed` is for MD5)
+//   lives in `src/federation/turn.nova`, where it imports this
+//   module.
+//
+//   Both MD5 and SCRAM auth paths COEXIST in turn.nova after R38D.
+//   Clients pick one via the SECURITY-FEATURES attribute (RFC 7635
+//   §4); R38D adds that attribute alongside the existing auth attrs
+//   without disturbing R36A's API surface.
+//
+// RFC 5802 / RFC 7677 SCRAM-SHA-256 protocol round-trip
+//
+//   Client -> Server  client-first  = "n,,n=<user>,r=<client-nonce>"
+//   Server -> Client  server-first  = "r=<combined-nonce>,s=<salt-b64>,
+//                                       i=<iterations>"
+//   Client -> Server  client-final  = "c=<cb-b64>,r=<combined-nonce>,
+//                                       p=<proof-b64>"
+//   Server -> Client  server-final  = "v=<server-signature-b64>"
+//
+//   Where:
+//     SaltedPassword     = PBKDF2-HMAC-SHA256(password, salt, iterations, 32)
+//     ClientKey          = HMAC(SaltedPassword, "Client Key")
+//     StoredKey          = SHA256(ClientKey)
+//     AuthMessage        = client-first-bare ',' server-first ','
+//                          client-final-without-proof
+//     ClientSignature    = HMAC(StoredKey, AuthMessage)
+//     ClientProof        = ClientKey XOR ClientSignature
+//     ServerKey          = HMAC(SaltedPassword, "Server Key")
+//     ServerSignature    = HMAC(ServerKey, AuthMessage)
+//
+// API
+//
+//   PBKDF2:
+//     pbkdf2_hmac_sha256(password_buf, pwd_n, salt_buf, salt_n,
+//                        iterations, output_len) -> output_buf
+//        RFC 8018 §5.2 PBKDF2 over HMAC-SHA256. For SCRAM the typical
+//        output_len is 32 (SaltedPassword) and iterations is at least
+//        4096 (RFC 5802 default min). Cost: each output block runs
+//        2*iterations HMAC-SHA256 invocations; 32-byte output (one
+//        block) at iter=4096 = ~8192 HMAC ops. Returns a freshly
+//        alloc'd (output_len + 1)-byte buffer (digest + trailing NUL).
+//
+//   Base64 (RFC 4648 §4):
+//     scram_base64_encode(buf, n) -> nul-terminated string buffer
+//     scram_base64_decode(s)      -> [buf, n] or 0 on bad input
+//
+//   SCRAM message construction (RFC 5802 §5.1):
+//     scram_client_first(username, client_nonce)
+//          -> "n,,n=USER,r=NONCE"   (NOVA string)
+//     scram_server_first(client_nonce, server_nonce,
+//                        salt_b64, iterations)
+//          -> "r=COMBINED,s=SALT,i=ITER"
+//     scram_client_final(channel_binding_b64, combined_nonce,
+//                        client_proof_b64)
+//          -> "c=CB,r=NONCE,p=PROOF"
+//     scram_server_final(server_signature_b64)
+//          -> "v=SIG"
+//
+//   SCRAM proof computation (RFC 5802 §3):
+//     scram_salted_password(pwd, salt_buf, salt_n, iterations)
+//          -> 32-byte SaltedPassword buf (PBKDF2-HMAC-SHA256)
+//     scram_client_key(salted_password)        -> 32B (HMAC "Client Key")
+//     scram_stored_key(client_key)             -> 32B (SHA256(ClientKey))
+//     scram_server_key(salted_password)        -> 32B (HMAC "Server Key")
+//     scram_client_signature(stored_key, auth_msg, auth_msg_n) -> 32B
+//     scram_client_proof(salted_password, auth_msg, auth_msg_n) -> 32B
+//          -> ClientKey XOR HMAC(SHA256(ClientKey), AuthMessage)
+//     scram_server_signature(salted_password, auth_msg, auth_msg_n) -> 32B
+//          -> HMAC(ServerKey, AuthMessage)
+//
+//   Deterministic nonce helper (for tests + audit-stamped flows):
+//     scram_nonce_from_counter(counter, n) -> n-byte buf
+//          Pseudo-random nonce derived as SHA256(LE64(counter))[0..n].
+//          PRODUCTION DEPLOYMENTS MUST USE A CSPRNG. This module does
+//          NOT bind to `sys_getrandom` because NOVA's runtime does not
+//          expose an OS-entropy primitive in the current build; the
+//          deterministic helper makes the entire SCRAM test surface
+//          reproducible while leaving a clear TODO marker for the
+//          production binding (see `scram_random_nonce` skeleton).
+//
+// Constants
+//   SCRAM_SHA256_KEY_LEN     = 32   (length of SaltedPassword / Keys)
+//   SCRAM_DEFAULT_ITERATIONS = 4096 (RFC 5802 §5.1 min)
+//
+// Cryptographic primitives used
+//   * HMAC-SHA256 + SHA-256 from `src/safety/sha256.nova` (R33A canonical).
+//   * PBKDF2-HMAC-SHA256 implemented here as the only consumer in the
+//     tree (no other module uses PBKDF2).
+//
+// Algorithm references
+//   RFC 5802 §3, §5.1, §10  -- SCRAM-SHA-1 (canonical SCRAM definition).
+//   RFC 7677 §3             -- SCRAM-SHA-256 test vectors.
+//   RFC 7635 §3, §4         -- STUN/TURN SCRAM-SHA-256 binding +
+//                              SECURITY-FEATURES attribute.
+//   RFC 8018 §5.2           -- PBKDF2 (the F-function loop is the
+//                              cryptographic bulk of this module).
+//   RFC 4648 §4             -- Base64 standard encoding (with padding).
+//
+// Honest cost caveat
+//   PBKDF2 with the RFC 5802 minimum of 4096 iterations is intentionally
+//   SLOW: ~8192 HMAC-SHA256 invocations for a 32-byte output. Each HMAC
+//   is ~2 SHA-256 compressions, so the effective cost is ~16K SHA-256
+//   compressions per password-derive. Tests use c=1 for the fast PBKDF2
+//   KAT path; the canonical RFC 7677 §3 SCRAM round-trip at c=4096 is
+//   verified once and takes on the order of 100ms in the NOVA bytecode
+//   runtime. The cost is INTENTIONAL -- it is the GPU/ASIC slowdown
+//   protecting offline cracking attempts against captured salt+proof.
+//
+// CSPRNG caveat
+//   `scram_nonce_from_counter` is a DETERMINISTIC counter+SHA256 helper
+//   used to make tests + audit-stamped flows reproducible. PRODUCTION
+//   nonce generation needs OS entropy. When NOVA's runtime binds
+//   `sys_getrandom` the production path will be `scram_random_nonce`
+//   (currently a stub that returns 0 to force callers to handle the
+//   "no entropy seam" branch explicitly). The deterministic helper is
+//   NOT secret-sharing-safe -- two SCRAM sessions seeded with the
+//   same counter produce the same nonce.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R38D SCRAM-SHA-256). NOVA
+//   dependencies: builtins only (alloc / store8 / load8 / int_* /
+//   list ops / char_at / chr / len). CrossEngin dependencies:
+//   * src/safety/sha256.nova -- canonical SHA-256 + HMAC-SHA256.
+//     Sole crypto primitive needed; PBKDF2 + SCRAM are both built
+//     on top.
+
+import "../safety/sha256.nova"
+
+// ============================================================================
+//                          Public constants
+// ============================================================================
+
+let SCRAM_SHA256_KEY_LEN     = 32
+let SCRAM_DEFAULT_ITERATIONS = 4096
+
+// ============================================================================
+//                          Byte buffer helpers (local)
+// ============================================================================
+//
+// SCRAM construction needs byte buffers from strings, byte buffers
+// from concatenation, and a handful of LE64 / store8 helpers. These
+// mirror the conventions used by sha256.nova + md5.nova -- each
+// alloc'd buffer is allocated with a `+ 1` slack byte and trailing
+// NUL terminator so NOVA string contexts can read it. The helpers
+// are underscore-prefixed (private) so they do not collide with
+// other safety modules.
+
+fn _scram_str_to_buf(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+fn _scram_alloc_zero(n) {
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n { store8(buf + i, 0); i = i + 1 }
+    store8(buf + n, 0)
+    return buf
+}
+
+fn _scram_buf_to_str(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        s = s + chr(load8(buf + i))
+        i = i + 1
+    }
+    return s
+}
+
+fn _scram_copy(dst, dst_off, src, src_off, n) {
+    let i = 0
+    while i < n {
+        store8(dst + dst_off + i, load8(src + src_off + i))
+        i = i + 1
+    }
+    return 1
+}
+
+// Compare two byte buffers; returns 1 if equal, 0 otherwise. Used by
+// tests + the verifier path. NOT constant-time -- callers that need
+// constant-time MAC comparison should use a per-call constant-time
+// helper; SCRAM proof verification is intentionally not on the hot
+// path so this leaks length-only.
+fn scram_buf_eq(a, an, b, bn) {
+    if an != bn { return 0 }
+    let i = 0
+    while i < an {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                          PBKDF2-HMAC-SHA256 (RFC 8018 §5.2)
+// ============================================================================
+//
+// PBKDF2 derives a key of arbitrary length from a password + salt under
+// a PRF (here HMAC-SHA256). The function F(P, S, c, i) produces one
+// `hLen` block via:
+//
+//     U_1 = PRF(P, S || INT(i))
+//     U_j = PRF(P, U_{j-1})        for j = 2..c
+//     F   = U_1 XOR U_2 XOR ... XOR U_c
+//
+// where INT(i) is a 4-byte BIG-endian encoding of the block index. The
+// final dkLen-byte output is the concatenation of F(P, S, c, 1) ||
+// F(P, S, c, 2) || ... truncated to dkLen.
+//
+// For SCRAM-SHA-256 the typical case is dkLen=32 (one block) and
+// c >= 4096; iter_blocks(dkLen=32, hLen=32) = 1, so the loop body runs
+// EXACTLY c HMAC operations per derive (plus 1 for U_1). 2*c HMACs
+// in total counting the inner+outer SHA-256 compressions each HMAC
+// runs.
+
+// PBKDF2's INT(i) -- 4-byte big-endian block index. RFC 8018 §5.2 step 3.
+fn _pbkdf2_put_int_be(buf, off, i) {
+    store8(buf + off + 0, int_and(int_shr(i, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(i, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(i, 8), 255))
+    store8(buf + off + 3, int_and(i, 255))
+    return 1
+}
+
+// Compute one F block of PBKDF2. block_index is 1-based per RFC.
+// Returns a freshly-alloc'd 32-byte buffer.
+fn _pbkdf2_F(password_buf, pwd_n, salt_buf, salt_n, iterations, block_index) {
+    // U_1 = HMAC(password, salt || INT(block_index))
+    let s1_n = salt_n + 4
+    let s1 = alloc(s1_n + 1)
+    _scram_copy(s1, 0, salt_buf, 0, salt_n)
+    _pbkdf2_put_int_be(s1, salt_n, block_index)
+    store8(s1 + s1_n, 0)
+    let u = hmac_sha256(password_buf, pwd_n, s1, s1_n)
+    // T accumulates the XOR of all U_j. Initialize to U_1.
+    let t = _scram_alloc_zero(SCRAM_SHA256_KEY_LEN)
+    let k = 0
+    while k < SCRAM_SHA256_KEY_LEN {
+        store8(t + k, load8(u + k))
+        k = k + 1
+    }
+    // Iterations 2..c: U_j = HMAC(password, U_{j-1}); T ^= U_j.
+    let j = 2
+    while j <= iterations {
+        u = hmac_sha256(password_buf, pwd_n, u, SCRAM_SHA256_KEY_LEN)
+        let m = 0
+        while m < SCRAM_SHA256_KEY_LEN {
+            store8(t + m, int_xor(load8(t + m), load8(u + m)))
+            m = m + 1
+        }
+        j = j + 1
+    }
+    return t
+}
+
+fn pbkdf2_hmac_sha256(password_buf, pwd_n, salt_buf, salt_n,
+                     iterations, output_len) {
+    if iterations < 1 { return 0 }
+    if output_len < 1 { return 0 }
+    let hLen = SCRAM_SHA256_KEY_LEN
+    let n_blocks = int_shr(output_len + hLen - 1, 5)     // ceil(out/32)
+    let out = _scram_alloc_zero(output_len)
+    let i = 1
+    while i <= n_blocks {
+        let block = _pbkdf2_F(password_buf, pwd_n, salt_buf, salt_n,
+                              iterations, i)
+        let off = (i - 1) * hLen
+        let limit = hLen
+        if off + limit > output_len { limit = output_len - off }
+        let k = 0
+        while k < limit {
+            store8(out + off + k, load8(block + k))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+//                          Base64 encode / decode (RFC 4648 §4)
+// ============================================================================
+//
+// Inline so this module compiles with sha256.nova as the only
+// CrossEngin dep. Future R38D.2 can extract to `src/safety/base64.nova`
+// alongside an x509 BER consumer.
+//
+// Standard base64 alphabet (no URL-safe variant): A-Z a-z 0-9 + /
+// Padding character '=' brings output length to a multiple of 4.
+
+fn _scram_b64_alphabet(v) {
+    if v < 26 { return 65 + v }              // 'A'..'Z'
+    if v < 52 { return 97 + (v - 26) }       // 'a'..'z'
+    if v < 62 { return 48 + (v - 52) }       // '0'..'9'
+    if v == 62 { return 43 }                 // '+'
+    return 47                                // '/'
+}
+
+// Decode a single base64 character to a 0..63 value, or -1 on invalid.
+fn _scram_b64_dechar(c) {
+    if c >= 65 {
+        if c <= 90  { return c - 65 }        // A..Z -> 0..25
+    }
+    if c >= 97 {
+        if c <= 122 { return c - 97 + 26 }   // a..z -> 26..51
+    }
+    if c >= 48 {
+        if c <= 57  { return c - 48 + 52 }   // 0..9 -> 52..61
+    }
+    if c == 43 { return 62 }                 // '+'
+    if c == 47 { return 63 }                 // '/'
+    return 0 - 1
+}
+
+// Encode a byte buffer to a NOVA string of base64 characters with
+// standard '=' padding per RFC 4648 §4.
+fn scram_base64_encode(buf, n) {
+    let s = ""
+    let full = int_shr(n, 2) * 3              // not used -- inline below
+    let i = 0
+    while i + 3 <= n {
+        let b0 = load8(buf + i + 0)
+        let b1 = load8(buf + i + 1)
+        let b2 = load8(buf + i + 2)
+        let v = int_or(int_or(int_shl(b0, 16), int_shl(b1, 8)), b2)
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 18), 63)))
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 12), 63)))
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 6), 63)))
+        s = s + chr(_scram_b64_alphabet(int_and(v, 63)))
+        i = i + 3
+    }
+    let rem = n - i
+    if rem == 1 {
+        let b0 = load8(buf + i)
+        let v = int_shl(b0, 16)
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 18), 63)))
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 12), 63)))
+        s = s + chr(61)            // '='
+        s = s + chr(61)            // '='
+    }
+    if rem == 2 {
+        let b0 = load8(buf + i + 0)
+        let b1 = load8(buf + i + 1)
+        let v = int_or(int_shl(b0, 16), int_shl(b1, 8))
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 18), 63)))
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 12), 63)))
+        s = s + chr(_scram_b64_alphabet(int_and(int_shr(v, 6), 63)))
+        s = s + chr(61)            // '='
+    }
+    return s
+}
+
+// Decode a base64 NOVA string into a freshly-alloc'd byte buffer.
+// Returns [buf, n] on success or 0 on malformed input (invalid char,
+// length not a multiple of 4, padding mid-string).
+fn scram_base64_decode(s) {
+    let slen = len(s)
+    if slen == 0 {
+        let out = list_new()
+        push(out, _scram_alloc_zero(0))
+        push(out, 0)
+        return out
+    }
+    if int_and(slen, 3) != 0 { return 0 }
+    // Count trailing '=' padding (0, 1, or 2).
+    let pad = 0
+    if char_at(s, slen - 1) == 61 { pad = 1 }
+    if pad == 1 {
+        if char_at(s, slen - 2) == 61 { pad = 2 }
+    }
+    if pad > 2 { return 0 }
+    let n_groups = int_shr(slen, 2)
+    let n = n_groups * 3 - pad
+    let buf = _scram_alloc_zero(n)
+    let i = 0
+    let off = 0
+    while i < n_groups {
+        let c0 = char_at(s, i * 4 + 0)
+        let c1 = char_at(s, i * 4 + 1)
+        let c2 = char_at(s, i * 4 + 2)
+        let c3 = char_at(s, i * 4 + 3)
+        let v0 = _scram_b64_dechar(c0)
+        let v1 = _scram_b64_dechar(c1)
+        // Last group may have '=' padding for c2/c3.
+        let v2 = 0
+        let v3 = 0
+        let last = 0
+        if i == n_groups - 1 { last = 1 }
+        if last == 1 {
+            if c2 == 61 { v2 = 0 } else { v2 = _scram_b64_dechar(c2) }
+            if c3 == 61 { v3 = 0 } else { v3 = _scram_b64_dechar(c3) }
+        } else {
+            v2 = _scram_b64_dechar(c2)
+            v3 = _scram_b64_dechar(c3)
+        }
+        if v0 < 0 { return 0 }
+        if v1 < 0 { return 0 }
+        if v2 < 0 { return 0 }
+        if v3 < 0 { return 0 }
+        let v = int_or(int_or(int_or(int_shl(v0, 18), int_shl(v1, 12)),
+                              int_shl(v2, 6)), v3)
+        let want = 3
+        if last == 1 { want = 3 - pad }
+        if want >= 1 {
+            store8(buf + off + 0, int_and(int_shr(v, 16), 255))
+        }
+        if want >= 2 {
+            store8(buf + off + 1, int_and(int_shr(v, 8), 255))
+        }
+        if want >= 3 {
+            store8(buf + off + 2, int_and(v, 255))
+        }
+        off = off + want
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+// ============================================================================
+//                          Nonce generation
+// ============================================================================
+//
+// Two paths -- the deterministic counter+SHA256 helper used by tests
+// and audit-stamped flows, and a production stub that returns 0 to
+// force callers through an OS-entropy seam they must wire themselves.
+//
+// SCRAM nonces are public values -- their security property is
+// UNIQUENESS, not unpredictability. RFC 5802 §5.1 calls them "a
+// printable sequence of characters"; the protocol round-trip binds
+// the combined client+server nonce into AuthMessage so a captured
+// nonce reuse across sessions is detectable. The deterministic helper
+// is fine for tests; production MUST seed with OS entropy.
+
+// Build an n-byte nonce as SHA256(LE64(counter))[0..n] then mapped
+// into the SCRAM "printable" subset by base64-encoding the first n
+// bytes of the resulting SHA-256 digest and truncating the result.
+// (RFC 5802 §5.1: nonces must be printable ASCII per the spec's
+// `value-safe-char` production; base64-encoded SHA-256 output is
+// trivially in that subset.)
+//
+// For test reproducibility this is the path: every test that needs
+// a "nonce" derives it as `scram_nonce_from_counter(some_int, 24)`.
+fn scram_nonce_from_counter(counter, n) {
+    let in_buf = _scram_alloc_zero(8)
+    store8(in_buf + 0, int_and(counter, 255))
+    store8(in_buf + 1, int_and(int_shr(counter, 8), 255))
+    store8(in_buf + 2, int_and(int_shr(counter, 16), 255))
+    store8(in_buf + 3, int_and(int_shr(counter, 24), 255))
+    store8(in_buf + 4, 0)
+    store8(in_buf + 5, 0)
+    store8(in_buf + 6, 0)
+    store8(in_buf + 7, 0)
+    let h = sha256_oneshot(in_buf, 8)
+    let s = scram_base64_encode(h, 32)
+    // Truncate; the caller asks for n bytes (printable).
+    let out = ""
+    let m = n
+    if m > len(s) { m = len(s) }
+    let i = 0
+    while i < m {
+        out = out + chr(char_at(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+// Production nonce generator stub. Returns 0 until NOVA's runtime
+// exposes `sys_getrandom`. Documented as a known caveat in the module
+// header. Callers must check for 0 and fail closed.
+fn scram_random_nonce(n) {
+    return 0
+}
+
+// ============================================================================
+//                          SCRAM proof + signature math (RFC 5802 §3)
+// ============================================================================
+//
+// The SCRAM key schedule:
+//   SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, iter, 32)
+//   ClientKey      = HMAC(SaltedPassword, "Client Key")
+//   StoredKey      = SHA256(ClientKey)
+//   ServerKey      = HMAC(SaltedPassword, "Server Key")
+//
+// Per-session:
+//   ClientSignature = HMAC(StoredKey, AuthMessage)
+//   ClientProof     = ClientKey XOR ClientSignature
+//   ServerSignature = HMAC(ServerKey, AuthMessage)
+//
+// The server stores StoredKey + ServerKey (not the password). Given a
+// ClientProof from the wire it recovers ClientKey = ClientProof XOR
+// HMAC(StoredKey, AuthMessage) and verifies SHA256(ClientKey) ==
+// StoredKey. The implementation here is the CLIENT side -- it derives
+// SaltedPassword from the password + salt + iteration count, then
+// computes ClientProof and ServerSignature for the wire.
+
+// SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, iter, 32)
+fn scram_salted_password(password, salt_buf, salt_n, iterations) {
+    let p = _scram_str_to_buf(password)
+    return pbkdf2_hmac_sha256(p[0], p[1], salt_buf, salt_n,
+                              iterations, SCRAM_SHA256_KEY_LEN)
+}
+
+fn scram_client_key(salted_password) {
+    let lbl = _scram_str_to_buf("Client Key")
+    return hmac_sha256(salted_password, SCRAM_SHA256_KEY_LEN,
+                       lbl[0], lbl[1])
+}
+
+fn scram_server_key(salted_password) {
+    let lbl = _scram_str_to_buf("Server Key")
+    return hmac_sha256(salted_password, SCRAM_SHA256_KEY_LEN,
+                       lbl[0], lbl[1])
+}
+
+fn scram_stored_key(client_key) {
+    return sha256_oneshot(client_key, SCRAM_SHA256_KEY_LEN)
+}
+
+fn scram_client_signature(stored_key, auth_msg_buf, auth_msg_n) {
+    return hmac_sha256(stored_key, SCRAM_SHA256_KEY_LEN,
+                       auth_msg_buf, auth_msg_n)
+}
+
+// ClientProof = ClientKey XOR HMAC(SHA256(ClientKey), AuthMessage)
+// Returns a freshly-alloc'd 32-byte buf.
+fn scram_client_proof(salted_password, auth_msg_buf, auth_msg_n) {
+    let ck = scram_client_key(salted_password)
+    let sk = scram_stored_key(ck)
+    let cs = scram_client_signature(sk, auth_msg_buf, auth_msg_n)
+    let proof = _scram_alloc_zero(SCRAM_SHA256_KEY_LEN)
+    let i = 0
+    while i < SCRAM_SHA256_KEY_LEN {
+        store8(proof + i, int_xor(load8(ck + i), load8(cs + i)))
+        i = i + 1
+    }
+    return proof
+}
+
+// ServerSignature = HMAC(ServerKey, AuthMessage).
+// Returns a freshly-alloc'd 32-byte buf.
+fn scram_server_signature(salted_password, auth_msg_buf, auth_msg_n) {
+    let sk = scram_server_key(salted_password)
+    return hmac_sha256(sk, SCRAM_SHA256_KEY_LEN,
+                       auth_msg_buf, auth_msg_n)
+}
+
+// ============================================================================
+//                          SCRAM message construction (RFC 5802 §5.1)
+// ============================================================================
+//
+// The four message constructors compose NOVA strings in the canonical
+// RFC 5802 §5.1 grammar:
+//
+//   client-first  ::= gs2-header "n=" saslname "," "r=" c-nonce
+//   server-first  ::= "r=" nonce "," "s=" base64 "," "i=" posnum
+//   client-final  ::= "c=" base64 "," "r=" nonce "," "p=" base64
+//   server-final  ::= "v=" base64
+//
+// gs2-header is "n,," when channel-binding is not requested (the
+// case this module ships; TLS-binding via cb=tls-server-end-point is
+// noted as future work). The `saslname` and `c-nonce` productions
+// are printable ASCII per §5.1 -- no escaping is required for the
+// SCRAM strings produced by `scram_nonce_from_counter`.
+//
+// All four functions return NOVA strings (the on-wire form is ASCII,
+// suitable for direct embedding in the TURN attribute value).
+
+fn scram_client_first(username, client_nonce) {
+    // "n,," gs2-header + "n=" + username + ",r=" + nonce
+    return "n,,n=" + username + ",r=" + client_nonce
+}
+
+// The "bare" form of client-first (without the gs2-header), per
+// RFC 5802 §3 -- this is what gets fed into AuthMessage. Callers
+// computing ClientProof use this; callers emitting to the wire use
+// scram_client_first.
+fn scram_client_first_bare(username, client_nonce) {
+    return "n=" + username + ",r=" + client_nonce
+}
+
+fn scram_server_first(client_nonce, server_nonce, salt_b64, iterations) {
+    return "r=" + client_nonce + server_nonce + ",s=" + salt_b64
+        + ",i=" + int_to_str(iterations)
+}
+
+// client-final-without-proof for the AuthMessage concatenation
+// (RFC 5802 §3). The full client-final adds ",p=PROOF" at the end.
+fn scram_client_final_no_proof(channel_binding_b64, combined_nonce) {
+    return "c=" + channel_binding_b64 + ",r=" + combined_nonce
+}
+
+fn scram_client_final(channel_binding_b64, combined_nonce,
+                     client_proof_b64) {
+    return "c=" + channel_binding_b64 + ",r=" + combined_nonce
+        + ",p=" + client_proof_b64
+}
+
+fn scram_server_final(server_signature_b64) {
+    return "v=" + server_signature_b64
+}
+
+// AuthMessage = client-first-bare + "," + server-first + "," +
+//               client-final-without-proof
+// (RFC 5802 §3). Returns a NOVA string.
+fn scram_auth_message(client_first_bare, server_first,
+                     client_final_no_proof) {
+    return client_first_bare + "," + server_first + ","
+        + client_final_no_proof
+}
+
+// ============================================================================
+//                          Channel-binding helper
+// ============================================================================
+//
+// When the client does NOT request TLS channel binding, the gs2-header
+// is "n,," and the c= attribute in client-final is base64("n,,") =
+// "biws". RFC 5802 §5.1 + §6 spell out the no-binding case; TLS-
+// binding ("tls-server-end-point" + the hashed certificate per
+// RFC 5929) is future work and is not implemented here.
+
+fn scram_channel_binding_none() {
+    // base64 of "n,," = the literal 4-char string "biws"
+    return "biws"
+}
+
+// ============================================================================
+//                          Quick wrapper -- whole client-final
+// ============================================================================
+//
+// Convenience for the canonical case: given password + salt + iter +
+// server-emitted combined nonce, derive the proof and emit the full
+// client-final-with-proof string. This is the function the TURN
+// SCRAM auth path in turn.nova consumes.
+
+fn scram_build_client_final(username, password, client_nonce,
+                           server_nonce, salt_b64, iterations) {
+    // Decode the salt from b64.
+    let salt = scram_base64_decode(salt_b64)
+    if salt == 0 { return "" }
+    // SaltedPassword + AuthMessage.
+    let sp = scram_salted_password(password, salt[0], salt[1], iterations)
+    let cfb = scram_client_first_bare(username, client_nonce)
+    let combined = client_nonce + server_nonce
+    let sf = scram_server_first(client_nonce, server_nonce, salt_b64,
+                                iterations)
+    let cb = scram_channel_binding_none()
+    let cfnp = scram_client_final_no_proof(cb, combined)
+    let am = scram_auth_message(cfb, sf, cfnp)
+    // Compute ClientProof.
+    let am_buf = _scram_str_to_buf(am)
+    let proof = scram_client_proof(sp, am_buf[0], am_buf[1])
+    let proof_b64 = scram_base64_encode(proof, SCRAM_SHA256_KEY_LEN)
+    return scram_client_final(cb, combined, proof_b64)
+}
+
+// Compute the server signature that the server would emit in
+// server-final, so a client can verify the server-final response.
+fn scram_compute_server_signature_b64(username, password, client_nonce,
+                                     server_nonce, salt_b64, iterations) {
+    let salt = scram_base64_decode(salt_b64)
+    if salt == 0 { return "" }
+    let sp = scram_salted_password(password, salt[0], salt[1], iterations)
+    let cfb = scram_client_first_bare(username, client_nonce)
+    let combined = client_nonce + server_nonce
+    let sf = scram_server_first(client_nonce, server_nonce, salt_b64,
+                                iterations)
+    let cb = scram_channel_binding_none()
+    let cfnp = scram_client_final_no_proof(cb, combined)
+    let am = scram_auth_message(cfb, sf, cfnp)
+    let am_buf = _scram_str_to_buf(am)
+    let sig = scram_server_signature(sp, am_buf[0], am_buf[1])
+    return scram_base64_encode(sig, SCRAM_SHA256_KEY_LEN)
+}
+
+// ============================================================================
+//                          Test-only shims (private surface)
+// ============================================================================
+//
+// Expose underscore-prefixed helpers under test-prefixed names so unit
+// tests can reach the internal routines without breaking the public
+// API surface.
+
+fn _scram_test_b64_alphabet(v) { return _scram_b64_alphabet(v) }
+fn _scram_test_b64_dechar(c)   { return _scram_b64_dechar(c) }
+fn _scram_test_pbkdf2_F(password_buf, pwd_n, salt_buf, salt_n,
+                       iterations, block_index) {
+    return _pbkdf2_F(password_buf, pwd_n, salt_buf, salt_n,
+                     iterations, block_index)
+}
+fn _scram_test_str_to_buf(s) { return _scram_str_to_buf(s) }

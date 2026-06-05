@@ -1,0 +1,536 @@
+// CrossEngin safety: canonical pure-NOVA MD5 primitive.
+//
+// Purpose
+//   Before this round the only consumer of MD5 in the tree was
+//   `src/federation/turn.nova` (R36A), which shipped an inline
+//   `_turn_md5_*` family (~80 lines: K-table, S-table, g-index,
+//   F/G/H/I round functions, compression, padding, oneshot). R36A's
+//   exit caveat documented a future R36A.2 follow-up that would
+//   canonicalize MD5 + SHA-1 alongside the sha256.nova dedup pattern
+//   R33A established. R37C closes that follow-up.
+//
+//   The only inline copy in the tree (R36A's `_turn_md5_*` family)
+//   is promoted here. The K-table, S-table, message-schedule
+//   g-index, F/G/H/I round functions, IV, compression function, and
+//   padding logic are byte-for-byte the same RFC 1321 §3 recipe
+//   every reference implementation in the wild implements. The lone
+//   consumer (turn) replaces its inline copy with calls into this
+//   module via thin per-module adapters that keep the existing
+//   public + test-shim symbols byte-identical (so callers don't
+//   need to know the refactor happened).
+//
+// Historical caveat -- MD5 cryptographic break
+//   MD5 is widely considered cryptographically broken for collision
+//   resistance:
+//     * Wang et al. 2004 -- first practical collision in O(2^39) ops
+//     * Stevens et al. 2007 -- FastColl chosen-prefix collisions
+//     * MD5SHATTERED-style chosen-prefix attacks (2009 and later)
+//     * Real-world exploitation: Flame malware (2012) used an MD5
+//       chosen-prefix collision to forge a Microsoft code-signing cert.
+//   Modern protocols REPLACE MD5 with SHA-256 / SHA-3 / Argon2 / etc.
+//   Despite that, multiple RFCs ACTIVELY mandate MD5 in legacy
+//   protocols this tree must remain compatible with:
+//     * RFC 1321 -- the MD5 spec itself; this module is the
+//       reference implementation.
+//     * RFC 5389 §15.4 -- STUN long-term-credential MESSAGE-INTEGRITY
+//       key derivation: HMAC-SHA1 key = MD5(username:realm:password).
+//       TURN (RFC 5766 / 8656) inherits this.
+//     * RFC 5849 -- OAuth 1.0 signature methods support HMAC-MD5
+//       alongside HMAC-SHA1 (informational; not used by this tree
+//       today but the spec mandates MD5 for the HMAC-MD5 variant).
+//     * RFC 1828 (IPsec AH-HMAC-MD5 / historical), RFC 2403
+//       (HMAC-MD5-96 / historical) -- legacy IPsec variants.
+//   The CrossEngin use is STRICTLY the RFC 5389 §15.4 long-term-
+//   credential key derivation. MD5 is not used as a primary digest
+//   for security-critical signing, key derivation outside the spec-
+//   mandated locations, or HMAC authentication.
+//   Modern replacements (SCRAM-SHA1 / SCRAM-SHA256 / RFC 7635 for
+//   STUN) are out of scope for the current round.
+//
+// API
+//   md5_oneshot(buf, n) -> 17-byte alloc'd buffer
+//     16 bytes of digest + a trailing NUL byte (mirrors the sha256
+//     and sha1 conventions). MD5 output is LITTLE-endian per
+//     RFC 1321 §3.5 (note: SHA-1 / SHA-256 are big-endian; do not
+//     copy bytes between the two without conversion).
+//
+//   md5_oneshot_str(s) -> 17-byte alloc'd buffer
+//     Convenience wrapper for an ASCII-only NOVA string.
+//
+//   md5_init() -> state
+//     Streaming MD5: returns an opaque state value (a NOVA list
+//     containing the working A,B,C,D + a 64-byte buffer for partial
+//     input + a total-length counter). Pass it to md5_update / final.
+//
+//   md5_update(st, buf, n) -> state
+//     Absorbs n bytes from buf into the streaming hash.
+//
+//   md5_final(st) -> 17-byte digest buffer
+//     Finalizes the streaming hash (applies RFC 1321 padding) and
+//     emits the same 17-byte buffer shape as md5_oneshot. After
+//     this call the state must not be reused.
+//
+// Constants
+//   MD5_HASH_LEN     = 16  (digest length in bytes)
+//   MD5_BLOCK_LEN    = 64  (compression block length in bytes)
+//
+// Algorithm references
+//   RFC 1321 §3.1     -- padding rule (append 0x80, zero-pad to
+//                        mod 64 == 56, append LE 64-bit bit length).
+//   RFC 1321 §3.3     -- IV (A,B,C,D).
+//   RFC 1321 §3.4     -- T-table (K[i] = floor(2^32 * |sin(i+1)|)),
+//                        per-round shift table S[i], message-schedule
+//                        index g(i).
+//   RFC 1321 §A.5     -- known-answer vectors (used by
+//                        tests/unit/test_md5.nova).
+//
+// Constant-time / side-channel caveats
+//   The compression function uses pure 32-bit arithmetic with no
+//   data-dependent branches (the only conditionals are loop bounds
+//   and the constant-time-safe `if rem >= 56` padding choice in
+//   md5_final). MD5 is not used in any HMAC keyed-mode in the tree;
+//   the RFC 5389 §15.4 derivation pre-hashes a public concatenation
+//   of (username, realm, password) where the password's byte length
+//   leaks (treated as public by the long-term-credential mechanism).
+//
+// ADRs touched: FEDERATED_AUDIT.md (R37C canonical MD5 + SHA-1). NOVA
+//   dependencies: builtins only (alloc / store8 / load8 / int_* /
+//   list ops). CrossEngin dependencies: none -- this is a leaf module
+//   so every other safety / federation module can pull it in without
+//   circular-import risk.
+
+import "std/io"
+
+// ============================================================================
+//                          Constants
+// ============================================================================
+
+let MD5_HASH_LEN  = 16
+let MD5_BLOCK_LEN = 64
+
+let _MD5_MASK32   = 4294967295   // 0xFFFFFFFF
+
+// ============================================================================
+//                          32-bit arithmetic helpers
+// ============================================================================
+//
+// MD5 is defined over 32-bit unsigned words; NOVA integers are
+// machine-width so we mask down after every operation that could
+// overflow 32 bits. Mirrors the pattern in sha256.nova / sha1.nova.
+
+fn _md5_mask32(x)   { return int_and(x, _MD5_MASK32) }
+fn _md5_add32(a, b) { return _md5_mask32(int_add(a, b)) }
+fn _md5_xor32(a, b) { return _md5_mask32(int_xor(a, b)) }
+fn _md5_and32(a, b) { return _md5_mask32(int_and(a, b)) }
+fn _md5_or32(a, b)  { return _md5_mask32(int_or(a, b)) }
+fn _md5_not32(x)    { return _md5_mask32(int_xor(x, _MD5_MASK32)) }
+
+fn _md5_rotl32(x, n) {
+    let left  = _md5_mask32(int_shl(x, n))
+    let right = int_shr(_md5_mask32(x), 32 - n)
+    return _md5_mask32(int_or(left, right))
+}
+
+// MD5 reads message words LITTLE-endian (unlike SHA-1 / SHA-256's BE).
+fn _md5_load_le32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_or(b0, int_shl(b1, 8))
+    v = int_or(v, int_shl(b2, 16))
+    v = int_or(v, int_shl(b3, 24))
+    return _md5_mask32(v)
+}
+
+fn _md5_store_le32(buf, off, v) {
+    store8(buf + off + 0, int_and(v, 255))
+    store8(buf + off + 1, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 3, int_and(int_shr(v, 24), 255))
+    return 1
+}
+
+// ============================================================================
+//                          RFC 1321 §3.4 T-table + S-table + g-index
+// ============================================================================
+//
+// K[i] = floor(2^32 * |sin(i + 1)|), i=0..63. Pre-computed because
+// NOVA has no float ops. Spot-checked against the published table.
+
+fn _md5_k(i) {
+    if i ==  0 { return 3614090360 }   // 0xd76aa478
+    if i ==  1 { return 3905402710 }   // 0xe8c7b756
+    if i ==  2 { return  606105819 }   // 0x242070db
+    if i ==  3 { return 3250441966 }   // 0xc1bdceee
+    if i ==  4 { return 4118548399 }   // 0xf57c0faf
+    if i ==  5 { return 1200080426 }   // 0x4787c62a
+    if i ==  6 { return 2821735955 }   // 0xa8304613
+    if i ==  7 { return 4249261313 }   // 0xfd469501
+    if i ==  8 { return 1770035416 }   // 0x698098d8
+    if i ==  9 { return 2336552879 }   // 0x8b44f7af
+    if i == 10 { return 4294925233 }   // 0xffff5bb1
+    if i == 11 { return 2304563134 }   // 0x895cd7be
+    if i == 12 { return 1804603682 }   // 0x6b901122
+    if i == 13 { return 4254626195 }   // 0xfd987193
+    if i == 14 { return 2792965006 }   // 0xa679438e
+    if i == 15 { return 1236535329 }   // 0x49b40821
+    if i == 16 { return 4129170786 }   // 0xf61e2562
+    if i == 17 { return 3225465664 }   // 0xc040b340
+    if i == 18 { return  643717713 }   // 0x265e5a51
+    if i == 19 { return 3921069994 }   // 0xe9b6c7aa
+    if i == 20 { return 3593408605 }   // 0xd62f105d
+    if i == 21 { return   38016083 }   // 0x02441453
+    if i == 22 { return 3634488961 }   // 0xd8a1e681
+    if i == 23 { return 3889429448 }   // 0xe7d3fbc8
+    if i == 24 { return  568446438 }   // 0x21e1cde6
+    if i == 25 { return 3275163606 }   // 0xc33707d6
+    if i == 26 { return 4107603335 }   // 0xf4d50d87
+    if i == 27 { return 1163531501 }   // 0x455a14ed
+    if i == 28 { return 2850285829 }   // 0xa9e3e905
+    if i == 29 { return 4243563512 }   // 0xfcefa3f8
+    if i == 30 { return 1735328473 }   // 0x676f02d9
+    if i == 31 { return 2368359562 }   // 0x8d2a4c8a
+    if i == 32 { return 4294588738 }   // 0xfffa3942
+    if i == 33 { return 2272392833 }   // 0x8771f681
+    if i == 34 { return 1839030562 }   // 0x6d9d6122
+    if i == 35 { return 4259657740 }   // 0xfde5380c
+    if i == 36 { return 2763975236 }   // 0xa4beea44
+    if i == 37 { return 1272893353 }   // 0x4bdecfa9
+    if i == 38 { return 4139469664 }   // 0xf6bb4b60
+    if i == 39 { return 3200236656 }   // 0xbebfbc70
+    if i == 40 { return  681279174 }   // 0x289b7ec6
+    if i == 41 { return 3936430074 }   // 0xeaa127fa
+    if i == 42 { return 3572445317 }   // 0xd4ef3085
+    if i == 43 { return   76029189 }   // 0x04881d05
+    if i == 44 { return 3654602809 }   // 0xd9d4d039
+    if i == 45 { return 3873151461 }   // 0xe6db99e5
+    if i == 46 { return  530742520 }   // 0x1fa27cf8
+    if i == 47 { return 3299628645 }   // 0xc4ac5665
+    if i == 48 { return 4096336452 }   // 0xf4292244
+    if i == 49 { return 1126891415 }   // 0x432aff97
+    if i == 50 { return 2878612391 }   // 0xab9423a7
+    if i == 51 { return 4237533241 }   // 0xfc93a039
+    if i == 52 { return 1700485571 }   // 0x655b59c3
+    if i == 53 { return 2399980690 }   // 0x8f0ccc92
+    if i == 54 { return 4293915773 }   // 0xffeff47d
+    if i == 55 { return 2240044497 }   // 0x85845dd1
+    if i == 56 { return 1873313359 }   // 0x6fa87e4f
+    if i == 57 { return 4264355552 }   // 0xfe2ce6e0
+    if i == 58 { return 2734768916 }   // 0xa3014314
+    if i == 59 { return 1309151649 }   // 0x4e0811a1
+    if i == 60 { return 4149444226 }   // 0xf7537e82
+    if i == 61 { return 3174756917 }   // 0xbd3af235
+    if i == 62 { return  718787259 }   // 0x2ad7d2bb
+    return 3951481745                   // 0xeb86d391 (i == 63)
+}
+
+// MD5 per-round shift table (RFC 1321 §3.4 -- S[i]).
+fn _md5_s(i) {
+    // Round 0..15: 7, 12, 17, 22 (repeating)
+    if i < 16 {
+        let r = i - int_shl(int_shr(i, 2), 2)   // i mod 4
+        if r == 0 { return 7 }
+        if r == 1 { return 12 }
+        if r == 2 { return 17 }
+        return 22
+    }
+    if i < 32 {
+        let r = i - int_shl(int_shr(i, 2), 2)
+        if r == 0 { return 5 }
+        if r == 1 { return 9 }
+        if r == 2 { return 14 }
+        return 20
+    }
+    if i < 48 {
+        let r = i - int_shl(int_shr(i, 2), 2)
+        if r == 0 { return 4 }
+        if r == 1 { return 11 }
+        if r == 2 { return 16 }
+        return 23
+    }
+    let r = i - int_shl(int_shr(i, 2), 2)
+    if r == 0 { return 6 }
+    if r == 1 { return 10 }
+    if r == 2 { return 15 }
+    return 21
+}
+
+// MD5 g(i) -- message-schedule index per round.
+fn _md5_g(i) {
+    if i < 16 { return i }
+    if i < 32 {
+        // (5*i + 1) mod 16
+        let v = 5 * i + 1
+        return v - int_shl(int_shr(v, 4), 4)
+    }
+    if i < 48 {
+        // (3*i + 5) mod 16
+        let v = 3 * i + 5
+        return v - int_shl(int_shr(v, 4), 4)
+    }
+    // (7*i) mod 16
+    let v = 7 * i
+    return v - int_shl(int_shr(v, 4), 4)
+}
+
+// MD5 IV (RFC 1321 §3.3).
+fn _md5_init_h() {
+    let h = list_new()
+    push(h, 1732584193)    // 0x67452301
+    push(h, 4023233417)    // 0xefcdab89
+    push(h, 2562383102)    // 0x98badcfe
+    push(h, 271733878)     // 0x10325476
+    return h
+}
+
+// ============================================================================
+//                          Compression function
+// ============================================================================
+//
+// Process exactly one 64-byte block. Updates `h` in place via
+// list_set. The compression follows RFC 1321 §3.4 verbatim.
+// Four rounds of 16 operations each, with the round-specific
+// non-linear function F/G/H/I:
+//   F(b,c,d) = (b AND c) OR ((NOT b) AND d)
+//   G(b,c,d) = (d AND b) OR ((NOT d) AND c)
+//   H(b,c,d) = b XOR c XOR d
+//   I(b,c,d) = c XOR (b OR (NOT d))
+
+fn _md5_compress(h, blk) {
+    // 1. Build M[0..15] from blk (LE words).
+    let m = list_new()
+    let i = 0
+    while i < 16 {
+        push(m, _md5_load_le32(blk, i * 4))
+        i = i + 1
+    }
+    let a = h[0]
+    let b = h[1]
+    let c = h[2]
+    let d = h[3]
+    let t = 0
+    while t < 64 {
+        let f = 0
+        if t < 16 {
+            // F = (b & c) | (~b & d)
+            f = _md5_or32(_md5_and32(b, c),
+                          _md5_and32(_md5_not32(b), d))
+        } else {
+            if t < 32 {
+                // G = (d & b) | (~d & c)
+                f = _md5_or32(_md5_and32(d, b),
+                              _md5_and32(_md5_not32(d), c))
+            } else {
+                if t < 48 {
+                    // H = b ^ c ^ d
+                    f = _md5_xor32(_md5_xor32(b, c), d)
+                } else {
+                    // I = c ^ (b | ~d)
+                    f = _md5_xor32(c,
+                          _md5_or32(b, _md5_not32(d)))
+                }
+            }
+        }
+        let mt = m[_md5_g(t)]
+        let tmp = _md5_add32(
+                    _md5_add32(a, f),
+                    _md5_add32(mt, _md5_k(t)))
+        let rotted = _md5_rotl32(tmp, _md5_s(t))
+        let new_b = _md5_add32(b, rotted)
+        a = d
+        d = c
+        c = b
+        b = new_b
+        t = t + 1
+    }
+    list_set(h, 0, _md5_add32(h[0], a))
+    list_set(h, 1, _md5_add32(h[1], b))
+    list_set(h, 2, _md5_add32(h[2], c))
+    list_set(h, 3, _md5_add32(h[3], d))
+    return 1
+}
+
+// ============================================================================
+//                          One-shot interface
+// ============================================================================
+//
+// `md5_oneshot(buf, n)` is the simplest entry point: pass a byte
+// buffer + length, get back a freshly alloc'd 17-byte buffer (16 bytes
+// of digest + trailing NUL for allocator slack).
+
+fn md5_oneshot(msg_buf, n) {
+    let h = _md5_init_h()
+    let full_blocks = int_shr(n, 6)         // n / 64
+    let i = 0
+    while i < full_blocks {
+        _md5_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    let rem = n - full_blocks * 64
+    let bits_lo = _md5_mask32(int_shl(n, 3))
+    let bits_hi = _md5_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)    // 0x80
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    // MD5 stores length LITTLE-endian (low word first).
+    _md5_store_le32(pad, final_size - 8, bits_lo)
+    _md5_store_le32(pad, final_size - 4, bits_hi)
+    _md5_compress(h, pad)
+    if need_two == 1 {
+        _md5_compress(h, pad + 64)
+    }
+    let out = alloc(MD5_HASH_LEN + 1)
+    let k = 0
+    while k < 4 {
+        _md5_store_le32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + MD5_HASH_LEN, 0)
+    return out
+}
+
+// String wrapper: MD5 of an ASCII-only NOVA string (no embedded
+// NULs). Returns a 17-byte alloc'd buffer (16B digest + trailing NUL).
+fn md5_oneshot_str(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return md5_oneshot(buf, n)
+}
+
+// ============================================================================
+//                          Streaming interface
+// ============================================================================
+//
+// The streaming state is a 4-cell list:
+//   [0] H[0..3]   -- the 4-word working hash (a NOVA list)
+//   [1] partial_buf -- a 64-byte alloc'd buffer holding any tail bytes
+//                      that haven't been compressed yet (length 0..63)
+//   [2] partial_n -- number of bytes in partial_buf (0..63)
+//   [3] total_n   -- total bytes absorbed so far (for the final
+//                    bit-length encoding in md5_final)
+//
+// The streaming API is functionally equivalent to md5_oneshot for
+// any (buf, n) pair: a test in test_md5.nova proves equivalence
+// across 4 splitting strategies.
+
+let _MD5_ST_H        = 0
+let _MD5_ST_PARTIAL  = 1
+let _MD5_ST_PARTIAL_N = 2
+let _MD5_ST_TOTAL_N  = 3
+let _MD5_ST_LEN      = 4
+
+fn md5_init() {
+    let st = list_new()
+    push(st, _md5_init_h())   // working H[0..3]
+    push(st, alloc(MD5_BLOCK_LEN + 1))  // partial-block buffer
+    push(st, 0)                  // bytes in partial_buf
+    push(st, 0)                  // total bytes absorbed
+    return st
+}
+
+// Absorb n bytes from `buf` into the streaming state. Returns the same
+// state (mutated in place). Safe to call with n == 0.
+fn md5_update(st, buf, n) {
+    if n <= 0 { return st }
+    let h = st[_MD5_ST_H]
+    let partial = st[_MD5_ST_PARTIAL]
+    let partial_n = st[_MD5_ST_PARTIAL_N]
+    let off = 0
+    // First, top up the partial buffer if it has anything in it. Once
+    // it reaches 64 bytes, compress it and reset.
+    if partial_n > 0 {
+        let want = MD5_BLOCK_LEN - partial_n
+        if want > n { want = n }
+        let i = 0
+        while i < want {
+            store8(partial + partial_n + i, load8(buf + off + i))
+            i = i + 1
+        }
+        partial_n = partial_n + want
+        off = off + want
+        if partial_n == MD5_BLOCK_LEN {
+            _md5_compress(h, partial)
+            partial_n = 0
+        }
+    }
+    // Compress every full 64-byte block straight from `buf`.
+    while off + MD5_BLOCK_LEN <= n {
+        _md5_compress(h, buf + off)
+        off = off + MD5_BLOCK_LEN
+    }
+    // Stash any tail bytes in the partial buffer.
+    let tail = n - off
+    if tail > 0 {
+        let j = 0
+        while j < tail {
+            store8(partial + partial_n + j, load8(buf + off + j))
+            j = j + 1
+        }
+        partial_n = partial_n + tail
+    }
+    list_set(st, _MD5_ST_PARTIAL_N, partial_n)
+    list_set(st, _MD5_ST_TOTAL_N, st[_MD5_ST_TOTAL_N] + n)
+    return st
+}
+
+// Apply RFC 1321 padding to the streaming state's tail bytes and
+// emit the final 17-byte digest buffer (16B + trailing NUL). The state
+// must not be reused after this call.
+fn md5_final(st) {
+    let h = st[_MD5_ST_H]
+    let partial = st[_MD5_ST_PARTIAL]
+    let partial_n = st[_MD5_ST_PARTIAL_N]
+    let total_n = st[_MD5_ST_TOTAL_N]
+    let bits_lo = _md5_mask32(int_shl(total_n, 3))
+    let bits_hi = _md5_mask32(int_shr(total_n, 29))
+    let need_two = 0
+    if partial_n >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < partial_n {
+        store8(pad + j, load8(partial + j))
+        j = j + 1
+    }
+    store8(pad + partial_n, 128)
+    j = partial_n + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _md5_store_le32(pad, final_size - 8, bits_lo)
+    _md5_store_le32(pad, final_size - 4, bits_hi)
+    _md5_compress(h, pad)
+    if need_two == 1 {
+        _md5_compress(h, pad + 64)
+    }
+    let out = alloc(MD5_HASH_LEN + 1)
+    let k = 0
+    while k < 4 {
+        _md5_store_le32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + MD5_HASH_LEN, 0)
+    return out
+}

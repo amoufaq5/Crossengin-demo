@@ -1,0 +1,527 @@
+// Unit tests for src/io/transducers/audio_pitch.nova (R10F).
+//
+// Hermetic coverage of the autocorrelation-based F0 estimator. No I/O --
+// every fixture is a NOVA list synthesized in-test (sine via synth_sine,
+// Klatt vowels via synth_phoneme, noise via LCG, silence via zero-fill).
+//
+// Coverage targets:
+//
+//   * Constants + accessors (defaults, frame size, voicing threshold,
+//     unvoiced sentinel, centi-Hz->Hz)                          (~5 checks)
+//   * Frame energy + autocorrelation primitives                 (~4 checks)
+//   * Per-frame estimator on pure sines at 100, 200, 400 Hz @
+//     16 kHz: F0 in centi-Hz within tolerance, voicing high     (~6 checks)
+//   * Per-frame on white-noise / square-wave: voicing low /
+//     unvoiced sentinel returned                                (~2 checks)
+//   * Per-frame on pure silence: voicing 0, unvoiced            (~1 check)
+//   * Per-frame on Klatt vowel: F0 within plausible range,
+//     voicing high                                              (~2 checks)
+//   * pitch_track on a 10-frame rising-pitch buffer (100..190 Hz)
+//     -> contour reflects the rise                              (~3 checks)
+//   * pitch_mean_voiced on mixed voiced+unvoiced buffer:
+//     only voiced contributes                                   (~2 checks)
+//   * pitch_range on a contour with known min/max               (~2 checks)
+//   * Bounds enforcement: 25 Hz with f0_min=50 -> wrong estimate
+//     (autocorr peaks outside band -> NOT 2500 centi-Hz);
+//     1500 Hz with f0_max=500 -> wrong estimate (subharmonic
+//     snap)                                                     (~2 checks)
+//   * Edge cases: empty buffer, single-frame minimum            (~3 checks)
+//
+// Total: ~32 assertions.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/audio_pitch.nova"
+import "../../src/io/effectors/audio_synth.nova"
+
+// ---- fixture builders ---------------------------------------------------
+
+// Build a constant-zero PCM list of n samples.
+fn _zero_buf(n) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        push(b, 0)
+        i = i + 1
+    }
+    return b
+}
+
+// Build a "white noise" PCM list -- pseudo-random samples in [-amp..amp].
+// LCG with constants that produce many sign flips.
+fn _noise_buf(n, amp) {
+    let b = list_new()
+    let i = 0
+    let seed = 12345
+    while i < n {
+        seed = (seed * 1103515245 + 12345) & 1048575
+        let v = seed - (seed / (2 * amp + 1)) * (2 * amp + 1) - amp
+        push(b, v)
+        i = i + 1
+    }
+    return b
+}
+
+// Build an alternating +amp/-amp square wave (max ZCR, period=2 samples).
+fn _square_buf(n, amp) {
+    let b = list_new()
+    let i = 0
+    while i < n {
+        if (i - (i / 2) * 2) == 0 {
+            push(b, amp)
+        } else {
+            push(b, 0 - amp)
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// Concatenate two PCM lists. NOVA's list has no append-list operator.
+fn _concat(a, b) {
+    let out = list_new()
+    let i = 0
+    while i < len(a) {
+        push(out, a[i])
+        i = i + 1
+    }
+    let j = 0
+    while j < len(b) {
+        push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+// ---- constants + accessors -----------------------------------------------
+
+fn test_defaults_accessors() {
+    ce_eq("default f0_min = 50 Hz",  pitch_default_f0_min(), 50)
+    ce_eq("default f0_max = 500 Hz", pitch_default_f0_max(), 500)
+    ce_eq("frame_ms = 30",           pitch_frame_ms(), 30)
+    ce_eq("voicing threshold = 300 milli",
+          pitch_voicing_threshold(), 300)
+    ce_eq("unvoiced sentinel = 0",   pitch_unvoiced_sentinel(), 0)
+}
+
+fn test_frame_size_per_rate() {
+    ce_eq("frame_size @ 8 kHz = 240",  pitch_frame_size(8000),  240)
+    ce_eq("frame_size @ 16 kHz = 480", pitch_frame_size(16000), 480)
+}
+
+fn test_centihz_to_hz() {
+    ce_eq("12034 centi-Hz -> 120 Hz",  pitch_centihz_to_hz(12034), 120)
+    ce_eq("20000 centi-Hz -> 200 Hz",  pitch_centihz_to_hz(20000), 200)
+    ce_eq("0 centi-Hz -> 0 Hz (unvoiced)",
+          pitch_centihz_to_hz(0), 0)
+}
+
+// ---- autocorrelation primitive ------------------------------------------
+
+fn test_energy_zero() {
+    let b = _zero_buf(480)
+    ce_eq("frame_energy of zero buffer = 0",
+          pitch_frame_energy(b, 0, 480), 0)
+}
+
+fn test_energy_constant() {
+    // 480 samples of amplitude 100 -> sum of squares = 480 * 100 * 100 =
+    // 4_800_000.
+    let b = list_new()
+    let i = 0
+    while i < 480 {
+        push(b, 100)
+        i = i + 1
+    }
+    ce_eq("frame_energy of constant 100 = 4_800_000",
+          pitch_frame_energy(b, 0, 480), 4800000)
+}
+
+fn test_autocorr_at_zero_lag_equals_energy() {
+    // R(0) must equal the frame energy (autocorr definition).
+    let s = synth_sine(200, 480, 16000)
+    let e = pitch_frame_energy(s, 0, 480)
+    let r0 = pitch_autocorr_at(s, 0, 480, 0)
+    ce_eq("R(0) == frame_energy on synth sine",
+          r0, e)
+}
+
+fn test_autocorr_constant_high_at_period() {
+    // 200 Hz sine @ 16 kHz: period = 80 samples. R(80) should be near
+    // R(0) (both positive cosine alignment). Asserting R(80) > R(40)
+    // (where cos turns negative) is the textbook "peak at period" check.
+    let s = synth_sine(200, 480, 16000)
+    let r_period = pitch_autocorr_at(s, 0, 480, 80)
+    let r_half = pitch_autocorr_at(s, 0, 480, 40)
+    ce_check("R(period=80) > R(half-period=40) for 200 Hz sine",
+             r_period > r_half)
+    ce_check("R(period) is positive (in-phase alignment)",
+             r_period > 0)
+}
+
+// ---- per-frame estimator -----------------------------------------------
+
+fn test_estimate_sine_200hz() {
+    // 200 Hz sine @ 16 kHz, 480 samples. F0_MIN=50 / F0_MAX=500. Expected:
+    // best_tau = 80, F0 = 16000/80 = 200 Hz = 20000 centi-Hz. Voicing
+    // strong (pure sine -> peak ~= R(0)).
+    let s = synth_sine(200, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    let v  = pitch_result_voicing_milli(res)
+    // Allow +/- 200 centi-Hz tolerance (the period quantizes to 80, so
+    // for a "perfect" 200 Hz sine the estimate should be exactly 20000;
+    // we allow a 2 Hz / 1% slop for synth/sin-table rounding).
+    ce_check("200 Hz sine: F0 centi-Hz in [19800, 20200]",
+             f0 >= 19800 && f0 <= 20200)
+    ce_check("200 Hz sine: voicing high (>= 600 milli)", v >= 600)
+}
+
+fn test_estimate_sine_100hz() {
+    // 100 Hz sine: period = 160 samples. F0 = 100 Hz = 10000 centi-Hz.
+    let s = synth_sine(100, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    let v  = pitch_result_voicing_milli(res)
+    ce_check("100 Hz sine: F0 centi-Hz in [9800, 10200]",
+             f0 >= 9800 && f0 <= 10200)
+    ce_check("100 Hz sine: voicing high (>= 600 milli)", v >= 600)
+}
+
+fn test_estimate_sine_400hz() {
+    // 400 Hz sine: period = 40 samples. F0 = 400 Hz = 40000 centi-Hz.
+    let s = synth_sine(400, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    let v  = pitch_result_voicing_milli(res)
+    ce_check("400 Hz sine: F0 centi-Hz in [39500, 40500]",
+             f0 >= 39500 && f0 <= 40500)
+    ce_check("400 Hz sine: voicing high (>= 600 milli)", v >= 600)
+}
+
+// ---- noise / silence ----------------------------------------------------
+
+fn test_estimate_white_noise_unvoiced() {
+    // Pseudo-random buffer -- autocorrelation has no dominant peak.
+    // Voicing should be well below 300; F0 should be PITCH_UNVOICED.
+    let s = _noise_buf(480, 5000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    let v  = pitch_result_voicing_milli(res)
+    ce_eq("white noise: f0_centihz = 0 (unvoiced)", f0, 0)
+    ce_check("white noise: voicing below threshold (< 300 milli)",
+             v < 300)
+}
+
+fn test_estimate_silence_unvoiced() {
+    // 480 samples of zero -- R(0) = 0 -> bail unvoiced.
+    let s = _zero_buf(480)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    let v  = pitch_result_voicing_milli(res)
+    ce_eq("silence: f0_centihz = 0 (unvoiced)", f0, 0)
+    ce_eq("silence: voicing 0", v, 0)
+}
+
+fn test_estimate_square_wave_picks_low_period() {
+    // Alternating +/-amp at period=2 samples = 8000 Hz periodicity. The
+    // pure square wave's autocorr also peaks at tau=2,4,6,... so within
+    // [50,500] Hz range (tau=32..320 @ 16k) the only thing visible is
+    // even-tau correlation. The voicing test isn't the point here -- we
+    // just need to assert the estimator doesn't crash on the degenerate
+    // input and returns SOMETHING in-range. (Voicing may be high.)
+    let s = _square_buf(480, 3000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let v = pitch_result_voicing_milli(res)
+    ce_check("square wave: voicing in [0, 1000]",
+             v >= 0 && v <= 1000)
+}
+
+// ---- Klatt vowel coverage ----------------------------------------------
+
+fn test_estimate_klatt_vowel() {
+    // Synthesize a Klatt vowel and assert the estimator returns a voiced
+    // F0 inside the human voice band.
+    //
+    // R6E's _synth_vowel_two_formant runs two cosine carriers at the
+    // vowel's F1 and F2 (e.g. "uw" -> 300 / 870 Hz). The autocorrelation
+    // periodicity of cos(2πF1·t) + cos(2πF2·t) is determined by GCD(F1, F2).
+    // For "uw" at 300/870 Hz, GCD = 30 Hz -- below the f0_min ceiling of
+    // 50 Hz. The autocorrelation peak will land at submultiples that are
+    // commensurate with F1 (period 26.67 samples @ 8 kHz). We assert F0
+    // is WITHIN the band [50..500] Hz (the band is enforced by the
+    // search bounds, so any voiced output must satisfy this) and that
+    // voicing crosses the threshold.
+    //
+    // The audio_synth module emits @ 8 kHz (AUDIO_SAMPLE_RATE = 8000),
+    // so we run the estimator at 8 kHz too -- frame_size = 240.
+    let vowel = synth_phoneme("uw")
+    // synth_phoneme returns ~1200 samples (150 ms @ 8 kHz). We use the
+    // first frame (240 samples).
+    let view = list_new()
+    let i = 0
+    while i < 240 {
+        push(view, vowel[i])
+        i = i + 1
+    }
+    let res = pitch_estimate_frame(view, 8000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    let v = pitch_result_voicing_milli(res)
+    // The Klatt two-formant carrier is a sum of two cosines at F1/F2;
+    // the autocorrelation argmax in [tau=16..160] (50-500 Hz @ 8 kHz)
+    // will be a submultiple of GCD(F1, F2). For "uw" (300/870 Hz):
+    // GCD(300, 870) = 30 -> 30 Hz period of the full sum. Within the
+    // f0_min=50 band, the estimator picks the first cos peak; the
+    // exact tau depends on tabulated sin rounding. We assert (a) the
+    // result is voiced and (b) within the searched band [50..500] Hz
+    // (i.e. centi-Hz in [5000..50000]).
+    ce_check("Klatt /uw/: voiced",
+             f0 != pitch_unvoiced_sentinel())
+    ce_check("Klatt /uw/: F0 in band [50..500] Hz (5000..50000 centi-Hz)",
+             f0 >= 5000 && f0 <= 50000)
+    ce_check("Klatt /uw/: voicing crosses threshold",
+             v >= pitch_voicing_threshold())
+}
+
+// ---- pitch_track on rising-pitch buffer --------------------------------
+
+fn test_track_rising_pitch_contour() {
+    // 10 frames at distinct pitches: 100, 110, 120, ..., 190 Hz.
+    // Each frame is 480 samples = 30 ms @ 16 kHz.
+    let pcm = list_new()
+    let target_freqs = list_new()
+    push(target_freqs, 100)
+    push(target_freqs, 110)
+    push(target_freqs, 120)
+    push(target_freqs, 130)
+    push(target_freqs, 140)
+    push(target_freqs, 150)
+    push(target_freqs, 160)
+    push(target_freqs, 170)
+    push(target_freqs, 180)
+    push(target_freqs, 190)
+    let fi = 0
+    while fi < len(target_freqs) {
+        let s = synth_sine(target_freqs[fi], 480, 16000)
+        let j = 0
+        while j < 480 {
+            push(pcm, s[j])
+            j = j + 1
+        }
+        fi = fi + 1
+    }
+    ce_eq("rising-pitch buffer has 4800 samples",
+          len(pcm), 4800)
+    let contour = pitch_track(pcm, 16000)
+    ce_eq("contour has 10 entries", len(contour), 10)
+    // All 10 frames should be voiced (pure sines in band).
+    ce_eq("all 10 frames voiced",
+          pitch_voiced_count(contour), 10)
+    // The contour should rise: contour[0] < contour[9]. We allow some
+    // jitter (period quantization @ 480 samples can offset by +/-1 Hz),
+    // but the trend over 100 -> 190 Hz must be visible.
+    let f0_first = pitch_result_f0_centihz(contour[0])
+    let f0_last  = pitch_result_f0_centihz(contour[9])
+    ce_check("contour rises: first frame < last frame",
+             f0_first < f0_last)
+    // First frame ~ 100 Hz, last frame ~ 190 Hz.
+    ce_check("first frame ~ 100 Hz (centi in [9500, 10500])",
+             f0_first >= 9500 && f0_first <= 10500)
+    ce_check("last frame ~ 190 Hz (centi in [18500, 19500])",
+             f0_last >= 18500 && f0_last <= 19500)
+}
+
+// ---- pitch_mean_voiced / pitch_range ----------------------------------
+
+fn test_mean_voiced_mixed_buffer() {
+    // 3 voiced (sine at 200 Hz) + 2 silence + 3 voiced (sine at 200 Hz).
+    // Mean voiced should be ~200 Hz = 20000 centi-Hz.
+    let v_sine = synth_sine(200, 480, 16000)
+    let sil = _zero_buf(480)
+    let pcm = list_new()
+    let k = 0
+    while k < 3 {
+        let i = 0
+        while i < 480 { push(pcm, v_sine[i]) i = i + 1 }
+        k = k + 1
+    }
+    k = 0
+    while k < 2 {
+        let i = 0
+        while i < 480 { push(pcm, sil[i]) i = i + 1 }
+        k = k + 1
+    }
+    k = 0
+    while k < 3 {
+        let i = 0
+        while i < 480 { push(pcm, v_sine[i]) i = i + 1 }
+        k = k + 1
+    }
+    let contour = pitch_track(pcm, 16000)
+    ce_eq("8 frames total", len(contour), 8)
+    ce_eq("6 voiced frames", pitch_voiced_count(contour), 6)
+    let mean_c = pitch_mean_voiced(contour)
+    ce_check("mean voiced F0 ~ 200 Hz (centi in [19500, 20500])",
+             mean_c >= 19500 && mean_c <= 20500)
+}
+
+fn test_mean_voiced_all_silence_zero() {
+    let pcm = _zero_buf(4800)
+    let contour = pitch_track(pcm, 16000)
+    ce_eq("all-silence: 0 voiced frames",
+          pitch_voiced_count(contour), 0)
+    ce_eq("all-silence: mean voiced = 0", pitch_mean_voiced(contour), 0)
+}
+
+fn test_pitch_range_known_min_max() {
+    // Mix 200 Hz (5 frames) and 300 Hz (5 frames). Range should be
+    // [200..300] Hz.
+    let s200 = synth_sine(200, 480, 16000)
+    let s300 = synth_sine(300, 480, 16000)
+    let pcm = list_new()
+    let k = 0
+    while k < 5 {
+        let i = 0
+        while i < 480 { push(pcm, s200[i]) i = i + 1 }
+        k = k + 1
+    }
+    k = 0
+    while k < 5 {
+        let i = 0
+        while i < 480 { push(pcm, s300[i]) i = i + 1 }
+        k = k + 1
+    }
+    let contour = pitch_track(pcm, 16000)
+    let range = pitch_range(contour)
+    ce_check("range min ~ 200 Hz (centi in [19500, 20500])",
+             range[0] >= 19500 && range[0] <= 20500)
+    ce_check("range max ~ 300 Hz (centi in [29500, 30500])",
+             range[1] >= 29500 && range[1] <= 30500)
+}
+
+fn test_pitch_range_no_voiced_zero() {
+    let pcm = _zero_buf(4800)
+    let contour = pitch_track(pcm, 16000)
+    let range = pitch_range(contour)
+    ce_eq("no voiced: range min = 0", range[0], 0)
+    ce_eq("no voiced: range max = 0", range[1], 0)
+}
+
+// ---- bounds enforcement ------------------------------------------------
+
+fn test_bounds_below_f0_min() {
+    // 25 Hz sine @ 16 kHz: true period = 640 samples > frame_size (480).
+    // With f0_min=50 the search range is tau in [32..320]. Within that
+    // range the autocorrelation of a 25 Hz sine is NOT periodic (we're
+    // below half a period), so the estimator either bails unvoiced or
+    // snaps to the band-edge. Either way: the returned F0 must NOT equal
+    // the true 2500 centi-Hz, proving f0_min was enforced.
+    let s = synth_sine(25, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    // f0 must NOT be in a +/- 100 centi-Hz tolerance band around 2500.
+    let too_low = 0
+    if f0 >= 2400 && f0 <= 2600 { too_low = 1 }
+    ce_eq("25 Hz with f0_min=50: F0 not in [24..26] Hz band",
+          too_low, 0)
+    // The returned F0 (if voiced) must respect the f0_min lower bound:
+    // sample_rate / tau_max where tau_max = sr/f0_min = 320. So F0 >=
+    // sr / 320 = 50 Hz = 5000 centi-Hz. Either f0==0 (unvoiced) OR
+    // f0 >= 5000.
+    let ok_bounds = 0
+    if f0 == 0 { ok_bounds = 1 }
+    if f0 >= 5000 { ok_bounds = 1 }
+    ce_eq("25 Hz: result either unvoiced OR f0 >= f0_min (5000 centi)",
+          ok_bounds, 1)
+}
+
+fn test_bounds_above_f0_max() {
+    // 1500 Hz sine @ 16 kHz: true period = 10.67 samples. With f0_max=500
+    // the search range is tau in [32..320]. The true period is BELOW 32
+    // so the estimator MUST snap to a subharmonic. The returned F0 must
+    // NOT equal the true 150000 centi-Hz.
+    let s = synth_sine(1500, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    let f0 = pitch_result_f0_centihz(res)
+    // f0 must NOT be in a +/- 1000 centi-Hz tolerance band around 150000.
+    let too_high = 0
+    if f0 >= 149000 && f0 <= 151000 { too_high = 1 }
+    ce_eq("1500 Hz with f0_max=500: F0 not in [1490..1510] Hz band",
+          too_high, 0)
+    // Result must respect the upper bound: F0 <= sample_rate / tau_min =
+    // 16000 / 32 = 500 Hz = 50000 centi-Hz. (And >= 0.)
+    let ok_bounds = 0
+    if f0 == 0 { ok_bounds = 1 }
+    if f0 > 0 && f0 <= 50000 { ok_bounds = 1 }
+    ce_eq("1500 Hz: result either unvoiced OR f0 <= f0_max (50000 centi)",
+          ok_bounds, 1)
+}
+
+// ---- edge cases --------------------------------------------------------
+
+fn test_estimate_short_buffer_unvoiced() {
+    // Buffer shorter than frame_size -> immediate unvoiced.
+    let s = synth_sine(200, 100, 16000)  // only 100 samples; frame=480
+    let res = pitch_estimate_frame(s, 16000, 50, 500)
+    ce_eq("short buffer: f0 = 0", pitch_result_f0_centihz(res), 0)
+    ce_eq("short buffer: voicing = 0",
+          pitch_result_voicing_milli(res), 0)
+}
+
+fn test_estimate_default_bounds() {
+    // f0_min=0 / f0_max=0 should fall back to module defaults (50..500).
+    let s = synth_sine(200, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 0, 0)
+    let f0 = pitch_result_f0_centihz(res)
+    ce_check("default bounds (0/0): F0 ~ 200 Hz",
+             f0 >= 19800 && f0 <= 20200)
+}
+
+fn test_estimate_swapped_bounds() {
+    // f0_min > f0_max should be normalized internally (swapped).
+    let s = synth_sine(200, 480, 16000)
+    let res = pitch_estimate_frame(s, 16000, 500, 50)
+    let f0 = pitch_result_f0_centihz(res)
+    ce_check("swapped bounds (500/50): F0 still ~ 200 Hz",
+             f0 >= 19800 && f0 <= 20200)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_defaults_accessors()
+    test_frame_size_per_rate()
+    test_centihz_to_hz()
+
+    test_energy_zero()
+    test_energy_constant()
+    test_autocorr_at_zero_lag_equals_energy()
+    test_autocorr_constant_high_at_period()
+
+    test_estimate_sine_200hz()
+    test_estimate_sine_100hz()
+    test_estimate_sine_400hz()
+
+    test_estimate_white_noise_unvoiced()
+    test_estimate_silence_unvoiced()
+    test_estimate_square_wave_picks_low_period()
+
+    test_estimate_klatt_vowel()
+
+    test_track_rising_pitch_contour()
+
+    test_mean_voiced_mixed_buffer()
+    test_mean_voiced_all_silence_zero()
+    test_pitch_range_known_min_max()
+    test_pitch_range_no_voiced_zero()
+
+    test_bounds_below_f0_min()
+    test_bounds_above_f0_max()
+
+    test_estimate_short_buffer_unvoiced()
+    test_estimate_default_bounds()
+    test_estimate_swapped_bounds()
+
+    ce_summary("audio_pitch")
+}
+
+main()

@@ -1,0 +1,535 @@
+// CrossEngin meta: meta-learning observer (per-source promotion/atrophy).
+//
+// Purpose
+//   The agent learns at three rates today: Hebbian synapses, Bayesian atoms,
+//   and atom birth/death. Nobody watches whether the learning is actually
+//   paying off. This module is a low-frequency, purely-observational loop:
+//   at every Nth idle tick it snapshots per-source atom-belief distributions
+//   and reports rolling promotion (tentative -> durable) and atrophy (durable
+//   -> tentative, dropped/tombstoned) rates so the operator -- and eventually
+//   the agent itself -- can tell which sources of evidence are productive.
+//
+//   P1.1 (this revision) closes the loop: the observer can now FEED its
+//   per-source rates back into `source_authority` by promoting or demoting a
+//   host's tier when a sustained signal crosses thresholds. `mo_apply_feedback`
+//   walks every tracked source; if the cumulative promotion rate >= 700/1000
+//   (70%) over a window of >= 10 attributed atoms, it promotes the
+//   corresponding host one tier; if the cumulative atrophy rate >= 500/1000
+//   (50%) over the same window, it demotes one tier. The window + threshold
+//   guard against thrash from a single-atom flip. `mo_feedback_dryrun` is the
+//   read-only twin used by the chat's `/meta-feedback` admin to PREVIEW what
+//   would change before `/meta-apply` actually mutates.
+//
+//   Source whitelist bridge: today `source_authority` is host-keyed (URLs map
+//   to a tier via a host registry). The P15 source tags (`src:topic:fever`)
+//   are NOT host-keyed, so the observer maps each tag to a synthetic host
+//   `learned:<kind>:<tag>` (see `_mo_tag_to_host`) before calling the
+//   `sa_host_set_tier` accessor. Tags that are not in the `src:...` form
+//   (e.g. `seed`, `user-teach`) map to `learned:builtin:<tag>` so they too
+//   have a tier registry slot. The mapping is one-way + idempotent.
+//
+//   P1.6 (this revision) adds atom-death attribution: `mo_record_death(mo,
+//   atom_id)` is called by the atom-death monitor at the death-decision
+//   callsite. Today the observer only sees atrophy as "tentative ->
+//   sub-threshold" via the rolling poll; this hook closes the case where a
+//   DURABLE atom dies outright (tombstone -> dead) before the next poll
+//   would have caught the transition.
+//
+//   Minimum-viable source tagging: atoms only carry a source if a caller
+//   explicitly tags them via `mo_attribute`. Atoms born without a tag are
+//   never observed here. The seed installer attributes the just-installed
+//   contiguous ID range as "seed"; user-teach attributes the freshly-ingested
+//   concept atom as "user-teach"; future learn:<TOPIC> taggers can register
+//   any other source string. The tag table lives ENTIRELY in the observer
+//   side-table (a list-of-lists keyed by tag), so atom_store's atom shape is
+//   unchanged. We don't mass-retag existing atoms -- the observer measures
+//   only what is tagged from this point forward.
+//
+//   Classification (per ADR-0030):
+//     - durable   : posterior mean >= 750/1000 (the CT_LOW_MEAN bar -- atoms
+//                   at/above this are confidence-closed in the learning loop).
+//     - tentative : posterior mean <  750/1000.
+//
+//   Rates (over the rolling-since-last-poll window, milli-fixed-point 0..1000):
+//     promotion_rate = newly_durable_this_poll * 1000 / (newly_durable + new_tentative_remaining)
+//     atrophy_rate   = atrophied_this_poll     * 1000 /  born_in_window
+//
+// ADRs implemented: ADR-0050 (meta-learning observer; P1.1 feedback into
+//   source_authority + P1.6 atom-death attribution). NOVA dependencies:
+//   builtins. CrossEngin dependencies: src/kg/atom_store.nova (read-only,
+//   transitively via multi_kg_manager), src/parts/meta/reflection_loop.nova
+//   (read-only, for the refl_kg promotion counter), src/learning/source_authority.nova
+//   (for the host-keyed tier accessor `sa_host_set_tier`).
+
+import "../../kg/multi_kg_manager.nova"
+import "../../learning/source_authority.nova"
+
+// ---- thresholds (milli) --------------------------------------------------
+let MO_DURABLE_MEAN = 750   // posterior mean at/above this counts as durable
+                            // (mirrors confidence_thresholds CT_LOW_MEAN).
+
+// ---- per-source record layout --------------------------------------------
+// [tag, atom_ids, promotion_count, atrophy_count, last_poll_tick,
+//  prev_durable_set, prev_attributed_count]
+let MO_MS_TAG          = 0
+let MO_MS_ATOM_IDS     = 1   // list of atom ids attributed to this source
+let MO_MS_PROMOTIONS   = 2   // cumulative tentative -> durable transitions
+let MO_MS_ATROPHIES    = 3   // cumulative durable -> (sub-durable or vanished) transitions
+let MO_MS_LAST_POLL    = 4   // last tick on which mo_poll observed this source
+let MO_MS_PREV_DURABLE = 5   // list of atom ids that were durable on the prior poll
+let MO_MS_PREV_ATTR    = 6   // size of attributed-ids list at the prior poll (for
+                          //   birth-in-window accounting)
+
+// ---- observer object layout ----------------------------------------------
+// [TAG, sources, total_polls, total_refl_promotions]
+let MO_TAG         = 0
+let MO_SOURCES     = 1
+let MO_TOTAL_POLLS = 2
+let MO_REFL_PROM   = 3   // cumulative refl-kg promotions counted so far
+let MO_OBJ_TAG = 5001
+
+fn mo_new() {
+    let m = list_new()
+    push(m, MO_OBJ_TAG)
+    push(m, list_new())   // sources
+    push(m, 0)            // total polls
+    push(m, 0)            // refl promotions seen
+    return m
+}
+
+// Find the per-source record for `tag`, or 0 if not yet tracked.
+fn _mo_find_source(mo, tag) {
+    let srcs = mo[MO_SOURCES]
+    let i = 0
+    while i < len(srcs) {
+        if str_eq(srcs[i][MO_MS_TAG], tag) == 1 { return srcs[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Create a fresh per-source record for `tag`.
+fn _mo_make_source(mo, tag) {
+    let s = list_new()
+    push(s, tag)
+    push(s, list_new())   // atom ids
+    push(s, 0)            // promotions
+    push(s, 0)            // atrophies
+    push(s, 0 - 1)        // last poll: never
+    push(s, list_new())   // prev durable set
+    push(s, 0)            // prev attributed count
+    push(mo[MO_SOURCES], s)
+    return s
+}
+
+// Record that an atom came from `source_tag`. Idempotent on (tag, atom_id):
+// re-attributing the same id under the same tag is a no-op.
+fn mo_attribute(mo, source_tag, atom_id) {
+    let src = _mo_find_source(mo, source_tag)
+    if src == 0 { src = _mo_make_source(mo, source_tag) }
+    let ids = src[MO_MS_ATOM_IDS]
+    let i = 0
+    while i < len(ids) {
+        if ids[i] == atom_id { return 0 }
+        i = i + 1
+    }
+    push(ids, atom_id)
+    return 1
+}
+
+// Look up an atom by id in `kg`. Returns the atom or 0 if absent / out of
+// range. (kg_atom already guards against out-of-range, but if `kg` is the
+// shared concept KG and the id was attributed to a different KG the atom
+// is silently treated as "vanished".)
+fn _mo_atom_by_id(kg, atom_id) {
+    return kg_atom(kg, atom_id)
+}
+
+// Is `atom_id` in the prev-durable set for this source?
+fn _mo_in_set(set, atom_id) {
+    let i = 0
+    while i < len(set) {
+        if set[i] == atom_id { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Walk one source's attributed atoms, computing the current tentative /
+// durable split AND the deltas-since-last-poll. Returns a 6-element list:
+// [tentative_now, durable_now, just_promoted, just_atrophied, born_since,
+//  durable_set_now] where the trailing list is the snapshot to carry forward.
+fn _mo_classify_source(src, kg) {
+    let ids = src[MO_MS_ATOM_IDS]
+    let prev_durable = src[MO_MS_PREV_DURABLE]
+    let prev_attr_n = src[MO_MS_PREV_ATTR]
+    let tentative = 0
+    let durable = 0
+    let just_promoted = 0
+    let just_atrophied = 0
+    let cur_durable = list_new()
+    let i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let a = _mo_atom_by_id(kg, id)
+        if a != 0 {
+            let mean = atom_confidence(a)
+            let was_durable = _mo_in_set(prev_durable, id)
+            if mean >= MO_DURABLE_MEAN {
+                durable = durable + 1
+                push(cur_durable, id)
+                if was_durable == 0 { just_promoted = just_promoted + 1 }
+            } else {
+                tentative = tentative + 1
+                if was_durable == 1 { just_atrophied = just_atrophied + 1 }
+            }
+        } else {
+            // Vanished (e.g. tombstone hard-removed by GC). Count it as
+            // atrophy if it WAS durable.
+            if _mo_in_set(prev_durable, id) == 1 {
+                just_atrophied = just_atrophied + 1
+            }
+        }
+        i = i + 1
+    }
+    let born_since = len(ids) - prev_attr_n
+    if born_since < 0 { born_since = 0 }
+    let out = list_new()
+    push(out, tentative)
+    push(out, durable)
+    push(out, just_promoted)
+    push(out, just_atrophied)
+    push(out, born_since)
+    push(out, cur_durable)
+    return out
+}
+
+// Per-poll snapshot (one entry per source): the rolling summary mo_report
+// will format. Layout:
+//   [tag, atoms_total, tentative, durable, promo_milli, atrophy_milli,
+//    poll_idx]
+let MO_SNAP_TAG      = 0
+let MO_SNAP_ATOMS    = 1
+let MO_SNAP_TENT     = 2
+let MO_SNAP_DUR      = 3
+let MO_SNAP_PROMO    = 4
+let MO_SNAP_ATROPHY  = 5
+let MO_SNAP_POLL_IDX = 6
+
+// rate_milli(num, denom): num*1000/denom, clamped, 0 when denom == 0.
+fn _mo_rate_milli(num, denom) {
+    if denom <= 0 { return 0 }
+    let r = num * 1000 / denom
+    if r < 0 { r = 0 }
+    if r > 1000 { r = 1000 }
+    return r
+}
+
+// Snapshot one source: classify its attributed atoms against `kg`, update the
+// running counters in the source record, and emit a SNAP_* row. (Refl-KG
+// promotions are observed globally, not per-source, and are folded into the
+// "unattributed" bucket by mo_poll if the bucket exists -- but per-source
+// rates are correctly each-source's own.)
+fn _mo_snapshot_source(src, kg, tick, poll_idx) {
+    let c = _mo_classify_source(src, kg)
+    let tentative = c[0]
+    let durable = c[1]
+    let just_promoted = c[2]
+    let just_atrophied = c[3]
+    let born_since = c[4]
+    let cur_durable = c[5]
+    let total = tentative + durable
+    list_set(src, MO_MS_PROMOTIONS, src[MO_MS_PROMOTIONS] + just_promoted)
+    list_set(src, MO_MS_ATROPHIES, src[MO_MS_ATROPHIES] + just_atrophied)
+    list_set(src, MO_MS_LAST_POLL, tick)
+    list_set(src, MO_MS_PREV_DURABLE, cur_durable)
+    list_set(src, MO_MS_PREV_ATTR, len(src[MO_MS_ATOM_IDS]))
+    let promo_rate = _mo_rate_milli(just_promoted, just_promoted + tentative)
+    let atrophy_rate = _mo_rate_milli(just_atrophied, born_since)
+    let snap = list_new()
+    push(snap, src[MO_MS_TAG])
+    push(snap, total)
+    push(snap, tentative)
+    push(snap, durable)
+    push(snap, promo_rate)
+    push(snap, atrophy_rate)
+    push(snap, poll_idx)
+    return snap
+}
+
+// One observation pass. Returns the per-source snapshot list. Side effects:
+//   - bumps the global poll counter
+//   - bumps each source's promotion / atrophy running totals
+//   - persists the new durable-set per source so the next poll can diff
+fn mo_poll(mo, kg, refl_kg, now) {
+    list_set(mo, MO_TOTAL_POLLS, mo[MO_TOTAL_POLLS] + 1)
+    let poll_idx = mo[MO_TOTAL_POLLS]
+    let srcs = mo[MO_SOURCES]
+    let out = list_new()
+    let i = 0
+    while i < len(srcs) {
+        push(out, _mo_snapshot_source(srcs[i], kg, now, poll_idx))
+        i = i + 1
+    }
+    // Observe reflection-KG promotions globally: the refl_kg's
+    // "promoted" payload flag marks already-graduated tentative atoms. Count
+    // them by walking refl_kg.atoms.
+    if refl_kg != 0 {
+        let refl_atoms = kg_atoms(refl_kg)
+        let promoted = 0
+        let j = 0
+        while j < len(refl_atoms) {
+            if atom_payload_has(refl_atoms[j], "promoted") == 1 {
+                promoted = promoted + 1
+            }
+            j = j + 1
+        }
+        list_set(mo, MO_REFL_PROM, promoted)
+    }
+    return out
+}
+
+// Number of polls so far.
+fn mo_total_polls(mo) { return mo[MO_TOTAL_POLLS] }
+
+// Cumulative refl-kg promotions counted (mostly for tests / introspection).
+fn mo_refl_promotions(mo) { return mo[MO_REFL_PROM] }
+
+// Names of every source the observer has seen at least one attribution for.
+fn mo_sources(mo) {
+    let srcs = mo[MO_SOURCES]
+    let out = list_new()
+    let i = 0
+    while i < len(srcs) {
+        push(out, srcs[i][MO_MS_TAG])
+        i = i + 1
+    }
+    return out
+}
+
+// Per-source rolling summary: one row per known source. Each row:
+//   [tag, promotion_rate_milli, atrophy_rate_milli, sample_size, last_poll]
+// where sample_size is the number of attributed atoms and last_poll is the
+// most recent poll tick this source was observed at (or -1 if never).
+//
+// Rates are CUMULATIVE (over the observer's lifetime), not just the last poll.
+// Lifetime numerator / denominator gives a stable signal that doesn't flip on
+// every idle tick.
+fn mo_report(mo) {
+    let srcs = mo[MO_SOURCES]
+    let out = list_new()
+    let i = 0
+    while i < len(srcs) {
+        let s = srcs[i]
+        let sample = len(s[MO_MS_ATOM_IDS])
+        let promos = s[MO_MS_PROMOTIONS]
+        let atrophies = s[MO_MS_ATROPHIES]
+        // Cumulative promotion: promotions / total atoms ever attributed.
+        let promo_rate = _mo_rate_milli(promos, sample)
+        // Cumulative atrophy: atrophies / total atoms ever attributed.
+        let atrophy_rate = _mo_rate_milli(atrophies, sample)
+        let row = list_new()
+        push(row, s[MO_MS_TAG])
+        push(row, promo_rate)
+        push(row, atrophy_rate)
+        push(row, sample)
+        push(row, s[MO_MS_LAST_POLL])
+        push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
+// Helpers for the chat / daemon to format a milli (0..1000) as "NN.N":
+//   mo_format_pct(425) -> "42.5"
+fn mo_format_pct(milli) {
+    let whole = milli / 10
+    let tenth = milli - whole * 10
+    if tenth < 0 { tenth = 0 - tenth }
+    return int_to_str(whole) + "." + int_to_str(tenth)
+}
+
+// ---- P1.1: source_authority feedback -------------------------------------
+// Thresholds + minimum-window for promoting / demoting a source. Tuned to
+// avoid thrash: a single-atom flip cannot move tiers; sustained signals only.
+let MO_FB_PROMO_MILLI   = 700   // cumulative promotion >= 70.0% -> promote
+let MO_FB_ATROPHY_MILLI = 500   // cumulative atrophy   >= 50.0% -> demote
+let MO_FB_WINDOW        = 10    // need at least this many attributed atoms
+
+// Feedback action codes (returned by mo_feedback_dryrun / mo_apply_feedback).
+let MO_FB_NONE    = 0   // sample too small, or no threshold crossed
+let MO_FB_PROMOTE = 1   // promotion rate crossed; tier moves up one (smaller #)
+let MO_FB_DEMOTE  = 2   // atrophy   rate crossed; tier moves down one (larger #)
+
+// Action-row layout (one per evaluated source):
+//   [tag, host, action, old_tier, new_tier, promo_milli, atrophy_milli, sample]
+let MO_FB_TAG       = 0
+let MO_FB_HOST      = 1
+let MO_FB_ACTION    = 2
+let MO_FB_OLD_TIER  = 3
+let MO_FB_NEW_TIER  = 4
+let MO_FB_PROMO     = 5
+let MO_FB_ATROPHY   = 6
+let MO_FB_SAMPLE    = 7
+
+// Map a source tag to the synthetic host string that source_authority's
+// host-keyed registry will store. The convention:
+//   "src:topic:fever"   -> "learned:topic:fever"
+//   "src:url:wikipedia" -> "learned:url:wikipedia"
+//   "seed"              -> "learned:builtin:seed"
+//   "user-teach"        -> "learned:builtin:user-teach"
+// One-way and idempotent. The "learned:" prefix keeps these synthetic hosts
+// from colliding with any real domain a future fetch path might register.
+fn _mo_tag_to_host(tag) {
+    if starts_with(tag, "src:") == 1 {
+        // strip the leading "src:" and prepend "learned:"
+        let rest = substr(tag, 4, len(tag) - 4)
+        return "learned:" + rest
+    }
+    return "learned:builtin:" + tag
+}
+
+// Public alias for callers that want the mapping (chat / docs). Same impl.
+fn mo_tag_to_host(tag) { return _mo_tag_to_host(tag) }
+
+// Decide what feedback (if any) a single source row should produce. Pure --
+// does not mutate anything. Reads the source's CUMULATIVE counters and
+// returns the action code (MO_FB_NONE / PROMOTE / DEMOTE) plus the rates +
+// sample. Promotion wins when both thresholds are crossed (rare).
+fn _mo_feedback_decide(src) {
+    let sample = len(src[MO_MS_ATOM_IDS])
+    let promos = src[MO_MS_PROMOTIONS]
+    let atrophies = src[MO_MS_ATROPHIES]
+    let promo_rate = _mo_rate_milli(promos, sample)
+    let atrophy_rate = _mo_rate_milli(atrophies, sample)
+    let action = MO_FB_NONE
+    if sample >= MO_FB_WINDOW {
+        if promo_rate >= MO_FB_PROMO_MILLI {
+            action = MO_FB_PROMOTE
+        } else {
+            if atrophy_rate >= MO_FB_ATROPHY_MILLI {
+                action = MO_FB_DEMOTE
+            }
+        }
+    }
+    let row = list_new()
+    push(row, action)
+    push(row, promo_rate)
+    push(row, atrophy_rate)
+    push(row, sample)
+    return row
+}
+
+// Build the per-source feedback action list WITHOUT mutating `source_auth`.
+// One row per tracked source. `mo_feedback_dryrun` is what `/meta-feedback`
+// surfaces; `mo_apply_feedback` shares the decision logic and then commits.
+fn mo_feedback_dryrun(mo, source_auth) {
+    let srcs = mo[MO_SOURCES]
+    let out = list_new()
+    let i = 0
+    while i < len(srcs) {
+        let s = srcs[i]
+        let tag = s[MO_MS_TAG]
+        let host = _mo_tag_to_host(tag)
+        let dec = _mo_feedback_decide(s)
+        let action = dec[0]
+        let promo_rate = dec[1]
+        let atrophy_rate = dec[2]
+        let sample = dec[3]
+        let old_tier = sa_tier_for_host(source_auth, host)
+        let new_tier = old_tier
+        if action == MO_FB_PROMOTE {
+            if old_tier > SA_TIER_A { new_tier = old_tier - 1 }
+            else { new_tier = old_tier }   // already top tier; effective no-op
+        }
+        if action == MO_FB_DEMOTE {
+            if old_tier < SA_TIER_C { new_tier = old_tier + 1 }
+            else { new_tier = old_tier }   // already bottom tier; effective no-op
+        }
+        let row = list_new()
+        push(row, tag)
+        push(row, host)
+        push(row, action)
+        push(row, old_tier)
+        push(row, new_tier)
+        push(row, promo_rate)
+        push(row, atrophy_rate)
+        push(row, sample)
+        push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
+// Apply the feedback: for every source whose dryrun row carries a non-NONE
+// action AND whose tier would actually change, write the new tier back into
+// `source_auth` via sa_host_set_tier. Returns the same action-row list as
+// dryrun (the rows that ACTUALLY moved a tier carry old_tier != new_tier;
+// other rows reflect either "no action" or "action capped at A / C edge").
+//
+// Sustained signals only: a source with fewer than MO_FB_WINDOW attributed
+// atoms is left alone (action = NONE). Tier hops are ONE step per call --
+// chained promotions / demotions require multiple feedback cycles.
+fn mo_apply_feedback(mo, source_auth) {
+    let rows = mo_feedback_dryrun(mo, source_auth)
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let old_tier = r[MO_FB_OLD_TIER]
+        let new_tier = r[MO_FB_NEW_TIER]
+        if new_tier != old_tier {
+            sa_host_set_tier(source_auth, r[MO_FB_HOST], new_tier)
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+// Human-readable action name for chat output.
+fn mo_fb_action_name(action) {
+    if action == MO_FB_PROMOTE { return "promote" }
+    if action == MO_FB_DEMOTE  { return "demote" }
+    return "none"
+}
+
+// Human-readable tier name (matches the source_authority ADR-0029 letters).
+fn mo_tier_name(tier) {
+    if tier == SA_TIER_A { return "A" }
+    if tier == SA_TIER_B { return "B" }
+    if tier == SA_TIER_C { return "C" }
+    return "?"
+}
+
+// ---- P1.6: atom-death attribution hook ----------------------------------
+// Called by the atom-death monitor (`adm_sweep` in
+// `src/learning/atom_death_monitor.nova`) at the moment an atom transitions
+// from tombstone -> dead. If the dead atom was attributed to a tracked
+// source, increments that source's atrophy counter directly so the
+// observer's per-source rate reflects the outright death (which the next
+// `mo_poll` would have classified as "vanished" anyway -- this hook makes
+// the attribution immediate AND robust to the atom being GC-removed before
+// the next poll fires).
+//
+// Returns 1 if the atom was found in a source's id-list and the counter
+// was bumped; 0 if the atom was untagged (never attributed). Idempotency
+// caveat: the caller is expected to invoke this AT MOST ONCE per atom
+// (the death-transition is itself one-shot); if it ever fires twice the
+// counter will double-count, but adm_sweep's dead-flag guard prevents that.
+fn mo_record_death(mo, atom_id) {
+    let srcs = mo[MO_SOURCES]
+    let i = 0
+    while i < len(srcs) {
+        let s = srcs[i]
+        let ids = s[MO_MS_ATOM_IDS]
+        let j = 0
+        while j < len(ids) {
+            if ids[j] == atom_id {
+                list_set(s, MO_MS_ATROPHIES, s[MO_MS_ATROPHIES] + 1)
+                return 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}

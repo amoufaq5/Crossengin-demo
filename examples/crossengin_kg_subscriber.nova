@@ -1,0 +1,211 @@
+// CrossEngin KG sync subscriber (Phase 20 / P1.3 -- reconnect + bidirectional).
+//
+// Purpose
+//   The subscriber half of the kg-sync seam. Dials a publisher, runs the v2
+//   HELLO/SUB handshake, then loops reading events. Each ATOM is applied to
+//   the local KG via `sync_apply_atom` (which transparently merges when the
+//   same label is taught at both ends -- average belief, keep local id).
+//   PROMOTE / ATROPHY / DELETE events update the corresponding local atom.
+//   On disconnect (recv returns 0 mid-stream), the subscriber transparently
+//   reconnects using the saved cursor (highest atom-id seen so far) and
+//   sends `SUB FROM <cursor>` so the publisher knows the resume point.
+//
+//   Bidirectional teach: pre-feed labels on stdin (e.g. via the same
+//   `printf '...' | ./bin/...` pattern the publisher uses) and the
+//   subscriber drains one stdin label per received event, piggybacking it
+//   to the publisher as a `PUB <kg> <id> <kind> <a> <b> <label>` line on
+//   the ACK channel. The publisher applies and re-broadcasts.
+//
+//   Run with: ./bin/crossengin-kg-subscriber
+//   Env:
+//     CE_KGSYNC_HOST   -- publisher host  (default 127.0.0.1)
+//     CE_KGSYNC_PORT   -- publisher port  (default 8766)
+//     CE_KGSYNC_TOKEN  -- shared auth token (default: anonymous)
+//
+//   The subscriber prints `recv kg=... id=... label=...` (back-compat with
+//   v1's integration scenario), plus per-kind `promote/atrophy/delete`
+//   lines, and `reconnect kg=... cursor=N ok` on a successful resume.
+//
+// ADRs exercised: ADR-0014, ADR-0016. NOVA dependencies: socket builtins,
+//   `read_line`, `getenv`. CrossEngin dependencies:
+//   src/io/transducers/kg_sync.nova, src/kg/multi_kg_manager.nova.
+
+import "../src/io/transducers/kg_sync.nova"
+import "../src/kg/multi_kg_manager.nova"
+
+let CE_KGSYNC_MAX_ATOMS = 1024
+
+fn _kgsync_host_from_env() {
+    let env = getenv("CE_KGSYNC_HOST")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return "127.0.0.1"
+}
+
+// Drain one stdin line into a PUB payload, if any. Returns the formatted
+// PUB line (including '\n') ready to send, or 0 if stdin is exhausted /
+// empty / `bye`. Births a local atom for the label so the subscriber's KG
+// reflects what it taught.
+//
+// `birthed_ids` is a list of local atom ids the subscriber has taught,
+// for the boot-time count line.
+fn _drain_one_teach(kg, birthed_ids) {
+    let line = read_line()
+    if len(line) == 0 { return 0 }
+    let label = str_trim(line)
+    if len(label) == 0 { return 0 }
+    if str_eq(label, "bye") == 1 { return 0 }
+    let a = kg_add_atom(kg, ATOM_CONCEPT, label, 0)
+    let b = atom_belief(a)
+    push(birthed_ids, atom_id(a))
+    println("teach kg=" + kg_label(kg)
+        + " id=" + int_to_str(atom_id(a))
+        + " label=" + label)
+    return KGSYNC_PUB_PREFIX + kg_label(kg) + " "
+        + int_to_str(atom_id(a)) + " "
+        + int_to_str(atom_kind(a)) + " "
+        + int_to_str(b[0]) + " "
+        + int_to_str(b[1]) + " "
+        + label + "\n"
+}
+
+fn main() {
+    let host = _kgsync_host_from_env()
+    let port = kgsync_port_from_env()
+    let token = kgsync_token_from_env()
+    println("kg-subscriber: dialing " + host + ":" + int_to_str(port)
+        + " auth=" + _auth_mode_str(token))
+
+    // 1. BOOT: own a small language KG, empty.
+    let kgreg = kg_registry_new()
+    let kg = kg_spawn(kgreg, "language")
+    println("kg-subscriber: boot kg=language atoms=" + int_to_str(kg_atom_count(kg)))
+
+    // 2. CONNECT (state-carrying form so we can reconnect on disconnect).
+    let conn = sync_sub_connect_state(host, port)
+    if conn == 0 {
+        println("kg-subscriber: ERROR cannot connect / handshake")
+        exit(1)
+    }
+    println("kg-subscriber: handshake OK, subscribing to all atoms")
+
+    let teach_ids = list_new()
+    let received = 0
+    let promotes = 0
+    let atrophies = 0
+    let deletes = 0
+    let reconnects = 0
+    let stdin_eof = 0
+    let go = 1
+
+    while go == 1 {
+        let fd = sync_conn_fd(conn)
+        let rec = sync_sub_recv_event(fd)
+        if rec == 0 {
+            // EOF / disconnect (NOT an intentional BYE). Attempt reconnect.
+            if sync_sub_reconnect(conn) == 1 {
+                reconnects = reconnects + 1
+                println("reconnect kg=" + kg_label(kg)
+                    + " cursor=" + int_to_str(sync_conn_cursor(conn))
+                    + " ok=1 attempts=" + int_to_str(reconnects))
+            } else {
+                go = 0
+            }
+        } else {
+            let t = rec[KGSYNC_R_TYPE]
+            if t == KGSYNC_EV_BYE {
+                // Publisher said goodbye cleanly -- don't reconnect.
+                go = 0
+            } else { if t == KGSYNC_EV_ATOM {
+                let pub_kg    = rec[KGSYNC_R_KG]
+                let pub_id    = rec[KGSYNC_R_ID]
+                let pub_kind  = rec[KGSYNC_R_KIND]
+                let pub_alpha = rec[KGSYNC_R_ALPHA]
+                let pub_beta  = rec[KGSYNC_R_BETA]
+                let pub_label = rec[KGSYNC_R_LABEL]
+
+                let a = sync_apply_atom(kg, pub_id, pub_kind, pub_alpha, pub_beta, pub_label)
+                received = received + 1
+                println("recv kg=" + pub_kg
+                    + " id=" + int_to_str(pub_id)
+                    + " label=" + pub_label)
+                // Advance the cursor so a later reconnect resumes after
+                // this id.
+                if pub_id > sync_conn_cursor(conn) {
+                    sync_conn_set_cursor(conn, pub_id)
+                }
+                // Bidirectional: piggyback a PUB if we have a stdin label.
+                let pub_line = 0
+                if stdin_eof == 0 {
+                    pub_line = _drain_one_teach(kg, teach_ids)
+                    if pub_line == 0 { stdin_eof = 1 }
+                }
+                let ok = sync_sub_ack_with_pub(fd, pub_id, pub_line)
+                if ok == 0 {
+                    // Send failed; attempt reconnect on next recv.
+                }
+                if received >= CE_KGSYNC_MAX_ATOMS {
+                    println("kg-subscriber: max atoms reached, closing")
+                    go = 0
+                }
+            } else {
+                if t == KGSYNC_EV_PROMOTE {
+                    promotes = promotes + 1
+                    sync_apply_promote(kg, rec[KGSYNC_R_ID],
+                        rec[KGSYNC_P_ALPHA], rec[KGSYNC_P_BETA])
+                    println("promote kg=" + rec[KGSYNC_R_KG]
+                        + " id=" + int_to_str(rec[KGSYNC_R_ID])
+                        + " alpha=" + int_to_str(rec[KGSYNC_P_ALPHA])
+                        + " beta=" + int_to_str(rec[KGSYNC_P_BETA]))
+                    sync_sub_ack(fd, rec[KGSYNC_R_ID])
+                } else {
+                    if t == KGSYNC_EV_ATROPHY {
+                        atrophies = atrophies + 1
+                        sync_apply_atrophy(kg, rec[KGSYNC_R_ID])
+                        println("atrophy kg=" + rec[KGSYNC_R_KG]
+                            + " id=" + int_to_str(rec[KGSYNC_R_ID]))
+                        sync_sub_ack(fd, rec[KGSYNC_R_ID])
+                    } else {
+                        if t == KGSYNC_EV_DELETE {
+                            deletes = deletes + 1
+                            sync_apply_delete(kg, rec[KGSYNC_R_ID])
+                            println("delete kg=" + rec[KGSYNC_R_KG]
+                                + " id=" + int_to_str(rec[KGSYNC_R_ID]))
+                            sync_sub_ack(fd, rec[KGSYNC_R_ID])
+                        } else {
+                            // Unknown event kind; ack just in case.
+                            if t != KGSYNC_EV_ACK {
+                                if t != KGSYNC_EV_PUB {
+                                    sync_sub_ack(fd, 0)
+                                }
+                            }
+                        }
+                    }
+                }
+            } }
+        }
+    }
+
+    // 3. CLOSE.
+    let fd2 = sync_conn_fd(conn)
+    if fd2 >= 0 {
+        sync_sub_bye(fd2)
+        sync_close(fd2)
+    }
+    println("kg-subscriber: closed (received " + int_to_str(received)
+        + " atom(s), taught " + int_to_str(len(teach_ids))
+        + ", promotes=" + int_to_str(promotes)
+        + " atrophies=" + int_to_str(atrophies)
+        + " deletes=" + int_to_str(deletes)
+        + " reconnects=" + int_to_str(reconnects)
+        + ", local kg=" + int_to_str(kg_atom_count(kg)) + ")")
+}
+
+fn _auth_mode_str(token) {
+    if token == 0 { return "anon" }
+    if len(token) == 0 { return "anon" }
+    return "token"
+}
+
+main()

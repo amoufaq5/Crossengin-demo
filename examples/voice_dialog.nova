@@ -1,0 +1,2559 @@
+// CrossEngin examples: multi-turn voice dialogue (R25B.2).
+//
+// Purpose
+//   R25B (examples/voice_conversation.nova) shipped single-turn voice
+//   conversation: each /converse call is independent, no state survives
+//   between calls. R25B.2 closes the "conversation state + follow-up
+//   handling" hole in R25B's deferred list: a session object accumulates
+//   the last N turns, and a follow-up parser layer in front of the R25B
+//   parser recognises "tell me more" / "the second one" / "what about X"
+//   / "describe it" / "actually" patterns and either rewrites the
+//   transcript with resolved context OR escalates the SPARQL LIMIT to
+//   pull more rows.
+//
+//   We deliberately layer R25B.2 ON TOP of the R25B module (which is
+//   imported here verbatim, READ-ONLY). The R25B public API is unchanged
+//   -- a single-turn /converse caller sees the same behaviour bit-for-bit.
+//   The new public surface is just the four `vc_session_*` functions
+//   plus turn accessors; they call the existing R25B parser / SPARQL
+//   builder / formatter / TTS legs as primitives.
+//
+//   Anaphora resolution (Greek anaphora = "carrying back"): when the
+//   operator says "describe it" / "tell me about him", "it" / "him" /
+//   "that one" map to the most recently mentioned ENTITY -- which in
+//   the R15D KG model is an atom id. The prior turn's bindings list
+//   carries the candidate ids; the resolver picks index 0 for "it"
+//   (the first / canonical entity) and index N-1 for "the last one".
+//
+//   Topic-shift detection: a transcript that starts with "actually" or
+//   "wait" or "never mind" or "let's talk about" or "change subject"
+//   is treated as a reset request. Session state is cleared (history
+//   discarded, last_template / last_bindings zeroed); the rest of the
+//   transcript (after the marker phrase) is then parsed FRESH so the
+//   operator can say "actually, list all CONCEPT" and have it act as
+//   a brand-new turn.
+//
+//   History capping: the brief stipulates last-5 turns. We keep a
+//   growing list, and on every new turn we drop the head if len > 5.
+//
+//   Public surface:
+//     vc_session_new() -> session_t
+//         A fresh, empty session. Zero turns, no prior context.
+//
+//     vc_session_turn(kg, session, question_text) ->
+//         [response_text, new_session]
+//         Run one turn against the live KG. Returns the formatted answer
+//         + the mutated session (same shape as session_t -- callers can
+//         pass it back into vc_session_turn for the next turn). The
+//         response text is what TTS should speak.
+//
+//     vc_session_history(session) -> list[turn_t]
+//         The accumulated turns (up to 5, oldest first). Each entry is
+//         a turn_t list -- use the vc_turn_* accessors below.
+//
+//     vc_session_reset(session)
+//         Reset the session IN PLACE -- clears history, last_template,
+//         last_bindings. Operator-facing: "wipe the slate". Returns 1
+//         for symmetry with the other set/reset APIs.
+//
+//     vc_turn_question(t)  -> question_text string
+//     vc_turn_template(t)  -> template id (one of VC_TPL_*)
+//     vc_turn_kind(t)      -> kind name (FACT / CONCEPT / ...)
+//     vc_turn_ids(t)       -> list of atom-id ints from the binding rows
+//
+//   Honest scope (R25B.3+):
+//     * Fuzzy intent matching -- "tell me more about CONCEPT" routes to
+//       the LIST_ALL escalation path AND keeps CONCEPT as the kind; we
+//       don't currently parse the trailing kind in follow-ups beyond
+//       "what about" + "and X" shapes.
+//     * Cross-turn entity reuse -- "the first one" requires the prior
+//       turn to have been a LIST_ALL; a WHAT_IS turn has only one id
+//       and "the first one" returns that id (degenerate but correct).
+//     * Backchannel handling -- "uh-huh" / "okay" / silence handling.
+//     * TTS layer -- this module returns response TEXT; the chat wrapper
+//       (`/dialog`) is responsible for piping the text into the TTS leg
+//       (tts_speak + tts_save_wav). Keeps the dialog-state layer pure
+//       so it can be unit-tested without a TTS dependency.
+//
+//   R25B.6 (CLARIFY for multi-kind ambiguity):
+//     * Extends R31F's KIND_PIVOT routing with a SIXTH classifier
+//       output VC_FOLLOWUP_CLARIFY for the case where the more-cue
+//       remainder names 2+ known kinds (e.g. "more facts and rules"
+//       after CONCEPT). The dispatcher emits a "Did you mean RULE
+//       or FACT atoms?" turn, stashes the candidate kinds in a new
+//       session slot (pending_clarify_kinds), and parses the NEXT
+//       user turn as a kind selector first. Bare kind names
+//       ("RULE"), morphology-routed phrases ("the rules"), and the
+//       "both" / "either" / "all" -> first-match shortcut all
+//       resolve to a single chosen kind which is then dispatched
+//       as KIND_PIVOT against the prior template. After
+//       VC_DIALOG_CLARIFY_MAX_ATTEMPTS (2) failed resolution turns
+//       we give up: emit an apologetic message and dispatch the
+//       FIRST candidate (R31F first-match) so the operator still
+//       gets a usable answer.
+//     * Env opt-out CE_VOICE_NO_CLARIFY=1 preserves R31F's
+//       deterministic "first kind wins" behaviour byte-identically
+//       for callers that prefer it. When set, the classifier
+//       returns KIND_PIVOT on multi-kind remainders and the
+//       dispatcher dispatches the first match directly, never
+//       touching the pending-clarify slot.
+//
+// ADRs exercised: ADR-0014 (modality bridge -- this layer rides on the
+//   R25B STT + cognition + TTS chain). NOVA dependencies: builtins only
+//   (str_eq, char_at, substr, len, list_new, push, list_set,
+//   int_to_str). CrossEngin dependencies: voice_conversation.nova
+//   (R25B parser / SPARQL builder / formatter).
+
+import "std/syscall"
+import "voice_conversation.nova"
+import "../src/kg/query.nova"
+
+// ---- constants -----------------------------------------------------------
+
+// History cap (brief mandate: last 5 turns).
+let VC_DIALOG_HISTORY_CAP = 5
+
+// "Tell me more" LIMIT escalation factor. Each consecutive "tell me more"
+// doubles the LIMIT used in the LIST_ALL SPARQL. Capped at 100 to keep
+// the spoken sentence finite; chat operators rarely want > 10 anyway.
+let VC_DIALOG_LIMIT_BASE = 10
+let VC_DIALOG_LIMIT_CAP  = 100
+
+// Follow-up classification classes (R25B.3 -- topic-shift detection).
+//
+// The R25B.2 dispatch in vc_session_turn assumes every "tell me more" or
+// "more" or "and X" continues the previous topic. That's wrong when the
+// transcript carries a CUE phrase ("tell me more") AND extra content
+// words unrelated to the prior intent: e.g. prior "list all FACT" then
+// "tell me more about cats" -- "cats" is unrelated to "fact" so we
+// should NOT escalate the LIMIT, we should reset and parse fresh.
+//
+// R25B.5 introduces a fifth class -- KIND_PIVOT -- for the case where
+// the remainder NAMES a different KNOWN kind (e.g. "tell me more about
+// that atom in the rule engine" after `list all FACT` -- "rule" is a
+// known second kind). Distinguished from generic PIVOT ("tell me more
+// about cats" -- "cats" isn't a known kind) so the dispatcher can
+// route as a fresh query against the new kind WITHOUT abandoning the
+// prior template ("list all RULE" rather than UNKNOWN). LIMIT resets
+// to baseline; the operator has shifted topic, not asked for more.
+//
+// R25B.6 introduces a SIXTH class -- FOLLOWUP_CLARIFY -- for the
+// MULTI-KIND ambiguous remainder case that R25B.5 honestly left as
+// "first kind wins". When the more-cue path's remainder names 2+
+// known kinds (e.g. "more facts and rules" after CONCEPT) AND the
+// `CE_VOICE_NO_CLARIFY` env opt-out is NOT set, the dispatcher emits
+// a clarifying question ("Did you mean RULE or FACT atoms?") and
+// records the candidate kinds in a new session slot. The NEXT user
+// turn is parsed as a kind-selector first (bare kind name "RULE",
+// or natural phrase "the rules"); on resolution we route as
+// KIND_PIVOT against the chosen kind. On failure-to-disambiguate
+// after 2 attempts we give up and route as generic PIVOT with an
+// apologetic message. The env opt-out `CE_VOICE_NO_CLARIFY=1`
+// preserves R31F's "first kind wins" deterministic behaviour
+// byte-identically -- callers that prefer the older R31F shape can
+// set the env and get the documented "honest scope" path.
+//
+// The classifier returns one of:
+//   VC_FOLLOWUP_NONE     -- no prior turn / no cue, fresh-parse fall-through.
+//   VC_FOLLOWUP_CONTINUE -- cue matches AND remainder content overlaps with
+//                           the prior turn's content words (Jaccard >=
+//                           VC_DIALOG_PIVOT_THRESHOLD / 10) or remainder is
+//                           empty. Run the existing continuation handler
+//                           (LIMIT escalation for more, pivot-kind for
+//                           "and X" when X matches the prior kind).
+//   VC_FOLLOWUP_PIVOT    -- cue matches BUT remainder content is unrelated
+//                           to the prior turn AND does not name a known
+//                           kind -- reset the session and re-parse the
+//                           cue+remainder as a fresh turn.
+//   VC_FOLLOWUP_KIND_PIVOT -- cue matches AND the remainder NAMES a known
+//                           second kind (case-insensitive, after morphology
+//                           normalisation) different from the prior turn's
+//                           kind. Dispatch re-runs the prior template
+//                           against the new kind (LIMIT reset to baseline,
+//                           NOT escalated). Distinct from PIVOT because
+//                           the operator's intent is "show me the SAME
+//                           query shape but for a different known kind",
+//                           not "wipe the slate and parse fresh". Also
+//                           covers "what about X" / "how about X" where X
+//                           is a known kind != prior (those used to land
+//                           on PIVOT before R25B.5; now upgraded so
+//                           classifier output matches semantics).
+//   VC_FOLLOWUP_ANAPHORA -- "describe it" / "the second one" / etc.
+//                           Existing anaphora resolver path -- classifier
+//                           gives anaphora priority over pivot detection
+//                           so "describe the first one" never trips the
+//                           topic-shift heuristic on the word "first".
+//   VC_FOLLOWUP_CLARIFY  -- R25B.6: cue matches AND remainder names 2+
+//                           known kinds different from prior. The
+//                           dispatcher emits a "did you mean X or Y?"
+//                           turn and stashes the candidate kinds in the
+//                           pending-clarify session slot. The NEXT user
+//                           turn is parsed as a kind selector first;
+//                           on success we route KIND_PIVOT to the chosen
+//                           kind. Suppressed (folds back to KIND_PIVOT
+//                           with first-match) when the env opt-out
+//                           `CE_VOICE_NO_CLARIFY=1` is set -- preserves
+//                           R31F's deterministic byte-identical
+//                           behaviour for callers that want the older
+//                           shape.
+let VC_FOLLOWUP_NONE       = 0
+let VC_FOLLOWUP_CONTINUE   = 1
+let VC_FOLLOWUP_PIVOT      = 2
+let VC_FOLLOWUP_ANAPHORA   = 3
+let VC_FOLLOWUP_KIND_PIVOT = 4
+let VC_FOLLOWUP_CLARIFY    = 5
+
+// R25B.6 -- maximum clarify attempts before we give up and route as
+// generic PIVOT with an apology. The brief calls out "give up after
+// 2 attempts"; we cap at 2 so the operator gets one clarify + one
+// retry, then a graceful fallthrough.
+let VC_DIALOG_CLARIFY_MAX_ATTEMPTS = 2
+
+// Jaccard overlap threshold (in tenths -- NOVA is integer-only) for the
+// pivot detector. Brief suggests ~0.2; we encode as 2/10. Below this,
+// the follow-up cue is interpreted as a topic pivot rather than a
+// continuation. The denominator is |prior_content_words UNION
+// remainder_content_words|; we score in tenths so a single overlap out
+// of five total words is exactly 2 == threshold (treated as CONTINUE),
+// while one out of six lands at 1 (PIVOT). Single-word remainders with
+// no overlap score 0 -- the canonical "tell me more about cats" case.
+//
+// R25B.4 layers a SECOND (weighted) score on top of the uniform Jaccard:
+// the prior turn's KIND word counts double, on both sides of the ratio.
+// If the uniform Jaccard says CONTINUE we stay there (R25B.3 parity).
+// If the uniform says PIVOT we consult the weighted score; when the
+// remainder's content tokens land on the kind term (after morphology
+// normalisation -- see _vd_stem) the weighted score lifts borderline
+// cases to CONTINUE. Threshold stays at 2/10 for both scorers so the
+// crossover lives in one constant.
+let VC_DIALOG_PIVOT_THRESHOLD = 2
+
+// Session slot indices. Public consumers use the accessor functions
+// below; these constants are file-private but commented for clarity.
+//   0 -- history (list of turn_t)
+//   1 -- last_template_id (one of VC_TPL_*)
+//   2 -- last_kind (string)
+//   3 -- last_bindings_ids (list of int)
+//   4 -- last_limit_used (int; for "tell me more" escalation)
+//   5 -- turn_count (int; monotonic, never decremented)
+//   6 -- pending_clarify_kinds (list of UPPER-CASE candidate kinds;
+//        empty list when no clarify is pending). R25B.6.
+//   7 -- pending_clarify_template (template id to dispatch on
+//        resolution; LIST_ALL when no prior). R25B.6.
+//   8 -- pending_clarify_attempts (number of clarify rounds already
+//        emitted; reaches VC_DIALOG_CLARIFY_MAX_ATTEMPTS -> give up).
+//        R25B.6.
+//   9 -- pending_clarify_raw (the original raw transcript that
+//        triggered the clarify, kept for history annotation on the
+//        give-up path). R25B.6.
+//  10 -- last_stt_confidence (milli 0..1000; -1 if unknown / not set).
+//        R34D. Telemetry slot for the most recent STT result's
+//        confidence as plumbed through `vc_session_turn_with_confidence`.
+//        The legacy `vc_session_turn` (which has no STT-side
+//        confidence to plumb) leaves it at -1.
+let _VC_SESS_HIST            = 0
+let _VC_SESS_TPL             = 1
+let _VC_SESS_KIND            = 2
+let _VC_SESS_IDS             = 3
+let _VC_SESS_LIMIT           = 4
+let _VC_SESS_COUNT           = 5
+let _VC_SESS_PENDING_KINDS   = 6
+let _VC_SESS_PENDING_TPL     = 7
+let _VC_SESS_PENDING_ATTEMPTS = 8
+let _VC_SESS_PENDING_RAW     = 9
+let _VC_SESS_LAST_STT_CONF   = 10
+
+// Turn slot indices.
+//   0 -- question_text (string)
+//   1 -- template_id (int)
+//   2 -- kind (string)
+//   3 -- ids (list of int from the bindings)
+let _VC_TURN_Q        = 0
+let _VC_TURN_TPL      = 1
+let _VC_TURN_KIND     = 2
+let _VC_TURN_IDS      = 3
+
+// ---- public session API --------------------------------------------------
+
+fn vc_session_new() {
+    let s = list_new()
+    push(s, list_new())          // history
+    push(s, VC_TPL_UNKNOWN)      // last_template_id
+    push(s, "")                  // last_kind
+    push(s, list_new())          // last_bindings_ids
+    push(s, VC_DIALOG_LIMIT_BASE)  // last_limit_used
+    push(s, 0)                   // turn_count
+    push(s, list_new())          // pending_clarify_kinds (R25B.6)
+    push(s, VC_TPL_UNKNOWN)      // pending_clarify_template (R25B.6)
+    push(s, 0)                   // pending_clarify_attempts (R25B.6)
+    push(s, "")                  // pending_clarify_raw (R25B.6)
+    push(s, 0 - 1)               // last_stt_confidence milli (-1 = unset) R34D
+    return s
+}
+
+fn vc_session_history(session) {
+    return session[_VC_SESS_HIST]
+}
+
+fn vc_session_last_template(session) {
+    return session[_VC_SESS_TPL]
+}
+
+fn vc_session_last_kind(session) {
+    return session[_VC_SESS_KIND]
+}
+
+fn vc_session_last_ids(session) {
+    return session[_VC_SESS_IDS]
+}
+
+fn vc_session_turn_count(session) {
+    return session[_VC_SESS_COUNT]
+}
+
+fn vc_session_last_limit(session) {
+    return session[_VC_SESS_LIMIT]
+}
+
+// R25B.6 -- pending-clarify accessors. A non-empty pending kinds list
+// means the dialog manager has emitted a clarifying question on the
+// last turn and is waiting for the operator to disambiguate. The
+// next turn's first parse pass is the kind-selector resolver in
+// `_vd_resolve_clarify_selector`; on success we route as KIND_PIVOT,
+// on failure we either re-clarify (if attempts remain) or give up.
+fn vc_session_pending_clarify_kinds(session) {
+    return session[_VC_SESS_PENDING_KINDS]
+}
+
+fn vc_session_pending_clarify_template(session) {
+    return session[_VC_SESS_PENDING_TPL]
+}
+
+fn vc_session_pending_clarify_attempts(session) {
+    return session[_VC_SESS_PENDING_ATTEMPTS]
+}
+
+fn vc_session_pending_clarify_raw(session) {
+    return session[_VC_SESS_PENDING_RAW]
+}
+
+// R34D -- last STT confidence in milli (0..1000), or -1 when no STT
+// result has been threaded through this session (the legacy
+// `vc_session_turn` path leaves it at -1; only `vc_session_turn_with_
+// confidence` populates it). Tests / telemetry use this to inspect the
+// most recent transcription's confidence without re-running STT.
+fn vc_session_last_stt_confidence(session) {
+    return session[_VC_SESS_LAST_STT_CONF]
+}
+
+fn vc_session_is_pending_clarify(session) {
+    if len(session[_VC_SESS_PENDING_KINDS]) > 0 { return 1 }
+    return 0
+}
+
+// Reset in place. After this call the session looks brand-new (history
+// empty, no prior context). The same `session` object can be reused;
+// callers do not have to swap pointers. Returns 1 for symmetric API
+// with other reset-style helpers in the codebase.
+fn vc_session_reset(session) {
+    list_set(session, _VC_SESS_HIST, list_new())
+    list_set(session, _VC_SESS_TPL, VC_TPL_UNKNOWN)
+    list_set(session, _VC_SESS_KIND, "")
+    list_set(session, _VC_SESS_IDS, list_new())
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    list_set(session, _VC_SESS_COUNT, 0)
+    list_set(session, _VC_SESS_PENDING_KINDS, list_new())
+    list_set(session, _VC_SESS_PENDING_TPL, VC_TPL_UNKNOWN)
+    list_set(session, _VC_SESS_PENDING_ATTEMPTS, 0)
+    list_set(session, _VC_SESS_PENDING_RAW, "")
+    list_set(session, _VC_SESS_LAST_STT_CONF, 0 - 1)
+    return 1
+}
+
+// ---- turn accessors ------------------------------------------------------
+
+fn vc_turn_question(t) { return t[_VC_TURN_Q] }
+fn vc_turn_template(t) { return t[_VC_TURN_TPL] }
+fn vc_turn_kind(t)     { return t[_VC_TURN_KIND] }
+fn vc_turn_ids(t)      { return t[_VC_TURN_IDS] }
+
+// ---- low-level helpers ---------------------------------------------------
+
+// Pull ?a / ?atom / ?n from bindings into a flat list of atom-id ints.
+// We pull the entity-id columns: ?a for LIST_ALL, ?atom for WHAT_IS.
+// HOW_MANY (?n) doesn't carry entity ids, so we return an empty list.
+// Order is preserved -- "the second one" = ids[1].
+fn _vc_extract_ids(parsed, bindings) {
+    let out = list_new()
+    if bindings == 0 { return out }
+    let n = len(bindings)
+    if n == 0 { return out }
+    let tpl = vc_parsed_template(parsed)
+    if tpl == VC_TPL_HOW_MANY { return out }
+    let var_name = "a"
+    if tpl == VC_TPL_WHAT_IS { var_name = "atom" }
+    let i = 0
+    while i < n {
+        let row = bindings[i]
+        if binding_has(row, var_name) == 1 {
+            push(out, binding_get(row, var_name))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Build a turn record from the live parse + bindings result. Pure -- no
+// side effects on the session itself; the caller folds the turn in.
+fn _vc_turn_new(question_text, parsed, ids) {
+    let t = list_new()
+    push(t, question_text)
+    push(t, vc_parsed_template(parsed))
+    push(t, vc_parsed_kind(parsed))
+    push(t, ids)
+    return t
+}
+
+// Append a turn to the history, dropping the head when over cap. The
+// session list is mutated in place; the history list at slot 0 is
+// replaced with a fresh trimmed list when an eviction is needed (NOVA
+// lists have push but no pop_front, so we copy from index 1..N).
+fn _vc_append_turn(session, turn) {
+    let hist = session[_VC_SESS_HIST]
+    push(hist, turn)
+    if len(hist) > VC_DIALOG_HISTORY_CAP {
+        let trimmed = list_new()
+        let i = len(hist) - VC_DIALOG_HISTORY_CAP
+        let n = len(hist)
+        while i < n {
+            push(trimmed, hist[i])
+            i = i + 1
+        }
+        list_set(session, _VC_SESS_HIST, trimmed)
+    }
+    list_set(session, _VC_SESS_COUNT, session[_VC_SESS_COUNT] + 1)
+    return 1
+}
+
+// Reuse R25B's tolower for the dialog parser. Inlined here so we don't
+// add a public accessor to voice_conversation.nova just for this one
+// caller. ASCII-only -- the STT transcripts we see are ASCII English.
+fn _vd_lower(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c >= 65 {
+            if c <= 90 {
+                out = out + chr(c + 32)
+            } else {
+                out = out + chr(c)
+            }
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Trim leading + trailing whitespace + question punctuation. Same shape
+// as voice_conversation.nova's `_vc_trim` but we don't export it from
+// there; inlined here for the dialog layer.
+fn _vd_is_trim_char(c) {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 10 { return 1 }
+    if c == 13 { return 1 }
+    if c == 46 { return 1 }
+    if c == 44 { return 1 }
+    if c == 33 { return 1 }
+    if c == 63 { return 1 }
+    if c == 59 { return 1 }
+    if c == 58 { return 1 }
+    return 0
+}
+
+fn _vd_trim(s) {
+    let n = len(s)
+    let start = 0
+    while start < n {
+        if _vd_is_trim_char(char_at(s, start)) == 0 { break }
+        start = start + 1
+    }
+    let end = n
+    while end > start {
+        if _vd_is_trim_char(char_at(s, end - 1)) == 0 { break }
+        end = end - 1
+    }
+    if end <= start { return "" }
+    return substr(s, start, end - start)
+}
+
+// Prefix probe -- same as voice_conversation.nova's `_vc_starts_with`.
+fn _vd_starts_with(text, prefix) {
+    let tn = len(text)
+    let pn = len(prefix)
+    if pn > tn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(text, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- follow-up pattern detection -----------------------------------------
+//
+// These are dialog-layer rewriters. Each takes the trimmed lower-cased
+// transcript + the session, and either returns 0 (this pattern does NOT
+// match) or a non-zero rewrite descriptor. The descriptor format depends
+// on the pattern but is consistent enough that vc_session_turn can use
+// the same dispatch shape.
+//
+// Patterns (in priority order, first match wins):
+//   1. Topic shift -- "actually ..." / "wait ..." / "change subject ..." /
+//      "never mind ..." / "let's talk about ...". Resets context. The
+//      remainder (after the marker phrase) is parsed FRESH; if empty
+//      the turn is treated as "topic reset acknowledged" with no query.
+//   2. "tell me more" / "list more" / "more" / "any more" -- escalate
+//      prior query (LIMIT *= 2 capped at 100; LIST_ALL is used even if
+//      prior was WHAT_IS / HOW_MANY).
+//   3. Anaphora -- "describe it" / "what is it" / "tell me about it" /
+//      "tell me about him" / "tell me about her" / "tell me about that".
+//      Resolves "it" to last_ids[0] (index 0); "the second one" /
+//      "the third one" / etc resolve to last_ids[1..N-1].
+//   4. "what about X" / "and X" -- reuse prior template with new kind.
+//
+// If no pattern fires we fall through to the R25B parser.
+
+// "Is this transcript a topic-shift marker?" -- returns the remainder
+// after the marker phrase, or empty-string when the entire transcript
+// IS the marker (e.g. just "actually"). Returns 0 (the int) when the
+// transcript does NOT start with a topic-shift marker.
+fn _vd_topic_shift_remainder(lowered) {
+    if _vd_starts_with(lowered, "actually ") == 1 {
+        return _vd_trim(substr(lowered, 9, len(lowered) - 9))
+    }
+    if str_eq(lowered, "actually") == 1 { return "" }
+    if _vd_starts_with(lowered, "wait ") == 1 {
+        return _vd_trim(substr(lowered, 5, len(lowered) - 5))
+    }
+    if _vd_starts_with(lowered, "never mind ") == 1 {
+        return _vd_trim(substr(lowered, 11, len(lowered) - 11))
+    }
+    if str_eq(lowered, "never mind") == 1 { return "" }
+    if _vd_starts_with(lowered, "change subject ") == 1 {
+        return _vd_trim(substr(lowered, 15, len(lowered) - 15))
+    }
+    if str_eq(lowered, "change subject") == 1 { return "" }
+    if _vd_starts_with(lowered, "change the subject ") == 1 {
+        return _vd_trim(substr(lowered, 19, len(lowered) - 19))
+    }
+    if str_eq(lowered, "change the subject") == 1 { return "" }
+    if _vd_starts_with(lowered, "let's talk about ") == 1 {
+        return _vd_trim(substr(lowered, 17, len(lowered) - 17))
+    }
+    if _vd_starts_with(lowered, "lets talk about ") == 1 {
+        return _vd_trim(substr(lowered, 16, len(lowered) - 16))
+    }
+    if _vd_starts_with(lowered, "new topic ") == 1 {
+        return _vd_trim(substr(lowered, 10, len(lowered) - 10))
+    }
+    if str_eq(lowered, "new topic") == 1 { return "" }
+    return 0
+}
+
+// "tell me more" family. Returns 1 on match, 0 otherwise. We accept a
+// few synonyms; the goal is to recognise the operator wanting MORE rows
+// from the prior query regardless of the exact phrasing.
+fn _vd_is_more_request(lowered) {
+    if str_eq(lowered, "tell me more") == 1 { return 1 }
+    if str_eq(lowered, "tell me more about it") == 1 { return 1 }
+    if str_eq(lowered, "more") == 1 { return 1 }
+    if str_eq(lowered, "list more") == 1 { return 1 }
+    if str_eq(lowered, "show more") == 1 { return 1 }
+    if str_eq(lowered, "any more") == 1 { return 1 }
+    if str_eq(lowered, "anything more") == 1 { return 1 }
+    if str_eq(lowered, "and more") == 1 { return 1 }
+    if str_eq(lowered, "what else") == 1 { return 1 }
+    return 0
+}
+
+// Anaphora -- "describe it" / "what is it" / "tell me about him" /
+// "tell me more about it" (covered above). Returns 1 on match.
+fn _vd_is_anaphora_describe(lowered) {
+    if str_eq(lowered, "describe it") == 1 { return 1 }
+    if str_eq(lowered, "what is it") == 1 { return 1 }
+    if str_eq(lowered, "what's it") == 1 { return 1 }
+    if str_eq(lowered, "tell me about it") == 1 { return 1 }
+    if str_eq(lowered, "tell me about him") == 1 { return 1 }
+    if str_eq(lowered, "tell me about her") == 1 { return 1 }
+    if str_eq(lowered, "tell me about that") == 1 { return 1 }
+    if str_eq(lowered, "tell me about that one") == 1 { return 1 }
+    if str_eq(lowered, "describe him") == 1 { return 1 }
+    if str_eq(lowered, "describe her") == 1 { return 1 }
+    if str_eq(lowered, "describe that") == 1 { return 1 }
+    if str_eq(lowered, "describe that one") == 1 { return 1 }
+    return 0
+}
+
+// "the Nth one" / "the first / second / third / fourth / fifth / last
+// one". Returns the 0-based index on match, or -1 otherwise. We accept
+// "what is the second one" / "what about the third" too.
+fn _vd_ordinal_index(lowered) {
+    let s = lowered
+    // Normalise common prefixes off.
+    if _vd_starts_with(s, "what is ") == 1 {
+        s = substr(s, 8, len(s) - 8)
+    }
+    if _vd_starts_with(s, "what about ") == 1 {
+        s = substr(s, 11, len(s) - 11)
+    }
+    if _vd_starts_with(s, "tell me about ") == 1 {
+        s = substr(s, 14, len(s) - 14)
+    }
+    if _vd_starts_with(s, "describe ") == 1 {
+        s = substr(s, 9, len(s) - 9)
+    }
+    if str_eq(s, "the first one") == 1 { return 0 }
+    if str_eq(s, "the first")     == 1 { return 0 }
+    if str_eq(s, "first one")     == 1 { return 0 }
+    if str_eq(s, "the second one") == 1 { return 1 }
+    if str_eq(s, "the second")     == 1 { return 1 }
+    if str_eq(s, "second one")     == 1 { return 1 }
+    if str_eq(s, "the third one") == 1 { return 2 }
+    if str_eq(s, "the third")     == 1 { return 2 }
+    if str_eq(s, "third one")     == 1 { return 2 }
+    if str_eq(s, "the fourth one") == 1 { return 3 }
+    if str_eq(s, "the fourth")     == 1 { return 3 }
+    if str_eq(s, "fourth one")     == 1 { return 3 }
+    if str_eq(s, "the fifth one") == 1 { return 4 }
+    if str_eq(s, "the fifth")     == 1 { return 4 }
+    if str_eq(s, "fifth one")     == 1 { return 4 }
+    if str_eq(s, "the last one") == 1 { return 0 - 1000 }  // sentinel
+    if str_eq(s, "the last")     == 1 { return 0 - 1000 }
+    if str_eq(s, "last one")     == 1 { return 0 - 1000 }
+    return 0 - 1
+}
+
+// "what about X" / "and X" -- topic-pivot on the same template. Returns
+// the kind name (upper-cased) on match, or 0 (the int) when no match.
+// "and" is single-word so we require a trailing token to consider it
+// a pivot (otherwise plain "and" is just noise).
+fn _vd_pivot_kind(lowered) {
+    if _vd_starts_with(lowered, "what about ") == 1 {
+        let rest = _vd_trim(substr(lowered, 11, len(lowered) - 11))
+        if len(rest) == 0 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    if _vd_starts_with(lowered, "how about ") == 1 {
+        let rest = _vd_trim(substr(lowered, 10, len(lowered) - 10))
+        if len(rest) == 0 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    if _vd_starts_with(lowered, "and ") == 1 {
+        let rest = _vd_trim(substr(lowered, 4, len(lowered) - 4))
+        if len(rest) == 0 { return 0 }
+        // Don't confuse "and more" with the pivot path -- it's the
+        // "more" path. Bail if the remainder is the more keyword.
+        if _vd_is_more_request("and " + rest) == 1 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    return 0
+}
+
+fn _vd_first_word(s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        if _vd_is_trim_char(char_at(s, i)) == 1 { break }
+        i = i + 1
+    }
+    if i == 0 { return "" }
+    return substr(s, 0, i)
+}
+
+fn _vd_upcase_token(t) {
+    let n = len(t)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(t, i)
+        if c >= 97 {
+            if c <= 122 {
+                out = out + chr(c - 32)
+            } else {
+                out = out + chr(c)
+            }
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Is the upper-cased token a known R15D kind?
+fn _vd_known_kind(kind) {
+    if str_eq(kind, "FACT")     == 1 { return 1 }
+    if str_eq(kind, "CONCEPT")  == 1 { return 1 }
+    if str_eq(kind, "RELATION") == 1 { return 1 }
+    if str_eq(kind, "SKILL")    == 1 { return 1 }
+    if str_eq(kind, "LANG")     == 1 { return 1 }
+    if str_eq(kind, "RULE")     == 1 { return 1 }
+    return 0
+}
+
+// ---- topic-shift detection (R25B.3) --------------------------------------
+//
+// The follow-up classifier compares the CONTENT WORDS of the prior turn's
+// surface form against the content words remaining in the new transcript
+// after stripping cue words ("tell", "me", "more", "about", "and", ...)
+// and the prior-intent keywords (the kind name). If the Jaccard overlap
+// is below VC_DIALOG_PIVOT_THRESHOLD / 10, the cue is interpreted as a
+// PIVOT (topic shift) rather than a CONTINUATION.
+//
+// The content-word extractor is deliberately tiny: we tokenise on
+// whitespace, lower-case, drop stopwords by lookup. NOVA has no regex /
+// string libraries; the stopword list is a fixed if-cascade. Coverage
+// is the natural-English question vocabulary we already accept in the
+// R25B parser (what / how / list / all / the / a / of / is / are /
+// pronouns / determiners / verbs of saying).
+
+// Is this lower-case token a stopword? Includes the dialog-cue words
+// ("tell", "me", "more", "about") so cue phrases don't leak into the
+// content set, AND the R25B template keywords ("list", "all", "what",
+// "how", "many", "is") so a recap question like "what is FACT" only
+// contributes "fact" to the content set, not "what" / "is".
+fn _vd_is_stopword(tok) {
+    if str_eq(tok, "the")     == 1 { return 1 }
+    if str_eq(tok, "a")       == 1 { return 1 }
+    if str_eq(tok, "an")      == 1 { return 1 }
+    if str_eq(tok, "of")      == 1 { return 1 }
+    if str_eq(tok, "is")      == 1 { return 1 }
+    if str_eq(tok, "are")     == 1 { return 1 }
+    if str_eq(tok, "was")     == 1 { return 1 }
+    if str_eq(tok, "were")    == 1 { return 1 }
+    if str_eq(tok, "be")      == 1 { return 1 }
+    if str_eq(tok, "to")      == 1 { return 1 }
+    if str_eq(tok, "in")      == 1 { return 1 }
+    if str_eq(tok, "on")      == 1 { return 1 }
+    if str_eq(tok, "at")      == 1 { return 1 }
+    if str_eq(tok, "for")     == 1 { return 1 }
+    if str_eq(tok, "with")    == 1 { return 1 }
+    if str_eq(tok, "and")     == 1 { return 1 }
+    if str_eq(tok, "or")      == 1 { return 1 }
+    if str_eq(tok, "but")     == 1 { return 1 }
+    if str_eq(tok, "more")    == 1 { return 1 }
+    if str_eq(tok, "about")   == 1 { return 1 }
+    if str_eq(tok, "also")    == 1 { return 1 }
+    if str_eq(tok, "tell")    == 1 { return 1 }
+    if str_eq(tok, "me")      == 1 { return 1 }
+    if str_eq(tok, "show")    == 1 { return 1 }
+    if str_eq(tok, "list")    == 1 { return 1 }
+    if str_eq(tok, "all")     == 1 { return 1 }
+    if str_eq(tok, "what")    == 1 { return 1 }
+    if str_eq(tok, "whats")   == 1 { return 1 }
+    if str_eq(tok, "how")     == 1 { return 1 }
+    if str_eq(tok, "many")    == 1 { return 1 }
+    if str_eq(tok, "much")    == 1 { return 1 }
+    if str_eq(tok, "do")      == 1 { return 1 }
+    if str_eq(tok, "does")    == 1 { return 1 }
+    if str_eq(tok, "did")     == 1 { return 1 }
+    if str_eq(tok, "have")    == 1 { return 1 }
+    if str_eq(tok, "has")     == 1 { return 1 }
+    if str_eq(tok, "had")     == 1 { return 1 }
+    if str_eq(tok, "it")      == 1 { return 1 }
+    if str_eq(tok, "its")     == 1 { return 1 }
+    if str_eq(tok, "he")      == 1 { return 1 }
+    if str_eq(tok, "him")     == 1 { return 1 }
+    if str_eq(tok, "his")     == 1 { return 1 }
+    if str_eq(tok, "she")     == 1 { return 1 }
+    if str_eq(tok, "her")     == 1 { return 1 }
+    if str_eq(tok, "they")    == 1 { return 1 }
+    if str_eq(tok, "them")    == 1 { return 1 }
+    if str_eq(tok, "that")    == 1 { return 1 }
+    if str_eq(tok, "this")    == 1 { return 1 }
+    if str_eq(tok, "those")   == 1 { return 1 }
+    if str_eq(tok, "these")   == 1 { return 1 }
+    if str_eq(tok, "one")     == 1 { return 1 }
+    if str_eq(tok, "ones")    == 1 { return 1 }
+    if str_eq(tok, "describe") == 1 { return 1 }
+    if str_eq(tok, "give")    == 1 { return 1 }
+    if str_eq(tok, "please")  == 1 { return 1 }
+    if str_eq(tok, "thanks")  == 1 { return 1 }
+    if str_eq(tok, "now")     == 1 { return 1 }
+    if str_eq(tok, "any")     == 1 { return 1 }
+    if str_eq(tok, "some")    == 1 { return 1 }
+    if str_eq(tok, "else")    == 1 { return 1 }
+    if str_eq(tok, "first")   == 1 { return 1 }
+    if str_eq(tok, "second")  == 1 { return 1 }
+    if str_eq(tok, "third")   == 1 { return 1 }
+    if str_eq(tok, "fourth")  == 1 { return 1 }
+    if str_eq(tok, "fifth")   == 1 { return 1 }
+    if str_eq(tok, "last")    == 1 { return 1 }
+    if str_eq(tok, "next")    == 1 { return 1 }
+    return 0
+}
+
+// Is this character an ASCII letter or digit? Used by the tokeniser to
+// peel words off a sentence -- everything else (whitespace, punctuation,
+// even apostrophes) is a delimiter so "what's" tokenises as ["whats"]
+// once we drop apostrophes via _vd_strip_apostrophes.
+fn _vd_is_word_char(c) {
+    if c >= 97 {
+        if c <= 122 { return 1 }
+    }
+    if c >= 48 {
+        if c <= 57 { return 1 }
+    }
+    return 0
+}
+
+// Strip ASCII apostrophes so "what's" becomes "whats" before tokenising.
+// This means our stopword list can have "whats" alongside "what".
+fn _vd_strip_apostrophes(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c != 39 {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// English s-suffix stemmer (R25B.4 morphology heuristic). Maps the
+// trivial English plural / 3rd-person singular endings back to their
+// canonical singular so "facts" matches "fact", "rules" matches "rule",
+// "entities" matches "entity". This is INTENTIONALLY not a Porter
+// stemmer -- NOVA has no string library, and the only thing we need
+// for kind-match parity is the trailing-s case. Quirks (so common
+// short words don't get mangled):
+//   * Length < 4 -> no change. Keeps "is" / "as" / "us" / "go" / "no".
+//   * Ends in "ies" with length >= 5 -> drop "ies", append "y".
+//     ("entities" -> "entity", "categories" -> "category",
+//     "facilities" -> "facility".) Length-4 "ies" forms like "ties"
+//     / "lies" / "pies" fall through to the bare s-strip so they
+//     become "tie" / "lie" / "pie" rather than "ty" / "ly" / "py".
+//   * Ends in "ss" / "us" / "is" / "as" / "os" -> no change. Keeps
+//     "kiss" / "focus" / "axis" / "atlas" / "kudos" intact.
+//   * Otherwise, ends in "s" -> drop the s. ("facts" -> "fact",
+//     "rules" -> "rule", "cats" -> "cat".)
+// The stemmer is ASCII-only and English-only; languages with
+// agglutinative or umlauted plurals (German "Haeuser", Arabic broken
+// plurals) need their own normaliser. Documented in the R25B.4 honest
+// scope section of AUDIO_AUDIT.md.
+fn _vd_stem(tok) {
+    let n = len(tok)
+    if n < 4 { return tok }
+    let c_last = char_at(tok, n - 1)
+    if c_last != 115 { return tok }  // not ending in 's'
+    // "...ies" -> "...y" for length >= 5 only (so short stems like
+    // "ties" / "lies" / "pies" still go through the trailing-s strip
+    // and become "tie" / "lie" / "pie" rather than the obviously
+    // wrong "ty" / "ly" / "py"). The pattern is last 3 chars = 'i'
+    // 'e' 's' (105, 101, 115).
+    if n >= 5 {
+        let c2 = char_at(tok, n - 2)  // 'e' position
+        let c3 = char_at(tok, n - 3)  // 'i' position
+        if c2 == 101 {
+            if c3 == 105 {
+                return substr(tok, 0, n - 3) + "y"
+            }
+        }
+    }
+    let c_prev = char_at(tok, n - 2)
+    // Preserve "...ss" (kiss, miss, bass, grass).
+    if c_prev == 115 { return tok }
+    // Preserve "...us" (bus, focus, cactus, virus).
+    if c_prev == 117 { return tok }
+    // Preserve "...is" (axis, basis, crisis, oasis). The bare token
+    // "is" already hit the length-<4 short-circuit above.
+    if c_prev == 105 { return tok }
+    // Preserve "...as" (was, has, bias, gas, atlas).
+    if c_prev == 97 { return tok }
+    // Preserve "...os" (kudos, pathos, ethos).
+    if c_prev == 111 { return tok }
+    // Strip the trailing s.
+    return substr(tok, 0, n - 1)
+}
+
+// Tokenise a lowercase sentence into a list of content words: split on
+// non-word chars, drop stopwords. Result preserves order (caller treats
+// it as a set; duplicates are harmless under set semantics in _vd_jaccard
+// which de-duplicates via _vd_set_add).
+//
+// R25B.4: each surviving token is run through _vd_stem before being
+// pushed, so morphology variants normalise on the way in. This is
+// applied to BOTH sides of the Jaccard (prior + remainder) so set
+// arithmetic stays consistent. Stopword test runs on the RAW token
+// (so "is" / "was" don't sneak past the stopword filter after a
+// degenerate stem); stemming happens after the stopword gate.
+fn _vd_content_words(lowered) {
+    let cleaned = _vd_strip_apostrophes(lowered)
+    let out = list_new()
+    let n = len(cleaned)
+    let i = 0
+    while i < n {
+        // skip non-word chars
+        while i < n {
+            if _vd_is_word_char(char_at(cleaned, i)) == 1 { break }
+            i = i + 1
+        }
+        if i >= n { break }
+        let start = i
+        while i < n {
+            if _vd_is_word_char(char_at(cleaned, i)) == 0 { break }
+            i = i + 1
+        }
+        let tok = substr(cleaned, start, i - start)
+        if _vd_is_stopword(tok) == 0 {
+            push(out, _vd_stem(tok))
+        }
+    }
+    return out
+}
+
+// "Set add" -- push only if not already present. Keeps content-word
+// containers de-duplicated for Jaccard arithmetic.
+fn _vd_set_add(set_list, tok) {
+    let n = len(set_list)
+    let i = 0
+    while i < n {
+        if str_eq(set_list[i], tok) == 1 { return 0 }
+        i = i + 1
+    }
+    push(set_list, tok)
+    return 1
+}
+
+// Build a deduplicated set from a list of tokens.
+fn _vd_dedup(toks) {
+    let out = list_new()
+    let n = len(toks)
+    let i = 0
+    while i < n {
+        _vd_set_add(out, toks[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Jaccard overlap in tenths: 10 * |A intersect B| / |A union B|. Empty
+// sets on BOTH sides return 10 (perfect overlap -- the trivial case of
+// "more" with no remainder and a prior intent that has been stripped to
+// its kind word; nothing CAN disagree). When only ONE side is empty we
+// return 0 (no shared signal).
+fn _vd_jaccard_tenths(a, b) {
+    let an = len(a)
+    let bn = len(b)
+    if an == 0 {
+        if bn == 0 { return 10 }
+        return 0
+    }
+    if bn == 0 { return 0 }
+    // |A intersect B|
+    let inter = 0
+    let i = 0
+    while i < an {
+        let j = 0
+        while j < bn {
+            if str_eq(a[i], b[j]) == 1 {
+                inter = inter + 1
+                break
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let uni = an + bn - inter
+    if uni == 0 { return 0 }
+    return (inter * 10) / uni
+}
+
+// Project the prior turn's content set: tokenise its question text, drop
+// stopwords. We additionally fold the canonical kind name (lower-case)
+// into the set so a HOW_MANY turn ("how many FACT") still contributes
+// "fact" even after the case fold.
+fn _vd_prior_content(session) {
+    let hist = vc_session_history(session)
+    let n = len(hist)
+    let out = list_new()
+    if n == 0 {
+        return out
+    }
+    let last_turn = hist[n - 1]
+    let q_lower = _vd_lower(vc_turn_question(last_turn))
+    let words = _vd_content_words(q_lower)
+    let i = 0
+    while i < len(words) {
+        _vd_set_add(out, words[i])
+        i = i + 1
+    }
+    // Fold the canonical kind too, lower-cased + stemmed for symmetry
+    // with the now-side tokenisation. (The known kinds FACT / CONCEPT /
+    // RELATION / SKILL / LANG / RULE all survive _vd_stem unchanged --
+    // none end in 's' after lower-casing -- so this is a no-op today,
+    // but it keeps the prior + remainder pipelines algebraically
+    // identical and resilient to future kind additions.)
+    let kind = vc_session_last_kind(session)
+    if len(kind) > 0 {
+        _vd_set_add(out, _vd_stem(_vd_lower(kind)))
+    }
+    return out
+}
+
+// Prior content WITHOUT the kind token folded in. Used by the weighted
+// scorer to separate "kind word" matches (which count double) from
+// other content-word matches (which count once). The returned set has
+// already been stemmed by _vd_content_words on the way in.
+fn _vd_prior_content_no_kind(session) {
+    let hist = vc_session_history(session)
+    let n = len(hist)
+    let out = list_new()
+    if n == 0 { return out }
+    let last_turn = hist[n - 1]
+    let q_lower = _vd_lower(vc_turn_question(last_turn))
+    let words = _vd_content_words(q_lower)
+    let kind_lower = _vd_stem(_vd_lower(vc_session_last_kind(session)))
+    let i = 0
+    while i < len(words) {
+        if str_eq(words[i], kind_lower) == 0 {
+            _vd_set_add(out, words[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Weighted Jaccard score in tenths (R25B.4). The prior turn's KIND word
+// counts double on both sides of the ratio; other prior-content words
+// count once. Formula:
+//
+//   (2 * |kind_matches| + |other_matches|)
+//   ----------------------------------------    * 10
+//   (2 * |kind_terms|   + |other_terms|)
+//
+// where kind_terms is conceptually a singleton {prior_kind_stemmed}
+// (so |kind_terms| = 1 when the prior turn established a kind, else 0)
+// and morphology is applied via _vd_stem on the way into the matcher
+// so remainder "facts" matches kind "fact". When both sides are empty
+// the score is 0 (no signal); when only one side is empty the score
+// is 0 (no overlap possible). The numerator caps at the denominator,
+// so the highest reachable score is 10 -- aligned with _vd_jaccard_tenths.
+//
+// Why weight the kind: R25B.3's documented failure mode was
+//   "list all FACT" + "tell me more about that atom in the rule engine"
+// scoring 0/4 = PIVOT (losing the implied LIST_ALL FACT continuation).
+// The R25B.4 weighting GIVES the kind word a double-stake voice so
+// remainder phrases that NAME the prior kind (even pluralised --
+// "more facts") stay anchored to the CONTINUE branch. The remainder
+// in the failure example NAMES a different kind ("rule"); the weighted
+// score still says PIVOT for that case -- correctly! the operator
+// shifted topic from FACT to the rule engine. Documented in
+// AUDIO_AUDIT.md (R25B.4 section).
+fn _vd_weighted_score_tenths(prior_other, prior_kind_stem, now) {
+    let now_n = len(now)
+    let other_n = len(prior_other)
+    let has_kind = 0
+    if len(prior_kind_stem) > 0 { has_kind = 1 }
+
+    // Empty cases mirror _vd_jaccard_tenths: both sides empty -> 0
+    // (we lean on the uniform scorer to return 10 in the bare-cue
+    // case, so the weighted scorer never has to express "trivial
+    // perfect overlap"). One side empty with the other non-empty ->
+    // 0 (no possible match).
+    if now_n == 0 { return 0 }
+    if has_kind == 0 {
+        if other_n == 0 { return 0 }
+    }
+
+    // Count weighted matches over the remainder. Each remainder token
+    // votes AT MOST once -- either as a kind match (weight 2) or as
+    // an other-content match (weight 1). Kind match takes priority
+    // when a remainder token coincidentally appears in both sets.
+    let kind_matches = 0
+    let other_matches = 0
+    let i = 0
+    while i < now_n {
+        let tok = now[i]
+        let matched_kind = 0
+        if has_kind == 1 {
+            if str_eq(tok, prior_kind_stem) == 1 { matched_kind = 1 }
+        }
+        if matched_kind == 1 {
+            kind_matches = kind_matches + 1
+        } else {
+            // Walk prior_other looking for a string-eq match.
+            let j = 0
+            while j < other_n {
+                if str_eq(prior_other[j], tok) == 1 {
+                    other_matches = other_matches + 1
+                    break
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    let num = (2 * kind_matches) + other_matches
+    let den = (2 * has_kind) + other_n
+    if den == 0 { return 0 }
+    // Cap at 10 (the numerator can't exceed the denominator in
+    // principle since each remainder token contributes weight at
+    // most equal to its match-class weight; but if duplicate kind
+    // mentions appeared via tokeniser quirks the numerator could
+    // overshoot for a remainder larger than the prior set -- clamp
+    // to keep the score comparable with the uniform scorer's range).
+    let score = (num * 10) / den
+    if score > 10 { score = 10 }
+    return score
+}
+
+// "Does this transcript open with a more / and / also cue?" Returns the
+// REMAINDER text after the cue (possibly empty) on match, or 0 (int)
+// when no cue is present. Distinct from _vd_is_more_request which only
+// recognises FIXED cue phrases; this one consumes the prefix and lets
+// content-word analysis decide what to do with the tail. We deliberately
+// keep "what about X" / "how about X" OUT of this set: those are
+// already handled by _vd_pivot_kind (template-preserving pivot with a
+// known kind), and feeding them to the topic-shift logic would
+// double-classify.
+fn _vd_more_cue_remainder(lowered) {
+    if _vd_starts_with(lowered, "tell me more about ") == 1 {
+        return _vd_trim(substr(lowered, 19, len(lowered) - 19))
+    }
+    if _vd_starts_with(lowered, "tell me more ") == 1 {
+        return _vd_trim(substr(lowered, 13, len(lowered) - 13))
+    }
+    if str_eq(lowered, "tell me more") == 1 { return "" }
+    if _vd_starts_with(lowered, "more about ") == 1 {
+        return _vd_trim(substr(lowered, 11, len(lowered) - 11))
+    }
+    if _vd_starts_with(lowered, "more ") == 1 {
+        return _vd_trim(substr(lowered, 5, len(lowered) - 5))
+    }
+    if str_eq(lowered, "more") == 1 { return "" }
+    if _vd_starts_with(lowered, "and also ") == 1 {
+        return _vd_trim(substr(lowered, 9, len(lowered) - 9))
+    }
+    if _vd_starts_with(lowered, "also ") == 1 {
+        return _vd_trim(substr(lowered, 5, len(lowered) - 5))
+    }
+    if str_eq(lowered, "also") == 1 { return "" }
+    if _vd_starts_with(lowered, "and ") == 1 {
+        return _vd_trim(substr(lowered, 4, len(lowered) - 4))
+    }
+    if str_eq(lowered, "and") == 1 { return "" }
+    return 0
+}
+
+// Accessors (public) for the FOLLOWUP_* enum -- callers test against
+// these returns rather than the raw int constants. Matches the shape of
+// the vc_template_* accessors in voice_conversation.nova.
+fn vc_followup_none()       { return VC_FOLLOWUP_NONE }
+fn vc_followup_continue()   { return VC_FOLLOWUP_CONTINUE }
+fn vc_followup_pivot()      { return VC_FOLLOWUP_PIVOT }
+fn vc_followup_anaphora()   { return VC_FOLLOWUP_ANAPHORA }
+fn vc_followup_kind_pivot() { return VC_FOLLOWUP_KIND_PIVOT }
+fn vc_followup_clarify()    { return VC_FOLLOWUP_CLARIFY }
+
+// R25B.6 max-clarify-attempts accessor -- exposes the give-up cap
+// so tests can drive past it deterministically. Mirrors the shape
+// of the limit-cap accessors elsewhere in this module.
+fn vc_dialog_clarify_max_attempts() {
+    return VC_DIALOG_CLARIFY_MAX_ATTEMPTS
+}
+
+// R25B.4 morphology helper -- public so callers (and tests) can probe
+// the s-suffix stripping behaviour directly. Returns the stemmed form
+// of `tok` (a lowercase ASCII string). See _vd_stem for the rules.
+fn vc_stem(tok) { return _vd_stem(tok) }
+
+// R25B.4 weighted-score probe -- runs the kind-weighted Jaccard on
+// a synthetic prior/now pair. Convenience for tests that want to
+// verify the scorer's output without driving a full vc_session_turn.
+// `prior_other` is the prior content set WITHOUT the kind word;
+// `prior_kind_stem` is the lowercase + stemmed kind ("" if no kind);
+// `now` is the remainder's content set (already stemmed via
+// _vd_content_words). Returns the score in tenths (0..10).
+fn vc_weighted_score(prior_other, prior_kind_stem, now) {
+    return _vd_weighted_score_tenths(prior_other, prior_kind_stem, now)
+}
+
+// R25B.6 -- env opt-out probe. When `CE_VOICE_NO_CLARIFY` is set to a
+// non-empty value (any value other than "" / "0"), the classifier
+// falls back to R31F's "first kind wins" deterministic behaviour
+// instead of emitting CLARIFY on a multi-kind remainder. This
+// preserves byte-identical behaviour for callers / fixtures that
+// want the older R31F shape. Returns 1 when the opt-out is active
+// and the dispatcher should suppress CLARIFY, 0 otherwise.
+fn _vd_clarify_suppressed_by_env() {
+    let env = getenv("CE_VOICE_NO_CLARIFY")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "0") == 1 { return 0 }
+    return 1
+}
+
+// R25B.6 public probe -- exposes the env-opt-out state so tests can
+// assert the CLARIFY-suppression behaviour without re-implementing
+// the env lookup. Returns 1 when CLARIFY is suppressed (R31F
+// fallback), 0 otherwise (R32F clarify path active).
+fn vc_clarify_suppressed_by_env() {
+    return _vd_clarify_suppressed_by_env()
+}
+
+// R25B.5 -- scan a stemmed-content-words list for a token that names a
+// KNOWN R15D kind (after morphology + uppercase + the _vd_known_kind
+// check). Returns the matched kind name (UPPER-CASE -- the canonical
+// shape consumed by _vd_pivot_turn) on the FIRST match, or "" when no
+// remainder token names a known kind.
+//
+// The "exactly one" rule from the brief is encoded by treating the
+// first match as definitive: subsequent matches of the SAME kind are
+// idempotent (no-op), and the rare multi-kind remainder ("more facts
+// and rules") returns the first match in tokeniser order ("facts" ->
+// FACT). Documented in AUDIO_AUDIT.md (R25B.5 honest scope -- "first
+// kind wins"). When the matched kind equals `exclude_kind_upper` (a
+// canonical UPPER-CASE form of the prior turn's kind) the function
+// keeps scanning -- only a DIFFERENT known kind triggers a kind-pivot
+// signal. Returns "" when no remainder token names a known kind OR
+// every remainder kind match equals the prior kind.
+fn _vd_remainder_known_kind(now, exclude_kind_upper) {
+    let n = len(now)
+    let i = 0
+    while i < n {
+        let tok_upper = _vd_upcase_token(now[i])
+        if _vd_known_kind(tok_upper) == 1 {
+            // Match only counts as a kind-pivot signal when DIFFERENT
+            // from the prior kind. Same-kind matches fall through
+            // (allowing the CONTINUE branch upstream to handle them).
+            if str_eq(tok_upper, exclude_kind_upper) == 0 {
+                return tok_upper
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// R25B.6 -- multi-kind detector. Scans a stemmed-content-words list for
+// ALL tokens that name a known R15D kind (after morphology + upcase),
+// returning a deduplicated UPPER-CASE list in tokeniser order. The
+// `exclude_kind_upper` argument is the prior turn's kind (also UPPER-
+// CASE); matches that equal it are dropped (the CONTINUE / same-kind
+// path handles those). Returns an empty list when no remainder token
+// names a known kind OR every match equals the prior kind.
+//
+// Used by the classifier to distinguish:
+//   * 0 matches  -> generic PIVOT (R30F fallback)
+//   * 1 match    -> KIND_PIVOT (R31F path; same as
+//                   _vd_remainder_known_kind's single-return shape)
+//   * 2+ matches -> CLARIFY (R32F: ambiguous; ask "did you mean X or Y?")
+//
+// Dedup is order-preserving so a remainder like "more facts and rules"
+// yields ["FACT", "RULE"] in that order; downstream rendering uses
+// the same order in the clarify question ("Did you mean FACT or RULE
+// atoms?"). The dedup catches a remainder like "more rules and rule
+// atoms" -- both tokens stem+upcase to RULE; the result is just
+// ["RULE"], so the multi-kind branch doesn't fire on what's really
+// the same single kind.
+fn _vd_remainder_known_kinds_all(now, exclude_kind_upper) {
+    let out = list_new()
+    let n = len(now)
+    let i = 0
+    while i < n {
+        let tok_upper = _vd_upcase_token(now[i])
+        if _vd_known_kind(tok_upper) == 1 {
+            if str_eq(tok_upper, exclude_kind_upper) == 0 {
+                _vd_set_add(out, tok_upper)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// R25B.6 public probe -- runs the multi-kind detector on a synthetic
+// remainder, returning the deduplicated list of upper-case kind names.
+// Convenience for tests that want to verify the helper without
+// driving a full vc_session_turn or classifier call. `now` is the
+// already-stemmed content-words list (caller's responsibility);
+// `exclude_kind_upper` is the prior kind in UPPER-CASE form
+// (pass "" if there is no prior).
+fn vc_remainder_known_kinds_all(now, exclude_kind_upper) {
+    return _vd_remainder_known_kinds_all(now, exclude_kind_upper)
+}
+
+// R25B.5 public probe -- given a session and a query, returns the
+// upper-case kind name that the more-cue path would route to as a
+// kind-pivot, or "" otherwise. The handler in vc_session_turn calls
+// this to look up the target kind for KIND_PIVOT dispatch without
+// re-running tokenisation. Returns "" when the query does NOT match
+// the more-cue path, when there is no prior turn, or when the
+// remainder does not name a known kind different from the prior.
+// `voice_followup_classify` returning VC_FOLLOWUP_KIND_PIVOT implies
+// this function returns a non-empty kind name on the same inputs.
+fn voice_followup_kind_pivot_target(session, query) {
+    let raw = _vd_trim(query)
+    if len(raw) == 0 { return "" }
+    let lowered = _vd_lower(raw)
+    let history_len = len(vc_session_history(session))
+    if history_len == 0 { return "" }
+    let prior_kind_upper = _vd_upcase_token(vc_session_last_kind(session))
+
+    // The two paths that can produce a KIND_PIVOT: explicit
+    // "what/how about KIND" AND the more-cue tail.
+    let piv_kind = _vd_pivot_kind_no_and(lowered)
+    if piv_kind != 0 {
+        if _vd_known_kind(piv_kind) == 1 {
+            if str_eq(piv_kind, prior_kind_upper) == 0 {
+                return piv_kind
+            }
+        }
+    }
+
+    let rem = _vd_more_cue_remainder(lowered)
+    if rem != 0 {
+        if len(rem) > 0 {
+            let now = _vd_dedup(_vd_content_words(rem))
+            return _vd_remainder_known_kind(now, prior_kind_upper)
+        }
+    }
+    return ""
+}
+
+// R25B.6 public probe -- given a session and a query, returns the
+// list of candidate UPPER-CASE kind names the classifier would
+// surface in a clarifying question, or an empty list when the
+// input does NOT classify as CLARIFY. Used by the dispatcher to
+// build the "Did you mean X or Y?" turn and to stash the candidates
+// in the pending-clarify session slot. Returns an empty list when
+// there is no prior turn, when the query doesn't take the more-cue
+// path, when the remainder names fewer than 2 known kinds, or when
+// the env opt-out `CE_VOICE_NO_CLARIFY` is active.
+fn voice_followup_clarify_candidates(session, query) {
+    let empty = list_new()
+    let raw = _vd_trim(query)
+    if len(raw) == 0 { return empty }
+    let lowered = _vd_lower(raw)
+    let history_len = len(vc_session_history(session))
+    if history_len == 0 { return empty }
+    let prior_kind_upper = _vd_upcase_token(vc_session_last_kind(session))
+
+    // The explicit "what about KIND" path never produces a clarify --
+    // it names exactly one kind on its own. Only the more-cue tail
+    // can multi-kind.
+    let rem = _vd_more_cue_remainder(lowered)
+    if rem == 0 { return empty }
+    if len(rem) == 0 { return empty }
+    let now = _vd_dedup(_vd_content_words(rem))
+    let cands = _vd_remainder_known_kinds_all(now, prior_kind_upper)
+    if len(cands) < 2 { return empty }
+    // Env opt-out: callers that explicitly suppress clarify see an
+    // empty list here too (the classifier would route to KIND_PIVOT
+    // on the first match instead).
+    if _vd_clarify_suppressed_by_env() == 1 { return empty }
+    return cands
+}
+
+// Public classifier (R25B.3 + R25B.4 + R25B.5) -- decides which
+// follow-up branch the transcript wants. Pure: no KG calls, no side
+// effects on the session. Returns one of the VC_FOLLOWUP_* ints.
+// Algorithm:
+//
+//   1. Empty / no-prior -> NONE.
+//   2. Anaphora cue ("describe it" / "the second one" / ordinal+verb /
+//      bare "describe X") -> ANAPHORA. Anaphora wins over pivot because
+//      "describe the first one" must NOT be classified as a topic
+//      shift on the word "first".
+//   3. "what about X" / "how about X" with X a known kind ->
+//        - KIND_PIVOT when X != prior kind (R25B.5 upgrade -- the
+//          handler reuses the prior template against the new kind,
+//          LIMIT resets to baseline).
+//        - CONTINUE when X == prior kind (restating the same topic --
+//          treat as a refresh of the prior LIST_ALL, no kind shift).
+//   4. More cue ("tell me more about X" / "more X" / "and X" / "also") ->
+//      content-word Jaccard against the prior turn:
+//         - cue with empty remainder (e.g. "tell me more"): CONTINUE.
+//         - remainder content overlap >= threshold: CONTINUE.
+//         - R25B.4 weighted scorer (kind word doubles): CONTINUE if
+//           weighted score >= threshold.
+//         - R25B.5: scan remainder for tokens naming a known kind
+//           (stem + upcase + _vd_known_kind). If a token names a kind
+//           DIFFERENT from the prior kind -> KIND_PIVOT (re-run the
+//           prior template against the new kind, LIMIT reset).
+//         - Otherwise -> PIVOT (reset session, fresh-parse remainder).
+//   5. Otherwise (no cue, no anaphora): NONE -- fresh parse path.
+//
+// R25B.5 rationale for the KIND_PIVOT class: R29C's documented failure
+// case "tell me more about that atom in the rule engine" after `list
+// all FACT` correctly identifies the topic shift to "rule engine" but
+// classifies it as PIVOT -- meaning the handler resets session state
+// and tries to fresh-parse "that atom in the rule engine" through the
+// R25B parser, which returns UNKNOWN. The operator's actual intent is
+// "show me the same LIST_ALL shape but for the RULE kind"; KIND_PIVOT
+// captures that by routing through _vd_pivot_turn (preserves the
+// prior template, swaps the kind, resets LIMIT).
+fn voice_followup_classify(session, query) {
+    let raw = _vd_trim(query)
+    if len(raw) == 0 { return VC_FOLLOWUP_NONE }
+    let lowered = _vd_lower(raw)
+    let last_tpl = vc_session_last_template(session)
+    let last_ids = vc_session_last_ids(session)
+    let history_len = len(vc_session_history(session))
+    let prior_kind_upper = _vd_upcase_token(vc_session_last_kind(session))
+
+    // 2. Anaphora has priority.
+    if _vd_is_anaphora_describe(lowered) == 1 {
+        if history_len > 0 { return VC_FOLLOWUP_ANAPHORA }
+        return VC_FOLLOWUP_NONE
+    }
+    let ord = _vd_ordinal_index(lowered)
+    if ord != 0 - 1 {
+        if history_len > 0 { return VC_FOLLOWUP_ANAPHORA }
+        return VC_FOLLOWUP_NONE
+    }
+
+    // 3. "what about X" / "how about X" -- template-preserving
+    //    kind-pivot path. R25B.5: split on whether the named kind
+    //    differs from the prior kind. Different kind -> KIND_PIVOT
+    //    (handler reuses prior template against new kind). Same kind
+    //    -> CONTINUE (the operator is restating the prior topic).
+    let piv_kind = _vd_pivot_kind_no_and(lowered)
+    if piv_kind != 0 {
+        if _vd_known_kind(piv_kind) == 1 {
+            if history_len == 0 { return VC_FOLLOWUP_NONE }
+            if str_eq(piv_kind, prior_kind_upper) == 0 {
+                return VC_FOLLOWUP_KIND_PIVOT
+            }
+            return VC_FOLLOWUP_CONTINUE
+        }
+    }
+
+    // 4. More/and/also cue -- content-word Jaccard decides. R25B.3
+    //    uses uniform-weight Jaccard for backwards parity; R25B.4
+    //    layers a kind-weighted scorer on top so borderline cases
+    //    where the remainder NAMES the prior kind (possibly pluralised,
+    //    via _vd_stem) get LIFTED into CONTINUE even when their
+    //    uniform Jaccard would round below threshold. R25B.5 adds a
+    //    third pass: if Jaccard misses BOTH ways but the remainder
+    //    NAMES a known kind != prior, return KIND_PIVOT.
+    let rem = _vd_more_cue_remainder(lowered)
+    if rem != 0 {
+        // No prior turn -> the cue has nothing to continue/pivot from;
+        // call it NONE so the runtime falls through to the existing
+        // "There is nothing yet" complaint path.
+        if history_len == 0 { return VC_FOLLOWUP_NONE }
+        // Empty remainder => pure continuation request.
+        if len(rem) == 0 { return VC_FOLLOWUP_CONTINUE }
+        // Content-word overlap against prior turn.
+        let prior = _vd_prior_content(session)
+        let now = _vd_dedup(_vd_content_words(rem))
+        // Special-case: remainder reduces to NO content words (e.g.
+        // "tell me more about it" -- "it" is a stopword; remainder
+        // content set is empty). That's not a pivot signal: the cue
+        // is asking for more of the prior thing.
+        if len(now) == 0 { return VC_FOLLOWUP_CONTINUE }
+        let j = _vd_jaccard_tenths(prior, now)
+        if j >= VC_DIALOG_PIVOT_THRESHOLD { return VC_FOLLOWUP_CONTINUE }
+        // R25B.4 kind-weighted second pass: if the remainder lands
+        // on the prior KIND token (after morphology) the weighted
+        // score lifts borderline cases over the threshold. Remainder
+        // tokens that name a DIFFERENT prior content word still earn
+        // a smaller (weight-1) vote each so a half-and-half remainder
+        // ("more rules about cats" after RULE) still tips CONTINUE.
+        let prior_other = _vd_prior_content_no_kind(session)
+        let prior_kind_stem = _vd_stem(_vd_lower(vc_session_last_kind(session)))
+        let jw = _vd_weighted_score_tenths(prior_other, prior_kind_stem, now)
+        if jw >= VC_DIALOG_PIVOT_THRESHOLD { return VC_FOLLOWUP_CONTINUE }
+        // R25B.5 kind-pivot pass: scan the remainder for ALL tokens
+        // naming KNOWN kinds != prior. R25B.6 splits on how many:
+        //   * 0 matches -> honest PIVOT (R30F fallback).
+        //   * 1 match   -> KIND_PIVOT (R31F behaviour; single deterministic
+        //                  target).
+        //   * 2+ matches -> CLARIFY (R25B.6: ambiguous remainder; emit a
+        //                  "did you mean X or Y?" turn). Suppressed back
+        //                  to KIND_PIVOT with the first match when the
+        //                  env opt-out `CE_VOICE_NO_CLARIFY` is set --
+        //                  this preserves R31F's deterministic byte-
+        //                  identical behaviour for callers that prefer
+        //                  the older shape.
+        let kind_matches = _vd_remainder_known_kinds_all(now, prior_kind_upper)
+        let n_kinds = len(kind_matches)
+        if n_kinds == 0 { return VC_FOLLOWUP_PIVOT }
+        if n_kinds == 1 { return VC_FOLLOWUP_KIND_PIVOT }
+        // 2+ kinds. Check env opt-out: when set, fall back to R31F's
+        // first-match-wins KIND_PIVOT routing byte-identically.
+        if _vd_clarify_suppressed_by_env() == 1 {
+            return VC_FOLLOWUP_KIND_PIVOT
+        }
+        return VC_FOLLOWUP_CLARIFY
+    }
+
+    return VC_FOLLOWUP_NONE
+}
+
+// R25B.6 -- "both" selector probe. Detects the operator's
+// "do all of them" answer to a clarifying question. We accept a
+// handful of natural-English forms; the goal is to recognise the
+// "I want all the candidates" intent regardless of exact phrasing.
+// Returns 1 on match, 0 otherwise. Documented "both" handling:
+// we FALL BACK to R31F's first-match KIND_PIVOT against the FIRST
+// candidate (matches the env-opt-out semantics for deterministic
+// behaviour). Rationale: the dialog layer dispatches one query at
+// a time; running BOTH would require an extended response shape,
+// dispatcher loop, and history bookkeeping. First-match honours the
+// "never silently drop user intent" principle and the multi-turn
+// loop lets the operator follow up with "what about KIND2" on the
+// SECOND kind whenever they choose.
+fn _vd_is_both_selector(lowered) {
+    if str_eq(lowered, "both") == 1 { return 1 }
+    if str_eq(lowered, "both of them") == 1 { return 1 }
+    if str_eq(lowered, "both please") == 1 { return 1 }
+    if str_eq(lowered, "either") == 1 { return 1 }
+    if str_eq(lowered, "all of them") == 1 { return 1 }
+    if str_eq(lowered, "all") == 1 { return 1 }
+    return 0
+}
+
+// R25B.6 -- given a clarify-pending session and a freshly-received
+// user transcript, try to map the transcript to one of the pending
+// candidate kinds. Returns the chosen UPPER-CASE kind name on
+// success, "" on failure (ambiguity persists).
+//
+// Resolution order:
+//   1. Trim + lowercase + strip apostrophes.
+//   2. Bare kind name (case-insensitive): "RULE", "rule", "Rule" all
+//      map to RULE iff RULE is in candidates.
+//   3. Tokenise into content words (drops stopwords like "the",
+//      "please", "atoms") + stem; the FIRST surviving token whose
+//      upcase + known-kind check matches a candidate wins.
+//      "the rules", "facts please", "rules thanks" all resolve.
+//   4. "both" / "either" / "all" -> first candidate (documented
+//      first-match fallback; see `_vd_is_both_selector`).
+//   5. Anything else -> "".
+fn _vd_resolve_clarify_selector(lowered, candidates) {
+    let n_cands = len(candidates)
+    if n_cands == 0 { return "" }
+
+    // Step 2: bare kind name (single token, no whitespace).
+    let upper = _vd_upcase_token(_vd_trim(lowered))
+    if _vd_known_kind(upper) == 1 {
+        let i = 0
+        while i < n_cands {
+            if str_eq(upper, candidates[i]) == 1 { return upper }
+            i = i + 1
+        }
+    }
+
+    // Step 4: "both" / "either" / "all" -> first candidate.
+    if _vd_is_both_selector(lowered) == 1 {
+        return candidates[0]
+    }
+
+    // Step 3: tokenise the lowered transcript into content words
+    // (stopword-stripped + s-suffix stemmed). The first surviving
+    // token that upcases into a candidate wins. We use the same
+    // _vd_content_words pipeline as the rest of the classifier so
+    // morphology + stopword behaviour is consistent.
+    let toks = _vd_content_words(lowered)
+    let n_toks = len(toks)
+    let j = 0
+    while j < n_toks {
+        let tok_upper = _vd_upcase_token(toks[j])
+        if _vd_known_kind(tok_upper) == 1 {
+            let k = 0
+            while k < n_cands {
+                if str_eq(tok_upper, candidates[k]) == 1 {
+                    return tok_upper
+                }
+                k = k + 1
+            }
+        }
+        j = j + 1
+    }
+
+    return ""
+}
+
+// R25B.6 public probe -- exposes the kind-selector resolver to
+// tests + integration drivers. `query` is the raw transcript
+// (we lower + trim internally); `candidates` is the UPPER-CASE
+// list of pending candidate kinds (same shape as the session's
+// pending_clarify_kinds slot). Returns the chosen kind name on
+// success, "" on failure.
+fn vc_resolve_clarify_selector(query, candidates) {
+    let raw = _vd_trim(query)
+    if len(raw) == 0 { return "" }
+    let lowered = _vd_lower(raw)
+    return _vd_resolve_clarify_selector(lowered, candidates)
+}
+
+// R25B.6 -- render the clarify question text from a candidate list.
+// "Did you mean RULE or FACT atoms?" for 2 candidates;
+// "Did you mean RULE, FACT, or CONCEPT atoms?" for 3+. Kept as a
+// dedicated helper so tests can assert byte-identical text and the
+// integration scenario can compare against an exact string.
+fn _vd_render_clarify_question(candidates) {
+    let n = len(candidates)
+    if n == 0 { return "" }
+    if n == 1 {
+        // Degenerate: a "1-candidate clarify" shouldn't fire, but if
+        // someone hand-builds the call, give a sensible string.
+        return "Did you mean " + candidates[0] + " atoms?"
+    }
+    if n == 2 {
+        return "Did you mean " + candidates[0] + " or "
+            + candidates[1] + " atoms?"
+    }
+    // 3+: comma-separated with " or " before the last.
+    let out = "Did you mean "
+    let i = 0
+    while i < n - 1 {
+        out = out + candidates[i] + ", "
+        i = i + 1
+    }
+    out = out + "or " + candidates[n - 1] + " atoms?"
+    return out
+}
+
+// R25B.6 public probe -- expose the clarify-question renderer.
+fn vc_render_clarify_question(candidates) {
+    return _vd_render_clarify_question(candidates)
+}
+
+// Internal -- same as _vd_pivot_kind but excludes the "and X" branch.
+// The classifier reaches the "and X" check via the more-cue path, so
+// the explicit-pivot path (what / how about X) handles only the
+// "knownkind" cases. Without this split we'd misclassify "and FACT"
+// as a kind-pivot AND a more-cue; we want it to flow through the more
+// path so the Jaccard heuristic sees it.
+fn _vd_pivot_kind_no_and(lowered) {
+    if _vd_starts_with(lowered, "what about ") == 1 {
+        let rest = _vd_trim(substr(lowered, 11, len(lowered) - 11))
+        if len(rest) == 0 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    if _vd_starts_with(lowered, "how about ") == 1 {
+        let rest = _vd_trim(substr(lowered, 10, len(lowered) - 10))
+        if len(rest) == 0 { return 0 }
+        return _vd_upcase_token(_vd_first_word(rest))
+    }
+    return 0
+}
+
+// ---- R34D: STT confidence threshold + clarifying-question fallback -------
+//
+// Purpose
+//   R34D adds a "did I hear you?" gate in front of the dialog state
+//   machine. Each turn the STT seam reports a confidence score (milli,
+//   0..1000) alongside the transcript; when that score is below
+//   threshold the dialog asks the operator to repeat themselves rather
+//   than feeding a probably-misheard string into the R31F kind-pivot /
+//   R32F multi-kind clarify routing.
+//
+//   The headline `vc_session_turn` path is UNCHANGED -- callers that
+//   don't have an STT confidence to plumb (chat fixtures, integration
+//   scripts that bypass real STT) still call it directly and get the
+//   pre-R34D behaviour byte-identically. The new
+//   `vc_session_turn_with_confidence(kg, session, text, conf_milli)`
+//   adds the confidence gate on top.
+//
+//   Threshold:
+//     * Default: 500 milli (= 0.5). Documented in the brief.
+//     * Env override: `CE_VOICE_STT_CONF_THRESHOLD` parsed as an
+//       integer "tenths-of-a-percent" -- the operator types a value
+//       in the range 0..100 representing percent (so "50" = 0.5,
+//       "70" = 0.7, "80" = 0.8). We multiply by 10 to convert to
+//       milli (0..1000). NOVA has no floats, so the env contract is
+//       integer-percent; the brief calls this out explicitly.
+//     * Anything outside [0, 100] clamps to the default 50% (500
+//       milli) -- defensive, since a typo'd env shouldn't silently
+//       disable the gate.
+//
+//   On a low-confidence turn:
+//     * The session's `last_stt_confidence` slot updates to the
+//       reported value (so telemetry / tests can see what we heard).
+//     * The dialog state machine is NOT advanced -- no parser run,
+//       no history append, no pending-clarify mutation. The next
+//       turn re-runs from the same dialog state.
+//     * The response text is the canonical "I didn't catch that
+//       clearly -- could you repeat?" sentence.
+//
+//   On a high-confidence turn:
+//     * Confidence is mirrored into the session slot (same as low).
+//     * The transcript flows through `vc_session_turn` unchanged, so
+//       all R25B / R25B.2 / R25B.3 / R25B.4 / R25B.5 / R25B.6 paths
+//       (R31F kind-pivot, R32F multi-kind clarify, etc.) work
+//       exactly as before.
+//
+//   Honest scope (R34D.2+ deferred):
+//     * No calibration step (comparing whisper's confidence to ground
+//       truth across a held-out set to learn the "true" threshold).
+//       The 0.5 default is the brief's intuitive cut; future work
+//       could plumb a calibration table per (acoustic-environment,
+//       model) pair.
+//     * No per-language threshold -- whisper's tiny.en model is the
+//       canonical install; other models (multi-lingual) may report
+//       systematically different confidence distributions, and a
+//       single global threshold won't be optimal for all of them.
+//     * No two-stage gating (confidence + content-word check) -- a
+//       high-confidence misparse ("list all FACTS." -> stops at
+//       trailing dot, parses fine) won't trip the gate today.
+
+let VC_STT_CONF_THRESHOLD_DEFAULT = 500   // milli, = 0.5
+let VC_STT_CONF_CLARIFY_TEXT = "I did not catch that clearly. Could you repeat?"
+
+// _vd_parse_threshold_env(env) -- pure helper, exposed as `vc_voice_
+// stt_threshold_milli` for tests. `env` is the env-string (or 0 / "");
+// returns the milli threshold in 0..1000. Out-of-range / parse-failure
+// returns the documented default 500.
+fn _vd_parse_threshold_env(env) {
+    if env == 0 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    let n = len(env)
+    if n == 0 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    // Parse a non-negative ASCII decimal integer up to 3 digits;
+    // anything weird falls back to the default. We don't accept
+    // negative numbers ("a threshold below zero is incoherent") or
+    // float-like inputs ("0.7") -- the integer-percent contract is
+    // documented above.
+    let val = 0
+    let i = 0
+    while i < n {
+        let c = char_at(env, i)
+        if c < 48 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+        if c > 57 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+        val = val * 10 + (c - 48)
+        if val > 1000 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+        i = i + 1
+    }
+    if val < 0 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    if val > 100 { return VC_STT_CONF_THRESHOLD_DEFAULT }
+    // Multiply by 10 to convert percent (0..100) -> milli (0..1000).
+    return val * 10
+}
+
+// Public probe -- exposes the env-resolved threshold so tests can
+// verify the env override path without driving a full turn.
+fn vc_voice_stt_threshold_milli() {
+    let env = getenv("CE_VOICE_STT_CONF_THRESHOLD")
+    return _vd_parse_threshold_env(env)
+}
+
+// Public probe -- exposes the canonical clarify-question text so
+// callers (and the integration scenario) can assert against the
+// exact string. Kept as a function rather than a let so future
+// localisation hooks can override it cleanly.
+fn vc_voice_stt_clarify_text() {
+    return VC_STT_CONF_CLARIFY_TEXT
+}
+
+// vc_session_turn_with_confidence(kg, session, transcript, conf_milli) ->
+//     [response_text, session]
+//
+// The R34D-aware turn entry. `conf_milli` is the STT confidence in
+// 0..1000 (the same milli encoding the seam emits). When conf_milli is
+// below the env-resolved threshold the dialog returns the clarifying
+// question without touching the state machine; otherwise the call
+// delegates to the existing `vc_session_turn` so all pre-R34D paths
+// (R31F kind-pivot, R32F multi-kind clarify, anaphora, ...) run as
+// they did before. The session's `last_stt_confidence` slot is updated
+// in BOTH branches so callers can introspect "what did STT report on
+// the most recent turn?" deterministically.
+//
+// Special-case: an empty transcript with conf_milli == 0 routes to the
+// clarify path (the seam returns this for whisper-cli's "empty
+// transcript" + the stub backend's placeholder). This keeps the
+// clarify-question response from being misclassified as a query through
+// the parser.
+fn vc_session_turn_with_confidence(kg, session, transcript, conf_milli) {
+    let result = list_new()
+    let threshold = vc_voice_stt_threshold_milli()
+    // Update the telemetry slot FIRST so a clarify-routed turn still
+    // reflects what STT reported -- inspection during a low-conf turn
+    // should see the actual milli value, not the "-1 unknown" sentinel.
+    list_set(session, _VC_SESS_LAST_STT_CONF, conf_milli)
+    if conf_milli < threshold {
+        // Confidence below threshold: emit clarification, do NOT
+        // advance the dialog state machine. No history append, no
+        // parser run, no pending-clarify mutation. The next turn
+        // re-enters from the same state.
+        push(result, VC_STT_CONF_CLARIFY_TEXT)
+        push(result, session)
+        return result
+    }
+    // High enough: delegate to the existing turn pipeline. The
+    // confidence is already mirrored to the session slot above.
+    return vc_session_turn(kg, session, transcript)
+}
+
+// ---- core turn logic -----------------------------------------------------
+//
+// The turn pipeline:
+//   1. Trim + lowercase the transcript.
+//   2. Empty transcript -> "I didn't catch that" apology; no state change.
+//   3. Topic-shift marker -> reset session; if remainder non-empty, parse
+//      it as a fresh question; if remainder empty, return acknowledgement.
+//   4. "Tell me more" -> requires prior turn. Escalate LIMIT, re-run
+//      LIST_ALL on the prior kind, fold in.
+//   5. Anaphora "describe it" -> requires prior turn with ids. Use
+//      WHAT_IS template against the FIRST id of the prior bindings.
+//   6. Ordinal "the second one" -> requires prior turn with ids. Use
+//      WHAT_IS template against ids[N] (or ids[N-1] for "last one").
+//   7. "what about X" / "and X" -> requires prior turn. Use prior
+//      template with new kind X.
+//   8. Otherwise -> R25B parser, fresh turn.
+
+fn vc_session_turn(kg, session, question_text) {
+    let raw = _vd_trim(question_text)
+    let result = list_new()
+
+    // Empty transcript: no state change.
+    if len(raw) == 0 {
+        push(result, "I did not catch that. Please try again.")
+        push(result, session)
+        return result
+    }
+
+    let lowered = _vd_lower(raw)
+
+    // 0. R25B.6 pending-clarify resolution. If the previous turn was
+    //    a CLARIFY (the dispatcher stashed candidate kinds in the
+    //    pending-clarify slot), interpret this turn as a kind-selector
+    //    response FIRST. On success we dispatch as KIND_PIVOT against
+    //    the chosen kind. On failure we either re-emit the clarify
+    //    (if attempts remain) or give up and route as PIVOT with an
+    //    apologetic message. Explicit topic-shift markers (handled
+    //    below) still take precedence -- "actually never mind" clears
+    //    pending state and resets the session.
+    //
+    //    Topic-shift detection runs BEFORE this branch because
+    //    `vc_session_reset` wipes the pending slot too; the operator
+    //    can always cancel a pending clarify by saying "actually" /
+    //    "never mind".
+    let shift_rem_early = _vd_topic_shift_remainder(lowered)
+    if shift_rem_early != 0 {
+        vc_session_reset(session)
+        if len(shift_rem_early) == 0 {
+            push(result, "Okay, let us change the topic. What would you like to know?")
+            push(result, session)
+            return result
+        }
+        return _vd_fresh_turn(kg, session, raw, shift_rem_early)
+    }
+
+    if vc_session_is_pending_clarify(session) == 1 {
+        return _vd_handle_pending_clarify(kg, session, raw, lowered)
+    }
+
+    // 1. Explicit topic-shift markers ("actually", "never mind", ...).
+    //    These are unconditional resets, independent of the content-word
+    //    classifier -- the operator explicitly TOLD us to wipe state.
+    //    The remainder type-discriminates: 0 means "this transcript is
+    //    not a shift marker"; "" means "shift acknowledged, no follow-up
+    //    question"; non-empty string means "shift acknowledged + parse
+    //    the rest as a fresh turn".
+    //
+    //    (R25B.6 NOTE: the topic-shift check above is the same one,
+    //    promoted to run before the pending-clarify branch so the
+    //    operator can always cancel a clarify mid-flight. The
+    //    duplicated comment is kept for code-archaeology continuity.)
+    let shift_rem = _vd_topic_shift_remainder(lowered)
+    if shift_rem != 0 {
+        vc_session_reset(session)
+        if len(shift_rem) == 0 {
+            push(result, "Okay, let us change the topic. What would you like to know?")
+            push(result, session)
+            return result
+        }
+        // Parse the remainder as a fresh question -- recurse into the
+        // R25B parser path. We don't recursively call vc_session_turn
+        // (which would re-enter the shift detector); we call the inner
+        // _vc_fresh_turn helper directly.
+        return _vd_fresh_turn(kg, session, raw, shift_rem)
+    }
+
+    // 2. R25B.3 follow-up classifier. Decides among CONTINUE / PIVOT /
+    //    ANAPHORA / NONE based on cue-word + content-word Jaccard. The
+    //    classifier is pure -- the runtime dispatches below using its
+    //    return value.
+    let cls = voice_followup_classify(session, raw)
+
+    let last_tpl = vc_session_last_template(session)
+    let last_kind = vc_session_last_kind(session)
+    let last_ids = vc_session_last_ids(session)
+
+    // 3. ANAPHORA -- "describe it" / "what is it" / "the second one" /
+    //    "the last one". Existing behaviour: resolve to last_ids[N].
+    if cls == VC_FOLLOWUP_ANAPHORA {
+        if _vd_is_anaphora_describe(lowered) == 1 {
+            if len(last_ids) == 0 {
+                push(result, "I do not have a previous result to describe.")
+                push(result, session)
+                return result
+            }
+            return _vd_describe_turn(kg, session, raw, last_ids[0])
+        }
+        let ord = _vd_ordinal_index(lowered)
+        if ord != 0 - 1 {
+            if len(last_ids) == 0 {
+                push(result, "I do not have a previous list to index into.")
+                push(result, session)
+                return result
+            }
+            let idx = ord
+            if ord == 0 - 1000 { idx = len(last_ids) - 1 }
+            if idx < 0 {
+                push(result, "I do not have that many results.")
+                push(result, session)
+                return result
+            }
+            if idx >= len(last_ids) {
+                push(result, "I do not have that many results.")
+                push(result, session)
+                return result
+            }
+            return _vd_describe_turn(kg, session, raw, last_ids[idx])
+        }
+        // Classifier voted ANAPHORA but no concrete cue matched: defensive
+        // fallthrough to fresh parse (shouldn't fire in practice).
+    }
+
+    // 3b. R25B.5 KIND_PIVOT -- the remainder NAMED a known second kind
+    //    (e.g. "tell me more about RULE atoms" / "tell me more about
+    //    that atom in the rule engine" / "what about CONCEPT" after a
+    //    FACT turn). Run _vd_pivot_turn against the prior template
+    //    (LIST_ALL if no prior template) with the new kind. LIMIT
+    //    resets to baseline (the prior _vd_pivot_turn does that
+    //    unconditionally), history captures the pivot turn with the
+    //    new kind annotated. Distinct from generic PIVOT below: there
+    //    is NO session reset -- the prior-template signal is what
+    //    distinguishes a kind-shift from a topic-shift.
+    if cls == VC_FOLLOWUP_KIND_PIVOT {
+        let kp_target = voice_followup_kind_pivot_target(session, raw)
+        if len(kp_target) > 0 {
+            let kp_tpl = last_tpl
+            if kp_tpl == VC_TPL_UNKNOWN { kp_tpl = VC_TPL_LIST_ALL }
+            return _vd_pivot_turn(kg, session, raw, kp_tpl, kp_target)
+        }
+        // Defensive fallthrough -- classifier voted KIND_PIVOT but
+        // the target lookup returned empty. Shouldn't fire in
+        // practice (the classifier + helper share the same _vd_
+        // primitives) but if it does, treat as generic PIVOT.
+    }
+
+    // 3c. R25B.6 CLARIFY -- the more-cue remainder names 2+ known
+    //    kinds different from prior. Stash the candidates in the
+    //    pending-clarify slot and emit "Did you mean X or Y atoms?".
+    //    The NEXT user turn is parsed as a kind-selector first
+    //    (handled at the top of this function via
+    //    `_vd_handle_pending_clarify`). The session's prior template
+    //    + kind + ids are LEFT INTACT -- the operator hasn't shifted
+    //    yet, they're being asked to specify. Suppressed back to
+    //    KIND_PIVOT (first-match) when CE_VOICE_NO_CLARIFY is set;
+    //    that branch is handled in the classifier so we don't reach
+    //    CLARIFY here.
+    if cls == VC_FOLLOWUP_CLARIFY {
+        let cands = voice_followup_clarify_candidates(session, raw)
+        if len(cands) >= 2 {
+            // Choose dispatch template for the eventual resolution.
+            // Mirrors KIND_PIVOT semantics: prior template if known,
+            // else LIST_ALL (the natural "list all KIND" shape).
+            let pending_tpl = last_tpl
+            if pending_tpl == VC_TPL_UNKNOWN {
+                pending_tpl = VC_TPL_LIST_ALL
+            }
+            list_set(session, _VC_SESS_PENDING_KINDS, cands)
+            list_set(session, _VC_SESS_PENDING_TPL, pending_tpl)
+            // Attempt counter: this is the FIRST clarify. If we end
+            // up re-emitting (operator's reply doesn't resolve), the
+            // counter bumps in `_vd_handle_pending_clarify`.
+            list_set(session, _VC_SESS_PENDING_ATTEMPTS, 1)
+            list_set(session, _VC_SESS_PENDING_RAW, raw)
+            let q = _vd_render_clarify_question(cands)
+            push(result, q)
+            push(result, session)
+            return result
+        }
+        // Defensive fallthrough -- classifier voted CLARIFY but
+        // candidates collapsed below 2 (env-opt-out race / empty
+        // history). Treat as generic PIVOT below.
+    }
+
+    // 4. PIVOT -- two sub-paths:
+    //    a) "what about KIND" / "how about KIND" -- template-preserving
+    //       pivot, run _vd_pivot_turn against the prior template.
+    //       (R25B.5 routes the known-kind != prior case as KIND_PIVOT
+    //       above; this branch now only fires on unknown-kind probe
+    //       fallthroughs which we keep for defensive symmetry with
+    //       the R29C dispatch shape.)
+    //    b) more / and / also cue with content-words unrelated to prior
+    //       -- reset session + fresh-parse the cue's remainder. History
+    //       still records the pivot turn so the operator can see what
+    //       was asked.
+    if cls == VC_FOLLOWUP_PIVOT {
+        let piv = _vd_pivot_kind_no_and(lowered)
+        if piv != 0 {
+            if _vd_known_kind(piv) == 1 {
+                if last_tpl != VC_TPL_UNKNOWN {
+                    return _vd_pivot_turn(kg, session, raw, last_tpl, piv)
+                }
+                return _vd_pivot_turn(kg, session, raw, VC_TPL_LIST_ALL, piv)
+            }
+        }
+        // Topic-shift via more-cue: reset session, parse the remainder
+        // (or the whole cue+remainder if remainder is empty) as a fresh
+        // turn. We record the turn in history even on UNKNOWN parse so
+        // the operator sees the pivot they just made.
+        let rem = _vd_more_cue_remainder(lowered)
+        // rem is "" / string / 0; classifier only routes us here when
+        // rem != 0 with non-empty remainder content. Defensive: if for
+        // any reason rem is 0 or empty, fall back to fresh-parse on the
+        // whole lowered transcript.
+        let to_parse = lowered
+        if rem != 0 {
+            if len(rem) > 0 { to_parse = rem }
+        }
+        vc_session_reset(session)
+        return _vd_pivot_fresh_turn(kg, session, raw, to_parse)
+    }
+
+    // 5. CONTINUE -- "tell me more" / "more" / "and also" without a
+    //    topic-shift signal. Existing handler: escalate LIMIT, re-run
+    //    LIST_ALL on the prior kind. The "and KIND" branch still goes
+    //    through _vd_pivot_kind (with-and variant) for backwards compat
+    //    with R25B.2 tests.
+    if cls == VC_FOLLOWUP_CONTINUE {
+        if _vd_is_more_request(lowered) == 1 {
+            if last_tpl == VC_TPL_UNKNOWN {
+                push(result, "There is nothing yet. Please ask a question first.")
+                push(result, session)
+                return result
+            }
+            return _vd_more_turn(kg, session, raw)
+        }
+        // "and KIND" / cue with empty remainder that the classifier
+        // marked CONTINUE. Treat "and KIND" as a template-preserving
+        // pivot (matches R25B.2 behaviour). "tell me more about it"
+        // also lands here (anaphora-shaped "it" returns CONTINUE).
+        let piv2 = _vd_pivot_kind(lowered)
+        if piv2 != 0 {
+            if _vd_known_kind(piv2) == 1 {
+                if last_tpl != VC_TPL_UNKNOWN {
+                    return _vd_pivot_turn(kg, session, raw, last_tpl, piv2)
+                }
+                return _vd_pivot_turn(kg, session, raw, VC_TPL_LIST_ALL, piv2)
+            }
+        }
+        // Cue with non-pivot remainder shape and not a more-request:
+        // fall back to the existing more handler if it's a known cue
+        // ("tell me more about it" matches via _vd_is_more_request),
+        // otherwise default to LIMIT escalation when we have prior.
+        if last_tpl != VC_TPL_UNKNOWN {
+            return _vd_more_turn(kg, session, raw)
+        }
+        push(result, "There is nothing yet. Please ask a question first.")
+        push(result, session)
+        return result
+    }
+
+    // 6. NONE with a more-request shape but no prior turn -- e.g.
+    //    "tell me more" against a fresh session. Emit the R25B.2
+    //    complaint so the operator knows the cue had nothing to anchor
+    //    to. Preserves byte-identical behaviour for R28D fixtures.
+    if _vd_is_more_request(lowered) == 1 {
+        push(result, "There is nothing yet. Please ask a question first.")
+        push(result, session)
+        return result
+    }
+    if _vd_is_anaphora_describe(lowered) == 1 {
+        push(result, "I do not have a previous result to describe.")
+        push(result, session)
+        return result
+    }
+    let ord2 = _vd_ordinal_index(lowered)
+    if ord2 != 0 - 1 {
+        push(result, "I do not have a previous list to index into.")
+        push(result, session)
+        return result
+    }
+
+    // 7. NONE: fall through to the R25B parser. Backwards-compat with
+    //    R25B.2 -- "what is FACT" / "list all CONCEPT" parse exactly as
+    //    before; topic-shift detection is only ACTIVATED on a cue.
+    return _vd_fresh_turn(kg, session, raw, lowered)
+}
+
+// R25B.6 -- pending-clarify resolver. Called from the top of
+// `vc_session_turn` when the session is mid-clarify (the previous
+// turn emitted a "Did you mean X or Y?" question). `raw` / `lowered`
+// are the trimmed verbatim + lower-cased transcript of the operator's
+// reply.
+//
+// Resolution flow:
+//   1. Try `_vd_resolve_clarify_selector(lowered, candidates)`.
+//      On hit -> clear pending state, dispatch as KIND_PIVOT using
+//      the stashed pending_template against the chosen kind. The
+//      original raw also passes into _vd_pivot_turn so history
+//      records the resolution turn (matches the KIND_PIVOT semantics
+//      from the headline path).
+//   2. On miss, bump the attempt counter:
+//      - attempts < VC_DIALOG_CLARIFY_MAX_ATTEMPTS (default 2):
+//        re-emit the clarify question with a "Please answer with
+//        the kind name" prefix. Pending state stays put.
+//      - attempts >= MAX: give up. Clear pending state. Route as
+//        generic PIVOT with an apologetic message that names the
+//        candidates so the operator can manually re-ask. We pick
+//        the FIRST candidate (R31F first-match) as the resolution
+//        kind so the dispatch still produces a usable response
+//        (rather than just emitting an apology and dropping the
+//        user intent on the floor).
+//
+// Honest design caveat: when attempts==MAX-1 and the operator's
+// reply names a third unrelated kind, that token becomes a NEW
+// known-kind signal. We don't currently re-classify their reply
+// through the multi-kind detector -- it's treated as a non-
+// resolution and we re-emit the clarify (giving them one more
+// chance). The argument for re-classification would be that
+// "tell me more about RULE" mid-clarify clearly shifts to RULE;
+// the argument against is that it's a semantic guess in a
+// disambiguation context. We chose the simpler path; the multi-
+// turn loop covers the gap.
+fn _vd_handle_pending_clarify(kg, session, raw, lowered) {
+    let result = list_new()
+    let candidates = session[_VC_SESS_PENDING_KINDS]
+    let pending_tpl = session[_VC_SESS_PENDING_TPL]
+    let attempts = session[_VC_SESS_PENDING_ATTEMPTS]
+    if pending_tpl == VC_TPL_UNKNOWN { pending_tpl = VC_TPL_LIST_ALL }
+
+    let chosen = _vd_resolve_clarify_selector(lowered, candidates)
+    if len(chosen) > 0 {
+        // Resolved. Clear pending state and dispatch as KIND_PIVOT.
+        // Note: do NOT reset the session here -- the prior FACT/
+        // CONCEPT turn is still useful context for further "more"
+        // / anaphora follow-ups.
+        list_set(session, _VC_SESS_PENDING_KINDS, list_new())
+        list_set(session, _VC_SESS_PENDING_TPL, VC_TPL_UNKNOWN)
+        list_set(session, _VC_SESS_PENDING_ATTEMPTS, 0)
+        list_set(session, _VC_SESS_PENDING_RAW, "")
+        return _vd_pivot_turn(kg, session, raw, pending_tpl, chosen)
+    }
+
+    // Resolution failed. Bump attempts. The semantics is:
+    //   * attempts==1 going in (initial clarify just emitted) -- the
+    //     reply was a non-resolution. Bump to 2 and re-emit. This is
+    //     the operator's "do-over" turn.
+    //   * attempts==2 going in (we already re-clarified once) -- give
+    //     up. Clear pending state, dispatch first-match KIND_PIVOT
+    //     with an apology so the operator gets a usable answer.
+    // The MAX cap is VC_DIALOG_CLARIFY_MAX_ATTEMPTS = 2; we re-emit
+    // when the post-bump count <= MAX and give up when it exceeds.
+    let new_attempts = attempts + 1
+    if new_attempts <= VC_DIALOG_CLARIFY_MAX_ATTEMPTS {
+        // Reduced-patience re-clarify. Same candidates; bump counter.
+        list_set(session, _VC_SESS_PENDING_ATTEMPTS, new_attempts)
+        let q = _vd_render_clarify_question(candidates)
+        let prompt = "Please answer with the kind name. " + q
+        push(result, prompt)
+        push(result, session)
+        return result
+    }
+
+    // attempts > MAX: give up. Clear pending state, route as PIVOT
+    // with an apologetic dispatch against the FIRST candidate (so
+    // the operator gets a real result rather than only an apology).
+    // Record the give-up turn in history via _vd_pivot_turn (which
+    // appends its own turn entry).
+    let first_kind = candidates[0]
+    let apology = "Sorry, I could not tell which kind you meant. Showing "
+        + first_kind + " atoms by default."
+    list_set(session, _VC_SESS_PENDING_KINDS, list_new())
+    list_set(session, _VC_SESS_PENDING_TPL, VC_TPL_UNKNOWN)
+    list_set(session, _VC_SESS_PENDING_ATTEMPTS, 0)
+    list_set(session, _VC_SESS_PENDING_RAW, "")
+    // Dispatch the resolution as KIND_PIVOT (first match) but stitch
+    // the apology onto the front so the operator sees BOTH the
+    // give-up explanation and the resulting answer in one response.
+    let kp_result = _vd_pivot_turn(kg, session, raw, pending_tpl, first_kind)
+    let kp_text = vc_session_result_text(kp_result)
+    let kp_sess = vc_session_result_session(kp_result)
+    push(result, apology + " " + kp_text)
+    push(result, kp_sess)
+    return result
+}
+
+// Pivot fresh turn -- same as _vd_fresh_turn but ALWAYS records the
+// turn in history (even on UNKNOWN parse). The pivot turn is a notable
+// state event -- the operator clearly shifted topic; we want to see it
+// in the transcript even if R25B's parser can't make sense of "cats".
+fn _vd_pivot_fresh_turn(kg, session, raw, text_to_parse) {
+    let result = list_new()
+    let parsed = vc_parse_question(text_to_parse)
+    let tpl = vc_parsed_template(parsed)
+    if tpl == VC_TPL_UNKNOWN {
+        // Record the pivot turn even though we don't have a query for
+        // it -- the operator's topic shift is itself signal.
+        let apology = vc_format_result(parsed, list_new())
+        let turn = _vc_turn_new(raw, parsed, list_new())
+        _vc_append_turn(session, turn)
+        // last_tpl stays UNKNOWN, last_kind stays "", last_ids empty,
+        // last_limit reset (it was reset before we got here).
+        push(result, apology)
+        push(result, session)
+        return result
+    }
+    let sparql = vc_build_sparql(parsed)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    let answer = ""
+    if _qry_is_error(bindings) == 1 {
+        answer = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, answer)
+        push(result, session)
+        return result
+    }
+    answer = vc_format_result(parsed, bindings)
+    let ids = _vc_extract_ids(parsed, bindings)
+    let turn = _vc_turn_new(raw, parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, tpl)
+    list_set(session, _VC_SESS_KIND, vc_parsed_kind(parsed))
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// Run a fresh-turn parse + execute + format. `raw` is the verbatim
+// transcript (for history); `text_to_parse` is what gets fed to the
+// R25B parser (might be the remainder after a topic-shift marker).
+fn _vd_fresh_turn(kg, session, raw, text_to_parse) {
+    let result = list_new()
+    let parsed = vc_parse_question(text_to_parse)
+    let tpl = vc_parsed_template(parsed)
+    if tpl == VC_TPL_UNKNOWN {
+        let apology = vc_format_result(parsed, list_new())
+        // Don't fold UNKNOWN turns into history: they don't establish
+        // referential context, and folding them would push useful
+        // earlier turns out of the 5-cap. R25B already says "I do not
+        // know how to answer that question.".
+        push(result, apology)
+        push(result, session)
+        return result
+    }
+    let sparql = vc_build_sparql(parsed)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    let answer = ""
+    if _qry_is_error(bindings) == 1 {
+        answer = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, answer)
+        push(result, session)
+        return result
+    }
+    answer = vc_format_result(parsed, bindings)
+    let ids = _vc_extract_ids(parsed, bindings)
+    let turn = _vc_turn_new(raw, parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, tpl)
+    list_set(session, _VC_SESS_KIND, vc_parsed_kind(parsed))
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// "Tell me more" -- escalate the LIMIT and re-run LIST_ALL on the prior
+// kind. If the prior turn was WHAT_IS or HOW_MANY, we still pivot to
+// LIST_ALL because "more" means "show me the rows".
+fn _vd_more_turn(kg, session, raw) {
+    let result = list_new()
+    let last_kind = vc_session_last_kind(session)
+    let last_limit = vc_session_last_limit(session)
+    let new_limit = last_limit * 2
+    if new_limit > VC_DIALOG_LIMIT_CAP { new_limit = VC_DIALOG_LIMIT_CAP }
+    let sparql = "SELECT ?a WHERE { ?a kind " + last_kind
+        + " . } LIMIT " + int_to_str(new_limit)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    if _qry_is_error(bindings) == 1 {
+        let err = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, err)
+        push(result, session)
+        return result
+    }
+    // Format as if it were a LIST_ALL turn (synthesise a parsed record).
+    let fake_parsed = list_new()
+    push(fake_parsed, VC_TPL_LIST_ALL)
+    push(fake_parsed, last_kind)
+    let answer = vc_format_result(fake_parsed, bindings)
+    let ids = _vc_extract_ids(fake_parsed, bindings)
+    let turn = _vc_turn_new(raw, fake_parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, VC_TPL_LIST_ALL)
+    list_set(session, _VC_SESS_KIND, last_kind)
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, new_limit)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// "describe it" / "the second one" -- run a WHAT_IS on a SPECIFIC atom
+// id. Because R15D's WHAT_IS query keys on the KIND (not the id), we
+// special-case the formatter here: we emit the id directly without
+// re-running the KG. This is honest because we already saw that id in
+// the prior turn (it survived the KG executor); the user is asking us
+// to remember it, not look it up again.
+fn _vd_describe_turn(kg, session, raw, atom_id) {
+    let result = list_new()
+    let last_kind = vc_session_last_kind(session)
+    let answer = "That " + last_kind + " atom has id " + int_to_str(atom_id) + "."
+    // Synthesise a turn entry: we treat this as a WHAT_IS that returns
+    // exactly one binding row with ?atom = atom_id, so the "describe it"
+    // chain works -- subsequent "tell me about it" still resolves to
+    // the same id.
+    let row = list_new()
+    let entry = list_new()
+    push(entry, "atom")
+    push(entry, atom_id)
+    push(row, entry)
+    let bindings = list_new()
+    push(bindings, row)
+    let fake_parsed = list_new()
+    push(fake_parsed, VC_TPL_WHAT_IS)
+    push(fake_parsed, last_kind)
+    let ids = list_new()
+    push(ids, atom_id)
+    let turn = _vc_turn_new(raw, fake_parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, VC_TPL_WHAT_IS)
+    list_set(session, _VC_SESS_KIND, last_kind)
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// "what about CONCEPT" / "and FACT" -- reuse prior template with new
+// kind. We resynthesise a SPARQL with the new kind + run it.
+fn _vd_pivot_turn(kg, session, raw, tpl, new_kind) {
+    let result = list_new()
+    let parsed = list_new()
+    push(parsed, tpl)
+    push(parsed, new_kind)
+    let sparql = vc_build_sparql(parsed)
+    let bindings = kg_query_compile_and_run(kg, sparql)
+    if _qry_is_error(bindings) == 1 {
+        let err = "I had trouble looking that up: "
+            + qry_error_message(bindings) + "."
+        push(result, err)
+        push(result, session)
+        return result
+    }
+    let answer = vc_format_result(parsed, bindings)
+    let ids = _vc_extract_ids(parsed, bindings)
+    let turn = _vc_turn_new(raw, parsed, ids)
+    _vc_append_turn(session, turn)
+    list_set(session, _VC_SESS_TPL, tpl)
+    list_set(session, _VC_SESS_KIND, new_kind)
+    list_set(session, _VC_SESS_IDS, ids)
+    list_set(session, _VC_SESS_LIMIT, VC_DIALOG_LIMIT_BASE)
+    push(result, answer)
+    push(result, session)
+    return result
+}
+
+// ---- public result accessors ---------------------------------------------
+
+fn vc_session_result_text(r)     { return r[0] }
+fn vc_session_result_session(r)  { return r[1] }
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/dialog <wav>` admin command -- multi-turn cousin of R25B's
+// `/converse`. Session lives in a module-level slot so successive
+// calls share state; `/dialog reset` clears it.
+//
+// The chat wires this with a single dispatch line + an existing
+// `_dialog_session` slot in `crossengin_chat.nova`. We deliberately
+// expose the wrapper as `vc_dialog_run(kg, arg)` so the chat-side
+// addition is one line (mirrors `vc_converse_run`'s shape).
+
+let _vc_default_session = 0
+
+fn _vc_get_default_session() {
+    if _vc_default_session == 0 {
+        _vc_default_session = vc_session_new()
+    }
+    return _vc_default_session
+}
+
+// Resolve a transcript from a WAV path via the R25B STT seam. Returns
+// [transcript_text, error_message, confidence_milli]. Empty error =>
+// transcript usable; non-empty error => caller should bail with an
+// apology. R34D appends the confidence_milli slot so callers can plumb
+// it into the dialog policy via `vc_session_turn_with_confidence`. The
+// confidence is 0 on any STT-error path (matching the seam's
+// `STT_CONFIDENCE_NONE` contract).
+fn _vd_transcribe_wav(wav_path) {
+    let seam = stt_seam_new()
+    let triple = stt_transcribe_wav(seam, wav_path)
+    let r = list_new()
+    let err = stt_result_error(triple)
+    let txt = stt_result_transcript(triple)
+    let conf = stt_result_confidence(triple)
+    if len(err) > 0 {
+        push(r, "")
+        push(r, "I could not hear you. Speech recognition failed: " + err + ".")
+        push(r, 0)
+        return r
+    }
+    if str_eq(txt, VC_STT_PLACEHOLDER_1) == 1 {
+        push(r, "")
+        push(r, "I could not hear you. No speech-to-text backend is available.")
+        push(r, 0)
+        return r
+    }
+    if str_eq(txt, VC_STT_PLACEHOLDER_2) == 1 {
+        push(r, "")
+        push(r, "I could not hear you. No speech-to-text backend is installed.")
+        push(r, 0)
+        return r
+    }
+    push(r, txt)
+    push(r, "")
+    push(r, conf)
+    return r
+}
+
+// Chat-facing wrapper. arg is either "reset" (drops session) or a WAV
+// path (full STT -> dialog turn -> TTS roundtrip). The function returns
+// a single status string for io_println to surface.
+fn vc_dialog_run(kg, arg) {
+    let trimmed = _vd_trim(arg)
+    if len(trimmed) == 0 {
+        return "(/dialog needs a WAV path or 'reset' -- usage: /dialog /tmp/q.wav or /dialog reset)"
+    }
+    let lowered = _vd_lower(trimmed)
+    if str_eq(lowered, "reset") == 1 {
+        let s = _vc_get_default_session()
+        vc_session_reset(s)
+        return "(dialog session reset; history cleared)"
+    }
+    let session = _vc_get_default_session()
+    let trans = _vd_transcribe_wav(trimmed)
+    let txt = trans[0]
+    let err = trans[1]
+    let conf = trans[2]
+    if len(err) > 0 {
+        // STT failure -- TTS the apology, return status.
+        let path = "/tmp/ce_vc_response.wav"
+        let env = getenv("CE_VC_RESPONSE_PATH")
+        if env != 0 {
+            if len(env) > 0 { path = env }
+        }
+        let wav = tts_speak(err, VC_TTS_SAMPLE_RATE)
+        let ok = tts_save_wav(wav, path)
+        let pstat = "no-wav"
+        if ok == 1 { pstat = "wrote " + path }
+        return "(dialog heard+answered '" + err + "' [" + pstat
+            + "] turn=" + int_to_str(vc_session_turn_count(session)) + ")"
+    }
+    // R34D: route through the confidence-aware path so a low-confidence
+    // transcript yields the clarify question rather than acting on a
+    // probably-misheard string. Pre-R34D code paths reading
+    // `vc_session_turn` directly are unchanged; only this wrapper opts
+    // into the gate.
+    let r = vc_session_turn_with_confidence(kg, session, txt, conf)
+    let answer = vc_session_result_text(r)
+    let path = "/tmp/ce_vc_response.wav"
+    let env = getenv("CE_VC_RESPONSE_PATH")
+    if env != 0 {
+        if len(env) > 0 { path = env }
+    }
+    let wav = tts_speak(answer, VC_TTS_SAMPLE_RATE)
+    let ok = tts_save_wav(wav, path)
+    let pstat = "no-wav"
+    if ok == 1 { pstat = "wrote " + path }
+    return "(dialog heard+answered '" + answer + "' [" + pstat
+        + "] turn=" + int_to_str(vc_session_turn_count(session)) + ")"
+}
+
+// ---- honest scope notes (R25B.3 / R25B.4 / R25B.5 / R25B.6 list) --------
+//
+// What this layer does NOT do (deferred to R25B.7+):
+//   * Real label lookup -- "describe it" returns "atom has id 42"; we
+//     don't dereference 42 back to its human-readable label. The R15D
+//     binding format uses an int hash for labels; a label-int -> string
+//     reverse-lookup table would let us speak "atom labelled foo".
+//   * Cross-session anaphora -- "him" / "her" / "it" resolve to the
+//     SAME first id (no gender / number tracking). NOVA has no NLP
+//     packages; even a tiny dictionary would inflate the module
+//     considerably.
+//   * Multi-kind ambiguous remainder -- CLOSED IN R25B.6 via the
+//     CLARIFY classifier output + pending-clarify session slot +
+//     kind-selector parser. The "first kind wins" honest scope from
+//     R25B.5 now only applies when CE_VOICE_NO_CLARIFY=1 (opt-out
+//     env preserved for byte-identical R31F compatibility). See the
+//     "R25B.6 design caveats" block below for the residual edges.
+//   * Sarcasm / hedge detection -- "I'm not sure but tell me about X"
+//     and "tell me about X" are treated identically.
+//   * Coreference chains -- "X is foo. Tell me about it. And about
+//     bar." -- "bar" doesn't propagate as a new antecedent for the
+//     next "tell me about it". Each turn updates last_ids based on
+//     the LAST resolved entity.
+//   * Conversational repair -- "no, the OTHER one" is not handled;
+//     the operator has to say "the second one" / "the third one"
+//     explicitly.
+//   * Prosody tracking -- the dialog layer treats every transcript
+//     as flat declarative; a real system would use rising tones on
+//     questions to disambiguate from statements.
+//
+// R25B.6 design caveats (multi-kind clarify):
+//
+//   * Clarify-attempt counter persists across topic shifts when the
+//     user PIVOTS during ambiguity. Explicit topic-shift markers
+//     ("actually" / "never mind") DO clear pending state via
+//     `vc_session_reset`, but a more-cue PIVOT that lands mid-
+//     ambiguity (e.g. operator answers "tell me about cats" to a
+//     RULE/FACT clarify) is processed as a non-resolution and bumps
+//     the attempt counter rather than restarting the ambiguity
+//     budget. Mostly benign -- the give-up path still emits a
+//     useful answer + apology after 2 turns -- but a 3-turn FACT ->
+//     CLARIFY -> "actually CONCEPT" interaction will lose the
+//     attempt counter due to the reset, which is the correct
+//     semantic but worth flagging.
+//   * "both" / "either" / "all" maps to the FIRST candidate kind via
+//     `_vd_is_both_selector`. Documented; rationale (chose this over
+//     a multi-dispatch return shape) lives in the comment block at
+//     the top of `_vd_handle_pending_clarify`. The operator can still
+//     get the second kind by following up with "what about KIND2"
+//     on the resolution turn.
+//   * Mid-clarify operator response that names a THIRD known kind
+//     ("tell me more about CONCEPT" while RULE/FACT are pending)
+//     does NOT re-classify through the multi-kind detector. We
+//     treat it as a non-resolution + bump the attempt counter.
+//     Documented in `_vd_handle_pending_clarify`'s comment block.
+//   * Single-kind clarify is degenerate by design -- the classifier
+//     only emits CLARIFY when 2+ candidates appear. A
+//     `_vd_render_clarify_question` call with len(candidates)==1
+//     still returns a valid string ("Did you mean RULE atoms?") but
+//     no in-tree path drives that branch; it's defensive.
+//
+// What it DOES demonstrate: stateful conversation on top of a
+// stateless cognitive substrate. The KG is unchanged; the dialog
+// layer is a thin (~700 line incl. R32F's clarify state machine)
+// rewriter sitting in front of R25B's parser / executor / formatter.

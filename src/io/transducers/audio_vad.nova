@@ -1,0 +1,678 @@
+// CrossEngin io/transducers: Voice Activity Detection (R7F).
+//
+// Purpose
+//   Inserts a VAD layer between `audio_capture.nova` (WAV/PCM ingest) and
+//   `stt_seam.nova` (transcription dispatch) so STT only sees frames that
+//   plausibly contain speech. Three wins:
+//
+//     1. **STT compute reduction.** Silence frames are dropped before they
+//        reach the backend; on a 5-second utterance with 60% silence, the
+//        STT call sees ~40% of the samples.
+//     2. **False-transcript reduction.** Pure silence in -> "[stt: input
+//        wav missing]" or the placeholder out is a real failure mode the
+//        stub backend has no signal to suppress; VAD short-circuits.
+//     3. **Segment boundaries.** SPEECH_START / SPEECH_END events let the
+//        chat (or any downstream consumer) chunk on real utterance
+//        boundaries -- no fixed 5-second windowing artifacts.
+//
+//   Algorithm: energy + zero-crossing-rate combined.
+//
+//     Per ~30 ms frame (240 samples @ 8 kHz, 480 samples @ 16 kHz):
+//       energy = sum( |sample| )                 -- variance proxy; sum of
+//                                                  absolutes avoids the
+//                                                  64-bit overflow / NOVA
+//                                                  pointer-threshold risk
+//                                                  of sum-of-squares.
+//       zcr    = count of sign flips             -- count adjacent samples
+//                                                  where sign changes.
+//                                                  Voiced speech: moderate.
+//                                                  Unvoiced fricatives:
+//                                                  high. Silence / pure
+//                                                  tones: low.
+//
+//     A frame is "speech" iff energy > E_THRESH AND zcr < ZCR_MAX. The
+//     ZCR ceiling rejects high-energy white noise (which has very high
+//     ZCR -- ~half the samples flip sign in pure-random noise).
+//
+//   State machine (hysteresis -- avoids flapping on per-frame edge cases):
+//
+//     SILENCE          --speech frame-->  SPEECH_CANDIDATE
+//     SPEECH_CANDIDATE --K speech in a row--> SPEECH (emit SPEECH_START)
+//     SPEECH_CANDIDATE --silence frame--> SILENCE
+//     SPEECH           --silence frame--> SILENCE_CANDIDATE
+//     SILENCE_CANDIDATE --M silence in a row--> SILENCE (emit SPEECH_END)
+//     SILENCE_CANDIDATE --speech frame--> SPEECH
+//
+//     Defaults: K=3 (need ~90 ms speech to commit), M=10 (need ~300 ms
+//     silence to release). These match the brief and the practical
+//     human-speech hysteresis empirically used by webrtcvad / Silero
+//     in aggressive-mode 1-2.
+//
+//   Sample rates supported: any rate in [8000..48000]. Frame size is
+//   computed as sample_rate * 30 / 1000 -- 240 / 480 / 720 / 1440 / etc.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- audio input chain).
+// NOVA dependencies: builtins -- alloc, list_new, push, list_set, len.
+//   No syscalls in the hot path (the module is pure -- caller does I/O).
+// CrossEngin dependencies: none (intentional -- leaf module so tests can
+//   exercise the VAD without dragging audio_capture or stt_seam into the
+//   unit compilation unit).
+
+// ---- frame / threshold constants ------------------------------------------
+
+// Frame duration in milliseconds. 30 ms is the webrtcvad / Silero standard.
+let VAD_FRAME_MS = 30
+
+// Hysteresis thresholds. K = SPEECH_CANDIDATE -> SPEECH commit count;
+// M = SILENCE_CANDIDATE -> SILENCE commit count.
+let VAD_K_SPEECH  = 3       // ~90 ms confirmation -- speech ON
+let VAD_M_SILENCE = 10      // ~300 ms confirmation -- speech OFF
+
+// Energy threshold: sum-of-absolutes per frame.
+// Default tuned for an 8 kHz / 240-sample frame with PCM16 samples:
+//   * silence baseline (LCG noise floor at +/-50): ~50 * 240 = 12000.
+//   * vowel (peak +/-4000-8000, RMS-proxy ~3000): ~3000 * 240 = 720000.
+//   * The threshold lives well between those; 50000 is a 4x margin over
+//     the noisiest silence baseline we've observed in tests.
+// Per-frame: scales with sample_rate (more samples -> higher sum), so the
+// state struct stores a scaled version of this baseline.
+//
+// R9B note: this is now the FLOOR of the adaptive threshold -- the
+// actual effective threshold is max(3 * noise_floor, this floor). The
+// floor still wins when the noise floor is low (synthetic test fixtures
+// with pure-zero silence, or whisper.cpp's bundled JFK WAV which has a
+// clean leading silence), but the adaptive multiplier kicks in for
+// real-mic recordings where the noise floor sits well above zero (USB
+// mic preamp noise, room HVAC, distant PA bleed).
+let VAD_ENERGY_BASE_8K = 50000
+
+// ZCR ceiling. Frames with ZCR above this look like white noise, not
+// speech. White noise: ~50% of samples flip sign -> ZCR ~= n/2. Speech:
+// voiced ~10-20%, unvoiced fricatives ~25-35%. Threshold at 40% gives
+// a safety margin between unvoiced consonants and pure noise.
+// Per-frame: scales with frame_size, so state struct stores the
+// per-frame integer count derived from this percent.
+let VAD_ZCR_MAX_PCT = 40
+
+// ZCR floor for "is this actually a signal, not DC?". Pure silence has
+// zero crossings only from noise floor flicker; pure tones near DC have
+// very few. We don't currently require zcr >= floor (the energy gate
+// already rejects DC), but we expose the constant so a future revision
+// could add it without touching the public surface.
+let VAD_ZCR_MIN_PCT = 1
+
+// Sample-rate clamp -- matches stt_seam_pcm's range.
+let VAD_RATE_MIN = 8000
+let VAD_RATE_MAX = 48000
+
+// R9B: adaptive energy threshold (Option A from the threshold-tuning brief).
+//
+// Calibration window: ~500 ms of leading audio is used to estimate the
+// noise floor (the minimum frame energy in that window). 500 ms /
+// 30 ms-per-frame ~= 16-17 frames; we round to 16 for a clean integer
+// even when the buffer is short.
+//
+// Multiplier: the effective energy threshold becomes
+//   max(VAD_ENERGY_BASE_8K_scaled, noise_floor * VAD_NOISE_MULT).
+//
+// 3x is the classical "speech runs ~10-30 dB above the room noise floor"
+// rule of thumb; webrtcvad and Silero use similar ratios (Silero's "very
+// permissive" mode is ~2x; "aggressive" is ~4x). We pick 3 as a
+// compromise: catches conversational-volume utterances on a USB mic
+// pre-amp while still rejecting fan noise and HVAC rumble.
+//
+// The hard floor (VAD_ENERGY_BASE_8K_scaled) prevents the adaptive
+// path from collapsing to 0 on a buffer that happens to start with
+// exact-zero samples (synthesized fixtures + whisper.cpp's bundled
+// jfk.wav both have an exact-silent lead-in). With noise_floor=0
+// the adaptive path would otherwise classify ANY non-zero frame as
+// speech, regressing the R7F low-amp-triangle rejection test.
+let VAD_NOISE_CALIB_FRAMES = 16
+let VAD_NOISE_MULT         = 3
+
+// ---- state machine codes --------------------------------------------------
+
+let VAD_STATE_SILENCE          = 0
+let VAD_STATE_SPEECH_CANDIDATE = 1
+let VAD_STATE_SPEECH           = 2
+let VAD_STATE_SILENCE_CANDIDATE = 3
+
+// Per-frame event codes returned by `vad_process_frame`.
+let VAD_EVENT_NONE         = 0
+let VAD_EVENT_SPEECH_START = 1
+let VAD_EVENT_SPEECH_END   = 2
+
+// ---- state struct layout --------------------------------------------------
+// Shape (parallels stt_seam_new / audio_capture_state_new):
+//   [0] tag             (sentinel: VAD_STATE_TAG)
+//   [1] sample_rate
+//   [2] frame_size      (samples per 30 ms frame)
+//   [3] energy_thresh   (per-frame absolute-sum threshold; live -- the
+//                        adaptive path REWRITES this slot after
+//                        calibration to keep the per-frame classifier
+//                        unchanged; tests that override via
+//                        vad_set_energy_thresh disable adaptive)
+//   [4] zcr_max         (per-frame zero-crossing count ceiling)
+//   [5] machine_state   (one of VAD_STATE_*)
+//   [6] speech_run      (consecutive speech frames seen)
+//   [7] silence_run     (consecutive silence frames seen)
+//   [8] last_event      (VAD_EVENT_* from most recent vad_process_frame call)
+//   [9] frames_total    (counter -- observability)
+//   [10] frames_speech  (counter -- # frames classified speech)
+//   [11] frames_silence (counter -- # frames classified silence)
+//   [12] segments       (list of [start_sample, end_sample] pairs)
+//   [13] cur_seg_start  (sample index where current SPEECH segment opened,
+//                        or -1 if not in a segment)
+//   [14] e_thresh_floor (R9B: hard minimum for the adaptive path -- the
+//                        R7F fixed threshold derived from
+//                        VAD_ENERGY_BASE_8K * frame_size / 240. Adaptive
+//                        calibration may raise the live energy_thresh
+//                        above this floor when the noise floor is high,
+//                        but never lowers it below)
+//   [15] noise_floor    (R9B: per-frame energy of the quietest frame in
+//                        the leading calibration window; 0 if not yet
+//                        calibrated or if the leading audio is exact
+//                        silence)
+//   [16] calibrated     (R9B: 0 = not yet calibrated, 1 = calibration
+//                        already applied. vad_process_pcm auto-calibrates
+//                        when this flag is 0 + adaptive is enabled)
+//   [17] adaptive       (R9B: 1 = adaptive calibration is enabled
+//                        (default), 0 = disabled (e.g. after the test
+//                        explicitly overrode the threshold via
+//                        vad_set_energy_thresh, or after the caller asked
+//                        for fixed-threshold mode via vad_set_adaptive(s, 0)))
+
+let VAD_STATE_TAG = 7401
+
+let V_TAG            = 0
+let V_RATE           = 1
+let V_FRAME_SIZE     = 2
+let V_E_THRESH       = 3
+let V_ZCR_MAX        = 4
+let V_MSTATE         = 5
+let V_SPEECH_RUN     = 6
+let V_SILENCE_RUN    = 7
+let V_LAST_EVENT     = 8
+let V_FRAMES_TOT     = 9
+let V_FRAMES_SP      = 10
+let V_FRAMES_SI      = 11
+let V_SEGMENTS       = 12
+let V_CUR_SEG        = 13
+let V_E_THRESH_FLOOR = 14
+let V_NOISE_FLOOR    = 15
+let V_CALIBRATED     = 16
+let V_ADAPTIVE       = 17
+
+// ---- helpers --------------------------------------------------------------
+
+// Absolute value. NOVA has no abs() builtin; this is a one-liner.
+fn _vad_abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// Sign of `x`: -1, 0, +1. Used by zero-crossing detection. Treating 0 as
+// its own class avoids false ZCR ticks on long stretches of exact zero
+// (which is what _synth_phoneme_silence emits).
+fn _vad_sign(x) {
+    if x > 0 { return 1 }
+    if x < 0 { return 0 - 1 }
+    return 0
+}
+
+// ---- constructor ----------------------------------------------------------
+//
+// vad_state_new(sample_rate) -> state list.
+//   sample_rate clamped to [8000..48000]. frame_size = rate * 30 / 1000.
+//   Thresholds derived from VAD_ENERGY_BASE_8K + VAD_ZCR_MAX_PCT, scaled to
+//   the frame_size so the per-frame integers don't drift across rates.
+//
+//   Test callers can override the thresholds via vad_set_energy_thresh /
+//   vad_set_zcr_max (tighter / looser bounds without touching env).
+
+fn vad_state_new(sample_rate) {
+    let rate = sample_rate
+    if rate < VAD_RATE_MIN { rate = VAD_RATE_MIN }
+    if rate > VAD_RATE_MAX { rate = VAD_RATE_MAX }
+    let frame_size = (rate * VAD_FRAME_MS) / 1000
+
+    // Energy threshold scales linearly with frame_size (sum of |s| grows
+    // with the number of samples). Baseline 50000 is calibrated to a
+    // 240-sample frame; for 480 samples we want ~100000, for 720 we want
+    // ~150000.
+    let e_thresh = (VAD_ENERGY_BASE_8K * frame_size) / 240
+
+    // ZCR ceiling: (frame_size * pct) / 100. 240 samples * 40% = 96.
+    let zcr_max = (frame_size * VAD_ZCR_MAX_PCT) / 100
+
+    let s = list_new()
+    push(s, VAD_STATE_TAG)              // [0]
+    push(s, rate)                       // [1]
+    push(s, frame_size)                 // [2]
+    push(s, e_thresh)                   // [3]
+    push(s, zcr_max)                    // [4]
+    push(s, VAD_STATE_SILENCE)          // [5]
+    push(s, 0)                          // [6] speech_run
+    push(s, 0)                          // [7] silence_run
+    push(s, VAD_EVENT_NONE)             // [8] last_event
+    push(s, 0)                          // [9] frames_total
+    push(s, 0)                          // [10] frames_speech
+    push(s, 0)                          // [11] frames_silence
+    push(s, list_new())                 // [12] segments
+    push(s, 0 - 1)                      // [13] cur_seg_start
+    // R9B: adaptive-threshold fields. The floor mirrors the R7F fixed
+    // threshold; before calibration it equals the live threshold (no
+    // behavior change). After calibration the live threshold is
+    // max(noise_floor * VAD_NOISE_MULT, floor).
+    push(s, e_thresh)                   // [14] e_thresh_floor
+    push(s, 0)                          // [15] noise_floor (uncalibrated)
+    push(s, 0)                          // [16] calibrated flag
+    push(s, 1)                          // [17] adaptive (on by default)
+    return s
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn vad_sample_rate(s)    { return s[V_RATE] }
+fn vad_frame_size(s)     { return s[V_FRAME_SIZE] }
+fn vad_energy_thresh(s)  { return s[V_E_THRESH] }
+fn vad_zcr_max(s)        { return s[V_ZCR_MAX] }
+fn vad_machine_state(s)  { return s[V_MSTATE] }
+fn vad_speech_run(s)     { return s[V_SPEECH_RUN] }
+fn vad_silence_run(s)    { return s[V_SILENCE_RUN] }
+fn vad_last_event(s)     { return s[V_LAST_EVENT] }
+fn vad_frames_total(s)   { return s[V_FRAMES_TOT] }
+fn vad_frames_speech(s)  { return s[V_FRAMES_SP] }
+fn vad_frames_silence(s) { return s[V_FRAMES_SI] }
+fn vad_segments(s)       { return s[V_SEGMENTS] }
+
+// ---- threshold override (tests / tuning) ---------------------------------
+
+// Any explicit threshold override disables adaptive calibration -- the
+// caller has spoken, we don't overwrite their bound on the next
+// vad_process_pcm call. This mirrors R7F's behavior bit-identical: tests
+// that constructed a state, called vad_set_energy_thresh, and then ran
+// per-frame classification still see exactly that override.
+fn vad_set_energy_thresh(s, v) {
+    list_set(s, V_E_THRESH, v)
+    list_set(s, V_ADAPTIVE, 0)
+    list_set(s, V_CALIBRATED, 1)
+    return 1
+}
+
+fn vad_set_zcr_max(s, v) {
+    list_set(s, V_ZCR_MAX, v)
+    return 1
+}
+
+// ---- R9B: adaptive-threshold accessors + tuning hooks --------------------
+//
+// vad_e_thresh_floor(s)   -- the hard minimum (R7F fixed threshold).
+// vad_noise_floor(s)      -- the min frame energy seen in the leading
+//                            calibration window; 0 before calibration.
+// vad_is_calibrated(s)    -- 1 once vad_process_pcm or vad_calibrate_
+//                            noise_floor has run; 0 before.
+// vad_is_adaptive(s)      -- 1 by default; 0 after vad_set_energy_thresh
+//                            or vad_set_adaptive(s, 0).
+//
+// vad_set_adaptive(s, v)  -- explicit opt-in/out for the buffer-level
+//                            entry point. Useful for tests that want to
+//                            assert the floor-only behavior without
+//                            calling vad_set_energy_thresh (which also
+//                            changes the threshold).
+
+fn vad_e_thresh_floor(s) { return s[V_E_THRESH_FLOOR] }
+fn vad_noise_floor(s)    { return s[V_NOISE_FLOOR] }
+fn vad_is_calibrated(s)  { return s[V_CALIBRATED] }
+fn vad_is_adaptive(s)    { return s[V_ADAPTIVE] }
+
+fn vad_set_adaptive(s, v) {
+    let on = 0
+    if v != 0 { on = 1 }
+    list_set(s, V_ADAPTIVE, on)
+    return 1
+}
+
+// ---- R9B: noise-floor calibration ----------------------------------------
+//
+// vad_calibrate_noise_floor(state, samples, max_frames) -> noise_floor
+//
+// Walks up to `max_frames` frames at the START of `samples` (the leading
+// audio, typically the "pre-speech" silence), computes per-frame energy
+// for each, takes the MIN as the noise-floor estimate, then sets the
+// live energy_thresh slot to max(noise_floor * VAD_NOISE_MULT, e_thresh_floor).
+// Marks the state as calibrated.
+//
+// If `samples` is shorter than one frame, no calibration happens and the
+// pre-existing threshold is retained.
+//
+// MIN-not-MEAN was chosen because:
+//   * The classical noise-floor estimator (Rabiner) takes the minimum
+//     spectral or temporal-energy value across a leading window to avoid
+//     biasing the floor upwards if the speaker started talking before
+//     the window ended. A short utterance ("hi") can land entirely
+//     inside the calibration window; MIN still finds the silent frames.
+//   * It preserves the existing tests: synthetic fixtures start with
+//     pure-zero silence, so MIN(window) = 0 -> live threshold falls back
+//     to the floor and behavior matches R7F.
+
+fn vad_calibrate_noise_floor(s, samples, max_frames) {
+    let frame_size = s[V_FRAME_SIZE]
+    let total = len(samples)
+    let avail_frames = total / frame_size
+    let n = max_frames
+    if n > avail_frames { n = avail_frames }
+    if n < 1 {
+        // Nothing to calibrate from; mark as calibrated to avoid a future
+        // re-attempt on the same state.
+        list_set(s, V_CALIBRATED, 1)
+        return s[V_NOISE_FLOOR]
+    }
+    let i = 0
+    let off = 0
+    let min_e = 0
+    while i < n {
+        let e = vad_frame_energy(samples, off, frame_size)
+        if i == 0 { min_e = e }
+        if e < min_e { min_e = e }
+        i = i + 1
+        off = off + frame_size
+    }
+    list_set(s, V_NOISE_FLOOR, min_e)
+    // Effective threshold: max(noise_floor * mult, floor).
+    let candidate = min_e * VAD_NOISE_MULT
+    let floor = s[V_E_THRESH_FLOOR]
+    let live = candidate
+    if floor > live { live = floor }
+    list_set(s, V_E_THRESH, live)
+    list_set(s, V_CALIBRATED, 1)
+    return min_e
+}
+
+// ---- frame analysis (pure helpers, no state) ----------------------------
+//
+// vad_frame_energy(samples, off, n) -> int
+//   Sum of absolute values across `samples[off..off+n]`. Bounds-checked:
+//   if off+n exceeds len(samples), the loop stops at the list end.
+//
+// vad_frame_zcr(samples, off, n) -> int
+//   Number of sign flips in `samples[off..off+n]`. Treats 0 as its own
+//   class so a long run of exact zero doesn't produce phantom crossings.
+
+fn vad_frame_energy(samples, off, n) {
+    let total = len(samples)
+    let end = off + n
+    if end > total { end = total }
+    let i = off
+    let sum = 0
+    while i < end {
+        sum = sum + _vad_abs(samples[i])
+        i = i + 1
+    }
+    return sum
+}
+
+fn vad_frame_zcr(samples, off, n) {
+    let total = len(samples)
+    let end = off + n
+    if end > total { end = total }
+    if end - off < 2 { return 0 }
+    let i = off + 1
+    let count = 0
+    let prev_sign = _vad_sign(samples[off])
+    while i < end {
+        let cur_sign = _vad_sign(samples[i])
+        // A crossing is a sign change from + to - or - to +.
+        // (sign 0 -> sign +/- is NOT a crossing; sign +/- -> sign 0 is NOT
+        // a crossing either; this is the classical webrtcvad convention.)
+        if prev_sign != 0 {
+            if cur_sign != 0 {
+                if prev_sign != cur_sign { count = count + 1 }
+            }
+        }
+        if cur_sign != 0 { prev_sign = cur_sign }
+        i = i + 1
+    }
+    return count
+}
+
+// ---- frame classification ------------------------------------------------
+//
+// vad_classify_frame(state, energy, zcr) -> 1 (speech) | 0 (silence)
+//
+// A frame is speech iff energy > threshold AND zcr is in (0, zcr_max).
+// The strict-greater on energy avoids classifying exactly-baseline frames
+// (a silent buffer with energy == 0 < threshold == 50000) as speech.
+
+fn vad_classify_frame(s, energy, zcr) {
+    if energy <= s[V_E_THRESH] { return 0 }
+    if zcr >= s[V_ZCR_MAX] { return 0 }
+    return 1
+}
+
+// ---- state machine -------------------------------------------------------
+//
+// _vad_advance(state, is_speech, sample_index) -> event code
+//
+// Walks the four-state machine once. `sample_index` is the global sample
+// offset where this frame STARTS (used to record segment boundaries).
+// Returns VAD_EVENT_NONE / _SPEECH_START / _SPEECH_END.
+
+fn _vad_advance(s, is_speech, sample_index) {
+    let state = s[V_MSTATE]
+    let event = VAD_EVENT_NONE
+
+    // SILENCE
+    if state == VAD_STATE_SILENCE {
+        if is_speech == 1 {
+            list_set(s, V_MSTATE, VAD_STATE_SPEECH_CANDIDATE)
+            list_set(s, V_SPEECH_RUN, 1)
+            list_set(s, V_SILENCE_RUN, 0)
+        } else {
+            // already silent -- just bump the counter so a future SPEECH_END
+            // path can introspect run length if needed.
+            list_set(s, V_SILENCE_RUN, s[V_SILENCE_RUN] + 1)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    // SPEECH_CANDIDATE
+    if state == VAD_STATE_SPEECH_CANDIDATE {
+        if is_speech == 1 {
+            let new_run = s[V_SPEECH_RUN] + 1
+            list_set(s, V_SPEECH_RUN, new_run)
+            if new_run >= VAD_K_SPEECH {
+                // Commit -- segment opens K frames BACK, at the first
+                // candidate frame, so the SPEECH_START sample index points
+                // to where the speech actually began (not where we
+                // confirmed it).
+                let frame_size = s[V_FRAME_SIZE]
+                let seg_start = sample_index - (VAD_K_SPEECH - 1) * frame_size
+                if seg_start < 0 { seg_start = 0 }
+                list_set(s, V_CUR_SEG, seg_start)
+                list_set(s, V_MSTATE, VAD_STATE_SPEECH)
+                list_set(s, V_SILENCE_RUN, 0)
+                event = VAD_EVENT_SPEECH_START
+            }
+        } else {
+            // Single noisy frame -- abandon candidate, go back to SILENCE.
+            list_set(s, V_MSTATE, VAD_STATE_SILENCE)
+            list_set(s, V_SPEECH_RUN, 0)
+            list_set(s, V_SILENCE_RUN, 1)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    // SPEECH
+    if state == VAD_STATE_SPEECH {
+        if is_speech == 1 {
+            list_set(s, V_SPEECH_RUN, s[V_SPEECH_RUN] + 1)
+            list_set(s, V_SILENCE_RUN, 0)
+        } else {
+            list_set(s, V_MSTATE, VAD_STATE_SILENCE_CANDIDATE)
+            list_set(s, V_SILENCE_RUN, 1)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    // SILENCE_CANDIDATE
+    if state == VAD_STATE_SILENCE_CANDIDATE {
+        if is_speech == 0 {
+            let new_run = s[V_SILENCE_RUN] + 1
+            list_set(s, V_SILENCE_RUN, new_run)
+            if new_run >= VAD_M_SILENCE {
+                // Commit -- segment closes M frames BACK (at the last
+                // SPEECH frame). The segment end-sample is sample_index
+                // minus the silent stretch that triggered the close.
+                let frame_size = s[V_FRAME_SIZE]
+                let seg_end = sample_index - (VAD_M_SILENCE - 1) * frame_size
+                if seg_end < 0 { seg_end = 0 }
+                let cur_start = s[V_CUR_SEG]
+                if cur_start >= 0 {
+                    let segs = s[V_SEGMENTS]
+                    let pair = list_new()
+                    push(pair, cur_start)
+                    push(pair, seg_end)
+                    push(segs, pair)
+                }
+                list_set(s, V_CUR_SEG, 0 - 1)
+                list_set(s, V_MSTATE, VAD_STATE_SILENCE)
+                list_set(s, V_SPEECH_RUN, 0)
+                event = VAD_EVENT_SPEECH_END
+            }
+        } else {
+            // Speech came back -- abandon silence candidate.
+            list_set(s, V_MSTATE, VAD_STATE_SPEECH)
+            list_set(s, V_SPEECH_RUN, s[V_SPEECH_RUN] + 1)
+            list_set(s, V_SILENCE_RUN, 0)
+        }
+        list_set(s, V_LAST_EVENT, event)
+        return event
+    }
+
+    list_set(s, V_LAST_EVENT, event)
+    return event
+}
+
+// ---- public frame processor ----------------------------------------------
+//
+// vad_process_frame(state, samples, off, n) -> event code
+//   Compute energy + zcr, classify, advance state machine. Updates the
+//   counters in the state struct. Returns one of VAD_EVENT_*.
+
+fn vad_process_frame(s, samples, off, n) {
+    let energy = vad_frame_energy(samples, off, n)
+    let zcr = vad_frame_zcr(samples, off, n)
+    let is_speech = vad_classify_frame(s, energy, zcr)
+
+    list_set(s, V_FRAMES_TOT, s[V_FRAMES_TOT] + 1)
+    if is_speech == 1 {
+        list_set(s, V_FRAMES_SP, s[V_FRAMES_SP] + 1)
+    } else {
+        list_set(s, V_FRAMES_SI, s[V_FRAMES_SI] + 1)
+    }
+    return _vad_advance(s, is_speech, off)
+}
+
+// ---- buffer processor ----------------------------------------------------
+//
+// vad_process_pcm(state, samples) -> list of [start, end] pairs
+//   Walks the PCM buffer in frame_size chunks, runs each through
+//   vad_process_frame. Tail (less than frame_size samples) is dropped.
+//   After processing every frame, if we're still inside a SPEECH or
+//   SILENCE_CANDIDATE segment, flush it -- close the segment at the end
+//   of the buffer.
+//
+//   Returns the seg-pair list (also accessible via vad_segments(state)).
+
+fn vad_process_pcm(s, samples) {
+    // R9B: auto-calibrate the noise floor from the leading window before
+    // any per-frame classification. The MIN-over-window estimator falls
+    // through to the existing R7F fixed floor when the leading samples
+    // are exact zero (synthetic fixtures, whisper.cpp's jfk.wav), so all
+    // R7F test fixtures stay bit-identical. Real-mic recordings whose
+    // noise floor sits well above zero get their threshold proportionally
+    // raised, eliminating false positives from steady-state preamp noise.
+    if s[V_ADAPTIVE] == 1 {
+        if s[V_CALIBRATED] == 0 {
+            vad_calibrate_noise_floor(s, samples, VAD_NOISE_CALIB_FRAMES)
+        }
+    }
+    let frame_size = s[V_FRAME_SIZE]
+    let total = len(samples)
+    let off = 0
+    while off + frame_size <= total {
+        vad_process_frame(s, samples, off, frame_size)
+        off = off + frame_size
+    }
+    _vad_flush(s, off)
+    return s[V_SEGMENTS]
+}
+
+// _vad_flush(state, end_sample): if a segment is currently open
+// (SPEECH or SILENCE_CANDIDATE with a cur_seg_start >= 0), close it at
+// end_sample and emit SPEECH_END. Otherwise no-op.
+
+fn _vad_flush(s, end_sample) {
+    let state = s[V_MSTATE]
+    if state != VAD_STATE_SPEECH {
+        if state != VAD_STATE_SILENCE_CANDIDATE {
+            return 0
+        }
+    }
+    let cur_start = s[V_CUR_SEG]
+    if cur_start < 0 { return 0 }
+    let segs = s[V_SEGMENTS]
+    let pair = list_new()
+    push(pair, cur_start)
+    push(pair, end_sample)
+    push(segs, pair)
+    list_set(s, V_CUR_SEG, 0 - 1)
+    list_set(s, V_MSTATE, VAD_STATE_SILENCE)
+    list_set(s, V_SPEECH_RUN, 0)
+    list_set(s, V_SILENCE_RUN, 0)
+    list_set(s, V_LAST_EVENT, VAD_EVENT_SPEECH_END)
+    return 1
+}
+
+// ---- VAD filter: PCM-in -> filtered-PCM-out -----------------------------
+//
+// vad_filter_pcm(state, samples) -> filtered PCM list (speech only).
+//   Runs vad_process_pcm; then returns a new list containing only the
+//   samples inside speech segments. Concatenates segments back-to-back so
+//   the resulting buffer is a continuous "all speech" PCM stream suitable
+//   for handing to stt_transcribe.
+//
+//   If the input has no detected speech, returns an empty list.
+
+fn vad_filter_pcm(s, samples) {
+    vad_process_pcm(s, samples)
+    let segs = s[V_SEGMENTS]
+    let out = list_new()
+    let n = len(segs)
+    let total = len(samples)
+    let si = 0
+    while si < n {
+        let pair = segs[si]
+        let start = pair[0]
+        let end = pair[1]
+        if start < 0 { start = 0 }
+        if end > total { end = total }
+        let j = start
+        while j < end {
+            push(out, samples[j])
+            j = j + 1
+        }
+        si = si + 1
+    }
+    return out
+}
+
+// ---- segment-pair accessors -----------------------------------------------
+
+fn vad_segment_start(pair) { return pair[0] }
+fn vad_segment_end(pair)   { return pair[1] }
+fn vad_segment_count(s)    { return len(s[V_SEGMENTS]) }

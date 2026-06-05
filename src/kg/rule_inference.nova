@@ -1,0 +1,1117 @@
+// CrossEngin knowledge: forward-chaining rule inference over the KG (R20B).
+//
+// Purpose
+//   The KG has many READ paths: exact lookup (atom_store.kg_find_atom),
+//   episodic recall (R6F+R8F), TF-IDF semantic search (R10C), LSH ANN
+//   (P3.4), LPA clustering (R11F), Louvain (R12C), PageRank (R13E),
+//   declarative mini-SPARQL queries (R15D+R16F+R17E), link prediction
+//   (R18B), and Allen temporal reasoning (R19C). What was missing is
+//   DECLARATIVE INFERENCE: a substrate-internal Datalog-style rule
+//   engine that DERIVES new facts (atoms / links) from existing ones
+//   by iterating to fixpoint.
+//
+//   The classical pattern -- transitive closure of `parent` to compute
+//   `ancestor` -- is the canonical motivating example. Operators write
+//   rules in mini-Datalog surface syntax:
+//
+//     RULE ancestor(?a, ?b) <- parent(?a, ?b)
+//     RULE ancestor(?a, ?c) <- ancestor(?a, ?b) AND parent(?b, ?c)
+//
+//   Then `/rule_run` iterates each rule against the current KG, derives
+//   the conclusion as a new RELATION atom for every binding that
+//   satisfies the premises, and repeats until no new atoms emerge
+//   (fixpoint reached). Each derived atom carries provenance back to
+//   the rule + source atoms that produced it.
+//
+// Fact representation
+//   In CrossEngin's KG, each Datalog-style fact `pred(arg1, arg2)` is
+//   stored as a RELATION-kind atom whose LABEL is the canonical form
+//   "pred|arg1|arg2" (predicate name + pipe + two args; args are
+//   string tokens -- usually atom ids rendered as decimal, but free-
+//   form strings work just as well for the engine). The pipe `|` is
+//   the canonical separator because (a) atom labels in this codebase
+//   are arbitrary ASCII strings (atom_label is just a string accessor)
+//   and (b) `|` does not appear in any predicate identifier produced
+//   by the parser (which accepts only alnum + underscore). The
+//   canonical-label discipline also gives us the DEDUPE primitive for
+//   free: kg_find_atom(kg, canonical) returns the existing atom (or 0)
+//   in O(1) amortised via the label hash index.
+//
+//   Args are limited to 2 for v1.0 -- the brief's syntax (parent,
+//   ancestor, transitive) is uniformly binary. The classical Datalog
+//   examples (parent->ancestor, transitive closure, ancestral chains)
+//   are all binary so this covers the brief's verification surface.
+//   Extending to arity 3+ would touch the label canonicalisation and
+//   the bindings inner loop; the rest of the engine is arity-agnostic.
+//
+// Rule surface syntax (mini-Datalog)
+//   rule    ::= "RULE" head "<-" body
+//   head    ::= ident "(" var "," var ")"
+//   body    ::= premise ("," premise | "AND" premise | "&&" premise)*
+//   premise ::= ident "(" arg "," arg ")"
+//   arg     ::= var | literal
+//   var     ::= "?" ident
+//   literal ::= ident
+//
+//   Whitespace is insignificant outside identifiers. The conjunction
+//   token is "," / "AND" / "&&" (any one -- operators come in from
+//   muscle memory; the engine accepts all three for usability). The
+//   unicode `∧` from the brief is also accepted (as its UTF-8 bytes).
+//   Variables share names between premise and conclusion: a free var
+//   in the head must appear in at least one premise (else the rule
+//   is unsafe -- we accept the rule but log a warning; binding fails
+//   at run time produce zero derivations rather than crashing).
+//
+// Forward-chaining algorithm (semi-naive Datalog)
+//   1. Snapshot the rules: parsed once at add time.
+//   2. Outer loop iterates UP TO max_iterations:
+//      - new_atoms_this_pass = 0
+//      - For each rule:
+//        - Find every binding of the premise vars that satisfies all
+//          premises in the CURRENT KG (cartesian product over candidate
+//          facts; small N typical for v1.0; an O(N^k) join is fine for
+//          k <= 4 premises and N <= 10000 atoms).
+//        - For each binding: instantiate the conclusion (substitute
+//          vars from the binding); canonicalise to "pred|arg1|arg2";
+//          if the atom does NOT already exist in the KG, add it as a
+//          new RELATION atom, record provenance, increment counter.
+//      - If new_atoms_this_pass == 0: fixpoint reached, break early.
+//      - Stop if derived_total >= max_derived_atoms (runaway guard).
+//   3. Return [augmented_kg, derived_count, iterations].
+//
+// Termination guarantees
+//   - Fixpoint termination is automatic when every rule's conclusion is
+//     among the existing facts: the dedupe step skips the add, so no
+//     new atoms emerge, and the outer loop's early-exit triggers.
+//   - The max_iterations cap (default 100) handles pathological rule
+//     sets (e.g. rules that produce ever-larger arities via free vars
+//     in the head). When the cap fires, the result list's `iterations`
+//     equals max_iterations and the caller can compare to detect the
+//     "did not reach fixpoint" condition.
+//   - The max_derived_atoms cap (default 10000) handles the case where
+//     the rule set's transitive closure is theoretically finite but
+//     larger than the operator's working set. This caps the KG growth
+//     irrespective of iterations.
+//
+// Provenance
+//   Each derived atom records a provenance entry in this module's
+//   internal provenance table: `[atom_id, rule_index, source_atom_ids]`.
+//   The provenance is queryable via rule_engine_explain(engine, atom_id)
+//   which returns the list of provenance entries for that derived atom.
+//   The brief specifies provenance is per-atom, not per-rule-firing, so
+//   if multiple rules derive the same atom, all are recorded (the dedupe
+//   on the KG side still happens -- we just append to the provenance
+//   list).
+//
+// ADRs implemented: ADR-0016 (atoms are the inference surface),
+//   ADR-0049 (testing + benchmarks -- 30+ unit assertions).
+// NOVA dependencies: builtins (lists, str_eq, str_trim, char_at,
+//   substr, len, push, list_set, int_to_str, rt_str_to_int).
+// CrossEngin dependencies: src/kg/atom_store.nova (ATOM_RELATION,
+//   atom_id, atom_label, atom_kind), src/kg/multi_kg_manager.nova
+//   (kg_atoms, kg_atom, kg_atom_count, kg_add_atom, kg_find_atom).
+
+import "std/io"
+import "std/string"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let RULE_DEFAULT_MAX_ITERATIONS = 100
+let RULE_DEFAULT_MAX_DERIVED    = 10000
+let RULE_MAX_ARITY              = 2     // v1.0: binary predicates only
+
+// Canonical separator for fact labels: "pred|arg1|arg2". The pipe character
+// (ASCII 124) is reserved by the parser (rejected from identifier tokens)
+// so it never collides with a predicate name.
+let RULE_FACT_SEPARATOR = "|"
+
+// ---- object layout: parsed_rule_t ----------------------------------------
+// parsed_rule_t ::= [RULE_OBJ_TAG, head_pred, head_args, body_premises]
+//   - head_pred:      string predicate name on the conclusion side
+//   - head_args:      list of head args; each arg is [TERM_VAR, name] or
+//                     [TERM_LIT, value]. Length == arity (2 for v1.0).
+//   - body_premises:  list of premise nodes. Each premise is
+//                     [premise_pred, premise_args] where premise_args has the
+//                     same shape as head_args.
+let RULE_OBJ_TAG = 2401   // distinct from QRY_OBJ_TAG (2301), ERR_OBJ_TAG (2399)
+let R_TAG    = 0
+let R_HEAD_PRED = 1
+let R_HEAD_ARGS = 2
+let R_BODY   = 3
+
+let RULE_TERM_VAR = 1
+let RULE_TERM_LIT = 2
+
+// ---- error layout (shared with R15D pattern) ----------------------------
+// Errors are [RULE_ERR_TAG, message]; callers use _rule_is_error() to test.
+let RULE_ERR_TAG = 2499
+
+fn _rule_error(msg) {
+    let e = list_new()
+    push(e, RULE_ERR_TAG)
+    push(e, msg)
+    return e
+}
+
+fn _rule_is_error(x) {
+    if x == 0 { return 0 }
+    if type_of(x) != 3 { return 0 }
+    let n = len(x)
+    if n < 1 { return 0 }
+    if x[0] == RULE_ERR_TAG { return 1 }
+    return 0
+}
+
+fn rule_error_message(x) {
+    if _rule_is_error(x) == 0 { return "" }
+    return x[1]
+}
+
+// ---- tokenizer (mini-Datalog) --------------------------------------------
+//
+// Token kinds:
+//   RT_KW       RULE (only one keyword)
+//   RT_VAR      ?identifier (leading ? dropped)
+//   RT_IDENT    bare identifier
+//   RT_LPAREN   (
+//   RT_RPAREN   )
+//   RT_COMMA    ,
+//   RT_ARROW    <-       -- rule head/body separator
+//   RT_AND      AND | && | & | wedge (unicode ∧ / its UTF-8 bytes 0xE2 0x88 0xA7)
+//   RT_OTHER    error sentinel
+let RT_KW     = 1
+let RT_VAR    = 2
+let RT_IDENT  = 3
+let RT_LPAREN = 4
+let RT_RPAREN = 5
+let RT_COMMA  = 6
+let RT_ARROW  = 7
+let RT_AND    = 8
+let RT_OTHER  = 9
+
+fn _rule_tok(kind, text) {
+    let t = list_new()
+    push(t, kind)
+    push(t, text)
+    return t
+}
+
+fn _rule_tok_kind(t) { return t[0] }
+fn _rule_tok_text(t) { return t[1] }
+
+fn _rule_is_ws(c) {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 10 { return 1 }
+    if c == 13 { return 1 }
+    return 0
+}
+
+// Is `c` a valid identifier byte after the first one? A..Z, a..z, 0..9, _.
+fn _rule_is_id(c) {
+    if c >= 65 {
+        if c <= 90 { return 1 }
+    }
+    if c >= 97 {
+        if c <= 122 { return 1 }
+    }
+    if c >= 48 {
+        if c <= 57 { return 1 }
+    }
+    if c == 95 { return 1 }   // _
+    return 0
+}
+
+// Classify a bare identifier. "RULE" is the only keyword; "AND" maps to
+// the AND token; everything else is RT_IDENT.
+fn _rule_classify_ident(s) {
+    if str_eq(s, "RULE") == 1 { return RT_KW }
+    if str_eq(s, "AND")  == 1 { return RT_AND }
+    return RT_IDENT
+}
+
+// Read an identifier or AND keyword starting at position i. Returns
+// [token, new_i].
+fn _rule_read_word(s, i) {
+    let n = len(s)
+    let start = i
+    while i < n {
+        let c = char_at(s, i)
+        if _rule_is_id(c) == 0 {
+            let text = substr(s, start, i - start)
+            let pair = list_new()
+            push(pair, _rule_tok(_rule_classify_ident(text), text))
+            push(pair, i)
+            return pair
+        }
+        i = i + 1
+    }
+    let text = substr(s, start, i - start)
+    let pair = list_new()
+    push(pair, _rule_tok(_rule_classify_ident(text), text))
+    push(pair, i)
+    return pair
+}
+
+// Read a ?var token starting at position i (pointing AT the ?). Returns
+// [token, new_i]. The leading ? is dropped from the token text.
+fn _rule_read_var(s, i) {
+    let n = len(s)
+    let start = i + 1
+    let j = start
+    while j < n {
+        if _rule_is_id(char_at(s, j)) == 0 {
+            let text = substr(s, start, j - start)
+            let pair = list_new()
+            push(pair, _rule_tok(RT_VAR, text))
+            push(pair, j)
+            return pair
+        }
+        j = j + 1
+    }
+    let text = substr(s, start, j - start)
+    let pair = list_new()
+    push(pair, _rule_tok(RT_VAR, text))
+    push(pair, j)
+    return pair
+}
+
+// Tokenize the rule string into a list of token records. The ASCII surface
+// is the primary path; we also accept `&&` and the UTF-8 wedge `∧`
+// (bytes 0xE2 0x88 0xA7) as conjunction tokens.
+fn _rule_tokenize(s) {
+    let toks = list_new()
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _rule_is_ws(c) == 1 {
+            i = i + 1
+        } else {
+            if c == 40 {
+                push(toks, _rule_tok(RT_LPAREN, "("))
+                i = i + 1
+            } else {
+                if c == 41 {
+                    push(toks, _rule_tok(RT_RPAREN, ")"))
+                    i = i + 1
+                } else {
+                    if c == 44 {
+                        // ',' -- conjunction in body, or arg separator in args.
+                        // The parser disambiguates by context (we always emit
+                        // RT_COMMA; the body parser treats COMMA after a `)`
+                        // as conjunction, and the args parser treats COMMA
+                        // inside parens as the arg separator).
+                        push(toks, _rule_tok(RT_COMMA, ","))
+                        i = i + 1
+                    } else {
+                        if c == 63 {
+                            let pair = _rule_read_var(s, i)
+                            push(toks, pair[0])
+                            i = pair[1]
+                        } else {
+                            if c == 60 {
+                                // `<` -- must be followed by `-` to form `<-`.
+                                if i + 1 < n {
+                                    if char_at(s, i + 1) == 45 {
+                                        push(toks, _rule_tok(RT_ARROW, "<-"))
+                                        i = i + 2
+                                    } else {
+                                        push(toks, _rule_tok(RT_OTHER, "<bad-lt>"))
+                                        i = i + 1
+                                    }
+                                } else {
+                                    push(toks, _rule_tok(RT_OTHER, "<bad-lt>"))
+                                    i = i + 1
+                                }
+                            } else {
+                                if c == 38 {
+                                    // `&` -- treat single & as AND, `&&` as AND too.
+                                    push(toks, _rule_tok(RT_AND, "&"))
+                                    if i + 1 < n {
+                                        if char_at(s, i + 1) == 38 { i = i + 1 }
+                                    }
+                                    i = i + 1
+                                } else {
+                                    if c == 226 {
+                                        // UTF-8 wedge (U+2227): 0xE2 0x88 0xA7. Match the
+                                        // 3-byte sequence verbatim and emit RT_AND.
+                                        if i + 2 < n {
+                                            if char_at(s, i + 1) == 136 {
+                                                if char_at(s, i + 2) == 167 {
+                                                    push(toks, _rule_tok(RT_AND, "wedge"))
+                                                    i = i + 3
+                                                } else {
+                                                    push(toks, _rule_tok(RT_OTHER, "<bad-utf8>"))
+                                                    i = i + 1
+                                                }
+                                            } else {
+                                                push(toks, _rule_tok(RT_OTHER, "<bad-utf8>"))
+                                                i = i + 1
+                                            }
+                                        } else {
+                                            push(toks, _rule_tok(RT_OTHER, "<bad-utf8>"))
+                                            i = i + 1
+                                        }
+                                    } else {
+                                        if _rule_is_id(c) == 1 {
+                                            let pair = _rule_read_word(s, i)
+                                            push(toks, pair[0])
+                                            i = pair[1]
+                                        } else {
+                                            push(toks, _rule_tok(RT_OTHER, "<unk>"))
+                                            i = i + 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return toks
+}
+
+// ---- parser -------------------------------------------------------------
+fn _rule_peek(toks, pos) {
+    if pos < 0 { return 0 }
+    if pos >= len(toks) { return 0 }
+    return toks[pos]
+}
+
+// Build a term: either a TERM_VAR (with the var name) or TERM_LIT (with
+// the literal text).
+fn _rule_term_var(name) {
+    let t = list_new()
+    push(t, RULE_TERM_VAR)
+    push(t, name)
+    return t
+}
+
+fn _rule_term_lit(text) {
+    let t = list_new()
+    push(t, RULE_TERM_LIT)
+    push(t, text)
+    return t
+}
+
+// Parse a single predicate atom: `ident ( arg , arg )`. Returns
+// [[pred_str, args_list], new_pos] or [error, pos].
+fn _rule_parse_atom(toks, pos) {
+    // predicate name
+    let pt = _rule_peek(toks, pos)
+    if pt == 0 {
+        let pair = list_new()
+        push(pair, _rule_error("expected predicate name, hit EOF"))
+        push(pair, pos)
+        return pair
+    }
+    if _rule_tok_kind(pt) != RT_IDENT {
+        let pair = list_new()
+        push(pair, _rule_error("expected predicate name, got " + _rule_tok_text(pt)))
+        push(pair, pos)
+        return pair
+    }
+    let pred = _rule_tok_text(pt)
+    pos = pos + 1
+    // (
+    let lp = _rule_peek(toks, pos)
+    if lp == 0 {
+        let pair = list_new()
+        push(pair, _rule_error("expected '(' after predicate name '" + pred + "'"))
+        push(pair, pos)
+        return pair
+    }
+    if _rule_tok_kind(lp) != RT_LPAREN {
+        let pair = list_new()
+        push(pair, _rule_error("expected '(' after predicate name '" + pred + "'"))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // arg list: var | ident; comma-separated. Arity must equal RULE_MAX_ARITY.
+    let args = list_new()
+    let first = 1
+    while pos < len(toks) {
+        let t = toks[pos]
+        if _rule_tok_kind(t) == RT_RPAREN {
+            pos = pos + 1
+            // Validate arity.
+            if len(args) != RULE_MAX_ARITY {
+                let pair = list_new()
+                push(pair, _rule_error("predicate '" + pred + "' has wrong arity (expected "
+                    + int_to_str(RULE_MAX_ARITY) + ", got " + int_to_str(len(args)) + ")"))
+                push(pair, pos)
+                return pair
+            }
+            let result = list_new()
+            push(result, pred)
+            push(result, args)
+            let pair = list_new()
+            push(pair, result)
+            push(pair, pos)
+            return pair
+        }
+        if first == 0 {
+            // Expect comma between args.
+            if _rule_tok_kind(t) != RT_COMMA {
+                let pair = list_new()
+                push(pair, _rule_error("expected ',' between args in '" + pred + "'"))
+                push(pair, pos)
+                return pair
+            }
+            pos = pos + 1
+            t = _rule_peek(toks, pos)
+            if t == 0 {
+                let pair = list_new()
+                push(pair, _rule_error("expected arg after ',' in '" + pred + "'"))
+                push(pair, pos)
+                return pair
+            }
+        }
+        first = 0
+        if _rule_tok_kind(t) == RT_VAR {
+            push(args, _rule_term_var(_rule_tok_text(t)))
+            pos = pos + 1
+        } else {
+            if _rule_tok_kind(t) == RT_IDENT {
+                push(args, _rule_term_lit(_rule_tok_text(t)))
+                pos = pos + 1
+            } else {
+                let pair = list_new()
+                push(pair, _rule_error("expected ?var or ident as arg in '" + pred + "'"))
+                push(pair, pos)
+                return pair
+            }
+        }
+    }
+    let pair = list_new()
+    push(pair, _rule_error("unterminated arg list for '" + pred + "'"))
+    push(pair, pos)
+    return pair
+}
+
+// Parse one rule. Surface: "RULE head <- premise [conjunction premise]*"
+// Returns parsed_rule_t (RULE_OBJ_TAG) or error.
+fn rule_parse(rule_string) {
+    let toks = _rule_tokenize(rule_string)
+    // Lex error sniff: any RT_OTHER token signals a tokenizer-emitted error.
+    let i = 0
+    while i < len(toks) {
+        if _rule_tok_kind(toks[i]) == RT_OTHER {
+            return _rule_error("lex: " + _rule_tok_text(toks[i]))
+        }
+        i = i + 1
+    }
+    if len(toks) == 0 {
+        return _rule_error("empty rule")
+    }
+    let pos = 0
+    // RULE keyword
+    let kw = _rule_peek(toks, pos)
+    if kw == 0 { return _rule_error("expected RULE keyword") }
+    if _rule_tok_kind(kw) != RT_KW {
+        return _rule_error("expected RULE keyword, got " + _rule_tok_text(kw))
+    }
+    if str_eq(_rule_tok_text(kw), "RULE") == 0 {
+        return _rule_error("expected RULE, got " + _rule_tok_text(kw))
+    }
+    pos = pos + 1
+    // head
+    let head_p = _rule_parse_atom(toks, pos)
+    if _rule_is_error(head_p[0]) == 1 { return head_p[0] }
+    let head = head_p[0]
+    pos = head_p[1]
+    let head_pred = head[0]
+    let head_args = head[1]
+    // <-
+    let arr = _rule_peek(toks, pos)
+    if arr == 0 { return _rule_error("expected '<-' after head") }
+    if _rule_tok_kind(arr) != RT_ARROW {
+        return _rule_error("expected '<-' after head, got " + _rule_tok_text(arr))
+    }
+    pos = pos + 1
+    // body: at least one premise; conjunctions between (AND, &&, ',', wedge)
+    let body = list_new()
+    let first = 1
+    while pos < len(toks) {
+        if first == 0 {
+            let conj = _rule_peek(toks, pos)
+            if conj == 0 { return _rule_error("expected conjunction or end of rule") }
+            let ck = _rule_tok_kind(conj)
+            if ck == RT_AND {
+                pos = pos + 1
+            } else {
+                if ck == RT_COMMA {
+                    pos = pos + 1
+                } else {
+                    return _rule_error("expected conjunction (AND/&&/,/\\u2227), got "
+                        + _rule_tok_text(conj))
+                }
+            }
+        }
+        first = 0
+        let p = _rule_parse_atom(toks, pos)
+        if _rule_is_error(p[0]) == 1 { return p[0] }
+        let pr = list_new()
+        push(pr, p[0][0])    // pred string
+        push(pr, p[0][1])    // args list
+        push(body, pr)
+        pos = p[1]
+    }
+    if len(body) == 0 {
+        return _rule_error("rule has no premises")
+    }
+    let rule = list_new()
+    push(rule, RULE_OBJ_TAG)
+    push(rule, head_pred)
+    push(rule, head_args)
+    push(rule, body)
+    return rule
+}
+
+// Parsed-rule accessors.
+fn rule_is_parsed(r) {
+    if r == 0 { return 0 }
+    if type_of(r) != 3 { return 0 }
+    if len(r) < 4 { return 0 }
+    if r[0] == RULE_OBJ_TAG { return 1 }
+    return 0
+}
+fn rule_head_pred(r) { return r[R_HEAD_PRED] }
+fn rule_head_args(r) { return r[R_HEAD_ARGS] }
+fn rule_body(r)      { return r[R_BODY] }
+fn rule_body_size(r) { return len(r[R_BODY]) }
+
+// ---- fact-store canonicalisation -----------------------------------------
+//
+// Each fact `pred(a, b)` lives in the KG as a RELATION atom with label
+// "pred|a|b". The args are stringified; for atom-id args we use
+// int_to_str(id); for literal-text args we keep the text as-is. The
+// engine's fact extraction reads atom_label and re-splits on "|".
+//
+// _rule_canonical_label(pred, arg_strs) -> "pred|arg1|arg2"
+fn _rule_canonical_label(pred, arg_strs) {
+    let s = pred
+    let i = 0
+    while i < len(arg_strs) {
+        s = s + RULE_FACT_SEPARATOR + arg_strs[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Render a term value to its string form for canonicalisation.
+//   - TERM_VAR with a binding -> the binding's value (int -> decimal,
+//     string -> verbatim).
+//   - TERM_LIT -> the literal text.
+//   - TERM_VAR without a binding -> "<unbound>" (a sentinel; callers
+//     must check bindings before constructing facts).
+fn _rule_term_str(term, bindings) {
+    if term[0] == RULE_TERM_VAR {
+        let val = _rb_get(bindings, term[1])
+        if val == 0 {
+            if _rb_has(bindings, term[1]) == 0 {
+                return "<unbound>"
+            }
+        }
+        return val
+    }
+    return term[1]
+}
+
+// ---- rule-engine bindings: pure string-valued (val is a string) ---------
+//
+// We use a separate binding shape from R15D's binding_t because Datalog
+// values are STRINGS (atom labels, arg tokens) rather than atom_ids; the
+// rule-engine doesn't need to chase atoms by id, just match their stored
+// argument tokens. List of [name, value_string] pairs, scanned linearly.
+fn _rb_new() { return list_new() }
+
+fn _rb_set(b, name, value) {
+    let i = 0
+    while i < len(b) {
+        if str_eq(b[i][0], name) == 1 {
+            list_set(b[i], 1, value)
+            return 1
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, name)
+    push(entry, value)
+    push(b, entry)
+    return 1
+}
+
+fn _rb_has(b, name) {
+    let i = 0
+    while i < len(b) {
+        if str_eq(b[i][0], name) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _rb_get(b, name) {
+    let i = 0
+    while i < len(b) {
+        if str_eq(b[i][0], name) == 1 { return b[i][1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _rb_copy(b) {
+    let out = list_new()
+    let i = 0
+    while i < len(b) {
+        let e = list_new()
+        push(e, b[i][0])
+        push(e, b[i][1])
+        push(out, e)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- engine_t layout -----------------------------------------------------
+// engine_t ::= [ENG_OBJ_TAG, rules, provenance, last_iterations,
+//               last_derived, hit_cap_flag]
+//   - rules:           list of parsed_rule_t
+//   - provenance:      list of [atom_id, rule_index, source_atom_ids_list]
+//                      (one entry per derivation; an atom may have many)
+//   - last_iterations: int -- number of outer-loop iterations in the
+//                      most recent rule_engine_run call
+//   - last_derived:    int -- number of NEW atoms added in the most
+//                      recent run (i.e. successful additions; the
+//                      dedupe-skipped derivations don't count)
+//   - hit_cap_flag:    int 0/1 -- 1 iff the last run was clamped by
+//                      max_iterations OR max_derived_atoms before
+//                      reaching a natural fixpoint
+let ENG_OBJ_TAG = 2402
+let RE_TAG    = 0
+let RE_RULES  = 1
+let RE_PROV   = 2
+let RE_LAST_ITER = 3
+let RE_LAST_DERIVED = 4
+let RE_HIT_CAP = 5
+
+fn rule_engine_new() {
+    let e = list_new()
+    push(e, ENG_OBJ_TAG)
+    push(e, list_new())     // rules
+    push(e, list_new())     // provenance
+    push(e, 0)              // last_iterations
+    push(e, 0)              // last_derived
+    push(e, 0)              // hit_cap_flag
+    return e
+}
+
+fn rule_engine_is(e) {
+    if e == 0 { return 0 }
+    if type_of(e) != 3 { return 0 }
+    if len(e) < 6 { return 0 }
+    if e[0] == ENG_OBJ_TAG { return 1 }
+    return 0
+}
+
+fn rule_engine_size(e) { return len(e[RE_RULES]) }
+fn rule_engine_last_iterations(e) { return e[RE_LAST_ITER] }
+fn rule_engine_last_derived(e) { return e[RE_LAST_DERIVED] }
+fn rule_engine_hit_cap(e) { return e[RE_HIT_CAP] }
+
+// Add one rule (parsed from `rule_string`) to the engine. Returns 1 on
+// success; an error list on parse failure (caller tests with
+// _rule_is_error).
+fn rule_engine_add(engine, rule_string) {
+    let parsed = rule_parse(rule_string)
+    if _rule_is_error(parsed) == 1 { return parsed }
+    push(engine[RE_RULES], parsed)
+    return 1
+}
+
+// ---- KG fact extraction --------------------------------------------------
+//
+// A FACT in the rule engine's sense is a RELATION-kind atom whose label
+// matches the canonical "pred|arg1|arg2" form for the given predicate.
+// This helper returns, for the named predicate, a list of [atom_id,
+// arg1, arg2] tuples extracted from the KG. The split is by the
+// RULE_FACT_SEPARATOR pipe character.
+//
+// We scan kg_atoms linearly. The pattern is the same as the R15D query
+// executor's per-atom scan -- no specialised index. For v1.0 + the
+// typical N (low hundreds), this is sub-millisecond and obviates a
+// duplicate predicate-index structure.
+fn _rule_fact_split(label) {
+    // Split on '|' (ASCII 124). Returns a list of substrings.
+    let parts = list_new()
+    let n = len(label)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(label, i) == 124 {
+            push(parts, substr(label, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(label, start, n - start))
+    return parts
+}
+
+fn _rule_kg_facts_for(kg, pred) {
+    let out = list_new()
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_RELATION {
+                let label = atom_label(a)
+                let parts = _rule_fact_split(label)
+                if len(parts) == 1 + RULE_MAX_ARITY {
+                    if str_eq(parts[0], pred) == 1 {
+                        let row = list_new()
+                        push(row, atom_id(a))
+                        let j = 1
+                        while j < len(parts) {
+                            push(row, parts[j])
+                            j = j + 1
+                        }
+                        push(out, row)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- premise matcher -----------------------------------------------------
+//
+// For each binding in `bindings`, find every fact that matches `premise`
+// under the current binding, and emit one extended binding per match.
+// A premise's args are either bound (we filter facts that match the
+// bound value) or free (we bind them from the fact's args). Identical
+// var names within a premise force the corresponding fact args to be
+// equal (e.g. `parent(?a, ?a)` only matches facts where arg1 == arg2).
+fn _rule_match_premise(kg, premise, bindings) {
+    let pred = premise[0]
+    let p_args = premise[1]
+    let facts = _rule_kg_facts_for(kg, pred)
+    let out = list_new()
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        // Track which source atom_ids this binding has used so we can
+        // record provenance later. Source ids are stored in a parallel
+        // list at "__sources__".
+        let fi = 0
+        while fi < len(facts) {
+            let f = facts[fi]   // [atom_id, arg1, arg2]
+            // Try to unify each premise arg with the corresponding fact arg.
+            // Make a candidate extension; if any unification fails, drop it.
+            let cand = _rb_copy(b)
+            let ok = 1
+            let ai = 0
+            while ai < len(p_args) {
+                if ok == 1 {
+                    let pa = p_args[ai]
+                    let fact_val = f[ai + 1]  // f[0] = atom_id; args start at 1
+                    if pa[0] == RULE_TERM_VAR {
+                        let vname = pa[1]
+                        if _rb_has(cand, vname) == 1 {
+                            // Already bound -- must match.
+                            if str_eq(_rb_get(cand, vname), fact_val) == 0 {
+                                ok = 0
+                            }
+                        } else {
+                            _rb_set(cand, vname, fact_val)
+                        }
+                    } else {
+                        // Literal -- must match the fact arg verbatim.
+                        if str_eq(pa[1], fact_val) == 0 {
+                            ok = 0
+                        }
+                    }
+                }
+                ai = ai + 1
+            }
+            if ok == 1 {
+                // Record this fact's atom_id under a synthetic source key.
+                // Keys are __src_0, __src_1, ... -- the body parser already
+                // emits premises in order, so we tag by ordinal.
+                let sources = _rb_get(cand, "__sources__")
+                if len(sources) == 0 {
+                    _rb_set(cand, "__sources__", int_to_str(f[0]))
+                } else {
+                    _rb_set(cand, "__sources__", sources + "," + int_to_str(f[0]))
+                }
+                push(out, cand)
+            }
+            fi = fi + 1
+        }
+        bi = bi + 1
+    }
+    return out
+}
+
+// Parse the comma-separated source list back into a list of ints.
+fn _rule_parse_sources(s) {
+    let out = list_new()
+    let n = len(s)
+    if n == 0 { return out }
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(s, i) == 44 {
+            let part = substr(s, start, i - start)
+            push(out, rt_str_to_int(part))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let last = substr(s, start, n - start)
+    if len(last) > 0 {
+        push(out, rt_str_to_int(last))
+    }
+    return out
+}
+
+// ---- forward chaining ----------------------------------------------------
+//
+// Apply ONE rule against the current KG. For every binding satisfying all
+// premises, derive the conclusion. Returns the count of NEW atoms added
+// (i.e. atoms whose canonical label was not already in the KG). Updates
+// engine's provenance table.
+//
+// `now` is the moment timestamp passed to kg_add_atom. We pass 0 from
+// rule_engine_run since derived atoms have no real-time meaning.
+fn _rule_apply_one(engine, rule_idx, kg, max_remaining, now) {
+    let rule = engine[RE_RULES][rule_idx]
+    let head_pred = rule_head_pred(rule)
+    let head_args = rule_head_args(rule)
+    let body = rule_body(rule)
+    // Seed with one empty binding.
+    let bindings = list_new()
+    push(bindings, _rb_new())
+    let pi = 0
+    while pi < len(body) {
+        bindings = _rule_match_premise(kg, body[pi], bindings)
+        pi = pi + 1
+    }
+    let new_count = 0
+    let bi = 0
+    while bi < len(bindings) {
+        if new_count < max_remaining {
+            let b = bindings[bi]
+            // Substitute head args from binding.
+            let head_arg_strs = list_new()
+            let ai = 0
+            let ok = 1
+            while ai < len(head_args) {
+                if ok == 1 {
+                    let ha = head_args[ai]
+                    if ha[0] == RULE_TERM_VAR {
+                        if _rb_has(b, ha[1]) == 0 {
+                            // Free var in head not bound by body -- unsafe rule;
+                            // skip this binding (no derivation).
+                            ok = 0
+                        } else {
+                            push(head_arg_strs, _rb_get(b, ha[1]))
+                        }
+                    } else {
+                        push(head_arg_strs, ha[1])
+                    }
+                }
+                ai = ai + 1
+            }
+            if ok == 1 {
+                let canonical = _rule_canonical_label(head_pred, head_arg_strs)
+                // Dedupe via kg_find_atom: O(1) amortised through label hash.
+                let existing = kg_find_atom(kg, canonical)
+                if existing == 0 {
+                    let derived = kg_add_atom(kg, ATOM_RELATION, canonical, now)
+                    // Record provenance.
+                    let prov = list_new()
+                    push(prov, atom_id(derived))
+                    push(prov, rule_idx)
+                    let sources_str = _rb_get(b, "__sources__")
+                    push(prov, _rule_parse_sources(sources_str))
+                    push(engine[RE_PROV], prov)
+                    new_count = new_count + 1
+                }
+            }
+        }
+        bi = bi + 1
+    }
+    return new_count
+}
+
+// rule_engine_run(engine, kg, max_iterations) -> [augmented_kg, derived_count, iterations]
+//
+// Iterates the engine's rules to fixpoint. Returns the same KG object
+// (mutated in place; the brief allows in-place mutation since the engine
+// owns the inference pass), the total NEW atoms added across all
+// iterations, and the iteration count. Stops at the natural fixpoint or
+// when either cap (max_iterations / max_derived_atoms) fires.
+fn rule_engine_run(engine, kg, max_iterations) {
+    if rule_engine_is(engine) == 0 {
+        let r = list_new()
+        push(r, kg)
+        push(r, 0)
+        push(r, 0)
+        return r
+    }
+    let cap_iter = max_iterations
+    if cap_iter <= 0 { cap_iter = RULE_DEFAULT_MAX_ITERATIONS }
+    let cap_derived = RULE_DEFAULT_MAX_DERIVED
+    let derived_total = 0
+    let iterations = 0
+    let hit_cap = 0
+    let done = 0
+    while done == 0 {
+        if iterations >= cap_iter {
+            hit_cap = 1
+            done = 1
+        } else {
+            if derived_total >= cap_derived {
+                hit_cap = 1
+                done = 1
+            } else {
+                iterations = iterations + 1
+                let new_this_pass = 0
+                let ri = 0
+                while ri < len(engine[RE_RULES]) {
+                    let remaining = cap_derived - derived_total
+                    if remaining > 0 {
+                        let added = _rule_apply_one(engine, ri, kg, remaining, 0)
+                        new_this_pass = new_this_pass + added
+                        derived_total = derived_total + added
+                    }
+                    ri = ri + 1
+                }
+                if new_this_pass == 0 {
+                    done = 1
+                }
+            }
+        }
+    }
+    list_set(engine, RE_LAST_ITER, iterations)
+    list_set(engine, RE_LAST_DERIVED, derived_total)
+    list_set(engine, RE_HIT_CAP, hit_cap)
+    let result = list_new()
+    push(result, kg)
+    push(result, derived_total)
+    push(result, iterations)
+    return result
+}
+
+// rule_engine_explain(engine, atom_id) -> list[provenance]
+//
+// Returns every provenance entry for the given derived atom_id. Each
+// entry is [atom_id, rule_index, source_atom_ids_list]. Returns an empty
+// list if the atom_id was not derived by the engine (e.g. a base fact).
+fn rule_engine_explain(engine, atom_id_in) {
+    let out = list_new()
+    if rule_engine_is(engine) == 0 { return out }
+    let prov = engine[RE_PROV]
+    let i = 0
+    while i < len(prov) {
+        if prov[i][0] == atom_id_in {
+            push(out, prov[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/rule_add <rule_string>` admin: parses and appends the rule to the
+// engine; reports the parsed shape on success or the error on failure.
+// `/rule_run` admin: runs forward chaining once and reports
+// (rules=R derived=D iterations=I [cap]).
+//
+// The engine is a process-scoped piece of state. We accept an engine
+// pointer passed in by the chat REPL (mirroring the kg/refl_kg
+// dispatch shape). Module count rule: +2 chat dispatches, +2 help
+// lines (per the brief's chat-wiring contract).
+
+fn _rule_cmd_add(engine, kg, arg) {
+    if rule_engine_is(engine) == 0 {
+        io_println("RULE error=engine not initialised")
+        return 1
+    }
+    if len(arg) == 0 {
+        io_println("usage: /rule_add <rule>  -- e.g. /rule_add RULE ancestor(?a, ?c) <- ancestor(?a, ?b) AND parent(?b, ?c)")
+        io_println("RULE_ADD store_rules=" + int_to_str(rule_engine_size(engine)))
+        return 1
+    }
+    let r = rule_engine_add(engine, arg)
+    if _rule_is_error(r) == 1 {
+        io_println("RULE_ADD error=" + rule_error_message(r))
+        return 1
+    }
+    // Get the just-added rule for a confirmation line.
+    let rules = engine[RE_RULES]
+    let last = rules[len(rules) - 1]
+    let prem_count = rule_body_size(last)
+    io_println("RULE_ADD head=" + rule_head_pred(last)
+        + " premises=" + int_to_str(prem_count)
+        + " store_rules=" + int_to_str(rule_engine_size(engine)))
+    return 1
+}
+
+fn _rule_cmd_run(engine, kg, arg) {
+    if rule_engine_is(engine) == 0 {
+        io_println("RULE_RUN error=engine not initialised")
+        return 1
+    }
+    let max_iters = RULE_DEFAULT_MAX_ITERATIONS
+    if len(arg) > 0 {
+        let v = rt_str_to_int(arg)
+        if v > 0 { max_iters = v }
+    }
+    let result = rule_engine_run(engine, kg, max_iters)
+    let derived = result[1]
+    let iters   = result[2]
+    let cap_str = ""
+    if rule_engine_hit_cap(engine) == 1 { cap_str = " hit_cap=1" }
+    io_println("RULE_RUN rules=" + int_to_str(rule_engine_size(engine))
+        + " derived=" + int_to_str(derived)
+        + " iterations=" + int_to_str(iters)
+        + cap_str)
+    return 1
+}
+
+// Single dispatch point. Chat dispatches /rule_add and /rule_run by
+// calling this with the command suffix ("add" or "run") and the arg
+// tail. Keeps the dispatch table small while still surfacing two
+// distinct admin commands per the brief.
+fn rule_cmd(engine, kg, sub, arg) {
+    if str_eq(sub, "add") == 1 { return _rule_cmd_add(engine, kg, arg) }
+    if str_eq(sub, "run") == 1 { return _rule_cmd_run(engine, kg, arg) }
+    io_println("RULE error=unknown subcommand '" + sub + "' (use 'add' or 'run')")
+    return 1
+}
+
+// ---- module-global rule engine for chat dispatch -------------------------
+//
+// The chat REPL has no per-session "rule engine" slot, and the brief's chat
+// wiring is /rule_add + /rule_run (admin commands operating over the active
+// KG). We host the engine here at module scope so the chat file's wiring
+// stays inside its 4-line touch budget: 1 import + 2 dispatch + 1 help.
+// The engine is process-shared (one engine per chat process, matching
+// `gate` and `arb` and the other substrate-shared structures). A user
+// wanting per-session rules can construct their own engine via
+// rule_engine_new() and drive it programmatically.
+let _rule_chat_engine = rule_engine_new()
+
+fn rule_chat_add_cmd(kg, arg) { return _rule_cmd_add(_rule_chat_engine, kg, arg) }
+fn rule_chat_run_cmd(kg, arg) { return _rule_cmd_run(_rule_chat_engine, kg, arg) }

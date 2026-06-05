@@ -1,0 +1,800 @@
+// CrossEngin io/transducers: Image OCR via character template matching (R24C).
+//
+// Purpose
+//   CrossEngin's CV pipeline lands feature matching (R5C SIFT, R6D ORB),
+//   dense descriptors (R14D HOG, R17D LBP), and sliding-window detection
+//   (R15C HOG / R22A integral). What was missing: OCR -- recognizing
+//   characters in an image. R24C ships the structural primitive:
+//   template-matching OCR. A gallery of known-character templates is
+//   slid across an input image; at each position the best-matching
+//   template above a confidence threshold is emitted as a (char, bbox,
+//   score) detection; overlapping detections of the same character are
+//   collapsed via non-max suppression (NMS); the surviving detections
+//   are sorted into reading order (top-to-bottom, left-to-right) and
+//   concatenated to recover the text string.
+//
+// Algorithm (template-matching OCR, integer-only)
+//   1. Gallery: a list of (char_code, template_bytes, w, h) entries.
+//      Every template MUST share the same w x h shape so the sliding
+//      window stride / NMS overlap arithmetic stays uniform.
+//   2. Sliding window: for each top-left (x, y) in
+//      [0, image_w - tw] x [0, image_h - th] compute an L2 (sum of
+//      squared differences) distance against EACH template; keep the
+//      template with the smallest distance. Convert distance to a
+//      [0..1000] match score via
+//        score_milli = 1000 - (dist * 1000 / max_dist)
+//      where max_dist = 255 * 255 * tw * th is the worst-case sum of
+//      squared differences (every pixel differs by 255 -- pure white
+//      vs pure black). A score of 1000 = perfect match; 0 = anti-match.
+//   3. Threshold: drop detections whose score is below
+//      threshold_milli (caller-supplied; defaults to 800 for the chat).
+//   4. NMS: walk surviving detections in descending-score order; for
+//      each, suppress any later detection of the SAME character whose
+//      bbox overlaps the current detection by >= 50% of the template
+//      area (IoU >= 333 milli, or equivalently the union of the two
+//      boxes is at most 2x the template area when the boxes are
+//      identical-sized). NMS is per-character: a "B" detection does
+//      NOT suppress an overlapping "8" detection -- this is by design,
+//      since lookalike confusables are useful to surface and the
+//      score-threshold gate already filters obvious noise.
+//   5. Reading order: sort surviving detections by y (rounded into
+//      a row-height bucket so a 1-pixel y wobble doesn't reorder
+//      same-line characters) then by x. The bucket height defaults
+//      to template_height / 2 (each row gets a single bucket per
+//      half-character-height step).
+//   6. ocr_to_text: concatenate the chars after reading-order sort.
+//
+// Built-in ASCII font: at module load time we mint a tiny 8x8
+//   bitmap font for the 36 ASCII-renderable characters that span
+//   uppercase A-Z + digits 0-9. The font is RIDICULOUSLY minimalist
+//   -- each glyph is a hand-rolled 8x8 0/255 stencil -- but it is
+//   ENOUGH to demonstrate end-to-end recognition of a synthetic
+//   "HELLO" image rendered from the same font. Real-world OCR needs
+//   trained CNN-based recognizers (Tesseract, EAST, CRNN, etc.) which
+//   CrossEngin cannot do without a learned model; the structural
+//   primitive (gallery + slide + L2 + NMS) is what R24C delivers and
+//   the same surface accepts a richer template gallery at any
+//   moment via ocr_gallery_add_char.
+//
+// Public API
+//   ocr_template_gallery_new() -> gallery_t
+//     Empty gallery. ocr_gallery_size returns 0.
+//   ocr_gallery_add_char(gallery, char_code, image, w, h) -> 1 on ok / 0 on err
+//     Adds a (char_code, template_bytes, w, h) entry. The template
+//     is COPIED so the caller can free `image`. Returns 0 if w/h
+//     mismatch a previously-added template (uniform-shape rule).
+//   ocr_gallery_size(gallery) -> int
+//   ocr_gallery_template_width(gallery) / _height -> int (or 0 on empty)
+//   ocr_recognize_text(image, w, h, gallery, threshold_milli) -> list of
+//     detections, each [char_code, x, y, score_milli, tw, th].
+//   ocr_to_text(detections) -> string
+//   ocr_default_gallery() -> gallery_t pre-populated with the built-in
+//     8x8 ASCII font (uppercase A-Z + digits 0-9 == 36 templates).
+//   ocr_render_text(text, gallery) -> [image_bytes, w, h] when every
+//     character in `text` has a template in `gallery`. Used by the
+//     unit suite + integration scenario to synthesize OCR inputs.
+//     Returns [0, 0, 0] on unknown character.
+//   ocr_pgm_args(arg) -> chat /ocr admin formatted string. Decodes
+//     the PGM at `arg`, runs ocr_recognize_text + ocr_to_text on the
+//     default gallery, and returns "(ocr <text>)" or
+//     "(ocr <PATH>: <error>)".
+//
+// Caps
+//   * Image dimensions <= OCR_MAX_DIM (=256) per axis (matches LBP).
+//   * Template dimensions <= OCR_TEMPLATE_MAX_DIM (=32) per axis (the
+//     16x24 brief shape fits; the default 8x8 leaves room for richer
+//     fonts).
+//   * Gallery size <= OCR_MAX_TEMPLATES (=128) entries (the brief
+//     names 64 ASCII glyphs; double that gives headroom for variants).
+//
+// Honest scope: template-matching OCR works PERFECTLY for clean
+//   rendered text that matches the gallery font; it falls apart on
+//   real photographs (variable lighting, perspective, fonts, sizes,
+//   anti-aliasing). The R24C surface is the STRUCTURAL primitive --
+//   correct on synthetic + clean rendered text. Real-world OCR
+//   requires CNN-based models (CE can't do that without a learned
+//   model). See IMAGE_AUDIT.md for the full roadmap.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_add, int_sub, int_mul, int_to_str, char_at,
+//   substr, str_eq.
+// CrossEngin dependencies: image_pgm.nova (PGM-P5 decode for the
+//   chat /ocr admin and ocr_render_text's output staging).
+
+import "image_pgm.nova"
+
+// ---- caps ----------------------------------------------------------------
+
+let OCR_MAX_DIM             = 256
+let OCR_TEMPLATE_MAX_DIM    = 32
+let OCR_MAX_TEMPLATES       = 128
+let OCR_DEFAULT_THRESHOLD   = 800   // milli; 0..1000 -- "tolerant" default
+let OCR_CHAT_THRESHOLD      = 950   // milli; 0..1000 -- "strict" for clean
+                                    //                rendered text used by the
+                                    //                /ocr chat admin.
+let OCR_NMS_OVERLAP_THRESH  = 333   // milli IoU; 0..1000
+
+// Built-in font dimensions. 8x8 0/255 stencils -- tiny but enough to
+// demonstrate end-to-end recognition.
+let OCR_FONT_W = 8
+let OCR_FONT_H = 8
+
+// ---- gallery layout ------------------------------------------------------
+//
+// Gallery is a list with three sub-lists:
+//   [0] char_codes  -- list of int (ASCII codes)
+//   [1] templates   -- list of pointer-to-template-bytes (each tw*th bytes)
+//   [2] meta        -- list of [tw, th] (a single int pair, captured from
+//                       the FIRST added template; subsequent adds must match)
+//
+// We keep the shape uniform because the slide step + NMS overlap
+// arithmetic assume every template shares one (tw, th).
+
+let OCR_G_CHARS    = 0
+let OCR_G_TEMPS    = 1
+let OCR_G_META     = 2
+
+fn ocr_template_gallery_new() {
+    let g = list_new()
+    push(g, list_new())   // chars
+    push(g, list_new())   // template byte pointers
+    let meta = list_new()
+    push(meta, 0)         // tw
+    push(meta, 0)         // th
+    push(g, meta)
+    return g
+}
+
+fn ocr_gallery_size(gallery) {
+    return len(gallery[OCR_G_CHARS])
+}
+
+fn ocr_gallery_template_width(gallery) {
+    return gallery[OCR_G_META][0]
+}
+
+fn ocr_gallery_template_height(gallery) {
+    return gallery[OCR_G_META][1]
+}
+
+fn ocr_gallery_char_at(gallery, idx) {
+    let chars = gallery[OCR_G_CHARS]
+    if idx < 0 { return 0 }
+    if idx >= len(chars) { return 0 }
+    return chars[idx]
+}
+
+fn ocr_gallery_template_at(gallery, idx) {
+    let temps = gallery[OCR_G_TEMPS]
+    if idx < 0 { return 0 }
+    if idx >= len(temps) { return 0 }
+    return temps[idx]
+}
+
+// ---- add a character template -------------------------------------------
+//
+// Returns 1 on success, 0 on failure (uniform-shape rule violated,
+// dimensions out-of-range, OR gallery full).
+
+fn ocr_gallery_add_char(gallery, char_code, image, w, h) {
+    if w <= 0 { return 0 }
+    if h <= 0 { return 0 }
+    if w > OCR_TEMPLATE_MAX_DIM { return 0 }
+    if h > OCR_TEMPLATE_MAX_DIM { return 0 }
+    if ocr_gallery_size(gallery) >= OCR_MAX_TEMPLATES { return 0 }
+    let meta = gallery[OCR_G_META]
+    let tw = meta[0]
+    let th = meta[1]
+    if tw == 0 {
+        // First template establishes the shape.
+        list_set(meta, 0, w)
+        list_set(meta, 1, h)
+        tw = w
+        th = h
+    } else {
+        if w != tw { return 0 }
+        if h != th { return 0 }
+    }
+    // Copy the template bytes so the caller may free `image`.
+    let area = w * h
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, load8(image + i))
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    push(gallery[OCR_G_CHARS], char_code)
+    push(gallery[OCR_G_TEMPS], buf)
+    return 1
+}
+
+// ---- L2 distance + score -------------------------------------------------
+//
+// _ocr_l2_distance(image, image_w, x, y, template, tw, th) -> int
+// Sum of squared differences between the template and the image
+// patch whose top-left is (x, y). The caller is expected to have
+// already bounds-checked x + tw <= image_w and y + th <= image_h.
+
+fn _ocr_l2_distance(image, image_w, x, y, template, tw, th) {
+    let dist = 0
+    let dy = 0
+    while dy < th {
+        let dx = 0
+        while dx < tw {
+            let a = load8(image + (y + dy) * image_w + (x + dx))
+            let b = load8(template + dy * tw + dx)
+            let d = a - b
+            if d < 0 { d = 0 - d }
+            dist = dist + d * d
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    return dist
+}
+
+// _ocr_score_milli(dist, tw, th) -> int [0..1000]
+// Convert distance to milli-score. max_dist = 255 * 255 * tw * th
+// for an 8x8 template == 4147200 < 2^22, well under the in-function
+// pointer-threshold of ~2^20. (The product 65025 * 64 = 4161600
+// is just above 2^22 -- but it's a constant the compiler can fold;
+// we still ladder the multiplies to be safe.)
+
+fn _ocr_score_milli(dist, tw, th) {
+    let area = tw * th
+    if area <= 0 { return 0 }
+    // max_dist = 255*255*area. Compute in a stepwise way so each
+    // intermediate stays under the threshold gotcha.
+    let max_dist_per_pixel = 65025   // 255 * 255
+    let max_dist = max_dist_per_pixel * area
+    if max_dist <= 0 { return 0 }
+    if dist <= 0 { return 1000 }
+    if dist >= max_dist { return 0 }
+    // score_milli = 1000 - (dist * 1000 / max_dist).
+    // dist * 1000 can be large; bound it by clamping max_dist scale.
+    let scaled = dist * 1000 / max_dist
+    if scaled >= 1000 { return 0 }
+    return 1000 - scaled
+}
+
+// ---- detection list shape ------------------------------------------------
+//
+// Each detection is [char_code, x, y, score_milli, tw, th].
+
+let OCR_D_CHAR  = 0
+let OCR_D_X     = 1
+let OCR_D_Y     = 2
+let OCR_D_SCORE = 3
+let OCR_D_TW    = 4
+let OCR_D_TH    = 5
+
+fn _ocr_make_det(char_code, x, y, score_milli, tw, th) {
+    let d = list_new()
+    push(d, char_code)
+    push(d, x)
+    push(d, y)
+    push(d, score_milli)
+    push(d, tw)
+    push(d, th)
+    return d
+}
+
+fn ocr_detection_char(d)  { return d[OCR_D_CHAR] }
+fn ocr_detection_x(d)     { return d[OCR_D_X] }
+fn ocr_detection_y(d)     { return d[OCR_D_Y] }
+fn ocr_detection_score(d) { return d[OCR_D_SCORE] }
+
+// ---- recognize_text: sliding window + NMS + reading-order sort ----------
+//
+// Returns a list of detections, each [char, x, y, score, tw, th]. The
+// returned list is sorted into READING ORDER (top-to-bottom, then
+// left-to-right within each row bucket).
+
+fn ocr_recognize_text(image, w, h, gallery, threshold_milli) {
+    let out = list_new()
+    let g_size = ocr_gallery_size(gallery)
+    if g_size == 0 { return out }
+    let tw = ocr_gallery_template_width(gallery)
+    let th = ocr_gallery_template_height(gallery)
+    if tw == 0 { return out }
+    if th == 0 { return out }
+    if w < tw { return out }
+    if h < th { return out }
+    if w > OCR_MAX_DIM { return out }
+    if h > OCR_MAX_DIM { return out }
+
+    // Stage 1: sliding-window scan -- for each top-left (x, y), find
+    // the best-matching template; emit the detection if it clears the
+    // score threshold.
+    let max_x = w - tw
+    let max_y = h - th
+    let y = 0
+    while y <= max_y {
+        let x = 0
+        while x <= max_x {
+            let best_dist = 0 - 1
+            let best_idx = 0 - 1
+            let i = 0
+            while i < g_size {
+                let tmp = ocr_gallery_template_at(gallery, i)
+                let d = _ocr_l2_distance(image, w, x, y, tmp, tw, th)
+                if best_idx < 0 {
+                    best_dist = d
+                    best_idx = i
+                } else {
+                    if d < best_dist {
+                        best_dist = d
+                        best_idx = i
+                    }
+                }
+                i = i + 1
+            }
+            if best_idx >= 0 {
+                let score = _ocr_score_milli(best_dist, tw, th)
+                if score >= threshold_milli {
+                    let ch = ocr_gallery_char_at(gallery, best_idx)
+                    push(out, _ocr_make_det(ch, x, y, score, tw, th))
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    // Stage 2: NMS. Within each character class, suppress later
+    // detections (descending score) that overlap an earlier-kept one
+    // by >= 50% of the template area. Implemented in two passes:
+    //   (a) sort by score descending.
+    //   (b) for each detection in order, keep it unless an
+    //       already-kept detection of the SAME character overlaps it
+    //       above the threshold.
+    let by_score = _ocr_sort_by_score_desc(out)
+    let kept = list_new()
+    let area = tw * th
+    let half_area = area / 2     // 50% overlap threshold (in pixels)
+    let j = 0
+    while j < len(by_score) {
+        let dj = by_score[j]
+        let cj = dj[OCR_D_CHAR]
+        let xj = dj[OCR_D_X]
+        let yj = dj[OCR_D_Y]
+        let dup = 0
+        let k = 0
+        while k < len(kept) {
+            let dk = kept[k]
+            // Cross-character NMS: an already-kept higher-score detection
+            // suppresses ANY overlapping detection here -- not just same-
+            // character matches. Without this a perfect-H at x=0 would
+            // not block a partial-T at x=1 even though both bound boxes
+            // occupy the same image region.
+            let xk = dk[OCR_D_X]
+            let yk = dk[OCR_D_Y]
+            let dx = xj - xk
+            if dx < 0 { dx = 0 - dx }
+            let dy = yj - yk
+            if dy < 0 { dy = 0 - dy }
+            if dx < tw {
+                if dy < th {
+                    let ow = tw - dx
+                    let oh = th - dy
+                    let overlap = ow * oh
+                    if overlap >= half_area { dup = 1 }
+                }
+            }
+            k = k + 1
+        }
+        if dup == 0 { push(kept, dj) }
+        j = j + 1
+    }
+
+    // Stage 3: reading-order sort. Bucket y into half-height rows; tie-
+    // break with x. Stable insertion sort over the small `kept` list.
+    let ordered = _ocr_sort_reading_order(kept, th)
+    return ordered
+}
+
+// Sort detections by score descending. We use a plain insertion sort
+// over the detection list -- O(n^2) but n is bounded by image area
+// after the threshold filter, which is small for the cases we ship.
+
+fn _ocr_sort_by_score_desc(dets) {
+    let out = list_new()
+    let i = 0
+    while i < len(dets) {
+        let d = dets[i]
+        let s = d[OCR_D_SCORE]
+        let inserted = 0
+        let j = 0
+        while j < len(out) {
+            if inserted == 0 {
+                let ds = out[j][OCR_D_SCORE]
+                if s > ds {
+                    _ocr_list_insert(out, j, d)
+                    inserted = 1
+                }
+            }
+            j = j + 1
+        }
+        if inserted == 0 { push(out, d) }
+        i = i + 1
+    }
+    return out
+}
+
+// Sort detections into reading order. The y bucket is computed as
+// y / (th / 2 if th >= 2 else 1) so a 1- or 2-pixel y wobble doesn't
+// reorder same-line characters; tie-break with x ascending.
+
+fn _ocr_sort_reading_order(dets, th) {
+    let bucket = th / 2
+    if bucket <= 0 { bucket = 1 }
+    let out = list_new()
+    let i = 0
+    while i < len(dets) {
+        let d = dets[i]
+        let by = d[OCR_D_Y] / bucket
+        let bx = d[OCR_D_X]
+        let inserted = 0
+        let j = 0
+        while j < len(out) {
+            if inserted == 0 {
+                let oj = out[j]
+                let oby = oj[OCR_D_Y] / bucket
+                let obx = oj[OCR_D_X]
+                let after = 0
+                if by < oby { after = 1 }
+                if by == oby {
+                    if bx < obx { after = 1 }
+                }
+                if after == 1 {
+                    _ocr_list_insert(out, j, d)
+                    inserted = 1
+                }
+            }
+            j = j + 1
+        }
+        if inserted == 0 { push(out, d) }
+        i = i + 1
+    }
+    return out
+}
+
+// _ocr_list_insert(list, idx, value): shift list[idx..] right by one
+// and place `value` at index `idx`. Used by the insertion sorts above.
+
+fn _ocr_list_insert(l, idx, value) {
+    let n = len(l)
+    push(l, 0)   // grow by one
+    let k = n
+    while k > idx {
+        list_set(l, k, l[k - 1])
+        k = k - 1
+    }
+    list_set(l, idx, value)
+}
+
+// ---- ocr_to_text: detection list -> string -------------------------------
+//
+// Reading-order sort already done in ocr_recognize_text. Here we
+// just concatenate the character codes into a string. We insert a
+// single space between detections whose row buckets differ (i.e.
+// across newlines, we emit a space; a proper newline would require
+// a richer text type than NOVA's strings carry).
+
+fn ocr_to_text(detections) {
+    let n = len(detections)
+    if n == 0 { return "" }
+    let s = ""
+    let prev_row = 0 - 1
+    let bucket = detections[0][OCR_D_TH] / 2
+    if bucket <= 0 { bucket = 1 }
+    let i = 0
+    while i < n {
+        let d = detections[i]
+        let row = d[OCR_D_Y] / bucket
+        if prev_row >= 0 {
+            if row != prev_row { s = s + " " }
+        }
+        // Convert int char code to a 1-char string.
+        let buf = alloc(2)
+        store8(buf + 0, d[OCR_D_CHAR])
+        store8(buf + 1, 0)
+        s = s + buf
+        prev_row = row
+        i = i + 1
+    }
+    return s
+}
+
+// ---- ocr_render_text: synthesize an image from text + gallery -----------
+//
+// Lays out one template per character side-by-side at a 1-pixel
+// horizontal gap. Returns [image_ptr, w, h]. The 1-pixel inter-char
+// gap stops adjacent templates from being interpreted as a single
+// merged glyph by the L2 distance metric. Returns [0, 0, 0] on
+// unknown character or empty gallery.
+
+fn ocr_render_text(text, gallery) {
+    let tw = ocr_gallery_template_width(gallery)
+    let th = ocr_gallery_template_height(gallery)
+    let g_size = ocr_gallery_size(gallery)
+    let n = len(text)
+    let r = list_new()
+    push(r, 0)
+    push(r, 0)
+    push(r, 0)
+    if g_size == 0 { return r }
+    if tw <= 0 { return r }
+    if th <= 0 { return r }
+    if n <= 0 { return r }
+    // Each character takes tw pixels; we leave NO inter-char gap so
+    // sliding-window detection picks up an exact match at multiples
+    // of tw with no false-positive "phantom" template at offset (1..tw-1).
+    let img_w = n * tw
+    let img_h = th
+    if img_w > OCR_MAX_DIM { return r }
+    if img_h > OCR_MAX_DIM { return r }
+    let area = img_w * img_h
+    let buf = alloc(area + 1)
+    // Zero-fill (black background).
+    let z = 0
+    while z < area {
+        store8(buf + z, 0)
+        z = z + 1
+    }
+    let i = 0
+    while i < n {
+        let ch = char_at(text, i)
+        let idx = _ocr_find_char(gallery, ch)
+        if idx < 0 {
+            // Unknown character -- fail.
+            let fail = list_new()
+            push(fail, 0)
+            push(fail, 0)
+            push(fail, 0)
+            return fail
+        }
+        let tmp = ocr_gallery_template_at(gallery, idx)
+        let x_off = i * tw
+        let dy = 0
+        while dy < th {
+            let dx = 0
+            while dx < tw {
+                let v = load8(tmp + dy * tw + dx)
+                store8(buf + dy * img_w + x_off + dx, v)
+                dx = dx + 1
+            }
+            dy = dy + 1
+        }
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    list_set(r, 0, buf)
+    list_set(r, 1, img_w)
+    list_set(r, 2, img_h)
+    return r
+}
+
+fn _ocr_find_char(gallery, ch) {
+    let chars = gallery[OCR_G_CHARS]
+    let n = len(chars)
+    let i = 0
+    while i < n {
+        if chars[i] == ch { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- ocr_default_gallery: built-in 8x8 ASCII font -----------------------
+//
+// 36 glyphs: uppercase A-Z + digits 0-9. Each glyph is an 8x8 0/255
+// stencil. The font is HAND-DRAWN, low-resolution (tighter than
+// real bitmap fonts) -- enough to demonstrate end-to-end recognition
+// but not a typeface you would ever ship for real human reading. The
+// glyphs are encoded one row at a time as an 8-bit mask, MSB on the
+// left, so a row "01100110" (== 0x66) means columns 1, 2, 5, 6 are
+// set (= 255) and the rest are 0.
+
+let _ocr_default_g = 0
+let _ocr_default_g_built = 0
+
+// Render the 8x8 mask into a freshly-allocated buffer and add it to
+// the gallery as character `ch`.
+fn _ocr_add_8x8_glyph(gallery, ch, m0, m1, m2, m3, m4, m5, m6, m7) {
+    let buf = alloc(OCR_FONT_W * OCR_FONT_H + 1)
+    _ocr_blit_row(buf, 0, m0)
+    _ocr_blit_row(buf, 1, m1)
+    _ocr_blit_row(buf, 2, m2)
+    _ocr_blit_row(buf, 3, m3)
+    _ocr_blit_row(buf, 4, m4)
+    _ocr_blit_row(buf, 5, m5)
+    _ocr_blit_row(buf, 6, m6)
+    _ocr_blit_row(buf, 7, m7)
+    store8(buf + OCR_FONT_W * OCR_FONT_H, 0)
+    ocr_gallery_add_char(gallery, ch, buf, OCR_FONT_W, OCR_FONT_H)
+}
+
+fn _ocr_blit_row(buf, row, mask) {
+    let col = 0
+    while col < OCR_FONT_W {
+        // MSB on the left: bit (OCR_FONT_W - 1 - col).
+        let shift = OCR_FONT_W - 1 - col
+        let bit = (mask / _ocr_pow2(shift)) - (mask / _ocr_pow2(shift + 1)) * 2
+        let v = 0
+        if bit == 1 { v = 255 }
+        store8(buf + row * OCR_FONT_W + col, v)
+        col = col + 1
+    }
+}
+
+fn _ocr_pow2(p) {
+    let r = 1
+    let i = 0
+    while i < p {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+fn ocr_default_gallery() {
+    if _ocr_default_g_built == 1 { return _ocr_default_g }
+    let g = ocr_template_gallery_new()
+
+    // --- digits 0-9 ------------------------------------------------------
+    // 0: 01111100 / 11000110 / 11001110 / 11010110 / 11100110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 48,
+        124, 198, 206, 214, 230, 198, 124, 0)
+    // 1: 00011000 / 00111000 / 01111000 / 00011000 / 00011000 / 00011000 / 01111110 / 00000000
+    _ocr_add_8x8_glyph(g, 49,
+        24, 56, 120, 24, 24, 24, 126, 0)
+    // 2: 01111100 / 11000110 / 00000110 / 00011100 / 01110000 / 11000000 / 11111110 / 00000000
+    _ocr_add_8x8_glyph(g, 50,
+        124, 198, 6, 28, 112, 192, 254, 0)
+    // 3: 01111100 / 11000110 / 00000110 / 00111100 / 00000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 51,
+        124, 198, 6, 60, 6, 198, 124, 0)
+    // 4: 00001100 / 00011100 / 00111100 / 01101100 / 11111110 / 00001100 / 00001100 / 00000000
+    _ocr_add_8x8_glyph(g, 52,
+        12, 28, 60, 108, 254, 12, 12, 0)
+    // 5: 11111110 / 11000000 / 11111100 / 00000110 / 00000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 53,
+        254, 192, 252, 6, 6, 198, 124, 0)
+    // 6: 00111100 / 01100000 / 11000000 / 11111100 / 11000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 54,
+        60, 96, 192, 252, 198, 198, 124, 0)
+    // 7: 11111110 / 11000110 / 00001100 / 00011000 / 00110000 / 00110000 / 00110000 / 00000000
+    _ocr_add_8x8_glyph(g, 55,
+        254, 198, 12, 24, 48, 48, 48, 0)
+    // 8: 01111100 / 11000110 / 11000110 / 01111100 / 11000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 56,
+        124, 198, 198, 124, 198, 198, 124, 0)
+    // 9: 01111100 / 11000110 / 11000110 / 01111110 / 00000110 / 00001100 / 01111000 / 00000000
+    _ocr_add_8x8_glyph(g, 57,
+        124, 198, 198, 126, 6, 12, 120, 0)
+
+    // --- uppercase A-Z ---------------------------------------------------
+    // A: 00111000 / 01101100 / 11000110 / 11000110 / 11111110 / 11000110 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 65,
+        56, 108, 198, 198, 254, 198, 198, 0)
+    // B: 11111100 / 11000110 / 11000110 / 11111100 / 11000110 / 11000110 / 11111100 / 00000000
+    _ocr_add_8x8_glyph(g, 66,
+        252, 198, 198, 252, 198, 198, 252, 0)
+    // C: 01111100 / 11000110 / 11000000 / 11000000 / 11000000 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 67,
+        124, 198, 192, 192, 192, 198, 124, 0)
+    // D: 11111000 / 11001100 / 11000110 / 11000110 / 11000110 / 11001100 / 11111000 / 00000000
+    _ocr_add_8x8_glyph(g, 68,
+        248, 204, 198, 198, 198, 204, 248, 0)
+    // E: 11111110 / 11000000 / 11000000 / 11111100 / 11000000 / 11000000 / 11111110 / 00000000
+    _ocr_add_8x8_glyph(g, 69,
+        254, 192, 192, 252, 192, 192, 254, 0)
+    // F: 11111110 / 11000000 / 11000000 / 11111100 / 11000000 / 11000000 / 11000000 / 00000000
+    _ocr_add_8x8_glyph(g, 70,
+        254, 192, 192, 252, 192, 192, 192, 0)
+    // G: 01111100 / 11000110 / 11000000 / 11001110 / 11000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 71,
+        124, 198, 192, 206, 198, 198, 124, 0)
+    // H: 11000110 / 11000110 / 11000110 / 11111110 / 11000110 / 11000110 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 72,
+        198, 198, 198, 254, 198, 198, 198, 0)
+    // I: 01111110 / 00011000 / 00011000 / 00011000 / 00011000 / 00011000 / 01111110 / 00000000
+    _ocr_add_8x8_glyph(g, 73,
+        126, 24, 24, 24, 24, 24, 126, 0)
+    // J: 00000110 / 00000110 / 00000110 / 00000110 / 00000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 74,
+        6, 6, 6, 6, 6, 198, 124, 0)
+    // K: 11000110 / 11001100 / 11011000 / 11110000 / 11011000 / 11001100 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 75,
+        198, 204, 216, 240, 216, 204, 198, 0)
+    // L: 11000000 / 11000000 / 11000000 / 11000000 / 11000000 / 11000000 / 11111110 / 00000000
+    _ocr_add_8x8_glyph(g, 76,
+        192, 192, 192, 192, 192, 192, 254, 0)
+    // M: 11000110 / 11101110 / 11111110 / 11010110 / 11000110 / 11000110 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 77,
+        198, 238, 254, 214, 198, 198, 198, 0)
+    // N: 11000110 / 11100110 / 11110110 / 11011110 / 11001110 / 11000110 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 78,
+        198, 230, 246, 222, 206, 198, 198, 0)
+    // O: 01111100 / 11000110 / 11000110 / 11000110 / 11000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 79,
+        124, 198, 198, 198, 198, 198, 124, 0)
+    // P: 11111100 / 11000110 / 11000110 / 11111100 / 11000000 / 11000000 / 11000000 / 00000000
+    _ocr_add_8x8_glyph(g, 80,
+        252, 198, 198, 252, 192, 192, 192, 0)
+    // Q: 01111100 / 11000110 / 11000110 / 11000110 / 11010110 / 11001100 / 01110110 / 00000000
+    _ocr_add_8x8_glyph(g, 81,
+        124, 198, 198, 198, 214, 204, 118, 0)
+    // R: 11111100 / 11000110 / 11000110 / 11111100 / 11011000 / 11001100 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 82,
+        252, 198, 198, 252, 216, 204, 198, 0)
+    // S: 01111100 / 11000110 / 11000000 / 01111100 / 00000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 83,
+        124, 198, 192, 124, 6, 198, 124, 0)
+    // T: 01111110 / 00011000 / 00011000 / 00011000 / 00011000 / 00011000 / 00011000 / 00000000
+    _ocr_add_8x8_glyph(g, 84,
+        126, 24, 24, 24, 24, 24, 24, 0)
+    // U: 11000110 / 11000110 / 11000110 / 11000110 / 11000110 / 11000110 / 01111100 / 00000000
+    _ocr_add_8x8_glyph(g, 85,
+        198, 198, 198, 198, 198, 198, 124, 0)
+    // V: 11000110 / 11000110 / 11000110 / 11000110 / 11000110 / 01101100 / 00111000 / 00000000
+    _ocr_add_8x8_glyph(g, 86,
+        198, 198, 198, 198, 198, 108, 56, 0)
+    // W: 11000110 / 11000110 / 11000110 / 11010110 / 11111110 / 11101110 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 87,
+        198, 198, 198, 214, 254, 238, 198, 0)
+    // X: 11000110 / 01101100 / 00111000 / 00010000 / 00111000 / 01101100 / 11000110 / 00000000
+    _ocr_add_8x8_glyph(g, 88,
+        198, 108, 56, 16, 56, 108, 198, 0)
+    // Y: 11000110 / 11000110 / 01101100 / 00111000 / 00011000 / 00011000 / 00011000 / 00000000
+    _ocr_add_8x8_glyph(g, 89,
+        198, 198, 108, 56, 24, 24, 24, 0)
+    // Z: 11111110 / 00000110 / 00001100 / 00011000 / 00110000 / 01100000 / 11111110 / 00000000
+    _ocr_add_8x8_glyph(g, 90,
+        254, 6, 12, 24, 48, 96, 254, 0)
+
+    _ocr_default_g = g
+    _ocr_default_g_built = 1
+    return g
+}
+
+// ---- chat-orchestration helper -------------------------------------------
+//
+// ocr_pgm_args(arg) -> formatted result string for the chat /ocr admin
+// command. arg is everything after `/ocr ` (a single PGM path).
+//
+// Output shapes:
+//   (/ocr needs a PATH -- usage: /ocr /tmp/test.pgm)
+//   (ocr FAILED on PATH: <pgm parser error>)
+//   (ocr <PATH>: text="HELLO" detections=5)
+//   (ocr <PATH>: text="" detections=0)
+
+fn ocr_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/ocr needs a PATH -- usage: /ocr /tmp/test.pgm)"
+    }
+    let r_p = pgm_parse_file(arg)
+    let err = pgm_result_error(r_p)
+    if len(err) > 0 {
+        return "(ocr FAILED on " + arg + ": " + err + ")"
+    }
+    let w = pgm_result_width(r_p)
+    let h = pgm_result_height(r_p)
+    let data = pgm_result_data(r_p)
+    if w > OCR_MAX_DIM {
+        return "(ocr FAILED: width " + int_to_str(w)
+            + " > " + int_to_str(OCR_MAX_DIM) + " cap; downsample first)"
+    }
+    if h > OCR_MAX_DIM {
+        return "(ocr FAILED: height " + int_to_str(h)
+            + " > " + int_to_str(OCR_MAX_DIM) + " cap; downsample first)"
+    }
+    let g = ocr_default_gallery()
+    let dets = ocr_recognize_text(data, w, h, g, OCR_CHAT_THRESHOLD)
+    let text = ocr_to_text(dets)
+    return "(ocr " + arg + ": text=\"" + text + "\" detections="
+        + int_to_str(len(dets)) + ")"
+}

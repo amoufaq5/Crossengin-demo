@@ -1,0 +1,3233 @@
+// CrossEngin interactive chat.
+//
+// Purpose
+//   The unified daemon's per-message logic, but driven from an stdin REPL
+//   instead of a fixed scripted episode. Boot once, then loop: read a line,
+//   post it as an EV_MESSAGE event, drain the scheduler to consume it, print
+//   the agent's reply. Because the agent stays alive across turns, learned
+//   vocabulary and decision-log entries PERSIST -- a follow-up message can use
+//   words taught earlier in the same conversation.
+//
+//   This is what the chat experience should be, and it's possible because the
+//   NOVA std/io fix (str_new + NUL-terminated string format) made io_input()
+//   return whole lines reliably. Before that fix, the bash-shim chat.sh was
+//   the only way to talk to the agent and each turn was a fresh boot.
+//
+//   Run with:  $NOVA_ROOT/nova run examples/crossengin_chat.nova
+//   Quit:      type "quit" / "exit" / Ctrl-D / an empty line at the prompt.
+//
+// ADRs exercised: same as examples/crossengin_daemon.nova -- this differs only
+//   in driving the loop from real stdin.
+
+import "std/syscall"
+import "std/string"
+import "std/io"
+
+import "../src/substrate/gate_router.nova"
+import "../src/substrate/part_lifecycle.nova"
+import "../src/scheduler/hybrid_scheduler.nova"
+import "../src/agent/loop_perception.nova"
+import "../src/agent/loop_memory.nova"
+import "../src/agent/loop_reasoning.nova"
+import "../src/agent/loop_emotion.nova"
+import "../src/agent/loop_goals.nova"
+import "../src/agent/loop_imagination_idle.nova"
+import "../src/parts/emotion/plasticity_mod.nova"
+import "../src/learning/predictive_coding_runtime.nova"
+import "../src/learning/self_learning_triggers.nova"
+import "../src/learning/ask_user_to_teach.nova"
+import "../src/io/transducers/input_transducer.nova"
+import "../src/io/effectors/output_generation.nova"
+import "../src/io/effectors/effector_gate.nova"
+import "../src/io/effectors/audio_speak.nova"
+import "../src/io/effectors/audio_tts.nova"
+import "../src/io/transducers/stt_seam.nova"
+import "../src/io/transducers/audio_pitch.nova"
+import "../src/io/transducers/audio_psola.nova"
+import "../src/io/transducers/audio_dsp.nova"
+import "../src/io/transducers/audio_spectrogram.nova"
+import "../src/io/transducers/audio_noise_reduce.nova"
+import "../src/io/transducers/audio_mfcc.nova"
+import "../src/io/transducers/audio_melody.nova"
+import "../src/io/transducers/audio_wakeword.nova"
+import "../src/io/transducers/audio_speaker_id.nova"
+import "../src/io/effectors/audio_voice_clone.nova"
+import "../src/io/transducers/visual_perception.nova"
+import "../src/io/transducers/video_perception.nova"
+import "../src/io/transducers/image_face_recognize.nova"
+import "../src/io/transducers/image_panorama.nova"
+import "../src/io/transducers/image_tracker.nova"
+import "../src/io/transducers/image_ocr.nova"
+import "../src/io/transducers/video_smooth.nova"
+import "../src/seed/first_atoms.nova"
+import "../src/seed/pack_registry.nova"
+import "../src/parts/reasoning/proof_checker.nova"
+import "../src/parts/meta/reflection_loop.nova"
+import "../src/parts/meta/meta_observer.nova"
+import "../src/learning/source_authority.nova"
+import "../src/persistence/snapshot_disk.nova"
+import "../src/session/session.nova"
+import "../src/safety/differential_privacy.nova"
+import "../src/safety/dp_budget_ui.nova"
+import "../src/learning/federated_aggregator.nova"
+import "../src/learning/secure_aggregation.nova"
+import "../src/chat/helpers.nova"
+import "../src/kg/semantic_search.nova"
+import "../src/kg/graph_clustering.nova"
+import "../src/kg/louvain.nova"
+import "../src/kg/pagerank.nova"
+import "../src/kg/link_prediction.nova"
+import "../src/kg/temporal.nova"
+import "../src/kg/query.nova"
+import "../src/kg/rule_inference.nova"
+import "../src/kg/rule_explain.nova"
+import "../src/io/transducers/kg_rss_ingest.nova"
+import "../src/perception/sensor_fusion.nova"
+import "../src/perception/lipsync.nova"
+import "voice_conversation.nova"
+import "voice_dialog.nova"
+
+let CE_CAP   = 128
+let CE_FIRST = 8
+
+// Default snapshot path for /save and /load. Set CE_SNAP_PATH to override.
+let CE_DEFAULT_SNAP_PATH = "/tmp/crossengin.snap"
+
+// Admin / safety flag. `/halt` flips it; effector_speak_governed honours the
+// halted bit and drains without speaking (ADR-0044 hard stop), `/resume`
+// clears it. Lives outside the REPL loop so commands can mutate it.
+let halted = 0
+
+// `/speak` (Phase 19 Tier-4 #1): the agent's last reply, captured after each
+// drained event. `/speak` with no text speaks this; mutated by the main loop.
+let _last_reply = ""
+
+// Phase 18 (Half A): in-process multi-tenant routing. `sreg` is the
+// SessionRegistry (built at boot); `active_id` is the id of the session every
+// turn currently dispatches into. `/switch <id>` flips `active_id` (creating
+// a fresh session under that id if it does not yet exist). The default
+// session is "default" with display-name "Aurora" -- existing
+// ./bin/crossengin-chat invocations stay bit-identical to before because no
+// /switch is ever issued.
+let sreg = sreg_new()
+let active_id = "default"
+
+// P1.1: process-shared source_authority registry. `/meta-feedback` and
+// `/meta-apply` read / mutate this to surface or commit tier changes derived
+// from the per-session meta-observer's promotion / atrophy rates. Built once
+// at boot with the ADR-0029 default host set; observer feedback can promote
+// or demote synthetic hosts (`learned:topic:fever`, `learned:builtin:seed`,
+// etc.) one tier at a time. See `mo_apply_feedback` in
+// `src/parts/meta/meta_observer.nova` for the threshold logic.
+let sauth = sa_default()
+
+// P2.10 -- per-active-session pending compacted snapshot. When non-zero,
+// `_pending_compact_snap` holds a snapshot value produced by /compact; the
+// next /save reads it (instead of rebuilding from live state) and clears
+// the slot. We also track `_pending_compact_session` so a /switch into a
+// different session invalidates the buffer. The buffer is a single global
+// -- /compact only operates on the active session.
+let _pending_compact_snap = 0
+let _pending_compact_session = ""
+
+// P3.1 visual perception seam (`src/io/transducers/visual_perception.nova`).
+// One per-process seam wires the PGM decoder so `/see PATH` can decode an
+// image and emit feature atoms. Built lazily on first /see call so chat
+// startup is unchanged when the visual seam is never used. Pre-registered
+// builtins: "stub" + "pgm"; CE_VP_DECODER overrides the default.
+let _vp_seam = 0
+
+// P3.2 video perception seam (`src/io/transducers/video_perception.nova`).
+// One per-process seam wires the Y4M decoder so `/play PATH [MAX_FRAMES]`
+// can decode a raw video stream, emit per-frame perception events
+// (image features + motion + scene-change), and print an operator-readable
+// summary. Lazy construction; CE_VID_DECODER picks the backend.
+let _vid_seam = 0
+
+// P3.7 federated aggregator state (per-process, single soul today). When
+// `/fed_join` connects to a coordinator, `_fed_agg` is constructed against
+// the active session's dp + meta_observer and `_fed_conn_fd` holds the
+// live TCP connection. `/fed_stats` runs a DRY-RUN emit (no consume) so
+// the operator can preview what the next FED_STAT batch would carry.
+// `/fed_leave` sends a FED_LEAVE line and closes the connection.
+// Federation is per-process (not per-session) for simplicity -- the audit
+// doc walks why multi-session federation is reserved for a future round.
+let _fed_agg = 0
+let _fed_conn_fd = 0 - 1
+
+// ---- structured-JSON logging (env-toggled) -------------------------------
+// `CE_LOG_JSON=1` flips one-line operator log records (the perceive line and
+// a few others) from human-readable to one-line JSON. Unset / "0" preserves
+// the legacy "agent>" + "       perceive(m=...)" output BIT-IDENTICAL so
+// existing tests, scripts/web.py, /metrics scrape, and runbooks keep
+// working. Toggle is read once per call so a mid-run env change is honoured
+// (cheap: getenv is just two syscalls).
+//
+// Schema (one object per line, no trailing fields):
+//   { "ts": <int>, "level": "info"|"warn"|"error", "session": "<id>",
+//     "event": "<name>", ... fields }
+//
+// `ts` is monotonic-nanoseconds-since-boot / 1e9 (seconds), which is enough
+// resolution for ordering inside one process and free of timezone questions.
+// `session` is the chat's active_id so multi-tenant logs are filterable.
+fn _log_json_enabled() {
+    let v = getenv("CE_LOG_JSON")
+    if v == 0 { return 0 }
+    if len(v) == 0 { return 0 }
+    if str_eq(v, "0") == 1 { return 0 }
+    return 1
+}
+
+// Escape a string for JSON. Conservative: quote, backslash, and control
+// bytes get the \uXXXX form. Newlines (which the perception input cap
+// already strips) also become \n so a record never spans two lines.
+fn _json_escape(s) {
+    let out = ""
+    let i = 0
+    let L = len(s)
+    while i < L {
+        let c = char_at(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else {
+            if c == 92 {
+                out = out + "\\\\"
+            } else {
+                if c == 10 {
+                    out = out + "\\n"
+                } else {
+                    if c == 13 {
+                        out = out + "\\r"
+                    } else {
+                        if c == 9 {
+                            out = out + "\\t"
+                        } else {
+                            if c < 32 {
+                                out = out + "\\u00"
+                                let hi = c / 16
+                                let lo = c - hi * 16
+                                if hi < 10 { out = out + int_to_str(hi) } else { out = out + substr("abcdef", hi - 10, 1) }
+                                if lo < 10 { out = out + int_to_str(lo) } else { out = out + substr("abcdef", lo - 10, 1) }
+                            } else {
+                                out = out + substr(s, i, 1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Monotonic seconds (nanotime / 1e9). Free of timezones; ordering is what
+// log aggregators care about, not wall-clock.
+fn _log_now_seconds() {
+    return nanotime() / 1000000000
+}
+
+// Emit one JSON object per line with the shared header (ts, level, session,
+// event) plus a flat list of [key, value, type] triples in `fields`.
+// `type` is "i" for int and "s" for string -- the caller passes it because
+// NOVA does not carry runtime type metadata for our purposes.
+fn _log_json(level, session_id, event, fields) {
+    let line = "{\"ts\":" + int_to_str(_log_now_seconds())
+        + ",\"level\":\"" + _json_escape(level) + "\""
+        + ",\"session\":\"" + _json_escape(session_id) + "\""
+        + ",\"event\":\"" + _json_escape(event) + "\""
+    let i = 0
+    while i < len(fields) {
+        let f = fields[i]
+        line = line + ",\"" + _json_escape(f[0]) + "\":"
+        if str_eq(f[2], "i") == 1 {
+            line = line + int_to_str(f[1])
+        } else {
+            line = line + "\"" + _json_escape(f[1]) + "\""
+        }
+        i = i + 1
+    }
+    line = line + "}"
+    io_println(line)
+    return 1
+}
+
+// Convenience: pack [key, value, type] for `_log_json`'s field list.
+fn _logf_i(key, val) {
+    let r = list_new()
+    push(r, key)
+    push(r, val)
+    push(r, "i")
+    return r
+}
+fn _logf_s(key, val) {
+    let r = list_new()
+    push(r, key)
+    push(r, val)
+    push(r, "s")
+    return r
+}
+
+// One-shot boot diagnostic: prints a single JSON line summarising the
+// runtime env that crossengin-doctor probes (snapshot path, dlog path,
+// session id). Called from main() right after the seed banner when
+// CE_LOG_JSON=1 -- under default mode the boot banner is unchanged.
+fn _log_boot_env(session_id) {
+    if _log_json_enabled() == 0 { return 0 }
+    let fields = list_new()
+    let snap_env = getenv("CE_SNAP_PATH")
+    if snap_env == 0 { snap_env = "" }
+    let dlog_env = getenv("CE_DLOG_PATH")
+    if dlog_env == 0 { dlog_env = "" }
+    push(fields, _logf_s("snap_path", snap_env))
+    push(fields, _logf_s("dlog_path", dlog_env))
+    _log_json("info", session_id, "boot", fields)
+    return 1
+}
+
+// ---- buffered line reader ------------------------------------------------
+// io_input() returns whatever sys_read drained -- on a terminal in line mode
+// that's one line, but on a pipe (or after a paste) it can be several lines
+// in one call. Buffer reads so the REPL always processes ONE line per turn.
+//
+// P1.7 (this edit): cap the line that ultimately reaches perception. The
+// root cause of the long-line segfault is the NOVA codegen pointer-threshold
+// bug at the smart-op dispatch (`_nova_mul` jumps to .mul_ptr when an
+// operand is >= 0x100000 = 1MB, interpreting it as a list / string pointer
+// and dereferencing it). The spreading-activation stage in src/reader/
+// accumulates per-token contributions into the activation map without an
+// upper clamp; at ~78 unknown tokens (or ~8 highly-connected known words
+// like "hello"/"see"/"help"/"fever") the per-node value crosses 1MB and
+// `fp_mul(src, SPREAD_DECAY)` segfaults.
+//
+// The spreading code is out of this fix's scope (the change set is the
+// chat reader only, per the brief), so the fix is the safety net: cap the
+// raw line below the trigger threshold and trim the tail if exceeded. The
+// byte cap is the brief's RAM safety value (4096); the token cap (64) is
+// the new codegen-bug guard. Empirically: alpha (unknown) crashes at 78
+// tokens; 'the' (mid-connected) crashes at 63; setting the cap at 64 keeps
+// 'the' just under the wire and stays comfortably below the alpha bound.
+// We also clip individual tokens past 128 bytes -- a single huge run of
+// the same character (think: paste-from-stream) hits the SAME codegen bug
+// inside word_lexical_vec's vec_cosine self-dot.
+//
+// On overflow we print a single "(warning: ...)" line so the operator
+// sees that content was dropped. Highly-connected concept words like
+// "hello" can still trip the bug at 8+ tokens -- that is a separate latent
+// issue in the reader and out of scope; failmode_chat_long_line.sh does
+// not probe it.
+
+let _MAX_LINE_BYTES  = 4096   // hard byte cap (paste / runaway safety)
+let _MAX_LINE_TOKENS = 64     // token-flood cap (codegen pointer-threshold)
+let _MAX_TOKEN_LEN   = 128    // per-token cap (single huge-word crash)
+
+let _buf = ""
+
+// Drain `_buf` + further io_input() chunks until a newline boundary.
+// Returns the next raw line WITHOUT the trailing newline; the residual
+// chunk (after the newline) stays in `_buf` for the next call.
+fn _read_line_raw() {
+    let i = 0
+    while i < len(_buf) {
+        if char_at(_buf, i) == 10 {
+            let line = substr(_buf, 0, i)
+            _buf = substr(_buf, i + 1, len(_buf) - i - 1)
+            return line
+        }
+        i = i + 1
+    }
+    let chunk = io_input()
+    if len(chunk) == 0 {
+        let line = _buf
+        _buf = ""
+        return line
+    }
+    _buf = _buf + chunk + "\n"
+    return _read_line_raw()
+}
+
+// Count whitespace-separated tokens in `line` (space = U+0020 = 32).
+// O(N) one pass; len(line) is evaluated once. Mirrors split-on-space
+// without allocating the parts list -- this runs on EVERY line so the
+// allocation matters.
+fn _line_token_count(line) {
+    let n = 0
+    let in_tok = 0
+    let L = len(line)
+    let i = 0
+    while i < L {
+        let c = char_at(line, i)
+        if c == 32 {
+            in_tok = 0
+        } else {
+            if in_tok == 0 {
+                n = n + 1
+                in_tok = 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Truncate `line` to its first `max_tokens` whitespace-separated tokens.
+// The cut point is right BEFORE the (max_tokens+1)th token, so trailing
+// whitespace from the kept run is preserved (harmless: the perception
+// pipeline trims). Returns `line` unchanged if the token count is at or
+// below `max_tokens`.
+fn _truncate_to_tokens(line, max_tokens) {
+    let L = len(line)
+    let count = 0
+    let in_tok = 0
+    let last_end = L
+    let i = 0
+    while i < L {
+        let c = char_at(line, i)
+        if c == 32 {
+            if in_tok == 1 { last_end = i }
+            in_tok = 0
+        } else {
+            if in_tok == 0 {
+                if count >= max_tokens {
+                    return substr(line, 0, last_end)
+                }
+                count = count + 1
+                in_tok = 1
+            }
+        }
+        i = i + 1
+    }
+    return line
+}
+
+// Clip each space-separated token in `line` to at most `max_len` bytes.
+// Returns [maybe_clipped_line, clipped_flag] -- the second slot is 0 if
+// no token was clipped, 1 if any token was. The caller surfaces the
+// one-line operator warning.
+fn _clip_tokens(line, max_len) {
+    let L = len(line)
+    let tok_start = 0
+    let in_tok = 0
+    let out = ""
+    let any_clip = 0
+    let i = 0
+    while i <= L {
+        let boundary = 0
+        if i == L {
+            boundary = 1
+        } else {
+            if char_at(line, i) == 32 { boundary = 1 }
+        }
+        if boundary == 1 {
+            if in_tok == 1 {
+                let tlen = i - tok_start
+                if tlen > max_len {
+                    out = out + substr(line, tok_start, max_len)
+                    any_clip = 1
+                } else {
+                    out = out + substr(line, tok_start, tlen)
+                }
+            }
+            if i < L {
+                out = out + " "
+            }
+            in_tok = 0
+            tok_start = i + 1
+        } else {
+            if in_tok == 0 {
+                tok_start = i
+                in_tok = 1
+            }
+        }
+        i = i + 1
+    }
+    let res = list_new()
+    push(res, out)
+    push(res, any_clip)
+    return res
+}
+
+// Read one logical line from stdin, capped to a safe length so the
+// downstream perception pipeline cannot trip the codegen pointer-
+// threshold bug (see the long block-comment above for the root cause).
+// Tail-truncation rather than head-truncation for the byte cap: in a
+// paste the operator is more likely watching the newest content, and
+// the front of a paste is more likely shell prompt / command-line junk
+// than message body. Token-cap keeps the FIRST N tokens so a normal
+// sentence with a long trailing copy/paste keeps its leading prompt.
+fn _take_line() {
+    let line = _read_line_raw()
+    let L = len(line)
+    if L > _MAX_LINE_BYTES {
+        let half = _MAX_LINE_BYTES / 2
+        line = substr(line, L - half, half)
+        io_println("(warning: input line over "
+            + int_to_str(_MAX_LINE_BYTES) + " bytes; kept last "
+            + int_to_str(half) + ")")
+    }
+    let toks = _line_token_count(line)
+    if toks > _MAX_LINE_TOKENS {
+        line = _truncate_to_tokens(line, _MAX_LINE_TOKENS)
+        io_println("(warning: input line over "
+            + int_to_str(_MAX_LINE_TOKENS) + " tokens; kept first "
+            + int_to_str(_MAX_LINE_TOKENS) + ")")
+    }
+    let clipped = _clip_tokens(line, _MAX_TOKEN_LEN)
+    if clipped[1] == 1 {
+        line = clipped[0]
+        io_println("(warning: long token(s) clipped to "
+            + int_to_str(_MAX_TOKEN_LEN) + " bytes)")
+    }
+    return line
+}
+
+// _intent1(role, lemma) -- extracted to src/chat/helpers.nova in P1.8 for
+// unit-test reach.
+
+// Build a gated signal and inject its strength into every routed destination
+// part (ADR-0009 path from event to substrate stimulus).
+fn _route_and_inject(reg, gate, stype, strength, moment) {
+    let s = sig_new(stype, 0 - 1, 0 - 1, strength, moment, 0)
+    let dests = gate_route(gate, s)
+    let i = 0
+    while i < len(dests) {
+        part_inject(reg, dests[i], strength)
+        i = i + 1
+    }
+    return dests
+}
+
+// Submit one trigger per unknown surface form (ADR-0026).
+fn _submit_curiosity(arb, lang, input_text) {
+    let toks = split(input_text, " ")
+    let ti = 0
+    while ti < len(toks) {
+        let tok = str_trim(toks[ti])
+        if len(tok) > 0 {
+            if word_find(lang, tok) == 0 {
+                slt_submit(arb, trigger_new(SLT_UNKNOWN_QUERY, tok, 800, 500))
+            }
+        }
+        ti = ti + 1
+    }
+    return 1
+}
+
+// Drain the trigger arbiter, ingesting up to 4 unknowns into the KGs at idle.
+// Returns how many were taught this cycle.
+fn _drain_and_teach(arb, kg, lang, now) {
+    let go = 1
+    let taught = 0
+    while go == 1 {
+        if slt_queue_size(arb) == 0 { go = 0 }
+        if go == 1 {
+            if taught >= 4 { go = 0 }
+        }
+        if go == 1 {
+            let trig = slt_arbiter_step(arb)
+            if trig != 0 {
+                let target = slt_target(trig)
+                au_ingest(lang, kg, target, "u:" + target, now)
+                taught = taught + 1
+            }
+            slt_clear_active(arb)
+        }
+    }
+    return taught
+}
+
+// ---- admin commands ------------------------------------------------------
+// All `/`-prefixed input is intercepted before it reaches the agent. Each
+// handler does its thing and returns -- the input is never processed as a user
+// message, so the agent's state is only what the admin explicitly changes.
+
+// _split_cmd("/cmd rest of line") -> ["/cmd", "args"] -- extracted to
+// src/chat/helpers.nova in P1.8 for unit-test reach.
+
+fn _admin_help() {
+    io_println("admin commands:")
+    io_println("  /help               this listing")
+    io_println("  /status             soul / mood / goal / KG / scheduler state")
+    io_println("  /history [N]        last N decision-log entries (default 5)")
+    io_println("  /why                explain the most recent decision")
+    io_println("  /why-deep [N]       recursive decision tree (default 3 levels, cap 8):")
+    io_println("                      operator chain + activating message + upstream evidence")
+    io_println("  /teach W            ingest W as a new word + concept binding")
+    io_println("  /learn TOPIC | URL | FILE | @batch | rss:URL | dir:PATH")
+    io_println("                      ingest /tmp/crossengin_learn_<tag>.txt")
+    io_println("                      (populate first with scripts/learn.sh ARG)")
+    io_println("  /reflect [DEPTH]    forward-simulate from current conclusions; record")
+    io_println("                      tentative inferences into the reflection KG (no act)")
+    io_println("  /pin W C            pin word W's belief to confidence C (0..1000)")
+    io_println("  /save [PATH]        durably write a snapshot to disk")
+    io_println("                      (default: $CE_SNAP_PATH or /tmp/crossengin.snap)")
+    io_println("  /load [PATH]        read a snapshot from disk and rehydrate the live")
+    io_println("                      soul (name/purpose/mood/OCEAN/const) + KGs (atoms")
+    io_println("                      merge by label; new labels create fresh atoms)")
+    io_println("  /snap_verify [PATH] recompute the KGS Merkle root and compare to the")
+    io_println("                      file's meta.merkle_root claim (R15E tamper detection)")
+    io_println("  /snap_sign_status [PATH] report Ed25519 signature attestation (R16A)")
+    io_println("  /halt               stop the effector (input keeps flowing)")
+    io_println("  /resume             un-halt")
+    io_println("  /meta               per-source promotion / atrophy rates")
+    io_println("  /meta-feedback      dry-run: what source_authority tier changes the")
+    io_println("                      observer's feedback WOULD apply right now")
+    io_println("  /meta-apply         commit those source_authority tier changes")
+    io_println("  /speak [TEXT]       synthesize and play TEXT (or last reply); writes")
+    io_println("                      /tmp/ce_speech.wav and plays via aplay if available")
+    io_println("                      (Klatt formant synth, ~44-phoneme ARPAbet inventory)")
+    io_println("  /say TEXT           full TTS pipeline: G2P (~120-word dict + rules) -> Klatt -> /tmp/tts_out.wav; paplay if avail (R21C)")
+    io_println("  /converse WAV       voice loop: STT (whisper/vosk) -> parse 'what is/how many/list all KIND' -> SPARQL -> TTS reply (R25B)")
+    io_println("  /listen [PATH]      capture (or read) WAV, gate through VAD (energy+ZCR),")
+    io_println("                      transcribe via stt_seam; prints transcript + segments (R7F)")
+    io_println("  /pitch PATH         autocorrelation F0 (pitch) contour over PATH WAV (R10F)")
+    io_println("  /pitch_shift PATH F TD-PSOLA pitch shift by factor F milli (1000=identity, R12D)")
+    io_println("  /clone REF.wav TEXT clone voice from REF.wav, synth TEXT to /tmp/cloned.wav (R13D)")
+    io_println("  /reverb PATH [WET] Schroeder reverb on PATH WAV (4 combs + 2 allpass, R14E)")
+    io_println("  /gate PATH [THR]   noise gate on PATH WAV (30 ms RMS, smoothed ramps, R14E)")
+    io_println("  /denoise PATH       spectral-subtraction Wiener noise reduction on PATH WAV (leading 300 ms = noise; R26C)")
+    io_println("  /spec PATH         STFT spectrogram of PATH WAV (integer Cooley-Tukey FFT, R16E)")
+    io_println("  /mfcc PATH         MFCC vector (first frame) of PATH WAV (26 Mel filters + DCT-13, R17B)")
+    io_println("  /melody PATH       melody extraction: F0 contour -> MIDI note sequence (R22F)")
+    io_println("  /wake_train PATH | /wake PATH    train + detect wake-word via MFCC+DTW; template /tmp/wakeword.template (R18C)")
+    io_println("  /spk_enroll L WAV | /spk_recognize WAV    enroll + nearest-neighbor speaker ID via MFCC+DTW gallery (R19D)")
+    io_println("  /see PATH           decode the PGM (.pgm) / PNG (.png) / JPEG (.jpg) image at PATH")
+    io_println("                      via the visual seam; prints dims + mean + feature atoms")
+    io_println("                      (image_dim_*, image_dark/mid/bright, image_bucket_<0..7>,")
+    io_println("                      ...). PNG: stored-DEFLATE only -- see IMAGE_AUDIT.md for")
+    io_println("                      the Huffman roadmap. JPEG: baseline header parse only")
+    io_println("                      (dims + diagnostic) -- see JPEG_AUDIT.md for entropy + IDCT.")
+    io_println("  /play PATH [N]      decode N frames (default 10) of the Y4M video at PATH")
+    io_println("                      via the video seam; emits per-frame events + motion +")
+    io_println("                      scene-change atoms. See VIDEO_AUDIT.md for codecs.")
+    io_println("  /match_images A B   detect + describe SIFT keypoints in A and B (PGM paths)")
+    io_println("                      then run Lowe's ratio-test matcher and print the count")
+    io_println("                      of matched pairs. See IMAGE_AUDIT.md for SIFT details.")
+    io_println("  /orb_match A B      ORB (FAST + rBRIEF, patent-free) variant of /match_images")
+    io_println("  /pano LEFT RIGHT    image-pair panorama stitching (R5C+R6D match + RANSAC + warp + blend) (R22D)")
+    io_println("  /hog PATH           HOG dense descriptor (Dalal-Triggs 2005); prints cells / dominant_bin / mag_mean")
+    io_println("  /detect T.pgm S.pgm HOG sliding-window template matching detector (R15C); prints # detections + best location")
+    io_println("  /faces PATH         Viola-Jones-style Haar cascade face detector (R16D, structural; see IMAGE_AUDIT.md scope)")
+    io_println("  /track VIDEO_DIR    track detector outputs across PGM frame sequence (Kalman + greedy Hungarian, R23D)")
+    io_println("  /smooth VIDEO_DIR   scene-level temporal smoothing over R23D tracker; reports dense field + continuity (R24F)")
+    io_println("  /lbp PATH           LBP (Local Binary Patterns, Ojala 1996) texture descriptor; prints dominant_code / entropy")
+    io_println("  /ocr PATH           template-matching OCR (R24C); slides built-in 8x8 ASCII font gallery; prints text + detection count")
+    io_println("  /face_enroll L PGM  enroll face L from PGM into the per-process LBP gallery (R18D)")
+    io_println("  /face_recognize PGM nearest-neighbor identity match against the LBP gallery; returns label or 'unknown' (R18D)")
+    io_println("  /depth L.pgm R.pgm  block-matching SAD stereo disparity + density label (R7E)")
+    io_println("  /flow prev next     Lucas-Kanade per-pixel optical flow (R10D)")
+    io_println("  /segment PATH [K]   spatial k-means image segmentation (R11E)")
+    io_println("  /slic PATH [K]      SLIC superpixel boundary-adherent segmentation (R12B)")
+    io_println("  /find QUERY         top-5 atoms by TF-IDF cosine similarity (R10C)")
+    io_println("  /communities        label-propagation community detection over KG xrefs (R11F)")
+    io_println("  /louvain            Louvain modularity-optimizing community detection (R12C)")
+    io_println("  /pagerank           PageRank centrality (top-5 atoms by importance) (R13E)")
+    io_println("  /predict ID [K] [M] link prediction (M in {cn,jaccard,aa}; default jaccard); top-K candidate edges from ID (R18B)")
+    io_println("  /temporal ID REL    Allen interval-algebra query (REL in {before,after,meets,overlaps,during,equals,...}); atoms in this relation to ID (R19C)")
+    io_println("  /rule_add RULE h(?a,?b)<-b1(?a,?b),b2(?b,?c) ; /rule_run [MAX]    register a Datalog rule / forward-chain to fixpoint, reports (rules,derived,iterations) (R20B)")
+    io_println("  /drule_add <rule> ; /drule_run    distributed (federated) Datalog rule add + run-to-fixpoint; ships in src/federation/distributed_rules.nova (no in-REPL gossip; see scenario_eeee) (R21B)")
+    io_println("  /explain ATOM_ID    recursive provenance walk over R20B's rule engine; prints indented proof tree with rule names, atom IDs, and ground facts (R22E)")
+    io_println("  /recall member ID   episodic memories where atom ID is in the cluster (R8F)")
+    io_println("  /recall window S E  episodic memories whose [first,last] overlaps [S,E]")
+    io_println("  /recall top         top-10 most-believed episodic memories")
+    io_println("  /recall recent      top-10 most-recently-seen episodic memories")
+    io_println("  /switch [ID]        list sessions (no arg) or activate/create ID")
+    io_println("  /seed [PACK]        list domain seed packs (no arg) or install PACK")
+    io_println("  /compact [--dry-run] compact the in-memory snapshot: drop dead atoms")
+    io_println("                      (mean<0.05), archived episodes, old moments, and")
+    io_println("                      sub-threshold synapses; next /save writes the")
+    io_println("                      compacted form. Knobs: CE_COMPACT_DEAD_BELIEF /")
+    io_println("                      _MOMENT_MAX_AGE_NS / _SYNAPSE_THRESHOLD")
+    io_println("  /__metrics__        (internal) machine-readable key=value lines for")
+    io_println("                      scripts/web.py's /metrics Prometheus scraper")
+    io_println("  /ann_query LABEL    (debug) top-5 nearest atoms by LSH-bucketed cosine")
+    io_println("  /prove P C [DEPTH]  find an operator-chain proof from atom labelled P")
+    io_println("                      to atom labelled C (bounded BFS, default depth 6)")
+    io_println("  /dp_status          print the session's differential-privacy budget")
+    io_println("  /dp_query TARGET    run a DP-noised KG query (TARGET=atoms; 0.1 eps)")
+    io_println("  /dp status          DP budget bar + remaining + last-query age (R12F)")
+    io_println("  /dp log [N]         last N DP queries (label/eps/age)")
+    io_println("  /dp warn THRESH     set warn-at-consumption threshold (milli-eps)")
+    io_println("  /dp reset T confirm reset budget to T milli-eps (audit-logged)")
+    io_println("  /fed_join URL       connect to a federated coordinator (default")
+    io_println("                      127.0.0.1:8777; URL=HOST:PORT) and send FED_JOIN")
+    io_println("  /fed_stats          dry-run preview of the local DP-noised per-source")
+    io_println("                      stats that the next FED_STAT batch would send")
+    io_println("  /fed_leave          drop out of the federation (send FED_LEAVE + close)")
+    io_println("  /leader             R19E Bully leader-election status (delegated to standalone driver, see scenario_zzz_leader.sh)")
+    io_println("  /attest_log PEER    R20F signed-snapshot attestation log for peer (delegated to standalone driver, see scenario_dddd_snapshot_attestation.sh)")
+    io_println("  /lipsync DIR W.wav  R23B audio-vision lip sync detection: per-frame mouth-open intensity gradient correlated with VAD voicing; DIR contains frame_001.pgm, ...")
+    io_println("  /nat status         R23E NAT traversal status (info-line; delegated to standalone driver, see scenario_oooo_nat_traversal.sh)")
+    io_println("  /snap_replicas      R23C federation snapshot replication -- list known remote roots + local replicas (delegated to standalone driver, see scenario_mmmm_snap_replication.sh)")
+    io_println("  /relay status       R26E gossip relay -- route via intermediary when direct dial blocked (delegated to standalone driver, see scenario_vvvv_gossip_relay.sh)")
+    io_println("  /relay_secure       R26E.2 Noise-XK wrap of relay payloads -- A and B share session keys; C forwards opaque ciphertext (delegated to standalone driver, see scenario_xxxx_relay_secure.sh)")
+    io_println("  /webrtc             R28E WebRTC data-channel signaling for browser-to-soul federation -- signaling half + DTLS stub; ships in src/federation/webrtc.nova (rtc_create_offer + rtc_receive_offer + rtc_receive_answer; rtc_send/rtc_recv return RTC_ERR_NEEDS_DTLS until R28E.2 wires DTLS-SRTP-SCTP-ICE)")
+    io_println("  /quit  /exit        exit chat")
+    return 1
+}
+
+fn _admin_status(sl, kg, refl_kg, log, engine, hs, stream, em, syn_g, sm, dp) {
+    io_println("soul     : " + soul_name(sl) + " (purpose: " + soul_purpose(sl) + ")")
+    io_println("mood     : valence=" + int_to_str(soul_mood_valence(sl))
+        + " arousal=" + int_to_str(soul_mood_arousal(sl)))
+    io_println("knowledge: " + int_to_str(kg_atom_count(kg)) + " atoms in shared KG, "
+        + int_to_str(refl_size(refl_kg)) + " tentative reflections")
+    io_println("audit    : " + int_to_str(dl_count(log)) + " decision-log entries")
+    // P0.1 follow-up: surface the durable-snapshot subsystems so a /load can
+    // be verified post-restart by reading /status. The headline acceptance
+    // test asserts moments/synapses survive a round-trip.
+    io_println("moments  : " + int_to_str(ms_count(stream)) + " moment(s), "
+        + int_to_str(em_count(em)) + " episode(s)")
+    io_println("synapses : " + int_to_str(syn_live(syn_g)) + " live edge(s) (reasoning part)")
+    io_println("selfmodel: " + int_to_str(self_model_count(sm)) + " competence record(s)")
+    io_println("scheduler: tick=" + int_to_str(hs_now(hs)) + " rate=" + int_to_str(hs_rate(hs)) + "Hz")
+    io_println(dpui_status_pane_line(dp))
+    let g = goal_arbitrate(engine)
+    if g >= 0 {
+        io_println("goal     : #" + int_to_str(g) + " " + goal_name(engine, g))
+    } else {
+        io_println("goal     : (none active)")
+    }
+    if halted == 1 { io_println("effector : HALTED") }
+    return 1
+}
+
+fn _admin_history(log, n) {
+    let total = dl_count(log)
+    if total == 0 { io_println("(no decisions yet)") return 1 }
+    let from = total - n
+    if from < 0 { from = 0 }
+    let i = from
+    while i < total {
+        let e = dl_get(log, i)
+        io_println("  #" + int_to_str(dl_seq(e)) + " " + dlk_name(dl_kind(e))
+            + " " + act_name(dl_action_type(e))
+            + " tier=" + perm_tier_name(dl_perm_tier(e))
+            + " outcome=" + out_name(dl_outcome(e)))
+        i = i + 1
+    }
+    return 1
+}
+
+fn _admin_why(log) {
+    let n = dl_count(log)
+    if n == 0 { io_println("(no decisions yet)") return 1 }
+    let e = dl_get(log, n - 1)
+    io_println("most recent: #" + int_to_str(dl_seq(e)) + " " + act_name(dl_action_type(e))
+        + " (" + rev_class_name(dl_rev_class(e)) + ")")
+    io_println("  tier    : " + perm_tier_name(dl_perm_tier(e)))
+    io_println("  outcome : " + out_name(dl_outcome(e)))
+    io_println("  trace   : " + int_to_str(len(dl_trace(e))) + " node(s)")
+    return 1
+}
+
+// Run one reflection cycle on the agent's current reasoning conclusions.
+// Forward-simulates them in ikg (depth 4 by default), accumulates derived
+// labels into refl_kg as Beta(2,1) tentative atoms, and prints what came up.
+// The live blackboard / ctx is not touched.
+fn _admin_reflect(ctx, kg, ikg, refl_kg, arg, moment) {
+    let concs = ctx_conclusions(ctx)
+    if len(concs) == 0 {
+        io_println("(nothing recent to reflect on -- send a non-trivial message first)")
+        return 1
+    }
+    let depth = 4
+    if len(arg) > 0 {
+        let d = rt_str_to_int(arg)
+        if d > 0 { depth = d }
+    }
+    // min_confidence=0: accept every forward-simulated candidate; refl_kg
+    // records each as Beta(2,1) so the prior gates premature belief, and
+    // promotion still requires crossing the 750 corroboration threshold.
+    let labels = refl_run(kg, ikg, refl_kg, refl_seed_from_ids(concs), depth, 0, moment)
+    let n = len(labels)
+    if n == 0 {
+        io_println("(reflected on " + int_to_str(len(concs)) + " concept(s); no new inferences)")
+        return 1
+    }
+    let line = "(reflected on " + int_to_str(len(concs)) + " concept(s); "
+        + int_to_str(n) + " tentative inference(s):"
+    let i = 0
+    while i < n {
+        line = line + " " + labels[i]
+        if i < n - 1 { line = line + "," }
+        i = i + 1
+    }
+    io_println(line + ")  refl_kg=" + int_to_str(refl_size(refl_kg)))
+    return 1
+}
+
+fn _admin_teach(lang, kg, mo, word, now) {
+    if len(word) == 0 { io_println("(/teach needs a word)") return 1 }
+    let a = au_ingest(lang, kg, word, "u:" + word, now)
+    // ADR-0050: tag the ingested concept atom as "user-teach" so the
+    // meta-observer can score the teach path's promotion / atrophy rates.
+    if a != 0 { mo_attribute(mo, "user-teach", atom_id(a)) }
+    io_println("(ingested '" + word + "' -- " + int_to_str(kg_atom_count(kg)) + " atoms now)")
+    return 1
+}
+
+// ---- multi-source learning helpers ---------------------------------------
+// /learn accepts SIX source kinds: TOPIC (bare word), URL (http://...),
+// FILE (/abs, ./rel, ../rel) and three new composite kinds (P1.5):
+// BATCH (@/path/urls.txt -- one URL per line), RSS (rss:URL -- feed of links),
+// DIR (dir:/path -- recursive .txt+.md walk). The scripts/learn.sh fetcher
+// derives a short alphanumeric <tag> from the argument and writes its output
+// to /tmp/crossengin_learn_<tag>.txt and ..._<tag>_triples.txt; for composite
+// kinds it also writes per-item caches (per-URL or per-file) under their own
+// tags and concatenates them into the combined cache for the composite tag.
+// The chat must re-derive the SAME <tag> from the user-typed argument to
+// find those files. _learn_kind classifies the argument; _learn_tag computes
+// the tag. The two helpers MUST stay byte-for-byte in lockstep with the
+// case + sed pipeline in scripts/learn.sh -- see the comment at the top of
+// that script.
+
+
+// LEARN_KIND_* constants, _learn_kind, _learn_kind_name, _is_tag_alnum,
+// _cap_tag, _learn_tag_url, _learn_tag_file, _tag_sanitise, _learn_tag_batch,
+// _learn_tag_rss, _basename, _learn_tag_dir, _learn_tag, _split_triple --
+// all extracted to src/chat/helpers.nova in P1.8 for unit-test reach (see
+// tests/unit/test_chat_helpers.nova).
+
+// Map a textual relation tag to an ROP_* kind, or 0 if unrecognised.
+fn _rel_to_op_kind(r) {
+    if str_eq(r, "causal") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "has")    == 1 { return ROP_CAUSAL }
+    if str_eq(r, "is_a")   == 1 { return ROP_IMPLY }
+    return 0
+}
+
+// Ingest the triples sidecar file: one "S|R|O" per line. For each triple
+// whose subject AND object are both real atoms in `kg` (either from seed
+// or from the vocabulary just ingested), spawn a reasoning operator atom
+// linking premise -> conclusion under the appropriate ROP_* kind. Triples
+// referring to unknown atoms are silently dropped -- the bash extractor is
+// permissive on purpose; this is the ground-truth filter.
+//
+// `tag` is the lockstep-derived cache key (see _learn_tag); `src_prefix` is
+// the human-readable source attribution stamped into each operator's label
+// so a future meta-loop / source-authority pass can attribute the operator
+// back to its source (Tier 2 item #3). Today's plumbing is the label prefix
+// itself plus the kind-stamped log line _admin_learn prints -- ADR-0029's
+// source_authority module already understands "src:..." conventions, so a
+// future meta-observer can mine the label.
+fn _admin_learn_triples(kg, tag, src_prefix, now) {
+    let path = "/tmp/crossengin_learn_" + tag + "_triples.txt"
+    let content = read_file(path)
+    if content == 0 { return 0 }
+    if len(content) == 0 { return 0 }
+    let ops = 0
+    let i = 0
+    let line_start = 0
+    let n = len(content)
+    while i <= n {
+        let bound = 0
+        if i == n {
+            bound = 1
+        } else {
+            if char_at(content, i) == 10 { bound = 1 }
+        }
+        if bound == 1 {
+            if i > line_start {
+                let line = str_trim(substr(content, line_start, i - line_start))
+                if len(line) > 0 {
+                    let parts = _split_triple(line)
+                    if parts != 0 {
+                        let s_atom = kg_find_atom(kg, parts[0])
+                        let o_atom = kg_find_atom(kg, parts[2])
+                        if s_atom != 0 {
+                            if o_atom != 0 {
+                                let kind = _rel_to_op_kind(parts[1])
+                                if kind != 0 {
+                                    let label = src_prefix + ":"
+                                        + parts[0] + "-" + parts[1] + "->" + parts[2]
+                                    rop_new(kg, kind, atom_id(s_atom),
+                                            atom_id(o_atom), label, now)
+                                    ops = ops + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    return ops
+}
+
+// Ingest a single /tmp/crossengin_learn_<tag>.txt + the matching triples
+// sidecar. Returns a 2-element list [words_ingested, ops_ingested], or 0 if
+// no cache exists at the given tag. Factored out so the P1.5 BATCH dispatch
+// can call it once per URL after the combined-cache ingestion.
+fn _learn_ingest_one(lang, kg, tag, src_prefix, now) {
+    let path = "/tmp/crossengin_learn_" + tag + ".txt"
+    let content = read_file(path)
+    if content == 0 { return 0 }
+    if len(content) == 0 {
+        let zero = list_new()
+        push(zero, 0)
+        push(zero, 0)
+        return zero
+    }
+    let count = 0
+    let i = 0
+    let line_start = 0
+    let n = len(content)
+    while i <= n {
+        let bound = 0
+        if i == n {
+            bound = 1
+        } else {
+            if char_at(content, i) == 10 { bound = 1 }
+        }
+        if bound == 1 {
+            if i > line_start {
+                let word = str_trim(substr(content, line_start, i - line_start))
+                if len(word) > 0 {
+                    au_ingest(lang, kg, word, src_prefix, now)
+                    count = count + 1
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    let ops = _admin_learn_triples(kg, tag, src_prefix, now)
+    let res = list_new()
+    push(res, count)
+    push(res, ops)
+    return res
+}
+
+// Walk a BATCH list file (the @arg points at a local text file with one URL
+// per line) and call ingest_one for each per-URL tag. The combined cache was
+// already ingested by the caller; this pass attributes each per-URL cache
+// back to its own URL-derived tag so the P13 meta_observer can score URLs
+// individually. Blank lines and '#' comments are skipped, matching the bash
+// loop in scripts/learn.sh. Returns [words_added, ops_added, urls_seen].
+fn _learn_ingest_batch_per_url(lang, kg, list_path, now) {
+    let words = 0
+    let ops = 0
+    let urls = 0
+    let content = read_file(list_path)
+    if content == 0 {
+        let res = list_new()
+        push(res, 0) push(res, 0) push(res, 0)
+        return res
+    }
+    let n = len(content)
+    let i = 0
+    let line_start = 0
+    while i <= n {
+        let bound = 0
+        if i == n {
+            bound = 1
+        } else {
+            if char_at(content, i) == 10 { bound = 1 }
+        }
+        if bound == 1 {
+            if i > line_start {
+                let url = str_trim(substr(content, line_start, i - line_start))
+                // Skip blanks and '#' comments (comment char is U+0023 = 35).
+                let skip = 0
+                if len(url) == 0 { skip = 1 }
+                if skip == 0 {
+                    if char_at(url, 0) == 35 { skip = 1 }
+                }
+                if skip == 0 {
+                    urls = urls + 1
+                    // Each URL gets its own tag via _learn_tag (which dispatches
+                    // to _learn_tag_url for http(s):// inputs) and its own
+                    // attribution prefix so the meta-observer can promote /
+                    // atrophy per URL, not per batch.
+                    let url_tag = _learn_tag(url)
+                    let url_prefix = "src:url:" + url_tag
+                    let pair = _learn_ingest_one(lang, kg, url_tag, url_prefix, now)
+                    if pair != 0 {
+                        words = words + pair[0]
+                        ops = ops + pair[1]
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    let res = list_new()
+    push(res, words) push(res, ops) push(res, urls)
+    return res
+}
+
+// Read /tmp/crossengin_learn_<tag>.txt (one word per line, populated by
+// scripts/learn.sh which does the actual web fetch / file read / text
+// extraction) and ingest each word via the same au_ingest path /teach uses.
+// NOVA has no fork/exec, so the network fetch lives in bash; the agent only
+// reads from /tmp.
+//
+// `arg` is the literal argument the user typed at the chat prompt. We
+// classify with _learn_kind and derive <tag> with _learn_tag, both of which
+// match scripts/learn.sh byte for byte so the cache file resolves on the
+// first try regardless of which source kind the operator used:
+//   - TOPIC / URL / FILE: single cache file
+//   - BATCH (@list):      combined cache + per-URL caches iterated here
+//   - RSS  (rss:URL):     combined cache only (per-link caches are already
+//                         merged into the combined cache by bash)
+//   - DIR  (dir:PATH):    combined cache only (per-file caches are already
+//                         merged into the combined cache by bash)
+//
+// After vocabulary, also try the structural sidecar
+// /tmp/crossengin_learn_<tag>_triples.txt -- one "S|R|O" per line -- and
+// turn each S/R/O whose endpoints are now real atoms into a reasoning
+// operator (ADR-0031), giving the agent STRUCTURE on top of vocabulary.
+//
+// Source attribution: every ingested word and operator is stamped with a
+// "src:<kind>:<tag>" prefix on its context / label. ADR-0029's source_authority
+// module already supports a Tier-A/B/C registry keyed off host, and the
+// "src:" convention threads cleanly into the same dispatch. Today's pipeline
+// just stores the prefix; the P13 meta_observer (separate agent) is the
+// designated consumer for promoting / atrophying atoms by source. See the
+// comment block in src/learning/source_authority.nova for the contract.
+fn _admin_learn(lang, kg, arg, now) {
+    if len(arg) == 0 {
+        io_println("(/learn needs an argument; first run: scripts/learn.sh <topic|url|file|@batch|rss:URL|dir:PATH>)")
+        return 1
+    }
+    let kind = _learn_kind(arg)
+    let kname = _learn_kind_name(kind)
+    let tag = _learn_tag(arg)
+    let path = "/tmp/crossengin_learn_" + tag + ".txt"
+    // Stamp each ingested atom/operator with "src:<kind>:<tag>" so a future
+    // meta-loop / source-authority pass (ADR-0029) can attribute corroboration
+    // and atrophy back to where the evidence came from. The chat-side hook is
+    // the only one available right now; the P13 meta_observer will mine this
+    // string from the ingestion log line and atom labels.
+    let src_prefix = "src:" + kname + ":" + tag
+    // First, ingest the (combined or single) cache the same way for all kinds.
+    let primary = _learn_ingest_one(lang, kg, tag, src_prefix, now)
+    if primary == 0 {
+        io_println("(no cache for '" + arg + "' [" + kname + "] at " + path + ")")
+        io_println("  run first:  scripts/learn.sh " + arg)
+        return 1
+    }
+    let count = primary[0]
+    let ops = primary[1]
+    if count == 0 {
+        if ops == 0 {
+            io_println("(empty cache for '" + arg + "' [" + kname + "])")
+            return 1
+        }
+    }
+    // BATCH adds a per-URL pass on top of the combined ingestion: the chat
+    // reads the same urls.txt the bash batch loop read, derives each URL's
+    // tag with _learn_tag, and pulls /tmp/crossengin_learn_<url-tag>.txt
+    // separately so each URL gets its own src: attribution. Per-URL caches
+    // that don't exist on disk are silently skipped (matches bash batch's
+    // tolerance for individual fetch failures).
+    if kind == LEARN_KIND_BATCH {
+        let list_path = arg
+        if len(list_path) >= 1 {
+            if char_at(list_path, 0) == 64 {
+                list_path = substr(list_path, 1, len(list_path) - 1)
+            }
+        }
+        let extra = _learn_ingest_batch_per_url(lang, kg, list_path, now)
+        let after = kg_atom_count(kg)
+        io_println("(learned about '" + arg + "' [" + kname + "]: combined "
+            + int_to_str(count) + " word(s) " + int_to_str(ops)
+            + " op(s); per-URL " + int_to_str(extra[0]) + " word(s) "
+            + int_to_str(extra[1]) + " op(s) across " + int_to_str(extra[2])
+            + " URL(s), KG=" + int_to_str(after) + ")")
+        return 1
+    }
+    let after = kg_atom_count(kg)
+    io_println("(learned about '" + arg + "' [" + kname + "]: " + int_to_str(count)
+        + " word(s), " + int_to_str(ops) + " operator(s) ingested, KG="
+        + int_to_str(after) + ")")
+    return 1
+}
+
+fn _admin_pin(lang, word, conf_str) {
+    if len(word) == 0 {
+        io_println("(usage: /pin WORD CONFIDENCE  -- confidence is 0..1000)")
+        return 1
+    }
+    if len(conf_str) == 0 {
+        io_println("(usage: /pin " + word + " CONFIDENCE  -- confidence is 0..1000)")
+        return 1
+    }
+    let w = word_find(lang, word)
+    if w == 0 { io_println("(no such word: '" + word + "')") return 1 }
+    let conf = rt_str_to_int(conf_str)
+    if conf < 0 { conf = 0 }
+    if conf > 1000 { conf = 1000 }
+    let b = atom_belief(w)
+    list_set(b, 0, conf * 10)
+    list_set(b, 1, (1000 - conf) * 10)
+    atom_payload_set(w, "pinned", 1)
+    io_println("(pinned '" + word + "' to confidence " + int_to_str(conf) + "/1000)")
+    return 1
+}
+
+fn _admin_halt() {
+    halted = 1
+    io_println("(halted -- effector will drain; constitution still applies)")
+    return 1
+}
+
+fn _admin_resume() {
+    halted = 0
+    io_println("(resumed)")
+    return 1
+}
+
+// `/speak [TEXT]` (Phase 19 Tier-4 #1, ADR-0014): synthesize TEXT (or the
+// agent's last reply if TEXT is empty) to a WAV at $CE_SPEECH_PATH (default
+// /tmp/ce_speech.wav). Composes the three-mode audio bridge in
+// audio_speak.nova: Mode 1 pure-NOVA phoneme synth always works; Mode 2
+// escalates to espeak when on PATH; Mode 3 best-effort plays via aplay or
+// paplay. The seam is closed regardless of which mode fires -- the WAV is
+// the load-bearing artifact, so the prompt reports its path. The live
+// language KG is passed so any seed phoneme atoms drive the carrier.
+fn _admin_speak(lang, arg) {
+    let text = arg
+    if len(text) == 0 { text = _last_reply }
+    if len(text) == 0 {
+        io_println("(/speak needs TEXT, or the agent must reply at least once first)")
+        return 1
+    }
+    let path = getenv("CE_SPEECH_PATH")
+    if len(path) == 0 { path = "/tmp/ce_speech.wav" }
+    let ok = effector_speak_audio_kg(text, lang, path)
+    if ok == 1 {
+        io_println("(spoke '" + text + "' [" + audio_modes_available()
+            + "]; wrote " + path + ")")
+    } else {
+        io_println("(speak FAILED: could not write " + path
+            + " -- check directory exists / permissions)")
+    }
+    return 1
+}
+
+// `/listen [PATH]` (R7F, ADR-0014): capture (or read) a WAV, run VAD over
+// it, and hand the speech-only PCM to the STT seam. With no arg, captures
+// a fresh 5 s clip via audio_capture; with PATH, transcribes the existing
+// WAV at PATH. Prints the transcript + segment count + backend used.
+fn _admin_listen(arg) {
+    let path = arg
+    if len(path) == 0 {
+        let cap = audio_capture_state_new()
+        path = audio_capture_wav_path(cap)
+        if audio_capture_record(cap, 0, path) == 0 {
+            io_println("(listen FAILED: capture script returned non-zero)")
+            return 1
+        }
+    }
+    let seam = stt_seam_new()
+    let r = stt_transcribe_wav_vad(seam, path)
+    let nseg = stt_vad_segments(r)
+    io_println("(heard '" + stt_result_transcript(r) + "' [vad_segments="
+        + int_to_str(nseg) + ", backend=" + stt_seam_backend_name(seam)
+        + "]; read " + path + ")")
+    return 1
+}
+
+// P3.1 visual-perception command. Decodes the PGM image at the operator-
+// supplied path via the pluggable `visual_perception.nova` seam (PGM
+// backend default; STUB available via CE_VP_DECODER=stub). Prints the
+// image dimensions, the operator-readable summary
+// (`<w>x<h> mean=<mean> dom_bucket=<dom> entropy=<entropy>`), and the
+// list of feature atoms the substrate would receive on a perception
+// path. Non-PGM inputs are not yet supported in pure NOVA -- operators
+// can pre-convert via `scripts/image_to_pgm.sh PATH` (ImageMagick /
+// ffmpeg shim) and pass the resulting `.pgm`. See `IMAGE_AUDIT.md` for
+// the realistic JPEG/PNG/feature-extraction roadmap.
+fn _admin_see(arg) {
+    if len(arg) == 0 {
+        io_println("(/see needs PATH -- usage: /see /tmp/test.pgm)")
+        return 1
+    }
+    // Lazy seam construction: pay the cost only when /see is exercised.
+    if _vp_seam == 0 { _vp_seam = vp_seam_new() }
+    let r = vp_decode_image(_vp_seam, arg)
+    let err = vp_result_error(r)
+    if len(err) > 0 {
+        io_println("(see FAILED: " + err + ")")
+        return 1
+    }
+    let feats = vp_result_features(r)
+    let summary = vp_seam_last_summary(_vp_seam)
+    // Report the decoder actually used (may differ from the seam's
+    // default when extension routing dispatched .png -> PNG / .pgm -> PGM).
+    let dec_name = vp_seam_last_decoder_name(_vp_seam)
+    if len(dec_name) == 0 { dec_name = vp_seam_decoder_name(_vp_seam) }
+    io_println("(saw image " + arg + " [" + summary
+        + ", decoder=" + dec_name + "])")
+    let i = 0
+    let labels = ""
+    while i < len(feats) {
+        if i > 0 { labels = labels + " " }
+        labels = labels + feats[i]
+        i = i + 1
+    }
+    io_println("  features: " + labels)
+    return 1
+}
+
+// P3.2 video-perception command. Decodes up to MAX_FRAMES frames of the
+// raw Y4M (YUV4MPEG2) stream at the operator-supplied path via the
+// pluggable `video_perception.nova` seam (Y4M backend default; STUB
+// available via CE_VID_DECODER=stub). For each frame the seam emits one
+// `EV_MESSAGE`-shaped line carrying image features + motion + scene-
+// change labels; the admin prints the per-frame lines plus the operator-
+// readable summary (`played PATH: N frame(s), <w>x<h>, motion=<...>,
+// scene changes: <K>`). H.264 / H.265 / AV1 / VP9 decode in pure NOVA is
+// MONTHS of work each (see `VIDEO_AUDIT.md`); until then operators
+// pre-convert via `scripts/video_to_y4m.sh PATH` (ffmpeg shim) and
+// pass the resulting `.y4m`.
+fn _admin_play(arg) {
+    if len(arg) == 0 {
+        io_println("(/play needs PATH -- usage: /play /tmp/test.y4m [MAX_FRAMES])")
+        return 1
+    }
+    // Split "PATH" or "PATH N" -- the helper splits on first whitespace.
+    let parts = _split_cmd(arg)
+    let path = parts[0]
+    let max_frames = 10
+    if len(parts[1]) > 0 {
+        let parsed = rt_str_to_int(parts[1])
+        if parsed > 0 { max_frames = parsed }
+    }
+    if _vid_seam == 0 { _vid_seam = vid_seam_new() }
+    let r = vid_decode_video(_vid_seam, path, max_frames)
+    let err = vid_result_error(r)
+    if len(err) > 0 {
+        io_println("(play FAILED: " + err + ")")
+        return 1
+    }
+    let events = vid_result_events(r)
+    let i = 0
+    while i < len(events) {
+        io_println("  " + events[i])
+        i = i + 1
+    }
+    let summary = vid_seam_last_summary(_vid_seam)
+    io_println("(" + summary + ", decoder=" + vid_seam_decoder_name(_vid_seam) + ")")
+    return 1
+}
+
+// P3.3 cont. v2: `/match_images PATH_A PATH_B` -- detect + describe SIFT
+// keypoints in two PGM images and report Lowe-ratio-test matches between
+// them. The descriptor + matcher pair lands the "image-to-image
+// correspondence" half of SIFT that the detection-only drop deferred.
+// Operator workflow: convert any input format to PGM via
+// scripts/image_to_pgm.sh, then `/match_images a.pgm b.pgm`. Output:
+//   (matched <N> keypoint(s); A=<kpa>kps B=<kpb>kps)
+// or
+//   (match_images FAILED: <reason>)
+// when either decode fails.
+fn _admin_match_images(arg) {
+    if len(arg) == 0 {
+        io_println("(/match_images needs two PATHs -- usage: /match_images A.pgm B.pgm)")
+        return 1
+    }
+    let parts = _split_cmd(arg)
+    let path_a = parts[0]
+    let path_b = parts[1]
+    if len(path_b) == 0 {
+        io_println("(/match_images needs TWO paths -- got 1)")
+        return 1
+    }
+    let r_a = pgm_parse_file(path_a)
+    let err_a = pgm_result_error(r_a)
+    if len(err_a) > 0 {
+        io_println("(match_images FAILED on A: " + err_a + ")")
+        return 1
+    }
+    let r_b = pgm_parse_file(path_b)
+    let err_b = pgm_result_error(r_b)
+    if len(err_b) > 0 {
+        io_println("(match_images FAILED on B: " + err_b + ")")
+        return 1
+    }
+    let w_a = pgm_result_width(r_a)
+    let h_a = pgm_result_height(r_a)
+    let d_a = pgm_result_data(r_a)
+    let w_b = pgm_result_width(r_b)
+    let h_b = pgm_result_height(r_b)
+    let d_b = pgm_result_data(r_b)
+    if w_a < 32 {
+        io_println("(match_images FAILED: A must be >= 32x32 (SIFT needs 3 octaves))")
+        return 1
+    }
+    if h_a < 32 {
+        io_println("(match_images FAILED: A must be >= 32x32 (SIFT needs 3 octaves))")
+        return 1
+    }
+    if w_b < 32 {
+        io_println("(match_images FAILED: B must be >= 32x32 (SIFT needs 3 octaves))")
+        return 1
+    }
+    if h_b < 32 {
+        io_println("(match_images FAILED: B must be >= 32x32 (SIFT needs 3 octaves))")
+        return 1
+    }
+    let kps_a = sift_keypoints(d_a, w_a, h_a, 200)
+    let kps_b = sift_keypoints(d_b, w_b, h_b, 200)
+    let descs_a = sift_describe_all(d_a, w_a, h_a, kps_a)
+    let descs_b = sift_describe_all(d_b, w_b, h_b, kps_b)
+    let vecs_a = list_new()
+    let vecs_b = list_new()
+    let i = 0
+    while i < len(descs_a) {
+        push(vecs_a, sift_descriptor_vec(descs_a[i]))
+        i = i + 1
+    }
+    let j = 0
+    while j < len(descs_b) {
+        push(vecs_b, sift_descriptor_vec(descs_b[j]))
+        j = j + 1
+    }
+    let matches = sift_match_keypoints(kps_a, vecs_a, kps_b, vecs_b, 700)
+    io_println("(matched " + int_to_str(len(matches))
+        + " keypoint(s); A=" + int_to_str(len(kps_a))
+        + "kps B=" + int_to_str(len(kps_b)) + "kps)")
+    return 1
+}
+
+// Build a snapshot from the live substrate. Now uses the Phase 11 full
+// subsystem-blob serializers in snapshot_disk.nova: SOUL carries name +
+// purpose + identity + mood + OCEAN + constitution; KGS carries the full
+// atom set (every taught word in the shared concept KG and the language KG
+// the chat created with `lang_kg_init`). The legacy first slots are kept
+// ([0]=name for SOUL, [0]=atom_count for KGS) so the daemon's reboot print
+// still works against the same image.
+fn _build_snapshot(sl, kg, lang, stream, em, reg, sm, now) {
+    let snap = snap_new(1, now)
+    snap_put_section(snap, SEC_SOUL, soul_section_build(sl))
+    // Combine the concept KG and the language KG into one KGS blob so a
+    // reload reinstalls both the concept atom AND the word atom that binds
+    // it -- the perception pipeline needs the word atom to anchor the input.
+    let kg_blob = kg_section_build(kg)
+    let lang_blob = kg_section_build(lang)
+    let merged = list_new()
+    push(merged, kg_atom_count(kg) + kg_atom_count(lang))   // [0] total count
+    let recs = list_new()
+    let kg_recs = kg_blob[1]
+    let lang_recs = lang_blob[1]
+    let i = 0
+    while i < len(kg_recs)   { push(recs, kg_recs[i]);   i = i + 1 }
+    let j = 0
+    while j < len(lang_recs) { push(recs, lang_recs[j]); j = j + 1 }
+    push(merged, recs)                                       // [1] atoms
+    snap_put_section(snap, SEC_KGS, merged)
+    // P0.1 (this edit): EPISODIC / SYNAPSES / SELFMODEL also carry full
+    // payloads. EPISODIC persists moment timestamps/lifecycle/traces and
+    // episode tiers via `stream` + `em`. SYNAPSES persists EVERY part's
+    // synapse graph (P0.1 follow-up #2: was reasoning-only; the multi-part
+    // builder walks the registry and emits per-part records, plus a legacy
+    // top-level block mirroring reasoning for back-compat with old readers).
+    // SELFMODEL persists the per-domain competence record list.
+    snap_put_section(snap, SEC_EPISODIC,  episodic_section_build(stream, em))
+    snap_put_section(snap, SEC_SYNAPSES,  synapses_section_build_multi(reg))
+    snap_put_section(snap, SEC_SELFMODEL, selfmodel_section_build(sm))
+    return snap
+}
+
+// Resolve the snapshot path for /save and /load.
+//
+// Precedence (P1.2):
+//   1. an explicit path argument typed at the prompt (`/save /tmp/x.snap`).
+//   2. `$CE_SNAP_PATH` (legacy single-file mode -- back-compat with pre-P1.2
+//      operator scripts that pin one path for the whole process).
+//   3. `$CE_SNAP_DIR/crossengin.<session_id>.snap` (default
+//      `$CE_SNAP_DIR=/tmp`) -- the per-tenant on-disk image; the active
+//      session id is threaded in by the caller.
+//
+// Steps 2 + 3 are delegated to `session_snap_path(session_id)` so the chat
+// and the daemon resolve the SAME path for the same session, regardless of
+// which binary writes first.
+fn _snap_path(arg, session_id) {
+    if len(arg) > 0 { return arg }
+    return session_snap_path(session_id)
+}
+
+// /save [PATH]: durably write a snapshot of the live soul + KG to disk.
+// Uses write_tmp -> fsync -> atomic_rename -> fsync(parent) so a crash mid-
+// write never corrupts the last good image. Path resolution: an explicit
+// PATH wins; otherwise the active session's per-session file under
+// `$CE_SNAP_DIR/crossengin.<session_id>.snap` (legacy `$CE_SNAP_PATH` still
+// honoured) -- so a `/switch alice` then `/save` writes alice's image,
+// leaving the default tenant's snapshot at its own path untouched (P1.2).
+fn _admin_save(sl, kg, lang, stream, em, reg, syn_g, sm, arg, session_id, now) {
+    let path = _snap_path(arg, session_id)
+    // P2.10: if /compact stashed a compacted snapshot for this session, write
+    // THAT instead of rebuilding from live state.
+    let snap = 0
+    let used_pending = 0
+    if _pending_compact_snap != 0 {
+        if str_eq(_pending_compact_session, session_id) == 1 {
+            snap = _pending_compact_snap
+            used_pending = 1
+        }
+    }
+    if snap == 0 {
+        snap = _build_snapshot(sl, kg, lang, stream, em, reg, sm, now)
+    }
+    let ok = snap_save(snap, path)
+    if ok == 1 {
+        if used_pending == 1 {
+            let kgs_recs = 0
+            let kgs_blob = snap_section(snap, SEC_KGS)
+            if kgs_blob != 0 {
+                if len(kgs_blob) > 1 { kgs_recs = len(kgs_blob[1]) }
+            }
+            let mom_count = ms_count(stream)
+            let ep_blob = snap_section(snap, SEC_EPISODIC)
+            if ep_blob != 0 {
+                if len(ep_blob) > 0 { mom_count = len(ep_blob[0]) }
+            }
+            let syn_count = syn_live(syn_g)
+            let syn_blob = snap_section(snap, SEC_SYNAPSES)
+            if syn_blob != 0 {
+                if len(syn_blob) > 1 { syn_count = len(syn_blob[1]) }
+            }
+            io_println("(saved compacted snapshot: kg=" + int_to_str(kgs_recs)
+                + " atom(s), " + int_to_str(mom_count)
+                + " moment(s), " + int_to_str(syn_count)
+                + " syn(s) -> " + path + " durably)")
+        } else {
+            // P0.1 follow-up #2: count synapses across EVERY part's graph,
+            // not just the reasoning part, so the save-line tally matches
+            // what the multi-part snapshot actually captured.
+            let syn_tot = 0
+            let pi = 0
+            while pi < registry_count(reg) {
+                let p = registry_get(reg, pi)
+                if p != 0 { syn_tot = syn_tot + syn_live(part_syn(p)) }
+                pi = pi + 1
+            }
+            io_println("(saved soul=" + soul_name(sl) + " kg=" + int_to_str(kg_atom_count(kg))
+                + " atom(s) + lang=" + int_to_str(kg_atom_count(lang))
+                + " atom(s) + " + int_to_str(ms_count(stream))
+                + " moment(s) + " + int_to_str(syn_tot)
+                + " syn(s) + " + int_to_str(self_model_count(sm))
+                + " competence record(s) -> " + path + " durably)")
+        }
+    } else {
+        io_println("(save FAILED: could not write " + path + " -- check directory exists / permissions)")
+    }
+    _pending_compact_snap = 0
+    _pending_compact_session = ""
+    return 1
+}
+
+// /load [PATH]: read a snapshot from disk and rehydrate the live substrate.
+//
+// Policy: REPLACE BY LABEL for KGS atoms (idempotent merge). For EPISODIC /
+// SYNAPSES / SELFMODEL the policy is straight REPLACE -- the snapshot is the
+// new ground truth, and a /load is "boot from this state", not "merge". The
+// live `stream` / `em` get wiped to length zero before reinstalling moments
+// + episodes; EACH PART's synapse graph (multi-part capture, P0.1 follow-up
+// #2) gets each pre->post edge overwritten (idempotent on a second /load);
+// the self-model gets cleared + reinstalled. Path resolution follows the
+// same per-session contract as /save (P1.2): explicit PATH wins, else
+// per-session file derived from the active session id.
+fn _admin_load(sl, kg, lang, kgreg, stream, em, reg, sm, arg, session_id, now) {
+    let path = _snap_path(arg, session_id)
+    let snap = snap_load(path)
+    if snap == 0 {
+        io_println("(load FAILED: " + path + " missing, unreadable, or not a snapshot)")
+        return 1
+    }
+    let soul_p = snap_has_section(snap, SEC_SOUL)
+    let kgs_p = snap_has_section(snap, SEC_KGS)
+    let ep_p  = snap_has_section(snap, SEC_EPISODIC)
+    let syn_p = snap_has_section(snap, SEC_SYNAPSES)
+    let sm_p  = snap_has_section(snap, SEC_SELFMODEL)
+    let before_kg = kg_atom_count(kg)
+    let before_lang = kg_atom_count(lang)
+    io_println("(loaded " + path + ":"
+        + " ver=" + int_to_str(snap_version(snap))
+        + " instance=" + int_to_str(snap_instance(snap))
+        + " ts=" + int_to_str(snap_timestamp(snap)) + ")")
+    if soul_p == 1 {
+        let sb = snap_section(snap, SEC_SOUL)
+        soul_section_apply(sl, sb)
+        io_println("  soul: name=" + soul_name(sl) + " purpose=\"" + soul_purpose(sl)
+            + "\" constcount=" + int_to_str(soul_constitution_count(sl)))
+    }
+    if kgs_p == 1 {
+        let kb = snap_section(snap, SEC_KGS)
+        let created = kg_section_apply(kgreg, kb, now)
+        let after_kg = kg_atom_count(kg)
+        let after_lang = kg_atom_count(lang)
+        let rec_count = 0
+        if len(kb) > 1 { rec_count = len(kb[1]) }
+        io_println("  kgs: blob_count=" + int_to_str(kb[0])
+            + " applied=" + int_to_str(rec_count)
+            + " new_atoms=" + int_to_str(created))
+        io_println("  reasoning KG: " + int_to_str(before_kg) + " -> "
+            + int_to_str(after_kg) + " atoms")
+        io_println("  language KG : " + int_to_str(before_lang) + " -> "
+            + int_to_str(after_lang) + " atoms")
+        if rec_count == 0 {
+            if kb[0] > 0 {
+                io_println("  (legacy/Phase-10 snapshot: atoms field is a metadata-only hint,"
+                    + " no per-atom records to rehydrate -- agent uses the live seed only)")
+            }
+        }
+    }
+    if ep_p == 1 {
+        let eb = snap_section(snap, SEC_EPISODIC)
+        let restored = episodic_section_apply(stream, em, eb)
+        io_println("  episodic: " + int_to_str(restored) + " moment(s) + "
+            + int_to_str(em_count(em)) + " episode(s) restored")
+    }
+    if syn_p == 1 {
+        let sb = snap_section(snap, SEC_SYNAPSES)
+        let parts_seen = synapses_section_parts_count(sb)
+        let n = synapses_section_apply_multi(reg, sb)
+        // Three log shapes: a new-format snapshot with at least one part
+        // (multi-part rehydrate), a new-format snapshot with zero parts
+        // (nothing to restore -- skip the misleading "legacy" label), or
+        // a true legacy snapshot whose `synapses.count` carried records
+        // (rehydrated into reasoning via the apply path's fallback).
+        let legacy_recs = 0
+        if len(sb) > 1 { legacy_recs = len(sb[1]) }
+        if parts_seen > 0 {
+            io_println("  synapses: " + int_to_str(n) + " edge(s) restored across "
+                + int_to_str(parts_seen) + " part(s) (threshold="
+                + int_to_str(sb[0]) + " milli)")
+        } else {
+            if legacy_recs > 0 {
+                io_println("  synapses: " + int_to_str(n)
+                    + " edge(s) restored into reasoning (legacy single-part snapshot, threshold="
+                    + int_to_str(sb[0]) + " milli)")
+            } else {
+                io_println("  synapses: " + int_to_str(n)
+                    + " edge(s) restored (no parts captured, threshold="
+                    + int_to_str(sb[0]) + " milli)")
+            }
+        }
+    }
+    if sm_p == 1 {
+        let mb = snap_section(snap, SEC_SELFMODEL)
+        let n = selfmodel_section_apply(sm, mb)
+        io_println("  selfmodel: " + int_to_str(n) + " competence record(s) restored")
+    }
+    return 1
+}
+
+// /snap_verify [PATH]: load the snapshot at PATH (or the active session's
+// default file), recompute the KGS Merkle root from the rehydrated atom
+// records, and compare against the file's `meta.merkle_root` claim
+// (R15E). Prints a single-line status: `verified` on match, `TAMPERED`
+// on mismatch, and a friendlier hint for the two edge cases (file
+// missing / file present but no Merkle commitment). The check is
+// read-only -- it never mutates live KG state.
+fn _admin_snap_verify(arg, session_id) {
+    let path = _snap_path(arg, session_id)
+    let rc = snap_verify_path(path)
+    if rc == 1 {
+        io_println("(snap_verify " + path + ": verified -- Merkle root matches)")
+        return 1
+    }
+    if rc == 0 {
+        io_println("(snap_verify " + path + ": TAMPERED -- Merkle root mismatch,"
+            + " on-disk file disagrees with the recomputed root)")
+        return 1
+    }
+    if rc == 0 - 2 {
+        io_println("(snap_verify " + path + ": no Merkle commitment in this file"
+            + " -- pre-R15E snapshot, no tamper detection possible)")
+        return 1
+    }
+    io_println("(snap_verify " + path + ": load FAILED"
+        + " -- file missing, unreadable, or not a snapshot)")
+    return 1
+}
+
+// /snap_sign_status [PATH] (R16A): report the snapshot's Ed25519
+// attestation state without mutating live KG state. Tells the
+// operator (a) whether the file carries a `meta.merkle_signature`
+// line, (b) whether CE_SNAPSHOT_VERIFY_PUBKEY is set (so a verify
+// is even possible), and (c) the verify result (verified / tampered
+// / no signature / no pubkey / file missing). Read-only command --
+// safe to run against any snapshot file at any time.
+fn _admin_snap_sign_status(arg, session_id) {
+    let path = _snap_path(arg, session_id)
+    let st = snap_sign_status_for_path(path)
+    let has_sig = st[0]
+    let pub_set = st[1]
+    let verify  = st[2]
+    let sig_hex = st[3]
+    let line = "(snap_sign_status " + path + ":"
+    if has_sig == 1 {
+        line = line + " signature=present"
+    } else {
+        line = line + " signature=absent"
+    }
+    if pub_set == 1 {
+        line = line + " pubkey=set"
+    } else {
+        line = line + " pubkey=unset"
+    }
+    if verify == 1        { line = line + " last_verify=verified)" }
+    if verify == 0        { line = line + " last_verify=TAMPERED)" }
+    if verify == 0 - 1    { line = line + " last_verify=no_signature)" }
+    if verify == 0 - 2    { line = line + " last_verify=no_pubkey)" }
+    if verify == 0 - 3    { line = line + " last_verify=file_missing)" }
+    io_println(line)
+    return 1
+}
+
+// /compact [--dry-run] (P2.10): run a compaction pass over the active
+// session's live state and either (a) cache the compacted snapshot for the
+// next /save (default) or (b) print the would-be stats without mutating the
+// pending-snapshot slot (--dry-run). Stats reported:
+//   - dead atoms dropped (mean < CE_COMPACT_DEAD_BELIEF, default 0.05)
+//   - archived episodes dropped (tier == EP_ARCHIVED)
+//   - moments older than CE_COMPACT_MOMENT_MAX_AGE_NS dropped
+//   - synapses with |weight| below CE_COMPACT_SYNAPSE_THRESHOLD (default
+//     0.2 milli, tighter than the wire-format default of 0.1) dropped
+//   - on-disk size delta: live-state snapshot size vs compacted size
+//
+// The "live state snapshot" is built fresh here (via _build_snapshot) so
+// the size delta reflects what /save WOULD have written without /compact
+// vs what it WILL write with the compaction cached. On a non-dry run, the
+// compacted snapshot is stashed in `_pending_compact_snap` keyed by the
+// active session id; _admin_save consumes it.
+//
+// Bytes -> KB rounding uses integer arithmetic (1000-based, matches `du
+// --si`).
+fn _admin_compact(sl, kg, lang, stream, em, reg, sm, arg, session_id, now) {
+    let dry = 0
+    if str_eq(arg, "--dry-run") == 1 { dry = 1 }
+    let live_snap = _build_snapshot(sl, kg, lang, stream, em, reg, sm, now)
+    let opts = compact_opts_from_env()
+    let stats = snap_compact_stats(live_snap, opts)
+    let dead_drop = stats[0]
+    let ep_drop = stats[1]
+    let m_drop = stats[2]
+    let syn_drop = stats[3]
+    let before_text = snap_to_text(live_snap)
+    let before_bytes = len(before_text)
+    let compacted = snap_compact(live_snap, opts)
+    let after_text = snap_to_text(compacted)
+    let after_bytes = len(after_text)
+    let before_kb = before_bytes / 1000
+    let after_kb = after_bytes / 1000
+    let mode_str = ""
+    if dry == 1 { mode_str = " (dry-run)" }
+    io_println("(compacted" + mode_str + ": "
+        + int_to_str(dead_drop) + " dead atoms dropped, "
+        + int_to_str(ep_drop) + " archived episodes dropped, "
+        + int_to_str(m_drop) + " old moments dropped, "
+        + int_to_str(syn_drop) + " synapses below new threshold dropped; "
+        + "snapshot " + int_to_str(before_kb) + "KB -> "
+        + int_to_str(after_kb) + "KB)")
+    if dry == 0 {
+        _pending_compact_snap = compacted
+        _pending_compact_session = session_id
+        io_println("(in-memory snapshot replaced; next /save writes the compacted form)")
+    }
+    return 1
+}
+
+// Returns 1 if the line was an admin command (and was handled), 0 otherwise.
+// /meta: poll the meta-learning observer once and print the per-source
+// promotion / atrophy table. The poll is the only side effect; the operator
+// can read the rates while the agent keeps running. ADR-0050.
+fn _admin_meta(mo, refl_kg, kg, now) {
+    mo_poll(mo, kg, refl_kg, now)
+    let report = mo_report(mo)
+    io_println("meta-observer status:")
+    io_println("  source           atoms   tentative  durable  promotion%  atrophy%  last_poll")
+    if len(report) == 0 {
+        io_println("  (no attributed sources yet)")
+        return 1
+    }
+    let i = 0
+    while i < len(report) {
+        let row = report[i]
+        let tag = row[0]
+        let promo_milli = row[1]
+        let atrophy_milli = row[2]
+        let sample = row[3]
+        let last = row[4]
+        // Re-classify against current beliefs so the table reflects right-now
+        // tentative / durable counts (mo_report only carries the cumulative
+        // running totals -- the visible split needs the live snapshot).
+        let srcs = mo[MO_SOURCES]
+        let tentative = 0
+        let durable = 0
+        let j = 0
+        while j < len(srcs) {
+            if str_eq(srcs[j][MO_MS_TAG], tag) == 1 {
+                let ids = srcs[j][MO_MS_ATOM_IDS]
+                let k = 0
+                while k < len(ids) {
+                    let a = kg_atom(kg, ids[k])
+                    if a != 0 {
+                        if atom_confidence(a) >= MO_DURABLE_MEAN {
+                            durable = durable + 1
+                        } else {
+                            tentative = tentative + 1
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            j = j + 1
+        }
+        let last_str = "(never)"
+        if last >= 0 { last_str = "tick " + int_to_str(last) }
+        io_println("  " + _mo_pad(tag, 17) + _mo_pad(int_to_str(sample), 8)
+            + _mo_pad(int_to_str(tentative), 11) + _mo_pad(int_to_str(durable), 9)
+            + _mo_pad(mo_format_pct(promo_milli), 12)
+            + _mo_pad(mo_format_pct(atrophy_milli), 10) + last_str)
+        i = i + 1
+    }
+    let polls = mo_total_polls(mo)
+    let refl_prom = mo_refl_promotions(mo)
+    io_println("  (" + int_to_str(polls) + " poll(s) total; "
+        + int_to_str(refl_prom) + " reflection-KG promotion(s) observed)")
+    return 1
+}
+
+// /meta-feedback: dry-run of mo_apply_feedback. Prints which sources WOULD
+// be promoted or demoted in source_authority right now, with their rates and
+// the current vs proposed tier. ADR-0050 P1.1. Pair with /meta-apply which
+// actually mutates `sauth`.
+fn _admin_meta_feedback(mo, sa) {
+    let rows = mo_feedback_dryrun(mo, sa)
+    io_println("meta-feedback (dry run):")
+    io_println("  tag             host                          promo%  atrophy%  sample  current  proposed  action")
+    if len(rows) == 0 {
+        io_println("  (no attributed sources yet)")
+        return 1
+    }
+    let i = 0
+    let pending = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let tag = r[MO_FB_TAG]
+        let host = r[MO_FB_HOST]
+        let act = r[MO_FB_ACTION]
+        let old_t = r[MO_FB_OLD_TIER]
+        let new_t = r[MO_FB_NEW_TIER]
+        let promo = r[MO_FB_PROMO]
+        let atrophy = r[MO_FB_ATROPHY]
+        let sample = r[MO_FB_SAMPLE]
+        let act_str = mo_fb_action_name(act)
+        if act == MO_FB_NONE {
+            if sample < MO_FB_WINDOW {
+                act_str = "skip(window)"
+            }
+        }
+        if new_t != old_t { pending = pending + 1 }
+        io_println("  " + _mo_pad(tag, 16) + _mo_pad(host, 30)
+            + _mo_pad(mo_format_pct(promo), 8)
+            + _mo_pad(mo_format_pct(atrophy), 10)
+            + _mo_pad(int_to_str(sample), 8)
+            + _mo_pad(mo_tier_name(old_t), 9)
+            + _mo_pad(mo_tier_name(new_t), 10)
+            + act_str)
+        i = i + 1
+    }
+    if pending == 0 {
+        io_println("  (no tier changes pending -- /meta-apply would be a no-op)")
+    } else {
+        io_println("  (" + int_to_str(pending) + " tier change(s) pending; run /meta-apply to commit)")
+    }
+    return 1
+}
+
+// /meta-apply: invoke mo_apply_feedback, which COMMITS tier promotions /
+// demotions into the shared `sauth` host registry. Prints exactly the rows
+// where a tier ACTUALLY changed (other rows surface only via /meta-feedback).
+// ADR-0050 P1.1. One-line confirmation up front.
+fn _admin_meta_apply(mo, sa) {
+    io_println("meta-apply: committing source_authority tier changes derived from meta-observer feedback")
+    let rows = mo_apply_feedback(mo, sa)
+    let committed = 0
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let old_t = r[MO_FB_OLD_TIER]
+        let new_t = r[MO_FB_NEW_TIER]
+        if new_t != old_t {
+            io_println("  (" + r[MO_FB_TAG]
+                + " -> host '" + r[MO_FB_HOST]
+                + "' " + mo_fb_action_name(r[MO_FB_ACTION])
+                + " tier " + mo_tier_name(old_t)
+                + " -> " + mo_tier_name(new_t)
+                + " | promo=" + mo_format_pct(r[MO_FB_PROMO])
+                + "% atrophy=" + mo_format_pct(r[MO_FB_ATROPHY])
+                + "% sample=" + int_to_str(r[MO_FB_SAMPLE]) + ")")
+            committed = committed + 1
+        }
+        i = i + 1
+    }
+    if committed == 0 {
+        io_println("  (no changes applied -- /meta-feedback would have shown the same)")
+    } else {
+        io_println("  (" + int_to_str(committed) + " tier change(s) committed)")
+    }
+    return 1
+}
+
+// _mo_pad(s, width) -- right-pad helper, extracted to src/chat/helpers.nova
+// in P1.8 for unit-test reach.
+
+// /__metrics__: machine-readable metrics dump for scripts/web.py's Prometheus
+// scrape endpoint. Emits one `key=value` line per metric, framed by a
+// `METRICS_BEGIN`/`METRICS_END` pair so the python parser can locate the block
+// without depending on log-line ordering. Underscore-prefixed + listed as
+// (internal) in /help so an end user typing /help sees it but won't usually
+// reach for it. Read-only: polls mo_poll once (the same operation /meta does)
+// and reads kg_atom_count / dl_count / soul mood / scheduler rate. ADR-0050
+// promotion/atrophy rates are reported in milli-percent (0..1000) so the
+// Prometheus side can divide by 10 for a real percent.
+fn _admin_metrics(sl, kg, lang, refl_kg, log, hs, mo, now) {
+    mo_poll(mo, kg, refl_kg, now)
+    io_println("METRICS_BEGIN")
+    io_println("atom_count_reasoning=" + int_to_str(kg_atom_count(kg)))
+    io_println("atom_count_language=" + int_to_str(kg_atom_count(lang)))
+    io_println("refl_atom_count=" + int_to_str(refl_size(refl_kg)))
+    io_println("dlog_entries=" + int_to_str(dl_count(log)))
+    io_println("soul_mood_valence=" + int_to_str(soul_mood_valence(sl)))
+    io_println("soul_mood_arousal=" + int_to_str(soul_mood_arousal(sl)))
+    io_println("scheduler_tick=" + int_to_str(hs_now(hs)))
+    io_println("scheduler_rate_hz=" + int_to_str(hs_rate(hs)))
+    // Pacer overruns are daemon-only today (chat doesn't bind a pacer); 0 is
+    // the honest value the Prometheus side should display.
+    io_println("scheduler_overruns=0")
+    let report = mo_report(mo)
+    let mi = 0
+    while mi < len(report) {
+        let row = report[mi]
+        let tag = row[0]
+        let promo_milli = row[1]
+        let atrophy_milli = row[2]
+        io_println("promotion_milli_" + tag + "=" + int_to_str(promo_milli))
+        io_println("atrophy_milli_" + tag + "=" + int_to_str(atrophy_milli))
+        mi = mi + 1
+    }
+    io_println("METRICS_END")
+    return 1
+}
+
+// /__atoms__: machine-readable atoms dump for scripts/web.py's /api/atoms
+// search endpoint. Walks the active session's reasoning + language KGs and
+// emits one `ATOM kg=<label> id=<int> kind=<int> label=<string> belief_mean=<int>`
+// line per atom, framed by `ATOMS_BEGIN`/`ATOMS_END` markers so the python
+// parser locates the block deterministically. Underscore-prefixed + (internal)
+// in /help. Read-only. Cap output at ~1000 atoms per probe -- the python
+// side caches repeat calls via CE_ATOMS_CACHE_S.
+fn _admin_atoms_probe(kg, lang) {
+    io_println("ATOMS_BEGIN")
+    let cap = 1000
+    let emitted = 0
+    // Reasoning KG first.
+    let r_label = kg_label(kg)
+    let r_atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(r_atoms) {
+        if emitted < cap {
+            let a = r_atoms[i]
+            if a != 0 {
+                io_println("ATOM kg=" + r_label
+                    + " id=" + int_to_str(atom_id(a))
+                    + " kind=" + int_to_str(atom_kind(a))
+                    + " label=" + atom_label(a)
+                    + " belief_mean=" + int_to_str(atom_confidence(a)))
+                emitted = emitted + 1
+            }
+        }
+        i = i + 1
+    }
+    // Language KG second.
+    let l_label = kg_label(lang)
+    let l_atoms = kg_atoms(lang)
+    let j = 0
+    while j < len(l_atoms) {
+        if emitted < cap {
+            let a2 = l_atoms[j]
+            if a2 != 0 {
+                io_println("ATOM kg=" + l_label
+                    + " id=" + int_to_str(atom_id(a2))
+                    + " kind=" + int_to_str(atom_kind(a2))
+                    + " label=" + atom_label(a2)
+                    + " belief_mean=" + int_to_str(atom_confidence(a2)))
+                emitted = emitted + 1
+            }
+        }
+        j = j + 1
+    }
+    io_println("ATOMS_END")
+    return 1
+}
+
+// /why-deep [N]: recursive /why decision tree (depth N, default 3, capped 8).
+// For the most recent decision, surface the operator chain that produced the
+// agent's spoken output, the activating message, and per-atom upstream
+// evidence. Uses proof_checker's bounded BFS with max_depth=N to walk from
+// each perceived percept atom to each context conclusion. Read-only.
+fn _admin_why_deep(kg, ctx, log, arg) {
+    let n = dl_count(log)
+    if n == 0 { io_println("(no decisions yet)") return 1 }
+    let depth = 3
+    if len(arg) > 0 {
+        let d = rt_str_to_int(arg)
+        if d > 0 { depth = d }
+    }
+    if depth > 8 { depth = 8 }
+
+    let e = dl_get(log, n - 1)
+    let outcome_name = out_name(dl_outcome(e))
+    let tier_name = perm_tier_name(dl_perm_tier(e))
+    let action_name = act_name(dl_action_type(e))
+    let said = ctx_output(ctx)
+    if len(said) == 0 { said = _last_reply }
+    io_println("decision #" + int_to_str(dl_seq(e)) + " " + action_name
+        + " \"" + said + "\""
+        + " (outcome=" + outcome_name + ", tier=" + tier_name + ")")
+
+    // Walk the operator chain that produced the spoken output: BFS from each
+    // perceived percept atom (premises) to each conclusion atom (post-
+    // reasoning). proof_checker.proof_check returns the operator-sequence
+    // proof; proof_format renders the human-readable header + per-op lines.
+    let percept = ctx_percept(ctx)
+    let concs = ctx_conclusions(ctx)
+    let printed_any = 0
+    let pi = 0
+    while pi < len(percept) {
+        let entry = percept[pi]
+        let pid = entry[1]
+        let ck = 0
+        while ck < len(concs) {
+            let cid = concs[ck]
+            if pid != cid {
+                let r = proof_check(pid, cid, kg, depth, PROOF_DEFAULT_VISITS)
+                if proof_result_valid(r) == 1 {
+                    let chain = proof_result_chain(r)
+                    if len(chain) > 0 {
+                        io_println("  " + proof_format(chain, kg))
+                        printed_any = 1
+                    }
+                }
+            }
+            ck = ck + 1
+        }
+        pi = pi + 1
+    }
+    if printed_any == 0 {
+        io_println("  proof: (no operator chain found within depth "
+            + int_to_str(depth) + ")")
+    }
+
+    // Activating message: the raw user input that drove this turn.
+    let raw_input = ctx_input(ctx)
+    let pcount = len(percept)
+    io_println("activated by: msg \"" + raw_input + "\" perceive(m="
+        + int_to_str(pcount) + ")")
+
+    // Upstream evidence: each percept atom + each conclusion atom in the
+    // reasoning KG, with belief mean and source provenance.
+    io_println("upstream evidence:")
+    let seen = list_new()
+    let pj = 0
+    while pj < len(percept) {
+        let pe = percept[pj]
+        let aid = pe[1]
+        let dup = 0
+        let si = 0
+        while si < len(seen) {
+            if seen[si] == aid { dup = 1 }
+            si = si + 1
+        }
+        if dup == 0 {
+            push(seen, aid)
+            let a = kg_atom(kg, aid)
+            if a != 0 {
+                let src = atom_payload_get(a, "provenance")
+                if src == 0 { src = "seed" }
+                if len(src) == 0 { src = "seed" }
+                io_println("  atom '" + atom_label(a)
+                    + "' belief mean=" + int_to_str(atom_confidence(a))
+                    + ", source='" + src + "'")
+            }
+        }
+        pj = pj + 1
+    }
+    let cj = 0
+    while cj < len(concs) {
+        let cid2 = concs[cj]
+        let dup2 = 0
+        let si2 = 0
+        while si2 < len(seen) {
+            if seen[si2] == cid2 { dup2 = 1 }
+            si2 = si2 + 1
+        }
+        if dup2 == 0 {
+            push(seen, cid2)
+            let c = kg_atom(kg, cid2)
+            if c != 0 {
+                let src2 = atom_payload_get(c, "provenance")
+                if src2 == 0 { src2 = "seed" }
+                if len(src2) == 0 { src2 = "seed" }
+                io_println("  atom '" + atom_label(c)
+                    + "' belief mean=" + int_to_str(atom_confidence(c))
+                    + ", source='" + src2 + "'")
+            }
+        }
+        cj = cj + 1
+    }
+    return 1
+}
+
+// ---- session bootstrap helper --------------------------------------------
+// Build a fresh Session value with a default-shaped soul, KG registry, all
+// three KGs with the seed applied, reflection KG, ctx, decision log, goal
+// engine, meta-observer (seeded sources attributed), and a per-tenant
+// hybrid scheduler attached to the SHARED substrate `reg`. Returns the
+// constructed Session ready for sreg_register. Mirrors the boot block in
+// main() byte-for-byte so a /switch into a brand-new id is indistinguishable
+// from a fresh process boot.
+fn _new_session_for(reg, id, name, now) {
+    let sl = soul_new(name)
+    soul_set_identity(sl, "understand and assist", "curious")
+    soul_set_ocean(sl, 700, 600, 500, 800, 300)
+    soul_add_constitution(sl, "exfiltrate", CONST_BLOCK)
+    // ADR-0045 semantic-intent variant of the keyword veto: install a
+    // CONCEPT-keyed rule whose canonical label is "exfiltrate". The gate
+    // walks the P14 neighborhood (operator + xref + word-sense) from this
+    // label, so paraphrases that anchor on leak / smuggle / send_external /
+    // share_secret (synonym edges seeded by first_atoms) trip the same veto
+    // as the literal substring rule above. Backwards-compat: both rules fire.
+    soul_add_constitution_concept(sl, "exfiltrate", CONST_BLOCK)
+    let kgreg = kg_registry_new()
+    let kg = reasoning_kg_init(kgreg)
+    let lang = lang_kg_init(kgreg)
+    let ikg = imagination_kg_init(kgreg)
+    seed_apply(kg, lang, ikg, 0)
+    let ctx = ctx_new()
+    let log = dl_new()
+    let engine = goal_engine_new()
+    goal_new(engine, "assist the user", 800, 0, 0, 0)
+    let refl_kg = refl_kg_init(kgreg)
+    let mo = mo_new()
+    let mo_seed_n = kg_atom_count(kg)
+    let mo_si = 0
+    while mo_si < mo_seed_n {
+        mo_attribute(mo, "seed", mo_si)
+        mo_si = mo_si + 1
+    }
+    let hs = hs_new(reg)
+    let sess = session_make(id, name, now, sl, kgreg, kg, lang, ikg, refl_kg,
+                            ctx, log, engine, mo, hs)
+    // P3.6 (ADR-0053): per-session differential-privacy state. Each
+    // tenant has its own epsilon budget so one session's noisy queries
+    // cannot drain another's. Default 10000 milli-eps; the env override
+    // CE_DP_EPSILON_BUDGET shifts the floor up or down.
+    session_attach_dp(sess, dp_new(dp_budget_from_env()))
+    return sess
+}
+
+// ---- /switch: in-process tenant routing ----------------------------------
+// `/switch <id>` activates an existing session under that id, or creates one
+// fresh if absent. `/switch` (no arg) lists all known sessions with a `*`
+// marker on the active row. Mutates `active_id` (the top-level mutable that
+// the main loop reads at the top of every turn -- same NOVA pattern the
+// `halted` flag uses).
+fn _admin_switch(reg, arg, now) {
+    if len(arg) == 0 {
+        // List mode.
+        let ids = sreg_ids(sreg)
+        let n = len(ids)
+        io_println("sessions (" + int_to_str(n) + " total):")
+        let i = 0
+        while i < n {
+            let id = ids[i]
+            let s = sreg_lookup(sreg, id)
+            let marker = " "
+            if str_eq(id, active_id) == 1 { marker = "*" }
+            let atoms = kg_atom_count(session_kg(s))
+            let last = now - session_last_active(s)
+            io_println("  " + marker + _mo_pad(id, 14)
+                + "\"" + session_name(s) + "\""
+                + _mo_pad("", 4)
+                + int_to_str(atoms) + " atoms"
+                + _mo_pad("", 3)
+                + "last " + int_to_str(last) + "s ago")
+            i = i + 1
+        }
+        io_println("(* = active)")
+        return 1
+    }
+    // Activate or create.
+    let existing = sreg_lookup(sreg, arg)
+    if existing != 0 {
+        active_id = arg
+        session_touch(existing, now)
+        let atoms = kg_atom_count(session_kg(existing))
+        io_println("(switched to session '" + arg + "' ("
+            + session_name(existing) + ", " + int_to_str(atoms) + " atoms))")
+        return 1
+    }
+    // Create a fresh session under this id. Default display name = "Default"
+    // (consistent with the brief's example output line).
+    let fresh = _new_session_for(reg, arg, "Default", now)
+    sreg_register(sreg, fresh)
+    active_id = arg
+    let atoms = kg_atom_count(session_kg(fresh))
+    io_println("(created and switched to new session '" + arg
+        + "' (Default, " + int_to_str(atoms) + " atoms))")
+    return 1
+}
+
+// ---- /seed: domain seed packs (P1.9) -------------------------------------
+// `/seed` (no arg) lists the available packs via pack_list() and marks any
+// that are already installed in the active session's reasoning KG.
+// `/seed <pack>` installs the named pack into the active session's KGs,
+// reporting (atoms, operators, KG size). `/seed --reset <pack>` (or
+// `/seed <pack> --reset`) forces re-install even if the pack's canary atom
+// is already present.
+fn _admin_seed(lang, kg, ikg, mo, arg, now) {
+    // Parse out a possible --reset flag and the pack name. Accepts both
+    // `/seed --reset medical` and `/seed medical --reset` orderings.
+    let force = 0
+    let name = arg
+    if str_eq(arg, "--reset") == 1 {
+        io_println("(/seed --reset needs a pack name -- try /seed)")
+        return 1
+    }
+    if len(arg) > 0 {
+        let parts = _split_cmd(arg)
+        if str_eq(parts[0], "--reset") == 1 {
+            force = 1
+            name = parts[1]
+        } else {
+            if str_eq(parts[1], "--reset") == 1 {
+                force = 1
+                name = parts[0]
+            } else {
+                name = arg
+            }
+        }
+    }
+    if len(name) == 0 {
+        // List mode.
+        let packs = pack_list()
+        io_println("domain seed packs (" + int_to_str(len(packs)) + " available):")
+        let i = 0
+        while i < len(packs) {
+            let e = packs[i]
+            let nm = pack_entry_name(e)
+            let desc = pack_entry_description(e)
+            let cnt = pack_entry_atom_count(e)
+            let marker = ""
+            if pack_already_installed(kg, nm) == 1 { marker = " [installed]" }
+            io_println("  " + nm + " (~" + int_to_str(cnt) + " atoms)"
+                + marker + " -- " + desc)
+            i = i + 1
+        }
+        io_println("(usage: /seed <name>  or  /seed --reset <name>)")
+        return 1
+    }
+    if force == 1 {
+        if len(name) == 0 {
+            io_println("(/seed --reset needs a pack name -- try /seed)")
+            return 1
+        }
+    }
+    let result = pack_install_with_force(name, lang, kg, ikg, mo, force, now)
+    let atoms = result[0]
+    let ops = result[1]
+    let status = result[2]
+    if str_eq(status, "unknown") == 1 {
+        io_println("(unknown pack: " + name + " -- try /seed)")
+        return 1
+    }
+    if str_eq(status, "already") == 1 {
+        io_println("(seed pack '" + name + "' already installed; use /seed --reset "
+            + name + " to re-apply)")
+        return 1
+    }
+    let after = kg_atom_count(kg)
+    io_println("(seed pack '" + name + "' installed: "
+        + int_to_str(atoms) + " atoms + "
+        + int_to_str(ops) + " operators; KG now "
+        + int_to_str(after) + " atoms)")
+    return 1
+}
+
+// ---- /ann_query: P3.4 ANN debugging --------------------------------------
+// Find the atom with `label`, run an ANN query with its embedding, print the
+// top 5 nearest atoms by label. Lazy-attaches an LSH index to the world KG
+// on first use so the command works out of the box without the user having
+// to wire one up. Debug-only -- the underscore prefix flags that.
+fn _admin_ann_query(kg, arg) {
+    if len(arg) == 0 {
+        io_println("(usage: /ann_query LABEL  -- find atom by label, list nearest neighbors)")
+        return 1
+    }
+    let probe = kg_find_atom(kg, arg)
+    if probe == 0 {
+        io_println("(no atom with label '" + arg + "')")
+        return 1
+    }
+    // Lazy-init: attach an ANN if the KG doesn't have one yet. ann_rebuild
+    // inside kg_set_ann re-buckets all existing atoms so the index is hot
+    // immediately. Idempotent: re-running /ann_query reuses the existing ann.
+    let ann = kg_ann(kg)
+    if ann == 0 {
+        ann = ann_new(ATOM_EMBED_DIMS, 8)
+        kg_set_ann(kg, ann)
+        io_println("(attached LSH index to '" + atom_kg(probe) + "': "
+            + int_to_str(kg_atom_count(kg)) + " atoms across "
+            + int_to_str(ann_bucket_total(ann)) + " buckets)")
+    }
+    let q = atom_embed(probe)
+    let results = ann_query(ann, kg_atoms(kg), q, 5)
+    let bid = ann_hash(ann, q)
+    let bsz = ann_bucket_count(ann, bid)
+    io_println("ann_query '" + arg + "' -> bucket " + int_to_str(bid)
+        + " (" + int_to_str(bsz) + " atom(s) scanned, "
+        + int_to_str(kg_atom_count(kg)) + " total in KG):")
+    if len(results) == 0 {
+        io_println("  (no neighbors in bucket)")
+        return 1
+    }
+    let i = 0
+    while i < len(results) {
+        let entry = results[i]
+        let aid = entry[0]
+        let cos = entry[1]
+        let a = kg_atom(kg, aid)
+        let lbl = "(missing)"
+        if a != 0 { lbl = atom_label(a) }
+        io_println("  " + int_to_str(i + 1) + ". " + lbl
+            + "  cosine=" + int_to_str(cos) + " milli")
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- /prove: P3.5 / ADR-0052 minimum-viable proof checker ---------------
+// Look up two atom labels in the reasoning KG and run a bounded BFS over
+// the operator graph between them. Prints either the operator-chain proof
+// (one line per hop) and the composed strength, or a "no proof" line with
+// the visit counter so the operator can tell whether the search was depth-
+// bound or graph-bound. Optional third token overrides the default depth.
+fn _admin_prove(kg, arg) {
+    if len(arg) == 0 {
+        io_println("(usage: /prove PREMISE CONCLUSION [DEPTH] -- both labels must exist in the reasoning KG)")
+        return 1
+    }
+    let parts = _split_cmd(arg)
+    let premise_label = parts[0]
+    let rest = parts[1]
+    if len(premise_label) == 0 {
+        io_println("(/prove needs a PREMISE label -- try /prove)")
+        return 1
+    }
+    if len(rest) == 0 {
+        io_println("(/prove needs a CONCLUSION label -- try /prove)")
+        return 1
+    }
+    let rest_parts = _split_cmd(rest)
+    let conclusion_label = rest_parts[0]
+    let depth_str = rest_parts[1]
+    let depth = PROOF_DEFAULT_DEPTH
+    if len(depth_str) > 0 {
+        let d = rt_str_to_int(depth_str)
+        if d > 0 { depth = d }
+    }
+    let p_atom = kg_find_atom(kg, premise_label)
+    if p_atom == 0 {
+        io_println("(no atom with label '" + premise_label + "' in the reasoning KG)")
+        return 1
+    }
+    let c_atom = kg_find_atom(kg, conclusion_label)
+    if c_atom == 0 {
+        io_println("(no atom with label '" + conclusion_label + "' in the reasoning KG)")
+        return 1
+    }
+    let r = proof_check(atom_id(p_atom), atom_id(c_atom), kg, depth, PROOF_DEFAULT_VISITS)
+    let valid = proof_result_valid(r)
+    let chain = proof_result_chain(r)
+    let strength = proof_result_strength(r)
+    let visited = proof_result_visited(r)
+    if valid == 0 {
+        io_println("no proof: " + premise_label + " -> " + conclusion_label
+            + " within depth " + int_to_str(depth)
+            + " (visited " + int_to_str(visited) + " of " + int_to_str(PROOF_DEFAULT_VISITS) + ")")
+        return 1
+    }
+    // Either trivial or a real chain. proof_format handles both shapes.
+    io_println(proof_format(chain, kg))
+    io_println("visited " + int_to_str(visited) + " state(s); depth budget "
+        + int_to_str(depth) + ", visit budget " + int_to_str(PROOF_DEFAULT_VISITS))
+    return 1
+}
+
+// ---- P3.6: /dp_status + /dp_query (ADR-0053) ----------------------------
+// `/dp_status` prints the active session's DP budget (consumed / remaining
+// / total) -- the privacy bookkeeping for noisy KG queries.
+// `/dp_query atoms` runs `kg_atom_count_dp` with epsilon = 100 milli
+// (= 0.1 eps), printing BOTH the true count (admin-context only -- in a
+// production tenant context the true count would be gated behind a role
+// check) AND the noisy count, so an operator can see the noise envelope
+// at a glance. Other targets ("belief LABEL") are reserved for future
+// iterations; today only `atoms` is wired.
+fn _admin_dp_status(dp) {
+    if dp == 0 {
+        io_println("(DP not configured for this session)")
+        return 1
+    }
+    let total = dp_budget(dp)
+    let rem = dp_remaining_budget(dp)
+    let used = dp_consumed(dp)
+    let queries = dp_query_count(dp)
+    io_println("dp budget: " + int_to_str(used) + " / " + int_to_str(total)
+        + " milli-eps consumed (remaining " + int_to_str(rem) + " milli-eps over "
+        + int_to_str(queries) + " quer" + _admin_dp_plural(queries) + ")")
+    return 1
+}
+
+// Tiny pluralizer for the dp_status line ("0 queries" / "1 query" / "N queries").
+fn _admin_dp_plural(n) {
+    if n == 1 { return "y" }
+    return "ies"
+}
+
+fn _admin_dp_query(kg, dp, arg) {
+    if dp == 0 {
+        io_println("(DP not configured for this session)")
+        return 1
+    }
+    let target = arg
+    if len(target) == 0 { target = "atoms" }
+    if str_eq(target, "atoms") == 1 {
+        let true_count = kg_atom_count(kg)
+        let noisy = kg_atom_count_dp(kg, dp, 100)
+        if dp_is_refused(noisy) == 1 {
+            io_println("dp_query atoms: budget exhausted (remaining "
+                + int_to_str(dp_remaining_budget(dp)) + " milli-eps)")
+            return 1
+        }
+        io_println("dp_query atoms: true=" + int_to_str(true_count)
+            + " noisy=" + int_to_str(noisy)
+            + " (epsilon=100 milli, remaining "
+            + int_to_str(dp_remaining_budget(dp)) + ")")
+        return 1
+    }
+    io_println("(dp_query: unknown target '" + target + "' -- try 'atoms')")
+    return 1
+}
+
+// ---- P3.7: /fed_join + /fed_stats + /fed_leave (ADR-0054) ---------------
+// `/fed_join URL`: connect to a federated coordinator at URL (default
+// 127.0.0.1:8777), send the ce-fed v1 HELLO (with CE_FED_TOKEN if set)
+// + a FED_JOIN line, then enter a tight in-line loop that handles
+// FED_ROUND / FED_AGGREGATE events until the coordinator closes (BYE)
+// or this soul's `_fed_conn_fd` is reset by /fed_leave. The chat REPL
+// is blocked during /fed_join -- the operator is expected to start the
+// coordinator in a separate terminal and then run /fed_join, and the
+// admin sees one round trip cycle then control returns. Multi-round
+// participation is via the integration test which scripts the
+// coordinator + multiple sessions.
+//
+// `/fed_stats`: print the local DP-noised stats that the NEXT round
+// would emit. This is a DRY-RUN -- it does consume the per-round
+// epsilon from the dp budget, because the noise sample needs the
+// budget to produce a useful preview. The audit doc walks why a
+// non-consuming preview is impossible without redesigning the dp
+// module's API.
+//
+// `/fed_leave`: send FED_LEAVE on the live connection and close the fd.
+// No-op if not currently joined.
+
+// Parse "HOST:PORT" -> [host, port]. Empty / malformed -> defaults.
+fn _fed_parse_url(arg) {
+    let host = "127.0.0.1"
+    let port = 8777
+    if len(arg) == 0 {
+        let out = list_new()
+        push(out, host)
+        push(out, port)
+        return out
+    }
+    // Split on ':'
+    let i = 0
+    let colon = 0 - 1
+    while i < len(arg) {
+        if char_at(arg, i) == 58 {
+            colon = i
+            i = len(arg)
+        } else {
+            i = i + 1
+        }
+    }
+    if colon < 0 {
+        host = arg
+    } else {
+        host = substr(arg, 0, colon)
+        let port_str = substr(arg, colon + 1, len(arg) - colon - 1)
+        let p = rt_str_to_int(port_str)
+        if p > 0 { port = p }
+    }
+    if len(host) == 0 { host = "127.0.0.1" }
+    let out = list_new()
+    push(out, host)
+    push(out, port)
+    return out
+}
+
+// P3.8 SecAgg-mode one-round driver. Reads FED_ROUND, emits all
+// FED_STAT_MASKED records, sends ACK <round_id>, collects
+// FED_AGGREGATE_SUM replies. Returns [completed, round_id, stats_sent,
+// aggs_recv, dropouts_seen].
+//
+// P3.8r dropout-resilience hook: if the coordinator broadcasts
+// FED_DROPOUT <round> <dropped_soul_id> during this round, the chat
+// re-emits its masked stats with the dropped peer's mask contribution
+// removed (FED_RECON_MASKED). The mask cancellation then holds over
+// the shrunk surviving-set so the coordinator's eventual sum is the
+// correct Σ_{i != dropped} x_i. The handler is a SMALL additive
+// branch on the existing FED_AGGREGATE_SUM receive loop -- no new
+// admin commands.
+fn _admin_fed_one_round_secagg(f, fd, source_auth) {
+    let out = list_new()
+    push(out, 0)        // completed
+    push(out, 0 - 1)    // round_id
+    push(out, 0)        // stats_sent
+    push(out, 0)        // aggs_recv
+    push(out, 0)        // dropouts_seen
+    let line = _admin_recv_line(fd)
+    if line == 0 { return out }
+    let rec = _admin_parse_fed_line(line)
+    if rec == 0 { return out }
+    let t = rec[0]
+    // Expect FED_ROUND.
+    if t != FED_EV_ROUND { return out }
+    let round_id = rec[FEDR_ROUND_ID]
+    let deadline = rec[FEDR_DEADLINE]
+    list_set(out, 1, round_id)
+    fed_agg_round_start(f, round_id, deadline)
+    let stats = fed_agg_emit_masked_stats(f)
+    let i = 0
+    while i < len(stats) {
+        let row = stats[i]
+        let stat_line = fed_agg_format_stat_masked_line(f, row[0], row[1], row[2])
+        if _admin_send_line(fd, stat_line) == 0 {
+            i = len(stats)
+        } else {
+            list_set(out, 2, out[2] + 1)
+            i = i + 1
+        }
+    }
+    let ack_line = "ACK " + int_to_str(round_id) + "\n"
+    let _ack = _admin_send_line(fd, ack_line)
+    // Collect FED_AGGREGATE_SUM (or FED_DROPOUT, which triggers
+    // a reconciliation pass and then loops back for AGG_SUM).
+    let go = 1
+    while go == 1 {
+        let aline = _admin_recv_line(fd)
+        if aline == 0 { go = 0 }
+        else {
+            let arec = _admin_parse_fed_line(aline)
+            if arec == 0 { go = 0 }
+            else {
+                let tt = arec[0]
+                if tt == SECAGG_EV_AGG_SUM {
+                    let rid = arec[1]
+                    if rid == round_id {
+                        let tag = arec[2]
+                        let sp = arec[3]
+                        let sa_ = arec[4]
+                        let n = arec[5]
+                        fed_agg_receive_aggregate_sum(f, tag, sp, sa_, n, source_auth)
+                        list_set(out, 3, out[3] + 1)
+                    }
+                } else {
+                    if tt == SECAGG_EV_DROPOUT {
+                        let rid = arec[1]
+                        if rid == round_id {
+                            let dropped_id = arec[2]
+                            io_println("fed: [SECAGG-R] FED_DROPOUT round="
+                                + int_to_str(round_id)
+                                + " dropped=" + dropped_id
+                                + " (reconciling masked submissions)")
+                            let recon_rows = fed_agg_emit_recon_masked(f, dropped_id)
+                            let ri = 0
+                            while ri < len(recon_rows) {
+                                let rrow = recon_rows[ri]
+                                let rline = fed_agg_format_recon_masked_line(f,
+                                    rrow[0], rrow[1], rrow[2])
+                                _admin_send_line(fd, rline)
+                                ri = ri + 1
+                            }
+                            // ACK signals "all my reconciled stats are in".
+                            _admin_send_line(fd, ack_line)
+                            list_set(out, 4, out[4] + 1)
+                        }
+                    } else { go = 0 }
+                }
+            }
+        }
+    }
+    fed_agg_round_end(f, round_id)
+    list_set(out, 0, 1)
+    return out
+}
+
+// Tiny IO wrappers so _admin_fed_one_round_secagg can use the chat's
+// existing per-line send/recv shape. We reuse fed_send_join's
+// underlying send_data loop via the federated_aggregator's
+// `_fed_send_all` -- but that's a private helper, so we replicate a
+// small version here.
+fn _admin_send_line(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _admin_recv_line(fd) {
+    let cap = 1024
+    let buf = alloc(cap)
+    let n = 0
+    while n < cap - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return buf
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return buf
+        }
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+// Parse a FED_ROUND / FED_AGGREGATE_SUM line by dispatching to the
+// federated_aggregator's parser for FED_ROUND, or to the SecAgg
+// module's parser for FED_AGGREGATE_SUM. We inline a tiny dispatch
+// here so we don't have to add a new wrapper in either module.
+fn _admin_parse_fed_line(text) {
+    // Try FED_ROUND first.
+    let r = _fed_parse_line(text)
+    if r != 0 { return r }
+    // Then FED_AGGREGATE_SUM.
+    let s = sa_parse_line(text)
+    if s != 0 { return s }
+    return 0
+}
+
+fn _admin_fed_join(sess, arg, source_auth) {
+    if _fed_conn_fd >= 0 {
+        io_println("(already joined a federation -- use /fed_leave first)")
+        return 1
+    }
+    let parts = _fed_parse_url(arg)
+    let host = parts[0]
+    let port = parts[1]
+    let dp = session_dp(sess)
+    let mo = session_mo(sess)
+    if dp == 0 {
+        io_println("(DP not configured for this session; cannot join federation)")
+        return 1
+    }
+    if mo == 0 {
+        io_println("(meta-observer not configured for this session)")
+        return 1
+    }
+    let soul_id = session_id(sess)
+    if len(soul_id) == 0 { soul_id = "default" }
+    // P3.8: detect SecAgg opt-in via CE_SECAGG_ENABLED. When set, dial
+    // the coordinator with the v2-sa HELLO, build an sa_state from
+    // env's CE_SECAGG_PEERS + CE_FED_TOKEN_<peer>, register peers, and
+    // drive the round via the SecAgg masked-stat path. Default: v1.
+    // P3.9: when CE_SECAGG_DH is ALSO set (the single env probe per the
+    // brief), the soul generates a 256-bit DH keypair, announces its
+    // public key during the handshake, then receives every peer's
+    // pubkey from the coordinator and derives pairwise shared secrets
+    // via `peer_pubkey ^ my_private mod p` -- replacing the
+    // CE_FED_TOKEN_<peer> pre-shared-token lookup.
+    let secagg = sa_enabled_from_env()
+    if secagg == 1 {
+        let dh_on = sa_dh_enabled_from_env()
+        // P3.9 cont.: CE_SECAGG_DH_2048=1 upgrades the DH path to the
+        // 2048-bit RFC 7919 Group 14 prime via the bignum_2048 module.
+        // Setting CE_SECAGG_DH_2048 also implies CE_SECAGG_DH (the
+        // 2048-bit path is a strict superset of the DH machinery).
+        // Single env probe per the brief; the rest of the flow runs
+        // through the existing v2-sa-dh pipeline -- just the modpow_ct
+        // primitive is wider.
+        let dh_2048_on = sa_dh_2048_enabled_from_env()
+        if dh_2048_on == 1 { dh_on = 1 }
+        let mode_label = "v2-sa"
+        if dh_on == 1 { mode_label = "v2-sa-dh (DH key-exchange)" }
+        if dh_2048_on == 1 { mode_label = "v2-sa-dh-2048 (RFC 7919 Group 14, ~15s/modpow_ct)" }
+        io_println("fed_join: [SECAGG] enabled (" + mode_label + "); dialing "
+            + host + ":" + int_to_str(port) + " as soul=" + soul_id)
+        let fdsa = fed_dial_secagg(host, port)
+        if fdsa < 0 {
+            io_println("fed_join: ERROR cannot connect / SecAgg handshake")
+            return 1
+        }
+        let sa = sa_state_new(soul_id)
+        // In DH mode we DO NOT load pre-shared tokens; the pubkey
+        // exchange below populates the per-peer shared-secret material.
+        // In v2-sa (non-DH) mode we keep the original behavior:
+        // CE_FED_TOKEN_<peer> per peer.
+        if dh_on == 0 {
+            let peer_ids = sa_peer_ids_from_env()
+            let pi = 0
+            while pi < len(peer_ids) {
+                let peer_id = peer_ids[pi]
+                let token = sa_peer_token_from_env(peer_id)
+                if token != 0 {
+                    sa_register_peer(sa, peer_id, token)
+                }
+                pi = pi + 1
+            }
+        }
+        _fed_agg = fed_agg_new_secagg(soul_id, dp, mo, sa)
+        fed_agg_join(_fed_agg)
+        if fed_send_join(_fed_agg, fdsa) == 0 {
+            fed_close(fdsa)
+            _fed_agg = 0
+            io_println("fed_join: ERROR sending FED_JOIN")
+            return 1
+        }
+        if dh_on == 1 {
+            // P3.9 DH key exchange phase.
+            // 1. Generate keypair (uses bn_modpow_ct -> ~50 ms wall-clock
+            //    in the 256-bit path; ~15s in the 2048-bit path -- a
+            //    LOUD banner warns the operator when v2-sa-dh-2048 is on).
+            // 2. Send FED_DH_PUBLIC <soul_id> <pubkey_hex> to coordinator.
+            // 3. Coordinator broadcasts every other soul's pubkey to us;
+            //    we register each via sa_register_peer_dh so the LCG mask
+            //    derivation uses the DH-derived shared secret instead of
+            //    a pre-shared token.
+            if dh_2048_on == 1 {
+                io_println("fed_join: [SECAGG-DH-2048] generating 2048-bit "
+                    + "keypair on RFC 7919 Group 14; expect ~15s wall-clock...")
+            }
+            let my_pub = 0
+            if dh_2048_on == 1 {
+                my_pub = sa_dh_generate_keys_2048(sa)
+            } else {
+                my_pub = sa_dh_generate_keys(sa)
+            }
+            let dh_line = sa_format_dh_public_line(soul_id, my_pub)
+            _admin_send_line(fdsa, dh_line)
+            let dh_log_label = "[SECAGG-DH]"
+            if dh_2048_on == 1 { dh_log_label = "[SECAGG-DH-2048]" }
+            io_println("fed_join: " + dh_log_label
+                + " generated keypair, sent FED_DH_PUBLIC pubkey="
+                + substr(my_pub, 0, 16) + "...")
+        } else {
+            fed_send_peers(_fed_agg, fdsa)
+        }
+        let _ack0 = _admin_send_line(fdsa, "ACK 0\n")
+        if dh_on == 1 {
+            // Drain incoming FED_DH_PUBLIC lines from the coordinator
+            // until an ACK 0 sentinel terminates the broadcast phase.
+            // Each line carries a peer's id + pubkey; register it via
+            // sa_register_peer_dh so the shared-secret derivation can
+            // proceed when the round opens.
+            let dh_peers = 0
+            let dh_done = 0
+            while dh_done == 0 {
+                let dh_in = _admin_recv_line(fdsa)
+                if dh_in == 0 { dh_done = 1 }
+                else {
+                    let drec = sa_parse_line(dh_in)
+                    if drec == 0 { dh_done = 1 }
+                    else {
+                        let dt = drec[0]
+                        if dt == SECAGG_EV_DH_PUBLIC {
+                            let peer_id  = drec[SECAGG_R_DH_SOUL_ID]
+                            let peer_pub = drec[SECAGG_R_DH_PUBKEY]
+                            sa_register_peer_dh(sa, peer_id, peer_pub)
+                            dh_peers = dh_peers + 1
+                        } else {
+                            // ACK 0 or anything else -> end of broadcast.
+                            dh_done = 1
+                        }
+                    }
+                }
+            }
+            io_println("fed_join: [SECAGG-DH] received " + int_to_str(dh_peers)
+                + " peer pubkey(s); pairwise shared secrets ready")
+        }
+        _fed_conn_fd = fdsa
+        io_println("fed_join: [SECAGG] HELLO ce-fed v2-sa + FED_JOIN exchange complete, "
+            + "peers=" + int_to_str(sa_peer_count(sa)))
+        let resultsa = _admin_fed_one_round_secagg(_fed_agg, fdsa, source_auth)
+        let completedsa = resultsa[0]
+        let round_idsa = resultsa[1]
+        let stats_sentsa = resultsa[2]
+        let aggs_recvsa = resultsa[3]
+        let dropoutssa = resultsa[4]
+        if completedsa == 1 {
+            io_println("fed: [SECAGG] round " + int_to_str(round_idsa) + " complete ("
+                + int_to_str(stats_sentsa) + " masked stats sent, "
+                + int_to_str(aggs_recvsa) + " sum aggregates received, "
+                + int_to_str(dropoutssa) + " dropout(s) reconciled)")
+        } else {
+            io_println("fed_join: [SECAGG] coordinator closed before round completed")
+            fed_close(fdsa)
+            _fed_conn_fd = 0 - 1
+            _fed_agg = 0
+        }
+        return 1
+    }
+    io_println("fed_join: dialing " + host + ":" + int_to_str(port)
+        + " as soul=" + soul_id)
+    let fd = fed_dial(host, port)
+    if fd < 0 {
+        io_println("fed_join: ERROR cannot connect / handshake")
+        return 1
+    }
+    // Build the fed_agg + send FED_JOIN.
+    _fed_agg = fed_agg_new(soul_id, dp, mo)
+    fed_agg_join(_fed_agg)
+    if fed_send_join(_fed_agg, fd) == 0 {
+        fed_close(fd)
+        _fed_agg = 0
+        io_println("fed_join: ERROR sending FED_JOIN")
+        return 1
+    }
+    _fed_conn_fd = fd
+    io_println("fed_join: HELLO + FED_JOIN exchange complete, "
+        + "epsilon=" + int_to_str(fed_agg_epsilon(_fed_agg)) + " milli/round")
+    // Drive one round inline (the integration test relies on this). The
+    // chat returns to the REPL after the first round; subsequent rounds
+    // require another /fed_join (per-round invocation matches the brief's
+    // minimum-viable shape).
+    let result = fed_one_round(_fed_agg, fd, source_auth)
+    let completed = fed_round_result_completed(result)
+    let round_id = fed_round_result_round_id(result)
+    let stats_sent = fed_round_result_stats_sent(result)
+    let aggs_recv = fed_round_result_aggs_recv(result)
+    if completed == 1 {
+        io_println("fed: round " + int_to_str(round_id) + " complete ("
+            + int_to_str(stats_sent) + " stats sent, "
+            + int_to_str(aggs_recv) + " aggregates received)")
+    } else {
+        io_println("fed_join: coordinator closed before round completed")
+        fed_close(fd)
+        _fed_conn_fd = 0 - 1
+        _fed_agg = 0
+    }
+    return 1
+}
+
+fn _admin_fed_stats(sess) {
+    let dp = session_dp(sess)
+    let mo = session_mo(sess)
+    if dp == 0 {
+        io_println("(DP not configured for this session)")
+        return 1
+    }
+    if mo == 0 {
+        io_println("(meta-observer not configured for this session)")
+        return 1
+    }
+    // Build a temporary fed_agg if none exists.
+    let f = _fed_agg
+    if f == 0 {
+        let soul_id = session_id(sess)
+        if len(soul_id) == 0 { soul_id = "default" }
+        f = fed_agg_new(soul_id, dp, mo)
+    }
+    io_println("fed_stats: dry-run preview (next FED_STAT batch)")
+    io_println("  soul=" + fed_agg_soul_id(f)
+        + " epsilon=" + int_to_str(fed_agg_epsilon(f)) + " milli/round")
+    io_println("  dp budget remaining: " + int_to_str(dp_remaining_budget(dp))
+        + " milli-eps")
+    let stats = fed_agg_emit_noised_stats(f)
+    if len(stats) == 0 {
+        io_println("  (no source tags tracked yet; teach some atoms first)")
+        return 1
+    }
+    let i = 0
+    while i < len(stats) {
+        let row = stats[i]
+        io_println("  " + row[FED_STAT_TAG]
+            + ": noised_promo=" + fed_format_milli(row[FED_STAT_PROMO])
+            + " noised_atr=" + fed_format_milli(row[FED_STAT_ATR]))
+        i = i + 1
+    }
+    io_println("  (" + int_to_str(len(stats)) + " source(s); dp budget after: "
+        + int_to_str(dp_remaining_budget(dp)) + " milli-eps)")
+    return 1
+}
+
+fn _admin_fed_leave() {
+    if _fed_conn_fd < 0 {
+        io_println("(not currently joined to a federation)")
+        return 1
+    }
+    if _fed_agg != 0 {
+        fed_send_leave(_fed_agg, _fed_conn_fd)
+        fed_agg_leave(_fed_agg)
+    }
+    fed_close(_fed_conn_fd)
+    _fed_conn_fd = 0 - 1
+    _fed_agg = 0
+    io_println("fed_leave: dropped out of federation")
+    return 1
+}
+
+fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, reg, stream, em, syn_g, sm, now) {
+    if len(msg) == 0 { return 0 }
+    if char_at(msg, 0) != 47 { return 0 }   // not '/'
+    let parts = _split_cmd(msg)
+    let cmd = parts[0]
+    let arg = parts[1]
+    // P0.7: shutdown lines. dl_close flushes any pending dlog batch so a
+    // clean /quit doesn't lose the last entries; the daemon's atexit-style
+    // path is the main-loop fall-through.
+    if str_eq(cmd, "/quit") == 1 { io_println("bye.") dl_close(log) exit(0) }
+    if str_eq(cmd, "/exit") == 1 { io_println("bye.") dl_close(log) exit(0) }
+    if str_eq(cmd, "/help")    == 1 { return _admin_help() }
+    if str_eq(cmd, "/status")  == 1 { return _admin_status(sl, kg, refl_kg, log, engine, hs, stream, em, syn_g, sm, session_dp(sreg_lookup(sreg, active_id))) }
+    if str_eq(cmd, "/why")     == 1 { return _admin_why(log) }
+    if str_eq(cmd, "/why-deep") == 1 { return _admin_why_deep(kg, ctx, log, arg) }
+    if str_eq(cmd, "/__atoms__") == 1 { return _admin_atoms_probe(kg, lang) }
+    if str_eq(cmd, "/halt")    == 1 { return _admin_halt() }
+    if str_eq(cmd, "/resume")  == 1 { return _admin_resume() }
+    if str_eq(cmd, "/teach")   == 1 { return _admin_teach(lang, kg, mo, arg, now) }
+    if str_eq(cmd, "/learn")   == 1 { return _admin_learn(lang, kg, arg, now) }
+    if str_eq(cmd, "/reflect") == 1 { return _admin_reflect(ctx, kg, ikg, refl_kg, arg, now) }
+    if str_eq(cmd, "/save")    == 1 { return _admin_save(sl, kg, lang, stream, em, reg, syn_g, sm, arg, active_id, now) }
+    if str_eq(cmd, "/load")    == 1 { return _admin_load(sl, kg, lang, kgreg, stream, em, reg, sm, arg, active_id, now) }
+    if str_eq(cmd, "/snap_verify") == 1 { return _admin_snap_verify(arg, active_id) }
+    if str_eq(cmd, "/snap_sign_status") == 1 { return _admin_snap_sign_status(arg, active_id) }
+    if str_eq(cmd, "/compact") == 1 { return _admin_compact(sl, kg, lang, stream, em, reg, sm, arg, active_id, now) }
+    if str_eq(cmd, "/speak")   == 1 { return _admin_speak(lang, arg) }
+    if str_eq(cmd, "/say")     == 1 { io_println(tts_say_run(arg)) return 1 }
+    if str_eq(cmd, "/converse") == 1 { io_println(vc_converse_run(kg, arg)) return 1 }
+    if str_eq(cmd, "/dialog")   == 1 { io_println(vc_dialog_run(kg, arg)) return 1 }
+    if str_eq(cmd, "/listen")  == 1 { return _admin_listen(arg) }
+    if str_eq(cmd, "/pitch")   == 1 { io_println(pitch_run_command(arg)) return 1 }
+    if str_eq(cmd, "/pitch_yin") == 1 { io_println(pitch_run_yin_command(arg)) return 1 }
+    if str_eq(cmd, "/pitch_shift") == 1 { io_println(psola_run_pitch_shift_command(arg)) return 1 }
+    if str_eq(cmd, "/clone")       == 1 { io_println(vc_run_clone_command(arg)) return 1 }
+    if str_eq(cmd, "/reverb")      == 1 { io_println(dsp_run_reverb_command(arg)) return 1 }
+    if str_eq(cmd, "/gate")        == 1 { io_println(dsp_run_gate_command(arg)) return 1 }
+    if str_eq(cmd, "/denoise")     == 1 { io_println(nr_run_denoise_command(arg)) return 1 }
+    if str_eq(cmd, "/spec")        == 1 { io_println(stft_run_command(arg)) return 1 }
+    if str_eq(cmd, "/mfcc")        == 1 { io_println(mfcc_run_command(arg)) return 1 }
+    if str_eq(cmd, "/melody")      == 1 { io_println(melody_run_command(arg)) return 1 }
+    if str_eq(cmd, "/wake_train")  == 1 { io_println(wake_run_train_command(arg)) return 1 }
+    if str_eq(cmd, "/wake")        == 1 { io_println(wake_run_detect_command(arg)) return 1 }
+    if str_eq(cmd, "/spk_enroll")    == 1 { io_println(spk_enroll_chat_args(arg)) return 1 }
+    if str_eq(cmd, "/spk_recognize") == 1 { io_println(spk_recognize_chat_args(arg)) return 1 }
+    if str_eq(cmd, "/see")     == 1 { return _admin_see(arg) }
+    if str_eq(cmd, "/play")    == 1 { return _admin_play(arg) }
+    if str_eq(cmd, "/match_images") == 1 { return _admin_match_images(arg) }
+    if str_eq(cmd, "/orb_match")    == 1 { io_println(orb_match_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/pano")         == 1 { io_println(pano_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/hog")          == 1 { io_println(hog_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/detect")       == 1 { io_println(det_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/faces")        == 1 { io_println(face_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/track")        == 1 { io_println(track_run_command(arg)) return 1 }
+    if str_eq(cmd, "/smooth")       == 1 { io_println(vsmooth_run_command(arg)) return 1 }
+    if str_eq(cmd, "/lbp")          == 1 { io_println(lbp_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/ocr")          == 1 { io_println(ocr_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/face_enroll")  == 1 { io_println(face_enroll_chat_args(arg)) return 1 }
+    if str_eq(cmd, "/face_recognize") == 1 { io_println(face_recognize_chat_args(arg)) return 1 }
+    if str_eq(cmd, "/depth")        == 1 { io_println(stereo_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/flow")         == 1 { io_println(lk_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/flow_pyr")     == 1 { io_println(lk_pgm_args_pyramid(arg)) return 1 }
+    if str_eq(cmd, "/flow_pp")      == 1 { io_println(lk_pgm_args_pyramid_perpixel(arg)) return 1 }
+    if str_eq(cmd, "/segment")      == 1 { io_println(seg_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/slic")         == 1 { io_println(slic_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/depth_q")      == 1 { io_println(stereo_quality_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/depth_sgm")    == 1 { io_println(stereo_sgm_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/recall")       == 1 { return episodic_recall_cmd(stream, arg) }
+    if str_eq(cmd, "/find")         == 1 { return ss_find_cmd(kg, arg) }
+    if str_eq(cmd, "/communities")  == 1 { return gc_communities_cmd(kg) }
+    if str_eq(cmd, "/louvain")      == 1 { return louvain_communities_cmd(kg) }
+    if str_eq(cmd, "/pagerank")     == 1 { return pagerank_cmd(kg) }
+    if str_eq(cmd, "/predict")      == 1 { return lp_predict_cmd(kg, arg) }
+    if str_eq(cmd, "/temporal")     == 1 { return tmp_temporal_cmd(kg, arg) }
+    if str_eq(cmd, "/query")        == 1 { return kg_query_cmd(kg, arg) }
+    if str_eq(cmd, "/rule_add")     == 1 { return rule_chat_add_cmd(kg, arg) }
+    if str_eq(cmd, "/rule_run")     == 1 { return rule_chat_run_cmd(kg, arg) }
+    if str_eq(cmd, "/explain")      == 1 { return explain_chat_cmd(kg, arg) }
+    if str_eq(cmd, "/rss")          == 1 { return rss_chat_cmd(kg, arg) }
+    if str_eq(cmd, "/drule_add")    == 1 { io_println("DRULE_ADD info=R21B distributed rule inference ships in src/federation/distributed_rules.nova; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul cross-soul derivation walkthrough)") return 1 }
+    if str_eq(cmd, "/drule_run")    == 1 { io_println("DRULE_RUN info=R21B distributed rule inference; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul fixpoint over partitioned parent-fact set)") return 1 }
+    if str_eq(cmd, "/meta")    == 1 { return _admin_meta(mo, refl_kg, kg, now) }
+    if str_eq(cmd, "/meta-feedback") == 1 { return _admin_meta_feedback(mo, sauth) }
+    if str_eq(cmd, "/meta-apply")    == 1 { return _admin_meta_apply(mo, sauth) }
+    if str_eq(cmd, "/switch")  == 1 { return _admin_switch(reg, arg, now) }
+    if str_eq(cmd, "/seed")    == 1 { return _admin_seed(lang, kg, ikg, mo, arg, now) }
+    if str_eq(cmd, "/__metrics__") == 1 { return _admin_metrics(sl, kg, lang, refl_kg, log, hs, mo, now) }
+    if str_eq(cmd, "/ann_query")   == 1 { return _admin_ann_query(kg, arg) }
+    if str_eq(cmd, "/prove")       == 1 { return _admin_prove(kg, arg) }
+    if str_eq(cmd, "/dp_status")   == 1 { return _admin_dp_status(session_dp(sreg_lookup(sreg, active_id))) }
+    if str_eq(cmd, "/dp_query")    == 1 { return _admin_dp_query(kg, session_dp(sreg_lookup(sreg, active_id)), arg) }
+    if str_eq(cmd, "/dp")          == 1 { return admin_dp_dispatch(session_dp(sreg_lookup(sreg, active_id)), arg) }
+    if str_eq(cmd, "/fed_join")    == 1 { return _admin_fed_join(sreg_lookup(sreg, active_id), arg, sauth) }
+    if str_eq(cmd, "/fed_stats")   == 1 { return _admin_fed_stats(sreg_lookup(sreg, active_id)) }
+    if str_eq(cmd, "/fed_leave")   == 1 { return _admin_fed_leave() }
+    if str_eq(cmd, "/gossip")      == 1 { io_println("gossip: R18E SWIM module ships in src/federation/gossip.nova; this REPL has no gossip daemon (see tests/integration/scenario_www_gossip.sh for the 3-soul mesh)") return 1 }
+    if str_eq(cmd, "/gossip_add_peer") == 1 { io_println("gossip_add_peer: stub -- the chat REPL has no gossip state. Use the standalone driver pattern in tests/integration/_scenario_www_drivers/ to bootstrap a mesh.") return 1 }
+    if str_eq(cmd, "/gossip_noise") == 1 { io_println("gossip_noise: R21E Noise-XK transport for gossip ships in src/federation/gossip.nova (gossip_set_noise_keys + gossip_register_peer_pubkey + CE_GOSSIP_REQUIRE_NOISE); REPL has no gossip state -- see tests/integration/scenario_hhhh_gossip_noise.sh") return 1 }
+    if str_eq(cmd, "/leader")      == 1 { io_println("leader: R19E Bully leader election module ships in src/federation/leader_election.nova; this REPL has no leader-election state (see tests/integration/scenario_zzz_leader.sh for the 3-soul highest-ID elects + leader-death re-election walkthrough)") return 1 }
+    if str_eq(cmd, "/attest_log")  == 1 { io_println("attest_log: R20F gossip-relayed signed snapshot attestation module ships in src/federation/snapshot_attestation.nova; this REPL has no gossip daemon (see tests/integration/scenario_dddd_snapshot_attestation.sh for the 2-soul mesh that broadcasts ATTESTATION tuples and verifies them against peer pubkeys)") return 1 }
+    if str_eq(cmd, "/nat")         == 1 { io_println("nat: R23E NAT traversal -- STUN-like external addr discovery + gossip-piggyback advertisement ships in src/federation/nat_traversal.nova (nat_query_stun + nat_advertise + nat_detect_type + EXTADDR wire); UDP hole-punching deferred to R23E.2 pending NOVA sendto/recvfrom -- see tests/integration/scenario_oooo_nat_traversal.sh for the 2-soul mesh") return 1 }
+    if str_eq(cmd, "/snap_replicas") == 1 { io_println("snap_replicas: R23C federation snapshot replication ships in src/federation/snapshot_replication.nova (sr_init + sr_observe_attestation + gossip_send_snap_fetch + sr_observe_snap_response); the REPL has no gossip daemon -- see tests/integration/scenario_mmmm_snap_replication.sh for the 2-soul walkthrough that broadcasts an attestation, drives SNAP_FETCH, verifies + stores the snapshot bytes against the signed Merkle root, and rejects tampered bytes") return 1 }
+    if str_eq(cmd, "/relay")       == 1 { io_println("relay: R26E gossip relay -- when direct A->B dial fails (peer behind symmetric NAT / firewall), A routes via an intermediate peer C. Ships in src/federation/gossip_relay.nova (relay_init + relay_send + relay_handle_request + relay_chosen_via + RELAY_REQ/DATA/ACK wire). TCP-based relay over pre-known mesh peers; full STUN-relay discovery is R26E.2. REPL has no gossip daemon -- see tests/integration/scenario_vvvv_gossip_relay.sh for the 3-soul A->C->B walkthrough") return 1 }
+    if str_eq(cmd, "/relay_secure") == 1 { io_println("relay_secure: R26E.2 Noise-XK end-to-end wrap of relay payloads ships in src/federation/gossip_relay_secure.nova (srl_init + srl_register_peer_session + srl_send_secure + srl_drain_relay_recv + srl_recv_secure). A and B share a Noise XK session post-Split (out-of-band or via R7C kg_sync v3 handshake); A nxk_seals plaintext under k_init_to_resp, hex-encodes, hands the frame to the R26E relay; C forwards opaque hex bytes (no key); B nxk_opens. Tampered byte in transit -> Poly1305 tag mismatch on B -> dropped. REPL has no gossip daemon -- see tests/integration/scenario_xxxx_relay_secure.sh for the 3-soul A->C->B walkthrough with C-side decrypt attempt + tamper detection") return 1 }
+    if str_eq(cmd, "/webrtc")      == 1 { io_println("webrtc: R28E WebRTC data-channel signaling for browser-to-soul federation ships in src/federation/webrtc.nova (rtc_init + rtc_create_offer + rtc_receive_offer + rtc_receive_answer + rtc_parse_sdp + rtc_sdp_has_media_app + rtc_format_sdp). Signaling-half complete: SDP offer/answer round-trip via HTTP/REST, well-formed v=0/o=/s=/m=application DTLS/SCTP webrtc-datachannel SDP with placeholder ice-ufrag/ice-pwd/fingerprint/setup attributes. Data-plane is the documented R28E.2 stub: rtc_send and rtc_recv return RTC_ERR_NEEDS_DTLS until DTLS 1.2/1.3 + ICE (STUN/TURN) + SRTP + SCTP-over-DTLS layers are wired. Signaling endpoint registration (rtc_signaling_register) is also a stub -- stream_http.nova accepts only /api/event today; R28E.2 needs path-routing or a dedicated /rtc/* listener") return 1 }
+    if str_eq(cmd, "/fuse")        == 1 { let _img_obs = list_new() let _aud_obs = list_new() if _vp_seam != 0 { let _vf = vp_seam_last_features(_vp_seam) if _vf != 0 { if len(_vf) > 0 { push(_img_obs, fuse_image_observation(0, _vf, "", 0 - 1, vp_seam_last_confidence(_vp_seam))) } } } let _fl = fuse_correlate_default(_img_obs, _aud_obs) io_println("fuse: " + fuse_chat_format(_fl)) return 1 }
+    if str_eq(cmd, "/lipsync")     == 1 { io_println(lipsync_pgm_args(arg)) return 1 }
+    if str_eq(cmd, "/history") == 1 {
+        let n = 5
+        if len(arg) > 0 { n = rt_str_to_int(arg) }
+        if n <= 0 { n = 5 }
+        return _admin_history(log, n)
+    }
+    if str_eq(cmd, "/pin") == 1 {
+        let ap = _split_cmd(arg)
+        return _admin_pin(lang, ap[0], ap[1])
+    }
+    io_println("(unknown command: " + cmd + " -- try /help)")
+    return 1
+}
+
+fn main() {
+    io_println("=== CrossEngin chat ===")
+    io_println("state persists across turns; type 'quit' / 'exit' / empty / Ctrl-D to leave")
+    io_println("type /help for admin commands (/teach, /pin, /status, /halt, ...)")
+    io_println("")
+
+    // Substrate-side, PROCESS-SHARED state. The part registry, gate router,
+    // and learning trigger arbiter route activation across all tenants --
+    // they are not part of the per-session bundle (see ADR-0051; the Session
+    // struct holds COGNITIVE state -- soul, KGs, ctx, log, engine, mo, hs --
+    // not substrate plumbing). `stream` (moment stream) and `em` (episodic
+    // memory) are also shared today; the Session shape can grow slots for
+    // them later if cross-tenant bleed becomes observable.
+    let reg = part_registry_new()
+    registry_spawn_fixed(reg, CE_CAP, CE_FIRST)
+    pl_spawn_kg(reg, "world", CE_CAP, CE_FIRST)
+    let gate = gate_new(reg)
+    gate_seed_from_parts(gate, reg)
+    let arb = slt_arbiter_new()
+    let stream = ms_new()
+    let em = em_new()
+    // P2.1 + P2.2: cofire + slot similarity side-indices. Initialized at
+    // boot; the cofire index accumulates pairs of co-firing atoms when
+    // moments settle (via ms_settle_old_with_cofire), and the slot index
+    // accumulates pattern fillers each time gen_from_intent_with_slot
+    // runs. These feed the reader's find_neighbors_full surface (Phase 14
+    // / Tier-2 #2 P2.1/P2.2 follow-up).
+    let ci = ci_new()
+    let si = si_new()
+    // P0.1 (this edit): synapse graph + self-model are also shared across
+    // sessions for now. P0.1 follow-up #2 (multi-part snapshot): /save and
+    // /load now walk the WHOLE part registry, so every part's synapse graph
+    // round-trips. We still pin `syn_g` to the reasoning part's graph -- it's
+    // the part where Hebbian learning between concept neurons happens, so
+    // it's the most learning-bearing graph; /status reports its live edge
+    // count, and the /save log line uses the registry walk for the total.
+    // The self-model starts empty; competence assessment is run on demand
+    // from the live KGs.
+    let reasoning_part = registry_get(reg, registry_find(reg, "reasoning"))
+    let syn_g = part_syn(reasoning_part)
+    let sm = self_model_new()
+
+    // Phase 18 Half A: install the default session ("default" / "Aurora") in
+    // the registry. Every subsequent turn looks up the active session via
+    // `active_id` and re-binds the cognitive locals. Bit-identical behaviour
+    // for vanilla ./bin/crossengin-chat (no /switch issued) because the only
+    // registered session at boot is the default and `active_id` starts at
+    // "default".
+    sreg_register(sreg, _new_session_for(reg, "default", "Aurora", 0))
+
+    // P0.7: wire the default session's dlog to its durable file. Path comes
+    // from CE_DLOG_PATH (default /tmp/crossengin.dlog); a failed open leaves
+    // the dlog in-memory (a warning prints) so the chat still boots. The
+    // existing /history admin reads dl_get; that surface is unchanged.
+    let _dlog_env = getenv("CE_DLOG_PATH")
+    let _dlog_path = "/tmp/crossengin.dlog"
+    if _dlog_env != 0 {
+        if len(_dlog_env) > 0 { _dlog_path = _dlog_env }
+    }
+    let _boot_log = session_log(sreg_lookup(sreg, active_id))
+    let _dlog_ok = dl_open(_boot_log, _dlog_path)
+    if _dlog_ok == 0 {
+        io_println("(warning: dlog could not be opened at " + _dlog_path + " -- in-memory only)")
+    } else {
+        if dl_count(_boot_log) > 0 {
+            io_println("(dlog: " + dl_path(_boot_log) + " loaded "
+                + int_to_str(dl_count(_boot_log)) + " prior entries)")
+        }
+    }
+
+    let modulator = 1000
+    let error = 0
+    let predicted = 300
+    let turn = 0
+
+    // For the boot banner, peek at the default session's KG.
+    let _boot_sess = sreg_lookup(sreg, active_id)
+    io_println("(seed: " + int_to_str(kg_atom_count(session_kg(_boot_sess))) + " atoms, "
+        + soul_name(session_soul(_boot_sess)) + " ready)")
+    io_println("")
+    // CE_LOG_JSON=1: emit a one-line boot record summarising env paths.
+    // No-op when the env var is unset (default), so the boot banner above
+    // stays bit-identical for vanilla operators.
+    _log_boot_env(active_id)
+
+    while 1 == 1 {
+        io_print("> ")
+        let msg = _take_line()
+        if len(msg) == 0 {
+            io_println("bye.")
+            dl_close(_boot_log)
+            return 0
+        }
+        if str_eq(msg, "quit") == 1 {
+            io_println("bye.")
+            dl_close(_boot_log)
+            return 0
+        }
+        if str_eq(msg, "exit") == 1 {
+            io_println("bye.")
+            dl_close(_boot_log)
+            return 0
+        }
+
+        // ---- per-turn: bind cognitive locals from the active session ----
+        // This is the load-bearing re-bind: `/switch` mutates `active_id`,
+        // so the NEXT iteration picks up the new session's soul / KG / ctx
+        // / log automatically. Per-session reader / world_kg_id / cands are
+        // re-derived here too so they reflect the active session's KGs.
+        let sess = sreg_lookup(sreg, active_id)
+        let sl = session_soul(sess)
+        let kgreg = session_kgreg(sess)
+        let kg = session_kg(sess)
+        let lang = session_lang(sess)
+        let ikg = session_ikg(sess)
+        let refl_kg = session_refl_kg(sess)
+        let ctx = session_ctx(sess)
+        let log = session_log(sess)
+        let engine = session_engine(sess)
+        let mo = session_mo(sess)
+        let hs = session_hs(sess)
+        let world_kg_id = atom_kg(kg_find_atom(kg, "fever"))
+        let reader = reader_new(kgreg, lang, 0)
+        // Build syntax candidates from the active session's language KG.
+        // Skip nulls defensively: a stale snapshot loaded over the seed can
+        // forcibly overwrite the syntax atom's `ltype` to LWORD inside
+        // kg_section_apply, after which syntax_find returns 0. Dropping the
+        // null keeps gen_best_pattern's loop from dereferencing it; the
+        // fallback path (_gen_emit_intent) still produces a reply.
+        let cands = list_new()
+        let _ack = syntax_find(lang, "ack")
+        if _ack != 0 { push(cands, _ack) }
+        let _see = syntax_find(lang, "see_topic")
+        if _see != 0 { push(cands, _see) }
+        session_touch(sess, hs_now(hs))
+
+        if _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, reg, stream, em, syn_g, sm, hs_now(hs)) == 1 {
+            // Admin command handled; do not feed to the agent.
+        } else {
+
+        hs_post_event(hs, EV_MESSAGE, msg)
+        let reply = ""
+        let last_matched = 0
+        let last_unk = 0
+
+        // Drain: each hs_step pops <=1 event and ticks once. Stop when the
+        // event has been processed (idle counter starts climbing).
+        let drained = 0
+        let drain_steps = 0
+        while drained == 0 {
+            let ev = hs_step(hs, modulator, error)
+            drain_steps = drain_steps + 1
+            if ev != 0 {
+                let raw = event_payload(ev)
+                let p = transduce(IN_TEXT, raw)
+                ctx_set_input(ctx, percept_text(p))
+                ctx_set_idle(ctx, 0)
+                ctx_set_tick(ctx, hs_now(hs))
+                let matched = loop_perception_step(ctx, reader)
+                last_matched = matched
+                // Reflection corroboration: percept tokens whose label is
+                // already in refl_kg confirm prior speculation (ADR-0023).
+                let corroborated = refl_corroborate_percept(kg, refl_kg, ctx_percept(ctx))
+                loop_memory_step(ctx, stream, em)
+                let nconcl = loop_reasoning_step(ctx, kg)
+
+                _route_and_inject(reg, gate, XSIG_SENSORY, 700, hs_now(hs))
+                let unk = ctx_unknown(ctx)
+                last_unk = unk
+                if unk > 0 {
+                    _route_and_inject(reg, gate, XSIG_CURIOSITY, 600, hs_now(hs))
+                    _submit_curiosity(arb, lang, ctx_input(ctx))
+                }
+
+                // Affect from comprehension -> mood -> tick modulation.
+                let des = matched * 300 - unk * 150
+                loop_emotion_step(ctx, sl, des, 0, matched * 100)
+                let val = ctx_valence(ctx)
+                let aro = ctx_arousal(ctx)
+                modulator = emotion_modulate_plasticity(val, aro, val)
+                error = pc_residual(aro, predicted)
+                predicted = aro
+
+                let gap = 200
+                if unk > 0 { gap = 700 }
+                loop_goals_step(ctx, engine, gap, turn, 0, 300)
+
+                // ADR-0045 semantic-intent gate: combine the legacy literal
+                // substring check on the raw input with the concept-keyed
+                // veto over the perceived concept handles (find_neighbors
+                // surfacing of the rule's canonical concept). Either path
+                // fires the constitutional veto -- and the gate writes a
+                // VETOED outcome to the decision log.
+                let input_veto = const_input_veto_for(sl, ctx_input(ctx), kgreg, ctx_percept(ctx))
+                if input_veto == 1 {
+                    effector_speak(log, ctx_input(ctx), 1, halted, 0 - 1, list_new(), 0, hs_now(hs))
+                    reply = "[refused]"
+                } else {
+                    // Output emerges from cognition: pick the first NEW
+                    // conclusion, reverse-look up its naming word, speak it.
+                    let percept = ctx_percept(ctx)
+                    let concs = ctx_conclusions(ctx)
+                    let intent = _intent1("ACK", "okay")
+                    let derived = ""
+                    let ck = 0
+                    while ck < len(concs) {
+                        if len(derived) == 0 {
+                            let cid = concs[ck]
+                            let in_p = 0
+                            let pi = 0
+                            while pi < len(percept) {
+                                if percept[pi][1] == cid { in_p = 1 }
+                                pi = pi + 1
+                            }
+                            if in_p == 0 {
+                                let w = gen_word_for_concept(lang, world_kg_id, cid)
+                                if w != 0 { derived = word_form(w) }
+                            }
+                        }
+                        ck = ck + 1
+                    }
+                    if len(derived) > 0 {
+                        let it = list_new()
+                        let a = list_new() push(a, "SEE") push(a, "see")
+                        let b = list_new() push(b, "TOPIC") push(b, derived)
+                        push(it, a) push(it, b)
+                        intent = it
+                    }
+                    let resp = gen_from_intent_with_slot(lang, cands, intent, hs_now(hs), si)
+                    let said = effector_speak_governed(log, sl, resp, halted, 0 - 1, list_new(), 0, hs_now(hs))
+                    ctx_set_output(ctx, said)
+                    _route_and_inject(reg, gate, XSIG_GOAL, 800, hs_now(hs))
+                    reply = said
+                    if len(reply) == 0 { reply = "[silent]" }
+                }
+                drained = 1
+            } else {
+                // Empty step; if we've burned many empty ticks without the
+                // event being drained, bail out (defensive).
+                if drain_steps > 10 { drained = 1 }
+            }
+        }
+
+        // Idle-style: if curiosity triggers were submitted, drain + teach now
+        // so the agent grows its KGs mid-conversation.
+        let taught = _drain_and_teach(arb, kg, lang, hs_now(hs))
+
+        // Any refl_kg atom whose belief crossed the promotion threshold this
+        // turn graduates to a real concept now -- reflective speculation that
+        // perception corroborated becomes accepted knowledge.
+        let promoted = refl_drain_promotions(kg, lang, refl_kg, hs_now(hs))
+
+        if len(reply) == 0 { reply = "[no response]" }
+        _last_reply = reply
+        if _log_json_enabled() == 1 {
+            // One JSON object per turn -- the operator-visible record of
+            // the agent's reply + perception counts. Tests/integration/
+            // scenario_y_json_logs.sh parses this line with python3's
+            // json.loads to verify it round-trips.
+            let rf = list_new()
+            push(rf, _logf_s("msg", msg))
+            push(rf, _logf_s("reply", reply))
+            _log_json("info", active_id, "reply", rf)
+            let pf = list_new()
+            push(pf, _logf_s("msg", msg))
+            push(pf, _logf_i("m", last_matched))
+            push(pf, _logf_i("unk", last_unk))
+            _log_json("info", active_id, "perceive", pf)
+            if taught > 0 {
+                let tf = list_new()
+                push(tf, _logf_i("taught", taught))
+                push(tf, _logf_i("atoms", kg_atom_count(kg)))
+                _log_json("info", active_id, "learn", tf)
+            }
+            if len(promoted) > 0 {
+                let mf = list_new()
+                push(mf, _logf_i("count", len(promoted)))
+                let promoted_csv = ""
+                let pk = 0
+                while pk < len(promoted) {
+                    if pk > 0 { promoted_csv = promoted_csv + "," }
+                    promoted_csv = promoted_csv + promoted[pk]
+                    pk = pk + 1
+                }
+                push(mf, _logf_s("labels", promoted_csv))
+                _log_json("info", active_id, "promote", mf)
+            }
+        } else {
+            io_println("agent> " + reply)
+            io_println("       perceive(m=" + int_to_str(last_matched)
+                + ",unk=" + int_to_str(last_unk) + ")")
+            if taught > 0 {
+                io_println("       (learned " + int_to_str(taught) + " new word(s) -- "
+                    + int_to_str(kg_atom_count(kg)) + " atoms total)")
+            }
+            if len(promoted) > 0 {
+                let line = "       (promoted from reflection:"
+                let k = 0
+                while k < len(promoted) {
+                    line = line + " " + promoted[k]
+                    if k < len(promoted) - 1 { line = line + "," }
+                    k = k + 1
+                }
+                io_println(line + ")")
+            }
+        }
+        turn = turn + 1
+        } // end else: regular agent message
+    }
+    return 0
+}
+main()

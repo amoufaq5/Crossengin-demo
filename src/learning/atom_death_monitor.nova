@@ -1,0 +1,160 @@
+// CrossEngin learning: atom death monitor (idle GC).
+//
+// Purpose
+//   Bounds long-term storage by collecting cold, weakly-evidenced atoms
+//   (ADR-0025). An atom is collectable only when ALL hold: activation strength
+//   below 0.02, belief strength below 4 (well-evidenced atoms are never GC'd),
+//   not in a protected class (constitutional / self-model / classical), and not
+//   referenced by a cross-KG edge. Death is two-phase: a collectable atom is
+//   tombstoned (soft-deleted) first; if it is still collectable on the next
+//   sweep it is hard-removed, but reactivation during the tombstone window
+//   rescues it.
+//
+//   Activation strength, last access, protection and tombstone/dead flags live
+//   in the atom payload (the base atom has no such fields). Strength is milli.
+//   Decay is geometric (tau_atom ~ 30 days; caller passes the retention factor).
+//
+//   P1.6 (this revision) wires the optional meta-observer hook: the
+//   tombstone-then-hard-remove transition calls `mo_record_death(mo, atom_id)`
+//   so a source-attributed atom that dies outright lands in the observer's
+//   atrophy counter immediately (today the observer only sees atrophy as
+//   "tentative -> sub-threshold" via the rolling poll; this hook is the
+//   "durable atom dies outright" path). The observer reference is OPTIONAL
+//   -- pass 0 to keep the original behavior (callers that have not yet been
+//   threaded). `adm_sweep` is the legacy entry that just passes 0; new
+//   callers use `adm_sweep_attributed(reg, kg, mo)`.
+//
+// ADRs implemented: ADR-0025 (atom death / GC + P1.6 observer hook), ADR-0017
+//   (cross-ref protection).
+//   Idle GC sweep cadence is NOVA enhancement #13.
+// NOVA dependencies: builtins. CrossEngin dependencies:
+//   src/kg/cross_kg_references.nova (xref accessors; and multi_kg, atom_store),
+//   src/parts/meta/meta_observer.nova (via the caller's `mo_record_death`
+//   pointer-shaped param; no import here).
+
+import "../kg/cross_kg_references.nova"
+import "../parts/meta/meta_observer.nova"
+
+let DEATH_STRENGTH  = 20    // 0.02 activation floor
+let DEATH_BELIEF    = 4000  // 4.0 evidence units (alpha+beta) below which GC-able
+let DEATH_REINFORCE = 200   // +0.2 on read/co-activation
+
+// Initialize an atom's lifecycle fields (active on creation).
+fn adm_init(atom, now) {
+    atom_payload_set(atom, "act", 1000)
+    atom_payload_set(atom, "last_access", now)
+    atom_payload_set(atom, "tomb", 0)
+    atom_payload_set(atom, "dead", 0)
+    return 1
+}
+
+fn adm_act(atom)          { return atom_payload_get(atom, "act") }
+fn adm_is_protected(atom) { if atom_payload_get(atom, "prot") == 1 { return 1 } return 0 }
+fn adm_is_tombstoned(atom){ if atom_payload_get(atom, "tomb") == 1 { return 1 } return 0 }
+fn adm_is_dead(atom)      { if atom_payload_get(atom, "dead") == 1 { return 1 } return 0 }
+
+fn adm_set_protected(atom) { atom_payload_set(atom, "prot", 1); return 1 }
+
+// Reinforce on read/co-activation: +0.2 capped at 1.0; refresh last access.
+fn adm_reinforce(atom, now) {
+    let a = adm_act(atom) + DEATH_REINFORCE
+    if a > 1000 { a = 1000 }
+    atom_payload_set(atom, "act", a)
+    atom_payload_set(atom, "last_access", now)
+    return a
+}
+
+// Geometric activation decay (one step).
+fn adm_decay(atom, retain_milli) {
+    atom_payload_set(atom, "act", fp_mul(adm_act(atom), retain_milli))
+    return adm_act(atom)
+}
+
+// Is `atom` (in any KG of `reg`) the destination of some cross-KG edge?
+fn adm_is_referenced(reg, atom) {
+    let target_kg = atom_kg(atom)
+    let target_id = atom_id(atom)
+    let n = kg_count(reg)
+    let k = 0
+    while k < n {
+        let kg = kg_get(reg, k)
+        let atoms = kg_atoms(kg)
+        let i = 0
+        while i < len(atoms) {
+            let xr = atom_xrefs(atoms[i])
+            let j = 0
+            while j < len(xr) {
+                if xref_dst_atom(xr[j]) == target_id {
+                    if str_eq(xref_dst_kg(xr[j]), target_kg) == 1 { return 1 }
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// All death gates (ADR-0025). Protected, well-evidenced, or referenced atoms
+// are never collectable.
+fn adm_is_collectable(reg, atom) {
+    if adm_is_protected(atom) == 1 { return 0 }
+    if adm_act(atom) >= DEATH_STRENGTH { return 0 }
+    if bel_strength(atom_belief(atom)) >= DEATH_BELIEF { return 0 }
+    if adm_is_referenced(reg, atom) == 1 { return 0 }
+    return 1
+}
+
+// One GC sweep over a KG with optional meta-observer attribution (P1.6).
+// Tombstones newly-collectable atoms; hard-removes ones still collectable from
+// a prior tombstone; rescues reactivated tombstoned ones. Returns
+// [tombstoned, removed, rescued].
+//
+// `mo` is the meta-observer reference (or 0 to disable attribution). When an
+// atom transitions tombstone -> dead AND `mo != 0`, calls
+// `mo_record_death(mo, atom_id(a))` so the source-attribution counter is
+// bumped at the moment of death (rather than waiting for the next mo_poll to
+// notice the atom "vanished" -- which the GC may already have removed by
+// then). Keeps the API surface tiny: one extra param, one extra call.
+fn adm_sweep_attributed(reg, kg, mo) {
+    let atoms = kg_atoms(kg)
+    let tombstoned = 0
+    let removed = 0
+    let rescued = 0
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if adm_is_dead(a) == 0 {
+            if adm_is_tombstoned(a) == 1 {
+                if adm_is_collectable(reg, a) == 1 {
+                    atom_payload_set(a, "dead", 1)
+                    removed = removed + 1
+                    // P1.6: observer attribution at the death-decision call site.
+                    if mo != 0 { mo_record_death(mo, atom_id(a)) }
+                } else {
+                    atom_payload_set(a, "tomb", 0)
+                    rescued = rescued + 1
+                }
+            } else {
+                if adm_is_collectable(reg, a) == 1 {
+                    atom_payload_set(a, "tomb", 1)
+                    tombstoned = tombstoned + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, tombstoned)
+    push(out, removed)
+    push(out, rescued)
+    return out
+}
+
+// Legacy entry point: same sweep, no observer attribution. Equivalent to
+// `adm_sweep_attributed(reg, kg, 0)`. Preserved so existing callers (and
+// `tests/unit/test_atom_death_monitor.nova`) continue to work unchanged.
+fn adm_sweep(reg, kg) {
+    return adm_sweep_attributed(reg, kg, 0)
+}

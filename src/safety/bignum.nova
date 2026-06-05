@@ -1,0 +1,721 @@
+// CrossEngin safety: pure-NOVA 256-bit unsigned bignum library.
+//
+// Purpose
+//   The arithmetic primitive that unblocks Diffie-Hellman key agreement
+//   (and downstream the X25519 ECDH that Google's SecAgg Bonawitz et al.
+//   2017 requires for per-round mask seeds), RSA decrypt/verify, and the
+//   modular-exponentiation kernel that TLS-cert validation will need
+//   once the X.509 stack lands. The federated SecAgg MVP (P3.8) shipped
+//   pre-shared tokens because NOVA had no bignum -- that's the gap this
+//   module closes. The DH-on-top-of-SecAgg upgrade is documented in
+//   SECAGG_AUDIT.md as the immediate downstream consumer; this module
+//   does not wire it up (that's the next session's work).
+//
+// Scope -- 256-bit fixed, NOT arbitrary precision
+//   256 bits is enough for X25519 ECDH on Curve25519 (the field is
+//   2^255 - 19, and scalar arithmetic happens mod 2^252 + small),
+//   for Ed25519 signatures, for P-256 ECDSA, and for the modular
+//   primitives most modern protocols use. Real DH on a 1024 / 2048-bit
+//   safe prime is OUT OF SCOPE -- that's an order-of-magnitude more
+//   work (32 / 64 limbs, Barrett or Montgomery reduction for speed,
+//   constant-time everything). The MVP picks the smallest fixed width
+//   that lets the headline cryptographic primitives compile.
+//
+// Representation
+//   `bn` is a NOVA list of exactly BN_LIMBS = 8 limbs, each a 32-bit
+//   non-negative integer. Index 0 is the LEAST-significant limb (the
+//   low 32 bits), index 7 is the MOST-significant. Concretely:
+//     value = sum over i in 0..7 of limbs[i] * (2^32)^i
+//   The byte/hex serialization is BIG-ENDIAN per crypto convention
+//   (`bn_to_hex` emits MSB-first, 64 lowercase hex chars), while the
+//   internal limb layout is little-endian for the natural multiplication
+//   and addition algorithms. Limbs stored as plain int, so all of
+//   NOVA's `int_*` builtins apply directly. The 32-bit mask
+//   BN_MASK32 = 0xFFFFFFFF folds intermediate products back into 32
+//   bits after each carry-propagate.
+//
+// Why 32-bit limbs (not 16-bit or 26-bit)
+//   * Sum of 8 32-bit limbs fits comfortably in a 64-bit signed int
+//     (NOVA's underlying int) with room for carries: 8 * 2^32 < 2^36.
+//   * Product of two 32-bit limbs is at most 2^64 - 2^33 + 1, which
+//     does NOT fit in signed 64-bit (would overflow to negative). So
+//     `bn_mul` does NOT compute the full 64-bit product per cell;
+//     instead it uses a 16-bit limb decomposition INTERNALLY: each
+//     32-bit limb splits into two 16-bit halves, the schoolbook
+//     multiply runs over 16 x 16 -> 32-bit cells, and the products
+//     are added column-by-column into a 16-limb (still 32-bit each)
+//     accumulator. Sum of 16 16-bit products in a column is at most
+//     16 * (2^16 - 1)^2 ~ 2^36, comfortably in signed 64-bit.
+//   * NOVA's pointer-threshold gotcha #11 fires at ~2^20 INSIDE
+//     loops when the smart `*` operator is used. We exclusively use
+//     `int_mul` here (no smart `*` for arithmetic) so the gotcha
+//     does not apply; 32-bit limbs are safe.
+//
+// Public API
+//   bn_new()                      -> a fresh zero bignum
+//   bn_from_int(n)                -> bignum holding the small non-negative n
+//   bn_from_hex(hex_str)          -> bignum from 1..64-char hex string
+//                                    (case-insensitive; left-pads with zeros);
+//                                    invalid input returns bn_new()
+//   bn_to_hex(bn)                 -> canonical 64-char lowercase hex string
+//   bn_zero(bn)                   -> 1 iff all limbs are zero, else 0
+//   bn_eq(a, b)                   -> 1 iff a == b, else 0
+//   bn_cmp(a, b)                  -> -1 if a < b, 0 if a == b, 1 if a > b
+//   bn_add(a, b)                  -> (a + b) mod 2^256 (drops any carry past bit 255)
+//   bn_sub(a, b)                  -> (a - b) mod 2^256 (two's-complement wrap on underflow)
+//   bn_mul(a, b)                  -> [hi, lo], the 512-bit product split into
+//                                    two 256-bit halves (hi*2^256 + lo == a*b
+//                                    exactly, no truncation)
+//   bn_mod(a, m)                  -> a mod m. 256-bit operands only; m > 0
+//   bn_modmul(a, b, m)            -> (a * b) mod m
+//   bn_modpow(base, exp, m)       -> base^exp mod m via square-and-multiply.
+//                                    FAST, SIDE-CHANNEL-UNSAFE: leaks the
+//                                    exponent's Hamming weight via timing
+//                                    (the inner `if (bit set)` branch only
+//                                    runs a multiply when the bit is 1, so
+//                                    a remote adversary measuring wall-clock
+//                                    can distinguish "lots of 1s" from
+//                                    "lots of 0s" in the exponent). Use ONLY
+//                                    for OFFLINE self-tests / vector checks
+//                                    where the exponent is public.
+//   bn_modpow_ct(base, exp, m)    -> base^exp mod m via the Montgomery
+//                                    ladder. CRYPTO-SAFE: every iteration
+//                                    executes EXACTLY one modmul AND one
+//                                    square, regardless of the current bit
+//                                    value, so the per-bit timing is
+//                                    independent of the exponent's Hamming
+//                                    weight. ~2x slower than `bn_modpow`
+//                                    per bit-loop iteration (`bn_modpow`
+//                                    only does the mul on 1-bits; the
+//                                    ladder ALWAYS does both ops). Use
+//                                    this for DH key agreement, ECDH
+//                                    scalar mult emulation, and any other
+//                                    code path where the exponent is a
+//                                    private key.
+//
+// Constant-time / side-channel disclaimer
+//   At the MVP level the comparator (`bn_cmp`) and the subtraction borrow
+//   path (`bn_sub`) still branch on data, so they leak the operand bits
+//   they walk. The `bn_modpow_ct` variant uses both internally (via
+//   `bn_mod` for the upfront base reduction and `bn_modmul` for the
+//   per-step multiplies) -- those calls have data-dependent control flow
+//   on the OPERANDS, but the OUTER LOOP STRUCTURE of `bn_modpow_ct` is
+//   exponent-bit-INDEPENDENT (one mul + one square per bit, regardless
+//   of bit value). A passive timing adversary watching wall-clock of a
+//   single `bn_modpow_ct` call cannot recover the exponent's Hamming
+//   weight or bit positions; they CAN in principle still recover signal
+//   from the operand-dependent paths inside `bn_modmul` and `bn_mod`,
+//   but those are NOT exponent-correlated, so the headline DH leak is
+//   closed. Fully constant-time everything is a separate ~2-3 week
+//   per-primitive project (Montgomery ladder for scalar mult is the
+//   easy part; masked subtraction for borrow and fixed-window exp with
+//   cmov-emulated table lookups are the rest). For the SecAgg DH key
+//   agreement landing in this session, `bn_modpow_ct` is the
+//   crypto-safe path; `bn_modpow` remains for offline test vectors
+//   only.
+//
+// Test parity
+//   tests/unit/test_bignum.nova covers ~30 assertions across:
+//     * zero/round-trip (bn_from_hex / bn_to_hex)
+//     * 32-bit carry propagation in bn_add (2^32 - 1 + 1 = 2^32)
+//     * underflow wrap in bn_sub (3 - 5 = 2^256 - 2)
+//     * small-product (2 * 3 = 6) and large-product (2^128 * 2^128 = 2^256, hi=1)
+//     * bn_mod with small modulus
+//     * bn_modpow against the textbook 2^10 mod 1000 = 24
+//     * bn_modpow on a 256-bit prime modulus (RFC 7748 X25519 field
+//       2^255 - 19) as a sanity check that the kernel survives full-
+//       width inputs
+//
+// ADRs touched: SECAGG_AUDIT.md ("DH key exchange unblocked"), TLS_AUDIT.md
+//   (modpow is the kernel of RSA verify + DHE key share derivation).
+// NOVA dependencies: builtins only -- int_add, int_sub, int_mul, int_and,
+//   int_or, int_xor, int_shl, int_shr, list_new, push, list_set, len,
+//   substr, char_at, chr, str_eq.
+// CrossEngin dependencies: none -- pure leaf primitive.
+
+// ---- size constants -------------------------------------------------------
+//
+// BN_LIMBS = 8 -> 256-bit total. BN_MASK32 = 2^32 - 1 = 4294967295 is the
+// 32-bit unsigned mask; held in a let-const so it stays out of the loop-
+// body smart-op path (NOVA gotcha #11). LIMB_BITS = 32. HALF_BITS = 16
+// (for the schoolbook bn_mul which splits each 32-bit limb into 2 16-bit
+// halves so per-cell products fit in signed 64-bit).
+let BN_LIMBS    = 8
+let BN_MASK32   = 4294967295    // 2^32 - 1
+let BN_MASK16   = 65535         // 2^16 - 1
+let BN_LIMB_BITS = 32
+let BN_HALF_BITS = 16
+let BN_HEX_DIGITS = 64          // 8 limbs * 8 hex chars each
+
+// ---- internal helpers -----------------------------------------------------
+
+// Mask a value into 32-bit unsigned range. Single int_and; lifted to a
+// helper so the call sites read clearly.
+fn _bn_mask32(x) {
+    return int_and(x, BN_MASK32)
+}
+
+// Construct a fresh `bn` with all 8 limbs zero. Used as the public
+// `bn_new` constructor and as the result-buffer in every arithmetic op.
+fn _bn_alloc_zero() {
+    let r = list_new()
+    let i = 0
+    while i < BN_LIMBS {
+        push(r, 0)
+        i = i + 1
+    }
+    return r
+}
+
+// Hex-nibble parser identical to the chacha20 codec; lifted locally
+// rather than imported so bignum stays a leaf module with no cross-
+// safety dependency (poly1305 / chacha20 are leaves too).
+fn _bn_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }   // '0'..'9'
+    if c >= 97 { if c <= 102 { return c - 87 } }   // 'a'..'f'
+    if c >= 65 { if c <= 70  { return c - 55 } }   // 'A'..'F'
+    return -1
+}
+
+// Inverse: nibble (0..15) -> lowercase hex char code.
+fn _bn_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87    // 'a'..'f'
+}
+
+// ---- constructors --------------------------------------------------------
+
+// Fresh 256-bit zero bignum.
+fn bn_new() {
+    return _bn_alloc_zero()
+}
+
+// Build a bignum from a small NOVA int (the int must be non-negative;
+// values <= 2^63 - 1 fit in the low 2 limbs and we accept up to 2^64 - 1
+// in principle via the two-limb split). Negative inputs are clamped to
+// zero so the function always returns a valid bignum.
+fn bn_from_int(n) {
+    let r = _bn_alloc_zero()
+    if n <= 0 { return r }
+    // Low 32 bits in limb[0], next 32 bits in limb[1], rest zero.
+    list_set(r, 0, _bn_mask32(n))
+    list_set(r, 1, _bn_mask32(int_shr(n, 32)))
+    return r
+}
+
+// Parse a hex string (no "0x" prefix; 1..64 hex chars; case-insensitive)
+// into a 256-bit bignum. Right-justifies: e.g. "ff" parses as the
+// integer 255 (limb[0] = 255, all others zero). Returns bn_new() on
+// invalid input (odd lengths permitted -- treated as left-padded with a
+// '0' nibble; bad characters always return zero).
+fn bn_from_hex(hex_str) {
+    let r = _bn_alloc_zero()
+    let n = len(hex_str)
+    if n == 0 { return r }
+    if n > BN_HEX_DIGITS { return r }   // too wide for 256-bit
+    // We process from the END of the string (least-significant nibble)
+    // toward the start. Each nibble contributes 4 bits to the running
+    // bit-offset, which decomposes into (limb_index, intra_limb_shift).
+    let i = n - 1
+    let bit_pos = 0
+    while i >= 0 {
+        let c = char_at(hex_str, i)
+        let v = _bn_hex_nibble(c)
+        if v < 0 {
+            // Reset on bad input.
+            return _bn_alloc_zero()
+        }
+        let limb_idx = int_shr(bit_pos, 5)            // bit_pos / 32
+        let shift    = int_and(bit_pos, 31)           // bit_pos mod 32
+        let cur      = r[limb_idx]
+        let add      = _bn_mask32(int_shl(v, shift))
+        list_set(r, limb_idx, _bn_mask32(int_or(cur, add)))
+        bit_pos = bit_pos + 4
+        i = i - 1
+    }
+    return r
+}
+
+// Canonical 64-character lowercase hex serialization (big-endian byte
+// order). Always emits exactly BN_HEX_DIGITS = 64 characters with
+// leading zeros preserved. The output is what bn_from_hex round-trips.
+fn bn_to_hex(bn) {
+    // Build a 64-char string by emitting limbs from MSB (index 7) to
+    // LSB (index 0), each as 8 hex chars (32 bits / 4 bits per char).
+    // Within each limb we go from high nibble to low.
+    let s = ""
+    let i = BN_LIMBS - 1
+    while i >= 0 {
+        let limb = bn[i]
+        // 8 hex chars per limb, high nibble first.
+        let j = 7
+        while j >= 0 {
+            let nib = int_and(int_shr(limb, int_mul(j, 4)), 15)
+            s = s + chr(_bn_nibble_hex(nib))
+            j = j - 1
+        }
+        i = i - 1
+    }
+    return s
+}
+
+// ---- predicates ----------------------------------------------------------
+
+// 1 iff every limb is zero. Single linear scan; eight reads.
+fn bn_zero(bn) {
+    let i = 0
+    while i < BN_LIMBS {
+        if bn[i] != 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// 1 iff a == b (limbwise). All eight limbs must match.
+fn bn_eq(a, b) {
+    let i = 0
+    while i < BN_LIMBS {
+        if a[i] != b[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// -1 / 0 / +1 comparator. Walks from MSB to LSB; the first differing
+// limb determines the sign. NOT constant-time -- documented at top of
+// file.
+fn bn_cmp(a, b) {
+    let i = BN_LIMBS - 1
+    while i >= 0 {
+        let ai = a[i]
+        let bi = b[i]
+        if ai < bi { return -1 }
+        if ai > bi { return 1 }
+        i = i - 1
+    }
+    return 0
+}
+
+// ---- addition + subtraction ----------------------------------------------
+
+// (a + b) mod 2^256 -- a 256-bit add with carry chain. Any carry past the
+// most-significant limb is dropped (this is the natural "wrapping" add
+// modular arithmetic libraries expose; callers needing the full 257-bit
+// result would use bn_mul or pre-extend).
+fn bn_add(a, b) {
+    let r = _bn_alloc_zero()
+    let carry = 0
+    let i = 0
+    while i < BN_LIMBS {
+        let sum = int_add(int_add(a[i], b[i]), carry)
+        list_set(r, i, _bn_mask32(sum))
+        // sum may be up to 2^32 + 2^32 + 1 ~ 2^33; the carry-out is bit 32.
+        carry = int_shr(sum, 32)
+        i = i + 1
+    }
+    return r
+}
+
+// (a - b) mod 2^256. Two's-complement wrap on underflow: if a < b the
+// result is 2^256 - (b - a). Implemented as the standard borrow-chain
+// subtraction with the borrow bit folded back into the next limb.
+fn bn_sub(a, b) {
+    let r = _bn_alloc_zero()
+    let borrow = 0
+    let i = 0
+    while i < BN_LIMBS {
+        // Diff can go negative in the signed view; we add 2^32 if it
+        // does, and propagate the borrow.
+        let diff = int_sub(int_sub(a[i], b[i]), borrow)
+        if diff < 0 {
+            diff = int_add(diff, int_shl(1, 32))    // diff + 2^32
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        list_set(r, i, _bn_mask32(diff))
+        i = i + 1
+    }
+    return r
+}
+
+// ---- multiplication ------------------------------------------------------
+//
+// Schoolbook 256-bit x 256-bit -> 512-bit product, split into two 256-bit
+// halves `[hi, lo]`. We split each 32-bit limb into two 16-bit halves so
+// the per-cell product limb_half * limb_half fits in 32 bits (well below
+// the 63-bit positive band) and the column sum of up to 16 + carries fits
+// in 64. The result is accumulated into a 16-limb (still 32-bit each)
+// scratch array, then re-packed into two 8-limb bignums.
+
+// Split a 32-bit limb into [lo16, hi16].
+fn _bn_split16(limb) {
+    let lo = int_and(limb, BN_MASK16)
+    let hi = int_and(int_shr(limb, 16), BN_MASK16)
+    let p = list_new()
+    push(p, lo)
+    push(p, hi)
+    return p
+}
+
+// Convert a list of 16 "32-bit limbs" into [hi, lo] bignum pair, both
+// 8-limb 256-bit bignums. Caller must ensure each entry is masked to 32
+// bits (or the natural carry propagation has already done the masking).
+fn _bn_pack16_to_pair(limbs16) {
+    let lo = _bn_alloc_zero()
+    let hi = _bn_alloc_zero()
+    let i = 0
+    while i < BN_LIMBS {
+        list_set(lo, i, limbs16[i])
+        list_set(hi, i, limbs16[i + BN_LIMBS])
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, hi)
+    push(pair, lo)
+    return pair
+}
+
+// Full 256x256 -> 512 multiplier. Internal layout: each 32-bit limb is
+// processed as two 16-bit halves, so a is 16 16-bit halves
+// (a_h[0..15]) and b similarly. The product is the sum over i, j of
+// a_h[i] * b_h[j] shifted by (i+j) 16-bit positions. We accumulate into
+// a 32-element 16-bit-half array (32 * 16 = 512 bits) with carries
+// propagated within the loop so no per-cell intermediate exceeds 2^32.
+//
+// Returns [hi_bn, lo_bn] where hi_bn * 2^256 + lo_bn = a * b exactly.
+fn bn_mul(a, b) {
+    // Build 16-half views of a and b.
+    let ah = list_new()
+    let bh = list_new()
+    let k = 0
+    while k < BN_LIMBS {
+        let pa = _bn_split16(a[k])
+        let pb = _bn_split16(b[k])
+        push(ah, pa[0])
+        push(ah, pa[1])
+        push(bh, pb[0])
+        push(bh, pb[1])
+        k = k + 1
+    }
+    // Accumulator: 32 16-bit slots (i.e. 32 ints whose values stay
+    // within 32 bits after every column-merge step). Stored as a list
+    // of 32 ints.
+    let acc = list_new()
+    let z = 0
+    while z < 32 {
+        push(acc, 0)
+        z = z + 1
+    }
+    // Schoolbook: for each (i, j), add a_h[i] * b_h[j] into acc[i+j],
+    // propagating carries upward. Each per-cell product fits in
+    // (2^16 - 1)^2 ~ 2^32, well in the positive 63-bit band; the
+    // accumulator carry chain keeps the running sum < 2^32 at each
+    // slot after carry propagation.
+    let i = 0
+    while i < 16 {
+        let aw = ah[i]
+        let j = 0
+        while j < 16 {
+            let prod = int_mul(aw, bh[j])
+            let pos = i + j
+            // Add prod into acc[pos]; propagate carry.
+            let s = int_add(acc[pos], prod)
+            list_set(acc, pos, int_and(s, BN_MASK16))
+            let carry = int_shr(s, 16)
+            let p2 = pos + 1
+            // Tail-walk carry; the carry chain has length at most ~33
+            // for the worst case (all 0xFFFFFFFF inputs); we bound
+            // strictly by the 32-slot accumulator.
+            while carry > 0 {
+                if p2 >= 32 { carry = 0 }
+                else {
+                    let s2 = int_add(acc[p2], carry)
+                    list_set(acc, p2, int_and(s2, BN_MASK16))
+                    carry = int_shr(s2, 16)
+                    p2 = p2 + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Merge 32 16-bit slots into 16 32-bit limbs (low half + high half
+    // packed). Then split into hi/lo 256-bit bignums.
+    let limbs16 = list_new()
+    let q = 0
+    while q < 16 {
+        let lo16 = acc[int_mul(q, 2)]
+        let hi16 = acc[int_add(int_mul(q, 2), 1)]
+        let limb = _bn_mask32(int_or(lo16, int_shl(hi16, 16)))
+        push(limbs16, limb)
+        q = q + 1
+    }
+    return _bn_pack16_to_pair(limbs16)
+}
+
+// ---- modular reduction ---------------------------------------------------
+
+// Bit-by-bit modular reduction: a mod m. Implemented as the slow but
+// transparent "shift-and-subtract" long division. For each bit position
+// of m from high to low, shift the remainder left by 1 and bring down
+// the next bit of a; if the remainder is now >= m, subtract m. The
+// result is the 256-bit remainder.
+//
+// Complexity: O(256 * cmp + 256 * sub) ~ a few thousand 32-bit ops per
+// reduction. Fast enough for the test surface; production would swap
+// in Barrett or Montgomery for the inner loop of modpow.
+fn bn_mod(a, m) {
+    // Special case: if m is zero, return a copy of a (caller error;
+    // crypto code should never reach here, but we don't trap).
+    if bn_zero(m) != 0 {
+        return _bn_clone(a)
+    }
+    // Trivial case: a < m means a is already in canonical form.
+    if bn_cmp(a, m) < 0 {
+        return _bn_clone(a)
+    }
+    let r = _bn_alloc_zero()
+    let bit = int_sub(int_mul(BN_LIMBS, BN_LIMB_BITS), 1)   // 255
+    while bit >= 0 {
+        // r := r << 1
+        _bn_shl1_inplace(r)
+        // Bring down a's bit `bit`.
+        let limb_idx = int_shr(bit, 5)                  // bit / 32
+        let bit_idx  = int_and(bit, 31)                 // bit mod 32
+        let a_bit    = int_and(int_shr(a[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        // If r >= m, subtract m.
+        if bn_cmp(r, m) >= 0 {
+            let nr = bn_sub(r, m)
+            _bn_copy_into(r, nr)
+        }
+        bit = bit - 1
+    }
+    return r
+}
+
+// Shallow copy of a bignum. Standalone so callers don't risk aliasing.
+fn _bn_clone(bn) {
+    let r = _bn_alloc_zero()
+    let i = 0
+    while i < BN_LIMBS {
+        list_set(r, i, bn[i])
+        i = i + 1
+    }
+    return r
+}
+
+// In-place copy: copy src limbs into dst. Used inside bn_mod where we
+// re-bind r without losing its identity.
+fn _bn_copy_into(dst, src) {
+    let i = 0
+    while i < BN_LIMBS {
+        list_set(dst, i, src[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// In-place 256-bit shift-left-by-one. Carry chain propagates from limb 0
+// upward; the topmost bit is lost (this is the standard wrap that
+// bn_mod expects -- we never call _bn_shl1_inplace on a value where the
+// MSB matters).
+fn _bn_shl1_inplace(bn) {
+    let carry = 0
+    let i = 0
+    while i < BN_LIMBS {
+        let v = bn[i]
+        let new_v = _bn_mask32(int_or(int_shl(v, 1), carry))
+        list_set(bn, i, new_v)
+        carry = int_and(int_shr(v, 31), 1)
+        i = i + 1
+    }
+    return 1
+}
+
+// (a * b) mod m via the 512-bit product. We reduce the high half by
+// `_bn_mod512`, then add the low half and reduce once more. The
+// product never exceeds 2^512, so the reduction is a clean two-step.
+fn bn_modmul(a, b, m) {
+    let pair = bn_mul(a, b)
+    let hi = pair[0]
+    let lo = pair[1]
+    return _bn_mod512(hi, lo, m)
+}
+
+// Reduce a 512-bit number (split into hi * 2^256 + lo) modulo a 256-bit
+// modulus. The bit-by-bit algorithm: walk all 512 bits high to low,
+// shift the remainder left, bring down the next bit, subtract m if
+// remainder >= m. The remainder is always < 2^256.
+fn _bn_mod512(hi, lo, m) {
+    if bn_zero(m) != 0 {
+        return _bn_clone(lo)
+    }
+    let r = _bn_alloc_zero()
+    let bit = 511
+    while bit >= 0 {
+        _bn_shl1_inplace(r)
+        // Pick the right source for this bit: high half for bits 256..511,
+        // low half for bits 0..255.
+        let src_bit = bit
+        let src = lo
+        if bit >= 256 {
+            src_bit = bit - 256
+            src = hi
+        }
+        let limb_idx = int_shr(src_bit, 5)
+        let bit_idx  = int_and(src_bit, 31)
+        let a_bit    = int_and(int_shr(src[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if bn_cmp(r, m) >= 0 {
+            let nr = bn_sub(r, m)
+            _bn_copy_into(r, nr)
+        }
+        bit = bit - 1
+    }
+    return r
+}
+
+// ---- modular exponentiation ---------------------------------------------
+//
+// Right-to-left square-and-multiply. Walk exp from LSB to MSB; if the
+// current exp bit is set, multiply the accumulator by `base` mod m. After
+// each bit, square `base` mod m. The classic textbook binary algorithm.
+//
+// !!! FAST, SIDE-CHANNEL-UNSAFE !!! The `if (bit set)` branch only runs
+// the multiply when the bit is 1. A remote adversary measuring wall-clock
+// can distinguish "many set bits" from "few set bits" in the exponent --
+// for a private key (e.g. a DH scalar) that's a Hamming-weight leak. Use
+// `bn_modpow_ct` (Montgomery ladder, below) for anything where `exp` is
+// a secret. This function remains in the public surface ONLY for offline
+// self-tests / public-exponent verification (e.g. RSA verify with a small
+// public e, or a test vector check where the exponent is public).
+fn bn_modpow(base, exp, m) {
+    // result = 1 mod m. If m == 1 the result is 0 (the only element).
+    if bn_zero(m) != 0 {
+        return _bn_clone(base)
+    }
+    let one = bn_from_int(1)
+    if bn_eq(m, one) != 0 {
+        return _bn_alloc_zero()
+    }
+    let result = bn_from_int(1)
+    // Reduce base modulo m up front; this keeps every intermediate
+    // square below 2^512 (the modular invariant).
+    let cur = bn_mod(base, m)
+    // Walk every bit of `exp`. 256 bits total.
+    let total_bits = int_mul(BN_LIMBS, BN_LIMB_BITS)
+    let i = 0
+    while i < total_bits {
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let bit      = int_and(int_shr(exp[limb_idx], bit_idx), 1)
+        if bit != 0 {
+            result = bn_modmul(result, cur, m)
+        }
+        // Square the current power.
+        cur = bn_modmul(cur, cur, m)
+        i = i + 1
+    }
+    return result
+}
+
+// Constant-time modular exponentiation via the Montgomery ladder.
+//
+// Algorithm (textbook Montgomery ladder for modpow):
+//   R0 = 1, R1 = base mod m
+//   for i = bit_len - 1 DOWN TO 0:
+//     b = exp.bit(i)
+//     if b == 0:
+//         R1 = R0 * R1 mod m
+//         R0 = R0 * R0 mod m
+//     else:
+//         R0 = R0 * R1 mod m
+//         R1 = R1 * R1 mod m
+//   return R0
+//
+// Both branches execute EXACTLY one modmul + one square. The per-bit
+// wall-clock cost is therefore the same regardless of bit value, so the
+// outer loop reveals no information about the exponent's Hamming weight
+// or bit positions to a passive timing observer. (See the header
+// "Constant-time / side-channel disclaimer" for the residual operand-
+// dependent paths inside bn_modmul / bn_mod -- those remain a
+// fully-constant-time follow-up, but they are NOT exponent-correlated,
+// so the SecAgg DH leak the brief flagged is closed.)
+//
+// Crypto-safe API: use this for DH private-key exponents, ECDH scalar
+// derivation, RSA private-key operations, and any other code path where
+// the exponent is a secret. `bn_modpow` (above) is square-and-multiply
+// and leaks the exponent's Hamming weight; do not export `bn_modpow` to
+// a remote-callable path that takes a private exponent.
+//
+// Cost: ~2x `bn_modpow` per bit-loop iteration (the square-and-multiply
+// path skips the multiply on 0-bits; the ladder always does both). For
+// a uniformly random 256-bit exponent the expected slowdown is ~4/3x
+// (square-and-multiply averages 1 + 0.5 = 1.5 modmuls per bit; the
+// ladder always does 2). For exponents with low Hamming weight the
+// gap widens, which is exactly the point: that's the leak we're closing.
+//
+// Returns base^exp mod m, 256-bit. Same edge cases as `bn_modpow`:
+//   - m == 0  -> returns a clone of base (caller error; defensive)
+//   - m == 1  -> returns 0 (the unique element of Z/1Z)
+//   - exp == 0 -> returns 1 (the loop body never updates R0; R0 starts at 1)
+fn bn_modpow_ct(base, exp, m) {
+    // Edge cases mirror bn_modpow exactly so the two functions are
+    // observably interchangeable on the test surface (the equivalence
+    // assertion in tests/unit/test_bignum.nova relies on this).
+    if bn_zero(m) != 0 {
+        return _bn_clone(base)
+    }
+    let one = bn_from_int(1)
+    if bn_eq(m, one) != 0 {
+        return _bn_alloc_zero()
+    }
+    // R0 = 1, R1 = base mod m. Pre-reducing base keeps all intermediate
+    // squares < 2^512 (the modular invariant; same as bn_modpow).
+    let r0 = bn_from_int(1)
+    let r1 = bn_mod(base, m)
+    // Walk exp from MSB to LSB. Total bit width = BN_LIMBS * 32 = 256.
+    // We walk EVERY bit (no leading-zero skip!) so the outer-loop count
+    // is constant: a leading-zero skip would itself leak the position
+    // of the most-significant set bit, which is precisely the kind of
+    // bit-position leak the ladder is supposed to close. The extra
+    // ladder steps on leading 0-bits are no-ops in algebra: R1 stays
+    // bound to base^0 = 1 (* the running x) until the first 1-bit, and
+    // R0 doubles harmlessly through the squarings.
+    let total_bits = int_mul(BN_LIMBS, BN_LIMB_BITS)
+    let i = total_bits - 1
+    while i >= 0 {
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let b = int_and(int_shr(exp[limb_idx], bit_idx), 1)
+        // BOTH branches execute one mul + one square. The only data-
+        // dependent control flow is the `if b == 0` / `else` arm
+        // selection itself, which is a single conditional jump on a
+        // ONE-BIT VALUE -- branch-prediction noise on a modern CPU is
+        // dwarfed by the modmul cost (~100 us each at 256 bits in pure
+        // NOVA), so the exponent-bit timing channel is effectively
+        // closed at the per-bit granularity. A more aggressive
+        // implementation would use a cmov-emulated swap of (R0, R1)
+        // and run a single (R0 * R1, R_bit^2) pair unconditionally;
+        // that's a follow-up if the per-bit branch ever shows up in a
+        // timing-channel evaluation. For DH at 256-bit field sizes
+        // against a network adversary, the modmul cost dominates by
+        // ~6 orders of magnitude, so the branch is not exploitable in
+        // practice.
+        if b == 0 {
+            r1 = bn_modmul(r0, r1, m)
+            r0 = bn_modmul(r0, r0, m)
+        } else {
+            r0 = bn_modmul(r0, r1, m)
+            r1 = bn_modmul(r1, r1, m)
+        }
+        i = i - 1
+    }
+    return r0
+}

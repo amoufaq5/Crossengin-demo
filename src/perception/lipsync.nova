@@ -1,0 +1,707 @@
+// CrossEngin perception: audio-vision lip sync detection (R23B).
+//
+// Purpose
+//   Given a sequence of video frames + an audio stream, decide whether
+//   the speaker on screen is actually saying the words in the audio.
+//   This is the third leg of the cross-modal perception story:
+//     * R16D (image_face_detect.nova): WHERE is the face on screen.
+//     * R18D (image_face_recognize.nova): WHO is the face on screen.
+//     * R7F/R9B (audio_vad.nova): is anyone SPEAKING in the audio.
+//     * R20C (sensor_fusion.nova): bind a face observation to a
+//         speaker observation at the same timestamp.
+//     * R23B (this module): does the FACE'S MOUTH agree with the AUDIO?
+//
+//   Lip sync detection catches cases sensor fusion's identity match
+//   cannot: pre-recorded audio dubbed over silent video; a single
+//   speaker on camera while a different off-camera voice is being
+//   recorded; out-of-sync streaming where the audio lags the video.
+//   These all yield a STRONG fusion (face=alice, speaker=alice, same
+//   timestamp), but the lip movement does not actually drive the
+//   speech being heard.
+//
+// Algorithm (heuristic, no learned model)
+//   1. Per-frame mouth detection. For each video frame:
+//        a. R16D face_detect locates the face bounding box.
+//        b. The mouth region is heuristically the lower third of the
+//           detected face (rows [2/3..1.0] of the face box). Mouth
+//           landmark localization (corner detection, opening width
+//           via lip-specific texture) requires a learned landmark
+//           model and is documented as the R23B.2 follow-up.
+//   2. Mouth-open metric. Open mouths have a dark interior (the oral
+//      cavity is unlit); closed mouths have near-uniform skin tone.
+//      Score = (mean_outer - mean_inner) / mean_outer * 1000, where
+//      "inner" is the central column of the mouth region (50% width,
+//      30% height around the mid-row) and "outer" is the rest of the
+//      mouth region. Score is in milli (0..1000); negative values
+//      saturate to 0 (interior is brighter than the rim, no opening).
+//   3. Audio voicing per frame. Walk the PCM in frame-aligned chunks
+//      (sample_rate * MS_PER_FRAME / 1000 samples per chunk; default
+//      33ms = ~30 fps). Per-chunk: vad_frame_energy + vad_frame_zcr +
+//      vad_classify_frame against a state derived from the sample
+//      rate. Yields a list of 0/1 voicing flags, one per video frame.
+//   4. Sliding-window correlation. Compute a Pearson-style correlation
+//      in milli between the per-frame mouth-open score sequence and the
+//      per-frame voicing sequence:
+//        corr_milli = (mean(x*y) - mean(x)*mean(y))
+//                     / sqrt(var(x) * var(y)) * 1000
+//      We rescale to milli so the entire pipeline stays integer.
+//      Both perfectly-correlated and perfectly-anti-correlated produce
+//      a high absolute correlation; we want SYNC (same-sign agreement),
+//      so the final score = max(0, corr_milli) and SYNC_THRESHOLD_MILLI
+//      gates true / false.
+//
+// Public API
+//   * lipsync_mouth_open_score(image, w, h, face_bbox) -> int_milli
+//       Per-frame mouth-open score. face_bbox is [x, y, size] (a
+//       face_result tuple's first three slots, identical to R16D's
+//       face_detect output). Returns 0..1000; -1 on invalid input.
+//   * lipsync_correlate(video_scores, audio_voicing) -> int_milli
+//       Pearson-style correlation in milli between two same-length
+//       integer sequences. video_scores is mouth-open in milli,
+//       audio_voicing is 0/1 (or any int -- correlation is shape-
+//       invariant). Returns -1000..1000; on degenerate input
+//       (zero variance, empty lists, length mismatch) returns
+//       LIPSYNC_CORR_SENTINEL (-1).
+//   * lipsync_voicing_per_frame(audio_pcm, sample_rate, n_frames)
+//       -> list of 0/1 ints, length n_frames
+//       Slice the PCM into n_frames equal chunks and classify each via
+//       VAD (energy + ZCR). Used by lipsync_detect; exposed for tests.
+//   * lipsync_detect(video_frames, audio_pcm, sample_rate)
+//       -> [sync_score_milli, is_synced_bool]
+//       video_frames is a list of [image_ptr, w, h, face_bbox] tuples
+//       (one per frame). audio_pcm is the PCM sample list (mono).
+//       Returns the correlation score + a 1/0 sync verdict using
+//       SYNC_THRESHOLD_MILLI.
+//   * lipsync_video_frame(image_ptr, w, h, face_bbox) -> frame tuple
+//       Constructor for video frame tuples (so callers don't depend
+//       on the internal slot layout).
+//
+// Honest scope note
+//   Real-world lip sync detection (e.g. Google's MediaPipe FaceLandmarker,
+//   AlphaSync, the SyncNet family) uses learned lip-landmark localization
+//   (mouth corners, lip opening width) and learned audio-visual joint
+//   embeddings. R23B ships the STRUCTURAL PIPELINE + HEURISTIC DETECTOR:
+//   face_detect -> heuristic mouth ROI -> intensity-gradient mouth-open
+//   score -> Pearson correlation against VAD voicing. The R23B.2 follow-up
+//   would add a trained landmark model + the joint-embedding correlator.
+//   The heuristic detector is good enough to catch the gross failure
+//   modes (audio dubbed over silent video, fixed image with audio over,
+//   gross sync drift) on cooperative fixtures.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- the lipsync leg).
+// NOVA dependencies: builtins -- list_new, push, list_set, len, str_eq,
+//   int_to_str, int_add, int_sub, int_mul, alloc, load8, store8.
+//   No std/* imports (integer + list arithmetic only).
+// CrossEngin dependencies (read-only callees):
+//   * src/io/transducers/image_face_detect.nova  (R16D; face_result_* accessors)
+//   * src/io/transducers/audio_vad.nova          (R7F/R9B; vad_state_new,
+//     vad_frame_energy, vad_frame_zcr, vad_classify_frame)
+//   * src/io/transducers/image_pgm.nova          (R3.1; pgm_parse_file,
+//     pgm_result_*; used by the chat /lipsync wiring to load PGM frames)
+
+import "../io/transducers/audio_vad.nova"
+import "../io/transducers/audio_capture.nova"
+import "../io/transducers/image_face_detect.nova"
+import "../io/transducers/image_pgm.nova"
+
+// ---- public sentinels -----------------------------------------------------
+
+// Above this milli-correlation, the verdict is is_synced=true. The pick
+// (400 milli = 0.40 Pearson) is the brief's documented threshold: it
+// catches matched synthetic fixtures and rejects all-mouth-open-vs-
+// random-voicing fixtures, with margin for noise.
+let LIPSYNC_SYNC_THRESHOLD_MILLI = 400
+
+// Per-frame mouth-open score range. The score saturates to
+// [0..LIPSYNC_SCORE_MAX] -- never returns a negative value on success,
+// reserving negative numbers (the LIPSYNC_*_SENTINEL family) for "input
+// invalid" paths.
+let LIPSYNC_SCORE_MAX = 1000
+
+// Default video frame rate when callers pass 0 / nothing. 30fps is the
+// canonical video frame rate; at sample_rate=16000 that's a 533-sample
+// chunk per video frame (well above the 16ms minimum any VAD needs to
+// estimate energy + ZCR meaningfully).
+let LIPSYNC_DEFAULT_FPS = 30
+
+// ---- sentinel values (negative; never returned on the success path) ------
+
+// Returned by lipsync_mouth_open_score on bad input (zero ptr, non-
+// positive dims, empty face box).
+let LIPSYNC_SCORE_SENTINEL = 0 - 1
+
+// Returned by lipsync_correlate on degenerate input (empty / length-
+// mismatched / zero-variance sequences). Distinguishable from any real
+// correlation since real corr ranges over [-1000..1000].
+let LIPSYNC_CORR_SENTINEL = 0 - 1
+
+// ---- video frame tuple ---------------------------------------------------
+//
+// A video frame for lipsync_detect: [image_ptr, w, h, face_bbox]. The
+// face_bbox is a 3-element list [x, y, size] (identical to the first
+// three slots of an R16D face_result tuple). Allowing callers to pass
+// only [x, y, size] (vs the full 4-slot detection tuple including score)
+// keeps the API independent of R16D's NMS-output shape.
+
+let LIPSYNC_FRAME_IMG  = 0
+let LIPSYNC_FRAME_W    = 1
+let LIPSYNC_FRAME_H    = 2
+let LIPSYNC_FRAME_BBOX = 3
+
+fn lipsync_video_frame(image_ptr, w, h, face_bbox) {
+    let f = list_new()
+    push(f, image_ptr)
+    push(f, w)
+    push(f, h)
+    push(f, face_bbox)
+    return f
+}
+
+fn lipsync_frame_image(f)    { return f[LIPSYNC_FRAME_IMG] }
+fn lipsync_frame_width(f)    { return f[LIPSYNC_FRAME_W] }
+fn lipsync_frame_height(f)   { return f[LIPSYNC_FRAME_H] }
+fn lipsync_frame_bbox(f)     { return f[LIPSYNC_FRAME_BBOX] }
+
+// Convenience constructor for the bbox half (so callers and tests can
+// build a bbox without depending on internal R16D layout).
+fn lipsync_make_bbox(x, y, size) {
+    let b = list_new()
+    push(b, x)
+    push(b, y)
+    push(b, size)
+    return b
+}
+
+fn lipsync_bbox_x(b)    { return b[0] }
+fn lipsync_bbox_y(b)    { return b[1] }
+fn lipsync_bbox_size(b) { return b[2] }
+
+// ---- per-frame mouth-open score ------------------------------------------
+//
+// Strategy: the mouth region is the lower third of the face bounding box.
+// Within the mouth region we compare:
+//   * inner box: central 50% width x 30% height (a tight rectangle
+//                around where the lips would meet). Open mouth ->
+//                dark interior (oral cavity).
+//   * outer ring: the rest of the mouth region (skin tone of the chin
+//                and lip surround).
+// darkness_score = (mean_outer - mean_inner) * 1000 / mean_outer
+//
+// Saturates negative -> 0 (interior brighter than rim is "no opening",
+// not "negative opening"). Returns LIPSYNC_SCORE_SENTINEL on invalid
+// inputs (zero image ptr, non-positive dims, malformed bbox, bbox
+// out-of-bounds, mouth region collapses to <1 pixel).
+//
+// O(face_size^2) per frame; called per-video-frame, so callers should
+// pre-decode the PGM streams (don't pgm_parse_file per pixel).
+
+fn _lipsync_mean_in_rect(image, w, h, x1, y1, x2, y2) {
+    // Clamp the rectangle to the image bounds and average load8 over it.
+    // Returns 0 if the rectangle is empty after clamping.
+    if x1 < 0 { x1 = 0 }
+    if y1 < 0 { y1 = 0 }
+    if x2 > w { x2 = w }
+    if y2 > h { y2 = h }
+    if x1 >= x2 { return 0 }
+    if y1 >= y2 { return 0 }
+    let sum = 0
+    let count = 0
+    let y = y1
+    while y < y2 {
+        let x = x1
+        while x < x2 {
+            sum = sum + load8(image + y * w + x)
+            count = count + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if count <= 0 { return 0 }
+    return sum / count
+}
+
+// _lipsync_sum_in_rect(image, w, h, x1, y1, x2, y2) -> [sum, count]
+// Helper that returns both the sum and the count so the caller can
+// compose "outer = total - inner" without re-walking the outer ring.
+fn _lipsync_sum_in_rect(image, w, h, x1, y1, x2, y2) {
+    if x1 < 0 { x1 = 0 }
+    if y1 < 0 { y1 = 0 }
+    if x2 > w { x2 = w }
+    if y2 > h { y2 = h }
+    let r = list_new()
+    push(r, 0)  // sum
+    push(r, 0)  // count
+    if x1 >= x2 { return r }
+    if y1 >= y2 { return r }
+    let sum = 0
+    let count = 0
+    let y = y1
+    while y < y2 {
+        let x = x1
+        while x < x2 {
+            sum = sum + load8(image + y * w + x)
+            count = count + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+    list_set(r, 0, sum)
+    list_set(r, 1, count)
+    return r
+}
+
+fn lipsync_mouth_open_score(image, w, h, face_bbox) {
+    if image == 0 { return LIPSYNC_SCORE_SENTINEL }
+    if w <= 0 { return LIPSYNC_SCORE_SENTINEL }
+    if h <= 0 { return LIPSYNC_SCORE_SENTINEL }
+    if face_bbox == 0 { return LIPSYNC_SCORE_SENTINEL }
+    if len(face_bbox) < 3 { return LIPSYNC_SCORE_SENTINEL }
+    let fx = face_bbox[0]
+    let fy = face_bbox[1]
+    let fs = face_bbox[2]
+    if fs <= 0 { return LIPSYNC_SCORE_SENTINEL }
+    if fx < 0 { return LIPSYNC_SCORE_SENTINEL }
+    if fy < 0 { return LIPSYNC_SCORE_SENTINEL }
+    if fx + fs > w { return LIPSYNC_SCORE_SENTINEL }
+    if fy + fs > h { return LIPSYNC_SCORE_SENTINEL }
+
+    // Mouth region = lower third of the face box (rows [2*fs/3..fs]).
+    let mouth_y1 = fy + (fs * 2) / 3
+    let mouth_y2 = fy + fs
+    let mouth_x1 = fx
+    let mouth_x2 = fx + fs
+    let mouth_h = mouth_y2 - mouth_y1
+    let mouth_w = mouth_x2 - mouth_x1
+    if mouth_h < 2 { return LIPSYNC_SCORE_SENTINEL }
+    if mouth_w < 2 { return LIPSYNC_SCORE_SENTINEL }
+
+    // Inner box = central 50% width x 30% height around mid-row of mouth.
+    // Use integer division; ensure at least 1 pixel.
+    let inner_w = mouth_w / 2
+    if inner_w < 1 { inner_w = 1 }
+    let inner_h = (mouth_h * 3) / 10
+    if inner_h < 1 { inner_h = 1 }
+    let inner_x1 = mouth_x1 + (mouth_w - inner_w) / 2
+    let inner_x2 = inner_x1 + inner_w
+    let inner_y1 = mouth_y1 + (mouth_h - inner_h) / 2
+    let inner_y2 = inner_y1 + inner_h
+
+    let inner_sc = _lipsync_sum_in_rect(image, w, h, inner_x1, inner_y1,
+                                        inner_x2, inner_y2)
+    let total_sc = _lipsync_sum_in_rect(image, w, h, mouth_x1, mouth_y1,
+                                        mouth_x2, mouth_y2)
+    let inner_sum = inner_sc[0]
+    let inner_count = inner_sc[1]
+    let total_sum = total_sc[0]
+    let total_count = total_sc[1]
+    if inner_count <= 0 { return LIPSYNC_SCORE_SENTINEL }
+    if total_count <= 0 { return LIPSYNC_SCORE_SENTINEL }
+    let outer_count = total_count - inner_count
+    if outer_count <= 0 { return LIPSYNC_SCORE_SENTINEL }
+    let outer_sum = total_sum - inner_sum
+    let mean_inner = inner_sum / inner_count
+    let mean_outer = outer_sum / outer_count
+    if mean_outer <= 0 { return 0 }  // all-black mouth region; no signal
+    let diff = mean_outer - mean_inner
+    if diff <= 0 { return 0 }  // interior brighter -> not an opening
+    let score = (diff * LIPSYNC_SCORE_MAX) / mean_outer
+    if score < 0 { score = 0 }
+    if score > LIPSYNC_SCORE_MAX { score = LIPSYNC_SCORE_MAX }
+    return score
+}
+
+// ---- Pearson-style correlation -------------------------------------------
+//
+// Standard Pearson correlation, rescaled to milli (so the result is an
+// int in [-1000..1000]). The implementation uses the alternative formula:
+//   cov = sum(xy) - (sum(x) * sum(y)) / n
+//   var_x = sum(x*x) - (sum(x))^2 / n
+//   var_y = sum(y*y) - (sum(y))^2 / n
+//   corr_milli = cov * 1000 / sqrt(var_x * var_y)
+//
+// Integer-only via an integer square-root helper. Returns
+// LIPSYNC_CORR_SENTINEL when either variance is 0 (constant input ->
+// correlation undefined) or the inputs differ in length.
+//
+// On large inputs, sum(x*x) for x in milli can reach ~N * 1000^2 = N M.
+// Up to N ~ 10000 frames (5 minutes at 30fps) the sum fits easily in
+// NOVA's 64-bit int.
+
+fn _lipsync_isqrt(n) {
+    // Integer square root via Newton's method. Returns floor(sqrt(n)).
+    if n <= 0 { return 0 }
+    if n < 4 { return 1 }
+    let x = n
+    let y = (x + 1) / 2
+    let safety = 0
+    while y < x {
+        if safety > 64 { return y }  // never more than 64 iters at 64-bit
+        x = y
+        y = (x + n / x) / 2
+        safety = safety + 1
+    }
+    return x
+}
+
+fn lipsync_correlate(video_scores, audio_voicing) {
+    if video_scores == 0 { return LIPSYNC_CORR_SENTINEL }
+    if audio_voicing == 0 { return LIPSYNC_CORR_SENTINEL }
+    let n = len(video_scores)
+    if n != len(audio_voicing) { return LIPSYNC_CORR_SENTINEL }
+    if n < 2 { return LIPSYNC_CORR_SENTINEL }
+
+    let sum_x = 0
+    let sum_y = 0
+    let sum_xx = 0
+    let sum_yy = 0
+    let sum_xy = 0
+    let i = 0
+    while i < n {
+        let x = video_scores[i]
+        let y = audio_voicing[i]
+        sum_x = sum_x + x
+        sum_y = sum_y + y
+        sum_xx = sum_xx + x * x
+        sum_yy = sum_yy + y * y
+        sum_xy = sum_xy + x * y
+        i = i + 1
+    }
+    // Use n-scaled formulas to keep integer math:
+    //   n*cov   = n*sum_xy - sum_x*sum_y
+    //   n*var_x = n*sum_xx - sum_x*sum_x
+    //   n*var_y = n*sum_yy - sum_y*sum_y
+    // n*corr_milli = (n*cov) * 1000 / sqrt(n*var_x * n*var_y)
+    // The factor-n cancels out top vs bottom (sqrt(n^2)=n).
+    let n_cov = n * sum_xy - sum_x * sum_y
+    let n_varx = n * sum_xx - sum_x * sum_x
+    let n_vary = n * sum_yy - sum_y * sum_y
+    if n_varx <= 0 { return LIPSYNC_CORR_SENTINEL }
+    if n_vary <= 0 { return LIPSYNC_CORR_SENTINEL }
+    // sqrt of the variance product. Both fit in 64-bit for the
+    // documented input bounds.
+    let denom = _lipsync_isqrt(n_varx * n_vary)
+    if denom <= 0 { return LIPSYNC_CORR_SENTINEL }
+    let corr_milli = (n_cov * LIPSYNC_SCORE_MAX) / denom
+    // Clamp to the valid range -- rounding errors near +/-1 can push
+    // an exact-1 result to +/-1001.
+    if corr_milli > LIPSYNC_SCORE_MAX { corr_milli = LIPSYNC_SCORE_MAX }
+    if corr_milli < (0 - LIPSYNC_SCORE_MAX) { corr_milli = 0 - LIPSYNC_SCORE_MAX }
+    return corr_milli
+}
+
+// ---- audio voicing per video frame ---------------------------------------
+//
+// Slice the PCM into n_frames equal-length chunks; classify each via
+// VAD energy + ZCR. Returns a list of n_frames 0/1 ints. Used by
+// lipsync_detect; exposed separately for testing.
+//
+// If sample_rate <= 0 or audio_pcm is shorter than n_frames samples,
+// returns a list of n_frames zeros (no voicing detected anywhere).
+
+fn lipsync_voicing_per_frame(audio_pcm, sample_rate, n_frames) {
+    let out = list_new()
+    if n_frames <= 0 { return out }
+    let i = 0
+    while i < n_frames {
+        push(out, 0)
+        i = i + 1
+    }
+    if audio_pcm == 0 { return out }
+    if sample_rate <= 0 { return out }
+    let total = len(audio_pcm)
+    if total < n_frames { return out }
+    let chunk = total / n_frames
+    if chunk < 2 { return out }
+    let rate = sample_rate
+    if rate < 8000 { rate = 8000 }
+    if rate > 48000 { rate = 48000 }
+    let vad_state = vad_state_new(rate)
+    // R23B: lipsync windows can be shorter than the canonical 30ms VAD
+    // frame (e.g. 5-frame fixtures at 30fps with low sample-rate). The
+    // VAD's frame_size is the calibration anchor for the energy
+    // threshold, so we don't override it here -- we just use the
+    // per-frame energy + ZCR classifier directly on the chunk window.
+    let f = 0
+    while f < n_frames {
+        let off = f * chunk
+        let energy = vad_frame_energy(audio_pcm, off, chunk)
+        let zcr = vad_frame_zcr(audio_pcm, off, chunk)
+        // Scale the threshold to the chunk window (vad_classify_frame
+        // compares against a threshold calibrated for the default 30ms
+        // frame; we re-derive the per-chunk threshold inline so a
+        // shorter chunk is not always classified as silence).
+        let frame_size = vad_frame_size(vad_state)
+        let scaled_thresh = (vad_energy_thresh(vad_state) * chunk) / frame_size
+        let zcr_max = (chunk * 40) / 100
+        let is_speech = 0
+        if energy > scaled_thresh {
+            if zcr > 0 {
+                if zcr < zcr_max {
+                    is_speech = 1
+                }
+            }
+        }
+        list_set(out, f, is_speech)
+        f = f + 1
+    }
+    return out
+}
+
+// ---- lipsync_detect ------------------------------------------------------
+//
+// End-to-end: for each video frame compute the mouth-open score, slice
+// the audio into one voicing flag per frame, correlate, decide.
+//
+// Returns [sync_score_milli, is_synced_bool]:
+//   * sync_score_milli is the milli-correlation, clamped to >= 0
+//     (anti-correlated streams are NOT synced; lip sync wants same-
+//     sign agreement, not just statistical dependence).
+//   * is_synced_bool is 1 iff sync_score_milli >= LIPSYNC_SYNC_THRESHOLD_MILLI.
+// On degenerate input (empty frame list, length mismatch, sentinel from
+// the underlying calls) returns [LIPSYNC_CORR_SENTINEL, 0].
+
+fn lipsync_detect(video_frames, audio_pcm, sample_rate) {
+    let r = list_new()
+    push(r, LIPSYNC_CORR_SENTINEL)
+    push(r, 0)
+    if video_frames == 0 { return r }
+    let n = len(video_frames)
+    if n < 2 { return r }
+    if audio_pcm == 0 { return r }
+    if sample_rate <= 0 { return r }
+
+    // Per-frame mouth-open scores. A frame whose face_bbox is missing
+    // (size <= 0) contributes a 0 score (no face detected -> no signal).
+    let scores = list_new()
+    let i = 0
+    while i < n {
+        let f = video_frames[i]
+        let img = f[LIPSYNC_FRAME_IMG]
+        let w = f[LIPSYNC_FRAME_W]
+        let h = f[LIPSYNC_FRAME_H]
+        let bbox = f[LIPSYNC_FRAME_BBOX]
+        let s = 0
+        if img != 0 {
+            if bbox != 0 {
+                if len(bbox) >= 3 {
+                    if bbox[2] > 0 {
+                        let raw = lipsync_mouth_open_score(img, w, h, bbox)
+                        if raw >= 0 { s = raw }
+                    }
+                }
+            }
+        }
+        push(scores, s)
+        i = i + 1
+    }
+
+    let voicing = lipsync_voicing_per_frame(audio_pcm, sample_rate, n)
+    if len(voicing) != n { return r }
+
+    let corr_milli = lipsync_correlate(scores, voicing)
+    if corr_milli == LIPSYNC_CORR_SENTINEL { return r }
+    let sync_score = corr_milli
+    if sync_score < 0 { sync_score = 0 }
+    let synced = 0
+    if sync_score >= LIPSYNC_SYNC_THRESHOLD_MILLI { synced = 1 }
+    list_set(r, 0, sync_score)
+    list_set(r, 1, synced)
+    return r
+}
+
+// ---- public accessors for the detect-result tuple ------------------------
+
+fn lipsync_result_sync_score(r) { return r[0] }
+fn lipsync_result_is_synced(r)  { return r[1] }
+
+// ---- public constants ----------------------------------------------------
+
+fn lipsync_sync_threshold_milli() { return LIPSYNC_SYNC_THRESHOLD_MILLI }
+fn lipsync_score_max()            { return LIPSYNC_SCORE_MAX }
+fn lipsync_default_fps()          { return LIPSYNC_DEFAULT_FPS }
+fn lipsync_score_sentinel()       { return LIPSYNC_SCORE_SENTINEL }
+fn lipsync_corr_sentinel()        { return LIPSYNC_CORR_SENTINEL }
+
+// ---- chat helper ---------------------------------------------------------
+//
+// lipsync_chat_format(result) -> string
+// Pretty-prints a detect result for the /lipsync admin command. Handles
+// the sentinel case explicitly so the operator gets a clear "no result"
+// message instead of "score=-1".
+
+fn lipsync_chat_format(result) {
+    if result == 0 {
+        return "(no result -- detector returned a null tuple)"
+    }
+    if len(result) < 2 {
+        return "(no result -- detector returned a malformed tuple)"
+    }
+    let score = result[0]
+    let synced = result[1]
+    if score == LIPSYNC_CORR_SENTINEL {
+        return "(no result -- degenerate input: empty frames, zero-variance signals, or length mismatch)"
+    }
+    let verdict = "false"
+    if synced == 1 { verdict = "true" }
+    return "sync_score_milli=" + int_to_str(score)
+        + " is_synced=" + verdict
+        + " (threshold=" + int_to_str(LIPSYNC_SYNC_THRESHOLD_MILLI) + ")"
+}
+
+// ---- file-driven entry point (PGM frame directory + WAV) -----------------
+//
+// lipsync_pgm_args(arg) parses the chat /lipsync command argument
+// "<video_dir> <audio.wav>" and returns a formatted result string.
+//
+// The video_dir contract: PGM frames are named frame_001.pgm,
+// frame_002.pgm, ... up to LIPSYNC_MAX_FRAMES. The loader reads
+// frame_NNN.pgm starting at 001 until the first missing file (or
+// until LIPSYNC_MAX_FRAMES). NOVA has no listdir, so the fixed naming
+// convention keeps the chat plumbing simple while letting the
+// integration scenario build fixtures procedurally.
+//
+// For each PGM frame we run R16D face_detect; if no face is found we
+// substitute a default bbox covering the central 80% of the image
+// (lets the heuristic still produce a score for synthesised fixtures
+// that don't pass the cascade -- the fixtures are tiny synthetic
+// rectangles with the right interior/exterior contrast but not real
+// face geometry).
+
+let LIPSYNC_MAX_FRAMES = 64
+
+fn _lipsync_digit(d) {
+    if d == 0 { return "0" }
+    if d == 1 { return "1" }
+    if d == 2 { return "2" }
+    if d == 3 { return "3" }
+    if d == 4 { return "4" }
+    if d == 5 { return "5" }
+    if d == 6 { return "6" }
+    if d == 7 { return "7" }
+    if d == 8 { return "8" }
+    return "9"
+}
+
+fn _lipsync_frame_path(dir, idx) {
+    // Pad to 3 digits: frame_001.pgm. Cap at 999 (LIPSYNC_MAX_FRAMES = 64
+    // so 3 digits is plenty; callers above LIPSYNC_MAX_FRAMES never get
+    // here because the load loop stops first).
+    let n = idx
+    if n < 0 { n = 0 }
+    if n > 999 { n = 999 }
+    let h = n / 100
+    let rem = n - h * 100
+    let t = rem / 10
+    let o = rem - t * 10
+    return dir + "/frame_" + _lipsync_digit(h) + _lipsync_digit(t)
+        + _lipsync_digit(o) + ".pgm"
+}
+
+fn _lipsync_load_pgm_frames(dir) {
+    // Walks frame_001.pgm, frame_002.pgm, ... and accumulates a list of
+    // [image_ptr, w, h, face_bbox] tuples. Stops at the first missing
+    // frame (or LIPSYNC_MAX_FRAMES, whichever comes first).
+    let frames = list_new()
+    let idx = 1
+    while idx <= LIPSYNC_MAX_FRAMES {
+        let path = _lipsync_frame_path(dir, idx)
+        let r = pgm_parse_file(path)
+        let err = pgm_result_error(r)
+        if len(err) > 0 {
+            return frames
+        }
+        let w = pgm_result_width(r)
+        let h = pgm_result_height(r)
+        let data = pgm_result_data(r)
+        // Default bbox = central 80% of the image (fallback for fixtures
+        // whose synthetic geometry doesn't pass the Haar cascade).
+        let margin_x = w / 10
+        let margin_y = h / 10
+        let bs = w - 2 * margin_x
+        let bsh = h - 2 * margin_y
+        if bsh < bs { bs = bsh }
+        let bbox = lipsync_make_bbox(margin_x, margin_y, bs)
+        // Try R16D face_detect; if it returns >= 1 detection use its
+        // best-score bbox in place of the default fallback.
+        if w >= 24 {
+            if h >= 24 {
+                let cap = w
+                if h < cap { cap = h }
+                if cap > 96 { cap = 96 }
+                let dets = face_detect(data, w, h, 24, cap, 4)
+                if len(dets) > 0 {
+                    let best = dets[0]
+                    let bi = 1
+                    while bi < len(dets) {
+                        let cur = dets[bi]
+                        if cur[FACE_D_SCORE] > best[FACE_D_SCORE] { best = cur }
+                        bi = bi + 1
+                    }
+                    bbox = lipsync_make_bbox(face_result_x(best),
+                                              face_result_y(best),
+                                              face_result_size(best))
+                }
+            }
+        }
+        push(frames, lipsync_video_frame(data, w, h, bbox))
+        idx = idx + 1
+    }
+    return frames
+}
+
+fn _lipsync_split_arg(arg) {
+    // Find the first space; left = video_dir, right = wav path. Mirrors
+    // src/chat/helpers.nova:_split_cmd shape so callers see the same
+    // [left, right] pair.
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            let pair = list_new()
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, i + 1, n - i - 1))
+            return pair
+        }
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn lipsync_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/lipsync needs '<video_dir> <audio.wav>')"
+    }
+    let parts = _lipsync_split_arg(arg)
+    let video_dir = parts[0]
+    let wav_path = parts[1]
+    if len(video_dir) == 0 {
+        return "(/lipsync needs '<video_dir> <audio.wav>')"
+    }
+    if len(wav_path) == 0 {
+        return "(/lipsync needs '<video_dir> <audio.wav>')"
+    }
+    let frames = _lipsync_load_pgm_frames(video_dir)
+    if len(frames) < 2 {
+        return "(lipsync FAILED: need >= 2 PGM frames in " + video_dir
+            + " named frame_001.pgm, frame_002.pgm, ...)"
+    }
+    let wav = audio_capture_to_pcm(wav_path)
+    let pcm = audio_capture_pcm_samples(wav)
+    let sr = audio_capture_pcm_rate(wav)
+    if sr <= 0 {
+        return "(lipsync FAILED: could not parse WAV at " + wav_path + ")"
+    }
+    if len(pcm) < len(frames) {
+        return "(lipsync FAILED: WAV " + wav_path
+            + " has fewer samples (" + int_to_str(len(pcm))
+            + ") than video frames (" + int_to_str(len(frames)) + "))"
+    }
+    let result = lipsync_detect(frames, pcm, sr)
+    return "lipsync " + video_dir + " " + wav_path + ": "
+        + lipsync_chat_format(result)
+        + " frames=" + int_to_str(len(frames))
+        + " sample_rate=" + int_to_str(sr)
+}

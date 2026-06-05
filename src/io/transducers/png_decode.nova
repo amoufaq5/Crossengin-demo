@@ -1,0 +1,759 @@
+// CrossEngin io/transducers: PNG (Portable Network Graphics) decoder (P3.1.PNG).
+//
+// Purpose
+//   The next plank in the modality bridge after PGM (P3.1) -- a pure-NOVA
+//   decoder for the PNG-8 grayscale format, the simplest variant of PNG
+//   that still covers ~30% of real-world PNGs (icons, single-channel
+//   monochrome scans, generated charts). With this module the agent can
+//   ingest PNG files without the ImageMagick / ffmpeg subprocess shim.
+//
+//   Scope of this MVP (deferred items are spelled out below):
+//     * Bit depth   8                       supported
+//     * Color type  0 (grayscale)           supported
+//     * Color type  2 (truecolor RGB)       DEFERRED
+//     * Color type  3 (indexed/palette)     DEFERRED
+//     * Color type  4 (grayscale + alpha)   DEFERRED
+//     * Color type  6 (truecolor + alpha)   DEFERRED
+//     * Bit depth   16                      DEFERRED
+//     * Bit depth   1 / 2 / 4               DEFERRED
+//     * Interlace   none (method 0)         supported
+//     * Interlace   Adam7 (method 1)        DEFERRED
+//     * Filter type 0 (None)                supported
+//     * Filter type 1 (Sub) / 2 (Up) / 3 (Average) / 4 (Paeth)
+//                                            partial: implemented per
+//                                            scanline (the filter byte
+//                                            is read and dispatched, all
+//                                            five RFC 2083 filters apply)
+//     * Compression Stored DEFLATE (BTYPE=00)   supported
+//     * Compression Static  Huffman  (BTYPE=01) DEFERRED -- in deflate_decode.nova
+//     * Compression Dynamic Huffman  (BTYPE=10) DEFERRED -- in deflate_decode.nova
+//     * Ancillary chunks (tEXt, gAMA, sRGB, ...)    ignored (skipped over)
+//
+//   The DEFLATE deferrals are the load-bearing limitation: a standard
+//   PNG from a phone camera or screenshot tool uses level 6 dynamic
+//   Huffman and will trip the documented `deflate: BTYPE=10 not
+//   implemented (TODO)` error. PNGs written with `pngcrush -force` /
+//   `optipng -o0` / zlib level 0 (stored blocks) decode end-to-end.
+//   The test fixture script `scripts/gen_test_png.py` produces a
+//   stored-only PNG via Python's struct + adler32; the integration
+//   test feeds that into `/see PATH.png` to exercise the full pipeline.
+//
+// Public API
+//   png_parse_signature(bytes, len) -> 1 if valid signature, 0 otherwise
+//   png_next_chunk(bytes, len, offset) ->
+//       [type_str, data_offset, data_len, next_offset, error_msg]
+//   png_parse_ihdr(chunk_data, chunk_len) ->
+//       [width, height, bit_depth, color_type, error_msg]
+//   png_decode_grayscale_8(path) ->
+//       [width, height, pixel_data_ptr, error_msg]
+//   png_crc32(bytes_ptr, len) -> int (CRC-32/PNG over the given bytes)
+//
+// PNG-8 grayscale layout (RFC 2083 + RFC 1950 zlib wrapper):
+//   * 8-byte signature: 89 50 4E 47 0D 0A 1A 0A
+//   * Chunks: [length:4 BE][type:4][data:length][crc:4 BE]
+//     Required chunks (in order): IHDR (first), IDAT (one or more), IEND
+//     (last). Ancillary chunks may appear between IHDR and IEND and are
+//     silently skipped over.
+//   * IHDR data (13 bytes): width:4 BE | height:4 BE | bit_depth:1 |
+//     color_type:1 | compression:1 | filter:1 | interlace:1
+//   * IDAT data: concatenated zlib stream -- 1 byte CMF | 1 byte FLG |
+//     DEFLATE bitstream | 4 byte Adler-32 trailer. For grayscale-8 the
+//     raw stream is `height` scanlines, each prefixed by a 1-byte filter
+//     type (0..4) followed by `width` raw pixel bytes.
+//   * IEND: zero data, fixed CRC 0xAE426082.
+//
+// Pixel-count cap: PNG dimensions are bounded at 1024x1024 (mirror of
+// PGM_MAX_DIM) so the decompressed scanline buffer
+// (height * (1 + width)) stays just over 1 MiB and lifts off NOVA's
+// codegen pointer-threshold gotcha #11 via int_* arithmetic where
+// needed. Larger PNGs are refused at IHDR parse time with a clear
+// "downsample first" error.
+//
+// CRC32: every PNG chunk carries a CRC-32 over [type + data]. We
+// validate the CRC for IHDR and IDAT chunks; ancillary chunks are
+// CRC-checked too (the cost is negligible vs the I/O). The CRC routine
+// uses the standard reflected polynomial 0xEDB88320 with a precomputed
+// 256-entry table built once at first call.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+//   ADR-0036 (atom hygiene -- feature extraction lives in
+//   visual_perception.nova, not here).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, char_at, int_to_str, int_add, int_mul, int_sub,
+//   int_xor, int_and, int_shr, sys_open, sys_read, sys_close from
+//   std/syscall.
+// CrossEngin dependencies: deflate_decode.nova (the inner DEFLATE
+//   decompressor for the IDAT bytes).
+
+import "std/syscall"
+import "deflate_decode.nova"
+
+// ---- signature ------------------------------------------------------------
+
+// PNG signature: 89 'P' 'N' 'G' 0D 0A 1A 0A. The non-ASCII first byte +
+// the CRLF + Ctrl-Z + LF sequence is designed to detect common file-
+// transfer corruption (ASCII-mode transfers strip the CRLF; the 0x1A is
+// the DOS end-of-file marker).
+let PNG_SIG_0 = 137    // 0x89
+let PNG_SIG_1 = 80     // 'P'
+let PNG_SIG_2 = 78     // 'N'
+let PNG_SIG_3 = 71     // 'G'
+let PNG_SIG_4 = 13     // 0x0D = CR
+let PNG_SIG_5 = 10     // 0x0A = LF
+let PNG_SIG_6 = 26     // 0x1A = SUB / DOS-EOF
+let PNG_SIG_7 = 10     // 0x0A = LF
+
+let PNG_SIG_LEN = 8
+
+// ---- color / format constants --------------------------------------------
+
+let PNG_COLOR_GRAYSCALE       = 0
+let PNG_COLOR_RGB             = 2     // DEFERRED
+let PNG_COLOR_PALETTE         = 3     // DEFERRED
+let PNG_COLOR_GRAYSCALE_ALPHA = 4     // DEFERRED
+let PNG_COLOR_RGBA            = 6     // DEFERRED
+
+let PNG_BIT_DEPTH_8 = 8
+
+// Filter types per RFC 2083 section 9.
+let PNG_FILTER_NONE    = 0
+let PNG_FILTER_SUB     = 1
+let PNG_FILTER_UP      = 2
+let PNG_FILTER_AVERAGE = 3
+let PNG_FILTER_PAETH   = 4
+
+// Dimension cap. Matches image_pgm.PGM_MAX_DIM so a PNG and a PGM of
+// the same shape go through the same downstream path.
+let PNG_MAX_DIM        = 1024
+let PNG_MAX_PIXEL_AREA = 1048576    // 1024 * 1024
+
+// File cap. PNG is compressed so a 1MiB grayscale image is typically
+// 30-300KB on disk; we still cap reads at ~2MiB so a malicious file
+// can not blow the buffer.
+let PNG_MAX_FILE_BYTES = 2097152    // 2 MiB
+
+// Result tuple indices for png_decode_grayscale_8.
+let PNG_R_WIDTH  = 0
+let PNG_R_HEIGHT = 1
+let PNG_R_DATA   = 2
+let PNG_R_ERROR  = 3
+
+// Chunk parse-tuple indices for png_next_chunk.
+let PNG_C_TYPE   = 0
+let PNG_C_DATA   = 1
+let PNG_C_LEN    = 2
+let PNG_C_NEXT   = 3
+let PNG_C_ERROR  = 4
+
+// IHDR parse-tuple indices for png_parse_ihdr.
+let PNG_I_WIDTH      = 0
+let PNG_I_HEIGHT     = 1
+let PNG_I_BIT_DEPTH  = 2
+let PNG_I_COLOR_TYPE = 3
+let PNG_I_ERROR      = 4
+
+// IHDR data layout is fixed at 13 bytes.
+let PNG_IHDR_DATA_LEN = 13
+
+// ---- result helpers -------------------------------------------------------
+
+fn _png_decode_result(width, height, data, error_msg) {
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, data)
+    push(r, error_msg)
+    return r
+}
+
+fn _png_decode_fail(error_msg) {
+    return _png_decode_result(0, 0, 0, error_msg)
+}
+
+fn _png_chunk_result(type_str, data_off, data_len, next_off, error_msg) {
+    let r = list_new()
+    push(r, type_str)
+    push(r, data_off)
+    push(r, data_len)
+    push(r, next_off)
+    push(r, error_msg)
+    return r
+}
+
+fn _png_chunk_fail(error_msg) {
+    return _png_chunk_result("", 0, 0, 0, error_msg)
+}
+
+fn _png_ihdr_result(width, height, bit_depth, color_type, error_msg) {
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, bit_depth)
+    push(r, color_type)
+    push(r, error_msg)
+    return r
+}
+
+fn _png_ihdr_fail(error_msg) {
+    return _png_ihdr_result(0, 0, 0, 0, error_msg)
+}
+
+// ---- result accessors -----------------------------------------------------
+
+fn png_result_width(r)  { return r[PNG_R_WIDTH] }
+fn png_result_height(r) { return r[PNG_R_HEIGHT] }
+fn png_result_data(r)   { return r[PNG_R_DATA] }
+fn png_result_error(r)  { return r[PNG_R_ERROR] }
+fn png_result_ok(r) {
+    if len(r[PNG_R_ERROR]) > 0 { return 0 }
+    if r[PNG_R_WIDTH] <= 0 { return 0 }
+    return 1
+}
+
+fn png_chunk_type(r)   { return r[PNG_C_TYPE] }
+fn png_chunk_data(r)   { return r[PNG_C_DATA] }
+fn png_chunk_len(r)    { return r[PNG_C_LEN] }
+fn png_chunk_next(r)   { return r[PNG_C_NEXT] }
+fn png_chunk_error(r)  { return r[PNG_C_ERROR] }
+
+fn png_ihdr_width(r)      { return r[PNG_I_WIDTH] }
+fn png_ihdr_height(r)     { return r[PNG_I_HEIGHT] }
+fn png_ihdr_bit_depth(r)  { return r[PNG_I_BIT_DEPTH] }
+fn png_ihdr_color_type(r) { return r[PNG_I_COLOR_TYPE] }
+fn png_ihdr_error(r)      { return r[PNG_I_ERROR] }
+
+// ---- big-endian readers ---------------------------------------------------
+//
+// PNG length and CRC fields are 4-byte big-endian. Use int_* arithmetic
+// for the * 256 chain so a 24-bit shift over a non-trivial chunk length
+// stays safe past NOVA's codegen pointer-threshold gotcha #11.
+
+fn _png_read_u32_be(bytes_ptr, off) {
+    let b0 = load8(bytes_ptr + off)
+    let b1 = load8(bytes_ptr + off + 1)
+    let b2 = load8(bytes_ptr + off + 2)
+    let b3 = load8(bytes_ptr + off + 3)
+    // b0 << 24 | b1 << 16 | b2 << 8 | b3
+    let v = int_mul(b0, 16777216)        // 256^3
+    v = int_add(v, int_mul(b1, 65536))   // 256^2
+    v = int_add(v, int_mul(b2, 256))
+    v = int_add(v, b3)
+    return v
+}
+
+// ---- CRC32 ----------------------------------------------------------------
+//
+// PNG's CRC is CRC-32 with the reflected polynomial 0xEDB88320 (the
+// standard "PNG / zlib / Ethernet" variant), MSB-first message bytes,
+// initial value 0xFFFFFFFF, post-XOR with 0xFFFFFFFF.
+//
+// We build the 256-entry table lazily on first call. Each entry is the
+// 32-bit CRC of the single byte i, treated as the polynomial division
+// remainder. The table is kept in a list of ints. We use int_* arithmetic
+// throughout: 32-bit values cross NOVA's 1MB threshold, so any smart-op
+// arithmetic would crash.
+//
+// Reference algorithm (RFC 2083 annex D, slightly modernized):
+//   for n in 0..255:
+//     c = n
+//     for k in 0..7:
+//       if (c & 1) == 1:
+//         c = 0xEDB88320 ^ (c >> 1)
+//       else:
+//         c = c >> 1
+//     table[n] = c
+//
+//   crc32(bytes):
+//     c = 0xFFFFFFFF
+//     for b in bytes:
+//       c = table[(c ^ b) & 0xFF] ^ (c >> 8)
+//     return c ^ 0xFFFFFFFF
+
+let _png_crc_table = 0      // built once on first call
+let _png_crc_built = 0
+
+// CRC32 polynomial in reflected form. Held in a const so we don't risk
+// emitting it as a smart-op literal inside the hot table-build loop.
+let PNG_CRC32_POLY = 3988292384    // 0xEDB88320
+let PNG_CRC32_INIT = 4294967295    // 0xFFFFFFFF
+
+fn _png_build_crc_table() {
+    if _png_crc_built == 1 { return 1 }
+    let t = list_new()
+    let n = 0
+    while n < 256 {
+        let c = n
+        let k = 0
+        while k < 8 {
+            let bit = int_and(c, 1)
+            if bit == 1 {
+                // c = POLY ^ (c >> 1)
+                let shifted = int_shr(c, 1)
+                c = int_xor(PNG_CRC32_POLY, shifted)
+            } else {
+                c = int_shr(c, 1)
+            }
+            k = k + 1
+        }
+        push(t, c)
+        n = n + 1
+    }
+    _png_crc_table = t
+    _png_crc_built = 1
+    return 1
+}
+
+// Compute CRC-32/PNG over `len` bytes at `bytes_ptr`. Returns the 32-bit
+// unsigned value (as a NOVA int).
+fn png_crc32(bytes_ptr, total_len) {
+    _png_build_crc_table()
+    let t = _png_crc_table
+    let c = PNG_CRC32_INIT
+    let i = 0
+    while i < total_len {
+        let b = load8(bytes_ptr + i)
+        // idx = (c XOR b) AND 0xFF
+        let mixed = int_xor(c, b)
+        let idx = int_and(mixed, 255)
+        let table_val = t[idx]
+        let high = int_shr(c, 8)
+        c = int_xor(table_val, high)
+        i = i + 1
+    }
+    return int_xor(c, PNG_CRC32_INIT)
+}
+
+// CRC over `type` (4 bytes at chunk type slot) + `data` (len bytes at
+// chunk data slot). Used to validate a chunk's CRC field against the
+// stored value. We concatenate type+data into a single small buffer so
+// the table-driven CRC sees a contiguous range -- the chunk type lives
+// at bytes_ptr + type_off and the data starts at bytes_ptr + data_off
+// which is type_off + 4, so they are already contiguous; we just call
+// png_crc32 over (type_off, 4 + data_len).
+fn _png_crc_chunk(bytes_ptr, type_off, data_len) {
+    return png_crc32(bytes_ptr + type_off, int_add(4, data_len))
+}
+
+// ---- signature parser -----------------------------------------------------
+
+fn png_parse_signature(bytes_ptr, total_len) {
+    if total_len < PNG_SIG_LEN { return 0 }
+    if load8(bytes_ptr + 0) != PNG_SIG_0 { return 0 }
+    if load8(bytes_ptr + 1) != PNG_SIG_1 { return 0 }
+    if load8(bytes_ptr + 2) != PNG_SIG_2 { return 0 }
+    if load8(bytes_ptr + 3) != PNG_SIG_3 { return 0 }
+    if load8(bytes_ptr + 4) != PNG_SIG_4 { return 0 }
+    if load8(bytes_ptr + 5) != PNG_SIG_5 { return 0 }
+    if load8(bytes_ptr + 6) != PNG_SIG_6 { return 0 }
+    if load8(bytes_ptr + 7) != PNG_SIG_7 { return 0 }
+    return 1
+}
+
+// ---- chunk iterator -------------------------------------------------------
+//
+// png_next_chunk(bytes_ptr, total_len, off) reads one chunk starting at
+// `off`. Returns [type_str, data_offset, data_len, next_offset, error].
+//
+// The PNG chunk format is [length:4 BE | type:4 | data:length | crc:4 BE].
+// `type` is exactly four ASCII bytes; we materialize it as a 4-char
+// string for caller convenience. CRC verification happens inline:
+// any mismatch sets the error_msg.
+
+fn _png_type_str(bytes_ptr, off) {
+    // Read 4 ASCII bytes as a freshly-allocated 4-char NOVA string.
+    // The smart-op `+` for char-by-char append would crash if any byte
+    // were >= 0x100000, but ASCII is 7-bit so this is safe -- we still
+    // do it via the substring/load8 path the rest of the codebase uses.
+    let buf = alloc(5)
+    store8(buf + 0, load8(bytes_ptr + off + 0))
+    store8(buf + 1, load8(bytes_ptr + off + 1))
+    store8(buf + 2, load8(bytes_ptr + off + 2))
+    store8(buf + 3, load8(bytes_ptr + off + 3))
+    store8(buf + 4, 0)
+    // Build a NOVA string from the four chars.
+    let s = ""
+    let i = 0
+    while i < 4 {
+        let c = load8(buf + i)
+        s = s + _png_char_to_str(c)
+        i = i + 1
+    }
+    return s
+}
+
+// Convert a single ASCII byte value to a 1-char string. We use a small
+// lookup table for the uppercase A..Z (which is what PNG chunk types
+// use). Falls back to the int_to_str path for any non-A..Z byte.
+fn _png_char_to_str(b) {
+    if b == 65 { return "A" }
+    if b == 66 { return "B" }
+    if b == 67 { return "C" }
+    if b == 68 { return "D" }
+    if b == 69 { return "E" }
+    if b == 70 { return "F" }
+    if b == 71 { return "G" }
+    if b == 72 { return "H" }
+    if b == 73 { return "I" }
+    if b == 74 { return "J" }
+    if b == 75 { return "K" }
+    if b == 76 { return "L" }
+    if b == 77 { return "M" }
+    if b == 78 { return "N" }
+    if b == 79 { return "O" }
+    if b == 80 { return "P" }
+    if b == 81 { return "Q" }
+    if b == 82 { return "R" }
+    if b == 83 { return "S" }
+    if b == 84 { return "T" }
+    if b == 85 { return "U" }
+    if b == 86 { return "V" }
+    if b == 87 { return "W" }
+    if b == 88 { return "X" }
+    if b == 89 { return "Y" }
+    if b == 90 { return "Z" }
+    if b == 97 { return "a" }
+    if b == 98 { return "b" }
+    if b == 99 { return "c" }
+    if b == 100 { return "d" }
+    if b == 101 { return "e" }
+    if b == 102 { return "f" }
+    if b == 103 { return "g" }
+    if b == 104 { return "h" }
+    if b == 105 { return "i" }
+    if b == 106 { return "j" }
+    if b == 107 { return "k" }
+    if b == 108 { return "l" }
+    if b == 109 { return "m" }
+    if b == 110 { return "n" }
+    if b == 111 { return "o" }
+    if b == 112 { return "p" }
+    if b == 113 { return "q" }
+    if b == 114 { return "r" }
+    if b == 115 { return "s" }
+    if b == 116 { return "t" }
+    if b == 117 { return "u" }
+    if b == 118 { return "v" }
+    if b == 119 { return "w" }
+    if b == 120 { return "x" }
+    if b == 121 { return "y" }
+    if b == 122 { return "z" }
+    return "?"
+}
+
+// String-equality helper specific to the 4-byte chunk type. We can't
+// use `str_eq` directly on the materialized string because we want the
+// chunk-type compare to short-circuit on byte mismatch; comparing each
+// of the 4 type bytes against an ASCII constant avoids any allocator
+// pressure in the hot chunk-iteration loop.
+fn _png_chunk_type_is(bytes_ptr, off, c0, c1, c2, c3) {
+    if load8(bytes_ptr + off + 0) != c0 { return 0 }
+    if load8(bytes_ptr + off + 1) != c1 { return 0 }
+    if load8(bytes_ptr + off + 2) != c2 { return 0 }
+    if load8(bytes_ptr + off + 3) != c3 { return 0 }
+    return 1
+}
+
+fn png_next_chunk(bytes_ptr, total_len, off) {
+    if off + 8 > total_len {
+        return _png_chunk_fail("png: chunk header truncated (need length+type)")
+    }
+    let chunk_len = _png_read_u32_be(bytes_ptr, off)
+    if chunk_len > total_len {
+        return _png_chunk_fail("png: chunk length exceeds file size")
+    }
+    let type_off = off + 4
+    let data_off = off + 8
+    let crc_off = int_add(data_off, chunk_len)
+    if int_add(crc_off, 4) > total_len {
+        return _png_chunk_fail("png: chunk data/CRC truncated")
+    }
+    // Validate CRC: stored = u32 BE at crc_off; computed = CRC32 over
+    // type (4 bytes) + data (chunk_len bytes), contiguous in the source.
+    let stored_crc = _png_read_u32_be(bytes_ptr, crc_off)
+    let computed_crc = _png_crc_chunk(bytes_ptr, type_off, chunk_len)
+    if stored_crc != computed_crc {
+        return _png_chunk_fail("png: chunk CRC mismatch")
+    }
+    let type_str = _png_type_str(bytes_ptr, type_off)
+    let next_off = int_add(crc_off, 4)
+    return _png_chunk_result(type_str, data_off, chunk_len, next_off, "")
+}
+
+// ---- IHDR parser ----------------------------------------------------------
+
+fn png_parse_ihdr(bytes_ptr, data_off, chunk_len) {
+    if chunk_len != PNG_IHDR_DATA_LEN {
+        return _png_ihdr_fail("png: IHDR length is not 13 bytes")
+    }
+    let width  = _png_read_u32_be(bytes_ptr, data_off + 0)
+    let height = _png_read_u32_be(bytes_ptr, data_off + 4)
+    let bit_depth   = load8(bytes_ptr + data_off + 8)
+    let color_type  = load8(bytes_ptr + data_off + 9)
+    let compression = load8(bytes_ptr + data_off + 10)
+    let filter      = load8(bytes_ptr + data_off + 11)
+    let interlace   = load8(bytes_ptr + data_off + 12)
+    if width <= 0  { return _png_ihdr_fail("png: width <= 0") }
+    if height <= 0 { return _png_ihdr_fail("png: height <= 0") }
+    if width > PNG_MAX_DIM {
+        return _png_ihdr_fail("png: width exceeds 1024 (downsample first)")
+    }
+    if height > PNG_MAX_DIM {
+        return _png_ihdr_fail("png: height exceeds 1024 (downsample first)")
+    }
+    if compression != 0 {
+        return _png_ihdr_fail("png: compression method other than 0 not supported")
+    }
+    if filter != 0 {
+        return _png_ihdr_fail("png: filter method other than 0 not supported")
+    }
+    if interlace != 0 {
+        return _png_ihdr_fail("png: Adam7 interlace not supported (use interlace=0)")
+    }
+    if color_type != PNG_COLOR_GRAYSCALE {
+        return _png_ihdr_fail("png: only grayscale (color_type=0) is supported (TODO: RGB/RGBA/palette)")
+    }
+    if bit_depth != PNG_BIT_DEPTH_8 {
+        return _png_ihdr_fail("png: only 8-bit depth is supported (TODO: 1/2/4/16-bit)")
+    }
+    return _png_ihdr_result(width, height, bit_depth, color_type, "")
+}
+
+// ---- zlib wrapper unwrap --------------------------------------------------
+//
+// PNG IDAT data is zlib-wrapped DEFLATE: 1 byte CMF, 1 byte FLG, then
+// the DEFLATE bitstream, then a 4-byte Adler-32 trailer. CMF lower 4
+// bits is the compression method (always 8 for PNG = DEFLATE). FLG
+// upper 5 bits encode FLEVEL (informational only). The (CMF*256 + FLG)
+// value must be divisible by 31 -- a simple parity check the encoder
+// pads via the lower FLG bits.
+//
+// We do NOT validate Adler-32 (the integrity story is the per-chunk
+// CRC32; Adler-32 catches the rare DEFLATE-internal corruption, but
+// for the MVP we trust the CRC). DEFERRED.
+
+fn _png_unwrap_zlib(zlib_ptr, zlib_len) {
+    if zlib_len < 6 {
+        return _deflate_fail("png: zlib stream too short")
+    }
+    let cmf = load8(zlib_ptr + 0)
+    let method = int_and(cmf, 15)   // lower 4 bits
+    if method != 8 {
+        return _deflate_fail("png: zlib compression method != 8 (DEFLATE)")
+    }
+    // Skip 2-byte zlib header + 4-byte Adler-32 trailer for the DEFLATE
+    // payload length.
+    let deflate_len = int_sub(zlib_len, 6)
+    return deflate_decode_stored(zlib_ptr + 2, deflate_len)
+}
+
+// ---- unfilter a grayscale-8 scanline buffer ------------------------------
+//
+// PNG filtering (RFC 2083 section 9) applies one of 5 prediction filters
+// per scanline. The filter type byte (0..4) prefixes each scanline.
+// For grayscale-8 the "bpp" (bytes per pixel) is 1, so the filter
+// references (left, above, upper-left) at offset -1 / -width / -width-1
+// in the raw output.
+//
+// Input: raw decompressed buffer of size height * (1 + width) bytes.
+// Output: a freshly-allocated buffer of `width * height` raw pixel bytes
+// with all filters reversed.
+
+fn _png_unfilter_grayscale_8(raw_ptr, width, height) {
+    // Pixel area cap (defensive; already checked at IHDR).
+    let area = int_mul(width, height)
+    if area > PNG_MAX_PIXEL_AREA {
+        return 0
+    }
+    let out = alloc(area + 1)
+    let row = 0
+    // We track the previous-row pointer for filters 2/3/4. NULL at row 0.
+    let prev_row_off = 0
+    while row < height {
+        let stride = int_add(1, width)
+        let row_off = int_mul(row, stride)
+        let filter_byte = load8(raw_ptr + row_off)
+        let in_pixel_off = int_add(row_off, 1)
+        let out_pixel_off = int_mul(row, width)
+        let x = 0
+        while x < width {
+            let raw_byte = load8(raw_ptr + in_pixel_off + x)
+            // a = pixel to the left (0 if x == 0)
+            let a = 0
+            if x > 0 { a = load8(out + out_pixel_off + x - 1) }
+            // b = pixel above (0 if row == 0)
+            let b = 0
+            if row > 0 { b = load8(out + int_sub(out_pixel_off, width) + x) }
+            // c = upper-left pixel (0 if x == 0 or row == 0)
+            let c = 0
+            if x > 0 {
+                if row > 0 { c = load8(out + int_sub(out_pixel_off, width) + x - 1) }
+            }
+            let v = raw_byte
+            if filter_byte == PNG_FILTER_NONE {
+                v = raw_byte
+            }
+            if filter_byte == PNG_FILTER_SUB {
+                v = int_and(int_add(raw_byte, a), 255)
+            }
+            if filter_byte == PNG_FILTER_UP {
+                v = int_and(int_add(raw_byte, b), 255)
+            }
+            if filter_byte == PNG_FILTER_AVERAGE {
+                let avg = (a + b) / 2
+                v = int_and(int_add(raw_byte, avg), 255)
+            }
+            if filter_byte == PNG_FILTER_PAETH {
+                let pred = _png_paeth(a, b, c)
+                v = int_and(int_add(raw_byte, pred), 255)
+            }
+            store8(out + out_pixel_off + x, v)
+            x = x + 1
+        }
+        prev_row_off = row_off
+        row = row + 1
+    }
+    store8(out + area, 0)
+    return out
+}
+
+// PNG Paeth predictor (RFC 2083 section 9.4). All inputs/outputs are in
+// 0..255 so smart-op arithmetic is safe (no operand exceeds the 1MB
+// threshold).
+fn _png_paeth(a, b, c) {
+    let p = a + b - c
+    let pa = p - a
+    if pa < 0 { pa = 0 - pa }
+    let pb = p - b
+    if pb < 0 { pb = 0 - pb }
+    let pc = p - c
+    if pc < 0 { pc = 0 - pc }
+    if pa <= pb {
+        if pa <= pc { return a }
+    }
+    if pb <= pc { return b }
+    return c
+}
+
+// ---- full grayscale-8 pipeline -------------------------------------------
+//
+// png_decode_grayscale_8(path) reads the file, validates the signature,
+// iterates chunks, concatenates IDAT, unwraps zlib, decompresses the
+// DEFLATE stream (stored-only for now), unfilters scanlines, and returns
+// a [width, height, pixel_data, error] result.
+
+fn png_decode_grayscale_8(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 {
+        return _png_decode_fail("png: cannot open file")
+    }
+    let buf = alloc(PNG_MAX_FILE_BYTES + 1)
+    let total = 0
+    let keep = 1
+    let chunk = 4096
+    while keep == 1 {
+        let space_left = int_sub(PNG_MAX_FILE_BYTES, total)
+        let want = chunk
+        if want > space_left { want = space_left }
+        if want <= 0 { keep = 0 }
+        if keep == 1 {
+            let n = sys_read(fd, buf + total, want)
+            if n <= 0 {
+                keep = 0
+            } else {
+                total = int_add(total, n)
+                if total >= PNG_MAX_FILE_BYTES { keep = 0 }
+            }
+        }
+    }
+    sys_close(fd)
+    if total <= 0 {
+        return _png_decode_fail("png: empty file")
+    }
+    return png_decode_grayscale_8_bytes(buf, total)
+}
+
+// In-memory variant. Useful for unit tests that build a fixture in alloc'd
+// memory rather than on disk.
+fn png_decode_grayscale_8_bytes(buf, total) {
+    if png_parse_signature(buf, total) == 0 {
+        return _png_decode_fail("png: invalid signature")
+    }
+    let off = PNG_SIG_LEN
+    // First chunk MUST be IHDR.
+    let first = png_next_chunk(buf, total, off)
+    if len(png_chunk_error(first)) > 0 {
+        return _png_decode_fail(png_chunk_error(first))
+    }
+    // IHDR == 'I','H','D','R' == 73,72,68,82
+    if _png_chunk_type_is(buf, off + 4, 73, 72, 68, 82) == 0 {
+        return _png_decode_fail("png: first chunk is not IHDR")
+    }
+    let ihdr = png_parse_ihdr(buf, png_chunk_data(first), png_chunk_len(first))
+    if len(png_ihdr_error(ihdr)) > 0 {
+        return _png_decode_fail(png_ihdr_error(ihdr))
+    }
+    let width  = png_ihdr_width(ihdr)
+    let height = png_ihdr_height(ihdr)
+    off = png_chunk_next(first)
+    // Walk chunks, concatenating IDAT payloads and stopping at IEND.
+    // We pre-allocate a worst-case IDAT buffer at the cap (raw scanlines
+    // for height*1024 plus filter bytes plus zlib header/trailer would
+    // be ~1.05 MiB; we round to 1.1 MiB which matches deflate's output cap).
+    let idat_buf = alloc(int_add(PNG_MAX_PIXEL_AREA, 1100))
+    let idat_len = 0
+    let saw_iend = 0
+    let walked = 1
+    while walked == 1 {
+        if off >= total { walked = 0 }
+        if walked == 1 {
+            let cur = png_next_chunk(buf, total, off)
+            if len(png_chunk_error(cur)) > 0 {
+                return _png_decode_fail(png_chunk_error(cur))
+            }
+            let cdata = png_chunk_data(cur)
+            let clen  = png_chunk_len(cur)
+            // IDAT == 'I','D','A','T' == 73, 68, 65, 84
+            if _png_chunk_type_is(buf, off + 4, 73, 68, 65, 84) == 1 {
+                if int_add(idat_len, clen) > int_add(PNG_MAX_PIXEL_AREA, 1100) {
+                    return _png_decode_fail("png: total IDAT size exceeds cap")
+                }
+                let i = 0
+                while i < clen {
+                    store8(idat_buf + idat_len + i, load8(buf + cdata + i))
+                    i = i + 1
+                }
+                idat_len = int_add(idat_len, clen)
+            }
+            // IEND == 'I','E','N','D' == 73, 69, 78, 68
+            if _png_chunk_type_is(buf, off + 4, 73, 69, 78, 68) == 1 {
+                saw_iend = 1
+                walked = 0
+            }
+            off = png_chunk_next(cur)
+        }
+    }
+    if saw_iend == 0 {
+        return _png_decode_fail("png: missing IEND chunk")
+    }
+    if idat_len == 0 {
+        return _png_decode_fail("png: missing IDAT chunk")
+    }
+    // Unwrap zlib + DEFLATE-decompress the IDAT bytes.
+    let inflated = _png_unwrap_zlib(idat_buf, idat_len)
+    let derr = deflate_result_error(inflated)
+    if len(derr) > 0 {
+        return _png_decode_fail(derr)
+    }
+    let raw_ptr = deflate_result_output(inflated)
+    let raw_len = deflate_result_length(inflated)
+    // Expected raw size: height * (1 + width).
+    let expected = int_mul(height, int_add(1, width))
+    if raw_len < expected {
+        return _png_decode_fail("png: decompressed scanline buffer too short")
+    }
+    let pixels = _png_unfilter_grayscale_8(raw_ptr, width, height)
+    if pixels == 0 {
+        return _png_decode_fail("png: unfilter failed (dim cap exceeded)")
+    }
+    return _png_decode_result(width, height, pixels, "")
+}

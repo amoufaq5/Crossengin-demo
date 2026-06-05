@@ -1,0 +1,529 @@
+// CrossEngin federation: Gossip-relayed signed snapshot attestation (R20F).
+//
+// Purpose
+//   R20F. CrossEngin's persistence layer can already produce
+//   tamper-evident snapshots:
+//     * R15E (`src/persistence/merkle.nova`) seals the KGS atom-records
+//       under a 32-byte Merkle root that any single-bit edit perturbs.
+//     * R16A (`src/persistence/merkle_signing.nova`) layers Ed25519
+//       signatures over the Merkle root so the operator can prove a
+//       snapshot was authored by a key they hold.
+//   And the federation layer can already discover + reach peers:
+//     * R18E (`src/federation/gossip.nova`) is a SWIM-style mesh that
+//       converges every soul on the same "who is alive" view.
+//     * R19E (`src/federation/leader_election.nova`) gives that mesh
+//       a single coordinator via Bully.
+//
+//   The remaining gap: peers can sign their OWN snapshots but cannot
+//   prove to each other that they saved a particular state at a
+//   particular time. This is the building block for cross-soul
+//   forensics ("show me peer X's snapshot history -- I'll know if a
+//   rollback happened by looking at the timestamps") + consistency
+//   checking ("at t=T, did both souls agree on a root?").
+//
+//   This module ships SNAPSHOT ATTESTATION: a periodic broadcast of
+//   `(soul_id, ts_ns, merkle_root, signature)` tuples. The signature
+//   is over the canonical concatenation `soul_id || ts_ns ||
+//   merkle_root`, signed under the soul's R7C Noise XK long-term
+//   pubkey (re-used here as the federation identity). A peer that
+//   receives an ATTESTATION verifies the signature against the
+//   originator's KNOWN pubkey (registered out-of-band at federation
+//   bootstrap, same way leader_election registers per-peer integer
+//   IDs); a bad signature is silently dropped (does NOT pollute the
+//   log). Verified attestations land in a per-peer log; the operator
+//   can inspect any peer's snapshot history via `/attest_log <id>`.
+//
+// Trust model
+//
+//   The gossip mesh is UNTRUSTED. A malicious peer can replay,
+//   reorder, or fabricate ATTESTATION lines -- but cannot forge a
+//   signature over a root they didn't authorize without the
+//   originator's seed. The receiver's defense is:
+//     1. Resolve `soul_id -> pubkey` via the local key table (same
+//        table that backs R7C Noise XK static auth + R19E peer-id
+//        registration).
+//     2. Reconstruct the canonical pre-image `soul_id || ts_ns ||
+//        merkle_root_bytes`.
+//     3. ed25519_verify(pre_image, sig, pubkey) -> 1 or 0.
+//   A verified attestation can still be a REPLAY (an old root re-
+//   broadcast); the consumer code (the operator looking at the log,
+//   or an automated consistency check) is responsible for
+//   monotonicity-on-ts policy. The attestation LOG keeps every
+//   verified tuple in receive order, so a replay shows up as a stale
+//   ts but a valid signature -- visible, not silent.
+//
+// Wire shape
+//
+//   ATTESTATION <soul_id> <ts_ns> <merkle_root_hex> <sig_hex>\n
+//
+//   * soul_id: integer (matches the R19E peer-id, typically hash of
+//     pubkey)
+//   * ts_ns:   integer nanoseconds since epoch (nanotime() at the
+//     moment the saver minted the tuple)
+//   * merkle_root_hex: 64-char lowercase hex (R15E's standard form)
+//   * sig_hex: 128-char lowercase hex (Ed25519 signature, R || s)
+//
+//   The line is piggybacked on a gossip PING/ACK exchange, similar to
+//   how MEMBER notices already ride along. Implementation here is
+//   transport-agnostic: `att_make` builds the tuple, the caller
+//   serialises and ships it. `att_parse` does the inverse. The gossip
+//   handler (R20F additive extension to `src/federation/gossip.nova`)
+//   recognises the ATTESTATION prefix on inbound and pipes verified
+//   tuples into the local store.
+//
+// Public API
+//
+//   att_make(soul_id, ts_ns, root_bytes, seed_bytes, pk_bytes)
+//                                            -> attestation tuple
+//   att_verify(att, pub_key_bytes)           -> 1 if signature valid
+//   att_store_new()                          -> empty store
+//   att_store_add(store, att)                -> appends iff valid sig
+//                                               is already verified
+//                                               by the caller; the
+//                                               low-level add is
+//                                               policy-free
+//   att_store_for_peer(store, peer_id)       -> list of attestations
+//   att_store_latest(store, peer_id)         -> latest att | 0
+//   att_store_count(store)                   -> total entries
+//   att_store_count_for_peer(store, peer_id) -> per-peer entries
+//
+//   Helpers exercised by unit + integration tests:
+//
+//   att_soul_id(att)         -> int
+//   att_ts_ns(att)           -> int
+//   att_root_hex(att)        -> 64-char hex
+//   att_sig_hex(att)         -> 128-char hex
+//   att_to_wire(att)         -> "ATTESTATION <id> <ts> <root> <sig>"
+//   att_parse_wire(line)     -> attestation tuple | 0 on shape error
+//   att_canonical_message(soul_id, ts_ns, root_bytes)
+//                            -> byte list (the signing pre-image)
+//
+// ADRs: registers ADR-0080 (gossip-relayed signed snapshot attestation).
+// NOVA dependencies: list_new, push, len, nanotime, str_eq, char_at,
+//   int_to_str, str_to_int, substr. CrossEngin dependencies:
+//   src/persistence/merkle_signing.nova (sign/verify primitives;
+//   READ-only), src/safety/ed25519.nova (transitively).
+
+import "std/io"
+import "../persistence/merkle_signing.nova"
+import "../safety/ed25519.nova"
+
+// ---- constants ------------------------------------------------------------
+
+let ATT_WIRE_PREFIX  = "ATTESTATION "
+let ATT_ROOT_HEX_LEN = 64
+let ATT_SIG_HEX_LEN  = 128
+let ATT_ROOT_LEN     = 32
+let ATT_PUB_LEN      = 32
+let ATT_SIG_LEN      = 64
+
+// ---- attestation tuple record indices ------------------------------------
+
+let ATT_F_SOUL_ID   = 0   // int
+let ATT_F_TS_NS     = 1   // int
+let ATT_F_ROOT_HEX  = 2   // 64-char hex
+let ATT_F_SIG_HEX   = 3   // 128-char hex
+
+// ---- attestation-store record indices ------------------------------------
+//
+// The store is a list of attestation tuples in INSERTION order. Per-
+// peer queries linear-scan the list filtering on soul_id. For a
+// federation of N=16 souls saving every minute, the store grows by
+// ~16 entries / minute / soul -- ~1K entries / soul / hour. Linear
+// scan stays cheap at this scale; if it ever doesn't, an index-by-id
+// secondary structure is the obvious upgrade.
+
+// ---- low-level helpers ---------------------------------------------------
+
+fn _att_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _att_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _att_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _att_starts_with(s, prefix) {
+    if len(s) < len(prefix) { return 0 }
+    let i = 0
+    while i < len(prefix) {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _att_split_spaces(s) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            if i > start { push(out, substr(s, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(s, start, i - start)) }
+    return out
+}
+
+// Lowercase-hex character classifier (0-9 a-f). Used to validate the
+// shape of root_hex / sig_hex on parse.
+fn _att_is_lc_hex_char(c) {
+    if c >= 48 {
+        if c <= 57 { return 1 }
+    }
+    if c >= 97 {
+        if c <= 102 { return 1 }
+    }
+    return 0
+}
+
+fn _att_is_lc_hex_string(s, expect_len) {
+    if len(s) != expect_len { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _att_is_lc_hex_char(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Append an 8-byte little-endian rendering of `v` to `out` (a byte
+// list). Used by att_canonical_message to lay out (soul_id || ts_ns).
+// Negative values are wrapped via two's complement (a 64-bit drop-in
+// for negative IDs would be unusual but the wrap is well-defined).
+fn _att_push_le64(out, v) {
+    // Use bitwise primitives so the rendering survives nanosecond
+    // timestamps (>= ~10^18 ns, near the 2^63 ceiling). The legacy
+    // (x / 256) * 256 trick overflows the temporary multiplication
+    // result; int_shr + int_and are well-defined for the full 64-bit
+    // signed range and produce the correct LE byte sequence for any
+    // representable int (negatives wrap via the natural two's
+    // complement of the underlying machine word).
+    let x = v
+    let i = 0
+    while i < 8 {
+        let b = int_and(x, 255)
+        push(out, b)
+        x = int_shr(x, 8)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- canonical signing pre-image ----------------------------------------
+//
+// The signing pre-image is `soul_id_le64 || ts_ns_le64 || root_bytes`.
+// 8 + 8 + 32 = 48 bytes total. The format is fixed-width / no
+// length-delimiters because every field is fixed width. Both endpoints
+// must produce bit-identical bytes from the same `(soul_id, ts_ns,
+// root_bytes)`; the test suite pins this with a known-vector check.
+
+fn att_canonical_message(soul_id, ts_ns, root_bytes) {
+    let out = list_new()
+    _att_push_le64(out, soul_id)
+    _att_push_le64(out, ts_ns)
+    if root_bytes == 0 { return out }
+    let i = 0
+    let n = len(root_bytes)
+    if n > ATT_ROOT_LEN { n = ATT_ROOT_LEN }
+    while i < n {
+        push(out, root_bytes[i])
+        i = i + 1
+    }
+    // If the caller passed a short root (shouldn't happen at the
+    // public API; defensive), zero-pad to the canonical 32 bytes.
+    while i < ATT_ROOT_LEN {
+        push(out, 0)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- constructors --------------------------------------------------------
+
+// Build an attestation tuple `(soul_id, ts_ns, root_hex, sig_hex)`
+// signed under (seed_bytes, pk_bytes). Returns the 4-element list, or
+// 0 on input-shape error.
+//
+//   * `root_bytes` is the 32-byte Merkle root as a NOVA byte list
+//     (the shape merkle_root_bytes_from_hex returns).
+//   * `seed_bytes` + `pk_bytes` are the 32-byte Ed25519 keypair.
+fn att_make(soul_id, ts_ns, root_bytes, seed_bytes, pk_bytes) {
+    if root_bytes == 0 { return 0 }
+    if seed_bytes == 0 { return 0 }
+    if pk_bytes == 0 { return 0 }
+    if len(root_bytes) != ATT_ROOT_LEN { return 0 }
+    if len(seed_bytes) != ATT_ROOT_LEN { return 0 }
+    if len(pk_bytes) != ATT_PUB_LEN { return 0 }
+    let msg = att_canonical_message(soul_id, ts_ns, root_bytes)
+    let sig = ed25519_sign(msg, seed_bytes, pk_bytes)
+    if sig == 0 { return 0 }
+    if len(sig) != ATT_SIG_LEN { return 0 }
+    let att = list_new()
+    push(att, soul_id)                              // F_SOUL_ID
+    push(att, ts_ns)                                // F_TS_NS
+    push(att, ed25519_bytes_to_hex(root_bytes))     // F_ROOT_HEX
+    push(att, ed25519_bytes_to_hex(sig))            // F_SIG_HEX
+    return att
+}
+
+// Convenience: build an attestation from the hex form of the root.
+// The on-disk meta block stores the root as hex (R15E's wire form),
+// so the snapshot-save hook prefers this entry point.
+fn att_make_from_hex(soul_id, ts_ns, root_hex, seed_bytes, pk_bytes) {
+    if root_hex == 0 { return 0 }
+    if _att_is_lc_hex_string(root_hex, ATT_ROOT_HEX_LEN) == 0 { return 0 }
+    let root_bytes = merkle_root_bytes_from_hex(root_hex)
+    if root_bytes == 0 { return 0 }
+    return att_make(soul_id, ts_ns, root_bytes, seed_bytes, pk_bytes)
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn att_soul_id(att)   { return att[ATT_F_SOUL_ID] }
+fn att_ts_ns(att)     { return att[ATT_F_TS_NS] }
+fn att_root_hex(att)  { return att[ATT_F_ROOT_HEX] }
+fn att_sig_hex(att)   { return att[ATT_F_SIG_HEX] }
+
+// ---- verify --------------------------------------------------------------
+
+// Verify the signature on an attestation tuple. Returns 1 iff the
+// signature is valid over the canonical pre-image. Returns 0 on any
+// shape error (missing fields, wrong-length hex, bad chars), missing
+// pubkey, or signature mismatch (Ed25519's standard fail-closed).
+fn att_verify(att, pk_bytes) {
+    if att == 0 { return 0 }
+    if pk_bytes == 0 { return 0 }
+    if len(att) < 4 { return 0 }
+    if len(pk_bytes) != ATT_PUB_LEN { return 0 }
+    let root_hex = att[ATT_F_ROOT_HEX]
+    let sig_hex  = att[ATT_F_SIG_HEX]
+    if _att_is_lc_hex_string(root_hex, ATT_ROOT_HEX_LEN) == 0 { return 0 }
+    if _att_is_lc_hex_string(sig_hex, ATT_SIG_HEX_LEN) == 0 { return 0 }
+    let root_bytes = ed25519_hex_to_bytes(root_hex)
+    if len(root_bytes) != ATT_ROOT_LEN { return 0 }
+    let sig_bytes = ed25519_hex_to_bytes(sig_hex)
+    if len(sig_bytes) != ATT_SIG_LEN { return 0 }
+    let msg = att_canonical_message(att[ATT_F_SOUL_ID], att[ATT_F_TS_NS], root_bytes)
+    return ed25519_verify(msg, sig_bytes, pk_bytes)
+}
+
+// ---- wire codec ----------------------------------------------------------
+
+// Serialise an attestation tuple to its on-wire form. The trailing
+// "\n" is the caller's responsibility (gossip's line framer already
+// owns the newline policy). Returns "" on missing/short input.
+fn att_to_wire(att) {
+    if att == 0 { return "" }
+    if len(att) < 4 { return "" }
+    return ATT_WIRE_PREFIX
+        + int_to_str(att[ATT_F_SOUL_ID])
+        + " " + int_to_str(att[ATT_F_TS_NS])
+        + " " + att[ATT_F_ROOT_HEX]
+        + " " + att[ATT_F_SIG_HEX]
+}
+
+// Parse a single ATTESTATION line. Returns the 4-element attestation
+// tuple on success, 0 on shape error. The line MUST NOT carry a
+// trailing newline (gossip's recv_line already stripped it). Does
+// NOT verify the signature -- the caller chains att_verify on the
+// returned tuple.
+fn att_parse_wire(line) {
+    if line == 0 { return 0 }
+    if _att_starts_with(line, ATT_WIRE_PREFIX) == 0 { return 0 }
+    let toks = _att_split_spaces(line)
+    // ATTESTATION <id> <ts> <root> <sig>
+    if len(toks) != 5 { return 0 }
+    if str_eq(toks[0], "ATTESTATION") == 0 { return 0 }
+    // Sign of the soul_id is optionally a leading '-' -- handle that.
+    let id_s = toks[1]
+    let ts_s = toks[2]
+    let root_hex = toks[3]
+    let sig_hex  = toks[4]
+    let id_neg = 0
+    let id_check = id_s
+    if len(id_s) > 0 {
+        if char_at(id_s, 0) == 45 {
+            id_neg = 1
+            id_check = substr(id_s, 1, len(id_s) - 1)
+        }
+    }
+    if _att_is_digits(id_check) == 0 { return 0 }
+    if _att_is_digits(ts_s) == 0 { return 0 }
+    if _att_is_lc_hex_string(root_hex, ATT_ROOT_HEX_LEN) == 0 { return 0 }
+    if _att_is_lc_hex_string(sig_hex,  ATT_SIG_HEX_LEN)  == 0 { return 0 }
+    let soul_id = str_to_int(id_check)
+    if id_neg == 1 { soul_id = 0 - soul_id }
+    let ts_ns = str_to_int(ts_s)
+    let att = list_new()
+    push(att, soul_id)
+    push(att, ts_ns)
+    push(att, root_hex)
+    push(att, sig_hex)
+    return att
+}
+
+// ---- attestation store ---------------------------------------------------
+//
+// The store is a flat list of attestation tuples. Insertion is O(1);
+// per-peer query is O(N); latest is O(N). The simple shape matches
+// the leader_election peer-map (also linear-scan), is enough for
+// federation sizes the system targets (N <= 16 souls), and avoids a
+// dependency on any KG/index data structure.
+
+fn att_store_new() {
+    return list_new()
+}
+
+// Append an attestation to the store. The store is policy-free: the
+// caller is expected to have verified the signature (typically via
+// att_verify) before adding. The integration scenario explicitly
+// asserts that the gossip handler refuses to enqueue tampered
+// attestations.
+fn att_store_add(store, att) {
+    if store == 0 { return 0 }
+    if att == 0 { return store }
+    if len(att) < 4 { return store }
+    push(store, att)
+    return store
+}
+
+// Total entries across all peers.
+fn att_store_count(store) {
+    if store == 0 { return 0 }
+    return len(store)
+}
+
+// Number of entries from peer `peer_id`.
+fn att_store_count_for_peer(store, peer_id) {
+    if store == 0 { return 0 }
+    let n = 0
+    let i = 0
+    while i < len(store) {
+        if store[i][ATT_F_SOUL_ID] == peer_id { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// All attestations from peer `peer_id`, in insertion order. Returns
+// a fresh list (never the underlying store).
+fn att_store_for_peer(store, peer_id) {
+    let out = list_new()
+    if store == 0 { return out }
+    let i = 0
+    while i < len(store) {
+        if store[i][ATT_F_SOUL_ID] == peer_id {
+            push(out, store[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Most-recent attestation from peer `peer_id` -- the entry with the
+// highest ts_ns. Returns 0 if no entry exists. "Most recent" is
+// timestamp-based (NOT insertion-order based) so an out-of-order
+// arrival doesn't change the answer.
+fn att_store_latest(store, peer_id) {
+    if store == 0 { return 0 }
+    let best = 0
+    let best_ts = 0
+    let i = 0
+    while i < len(store) {
+        if store[i][ATT_F_SOUL_ID] == peer_id {
+            let ts = store[i][ATT_F_TS_NS]
+            if best == 0 {
+                best = store[i]
+                best_ts = ts
+            } else {
+                if ts > best_ts {
+                    best = store[i]
+                    best_ts = ts
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Distinct peer IDs that have at least one entry in the store.
+// Returned in insertion-order of first sighting (stable for the test
+// suite). Used by the admin command to enumerate "which peers have
+// we received attestations from".
+fn att_store_peer_ids(store) {
+    let out = list_new()
+    if store == 0 { return out }
+    let i = 0
+    while i < len(store) {
+        let id = store[i][ATT_F_SOUL_ID]
+        let dupe = 0
+        let j = 0
+        while j < len(out) {
+            if out[j] == id { dupe = 1 }
+            j = j + 1
+        }
+        if dupe == 0 { push(out, id) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- admin / diagnostics -------------------------------------------------
+//
+// One-line summary suitable for `/attest_log <peer>` output. If the
+// peer has no entries, returns "att: peer <id> no attestations".
+// Otherwise: "att: peer <id> count=N latest_ts=<ns> latest_root=<hex8>".
+// `hex8` is the first 8 characters of the root_hex -- short enough
+// for visual diffing across souls, full hex available via
+// att_store_for_peer for programmatic checks.
+fn att_status_line_for_peer(store, peer_id) {
+    let latest = att_store_latest(store, peer_id)
+    if latest == 0 {
+        return "att: peer " + int_to_str(peer_id) + " no attestations"
+    }
+    let n = att_store_count_for_peer(store, peer_id)
+    let root_hex = latest[ATT_F_ROOT_HEX]
+    let short = substr(root_hex, 0, 8)
+    return "att: peer " + int_to_str(peer_id)
+        + " count=" + int_to_str(n)
+        + " latest_ts=" + int_to_str(latest[ATT_F_TS_NS])
+        + " latest_root=" + short
+}
+
+// Render up to `max_n` entries for `peer_id`, newest first. Used by
+// `/attest_log <peer>` to dump a few recent entries below the summary
+// line. Returns a list of formatted strings (one per entry).
+fn att_recent_lines_for_peer(store, peer_id, max_n) {
+    let out = list_new()
+    let all = att_store_for_peer(store, peer_id)
+    // Walk the list backwards (most recent inserted first); the
+    // ts-order vs insertion-order divergence is fine here -- this is
+    // a diagnostic, not a primary record.
+    let i = len(all) - 1
+    let emitted = 0
+    while i >= 0 {
+        if emitted >= max_n { i = -1 } else {
+            let a = all[i]
+            let line = "  ts=" + int_to_str(a[ATT_F_TS_NS])
+                + " root=" + a[ATT_F_ROOT_HEX]
+                + " sig=" + substr(a[ATT_F_SIG_HEX], 0, 16) + "..."
+            push(out, line)
+            emitted = emitted + 1
+            i = i - 1
+        }
+    }
+    return out
+}

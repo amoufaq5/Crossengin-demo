@@ -1,0 +1,334 @@
+// Unit tests for src/io/transducers/image_pgm.nova (P3.1).
+//
+// Hermetic coverage of the minimum-viable PGM-P5 decoder + the
+// statistics helpers the visual_perception seam leans on. We build all
+// test fixtures in-memory (alloc + store8) so the unit suite never
+// depends on an on-disk image file. The pgm_parse_file path is
+// exercised by the integration test (scenario_q_image_see.sh) which
+// builds a fixture in /tmp via printf -- separating in-memory from
+// on-disk coverage keeps this suite tied only to the decoder's
+// in-buffer logic.
+//
+// Assertion targets (the brief asks for ~20):
+//   * pgm_parse_bytes happy path: a hand-built 4x4 grid with known
+//     pixel values; width/height/maxval match; every individual pixel
+//     reads back the value we wrote.
+//   * pgm_pixel address arithmetic (row-major, x then y).
+//   * pgm_histogram on a 16-pixel gradient: each bin holds exactly 1
+//     pixel at the gradient steps; all others zero.
+//   * pgm_mean_intensity on the gradient and on a flat field.
+//   * pgm_dominant_intensity on a flat field returns the right bucket
+//     (e.g. value 200 -> bucket 6 because 200/32 == 6).
+//   * pgm_resize_nn 4x4 -> 2x2 produces the nearest-pixel value at each
+//     destination coord.
+//   * Malformed inputs: bad magic, truncated, missing width, missing
+//     maxval all set a non-empty error_msg and pgm_result_ok==0.
+//   * Comments in the header ("# CREATOR: ImageMagick ..." line) are
+//     skipped correctly.
+//   * Dimension cap: a width > 1024 is refused with a clear error.
+//   * pgm_result_ok respects width / error_msg state.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_pgm.nova"
+
+// ---- fixture builder ------------------------------------------------------
+// Build a P5 PGM in raw bytes: header followed by `area` pixel bytes
+// produced by calling `pixel_fn(i)` for i in 0..area. Returns
+// [buffer_ptr, total_len].
+
+fn _build_pgm(width, height, maxval, pixels) {
+    // Header: "P5\n<w> <h>\n<mv>\n"
+    let w_str = int_to_str(width)
+    let h_str = int_to_str(height)
+    let m_str = int_to_str(maxval)
+    let header = "P5\n" + w_str + " " + h_str + "\n" + m_str + "\n"
+    let hlen = len(header)
+    let area = len(pixels)
+    let total = hlen + area
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < hlen {
+        store8(buf + i, char_at(header, i))
+        i = i + 1
+    }
+    let k = 0
+    while k < area {
+        store8(buf + hlen + k, pixels[k])
+        k = k + 1
+    }
+    let pair = list_new()
+    push(pair, buf)
+    push(pair, total)
+    return pair
+}
+
+fn _gradient_pixels_16() {
+    // 0, 16, 32, 48, ..., 240 -- 16 evenly-spaced grayscale values.
+    let l = list_new()
+    let i = 0
+    while i < 16 {
+        push(l, i * 16)
+        i = i + 1
+    }
+    return l
+}
+
+fn _flat_pixels(area, value) {
+    let l = list_new()
+    let i = 0
+    while i < area {
+        push(l, value)
+        i = i + 1
+    }
+    return l
+}
+
+// ---- happy path -----------------------------------------------------------
+
+fn test_parse_4x4_gradient_dims() {
+    let fix = _build_pgm(4, 4, 255, _gradient_pixels_16())
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    ce_str_eq("error empty on valid 4x4 PGM", pgm_result_error(r), "")
+    ce_eq("width=4",   pgm_result_width(r),  4)
+    ce_eq("height=4",  pgm_result_height(r), 4)
+    ce_eq("maxval=255",pgm_result_maxval(r), 255)
+    ce_eq("ok=1 on valid PGM", pgm_result_ok(r), 1)
+}
+
+fn test_parse_4x4_gradient_pixels() {
+    let fix = _build_pgm(4, 4, 255, _gradient_pixels_16())
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    let data = pgm_result_data(r)
+    // Row-major: (x, y) -> data[y*4 + x]
+    ce_eq("pixel(0,0)=0",     pgm_pixel(data, 4, 0, 0), 0)
+    ce_eq("pixel(1,0)=16",    pgm_pixel(data, 4, 1, 0), 16)
+    ce_eq("pixel(0,1)=64",    pgm_pixel(data, 4, 0, 1), 64)
+    ce_eq("pixel(3,3)=240",   pgm_pixel(data, 4, 3, 3), 240)
+    ce_eq("pixel(2,2)=160",   pgm_pixel(data, 4, 2, 2), 160)
+}
+
+// ---- histogram + statistics ----------------------------------------------
+
+fn test_histogram_on_gradient() {
+    let fix = _build_pgm(4, 4, 255, _gradient_pixels_16())
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    let hist = pgm_histogram(pgm_result_data(r), 4, 4)
+    ce_eq("histogram length 256", len(hist), 256)
+    // 16 distinct values; each appears exactly once.
+    ce_eq("hist[0]=1",   hist[0],   1)
+    ce_eq("hist[16]=1",  hist[16],  1)
+    ce_eq("hist[128]=1", hist[128], 1)
+    ce_eq("hist[240]=1", hist[240], 1)
+    // Anything in between should be zero.
+    ce_eq("hist[1]=0",   hist[1],   0)
+    ce_eq("hist[100]=0", hist[100], 0)
+    // Sum of histogram == area.
+    let total = 0
+    let i = 0
+    while i < 256 { total = total + hist[i]; i = i + 1 }
+    ce_eq("sum of histogram == 16", total, 16)
+}
+
+fn test_mean_intensity() {
+    let fix = _build_pgm(4, 4, 255, _gradient_pixels_16())
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    // sum = 0+16+32+...+240 = 16*(0+1+...+15) = 16 * 120 = 1920.
+    // mean = 1920 / 16 = 120.
+    ce_eq("mean of 0..240 step 16 is 120",
+          pgm_mean_intensity(pgm_result_data(r), 4, 4), 120)
+    // Flat field at 200: mean must equal 200 exactly.
+    let fix2 = _build_pgm(4, 4, 255, _flat_pixels(16, 200))
+    let r2 = pgm_parse_bytes(fix2[0], fix2[1])
+    ce_eq("mean of flat 200 is 200",
+          pgm_mean_intensity(pgm_result_data(r2), 4, 4), 200)
+}
+
+fn test_dominant_intensity_bucket() {
+    // Flat 200: bucket = 200 / 32 = 6.
+    let fix = _build_pgm(4, 4, 255, _flat_pixels(16, 200))
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    ce_eq("flat 200 -> bucket 6",
+          pgm_dominant_intensity(pgm_result_data(r), 4, 4), 6)
+    // Flat 0: bucket 0.
+    let fix2 = _build_pgm(4, 4, 255, _flat_pixels(16, 0))
+    let r2 = pgm_parse_bytes(fix2[0], fix2[1])
+    ce_eq("flat 0 -> bucket 0",
+          pgm_dominant_intensity(pgm_result_data(r2), 4, 4), 0)
+    // Flat 255: bucket 7 (after clamp).
+    let fix3 = _build_pgm(4, 4, 255, _flat_pixels(16, 255))
+    let r3 = pgm_parse_bytes(fix3[0], fix3[1])
+    ce_eq("flat 255 -> bucket 7",
+          pgm_dominant_intensity(pgm_result_data(r3), 4, 4), 7)
+}
+
+// ---- resize ---------------------------------------------------------------
+
+fn test_resize_nn_4x4_to_2x2() {
+    let fix = _build_pgm(4, 4, 255, _gradient_pixels_16())
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    let data = pgm_result_data(r)
+    let small = pgm_resize_nn(data, 4, 4, 2, 2)
+    // Nearest-neighbour: dst(x,y) <- src(x*4/2, y*4/2) = src(x*2, y*2)
+    //   (0,0) -> (0,0) = 0
+    //   (1,0) -> (2,0) = 32
+    //   (0,1) -> (0,2) = 128
+    //   (1,1) -> (2,2) = 160
+    ce_eq("resized(0,0) = 0",   load8(small + 0), 0)
+    ce_eq("resized(1,0) = 32",  load8(small + 1), 32)
+    ce_eq("resized(0,1) = 128", load8(small + 2), 128)
+    ce_eq("resized(1,1) = 160", load8(small + 3), 160)
+}
+
+fn test_resize_nn_2x2_to_4x4_upscale() {
+    // Upscale a known 2x2 (with values 0, 100, 200, 250 at (0,0)(1,0)(0,1)(1,1))
+    // to 4x4. Each destination pixel maps via sx = x*2/4, sy = y*2/4.
+    let p = list_new()
+    push(p, 0)    // (0,0)
+    push(p, 100)  // (1,0)
+    push(p, 200)  // (0,1)
+    push(p, 250)  // (1,1)
+    let fix = _build_pgm(2, 2, 255, p)
+    let r = pgm_parse_bytes(fix[0], fix[1])
+    let data = pgm_result_data(r)
+    let big = pgm_resize_nn(data, 2, 2, 4, 4)
+    // sx = x*2/4 = x/2, sy = y/2 (integer div). So:
+    //   x=0,1 -> sx=0; x=2,3 -> sx=1.
+    //   y=0,1 -> sy=0; y=2,3 -> sy=1.
+    // dst(0,0)=src(0,0)=0; dst(2,0)=src(1,0)=100;
+    // dst(0,2)=src(0,1)=200; dst(2,2)=src(1,1)=250.
+    ce_eq("big(0,0) == 0",     load8(big + 0 * 4 + 0), 0)
+    ce_eq("big(2,0) == 100",   load8(big + 0 * 4 + 2), 100)
+    ce_eq("big(0,2) == 200",   load8(big + 2 * 4 + 0), 200)
+    ce_eq("big(2,2) == 250",   load8(big + 2 * 4 + 2), 250)
+}
+
+// ---- malformed inputs ----------------------------------------------------
+
+fn test_malformed_bad_magic() {
+    let buf = alloc(16)
+    store8(buf + 0, 81)   // 'Q' instead of 'P'
+    store8(buf + 1, 53)   // '5'
+    let i = 2
+    while i < 16 { store8(buf + i, 0); i = i + 1 }
+    let r = pgm_parse_bytes(buf, 16)
+    let err = pgm_result_error(r)
+    ce_check("bad magic byte 0 -> non-empty error", len(err) > 0)
+    ce_eq("bad magic -> ok=0", pgm_result_ok(r), 0)
+}
+
+fn test_malformed_wrong_format_p2() {
+    // P2 is ASCII PGM, not supported. Magic byte 1 == '2' (50) instead of '5'.
+    let buf = alloc(16)
+    store8(buf + 0, 80)   // 'P'
+    store8(buf + 1, 50)   // '2'
+    let i = 2
+    while i < 16 { store8(buf + i, 0); i = i + 1 }
+    let r = pgm_parse_bytes(buf, 16)
+    let err = pgm_result_error(r)
+    ce_check("P2 (ASCII) -> non-empty error", len(err) > 0)
+    ce_eq("P2 -> ok=0", pgm_result_ok(r), 0)
+}
+
+fn test_malformed_truncated_buffer() {
+    // 4-byte buffer with "P5\n4" -- header truncated mid-dimension.
+    let buf = alloc(8)
+    store8(buf + 0, 80)
+    store8(buf + 1, 53)
+    store8(buf + 2, 10)
+    store8(buf + 3, 52)
+    let r = pgm_parse_bytes(buf, 4)
+    let err = pgm_result_error(r)
+    ce_check("truncated buffer -> non-empty error", len(err) > 0)
+}
+
+fn test_malformed_missing_pixel_bytes() {
+    // Valid header for 4x4 but only 8 pixel bytes (16 expected).
+    let header = "P5\n4 4\n255\n"
+    let hlen = len(header)
+    let total = hlen + 8
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < hlen {
+        store8(buf + i, char_at(header, i))
+        i = i + 1
+    }
+    let k = 0
+    while k < 8 {
+        store8(buf + hlen + k, k * 16)
+        k = k + 1
+    }
+    let r = pgm_parse_bytes(buf, total)
+    let err = pgm_result_error(r)
+    ce_check("missing pixel bytes -> non-empty error", len(err) > 0)
+}
+
+// ---- comment handling ----------------------------------------------------
+
+fn test_header_with_imagemagick_comment() {
+    // The shape `convert input.jpg output.pgm` produces:
+    //   P5\n# CREATOR: ImageMagick 6.x\n4 4\n255\n<pixels>
+    let header = "P5\n# CREATOR: ImageMagick 6.x q90\n4 4\n255\n"
+    let hlen = len(header)
+    let total = hlen + 16
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < hlen {
+        store8(buf + i, char_at(header, i))
+        i = i + 1
+    }
+    let k = 0
+    while k < 16 {
+        store8(buf + hlen + k, 200)
+        k = k + 1
+    }
+    let r = pgm_parse_bytes(buf, total)
+    ce_str_eq("comment-bearing header parses OK",
+              pgm_result_error(r), "")
+    ce_eq("comment header width=4",  pgm_result_width(r), 4)
+    ce_eq("comment header height=4", pgm_result_height(r), 4)
+    ce_eq("comment header pixel(0,0)=200",
+          pgm_pixel(pgm_result_data(r), 4, 0, 0), 200)
+}
+
+// ---- dimension cap -------------------------------------------------------
+
+fn test_dimension_cap_rejects_huge() {
+    // Width 2048 > PGM_MAX_DIM (1024). Parser must refuse before
+    // doing any width*height multiply (which would dance with the
+    // NOVA codegen pointer-threshold gotcha).
+    let header = "P5\n2048 1\n255\n"
+    let hlen = len(header)
+    let total = hlen + 4   // only a few pixel bytes; the parser should
+                            // refuse before reaching them.
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < hlen {
+        store8(buf + i, char_at(header, i))
+        i = i + 1
+    }
+    let r = pgm_parse_bytes(buf, total)
+    let err = pgm_result_error(r)
+    ce_check("width > 1024 -> non-empty error", len(err) > 0)
+    ce_eq("oversized -> ok=0", pgm_result_ok(r), 0)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_parse_4x4_gradient_dims()
+    test_parse_4x4_gradient_pixels()
+    test_histogram_on_gradient()
+    test_mean_intensity()
+    test_dominant_intensity_bucket()
+    test_resize_nn_4x4_to_2x2()
+    test_resize_nn_2x2_to_4x4_upscale()
+    test_malformed_bad_magic()
+    test_malformed_wrong_format_p2()
+    test_malformed_truncated_buffer()
+    test_malformed_missing_pixel_bytes()
+    test_header_with_imagemagick_comment()
+    test_dimension_cap_rejects_huge()
+    ce_summary("image_pgm")
+}
+
+main()

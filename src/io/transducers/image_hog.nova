@@ -1,0 +1,1137 @@
+// CrossEngin io/transducers: HOG (Histogram of Oriented Gradients)
+// dense feature descriptor (R14D -- classic Dalal-Triggs 2005 pipeline).
+//
+// Purpose
+//   Sparse keypoint pipelines (SIFT R5C, ORB R6D, Harris R1.6) describe
+//   only a handful of distinctive points. HOG is the OTHER classic dense
+//   descriptor: it tiles the WHOLE image (or detection window) and
+//   summarizes gradient orientation in fixed cells, building a long
+//   descriptor that captures the global shape distribution. This is the
+//   feature that powered classical pedestrian detection (Dalal & Triggs
+//   CVPR 2005) and remains the standard baseline for any "describe the
+//   image as a single vector" task that does NOT require sparse keypoint
+//   matching.
+//
+//   The difference from SIFT/ORB is the FIXED tiling -- there is no
+//   keypoint detection. Every image of the same dimensions produces a
+//   descriptor of the same length and topology, so two HOG vectors are
+//   compared with a single distance metric (no Lowe ratio test, no
+//   N x M match search). This makes HOG the natural feature for:
+//     - Whole-image classification (vehicle vs pedestrian vs background)
+//     - Template matching with a sliding-window classifier
+//     - Coarse image fingerprinting for retrieval (a poor man's CNN
+//       embedding, integer-arithmetic style).
+//
+//   HOG is NOT rotation-invariant (that is the key trade-off versus
+//   SIFT/ORB). A rotated copy of the same image produces a DIFFERENT
+//   HOG vector. This is by design: HOG is meant for templates where
+//   orientation is part of the identity (an upright pedestrian, a car
+//   from the side).
+//
+// Algorithm (Dalal-Triggs 2005, integer-only adaptation):
+//   1. Per-pixel gradient via central differences:
+//        Gx(x, y) = I(x+1, y) - I(x-1, y)
+//        Gy(x, y) = I(x, y+1) - I(x, y-1)
+//      Border pixels use a one-sided difference (zero on the outermost
+//      ring to avoid negative-index reads).
+//
+//   2. Magnitude + orientation bin:
+//        mag(x, y)       = |Gx| + |Gy|                  (L1 approximation)
+//        theta_bin(x, y) = round(atan2(Gy, Gx) * NUM_BINS / 180)
+//      We use UNSIGNED orientation (gradient direction folded to [0, 180)
+//      degrees by absolute-value of the sign), matching Dalal-Triggs.
+//      atan2 is computed via the same 8-quadrant integer-comparison
+//      lookup image_sift.nova uses (no float, no trig table -- pure
+//      int_mul on small operands so the codegen stays in the safe
+//      cap-respecting range).
+//
+//   3. Cell histogram: divide image into 8x8 (or CELL_SIZE) cells. For
+//      every pixel in a cell, accumulate its magnitude into the bin
+//      indexed by theta_bin. Output is a NUM_BINS-element histogram per
+//      cell (default 9 bins -> 20 degrees each). Each cell stores the
+//      raw magnitude-weighted sum as a single int per bin.
+//
+//   4. Block normalization: group cells into 2x2 BLOCKS (16x16 pixels
+//      for cell_size=8). Concatenate the 4 cell histograms -> a
+//      (4 * NUM_BINS) = 36-element block descriptor. L2-normalize:
+//        b_norm[i] = b[i] * 1000 / max(1, isqrt(sum(b[j]^2)))
+//      The output is in milli-units (post-norm L2 = ~1000 milli).
+//      Then apply L2-Hys clipping (Lowe's 0.2 cap, mirrored from
+//      SIFT's normalization): clamp every component to 200 milli and
+//      re-normalize. The clip suppresses dominant gradients (sun
+//      reflections, large texture peaks) that would otherwise drown
+//      out the rest of the histogram.
+//
+//   5. Slide blocks with 50% overlap (stride = 1 cell). For a W x H
+//      image with cell_size 8, there are (W/8) cells across and (H/8)
+//      cells down. With 2x2 blocks the block-grid is
+//      (W/8 - 1) x (H/8 - 1). Final HOG = concatenate every block
+//      descriptor in scan order -> total length is
+//      (W/8 - 1) * (H/8 - 1) * 36.
+//
+//   For Dalal-Triggs' canonical 64x128 pedestrian window, that is
+//   7x15=105 blocks x 36 = 3780 ints. CrossEngin's typical fixture is
+//   smaller (32x32 -> 3x3=9 blocks x 36 = 324 ints, well within the
+//   2^20 codegen pointer-threshold ceiling).
+//
+// Public API
+//   hog_compute(image, width, height, cell_size, num_bins) -> hog_result
+//       Defaults: cell_size = 8, num_bins = 9. The caller may pass either
+//       (image, w, h) and use hog_compute_default; the underscore form
+//       lets callers tune cell_size or num_bins.
+//   hog_compute_default(image, width, height) -> hog_result
+//       Convenience: cell_size=8, num_bins=9.
+//   hog_descriptor(result) -> list[int_milli]
+//       Final L2-Hys-normalized feature vector (concatenated blocks).
+//   hog_cell_histogram(result, cx, cy) -> list[int_milli]
+//       Per-cell histogram for inspection. Returns the empty list if
+//       (cx, cy) is out of cell-grid bounds (sentinel for OOB).
+//   hog_compare(hog_a, hog_b) -> int_milli_distance
+//       L1 distance between two HOG vectors. Returns -1 if lengths
+//       differ (incompatible inputs).
+//   hog_result_width / _height / _cell_size / _num_bins / _cells_x
+//       / _cells_y / _blocks_x / _blocks_y / _dominant_bin
+//       / _magnitude_mean -- accessors.
+//   hog_pgm_args(arg) -> formatted result string for the chat `/hog`
+//       admin command. Mirrors orb_match_pgm_args's contract.
+//
+// Caps:
+//   Dimensions <= 256x256 per axis (hard cap HOG_MAX_DIM).
+//   cell_size in {4, 8, 16} -- enforced; defaults to 8.
+//   num_bins  in {6, 9, 12} -- enforced; defaults to 9.
+//   Block layout is fixed at 2x2 cells (the Dalal-Triggs default).
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub.
+// CrossEngin dependencies: image_pgm.nova (only the chat helper imports
+//   it; the core algorithm is a leaf).
+
+import "image_pgm.nova"
+
+// ---- caps + defaults ------------------------------------------------------
+
+let HOG_MAX_DIM = 256
+let HOG_MAX_AREA = 65536            // 256 * 256
+
+let HOG_CELL_DEFAULT = 8
+let HOG_BINS_DEFAULT = 9
+
+// Block layout is fixed at 2x2 cells (Dalal-Triggs default). A block
+// holds 4 cells; a block descriptor is BLOCK_CELLS * num_bins ints.
+let HOG_BLOCK_CELLS_PER_AXIS = 2
+let HOG_BLOCK_CELLS          = 4    // 2 * 2
+
+// Block stride (in CELLS). 1 = 50% overlap.
+let HOG_BLOCK_STRIDE = 1
+
+// L2-Hys cap + post-norm target. Same numbers SIFT uses for its
+// 128-D descriptor.
+let HOG_L2_TARGET_MILLI = 1000
+let HOG_HYS_CAP_MILLI   = 200
+
+// ---- result tuple slot indices --------------------------------------------
+//
+// hog_result layout (positional):
+//   [0]  width            -- input width
+//   [1]  height           -- input height
+//   [2]  cell_size        -- bin width in pixels (4, 8, or 16)
+//   [3]  num_bins         -- histogram length per cell (6, 9, or 12)
+//   [4]  cells_x          -- width  / cell_size  (integer division)
+//   [5]  cells_y          -- height / cell_size
+//   [6]  blocks_x         -- cells_x - 1
+//   [7]  blocks_y         -- cells_y - 1
+//   [8]  cell_hists       -- list of cells_x * cells_y per-cell histograms
+//                            (each one a num_bins int list, RAW magnitudes)
+//   [9]  descriptor       -- final concatenated, L2-Hys-normalized vector
+//   [10] dominant_bin     -- argmax over the per-cell bin counts (the
+//                            integer-of-greatest-summed-magnitude bin
+//                            across the whole image)
+//   [11] magnitude_mean   -- mean L1 gradient magnitude across all pixels
+//                            (an integer; uniform regions yield 0)
+
+let HOG_R_WIDTH         = 0
+let HOG_R_HEIGHT        = 1
+let HOG_R_CELL_SIZE     = 2
+let HOG_R_NUM_BINS      = 3
+let HOG_R_CELLS_X       = 4
+let HOG_R_CELLS_Y       = 5
+let HOG_R_BLOCKS_X      = 6
+let HOG_R_BLOCKS_Y      = 7
+let HOG_R_CELL_HISTS    = 8
+let HOG_R_DESCRIPTOR    = 9
+let HOG_R_DOMINANT_BIN  = 10
+let HOG_R_MAG_MEAN      = 11
+
+// Cell histogram size cap (for the OOB-safe sentinel return).
+let HOG_R_SLOTS = 12
+
+// ---- result helpers -------------------------------------------------------
+
+fn _hog_empty_result(width, height, cell_size, num_bins) {
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, cell_size)
+    push(r, num_bins)
+    push(r, 0)              // cells_x
+    push(r, 0)              // cells_y
+    push(r, 0)              // blocks_x
+    push(r, 0)              // blocks_y
+    push(r, list_new())     // cell_hists
+    push(r, list_new())     // descriptor
+    push(r, 0 - 1)          // dominant_bin (sentinel = -1)
+    push(r, 0)              // magnitude_mean
+    return r
+}
+
+// ---- integer sqrt ---------------------------------------------------------
+//
+// Newton's method, bounded iteration count. Mirrors image_sift.nova's
+// _sift_isqrt: returns floor(sqrt(n)) for n >= 0. The block-normalization
+// inputs reach 4 * num_bins * max_cell_sum^2 -- for 9-bin cells with
+// magnitudes up to ~1020 per pixel * 64 pixels/cell = ~65280 per bin,
+// sum_sq can reach 36 * 65280^2 ~= 1.5e11, well into the range where
+// Newton's method needs ~30 iterations from a crude seed. We seed with
+// n/2 and bound at 50 iterations (no NOVA TCO; an unbounded loop on a
+// 1.5e11 input would spin too long).
+
+fn _hog_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 4 { return 1 }
+    let x = n
+    let y = int_add(n / 2, 1)
+    let iter = 0
+    while iter < 50 {
+        if y >= x { iter = 50 }
+        else {
+            x = y
+            y = int_add(x, n / x) / 2
+            iter = int_add(iter, 1)
+        }
+    }
+    return x
+}
+
+// ---- orientation-bin lookup ----------------------------------------------
+//
+// _hog_orient_bin(gx, gy, num_bins) -> int in [0, num_bins).
+//
+// We compute the UNSIGNED orientation: theta = atan2(|gy|, |gx|) mapped
+// into [0, 180) degrees, then quantized to num_bins buckets. Each bucket
+// covers 180 / num_bins degrees (20 degrees for the default 9 bins, 30
+// for 6, 15 for 12).
+//
+// The integer-arithmetic trick mirrors image_sift's _sift_dir_bin: we
+// compute the ratio short/long as an int_mul ratio against the tangent
+// of each bucket boundary. For 9 bins (20 deg each) the boundaries are
+// at 10, 30, 50, 70, 90, 110, 130, 150, 170 degrees. tan(10) ~= 176/1000,
+// tan(30) ~= 577/1000, tan(50) ~= 1191/1000, tan(70) ~= 2747/1000,
+// tan(90) -> infinity (the cardinal). Symmetric reflection past 90
+// degrees gives the other half.
+//
+// We compare short_axis * 1000 vs long_axis * tan_boundary_milli to find
+// the bin index. The boundary table is generated for the bin count in
+// use (6, 9, 12) so the same code path covers all three.
+//
+// Sign handling: |gx|, |gy| go into the bin lookup; the SIGN of the
+// product gx*gy decides whether we're in the [0, 90) half (signs equal,
+// gradient rises to upper-right or lower-left) or the [90, 180) half
+// (signs differ).
+
+// Precomputed tan(boundary_degrees) * 1000, indexed by bin count.
+// Boundaries for 9 bins (20 deg each, midpoints at 10, 30, 50, 70):
+//   tan(10) = 176, tan(30) = 577, tan(50) = 1191, tan(70) = 2747
+fn _hog_tan_for_bin(num_bins, k) {
+    // k is the boundary index (0..N/2-1 for first quadrant).
+    if num_bins == 9 {
+        if k == 0 { return 176 }
+        if k == 1 { return 577 }
+        if k == 2 { return 1191 }
+        if k == 3 { return 2747 }
+        return 100000          // sentinel "infinity" past the table
+    }
+    if num_bins == 6 {
+        // 30 deg each, midpoints at 15, 45, 75. tan(15) = 268,
+        // tan(45) = 1000, tan(75) = 3732.
+        if k == 0 { return 268 }
+        if k == 1 { return 1000 }
+        if k == 2 { return 3732 }
+        return 100000
+    }
+    if num_bins == 12 {
+        // 15 deg each, midpoints at 7.5, 22.5, 37.5, 52.5, 67.5, 82.5.
+        // tan(7.5)=132, tan(22.5)=414, tan(37.5)=768, tan(52.5)=1303,
+        // tan(67.5)=2414, tan(82.5)=7595.
+        if k == 0 { return 132 }
+        if k == 1 { return 414 }
+        if k == 2 { return 768 }
+        if k == 3 { return 1303 }
+        if k == 4 { return 2414 }
+        if k == 5 { return 7595 }
+        return 100000
+    }
+    return 100000
+}
+
+// _hog_first_quadrant_bin: given non-negative ax, ay and num_bins, return
+// the bin index in [0, num_bins/2] for the first quadrant of the unsigned
+// half-circle. Bin 0 = 0 degrees (purely horizontal); bin num_bins/2 = 90
+// degrees (purely vertical).
+fn _hog_first_quadrant_bin(ax, ay, num_bins) {
+    let half = num_bins / 2
+    // Walk the boundary table; the first boundary the ratio EXCEEDS
+    // (ay > ax * tan_milli / 1000) is the boundary above the bin we
+    // belong to. The bin index equals the first boundary we exceed.
+    let k = 0
+    while k < half {
+        let t = _hog_tan_for_bin(num_bins, k)
+        // Compare ay vs ax * t / 1000 without dividing: ay * 1000 vs ax * t.
+        let lhs = int_mul(ay, 1000)
+        let rhs = int_mul(ax, t)
+        if lhs <= rhs { return k }
+        k = int_add(k, 1)
+    }
+    return half
+}
+
+fn _hog_orient_bin(gx, gy, num_bins) {
+    let ax = gx
+    if ax < 0 { ax = 0 - ax }
+    let ay = gy
+    if ay < 0 { ay = 0 - ay }
+    if ax == 0 {
+        if ay == 0 { return 0 }
+    }
+    // First-quadrant bin: 0 = horizontal, num_bins/2 = vertical.
+    let q = _hog_first_quadrant_bin(ax, ay, num_bins)
+    // Wrap the "vertical" bin (q == num_bins/2) to bin 0 of the next
+    // half (since the unsigned circle folds back at 180 degrees).
+    // For 9 bins: q == 4 means vertical (~90 deg); bin 4 of the 9-bin
+    // ring. Beyond that we mirror by the sign of gx*gy.
+    if q >= num_bins / 2 {
+        // Pure vertical: assign to bin num_bins/2 (4 for 9-bin default).
+        return q % num_bins
+    }
+    // Sign of gx*gy: positive (both same sign) -> first half [0, 90);
+    //                negative (signs differ)   -> second half [90, 180).
+    // The second-half bins are num_bins - 1 - q (mirror around vertical).
+    let sign_pos = 1
+    if gx < 0 {
+        if gy >= 0 { sign_pos = 0 }
+    }
+    if gx >= 0 {
+        if gy < 0 { sign_pos = 0 }
+    }
+    if sign_pos == 1 { return q }
+    // Mirror to second half. For 9 bins: q=0 (horizontal) and signs
+    // differ -> bin 8 (170 deg, "near-horizontal from above"). The
+    // bin indices increase CCW around the half-circle.
+    let mirror = int_sub(num_bins, q)
+    if mirror >= num_bins { mirror = int_sub(num_bins, 1) }
+    if mirror < 0         { mirror = 0 }
+    return mirror
+}
+
+// ---- per-pixel gradient pass ---------------------------------------------
+//
+// Compute (mag, bin) for every pixel and accumulate into per-cell
+// histograms. Border pixels use central differences when they have
+// both neighbors; the outermost ring (y == 0 or y == height-1, x == 0
+// or x == width-1) gets gradient 0 and contributes nothing.
+//
+// Returns [cell_hists, mag_sum, mag_count, dominant_bin].
+//   cell_hists -- list of cells_x * cells_y per-cell histograms
+//   mag_sum    -- sum of all per-pixel magnitudes
+//   mag_count  -- pixels considered (interior count; for the mean)
+//   dominant_bin -- argmax over the GLOBAL per-bin magnitude sums
+
+fn _hog_compute_cell_histograms(data_ptr, width, height, cells_x, cells_y, cell_size, num_bins) {
+    // Allocate cells_x * cells_y per-cell histograms (each num_bins ints, zero-init).
+    let cell_hists = list_new()
+    let total_cells = int_mul(cells_x, cells_y)
+    let ci = 0
+    while ci < total_cells {
+        let h = list_new()
+        let b = 0
+        while b < num_bins {
+            push(h, 0)
+            b = int_add(b, 1)
+        }
+        push(cell_hists, h)
+        ci = int_add(ci, 1)
+    }
+    // Global per-bin accumulator (for the dominant-bin atom).
+    let global_bin = list_new()
+    let gb = 0
+    while gb < num_bins {
+        push(global_bin, 0)
+        gb = int_add(gb, 1)
+    }
+    let mag_sum = 0
+    let mag_count = 0
+    // Walk interior pixels only; the outermost ring stays gradient 0.
+    let y = 1
+    while y < int_sub(height, 1) {
+        let row_above = int_mul(int_sub(y, 1), width)
+        let row_mid   = int_mul(y, width)
+        let row_below = int_mul(int_add(y, 1), width)
+        let x = 1
+        while x < int_sub(width, 1) {
+            let gx = int_sub(load8(data_ptr + row_mid + int_add(x, 1)),
+                             load8(data_ptr + row_mid + int_sub(x, 1)))
+            let gy = int_sub(load8(data_ptr + row_below + x),
+                             load8(data_ptr + row_above + x))
+            let ax = gx
+            if ax < 0 { ax = 0 - ax }
+            let ay = gy
+            if ay < 0 { ay = 0 - ay }
+            let mag = int_add(ax, ay)
+            mag_sum = int_add(mag_sum, mag)
+            mag_count = int_add(mag_count, 1)
+            if mag > 0 {
+                let bin = _hog_orient_bin(gx, gy, num_bins)
+                // Locate the owning cell. Pixel (x, y) belongs to cell
+                // (x / cell_size, y / cell_size). Clamp into bounds in
+                // case the image dimensions are not exact cell multiples.
+                let cx = x / cell_size
+                let cy = y / cell_size
+                if cx < cells_x {
+                    if cy < cells_y {
+                        let cell_idx = int_add(int_mul(cy, cells_x), cx)
+                        let h = cell_hists[cell_idx]
+                        list_set(h, bin, int_add(h[bin], mag))
+                        list_set(global_bin, bin,
+                                 int_add(global_bin[bin], mag))
+                    }
+                }
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    // Find the global dominant bin (argmax).
+    let dominant = 0 - 1
+    let best = 0 - 1
+    let bi = 0
+    while bi < num_bins {
+        let v = global_bin[bi]
+        if v > best {
+            best = v
+            dominant = bi
+        }
+        bi = int_add(bi, 1)
+    }
+    let out = list_new()
+    push(out, cell_hists)
+    push(out, mag_sum)
+    push(out, mag_count)
+    push(out, dominant)
+    return out
+}
+
+// ---- block normalization (L2-Hys) ----------------------------------------
+//
+// Build one block descriptor: concatenate the 4 cell histograms of the
+// 2x2 block at (block_x, block_y), L2-normalize to HOG_L2_TARGET_MILLI,
+// clip every component at HOG_HYS_CAP_MILLI, and re-normalize.
+
+fn _hog_block_descriptor(cell_hists, cells_x, block_x, block_y, num_bins) {
+    let block_len = int_mul(HOG_BLOCK_CELLS, num_bins)
+    let block = list_new()
+    // Concatenate the 4 cell histograms in row-major scan order.
+    let dy = 0
+    while dy < HOG_BLOCK_CELLS_PER_AXIS {
+        let cy = int_add(block_y, dy)
+        let dx = 0
+        while dx < HOG_BLOCK_CELLS_PER_AXIS {
+            let cx = int_add(block_x, dx)
+            let cell_idx = int_add(int_mul(cy, cells_x), cx)
+            let h = cell_hists[cell_idx]
+            let b = 0
+            while b < num_bins {
+                push(block, h[b])
+                b = int_add(b, 1)
+            }
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    // L2 norm (over the RAW magnitudes).
+    let sum_sq = 0
+    let i = 0
+    while i < block_len {
+        let v = block[i]
+        sum_sq = int_add(sum_sq, int_mul(v, v))
+        i = int_add(i, 1)
+    }
+    let norm = _hog_isqrt(sum_sq)
+    if norm <= 0 {
+        // All-zero block (uniform region). Leave at zeros.
+        return block
+    }
+    // Scale to L2 = HOG_L2_TARGET_MILLI.
+    let j = 0
+    while j < block_len {
+        let scaled = int_mul(block[j], HOG_L2_TARGET_MILLI) / norm
+        list_set(block, j, scaled)
+        j = int_add(j, 1)
+    }
+    // L2-Hys: clip every component at HOG_HYS_CAP_MILLI.
+    let k = 0
+    let any_clipped = 0
+    while k < block_len {
+        if block[k] > HOG_HYS_CAP_MILLI {
+            list_set(block, k, HOG_HYS_CAP_MILLI)
+            any_clipped = 1
+        }
+        k = int_add(k, 1)
+    }
+    if any_clipped == 1 {
+        // Re-normalize after the clip.
+        let sum_sq2 = 0
+        let p = 0
+        while p < block_len {
+            let v = block[p]
+            sum_sq2 = int_add(sum_sq2, int_mul(v, v))
+            p = int_add(p, 1)
+        }
+        let norm2 = _hog_isqrt(sum_sq2)
+        if norm2 > 0 {
+            let q = 0
+            while q < block_len {
+                let scaled = int_mul(block[q], HOG_L2_TARGET_MILLI) / norm2
+                list_set(block, q, scaled)
+                q = int_add(q, 1)
+            }
+        }
+        // Final clamp pass. Re-normalization can push a few components
+        // back above the cap (especially if many were originally clipped:
+        // the new norm is smaller, and the unclipped components scale
+        // up). The Dalal-Triggs paper just accepts this; we apply a
+        // FINAL CAP without a second renorm so the documented invariant
+        // "no bin > 200 milli" holds for downstream callers. The
+        // post-final-clip sum_sq is at MOST the post-renorm sum_sq, so
+        // the descriptor stays close to (but not exactly equal to) the
+        // L2 target. The unit test allows the [500k, 1.1M] band for the
+        // sum-of-squares to absorb this slack.
+        let f = 0
+        while f < block_len {
+            if block[f] > HOG_HYS_CAP_MILLI {
+                list_set(block, f, HOG_HYS_CAP_MILLI)
+            }
+            f = int_add(f, 1)
+        }
+    }
+    return block
+}
+
+// ---- arg validation -------------------------------------------------------
+
+fn _hog_cell_size_ok(cs) {
+    if cs == 4  { return 1 }
+    if cs == 8  { return 1 }
+    if cs == 16 { return 1 }
+    return 0
+}
+
+fn _hog_num_bins_ok(nb) {
+    if nb == 6  { return 1 }
+    if nb == 9  { return 1 }
+    if nb == 12 { return 1 }
+    return 0
+}
+
+// ---- public: hog_compute --------------------------------------------------
+
+fn hog_compute(image, width, height, cell_size, num_bins) {
+    if image == 0  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if width <= 0  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if height <= 0 { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if width > HOG_MAX_DIM  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if height > HOG_MAX_DIM { return _hog_empty_result(width, height, cell_size, num_bins) }
+    let area = int_mul(width, height)
+    if area > HOG_MAX_AREA { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if _hog_cell_size_ok(cell_size) == 0 {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    if _hog_num_bins_ok(num_bins) == 0 {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    let cells_x = width  / cell_size
+    let cells_y = height / cell_size
+    // We need at least 2 cells per axis for one block; the block grid is
+    // (cells_x - 1) x (cells_y - 1) at stride 1.
+    if cells_x < HOG_BLOCK_CELLS_PER_AXIS {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    if cells_y < HOG_BLOCK_CELLS_PER_AXIS {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    // 1. + 2. + 3. -- per-pixel gradient pass + cell histograms.
+    let cell_pass = _hog_compute_cell_histograms(image, width, height,
+                                                  cells_x, cells_y,
+                                                  cell_size, num_bins)
+    let cell_hists = cell_pass[0]
+    let mag_sum    = cell_pass[1]
+    let mag_count  = cell_pass[2]
+    let dominant   = cell_pass[3]
+    let mag_mean = 0
+    if mag_count > 0 { mag_mean = mag_sum / mag_count }
+    // 4. + 5. -- block normalization + concatenation.
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    // (cells_x - 1) and (cells_y - 1) for a 2x2 block layout at stride 1.
+    let descriptor = list_new()
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            let bi = 0
+            let block_len = len(block)
+            while bi < block_len {
+                push(descriptor, block[bi])
+                bi = int_add(bi, 1)
+            }
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    // Assemble result tuple.
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, cell_size)
+    push(r, num_bins)
+    push(r, cells_x)
+    push(r, cells_y)
+    push(r, blocks_x)
+    push(r, blocks_y)
+    push(r, cell_hists)
+    push(r, descriptor)
+    push(r, dominant)
+    push(r, mag_mean)
+    return r
+}
+
+// ---- public: hog_compute_default ------------------------------------------
+
+fn hog_compute_default(image, width, height) {
+    return hog_compute(image, width, height, HOG_CELL_DEFAULT, HOG_BINS_DEFAULT)
+}
+
+// ---- public: descriptor + cell-histogram accessors -----------------------
+
+fn hog_descriptor(result) {
+    return result[HOG_R_DESCRIPTOR]
+}
+
+// hog_cell_histogram(result, cx, cy) -- return the per-cell histogram at
+// the cell-grid coordinate (cx, cy). Returns the empty list (sentinel)
+// for any out-of-bounds query so the caller can distinguish a degenerate
+// query from a valid all-zero cell (which would return a num_bins list
+// of zeros).
+fn hog_cell_histogram(result, cx, cy) {
+    if cx < 0 { return list_new() }
+    if cy < 0 { return list_new() }
+    let cells_x = result[HOG_R_CELLS_X]
+    let cells_y = result[HOG_R_CELLS_Y]
+    if cx >= cells_x { return list_new() }
+    if cy >= cells_y { return list_new() }
+    let cell_hists = result[HOG_R_CELL_HISTS]
+    let idx = int_add(int_mul(cy, cells_x), cx)
+    if idx < 0 { return list_new() }
+    if idx >= len(cell_hists) { return list_new() }
+    return cell_hists[idx]
+}
+
+// ---- public: hog_compare (L1 distance between two HOG vectors) -----------
+//
+// We use L1 distance (sum of absolute differences) over the
+// concatenated, normalized block descriptors. The components are in
+// milli-units (max ~200 after the L2-Hys cap) so the L1 sum is bounded
+// by 2 * 200 * len(vector). For the 32x32 default fixture
+// (3x3 blocks x 36 = 324 ints) the max L1 distance is ~130K milli.
+//
+// Returns -1 if the lengths differ (incompatible inputs). 0 for
+// identical descriptors. Larger -> more different.
+
+fn hog_compare(hog_a, hog_b) {
+    let va = hog_descriptor(hog_a)
+    let vb = hog_descriptor(hog_b)
+    let na = len(va)
+    let nb = len(vb)
+    if na != nb { return 0 - 1 }
+    let sum = 0
+    let i = 0
+    while i < na {
+        let d = int_sub(va[i], vb[i])
+        if d < 0 { d = 0 - d }
+        sum = int_add(sum, d)
+        i = int_add(i, 1)
+    }
+    return sum
+}
+
+// ---- result-tuple accessors ----------------------------------------------
+
+fn hog_result_width(r)         { return r[HOG_R_WIDTH] }
+fn hog_result_height(r)        { return r[HOG_R_HEIGHT] }
+fn hog_result_cell_size(r)     { return r[HOG_R_CELL_SIZE] }
+fn hog_result_num_bins(r)      { return r[HOG_R_NUM_BINS] }
+fn hog_result_cells_x(r)       { return r[HOG_R_CELLS_X] }
+fn hog_result_cells_y(r)       { return r[HOG_R_CELLS_Y] }
+fn hog_result_blocks_x(r)      { return r[HOG_R_BLOCKS_X] }
+fn hog_result_blocks_y(r)      { return r[HOG_R_BLOCKS_Y] }
+fn hog_result_dominant_bin(r)  { return r[HOG_R_DOMINANT_BIN] }
+fn hog_result_magnitude_mean(r){ return r[HOG_R_MAG_MEAN] }
+fn hog_result_descriptor_size(r) { return len(r[HOG_R_DESCRIPTOR]) }
+fn hog_result_cell_count(r)    { return len(r[HOG_R_CELL_HISTS]) }
+
+// ---- structural-feature labels for visual_perception --------------------
+//
+// Bucket the descriptor size into small / medium / large so the
+// perception path can emit an `image_hog_descriptor_size_*` atom that
+// is stable across multiple images at the same dimensions.
+
+let HOG_SIZE_SMALL_MAX  = 200      // ~ 4x4 blocks * 36 bins / 2
+let HOG_SIZE_MEDIUM_MAX = 1000     // ~ 8x4 blocks
+
+fn hog_descriptor_size_label(size) {
+    if size <= HOG_SIZE_SMALL_MAX  { return "image_hog_descriptor_size_small" }
+    if size <= HOG_SIZE_MEDIUM_MAX { return "image_hog_descriptor_size_medium" }
+    return "image_hog_descriptor_size_large"
+}
+
+// Dominant-bin atom: `image_hog_dominant_bin_<0..N-1>`. Each bin covers
+// 180/num_bins degrees of UNSIGNED orientation. For the default 9-bin
+// histogram: bin 0 ~= horizontal, bin 4 ~= vertical, with bins 1-3 the
+// upper-right diagonals and bins 5-8 the upper-left diagonals.
+fn hog_dominant_bin_label(bin) {
+    if bin < 0 { return "image_hog_dominant_bin_none" }
+    if bin == 0 { return "image_hog_dominant_bin_0" }
+    if bin == 1 { return "image_hog_dominant_bin_1" }
+    if bin == 2 { return "image_hog_dominant_bin_2" }
+    if bin == 3 { return "image_hog_dominant_bin_3" }
+    if bin == 4 { return "image_hog_dominant_bin_4" }
+    if bin == 5 { return "image_hog_dominant_bin_5" }
+    if bin == 6 { return "image_hog_dominant_bin_6" }
+    if bin == 7 { return "image_hog_dominant_bin_7" }
+    if bin == 8 { return "image_hog_dominant_bin_8" }
+    if bin == 9 { return "image_hog_dominant_bin_9" }
+    if bin == 10 { return "image_hog_dominant_bin_10" }
+    if bin == 11 { return "image_hog_dominant_bin_11" }
+    return "image_hog_dominant_bin_none"
+}
+
+// ---- R21D: integral histogram of gradients --------------------------------
+//
+// Acceleration of the per-cell histogram aggregation step (step 3 of the
+// Dalal-Triggs pipeline) via a precomputed INTEGRAL HISTOGRAM:
+//
+//     IH(x, y, bin) = sum over pixels (i, j) with i in [0..x] and
+//                     j in [0..y] of (mag(i, j) if bin(i, j) == bin else 0)
+//
+// Any cell's bin total then becomes a four-corner rectangle sum on the
+// per-bin integral image:
+//
+//     cell_hist[bin] = IH(x2, y2, bin)
+//                    - IH(x1-1, y2, bin)
+//                    - IH(x2, y1-1, bin)
+//                    + IH(x1-1, y1-1, bin)
+//
+// The scalar path costs O(WIN_W * WIN_H) per cell summed (a 64-pixel
+// 8x8 cell with 9 bins = 64 adds across the per-pixel loop). The
+// integral-histogram path costs O(NUM_BINS * 4) lookups per cell once
+// the per-bin integral images are built. The build cost is itself
+// O(W * H * NUM_BINS) -- one extra pass over the image per bin -- so
+// the cross-over point sits around the first time you call the cell-
+// histogram aggregator more than once at the same image resolution
+// (e.g. a sliding-window detector evaluating many overlapping windows
+// at the same scale, which is exactly R15C's hot path).
+//
+// BIT-IDENTICAL CONTRACT: this path produces THE SAME per-cell histogram
+// values as the scalar path. The same gradient direction, the same
+// orientation bin, the same magnitude. The only thing that changes is
+// the order of summation -- and we sum the SAME integer values in the
+// SAME bin slots, so the integer arithmetic is reordering-safe.
+//
+// Pixel-ownership exactly mirrors the scalar path:
+//   - Interior loop bounds: y in [1, h-2], x in [1, w-2] (outer ring
+//     contributes nothing -- the central differences read out of bounds).
+//   - Cell ownership: cx = x / cell_size, cy = y / cell_size (truncating
+//     integer division). The same clamps to (cells_x, cells_y) gate
+//     fractional-cell pixels at the right/bottom borders if the image
+//     dimensions are not exact cell multiples.
+//
+// PUBLIC API (opt-in via CE_HOG_INTEGRAL=on by default OFF):
+//   hog_compute_integral(image, w, h, cell_size, num_bins) -> hog_result
+//   hog_compute_integral_default(image, w, h) -> hog_result
+//
+// The opt-in env var lets the scalar path stay default until further
+// validation; the bit-identical contract is enforced by the unit suite
+// (test_hog_integral) on every fixture R14D's test_image_hog uses.
+//
+// Memory: W*H*NUM_BINS int64 cells. For the canonical 64x128 Dalal-
+// Triggs window with 9 bins: 64*128*9*8 = 589,824 bytes (~576 KB).
+// For the 32x32 default fixture with 9 bins: 32*32*9*8 = 73,728 bytes.
+// Within the HOG_MAX_AREA = 65,536 cap, the worst case is
+// 65,536 * 12 * 8 = 6.3 MB which is fine for the substrate's flat
+// arena.
+
+// _hog_ih_idx: (x, y, bin) -> integer index into the integral-histogram
+// buffer, laid out [num_bins][height][width] (bin-major so the inner
+// integral build pass walks contiguous pixels).
+fn _hog_ih_idx(x, y, w, h, bin) {
+    let plane = int_mul(int_mul(bin, h), w)
+    return int_add(plane, int_add(int_mul(y, w), x))
+}
+
+fn _hog_ih_get(ih, x, y, w, h, bin) {
+    return load64(int_add(ih, int_mul(_hog_ih_idx(x, y, w, h, bin), 8)))
+}
+
+fn _hog_ih_set(ih, x, y, w, h, bin, v) {
+    store64(int_add(ih, int_mul(_hog_ih_idx(x, y, w, h, bin), 8)), v)
+}
+
+// _hog_ih_rect_sum: standard four-corner integral rectangle sum for the
+// inclusive rectangle [x1..x2] x [y1..y2] on the per-bin integral plane.
+// Returns 0 if the rectangle is degenerate (no pixels selected).
+fn _hog_ih_rect_sum(ih, w, h, bin, x1, y1, x2, y2) {
+    if x1 > x2 { return 0 }
+    if y1 > y2 { return 0 }
+    if x2 < 0 { return 0 }
+    if y2 < 0 { return 0 }
+    if x1 >= w { return 0 }
+    if y1 >= h { return 0 }
+    if x1 < 0 { x1 = 0 }
+    if y1 < 0 { y1 = 0 }
+    if x2 >= w { x2 = int_sub(w, 1) }
+    if y2 >= h { y2 = int_sub(h, 1) }
+    let a = _hog_ih_get(ih, x2, y2, w, h, bin)
+    let b = 0
+    if x1 > 0 { b = _hog_ih_get(ih, int_sub(x1, 1), y2, w, h, bin) }
+    let c = 0
+    if y1 > 0 { c = _hog_ih_get(ih, x2, int_sub(y1, 1), w, h, bin) }
+    let d = 0
+    if x1 > 0 {
+        if y1 > 0 {
+            d = _hog_ih_get(ih, int_sub(x1, 1), int_sub(y1, 1), w, h, bin)
+        }
+    }
+    return int_add(int_sub(int_sub(a, b), c), d)
+}
+
+// _hog_build_integral_histogram: returns an opaque integral-histogram
+// buffer [num_bins][h][w] of int64 cumulative bin counts. Magnitude is
+// applied at the per-pixel store (so bin b's plane holds cumulative
+// magnitude where pixel's bin == b, zero elsewhere). The outer interior-
+// loop bounds (y in [1, h-2], x in [1, w-2]) exactly match the scalar
+// path; border pixels contribute zero (no central difference available).
+// Also returns the per-pixel mag_sum, mag_count, and global dominant bin
+// so the caller can populate the result tuple identically to the scalar
+// path.
+//
+// Returns [ih_ptr, mag_sum, mag_count, dominant_bin].
+fn _hog_build_integral_histogram(image, w, h, num_bins) {
+    // Allocate a (w * h * num_bins) int64 buffer, zero-initialized.
+    let total_cells = int_mul(int_mul(w, h), num_bins)
+    let bytes = int_mul(total_cells, 8)
+    let ih = alloc(int_add(bytes, 8))
+    // Zero-fill (alloc may not guarantee zeroes on every NOVA target;
+    // explicit init keeps the integral semantics correct).
+    let zi = 0
+    while zi < total_cells {
+        store64(int_add(ih, int_mul(zi, 8)), 0)
+        zi = int_add(zi, 1)
+    }
+    // Per-bin global accumulator for the dominant-bin atom.
+    let global_bin = list_new()
+    let gb = 0
+    while gb < num_bins {
+        push(global_bin, 0)
+        gb = int_add(gb, 1)
+    }
+    let mag_sum = 0
+    let mag_count = 0
+    // ---- Pass 1: per-pixel (mag, bin) sparse store into the integral
+    // raw buffer (ih[bin][y][x] = mag if pixel's bin == bin, else 0).
+    // We MUST track the pixel count over the FULL interior rectangle
+    // (y in [1, h-2], x in [1, w-2]) to match the scalar path's
+    // mag_count exactly.
+    let y = 1
+    while y < int_sub(h, 1) {
+        let row_above = int_mul(int_sub(y, 1), w)
+        let row_mid   = int_mul(y, w)
+        let row_below = int_mul(int_add(y, 1), w)
+        let x = 1
+        while x < int_sub(w, 1) {
+            let gx = int_sub(load8(image + row_mid + int_add(x, 1)),
+                             load8(image + row_mid + int_sub(x, 1)))
+            let gy = int_sub(load8(image + row_below + x),
+                             load8(image + row_above + x))
+            let ax = gx
+            if ax < 0 { ax = 0 - ax }
+            let ay = gy
+            if ay < 0 { ay = 0 - ay }
+            let mag = int_add(ax, ay)
+            mag_sum = int_add(mag_sum, mag)
+            mag_count = int_add(mag_count, 1)
+            if mag > 0 {
+                let bin = _hog_orient_bin(gx, gy, num_bins)
+                _hog_ih_set(ih, x, y, w, h, bin, mag)
+                list_set(global_bin, bin,
+                         int_add(global_bin[bin], mag))
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    // ---- Pass 2: integrate each per-bin plane in place using the
+    // standard row-then-column cumulative recurrence:
+    //   I(x, y) = raw(x, y) + I(x-1, y) + I(x, y-1) - I(x-1, y-1)
+    // (with I(-1, *) = I(*, -1) = 0). We do this per bin so the
+    // cumulative magnitude planes are independent.
+    let b = 0
+    while b < num_bins {
+        // First row: left-to-right cumulative sum.
+        let row_acc = 0
+        let xa = 0
+        while xa < w {
+            let v0 = _hog_ih_get(ih, xa, 0, w, h, b)
+            row_acc = int_add(row_acc, v0)
+            _hog_ih_set(ih, xa, 0, w, h, b, row_acc)
+            xa = int_add(xa, 1)
+        }
+        // Remaining rows: row-cumulative-sum + carry-from-above.
+        let yy = 1
+        while yy < h {
+            let row_sum = 0
+            let xx = 0
+            while xx < w {
+                let cur = _hog_ih_get(ih, xx, yy, w, h, b)
+                row_sum = int_add(row_sum, cur)
+                let above = _hog_ih_get(ih, xx, int_sub(yy, 1), w, h, b)
+                _hog_ih_set(ih, xx, yy, w, h, b,
+                            int_add(above, row_sum))
+                xx = int_add(xx, 1)
+            }
+            yy = int_add(yy, 1)
+        }
+        b = int_add(b, 1)
+    }
+    // Find the global dominant bin (argmax). Matches the scalar path
+    // exactly because we accumulate into the same global_bin list.
+    let dominant = 0 - 1
+    let best = 0 - 1
+    let bi = 0
+    while bi < num_bins {
+        let v = global_bin[bi]
+        if v > best {
+            best = v
+            dominant = bi
+        }
+        bi = int_add(bi, 1)
+    }
+    let out = list_new()
+    push(out, ih)
+    push(out, mag_sum)
+    push(out, mag_count)
+    push(out, dominant)
+    return out
+}
+
+// _hog_cell_histograms_from_integral: walk every (cx, cy) cell and
+// fetch its NUM_BINS bin counts via 4 integral lookups per bin. The
+// per-cell rectangle is the same one the scalar path would have
+// accumulated over: pixels with cx == x / cell_size AND
+// 1 <= x < width - 1 AND 1 <= y < height - 1.
+//
+// For cell (cx, cy) with cell_size cs, the natural rectangle is
+//   x1 = cx * cs,  y1 = cy * cs
+//   x2 = (cx + 1) * cs - 1,  y2 = (cy + 1) * cs - 1
+// Clamp to the scalar-path's interior bounds:
+//   x1 = max(x1, 1), x2 = min(x2, w - 2)
+//   y1 = max(y1, 1), y2 = min(y2, h - 2)
+// (The outer-ring pixels contribute zero to the integral planes
+// because the scalar build pass skipped them, so even an unclamped
+// rectangle would give the same answer -- but the explicit clamp
+// keeps the code readable and matches the documented contract.)
+fn _hog_cell_histograms_from_integral(ih, w, h, cells_x, cells_y,
+                                      cell_size, num_bins) {
+    let cell_hists = list_new()
+    let cy = 0
+    while cy < cells_y {
+        let y1 = int_mul(cy, cell_size)
+        let y2 = int_sub(int_mul(int_add(cy, 1), cell_size), 1)
+        if y1 < 1 { y1 = 1 }
+        if y2 > int_sub(h, 2) { y2 = int_sub(h, 2) }
+        let cx = 0
+        while cx < cells_x {
+            let x1 = int_mul(cx, cell_size)
+            let x2 = int_sub(int_mul(int_add(cx, 1), cell_size), 1)
+            if x1 < 1 { x1 = 1 }
+            if x2 > int_sub(w, 2) { x2 = int_sub(w, 2) }
+            let hist = list_new()
+            let b = 0
+            while b < num_bins {
+                let s = _hog_ih_rect_sum(ih, w, h, b, x1, y1, x2, y2)
+                push(hist, s)
+                b = int_add(b, 1)
+            }
+            push(cell_hists, hist)
+            cx = int_add(cx, 1)
+        }
+        cy = int_add(cy, 1)
+    }
+    return cell_hists
+}
+
+// _hog_integral_enabled() -> 1 if CE_HOG_INTEGRAL env var is set to
+//   "on"/"1"/"yes" (default OFF; explicit opt-in until the bit-identical
+//   contract has been validated against more end-to-end fixtures).
+//   Mirrors the R15A opt-in pattern for u8 SIMD.
+fn _hog_integral_enabled() {
+    let env = getenv("CE_HOG_INTEGRAL")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// hog_compute_integral: public API. Same contract as hog_compute --
+// returns the same hog_result tuple -- but the per-cell histogram
+// aggregation step uses the integral-histogram path. All validation
+// and downstream block-normalization is reused verbatim. Bit-identical
+// output to hog_compute on every fixture (asserted in
+// tests/unit/test_hog_integral.nova).
+fn hog_compute_integral(image, width, height, cell_size, num_bins) {
+    if image == 0  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if width <= 0  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if height <= 0 { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if width > HOG_MAX_DIM  { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if height > HOG_MAX_DIM { return _hog_empty_result(width, height, cell_size, num_bins) }
+    let area = int_mul(width, height)
+    if area > HOG_MAX_AREA { return _hog_empty_result(width, height, cell_size, num_bins) }
+    if _hog_cell_size_ok(cell_size) == 0 {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    if _hog_num_bins_ok(num_bins) == 0 {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    let cells_x = width  / cell_size
+    let cells_y = height / cell_size
+    if cells_x < HOG_BLOCK_CELLS_PER_AXIS {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    if cells_y < HOG_BLOCK_CELLS_PER_AXIS {
+        return _hog_empty_result(width, height, cell_size, num_bins)
+    }
+    // 1. + 2. -- per-pixel gradient pass folded into the integral
+    // histogram build.
+    let ih_pass = _hog_build_integral_histogram(image, width, height, num_bins)
+    let ih         = ih_pass[0]
+    let mag_sum    = ih_pass[1]
+    let mag_count  = ih_pass[2]
+    let dominant   = ih_pass[3]
+    // 3. -- per-cell histograms via 4 integral lookups per bin.
+    let cell_hists = _hog_cell_histograms_from_integral(ih, width, height,
+                                                        cells_x, cells_y,
+                                                        cell_size, num_bins)
+    let mag_mean = 0
+    if mag_count > 0 { mag_mean = mag_sum / mag_count }
+    // 4. + 5. -- identical block normalization to the scalar path
+    // (reuses _hog_block_descriptor).
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let descriptor = list_new()
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            let bi = 0
+            let block_len = len(block)
+            while bi < block_len {
+                push(descriptor, block[bi])
+                bi = int_add(bi, 1)
+            }
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    let r = list_new()
+    push(r, width)
+    push(r, height)
+    push(r, cell_size)
+    push(r, num_bins)
+    push(r, cells_x)
+    push(r, cells_y)
+    push(r, blocks_x)
+    push(r, blocks_y)
+    push(r, cell_hists)
+    push(r, descriptor)
+    push(r, dominant)
+    push(r, mag_mean)
+    return r
+}
+
+// hog_compute_integral_default: convenience wrapper at the default
+// cell_size/num_bins.
+fn hog_compute_integral_default(image, width, height) {
+    return hog_compute_integral(image, width, height,
+                                HOG_CELL_DEFAULT, HOG_BINS_DEFAULT)
+}
+
+// ---- chat-orchestration helper -------------------------------------------
+//
+// hog_pgm_args(arg) -> formatted result string for the chat /hog admin
+// command. arg is everything after `/hog ` (a single PGM path).
+//
+// Output shapes:
+//   (/hog needs a PATH -- usage: /hog /tmp/test.pgm)
+//   (hog FAILED on PATH: <pgm parser error>)
+//   (hog FAILED: image too small -- need >= 16x16 for 2x2 blocks of 8x8 cells)
+//   (hog WxH cells=<N> dominant_bin=<K> magnitude_mean=<M>)
+
+let HOG_CHAT_MIN_DIM = 16          // 2 cells of 8 pixels each
+
+fn hog_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/hog needs a PATH -- usage: /hog /tmp/test.pgm)"
+    }
+    let r_p = pgm_parse_file(arg)
+    let err = pgm_result_error(r_p)
+    if len(err) > 0 {
+        return "(hog FAILED on " + arg + ": " + err + ")"
+    }
+    let w = pgm_result_width(r_p)
+    let h = pgm_result_height(r_p)
+    let data = pgm_result_data(r_p)
+    if w < HOG_CHAT_MIN_DIM {
+        return "(hog FAILED: image too small -- need >= 16x16 for 2x2 blocks of 8x8 cells)"
+    }
+    if h < HOG_CHAT_MIN_DIM {
+        return "(hog FAILED: image too small -- need >= 16x16 for 2x2 blocks of 8x8 cells)"
+    }
+    if w > HOG_MAX_DIM {
+        return "(hog FAILED: width " + int_to_str(w)
+            + " > " + int_to_str(HOG_MAX_DIM) + " cap; downsample first)"
+    }
+    if h > HOG_MAX_DIM {
+        return "(hog FAILED: height " + int_to_str(h)
+            + " > " + int_to_str(HOG_MAX_DIM) + " cap; downsample first)"
+    }
+    let r = hog_compute_default(data, w, h)
+    let cells = hog_result_cell_count(r)
+    let dom   = hog_result_dominant_bin(r)
+    let mag   = hog_result_magnitude_mean(r)
+    return "(hog " + int_to_str(w) + "x" + int_to_str(h)
+        + " cells=" + int_to_str(cells)
+        + " dominant_bin=" + int_to_str(dom)
+        + " magnitude_mean=" + int_to_str(mag) + ")"
+}

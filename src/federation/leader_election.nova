@@ -1,0 +1,570 @@
+// CrossEngin federation: Bully leader election on top of R18E gossip mesh.
+//
+// Purpose
+//   R19E. R18E ships SWIM-style gossip for peer discovery + KG delta
+//   propagation. The remaining federation primitive: AGREE on a SINGLE
+//   coordinator for tasks that need linearizability (monotonic ID
+//   generation, distributed event ordering, single-writer schemas).
+//   This module ships that piece as Garcia-Molina's Bully algorithm
+//   (1982), simplified for small meshes.
+//
+// Why Bully (and not Raft / Paxos)
+//
+//   The use case is "pick ONE coordinator from the live peer set" --
+//   not "agree on a replicated log." Bully matches that surface:
+//
+//     * No log replication, no term management, no quorum count.
+//     * State is a single integer (`current_leader_id`) + an election
+//       flag.
+//     * Convergence on a stable mesh: ONE election round.
+//     * Convergence on a stable mesh after leader-failure: ONE round
+//       after gossip marks the leader DEAD.
+//     * Worst-case message count: O(N^2) (every soul sends ELECTION to
+//       every higher-ID peer), acceptable for the N <= 16 federation
+//       sizes CrossEngin targets.
+//
+//   Raft would be the right call when we need to order WRITES across
+//   replicas (e.g. shared snapshot append). For "elect a coordinator"
+//   it is overkill, would add ~1500 lines, and would couple the
+//   federation layer to a log-and-term abstraction that nothing else
+//   in the tree needs.
+//
+// Algorithm
+//
+//   1. Each soul has a numeric `self_id` (typically the hash of its
+//      R7C Noise XK static pubkey -- stable across reboots).
+//   2. Each soul knows its peers via R18E gossip: `gossip_alive_peers`
+//      returns the addrs whose status is ALIVE. The leader-election
+//      module maintains a separate `addr -> id` mapping (registered
+//      by the daemon at bootstrap time), so the LE state machine
+//      operates entirely on IDs.
+//   3. Bully election sequence (initiated by `le_start_election`):
+//        a. The initiator transitions to LE_STATE_ELECTING and stamps
+//           `election_started_ns = nanotime()`.
+//        b. The initiator sends ELECTION to every peer whose ID is
+//           HIGHER than self_id (modeled here as a deferred message
+//           list; the daemon drains it onto whatever transport it owns).
+//        c. Any higher-ID peer that receives ELECTION responds with
+//           OK and starts its own election (transitioning to ELECTING
+//           if not already).
+//        d. The initiator waits up to `election_timeout_ns` (default
+//           2 * gossip ping interval) for an OK message.
+//        e. If NO OK arrives in the window: the initiator is the
+//           highest-alive ID -> broadcasts VICTORY to all lower-ID
+//           peers, sets `current_leader_id = self_id`, transitions
+//           to LE_STATE_STABLE.
+//        f. If an OK arrives: the initiator suppresses its own
+//           VICTORY (a higher-ID peer will take over) and waits for
+//           a VICTORY from someone with a higher ID. Timeout on
+//           VICTORY restarts the election.
+//   4. VICTORY handler: any soul that receives VICTORY sets
+//      `current_leader_id = sender_id`, transitions to STABLE.
+//   5. Leader-death detection: every `le_step` checks whether
+//      `current_leader_id` is still in the alive-peer set (or is
+//      self). If not, kicks off a fresh election via
+//      `le_start_election`.
+//
+// Public API
+//
+//   le_init(gossip_state, self_id) -> le_state_t
+//   le_current_leader(state)       -> int_id | -1     (-1 = no leader / electing)
+//   le_is_leader(state)            -> 1 if self_id == current_leader, else 0
+//   le_step(state)                 -> updated state (called every tick)
+//   le_force_election(state)       -> updated state (admin trigger)
+//
+// Helpers exercised by unit tests
+//
+//   le_register_peer(state, addr, id)         -> updated state
+//   le_unregister_peer(state, addr)           -> updated state
+//   le_peer_id_for_addr(state, addr)          -> id | -1
+//   le_alive_peer_ids(state)                  -> list of int IDs from gossip
+//   le_on_election(state, from_id)            -> handle inbound ELECTION
+//   le_on_ok(state, from_id)                  -> handle inbound OK
+//   le_on_victory(state, from_id)             -> handle inbound VICTORY
+//   le_start_election(state)                  -> kick off bully election
+//   le_election_state(state)                  -> LE_STATE_STABLE | _ELECTING
+//   le_pending_message_count(state)           -> # deferred outbound messages
+//   le_drain_pending(state)                   -> list of [to_id, kind] pairs
+//   le_status_line(state)                     -> one-line summary for /leader
+//
+// ADRs: registers ADR-0079 (federation leader election via Bully).
+// NOVA dependencies: list_new, push, len, nanotime, int_to_str, str_eq,
+//   list indexing. CrossEngin dependencies: src/federation/gossip.nova
+//   (read-only -- uses gossip_alive_peers + gossip_self_addr).
+
+import "std/io"
+import "./gossip.nova"
+
+// ---- protocol constants --------------------------------------------------
+
+// Election state values. Distinct ints so the wire encoding (and the
+// /leader status line) can stringify them without collision.
+let LE_STATE_STABLE   = 0   // current_leader_id is authoritative
+let LE_STATE_ELECTING = 1   // election in flight; current_leader_id is -1
+
+// Bully message kinds. The leader-election state machine emits
+// (to_id, kind) pairs into a `pending_messages` queue; the daemon
+// drains the queue and translates each pair onto whatever transport
+// it owns (kg_sync v3 channel, gossip piggyback, etc.). Keeping the
+// state machine independent of the transport mirrors how gossip
+// keeps its state machine independent of socket I/O.
+let LE_MSG_ELECTION = 1
+let LE_MSG_OK       = 2
+let LE_MSG_VICTORY  = 3
+
+// Sentinel for "no leader" (either at bootstrap or during an election).
+let LE_NO_LEADER    = -1
+
+// Default election timeout: 2x the gossip ping interval. After this
+// long without an OK response, the initiator declares itself winner.
+// Long enough to cover one full ping round; short enough that a 5s
+// integration scenario can observe convergence.
+let LE_DEFAULT_TIMEOUT_MS = 2000
+
+// ---- peer-id-map record indices ------------------------------------------
+let LE_PM_ADDR = 0
+let LE_PM_ID   = 1
+
+// ---- pending-message record indices --------------------------------------
+let LE_PEND_TO_ID = 0
+let LE_PEND_KIND  = 1
+
+// ---- le_state_t record indices -------------------------------------------
+let LE_S_GOSSIP            = 0  // ref to gossip state (read-only use)
+let LE_S_SELF_ID           = 1  // this soul's numeric id
+let LE_S_LEADER_ID         = 2  // current_leader_id, -1 == none
+let LE_S_ELECTION_STATE    = 3  // LE_STATE_STABLE | _ELECTING
+let LE_S_ELECTION_START_NS = 4  // when current election kicked off (nanotime)
+let LE_S_TIMEOUT_NS        = 5  // election timeout (nanotime span)
+let LE_S_PEER_MAP          = 6  // list of [addr, id]
+let LE_S_PENDING           = 7  // list of [to_id, kind]
+let LE_S_GOT_OK            = 8  // 1 if any higher-ID peer OKed this election
+let LE_S_STATS_ELECTIONS   = 9  // counter: # elections initiated
+let LE_S_STATS_VICTORIES   = 10 // counter: # times we won
+let LE_S_STATS_DEPOSED     = 11 // counter: # times we yielded to a higher-ID
+
+// ---- state constructor ---------------------------------------------------
+
+fn le_init(gossip_state, self_id) {
+    let st = list_new()
+    push(st, gossip_state)                              // S_GOSSIP
+    push(st, self_id)                                   // S_SELF_ID
+    push(st, LE_NO_LEADER)                              // S_LEADER_ID
+    push(st, LE_STATE_STABLE)                           // S_ELECTION_STATE
+    push(st, 0)                                         // S_ELECTION_START_NS
+    push(st, LE_DEFAULT_TIMEOUT_MS * 1000000)           // S_TIMEOUT_NS
+    push(st, list_new())                                // S_PEER_MAP
+    push(st, list_new())                                // S_PENDING
+    push(st, 0)                                         // S_GOT_OK
+    push(st, 0)                                         // S_STATS_ELECTIONS
+    push(st, 0)                                         // S_STATS_VICTORIES
+    push(st, 0)                                         // S_STATS_DEPOSED
+    return st
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn le_self_id(state)          { return state[LE_S_SELF_ID] }
+fn le_current_leader(state)   { return state[LE_S_LEADER_ID] }
+fn le_election_state(state)   { return state[LE_S_ELECTION_STATE] }
+fn le_stats_elections(state)  { return state[LE_S_STATS_ELECTIONS] }
+fn le_stats_victories(state)  { return state[LE_S_STATS_VICTORIES] }
+fn le_stats_deposed(state)    { return state[LE_S_STATS_DEPOSED] }
+
+fn le_is_leader(state) {
+    if state[LE_S_LEADER_ID] == state[LE_S_SELF_ID] { return 1 }
+    return 0
+}
+
+// Tunable knob -- tests pin this so the unit tests run deterministically.
+fn le_set_timeout_ms(state, ms) {
+    state[LE_S_TIMEOUT_NS] = ms * 1000000
+    return state
+}
+
+// ---- peer-id map ---------------------------------------------------------
+
+// Find idx of addr in the addr->id mapping, or -1.
+fn _le_find_peer(state, addr) {
+    let m = state[LE_S_PEER_MAP]
+    let i = 0
+    while i < len(m) {
+        if str_eq(m[i][LE_PM_ADDR], addr) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Register a peer's numeric ID under its gossip addr. Idempotent: re-
+// registering the same addr overwrites the ID (operator may rotate
+// keys; the new pubkey hash takes precedence). The daemon calls this
+// once per peer at bootstrap and again whenever a peer rotates its
+// identity.
+fn le_register_peer(state, addr, id) {
+    let idx = _le_find_peer(state, addr)
+    if idx >= 0 {
+        state[LE_S_PEER_MAP][idx][LE_PM_ID] = id
+        return state
+    }
+    let rec = list_new()
+    push(rec, addr)
+    push(rec, id)
+    push(state[LE_S_PEER_MAP], rec)
+    return state
+}
+
+fn le_unregister_peer(state, addr) {
+    let idx = _le_find_peer(state, addr)
+    if idx < 0 { return state }
+    let m = state[LE_S_PEER_MAP]
+    let last = len(m) - 1
+    if idx != last { m[idx] = m[last] }
+    pop(m)
+    return state
+}
+
+fn le_peer_id_for_addr(state, addr) {
+    let idx = _le_find_peer(state, addr)
+    if idx < 0 { return -1 }
+    return state[LE_S_PEER_MAP][idx][LE_PM_ID]
+}
+
+fn le_peer_count(state) {
+    return len(state[LE_S_PEER_MAP])
+}
+
+// Return the list of numeric IDs corresponding to gossip's alive-peer
+// set. Used by the election step to decide who is a candidate. If the
+// gossip module is not wired (gossip == 0 in test helpers), returns
+// an empty list.
+fn le_alive_peer_ids(state) {
+    let out = list_new()
+    let gs = state[LE_S_GOSSIP]
+    if gs == 0 { return out }
+    let alive = gossip_alive_peers(gs)
+    let i = 0
+    while i < len(alive) {
+        let id = le_peer_id_for_addr(state, alive[i])
+        if id >= 0 { push(out, id) }
+        i = i + 1
+    }
+    return out
+}
+
+// Return the highest-ID peer (or self) in the alive set. Returns
+// self_id if the alive set contains no higher peer. This is the
+// "natural leader" of the current mesh -- the soul that Bully would
+// converge on if started from a clean slate.
+fn _le_highest_alive_or_self(state) {
+    let best = state[LE_S_SELF_ID]
+    let alive = le_alive_peer_ids(state)
+    let i = 0
+    while i < len(alive) {
+        if alive[i] > best { best = alive[i] }
+        i = i + 1
+    }
+    return best
+}
+
+// Like _le_highest_alive_or_self but also considers SUSPECT peers as
+// candidates. Used as a hedge against SWIM's known false-positive
+// case: when a peer is briefly stale-marked (no recent direct PING)
+// the suspicion sweep can promote it to SUSPECT even though it is
+// still responding to other peers' PINGs. Deferring to a SUSPECT
+// peer-as-leader is safe: if the peer really did die, the LE step
+// will detect the DEAD transition on the next tick and re-elect.
+// Returns self_id if no non-DEAD higher-ID peer exists.
+fn _le_highest_non_dead_or_self(state) {
+    let best = state[LE_S_SELF_ID]
+    let gs = state[LE_S_GOSSIP]
+    if gs == 0 { return best }
+    let peers = gossip_peer_table(gs)
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if p[GOSSIP_PE_STATUS] != GOSSIP_STATUS_DEAD {
+            let id = le_peer_id_for_addr(state, p[GOSSIP_PE_ADDR])
+            if id > best { best = id }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ---- pending-message queue (transport-agnostic outbox) ------------------
+
+fn _le_enqueue(state, to_id, kind) {
+    let rec = list_new()
+    push(rec, to_id)
+    push(rec, kind)
+    push(state[LE_S_PENDING], rec)
+    return state
+}
+
+fn le_pending_message_count(state) {
+    return len(state[LE_S_PENDING])
+}
+
+// Drain ALL pending messages into a list and clear the queue. The
+// daemon calls this each tick to translate the queue onto whatever
+// transport it owns. Returns a list of [to_id, kind] pairs.
+fn le_drain_pending(state) {
+    let out = state[LE_S_PENDING]
+    state[LE_S_PENDING] = list_new()
+    return out
+}
+
+// ---- inbound message handlers -------------------------------------------
+
+// Handle an ELECTION message from peer `from_id`. Bully rule: every
+// higher-ID peer that receives an ELECTION responds with OK and kicks
+// off its own election (so eventually the highest-alive ID broadcasts
+// VICTORY). Lower-ID peers ignore the message (they are not
+// candidates).
+fn le_on_election(state, from_id) {
+    let self_id = state[LE_S_SELF_ID]
+    if self_id > from_id {
+        // Respond OK -- "I'll take over."
+        _le_enqueue(state, from_id, LE_MSG_OK)
+        // Start our own election if not already in flight.
+        if state[LE_S_ELECTION_STATE] != LE_STATE_ELECTING {
+            le_start_election(state)
+        }
+    }
+    // If self_id <= from_id we just wait for the eventual VICTORY.
+    return state
+}
+
+// Handle an OK message from a higher-ID peer. This tells the local
+// initiator that a higher-ID peer is alive and will take over the
+// election. We suppress our own VICTORY broadcast.
+fn le_on_ok(state, from_id) {
+    if from_id > state[LE_S_SELF_ID] {
+        state[LE_S_GOT_OK] = 1
+        state[LE_S_STATS_DEPOSED] = state[LE_S_STATS_DEPOSED] + 1
+    }
+    return state
+}
+
+// Handle a VICTORY message from a peer claiming to be the new leader.
+// Bully rule: accept ONLY if the claimant's ID is >= self_id (a peer
+// with a lower ID claiming victory is malformed / racing -- ignore).
+// On accept: set current_leader_id and return to STABLE.
+fn le_on_victory(state, from_id) {
+    if from_id >= state[LE_S_SELF_ID] {
+        state[LE_S_LEADER_ID] = from_id
+        state[LE_S_ELECTION_STATE] = LE_STATE_STABLE
+        state[LE_S_GOT_OK] = 0
+    }
+    return state
+}
+
+// ---- election trigger ---------------------------------------------------
+
+// Start a Bully election. Transitions to ELECTING, sends ELECTION to
+// every alive peer with a higher ID, stamps the start timestamp.
+// Idempotent on the ELECTING-state half: re-calling resets the start
+// timestamp (the operator is asking for a fresh round).
+fn le_start_election(state) {
+    state[LE_S_ELECTION_STATE] = LE_STATE_ELECTING
+    state[LE_S_LEADER_ID] = LE_NO_LEADER
+    state[LE_S_ELECTION_START_NS] = nanotime()
+    state[LE_S_GOT_OK] = 0
+    state[LE_S_STATS_ELECTIONS] = state[LE_S_STATS_ELECTIONS] + 1
+    // Enqueue ELECTION to every alive peer with a higher ID.
+    let alive = le_alive_peer_ids(state)
+    let self_id = state[LE_S_SELF_ID]
+    let i = 0
+    while i < len(alive) {
+        if alive[i] > self_id {
+            _le_enqueue(state, alive[i], LE_MSG_ELECTION)
+        }
+        i = i + 1
+    }
+    return state
+}
+
+// Admin trigger: force a fresh election even when a stable leader
+// exists. Useful for operator-driven failover ("/leader force") and
+// for tests that need a deterministic election kick.
+fn le_force_election(state) {
+    return le_start_election(state)
+}
+
+// Check whether the in-flight election has timed out. Outcomes:
+//   * GOT_OK was set by an inbound OK message -> a higher-ID peer is
+//     taking over but its VICTORY hasn't arrived yet. Restart the
+//     election (the higher-ID may have died); GOT_OK is cleared so
+//     the next timeout makes a fresh decision.
+//   * GOT_OK was NOT set, but the gossip-alive view shows a higher-ID
+//     peer is still ALIVE -> the message transport must have lost an
+//     OK, or none is wired (the gossip-derived bully path). Defer to
+//     the highest-ID alive peer (treat it as if VICTORY had been
+//     received from it). This produces the SAME end-state Bully
+//     would converge on with full message delivery, and is the path
+//     CrossEngin's integration scenario exercises (gossip is the
+//     liveness transport; the bully wire is queued but not delivered).
+//   * GOT_OK not set AND no higher-ID alive peer -> we ARE the
+//     highest-alive ID. Declare self winner, broadcast VICTORY to
+//     lower-ID alive peers.
+fn le_election_check(state) {
+    if state[LE_S_ELECTION_STATE] != LE_STATE_ELECTING { return state }
+    let now = nanotime()
+    let elapsed = now - state[LE_S_ELECTION_START_NS]
+    if elapsed < state[LE_S_TIMEOUT_NS] { return state }
+    if state[LE_S_GOT_OK] == 1 {
+        // A higher-ID peer is taking over but hasn't broadcast yet
+        // -- restart the election (the higher-ID may have died).
+        state[LE_S_GOT_OK] = 0
+        state[LE_S_ELECTION_START_NS] = now
+        let alive2 = le_alive_peer_ids(state)
+        let self_id2 = state[LE_S_SELF_ID]
+        let i2 = 0
+        while i2 < len(alive2) {
+            if alive2[i2] > self_id2 {
+                _le_enqueue(state, alive2[i2], LE_MSG_ELECTION)
+            }
+            i2 = i2 + 1
+        }
+        return state
+    }
+    // GOT_OK==0. Two cases: gossip shows a higher-ID alive-or-suspect
+    // (defer) or not (self-elect). The "non-dead" set includes SUSPECT
+    // peers: under SWIM, a SUSPECT peer may still be live (the
+    // suspicion sweep can briefly mark a stale-LAST_SEEN peer
+    // suspicious before a direct PING confirms it). Deferring to a
+    // SUSPECT-but-not-yet-DEAD peer-as-leader is the conservative
+    // choice; if it's actually dead the next tick will detect the
+    // DEAD transition and re-elect.
+    let highest = _le_highest_non_dead_or_self(state)
+    let self_id3 = state[LE_S_SELF_ID]
+    if highest > self_id3 {
+        // Defer to the highest-ID non-dead peer. This is the gossip-
+        // derived bully convergence: the highest-ID peer would (in
+        // a full-message-delivery run) eventually broadcast VICTORY
+        // anyway. Skip the wait and adopt that end-state now.
+        state[LE_S_LEADER_ID] = highest
+        state[LE_S_ELECTION_STATE] = LE_STATE_STABLE
+        state[LE_S_STATS_DEPOSED] = state[LE_S_STATS_DEPOSED] + 1
+        return state
+    }
+    // We ARE the highest alive ID. Declare self the leader and
+    // broadcast VICTORY to every alive lower-ID peer.
+    state[LE_S_LEADER_ID] = self_id3
+    state[LE_S_ELECTION_STATE] = LE_STATE_STABLE
+    state[LE_S_STATS_VICTORIES] = state[LE_S_STATS_VICTORIES] + 1
+    let alive3 = le_alive_peer_ids(state)
+    let j = 0
+    while j < len(alive3) {
+        if alive3[j] < self_id3 {
+            _le_enqueue(state, alive3[j], LE_MSG_VICTORY)
+        }
+        j = j + 1
+    }
+    return state
+}
+
+// ---- leader liveness check ----------------------------------------------
+
+// Return 1 if the current leader is still considered alive (either it
+// IS self, or it is in the alive-peer-ID set), else 0. With LE_NO_LEADER
+// (no current leader), returns 0 -- the caller should kick off an
+// election. The gossip module's failure detector is the authority on
+// liveness.
+fn le_leader_alive(state) {
+    let lid = state[LE_S_LEADER_ID]
+    if lid == LE_NO_LEADER { return 0 }
+    if lid == state[LE_S_SELF_ID] { return 1 }
+    let alive = le_alive_peer_ids(state)
+    let i = 0
+    while i < len(alive) {
+        if alive[i] == lid { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- step function ------------------------------------------------------
+//
+// One tick of the leader-election loop. Called every tick (e.g. each
+// gossip_step) by the daemon. Does:
+//
+//   1. If an election is in flight, check whether it has timed out
+//      (-> declare self winner if no higher-ID peer answered).
+//   2. Otherwise, check whether the current leader is still alive
+//      (per gossip's view); if not, start a fresh election.
+//   3. As a CONVENIENCE for environments without a per-message
+//      transport (the practical case in CrossEngin v1: gossip's
+//      wire format doesn't carry ELECTION/OK/VICTORY): if the
+//      election times out cleanly with no OK received, that path
+//      already runs in step 1. If an election starts with NO
+//      higher-ID alive peers in the gossip view, step 1 will
+//      conclude on the very next tick (after the timeout) that we
+//      are the natural leader. Tests that drive election timing
+//      manually call le_election_check / le_on_* directly.
+
+fn le_step(state) {
+    // 1. In-flight election timing check.
+    if state[LE_S_ELECTION_STATE] == LE_STATE_ELECTING {
+        le_election_check(state)
+        return state
+    }
+    // 2. Leader liveness check.
+    if le_leader_alive(state) == 0 {
+        // Either at bootstrap (LE_NO_LEADER) or the gossip failure
+        // detector marked the leader DEAD. Kick a fresh election.
+        le_start_election(state)
+        // Special case: if there are NO higher-ID alive peers AT ALL,
+        // the election has nothing to wait for. We could optimistically
+        // shortcut by declaring victory immediately, but that would
+        // race with a peer we haven't gossiped with yet. Instead, the
+        // election timeout (default 2000ms) gives gossip a chance to
+        // surface a higher-ID peer; if none appears, the next
+        // le_step's election_check declares self winner. This matches
+        // the integration scenario's "alone -> self is leader within
+        // one timeout" assertion.
+        return state
+    }
+    // 3. Stability check: if a higher-ID non-dead peer exists than the
+    // current leader, yield to it. Strict bully invariant: the
+    // highest-alive ID wins. This handles two race conditions:
+    //   a. We self-elected because gossip's alive view temporarily
+    //      missed a higher-ID peer; the peer has since appeared.
+    //   b. We are following a leader chosen under a partial alive
+    //      view, and a HIGHER-ID peer has since surfaced (e.g. the
+    //      previously-killed-leader restarts -- scenario_zzz_leader
+    //      stage 3).
+    // Without this, the wrong-leader state is sticky. We include
+    // SUSPECT peers (non-dead) so a transient false-suspect doesn't
+    // make a survivor self-elect over a still-live higher-ID peer.
+    let highest = _le_highest_non_dead_or_self(state)
+    if highest > state[LE_S_LEADER_ID] {
+        state[LE_S_LEADER_ID] = highest
+        state[LE_S_STATS_DEPOSED] = state[LE_S_STATS_DEPOSED] + 1
+    }
+    return state
+}
+
+// ---- /leader status line for chat ---------------------------------------
+
+fn _le_state_name(s) {
+    if s == LE_STATE_STABLE   { return "stable" }
+    if s == LE_STATE_ELECTING { return "electing" }
+    return "?"
+}
+
+fn le_status_line(state) {
+    let lid = state[LE_S_LEADER_ID]
+    let lid_s = "-1"
+    if lid != LE_NO_LEADER { lid_s = int_to_str(lid) }
+    let is_l = "no"
+    if le_is_leader(state) == 1 { is_l = "yes" }
+    return "leader: leader=" + lid_s
+        + " self_id=" + int_to_str(state[LE_S_SELF_ID])
+        + " is_leader=" + is_l
+        + " state=" + _le_state_name(state[LE_S_ELECTION_STATE])
+        + " peers=" + int_to_str(le_peer_count(state))
+        + " elections=" + int_to_str(state[LE_S_STATS_ELECTIONS])
+        + " victories=" + int_to_str(state[LE_S_STATS_VICTORIES])
+        + " deposed=" + int_to_str(state[LE_S_STATS_DEPOSED])
+}

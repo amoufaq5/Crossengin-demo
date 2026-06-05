@@ -1,0 +1,561 @@
+// CrossEngin knowledge: multi-KG manager.
+//
+// Purpose
+//   Knowledge is organized into per-domain knowledge graphs (ADR-0004): each KG
+//   is a namespace owning its own atoms, addressed by a stable (kg_id, atom_id)
+//   handle. A KG is spawned per domain (the spawn heuristic that decides *when*
+//   lives in cross_kg_references.nova, ADR-0017); this module is the registry
+//   and atom store underneath it. Each KG also exposes an embedding centroid,
+//   the mean of its atoms' embeddings, used for routing and spawn decisions.
+//
+//   Atoms are stored in a list indexed by atom_id (O(1) by handle). Label
+//   lookup is O(1) amortized via a hand-rolled hash index (P2.4): each KG
+//   carries a `label_index` side-table of 256 buckets, where each bucket holds
+//   `[label_hash, atom_id]` pairs. `kg_find_atom` hashes the label, jumps to
+//   the bucket, and linear-walks the (small) bucket. Kind lookups are O(1)
+//   via a parallel `kind_index` keyed on ATOM_KIND_COUNT entries. Both
+//   indexes are transparent to callers: legacy snapshots that rehydrate
+//   without indexes fall back to the original linear scan, and snapshot
+//   apply paths call `kg_rebuild_index(kg)` to repopulate the index after
+//   replaying atoms. The hash bucket count + hash function live in
+//   atom_store.nova (`LABEL_BUCKETS`, `label_hash`).
+//
+//   P3.4 adds an optional per-KG approximate-nearest-neighbor (ANN) index
+//   over atom embeddings (Locality-Sensitive Hashing; see
+//   `src/kg/ann_index.nova`). The index is opt-in -- a KG with no ann
+//   attached behaves identically to pre-P3.4. When attached via
+//   `kg_set_ann`, `kg_add_atom` / `kg_remove_atom` keep the ann in sync,
+//   and `kg_rebuild_index` (the snapshot rehydrate hook) rebuilds the ann
+//   buckets from `kg_atoms(kg)`. The KG record carries the ann handle in
+//   slot `KG_ANN`.
+//
+// ADRs implemented: ADR-0004 (multi-KG organization), ADR-0016 (atoms live in
+//   KGs). Depends-on note: NOVA enhancement #8 (multi-KG namespacing) is the
+//   scale backing; the semantics are complete now.
+// NOVA dependencies: builtins (lists, str_eq).
+// CrossEngin dependencies: src/kg/atom_store.nova, src/kg/ann_index.nova,
+//   src/safety/differential_privacy.nova (for the opt-in `_dp` variants).
+
+import "atom_store.nova"
+import "ann_index.nova"
+import "../safety/differential_privacy.nova"
+
+// ---- KG layout ------------------------------------------------------------
+let KG_TAG    = 0
+let KG_LABEL  = 1   // kg_id: human-readable domain name (the atom's kg_id)
+let KG_NUMID  = 2   // registry-local numeric id
+let KG_ATOMS  = 3   // list indexed by atom_id -> atom
+let KG_NEXTID = 4
+let KG_ALIVE  = 5
+let KG_LABEL_IDX = 6   // P2.4: hash index, list of LABEL_BUCKETS buckets;
+                       // bucket = list of [label_hash, atom_id] pairs.
+let KG_KIND_IDX  = 7   // P2.4: kind index, list of ATOM_KIND_COUNT lists of
+                       // atom_ids. Slot 0 is unused (kinds start at 1).
+let KG_ANN       = 8   // P3.4: optional approximate-nearest-neighbor index;
+                       // 0 when no ann is attached.
+let KG_OBJ_TAG = 1701
+
+// ATOM_RULE is the highest kind code (= 6); add one for slot-0 padding so the
+// kind_index can be indexed directly by kind without subtracting.
+let ATOM_KIND_COUNT = 7
+
+// ---- registry layout ------------------------------------------------------
+let KREG_TAG  = 0
+let KREG_KGS  = 1   // list indexed by numeric kg id
+let KREG_NEXT = 2
+let KREG_OBJ_TAG = 1702
+
+fn kg_registry_new() {
+    let reg = list_new()
+    push(reg, KREG_OBJ_TAG)
+    push(reg, list_new())
+    push(reg, 0)
+    return reg
+}
+
+// Allocate a fresh empty hash index: LABEL_BUCKETS empty buckets.
+fn _new_label_index() {
+    let buckets = list_new()
+    let i = 0
+    while i < LABEL_BUCKETS {
+        push(buckets, list_new())
+        i = i + 1
+    }
+    return buckets
+}
+
+// Allocate a fresh empty kind index: ATOM_KIND_COUNT empty atom-id lists.
+fn _new_kind_index() {
+    let kinds = list_new()
+    let i = 0
+    while i < ATOM_KIND_COUNT {
+        push(kinds, list_new())
+        i = i + 1
+    }
+    return kinds
+}
+
+fn _kg_build(label, num_id) {
+    let kg = list_new()
+    push(kg, KG_OBJ_TAG)
+    push(kg, label)
+    push(kg, num_id)
+    push(kg, list_new())
+    push(kg, 0)
+    push(kg, 1)
+    push(kg, _new_label_index())   // KG_LABEL_IDX
+    push(kg, _new_kind_index())    // KG_KIND_IDX
+    push(kg, 0)                    // KG_ANN: no ann attached by default
+    return kg
+}
+
+// Does this KG carry the P2.4 hash index? Old snapshots rehydrated before the
+// indexes existed will be short (len <= KG_ALIVE+1) -- callers then fall back
+// to linear scans.
+fn _kg_has_index(kg) {
+    if len(kg) <= KG_LABEL_IDX { return 0 }
+    if kg[KG_LABEL_IDX] == 0 { return 0 }
+    return 1
+}
+
+fn _kg_has_kind_index(kg) {
+    if len(kg) <= KG_KIND_IDX { return 0 }
+    if kg[KG_KIND_IDX] == 0 { return 0 }
+    return 1
+}
+
+// P3.4: does this KG carry an ANN side-index? The slot is optional -- 0 for
+// KGs that haven't opted in, or for legacy KGs rehydrated before P3.4.
+fn _kg_has_ann(kg) {
+    if len(kg) <= KG_ANN { return 0 }
+    if kg[KG_ANN] == 0 { return 0 }
+    return 1
+}
+
+// Find a KG by label (linear scan); returns the KG object or 0.
+fn kg_find(reg, label) {
+    let kgs = reg[KREG_KGS]
+    let i = 0
+    while i < len(kgs) {
+        if str_eq(kgs[i][KG_LABEL], label) == 1 { return kgs[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Spawn (or return existing) the KG for a domain label. Idempotent.
+fn kg_spawn(reg, label) {
+    let existing = kg_find(reg, label)
+    if existing != 0 { return existing }
+    let num_id = reg[KREG_NEXT]
+    let kg = _kg_build(label, num_id)
+    push(reg[KREG_KGS], kg)
+    list_set(reg, KREG_NEXT, num_id + 1)
+    return kg
+}
+
+fn kg_get(reg, num_id) {
+    let kgs = reg[KREG_KGS]
+    if num_id < 0 { return 0 }
+    if num_id >= len(kgs) { return 0 }
+    return kgs[num_id]
+}
+
+fn kg_count(reg) { return len(reg[KREG_KGS]) }
+
+// List of every registered KG's human-readable label (e.g. "reasoning",
+// "language", "imagination", "reflection"). The set is fixed at boot by the
+// chat/daemon's `*_kg_init` calls; snapshot_disk's kg_section_apply uses this
+// to validate that a snapshot's atom KG labels are known (a hand-rewritten
+// snapshot that names an unknown KG must NOT silently auto-spawn one --
+// kg_spawn is idempotent on label, so a security-sensitive caller checks
+// against this list first). Returns a fresh list of strings.
+fn kgreg_labels(reg) {
+    let kgs = reg[KREG_KGS]
+    let out = list_new()
+    let i = 0
+    while i < len(kgs) {
+        push(out, kgs[i][KG_LABEL])
+        i = i + 1
+    }
+    return out
+}
+
+// Is `label` one of the registry's currently-known KG labels? Linear scan
+// over kgreg_labels (the registry is small: 4-6 KGs at boot, never more
+// than a few dozen even with learning).
+fn kgreg_has_label(reg, label) {
+    let kgs = reg[KREG_KGS]
+    let i = 0
+    while i < len(kgs) {
+        if str_eq(kgs[i][KG_LABEL], label) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn kg_label(kg)    { return kg[KG_LABEL] }
+fn kg_num_id(kg)   { return kg[KG_NUMID] }
+fn kg_is_alive(kg) { return kg[KG_ALIVE] }
+fn kg_atom_count(kg) { return len(kg[KG_ATOMS]) }
+fn kg_atoms(kg)    { return kg[KG_ATOMS] }
+
+// Append (label_hash, atom_id) to the bucket selected by `label`. Idempotent
+// for the same (hash, id) pair, so re-indexing the same atom is a no-op.
+fn _idx_label_add(kg, label, atom_id) {
+    if _kg_has_index(kg) == 0 { return 0 }
+    let h = label_hash(label)
+    let bucket = kg[KG_LABEL_IDX][h & LABEL_BUCKETS_MASK]
+    let i = 0
+    while i < len(bucket) {
+        if bucket[i][0] == h {
+            if bucket[i][1] == atom_id { return 1 }
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, h)
+    push(entry, atom_id)
+    push(bucket, entry)
+    return 1
+}
+
+// Remove (label_hash, atom_id) from the bucket. Rebuilds the bucket without
+// the matching entry (no `pop` builtin); cheap because bucket size is small.
+fn _idx_label_remove(kg, label, atom_id) {
+    if _kg_has_index(kg) == 0 { return 0 }
+    let h = label_hash(label)
+    let buckets = kg[KG_LABEL_IDX]
+    let bidx = h & LABEL_BUCKETS_MASK
+    let bucket = buckets[bidx]
+    let kept = list_new()
+    let i = 0
+    let removed = 0
+    while i < len(bucket) {
+        let keep = 1
+        if bucket[i][0] == h {
+            if bucket[i][1] == atom_id {
+                keep = 0
+                removed = 1
+            }
+        }
+        if keep == 1 { push(kept, bucket[i]) }
+        i = i + 1
+    }
+    list_set(buckets, bidx, kept)
+    return removed
+}
+
+// Append atom_id to the kind bucket; idempotent.
+fn _idx_kind_add(kg, kind, atom_id) {
+    if _kg_has_kind_index(kg) == 0 { return 0 }
+    if kind < 0 { return 0 }
+    if kind >= ATOM_KIND_COUNT { return 0 }
+    let bucket = kg[KG_KIND_IDX][kind]
+    let i = 0
+    while i < len(bucket) {
+        if bucket[i] == atom_id { return 1 }
+        i = i + 1
+    }
+    push(bucket, atom_id)
+    return 1
+}
+
+// Remove atom_id from the kind bucket; rebuilds the bucket without it.
+fn _idx_kind_remove(kg, kind, atom_id) {
+    if _kg_has_kind_index(kg) == 0 { return 0 }
+    if kind < 0 { return 0 }
+    if kind >= ATOM_KIND_COUNT { return 0 }
+    let kinds = kg[KG_KIND_IDX]
+    let bucket = kinds[kind]
+    let kept = list_new()
+    let i = 0
+    let removed = 0
+    while i < len(bucket) {
+        if bucket[i] == atom_id {
+            removed = 1
+        } else {
+            push(kept, bucket[i])
+        }
+        i = i + 1
+    }
+    list_set(kinds, kind, kept)
+    return removed
+}
+
+// Create and store a new atom in the KG; assigns the next atom id. Returns the
+// atom. Identity (kg label, atom id) is stable for the atom's lifetime. The
+// P2.4 label + kind indexes are updated transparently so callers don't need to
+// know they exist. P3.4: when an ANN is attached, also bucket the atom's
+// (empty-at-create) embedding -- callers can re-insert via the ANN after
+// setting a real embedding with `atom_set_embed`; the convenience wrapper
+// `kg_atom_embed_set` (below) does that in one step.
+fn kg_add_atom(kg, kind, label, moment) {
+    let id = kg[KG_NEXTID]
+    let a = atom_new(kg[KG_LABEL], id, kind, label, moment)
+    push(kg[KG_ATOMS], a)
+    list_set(kg, KG_NEXTID, id + 1)
+    _idx_label_add(kg, label, id)
+    _idx_kind_add(kg, kind, id)
+    if _kg_has_ann(kg) == 1 {
+        ann_add(kg[KG_ANN], id, atom_embed(a))
+    }
+    return a
+}
+
+// Retrieve an atom by id; 0 if out of range.
+fn kg_atom(kg, atom_id) {
+    let atoms = kg[KG_ATOMS]
+    if atom_id < 0 { return 0 }
+    if atom_id >= len(atoms) { return 0 }
+    return atoms[atom_id]
+}
+
+// First atom with the given label; 0 if none. P2.4: O(1) amortized via the
+// label hash index. Falls back to a linear scan if the KG has no index (e.g.
+// a legacy snapshot rehydrated before this change).
+fn kg_find_atom(kg, label) {
+    let atoms = kg[KG_ATOMS]
+    if _kg_has_index(kg) == 1 {
+        let h = label_hash(label)
+        let bucket = kg[KG_LABEL_IDX][h & LABEL_BUCKETS_MASK]
+        let i = 0
+        while i < len(bucket) {
+            if bucket[i][0] == h {
+                let aid = bucket[i][1]
+                if aid >= 0 {
+                    if aid < len(atoms) {
+                        let a = atoms[aid]
+                        if str_eq(atom_label(a), label) == 1 { return a }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        // Hash-clean miss is a real miss; no need to fall through to the
+        // linear scan path here. (Index integrity is maintained by
+        // kg_add_atom / kg_remove_atom / kg_rebuild_index.)
+        return 0
+    }
+    // Backwards-compat: no index installed yet -- fall back to linear scan.
+    let i = 0
+    while i < len(atoms) {
+        if str_eq(atom_label(atoms[i]), label) == 1 { return atoms[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// All atom ids in `kg` of the given kind. P2.4: O(1) via the kind index.
+// Returns a fresh list of atom_ids (never the bucket itself; callers may
+// mutate it freely). Falls back to a linear scan over kg_atoms when the
+// index is absent.
+fn kg_atoms_by_kind(kg, kind) {
+    let out = list_new()
+    if _kg_has_kind_index(kg) == 1 {
+        if kind < 0 { return out }
+        if kind >= ATOM_KIND_COUNT { return out }
+        let bucket = kg[KG_KIND_IDX][kind]
+        let i = 0
+        while i < len(bucket) {
+            push(out, bucket[i])
+            i = i + 1
+        }
+        return out
+    }
+    let atoms = kg[KG_ATOMS]
+    let i = 0
+    while i < len(atoms) {
+        if atom_kind(atoms[i]) == kind {
+            push(out, atom_id(atoms[i]))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Remove the index entry for an atom (P2.4 hook for atom_death_monitor's
+// tombstone path). The atom slot in `kg_atoms` is left in place so existing
+// (kg, atom_id) handles + iteration callers stay valid -- only the label +
+// kind indexes are updated to forget the atom. After this call,
+// `kg_find_atom(kg, label)` will return 0 for the dead atom (a hash miss in
+// the bucket), but `kg_atom(kg, atom_id)` still returns the atom object so
+// callers that still hold a handle can observe the tombstone via
+// `adm_is_dead`/`adm_is_tombstoned`. Returns 1 if the atom existed, 0 if
+// out of range.
+fn kg_remove_atom(kg, atom_id) {
+    let atoms = kg[KG_ATOMS]
+    if atom_id < 0 { return 0 }
+    if atom_id >= len(atoms) { return 0 }
+    let a = atoms[atom_id]
+    if a == 0 { return 0 }
+    _idx_label_remove(kg, atom_label(a), atom_id)
+    _idx_kind_remove(kg, atom_kind(a), atom_id)
+    // P3.4: drop from the ANN bucket too if attached. ann_remove walks every
+    // bucket (we don't trust the caller to remember the original embedding,
+    // and the atom may have been re-embedded since insert), so this is
+    // safe regardless of how the atom was originally hashed.
+    if _kg_has_ann(kg) == 1 {
+        ann_remove(kg[KG_ANN], atom_id)
+    }
+    return 1
+}
+
+// Rebuild the label + kind indexes from scratch by walking every atom in
+// kg_atoms. Snapshot rehydration calls this after `kg_section_apply` so the
+// restored atoms are addressable by the hash path on the first lookup. Also
+// the recovery path for a KG whose indexes got out of sync.
+//
+// P3.4: also rebuilds the ANN bucket layout when an ann is attached. The ann
+// is opt-in -- when no ann is attached the call is a no-op for the ann path.
+// `kg_set_ann` itself triggers this rebuild path so attaching an ann to a
+// KG that already has atoms in it Just Works.
+fn kg_rebuild_index(kg) {
+    // Auto-grow: a legacy KG (built before P2.4) may not have the index slots.
+    // Extend the list to install them in place.
+    while len(kg) <= KG_LABEL_IDX { push(kg, 0) }
+    while len(kg) <= KG_KIND_IDX  { push(kg, 0) }
+    while len(kg) <= KG_ANN       { push(kg, 0) }
+    list_set(kg, KG_LABEL_IDX, _new_label_index())
+    list_set(kg, KG_KIND_IDX,  _new_kind_index())
+    let atoms = kg[KG_ATOMS]
+    let n = len(atoms)
+    let i = 0
+    while i < n {
+        let a = atoms[i]
+        if a != 0 {
+            _idx_label_add(kg, atom_label(a), atom_id(a))
+            _idx_kind_add(kg, atom_kind(a), atom_id(a))
+        }
+        i = i + 1
+    }
+    if _kg_has_ann(kg) == 1 {
+        ann_rebuild_from_atoms(kg[KG_ANN], atoms)
+    }
+    return n
+}
+
+// P3.4: attach an ANN side-index to this KG. The index becomes opt-in for
+// every subsequent `kg_add_atom` / `kg_remove_atom`. The KG's existing atoms
+// are immediately bucketed against the ann's hyperplanes, so attaching an
+// ann to an already-populated KG produces the same buckets as inserting the
+// atoms one-by-one with the ann attached. Returns 1 on success.
+//
+// Pre-P3.4 KGs auto-grow the KG_ANN slot here, mirroring the way
+// `kg_rebuild_index` auto-grows the P2.4 slots for older KGs.
+fn kg_set_ann(kg, ann) {
+    while len(kg) <= KG_ANN { push(kg, 0) }
+    list_set(kg, KG_ANN, ann)
+    if ann != 0 {
+        ann_rebuild_from_atoms(ann, kg[KG_ATOMS])
+    }
+    return 1
+}
+
+// P3.4: fetch the attached ANN, or 0 if none. Callers gate ANN-aware paths
+// on this -- e.g. a `/ann_query` admin command can refuse cleanly when the
+// active KG hasn't opted in yet.
+fn kg_ann(kg) {
+    if _kg_has_ann(kg) == 0 { return 0 }
+    return kg[KG_ANN]
+}
+
+// P3.4: convenience that updates an atom's embedding AND re-files it in the
+// attached ANN (if any) under the new bucket. Tests + callers that mutate
+// the embedding after insertion should prefer this over the raw
+// `atom_set_embed` so the ANN doesn't drift away from the underlying data.
+fn kg_atom_set_embed(kg, atom, vec) {
+    if atom == 0 { return 0 }
+    if _kg_has_ann(kg) == 1 {
+        // Drop the old bucket entry first; the new bucket is selected from
+        // the new vector below.
+        ann_remove(kg[KG_ANN], atom_id(atom))
+    }
+    atom_set_embed(atom, vec)
+    if _kg_has_ann(kg) == 1 {
+        ann_add(kg[KG_ANN], atom_id(atom), vec)
+    }
+    return 1
+}
+
+// The KG's embedding centroid: the per-dimension mean of its atoms' embeddings.
+// Returns a zero vector when the KG is empty.
+fn kg_centroid(kg) {
+    let dims = ATOM_EMBED_DIMS
+    let c = vec_new(dims)
+    let atoms = kg[KG_ATOMS]
+    let n = len(atoms)
+    if n == 0 { return c }
+    let i = 0
+    while i < n {
+        let e = atom_embed(atoms[i])
+        let d = 0
+        while d < dims {
+            vec_set(c, d, vec_get(c, d) + vec_get(e, d))
+            d = d + 1
+        }
+        i = i + 1
+    }
+    let d2 = 0
+    while d2 < dims {
+        vec_set(c, d2, vec_get(c, d2) / n)
+        d2 = d2 + 1
+    }
+    return c
+}
+
+// ---- P3.6: DP-wrapped query helpers (opt-in) -----------------------------
+// The standard query surface (kg_atom_count, kg_atoms, kg_find_atom, ...)
+// remains unchanged. These DP-wrapped variants are OPT-IN: callers that
+// want the calibrated noise floor over a numeric KG query pass in the
+// session's dp_state and an epsilon cost; the wrapper consumes from the
+// budget, samples integer Laplace noise of the appropriate scale, and
+// returns the noisy answer. When the budget is exhausted, the wrapper
+// returns DP_REFUSED -- callers must check `dp_is_refused(v)` before
+// treating the value as a count / mean. See src/safety/differential_privacy.nova
+// for the underlying mechanism and DP_AUDIT.md for the privacy/utility
+// envelope.
+
+// Noisy atom count. Sensitivity = 1 (a single teaching event adds or
+// removes exactly one atom). Consumes `epsilon_milli` from the budget.
+// At the default epsilon = 100 milli (= 0.1) the Laplace scale is 10 in
+// continuous units (noise stdev ~ 14), comfortable for diagnostic-grade
+// counts but not for fine-grained queries. Callers that want tighter
+// utility can raise epsilon at the cost of faster budget drain.
+fn kg_atom_count_dp(kg, dp, epsilon_milli) {
+    let true_count = kg_atom_count(kg)
+    return dp_noisy_count(dp, true_count, epsilon_milli)
+}
+
+// Noisy mean belief for a single atom (looked up by id). Sensitivity is
+// approximated as 1000 / (alpha + beta) -- the worst-case change in the
+// posterior mean when a single observation is removed from a Beta with
+// alpha + beta evidence mass. For an atom with no observations beyond the
+// uniform prior the sensitivity is 1000 / 2000 = 500 milli (very loose);
+// once 10+ observations accrue the sensitivity drops below 100 milli, the
+// noise tightens, and the noisy mean becomes more informative.
+//
+// Returns DP_REFUSED if the budget is exhausted OR the atom_id is invalid
+// (out-of-range / dead slot). Caller MUST distinguish the two via
+// dp_is_refused + a pre-check on the id; the brief calls for opt-in
+// helpers, so returning the sentinel on bad-id is the simplest contract.
+fn kg_atom_belief_mean_dp(kg, atom_id_in, dp, epsilon_milli) {
+    let atoms = kg[KG_ATOMS]
+    if atom_id_in < 0 { return DP_REFUSED }
+    if atom_id_in >= len(atoms) { return DP_REFUSED }
+    let a = atoms[atom_id_in]
+    if a == 0 { return DP_REFUSED }
+    let b = atom_belief(a)
+    let total = b[0] + b[1]
+    if total <= 0 { total = 2000 }
+    // Sensitivity in milli: how much the posterior mean can shift on a
+    // single-observation change. Use 1000 * 1000 / total to keep the
+    // numerator under the pointer threshold (total >= 2000 so the
+    // numerator stays well below 2^20). Floor at 100 milli so the
+    // sensitivity is never absurdly low for an unbounded-evidence atom.
+    let sens = 1000000 / total
+    if sens < 100 { sens = 100 }
+    let mean_milli = bel_mean(b)
+    return dp_noisy_mean(dp, mean_milli, sens, epsilon_milli)
+}
+

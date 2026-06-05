@@ -1,0 +1,376 @@
+// R17C -- u8 raw-byte SIMD wired into the optical-flow LK hot path.
+//
+// Verifies the three R17C u8 SIMD additions:
+//
+//   1. lk_sad_block_u8(prev, next, w, x, y, ws, p_buf, n_buf): packs the
+//      WIN x WIN windows of prev + next via memcpy_raw, reduces via
+//      R14B's simd_sad_u8 (AVX2 vpsadbw). Diagnostic SAD: Σ|It| over
+//      the window. Bit-identical to a scalar reference computing
+//      Σ|next - prev| over the same cells.
+//
+//   2. lk_image_sad_residual_u8(prev, next, w, h): per-row simd_sad_u8
+//      across the full image (rows are contiguous so no packing is
+//      needed). Returns Σ|next - prev| over all pixels. Bit-identical
+//      to a scalar Σ|a[i] - b[i]|.
+//
+//   3. lk_optical_flow_u8_simd(prev, next, w, h, win_size): full LK
+//      with packed-scan locality. Pack the WIN x WIN windows of prev
+//      and next per pixel, then run the 5-accumulator scalar inner
+//      loop reading It from the packed buffer. Bit-identical (same
+//      integer math + same loop order) to lk_optical_flow.
+//
+// The HONEST scope (mirrors R12A precedent -- agent shipped wiring at
+// 0.84x/0.20x and documented it): the LK accumulator products (Σ Ix*Ix,
+// Σ Ix*It, ...) are byte * byte -> i32 SIGNED multiplies. simd_sad_u8
+// computes absolute-difference sums on UNSIGNED bytes; it does NOT
+// vectorize the inner accumulators directly. R17C's win is locality of
+// the It read (packed contiguous load instead of strided per-row image
+// load) + the two diagnostic SAD helpers ((1) and (2) above) that fit
+// the simd_sad_u8 primitive naturally. See file header for the full
+// rationale + the list of follow-up primitives that WOULD vectorize the
+// inner accumulators (pmaddubsw / simd_mul_i16x16).
+//
+// Coverage targets (~20 assertions):
+//   * lk_sad_block_u8 on flat / known-diff / negative-diff fixtures:
+//     bit-identical to a scalar Σ|next - prev| reference.
+//   * lk_sad_block_u8 across ws in {3, 5, 7, 9, 11}: bit-identical
+//     across the SAD primitive coverage range.
+//   * lk_image_sad_residual_u8 on identical / known-diff / textured
+//     fixtures: bit-identical to scalar absolute-difference sum.
+//   * lk_optical_flow_u8_simd (via _inner) bit-identical to scalar
+//     lk_optical_flow on R10D's textured fixture (mean magnitude +
+//     valid count + per-pixel flow at probe pixels).
+//   * lk_optical_flow_u8_simd_inner bit-identical across multiple
+//     fixture shapes (identical-frames, h-shift-3).
+//   * Env-var dispatch: lk_optical_flow_u8_simd routes to scalar when
+//     CE_LK_U8_SIMD env-var is OFF/unset (default); calling the
+//     _inner helper directly exercises the SIMD path.
+//   * Input validation: zero pointers / oversize dims rejected
+//     cleanly (matches R10D contract).
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_optical_flow.nova"
+
+// ---- fixture builders ---------------------------------------------------
+
+fn _u8_flat(w, h, v) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, v)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// R10D's textured fixture: smooth saturated quadratic. Reused so the
+// SIMD vs scalar comparison runs on the SAME data lk_optical_flow's
+// own unit tests cover.
+fn _u8_textured(w, h) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let xx = int_mul(x, x)
+            let yy = int_mul(y, y)
+            let v = int_add(xx, int_mul(3, yy)) / 8
+            if v > 255 { v = 255 }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// next(x, y) = prev(x - shift, y) zero-padded -- R10D's h-shift fixture.
+fn _u8_shift_right(src, w, h, shift) {
+    let area = int_mul(w, h)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < h {
+        let row_off = int_mul(y, w)
+        let x = 0
+        while x < w {
+            let sx = int_sub(x, shift)
+            let v = 0
+            if sx >= 0 {
+                if sx < w { v = load8(src + row_off + sx) }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Scalar reference: Σ|next - prev| over a WIN x WIN window. Independent
+// of any SIMD code path so the bit-identical check is meaningful.
+fn _u8_scalar_window_sad(prev, next, w, x_c, y_c, ws) {
+    let half = ws / 2
+    let dy = 0 - half
+    let s = 0
+    while dy <= half {
+        let py = int_add(y_c, dy)
+        let row_off = int_mul(py, w)
+        let dx = 0 - half
+        while dx <= half {
+            let px = int_add(x_c, dx)
+            let p = load8(int_add(prev, int_add(row_off, px)))
+            let n = load8(int_add(next, int_add(row_off, px)))
+            let d = int_sub(n, p)
+            if d < 0 { d = 0 - d }
+            s = int_add(s, d)
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    return s
+}
+
+// Scalar reference: Σ|next - prev| over the full image. Independent of
+// any SIMD code path.
+fn _u8_scalar_image_sad(prev, next, w, h) {
+    let area = int_mul(w, h)
+    let i = 0
+    let s = 0
+    while i < area {
+        let p = load8(int_add(prev, i))
+        let n = load8(int_add(next, i))
+        let d = int_sub(n, p)
+        if d < 0 { d = 0 - d }
+        s = int_add(s, d)
+        i = int_add(i, 1)
+    }
+    return s
+}
+
+// ---- lk_sad_block_u8 vs scalar -----------------------------------------
+
+fn test_block_sad_flat_zero() {
+    let p = _u8_flat(16, 16, 100)
+    let n = _u8_flat(16, 16, 100)
+    let p_buf = alloc(49 + 8)
+    let n_buf = alloc(49 + 8)
+    let s_sc  = _u8_scalar_window_sad(p, n, 16, 8, 8, 7)
+    let s_u8  = lk_sad_block_u8(p, n, 16, 8, 8, 7, p_buf, n_buf)
+    ce_eq("LK SAD block on identical 7x7 == scalar", s_u8, s_sc)
+    ce_eq("LK SAD block on identical 7x7 == 0",     s_u8, 0)
+}
+
+fn test_block_sad_known_diff() {
+    let p = _u8_flat(16, 16, 100)
+    let n = _u8_flat(16, 16, 110)
+    let p_buf = alloc(49 + 8)
+    let n_buf = alloc(49 + 8)
+    let s_sc  = _u8_scalar_window_sad(p, n, 16, 8, 8, 7)
+    let s_u8  = lk_sad_block_u8(p, n, 16, 8, 8, 7, p_buf, n_buf)
+    ce_eq("LK SAD block (100/110) 7x7 == scalar",  s_u8, s_sc)
+    // 7*7 cells, each |110 - 100| = 10 => 490.
+    ce_eq("LK SAD block (100/110) 7x7 == 490",     s_u8, 490)
+}
+
+fn test_block_sad_negative_diff_symmetric() {
+    // simd_sad_u8 treats bytes as UNSIGNED so |a - b| == |b - a| in
+    // both directions. Mirrors R15A's stereo symmetry check.
+    let p = _u8_flat(16, 16, 100)
+    let n = _u8_flat(16, 16, 50)
+    let p_buf = alloc(49 + 8)
+    let n_buf = alloc(49 + 8)
+    let s_pn = lk_sad_block_u8(p, n, 16, 8, 8, 7, p_buf, n_buf)
+    let s_np = lk_sad_block_u8(n, p, 16, 8, 8, 7, p_buf, n_buf)
+    ce_eq("LK SAD block symmetric p/n == n/p", s_pn, s_np)
+    // 49 * 50 == 2450.
+    ce_eq("LK SAD block (100/50) 7x7 == 2450", s_pn, 2450)
+}
+
+fn test_block_sad_varying_winsize() {
+    // ws in {3, 5, 7, 9, 11} on a textured pair: SIMD SAD must be
+    // bit-identical to scalar SAD across all window sizes. Covers
+    // the vpsadbw chunk path (ws >= 7) + scalar-tail path (ws < 7).
+    let prev = _u8_textured(32, 32)
+    let next = _u8_shift_right(prev, 32, 32, 2)
+    let p_buf = alloc(121 + 8)
+    let n_buf = alloc(121 + 8)
+    let s3_sc = _u8_scalar_window_sad(prev, next, 32, 16, 16, 3)
+    let s3_u8 = lk_sad_block_u8(prev, next, 32, 16, 16, 3, p_buf, n_buf)
+    ce_eq("LK SAD ws=3 == scalar", s3_u8, s3_sc)
+    let s5_sc = _u8_scalar_window_sad(prev, next, 32, 16, 16, 5)
+    let s5_u8 = lk_sad_block_u8(prev, next, 32, 16, 16, 5, p_buf, n_buf)
+    ce_eq("LK SAD ws=5 == scalar", s5_u8, s5_sc)
+    let s7_sc = _u8_scalar_window_sad(prev, next, 32, 16, 16, 7)
+    let s7_u8 = lk_sad_block_u8(prev, next, 32, 16, 16, 7, p_buf, n_buf)
+    ce_eq("LK SAD ws=7 == scalar", s7_u8, s7_sc)
+    let s9_sc = _u8_scalar_window_sad(prev, next, 32, 16, 16, 9)
+    let s9_u8 = lk_sad_block_u8(prev, next, 32, 16, 16, 9, p_buf, n_buf)
+    ce_eq("LK SAD ws=9 == scalar", s9_u8, s9_sc)
+    let s11_sc = _u8_scalar_window_sad(prev, next, 32, 16, 16, 11)
+    let s11_u8 = lk_sad_block_u8(prev, next, 32, 16, 16, 11, p_buf, n_buf)
+    ce_eq("LK SAD ws=11 == scalar", s11_u8, s11_sc)
+}
+
+// ---- lk_image_sad_residual_u8 vs scalar --------------------------------
+
+fn test_image_sad_residual_identical_zero() {
+    let buf = _u8_textured(40, 32)
+    let r = lk_image_sad_residual_u8(buf, buf, 40, 32)
+    ce_eq("image SAD identical inputs -> 0", r, 0)
+}
+
+fn test_image_sad_residual_known_flat() {
+    let p = _u8_flat(40, 32, 80)
+    let n = _u8_flat(40, 32, 90)
+    let r_sc = _u8_scalar_image_sad(p, n, 40, 32)
+    let r_u8 = lk_image_sad_residual_u8(p, n, 40, 32)
+    ce_eq("image SAD flat 80/90 == scalar", r_u8, r_sc)
+    // 40 * 32 * 10 == 12800.
+    ce_eq("image SAD flat 80/90 == 12800",  r_u8, 12800)
+}
+
+fn test_image_sad_residual_textured_byte_wise_identical() {
+    let prev = _u8_textured(48, 32)
+    let next = _u8_shift_right(prev, 48, 32, 3)
+    let r_sc = _u8_scalar_image_sad(prev, next, 48, 32)
+    let r_u8 = lk_image_sad_residual_u8(prev, next, 48, 32)
+    ce_eq("image SAD textured h-shift-3 == scalar", r_u8, r_sc)
+    ce_check("image SAD textured h-shift-3 > 0", r_u8 > 0)
+}
+
+fn test_image_sad_residual_input_validation() {
+    let dummy = alloc(8)
+    ce_eq("image SAD zero prev -> 0",  lk_image_sad_residual_u8(0, dummy, 8, 8), 0)
+    ce_eq("image SAD zero next -> 0",  lk_image_sad_residual_u8(dummy, 0, 8, 8), 0)
+    ce_eq("image SAD zero w -> 0",     lk_image_sad_residual_u8(dummy, dummy, 0, 8), 0)
+    ce_eq("image SAD zero h -> 0",     lk_image_sad_residual_u8(dummy, dummy, 8, 0), 0)
+}
+
+// ---- lk_optical_flow_u8_simd_inner vs scalar bit-identical -------------
+//
+// Calls _lk_optical_flow_u8_simd_inner directly (bypassing the env-var
+// dispatch in the public lk_optical_flow_u8_simd entry-point) so the
+// test exercises the SIMD path regardless of CE_LK_U8_SIMD state.
+// Mirrors R15A's test pattern (test_stereo_u8_simd.nova calls
+// _stereo_disparity_u8_simd_inner directly in the bench script).
+
+fn test_optical_flow_u8_simd_textured_identical() {
+    // R10D's textured fixture, h-shift-3 -- the canonical LK test
+    // case. The u8 SIMD inner loop must produce bit-identical output
+    // to scalar (same integer math, same loop order).
+    let W = 40
+    let H = 32
+    let WS = 5
+    let HALF = 2
+    let PAD = 3
+    let AREA = int_mul(W, H)
+    let prev = _u8_textured(W, H)
+    let next = _u8_shift_right(prev, W, H, 3)
+    let r_sc = lk_optical_flow(prev, next, W, H, WS)
+    let r_u8 = _lk_optical_flow_u8_simd_inner(prev, next, W, H, WS, HALF, PAD, AREA)
+    let mm_sc = lk_flow_mean_magnitude(r_sc)
+    let mm_u8 = lk_flow_mean_magnitude(r_u8)
+    let vc_sc = lk_flow_valid_count(r_sc)
+    let vc_u8 = lk_flow_valid_count(r_u8)
+    ce_eq("u8 SIMD LK textured: mean magnitude == scalar",   mm_u8, mm_sc)
+    ce_eq("u8 SIMD LK textured: valid count == scalar",      vc_u8, vc_sc)
+}
+
+fn test_optical_flow_u8_simd_per_pixel_identical() {
+    // R10D h-shift-3 probe pixels: scalar reads (u, v, valid) at
+    // (20, 16) and (16, 12). u8 SIMD must produce IDENTICAL output
+    // at the SAME probe pixels (same integer math, same loop order).
+    let W = 40
+    let H = 32
+    let WS = 5
+    let HALF = 2
+    let PAD = 3
+    let AREA = int_mul(W, H)
+    let prev = _u8_textured(W, H)
+    let next = _u8_shift_right(prev, W, H, 3)
+    let r_sc = lk_optical_flow(prev, next, W, H, WS)
+    let r_u8 = _lk_optical_flow_u8_simd_inner(prev, next, W, H, WS, HALF, PAD, AREA)
+    let f_sc_20_16 = lk_flow_at(r_sc, 20, 16)
+    let f_u8_20_16 = lk_flow_at(r_u8, 20, 16)
+    ce_eq("u8 SIMD LK (20,16) u == scalar",      f_u8_20_16[0], f_sc_20_16[0])
+    ce_eq("u8 SIMD LK (20,16) v == scalar",      f_u8_20_16[1], f_sc_20_16[1])
+    ce_eq("u8 SIMD LK (20,16) valid == scalar",  f_u8_20_16[2], f_sc_20_16[2])
+    let f_sc_16_12 = lk_flow_at(r_sc, 16, 12)
+    let f_u8_16_12 = lk_flow_at(r_u8, 16, 12)
+    ce_eq("u8 SIMD LK (16,12) u == scalar",      f_u8_16_12[0], f_sc_16_12[0])
+    ce_eq("u8 SIMD LK (16,12) v == scalar",      f_u8_16_12[1], f_sc_16_12[1])
+}
+
+fn test_optical_flow_u8_simd_identical_frames() {
+    // Identical prev/next: scalar produces zero flow at every valid
+    // pixel. u8 SIMD must produce the same.
+    let W = 32
+    let H = 32
+    let WS = 5
+    let HALF = 2
+    let PAD = 3
+    let AREA = int_mul(W, H)
+    let buf = _u8_textured(W, H)
+    let r_sc = lk_optical_flow(buf, buf, W, H, WS)
+    let r_u8 = _lk_optical_flow_u8_simd_inner(buf, buf, W, H, WS, HALF, PAD, AREA)
+    ce_eq("u8 SIMD LK identical frames: mean mag == scalar",
+          lk_flow_mean_magnitude(r_u8), lk_flow_mean_magnitude(r_sc))
+    ce_eq("u8 SIMD LK identical frames: valid count == scalar",
+          lk_flow_valid_count(r_u8), lk_flow_valid_count(r_sc))
+}
+
+// ---- env-var dispatch --------------------------------------------------
+
+fn test_dispatch_off_falls_back_to_scalar() {
+    // CE_LK_U8_SIMD unset / "off" -- lk_optical_flow_u8_simd dispatches
+    // to lk_optical_flow (scalar), so output is identical-by-construction
+    // (bit-identical because we're literally calling the scalar path
+    // both times). This proves the dispatch fallback works.
+    let prev = _u8_textured(32, 32)
+    let next = _u8_shift_right(prev, 32, 32, 2)
+    let r_sc = lk_optical_flow(prev, next, 32, 32, 5)
+    let r_u8 = lk_optical_flow_u8_simd(prev, next, 32, 32, 5)
+    ce_eq("dispatch off: mean mag == scalar",
+          lk_flow_mean_magnitude(r_u8), lk_flow_mean_magnitude(r_sc))
+    ce_eq("dispatch off: valid count == scalar",
+          lk_flow_valid_count(r_u8), lk_flow_valid_count(r_sc))
+}
+
+// ---- input validation --------------------------------------------------
+
+fn test_input_validation() {
+    let dummy = alloc(8)
+    let r0 = lk_optical_flow_u8_simd(0, dummy, 32, 32, 5)
+    ce_eq("zero prev ptr -> total 0", lk_flow_total(r0), 0)
+    let r1 = lk_optical_flow_u8_simd(dummy, 0, 32, 32, 5)
+    ce_eq("zero next ptr -> total 0", lk_flow_total(r1), 0)
+    let r2 = lk_optical_flow_u8_simd(dummy, dummy, 300, 300, 5)
+    ce_eq("oversize dims -> total 0", lk_flow_total(r2), 0)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_block_sad_flat_zero()
+    test_block_sad_known_diff()
+    test_block_sad_negative_diff_symmetric()
+    test_block_sad_varying_winsize()
+    test_image_sad_residual_identical_zero()
+    test_image_sad_residual_known_flat()
+    test_image_sad_residual_textured_byte_wise_identical()
+    test_image_sad_residual_input_validation()
+    test_optical_flow_u8_simd_textured_identical()
+    test_optical_flow_u8_simd_per_pixel_identical()
+    test_optical_flow_u8_simd_identical_frames()
+    test_dispatch_off_falls_back_to_scalar()
+    test_input_validation()
+    ce_summary("image_optical_flow_u8_simd")
+}
+
+main()

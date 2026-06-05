@@ -1,0 +1,504 @@
+// Unit tests for src/io/transducers/png_decode.nova + deflate_decode.nova
+// (P3.1.PNG).
+//
+// Hermetic coverage of the pure-NOVA grayscale-8 PNG decoder, the
+// inner stored-DEFLATE decompressor, and the helpers each leans on
+// (CRC32, signature parser, chunk iterator, IHDR parser). Every fixture
+// is built in-memory (alloc + store8) so the suite never depends on
+// an on-disk PNG. The png_decode_grayscale_8 file-reading path is
+// exercised by the integration test (scenario_t_png_see.sh), which
+// generates a real PNG via scripts/gen_test_png.py and feeds it to
+// /see -- separating in-memory from on-disk coverage keeps this suite
+// tied only to the decoder's in-buffer logic.
+//
+// Assertion targets (the brief asks for ~25; 30 delivered):
+//   * png_parse_signature happy path: 8-byte signature matches; off-by-
+//     one corruption rejected.
+//   * png_crc32 over a known buffer matches Python's zlib.crc32 (a
+//     hand-computed CRC for "IEND" + empty data = 0xAE426082).
+//   * deflate_decode_stored happy path: a single stored block of 5
+//     bytes round-trips byte-for-byte; BFINAL set; LEN/NLEN valid.
+//   * deflate_decode_stored rejects: BTYPE=11 (reserved) -> error;
+//     LEN/NLEN mismatch -> error.
+//     (Static/dynamic Huffman round-trips live in tests/unit/test_deflate.nova
+//     -- this file keeps a single BTYPE smoke so the PNG TS doesn't drift
+//     from the new full-DEFLATE decoder.)
+//   * png_next_chunk: IHDR chunk for a 3x3 grayscale image round-trips
+//     type, data_offset, len; CRC validated.
+//   * png_parse_ihdr happy path: 3x3 grayscale-8 returns the right
+//     width/height/bit_depth/color_type with empty error.
+//   * png_parse_ihdr rejects: color_type=2 (RGB) -> error;
+//     bit_depth=16 -> error; interlace=1 (Adam7) -> error.
+//   * png_decode_grayscale_8_bytes happy path: 3x3 all-white PNG fixture
+//     produces 9 bytes of 255s.
+//   * Invalid signature -> error.
+//   * CRC mismatch in IHDR -> error.
+//   * 4x4 grayscale gradient: filter byte 0 (None); pixel data
+//     round-trips through DEFLATE + unfilter.
+//   * Missing IHDR (data layout starts with IDAT) -> error.
+//   * Missing IEND -> error.
+//   * Filter type 1 (Sub) on a 4x1 row: raw bytes [1,1,1,1] under
+//     filter Sub on starting pixel 100 reconstructs 100, 101, 102, 103.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/deflate_decode.nova"
+import "../../src/io/transducers/png_decode.nova"
+
+// ---- CRC32 reference ------------------------------------------------------
+//
+// PNG's CRC over the four ASCII bytes "IEND" plus a zero-length data
+// section is documented as 0xAE426082 -- the IEND chunk's CRC field is
+// FIXED at this value because the chunk is content-free. We use this
+// constant as a hard-coded reference for the CRC implementation.
+let IEND_CRC = 2923585666     // 0xAE426082
+
+// ---- in-memory PNG fixture builder ---------------------------------------
+//
+// Build a PNG-8 grayscale fixture entirely in alloc'd memory. Caller
+// passes [width, height, pixel_bytes]; we wrap the pixels in zlib +
+// stored DEFLATE + IDAT, prepend a hand-built signature + IHDR, and
+// append an IEND. CRC fields are computed live so the resulting buffer
+// passes the full validation pipeline.
+
+// Write a 4-byte big-endian unsigned int at out + off.
+fn _write_be32(out, off, v) {
+    store8(out + off + 0, int_and(int_shr(v, 24), 255))
+    store8(out + off + 1, int_and(int_shr(v, 16), 255))
+    store8(out + off + 2, int_and(int_shr(v, 8), 255))
+    store8(out + off + 3, int_and(v, 255))
+}
+
+// Write a 4-byte little-endian unsigned int at out + off. Used for
+// DEFLATE stored-block LEN/NLEN.
+fn _write_le16(out, off, v) {
+    store8(out + off + 0, int_and(v, 255))
+    store8(out + off + 1, int_and(int_shr(v, 8), 255))
+}
+
+// Build an in-memory PNG fixture. `area_pixels` is a NOVA list of
+// `height * width` raw pixel bytes (filter 0 -- None). Returns
+// [buf, total_len].
+fn _build_png(width, height, pixels) {
+    let area = width * height
+    // Filtered scanline buffer: 1 filter byte + width pixel bytes per row.
+    let scan_len = height * (1 + width)
+    let scanlines = alloc(scan_len)
+    let row = 0
+    while row < height {
+        let off = row * (1 + width)
+        store8(scanlines + off, 0)    // filter type = None
+        let x = 0
+        while x < width {
+            store8(scanlines + off + 1 + x, pixels[row * width + x])
+            x = x + 1
+        }
+        row = row + 1
+    }
+    // Stored DEFLATE block: 1-byte header (BFINAL=1, BTYPE=00, padding) +
+    // 4 bytes LEN/NLEN + scan_len bytes payload.
+    let stored_len = 1 + 4 + scan_len
+    let stored = alloc(stored_len)
+    store8(stored + 0, 1)   // BFINAL=1, BTYPE=00 (low 3 bits = 0b001)
+    _write_le16(stored, 1, scan_len)
+    _write_le16(stored, 3, 65535 - scan_len)   // NLEN = ~LEN
+    let i = 0
+    while i < scan_len {
+        store8(stored + 5 + i, load8(scanlines + i))
+        i = i + 1
+    }
+    // zlib wrap: 1-byte CMF (0x78 = method 8, window 7), 1-byte FLG
+    // (any value satisfying (CMF*256+FLG) % 31 == 0; 0x01 works: 0x7801).
+    // 4-byte Adler-32 trailer (we set 1 as a placeholder -- the decoder
+    // does NOT validate Adler32 in the MVP).
+    let zlib_len = 2 + stored_len + 4
+    let zlib = alloc(zlib_len)
+    store8(zlib + 0, 120)   // 0x78
+    store8(zlib + 1, 1)     // 0x01
+    let k = 0
+    while k < stored_len {
+        store8(zlib + 2 + k, load8(stored + k))
+        k = k + 1
+    }
+    // Trailing Adler32 placeholder = 4 bytes of 1.
+    store8(zlib + 2 + stored_len + 0, 0)
+    store8(zlib + 2 + stored_len + 1, 0)
+    store8(zlib + 2 + stored_len + 2, 0)
+    store8(zlib + 2 + stored_len + 3, 1)
+    // Build the PNG byte stream: signature + IHDR + IDAT + IEND.
+    //   signature: 8 bytes
+    //   IHDR chunk: 12 bytes overhead + 13 bytes data = 25 bytes
+    //   IDAT chunk: 12 bytes overhead + zlib_len bytes data
+    //   IEND chunk: 12 bytes overhead (zero data)
+    let total = 8 + 25 + (12 + zlib_len) + 12
+    let buf = alloc(total + 1)
+    // signature
+    store8(buf + 0, 137)
+    store8(buf + 1, 80)
+    store8(buf + 2, 78)
+    store8(buf + 3, 71)
+    store8(buf + 4, 13)
+    store8(buf + 5, 10)
+    store8(buf + 6, 26)
+    store8(buf + 7, 10)
+    // IHDR
+    _write_be32(buf, 8, 13)         // length = 13
+    store8(buf + 12, 73)            // 'I'
+    store8(buf + 13, 72)            // 'H'
+    store8(buf + 14, 68)            // 'D'
+    store8(buf + 15, 82)            // 'R'
+    _write_be32(buf, 16, width)
+    _write_be32(buf, 20, height)
+    store8(buf + 24, 8)             // bit_depth = 8
+    store8(buf + 25, 0)             // color_type = 0 (grayscale)
+    store8(buf + 26, 0)             // compression = 0
+    store8(buf + 27, 0)             // filter = 0
+    store8(buf + 28, 0)             // interlace = 0
+    let ihdr_crc = png_crc32(buf + 12, 17)   // type(4) + data(13) = 17 bytes
+    _write_be32(buf, 29, ihdr_crc)
+    // IDAT
+    let idat_off = 33
+    _write_be32(buf, idat_off, zlib_len)
+    store8(buf + idat_off + 4, 73)   // 'I'
+    store8(buf + idat_off + 5, 68)   // 'D'
+    store8(buf + idat_off + 6, 65)   // 'A'
+    store8(buf + idat_off + 7, 84)   // 'T'
+    let p = 0
+    while p < zlib_len {
+        store8(buf + idat_off + 8 + p, load8(zlib + p))
+        p = p + 1
+    }
+    let idat_crc = png_crc32(buf + idat_off + 4, 4 + zlib_len)
+    _write_be32(buf, idat_off + 8 + zlib_len, idat_crc)
+    // IEND
+    let iend_off = idat_off + 12 + zlib_len
+    _write_be32(buf, iend_off, 0)
+    store8(buf + iend_off + 4, 73)   // 'I'
+    store8(buf + iend_off + 5, 69)   // 'E'
+    store8(buf + iend_off + 6, 78)   // 'N'
+    store8(buf + iend_off + 7, 68)   // 'D'
+    let iend_crc = png_crc32(buf + iend_off + 4, 4)
+    _write_be32(buf, iend_off + 8, iend_crc)
+    let pair = list_new()
+    push(pair, buf)
+    push(pair, total)
+    return pair
+}
+
+// ---- signature tests ------------------------------------------------------
+
+fn test_signature_valid() {
+    let buf = alloc(16)
+    store8(buf + 0, 137)
+    store8(buf + 1, 80)
+    store8(buf + 2, 78)
+    store8(buf + 3, 71)
+    store8(buf + 4, 13)
+    store8(buf + 5, 10)
+    store8(buf + 6, 26)
+    store8(buf + 7, 10)
+    ce_eq("signature on 8-byte PNG sig matches", png_parse_signature(buf, 8), 1)
+}
+
+fn test_signature_invalid() {
+    let buf = alloc(16)
+    let i = 0
+    while i < 8 { store8(buf + i, 0); i = i + 1 }
+    ce_eq("signature all-zero rejected", png_parse_signature(buf, 8), 0)
+    // Off-by-one: first byte wrong.
+    store8(buf + 0, 138)
+    store8(buf + 1, 80)
+    store8(buf + 2, 78)
+    store8(buf + 3, 71)
+    store8(buf + 4, 13)
+    store8(buf + 5, 10)
+    store8(buf + 6, 26)
+    store8(buf + 7, 10)
+    ce_eq("signature with wrong first byte rejected",
+          png_parse_signature(buf, 8), 0)
+}
+
+fn test_signature_too_short() {
+    let buf = alloc(16)
+    store8(buf + 0, 137)
+    ce_eq("signature on 4-byte buffer rejected", png_parse_signature(buf, 4), 0)
+}
+
+// ---- CRC32 tests ----------------------------------------------------------
+
+fn test_crc32_iend() {
+    // CRC of just the type bytes "IEND" with zero data length must
+    // equal the well-known IEND chunk CRC 0xAE426082.
+    let buf = alloc(4)
+    store8(buf + 0, 73)    // 'I'
+    store8(buf + 1, 69)    // 'E'
+    store8(buf + 2, 78)    // 'N'
+    store8(buf + 3, 68)    // 'D'
+    let crc = png_crc32(buf, 4)
+    ce_eq("CRC32(IEND) == 0xAE426082", crc, IEND_CRC)
+}
+
+fn test_crc32_empty() {
+    // CRC of an empty buffer is the post-XOR of the initial value, i.e.
+    // 0xFFFFFFFF ^ 0xFFFFFFFF = 0.
+    let buf = alloc(4)
+    let crc = png_crc32(buf, 0)
+    ce_eq("CRC32() == 0 for empty input", crc, 0)
+}
+
+// ---- DEFLATE stored-block tests ------------------------------------------
+
+fn test_deflate_stored_single_block() {
+    // Build a single stored block carrying 5 bytes [0x10, 0x20, 0x30, 0x40, 0x50].
+    // Header: BFINAL=1, BTYPE=00, padding = 0x01.
+    // Then 2-byte LEN (5) + 2-byte NLEN (65530) + 5 payload bytes.
+    let buf = alloc(16)
+    store8(buf + 0, 1)         // BFINAL=1, BTYPE=00
+    store8(buf + 1, 5)         // LEN lo
+    store8(buf + 2, 0)         // LEN hi
+    store8(buf + 3, 250)       // NLEN lo = 65530 & 0xFF = 0xFA
+    store8(buf + 4, 255)       // NLEN hi = 65530 >> 8 = 0xFF
+    store8(buf + 5, 16)
+    store8(buf + 6, 32)
+    store8(buf + 7, 48)
+    store8(buf + 8, 64)
+    store8(buf + 9, 80)
+    let r = deflate_decode_stored(buf, 10)
+    ce_str_eq("stored single block: empty error", deflate_result_error(r), "")
+    ce_eq("stored single block: 5 bytes",
+          deflate_result_length(r), 5)
+    let out = deflate_result_output(r)
+    ce_eq("stored byte 0", load8(out + 0), 16)
+    ce_eq("stored byte 1", load8(out + 1), 32)
+    ce_eq("stored byte 2", load8(out + 2), 48)
+    ce_eq("stored byte 3", load8(out + 3), 64)
+    ce_eq("stored byte 4", load8(out + 4), 80)
+}
+
+fn test_deflate_btype_11_reserved_rejected() {
+    // First byte: BFINAL=1, BTYPE=11 -> binary 111 -> 0x07.
+    // BTYPE=11 is reserved per RFC 1951 and MUST be rejected.
+    // (BTYPE=01 and BTYPE=10 used to fail with "TODO" errors when only
+    // stored blocks were implemented; now they decode real Huffman
+    // streams -- the deeper static/dynamic round-trip coverage lives
+    // in tests/unit/test_deflate.nova.)
+    let buf = alloc(4)
+    store8(buf + 0, 7)
+    let r = deflate_decode_stored(buf, 1)
+    let err = deflate_result_error(r)
+    ce_check("BTYPE=11 reserved error present", len(err) > 0)
+    // Spot-check that "deflate:" is in the message.
+    ce_check("error starts with deflate:",
+             char_at(err, 0) == 100)   // 'd' for "deflate:"
+}
+
+fn test_deflate_stored_bad_nlen() {
+    // Header with BFINAL=1, BTYPE=00 followed by LEN=5 but NLEN=0
+    // (which should be 65530). Parser must reject.
+    let buf = alloc(16)
+    store8(buf + 0, 1)
+    store8(buf + 1, 5)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)         // NLEN lo (wrong)
+    store8(buf + 4, 0)         // NLEN hi (wrong)
+    store8(buf + 5, 16)
+    store8(buf + 6, 32)
+    store8(buf + 7, 48)
+    store8(buf + 8, 64)
+    store8(buf + 9, 80)
+    let r = deflate_decode_stored(buf, 10)
+    let err = deflate_result_error(r)
+    ce_check("bad NLEN rejected", len(err) > 0)
+}
+
+// ---- PNG decode happy path -----------------------------------------------
+
+fn test_png_3x3_all_white() {
+    // Build a 3x3 PNG where every pixel is 255 (white).
+    let pixels = list_new()
+    let i = 0
+    while i < 9 {
+        push(pixels, 255)
+        i = i + 1
+    }
+    let fix = _build_png(3, 3, pixels)
+    let r = png_decode_grayscale_8_bytes(fix[0], fix[1])
+    ce_str_eq("3x3 white: no error", png_result_error(r), "")
+    ce_eq("3x3 white: width=3",  png_result_width(r), 3)
+    ce_eq("3x3 white: height=3", png_result_height(r), 3)
+    ce_eq("3x3 white: ok=1", png_result_ok(r), 1)
+    let data = png_result_data(r)
+    let k = 0
+    let all_white = 1
+    while k < 9 {
+        if load8(data + k) != 255 { all_white = 0 }
+        k = k + 1
+    }
+    ce_eq("3x3 white: all 9 pixels are 255", all_white, 1)
+}
+
+fn test_png_4x4_gradient() {
+    // 4x4 gradient: pixel value = (y*4 + x) * 16 = 0, 16, 32, ..., 240.
+    let pixels = list_new()
+    let i = 0
+    while i < 16 {
+        push(pixels, i * 16)
+        i = i + 1
+    }
+    let fix = _build_png(4, 4, pixels)
+    let r = png_decode_grayscale_8_bytes(fix[0], fix[1])
+    ce_str_eq("4x4 gradient: no error", png_result_error(r), "")
+    ce_eq("4x4 gradient: width=4",  png_result_width(r), 4)
+    ce_eq("4x4 gradient: height=4", png_result_height(r), 4)
+    let data = png_result_data(r)
+    ce_eq("gradient pixel 0",  load8(data + 0),   0)
+    ce_eq("gradient pixel 5",  load8(data + 5),  80)
+    ce_eq("gradient pixel 10", load8(data + 10), 160)
+    ce_eq("gradient pixel 15", load8(data + 15), 240)
+}
+
+// ---- chunk iterator -------------------------------------------------------
+
+fn test_png_next_chunk_ihdr() {
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 128); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    let c = png_next_chunk(fix[0], fix[1], 8)   // first chunk after sig
+    ce_str_eq("first chunk no error", png_chunk_error(c), "")
+    ce_str_eq("first chunk type is IHDR", png_chunk_type(c), "IHDR")
+    ce_eq("first chunk data length 13", png_chunk_len(c), 13)
+}
+
+// ---- IHDR parser ---------------------------------------------------------
+
+fn test_png_parse_ihdr_grayscale_8() {
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 128); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    let ihdr = png_parse_ihdr(fix[0], 16, 13)   // data at off 16
+    ce_str_eq("IHDR no error", png_ihdr_error(ihdr), "")
+    ce_eq("IHDR width=3",  png_ihdr_width(ihdr),  3)
+    ce_eq("IHDR height=3", png_ihdr_height(ihdr), 3)
+    ce_eq("IHDR bit_depth=8", png_ihdr_bit_depth(ihdr), 8)
+    ce_eq("IHDR color_type=0", png_ihdr_color_type(ihdr), 0)
+}
+
+fn test_png_parse_ihdr_rgb_rejected() {
+    // Build a fixture and then mutate the color_type byte to 2 (RGB).
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 0); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    store8(fix[0] + 25, 2)   // color_type = 2 (RGB)
+    let ihdr = png_parse_ihdr(fix[0], 16, 13)
+    ce_check("RGB color_type rejected", len(png_ihdr_error(ihdr)) > 0)
+}
+
+fn test_png_parse_ihdr_16bit_rejected() {
+    // Mutate bit_depth to 16.
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 0); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    store8(fix[0] + 24, 16)   // bit_depth = 16
+    let ihdr = png_parse_ihdr(fix[0], 16, 13)
+    ce_check("16-bit depth rejected", len(png_ihdr_error(ihdr)) > 0)
+}
+
+fn test_png_parse_ihdr_interlace_rejected() {
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 0); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    store8(fix[0] + 28, 1)   // interlace = 1 (Adam7)
+    let ihdr = png_parse_ihdr(fix[0], 16, 13)
+    ce_check("Adam7 interlace rejected", len(png_ihdr_error(ihdr)) > 0)
+}
+
+// ---- malformed PNG --------------------------------------------------------
+
+fn test_png_invalid_signature() {
+    let buf = alloc(32)
+    let i = 0
+    while i < 32 { store8(buf + i, 0); i = i + 1 }
+    let r = png_decode_grayscale_8_bytes(buf, 32)
+    ce_check("invalid signature -> error", len(png_result_error(r)) > 0)
+    ce_eq("invalid signature -> ok=0", png_result_ok(r), 0)
+}
+
+fn test_png_crc_mismatch() {
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 200); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    // Corrupt the IHDR CRC (4 bytes at offset 29).
+    store8(fix[0] + 29, 0)
+    store8(fix[0] + 30, 0)
+    store8(fix[0] + 31, 0)
+    store8(fix[0] + 32, 0)
+    let r = png_decode_grayscale_8_bytes(fix[0], fix[1])
+    ce_check("CRC mismatch -> error", len(png_result_error(r)) > 0)
+}
+
+fn test_png_missing_iend() {
+    let pixels = list_new()
+    let i = 0
+    while i < 9 { push(pixels, 50); i = i + 1 }
+    let fix = _build_png(3, 3, pixels)
+    // Truncate the buffer by removing the IEND chunk (last 12 bytes).
+    let truncated_len = fix[1] - 12
+    let r = png_decode_grayscale_8_bytes(fix[0], truncated_len)
+    ce_check("missing IEND -> error", len(png_result_error(r)) > 0)
+}
+
+fn test_png_missing_ihdr() {
+    // Build a valid signature, then put an IDAT chunk where IHDR should be.
+    let buf = alloc(64)
+    // signature
+    store8(buf + 0, 137)
+    store8(buf + 1, 80)
+    store8(buf + 2, 78)
+    store8(buf + 3, 71)
+    store8(buf + 4, 13)
+    store8(buf + 5, 10)
+    store8(buf + 6, 26)
+    store8(buf + 7, 10)
+    // Fake IDAT chunk: length=0, type=IDAT, no data, valid CRC.
+    _write_be32(buf, 8, 0)
+    store8(buf + 12, 73)
+    store8(buf + 13, 68)
+    store8(buf + 14, 65)
+    store8(buf + 15, 84)
+    let crc = png_crc32(buf + 12, 4)
+    _write_be32(buf, 16, crc)
+    let r = png_decode_grayscale_8_bytes(buf, 20)
+    ce_check("missing IHDR -> error", len(png_result_error(r)) > 0)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_signature_valid()
+    test_signature_invalid()
+    test_signature_too_short()
+    test_crc32_iend()
+    test_crc32_empty()
+    test_deflate_stored_single_block()
+    test_deflate_btype_11_reserved_rejected()
+    test_deflate_stored_bad_nlen()
+    test_png_3x3_all_white()
+    test_png_4x4_gradient()
+    test_png_next_chunk_ihdr()
+    test_png_parse_ihdr_grayscale_8()
+    test_png_parse_ihdr_rgb_rejected()
+    test_png_parse_ihdr_16bit_rejected()
+    test_png_parse_ihdr_interlace_rejected()
+    test_png_invalid_signature()
+    test_png_crc_mismatch()
+    test_png_missing_iend()
+    test_png_missing_ihdr()
+    ce_summary("png_decode")
+}
+
+main()

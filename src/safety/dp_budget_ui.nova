@@ -1,0 +1,399 @@
+// CrossEngin safety: differential privacy budget UI/reporting (R12F).
+//
+// Purpose
+//   src/safety/differential_privacy.nova carries the actual DP machinery
+//   (LCG, Laplace sampling, budget accountant, query log). This module is
+//   the THIN PRESENTATION LAYER on top of it: ASCII bar rendering,
+//   "(epsilon: X / Y consumed, Z remaining, last query at T)" lines, and
+//   the helpers that translate the milli-eps integers into the operator-
+//   facing words. The split keeps the DP module narrow (no string-builder
+//   surface area on the privacy primitive itself) and gives the chat-side
+//   /dp command a single import to depend on.
+//
+//   The /dp chat dispatcher (admin_dp_dispatch) ALSO lives here so the
+//   chat module can wire a single dispatch line for `/dp <subcommand>`
+//   and the four-line /help block; the per-subcommand wiring (status /
+//   log / warn / reset) is colocated with the formatting helpers it
+//   drives. The chat's surface area is therefore minimal (5 net lines:
+//   1 dispatch + 4 help + 1 /status pane line, per the R12F brief).
+//
+//   Convention: the helpers prefixed with `dpui_` are PURE (no I/O, no
+//   nanotime, no mutation of dp state) so the unit tests can call them
+//   with stable inputs. The chat-side dispatcher (admin_dp_dispatch
+//   below) drives the I/O (io_println) using the strings the pure
+//   helpers return; that keeps the formatting under
+//   tests/unit/test_dp_budget_ui.nova's ce_str_eq lens.
+//
+// ADRs implemented: ADR-0053 (differential privacy follow-up: operator-
+//   facing reporting surface).
+// NOVA dependencies: builtins (int_to_str, len, push, list_new) + std/io
+//   (io_println, nanotime) + std/string (str_eq, substr, str_trim,
+//   char_at).
+// CrossEngin dependencies: src/safety/differential_privacy.nova
+//   (read-only accessors).
+
+import "std/string"
+import "std/io"
+import "differential_privacy.nova"
+
+// Default bar width in characters. 10 cells -> each cell = 10% of budget,
+// which matches the typical operator's mental model ("about 50%
+// consumed"). The bar can be widened by the caller for log-style output
+// (40 cells gives ~2.5%-per-cell resolution).
+let DPUI_BAR_WIDTH_DEFAULT = 10
+
+// Default `last N` for /dp log. Most operators want a recency window
+// rather than the full history; 10 lines fits a 25-line terminal
+// comfortably alongside the chat scrollback.
+let DPUI_LOG_DEFAULT_N = 10
+
+// ---- percent / cell math --------------------------------------------------
+// Round `(num * 1000) / denom` to nearest -- percent-times-10. Used
+// internally so the bar renderer and the "(X%)" suffix agree byte-for-byte.
+// Returns 0 if denom <= 0. Both inputs capped at safe ranges.
+fn _dpui_pct_milli(num, denom) {
+    if denom <= 0 { return 0 }
+    let n = num
+    if n < 0 { n = 0 }
+    if n > denom { n = denom }
+    let scaled = n * 1000
+    let half = denom / 2
+    return (scaled + half) / denom
+}
+
+// Round the milli-percent (out of 1000) to the nearest whole percent.
+// 500 -> 50, 555 -> 56, 999 -> 100.
+fn _dpui_pct_whole(num, denom) {
+    let m = _dpui_pct_milli(num, denom)
+    return (m + 5) / 10
+}
+
+// How many of `width` cells should be filled given `consumed` out of
+// `total`? Rounded to nearest with a half-up tie. Capped at [0, width].
+fn _dpui_cells(consumed, total, width) {
+    if total <= 0 { return 0 }
+    let c = consumed
+    if c < 0 { c = 0 }
+    if c > total { c = total }
+    let half = total / 2
+    let cells = (c * width + half) / total
+    if cells < 0 { cells = 0 }
+    if cells > width { cells = width }
+    return cells
+}
+
+// ---- bar -------------------------------------------------------------------
+// Render the consumption bar. Returns a string like "[#####-----]" of
+// `width` cells, where `#` covers the consumed fraction and `-` covers the
+// remaining. We use ASCII `#`/`-` (not Unicode block characters) for
+// codepage portability across older terminals; the R12F brief calls for
+// an "ASCII bar visualization".
+//
+// On a 10-cell bar at 25% consumed: "[###-------]" -- two-and-a-half cells
+// rounds to three with the half-up tie.
+fn dpui_render_bar(consumed_milli, total_milli, width) {
+    let w = width
+    if w < 1 { w = 1 }
+    if w > 80 { w = 80 }   // sanity cap; a 200-cell bar is not a bar
+    let total = total_milli
+    if total <= 0 {
+        // Degenerate budget. Render an empty bar; the caller's status
+        // line will say "no budget configured".
+        let s = "["
+        let i = 0
+        while i < w {
+            s = s + "-"
+            i = i + 1
+        }
+        s = s + "]"
+        return s
+    }
+    let cells = _dpui_cells(consumed_milli, total, w)
+    let s = "["
+    let i = 0
+    while i < w {
+        if i < cells { s = s + "#" } else { s = s + "-" }
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+// ---- recency phrase --------------------------------------------------------
+// "no queries yet" if last == 0; "last query Ts ago" otherwise. If now_ns
+// is in the past (clock jitter across nanotime calls -- rare) reports
+// "last query just now".
+fn _dpui_recency(last_ns, now_ns) {
+    if last_ns <= 0 { return "no queries yet" }
+    if now_ns <= last_ns { return "last query just now" }
+    let delta = now_ns - last_ns
+    let secs = (delta / 1000000) / 1000
+    return "last query " + int_to_str(secs) + "s ago"
+}
+
+// ---- status lines ---------------------------------------------------------
+// Top-level status line. Returns a single-line string of the form
+//   "DP budget: [#####-----] 50% (500/1000 milli eps consumed; last query 12s ago)"
+// or
+//   "DP budget: [----------] 0% (0/1000 milli eps consumed; no queries yet)"
+// when nothing has been spent. `width` is the bar width (typically the
+// module default of 10). `now_ns` is the chat's "now" (so the rendering
+// is stable for a single status command).
+fn dpui_status_line(dp, width, now_ns) {
+    if dp == 0 { return "DP budget: (not configured)" }
+    let consumed = dp_budget_consumed_milli(dp)
+    let total = dp_budget_total_milli(dp)
+    let bar = dpui_render_bar(consumed, total, width)
+    let pct = _dpui_pct_whole(consumed, total)
+    let last = dp_last_query_ns(dp)
+    let recency = _dpui_recency(last, now_ns)
+    let line = "DP budget: " + bar + " "
+        + int_to_str(pct) + "% ("
+        + int_to_str(consumed) + "/" + int_to_str(total)
+        + " milli eps consumed; " + recency + ")"
+    return line
+}
+
+// One-liner for /status (the broader status pane). Differs from
+// dpui_status_line in being tighter (no bar): the /status pane already
+// has 8+ lines of state to print and the bar would consume too much
+// width. Format:
+//   "dp       : 50% used (500/1000 milli eps; 3 queries)"
+// At 0% the form is:
+//   "dp       : 0% used (0/1000 milli eps; no queries yet)"
+fn dpui_status_pane_line(dp) {
+    if dp == 0 { return "dp       : (not configured)" }
+    let consumed = dp_budget_consumed_milli(dp)
+    let total = dp_budget_total_milli(dp)
+    let queries = dp_query_count(dp)
+    let pct = _dpui_pct_whole(consumed, total)
+    let tail = ""
+    if queries == 0 {
+        tail = "no queries yet"
+    } else {
+        tail = int_to_str(queries) + " quer" + _dpui_plural(queries)
+    }
+    return "dp       : " + int_to_str(pct) + "% used ("
+        + int_to_str(consumed) + "/" + int_to_str(total)
+        + " milli eps; " + tail + ")"
+}
+
+// Tiny pluralizer for "1 query" / "N queries".
+fn _dpui_plural(n) {
+    if n == 1 { return "y" }
+    return "ies"
+}
+
+// Warn line. Printed when dp_budget_should_warn(dp) returns 1. Format:
+//   "DP warning: 85% of budget consumed (850/1000 milli eps; remaining 150 milli eps)"
+// Returns the string; the caller is responsible for io_println + the
+// dp_warn_mark_emitted call.
+fn dpui_warn_line(dp) {
+    let consumed = dp_budget_consumed_milli(dp)
+    let total = dp_budget_total_milli(dp)
+    let rem = dp_budget_remaining_milli(dp)
+    let pct = _dpui_pct_whole(consumed, total)
+    return "DP warning: " + int_to_str(pct) + "% of budget consumed ("
+        + int_to_str(consumed) + "/" + int_to_str(total)
+        + " milli eps; remaining " + int_to_str(rem) + " milli eps)"
+}
+
+// ---- log rendering --------------------------------------------------------
+// Log-rendering helper that emits a header line + the rendered entries.
+// Returns a list of strings (caller prints each via io_println).
+//   "DP query log (last N of M):"
+//   "  1. atoms -> 100 milli-eps (1s ago)"
+//   "  2. belief -> 100 milli-eps (0s ago)"
+//   ...
+// On an empty log, returns ["DP query log: (empty)"]. `now_ns` flows
+// through to dp_query_log_render so the rendered "Xs ago" deltas are
+// stable for a single /dp log invocation.
+fn dpui_log_lines(dp, last_n, now_ns) {
+    let out = list_new()
+    let total = dp_query_log_count(dp)
+    if total == 0 {
+        push(out, "DP query log: (empty)")
+        return out
+    }
+    let n = last_n
+    if n <= 0 { n = total }
+    let shown = n
+    if shown > total { shown = total }
+    push(out, "DP query log (last " + int_to_str(shown) + " of "
+        + int_to_str(total) + "):")
+    let rendered = dp_query_log_render(dp, last_n, now_ns)
+    let i = 0
+    while i < len(rendered) {
+        push(out, rendered[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- usage ---------------------------------------------------------------
+// Usage / help text for /dp with no argument. Returned as a list of
+// strings; caller io_prints each. Kept here (not in the chat module) so
+// the message can be unit-tested without booting the chat.
+fn dpui_usage_lines() {
+    let out = list_new()
+    push(out, "/dp <subcommand> -- differential-privacy budget management")
+    push(out, "  /dp status              consumption bar + remaining budget")
+    push(out, "  /dp log [N]             last N queries (default 10)")
+    push(out, "  /dp warn <threshold>    set warn-at-consumption threshold (milli-eps)")
+    push(out, "  /dp reset <new_total>   admin reset (requires explicit confirm word)")
+    return out
+}
+
+// ---- /dp chat dispatcher --------------------------------------------------
+// The chat side (examples/crossengin_chat.nova) routes `/dp` to this single
+// entry point so the per-subcommand wiring lives here. Returns 1 always
+// (the admin command is always handled even if the subcommand is unknown
+// -- that case prints the usage block).
+//
+// `arg` is the full post-command portion of the input line ("status",
+// "log 5", "warn 700", "reset 5000 confirm", or empty for the usage
+// block).
+//
+// I/O note: `io_println` is fine in this module -- the privacy primitive
+// proper is in differential_privacy.nova; this file is the chat-
+// presentation layer and naturally does I/O.
+fn admin_dp_dispatch(dp, arg) {
+    if dp == 0 {
+        io_println("(DP not configured for this session)")
+        return 1
+    }
+    if len(arg) == 0 { return _dpui_print_usage() }
+    let sub = _dpui_first_word(arg)
+    let tail = _dpui_rest(arg)
+    if str_eq(sub, "status") == 1 { return _dpui_cmd_status(dp) }
+    if str_eq(sub, "log") == 1    { return _dpui_cmd_log(dp, tail) }
+    if str_eq(sub, "warn") == 1   { return _dpui_cmd_warn(dp, tail) }
+    if str_eq(sub, "reset") == 1  { return _dpui_cmd_reset(dp, tail) }
+    io_println("(/dp: unknown subcommand '" + sub + "')")
+    return _dpui_print_usage()
+}
+
+// First space-delimited word of `s`. "log 5" -> "log". "" -> "".
+fn _dpui_first_word(s) {
+    let i = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 { return substr(s, 0, i) }
+        i = i + 1
+    }
+    return s
+}
+
+// Substring after the first space, leading/trailing whitespace trimmed.
+// "log 5" -> "5". "log" -> "".
+fn _dpui_rest(s) {
+    let i = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            return str_trim(substr(s, i + 1, len(s) - i - 1))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// /dp status -- bar + remaining + last query.
+fn _dpui_cmd_status(dp) {
+    io_println(dpui_status_line(dp, DPUI_BAR_WIDTH_DEFAULT, nanotime()))
+    return 1
+}
+
+// /dp log [N] -- last N queries.
+fn _dpui_cmd_log(dp, tail) {
+    let n = DPUI_LOG_DEFAULT_N
+    if len(tail) > 0 {
+        let v = _dpui_str_to_int(tail)
+        if v > 0 { n = v }
+    }
+    let lines = dpui_log_lines(dp, n, nanotime())
+    let i = 0
+    while i < len(lines) {
+        io_println(lines[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// /dp warn <threshold> -- set the warn threshold (milli-eps).
+fn _dpui_cmd_warn(dp, tail) {
+    if len(tail) == 0 {
+        io_println("(usage: /dp warn <threshold-milli-eps>; current="
+            + int_to_str(dp_budget_warn_threshold(dp)) + ")")
+        return 1
+    }
+    let v = _dpui_str_to_int(tail)
+    if v < 0 {
+        io_println("(/dp warn: threshold must be a non-negative integer)")
+        return 1
+    }
+    let ok = dp_budget_warn_set(dp, v)
+    if ok == 0 {
+        io_println("(/dp warn: rejected value " + tail + ")")
+        return 1
+    }
+    io_println("dp warn threshold set to "
+        + int_to_str(dp_budget_warn_threshold(dp)) + " milli-eps")
+    return 1
+}
+
+// /dp reset <new_total> -- admin reset. Requires an explicit second word
+// "confirm" so an accidental `/dp reset` does not blow away the audit
+// history. Format: "/dp reset 5000 confirm". A reset without "confirm"
+// prints the warning + the proposed value but does NOT touch the budget.
+fn _dpui_cmd_reset(dp, tail) {
+    if len(tail) == 0 {
+        io_println("(usage: /dp reset <new-total-milli-eps> confirm)")
+        return 1
+    }
+    let first = _dpui_first_word(tail)
+    let rest = _dpui_rest(tail)
+    let v = _dpui_str_to_int(first)
+    if v <= 0 {
+        io_println("(/dp reset: total must be a positive integer; got '"
+            + first + "')")
+        return 1
+    }
+    if str_eq(rest, "confirm") == 0 {
+        io_println("dp reset PENDING: would set total to " + int_to_str(v)
+            + " milli-eps (re-run with 'confirm' to apply)")
+        return 1
+    }
+    let prev_total = dp_budget_total_milli(dp)
+    let prev_consumed = dp_budget_consumed_milli(dp)
+    dp_reset_budget(dp, v)
+    io_println("dp reset OK: total " + int_to_str(prev_total) + " -> "
+        + int_to_str(v) + " milli-eps (was " + int_to_str(prev_consumed)
+        + " consumed; reset_count=" + int_to_str(dp_reset_count(dp)) + ")")
+    return 1
+}
+
+fn _dpui_print_usage() {
+    let u = dpui_usage_lines()
+    let i = 0
+    while i < len(u) {
+        io_println(u[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// Local str-to-int. Returns -1 on parse error so the caller can
+// distinguish "0" (valid) from "garbage" (invalid). Mirrors
+// _dp_str_to_int's semantics but treats garbage as -1, not 0.
+fn _dpui_str_to_int(s) {
+    let n = 0
+    let i = 0
+    if len(s) == 0 { return -1 }
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return -1 }
+        if c > 57 { return -1 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    return n
+}

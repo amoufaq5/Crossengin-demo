@@ -1,0 +1,1209 @@
+// CrossEngin io/effectors: pure-substrate audio synthesis.
+//
+// Purpose
+//   Phase 19 Tier-4 item #1 (P2.6 upgrade): the audio modality bridge,
+//   Mode-1 floor. The original P19 module shipped a pure-NOVA sine-only
+//   phoneme synth (one carrier per phoneme, triangular envelope, 44-byte
+//   RIFF/WAVE/PCM written via the sys_write floor) -- audibly a sequence
+//   of phonemes but comically robotic. P2.6 swaps the carrier for a
+//   simplified-Klatt two-formant synthesizer for noticeably better quality
+//   while preserving every wire-format invariant: still 8 kHz, still 16-bit
+//   PCM mono, still 150 ms per phoneme = 1200 samples, still the same
+//   `audio_write_wav` byte layout. The OLD sine-only path stays as
+//   `synth_phoneme_sine` for tests + A/B comparison.
+//
+//   Klatt-style two-formant model (the simplified one -- full Klatt is
+//   years of engineering): per phoneme we look up [F1, F2, F3, kind] in a
+//   hardcoded formant table covering 20+ common ARPABET-ish atoms:
+//     - 12 vowels: F1 + F2 (we skip F3 -- it doubles the work for marginal
+//       quality at 8 kHz; the F2/F3 boundary at ~3 kHz isn't well-resolved
+//       at that sample rate anyway). Two cosine carriers summed at equal
+//       amplitude per sample -> formant envelope is the sum.
+//     - 4 plosives (b/d/g/k/p/t): 5 ms silence + 30 ms noise-burst -- the
+//       LCG pseudo-noise filtered through a single high-F2 formant.
+//     - 4 fricatives (s/sh/f/th/v/z): 120 ms of LCG pseudo-noise scaled to
+//       half amplitude (white noise sounds like a fricative when summed at
+//       a moderate amplitude; full Klatt would high-pass filter it).
+//     - Nasal "n"/"m"/"ng": single damped formant ~250..500 Hz. The damped
+//       envelope (exponential-decay-ish, integer linear approximation)
+//       produces the muffled nasal quality.
+//     - Anything else falls back to the 440 Hz placeholder (unchanged).
+//
+//   Anti-click ADSR: every synthesized phoneme gets a 5 ms attack + sustain
+//   + 10 ms release envelope so phoneme boundaries don't audibly tick. The
+//   old triangular envelope (n/4 each side) lives on as `_apply_envelope`
+//   for `synth_phoneme_sine`; the new envelope `_envelope` takes explicit
+//   attack/hold/release in ms so plosive bursts and vowel sustains can
+//   share the implementation.
+//
+//   Pseudo-noise (for fricatives + plosive bursts): a Linear Congruential
+//   Generator with a fixed seed -- `state = state * 31 + 7; sample =
+//   state & 0x7FFF` produces ±16k-amplitude noise that sounds like a hiss
+//   at 8 kHz. The small multiplier (31 instead of the textbook 1103515245)
+//   stays well under NOVA's codegen pointer-threshold (blocker #11). Seed
+//   is a process-local global `_lcg_seed` -- deterministic across runs so
+//   the same input text always produces the same bytes (the brief calls
+//   out the determinism test).
+//
+//   Synth-mode selector: `CE_SYNTH_MODE` env switches the synth strategy:
+//     - "klatt"   (default): the new two-formant + LCG fricative path
+//     - "sine"    (legacy): the pre-P2.6 single-carrier path for A/B
+//     - "silence" (CI): emits 1 s of zeros (still a valid 8000-sample WAV)
+//   The selector lives at synthesis time (per phoneme), so a single env
+//   switch flips the WHOLE audio output without disturbing the WAV writer.
+//
+//   Wire format: PCM16 bytes are little-endian by construction, samples
+//   stay bounded by AUDIO_AMPLITUDE (16000, well under 32767), and writes
+//   go through sys_open/sys_write/sys_fsync/sys_close so the file is
+//   durable before any aplay reader opens it (same contract as
+//   snapshot_disk.nova's write_durable). Caller composes Modes 2/3 above
+//   this floor; see audio_speak.nova.
+//
+//   The synthesizer accesses the language KG for phoneme references via
+//   word_atoms.nova's `word_phonemes(word)` cross-ref (when the seed or the
+//   learner has installed them). Words without recorded phonemes fall back
+//   to a one-syllable-per-word policy at a carrier derived from the word's
+//   length, so synth_text("hello", 0) always produces audible output even
+//   on the cold seed.
+//
+// ADRs implemented: ADR-0014 (modality bridge -- the audio leg), ADR-0015
+//   (phoneme atoms feed the synth), ADR-0013 (output is the terminal stage of
+//   substrate generation). NOVA dependencies: builtins (alloc/store8/store64/
+//   list_*) + sys_open/sys_write/sys_fsync/sys_close from std/syscall +
+//   getenv (for CE_SYNTH_MODE). CrossEngin dependencies:
+//   src/language/phoneme_atoms.nova (-> word_atoms -> kg) -- for
+//   word_phonemes and phoneme symbol lookup.
+
+import "std/syscall"
+import "../../language/phoneme_atoms.nova"
+
+// ---- audio constants ------------------------------------------------------
+
+let AUDIO_SAMPLE_RATE  = 8000     // Hz; tiny files at full audibility
+let AUDIO_BITS_PER_SAMPLE = 16
+let AUDIO_CHANNELS     = 1        // mono
+let AUDIO_AMPLITUDE    = 16000    // peak PCM16 value (well below 32767)
+let AUDIO_PHONEME_MS   = 150      // ~150ms per phoneme atom
+// 150ms @ 8000Hz = 1200 samples per phoneme. Hard-coded so tests can
+// assert without recomputing.
+let AUDIO_PHONEME_SAMPLES = 1200
+
+// Envelope shape: triangular ramp-up over the first envelope-frac of the
+// phoneme, sustain at peak, ramp-down over the last envelope-frac. Keeps
+// edges click-free.
+let AUDIO_ENV_FRAC = 4            // 1/4 of duration ramps each side
+
+// Klatt anti-click ADSR: 5 ms attack + n-(attack+release) ms hold + 10 ms
+// release. At 8 kHz: attack=40 samples, release=80 samples. Hold = whatever
+// fits between them. Total still equals n (caller-supplied).
+let AUDIO_ATTACK_MS  = 5
+let AUDIO_RELEASE_MS = 10
+
+// Phoneme kinds the formant table returns. The synth dispatches on these.
+let PHO_KIND_UNKNOWN   = 0
+let PHO_KIND_VOWEL     = 1
+let PHO_KIND_PLOSIVE   = 2
+let PHO_KIND_FRICATIVE = 3
+let PHO_KIND_NASAL     = 4
+// P6 expansion: diphthongs glide between two formant targets; affricates
+// concat a plosive then a fricative; syllabic nasals/liquids carry the
+// syllable nucleus with reduced amplitude.
+let PHO_KIND_DIPHTHONG = 5
+let PHO_KIND_AFFRICATE = 6
+let PHO_KIND_SYLLABIC  = 7
+
+// Synth mode selector -- read once from CE_SYNTH_MODE at first synthesis
+// call (cached in _synth_mode_cache). Values: "klatt" (default), "sine"
+// (legacy), "silence" (CI).
+let SYNTH_MODE_KLATT   = 1
+let SYNTH_MODE_SINE    = 2
+let SYNTH_MODE_SILENCE = 3
+let _synth_mode_cache = 0       // 0 = unset; first call resolves and caches
+
+// ---- sine table -----------------------------------------------------------
+//
+// A 256-entry quarter-wave table built via Bhaskara's degree-domain sine
+// approximation in integer arithmetic. The approximation:
+//
+//   sin(deg) ~= (4 * deg * (180 - deg)) / (40500 - deg * (180 - deg))
+//
+// is accurate to ~1.7% across [0, 180]. We sample 256 points across [0, 90]
+// (so the table indexes are quarter-period steps) and scale to AUDIO_AMPLITUDE.
+// Full-period values come from 4-fold symmetry:
+//
+//   q in [0..255]                -> +table[q]              (Q1)
+//   q in [256..511]              -> +table[511 - q]        (Q2)
+//   q in [512..767]              -> -table[q - 512]        (Q3)
+//   q in [768..1023]             -> -table[1023 - q]       (Q4)
+//
+// One period = 1024 entries; pointer-thresholds in the loop never exceed
+// AUDIO_AMPLITUDE * 180 < 3e6, well under the NOVA loop-multiply ceiling
+// (blocker #11).
+
+let _SIN_TABLE_SIZE = 256        // quarter-wave entries
+let _SIN_PERIOD     = 1024       // full-wave entries via 4-fold symmetry
+
+let _sin_table = 0               // initialized lazily on first synth_sine
+
+fn _sin_q_milli(deg) {
+    // Bhaskara, scaled to milli (1000 = sin(90)).
+    let prod = deg * (180 - deg)
+    let num = 4 * prod * 1000
+    let den = 40500 - prod
+    if den <= 0 { return 1000 }
+    return num / den
+}
+
+// Build the 256-entry quarter-wave table mapping index 0..255 -> 0..AMPLITUDE.
+// We sample at deg = i * 90 / 255 across [0, 90], so the last entry is the
+// peak. Idempotent: re-calling installs the same values.
+fn _sin_table_init() {
+    if _sin_table != 0 { return _sin_table }
+    let t = list_new()
+    let i = 0
+    while i < _SIN_TABLE_SIZE {
+        // Degree in [0..90]; integer-precise division for both ends.
+        let deg = (i * 90) / (_SIN_TABLE_SIZE - 1)
+        let milli = _sin_q_milli(deg)
+        let amp = (milli * AUDIO_AMPLITUDE) / 1000
+        push(t, amp)
+        i = i + 1
+    }
+    _sin_table = t
+    return t
+}
+
+// Look up sin(theta) for theta in 0..1023 (one period), returning a signed
+// integer in [-AMPLITUDE..+AMPLITUDE]. 4-fold symmetry off the quarter table.
+fn _sin_lookup(phase) {
+    let t = _sin_table_init()
+    let p = phase
+    while p < 0 { p = p + _SIN_PERIOD }
+    p = p - (p / _SIN_PERIOD) * _SIN_PERIOD
+    if p < _SIN_TABLE_SIZE {
+        return t[p]                              // Q1
+    }
+    if p < 2 * _SIN_TABLE_SIZE {
+        return t[2 * _SIN_TABLE_SIZE - 1 - p]    // Q2
+    }
+    if p < 3 * _SIN_TABLE_SIZE {
+        return 0 - t[p - 2 * _SIN_TABLE_SIZE]    // Q3
+    }
+    return 0 - t[4 * _SIN_TABLE_SIZE - 1 - p]    // Q4
+}
+
+// Public sample lookup for callers / tests. Wraps phase to one period.
+fn audio_sine_sample(phase) {
+    return _sin_lookup(phase)
+}
+
+// ---- WAV header -----------------------------------------------------------
+//
+// Builds the 44-byte RIFF/WAVE/PCM header as a list of 44 ints (one byte
+// each, 0..255). Returned as a list so callers can introspect; the writer
+// appends the PCM data directly with the same byte semantics.
+//
+// Layout (RIFF little-endian throughout):
+//   0..3   "RIFF"
+//   4..7   chunk size = 36 + data_size              (LE u32)
+//   8..11  "WAVE"
+//   12..15 "fmt "
+//   16..19 fmt chunk size = 16                      (LE u32)
+//   20..21 audio format = 1 (PCM)                   (LE u16)
+//   22..23 n channels = 1 (mono)                    (LE u16)
+//   24..27 sample rate                              (LE u32)
+//   28..31 byte rate = sample_rate * 2              (LE u32)
+//   32..33 block align = 2                          (LE u16)
+//   34..35 bits per sample = 16                     (LE u16)
+//   36..39 "data"
+//   40..43 data size = n_samples * 2                (LE u32)
+
+fn _push_le_u16(buf, v) {
+    push(buf, v & 255)
+    push(buf, (v / 256) & 255)
+    return buf
+}
+
+fn _push_le_u32(buf, v) {
+    push(buf, v & 255)
+    push(buf, (v / 256) & 255)
+    push(buf, (v / 65536) & 255)
+    push(buf, (v / 16777216) & 255)
+    return buf
+}
+
+fn _push_ascii(buf, s) {
+    let i = 0
+    while i < len(s) {
+        push(buf, char_at(s, i))
+        i = i + 1
+    }
+    return buf
+}
+
+fn wav_header(sample_rate, n_samples) {
+    let data_size = n_samples * 2
+    let h = list_new()
+    _push_ascii(h, "RIFF")                          // 0..3
+    _push_le_u32(h, 36 + data_size)                 // 4..7
+    _push_ascii(h, "WAVE")                          // 8..11
+    _push_ascii(h, "fmt ")                          // 12..15
+    _push_le_u32(h, 16)                             // 16..19 fmt chunk size
+    _push_le_u16(h, 1)                              // 20..21 PCM
+    _push_le_u16(h, AUDIO_CHANNELS)                 // 22..23 mono
+    _push_le_u32(h, sample_rate)                    // 24..27
+    _push_le_u32(h, sample_rate * 2)                // 28..31 byte rate
+    _push_le_u16(h, 2)                              // 32..33 block align
+    _push_le_u16(h, AUDIO_BITS_PER_SAMPLE)          // 34..35 bps
+    _push_ascii(h, "data")                          // 36..39 canonical PCM marker
+    _push_le_u32(h, data_size)                      // 40..43
+    return h
+}
+
+fn wav_header_byte(h, i) {
+    if i < 0 { return 0 }
+    if i >= len(h) { return 0 }
+    return h[i]
+}
+
+// ---- sine generation ------------------------------------------------------
+//
+// Generates n_samples PCM16 samples of a sine wave at freq_hz, sampled at
+// sample_rate. Integer math throughout:
+//
+//   phase(t) = (t * freq_hz * _SIN_PERIOD / sample_rate) mod _SIN_PERIOD
+//
+// Intermediate t*freq stays under 1e8 for our parameters (1200 samples,
+// 1000 Hz peak), well clear of the NOVA loop-multiply ceiling (blocker #11).
+
+fn synth_sine(freq_hz, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    _sin_table_init()
+    // Bresenham-style phase generator: keep all loop-body intermediates
+    // small (<~16k) so the NOVA codegen loop-multiply pointer threshold
+    // (blocker #11, ~1M for audio loops) is never crossed. The wide
+    // outside-loop products (freq * 1024 / sample_rate) are safe -- the
+    // blocker only bites inside the loop body.
+    //
+    //   step_int  = floor(freq * 1024 / sample_rate)
+    //   step_num  = (freq * 1024) mod sample_rate
+    //   err += step_num per sample; when err >= sample_rate, phase += 1
+    //   phase wraps modulo 1024 with a subtract (no multiply).
+    let product = freq_hz * _SIN_PERIOD       // outside the loop
+    let step_int = product / sample_rate      // outside the loop
+    let step_num = product - step_int * sample_rate
+    let phase = 0
+    let err = 0
+    let t = 0
+    while t < n_samples {
+        push(samples, _sin_lookup(phase))
+        phase = phase + step_int
+        err = err + step_num
+        if err >= sample_rate {
+            err = err - sample_rate
+            phase = phase + 1
+        }
+        while phase >= _SIN_PERIOD { phase = phase - _SIN_PERIOD }
+        t = t + 1
+    }
+    return samples
+}
+
+// Apply a triangular envelope in place over `samples` (returns the same list).
+// Ramp up over the first n/AUDIO_ENV_FRAC samples, sustain at full, ramp down
+// over the last n/AUDIO_ENV_FRAC samples. Keeps edges click-free between
+// concatenated phonemes. Retained for `synth_phoneme_sine` (the legacy path).
+fn _apply_envelope(samples) {
+    let n = len(samples)
+    if n == 0 { return samples }
+    let ramp = n / AUDIO_ENV_FRAC
+    if ramp < 1 { ramp = 1 }
+    let i = 0
+    while i < n {
+        let g = 1000   // 1.0 in milli
+        if i < ramp {
+            g = (i * 1000) / ramp
+        } else {
+            if i >= n - ramp {
+                let k = n - 1 - i
+                g = (k * 1000) / ramp
+            }
+        }
+        samples[i] = (samples[i] * g) / 1000
+        i = i + 1
+    }
+    return samples
+}
+
+// ---- LCG pseudo-noise -----------------------------------------------------
+//
+// Linear Congruential Generator for fricative + plosive-burst noise. Uses
+// a SMALL multiplier (31, not 1103515245) so the loop-body product stays
+// well under the NOVA codegen pointer threshold (blocker #11). The cycle
+// length is shorter than a textbook LCG but at 8 kHz / 120 ms = 960 samples
+// per fricative the perceptual difference is nil -- it still sounds like
+// hiss. Seed is a process-local global so the same input deterministically
+// produces the same noise (the brief calls out the determinism test).
+
+let _LCG_DEFAULT_SEED = 12345
+let _lcg_seed = 12345          // mutable global; reset by _lcg_reset()
+
+fn _lcg_reset() {
+    _lcg_seed = _LCG_DEFAULT_SEED
+    return _lcg_seed
+}
+
+// Advance the seed once and return a sample in [-amp..+amp]. Keep
+// intermediates small: NOVA's codegen pointer-threshold (blocker #11)
+// crashes when an in-loop multiply produces a value above ~1M. So we
+// mask the seed to 20 bits (= 1048575) BEFORE every multiply -- so the
+// product state*31 stays under ~32M (still over 1M but only briefly,
+// and the next mask brings it back). In practice the 1048575 mask is
+// the tightest one verified stable in the host's NOVA build.
+fn _lcg_next(amp) {
+    // Mask first so the LHS is bounded to 20 bits.
+    _lcg_seed = _lcg_seed & 1048575
+    _lcg_seed = _lcg_seed * 31 + 7
+    let sample = _lcg_seed & 32767                    // unsigned 15-bit
+    return (sample - 16384) * amp / 16384             // signed ~ [-amp..+amp]
+}
+
+// Public reset for tests; resets the seed to the default so the noise is
+// reproducible across test runs.
+fn audio_lcg_reset() {
+    return _lcg_reset()
+}
+
+fn audio_lcg_next(amp) {
+    return _lcg_next(amp)
+}
+
+// ---- ADSR envelope (Klatt anti-click) ------------------------------------
+//
+// Apply a linear attack + sustain + release envelope IN PLACE over samples.
+// attack_ms = 5, release_ms = 10 by default (the brief's anti-click numbers).
+// hold_ms = (n samples / sample_rate * 1000) - attack - release; computed
+// internally. If the buffer is shorter than attack + release, we shrink the
+// ramps proportionally so each ramp gets at least 1 sample.
+
+fn _envelope(samples, attack_ms, hold_ms, release_ms, sample_rate) {
+    let n = len(samples)
+    if n == 0 { return samples }
+    let atk = (attack_ms * sample_rate) / 1000
+    let rel = (release_ms * sample_rate) / 1000
+    if atk < 1 { atk = 1 }
+    if rel < 1 { rel = 1 }
+    // If buffer is too short to fit both ramps, fall back to triangular
+    // (n/2 each side). This handles the 5 ms silence + 30 ms burst plosive
+    // shape where each segment is shorter than the default attack.
+    if atk + rel > n {
+        atk = n / 2
+        rel = n / 2
+        if atk < 1 { atk = 1 }
+        if rel < 1 { rel = 1 }
+    }
+    let i = 0
+    while i < n {
+        let g = 1000          // 1.0 in milli
+        if i < atk {
+            g = (i * 1000) / atk
+        } else {
+            if i >= n - rel {
+                let k = n - 1 - i
+                g = (k * 1000) / rel
+            }
+        }
+        samples[i] = (samples[i] * g) / 1000
+        i = i + 1
+    }
+    return samples
+}
+
+// Public envelope wrapper for tests. Returns the input list (mutated).
+fn audio_envelope(samples, attack_ms, hold_ms, release_ms, sample_rate) {
+    return _envelope(samples, attack_ms, hold_ms, release_ms, sample_rate)
+}
+
+// ---- formant table --------------------------------------------------------
+//
+// Per-phoneme formant + kind lookup. Returns a 4-element list
+// [F1, F2, F3, kind].  F3 stays 0 for vowels (we skip it -- the simplified
+// Klatt model -- but the slot is preserved so a full-Klatt upgrade slots
+// in). For non-vowels F1/F2/F3 may carry kind-specific carrier hints.
+//
+// For diphthongs, the 4-element output carries the START formants and the
+// DIPHTHONG kind; the END formants come from `_diphthong_end_formants(label)`
+// and the glide duration is implicit (entire phoneme length).
+//
+// Formant values from the Hillenbrand 1995 vowel formant tables (average
+// adult male, edited for the 8 kHz Nyquist of our sample rate so F3 entries
+// > 3500 are clipped). Plosive bursts use a high-F2 carrier hint to flavor
+// the noise; fricative carrier hints are not used (the noise is amplitude-
+// shaped, not formant-shaped).
+//
+// P6 expansion: full ARPAbet (~44 phonemes). Added: 6 more monophthongs
+// (er, uh, ao, ax, ix, axr), 4 diphthongs (aw, ay, ey, oy -- ow remains a
+// vowel because it was already in the table; arguably it's a diphthong too,
+// but the existing entry preserves byte-for-byte backward compat), 2
+// affricates (ch, jh), 2 voiced fricatives (dh, zh), and 4 syllabic
+// nasals/liquids (em, en, eng, el). 33 + 18 = 51 dispatches, 44 distinct
+// ARPAbet symbols (since some have multiple aliases like a/ah and o/oh/ao).
+
+fn _phoneme_formants(label) {
+    let s = str_trim(label)
+    let out = list_new()
+    // ---- vowels (F1, F2, F3, VOWEL) ---------------------------------
+    if str_eq(s, "a")  == 1 { push(out, 730);  push(out, 1090); push(out, 2440); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "aa") == 1 { push(out, 730);  push(out, 1090); push(out, 2440); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ah") == 1 { push(out, 730);  push(out, 1090); push(out, 2440); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "e")  == 1 { push(out, 530);  push(out, 1840); push(out, 2480); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "eh") == 1 { push(out, 530);  push(out, 1840); push(out, 2480); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "i")  == 1 { push(out, 270);  push(out, 2290); push(out, 3010); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "iy") == 1 { push(out, 270);  push(out, 2290); push(out, 3010); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ih") == 1 { push(out, 390);  push(out, 1990); push(out, 2550); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "o")  == 1 { push(out, 570);  push(out, 840);  push(out, 2410); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "oh") == 1 { push(out, 570);  push(out, 840);  push(out, 2410); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ao") == 1 { push(out, 570);  push(out, 840);  push(out, 2410); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ow") == 1 { push(out, 470);  push(out, 990);  push(out, 2300); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "u")  == 1 { push(out, 300);  push(out, 870);  push(out, 2240); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "uw") == 1 { push(out, 300);  push(out, 870);  push(out, 2240); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "uh") == 1 { push(out, 440);  push(out, 1020); push(out, 2240); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ae") == 1 { push(out, 660);  push(out, 1720); push(out, 2410); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "er") == 1 { push(out, 490);  push(out, 1350); push(out, 1690); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ax") == 1 { push(out, 500);  push(out, 1500); push(out, 2500); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "ix") == 1 { push(out, 400);  push(out, 1700); push(out, 2500); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "axr") == 1 { push(out, 460); push(out, 1310); push(out, 1600); push(out, PHO_KIND_VOWEL); return out }
+    // ---- diphthongs (START formants; END comes from _diphthong_end_formants) -
+    if str_eq(s, "aw") == 1 { push(out, 730);  push(out, 1090); push(out, 2440); push(out, PHO_KIND_DIPHTHONG); return out }
+    if str_eq(s, "ay") == 1 { push(out, 660);  push(out, 1230); push(out, 2440); push(out, PHO_KIND_DIPHTHONG); return out }
+    if str_eq(s, "ey") == 1 { push(out, 530);  push(out, 1840); push(out, 2480); push(out, PHO_KIND_DIPHTHONG); return out }
+    if str_eq(s, "oy") == 1 { push(out, 570);  push(out, 840);  push(out, 2410); push(out, PHO_KIND_DIPHTHONG); return out }
+    // ---- plosives (silence + burst; carrier is high-F2 hint) --------
+    if str_eq(s, "p")  == 1 { push(out, 0);    push(out, 1800); push(out, 0); push(out, PHO_KIND_PLOSIVE); return out }
+    if str_eq(s, "t")  == 1 { push(out, 0);    push(out, 3200); push(out, 0); push(out, PHO_KIND_PLOSIVE); return out }
+    if str_eq(s, "k")  == 1 { push(out, 0);    push(out, 2800); push(out, 0); push(out, PHO_KIND_PLOSIVE); return out }
+    if str_eq(s, "b")  == 1 { push(out, 0);    push(out, 1500); push(out, 0); push(out, PHO_KIND_PLOSIVE); return out }
+    if str_eq(s, "d")  == 1 { push(out, 0);    push(out, 2700); push(out, 0); push(out, PHO_KIND_PLOSIVE); return out }
+    if str_eq(s, "g")  == 1 { push(out, 0);    push(out, 2400); push(out, 0); push(out, PHO_KIND_PLOSIVE); return out }
+    // ---- affricates (sequenced plosive+fricative; carrier hint unused) -----
+    if str_eq(s, "ch") == 1 { push(out, 0);    push(out, 2800); push(out, 0); push(out, PHO_KIND_AFFRICATE); return out }
+    if str_eq(s, "jh") == 1 { push(out, 0);    push(out, 2500); push(out, 0); push(out, PHO_KIND_AFFRICATE); return out }
+    // ---- fricatives (pseudo-noise; carrier hints unused) ------------
+    if str_eq(s, "s")  == 1 { push(out, 0);    push(out, 3500); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "z")  == 1 { push(out, 0);    push(out, 3200); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "f")  == 1 { push(out, 0);    push(out, 3800); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "v")  == 1 { push(out, 0);    push(out, 3300); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "sh") == 1 { push(out, 0);    push(out, 2800); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "zh") == 1 { push(out, 0);    push(out, 2500); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "th") == 1 { push(out, 0);    push(out, 3000); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "dh") == 1 { push(out, 0);    push(out, 2400); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "h")  == 1 { push(out, 0);    push(out, 2500); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    if str_eq(s, "hh") == 1 { push(out, 0);    push(out, 2500); push(out, 0); push(out, PHO_KIND_FRICATIVE); return out }
+    // ---- nasals (single damped formant ~500 Hz) ---------------------
+    if str_eq(s, "n")  == 1 { push(out, 310);  push(out, 0);    push(out, 0); push(out, PHO_KIND_NASAL); return out }
+    if str_eq(s, "m")  == 1 { push(out, 280);  push(out, 0);    push(out, 0); push(out, PHO_KIND_NASAL); return out }
+    if str_eq(s, "ng") == 1 { push(out, 260);  push(out, 0);    push(out, 0); push(out, PHO_KIND_NASAL); return out }
+    // ---- syllabic nasals/liquids (carry the syllable nucleus; reduced amp) -
+    if str_eq(s, "em") == 1 { push(out, 280);  push(out, 0);    push(out, 0); push(out, PHO_KIND_SYLLABIC); return out }
+    if str_eq(s, "en") == 1 { push(out, 310);  push(out, 0);    push(out, 0); push(out, PHO_KIND_SYLLABIC); return out }
+    if str_eq(s, "eng") == 1 { push(out, 260); push(out, 0);    push(out, 0); push(out, PHO_KIND_SYLLABIC); return out }
+    if str_eq(s, "el") == 1 { push(out, 360);  push(out, 1300); push(out, 2700); push(out, PHO_KIND_SYLLABIC); return out }
+    // ---- liquids treated as vowels (l/r/w/y) ------------------------
+    if str_eq(s, "l")  == 1 { push(out, 360);  push(out, 1300); push(out, 2700); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "r")  == 1 { push(out, 340);  push(out, 1300); push(out, 1600); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "w")  == 1 { push(out, 290);  push(out, 600);  push(out, 2300); push(out, PHO_KIND_VOWEL); return out }
+    if str_eq(s, "y")  == 1 { push(out, 380);  push(out, 2200); push(out, 2700); push(out, PHO_KIND_VOWEL); return out }
+    // ---- unknown -----------------------------------------------------
+    push(out, 440); push(out, 0); push(out, 0); push(out, PHO_KIND_UNKNOWN)
+    return out
+}
+
+// Public accessor for tests.
+fn phoneme_formants(label) {
+    return _phoneme_formants(label)
+}
+
+// ---- diphthong end-formants -----------------------------------------------
+//
+// Diphthongs glide from one vowel target to another over the phoneme
+// duration. The START formants come from `_phoneme_formants`; the END
+// formants are kept in this small parallel table so the start table stays
+// in the same 4-element layout as every other phoneme kind. Linear
+// interpolation between start and end across all 1200 samples.
+//
+// Canonical pairings (American English; Klatt 1980 / Hillenbrand 1995
+// reference vowels):
+//   aw : AA -> UW   (PRICE/MOUTH; "now")     start ~ a-formants, end ~ uw
+//   ay : AE -> IY   (PRICE; "my")             start ~ ae-formants, end ~ iy
+//   ey : EH -> IY   (FACE; "day")             start ~ eh-formants, end ~ iy
+//   oy : AO -> IY   (CHOICE; "boy")           start ~ ao-formants, end ~ iy
+
+fn _diphthong_end_formants(label) {
+    let s = str_trim(label)
+    let out = list_new()
+    if str_eq(s, "aw") == 1 { push(out, 300);  push(out, 870);  push(out, 2240); return out }
+    if str_eq(s, "ay") == 1 { push(out, 270);  push(out, 2290); push(out, 3010); return out }
+    if str_eq(s, "ey") == 1 { push(out, 270);  push(out, 2290); push(out, 3010); return out }
+    if str_eq(s, "oy") == 1 { push(out, 270);  push(out, 2290); push(out, 3010); return out }
+    // unknown / not a diphthong -- return zeros; caller falls back to vowel.
+    push(out, 0); push(out, 0); push(out, 0)
+    return out
+}
+
+// Public accessor for tests.
+fn diphthong_end_formants(label) {
+    return _diphthong_end_formants(label)
+}
+
+// ---- affricate components -------------------------------------------------
+//
+// Affricates are a tightly-coupled plosive + fricative pair:
+//   ch = t + sh   (CHURCH)
+//   jh = d + zh   (JUDGE)
+// Synthesized by concatenating ~40% plosive + ~60% fricative within the
+// 1200-sample phoneme budget. Returned as a 2-element list of phoneme
+// labels [stop_label, fricative_label].
+
+fn _affricate_parts(label) {
+    let s = str_trim(label)
+    let out = list_new()
+    if str_eq(s, "ch") == 1 { push(out, "t"); push(out, "sh"); return out }
+    if str_eq(s, "jh") == 1 { push(out, "d"); push(out, "zh"); return out }
+    return out
+}
+
+// Legacy single-carrier per-phoneme frequency (used by synth_phoneme_sine).
+fn _phoneme_freq(label) {
+    let s = str_trim(label)
+    if str_eq(s, "a")  == 1 { return 700 }
+    if str_eq(s, "e")  == 1 { return 500 }
+    if str_eq(s, "i")  == 1 { return 350 }
+    if str_eq(s, "o")  == 1 { return 450 }
+    if str_eq(s, "u")  == 1 { return 320 }
+    if str_eq(s, "ah") == 1 { return 730 }
+    if str_eq(s, "ae") == 1 { return 660 }
+    if str_eq(s, "eh") == 1 { return 530 }
+    if str_eq(s, "ih") == 1 { return 390 }
+    if str_eq(s, "iy") == 1 { return 270 }
+    if str_eq(s, "oh") == 1 { return 570 }
+    if str_eq(s, "ow") == 1 { return 470 }
+    if str_eq(s, "uw") == 1 { return 300 }
+    if str_eq(s, "p")  == 1 { return 200 }
+    if str_eq(s, "t")  == 1 { return 220 }
+    if str_eq(s, "k")  == 1 { return 240 }
+    if str_eq(s, "b")  == 1 { return 180 }
+    if str_eq(s, "d")  == 1 { return 190 }
+    if str_eq(s, "g")  == 1 { return 210 }
+    if str_eq(s, "s")  == 1 { return 3500 }    // fricative
+    if str_eq(s, "z")  == 1 { return 3200 }
+    if str_eq(s, "f")  == 1 { return 3800 }
+    if str_eq(s, "v")  == 1 { return 3300 }
+    if str_eq(s, "sh") == 1 { return 2800 }
+    if str_eq(s, "h")  == 1 { return 2500 }
+    if str_eq(s, "m")  == 1 { return 280 }     // nasal
+    if str_eq(s, "n")  == 1 { return 310 }
+    if str_eq(s, "ng") == 1 { return 260 }
+    if str_eq(s, "l")  == 1 { return 360 }     // liquid
+    if str_eq(s, "r")  == 1 { return 340 }
+    if str_eq(s, "w")  == 1 { return 290 }
+    if str_eq(s, "y")  == 1 { return 380 }
+    return 440                                  // A4 fallback
+}
+
+// ---- Klatt: vowel synthesis ----------------------------------------------
+//
+// Two cosine carriers (F1 + F2) summed at equal amplitude per sample. We
+// SCALE each to half-amplitude (8000) so the sum never crosses
+// AUDIO_AMPLITUDE (16000). Phase generator is the same Bresenham loop as
+// synth_sine; we just run it twice (once per formant) and sum.
+
+fn _synth_vowel_two_formant(f1, f2, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    _sin_table_init()
+    let half_amp = AUDIO_AMPLITUDE / 2                  // 8000 per formant
+    // f1 phase generator
+    let p1 = f1 * _SIN_PERIOD
+    let s1_int = p1 / sample_rate
+    let s1_num = p1 - s1_int * sample_rate
+    let ph1 = 0
+    let er1 = 0
+    // f2 phase generator (defaults to f1 if f2 == 0 -- single-formant case)
+    let f2u = f2
+    if f2u == 0 { f2u = f1 }
+    let p2 = f2u * _SIN_PERIOD
+    let s2_int = p2 / sample_rate
+    let s2_num = p2 - s2_int * sample_rate
+    let ph2 = 0
+    let er2 = 0
+    let t = 0
+    while t < n_samples {
+        // Sum the two carriers; each contributes half_amp/AUDIO_AMPLITUDE
+        // of the full-scale lookup. _sin_lookup returns ±AUDIO_AMPLITUDE,
+        // so dividing by 2 keeps each ±half_amp; sum stays ±AUDIO_AMPLITUDE.
+        let v1 = _sin_lookup(ph1) / 2
+        let v2 = _sin_lookup(ph2) / 2
+        push(samples, v1 + v2)
+        ph1 = ph1 + s1_int
+        er1 = er1 + s1_num
+        if er1 >= sample_rate { er1 = er1 - sample_rate; ph1 = ph1 + 1 }
+        while ph1 >= _SIN_PERIOD { ph1 = ph1 - _SIN_PERIOD }
+        ph2 = ph2 + s2_int
+        er2 = er2 + s2_num
+        if er2 >= sample_rate { er2 = er2 - sample_rate; ph2 = ph2 + 1 }
+        while ph2 >= _SIN_PERIOD { ph2 = ph2 - _SIN_PERIOD }
+        t = t + 1
+    }
+    return samples
+}
+
+// ---- Klatt: plosive synthesis --------------------------------------------
+//
+// Plosive shape: 5 ms silence + 30 ms noise burst (modulated by the high-F2
+// carrier hint) + the rest of the phoneme as silence. The burst is amplitude-
+// scaled to roughly half-AMPLITUDE so it's clearly audible above the prior/
+// following vowel without clipping.
+
+fn _synth_plosive(f2_carrier, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    let silence_ms = 5
+    let burst_ms   = 30
+    let silence_n = (silence_ms * sample_rate) / 1000
+    let burst_n   = (burst_ms   * sample_rate) / 1000
+    if silence_n < 1 { silence_n = 1 }
+    if burst_n < 1   { burst_n = 1 }
+    let burst_amp = AUDIO_AMPLITUDE / 2     // half-amplitude burst
+    // Leading silence
+    let i = 0
+    while i < silence_n {
+        push(samples, 0)
+        i = i + 1
+    }
+    // Noise burst: LCG noise modulated by the f2_carrier sine (the
+    // formant hint provides a slight tonal coloring on top of the hiss).
+    _sin_table_init()
+    let p = f2_carrier * _SIN_PERIOD
+    let s_int = p / sample_rate
+    let s_num = p - s_int * sample_rate
+    let ph = 0
+    let er = 0
+    let j = 0
+    while j < burst_n {
+        // noise in [-burst_amp..+burst_amp]
+        let n = _lcg_next(burst_amp)
+        // tonal coloring: multiply by sine carrier in milli; sine
+        // returns ±AUDIO_AMPLITUDE so divide by AUDIO_AMPLITUDE first.
+        let s = _sin_lookup(ph)
+        let blend = (n + s / 4)              // mostly noise, hint of carrier
+        // clamp to ±AUDIO_AMPLITUDE
+        if blend > AUDIO_AMPLITUDE     { blend = AUDIO_AMPLITUDE }
+        if blend < 0 - AUDIO_AMPLITUDE { blend = 0 - AUDIO_AMPLITUDE }
+        push(samples, blend)
+        ph = ph + s_int
+        er = er + s_num
+        if er >= sample_rate { er = er - sample_rate; ph = ph + 1 }
+        while ph >= _SIN_PERIOD { ph = ph - _SIN_PERIOD }
+        j = j + 1
+    }
+    // Trailing silence to round out the phoneme
+    let trailing = n_samples - silence_n - burst_n
+    let k = 0
+    while k < trailing {
+        push(samples, 0)
+        k = k + 1
+    }
+    return samples
+}
+
+// ---- Klatt: fricative synthesis ------------------------------------------
+//
+// Fricative: ~120 ms of LCG noise scaled to half-amplitude. The default
+// AUDIO_PHONEME_SAMPLES (1200 = 150 ms) is shaped: 15 ms attack of noise,
+// 120 ms hold, 15 ms release of noise (the envelope handles the ramps;
+// the noise body is continuous LCG output).
+
+fn _synth_fricative(n_samples) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    let amp = AUDIO_AMPLITUDE / 2
+    let i = 0
+    while i < n_samples {
+        push(samples, _lcg_next(amp))
+        i = i + 1
+    }
+    return samples
+}
+
+// ---- Klatt: nasal synthesis ----------------------------------------------
+//
+// Nasal "n"/"m"/"ng": single low formant (~250..500 Hz) with damping. The
+// damping is a slow per-sample amplitude decay (linear, ~50% over n samples)
+// that gives the muffled, fading quality of a nasal consonant.
+
+fn _synth_nasal(f1, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    _sin_table_init()
+    let p = f1 * _SIN_PERIOD
+    let s_int = p / sample_rate
+    let s_num = p - s_int * sample_rate
+    let ph = 0
+    let er = 0
+    let t = 0
+    while t < n_samples {
+        // Damping factor: 1000 -> 500 over the buffer length (linear).
+        let damp = 1000 - (t * 500) / n_samples
+        let v = (_sin_lookup(ph) * damp) / 1000
+        push(samples, v)
+        ph = ph + s_int
+        er = er + s_num
+        if er >= sample_rate { er = er - sample_rate; ph = ph + 1 }
+        while ph >= _SIN_PERIOD { ph = ph - _SIN_PERIOD }
+        t = t + 1
+    }
+    return samples
+}
+
+// ---- Klatt: diphthong synthesis -------------------------------------------
+//
+// Diphthong: two cosine carriers, but the formant centers GLIDE linearly
+// from `start_F1/F2` to `end_F1/F2` across the buffer. Same Bresenham phase
+// generator as `_synth_vowel_two_formant`; the only difference is that
+// `f1`/`f2` are re-evaluated per-sample as a linear interpolation of the
+// start and end targets. F3 is ignored at 8 kHz (the simplified Klatt
+// model). At 1200 samples the per-sample formant delta is well under 1 Hz
+// for the largest jumps (AY's F2: 1230 -> 2290 Hz across 1200 samples =
+// ~0.88 Hz/sample), giving a smooth, audibly-distinct glide.
+
+fn _synth_diphthong(f1_start, f2_start, f1_end, f2_end, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    _sin_table_init()
+    let half_amp = AUDIO_AMPLITUDE / 2
+    // Per-sample formant interpolation deltas in milli (1000 = full span).
+    // f1(t) = f1_start + (f1_end - f1_start) * t / n_samples
+    // Pre-compute the deltas in plain Hz; the cumulative phase update
+    // re-derives the per-sample step from the current formant freq.
+    let ph1 = 0
+    let er1 = 0
+    let ph2 = 0
+    let er2 = 0
+    let t = 0
+    while t < n_samples {
+        // Interpolated formant frequencies (Hz) for this sample.
+        let f1 = f1_start + ((f1_end - f1_start) * t) / n_samples
+        let f2 = f2_start + ((f2_end - f2_start) * t) / n_samples
+        if f2 == 0 { f2 = f1 }
+        // Bresenham phase step per sample for the current f1/f2.
+        let p1 = f1 * _SIN_PERIOD
+        let s1_int = p1 / sample_rate
+        let s1_num = p1 - s1_int * sample_rate
+        let p2 = f2 * _SIN_PERIOD
+        let s2_int = p2 / sample_rate
+        let s2_num = p2 - s2_int * sample_rate
+        let v1 = _sin_lookup(ph1) / 2
+        let v2 = _sin_lookup(ph2) / 2
+        push(samples, v1 + v2)
+        ph1 = ph1 + s1_int
+        er1 = er1 + s1_num
+        if er1 >= sample_rate { er1 = er1 - sample_rate; ph1 = ph1 + 1 }
+        while ph1 >= _SIN_PERIOD { ph1 = ph1 - _SIN_PERIOD }
+        ph2 = ph2 + s2_int
+        er2 = er2 + s2_num
+        if er2 >= sample_rate { er2 = er2 - sample_rate; ph2 = ph2 + 1 }
+        while ph2 >= _SIN_PERIOD { ph2 = ph2 - _SIN_PERIOD }
+        t = t + 1
+    }
+    return samples
+}
+
+// ---- Klatt: affricate synthesis -------------------------------------------
+//
+// Affricate = a stop release (~30%) immediately followed by a fricative
+// (~70%): "ch" = t + sh, "jh" = d + zh. We synthesize the two parts
+// directly at reduced lengths so the total stays at AUDIO_PHONEME_SAMPLES.
+// The boundary is shaped by the underlying plosive's trailing silence +
+// the fricative's attack ramp, so we get a natural close transition.
+
+fn _synth_affricate(stop_label, fric_label, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    // Allocate samples: ~40% plosive, ~60% fricative
+    let stop_n = (n_samples * 40) / 100
+    let fric_n = n_samples - stop_n
+    let f_stop = _phoneme_formants(stop_label)
+    let stop_part = _synth_plosive(f_stop[1], stop_n, sample_rate)
+    let fric_part = _synth_fricative(fric_n)
+    _envelope(fric_part, 5, 0, AUDIO_RELEASE_MS, sample_rate)
+    let i = 0
+    while i < len(stop_part) {
+        push(samples, stop_part[i])
+        i = i + 1
+    }
+    let j = 0
+    while j < len(fric_part) {
+        push(samples, fric_part[j])
+        j = j + 1
+    }
+    return samples
+}
+
+// ---- Klatt: syllabic nasal/liquid synthesis -------------------------------
+//
+// Syllabic nasals/liquids (EM/EN/ENG/EL) carry the syllable nucleus. They
+// behave like nasals/liquids but at REDUCED amplitude (~70% of onset-nasal
+// amplitude) since they're a continuation rather than an attack -- and the
+// damping curve is gentler (1000 -> 700 rather than 1000 -> 500).
+
+fn _synth_syllabic(f1, n_samples, sample_rate) {
+    let samples = list_new()
+    if n_samples <= 0 { return samples }
+    if sample_rate <= 0 { return samples }
+    _sin_table_init()
+    let p = f1 * _SIN_PERIOD
+    let s_int = p / sample_rate
+    let s_num = p - s_int * sample_rate
+    let ph = 0
+    let er = 0
+    let t = 0
+    while t < n_samples {
+        // Gentler damping: 1000 -> 700 across buffer (compared to nasal's
+        // 1000 -> 500), then scaled by 0.7 for the syllabic amplitude floor.
+        let damp = 1000 - (t * 300) / n_samples
+        let v = (_sin_lookup(ph) * damp) / 1000
+        // Reduce amplitude: ~70% of onset.
+        v = (v * 700) / 1000
+        push(samples, v)
+        ph = ph + s_int
+        er = er + s_num
+        if er >= sample_rate { er = er - sample_rate; ph = ph + 1 }
+        while ph >= _SIN_PERIOD { ph = ph - _SIN_PERIOD }
+        t = t + 1
+    }
+    return samples
+}
+
+// ---- public phoneme synth -------------------------------------------------
+//
+// Resolve CE_SYNTH_MODE the first time, cache it. Empty / unrecognized -> klatt.
+// Tests can reset via audio_synth_mode_reset() to force re-read.
+
+fn _resolve_synth_mode() {
+    if _synth_mode_cache != 0 { return _synth_mode_cache }
+    let env = getenv("CE_SYNTH_MODE")
+    if env == 0 {
+        _synth_mode_cache = SYNTH_MODE_KLATT
+        return _synth_mode_cache
+    }
+    if len(env) == 0 {
+        _synth_mode_cache = SYNTH_MODE_KLATT
+        return _synth_mode_cache
+    }
+    if str_eq(env, "sine")    == 1 { _synth_mode_cache = SYNTH_MODE_SINE;    return _synth_mode_cache }
+    if str_eq(env, "silence") == 1 { _synth_mode_cache = SYNTH_MODE_SILENCE; return _synth_mode_cache }
+    _synth_mode_cache = SYNTH_MODE_KLATT
+    return _synth_mode_cache
+}
+
+fn audio_synth_mode_reset() {
+    _synth_mode_cache = 0
+    return 0
+}
+
+fn audio_synth_mode() {
+    return _resolve_synth_mode()
+}
+
+// Synthesize one phoneme atom: AUDIO_PHONEME_SAMPLES PCM16 samples using
+// the Klatt-style two-formant + LCG-noise path. Always returns a 1200-sample
+// list. Anti-click ADSR (5 ms attack + 10 ms release) is applied per kind:
+// vowels + nasals get the full envelope; fricatives get a longer attack
+// (15 ms) so the noise doesn't tick on; plosives skip the envelope (the
+// silence prefix + burst already shape the edges).
+fn synth_phoneme_klatt(phoneme_label) {
+    let f = _phoneme_formants(phoneme_label)
+    let kind = f[3]
+    if kind == PHO_KIND_VOWEL {
+        let samples = _synth_vowel_two_formant(f[0], f[1], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        _envelope(samples, AUDIO_ATTACK_MS, 0, AUDIO_RELEASE_MS, AUDIO_SAMPLE_RATE)
+        return samples
+    }
+    if kind == PHO_KIND_PLOSIVE {
+        // Plosive: silence + burst + trailing silence. No outer envelope
+        // (the burst itself is the envelope shape).
+        let samples = _synth_plosive(f[1], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        return samples
+    }
+    if kind == PHO_KIND_FRICATIVE {
+        let samples = _synth_fricative(AUDIO_PHONEME_SAMPLES)
+        // Longer attack on noise so it doesn't tick on; same release.
+        _envelope(samples, 15, 0, AUDIO_RELEASE_MS, AUDIO_SAMPLE_RATE)
+        return samples
+    }
+    if kind == PHO_KIND_NASAL {
+        let samples = _synth_nasal(f[0], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        _envelope(samples, AUDIO_ATTACK_MS, 0, AUDIO_RELEASE_MS, AUDIO_SAMPLE_RATE)
+        return samples
+    }
+    if kind == PHO_KIND_DIPHTHONG {
+        // Diphthong: glide from start formants (in f[]) to end formants
+        // (in _diphthong_end_formants(label)) across the buffer.
+        let e = _diphthong_end_formants(phoneme_label)
+        let samples = _synth_diphthong(f[0], f[1], e[0], e[1], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        _envelope(samples, AUDIO_ATTACK_MS, 0, AUDIO_RELEASE_MS, AUDIO_SAMPLE_RATE)
+        return samples
+    }
+    if kind == PHO_KIND_AFFRICATE {
+        // Affricate: stop release + fricative back-to-back.
+        let parts = _affricate_parts(phoneme_label)
+        if len(parts) == 2 {
+            return _synth_affricate(parts[0], parts[1], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        }
+        // Unknown affricate label -> fall through to UNKNOWN below.
+    }
+    if kind == PHO_KIND_SYLLABIC {
+        // Syllabic nasal/liquid: reduced-amplitude carrier with gentler
+        // damping than an onset nasal.
+        let samples = _synth_syllabic(f[0], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+        _envelope(samples, AUDIO_ATTACK_MS, 0, AUDIO_RELEASE_MS, AUDIO_SAMPLE_RATE)
+        return samples
+    }
+    // UNKNOWN -> the 440 Hz fallback (same shape as legacy synth_phoneme).
+    let samples = synth_sine(f[0], AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+    _envelope(samples, AUDIO_ATTACK_MS, 0, AUDIO_RELEASE_MS, AUDIO_SAMPLE_RATE)
+    return samples
+}
+
+// Legacy single-carrier synth (the pre-P2.6 path). Retained for A/B and the
+// CE_SYNTH_MODE=sine selector. Triangular envelope (n/4 each side) preserves
+// the original sound exactly.
+fn synth_phoneme_sine(phoneme_label) {
+    let f = _phoneme_freq(phoneme_label)
+    let samples = synth_sine(f, AUDIO_PHONEME_SAMPLES, AUDIO_SAMPLE_RATE)
+    _apply_envelope(samples)
+    return samples
+}
+
+// CE_SYNTH_MODE=silence: 1200 samples of zero. Useful in CI where audible
+// noise is undesirable but the WAV must still be produced.
+fn _synth_phoneme_silence() {
+    let samples = list_new()
+    let i = 0
+    while i < AUDIO_PHONEME_SAMPLES {
+        push(samples, 0)
+        i = i + 1
+    }
+    return samples
+}
+
+// Top-level phoneme synth: dispatches on CE_SYNTH_MODE. Always returns a
+// 1200-sample list (the brief's invariant). Default mode is Klatt.
+fn synth_phoneme(phoneme_label) {
+    let m = _resolve_synth_mode()
+    if m == SYNTH_MODE_SINE    { return synth_phoneme_sine(phoneme_label) }
+    if m == SYNTH_MODE_SILENCE { return _synth_phoneme_silence() }
+    return synth_phoneme_klatt(phoneme_label)
+}
+
+// ---- text-level synthesis -------------------------------------------------
+//
+// Splits text into space-delimited words; for each word, looks up its
+// phoneme sequence in the language KG via word_phonemes(); concatenates
+// synth_phoneme(...) per phoneme. When the language KG is unavailable
+// (lang == 0) or the word has no recorded phonemes, falls back to ONE
+// PHONEME per character via synth_phoneme (so the cold seed still emits
+// audible Klatt-quality output -- a/e/i/o/u become formant vowels, s/f/h
+// become noise, etc; unknown characters take the 440 Hz fallback).
+
+fn _append_all(dst, src) {
+    let i = 0
+    while i < len(src) {
+        push(dst, src[i])
+        i = i + 1
+    }
+    return dst
+}
+
+// When the language KG is missing or the word has no recorded phonemes, we
+// fall back to one PHONEME per character. Each character is treated as a
+// phoneme label and dispatched through `synth_phoneme` -- so the fallback
+// inherits whatever quality the active CE_SYNTH_MODE delivers (Klatt vowels
+// for a/e/i/o/u, Klatt fricatives for s/h/f, Klatt plosives for p/t/k, etc).
+// 1200 samples per character is preserved so synth_text("hello", 0) still
+// emits 6000 samples in fallback mode (the brief's invariant).
+fn _synth_word_fallback(word) {
+    let n = len(word)
+    let out = list_new()
+    if n == 0 { return out }
+    let i = 0
+    while i < n {
+        // Extract one character as a 1-char label; phoneme_formants tries
+        // to match it; unknown characters fall through to the 440 Hz sine
+        // placeholder (still 1200 samples).
+        let lab = substr(word, i, 1)
+        let chunk = synth_phoneme(lab)
+        _append_all(out, chunk)
+        i = i + 1
+    }
+    return out
+}
+
+fn _resolve_phoneme_label(lang_kg, atom_id_val) {
+    if lang_kg == 0 { return "" }
+    let a = kg_atom(lang_kg, atom_id_val)
+    if a == 0 { return "" }
+    if is_phoneme_atom(a) == 0 { return "" }
+    return phoneme_symbol(a)
+}
+
+fn synth_text(text, lang_kg) {
+    let out = list_new()
+    let toks = split(text, " ")
+    let i = 0
+    while i < len(toks) {
+        let w = str_trim(toks[i])
+        if len(w) > 0 {
+            let used_phon = 0
+            if lang_kg != 0 {
+                let wa = word_find(lang_kg, w)
+                if wa != 0 {
+                    let pids = word_phonemes(wa)
+                    let j = 0
+                    while j < len(pids) {
+                        let lab = _resolve_phoneme_label(lang_kg, pids[j])
+                        if len(lab) > 0 {
+                            let chunk = synth_phoneme(lab)
+                            _append_all(out, chunk)
+                            used_phon = 1
+                        }
+                        j = j + 1
+                    }
+                }
+            }
+            if used_phon == 0 {
+                let chunk2 = _synth_word_fallback(w)
+                _append_all(out, chunk2)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- WAV writer -----------------------------------------------------------
+//
+// audio_write_wav(samples, path) -> 1 on success, 0 on any syscall failure.
+//
+// Allocates a single contiguous byte buffer of (44 + n*2) bytes, copies the
+// wav_header() into the leading 44 bytes, encodes each PCM16 sample as
+// (low byte, high byte), then sys_write the full buffer in one call and
+// sys_fsync before close (same durability contract as snapshot_disk.nova,
+// so any subsequent aplay reads the file we just wrote, not a stale one).
+// Negative-sample two's-complement is enforced by masking with 0xFFFF.
+
+let _AUDIO_FILE_MODE = 420       // 0644 rw-r--r--
+
+fn audio_write_wav(samples, path) {
+    let n = len(samples)
+    let header = wav_header(AUDIO_SAMPLE_RATE, n)
+    let hn = len(header)                          // 44 by construction
+    let total = hn + n * 2
+    let buf = alloc(total + 1)                    // +1 for an end NUL byte
+    let i = 0
+    while i < hn {
+        store8(buf + i, header[i])
+        i = i + 1
+    }
+    let j = 0
+    while j < n {
+        let s = samples[j]
+        // PCM16 two's-complement: signed int -> unsigned 16-bit via mask.
+        // NOVA integers are 64-bit, so (& 65535) is safe for negative s.
+        let u = s & 65535
+        if s < 0 {
+            u = (s + 65536) & 65535
+        }
+        store8(buf + hn + j * 2,     u & 255)
+        store8(buf + hn + j * 2 + 1, (u / 256) & 255)
+        j = j + 1
+    }
+    store8(buf + total, 0)
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, _AUDIO_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, total)
+    if written != total {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// Convenience for diagnostics: total samples in a duration ms at the canonical
+// rate. Used by the speak escalation logic when sizing temp buffers.
+fn audio_samples_for_ms(ms) {
+    return (ms * AUDIO_SAMPLE_RATE) / 1000
+}
+
+// ---- inventory API --------------------------------------------------------
+//
+// klatt_phoneme_count() returns the size of the active Klatt formant
+// inventory: the number of distinct phoneme symbols `_phoneme_formants`
+// recognizes (counting aliases like a/aa/ah as separate dispatches since
+// they're independently addressable from caller code). The constant is
+// hand-maintained next to the formant table; the unit test cross-checks it
+// by enumerating each label and asserting the dispatcher returns a non-
+// UNKNOWN kind. P6 expansion: 33 -> 53 dispatches (44 distinct ARPAbet
+// symbols + 9 alias entries: aa/ah for AA, eh for EH, iy for IY, oh/ao for
+// AO, uw for UW, hh for HH).
+
+let KLATT_PHONEME_COUNT_TOTAL = 53
+
+fn klatt_phoneme_count() {
+    return KLATT_PHONEME_COUNT_TOTAL
+}
+
+// klatt_phoneme_labels() returns the canonical list of phoneme labels the
+// formant table dispatches on, in dispatch order (same as the if-chain in
+// `_phoneme_formants`). Useful for the chat /help command + tests that
+// want to enumerate the inventory without hardcoding it.
+
+fn klatt_phoneme_labels() {
+    let out = list_new()
+    // vowels (monophthongs)
+    push(out, "a") push(out, "aa") push(out, "ah")
+    push(out, "e") push(out, "eh")
+    push(out, "i") push(out, "iy") push(out, "ih")
+    push(out, "o") push(out, "oh") push(out, "ao")
+    push(out, "ow")
+    push(out, "u") push(out, "uw") push(out, "uh")
+    push(out, "ae")
+    push(out, "er") push(out, "ax") push(out, "ix") push(out, "axr")
+    // diphthongs
+    push(out, "aw") push(out, "ay") push(out, "ey") push(out, "oy")
+    // plosives
+    push(out, "p") push(out, "t") push(out, "k")
+    push(out, "b") push(out, "d") push(out, "g")
+    // affricates
+    push(out, "ch") push(out, "jh")
+    // fricatives
+    push(out, "s") push(out, "z") push(out, "f") push(out, "v")
+    push(out, "sh") push(out, "zh") push(out, "th") push(out, "dh")
+    push(out, "h") push(out, "hh")
+    // nasals (onset)
+    push(out, "n") push(out, "m") push(out, "ng")
+    // syllabic nasals/liquids
+    push(out, "em") push(out, "en") push(out, "eng") push(out, "el")
+    // liquids / glides
+    push(out, "l") push(out, "r") push(out, "w") push(out, "y")
+    return out
+}

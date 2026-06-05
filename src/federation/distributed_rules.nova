@@ -1,0 +1,2222 @@
+// CrossEngin federation: distributed rule inference -- mini-Datalog
+// rules running across the gossip mesh (R21B).
+//
+// Purpose
+//   R20B (`src/kg/rule_inference.nova`) ships forward-chaining mini-
+//   Datalog rule inference on a SINGLE local KG: rules look like
+//   `RULE ancestor(?a, ?c) <- ancestor(?a, ?b) AND parent(?b, ?c)`,
+//   facts live as RELATION-kind atoms labelled "pred|arg1|arg2", and
+//   the engine iterates to fixpoint. R20E
+//   (`src/federation/distributed_query.nova`) ships distributed SPARQL
+//   query: fan-out across the R18E gossip mesh, each peer evaluates
+//   locally against its own KG, the originator merges per-row
+//   provenance back. R21B is the bridge: declarative INFERENCE that
+//   ALSO crosses the mesh.
+//
+//   The classical motivating case: peer A has `parent(alice, bob)`,
+//   peer B has `parent(bob, carol)`, neither alone can derive
+//   `ancestor(alice, carol)` because each is missing one premise.
+//   With R21B, the ancestor rule's premise patterns are evaluated
+//   against the FEDERATED fact set -- premise 1 (`ancestor(?a, ?b)`)
+//   may come from peer A while premise 2 (`parent(?b, ?c)`) may come
+//   from peer B; the cross-soul join produces the conclusion. The
+//   derivation is then broadcast as a DERIVATION line so peer C (with
+//   no relevant local facts) also sees `ancestor(alice, carol)` in
+//   its KG.
+//
+// Protocol (additive on top of R18E gossip)
+//
+//   1. RULE broadcast -- `dr_add_rule(dr, rule_string)`:
+//        - parse + append into the LOCAL rule engine (R20B engine, no
+//          modifications)
+//        - send `RULE <rule_string>\n` to every alive peer
+//      Peers receive RULE via the gossip handler (gossip.nova R21B
+//      branch); the line is enqueued on dr_state's inbound-rule
+//      queue and drained on the next `dr_run_round`. The queue avoids
+//      a gossip <-> distributed_rules import cycle.
+//
+//   2. DRFETCH fan-out -- for each rule premise predicate, the
+//      originator pulls the full set of relation atoms for that
+//      predicate from every alive peer. `gossip_dr_fetch_from(state,
+//      addr, pred)` does the TCP round trip:
+//          DRFETCH <pred>\n  ->
+//          DRFACT <peer_addr> <pred> <arg1> <arg2> <atom_id>\n  (n times)
+//          DREND\n
+//      Local facts are read directly from the KG (no wire trip).
+//      Every returned fact carries an annotation: the originating
+//      peer_addr. That annotation feeds provenance.
+//
+//   3. Cross-peer cross-join -- the originator joins the federated
+//      fact set just like a local Datalog evaluator joins facts. The
+//      premise matcher emits one binding per fact match; multi-premise
+//      rules cartesian-product against the previous premise's
+//      bindings. Each emitted binding carries a "contributors" set:
+//      which peer addresses provided which premise atoms.
+//
+//   4. Conclusion -- for each satisfied binding, the originator:
+//        - constructs the canonical "pred|arg1|arg2" label
+//        - kg_find_atom(kg, label) -> if already present, skip (dedupe)
+//        - kg_add_atom(kg, ATOM_RELATION, label, 0) -> new atom
+//        - records provenance: [atom_id, rule_idx, [contributor_addrs]]
+//        - broadcasts DERIVATION so peers can cache the fact
+//
+//   5. Fixpoint -- `dr_run_to_fixpoint(dr, max_rounds)` repeats step
+//      2-4 until no new atoms are derived in a round or the cap fires.
+//
+// Provenance shape
+//
+//   `dr_derivation_provenance(dr, atom_id)` returns
+//       [rule_name_or_idx, peer_addr_1, peer_addr_2, ...]
+//   where rule_name_or_idx is the head predicate name of the rule
+//   that produced the atom (per the brief's "(which rule)" spec) and
+//   the peer_addrs are the unique addresses that supplied any premise
+//   atom for the firing (the "(which peers contributed which
+//   premises)" spec, in the order they were used by the cross-join).
+//   The originator's own self_addr is included if any premise came
+//   from the local KG.
+//
+// Trust model
+//
+//   The gossip mesh is the SAME shape R18E ships -- assume mutually
+//   non-malicious peers (or pair with the R7C Noise XK auth + R20F
+//   attestation surface for adversarial settings). The R21B substrate
+//   adds no new cryptographic guarantees beyond what gossip provides;
+//   provenance is informational, not a signed receipt. A malicious
+//   peer can fabricate DRFACT or DERIVATION lines -- defense for that
+//   threat lives one layer up (e.g. signed-fact attestations, similar
+//   shape to R20F).
+//
+// Public API
+//
+//   dr_init(gossip_state, rule_engine)        -> dr_state
+//   dr_add_rule(dr, rule_string)              -> 1 | error
+//   dr_run_round(dr, kg)                      -> int (atoms derived
+//                                                this round)
+//   dr_run_to_fixpoint(dr, kg, max_rounds)    -> [total_derived,
+//                                                 rounds]
+//   dr_derivation_provenance(dr, atom_id)     -> [rule_name, peer1,
+//                                                 peer2, ...]
+//
+//   Plus helpers exercised by unit tests:
+//
+//   dr_engine(dr)                             -> the wrapped R20B
+//                                                engine (rule_engine_t)
+//   dr_rule_count(dr)                         -> int
+//   dr_stats_line(dr)                         -> one-line summary
+//   dr_inbound_rule_count(dr)                 -> # pending RULE lines
+//   dr_inbound_deriv_count(dr)                -> # pending DERIVATION
+//                                                lines
+//
+// ADRs: registers ADR-0081 (distributed Datalog over gossip). NOVA
+// dependencies: nanotime, str_eq, push, len, list_set, int_to_str.
+// CrossEngin dependencies: src/federation/gossip.nova (the R21B
+// extension provides RULE/DRFETCH/DERIVATION wire format + state
+// slots; we read GOSSIP_DR_INBOUND_RULES + _DERIVS for the dispatch
+// queues), src/kg/rule_inference.nova (read-only -- we re-use the
+// R20B engine for local rule storage, premise matcher logic
+// borrowed inline to handle federated fact set), src/kg/atom_store.nova
+// (ATOM_RELATION, atom_id, atom_label, atom_kind), src/kg/
+// multi_kg_manager.nova (kg_atoms, kg_add_atom, kg_find_atom,
+// kg_atom_count).
+
+import "std/io"
+import "./gossip.nova"
+import "../kg/atom_store.nova"
+import "../kg/multi_kg_manager.nova"
+import "../kg/rule_inference.nova"
+
+// ---- tuning -------------------------------------------------------------
+let DR_DEFAULT_MAX_ROUNDS  = 50
+let DR_DEFAULT_MAX_DERIVED = 5000
+let DR_OBJ_TAG             = 2601    // distinct from RULE_OBJ_TAG (2401),
+                                     // ENG_OBJ_TAG (2402)
+
+// ---- R28A: async DRFETCH + adaptive timeout tuning ---------------------
+//
+// R27E observed that R21B's synchronous DRFETCH fan-out (gossip_dr_fetch_from
+// per peer, serialized) stalls the fixpoint on a slow peer: a peer that
+// takes > 500 ms to ACK gets marked SUSPECT by the gossip layer, and on
+// the next round the federated parent set shrinks. R28A adds an opt-in
+// async dispatch path that (a) dials every alive peer up-front in a
+// fan-out pass (NOVA's blocking sockets don't support poll(2)/select(2),
+// so this is "pipelined" rather than truly-parallel: the dials happen
+// back-to-back without waiting for ACKs in between), (b) tracks per-peer
+// ACK latency in a small rolling window, (c) uses an adaptive receive
+// timeout per peer = min(MAX, 2 * median_latency + base_pad_ms), and (d)
+// does NOT mark a slow peer as SUSPECT when the DRFETCH receive timer
+// fires -- the per-round late-ACK is silently dropped, while the gossip
+// PING cadence remains the authoritative liveness signal.
+//
+// The opt-in flag is read once per dr_state init from the env var
+// CE_DR_ASYNC_FETCH (set to "on" / "1" / "yes" to enable). A test path
+// (dr_set_async_fetch) lets the unit tests flip the flag without
+// touching the environment.
+let DR_FETCH_DEFAULT_TIMEOUT_MS = 500    // initial timeout before any
+                                         // latency samples (same as
+                                         // R21B's hardcoded value -- a
+                                         // fresh dr_state with no
+                                         // recorded medians is wire-
+                                         // identical to R21B for the
+                                         // first round)
+let DR_FETCH_MAX_TIMEOUT_MS     = 5000   // hard cap; even if a slow peer
+                                         // pushes the median high, we
+                                         // bound any single DRFETCH
+                                         // window so the fixpoint can't
+                                         // hang
+let DR_FETCH_MIN_TIMEOUT_MS     = 500    // floor: the adaptive
+                                         // calculator never shrinks
+                                         // below R21B's hardcoded 500
+                                         // ms. A fast peer with median
+                                         // 50 ms would yield raw =
+                                         // 2*50 + 200 = 300 ms, which
+                                         // is TIGHTER than R21B and
+                                         // would cut off a peer that
+                                         // had a one-off jitter. The
+                                         // adaptive timeout's job is
+                                         // to GROW the budget for
+                                         // slow peers; tight peers
+                                         // keep R21B's 500 ms.
+let DR_FETCH_TIMEOUT_PAD_MS     = 200    // additive headroom over
+                                         // 2 x median (per task spec)
+let DR_LATENCY_WINDOW           = 5      // # recent rounds we median
+                                         // over per peer
+
+// ---- dr_state layout ----------------------------------------------------
+//
+// Pinned slot indices 3 and 4 are the inbound queues the gossip handler
+// pushes onto (GOSSIP_DR_INBOUND_RULES / GOSSIP_DR_INBOUND_DERIVS at
+// 3 and 4 respectively).
+let DR_S_TAG               = 0   // DR_OBJ_TAG
+let DR_S_GOSSIP            = 1   // gossip_state_t (back-reference)
+let DR_S_ENGINE            = 2   // R20B rule_engine_t
+let DR_S_INBOUND_RULES     = 3   // queue of inbound rule strings (pinned)
+let DR_S_INBOUND_DERIVS    = 4   // queue of inbound derivation records (pinned)
+let DR_S_PROVENANCE        = 5   // list of [atom_id, rule_name, [peer_addrs]]
+let DR_S_RULE_NAMES        = 6   // parallel to engine rules: head preds
+let DR_S_STATS_DERIVED     = 7   // total atoms derived across all rounds
+let DR_S_STATS_ROUNDS      = 8   // total rounds run
+let DR_S_STATS_RULES_TX    = 9   // RULE lines broadcast (originator side)
+let DR_S_STATS_DERIVS_TX   = 10  // DERIVATION lines broadcast
+let DR_S_STATS_FETCHES_TX  = 11  // DRFETCH requests sent
+let DR_S_LAST_DERIVED      = 12  // # atoms derived in the most recent round
+let DR_S_LAST_ROUNDS       = 13  // rounds taken in last to_fixpoint call
+// R28A async/adaptive-timeout extension slots. dr_is_state still asserts
+// len >= 14 so a pre-R28A dr_state record (from a stub harness, before
+// dr_init populated the new slots) is still recognised. dr_init always
+// initialises the full 19-slot layout.
+let DR_S_PEER_LATENCIES    = 14  // list of [peer_addr, [recent_ms...],
+                                 //         median_ms]; per-peer rolling
+                                 //         window of DRFETCH round-trip
+                                 //         times (R28A)
+let DR_S_ASYNC_FETCH_OPT   = 15  // 0 = sync (default), 1 = async dispatch
+                                 // + adaptive timeout (CE_DR_ASYNC_FETCH)
+let DR_S_STATS_ASYNC_RX    = 16  // # peer DRFETCH replies received via
+                                 // the async path (cumulative)
+let DR_S_STATS_LATE_DROPS  = 17  // # peers whose DRFETCH adaptive
+                                 // timeout fired before DREND -- these
+                                 // are NOT propagated as gossip
+                                 // SUSPECT marks
+let DR_S_STATS_TIMEOUT_ADJ = 18  // # times the adaptive-timeout
+                                 // calculator clamped at the MAX ceiling
+// R30A pipelined-DRFETCH slots. The pipeline path is an additional opt-in
+// (CE_DRFETCH_PIPELINE) layered on top of R28A. It uses R29A's `sys_poll`
+// builtin to wait on multiple peer ACK sockets concurrently after a
+// single fan-out sweep, the design R28A had to abandon because NOVA had
+// no multi-fd wait at the time. The slots are defensive-tolerated by
+// dr_is_state (len >= 14 still recognized) and zero-init'd by dr_init
+// so a pre-R30A stub harness keeps working.
+let DR_S_PIPELINE_OPT          = 19  // 0 = off (default, keeps R28A
+                                     // serial+adaptive as the safe
+                                     // baseline), 1 = on
+                                     // (CE_DRFETCH_PIPELINE)
+let DR_S_STATS_PIPELINE_DISPATCHED = 20  // # peers dispatched in phase 1
+                                         // (cumulative across rounds)
+let DR_S_STATS_PIPELINE_READY      = 21  // # peers whose pollfd had
+                                         // POLLIN ready before timeout
+let DR_S_STATS_PIPELINE_TIMEOUTS   = 22  // # peers whose pollfd never
+                                         // became ready (analogous to
+                                         // STATS_LATE_DROPS for the
+                                         // pipeline path)
+let DR_S_STATS_PIPELINE_PARTIAL    = 23  // # pollfds where sys_poll
+                                         // returned > 0 but fewer fds
+                                         // than dispatched -- diagnostic
+                                         // signal of partial wakeup
+// R31A parallel-connect slots. Layered on top of R30A's pipelined path:
+// phase 1 now opens N sockets non-blocking, kicks N connects, and waits
+// for POLLOUT readiness via a SECOND sys_poll call before sending HELLO.
+// The 4 counters distinguish the new failure modes (so a partial-failure
+// run is debuggable from the stats line) and are zero on dr_states that
+// never used the pipeline path. Same defensive-read pattern as R30A.
+let DR_S_STATS_CONNECT_DISPATCHED = 24   // # non-blocking connects
+                                         // kicked by phase-1 parallel
+                                         // dial (cumulative across rounds)
+let DR_S_STATS_CONNECT_READY      = 25   // # peers whose POLLOUT fired
+                                         // AND whose SO_ERROR readback
+                                         // returned 0 (successful
+                                         // non-blocking connect)
+let DR_S_STATS_CONNECT_TIMEOUTS   = 26   // # peers whose POLLOUT never
+                                         // fired within the dial budget
+                                         // (sys_poll revents stayed 0)
+let DR_S_STATS_CONNECT_SO_ERROR   = 27   // # peers whose POLLOUT fired
+                                         // but SO_ERROR readback was
+                                         // non-zero (ECONNREFUSED /
+                                         // EHOSTUNREACH / etc — deferred
+                                         // connect failure)
+
+// ---- R30A pipelined-DRFETCH pollfd layout ------------------------------
+//
+// `sys_poll` (R29A NOVA codegen) consumes an array of POSIX pollfd
+// structs: 8 bytes each, fd at offset 0 (i32 LE), events at offset 4
+// (i16 LE bitmask), revents at offset 6 (i16 LE, kernel writes here).
+// We materialise the array on the heap via `alloc(nfds * 8)` so the
+// memory lives across the dial-many / poll-once / drain-ready sequence.
+let DR_POLLFD_SIZE       = 8     // bytes per pollfd entry
+let DR_POLLFD_OFF_FD     = 0     // i32 (4 bytes)
+let DR_POLLFD_OFF_EVENTS = 4     // i16 (2 bytes)
+let DR_POLLFD_OFF_REVENTS = 6    // i16 (2 bytes)
+let DR_POLLIN            = 1     // POSIX POLLIN bit
+// R31A: POLLOUT is requested during the parallel-connect wait. POLLOUT
+// fires when a non-blocking socket's connect(2) completes (kernel marks
+// the fd writable). On Linux POLLOUT==4; POSIX guarantees the same bit
+// across all backends NOVA targets. The kernel may also set POLLERR (8)
+// or POLLHUP (16) on a failed/closed fd — we treat any bit set as
+// "ready for SO_ERROR check" so we never wait past the moment the
+// kernel has decided the dial's fate.
+let DR_POLLOUT           = 4     // POSIX POLLOUT bit
+let DR_POLLERR           = 8     // POSIX POLLERR bit (kernel-set only)
+let DR_POLLHUP           = 16    // POSIX POLLHUP bit (kernel-set only)
+let DR_POLL_OUT_MASK     = 28    // POLLOUT | POLLERR | POLLHUP == 4|8|16
+// R31A: parallel-connect timeout budget. We use the same default as the
+// adaptive-RCVTIMEO fallback so a peer that's slow to ACCEPT a connect
+// (e.g. mid-startup, accept queue still warming up) gets the same
+// budget as a peer that's slow to ACK a DRFETCH. A peer that doesn't
+// even complete the TCP handshake within this window is treated as a
+// dial-timeout (counter bump, fd closed, peer dropped from the pending
+// list before phase-2 runs).
+let DR_CONNECT_TIMEOUT_MS = 500
+let DR_CONNECT_EINPROGRESS = -115  // Linux errno -EINPROGRESS, the
+                                   // expected return from a non-blocking
+                                   // connect that started successfully.
+                                   // ARM64-Linux is the same value
+                                   // (errno is target-stable for the
+                                   // POSIX errnos this code touches).
+// Sentinel for "peer not ready by deadline" so the post-poll drain
+// loop can distinguish a never-ready fd from a fd that hit EOF mid-
+// drain.
+let DR_PIPELINE_PEND_FD    = 0    // index of peer's open fd
+let DR_PIPELINE_PEND_ADDR  = 1    // peer addr string
+let DR_PIPELINE_PEND_START = 2    // nanotime at DRFETCH-send (for
+                                  // latency on success)
+let DR_PIPELINE_PEND_DONE  = 3    // 1 once DREND drained / timed out
+
+// ---- R28A peer-latency record layout -----------------------------------
+//
+// Per-peer rolling window of DRFETCH round-trip times. The window holds
+// at most DR_LATENCY_WINDOW samples; on push, oldest is shifted out.
+// The median is recomputed on every push so the read path is O(1).
+let DR_L_ADDR    = 0   // peer addr string
+let DR_L_SAMPLES = 1   // list of recent latency_ms ints
+let DR_L_MEDIAN  = 2   // last-computed median (cached)
+
+// ---- provenance record layout ------------------------------------------
+let DR_P_ATOM_ID  = 0
+let DR_P_RULE     = 1   // rule head pred (string)
+let DR_P_PEERS    = 2   // list of peer_addr strings (unique)
+
+// ---- inbound derivation record layout ----------------------------------
+// Mirrors gossip.nova's enqueue shape:
+//   [rule_idx, pred, arg1, arg2, origin_addr, contrib_csv]
+let DR_D_RULE_IDX = 0
+let DR_D_PRED     = 1
+let DR_D_ARG1     = 2
+let DR_D_ARG2     = 3
+let DR_D_ORIGIN   = 4
+let DR_D_CONTRIBS = 5
+
+// ---- state constructor --------------------------------------------------
+
+// dr_init wires a gossip state + a R20B rule engine into a federated
+// inference state. The engine may be empty or already populated; either
+// way it's treated as the LOCAL store -- rules added subsequently via
+// dr_add_rule are appended into it AND broadcast.
+//
+// As a side effect, dr_init installs `dr_state` on the gossip state via
+// gossip_set_dr_state so inbound RULE / DRFETCH / DERIVATION lines are
+// routed correctly. A daemon that wants to listen for these without
+// driving its own inference loop can still wire a dr_state and call
+// `dr_run_round` periodically to drain the queues.
+fn dr_init(gossip_state, engine) {
+    let st = list_new()
+    push(st, DR_OBJ_TAG)             // S_TAG
+    push(st, gossip_state)           // S_GOSSIP
+    push(st, engine)                 // S_ENGINE
+    push(st, list_new())             // S_INBOUND_RULES (pinned slot 3)
+    push(st, list_new())             // S_INBOUND_DERIVS (pinned slot 4)
+    push(st, list_new())             // S_PROVENANCE
+    push(st, list_new())             // S_RULE_NAMES
+    push(st, 0)                      // S_STATS_DERIVED
+    push(st, 0)                      // S_STATS_ROUNDS
+    push(st, 0)                      // S_STATS_RULES_TX
+    push(st, 0)                      // S_STATS_DERIVS_TX
+    push(st, 0)                      // S_STATS_FETCHES_TX
+    push(st, 0)                      // S_LAST_DERIVED
+    push(st, 0)                      // S_LAST_ROUNDS
+    // R28A async dispatch + adaptive timeout slots.
+    push(st, list_new())             // S_PEER_LATENCIES
+    push(st, _dr_async_fetch_from_env()) // S_ASYNC_FETCH_OPT (env opt-in)
+    push(st, 0)                      // S_STATS_ASYNC_RX
+    push(st, 0)                      // S_STATS_LATE_DROPS
+    push(st, 0)                      // S_STATS_TIMEOUT_ADJ
+    // R30A true-pipelined DRFETCH (sys_poll multi-fd wait).
+    push(st, _dr_pipeline_from_env()) // S_PIPELINE_OPT
+    push(st, 0)                       // S_STATS_PIPELINE_DISPATCHED
+    push(st, 0)                       // S_STATS_PIPELINE_READY
+    push(st, 0)                       // S_STATS_PIPELINE_TIMEOUTS
+    push(st, 0)                       // S_STATS_PIPELINE_PARTIAL
+    // R31A parallel-connect counters. Same zero-init pattern as R30A:
+    // the slots only meaningfully bump when CE_DRFETCH_PIPELINE=1.
+    push(st, 0)                       // S_STATS_CONNECT_DISPATCHED
+    push(st, 0)                       // S_STATS_CONNECT_READY
+    push(st, 0)                       // S_STATS_CONNECT_TIMEOUTS
+    push(st, 0)                       // S_STATS_CONNECT_SO_ERROR
+
+    // Backfill rule names from any pre-existing rules in the engine.
+    // The R20B engine may have been populated before wrapping -- we
+    // mirror the head preds so dr_derivation_provenance can return them
+    // by-name even after the engine adds more.
+    if rule_engine_is(engine) == 1 {
+        let rules = engine[RE_RULES]
+        let i = 0
+        while i < len(rules) {
+            push(st[DR_S_RULE_NAMES], rule_head_pred(rules[i]))
+            i = i + 1
+        }
+    }
+
+    // Register dr_state on the gossip back-reference so the inbound
+    // dispatcher knows where to enqueue.
+    gossip_set_dr_state(gossip_state, st)
+
+    return st
+}
+
+// ---- predicates ---------------------------------------------------------
+
+fn dr_is_state(x) {
+    if x == 0 { return 0 }
+    if type_of(x) != 3 { return 0 }
+    if len(x) < 14 { return 0 }
+    if x[DR_S_TAG] == DR_OBJ_TAG { return 1 }
+    return 0
+}
+
+fn dr_engine(dr)             { return dr[DR_S_ENGINE] }
+fn dr_rule_count(dr)         { return rule_engine_size(dr[DR_S_ENGINE]) }
+fn dr_inbound_rule_count(dr) { return len(dr[DR_S_INBOUND_RULES]) }
+fn dr_inbound_deriv_count(dr) { return len(dr[DR_S_INBOUND_DERIVS]) }
+fn dr_stats_derived(dr)      { return dr[DR_S_STATS_DERIVED] }
+fn dr_stats_rounds(dr)       { return dr[DR_S_STATS_ROUNDS] }
+fn dr_stats_rules_tx(dr)     { return dr[DR_S_STATS_RULES_TX] }
+fn dr_stats_derivs_tx(dr)    { return dr[DR_S_STATS_DERIVS_TX] }
+fn dr_stats_fetches_tx(dr)   { return dr[DR_S_STATS_FETCHES_TX] }
+fn dr_last_derived(dr)       { return dr[DR_S_LAST_DERIVED] }
+fn dr_last_rounds(dr)        { return dr[DR_S_LAST_ROUNDS] }
+
+// R28A: async/adaptive accessors. All return 0 / empty on an old-shape
+// dr_state record that lacks the post-R28A slots (defensive: a stub
+// harness from a prior round that hand-built the list may not have
+// appended the new fields).
+fn dr_async_fetch_opt(dr) {
+    if len(dr) <= DR_S_ASYNC_FETCH_OPT { return 0 }
+    return dr[DR_S_ASYNC_FETCH_OPT]
+}
+fn dr_stats_async_rx(dr) {
+    if len(dr) <= DR_S_STATS_ASYNC_RX { return 0 }
+    return dr[DR_S_STATS_ASYNC_RX]
+}
+fn dr_stats_late_drops(dr) {
+    if len(dr) <= DR_S_STATS_LATE_DROPS { return 0 }
+    return dr[DR_S_STATS_LATE_DROPS]
+}
+fn dr_stats_timeout_adj(dr) {
+    if len(dr) <= DR_S_STATS_TIMEOUT_ADJ { return 0 }
+    return dr[DR_S_STATS_TIMEOUT_ADJ]
+}
+
+// R30A pipelined-DRFETCH accessors. Each returns 0 on a pre-R30A
+// shape (the post-R28A slots are all optional from the test harness's
+// perspective; defensive read is consistent with the R28A pattern
+// above).
+fn dr_pipeline_opt(dr) {
+    if len(dr) <= DR_S_PIPELINE_OPT { return 0 }
+    return dr[DR_S_PIPELINE_OPT]
+}
+fn dr_stats_pipeline_dispatched(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_DISPATCHED { return 0 }
+    return dr[DR_S_STATS_PIPELINE_DISPATCHED]
+}
+fn dr_stats_pipeline_ready(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_READY { return 0 }
+    return dr[DR_S_STATS_PIPELINE_READY]
+}
+fn dr_stats_pipeline_timeouts(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_TIMEOUTS { return 0 }
+    return dr[DR_S_STATS_PIPELINE_TIMEOUTS]
+}
+fn dr_stats_pipeline_partial(dr) {
+    if len(dr) <= DR_S_STATS_PIPELINE_PARTIAL { return 0 }
+    return dr[DR_S_STATS_PIPELINE_PARTIAL]
+}
+
+// R31A parallel-connect accessors. Same defensive-read pattern as R30A
+// above — a pre-R31A dr_state record (e.g. from a test harness that
+// builds the list by hand) keeps reading these as 0.
+fn dr_stats_connect_dispatched(dr) {
+    if len(dr) <= DR_S_STATS_CONNECT_DISPATCHED { return 0 }
+    return dr[DR_S_STATS_CONNECT_DISPATCHED]
+}
+fn dr_stats_connect_ready(dr) {
+    if len(dr) <= DR_S_STATS_CONNECT_READY { return 0 }
+    return dr[DR_S_STATS_CONNECT_READY]
+}
+fn dr_stats_connect_timeouts(dr) {
+    if len(dr) <= DR_S_STATS_CONNECT_TIMEOUTS { return 0 }
+    return dr[DR_S_STATS_CONNECT_TIMEOUTS]
+}
+fn dr_stats_connect_so_error(dr) {
+    if len(dr) <= DR_S_STATS_CONNECT_SO_ERROR { return 0 }
+    return dr[DR_S_STATS_CONNECT_SO_ERROR]
+}
+
+// Test/operator setter: flip the pipeline flag on a live dr_state
+// without re-reading the env var. Returns the value as accepted.
+fn dr_set_pipeline(dr, on) {
+    if len(dr) <= DR_S_PIPELINE_OPT { return 0 }
+    if on != 0 {
+        dr[DR_S_PIPELINE_OPT] = 1
+    } else {
+        dr[DR_S_PIPELINE_OPT] = 0
+    }
+    return dr[DR_S_PIPELINE_OPT]
+}
+
+// Returns the current per-peer median ms; -1 if no samples for that peer.
+fn dr_peer_median_ms(dr, peer_addr) {
+    if len(dr) <= DR_S_PEER_LATENCIES { return -1 }
+    let table = dr[DR_S_PEER_LATENCIES]
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][DR_L_ADDR], peer_addr) == 1 {
+            return table[i][DR_L_MEDIAN]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Returns the count of recent latency samples for a peer (0 if none).
+fn dr_peer_latency_count(dr, peer_addr) {
+    if len(dr) <= DR_S_PEER_LATENCIES { return 0 }
+    let table = dr[DR_S_PEER_LATENCIES]
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][DR_L_ADDR], peer_addr) == 1 {
+            return len(table[i][DR_L_SAMPLES])
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Test/operator setter: flip the async-fetch flag on a live dr_state
+// without re-reading the env var. Returns the value as accepted.
+fn dr_set_async_fetch(dr, on) {
+    if len(dr) <= DR_S_ASYNC_FETCH_OPT { return 0 }
+    if on != 0 {
+        dr[DR_S_ASYNC_FETCH_OPT] = 1
+    } else {
+        dr[DR_S_ASYNC_FETCH_OPT] = 0
+    }
+    return dr[DR_S_ASYNC_FETCH_OPT]
+}
+
+// Returns the adaptive-timeout ms the next DRFETCH to peer_addr will
+// use. With no samples this returns DR_FETCH_DEFAULT_TIMEOUT_MS so the
+// first round-trip after dr_init still has a sensible budget; once a
+// median is recorded it returns
+//   min(MAX, max(MIN, 2 * median + PAD))
+fn dr_adaptive_timeout_for(dr, peer_addr) {
+    let med = dr_peer_median_ms(dr, peer_addr)
+    if med < 0 { return DR_FETCH_DEFAULT_TIMEOUT_MS }
+    let t = 2 * med + DR_FETCH_TIMEOUT_PAD_MS
+    if t < DR_FETCH_MIN_TIMEOUT_MS { t = DR_FETCH_MIN_TIMEOUT_MS }
+    if t > DR_FETCH_MAX_TIMEOUT_MS { t = DR_FETCH_MAX_TIMEOUT_MS }
+    return t
+}
+
+// ---- rule management ----------------------------------------------------
+
+// dr_add_rule parses the rule string locally, appends into the engine,
+// records the rule's head predicate name for provenance, and broadcasts
+// to every alive peer. Returns 1 on success; an error tuple on local
+// parse failure (the broadcast is suppressed in that case).
+fn dr_add_rule(dr, rule_string) {
+    if dr_is_state(dr) == 0 { return _rule_error("dr_add_rule: bad dr_state") }
+    let engine = dr[DR_S_ENGINE]
+    let r = rule_engine_add(engine, rule_string)
+    if _rule_is_error(r) == 1 { return r }
+    // Track the head pred for this rule's index. The engine appends, so
+    // its len after the add equals the new rule's idx + 1.
+    let rules = engine[RE_RULES]
+    let last = rules[len(rules) - 1]
+    push(dr[DR_S_RULE_NAMES], rule_head_pred(last))
+    // Broadcast to peers. Best-effort: ignore the return count
+    // (gossip_broadcast_rule already records timeouts on the gossip
+    // stats counters).
+    let gs = dr[DR_S_GOSSIP]
+    gossip_broadcast_rule(gs, rule_string)
+    dr[DR_S_STATS_RULES_TX] = dr[DR_S_STATS_RULES_TX] + 1
+    return 1
+}
+
+// dr_drain_inbound_rules drains the inbound RULE queue: parses each
+// queued rule string locally, adds to the engine (without re-
+// broadcasting, to avoid gossip storms). Called at the top of every
+// dr_run_round so peers naturally converge on the same rule set. Idempotent
+// on duplicate rules: the R20B engine's parser will accept duplicates
+// but the rule firing remains dedupe-safe via kg_find_atom.
+fn _dr_drain_inbound_rules(dr) {
+    let q = dr[DR_S_INBOUND_RULES]
+    let engine = dr[DR_S_ENGINE]
+    let n_added = 0
+    while len(q) > 0 {
+        let rule_str = q[0]
+        // Pop front: shift left then trim.
+        let i = 0
+        while i < len(q) - 1 {
+            q[i] = q[i + 1]
+            i = i + 1
+        }
+        pop(q)
+        let r = rule_engine_add(engine, rule_str)
+        if _rule_is_error(r) == 0 {
+            let rules = engine[RE_RULES]
+            let last = rules[len(rules) - 1]
+            push(dr[DR_S_RULE_NAMES], rule_head_pred(last))
+            n_added = n_added + 1
+        }
+    }
+    return n_added
+}
+
+// ---- federated fact gathering -------------------------------------------
+//
+// _dr_local_facts_for(kg, pred) -- mirrors R20B's _rule_kg_facts_for but
+// also tags each fact with the local self_addr so the cross-join can
+// attribute provenance. Returns a list of [peer_addr, arg1, arg2,
+// atom_id] records.
+fn _dr_local_facts_for(kg, pred, self_addr) {
+    let out = list_new()
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_RELATION {
+                let label = atom_label(a)
+                let parts = _dr_split_label(label)
+                if len(parts) == 3 {
+                    if str_eq(parts[0], pred) == 1 {
+                        let row = list_new()
+                        push(row, self_addr)
+                        push(row, parts[1])
+                        push(row, parts[2])
+                        push(row, atom_id(a))
+                        push(out, row)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Split a "pred|arg1|arg2" label on the pipe (ASCII 124). The same
+// split rule_inference.nova uses; duplicated here so we don't expose
+// the R20B private helper.
+fn _dr_split_label(label) {
+    let parts = list_new()
+    let n = len(label)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(label, i) == 124 {
+            push(parts, substr(label, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(label, start, n - start))
+    return parts
+}
+
+// _dr_federated_facts_for(dr, kg, pred) -- gather the FULL federated
+// set of relation facts for the named predicate. Pulls local facts
+// directly from kg + DRFETCHes from every alive peer. Returns a list
+// of [peer_addr, arg1, arg2, atom_id] records (each row tagged with
+// the originating peer's self_addr for provenance attribution).
+//
+// Dispatch precedence (R30A > R28A > R21B):
+//   1. dr_pipeline_opt == 1 -> _dr_federated_facts_for_pipelined
+//      (R30A: phase-1 dispatch + phase-2 sys_poll collect, true multi-
+//       fd wait via R29A's sys_poll builtin)
+//   2. dr_async_fetch_opt == 1 -> _dr_federated_facts_for_async
+//      (R28A: serial dispatch with per-peer adaptive RCVTIMEO and
+//       late-ACK isolation, retained as the safe baseline)
+//   3. default -> R21B synchronous loop (preserved bit-identical for
+//      any caller that doesn't flip either env flag)
+fn _dr_federated_facts_for(dr, kg, pred) {
+    if dr_pipeline_opt(dr) == 1 {
+        return _dr_federated_facts_for_pipelined(dr, kg, pred)
+    }
+    if dr_async_fetch_opt(dr) == 1 {
+        return _dr_federated_facts_for_async(dr, kg, pred)
+    }
+    let gs = dr[DR_S_GOSSIP]
+    let self_addr = gossip_self_addr(gs)
+    let out = _dr_local_facts_for(kg, pred, self_addr)
+    let alive = gossip_alive_peers(gs)
+    let i = 0
+    while i < len(alive) {
+        let p_addr = alive[i]
+        if str_eq(p_addr, self_addr) == 0 {
+            let peer_rows = gossip_dr_fetch_from(gs, p_addr, pred)
+            dr[DR_S_STATS_FETCHES_TX] = dr[DR_S_STATS_FETCHES_TX] + 1
+            // peer_rows: list of [peer_addr, pred, arg1, arg2, atom_id].
+            // Re-shape to our [peer_addr, arg1, arg2, atom_id] form.
+            let j = 0
+            while j < len(peer_rows) {
+                let r = peer_rows[j]
+                if len(r) >= 5 {
+                    let rec = list_new()
+                    push(rec, r[0])    // peer_addr
+                    push(rec, r[2])    // arg1
+                    push(rec, r[3])    // arg2
+                    push(rec, r[4])    // atom_id (remote)
+                    push(out, rec)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- distributed binding evaluator --------------------------------------
+//
+// Pure string-valued binding model (mirroring R20B's _rb_new). We
+// augment each binding with a __peers__ list (set of unique peer_addrs)
+// so multi-premise rules accumulate the contributors set across the
+// cross-join. A premise atom contributes its peer_addr to the set.
+
+fn _drb_new() {
+    let b = list_new()
+    push(b, list_new())   // [0] = list of [name, value] pairs
+    push(b, list_new())   // [1] = list of peer_addrs (unique)
+    return b
+}
+
+fn _drb_vars(b)  { return b[0] }
+fn _drb_peers(b) { return b[1] }
+
+fn _drb_has(b, name) {
+    let v = b[0]
+    let i = 0
+    while i < len(v) {
+        if str_eq(v[i][0], name) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _drb_get(b, name) {
+    let v = b[0]
+    let i = 0
+    while i < len(v) {
+        if str_eq(v[i][0], name) == 1 { return v[i][1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _drb_set(b, name, value) {
+    let v = b[0]
+    let i = 0
+    while i < len(v) {
+        if str_eq(v[i][0], name) == 1 {
+            list_set(v[i], 1, value)
+            return 1
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, name)
+    push(entry, value)
+    push(v, entry)
+    return 1
+}
+
+fn _drb_add_peer(b, peer_addr) {
+    let p = b[1]
+    let i = 0
+    while i < len(p) {
+        if str_eq(p[i], peer_addr) == 1 { return 0 }
+        i = i + 1
+    }
+    push(p, peer_addr)
+    return 1
+}
+
+fn _drb_copy(b) {
+    let out = _drb_new()
+    let v = b[0]
+    let i = 0
+    while i < len(v) {
+        let e = list_new()
+        push(e, v[i][0])
+        push(e, v[i][1])
+        push(out[0], e)
+        i = i + 1
+    }
+    let p = b[1]
+    let j = 0
+    while j < len(p) {
+        push(out[1], p[j])
+        j = j + 1
+    }
+    return out
+}
+
+// _dr_match_premise(facts, premise, bindings) -- for every binding in
+// `bindings`, try to extend it with each fact in `facts`. A premise's
+// args are either bound (we filter facts whose value at that position
+// matches the binding) or free (we bind the free var to the fact's
+// value at that position). A fact's peer_addr is added to the binding's
+// peers set on every successful extension.
+fn _dr_match_premise(facts, premise, bindings) {
+    let p_args = premise[1]
+    let out = list_new()
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        let fi = 0
+        while fi < len(facts) {
+            let f = facts[fi]    // [peer_addr, arg1, arg2, atom_id]
+            let cand = _drb_copy(b)
+            let ok = 1
+            let ai = 0
+            while ai < len(p_args) {
+                if ok == 1 {
+                    let pa = p_args[ai]
+                    let fact_val = f[ai + 1]   // skip peer_addr at [0]
+                    if pa[0] == RULE_TERM_VAR {
+                        let vname = pa[1]
+                        if _drb_has(cand, vname) == 1 {
+                            if str_eq(_drb_get(cand, vname), fact_val) == 0 {
+                                ok = 0
+                            }
+                        } else {
+                            _drb_set(cand, vname, fact_val)
+                        }
+                    } else {
+                        if str_eq(pa[1], fact_val) == 0 {
+                            ok = 0
+                        }
+                    }
+                }
+                ai = ai + 1
+            }
+            if ok == 1 {
+                _drb_add_peer(cand, f[0])
+                push(out, cand)
+            }
+            fi = fi + 1
+        }
+        bi = bi + 1
+    }
+    return out
+}
+
+// ---- one round of distributed forward chaining --------------------------
+//
+// _dr_apply_one(dr, rule, rule_idx, kg) -- apply ONE rule against the
+// federated fact set. For each rule premise, build the federated fact
+// list (local + DRFETCH from peers), join the bindings, then for each
+// satisfied binding instantiate the head and try to add. Returns the
+// count of NEW atoms added locally; broadcasts DERIVATION for each.
+fn _dr_apply_one(dr, rule, rule_idx, kg) {
+    let head_pred = rule_head_pred(rule)
+    let head_args = rule_head_args(rule)
+    let body = rule_body(rule)
+    let gs = dr[DR_S_GOSSIP]
+    let self_addr = gossip_self_addr(gs)
+    // Seed with one empty binding.
+    let bindings = list_new()
+    push(bindings, _drb_new())
+    let pi = 0
+    while pi < len(body) {
+        let premise = body[pi]
+        let pred = premise[0]
+        let facts = _dr_federated_facts_for(dr, kg, pred)
+        bindings = _dr_match_premise(facts, premise, bindings)
+        pi = pi + 1
+    }
+    let new_count = 0
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        // Substitute head args.
+        let head_arg_strs = list_new()
+        let ok = 1
+        let ai = 0
+        while ai < len(head_args) {
+            if ok == 1 {
+                let ha = head_args[ai]
+                if ha[0] == RULE_TERM_VAR {
+                    if _drb_has(b, ha[1]) == 0 {
+                        ok = 0
+                    } else {
+                        push(head_arg_strs, _drb_get(b, ha[1]))
+                    }
+                } else {
+                    push(head_arg_strs, ha[1])
+                }
+            }
+            ai = ai + 1
+        }
+        if ok == 1 {
+            let canonical = _dr_canonical_label(head_pred, head_arg_strs)
+            let existing = kg_find_atom(kg, canonical)
+            if existing == 0 {
+                let derived = kg_add_atom(kg, ATOM_RELATION, canonical, 0)
+                new_count = new_count + 1
+                // Record provenance.
+                let peers = _drb_peers(b)
+                _dr_record_provenance(dr, atom_id(derived), head_pred, peers)
+                // Broadcast derivation.
+                let arg1 = head_arg_strs[0]
+                let arg2 = ""
+                if len(head_arg_strs) > 1 { arg2 = head_arg_strs[1] }
+                let csv = _dr_join_csv(peers)
+                gossip_broadcast_derivation(gs, rule_idx, head_pred, arg1, arg2, csv)
+                dr[DR_S_STATS_DERIVS_TX] = dr[DR_S_STATS_DERIVS_TX] + 1
+            }
+        }
+        bi = bi + 1
+    }
+    return new_count
+}
+
+fn _dr_canonical_label(pred, arg_strs) {
+    let s = pred
+    let i = 0
+    while i < len(arg_strs) {
+        s = s + "|" + arg_strs[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn _dr_join_csv(items) {
+    let s = ""
+    let i = 0
+    while i < len(items) {
+        if i > 0 { s = s + "," }
+        s = s + items[i]
+        i = i + 1
+    }
+    if len(s) == 0 { s = "(none)" }
+    return s
+}
+
+fn _dr_split_csv(s) {
+    let out = list_new()
+    if str_eq(s, "(none)") == 1 { return out }
+    let n = len(s)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(s, i) == 44 {
+            push(out, substr(s, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { push(out, substr(s, start, n - start)) }
+    return out
+}
+
+// _dr_record_provenance appends a provenance entry. peers is the list
+// of contributor peer_addrs.
+fn _dr_record_provenance(dr, atom_id_in, rule_name, peers) {
+    let rec = list_new()
+    push(rec, atom_id_in)
+    push(rec, rule_name)
+    let plist = list_new()
+    let i = 0
+    while i < len(peers) {
+        push(plist, peers[i])
+        i = i + 1
+    }
+    push(rec, plist)
+    push(dr[DR_S_PROVENANCE], rec)
+    return rec
+}
+
+// ---- inbound DERIVATION drain -------------------------------------------
+//
+// _dr_drain_inbound_derivs(dr, kg) caches each peer-broadcast
+// DERIVATION into the local KG (dedupe via kg_find_atom) and records
+// provenance with the contributors decoded from the CSV. Called at the
+// top of every dr_run_round so peers converge on the federation's
+// derived-fact set.
+fn _dr_drain_inbound_derivs(dr, kg) {
+    let q = dr[DR_S_INBOUND_DERIVS]
+    let n_cached = 0
+    while len(q) > 0 {
+        let rec = q[0]
+        // Pop front.
+        let i = 0
+        while i < len(q) - 1 {
+            q[i] = q[i + 1]
+            i = i + 1
+        }
+        pop(q)
+        let rule_idx = rec[DR_D_RULE_IDX]
+        let pred = rec[DR_D_PRED]
+        let arg1 = rec[DR_D_ARG1]
+        let arg2 = rec[DR_D_ARG2]
+        let origin = rec[DR_D_ORIGIN]
+        let csv = rec[DR_D_CONTRIBS]
+        let canonical = pred + "|" + arg1 + "|" + arg2
+        let existing = kg_find_atom(kg, canonical)
+        if existing == 0 {
+            let derived = kg_add_atom(kg, ATOM_RELATION, canonical, 0)
+            // Build the provenance peer list: contributors CSV + the
+            // origin peer (the originator may have included itself in
+            // the CSV; dedupe is handled by _drb_add_peer-style scan).
+            let peers = _dr_split_csv(csv)
+            let has_origin = 0
+            let pi = 0
+            while pi < len(peers) {
+                if str_eq(peers[pi], origin) == 1 { has_origin = 1 }
+                pi = pi + 1
+            }
+            if has_origin == 0 { push(peers, origin) }
+            // Rule name: prefer the local engine's name at rule_idx if
+            // present, else fall back to the predicate name (peers may
+            // disagree on rule index ordering).
+            let rule_name = pred
+            let names = dr[DR_S_RULE_NAMES]
+            if rule_idx >= 0 {
+                if rule_idx < len(names) {
+                    rule_name = names[rule_idx]
+                }
+            }
+            _dr_record_provenance(dr, atom_id(derived), rule_name, peers)
+            n_cached = n_cached + 1
+        }
+    }
+    return n_cached
+}
+
+// ---- top-level rounds + fixpoint ---------------------------------------
+
+// dr_run_round runs ONE round of distributed forward chaining over the
+// federated mesh. The order:
+//   1. Drain inbound RULE queue (peers may have broadcast new rules).
+//   2. Drain inbound DERIVATION queue (peers may have broadcast new facts).
+//   3. For each rule in the engine, evaluate against the federated fact
+//      set; for each satisfied binding that isn't already in the KG, add
+//      the conclusion + broadcast DERIVATION + record provenance.
+// Returns the count of NEW atoms derived locally during step 3 (the
+// step-2 cache count is separate -- visible via dr_stats_derived in
+// the cumulative view).
+fn dr_run_round(dr, kg) {
+    if dr_is_state(dr) == 0 { return 0 }
+    _dr_drain_inbound_rules(dr)
+    _dr_drain_inbound_derivs(dr, kg)
+    let engine = dr[DR_S_ENGINE]
+    let rules = engine[RE_RULES]
+    let total = 0
+    let ri = 0
+    while ri < len(rules) {
+        let n = _dr_apply_one(dr, rules[ri], ri, kg)
+        total = total + n
+        ri = ri + 1
+    }
+    dr[DR_S_LAST_DERIVED] = total
+    dr[DR_S_STATS_DERIVED] = dr[DR_S_STATS_DERIVED] + total
+    dr[DR_S_STATS_ROUNDS] = dr[DR_S_STATS_ROUNDS] + 1
+    return total
+}
+
+// dr_run_to_fixpoint iterates dr_run_round until a round produces 0
+// new local derivations OR max_rounds fires. Returns [total_derived,
+// rounds]. max_rounds=0 falls back to DR_DEFAULT_MAX_ROUNDS.
+fn dr_run_to_fixpoint(dr, kg, max_rounds) {
+    if dr_is_state(dr) == 0 {
+        let r = list_new()
+        push(r, 0)
+        push(r, 0)
+        return r
+    }
+    let cap = max_rounds
+    if cap <= 0 { cap = DR_DEFAULT_MAX_ROUNDS }
+    let total = 0
+    let rounds = 0
+    let done = 0
+    while done == 0 {
+        if rounds >= cap {
+            done = 1
+        } else {
+            let n = dr_run_round(dr, kg)
+            rounds = rounds + 1
+            total = total + n
+            if n == 0 { done = 1 }
+        }
+    }
+    dr[DR_S_LAST_ROUNDS] = rounds
+    let r = list_new()
+    push(r, total)
+    push(r, rounds)
+    return r
+}
+
+// dr_derivation_provenance returns [rule_name, peer1, peer2, ...] for
+// the given derived atom_id. The first element is the rule's head pred
+// name; subsequent elements are the peer addresses that contributed.
+// Returns an empty list if the atom was not derived by this dr_state.
+fn dr_derivation_provenance(dr, atom_id_in) {
+    let out = list_new()
+    if dr_is_state(dr) == 0 { return out }
+    let prov = dr[DR_S_PROVENANCE]
+    let i = 0
+    while i < len(prov) {
+        if prov[i][DR_P_ATOM_ID] == atom_id_in {
+            push(out, prov[i][DR_P_RULE])
+            let peers = prov[i][DR_P_PEERS]
+            let j = 0
+            while j < len(peers) {
+                push(out, peers[j])
+                j = j + 1
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// dr_provenance_count returns the number of provenance entries
+// recorded so far (one entry per LOCAL derivation, multi-counted if
+// the same atom_id is derived by multiple rules).
+fn dr_provenance_count(dr) {
+    if dr_is_state(dr) == 0 { return 0 }
+    return len(dr[DR_S_PROVENANCE])
+}
+
+// ---- chat-side conveniences ---------------------------------------------
+
+fn dr_stats_line(dr) {
+    if dr_is_state(dr) == 0 { return "drule: bad state" }
+    let gs = dr[DR_S_GOSSIP]
+    let line = "drule: self=" + gossip_self_addr(gs)
+        + " rules=" + int_to_str(rule_engine_size(dr[DR_S_ENGINE]))
+        + " derived=" + int_to_str(dr[DR_S_STATS_DERIVED])
+        + " rounds=" + int_to_str(dr[DR_S_STATS_ROUNDS])
+        + " rules_tx=" + int_to_str(dr[DR_S_STATS_RULES_TX])
+        + " derivs_tx=" + int_to_str(dr[DR_S_STATS_DERIVS_TX])
+        + " fetches_tx=" + int_to_str(dr[DR_S_STATS_FETCHES_TX])
+        + " inbound_rules=" + int_to_str(len(dr[DR_S_INBOUND_RULES]))
+        + " inbound_derivs=" + int_to_str(len(dr[DR_S_INBOUND_DERIVS]))
+        + " async=" + int_to_str(dr_async_fetch_opt(dr))
+        + " async_rx=" + int_to_str(dr_stats_async_rx(dr))
+        + " late_drops=" + int_to_str(dr_stats_late_drops(dr))
+        + " timeout_adj=" + int_to_str(dr_stats_timeout_adj(dr))
+    // R30A pipelined counters only when the path is active. Keeps the
+    // legacy line shape for the default R28A-or-R21B configuration so
+    // existing log scrapers don't break.
+    if dr_pipeline_opt(dr) == 1 {
+        line = line + " pipeline=1"
+            + " pipe_dispatched=" + int_to_str(dr_stats_pipeline_dispatched(dr))
+            + " pipe_ready=" + int_to_str(dr_stats_pipeline_ready(dr))
+            + " pipe_timeouts=" + int_to_str(dr_stats_pipeline_timeouts(dr))
+            + " pipe_partial=" + int_to_str(dr_stats_pipeline_partial(dr))
+            + " conn_dispatched=" + int_to_str(dr_stats_connect_dispatched(dr))
+            + " conn_ready=" + int_to_str(dr_stats_connect_ready(dr))
+            + " conn_timeouts=" + int_to_str(dr_stats_connect_timeouts(dr))
+            + " conn_so_error=" + int_to_str(dr_stats_connect_so_error(dr))
+    }
+    return line
+}
+
+// ---- chat dispatch ------------------------------------------------------
+//
+// The chat REPL has no in-process gossip mesh (gossip is daemon-only),
+// so `/drule_add` and `/drule_run` are surfaced as INFORMATIONAL
+// commands that point operators at the federation scenario. This
+// mirrors how /gossip + /leader + /attest_log are wired into the
+// chat (no live state).
+fn drule_chat_add_cmd(arg) {
+    if len(arg) == 0 {
+        io_println("usage: /drule_add <rule>  -- e.g. /drule_add RULE ancestor(?a, ?c) <- ancestor(?a, ?b) AND parent(?b, ?c)")
+        io_println("DRULE_ADD info=R21B distributed rule inference runs on the federation mesh; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul cross-soul derivation walkthrough)")
+        return 1
+    }
+    // Parse locally as a sanity check so operators get immediate
+    // feedback on rule syntax errors.
+    let parsed = rule_parse(arg)
+    if _rule_is_error(parsed) == 1 {
+        io_println("DRULE_ADD error=" + rule_error_message(parsed))
+        return 1
+    }
+    io_println("DRULE_ADD parsed=ok head=" + rule_head_pred(parsed)
+        + " premises=" + int_to_str(rule_body_size(parsed))
+        + " info=R21B distributed rule (broadcast over gossip mesh; see scenario_eeee for the live walkthrough)")
+    return 1
+}
+
+fn drule_chat_run_cmd(arg) {
+    io_println("DRULE_RUN info=R21B distributed rule inference module ships in src/federation/distributed_rules.nova; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul cross-soul derivation walkthrough that drives dr_run_to_fixpoint over a partitioned parent-fact set)")
+    return 1
+}
+
+// ============================================================================
+// R28A -- async DRFETCH dispatch + adaptive timeout
+// ============================================================================
+//
+// Why
+//   R27E (commit ada38e1, scenario_yyyy_rule_convergence.sh) documented
+//   that on loaded CI hosts the synchronous DRFETCH path (one peer at a
+//   time, hardcoded 500 ms socket timeout) drives the convergence-stress
+//   suite into a partial-closure regime. The algorithm is correct (the
+//   3-soul scenario_eeee proves it), but the behaviour degrades under
+//   jitter: a peer that takes > 500 ms to ACK a DRFETCH causes the
+//   gossip layer's PING-derived suspicion machinery to mark the peer
+//   SUSPECT on the next tick (because the same TCP socket's RCVTIMEO
+//   fires the recv hard, and the dial path increments the
+//   STATS_TIMEOUTS counter on every miss). Subsequent rounds shrink the
+//   alive set the originator dials, the federated parent set shrinks,
+//   the chain extension stops at ~20-40 of the 55 ancestor pairs.
+//
+// What R28A changes
+//   1. Adaptive per-peer timeout. Each peer's recent DRFETCH round-trip
+//      latency is tracked in a 5-sample rolling window
+//      (DR_LATENCY_WINDOW); the median is recomputed on every push;
+//      the next DRFETCH to that peer SWITCHES its socket's RCVTIMEO
+//      after the HELLO/OK exchange to
+//          timeout_ms = min(MAX, max(MIN, 2 * median + PAD))
+//      with MAX=5000 ms, MIN=200 ms, PAD=200 ms. With no samples we
+//      fall back to the legacy 500 ms default (same as R21B's
+//      `_gossip_dial`), so the first round is bit-for-bit identical
+//      to R21B. A peer that consistently runs slow gets MORE budget
+//      across rounds; a permanently-dead peer fails fast on the dial.
+//   2. Late-ACK isolation. When the adaptive timer fires before DREND,
+//      we close the fd, increment STATS_LATE_DROPS, and continue. The
+//      gossip module's SUSPECT counter is NOT touched -- only the
+//      PING/ACK liveness probe path drives gossip_on_timeout. R21B's
+//      `gossip_dr_fetch_from` does not call gossip_on_timeout either,
+//      so the late-drop change is API-compatible. The peer's existing
+//      latency window is also left untouched on the timeout path so a
+//      one-off jitter doesn't poison the median for the next round.
+//   3. Opt-in via CE_DR_ASYNC_FETCH env var (values "on", "1", "yes"
+//      enable; everything else / unset stays on the synchronous path).
+//
+// Wire dispatch shape
+//   The async path keeps R21B's per-peer serial dispatch order: dial,
+//   HELLO, DRFETCH, switch-to-adaptive-RCVTIMEO, drain DRFACT*+DREND,
+//   BYE, close. The earlier R28A draft tried a phase-1-dispatch /
+//   phase-2-collect pipelining (dial every alive peer first, send
+//   DRFETCH back-to-back, then read DREND from each in order). That
+//   shape regressed every sub-scenario empirically: NOVA's runtime is
+//   single-threaded with blocking sockets, so holding 4 client
+//   connections open before any BYE keeps each peer's
+//   `gossip_handle_conn_kg` blocked in `_gossip_recv_line` waiting for
+//   our BYE for the duration of the dispatch pass. A blocked handler
+//   can't poll its accept queue or serve incoming PINGs from OTHER
+//   peers, which under load drives the gossip mesh into a SUSPECT
+//   cascade -- the very failure mode R28A is trying to fix. The
+//   sequential adaptive-timeout shape preserves R21B's wire semantics
+//   exactly; the per-peer adaptive RCVTIMEO + late-ACK isolation are
+//   the only behavioural deltas.
+//
+// Constraints noted in the implementation
+//   * NOVA has no poll(2)/select(2). The "async" name on the dispatch
+//     entrypoint and env var is preserved for API back-compat; the
+//     behaviour is "per-peer adaptive timeout with late-drop
+//     isolation" rather than wire-level parallelism.
+//   * The peer-latency table uses string-compare to find a peer's entry;
+//     the table only ever holds the union of peers we DRFETCHed, which
+//     in a typical mesh is < 32 entries. Linear scan stays tiny.
+//   * The HELLO/OK exchange happens BEFORE the adaptive RCVTIMEO is set;
+//     the dial path's 500 ms default applies to that handshake, so a
+//     permanently-dead peer fails fast (the OK we'd never receive
+//     triggers the dial's own timeout).
+
+// ---- env-var detection --------------------------------------------------
+
+// Read CE_DR_ASYNC_FETCH and return 1 iff the value opts in. Recognised
+// truthy values: "on", "1", "yes" (lowercased). Anything else / unset =
+// off (preserves R21B behaviour by default for any caller that doesn't
+// pass the env var through).
+fn _dr_async_fetch_from_env() {
+    let env = getenv("CE_DR_ASYNC_FETCH")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "on") == 1 { return 1 }
+    if str_eq(env, "1") == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    if str_eq(env, "ON") == 1 { return 1 }
+    if str_eq(env, "YES") == 1 { return 1 }
+    return 0
+}
+
+// ---- per-peer latency table --------------------------------------------
+
+// Find-or-create the latency record for peer_addr in dr's table.
+// Returns the record [addr, samples, median] (mutable).
+fn _dr_lat_get_or_make(dr, peer_addr) {
+    let table = dr[DR_S_PEER_LATENCIES]
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][DR_L_ADDR], peer_addr) == 1 {
+            return table[i]
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_addr)
+    push(rec, list_new())
+    push(rec, -1)
+    push(table, rec)
+    return rec
+}
+
+// Push a fresh latency sample (ms) onto a peer's rolling window. Shifts
+// out the oldest if we're at capacity; recomputes the cached median.
+fn _dr_lat_push(dr, peer_addr, lat_ms) {
+    let rec = _dr_lat_get_or_make(dr, peer_addr)
+    let samples = rec[DR_L_SAMPLES]
+    if len(samples) >= DR_LATENCY_WINDOW {
+        // Drop the oldest (front).
+        let i = 0
+        while i < len(samples) - 1 {
+            samples[i] = samples[i + 1]
+            i = i + 1
+        }
+        pop(samples)
+    }
+    push(samples, lat_ms)
+    list_set(rec, DR_L_MEDIAN, _dr_lat_median(samples))
+    return rec
+}
+
+// Compute the median of a list of ints. The list is small
+// (<= DR_LATENCY_WINDOW); copy + insertion sort + middle element.
+// Empty list -> -1.
+fn _dr_lat_median(samples) {
+    if len(samples) == 0 { return -1 }
+    let sorted = list_new()
+    let i = 0
+    while i < len(samples) {
+        push(sorted, samples[i])
+        i = i + 1
+    }
+    // Insertion sort.
+    let n = len(sorted)
+    let k = 1
+    while k < n {
+        let v = sorted[k]
+        let j = k
+        let done = 0
+        while done == 0 {
+            if j == 0 {
+                done = 1
+            } else {
+                if sorted[j - 1] > v {
+                    sorted[j] = sorted[j - 1]
+                    j = j - 1
+                } else {
+                    done = 1
+                }
+            }
+        }
+        sorted[j] = v
+        k = k + 1
+    }
+    // Middle.
+    return sorted[n / 2]
+}
+
+// ---- adaptive-timeout DRFETCH ------------------------------------------
+//
+// _dr_federated_facts_for_async(dr, kg, pred) -- the R28A pipelined
+// gather path. Same wire-level shape as R21B's `gossip_dr_fetch_from`
+// (one peer dial -> HELLO -> DRFETCH -> DRFACT* -> DREND -> BYE -> close)
+// but with two behaviour changes that close R27E's loaded-host gap:
+//
+//   1. **Per-peer adaptive RCVTIMEO.** The dial path's default 500 ms
+//      RCVTIMEO is overwritten with `dr_adaptive_timeout_for(dr, peer)`
+//      between sending DRFETCH and reading the DRFACT/DREND stream.
+//      The first round to a fresh peer uses 500 ms (no samples); later
+//      rounds use `min(MAX, max(MIN, 2 * median + PAD))`. A peer that
+//      consistently runs slow gets MORE budget; a fast peer keeps the
+//      tight 200 ms floor so a permanently-dead peer fails fast.
+//
+//   2. **Late-ACK isolation.** When the adaptive timer fires before
+//      DREND, we close the fd and bump STATS_LATE_DROPS but do NOT
+//      call `gossip_on_timeout`. The gossip PING/ACK liveness probe
+//      remains the only source of SUSPECT marks. The peer's existing
+//      latency window is left untouched (so a one-off jitter doesn't
+//      poison the median for the next round).
+//
+// Why not phase-1-dispatch / phase-2-collect (true pipelining)? NOVA's
+// runtime is single-threaded with blocking sockets; opening 4 client
+// connections to peers before reading DREND keeps each peer's
+// `gossip_handle_conn_kg` blocked in `_gossip_recv_line` waiting for
+// our BYE for the duration of the dispatch pass. A blocked handler
+// can't poll its accept queue or serve incoming PINGs from OTHER peers,
+// which under load drives the gossip mesh into a SUSPECT cascade
+// (observed empirically: phase-split caused regressions vs. the
+// sequential adaptive-timeout shape on every sub-scenario). The
+// sequential shape preserves R21B's wire semantics exactly; the
+// adaptive timeout is the only behavioural delta.
+fn _dr_federated_facts_for_async(dr, kg, pred) {
+    let gs = dr[DR_S_GOSSIP]
+    let self_addr = gossip_self_addr(gs)
+    let out = _dr_local_facts_for(kg, pred, self_addr)
+    let alive = gossip_alive_peers(gs)
+    let i = 0
+    while i < len(alive) {
+        let p_addr = alive[i]
+        if str_eq(p_addr, self_addr) == 0 {
+            dr[DR_S_STATS_FETCHES_TX] = dr[DR_S_STATS_FETCHES_TX] + 1
+            _dr_fetch_one_adaptive(dr, gs, p_addr, pred, out)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// _dr_fetch_one_adaptive(dr, gs, peer_addr, pred, out) -- the per-peer
+// half of the adaptive fetch. Open a connection, run the HELLO/OK
+// handshake under the default 500 ms RCVTIMEO, send `DRFETCH <pred>`,
+// SWITCH the RCVTIMEO to the peer's adaptive value, drain DRFACT lines
+// until DREND or the timer fires, append facts to `out`, record the
+// observed latency on success. Returns the count of facts appended
+// (informational; the caller relies on `out` mutation).
+fn _dr_fetch_one_adaptive(dr, gs, peer_addr, pred, out) {
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return 0 }
+    // HELLO/OK runs under the dial path's 500 ms RCVTIMEO -- the same
+    // budget R21B's `gossip_dr_fetch_from` uses for the same exchange.
+    // The adaptive timeout kicks in only AFTER DRFETCH is sent, where
+    // the per-peer latency window has actually measured a server
+    // response (the HELLO/OK round-trip is unrelated to the peer's
+    // DRFETCH service latency -- it's just the gossip handshake).
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    let start_ns = nanotime()
+    if _gossip_send_all(fd, GOSSIP_DRFETCH_PREFIX + pred + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let timeout_ms = dr_adaptive_timeout_for(dr, peer_addr)
+    if timeout_ms >= DR_FETCH_MAX_TIMEOUT_MS {
+        dr[DR_S_STATS_TIMEOUT_ADJ] = dr[DR_S_STATS_TIMEOUT_ADJ] + 1
+    }
+    _gossip_set_rcvtimeo_ms(fd, timeout_ms)
+    let collected = 0
+    let saw_dr_end = 0
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 {
+            running = 0
+        } else {
+            if str_eq(line, GOSSIP_DREND_LINE) == 1 {
+                running = 0
+                saw_dr_end = 1
+            } else {
+                if _gossip_starts_with(line, GOSSIP_DRFACT_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // DRFACT peer_addr pred arg1 arg2 atom_id
+                    if len(toks) >= 6 {
+                        let rec = list_new()
+                        push(rec, toks[1])
+                        push(rec, toks[3])
+                        push(rec, toks[4])
+                        let aid = 0
+                        if _gossip_is_digits(toks[5]) == 1 {
+                            aid = str_to_int(toks[5])
+                        }
+                        push(rec, aid)
+                        push(out, rec)
+                        collected = collected + 1
+                    }
+                }
+            }
+        }
+    }
+    if saw_dr_end == 1 {
+        let end_ns = nanotime()
+        let lat_ms = (end_ns - start_ns) / 1000000
+        if lat_ms < 0 { lat_ms = 0 }
+        _dr_lat_push(dr, peer_addr, lat_ms)
+        dr[DR_S_STATS_ASYNC_RX] = dr[DR_S_STATS_ASYNC_RX] + 1
+    } else {
+        // Adaptive timer fired before DREND. Increment the local
+        // late-drop counter ONLY; do NOT call gossip_on_timeout (that
+        // path is reserved for PING/ACK probes). The peer's existing
+        // latency window is left untouched so a one-off jitter doesn't
+        // poison the median for the next round.
+        dr[DR_S_STATS_LATE_DROPS] = dr[DR_S_STATS_LATE_DROPS] + 1
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return collected
+}
+
+// ---- test/operator helpers ----------------------------------------------
+//
+// dr_inject_peer_latency_sample(dr, peer_addr, lat_ms) -- expose the
+// latency-push path so unit tests can drive the median calculator
+// without opening real sockets. Returns the new cached median.
+fn dr_inject_peer_latency_sample(dr, peer_addr, lat_ms) {
+    let rec = _dr_lat_push(dr, peer_addr, lat_ms)
+    return rec[DR_L_MEDIAN]
+}
+
+// dr_peer_latency_table(dr) -- read-only accessor for diagnostics +
+// the unit test suite.
+fn dr_peer_latency_table(dr) {
+    if len(dr) <= DR_S_PEER_LATENCIES { return list_new() }
+    return dr[DR_S_PEER_LATENCIES]
+}
+
+// ============================================================================
+// R30A -- true-pipelined DRFETCH via sys_poll multi-fd wait
+// ============================================================================
+//
+// Why
+//   R28A documented (above) that NOVA's single-threaded blocking-socket
+//   runtime forced the original phase-1-dispatch / phase-2-collect
+//   pipeline design to be abandoned: holding N client connections open
+//   simultaneously kept each peer's `gossip_handle_conn_kg` blocked in
+//   `_gossip_recv_line` waiting for our BYE for the duration of the
+//   dispatch pass; a blocked peer handler could not poll its own
+//   accept queue or serve incoming PINGs from OTHER peers; under load
+//   this drove the gossip mesh into a SUSPECT cascade. R28A fell back
+//   to per-peer serial dispatch with adaptive RCVTIMEO -- the
+//   late-ACK isolation invariant survived but each round still walked
+//   alive peers one-at-a-time with two TCP round-trips between any
+//   two reads.
+//
+//   R29A (NOVA commit c48208e) ships `sys_poll(fds, nfds, timeout_ms)`
+//   across Linux x86-64, ARM64-Linux, macOS BSD, and Windows WSAPoll.
+//   The codegen exposes the POSIX pollfd struct shape directly: fd at
+//   offset 0 (i32 LE), events at offset 4 (i16 LE bitmask), revents at
+//   offset 6 (i16 LE), 8 bytes per entry. With sys_poll available the
+//   original phase-1 / phase-2 design CAN work:
+//
+//     Phase 1: for every alive peer P_i, open + HELLO + send DRFETCH
+//              header. Record (fd_i, peer_addr_i, start_ns_i) into a
+//              `pending` table. Do NOT wait for any ACK between
+//              dispatches; non-blocking semantics on the send side are
+//              guaranteed by the kernel's send buffer for typical
+//              DRFETCH header sizes (~20 bytes).
+//     Phase 2: build a pollfd array of size N with events=POLLIN.
+//              Call sys_poll(fds, N, adaptive_timeout_ms). Walk the
+//              returned revents bitmask: any entry with POLLIN set
+//              gets drained into the federated fact list via the same
+//              DRFACT/DREND state machine R21B uses; any entry whose
+//              revents stays 0 after sys_poll returned is a per-peer
+//              timeout -- close + bump STATS_PIPELINE_TIMEOUTS, leave
+//              the peer's latency window untouched (late-ACK isolation
+//              preserved).
+//
+//   The critical concurrency observation that broke the R28A draft is
+//   STILL true on the peer side: while the originator holds N
+//   connections to the responders, each responder's
+//   `gossip_handle_conn_kg` is parked in `_gossip_recv_line`. The
+//   difference is that with sys_poll, the originator can collect ALL
+//   N responses in a single syscall window (typically the slowest
+//   peer's RTT, not the sum of all peers' RTTs). The pause window
+//   shrinks from O(sum_RTT) to O(max_RTT). On a 5-soul mesh where one
+//   peer has 200 ms RTT and the rest have 50 ms, R28A waits ~400 ms
+//   per round (4 serial drains), R30A waits ~200 ms per round (one
+//   sys_poll that returns when the 200 ms peer is ready).
+//
+//   The honest caveat: NOVA still issues `_gossip_dial` + HELLO/OK
+//   serially in phase 1 (the dial uses connect(2) which is itself
+//   blocking on this runtime). For a 5-soul mesh on loopback the
+//   dial portion is < 5 ms total; the win comes from the poll
+//   parallelism on the response wait. For mesh sizes where the dial
+//   cost dominates the per-peer RTT (e.g. 50+ peers on lossy
+//   WAN) the pipeline win shrinks. Above some peer-count threshold
+//   the dial-serial cost can exceed any poll-parallel saving. The
+//   integration sub-scenario records the round count delta honestly
+//   so operators can see where the threshold sits for THEIR mesh.
+//
+// Adaptive timeout for the pipeline
+//   R28A's per-peer adaptive RCVTIMEO is computed from each peer's
+//   median latency window. With a single sys_poll wait we need ONE
+//   timeout that doesn't cut off the slowest peer. We take the MAX
+//   of all dispatched peers' adaptive timeouts (which already
+//   incorporate the per-peer median + R28A's MIN/MAX/PAD floor /
+//   ceiling), so the slowest peer gets its budget AND the floor/
+//   ceiling stay applied at the policy boundary. A peer with no
+//   recorded samples uses DR_FETCH_DEFAULT_TIMEOUT_MS just as in R28A.
+//
+// Late-ACK isolation
+//   When sys_poll returns and a peer's revents is 0 (no POLLIN), we
+//   close the fd, bump STATS_PIPELINE_TIMEOUTS, and DO NOT touch the
+//   peer's latency median window. That mirrors R28A's design intent:
+//   the gossip PING/ACK liveness probe remains the only source of
+//   SUSPECT marks; one slow DRFETCH does not poison the per-peer
+//   median for the next round.
+//
+// Implementation outline
+//   * `_dr_pipeline_from_env` -- read CE_DRFETCH_PIPELINE on dr_init.
+//   * `_dr_federated_facts_for_pipelined(dr, kg, pred)` -- the
+//     dispatcher entrypoint.
+//   * `_dr_pipeline_phase1_dispatch(dr, gs, pred, alive, self_addr)`
+//     opens connections, sends DRFETCH headers, returns a `pending`
+//     list of [fd, peer_addr, start_ns, done_flag] records.
+//   * `_dr_pipeline_compute_max_timeout(dr, pending)` -- MAX of
+//     per-peer adaptive timeouts.
+//   * `_dr_pipeline_alloc_pollfds(pending)` -- materialise the
+//     `alloc(N * 8)` pollfd array with the documented layout.
+//   * `_dr_pipeline_phase2_collect(dr, pending, fds_buf, timeout_ms,
+//      out)` -- one sys_poll call + per-fd drain.
+//   * `_dr_pipeline_drain_ready(dr, pend_rec, out)` -- the per-peer
+//     DRFACT*/DREND drainer; records the per-peer latency on success.
+
+// Read CE_DRFETCH_PIPELINE and return 1 iff the value opts in.
+// Recognised truthy values match the R28A convention (on / 1 / yes,
+// case-insensitive for the typical operator typo set).
+fn _dr_pipeline_from_env() {
+    let env = getenv("CE_DRFETCH_PIPELINE")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "on") == 1 { return 1 }
+    if str_eq(env, "1") == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    if str_eq(env, "ON") == 1 { return 1 }
+    if str_eq(env, "YES") == 1 { return 1 }
+    return 0
+}
+
+// ---- pollfd struct write/read helpers ----------------------------------
+//
+// R29A guarantees the pollfd layout: fd:i32 @0, events:i16 @4,
+// revents:i16 @6, 8 bytes total. The codegen test (R29A
+// tests/unit/test_codegen_poll.nova) cross-checks all six backends
+// against this layout via the same store8 + load8 primitives below.
+
+fn _dr_pollfd_addr(fds_buf, idx) {
+    return fds_buf + idx * DR_POLLFD_SIZE
+}
+
+// Write a 16-bit little-endian word at ptr+offset using two store8's.
+// All NOVA target platforms (Linux/macOS/Win x86-64; Linux ARM64-LE;
+// winARM64; WASM) are little-endian for the syscall layer, so this
+// is byte-identical to the kernel's pollfd shape.
+fn _dr_store_u16_le(ptr, off, val) {
+    let lo = int_and(val, 255)
+    let hi = int_and(int_shr(val, 8), 255)
+    store8(ptr + off, lo)
+    store8(ptr + off + 1, hi)
+    return 0
+}
+
+fn _dr_load_u16_le(ptr, off) {
+    let lo = load8(ptr + off)
+    let hi = load8(ptr + off + 1)
+    return int_or(lo, int_shl(hi, 8))
+}
+
+// Stamp fd (i32 LE, full 4 bytes for layout correctness even though
+// our fds are small ints) + events (i16 LE) + revents=0 into the
+// slot. Clears revents so the kernel write is the only source of
+// non-zero bits there.
+fn _dr_pollfd_init(slot, fd, events) {
+    store8(slot + DR_POLLFD_OFF_FD, int_and(fd, 255))
+    store8(slot + DR_POLLFD_OFF_FD + 1, int_and(int_shr(fd, 8), 255))
+    store8(slot + DR_POLLFD_OFF_FD + 2, int_and(int_shr(fd, 16), 255))
+    store8(slot + DR_POLLFD_OFF_FD + 3, int_and(int_shr(fd, 24), 255))
+    _dr_store_u16_le(slot, DR_POLLFD_OFF_EVENTS, events)
+    _dr_store_u16_le(slot, DR_POLLFD_OFF_REVENTS, 0)
+    return 0
+}
+
+fn _dr_pollfd_revents(slot) {
+    return _dr_load_u16_le(slot, DR_POLLFD_OFF_REVENTS)
+}
+
+// Has POLLIN been set on this slot's revents by the kernel?
+fn _dr_pollfd_has_pollin(slot) {
+    let rev = _dr_pollfd_revents(slot)
+    if int_and(rev, DR_POLLIN) == DR_POLLIN { return 1 }
+    return 0
+}
+
+// R31A: has any bit in (POLLOUT | POLLERR | POLLHUP) been set? The
+// kernel uses POLLOUT for "connect succeeded — fd is writable" and
+// POLLERR / POLLHUP for "connect failed — peer is unreachable /
+// reset". Either way SO_ERROR is now meaningful, so we treat the
+// fd as ready-for-SO_ERROR-check on any bit in the mask. Doing
+// otherwise would let a peer that RST'd mid-handshake silently
+// burn our entire dial budget.
+fn _dr_pollfd_has_pollout_or_err(slot) {
+    let rev = _dr_pollfd_revents(slot)
+    if int_and(rev, DR_POLL_OUT_MASK) != 0 { return 1 }
+    return 0
+}
+
+// ---- R31A: non-blocking connect wrapper --------------------------------
+//
+// _dr_connect_async(peer_addr) -> fd_or_neg.
+//
+// Opens a fresh TCP socket, sets O_NONBLOCK, calls connect(2). The
+// expected return path on a well-formed peer is connect(2) returning
+// -EINPROGRESS=-115 — the kernel started the SYN, the fd is valid,
+// caller must sys_poll(POLLOUT) and then getsockopt(SO_ERROR) to learn
+// the final outcome. The wrapper returns:
+//
+//   fd  >=  0 : fd is in the IN_PROGRESS state (or, rarely, the connect
+//               completed synchronously — typically only on loopback;
+//               either way the POLLOUT wait will satisfy immediately
+//               and SO_ERROR will read 0).
+//   fd  ==  -1 : hard local failure (parse error / socket() failed /
+//                fcntl failed / connect failed with non-EINPROGRESS
+//                errno like EADDRNOTAVAIL). No fd to clean up.
+//   fd  ==  -2 : connect returned an errno that's neither 0 nor
+//                EINPROGRESS, but the fd was successfully opened (we
+//                close it before returning so the caller doesn't have
+//                to). Used for diagnostic separation in stats counters.
+//
+// Note this wrapper does NOT retry like _gossip_dial does: parallel
+// dialing means a single attempt per peer per round; transient peer
+// startup-race failures fall to the next gossip round naturally,
+// matching the R28A late-ACK isolation principle.
+//
+// The wrapper is inlined into distributed_rules.nova rather than living
+// in src/io/transducers/stream_tcp.nova because that file doesn't yet
+// exist (R31A predates the stream_tcp transducer module); adding it
+// here keeps the dial-parallel surface owned by the federation layer
+// that consumes it.
+fn _dr_connect_async(peer_addr) {
+    let parsed = _gossip_parse_addr(peer_addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _gossip_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let fd = socket(2, 1, 0)
+    if fd < 0 { return -1 }
+    let nb = sys_fcntl_setfl_nonblock(fd)
+    if nb != 0 {
+        close_fd(fd)
+        return -1
+    }
+    let sa = make_sockaddr_in(port, ip)
+    let crc = connect_socket(fd, sa, 16)
+    // Three outcomes on the connect:
+    //   crc >= 0  : connect completed synchronously (loopback fast-path).
+    //   crc == -115 : -EINPROGRESS (the expected non-blocking case).
+    //   else      : hard error; close fd and report -2 so the caller can
+    //               distinguish "open + sync-error" from "open failed".
+    if crc >= 0 { return fd }
+    if crc == DR_CONNECT_EINPROGRESS { return fd }
+    close_fd(fd)
+    return -2
+}
+
+// R31A: pollfd-array helper that stamps fd + POLLOUT events for the
+// parallel dial wait. Same byte-layout invariants as the POLLIN array
+// used by phase 2; we just request POLLOUT instead.
+fn _dr_pollfd_init_pollout(slot, fd) {
+    _dr_pollfd_init(slot, fd, DR_POLLOUT)
+    return 0
+}
+
+// R31A: clear O_NONBLOCK from an fd. After the parallel-connect wait
+// has completed the dial sub-phase, we still want HELLO/OK and
+// DRFETCH-header _gossip_send_all/_recv_line to BLOCK normally —
+// otherwise a half-millisecond hiccup turns into EAGAIN on the send
+// loop and the peer is misclassified as "handshake failed". The
+// cleanest path is one extra fcntl(F_SETFL, 0) per peer, putting the
+// fd back into the same state _gossip_dial would have produced.
+// Linux-only inline asm following the same precedent as
+// gossip.nova's _gossip_fcntl wrapper. ARM64-Linux uses syscall 25
+// for fcntl; expanding this helper to multi-arch is a follow-up
+// (the pipelined-dial path is already Linux-first via gossip.nova's
+// _gossip_fcntl using the same asm shape, so cross-arch coverage
+// improves together).
+fn _dr_clear_nonblock(fd) {
+    let cmd = 4         // F_SETFL
+    let arg = 0         // clear all flags (= remove O_NONBLOCK)
+    asm {
+        "mov rax, 72"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// ---- phase 1: dispatch every peer ---------------------------------------
+//
+// R31A: Phase 1 now has TWO sub-phases:
+//   1a. Parallel non-blocking dial. Open ALL peer sockets non-blocking,
+//       kick connects (each returns -EINPROGRESS), build a pollfd
+//       POLLOUT array, sys_poll the array for up to DR_CONNECT_TIMEOUT_MS
+//       so every peer's TCP handshake races in parallel. Walk revents:
+//       for each peer that signalled, check SO_ERROR; if 0 the dial
+//       succeeded, else the dial failed (close fd, bump
+//       STATS_CONNECT_SO_ERROR counter). Peers with revents still 0 are
+//       dial-timeouts (STATS_CONNECT_TIMEOUTS).
+//   1b. Per-peer HELLO/OK + DRFETCH header. For each peer that survived
+//       1a, send GOSSIP_HELLO, recv GOSSIP_OK, send GOSSIP_DRFETCH +
+//       pred. These three steps are still serial (and could be a future
+//       R31B follow-up: per-line POLLOUT and per-recv POLLIN to make
+//       even the application-protocol exchange race in parallel), but
+//       the TCP-handshake portion — the part that scales linearly with
+//       network RTT — is now parallel.
+//
+// Returns the pending list in the same shape as R30A:
+//   [[fd, peer_addr, start_ns, done], ...]
+//
+// Honest expectation: at 5 peers on loopback the dial-RTT is ~10us so
+// the parallel speedup is invisible. At 50+ peers on WAN where each
+// dial is 50-150ms, this collapses O(N*RTT) into O(max_RTT), exactly
+// the win the brief targets.
+fn _dr_pipeline_phase1_dispatch(dr, gs, pred, alive, self_addr) {
+    // ---- 1a. Parallel non-blocking dial. ------------------------------
+    //
+    // First sweep: kick connects on every alive peer. Each returns
+    // either a fd in EINPROGRESS state (the expected case) or a
+    // negative error code that we account-for via stats.
+    // `dial_recs` is a list of [fd, peer_addr, dial_outcome] — outcome
+    // is reserved for diagnostics but not currently inspected past
+    // this loop; we just need fd and addr in 1a's poll loop.
+    let dial_recs = list_new()
+    let i = 0
+    while i < len(alive) {
+        let p_addr = alive[i]
+        if str_eq(p_addr, self_addr) == 0 {
+            let fd = _dr_connect_async(p_addr)
+            if fd >= 0 {
+                // fd is open, connect is in-progress (or already
+                // completed on loopback). Track it for the POLLOUT
+                // wait; we'll learn the final outcome via SO_ERROR.
+                let rec = list_new()
+                push(rec, fd)
+                push(rec, p_addr)
+                push(dial_recs, rec)
+                dr[DR_S_STATS_CONNECT_DISPATCHED] =
+                    dr[DR_S_STATS_CONNECT_DISPATCHED] + 1
+            }
+            // fd < 0 means a hard local failure — couldn't even open
+            // the socket. We do NOT bump CONNECT_DISPATCHED for those:
+            // the counter means "this peer's connect was kicked off",
+            // not "this peer was considered". Falling silently here
+            // matches R30A's behaviour for peers whose _gossip_dial
+            // returned -1.
+        }
+        i = i + 1
+    }
+
+    // ---- 1a (cont). POLLOUT wait + SO_ERROR check. -------------------
+    let nd = len(dial_recs)
+    if nd == 0 {
+        // No peer made it to the dial step. Either alive contained only
+        // self, or every peer's socket() / fcntl() / connect-with-hard-
+        // error fired. Either way phase 2 will see an empty pending list
+        // and degenerate cleanly.
+        return list_new()
+    }
+    let dial_buf = alloc(nd * DR_POLLFD_SIZE)
+    let j = 0
+    while j < nd {
+        let slot = _dr_pollfd_addr(dial_buf, j)
+        _dr_pollfd_init_pollout(slot, dial_recs[j][0])
+        j = j + 1
+    }
+    // Single sys_poll across the whole dial fleet. Timeout is the
+    // R31A-specific DR_CONNECT_TIMEOUT_MS (500ms default), independent
+    // of phase 2's adaptive timeout — phase 1 is about TCP handshake
+    // completion, phase 2 is about application-level ACK; they have
+    // different latency profiles.
+    let nready_dial = sys_poll(dial_buf, nd, DR_CONNECT_TIMEOUT_MS)
+    // nready_dial < 0 means a syscall-level poll error (rare). Treat
+    // it as "no peer dialed successfully" so we don't try to drain
+    // bogus revents below.
+    let alive_after_dial = list_new()
+    let k = 0
+    while k < nd {
+        let drec = dial_recs[k]
+        let fd_k = drec[0]
+        let pa_k = drec[1]
+        let slot_k = _dr_pollfd_addr(dial_buf, k)
+        let ready = 0
+        if nready_dial > 0 {
+            if _dr_pollfd_has_pollout_or_err(slot_k) == 1 { ready = 1 }
+        }
+        if ready == 1 {
+            // POLLOUT (or POLLERR/HUP) fired — read SO_ERROR to learn
+            // the actual outcome. 0 == clean connect; non-zero == the
+            // deferred connect errno (ECONNREFUSED=111, ETIMEDOUT=110,
+            // EHOSTUNREACH=113, ...).
+            let so_err = sys_getsockopt_so_error(fd_k)
+            if so_err == 0 {
+                dr[DR_S_STATS_CONNECT_READY] =
+                    dr[DR_S_STATS_CONNECT_READY] + 1
+                push(alive_after_dial, drec)
+            } else {
+                // SO_ERROR readback returned non-zero (or -1 == syscall
+                // itself failed). Either way the dial is dead; close
+                // the fd and bump the diagnostic counter.
+                dr[DR_S_STATS_CONNECT_SO_ERROR] =
+                    dr[DR_S_STATS_CONNECT_SO_ERROR] + 1
+                close_fd(fd_k)
+            }
+        } else {
+            // POLLOUT never fired within the dial budget. Peer is
+            // either slow or unreachable; close fd, bump dial-timeout.
+            // Like R28A's late-ACK isolation, we do NOT update the
+            // peer's latency median window for a dial timeout — the
+            // gossip PING/ACK probe remains the only liveness signal.
+            dr[DR_S_STATS_CONNECT_TIMEOUTS] =
+                dr[DR_S_STATS_CONNECT_TIMEOUTS] + 1
+            close_fd(fd_k)
+        }
+        k = k + 1
+    }
+
+    // ---- 1b. Per-peer HELLO/OK + DRFETCH header. ----------------------
+    //
+    // The TCP handshake portion of phase 1 has been parallelised; what
+    // remains is the application-level HELLO/OK + DRFETCH-header
+    // exchange. R30A walked these serially; R31A keeps the same serial
+    // walk on the (smaller) post-dial fleet because the HELLO/OK is
+    // sub-millisecond on a happy peer and the win-per-peer would be
+    // dwarfed by the sys_poll setup cost. A future R31B can add a
+    // second sys_poll(POLLIN) wait for the OK frames if profiling
+    // shows that's the new long pole.
+    //
+    // Before sending HELLO we clear O_NONBLOCK so _gossip_send_all
+    // and _gossip_recv_line block normally. Without this, a connected
+    // fd that's still in non-blocking mode would return EAGAIN
+    // (n<=0 in _gossip_send_all) and the peer would be misclassified
+    // as "handshake failed" even though the dial succeeded.
+    let pending = list_new()
+    let m = 0
+    while m < len(alive_after_dial) {
+        let drec = alive_after_dial[m]
+        let fd = drec[0]
+        let p_addr = drec[1]
+        _dr_clear_nonblock(fd)
+        let ok = 1
+        if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+            ok = 0
+        }
+        if ok == 1 {
+            let ack = _gossip_recv_line(fd)
+            if ack == 0 { ok = 0 }
+            if ok == 1 {
+                if str_eq(ack, GOSSIP_OK_LINE) == 0 { ok = 0 }
+            }
+        }
+        if ok == 1 {
+            let start_ns = nanotime()
+            if _gossip_send_all(fd, GOSSIP_DRFETCH_PREFIX
+                                + pred + "\n") == 0 {
+                ok = 0
+            }
+            if ok == 1 {
+                let rec = list_new()
+                push(rec, fd)
+                push(rec, p_addr)
+                push(rec, start_ns)
+                push(rec, 0)              // done = 0
+                push(pending, rec)
+                dr[DR_S_STATS_FETCHES_TX] =
+                    dr[DR_S_STATS_FETCHES_TX] + 1
+                dr[DR_S_STATS_PIPELINE_DISPATCHED] =
+                    dr[DR_S_STATS_PIPELINE_DISPATCHED] + 1
+            } else {
+                close_fd(fd)
+            }
+        } else {
+            close_fd(fd)
+        }
+        m = m + 1
+    }
+    return pending
+}
+
+// ---- phase 2: poll + drain ready --------------------------------------
+//
+// Compute the adaptive timeout for the pipeline as MAX over all
+// dispatched peers (each peer's adaptive timeout already incorporates
+// the R28A min/max/pad clamps; the MAX-of-max stays inside those
+// bounds by construction). A peer with no samples contributes
+// DR_FETCH_DEFAULT_TIMEOUT_MS just as in R28A.
+fn _dr_pipeline_compute_max_timeout(dr, pending) {
+    let max_t = DR_FETCH_DEFAULT_TIMEOUT_MS
+    let i = 0
+    while i < len(pending) {
+        let t = dr_adaptive_timeout_for(dr, pending[i][DR_PIPELINE_PEND_ADDR])
+        if t > max_t { max_t = t }
+        i = i + 1
+    }
+    // The clamps are already baked in via dr_adaptive_timeout_for, but
+    // belt-and-braces: bump the STATS_TIMEOUT_ADJ counter once if the
+    // pipeline winds up at the MAX ceiling so the diagnostic matches
+    // the R28A meaning of "we hit the ceiling".
+    if max_t >= DR_FETCH_MAX_TIMEOUT_MS {
+        dr[DR_S_STATS_TIMEOUT_ADJ] = dr[DR_S_STATS_TIMEOUT_ADJ] + 1
+    }
+    return max_t
+}
+
+// Allocate the pollfd array. One sys_poll call needs the array to be
+// contiguous in memory; alloc() returns a heap pointer we can index by
+// `base + idx * 8` (DR_POLLFD_SIZE). The caller owns the buffer for
+// the duration of the collect pass; NOVA's allocator handles the
+// free implicitly via the round-end GC of the dr_run_round arena.
+fn _dr_pipeline_alloc_pollfds(pending) {
+    let n = len(pending)
+    if n == 0 { return 0 }
+    let buf = alloc(n * DR_POLLFD_SIZE)
+    let i = 0
+    while i < n {
+        let slot = _dr_pollfd_addr(buf, i)
+        let fd = pending[i][DR_PIPELINE_PEND_FD]
+        _dr_pollfd_init(slot, fd, DR_POLLIN)
+        i = i + 1
+    }
+    return buf
+}
+
+// Drain DRFACT*/DREND from a peer whose revents had POLLIN set.
+// Mirrors `_dr_fetch_one_adaptive`'s drain loop. Records the per-peer
+// latency on a clean DREND. On EOF / partial read mid-stream we treat
+// it as a timeout (no latency push -- one-off jitter on partial drain
+// shouldn't poison the median). Returns 1 on clean drain, 0 on
+// partial.
+fn _dr_pipeline_drain_ready(dr, pend_rec, out) {
+    let fd = pend_rec[DR_PIPELINE_PEND_FD]
+    let peer_addr = pend_rec[DR_PIPELINE_PEND_ADDR]
+    let start_ns = pend_rec[DR_PIPELINE_PEND_START]
+    let saw_dr_end = 0
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 {
+            running = 0
+        } else {
+            if str_eq(line, GOSSIP_DREND_LINE) == 1 {
+                running = 0
+                saw_dr_end = 1
+            } else {
+                if _gossip_starts_with(line, GOSSIP_DRFACT_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // DRFACT peer_addr pred arg1 arg2 atom_id
+                    if len(toks) >= 6 {
+                        let rec = list_new()
+                        push(rec, toks[1])
+                        push(rec, toks[3])
+                        push(rec, toks[4])
+                        let aid = 0
+                        if _gossip_is_digits(toks[5]) == 1 {
+                            aid = str_to_int(toks[5])
+                        }
+                        push(rec, aid)
+                        push(out, rec)
+                    }
+                }
+            }
+        }
+    }
+    if saw_dr_end == 1 {
+        let end_ns = nanotime()
+        let lat_ms = (end_ns - start_ns) / 1000000
+        if lat_ms < 0 { lat_ms = 0 }
+        _dr_lat_push(dr, peer_addr, lat_ms)
+        dr[DR_S_STATS_ASYNC_RX] = dr[DR_S_STATS_ASYNC_RX] + 1
+        return 1
+    }
+    return 0
+}
+
+// Walk the pollfd array, for each entry with POLLIN drain DRFACT*/
+// DREND; for entries whose revents stays clear after the syscall
+// returned, bump STATS_PIPELINE_TIMEOUTS (late-ACK isolation: no
+// gossip_on_timeout, no latency-window push). Returns the count of
+// peers that were drained cleanly so the caller can report a
+// "partial" diagnostic when sys_poll reported >= 1 but not all.
+fn _dr_pipeline_phase2_collect(dr, pending, fds_buf, out) {
+    let n = len(pending)
+    let drained_ok = 0
+    let i = 0
+    while i < n {
+        let slot = _dr_pollfd_addr(fds_buf, i)
+        let rec = pending[i]
+        if _dr_pollfd_has_pollin(slot) == 1 {
+            let ok = _dr_pipeline_drain_ready(dr, rec, out)
+            if ok == 1 {
+                dr[DR_S_STATS_PIPELINE_READY] =
+                    dr[DR_S_STATS_PIPELINE_READY] + 1
+                drained_ok = drained_ok + 1
+            } else {
+                // POLLIN set but the drain hit EOF before DREND --
+                // count as a timeout-style late drop for diagnostic
+                // honesty (the peer's median window is left untouched).
+                dr[DR_S_STATS_PIPELINE_TIMEOUTS] =
+                    dr[DR_S_STATS_PIPELINE_TIMEOUTS] + 1
+                dr[DR_S_STATS_LATE_DROPS] =
+                    dr[DR_S_STATS_LATE_DROPS] + 1
+            }
+        } else {
+            // revents stayed 0 -- peer never became ready within the
+            // pipeline timeout. Late-ACK isolation: increment the
+            // local pipeline-timeouts counter and the legacy R28A
+            // late-drops counter, but do NOT call gossip_on_timeout
+            // and do NOT push a latency sample.
+            dr[DR_S_STATS_PIPELINE_TIMEOUTS] =
+                dr[DR_S_STATS_PIPELINE_TIMEOUTS] + 1
+            dr[DR_S_STATS_LATE_DROPS] =
+                dr[DR_S_STATS_LATE_DROPS] + 1
+        }
+        // BYE + close regardless of drain outcome so the peer's
+        // handler unwinds promptly and can return to its accept loop.
+        // A failed BYE send is harmless; the close_fd hits the kernel
+        // unconditionally.
+        _gossip_send_all(rec[DR_PIPELINE_PEND_FD], GOSSIP_BYE_LINE + "\n")
+        close_fd(rec[DR_PIPELINE_PEND_FD])
+        i = i + 1
+    }
+    return drained_ok
+}
+
+// _dr_federated_facts_for_pipelined(dr, kg, pred) -- R30A entrypoint.
+// Mirrors _dr_federated_facts_for_async's shape (seed local facts +
+// fan out over alive peers) but uses sys_poll for the wait phase
+// instead of one-RTT-at-a-time. Returns the federated fact list in
+// the standard [peer_addr, arg1, arg2, atom_id] row shape.
+//
+// Edge cases:
+//   * 0 peers (single-soul mesh or only-self alive) -> degenerate to
+//     the local-only fact list, identical to the sync path. No
+//     dispatch counter bumps (correctly reports "nothing pipelined").
+//   * 1 peer -> phase 1 dispatches one, sys_poll(nfds=1) waits up to
+//     the adaptive timeout, phase 2 drains. Wire-shape identical to
+//     R28A's serial path; the diagnostic counters distinguish the
+//     two via STATS_PIPELINE_DISPATCHED.
+//   * N peers -> the win case described above.
+fn _dr_federated_facts_for_pipelined(dr, kg, pred) {
+    let gs = dr[DR_S_GOSSIP]
+    let self_addr = gossip_self_addr(gs)
+    let out = _dr_local_facts_for(kg, pred, self_addr)
+    let alive = gossip_alive_peers(gs)
+    let pending = _dr_pipeline_phase1_dispatch(dr, gs, pred, alive, self_addr)
+    let n = len(pending)
+    if n == 0 { return out }
+    let timeout_ms = _dr_pipeline_compute_max_timeout(dr, pending)
+    let fds_buf = _dr_pipeline_alloc_pollfds(pending)
+    let nready = sys_poll(fds_buf, n, timeout_ms)
+    // nready >= 1: at least one peer ready; walk all slots to
+    //              attribute timeouts vs ready (sys_poll returns the
+    //              count of ready fds but we must iterate to find
+    //              WHICH ones via the revents bits).
+    // nready == 0: timeout fired before any peer responded; all N are
+    //              late drops.
+    // nready < 0: kernel-level poll error (rare on healthy hosts but
+    //             we have to be defensive); treat all N as late drops
+    //             so the upper layer doesn't loop reading bogus revents.
+    if nready < 0 {
+        // Degrade gracefully: every dispatched peer becomes a late drop.
+        let i = 0
+        while i < n {
+            let rec = pending[i]
+            dr[DR_S_STATS_PIPELINE_TIMEOUTS] =
+                dr[DR_S_STATS_PIPELINE_TIMEOUTS] + 1
+            dr[DR_S_STATS_LATE_DROPS] =
+                dr[DR_S_STATS_LATE_DROPS] + 1
+            _gossip_send_all(rec[DR_PIPELINE_PEND_FD],
+                             GOSSIP_BYE_LINE + "\n")
+            close_fd(rec[DR_PIPELINE_PEND_FD])
+            i = i + 1
+        }
+        return out
+    }
+    let drained = _dr_pipeline_phase2_collect(dr, pending, fds_buf, out)
+    // Partial diagnostic: sys_poll reported >0 ready fds but we
+    // drained fewer than dispatched. Honest signal that a tail-end
+    // peer is consistently the long-pole.
+    if nready > 0 {
+        if drained < n {
+            dr[DR_S_STATS_PIPELINE_PARTIAL] =
+                dr[DR_S_STATS_PIPELINE_PARTIAL] + 1
+        }
+    }
+    return out
+}
+
+// ---- test/operator helpers (R30A) --------------------------------------
+//
+// dr_pollfd_size() -- expose DR_POLLFD_SIZE so a test can assert the
+// layout matches R29A's documented contract (offsets 0/4/6, size 8).
+// This is the only public surface the layout exposes; the rest is
+// internal so the lowering can evolve if R29A revises the pollfd
+// shape on a future backend.
+fn dr_pollfd_size() { return DR_POLLFD_SIZE }
+fn dr_pollfd_off_fd() { return DR_POLLFD_OFF_FD }
+fn dr_pollfd_off_events() { return DR_POLLFD_OFF_EVENTS }
+fn dr_pollfd_off_revents() { return DR_POLLFD_OFF_REVENTS }
+
+// dr_test_pipeline_pollfd_buf(n) -- allocate a pollfd buffer of size
+// n * 8 for layout tests. Returns the buffer pointer + does not
+// initialise contents (the test is responsible for stamping fields).
+fn dr_test_pipeline_pollfd_buf(n) {
+    if n <= 0 { return 0 }
+    return alloc(n * DR_POLLFD_SIZE)
+}
+
+// dr_test_pollfd_init / dr_test_pollfd_revents -- thin wrappers that
+// route through the private helpers above so unit tests can drive the
+// layout assertions without exposing the raw bit-twiddling helpers.
+fn dr_test_pollfd_init(buf, idx, fd, events) {
+    let slot = _dr_pollfd_addr(buf, idx)
+    _dr_pollfd_init(slot, fd, events)
+    return 0
+}
+
+fn dr_test_pollfd_revents(buf, idx) {
+    let slot = _dr_pollfd_addr(buf, idx)
+    return _dr_pollfd_revents(slot)
+}
+
+fn dr_test_pollfd_raw_byte(buf, idx, off) {
+    let slot = _dr_pollfd_addr(buf, idx)
+    return load8(slot + off)
+}

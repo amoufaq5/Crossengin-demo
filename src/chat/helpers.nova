@@ -1,0 +1,382 @@
+// CrossEngin chat: pure helper functions extracted from
+// examples/crossengin_chat.nova for testability (P1.8).
+//
+// Purpose
+//   examples/crossengin_chat.nova has grown past 1600 lines as the REPL has
+//   accreted features (/learn composite kinds, /switch, /save, /load, /meta,
+//   /reflect, etc.). A large fraction of the file is small pure helpers --
+//   string splitters, tag-deriving sanitisers, the intent-list builder --
+//   that are easy to test in isolation but cannot be imported as long as
+//   they share a translation unit with `fn main()` and the chat's top-level
+//   mutables (`halted`, `_buf`, `_last_reply`, `sreg`, `sauth`, `active_id`).
+//
+//   This module is the load-bearing extraction: each function here is a
+//   verbatim copy of the chat-side body, moved out so test_chat_helpers.nova
+//   can exercise it directly. The chat re-imports this module instead of
+//   re-defining the helpers inline; behaviour is bit-identical. Pre-P1.8
+//   `tests/unit/test_learn_tag.nova` re-defined the same tag helpers locally
+//   for the same reason; it stays as-is for now as a regression net (a
+//   one-line cross-reference comment points at this module + the new tests).
+//
+// Selection criteria (must satisfy ALL)
+//   1. The function reads ONLY its parameters; no top-level mutable state.
+//   2. The function returns a value (no IO side effects: no print, no exit,
+//      no atom mutation, no scheduler poke).
+//   3. Removing the function from the chat does not change the chat's
+//      behaviour byte-for-byte (verified by `make build && make integration`
+//      + the chat REPL still boots and prints `/help` cleanly).
+//
+//   Helpers that touch `halted` / `_buf` / `_last_reply` / `sreg` / `sauth`
+//   / `active_id` / `arb` / `kg` / `lang` / the substrate registry STAY in
+//   chat.nova; they are flagged in this module's header for the next
+//   refactoring pass. See the "Keep in chat" list in the P1.8 brief.
+//
+// ADRs implemented: ADR-0049 (testing and benchmarks) -- this is the
+//   "factor out for unit-test reach" pattern that ADR-0049's "every module
+//   has a matching tests/unit/test_<module>.nova" rule asks for.
+//
+// NOVA dependencies: builtins only (substr, len, char_at, push, list_new,
+//   str_trim, str_eq, starts_with).
+// CrossEngin dependencies: NONE -- this module is the lowest-level chat
+//   facade; importing anything else here would dilute the "pure helpers"
+//   contract.
+
+// ---- /learn argument classification --------------------------------------
+// Six source kinds, all detected by prefix on the argument string. Mirrors
+// the bash `case` blocks in scripts/learn.sh -- if drift creeps in between
+// the two sides, scripts/learn_smoke_multi.sh + test_chat_helpers will both
+// surface it.
+
+let LEARN_KIND_TOPIC = 0
+let LEARN_KIND_URL   = 1
+let LEARN_KIND_FILE  = 2
+let LEARN_KIND_BATCH = 3   // P1.5 -- @/path/urls.txt
+let LEARN_KIND_RSS   = 4   // P1.5 -- rss:URL
+let LEARN_KIND_DIR   = 5   // P1.5 -- dir:/path
+
+// ---- pure helpers --------------------------------------------------------
+
+// Used by chat's main reply path. Builds a one-cell intent list of the
+// shape [[role, lemma]] so gen_from_intent can emit ACK / SEE patterns.
+fn _intent1(role, lemma) {
+    let it = list_new()
+    let a = list_new() push(a, role) push(a, lemma)
+    push(it, a)
+    return it
+}
+
+// Used by chat's _try_admin (and /pin's two-arg split). Split "/cmd rest of
+// line" into [cmd, args]. args is "" if there was no space. Treats a single
+// ASCII space (32) as the delimiter -- multi-space inputs land entirely in
+// args after str_trim.
+fn _split_cmd(msg) {
+    let i = 0
+    while i < len(msg) {
+        if char_at(msg, i) == 32 {
+            let pair = list_new()
+            push(pair, substr(msg, 0, i))
+            push(pair, str_trim(substr(msg, i + 1, len(msg) - i - 1)))
+            return pair
+        }
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, msg)
+    push(pair, "")
+    return pair
+}
+
+// Used by chat's _admin_learn_triples. Split one "S|R|O" line into a
+// 3-element list. Returns 0 on malformed lines (missing/extra pipes, empty
+// fields). Pipe (|) is U+007C = 124.
+fn _split_triple(line) {
+    let n = len(line)
+    let p1 = -1
+    let p2 = -1
+    let i = 0
+    while i < n {
+        if char_at(line, i) == 124 {
+            if p1 < 0 { p1 = i } else { if p2 < 0 { p2 = i } }
+        }
+        i = i + 1
+    }
+    if p1 < 0 { return 0 }
+    if p2 < 0 { return 0 }
+    if p2 <= p1 + 1 { return 0 }
+    let s = str_trim(substr(line, 0, p1))
+    let r = str_trim(substr(line, p1 + 1, p2 - p1 - 1))
+    let o = str_trim(substr(line, p2 + 1, n - p2 - 1))
+    if len(s) == 0 { return 0 }
+    if len(r) == 0 { return 0 }
+    if len(o) == 0 { return 0 }
+    let out = list_new()
+    push(out, s)
+    push(out, r)
+    push(out, o)
+    return out
+}
+
+// Used by chat's _admin_learn (and by the _learn_tag_* derivers). Tag for
+// source attribution / log lines (avoids hard-coding the literal name).
+fn _learn_kind_name(k) {
+    if k == LEARN_KIND_URL   { return "url" }
+    if k == LEARN_KIND_FILE  { return "file" }
+    if k == LEARN_KIND_BATCH { return "batch" }
+    if k == LEARN_KIND_RSS   { return "rss" }
+    if k == LEARN_KIND_DIR   { return "dir" }
+    return "topic"
+}
+
+// Used by chat's _admin_learn and _learn_tag. Classify the argument:
+// TOPIC (bare word, default), URL (http(s)://prefix), FILE (absolute or
+// ./|../ relative), BATCH (@-prefix), RSS (rss: prefix), DIR (dir: prefix).
+// Mirrors the bash `case` blocks in learn.sh -- the composite-prefix cases
+// are checked FIRST so e.g. a directory called `./foo` is not misclassified
+// as FILE.
+fn _learn_kind(arg) {
+    if len(arg) == 0 { return LEARN_KIND_TOPIC }
+    // P1.5 composite prefixes come first.
+    if char_at(arg, 0) == 64 { return LEARN_KIND_BATCH }                  // '@'
+    if starts_with(arg, "rss:") == 1 { return LEARN_KIND_RSS }
+    if starts_with(arg, "dir:") == 1 { return LEARN_KIND_DIR }
+    // Original three.
+    if starts_with(arg, "http://")  == 1 { return LEARN_KIND_URL }
+    if starts_with(arg, "https://") == 1 { return LEARN_KIND_URL }
+    if char_at(arg, 0) == 47 { return LEARN_KIND_FILE }                   // '/'
+    if len(arg) >= 2 {
+        if char_at(arg, 0) == 46 {
+            if char_at(arg, 1) == 47 { return LEARN_KIND_FILE }           // './'
+            if len(arg) >= 3 {
+                if char_at(arg, 1) == 46 {
+                    if char_at(arg, 2) == 47 { return LEARN_KIND_FILE }   // '../'
+                }
+            }
+        }
+    }
+    return LEARN_KIND_TOPIC
+}
+
+// Used by every tag-deriving helper below. True if c is alphanumeric, '_'
+// or '-'.
+fn _is_tag_alnum(c) {
+    if c >= 48 { if c <= 57  { return 1 } }     // 0-9
+    if c >= 65 { if c <= 90  { return 1 } }     // A-Z
+    if c >= 97 { if c <= 122 { return 1 } }     // a-z
+    if c == 95 { return 1 }                     // _
+    if c == 45 { return 1 }                     // -
+    return 0
+}
+
+// Used by every tag-deriving helper. Cap a tag at 64 characters (matching
+// `cut -c1-64`).
+fn _cap_tag(s) {
+    if len(s) <= 64 { return s }
+    return substr(s, 0, 64)
+}
+
+// Used by _learn_tag's URL branch. URL tag: strip scheme, swap '/' for '_',
+// DROP non-alnum/_/-, cap 64. Mirrors:
+//   sed -E 's|^https?://||; s|/|_|g; s|[^a-zA-Z0-9_-]||g' | cut -c1-64
+fn _learn_tag_url(arg) {
+    let s = arg
+    if starts_with(s, "https://") == 1 { s = substr(s, 8, len(s) - 8) }
+    else { if starts_with(s, "http://") == 1 { s = substr(s, 7, len(s) - 7) } }
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 47 {                          // '/' -> '_'
+            out = out + "_"
+        } else {
+            if _is_tag_alnum(c) == 1 {
+                out = out + substr(s, i, 1)
+            }
+        }
+        i = i + 1
+    }
+    return _cap_tag(out)
+}
+
+// Used by _learn_tag's FILE branch. FILE tag: take basename, strip last
+// extension, replace non-alnum/_/- with '_', cap 64. Mirrors:
+//   basename | sed -E 's|\.[^.]+$||; s|[^a-zA-Z0-9_-]|_|g'
+fn _learn_tag_file(arg) {
+    // basename: substring after the last '/'.
+    let cut = 0 - 1
+    let i = 0
+    while i < len(arg) {
+        if char_at(arg, i) == 47 { cut = i }
+        i = i + 1
+    }
+    let base = arg
+    if cut >= 0 { base = substr(arg, cut + 1, len(arg) - cut - 1) }
+    // Strip last extension (last '.' followed by 1+ non-'.' chars to end).
+    // Mirrors `sed 's|\.[^.]+$||'`: only strip if there's a non-empty tail.
+    let dot = 0 - 1
+    let j = 0
+    while j < len(base) {
+        if char_at(base, j) == 46 { dot = j }
+        j = j + 1
+    }
+    let body = base
+    if dot >= 0 {
+        if dot < len(base) - 1 { body = substr(base, 0, dot) }
+    }
+    // Replace remaining non-alnum/_/- with '_'.
+    let out = ""
+    let k = 0
+    while k < len(body) {
+        let c = char_at(body, k)
+        if _is_tag_alnum(c) == 1 {
+            out = out + substr(body, k, 1)
+        } else {
+            out = out + "_"
+        }
+        k = k + 1
+    }
+    return _cap_tag(out)
+}
+
+// Used by _learn_tag_batch / _learn_tag_rss / _learn_tag_dir. Generic
+// alphanumeric sanitiser: replace any char outside [A-Za-z0-9_-] with '_'
+// and cap at 64. Mirrors `sed -E 's|[^a-zA-Z0-9_-]|_|g' | cut -c1-64` in
+// scripts/learn.sh.
+fn _tag_sanitise(s) {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if _is_tag_alnum(c) == 1 {
+            out = out + substr(s, i, 1)
+        } else {
+            out = out + "_"
+        }
+        i = i + 1
+    }
+    return _cap_tag(out)
+}
+
+// Used by _learn_tag's BATCH branch. BATCH tag: drop '@' prefix, take
+// basename, strip the LAST extension, then sanitise, prepend "batch_",
+// cap 64. Mirrors:
+//   STEM=basename(LIST_PATH); TAG=_tag_sanitise("batch_" + STEM_without_ext)
+fn _learn_tag_batch(arg) {
+    // Skip the leading '@' (already verified by _learn_kind).
+    let s = arg
+    if len(s) >= 1 {
+        if char_at(s, 0) == 64 { s = substr(s, 1, len(s) - 1) }
+    }
+    // basename: portion after the last '/'.
+    let cut = 0 - 1
+    let i = 0
+    while i < len(s) {
+        if char_at(s, i) == 47 { cut = i }
+        i = i + 1
+    }
+    let base = s
+    if cut >= 0 { base = substr(s, cut + 1, len(s) - cut - 1) }
+    // Strip last extension (only if non-empty tail follows the dot).
+    let dot = 0 - 1
+    let j = 0
+    while j < len(base) {
+        if char_at(base, j) == 46 { dot = j }
+        j = j + 1
+    }
+    let stem = base
+    if dot >= 0 {
+        if dot < len(base) - 1 { stem = substr(base, 0, dot) }
+    }
+    return _tag_sanitise("batch_" + stem)
+}
+
+// Used by _learn_tag's RSS branch. RSS tag: drop "rss:" prefix, strip
+// http(s):// scheme, take the host portion (up to the first '/'), sanitise,
+// prepend "rss_", cap. Mirrors:
+//   FEED_HOST=$(echo URL | sed -E 's|^https?://||; s|/.*$||;
+//                                   s|[^a-zA-Z0-9_-]|_|g' | cut -c1-32)
+//   TAG=_tag_sanitise("rss_" + FEED_HOST)
+fn _learn_tag_rss(arg) {
+    let s = arg
+    // Skip "rss:" prefix.
+    if starts_with(s, "rss:") == 1 { s = substr(s, 4, len(s) - 4) }
+    // Strip scheme.
+    if starts_with(s, "https://") == 1 { s = substr(s, 8, len(s) - 8) }
+    else { if starts_with(s, "http://") == 1 { s = substr(s, 7, len(s) - 7) } }
+    // Host portion: up to the first '/' (or full s if no '/').
+    let slash = 0 - 1
+    let i = 0
+    while i < len(s) {
+        if char_at(s, i) == 47 {
+            if slash < 0 { slash = i }
+        }
+        i = i + 1
+    }
+    let host = s
+    if slash >= 0 { host = substr(s, 0, slash) }
+    // Cap host at 32 chars before sanitising (matches bash `cut -c1-32`), so
+    // the final tag has room for the "rss_" prefix without spilling past 64.
+    if len(host) > 32 { host = substr(host, 0, 32) }
+    return _tag_sanitise("rss_" + host)
+}
+
+// Used by _learn_tag_dir. Tiny basename helper: substring after the last
+// '/' (or the whole string if no slash). Kept local so the P1.5 derivers
+// don't need to import io_basename.
+fn _basename(s) {
+    let cut = 0 - 1
+    let i = 0
+    while i < len(s) {
+        if char_at(s, i) == 47 { cut = i }
+        i = i + 1
+    }
+    if cut < 0 { return s }
+    return substr(s, cut + 1, len(s) - cut - 1)
+}
+
+// Used by _learn_tag's DIR branch. DIR tag: drop "dir:" prefix, strip
+// trailing '/' (so basename(/a/b/) == 'b'), take basename, sanitise,
+// prepend "dir_", cap. Mirrors:
+//   DIR_TRIM="${DIR_PATH%/}"; DIR_BASE=$(basename "$DIR_TRIM")
+//   TAG=_tag_sanitise("dir_" + DIR_BASE)
+fn _learn_tag_dir(arg) {
+    let s = arg
+    if starts_with(s, "dir:") == 1 { s = substr(s, 4, len(s) - 4) }
+    // Strip trailing slashes (one or more).
+    while len(s) > 0 {
+        if char_at(s, len(s) - 1) == 47 { s = substr(s, 0, len(s) - 1) }
+        else { return _tag_sanitise("dir_" + _basename(s)) }
+    }
+    // Path was all slashes (e.g. "dir:/"): basename is empty.
+    return _tag_sanitise("dir_")
+}
+
+// Used by chat's _admin_learn (and _learn_ingest_batch_per_url). Re-derive
+// the same <tag> that scripts/learn.sh used for this argument so
+// /tmp/crossengin_learn_<tag>.txt resolves to the right cache file.
+fn _learn_tag(arg) {
+    let kind = _learn_kind(arg)
+    if kind == LEARN_KIND_URL   { return _learn_tag_url(arg) }
+    if kind == LEARN_KIND_FILE  { return _learn_tag_file(arg) }
+    if kind == LEARN_KIND_BATCH { return _learn_tag_batch(arg) }
+    if kind == LEARN_KIND_RSS   { return _learn_tag_rss(arg) }
+    if kind == LEARN_KIND_DIR   { return _learn_tag_dir(arg) }
+    return arg
+}
+
+// Used by chat's _admin_meta / _admin_meta_feedback / _admin_switch table
+// formatting. Right-pad a string to `width` columns. Truncates if the input
+// is wider (preserves alignment for long tag names). Pure string transform;
+// no IO.
+fn _mo_pad(s, width) {
+    let out = s
+    let n = len(s)
+    if n >= width {
+        return substr(s, 0, width - 1) + " "
+    }
+    let i = n
+    while i < width {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}

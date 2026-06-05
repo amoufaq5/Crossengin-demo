@@ -1,0 +1,428 @@
+// Unit tests for src/io/transducers/image_optical_flow.nova (R10D).
+//
+// Hermetic coverage of the Lucas-Kanade dense optical flow algorithm.
+// Fixtures are built in-memory via alloc + store8 so this suite never
+// touches disk; the integration test (scenario_ss_optical_flow.sh)
+// exercises the chat /flow admin against hand-built PGM pairs.
+//
+// Assertion targets (~33):
+//   * Identical frames: flow ~ (0, 0) and density "low".
+//   * Rigid horizontal shift (next = prev shifted right by 3 px):
+//       u_milli ~ 3000 at interior textured pixels, v_milli ~ 0.
+//   * Rigid vertical shift (next = prev shifted down by 2 px):
+//       u_milli ~ 0, v_milli ~ 2000.
+//   * Diagonal shift (1 right, 1 down): u_milli ~ 1000, v_milli ~ 1000.
+//   * Texture-less region (flat fill): det == 0 -> invalid.
+//   * Mean magnitude on the shifted-by-3 fixture: ~3000 milli.
+//   * Density label round-trip (low / mid / high).
+//   * lk_flow_at OOB safety.
+//   * lk_optical_flow rejects oversized inputs / zero pointers.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_optical_flow.nova"
+
+// ---- fixture builders ----------------------------------------------------
+//
+// We use a TEXTURED fixture (deterministic pseudo-noise) so the LK normal
+// equations have meaningful gradient sums. A flat fixture would produce
+// det == 0 everywhere -- intentionally exercised in the texture-less test.
+
+fn _flat_fixture(width, height, value) {
+    let area = int_mul(width, height)
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// SMOOTH textured fixture. LK's linearization (I_next ~ I_prev +
+// dx*Ix + dy*Iy + It) requires the image to vary smoothly enough that
+// the first-order Taylor expansion holds at the pixel scale of the
+// shift. A pseudo-noise pattern violates this: adjacent pixels are
+// uncorrelated so a 1-pixel shift looks like fresh noise to the
+// gradient. A pure-linear ramp (4*x + 6*y) gives well-defined gradients
+// but the 2x2 matrix is RANK-1 (Ix, Iy are constant -> det == 0). We
+// need TWO independent gradient directions whose product structure
+// makes (Ix^2)(Iy^2) - (IxIy)^2 strictly positive.
+//
+// The cleanest pattern is a smooth quadratic without aliasing. We pick
+// I(x, y) = (x*x + 3*y*y) / 8, capped at 255. For x in [0..40],
+// y in [0..32]: x^2 / 8 in [0..200], 3*y^2/8 in [0..384]. Sum capped
+// at 255 gives a smooth quadratic-then-saturated bowl. Within the
+// interior (x in [4..36], y in [4..28]) the gradient is approximately
+// linear in (x, y) -- gradients vary spatially, so different pixels
+// in the window contribute independent (Ix, Iy) directions.
+fn _textured_fixture(width, height) {
+    let area = int_mul(width, height)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            // I(x, y) = (x*x + 3*y*y) / 8 with saturation. At the LK
+            // probe pixels (interior, well away from the wall) gradients
+            // are large enough that the central-difference /2 doesn't
+            // collapse to noise. At x=20 y=16: I=145 (well under 255).
+            // At x=25 y=20: 78+150=228 < 255. Saturation does kick in
+            // at higher (x, y) but the LK probes target interior pixels
+            // where saturation is absent.
+            let xx = int_mul(x, x)
+            let yy = int_mul(y, y)
+            let v = int_add(xx, int_mul(3, yy)) / 8
+            if v > 255 { v = 255 }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// _shift_right_fixture: next(x, y) = prev(x - shift, y) when x >= shift,
+// else 0. This simulates the PREV image translating RIGHTWARD by `shift`
+// pixels between frames -- the LK solver should report u_milli ~
+// shift * 1000 at interior pixels (and v_milli ~ 0).
+fn _shift_right_fixture(src, width, height, shift) {
+    let area = int_mul(width, height)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let sx = int_sub(x, shift)
+            let v = 0
+            if sx >= 0 {
+                if sx < width { v = load8(src + row_off + sx) }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// _shift_down_fixture: next(x, y) = prev(x, y - shift) when y >= shift.
+// PREV translates DOWNWARD by `shift` pixels; LK should report u ~ 0,
+// v_milli ~ shift * 1000.
+fn _shift_down_fixture(src, width, height, shift) {
+    let area = int_mul(width, height)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let sy = int_sub(y, shift)
+            let v = 0
+            if sy >= 0 {
+                if sy < height {
+                    v = load8(src + int_add(int_mul(sy, width), x))
+                }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// _shift_diag_fixture: next(x, y) = prev(x - sx, y - sy). Translates
+// PREV by (sx, sy); LK should report u_milli ~ sx * 1000, v_milli ~
+// sy * 1000.
+fn _shift_diag_fixture(src, width, height, sx_shift, sy_shift) {
+    let area = int_mul(width, height)
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let psx = int_sub(x, sx_shift)
+            let psy = int_sub(y, sy_shift)
+            let v = 0
+            if psx >= 0 {
+                if psx < width {
+                    if psy >= 0 {
+                        if psy < height {
+                            v = load8(src + int_add(int_mul(psy, width), psx))
+                        }
+                    }
+                }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- identical-frames tests ---------------------------------------------
+
+fn test_identical_frames_zero_flow() {
+    // prev == next -> It == 0 at every pixel -> u, v == 0.
+    let buf = _textured_fixture(40, 32)
+    let r = lk_optical_flow(buf, buf, 40, 32, 5)
+    ce_check("identical frames produce non-zero flow_buf",
+             r[0] != 0)
+    ce_check("identical frames produce non-zero valid_buf",
+             r[1] != 0)
+    // Mean magnitude must be zero (or near zero -- exact 0 when It == 0).
+    ce_eq("identical frames -> mean magnitude 0",
+          lk_flow_mean_magnitude(r), 0)
+    ce_str_eq("identical frames -> density label 'low'",
+              lk_flow_density_label(r), "image_optical_flow_density_low")
+    // Spot-check interior pixels.
+    let p1 = lk_flow_at(r, 20, 16)
+    ce_near("identical: u at (20,16) ~ 0",     p1[0], 0, 50)
+    ce_near("identical: v at (20,16) ~ 0",     p1[1], 0, 50)
+    ce_eq  ("identical: valid at (20,16) == 1", p1[2], 1)
+    let p2 = lk_flow_at(r, 15, 10)
+    ce_near("identical: u at (15,10) ~ 0", p2[0], 0, 50)
+    ce_near("identical: v at (15,10) ~ 0", p2[1], 0, 50)
+}
+
+// ---- rigid horizontal shift ---------------------------------------------
+
+fn test_horizontal_shift_3px() {
+    // PREV shifted right by 3 to get NEXT -> LK reports u_milli ~ 3000.
+    // LK on integer-pixel rigid shifts is approximate: the first-order
+    // Taylor expansion breaks down at multi-pixel shifts so the
+    // reported u runs slightly low. We allow a generous tolerance --
+    // the key claims are (a) u >> 0 in the correct direction,
+    // (b) v ~ 0, (c) valid == 1.
+    let prev = _textured_fixture(40, 32)
+    let next = _shift_right_fixture(prev, 40, 32, 3)
+    let r = lk_optical_flow(prev, next, 40, 32, 5)
+    // Probe interior pixels well-clear of borders + the shift dead-zone.
+    let p1 = lk_flow_at(r, 20, 16)
+    ce_near("h-shift-3: u at (20,16) ~ 3000 milli", p1[0], 3000, 1000)
+    ce_near("h-shift-3: v at (20,16) ~ 0 milli",    p1[1], 0,    1000)
+    ce_eq  ("h-shift-3: valid at (20,16) == 1",     p1[2], 1)
+    let p2 = lk_flow_at(r, 18, 12)
+    ce_near("h-shift-3: u at (18,12) ~ 3000 milli", p2[0], 3000, 1000)
+    ce_near("h-shift-3: v at (18,12) ~ 0 milli",    p2[1], 0,    1000)
+    // Mean magnitude across all valid pixels should be roughly the
+    // shift magnitude (3000 milli) but the under-estimation at
+    // saturation-tail pixels drags it down -- we just want a
+    // positive, non-trivial signal here.
+    let mean = lk_flow_mean_magnitude(r)
+    // Mean magnitude is dominated by VALID interior pixels; the leftmost
+    // shifted columns where prev was 0-filled inject spurious large
+    // flows at the gradient discontinuity, so the mean often runs ABOVE
+    // the rigid-shift 3000 milli. We only assert the signal is non-
+    // trivial -- the spot-checked interior pixels above carry the
+    // tighter "u ~ 3000" claim.
+    ce_check("h-shift-3: mean magnitude > 1000 milli",
+             mean > 1000)
+}
+
+// ---- rigid vertical shift -----------------------------------------------
+
+fn test_vertical_shift_2px() {
+    // PREV shifted down by 2 -> u ~ 0, v_milli ~ 2000.
+    let prev = _textured_fixture(40, 32)
+    let next = _shift_down_fixture(prev, 40, 32, 2)
+    let r = lk_optical_flow(prev, next, 40, 32, 5)
+    let p1 = lk_flow_at(r, 20, 16)
+    ce_near("v-shift-2: u at (20,16) ~ 0 milli",     p1[0], 0,    600)
+    ce_near("v-shift-2: v at (20,16) ~ 2000 milli",  p1[1], 2000, 600)
+    ce_eq  ("v-shift-2: valid at (20,16) == 1",      p1[2], 1)
+    let p2 = lk_flow_at(r, 18, 18)
+    ce_near("v-shift-2: u at (18,18) ~ 0 milli",     p2[0], 0,    600)
+    ce_near("v-shift-2: v at (18,18) ~ 2000 milli",  p2[1], 2000, 600)
+}
+
+// ---- diagonal shift -----------------------------------------------------
+
+fn test_diagonal_shift_1_1() {
+    // PREV shifted by (1, 1) -> u_milli ~ 1000, v_milli ~ 1000.
+    // 1-pixel shifts are the IDEAL regime for first-order LK so
+    // tolerances are tighter than the 3-pixel test.
+    let prev = _textured_fixture(40, 32)
+    let next = _shift_diag_fixture(prev, 40, 32, 1, 1)
+    let r = lk_optical_flow(prev, next, 40, 32, 5)
+    let p1 = lk_flow_at(r, 20, 16)
+    ce_near("diag-1-1: u at (20,16) ~ 1000 milli", p1[0], 1000, 600)
+    ce_near("diag-1-1: v at (20,16) ~ 1000 milli", p1[1], 1000, 600)
+    ce_eq  ("diag-1-1: valid at (20,16) == 1",     p1[2], 1)
+    let p2 = lk_flow_at(r, 18, 14)
+    ce_near("diag-1-1: u at (18,14) ~ 1000 milli", p2[0], 1000, 600)
+    ce_near("diag-1-1: v at (18,14) ~ 1000 milli", p2[1], 1000, 600)
+}
+
+// ---- texture-less region ------------------------------------------------
+
+fn test_textureless_region_invalid() {
+    // Both frames are constant intensity. Every pixel has zero gradient,
+    // det == 0, every interior pixel must be marked invalid.
+    let prev = _flat_fixture(32, 32, 128)
+    let next = _flat_fixture(32, 32, 128)
+    let r = lk_optical_flow(prev, next, 32, 32, 5)
+    // valid_count must be ZERO -- no pixel survives the det == 0 gate.
+    ce_eq("textureless: valid_count == 0", lk_flow_valid_count(r), 0)
+    // Interior pixel reads valid == 0, flow (0, 0).
+    let p = lk_flow_at(r, 16, 16)
+    ce_eq("textureless: u at (16,16) == 0",  p[0], 0)
+    ce_eq("textureless: v at (16,16) == 0",  p[1], 0)
+    ce_eq("textureless: valid at (16,16) == 0", p[2], 0)
+}
+
+fn test_textureless_two_different_values() {
+    // Two flat fields of DIFFERENT constant intensity -- It != 0 but
+    // both Ix, Iy still zero everywhere; the system is degenerate
+    // (under-determined since gradients vanish). Every pixel invalid.
+    let prev = _flat_fixture(32, 32, 100)
+    let next = _flat_fixture(32, 32, 150)
+    let r = lk_optical_flow(prev, next, 32, 32, 5)
+    ce_eq("flat-different: valid_count == 0",
+          lk_flow_valid_count(r), 0)
+    let p = lk_flow_at(r, 16, 16)
+    ce_eq("flat-different: valid at (16,16) == 0", p[2], 0)
+}
+
+// ---- density / magnitude labels -----------------------------------------
+
+fn test_magnitude_label_roundtrip() {
+    ce_str_eq("0 milli -> magnitude_low",
+              lk_flow_magnitude_label(0),
+              "image_optical_flow_magnitude_low")
+    ce_str_eq("499 milli -> magnitude_low",
+              lk_flow_magnitude_label(499),
+              "image_optical_flow_magnitude_low")
+    ce_str_eq("500 milli -> magnitude_mid",
+              lk_flow_magnitude_label(500),
+              "image_optical_flow_magnitude_mid")
+    ce_str_eq("1500 milli -> magnitude_mid",
+              lk_flow_magnitude_label(1500),
+              "image_optical_flow_magnitude_mid")
+    ce_str_eq("2000 milli -> magnitude_high",
+              lk_flow_magnitude_label(2000),
+              "image_optical_flow_magnitude_high")
+    ce_str_eq("5000 milli -> magnitude_high",
+              lk_flow_magnitude_label(5000),
+              "image_optical_flow_magnitude_high")
+}
+
+fn test_density_label_from_shifted() {
+    // Stationary -> "low".
+    let prev = _textured_fixture(40, 32)
+    let r_s = lk_optical_flow(prev, prev, 40, 32, 5)
+    ce_str_eq("stationary density 'low'",
+              lk_flow_density_label(r_s),
+              "image_optical_flow_density_low")
+    // A non-trivial shift produces a non-low density label.
+    let next = _shift_right_fixture(prev, 40, 32, 3)
+    let r_h = lk_optical_flow(prev, next, 40, 32, 5)
+    let dens = lk_flow_density_label(r_h)
+    ce_check("h-shift-3 density NOT 'low'",
+             str_eq(dens, "image_optical_flow_density_low") == 0)
+}
+
+// ---- OOB / failure paths ------------------------------------------------
+
+fn test_flow_at_oob_safe() {
+    let prev = _textured_fixture(32, 32)
+    let r = lk_optical_flow(prev, prev, 32, 32, 5)
+    let p_neg = lk_flow_at(r, -1, 16)
+    ce_eq("OOB neg x: u == 0",     p_neg[0], 0)
+    ce_eq("OOB neg x: v == 0",     p_neg[1], 0)
+    ce_eq("OOB neg x: valid == 0", p_neg[2], 0)
+    let p_big = lk_flow_at(r, 99, 99)
+    ce_eq("OOB big xy: valid == 0", p_big[2], 0)
+    // Empty result.
+    let empty = list_new()
+    let p_empty = lk_flow_at(empty, 0, 0)
+    ce_eq("empty result: valid == 0", p_empty[2], 0)
+}
+
+fn test_oversized_input_refused() {
+    // 300 > LK_MAX_DIM. lk_optical_flow must return _lk_fail() shape.
+    let dummy = alloc(8)
+    let r = lk_optical_flow(dummy, dummy, 300, 300, 5)
+    ce_eq("oversized -> total == 0",       lk_flow_total(r), 0)
+    ce_eq("oversized -> valid_count == 0", lk_flow_valid_count(r), 0)
+    ce_eq("oversized -> mean_mag == 0",    lk_flow_mean_magnitude(r), 0)
+}
+
+fn test_zero_pointers_refused() {
+    let buf = _flat_fixture(16, 16, 100)
+    let r0 = lk_optical_flow(0,   buf, 16, 16, 5)
+    ce_eq("zero prev ptr -> total 0", lk_flow_total(r0), 0)
+    let r1 = lk_optical_flow(buf, 0,   16, 16, 5)
+    ce_eq("zero next ptr -> total 0", lk_flow_total(r1), 0)
+    let r2 = lk_optical_flow(buf, buf, 0, 16, 5)
+    ce_eq("zero width    -> total 0", lk_flow_total(r2), 0)
+}
+
+// ---- pgm_args dispatch (no I/O) -----------------------------------------
+
+fn test_pgm_args_dispatch_basic() {
+    let r0 = lk_pgm_args("")
+    ce_check("/flow no-arg returns usage",
+             str_eq(r0, "(/flow needs two PATHs -- usage: /flow prev.pgm next.pgm)") == 1)
+    let r1 = lk_pgm_args("only_one.pgm")
+    ce_check("/flow one-arg returns 'got 1' usage",
+             str_eq(r1, "(/flow needs TWO paths -- got 1)") == 1)
+    let r2 = lk_pgm_args("/nonexistent_prev.pgm /nonexistent_next.pgm")
+    ce_check("/flow missing files returns error", len(r2) > 0)
+}
+
+// ---- diagnostic: print headline numbers for the report ------------------
+
+fn diag_report_numbers() {
+    let prev = _textured_fixture(40, 32)
+    // shift-3 right
+    let n3 = _shift_right_fixture(prev, 40, 32, 3)
+    let r3 = lk_optical_flow(prev, n3, 40, 32, 5)
+    let p3 = lk_flow_at(r3, 20, 16)
+    println("DIAG h-shift-3: u=" + int_to_str(p3[0])
+            + " v=" + int_to_str(p3[1])
+            + " mean=" + int_to_str(lk_flow_mean_magnitude(r3)))
+    // diagonal-(1,1)
+    let nd = _shift_diag_fixture(prev, 40, 32, 1, 1)
+    let rd = lk_optical_flow(prev, nd, 40, 32, 5)
+    let pd = lk_flow_at(rd, 20, 16)
+    println("DIAG diag-1-1: u=" + int_to_str(pd[0])
+            + " v=" + int_to_str(pd[1])
+            + " mean=" + int_to_str(lk_flow_mean_magnitude(rd)))
+    // textureless invalid rate
+    let pf = _flat_fixture(32, 32, 128)
+    let nf = _flat_fixture(32, 32, 128)
+    let rf = lk_optical_flow(pf, nf, 32, 32, 5)
+    println("DIAG textureless: valid=" + int_to_str(lk_flow_valid_count(rf))
+            + " total=" + int_to_str(lk_flow_total(rf)))
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_identical_frames_zero_flow()
+    test_horizontal_shift_3px()
+    test_vertical_shift_2px()
+    test_diagonal_shift_1_1()
+    test_textureless_region_invalid()
+    test_textureless_two_different_values()
+    test_magnitude_label_roundtrip()
+    test_density_label_from_shifted()
+    test_flow_at_oob_safe()
+    test_oversized_input_refused()
+    test_zero_pointers_refused()
+    test_pgm_args_dispatch_basic()
+    diag_report_numbers()
+    ce_summary("image_optical_flow")
+}
+
+main()

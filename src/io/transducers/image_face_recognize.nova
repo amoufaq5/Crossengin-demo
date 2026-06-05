@@ -1,0 +1,808 @@
+// CrossEngin io/transducers: Face RECOGNITION (identity matching) via
+// LBP gallery + nearest-neighbor chi-squared lookup.
+//
+// Purpose
+//   R16D (Viola-Jones Haar cascade -- `image_face_detect.nova`) finds
+//   *where* a face is in an image. R17D (LBP descriptor --
+//   `image_lbp.nova`) computes *what a face looks like* as a 4096-D
+//   chi-squared-comparable feature vector. R18D (this module) closes
+//   the canonical face-recognition pipeline: given a gallery of
+//   ENROLLED descriptors (one per known identity) and an unknown
+//   query face, return the nearest-neighbor identity if the
+//   chi-squared distance is below an operator-tunable threshold;
+//   otherwise return "unknown".
+//
+//   This is the Ahonen et al. 2006 "Face Recognition with Local
+//   Binary Patterns" pipeline (without the cell-weighted variant --
+//   we use a flat 4x4 cell grid, matching R17D's default descriptor
+//   shape; the weighted-cell extension is a documented follow-up).
+//   The pipeline structure is:
+//
+//     ENROLL:                       QUERY:
+//       face_image                    face_image
+//          |                              |
+//          v                              v
+//       lbp_descriptor                lbp_descriptor
+//          |                              |
+//          v                              v
+//       [label, desc] ----+               desc
+//                         |               |
+//                         v               v
+//                         gallery <-- chi2(gallery, desc)
+//                                            |
+//                                            v
+//                                       argmin -> label | "unknown"
+//
+//   The module is intentionally an *orthogonal* sibling of
+//   `image_face_detect.nova` (which is detection, not identification)
+//   -- face detection finds bounding boxes; face recognition matches
+//   a (presumably already-cropped + pose-normalized) face against
+//   known identities. In a real pipeline the operator would chain
+//   detect -> crop -> recognize; we keep recognition self-contained
+//   so the contract is testable in isolation.
+//
+//   CrossEngin's no-training-data design forbids shipping a
+//   pre-trained gallery -- the gallery is OPERATOR-MAINTAINED state.
+//   /face_enroll registers new identities; /face_recognize queries
+//   against the current gallery; /face_gallery_save and
+//   /face_gallery_load round-trip the gallery to disk so an
+//   operator can pre-load a known-identities table at boot.
+//
+// Algorithm
+//   1. ENROLLMENT (per known identity):
+//        desc = lbp_descriptor(image, w, h, FACE_REC_CELLS,
+//                              FACE_REC_CELLS)
+//        gallery_append([label, desc])
+//      If a label already exists, the new descriptor OVERWRITES the
+//      old one -- enrollment is idempotent on label so re-enrolling
+//      with a fresher / better-aligned face is a single command.
+//
+//   2. QUERY:
+//        q_desc = lbp_descriptor(query_image, w, h, FACE_REC_CELLS,
+//                                FACE_REC_CELLS)
+//        for each [label, desc] in gallery:
+//            d = lbp_compare(q_desc, desc)  // chi-squared
+//            track (label, d) with the minimum d
+//        if min_d < threshold_milli: return [argmin_label, min_d]
+//        else: return ["unknown", -1]
+//
+//      The threshold is in *raw chi-squared units* (not actual milli
+//      -- the name "threshold_milli" preserves API ordering with the
+//      rest of the substrate's milli-fixed-point conventions; the
+//      chi-squared sum already is an integer in (a-b)^2/(a+b+1)
+//      units, which we use directly). Calibration: a self-match is
+//      always 0; identical fixture descriptors at typical 32x32
+//      cells=4x4 yield distances in the 50..200 range for closely-
+//      related faces and 1000+ for unrelated faces. The integration
+//      suite uses threshold=500.
+//
+// Gallery storage layout (in-memory):
+//   gallery = [[label_1, desc_1], [label_2, desc_2], ...]
+//   Each entry is a 2-element list: [string, list[int]].
+//   The descriptor list is the 4096-int LBP descriptor from R17D
+//   (4x4 cells * 256 bins).
+//
+// Gallery storage layout (on disk):
+//   ASCII line-oriented for inspectability + portability across NOVA
+//   builds. Header magic + version + entry count, then per-entry the
+//   label, descriptor length, and one int per line for the
+//   descriptor values. Trailing newline. This shape is bit-identical
+//   round-trip safe so long as the descriptor consists of small
+//   non-negative ints (which it does -- LBP histogram counts are
+//   bounded by the cell area, ~64 max at 32x32 cells=4x4).
+//
+//     CE_FACE_GALLERY_V1
+//     <n_entries>
+//     <label_1>
+//     <desc_len_1>
+//     <desc_1[0]>
+//     <desc_1[1]>
+//     ...
+//     <desc_1[desc_len_1 - 1]>
+//     <label_2>
+//     ...
+//
+//   Empty gallery: the file contains just the magic + version line
+//   followed by "0" entries.
+//
+// Public API
+//   face_gallery_new() -> gallery_t
+//   face_gallery_enroll(gallery, label, image, w, h) ->
+//       1 on success, 0 on error (invalid descriptor / oversize / etc.)
+//   face_gallery_recognize(gallery, query_image, w, h,
+//                          threshold_milli) ->
+//       [label, distance] on a match within threshold;
+//       ["unknown", -1] on no match.
+//   face_gallery_save(gallery, path) -> 1 on success, 0 on syscall fail
+//   face_gallery_load(path) -> gallery_t (empty gallery on read error;
+//                                         caller can call _size to
+//                                         distinguish empty from
+//                                         partially-failed)
+//   face_gallery_size(gallery) -> int
+//   face_gallery_clear(gallery) -> 1 (always succeeds)
+//   face_gallery_label_at(gallery, idx) -> string ("" on OOB)
+//   face_gallery_descriptor_at(gallery, idx) -> list (empty on OOB)
+//   face_recognize_pgm_args(...) -> chat /face_recognize formatted str
+//   face_enroll_pgm_args(...) -> chat /face_enroll formatted str
+//
+// Caps:
+//   Gallery MAX entries: FACE_REC_MAX_ENTRIES (128).
+//   Per-face LBP descriptor uses FACE_REC_CELLS x FACE_REC_CELLS
+//   cells; default 4x4 so a face descriptor is 4096 ints. Image
+//   dimensions inherit LBP_MAX_DIM (256) per axis from R17D.
+//   Label max length: FACE_REC_LABEL_MAX (64) bytes; longer labels
+//   are rejected at enrollment.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new,
+//   push, list_set, list_get, len, int_add, int_sub, int_mul,
+//   str_eq, char_at, substr, int_to_str, str_to_int, sys_open,
+//   sys_read, sys_write, sys_fsync, sys_close, O_RDONLY, O_WRONLY,
+//   O_CREAT, O_TRUNC.
+// CrossEngin dependencies: image_lbp.nova (descriptor + chi-squared),
+//   image_pgm.nova (chat-helper PGM parse).
+
+import "image_lbp.nova"
+import "image_pgm.nova"
+
+// ---- caps + defaults ------------------------------------------------------
+
+let FACE_REC_MAX_ENTRIES   = 128
+let FACE_REC_CELLS         = 4         // 4x4 cells -> 4096-int descriptor
+let FACE_REC_LABEL_MAX     = 64        // bytes per identity label
+let FACE_REC_DEFAULT_THR   = 500       // default chi-squared distance bar
+let FACE_REC_MIN_DIM       = 8         // mirrors LBP_CHAT_MIN_DIM
+
+// Entry-tuple slots: [label, descriptor].
+let FACE_REC_E_LABEL = 0
+let FACE_REC_E_DESC  = 1
+
+// Result-tuple slots for recognize(): [label, distance].
+let FACE_REC_R_LABEL = 0
+let FACE_REC_R_DIST  = 1
+
+// File-format magic + version line. Bumping the V1 suffix breaks
+// existing on-disk galleries (intentional -- a hand-rewritten v2
+// should not silently load with v1 parsing semantics).
+let FACE_REC_MAGIC = "CE_FACE_GALLERY_V1"
+
+let FACE_REC_FILE_MODE = 420   // 0644 rw-r--r--
+let FACE_REC_MAX_FILE_BYTES = 4194304   // 4 MB -- enough for the cap
+
+// ---- constructor ----------------------------------------------------------
+//
+// A gallery is a NOVA list. Each element is a 2-tuple [label, desc].
+// face_gallery_new returns an empty list.
+
+fn face_gallery_new() {
+    return list_new()
+}
+
+// ---- size + clear ---------------------------------------------------------
+
+fn face_gallery_size(gallery) {
+    if gallery == 0 { return 0 }
+    return len(gallery)
+}
+
+// Clear: zero out the gallery in place. Because NOVA list_set can
+// only replace existing slots and we need to drop elements, we walk
+// the list and overwrite each entry with the sentinel 0 and then
+// truncate by... wait, NOVA lists don't expose a truncate. The
+// idiomatic clear is "rebuild from empty". We can't shrink the
+// original list, but the contract is "after clear, size = 0". Since
+// the gallery is passed by reference (it's a list), we'd need to
+// mutate it. NOVA's list_set lets us null entries but len() still
+// counts them. The cleanest fix is to drain into a sentinel state
+// where each entry is "" / empty, and size walks that. Match the
+// substrate's pattern from other gallery-like primitives by tracking
+// a logical "live count" via list contents.
+//
+// Pragmatic choice: since gallery is mutable list and NOVA has no
+// list_truncate, _clear sets every existing entry to a SENTINEL
+// (an empty label) and our size / iter helpers skip them. We expose
+// face_gallery_size which counts only non-sentinel live entries.
+//
+// _entry_alive(): returns 1 iff the entry at idx has a non-empty
+// label string (a live identity).
+
+fn _face_rec_entry_alive(entry) {
+    if entry == 0 { return 0 }
+    let label = entry[FACE_REC_E_LABEL]
+    if len(label) == 0 { return 0 }
+    return 1
+}
+
+fn face_gallery_clear(gallery) {
+    if gallery == 0 { return 1 }
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let dead = list_new()
+        push(dead, "")
+        push(dead, list_new())
+        list_set(gallery, i, dead)
+        i = int_add(i, 1)
+    }
+    return 1
+}
+
+// Walk the gallery and count entries with non-empty labels (alive
+// after clear / overwrite).
+fn _face_rec_live_count(gallery) {
+    if gallery == 0 { return 0 }
+    let n = len(gallery)
+    let live = 0
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _face_rec_entry_alive(e) == 1 {
+            live = int_add(live, 1)
+        }
+        i = int_add(i, 1)
+    }
+    return live
+}
+
+// Public-facing size: live entries (clear -> 0).
+fn face_gallery_live_size(gallery) {
+    return _face_rec_live_count(gallery)
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn face_gallery_label_at(gallery, idx) {
+    if gallery == 0 { return "" }
+    if idx < 0 { return "" }
+    if idx >= len(gallery) { return "" }
+    let e = gallery[idx]
+    if e == 0 { return "" }
+    return e[FACE_REC_E_LABEL]
+}
+
+fn face_gallery_descriptor_at(gallery, idx) {
+    if gallery == 0 { return list_new() }
+    if idx < 0 { return list_new() }
+    if idx >= len(gallery) { return list_new() }
+    let e = gallery[idx]
+    if e == 0 { return list_new() }
+    return e[FACE_REC_E_DESC]
+}
+
+// ---- find existing entry by label ----------------------------------------
+//
+// Linear scan over the gallery for the first ALIVE entry whose label
+// matches. Returns the index, or -1 if not found. (We skip dead
+// sentinel entries from a prior clear.)
+
+fn _face_rec_find_label(gallery, label) {
+    if gallery == 0 { return 0 - 1 }
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _face_rec_entry_alive(e) == 1 {
+            if str_eq(e[FACE_REC_E_LABEL], label) == 1 {
+                return i
+            }
+        }
+        i = int_add(i, 1)
+    }
+    return 0 - 1
+}
+
+// ---- enroll --------------------------------------------------------------
+//
+// face_gallery_enroll(gallery, label, image, w, h) -> 1 | 0
+//
+//   Compute the LBP descriptor of `image` using a FACE_REC_CELLS x
+//   FACE_REC_CELLS cell grid (4x4 by default). If the descriptor
+//   build fails (image too small / over-cap / null), return 0 to
+//   signal failure -- the caller is responsible for surfacing the
+//   error.
+//
+//   On success, two paths:
+//     (a) The label already exists in the gallery -- OVERWRITE the
+//         old descriptor with the fresh one (idempotent
+//         re-enrollment; the operator can refresh an identity's
+//         descriptor without first clearing the slot).
+//     (b) The label is new -- APPEND a new [label, desc] entry. If
+//         the gallery is at FACE_REC_MAX_ENTRIES capacity, the
+//         enrollment is REJECTED (return 0) -- the cap protects the
+//         in-memory gallery footprint, and an operator who wants to
+//         enroll more identities first clears and re-enrolls.
+
+fn face_gallery_enroll(gallery, label, image, w, h) {
+    if gallery == 0 { return 0 }
+    if label == 0 { return 0 }
+    if len(label) == 0 { return 0 }
+    if len(label) > FACE_REC_LABEL_MAX { return 0 }
+    if image == 0 { return 0 }
+    if w < FACE_REC_MIN_DIM { return 0 }
+    if h < FACE_REC_MIN_DIM { return 0 }
+    let desc = lbp_descriptor(image, w, h, FACE_REC_CELLS, FACE_REC_CELLS)
+    if len(desc) == 0 { return 0 }     // descriptor build failed
+    let existing = _face_rec_find_label(gallery, label)
+    let entry = list_new()
+    push(entry, label)
+    push(entry, desc)
+    if existing >= 0 {
+        // OVERWRITE: replace at the existing slot. (We also reset the
+        // slot to a fresh tuple so the old descriptor list is no
+        // longer referenced via this gallery.)
+        list_set(gallery, existing, entry)
+        return 1
+    }
+    // APPEND new identity (subject to cap on LIVE entries -- dead
+    // sentinel slots from a prior clear are reused via the
+    // find-first-dead-slot pass below).
+    if _face_rec_live_count(gallery) >= FACE_REC_MAX_ENTRIES { return 0 }
+    // Try to slot into a dead-sentinel position first (so clear +
+    // re-enroll reuses the array without unbounded growth).
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _face_rec_entry_alive(e) == 0 {
+            list_set(gallery, i, entry)
+            return 1
+        }
+        i = int_add(i, 1)
+    }
+    push(gallery, entry)
+    return 1
+}
+
+// ---- recognize ----------------------------------------------------------
+//
+// face_gallery_recognize(gallery, query_image, w, h, threshold) ->
+//     [label, distance] on a match;
+//     ["unknown", -1] on empty-gallery / no-match-within-threshold.
+//
+//   Compute the query's LBP descriptor and scan every ALIVE gallery
+//   entry, tracking the minimum chi-squared distance. Three failure
+//   shapes all return ["unknown", -1]:
+//     1. Gallery has zero live entries.
+//     2. Descriptor build fails on the query image.
+//     3. Every distance >= threshold (no neighbor is "close enough").
+//
+//   Argmin returns the FIRST entry that ties the minimum -- ties are
+//   resolved by enrollment order (older entries win). For the
+//   identical-self-match case (chi-squared 0) ties don't occur unless
+//   the operator enrolled the same image under multiple labels.
+
+fn _face_rec_unknown_result() {
+    let r = list_new()
+    push(r, "unknown")
+    push(r, 0 - 1)
+    return r
+}
+
+fn face_gallery_recognize(gallery, query_image, w, h, threshold_milli) {
+    if gallery == 0 { return _face_rec_unknown_result() }
+    if _face_rec_live_count(gallery) == 0 {
+        return _face_rec_unknown_result()
+    }
+    if query_image == 0 { return _face_rec_unknown_result() }
+    if w < FACE_REC_MIN_DIM { return _face_rec_unknown_result() }
+    if h < FACE_REC_MIN_DIM { return _face_rec_unknown_result() }
+    let q_desc = lbp_descriptor(query_image, w, h,
+                                 FACE_REC_CELLS, FACE_REC_CELLS)
+    if len(q_desc) == 0 { return _face_rec_unknown_result() }
+    let n = len(gallery)
+    let best_label = ""
+    let best_dist = 0 - 1
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _face_rec_entry_alive(e) == 1 {
+            let d = lbp_compare(q_desc, e[FACE_REC_E_DESC])
+            if d >= 0 {
+                if best_dist < 0 {
+                    best_dist = d
+                    best_label = e[FACE_REC_E_LABEL]
+                } else {
+                    if d < best_dist {
+                        best_dist = d
+                        best_label = e[FACE_REC_E_LABEL]
+                    }
+                }
+            }
+        }
+        i = int_add(i, 1)
+    }
+    if best_dist < 0 { return _face_rec_unknown_result() }
+    if best_dist >= threshold_milli { return _face_rec_unknown_result() }
+    let r = list_new()
+    push(r, best_label)
+    push(r, best_dist)
+    return r
+}
+
+// ---- save ---------------------------------------------------------------
+//
+// face_gallery_save(gallery, path) -> 1 on success, 0 on syscall fail.
+//
+//   Serializes the gallery to a line-oriented ASCII file with header
+//   magic + version, an entry count, and per-entry the label,
+//   descriptor length, and one descriptor int per line. Only ALIVE
+//   entries are written -- dead sentinel slots are dropped.
+//
+//   The buffer is pre-allocated once at FACE_REC_MAX_FILE_BYTES; we
+//   stream-write into it via a single grow-cursor. Write fails (over
+//   the cap, sys_open / sys_write failure) cleanly close the fd and
+//   return 0; partial writes are NOT atomic by design -- the
+//   operator who wants atomicity writes to a tmp path + renames
+//   (outside the scope of this module).
+
+fn _face_rec_emit_str(buf, off, s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        store8(buf + int_add(off, i), char_at(s, i))
+        i = int_add(i, 1)
+    }
+    return int_add(off, n)
+}
+
+fn _face_rec_emit_int(buf, off, v) {
+    return _face_rec_emit_str(buf, off, int_to_str(v))
+}
+
+fn _face_rec_emit_nl(buf, off) {
+    store8(buf + off, 10)        // '\n'
+    return int_add(off, 1)
+}
+
+fn face_gallery_save(gallery, path) {
+    if gallery == 0 { return 0 }
+    if path == 0 { return 0 }
+    if len(path) == 0 { return 0 }
+    let buf = alloc(FACE_REC_MAX_FILE_BYTES + 1)
+    let off = 0
+    off = _face_rec_emit_str(buf, off, FACE_REC_MAGIC)
+    off = _face_rec_emit_nl(buf, off)
+    let live = _face_rec_live_count(gallery)
+    off = _face_rec_emit_int(buf, off, live)
+    off = _face_rec_emit_nl(buf, off)
+    let n = len(gallery)
+    let i = 0
+    while i < n {
+        let e = gallery[i]
+        if _face_rec_entry_alive(e) == 1 {
+            off = _face_rec_emit_str(buf, off, e[FACE_REC_E_LABEL])
+            off = _face_rec_emit_nl(buf, off)
+            let desc = e[FACE_REC_E_DESC]
+            let dl = len(desc)
+            off = _face_rec_emit_int(buf, off, dl)
+            off = _face_rec_emit_nl(buf, off)
+            let j = 0
+            while j < dl {
+                off = _face_rec_emit_int(buf, off, desc[j])
+                off = _face_rec_emit_nl(buf, off)
+                j = int_add(j, 1)
+            }
+        }
+        i = int_add(i, 1)
+    }
+    if off > FACE_REC_MAX_FILE_BYTES { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, FACE_REC_FILE_MODE)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, off)
+    if written != off {
+        sys_close(fd)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// ---- load ---------------------------------------------------------------
+//
+// face_gallery_load(path) -> gallery_t.
+//
+//   Reads the file at `path` via sys_open + sys_read into a single
+//   contiguous buffer; tokenizes line-by-line and validates the
+//   magic + version line. Returns:
+//     - a fresh empty gallery on any open/read/parse failure
+//     - a fully-populated gallery on success
+//
+//   The format is strict: the first line MUST equal FACE_REC_MAGIC;
+//   the second line MUST be a non-negative integer count of entries;
+//   each entry MUST follow the [label, desc_len, desc[0]..desc[N-1]]
+//   pattern. Any deviation aborts the load and returns the gallery
+//   built up to that point (so a corrupted tail doesn't lose the
+//   well-formed prefix -- "graceful degradation" matches the
+//   substrate's other dlog / snap loaders).
+
+fn _face_rec_read_file(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let buf = alloc(FACE_REC_MAX_FILE_BYTES + 1)
+    let total = 0
+    let keep = 1
+    let chunk = 4096
+    while keep == 1 {
+        let room = int_sub(FACE_REC_MAX_FILE_BYTES, total)
+        let want = chunk
+        if want > room { want = room }
+        if want <= 0 { keep = 0 }
+        if keep == 1 {
+            let n = sys_read(fd, buf + total, want)
+            if n <= 0 {
+                keep = 0
+            } else {
+                total = int_add(total, n)
+                if total >= FACE_REC_MAX_FILE_BYTES { keep = 0 }
+            }
+        }
+    }
+    sys_close(fd)
+    store8(buf + total, 0)
+    // Return as [buf, total].
+    let r = list_new()
+    push(r, buf)
+    push(r, total)
+    return r
+}
+
+// Find the next '\n' in `buf` starting at `from`, capped at `total`.
+// Returns the index OR `total` if none.
+fn _face_rec_next_nl(buf, total, from) {
+    let i = from
+    while i < total {
+        if load8(buf + i) == 10 { return i }
+        i = int_add(i, 1)
+    }
+    return total
+}
+
+// Extract a NUL-terminated string from `buf[start..end)`. Allocates
+// a fresh `end - start + 1` byte block and copies.
+fn _face_rec_extract_str(buf, start, end) {
+    let n = int_sub(end, start)
+    if n < 0 { n = 0 }
+    let s = alloc(int_add(n, 1))
+    let i = 0
+    while i < n {
+        store8(s + i, load8(buf + int_add(start, i)))
+        i = int_add(i, 1)
+    }
+    store8(s + n, 0)
+    return s
+}
+
+// Extract an integer from `buf[start..end)`. Negative numbers
+// supported via str_to_int's leading '-' parsing. Empty / non-digit
+// content yields 0.
+fn _face_rec_extract_int(buf, start, end) {
+    let s = _face_rec_extract_str(buf, start, end)
+    return str_to_int(s)
+}
+
+fn face_gallery_load(path) {
+    let empty = face_gallery_new()
+    if path == 0 { return empty }
+    if len(path) == 0 { return empty }
+    let read = _face_rec_read_file(path)
+    if read == 0 { return empty }
+    let buf = read[0]
+    let total = read[1]
+    if total <= 0 { return empty }
+    // Line 1: magic.
+    let p = 0
+    let nl1 = _face_rec_next_nl(buf, total, p)
+    let magic = _face_rec_extract_str(buf, p, nl1)
+    if str_eq(magic, FACE_REC_MAGIC) == 0 { return empty }
+    p = int_add(nl1, 1)
+    if p >= total { return empty }
+    // Line 2: entry count.
+    let nl2 = _face_rec_next_nl(buf, total, p)
+    let n = _face_rec_extract_int(buf, p, nl2)
+    if n < 0 { return empty }
+    p = int_add(nl2, 1)
+    let gallery = face_gallery_new()
+    let i = 0
+    while i < n {
+        if p >= total { return gallery }
+        // Read label.
+        let nl_label = _face_rec_next_nl(buf, total, p)
+        let label = _face_rec_extract_str(buf, p, nl_label)
+        p = int_add(nl_label, 1)
+        if p >= total { return gallery }
+        // Read desc_len.
+        let nl_dl = _face_rec_next_nl(buf, total, p)
+        let dl = _face_rec_extract_int(buf, p, nl_dl)
+        p = int_add(nl_dl, 1)
+        if dl < 0 { return gallery }
+        if dl > 65536 { return gallery }   // sanity cap
+        // Read dl integers.
+        let desc = list_new()
+        let j = 0
+        while j < dl {
+            if p >= total { return gallery }
+            let nl_v = _face_rec_next_nl(buf, total, p)
+            let v = _face_rec_extract_int(buf, p, nl_v)
+            push(desc, v)
+            p = int_add(nl_v, 1)
+            j = int_add(j, 1)
+        }
+        if len(label) > 0 {
+            let entry = list_new()
+            push(entry, label)
+            push(entry, desc)
+            push(gallery, entry)
+        }
+        i = int_add(i, 1)
+    }
+    return gallery
+}
+
+// ---- chat-side singleton gallery -----------------------------------------
+//
+// The chat wires a single per-process gallery -- /face_enroll mutates
+// it, /face_recognize queries it. We keep the singleton inside this
+// module (rather than in crossengin_chat.nova) so the chat wire-in is
+// 2 dispatches + 2 help lines = 4 net lines (no extra let-global).
+//
+// `_face_rec_chat_gallery` is a module-level mutable: the first
+// caller initializes it via face_gallery_new(); subsequent callers
+// see the same gallery. The chat's /face_enroll / /face_recognize
+// admin paths go through face_chat_gallery() so the lazy-init is
+// invisible to the wire-in.
+//
+// A small wrinkle: NOVA module-level lets are immutable from outside
+// the module. We use the standard substrate pattern of wrapping the
+// gallery in a single-element list at construction so callers can
+// mutate via list_set without re-declaring the global. The list
+// holds: [gallery_obj].
+
+let _face_rec_chat_holder = list_new()
+
+fn face_chat_gallery() {
+    if len(_face_rec_chat_holder) == 0 {
+        push(_face_rec_chat_holder, face_gallery_new())
+    }
+    return _face_rec_chat_holder[0]
+}
+
+// Default chat-side recognize threshold. Operator-tunable would be a
+// follow-up (CE_FACE_REC_THRESHOLD env var). For now the default of
+// 500 (chi-squared units) admits closely-related fixture descriptors
+// and rejects unrelated ones in the integration suite.
+let FACE_REC_CHAT_THRESHOLD = 500
+
+// ---- chat orchestration helpers ------------------------------------------
+//
+// face_recognize_pgm_args(gallery, arg, threshold)
+//   arg = "<pgm path>". Prints either the matched identity with
+//   distance, or "unknown" if no entry passes the threshold. Returns
+//   the formatted string; the dispatcher emits via io_println.
+//
+//   Output shapes (all wrapped in parens for chat-format consistency):
+//     (/face_recognize needs PATH.pgm)
+//     (face_recognize FAILED on PATH: <pgm parser error>)
+//     (face_recognize FAILED: image too small -- need >= 8x8)
+//     (face_recognize FAILED: gallery empty -- /face_enroll first)
+//     (face_recognize matched=<label> distance=<D> threshold=<T>)
+//     (face_recognize unknown distance=-1 threshold=<T>)
+//
+// face_enroll_pgm_args(gallery, arg)
+//   arg = "<label> <pgm path>". Adds (or overwrites) the gallery
+//   entry; returns the formatted result string.
+//
+// face_recognize_chat_args(arg) -- chat-side wrapper that uses the
+// process singleton gallery + the default threshold. The chat
+// dispatcher emits its return value via io_println.
+//
+// face_enroll_chat_args(arg) -- chat-side wrapper that uses the
+// process singleton gallery.
+
+fn face_recognize_pgm_args(gallery, arg, threshold_milli) {
+    if len(arg) == 0 {
+        return "(/face_recognize needs PATH.pgm)"
+    }
+    if _face_rec_live_count(gallery) == 0 {
+        return "(face_recognize FAILED: gallery empty -- /face_enroll first)"
+    }
+    let r_p = pgm_parse_file(arg)
+    let err = pgm_result_error(r_p)
+    if len(err) > 0 {
+        return "(face_recognize FAILED on " + arg + ": " + err + ")"
+    }
+    let w = pgm_result_width(r_p)
+    let h = pgm_result_height(r_p)
+    let data = pgm_result_data(r_p)
+    if w < FACE_REC_MIN_DIM {
+        return "(face_recognize FAILED: image too small -- need >= 8x8)"
+    }
+    if h < FACE_REC_MIN_DIM {
+        return "(face_recognize FAILED: image too small -- need >= 8x8)"
+    }
+    let result = face_gallery_recognize(gallery, data, w, h, threshold_milli)
+    let label = result[FACE_REC_R_LABEL]
+    let dist = result[FACE_REC_R_DIST]
+    if str_eq(label, "unknown") == 1 {
+        return "(face_recognize unknown distance=-1 threshold="
+            + int_to_str(threshold_milli) + ")"
+    }
+    return "(face_recognize matched=" + label
+        + " distance=" + int_to_str(dist)
+        + " threshold=" + int_to_str(threshold_milli) + ")"
+}
+
+// _face_rec_split_label_path: split "label path/to.pgm" into
+// [label, path]. The label is everything up to the FIRST space; the
+// path is the rest (trimmed). Returns ["", ""] if no space is
+// present (malformed args).
+fn _face_rec_split_label_path(arg) {
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {     // ASCII space
+            let lab = substr(arg, 0, i)
+            let path = substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1)))
+            let out = list_new()
+            push(out, lab)
+            push(out, path)
+            return out
+        }
+        i = int_add(i, 1)
+    }
+    let out = list_new()
+    push(out, "")
+    push(out, "")
+    return out
+}
+
+fn face_enroll_pgm_args(gallery, arg) {
+    if len(arg) == 0 {
+        return "(/face_enroll needs LABEL PATH.pgm)"
+    }
+    let parts = _face_rec_split_label_path(arg)
+    let label = parts[0]
+    let path = parts[1]
+    if len(label) == 0 {
+        return "(/face_enroll needs LABEL PATH.pgm -- got 1 arg)"
+    }
+    if len(path) == 0 {
+        return "(/face_enroll needs LABEL PATH.pgm -- got 1 arg)"
+    }
+    if len(label) > FACE_REC_LABEL_MAX {
+        return "(face_enroll FAILED: label exceeds 64-byte cap)"
+    }
+    let r_p = pgm_parse_file(path)
+    let err = pgm_result_error(r_p)
+    if len(err) > 0 {
+        return "(face_enroll FAILED on " + path + ": " + err + ")"
+    }
+    let w = pgm_result_width(r_p)
+    let h = pgm_result_height(r_p)
+    let data = pgm_result_data(r_p)
+    if w < FACE_REC_MIN_DIM {
+        return "(face_enroll FAILED: image too small -- need >= 8x8)"
+    }
+    if h < FACE_REC_MIN_DIM {
+        return "(face_enroll FAILED: image too small -- need >= 8x8)"
+    }
+    let ok = face_gallery_enroll(gallery, label, data, w, h)
+    if ok == 0 {
+        return "(face_enroll FAILED: descriptor build failed or gallery full)"
+    }
+    return "(face_enroll OK label=" + label
+        + " size=" + int_to_str(_face_rec_live_count(gallery)) + ")"
+}
+
+// Chat-side wrappers that use the per-process singleton + the default
+// threshold; the dispatcher emits these one-liners via io_println.
+
+fn face_enroll_chat_args(arg) {
+    return face_enroll_pgm_args(face_chat_gallery(), arg)
+}
+
+fn face_recognize_chat_args(arg) {
+    return face_recognize_pgm_args(face_chat_gallery(), arg,
+                                    FACE_REC_CHAT_THRESHOLD)
+}

@@ -1,0 +1,474 @@
+// CrossEngin persistence: snapshot writer (container format).
+//
+// Purpose
+//   The ADR-0048 substrate-snapshot container: a tagged, versioned, ordered,
+//   section-framed image of the durable substrate. Sections are fixed and
+//   ordered [SOUL][KGS][EPISODIC][SYNAPSES][SELFMODEL]; each holds an opaque,
+//   subsystem-serialized blob (each subsystem owns its own *_serialize, e.g.
+//   goal_persistence already does goals). This module is the generic CONTAINER
+//   only -- it frames and orders pre-serialized section blobs -- so it stays
+//   standalone (no subsystem imports) and composes into any program. Ephemeral
+//   signal traffic / node scratch are deliberately NOT sections (ADR-0048): they
+//   are reconstructed by running the loops after rehydration.
+//
+//   snap_serialize yields the framed value (tag, version, instance, timestamp,
+//   section count, then each [present, blob] in mandatory order). The byte-level
+//   write to disk -- temp file, fsync, atomic rename for crash safety -- is the
+//   runtime seam (NOVA enhancement #10); snap_tmp_path / snap_durable_steps
+//   express that contract. The decision log (ADR-0043) persists independently
+//   and is intentionally not a snapshot section.
+//
+// ADRs implemented: ADR-0048 (persistence container + format). NOVA
+//   dependencies: builtins. CrossEngin dependencies: none.
+//
+// R15E: the meta block grows one more optional slot for the Merkle root
+// (`meta.merkle_root <hex>`) -- a tamper-evident summary computed over
+// the KGS section's atom records. The slot rides on the v2 wire format
+// (no major bump); pre-R15E readers ignore the new line, post-R15E
+// readers can opt into recomputing + verifying via the
+// CE_SNAPSHOT_VERIFY_MERKLE env var. See src/persistence/merkle.nova for
+// the tree construction + proof contract.
+//
+// R16A: the meta block grows ONE MORE optional slot for the Ed25519
+// signature over the Merkle root (`meta.merkle_signature <128-char hex>`).
+// R15E's Merkle root closes the "single-byte tamper" gap; R16A's
+// signature closes the "attacker-controls-the-whole-file" gap by
+// requiring the signer's private key to produce a fresh root signature.
+// Same forward-compat shape: pre-R16A readers ignore the new line, and
+// the meta block grows from 6 cells to 7 cells without a major bump.
+// The signature is the Ed25519 sig over the 32 ROOT BYTES (NOT the hex
+// rendering), but the wire form is hex for symmetry with meta.merkle_root.
+// See src/persistence/merkle_signing.nova for the sign / verify contract.
+
+let SNAP_TAG            = 5361   // 'SNAP' image marker
+// SNAP_FORMAT_VERSION history (see SNAPSHOT_FORMAT.md for the policy):
+//   v1 -- original line-oriented `key val` wire format; sections SOUL +
+//         KGS + EPISODIC + SYNAPSES + SELFMODEL; no meta block.
+//   v2 -- adds optional `meta.creator`, `meta.created_ns`,
+//         `meta.compaction_threshold`, `meta.encryption` fields. A v1 file
+//         is migrated transparently on read via `snap_migrate_v1_to_v2`.
+//         Later additive extensions ride on v2 without a major bump:
+//           `schema.atoms_version`  (R8E -- per-atom-kind schema generation)
+//           `meta.merkle_root`      (R15E -- KGS atom-hash chain root)
+let SNAP_FORMAT_VERSION = 2
+let SNAP_FORMAT_VERSION_MIN_SUPPORTED = 1   // oldest version we can MIGRATE from
+
+// Fixed sections, in their mandatory snapshot/rehydration order (ADR-0048).
+let SEC_SOUL      = 0
+let SEC_KGS       = 1
+let SEC_EPISODIC  = 2
+let SEC_SYNAPSES  = 3
+let SEC_SELFMODEL = 4
+let SEC_COUNT     = 5
+
+// Meta block offsets (v2+). The meta block is a fixed-shape 5-cell list
+// living alongside the section blobs; missing fields default to
+// v1-migration values:
+//   creator              "unknown/<v1>"
+//   created_ns           0
+//   compaction_threshold -1   (unknown)
+//   encryption           "none"
+//   atoms_version        1    (R8E: per-atom-kind schema generation;
+//                              absent from any pre-R8E v2 file -- the
+//                              reader treats absence as v1, the implicit
+//                              shape every pre-this-build snapshot has)
+//
+// R8E forward-compat: pre-R8E v2 readers see a 4-cell meta block and
+// ignore the new `schema.atoms_version` line entirely (it parses as
+// any other unknown `key val` pair). The cell count grew from 4 to 5
+// but the existing offsets (0..3) are bit-stable, so legacy meta
+// accessors still return the right values without modification.
+//
+// R15E grows the block to 6 cells, adding the Merkle root slot at
+// offset 5. Same forward-compat shape as the R8E addition: pre-R15E
+// readers ignore the new `meta.merkle_root` line entirely, post-R15E
+// readers populate the slot from the parsed line (empty string if
+// absent, signalling "no Merkle commitment was made by this writer").
+//
+// R16A grows the block to 7 cells, adding the Merkle SIGNATURE slot at
+// offset 6. Same forward-compat shape: pre-R16A readers ignore the
+// new `meta.merkle_signature` line, post-R16A readers populate the
+// slot from the parsed line (empty string if absent, signalling "no
+// Ed25519 signature was emitted by this writer").
+let SNAP_META_CREATOR          = 0
+let SNAP_META_CREATED_NS       = 1
+let SNAP_META_COMPACT_TH       = 2
+let SNAP_META_ENCRYPTION       = 3
+let SNAP_META_ATOMS_VER        = 4
+let SNAP_META_MERKLE_ROOT      = 5     // R15E -- 64-char hex string or ""
+let SNAP_META_MERKLE_SIGNATURE = 6     // R16A -- 128-char hex string or ""
+let SNAP_META_COUNT            = 7
+
+// Default meta values used by v1 -> v2 migration (and by writers that don't
+// supply a value). Keep these in lockstep with SNAPSHOT_FORMAT.md.
+let SNAP_META_CREATOR_DEFAULT_V1   = "unknown/<v1>"
+let SNAP_META_CREATOR_DEFAULT_V2   = "crossengin/0.1.0"
+let SNAP_META_ENCRYPTION_NONE      = "none"
+let SNAP_META_COMPACT_TH_UNKNOWN   = 0 - 1
+// R8E: the atoms_schema version a fresh writer stamps. Bump in lockstep
+// with SCHEMA_CURRENT_VERSION in schema_migration.nova.
+let SNAP_META_ATOMS_VER_CURRENT    = 3
+let SNAP_META_ATOMS_VER_LEGACY     = 1
+// R15E: the empty Merkle-root slot. The writer recomputes the root at
+// emit time and replaces this; a snapshot that never went through
+// snap_to_text keeps the empty marker, which signals "no commitment".
+let SNAP_META_MERKLE_ROOT_NONE     = ""
+// R16A: the empty Merkle-signature slot. The writer (optionally) signs
+// the recomputed root at emit time when CE_SNAPSHOT_SIGN_KEY is set;
+// an empty value signals "no signature was emitted by this writer".
+let SNAP_META_MERKLE_SIG_NONE      = ""
+
+fn sec_name(s) {
+    if s == SEC_SOUL      { return "soul" }
+    if s == SEC_KGS       { return "kgs" }
+    if s == SEC_EPISODIC  { return "episodic" }
+    if s == SEC_SYNAPSES  { return "synapses" }
+    if s == SEC_SELFMODEL { return "selfmodel" }
+    return "unknown"
+}
+
+// Snapshot object layout.
+let SNAP_TAGOFF   = 0
+let SNAP_VER      = 1
+let SNAP_INSTANCE = 2
+let SNAP_TS       = 3
+let SNAP_SECTIONS = 4   // list of SEC_COUNT cells, each [present, blob]
+let SNAP_META     = 5   // v2+: meta block (4-cell list); short list = legacy v1.
+
+// Build a fresh meta block populated with the v2 defaults. A writer that wants
+// to record its identity / creation time / compaction policy stamps the slots
+// directly via `snap_meta_set_*`; the migration path uses the v1-recovery
+// defaults from snap_migrate_v1_to_v2 instead.
+fn snap_meta_new() {
+    let m = list_new()
+    push(m, SNAP_META_CREATOR_DEFAULT_V2)   // [0] creator
+    push(m, 0)                              // [1] created_ns
+    push(m, SNAP_META_COMPACT_TH_UNKNOWN)   // [2] compaction_threshold
+    push(m, SNAP_META_ENCRYPTION_NONE)      // [3] encryption
+    push(m, SNAP_META_ATOMS_VER_CURRENT)    // [4] atoms_version (R8E)
+    push(m, SNAP_META_MERKLE_ROOT_NONE)     // [5] merkle_root hex (R15E)
+    push(m, SNAP_META_MERKLE_SIG_NONE)      // [6] merkle_signature hex (R16A)
+    return m
+}
+
+fn snap_new(instance_id, now) {
+    let secs = list_new()
+    let i = 0
+    while i < SEC_COUNT {
+        let cell = list_new()
+        push(cell, 0)
+        push(cell, 0)
+        push(secs, cell)
+        i = i + 1
+    }
+    let s = list_new()
+    push(s, SNAP_TAG)
+    push(s, SNAP_FORMAT_VERSION)
+    push(s, instance_id)
+    push(s, now)
+    push(s, secs)
+    push(s, snap_meta_new())   // SNAP_META slot, v2 defaults
+    return s
+}
+
+fn snap_tag(s)       { return s[SNAP_TAGOFF] }
+fn snap_version(s)   { return s[SNAP_VER] }
+fn snap_instance(s)  { return s[SNAP_INSTANCE] }
+fn snap_timestamp(s) { return s[SNAP_TS] }
+
+// ---- v2 meta-block accessors ----------------------------------------------
+//
+// A v2 snapshot carries a 4-cell meta block alongside its sections. The
+// accessors below return the default value when the slot is absent (a v1
+// snapshot pre-migration, or a v2 snapshot whose meta block hasn't been
+// installed yet -- treated as "default values, never written").
+fn snap_has_meta(s) {
+    if len(s) <= SNAP_META { return 0 }
+    let m = s[SNAP_META]
+    if m == 0 { return 0 }
+    // Accept the pre-R8E 4-cell meta as valid -- the legacy fields
+    // (creator/created_ns/compaction_threshold/encryption) still live
+    // at offsets 0..3. The R8E-added `atoms_version` slot (offset 4)
+    // is optional; absence triggers the SCHEMA_LEGACY default at read.
+    if len(m) < 4 { return 0 }
+    return 1
+}
+
+// R8E: dedicated check for the atoms_version slot. A pre-R8E meta
+// block lacks the slot; callers that care about the schema version
+// need a way to distinguish "absent" from "explicitly set to 0".
+fn snap_meta_has_atoms_version(s) {
+    if snap_has_meta(s) == 0 { return 0 }
+    if len(s[SNAP_META]) <= SNAP_META_ATOMS_VER { return 0 }
+    return 1
+}
+
+fn snap_meta(s) {
+    if snap_has_meta(s) == 0 { return 0 }
+    return s[SNAP_META]
+}
+
+fn snap_meta_creator(s) {
+    if snap_has_meta(s) == 0 { return SNAP_META_CREATOR_DEFAULT_V2 }
+    return s[SNAP_META][SNAP_META_CREATOR]
+}
+
+fn snap_meta_created_ns(s) {
+    if snap_has_meta(s) == 0 { return 0 }
+    return s[SNAP_META][SNAP_META_CREATED_NS]
+}
+
+fn snap_meta_compaction_threshold(s) {
+    if snap_has_meta(s) == 0 { return SNAP_META_COMPACT_TH_UNKNOWN }
+    return s[SNAP_META][SNAP_META_COMPACT_TH]
+}
+
+fn snap_meta_encryption(s) {
+    if snap_has_meta(s) == 0 { return SNAP_META_ENCRYPTION_NONE }
+    return s[SNAP_META][SNAP_META_ENCRYPTION]
+}
+
+fn snap_meta_set_creator(s, val) {
+    if snap_has_meta(s) == 0 { return 0 }
+    list_set(s[SNAP_META], SNAP_META_CREATOR, val)
+    return 1
+}
+
+fn snap_meta_set_created_ns(s, val) {
+    if snap_has_meta(s) == 0 { return 0 }
+    list_set(s[SNAP_META], SNAP_META_CREATED_NS, val)
+    return 1
+}
+
+fn snap_meta_set_compaction_threshold(s, val) {
+    if snap_has_meta(s) == 0 { return 0 }
+    list_set(s[SNAP_META], SNAP_META_COMPACT_TH, val)
+    return 1
+}
+
+fn snap_meta_set_encryption(s, val) {
+    if snap_has_meta(s) == 0 { return 0 }
+    list_set(s[SNAP_META], SNAP_META_ENCRYPTION, val)
+    return 1
+}
+
+// R8E: atoms_version (per-atom-kind schema generation).
+//
+// An older meta block (pre-R8E, 4 cells) reads back as the legacy
+// schema version (= 1, the implicit shape every pre-this-build atom
+// has). A writer that wants to record a newer generation calls
+// snap_meta_set_atoms_version, which extends the meta block to 5
+// cells in place. The schema framework (src/persistence/
+// schema_migration.nova) plumbs this through migrate_kg at load
+// time.
+fn snap_meta_atoms_version(s) {
+    if snap_has_meta(s) == 0 { return SNAP_META_ATOMS_VER_LEGACY }
+    if snap_meta_has_atoms_version(s) == 0 { return SNAP_META_ATOMS_VER_LEGACY }
+    return s[SNAP_META][SNAP_META_ATOMS_VER]
+}
+
+fn snap_meta_set_atoms_version(s, val) {
+    if snap_has_meta(s) == 0 { return 0 }
+    let m = s[SNAP_META]
+    // Extend the meta block to the current full cell count if a pre-R8E
+    // (4-cell) or pre-R15E (5-cell) block is installed -- a freshly-
+    // built snapshot via snap_meta_new already has SNAP_META_COUNT
+    // cells. Append the slot-typed default for each missing slot so
+    // existing accessors keep their offsets.
+    _snap_meta_extend(m)
+    list_set(m, SNAP_META_ATOMS_VER, val)
+    return 1
+}
+
+// R15E: pad a short meta block (pre-R8E 4-cell, pre-R15E 5-cell) up to
+// the current SNAP_META_COUNT, populating each new slot with its
+// slot-typed default so callers don't have to special-case absence.
+// R16A grows the same pattern: pad up to the R16A signature slot
+// (offset 6).
+fn _snap_meta_extend(m) {
+    if len(m) < SNAP_META_ATOMS_VER + 1 {
+        // Pad up to the R8E slot.
+        while len(m) < SNAP_META_ATOMS_VER + 1 {
+            push(m, SNAP_META_ATOMS_VER_LEGACY)
+        }
+    }
+    if len(m) < SNAP_META_MERKLE_ROOT + 1 {
+        // Pad up to the R15E slot.
+        while len(m) < SNAP_META_MERKLE_ROOT + 1 {
+            push(m, SNAP_META_MERKLE_ROOT_NONE)
+        }
+    }
+    if len(m) < SNAP_META_MERKLE_SIGNATURE + 1 {
+        // Pad up to the R16A signature slot.
+        while len(m) < SNAP_META_MERKLE_SIGNATURE + 1 {
+            push(m, SNAP_META_MERKLE_SIG_NONE)
+        }
+    }
+    return 1
+}
+
+// R15E: dedicated accessor + setter for the Merkle-root slot. The
+// reader populates the slot from the optional `meta.merkle_root` line;
+// the writer recomputes the root over the KGS records at emit time
+// and replaces this slot. An absent / empty value signals "no Merkle
+// commitment was made by this snapshot" (= the same effect as the
+// pre-R15E behaviour).
+fn snap_meta_has_merkle_root(s) {
+    if snap_has_meta(s) == 0 { return 0 }
+    if len(s[SNAP_META]) <= SNAP_META_MERKLE_ROOT { return 0 }
+    let v = s[SNAP_META][SNAP_META_MERKLE_ROOT]
+    if v == 0 { return 0 }
+    if str_eq(v, SNAP_META_MERKLE_ROOT_NONE) == 1 { return 0 }
+    return 1
+}
+
+fn snap_meta_merkle_root(s) {
+    if snap_has_meta(s) == 0 { return SNAP_META_MERKLE_ROOT_NONE }
+    if len(s[SNAP_META]) <= SNAP_META_MERKLE_ROOT { return SNAP_META_MERKLE_ROOT_NONE }
+    return s[SNAP_META][SNAP_META_MERKLE_ROOT]
+}
+
+fn snap_meta_set_merkle_root(s, hex) {
+    if snap_has_meta(s) == 0 { return 0 }
+    let m = s[SNAP_META]
+    _snap_meta_extend(m)
+    list_set(m, SNAP_META_MERKLE_ROOT, hex)
+    return 1
+}
+
+// R16A: accessor + setter for the Ed25519 signature slot. The reader
+// populates the slot from the optional `meta.merkle_signature` line;
+// the writer (when CE_SNAPSHOT_SIGN_KEY is set) signs the recomputed
+// root at emit time and replaces this slot. An absent / empty value
+// signals "no signature was emitted by this writer" -- the same
+// shape R15E used for the merkle_root slot.
+fn snap_meta_has_merkle_signature(s) {
+    if snap_has_meta(s) == 0 { return 0 }
+    if len(s[SNAP_META]) <= SNAP_META_MERKLE_SIGNATURE { return 0 }
+    let v = s[SNAP_META][SNAP_META_MERKLE_SIGNATURE]
+    if v == 0 { return 0 }
+    if str_eq(v, SNAP_META_MERKLE_SIG_NONE) == 1 { return 0 }
+    return 1
+}
+
+fn snap_meta_merkle_signature(s) {
+    if snap_has_meta(s) == 0 { return SNAP_META_MERKLE_SIG_NONE }
+    if len(s[SNAP_META]) <= SNAP_META_MERKLE_SIGNATURE {
+        return SNAP_META_MERKLE_SIG_NONE
+    }
+    return s[SNAP_META][SNAP_META_MERKLE_SIGNATURE]
+}
+
+fn snap_meta_set_merkle_signature(s, hex) {
+    if snap_has_meta(s) == 0 { return 0 }
+    let m = s[SNAP_META]
+    _snap_meta_extend(m)
+    list_set(m, SNAP_META_MERKLE_SIGNATURE, hex)
+    return 1
+}
+
+// Migrate a v1-shape snapshot to v2: bump the version field, attach a meta
+// block populated with the v1-recovery defaults documented in
+// SNAPSHOT_FORMAT.md. Returns 1 on success, 0 if the snapshot is not in v1
+// shape (already v2, or wrong tag entirely).
+//
+// Idempotent on a v1 snapshot only by accident -- callers should check
+// snap_version(s) == 1 before invoking. The current reader path
+// (snapshot_disk.nova) takes care of that.
+fn snap_migrate_v1_to_v2(s) {
+    if s == 0 { return 0 }
+    if len(s) < 5 { return 0 }
+    if snap_tag(s) != SNAP_TAG { return 0 }
+    if snap_version(s) != 1 { return 0 }
+    // Bump the wire version.
+    list_set(s, SNAP_VER, 2)
+    // Attach a v1-defaults meta block. A v1 file never carried these fields,
+    // so we have to invent placeholder values; SNAPSHOT_FORMAT.md documents
+    // them as the canonical migration recovery values.
+    let m = list_new()
+    push(m, SNAP_META_CREATOR_DEFAULT_V1)        // creator
+    push(m, 0)                                   // created_ns (unknown -> 0)
+    push(m, SNAP_META_COMPACT_TH_UNKNOWN)        // compaction_threshold (-1)
+    push(m, SNAP_META_ENCRYPTION_NONE)           // encryption
+    push(m, SNAP_META_ATOMS_VER_LEGACY)          // atoms_version (R8E; v1 file = implicit schema v1)
+    push(m, SNAP_META_MERKLE_ROOT_NONE)          // merkle_root (R15E; v1 file = no commitment)
+    push(m, SNAP_META_MERKLE_SIG_NONE)           // merkle_signature (R16A; v1 file = no commitment)
+    if len(s) > SNAP_META {
+        list_set(s, SNAP_META, m)
+    } else {
+        push(s, m)
+    }
+    return 1
+}
+
+fn _sec_valid(sec_id) {
+    if sec_id < 0 { return 0 }
+    if sec_id >= SEC_COUNT { return 0 }
+    return 1
+}
+
+// Attach a subsystem's serialized blob to its section.
+fn snap_put_section(s, sec_id, blob) {
+    if _sec_valid(sec_id) == 0 { return 0 }
+    let cell = s[SNAP_SECTIONS][sec_id]
+    list_set(cell, 0, 1)
+    list_set(cell, 1, blob)
+    return 1
+}
+
+fn snap_has_section(s, sec_id) {
+    if _sec_valid(sec_id) == 0 { return 0 }
+    return s[SNAP_SECTIONS][sec_id][0]
+}
+
+fn snap_section(s, sec_id) {
+    if snap_has_section(s, sec_id) == 0 { return 0 }
+    return s[SNAP_SECTIONS][sec_id][1]
+}
+
+fn snap_section_count(s) {
+    let n = 0
+    let i = 0
+    while i < SEC_COUNT {
+        if s[SNAP_SECTIONS][i][0] == 1 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// Frame the snapshot into the ordered, section-framed value:
+//   [SNAP_TAG, version, instance, timestamp, SEC_COUNT, c0, c1, .. c4]
+// where ci = [present, blob] in mandatory section order. (The byte-level
+// encoding to disk is the runtime seam.)
+fn snap_serialize(s) {
+    let out = list_new()
+    push(out, snap_tag(s))
+    push(out, snap_version(s))
+    push(out, snap_instance(s))
+    push(out, snap_timestamp(s))
+    push(out, SEC_COUNT)
+    let i = 0
+    while i < SEC_COUNT {
+        let cell = s[SNAP_SECTIONS][i]
+        let c = list_new()
+        push(c, cell[0])
+        push(c, cell[1])
+        push(out, c)
+        i = i + 1
+    }
+    return out
+}
+
+// Crash-safe write contract (ADR-0048, NOVA enhancement #10): serialize to a
+// temp file, fsync, then atomically rename over the live image, so a crash
+// mid-write never corrupts the last good snapshot. The syscalls are the runtime
+// seam; these express the plan the daemon follows.
+fn snap_tmp_path(path) { return path + ".tmp" }
+
+fn snap_durable_steps() {
+    let steps = list_new()
+    push(steps, "write_tmp")
+    push(steps, "fsync")
+    push(steps, "atomic_rename")
+    return steps
+}

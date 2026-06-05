@@ -1,0 +1,966 @@
+// CrossEngin safety: pure-NOVA 256-bit unsigned bignum library with
+// Montgomery REDC.
+//
+// Purpose
+//   `bignum.nova` (the original `bn_*` 256-bit primitive) ships with a
+//   bit-by-bit modular reduction: every `bn_modmul` does a 512-bit
+//   shift-and-subtract long division (~512 iterations of (shl + cmp +
+//   maybe-sub) per reduce). That was acceptable for the SecAgg DH
+//   prerequisite, but the per-`bn_modpow_ct` cost on the Curve25519
+//   prime (used in Curve25519 ECDH, ChaCha20-Poly1305 fields, and
+//   DH-256) is ~40 ms wall-clock -- the same algorithmic step that
+//   pushed 2048-bit DH from ~15 s to ~1.2 s when R4D shipped
+//   Montgomery REDC for `bignum_2048.nova`. This module mirrors that
+//   upgrade for the 256-bit primitive: a parallel `bn256_*` API with
+//   Montgomery-form (CIOS) reduction backing the constant-time
+//   exponentiation.
+//
+//   We ship as a NEW module (parallel to `bignum.nova`) rather than
+//   editing the existing `bn_*` surface so:
+//     (a) existing callers (Curve25519, ChaCha20-Poly1305 field math,
+//         secure_aggregation's DH-256 fallback) continue to import
+//         `bignum.nova` with byte-identical semantics during the
+//         transition; the upgrade is opt-in via the `bn256_*` prefix.
+//     (b) the equivalence anchor (`_bn256_modpow_ct_legacy`) lives
+//         inside this module so the equivalence sweep doesn't depend
+//         on cross-module identifiers from `bignum.nova`.
+//
+// Scope -- 256-bit fixed, NOT arbitrary precision
+//   256 bits is enough for X25519 ECDH on Curve25519 (the field is
+//   2^255 - 19), for Ed25519, for P-256 ECDSA, and for the modular
+//   primitives most modern protocols use. Wider DH (2048-bit RFC
+//   7919) lives in `bignum_2048.nova`. This module is for the field
+//   sizes that the bn256_* prefix implies.
+//
+// Representation
+//   `bn256` is a NOVA list of exactly BN256_LIMBS = 8 limbs, each a
+//   32-bit non-negative integer. Index 0 is the LEAST-significant
+//   limb; index 7 is the MOST-significant. Concretely:
+//     value = sum over i in 0..7 of limbs[i] * (2^32)^i
+//   Same convention as `bignum.nova` / `bignum_2048.nova`: little-
+//   endian internally for the natural multiplication and addition
+//   algorithms; big-endian for `bn256_to_hex` / `bn256_from_hex` per
+//   crypto convention. The 32-bit mask BN256_MASK32 = 0xFFFFFFFF
+//   folds intermediate products back into 32 bits after each carry-
+//   propagate.
+//
+// Why 32-bit limbs (mirror of bignum_2048.nova rationale)
+//   * Sum of 8 32-bit limbs fits comfortably in a 64-bit signed int.
+//   * Product of two 32-bit limbs does NOT fit in signed 64-bit; same
+//     16-bit-half schoolbook trick as `bn_mul` / `bn2048_mul`.
+//   * `int_mul` is used exclusively for arithmetic so NOVA gotcha #11
+//     (pointer-threshold bug at ~2^20 for the smart `*` operator
+//     inside loops) does not apply.
+//
+// Performance reality check
+//   A 256-bit modpow_ct does 256 modular squarings + 256 modular
+//   multiplications in the Montgomery ladder. Pre-Montgomery REDC,
+//   each modmul cost a full 512-bit bit-by-bit reduction (~1.5k limb-
+//   ops) plus an 8x8-limb schoolbook product (~256 limb-mults); per-
+//   modpow wall-clock was ~40 ms on this sandbox. Post-Montgomery
+//   REDC (CIOS form, this module), the per-modmul reduce shrinks to
+//   ~64 limb-mults and the wall-clock drops to ~5-8 ms -- a ~5-8x
+//   speedup. The 256-bit speedup is smaller than the 2048-bit
+//   speedup because the legacy reduction is itself smaller in
+//   absolute terms (512 bits vs 4096 bits), but the asymptotic shape
+//   (O(N) Montgomery vs O(N^2) bit-by-bit, where N is the bit width)
+//   is the same.
+//
+// Reduction-loop correctness note
+//   `_bn256_shl1_inplace` returns its carry-out so the bit-by-bit
+//   reducers (`bn256_mod`, `_bn256_mod512`) handle moduli where bit
+//   255 is set. The Curve25519 prime has bit 255 CLEAR so the legacy
+//   `bn_mod` in `bignum.nova` doesn't honor the carry-out; we honor
+//   it here defensively for any 256-bit-wide odd modulus the caller
+//   might pass.
+//
+// Public API (mirrors bignum_2048.nova; same shape, 8-limb wide)
+//   bn256_new()                       -> a fresh zero 256-bit bignum
+//   bn256_from_int(n)                 -> bignum holding the small non-negative n
+//   bn256_from_hex(hex_str)           -> bignum from 1..64-char hex string
+//   bn256_to_hex(bn)                  -> canonical 64-char lowercase hex string
+//   bn256_zero(bn)                    -> 1 iff all limbs are zero
+//   bn256_eq(a, b)                    -> 1 iff a == b
+//   bn256_cmp(a, b)                   -> -1 / 0 / +1 comparator
+//   bn256_add(a, b)                   -> (a + b) mod 2^256
+//   bn256_sub(a, b)                   -> (a - b) mod 2^256
+//   bn256_mul(a, b)                   -> [hi, lo], 512-bit product split into
+//                                        two 256-bit halves
+//   bn256_mod(a, m)                   -> a mod m
+//   bn256_modmul(a, b, m)             -> (a * b) mod m
+//   bn256_modpow_ct(base, exp, m)     -> base^exp mod m, Montgomery ladder
+//                                        (constant-time per bit; CRYPTO-SAFE;
+//                                        backed by Montgomery REDC for ~5-8x
+//                                        speedup vs the bit-by-bit reducer)
+//   bn256_mont_ctx_new(N)             -> precomputed Montgomery context for
+//                                        the fixed modulus N (one-shot
+//                                        precompute amortized across many
+//                                        operations on the same N)
+//   bn256_to_mont(x, ctx)             -> x_mont = (x * R) mod N
+//   bn256_from_mont(x_mont, ctx)      -> x = (x_mont * R^-1) mod N
+//   bn256_montmul(a, b, ctx)          -> (a * b * R^-1) mod N (CIOS form)
+//   bn256_modpow_ct_mont(b, e, ctx)   -> b^e mod N via Montgomery REDC
+//   _bn256_modpow_ct_legacy(b, e, m)  -> bit-by-bit Montgomery ladder; the
+//                                        even-modulus fallback + equivalence
+//                                        anchor for the unit tests
+//
+// !!! INTENTIONAL OMISSION (mirrors bignum_2048.nova) !!!
+//   We do NOT expose a `bn256_modpow` (non-CT square-and-multiply
+//   variant). For 256-bit DH / ECDH, only the CT path is safe to
+//   expose to any remote-callable code path. The non-CT square-and-
+//   multiply variant lives in `bignum.nova` as `bn_modpow` and is
+//   documented there as "OFFLINE self-tests only".
+//
+// Constant-time / side-channel disclaimer
+//   Same caveats as bignum.nova / bignum_2048.nova: `bn256_cmp` and
+//   `bn256_sub` still branch on data, so they leak the operand bits
+//   they walk. `bn256_modpow_ct` uses both internally; those calls
+//   have data-dependent control flow on the OPERANDS, but the OUTER
+//   LOOP STRUCTURE is exponent-bit-INDEPENDENT (one mul + one square
+//   per bit). The Montgomery REDC reduction step is also exponent-
+//   bit-INDEPENDENT.
+//
+// ADRs touched: SECAGG_AUDIT.md ("bn256 Montgomery REDC perf upgrade").
+// NOVA dependencies: builtins only.
+// CrossEngin dependencies: none -- pure leaf primitive (parallel to
+//   bignum.nova / bignum_2048.nova; all three leaves consume only NOVA
+//   builtins).
+
+// ---- size constants -------------------------------------------------------
+//
+// BN256_LIMBS = 8 -> 256-bit total. BN256_MASK32 = 2^32 - 1 mirrors the
+// 2048-bit module. BN256_HEX_DIGITS = 64 = 8 limbs * 8 hex chars each.
+let BN256_LIMBS    = 8
+let BN256_MASK32   = 4294967295    // 2^32 - 1
+let BN256_MASK16   = 65535         // 2^16 - 1
+let BN256_LIMB_BITS = 32
+let BN256_HALF_BITS = 16
+let BN256_HEX_DIGITS = 64          // 8 limbs * 8 hex chars each
+// Precomputed loop bounds for hot paths -- avoids `int_mul` in the
+// loop predicate evaluation under NOVA's smart-op handling.
+let BN256_TOTAL_BITS = 256         // BN256_LIMBS * BN256_LIMB_BITS
+let BN256_DOUBLE_BITS = 512        // 2 * BN256_TOTAL_BITS
+let BN256_HALF_LIMBS = 16          // BN256_LIMBS * 2  (16-bit half count in bn256_mul)
+let BN256_HALF_LIMBS_DOUBLE = 32   // 2 * BN256_HALF_LIMBS
+// Montgomery REDC working buffer width: N+1 limbs (the CIOS accumulator
+// needs one extra limb beyond the N-limb modulus to hold the partial
+// product before the per-iteration reduction folds it back to N limbs).
+let BN256_LIMBS_PLUS_ONE = 9       // BN256_LIMBS + 1
+let BN256_TWO_POW_32 = 4294967296  // 2^32 -- used to negate mod 2^32 in
+                                   // the Newton-iteration final step.
+
+// ---- internal helpers -----------------------------------------------------
+
+fn _bn256_mask32(x) {
+    return int_and(x, BN256_MASK32)
+}
+
+// Construct a fresh `bn256` with all 8 limbs zero. Used as the public
+// `bn256_new` constructor and as the result-buffer in every arithmetic op.
+fn _bn256_alloc_zero() {
+    let r = list_new()
+    let i = 0
+    while i < BN256_LIMBS {
+        push(r, 0)
+        i = i + 1
+    }
+    return r
+}
+
+// Hex-nibble parser identical to bignum.nova / chacha20 codec.
+fn _bn256_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }   // '0'..'9'
+    if c >= 97 { if c <= 102 { return c - 87 } }   // 'a'..'f'
+    if c >= 65 { if c <= 70  { return c - 55 } }   // 'A'..'F'
+    return -1
+}
+
+// Inverse: nibble (0..15) -> lowercase hex char code.
+fn _bn256_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87    // 'a'..'f'
+}
+
+// ---- constructors --------------------------------------------------------
+
+fn bn256_new() {
+    return _bn256_alloc_zero()
+}
+
+// Build a bignum from a small NOVA int. Low 32 bits in limb[0], next
+// 32 bits in limb[1], rest zero. Negative inputs clamp to zero.
+fn bn256_from_int(n) {
+    let r = _bn256_alloc_zero()
+    if n <= 0 { return r }
+    list_set(r, 0, _bn256_mask32(n))
+    list_set(r, 1, _bn256_mask32(int_shr(n, 32)))
+    return r
+}
+
+// Parse a hex string (no "0x" prefix; 1..64 hex chars; case-insensitive)
+// into a 256-bit bignum. Right-justifies. Returns bn256_new() on
+// invalid input.
+fn bn256_from_hex(hex_str) {
+    let r = _bn256_alloc_zero()
+    let n = len(hex_str)
+    if n == 0 { return r }
+    if n > BN256_HEX_DIGITS { return r }   // too wide for 256-bit
+    let i = n - 1
+    let bit_pos = 0
+    while i >= 0 {
+        let c = char_at(hex_str, i)
+        let v = _bn256_hex_nibble(c)
+        if v < 0 {
+            return _bn256_alloc_zero()
+        }
+        let limb_idx = int_shr(bit_pos, 5)            // bit_pos / 32
+        let shift    = int_and(bit_pos, 31)           // bit_pos mod 32
+        let cur      = r[limb_idx]
+        let add      = _bn256_mask32(int_shl(v, shift))
+        list_set(r, limb_idx, _bn256_mask32(int_or(cur, add)))
+        bit_pos = bit_pos + 4
+        i = i - 1
+    }
+    return r
+}
+
+// Canonical 64-character lowercase hex serialization (big-endian).
+// Always emits exactly BN256_HEX_DIGITS = 64 characters with leading
+// zeros preserved.
+fn bn256_to_hex(bn) {
+    let s = ""
+    let i = BN256_LIMBS - 1
+    while i >= 0 {
+        let limb = bn[i]
+        let j = 7
+        while j >= 0 {
+            let nib = int_and(int_shr(limb, int_mul(j, 4)), 15)
+            s = s + chr(_bn256_nibble_hex(nib))
+            j = j - 1
+        }
+        i = i - 1
+    }
+    return s
+}
+
+// ---- predicates ----------------------------------------------------------
+
+fn bn256_zero(bn) {
+    let i = 0
+    while i < BN256_LIMBS {
+        if bn[i] != 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn bn256_eq(a, b) {
+    let i = 0
+    while i < BN256_LIMBS {
+        if a[i] != b[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// -1 / 0 / +1 comparator. Walks from MSB to LSB; first differing limb
+// determines the sign. NOT constant-time.
+fn bn256_cmp(a, b) {
+    let i = BN256_LIMBS - 1
+    while i >= 0 {
+        let ai = a[i]
+        let bi = b[i]
+        if ai < bi { return -1 }
+        if ai > bi { return 1 }
+        i = i - 1
+    }
+    return 0
+}
+
+// ---- addition + subtraction ----------------------------------------------
+
+fn bn256_add(a, b) {
+    let r = _bn256_alloc_zero()
+    let carry = 0
+    let i = 0
+    while i < BN256_LIMBS {
+        let sum = int_add(int_add(a[i], b[i]), carry)
+        list_set(r, i, _bn256_mask32(sum))
+        carry = int_shr(sum, 32)
+        i = i + 1
+    }
+    return r
+}
+
+fn bn256_sub(a, b) {
+    let r = _bn256_alloc_zero()
+    let borrow = 0
+    let i = 0
+    while i < BN256_LIMBS {
+        let diff = int_sub(int_sub(a[i], b[i]), borrow)
+        if diff < 0 {
+            diff = int_add(diff, int_shl(1, 32))    // diff + 2^32
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        list_set(r, i, _bn256_mask32(diff))
+        i = i + 1
+    }
+    return r
+}
+
+// ---- multiplication ------------------------------------------------------
+
+// Split a 32-bit limb into [lo16, hi16].
+fn _bn256_split16(limb) {
+    let lo = int_and(limb, BN256_MASK16)
+    let hi = int_and(int_shr(limb, 16), BN256_MASK16)
+    let p = list_new()
+    push(p, lo)
+    push(p, hi)
+    return p
+}
+
+// Convert a list of 16 "32-bit limbs" into [hi, lo] bignum pair, both
+// 8-limb 256-bit bignums.
+fn _bn256_pack16_to_pair(limbs16) {
+    let lo = _bn256_alloc_zero()
+    let hi = _bn256_alloc_zero()
+    let i = 0
+    while i < BN256_LIMBS {
+        list_set(lo, i, limbs16[i])
+        list_set(hi, i, limbs16[i + BN256_LIMBS])
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, hi)
+    push(pair, lo)
+    return pair
+}
+
+// Full 256x256 -> 512 multiplier (schoolbook). Same shape as
+// `bn_mul` in bignum.nova; documented in `_bn256_pack16_to_pair`.
+// Returns [hi_bn, lo_bn] where hi_bn * 2^256 + lo_bn = a * b exactly.
+fn bn256_mul(a, b) {
+    // Build 16-half views of a and b.
+    let ah = list_new()
+    let bh = list_new()
+    let k = 0
+    while k < BN256_LIMBS {
+        let pa = _bn256_split16(a[k])
+        let pb = _bn256_split16(b[k])
+        push(ah, pa[0])
+        push(ah, pa[1])
+        push(bh, pb[0])
+        push(bh, pb[1])
+        k = k + 1
+    }
+    // Accumulator: 32 16-bit slots. Values stay within 32 bits after
+    // every column-merge step.
+    let acc = list_new()
+    let z = 0
+    while z < BN256_HALF_LIMBS_DOUBLE {
+        push(acc, 0)
+        z = z + 1
+    }
+    let i = 0
+    while i < BN256_HALF_LIMBS {
+        let aw = ah[i]
+        let j = 0
+        while j < BN256_HALF_LIMBS {
+            let prod = int_mul(aw, bh[j])
+            let pos = i + j
+            let s = int_add(acc[pos], prod)
+            list_set(acc, pos, int_and(s, BN256_MASK16))
+            let carry = int_shr(s, 16)
+            let p2 = pos + 1
+            while carry > 0 {
+                if p2 >= BN256_HALF_LIMBS_DOUBLE { carry = 0 }
+                else {
+                    let s2 = int_add(acc[p2], carry)
+                    list_set(acc, p2, int_and(s2, BN256_MASK16))
+                    carry = int_shr(s2, 16)
+                    p2 = p2 + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Merge 32 16-bit slots into 16 32-bit limbs.
+    let limbs16 = list_new()
+    let q = 0
+    while q < BN256_HALF_LIMBS {
+        let lo16 = acc[int_mul(q, 2)]
+        let hi16 = acc[int_add(int_mul(q, 2), 1)]
+        let limb = _bn256_mask32(int_or(lo16, int_shl(hi16, 16)))
+        push(limbs16, limb)
+        q = q + 1
+    }
+    return _bn256_pack16_to_pair(limbs16)
+}
+
+// ---- modular reduction ---------------------------------------------------
+
+// Shallow copy of a bignum_256. Standalone so callers don't risk aliasing.
+fn _bn256_clone(bn) {
+    let r = _bn256_alloc_zero()
+    let i = 0
+    while i < BN256_LIMBS {
+        list_set(r, i, bn[i])
+        i = i + 1
+    }
+    return r
+}
+
+// In-place copy: copy src limbs into dst.
+fn _bn256_copy_into(dst, src) {
+    let i = 0
+    while i < BN256_LIMBS {
+        list_set(dst, i, src[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// In-place 256-bit shift-left-by-one. Returns the carry-out (0 or 1)
+// -- the bit that fell off the top of the 256-bit container. The
+// reduction loop uses this carry-out to detect the case where the
+// shifted value would have crossed 2^256: in that case the value is
+// >= m (since m > 2^255 for any 256-bit modulus with bit 255 set),
+// so the subsequent `if r >= m: r -= m` step must force a subtraction.
+// The Curve25519 prime has bit 255 clear so this carry never fires
+// for that modulus, but we honor it defensively for any odd 256-bit
+// modulus.
+fn _bn256_shl1_inplace(bn) {
+    let carry = 0
+    let i = 0
+    while i < BN256_LIMBS {
+        let v = bn[i]
+        let new_v = _bn256_mask32(int_or(int_shl(v, 1), carry))
+        list_set(bn, i, new_v)
+        carry = int_and(int_shr(v, 31), 1)
+        i = i + 1
+    }
+    return carry
+}
+
+// In-place subtraction: dst = dst - src. Avoids the alloc + copy-back
+// that `bn256_sub` followed by `_bn256_copy_into` would impose on
+// every reducing subtract inside `bn256_mod` / `_bn256_mod512`.
+fn _bn256_sub_inplace(dst, src) {
+    let borrow = 0
+    let i = 0
+    while i < BN256_LIMBS {
+        let diff = int_sub(int_sub(dst[i], src[i]), borrow)
+        if diff < 0 {
+            diff = int_add(diff, int_shl(1, 32))
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        list_set(dst, i, _bn256_mask32(diff))
+        i = i + 1
+    }
+    return 1
+}
+
+// Bit-by-bit modular reduction: a mod m. 256 iterations; each
+// iteration does a shl + a cmp + (maybe) a sub.
+//
+// The `shift_carry` branch handles the case where shifting the running
+// remainder overflows the 256-bit container: when m has bit 255 set,
+// shift-overflow means the true value is >= m, so we force a subtract.
+fn bn256_mod(a, m) {
+    if bn256_zero(m) != 0 {
+        return _bn256_clone(a)
+    }
+    if bn256_cmp(a, m) < 0 {
+        return _bn256_clone(a)
+    }
+    let r = _bn256_alloc_zero()
+    let bit = BN256_TOTAL_BITS - 1
+    while bit >= 0 {
+        let shift_carry = _bn256_shl1_inplace(r)
+        let limb_idx = int_shr(bit, 5)                  // bit / 32
+        let bit_idx  = int_and(bit, 31)                 // bit mod 32
+        let a_bit    = int_and(int_shr(a[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if shift_carry != 0 {
+            _bn256_sub_inplace(r, m)
+        } else {
+            if bn256_cmp(r, m) >= 0 {
+                _bn256_sub_inplace(r, m)
+            }
+        }
+        bit = bit - 1
+    }
+    return r
+}
+
+// (a * b) mod m via the 512-bit product, reduced by `_bn256_mod512`.
+fn bn256_modmul(a, b, m) {
+    let pair = bn256_mul(a, b)
+    let hi = pair[0]
+    let lo = pair[1]
+    return _bn256_mod512(hi, lo, m)
+}
+
+// Reduce a 512-bit number (split as hi * 2^256 + lo) modulo a
+// 256-bit modulus. Walks all 512 bits high to low. The remainder is
+// always < 2^256.
+//
+// We split the walk into two phases (hi-half then lo-half) instead of
+// a single 512-bit loop with a `bit >= TOTAL_BITS` branch: dispatching
+// the source once per phase removes one conditional from the hot path.
+fn _bn256_mod512(hi, lo, m) {
+    if bn256_zero(m) != 0 {
+        return _bn256_clone(lo)
+    }
+    let r = _bn256_alloc_zero()
+    // Phase 1: hi-half bits, high to low.
+    let bit = BN256_TOTAL_BITS - 1
+    while bit >= 0 {
+        let shift_carry = _bn256_shl1_inplace(r)
+        let limb_idx = int_shr(bit, 5)
+        let bit_idx  = int_and(bit, 31)
+        let a_bit    = int_and(int_shr(hi[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if shift_carry != 0 {
+            _bn256_sub_inplace(r, m)
+        } else {
+            if bn256_cmp(r, m) >= 0 {
+                _bn256_sub_inplace(r, m)
+            }
+        }
+        bit = bit - 1
+    }
+    // Phase 2: lo-half bits, high to low.
+    bit = BN256_TOTAL_BITS - 1
+    while bit >= 0 {
+        let shift_carry = _bn256_shl1_inplace(r)
+        let limb_idx = int_shr(bit, 5)
+        let bit_idx  = int_and(bit, 31)
+        let a_bit    = int_and(int_shr(lo[limb_idx], bit_idx), 1)
+        if a_bit != 0 {
+            list_set(r, 0, int_or(r[0], 1))
+        }
+        if shift_carry != 0 {
+            _bn256_sub_inplace(r, m)
+        } else {
+            if bn256_cmp(r, m) >= 0 {
+                _bn256_sub_inplace(r, m)
+            }
+        }
+        bit = bit - 1
+    }
+    return r
+}
+
+// ---- Montgomery REDC (CIOS form) -----------------------------------------
+//
+// Montgomery reduction replaces the bit-by-bit `_bn256_mod512` (512
+// iterations x ~3 8-limb passes = ~12k limb-ops per reduce) with a
+// single O(N^2) limb-multiply pass = ~64 limb-mults per reduce. The
+// dominant cost in `bn256_modpow_ct` was the reduction step embedded
+// in every `bn256_modmul`; replacing it via Montgomery REDC shrinks
+// per-modpow wall-clock by ~5-8x on the Curve25519 prime.
+//
+// Algorithm shape (textbook Montgomery REDC):
+//   For modulus N (odd) and R = 2^(N_LIMBS*32) = 2^256, precompute:
+//     n_prime0 = (-N^-1) mod 2^32   (limb-level inverse via Newton)
+//     r2_mod_n = R^2 mod N          (used to enter Montgomery form)
+//   Montgomery form: x_mont = x * R mod N
+//   Montgomery multiplication (a_mont * b_mont) -> (a*b)_mont via CIOS
+//   (Coarsely Integrated Operand Scanning): interleave the schoolbook
+//   multiply with the per-iteration reduction so the accumulator stays
+//   at N+1 limbs throughout (no 512-bit intermediate).
+//
+// Why CIOS over SOS: CIOS keeps the accumulator at N+1 limbs (fits a
+// flat NOVA list cleanly), and the per-iteration carry chains stay
+// short. CIOS also gives a tight inner-loop body where we INLINE the
+// 32x32 multiply directly (no helper returning a [lo, hi] pair) --
+// critical for NOVA where the helper form allocates ~32M short-lived
+// pairs per modpow_ct (in the 2048-bit module that OOMed at 14GB; at
+// 256-bit it'd be ~4M and "merely" slow + GC-thrashing).
+//
+// Correctness anchor: `bn256_modpow_ct` keeps its external behavior
+// bit-exact -- same return values for all inputs; only the internal
+// reducer switches. The equivalence sweep against the legacy path
+// (`_bn256_modpow_ct_legacy`) passes on deterministic pseudo-random
+// vectors and on the Curve25519 prime; the headline Fermat check
+// `bn256_modpow_ct(2, p-1, p) == 1` continues to pass.
+
+// Allocate a fresh list of `n` zero limbs (for the N+1-wide CIOS
+// accumulator).
+fn _bn256_alloc_zero_n(n) {
+    let r = list_new()
+    let i = 0
+    while i < n {
+        push(r, 0)
+        i = i + 1
+    }
+    return r
+}
+
+// Newton's iteration for -N^-1 mod 2^32, where n0 = N's least-
+// significant limb. For odd n0, Newton's method converges quadratically
+// from x_0 = 1: each iteration doubles the bit-precision (1 -> 2 -> 4
+// -> 8 -> 16 -> 32), so 5 iterations give a 32-bit-correct inverse.
+// Recurrence: x_{k+1} = x_k * (2 - n0 * x_k) mod 2^32. Negate at the
+// end to produce -N^-1 mod 2^32 as required by Montgomery REDC.
+//
+// Bug-A escape: every multiply explicitly splits into 16-bit halves
+// (n0 * x can overflow signed 64-bit otherwise).
+fn _bn256_compute_n_prime0(n0) {
+    let n0_lo = int_and(n0, BN256_MASK16)
+    let n0_hi = int_and(int_shr(n0, 16), BN256_MASK16)
+    let x = 1
+    let i = 0
+    while i < 5 {
+        // prod_lo = (n0 * x) mod 2^32 via 16-bit-half split.
+        let x_lo = int_and(x, BN256_MASK16)
+        let x_hi = int_and(int_shr(x, 16), BN256_MASK16)
+        let p_ll = int_mul(n0_lo, x_lo)
+        let p_lh = int_mul(n0_lo, x_hi)
+        let p_hl = int_mul(n0_hi, x_lo)
+        let p_mid = int_add(p_lh, p_hl)
+        let p_low = int_and(p_ll, BN256_MASK16)
+        let p_high16_sum = int_add(int_shr(p_ll, 16), int_and(p_mid, BN256_MASK16))
+        let prod_lo = _bn256_mask32(int_or(p_low, int_shl(int_and(p_high16_sum, BN256_MASK16), 16)))
+        // two_minus = (2 - prod_lo) mod 2^32 (avoid negatives by adding 2^32).
+        let two_minus = int_add(BN256_TWO_POW_32, 2)
+        two_minus = int_sub(two_minus, prod_lo)
+        two_minus = _bn256_mask32(two_minus)
+        // next_x = (x * two_minus) mod 2^32.
+        let tm_lo = int_and(two_minus, BN256_MASK16)
+        let tm_hi = int_and(int_shr(two_minus, 16), BN256_MASK16)
+        let n_ll = int_mul(x_lo, tm_lo)
+        let n_lh = int_mul(x_lo, tm_hi)
+        let n_hl = int_mul(x_hi, tm_lo)
+        let n_mid = int_add(n_lh, n_hl)
+        let n_low = int_and(n_ll, BN256_MASK16)
+        let n_high16_sum = int_add(int_shr(n_ll, 16), int_and(n_mid, BN256_MASK16))
+        x = _bn256_mask32(int_or(n_low, int_shl(int_and(n_high16_sum, BN256_MASK16), 16)))
+        i = i + 1
+    }
+    let neg = int_sub(BN256_TWO_POW_32, x)
+    return _bn256_mask32(neg)
+}
+
+// Compute R^2 mod N where R = 2^256. Used to enter Montgomery form:
+//   to_mont(x) = (x * R) mod N = mont_mul(x, r2_mod_n)
+// Construction: 2^256 is hi=1, lo=0 in the (hi, lo) split; reduce via
+// `_bn256_mod512` to get R mod N; square via `bn256_modmul`. This is
+// a ONE-TIME cost per modulus -- amortized across every Montgomery op
+// that follows.
+fn _bn256_compute_r2_mod_n(N) {
+    let hi = bn256_from_int(1)
+    let lo = _bn256_alloc_zero()
+    let r_mod_n = _bn256_mod512(hi, lo, N)
+    return bn256_modmul(r_mod_n, r_mod_n, N)
+}
+
+// Montgomery context: precomputed values for a fixed modulus N.
+//   ctx[0] = n_prime0   (32-bit -N^-1 mod 2^32)
+//   ctx[1] = r2_mod_n   (R^2 mod N, used by to_mont)
+//   ctx[2] = N          (the modulus itself; kept for the final
+//                        conditional subtract + from-Mont conversion)
+//   ctx[3] = N_LIMBS    (= 8; held for clarity / future generalization)
+//
+// Allocating a context is amortized over every Montgomery operation on
+// the same modulus. One DH session does dozens of modpow_ct on the
+// same prime; the per-context precompute cost (one bit-by-bit reduce
+// + one schoolbook modmul) is paid ONCE.
+fn bn256_mont_ctx_new(N) {
+    let ctx = list_new()
+    let n0 = N[0]
+    let nprime0 = _bn256_compute_n_prime0(n0)
+    let r2 = _bn256_compute_r2_mod_n(N)
+    push(ctx, nprime0)
+    push(ctx, r2)
+    push(ctx, _bn256_clone(N))
+    push(ctx, BN256_LIMBS)
+    return ctx
+}
+
+// CIOS Montgomery multiplication: compute (a * b * R^-1) mod N. When a
+// and b are both in Montgomery form (a = a' * R mod N, b = b' * R mod N),
+// the result is (a' * b' * R) mod N -- i.e., (a'*b')_mont.
+//
+// CIOS interleaves the schoolbook multiply with the reduction. For each
+// outer iteration i in 0..N-1:
+//   1. Multiply step: t += a * b[i]  (t is an N+1-limb accumulator).
+//   2. Reduction step: m = t[0] * nprime0 mod 2^32; t += m * N; t >>= 32.
+// After N iterations, t < 2*N mathematically; a final conditional
+// subtract of N produces the canonical [0, N) result.
+//
+// All 32x32 -> 64 multiplies are INLINED (16-bit-half splits) so the
+// hot path allocates ZERO new lists per outer iter past the one-shot
+// 9-limb accumulator. The 2048-bit module's experience: the helper-
+// function form (a `[lo, hi]` returning helper) allocated ~32M short-
+// lived pairs per modpow at 2048 bits and OOMed at 14GB. At 256 bits
+// the same anti-pattern would allocate ~512k pairs per modpow; still
+// punishing, hence the same inline policy here.
+fn bn256_montmul(a, b, ctx) {
+    let nprime0 = ctx[0]
+    let N = ctx[2]
+    let t = _bn256_alloc_zero_n(BN256_LIMBS_PLUS_ONE)
+    let i = 0
+    while i < BN256_LIMBS {
+        let b_i = b[i]
+        let b_i_lo = int_and(b_i, BN256_MASK16)
+        let b_i_hi = int_and(int_shr(b_i, 16), BN256_MASK16)
+        // Multiply step: t += a * b_i, propagating limb-wise carries.
+        let carry = 0
+        let j = 0
+        while j < BN256_LIMBS {
+            let aj = a[j]
+            let aj_lo = int_and(aj, BN256_MASK16)
+            let aj_hi = int_and(int_shr(aj, 16), BN256_MASK16)
+            let ll = int_mul(aj_lo, b_i_lo)
+            let lh = int_mul(aj_lo, b_i_hi)
+            let hl = int_mul(aj_hi, b_i_lo)
+            let hh = int_mul(aj_hi, b_i_hi)
+            let mid = int_add(lh, hl)
+            let b1_sum = int_add(int_shr(ll, 16), int_and(mid, BN256_MASK16))
+            let plo = int_or(int_and(ll, BN256_MASK16),
+                             int_shl(int_and(b1_sum, BN256_MASK16), 16))
+            let phi = int_add(int_add(hh, int_shr(mid, 16)),
+                              int_shr(b1_sum, 16))
+            let s_lo = int_add(int_add(t[j], plo), carry)
+            list_set(t, j, _bn256_mask32(s_lo))
+            carry = int_add(phi, int_shr(s_lo, 32))
+            j = j + 1
+        }
+        // Add final carry into t[N]; spillover beyond t[N] becomes t_overflow.
+        let tn_sum = int_add(t[BN256_LIMBS], carry)
+        list_set(t, BN256_LIMBS, _bn256_mask32(tn_sum))
+        let t_overflow = int_shr(tn_sum, 32)
+
+        // Reduction step: m = t[0] * nprime0 mod 2^32; t += m * N; t >>= 32.
+        // Inlined 32x32 -> low-32 only (we only need m's low 32 bits).
+        let np_lo = int_and(nprime0, BN256_MASK16)
+        let np_hi = int_and(int_shr(nprime0, 16), BN256_MASK16)
+        let t0 = t[0]
+        let t0_lo = int_and(t0, BN256_MASK16)
+        let t0_hi = int_and(int_shr(t0, 16), BN256_MASK16)
+        let m_mid = int_add(int_mul(t0_lo, np_hi), int_mul(t0_hi, np_lo))
+        let m = _bn256_mask32(int_add(int_mul(t0_lo, np_lo),
+                                      int_shl(int_and(m_mid, BN256_MASK16), 16)))
+        let m_lo = int_and(m, BN256_MASK16)
+        let m_hi = int_and(int_shr(m, 16), BN256_MASK16)
+        // First inner: by Montgomery's construction the low 32 bits of
+        // t[0] + m * N[0] are zero; discard the result and propagate
+        // only the carry-into-hi. Inlined 32x32 (avoid per-iter alloc).
+        let N0 = N[0]
+        let N0_lo = int_and(N0, BN256_MASK16)
+        let N0_hi = int_and(int_shr(N0, 16), BN256_MASK16)
+        let ll0 = int_mul(m_lo, N0_lo)
+        let lh0 = int_mul(m_lo, N0_hi)
+        let hl0 = int_mul(m_hi, N0_lo)
+        let hh0 = int_mul(m_hi, N0_hi)
+        let mid0 = int_add(lh0, hl0)
+        let b1_sum0 = int_add(int_shr(ll0, 16), int_and(mid0, BN256_MASK16))
+        let p0_lo = int_or(int_and(ll0, BN256_MASK16),
+                           int_shl(int_and(b1_sum0, BN256_MASK16), 16))
+        let p0_hi = int_add(int_add(hh0, int_shr(mid0, 16)),
+                            int_shr(b1_sum0, 16))
+        let s0 = int_add(t[0], p0_lo)
+        let carry2 = int_add(p0_hi, int_shr(s0, 32))
+        // Inner reduce loop: for j = 1..N-1, t[j-1] = t[j] + m*N[j] + carry2.
+        let jj = 1
+        while jj < BN256_LIMBS {
+            let Nj = N[jj]
+            let Nj_lo = int_and(Nj, BN256_MASK16)
+            let Nj_hi = int_and(int_shr(Nj, 16), BN256_MASK16)
+            let llj = int_mul(m_lo, Nj_lo)
+            let lhj = int_mul(m_lo, Nj_hi)
+            let hlj = int_mul(m_hi, Nj_lo)
+            let hhj = int_mul(m_hi, Nj_hi)
+            let midj = int_add(lhj, hlj)
+            let b1_sumj = int_add(int_shr(llj, 16), int_and(midj, BN256_MASK16))
+            let pj_lo = int_or(int_and(llj, BN256_MASK16),
+                               int_shl(int_and(b1_sumj, BN256_MASK16), 16))
+            let pj_hi = int_add(int_add(hhj, int_shr(midj, 16)),
+                                int_shr(b1_sumj, 16))
+            let s_lo = int_add(int_add(t[jj], pj_lo), carry2)
+            list_set(t, jj - 1, _bn256_mask32(s_lo))
+            carry2 = int_add(pj_hi, int_shr(s_lo, 32))
+            jj = jj + 1
+        }
+        // Tail: t[N-1] = t[N] + carry2; new t[N] = t_overflow + spill.
+        let tail = int_add(t[BN256_LIMBS], carry2)
+        list_set(t, BN256_LIMBS - 1, _bn256_mask32(tail))
+        let tail_carry = int_shr(tail, 32)
+        list_set(t, BN256_LIMBS, _bn256_mask32(int_add(t_overflow, tail_carry)))
+        i = i + 1
+    }
+    // Result candidate: t[0..N-1]. Mathematically result < 2*N; one
+    // conditional subtract of N produces the canonical [0, N) value.
+    let result = _bn256_alloc_zero()
+    let k = 0
+    while k < BN256_LIMBS {
+        list_set(result, k, t[k])
+        k = k + 1
+    }
+    if t[BN256_LIMBS] != 0 {
+        _bn256_sub_inplace(result, N)
+    } else {
+        if bn256_cmp(result, N) >= 0 {
+            _bn256_sub_inplace(result, N)
+        }
+    }
+    return result
+}
+
+// Enter Montgomery form: x_mont = (x * R) mod N = mont_mul(x, R^2 mod N).
+// The mont_mul "removes" one factor of R, so multiplying x (no R factor)
+// by R^2 gives (x * R^2 * R^-1) mod N = x * R mod N.
+//
+// Precondition: x < N. bn256_modpow_ct reduces inputs first.
+fn bn256_to_mont(x, ctx) {
+    let r2 = ctx[1]
+    return bn256_montmul(x, r2, ctx)
+}
+
+// Leave Montgomery form: x = mont_mul(x_mont, 1). The mont_mul
+// "removes" one factor of R: (x * R * 1 * R^-1) mod N = x mod N.
+fn bn256_from_mont(x_mont, ctx) {
+    let one = bn256_from_int(1)
+    return bn256_montmul(x_mont, one, ctx)
+}
+
+// Modular exponentiation via Montgomery REDC. Behavior IDENTICAL to
+// the bit-by-bit modpow_ct: walks every bit of the exponent (constant-
+// time per bit) and always performs both a modular multiply and a
+// modular square per iteration (Montgomery ladder; exponent-bit-
+// INDEPENDENT loop body).
+//
+// Per-bit cost shifts from (one bit-by-bit reduce ~1.5k limb-ops) to
+// (one CIOS mont_mul ~64 limb-mults) -- the headline ~5-8x speedup.
+fn bn256_modpow_ct_mont(base, exp, ctx) {
+    let N = ctx[2]
+    let base_reduced = bn256_mod(base, N)
+    let r0 = bn256_to_mont(bn256_from_int(1), ctx)
+    let r1 = bn256_to_mont(base_reduced, ctx)
+    let i = BN256_TOTAL_BITS - 1
+    while i >= 0 {
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let b = int_and(int_shr(exp[limb_idx], bit_idx), 1)
+        if b == 0 {
+            r1 = bn256_montmul(r0, r1, ctx)
+            r0 = bn256_montmul(r0, r0, ctx)
+        } else {
+            r0 = bn256_montmul(r0, r1, ctx)
+            r1 = bn256_montmul(r1, r1, ctx)
+        }
+        i = i - 1
+    }
+    return bn256_from_mont(r0, ctx)
+}
+
+// Legacy bit-by-bit Montgomery-ladder modpow (the pre-REDC implementation).
+// Retained as:
+//   (a) Fallback for EVEN moduli: Montgomery REDC requires gcd(N, R) = 1,
+//       i.e., N odd. Every standard DH safe prime is odd by construction,
+//       but a synthetic caller could pass an even modulus -- in which
+//       case the public `bn256_modpow_ct` falls back here.
+//   (b) Equivalence anchor in the unit-test sweep: the new Mont path
+//       is compared bit-exactly against this legacy path over a small
+//       sweep of deterministic pseudo-random vectors (proves
+//       correctness) plus one cross-check on the Curve25519 prime.
+fn _bn256_modpow_ct_legacy(base, exp, m) {
+    if bn256_zero(m) != 0 {
+        return _bn256_clone(base)
+    }
+    let one = bn256_from_int(1)
+    if bn256_eq(m, one) != 0 {
+        return _bn256_alloc_zero()
+    }
+    let r0 = bn256_from_int(1)
+    let r1 = bn256_mod(base, m)
+    let i = BN256_TOTAL_BITS - 1
+    while i >= 0 {
+        let limb_idx = int_shr(i, 5)
+        let bit_idx  = int_and(i, 31)
+        let b = int_and(int_shr(exp[limb_idx], bit_idx), 1)
+        if b == 0 {
+            r1 = bn256_modmul(r0, r1, m)
+            r0 = bn256_modmul(r0, r0, m)
+        } else {
+            r0 = bn256_modmul(r0, r1, m)
+            r1 = bn256_modmul(r1, r1, m)
+        }
+        i = i - 1
+    }
+    return r0
+}
+
+// ---- modular exponentiation (CT only) -----------------------------------
+//
+// Constant-time modular exponentiation via the Montgomery ladder, now
+// with Montgomery REDC under the hood. IDENTICAL ALGORITHM SHAPE to
+// bignum.nova's bn_modpow_ct, just routed through Montgomery form:
+//
+//   R0 = 1, R1 = base mod m
+//   for i = bit_len - 1 DOWN TO 0:
+//     b = exp.bit(i)
+//     if b == 0:
+//         R1 = R0 * R1 mod m
+//         R0 = R0 * R0 mod m
+//     else:
+//         R0 = R0 * R1 mod m
+//         R1 = R1 * R1 mod m
+//   return R0
+//
+// Internally, this delegates to `bn256_modpow_ct_mont` (CIOS
+// Montgomery multiplication) after building a Montgomery context for m.
+// Externally bit-exact with the pre-Montgomery legacy implementation
+// (`_bn256_modpow_ct_legacy`); the equivalence sweep in
+// tests/unit/test_bignum_256.nova proves this.
+//
+// Returns base^exp mod m, 256-bit. Edge cases match bn_modpow_ct:
+//   - m == 0   -> returns a clone of base
+//   - m == 1   -> returns 0
+//   - exp == 0 -> returns 1
+//   - m even   -> falls back to legacy bit-by-bit path (Montgomery REDC
+//                 requires gcd(N, R) = 1; R = 2^256 so N must be odd).
+fn bn256_modpow_ct(base, exp, m) {
+    if bn256_zero(m) != 0 {
+        return _bn256_clone(base)
+    }
+    let one = bn256_from_int(1)
+    if bn256_eq(m, one) != 0 {
+        return _bn256_alloc_zero()
+    }
+    // Montgomery REDC requires gcd(N, R) = 1. R = 2^256, so N must be
+    // odd. For even N, fall back to the legacy path -- correct, slow,
+    // but only reachable for synthetic non-DH call sites.
+    if int_and(m[0], 1) == 0 {
+        return _bn256_modpow_ct_legacy(base, exp, m)
+    }
+    let ctx = bn256_mont_ctx_new(m)
+    return bn256_modpow_ct_mont(base, exp, ctx)
+}
+
+// ---- Curve25519 field-prime constant -------------------------------------
+//
+// p = 2^255 - 19, the Curve25519 field prime. Used by X25519 ECDH, the
+// ChaCha20-Poly1305 Poly1305 MAC (over a clamped field; the Curve25519
+// prime is the canonical 256-bit prime for crypto code), and DH-256
+// fallbacks. Hex form: 0x7fff...ffed (top byte 0x7f because bit 255 is
+// clear; low byte 0xed because of the -19 offset).
+//
+// Lazily produced via a function rather than as a let-global so the
+// 8-limb allocation cost is paid only on first call from any importer.
+fn bn256_curve25519_p() {
+    return bn256_from_hex(
+        "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed")
+}

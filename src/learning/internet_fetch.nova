@@ -1,0 +1,265 @@
+// CrossEngin learning: internet fetching.
+//
+// Purpose
+//   The whitelisted, rate-limited fetch pipeline (ADR-0028): host whitelist gate
+//   (ADR-0028), rate limiting (30 requests/hour, <=1 in-flight, >=2s per
+//   domain), a URL cache (cache hits bypass the limiter), content validation
+//   (allowed content types, <=2MB), and ingestion of fetched content as
+//   provenance=fetched evidence weighted by source tier (ADR-0029).
+//
+//   The actual TLS byte retrieval is NOT performed here -- it is NOVA
+//   enhancement #11 (no verified TLS/socket stack), and outbound network is
+//   governed by the environment policy. This module gates a request
+//   (if_permit), and ingests a body supplied by the transport (if_ingest);
+//   the agent/ops layer wires the transport between them. No fetched bytes ever
+//   reach an LLM (ADR-0014).
+//
+// ADRs implemented: ADR-0028 (whitelist, rate limit, cache, validation,
+//   ingestion), ADR-0029 (source-tier evidence). NOVA dependencies: builtins.
+//   CrossEngin dependencies: src/learning/source_whitelist.nova,
+//   src/learning/source_authority.nova, src/kg/multi_kg_manager.nova.
+
+import "source_whitelist.nova"
+import "source_authority.nova"
+import "../kg/multi_kg_manager.nova"
+import "../io/transducers/http_client.nova"
+
+// ---- result tags (ADR-0028) -----------------------------------------------
+let FETCH_OK           = 1
+let FETCH_DENIED_HOST  = 2
+let FETCH_RATE_LIMITED = 3
+let FETCH_INVALID      = 4
+let FETCH_CACHE_HIT    = 5
+
+// ---- limits ---------------------------------------------------------------
+let IF_MAX_PER_HOUR   = 30
+let IF_HOUR           = 3600
+let IF_DOMAIN_SPACING = 2          // >= 2s between requests to the same host
+let IF_MAX_BYTES      = 2097152    // 2MB
+let IF_TTL_DEFAULT    = 604800     // 7 days
+
+// ---- fetcher --------------------------------------------------------------
+let IF_TAG   = 0
+let IF_WL    = 1
+let IF_AUTH  = 2
+let IF_RL    = 3   // [window_start, count, in_flight, per-domain list]
+let IF_CACHE = 4   // list of [url, body, expiry]
+
+let RL_WSTART  = 0
+let RL_COUNT   = 1
+let RL_INFLT   = 2
+let RL_DOMAINS = 3
+
+fn if_fetcher_new(whitelist, authority) {
+    let rl = list_new()
+    push(rl, -100000)   // window start in the past
+    push(rl, 0)         // count
+    push(rl, 0)         // in-flight
+    push(rl, list_new())// per-domain [host, last_time]
+    let f = list_new()
+    push(f, IF_TAG)
+    push(f, whitelist)
+    push(f, authority)
+    push(f, rl)
+    push(f, list_new())
+    return f
+}
+
+// ---- cache ----------------------------------------------------------------
+fn _if_cache_index(f, url) {
+    let c = f[IF_CACHE]
+    let i = 0
+    while i < len(c) {
+        if str_eq(c[i][0], url) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn if_cache_has(f, url, now) {
+    let idx = _if_cache_index(f, url)
+    if idx == -1 { return 0 }
+    if f[IF_CACHE][idx][2] <= now { return 0 }   // expired
+    return 1
+}
+
+fn if_cache_get(f, url, now) {
+    if if_cache_has(f, url, now) == 0 { return "" }
+    return f[IF_CACHE][_if_cache_index(f, url)][1]
+}
+
+fn if_cache_put(f, url, body, ttl, now) {
+    let idx = _if_cache_index(f, url)
+    if idx == -1 {
+        let e = list_new(); push(e, url); push(e, body); push(e, now + ttl)
+        push(f[IF_CACHE], e)
+    } else {
+        list_set(f[IF_CACHE][idx], 1, body)
+        list_set(f[IF_CACHE][idx], 2, now + ttl)
+    }
+    return 1
+}
+
+// ---- per-domain spacing ---------------------------------------------------
+fn _if_domain_last(rl, host) {
+    let d = rl[RL_DOMAINS]
+    let i = 0
+    while i < len(d) {
+        if str_eq(d[i][0], host) == 1 { return d[i][1] }
+        i = i + 1
+    }
+    return -100000
+}
+
+fn _if_domain_set(rl, host, now) {
+    let d = rl[RL_DOMAINS]
+    let i = 0
+    while i < len(d) {
+        if str_eq(d[i][0], host) == 1 { list_set(d[i], 1, now); return 1 }
+        i = i + 1
+    }
+    let e = list_new(); push(e, host); push(e, now)
+    push(d, e)
+    return 1
+}
+
+// Gate a request. Returns a FETCH_* tag. On FETCH_OK the request is recorded as
+// in-flight; the caller performs the transport and then calls if_complete.
+fn if_permit(f, url, now) {
+    if if_cache_has(f, url, now) == 1 { return FETCH_CACHE_HIT }
+    if sw_check(f[IF_WL], url) == 0 { return FETCH_DENIED_HOST }
+    let rl = f[IF_RL]
+    if now - rl[RL_WSTART] >= IF_HOUR {
+        list_set(rl, RL_WSTART, now)
+        list_set(rl, RL_COUNT, 0)
+    }
+    if rl[RL_COUNT] >= IF_MAX_PER_HOUR { return FETCH_RATE_LIMITED }
+    if rl[RL_INFLT] >= 1 { return FETCH_RATE_LIMITED }
+    if now - _if_domain_last(rl, sw_host(url)) < IF_DOMAIN_SPACING { return FETCH_RATE_LIMITED }
+    list_set(rl, RL_COUNT, rl[RL_COUNT] + 1)
+    list_set(rl, RL_INFLT, 1)
+    _if_domain_set(rl, sw_host(url), now)
+    return FETCH_OK
+}
+
+// Mark the in-flight request complete (the transport returned).
+fn if_complete(f) {
+    list_set(f[IF_RL], RL_INFLT, 0)
+    return 1
+}
+
+fn if_in_flight(f) { return f[IF_RL][RL_INFLT] }
+fn if_request_count(f) { return f[IF_RL][RL_COUNT] }
+
+// Validate a response: allowed content type and within the size cap.
+fn if_validate(content_type, byte_count) {
+    if byte_count > IF_MAX_BYTES { return 0 }
+    if str_eq(content_type, "text/html") == 1 { return 1 }
+    if str_eq(content_type, "application/json") == 1 { return 1 }
+    if str_eq(content_type, "text/plain") == 1 { return 1 }
+    return 0
+}
+
+// Ingest a fetched body into the domain KG as provenance=fetched evidence,
+// weighted by the source tier, and cache it. Returns the atom, or 0 if the
+// content failed validation.
+fn if_ingest(f, domain_kg, url, content_type, body, byte_count, now) {
+    if if_validate(content_type, byte_count) == 0 { return 0 }
+    let tier = sa_tier(f[IF_AUTH], url)
+    let a = kg_add_atom(domain_kg, ATOM_FACT, url, now)
+    atom_payload_set(a, "fetched", body)
+    atom_payload_set(a, "provenance", "fetched")
+    atom_payload_set(a, "source_tier", tier)
+    let b = atom_belief(a)
+    list_set(b, 0, b[0] + sa_increment(tier))
+    if_cache_put(f, url, body, IF_TTL_DEFAULT, now)
+    return a
+}
+
+fn if_is_fetched(atom) {
+    if str_eq(atom_payload_get(atom, "provenance"), "fetched") == 1 { return 1 }
+    return 0
+}
+
+// ---- transport dispatch (P1.4 / NOVA enhancement #11, Mode 3 wiring) -----
+//
+// Mode 3 of P1.4 -- thin auto-escalating dispatch sitting between the gated
+// fetch (`if_permit` returning FETCH_OK) and the eventual `if_ingest` call.
+// The whitelist / rate-limit / cache wrapping is UNCHANGED -- callers should
+// still call `if_permit` before this and `if_complete` + `if_ingest` after.
+//
+//   if_dispatch_transport(url, max_bytes)
+//     -> [tag, status_code, body, error_msg]
+//
+//   tag values:
+//     IF_TRANSPORT_HTTP_OK   1  in-process plain HTTP succeeded.
+//                                Body is the response bytes (capped to
+//                                max_bytes), status_code is the HTTP integer
+//                                (200, 404, 301, ...).
+//     IF_TRANSPORT_HTTP_ERR  2  plain HTTP attempted, transport / parse
+//                                failed. error_msg carries the HTTP_ERR_*
+//                                tag, body is "".
+//     IF_TRANSPORT_DEFERRED  3  scheme is https -- this seam is deferred to
+//                                the existing scripts/learn.sh curl shim.
+//                                See TLS_AUDIT.md for the roadmap. The
+//                                caller should fall back to the curl path
+//                                (the agent already does -- this is the
+//                                no-regression branch). error_msg carries a
+//                                human-readable "deferred" note.
+//     IF_TRANSPORT_BAD_URL   4  URL was unparseable. error_msg explains.
+//
+// Why this lives in internet_fetch and not http_client: the whitelist gate +
+// rate limit + ingestion path all sit here, so this is the natural seam
+// where the http/https branch is decided.
+
+let IF_TRANSPORT_HTTP_OK   = 1
+let IF_TRANSPORT_HTTP_ERR  = 2
+let IF_TRANSPORT_DEFERRED  = 3
+let IF_TRANSPORT_BAD_URL   = 4
+
+// Build a uniform 4-slot transport result.
+fn _if_transport_result(tag, status, body, err) {
+    let r = list_new()
+    push(r, tag)
+    push(r, status)
+    push(r, body)
+    push(r, err)
+    return r
+}
+
+fn if_dispatch_transport(url, max_bytes) {
+    let parts = http_parse_url(url)
+    let scheme = parts[0]
+    if len(scheme) == 0 {
+        return _if_transport_result(IF_TRANSPORT_BAD_URL, 0, "", HTTP_ERR_MALFORMED)
+    }
+    if str_eq(scheme, "https") == 1 {
+        // Deferred seam -- caller should fall through to scripts/learn.sh.
+        // TLS_AUDIT.md tracks the roadmap; until then the curl shim is the
+        // production path for https.
+        return _if_transport_result(IF_TRANSPORT_DEFERRED, 0, "",
+            "https deferred to scripts/learn.sh -- see TLS_AUDIT.md")
+    }
+    if str_eq(scheme, "http") == 1 {
+        let resp = http_get(url, max_bytes)
+        let status = resp[0]
+        let body   = resp[2]
+        let err    = resp[3]
+        if status == 0 {
+            return _if_transport_result(IF_TRANSPORT_HTTP_ERR, 0, "", err)
+        }
+        // HTTP_ERR_TOO_LARGE is delivered as a success-with-warning -- the
+        // body slot still has up-to-max_bytes worth of data, and status is
+        // populated. Callers may want to treat 4xx/5xx as failure on the
+        // ingest side; we leave that policy to them so the dispatcher
+        // stays a pure transport.
+        return _if_transport_result(IF_TRANSPORT_HTTP_OK, status, body, err)
+    }
+    return _if_transport_result(IF_TRANSPORT_BAD_URL, 0, "", HTTP_ERR_SCHEME)
+}
+
+// Convenience accessors for the 4-slot transport record. Pure sugar.
+fn if_tr_tag(r)    { return r[0] }
+fn if_tr_status(r) { return r[1] }
+fn if_tr_body(r)   { return r[2] }
+fn if_tr_err(r)    { return r[3] }

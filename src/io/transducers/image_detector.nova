@@ -1,0 +1,887 @@
+// CrossEngin io/transducers: HOG-based sliding-window object detector
+// (R15C -- classical Dalal-Triggs detector built on the R14D dense HOG
+// descriptor).
+//
+// Purpose
+//   R14D landed the HOG dense descriptor; the canonical downstream use
+//   is pedestrian / object detection via a sliding-window classifier.
+//   Dalal-Triggs (CVPR 2005) trained a linear SVM on the HOG vector of
+//   a 64x128 window and slid that classifier across the image at every
+//   position; positions where the SVM score crosses a threshold are
+//   declared detections, then non-maximum suppression collapses
+//   overlapping windows. A non-LLM, integer-only CrossEngin substrate
+//   cannot train an SVM the way Dalal-Triggs did, but the same
+//   pipeline works with a simpler classifier: TEMPLATE MATCHING via
+//   L1-distance comparison between every window's HOG vector and a
+//   stored template HOG (the descriptor of a single positive example).
+//   Windows whose distance falls below a threshold are detections.
+//   This is the "1-shot" version of the same algorithm, well-suited to
+//   the substrate's no-training-data design constraint, and matches
+//   the way orb_match (R6D) uses Hamming distance between rBRIEF
+//   descriptors for keypoint correspondence rather than a trained
+//   classifier.
+//
+// Algorithm (sliding-window HOG matching)
+//   1. det_train_template(image, w, h, hog_window_w, hog_window_h)
+//      -- compute hog_compute_default on the WHOLE input image (or a
+//      sub-image of the requested window size); return the HOG result.
+//      The template is later compared via hog_compare against every
+//      candidate window's HOG.
+//   2. det_sliding_window(image, w, h, template, threshold_milli,
+//                          stride) -- walk (x, y) over the image at the
+//      requested stride; for each candidate window of the template's
+//      dimensions, extract the sub-image, compute its HOG, compare via
+//      hog_compare (L1 distance over the L2-Hys normalized
+//      descriptors), and accept the position if distance < threshold.
+//      Returns a list of [x, y, distance] triples.
+//   3. det_nms(detections, overlap_iou_milli) -- IoU-based
+//      non-maximum suppression: sort detections by ascending distance,
+//      then greedily keep each detection and discard any that overlap
+//      a kept one with IoU >= overlap_iou_milli / 1000.
+//   4. det_detect(image, w, h, template, threshold_milli, stride,
+//                  nms_iou_milli) -- convenience wrapper that runs
+//      sliding-window + NMS in sequence.
+//
+// Public API
+//   det_train_template(image, w, h, hog_window_w, hog_window_h) -> hog_result
+//   det_sliding_window(image, w, h, template, threshold_milli, stride)
+//       -> list of [x, y, distance_milli]
+//   det_nms(detections, overlap_iou_milli) -> filtered list (same shape)
+//   det_detect(image, w, h, template, threshold_milli, stride, nms_iou_milli)
+//       -> filtered list of [x, y, distance_milli]
+//   det_result_x(d) / _y / _distance -- accessors for a detection triple.
+//   det_pgm_args(arg) -> formatted result string for the chat /detect
+//       admin command. Format: "/detect TEMPLATE.pgm SCENE.pgm".
+//
+// Caps:
+//   image  dim <= 256 (DET_MAX_IMAGE_DIM)
+//   template dim <= 128 (DET_MAX_TEMPLATE_DIM)
+//   stride in [4, 32]; defaults to DET_DEFAULT_STRIDE = 8.
+//   zero / negative stride is clamped to DET_DEFAULT_STRIDE.
+//
+// Performance budget
+//   Brute force: for a 256x256 image with a 32x32 template at stride 8,
+//   the candidate grid is (256-32)/8 + 1 = 29 across and 29 down -> 841
+//   windows. Each window runs hog_compute_default(32x32) -- the R14D
+//   profile measures ~100ms per HOG on the reference fixture -> ~84s
+//   per image. The default DET_DEFAULT_STRIDE = 8 trades 4x more
+//   windows for finer localization; chat callers can pass a coarser
+//   stride for interactive use. The unit tests stick to small fixtures
+//   (64x64 scenes, 32x32 templates) where the search completes in
+//   well under a second.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub, getenv, str_eq, char_at,
+//   substr, int_to_str.
+// CrossEngin dependencies: image_pgm.nova (chat helper PGM parse),
+//   image_hog.nova (HOG compute + compare).
+
+import "image_pgm.nova"
+import "image_hog.nova"
+
+// ---- caps + defaults ------------------------------------------------------
+
+let DET_MAX_IMAGE_DIM     = 256
+let DET_MAX_TEMPLATE_DIM  = 128
+let DET_MIN_TEMPLATE_DIM  = 16     // HOG needs >= 16 per axis (2 cells of 8)
+
+let DET_STRIDE_MIN        = 4
+let DET_STRIDE_MAX        = 32
+let DET_DEFAULT_STRIDE    = 8
+
+// Default L1 distance threshold (milli units): two HOG vectors are
+// considered "matching" if their L1 distance < this. The R14D HOG
+// descriptor lives in the [0, 200] milli range per component; for a
+// 32x32 fixture (324 ints) the max possible L1 distance is bounded by
+// 2 * 200 * 324 ~= 130K. Empirically, identical-content windows score
+// 0 (the template equals itself), uniform-background windows score
+// around 3000 milli on simple vertical-edge templates (the descriptor
+// is all-zero so L1 reduces to the L1 norm of the template), and
+// completely-different vertical-vs-horizontal edges score 10K+. A
+// default of 4000 milli sits in the "near-identical" band -- it
+// catches the actual template match while rejecting uniform
+// background, but admits some tolerance for noise and slight
+// translation across the cell-stride boundary. Callers can tune this
+// per use case via the threshold_milli parameter to det_sliding_window.
+let DET_DEFAULT_THRESHOLD_MILLI = 4000
+
+// Default NMS IoU threshold (milli): two detections overlap if their
+// bounding-box IoU >= this fraction. 300 milli = 0.30 IoU is the same
+// number that the original Dalal-Triggs paper used for pedestrian NMS.
+let DET_DEFAULT_NMS_IOU_MILLI = 300
+
+// ---- detection-triple slots ----------------------------------------------
+//
+// A detection is a 3-element list [x, y, distance_milli]:
+//   [0] x in pixels (top-left of the matching window)
+//   [1] y in pixels
+//   [2] distance_milli (L1 distance from the template)
+
+let DET_D_X        = 0
+let DET_D_Y        = 1
+let DET_D_DISTANCE = 2
+
+fn _det_new_detection(x, y, distance) {
+    let d = list_new()
+    push(d, x)
+    push(d, y)
+    push(d, distance)
+    return d
+}
+
+fn det_result_x(d)        { return d[DET_D_X] }
+fn det_result_y(d)        { return d[DET_D_Y] }
+fn det_result_distance(d) { return d[DET_D_DISTANCE] }
+
+// ---- sub-image extraction -------------------------------------------------
+//
+// Allocate a fresh buffer of (win_w * win_h) bytes and copy the
+// rectangle of `image` starting at (x0, y0). The window is fully
+// in-bounds (the caller guarantees x0 + win_w <= w and y0 + win_h <= h).
+// Append a trailing zero byte so the buffer is C-string-safe for any
+// downstream loader that wants to scan with str_eq sentinels.
+
+fn _det_extract_window(image, w, h, x0, y0, win_w, win_h) {
+    let area = int_mul(win_w, win_h)
+    let buf = alloc(int_add(area, 1))
+    let y = 0
+    while y < win_h {
+        let src_row = int_mul(int_add(y0, y), w)
+        let dst_row = int_mul(y, win_w)
+        let x = 0
+        while x < win_w {
+            store8(int_add(buf, int_add(dst_row, x)),
+                   load8(int_add(image, int_add(src_row, int_add(x0, x)))))
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    store8(int_add(buf, area), 0)
+    return buf
+}
+
+// ---- stride validation ----------------------------------------------------
+
+fn _det_clamp_stride(stride) {
+    if stride <= 0 { return DET_DEFAULT_STRIDE }
+    if stride < DET_STRIDE_MIN { return DET_STRIDE_MIN }
+    if stride > DET_STRIDE_MAX { return DET_STRIDE_MAX }
+    return stride
+}
+
+// ---- public: det_train_template ------------------------------------------
+//
+// det_train_template(image, w, h, hog_window_w, hog_window_h)
+//   Compute and return the HOG descriptor for a positive-example image.
+//   If hog_window_w / hog_window_h match w / h (the typical case where
+//   the template fixture is exactly window-sized) we compute HOG on the
+//   whole image. If the requested window is SMALLER than the image, we
+//   extract the centered sub-image and compute HOG on that sub-image
+//   instead -- callers can fold a crop step into the same call.
+//
+// Returns the same hog_result tuple that hog_compute returns; an empty
+// result (per _hog_empty_result) signals an invalid template.
+
+fn det_train_template(image, w, h, hog_window_w, hog_window_h) {
+    if image == 0  { return hog_compute_default(0, hog_window_w, hog_window_h) }
+    if w <= 0      { return hog_compute_default(0, hog_window_w, hog_window_h) }
+    if h <= 0      { return hog_compute_default(0, hog_window_w, hog_window_h) }
+    if hog_window_w < DET_MIN_TEMPLATE_DIM {
+        return hog_compute_default(0, hog_window_w, hog_window_h)
+    }
+    if hog_window_h < DET_MIN_TEMPLATE_DIM {
+        return hog_compute_default(0, hog_window_w, hog_window_h)
+    }
+    if hog_window_w > DET_MAX_TEMPLATE_DIM {
+        return hog_compute_default(0, hog_window_w, hog_window_h)
+    }
+    if hog_window_h > DET_MAX_TEMPLATE_DIM {
+        return hog_compute_default(0, hog_window_w, hog_window_h)
+    }
+    if hog_window_w > w {
+        return hog_compute_default(0, hog_window_w, hog_window_h)
+    }
+    if hog_window_h > h {
+        return hog_compute_default(0, hog_window_w, hog_window_h)
+    }
+    if hog_window_w == w {
+        if hog_window_h == h {
+            return hog_compute_default(image, w, h)
+        }
+    }
+    // Centered crop.
+    let x0 = (w - hog_window_w) / 2
+    let y0 = (h - hog_window_h) / 2
+    let buf = _det_extract_window(image, w, h, x0, y0, hog_window_w, hog_window_h)
+    return hog_compute_default(buf, hog_window_w, hog_window_h)
+}
+
+// ---- public: det_sliding_window ------------------------------------------
+//
+// det_sliding_window(image, w, h, template, threshold_milli, stride)
+//   Slide a window of the template's dimensions across the image at
+//   the requested stride. For each candidate position, extract the
+//   sub-image, compute its HOG, and compare via hog_compare. Accept
+//   the position if hog_compare < threshold_milli.
+//
+// Returns a list of [x, y, distance] triples (possibly empty).
+//
+// R22A: integral-histogram fast path (CE_DETECTOR_INTEGRAL=on).
+//   When the env var is set, the per-image integral histogram (R21D)
+//   is built ONCE up-front; each candidate window's per-cell
+//   histograms are then recovered in O(NUM_BINS * 4) lookups per
+//   cell via _hog_ih_rect_sum on the precomputed planes. The build
+//   cost amortizes across the (~841 for 256x256 / 32x32 / stride 8)
+//   window queries at the same scale, realizing the structural win
+//   R21D flagged as a future wire-in. Bit-identical to the scalar
+//   path (asserted in tests/unit/test_detector_integral.nova).
+
+fn det_sliding_window(image, w, h, template, threshold_milli, stride) {
+    let dets = list_new()
+    if image == 0 { return dets }
+    if w <= 0 { return dets }
+    if h <= 0 { return dets }
+    if w > DET_MAX_IMAGE_DIM { return dets }
+    if h > DET_MAX_IMAGE_DIM { return dets }
+    let win_w = hog_result_width(template)
+    let win_h = hog_result_height(template)
+    if win_w < DET_MIN_TEMPLATE_DIM { return dets }
+    if win_h < DET_MIN_TEMPLATE_DIM { return dets }
+    if win_w > DET_MAX_TEMPLATE_DIM { return dets }
+    if win_h > DET_MAX_TEMPLATE_DIM { return dets }
+    if win_w > w { return dets }
+    if win_h > h { return dets }
+    let tpl_desc = hog_descriptor(template)
+    if len(tpl_desc) == 0 { return dets }
+    let s = _det_clamp_stride(stride)
+    // R22A: dispatch on CE_DETECTOR_INTEGRAL. Default OFF until
+    // operator validation. The integral path is bit-identical so
+    // both branches return the same detection list on the same
+    // inputs; only the wallclock differs.
+    if _det_integral_enabled() == 1 {
+        return _det_sliding_window_integral(image, w, h, template,
+                                             threshold_milli, s)
+    }
+    let max_x = int_sub(w, win_w)
+    let max_y = int_sub(h, win_h)
+    let y = 0
+    while y <= max_y {
+        let x = 0
+        while x <= max_x {
+            let win = _det_extract_window(image, w, h, x, y, win_w, win_h)
+            let win_hog = hog_compute_default(win, win_w, win_h)
+            let d = hog_compare(template, win_hog)
+            if d >= 0 {
+                if d < threshold_milli {
+                    push(dets, _det_new_detection(x, y, d))
+                }
+            }
+            x = int_add(x, s)
+        }
+        y = int_add(y, s)
+    }
+    return dets
+}
+
+// ---- R22A: integral-histogram amortized sliding window -------------------
+//
+// _det_integral_enabled() -> 1 if CE_DETECTOR_INTEGRAL is set to
+//   "on" / "1" / "yes". Default OFF; mirrors the R15A u8 SIMD and
+//   R21D HOG-integral opt-in shape.
+fn _det_integral_enabled() {
+    let env = getenv("CE_DETECTOR_INTEGRAL")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// _det_window_cell_hists_from_integral: lift R21D's
+// _hog_cell_histograms_from_integral to a SUB-RECTANGLE of the
+// full-image integral planes. The window at (x0, y0) of size
+// (win_w x win_h) has cells (cx, cy) covering full-image pixels
+//   x in [x0 + cx*cs .. x0 + (cx+1)*cs - 1]
+//   y in [y0 + cy*cs .. y0 + (cy+1)*cs - 1]
+// Clamped to the WINDOW's interior bounds (mirroring what
+// hog_compute_default(extracted_window, ...) would have used):
+//   x in [x0 + 1 .. x0 + win_w - 2]
+//   y in [y0 + 1 .. y0 + win_h - 2]
+// This is the precise contract that makes the integral path
+// bit-identical to the scalar path: the scalar path runs gradients
+// on the EXTRACTED window, where the outer-ring of the window has
+// gradient 0 because the central-difference reads would go out of
+// the window buffer. The full-image integral planes have non-zero
+// gradients at the window's outer ring (the full image has neighbors
+// there), so we MUST exclude that ring from each cell rectangle.
+//
+// HOT-LOOP OPTIMIZATION: the four-corner rectangle sum reads four
+// planes per bin, but the (y, x) coordinates of those corners are
+// IDENTICAL across all bins for a given cell. We hoist the
+// row-major flat indices (a = y2*w + x2, b = y2*w + (x1-1),
+// c = (y1-1)*w + x2, d = (y1-1)*w + (x1-1)) OUTSIDE the bin loop;
+// each bin then becomes
+//   ih_byte_addr = ih + 8 * (bin * planesize + flat_index)
+// where planesize = w * h. The 4-corner index recomputation per bin
+// collapses from 4 * _hog_ih_get calls (each of which calls
+// _hog_ih_idx -> 2 mul + 1 add -> 3 mul + 1 add for byte offset)
+// down to 4 adds + 4 loads.
+fn _det_window_cell_hists_from_integral(ih, w, h, x0, y0, win_w, win_h,
+                                         cells_x, cells_y,
+                                         cell_size, num_bins) {
+    let cell_hists = list_new()
+    let win_x_lo = int_add(x0, 1)
+    let win_y_lo = int_add(y0, 1)
+    let win_x_hi = int_sub(int_add(x0, win_w), 2)
+    let win_y_hi = int_sub(int_add(y0, win_h), 2)
+    let planesize = int_mul(w, h)        // ih plane stride (bin * planesize = bin offset)
+    let cy = 0
+    while cy < cells_y {
+        let y1 = int_add(y0, int_mul(cy, cell_size))
+        let y2 = int_sub(int_add(y0, int_mul(int_add(cy, 1), cell_size)), 1)
+        if y1 < win_y_lo { y1 = win_y_lo }
+        if y2 > win_y_hi { y2 = win_y_hi }
+        let cx = 0
+        while cx < cells_x {
+            let x1 = int_add(x0, int_mul(cx, cell_size))
+            let x2 = int_sub(int_add(x0, int_mul(int_add(cx, 1), cell_size)), 1)
+            if x1 < win_x_lo { x1 = win_x_lo }
+            if x2 > win_x_hi { x2 = win_x_hi }
+            let hist = list_new()
+            // Degenerate rectangle short-circuit. The scalar path's
+            // outer-ring clamp can collapse a cell to zero pixels for
+            // windows touching the full-image border. In that case
+            // every bin sum is zero -- emit an all-zero histogram
+            // without the load64 traffic.
+            if x1 > x2 {
+                let bz = 0
+                while bz < num_bins {
+                    push(hist, 0)
+                    bz = int_add(bz, 1)
+                }
+                push(cell_hists, hist)
+                cx = int_add(cx, 1)
+            }
+            else {
+                if y1 > y2 {
+                    let bzz = 0
+                    while bzz < num_bins {
+                        push(hist, 0)
+                        bzz = int_add(bzz, 1)
+                    }
+                    push(cell_hists, hist)
+                    cx = int_add(cx, 1)
+                }
+                else {
+                    // Hoist the per-corner flat indices once per cell.
+                    // a corresponds to (x2, y2); b to (x1-1, y2);
+                    // c to (x2, y1-1); d to (x1-1, y1-1). When
+                    // x1 == 0 or y1 == 0 the corresponding b / c / d
+                    // contribute zero (matches the original
+                    // _hog_ih_rect_sum's branch-on-zero semantics).
+                    let a_idx = int_add(int_mul(y2, w), x2)
+                    let have_b = 0
+                    let b_idx = 0
+                    if x1 > 0 {
+                        have_b = 1
+                        b_idx = int_add(int_mul(y2, w), int_sub(x1, 1))
+                    }
+                    let have_c = 0
+                    let c_idx = 0
+                    if y1 > 0 {
+                        have_c = 1
+                        c_idx = int_add(int_mul(int_sub(y1, 1), w), x2)
+                    }
+                    let have_d = 0
+                    let d_idx = 0
+                    if x1 > 0 {
+                        if y1 > 0 {
+                            have_d = 1
+                            d_idx = int_add(int_mul(int_sub(y1, 1), w),
+                                            int_sub(x1, 1))
+                        }
+                    }
+                    let b = 0
+                    let plane_off = 0
+                    while b < num_bins {
+                        let a_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, a_idx), 8)))
+                        let b_v = 0
+                        if have_b == 1 {
+                            b_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, b_idx), 8)))
+                        }
+                        let c_v = 0
+                        if have_c == 1 {
+                            c_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, c_idx), 8)))
+                        }
+                        let d_v = 0
+                        if have_d == 1 {
+                            d_v = load64(int_add(ih,
+                                                  int_mul(int_add(plane_off, d_idx), 8)))
+                        }
+                        let s = int_add(int_sub(int_sub(a_v, b_v), c_v), d_v)
+                        push(hist, s)
+                        plane_off = int_add(plane_off, planesize)
+                        b = int_add(b, 1)
+                    }
+                    push(cell_hists, hist)
+                    cx = int_add(cx, 1)
+                }
+            }
+        }
+        cy = int_add(cy, 1)
+    }
+    return cell_hists
+}
+
+// _det_window_descriptor_from_cells: run the SAME L2-Hys block
+// normalization the scalar path runs (reuses R14D's
+// _hog_block_descriptor verbatim), then concatenate every block
+// into the final descriptor list. Mirrors hog_compute's step 4/5.
+fn _det_window_descriptor_from_cells(cell_hists, cells_x, cells_y, num_bins) {
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let descriptor = list_new()
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            let bi = 0
+            let block_len = len(block)
+            while bi < block_len {
+                push(descriptor, block[bi])
+                bi = int_add(bi, 1)
+            }
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    return descriptor
+}
+
+// _det_l1_distance_from_cells_streaming: inline-compute the L1
+// distance between the template descriptor and this window's
+// descriptor WITHOUT materializing the window's full descriptor
+// list. We walk the same (by, bx, dy, dx, b) loop nest the
+// scalar path uses to build `descriptor`, compute each component
+// in turn, immediately subtract the corresponding template value,
+// accumulate into the L1 sum, and discard the component. This
+// saves the 324-element descriptor list allocation per window
+// (plus the per-block intermediate `block` list).
+//
+// IMPORTANT: the per-component arithmetic is BIT-IDENTICAL to
+// _hog_block_descriptor + hog_compare: same L2-Hys clip, same
+// post-clip final clamp, same milli-units, same int_mul/int_sub
+// order. The only thing that changes is when we accumulate into
+// the running L1 sum vs when we push into a descriptor list.
+//
+// Returns the L1 distance (always >= 0; the empty-cells case
+// where every block is all-zero still goes through the same
+// arithmetic and yields the L1 sum of the template's components).
+fn _det_l1_distance_from_cells_streaming(cell_hists, cells_x, cells_y,
+                                          num_bins, tpl_desc) {
+    let blocks_x = int_sub(cells_x, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let blocks_y = int_sub(cells_y, int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))
+    let block_len = int_mul(HOG_BLOCK_CELLS, num_bins)
+    let l1_sum = 0
+    let tpl_off = 0
+    let by = 0
+    while by < blocks_y {
+        let bx = 0
+        while bx < blocks_x {
+            // ---- Replicate _hog_block_descriptor inline ----
+            let block = _hog_block_descriptor(cell_hists, cells_x, bx, by, num_bins)
+            // Stream L1 difference against tpl_desc[tpl_off..tpl_off+block_len).
+            let i = 0
+            while i < block_len {
+                let diff = int_sub(tpl_desc[int_add(tpl_off, i)], block[i])
+                if diff < 0 { diff = 0 - diff }
+                l1_sum = int_add(l1_sum, diff)
+                i = int_add(i, 1)
+            }
+            tpl_off = int_add(tpl_off, block_len)
+            bx = int_add(bx, HOG_BLOCK_STRIDE)
+        }
+        by = int_add(by, HOG_BLOCK_STRIDE)
+    }
+    return l1_sum
+}
+
+// _det_sliding_window_integral: the amortized hot path.
+//   1. Build the per-bin integral planes ONCE over the full image.
+//   2. For each candidate window position, look up the per-cell
+//      histograms via four-corner rectangle sums on the precomputed
+//      planes (NUM_BINS * 4 loads per cell).
+//   3. Apply L2-Hys block normalization (reuse _hog_block_descriptor)
+//      and concatenate -> the window descriptor.
+//   4. L1-compare to the template; accept if distance < threshold.
+//
+// The build cost (O(W * H * NUM_BINS)) is paid ONCE; the per-window
+// cost drops from O(WIN_W * WIN_H) per window down to
+// O(CELLS_X * CELLS_Y * NUM_BINS * 4) + O(BLOCKS_X * BLOCKS_Y) for
+// the block-norm pass. For a 256x256 scene with a 32x32 / stride 8
+// template the candidate grid is 29x29 = 841 windows; the build cost
+// gets divided by that many evaluations.
+fn _det_sliding_window_integral(image, w, h, template,
+                                 threshold_milli, s) {
+    let dets = list_new()
+    let win_w = hog_result_width(template)
+    let win_h = hog_result_height(template)
+    let cell_size = hog_result_cell_size(template)
+    let num_bins  = hog_result_num_bins(template)
+    let cells_x_win = win_w / cell_size
+    let cells_y_win = win_h / cell_size
+    let tpl_desc = hog_descriptor(template)
+    let tpl_len = len(tpl_desc)
+    let expected_len = int_mul(
+                        int_mul(int_sub(cells_x_win,
+                                         int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1)),
+                                int_sub(cells_y_win,
+                                         int_sub(HOG_BLOCK_CELLS_PER_AXIS, 1))),
+                        int_mul(HOG_BLOCK_CELLS, num_bins))
+    // If the template descriptor length disagrees with the
+    // expected window descriptor length, the inputs are
+    // incompatible -- return empty. hog_compare would have
+    // returned -1 in the same case.
+    if tpl_len != expected_len { return dets }
+    // Build the per-bin integral planes ONCE over the FULL image.
+    // _hog_build_integral_histogram returns
+    // [ih_ptr, mag_sum, mag_count, dominant_bin]; only ih_ptr is
+    // needed for the cell-rect queries below.
+    let ih_pass = _hog_build_integral_histogram(image, w, h, num_bins)
+    let ih = ih_pass[0]
+    let max_x = int_sub(w, win_w)
+    let max_y = int_sub(h, win_h)
+    let y = 0
+    while y <= max_y {
+        let x = 0
+        while x <= max_x {
+            let cell_hists = _det_window_cell_hists_from_integral(
+                              ih, w, h, x, y, win_w, win_h,
+                              cells_x_win, cells_y_win,
+                              cell_size, num_bins)
+            // Streaming L1 distance: combines block-norm + L1 in
+            // one pass, avoiding the 324-int descriptor list
+            // allocation per window. Bit-identical to the scalar
+            // path because the inner arithmetic is the same
+            // _hog_block_descriptor body, just consumed
+            // immediately rather than stashed.
+            let d = _det_l1_distance_from_cells_streaming(
+                     cell_hists, cells_x_win, cells_y_win,
+                     num_bins, tpl_desc)
+            if d < threshold_milli {
+                push(dets, _det_new_detection(x, y, d))
+            }
+            x = int_add(x, s)
+        }
+        y = int_add(y, s)
+    }
+    return dets
+}
+
+// ---- public: det_nms ------------------------------------------------------
+//
+// det_nms(detections, overlap_iou_milli)
+//   Sort detections by ascending distance (lowest distance = highest
+//   confidence) and greedily keep each in turn; discard any that
+//   overlap a previously-kept detection with bounding-box IoU >=
+//   overlap_iou_milli / 1000.
+//
+//   The bounding boxes use the template's dimensions, which all
+//   detections inherit from the same template -- so every box is the
+//   same size, and IoU reduces to:
+//     inter = max(0, min(x1+W, x2+W) - max(x1, x2)) *
+//             max(0, min(y1+H, y2+H) - max(y1, y2))
+//     union = 2*W*H - inter
+//     iou_milli = inter * 1000 / union
+//
+//   We don't have the template width/height in the detection tuple
+//   (the caller stored only x, y, distance). To stay self-contained,
+//   det_nms takes EQUAL-sized boxes implied by the detection layout:
+//   if two detections share the same x or y modulo their stride, the
+//   overlap is computed via a passed-in `box_size`. For the typical
+//   use case (single template -> all boxes same size) callers use
+//   det_detect, which knows the template width/height and computes
+//   overlap from those.
+//
+// This bare det_nms uses a SQUARE box of `box_size` for simplicity;
+// rectangular templates are handled by _det_nms_with_dims.
+
+fn _det_iou_milli(x1, y1, w1, h1, x2, y2, w2, h2) {
+    let xa = x1
+    if x2 > xa { xa = x2 }
+    let ya = y1
+    if y2 > ya { ya = y2 }
+    let xb = int_add(x1, w1)
+    let xb2 = int_add(x2, w2)
+    if xb2 < xb { xb = xb2 }
+    let yb = int_add(y1, h1)
+    let yb2 = int_add(y2, h2)
+    if yb2 < yb { yb = yb2 }
+    let iw = int_sub(xb, xa)
+    let ih = int_sub(yb, ya)
+    if iw <= 0 { return 0 }
+    if ih <= 0 { return 0 }
+    let inter = int_mul(iw, ih)
+    let union = int_sub(int_add(int_mul(w1, h1), int_mul(w2, h2)), inter)
+    if union <= 0 { return 0 }
+    return int_mul(inter, 1000) / union
+}
+
+// _det_nms_with_dims: NMS with caller-supplied window dimensions.
+// Returns the filtered list (lowest-distance-wins).
+fn _det_nms_with_dims(detections, box_w, box_h, overlap_iou_milli) {
+    let n = len(detections)
+    if n <= 1 { return detections }
+    // Build a kept[] parallel array; 1 = keep, 0 = suppressed.
+    let kept = list_new()
+    let i = 0
+    while i < n {
+        push(kept, 1)
+        i = int_add(i, 1)
+    }
+    // Sort by ascending distance using a simple insertion-sort over an
+    // index permutation. The detection list itself is left intact.
+    let order = list_new()
+    let j = 0
+    while j < n {
+        push(order, j)
+        j = int_add(j, 1)
+    }
+    // Insertion sort on `order` by detections[order[k]][DET_D_DISTANCE].
+    let k = 1
+    while k < n {
+        let key_idx = order[k]
+        let key_d = detections[key_idx]
+        let key_dist = key_d[DET_D_DISTANCE]
+        let m = int_sub(k, 1)
+        let stop = 0
+        while stop == 0 {
+            if m < 0 { stop = 1 }
+            else {
+                let cur_idx = order[m]
+                let cur_d = detections[cur_idx]
+                if cur_d[DET_D_DISTANCE] <= key_dist { stop = 1 }
+                else {
+                    list_set(order, int_add(m, 1), cur_idx)
+                    m = int_sub(m, 1)
+                }
+            }
+        }
+        list_set(order, int_add(m, 1), key_idx)
+        k = int_add(k, 1)
+    }
+    // Greedy suppression in distance order.
+    let a = 0
+    while a < n {
+        let ai = order[a]
+        if kept[ai] == 1 {
+            let da = detections[ai]
+            let xa_pos = da[DET_D_X]
+            let ya_pos = da[DET_D_Y]
+            let b = int_add(a, 1)
+            while b < n {
+                let bi = order[b]
+                if kept[bi] == 1 {
+                    let db = detections[bi]
+                    let xb_pos = db[DET_D_X]
+                    let yb_pos = db[DET_D_Y]
+                    let iou = _det_iou_milli(xa_pos, ya_pos, box_w, box_h,
+                                              xb_pos, yb_pos, box_w, box_h)
+                    if iou >= overlap_iou_milli {
+                        list_set(kept, bi, 0)
+                    }
+                }
+                b = int_add(b, 1)
+            }
+        }
+        a = int_add(a, 1)
+    }
+    // Materialize the surviving detections in original order.
+    let out = list_new()
+    let p = 0
+    while p < n {
+        if kept[p] == 1 {
+            push(out, detections[p])
+        }
+        p = int_add(p, 1)
+    }
+    return out
+}
+
+// Public bare det_nms uses SQUARE boxes of side `box_size`. Tests that
+// build mock detection lists pass a known box size.
+fn det_nms(detections, box_size, overlap_iou_milli) {
+    return _det_nms_with_dims(detections, box_size, box_size, overlap_iou_milli)
+}
+
+// ---- public: det_detect ---------------------------------------------------
+//
+// det_detect(image, w, h, template, threshold_milli, stride, nms_iou_milli)
+//   Convenience wrapper: run det_sliding_window, then apply NMS using
+//   the template's dimensions for the box geometry.
+
+fn det_detect(image, w, h, template, threshold_milli, stride, nms_iou_milli) {
+    let raw = det_sliding_window(image, w, h, template, threshold_milli, stride)
+    if len(raw) <= 1 { return raw }
+    let win_w = hog_result_width(template)
+    let win_h = hog_result_height(template)
+    return _det_nms_with_dims(raw, win_w, win_h, nms_iou_milli)
+}
+
+// ---- structural-feature label --------------------------------------------
+//
+// Visual-perception integration label: bucket detection count into
+// none / few / many so the perception path emits a stable atom across
+// multiple images with the same template.
+
+fn det_count_label(count) {
+    if count <= 0 { return "image_detector_count_none" }
+    if count == 1 { return "image_detector_count_one" }
+    if count <= 4 { return "image_detector_count_few" }
+    return "image_detector_count_many"
+}
+
+// ---- visual-perception integration ---------------------------------------
+//
+// det_append_features_if_templated(feats, image, w, h)
+//   When CE_VP_DETECT_TEMPLATE is set to a PGM path, decode it, train a
+//   template HOG, run the sliding-window detector on `image`, then
+//   append a single image_detector_count_<bucket> atom. Silent return
+//   on every failure path (missing env, parse error, dim mismatch,
+//   over-cap image). Mirrors stereo_append_features_if_paired's
+//   contract: never make /see fall over when the side-channel is
+//   unavailable.
+
+fn det_append_features_if_templated(feats, image, w, h) {
+    let env = getenv("CE_VP_DETECT_TEMPLATE")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if w > DET_MAX_IMAGE_DIM { return 0 }
+    if h > DET_MAX_IMAGE_DIM { return 0 }
+    let r_t = pgm_parse_file(env)
+    let err_t = pgm_result_error(r_t)
+    if len(err_t) > 0 { return 0 }
+    let w_t = pgm_result_width(r_t)
+    let h_t = pgm_result_height(r_t)
+    if w_t < DET_MIN_TEMPLATE_DIM { return 0 }
+    if h_t < DET_MIN_TEMPLATE_DIM { return 0 }
+    if w_t > DET_MAX_TEMPLATE_DIM { return 0 }
+    if h_t > DET_MAX_TEMPLATE_DIM { return 0 }
+    if w_t > w { return 0 }
+    if h_t > h { return 0 }
+    let d_t = pgm_result_data(r_t)
+    let tpl = det_train_template(d_t, w_t, h_t, w_t, h_t)
+    let raw = det_sliding_window(image, w, h, tpl,
+                                  DET_DEFAULT_THRESHOLD_MILLI,
+                                  DET_DEFAULT_STRIDE)
+    let final = _det_nms_with_dims(raw, w_t, h_t, DET_DEFAULT_NMS_IOU_MILLI)
+    push(feats, det_count_label(len(final)))
+    return 1
+}
+
+// ---- chat-orchestration helper -------------------------------------------
+//
+// det_pgm_args(arg) -> formatted result string for the chat /detect
+// admin command. arg format: "TEMPLATE.pgm SCENE.pgm" (two space-
+// separated PGM paths).
+//
+// Output shapes (all wrapped in parens for chat-format consistency):
+//   (/detect needs TEMPLATE.pgm and SCENE.pgm)
+//   (/detect needs TWO paths -- got 1)
+//   (detect FAILED on TEMPLATE: <pgm parser error>)
+//   (detect FAILED on SCENE: <pgm parser error>)
+//   (detect FAILED: TEMPLATE too small -- need >= 16x16)
+//   (detect FAILED: TEMPLATE too large -- max 128x128)
+//   (detect FAILED: SCENE too large -- max 256x256)
+//   (detect FAILED: TEMPLATE > SCENE)
+//   (detect N detection(s); T=WxH S=WxH stride=S best=DIST at (X, Y))
+
+fn _det_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn det_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/detect needs TEMPLATE.pgm and SCENE.pgm)"
+    }
+    let parts = _det_split_two(arg)
+    let path_t = parts[0]
+    let path_s = parts[1]
+    if len(path_t) == 0 {
+        return "(/detect needs TEMPLATE.pgm and SCENE.pgm)"
+    }
+    if len(path_s) == 0 {
+        return "(/detect needs TWO paths -- got 1)"
+    }
+    let r_t = pgm_parse_file(path_t)
+    let err_t = pgm_result_error(r_t)
+    if len(err_t) > 0 {
+        return "(detect FAILED on TEMPLATE: " + err_t + ")"
+    }
+    let r_s = pgm_parse_file(path_s)
+    let err_s = pgm_result_error(r_s)
+    if len(err_s) > 0 {
+        return "(detect FAILED on SCENE: " + err_s + ")"
+    }
+    let w_t = pgm_result_width(r_t)
+    let h_t = pgm_result_height(r_t)
+    let d_t = pgm_result_data(r_t)
+    let w_s = pgm_result_width(r_s)
+    let h_s = pgm_result_height(r_s)
+    let d_s = pgm_result_data(r_s)
+    if w_t < DET_MIN_TEMPLATE_DIM { return "(detect FAILED: TEMPLATE too small -- need >= 16x16)" }
+    if h_t < DET_MIN_TEMPLATE_DIM { return "(detect FAILED: TEMPLATE too small -- need >= 16x16)" }
+    if w_t > DET_MAX_TEMPLATE_DIM { return "(detect FAILED: TEMPLATE too large -- max 128x128)" }
+    if h_t > DET_MAX_TEMPLATE_DIM { return "(detect FAILED: TEMPLATE too large -- max 128x128)" }
+    if w_s > DET_MAX_IMAGE_DIM { return "(detect FAILED: SCENE too large -- max 256x256)" }
+    if h_s > DET_MAX_IMAGE_DIM { return "(detect FAILED: SCENE too large -- max 256x256)" }
+    if w_t > w_s { return "(detect FAILED: TEMPLATE > SCENE)" }
+    if h_t > h_s { return "(detect FAILED: TEMPLATE > SCENE)" }
+    let tpl = det_train_template(d_t, w_t, h_t, w_t, h_t)
+    let dets = det_detect(d_s, w_s, h_s, tpl,
+                           DET_DEFAULT_THRESHOLD_MILLI,
+                           DET_DEFAULT_STRIDE,
+                           DET_DEFAULT_NMS_IOU_MILLI)
+    let n = len(dets)
+    if n == 0 {
+        return "(detect 0 detection(s); T=" + int_to_str(w_t) + "x" + int_to_str(h_t)
+            + " S=" + int_to_str(w_s) + "x" + int_to_str(h_s)
+            + " stride=" + int_to_str(DET_DEFAULT_STRIDE) + ")"
+    }
+    // Find the best (lowest-distance) detection for the summary line.
+    let best_idx = 0
+    let i = 1
+    while i < n {
+        let cur = dets[i]
+        let best = dets[best_idx]
+        if cur[DET_D_DISTANCE] < best[DET_D_DISTANCE] { best_idx = i }
+        i = int_add(i, 1)
+    }
+    let best = dets[best_idx]
+    return "(detect " + int_to_str(n) + " detection(s); T="
+        + int_to_str(w_t) + "x" + int_to_str(h_t)
+        + " S=" + int_to_str(w_s) + "x" + int_to_str(h_s)
+        + " stride=" + int_to_str(DET_DEFAULT_STRIDE)
+        + " best=" + int_to_str(best[DET_D_DISTANCE])
+        + " at (" + int_to_str(best[DET_D_X])
+        + ", " + int_to_str(best[DET_D_Y]) + "))"
+}

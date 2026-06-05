@@ -1,0 +1,575 @@
+// CrossEngin safety: differential privacy (DP) at the KG-query surface.
+//
+// Purpose
+//   CrossEngin's KGs are queryable today -- atom counts, beliefs, neighborhood
+//   statistics -- but there is no formal privacy layer. When multiple users
+//   teach a single soul (multi-tenant deployments / shared families), one
+//   user's queries against `kg_atom_count` or belief means can in principle
+//   expose another user's teaching. This module is the P3.6 minimum-viable
+//   differential-privacy mechanism that injects calibrated integer noise into
+//   numeric KG queries and bookkeeps a per-session epsilon budget, so the
+//   leakage of any individual query is bounded by a configurable parameter.
+//
+//   The mechanism is the *Discrete Laplace* distribution (geometric-on-Z):
+//   sample two geometrics from the same parameter and take their difference,
+//   Y = G(p) - G(p). For sensitivity Delta_f and budget epsilon, the scale
+//   is Delta_f / epsilon; for atom counts (sensitivity = 1) and epsilon = 1.0
+//   the geometric parameter is p ~ 0.63. The result is a discrete random
+//   variable on Z with variance ~ 2 * scale^2 -- the same Laplace utility
+//   bound as the continuous mechanism, with NO floating-point operations:
+//   every step is integer arithmetic with milli-fixed-point (scale 1000).
+//   This matches CrossEngin's convention (beliefs, mood, valence -- all
+//   integer milli throughout) and dodges the NOVA pointer-threshold bug
+//   that bites large multiplies (NOVA blocker bug #5/6 -- the LCG state is
+//   masked to 15 bits before any multiply for that reason).
+//
+//   Each query consumes a piece of the epsilon budget. The total per-session
+//   budget is configurable (`CE_DP_EPSILON_BUDGET`, default 10.0 == 10000
+//   milli-eps). When the budget is exhausted, the dp module returns 0 from
+//   `dp_consume` and the wrapper helpers `kg_atom_count_dp` /
+//   `kg_atom_belief_mean_dp` translate that into a "budget exhausted"
+//   refusal (option 2 in the brief; the alternative -- returning cached /
+//   stale answers -- is reserved for a future revision when call paths
+//   warrant it). The brief calls budget exhaustion "privacy-preserving": a
+//   refusal cannot leak fresh information about the underlying data.
+//
+//   Per-session bookkeeping: the `dp_state` value is owned by a single
+//   Session (`SES_DP` slot in src/session/session.nova) so one tenant's
+//   queries cannot drain another tenant's budget. Sequential composition
+//   over a single session is additive: N queries each consuming
+//   epsilon_i milli-eps consume sum(epsilon_i) milli-eps total. Advanced
+//   composition (RDP, moments accountant) is out of scope; see
+//   `DP_AUDIT.md` for the privacy/utility envelope and the future-work
+//   gaps.
+//
+// ADRs implemented: ADR-0053 (differential privacy at the KG-query surface).
+// NOVA dependencies: builtins (lists, int math) + std/io (nanotime for seed).
+// CrossEngin dependencies: none -- the module is self-contained inside
+//   src/safety/ so the privacy primitive has no upstream attack surface.
+
+import "std/io"
+
+// ---- DP_STATE layout ------------------------------------------------------
+let DP_TAG          = 0
+let DP_BUDGET_MILLI = 1   // total per-session budget, milli-eps
+let DP_REMAINING    = 2   // remaining budget, milli-eps
+let DP_SEED         = 3   // 15-bit LCG state (current)
+let DP_INITIAL_SEED = 4   // 15-bit LCG state (at construction; for reset/deterministic seeding)
+let DP_QUERY_COUNT  = 5   // count of queries that consumed budget (success only)
+// R12F: budget UI / reporting slots (ADR-0053 follow-up).
+//   DP_QUERY_LOG    list of per-query entries [[ts_ns, label, eps_milli], ...]
+//                   appended on every successful dp_consume. Capped at
+//                   _DP_QUERY_LOG_CAP entries (ring-buffer: oldest dropped).
+//   DP_LAST_QUERY_NS  nanotime() at the most recent successful consume; 0
+//                     if no queries have run yet. Surfaced in the /dp status
+//                     line as "last query Ts ago".
+//   DP_WARN_THRESHOLD milli-eps of total budget at which a warning should
+//                     be emitted. Default = 800 (= 80% of a 1000 budget;
+//                     scaled proportionally when budget != 1000). Persists
+//                     across dp_budget_reset (admin sticky knob).
+//   DP_WARN_EMITTED   1 if the warn line has already been printed for the
+//                     current budget cycle (a single warn per cycle; reset
+//                     on dp_budget_reset).
+//   DP_RESET_COUNT    count of times dp_budget_reset has been invoked
+//                     (admin-audit aid: an unexpected jump in this counter
+//                     is a sign that an unauthorised reset path is wired).
+let DP_QUERY_LOG       = 6
+let DP_LAST_QUERY_NS   = 7
+let DP_WARN_THRESHOLD  = 8
+let DP_WARN_EMITTED    = 9
+let DP_RESET_COUNT     = 10
+
+// Per-entry layout of the query log. Each entry is a 3-element list.
+let DPQ_TS_NS    = 0
+let DPQ_LABEL    = 1
+let DPQ_EPSILON  = 2
+
+// Cap on the query log size. The log is a ring: when len reaches
+// _DP_QUERY_LOG_CAP, the next append drops the OLDEST entry. The cap is
+// generous (500) because each entry is three slots and the typical session
+// runs <100 noisy queries before exhaustion; the cap matters only for very
+// long sessions or budgets that have been reset many times.
+let _DP_QUERY_LOG_CAP = 500
+
+// Default warn threshold (milli of total budget). 800 means "warn at 80%
+// consumed", matching the brief. Admins override via dp_budget_warn_set.
+let _DP_DEFAULT_WARN_THRESHOLD = 800
+
+let DP_OBJ_TAG = 1801     // disambiguating tag
+
+// LCG parameters. The multiplier and increment are deliberately small so
+// the product `seed * MUL + INC` stays well under NOVA's pointer-threshold
+// of 0x100000 (= 1048576). Seed is masked to 15 bits = 32767, MUL = 6917
+// (< 2^13), so seed * MUL < 32767 * 6917 = ~226M which is still above the
+// threshold -- so we mask the PRODUCT back to 15 bits after the multiply,
+// keeping every intermediate inside the safe range. The full pattern is
+// `_lcg_step()` below.
+//
+// A bare 15-bit LCG has a short period (worst-case 2^15 = 32768) and a
+// noticeably biased low bit. The brief calls out the LCG quality knob:
+// "We approximate with integer-only arithmetic via an LCG and integer
+// comparisons." The brief also calls out that this is a MINIMUM VIABLE
+// DP and the audit doc must note where the floor is. To reduce the
+// per-bit bias without crossing the pointer threshold, `_lcg_step`
+// XORs the high half into the low half each step -- a one-byte
+// avalanche that breaks the LCG's near-perfect linearity in the low
+// bits without introducing any large multiply.
+let _LCG_MUL  = 6917      // small prime-ish
+let _LCG_INC  = 31        // odd
+let _LCG_MASK = 32767     // 2^15 - 1
+
+// Maximum iterations for the geometric loop. The brief calls this out: a
+// pathological probability can make the geometric loop spin forever; cap
+// at 1000 iterations and return the truncated value (rare in practice for
+// typical epsilon). Per-call timing: at typical epsilon = 1.0 (1000 milli)
+// the success probability is ~ 0.63 and the expected geometric length is
+// ~ 1.6, so 1000 iterations is generous (chance of truncation < 2^-300).
+let _DP_GEOM_MAX_ITERS = 1000
+
+// ---- LCG (linear-congruential generator) ---------------------------------
+// Step the LCG one position, update the dp state's seed, and return the
+// fresh value. The mask is applied to BOTH the product and the post-add,
+// so the seed and every intermediate stays under the NOVA pointer
+// threshold (NOVA blocker bug #5/6). DO NOT remove the masks.
+//
+// To improve the low-bit bias inherent to a 15-bit LCG, we run TWO
+// short LCG steps per call and combine the high and low halves via XOR.
+// Each multiply uses MUL < 2^13 and seed < 2^15, so the intermediate
+// is < 2^28; we mask back to 15 bits immediately after each multiply.
+// The combined return value is the bottom 15 bits of the XOR'd mix --
+// callers consume 10 bits (`& 1023`) for the geometric coin-flip, so
+// the high-half avalanche reaches them.
+fn _lcg_step(dp) {
+    let s = dp[DP_SEED]
+    // Stage 1: standard LCG step.
+    let prod1 = s * _LCG_MUL
+    prod1 = prod1 & _LCG_MASK
+    let mid = prod1 + _LCG_INC
+    mid = mid & _LCG_MASK
+    // Stage 2: re-step the LCG over the intermediate; XOR the two halves
+    // (top 7 bits shifted down into the low 8) into the post-mix so the
+    // returned value has avalanche from both halves of the trajectory.
+    let prod2 = mid * _LCG_MUL
+    prod2 = prod2 & _LCG_MASK
+    let next = prod2 + _LCG_INC
+    next = next & _LCG_MASK
+    // Avalanche: XOR the top 7 bits into the low 8 (using a small constant
+    // shift via integer division -- NOVA has no `>>` operator in v0.x, so
+    // div by power-of-two stands in).
+    let high = next / 256          // top 7 bits (next is 15-bit)
+    let mixed = next ^ high
+    mixed = mixed & _LCG_MASK
+    list_set(dp, DP_SEED, mixed)
+    return mixed
+}
+
+// ---- constructors --------------------------------------------------------
+// Build a fresh dp_state with the given per-session budget in milli-eps.
+// Seeds the LCG from `nanotime() & 32767` -- the mask is critical: the raw
+// nanotime is > 2^20 (typically > 2^40), and EVERY multiply of it would
+// dispatch through _nova_mul's pointer-threshold path, segfaulting the
+// process (NOVA bug #5/6, repeatedly observed in P0.7 / P2.10 / P3.4).
+// Mask first, then use.
+fn dp_new(epsilon_budget_milli) {
+    let dp = list_new()
+    push(dp, DP_OBJ_TAG)
+    push(dp, epsilon_budget_milli)      // DP_BUDGET_MILLI
+    push(dp, epsilon_budget_milli)      // DP_REMAINING (initialized to budget)
+    let seed = nanotime() & _LCG_MASK   // MASK BEFORE USE -- see comment above.
+    if seed == 0 { seed = 1 }           // a zero seed gives stuck = INC sequence
+    push(dp, seed)                      // DP_SEED
+    push(dp, seed)                      // DP_INITIAL_SEED
+    push(dp, 0)                         // DP_QUERY_COUNT
+    // R12F: budget-UI slots. The query log is an empty list; warn threshold
+    // defaults to 80% of the total budget (scaled to the new total so a
+    // 5000-eps budget warns at 4000 by default).
+    push(dp, list_new())                                       // DP_QUERY_LOG
+    push(dp, 0)                                                // DP_LAST_QUERY_NS
+    push(dp, _dp_default_warn(epsilon_budget_milli))           // DP_WARN_THRESHOLD
+    push(dp, 0)                                                // DP_WARN_EMITTED
+    push(dp, 0)                                                // DP_RESET_COUNT
+    return dp
+}
+
+// Build a fresh dp_state with the given budget AND an explicit seed. Used
+// by tests for deterministic noise streams: same seed -> same sequence.
+// The explicit seed is masked the same way as the nanotime path.
+fn dp_new_seeded(epsilon_budget_milli, explicit_seed) {
+    let dp = list_new()
+    push(dp, DP_OBJ_TAG)
+    push(dp, epsilon_budget_milli)
+    push(dp, epsilon_budget_milli)
+    let seed = explicit_seed & _LCG_MASK
+    if seed == 0 { seed = 1 }
+    push(dp, seed)
+    push(dp, seed)
+    push(dp, 0)
+    push(dp, list_new())                                       // DP_QUERY_LOG
+    push(dp, 0)                                                // DP_LAST_QUERY_NS
+    push(dp, _dp_default_warn(epsilon_budget_milli))           // DP_WARN_THRESHOLD
+    push(dp, 0)                                                // DP_WARN_EMITTED
+    push(dp, 0)                                                // DP_RESET_COUNT
+    return dp
+}
+
+// Default warn threshold = 80% of the total budget in milli, computed
+// without crossing the pointer threshold. budget * 8 / 10 is safe for any
+// budget under ~130k milli; we use that even for unrealistically large
+// totals (the floor handles tiny budgets gracefully).
+fn _dp_default_warn(budget_milli) {
+    if budget_milli <= 0 { return _DP_DEFAULT_WARN_THRESHOLD }
+    let b = budget_milli
+    if b > 1000000 { b = 1000000 }
+    return (b * 8) / 10
+}
+
+// ---- budget accounting ---------------------------------------------------
+fn dp_budget(dp)              { return dp[DP_BUDGET_MILLI] }
+fn dp_remaining_budget(dp)    { return dp[DP_REMAINING] }
+fn dp_query_count(dp)         { return dp[DP_QUERY_COUNT] }
+fn dp_consumed(dp)            { return dp[DP_BUDGET_MILLI] - dp[DP_REMAINING] }
+
+// Try to consume `epsilon_milli` from the budget. Returns 1 on success
+// (budget had enough), 0 on exhaustion (budget not modified). A zero or
+// negative request is rejected (returns 0) -- a query that consumes
+// nothing has no defined noise level, so the caller must not be granted
+// the "free pass" shape. This matches the brief's "refuse on exhaust"
+// posture: a budget-exhausted caller cannot wheedle a noisy answer by
+// passing epsilon=0.
+//
+// R12F: every successful consume also appends a labelled entry to the
+// per-session query log (timestamp_ns, label, eps_milli) so /dp log can
+// surface the recent activity. The legacy (unlabelled) call site uses
+// the catch-all "query" label; the new dp_consume_labeled entry point
+// carries an explicit label through.
+fn dp_consume(dp, epsilon_milli) {
+    return dp_consume_labeled(dp, epsilon_milli, "query")
+}
+
+// Labelled variant of dp_consume. Wrappers like kg_atom_count_dp call this
+// directly with their own label ("atoms", "belief", ...) so /dp log can
+// distinguish query kinds. Backward-compat: dp_consume (above) routes here
+// with label = "query" so older call sites still work.
+fn dp_consume_labeled(dp, epsilon_milli, label) {
+    if epsilon_milli <= 0 { return 0 }
+    let rem = dp[DP_REMAINING]
+    if epsilon_milli > rem { return 0 }
+    list_set(dp, DP_REMAINING, rem - epsilon_milli)
+    list_set(dp, DP_QUERY_COUNT, dp[DP_QUERY_COUNT] + 1)
+    // R12F: per-query log. Append [ts_ns, label, eps_milli]; trim the head
+    // when the cap is reached so the log is bounded (ring buffer).
+    let ts = nanotime()
+    list_set(dp, DP_LAST_QUERY_NS, ts)
+    let entry = list_new()
+    push(entry, ts)
+    push(entry, label)
+    push(entry, epsilon_milli)
+    let qlog = dp[DP_QUERY_LOG]
+    push(qlog, entry)
+    if len(qlog) > _DP_QUERY_LOG_CAP {
+        let trimmed = list_new()
+        let i = 1
+        while i < len(qlog) {
+            push(trimmed, qlog[i])
+            i = i + 1
+        }
+        list_set(dp, DP_QUERY_LOG, trimmed)
+    }
+    return 1
+}
+
+// Reset the budget back to a fresh per-session value. Does NOT reset the
+// LCG seed -- the noise stream advances monotonically. The brief asks
+// only for budget reset; deterministic-seed re-seed is via dp_new_seeded.
+//
+// R12F: also clears the warn-emitted bit (so the new cycle gets one fresh
+// warning when consumption crosses the threshold) and bumps the reset
+// counter (audit aid). The query log is NOT cleared: an operator who
+// resets the budget mid-session likely wants the pre-reset queries
+// preserved as audit history. The dp_query_log_clear admin tool clears
+// the log explicitly when needed.
+fn dp_reset_budget(dp, epsilon_budget_milli) {
+    list_set(dp, DP_BUDGET_MILLI, epsilon_budget_milli)
+    list_set(dp, DP_REMAINING, epsilon_budget_milli)
+    list_set(dp, DP_QUERY_COUNT, 0)
+    list_set(dp, DP_WARN_EMITTED, 0)
+    list_set(dp, DP_RESET_COUNT, dp[DP_RESET_COUNT] + 1)
+    return 1
+}
+
+// R12F: budget-UI / reporting APIs (brief: "extend the existing DP module
+// with reporting APIs"). These are pure read-only accessors over the
+// existing state plus the R12F slots; they exist so the chat-side /dp
+// command and the /status pane have a single, narrow surface to query.
+
+// Total budget allocated to the session, in milli-eps. Mirrors dp_budget
+// with the explicit-units name the brief asks for.
+fn dp_budget_total_milli(dp)     { return dp[DP_BUDGET_MILLI] }
+fn dp_budget_remaining_milli(dp) { return dp[DP_REMAINING] }
+fn dp_budget_consumed_milli(dp)  { return dp[DP_BUDGET_MILLI] - dp[DP_REMAINING] }
+
+// The per-query log, as a list of [ts_ns, label, eps_milli] entries in
+// insertion order (oldest first). Returned directly (the caller is
+// expected to be read-only; mutating the returned list mutates the dp
+// state, which is the caller's problem).
+fn dp_query_log(dp) { return dp[DP_QUERY_LOG] }
+fn dp_query_log_count(dp) { return len(dp[DP_QUERY_LOG]) }
+
+// Per-entry accessors over the log entries. Hidden behind a function
+// boundary so a future change to the per-entry layout (e.g. adding the
+// noisy result) does not break call sites.
+fn dp_qlog_ts(entry)      { return entry[DPQ_TS_NS] }
+fn dp_qlog_label(entry)   { return entry[DPQ_LABEL] }
+fn dp_qlog_epsilon(entry) { return entry[DPQ_EPSILON] }
+
+// Timestamp (nanotime) of the most recent successful consume. Returns 0
+// if no query has run yet. Used by the /dp status line ("last query Ts
+// ago").
+fn dp_last_query_ns(dp) { return dp[DP_LAST_QUERY_NS] }
+
+// Current warn threshold in milli-eps. Default = 80% of the total budget
+// at construction; admins override via dp_budget_warn_set.
+fn dp_budget_warn_threshold(dp) { return dp[DP_WARN_THRESHOLD] }
+
+// Set the warn threshold to `threshold_milli`. Clamps to [0, total_budget]
+// so an operator cannot accidentally configure a threshold that can
+// never fire (above total) nor one that fires before any consumption
+// (negative). Returns 1 on success, 0 on rejected input.
+fn dp_budget_warn_set(dp, threshold_milli) {
+    if threshold_milli < 0 { return 0 }
+    let t = threshold_milli
+    let total = dp[DP_BUDGET_MILLI]
+    if t > total { t = total }
+    list_set(dp, DP_WARN_THRESHOLD, t)
+    list_set(dp, DP_WARN_EMITTED, 0)
+    return 1
+}
+
+// Has the budget consumption crossed the configured warn threshold AND
+// the warn-emitted bit is still 0? When this returns 1, the caller is
+// expected to print one warning line and call dp_warn_mark_emitted to
+// suppress further warnings until the next budget reset.
+fn dp_budget_should_warn(dp) {
+    if dp[DP_WARN_EMITTED] == 1 { return 0 }
+    let used = dp[DP_BUDGET_MILLI] - dp[DP_REMAINING]
+    if used >= dp[DP_WARN_THRESHOLD] { return 1 }
+    return 0
+}
+
+fn dp_warn_mark_emitted(dp) {
+    list_set(dp, DP_WARN_EMITTED, 1)
+    return 1
+}
+
+fn dp_warn_emitted(dp) { return dp[DP_WARN_EMITTED] }
+
+fn dp_reset_count(dp) { return dp[DP_RESET_COUNT] }
+
+// Clear the query log. Distinct from dp_budget_reset so an operator can
+// scrub the log without resetting the budget (useful when handing the
+// session over to an external auditor).
+fn dp_query_log_clear(dp) {
+    list_set(dp, DP_QUERY_LOG, list_new())
+    return 1
+}
+
+// Render the last N entries of the query log as a list of human-readable
+// strings (one per entry). Each line is
+//   "<seq>. <label> -> <eps_milli> milli-eps (<delta_ago>s ago)"
+// where the seq is 1-based from the oldest of the N returned (so the
+// most recent query is the LAST line). `now_ns` is passed in (rather
+// than read from nanotime() here) so the chat can pick a stable "now"
+// for the whole /dp log output; tests use 0 to get a stable string.
+fn dp_query_log_render(dp, last_n, now_ns) {
+    let out = list_new()
+    let qlog = dp[DP_QUERY_LOG]
+    let total = len(qlog)
+    if total == 0 { return out }
+    let n = last_n
+    if n <= 0 { n = total }
+    if n > total { n = total }
+    let from = total - n
+    let i = from
+    let seq = 1
+    while i < total {
+        let e = qlog[i]
+        let ts = e[DPQ_TS_NS]
+        let label = e[DPQ_LABEL]
+        let eps = e[DPQ_EPSILON]
+        let ago_s = 0
+        if now_ns > ts {
+            let delta = now_ns - ts
+            ago_s = (delta / 1000000) / 1000
+        }
+        let line = "  " + int_to_str(seq) + ". " + label
+            + " -> " + int_to_str(eps) + " milli-eps ("
+            + int_to_str(ago_s) + "s ago)"
+        push(out, line)
+        i = i + 1
+        seq = seq + 1
+    }
+    return out
+}
+
+// ---- geometric sampling --------------------------------------------------
+// Sample G(p) where p ~ 1/(scale+1) -- the discrete-geometric on the
+// non-negative integers parameterised so that E[G(p)] = scale.
+// Implementation: at each step, draw a 10-bit uniform variate
+// `u in [0, 1023]` and compare against the threshold `t = 1024 * scale /
+// (scale + 1)`; if u < t, the trial "succeeded" (still in the tail) and
+// the geometric advances by 1; otherwise the trial "failed" and the
+// geometric value is returned. The 10-bit chunk gives sub-percent
+// resolution on p, which is sufficient for the discrete Laplace utility
+// envelope ADR-0053 calls out (we don't need exact p; we need a
+// distribution with E and Var that match the integer-Laplace target).
+//
+// Capped at _DP_GEOM_MAX_ITERS to dodge the pathological "p approaches 1"
+// case (the brief calls this out). At typical epsilon (>= 100 milli-eps)
+// the expected length is well under the cap.
+fn _dp_geometric(dp, scale_milli) {
+    // Threshold (out of 1024): t = 1024 * scale / (scale + 1000), where
+    // scale is in milli units already. Both operands fit comfortably under
+    // the pointer threshold for any reasonable scale (< 2^20).
+    let s = scale_milli
+    if s < 0 { s = 0 }
+    let denom = s + 1000
+    if denom <= 0 { return 0 }
+    // scale_factor: 1024 * s. For s = 1000 this is 1024000, just over the
+    // 2^20 boundary. We compute via a safer split: t = (s * 1024) / denom,
+    // but s * 1024 = s << 10. For s up to ~1000 (typical), s * 1024 is
+    // ~1M; we keep s capped before the multiply to be safe.
+    if s > 100000 { s = 100000 }   // cap at 100x epsilon = 1; geometric
+                                   // beyond this is a degenerate use case
+    let t = (s * 1024) / denom
+    let g = 0
+    let iters = 0
+    while iters < _DP_GEOM_MAX_ITERS {
+        let u = _lcg_step(dp) & 1023   // 10-bit uniform on [0, 1023]
+        if u >= t { return g }
+        g = g + 1
+        iters = iters + 1
+    }
+    // Truncation: pathological p ~ 1. Return the cap; the caller's
+    // distribution will look saturated but the privacy bound still holds.
+    return g
+}
+
+// ---- Laplace noise sampling ----------------------------------------------
+// Discrete Laplace = G(p) - G(p): two independent geometrics, subtract.
+// Mean is 0, variance is 2 * scale^2 (in milli units, scale is the
+// continuous Laplace scale Delta_f / epsilon). Returns an integer noise
+// sample. Caller-facing: dp_laplace_noise advances the LCG by ~2 *
+// expected-G steps per call; the budget is NOT touched here (the brief's
+// API separates the noise primitive from the budget accountant -- the
+// wrappers do both).
+fn dp_laplace_noise(dp, scale_milli) {
+    let g1 = _dp_geometric(dp, scale_milli)
+    let g2 = _dp_geometric(dp, scale_milli)
+    return g1 - g2
+}
+
+// ---- noisy-count helper --------------------------------------------------
+// The flagship application: a noisy atom count. Sensitivity is 1 (adding
+// one atom changes the count by exactly 1), so scale = 1000 / epsilon_milli
+// (note: scale is in milli, epsilon is in milli -- scale_milli = 1 *
+// 1000 * 1000 / epsilon_milli = 1000000 / epsilon_milli, but we want it
+// in the same units as our geometric helper which treats scale as the
+// MEAN of the geometric, so a milli scale of 1000 corresponds to a
+// continuous-Laplace scale of 1.0). At epsilon = 1.0 == 1000 milli the
+// scale is 1000 milli, i.e. variance ~ 2 (noise of magnitude ~ 1-2).
+//
+// Consumes epsilon_milli from the budget. Returns the noisy count, or
+// the special sentinel -2147483647 (DP_REFUSED) if the budget is
+// exhausted. Callers MUST check the return value before treating it as
+// a count.
+let DP_REFUSED = 0 - 2147483647   // a value the noisy count cannot
+                                  // produce (negative and far below any
+                                  // realistic noise magnitude)
+
+fn dp_noisy_count(dp, true_count, epsilon_milli) {
+    // R12F: log the consume with the "count" label so /dp log groups
+    // atom-count queries together.
+    if dp_consume_labeled(dp, epsilon_milli, "count") == 0 { return DP_REFUSED }
+    // Scale for Laplace mech with sensitivity 1 is 1 / epsilon. In milli
+    // scale: scale_milli = 1000 * 1000 / epsilon_milli. Cap epsilon to
+    // avoid division by very small numbers and keep the geometric
+    // tractable. The cap is generous; epsilon >= 1 milli is enough that
+    // scale stays under 1M.
+    let eps = epsilon_milli
+    if eps < 1 { eps = 1 }
+    let scale_milli = 1000000 / eps
+    let noise = dp_laplace_noise(dp, scale_milli)
+    return true_count + noise
+}
+
+// ---- noisy-mean helper ---------------------------------------------------
+// Noisy belief mean (or any other milli-fixed-point mean). Sensitivity is
+// caller-provided: for a Bayesian mean alpha/(alpha+beta) over a single
+// atom the worst-case change from removing one observation is ~ 1000 /
+// (alpha+beta), which we approximate via the caller-supplied
+// `sensitivity_milli`. The Laplace scale in milli is then
+// sensitivity_milli * 1000 / epsilon_milli.
+//
+// Consumes epsilon_milli from the budget. Returns the noisy mean (still
+// in milli; clamped to [0, 1000]), or DP_REFUSED on exhaustion.
+fn dp_noisy_mean(dp, true_mean_milli, sensitivity_milli, epsilon_milli) {
+    // R12F: log under "mean" so /dp log distinguishes belief means from
+    // raw counts.
+    if dp_consume_labeled(dp, epsilon_milli, "mean") == 0 { return DP_REFUSED }
+    let eps = epsilon_milli
+    if eps < 1 { eps = 1 }
+    let sens = sensitivity_milli
+    if sens < 1 { sens = 1 }
+    let scale_milli = (sens * 1000) / eps
+    let noise = dp_laplace_noise(dp, scale_milli)
+    let noisy = true_mean_milli + noise
+    if noisy < 0 { noisy = 0 }
+    if noisy > 1000 { noisy = 1000 }
+    return noisy
+}
+
+// ---- budget exhaustion sentinel helper -----------------------------------
+// Did the noisy-query return refuse-on-exhaustion? Callers that want to
+// distinguish a legitimate noisy answer of -2147483647 (impossible) from
+// the exhaustion sentinel should use this helper rather than comparing
+// to the magic value directly.
+fn dp_is_refused(v) {
+    if v == DP_REFUSED { return 1 }
+    return 0
+}
+
+// ---- env helper ----------------------------------------------------------
+// Read the per-session epsilon budget from $CE_DP_EPSILON_BUDGET, in
+// integer milli-eps. Defaults to 10000 milli-eps (= 10.0) when unset or
+// invalid. The daemon / chat wire this at session_make time.
+fn dp_budget_from_env() {
+    let env = getenv("CE_DP_EPSILON_BUDGET")
+    if env != 0 {
+        if len(env) > 0 {
+            let v = _dp_str_to_int(env)
+            if v > 0 { return v }
+        }
+    }
+    return 10000
+}
+
+// Local str-to-int (the rt_str_to_int helper lives in src/chat/helpers.nova
+// which we cannot import without circular dependencies; the substrate-
+// proximate copy is small and self-contained).
+fn _dp_str_to_int(s) {
+    let n = 0
+    let i = 0
+    let neg = 0
+    if len(s) > 0 {
+        if char_at(s, 0) == 45 { neg = 1 i = 1 }   // '-'
+    }
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    if neg == 1 { return 0 - n }
+    return n
+}

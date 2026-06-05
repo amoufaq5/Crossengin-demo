@@ -1,0 +1,323 @@
+// CrossEngin io/transducers: Sobel edge detector (P3.3 image structural feature).
+//
+// Purpose
+//   The first STRUCTURAL feature beyond P3.1's pixel statistics. Sobel
+//   convolves a grayscale image with two 3x3 kernels (Sobel-X for
+//   horizontal gradient, Sobel-Y for vertical gradient) and produces a
+//   per-pixel edge magnitude plus a quantized orientation bucket
+//   (0 / 45 / 90 / 135 degrees, the four cardinal directions). The
+//   substrate consumes a SMALL set of label-shaped atoms derived from
+//   the per-image aggregate: `image_edge_dense` when more than 10% of
+//   pixels are above the magnitude threshold; `image_edge_sparse`
+//   otherwise; and an `image_orient_<deg>` label for the dominant edge
+//   orientation observed.
+//
+//   Sobel was chosen over more sophisticated edge detectors (Canny,
+//   Laplacian-of-Gaussian) for the same reason PGM was chosen over JPEG
+//   in P3.1: it is the simplest STANDARDIZED algorithm that produces a
+//   structurally interesting feature. The two kernels are integer-valued
+//   (-2, -1, 0, 1, 2), the convolution is a 9-tap inner loop, and the
+//   whole thing fits in ~150 lines of NOVA with no smoothing or
+//   non-maximum suppression. Canny + hysteresis is a follow-up (see
+//   IMAGE_AUDIT.md).
+//
+// Kernels (matrices applied per pixel; centre at (1, 1)):
+//   Sobel-X = [[-1, 0, 1],
+//              [-2, 0, 2],
+//              [-1, 0, 1]]
+//   Sobel-Y = [[-1, -2, -1],
+//              [ 0,  0,  0],
+//              [ 1,  2,  1]]
+// Magnitude = |Gx| + |Gy|     (L1 norm; faster than sqrt(Gx*Gx + Gy*Gy)
+//                              and adequate for thresholding).
+// Orientation bucket per pixel: arctan2(Gy, Gx) quantized to 4 bins.
+//   bucket 0 -> 0 degrees     (mostly horizontal: |Gx| dominant, Gx*Gy >= 0
+//                              not a useful axis for binning when we have
+//                              both signs; we lean on the |Gx| vs |Gy|
+//                              comparison instead)
+//   bucket 1 -> 45 degrees    (diagonal: |Gx| ~ |Gy|, Gx*Gy > 0)
+//   bucket 2 -> 90 degrees    (mostly vertical: |Gy| dominant)
+//   bucket 3 -> 135 degrees   (anti-diagonal: |Gx| ~ |Gy|, Gx*Gy < 0)
+//
+// Public API
+//   sobel_apply(data_ptr, width, height) -> [magnitudes_ptr,
+//                                            orientations_ptr,
+//                                            edge_count, total_pixels,
+//                                            orient_counts]
+//     `magnitudes_ptr`   -- width*height int per pixel (caller frees).
+//     `orientations_ptr` -- width*height int per pixel (bucket 0..3),
+//                           or 4 for "below threshold / no orientation".
+//     `edge_count`       -- pixels where magnitude > SOBEL_EDGE_THRESHOLD.
+//     `total_pixels`     -- width * height (cap-respecting).
+//     `orient_counts`    -- list of 4 ints (counts per orientation bucket,
+//                           limited to ABOVE-THRESHOLD pixels).
+//   sobel_edge_density_milli(edge_count, total_pixels) -> int in 0..1000
+//   sobel_dominant_orientation(orient_counts) -> int in 0..3 (or -1 if all zero)
+//   sobel_orient_label(bucket) -> string "image_orient_0" etc.
+//
+// Pixel-area cap: SOBEL_MAX_DIM = 512 per axis (max area 262144). At that
+// cap the per-pixel int accumulators stay safe; the Bug-A int_mul fix
+// path is used for any multiply whose product can reach into the
+// pointer-threshold zone.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_mul, int_add, int_sub. No sys_* (no I/O).
+// CrossEngin dependencies: none (leaf module -- visual_perception.nova
+//   imports this).
+
+// ---- format constants -----------------------------------------------------
+
+// Magnitude threshold above which a pixel is considered an "edge".
+// Picked so a clean vertical line in a flat field reads ~ |2 + 2*1| = 4
+// per neighbor pair; the kernel sum reaches well over 100 at a hard
+// black-to-white transition. 100 is a reasonable "more than gradient
+// noise" threshold for the L1-norm magnitude.
+let SOBEL_EDGE_THRESHOLD = 100
+
+// Hard cap on pixel area to dodge NOVA's codegen pointer-threshold
+// gotcha (#11). 512 * 512 = 262144 == 2^18, comfortably under 2^20.
+let SOBEL_MAX_DIM = 512
+let SOBEL_MAX_PIXEL_AREA = 262144   // 512 * 512
+
+// Density classifier. >= 100 milli (10%) -> dense; < 100 milli -> sparse.
+let SOBEL_EDGE_DENSE_MIN_MILLI = 100
+
+// Orientation bucket count (4 cardinal directions: 0, 45, 90, 135).
+let SOBEL_ORIENT_BUCKETS = 4
+
+// Sentinel orientation for sub-threshold pixels (no useful edge).
+let SOBEL_ORIENT_NONE = 4
+
+// Result tuple slot indices.
+let SOBEL_R_MAGNITUDES   = 0
+let SOBEL_R_ORIENTATIONS = 1
+let SOBEL_R_EDGE_COUNT   = 2
+let SOBEL_R_TOTAL        = 3
+let SOBEL_R_ORIENT_COUNTS = 4
+
+// ---- result helper --------------------------------------------------------
+
+fn _sobel_result(mag, orient, edge_count, total, orient_counts) {
+    let r = list_new()
+    push(r, mag)
+    push(r, orient)
+    push(r, edge_count)
+    push(r, total)
+    push(r, orient_counts)
+    return r
+}
+
+fn _sobel_fail() {
+    let empty_counts = list_new()
+    let i = 0
+    while i < SOBEL_ORIENT_BUCKETS {
+        push(empty_counts, 0)
+        i = i + 1
+    }
+    return _sobel_result(0, 0, 0, 0, empty_counts)
+}
+
+// ---- core: per-pixel convolution -----------------------------------------
+//
+// Apply both Sobel kernels in one pass. Border pixels (first / last row,
+// first / last column) are zero by construction -- no padding mode, no
+// reflect, just a hard zero. For images larger than 3x3 this is fine; for
+// 3x3 inputs the only inner pixel is the centre.
+//
+// Loop layout:
+//   for y in 1..height-1:
+//     for x in 1..width-1:
+//       Gx = sum_k_l ( kernel_x[k][l] * pixel(x + l - 1, y + k - 1) )
+//       Gy = sum_k_l ( kernel_y[k][l] * pixel(x + l - 1, y + k - 1) )
+//       magnitudes[y * width + x] = |Gx| + |Gy|
+//       orientations[y * width + x] = bucketize(Gx, Gy)
+//   The center pixel's offset into the flat buffer is computed via
+//   int_mul so we stay safe past the pointer-threshold even at 512x512
+//   (262144 won't trigger gotcha #11 on its own, but the addition with
+//   the data_ptr base might).
+
+fn sobel_apply(data_ptr, width, height) {
+    if width <= 0   { return _sobel_fail() }
+    if height <= 0  { return _sobel_fail() }
+    if data_ptr == 0 { return _sobel_fail() }
+    if width > SOBEL_MAX_DIM  { return _sobel_fail() }
+    if height > SOBEL_MAX_DIM { return _sobel_fail() }
+    let area = int_mul(width, height)
+    if area > SOBEL_MAX_PIXEL_AREA { return _sobel_fail() }
+    // Sobel needs at least 3x3 to fit the kernel. Anything smaller has
+    // zero interior pixels; we still return a sensible empty result.
+    if width < 3 {
+        let empty = alloc(area + 1)
+        let i = 0
+        while i < area { store8(empty + i, 0); i = i + 1 }
+        store8(empty + area, 0)
+        let empty2 = alloc(area + 1)
+        let j = 0
+        while j < area { store8(empty2 + j, SOBEL_ORIENT_NONE); j = j + 1 }
+        store8(empty2 + area, 0)
+        let zero_counts = list_new()
+        let k = 0
+        while k < SOBEL_ORIENT_BUCKETS { push(zero_counts, 0); k = k + 1 }
+        return _sobel_result(empty, empty2, 0, area, zero_counts)
+    }
+    if height < 3 {
+        let empty = alloc(area + 1)
+        let i = 0
+        while i < area { store8(empty + i, 0); i = i + 1 }
+        store8(empty + area, 0)
+        let empty2 = alloc(area + 1)
+        let j = 0
+        while j < area { store8(empty2 + j, SOBEL_ORIENT_NONE); j = j + 1 }
+        store8(empty2 + area, 0)
+        let zero_counts = list_new()
+        let k = 0
+        while k < SOBEL_ORIENT_BUCKETS { push(zero_counts, 0); k = k + 1 }
+        return _sobel_result(empty, empty2, 0, area, zero_counts)
+    }
+
+    // Two flat buffers: magnitudes (clamped to 0..255 for store8) and
+    // orientation buckets (one of 0..3, or SOBEL_ORIENT_NONE=4).
+    let mag    = alloc(area + 1)
+    let orient = alloc(area + 1)
+    // Zero-initialize both. Border pixels keep these zeros / NONE values.
+    let z = 0
+    while z < area {
+        store8(mag + z, 0)
+        store8(orient + z, SOBEL_ORIENT_NONE)
+        z = z + 1
+    }
+    store8(mag + area, 0)
+    store8(orient + area, 0)
+
+    // Counters.
+    let edge_count = 0
+    let orient_counts = list_new()
+    let oc = 0
+    while oc < SOBEL_ORIENT_BUCKETS {
+        push(orient_counts, 0)
+        oc = oc + 1
+    }
+
+    // Interior pixels: y in 1..height-2, x in 1..width-2.
+    let y = 1
+    while y < height - 1 {
+        // Pre-compute row offsets (use int_mul -- product can be 511*512 ~= 261632
+        // at the cap, just under the 2^18 ceiling, but using int_mul is the
+        // documented safe path).
+        let row_above_off = int_mul(int_sub(y, 1), width)
+        let row_mid_off   = int_mul(y, width)
+        let row_below_off = int_mul(int_add(y, 1), width)
+        let x = 1
+        while x < width - 1 {
+            // Load the 3x3 neighborhood.
+            let tl = load8(data_ptr + row_above_off + x - 1)
+            let tm = load8(data_ptr + row_above_off + x)
+            let tr = load8(data_ptr + row_above_off + x + 1)
+            let ml = load8(data_ptr + row_mid_off   + x - 1)
+            // centre (ml_c) unused -- both kernels have 0 at centre
+            let mr = load8(data_ptr + row_mid_off   + x + 1)
+            let bl = load8(data_ptr + row_below_off + x - 1)
+            let bm = load8(data_ptr + row_below_off + x)
+            let br = load8(data_ptr + row_below_off + x + 1)
+            // Gx = -tl + tr - 2*ml + 2*mr - bl + br
+            // Use int_mul for the 2* coefficient even though the operands
+            // are at most 255 (the per-byte values stay small but the
+            // accumulator can be negative and we want to stay safe).
+            let gx = int_sub(tr, tl)
+            gx = int_add(gx, int_sub(int_mul(2, mr), int_mul(2, ml)))
+            gx = int_add(gx, int_sub(br, bl))
+            // Gy = -tl - 2*tm - tr + bl + 2*bm + br
+            let gy = int_sub(bl, tl)
+            gy = int_add(gy, int_sub(int_mul(2, bm), int_mul(2, tm)))
+            gy = int_add(gy, int_sub(br, tr))
+            let abs_gx = gx
+            if abs_gx < 0 { abs_gx = 0 - abs_gx }
+            let abs_gy = gy
+            if abs_gy < 0 { abs_gy = 0 - abs_gy }
+            let m = int_add(abs_gx, abs_gy)
+            // Store the magnitude clamped to 0..255 so it fits in a byte.
+            // Even with the L1 norm Sobel's theoretical max is
+            // 4*255 = 1020 (Gx ~= 1020) so we clamp.
+            let m_byte = m
+            if m_byte > 255 { m_byte = 255 }
+            let off = int_add(row_mid_off, x)
+            store8(mag + off, m_byte)
+            // Orientation bucket. We pick by comparing magnitudes:
+            //   |Gy| > 2 * |Gx|       -> bucket 2 (vertical, 90 deg)
+            //   |Gx| > 2 * |Gy|       -> bucket 0 (horizontal, 0 deg)
+            //   else: diagonal. Sign of Gx*Gy: positive -> 45, negative -> 135.
+            if m > SOBEL_EDGE_THRESHOLD {
+                let bucket = 0
+                if int_mul(2, abs_gx) < abs_gy {
+                    bucket = 2
+                } else {
+                    if int_mul(2, abs_gy) < abs_gx {
+                        bucket = 0
+                    } else {
+                        // Diagonal: distinguish by sign of Gx * Gy. We
+                        // never actually take that product (it'd hit the
+                        // pointer threshold for unlucky values), instead
+                        // we check Gx and Gy signs directly.
+                        let gx_pos = 0
+                        if gx > 0 { gx_pos = 1 }
+                        if gx == 0 { gx_pos = 1 }
+                        let gy_pos = 0
+                        if gy > 0 { gy_pos = 1 }
+                        if gy == 0 { gy_pos = 1 }
+                        if gx_pos == gy_pos { bucket = 1 }
+                        else { bucket = 3 }
+                    }
+                }
+                store8(orient + off, bucket)
+                list_set(orient_counts, bucket, int_add(orient_counts[bucket], 1))
+                edge_count = int_add(edge_count, 1)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return _sobel_result(mag, orient, edge_count, area, orient_counts)
+}
+
+// ---- aggregate helpers ---------------------------------------------------
+
+// Edge density in milli-units (parts per thousand). 100 milli == 10%.
+fn sobel_edge_density_milli(edge_count, total_pixels) {
+    if total_pixels <= 0 { return 0 }
+    return int_mul(edge_count, 1000) / total_pixels
+}
+
+// sobel_dominant_orientation(orient_counts) -> 0..3, or -1 if all bins are zero.
+fn sobel_dominant_orientation(orient_counts) {
+    if len(orient_counts) < SOBEL_ORIENT_BUCKETS { return -1 }
+    let best = -1
+    let best_n = 0
+    let k = 0
+    while k < SOBEL_ORIENT_BUCKETS {
+        if orient_counts[k] > best_n {
+            best_n = orient_counts[k]
+            best = k
+        }
+        k = int_add(k, 1)
+    }
+    return best
+}
+
+// sobel_orient_label(bucket) -> "image_orient_0" / "image_orient_45" /
+//                               "image_orient_90" / "image_orient_135"
+fn sobel_orient_label(bucket) {
+    if bucket == 0 { return "image_orient_0" }
+    if bucket == 1 { return "image_orient_45" }
+    if bucket == 2 { return "image_orient_90" }
+    if bucket == 3 { return "image_orient_135" }
+    return ""
+}
+
+// ---- result-tuple accessors ----------------------------------------------
+
+fn sobel_result_magnitudes(r)    { return r[SOBEL_R_MAGNITUDES] }
+fn sobel_result_orientations(r)  { return r[SOBEL_R_ORIENTATIONS] }
+fn sobel_result_edge_count(r)    { return r[SOBEL_R_EDGE_COUNT] }
+fn sobel_result_total(r)         { return r[SOBEL_R_TOTAL] }
+fn sobel_result_orient_counts(r) { return r[SOBEL_R_ORIENT_COUNTS] }

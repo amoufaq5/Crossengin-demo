@@ -1,0 +1,509 @@
+// CrossEngin safety: canonical pure-NOVA SHA-1 + HMAC-SHA1 primitive.
+//
+// Purpose
+//   Before this round, every consumer of SHA-1 in the tree shipped its
+//   own inline FIPS 180-4 implementation: `_srtp_sha1_*` family in
+//   `src/federation/srtp.nova` (R34C, ~150 lines) and `_turn_sha1_*` +
+//   `_turn_hmac_sha1` in `src/federation/turn.nova` (R36A, ~120 lines
+//   of SHA-1 + RFC 2104 wrapper).
+//
+//   R34C documented the duplication as an R34A.3-style follow-up
+//   candidate; R36A documented its own re-inline as deferred to a
+//   future R36A.2 that would canonicalize MD5 + SHA-1 alongside the
+//   sha256.nova dedup pattern R33A established. R37C closes both.
+//
+//   The cleanest source copy (the `_srtp_sha1_*` family lifted from
+//   `src/federation/srtp.nova`, R34C -- which itself mirrors the
+//   shape of `src/safety/sha256.nova`) is promoted to this module;
+//   the K table, IV, compression function, padding, and HMAC
+//   construction are byte-for-byte the same FIPS 180-4 / RFC 3174 /
+//   RFC 2104 recipe every reference implementation in the tree
+//   implements. Both consumers (turn, srtp) replace their inline
+//   copies with calls into this module via thin per-module adapters
+//   that keep the existing public symbols byte-identical (so callers
+//   don't need to know the refactor happened).
+//
+// Historical caveat -- SHA-1 collision attacks
+//   SHA-1 is no longer considered collision-resistant. SHAttered
+//   (Stevens et al., 2017) demonstrated the first practical SHA-1
+//   collision; modern protocols REPLACE SHA-1 with SHA-256 or
+//   SHA-3. Despite that, three RFCs ACTIVELY mandate SHA-1 in
+//   protocols this tree must remain compatible with:
+//     * RFC 3174 -- the SHA-1 spec itself; this module is the
+//       reference implementation.
+//     * RFC 5389 §15.4 -- STUN MESSAGE-INTEGRITY = HMAC-SHA1 over
+//       the message prefix using MD5(user:realm:pass) as the key.
+//       TURN (RFC 5766 / 8656) inherits this.
+//     * RFC 3711 §4.2 -- SRTP authentication tag = HMAC-SHA1
+//       truncated to 80 bits over the RTP header + ciphertext +
+//       32-bit rollover counter.
+//   Modern replacements (SCRAM-SHA256 / RFC 7635 for STUN; SRTP-AES-GCM
+//   for SRTP) are out of scope for the current round.
+//
+// API
+//   sha1_oneshot(buf, n) -> 21-byte alloc'd buffer
+//     20 bytes of digest + a trailing NUL byte (mirrors the sha256
+//     convention so the buffer can be passed to NOVA string contexts
+//     without extra allocation).
+//
+//   sha1_oneshot_str(s) -> 21-byte alloc'd buffer
+//     Convenience wrapper for an ASCII-only NOVA string.
+//
+//   sha1_init() -> state
+//     Streaming SHA-1: returns an opaque state value (a NOVA list
+//     containing the working H[0..4] + a 64-byte buffer for partial
+//     input + a total-length counter). Pass it to sha1_update / final.
+//
+//   sha1_update(st, buf, n) -> state
+//     Absorbs n bytes from buf into the streaming hash. Returns the
+//     same state value; the state is mutated in place.
+//
+//   sha1_final(st) -> 21-byte digest buffer
+//     Finalizes the streaming hash (applies FIPS 180-4 padding) and
+//     emits the same 21-byte buffer shape as sha1_oneshot. After
+//     this call the state must not be reused.
+//
+//   hmac_sha1(key_buf, key_n, msg_buf, msg_n) -> 21-byte buffer
+//     RFC 2104 HMAC-SHA1. Key normalization follows RFC 2104:
+//     keys > 64 bytes are pre-hashed, keys < 64 bytes are zero-padded
+//     up to the SHA-1 block length.
+//
+// Constants
+//   SHA1_HASH_LEN    = 20  (digest length in bytes)
+//   SHA1_BLOCK_LEN   = 64  (compression block length in bytes)
+//
+// Algorithm references
+//   FIPS 180-4 §5.3.1, §6.1 -- SHA-1 IV, K table, compression function.
+//   FIPS 180-4 §5.1.1       -- padding rule (append 0x80, zero-pad to
+//                              mod 64 == 56, append BE 64-bit bit length).
+//   RFC 3174                -- SHA-1 reference + test vectors.
+//   RFC 2104 §2             -- HMAC construction (ipad / opad XOR pads).
+//   RFC 2202 §3             -- HMAC-SHA1 known-answer vectors (used
+//                              by tests/unit/test_sha1.nova).
+//
+// Constant-time / side-channel caveats
+//   The compression function uses pure 32-bit arithmetic with no
+//   data-dependent branches (the only conditionals are loop bounds
+//   and the constant-time-safe `if rem >= 56` padding choice in
+//   sha1_final). For HMAC the key-pad fast path branches on
+//   `key_n > 64`, which leaks ONLY the key LENGTH -- not the key
+//   bytes. STUN / TURN / SRTP all treat the key length as public.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R37C canonical SHA-1 + MD5). NOVA
+//   dependencies: builtins only (alloc / store8 / load8 / int_* /
+//   list ops). CrossEngin dependencies: none -- this is a leaf module
+//   so every other safety / federation module can pull it in without
+//   circular-import risk.
+
+import "std/io"
+
+// ============================================================================
+//                          Constants
+// ============================================================================
+
+let SHA1_HASH_LEN  = 20
+let SHA1_BLOCK_LEN = 64
+
+let _SHA1_MASK32   = 4294967295   // 0xFFFFFFFF
+
+// ============================================================================
+//                          32-bit arithmetic helpers
+// ============================================================================
+//
+// SHA-1 is defined over 32-bit unsigned words; NOVA integers are
+// machine-width so we mask down after every operation that could
+// overflow 32 bits. Mirrors the pattern in sha256.nova.
+
+fn _sha1_mask32(x) { return int_and(x, _SHA1_MASK32) }
+fn _sha1_add32(a, b) { return _sha1_mask32(int_add(a, b)) }
+fn _sha1_xor32(a, b) { return _sha1_mask32(int_xor(a, b)) }
+fn _sha1_and32(a, b) { return _sha1_mask32(int_and(a, b)) }
+fn _sha1_or32(a, b)  { return _sha1_mask32(int_or(a, b)) }
+fn _sha1_not32(x)    { return _sha1_mask32(int_xor(x, _SHA1_MASK32)) }
+
+// 32-bit rotate-left -- SHA-1 uses rotl (vs SHA-256's rotr).
+fn _sha1_rotl32(x, n) {
+    let left  = _sha1_mask32(int_shl(x, n))
+    let right = int_shr(_sha1_mask32(x), 32 - n)
+    return _sha1_mask32(int_or(left, right))
+}
+
+// Big-endian 32-bit load / store for the SHA-1 message schedule.
+fn _sha1_load_be32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return _sha1_mask32(v)
+}
+
+fn _sha1_store_be32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+// ============================================================================
+//                          FIPS 180-4 K-table + IV
+// ============================================================================
+//
+// K[t]: four 32-bit constants spanning rounds 0..19, 20..39, 40..59,
+// 60..79. Byte-identical to every other SHA-1 copy in the tree (and
+// to every reference implementation in the wild). FIPS 180-4 §4.2.1.
+
+fn _sha1_k(t) {
+    if t < 20 { return 1518500249 }   // 0x5a827999
+    if t < 40 { return 1859775393 }   // 0x6ed9eba1
+    if t < 60 { return 2400959708 }   // 0x8f1bbcdc
+    return 3395469782                 // 0xca62c1d6
+}
+
+// Initial hash values H[0..4] (FIPS 180-4 §5.3.1).
+fn _sha1_init_h() {
+    let h = list_new()
+    push(h, 1732584193)   // 0x67452301
+    push(h, 4023233417)   // 0xefcdab89
+    push(h, 2562383102)   // 0x98badcfe
+    push(h, 271733878)    // 0x10325476
+    push(h, 3285377520)   // 0xc3d2e1f0
+    return h
+}
+
+// ============================================================================
+//                          Compression function
+// ============================================================================
+//
+// Process exactly one 64-byte block. Updates `h` in place (NOVA lists
+// are reference-typed via list_set). The compression follows FIPS 180-4
+// §6.1.2 verbatim.
+
+fn _sha1_compress(h, blk) {
+    // 1. Build the 80-word message schedule W. W[0..15] = blk parsed
+    //    big-endian. W[16..79] = rotl(W[i-3] XOR W[i-8] XOR W[i-14]
+    //    XOR W[i-16], 1).
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _sha1_load_be32(blk, i * 4))
+        i = i + 1
+    }
+    while i < 80 {
+        let v = _sha1_xor32(
+                  _sha1_xor32(w[i - 3], w[i - 8]),
+                  _sha1_xor32(w[i - 14], w[i - 16]))
+        push(w, _sha1_rotl32(v, 1))
+        i = i + 1
+    }
+    // 2. Working variables a..e are snapshotted from H[0..4].
+    let a = h[0]
+    let b = h[1]
+    let c = h[2]
+    let d = h[3]
+    let e = h[4]
+    // 3. 80-round compression loop.
+    let t = 0
+    while t < 80 {
+        let f = 0
+        if t < 20 {
+            // (b AND c) OR ((NOT b) AND d)
+            f = _sha1_or32(_sha1_and32(b, c),
+                           _sha1_and32(_sha1_not32(b), d))
+        } else {
+            if t < 40 {
+                // b XOR c XOR d
+                f = _sha1_xor32(_sha1_xor32(b, c), d)
+            } else {
+                if t < 60 {
+                    // (b AND c) OR (b AND d) OR (c AND d)
+                    f = _sha1_or32(
+                          _sha1_or32(_sha1_and32(b, c),
+                                     _sha1_and32(b, d)),
+                          _sha1_and32(c, d))
+                } else {
+                    // b XOR c XOR d
+                    f = _sha1_xor32(_sha1_xor32(b, c), d)
+                }
+            }
+        }
+        let temp = _sha1_add32(
+                     _sha1_add32(
+                       _sha1_add32(_sha1_rotl32(a, 5), f),
+                       _sha1_add32(e, w[t])),
+                     _sha1_k(t))
+        e = d
+        d = c
+        c = _sha1_rotl32(b, 30)
+        b = a
+        a = temp
+        t = t + 1
+    }
+    // 4. Add working vars back into H.
+    list_set(h, 0, _sha1_add32(h[0], a))
+    list_set(h, 1, _sha1_add32(h[1], b))
+    list_set(h, 2, _sha1_add32(h[2], c))
+    list_set(h, 3, _sha1_add32(h[3], d))
+    list_set(h, 4, _sha1_add32(h[4], e))
+    return 1
+}
+
+// ============================================================================
+//                          One-shot interface
+// ============================================================================
+//
+// `sha1_oneshot(buf, n)` is the simplest entry point: pass a byte
+// buffer + length, get back a freshly alloc'd 21-byte buffer (20 bytes
+// of digest + trailing NUL for allocator slack).
+
+fn sha1_oneshot(msg_buf, n) {
+    let h = _sha1_init_h()
+    let full_blocks = int_shr(n, 6)         // n / 64
+    let i = 0
+    while i < full_blocks {
+        _sha1_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    // FIPS 180-4 §5.1.1 padding: append 0x80, zero-pad to (mod 64 == 56),
+    // append 64-bit big-endian bit length.
+    let rem = n - full_blocks * 64
+    let total_bits_lo = _sha1_mask32(int_shl(n, 3))
+    let total_bits_hi = _sha1_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)    // 0x80
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _sha1_store_be32(pad, final_size - 8, total_bits_hi)
+    _sha1_store_be32(pad, final_size - 4, total_bits_lo)
+    _sha1_compress(h, pad)
+    if need_two == 1 {
+        _sha1_compress(h, pad + 64)
+    }
+    // Emit H[0..4] as 20 big-endian bytes, NUL-terminated.
+    let out = alloc(SHA1_HASH_LEN + 1)
+    let k = 0
+    while k < 5 {
+        _sha1_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + SHA1_HASH_LEN, 0)
+    return out
+}
+
+// String wrapper: SHA-1 of an ASCII-only NOVA string (no embedded
+// NULs). Returns a 21-byte alloc'd buffer (20B digest + trailing NUL).
+fn sha1_oneshot_str(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return sha1_oneshot(buf, n)
+}
+
+// ============================================================================
+//                          Streaming interface
+// ============================================================================
+//
+// The streaming state is a 4-cell list:
+//   [0] H[0..4]   -- the 5-word working hash (a NOVA list)
+//   [1] partial_buf -- a 64-byte alloc'd buffer holding any tail bytes
+//                      that haven't been compressed yet (length 0..63)
+//   [2] partial_n -- number of bytes in partial_buf (0..63)
+//   [3] total_n   -- total bytes absorbed so far (for the final
+//                    bit-length encoding in sha1_final)
+//
+// The streaming API is functionally equivalent to sha1_oneshot for
+// any (buf, n) pair: a test in test_sha1.nova proves equivalence
+// across 5 splitting strategies.
+
+let _SHA1_ST_H        = 0
+let _SHA1_ST_PARTIAL  = 1
+let _SHA1_ST_PARTIAL_N = 2
+let _SHA1_ST_TOTAL_N  = 3
+let _SHA1_ST_LEN      = 4
+
+fn sha1_init() {
+    let st = list_new()
+    push(st, _sha1_init_h())   // working H[0..4]
+    push(st, alloc(SHA1_BLOCK_LEN + 1))  // partial-block buffer
+    push(st, 0)                  // bytes in partial_buf
+    push(st, 0)                  // total bytes absorbed
+    return st
+}
+
+// Absorb n bytes from `buf` into the streaming state. Returns the same
+// state (mutated in place). Safe to call with n == 0.
+fn sha1_update(st, buf, n) {
+    if n <= 0 { return st }
+    let h = st[_SHA1_ST_H]
+    let partial = st[_SHA1_ST_PARTIAL]
+    let partial_n = st[_SHA1_ST_PARTIAL_N]
+    let off = 0
+    // First, top up the partial buffer if it has anything in it. Once
+    // it reaches 64 bytes, compress it and reset.
+    if partial_n > 0 {
+        let want = SHA1_BLOCK_LEN - partial_n
+        if want > n { want = n }
+        let i = 0
+        while i < want {
+            store8(partial + partial_n + i, load8(buf + off + i))
+            i = i + 1
+        }
+        partial_n = partial_n + want
+        off = off + want
+        if partial_n == SHA1_BLOCK_LEN {
+            _sha1_compress(h, partial)
+            partial_n = 0
+        }
+    }
+    // Compress every full 64-byte block straight from `buf`.
+    while off + SHA1_BLOCK_LEN <= n {
+        _sha1_compress(h, buf + off)
+        off = off + SHA1_BLOCK_LEN
+    }
+    // Stash any tail bytes in the partial buffer.
+    let tail = n - off
+    if tail > 0 {
+        let j = 0
+        while j < tail {
+            store8(partial + partial_n + j, load8(buf + off + j))
+            j = j + 1
+        }
+        partial_n = partial_n + tail
+    }
+    list_set(st, _SHA1_ST_PARTIAL_N, partial_n)
+    list_set(st, _SHA1_ST_TOTAL_N, st[_SHA1_ST_TOTAL_N] + n)
+    return st
+}
+
+// Apply FIPS 180-4 padding to the streaming state's tail bytes and
+// emit the final 21-byte digest buffer (20B + trailing NUL). The state
+// must not be reused after this call.
+fn sha1_final(st) {
+    let h = st[_SHA1_ST_H]
+    let partial = st[_SHA1_ST_PARTIAL]
+    let partial_n = st[_SHA1_ST_PARTIAL_N]
+    let total_n = st[_SHA1_ST_TOTAL_N]
+    let total_bits_lo = _sha1_mask32(int_shl(total_n, 3))
+    let total_bits_hi = _sha1_mask32(int_shr(total_n, 29))
+    // Need either one final block (rem <= 55) or two (rem >= 56).
+    let need_two = 0
+    if partial_n >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < partial_n {
+        store8(pad + j, load8(partial + j))
+        j = j + 1
+    }
+    store8(pad + partial_n, 128)
+    j = partial_n + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _sha1_store_be32(pad, final_size - 8, total_bits_hi)
+    _sha1_store_be32(pad, final_size - 4, total_bits_lo)
+    _sha1_compress(h, pad)
+    if need_two == 1 {
+        _sha1_compress(h, pad + 64)
+    }
+    let out = alloc(SHA1_HASH_LEN + 1)
+    let k = 0
+    while k < 5 {
+        _sha1_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + SHA1_HASH_LEN, 0)
+    return out
+}
+
+// ============================================================================
+//                          HMAC-SHA1 (RFC 2104)
+// ============================================================================
+//
+// HMAC-SHA1 over byte buffers. Key normalization follows RFC 2104:
+//   * keys longer than 64 bytes are pre-hashed
+//   * keys shorter than 64 bytes are zero-padded up to 64 bytes
+// Returns a freshly alloc'd 21-byte buffer (20B digest + trailing NUL).
+
+fn hmac_sha1(key_buf, key_n, msg_buf, msg_n) {
+    // 1. Normalize the key to exactly SHA1_BLOCK_LEN bytes.
+    let k_block = alloc(SHA1_BLOCK_LEN + 1)
+    let i = 0
+    while i < SHA1_BLOCK_LEN {
+        store8(k_block + i, 0)
+        i = i + 1
+    }
+    if key_n > SHA1_BLOCK_LEN {
+        // Hash the long key first.
+        let h = sha1_oneshot(key_buf, key_n)
+        let j = 0
+        while j < SHA1_HASH_LEN {
+            store8(k_block + j, load8(h + j))
+            j = j + 1
+        }
+    } else {
+        let j = 0
+        while j < key_n {
+            store8(k_block + j, load8(key_buf + j))
+            j = j + 1
+        }
+    }
+    // 2. ipad / opad XOR.
+    let ipad = alloc(SHA1_BLOCK_LEN + 1)
+    let opad = alloc(SHA1_BLOCK_LEN + 1)
+    i = 0
+    while i < SHA1_BLOCK_LEN {
+        store8(ipad + i, int_xor(load8(k_block + i), 54))    // 0x36
+        store8(opad + i, int_xor(load8(k_block + i), 92))    // 0x5c
+        i = i + 1
+    }
+    // 3. inner = SHA-1(ipad || msg).
+    let inner_in = alloc(SHA1_BLOCK_LEN + msg_n + 1)
+    i = 0
+    while i < SHA1_BLOCK_LEN {
+        store8(inner_in + i, load8(ipad + i))
+        i = i + 1
+    }
+    let m = 0
+    while m < msg_n {
+        store8(inner_in + SHA1_BLOCK_LEN + m, load8(msg_buf + m))
+        m = m + 1
+    }
+    let inner = sha1_oneshot(inner_in, SHA1_BLOCK_LEN + msg_n)
+    // 4. outer = SHA-1(opad || inner).
+    let outer_in = alloc(SHA1_BLOCK_LEN + SHA1_HASH_LEN + 1)
+    i = 0
+    while i < SHA1_BLOCK_LEN {
+        store8(outer_in + i, load8(opad + i))
+        i = i + 1
+    }
+    i = 0
+    while i < SHA1_HASH_LEN {
+        store8(outer_in + SHA1_BLOCK_LEN + i, load8(inner + i))
+        i = i + 1
+    }
+    return sha1_oneshot(outer_in, SHA1_BLOCK_LEN + SHA1_HASH_LEN)
+}

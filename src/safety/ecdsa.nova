@@ -1,0 +1,292 @@
+// CrossEngin safety: pure-NOVA ECDSA-P-256 signature verification + SHA-256.
+//
+// Purpose
+//   The DTLS 1.2 record-layer + handshake skeleton in
+//   `src/federation/dtls12.nova` (R29B) leaves `dtls_cert_verify_R29B2_STUB`
+//   as the last unfilled cryptographic stub. The ECDHE-ECDSA-AES128-GCM-
+//   SHA256 cipher suite (0xC02B) it negotiates needs server-side X.509
+//   certificate signature validation: hash the tbsCertificate, then
+//   verify the ECDSA-P256 signature pulled from the certificate envelope.
+//   R30B (commit 17e9cb8) shipped P-256 ECDH using the same curve
+//   arithmetic but with the ECDH algorithm (scalar * peer point). This
+//   module reuses `src/safety/p256.nova`'s field + group primitives and
+//   adds the ECDSA verify algorithm on top: the underlying curve math is
+//   shared, only the high-level recipe differs.
+//
+//   R32C ships the FOUNDATION (this module + `src/safety/x509.nova`).
+//   R32C.2 (future round) wires both into `dtls12.nova` to retire the
+//   `dtls_cert_verify_R29B2_STUB` slot. R32C does NOT touch
+//   `dtls12.nova` -- that's a parallel-agent ownership rule, mirroring
+//   how R30B did not touch `dtls12.nova` when it shipped the ECDH
+//   primitive that R31B later wired in.
+//
+// Algorithm references
+//   * FIPS 186-4 section 6.4 -- "ECDSA Signature Verification". The
+//     canonical recipe:
+//       Input: pub Q, msg hash e (truncated to bitlen(n)), signature (r, s)
+//       1. Reject if r or s not in [1, n-1].
+//       2. w = s^-1 mod n.
+//       3. u1 = e * w mod n; u2 = r * w mod n.
+//       4. (x, y) = u1 * G + u2 * Q   (point addition on the curve)
+//       5. Reject if (x, y) is the identity.
+//       6. Accept iff (x mod n) == r.
+//   * RFC 6979 section 2.4 -- the same recipe, with a note that the
+//     hash `e` is the LEFTMOST bitlen(n) bits of the digest. For
+//     P-256 and SHA-256, the hash is exactly 256 bits long, so the
+//     truncation step is a no-op: `e = SHA-256(message) mod 2^256`,
+//     then we reduce mod n inside the multiplications.
+//   * FIPS 180-4 -- SHA-256, used to hash the TBS bytes before verify.
+//
+// SHA-256 (R33A canonical dedup)
+//   R33A landed `src/safety/sha256.nova` as the canonical SHA-256 /
+//   HMAC-SHA256 primitive. This module previously inlined a private
+//   `_ecdsa_sha256_*` copy of FIPS 180-4 (one of four byte-identical
+//   copies across the tree); after R33A this module imports the
+//   canonical and `ecdsa_sha256(msg_buf, n)` is a thin wrapper around
+//   `sha256_oneshot`. The wrapper exists because callers (test_x509,
+//   test_ecdsa, the verify_full path) expect the `ecdsa_sha256` symbol
+//   and the same 33-byte (32B digest + trailing NUL) buffer shape; we
+//   keep the wrapper rather than churn the call sites so the refactor
+//   is byte-identical at the wire level. `dtls12.nova` still ships its
+//   own `dtls_sha256` for one more round -- the dedup of that fourth
+//   copy lands in a follow-up after R33A + R33B's parallel work both
+//   merge.
+//
+// Reuse of p256.nova
+//   * `p256_curve_n()` -- the subgroup order n (used to bound r, s).
+//   * `p256_base_point()` -- the base point G as [Gx, Gy] affine.
+//   * `p256_decode_point()` -- decode an SEC1 uncompressed/compressed
+//     public-key buffer into an affine (X, Y).
+//   * `p256_scalar_mult()` -- compute scalar * affine -> affine.
+//   * `p256_pt_add_affine()` -- add two affine points -> affine.
+//   * `_p256_bytes_to_bn()` -- big-endian 32-byte -> bn256.
+//
+// Scalar arithmetic mod n
+//   For modular inverse we use Fermat's little theorem (n is prime):
+//   s^-1 = s^(n-2) mod n, via `bn256_modpow_ct` against n. For modular
+//   multiplication we use `bn256_modmul(a, b, n)` -- the Montgomery
+//   context is built per-call; the ~3-call overhead for a single verify
+//   is dominated by the two scalar multiplications on the curve, so the
+//   ctx caching that p256 does for the FIELD prime is not duplicated
+//   here for the GROUP prime.
+//
+// Constant-time / side-channel caveats (R32C.3 hardening followup)
+//   * `ecdsa_p256_verify` is NOT constant-time. The inner
+//     `p256_scalar_mult` uses double-and-add (data-dependent conditional
+//     add per scalar bit -- inherited from p256.nova's R30B.3 hardening
+//     item). For VERIFY this exposure is academic: the scalar inputs
+//     (u1, u2) and the public key are all PUBLIC values; an attacker
+//     observing timing learns nothing they don't already know. The
+//     side-channel concern only matters for the SIGN path, which this
+//     module does NOT ship (DTLS server-side certificate-based auth
+//     verifies the peer's signature; the local key is the long-term
+//     identity loaded via `ed25519` for snapshot signing, not ECDSA).
+//   * Comparison `x mod n == r` does early-exit on first mismatch via
+//     bn256_eq -- again, both operands are public.
+//   * `r in [1, n-1]` and `s in [1, n-1]` range checks short-circuit
+//     BEFORE any curve math, which protects against malformed sig
+//     length attacks but doesn't leak secret-dependent state.
+//
+// Public API
+//   ecdsa_sha256(msg_buf, n)              -> 33-byte buffer (32B digest +
+//                                            trailing NUL byte). Thin
+//                                            adapter that forwards to
+//                                            `sha256_oneshot` from
+//                                            `src/safety/sha256.nova`
+//                                            (R33A canonical dedup).
+//   ecdsa_sha256_bytes(byte_list)         -> 32-element byte list (variant
+//                                            for callers holding a NOVA
+//                                            byte list rather than a
+//                                            buffer + length pair).
+//                                            Forwards to
+//                                            `sha256_oneshot_bytes`.
+//   ecdsa_p256_verify(pub_buf, pub_n,
+//                     hash_buf,
+//                     sig_r_buf, sig_s_buf)
+//                                         -> 1 if signature valid,
+//                                            0 otherwise
+//     `pub_buf` is the SEC1 uncompressed or compressed public-key
+//     encoding (65 or 33 bytes). `pub_n` is its length. `hash_buf` is
+//     the 32-byte big-endian message hash (SHA-256 output). `sig_r_buf`
+//     and `sig_s_buf` are the 32-byte big-endian r and s scalars.
+//   ecdsa_p256_verify_full(pub_buf, pub_n,
+//                          msg_buf, msg_n,
+//                          sig_r_buf, sig_s_buf)
+//                                         -> 1 if SHA-256(msg) + ECDSA
+//                                            verify matches, 0 otherwise
+//   ecdsa_p256_verify_bn(pub_buf, pub_n,
+//                        hash_bn, r_bn, s_bn)
+//                                         -> 1 if signature valid, 0
+//                                            otherwise; pre-decoded
+//                                            bn256 variant used by
+//                                            x509.nova which already
+//                                            parsed the ASN.1 INTEGERs
+//                                            into bn256.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R32C cert-verify foundation,
+//   prepares R29B's dtls_cert_verify_R29B2_STUB for R32C.2 wiring;
+//   R33A canonical SHA-256 dedup).
+// NOVA dependencies: builtins (alloc, store8, load8, int_*, list_*,
+//   secure_random unused but available).
+// CrossEngin dependencies:
+//   * src/safety/sha256.nova -- canonical FIPS 180-4 SHA-256 (R33A).
+//   * src/safety/p256.nova -- field + group primitives, SEC1 codec,
+//     scalar mult on the NIST P-256 curve.
+//   * src/safety/bignum_256.nova -- transitively via p256.nova, used
+//     directly for bn256_modmul / bn256_modpow_ct / bn256_cmp against n.
+
+import "../safety/sha256.nova"
+import "../safety/p256.nova"
+
+// ============================================================================
+//                  SHA-256 (FIPS 180-4) -- thin adapters
+// ============================================================================
+//
+// Pre-R33A this module carried a private `_ecdsa_sha_*` family that was
+// byte-identical to the SHA-256 in `noise_xk.nova`, `merkle.nova`, and
+// `dtls12.nova`. R33A extracted those four copies into the canonical
+// `src/safety/sha256.nova`; the two public symbols below remain so
+// existing callers (test_x509, test_ecdsa, x509.nova's combined verify
+// path) don't have to learn a new name. Each is a one-line forward to
+// the canonical entry point.
+
+// SHA-256 of n bytes at msg_buf. Returns a 33-byte buffer (32B digest +
+// trailing NUL byte). Thin adapter over `sha256_oneshot` (R33A canonical).
+fn ecdsa_sha256(msg_buf, n) {
+    return sha256_oneshot(msg_buf, n)
+}
+
+// SHA-256 of a NOVA byte list. Returns a 32-element byte list.
+// Thin adapter over `sha256_oneshot_bytes` (R33A canonical).
+fn ecdsa_sha256_bytes(byte_list) {
+    return sha256_oneshot_bytes(byte_list)
+}
+
+// ============================================================================
+//                  ECDSA-P-256 verify (FIPS 186-4 §6.4)
+// ============================================================================
+//
+// Given a public key Q (decoded into an affine point), a 32-byte hash e,
+// and signature scalars (r, s):
+//   1. Reject if r or s not in [1, n-1].
+//   2. w = s^-1 mod n.
+//   3. u1 = e * w mod n; u2 = r * w mod n.
+//   4. (X, Y) = u1 * G + u2 * Q on the curve.
+//   5. Reject if the result is the identity (point at infinity).
+//   6. Accept iff (X mod n) == r.
+
+// Modular inverse of x mod the SUBGROUP order n via Fermat (n is prime).
+// w = x^(n-2) mod n. Returns 0 if x is zero (caller must check).
+fn _ecdsa_n_inv(x) {
+    let n = p256_curve_n()
+    if bn256_zero(x) != 0 { return bn256_new() }
+    let two = bn256_from_int(2)
+    let exp = bn256_sub(n, two)             // n - 2
+    return bn256_modpow_ct(x, exp, n)
+}
+
+// Range check: 1 <= x < n. Returns 1 if in range, 0 otherwise.
+fn _ecdsa_in_range_n(x) {
+    let n = p256_curve_n()
+    if bn256_zero(x) != 0 { return 0 }
+    if bn256_cmp(x, n) >= 0 { return 0 }
+    return 1
+}
+
+// ECDSA verify with pre-decoded bn256 inputs. Used by `x509_parse` ->
+// `ecdsa_p256_verify_bn` (the ASN.1 INTEGER decode already produced
+// bn256 r, s). Returns 1 if the signature is valid for the public key
+// + message hash, 0 otherwise.
+//
+// Verify recipe (FIPS 186-4 §6.4):
+//   1. Range-check r, s in [1, n-1].
+//   2. Compute e = hash_bn (reduced mod n if needed).
+//   3. w = s^-1 mod n.
+//   4. u1 = e * w mod n; u2 = r * w mod n.
+//   5. (X, Y) = u1 * G + u2 * Q.
+//   6. Reject identity; accept iff X mod n == r.
+fn ecdsa_p256_verify_bn(pub_buf, pub_n, hash_bn, r_bn, s_bn) {
+    // Step 1: range checks BEFORE any curve math (defense vs malformed sig).
+    if _ecdsa_in_range_n(r_bn) == 0 { return 0 }
+    if _ecdsa_in_range_n(s_bn) == 0 { return 0 }
+    // Decode the public-key point. Q must be on the curve; p256_decode_point
+    // already enforces that, plus rejects bad tag / length / X >= p.
+    let Q = p256_decode_point(pub_buf, pub_n)
+    if Q == 0 { return 0 }
+    // Step 2: e = hash mod n (RFC 6979 §2.4 says leftmost bitlen(n) bits;
+    // for P-256 with SHA-256 the digest is exactly 256 bits, so reduce
+    // mod n is enough -- equivalent to "take all 256 bits as a big-endian
+    // integer, reduce mod n").
+    let n = p256_curve_n()
+    let e = hash_bn
+    if bn256_cmp(e, n) >= 0 {
+        e = bn256_mod(e, n)
+    }
+    // Step 3: w = s^-1 mod n.
+    let w = _ecdsa_n_inv(s_bn)
+    if bn256_zero(w) != 0 { return 0 }
+    // Step 4: u1, u2 mod n.
+    let u1 = bn256_modmul(e, w, n)
+    let u2 = bn256_modmul(r_bn, w, n)
+    // Step 5: (X, Y) = u1 * G + u2 * Q. We compute the two scalar mults
+    // independently via p256_scalar_mult, then add them via
+    // p256_pt_add_affine. Both inner calls return 0 sentinel on identity.
+    let G = p256_base_point()
+    let P1 = p256_scalar_mult(u1, G[0], G[1])
+    let P2 = p256_scalar_mult(u2, Q[0], Q[1])
+    // If either intermediate is identity, the sum is whichever non-zero
+    // term remains (since 0 + P = P in the group).
+    let X = 0
+    if P1 == 0 {
+        if P2 == 0 { return 0 }
+        X = P2[0]
+    } else {
+        if P2 == 0 {
+            X = P1[0]
+        } else {
+            let S = p256_pt_add_affine(P1[0], P1[1], P2[0], P2[1])
+            if S == 0 { return 0 }
+            X = S[0]
+        }
+    }
+    // Step 6: x mod n == r.
+    let x_mod_n = X
+    if bn256_cmp(x_mod_n, n) >= 0 {
+        x_mod_n = bn256_mod(x_mod_n, n)
+    }
+    return bn256_eq(x_mod_n, r_bn)
+}
+
+// ECDSA-P-256 verify with raw 32-byte big-endian buffers for the hash
+// and signature scalars. Public-key buffer is SEC1 (uncompressed 65B or
+// compressed 33B). Returns 1 on valid signature, 0 otherwise.
+fn ecdsa_p256_verify(pub_buf, pub_n, hash_buf, sig_r_buf, sig_s_buf) {
+    let hash_bn = _p256_bytes_to_bn(hash_buf, 0)
+    let r_bn = _p256_bytes_to_bn(sig_r_buf, 0)
+    let s_bn = _p256_bytes_to_bn(sig_s_buf, 0)
+    return ecdsa_p256_verify_bn(pub_buf, pub_n, hash_bn, r_bn, s_bn)
+}
+
+// One-shot: SHA-256 the message, then ECDSA-verify. Returns 1 / 0.
+fn ecdsa_p256_verify_full(pub_buf, pub_n, msg_buf, msg_n, sig_r_buf, sig_s_buf) {
+    let digest = ecdsa_sha256(msg_buf, msg_n)
+    return ecdsa_p256_verify(pub_buf, pub_n, digest, sig_r_buf, sig_s_buf)
+}
+
+// ============================================================================
+//                  Hex codec (mirror of p256_hex_decode)
+// ============================================================================
+//
+// Re-exported under an ecdsa_* prefix so the unit tests can decode hex
+// vectors without importing p256 directly (the import IS transitive via
+// p256.nova, but the symbolic re-export keeps the test file's
+// dependencies legible). Internally these just forward to the p256
+// helpers.
+
+fn ecdsa_hex_decode(hex_str) {
+    return p256_hex_decode(hex_str)
+}
+
+fn ecdsa_hex_encode_buf(buf, n) {
+    return p256_hex_encode_buf(buf, n)
+}

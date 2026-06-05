@@ -1,0 +1,192 @@
+// CrossEngin benchmark: approximate-nearest-neighbor (ANN) query speedup
+// at 1000 atoms (P3.4).
+//
+// Purpose
+//   Phase-boundary performance check for the LSH side-index over atom
+//   embeddings. Builds a KG with N=1000 atoms each carrying a unique
+//   embedding, then times two equivalent operations head-to-head:
+//
+//     A) Linear scan: compute `vec_cosine(query_vec, atom_embed(atom))`
+//        for every atom in the KG, pick the top-5 by cosine.
+//     B) ANN query: `ann_query(ann, kg_atoms(kg), query_vec, 5)` -- hash
+//        the query, walk the matching bucket, score only that bucket.
+//
+//   The expected ratio is ~50-100x on a 1000-atom KG with K=8 hyperplanes
+//   (256 buckets, average bucket size ~4-8). The brief asks for "100x
+//   speedup at 1000 atoms" as the acceptance bar.
+//
+//   The clock is `nanotime()` for ns-resolution -- `time()` only resolves to
+//   seconds and the indexed path finishes well under 1s on its own.
+//
+// CrossEngin dependencies: src/kg/multi_kg_manager.nova (which transitively
+//   imports ann_index + atom_store).
+
+import "std/io"
+import "../../src/kg/multi_kg_manager.nova"
+
+// Build a deterministic, well-spread embedding for atom `i`. Same recipe as
+// the unit test: each dimension is fed by a small LCG so the embedding
+// varies on every axis. Components in [0, 400] so `vec_cosine`'s
+// `dot * FP_SCALE` intermediate stays well under NOVA's codegen
+// pointer-threshold bug (intermediate magnitudes < 8 * 400^2 * 1000 = 1.28B).
+fn _embed_for(i, dims) {
+    let v = vec_new(dims)
+    let state = ((i + 1) * 31) & 32767
+    let d = 0
+    while d < dims {
+        state = ((state * 31) + (d * 17) + 7) & 32767
+        let r = state % 400
+        vec_set(v, d, r)
+        d = d + 1
+    }
+    return v
+}
+
+// Linear-scan top-K nearest neighbors by `vec_cosine`. Iterates every atom,
+// computes the full cosine, maintains a streaming top-K via swap-out of the
+// current worst. The streaming top-K is O(N*K) at K=5 -- O(5000) tiny ops
+// over N=1000 atoms, negligible alongside the N cosine evaluations themselves.
+// This is the pre-P3.4 query path.
+fn _linear_topk(atoms_list, q, max_results) {
+    let out = list_new()
+    let n = len(atoms_list)
+    let i = 0
+    while i < n {
+        let a = atoms_list[i]
+        if a != 0 {
+            let c = vec_cosine(q, atom_embed(a))
+            if len(out) < max_results {
+                let entry = list_new()
+                push(entry, atom_id(a))
+                push(entry, c)
+                push(out, entry)
+            } else {
+                // Find the worst-scoring entry in `out`; swap it for the
+                // new one if the new one beats it.
+                let worst = 0
+                let worst_score = out[0][1]
+                let j = 1
+                while j < len(out) {
+                    if out[j][1] < worst_score {
+                        worst = j
+                        worst_score = out[j][1]
+                    }
+                    j = j + 1
+                }
+                if c > worst_score {
+                    let entry = list_new()
+                    push(entry, atom_id(a))
+                    push(entry, c)
+                    list_set(out, worst, entry)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn safe_div(a, b) {
+    if b <= 0 { return a }
+    return a / b
+}
+
+fn main() {
+    println("=== CrossEngin benchmark: ANN query (P3.4 LSH) ===")
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "bench_ann")
+    let ann = ann_new(ATOM_EMBED_DIMS, 8)
+    kg_set_ann(kg, ann)
+    let n_atoms = 1000
+
+    // Insertion (instruments wall-clock for the build).
+    let t0 = nanotime()
+    let i = 0
+    while i < n_atoms {
+        let a = kg_add_atom(kg, ATOM_FACT, "ann_" + int_to_str(i), 0)
+        kg_atom_set_embed(kg, a, _embed_for(i, ATOM_EMBED_DIMS))
+        i = i + 1
+    }
+    let t_ins_ns = nanotime() - t0
+    println("  atoms inserted        : " + int_to_str(n_atoms))
+    println("  insert elapsed(ms)    : " + int_to_str(t_ins_ns / 1000000))
+
+    // Pre-build query vectors so the timed loops only pay the cost of the
+    // query itself. We use 100 distinct queries; the benchmark runs each
+    // query through both paths.
+    let queries = list_new()
+    let q_count = 100
+    let qi = 0
+    while qi < q_count {
+        push(queries, _embed_for(qi * 7 + 3, ATOM_EMBED_DIMS))
+        qi = qi + 1
+    }
+
+    // ---- A: linear scan (the pre-P3.4 path) ------------------------------
+    // Run many rounds so total elapsed >> noise. 100 queries x 50 rounds =
+    // 5000 cosine-over-all-1000 invocations.
+    let bench_rounds = 50
+    let lin_results = 0
+    let t_lin_0 = nanotime()
+    let r = 0
+    while r < bench_rounds {
+        let m = 0
+        while m < q_count {
+            let out = _linear_topk(kg_atoms(kg), queries[m], 5)
+            lin_results = lin_results + len(out)
+            m = m + 1
+        }
+        r = r + 1
+    }
+    let t_lin_ns = nanotime() - t_lin_0
+    let total_queries = bench_rounds * q_count
+
+    // ---- B: ANN query (the P3.4 path) -----------------------------------
+    let ann_results = 0
+    let t_ann_0 = nanotime()
+    let r2 = 0
+    while r2 < bench_rounds {
+        let m2 = 0
+        while m2 < q_count {
+            let out = ann_query(ann, kg_atoms(kg), queries[m2], 5)
+            ann_results = ann_results + len(out)
+            m2 = m2 + 1
+        }
+        r2 = r2 + 1
+    }
+    let t_ann_ns = nanotime() - t_ann_0
+
+    let t_lin_ms = t_lin_ns / 1000000
+    let t_ann_ms = t_ann_ns / 1000000
+    let speedup = 0
+    if t_ann_ns > 0 { speedup = t_lin_ns / t_ann_ns }
+
+    println("  --- linear scan vs LSH (N=" + int_to_str(n_atoms) + " atoms) ---")
+    println("  total queries          : " + int_to_str(total_queries))
+    println("  linear  elapsed(ms)    : " + int_to_str(t_lin_ms))
+    println("  ann     elapsed(ms)    : " + int_to_str(t_ann_ms))
+    println("  linear  queries/sec    : " + int_to_str(safe_div(total_queries * 1000, t_lin_ms)))
+    println("  ann     queries/sec    : " + int_to_str(safe_div(total_queries * 1000, t_ann_ms)))
+    println("  speedup (linear / ann) : " + int_to_str(speedup) + "x")
+    println("  linear  results count  : " + int_to_str(lin_results))
+    println("  ann     results count  : " + int_to_str(ann_results))
+
+    // Bucket distribution summary (the LSH quality signal).
+    let nonempty = 0
+    let maxsz = 0
+    let b = 0
+    while b < ann_bucket_total(ann) {
+        let c = ann_bucket_count(ann, b)
+        if c > 0 { nonempty = nonempty + 1 }
+        if c > maxsz { maxsz = c }
+        b = b + 1
+    }
+    println("  --- LSH bucket stats ---")
+    println("  bucket count           : " + int_to_str(ann_bucket_total(ann)))
+    println("  buckets nonempty       : " + int_to_str(nonempty))
+    println("  largest bucket size    : " + int_to_str(maxsz))
+    println("  avg nonempty bucket sz : " + int_to_str(safe_div(n_atoms, nonempty)))
+    println("benchmark complete")
+}
+
+main()

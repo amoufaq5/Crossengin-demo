@@ -1,0 +1,457 @@
+// Unit tests for src/io/transducers/image_panorama.nova (R22D --
+// panorama stitching: feature matching + RANSAC homography + warp +
+// blend).
+//
+// Hermetic coverage (~30 assertions):
+//   * Identity homography preserves coords (pano_homography_apply).
+//   * Translation homography maps coords by the expected offset.
+//   * pano_homography_invert produces the correct inverse for the
+//     translation case (composition with the original yields identity).
+//   * Identity warp: every output pixel matches the input pixel.
+//   * Translation warp: pixel at (sx, sy) in source lands at
+//     (sx + tx, sy + ty) in the output (subject to interior bounds).
+//   * RANSAC with 4 inlier correspondences + 0 outliers: finds the
+//     exact homography (inlier_count == 4) and the recovered H maps
+//     each (xa, ya) to (xb, yb) within 1 px.
+//   * RANSAC with 4 inliers + 4 outliers: still recovers the
+//     translation (inlier_count >= 4) and the recovered H does NOT
+//     accidentally classify the 4 outliers as inliers.
+//   * pano_blend: 100% A in A-only region; 50/50 in overlap; 100% B
+//     in B-only region.
+//   * pano_stitch on synthetic overlapping checkerboard halves: output
+//     covers full width with consistent intensity (non-black pixels at
+//     both left-edge and right-edge of the output canvas).
+//   * Edge case: uniform images -> no feature matches -> empty match
+//     list (graceful) AND stitch still produces a valid PGM buffer.
+//   * pano_match_features rejects degenerate inputs (null pointers,
+//     out-of-spec dims) -> empty list.
+//   * pano_ransac_homography with < 4 matches returns identity +
+//     inlier_count = 0.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_panorama.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+fn _flat_fixture(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Bright NxN spot at (sx, sy) on a dark background; matches the four-
+// spots / single-spot fixtures used by the SIFT + ORB suites.
+fn _spot_fixture(width, height, sx, sy, sz, intensity) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    let y = sy
+    while y < sy + sz {
+        if y >= 0 {
+            if y < height {
+                let row_off = y * width
+                let x = sx
+                while x < sx + sz {
+                    if x >= 0 {
+                        if x < width {
+                            store8(buf + row_off + x, intensity)
+                        }
+                    }
+                    x = x + 1
+                }
+            }
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Checkerboard fixture: alternating dark / light cells of cell_size px.
+// Useful structural fixture for the stitch test -- distinct corners
+// the ORB detector can latch onto everywhere in the image.
+fn _checker_fixture(width, height, cell_size) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let cy = y / cell_size
+        let x = 0
+        while x < width {
+            let cx = x / cell_size
+            let v = 0
+            if (cx + cy) - ((cx + cy) / 2) * 2 == 0 {
+                v = 220
+            } else {
+                v = 30
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Left half of a wide image: pixels [0, half) -> bright stripes;
+// pixels [half, width) -> black. Used to verify the blend's
+// "100% A in A-only region" property.
+fn _left_half_fixture(width, height, half_w) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = 0
+            if x < half_w {
+                v = 200
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+fn _right_half_fixture(width, height, start_x) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = 0
+            if x >= start_x {
+                v = 180
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- helpers --------------------------------------------------------------
+
+fn _make_match(xa, ya, xb, yb) {
+    let m = list_new()
+    push(m, xa) ; push(m, ya) ; push(m, xb) ; push(m, yb)
+    return m
+}
+
+// ---- homography helpers -------------------------------------------------
+
+fn test_homography_identity_shape() {
+    let H = pano_homography_identity()
+    ce_eq("identity homography has 9 elements", len(H), 9)
+    ce_eq("H[0] = milli (1000)", H[0], 1000)
+    ce_eq("H[4] = milli (1000)", H[4], 1000)
+    ce_eq("H[8] = milli (1000)", H[8], 1000)
+    ce_eq("H[1] = 0", H[1], 0)
+    ce_eq("H[5] = 0", H[5], 0)
+}
+
+fn test_homography_identity_apply() {
+    let H = pano_homography_identity()
+    let p = pano_homography_apply(H, 10, 20)
+    ce_eq("identity*(10,20) -> x = 10", p[0], 10)
+    ce_eq("identity*(10,20) -> y = 20", p[1], 20)
+    let p2 = pano_homography_apply(H, 0, 0)
+    ce_eq("identity*(0,0) -> x = 0", p2[0], 0)
+    ce_eq("identity*(0,0) -> y = 0", p2[1], 0)
+}
+
+fn test_homography_translation_apply() {
+    let T = pano_homography_translation(5, 3)
+    let p = pano_homography_apply(T, 10, 20)
+    ce_eq("translation(5,3)*(10,20) -> x = 15", p[0], 15)
+    ce_eq("translation(5,3)*(10,20) -> y = 23", p[1], 23)
+    let T2 = pano_homography_translation(0 - 5, 0)
+    let p2 = pano_homography_apply(T2, 15, 10)
+    ce_eq("translation(-5,0)*(15,10) -> x = 10", p2[0], 10)
+    ce_eq("translation(-5,0)*(15,10) -> y = 10", p2[1], 10)
+}
+
+fn test_homography_invert_translation() {
+    let T = pano_homography_translation(5, 3)
+    let T_inv = pano_homography_invert(T)
+    // Inverse of translation(tx, ty) is translation(-tx, -ty), milli-scaled.
+    ce_eq("inverse T[2] = -5000 (milli of -5)", T_inv[2], 0 - 5000)
+    ce_eq("inverse T[5] = -3000 (milli of -3)", T_inv[5], 0 - 3000)
+    // Apply inverse: should map (15, 23) back to (10, 20).
+    let p = pano_homography_apply(T_inv, 15, 23)
+    ce_eq("T_inv*(15,23) -> x = 10", p[0], 10)
+    ce_eq("T_inv*(15,23) -> y = 20", p[1], 20)
+}
+
+// ---- warp ----------------------------------------------------------------
+
+fn test_warp_identity_preserves_image() {
+    let w = 32
+    let h = 32
+    let buf = _spot_fixture(w, h, 10, 10, 1, 200)
+    let H = pano_homography_identity()
+    let warped = pano_warp(buf, w, h, H, w, h)
+    ce_check("identity warp returned non-zero buffer", warped != 0)
+    let v = load8(warped + 10 * w + 10)
+    ce_eq("identity warp pixel(10,10) = 200", v, 200)
+    let v_zero = load8(warped + 5 * w + 5)
+    ce_eq("identity warp pixel(5,5) = 0 (background)", v_zero, 0)
+}
+
+fn test_warp_translation_shifts_pixel() {
+    let w = 32
+    let h = 32
+    let buf = _spot_fixture(w, h, 10, 10, 1, 200)
+    // Translation(5, 0): for output pixel (xo, yo) the source is
+    // (xo - 5, yo). So the bright source at (10,10) lands at (15,10).
+    let T = pano_homography_translation(5, 0)
+    let warped = pano_warp(buf, w, h, T, w, h)
+    ce_check("translation warp returned non-zero buffer", warped != 0)
+    let v = load8(warped + 10 * w + 15)
+    ce_eq("trans(5,0) warp pixel(15,10) = 200 (shifted from src 10,10)",
+          v, 200)
+    let v_orig = load8(warped + 10 * w + 10)
+    ce_eq("trans(5,0) warp pixel(10,10) = 0 (no longer bright)", v_orig, 0)
+}
+
+fn test_warp_rejects_invalid_inputs() {
+    let r1 = pano_warp(0, 32, 32, pano_homography_identity(), 32, 32)
+    ce_eq("warp on null image -> 0", r1, 0)
+    let buf = _flat_fixture(32, 32, 128)
+    let r2 = pano_warp(buf, 32, 32, pano_homography_identity(), 0, 32)
+    ce_eq("warp with out_w=0 -> 0", r2, 0)
+    let r3 = pano_warp(buf, 300, 32, pano_homography_identity(), 32, 32)
+    ce_eq("warp with w > PANO_MAX_DIM -> 0", r3, 0)
+}
+
+// ---- RANSAC --------------------------------------------------------------
+
+fn test_ransac_4_inliers_finds_exact_homography() {
+    // 4 correspondences (10,10)->(15,13), (20,5)->(25,8), (5,20)->(10,23),
+    // (15,25)->(20,28). All are perfect translations by (+5, +3).
+    let matches = list_new()
+    push(matches, _make_match(10, 10, 15, 13))
+    push(matches, _make_match(20, 5,  25, 8))
+    push(matches, _make_match(5,  20, 10, 23))
+    push(matches, _make_match(15, 25, 20, 28))
+    let result = pano_ransac_homography(matches, 2, 50)
+    let inl = pano_inlier_count(result)
+    ce_eq("RANSAC 4 perfect inliers -> 4 inliers", inl, 4)
+    // The recovered H should map (10,10) close to (15,13) (within +/- 1 px).
+    let H = pano_homography(result)
+    let p = pano_homography_apply(H, 10, 10)
+    let dx = p[0] - 15
+    if dx < 0 { dx = 0 - dx }
+    let dy = p[1] - 13
+    if dy < 0 { dy = 0 - dy }
+    ce_check("RANSAC H maps (10,10) -> (15,13) within 1 px", dx <= 1)
+    ce_check("RANSAC H maps (10,10) y within 1 px", dy <= 1)
+}
+
+fn test_ransac_4_inliers_plus_4_outliers_rejects_outliers() {
+    // 4 perfect translation(+5, +3) correspondences.
+    let matches = list_new()
+    push(matches, _make_match(10, 10, 15, 13))
+    push(matches, _make_match(20, 5,  25, 8))
+    push(matches, _make_match(5,  20, 10, 23))
+    push(matches, _make_match(15, 25, 20, 28))
+    // 4 wildly wrong outliers (random "destination" coordinates).
+    push(matches, _make_match(8,  12, 100, 200))
+    push(matches, _make_match(22, 18, 7,   3))
+    push(matches, _make_match(3,  4,  88,  77))
+    push(matches, _make_match(28, 28, 1,   1))
+    let result = pano_ransac_homography(matches, 2, 200)
+    let inl = pano_inlier_count(result)
+    // RANSAC should pick up exactly the 4 true correspondences. With a
+    // tight threshold (2 px) the outliers cannot accidentally clear.
+    ce_check("RANSAC 4 inliers + 4 outliers -> inliers >= 4", inl >= 4)
+    ce_check("RANSAC rejects most outliers (inliers <= 5)", inl <= 5)
+    let H = pano_homography(result)
+    let p = pano_homography_apply(H, 10, 10)
+    let dx = p[0] - 15
+    if dx < 0 { dx = 0 - dx }
+    ce_check("RANSAC recovers correct H despite outliers", dx <= 2)
+}
+
+fn test_ransac_too_few_matches_returns_identity() {
+    let matches = list_new()
+    push(matches, _make_match(10, 10, 11, 11))
+    push(matches, _make_match(20, 20, 21, 21))
+    push(matches, _make_match(5,  5,  6,  6))
+    let result = pano_ransac_homography(matches, 2, 50)
+    ce_eq("RANSAC with 3 matches -> 0 inliers", pano_inlier_count(result), 0)
+    let H = pano_homography(result)
+    ce_eq("RANSAC fallback H is identity (H[0])", H[0], 1000)
+    ce_eq("RANSAC fallback H is identity (H[4])", H[4], 1000)
+    ce_eq("RANSAC fallback H is identity (H[8])", H[8], 1000)
+}
+
+// ---- match-features ------------------------------------------------------
+
+fn test_match_features_uniform_images_no_matches() {
+    let a = _flat_fixture(40, 40, 128)
+    let b = _flat_fixture(40, 40, 128)
+    let matches = pano_match_features(a, b, 40, 40, PANO_USE_ORB)
+    ce_eq("uniform 40x40 vs uniform 40x40 -> 0 matches", len(matches), 0)
+}
+
+fn test_match_features_rejects_invalid_inputs() {
+    let buf = _flat_fixture(40, 40, 128)
+    let m1 = pano_match_features(0, buf, 40, 40, PANO_USE_ORB)
+    ce_eq("match_features with null A -> empty", len(m1), 0)
+    let m2 = pano_match_features(buf, 0, 40, 40, PANO_USE_ORB)
+    ce_eq("match_features with null B -> empty", len(m2), 0)
+    let m3 = pano_match_features(buf, buf, 300, 40, PANO_USE_ORB)
+    ce_eq("match_features with w > MAX_DIM -> empty", len(m3), 0)
+}
+
+// ---- blend ---------------------------------------------------------------
+
+fn test_blend_a_only_region_passes_a_through() {
+    let w = 32
+    let h = 32
+    // A has bright pixels on the left half [0, 16); B is all zeros.
+    let a = _left_half_fixture(w, h, 16)
+    let b = _flat_fixture(w, h, 0)
+    let pgm = pano_blend(a, b, w, h)
+    ce_check("blend returned non-zero buffer", pgm != 0)
+    // PGM header is at the front; skip it to inspect pixel data.
+    let total = pano_pgm_size(w, h)
+    let area = w * h
+    let header = total - area
+    // Pixel (5, 5) in A's region: expect 200 (A's value).
+    let v_a = load8(pgm + header + 5 * w + 5)
+    ce_eq("blend A-only region: pixel = 200 (A's value)", v_a, 200)
+    // Pixel (20, 5) in B's region: both inputs zero -> expect 0.
+    let v_zero = load8(pgm + header + 5 * w + 20)
+    ce_eq("blend with both zero: pixel = 0", v_zero, 0)
+}
+
+fn test_blend_overlap_averages_50_50() {
+    let w = 32
+    let h = 32
+    // A: bright [0, 20) at intensity 200.
+    let a = _left_half_fixture(w, h, 20)
+    // B: bright [10, w) at intensity 100.
+    let b = _right_half_fixture(w, h, 10)
+    let pgm = pano_blend(a, b, w, h)
+    ce_check("blend (overlap) returned non-zero buffer", pgm != 0)
+    let total = pano_pgm_size(w, h)
+    let area = w * h
+    let header = total - area
+    // Pixel (5, 5): only A is non-zero -> expect 200.
+    let v_a_only = load8(pgm + header + 5 * w + 5)
+    ce_eq("blend left-only: pixel = 200", v_a_only, 200)
+    // Pixel (25, 5): only B is non-zero -> expect 180.
+    let v_b_only = load8(pgm + header + 5 * w + 25)
+    ce_eq("blend right-only: pixel = 180", v_b_only, 180)
+    // Pixel (15, 5): both A (200) and B (180) non-zero -> 50/50 = 190.
+    let v_overlap = load8(pgm + header + 5 * w + 15)
+    ce_eq("blend overlap region: pixel = 190 (50/50 of 200 + 180)",
+          v_overlap, 190)
+}
+
+// ---- stitch (full pipeline) ---------------------------------------------
+
+fn test_stitch_uniform_images_returns_valid_pgm() {
+    let a = _flat_fixture(40, 40, 128)
+    let b = _flat_fixture(40, 40, 128)
+    let pgm = pano_stitch(a, b, 40, 40)
+    ce_check("stitch on uniform images returned non-zero (fallback path)",
+             pgm != 0)
+}
+
+fn test_stitch_checkerboard_halves_covers_full_width() {
+    // Build two 64x64 checkerboard fixtures. Both are structural enough
+    // for the ORB detector to find FAST corners but may not produce
+    // many valid correspondences in our default-fallback mode -- the
+    // test verifies the OUTPUT canvas is wider than either input and
+    // that pixels at both left-edge and right-edge are non-black.
+    let a = _checker_fixture(64, 64, 8)
+    let b = _checker_fixture(64, 64, 8)
+    let pgm = pano_stitch(a, b, 64, 64)
+    ce_check("stitch on checkerboard halves returned non-zero", pgm != 0)
+    // Output canvas is 2*W - overlap = 128 - 10 = 118 px wide.
+    let out_w = 2 * 64 - 10
+    let out_h = 64
+    let total = pano_pgm_size(out_w, out_h)
+    let area = out_w * out_h
+    let header = total - area
+    // Sample one bright cell on the LEFT side (image A's contribution).
+    let left_bright = load8(pgm + header + 4 * out_w + 4)
+    ce_check("stitch output has non-zero pixel near left edge",
+             left_bright > 0)
+    // Sample one bright cell on the RIGHT side (image B's contribution).
+    let right_bright = load8(pgm + header + 4 * out_w + out_w - 5)
+    ce_check("stitch output has non-zero pixel near right edge",
+             right_bright > 0)
+}
+
+// ---- accessors round-trip ------------------------------------------------
+
+fn test_match_pair_indices_round_trip() {
+    let m = _make_match(11, 22, 33, 44)
+    ce_eq("match xa accessor", m[PANO_MP_XA], 11)
+    ce_eq("match ya accessor", m[PANO_MP_YA], 22)
+    ce_eq("match xb accessor", m[PANO_MP_XB], 33)
+    ce_eq("match yb accessor", m[PANO_MP_YB], 44)
+}
+
+// ---- PGM header sizing --------------------------------------------------
+
+fn test_pgm_size_matches_header_plus_area() {
+    // 32x32 -> header is "P5\n32 32\n255\n" = 13 bytes, plus 1024 px.
+    let total = pano_pgm_size(32, 32)
+    ce_eq("pgm_size 32x32 = 13 + 1024 = 1037", total, 1037)
+    // 100x50 -> "P5\n100 50\n255\n" = 14 bytes, plus 5000 px.
+    let total2 = pano_pgm_size(100, 50)
+    ce_eq("pgm_size 100x50 = 14 + 5000 = 5014", total2, 5014)
+    // Degenerate -- zero dim -> 0.
+    ce_eq("pgm_size 0x0 = 0", pano_pgm_size(0, 0), 0)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_homography_identity_shape()
+    test_homography_identity_apply()
+    test_homography_translation_apply()
+    test_homography_invert_translation()
+    test_warp_identity_preserves_image()
+    test_warp_translation_shifts_pixel()
+    test_warp_rejects_invalid_inputs()
+    test_ransac_4_inliers_finds_exact_homography()
+    test_ransac_4_inliers_plus_4_outliers_rejects_outliers()
+    test_ransac_too_few_matches_returns_identity()
+    test_match_features_uniform_images_no_matches()
+    test_match_features_rejects_invalid_inputs()
+    test_blend_a_only_region_passes_a_through()
+    test_blend_overlap_averages_50_50()
+    test_stitch_uniform_images_returns_valid_pgm()
+    test_stitch_checkerboard_halves_covers_full_width()
+    test_match_pair_indices_round_trip()
+    test_pgm_size_matches_header_plus_area()
+    ce_summary("panorama")
+}
+
+main()

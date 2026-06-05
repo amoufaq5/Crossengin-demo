@@ -1,0 +1,803 @@
+// CrossEngin io/transducers: in-process plain-HTTP/1.1 client (Mode 1 of P1.4).
+//
+// Purpose
+//   The minimum-viable runtime seam that lifts CrossEngin off the `curl` shim
+//   for plain `http://` URLs. The whitelist / rate-limit / cache gate
+//   (`src/learning/internet_fetch.nova`) is unchanged; once it returns
+//   FETCH_OK, the caller asks this module to do the transport and hands the
+//   body back through `if_ingest`. Full TLS (`https://`) is deferred to the
+//   TLS_AUDIT.md roadmap; for `https://` the dispatcher in internet_fetch
+//   continues to fall through to the existing curl shim (scripts/learn.sh).
+//
+// Scope (intentional)
+//   * HTTP/1.1, GET only, Host + UA + Connection: close, no redirects.
+//     Redirects are returned in a structured way the caller can re-issue.
+//   * No compression, no chunked transfer (we close the connection at the end
+//     and treat the read stream as length-of-body-equals-bytes-until-EOF;
+//     Content-Length is honoured when present for the redirect/short-read
+//     case but not relied on).
+//   * No DNS. NOVA has no getaddrinfo; we accept only:
+//       (a) dotted-quad IPs in the URL host          ("http://127.0.0.1/x")
+//       (b) names resolvable via the in-process tiny DNS cache populated
+//           from env: HTTP_DNS_HOST_TO_IP="example.com:93.184.216.34,..."
+//     A `host` that isn't a dotted-quad and isn't in the cache returns the
+//     structured "dns" error. This is a real production blocker -- documented
+//     prominently in TLS_AUDIT.md.
+//   * `max_bytes` is enforced; if the body would exceed it the connection is
+//     closed and the result carries the trimmed body and a "max_bytes
+//     exceeded" notice. (We do NOT consume the rest of the stream -- a long
+//     payload doesn't waste cycles or memory.)
+//
+// Public API (the only symbols callers should use)
+//   http_get(url, max_bytes)
+//       -> [status_code, headers_list, body, error_msg]
+//       status_code: HTTP integer (200, 404, 301, ...) or 0 on transport error
+//       headers_list: list of [name, value] string pairs (header names
+//                     preserved as sent on the wire; no folding, no
+//                     case-normalization beyond lookup helpers).
+//       body: the bytes after the blank line, capped to max_bytes
+//       error_msg: "" on success; on failure one of the HTTP_ERR_* strings.
+//   http_parse_url(url)
+//       -> [scheme, host, port, path]
+//       Parses just enough of an absolute URL for our purposes. Returns
+//       ["", "", 0, ""] on malformed input. Default port is 80 for http,
+//       443 for https. A URL with no path returns "/" (HTTP requires it).
+//   http_header_get(headers, name)  -> value string or "" if absent
+//   http_is_redirect(status_code)   -> 1 if 3xx with a Location header
+//
+//   Auxiliary (testable without sockets):
+//     _http_dns_cache_init()          -- read env once, lazily
+//     _http_dns_lookup(host)          -- "" if unknown
+//     _http_status_from_line(line)    -- parse "HTTP/1.1 200 OK"
+//
+// ADRs touched: ADR-0028 (the whitelist/rate-limit pipeline calls us), ADR-0014
+//   (the body bytes never enter an LLM; we are pure transport). NOVA
+//   dependencies: socket builtins (`socket`, `connect_socket`, `send_data`,
+//   `recv_data`, `close_fd`, `make_sockaddr_in`), `alloc`, `store8`, `load8`,
+//   `getenv`. CrossEngin dependencies: none -- this is a leaf module so
+//   internet_fetch can pull it in without dragging the kg layer.
+//
+// Test parity: see tests/unit/test_http_client.nova for the parser-layer
+// contract (no sockets, ~20 assertions) and
+// tests/integration/scenario_j_http_client.sh for the full
+// loopback (python -m http.server) round-trip.
+//
+// PSK secure-channel mode (post-P1.4 extension, see TLS_AUDIT.md):
+//   https_get_psk(url, psk_hex, max_bytes) routes the HTTP/1.1 request
+//   through src/io/transducers/secure_channel.nova -- ChaCha20-Poly1305
+//   per-frame envelope on top of TCP, using a 32-byte pre-shared key.
+//   NOT real HTTPS (no certs, no TLS framing); see secure_channel.nova
+//   header for the SAFETY caveat (predictable nonce w/o getrandom).
+
+import "secure_channel.nova"
+
+// ---- error tags (text, so they show up in logs unmangled) -----------------
+let HTTP_ERR_MALFORMED   = "malformed url"
+let HTTP_ERR_SCHEME      = "unsupported scheme"
+let HTTP_ERR_DNS         = "dns unresolved (set HTTP_DNS_HOST_TO_IP)"
+let HTTP_ERR_SOCKET      = "socket create failed"
+let HTTP_ERR_CONNECT     = "connect failed"
+let HTTP_ERR_SEND        = "send failed"
+let HTTP_ERR_RECV        = "recv failed before any data"
+let HTTP_ERR_NO_STATUS   = "no status line"
+let HTTP_ERR_BAD_STATUS  = "malformed status line"
+let HTTP_ERR_TOO_LARGE   = "max_bytes exceeded"   // body truncated, see body slot
+
+// ---- recv tuning ---------------------------------------------------------
+// One buffered recv chunk. Kept modest so we do not chain large multiplies
+// in the loop body (NOVA loop-body multiply codegen gets unhappy with
+// products > ~1e6 inside a while -- see NEXT_SESSION.md gotcha #11). 4096 is
+// the standard kernel page; products like `chunk * 1` never approach the
+// threshold.
+let HTTP_CHUNK = 4096
+// Hard ceiling on response buffer growth even if max_bytes is huge -- we
+// still need to bound the in-memory string length we hand back. 4MB matches
+// the IF_MAX_BYTES ceiling (2MB) with a 2x safety margin so headers + body
+// always fit.
+let HTTP_RECV_CAP = 4194304
+
+// ---- tiny char/string helpers (kept private) ------------------------------
+
+fn _hc_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _hc_all_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _hc_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _hc_to_lower_char(c) {
+    if c >= 65 { if c <= 90 { return c + 32 } }
+    return c
+}
+
+fn _hc_str_lower(s) {
+    let buf = alloc(len(s) + 1)
+    let i = 0
+    while i < len(s) {
+        store8(buf + i, _hc_to_lower_char(char_at(s, i)))
+        i = i + 1
+    }
+    store8(buf + len(s), 0)
+    return buf
+}
+
+fn _hc_starts_with(s, prefix) {
+    let pn = len(prefix)
+    if len(s) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Case-insensitive starts_with on plain ASCII (header names only).
+fn _hc_starts_with_ci(s, prefix) {
+    let pn = len(prefix)
+    if len(s) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if _hc_to_lower_char(char_at(s, i)) != _hc_to_lower_char(char_at(prefix, i)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Find first occurrence of char c starting at offset `from`; -1 if absent.
+fn _hc_index_of(s, c, from) {
+    let i = from
+    while i < len(s) {
+        if char_at(s, i) == c { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Find first occurrence of substring `needle` in `hay` starting at `from`;
+// -1 if absent. Plain O(n*m) -- inputs are tiny status / header lines.
+fn _hc_find_substr(hay, needle, from) {
+    let n = len(needle)
+    if n == 0 { return from }
+    if len(hay) < n { return -1 }
+    let limit = len(hay) - n
+    let i = from
+    while i <= limit {
+        let j = 0
+        let ok = 1
+        while j < n {
+            if char_at(hay, i + j) != char_at(needle, j) { ok = 0; j = n }
+            else { j = j + 1 }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---- URL parser ----------------------------------------------------------
+
+// Parse "http(s)://host[:port][/path[?q]]". Returns [scheme, host, port, path].
+// On any malformation returns ["", "", 0, ""]. Path defaults to "/" if absent.
+// Port defaults to 80 for http, 443 for https. Host is preserved
+// case-as-given (RFC says hosts are case-insensitive; we lowercase only when
+// it matters, which is the DNS cache lookup).
+fn http_parse_url(url) {
+    let bad = list_new()
+    push(bad, "")
+    push(bad, "")
+    push(bad, 0)
+    push(bad, "")
+    if len(url) == 0 { return bad }
+    // Scheme.
+    let scheme = ""
+    let after = 0
+    if _hc_starts_with(url, "http://") == 1 {
+        scheme = "http"
+        after = 7
+    } else {
+        if _hc_starts_with(url, "https://") == 1 {
+            scheme = "https"
+            after = 8
+        } else { return bad }
+    }
+    // Authority (host[:port]).
+    let path_slash = _hc_index_of(url, 47, after)   // '/'
+    let auth_end = path_slash
+    if auth_end < 0 { auth_end = len(url) }
+    let auth = substr(url, after, auth_end - after)
+    if len(auth) == 0 { return bad }
+    // Optional port.
+    let host = auth
+    let port = 80
+    if str_eq(scheme, "https") == 1 { port = 443 }
+    let colon = _hc_index_of(auth, 58, 0)           // ':'
+    if colon >= 0 {
+        host = substr(auth, 0, colon)
+        let pstr = substr(auth, colon + 1, len(auth) - colon - 1)
+        if _hc_all_digits(pstr) == 0 { return bad }
+        let pv = str_to_int(pstr)
+        if pv <= 0 { return bad }
+        if pv > 65535 { return bad }
+        port = pv
+    }
+    if len(host) == 0 { return bad }
+    // Path.
+    let path = "/"
+    if path_slash >= 0 {
+        path = substr(url, path_slash, len(url) - path_slash)
+    }
+    let out = list_new()
+    push(out, scheme)
+    push(out, host)
+    push(out, port)
+    push(out, path)
+    return out
+}
+
+// ---- tiny DNS cache ------------------------------------------------------
+//
+// Workaround for the NOVA toolchain not having getaddrinfo: a process-local
+// map of host -> dotted-quad. Populated from env at first lookup. Format:
+//     HTTP_DNS_HOST_TO_IP="example.com:93.184.216.34,foo.test:10.0.0.5"
+// (comma-separated host:ip pairs; spaces ignored). Dotted-quads as hosts are
+// accepted directly without going through the cache.
+
+let _hc_dns_inited = 0
+let _hc_dns_entries = 0    // list of [host_lower, ip_string]
+
+fn _hc_dns_split_pairs(env) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(env) {
+        let c = char_at(env, i)
+        if c == 44 {           // ','
+            push(out, substr(env, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < len(env) {
+        push(out, substr(env, start, len(env) - start))
+    }
+    return out
+}
+
+// True iff `s` looks like a dotted-quad (4 numeric tokens 0..255 split by '.').
+fn _hc_is_dotted_quad(s) {
+    if len(s) == 0 { return 0 }
+    let dots = 0
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 46 { dots = dots + 1 }
+        else {
+            if _hc_is_digit(c) == 0 { return 0 }
+        }
+        i = i + 1
+    }
+    if dots != 3 { return 0 }
+    // Per-octet bounds.
+    let toks = list_new()
+    let i2 = 0
+    let start = 0
+    while i2 < len(s) {
+        if char_at(s, i2) == 46 {
+            push(toks, substr(s, start, i2 - start))
+            start = i2 + 1
+        }
+        i2 = i2 + 1
+    }
+    push(toks, substr(s, start, len(s) - start))
+    if len(toks) != 4 { return 0 }
+    let k = 0
+    while k < 4 {
+        let t = toks[k]
+        if len(t) == 0 { return 0 }
+        if len(t) > 3 { return 0 }
+        let v = str_to_int(t)
+        if v < 0 { return 0 }
+        if v > 255 { return 0 }
+        k = k + 1
+    }
+    return 1
+}
+
+fn _http_dns_cache_init() {
+    if _hc_dns_inited == 1 { return 1 }
+    _hc_dns_inited = 1
+    _hc_dns_entries = list_new()
+    let env = getenv("HTTP_DNS_HOST_TO_IP")
+    if env == 0 { return 1 }
+    if len(env) == 0 { return 1 }
+    let pairs = _hc_dns_split_pairs(env)
+    let i = 0
+    while i < len(pairs) {
+        let p = str_trim(pairs[i])
+        let colon = _hc_index_of(p, 58, 0)   // ':'
+        if colon > 0 {
+            let h = str_trim(substr(p, 0, colon))
+            let ip = str_trim(substr(p, colon + 1, len(p) - colon - 1))
+            if len(h) > 0 {
+                if _hc_is_dotted_quad(ip) == 1 {
+                    let e = list_new()
+                    push(e, _hc_str_lower(h))
+                    push(e, ip)
+                    push(_hc_dns_entries, e)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Look up a host in the env cache. Returns the dotted-quad string or "" if
+// unknown. If `host` is itself a dotted-quad, returns it unchanged.
+fn _http_dns_lookup(host) {
+    if _hc_is_dotted_quad(host) == 1 { return host }
+    _http_dns_cache_init()
+    let lc = _hc_str_lower(host)
+    let i = 0
+    while i < len(_hc_dns_entries) {
+        let e = _hc_dns_entries[i]
+        if str_eq(e[0], lc) == 1 { return e[1] }
+        i = i + 1
+    }
+    return ""
+}
+
+// Test-only: seed an entry manually. Not used in production paths; the
+// integration scenario doesn't need it because 127.0.0.1 is a dotted-quad.
+fn http_dns_register(host, ip) {
+    _http_dns_cache_init()
+    if _hc_is_dotted_quad(ip) == 0 { return 0 }
+    let e = list_new()
+    push(e, _hc_str_lower(host))
+    push(e, ip)
+    push(_hc_dns_entries, e)
+    return 1
+}
+
+// ---- IP encoding ---------------------------------------------------------
+// Encode a dotted-quad as the 32-bit value make_sockaddr_in expects. Kept
+// independent of kg_sync's helper (it's static-private there) so this module
+// has no cross-subtree dependency.
+fn _hc_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _hc_all_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    // Build a + b*256 + c*65536 + d*16777216 without any large literal
+    // multiplications inside a loop (no loop body here, single-shot).
+    let k256 = 256
+    let b_p = b * k256
+    let c_p = c * k256 * k256
+    let d_p = d * k256 * k256 * k256
+    return a + b_p + c_p + d_p
+}
+
+// ---- status line + headers ----------------------------------------------
+
+// Parse "HTTP/1.1 200 OK" -> 200. Accepts HTTP/1.0 too. Returns -1 on
+// malformation.
+fn _http_status_from_line(line) {
+    if len(line) < 12 { return -1 }      // "HTTP/1.x NNN"
+    if _hc_starts_with(line, "HTTP/") == 0 { return -1 }
+    // Find the first space after "HTTP/x.y".
+    let sp = _hc_index_of(line, 32, 5)
+    if sp < 0 { return -1 }
+    // The status code is the next 3 (or more) digits up to the next space.
+    let sp2 = _hc_index_of(line, 32, sp + 1)
+    let end = sp2
+    if end < 0 { end = len(line) }
+    let code = substr(line, sp + 1, end - sp - 1)
+    if _hc_all_digits(code) == 0 { return -1 }
+    let v = str_to_int(code)
+    if v < 100 { return -1 }
+    if v > 599 { return -1 }
+    return v
+}
+
+// Split one header line "Name: value" into [Name, value]. Trims SP/HT on
+// both sides of value; returns 0 on bad shape (no colon, empty name).
+fn _http_parse_header(line) {
+    let colon = _hc_index_of(line, 58, 0)
+    if colon <= 0 { return 0 }
+    let name = substr(line, 0, colon)
+    let val = substr(line, colon + 1, len(line) - colon - 1)
+    // Trim leading SP / HT on value.
+    let v = val
+    let trimmed = 0
+    while trimmed == 0 {
+        if len(v) == 0 { trimmed = 1 }
+        else {
+            let c = char_at(v, 0)
+            if c == 32 { v = substr(v, 1, len(v) - 1) }
+            else { if c == 9 { v = substr(v, 1, len(v) - 1) }
+                   else { trimmed = 1 } }
+        }
+    }
+    // Trim trailing SP/HT/CR.
+    trimmed = 0
+    while trimmed == 0 {
+        let n = len(v)
+        if n == 0 { trimmed = 1 }
+        else {
+            let c = char_at(v, n - 1)
+            if c == 32 { v = substr(v, 0, n - 1) }
+            else { if c == 9 { v = substr(v, 0, n - 1) }
+                   else { if c == 13 { v = substr(v, 0, n - 1) }
+                          else { trimmed = 1 } } }
+        }
+    }
+    let pair = list_new()
+    push(pair, name)
+    push(pair, v)
+    return pair
+}
+
+// Case-insensitive header lookup. Returns "" if absent.
+fn http_header_get(headers, name) {
+    let i = 0
+    while i < len(headers) {
+        let h = headers[i]
+        if str_eq(_hc_str_lower(h[0]), _hc_str_lower(name)) == 1 { return h[1] }
+        i = i + 1
+    }
+    return ""
+}
+
+// True if 3xx and has a Location header. Callers can re-issue with the new
+// URL after applying their own whitelist + rate-limit gate again.
+fn http_is_redirect(status_code) {
+    if status_code < 300 { return 0 }
+    if status_code >= 400 { return 0 }
+    return 1
+}
+
+// ---- core fetch ---------------------------------------------------------
+
+// Build [status_code, headers_list, body, error_msg] uniformly so callers
+// have one record shape.
+fn _http_result(status_code, headers, body, err) {
+    let r = list_new()
+    push(r, status_code)
+    push(r, headers)
+    push(r, body)
+    push(r, err)
+    return r
+}
+
+fn _http_err(msg) {
+    return _http_result(0, list_new(), "", msg)
+}
+
+// Write the full string to fd. Loops on partial writes. 0 on send error.
+fn _hc_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+// Read the response into a flat byte buffer until EOF or cap reached.
+// Returns the buffer length actually read; on transport error before any
+// byte returns -1. The buffer is appended into `out_buf_holder[0]` as a
+// string for the parser to slice.
+fn _hc_recv_until_eof(fd, max_bytes, out_holder) {
+    // Choose a generous cap: enough for headers + body up to max_bytes,
+    // but never above HTTP_RECV_CAP.
+    let cap_target = max_bytes + 8192   // +8K headroom for headers
+    if cap_target < 8192 { cap_target = 8192 }
+    if cap_target > HTTP_RECV_CAP { cap_target = HTTP_RECV_CAP }
+    let buf = alloc(cap_target + 1)
+    let total = 0
+    let done = 0
+    let truncated = 0
+    while done == 0 {
+        if total >= cap_target { done = 1; truncated = 1 }
+        else {
+            let want = cap_target - total
+            if want > HTTP_CHUNK { want = HTTP_CHUNK }
+            let n = recv_data(fd, buf + total, want)
+            if n < 0 {
+                if total == 0 {
+                    return -1
+                }
+                done = 1
+            } else {
+                if n == 0 { done = 1 }
+                else { total = total + n }
+            }
+        }
+    }
+    store8(buf + total, 0)
+    push(out_holder, buf)
+    push(out_holder, total)
+    push(out_holder, truncated)
+    return total
+}
+
+// Split the recv buffer into [status_line, headers_list, body, parse_err].
+// `parse_err` is "" on success.
+fn _hc_parse_response(buf, total, max_bytes) {
+    let out = list_new()
+    // Find the blank-line boundary: "\r\n\r\n" first, fall back to "\n\n".
+    let blank = _hc_find_substr(buf, "\r\n\r\n", 0)
+    let blank_len = 4
+    if blank < 0 {
+        blank = _hc_find_substr(buf, "\n\n", 0)
+        blank_len = 2
+    }
+    let status_line = ""
+    let headers = list_new()
+    let body = ""
+    let parse_err = ""
+    if blank < 0 {
+        // No header terminator -- malformed.
+        parse_err = HTTP_ERR_NO_STATUS
+        push(out, status_line)
+        push(out, headers)
+        push(out, body)
+        push(out, parse_err)
+        return out
+    }
+    let header_block = substr(buf, 0, blank)
+    let body_offset = blank + blank_len
+    let body_len_avail = total - body_offset
+    if body_len_avail < 0 { body_len_avail = 0 }
+    let body_len = body_len_avail
+    if body_len > max_bytes { body_len = max_bytes }
+    body = substr(buf, body_offset, body_len)
+    // Split header block on '\n', stripping a trailing '\r' per line.
+    let i = 0
+    let start = 0
+    let first_line = 1
+    let nl = -1
+    while i <= len(header_block) {
+        let at_end = 0
+        if i == len(header_block) { at_end = 1 }
+        if at_end == 1 { nl = i }
+        else {
+            if char_at(header_block, i) == 10 { nl = i } else { nl = -1 }
+        }
+        if nl >= 0 {
+            let line_end = nl
+            // Strip a trailing CR.
+            if line_end > start {
+                if char_at(header_block, line_end - 1) == 13 {
+                    line_end = line_end - 1
+                }
+            }
+            let line = substr(header_block, start, line_end - start)
+            if first_line == 1 {
+                status_line = line
+                first_line = 0
+            } else {
+                if len(line) > 0 {
+                    let pair = _http_parse_header(line)
+                    if pair != 0 { push(headers, pair) }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, status_line)
+    push(out, headers)
+    push(out, body)
+    push(out, parse_err)
+    return out
+}
+
+// The public fetch entry. See file header for contract.
+fn http_get(url, max_bytes) {
+    let parts = http_parse_url(url)
+    let scheme = parts[0]
+    let host = parts[1]
+    let port = parts[2]
+    let path = parts[3]
+    if len(scheme) == 0 { return _http_err(HTTP_ERR_MALFORMED) }
+    if str_eq(scheme, "http") == 0 { return _http_err(HTTP_ERR_SCHEME) }
+    if max_bytes <= 0 { max_bytes = HTTP_RECV_CAP }
+    let ip = _http_dns_lookup(host)
+    if len(ip) == 0 { return _http_err(HTTP_ERR_DNS) }
+    let ip_int = _hc_ip_str_to_int(ip)
+    if ip_int < 0 { return _http_err(HTTP_ERR_DNS) }
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return _http_err(HTTP_ERR_SOCKET) }
+    let addr = make_sockaddr_in(port, ip_int)
+    if connect_socket(sock, addr, 16) < 0 {
+        close_fd(sock)
+        return _http_err(HTTP_ERR_CONNECT)
+    }
+    // Build request line + headers. Order matters for Connection: close.
+    let req = "GET " + path + " HTTP/1.1\r\n"
+        + "Host: " + host + "\r\n"
+        + "User-Agent: crossengin/0.1\r\n"
+        + "Accept: */*\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+    if _hc_send_all(sock, req) == 0 {
+        close_fd(sock)
+        return _http_err(HTTP_ERR_SEND)
+    }
+    let holder = list_new()
+    let total = _hc_recv_until_eof(sock, max_bytes, holder)
+    close_fd(sock)
+    if total < 0 { return _http_err(HTTP_ERR_RECV) }
+    let buf = holder[0]
+    let buf_total = holder[1]
+    let truncated = holder[2]
+    let split = _hc_parse_response(buf, buf_total, max_bytes)
+    let status_line = split[0]
+    let headers = split[1]
+    let body = split[2]
+    let split_err = split[3]
+    if len(split_err) > 0 { return _http_err(split_err) }
+    let status = _http_status_from_line(status_line)
+    if status < 0 {
+        return _http_err(HTTP_ERR_BAD_STATUS)
+    }
+    let err = ""
+    if truncated == 1 { err = HTTP_ERR_TOO_LARGE }
+    if len(body) >= max_bytes { err = HTTP_ERR_TOO_LARGE }
+    return _http_result(status, headers, body, err)
+}
+
+// ---- PSK-secured GET (https-but-not-really) ------------------------------
+//
+// Opt-in opener that routes the HTTP/1.1 request through the
+// secure_channel framework (`src/io/transducers/secure_channel.nova`):
+// ChaCha20-Poly1305 envelope per frame on top of a plain TCP socket
+// with a pre-shared key. This is NOT real HTTPS:
+//   * no TLS framing, no record layer
+//   * no X.509 certificate, no CA bundle, no hostname matching
+//   * predictable nonce material (see SAFETY caveat in secure_channel.nova)
+// It is "HTTP over a PSK-encrypted channel" -- useful for a CrossEngin
+// daemon talking to a CrossEngin-controlled upstream where both sides
+// have provisioned a 32-byte shared key out of band. The remaining
+// ~2 weeks of work to layer X.509 / RSA-PSS / SHA-256 on top are
+// tracked in TLS_AUDIT.md.
+//
+// Wire flow:
+//   1. sc_open(host, port, psk_hex) handshakes the PSK secure channel.
+//   2. The HTTP/1.1 request bytes are written via sc_send(state, ...) in
+//      one frame (small requests; multi-frame is fine since the framing
+//      naturally chunks).
+//   3. Response bytes are read via sc_recv(state) in one or more frames
+//      until the peer closes; the response is parsed by the same
+//      _hc_parse_response helper used for plain HTTP.
+//
+// Public API:
+//   https_get_psk(url, psk_hex, max_bytes) -> same shape as http_get
+//     status_code, headers_list, body, error_msg.
+//   On any error (PSK invalid, connect failed, handshake reject, MAC
+//   verification failure, EOF before a status line) returns the same
+//   _http_err shape with a descriptive tag.
+
+let HTTP_ERR_PSK         = "psk: hex must decode to 32 bytes"
+let HTTP_ERR_SC_HANDSHAKE = "secure_channel: handshake failed"
+let HTTP_ERR_SC_VERIFY    = "secure_channel: tag verification failed"
+
+// secure_channel.nova is imported at the top of this file (see header
+// comment). Callers that only need plain `http_get` still pay nothing
+// at runtime for the unused PSK path -- the imported chacha20 +
+// poly1305 modules are leaf primitives with no init-side effects.
+
+fn https_get_psk(url, psk_hex, max_bytes) {
+    let parts = http_parse_url(url)
+    let scheme = parts[0]
+    let host = parts[1]
+    let port = parts[2]
+    let path = parts[3]
+    if len(scheme) == 0 { return _http_err(HTTP_ERR_MALFORMED) }
+    // We accept both "http://" and "https://" here -- the scheme is
+    // informational since the actual transport is PSK-secured. (Callers
+    // that want strict scheme enforcement should check the URL.)
+    if sc_psk_validate(psk_hex) == 0 { return _http_err(HTTP_ERR_PSK) }
+    if max_bytes <= 0 { max_bytes = HTTP_RECV_CAP }
+    let ip = _http_dns_lookup(host)
+    if len(ip) == 0 { return _http_err(HTTP_ERR_DNS) }
+    let state = sc_open(ip, port, psk_hex)
+    if state == 0 { return _http_err(HTTP_ERR_SC_HANDSHAKE) }
+    // Build the HTTP request as a NOVA string (all ASCII, no zero bytes).
+    let req = "GET " + path + " HTTP/1.1\r\n"
+        + "Host: " + host + "\r\n"
+        + "User-Agent: crossengin/0.1-psk\r\n"
+        + "Accept: */*\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+    let req_len = len(req)
+    let req_buf = alloc(req_len + 1)
+    let i = 0
+    while i < req_len {
+        store8(req_buf + i, char_at(req, i))
+        i = i + 1
+    }
+    store8(req_buf + req_len, 0)
+    if sc_send(state, req_buf, req_len) == 0 {
+        sc_close(state)
+        return _http_err(HTTP_ERR_SEND)
+    }
+    // Pull frames until the peer closes; concatenate plaintext into one
+    // contiguous buffer for the parser.
+    let acc = alloc(HTTP_RECV_CAP + 1)
+    let acc_len = 0
+    let done = 0
+    while done == 0 {
+        let frame = sc_recv(state)
+        if frame == 0 {
+            // Either clean EOF or a verification failure. The state's last
+            // error tag distinguishes.
+            let tag = sc_last_error(state)
+            if str_eq(tag, SC_ERR_TAG_FAIL) == 1 {
+                sc_close(state)
+                return _http_err(HTTP_ERR_SC_VERIFY)
+            }
+            // Otherwise: clean shutdown of the peer is expected.
+            done = 1
+        } else {
+            let n = frame[1]
+            if acc_len + n > HTTP_RECV_CAP { n = HTTP_RECV_CAP - acc_len }
+            let j = 0
+            while j < n {
+                store8(acc + acc_len + j, load8(frame[0] + j))
+                j = j + 1
+            }
+            acc_len = acc_len + n
+            if acc_len >= HTTP_RECV_CAP { done = 1 }
+        }
+    }
+    sc_close(state)
+    store8(acc + acc_len, 0)
+    let split = _hc_parse_response(acc, acc_len, max_bytes)
+    let status_line = split[0]
+    let headers = split[1]
+    let body = split[2]
+    let split_err = split[3]
+    if len(split_err) > 0 { return _http_err(split_err) }
+    let status = _http_status_from_line(status_line)
+    if status < 0 {
+        return _http_err(HTTP_ERR_BAD_STATUS)
+    }
+    let err = ""
+    if len(body) >= max_bytes { err = HTTP_ERR_TOO_LARGE }
+    return _http_result(status, headers, body, err)
+}

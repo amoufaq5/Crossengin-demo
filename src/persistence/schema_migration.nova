@@ -1,0 +1,493 @@
+// CrossEngin persistence: KG atom schema-evolution / migration framework.
+//
+// Purpose
+//   R5D's snapshot v2 wire format added a `meta` block and a one-off
+//   `snap_migrate_v1_to_v2` helper that bumps the SNAPSHOT WIRE format from
+//   v1 -> v2. R6F added episodic atoms as a forward-compatible third
+//   sub-list. Those handled the CONTAINER layer.
+//
+//   This module is the NEXT layer: a generic, declarative framework for
+//   evolving the SHAPE of an atom (the atom's payload schema) over time
+//   without breaking older readers. It generalizes the single-step
+//   snapshot-wire migration into a chain of per-atom-kind migrations that
+//   the snapshot reader runs on every atom after the wire is parsed.
+//
+//   Supported operations:
+//     - ADD     a new payload field with a default value
+//     - RENAME  an existing payload field (rewrite key)
+//     - RETYPE  a field's type (e.g. int -> milli, multiply by 1000)
+//     - REMOVE  a deprecated payload field
+//
+//   Each atom carries a `schema_version` payload field (per atom-kind, not
+//   global) that names which schema generation produced it. A migration
+//   chain runs every migration with `from_version <= atom_schema_version
+//   < to_version` AND a `kind` matching the atom's kind, in order. If
+//   no migrations apply (because the atom is already at the current
+//   schema version), `migrate_atom` is a no-op -- the framework is
+//   idempotent on already-current atoms.
+//
+//   Wire-format encoding (forward-compatible with R5D's v2):
+//     - The snapshot writer emits one extra `schema.atoms_version <int>`
+//       line in the meta block. A v2 reader that doesn't know about this
+//       line silently ignores it (same forward-compat as `meta.creator`
+//       and friends).
+//     - A snapshot that LACKS the line is treated as schema v1 -- the
+//       implicit shape every pre-this-build snapshot has.
+//
+// Module shape:
+//   Migration descriptor: a 6-element list
+//     [from_version, to_version, atom_kind, op, field, default]
+//   where `atom_kind` is either an ATOM_* constant (specific match) or
+//   SCHEMA_KIND_ANY (-1) for "applies to every atom kind".
+//
+//   For RENAME: `field` carries "oldname:newname" (the colon separates the
+//   two keys). For ADD: `field` is the new key and `default` the value
+//   to install when absent. For REMOVE: `field` is the key to drop. For
+//   RETYPE: `field` is the key and `default` is one of SCHEMA_RETYPE_*
+//   tags naming the transform (only "x1000" int -> milli is shipped today).
+//
+// Demo migrations registered at module load:
+//   V1 -> V2: ADD `created_ns` field to all atoms (default = 0; the
+//             snapshot reader passes the snapshot timestamp via
+//             `migrate_kg_with_default_ns` so a v1 atom rehydrated from
+//             a snapshot inherits the snapshot's timestamp when one is
+//             available).
+//   V2 -> V3: RENAME `label` -> `display_label` on observation (FACT)
+//             atoms ONLY -- episodic / lang / concept atoms keep `label`.
+//             The rename runs on the PAYLOAD (the atom's `label` slot in
+//             the layout is untouched; the rule applies to a "label"
+//             payload field, which is how the older daemon recorded an
+//             observation note).
+//
+// Production note:
+//   The two shipped migrations are DEMOS that prove the framework. Adding
+//   a fresh migration in a future session is a one-liner: append a
+//   `register_migration(...)` call at the bottom of this module and bump
+//   SCHEMA_CURRENT_VERSION. R5D's v2 wire format is undisturbed.
+//
+// ADRs touched: ADR-0048 (persistence container + format). NOVA
+//   dependencies: builtins (lists, str_eq, int_to_str). CrossEngin
+//   dependencies: ../kg/atom_store.nova (atom payload helpers + ATOM_*
+//   kind constants).
+
+import "../kg/atom_store.nova"
+import "../kg/multi_kg_manager.nova"
+import "snapshot_writer.nova"
+
+// ---- schema version constants --------------------------------------------
+//
+// Per-atom-kind schema versions. SCHEMA_CURRENT_VERSION is the target a
+// freshly-built atom is stamped with and the version a fully-migrated
+// snapshot lands at. A snapshot file that lacks the `schema.atoms_version`
+// meta line is treated as SCHEMA_LEGACY_VERSION (= 1) -- the implicit
+// shape every pre-this-build atom has.
+let SCHEMA_LEGACY_VERSION  = 1
+let SCHEMA_CURRENT_VERSION = 3
+
+// `atom_kind` slot value that means "applies to every atom kind". A
+// migration descriptor with this value runs on every atom regardless of
+// its ATOM_FACT / ATOM_CONCEPT / ATOM_LANG / ... kind.
+let SCHEMA_KIND_ANY = -1
+
+// Operation tags. The op is stored as an int so the registry comparison
+// is a fast `==` rather than a string match.
+let SCHEMA_OP_ADD    = 1
+let SCHEMA_OP_RENAME = 2
+let SCHEMA_OP_RETYPE = 3
+let SCHEMA_OP_REMOVE = 4
+
+// RETYPE transform tags. Only int -> milli (multiply by 1000) is shipped
+// today; new tags get appended without breaking older migrations.
+let SCHEMA_RETYPE_X1000 = "x1000"
+
+// Migration descriptor offsets.
+let SCHEMA_MIG_FROM    = 0
+let SCHEMA_MIG_TO      = 1
+let SCHEMA_MIG_KIND    = 2
+let SCHEMA_MIG_OP      = 3
+let SCHEMA_MIG_FIELD   = 4
+let SCHEMA_MIG_DEFAULT = 5
+let SCHEMA_MIG_COUNT   = 6
+
+// Payload field name carrying the atom's schema version. Stored as a
+// payload entry so it survives the v2 snapshot wire format unchanged --
+// the reader plumbs it into the migration chain via _atom_schema_version
+// without needing any new container slot.
+let SCHEMA_FIELD_VERSION = "schema_version"
+
+// Wire-format meta key for the snapshot-wide atoms schema version. A
+// snapshot writer emits one of these per file in the meta block; the
+// reader pulls it out before running migrate_kg.
+let SCHEMA_META_KEY = "schema.atoms_version"
+
+// ---- registry --------------------------------------------------------------
+//
+// The module-level registry is a flat list of Migration descriptors. NEW
+// migrations get APPENDED (so the legal stable order of execution is
+// from_version-ascending, registration-order within the same from_version);
+// OLD migrations are NEVER modified, so the chain a snapshot from any
+// historic build runs is bit-for-bit reproducible across sessions.
+let _SCHEMA_MIGRATIONS = list_new()
+
+// Construct a Migration descriptor. Exposed as a public helper so tests
+// can build one-off migrations without going through the registry.
+fn migration_new(from_v, to_v, kind, op, field, default) {
+    let m = list_new()
+    push(m, from_v)
+    push(m, to_v)
+    push(m, kind)
+    push(m, op)
+    push(m, field)
+    push(m, default)
+    return m
+}
+
+fn migration_from(m)    { return m[SCHEMA_MIG_FROM] }
+fn migration_to(m)      { return m[SCHEMA_MIG_TO] }
+fn migration_kind(m)    { return m[SCHEMA_MIG_KIND] }
+fn migration_op(m)      { return m[SCHEMA_MIG_OP] }
+fn migration_field(m)   { return m[SCHEMA_MIG_FIELD] }
+fn migration_default(m) { return m[SCHEMA_MIG_DEFAULT] }
+
+// Append a migration to the registry. Returns the new total count.
+//
+// The framework is DECLARATIVE: a caller registers a Migration once at
+// module load (or test setup) and every subsequent migrate_atom /
+// migrate_kg run picks it up automatically. The registration order is
+// the execution order within the same from_version, so a session that
+// needs to chain "ADD field A then RENAME field A" must register the
+// ADD before the RENAME.
+fn register_migration(from_v, to_v, kind, op, field, default) {
+    push(_SCHEMA_MIGRATIONS, migration_new(from_v, to_v, kind, op, field, default))
+    return len(_SCHEMA_MIGRATIONS)
+}
+
+fn schema_migration_count() { return len(_SCHEMA_MIGRATIONS) }
+
+fn schema_migration_at(idx) {
+    if idx < 0 { return 0 }
+    if idx >= len(_SCHEMA_MIGRATIONS) { return 0 }
+    return _SCHEMA_MIGRATIONS[idx]
+}
+
+// Wipe the registry. Used by tests that install a synthetic ruleset and
+// need to clean up after themselves. PRODUCTION CODE MUST NOT CALL THIS.
+fn _schema_migrations_clear_for_test() {
+    while len(_SCHEMA_MIGRATIONS) > 0 {
+        let last = len(_SCHEMA_MIGRATIONS) - 1
+        let trimmed = list_new()
+        let i = 0
+        while i < last {
+            push(trimmed, _SCHEMA_MIGRATIONS[i])
+            i = i + 1
+        }
+        _SCHEMA_MIGRATIONS = trimmed
+    }
+    return 1
+}
+
+// ---- per-atom schema-version helpers --------------------------------------
+
+// Read an atom's schema version. Absent -> SCHEMA_LEGACY_VERSION (= 1).
+// This is the contract a snapshot reader leans on: an atom rehydrated
+// from a pre-this-build snapshot has no schema_version payload, and the
+// migration chain treats it as v1.
+fn atom_schema_version(a) {
+    if atom_payload_has(a, SCHEMA_FIELD_VERSION) == 0 {
+        return SCHEMA_LEGACY_VERSION
+    }
+    return atom_payload_get(a, SCHEMA_FIELD_VERSION)
+}
+
+fn atom_set_schema_version(a, v) {
+    return atom_payload_set(a, SCHEMA_FIELD_VERSION, v)
+}
+
+// ---- rename-key helper ----------------------------------------------------
+
+// Parse "old:new" -> [old, new]. Returns 0 on a missing colon.
+fn _schema_split_rename(spec) {
+    let n = len(spec)
+    let i = 0
+    while i < n {
+        if char_at(spec, i) == 58 {     // ':'
+            let pair = list_new()
+            push(pair, substr(spec, 0, i))
+            push(pair, substr(spec, i + 1, n - i - 1))
+            return pair
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- payload rewriters ----------------------------------------------------
+//
+// Atoms use a scanned-list payload (atom_store.nova: A_PAYLOAD slot, list
+// of [key, value] entries). The migration ops below mutate that list in
+// place; the atom's layout slots (id, label, kind, ...) are NEVER touched
+// -- the migration framework is for PAYLOAD evolution, not for changing
+// the atom's identity or kind.
+
+// REMOVE: drop a payload entry. Returns 1 if anything was removed.
+fn _schema_payload_remove(a, key) {
+    if atom_payload_has(a, key) == 0 { return 0 }
+    let pl = a[A_PAYLOAD]
+    let kept = list_new()
+    let i = 0
+    while i < len(pl) {
+        if str_eq(pl[i][0], key) == 0 {
+            push(kept, pl[i])
+        }
+        i = i + 1
+    }
+    list_set(a, A_PAYLOAD, kept)
+    return 1
+}
+
+// RENAME: rewrite a payload entry's key in place. The value is preserved
+// bit-for-bit. If the key doesn't exist on this atom, nothing happens
+// (rename is idempotent on atoms that don't carry the old field).
+fn _schema_payload_rename(a, old_key, new_key) {
+    if atom_payload_has(a, old_key) == 0 { return 0 }
+    let pl = a[A_PAYLOAD]
+    let i = 0
+    while i < len(pl) {
+        if str_eq(pl[i][0], old_key) == 1 {
+            list_set(pl[i], 0, new_key)
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- single-migration apply ------------------------------------------------
+
+// Apply one Migration to one atom. The kind gate runs first so a
+// migration tagged for ATOM_FACT only doesn't touch ATOM_LANG atoms.
+// Returns 1 if the migration applied (kind matched), 0 if it was a
+// no-op (kind mismatch). NB: a kind-matched migration that doesn't
+// physically change the atom (e.g. RENAME on an atom without the old
+// key) still returns 1 -- the framework's contract is "this rule
+// applied to this atom kind", not "this atom changed".
+fn apply_migration(a, m) {
+    if len(m) < SCHEMA_MIG_COUNT { return 0 }
+    let kind = migration_kind(m)
+    if kind != SCHEMA_KIND_ANY {
+        if atom_kind(a) != kind { return 0 }
+    }
+    let op = migration_op(m)
+    let field = migration_field(m)
+    let default = migration_default(m)
+    if op == SCHEMA_OP_ADD {
+        // ADD: install the default value if the field is absent. An atom
+        // that already has the field (e.g. a re-applied migration on a
+        // partially-migrated KG) is left alone -- idempotent.
+        if atom_payload_has(a, field) == 0 {
+            atom_payload_set(a, field, default)
+        }
+        return 1
+    }
+    if op == SCHEMA_OP_REMOVE {
+        _schema_payload_remove(a, field)
+        return 1
+    }
+    if op == SCHEMA_OP_RENAME {
+        let pair = _schema_split_rename(field)
+        if pair == 0 { return 1 }
+        _schema_payload_rename(a, pair[0], pair[1])
+        return 1
+    }
+    if op == SCHEMA_OP_RETYPE {
+        // Only int -> milli is shipped. A future RETYPE tag gets a new
+        // branch here without disturbing any existing migration.
+        if atom_payload_has(a, field) == 1 {
+            if str_eq(default, SCHEMA_RETYPE_X1000) == 1 {
+                let old = atom_payload_get(a, field)
+                atom_payload_set(a, field, old * 1000)
+            }
+        }
+        return 1
+    }
+    return 0
+}
+
+// ---- migrate-one-atom (the chain) ------------------------------------------
+
+// Run every applicable registered migration on `a` until its schema
+// version reaches `target_version`. The chain stops when no more
+// migrations can advance the version -- either because the target was
+// reached, OR because no migration is registered for the current
+// version (defensive: prevents an infinite loop on a malformed
+// registry).
+//
+// Within each version step, we run EVERY migration tagged with the
+// matching from-version, in registration order. ALL of them must
+// either apply (kind match) or skip (kind mismatch) before the atom's
+// version is bumped to the to-version of the LAST step. We use the
+// LAST step because the framework assumes every migration at a given
+// from-version shares the same to-version (one logical "v1 -> v2"
+// step may include several atom-shape rules, but they're all part of
+// the same generation bump).
+fn migrate_atom(a, target_version) {
+    let current = atom_schema_version(a)
+    let safety = 0
+    while current < target_version {
+        // Find every migration with from == current. If none, we're
+        // stuck -- bump the version anyway so the caller doesn't see
+        // an infinite loop on a registry that's missing a step.
+        let any = 0
+        let next_version = current + 1
+        let i = 0
+        let n = len(_SCHEMA_MIGRATIONS)
+        while i < n {
+            let m = _SCHEMA_MIGRATIONS[i]
+            if migration_from(m) == current {
+                any = 1
+                next_version = migration_to(m)
+                apply_migration(a, m)
+            }
+            i = i + 1
+        }
+        if any == 0 {
+            // No registered migrations from `current` -> anywhere. Bump
+            // by one and continue so a partial registry doesn't deadlock
+            // the chain.
+            current = current + 1
+        } else {
+            current = next_version
+        }
+        atom_set_schema_version(a, current)
+        // Loop safety: every migration step must advance current by >=1;
+        // a malformed registry that registers a from_v == to_v rule
+        // would otherwise spin. Cap at the target distance + slack.
+        safety = safety + 1
+        if safety > 64 { current = target_version }
+    }
+    atom_set_schema_version(a, target_version)
+    return 1
+}
+
+// ---- migrate-a-whole-KG ----------------------------------------------------
+
+// Walk every atom in `kg` and migrate it up to `target_version`. The
+// migration framework operates on individual atoms (the per-atom schema
+// version is what gates each rule), so the KG walker is a thin loop --
+// the heavy lifting lives in migrate_atom.
+//
+// Returns the number of atoms touched (== total atom count in the KG,
+// since migrate_atom is unconditional on each atom). Ordering is the
+// KG's iteration order (kg_atoms()), preserved across the walk.
+fn migrate_kg(kg, target_version) {
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        migrate_atom(atoms[i], target_version)
+        i = i + 1
+    }
+    return len(atoms)
+}
+
+// Variant used by the snapshot reader. For ADD migrations whose default
+// is a sentinel (0), the reader can pass a snapshot-derived value (e.g.
+// the snapshot's `timestamp` field) to be used instead. Currently only
+// `created_ns` (the v1 -> v2 demo migration) honors the substitution;
+// other ADD migrations use their registered default verbatim.
+//
+// This mirrors R5D's snap_migrate_v1_to_v2: when the wire format has
+// no `meta.created_ns`, we use the file's outer `timestamp` as the
+// inherited recovery default. The atom-schema framework follows the
+// same principle for atoms.
+fn migrate_kg_with_default_ns(kg, target_version, snapshot_ts) {
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        let pre = atom_schema_version(a)
+        migrate_atom(a, target_version)
+        // If the atom was at v1 (pre-migration) and the v1 -> v2
+        // demo migration installed a zero `created_ns`, replace it
+        // with the snapshot's timestamp so the atom inherits a
+        // meaningful birth tick. Only triggers when the atom was
+        // genuinely at v1 on entry -- already-v2 atoms keep their
+        // existing `created_ns`.
+        if pre < 2 {
+            if snapshot_ts > 0 {
+                if atom_payload_has(a, "created_ns") == 1 {
+                    let cur = atom_payload_get(a, "created_ns")
+                    if cur == 0 {
+                        atom_payload_set(a, "created_ns", snapshot_ts)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(atoms)
+}
+
+// ---- demo migrations: the two shipped today --------------------------------
+//
+// V1 -> V2: ADD `created_ns` (default 0; snapshot reader substitutes
+//           the snapshot's `timestamp` when available).
+// V2 -> V3: RENAME `label` -> `display_label` on FACT (observation)
+//           atoms only.
+//
+// New migrations get APPENDED below this comment in future sessions.
+// The two demos prove ADD + RENAME on a kind-agnostic and a
+// kind-specific rule respectively. REMOVE + RETYPE are exercised by
+// the unit tests via _schema_migrations_clear_for_test +
+// register_migration; they're a one-liner away from production use.
+fn _schema_register_default_migrations() {
+    // V1 -> V2: add created_ns to every atom kind.
+    register_migration(
+        1, 2, SCHEMA_KIND_ANY, SCHEMA_OP_ADD, "created_ns", 0)
+    // V2 -> V3: rename label -> display_label on FACT (observation)
+    // atoms only. Other kinds (LANG, CONCEPT, episodic-promoted
+    // FACT, ...) keep their "label" payload field unchanged.
+    register_migration(
+        2, 3, ATOM_FACT, SCHEMA_OP_RENAME, "label:display_label", 0)
+    return len(_SCHEMA_MIGRATIONS)
+}
+
+// Module-load registration. NOVA modules execute top-level expressions
+// once at import, so this single call installs the demo migrations
+// before any caller invokes migrate_kg.
+let _SCHEMA_DEFAULTS_INSTALLED = _schema_register_default_migrations()
+
+// ---- snapshot-reader hook -------------------------------------------------
+//
+// After the daemon/chat applies the snapshot's KG section (i.e. atoms
+// are now live in the registry), it calls this helper to bring every
+// atom up to SCHEMA_CURRENT_VERSION. The helper reads the snapshot's
+// per-file atoms_version slot via snap_meta_atoms_version; a pre-R8E
+// snapshot (no slot) reads as SCHEMA_LEGACY_VERSION (= 1) and migrates
+// up cleanly.
+//
+// Returns the total number of atoms touched across every KG (== sum
+// over every KG of len(kg_atoms(kg))). 0 if either argument is 0.
+//
+// `kg_reg` is the KG registry the daemon installs via kg_section_apply.
+// The R5D reader is the contract: it parses the file into a snapshot
+// value, kg_section_apply installs the atoms, and THIS helper runs
+// the post-install schema sweep.
+fn snap_post_load_migrate(s, kg_reg) {
+    if s == 0 { return 0 }
+    if kg_reg == 0 { return 0 }
+    let from_v = snap_meta_atoms_version(s)
+    if from_v >= SCHEMA_CURRENT_VERSION { return 0 }
+    let snapshot_ts = snap_timestamp(s)
+    let kgs = kg_reg[KREG_KGS]
+    let total = 0
+    let i = 0
+    while i < len(kgs) {
+        total = total + migrate_kg_with_default_ns(kgs[i], SCHEMA_CURRENT_VERSION, snapshot_ts)
+        i = i + 1
+    }
+    // Stamp the snapshot's atoms_version slot so a subsequent save
+    // emits the current generation. R5D's snap_save -> snap_to_text
+    // path picks up the new line automatically.
+    snap_meta_set_atoms_version(s, SCHEMA_CURRENT_VERSION)
+    return total
+}

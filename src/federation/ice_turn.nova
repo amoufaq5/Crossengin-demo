@@ -1,0 +1,715 @@
+// CrossEngin federation: ICE-TURN integration layer (R35D / R28E.2).
+//
+// Purpose
+//
+//   R30C (`src/federation/ice.nova`, commit `0f95bb6`) shipped the ICE
+//   agent (RFC 8445 subset) with host + server-reflexive candidate
+//   gathering, RFC 8445 §5.1.2.1 priority computation, RFC 8445
+//   §6.1.2.3 pair-priority + the per-pair check-state machine. The
+//   `ICE_TYPE_RELAY` constant was carved out structurally but the
+//   matching relay-candidate gathering path was deferred -- R30C's
+//   header explicitly flags "TURN relay candidate gathering
+//   (allocate / refresh / send / data indications); `ICE_TYPE_RELAY`
+//   is a structural placeholder" as future work.
+//
+//   R34B (`src/federation/turn.nova`, commit `423a352`) then shipped
+//   the TURN protocol wire codec: parse + emit for Allocate, Refresh,
+//   Send, Data, CreatePermission, and ChannelBind, plus the TURN
+//   attribute set (LIFETIME, XOR-PEER-ADDRESS, XOR-RELAYED-ADDRESS,
+//   REQUESTED-TRANSPORT, CHANNEL-NUMBER, ...). R34B is also a leaf
+//   module -- it does NOT drive an allocation lifecycle, it just
+//   provides the byte-codec the lifecycle uses.
+//
+//   R35D bridges the two -- this module is the THIN ORCHESTRATOR that
+//   handles the "ICE exhausted host + srflx without a usable pair,
+//   escalate to a TURN-relayed candidate" transition. It composes
+//   R30C + R34B WITHOUT modifying either: every call into ice.nova
+//   uses the existing public surface (ice_add_local_candidate,
+//   ice_get_pair, ice_n_pairs), and every call into turn.nova uses
+//   the existing emit/parse helpers (turn_emit_allocate_request,
+//   turn_parse_allocate_success_response,
+//   turn_parse_allocate_error_response, turn_ipv4_str_to_buf).
+//
+// Flow
+//
+//   1. Caller drives ICE candidate gathering + connectivity checks via
+//      R30C's API.
+//   2. At any point the caller invokes `ice_turn_check_escalation`.
+//      If the agent has at least one pair AND every pair is in the
+//      `ICE_CHECK_FAILED` terminal state AND TURN hasn't already been
+//      activated, return `ICE_TURN_ESCALATE`.
+//   3. Caller then invokes `ice_turn_begin_allocate(state, txn_id_buf)`
+//      to obtain the on-wire Allocate Request bytes. The txn id is
+//      stashed for later response matching, and `turn_active` is
+//      latched to 1 so subsequent calls to `check_escalation` return
+//      `ICE_TURN_NO_ESCALATION` (one-way escalation).
+//   4. Caller transmits those bytes (real socket I/O lives elsewhere),
+//      receives a UDP datagram back from the TURN server, and feeds
+//      it into `ice_turn_handle_allocate_response`.
+//   5. On success that handler extracts the relayed (ip, port),
+//      injects it back into the ICE agent as a relay-typed local
+//      candidate via R30C's `ice_add_local_candidate`, and returns
+//      `ICE_TURN_RELAY_READY`. The caller then re-runs
+//      `ice_form_pairs` to materialize the new pairs the relay
+//      candidate participates in, and drives connectivity checks
+//      across them.
+//   6. On error (e.g. 401 Unauthorized when the TURN server demands
+//      USERNAME / MESSAGE-INTEGRITY / NONCE auth that this round does
+//      NOT plumb), the handler returns `ICE_TURN_RELAY_FAILED` and
+//      bumps the failure counter. The ice_agent remains unchanged.
+//
+// What R35D does NOT ship (out of scope, documented):
+//
+//   * USERNAME / MESSAGE-INTEGRITY / NONCE / REALM long-term-credential
+//     auth handshake. R34B's emit path doesn't generate these
+//     attributes; the parse path tolerates them on incoming messages
+//     but doesn't verify integrity. A real TURN server will return
+//     401 Unauthorized on the first Allocate request -- R35D
+//     correctly reports that as `ICE_TURN_RELAY_FAILED` rather than
+//     spinning a second request with auth. A future round must plumb
+//     STUN long-term-credential auth (RFC 8489 §9.2) through both
+//     R34B's emit path and this orchestrator.
+//   * Re-allocation on Refresh expiry -- the allocation has a
+//     LIFETIME and TURN servers expect periodic Refresh requests
+//     (RFC 5766 §7). R35D handles the FIRST Allocate only; the
+//     Refresh lifecycle is owned by R35B (the parallel "TURN
+//     allocation state machine" round).
+//   * Downgrade -- once `turn_active` is set, R35D does NOT clear it
+//     even if a higher-priority host / srflx pair later succeeds.
+//     RFC 8445 allows re-nomination but R35D is "one-way escalate";
+//     a real ICE driver would notice the higher-priority pair via
+//     R30C's nomination logic naturally.
+//   * Multiple TURN servers / multi-relay candidate -- the brief
+//     pins ONE TURN server endpoint. Multi-relay would need a list
+//     in the state and per-server txn id tracking.
+//   * CreatePermission and channel-binding after the relayed addr is
+//     allocated. The relay candidate is added to ICE, but actually
+//     SENDING data through the relay requires CreatePermission for
+//     each remote peer the application wants to reach. That's a
+//     follow-up wiring step on top of R35D.
+//
+// Public API surface
+//
+//   ice_turn_init(ice_agent, turn_server_ip_str, turn_server_port)
+//                                                  -> state
+//   ice_turn_check_escalation(state)
+//                                                  -> ICE_TURN_NO_ESCALATION
+//                                                  | ICE_TURN_ESCALATE
+//   ice_turn_begin_allocate(state, txn_id_buf)
+//                                                  -> [emit_buf, n]
+//   ice_turn_handle_allocate_response(state, recv_buf, n)
+//                                                  -> ICE_TURN_RELAY_READY
+//                                                  | ICE_TURN_RELAY_FAILED
+//   ice_turn_relay_priority()
+//                                                  -> 16777215 (RFC 8445)
+//   ice_turn_is_active(state)                      -> 0 | 1
+//   ice_turn_relayed_ip(state)                     -> "" | "a.b.c.d"
+//   ice_turn_relayed_port(state)                   -> 0 | port
+//   ice_turn_escalations_attempted(state)          -> int
+//   ice_turn_escalations_succeeded(state)          -> int
+//   ice_turn_escalations_failed(state)             -> int
+//   ice_turn_last_error_code(state)                -> int (0 if none;
+//                                                          else TURN error
+//                                                          code like 401)
+//   ice_turn_status_line(state)                    -> string
+//
+// ADRs touched: registers an entry against the R28E.2 ADR-0095 (ICE
+//   candidate gathering + connectivity-check matrix) lineage -- R35D
+//   adds the relay leg to ADR-0095.
+// NOVA dependencies: builtins (alloc, store8, load8, list_new, push,
+//   len, int_to_str, str_eq).
+// CrossEngin dependencies: `src/federation/ice.nova` (R30C),
+//   `src/federation/turn.nova` (R34B). Both consumed read-only via
+//   their existing public surface.
+
+import "./ice.nova"
+import "./turn.nova"
+
+// ============================================================================
+//                              Public return tags
+// ============================================================================
+
+let ICE_TURN_NO_ESCALATION = 0
+let ICE_TURN_ESCALATE      = 1
+
+let ICE_TURN_RELAY_READY   = 0
+let ICE_TURN_RELAY_FAILED  = 0 - 1
+
+// State-machine markers (`last_state` slot).
+let ICE_TURN_STATE_IDLE        = 0
+let ICE_TURN_STATE_ESCALATING  = 1
+let ICE_TURN_STATE_ALLOCATED   = 2
+let ICE_TURN_STATE_FAILED      = 3
+
+// Event markers (`last_event` slot) for status-line debugging.
+let ICE_TURN_EVT_NONE          = 0
+let ICE_TURN_EVT_ESCALATE      = 1
+let ICE_TURN_EVT_BEGIN_ALLOC   = 2
+let ICE_TURN_EVT_RELAY_READY   = 3
+let ICE_TURN_EVT_RELAY_FAILED  = 4
+
+// ============================================================================
+//                              ice_turn_state_t record indices
+// ============================================================================
+//
+//   The state is a positional list -- the slot order is part of the
+//   API contract. New slots MUST be appended (not inserted) to
+//   preserve byte-identity of existing tests.
+
+let _ICE_TURN_S_ICE_AGENT         = 0
+let _ICE_TURN_S_TURN_ACTIVE       = 1
+let _ICE_TURN_S_TURN_SERVER_IP    = 2
+let _ICE_TURN_S_TURN_SERVER_PORT  = 3
+let _ICE_TURN_S_TURN_SERVER_BUF   = 4  // 4-byte IPv4 buffer of server_ip
+let _ICE_TURN_S_RELAYED_IP        = 5
+let _ICE_TURN_S_RELAYED_PORT      = 6
+let _ICE_TURN_S_TXN_ID            = 7  // 12-byte buf of in-flight txn id
+let _ICE_TURN_S_LAST_STATE        = 8
+let _ICE_TURN_S_LAST_EVENT        = 9
+let _ICE_TURN_S_ESC_ATTEMPTED     = 10
+let _ICE_TURN_S_ESC_SUCCEEDED     = 11
+let _ICE_TURN_S_ESC_FAILED        = 12
+let _ICE_TURN_S_LAST_ERROR_CODE   = 13
+let _ICE_TURN_S_LAST_ERROR_REASON = 14
+let _ICE_TURN_S_GRANTED_LIFETIME  = 15
+let _ICE_TURN_S_RELAY_CAND_ID     = 16
+
+// ============================================================================
+//                              Relay candidate priority (RFC 8445 §5.1.2.1)
+// ============================================================================
+//
+//   priority = 2^24 * type_pref + 2^8 * local_pref + (256 - component_id)
+//
+//   For a relay candidate at the canonical RTP component with the
+//   default high local_pref (65535):
+//     type_pref      = 0      (relay is LOWEST of the four types --
+//                              RFC 8445 §5.1.2.2)
+//     local_pref     = 65535  (default highest)
+//     component_id   = 1      (RTP)
+//
+//     priority = 2^24 * 0     + 2^8 * 65535 + (256 - 1)
+//              = 0            + 16776960    + 255
+//              = 16777215
+//
+//   This matches the RFC 8445 §5.1.2.2 worked example for a relay
+//   candidate with maximum local preference at the RTP component.
+
+let _ICE_TURN_RELAY_LOCAL_PREF    = 65535
+let _ICE_TURN_RELAY_COMPONENT_ID  = 1
+let _ICE_TURN_RELAY_PRIORITY      = 16777215
+
+fn ice_turn_relay_priority() {
+    return _ICE_TURN_RELAY_PRIORITY
+}
+
+// ============================================================================
+//                              Init
+// ============================================================================
+
+fn _ice_turn_zero_buf(n) {
+    let b = alloc(n + 1)
+    let i = 0
+    while i < n { store8(b + i, 0); i = i + 1 }
+    store8(b + n, 0)
+    return b
+}
+
+fn ice_turn_init(ice_agent, turn_server_ip_str, turn_server_port) {
+    let st = list_new()
+    push(st, ice_agent)                                 // 0  ice_agent
+    push(st, 0)                                          // 1  turn_active
+    push(st, turn_server_ip_str)                         // 2  server ip str
+    push(st, turn_server_port)                           // 3  server port
+    let server_buf = turn_ipv4_str_to_buf(turn_server_ip_str)
+    push(st, server_buf)                                 // 4  server 4-byte buf
+    push(st, "")                                          // 5  relayed ip
+    push(st, 0)                                          // 6  relayed port
+    push(st, _ice_turn_zero_buf(TURN_TXN_ID_LEN))        // 7  txn id buf
+    push(st, ICE_TURN_STATE_IDLE)                        // 8  last_state
+    push(st, ICE_TURN_EVT_NONE)                          // 9  last_event
+    push(st, 0)                                          // 10 escalations_attempted
+    push(st, 0)                                          // 11 escalations_succeeded
+    push(st, 0)                                          // 12 escalations_failed
+    push(st, 0)                                          // 13 last_error_code
+    push(st, "")                                          // 14 last_error_reason
+    push(st, 0)                                          // 15 granted_lifetime
+    push(st, 0 - 1)                                      // 16 relay_cand_id
+    return st
+}
+
+// ============================================================================
+//                              Accessors
+// ============================================================================
+
+fn ice_turn_is_active(state)              { return state[_ICE_TURN_S_TURN_ACTIVE] }
+fn ice_turn_relayed_ip(state)             { return state[_ICE_TURN_S_RELAYED_IP] }
+fn ice_turn_relayed_port(state)           { return state[_ICE_TURN_S_RELAYED_PORT] }
+fn ice_turn_escalations_attempted(state)  { return state[_ICE_TURN_S_ESC_ATTEMPTED] }
+fn ice_turn_escalations_succeeded(state)  { return state[_ICE_TURN_S_ESC_SUCCEEDED] }
+fn ice_turn_escalations_failed(state)     { return state[_ICE_TURN_S_ESC_FAILED] }
+fn ice_turn_last_error_code(state)        { return state[_ICE_TURN_S_LAST_ERROR_CODE] }
+fn ice_turn_last_error_reason(state)      { return state[_ICE_TURN_S_LAST_ERROR_REASON] }
+fn ice_turn_granted_lifetime(state)       { return state[_ICE_TURN_S_GRANTED_LIFETIME] }
+fn ice_turn_relay_candidate_id(state)     { return state[_ICE_TURN_S_RELAY_CAND_ID] }
+fn ice_turn_last_state(state)             { return state[_ICE_TURN_S_LAST_STATE] }
+fn ice_turn_last_event(state)             { return state[_ICE_TURN_S_LAST_EVENT] }
+fn ice_turn_server_ip(state)              { return state[_ICE_TURN_S_TURN_SERVER_IP] }
+fn ice_turn_server_port(state)            { return state[_ICE_TURN_S_TURN_SERVER_PORT] }
+
+// ============================================================================
+//                              Checklist inspection
+// ============================================================================
+//
+//   `ice_turn_check_escalation` reads the ICE agent's pair list and
+//   returns `ICE_TURN_ESCALATE` iff:
+//     (a) TURN has NOT already been activated (one-way escalation), AND
+//     (b) the agent has at least one pair (we don't escalate on an
+//         empty checklist -- that means gathering hasn't run yet), AND
+//     (c) EVERY pair is in the `ICE_CHECK_FAILED` terminal state.
+//
+//   Otherwise returns `ICE_TURN_NO_ESCALATION`.
+
+fn _ice_turn_all_pairs_failed(ice_agent) {
+    let n = ice_n_pairs(ice_agent)
+    if n == 0 { return 0 }
+    let i = 0
+    while i < n {
+        let p = ice_get_pair(ice_agent, i)
+        if p == 0 { return 0 }
+        if p[3] != ICE_CHECK_FAILED { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn ice_turn_check_escalation(state) {
+    if state[_ICE_TURN_S_TURN_ACTIVE] == 1 {
+        return ICE_TURN_NO_ESCALATION
+    }
+    let agent = state[_ICE_TURN_S_ICE_AGENT]
+    if _ice_turn_all_pairs_failed(agent) == 1 {
+        return ICE_TURN_ESCALATE
+    }
+    return ICE_TURN_NO_ESCALATION
+}
+
+// ============================================================================
+//                              Begin Allocate
+// ============================================================================
+//
+//   `ice_turn_begin_allocate(state, txn_id_buf)` invokes R34B's
+//   `turn_emit_allocate_request(txn_id, lifetime=600,
+//   requested_transport=UDP17)` and stores `txn_id_buf` (copied byte
+//   for byte) into the state for later response matching. Returns the
+//   `[emit_buf, n]` pair the caller should transmit on its UDP socket.
+//   Bumps `escalations_attempted` and latches `turn_active = 1` so
+//   `check_escalation` does not retry.
+//
+//   Caller is responsible for randomly generating the txn id. RFC 8489
+//   §6 requires 96 bits of cryptographic randomness; R35D does NOT do
+//   that for the caller, it just copies the bytes.
+
+fn _ice_turn_copy_txn(dst, src) {
+    let i = 0
+    while i < TURN_TXN_ID_LEN {
+        store8(dst + i, load8(src + i))
+        i = i + 1
+    }
+    return 1
+}
+
+fn ice_turn_begin_allocate(state, txn_id_buf) {
+    _ice_turn_copy_txn(state[_ICE_TURN_S_TXN_ID], txn_id_buf)
+    state[_ICE_TURN_S_TURN_ACTIVE] = 1
+    state[_ICE_TURN_S_LAST_STATE]  = ICE_TURN_STATE_ESCALATING
+    state[_ICE_TURN_S_LAST_EVENT]  = ICE_TURN_EVT_BEGIN_ALLOC
+    state[_ICE_TURN_S_ESC_ATTEMPTED] =
+        state[_ICE_TURN_S_ESC_ATTEMPTED] + 1
+    let req = turn_emit_allocate_request(txn_id_buf,
+                                         TURN_LIFETIME_DEFAULT,
+                                         TURN_TRANSPORT_UDP)
+    return req
+}
+
+// ============================================================================
+//                              Handle Allocate Response
+// ============================================================================
+//
+//   `ice_turn_handle_allocate_response(state, recv_buf, n)` first asks
+//   R34B's parser to interpret the response. The parser returns either
+//   a list of fields (success) or a negative error sentinel (framing
+//   failure / wrong method / missing attr / IPv6 family).
+//
+//   Order of attempts:
+//     1. `turn_parse_allocate_success_response(buf, n)` -- if it returns
+//        a 5-element list, extract relayed (ip, port) + lifetime,
+//        inject the relayed addr as an ICE relay-typed local candidate,
+//        bump `escalations_succeeded`, set state ALLOCATED, return
+//        `ICE_TURN_RELAY_READY`.
+//     2. If step 1 returned a negative integer, try
+//        `turn_parse_allocate_error_response(buf, n)`. If it returns a
+//        2-element list, extract err_code + reason, store them, bump
+//        `escalations_failed`, set state FAILED, return
+//        `ICE_TURN_RELAY_FAILED`.
+//     3. If step 2 also returned a negative integer, the message is
+//        neither a valid Allocate Success nor a valid Allocate Error.
+//        Bump `escalations_failed`, store error code = -999 (synthetic),
+//        return `ICE_TURN_RELAY_FAILED`.
+//
+//   Why two attempts: R34B's parsers are strict about method+class
+//   (they return TURN_ERR_METHOD if the message isn't an Allocate
+//   Success / Error specifically). The caller doesn't have to
+//   pre-classify -- we try success first then error.
+
+// Heuristic: a parse-result is "a list" iff it's a NOVA list reference
+// (return value of list_new() + push). A parse error is a NEGATIVE int.
+// In NOVA we cannot directly type-test, but the success path returns
+// >= 0 -length list and the error path returns a negative scalar.
+// We exploit the value range: parse success-resp returns a 5-elem list,
+// parse error-resp returns a 2-elem list; negative-int errors are
+// detected via the < 0 comparison.
+
+fn _ice_turn_is_parse_err(r) {
+    // R34B's parsers return either a list (success) or a negative int
+    // (TURN_ERR_*). A list cannot be < 0 in any sensible coercion, but
+    // NOVA's int/list comparison is implementation-defined for ==.
+    // The safe pattern is to compare against the known sentinel
+    // constants: TURN_ERR_HEADER = -1, ..., TURN_ERR_METHOD = -7.
+    if r == TURN_ERR_HEADER  { return 1 }
+    if r == TURN_ERR_COOKIE  { return 1 }
+    if r == TURN_ERR_LENGTH  { return 1 }
+    if r == TURN_ERR_ATTR    { return 1 }
+    if r == TURN_ERR_FAMILY  { return 1 }
+    if r == TURN_ERR_NO_ATTR { return 1 }
+    if r == TURN_ERR_METHOD  { return 1 }
+    return 0
+}
+
+fn _ice_turn_inject_relay_candidate(state, relayed_ip, relayed_port) {
+    let agent = state[_ICE_TURN_S_ICE_AGENT]
+    let id = ice_add_local_candidate(agent,
+                                     ICE_TYPE_RELAY,
+                                     relayed_ip,
+                                     relayed_port,
+                                     ICE_FAMILY_IPV4,
+                                     _ICE_TURN_RELAY_COMPONENT_ID)
+    state[_ICE_TURN_S_RELAY_CAND_ID] = id
+    return id
+}
+
+fn ice_turn_handle_allocate_response(state, recv_buf, n) {
+    let s_dec = turn_parse_allocate_success_response(recv_buf, n)
+    if _ice_turn_is_parse_err(s_dec) == 0 {
+        // Success path -- 5-element list:
+        //   [relayed_ip_str, relayed_port, lifetime_sec,
+        //    mapped_ip_str, mapped_port]
+        let relayed_ip   = s_dec[0]
+        let relayed_port = s_dec[1]
+        let lifetime     = s_dec[2]
+        state[_ICE_TURN_S_RELAYED_IP]       = relayed_ip
+        state[_ICE_TURN_S_RELAYED_PORT]     = relayed_port
+        state[_ICE_TURN_S_GRANTED_LIFETIME] = lifetime
+        state[_ICE_TURN_S_LAST_STATE]       = ICE_TURN_STATE_ALLOCATED
+        state[_ICE_TURN_S_LAST_EVENT]       = ICE_TURN_EVT_RELAY_READY
+        state[_ICE_TURN_S_LAST_ERROR_CODE]  = 0
+        state[_ICE_TURN_S_LAST_ERROR_REASON] = ""
+        _ice_turn_inject_relay_candidate(state, relayed_ip, relayed_port)
+        state[_ICE_TURN_S_ESC_SUCCEEDED] =
+            state[_ICE_TURN_S_ESC_SUCCEEDED] + 1
+        return ICE_TURN_RELAY_READY
+    }
+    let e_dec = turn_parse_allocate_error_response(recv_buf, n)
+    if _ice_turn_is_parse_err(e_dec) == 0 {
+        // Error path -- 2-element list: [err_code, reason]
+        state[_ICE_TURN_S_LAST_ERROR_CODE]   = e_dec[0]
+        state[_ICE_TURN_S_LAST_ERROR_REASON] = e_dec[1]
+        state[_ICE_TURN_S_LAST_STATE]        = ICE_TURN_STATE_FAILED
+        state[_ICE_TURN_S_LAST_EVENT]        = ICE_TURN_EVT_RELAY_FAILED
+        state[_ICE_TURN_S_ESC_FAILED] =
+            state[_ICE_TURN_S_ESC_FAILED] + 1
+        return ICE_TURN_RELAY_FAILED
+    }
+    // Neither parser recognized the message -- malformed bytes.
+    // Use a synthetic local error code so the caller can still
+    // distinguish "no error code surfaced" from "missing".
+    state[_ICE_TURN_S_LAST_ERROR_CODE]   = 0 - 999
+    state[_ICE_TURN_S_LAST_ERROR_REASON] = "malformed Allocate response"
+    state[_ICE_TURN_S_LAST_STATE]        = ICE_TURN_STATE_FAILED
+    state[_ICE_TURN_S_LAST_EVENT]        = ICE_TURN_EVT_RELAY_FAILED
+    state[_ICE_TURN_S_ESC_FAILED] =
+        state[_ICE_TURN_S_ESC_FAILED] + 1
+    return ICE_TURN_RELAY_FAILED
+}
+
+// ============================================================================
+//                              Diagnostic / status line
+// ============================================================================
+
+fn _ice_turn_state_name(s) {
+    if s == ICE_TURN_STATE_IDLE       { return "idle" }
+    if s == ICE_TURN_STATE_ESCALATING { return "escalating" }
+    if s == ICE_TURN_STATE_ALLOCATED  { return "allocated" }
+    if s == ICE_TURN_STATE_FAILED     { return "failed" }
+    return "?"
+}
+
+fn ice_turn_status_line(state) {
+    if state == 0 { return "ice_turn: <no state>" }
+    let active = "no"
+    if state[_ICE_TURN_S_TURN_ACTIVE] == 1 { active = "yes" }
+    let relayed = state[_ICE_TURN_S_RELAYED_IP]
+    if len(relayed) == 0 { relayed = "<none>" }
+    return "ice_turn: state=" + _ice_turn_state_name(state[_ICE_TURN_S_LAST_STATE])
+        + " turn_active=" + active
+        + " relayed=" + relayed
+        + " attempted=" + int_to_str(state[_ICE_TURN_S_ESC_ATTEMPTED])
+        + " succeeded=" + int_to_str(state[_ICE_TURN_S_ESC_SUCCEEDED])
+        + " failed=" + int_to_str(state[_ICE_TURN_S_ESC_FAILED])
+}
+
+// ============================================================================
+//                              Test-only shims
+// ============================================================================
+
+fn _ice_turn_test_all_pairs_failed(ice_agent) {
+    return _ice_turn_all_pairs_failed(ice_agent)
+}
+
+fn _ice_turn_test_is_parse_err(r) {
+    return _ice_turn_is_parse_err(r)
+}
+
+fn _ice_turn_test_state_name(s) {
+    return _ice_turn_state_name(s)
+}
+
+// ============================================================================
+// ============================================================================
+//        R36A -- 401 auto-retry with long-term credentials (R35D.2)
+// ============================================================================
+// ============================================================================
+//
+// The original `ice_turn_handle_allocate_response` above classifies any
+// Allocate-error (including a 401 Unauthorized that simply means the
+// server demands long-term credentials per RFC 5389 §10) as
+// `RELAY_FAILED`. R36A's R35D.2 extension transitions a 401 to a NEW
+// `ICE_TURN_AUTH_PENDING` state instead, stashes the REALM + NONCE
+// from the 401 body, and exposes `ice_turn_credentials(state, username,
+// password)` for the caller to supply the credentials. That call
+// emits a fresh Allocate request with the four long-term-credential
+// attributes (USERNAME, REALM, NONCE, MESSAGE-INTEGRITY) computed via
+// R36A's `turn_emit_allocate_request_authed`.
+//
+// Retry cap: if a SECOND 401 follows the credentialed Allocate (which
+// means the credentials were wrong), the handler classifies
+// `RELAY_FAILED` and stops; no further retries. A counter
+// `stats_auth_retries` bumps each time we emit the credentialed
+// retry.
+
+// New return tag: 401 received, awaiting caller-supplied credentials.
+let ICE_TURN_RELAY_AUTH_PENDING = 1
+
+// Auth sub-state.
+let ICE_TURN_AUTH_NONE      = 0
+let ICE_TURN_AUTH_PENDING   = 1
+let ICE_TURN_AUTH_OK        = 2
+let ICE_TURN_AUTH_FAILED    = 3
+
+let ICE_TURN_STATE_AUTH_PENDING = 4
+
+let ICE_TURN_EVT_AUTH_PENDING   = 5
+let ICE_TURN_EVT_AUTH_RETRY     = 6
+
+// New state slots, appended to preserve the R35D 17-slot layout.
+let _ICE_TURN_S_AUTH_REALM        = 17
+let _ICE_TURN_S_AUTH_REALM_N      = 18
+let _ICE_TURN_S_AUTH_NONCE        = 19
+let _ICE_TURN_S_AUTH_NONCE_N      = 20
+let _ICE_TURN_S_AUTH_STATE        = 21
+let _ICE_TURN_S_STATS_AUTH_RETRIES = 22
+
+// Extension helper -- callers built on R35D's `ice_turn_init` can call
+// `ice_turn_extend_state_r36a(state)` to append the new slots in
+// place. Existing slots 0..16 are preserved.
+fn ice_turn_extend_state_r36a(state) {
+    if len(state) > _ICE_TURN_S_STATS_AUTH_RETRIES { return state }
+    push(state, 0)                            // 17 AUTH_REALM buf
+    push(state, 0)                            // 18 AUTH_REALM_N
+    push(state, 0)                            // 19 AUTH_NONCE buf
+    push(state, 0)                            // 20 AUTH_NONCE_N
+    push(state, ICE_TURN_AUTH_NONE)           // 21 AUTH_STATE
+    push(state, 0)                            // 22 STATS_AUTH_RETRIES
+    return state
+}
+
+// R36A initializer that pre-extends the state.
+fn ice_turn_init_authed(ice_agent, turn_server_ip_str, turn_server_port) {
+    let st = ice_turn_init(ice_agent, turn_server_ip_str, turn_server_port)
+    return ice_turn_extend_state_r36a(st)
+}
+
+// Read accessors.
+fn ice_turn_auth_state(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_STATE { return ICE_TURN_AUTH_NONE }
+    return state[_ICE_TURN_S_AUTH_STATE]
+}
+
+fn ice_turn_stats_auth_retries(state) {
+    if len(state) <= _ICE_TURN_S_STATS_AUTH_RETRIES { return 0 }
+    return state[_ICE_TURN_S_STATS_AUTH_RETRIES]
+}
+
+fn ice_turn_auth_realm_buf(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_REALM { return 0 }
+    return state[_ICE_TURN_S_AUTH_REALM]
+}
+
+fn ice_turn_auth_realm_n(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_REALM_N { return 0 }
+    return state[_ICE_TURN_S_AUTH_REALM_N]
+}
+
+fn ice_turn_auth_nonce_buf(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_NONCE { return 0 }
+    return state[_ICE_TURN_S_AUTH_NONCE]
+}
+
+fn ice_turn_auth_nonce_n(state) {
+    if len(state) <= _ICE_TURN_S_AUTH_NONCE_N { return 0 }
+    return state[_ICE_TURN_S_AUTH_NONCE_N]
+}
+
+// Copy a buffer slice into a freshly alloc'd NUL-terminated copy. Used
+// so the parse pointers (which point INTO the recv buf) become
+// owned copies that outlive the recv buf.
+fn _ice_turn_copy_slice(src, n) {
+    if n <= 0 { return 0 }
+    let b = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(b + i, load8(src + i))
+        i = i + 1
+    }
+    store8(b + n, 0)
+    return b
+}
+
+// Convert a slice into a NUL-terminated NOVA string so it can be passed
+// to `turn_emit_allocate_request_authed` which takes string args.
+fn _ice_turn_slice_to_str(src, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        s = s + chr(load8(src + i))
+        i = i + 1
+    }
+    return s
+}
+
+// ============================================================================
+//                  ice_turn_handle_allocate_response_authed
+// ============================================================================
+//
+// R35D.2 wrapper around the R35D handler. On a 401 specifically, we
+// DO NOT classify `RELAY_FAILED` -- instead, we parse out REALM +
+// NONCE, stash them, transition to `AUTH_PENDING`, and return
+// `ICE_TURN_RELAY_AUTH_PENDING`. Caller then invokes
+// `ice_turn_credentials(state, username, password)` to retry.
+//
+// If a SECOND 401 arrives (auth_state already == OK or PENDING with
+// retries > 0), classify `RELAY_FAILED` to stop the loop.
+//
+// All non-401 paths delegate to the R35D handler unchanged.
+
+fn ice_turn_handle_allocate_response_authed(state, recv_buf, n) {
+    ice_turn_extend_state_r36a(state)
+    // First try the 401 parser. If it returns a non-error list, we
+    // have a 401 with REALM + NONCE in hand.
+    let auth = turn_parse_401_response(recv_buf, n)
+    if _ice_turn_is_parse_err(auth) == 0 {
+        // It's a 401. If we already retried once, fail hard.
+        let prior_retries = state[_ICE_TURN_S_STATS_AUTH_RETRIES]
+        if prior_retries >= 1 {
+            // Second 401 -- credentials were wrong. Bumps the standard
+            // R35D failure counters via the underlying handler to keep
+            // the existing accounting consistent.
+            state[_ICE_TURN_S_AUTH_STATE]    = ICE_TURN_AUTH_FAILED
+            state[_ICE_TURN_S_LAST_STATE]    = ICE_TURN_STATE_FAILED
+            state[_ICE_TURN_S_LAST_EVENT]    = ICE_TURN_EVT_RELAY_FAILED
+            state[_ICE_TURN_S_LAST_ERROR_CODE]   = 401
+            state[_ICE_TURN_S_LAST_ERROR_REASON] = "Unauthorized (after retry)"
+            state[_ICE_TURN_S_ESC_FAILED] =
+                state[_ICE_TURN_S_ESC_FAILED] + 1
+            return ICE_TURN_RELAY_FAILED
+        }
+        // First 401: stash REALM + NONCE and signal AUTH_PENDING.
+        let realm_buf_in = auth[0]
+        let realm_n      = auth[1]
+        let nonce_buf_in = auth[2]
+        let nonce_n      = auth[3]
+        state[_ICE_TURN_S_AUTH_REALM]   = _ice_turn_copy_slice(realm_buf_in,
+                                                               realm_n)
+        state[_ICE_TURN_S_AUTH_REALM_N] = realm_n
+        state[_ICE_TURN_S_AUTH_NONCE]   = _ice_turn_copy_slice(nonce_buf_in,
+                                                               nonce_n)
+        state[_ICE_TURN_S_AUTH_NONCE_N] = nonce_n
+        state[_ICE_TURN_S_AUTH_STATE]   = ICE_TURN_AUTH_PENDING
+        state[_ICE_TURN_S_LAST_STATE]   = ICE_TURN_STATE_AUTH_PENDING
+        state[_ICE_TURN_S_LAST_EVENT]   = ICE_TURN_EVT_AUTH_PENDING
+        state[_ICE_TURN_S_LAST_ERROR_CODE]   = 401
+        state[_ICE_TURN_S_LAST_ERROR_REASON] = "Unauthorized"
+        return ICE_TURN_RELAY_AUTH_PENDING
+    }
+    // Not a 401. Delegate to the R35D handler. If that classifies the
+    // message as a SUCCESS, mark auth as OK so future calls don't try
+    // to re-retry on a subsequent miscall.
+    let rc = ice_turn_handle_allocate_response(state, recv_buf, n)
+    if rc == ICE_TURN_RELAY_READY {
+        state[_ICE_TURN_S_AUTH_STATE] = ICE_TURN_AUTH_OK
+    }
+    return rc
+}
+
+// ============================================================================
+//                  ice_turn_credentials
+// ============================================================================
+//
+// Caller hands in username + password after receiving an
+// `ICE_TURN_RELAY_AUTH_PENDING` verdict. We compose REALM + NONCE
+// (stashed from the 401) with the caller's creds via R36A's
+// `turn_emit_allocate_request_authed` and return the emit tuple.
+// Also bumps `stats_auth_retries` and updates the transaction id
+// state slot so the next response handler matches it.
+
+fn ice_turn_credentials(state, username, password) {
+    ice_turn_extend_state_r36a(state)
+    if state[_ICE_TURN_S_AUTH_STATE] != ICE_TURN_AUTH_PENDING {
+        return 0
+    }
+    if state[_ICE_TURN_S_AUTH_REALM] == 0 { return 0 }
+    if state[_ICE_TURN_S_AUTH_NONCE] == 0 { return 0 }
+    let realm = _ice_turn_slice_to_str(state[_ICE_TURN_S_AUTH_REALM],
+                                       state[_ICE_TURN_S_AUTH_REALM_N])
+    let nonce = _ice_turn_slice_to_str(state[_ICE_TURN_S_AUTH_NONCE],
+                                       state[_ICE_TURN_S_AUTH_NONCE_N])
+    // Re-use the txn id stashed by begin_allocate. We allocate a fresh
+    // buffer for the emit so the caller can independently track the
+    // retry txn (we just copy the prior bytes for now -- a real
+    // implementation rotates the txn id, but keeping the same id keeps
+    // the response handler's txn-correlation in lock-step without a
+    // second stash slot).
+    let txn = state[_ICE_TURN_S_TXN_ID]
+    state[_ICE_TURN_S_STATS_AUTH_RETRIES] =
+        state[_ICE_TURN_S_STATS_AUTH_RETRIES] + 1
+    state[_ICE_TURN_S_LAST_EVENT] = ICE_TURN_EVT_AUTH_RETRY
+    let req = turn_emit_allocate_request_authed(txn,
+                                                TURN_LIFETIME_DEFAULT,
+                                                TURN_TRANSPORT_UDP,
+                                                username, password,
+                                                realm, nonce)
+    return req
+}
+
+// Test-only shims.
+fn _ice_turn_test_copy_slice(src, n)    { return _ice_turn_copy_slice(src, n) }
+fn _ice_turn_test_slice_to_str(src, n)  { return _ice_turn_slice_to_str(src, n) }

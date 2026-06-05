@@ -1,0 +1,975 @@
+// CrossEngin federation: gossip relay -- peer-to-peer routing through
+// intermediaries when direct connection isn't possible (R26E).
+//
+// Purpose
+//
+//   R18E (`src/federation/gossip.nova`) ships a SWIM-style gossip mesh
+//   assuming every peer can directly TCP-connect to every other peer.
+//   R23E adds NAT-type detection but UDP hole-punching is stubbed
+//   (R23E.2). Until full NAT traversal: peers behind symmetric NATs
+//   or strict firewalls can't reach each other directly. This module
+//   ships the relay primitive: when peer A wants to send to peer B
+//   but the direct dial fails, A picks a peer C that can reach both
+//   A and B, sends RELAY_REQ to C, C forwards as RELAY_DATA to B, B
+//   ACKs via the reverse path A <- C <- B.
+//
+// Protocol
+//
+//   1. Each peer advertises its NAT-traversal capability (open / cone
+//      / symmetric / blocked) via R23E's nat_state.
+//   2. When peer A wants to send to peer B: A first tries direct
+//      dial. On dial failure, A walks gossip_alive_peers() picking
+//      any peer C != B that A considers reachable; sends
+//          RELAY_REQ <req_id> <target=B> <originator=A> <payload>
+//      to C.
+//   3. C parses the line; verifies it can reach B via the same direct-
+//      dial primitive. If yes, C sends
+//          RELAY_DATA <req_id> <target=B> <via=C> <from=A> <payload>
+//      to B. The `via=C` and `from=A` annotations let B distinguish a
+//      relayed message from a direct one and remember the working
+//      route.
+//   4. B processes the message; sends
+//          RELAY_ACK <req_id> <originator=A> <via=C>
+//      back to C (B's reverse route just dials C directly; B->C is
+//      assumed bidirectional because C just delivered B->A's leg
+//      via C, transitively).
+//   5. C forwards
+//          RELAY_ACK <req_id> <originator=A> <via=C>
+//      to A. A's connection state caches (B -> via=C) so the next
+//      send to B short-circuits straight to the relay path.
+//
+// Honest scope
+//
+//   True NAT relay needs UDP hole-punching for ad-hoc relay
+//   selection; R26E ships the TCP-based relay via pre-known mesh
+//   peers. Any alive peer (from the gossip table) can serve as
+//   relay. Full STUN-like relay discovery (where C is chosen based
+//   on observed NAT topology rather than mere aliveness) is R26E.2.
+//
+// Public API
+//
+//   relay_init(gossip_state)                    -> relay_state_t
+//   relay_send(relay, target_peer, payload)     -> 1 (ok) | 0 (error)
+//       Auto-routes: direct dial first, falls back to relay via a
+//       common alive peer if direct fails.
+//   relay_handle_request(relay, req_line)       -> 1 forwarded | 0 dropped
+//       Peer-relay side: forwards an incoming RELAY_REQ to the
+//       declared target.
+//   relay_chosen_via(relay, target)             -> int_peer_addr | -1
+//       For diagnostics: returns the cached relay peer addr last
+//       used to reach `target`, or -1 if no cache entry.
+//   relay_handle_data(relay, data_line)         -> 1 delivered | 0 dropped
+//       Terminal receiver side: records inbound relayed payload +
+//       annotations into the relay's received-queue.
+//   relay_received_count(relay)                 -> count of inbound
+//       RELAY_DATA messages delivered to us (the terminal receiver).
+//   relay_received_at(relay, idx)               -> [req_id, payload, via, from]
+//       Inspect a delivered message (test + diagnostics helper).
+//   relay_stats_line(relay)                     -> one-liner for status
+//
+//   Plus helpers exercised by unit tests:
+//   relay_format_request(req_id, target, origin, payload) -> wire str
+//   relay_format_data(req_id, target, via, from, payload) -> wire str
+//   relay_format_ack(req_id, origin, via)        -> wire str
+//   relay_parse_request(line)                    -> [req_id, target, origin, payload] | 0
+//   relay_parse_data(line)                       -> [req_id, target, via, from, payload] | 0
+//   relay_parse_ack(line)                        -> [req_id, origin, via] | 0
+//   relay_pick_intermediate(relay, target)       -> peer_addr | 0
+//       Picks an alive peer != target to serve as relay.
+//   relay_cache_via(relay, target, via)          -> 1
+//   relay_mark_unreachable(relay, peer)          -> 1
+//       Test hook: simulate a peer A cannot directly dial. Used by
+//       unit tests + integration scenario to force the relay path
+//       without iptables. relay_send consults this set first.
+//   relay_is_unreachable(relay, peer)            -> 1 | 0
+//   relay_stats_sent_direct(relay)               -> counter
+//   relay_stats_sent_via_relay(relay)            -> counter
+//   relay_stats_forwarded(relay)                 -> counter
+//   relay_stats_acked(relay)                     -> counter
+//   relay_stats_no_relay(relay)                  -> counter
+//
+//   R26E.2: STUN-like ranked relay candidate selection (opt-in).
+//   relay_set_peer_nat_type(relay, peer, type)        -> 1
+//       Populate the per-peer NAT-type registry. `type` is one of
+//       "open" / "cone" / "symmetric" / "blocked" / "unknown" (any
+//       other string is treated as "unknown" by the ranker). Souls
+//       feed this from R23E's nat_detect_type result for each
+//       peer they've learned about; tests + the integration
+//       scenario stub it directly.
+//   relay_get_peer_nat_type(relay, peer)              -> str
+//       Returns the cached type or "unknown" if absent.
+//   relay_rank_candidates(relay, target)              -> list of peer_addr
+//       Returns the alive non-target non-self non-blocked peers
+//       sorted by R23E NAT rank descending (open > cone > unknown >
+//       symmetric); ties broken by least-recently-used (LRU
+//       rotation). The list is suitable for sequential fallback if
+//       the top pick fails.
+//   relay_choose_candidate_ranked(relay, target)      -> peer_addr | -1
+//       Top of relay_rank_candidates, with the chosen peer pushed to
+//       most-recently-used in the LRU tracker (so a follow-up call
+//       with all-equal ranks rotates to the next peer). Returns -1
+//       when no usable candidate exists (empty mesh, all blocked,
+//       etc.). Honoured by relay_send when CE_RELAY_RANK_NAT=on.
+//   relay_mark_relay_failed(relay, peer)              -> 1
+//       Invalidates any cache entry whose via=peer. Called when a
+//       relayed send fails (target still unreachable after relay).
+//       The next send will re-pick.
+//
+//   Extends gossip with RELAY_REQ / RELAY_DATA / RELAY_ACK wire types
+//   (dispatched in gossip.nova via the additive parser branches).
+//
+// ADRs implemented: registers ADR-0090 (federation gossip relay).
+// NOVA dependencies: socket builtins (same set as R18E), nanotime,
+// int_to_str, str_to_int. CrossEngin dependencies:
+// src/federation/gossip.nova (read-only -- gossip_alive_peers,
+// gossip_self_addr, internal _gossip_send_all / _gossip_recv_line /
+// _gossip_dial / _gossip_split_spaces / _gossip_starts_with helpers
+// reused inline).
+
+import "std/io"
+import "./gossip.nova"
+
+// ---- protocol constants ---------------------------------------------------
+
+let RELAY_VERSION       = 1
+let RELAY_LINE_MAX      = 1024
+
+// Wire prefixes / lines. Distinct from every other prefix in
+// gossip.nova so the additive parser branches in gossip_handle_conn
+// can dispatch via prefix match without ambiguity.
+let RELAY_REQ_PREFIX    = "RELAY_REQ "
+let RELAY_DATA_PREFIX   = "RELAY_DATA "
+let RELAY_ACK_PREFIX    = "RELAY_ACK "
+
+// Relay-state record indices. Slot 0 holds the back-ref to the
+// gossip state (read-only use: alive peers + self_addr lookups + dial
+// + send helpers). Slots 11-13 are pinned by the gossip <-> relay
+// cross-module protocol so gossip can enqueue inbound wire lines
+// without importing this module (the import graph runs in the
+// other direction). The pinned indices are mirrored in gossip.nova
+// as GOSSIP_RELAY_INBOUND_REQS / _DATA / _ACKS.
+let RELAY_S_GOSSIP             = 0
+let RELAY_S_REQ_SEQ            = 1
+let RELAY_S_CACHE              = 2  // list of [target_addr, via_addr]
+let RELAY_S_UNREACHABLE        = 3  // list of addrs that direct-dial fails for (test hook)
+let RELAY_S_RECEIVED           = 4  // list of inbound delivered records
+let RELAY_S_STATS_SENT_DIRECT  = 5
+let RELAY_S_STATS_SENT_VIA     = 6
+let RELAY_S_STATS_FORWARDED    = 7
+let RELAY_S_STATS_ACKED        = 8
+let RELAY_S_STATS_NO_RELAY     = 9
+let RELAY_S_STATS_DELIVERED    = 10
+// Pinned by gossip <-> relay protocol. Indices MUST equal the ones
+// declared in gossip.nova (GOSSIP_RELAY_INBOUND_REQS = 11, etc.).
+let RELAY_S_INBOUND_REQS       = 11  // queue of RELAY_REQ wire lines
+let RELAY_S_INBOUND_DATA       = 12  // queue of RELAY_DATA wire lines
+let RELAY_S_INBOUND_ACKS       = 13  // queue of RELAY_ACK wire lines
+// R26E.2 ranking slots. Both ordered after the gossip-pinned region
+// (slots 14+) so the inter-module contract is undisturbed.
+let RELAY_S_NAT_TYPES          = 14  // list of [peer_addr, nat_type_str]
+let RELAY_S_LRU                = 15  // list of peer_addr; tail = most-recently-used
+
+// Received-record slot indices.
+let RELAY_R_REQ_ID  = 0
+let RELAY_R_PAYLOAD = 1
+let RELAY_R_VIA     = 2
+let RELAY_R_FROM    = 3
+
+// Cache-record slot indices.
+let RELAY_C_TARGET = 0
+let RELAY_C_VIA    = 1
+
+// R26E.2 NAT-rank table. Higher rank = better candidate; rank 0 is
+// "skip entirely". Matches the brief:
+//   open       -> 4 (no NAT, definitely reachable)
+//   cone       -> 3 (most NATs allow inbound on the existing mapping)
+//   unknown    -> 2 (default for peers we haven't profiled yet --
+//                    better than confirmed-symmetric, worse than known cone)
+//   symmetric  -> 1 (per-destination mapping; inbound usually fails)
+//   blocked    -> 0 (skip; STUN couldn't reach the peer at all)
+let RELAY_RANK_OPEN      = 4
+let RELAY_RANK_CONE      = 3
+let RELAY_RANK_UNKNOWN   = 2
+let RELAY_RANK_SYMMETRIC = 1
+let RELAY_RANK_BLOCKED   = 0
+
+let RELAY_NAT_OPEN      = "open"
+let RELAY_NAT_CONE      = "cone"
+let RELAY_NAT_SYMMETRIC = "symmetric"
+let RELAY_NAT_BLOCKED   = "blocked"
+let RELAY_NAT_UNKNOWN   = "unknown"
+
+// Opt-in env var: when set to "on" (case-sensitive) the relay's
+// send path uses the ranked picker instead of "first alive peer".
+let RELAY_RANK_NAT_ENV = "CE_RELAY_RANK_NAT"
+
+// ---- state constructor ---------------------------------------------------
+
+fn relay_init(gossip_state) {
+    let st = list_new()
+    push(st, gossip_state)    // S_GOSSIP
+    push(st, 0)               // S_REQ_SEQ
+    push(st, list_new())      // S_CACHE
+    push(st, list_new())      // S_UNREACHABLE
+    push(st, list_new())      // S_RECEIVED
+    push(st, 0)               // S_STATS_SENT_DIRECT
+    push(st, 0)               // S_STATS_SENT_VIA
+    push(st, 0)               // S_STATS_FORWARDED
+    push(st, 0)               // S_STATS_ACKED
+    push(st, 0)               // S_STATS_NO_RELAY
+    push(st, 0)               // S_STATS_DELIVERED
+    push(st, list_new())      // S_INBOUND_REQS
+    push(st, list_new())      // S_INBOUND_DATA
+    push(st, list_new())      // S_INBOUND_ACKS
+    push(st, list_new())      // S_NAT_TYPES (R26E.2)
+    push(st, list_new())      // S_LRU (R26E.2)
+    return st
+}
+
+// ---- accessors -----------------------------------------------------------
+
+fn relay_gossip_state(state)        { return state[RELAY_S_GOSSIP] }
+fn relay_stats_sent_direct(state)   { return state[RELAY_S_STATS_SENT_DIRECT] }
+fn relay_stats_sent_via_relay(state){ return state[RELAY_S_STATS_SENT_VIA] }
+fn relay_stats_forwarded(state)     { return state[RELAY_S_STATS_FORWARDED] }
+fn relay_stats_acked(state)         { return state[RELAY_S_STATS_ACKED] }
+fn relay_stats_no_relay(state)      { return state[RELAY_S_STATS_NO_RELAY] }
+fn relay_stats_delivered(state)     { return state[RELAY_S_STATS_DELIVERED] }
+fn relay_cache_count(state)         { return len(state[RELAY_S_CACHE]) }
+fn relay_received_count(state)      { return len(state[RELAY_S_RECEIVED]) }
+
+// Per-target cache lookup. Returns the cached relay addr or -1.
+fn relay_chosen_via(state, target) {
+    let cache = state[RELAY_S_CACHE]
+    let i = 0
+    while i < len(cache) {
+        if str_eq(cache[i][RELAY_C_TARGET], target) == 1 {
+            return cache[i][RELAY_C_VIA]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Idempotent cache write.
+fn relay_cache_via(state, target, via) {
+    let cache = state[RELAY_S_CACHE]
+    let i = 0
+    while i < len(cache) {
+        if str_eq(cache[i][RELAY_C_TARGET], target) == 1 {
+            cache[i][RELAY_C_VIA] = via
+            return 1
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, target)
+    push(rec, via)
+    push(cache, rec)
+    return 1
+}
+
+// Test hook: peer is marked direct-unreachable. relay_send will skip
+// the direct-dial attempt for this peer. Idempotent.
+fn relay_mark_unreachable(state, peer) {
+    let bad = state[RELAY_S_UNREACHABLE]
+    let i = 0
+    while i < len(bad) {
+        if str_eq(bad[i], peer) == 1 { return 1 }
+        i = i + 1
+    }
+    push(bad, peer)
+    return 1
+}
+
+fn relay_is_unreachable(state, peer) {
+    let bad = state[RELAY_S_UNREACHABLE]
+    let i = 0
+    while i < len(bad) {
+        if str_eq(bad[i], peer) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Sequence-counter helper. Per-soul monotonic; collisions across
+// souls are tolerated because RELAY_DATA carries the from= annotation
+// so the receiver can disambiguate.
+fn _relay_next_req_id(state) {
+    let seq = state[RELAY_S_REQ_SEQ] + 1
+    state[RELAY_S_REQ_SEQ] = seq
+    return seq
+}
+
+// ---- wire format -- format + parse ---------------------------------------
+//
+// All three message types are space-delimited; the payload (only on
+// REQ + DATA) is the final field and may contain spaces, so the
+// parser rejoins toks[N..] back into a single string. Empty payload
+// is permitted (zero-length string).
+//
+//   RELAY_REQ <req_id> <target> <origin> <payload...>
+//   RELAY_DATA <req_id> <target> <via> <from> <payload...>
+//   RELAY_ACK <req_id> <origin> <via>
+
+fn relay_format_request(req_id, target, origin, payload) {
+    return RELAY_REQ_PREFIX + int_to_str(req_id)
+        + " " + target + " " + origin + " " + payload
+}
+
+fn relay_format_data(req_id, target, via, from, payload) {
+    return RELAY_DATA_PREFIX + int_to_str(req_id)
+        + " " + target + " " + via + " " + from + " " + payload
+}
+
+fn relay_format_ack(req_id, origin, via) {
+    return RELAY_ACK_PREFIX + int_to_str(req_id)
+        + " " + origin + " " + via
+}
+
+fn _relay_join_tail(toks, start_idx) {
+    if start_idx >= len(toks) { return "" }
+    let s = toks[start_idx]
+    let i = start_idx + 1
+    while i < len(toks) {
+        s = s + " " + toks[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Parse `RELAY_REQ <id> <target> <origin> <payload...>`. Returns
+// [req_id, target, origin, payload] or 0 on malformed line.
+fn relay_parse_request(line) {
+    if _gossip_starts_with(line, RELAY_REQ_PREFIX) == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 4 { return 0 }
+    let id_s = toks[1]
+    if _gossip_is_digits(id_s) == 0 { return 0 }
+    let req_id = str_to_int(id_s)
+    let target = toks[2]
+    let origin = toks[3]
+    if len(target) == 0 { return 0 }
+    if len(origin) == 0 { return 0 }
+    let payload = _relay_join_tail(toks, 4)
+    let out = list_new()
+    push(out, req_id)
+    push(out, target)
+    push(out, origin)
+    push(out, payload)
+    return out
+}
+
+// Parse `RELAY_DATA <id> <target> <via> <from> <payload...>`. Returns
+// [req_id, target, via, from, payload] or 0 on malformed line.
+fn relay_parse_data(line) {
+    if _gossip_starts_with(line, RELAY_DATA_PREFIX) == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 5 { return 0 }
+    let id_s = toks[1]
+    if _gossip_is_digits(id_s) == 0 { return 0 }
+    let req_id = str_to_int(id_s)
+    let target = toks[2]
+    let via = toks[3]
+    let from = toks[4]
+    if len(target) == 0 { return 0 }
+    if len(via) == 0 { return 0 }
+    if len(from) == 0 { return 0 }
+    let payload = _relay_join_tail(toks, 5)
+    let out = list_new()
+    push(out, req_id)
+    push(out, target)
+    push(out, via)
+    push(out, from)
+    push(out, payload)
+    return out
+}
+
+// Parse `RELAY_ACK <id> <origin> <via>`. Returns [req_id, origin, via]
+// or 0 on malformed line.
+fn relay_parse_ack(line) {
+    if _gossip_starts_with(line, RELAY_ACK_PREFIX) == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 4 { return 0 }
+    let id_s = toks[1]
+    if _gossip_is_digits(id_s) == 0 { return 0 }
+    let req_id = str_to_int(id_s)
+    let origin = toks[2]
+    let via = toks[3]
+    if len(origin) == 0 { return 0 }
+    if len(via) == 0 { return 0 }
+    let out = list_new()
+    push(out, req_id)
+    push(out, origin)
+    push(out, via)
+    return out
+}
+
+// ---- intermediate-peer selection ----------------------------------------
+//
+// Pick an alive peer C != target that we (the originator) can use as
+// relay. R26E uses the simple policy "first non-target alive peer";
+// future R26E.2 will rank by observed NAT topology (cone > symmetric)
+// once R23E's per-peer NAT-type annotation arrives. The picker
+// excludes peers currently marked unreachable so the test hook can
+// simulate a partition.
+
+fn relay_pick_intermediate(state, target) {
+    let g = state[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let alive = gossip_alive_peers(g)
+    let self_addr = gossip_self_addr(g)
+    let i = 0
+    while i < len(alive) {
+        let cand = alive[i]
+        if str_eq(cand, target) == 0 {
+            if str_eq(cand, self_addr) == 0 {
+                if relay_is_unreachable(state, cand) == 0 {
+                    return cand
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- R26E.2: STUN-like ranked relay candidate selection -----------------
+//
+// The base picker (relay_pick_intermediate) walks alive peers in
+// gossip-table order and returns the first non-target non-self
+// non-unreachable. That ignores observed NAT topology: a peer behind
+// a symmetric NAT is a poor relay choice (its outbound mappings are
+// per-destination so even if A reaches it, the peer's reply path to
+// B may fail). R23E classifies each peer as open / cone / symmetric /
+// blocked via nat_detect_type. R26E.2 uses that classification to
+// rank candidates so the originator prefers the most-likely-to-work
+// relay. Tie-break by least-recently-used so load spreads across
+// equally-ranked peers.
+//
+// The NAT-type table is populated by callers via relay_set_peer_nat_
+// type (souls feed it from their R23E nat_state after each STUN
+// probe; tests stub it directly). A peer without an entry is treated
+// as "unknown" -- ranked above symmetric but below known cone.
+//
+// Opt-in dispatch: when CE_RELAY_RANK_NAT=on, relay_send uses the
+// ranked picker; otherwise the original picker is used (R26E
+// back-compat -- existing callers see no behaviour change).
+
+// Map a NAT-type string to a rank int. Unrecognised strings collapse
+// to RELAY_RANK_UNKNOWN so a future R23E extension that adds new
+// type names doesn't silently break the ranker.
+fn _relay_nat_rank(nat_type) {
+    if str_eq(nat_type, RELAY_NAT_OPEN) == 1      { return RELAY_RANK_OPEN }
+    if str_eq(nat_type, RELAY_NAT_CONE) == 1      { return RELAY_RANK_CONE }
+    if str_eq(nat_type, RELAY_NAT_SYMMETRIC) == 1 { return RELAY_RANK_SYMMETRIC }
+    if str_eq(nat_type, RELAY_NAT_BLOCKED) == 1   { return RELAY_RANK_BLOCKED }
+    return RELAY_RANK_UNKNOWN
+}
+
+// Public NAT-rank lookup so tests + diagnostics can spot-check what
+// rank a peer's classification resolves to without round-tripping
+// through the ranker.
+fn relay_nat_rank_of(nat_type) { return _relay_nat_rank(nat_type) }
+
+// Set the cached NAT type for `peer`. Idempotent (overwrites on
+// repeat). Souls call this with the R23E nat_detect_type result.
+fn relay_set_peer_nat_type(state, peer, nat_type) {
+    let tbl = state[RELAY_S_NAT_TYPES]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], peer) == 1 {
+            tbl[i][1] = nat_type
+            return 1
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer)
+    push(rec, nat_type)
+    push(tbl, rec)
+    return 1
+}
+
+// Cached lookup. Returns RELAY_NAT_UNKNOWN if the peer isn't
+// registered yet (so the ranker treats unprofiled peers as the
+// midpoint rank rather than rejecting them outright).
+fn relay_get_peer_nat_type(state, peer) {
+    let tbl = state[RELAY_S_NAT_TYPES]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], peer) == 1 { return tbl[i][1] }
+        i = i + 1
+    }
+    return RELAY_NAT_UNKNOWN
+}
+
+fn relay_nat_type_count(state) { return len(state[RELAY_S_NAT_TYPES]) }
+
+// LRU helpers. The tracker is a list of peer addrs in order of last
+// use. _relay_lru_position returns the index of `peer` (-1 if not
+// tracked); _relay_lru_bump moves `peer` to the tail (= most-
+// recently-used), inserting it if absent. The ranker uses
+// _relay_lru_position as a tie-breaker: lower position = older =
+// preferred when two peers have equal NAT rank. Brand-new peers
+// (position -1) outrank everything in the LRU because they have NEVER
+// been chosen and so deserve a chance.
+
+fn _relay_lru_position(state, peer) {
+    let lru = state[RELAY_S_LRU]
+    let i = 0
+    while i < len(lru) {
+        if str_eq(lru[i], peer) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _relay_lru_bump(state, peer) {
+    let lru = state[RELAY_S_LRU]
+    let pos = _relay_lru_position(state, peer)
+    if pos >= 0 {
+        // Compact -- copy everything except `pos`.
+        let next = list_new()
+        let j = 0
+        while j < len(lru) {
+            if j != pos { push(next, lru[j]) }
+            j = j + 1
+        }
+        push(next, peer)
+        state[RELAY_S_LRU] = next
+        return 1
+    }
+    push(lru, peer)
+    return 1
+}
+
+fn relay_lru_count(state) { return len(state[RELAY_S_LRU]) }
+
+// Returns the index where `peer` sits in the LRU, or -1 if it has
+// never been chosen. Lower indices are older (preferred under tie
+// break); -1 means "fresh" and is treated as the most preferred.
+fn relay_lru_position(state, peer) { return _relay_lru_position(state, peer) }
+
+// Comparator: returns 1 if `a` should be ranked BEFORE `b`, 0 if
+// the relative order can be preserved (stable sort). Primary key is
+// NAT rank descending; tie-break by LRU position ascending where
+// position -1 (never used) ranks BEFORE any positive position.
+fn _relay_rank_before(state, a, b) {
+    let ta = relay_get_peer_nat_type(state, a)
+    let tb = relay_get_peer_nat_type(state, b)
+    let ra = _relay_nat_rank(ta)
+    let rb = _relay_nat_rank(tb)
+    if ra > rb { return 1 }
+    if ra < rb { return 0 }
+    // Equal rank -- LRU tie-break. -1 (never used) sorts before any
+    // positive position; ascending otherwise.
+    let pa = _relay_lru_position(state, a)
+    let pb = _relay_lru_position(state, b)
+    if pa < 0 {
+        if pb < 0 { return 0 }
+        return 1
+    }
+    if pb < 0 { return 0 }
+    if pa < pb { return 1 }
+    return 0
+}
+
+// Build the candidate pool: alive peers minus target, self, marked-
+// unreachable, and any peer whose cached NAT type is "blocked" (rank
+// 0; per the brief these are skipped entirely rather than ranked
+// last). Returns a fresh list -- callers may sort in place.
+fn _relay_build_candidate_pool(state, target) {
+    let pool = list_new()
+    let g = state[RELAY_S_GOSSIP]
+    if g == 0 { return pool }
+    let alive = gossip_alive_peers(g)
+    let self_addr = gossip_self_addr(g)
+    let i = 0
+    while i < len(alive) {
+        let cand = alive[i]
+        if str_eq(cand, target) == 0 {
+            if str_eq(cand, self_addr) == 0 {
+                if relay_is_unreachable(state, cand) == 0 {
+                    let t = relay_get_peer_nat_type(state, cand)
+                    if _relay_nat_rank(t) > 0 {
+                        push(pool, cand)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return pool
+}
+
+// Rank candidates from best to worst. Selection-sort style (the
+// pool is bounded by the alive-peer count -- a handful at most -- so
+// O(n^2) is fine and avoids depending on any list_sort builtin). The
+// returned list is a fresh copy; the caller owns it and may consume
+// the head as the chosen relay.
+fn relay_rank_candidates(state, target) {
+    let pool = _relay_build_candidate_pool(state, target)
+    let n = len(pool)
+    let i = 0
+    while i < n {
+        let best = i
+        let j = i + 1
+        while j < n {
+            if _relay_rank_before(state, pool[j], pool[best]) == 1 {
+                best = j
+            }
+            j = j + 1
+        }
+        if best != i {
+            let tmp = pool[i]
+            pool[i] = pool[best]
+            pool[best] = tmp
+        }
+        i = i + 1
+    }
+    return pool
+}
+
+// Top of relay_rank_candidates; bumps the chosen peer in the LRU
+// tracker so a follow-up call with all equal ranks picks the next
+// peer. Returns -1 when no usable candidate exists.
+fn relay_choose_candidate_ranked(state, target) {
+    let ranked = relay_rank_candidates(state, target)
+    if len(ranked) == 0 { return -1 }
+    let chosen = ranked[0]
+    _relay_lru_bump(state, chosen)
+    return chosen
+}
+
+// Invalidate any cache entry whose via=peer. Called when a relayed
+// send fails (the target was reported unreachable AFTER the relay
+// attempt). Returns the number of cache entries removed.
+fn relay_mark_relay_failed(state, peer) {
+    let cache = state[RELAY_S_CACHE]
+    let next = list_new()
+    let removed = 0
+    let i = 0
+    while i < len(cache) {
+        if str_eq(cache[i][RELAY_C_VIA], peer) == 1 {
+            removed = removed + 1
+        } else {
+            push(next, cache[i])
+        }
+        i = i + 1
+    }
+    state[RELAY_S_CACHE] = next
+    return removed
+}
+
+// Env helper: is the opt-in ranking dispatch enabled? Treated as
+// case-sensitive "on"; any other value (including "ON" or "1") is
+// off. This is deliberate -- the integration scenario sets the env
+// to exactly "on" so we don't accidentally enable ranking on hosts
+// where the env has lingering values from unrelated tooling.
+fn relay_rank_nat_enabled() {
+    let env = getenv(RELAY_RANK_NAT_ENV)
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "on") == 1 { return 1 }
+    return 0
+}
+
+// Unified pick: dispatch on the env var. Returns a peer_addr str on
+// success or 0 (legacy convention) on failure. Used by relay_send
+// internally so existing call sites need no change.
+fn _relay_pick_dispatch(state, target) {
+    if relay_rank_nat_enabled() == 1 {
+        let chosen = relay_choose_candidate_ranked(state, target)
+        if chosen == -1 { return 0 }
+        return chosen
+    }
+    return relay_pick_intermediate(state, target)
+}
+
+// ---- short-lived TCP-send helpers ---------------------------------------
+//
+// Open a short-lived gossip TCP connection, run the HELLO/OK
+// handshake, send one line, expect BYE close. Returns 1 on a clean
+// exchange, 0 on any error. Reuses the gossip plaintext wire helpers
+// from `gossip.nova` (the Noise-protected path is R26E.2 -- relay
+// wire is plaintext for the first cut).
+//
+// The relay messages piggyback on the existing v1 gossip listener,
+// so the receiver-side dispatch lives in gossip.nova's
+// gossip_handle_conn / gossip_handle_conn_kg additive parser
+// branches (the BYE-aware reader sees a RELAY_* prefix and routes to
+// the corresponding _gossip_serve_relay_* handler we ship below).
+//
+// We give the relay wire a longer per-recv timeout than PING's 500ms
+// default because the relay's path can sit behind a peer that is
+// itself mid-forward (a chained A -> C -> B request gives C a window
+// where it dials B while another peer dials it; the bumped
+// RCVTIMEO accommodates the bursty load without false timeouts).
+let RELAY_RECV_TIMEOUT_MS = 3000
+
+fn _relay_send_line(addr, line) {
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    _gossip_set_rcvtimeo_ms(fd, RELAY_RECV_TIMEOUT_MS)
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    if _gossip_send_all(fd, line + "\n") == 0 { close_fd(fd); return 0 }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// Direct-dial attempt; consults the unreachable set first so the
+// test hook can force a failure without an actual partition. Returns
+// 1 on success, 0 if either the partition simulation triggered or the
+// dial failed for real.
+fn _relay_try_direct(state, addr, line) {
+    if relay_is_unreachable(state, addr) == 1 { return 0 }
+    return _relay_send_line(addr, line)
+}
+
+// ---- public API: relay_send --------------------------------------------
+//
+// Send `payload` to `target_peer`. Logical flow:
+//
+//   1. If we have a cached relay (target -> via) AND the target is
+//      marked unreachable, route via the cache directly.
+//   2. Try direct dial. If success, increment SENT_DIRECT stat,
+//      return 1.
+//   3. On direct failure, walk gossip_alive_peers picking an
+//      intermediate C != target; send RELAY_REQ. If C accepts,
+//      cache (target -> C); increment SENT_VIA; return 1.
+//   4. No reachable intermediate -> increment NO_RELAY stat,
+//      return 0.
+
+fn relay_send(state, target, payload) {
+    let g = state[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let self_addr = gossip_self_addr(g)
+
+    // 1. Cache short-circuit: if the target is direct-unreachable
+    //    AND we have a cached via, jump straight to the relay path.
+    if relay_is_unreachable(state, target) == 1 {
+        let cached_via = relay_chosen_via(state, target)
+        if cached_via != -1 {
+            let req_id = _relay_next_req_id(state)
+            let line = relay_format_request(req_id, target, self_addr, payload)
+            if _relay_send_line(cached_via, line) == 1 {
+                state[RELAY_S_STATS_SENT_VIA] = state[RELAY_S_STATS_SENT_VIA] + 1
+                return 1
+            }
+        }
+    }
+
+    // 2. Direct dial attempt.
+    //    Build a wire line that looks like a relayed delivery whose
+    //    origin == us so the receiver can apply the same parser. The
+    //    via field carries our self addr (no intermediate).
+    let direct_id = _relay_next_req_id(state)
+    let direct_line = relay_format_data(direct_id, target, self_addr,
+                                         self_addr, payload)
+    if _relay_try_direct(state, target, direct_line) == 1 {
+        state[RELAY_S_STATS_SENT_DIRECT] = state[RELAY_S_STATS_SENT_DIRECT] + 1
+        return 1
+    }
+
+    // 3. Pick an intermediate. The unreachable list excludes the
+    //    chosen relay from short-circuit policy (we only force relay
+    //    when the TARGET is unreachable, not when the candidate
+    //    relays are). Picker dispatch consults CE_RELAY_RANK_NAT --
+    //    when on, the R26E.2 ranked picker is used; otherwise the
+    //    legacy first-alive-non-target picker. Both return 0 on no
+    //    candidate so callers downstream see the same shape.
+    let via = _relay_pick_dispatch(state, target)
+    if via == 0 {
+        state[RELAY_S_STATS_NO_RELAY] = state[RELAY_S_STATS_NO_RELAY] + 1
+        return 0
+    }
+    let req_id = _relay_next_req_id(state)
+    let req_line = relay_format_request(req_id, target, self_addr, payload)
+    if _relay_send_line(via, req_line) == 1 {
+        relay_cache_via(state, target, via)
+        state[RELAY_S_STATS_SENT_VIA] = state[RELAY_S_STATS_SENT_VIA] + 1
+        return 1
+    }
+    state[RELAY_S_STATS_NO_RELAY] = state[RELAY_S_STATS_NO_RELAY] + 1
+    return 0
+}
+
+// ---- public API: relay_handle_request -----------------------------------
+//
+// Called by the gossip handler when a RELAY_REQ arrives. Parses the
+// line; if we (the relay) can reach the target, forwards as
+// RELAY_DATA with our self_addr as via. Returns 1 on a successful
+// forward, 0 otherwise.
+
+fn relay_handle_request(state, line) {
+    let g = state[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let parsed = relay_parse_request(line)
+    if parsed == 0 { return 0 }
+    let req_id = parsed[0]
+    let target = parsed[1]
+    let origin = parsed[2]
+    let payload = parsed[3]
+    let self_addr = gossip_self_addr(g)
+    // Drop self-loop: a peer asking us to relay to ourselves is
+    // malformed (the origin would have direct-delivered).
+    if str_eq(target, self_addr) == 1 { return 0 }
+    // Build the forwarded line.
+    let fwd = relay_format_data(req_id, target, self_addr, origin, payload)
+    if _relay_send_line(target, fwd) == 1 {
+        state[RELAY_S_STATS_FORWARDED] = state[RELAY_S_STATS_FORWARDED] + 1
+        // Try to send an ACK back to the origin. Best-effort: the
+        // ACK round-trip is documentary (the originator counts
+        // RELAY_ACK via the additive parser branch when we wire
+        // it; integration scenario observes the via= annotation on
+        // delivery to verify the path).
+        let ack = relay_format_ack(req_id, origin, self_addr)
+        _relay_send_line(origin, ack)
+        return 1
+    }
+    return 0
+}
+
+// ---- public API: relay_handle_data --------------------------------------
+//
+// Called by the gossip handler when a RELAY_DATA arrives. The
+// terminal receiver records the (req_id, payload, via, from) tuple
+// onto the received-queue. The via annotation is what diagnostics
+// inspect to confirm "B received the message via C, originated by A".
+
+fn relay_handle_data(state, line) {
+    let g = state[RELAY_S_GOSSIP]
+    if g == 0 { return 0 }
+    let parsed = relay_parse_data(line)
+    if parsed == 0 { return 0 }
+    let req_id = parsed[0]
+    let target = parsed[1]
+    let via = parsed[2]
+    let from = parsed[3]
+    let payload = parsed[4]
+    let self_addr = gossip_self_addr(g)
+    // Drop misrouted: only process if WE are the target. Defensive --
+    // the relay should have verified before forwarding.
+    if str_eq(target, self_addr) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, req_id)
+    push(rec, payload)
+    push(rec, via)
+    push(rec, from)
+    push(state[RELAY_S_RECEIVED], rec)
+    state[RELAY_S_STATS_DELIVERED] = state[RELAY_S_STATS_DELIVERED] + 1
+    return 1
+}
+
+// ---- public API: relay_handle_ack --------------------------------------
+//
+// Called by the gossip handler when a RELAY_ACK arrives. The
+// originator updates its acked counter (best-effort -- ACK loss is
+// tolerated, the cache already remembers the working via).
+
+fn relay_handle_ack(state, line) {
+    let parsed = relay_parse_ack(line)
+    if parsed == 0 { return 0 }
+    state[RELAY_S_STATS_ACKED] = state[RELAY_S_STATS_ACKED] + 1
+    return 1
+}
+
+// ---- received-queue inspectors ------------------------------------------
+//
+// relay_received_at returns the i-th delivered record as
+// [req_id, payload, via, from]. The integration scenario reads the
+// via field to assert the relay path; unit tests read all four to
+// confirm the wire round-trip.
+
+fn relay_received_at(state, idx) {
+    if idx < 0 { return 0 }
+    let q = state[RELAY_S_RECEIVED]
+    if idx >= len(q) { return 0 }
+    return q[idx]
+}
+
+fn relay_received_via(rec) {
+    if rec == 0 { return "" }
+    return rec[RELAY_R_VIA]
+}
+
+fn relay_received_from(rec) {
+    if rec == 0 { return "" }
+    return rec[RELAY_R_FROM]
+}
+
+fn relay_received_payload(rec) {
+    if rec == 0 { return "" }
+    return rec[RELAY_R_PAYLOAD]
+}
+
+fn relay_received_req_id(rec) {
+    if rec == 0 { return 0 }
+    return rec[RELAY_R_REQ_ID]
+}
+
+// ---- inbound-queue drain -----------------------------------------------
+//
+// The gossip dispatcher pushes raw wire lines onto the per-message-
+// type queues at the pinned slots (RELAY_S_INBOUND_REQS / _DATA /
+// _ACKS); this helper drains all three queues, invoking the
+// appropriate relay_handle_* per line. The caller is the daemon
+// loop (or the integration scenario's per-tick body); semantics
+// mirror R21B's dr_run_round drain. Returns the total number of
+// inbound lines processed across all three queues this round.
+
+fn relay_drain_inbound(state) {
+    let processed = 0
+    let qr = state[RELAY_S_INBOUND_REQS]
+    let i = 0
+    while i < len(qr) {
+        relay_handle_request(state, qr[i])
+        processed = processed + 1
+        i = i + 1
+    }
+    // Compact the request queue by re-initialising the list.
+    while len(qr) > 0 { pop(qr) }
+
+    let qd = state[RELAY_S_INBOUND_DATA]
+    let j = 0
+    while j < len(qd) {
+        relay_handle_data(state, qd[j])
+        processed = processed + 1
+        j = j + 1
+    }
+    while len(qd) > 0 { pop(qd) }
+
+    let qa = state[RELAY_S_INBOUND_ACKS]
+    let k = 0
+    while k < len(qa) {
+        relay_handle_ack(state, qa[k])
+        processed = processed + 1
+        k = k + 1
+    }
+    while len(qa) > 0 { pop(qa) }
+    return processed
+}
+
+// Queue-length inspectors (test + diagnostics).
+fn relay_inbound_req_count(state)  { return len(state[RELAY_S_INBOUND_REQS]) }
+fn relay_inbound_data_count(state) { return len(state[RELAY_S_INBOUND_DATA]) }
+fn relay_inbound_ack_count(state)  { return len(state[RELAY_S_INBOUND_ACKS]) }
+
+// ---- status line --------------------------------------------------------
+
+fn relay_stats_line(state) {
+    return "relay: cache=" + int_to_str(relay_cache_count(state))
+        + " direct=" + int_to_str(state[RELAY_S_STATS_SENT_DIRECT])
+        + " via=" + int_to_str(state[RELAY_S_STATS_SENT_VIA])
+        + " fwd=" + int_to_str(state[RELAY_S_STATS_FORWARDED])
+        + " ack=" + int_to_str(state[RELAY_S_STATS_ACKED])
+        + " no_relay=" + int_to_str(state[RELAY_S_STATS_NO_RELAY])
+        + " delivered=" + int_to_str(state[RELAY_S_STATS_DELIVERED])
+}

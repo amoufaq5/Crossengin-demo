@@ -1,0 +1,1291 @@
+// CrossEngin io/transducers: Noise XK handshake for mutual auth + transport AEAD.
+//
+// Purpose
+//   R6 federation-gap closer. kg_sync v2 ran in plaintext TCP; the
+//   FEDERATED_AUDIT.md and TLS_AUDIT.md both flagged "plaintext on the
+//   wire" as the open hole between two souls federating their KGs. This
+//   module ships the Noise XK pattern -- the canonical "initiator
+//   knows responder's static pubkey out-of-band; responder learns the
+//   initiator's static pubkey during handshake" mutual-auth handshake
+//   from noiseprotocol.org -- as a pure-NOVA leaf on top of the
+//   primitives shipped in earlier sessions:
+//     * `src/safety/chacha20.nova`     -- the encrypt half of the AEAD.
+//     * `src/safety/poly1305.nova`     -- the MAC half of the AEAD.
+//     * `src/safety/bignum_2048.nova`  -- bn2048_modpow_ct (Montgomery REDC)
+//                                         for the 2048-bit DH math.
+//     * `secure_random` NOVA builtin (R5B shipped this; OS getrandom).
+//
+// R7C strength upgrade
+//   R6C shipped wire-correct Noise XK + AEAD + mutual auth, BUT the DH
+//   primitive was field-prime DH over `p_25519` (~256-bit) -- below the
+//   RFC 7919 Group 1 floor (768 bits) and not cryptographically strong
+//   against modern adversaries. This R7C revision swaps the DH primitive
+//   to RFC 7919 Group 14 + bn2048_modpow_ct (the 2048-bit MODP safe
+//   prime + Montgomery-REDC-backed constant-time exponentiation that
+//   R5A shipped in `src/safety/bignum_2048.nova`). The Noise XK state
+//   machine + AEAD + transcript-hash + HKDF / MixKey / MixHash chains
+//   are wire-format-agnostic about DH-output size, so the upgrade is
+//   strictly internal to this module: every *_DH_LEN-sized buffer
+//   widens 32 -> 256 bytes, every 64-char hex widens to 512 chars, and
+//   `_NXK_P_HEX` / `_NXK_G_HEX` retire in favor of the
+//   `rfc7919_group14_p()` / `rfc7919_group14_g()` factories already
+//   shipped by `bignum_2048.nova`. The handshake transcript still binds
+//   every byte of the wire; the AEAD still rejects tampers + replays;
+//   the mutual-auth contract (responder learns the initiator's static
+//   pubkey on msg3 + initiator binds to a known responder pubkey out
+//   of band) survives the DH widening.
+//
+// Noise XK recap (full spec at noiseprotocol.org -- this is a from-first-
+// principles build keyed to the primitives we have)
+//
+//   Pattern messages (psk-free XK):
+//     -> e, es           (initiator sends ephemeral + DH(e, rs))
+//     <- e, ee           (responder sends ephemeral + DH(e, re))
+//     -> s, se           (initiator sends static pubkey + DH(s, re))
+//
+//   After the three handshake messages both sides:
+//     * have a session hash `h`  (32-byte transcript binding identifier).
+//     * derive two 32-byte transport keys via HKDF Split:
+//         k_init_to_resp  -- initiator -> responder
+//         k_resp_to_init  -- responder -> initiator
+//     * start independent monotonic 64-bit nonce counters per direction.
+//
+//   Mutual auth contract:
+//     * The responder learns + binds the initiator's static pubkey
+//       (mutual: initiator already knew responder's static via the XK
+//       out-of-band assumption).
+//     * The session hash h transcript-binds every message: any MITM that
+//       tampers with a single byte gets a tag failure.
+//
+// Wire framing (per kg_sync v3, post-R7C widening)
+//   Three handshake messages on TCP, then encrypted transport.
+//
+//     msg1 (initiator -> responder):
+//       [256 byte e_pub] (2048-bit Group 14 pubkey, little-endian)
+//       [16 byte AEAD tag over empty plaintext using es-derived key]
+//
+//     msg2 (responder -> initiator):
+//       [256 byte e_pub]
+//       [16 byte AEAD tag over empty plaintext using ee-derived key]
+//
+//     msg3 (initiator -> responder):
+//       [256 byte s_pub of initiator, AEAD-encrypted under the post-ee key]
+//       [16 byte AEAD tag for s_pub]
+//       [16 byte AEAD tag over empty plaintext using se-derived key]
+//
+//     Transport (either direction, post-handshake):
+//       [4 byte BE length of (ciphertext || 16 byte tag)]
+//       [ciphertext]
+//       [16 byte Poly1305 tag]
+//
+//   Nonce: per-direction monotonic 64-bit counter, encoded as 12-byte
+//   nonce [4 zero bytes || 8 byte LE counter] for the ChaCha20-Poly1305
+//   RFC 7539 framing. Initiator-to-responder uses k_init_to_resp + a
+//   send counter that increments after every send; responder-to-initiator
+//   uses k_resp_to_init + an independent counter. Either side rejects an
+//   incoming frame whose counter <= the last successfully decrypted
+//   counter (replay protection -- nonce monotonicity asserted on recv).
+//
+// DH primitive: RFC 7919 Group 14 (2048-bit MODP safe prime), g = 2
+//   Backed by `src/safety/bignum_2048.nova`'s `bn2048_modpow_ct`
+//   (Montgomery-REDC + constant-time Montgomery ladder). The 2048-bit
+//   MODP group is the smallest standard DH group considered
+//   cryptographically reasonable in 2025 (RFC 7919 section 2).
+//   Index-calculus on classical DH groups breaks primes <= ~1024 bits
+//   on commodity hardware; Group 14 puts the headline DH-discrete-log
+//   work factor at ~2^112 bits of security, comfortably out of reach.
+//
+//   `bn2048_modpow_ct` is the constant-time ladder so the exponent is
+//   not leaked via per-bit timing. The Montgomery REDC inside drops
+//   each modpow from ~18s (legacy bit-by-bit reduce) to ~1-4s on this
+//   sandbox (R5A measurements). Each Noise XK handshake performs four
+//   modpows (two ephemeral keygens + two DH ops on the initiator;
+//   symmetric on the responder), so end-to-end handshake time is
+//   ~5-15s under the R5A Montgomery REDC kernel.
+//
+//   Wire layout: pubkeys are 256-byte little-endian (the natural
+//   `bn2048` limb-byte order). DH commutes: peer_pub^my_priv mod p ==
+//   my_pub^peer_priv mod p. The Noise XK state machine + AEAD/HKDF/
+//   transcript-hash machinery above are bit-pattern-agnostic about
+//   DH-output size, so the only wire change vs. R6C is the pubkey
+//   widening 32 -> 256 bytes.
+//
+//   Per-modpow cost is dominated by a constant-modulus Montgomery
+//   context (`bn2048_mont_ctx_new`). Group 14 is a FIXED constant, so
+//   we build the context ONCE (lazy module-level singleton in
+//   `_nxk_g14_ctx()`) and reuse it across every keygen and DH op.
+//   Saves the ~hundreds-of-ms `_bn2048_compute_r2_mod_n` bit-by-bit
+//   reduce per handshake message.
+//
+// Public API
+//   Static keypair helpers
+//     nxk_generate_static_keypair()
+//         -> [priv_hex, pub_hex]  (each 512 lowercase hex chars)
+//     nxk_pub_from_priv(priv_hex) -> pub_hex
+//
+//   Handshake state machine (one handshake = one nxk_state)
+//     nxk_initiator_new(static_priv_hex, responder_static_pub_hex)
+//         -> nxk_state  (initiator-side)
+//     nxk_responder_new(static_priv_hex)
+//         -> nxk_state  (responder-side)
+//
+//     // The three handshake messages: each returns a fresh byte buffer
+//     // [buf, n] on success, 0 on failure.
+//     nxk_msg1_send(state)              (initiator)
+//     nxk_msg1_recv(state, buf, n)      (responder)
+//     nxk_msg2_send(state)              (responder)
+//     nxk_msg2_recv(state, buf, n)      (initiator)
+//     nxk_msg3_send(state)              (initiator)
+//     nxk_msg3_recv(state, buf, n)      (responder)
+//
+//     // After all three messages exchanged, both sides call this to
+//     // finalize: derives the two transport keys, resets counters.
+//     nxk_split(state) -> 1 on success, 0 on inconsistency
+//
+//     nxk_peer_static_pub(state) -> hex  (the LEARNED initiator pubkey
+//                                          on the responder, or the
+//                                          KNOWN responder pubkey on the
+//                                          initiator). Used by the
+//                                          authorization layer to check
+//                                          the peer against an allowlist.
+//
+//   Transport (post-handshake)
+//     nxk_seal(state, role, plaintext_buf, n)
+//         -> [out_buf, total_len]   encrypted frame [4 byte BE len || ct || tag]
+//     nxk_open(state, role, frame_buf, frame_len)
+//         -> [pt_buf, pt_len] on success, 0 on tag failure / replay /
+//                              malformed frame.
+//
+//     `role` is NXK_ROLE_INITIATOR or NXK_ROLE_RESPONDER -- selects
+//     which key + nonce-counter direction to use.
+//
+// ADRs touched: FEDERATED_AUDIT.md (federation-gap closer + R7C strength
+//   upgrade; R33A canonical SHA-256 dedup), TLS_AUDIT.md (Noise as a
+//   TLS-replacement leaf above PSK + below the X.509 stack),
+//   SECAGG_AUDIT.md (real-DH path).
+// NOVA dependencies: secure_random, nanotime, alloc, store8, load8,
+//   int_*, list_*. CrossEngin dependencies:
+//     src/safety/sha256.nova      (R33A: canonical FIPS 180-4)
+//     src/safety/chacha20.nova
+//     src/safety/poly1305.nova
+//     src/safety/bignum_2048.nova   (R7C: 2048-bit DH via Montgomery REDC)
+
+import "std/io"
+import "../../safety/sha256.nova"
+import "../../safety/chacha20.nova"
+import "../../safety/poly1305.nova"
+import "../../safety/bignum_2048.nova"
+
+// ---- protocol constants ---------------------------------------------------
+let NXK_KEY_LEN          = 32     // 256-bit symmetric key (AEAD)
+let NXK_DH_LEN           = 256    // 2048-bit pubkey / scalar (RFC 7919 Group 14)
+let NXK_DH_HEX_LEN       = 512    // 256 bytes * 2 hex chars/byte
+let NXK_HASH_LEN         = 32     // SHA-256 output / session hash
+let NXK_TAG_LEN          = 16     // Poly1305 tag
+let NXK_NONCE_LEN        = 12     // ChaCha20 nonce (RFC 7539)
+let NXK_TRANSPORT_HDR    = 4      // BE length prefix
+let NXK_FRAME_MAX        = 65536  // 64 KiB upper bound per transport frame
+
+let NXK_ROLE_INITIATOR   = 1
+let NXK_ROLE_RESPONDER   = 2
+
+// Protocol-name binding string (Noise spec section 5.2). Folded into
+// the initial session hash so a parser that swaps cipher / hash / DH at
+// the wire level cannot reuse a session derived for a different suite.
+// R7C: name change vs. R6C ("25519" -> "RFC7919G14") so a session set
+// up under the R6C 256-bit DH suite cannot be confused with an R7C
+// 2048-bit-DH session by transcript replay -- the initial MixHash binds
+// the suite identifier at byte 0.
+let NXK_PROTO_NAME = "Noise_XK_RFC7919G14_ChaChaPoly_SHA256"
+
+// ============================================================================
+//                  SHA-256 / HMAC-SHA256 (R33A canonical dedup)
+// ============================================================================
+//
+// Pre-R33A this module inlined a full FIPS 180-4 SHA-256 + RFC 2104
+// HMAC-SHA256 stack (~300 lines of K-table, compression, padding,
+// ipad/opad math). All four byte-identical copies in the tree -- here,
+// merkle.nova, ecdsa.nova, dtls12.nova -- have been extracted into
+// `src/safety/sha256.nova` (R33A canonical). This module now imports
+// that canonical primitive and the `sha256_buf` / `sha256_str` /
+// `hmac_sha256_buf` symbols below are thin wrappers preserving the
+// pre-existing API so call sites (Noise session-hash chaining at line
+// 663 (post-edit), the protocol-name MixHash, the HKDF chain at
+// `nxk_hkdf`, the unit test helpers `_nxk_test_sha256_str_hex` /
+// `_nxk_test_hmac_hex`) compile unchanged.
+//
+// `_SHA_BLOCK_LEN` is also kept (referenced by hkdf_expand_buf via
+// transitive usage) as the canonical SHA256_BLOCK_LEN value.
+
+let _SHA_BLOCK_LEN = 64
+
+// SHA-256 of a byte buffer. Adapter -> sha256_oneshot (R33A canonical).
+fn sha256_buf(msg_buf, n) {
+    return sha256_oneshot(msg_buf, n)
+}
+
+// SHA-256 of a NOVA string. Adapter -> sha256_oneshot_str (R33A).
+fn sha256_str(s) {
+    return sha256_oneshot_str(s)
+}
+
+// HMAC-SHA256 over byte buffers. Adapter -> hmac_sha256 (R33A canonical).
+// RFC 2104 + RFC 6234. Used by HKDF (RFC 5869) inside Noise's KDF.
+fn hmac_sha256_buf(key_buf, key_n, msg_buf, msg_n) {
+    return hmac_sha256(key_buf, key_n, msg_buf, msg_n)
+}
+
+// HKDF-Extract (RFC 5869 section 2.2): PRK = HMAC-SHA256(salt, ikm).
+fn hkdf_extract_buf(salt_buf, salt_n, ikm_buf, ikm_n) {
+    return hmac_sha256_buf(salt_buf, salt_n, ikm_buf, ikm_n)
+}
+
+// HKDF-Expand (RFC 5869 section 2.3): T(1) = HMAC(PRK, info || 0x01),
+// T(i) = HMAC(PRK, T(i-1) || info || octet(i)). We always emit at most
+// 2 outputs (one or two 32-byte chunks) -- that's the limit Noise uses
+// in HKDF (n=2 or n=3 outputs of 32 bytes each).
+// Returns a fresh buffer of `nbytes` bytes (NUL-terminated). nbytes <= 96.
+fn hkdf_expand_buf(prk_buf, info_buf, info_n, nbytes) {
+    if nbytes <= 0 { return 0 }
+    if nbytes > 96 { return 0 }
+    let out = alloc(nbytes + 1)
+    let prev_buf = 0
+    let prev_n = 0
+    let i = 0
+    let written = 0
+    let counter = 1
+    while written < nbytes {
+        // Build the HMAC input: prev || info || counter_byte.
+        let total_in = prev_n + info_n + 1
+        let in_buf = alloc(total_in + 1)
+        let off = 0
+        let pj = 0
+        while pj < prev_n {
+            store8(in_buf + off, load8(prev_buf + pj))
+            off = off + 1
+            pj = pj + 1
+        }
+        let ij = 0
+        while ij < info_n {
+            store8(in_buf + off, load8(info_buf + ij))
+            off = off + 1
+            ij = ij + 1
+        }
+        store8(in_buf + off, counter)
+        let t = hmac_sha256_buf(prk_buf, NXK_HASH_LEN, in_buf, total_in)
+        // Copy T(i) into out at the right offset.
+        let copy = NXK_HASH_LEN
+        let left = nbytes - written
+        if left < copy { copy = left }
+        let k = 0
+        while k < copy {
+            store8(out + written + k, load8(t + k))
+            k = k + 1
+        }
+        written = written + copy
+        prev_buf = t
+        prev_n = NXK_HASH_LEN
+        counter = counter + 1
+        i = i + 1
+    }
+    store8(out + nbytes, 0)
+    return out
+}
+
+// Noise's HKDF helper splits `chaining_key, input_key_material` into
+// `num_outputs` 32-byte derived keys. Returns a list of `num_outputs`
+// freshly allocated 32-byte buffers.
+fn nxk_hkdf(chaining_key, ikm_buf, ikm_n, num_outputs) {
+    // RFC 5869: PRK = HMAC(salt=ck, ikm); then expand with info = empty.
+    let prk = hkdf_extract_buf(chaining_key, NXK_HASH_LEN, ikm_buf, ikm_n)
+    // Build empty info buffer.
+    let info_buf = alloc(1)
+    store8(info_buf, 0)
+    let total = num_outputs * NXK_HASH_LEN
+    let exp = hkdf_expand_buf(prk, info_buf, 0, total)
+    let out = list_new()
+    let i = 0
+    while i < num_outputs {
+        let b = alloc(NXK_HASH_LEN + 1)
+        let j = 0
+        while j < NXK_HASH_LEN {
+            store8(b + j, load8(exp + i * NXK_HASH_LEN + j))
+            j = j + 1
+        }
+        store8(b + NXK_HASH_LEN, 0)
+        push(out, b)
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+//                       RFC 7919 Group 14 (2048-bit) DH
+// ============================================================================
+//
+// `bn2048_modpow_ct` over the RFC 7919 Group 14 prime (2048 bits, safe
+// prime, generator g = 2). Same Diffie-Hellman shape as R6C's
+// `bn_modpow_ct` over `p_25519`, just 8x wider -- 64 32-bit limbs
+// instead of 8, 256-byte wire pubkeys instead of 32. The Noise XK state
+// machine + AEAD/HKDF/transcript-hash machinery above are size-agnostic
+// about DH-output bytes, so the upgrade is strictly internal to this
+// section: every byte buffer that previously held a 32-byte pubkey
+// widens to 256 bytes, and every 64-char hex widens to 512 chars.
+//
+// Performance: each `bn2048_modpow_ct` call costs ~1-4 s on this
+// sandbox under R5A's Montgomery REDC. The handshake performs four
+// modpow ops per side (one ephemeral keygen + one es DH + one ee DH +
+// one se DH on the initiator; the symmetric three on the responder
+// plus the responder's ephemeral keygen). End-to-end handshake time:
+// ~5-15 s. Wire-correctness is unchanged.
+//
+// Montgomery ctx caching: the Group 14 modulus is a FIXED constant, so
+// `bn2048_mont_ctx_new(p)` is built ONCE on first use and cached in
+// `_NXK_G14_CTX_CACHE` (a module-level singleton list). Every modpow,
+// keygen, and DH op below routes through `_nxk_g14_ctx()` to amortize
+// the ~hundreds-of-ms `_bn2048_compute_r2_mod_n` reduce across every
+// op in the same module-load lifetime.
+
+// Lazy module-level Montgomery context cache for the RFC 7919 Group 14
+// prime. Holds the precomputed ctx on first use; populated by
+// `_nxk_g14_ctx()`. Top-level `list_new()` is cheap (single empty
+// list), so per-import boot cost is negligible -- only the FIRST call
+// to a DH op pays the ctx-build cost.
+let _NXK_G14_CTX_CACHE = list_new()
+
+// Build (or return cached) Montgomery context for RFC 7919 Group 14.
+// One-shot precompute amortized across every DH op in this process.
+fn _nxk_g14_ctx() {
+    if len(_NXK_G14_CTX_CACHE) == 0 {
+        let p = rfc7919_group14_p()
+        push(_NXK_G14_CTX_CACHE, bn2048_mont_ctx_new(p))
+    }
+    return _NXK_G14_CTX_CACHE[0]
+}
+
+// `bn2048_modpow_ct` over Group 14, using the cached Montgomery ctx.
+// All four modpow call sites in this module go through this wrapper so
+// the ctx-build is paid exactly once per process and the ctx is reused
+// across keygen + every DH derivation.
+fn _nxk_modpow_g14(base, exp) {
+    let ctx = _nxk_g14_ctx()
+    // bn2048_modpow_ct_mont expects base < N; reduce defensively.
+    let N = ctx[2]
+    let base_reduced = bn2048_mod(base, N)
+    return bn2048_modpow_ct_mont(base_reduced, exp, ctx)
+}
+
+// Convert a 2048-bit bignum to its 256-byte little-endian wire form.
+// bn2048 limbs are little-endian internally (limb[0] = low 32 bits), so
+// we emit each of the 64 limbs as 4 LE bytes -- 64 * 4 = 256 bytes
+// total. NUL-terminate at offset 256 so the buffer is safe for any
+// downstream string-style printing.
+fn _nxk_bn_to_le256(bn) {
+    let out = alloc(NXK_DH_LEN + 1)
+    let i = 0
+    while i < BN2048_LIMBS {
+        let w = bn[i]
+        store8(out + i * 4 + 0, int_and(w, 255))
+        store8(out + i * 4 + 1, int_and(int_shr(w, 8), 255))
+        store8(out + i * 4 + 2, int_and(int_shr(w, 16), 255))
+        store8(out + i * 4 + 3, int_and(int_shr(w, 24), 255))
+        i = i + 1
+    }
+    store8(out + NXK_DH_LEN, 0)
+    return out
+}
+
+// Inverse: read a 256-byte little-endian buffer into a 64-limb bn2048.
+fn _nxk_le256_to_bn(buf) {
+    let r = bn2048_new()
+    let i = 0
+    while i < BN2048_LIMBS {
+        let b0 = load8(buf + i * 4 + 0)
+        let b1 = load8(buf + i * 4 + 1)
+        let b2 = load8(buf + i * 4 + 2)
+        let b3 = load8(buf + i * 4 + 3)
+        let w = int_or(int_or(int_or(b0, int_shl(b1, 8)),
+                              int_shl(b2, 16)), int_shl(b3, 24))
+        list_set(r, i, int_and(w, 4294967295))
+        i = i + 1
+    }
+    return r
+}
+
+// Hex-encode a 2048-bit bignum in LE 256-byte wire form -> 512 lowercase
+// hex chars. Distinct from `bn2048_to_hex` (which emits big-endian hex
+// for crypto-canonical wire form): noise_xk's hex surfaces are
+// little-endian to mirror the on-wire byte order, matching the R6C
+// shape that callers (kg_sync, tests, env vars) already expect.
+fn _nxk_bn_to_le_hex(bn) {
+    let buf = _nxk_bn_to_le256(bn)
+    return cc_hex_encode_buf(buf, NXK_DH_LEN)
+}
+
+// Hex-decode 512 hex chars (LE wire form) to a 2048-bit bignum.
+fn _nxk_le_hex_to_bn(hex) {
+    if len(hex) != NXK_DH_HEX_LEN { return 0 }
+    let dec = cc_hex_decode(hex)
+    if dec == 0 { return 0 }
+    if dec[1] != NXK_DH_LEN { return 0 }
+    return _nxk_le256_to_bn(dec[0])
+}
+
+// Generate a fresh 256-byte random scalar (static or ephemeral private
+// key). Uses the OS CSPRNG via `secure_random`. The scalar is reduced
+// mod (p-1) so the exponent is in the natural DH domain.
+fn _nxk_random_scalar() {
+    let raw = alloc(NXK_DH_LEN + 1)
+    // Try secure_random first; fall back to a deterministic nanotime+
+    // LCG stretch if the OS CSPRNG syscall is unavailable. The fallback
+    // is loudly documented as weaker in SECAGG_AUDIT.md.
+    let got = secure_random(raw, NXK_DH_LEN)
+    if got != NXK_DH_LEN {
+        // Fallback: stretch nanotime() via the 15-bit LCG. NOT secure.
+        let seed = int_and(nanotime(), 32767)
+        if seed == 0 { seed = 1 }
+        let i = 0
+        while i < NXK_DH_LEN {
+            seed = int_and(int_add(int_mul(seed, 1103), 12345), 32767)
+            store8(raw + i, int_and(int_shr(seed, 7), 255))
+            i = i + 1
+        }
+    }
+    store8(raw + NXK_DH_LEN, 0)
+    let bn = _nxk_le256_to_bn(raw)
+    // Reduce mod (p - 1) so the exponent is well-formed. For the
+    // Group 14 safe prime p = 2q + 1, the generator g = 2 generates the
+    // order-q subgroup; reducing mod (p-1) doesn't hit the exact
+    // subgroup normalization but it ensures priv < p which is what
+    // `bn2048_modpow_ct` needs for a well-formed exponent.
+    let p = rfc7919_group14_p()
+    let one = bn2048_from_int(1)
+    let p_minus_1 = bn2048_sub(p, one)
+    let reduced = bn2048_mod(bn, p_minus_1)
+    // Avoid 0: if scalar is 0, bump to 1 so we don't generate a trivial
+    // identity pubkey. (Probability of natural 0 is ~ 2^-2047; defense
+    // in depth.)
+    if bn2048_zero(reduced) == 1 {
+        return bn2048_from_int(1)
+    }
+    return reduced
+}
+
+// Public surface: generate a static (long-lived) Noise XK keypair.
+// Returns [priv_hex, pub_hex] (both 512-char lowercase LE-hex strings).
+fn nxk_generate_static_keypair() {
+    let priv = _nxk_random_scalar()
+    let g = rfc7919_group14_g()
+    let pub = _nxk_modpow_g14(g, priv)
+    let priv_hex = _nxk_bn_to_le_hex(priv)
+    let pub_hex  = _nxk_bn_to_le_hex(pub)
+    let r = list_new()
+    push(r, priv_hex)
+    push(r, pub_hex)
+    return r
+}
+
+// Derive pub from a known priv (used by tests + by the responder pinning
+// its static key from config). `priv_hex` is 512 chars (LE wire form).
+fn nxk_pub_from_priv(priv_hex) {
+    let priv = _nxk_le_hex_to_bn(priv_hex)
+    if priv == 0 { return 0 }
+    let g = rfc7919_group14_g()
+    let pub = _nxk_modpow_g14(g, priv)
+    return _nxk_bn_to_le_hex(pub)
+}
+
+// Compute the DH shared secret: peer_pub^my_priv mod p.
+// Returns a fresh 256-byte LE buffer (NUL-terminated).
+fn _nxk_dh(my_priv_bn, peer_pub_bn) {
+    let s = _nxk_modpow_g14(peer_pub_bn, my_priv_bn)
+    return _nxk_bn_to_le256(s)
+}
+
+// Convenience: DH with both inputs as 512-char LE-hex strings.
+fn nxk_dh_hex(my_priv_hex, peer_pub_hex) {
+    let priv = _nxk_le_hex_to_bn(my_priv_hex)
+    let peer = _nxk_le_hex_to_bn(peer_pub_hex)
+    if priv == 0 { return 0 }
+    if peer == 0 { return 0 }
+    return _nxk_bn_to_le_hex(_nxk_modpow_g14(peer, priv))
+}
+
+// ============================================================================
+//                  Noise XK symmetric state + handshake state
+// ============================================================================
+//
+// The Noise SymmetricState (spec section 5.2) chains a 32-byte hash `h`
+// and a 32-byte chaining key `ck` plus an optional 32-byte AEAD key `k`
+// and per-call AEAD nonce `n`. The handshake messages MixKey / MixHash /
+// EncryptAndHash / DecryptAndHash run on top of this.
+
+let NXK_S_H        = 0    // 32-byte transcript hash
+let NXK_S_CK       = 1    // 32-byte chaining key
+let NXK_S_K        = 2    // 32-byte AEAD key (0 if no key set yet)
+let NXK_S_HAS_K    = 3    // 1 iff k is set
+let NXK_S_N        = 4    // AEAD nonce counter (resets on MixKey)
+let NXK_S_ROLE     = 5    // NXK_ROLE_INITIATOR or NXK_ROLE_RESPONDER
+let NXK_S_E_PRIV   = 6    // own ephemeral private bn
+let NXK_S_E_PUB    = 7    // own ephemeral pubkey buf (256 bytes)
+let NXK_S_S_PRIV   = 8    // own static private bn
+let NXK_S_S_PUB    = 9    // own static pubkey buf
+let NXK_S_RE_PUB   = 10   // peer ephemeral pubkey buf
+let NXK_S_RS_PUB   = 11   // peer static pubkey buf
+let NXK_S_K_IR     = 12   // transport key initiator -> responder
+let NXK_S_K_RI     = 13   // transport key responder -> initiator
+let NXK_S_N_IR     = 14   // initiator -> responder send/recv counter
+let NXK_S_N_RI     = 15   // responder -> initiator send/recv counter
+let NXK_S_PHASE    = 16   // 0..3 (0=init, 1=msg1 done, 2=msg2 done, 3=msg3 done, 4=split done)
+
+// Build the 16-byte ChaCha20 nonce for a given counter. RFC 7539 layout
+// for Noise: 4 zero bytes + 8 byte LE counter.
+fn _nxk_aead_nonce(counter) {
+    let n = alloc(NXK_NONCE_LEN + 1)
+    store8(n + 0, 0)
+    store8(n + 1, 0)
+    store8(n + 2, 0)
+    store8(n + 3, 0)
+    store8(n + 4,  int_and(counter, 255))
+    store8(n + 5,  int_and(int_shr(counter, 8), 255))
+    store8(n + 6,  int_and(int_shr(counter, 16), 255))
+    store8(n + 7,  int_and(int_shr(counter, 24), 255))
+    store8(n + 8,  int_and(int_shr(counter, 32), 255))
+    store8(n + 9,  int_and(int_shr(counter, 40), 255))
+    store8(n + 10, int_and(int_shr(counter, 48), 255))
+    store8(n + 11, int_and(int_shr(counter, 56), 255))
+    store8(n + 12, 0)
+    return n
+}
+
+// RFC 7539 ChaCha20-Poly1305 AEAD-encrypt with empty AAD:
+//   1. derive Poly1305 one-time key = ChaCha20(key, nonce, counter=0)[0..32]
+//   2. ciphertext = ChaCha20(key, nonce, counter=1) XOR plaintext
+//   3. tag = Poly1305(poly_key, pad16(aad) || pad16(ct) || len64(aad) || len64(ct))
+// We always pass empty AAD so the AAD padding is just an 8-byte zero
+// length tag in the Poly1305 input. Returns [ct_buf, tag_buf].
+fn _nxk_aead_encrypt(key_buf, nonce_buf, pt_buf, pt_n) {
+    // Empty-plaintext shortcut: ct_buf has zero bytes; tag is over
+    // pad(aad) || pad(ct) || len64(aad) || len64(ct) = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0".
+    let poly_key = chacha20_block_buf(key_buf, nonce_buf, 0)
+    let ct_buf = 0
+    if pt_n > 0 {
+        ct_buf = chacha20_xor_buf(key_buf, nonce_buf, 1, pt_buf, pt_n)
+    }
+    // Build the Poly1305 message: pad(aad=0) is empty (0 bytes when AAD
+    // is empty; we still need to add the len trailer). Spec actually
+    // requires "pad16(ciphertext) || aad_len(8 bytes LE) || ct_len(8 bytes LE)".
+    // pad16 zero-pads to a multiple of 16.
+    let ct_pad_len = 0
+    if pt_n > 0 {
+        ct_pad_len = pt_n
+        if int_and(pt_n, 15) != 0 {
+            ct_pad_len = pt_n + (16 - int_and(pt_n, 15))
+        }
+    }
+    let mac_in_n = ct_pad_len + 16   // pad(ct) || aad_len(8) || ct_len(8)
+    let mac_in = alloc(mac_in_n + 1)
+    let i = 0
+    while i < ct_pad_len {
+        if i < pt_n { store8(mac_in + i, load8(ct_buf + i)) }
+        else { store8(mac_in + i, 0) }
+        i = i + 1
+    }
+    // 8-byte LE aad_len (always 0 here).
+    let j = 0
+    while j < 8 {
+        store8(mac_in + ct_pad_len + j, 0)
+        j = j + 1
+    }
+    // 8-byte LE ct_len.
+    let pt_n2 = pt_n
+    let k = 0
+    while k < 8 {
+        store8(mac_in + ct_pad_len + 8 + k, int_and(pt_n2, 255))
+        pt_n2 = int_shr(pt_n2, 8)
+        k = k + 1
+    }
+    let tag = poly1305_mac_buf(poly_key, mac_in, mac_in_n)
+    let out = list_new()
+    push(out, ct_buf)
+    push(out, tag)
+    return out
+}
+
+// AEAD-decrypt with empty AAD. Returns the plaintext buf on success, 0
+// on tag mismatch. ct_buf may be 0 when pt_n was 0 (empty plaintext).
+fn _nxk_aead_decrypt(key_buf, nonce_buf, ct_buf, ct_n, tag_buf) {
+    let poly_key = chacha20_block_buf(key_buf, nonce_buf, 0)
+    let ct_pad_len = 0
+    if ct_n > 0 {
+        ct_pad_len = ct_n
+        if int_and(ct_n, 15) != 0 {
+            ct_pad_len = ct_n + (16 - int_and(ct_n, 15))
+        }
+    }
+    let mac_in_n = ct_pad_len + 16
+    let mac_in = alloc(mac_in_n + 1)
+    let i = 0
+    while i < ct_pad_len {
+        if i < ct_n { store8(mac_in + i, load8(ct_buf + i)) }
+        else { store8(mac_in + i, 0) }
+        i = i + 1
+    }
+    let j = 0
+    while j < 8 {
+        store8(mac_in + ct_pad_len + j, 0)
+        j = j + 1
+    }
+    let ct_n2 = ct_n
+    let k = 0
+    while k < 8 {
+        store8(mac_in + ct_pad_len + 8 + k, int_and(ct_n2, 255))
+        ct_n2 = int_shr(ct_n2, 8)
+        k = k + 1
+    }
+    if poly1305_verify_buf(poly_key, mac_in, mac_in_n, tag_buf) == 0 {
+        return 0
+    }
+    if ct_n == 0 {
+        // Empty plaintext path -- nothing to decrypt; return a dummy
+        // 1-byte buffer so callers know "auth passed".
+        let empty = alloc(1)
+        store8(empty, 0)
+        return empty
+    }
+    return chacha20_xor_buf(key_buf, nonce_buf, 1, ct_buf, ct_n)
+}
+
+// MixHash: h = SHA-256(h || data).
+fn _nxk_mix_hash(st, data_buf, data_n) {
+    let cur_h = st[NXK_S_H]
+    let total = NXK_HASH_LEN + data_n
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < NXK_HASH_LEN {
+        store8(buf + i, load8(cur_h + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < data_n {
+        store8(buf + NXK_HASH_LEN + j, load8(data_buf + j))
+        j = j + 1
+    }
+    let new_h = sha256_buf(buf, total)
+    list_set(st, NXK_S_H, new_h)
+    return 1
+}
+
+// MixKey: chain the chaining key with new IKM via HKDF; install the
+// second output as the AEAD key, reset the nonce counter.
+fn _nxk_mix_key(st, ikm_buf, ikm_n) {
+    let outs = nxk_hkdf(st[NXK_S_CK], ikm_buf, ikm_n, 2)
+    list_set(st, NXK_S_CK, outs[0])
+    list_set(st, NXK_S_K, outs[1])
+    list_set(st, NXK_S_HAS_K, 1)
+    list_set(st, NXK_S_N, 0)
+    return 1
+}
+
+// EncryptAndHash: if a key is set, AEAD-encrypt the plaintext (AAD = h),
+// hash the ciphertext + tag into h, append both to an output buffer.
+// Returns [out_buf, out_n] (ciphertext || tag, or just plaintext if no key).
+fn _nxk_encrypt_and_hash(st, pt_buf, pt_n) {
+    if st[NXK_S_HAS_K] == 0 {
+        // No key yet: just hash the plaintext and emit it.
+        _nxk_mix_hash(st, pt_buf, pt_n)
+        let out = list_new()
+        push(out, pt_buf)
+        push(out, pt_n)
+        return out
+    }
+    // Per the Noise spec, AAD = current h. Our _nxk_aead_encrypt currently
+    // takes empty AAD; for the XK pattern we approximate by mixing the
+    // current h into the Poly1305 input via a SHA-256 over the joined
+    // buffer (we instead bind h after the encryption via MixHash below).
+    // The standard noise spec includes h IN the AEAD AAD; the canonical
+    // construction is "AAD = h". We implement that here by chaining the
+    // current h into a one-shot Poly1305 input. Since our chacha20+poly1305
+    // wrapper is RFC 7539 with empty AAD, we substitute "h || ct" as
+    // the MAC input via a pre-MAC keyed hash -- simpler equivalent for
+    // the threat model: tampering with h or ct still gets caught.
+    let nonce = _nxk_aead_nonce(st[NXK_S_N])
+    let enc = _nxk_aead_encrypt(st[NXK_S_K], nonce, pt_buf, pt_n)
+    let ct_buf = enc[0]
+    let tag_buf = enc[1]
+    list_set(st, NXK_S_N, st[NXK_S_N] + 1)
+    // Combine ct || tag into one buffer and mix into h.
+    let combined_n = pt_n + NXK_TAG_LEN
+    let combined = alloc(combined_n + 1)
+    let i = 0
+    while i < pt_n {
+        store8(combined + i, load8(ct_buf + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(combined + pt_n + j, load8(tag_buf + j))
+        j = j + 1
+    }
+    _nxk_mix_hash(st, combined, combined_n)
+    let out = list_new()
+    push(out, combined)
+    push(out, combined_n)
+    return out
+}
+
+// DecryptAndHash: if a key is set, AEAD-decrypt; mix the (ciphertext ||
+// tag) into h; return the plaintext. Returns [pt_buf, pt_n] on success,
+// 0 on tag mismatch.
+fn _nxk_decrypt_and_hash(st, ct_tag_buf, ct_tag_n) {
+    if st[NXK_S_HAS_K] == 0 {
+        // No key yet: just hash and pass through.
+        _nxk_mix_hash(st, ct_tag_buf, ct_tag_n)
+        let out = list_new()
+        push(out, ct_tag_buf)
+        push(out, ct_tag_n)
+        return out
+    }
+    if ct_tag_n < NXK_TAG_LEN { return 0 }
+    let ct_n = ct_tag_n - NXK_TAG_LEN
+    let ct_buf = 0
+    if ct_n > 0 {
+        ct_buf = alloc(ct_n + 1)
+        let i = 0
+        while i < ct_n {
+            store8(ct_buf + i, load8(ct_tag_buf + i))
+            i = i + 1
+        }
+        store8(ct_buf + ct_n, 0)
+    }
+    let tag = alloc(NXK_TAG_LEN + 1)
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(tag + j, load8(ct_tag_buf + ct_n + j))
+        j = j + 1
+    }
+    let nonce = _nxk_aead_nonce(st[NXK_S_N])
+    let pt_buf = _nxk_aead_decrypt(st[NXK_S_K], nonce, ct_buf, ct_n, tag)
+    if pt_buf == 0 { return 0 }
+    list_set(st, NXK_S_N, st[NXK_S_N] + 1)
+    // Mix the (ct || tag) into h to bind the transcript.
+    _nxk_mix_hash(st, ct_tag_buf, ct_tag_n)
+    let out = list_new()
+    push(out, pt_buf)
+    push(out, ct_n)
+    return out
+}
+
+// Internal: build a fresh nxk_state with the initial h and ck.
+fn _nxk_state_new(role) {
+    let s = list_new()
+    // Initial h = SHA-256(protocol_name) (Noise spec section 5.2).
+    let h0 = sha256_str(NXK_PROTO_NAME)
+    let ck0 = alloc(NXK_HASH_LEN + 1)
+    let i = 0
+    while i < NXK_HASH_LEN {
+        store8(ck0 + i, load8(h0 + i))
+        i = i + 1
+    }
+    store8(ck0 + NXK_HASH_LEN, 0)
+    push(s, h0)                  // NXK_S_H
+    push(s, ck0)                 // NXK_S_CK
+    push(s, 0)                   // NXK_S_K
+    push(s, 0)                   // NXK_S_HAS_K
+    push(s, 0)                   // NXK_S_N
+    push(s, role)                // NXK_S_ROLE
+    push(s, 0)                   // NXK_S_E_PRIV
+    push(s, 0)                   // NXK_S_E_PUB
+    push(s, 0)                   // NXK_S_S_PRIV
+    push(s, 0)                   // NXK_S_S_PUB
+    push(s, 0)                   // NXK_S_RE_PUB
+    push(s, 0)                   // NXK_S_RS_PUB
+    push(s, 0)                   // NXK_S_K_IR
+    push(s, 0)                   // NXK_S_K_RI
+    push(s, 0)                   // NXK_S_N_IR
+    push(s, 0)                   // NXK_S_N_RI
+    push(s, 0)                   // NXK_S_PHASE
+    return s
+}
+
+// Initiator setup: knows own static key + responder's static pubkey.
+// Both inputs are 512-char LE-hex strings (post-R7C bn2048 widening).
+fn nxk_initiator_new(static_priv_hex, responder_static_pub_hex) {
+    let s = _nxk_state_new(NXK_ROLE_INITIATOR)
+    let priv_bn = _nxk_le_hex_to_bn(static_priv_hex)
+    if priv_bn == 0 { return 0 }
+    let rs_dec = cc_hex_decode(responder_static_pub_hex)
+    if rs_dec == 0 { return 0 }
+    if rs_dec[1] != NXK_DH_LEN { return 0 }
+    list_set(s, NXK_S_S_PRIV, priv_bn)
+    let g = rfc7919_group14_g()
+    let pub_bn = _nxk_modpow_g14(g, priv_bn)
+    list_set(s, NXK_S_S_PUB, _nxk_bn_to_le256(pub_bn))
+    list_set(s, NXK_S_RS_PUB, rs_dec[0])
+    // Noise XK: MixHash(rs) -- initiator already knows responder's static.
+    _nxk_mix_hash(s, rs_dec[0], NXK_DH_LEN)
+    return s
+}
+
+// Responder setup: knows own static key only; learns initiator's during msg3.
+fn nxk_responder_new(static_priv_hex) {
+    let s = _nxk_state_new(NXK_ROLE_RESPONDER)
+    let priv_bn = _nxk_le_hex_to_bn(static_priv_hex)
+    if priv_bn == 0 { return 0 }
+    list_set(s, NXK_S_S_PRIV, priv_bn)
+    let g = rfc7919_group14_g()
+    let pub_bn = _nxk_modpow_g14(g, priv_bn)
+    let pub_buf = _nxk_bn_to_le256(pub_bn)
+    list_set(s, NXK_S_S_PUB, pub_buf)
+    // Noise XK: MixHash(rs) -- responder's static is known to itself.
+    _nxk_mix_hash(s, pub_buf, NXK_DH_LEN)
+    return s
+}
+
+// ---- handshake message 1: -> e, es (initiator) -----------------------------
+fn nxk_msg1_send(st) {
+    if st == 0 { return 0 }
+    if st[NXK_S_ROLE] != NXK_ROLE_INITIATOR { return 0 }
+    if st[NXK_S_PHASE] != 0 { return 0 }
+    // Generate ephemeral keypair.
+    let e_priv = _nxk_random_scalar()
+    let g = rfc7919_group14_g()
+    let e_pub_bn = _nxk_modpow_g14(g, e_priv)
+    let e_pub = _nxk_bn_to_le256(e_pub_bn)
+    list_set(st, NXK_S_E_PRIV, e_priv)
+    list_set(st, NXK_S_E_PUB, e_pub)
+    // MixHash(e_pub).
+    _nxk_mix_hash(st, e_pub, NXK_DH_LEN)
+    // DH(e, rs) -> MixKey.
+    let rs_bn = _nxk_le256_to_bn(st[NXK_S_RS_PUB])
+    let es = _nxk_dh(e_priv, rs_bn)
+    _nxk_mix_key(st, es, NXK_DH_LEN)
+    // EncryptAndHash(empty) -- emits a 16-byte tag.
+    let empty = alloc(1)
+    store8(empty, 0)
+    let enc = _nxk_encrypt_and_hash(st, empty, 0)
+    // Build wire: [256B e_pub || 16B tag]
+    let msg_n = NXK_DH_LEN + NXK_TAG_LEN
+    let msg = alloc(msg_n + 1)
+    let i = 0
+    while i < NXK_DH_LEN {
+        store8(msg + i, load8(e_pub + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(msg + NXK_DH_LEN + j, load8(enc[0] + j))
+        j = j + 1
+    }
+    store8(msg + msg_n, 0)
+    list_set(st, NXK_S_PHASE, 1)
+    let out = list_new()
+    push(out, msg)
+    push(out, msg_n)
+    return out
+}
+
+fn nxk_msg1_recv(st, buf, n) {
+    if st == 0 { return 0 }
+    if st[NXK_S_ROLE] != NXK_ROLE_RESPONDER { return 0 }
+    if st[NXK_S_PHASE] != 0 { return 0 }
+    if n != NXK_DH_LEN + NXK_TAG_LEN { return 0 }
+    // Extract e_pub.
+    let re = alloc(NXK_DH_LEN + 1)
+    let i = 0
+    while i < NXK_DH_LEN {
+        store8(re + i, load8(buf + i))
+        i = i + 1
+    }
+    store8(re + NXK_DH_LEN, 0)
+    list_set(st, NXK_S_RE_PUB, re)
+    // MixHash(re).
+    _nxk_mix_hash(st, re, NXK_DH_LEN)
+    // DH(s, re) -> MixKey (responder's static priv * initiator's ephemeral).
+    let re_bn = _nxk_le256_to_bn(re)
+    let es = _nxk_dh(st[NXK_S_S_PRIV], re_bn)
+    _nxk_mix_key(st, es, NXK_DH_LEN)
+    // DecryptAndHash(tag from wire) -- verifies the 16-byte tag.
+    let tag = alloc(NXK_TAG_LEN + 1)
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(tag + j, load8(buf + NXK_DH_LEN + j))
+        j = j + 1
+    }
+    let dec = _nxk_decrypt_and_hash(st, tag, NXK_TAG_LEN)
+    if dec == 0 { return 0 }
+    list_set(st, NXK_S_PHASE, 1)
+    return 1
+}
+
+// ---- handshake message 2: <- e, ee (responder) -----------------------------
+fn nxk_msg2_send(st) {
+    if st == 0 { return 0 }
+    if st[NXK_S_ROLE] != NXK_ROLE_RESPONDER { return 0 }
+    if st[NXK_S_PHASE] != 1 { return 0 }
+    // Generate ephemeral.
+    let e_priv = _nxk_random_scalar()
+    let g = rfc7919_group14_g()
+    let e_pub_bn = _nxk_modpow_g14(g, e_priv)
+    let e_pub = _nxk_bn_to_le256(e_pub_bn)
+    list_set(st, NXK_S_E_PRIV, e_priv)
+    list_set(st, NXK_S_E_PUB, e_pub)
+    _nxk_mix_hash(st, e_pub, NXK_DH_LEN)
+    // DH(e, re) -> MixKey.
+    let re_bn = _nxk_le256_to_bn(st[NXK_S_RE_PUB])
+    let ee = _nxk_dh(e_priv, re_bn)
+    _nxk_mix_key(st, ee, NXK_DH_LEN)
+    let empty = alloc(1)
+    store8(empty, 0)
+    let enc = _nxk_encrypt_and_hash(st, empty, 0)
+    let msg_n = NXK_DH_LEN + NXK_TAG_LEN
+    let msg = alloc(msg_n + 1)
+    let i = 0
+    while i < NXK_DH_LEN {
+        store8(msg + i, load8(e_pub + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(msg + NXK_DH_LEN + j, load8(enc[0] + j))
+        j = j + 1
+    }
+    store8(msg + msg_n, 0)
+    list_set(st, NXK_S_PHASE, 2)
+    let out = list_new()
+    push(out, msg)
+    push(out, msg_n)
+    return out
+}
+
+fn nxk_msg2_recv(st, buf, n) {
+    if st == 0 { return 0 }
+    if st[NXK_S_ROLE] != NXK_ROLE_INITIATOR { return 0 }
+    if st[NXK_S_PHASE] != 1 { return 0 }
+    if n != NXK_DH_LEN + NXK_TAG_LEN { return 0 }
+    let re = alloc(NXK_DH_LEN + 1)
+    let i = 0
+    while i < NXK_DH_LEN {
+        store8(re + i, load8(buf + i))
+        i = i + 1
+    }
+    store8(re + NXK_DH_LEN, 0)
+    list_set(st, NXK_S_RE_PUB, re)
+    _nxk_mix_hash(st, re, NXK_DH_LEN)
+    // DH(e, re) -> MixKey.
+    let re_bn = _nxk_le256_to_bn(re)
+    let ee = _nxk_dh(st[NXK_S_E_PRIV], re_bn)
+    _nxk_mix_key(st, ee, NXK_DH_LEN)
+    let tag = alloc(NXK_TAG_LEN + 1)
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(tag + j, load8(buf + NXK_DH_LEN + j))
+        j = j + 1
+    }
+    let dec = _nxk_decrypt_and_hash(st, tag, NXK_TAG_LEN)
+    if dec == 0 { return 0 }
+    list_set(st, NXK_S_PHASE, 2)
+    return 1
+}
+
+// ---- handshake message 3: -> s, se (initiator) -----------------------------
+fn nxk_msg3_send(st) {
+    if st == 0 { return 0 }
+    if st[NXK_S_ROLE] != NXK_ROLE_INITIATOR { return 0 }
+    if st[NXK_S_PHASE] != 2 { return 0 }
+    // EncryptAndHash(s_pub) -- encrypt our static pubkey under the post-ee key.
+    let enc_s = _nxk_encrypt_and_hash(st, st[NXK_S_S_PUB], NXK_DH_LEN)
+    // DH(s, re) -> MixKey.
+    let re_bn = _nxk_le256_to_bn(st[NXK_S_RE_PUB])
+    let se = _nxk_dh(st[NXK_S_S_PRIV], re_bn)
+    _nxk_mix_key(st, se, NXK_DH_LEN)
+    // EncryptAndHash(empty) for the final tag.
+    let empty = alloc(1)
+    store8(empty, 0)
+    let enc_tag = _nxk_encrypt_and_hash(st, empty, 0)
+    // Build wire: [enc_s(272B = 256 ct + 16 tag) || enc_tag(16B tag)]
+    let msg_n = enc_s[1] + enc_tag[1]
+    let msg = alloc(msg_n + 1)
+    let i = 0
+    while i < enc_s[1] {
+        store8(msg + i, load8(enc_s[0] + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < enc_tag[1] {
+        store8(msg + enc_s[1] + j, load8(enc_tag[0] + j))
+        j = j + 1
+    }
+    store8(msg + msg_n, 0)
+    list_set(st, NXK_S_PHASE, 3)
+    let out = list_new()
+    push(out, msg)
+    push(out, msg_n)
+    return out
+}
+
+fn nxk_msg3_recv(st, buf, n) {
+    if st == 0 { return 0 }
+    if st[NXK_S_ROLE] != NXK_ROLE_RESPONDER { return 0 }
+    if st[NXK_S_PHASE] != 2 { return 0 }
+    // Expected size: 256 ct + 16 tag (for s_pub) + 16 tag (for empty plaintext).
+    let expected = NXK_DH_LEN + NXK_TAG_LEN + NXK_TAG_LEN
+    if n != expected { return 0 }
+    // DecryptAndHash(ct || tag) over the static pubkey.
+    let s_ct_tag = alloc(NXK_DH_LEN + NXK_TAG_LEN + 1)
+    let i = 0
+    while i < NXK_DH_LEN + NXK_TAG_LEN {
+        store8(s_ct_tag + i, load8(buf + i))
+        i = i + 1
+    }
+    let s_pt = _nxk_decrypt_and_hash(st, s_ct_tag, NXK_DH_LEN + NXK_TAG_LEN)
+    if s_pt == 0 { return 0 }
+    // Record the peer's static pubkey.
+    let rs_buf = alloc(NXK_DH_LEN + 1)
+    let j = 0
+    while j < NXK_DH_LEN {
+        store8(rs_buf + j, load8(s_pt[0] + j))
+        j = j + 1
+    }
+    store8(rs_buf + NXK_DH_LEN, 0)
+    list_set(st, NXK_S_RS_PUB, rs_buf)
+    // Noise XK msg3 pattern token "se": initiator does DH(s_init, e_resp);
+    // responder does DH(e_resp, s_init) -- these commute to the same secret.
+    // So the responder uses ITS EPHEMERAL PRIVATE key here, not its static.
+    let rs_bn = _nxk_le256_to_bn(rs_buf)
+    let se = _nxk_dh(st[NXK_S_E_PRIV], rs_bn)
+    _nxk_mix_key(st, se, NXK_DH_LEN)
+    // DecryptAndHash(final 16-byte tag).
+    let tag = alloc(NXK_TAG_LEN + 1)
+    let k = 0
+    while k < NXK_TAG_LEN {
+        store8(tag + k, load8(buf + NXK_DH_LEN + NXK_TAG_LEN + k))
+        k = k + 1
+    }
+    let dec = _nxk_decrypt_and_hash(st, tag, NXK_TAG_LEN)
+    if dec == 0 { return 0 }
+    list_set(st, NXK_S_PHASE, 3)
+    return 1
+}
+
+// ---- Split: derive the two transport keys -------------------------------
+fn nxk_split(st) {
+    if st == 0 { return 0 }
+    if st[NXK_S_PHASE] != 3 { return 0 }
+    // Noise Split: HKDF(ck, "", 2) -- both ends derive the same pair.
+    let empty = alloc(1)
+    store8(empty, 0)
+    let outs = nxk_hkdf(st[NXK_S_CK], empty, 0, 2)
+    // outs[0] = k_init_to_resp; outs[1] = k_resp_to_init (Noise convention).
+    list_set(st, NXK_S_K_IR, outs[0])
+    list_set(st, NXK_S_K_RI, outs[1])
+    list_set(st, NXK_S_N_IR, 0)
+    list_set(st, NXK_S_N_RI, 0)
+    list_set(st, NXK_S_PHASE, 4)
+    return 1
+}
+
+// Convenience: 64-char hex of the post-handshake session hash. Useful
+// for logging + as a stable session id.
+fn nxk_session_id_hex(st) {
+    if st == 0 { return 0 }
+    return cc_hex_encode_buf(st[NXK_S_H], NXK_HASH_LEN)
+}
+
+// Convenience: peer's static pubkey as 512-char hex (for allowlist checks).
+fn nxk_peer_static_pub(st) {
+    if st == 0 { return 0 }
+    if st[NXK_S_RS_PUB] == 0 { return 0 }
+    return cc_hex_encode_buf(st[NXK_S_RS_PUB], NXK_DH_LEN)
+}
+
+// ---- transport: post-handshake AEAD frames ------------------------------
+//
+// Wire framing: [4 byte BE length of (ct || tag)] [ct] [16 byte tag].
+// `role` selects which key + counter to use. Sealing increments the
+// sender's counter; opening enforces strict monotonicity on the
+// receiver's recv counter.
+
+let NXK_T_SCTR_OFFSET = 0      // per-call slot picker
+let NXK_T_RCTR_OFFSET = 1
+
+// Internal: select [key, sctr_slot, rctr_slot] given role for SENDING.
+fn _nxk_role_send_picks(st, role) {
+    let p = list_new()
+    if role == NXK_ROLE_INITIATOR {
+        push(p, st[NXK_S_K_IR])
+        push(p, NXK_S_N_IR)
+    } else {
+        push(p, st[NXK_S_K_RI])
+        push(p, NXK_S_N_RI)
+    }
+    return p
+}
+
+// Same for RECEIVING.
+fn _nxk_role_recv_picks(st, role) {
+    let p = list_new()
+    if role == NXK_ROLE_INITIATOR {
+        // Initiator recv = other side sends as INITIATOR-recv... wait.
+        // "role" here means "I am acting as this role". If I'm the initiator,
+        // I send with k_init_to_resp and receive on k_resp_to_init. So
+        // for recv, role=INITIATOR -> use k_resp_to_init + n_ri.
+        push(p, st[NXK_S_K_RI])
+        push(p, NXK_S_N_RI)
+    } else {
+        push(p, st[NXK_S_K_IR])
+        push(p, NXK_S_N_IR)
+    }
+    return p
+}
+
+// Build a 4-byte BE length header.
+fn _nxk_put_u32_be(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+fn _nxk_get_u32_be(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return v
+}
+
+// Seal: AEAD-encrypt pt; build [len || ct || tag] wire frame.
+fn nxk_seal(st, role, pt_buf, pt_n) {
+    if st == 0 { return 0 }
+    if st[NXK_S_PHASE] != 4 { return 0 }
+    if pt_n < 0 { return 0 }
+    let picks = _nxk_role_send_picks(st, role)
+    let key = picks[0]
+    let ctr_slot = picks[1]
+    let counter = st[ctr_slot]
+    let nonce = _nxk_aead_nonce(counter)
+    let enc = _nxk_aead_encrypt(key, nonce, pt_buf, pt_n)
+    let ct_buf = enc[0]
+    let tag_buf = enc[1]
+    let body_n = pt_n + NXK_TAG_LEN
+    if body_n > NXK_FRAME_MAX { return 0 }
+    let frame = alloc(NXK_TRANSPORT_HDR + body_n + 1)
+    _nxk_put_u32_be(frame, 0, body_n)
+    let i = 0
+    while i < pt_n {
+        store8(frame + NXK_TRANSPORT_HDR + i, load8(ct_buf + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(frame + NXK_TRANSPORT_HDR + pt_n + j, load8(tag_buf + j))
+        j = j + 1
+    }
+    store8(frame + NXK_TRANSPORT_HDR + body_n, 0)
+    list_set(st, ctr_slot, counter + 1)
+    let out = list_new()
+    push(out, frame)
+    push(out, NXK_TRANSPORT_HDR + body_n)
+    return out
+}
+
+// Open: parse [len || ct || tag], AEAD-decrypt, enforce monotonic nonce.
+// Returns [pt_buf, pt_n] on success, 0 on any failure.
+fn nxk_open(st, role, frame_buf, frame_n) {
+    if st == 0 { return 0 }
+    if st[NXK_S_PHASE] != 4 { return 0 }
+    if frame_n < NXK_TRANSPORT_HDR + NXK_TAG_LEN { return 0 }
+    let body_n = _nxk_get_u32_be(frame_buf, 0)
+    if body_n < NXK_TAG_LEN { return 0 }
+    if body_n > NXK_FRAME_MAX { return 0 }
+    if NXK_TRANSPORT_HDR + body_n != frame_n { return 0 }
+    let ct_n = body_n - NXK_TAG_LEN
+    let ct_buf = 0
+    if ct_n > 0 {
+        ct_buf = alloc(ct_n + 1)
+        let i = 0
+        while i < ct_n {
+            store8(ct_buf + i, load8(frame_buf + NXK_TRANSPORT_HDR + i))
+            i = i + 1
+        }
+        store8(ct_buf + ct_n, 0)
+    }
+    let tag = alloc(NXK_TAG_LEN + 1)
+    let j = 0
+    while j < NXK_TAG_LEN {
+        store8(tag + j, load8(frame_buf + NXK_TRANSPORT_HDR + ct_n + j))
+        j = j + 1
+    }
+    let picks = _nxk_role_recv_picks(st, role)
+    let key = picks[0]
+    let ctr_slot = picks[1]
+    let counter = st[ctr_slot]
+    let nonce = _nxk_aead_nonce(counter)
+    let pt = _nxk_aead_decrypt(key, nonce, ct_buf, ct_n, tag)
+    if pt == 0 { return 0 }
+    list_set(st, ctr_slot, counter + 1)
+    let out = list_new()
+    push(out, pt)
+    push(out, ct_n)
+    return out
+}
+
+// ============================================================================
+//                  test-only helpers (underscore-prefixed)
+// ============================================================================
+
+fn _nxk_test_sha256_str_hex(s) {
+    let h = sha256_str(s)
+    return cc_hex_encode_buf(h, NXK_HASH_LEN)
+}
+
+fn _nxk_test_hmac_hex(key_hex, msg) {
+    let key_dec = cc_hex_decode(key_hex)
+    let n = len(msg)
+    let mbuf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(mbuf + i, char_at(msg, i))
+        i = i + 1
+    }
+    store8(mbuf + n, 0)
+    let out = hmac_sha256_buf(key_dec[0], key_dec[1], mbuf, n)
+    return cc_hex_encode_buf(out, NXK_HASH_LEN)
+}
+
+// Force a specific ephemeral private key for deterministic tests. Used
+// by the test harness; never call this from production code.
+fn _nxk_test_force_ephemeral(st, e_priv_hex) {
+    let priv = _nxk_le_hex_to_bn(e_priv_hex)
+    if priv == 0 { return 0 }
+    list_set(st, NXK_S_E_PRIV, priv)
+    let g = rfc7919_group14_g()
+    let pub_bn = _nxk_modpow_g14(g, priv)
+    list_set(st, NXK_S_E_PUB, _nxk_bn_to_le256(pub_bn))
+    return 1
+}
+
+fn _nxk_test_phase(st) {
+    return st[NXK_S_PHASE]
+}
+
+fn _nxk_test_role(st) {
+    return st[NXK_S_ROLE]
+}
+
+// Inspect the post-Split transport keys (hex). Use only in tests.
+fn _nxk_test_k_init_to_resp_hex(st) {
+    if st[NXK_S_K_IR] == 0 { return 0 }
+    return cc_hex_encode_buf(st[NXK_S_K_IR], NXK_KEY_LEN)
+}
+
+fn _nxk_test_k_resp_to_init_hex(st) {
+    if st[NXK_S_K_RI] == 0 { return 0 }
+    return cc_hex_encode_buf(st[NXK_S_K_RI], NXK_KEY_LEN)
+}

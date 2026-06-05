@@ -1,0 +1,1369 @@
+// CrossEngin learning: secure aggregation (SecAgg) primitive (P3.8 / ADR-0055).
+//
+// Purpose
+//   P3.7 shipped federated learning with a trusted coordinator: souls
+//   add DP noise locally, the coordinator sees per-soul DP-noised
+//   values, then averages them. That's "trusted-coordinator + DP" --
+//   the coordinator can still inspect each soul's noised contribution.
+//
+//   This module adds the secure-aggregation MVP. The goal is that
+//   coordinator sees ONLY THE SUM across souls, never any individual
+//   soul's contribution. The mechanism is PAIRWISE ADDITIVE MASKING:
+//
+//     For every pair of souls (A, B), the pair agrees on a shared random
+//     mask m_AB (deterministic from a pre-shared token). A adds +m_AB
+//     to its share; B subtracts m_AB from its share. When the
+//     coordinator sums every soul's masked share, the +m_AB / -m_AB
+//     pair cancels, so the sum equals Σ raw shares -- but no single
+//     soul's contribution is recoverable from the masked value alone.
+//
+//   This is the SAME core primitive Google's 2017 SecAgg paper builds
+//   on; that paper adds Shamir secret sharing + Diffie-Hellman key
+//   agreement + dropout handling on top, which together take 4-6 weeks
+//   per the reference implementation. The MVP here ships the core
+//   masking primitive only; SECAGG_AUDIT.md walks the gaps.
+//
+//   This module owns the SOUL-SIDE masking + the COORDINATOR-SIDE
+//   sum accumulator. The wire-protocol parsing for SECAGG_* lines is
+//   in `src/io/transducers/kg_sync.nova` (additive case at the end of
+//   the protocol dispatch table). The coordinator example
+//   (examples/crossengin_fed_coordinator.nova) consumes both.
+//
+// Wire protocol (extension of P3.7's FED_*, additive)
+//
+//   Handshake (replaces FED_HELLO in v2-sa mode)
+//     C->S : SECAGG_HELLO ce-fed v2-sa             secagg opt-in
+//     S->C : OK ce-fed v2-sa protocol accepted     server confirms
+//
+//   Mask agreement (soul announces its peers at join time)
+//     C->S : SECAGG_PEER <peer_id> <token>         one line per peer
+//
+//   Round
+//     C->S : FED_ROUND <round_id> <deadline_ns>    (unchanged from P3.7)
+//     C->S : FED_STAT_MASKED <round> <source_tag>
+//                <masked_promo> <masked_atr>       masked submission
+//     S->C : FED_AGGREGATE_SUM <round> <source>
+//                <sum_promo> <sum_atr>
+//                <n_participants>                  coord broadcasts SUM
+//                                                  (soul divides by n
+//                                                   to recover avg)
+//
+//   The MASKED submission replaces FED_STAT in v2-sa mode. The
+//   coordinator's AGGREGATE_SUM line is the sum (not the average) so
+//   the soul can divide by n_participants on its own end -- this
+//   surfaces the "what the coordinator computed" vs "what the soul
+//   recovers" split cleanly in the audit.
+//
+// Mask derivation
+//   For a pair (i, j) with i < j and a shared token T_ij:
+//     mask_ij = LCG(seed = hash(T_ij + ":" + round_id), iterate K times)
+//   The same LCG primitives as `src/safety/differential_privacy.nova`:
+//     - multiplier < 2^13 (NOVA pointer-threshold bug #5/6)
+//     - 15-bit state mask after every multiply
+//     - small odd increment
+//
+//   Soul i then computes its masked contribution:
+//     masked_x_i = x_i
+//                + Σ_{j > i} mask_ij      (positive side -- i is smaller)
+//                - Σ_{j < i} mask_ji      (negative side -- i is larger)
+//   The coordinator sums masked_x_i across all souls. The +mask_ij /
+//   -mask_ji pairs cancel, so the coordinator recovers Σ x_i. No
+//   single soul's x_i is recoverable from its masked_x_i alone:
+//   information-theoretic privacy (with the standard non-collusion
+//   caveat -- if (n-1) of n souls collude they can subtract the masks
+//   and reveal the holdout; see the audit).
+//
+// API summary
+//   sa_state_new(soul_id) -> sa_state
+//   sa_register_peer(sa, peer_id, token)          announce a peer's token
+//   sa_peer_count(sa) -> int
+//   sa_round_set(sa, round_id)                    set current round (for mask derivation)
+//   sa_mask_for_peer(sa, peer_id, round_id, k_dim) -> mask (int)
+//   sa_apply_masks(sa, soul_id, x, k_dim) -> masked_x
+//                                                 raw -> masked, for one stat dimension
+//   sa_format_hello_line() -> "SECAGG_HELLO ce-fed v2-sa\n"
+//   sa_format_peer_line(peer_id, token) -> "SECAGG_PEER <p> <t>\n"
+//   sa_format_stat_masked_line(round, tag, mp, ma) -> wire line
+//   sa_format_aggregate_sum_line(round, tag, sp, sa_, n) -> wire line
+//
+//   sa_acc_new(round_id) -> sum-accumulator
+//   sa_acc_add_masked(acc, source_tag, masked_p, masked_a)
+//   sa_acc_sums(acc) -> list of [tag, sum_p, sum_a, n]
+//
+// ADRs implemented: ADR-0055 (SecAgg MVP / pairwise additive masking).
+//   NOVA dependencies: builtins (lists, strings, int math).
+// CrossEngin dependencies: none (no cross-module coupling; consumed
+//   by federated_aggregator + the coordinator example).
+//
+// SecAgg vs Byzantine resilience -- a deliberate trade-off
+//
+//   SecAgg's privacy property is that the coordinator sees ONLY the
+//   sum of all souls' contributions, never any single soul's value.
+//   The new Byzantine-resilient aggregation module
+//   (`byzantine_aggregation.nova`, P3.10 / ADR-0056) takes the OPPOSITE
+//   view: to drop adversarial outliers (souls that submit poisoned
+//   updates), the aggregator MUST inspect each soul's contribution
+//   individually. The two are FUNDAMENTALLY in tension at this layer
+//   (filtering needs per-soul values; SecAgg hides them). The P3.10
+//   pragmatic choice -- documented in SECAGG_AUDIT.md -- is that
+//   operators pick ONE privacy posture per round:
+//     * SecAgg mode (use `sa_acc_*`) -- privacy, no Byzantine defense.
+//     * Byzantine mode (use `fed_acc_byz_*`) -- per-soul plaintext
+//       visible to the coordinator, robust aggregation against
+//       adaptive adversaries.
+//   The advanced primitives that close this gap (zero-knowledge
+//   proofs of well-formedness, threshold-homomorphic verification,
+//   trimmed-mean over secret shares) are out of scope for P3.10.
+
+import "std/io"
+import "../safety/bignum.nova"
+import "../safety/bignum_256.nova"
+import "../safety/bignum_2048.nova"
+
+// ---- protocol constants --------------------------------------------------
+let SECAGG_HELLO_V2SA_LINE  = "SECAGG_HELLO ce-fed v2-sa"
+let SECAGG_OK_V2SA_LINE     = "OK ce-fed v2-sa protocol accepted"
+let SECAGG_PEER_PREFIX      = "SECAGG_PEER "
+let SECAGG_STAT_MASKED_PREFIX = "FED_STAT_MASKED "
+let SECAGG_AGG_SUM_PREFIX   = "FED_AGGREGATE_SUM "
+// P3.9 DH key agreement additions (v2-sa-dh; additive on v2-sa-r).
+//   FED_DH_PUBLIC soul=<id> pubkey=<hex>
+// Sent during round setup: each soul announces its DH public key; the
+// coordinator broadcasts all of them back so each soul can derive a
+// pairwise shared secret with each peer via `peer_public^my_private
+// mod p`. The shared secret then SEEDS the existing LCG mask derivation
+// (replacing the pre-shared token in DH-mode). All existing v2-sa-r
+// wire shapes are unchanged; the DH lines are added ahead of
+// SECAGG_PEER + before the round_open broadcast.
+let SECAGG_DH_PUBLIC_PREFIX = "FED_DH_PUBLIC "
+// P3.8r (v2-sa-r) dropout-resilience additions.
+//   FED_DROPOUT      <round> <dropped_soul_id>    coord -> all surviving souls
+//   FED_RECON_MASKED <round> <soul_id>            soul -> coord; the
+//                    <source_tag> <adjusted_promo>  surviving soul resubmits
+//                    <adjusted_atr>                 its masked stat after
+//                                                   subtracting the dropped
+//                                                   soul's mask contribution
+//                                                   (so the per-pair mask
+//                                                   cancellation still holds
+//                                                   across the SHRUNK set).
+let SECAGG_DROPOUT_PREFIX   = "FED_DROPOUT "
+let SECAGG_RECON_MASKED_PREFIX = "FED_RECON_MASKED "
+
+// Event tag values returned by the local parser.
+let SECAGG_EV_NONE         = 0
+let SECAGG_EV_HELLO        = 1
+let SECAGG_EV_PEER         = 2
+let SECAGG_EV_STAT_MASKED  = 3
+let SECAGG_EV_AGG_SUM      = 4
+// P3.8r dropout-resilience events.
+let SECAGG_EV_DROPOUT      = 5
+let SECAGG_EV_RECON_MASKED = 6
+// P3.9 DH key agreement event.
+let SECAGG_EV_DH_PUBLIC    = 7
+
+// Record slot conventions:
+//   SECAGG_PEER         : [type, peer_id, token]
+//   FED_STAT_MASKED     : [type, round_id, source_tag, masked_promo, masked_atr]
+//   FED_AGGREGATE_SUM   : [type, round_id, source_tag, sum_promo, sum_atr, n_part]
+//   FED_DROPOUT         : [type, round_id, dropped_soul_id]
+//   FED_RECON_MASKED    : [type, round_id, soul_id, source_tag, adj_promo, adj_atr]
+let SECAGG_R_TYPE    = 0
+let SECAGG_R_PEER_ID = 1
+let SECAGG_R_TOKEN   = 2
+let SECAGG_R_ROUND   = 1
+let SECAGG_R_TAG     = 2
+let SECAGG_R_PROMO   = 3
+let SECAGG_R_ATR     = 4
+let SECAGG_R_NPART   = 5
+// FED_DROPOUT slot layout
+let SECAGG_R_DROPPED_ID = 2
+// FED_RECON_MASKED slot layout (round_id at slot 1 reuses SECAGG_R_ROUND).
+let SECAGG_R_RECON_SOUL = 2
+let SECAGG_R_RECON_TAG  = 3
+let SECAGG_R_RECON_PROMO = 4
+let SECAGG_R_RECON_ATR   = 5
+// FED_DH_PUBLIC slot layout: [type, soul_id, pubkey_hex]
+let SECAGG_R_DH_SOUL_ID = 1
+let SECAGG_R_DH_PUBKEY  = 2
+
+// ---- SA_STATE layout ----------------------------------------------------
+// Original v2-sa layout (positional, backward-compatible):
+//   [SA_OBJ_TAG, soul_id, peers, round_id]
+// v2-sa-dh extension (additive; new slots appended):
+//   + dh_mode (0/1), dh_private (bn hex), dh_public (bn hex)
+// v2-sa-dh-2048 extension (additive again):
+//   + dh_bits (256 or 2048; 256 = legacy 8-limb path, 2048 = RFC 7919
+//              Group 14 64-limb path; the DH_PRIVATE / DH_PUBLIC hex
+//              widths are inferred from this slot at runtime)
+// Per-peer record in the peers list is also extended:
+//   v2-sa:    [peer_id, token]
+//   v2-sa-dh: [peer_id, token, peer_pubkey_hex]   token is "" in DH mode
+let SA_TAG        = 0
+let SA_SOUL_ID    = 1
+let SA_PEERS      = 2  // list of [peer_id, token, optional peer_pubkey_hex]
+let SA_ROUND_ID   = 3  // current round (for mask derivation)
+let SA_DH_MODE    = 4  // 1 = DH-derived shared secrets, 0 = pre-shared tokens
+let SA_DH_PRIVATE = 5  // local private key, hex string; 0 if not set
+let SA_DH_PUBLIC  = 6  // local public key = g^private mod p, hex string; 0 if unset
+let SA_DH_BITS    = 7  // 256 (legacy v2-sa-dh) or 2048 (v2-sa-dh-2048 / RFC 7919 group 14)
+let SA_OBJ_TAG    = 7501
+
+// Per-peer record layout (slot indices)
+let SA_PEER_ID     = 0
+let SA_PEER_TOKEN  = 1
+let SA_PEER_PUBKEY = 2  // peer's DH public key, hex string; 0 / absent in v2-sa mode
+
+// ---- DH constants (256-bit group; MVP for wire-protocol demonstration) ---
+//
+// !!! BELOW CRYPTOGRAPHIC STRENGTH !!!
+// We use the Curve25519 field prime p = 2^255 - 19 (RFC 7748) as the DH
+// prime and a small generator g = 2. This is NOT a standard DH group:
+//   - Curve25519's prime is the FIELD prime of an elliptic curve, not the
+//     order of a prime-order subgroup of (Z/pZ)*. For real DH we want a
+//     "safe prime" p = 2q + 1 with q prime, AND a generator of the
+//     order-q subgroup. p_25519 is prime but the multiplicative subgroup
+//     structure under it is NOT what RFC 7919's Group 1 / 2 / 14 give you.
+//   - A 256-bit prime is BROKEN against modern crypto adversaries. RFC
+//     7919 starts at 2048 bits (Group 14) precisely because the index
+//     calculus attack on classical DH groups makes anything < 2048 bits
+//     recoverable on commodity hardware.
+//
+// We use this size + group ANYWAY because:
+//   1. Our bignum is 256-bit. RFC 7919's 2048-bit Group 14 is 8x too big;
+//      we'd need a 2048-bit bignum library which is multi-week work.
+//   2. The MVP demonstrates the WIRE PROTOCOL + FLOW, not the crypto
+//      strength. The shipping value here is "does the FED_DH_PUBLIC
+//      exchange land matching shared secrets on both ends", which is
+//      group-size-independent and tested in unit + integration.
+//   3. The SECAGG_AUDIT.md update flags this loudly so anyone reading
+//      the protocol understands the MVP is a strawman for the wire
+//      shape, not a production crypto deployment.
+//
+// To upgrade to real DH: ship a 2048-bit bignum (or use a 256-bit
+// elliptic-curve group like Curve25519 X25519 scalar mult, which needs
+// the Montgomery-ladder scalar-mult routine on top of the existing
+// bignum), then swap p_DH and g_DH for an RFC 7919 group constant.
+let _SA_DH_P_HEX = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed"
+let _SA_DH_G_HEX = "0000000000000000000000000000000000000000000000000000000000000002"
+
+// ---- LCG constants (mirrored from differential_privacy.nova) ------------
+// Multiplier < 2^13 so seed * MUL < 2^28 stays well under the NOVA
+// pointer-threshold bug (#5/6). Mask intermediates to 15 bits after
+// every multiply -- do NOT remove the masks.
+let _SA_LCG_MUL  = 6917
+let _SA_LCG_INC  = 31
+let _SA_LCG_MASK = 32767   // 2^15 - 1
+
+// Mask domain. Each stat is in milli (typically 0..1000), so masks in
+// the 15-bit range (0..32767) more than cover the dynamic range. We
+// keep masks in [0, 32767] so the masked value fits 16 bits + sign.
+let _SA_MASK_DOMAIN = 32768
+
+// ---- constructors --------------------------------------------------------
+fn sa_state_new(soul_id) {
+    let s = list_new()
+    push(s, SA_OBJ_TAG)        // SA_TAG
+    push(s, soul_id)           // SA_SOUL_ID
+    push(s, list_new())        // SA_PEERS
+    push(s, 0 - 1)             // SA_ROUND_ID (none yet)
+    push(s, 0)                 // SA_DH_MODE (0 = pre-shared tokens; 1 = DH)
+    push(s, 0)                 // SA_DH_PRIVATE (hex string; 0 if unset)
+    push(s, 0)                 // SA_DH_PUBLIC (hex string; 0 if unset)
+    push(s, 256)               // SA_DH_BITS (256 by default; 2048 in v2-sa-dh-2048 mode)
+    return s
+}
+
+// ---- accessors -----------------------------------------------------------
+fn sa_soul_id(s)      { return s[SA_SOUL_ID] }
+fn sa_peer_count(s)   { return len(s[SA_PEERS]) }
+fn sa_round_id(s)     { return s[SA_ROUND_ID] }
+fn sa_peers(s)        { return s[SA_PEERS] }
+fn sa_dh_mode(s)      { return s[SA_DH_MODE] }
+fn sa_dh_private(s)   { return s[SA_DH_PRIVATE] }
+fn sa_dh_public(s)    { return s[SA_DH_PUBLIC] }
+// Returns 256 (default) or 2048 (after sa_dh_generate_keys_2048).
+fn sa_dh_bits(s) {
+    // Defensive: tolerate older sa_state objects that don't carry the
+    // SA_DH_BITS slot (e.g., snapshots loaded from a pre-2048 deployment).
+    if len(s) <= SA_DH_BITS { return 256 }
+    return s[SA_DH_BITS]
+}
+
+// Set the current round id so subsequent sa_apply_masks calls derive
+// masks bound to this round. Round id rotation is critical: the same
+// pair of souls MUST derive a different mask each round, else a
+// passive eavesdropper that captures one round's masked values can
+// subtract them to reveal raw-deltas-between-rounds.
+fn sa_round_set(s, round_id) {
+    list_set(s, SA_ROUND_ID, round_id)
+    return 1
+}
+
+// Register a peer's pre-shared token. The pair (this soul, peer)
+// share a deterministic mask seed derived from the token + round id;
+// both sides MUST register the SAME token for cancellation to work.
+//
+// Returns 1 on registration, 0 if the peer_id was already known
+// (idempotent re-register is a no-op).
+fn sa_register_peer(s, peer_id, token) {
+    let peers = s[SA_PEERS]
+    let i = 0
+    while i < len(peers) {
+        if _sa_str_eq(peers[i][SA_PEER_ID], peer_id) == 1 {
+            // Update token (let re-registration refresh the token).
+            list_set(peers[i], SA_PEER_TOKEN, token)
+            return 0
+        }
+        i = i + 1
+    }
+    let row = list_new()
+    push(row, peer_id)
+    push(row, token)
+    push(row, 0)              // SA_PEER_PUBKEY -- absent in v2-sa mode
+    push(peers, row)
+    return 1
+}
+
+// Register a peer's DH public key in v2-sa-dh mode. The shared mask
+// seed is then derived as `peer_pubkey ^ my_private mod p` -- no
+// pre-shared token needed. The token slot is set to the empty string
+// as a marker that this peer uses DH-derived secrets.
+//
+// Returns 1 on new registration, 0 if the peer was already known
+// (pubkey is updated in either case so a re-register refreshes it).
+fn sa_register_peer_dh(s, peer_id, peer_pubkey_hex) {
+    let peers = s[SA_PEERS]
+    let i = 0
+    while i < len(peers) {
+        if _sa_str_eq(peers[i][SA_PEER_ID], peer_id) == 1 {
+            // Update DH pubkey (idempotent; lets the protocol refresh
+            // a peer's key if the round restarts with a new DH exchange).
+            // The peer record may have been created without a pubkey
+            // slot under the v2-sa code path; append the slot if needed
+            // so the row is always SA_PEER_PUBKEY-indexable.
+            if len(peers[i]) <= SA_PEER_PUBKEY {
+                push(peers[i], peer_pubkey_hex)
+            } else {
+                list_set(peers[i], SA_PEER_PUBKEY, peer_pubkey_hex)
+            }
+            list_set(peers[i], SA_PEER_TOKEN, "")
+            return 0
+        }
+        i = i + 1
+    }
+    let row = list_new()
+    push(row, peer_id)
+    push(row, "")             // empty token marker for DH mode
+    push(row, peer_pubkey_hex)
+    push(peers, row)
+    return 1
+}
+
+// Find a peer's token by id, or 0 if absent.
+fn sa_token_for_peer(s, peer_id) {
+    let peers = s[SA_PEERS]
+    let i = 0
+    while i < len(peers) {
+        if _sa_str_eq(peers[i][SA_PEER_ID], peer_id) == 1 {
+            return peers[i][SA_PEER_TOKEN]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Find a peer's DH public key (hex string) by id, or 0 if absent /
+// not registered in DH mode. Returns 0 if the peer row has no pubkey
+// slot (legacy v2-sa row) or the slot is the sentinel 0.
+fn sa_pubkey_for_peer(s, peer_id) {
+    let peers = s[SA_PEERS]
+    let i = 0
+    while i < len(peers) {
+        if _sa_str_eq(peers[i][SA_PEER_ID], peer_id) == 1 {
+            let row = peers[i]
+            if len(row) <= SA_PEER_PUBKEY { return 0 }
+            return row[SA_PEER_PUBKEY]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- LCG mask derivation -------------------------------------------------
+// Pure-integer LCG. State stays under 15 bits at every step so the
+// multiply never crosses NOVA's pointer-threshold (NOVA bug #5/6).
+// Apply the lessons from the dp module: small multiplier, 15-bit
+// mask after every multiply, avalanche XOR of high half into low.
+fn _sa_lcg_step(seed) {
+    // Stage 1: standard LCG step.
+    let prod1 = seed * _SA_LCG_MUL
+    prod1 = prod1 & _SA_LCG_MASK
+    let mid = prod1 + _SA_LCG_INC
+    mid = mid & _SA_LCG_MASK
+    // Stage 2: re-step + XOR-avalanche the top into the bottom.
+    let prod2 = mid * _SA_LCG_MUL
+    prod2 = prod2 & _SA_LCG_MASK
+    let next = prod2 + _SA_LCG_INC
+    next = next & _SA_LCG_MASK
+    let high = next / 256
+    let mixed = next ^ high
+    mixed = mixed & _SA_LCG_MASK
+    if mixed == 0 { mixed = 1 }
+    return mixed
+}
+
+// Hash a string to a 15-bit seed. Walk the bytes, treat each as a
+// small contribution into the seed. We mask AGGRESSIVELY (after every
+// multiply) so the intermediate never crosses NOVA's pointer threshold.
+// This is NOT a cryptographic hash -- a real SecAgg would use SHA-256.
+// For the MVP and the LCG-driven mask we accept the small-domain hash
+// because the LCG step expands the avalanche.
+fn _sa_hash_str(s) {
+    let h = 1
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        // Each step: h = (h * 31 + c) & 15-bit mask. 31 < 2^5 and h is
+        // < 2^15 so the product is < 2^20 -- still under the pointer
+        // threshold (~2^20). Mask immediately.
+        h = h * 31
+        h = h & _SA_LCG_MASK
+        h = h + c
+        h = h & _SA_LCG_MASK
+        i = i + 1
+    }
+    if h == 0 { h = 1 }
+    return h
+}
+
+// Hash (token + ":" + round_id) -> a 15-bit seed. Round id rotation
+// changes the seed every round so the mask is fresh per round.
+fn _sa_seed_for_pair(token, round_id) {
+    let seed_str = token + ":" + int_to_str(round_id)
+    return _sa_hash_str(seed_str)
+}
+
+// ---- DH key agreement (P3.9 / v2-sa-dh) ---------------------------------
+//
+// WIRE PROTOCOL FLOW (additive on v2-sa-r):
+//   1. Each soul generates a random 256-bit private key d_i
+//      (`sa_dh_generate_keys`).
+//   2. Each soul computes its public key P_i = g^d_i mod p (using the
+//      constant-time `bn_modpow_ct` so the private exponent does NOT
+//      leak via timing).
+//   3. Each soul sends FED_DH_PUBLIC <soul_id> <pubkey_hex> to the
+//      coordinator during round setup.
+//   4. Coordinator broadcasts every FED_DH_PUBLIC to every other soul.
+//   5. Each soul (i) receives every other soul's pubkey P_j and registers
+//      it via `sa_register_peer_dh(s, j, P_j_hex)`.
+//   6. The pairwise shared secret with peer j is
+//      s_ij = P_j^d_i mod p = g^(d_j * d_i) mod p
+//      (`sa_dh_shared_secret_for_peer`). By DH commutativity both sides
+//      derive the same s_ij. The shared secret hex is fed into the
+//      existing LCG mask derivation in place of the pre-shared token.
+//
+// !!! WEAK RANDOM CAVEAT (LOUDLY) !!!
+// The "random" 256-bit private key is generated via `nanotime() + LCG`,
+// which is NOT cryptographically secure. nanotime() returns a wall-clock
+// value an adversary can guess to within microseconds; the LCG state is
+// 15 bits. The DH key material derived from this is BROKEN against any
+// adversary who can guess the boot time of the soul to within a second
+// (a few thousand candidate seeds * an offline brute-force grid search).
+// Production needs `/dev/urandom` (or the platform-equivalent CSPRNG),
+// which the NOVA toolchain does not expose today. The MVP documents
+// this limitation and demonstrates the wire flow under it; an upgrade
+// to a CSPRNG is a NOVA-runtime task.
+//
+// !!! SUB-CRYPTOGRAPHIC PRIME CAVEAT (LOUDLY) !!!
+// The DH prime `p = 2^255 - 19` is below the RFC 7919 Group 1
+// (768-bit) minimum, and 256-bit DH is BREAKABLE in tractable time on
+// commodity hardware. We use this size only because our bignum is
+// 256-bit; the audit calls for a 2048-bit-or-more upgrade once a wider
+// bignum lands.
+
+// Tiny 15-bit LCG (same constants as the mask-derivation LCG) used to
+// stretch a single nanotime() seed into a 256-bit DH private key. Each
+// LCG step yields 8 bits of "random" output (the high 8 bits of the
+// 15-bit state), and 32 steps fill one 32-bit limb; 8 limbs fill the
+// 256-bit bignum. NOTE: the LCG is SEEDED from nanotime() so the same
+// boot at the same wall-clock would produce the same key (replay
+// attack); for the MVP this is acceptable because the integration-test
+// soul-pair runs in a single process invocation per scenario.
+fn _sa_dh_random_bn_from_nanotime() {
+    let raw = nanotime()
+    // Fold the wall-clock into a small starting seed (mask to 15 bits).
+    // We XOR the high 32 bits into the low 32, then mask, to spread
+    // any monotonic bias across the avalanche.
+    let lo = int_and(raw, 4294967295)
+    let hi = int_shr(raw, 32)
+    let mixed = int_and(int_xor(lo, hi), 32767)
+    if mixed == 0 { mixed = 1 }
+    let seed = mixed
+    let bn = bn_new()
+    let limb_idx = 0
+    while limb_idx < 8 {
+        // Build one 32-bit limb by stacking 4 8-bit slices from the LCG.
+        let limb = 0
+        let slice = 0
+        while slice < 4 {
+            seed = _sa_lcg_step(seed)
+            // 8 high bits of the 15-bit state become this slice.
+            let byte = int_and(int_shr(seed, 7), 255)
+            limb = int_or(limb, int_shl(byte, int_mul(slice, 8)))
+            slice = slice + 1
+        }
+        list_set(bn, limb_idx, int_and(limb, 4294967295))
+        limb_idx = limb_idx + 1
+    }
+    return bn
+}
+
+// Generate a (weak-random) 256-bit private key + matching public key
+// P = g^d mod p. Stores both on the sa_state (slot SA_DH_PRIVATE +
+// SA_DH_PUBLIC, hex form) and flips SA_DH_MODE to 1. Returns the
+// public key hex string so the caller can wire it onto FED_DH_PUBLIC
+// immediately.
+//
+// CRYPTO-SAFE EXPONENT: uses `bn256_modpow_ct` (Montgomery ladder over
+// Montgomery REDC) so the private exponent does NOT leak via wall-clock
+// timing to a passive network observer. (The weak-random caveat above
+// stands separately: the *generation* is broken, but the *use* of the
+// generated key in the modpow is constant-time per the bignum module's
+// contract.)
+//
+// MIGRATION (R7B): switched from the legacy `bn_modpow_ct` (bit-by-bit
+// reducer in bignum.nova) to `bn256_modpow_ct` (Montgomery REDC in
+// bignum_256.nova). bn256_ is bit-exactly equivalent on the public
+// surface (`tests/unit/test_bignum_256.nova::test_bn256_modpow_mont_eq_
+// legacy_curve25519` proves this on the Curve25519 prime), but ~14x
+// faster per modpow_ct on this prime (~5 ms vs ~60 ms in the dev
+// sandbox). The on-disk hex representation is identical (both modules
+// use 8 x 32-bit little-endian limbs internally with big-endian hex
+// on the wire), so registered peer pubkeys parse cleanly via either
+// bn_from_hex or bn256_from_hex. We keep the bignum.nova import for
+// the non-DH random-key construction helper
+// (`_sa_dh_random_bn_from_nanotime` returns an 8-limb list that bn256_*
+// consumes unchanged).
+fn sa_dh_generate_keys(s) {
+    let priv_bn = _sa_dh_random_bn_from_nanotime()
+    // Reduce priv mod (p - 1) so the exponent space matches the group
+    // order's nominal domain. For a non-safe prime like p_25519 the
+    // "group order" of the subgroup g=2 generates is not (p-1), so
+    // this reduction is not exactly the textbook ECDH normalization;
+    // it just ensures priv is well-formed for bn256_modpow_ct.
+    let p = bn256_from_hex(_SA_DH_P_HEX)
+    let priv_reduced = bn256_mod(priv_bn, p)
+    let g = bn256_from_hex(_SA_DH_G_HEX)
+    let pub_bn = bn256_modpow_ct(g, priv_reduced, p)
+    let priv_hex = bn256_to_hex(priv_reduced)
+    let pub_hex  = bn256_to_hex(pub_bn)
+    list_set(s, SA_DH_PRIVATE, priv_hex)
+    list_set(s, SA_DH_PUBLIC, pub_hex)
+    list_set(s, SA_DH_MODE, 1)
+    return pub_hex
+}
+
+// Derive the pairwise shared secret with a peer:
+//   shared_ij = peer_pubkey ^ my_private mod p
+// where peer_pubkey was registered via `sa_register_peer_dh`. Returns
+// the shared-secret hex string (64 lowercase chars), or 0 if either
+// the peer has no registered pubkey or this soul has no DH private
+// key set. By DH commutativity both ends compute the same value; the
+// shared secret then SEEDS the existing LCG mask derivation.
+//
+// CRYPTO-SAFE: `bn256_modpow_ct` is the Montgomery ladder (over
+// Montgomery REDC); the private exponent does not leak via timing.
+// See `sa_dh_generate_keys` migration note for the legacy-bn-to-bn256
+// rationale (R7B; ~14x speedup on the Curve25519 prime).
+fn sa_dh_shared_secret_for_peer(s, peer_id) {
+    let peer_pub_hex = sa_pubkey_for_peer(s, peer_id)
+    if peer_pub_hex == 0 { return 0 }
+    let my_priv_hex = s[SA_DH_PRIVATE]
+    if my_priv_hex == 0 { return 0 }
+    let peer_pub = bn256_from_hex(peer_pub_hex)
+    let my_priv  = bn256_from_hex(my_priv_hex)
+    let p        = bn256_from_hex(_SA_DH_P_HEX)
+    let shared   = bn256_modpow_ct(peer_pub, my_priv, p)
+    return bn256_to_hex(shared)
+}
+
+// Read the DH-mode opt-in flag from the env. Returns 1 iff CE_SECAGG_DH
+// is set to a non-empty, non-"0" value. Default (env unset / "0") is 0
+// so the existing pre-shared-token path stays the backwards-compatible
+// default and the DH path only fires when an operator explicitly opts
+// in. The brief asks for ONE CE_SECAGG_DH detection in the chat; this
+// is the helper the chat calls.
+fn sa_dh_enabled_from_env() {
+    let env = getenv("CE_SECAGG_DH")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if _sa_str_eq(env, "0") == 1 { return 0 }
+    return 1
+}
+
+// !!! P3.9 cont. — v2-sa-dh-2048 (RFC 7919 Group 14 DH) -------------------
+//
+// `bignum_2048.nova` lands the 64-limb 2048-bit arithmetic that lets us
+// swap in a real RFC 7919 Group 14 safe-prime group in place of the
+// broken 256-bit Curve25519-field DH the original v2-sa-dh used. The
+// wire protocol is unchanged: the FED_DH_PUBLIC line just carries a
+// 512-char hex pubkey instead of a 64-char one. The mask-derivation LCG
+// step still gets seeded from the shared-secret hex (which is now a
+// 512-char string from `bn2048_to_hex` instead of 64-char from
+// `bn_to_hex`); the LCG step itself doesn't care about the seed length.
+//
+// !!! TIMING REALITY CHECK (LOUDLY) !!!
+// `bn2048_modpow_ct` costs ~15 seconds wall-clock per call on this dev
+// sandbox vs. ~40 ms for the 256-bit `bn_modpow_ct`. One DH keygen + one
+// per-peer shared-secret derivation = 2 modpow_ct calls = ~30 seconds.
+// A 5-soul round needs 5 keygens + 4 * 5 = 20 per-peer derivations =
+// ~25 modpow_ct calls = ~6 minutes. v2-sa-dh-2048 is an OFFLINE
+// federation mode; do not enable it for real-time per-message rounds.
+//
+// !!! WEAK RANDOM CAVEAT (unchanged) !!!
+// The 2048-bit "random" private key is generated by the SAME stretched-
+// nanotime + 15-bit LCG as the 256-bit path (`_sa_dh_random_bn_from_
+// nanotime` extended to 64 limbs via `_sa_dh_random_bn2048_from_
+// nanotime`). The LCG state is 15 bits, so an adversary who can guess
+// the soul's boot time to within seconds can brute-force the private
+// key by enumerating LCG seeds. The 2048-bit ARITHMETIC is strong; the
+// 2048-bit ENTROPY is NOT. Production needs `/dev/urandom` or the
+// platform CSPRNG. Documented in SECAGG_AUDIT.md.
+
+// 2048-bit equivalent of `_sa_dh_random_bn_from_nanotime`. Stretches a
+// single nanotime() seed via the 15-bit LCG into 64 32-bit limbs (each
+// limb built from 4 8-bit slices of the LCG output). Returns a bn2048
+// list.
+fn _sa_dh_random_bn2048_from_nanotime() {
+    let raw = nanotime()
+    let lo = int_and(raw, 4294967295)
+    let hi = int_shr(raw, 32)
+    let mixed = int_and(int_xor(lo, hi), 32767)
+    if mixed == 0 { mixed = 1 }
+    let seed = mixed
+    let bn = bn2048_new()
+    let limb_idx = 0
+    while limb_idx < 64 {
+        let limb = 0
+        let slice = 0
+        while slice < 4 {
+            seed = _sa_lcg_step(seed)
+            let byte = int_and(int_shr(seed, 7), 255)
+            limb = int_or(limb, int_shl(byte, int_mul(slice, 8)))
+            slice = slice + 1
+        }
+        list_set(bn, limb_idx, int_and(limb, 4294967295))
+        limb_idx = limb_idx + 1
+    }
+    return bn
+}
+
+// Generate a (weak-random) 2048-bit private key + matching public key
+// P = g^d mod p, where p = RFC 7919 Group 14 prime and g = 2. Stores
+// both as 512-char hex strings on the sa_state (SA_DH_PRIVATE +
+// SA_DH_PUBLIC slots), flips SA_DH_MODE = 1, and sets SA_DH_BITS = 2048
+// so subsequent shared-secret derivations dispatch to the 2048-bit
+// path. Returns the public key hex string so the caller can immediately
+// wire it into FED_DH_PUBLIC.
+//
+// CRYPTO-SAFE EXPONENT: uses `bn2048_modpow_ct` (Montgomery ladder) so
+// the private exponent does NOT leak via wall-clock timing.
+//
+// !!! COST !!!: this call takes ~15 seconds wall-clock per the bn2048
+// performance reality check. The caller should print a "[SECAGG-DH-2048]
+// generating keys; expect ~15s wall-clock" banner before invoking so
+// operators understand the latency budget.
+fn sa_dh_generate_keys_2048(s) {
+    let priv_bn = _sa_dh_random_bn2048_from_nanotime()
+    let p = rfc7919_group14_p()
+    // Reduce priv mod p. For a safe prime p = 2q + 1 with q prime, the
+    // generator g = 2 generates the order-q subgroup; reducing mod p
+    // doesn't hit the exact subgroup-order normalization, but it
+    // ensures priv is well-formed for bn2048_modpow_ct (priv < p).
+    let priv_reduced = bn2048_mod(priv_bn, p)
+    let g = rfc7919_group14_g()
+    let pub_bn = bn2048_modpow_ct(g, priv_reduced, p)
+    let priv_hex = bn2048_to_hex(priv_reduced)
+    let pub_hex  = bn2048_to_hex(pub_bn)
+    list_set(s, SA_DH_PRIVATE, priv_hex)
+    list_set(s, SA_DH_PUBLIC, pub_hex)
+    list_set(s, SA_DH_MODE, 1)
+    // Ensure SA_DH_BITS exists then set it to 2048.
+    if len(s) <= SA_DH_BITS {
+        push(s, 2048)
+    } else {
+        list_set(s, SA_DH_BITS, 2048)
+    }
+    return pub_hex
+}
+
+// 2048-bit equivalent of `sa_dh_shared_secret_for_peer`. Derives the
+// pairwise shared secret via `peer_pubkey ^ my_private mod p` using
+// `bn2048_modpow_ct`. Returns the 512-char hex secret, or 0 if either
+// the peer pubkey or local private key is unset.
+//
+// !!! COST !!!: one `bn2048_modpow_ct` call per invocation = ~15
+// seconds wall-clock. The mask-derivation cache layer (TODO: add if
+// the multi-peer cost becomes a hot path) would amortize this across
+// rounds, but for the MVP each call re-derives.
+fn sa_dh_shared_secret_for_peer_2048(s, peer_id) {
+    let peer_pub_hex = sa_pubkey_for_peer(s, peer_id)
+    if peer_pub_hex == 0 { return 0 }
+    let my_priv_hex = s[SA_DH_PRIVATE]
+    if my_priv_hex == 0 { return 0 }
+    let peer_pub = bn2048_from_hex(peer_pub_hex)
+    let my_priv  = bn2048_from_hex(my_priv_hex)
+    let p        = rfc7919_group14_p()
+    let shared   = bn2048_modpow_ct(peer_pub, my_priv, p)
+    return bn2048_to_hex(shared)
+}
+
+// Read the 2048-bit DH-mode opt-in flag from the env. Returns 1 iff
+// CE_SECAGG_DH_2048 is set to a non-empty, non-"0" value. Default
+// (env unset / "0") is 0 -- the 256-bit path stays the backwards-
+// compatible default, and the 2048-bit path only fires when an
+// operator EXPLICITLY opts in (because of the ~15s-per-modpow_ct
+// cost). The brief asks for ONE env probe in the chat for this flag;
+// this is the helper the chat calls.
+//
+// Note: setting CE_SECAGG_DH_2048=1 also IMPLICITLY enables
+// CE_SECAGG_DH (the 2048-bit path is a strict superset of the DH
+// path -- both share the same wire protocol and state machine).
+fn sa_dh_2048_enabled_from_env() {
+    let env = getenv("CE_SECAGG_DH_2048")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if _sa_str_eq(env, "0") == 1 { return 0 }
+    return 1
+}
+
+// Derive the pairwise mask for (this soul, peer) at (round_id) for
+// the k-th stat dimension. K iterations of the LCG so different
+// dimensions get distinct masks even though they share a token.
+//
+// In v2-sa-dh mode (s[SA_DH_MODE] == 1) the SEED for the mask LCG is
+// the DH-derived shared secret hex (`peer_pubkey ^ my_private mod p`)
+// instead of the pre-shared token. By DH commutativity both ends of
+// the pair derive the SAME shared secret, so the LCG seed -- and
+// therefore the mask -- still matches across the pair, preserving
+// the cancellation invariant. The seed-string still ends in
+// ":<round_id>" so round-id rotation still freshens the mask each
+// round.
+//
+// Returns a mask in [0, 32767] -- a positive integer. The caller
+// decides the sign (i < j -> +mask, i > j -> -mask).
+fn sa_mask_for_peer(s, peer_id, round_id, k_dim) {
+    let secret_for_seed = 0
+    if s[SA_DH_MODE] == 1 {
+        // DH mode: derive shared secret from peer pubkey + my private.
+        // The shared secret hex is fed into the LCG seed builder, taking
+        // the slot the pre-shared token would have in v2-sa.
+        //
+        // Dispatch on SA_DH_BITS so v2-sa-dh-2048 souls call the
+        // 2048-bit derivation (`sa_dh_shared_secret_for_peer_2048`)
+        // and produce a 512-char hex shared secret, while v2-sa-dh
+        // souls keep using the 256-bit path. The LCG seed builder
+        // (`_sa_seed_for_pair`) hashes the secret string with
+        // `_sa_hash_str` which walks bytes one-by-one and works for
+        // any string length, so the seed-builder is agnostic to the
+        // secret width.
+        if sa_dh_bits(s) == 2048 {
+            secret_for_seed = sa_dh_shared_secret_for_peer_2048(s, peer_id)
+        } else {
+            secret_for_seed = sa_dh_shared_secret_for_peer(s, peer_id)
+        }
+    } else {
+        secret_for_seed = sa_token_for_peer(s, peer_id)
+    }
+    if secret_for_seed == 0 { return 0 }
+    let seed = _sa_seed_for_pair(secret_for_seed, round_id)
+    // Run k+1 LCG steps so dim=0 gets the first step, dim=1 the second, etc.
+    let i = 0
+    let cur = seed
+    while i <= k_dim {
+        cur = _sa_lcg_step(cur)
+        i = i + 1
+    }
+    return cur
+}
+
+// String-compare helper (renamed local copy to avoid TU collisions).
+fn _sa_str_eq(a, b) {
+    if str_eq(a, b) == 1 { return 1 }
+    return 0
+}
+
+// Lex-compare for ids: returns -1 if a < b, 0 if a == b, 1 if a > b.
+// Compares byte-by-byte; shorter string is less when they share a
+// prefix. This is the canonical ordering used to decide the sign of
+// the mask: soul i < j -> i adds +mask, i > j -> i subtracts mask.
+fn sa_id_compare(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    let n = la
+    if lb < n { n = lb }
+    let i = 0
+    while i < n {
+        let ca = char_at(a, i)
+        let cb = char_at(b, i)
+        if ca < cb { return 0 - 1 }
+        if ca > cb { return 1 }
+        i = i + 1
+    }
+    if la < lb { return 0 - 1 }
+    if la > lb { return 1 }
+    return 0
+}
+
+// Apply pairwise masks to a single integer x. The caller's soul_id
+// determines the sign: peers lex-greater contribute +mask, peers
+// lex-smaller contribute -mask. The result is the masked share to
+// send to the coordinator.
+//
+// k_dim selects which dimension of the LCG output to use -- pass 0
+// for the promotion stat, 1 for the atrophy stat, etc. Different
+// dimensions use different LCG iterations so the per-dim masks are
+// independent.
+fn sa_apply_masks(s, x, k_dim) {
+    let soul_id = s[SA_SOUL_ID]
+    let round_id = s[SA_ROUND_ID]
+    let peers = s[SA_PEERS]
+    let masked = x
+    let i = 0
+    while i < len(peers) {
+        let peer_id = peers[i][SA_PEER_ID]
+        let mask = sa_mask_for_peer(s, peer_id, round_id, k_dim)
+        let cmp = sa_id_compare(soul_id, peer_id)
+        if cmp < 0 {
+            // soul_id < peer_id -> add +mask
+            masked = masked + mask
+        }
+        if cmp > 0 {
+            // soul_id > peer_id -> subtract mask
+            masked = masked - mask
+        }
+        // cmp == 0 (own id; shouldn't happen but defensive): no-op.
+        i = i + 1
+    }
+    return masked
+}
+
+// Convenience: apply masks to TWO stats (the typical promotion + atrophy
+// pair). Returns a [masked_promo, masked_atr] list.
+fn sa_apply_masks_pair(s, x_promo, x_atr) {
+    let mp = sa_apply_masks(s, x_promo, 0)
+    let ma = sa_apply_masks(s, x_atr, 1)
+    let out = list_new()
+    push(out, mp)
+    push(out, ma)
+    return out
+}
+
+// ---- P3.8r dropout reconciliation ---------------------------------------
+// When a soul k vanishes mid-round, the surviving souls' masked submissions
+// still carry the +/- m_ik terms that would have been cancelled by k's
+// submission. Each surviving soul i must REMOVE its (now-uncancelled)
+// contribution against k from its already-sent masked_x_i so the
+// coordinator's sum over the SURVIVORS still equals Σ_{i != k} x_i.
+//
+// Original masking: masked_x_i = x_i + Σ_{j>i} m_ij - Σ_{j<i} m_ji.
+// If peer k drops:
+//   - if i < k -> i had ADDED +m_ik, so adjusted_x_i = masked_x_i - m_ik
+//   - if i > k -> i had SUBTRACTED -m_ki, so adjusted_x_i = masked_x_i + m_ki
+//   - if i == k -> defensive no-op (the dropped soul itself doesn't reconcile)
+//   - if k is not a registered peer -> no-op (the soul didn't add/sub any
+//     mask against k anyway)
+//
+// LCG determinism is critical here: the soul MUST derive the EXACT SAME
+// mask used during sa_apply_masks to be able to subtract it back out. The
+// existing sa_mask_for_peer is purely deterministic (token + round + k_dim
+// -> mask), so calling it again produces the same value. We verify in
+// tests/unit/test_secure_aggregation.nova with the
+// test_sa_recompute_without_determinism case.
+//
+// sa_recompute_without computes the SIGNED mask contribution this soul
+// added against the dropped peer in the named k_dim. The surviving soul
+// SUBTRACTS this value from its masked_x_i to undo its participation:
+//   delta = sa_recompute_without(s, dropped_id, k_dim)
+//   adjusted_x_i = masked_x_i - delta
+// Returns 0 if the dropped id was not a peer, or if the dropped id equals
+// the soul's own id (defensive: a soul never masked against itself).
+fn sa_recompute_without(s, dropped_id, k_dim) {
+    let soul_id = s[SA_SOUL_ID]
+    if _sa_str_eq(soul_id, dropped_id) == 1 { return 0 }
+    let round_id = s[SA_ROUND_ID]
+    let token = sa_token_for_peer(s, dropped_id)
+    if token == 0 { return 0 }
+    let mask = sa_mask_for_peer(s, dropped_id, round_id, k_dim)
+    let cmp = sa_id_compare(soul_id, dropped_id)
+    if cmp < 0 { return mask }
+    if cmp > 0 { return 0 - mask }
+    return 0
+}
+
+// Pair variant: returns [delta_promo, delta_atr] -- the signed
+// contributions to subtract from a 2-dim (promotion + atrophy) masked
+// pair. Conventional wrapper so callers don't dual-call by hand.
+fn sa_recompute_without_pair(s, dropped_id) {
+    let dp = sa_recompute_without(s, dropped_id, 0)
+    let da = sa_recompute_without(s, dropped_id, 1)
+    let out = list_new()
+    push(out, dp)
+    push(out, da)
+    return out
+}
+
+// One-shot reconciliation: given the already-sent masked_x (single
+// dimension) and the id of the dropped peer, return the adjusted value
+// that the coordinator can sum across SURVIVORS. Equivalent to
+// `masked_x - sa_recompute_without(s, dropped_id, k_dim)` but the
+// helper documents the calling contract (subtract once per dropped peer).
+fn sa_reconcile_for_dropped(s, masked_x, dropped_id, k_dim) {
+    let delta = sa_recompute_without(s, dropped_id, k_dim)
+    return masked_x - delta
+}
+
+// Pair variant of sa_reconcile_for_dropped. Returns [adj_promo, adj_atr].
+fn sa_reconcile_for_dropped_pair(s, masked_promo, masked_atr, dropped_id) {
+    let dp = sa_recompute_without(s, dropped_id, 0)
+    let da = sa_recompute_without(s, dropped_id, 1)
+    let out = list_new()
+    push(out, masked_promo - dp)
+    push(out, masked_atr - da)
+    return out
+}
+
+// ---- wire formatters -----------------------------------------------------
+fn sa_format_hello_line() {
+    return SECAGG_HELLO_V2SA_LINE + "\n"
+}
+
+fn sa_format_ok_line() {
+    return SECAGG_OK_V2SA_LINE + "\n"
+}
+
+fn sa_format_peer_line(peer_id, token) {
+    return SECAGG_PEER_PREFIX + peer_id + " " + token + "\n"
+}
+
+fn sa_format_stat_masked_line(round_id, source_tag, masked_promo, masked_atr) {
+    return SECAGG_STAT_MASKED_PREFIX + int_to_str(round_id) + " "
+        + source_tag + " "
+        + int_to_str(masked_promo) + " "
+        + int_to_str(masked_atr) + "\n"
+}
+
+fn sa_format_aggregate_sum_line(round_id, source_tag, sum_promo, sum_atr, n_part) {
+    return SECAGG_AGG_SUM_PREFIX + int_to_str(round_id) + " "
+        + source_tag + " "
+        + int_to_str(sum_promo) + " "
+        + int_to_str(sum_atr) + " "
+        + int_to_str(n_part) + "\n"
+}
+
+// P3.8r FED_DROPOUT wire formatter (coord -> all survivors).
+//   FED_DROPOUT <round_id> <dropped_soul_id>
+fn sa_format_dropout_line(round_id, dropped_soul_id) {
+    return SECAGG_DROPOUT_PREFIX + int_to_str(round_id) + " "
+        + dropped_soul_id + "\n"
+}
+
+// P3.8r FED_RECON_MASKED wire formatter (soul -> coord).
+//   FED_RECON_MASKED <round_id> <soul_id> <source_tag> <adj_promo> <adj_atr>
+fn sa_format_recon_masked_line(round_id, soul_id, source_tag, adj_promo, adj_atr) {
+    return SECAGG_RECON_MASKED_PREFIX + int_to_str(round_id) + " "
+        + soul_id + " "
+        + source_tag + " "
+        + int_to_str(adj_promo) + " "
+        + int_to_str(adj_atr) + "\n"
+}
+
+// P3.9 FED_DH_PUBLIC wire formatter (soul -> coord during round setup,
+// then coord -> all souls in broadcast).
+//   FED_DH_PUBLIC <soul_id> <pubkey_hex>
+fn sa_format_dh_public_line(soul_id, pubkey_hex) {
+    return SECAGG_DH_PUBLIC_PREFIX + soul_id + " " + pubkey_hex + "\n"
+}
+
+// ---- coordinator-side sum accumulator ------------------------------------
+// The coordinator's job under SecAgg is much simpler than under
+// DP-only: just SUM the masked values per source. The mask
+// cancellation means the sum equals the sum of raw contributions --
+// the coordinator never learns the individual raw values.
+//
+// Accumulator layout:
+//   [ACC_TAG, round_id, list of [source_tag, sum_promo, sum_atr, n_part]]
+let SA_ACC_TAG       = 0
+let SA_ACC_ROUND     = 1
+let SA_ACC_ROWS      = 2
+let SA_ACC_OBJ_TAG   = 7502
+
+// Per-row layout under SA_ACC_ROWS:
+//   [source_tag, sum_promo, sum_atr, n_part]
+let SA_ACR_TAG    = 0
+let SA_ACR_PROMO  = 1
+let SA_ACR_ATR    = 2
+let SA_ACR_NPART  = 3
+
+fn sa_acc_new(round_id) {
+    let a = list_new()
+    push(a, SA_ACC_OBJ_TAG)
+    push(a, round_id)
+    push(a, list_new())
+    return a
+}
+
+fn sa_acc_round_id(a) { return a[SA_ACC_ROUND] }
+fn sa_acc_rows(a)     { return a[SA_ACC_ROWS] }
+fn sa_acc_count(a)    { return len(a[SA_ACC_ROWS]) }
+
+// Add one masked-stat record. The same source tag from the same round
+// just sums; participant count bumps once per contribution. We DO NOT
+// average -- the coordinator broadcasts the SUM, the soul divides by
+// n_participants to recover the average. This split is the SecAgg
+// audit-readable contract: the coordinator only ever sees + computes
+// sums; it never directly receives a per-soul value.
+fn sa_acc_add_masked(a, source_tag, masked_promo, masked_atr) {
+    let rows = a[SA_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        if _sa_str_eq(rows[i][SA_ACR_TAG], source_tag) == 1 {
+            let row = rows[i]
+            list_set(row, SA_ACR_PROMO, row[SA_ACR_PROMO] + masked_promo)
+            list_set(row, SA_ACR_ATR, row[SA_ACR_ATR] + masked_atr)
+            list_set(row, SA_ACR_NPART, row[SA_ACR_NPART] + 1)
+            return 1
+        }
+        i = i + 1
+    }
+    let row = list_new()
+    push(row, source_tag)
+    push(row, masked_promo)
+    push(row, masked_atr)
+    push(row, 1)
+    push(rows, row)
+    return 1
+}
+
+// Get the sums per source. Returns a list of
+// [source_tag, sum_promo, sum_atr, n_part] rows. The coordinator
+// broadcasts these as FED_AGGREGATE_SUM lines (the soul side divides
+// by n_part if it wants the average).
+fn sa_acc_sums(a) {
+    let out = list_new()
+    let rows = a[SA_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        let row = rows[i]
+        let r = list_new()
+        push(r, row[SA_ACR_TAG])
+        push(r, row[SA_ACR_PROMO])
+        push(r, row[SA_ACR_ATR])
+        push(r, row[SA_ACR_NPART])
+        push(out, r)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- env helpers ---------------------------------------------------------
+// Read CE_SECAGG_ENABLED from the env. Returns 1 iff the env var is
+// set to a non-empty, non-"0" value. Empty / unset / "0" -> 0
+// (backwards compatible default: P3.7's trusted-coordinator mode).
+fn sa_enabled_from_env() {
+    let env = getenv("CE_SECAGG_ENABLED")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if _sa_str_eq(env, "0") == 1 { return 0 }
+    return 1
+}
+
+// Read the pre-shared token for a specific peer. Mirrors the
+// CE_FED_TOKEN env convention, but per-peer:
+//   CE_FED_TOKEN_<peer_id>="<shared-secret>"
+// Returns the token string, or 0 if not set.
+fn sa_peer_token_from_env(peer_id) {
+    let env_key = "CE_FED_TOKEN_" + peer_id
+    let env = getenv(env_key)
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    return env
+}
+
+// Read CE_FED_ROUND_DEADLINE_MS from env. Returns the per-soul receive
+// deadline in milliseconds (caller converts to ns if needed). Default
+// 5000 ms (the P3.8r dropout-resilience default per the brief). Capped
+// at 60_000 ms (1 minute) so a typo in the env can't lock the
+// coordinator for an arbitrary length of time. Below 100 ms is rounded
+// up to 100 to avoid wedging the coordinator into an aggressive
+// false-positive dropout loop on a slow handshake.
+fn sa_round_deadline_ms_from_env() {
+    let env = getenv("CE_FED_ROUND_DEADLINE_MS")
+    if env == 0 { return 5000 }
+    if len(env) == 0 { return 5000 }
+    let v = _sa_str_to_int(env)
+    if v <= 0 { return 5000 }
+    if v < 100 { return 100 }
+    if v > 60000 { return 60000 }
+    return v
+}
+
+// Read the list of peer ids from CE_SECAGG_PEERS (comma-separated).
+// Returns a list of peer-id strings. For each id returned, the caller
+// should look up the corresponding CE_FED_TOKEN_<id> env var.
+fn sa_peer_ids_from_env() {
+    let out = list_new()
+    let env = getenv("CE_SECAGG_PEERS")
+    if env == 0 { return out }
+    if len(env) == 0 { return out }
+    let i = 0
+    let start = 0
+    while i < len(env) {
+        if char_at(env, i) == 44 {  // ','
+            if i > start {
+                push(out, substr(env, start, i - start))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if len(env) > start {
+        push(out, substr(env, start, len(env) - start))
+    }
+    return out
+}
+
+// ---- local parsers (small, SecAgg-only) ----------------------------------
+// These mirror the kg_sync SECAGG_* parser branches added under
+// ADR-0055 (the brief asks for that branch as an additive case in
+// kg_sync.nova; this module needs a self-contained copy because the
+// chat cannot import kg_sync directly -- see the existing
+// federated_aggregator.nova comment block on the snapshot_disk +
+// kg_sync `_starts_with` TU-scope collision).
+
+fn _sa_starts_with(s, prefix) {
+    let pn = len(prefix)
+    if len(s) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sa_strip_eol(s) {
+    let n = len(s)
+    let done = 0
+    while done == 0 {
+        if n <= 0 { done = 1 }
+        if done == 0 {
+            let c = char_at(s, n - 1)
+            if c == 10 { n = n - 1 }
+            else { if c == 13 { n = n - 1 } else { done = 1 } }
+        }
+    }
+    return substr(s, 0, n)
+}
+
+fn _sa_split_spaces(s) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            push(out, substr(s, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, substr(s, start, len(s) - start))
+    return out
+}
+
+fn _sa_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    let start = 0
+    if char_at(s, 0) == 45 { start = 1 }  // allow leading '-'
+    if start >= len(s) { return 0 }
+    let i2 = start
+    while i2 < len(s) {
+        let c = char_at(s, i2)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        i2 = i2 + 1
+    }
+    return 1
+}
+
+fn _sa_str_to_int(s) {
+    let n = 0
+    let i = 0
+    let neg = 0
+    if len(s) > 0 {
+        if char_at(s, 0) == 45 { neg = 1 i = 1 }
+    }
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    if neg == 1 { return 0 - n }
+    return n
+}
+
+// Parse SECAGG_PEER <peer_id> <token>
+fn sa_parse_peer_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_PEER_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "SECAGG_PEER") == 0 { return 0 }
+    if len(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_PEER)
+    push(rec, toks[1])
+    push(rec, toks[2])
+    return rec
+}
+
+// Parse FED_STAT_MASKED <round> <source_tag> <masked_promo> <masked_atr>
+fn sa_parse_stat_masked_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_STAT_MASKED_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 5 { return 0 }
+    if str_eq(toks[0], "FED_STAT_MASKED") == 0 { return 0 }
+    if _sa_is_digits(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    if _sa_is_digits(toks[3]) == 0 { return 0 }
+    if _sa_is_digits(toks[4]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_STAT_MASKED)
+    push(rec, _sa_str_to_int(toks[1]))
+    push(rec, toks[2])
+    push(rec, _sa_str_to_int(toks[3]))
+    push(rec, _sa_str_to_int(toks[4]))
+    return rec
+}
+
+// Parse FED_AGGREGATE_SUM <round> <source_tag> <sum_p> <sum_a> <n>
+fn sa_parse_aggregate_sum_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_AGG_SUM_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 6 { return 0 }
+    if str_eq(toks[0], "FED_AGGREGATE_SUM") == 0 { return 0 }
+    if _sa_is_digits(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    if _sa_is_digits(toks[3]) == 0 { return 0 }
+    if _sa_is_digits(toks[4]) == 0 { return 0 }
+    if _sa_is_digits(toks[5]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_AGG_SUM)
+    push(rec, _sa_str_to_int(toks[1]))
+    push(rec, toks[2])
+    push(rec, _sa_str_to_int(toks[3]))
+    push(rec, _sa_str_to_int(toks[4]))
+    push(rec, _sa_str_to_int(toks[5]))
+    return rec
+}
+
+// Parse FED_DROPOUT <round_id> <dropped_soul_id>
+// Returns [SECAGG_EV_DROPOUT, round_id, dropped_soul_id] or 0.
+fn sa_parse_dropout_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_DROPOUT_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "FED_DROPOUT") == 0 { return 0 }
+    if _sa_is_digits(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_DROPOUT)
+    push(rec, _sa_str_to_int(toks[1]))
+    push(rec, toks[2])
+    return rec
+}
+
+// Parse FED_RECON_MASKED <round_id> <soul_id> <source_tag> <adj_promo> <adj_atr>
+// Returns [SECAGG_EV_RECON_MASKED, round_id, soul_id, tag, adj_promo, adj_atr] or 0.
+// Reconciled values can be negative (the dropped peer's mask subtraction
+// can leave a negative residual), so the parser accepts a leading '-'.
+fn sa_parse_recon_masked_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_RECON_MASKED_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 6 { return 0 }
+    if str_eq(toks[0], "FED_RECON_MASKED") == 0 { return 0 }
+    if _sa_is_digits(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    if len(toks[3]) == 0 { return 0 }
+    if _sa_is_digits(toks[4]) == 0 { return 0 }
+    if _sa_is_digits(toks[5]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_RECON_MASKED)
+    push(rec, _sa_str_to_int(toks[1]))
+    push(rec, toks[2])
+    push(rec, toks[3])
+    push(rec, _sa_str_to_int(toks[4]))
+    push(rec, _sa_str_to_int(toks[5]))
+    return rec
+}
+
+// Parse FED_DH_PUBLIC <soul_id> <pubkey_hex>
+// Returns [SECAGG_EV_DH_PUBLIC, soul_id, pubkey_hex] or 0.
+fn sa_parse_dh_public_line(text) {
+    let line = _sa_strip_eol(text)
+    if _sa_starts_with(line, SECAGG_DH_PUBLIC_PREFIX) == 0 { return 0 }
+    let toks = _sa_split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "FED_DH_PUBLIC") == 0 { return 0 }
+    if len(toks[1]) == 0 { return 0 }
+    if len(toks[2]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, SECAGG_EV_DH_PUBLIC)
+    push(rec, toks[1])
+    push(rec, toks[2])
+    return rec
+}
+
+// Top-level dispatch -- handles the events the soul / coord receives.
+fn sa_parse_line(text) {
+    let line = _sa_strip_eol(text)
+    if len(line) == 0 { return 0 }
+    if str_eq(line, SECAGG_HELLO_V2SA_LINE) == 1 {
+        let rec = list_new()
+        push(rec, SECAGG_EV_HELLO)
+        return rec
+    }
+    if _sa_starts_with(line, SECAGG_PEER_PREFIX) == 1 { return sa_parse_peer_line(line) }
+    if _sa_starts_with(line, SECAGG_STAT_MASKED_PREFIX) == 1 { return sa_parse_stat_masked_line(line) }
+    if _sa_starts_with(line, SECAGG_AGG_SUM_PREFIX) == 1 { return sa_parse_aggregate_sum_line(line) }
+    // P3.8r dropout-resilience dispatch (additive case).
+    if _sa_starts_with(line, SECAGG_DROPOUT_PREFIX) == 1 { return sa_parse_dropout_line(line) }
+    if _sa_starts_with(line, SECAGG_RECON_MASKED_PREFIX) == 1 { return sa_parse_recon_masked_line(line) }
+    // P3.9 DH key-agreement dispatch (additive case).
+    if _sa_starts_with(line, SECAGG_DH_PUBLIC_PREFIX) == 1 { return sa_parse_dh_public_line(line) }
+    return 0
+}
+
+// Reverse the SUM-to-AVG conversion: given a FED_AGGREGATE_SUM row
+// (sum_promo, sum_atr, n_part), compute the per-soul average. This
+// lets the soul recover the federation-wide AVERAGE from the
+// coordinator's SUM. n_part == 0 -> returns [0, 0] defensively.
+fn sa_sum_to_avg(sum_promo, sum_atr, n_part) {
+    let out = list_new()
+    if n_part <= 0 {
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    push(out, sum_promo / n_part)
+    push(out, sum_atr / n_part)
+    return out
+}

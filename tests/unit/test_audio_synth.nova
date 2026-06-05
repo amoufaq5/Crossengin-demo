@@ -1,0 +1,883 @@
+// Unit tests for src/io/effectors/audio_synth.nova
+//
+// Verifies the Phase 19 Tier-4 #1 minimum-viable audio modality bridge:
+// WAV header bytes, sine generation (peak / zero crossings / scale),
+// per-phoneme duration, text-level concatenation, and the on-disk WAV write
+// path (read back the first 4 bytes via sys_open + sys_read and check RIFF).
+//
+// P2.6: extends the suite with Klatt-style two-formant synthesis tests --
+// vowel amplitude statistics (peak-to-peak / RMS / no-clipping bounds),
+// fricative vs vowel zero-crossing rate (noise vs tonal), plosive silence-
+// then-burst shape (RMS by region), anti-click ADSR envelope verified by
+// max-abs window growth, LCG determinism (seeded twice -> same sequence),
+// phoneme formant table (F1/F2/F3 + kind dispatch), and CE_SYNTH_MODE
+// selector defaults.
+// All integer math; no LLM.
+
+import "std/syscall"
+import "../ce_test.nova"
+import "../../src/io/effectors/audio_synth.nova"
+
+// Helper since NOVA has no `abs`.
+fn _abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn _sl3(a, b, c) {
+    let l = list_new()
+    push(l, a) push(l, b) push(l, c)
+    return l
+}
+
+fn _zero_samples(n) {
+    let l = list_new()
+    let i = 0
+    while i < n { push(l, 0); i = i + 1 }
+    return l
+}
+
+// ---- WAV header -----------------------------------------------------------
+
+fn test_wav_header_riff() {
+    let h = wav_header(8000, 1000)
+    ce_eq("header is 44 bytes", len(h), 44)
+    ce_eq("byte 0 == 'R'", h[0], 82)
+    ce_eq("byte 1 == 'I'", h[1], 73)
+    ce_eq("byte 2 == 'F'", h[2], 70)
+    ce_eq("byte 3 == 'F'", h[3], 70)
+    // "WAVE" at 8..11
+    ce_eq("byte 8 == 'W'",  h[8],  87)
+    ce_eq("byte 9 == 'A'",  h[9],  65)
+    ce_eq("byte 10 == 'V'", h[10], 86)
+    ce_eq("byte 11 == 'E'", h[11], 69)
+    // "data" -- the canonical PCM chunk marker at 36..39 (the header
+    // ENDS with the data-chunk identifier, followed by its 4-byte size).
+    ce_eq("byte 36 == 'd'", h[36], 100)
+    ce_eq("byte 37 == 'a'", h[37], 97)
+    ce_eq("byte 38 == 't'", h[38], 116)
+    ce_eq("byte 39 == 'a'", h[39], 97)
+}
+
+fn test_wav_header_fields() {
+    let h = wav_header(8000, 1000)
+    // PCM format (1) at 20..21
+    ce_eq("audio format = 1", h[20], 1)
+    ce_eq("audio format hi byte = 0", h[21], 0)
+    // n channels (1) at 22..23
+    ce_eq("n channels = 1", h[22], 1)
+    // sample rate LE at 24..27: 8000 = 0x1F40 -> 0x40,0x1F,0x00,0x00
+    ce_eq("sample rate byte 0", h[24], 64)        // 0x40
+    ce_eq("sample rate byte 1", h[25], 31)        // 0x1F
+    ce_eq("sample rate byte 2", h[26], 0)
+    ce_eq("sample rate byte 3", h[27], 0)
+    // data size at 40..43 = 2000 = 0x07D0 -> 0xD0,0x07,0x00,0x00
+    ce_eq("data size byte 0", h[40], 208)         // 0xD0
+    ce_eq("data size byte 1", h[41], 7)
+    ce_eq("data size byte 2", h[42], 0)
+    ce_eq("data size byte 3", h[43], 0)
+}
+
+// ---- synth_sine -----------------------------------------------------------
+
+fn test_synth_sine_count_and_shape() {
+    let s = synth_sine(440, 8000, 8000)
+    ce_eq("8000 samples", len(s), 8000)
+    // Sine starts at 0 (phase 0).
+    ce_check("first sample near zero", _abs(s[0]) <= 200)
+    // Find max / min across the buffer; should be near +AUDIO_AMPLITUDE
+    // (16000) and -AUDIO_AMPLITUDE respectively (within a Bhaskara tolerance).
+    let mx = s[0]
+    let mn = s[0]
+    let i = 0
+    while i < len(s) {
+        if s[i] > mx { mx = s[i] }
+        if s[i] < mn { mn = s[i] }
+        i = i + 1
+    }
+    ce_check("max ~ +16000", mx >= 15500 && mx <= 16000)
+    ce_check("min ~ -16000", mn <= 0 - 15500 && mn >= 0 - 16000)
+}
+
+fn test_synth_sine_zero_first_and_last() {
+    // At 1 Hz sampled at 1000 samples / 1 sec, the wave completes one period
+    // exactly, so first AND last samples are at 0 phase (both near zero).
+    let s = synth_sine(1, 1000, 1000)
+    ce_eq("1000 samples", len(s), 1000)
+    ce_check("first sample near zero", _abs(s[0]) <= 200)
+    ce_check("last sample near zero",  _abs(s[len(s) - 1]) <= 200)
+}
+
+fn test_synth_sine_silent_on_zero_count() {
+    let s = synth_sine(440, 0, 8000)
+    ce_eq("zero samples requested -> zero produced", len(s), 0)
+}
+
+// ---- synth_phoneme --------------------------------------------------------
+
+fn test_synth_phoneme_duration() {
+    let s = synth_phoneme("a")
+    // 150ms at 8000Hz = 1200 samples (the AUDIO_PHONEME_SAMPLES invariant).
+    ce_eq("a phoneme is 1200 samples", len(s), 1200)
+    // Envelope: the first sample is at zero gain (ramped down to nothing).
+    ce_eq("envelope zero at start", s[0], 0)
+    // Mid-buffer should hit close to the carrier amplitude (the envelope is
+    // 1.0 in the sustain region). Scan for the absolute peak.
+    let mx = 0
+    let i = 0
+    while i < len(s) {
+        let v = _abs(s[i])
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    ce_check("envelope peak ~ 16000", mx >= 15500 && mx <= 16000)
+}
+
+fn test_synth_phoneme_unknown_fallback() {
+    let s = synth_phoneme("xx-unknown-xx")
+    ce_eq("unknown phoneme still 1200 samples", len(s), 1200)
+}
+
+fn test_synth_phoneme_fricative() {
+    // Fricatives ('s') use a high carrier (3500 Hz) but the duration
+    // invariant still holds.
+    let s = synth_phoneme("s")
+    ce_eq("fricative still 1200 samples", len(s), 1200)
+}
+
+// ---- synth_text -----------------------------------------------------------
+
+fn test_synth_text_minimum_length() {
+    // 5 fallback per-character phonemes -> 5 * 1200 = 6000 samples; brief
+    // asks for at least 1500 ("5 phonemes worth").
+    let s = synth_text("hello", 0)
+    ce_check("hello samples >= 1500", len(s) >= 1500)
+    ce_check("hello samples >= 6000",  len(s) >= 6000)
+}
+
+fn test_synth_text_multiword() {
+    let s1 = synth_text("hello",       0)
+    let s2 = synth_text("hello world", 0)
+    ce_check("two words longer than one", len(s2) > len(s1))
+}
+
+fn test_synth_text_empty_input() {
+    let s = synth_text("", 0)
+    ce_eq("empty input -> no samples", len(s), 0)
+}
+
+fn test_synth_text_uses_lang_phonemes() {
+    // When the language KG has phoneme atoms attached to a word, synth_text
+    // emits one phoneme per registered phoneme atom -- proving the lang-KG
+    // path is taken in preference to the per-character fallback.
+    let reg = kg_registry_new()
+    let lang = lang_kg_init(reg)
+    let w = word_atom_new(lang, "asp", 0)
+    // 3 phonemes: a, s, p. Expect 3 * 1200 = 3600 samples (not 3 chars * 1200
+    // via fallback -- they're the same here by coincidence, so we add a
+    // length-mismatch check below).
+    word_set_phonemes(lang, w, _sl3("a", "s", "p"), 0)
+    let s = synth_text("asp", lang)
+    ce_eq("three phonemes -> 3600 samples", len(s), 3600)
+}
+
+fn test_synth_text_lang_overrides_fallback_count() {
+    // Same word with 5 recorded phonemes -> KG path wins -> 5 * 1200 = 6000,
+    // not the 3-char fallback's 3 * 1200 = 3600. Distinguishes the two paths.
+    let reg = kg_registry_new()
+    let lang = lang_kg_init(reg)
+    let w = word_atom_new(lang, "asp", 0)
+    let pl = list_new()
+    push(pl, "a") push(pl, "e") push(pl, "i") push(pl, "o") push(pl, "u")
+    word_set_phonemes(lang, w, pl, 0)
+    let s = synth_text("asp", lang)
+    ce_eq("five phonemes -> 6000 samples", len(s), 6000)
+}
+
+// ---- audio_write_wav ------------------------------------------------------
+
+fn test_write_wav_returns_1() {
+    let z = _zero_samples(3)
+    let ok = audio_write_wav(z, "/tmp/ce_test_audio.wav")
+    ce_eq("write_wav success", ok, 1)
+}
+
+fn test_write_wav_starts_with_RIFF() {
+    let z = _zero_samples(3)
+    audio_write_wav(z, "/tmp/ce_test_audio.wav")
+    let fd = sys_open("/tmp/ce_test_audio.wav", O_RDONLY, 0)
+    ce_check("file opens after write", fd >= 0)
+    let buf = alloc(8)
+    let n = sys_read(fd, buf, 4)
+    sys_close(fd)
+    ce_eq("read 4 bytes", n, 4)
+    ce_eq("first byte 'R'", load8(buf),     82)
+    ce_eq("byte 1 'I'",     load8(buf + 1), 73)
+    ce_eq("byte 2 'F'",     load8(buf + 2), 70)
+    ce_eq("byte 3 'F'",     load8(buf + 3), 70)
+}
+
+fn test_write_wav_size_includes_header() {
+    // 10 samples -> 20 PCM bytes + 44 header = 64 bytes total.
+    let z = _zero_samples(10)
+    audio_write_wav(z, "/tmp/ce_test_audio.wav")
+    let fd = sys_open("/tmp/ce_test_audio.wav", O_RDONLY, 0)
+    ce_check("file opens", fd >= 0)
+    let buf = alloc(128)
+    let n = sys_read(fd, buf, 128)
+    sys_close(fd)
+    ce_eq("file is 64 bytes", n, 64)
+}
+
+// ---- P2.6 Klatt synthesis additions ---------------------------------------
+
+fn _max_abs(s, lo, hi) {
+    let m = 0
+    let i = lo
+    while i < hi && i < len(s) {
+        let v = _abs(s[i])
+        if v > m { m = v }
+        i = i + 1
+    }
+    return m
+}
+
+fn _max_sample(s, lo, hi) {
+    let m = 0 - 999999
+    let i = lo
+    while i < hi && i < len(s) {
+        if s[i] > m { m = s[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn _min_sample(s, lo, hi) {
+    let m = 999999
+    let i = lo
+    while i < hi && i < len(s) {
+        if s[i] < m { m = s[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// Sum-of-abs proxy for RMS: avoids squaring (which would risk the
+// loop-multiply pointer threshold) but discriminates noise vs silence vs
+// tone just as cleanly for our purposes.
+fn _sum_abs(s, lo, hi) {
+    let sum = 0
+    let i = lo
+    while i < hi && i < len(s) {
+        sum = sum + _abs(s[i])
+        i = i + 1
+    }
+    return sum
+}
+
+// Count sign-change zero-crossings in samples[lo..hi].
+fn _zero_crossings(s, lo, hi) {
+    let zc = 0
+    let i = lo + 1
+    while i < hi && i < len(s) {
+        let a = s[i - 1]
+        let b = s[i]
+        if a >= 0 && b < 0 { zc = zc + 1 }
+        if a < 0 && b >= 0 { zc = zc + 1 }
+        i = i + 1
+    }
+    return zc
+}
+
+// ---- formant table --------------------------------------------------------
+
+fn test_phoneme_formants_vowel() {
+    // "a" (father) -> F1=730, F2=1090, F3=2440, kind=VOWEL (1).
+    let f = phoneme_formants("a")
+    ce_eq("a formants list size", len(f), 4)
+    ce_eq("a F1", f[0], 730)
+    ce_eq("a F2", f[1], 1090)
+    ce_eq("a F3", f[2], 2440)
+    ce_eq("a kind = VOWEL", f[3], 1)
+}
+
+fn test_phoneme_formants_kinds() {
+    // Plosive 'p' -> kind=2
+    let p = phoneme_formants("p")
+    ce_eq("p kind = PLOSIVE", p[3], 2)
+    // Fricative 's' -> kind=3
+    let s = phoneme_formants("s")
+    ce_eq("s kind = FRICATIVE", s[3], 3)
+    // Nasal 'n' -> kind=4
+    let n = phoneme_formants("n")
+    ce_eq("n kind = NASAL", n[3], 4)
+    // Unknown -> kind=0
+    let u = phoneme_formants("xx-unknown-xx")
+    ce_eq("unknown kind = UNKNOWN", u[3], 0)
+    ce_eq("unknown F1 = 440 fallback", u[0], 440)
+}
+
+// ---- vowel amplitude statistics ------------------------------------------
+
+fn test_vowel_a_amplitude_stats() {
+    audio_synth_mode_reset()
+    let s = synth_phoneme("a")
+    ce_eq("a is 1200 samples", len(s), 1200)
+    // Peak-to-peak amplitude > 5000 -- the Klatt vowel sums F1 + F2 to
+    // ~AUDIO_AMPLITUDE peak; even with the envelope ramps the sustain
+    // region peaks well above 5000.
+    let mx = _max_sample(s, 0, len(s))
+    let mn = _min_sample(s, 0, len(s))
+    ce_check("peak-to-peak > 5000", (mx - mn) > 5000)
+    // No clipping: max sample < 32000 (the Klatt sum is bounded by
+    // AUDIO_AMPLITUDE = 16000, well under PCM16 ceiling 32767).
+    ce_check("no clipping (max < 32000)", mx < 32000)
+    ce_check("no clipping (min > -32000)", mn > 0 - 32000)
+    // Sum-abs proxy for RMS over the sustain region (skip attack/release)
+    // should be well above 2000 * (range size).
+    let sustain_n = 800       // samples 200..1000 = sustain heart
+    let sa = _sum_abs(s, 200, 1000)
+    let rms_proxy = sa / sustain_n
+    ce_check("sustain RMS proxy > 2000", rms_proxy > 2000)
+}
+
+// ---- fricative vs vowel zero-crossing rate -------------------------------
+
+fn test_fricative_higher_zcr_than_vowel() {
+    audio_synth_mode_reset()
+    audio_lcg_reset()
+    let v = synth_phoneme("a")           // vowel: tonal
+    audio_lcg_reset()
+    let f = synth_phoneme("s")           // fricative: noisy
+    // Count over the inner 800 samples (skip attack/release).
+    let v_zc = _zero_crossings(v, 200, 1000)
+    let f_zc = _zero_crossings(f, 200, 1000)
+    ce_check("fricative zcr > vowel zcr", f_zc > v_zc)
+    // Fricative should be MUCH higher than vowel (>= 1.5x typically).
+    ce_check("fricative zcr at least 1.5x vowel", f_zc * 10 >= v_zc * 15)
+}
+
+// ---- plosive silence-then-burst shape ------------------------------------
+
+fn test_plosive_silence_then_burst() {
+    audio_synth_mode_reset()
+    audio_lcg_reset()
+    let p = synth_phoneme("p")
+    ce_eq("p is 1200 samples", len(p), 1200)
+    // 5 ms silence = 40 samples; first 40 should sum to zero.
+    let pre_sum = _sum_abs(p, 0, 40)
+    ce_eq("first 40 samples are silence (sum_abs == 0)", pre_sum, 0)
+    // 30 ms burst from sample 40 to sample 280; mean amplitude well > 1000.
+    let burst_sum = _sum_abs(p, 40, 280)
+    let burst_mean = burst_sum / 240
+    ce_check("burst mean abs > 1000", burst_mean > 1000)
+    // The first 30 ms (== 240 samples) span 0..40 silence + 200 burst;
+    // for the test invariant the brief calls out, the silence region (first
+    // 40 samples) has RMS ~0 and the burst region has RMS >> 1000.
+    let burst_max = _max_abs(p, 40, 280)
+    ce_check("burst peak > 1000", burst_max > 1000)
+    // Trailing region (280..1200) should be silence again.
+    let trail_sum = _sum_abs(p, 280, 1200)
+    ce_eq("trailing samples all silence", trail_sum, 0)
+}
+
+// ---- anti-click ADSR envelope --------------------------------------------
+
+fn test_envelope_attack_ramp() {
+    // Attack is 5 ms = 40 samples at 8 kHz. The brief asks for "monotonic-
+    // ally-increasing absolute amplitude in the first 40 samples". Since
+    // the wave oscillates within that window, we check that the max-abs
+    // over a window grows when the window moves later in the attack:
+    // max-abs[0..20] < max-abs[20..40] (the envelope gain has roughly
+    // doubled across that span).
+    audio_synth_mode_reset()
+    let s = synth_phoneme("a")
+    let early = _max_abs(s, 0, 20)
+    let late  = _max_abs(s, 20, 40)
+    ce_check("attack early peak < attack late peak", early < late)
+    ce_eq("first sample is exactly 0 (envelope start)", s[0], 0)
+}
+
+fn test_envelope_release_ramp() {
+    // Release is 10 ms = 80 samples at 8 kHz. Same pattern: max-abs[n-40..n]
+    // should be less than max-abs[n-80..n-40].
+    audio_synth_mode_reset()
+    let s = synth_phoneme("a")
+    let n = len(s)
+    let pre_release = _max_abs(s, n - 80, n - 40)
+    let in_release  = _max_abs(s, n - 40, n)
+    ce_check("release tail peak < pre-release peak", in_release < pre_release)
+    ce_eq("last sample is exactly 0 (envelope end)", s[n - 1], 0)
+}
+
+fn test_envelope_direct() {
+    // Apply the envelope directly to a flat 1200-sample buffer of all-
+    // AUDIO_AMPLITUDE values; verify the attack/release shape.
+    let buf = list_new()
+    let i = 0
+    while i < 1200 {
+        push(buf, 16000)
+        i = i + 1
+    }
+    audio_envelope(buf, 5, 0, 10, 8000)
+    // attack=40 samples, release=80 samples
+    ce_eq("envelope flat[0] == 0", buf[0], 0)
+    ce_eq("envelope flat[1199] == 0", buf[1199], 0)
+    // Mid-buffer (sustain) should be at full amplitude.
+    ce_eq("envelope flat[600] == 16000", buf[600], 16000)
+    // At sample 20 (halfway through 40-sample attack) gain ~= 500/1000.
+    ce_check("envelope flat[20] in [7000..9000]", buf[20] >= 7000 && buf[20] <= 9000)
+}
+
+// ---- LCG determinism -----------------------------------------------------
+
+fn test_lcg_determinism() {
+    audio_lcg_reset()
+    let a1 = audio_lcg_next(16000)
+    let a2 = audio_lcg_next(16000)
+    let a3 = audio_lcg_next(16000)
+    audio_lcg_reset()
+    let b1 = audio_lcg_next(16000)
+    let b2 = audio_lcg_next(16000)
+    let b3 = audio_lcg_next(16000)
+    ce_eq("LCG first sample after reset", a1, b1)
+    ce_eq("LCG second sample after reset", a2, b2)
+    ce_eq("LCG third sample after reset", a3, b3)
+}
+
+fn test_lcg_bounded() {
+    // Run the LCG for a chunk; every output must be in [-16000..+16000].
+    audio_lcg_reset()
+    let max_seen = 0
+    let min_seen = 0
+    let i = 0
+    while i < 200 {
+        let v = audio_lcg_next(16000)
+        if v > max_seen { max_seen = v }
+        if v < min_seen { min_seen = v }
+        i = i + 1
+    }
+    ce_check("LCG max <= 16000", max_seen <= 16000)
+    ce_check("LCG min >= -16000", min_seen >= 0 - 16000)
+    // Should cover a wide range (the noise should not be a constant).
+    ce_check("LCG range > 10000", max_seen - min_seen > 10000)
+}
+
+// ---- klatt vs sine A/B comparison ----------------------------------------
+
+fn test_klatt_differs_from_sine() {
+    // The explicit klatt and sine entry points should produce noticeably
+    // different sample sequences for the same phoneme. Count the differing
+    // samples over the first 100; should be > 50 (most samples differ).
+    let kl = synth_phoneme_klatt("a")
+    let si = synth_phoneme_sine("a")
+    ce_eq("klatt count", len(kl), 1200)
+    ce_eq("sine count", len(si), 1200)
+    let diffs = 0
+    let i = 0
+    while i < 100 {
+        if kl[i] != si[i] { diffs = diffs + 1 }
+        i = i + 1
+    }
+    ce_check("klatt and sine differ on > 50/100 of first samples", diffs > 50)
+}
+
+// ---- synth mode selector -------------------------------------------------
+
+fn test_synth_mode_default_klatt() {
+    audio_synth_mode_reset()
+    // Without CE_SYNTH_MODE the resolver returns klatt (1).
+    let m = audio_synth_mode()
+    ce_eq("default mode is klatt", m, 1)
+}
+
+// ---- nasal --------------------------------------------------------------
+
+fn test_nasal_has_damping() {
+    // Nasal 'n' has a linear-amplitude-decay damping factor (1000 -> 500
+    // across the buffer). max-abs in the first quarter should exceed
+    // max-abs in the last quarter (after the envelope-release tail).
+    audio_synth_mode_reset()
+    let s = synth_phoneme("n")
+    ce_eq("n is 1200 samples", len(s), 1200)
+    let early = _max_abs(s, 100, 300)
+    let late  = _max_abs(s, 700, 900)
+    ce_check("nasal early peak > late peak (damping)", early > late)
+}
+
+// ---- P6 expansion: full ~44-phoneme ARPAbet inventory ---------------------
+
+// Inventory size sanity check: the formant table should now expose 51
+// dispatches (44 distinct ARPAbet symbols + a few alias groups: a/aa/ah,
+// e/eh, i/iy, o/oh/ao, u/uw, h/hh).
+fn test_klatt_inventory_count() {
+    let n = klatt_phoneme_count()
+    ce_check("phoneme inventory >= 44", n >= 44)
+    let labels = klatt_phoneme_labels()
+    ce_eq("labels list matches count", len(labels), n)
+}
+
+// Every label in the canonical list should resolve to a non-UNKNOWN kind
+// (i.e. the dispatcher recognizes it). Catches typos when adding new
+// phonemes to the if-chain.
+fn test_every_label_is_recognized() {
+    let labels = klatt_phoneme_labels()
+    let i = 0
+    while i < len(labels) {
+        let lab = labels[i]
+        let f = phoneme_formants(lab)
+        ce_check("label resolves to known kind", f[3] != 0)
+        i = i + 1
+    }
+}
+
+// ---- new monophthongs (er, uh, ax, ix, axr, ao) ---------------------------
+
+fn test_vowel_er_formants() {
+    // ER (rhotacized vowel, as in "bird"): F1~490, F2~1350, F3~1690.
+    let f = phoneme_formants("er")
+    ce_eq("er kind = VOWEL", f[3], 1)
+    ce_check("er F1 in [400..550]",  f[0] >= 400 && f[0] <= 550)
+    ce_check("er F2 in [1200..1500]", f[1] >= 1200 && f[1] <= 1500)
+    ce_check("er F3 in [1500..1800]", f[2] >= 1500 && f[2] <= 1800)
+}
+
+fn test_vowel_uh_formants() {
+    // UH ("foot"): F1~440, F2~1020.
+    let f = phoneme_formants("uh")
+    ce_eq("uh kind = VOWEL", f[3], 1)
+    ce_check("uh F1 in [380..500]",  f[0] >= 380 && f[0] <= 500)
+    ce_check("uh F2 in [900..1100]", f[1] >= 900 && f[1] <= 1100)
+}
+
+fn test_vowel_ax_formants() {
+    // AX (schwa): F1~500, F2~1500.
+    let f = phoneme_formants("ax")
+    ce_eq("ax kind = VOWEL", f[3], 1)
+    ce_check("ax F1 in [400..600]", f[0] >= 400 && f[0] <= 600)
+    ce_check("ax F2 in [1300..1700]", f[1] >= 1300 && f[1] <= 1700)
+}
+
+fn test_new_monophthong_audible() {
+    // ER should synthesize audible (non-silent) output.
+    audio_synth_mode_reset()
+    let s = synth_phoneme("er")
+    ce_eq("er is 1200 samples", len(s), 1200)
+    let mx = _max_sample(s, 0, len(s))
+    let mn = _min_sample(s, 0, len(s))
+    ce_check("er peak-to-peak > 5000", (mx - mn) > 5000)
+    let sa = _sum_abs(s, 200, 1000)
+    let rms_proxy = sa / 800
+    ce_check("er sustain RMS proxy > 1500", rms_proxy > 1500)
+}
+
+// ---- diphthongs (aw, ay, ey, oy) ------------------------------------------
+
+fn test_diphthong_ay_start_end() {
+    // AY (PRICE; "my"): glides from AE-ish (F1~660, F2~1230) to IY (F1~270,
+    // F2~2290). Brief explicitly calls out these ranges.
+    let start = phoneme_formants("ay")
+    let end = diphthong_end_formants("ay")
+    ce_eq("ay kind = DIPHTHONG", start[3], 5)
+    ce_check("ay start F1 ~ 660", start[0] >= 600 && start[0] <= 730)
+    ce_check("ay start F2 ~ 1230", start[1] >= 1100 && start[1] <= 1300)
+    ce_check("ay end F1 ~ 270", end[0] >= 250 && end[0] <= 320)
+    ce_check("ay end F2 ~ 2290", end[1] >= 2200 && end[1] <= 2350)
+}
+
+fn test_diphthong_ey_start_end() {
+    // EY (FACE; "day"): EH (F1~530, F2~1840) -> IY (F1~270, F2~2290).
+    let start = phoneme_formants("ey")
+    let end = diphthong_end_formants("ey")
+    ce_eq("ey kind = DIPHTHONG", start[3], 5)
+    ce_check("ey start F1 ~ 530", start[0] >= 480 && start[0] <= 580)
+    ce_check("ey start F2 ~ 1840", start[1] >= 1750 && start[1] <= 1900)
+    ce_check("ey end F2 ~ 2290", end[1] >= 2200 && end[1] <= 2350)
+}
+
+fn test_diphthong_aw_start_end() {
+    // AW (MOUTH; "now"): AA (F1~730) -> UW (F1~300).
+    let start = phoneme_formants("aw")
+    let end = diphthong_end_formants("aw")
+    ce_eq("aw kind = DIPHTHONG", start[3], 5)
+    ce_check("aw start F1 ~ 730", start[0] >= 680 && start[0] <= 750)
+    ce_check("aw end F1 ~ 300", end[0] >= 270 && end[0] <= 350)
+    // F2 also drops AW -> UW (1090 -> 870).
+    ce_check("aw end F2 lower than start", end[1] < start[1])
+}
+
+fn test_diphthong_oy_start_end() {
+    // OY (CHOICE; "boy"): AO (F1~570, F2~840) -> IY (F1~270, F2~2290).
+    let start = phoneme_formants("oy")
+    let end = diphthong_end_formants("oy")
+    ce_eq("oy kind = DIPHTHONG", start[3], 5)
+    ce_check("oy F2 rises (start < end)", start[1] < end[1])
+    ce_check("oy F1 drops (start > end)", start[0] > end[0])
+}
+
+fn test_diphthong_synthesizes_audible() {
+    audio_synth_mode_reset()
+    let s = synth_phoneme("ay")
+    ce_eq("ay is 1200 samples", len(s), 1200)
+    let mx = _max_sample(s, 0, len(s))
+    let mn = _min_sample(s, 0, len(s))
+    ce_check("ay peak-to-peak > 5000", (mx - mn) > 5000)
+    let sa = _sum_abs(s, 200, 1000)
+    let rms_proxy = sa / 800
+    ce_check("ay sustain RMS proxy > 1500", rms_proxy > 1500)
+}
+
+fn test_diphthong_glide_zcr_progression() {
+    // A diphthong's zero-crossing rate should change between the first half
+    // and the second half because the formant centers move. AY glides
+    // from F2~1230 to F2~2290, so the second-half zcr should be HIGHER
+    // than the first-half (higher F2 -> more sign changes per unit time).
+    audio_synth_mode_reset()
+    let s = synth_phoneme("ay")
+    let early_zc = _zero_crossings(s, 200, 600)
+    let late_zc = _zero_crossings(s, 600, 1000)
+    ce_check("ay late zcr > early zcr (formant glides up)", late_zc > early_zc)
+}
+
+// ---- affricates (ch, jh) --------------------------------------------------
+
+fn test_affricate_ch_kind() {
+    let f = phoneme_formants("ch")
+    ce_eq("ch kind = AFFRICATE", f[3], 6)
+}
+
+fn test_affricate_jh_kind() {
+    let f = phoneme_formants("jh")
+    ce_eq("jh kind = AFFRICATE", f[3], 6)
+}
+
+fn test_affricate_synthesizes_full_buffer() {
+    audio_synth_mode_reset()
+    audio_lcg_reset()
+    let s = synth_phoneme("ch")
+    ce_eq("ch is 1200 samples", len(s), 1200)
+    // The stop portion at the front should have a silence-then-burst
+    // shape; the fricative portion at the back should have noise-like
+    // amplitude (substantially > silence).
+    let stop_n = (1200 * 40) / 100   // 480 samples
+    // First 40 samples are silence (the plosive's silence prefix).
+    let pre_sum = _sum_abs(s, 0, 40)
+    ce_eq("ch first 40 are silence", pre_sum, 0)
+    // The fricative region (after stop_n) should be active noise.
+    let tail_max = _max_abs(s, stop_n + 100, 1100)
+    ce_check("ch fricative tail audible (> 1000)", tail_max > 1000)
+}
+
+// ---- voiced fricatives (dh, zh) -------------------------------------------
+
+fn test_fricative_dh_kind() {
+    let f = phoneme_formants("dh")
+    ce_eq("dh kind = FRICATIVE", f[3], 3)
+}
+
+fn test_fricative_zh_kind() {
+    let f = phoneme_formants("zh")
+    ce_eq("zh kind = FRICATIVE", f[3], 3)
+}
+
+fn test_fricative_zh_higher_zcr_than_vowel() {
+    audio_synth_mode_reset()
+    audio_lcg_reset()
+    let v = synth_phoneme("a")
+    audio_lcg_reset()
+    let f = synth_phoneme("zh")
+    let v_zc = _zero_crossings(v, 200, 1000)
+    let f_zc = _zero_crossings(f, 200, 1000)
+    ce_check("zh fricative zcr > vowel zcr", f_zc > v_zc)
+}
+
+// ---- syllabic nasals/liquids (em, en, eng, el) ----------------------------
+
+fn test_syllabic_em_kind() {
+    let f = phoneme_formants("em")
+    ce_eq("em kind = SYLLABIC", f[3], 7)
+}
+
+fn test_syllabic_en_kind() {
+    let f = phoneme_formants("en")
+    ce_eq("en kind = SYLLABIC", f[3], 7)
+}
+
+fn test_syllabic_amplitude_reduced() {
+    // Syllabic 'em' should have reduced amplitude (~70%) compared to onset
+    // nasal 'm'. Compare the peak amplitudes in the early sustain region.
+    audio_synth_mode_reset()
+    let onset = synth_phoneme("m")
+    let syll = synth_phoneme("em")
+    let onset_peak = _max_abs(onset, 100, 300)
+    let syll_peak = _max_abs(syll, 100, 300)
+    // Syllabic should be lower than onset (the brief calls out reduced amp).
+    ce_check("syllabic peak < onset peak", syll_peak < onset_peak)
+}
+
+fn test_syllabic_eng_audible() {
+    audio_synth_mode_reset()
+    let s = synth_phoneme("eng")
+    ce_eq("eng is 1200 samples", len(s), 1200)
+    let mx = _max_abs(s, 100, 500)
+    ce_check("eng has audible peak (> 500)", mx > 500)
+}
+
+// ---- 4-word diphthong utterance ("DAY KAY MOW BOY") -----------------------
+//
+// Synthesize the 4-word test utterance the brief calls out: D+EY D+EY K+EY
+// M+OW B+OY. 4 words x 3 phonemes/word x 1200 samples = 14400 samples.
+// Then write to WAV and verify the on-disk size matches.
+
+fn _synth_word_phonemes(labels) {
+    let out = list_new()
+    let i = 0
+    while i < len(labels) {
+        let chunk = synth_phoneme(labels[i])
+        let j = 0
+        while j < len(chunk) {
+            push(out, chunk[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn test_four_word_diphthong_utterance() {
+    audio_synth_mode_reset()
+    audio_lcg_reset()
+    // "DAY" = D + EY ; "KAY" = K + EY ; "MOW" = M + OW ; "BOY" = B + OY
+    let day = list_new()
+    push(day, "d") push(day, "ey")
+    let kay = list_new()
+    push(kay, "k") push(kay, "ey")
+    let mow = list_new()
+    push(mow, "m") push(mow, "ow")
+    let boy = list_new()
+    push(boy, "b") push(boy, "oy")
+    let s1 = _synth_word_phonemes(day)
+    let s2 = _synth_word_phonemes(kay)
+    let s3 = _synth_word_phonemes(mow)
+    let s4 = _synth_word_phonemes(boy)
+    ce_eq("DAY = 2 * 1200 samples", len(s1), 2400)
+    ce_eq("KAY = 2 * 1200 samples", len(s2), 2400)
+    ce_eq("MOW = 2 * 1200 samples", len(s3), 2400)
+    ce_eq("BOY = 2 * 1200 samples", len(s4), 2400)
+    // Concat all 4 words into one buffer; expect 4 * 2400 = 9600 samples.
+    let utterance = list_new()
+    let lists = list_new()
+    push(lists, s1) push(lists, s2) push(lists, s3) push(lists, s4)
+    let i = 0
+    while i < len(lists) {
+        let w = lists[i]
+        let j = 0
+        while j < len(w) {
+            push(utterance, w[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ce_eq("utterance = 4 * 2400 samples", len(utterance), 9600)
+    // Duration check: 9600 samples / 8000 Hz = 1200 ms = 1.2 sec.
+    // Compute via audio_samples_for_ms and verify the inverse.
+    ce_eq("1.2 s @ 8 kHz = 9600 samples", audio_samples_for_ms(1200), 9600)
+    // Write the utterance to disk and verify byte count.
+    let ok = audio_write_wav(utterance, "/tmp/ce_test_diphthong_utterance.wav")
+    ce_eq("write_wav success", ok, 1)
+    let fd = sys_open("/tmp/ce_test_diphthong_utterance.wav", O_RDONLY, 0)
+    ce_check("file opens", fd >= 0)
+    let big = alloc(32768)
+    let total = sys_read(fd, big, 32768)
+    sys_close(fd)
+    // File size = 44 + 9600*2 = 19244 bytes; we only read 32768 max so it
+    // fits in one read.
+    ce_eq("wav file size = 44 + 9600*2", total, 44 + 9600 * 2)
+}
+
+// ---- WAV writer integration with new synth -------------------------------
+
+fn test_write_wav_klatt_sentence() {
+    // Write the quality-test sentence to disk; verify the file exists,
+    // starts with RIFF, and is the expected size for the sample count.
+    let samples = synth_text("hello world this is a test", 0)
+    let n = len(samples)
+    let ok = audio_write_wav(samples, "/tmp/ce_test_klatt_sentence.wav")
+    ce_eq("write_wav success", ok, 1)
+    let fd = sys_open("/tmp/ce_test_klatt_sentence.wav", O_RDONLY, 0)
+    ce_check("file opens", fd >= 0)
+    let buf = alloc(8)
+    let nr = sys_read(fd, buf, 4)
+    sys_close(fd)
+    ce_eq("read 4 bytes", nr, 4)
+    ce_eq("first byte 'R'", load8(buf), 82)
+    // File size = 44 + n*2 bytes (header + PCM16 samples).
+    let fd2 = sys_open("/tmp/ce_test_klatt_sentence.wav", O_RDONLY, 0)
+    let big = alloc(200000)
+    let total = sys_read(fd2, big, 200000)
+    sys_close(fd2)
+    ce_eq("file size = 44 + n*2", total, 44 + n * 2)
+}
+
+// ---- main -----------------------------------------------------------------
+
+fn main() {
+    test_wav_header_riff()
+    test_wav_header_fields()
+    test_synth_sine_count_and_shape()
+    test_synth_sine_zero_first_and_last()
+    test_synth_sine_silent_on_zero_count()
+    test_synth_phoneme_duration()
+    test_synth_phoneme_unknown_fallback()
+    test_synth_phoneme_fricative()
+    test_synth_text_minimum_length()
+    test_synth_text_multiword()
+    test_synth_text_empty_input()
+    test_synth_text_uses_lang_phonemes()
+    test_synth_text_lang_overrides_fallback_count()
+    test_write_wav_returns_1()
+    test_write_wav_starts_with_RIFF()
+    test_write_wav_size_includes_header()
+    // P2.6 Klatt additions
+    test_phoneme_formants_vowel()
+    test_phoneme_formants_kinds()
+    test_vowel_a_amplitude_stats()
+    test_fricative_higher_zcr_than_vowel()
+    test_plosive_silence_then_burst()
+    test_envelope_attack_ramp()
+    test_envelope_release_ramp()
+    test_envelope_direct()
+    test_lcg_determinism()
+    test_lcg_bounded()
+    test_klatt_differs_from_sine()
+    test_synth_mode_default_klatt()
+    test_nasal_has_damping()
+    test_write_wav_klatt_sentence()
+    // P6 expansion: full ~44-phoneme ARPAbet inventory
+    test_klatt_inventory_count()
+    test_every_label_is_recognized()
+    test_vowel_er_formants()
+    test_vowel_uh_formants()
+    test_vowel_ax_formants()
+    test_new_monophthong_audible()
+    test_diphthong_ay_start_end()
+    test_diphthong_ey_start_end()
+    test_diphthong_aw_start_end()
+    test_diphthong_oy_start_end()
+    test_diphthong_synthesizes_audible()
+    test_diphthong_glide_zcr_progression()
+    test_affricate_ch_kind()
+    test_affricate_jh_kind()
+    test_affricate_synthesizes_full_buffer()
+    test_fricative_dh_kind()
+    test_fricative_zh_kind()
+    test_fricative_zh_higher_zcr_than_vowel()
+    test_syllabic_em_kind()
+    test_syllabic_en_kind()
+    test_syllabic_amplitude_reduced()
+    test_syllabic_eng_audible()
+    test_four_word_diphthong_utterance()
+    ce_summary("audio_synth")
+}
+
+main()

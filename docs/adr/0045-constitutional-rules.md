@@ -1,0 +1,36 @@
+# ADR-0045: Constitutional rules (hard inhibitory signals, enterprise vs user loyalty resolution)
+
+## Status
+
+Proposed
+
+## Date
+
+2026-05-25
+
+## Context
+The permission tiers (ADR-0041), reversibility classifier (ADR-0042), and overrides (ADR-0044) govern *individual actions and corrections*. But some prohibitions must be absolute and substrate-wide: rules the system will not violate no matter what goal, belief, or learned habit pushes toward them (e.g. never exfiltrate the user's private data, never self-modify the constitution without deliberate revision, never take an irreversible action that harms the user). These are constitutional. They cannot be mere high-tier permissions, because a permission is something the user could approve away in the moment; a constitutional rule must be able to *inhibit* an action even against a local approval, and must be expressed in the substrate's own currency so it participates in dynamics rather than sitting outside as a bolt-on checker.
+
+This is decided now because the soul already carries a constitution and a loyalty hierarchy (`core/soul.nova`, ADR-0034), and the signal taxonomy (ADR-0008) already defines `inhibitory` and `constitutional` signal types — the pieces exist and must be connected before autonomous action ships. The v2 enterprise pilot (ADR-0047) sharpens the hardest question: when the deploying enterprise and the end user want different things, who wins, and where is that non-negotiable?
+
+## Decision
+Constitutional rules are implemented as **hard inhibitory signals**, using the `constitutional` and `inhibitory` signal types from the 18-type taxonomy (ADR-0008), extending `core/signal.nova`'s tag space (enhancement #6). A constitutional rule is a standing watcher in `core/soul.nova` that, when a candidate action or goal matches its prohibition pattern, emits a maximal-priority `constitutional`/`inhibitory` signal targeting the originating `NTYPE_ACTOR`/goal nodes. Unlike ordinary `inhibitory` signals (which lower activation probabilistically), a `constitutional` signal is **hard**: it sets a veto bit on the action that `safety_gate` (ADR-0041) treats as terminal — the action cannot execute, and no in-the-moment user approval can clear it (only deliberate constitutional revision can, per ADR-0034). Constitutional signals carry top `priority` in the `core/signal.nova` layout so they preempt excitatory/goal-drive signals at every gate (ADR-0009).
+
+For **enterprise-vs-user loyalty resolution**, we bind to the soul's existing loyalty hierarchy (`core/soul.nova`, ADR-0034). The hierarchy is ordered, and the constitutional layer sits ABOVE both enterprise and user: (1) constitution (non-negotiable, e.g. legal/safety/no-harm), (2) the deploying authority's policy (enterprise in v2), (3) the end user, (4) the system's own goals. Conflicts resolve top-down: a constitutional rule overrides everything; below it, enterprise policy overrides a conflicting user request in v2; in v1 there is no enterprise layer, so the user is the top non-constitutional authority. Critically, neither enterprise nor user can override a constitutional rule via permission or override — constitutional rules are reachable only through deliberate revision, which is itself a constitutional-gated, fully-logged operation.
+
+## Options Considered
+1. **Post-hoc policy checker outside the substrate (rejected).** A classic allow/deny filter wrapping effectors. Simple and familiar, but it sits outside substrate dynamics: it cannot *shape* goal formation or activation, only block at the very end, and it duplicates the gating ADR-0041 already does. Expressing constitution as signals lets prohibitions damp bad goals *before* they reach action. Rejected as the primary mechanism (we still keep the gate veto bit as the enforcement point).
+
+2. **Constitution as very-high-tier permissions (rejected).** Fold constitution into ADR-0041 as a `PERM_APPROVE`-always class. But permissions are user-clearable in the moment; constitution by definition must not be. Conflating them lets a single approval defeat a hard rule. Rejected.
+
+3. **Soft inhibitory-only constitution (rejected).** Use only the probabilistic `inhibitory` signal type, strongly weighted. Elegant and fully substrate-native, but "strongly discouraged" is not "forbidden" — under enough goal pressure a soft inhibition can be overcome, which is unacceptable for hard rules. Rejected; we use the *hard* `constitutional` type for absolutes and reserve soft `inhibitory` for preferences (e.g. standing vetoes from ADR-0044).
+
+4. **Hard `constitutional` inhibitory signals + soul loyalty hierarchy (CHOSEN).** Substrate-native (participates in dynamics, can damp goals early), yet terminal at the gate (cannot be approved away), with conflict resolution grounded in the soul structure that already exists. Chosen.
+
+## Consequences
+- **Positive:** Absolute prohibitions are both substrate-native and unbypassable; constitutional pressure shapes goals before they become actions, not just blocks at the end; the loyalty hierarchy gives a single, inspectable answer to enterprise-vs-user conflicts; v1 and v2 share the mechanism with only the hierarchy contents differing.
+- **Negative:** Authoring correct prohibition-match patterns is hard and high-stakes (a too-broad rule paralyzes the system, a too-narrow one leaks); maximal-priority signals must be implemented carefully so they truly preempt at every gate (ADR-0009). The "deliberate revision only" path for changing constitution adds process friction by design.
+- **Future work:** A constitutional revision workflow (constitutional-gated, logged via ADR-0043) for v1; enterprise admin provisioning of layer-2 policy and lockout of layer-3 overrides for v2 (ADR-0047); pattern-authoring tooling and a constitutional test suite among the 8 capability tests (ADR-0049).
+
+## Implementation Notes
+Extend `core/signal.nova` with the `constitutional` and `inhibitory` tags (ADR-0008, enhancement #6 — extended signal tag space with typed fast-dispatch). In `core/soul.nova`: a `constitution` set of rules each `[CONST_RULE, match_pattern, severity]`; `constitution_watch(candidate_action_or_goal)` emits a top-`priority` `constitutional` signal on match. `safety_gate` (ADR-0041) checks for a constitutional veto bit before any tier logic and treats it as terminal (no approval clears it). The loyalty hierarchy is read from `core/soul.nova` (ADR-0034); add `loyalty_resolve(conflict) -> authority` returning the highest-ranked stakeholder, with constitution pinned above all. Gates (ADR-0009) must honor signal `priority` so constitutional signals preempt. Every constitutional inhibition and every revision attempt appends to the decision log (ADR-0043, enhancement #9). Enforcement is pure substrate — no `runtime/llm.nova` involvement. Tests: assert a constitutionally-vetoed action cannot be executed even with explicit user approval; assert `loyalty_resolve` returns enterprise over user in a v2 fixture and user (top non-constitutional) in a v1 fixture; assert constitution outranks both in all fixtures; assert a soft `inhibitory` preference can be overridden by sufficient goal drive while a hard `constitutional` cannot.

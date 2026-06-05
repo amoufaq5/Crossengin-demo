@@ -1,0 +1,414 @@
+// CrossEngin reasoning: minimum viable proof checker (P3.5 / ADR-0052).
+//
+// Purpose
+//   Today reasoning produces a conclusion via operator chains
+//   (`fever -> infection -> antibiotic`) but there is no formal proof trail
+//   exposed to the operator/auditor: you cannot ask "show me the operator
+//   sequence that justifies this conclusion" and get a machine-checkable
+//   answer back. This module adds a substrate-internal proof checker that
+//   takes (premise_atom_id, conclusion_atom_id) and either returns a valid
+//   operator chain together with its composed confidence, or reports
+//   "no proof found within depth D".
+//
+//   A "proof" is an ordered sequence of operator atoms [op1, op2, ..., opN]
+//   such that:
+//     - op1.premise contains the queried premise atom
+//     - op_k.conclusion is the premise of op_{k+1}    (chain link)
+//     - opN.conclusion is the queried conclusion
+//   The proof's strength is the product of each operator's Beta-posterior
+//   mean (milli, clamped to 0..1000). A short high-confidence chain is a
+//   strong proof; a long chain of weak operators is a weak proof.
+//
+//   The checker = bounded BFS over the operator graph from premise_atom_id;
+//   conclusion marks the goal. Bound by depth D (default 6) and visited-
+//   states (default 1024). The "graph" is the existing operator edges
+//   exposed by reasoning_atoms: rk_operators_from (forward) AND
+//   rk_operators_to (backward, so the substrate's notion of "neighbourhood
+//   is symmetric for surfacing" -- ADR-0031 / reader/neighborhood.nova --
+//   carries over to proof reach). The visit set is keyed by atom_id so a
+//   cycle (a -> b -> a) cannot cause re-expansion.
+//
+//   No SAT solver, no embedding lookup, no language model. Pure substrate
+//   integer arithmetic over operator-graph edges already in the reasoning
+//   KG.
+//
+// API
+//   proof_new()                                                            -> checker state
+//   proof_check(premise, conclusion, rkg, max_depth, max_visits)
+//       -> [valid (0|1), chain_op_atoms, strength_milli, visited_count]
+//   proof_format(chain, rkg)                                               -> human-readable string
+//   proof_to_dlog_trace(chain, rkg)                                        -> list suitable for dl_append's trace field
+//
+//   The returned chain is the list of operator ATOMS (not ids) -- this is
+//   what proof_format / proof_to_dlog_trace need anyway and saves the
+//   caller a second per-op lookup. Callers wanting atom-id-only can map
+//   `atom_id` over the chain themselves.
+//
+// Edge cases (covered + unit-tested):
+//   - premise == conclusion              -> valid=1, chain=[], strength=1000
+//   - no path within max_depth           -> valid=0, chain=[], strength=0
+//   - cycle (a -> b -> a)                -> visit-set prevents re-expansion
+//   - empty operator graph               -> valid=0
+//   - max_visits exhausted before reach  -> valid=0, visited_count reflects the cap
+//
+// NOVA gotchas honoured
+//   - The chain-strength multiply uses the well-known integer-milli step
+//     `result = result * confidence / 1000` per link (reason_evidential_chain
+//     does the same, reasoning_module.nova:148-155). NEVER fold the whole
+//     product into one expression -- that hits the codegen pointer-threshold
+//     bug for large intermediates (NEXT_SESSION.md "+5 instances and
+//     counting"). Each link keeps the running result under ~1M.
+//   - BFS queue is a plain NOVA list. Append at the tail, read from index 0
+//     via a head cursor (`q_head`) so we never need a builtin deque.
+//   - rk_operators_from may return 0 (no operators) per the operator-graph
+//     contract -- check len() before iterating. (Today reasoning_atoms.nova
+//     always returns a list, but defensive against future changes.)
+//
+// ADRs implemented: ADR-0052 (proof checker), ADR-0031 (operator atoms),
+//   ADR-0016/0023 (atom + Bayesian belief).
+// NOVA dependencies: builtins (lists, integer math).
+// CrossEngin dependencies: src/parts/reasoning/reasoning_atoms.nova
+//   (operator graph queries + accessors), src/kg/atom_store.nova (atom
+//   accessors; read-only).
+
+import "reasoning_atoms.nova"
+
+// ---- tuneables -----------------------------------------------------------
+let PROOF_DEFAULT_DEPTH  = 6
+let PROOF_DEFAULT_VISITS = 1024
+let PROOF_STRENGTH_MAX   = 1000
+
+// ---- checker state -------------------------------------------------------
+// Stateless today (every proof_check is self-contained), but kept as an
+// opaque value so future caching / stats can hang off the same handle
+// without breaking the chat dispatch surface. Layout:
+//   [tag, queries_run, total_visited]
+let PC_TAG = 1
+let _PC_OBJ_TAG = 5201
+
+fn proof_new() {
+    let s = list_new()
+    push(s, _PC_OBJ_TAG)
+    push(s, 0)   // queries_run
+    push(s, 0)   // total_visited
+    return s
+}
+
+fn proof_queries(s)  { return s[1] }
+fn proof_visited(s)  { return s[2] }
+
+fn _pc_record(s, visited) {
+    list_set(s, 1, s[1] + 1)
+    list_set(s, 2, s[2] + visited)
+    return 1
+}
+
+// ---- BFS visit table -----------------------------------------------------
+// Each visited entry: [atom_id, depth, parent_op_atom, parent_atom_id].
+// parent_op_atom is 0 for the seed; parent_atom_id is -1 for the seed.
+// A linear scan is fine -- max_visits is bounded by PROOF_DEFAULT_VISITS
+// (default 1024).
+
+let _PV_ID    = 0
+let _PV_DEPTH = 1
+let _PV_POP   = 2
+let _PV_PID   = 3
+
+fn _pv_index(visited, atom_id) {
+    let i = 0
+    while i < len(visited) {
+        if visited[i][_PV_ID] == atom_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _pv_make(atom_id, depth, parent_op, parent_id) {
+    let e = list_new()
+    push(e, atom_id)
+    push(e, depth)
+    push(e, parent_op)
+    push(e, parent_id)
+    return e
+}
+
+// ---- chain reconstruction ------------------------------------------------
+// Walks parent_op pointers back from the conclusion to the premise, then
+// reverses the collected operator list so callers see premise->conclusion
+// order. parent_op==0 for the seed entry terminates the walk.
+
+fn _reconstruct_chain(visited, conclusion_id) {
+    let chain = list_new()
+    let idx = _pv_index(visited, conclusion_id)
+    if idx == -1 { return chain }
+    let cur = idx
+    let safety = 0
+    while safety < PROOF_DEFAULT_VISITS {
+        let entry = visited[cur]
+        let pop = entry[_PV_POP]
+        if pop == 0 { safety = PROOF_DEFAULT_VISITS }
+        else {
+            push(chain, pop)
+            let pid = entry[_PV_PID]
+            if pid == -1 { safety = PROOF_DEFAULT_VISITS }
+            else {
+                let pidx = _pv_index(visited, pid)
+                if pidx == -1 { safety = PROOF_DEFAULT_VISITS }
+                else { cur = pidx; safety = safety + 1 }
+            }
+        }
+    }
+    // Reverse so the caller reads premise -> conclusion.
+    let out = list_new()
+    let i = len(chain) - 1
+    while i >= 0 {
+        push(out, chain[i])
+        i = i - 1
+    }
+    return out
+}
+
+// ---- chain strength ------------------------------------------------------
+// Product of per-operator confidences, milli, clamped to [0, 1000]. Multi-
+// step is done one link at a time and re-clamped each step so intermediates
+// stay under PROOF_STRENGTH_MAX -- well below the NOVA codegen pointer-
+// threshold bug's danger zone.
+
+fn _chain_strength(chain) {
+    if len(chain) == 0 { return PROOF_STRENGTH_MAX }
+    let result = PROOF_STRENGTH_MAX
+    let i = 0
+    while i < len(chain) {
+        let c = rop_confidence(chain[i])
+        if c < 0 { c = 0 }
+        if c > PROOF_STRENGTH_MAX { c = PROOF_STRENGTH_MAX }
+        result = result * c / 1000
+        if result < 0 { result = 0 }
+        if result > PROOF_STRENGTH_MAX { result = PROOF_STRENGTH_MAX }
+        i = i + 1
+    }
+    return result
+}
+
+// ---- BFS over the operator graph -----------------------------------------
+// Classic frontier BFS. State per-atom is (atom_id, depth, parent_op,
+// parent_atom_id). The frontier is a list of atom_ids we have NOT yet
+// expanded; we expand by enumerating both forward (rk_operators_from) and
+// backward (rk_operators_to) edges, because the substrate treats operator
+// neighborhood as symmetric for surfacing purposes (ADR-0031 / reader/
+// neighborhood.nova).
+//
+// Termination:
+//   - conclusion found        -> early exit, valid=1
+//   - frontier empties        -> graph exhausted within depth, valid=0
+//   - len(visited) >= max_v   -> visit cap reached, valid=0
+//   - depth > max_depth       -> depth cap reached, valid=0
+//
+// Returns the visited table; the caller does the reconstruct + strength.
+
+fn _proof_bfs(premise_id, conclusion_id, rkg, max_depth, max_visits) {
+    let visited = list_new()
+    push(visited, _pv_make(premise_id, 0, 0, -1))
+    if premise_id == conclusion_id { return visited }
+    let frontier = list_new()
+    push(frontier, premise_id)
+    let depth = 0
+    let found = 0
+    while depth < max_depth {
+        if len(frontier) == 0 { depth = max_depth }
+        else {
+            if found == 1 { depth = max_depth }
+            else {
+                if len(visited) >= max_visits { depth = max_depth }
+                else {
+                    let next_frontier = list_new()
+                    let f = 0
+                    while f < len(frontier) {
+                        if found == 0 {
+                            if len(visited) < max_visits {
+                                let cur_id = frontier[f]
+                                // Forward edges: ops whose premise is cur_id.
+                                let outs = rk_operators_from(rkg, cur_id)
+                                if outs != 0 {
+                                    let j = 0
+                                    while j < len(outs) {
+                                        if found == 0 {
+                                            if len(visited) < max_visits {
+                                                let op = outs[j]
+                                                let c = rop_conclusion(op)
+                                                if _pv_index(visited, c) == -1 {
+                                                    push(visited, _pv_make(c, depth + 1, op, cur_id))
+                                                    if c == conclusion_id { found = 1 }
+                                                    else { push(next_frontier, c) }
+                                                }
+                                            }
+                                        }
+                                        j = j + 1
+                                    }
+                                }
+                                // Backward edges: ops whose conclusion is cur_id;
+                                // contribute the operator's premise as a neighbour.
+                                let ins = rk_operators_to(rkg, cur_id)
+                                if ins != 0 {
+                                    let k = 0
+                                    while k < len(ins) {
+                                        if found == 0 {
+                                            if len(visited) < max_visits {
+                                                let op2 = ins[k]
+                                                let p = rop_premise(op2)
+                                                if _pv_index(visited, p) == -1 {
+                                                    push(visited, _pv_make(p, depth + 1, op2, cur_id))
+                                                    if p == conclusion_id { found = 1 }
+                                                    else { push(next_frontier, p) }
+                                                }
+                                            }
+                                        }
+                                        k = k + 1
+                                    }
+                                }
+                            }
+                        }
+                        f = f + 1
+                    }
+                    frontier = next_frontier
+                    depth = depth + 1
+                }
+            }
+        }
+    }
+    return visited
+}
+
+// ---- public entry point --------------------------------------------------
+// Returns a 4-element list: [valid, chain_op_atoms, strength_milli, visited_count].
+//   valid           : 1 if a proof was found, else 0
+//   chain_op_atoms  : ordered operator ATOMS premise->conclusion; empty when
+//                     valid=0 OR when premise==conclusion (trivial proof)
+//   strength_milli  : product of operator confidences, clamped to [0,1000];
+//                     1000 for the trivial proof; 0 when valid=0
+//   visited_count   : how many BFS states were materialised (debug counter)
+//
+// max_depth / max_visits override the defaults when > 0; pass 0 to use
+// PROOF_DEFAULT_DEPTH / PROOF_DEFAULT_VISITS.
+fn proof_check(premise_id, conclusion_id, rkg, max_depth, max_visits) {
+    let result = list_new()
+    push(result, 0)             // valid
+    push(result, list_new())    // chain
+    push(result, 0)             // strength
+    push(result, 0)             // visited
+
+    if rkg == 0 { return result }
+
+    let md = max_depth
+    if md <= 0 { md = PROOF_DEFAULT_DEPTH }
+    let mv = max_visits
+    if mv <= 0 { mv = PROOF_DEFAULT_VISITS }
+
+    // Trivial proof: same atom on both sides.
+    if premise_id == conclusion_id {
+        list_set(result, 0, 1)
+        list_set(result, 2, PROOF_STRENGTH_MAX)
+        list_set(result, 3, 1)
+        return result
+    }
+
+    let visited = _proof_bfs(premise_id, conclusion_id, rkg, md, mv)
+    list_set(result, 3, len(visited))
+
+    let target_idx = _pv_index(visited, conclusion_id)
+    if target_idx == -1 { return result }
+
+    let chain = _reconstruct_chain(visited, conclusion_id)
+    if len(chain) == 0 { return result }
+
+    list_set(result, 0, 1)
+    list_set(result, 1, chain)
+    list_set(result, 2, _chain_strength(chain))
+    return result
+}
+
+// Convenience: run proof_check and also update a checker state (proof_new())
+// so callers tracking aggregate stats have a single call point.
+fn proof_check_stateful(state, premise_id, conclusion_id, rkg, max_depth, max_visits) {
+    let r = proof_check(premise_id, conclusion_id, rkg, max_depth, max_visits)
+    _pc_record(state, r[3])
+    return r
+}
+
+// ---- result-extraction helpers (also nice in tests) ----------------------
+fn proof_result_valid(r)    { return r[0] }
+fn proof_result_chain(r)    { return r[1] }
+fn proof_result_strength(r) { return r[2] }
+fn proof_result_visited(r)  { return r[3] }
+
+// ---- human-readable formatter --------------------------------------------
+// Produces the multi-line format the brief specifies:
+//   proof: <p_lbl> -> <hop1> -> ... -> <c_lbl>
+//     op #<id> (<kind>) <plbl> -> <clbl>; confidence <conf>
+//     ...
+//   strength: <s> milli (product of confidences)
+// Trivial proof prints "proof (trivial): <p_lbl> == <c_lbl>; strength 1000".
+fn proof_format(chain, rkg) {
+    if len(chain) == 0 {
+        return "proof (trivial): premise == conclusion; strength 1000"
+    }
+    // Header: arrow line of premise labels.
+    let head = "proof:"
+    let i = 0
+    while i < len(chain) {
+        let op = chain[i]
+        let p = kg_atom(rkg, rop_premise(op))
+        if i == 0 {
+            let plbl = "(missing)"
+            if p != 0 { plbl = atom_label(p) }
+            head = head + " " + plbl
+        }
+        let c = kg_atom(rkg, rop_conclusion(op))
+        let clbl = "(missing)"
+        if c != 0 { clbl = atom_label(c) }
+        head = head + " -> " + clbl
+        i = i + 1
+    }
+    let body = ""
+    let j = 0
+    while j < len(chain) {
+        let op2 = chain[j]
+        let pa = kg_atom(rkg, rop_premise(op2))
+        let ca = kg_atom(rkg, rop_conclusion(op2))
+        let plbl2 = "(missing)"
+        if pa != 0 { plbl2 = atom_label(pa) }
+        let clbl2 = "(missing)"
+        if ca != 0 { clbl2 = atom_label(ca) }
+        body = body + "\n  op #" + int_to_str(atom_id(op2))
+            + " (" + rop_kind_name(rop_kind(op2)) + ") "
+            + plbl2 + " -> " + clbl2
+            + "; confidence " + int_to_str(rop_confidence(op2))
+        j = j + 1
+    }
+    let strength = _chain_strength(chain)
+    let foot = "\nstrength: " + int_to_str(strength)
+        + " milli (product of confidences)"
+    return head + body + foot
+}
+
+// ---- decision-log trace adapter ------------------------------------------
+// Returns a list of [op_atom_id, premise_id, conclusion_id, confidence]
+// entries -- the SAME shape reasoning_module.nova:60-66 already uses for its
+// forward-chain trace records. dl_append's trace field is opaque; this gives
+// any /why-style introspection a uniform record format to walk regardless of
+// whether the trace came from forward_chain or from a proof check.
+fn proof_to_dlog_trace(chain, rkg) {
+    let out = list_new()
+    let i = 0
+    while i < len(chain) {
+        let op = chain[i]
+        let entry = list_new()
+        push(entry, atom_id(op))
+        push(entry, rop_premise(op))
+        push(entry, rop_conclusion(op))
+        push(entry, rop_confidence(op))
+        push(out, entry)
+        i = i + 1
+    }
+    return out
+}

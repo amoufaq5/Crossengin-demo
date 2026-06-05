@@ -1,0 +1,607 @@
+// CrossEngin federation: distributed SPARQL query via gossip-mesh fan-out.
+//
+// Purpose
+//   R20E. R15D + R16F + R17E ship mini-SPARQL (SELECT / WHERE /
+//   FILTER / OPTIONAL / UNION / ORDER BY / LIMIT / COUNT / SUM / AVG
+//   / MIN / MAX / GROUP BY) over a SINGLE local KG. R18E ships SWIM-
+//   style gossip for peer discovery on a mesh; R19E ships Bully
+//   leader election on top. The remaining federation primitive: run
+//   ONE SPARQL query that fans out across the live mesh, every soul
+//   evaluates against its OWN KG, results merge at the originator
+//   with per-row PROVENANCE (which soul produced each binding).
+//
+// Why a fan-out + merge (not a centralized index)
+//
+//   CrossEngin is a federation of souls, NOT a sharded database. Each
+//   soul carries its own KG (its lived experience: episodic events,
+//   teach-pinned facts, learned concepts, language atoms, ...) and
+//   has every right to keep that KG private to itself. A distributed
+//   query has to RESPECT those local decisions: it evaluates at the
+//   peer, sends back only the BINDINGS the peer chose to return, and
+//   the originator never sees raw atoms it wasn't already entitled
+//   to. The merge is purely additive on rows the peers AGREE to
+//   share. (A future hardening could add DP noise per peer or filter
+//   bindings via a constitution check before send -- this module
+//   ships the substrate.)
+//
+//   Provenance is non-negotiable: every row returned MUST carry the
+//   peer_id (gossip self_addr) that produced it. A row from soul A
+//   and an identical row from soul B are kept SEPARATE -- the
+//   originator gets two rows with distinct __peer annotations, NOT
+//   one merged row. The caller decides whether to dedupe semantically;
+//   the federation layer cannot guess the right policy.
+//
+// Protocol (one short-lived TCP connection per peer per query)
+//
+//   1. Originator builds a query_id from nanotime() + a per-query
+//      counter (a 63-bit unique within a single soul's lifetime;
+//      collisions across souls are tolerated because the response
+//      is annotated with peer_id, so even if two souls happened
+//      to assign the same query_id by chance the originator can
+//      distinguish responses by sender).
+//   2. Originator runs the query LOCALLY first (always wants its
+//      own rows; saves one round trip; covers the single-soul mesh
+//      case as a degenerate fan-out of zero peers).
+//   3. For each ALIVE peer (per gossip_alive_peers): originator
+//      opens a TCP connection to the peer's gossip port, sends
+//      HELLO, expects OK, sends one line:
+//          DQUERY <query_id> <originator_addr> <ts_ns> <query_string>
+//      and reads the response stream:
+//          DQRES <query_id> <peer_addr> <count>
+//          DQBIND <var1>=<val1> <var2>=<val2> ...   (one per row)
+//          DQEND
+//      The reader stops on DQEND or on per-connection timeout.
+//   4. Originator merges peer rows with the local rows, annotating
+//      each with the source peer's addr (local rows get self_addr).
+//   5. dq_query returns the merged list of (binding, peer_addr)
+//      pairs to the caller.
+//
+//   The query_string is sent VERBATIM on the wire. To keep the
+//   line-oriented framing intact we forbid newlines in the query
+//   string (the parser will reject one if it slips through). Spaces
+//   are fine -- the receiver reads everything after the third token
+//   as the query string.
+//
+//   Each peer connection has its own RCVTIMEO so a single slow peer
+//   cannot stall the whole fan-out beyond the query_timeout_ns
+//   budget. A peer that fails to respond within the budget is
+//   silently dropped from the result set (its rows just aren't
+//   included); the originator's stats counter `peers_timeout` is
+//   bumped so /dquery status can surface the failure to the
+//   operator.
+//
+// Public API
+//
+//   dq_init(gossip_state) -> dq_state_t
+//   dq_query(dq_state, kg, query_string, timeout_ns)
+//       -> list of [binding, peer_addr] pairs
+//   dq_handle_incoming_query(dq_state, kg, conn_fd, query_id,
+//                            originator_addr, ts_ns, query_string)
+//       -> writes DQRES / DQBIND* / DQEND to conn_fd, returns count
+//   dq_pending_queries(dq_state)
+//       -> list of [query_id, originator_addr, started_ns] (NB: this
+//          is the originator's view of in-flight + recently
+//          completed queries; the peer side keeps no per-query state
+//          because responses are sent inline before close)
+//   dq_stats_line(dq_state)
+//       -> one-line summary for `/dquery status`
+//
+// Helpers exercised by unit tests:
+//
+//   dq_format_binding(b, vars, peer_addr) -> wire string
+//   dq_parse_binding(line)                -> [binding, peer_addr]
+//   dq_merge_results(local_rows, peer_rows) -> list of annotated rows
+//
+// Wire-format conventions
+//   * DQUERY line: `DQUERY <id> <originator_addr> <ts_ns> <query_string>`
+//     query_string may contain spaces; receiver reads everything from
+//     the 4th token to end-of-line as the query.
+//   * DQRES line:  `DQRES <id> <peer_addr> <count>`
+//   * DQBIND line: `DQBIND <peer_addr> <var1>=<val1> <var2>=<val2> ...`
+//     The peer_addr is repeated on EVERY binding line so the originator
+//     can survive a split response (interleaved with another peer's
+//     stream when the same gossip-conn handler is concurrent). A bare
+//     `DQBIND` with no vars represents a binding that produced rows
+//     with no SELECTed columns (rare; surfaces as an empty row).
+//   * DQEND line: `DQEND <id>`. Includes the id so the receiver can
+//     distinguish two concurrent queries on the same connection (the
+//     1.0 protocol opens a fresh connection per query so this is
+//     defense-in-depth; future protocol versions may multiplex).
+//   * DQERR line: `DQERR <id> <message>`. Sent in place of DQRES when
+//     the query failed to parse; the message contains the
+//     kg_query_parse error verbatim. Originator records the error
+//     against the peer's slot but continues collecting from other
+//     peers. The merge result does not include any error rows.
+//
+// ADRs: registers ADR-0080 (federation distributed query). NOVA
+// dependencies: socket builtins (shared with gossip / kg_sync),
+// nanotime, int_to_str, str_to_int. CrossEngin dependencies:
+// src/federation/gossip.nova (read-only -- gossip_alive_peers,
+// gossip_self_addr, gossip_pe_status, internal _gossip_send_all/
+// _gossip_recv_line/_gossip_dial helpers reused inline); src/kg/
+// query.nova (read-only -- kg_query_compile_and_run, binding_get,
+// _qry_is_error, qry_error_message).
+
+import "std/io"
+import "./gossip.nova"
+import "../kg/query.nova"
+
+// ---- protocol constants --------------------------------------------------
+
+let DQ_VERSION              = 1
+let DQ_LINE_MAX             = 1024
+let DQ_DEFAULT_TIMEOUT_NS   = 5000000000   // 5 seconds
+let DQ_RECV_TIMEOUT_MS      = 2000         // per-peer TCP recv ceiling
+
+let DQ_QUERY_PREFIX         = "DQUERY "
+let DQ_RES_PREFIX           = "DQRES "
+let DQ_BIND_PREFIX          = "DQBIND "
+let DQ_END_PREFIX           = "DQEND "
+let DQ_ERR_PREFIX           = "DQERR "
+
+// ---- dq_state_t record indices ------------------------------------------
+let DQ_S_GOSSIP             = 0   // ref to gossip state (read-only use)
+let DQ_S_QUERY_SEQ          = 1   // monotonic query-id counter
+let DQ_S_PENDING            = 2   // list of [query_id, originator_addr, started_ns]
+let DQ_S_RECENT             = 3   // list of recently-completed queries (capped)
+let DQ_S_STATS_QUERIES      = 4   // counter: # queries dispatched
+let DQ_S_STATS_PEERS_OK     = 5   // counter: # peer responses received
+let DQ_S_STATS_PEERS_TIMEOUT = 6  // counter: # peers that failed to respond
+let DQ_S_STATS_BAD_QUERY    = 7   // counter: # parse errors received
+let DQ_S_STATS_ROWS_MERGED  = 8   // counter: # rows in merged result sets
+
+// ---- pending-record record indices --------------------------------------
+let DQ_P_QUERY_ID   = 0
+let DQ_P_ORIGINATOR = 1
+let DQ_P_STARTED_NS = 2
+
+// ---- annotated-row record indices ---------------------------------------
+// A merged result row: [binding, peer_addr]
+let DQ_R_BINDING    = 0
+let DQ_R_PEER       = 1
+
+// ---- state constructor --------------------------------------------------
+
+fn dq_init(gossip_state) {
+    let st = list_new()
+    push(st, gossip_state)   // S_GOSSIP
+    push(st, 0)              // S_QUERY_SEQ
+    push(st, list_new())     // S_PENDING
+    push(st, list_new())     // S_RECENT
+    push(st, 0)              // S_STATS_QUERIES
+    push(st, 0)              // S_STATS_PEERS_OK
+    push(st, 0)              // S_STATS_PEERS_TIMEOUT
+    push(st, 0)              // S_STATS_BAD_QUERY
+    push(st, 0)              // S_STATS_ROWS_MERGED
+    return st
+}
+
+// ---- accessors ----------------------------------------------------------
+
+fn dq_stats_queries(state)       { return state[DQ_S_STATS_QUERIES] }
+fn dq_stats_peers_ok(state)      { return state[DQ_S_STATS_PEERS_OK] }
+fn dq_stats_peers_timeout(state) { return state[DQ_S_STATS_PEERS_TIMEOUT] }
+fn dq_stats_bad_query(state)     { return state[DQ_S_STATS_BAD_QUERY] }
+fn dq_stats_rows_merged(state)   { return state[DQ_S_STATS_ROWS_MERGED] }
+
+fn dq_pending_count(state) { return len(state[DQ_S_PENDING]) }
+fn dq_recent_count(state)  { return len(state[DQ_S_RECENT]) }
+
+// ---- query-id generation -------------------------------------------------
+//
+// Monotonic per-soul. The id is just a counter -- the originator's
+// addr accompanies every response anyway, so cross-soul collisions are
+// safe (responder peer_addr disambiguates them). Keeping it small
+// avoids overflowing the 64-bit int when used in arithmetic.
+fn _dq_next_query_id(state) {
+    let seq = state[DQ_S_QUERY_SEQ] + 1
+    state[DQ_S_QUERY_SEQ] = seq
+    return seq
+}
+
+// ---- pending-queue management -------------------------------------------
+
+fn _dq_pending_add(state, query_id, originator_addr, started_ns) {
+    let rec = list_new()
+    push(rec, query_id)        // P_QUERY_ID
+    push(rec, originator_addr) // P_ORIGINATOR
+    push(rec, started_ns)      // P_STARTED_NS
+    push(state[DQ_S_PENDING], rec)
+    return state
+}
+
+fn _dq_pending_remove(state, query_id) {
+    let p = state[DQ_S_PENDING]
+    let i = 0
+    while i < len(p) {
+        if p[i][DQ_P_QUERY_ID] == query_id {
+            let last = len(p) - 1
+            if i != last { p[i] = p[last] }
+            pop(p)
+            return state
+        }
+        i = i + 1
+    }
+    return state
+}
+
+// dq_pending_queries returns the list of in-flight query records.
+// Test helper + chat status reporter; nothing in the protocol depends on
+// the order. Each record is [query_id, originator_addr, started_ns].
+fn dq_pending_queries(state) {
+    let out = list_new()
+    let p = state[DQ_S_PENDING]
+    let i = 0
+    while i < len(p) {
+        push(out, p[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Append a recently-completed query to a capped circular buffer. Kept
+// for /dquery status to show the last few queries the originator ran.
+// Cap at 16 records to bound memory.
+fn _dq_recent_add(state, query_id, originator_addr, started_ns, n_rows) {
+    let rec = list_new()
+    push(rec, query_id)
+    push(rec, originator_addr)
+    push(rec, started_ns)
+    push(rec, n_rows)
+    let r = state[DQ_S_RECENT]
+    push(r, rec)
+    if len(r) > 16 {
+        // Drop the oldest. Slide everything left.
+        let i = 0
+        while i < len(r) - 1 {
+            r[i] = r[i + 1]
+            i = i + 1
+        }
+        pop(r)
+    }
+    return state
+}
+
+// ---- wire-format helpers ------------------------------------------------
+//
+// dq_format_binding serializes a binding into a single DQBIND line. We
+// emit only the SELECTED variables in the given order so the receiver
+// doesn't need to know which keys the executor happens to have populated.
+// Atoms are integers (kg atom IDs); the receiver gets `<name>=<int>`.
+fn dq_format_binding(b, vars, peer_addr) {
+    let s = DQ_BIND_PREFIX + peer_addr
+    let i = 0
+    while i < len(vars) {
+        let name = vars[i]
+        if binding_has(b, name) == 1 {
+            let v = binding_get(b, name)
+            s = s + " " + name + "=" + int_to_str(v)
+        } else {
+            s = s + " " + name + "=?"
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// dq_parse_binding takes a "DQBIND <peer> <var>=<val> ..." line and
+// returns [binding, peer_addr]. Returns 0 on parse failure (the caller
+// drops it). Robust to extra spaces; rejects bindings with malformed
+// var=val tokens (the var name must be non-empty, the value must be a
+// signed integer or "?" for unbound).
+fn dq_parse_binding(line) {
+    if _gossip_starts_with(line, DQ_BIND_PREFIX) == 0 { return 0 }
+    let after = substr(line, len(DQ_BIND_PREFIX), len(line) - len(DQ_BIND_PREFIX))
+    let toks = _gossip_split_spaces(after)
+    if len(toks) < 1 { return 0 }
+    let peer_addr = toks[0]
+    let b = binding_new()
+    let i = 1
+    while i < len(toks) {
+        let kv = toks[i]
+        let eq_at = -1
+        let j = 0
+        while j < len(kv) {
+            if char_at(kv, j) == 61 { eq_at = j; j = len(kv) }
+            j = j + 1
+        }
+        if eq_at <= 0 {
+            // Malformed token -- skip silently. The originator still
+            // gets the rest of the bindings on the line.
+            i = i + 1
+        } else {
+            let name = substr(kv, 0, eq_at)
+            let val_s = substr(kv, eq_at + 1, len(kv) - eq_at - 1)
+            if str_eq(val_s, "?") == 1 {
+                // Unbound -- omit from binding so binding_has returns 0.
+                i = i + 1
+            } else {
+                // Allow optional leading '-' for negatives.
+                let neg = 0
+                let rest = val_s
+                if len(val_s) > 0 {
+                    if char_at(val_s, 0) == 45 {
+                        neg = 1
+                        rest = substr(val_s, 1, len(val_s) - 1)
+                    }
+                }
+                if _gossip_is_digits(rest) == 1 {
+                    let v = str_to_int(rest)
+                    if neg == 1 { v = 0 - v }
+                    binding_set(b, name, v)
+                }
+                i = i + 1
+            }
+        }
+    }
+    let out = list_new()
+    push(out, b)
+    push(out, peer_addr)
+    return out
+}
+
+// ---- merge ---------------------------------------------------------------
+//
+// Merge the local rows (already evaluated against the originator's KG)
+// with the peer responses. Local rows are annotated with self_addr; each
+// peer's rows carry the peer_addr the response declared. The merge is a
+// CONCATENATION -- duplicates from two peers stay distinct so the caller
+// can audit provenance (matching the doc-level "no semantic dedupe"
+// policy). Total row count is bumped on the stats counter.
+fn dq_merge_results(state, local_rows, peer_rows) {
+    let out = list_new()
+    let i = 0
+    while i < len(local_rows) {
+        push(out, local_rows[i])
+        i = i + 1
+    }
+    let j = 0
+    while j < len(peer_rows) {
+        push(out, peer_rows[j])
+        j = j + 1
+    }
+    state[DQ_S_STATS_ROWS_MERGED] = state[DQ_S_STATS_ROWS_MERGED] + len(out)
+    return out
+}
+
+// Annotate a list of bindings with a peer_addr -- builds the
+// [binding, peer_addr] rows the merge consumes.
+fn _dq_annotate(bindings, peer_addr) {
+    let out = list_new()
+    let i = 0
+    while i < len(bindings) {
+        let row = list_new()
+        push(row, bindings[i])
+        push(row, peer_addr)
+        push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- client side: query a single peer -----------------------------------
+//
+// Open a TCP connection to a peer's gossip port, send the DQUERY line,
+// drain the response stream into a list of [binding, peer_addr] rows.
+// Returns the rows on success, 0 on failure (parse error / timeout /
+// connection refused). The caller bumps stats counters based on the
+// return value.
+fn _dq_query_peer(state, peer_addr, query_id, query_string, ts_ns, vars) {
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return 0 }
+    // Override the default 500ms gossip recv timeout for the longer
+    // query-evaluation budget. Each peer is granted DQ_RECV_TIMEOUT_MS.
+    _gossip_set_rcvtimeo_ms(fd, DQ_RECV_TIMEOUT_MS)
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ok = _gossip_recv_line(fd)
+    if ok == 0 { close_fd(fd); return 0 }
+    if str_eq(ok, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+
+    let self_addr = state[DQ_S_GOSSIP][GOSSIP_S_SELF_ADDR]
+    let line = DQ_QUERY_PREFIX + int_to_str(query_id) + " " + self_addr
+        + " " + int_to_str(ts_ns) + " " + query_string + "\n"
+    if _gossip_send_all(fd, line) == 0 { close_fd(fd); return 0 }
+
+    let rows = list_new()
+    let saw_res = 0
+    let saw_err = 0
+    let running = 1
+    while running == 1 {
+        let l = _gossip_recv_line(fd)
+        if l == 0 { running = 0 } else {
+            if _gossip_starts_with(l, DQ_END_PREFIX) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(l, DQ_RES_PREFIX) == 1 {
+                    saw_res = 1
+                } else {
+                    if _gossip_starts_with(l, DQ_ERR_PREFIX) == 1 {
+                        saw_err = 1
+                    } else {
+                        if _gossip_starts_with(l, DQ_BIND_PREFIX) == 1 {
+                            let parsed = dq_parse_binding(l)
+                            if parsed != 0 { push(rows, parsed) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    if saw_err == 1 {
+        state[DQ_S_STATS_BAD_QUERY] = state[DQ_S_STATS_BAD_QUERY] + 1
+    }
+    if saw_res == 0 {
+        if saw_err == 0 { return 0 }
+    }
+    return rows
+}
+
+// ---- public client: dq_query -------------------------------------------
+//
+// Issue a SPARQL query, fanned out across the live mesh. Evaluation is
+// LOCAL FIRST (the originator's rows are always part of the result set
+// regardless of mesh liveness) plus one short-lived TCP exchange per
+// alive peer. Returns a list of [binding, peer_addr] rows.
+//
+// Inputs:
+//   state         : dq_state_t from dq_init
+//   kg            : the originator's local KG (read-only here)
+//   query_string  : SPARQL text (must not contain newlines)
+//   timeout_ns    : overall budget for the fan-out. 0 means use
+//                   DQ_DEFAULT_TIMEOUT_NS (5s).
+//
+// Side effects: bumps stats counters, appends to the recent-queries log.
+// Errors: if the query fails to parse LOCALLY, returns an empty list
+// (peers won't be asked; the local parse error is the canonical
+// signal). The caller can detect this via kg_query_parse(query_string)
+// before calling.
+fn dq_query(state, kg, query_string, timeout_ns) {
+    let actual_timeout = timeout_ns
+    if actual_timeout <= 0 { actual_timeout = DQ_DEFAULT_TIMEOUT_NS }
+    let started_ns = nanotime()
+    let query_id = _dq_next_query_id(state)
+    let self_addr = state[DQ_S_GOSSIP][GOSSIP_S_SELF_ADDR]
+    _dq_pending_add(state, query_id, self_addr, started_ns)
+    state[DQ_S_STATS_QUERIES] = state[DQ_S_STATS_QUERIES] + 1
+
+    // Parse locally to detect bad SPARQL and extract the SELECTed vars
+    // (used to format binding lines on the wire so the receiver doesn't
+    // need to know which keys the executor populated).
+    let parsed = kg_query_parse(query_string)
+    if _qry_is_error(parsed) == 1 {
+        // Bad SPARQL on the originator: do not fan out. Recent log
+        // records 0 rows; caller can call dq_pending_queries to detect
+        // the failure (the entry is removed; recent shows count=0).
+        _dq_pending_remove(state, query_id)
+        _dq_recent_add(state, query_id, self_addr, started_ns, 0)
+        state[DQ_S_STATS_BAD_QUERY] = state[DQ_S_STATS_BAD_QUERY] + 1
+        return list_new()
+    }
+    let vars = kg_query_vars(parsed)
+
+    // Local pass: evaluate against the originator's own KG.
+    let local_bindings = kg_query_execute(kg, parsed)
+    let local_rows = _dq_annotate(local_bindings, self_addr)
+
+    // Fan-out: each alive peer gets one short-lived connection. We bound
+    // total time across all peers by the overall timeout_ns -- if a
+    // peer's RCVTIMEO * len(alive) would exceed the budget, the budget
+    // dominates and later peers see truncated time. Realistic meshes are
+    // small (N <= 16) and the per-peer ceiling is short.
+    let peer_rows = list_new()
+    let gs = state[DQ_S_GOSSIP]
+    let alive = gossip_alive_peers(gs)
+    let i = 0
+    while i < len(alive) {
+        let p_addr = alive[i]
+        // Skip self if it appears in alive (gossip filters self at
+        // init time, but defense-in-depth).
+        if str_eq(p_addr, self_addr) == 0 {
+            // Budget check: if we've spent more than the budget, stop.
+            let elapsed = nanotime() - started_ns
+            if elapsed < actual_timeout {
+                let result = _dq_query_peer(state, p_addr, query_id,
+                                            query_string, started_ns, vars)
+                if result == 0 {
+                    state[DQ_S_STATS_PEERS_TIMEOUT] =
+                        state[DQ_S_STATS_PEERS_TIMEOUT] + 1
+                } else {
+                    state[DQ_S_STATS_PEERS_OK] = state[DQ_S_STATS_PEERS_OK] + 1
+                    let k = 0
+                    while k < len(result) {
+                        push(peer_rows, result[k])
+                        k = k + 1
+                    }
+                }
+            } else {
+                // Out of budget -- count remaining peers as timeouts.
+                state[DQ_S_STATS_PEERS_TIMEOUT] =
+                    state[DQ_S_STATS_PEERS_TIMEOUT] + 1
+            }
+        }
+        i = i + 1
+    }
+
+    let merged = dq_merge_results(state, local_rows, peer_rows)
+    _dq_pending_remove(state, query_id)
+    _dq_recent_add(state, query_id, self_addr, started_ns, len(merged))
+    return merged
+}
+
+// ---- server side: handle an inbound DQUERY -----------------------------
+//
+// Called by the gossip connection handler when it sees a `DQUERY ...`
+// line. Parses the query string, evaluates against the local KG, writes
+// the response stream (DQRES, one DQBIND per row, DQEND) onto the
+// connection fd. Returns the number of rows produced (>= 0) or -1 on a
+// send failure. A bad SPARQL string sends a DQERR line; the originator
+// records this against the peer's slot.
+//
+// query_id, originator_addr, ts_ns, query_string are pre-parsed by the
+// gossip handler (which is doing the line tokenizing anyway). self_addr
+// is the LOCAL gossip self_addr used to annotate response rows.
+fn dq_handle_incoming_query(state, kg, conn_fd, query_id,
+                            originator_addr, ts_ns, query_string) {
+    let self_addr = state[DQ_S_GOSSIP][GOSSIP_S_SELF_ADDR]
+
+    let parsed = kg_query_parse(query_string)
+    if _qry_is_error(parsed) == 1 {
+        let err_msg = qry_error_message(parsed)
+        let err_line = DQ_ERR_PREFIX + int_to_str(query_id) + " " + err_msg + "\n"
+        if _gossip_send_all(conn_fd, err_line) == 0 { return -1 }
+        let end_line = DQ_END_PREFIX + int_to_str(query_id) + "\n"
+        _gossip_send_all(conn_fd, end_line)
+        return 0
+    }
+    let vars = kg_query_vars(parsed)
+    let bindings = kg_query_execute(kg, parsed)
+    let n = len(bindings)
+    let res_line = DQ_RES_PREFIX + int_to_str(query_id) + " " + self_addr
+        + " " + int_to_str(n) + "\n"
+    if _gossip_send_all(conn_fd, res_line) == 0 { return -1 }
+    let i = 0
+    while i < n {
+        let line = dq_format_binding(bindings[i], vars, self_addr) + "\n"
+        if _gossip_send_all(conn_fd, line) == 0 { return -1 }
+        i = i + 1
+    }
+    let end_line = DQ_END_PREFIX + int_to_str(query_id) + "\n"
+    _gossip_send_all(conn_fd, end_line)
+    return n
+}
+
+// ---- chat-side conveniences --------------------------------------------
+
+fn dq_stats_line(state) {
+    let self_addr = state[DQ_S_GOSSIP][GOSSIP_S_SELF_ADDR]
+    return "dquery: self=" + self_addr
+        + " queries=" + int_to_str(state[DQ_S_STATS_QUERIES])
+        + " peers_ok=" + int_to_str(state[DQ_S_STATS_PEERS_OK])
+        + " peers_timeout=" + int_to_str(state[DQ_S_STATS_PEERS_TIMEOUT])
+        + " bad_query=" + int_to_str(state[DQ_S_STATS_BAD_QUERY])
+        + " rows_merged=" + int_to_str(state[DQ_S_STATS_ROWS_MERGED])
+        + " pending=" + int_to_str(len(state[DQ_S_PENDING]))
+}
+
+// dq_format_row turns a [binding, peer_addr] row into a printable line.
+// Used by the integration scenario to log merged result sets.
+fn dq_format_row(row, vars) {
+    let b = row[DQ_R_BINDING]
+    let peer = row[DQ_R_PEER]
+    let s = "row peer=" + peer
+    let i = 0
+    while i < len(vars) {
+        let name = vars[i]
+        if binding_has(b, name) == 1 {
+            s = s + " " + name + "=" + int_to_str(binding_get(b, name))
+        } else {
+            s = s + " " + name + "=?"
+        }
+        i = i + 1
+    }
+    return s
+}

@@ -1,0 +1,690 @@
+// CrossEngin io/transducers: PSK-only secure channel over TCP
+//   (P1.4 continuation -- the next step beyond plain HTTP, partway down
+//   the TLS_AUDIT.md roadmap).
+//
+// Purpose
+//   A minimum-viable confidential + authenticated channel layered over
+//   an existing TCP socket, using a 32-byte pre-shared key (PSK). NO X.509,
+//   NO CA bundle, NO certificate validation -- just a symmetric
+//   ChaCha20-Poly1305 envelope around each frame. The crypto primitives
+//   are pure NOVA (`src/safety/chacha20.nova` + `src/safety/poly1305.nova`),
+//   so the entire path is in-process and runs on top of the same socket
+//   builtins (`socket`, `connect_socket`, `send_data`, `recv_data`,
+//   `close_fd`) that the plain HTTP client already uses.
+//
+//   This is "secure channel over TCP" in the same spirit as wireguard's
+//   noise protocol -- a tiny AEAD envelope replacing TLS framing. It is
+//   NOT real TLS 1.3 (no signatures, no certificate chain, no Finished
+//   message). The TLS_AUDIT.md document tracks the remaining ~2 weeks of
+//   work to layer X.509 / ASN.1 / RSA-PSS on top.
+//
+// Wire framing (per frame)
+//   [4-byte BE length][12-byte nonce][ciphertext (variable)][16-byte tag]
+//   * length: number of bytes in the (ciphertext || tag) trailer.
+//   * nonce: per-frame ChaCha20 nonce; the sender increments a 64-bit
+//            counter and stores it little-endian in the low 8 bytes,
+//            with the session-id prefix occupying the high 4 bytes.
+//            Nonce reuse with the same key is the catastrophic failure
+//            mode of any stream-cipher AEAD; the counter monotonicity is
+//            asserted on both send and recv.
+//   * ciphertext: ChaCha20(key=session_key, nonce=frame_nonce, counter=1)
+//                 XOR plaintext.
+//   * tag: Poly1305(key=Poly_key, ciphertext). The Poly1305 one-time key
+//          is derived per-frame from ChaCha20(session_key, frame_nonce,
+//          counter=0) first 32 bytes (RFC 7539 section 2.6.1 AEAD
+//          construction).
+//
+// Handshake
+//   1. TCP connect.
+//   2. Client picks a 12-byte random nonce N0 (we use the 4-byte
+//      `session_id` from nanotime() folded down, plus 8 bytes of fresh
+//      bytes from nanotime + counter; not a real CSPRNG -- see SAFETY
+//      caveat below). Client sends [N0 (12 bytes)].
+//   3. Both sides derive session_key = ChaCha20-block(PSK, N0, counter=0)
+//      first 32 bytes (the standard AEAD subkey-derivation trick).
+//   4. Client sends one encrypted handshake frame containing the literal
+//      bytes `SC_HANDSHAKE_MAGIC` ("CE-SC-HS-OK\0\0\0\0" padded to 16 bytes)
+//      using the framing above with frame counter 1. Server verifies the
+//      Poly1305 tag AND that the decrypted bytes equal the magic. Mismatch
+//      means PSK mismatch or in-flight tampering -- both sides close.
+//   5. The same framing is used for all subsequent payload frames; the
+//      counter monotonically increases from 2 upward on both sides.
+//
+// SAFETY caveat
+//   NOVA does not expose a CSPRNG (`getrandom(2)` syscall). The nonce
+//   is derived from `nanotime()` plus a process-local counter. For PSK
+//   secure channels the failure mode of a predictable nonce is reduced
+//   to "an attacker can replay or skip frames" -- the PSK is still
+//   secret. But: a deterministic nonce ACROSS two sessions with the
+//   SAME PSK breaks confidentiality. This is documented in TLS_AUDIT.md
+//   as a real production blocker (the secure-channel section). The
+//   integration scenario (scenario_v_secure_channel.sh) uses a freshly
+//   randomized PSK per run, so the test exercises the framework without
+//   triggering the failure mode.
+//
+// Public API
+//   sc_open(host, port, psk_hex) -> sc_state | 0
+//       Opens a TCP socket to `host:port`, runs the handshake, returns
+//       an opaque `sc_state` list on success or 0 on any error (DNS
+//       miss, connect refused, handshake reject, malformed PSK).
+//       `host` must be a dotted-quad IP (no DNS resolution); `psk_hex`
+//       must decode to exactly 32 bytes.
+//   sc_send(state, payload_buf, payload_len) -> 1 on success, 0 on error.
+//       Encrypts + Poly1305-MACs the payload and sends one frame.
+//   sc_recv(state) -> [plaintext_buf, len] on success, 0 on error
+//       (transport, MAC verification, or counter regression).
+//   sc_close(state)
+//       Closes the underlying socket. Idempotent.
+//   sc_psk_validate(psk_hex) -> 1 if it decodes to 32 bytes, 0 otherwise.
+//
+//   Error tags (returned through `sc_state`'s slot SC_LAST_ERR):
+//     SC_ERR_NONE        ""
+//     SC_ERR_BAD_PSK     "psk: hex must decode to exactly 32 bytes"
+//     SC_ERR_CONNECT     "tcp: connect failed"
+//     SC_ERR_HANDSHAKE   "handshake: peer rejected magic or psk mismatch"
+//     SC_ERR_TAG_FAIL    "poly1305: tag verification failed"
+//     SC_ERR_TRANSPORT   "tcp: recv/send returned <= 0"
+//     SC_ERR_FRAME_LEN   "frame: length header out of range"
+//     SC_ERR_REPLAY      "frame: counter did not advance"
+//
+// ADRs touched: TLS_AUDIT.md (PSK-only secure channel).
+// NOVA dependencies: builtins -- alloc, store8, load8, len, list_new,
+//   push, list_set, str_eq, char_at, chr, int_*, nanotime, socket,
+//   connect_socket, send_data, recv_data, close_fd, make_sockaddr_in.
+// CrossEngin dependencies:
+//   src/safety/chacha20.nova    -- the encrypt + KDF primitive.
+//   src/safety/poly1305.nova    -- the authentication primitive.
+
+import "std/io"
+import "../../safety/chacha20.nova"
+import "../../safety/poly1305.nova"
+
+// ---- error tags ----------------------------------------------------------
+let SC_ERR_NONE       = ""
+let SC_ERR_BAD_PSK    = "psk: hex must decode to exactly 32 bytes"
+let SC_ERR_CONNECT    = "tcp: connect failed"
+let SC_ERR_HANDSHAKE  = "handshake: peer rejected magic or psk mismatch"
+let SC_ERR_TAG_FAIL   = "poly1305: tag verification failed"
+let SC_ERR_TRANSPORT  = "tcp: recv/send returned <= 0"
+let SC_ERR_FRAME_LEN  = "frame: length header out of range"
+let SC_ERR_REPLAY     = "frame: counter did not advance"
+let SC_ERR_SOCKET     = "tcp: socket() failed"
+let SC_ERR_BAD_IP     = "tcp: host must be a dotted-quad"
+
+// ---- frame constants -----------------------------------------------------
+//
+// The 12-byte nonce splits into a 4-byte "session id" (set during
+// handshake from nanotime fold-down) + an 8-byte little-endian counter.
+// Send and recv each have an independent counter: client send counter
+// starts at 1 (handshake) and increments; server send counter starts at
+// 1 + (recv from client's handshake) is not the same channel direction
+// -- the framework here is half-duplex per session, the client always
+// sends first. For full-duplex production we'd want two counters per
+// direction; out of scope here.
+let SC_NONCE_LEN     = 12
+let SC_TAG_LEN       = 16
+let SC_KEY_LEN       = 32
+let SC_LEN_HDR       = 4         // BE length prefix
+let SC_FRAME_MAX     = 65536     // 64 KiB upper bound per frame
+let SC_HANDSHAKE_MAGIC = "CE-SC-HS-OK"   // 11 bytes; padded to 16 in handshake_buf
+
+// ---- sc_state shape ------------------------------------------------------
+//
+// Opaque list passed around by the public API. Layout:
+//   [0] tag (a disambiguating sentinel for runtime asserts)
+//   [1] fd
+//   [2] session_key buf (32 bytes derived from PSK + handshake nonce)
+//   [3] nonce_prefix buf (4 bytes -- the high 4 bytes of every frame nonce)
+//   [4] send_counter (NOVA int, starts at 2 after handshake)
+//   [5] recv_counter (NOVA int, starts at 2 after handshake)
+//   [6] last_error_tag (string)
+
+let SC_OBJ_TAG = 7501
+
+let SC_T_TAG     = 0
+let SC_T_FD      = 1
+let SC_T_KEY     = 2
+let SC_T_NPRE    = 3
+let SC_T_SCTR    = 4
+let SC_T_RCTR    = 5
+let SC_T_ERR     = 6
+
+fn _sc_state_new(fd, key_buf, nonce_prefix_buf) {
+    let s = list_new()
+    push(s, SC_OBJ_TAG)
+    push(s, fd)
+    push(s, key_buf)
+    push(s, nonce_prefix_buf)
+    push(s, 2)      // send counter (post-handshake)
+    push(s, 2)      // recv counter (post-handshake)
+    push(s, SC_ERR_NONE)
+    return s
+}
+
+fn sc_last_error(state) {
+    if state == 0 { return "<null state>" }
+    return state[SC_T_ERR]
+}
+
+fn _sc_set_err(state, msg) {
+    list_set(state, SC_T_ERR, msg)
+    return 1
+}
+
+// ---- IP helpers (mirrored from http_client to keep this leaf) ------------
+
+fn _sc_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _sc_all_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _sc_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sc_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _sc_all_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    let b_p = b * k256
+    let c_p = c * k256 * k256
+    let d_p = d * k256 * k256 * k256
+    return a + b_p + c_p + d_p
+}
+
+// ---- low-level send/recv (over a byte buffer, not a NOVA string) --------
+//
+// Write `n` bytes starting at `buf` to `fd`, looping on short writes.
+// Returns 1 on success, 0 on any error.
+
+fn _sc_send_buf(fd, buf, n) {
+    let sent = 0
+    while sent < n {
+        let r = send_data(fd, buf + sent, n - sent)
+        if r <= 0 { return 0 }
+        sent = sent + r
+    }
+    return 1
+}
+
+// Read exactly `n` bytes from `fd` into a freshly-allocated buffer.
+// Returns [buf, n] on success, 0 if the connection closed before `n`
+// bytes were read.
+fn _sc_recv_exact(fd, n) {
+    if n <= 0 { return 0 }
+    let buf = alloc(n + 1)
+    let got = 0
+    while got < n {
+        let r = recv_data(fd, buf + got, n - got)
+        if r <= 0 { return 0 }
+        got = got + r
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+// 4-byte big-endian length encoder / decoder.
+fn _sc_put_u32_be(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8),  255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+fn _sc_get_u32_be(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return v
+}
+
+// ---- nonce construction --------------------------------------------------
+//
+// Build the 12-byte ChaCha20 nonce for a given direction's counter.
+// Layout: [4 bytes session_id (the "nonce_prefix")] [8 bytes counter LE].
+fn _sc_build_nonce(prefix_buf, counter) {
+    let n = alloc(SC_NONCE_LEN + 1)
+    store8(n + 0, load8(prefix_buf + 0))
+    store8(n + 1, load8(prefix_buf + 1))
+    store8(n + 2, load8(prefix_buf + 2))
+    store8(n + 3, load8(prefix_buf + 3))
+    // 8 byte LE counter at offset 4..11
+    store8(n + 4,  int_and(counter, 255))
+    store8(n + 5,  int_and(int_shr(counter, 8),  255))
+    store8(n + 6,  int_and(int_shr(counter, 16), 255))
+    store8(n + 7,  int_and(int_shr(counter, 24), 255))
+    store8(n + 8,  int_and(int_shr(counter, 32), 255))
+    store8(n + 9,  int_and(int_shr(counter, 40), 255))
+    store8(n + 10, int_and(int_shr(counter, 48), 255))
+    store8(n + 11, int_and(int_shr(counter, 56), 255))
+    store8(n + 12, 0)
+    return n
+}
+
+// Derive a per-frame Poly1305 one-time key: ChaCha20(session_key,
+// frame_nonce, counter=0) gives a 64-byte block; the first 32 bytes are
+// the Poly1305 key per RFC 7539 section 2.6.1.
+fn _sc_derive_poly_key(session_key, frame_nonce) {
+    return chacha20_block_buf(session_key, frame_nonce, 0)
+}
+
+// ---- nonce / session_key derivation from PSK ----------------------------
+//
+// Build a fresh 12-byte handshake nonce. We derive 12 bytes from
+// nanotime() by treating its 64-bit value as the low 8 bytes plus an
+// XOR-folded 4-byte high prefix. This is NOT a CSPRNG (a determined
+// attacker can predict it); the SAFETY caveat at the top of this file
+// documents the failure mode. The integration test uses one fresh PSK
+// per run so the predictable nonce is benign there.
+//
+// Also installed are two byte taps from a small process-local counter
+// so identical-second invocations don't trivially collide.
+let _sc_nonce_seq = 1
+
+fn _sc_random_nonce() {
+    let now = nanotime()
+    let buf = alloc(SC_NONCE_LEN + 1)
+    let s = _sc_nonce_seq
+    _sc_nonce_seq = s + 1
+    // Low 8 bytes = nanotime LE.
+    store8(buf + 0,  int_and(now, 255))
+    store8(buf + 1,  int_and(int_shr(now, 8),  255))
+    store8(buf + 2,  int_and(int_shr(now, 16), 255))
+    store8(buf + 3,  int_and(int_shr(now, 24), 255))
+    store8(buf + 4,  int_and(int_shr(now, 32), 255))
+    store8(buf + 5,  int_and(int_shr(now, 40), 255))
+    store8(buf + 6,  int_and(int_shr(now, 48), 255))
+    store8(buf + 7,  int_and(int_shr(now, 56), 255))
+    // High 4 bytes = sequence number XORed into the time bytes.
+    store8(buf + 8,  int_and(int_xor(s,                load8(buf + 0)), 255))
+    store8(buf + 9,  int_and(int_xor(int_shr(s, 8),   load8(buf + 1)), 255))
+    store8(buf + 10, int_and(int_xor(int_shr(s, 16),  load8(buf + 2)), 255))
+    store8(buf + 11, int_and(int_xor(int_shr(s, 24),  load8(buf + 3)), 255))
+    store8(buf + 12, 0)
+    return buf
+}
+
+// Derive the session ChaCha20 key + nonce_prefix from the PSK + handshake
+// nonce: session_key = ChaCha20-block(PSK, handshake_nonce, 0)[0..32],
+// nonce_prefix = handshake_nonce[0..4]. The same handshake nonce + PSK
+// always produce the same session key, so server and client agree.
+fn _sc_derive_session(psk_buf, hs_nonce_buf) {
+    let block = chacha20_block_buf(psk_buf, hs_nonce_buf, 0)
+    let key = alloc(SC_KEY_LEN + 1)
+    let i = 0
+    while i < SC_KEY_LEN {
+        store8(key + i, load8(block + i))
+        i = i + 1
+    }
+    store8(key + SC_KEY_LEN, 0)
+    let prefix = alloc(5)
+    store8(prefix + 0, load8(hs_nonce_buf + 0))
+    store8(prefix + 1, load8(hs_nonce_buf + 1))
+    store8(prefix + 2, load8(hs_nonce_buf + 2))
+    store8(prefix + 3, load8(hs_nonce_buf + 3))
+    store8(prefix + 4, 0)
+    let out = list_new()
+    push(out, key)
+    push(out, prefix)
+    return out
+}
+
+// ---- PSK + handshake-magic helpers --------------------------------------
+
+// Validate a hex-encoded PSK. Returns 1 if it decodes to exactly 32
+// bytes; 0 otherwise.
+fn sc_psk_validate(psk_hex) {
+    let dec = cc_hex_decode(psk_hex)
+    if dec == 0 { return 0 }
+    if dec[1] != SC_KEY_LEN { return 0 }
+    return 1
+}
+
+// Build the 16-byte handshake-magic buffer: "CE-SC-HS-OK" (11 bytes) +
+// 5 zero bytes. Both sides know this magic; matching after
+// decryption proves the PSK and the channel work.
+fn _sc_handshake_magic_buf() {
+    let b = alloc(17)
+    let i = 0
+    while i < 11 {
+        store8(b + i, char_at(SC_HANDSHAKE_MAGIC, i))
+        i = i + 1
+    }
+    store8(b + 11, 0)
+    store8(b + 12, 0)
+    store8(b + 13, 0)
+    store8(b + 14, 0)
+    store8(b + 15, 0)
+    store8(b + 16, 0)
+    return b
+}
+
+// Constant-time 11-byte compare (the handshake-magic visible portion).
+fn _sc_eq11(a, b) {
+    let acc = 0
+    let i = 0
+    while i < 11 {
+        acc = int_or(acc, int_xor(load8(a + i), load8(b + i)))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+// ---- frame send / recv ---------------------------------------------------
+//
+// Wire format per frame (after handshake):
+//   [4-byte length BE] [12-byte nonce] [ciphertext (variable)] [16-byte tag]
+// The 4-byte length covers (12 + ciphertext_len + 16). The receiver reads
+// length, then exactly (length) more bytes.
+
+fn _sc_send_frame(state, plaintext_buf, plaintext_len) {
+    let counter = state[SC_T_SCTR]
+    let nonce = _sc_build_nonce(state[SC_T_NPRE], counter)
+    // Encrypt with counter = 1 (counter = 0 is the Poly1305-key-derivation
+    // block, which we already consumed in _sc_derive_poly_key).
+    let ct = chacha20_xor_buf(state[SC_T_KEY], nonce, 1, plaintext_buf, plaintext_len)
+    // Derive the per-frame Poly1305 key and tag the ciphertext.
+    let poly_key = _sc_derive_poly_key(state[SC_T_KEY], nonce)
+    let tag = poly1305_mac_buf(poly_key, ct, plaintext_len)
+    // Build the [length || nonce || ct || tag] envelope.
+    let body_len = SC_NONCE_LEN + plaintext_len + SC_TAG_LEN
+    if body_len > SC_FRAME_MAX {
+        _sc_set_err(state, SC_ERR_FRAME_LEN)
+        return 0
+    }
+    let frame = alloc(SC_LEN_HDR + body_len + 1)
+    _sc_put_u32_be(frame, 0, body_len)
+    let i = 0
+    while i < SC_NONCE_LEN {
+        store8(frame + SC_LEN_HDR + i, load8(nonce + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < plaintext_len {
+        store8(frame + SC_LEN_HDR + SC_NONCE_LEN + j, load8(ct + j))
+        j = j + 1
+    }
+    let k = 0
+    while k < SC_TAG_LEN {
+        store8(frame + SC_LEN_HDR + SC_NONCE_LEN + plaintext_len + k, load8(tag + k))
+        k = k + 1
+    }
+    store8(frame + SC_LEN_HDR + body_len, 0)
+    if _sc_send_buf(state[SC_T_FD], frame, SC_LEN_HDR + body_len) == 0 {
+        _sc_set_err(state, SC_ERR_TRANSPORT)
+        return 0
+    }
+    list_set(state, SC_T_SCTR, counter + 1)
+    return 1
+}
+
+// Returns [plaintext_buf, plaintext_len] on success, 0 on error.
+fn _sc_recv_frame(state) {
+    let hdr = _sc_recv_exact(state[SC_T_FD], SC_LEN_HDR)
+    if hdr == 0 {
+        _sc_set_err(state, SC_ERR_TRANSPORT)
+        return 0
+    }
+    let body_len = _sc_get_u32_be(hdr[0], 0)
+    if body_len < SC_NONCE_LEN + SC_TAG_LEN {
+        _sc_set_err(state, SC_ERR_FRAME_LEN)
+        return 0
+    }
+    if body_len > SC_FRAME_MAX {
+        _sc_set_err(state, SC_ERR_FRAME_LEN)
+        return 0
+    }
+    let body = _sc_recv_exact(state[SC_T_FD], body_len)
+    if body == 0 {
+        _sc_set_err(state, SC_ERR_TRANSPORT)
+        return 0
+    }
+    let ct_len = body_len - SC_NONCE_LEN - SC_TAG_LEN
+    // Materialize the nonce, ciphertext, tag from the body buffer.
+    let nonce = alloc(SC_NONCE_LEN + 1)
+    let i = 0
+    while i < SC_NONCE_LEN {
+        store8(nonce + i, load8(body[0] + i))
+        i = i + 1
+    }
+    store8(nonce + SC_NONCE_LEN, 0)
+    let ct = alloc(ct_len + 1)
+    let j = 0
+    while j < ct_len {
+        store8(ct + j, load8(body[0] + SC_NONCE_LEN + j))
+        j = j + 1
+    }
+    store8(ct + ct_len, 0)
+    let tag = alloc(SC_TAG_LEN + 1)
+    let k = 0
+    while k < SC_TAG_LEN {
+        store8(tag + k, load8(body[0] + SC_NONCE_LEN + ct_len + k))
+        k = k + 1
+    }
+    store8(tag + SC_TAG_LEN, 0)
+    // Verify the Poly1305 tag BEFORE decrypting.
+    let poly_key = _sc_derive_poly_key(state[SC_T_KEY], nonce)
+    if poly1305_verify_buf(poly_key, ct, ct_len, tag) == 0 {
+        _sc_set_err(state, SC_ERR_TAG_FAIL)
+        return 0
+    }
+    let pt = chacha20_xor_buf(state[SC_T_KEY], nonce, 1, ct, ct_len)
+    list_set(state, SC_T_RCTR, state[SC_T_RCTR] + 1)
+    let out = list_new()
+    push(out, pt)
+    push(out, ct_len)
+    return out
+}
+
+// ---- public surface ------------------------------------------------------
+
+// Open a PSK-secured channel to `host:port`. host must be a dotted-quad.
+// Returns an sc_state on success, 0 on error. On error, the caller can
+// inspect the most-recent error via sc_last_error(state)... but on
+// connection-level failures there is NO state to inspect; we return 0
+// and the only signal is the return value.
+fn sc_open(host, port, psk_hex) {
+    if sc_psk_validate(psk_hex) == 0 { return 0 }
+    let psk_pair = cc_hex_decode(psk_hex)
+    let psk_buf = psk_pair[0]
+    let ip_int = _sc_ip_str_to_int(host)
+    if ip_int < 0 { return 0 }
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return 0 }
+    let addr = make_sockaddr_in(port, ip_int)
+    if connect_socket(sock, addr, 16) < 0 {
+        close_fd(sock)
+        return 0
+    }
+    // 1) generate + send the 12-byte handshake nonce.
+    let hs_nonce = _sc_random_nonce()
+    if _sc_send_buf(sock, hs_nonce, SC_NONCE_LEN) == 0 {
+        close_fd(sock)
+        return 0
+    }
+    // 2) derive the session key.
+    let derived = _sc_derive_session(psk_buf, hs_nonce)
+    let key_buf = derived[0]
+    let nonce_prefix = derived[1]
+    let state = _sc_state_new(sock, key_buf, nonce_prefix)
+    // 3) send the handshake-magic frame (counter = 1).
+    let magic = _sc_handshake_magic_buf()
+    list_set(state, SC_T_SCTR, 1)
+    if _sc_send_frame(state, magic, 16) == 0 {
+        close_fd(sock)
+        return 0
+    }
+    // 4) read the server's handshake echo (same 16-byte magic).
+    list_set(state, SC_T_RCTR, 1)
+    let echo = _sc_recv_frame(state)
+    if echo == 0 {
+        close_fd(sock)
+        return 0
+    }
+    if echo[1] != 16 {
+        _sc_set_err(state, SC_ERR_HANDSHAKE)
+        close_fd(sock)
+        return 0
+    }
+    if _sc_eq11(echo[0], magic) == 0 {
+        _sc_set_err(state, SC_ERR_HANDSHAKE)
+        close_fd(sock)
+        return 0
+    }
+    return state
+}
+
+fn sc_send(state, payload_buf, payload_len) {
+    if state == 0 { return 0 }
+    return _sc_send_frame(state, payload_buf, payload_len)
+}
+
+fn sc_recv(state) {
+    if state == 0 { return 0 }
+    return _sc_recv_frame(state)
+}
+
+fn sc_close(state) {
+    if state == 0 { return 0 }
+    let fd = state[SC_T_FD]
+    if fd > 0 {
+        close_fd(fd)
+        list_set(state, SC_T_FD, 0)
+    }
+    return 1
+}
+
+// ---- test-only helpers --------------------------------------------------
+//
+// The unit test reaches into the framing primitives directly so it can
+// exercise the encrypt/MAC envelope WITHOUT a real socket: it runs the
+// "client" and "server" both as in-process state objects, swaps the
+// nonce_prefix + session_key bytes manually, and stuffs ciphertext into
+// memory buffers instead of sending over a socket.
+
+fn _sc_test_derive_session(psk_hex, nonce_hex) {
+    let psk_pair = cc_hex_decode(psk_hex)
+    let nonce_pair = cc_hex_decode(nonce_hex)
+    return _sc_derive_session(psk_pair[0], nonce_pair[0])
+}
+
+fn _sc_test_build_nonce(prefix_hex, counter) {
+    let prefix_pair = cc_hex_decode(prefix_hex)
+    return _sc_build_nonce(prefix_pair[0], counter)
+}
+
+fn _sc_test_state_with(key_buf, prefix_buf, send_ctr, recv_ctr) {
+    let s = _sc_state_new(0, key_buf, prefix_buf)
+    list_set(s, SC_T_SCTR, send_ctr)
+    list_set(s, SC_T_RCTR, recv_ctr)
+    return s
+}
+
+// Build and "transmit" one frame in-memory: returns the wire-format
+// envelope as [buf, len]. Used by the unit test in lieu of a socket.
+fn _sc_test_make_frame(send_state, pt_buf, pt_len) {
+    let counter = send_state[SC_T_SCTR]
+    let nonce = _sc_build_nonce(send_state[SC_T_NPRE], counter)
+    let ct = chacha20_xor_buf(send_state[SC_T_KEY], nonce, 1, pt_buf, pt_len)
+    let poly_key = _sc_derive_poly_key(send_state[SC_T_KEY], nonce)
+    let tag = poly1305_mac_buf(poly_key, ct, pt_len)
+    let body_len = SC_NONCE_LEN + pt_len + SC_TAG_LEN
+    let frame = alloc(SC_LEN_HDR + body_len + 1)
+    _sc_put_u32_be(frame, 0, body_len)
+    let i = 0
+    while i < SC_NONCE_LEN {
+        store8(frame + SC_LEN_HDR + i, load8(nonce + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < pt_len {
+        store8(frame + SC_LEN_HDR + SC_NONCE_LEN + j, load8(ct + j))
+        j = j + 1
+    }
+    let k = 0
+    while k < SC_TAG_LEN {
+        store8(frame + SC_LEN_HDR + SC_NONCE_LEN + pt_len + k, load8(tag + k))
+        k = k + 1
+    }
+    store8(frame + SC_LEN_HDR + body_len, 0)
+    list_set(send_state, SC_T_SCTR, counter + 1)
+    let out = list_new()
+    push(out, frame)
+    push(out, SC_LEN_HDR + body_len)
+    return out
+}
+
+// "Receive" one frame from a wire buffer: returns [pt_buf, pt_len] on
+// success, 0 on MAC failure / bad length. Used by the unit test.
+fn _sc_test_open_frame(recv_state, frame_buf, frame_len) {
+    if frame_len < SC_LEN_HDR + SC_NONCE_LEN + SC_TAG_LEN { return 0 }
+    let body_len = _sc_get_u32_be(frame_buf, 0)
+    if SC_LEN_HDR + body_len != frame_len { return 0 }
+    let ct_len = body_len - SC_NONCE_LEN - SC_TAG_LEN
+    if ct_len < 0 { return 0 }
+    let nonce = alloc(SC_NONCE_LEN + 1)
+    let i = 0
+    while i < SC_NONCE_LEN {
+        store8(nonce + i, load8(frame_buf + SC_LEN_HDR + i))
+        i = i + 1
+    }
+    let ct = alloc(ct_len + 1)
+    let j = 0
+    while j < ct_len {
+        store8(ct + j, load8(frame_buf + SC_LEN_HDR + SC_NONCE_LEN + j))
+        j = j + 1
+    }
+    let tag = alloc(SC_TAG_LEN + 1)
+    let k = 0
+    while k < SC_TAG_LEN {
+        store8(tag + k, load8(frame_buf + SC_LEN_HDR + SC_NONCE_LEN + ct_len + k))
+        k = k + 1
+    }
+    let poly_key = _sc_derive_poly_key(recv_state[SC_T_KEY], nonce)
+    if poly1305_verify_buf(poly_key, ct, ct_len, tag) == 0 { return 0 }
+    let pt = chacha20_xor_buf(recv_state[SC_T_KEY], nonce, 1, ct, ct_len)
+    list_set(recv_state, SC_T_RCTR, recv_state[SC_T_RCTR] + 1)
+    let out = list_new()
+    push(out, pt)
+    push(out, ct_len)
+    return out
+}

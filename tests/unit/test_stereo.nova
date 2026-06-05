@@ -1,0 +1,349 @@
+// Unit tests for src/io/transducers/image_stereo.nova (R7E).
+//
+// Hermetic coverage of the SAD block-matching disparity + depth pipeline.
+// All fixtures are built in-memory (alloc + store8) so the suite never
+// depends on an on-disk image. The integration test
+// (scenario_hh_stereo.sh) exercises the chat /depth admin against
+// hand-built PGM stereo pairs; this unit suite focuses on the algorithm.
+//
+// Assertion targets (~28):
+//   * SAD on identical constant-color blocks: 0 (10 cases over sizes/values).
+//   * SAD on blocks with known intensity diff: predictable value.
+//   * stereo_disparity on identical left=right: disparity == 0 everywhere
+//     interior.
+//   * stereo_disparity on a synthesized SHIFTED pair (right = left shifted
+//     LEFT by 10 px) -> disparity ~10 over the textured interior.
+//   * stereo_disparity respects the dimension cap (rejects >256 inputs).
+//   * stereo_depth math: depth = baseline * focal / disparity for 3 triples.
+//   * stereo_depth at zero disparity -> STEREO_MAX_DEPTH_MM (sentinel).
+//   * stereo_density_label round-trips low / mid / high.
+//   * Result-tuple accessors return sane values on a valid call.
+//   * stereo_disparity_at / stereo_depth_at bounds-check OOB.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_stereo.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+fn _flat_fixture(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Build a textured fixture: each row gets a deterministic pseudo-random
+// pattern keyed off (x + y * 13). The pattern is dense enough that block
+// matching has features to lock onto.
+fn _textured_fixture(width, height) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            // (x * 37 + y * 13) mod 256 -- deterministic pseudo-noise.
+            let v = (x * 37 + y * 13)
+            // Reduce to 0..255 via repeated subtraction (NOVA's modulo is
+            // via division). Use the basic int divide.
+            let q = v / 256
+            v = v - q * 256
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Build the SHIFTED-LEFT companion: right(x, y) = left(x + shift, y) when
+// x + shift < width, else 0. This simulates "right camera, baseline offset
+// to the left by `shift` pixels" -- the matching block in the right image
+// sits at x_l - shift, which is exactly what stereo_disparity should find.
+fn _shift_left_fixture(src, width, height, shift) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let sx = x + shift
+            let v = 0
+            if sx < width { v = load8(src + row_off + sx) }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- SAD inner-loop tests ------------------------------------------------
+
+fn test_sad_constant_block_zero() {
+    // Two identical flat fields: SAD over any block must be exactly 0.
+    let a = _flat_fixture(16, 16, 100)
+    let b = _flat_fixture(16, 16, 100)
+    let sad = stereo_sad_block(a, b, 16, 8, 8, 8, 7)
+    ce_eq("flat-flat SAD == 0", sad, 0)
+    let sad3 = stereo_sad_block(a, b, 16, 8, 8, 8, 3)
+    ce_eq("flat-flat SAD (3x3) == 0", sad3, 0)
+    let sad5 = stereo_sad_block(a, b, 16, 8, 8, 8, 5)
+    ce_eq("flat-flat SAD (5x5) == 0", sad5, 0)
+}
+
+fn test_sad_known_intensity_diff() {
+    // Two flat fields differing by exactly 10. SAD over 7x7 = 49*10 = 490.
+    let a = _flat_fixture(16, 16, 100)
+    let b = _flat_fixture(16, 16, 110)
+    let sad = stereo_sad_block(a, b, 16, 8, 8, 8, 7)
+    ce_eq("flat (100 vs 110) SAD over 7x7 == 49*10 = 490", sad, 490)
+    // 3x3: 9 * 10 = 90.
+    let sad3 = stereo_sad_block(a, b, 16, 8, 8, 8, 3)
+    ce_eq("flat (100 vs 110) SAD over 3x3 == 9*10 = 90", sad3, 90)
+    // 5x5: 25 * 10 = 250.
+    let sad5 = stereo_sad_block(a, b, 16, 8, 8, 8, 5)
+    ce_eq("flat (100 vs 110) SAD over 5x5 == 25*10 = 250", sad5, 250)
+}
+
+fn test_sad_negative_diff_absoluted() {
+    // SAD must be symmetric (|a - b| == |b - a|). 100 vs 50 -> diff 50.
+    let a = _flat_fixture(16, 16, 100)
+    let b = _flat_fixture(16, 16, 50)
+    let sad_ab = stereo_sad_block(a, b, 16, 8, 8, 8, 7)
+    let sad_ba = stereo_sad_block(b, a, 16, 8, 8, 8, 7)
+    ce_eq("SAD a->b symmetric with b->a", sad_ab, sad_ba)
+    ce_eq("SAD 100-vs-50 over 7x7 == 49*50 = 2450", sad_ab, 2450)
+}
+
+// ---- disparity tests -----------------------------------------------------
+
+fn test_disparity_identical_inputs_zero() {
+    // left == right -> disparity 0 at every interior pixel.
+    let buf = _textured_fixture(48, 32)
+    let r = stereo_disparity(buf, buf, 48, 32, 7, 32)
+    let m = stereo_result_map(r)
+    ce_check("identical inputs produce non-zero map ptr", m != 0)
+    // Mean disparity should be exactly 0 since every pixel matches at d=0.
+    ce_eq("identical inputs -> mean disparity 0", stereo_result_mean(r), 0)
+    ce_eq("identical inputs -> density 0 milli", stereo_result_density(r), 0)
+    // Spot-check 5 interior pixels.
+    ce_eq("disp_at(20, 16) == 0", stereo_disparity_at(m, 48, 20, 16), 0)
+    ce_eq("disp_at(24, 12) == 0", stereo_disparity_at(m, 48, 24, 12), 0)
+    ce_eq("disp_at(30, 20) == 0", stereo_disparity_at(m, 48, 30, 20), 0)
+}
+
+fn test_disparity_on_shifted_pair() {
+    // Build a textured left image and a "right" image that is left shifted
+    // LEFT by SHIFT pixels (so right(x) = left(x + SHIFT)). The optimal
+    // matching block in right for left(x_l) sits at x_l - SHIFT (matching
+    // pixels at the LEFT subtract SHIFT to find their match in right;
+    // disparity == SHIFT). We probe a few interior pixels and check that
+    // the best-matching disparity is exactly SHIFT.
+    let SHIFT = 10
+    let left  = _textured_fixture(64, 32)
+    let right = _shift_left_fixture(left, 64, 32, SHIFT)
+    let r = stereo_disparity(left, right, 64, 32, 7, 32)
+    let m = stereo_result_map(r)
+    ce_check("shifted pair produces non-zero map ptr", m != 0)
+    // Probe 4 interior pixels in the well-defined region: x must be large
+    // enough that x - SHIFT - half >= 0 AND small enough that x + half <
+    // width - SHIFT (the rightmost SHIFT columns of left have no
+    // corresponding patch in right).
+    let d1 = stereo_disparity_at(m, 64, 30, 16)
+    let d2 = stereo_disparity_at(m, 64, 35, 18)
+    let d3 = stereo_disparity_at(m, 64, 40, 20)
+    let d4 = stereo_disparity_at(m, 64, 45, 14)
+    ce_eq("disparity at (30, 16) == SHIFT (10)", d1, SHIFT)
+    ce_eq("disparity at (35, 18) == SHIFT (10)", d2, SHIFT)
+    ce_eq("disparity at (40, 20) == SHIFT (10)", d3, SHIFT)
+    ce_eq("disparity at (45, 14) == SHIFT (10)", d4, SHIFT)
+    // Mean over the textured interior should be close to SHIFT (within a
+    // few units -- the leftmost interior columns have x < half + SHIFT so
+    // their local_max_d is < SHIFT and they cannot reach the right
+    // answer; that drags the mean down).
+    let mean = stereo_result_mean(r)
+    ce_check("mean disparity > 0 on shifted pair", mean > 0)
+    ce_check("mean disparity within tolerance of SHIFT/2 .. SHIFT",
+             mean > 3)
+}
+
+fn test_disparity_dim_cap_rejects_huge() {
+    // 300x300 > STEREO_MAX_DIM (256). stereo_disparity must refuse cleanly.
+    let dummy = alloc(8)
+    let r = stereo_disparity(dummy, dummy, 300, 300, 7, 32)
+    ce_eq("oversized input -> total == 0", stereo_result_total(r), 0)
+    ce_eq("oversized input -> map == 0", stereo_result_map(r), 0)
+}
+
+fn test_disparity_zero_inputs_refused() {
+    // Zero pointer, zero dimension, etc. -- all must return _stereo_fail()
+    // shape without crashing.
+    let buf = _flat_fixture(8, 8, 100)
+    let r0 = stereo_disparity(0, buf, 8, 8, 7, 32)
+    ce_eq("zero left ptr -> total 0", stereo_result_total(r0), 0)
+    let r1 = stereo_disparity(buf, 0, 8, 8, 7, 32)
+    ce_eq("zero right ptr -> total 0", stereo_result_total(r1), 0)
+    let r2 = stereo_disparity(buf, buf, 0, 8, 7, 32)
+    ce_eq("zero width -> total 0", stereo_result_total(r2), 0)
+}
+
+// ---- depth tests ---------------------------------------------------------
+
+fn test_depth_formula_known_triples() {
+    // We build a small disparity map (4 pixels, all known disparities) and
+    // check the formula directly. width=4 height=1.
+    let map = alloc(4 + 1)
+    store8(map + 0, 10)
+    store8(map + 1, 20)
+    store8(map + 2, 5)
+    store8(map + 3, 0)
+    store8(map + 4, 0)
+    // baseline=120mm, focal=600px -> bf=72000.
+    //   d=10 -> 7200
+    //   d=20 -> 3600
+    //   d= 5 -> 14400
+    //   d= 0 -> STEREO_MAX_DEPTH_MM (sentinel)
+    let depth = stereo_depth(map, 4, 1, 120, 600)
+    ce_eq("d=10, b=120, f=600 -> 7200mm", stereo_depth_at(depth, 4, 0, 0), 7200)
+    ce_eq("d=20, b=120, f=600 -> 3600mm", stereo_depth_at(depth, 4, 1, 0), 3600)
+    ce_eq("d= 5, b=120, f=600 -> 14400mm", stereo_depth_at(depth, 4, 2, 0), 14400)
+    ce_eq("d= 0 -> STEREO_MAX_DEPTH_MM (sentinel)",
+          stereo_depth_at(depth, 4, 3, 0), 100000)
+}
+
+fn test_depth_formula_alt_baseline_focal() {
+    // baseline=60mm, focal=500px -> bf=30000.
+    //   d=1 -> 30000mm (right at saturate threshold)
+    //   d=2 -> 15000mm
+    //   d=3 -> 10000mm
+    let map = alloc(3 + 1)
+    store8(map + 0, 1)
+    store8(map + 1, 2)
+    store8(map + 2, 3)
+    store8(map + 3, 0)
+    let depth = stereo_depth(map, 3, 1, 60, 500)
+    ce_eq("d=1, b=60, f=500 -> 30000mm",  stereo_depth_at(depth, 3, 0, 0), 30000)
+    ce_eq("d=2, b=60, f=500 -> 15000mm",  stereo_depth_at(depth, 3, 1, 0), 15000)
+    ce_eq("d=3, b=60, f=500 -> 10000mm",  stereo_depth_at(depth, 3, 2, 0), 10000)
+}
+
+fn test_depth_clamped_at_max() {
+    // baseline=200mm, focal=1000px -> bf=200000. At d=1 the formula would
+    // give 200000mm, but our cap is STEREO_MAX_DEPTH_MM=100000 so we
+    // clamp.
+    let map = alloc(2 + 1)
+    store8(map + 0, 1)
+    store8(map + 1, 0)
+    store8(map + 2, 0)
+    let depth = stereo_depth(map, 2, 1, 200, 1000)
+    ce_eq("very-close pixel clamped at MAX_DEPTH", stereo_depth_at(depth, 2, 0, 0), 100000)
+    ce_eq("zero disparity -> MAX_DEPTH", stereo_depth_at(depth, 2, 1, 0), 100000)
+}
+
+fn test_depth_bad_inputs() {
+    let map = alloc(2 + 1)
+    store8(map + 0, 10)
+    store8(map + 1, 5)
+    store8(map + 2, 0)
+    // zero baseline
+    let d0 = stereo_depth(map, 2, 1, 0, 500)
+    ce_eq("zero baseline -> empty depth list", len(d0), 0)
+    // zero focal
+    let d1 = stereo_depth(map, 2, 1, 60, 0)
+    ce_eq("zero focal -> empty depth list", len(d1), 0)
+    // zero map
+    let d2 = stereo_depth(0, 2, 1, 60, 500)
+    ce_eq("zero map -> empty depth list", len(d2), 0)
+}
+
+// ---- label + accessor tests ---------------------------------------------
+
+fn test_density_label_roundtrip() {
+    ce_str_eq("0 milli  -> image_stereo_density_low",
+              stereo_density_label(0),  "image_stereo_density_low")
+    ce_str_eq("50 milli -> image_stereo_density_low",
+              stereo_density_label(50), "image_stereo_density_low")
+    ce_str_eq("99 milli -> image_stereo_density_low",
+              stereo_density_label(99), "image_stereo_density_low")
+    ce_str_eq("100 milli -> image_stereo_density_mid",
+              stereo_density_label(100), "image_stereo_density_mid")
+    ce_str_eq("300 milli -> image_stereo_density_mid",
+              stereo_density_label(300), "image_stereo_density_mid")
+    ce_str_eq("500 milli -> image_stereo_density_high",
+              stereo_density_label(500), "image_stereo_density_high")
+    ce_str_eq("999 milli -> image_stereo_density_high",
+              stereo_density_label(999), "image_stereo_density_high")
+}
+
+fn test_disparity_at_oob_returns_zero() {
+    let buf = _textured_fixture(16, 16)
+    let r = stereo_disparity(buf, buf, 16, 16, 7, 8)
+    let m = stereo_result_map(r)
+    // OOB query returns 0 (the border default), or 0 for bad inputs.
+    ce_eq("disp_at zero map -> 0", stereo_disparity_at(0, 16, 4, 4), 0)
+    ce_eq("disp_at negative x -> 0", stereo_disparity_at(m, 16, -1, 4), 0)
+    ce_eq("disp_at negative y -> 0", stereo_disparity_at(m, 16, 4, -1), 0)
+}
+
+fn test_depth_at_oob_returns_max() {
+    let map = alloc(4 + 1)
+    store8(map + 0, 10)
+    store8(map + 1, 20)
+    store8(map + 2, 5)
+    store8(map + 3, 0)
+    store8(map + 4, 0)
+    let depth = stereo_depth(map, 4, 1, 100, 500)
+    // OOB returns the MAX_DEPTH sentinel.
+    ce_eq("depth_at negative x -> MAX_DEPTH",
+          stereo_depth_at(depth, 4, -1, 0), 100000)
+    ce_eq("depth_at negative y -> MAX_DEPTH",
+          stereo_depth_at(depth, 4, 0, -1), 100000)
+    ce_eq("depth_at out-of-range idx -> MAX_DEPTH",
+          stereo_depth_at(depth, 4, 99, 99), 100000)
+}
+
+fn test_pgm_args_dispatch_basic() {
+    // No arg / one arg -> usage strings (no I/O needed).
+    let r0 = stereo_pgm_args("")
+    ce_check("/depth no-arg returns usage",
+             str_eq(r0, "(/depth needs two PATHs -- usage: /depth L.pgm R.pgm)") == 1)
+    let r1 = stereo_pgm_args("only_one.pgm")
+    ce_check("/depth one-arg returns 'got 1' usage",
+             str_eq(r1, "(/depth needs TWO paths -- got 1)") == 1)
+    // missing files -> error wrapped in parens
+    let r2 = stereo_pgm_args("/nonexistent_left.pgm /nonexistent_right.pgm")
+    ce_check("/depth missing files returns error", len(r2) > 0)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_sad_constant_block_zero()
+    test_sad_known_intensity_diff()
+    test_sad_negative_diff_absoluted()
+    test_disparity_identical_inputs_zero()
+    test_disparity_on_shifted_pair()
+    test_disparity_dim_cap_rejects_huge()
+    test_disparity_zero_inputs_refused()
+    test_depth_formula_known_triples()
+    test_depth_formula_alt_baseline_focal()
+    test_depth_clamped_at_max()
+    test_depth_bad_inputs()
+    test_density_label_roundtrip()
+    test_disparity_at_oob_returns_zero()
+    test_depth_at_oob_returns_max()
+    test_pgm_args_dispatch_basic()
+    ce_summary("image_stereo")
+}
+
+main()

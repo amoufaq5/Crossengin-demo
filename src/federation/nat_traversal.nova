@@ -1,0 +1,1473 @@
+// CrossEngin federation: NAT traversal -- STUN-like external address
+// discovery + gossip-piggyback advertisement (R23E) + RFC 8489 STUN
+// wire migration (R31C / R30C.2) + UDP datagram dispatch (R32A /
+// R31C.2 / R28C consumer) + stateless-caller UDP threading
+// (R33E / R32A.2).
+//
+// R33E closes the R32A.2 caveat: before R33E, `nat_query_stun(addr)`
+// (the stateless form) and `nat_detect_type(addr1, addr2)` (which is
+// built on top of it) walked the legacy TCP-text path EVEN when
+// `CE_NAT_USE_RFC8489=1` was set, because the RFC 8489 codec needs a
+// `stun_state_t` slot for transaction-id tracking and credentials and
+// the stateless caller has no `nat_state_t` to hang it on. R33E threads
+// a transient `nat_state_t` through these callers: when the env flag
+// is on, the stateless dispatcher allocates a per-call `nat_state_t`
+// internally, runs the full UDP path, harvests the external address,
+// and discards the state. Counters are still bumped (on the transient
+// state during the call) but additionally mirrored into a module-level
+// "last stateless call" snapshot so tests + status lines can confirm
+// the UDP path was actually taken.
+//
+// Approach (a): transient-per-call. Each stateless call gets a fresh
+//   `nat_state_t` allocated on entry, used internally, and dropped on
+//   exit. There is NO shared mutable state across calls.
+//   Rationale: concurrency-safe by construction (two callers cannot
+//   stomp on each other's stun_state.txn_id), API-preserving (no
+//   caller-visible state allocation), and the per-call alloc cost is
+//   dwarfed by the UDP round-trip cost (~ms vs ~us alloc).
+// Approach (b) considered but rejected: a module-singleton
+//   `stun_state_t`. Simpler to implement but introduces shared mutable
+//   state with all the standard concurrency hazards (two concurrent
+//   stateless calls would race on the same txn id slot, the second
+//   call's response could be parsed against the first call's txn id).
+//
+// Purpose
+//   R18E (`src/federation/gossip.nova`) ships a SWIM-style gossip mesh
+//   that assumes every peer can directly reach every other peer's TCP
+//   port. Real-world federation across home networks, mobile devices,
+//   and corporate firewalls violates this assumption: peers behind a
+//   NAT can OUT-connect (the NAT creates a temporary mapping at egress)
+//   but cannot accept INBOUND connections on their internal addr/port.
+//   The canonical fix is the STUN/TURN/ICE stack -- discover the
+//   external addr via a rendezvous server, advertise it to peers, and
+//   hole-punch to establish reciprocal flows.
+//
+//   R23E shipped the discovery + advertisement half on TCP using a
+//   STUN-LIKE newline-text wire (`STUN_REQUEST\n` / `EXTERNAL
+//   <ip>:<port>\n`). That wire was convenient for soul-to-soul
+//   federation but it is NOT RFC 8489 compliant -- no 20-byte header
+//   with magic cookie 0x2112A442, no TLV attribute block, no
+//   XOR-MAPPED-ADDRESS, no MESSAGE-INTEGRITY HMAC-SHA1, no
+//   FINGERPRINT CRC32 XOR. A browser asked to send STUN to that wire
+//   times out.
+//
+//   R30C (commit `07ba781`) shipped `src/federation/stun_rfc8489.nova`
+//   -- a true RFC 8489 STUN client wire codec. R31C migrates this
+//   module's wire functions through it. The migration shape:
+//
+//   * The R23E STUN-LIKE TCP text wire is **default-on**. The
+//     integration scenario_oooo multiplexes STUN_REQUEST against
+//     GOSSIP_HELLO on the same TCP listener by looking at the first
+//     newline-terminated text line: making the default RFC 8489
+//     would break that dispatcher (binary frames have no leading
+//     ASCII prefix). All 53 existing R23E assertions pass byte-
+//     identical with the legacy path.
+//   * NEW helpers `nat_emit_rfc8489_binding_request`,
+//     `nat_parse_rfc8489_binding_response`,
+//     `nat_format_rfc8489_success_response_ipv4`, and high-level
+//     `nat_send_binding_request` / `nat_recv_binding_response`
+//     route through R30C's `stun_rfc8489.nova` and produce / consume
+//     real RFC 8489 wire bytes. These are the path a browser or any
+//     standard STUN server can interoperate with.
+//   * `nat_query_stun_with_state` honors `CE_NAT_USE_RFC8489=1` (env
+//     flag) to dispatch through the RFC 8489 codec when the dialer
+//     speaks the real wire. Default 0 = legacy text wire.
+//   * `nat_state` gains a `stun_rfc8489_state` slot constructed
+//     lazily so existing R23E callers never see it.
+//
+// Protocol (R23E legacy, default-on)
+//
+//   1. External address discovery -- the peer dials a STUN-like
+//      rendezvous server. Wire:
+//
+//          dialer >> STUN_REQUEST\n
+//          server >> EXTERNAL <ip>:<port>\n
+//
+//      The server learns the dialer's external addr from the kernel
+//      via `accept_conn(server_fd, sa_buf, sa_len_ptr)`: the
+//      `struct sockaddr_in` slot the kernel fills carries the peer's
+//      IP + port AS OBSERVED ON THE SERVER SIDE -- which for a NATed
+//      dialer is the public mapping. In sandbox tests with
+//      127.0.0.1, the server sees `127.0.0.1:<ephemeral>`.
+//
+//   2. Gossip-piggyback advertisement (unchanged):
+//          EXTADDR <self_internal_addr> <external_addr>\n
+//
+//      Receivers update their per-peer external-addr table. The gossip
+//      handler's EXTADDR parser branch (gossip.nova) writes into
+//      nat_state via the pinned cross-module slot.
+//
+//   3. NAT type detection (heuristic): query TWO STUN servers, compare:
+//          two queries same external port  -> "cone" NAT
+//          two queries different ext ports -> "symmetric" NAT
+//          ext addr == one of local addrs  -> "open" (no NAT)
+//          query fails entirely            -> "blocked"
+//
+//   4. Hole punching (STUB, R23E.2) -- nat_hole_punch returns 0.
+//
+// Protocol (R31C RFC 8489 path)
+//
+//   1. `nat_send_binding_request(state, remote_addr, software)` builds
+//      an RFC 8489 Binding Request through `stun_send_binding_request`
+//      (20-byte header with magic cookie + 12-byte txn id; SOFTWARE +
+//      USERNAME + MESSAGE-INTEGRITY + FINGERPRINT attributes per the
+//      configured credentials). Returns `[pkt_buf, n, txn_id_buf]`.
+//   2. `nat_recv_binding_response(state, pkt_buf, n)` parses an RFC
+//      8489 Binding Success / Error Response via `stun_recv`, maps
+//      XOR-MAPPED-ADDRESS into `nat_state.mapped_addr` (the
+//      NAT_S_MY_EXTERNAL slot), and bumps the same counters
+//      `nat_query_count` / `nat_query_ok_count` so the R23E status
+//      line stays the source of truth.
+//   3. RFC 8489 is a UDP datagram protocol. R32A wires the actual UDP
+//      datagram round-trip through R28C's `sys_socket_udp`,
+//      `sys_sendto`, and `sys_recvfrom` builtins. When
+//      `CE_NAT_USE_RFC8489=1` is set in the env,
+//      `nat_query_stun_with_state` opens a UDP socket, dispatches the
+//      Binding Request through the R30C codec, waits up to
+//      `CE_NAT_RFC8489_TIMEOUT_MS` (default 1000ms) for a Binding
+//      Success Response, and reflects the XOR-MAPPED-ADDRESS into
+//      `NAT_S_MY_EXTERNAL`. When the env flag is unset / 0, the TCP
+//      text path is bit-identical with R23E + R31C.
+//
+// Protocol (R32A / R31C.2 UDP dispatch path)
+//
+//   1. `nat_query_stun_with_state(state, stun_addr)`:
+//          * If `CE_NAT_USE_RFC8489=1` -> dispatch through
+//            `nat_udp_query_rfc8489_with_state(state, stun_addr)`.
+//          * Otherwise -> legacy TCP text path.
+//   2. `nat_udp_query_rfc8489_with_state` internally calls split
+//      helpers `nat_udp_open()`, `nat_udp_send_binding_request_at(...)`,
+//      `nat_udp_recv_binding_response(...)`, `close_fd(fd)`. The
+//      same helpers are reusable for tests that drive both sides
+//      manually inside one process (loopback UDP echo).
+//   3. The UDP-specific counters are
+//      `NAT_S_UDP_SENT`  -- successful `sys_sendto` calls
+//      `NAT_S_UDP_RECVD` -- successful `sys_recvfrom` parses
+//      `NAT_S_UDP_TIMEOUTS` -- `sys_recvfrom` timeouts
+//      Accessors: `nat_udp_sent_count`, `nat_udp_recvd_count`,
+//      `nat_udp_timeout_count`. Mirrors R31C convention.
+//
+// Public API
+//
+//   nat_init()                                       -> nat_state_t
+//   nat_query_stun(addr)                             -> ext_addr | 0
+//   nat_query_stun_with_state(state, addr)           -> ext_addr | 0
+//   nat_serve_stun_conn(conn_fd, peer_ip, peer_port) -> 1 | 0
+//   nat_serve_stun_conn_sa(conn_fd, sa_buf)          -> 1 | 0
+//   nat_serve_stun_one_shot(bind_addr)               -> 1 | 0
+//   nat_advertise(gossip_state, nat_state, ext_addr) -> int
+//   nat_peer_external_addrs(state)                   -> list of [internal, external]
+//   nat_local_addrs()                                -> list of addr strings
+//   nat_detect_type(addr1, addr2)                    -> str
+//   nat_detect_type_from_replies(reply1, reply2)     -> str
+//   nat_hole_punch(state, addr)                      -> 0 (stub)
+//   nat_status_line(state)                           -> one-line summary
+//
+//   R31C / RFC 8489 additions:
+//
+//   nat_use_rfc8489_enabled()                        -> 1 | 0
+//   nat_rfc8489_state(state)                         -> stun_state_t
+//   nat_set_rfc8489_credentials(state, user, pass)   -> 0
+//   nat_emit_rfc8489_binding_request(state, software) -> [pkt, n, txn]
+//   nat_parse_rfc8489_binding_response(state, pkt, n) -> [ip, port, family] | 0
+//   nat_format_rfc8489_success_response_ipv4(txn, ip, port, software,
+//                                            user, pass) -> [pkt, n]
+//   nat_send_binding_request(state, remote_addr, software) -> [pkt, n, txn]
+//   nat_recv_binding_response(state, pkt, n)         -> 1 | 0 (updates state)
+//
+//   R32A / R31C.2 / R28C consumer additions:
+//
+//   nat_rfc8489_timeout_ms_from_env()                 -> ms (default 1000)
+//   nat_udp_open()                                    -> fd | -1
+//   nat_udp_send_binding_request_at(fd, state, ip,
+//                                   port, software)   -> [pkt, n, txn] | 0
+//   nat_udp_recv_binding_response(fd, state,
+//                                 timeout_ms)         -> 1 | 0 (-1 timeout)
+//   nat_udp_query_rfc8489_with_state(state, addr)     -> ext_addr | 0
+//   nat_udp_sent_count(state)                         -> int
+//   nat_udp_recvd_count(state)                        -> int
+//   nat_udp_timeout_count(state)                      -> int
+//
+//   R33E / R32A.2 additions (stateless-caller UDP threading):
+//
+//   nat_stateless_last_path()                         -> "udp" | "tcp" | "none"
+//   nat_stateless_last_udp_sent()                     -> int (last call's _SENT)
+//   nat_stateless_last_udp_recvd()                    -> int (last call's _RECVD)
+//   nat_stateless_last_udp_timeouts()                 -> int (last call's _TIMEOUTS)
+//   nat_stateless_last_external()                     -> str (last call's external)
+//   nat_stateless_last_error()                        -> str (last call's last_error)
+//   nat_stateless_reset_stats()                       -> 0  (zero the snapshot)
+//   nat_query_stun_stateless_udp(addr)                -> ext_addr | 0
+//                                                      (always UDP path,
+//                                                       allocates a transient
+//                                                       nat_state_t)
+//
+//   Plus helpers exercised by the unit tests: nat_parse_stun_response,
+//   nat_format_stun_response, nat_extract_peer_addr, nat_alloc_sa_buf,
+//   nat_alloc_sa_len, nat_set_external, nat_get_external,
+//   nat_set_peer_external, nat_get_peer_external,
+//   nat_record_inbound_extaddr, nat_query_count, nat_query_ok_count,
+//   nat_advertise_count, nat_inbound_ad_count.
+//
+// ADRs implemented: registers ADR-0086 (NAT traversal substrate).
+//   Migrates the wire half to ADR-0094 (RFC 8489 STUN, registered by
+//   R30C) via the new helpers, leaving the gossip-piggyback layer
+//   on top untouched.
+// NOVA dependencies: socket(2,1,0), bind/listen/accept/connect,
+// send/recv, close_fd, getenv, alloc/load8/store8/store64.
+// CrossEngin dependencies: src/federation/gossip.nova,
+// src/federation/stun_rfc8489.nova (R31C, RFC 8489 wire).
+
+import "std/io"
+import "./gossip.nova"
+import "./stun_rfc8489.nova"
+
+// ---- protocol constants ---------------------------------------------------
+
+let NAT_DEFAULT_STUN_PORT  = 8770
+let NAT_LINE_MAX           = 1024
+let NAT_CONNECT_RETRIES    = 3
+let NAT_CONNECT_DELAY_MS   = 50
+let NAT_QUERY_TIMEOUT_MS   = 500
+
+let NAT_STUN_REQUEST_LINE  = "STUN_REQUEST"
+let NAT_EXTERNAL_PREFIX    = "EXTERNAL "
+let NAT_EXTADDR_PREFIX     = "EXTADDR "
+
+let NAT_TYPE_OPEN      = "open"
+let NAT_TYPE_CONE      = "cone"
+let NAT_TYPE_SYMMETRIC = "symmetric"
+let NAT_TYPE_BLOCKED   = "blocked"
+
+// ---- nat_state_t record indices ------------------------------------------
+
+let NAT_S_MY_EXTERNAL    = 0
+let NAT_S_PEER_EXT_TABLE = 1
+let NAT_S_TYPE_GUESS     = 2
+let NAT_S_QUERIES        = 3
+let NAT_S_QUERIES_OK     = 4
+let NAT_S_ADVERTS        = 5
+let NAT_S_INBOUND_ADS    = 6
+let NAT_S_HOLE_PUNCHES   = 7
+let NAT_S_LAST_ERROR     = 8
+let NAT_S_STUN_STATE     = 9   // R31C: lazy stun_rfc8489 state, 0 until requested
+let NAT_S_RFC_REQUESTS   = 10  // R31C: count RFC 8489 binding requests emitted
+let NAT_S_RFC_OK         = 11  // R31C: count RFC 8489 success responses parsed
+let NAT_S_RFC_BAD        = 12  // R31C: count RFC 8489 bad / mismatched responses
+let NAT_S_UDP_SENT       = 13  // R32A: count successful sys_sendto dispatches
+let NAT_S_UDP_RECVD      = 14  // R32A: count successful sys_recvfrom + parses
+let NAT_S_UDP_TIMEOUTS   = 15  // R32A: count sys_recvfrom timeouts (no datagram)
+
+// R32A: default RFC 8489 UDP recv timeout in milliseconds. Env override
+// via CE_NAT_RFC8489_TIMEOUT_MS; the env value MUST be a positive int.
+let NAT_RFC8489_DEFAULT_TIMEOUT_MS = 1000
+
+// R33E: module-level snapshot of the most recent stateless call's
+// dispatch decision + counters. Each new stateless call OVERWRITES this
+// snapshot; it is NOT cumulative. This is the observability hook that
+// lets tests + status lines confirm a stateless UDP dispatch happened
+// without exposing a caller-side `nat_state_t`. The snapshot is a
+// 6-element list, indexed by NAT_SL_* constants below.
+//
+// Concurrency note: a single shared snapshot CAN race if two stateless
+// callers run concurrently (the second writer wins). This is acceptable
+// because (a) the snapshot is observational, not authoritative -- the
+// per-call transient `nat_state_t` IS the authoritative state used by
+// the codec -- and (b) NOVA is single-threaded today so there is no
+// actual concurrent writer. If a future runtime threads stateless
+// queries, callers that need observability should switch to the
+// stateful entry point `nat_query_stun_with_state`.
+let NAT_SL_PATH         = 0    // string: "udp" | "tcp" | "none"
+let NAT_SL_UDP_SENT     = 1    // int from the transient state's NAT_S_UDP_SENT
+let NAT_SL_UDP_RECVD    = 2    // int from the transient state's NAT_S_UDP_RECVD
+let NAT_SL_UDP_TIMEOUTS = 3    // int from the transient state's NAT_S_UDP_TIMEOUTS
+let NAT_SL_EXTERNAL     = 4    // string: "<ip>:<port>" or ""
+let NAT_SL_LAST_ERROR   = 5    // string: last_error from the transient state
+
+let _nat_stateless_snap = 0    // lazy-allocated singleton (R33E)
+
+// Receive buffer size for the inbound Binding Response. RFC 8489 messages
+// are at most 64KB but practical responses stay tiny (XOR-MAPPED-ADDRESS
+// + SOFTWARE + MESSAGE-INTEGRITY + FINGERPRINT < 200 bytes). 1500 covers
+// any sane interop with margin (matches Ethernet MTU).
+let NAT_RFC8489_UDP_BUF_LEN = 1500
+
+// ---- low-level string helpers --------------------------------------------
+
+fn _nat_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _nat_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _nat_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _nat_starts_with(s, prefix) {
+    if len(s) < len(prefix) { return 0 }
+    let i = 0
+    while i < len(prefix) {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _nat_strip_eol(s) {
+    let n = len(s)
+    while n > 0 {
+        let c = char_at(s, n - 1)
+        if c == 10 { n = n - 1 } else {
+            if c == 13 { n = n - 1 } else { return substr(s, 0, n) }
+        }
+    }
+    return ""
+}
+
+fn _nat_parse_addr(addr) {
+    let i = 0
+    while i < len(addr) {
+        if char_at(addr, i) == 58 {
+            let host = substr(addr, 0, i)
+            let port_s = substr(addr, i + 1, len(addr) - i - 1)
+            if len(host) == 0 { return 0 }
+            if _nat_is_digits(port_s) == 0 { return 0 }
+            let port = str_to_int(port_s)
+            if port <= 0 { return 0 }
+            if port > 65535 { return 0 }
+            let rec = list_new()
+            push(rec, host)
+            push(rec, port)
+            return rec
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _nat_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _nat_is_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    return a + b * k256 + c * k256 * k256 + d * k256 * k256 * k256
+}
+
+// ---- state constructors ---------------------------------------------------
+
+fn nat_init() {
+    let st = list_new()
+    push(st, "")             // NAT_S_MY_EXTERNAL
+    push(st, list_new())     // NAT_S_PEER_EXT_TABLE
+    push(st, "")             // NAT_S_TYPE_GUESS
+    push(st, 0)              // NAT_S_QUERIES
+    push(st, 0)              // NAT_S_QUERIES_OK
+    push(st, 0)              // NAT_S_ADVERTS
+    push(st, 0)              // NAT_S_INBOUND_ADS
+    push(st, 0)              // NAT_S_HOLE_PUNCHES
+    push(st, "")             // NAT_S_LAST_ERROR
+    push(st, 0)              // NAT_S_STUN_STATE (R31C, lazy)
+    push(st, 0)              // NAT_S_RFC_REQUESTS (R31C)
+    push(st, 0)              // NAT_S_RFC_OK (R31C)
+    push(st, 0)              // NAT_S_RFC_BAD (R31C)
+    push(st, 0)              // NAT_S_UDP_SENT (R32A)
+    push(st, 0)              // NAT_S_UDP_RECVD (R32A)
+    push(st, 0)              // NAT_S_UDP_TIMEOUTS (R32A)
+    return st
+}
+
+// ---- external-addr setters / accessors -----------------------------------
+
+fn nat_set_external(state, addr) { state[NAT_S_MY_EXTERNAL] = addr; return state }
+fn nat_get_external(state)       { return state[NAT_S_MY_EXTERNAL] }
+fn nat_set_type(state, type_str) { state[NAT_S_TYPE_GUESS] = type_str; return state }
+fn nat_get_type(state)           { return state[NAT_S_TYPE_GUESS] }
+fn nat_set_last_error(state, msg) { state[NAT_S_LAST_ERROR] = msg; return state }
+fn nat_last_error(state)         { return state[NAT_S_LAST_ERROR] }
+fn nat_query_count(state)        { return state[NAT_S_QUERIES] }
+fn nat_query_ok_count(state)     { return state[NAT_S_QUERIES_OK] }
+fn nat_advertise_count(state)    { return state[NAT_S_ADVERTS] }
+fn nat_inbound_ad_count(state)   { return state[NAT_S_INBOUND_ADS] }
+
+// ---- peer external-addr table operations ---------------------------------
+
+fn nat_set_peer_external(state, internal_addr, external_addr) {
+    let tbl = state[NAT_S_PEER_EXT_TABLE]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], internal_addr) == 1 {
+            tbl[i][1] = external_addr
+            return state
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, internal_addr)
+    push(rec, external_addr)
+    push(tbl, rec)
+    return state
+}
+
+fn nat_get_peer_external(state, internal_addr) {
+    let tbl = state[NAT_S_PEER_EXT_TABLE]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], internal_addr) == 1 { return tbl[i][1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn nat_peer_external_addrs(state) { return state[NAT_S_PEER_EXT_TABLE] }
+fn nat_peer_count(state) { return len(state[NAT_S_PEER_EXT_TABLE]) }
+
+// ---- STUN-response parser ------------------------------------------------
+
+fn nat_parse_stun_response(line) {
+    let stripped = _nat_strip_eol(line)
+    if _nat_starts_with(stripped, NAT_EXTERNAL_PREFIX) == 0 { return 0 }
+    let rest = substr(stripped, len(NAT_EXTERNAL_PREFIX),
+                      len(stripped) - len(NAT_EXTERNAL_PREFIX))
+    if len(rest) == 0 { return 0 }
+    let parsed = _nat_parse_addr(rest)
+    if parsed == 0 { return 0 }
+    if _nat_ip_str_to_int(parsed[0]) < 0 { return 0 }
+    return rest
+}
+
+fn nat_format_stun_response(ip, port) {
+    return NAT_EXTERNAL_PREFIX + ip + ":" + int_to_str(port)
+}
+
+// ---- sockaddr_in peer-addr extraction ------------------------------------
+//
+// struct sockaddr_in (16 bytes):
+//   bytes 0-1: sin_family (AF_INET = 2), little-endian
+//   bytes 2-3: sin_port, big-endian
+//   bytes 4-7: sin_addr (4 bytes, network byte order)
+//   bytes 8-15: pad
+
+fn nat_extract_peer_addr(sa_buf) {
+    if sa_buf == 0 { return 0 }
+    let family_lo = load8(sa_buf + 0)
+    let family_hi = load8(sa_buf + 1)
+    let family = family_lo + family_hi * 256
+    if family != 2 { return 0 }
+    let port_hi = load8(sa_buf + 2)
+    let port_lo = load8(sa_buf + 3)
+    let port = port_hi * 256 + port_lo
+    let b0 = load8(sa_buf + 4)
+    let b1 = load8(sa_buf + 5)
+    let b2 = load8(sa_buf + 6)
+    let b3 = load8(sa_buf + 7)
+    let ip_str = int_to_str(b0) + "." + int_to_str(b1) + "."
+        + int_to_str(b2) + "." + int_to_str(b3)
+    let out = list_new()
+    push(out, ip_str)
+    push(out, port)
+    return out
+}
+
+fn nat_alloc_sa_buf() {
+    let buf = alloc(16)
+    let i = 0
+    while i < 16 { store8(buf + i, 0); i = i + 1 }
+    return buf
+}
+
+fn nat_alloc_sa_len() {
+    let buf = alloc(4)
+    store8(buf + 0, 16)
+    store8(buf + 1, 0)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    return buf
+}
+
+// ---- low-level wire helpers ----------------------------------------------
+
+fn _nat_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _nat_recv_line(fd) {
+    let buf = alloc(NAT_LINE_MAX)
+    let n = 0
+    while n < NAT_LINE_MAX - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return _nat_strip_eol(buf)
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return _nat_strip_eol(buf)
+        }
+    }
+    store8(buf + n, 0)
+    return _nat_strip_eol(buf)
+}
+
+fn _nat_setsockopt(fd, level, optname, optval, optlen) {
+    asm {
+        "mov rax, 54"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "mov r10, [rbp-32]"
+        "mov r8, [rbp-40]"
+        "syscall"
+    }
+}
+
+fn _nat_set_rcvtimeo_ms(fd, ms) {
+    let tv = alloc(16)
+    let i = 0
+    while i < 16 { store8(tv + i, 0); i = i + 1 }
+    let secs = ms / 1000
+    let rem_ms = ms - secs * 1000
+    let usec = rem_ms * 1000
+    let vs = secs
+    let k = 0
+    while k < 8 {
+        store8(tv + k, vs - (vs / 256) * 256)
+        vs = vs / 256
+        k = k + 1
+    }
+    let v = usec
+    let j = 0
+    while j < 8 {
+        store8(tv + 8 + j, v - (v / 256) * 256)
+        v = v / 256
+        j = j + 1
+    }
+    _nat_setsockopt(fd, 1, 20, tv, 16)
+    _nat_setsockopt(fd, 1, 21, tv, 16)
+    return 0
+}
+
+fn _nat_dial(addr) {
+    let parsed = _nat_parse_addr(addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _nat_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let sa = make_sockaddr_in(port, ip)
+    let attempt = 0
+    while attempt < NAT_CONNECT_RETRIES {
+        let fd = socket(2, 1, 0)
+        if fd < 0 { return -1 }
+        _nat_set_rcvtimeo_ms(fd, NAT_QUERY_TIMEOUT_MS)
+        if connect_socket(fd, sa, 16) >= 0 {
+            return fd
+        }
+        close_fd(fd)
+        sleep_ms(NAT_CONNECT_DELAY_MS)
+        attempt = attempt + 1
+    }
+    return -1
+}
+
+// ---- public API: STUN query (client side) --------------------------------
+//
+// `nat_query_stun_with_state` is the public entry point. When the env
+// flag `CE_NAT_USE_RFC8489=1` is set AND the caller passes a non-zero
+// state (so the lazy stun_state can be allocated), dispatch hands off
+// to the RFC 8489 UDP path implemented in
+// `nat_udp_query_rfc8489_with_state` further down. Otherwise the
+// legacy R23E TCP text path runs.
+//
+// Behavior contract preserved across both paths:
+//   * NAT_S_QUERIES bumps on every entry, regardless of which path
+//     handled the call.
+//   * NAT_S_QUERIES_OK bumps only on a successful external-addr parse.
+//   * NAT_S_MY_EXTERNAL is left untouched on failure (caller decides
+//     whether to overwrite via `nat_set_external`).
+//   * Return value: the formatted `<ip>:<port>` string on success, or
+//     0 on any failure (with `nat_last_error` set).
+
+fn _nat_query_stun_tcp(state, stun_addr) {
+    let fd = _nat_dial(stun_addr)
+    if fd < 0 {
+        if state != 0 { nat_set_last_error(state, "dial-failed") }
+        return 0
+    }
+    if _nat_send_all(fd, NAT_STUN_REQUEST_LINE + "\n") == 0 {
+        if state != 0 { nat_set_last_error(state, "send-failed") }
+        close_fd(fd)
+        return 0
+    }
+    let reply = _nat_recv_line(fd)
+    close_fd(fd)
+    if reply == 0 {
+        if state != 0 { nat_set_last_error(state, "recv-failed") }
+        return 0
+    }
+    let ext = nat_parse_stun_response(reply)
+    if ext == 0 {
+        if state != 0 { nat_set_last_error(state, "malformed-response") }
+        return 0
+    }
+    if state != 0 {
+        state[NAT_S_QUERIES_OK] = state[NAT_S_QUERIES_OK] + 1
+        nat_set_last_error(state, "")
+    }
+    return ext
+}
+
+fn nat_query_stun_with_state(state, stun_addr) {
+    if state != 0 {
+        state[NAT_S_QUERIES] = state[NAT_S_QUERIES] + 1
+    }
+    // R32A: dispatch through the RFC 8489 UDP path when the env flag
+    // is on AND we have a state to hang the stun_state_t off of.
+    // R33E: when state == 0 (true stateless call) AND the env flag is
+    // on, dispatch through `_nat_query_stun_stateless_udp` which
+    // allocates a transient `nat_state_t` per call.
+    if state != 0 {
+        if nat_use_rfc8489_enabled() == 1 {
+            return _nat_query_stun_rfc8489_udp(state, stun_addr)
+        }
+    }
+    return _nat_query_stun_tcp(state, stun_addr)
+}
+
+// R33E / R32A.2: the stateless form now ALSO honors CE_NAT_USE_RFC8489.
+// When the flag is on, we allocate a transient nat_state_t internally,
+// run the full UDP path, harvest the external addr, mirror the
+// transient state's UDP counters into the module-level stateless
+// snapshot (so tests + status lines can observe the dispatch), and
+// discard the transient state. When the flag is off, fall back to the
+// legacy stateless TCP-text path -- byte-identical to R23E.
+fn nat_query_stun(stun_addr) {
+    if nat_use_rfc8489_enabled() == 1 {
+        return _nat_query_stun_stateless_udp(stun_addr)
+    }
+    let ext = _nat_query_stun_tcp(0, stun_addr)
+    _nat_stateless_record_tcp(ext)
+    return ext
+}
+
+// ---- public API: STUN server side ----------------------------------------
+
+fn nat_serve_stun_conn(conn_fd, peer_ip, peer_port) {
+    let line = _nat_recv_line(conn_fd)
+    if line == 0 { close_fd(conn_fd); return 0 }
+    if str_eq(line, NAT_STUN_REQUEST_LINE) == 0 {
+        close_fd(conn_fd)
+        return 0
+    }
+    let reply = nat_format_stun_response(peer_ip, peer_port) + "\n"
+    let ok = _nat_send_all(conn_fd, reply)
+    close_fd(conn_fd)
+    return ok
+}
+
+fn nat_serve_stun_conn_sa(conn_fd, sa_buf) {
+    let parsed = nat_extract_peer_addr(sa_buf)
+    if parsed == 0 { close_fd(conn_fd); return 0 }
+    return nat_serve_stun_conn(conn_fd, parsed[0], parsed[1])
+}
+
+fn nat_serve_stun_one_shot(bind_addr) {
+    let parsed = _nat_parse_addr(bind_addr)
+    if parsed == 0 { return 0 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _nat_ip_str_to_int(host)
+    if ip < 0 { return 0 }
+    let fd = socket(2, 1, 0)
+    if fd < 0 { return 0 }
+    let one_buf = alloc(4)
+    store8(one_buf, 1)
+    store8(one_buf + 1, 0)
+    store8(one_buf + 2, 0)
+    store8(one_buf + 3, 0)
+    _nat_setsockopt(fd, 1, 2, one_buf, 4)
+    let sa = make_sockaddr_in(port, ip)
+    if bind_socket(fd, sa, 16) < 0 { close_fd(fd); return 0 }
+    if listen_socket(fd, 4) < 0 { close_fd(fd); return 0 }
+    let sa_buf = nat_alloc_sa_buf()
+    let sa_len = nat_alloc_sa_len()
+    let conn_fd = accept_conn(fd, sa_buf, sa_len)
+    if conn_fd < 0 { close_fd(fd); return 0 }
+    let ok = nat_serve_stun_conn_sa(conn_fd, sa_buf)
+    close_fd(fd)
+    return ok
+}
+
+// ---- public API: advertise via gossip ------------------------------------
+
+fn nat_advertise_to(state, peer_addr, self_internal, my_external) {
+    if state != 0 {
+        state[NAT_S_ADVERTS] = state[NAT_S_ADVERTS] + 1
+    }
+    let fd = _nat_dial(peer_addr)
+    if fd < 0 { return 0 }
+    if _nat_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _nat_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    let line = NAT_EXTADDR_PREFIX + self_internal + " " + my_external + "\n"
+    if _nat_send_all(fd, line) == 0 { close_fd(fd); return 0 }
+    _nat_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+fn nat_advertise(gossip_state, nat_state, my_external) {
+    if my_external == 0 { return 0 }
+    if len(my_external) == 0 { return 0 }
+    if nat_state != 0 {
+        nat_set_external(nat_state, my_external)
+    }
+    let alive = gossip_alive_peers(gossip_state)
+    let self_internal = gossip_self_addr(gossip_state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if nat_advertise_to(nat_state, alive[i], self_internal, my_external) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// ---- public API: record inbound EXTADDR ----------------------------------
+
+fn nat_record_inbound_extaddr(state, internal_addr, external_addr) {
+    if state == 0 { return 0 }
+    if len(internal_addr) == 0 { return 0 }
+    if len(external_addr) == 0 { return 0 }
+    let parsed = _nat_parse_addr(external_addr)
+    if parsed == 0 { return 0 }
+    if _nat_ip_str_to_int(parsed[0]) < 0 { return 0 }
+    nat_set_peer_external(state, internal_addr, external_addr)
+    state[NAT_S_INBOUND_ADS] = state[NAT_S_INBOUND_ADS] + 1
+    return 1
+}
+
+// ---- public API: local-address enumeration -------------------------------
+
+fn nat_local_addrs() {
+    let out = list_new()
+    push(out, "127.0.0.1")
+    let env = getenv("CE_NAT_LOCAL_ADDRS")
+    if env != 0 {
+        if len(env) > 0 {
+            let i = 0
+            let start = 0
+            while i < len(env) {
+                if char_at(env, i) == 44 {
+                    if i > start {
+                        let tok = substr(env, start, i - start)
+                        let seen = 0
+                        let j = 0
+                        while j < len(out) {
+                            if str_eq(out[j], tok) == 1 { seen = 1 }
+                            j = j + 1
+                        }
+                        if seen == 0 { push(out, tok) }
+                    }
+                    start = i + 1
+                }
+                i = i + 1
+            }
+            if i > start {
+                let tok2 = substr(env, start, i - start)
+                let seen2 = 0
+                let k = 0
+                while k < len(out) {
+                    if str_eq(out[k], tok2) == 1 { seen2 = 1 }
+                    k = k + 1
+                }
+                if seen2 == 0 { push(out, tok2) }
+            }
+        }
+    }
+    return out
+}
+
+fn nat_local_addr_count() { return len(nat_local_addrs()) }
+
+// ---- public API: NAT-type detection --------------------------------------
+
+fn _nat_local_addr_in(ip_str, local_addrs) {
+    let i = 0
+    while i < len(local_addrs) {
+        if str_eq(local_addrs[i], ip_str) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn nat_detect_type_from_replies(reply1, reply2) {
+    if reply1 == 0 { return NAT_TYPE_BLOCKED }
+    if reply2 == 0 { return NAT_TYPE_BLOCKED }
+    if len(reply1) == 0 { return NAT_TYPE_BLOCKED }
+    if len(reply2) == 0 { return NAT_TYPE_BLOCKED }
+    let p1 = _nat_parse_addr(reply1)
+    let p2 = _nat_parse_addr(reply2)
+    if p1 == 0 { return NAT_TYPE_BLOCKED }
+    if p2 == 0 { return NAT_TYPE_BLOCKED }
+    let locals = nat_local_addrs()
+    if str_eq(p1[0], p2[0]) == 1 {
+        if p1[1] == p2[1] {
+            if _nat_local_addr_in(p1[0], locals) == 1 {
+                return NAT_TYPE_OPEN
+            }
+            return NAT_TYPE_CONE
+        }
+    }
+    return NAT_TYPE_SYMMETRIC
+}
+
+fn nat_detect_type(stun_addr_1, stun_addr_2) {
+    let r1 = nat_query_stun(stun_addr_1)
+    let r2 = nat_query_stun(stun_addr_2)
+    return nat_detect_type_from_replies(r1, r2)
+}
+
+// ---- public API: hole punching (STUB) -----------------------------------
+
+fn nat_hole_punch(state, peer_external_addr) {
+    if state != 0 {
+        state[NAT_S_HOLE_PUNCHES] = state[NAT_S_HOLE_PUNCHES] + 1
+        nat_set_last_error(state, "hole-punch-not-implemented")
+    }
+    return 0
+}
+
+// ---- env helpers ---------------------------------------------------------
+
+fn nat_stun_server_from_env() {
+    let env = getenv("CE_NAT_STUN_SERVER")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return ""
+}
+
+// ============================================================================
+//                R31C / R30C.2 -- RFC 8489 STUN wire migration
+// ============================================================================
+//
+// The RFC 8489 path runs through R30C's `stun_rfc8489.nova` exclusively.
+// We never re-implement the binary wire here; we lazily allocate a
+// stun_state and reflect its results into the existing nat_state slots
+// so the R23E status line + counters stay the source of truth.
+//
+// nat_use_rfc8489_enabled()  -- read CE_NAT_USE_RFC8489 env flag.
+//                                Default 0 (legacy text wire). "1" or
+//                                "true" or "yes" -> 1.
+// nat_rfc8489_state(state)   -- lazily allocate + return the
+//                                underlying stun_state_t.
+// nat_set_rfc8489_credentials(state, username, password) -- forward
+//                                to stun_set_credentials.
+//
+// Emit / parse / map helpers (do NOT touch the network):
+//
+// nat_emit_rfc8489_binding_request(state, software)
+//   -> [pkt_buf, pkt_n, txn_id_buf]
+//      Calls stun_send_binding_request internally; the resulting
+//      bytes are a real RFC 8489 Binding Request that any standard
+//      STUN server will accept.
+//
+// nat_parse_rfc8489_binding_response(state, pkt_buf, pkt_n)
+//   -> [ip_str, port, family] | 0
+//      Calls stun_recv internally; on success returns the decoded
+//      XOR-MAPPED-ADDRESS as a 3-element list. On failure returns 0
+//      and sets nat_last_error to the stun_state error tag.
+//
+// nat_format_rfc8489_success_response_ipv4(txn, ip_str, port, software,
+//                                          username, password)
+//   -> [pkt_buf, pkt_n]
+//      Builds an RFC 8489 Binding Success Response with
+//      XOR-MAPPED-ADDRESS IPv4 + optional SOFTWARE / USERNAME / MI /
+//      FINGERPRINT. Returns 0 on bad IP.
+//
+// nat_send_binding_request(state, remote_addr, software)
+//   -> [pkt_buf, pkt_n, txn_id_buf] | 0
+//      High-level wrapper. Validates `remote_addr` shape (host:port);
+//      bumps NAT_S_QUERIES + NAT_S_RFC_REQUESTS. On bad addr sets
+//      nat_last_error and returns 0.
+//
+// nat_recv_binding_response(state, pkt_buf, pkt_n)
+//   -> 1 | 0
+//      High-level wrapper. Parses an RFC 8489 response and on success
+//      writes the mapped addr into NAT_S_MY_EXTERNAL (formatted as
+//      "<ip>:<port>") and bumps NAT_S_QUERIES_OK + NAT_S_RFC_OK. On
+//      failure bumps NAT_S_RFC_BAD and sets nat_last_error.
+
+fn nat_use_rfc8489_enabled() {
+    let env = getenv("CE_NAT_USE_RFC8489")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "1") == 1 { return 1 }
+    if str_eq(env, "true") == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    if str_eq(env, "on") == 1 { return 1 }
+    return 0
+}
+
+fn nat_rfc8489_state(state) {
+    if state == 0 { return 0 }
+    if state[NAT_S_STUN_STATE] != 0 { return state[NAT_S_STUN_STATE] }
+    let ss = stun_init()
+    state[NAT_S_STUN_STATE] = ss
+    return ss
+}
+
+fn nat_set_rfc8489_credentials(state, username, password) {
+    if state == 0 { return 0 }
+    let ss = nat_rfc8489_state(state)
+    stun_set_credentials(ss, username, password)
+    return 0
+}
+
+fn nat_rfc8489_requests_sent(state)  {
+    if state == 0 { return 0 }
+    return state[NAT_S_RFC_REQUESTS]
+}
+fn nat_rfc8489_responses_ok(state)   {
+    if state == 0 { return 0 }
+    return state[NAT_S_RFC_OK]
+}
+fn nat_rfc8489_responses_bad(state)  {
+    if state == 0 { return 0 }
+    return state[NAT_S_RFC_BAD]
+}
+
+// ---- emit / parse helpers (state-aware, but pure of network IO) ----------
+
+fn nat_emit_rfc8489_binding_request(state, software) {
+    if state == 0 { return 0 }
+    let ss = nat_rfc8489_state(state)
+    let result = stun_send_binding_request(ss, "", software)
+    state[NAT_S_RFC_REQUESTS] = state[NAT_S_RFC_REQUESTS] + 1
+    return result
+}
+
+fn nat_parse_rfc8489_binding_response(state, pkt_buf, pkt_n) {
+    if state == 0 { return 0 }
+    let ss = nat_rfc8489_state(state)
+    let r = stun_recv(ss, pkt_buf, pkt_n)
+    if r[0] == STUN_RES_OK {
+        let out = list_new()
+        push(out, r[1])      // ip string
+        push(out, r[2])      // port
+        push(out, r[3])      // family
+        return out
+    }
+    if r[0] == STUN_RES_ERR {
+        nat_set_last_error(state,
+            "rfc8489-error-" + int_to_str(r[1]) + " " + r[2])
+        return 0
+    }
+    nat_set_last_error(state, stun_state_get_last_error(ss))
+    return 0
+}
+
+fn nat_format_rfc8489_success_response_ipv4(txn_id_buf, ip_str, port,
+                                            software, username, password) {
+    let v4 = stun_ipv4_str_to_buf(ip_str)
+    if v4 == 0 { return 0 }
+    let add_fp = 1
+    return stun_msg_build_success_response_ipv4(txn_id_buf, v4, port,
+                                                software, username,
+                                                password, add_fp)
+}
+
+// ---- high-level send / recv wrappers (R31C public API) -------------------
+
+fn nat_send_binding_request(state, remote_addr, software) {
+    if state == 0 { return 0 }
+    let parsed = _nat_parse_addr(remote_addr)
+    if parsed == 0 {
+        nat_set_last_error(state, "bad-remote-addr")
+        return 0
+    }
+    if _nat_ip_str_to_int(parsed[0]) < 0 {
+        nat_set_last_error(state, "bad-remote-addr-ip")
+        return 0
+    }
+    let ss = nat_rfc8489_state(state)
+    let result = stun_send_binding_request(ss, remote_addr, software)
+    state[NAT_S_QUERIES] = state[NAT_S_QUERIES] + 1
+    state[NAT_S_RFC_REQUESTS] = state[NAT_S_RFC_REQUESTS] + 1
+    nat_set_last_error(state, "")
+    return result
+}
+
+fn nat_recv_binding_response(state, pkt_buf, pkt_n) {
+    if state == 0 { return 0 }
+    if pkt_buf == 0 { return 0 }
+    if pkt_n <= 0 { return 0 }
+    let ss = nat_rfc8489_state(state)
+    let r = stun_recv(ss, pkt_buf, pkt_n)
+    if r[0] == STUN_RES_OK {
+        let mapped = r[1] + ":" + int_to_str(r[2])
+        nat_set_external(state, mapped)
+        state[NAT_S_QUERIES_OK] = state[NAT_S_QUERIES_OK] + 1
+        state[NAT_S_RFC_OK] = state[NAT_S_RFC_OK] + 1
+        nat_set_last_error(state, "")
+        return 1
+    }
+    if r[0] == STUN_RES_ERR {
+        state[NAT_S_RFC_BAD] = state[NAT_S_RFC_BAD] + 1
+        nat_set_last_error(state,
+            "rfc8489-error-" + int_to_str(r[1]) + " " + r[2])
+        return 0
+    }
+    state[NAT_S_RFC_BAD] = state[NAT_S_RFC_BAD] + 1
+    nat_set_last_error(state, stun_state_get_last_error(ss))
+    return 0
+}
+
+// ---- backward-compat shims for the legacy STUN-LIKE text wire ------------
+//
+// These exist so callers that hardcoded the old wire (e.g. the
+// integration scenario_oooo manual STUN multiplexer) can opt to keep
+// the legacy bytes alive even after the RFC 8489 wire is the
+// recommended path. The format is unchanged from R23E:
+//
+//   request line  -- "STUN_REQUEST\n"
+//   response line -- "EXTERNAL <ip>:<port>\n"
+//
+// They share the same wire as `nat_format_stun_response` /
+// `nat_parse_stun_response` / `_nat_send_all` / `_nat_recv_line` --
+// just wrapped for explicit naming.
+
+fn nat_legacy_emit_stunlike_request() {
+    return NAT_STUN_REQUEST_LINE + "\n"
+}
+
+fn nat_legacy_parse_stunlike_response(line) {
+    return nat_parse_stun_response(line)
+}
+
+fn nat_legacy_format_stunlike_response(ip, port) {
+    return nat_format_stun_response(ip, port) + "\n"
+}
+
+// ============================================================================
+//        R32A / R31C.2 / R28C consumer -- UDP datagram dispatch path
+// ============================================================================
+//
+// This block wires the R30C wire codec to actual UDP sockets through the
+// R28C builtins:
+//   sys_socket_udp()                               -> fd | -1
+//   sys_sendto(fd, buf, len, ip_int, port)         -> bytes_sent | -1
+//   sys_recvfrom(fd, buf, max_len, timeout_ms)
+//                  -> [bytes_read, sender_ip, sender_port]
+//   sys_setsockopt_so_reuseaddr(fd)                -> 0 | -1
+//
+// The IP integer encoding is the same as `make_sockaddr_in`'s expectation:
+// the four address octets packed little-endian into a 32-bit int so the
+// kernel's `sockaddr_in.sin_addr.s_addr` (network byte order on the wire)
+// receives them. `_nat_ip_str_to_int` already produces this encoding;
+// reuse it.
+//
+// Public helpers (state-aware):
+//
+//   nat_udp_open()
+//     Open a fresh UDP socket. Returns fd >= 0 or -1 on sandbox deny /
+//     stub target. No bind: source port stays kernel-assigned which is
+//     standard STUN client behavior.
+//
+//   nat_udp_send_binding_request_at(fd, state, ip_str, port, software)
+//     Emit an RFC 8489 Binding Request through the R30C codec and
+//     send it via `sys_sendto`. Bumps NAT_S_RFC_REQUESTS and on a
+//     successful send NAT_S_UDP_SENT. Returns [pkt, n, txn] on success
+//     so the caller can match the response to the request, or 0 on
+//     bad IP / socket failure / sendto failure (with `nat_last_error`
+//     set).
+//
+//   nat_udp_recv_binding_response(fd, state, timeout_ms)
+//     Wait up to `timeout_ms` milliseconds for a Binding Response on
+//     `fd` via `sys_recvfrom`. On parse success the XOR-MAPPED-ADDRESS
+//     is written into NAT_S_MY_EXTERNAL, NAT_S_QUERIES_OK / NAT_S_RFC_OK
+//     / NAT_S_UDP_RECVD all bump, and 1 returned. On timeout
+//     NAT_S_UDP_TIMEOUTS bumps, `nat_last_error` set to "udp-timeout",
+//     and 0 returned. On bad / mismatched parse NAT_S_RFC_BAD bumps,
+//     `nat_last_error` set from `nat_recv_binding_response`, and 0
+//     returned.
+//
+//   nat_udp_query_rfc8489_with_state(state, stun_addr)
+//     End-to-end client: open UDP socket, dispatch Binding Request,
+//     wait for response with `CE_NAT_RFC8489_TIMEOUT_MS` timeout
+//     (default 1000ms), close socket. Returns the discovered external
+//     address string "<ip>:<port>" on success, or 0 on any failure.
+//     This is what `nat_query_stun_with_state` dispatches to when
+//     `CE_NAT_USE_RFC8489=1`.
+
+fn nat_rfc8489_timeout_ms_from_env() {
+    let env = getenv("CE_NAT_RFC8489_TIMEOUT_MS")
+    if env == 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    if len(env) == 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    if _nat_is_digits(env) == 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    let ms = str_to_int(env)
+    if ms <= 0 { return NAT_RFC8489_DEFAULT_TIMEOUT_MS }
+    return ms
+}
+
+fn nat_udp_open() {
+    let fd = sys_socket_udp()
+    if fd < 0 { return -1 }
+    // SO_REUSEADDR is harmless on a kernel-assigned source port but
+    // helps when callers pre-bind to a fixed test port. We ignore the
+    // result -- on stub targets it returns -1 but the fd is still
+    // unusable (sys_socket_udp would have returned -1 too).
+    sys_setsockopt_so_reuseaddr(fd)
+    return fd
+}
+
+fn nat_udp_sent_count(state) {
+    if state == 0 { return 0 }
+    return state[NAT_S_UDP_SENT]
+}
+
+fn nat_udp_recvd_count(state) {
+    if state == 0 { return 0 }
+    return state[NAT_S_UDP_RECVD]
+}
+
+fn nat_udp_timeout_count(state) {
+    if state == 0 { return 0 }
+    return state[NAT_S_UDP_TIMEOUTS]
+}
+
+fn nat_udp_send_binding_request_at(fd, state, ip_str, port, software) {
+    if state == 0 { return 0 }
+    if fd < 0 {
+        nat_set_last_error(state, "udp-bad-fd")
+        return 0
+    }
+    let ip_int = _nat_ip_str_to_int(ip_str)
+    if ip_int < 0 {
+        nat_set_last_error(state, "bad-remote-addr-ip")
+        return 0
+    }
+    if port <= 0 {
+        nat_set_last_error(state, "bad-remote-addr-port")
+        return 0
+    }
+    if port > 65535 {
+        nat_set_last_error(state, "bad-remote-addr-port")
+        return 0
+    }
+    // Emit through R30C. The result is [pkt_buf, n, txn_id_buf].
+    let emitted = nat_emit_rfc8489_binding_request(state, software)
+    if emitted == 0 {
+        nat_set_last_error(state, "rfc8489-emit-failed")
+        return 0
+    }
+    let pkt = emitted[0]
+    let n = emitted[1]
+    if pkt == 0 {
+        nat_set_last_error(state, "rfc8489-emit-failed")
+        return 0
+    }
+    if n <= 0 {
+        nat_set_last_error(state, "rfc8489-emit-failed")
+        return 0
+    }
+    let sent = sys_sendto(fd, pkt, n, ip_int, port)
+    if sent < 0 {
+        nat_set_last_error(state, "udp-sendto-failed")
+        return 0
+    }
+    if sent != n {
+        nat_set_last_error(state, "udp-sendto-short")
+        return 0
+    }
+    state[NAT_S_UDP_SENT] = state[NAT_S_UDP_SENT] + 1
+    nat_set_last_error(state, "")
+    return emitted
+}
+
+fn nat_udp_recv_binding_response(fd, state, timeout_ms) {
+    if state == 0 { return 0 }
+    if fd < 0 {
+        nat_set_last_error(state, "udp-bad-fd")
+        return 0
+    }
+    let buf = alloc(NAT_RFC8489_UDP_BUF_LEN)
+    let i = 0
+    while i < NAT_RFC8489_UDP_BUF_LEN { store8(buf + i, 0); i = i + 1 }
+    let rx = sys_recvfrom(fd, buf, NAT_RFC8489_UDP_BUF_LEN, timeout_ms)
+    let bytes_read = rx[0]
+    if bytes_read < 0 {
+        state[NAT_S_UDP_TIMEOUTS] = state[NAT_S_UDP_TIMEOUTS] + 1
+        nat_set_last_error(state, "udp-timeout")
+        return 0
+    }
+    if bytes_read == 0 {
+        state[NAT_S_UDP_TIMEOUTS] = state[NAT_S_UDP_TIMEOUTS] + 1
+        nat_set_last_error(state, "udp-timeout")
+        return 0
+    }
+    let ok = nat_recv_binding_response(state, buf, bytes_read)
+    if ok == 1 {
+        state[NAT_S_UDP_RECVD] = state[NAT_S_UDP_RECVD] + 1
+        return 1
+    }
+    return 0
+}
+
+fn _nat_query_stun_rfc8489_udp(state, stun_addr) {
+    if state == 0 { return 0 }
+    let parsed = _nat_parse_addr(stun_addr)
+    if parsed == 0 {
+        nat_set_last_error(state, "bad-remote-addr")
+        return 0
+    }
+    let ip_str = parsed[0]
+    let port = parsed[1]
+    if _nat_ip_str_to_int(ip_str) < 0 {
+        nat_set_last_error(state, "bad-remote-addr-ip")
+        return 0
+    }
+    let fd = nat_udp_open()
+    if fd < 0 {
+        nat_set_last_error(state, "udp-socket-failed")
+        return 0
+    }
+    let timeout_ms = nat_rfc8489_timeout_ms_from_env()
+    let sent = nat_udp_send_binding_request_at(fd, state, ip_str, port,
+                                               "crossengin/r32a")
+    if sent == 0 {
+        close_fd(fd)
+        return 0
+    }
+    let ok = nat_udp_recv_binding_response(fd, state, timeout_ms)
+    close_fd(fd)
+    if ok == 1 {
+        return nat_get_external(state)
+    }
+    return 0
+}
+
+fn nat_udp_query_rfc8489_with_state(state, stun_addr) {
+    return _nat_query_stun_rfc8489_udp(state, stun_addr)
+}
+
+// ============================================================================
+//      R33E / R32A.2 -- stateless-caller UDP threading
+// ============================================================================
+//
+// Pre-R33E, `nat_query_stun(addr)` and `nat_detect_type(addr1, addr2)`
+// were stateless: no `nat_state_t` parameter. The RFC 8489 codec needs
+// a `stun_state_t` for transaction-id storage + credentials, so the
+// stateless callers always fell through to the TCP-text path even when
+// `CE_NAT_USE_RFC8489=1` was set in the env. This was R32A's exit
+// caveat.
+//
+// R33E closes this caveat with **approach (a) transient-per-call**:
+//
+//   * On each stateless call entry, allocate a fresh `nat_state_t` via
+//     `nat_init()`. This state lives only for the duration of the call.
+//   * Dispatch through `_nat_query_stun_rfc8489_udp(transient, addr)`:
+//     it opens a UDP socket, sends the RFC 8489 Binding Request via
+//     `sys_sendto`, waits up to `CE_NAT_RFC8489_TIMEOUT_MS` for the
+//     Binding Response via `sys_recvfrom`, parses the
+//     XOR-MAPPED-ADDRESS into `transient.NAT_S_MY_EXTERNAL`, bumps
+//     the transient state's UDP counters, and closes the socket.
+//   * Mirror the transient state's UDP counters (SENT / RECVD /
+//     TIMEOUTS), external addr, and last_error into the module-level
+//     stateless snapshot so tests + integration scenarios can confirm
+//     the UDP path was actually taken.
+//   * Return the external addr string on success, 0 on failure. The
+//     transient `nat_state_t` is unreferenced after return and the
+//     garbage collector reclaims it.
+//
+// Concurrency: each call's transient state is local to the call frame.
+// Two concurrent stateless callers do NOT share txn ids or sockets.
+// The ONLY shared resource is the module-level snapshot
+// (`_nat_stateless_snap`), which is observational only: a race between
+// two writers can corrupt the snapshot but cannot corrupt the call
+// result. (NOVA is single-threaded today so this is moot.)
+//
+// `nat_detect_type(addr1, addr2)` is automatically threaded too: it
+// calls `nat_query_stun(addr)` twice. Each call gets its own transient
+// state, so the second call's response cannot be parsed against the
+// first call's txn id.
+
+// Lazy-allocate the module-level snapshot. Initialized to
+// PATH="none" / counters=0 / external="" / last_error="".
+fn _nat_stateless_snap_get() {
+    if _nat_stateless_snap != 0 { return _nat_stateless_snap }
+    let snap = list_new()
+    push(snap, "none")  // NAT_SL_PATH
+    push(snap, 0)       // NAT_SL_UDP_SENT
+    push(snap, 0)       // NAT_SL_UDP_RECVD
+    push(snap, 0)       // NAT_SL_UDP_TIMEOUTS
+    push(snap, "")      // NAT_SL_EXTERNAL
+    push(snap, "")      // NAT_SL_LAST_ERROR
+    _nat_stateless_snap = snap
+    return snap
+}
+
+// Snapshot the transient state's UDP-relevant fields. Called by the
+// stateless UDP dispatcher AFTER the UDP path returns (success or fail)
+// so the snapshot reflects exactly what happened on that call. The
+// snapshot REPLACES (not accumulates) previous values.
+fn _nat_stateless_record_udp(transient, ext_result) {
+    let snap = _nat_stateless_snap_get()
+    snap[NAT_SL_PATH] = "udp"
+    snap[NAT_SL_UDP_SENT] = transient[NAT_S_UDP_SENT]
+    snap[NAT_SL_UDP_RECVD] = transient[NAT_S_UDP_RECVD]
+    snap[NAT_SL_UDP_TIMEOUTS] = transient[NAT_S_UDP_TIMEOUTS]
+    if ext_result == 0 {
+        snap[NAT_SL_EXTERNAL] = ""
+    } else {
+        snap[NAT_SL_EXTERNAL] = ext_result
+    }
+    snap[NAT_SL_LAST_ERROR] = nat_last_error(transient)
+    return 0
+}
+
+// Symmetric helper for the TCP fallback path. Records path="tcp" and
+// zeros the UDP counters (no UDP activity on the TCP path), echoes the
+// returned external addr (or "" on fail). Keeps the snapshot's
+// path-discriminator honest so `nat_stateless_last_path()` is the
+// definitive "what path did the LAST stateless call take" oracle.
+fn _nat_stateless_record_tcp(ext_result) {
+    let snap = _nat_stateless_snap_get()
+    snap[NAT_SL_PATH] = "tcp"
+    snap[NAT_SL_UDP_SENT] = 0
+    snap[NAT_SL_UDP_RECVD] = 0
+    snap[NAT_SL_UDP_TIMEOUTS] = 0
+    if ext_result == 0 {
+        snap[NAT_SL_EXTERNAL] = ""
+    } else {
+        snap[NAT_SL_EXTERNAL] = ext_result
+    }
+    snap[NAT_SL_LAST_ERROR] = ""
+    return 0
+}
+
+// The stateless UDP entry. Allocates a transient nat_state_t, runs the
+// full UDP path through `_nat_query_stun_rfc8489_udp`, records the
+// snapshot, returns the external addr (or 0). The transient state is
+// NOT returned to the caller and goes out of scope at return.
+fn _nat_query_stun_stateless_udp(stun_addr) {
+    let transient = nat_init()
+    let ext = _nat_query_stun_rfc8489_udp(transient, stun_addr)
+    _nat_stateless_record_udp(transient, ext)
+    return ext
+}
+
+// Public alias for the stateless UDP helper. Useful for tests that want
+// to drive the UDP path directly without relying on the env flag, and
+// for callers that already know they want UDP. Distinct from the
+// env-gated `nat_query_stun(addr)`.
+fn nat_query_stun_stateless_udp(stun_addr) {
+    return _nat_query_stun_stateless_udp(stun_addr)
+}
+
+// ---- snapshot accessors --------------------------------------------------
+
+fn nat_stateless_last_path() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_PATH]
+}
+
+fn nat_stateless_last_udp_sent() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_UDP_SENT]
+}
+
+fn nat_stateless_last_udp_recvd() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_UDP_RECVD]
+}
+
+fn nat_stateless_last_udp_timeouts() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_UDP_TIMEOUTS]
+}
+
+fn nat_stateless_last_external() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_EXTERNAL]
+}
+
+fn nat_stateless_last_error() {
+    let snap = _nat_stateless_snap_get()
+    return snap[NAT_SL_LAST_ERROR]
+}
+
+// Reset the snapshot to the initial state. Useful between tests so
+// the previous test's state does not bleed in.
+fn nat_stateless_reset_stats() {
+    let snap = _nat_stateless_snap_get()
+    snap[NAT_SL_PATH] = "none"
+    snap[NAT_SL_UDP_SENT] = 0
+    snap[NAT_SL_UDP_RECVD] = 0
+    snap[NAT_SL_UDP_TIMEOUTS] = 0
+    snap[NAT_SL_EXTERNAL] = ""
+    snap[NAT_SL_LAST_ERROR] = ""
+    return 0
+}
+
+// ---- chat helpers --------------------------------------------------------
+
+fn nat_status_line(state) {
+    if state == 0 { return "nat: <no state>" }
+    let ext = state[NAT_S_MY_EXTERNAL]
+    if len(ext) == 0 { ext = "<unknown>" }
+    let type_str = state[NAT_S_TYPE_GUESS]
+    if len(type_str) == 0 { type_str = "<undetected>" }
+    return "nat: external=" + ext
+        + " type=" + type_str
+        + " peers=" + int_to_str(nat_peer_count(state))
+        + " queries=" + int_to_str(state[NAT_S_QUERIES])
+        + " queries_ok=" + int_to_str(state[NAT_S_QUERIES_OK])
+        + " adverts=" + int_to_str(state[NAT_S_ADVERTS])
+        + " inbound_ads=" + int_to_str(state[NAT_S_INBOUND_ADS])
+        + " hole_punches=" + int_to_str(state[NAT_S_HOLE_PUNCHES])
+}

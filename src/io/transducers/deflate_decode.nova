@@ -1,0 +1,934 @@
+// CrossEngin io/transducers: DEFLATE decompressor (P3.1.PNG full).
+//
+// Purpose
+//   The DEFLATE bitstream is the inner compression layer of PNG (zlib(DEFLATE)
+//   + filter prediction + scanline framing). This module is the FIRST half of
+//   the pure-NOVA PNG decoder: it accepts a DEFLATE stream and returns the
+//   raw uncompressed bytes. PNG's outer zlib wrapper (2-byte header + 4-byte
+//   Adler-32 trailer) lives in `png_decode.nova` -- this module deals only
+//   with the inner DEFLATE block structure.
+//
+//   DEFLATE has three block types (RFC 1951 section 3.2):
+//
+//     BTYPE = 00  STORED (uncompressed)
+//                 A length-prefixed copy of the raw bytes. No Huffman, no
+//                 LZ77 back-references. The encoder uses this for already-
+//                 compressed payloads (gzip's "no improvement" path) and
+//                 for very small payloads where a Huffman table would not
+//                 amortize. Implemented since P3.1.PNG MVP.
+//
+//     BTYPE = 01  STATIC HUFFMAN
+//                 Fixed pre-defined Huffman tables (literal/length + distance).
+//                 Bit-level reader, canonical Huffman decoder, LZ77 back-
+//                 reference resolver, the length/distance code tables from
+//                 RFC 1951 section 3.2.6. Implemented in this session
+//                 (extends Item 3's stored-only path so the PNG decoder
+//                 accepts level 1-9 zlib output).
+//
+//     BTYPE = 10  DYNAMIC HUFFMAN
+//                 Variable Huffman tables transmitted in the block header
+//                 (HLIT/HDIST/HCLEN + code-length-code-lengths +
+//                 literal/length codes + distance codes). Same back-reference
+//                 resolver as static; the header parse decodes a third
+//                 "code-length" Huffman table and uses it to recover the
+//                 literal+distance code lengths. Implemented in this
+//                 session alongside BTYPE=01.
+//
+//   Scope for THIS session: BTYPE = 00, 01, and 02 all implemented. The
+//   decoder accepts ANY standard PNG (cameras, phones, screenshots) since
+//   real-world zlib defaults to level 6 dynamic Huffman. The remaining
+//   gap is the 2-byte zlib header + 4-byte Adler-32 trailer (handled in
+//   png_decode.nova) and PNG's filter byte (also in png_decode.nova).
+//
+// Public API
+//   deflate_decode(bytes_ptr, len) -> [output_ptr, output_len, error_msg]
+//     Decompress a raw DEFLATE bitstream of one or more BFINAL-tagged
+//     blocks (any mix of stored / static-Huffman / dynamic-Huffman).
+//     Returns the concatenated raw payload. Empty input or a malformed
+//     block sets error_msg and returns a zero-length output. This is
+//     the function the PNG decoder calls -- it dispatches per-block on
+//     BTYPE.
+//   deflate_decode_stored(bytes_ptr, len) -> [output_ptr, output_len,
+//                                             error_msg]
+//     Backwards-compatible alias for deflate_decode -- callers that only
+//     expect stored blocks can still use this name; on a static / dynamic
+//     block we fall through to the new code path so PNGs at any level
+//     decode end-to-end. Kept for ABI continuity with Item 3.
+//   deflate_block_type_at(bytes_ptr, total_len, bit_offset) -> int (0..3)
+//     Read the BTYPE field at the given bit offset (after the BFINAL bit).
+//     Returned for diagnostics; the main decoder no longer needs it but
+//     a couple of older callers (the integration scenario, IMAGE_AUDIT)
+//     still surface it for operator-facing TODO messages.
+//
+// DEFLATE block formats (RFC 1951 section 3.2):
+//
+//   STORED (3.2.4):
+//     1 bit   BFINAL
+//     2 bits  BTYPE = 00
+//     align   skip to next byte boundary
+//     2 bytes LEN     (little-endian)
+//     2 bytes NLEN    (one's complement of LEN, MUST match)
+//     LEN bytes raw payload
+//
+//   STATIC HUFFMAN (3.2.6):
+//     1 bit   BFINAL
+//     2 bits  BTYPE = 01
+//     Then symbols decoded against the fixed Huffman tables:
+//       literal/length alphabet (288 symbols):
+//          0..143  -> 8-bit codes 0b00110000..0b10111111  (00110000-10111111)
+//        144..255  -> 9-bit codes 0b110010000..0b111111111
+//        256..279  -> 7-bit codes 0b0000000..0b0010111
+//        280..287  -> 8-bit codes 0b11000000..0b11000111
+//       distance alphabet (30 valid symbols of 32):
+//          0..29   -> 5-bit codes 0b00000..0b11101 (canonical, all length 5)
+//
+//   DYNAMIC HUFFMAN (3.2.7):
+//     1 bit   BFINAL
+//     2 bits  BTYPE = 10
+//     5 bits  HLIT    (# of literal/length codes - 257)        => 257..286
+//     5 bits  HDIST   (# of distance codes - 1)                =>   1..32
+//     4 bits  HCLEN   (# of code-length codes - 4)             =>   4..19
+//     HCLEN * 3 bits  code-length code lengths (in fixed order)
+//     Then variable: decode literal+distance code lengths via the
+//     code-length alphabet (16 = repeat-prev, 17 = repeat-zero-3-10,
+//     18 = repeat-zero-11-138).
+//
+//   After tables exist (STATIC or DYNAMIC), symbol decode loop:
+//     symbol 0..255   literal byte -> output
+//     symbol 256      end-of-block (terminate per-block loop)
+//     symbol 257..285 length code:
+//                       extra-bits + length-base = length (3..258)
+//                       then read distance symbol from the distance table
+//                       extra-bits + dist-base = distance (1..32768)
+//                       copy `length` bytes from output[-distance]
+//                       (note: copy may overlap when distance < length;
+//                        this is how RLE-style runs are represented)
+//
+// CrossEngin contract:
+//   * Decoder is single-buffer: caller passes the bitstream pointer and
+//     length; we allocate the output buffer. Stored blocks have a 64 KiB
+//     LEN cap (2^16 - 1 == 65535 bytes per block, per RFC 1951). We cap
+//     the total decompressed size at 1.1 MiB (slightly above
+//     PGM_MAX_PIXEL_AREA from image_pgm.nova) so the buffer never exceeds
+//     NOVA's codegen pointer-threshold gotcha #11.
+//   * Sliding window for back-references is the same output buffer
+//     (RFC 1951's 32 KiB window is at most as large as what we already
+//     wrote). Overlapping copies (distance < length, RLE encoding) are
+//     handled byte-by-byte so the freshly-written bytes feed the copy.
+//   * No back-pressure / streaming -- the entire output buffer is
+//     allocated up front at the cap.
+//   * No CRC / Adler-32 / window tracking -- those live in png_decode.nova
+//     (CRC32 per PNG chunk; Adler-32 deferred).
+//
+// ADRs implemented: ADR-0014 (modality bridge / no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, list_new, push,
+//   list_set, len, int_to_str, int_add, int_mul, int_sub, int_xor,
+//   int_and, int_shr, int_shl.
+// CrossEngin dependencies: none (leaf module -- png_decode imports this).
+
+// ---- format constants -----------------------------------------------------
+
+// DEFLATE block types per RFC 1951 section 3.2.3.
+let DEFLATE_BTYPE_STORED   = 0      // BTYPE = 00: uncompressed
+let DEFLATE_BTYPE_STATIC   = 1      // BTYPE = 01: static Huffman
+let DEFLATE_BTYPE_DYNAMIC  = 2      // BTYPE = 10: dynamic Huffman
+let DEFLATE_BTYPE_RESERVED = 3      // BTYPE = 11: reserved error (RFC)
+
+// Maximum LEN per RFC 1951: 16-bit field, so 65535 bytes per stored block.
+let DEFLATE_STORED_MAX_LEN = 65535
+
+// Total decompressed cap. Slightly above PGM_MAX_PIXEL_AREA (1 MiB) so the
+// output buffer always lands under NOVA's codegen pointer-threshold gotcha
+// #11. A PNG with a 1024x1024 grayscale plane decompresses to ~1 MiB raw
+// (+ 1 filter byte per scanline, so ~1.0009 MiB); we leave margin.
+let DEFLATE_MAX_OUTPUT_BYTES = 1100000
+
+// Huffman alphabet sizes per RFC 1951.
+let DEFLATE_NUM_LITLEN  = 288   // literal/length alphabet (0..287)
+let DEFLATE_NUM_DIST    = 32    // distance alphabet (0..31)
+let DEFLATE_NUM_CODELEN = 19    // code-length-code alphabet (0..18)
+let DEFLATE_MAX_BITS    = 15    // any Huffman code is at most 15 bits
+
+// Result tuple indices.
+let DEFLATE_R_OUTPUT = 0
+let DEFLATE_R_LENGTH = 1
+let DEFLATE_R_ERROR  = 2
+
+// ---- result helpers -------------------------------------------------------
+
+fn _deflate_result(output_ptr, output_len, error_msg) {
+    let r = list_new()
+    push(r, output_ptr)
+    push(r, output_len)
+    push(r, error_msg)
+    return r
+}
+
+fn _deflate_fail(error_msg) {
+    return _deflate_result(0, 0, error_msg)
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn deflate_result_output(r) { return r[DEFLATE_R_OUTPUT] }
+fn deflate_result_length(r) { return r[DEFLATE_R_LENGTH] }
+fn deflate_result_error(r)  { return r[DEFLATE_R_ERROR] }
+
+// ---- power-of-two helper --------------------------------------------------
+//
+// Small table-walk so we can mask bits without using int_shl (which is
+// fine for small operands but the explicit pow2 helper matches the
+// arithmetic style the rest of the codebase uses for byte/bit twiddling).
+
+fn _deflate_pow2(n) {
+    if n <= 0 { return 1 }
+    let v = 1
+    let i = 0
+    while i < n {
+        v = v * 2
+        i = i + 1
+    }
+    return v
+}
+
+// ---- bit-field reader -----------------------------------------------------
+//
+// DEFLATE is bit-level inside a block, LSB-first within each byte. The
+// reader returns [value, new_bit_offset] -- callers thread the offset
+// through every read.
+//
+// bit_off can grow large (a 1.1 MiB decompressed buffer comes from
+// ~200-500 KiB of DEFLATE input == ~1.6-4M bits) so the byte-index
+// multiply uses int_mul to stay safe past NOVA's codegen pointer-
+// threshold gotcha #11.
+
+fn _deflate_read_bits(bytes_ptr, total_len, bit_off, n) {
+    let v = 0
+    let i = 0
+    while i < n {
+        let byte_index = bit_off / 8
+        let bit_index  = int_sub(bit_off, int_mul(byte_index, 8))
+        if byte_index >= total_len {
+            // Out of bounds -- caller is responsible for not asking for
+            // more bits than exist. Return what we have so far.
+            let pair = list_new()
+            push(pair, v)
+            push(pair, bit_off)
+            return pair
+        }
+        let b = load8(bytes_ptr + byte_index)
+        // Extract bit `bit_index` from byte b. `bit_index` is in 0..7 so
+        // _deflate_pow2 returns 1..128 -- always small, safe.
+        let bit = (b / _deflate_pow2(bit_index)) - ((b / _deflate_pow2(bit_index + 1)) * 2)
+        // `i` is in 0..16 here (callers ask for up to 16 bits at a time),
+        // so _deflate_pow2(i) <= 65536 -- safe with `bit` which is 0 or 1.
+        v = v + bit * _deflate_pow2(i)
+        bit_off = bit_off + 1
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, v)
+    push(pair, bit_off)
+    return pair
+}
+
+// Advance bit_off to the next byte boundary. Returns the new offset.
+// bit_off can grow large (1MB stored payload * 8 = 8.8M bits) so the
+// quotient*8 multiply uses int_mul to stay safe past the threshold.
+fn _deflate_align_to_byte(bit_off) {
+    let q = bit_off / 8
+    let r = int_sub(bit_off, int_mul(q, 8))   // remainder bits in current byte
+    if r == 0 { return bit_off }
+    return bit_off + (8 - r)
+}
+
+// ---- BTYPE readback (used by some operator-facing error paths) -----------
+
+fn deflate_block_type_at(bytes_ptr, total_len, bit_off) {
+    // The BTYPE field is 2 bits, AFTER BFINAL (1 bit). Caller passes the
+    // bit offset of BFINAL; we read past it.
+    let after_bfinal = bit_off + 1
+    let r = _deflate_read_bits(bytes_ptr, total_len, after_bfinal, 2)
+    return r[0]
+}
+
+// ---- canonical Huffman table build ---------------------------------------
+//
+// RFC 1951 section 3.2.2 specifies that DEFLATE uses CANONICAL Huffman
+// codes. Given a list of bit-lengths bl[0..n-1] (length 0 == "symbol
+// absent from this code"), the codes are derived deterministically:
+//
+//   1. bl_count[L] = # of symbols whose bit-length is L (L = 1..15)
+//   2. For L = 1..15:
+//        next_code[L] = (next_code[L-1] + bl_count[L-1]) << 1
+//   3. For each symbol s with bl[s] > 0:
+//        code[s] = next_code[bl[s]]; next_code[bl[s]] += 1
+//
+// For DECODING we don't need to materialize per-symbol codes -- we just
+// need:
+//   * first_code[L] = next_code[L]     (smallest code at length L)
+//   * count[L]      = bl_count[L]
+//   * sorted_syms[] = symbols sorted by (bl[s], s); the symbol at
+//     code value v at length L is sorted_syms[sym_offset[L] + (v - first_code[L])]
+//
+// The table we return is a single NOVA list with the layout:
+//   slot 0     = "first_code" 16-int sub-list (index by L; L=0 unused = 0)
+//   slot 1     = "count"      16-int sub-list (index by L)
+//   slot 2     = "sym_offset" 16-int sub-list (start index in sorted_syms)
+//   slot 3     = "sorted_syms" list (length = total non-zero-length symbols)
+//
+// All arithmetic uses int_add / int_mul / int_shl etc. (the Bug-A fix
+// path) so the shift chain stays correct even though next_code grows up
+// to 2^15. Code values are at most 15 bits == 32767 which is well below
+// the 1MB threshold, but the discipline of using int_* keeps the code
+// uniform with the rest of the module.
+
+let DEFLATE_T_FIRST = 0
+let DEFLATE_T_COUNT = 1
+let DEFLATE_T_OFF   = 2
+let DEFLATE_T_SYMS  = 3
+
+fn _deflate_build_huffman(code_lengths, n_symbols) {
+    // bl_count[L]: number of symbols at each bit length, L = 0..15.
+    let bl_count = list_new()
+    let i = 0
+    while i < 16 {
+        push(bl_count, 0)
+        i = i + 1
+    }
+    // Count length occurrences.
+    let s = 0
+    while s < n_symbols {
+        let L = code_lengths[s]
+        if L < 0 { L = 0 }
+        if L > DEFLATE_MAX_BITS { L = DEFLATE_MAX_BITS }
+        if L > 0 {
+            list_set(bl_count, L, bl_count[L] + 1)
+        }
+        s = s + 1
+    }
+    // first_code[L]: smallest canonical code at length L. RFC 1951
+    // pseudo-code: code = 0; for L = 1..15: code = (code + bl_count[L-1]) << 1
+    // The shift never overflows: bl_count[L-1] <= n_symbols <= 288 and
+    // there are at most 15 shifts so the running value stays under 2^15.
+    let first_code = list_new()
+    push(first_code, 0)
+    let code = 0
+    let L = 1
+    while L < 16 {
+        code = int_shl(int_add(code, bl_count[L - 1]), 1)
+        push(first_code, code)
+        L = L + 1
+    }
+    // sym_offset[L]: starting index of bit-length-L symbols in sorted_syms.
+    // We sort by (length, symbol) by walking lengths in order then symbols
+    // in order; the offset for L is the running count of all previous
+    // lengths.
+    let sym_offset = list_new()
+    push(sym_offset, 0)
+    let off = 0
+    let L2 = 1
+    while L2 < 16 {
+        off = int_add(off, bl_count[L2 - 1])
+        push(sym_offset, off)
+        L2 = L2 + 1
+    }
+    // Build sorted_syms: for L = 1..15, for s = 0..n-1, if code_lengths[s] == L,
+    // append s.
+    let sorted_syms = list_new()
+    let L3 = 1
+    while L3 < 16 {
+        let s2 = 0
+        while s2 < n_symbols {
+            let cl = code_lengths[s2]
+            if cl == L3 {
+                push(sorted_syms, s2)
+            }
+            s2 = s2 + 1
+        }
+        L3 = L3 + 1
+    }
+    let table = list_new()
+    push(table, first_code)
+    push(table, bl_count)
+    push(table, sym_offset)
+    push(table, sorted_syms)
+    return table
+}
+
+// ---- Huffman decode step --------------------------------------------------
+//
+// Decode one symbol from the bitstream against `table`. DEFLATE Huffman
+// codes are emitted MSB-first within the variable-length code (i.e. the
+// first bit you read is the highest-order bit of the code), even though
+// individual bytes are read LSB-first. So we accumulate `code` by
+// shift-left + OR new bit (taken LSB-first from the byte).
+//
+// At each length L we check whether the accumulated `code` falls in the
+// range [first_code[L], first_code[L] + count[L]); if so, the symbol is
+// sorted_syms[sym_offset[L] + (code - first_code[L])].
+//
+// Returns [symbol, new_bit_off]. On EOF / out-of-table returns [-1, off]
+// and the caller treats it as a decode error.
+
+fn _deflate_decode_symbol(bytes_ptr, total_len, bit_off, table) {
+    let first_code = table[DEFLATE_T_FIRST]
+    let count      = table[DEFLATE_T_COUNT]
+    let sym_offset = table[DEFLATE_T_OFF]
+    let sorted_syms = table[DEFLATE_T_SYMS]
+    let code = 0
+    let L = 1
+    while L <= DEFLATE_MAX_BITS {
+        // Read ONE bit and append it as the new LSB of `code`.
+        let br = _deflate_read_bits(bytes_ptr, total_len, bit_off, 1)
+        bit_off = br[1]
+        code = int_add(int_shl(code, 1), br[0])
+        let cnt = count[L]
+        if cnt > 0 {
+            let base = first_code[L]
+            // valid range: code in [base, base + cnt)
+            if code >= base {
+                let diff = int_sub(code, base)
+                if diff < cnt {
+                    let sym_idx = int_add(sym_offset[L], diff)
+                    let pair = list_new()
+                    push(pair, sorted_syms[sym_idx])
+                    push(pair, bit_off)
+                    return pair
+                }
+            }
+        }
+        L = L + 1
+    }
+    // Decode failed -- no matching code in 15 bits.
+    let pair = list_new()
+    push(pair, 0 - 1)
+    push(pair, bit_off)
+    return pair
+}
+
+// ---- RFC 1951 length / distance tables -----------------------------------
+//
+// Length codes 257..285: base length + N extra bits. Code 285 is the
+// special "258 with 0 extra bits" terminator. Distances 0..29: base
+// distance + N extra bits. Codes 30/31 in the distance alphabet are
+// invalid per spec but the canonical-Huffman build still gives them a
+// code slot; we reject them at decode time.
+
+fn _deflate_length_base(sym) {
+    // sym is 257..285. Returns base length.
+    let i = int_sub(sym, 257)
+    if i == 0  { return 3   }
+    if i == 1  { return 4   }
+    if i == 2  { return 5   }
+    if i == 3  { return 6   }
+    if i == 4  { return 7   }
+    if i == 5  { return 8   }
+    if i == 6  { return 9   }
+    if i == 7  { return 10  }
+    if i == 8  { return 11  }
+    if i == 9  { return 13  }
+    if i == 10 { return 15  }
+    if i == 11 { return 17  }
+    if i == 12 { return 19  }
+    if i == 13 { return 23  }
+    if i == 14 { return 27  }
+    if i == 15 { return 31  }
+    if i == 16 { return 35  }
+    if i == 17 { return 43  }
+    if i == 18 { return 51  }
+    if i == 19 { return 59  }
+    if i == 20 { return 67  }
+    if i == 21 { return 83  }
+    if i == 22 { return 99  }
+    if i == 23 { return 115 }
+    if i == 24 { return 131 }
+    if i == 25 { return 163 }
+    if i == 26 { return 195 }
+    if i == 27 { return 227 }
+    if i == 28 { return 258 }
+    return 0 - 1
+}
+
+fn _deflate_length_extra(sym) {
+    let i = int_sub(sym, 257)
+    if i < 4  { return 0 }     // 257..260 -> 0 extra
+    if i == 28 { return 0 }    // 285 -> 0 extra (special)
+    // 261..264 -> 0, 265..268 -> 1, 269..272 -> 2, ..., 281..284 -> 5
+    if i < 8  { return 0 }
+    if i < 12 { return 1 }
+    if i < 16 { return 2 }
+    if i < 20 { return 3 }
+    if i < 24 { return 4 }
+    if i < 28 { return 5 }
+    return 0
+}
+
+fn _deflate_dist_base(sym) {
+    // sym is 0..29 (30/31 reserved/illegal per RFC; we still permit a
+    // build but the decoder rejects them in the use site).
+    if sym == 0  { return 1     }
+    if sym == 1  { return 2     }
+    if sym == 2  { return 3     }
+    if sym == 3  { return 4     }
+    if sym == 4  { return 5     }
+    if sym == 5  { return 7     }
+    if sym == 6  { return 9     }
+    if sym == 7  { return 13    }
+    if sym == 8  { return 17    }
+    if sym == 9  { return 25    }
+    if sym == 10 { return 33    }
+    if sym == 11 { return 49    }
+    if sym == 12 { return 65    }
+    if sym == 13 { return 97    }
+    if sym == 14 { return 129   }
+    if sym == 15 { return 193   }
+    if sym == 16 { return 257   }
+    if sym == 17 { return 385   }
+    if sym == 18 { return 513   }
+    if sym == 19 { return 769   }
+    if sym == 20 { return 1025  }
+    if sym == 21 { return 1537  }
+    if sym == 22 { return 2049  }
+    if sym == 23 { return 3073  }
+    if sym == 24 { return 4097  }
+    if sym == 25 { return 6145  }
+    if sym == 26 { return 8193  }
+    if sym == 27 { return 12289 }
+    if sym == 28 { return 16385 }
+    if sym == 29 { return 24577 }
+    return 0 - 1
+}
+
+fn _deflate_dist_extra(sym) {
+    if sym < 2  { return 0 }
+    // From sym 2 onwards, extra bits = (sym / 2) - 1 (per RFC: pattern
+    // is 0,0,0,0,1,1,2,2,3,3,4,4,...).
+    let half = sym / 2
+    return int_sub(half, 1)
+}
+
+// ---- static Huffman tables (RFC 1951 section 3.2.6) ----------------------
+//
+// Code lengths for the fixed literal/length alphabet:
+//   symbols 0..143    -> 8 bits
+//   symbols 144..255  -> 9 bits
+//   symbols 256..279  -> 7 bits
+//   symbols 280..287  -> 8 bits
+// Distance alphabet:
+//   symbols 0..31     -> 5 bits (all equal length)
+//
+// Built once lazily on first decode call and cached in a module-level
+// holder. The cache avoids 288-symbol table rebuild on every static
+// block (which can be many in a single multi-block PNG).
+
+let _deflate_static_litlen = 0
+let _deflate_static_dist   = 0
+let _deflate_static_built  = 0
+
+fn _deflate_build_static_tables() {
+    if _deflate_static_built == 1 { return 1 }
+    // literal/length code lengths
+    let ll = list_new()
+    let s = 0
+    while s < DEFLATE_NUM_LITLEN {
+        let L = 8
+        if s >= 144 { L = 9 }
+        if s >= 256 { L = 7 }
+        if s >= 280 { L = 8 }
+        push(ll, L)
+        s = s + 1
+    }
+    _deflate_static_litlen = _deflate_build_huffman(ll, DEFLATE_NUM_LITLEN)
+    // distance code lengths -- all 5 (32 entries; symbols 30/31 reserved)
+    let dl = list_new()
+    let d = 0
+    while d < DEFLATE_NUM_DIST {
+        push(dl, 5)
+        d = d + 1
+    }
+    _deflate_static_dist = _deflate_build_huffman(dl, DEFLATE_NUM_DIST)
+    _deflate_static_built = 1
+    return 1
+}
+
+// ---- code-length-code order (RFC 1951 section 3.2.7) --------------------
+//
+// Dynamic-Huffman blocks transmit code-length codes in this PERMUTED
+// order, designed so that the most common (small / zero) lengths come
+// first; HCLEN encodes how many of these 19 lengths are actually carried.
+
+fn _deflate_clen_order(i) {
+    if i == 0  { return 16 }
+    if i == 1  { return 17 }
+    if i == 2  { return 18 }
+    if i == 3  { return 0  }
+    if i == 4  { return 8  }
+    if i == 5  { return 7  }
+    if i == 6  { return 9  }
+    if i == 7  { return 6  }
+    if i == 8  { return 10 }
+    if i == 9  { return 5  }
+    if i == 10 { return 11 }
+    if i == 11 { return 4  }
+    if i == 12 { return 12 }
+    if i == 13 { return 3  }
+    if i == 14 { return 13 }
+    if i == 15 { return 2  }
+    if i == 16 { return 14 }
+    if i == 17 { return 1  }
+    if i == 18 { return 15 }
+    return 0
+}
+
+// ---- dynamic Huffman: read code-length alphabet then literal+distance ---
+//
+// Returns [litlen_table, dist_table, new_bit_off, error_msg]. On any
+// malformed input the error_msg is non-empty and the tables are 0.
+
+let DEFLATE_D_LITLEN = 0
+let DEFLATE_D_DIST   = 1
+let DEFLATE_D_OFF    = 2
+let DEFLATE_D_ERROR  = 3
+
+fn _deflate_read_dynamic_tables(bytes_ptr, total_len, bit_off) {
+    // HLIT: 5 bits, value + 257 == number of literal/length codes (max 286).
+    let r = _deflate_read_bits(bytes_ptr, total_len, bit_off, 5)
+    let hlit = int_add(r[0], 257)
+    bit_off = r[1]
+    // HDIST: 5 bits, value + 1 == number of distance codes (max 32).
+    r = _deflate_read_bits(bytes_ptr, total_len, bit_off, 5)
+    let hdist = int_add(r[0], 1)
+    bit_off = r[1]
+    // HCLEN: 4 bits, value + 4 == number of code-length codes (max 19).
+    r = _deflate_read_bits(bytes_ptr, total_len, bit_off, 4)
+    let hclen = int_add(r[0], 4)
+    bit_off = r[1]
+    if hlit > 286  { return _deflate_dyn_fail("deflate: HLIT too large", bit_off) }
+    if hdist > 30  { return _deflate_dyn_fail("deflate: HDIST too large", bit_off) }
+    if hclen > 19  { return _deflate_dyn_fail("deflate: HCLEN too large", bit_off) }
+    // Read HCLEN code-length code lengths (3 bits each) in the
+    // permuted order; the rest stay at zero.
+    let clen_lengths = list_new()
+    let i = 0
+    while i < 19 {
+        push(clen_lengths, 0)
+        i = i + 1
+    }
+    let j = 0
+    while j < hclen {
+        let cr = _deflate_read_bits(bytes_ptr, total_len, bit_off, 3)
+        list_set(clen_lengths, _deflate_clen_order(j), cr[0])
+        bit_off = cr[1]
+        j = j + 1
+    }
+    // Build the code-length alphabet decoder.
+    let clen_table = _deflate_build_huffman(clen_lengths, 19)
+    // Decode hlit+hdist combined code lengths using clen_table.
+    let total_codes = int_add(hlit, hdist)
+    let combined_lengths = list_new()
+    let n_filled = 0
+    while n_filled < total_codes {
+        let dr = _deflate_decode_symbol(bytes_ptr, total_len, bit_off, clen_table)
+        let sym = dr[0]
+        bit_off = dr[1]
+        if sym < 0 {
+            return _deflate_dyn_fail("deflate: bad code-length symbol", bit_off)
+        }
+        if sym < 16 {
+            // Literal length 0..15
+            push(combined_lengths, sym)
+            n_filled = int_add(n_filled, 1)
+        }
+        if sym == 16 {
+            // Repeat previous code length 3..6 times (2 extra bits).
+            if n_filled == 0 {
+                return _deflate_dyn_fail("deflate: code-length 16 with no previous length", bit_off)
+            }
+            let er = _deflate_read_bits(bytes_ptr, total_len, bit_off, 2)
+            let n_rep = int_add(er[0], 3)
+            bit_off = er[1]
+            let prev = combined_lengths[int_sub(n_filled, 1)]
+            let k = 0
+            while k < n_rep {
+                if n_filled >= total_codes {
+                    return _deflate_dyn_fail("deflate: code-length repeat overruns alphabet", bit_off)
+                }
+                push(combined_lengths, prev)
+                n_filled = int_add(n_filled, 1)
+                k = k + 1
+            }
+        }
+        if sym == 17 {
+            // Repeat zero 3..10 times (3 extra bits).
+            let er = _deflate_read_bits(bytes_ptr, total_len, bit_off, 3)
+            let n_rep = int_add(er[0], 3)
+            bit_off = er[1]
+            let k = 0
+            while k < n_rep {
+                if n_filled >= total_codes {
+                    return _deflate_dyn_fail("deflate: code-length zero-repeat overruns", bit_off)
+                }
+                push(combined_lengths, 0)
+                n_filled = int_add(n_filled, 1)
+                k = k + 1
+            }
+        }
+        if sym == 18 {
+            // Repeat zero 11..138 times (7 extra bits).
+            let er = _deflate_read_bits(bytes_ptr, total_len, bit_off, 7)
+            let n_rep = int_add(er[0], 11)
+            bit_off = er[1]
+            let k = 0
+            while k < n_rep {
+                if n_filled >= total_codes {
+                    return _deflate_dyn_fail("deflate: code-length long-zero-repeat overruns", bit_off)
+                }
+                push(combined_lengths, 0)
+                n_filled = int_add(n_filled, 1)
+                k = k + 1
+            }
+        }
+    }
+    // Split into literal/length and distance lengths.
+    let ll_lengths = list_new()
+    let dl_lengths = list_new()
+    let m = 0
+    while m < hlit {
+        push(ll_lengths, combined_lengths[m])
+        m = m + 1
+    }
+    while m < total_codes {
+        push(dl_lengths, combined_lengths[m])
+        m = m + 1
+    }
+    let lit_table  = _deflate_build_huffman(ll_lengths, hlit)
+    let dist_table = _deflate_build_huffman(dl_lengths, hdist)
+    let out = list_new()
+    push(out, lit_table)
+    push(out, dist_table)
+    push(out, bit_off)
+    push(out, "")
+    return out
+}
+
+fn _deflate_dyn_fail(msg, bit_off) {
+    let r = list_new()
+    push(r, 0)
+    push(r, 0)
+    push(r, bit_off)
+    push(r, msg)
+    return r
+}
+
+// ---- Huffman block body (shared by static + dynamic) ---------------------
+//
+// Loop: decode literal/length symbol, then either:
+//   * symbol < 256: literal byte -> output[out_len++]
+//   * symbol == 256: end of block, return new (out_len, bit_off, "")
+//   * symbol >= 257: length code; read extra bits; read distance symbol;
+//     read its extra bits; copy `length` bytes from output[out_len-distance].
+// out_len cap and bit-stream EOF both fail with descriptive errors.
+
+let DEFLATE_BB_OUTLEN = 0
+let DEFLATE_BB_OFF    = 1
+let DEFLATE_BB_ERROR  = 2
+
+fn _deflate_decode_block_body(bytes_ptr, total_len, bit_off, out, out_len,
+                               lit_table, dist_table) {
+    let going = 1
+    while going == 1 {
+        let sr = _deflate_decode_symbol(bytes_ptr, total_len, bit_off, lit_table)
+        let sym = sr[0]
+        bit_off = sr[1]
+        if sym < 0 {
+            return _deflate_bb_fail("deflate: bad literal/length code", out_len, bit_off)
+        }
+        if sym < 256 {
+            if out_len >= DEFLATE_MAX_OUTPUT_BYTES {
+                return _deflate_bb_fail("deflate: decompressed size exceeds 1MiB cap", out_len, bit_off)
+            }
+            store8(out + out_len, sym)
+            out_len = int_add(out_len, 1)
+        }
+        if sym == 256 {
+            going = 0
+        }
+        if sym > 256 {
+            if sym > 285 {
+                return _deflate_bb_fail("deflate: literal/length symbol out of range", out_len, bit_off)
+            }
+            let length = _deflate_length_base(sym)
+            let extra_l = _deflate_length_extra(sym)
+            if extra_l > 0 {
+                let er = _deflate_read_bits(bytes_ptr, total_len, bit_off, extra_l)
+                length = int_add(length, er[0])
+                bit_off = er[1]
+            }
+            // Now read the distance code.
+            let dr = _deflate_decode_symbol(bytes_ptr, total_len, bit_off, dist_table)
+            let dsym = dr[0]
+            bit_off = dr[1]
+            if dsym < 0 {
+                return _deflate_bb_fail("deflate: bad distance code", out_len, bit_off)
+            }
+            if dsym > 29 {
+                return _deflate_bb_fail("deflate: distance symbol > 29 (reserved)", out_len, bit_off)
+            }
+            let dist = _deflate_dist_base(dsym)
+            let extra_d = _deflate_dist_extra(dsym)
+            if extra_d > 0 {
+                let er = _deflate_read_bits(bytes_ptr, total_len, bit_off, extra_d)
+                dist = int_add(dist, er[0])
+                bit_off = er[1]
+            }
+            if dist <= 0 {
+                return _deflate_bb_fail("deflate: distance <= 0", out_len, bit_off)
+            }
+            if dist > out_len {
+                return _deflate_bb_fail("deflate: distance exceeds output history", out_len, bit_off)
+            }
+            // Cap check before the copy loop.
+            if int_add(out_len, length) > DEFLATE_MAX_OUTPUT_BYTES {
+                return _deflate_bb_fail("deflate: copy exceeds 1MiB cap", out_len, bit_off)
+            }
+            // Copy `length` bytes from out[out_len - dist]. Done byte-by-byte
+            // so an overlapping copy (dist < length) reads bytes that were
+            // JUST written, implementing the RLE-style run encoding the
+            // RFC describes.
+            let k = 0
+            while k < length {
+                let src = load8(out + int_sub(out_len, dist) + k)
+                store8(out + out_len + k, src)
+                k = k + 1
+            }
+            out_len = int_add(out_len, length)
+        }
+    }
+    let r = list_new()
+    push(r, out_len)
+    push(r, bit_off)
+    push(r, "")
+    return r
+}
+
+fn _deflate_bb_fail(msg, out_len, bit_off) {
+    let r = list_new()
+    push(r, out_len)
+    push(r, bit_off)
+    push(r, msg)
+    return r
+}
+
+// ---- main DEFLATE decoder -------------------------------------------------
+//
+// Loop over one or more DEFLATE blocks until BFINAL is set. For each
+// block dispatch on BTYPE:
+//   * BTYPE=00 STORED -- align, read LEN/NLEN, copy LEN bytes.
+//   * BTYPE=01 STATIC -- build static tables once, decode block body.
+//   * BTYPE=10 DYNAMIC -- parse HLIT/HDIST/HCLEN headers, build tables,
+//     decode block body.
+//   * BTYPE=11 RESERVED -- error per RFC.
+//
+// Returns [out_ptr, out_len, error_msg].
+
+fn deflate_decode(bytes_ptr, total_len) {
+    if total_len <= 0 {
+        return _deflate_fail("deflate: empty input")
+    }
+    let out = alloc(DEFLATE_MAX_OUTPUT_BYTES + 1)
+    let out_len = 0
+    let bit_off = 0
+    let done = 0
+    while done == 0 {
+        let total_bits = int_mul(total_len, 8)
+        if int_add(bit_off, 3) > total_bits {
+            return _deflate_fail("deflate: truncated block header")
+        }
+        let bfinal_r = _deflate_read_bits(bytes_ptr, total_len, bit_off, 1)
+        let bfinal = bfinal_r[0]
+        let after_bfinal = bfinal_r[1]
+        let btype_r = _deflate_read_bits(bytes_ptr, total_len, after_bfinal, 2)
+        let btype = btype_r[0]
+        let after_btype = btype_r[1]
+        if btype == DEFLATE_BTYPE_RESERVED {
+            return _deflate_fail("deflate: BTYPE=11 (reserved) is illegal per RFC 1951")
+        }
+        if btype == DEFLATE_BTYPE_STORED {
+            // Stored block: align, read LEN/NLEN, copy.
+            let aligned = _deflate_align_to_byte(after_btype)
+            let byte_off = aligned / 8
+            if byte_off + 4 > total_len {
+                return _deflate_fail("deflate: stored-block header truncated (need LEN+NLEN)")
+            }
+            let len_lo  = load8(bytes_ptr + byte_off)
+            let len_hi  = load8(bytes_ptr + byte_off + 1)
+            let nlen_lo = load8(bytes_ptr + byte_off + 2)
+            let nlen_hi = load8(bytes_ptr + byte_off + 3)
+            let block_len = len_lo + len_hi * 256
+            let nlen      = nlen_lo + nlen_hi * 256
+            if block_len + nlen != 65535 {
+                return _deflate_fail("deflate: LEN/NLEN check failed (corrupted stored block)")
+            }
+            if block_len > DEFLATE_STORED_MAX_LEN {
+                return _deflate_fail("deflate: stored-block LEN exceeds 65535")
+            }
+            let data_off = byte_off + 4
+            if data_off + block_len > total_len {
+                return _deflate_fail("deflate: stored-block payload truncated")
+            }
+            if out_len + block_len > DEFLATE_MAX_OUTPUT_BYTES {
+                return _deflate_fail("deflate: decompressed size exceeds 1MiB cap")
+            }
+            let i = 0
+            while i < block_len {
+                store8(out + out_len + i, load8(bytes_ptr + data_off + i))
+                i = i + 1
+            }
+            out_len = out_len + block_len
+            bit_off = int_mul(int_add(data_off, block_len), 8)
+        }
+        if btype == DEFLATE_BTYPE_STATIC {
+            _deflate_build_static_tables()
+            let lit_table  = _deflate_static_litlen
+            let dist_table = _deflate_static_dist
+            let bb = _deflate_decode_block_body(bytes_ptr, total_len, after_btype,
+                                                out, out_len, lit_table, dist_table)
+            let bb_err = bb[DEFLATE_BB_ERROR]
+            if len(bb_err) > 0 {
+                return _deflate_fail(bb_err)
+            }
+            out_len = bb[DEFLATE_BB_OUTLEN]
+            bit_off = bb[DEFLATE_BB_OFF]
+        }
+        if btype == DEFLATE_BTYPE_DYNAMIC {
+            let dt = _deflate_read_dynamic_tables(bytes_ptr, total_len, after_btype)
+            let dt_err = dt[DEFLATE_D_ERROR]
+            if len(dt_err) > 0 {
+                return _deflate_fail(dt_err)
+            }
+            let lit_table  = dt[DEFLATE_D_LITLEN]
+            let dist_table = dt[DEFLATE_D_DIST]
+            bit_off = dt[DEFLATE_D_OFF]
+            let bb = _deflate_decode_block_body(bytes_ptr, total_len, bit_off,
+                                                out, out_len, lit_table, dist_table)
+            let bb_err = bb[DEFLATE_BB_ERROR]
+            if len(bb_err) > 0 {
+                return _deflate_fail(bb_err)
+            }
+            out_len = bb[DEFLATE_BB_OUTLEN]
+            bit_off = bb[DEFLATE_BB_OFF]
+        }
+        if bfinal == 1 { done = 1 }
+    }
+    store8(out + out_len, 0)   // sentinel NUL; callers must use returned length
+    return _deflate_result(out, out_len, "")
+}
+
+// Backwards-compatible alias for ABI continuity with Item 3. The original
+// name advertised STORED-only support; the new BTYPE=01/02 paths slot in
+// underneath so existing callers (png_decode.nova) keep working without
+// the boilerplate of switching names.
+fn deflate_decode_stored(bytes_ptr, total_len) {
+    return deflate_decode(bytes_ptr, total_len)
+}

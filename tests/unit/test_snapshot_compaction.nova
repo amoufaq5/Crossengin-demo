@@ -1,0 +1,410 @@
+// Unit tests for src/persistence/snapshot_compaction.nova (P2.10).
+//
+// Builds a synthetic snapshot with mixed-tier episodes + dead atoms + low-
+// weight synapses, runs each per-section compactor + the orchestrator, and
+// asserts the drop counts + survivor counts + that the compacted snapshot
+// still parses through snap_to_text / snap_from_text (so the on-disk shape
+// is unchanged -- only the payloads shrink).
+//
+// We also cover the env-driven defaults helper, the opts setters, and the
+// no-section / empty-blob edge cases so the orchestrator is total.
+//
+// ADRs: ADR-0048 (persistence container; compaction is the in-memory editor
+// of the same value the container holds).
+
+import "../ce_test.nova"
+import "../../src/persistence/snapshot_disk.nova"
+import "../../src/persistence/snapshot_compaction.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Build a KGS blob from a list of [label, alpha, beta] triples (with a
+// stable kg/id/kind so the compactor's predicate sees only the belief and
+// label). Matches the shape `kg_section_build` emits.
+fn _mk_kgs_blob(specs) {
+    let blob = list_new()
+    push(blob, len(specs))
+    let recs = list_new()
+    let i = 0
+    while i < len(specs) {
+        let s = specs[i]
+        let r = list_new()
+        push(r, "reasoning")   // kg label
+        push(r, i)             // id
+        push(r, 1)             // kind (ATOM_FACT == 1, but value doesn't matter for compaction)
+        push(r, s[0])          // label
+        push(r, s[1])          // alpha
+        push(r, s[2])          // beta
+        push(recs, r)
+        i = i + 1
+    }
+    push(blob, recs)
+    return blob
+}
+
+// Build an episodic blob from a list of [ts, lifecycle, valence] tuples for
+// moments and a list of [id, tier] tuples for episodes.
+fn _mk_episodic_blob(moments_spec, episodes_spec) {
+    let blob = list_new()
+    let moments = list_new()
+    let i = 0
+    while i < len(moments_spec) {
+        let s = moments_spec[i]
+        let rec = list_new()
+        push(rec, s[0])           // ts
+        push(rec, s[1])           // lifecycle
+        push(rec, s[2])           // valence
+        push(rec, list_new())     // atoms (empty for this test)
+        push(moments, rec)
+        i = i + 1
+    }
+    push(blob, moments)
+    let episodes = list_new()
+    let j = 0
+    while j < len(episodes_spec) {
+        let s = episodes_spec[j]
+        let rec = list_new()
+        push(rec, s[0])           // id
+        push(rec, s[1])           // tier
+        let mids = list_new()
+        push(mids, 0)
+        push(rec, mids)
+        push(episodes, rec)
+        j = j + 1
+    }
+    push(blob, episodes)
+    return blob
+}
+
+// Build a synapses blob from a list of [src, dst, weight, eligibility]
+// records (plus an initial threshold).
+fn _mk_syn_blob(threshold, recs_spec) {
+    let blob = list_new()
+    push(blob, threshold)
+    let recs = list_new()
+    let i = 0
+    while i < len(recs_spec) {
+        let s = recs_spec[i]
+        let r = list_new()
+        push(r, s[0])
+        push(r, s[1])
+        push(r, s[2])
+        push(r, s[3])
+        push(recs, r)
+        i = i + 1
+    }
+    push(blob, recs)
+    return blob
+}
+
+// Build a snapshot wrapping all three sections (plus a stub SOUL so
+// snap_to_text accepts the frame).
+fn _mk_full_snap(kgs_blob, ep_blob, syn_blob) {
+    let s = snap_new(1, 1000)
+    let sb = list_new()
+    push(sb, "Aurora")
+    push(sb, 0)
+    snap_put_section(s, SEC_SOUL, sb)
+    snap_put_section(s, SEC_KGS, kgs_blob)
+    snap_put_section(s, SEC_EPISODIC, ep_blob)
+    snap_put_section(s, SEC_SYNAPSES, syn_blob)
+    return s
+}
+
+// ---- opts defaults --------------------------------------------------------
+
+fn test_opts_defaults() {
+    let o = compact_opts_new()
+    ce_eq("default dead_belief = 50 milli", compact_opts_dead_belief(o), 50)
+    ce_eq("default syn_thresh = 200 milli", compact_opts_synapse_threshold(o), 200)
+    ce_eq("default moment_max_age = 3.6e12 ns",
+        compact_opts_moment_max_age(o), 3600000000000)
+    ce_eq("default drop_prefix len = 0",
+        len(compact_opts_drop_label_prefix(o)), 0)
+}
+
+fn test_opts_setters() {
+    let o = compact_opts_new()
+    compact_opts_set_dead_belief(o, 75)
+    ce_eq("dead_belief setter", compact_opts_dead_belief(o), 75)
+    compact_opts_set_synapse_threshold(o, 300)
+    ce_eq("syn_threshold setter", compact_opts_synapse_threshold(o), 300)
+    compact_opts_set_moment_max_age(o, 5000)
+    ce_eq("moment_max_age setter", compact_opts_moment_max_age(o), 5000)
+    compact_opts_set_drop_label_prefix(o, "debug:")
+    ce_str_eq("drop_prefix setter",
+        compact_opts_drop_label_prefix(o), "debug:")
+}
+
+// ---- compact_kgs ----------------------------------------------------------
+
+fn test_compact_kgs_drops_dead_atoms() {
+    // Five atoms: 3 alive (mean >= 50), 2 dead (mean < 50).
+    // mean = alpha * 1000 / (alpha+beta)
+    //   alpha=1000, beta=1000 -> mean 500 (alive)
+    //   alpha=800, beta=200  -> mean 800 (alive)
+    //   alpha=10, beta=990   -> mean 10  (dead)
+    //   alpha=900, beta=100  -> mean 900 (alive)
+    //   alpha=20, beta=1980  -> mean 10  (dead)
+    let specs = list_new()
+    let a = list_new() push(a, "alpha") push(a, 1000) push(a, 1000) push(specs, a)
+    let b = list_new() push(b, "beta")  push(b, 800)  push(b, 200)  push(specs, b)
+    let c = list_new() push(c, "gamma") push(c, 10)   push(c, 990)  push(specs, c)
+    let d = list_new() push(d, "delta") push(d, 900)  push(d, 100)  push(specs, d)
+    let e = list_new() push(e, "eps")   push(e, 20)   push(e, 1980) push(specs, e)
+    let kgs_blob = _mk_kgs_blob(specs)
+    let ep_blob = _mk_episodic_blob(list_new(), list_new())
+    let syn_blob = _mk_syn_blob(100, list_new())
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    let res = compact_kgs(snap, opts)
+    let new_blob = res[0]
+    let dropped = res[1]
+    ce_eq("compact_kgs dropped 2 dead atoms", dropped, 2)
+    ce_eq("compact_kgs new blob[0] = 3", new_blob[0], 3)
+    ce_eq("compact_kgs new blob[1] has 3 atoms", len(new_blob[1]), 3)
+    // Survivors: alpha (mean 500), beta (mean 800), delta (mean 900). gamma
+    // and eps were the dead ones.
+    let labels_ok = 0
+    let i = 0
+    while i < len(new_blob[1]) {
+        let lbl = new_blob[1][i][3]
+        if str_eq(lbl, "gamma") == 1 { labels_ok = 1 }
+        if str_eq(lbl, "eps") == 1 { labels_ok = 1 }
+        i = i + 1
+    }
+    ce_eq("no dead labels survive", labels_ok, 0)
+}
+
+fn test_compact_kgs_drops_by_label_prefix() {
+    // Three atoms, all alive, two with label "debug:" prefix.
+    let specs = list_new()
+    let a = list_new() push(a, "real")       push(a, 800) push(a, 200) push(specs, a)
+    let b = list_new() push(b, "debug:x")    push(b, 800) push(b, 200) push(specs, b)
+    let c = list_new() push(c, "debug:tmp")  push(c, 800) push(c, 200) push(specs, c)
+    let kgs_blob = _mk_kgs_blob(specs)
+    let ep_blob = _mk_episodic_blob(list_new(), list_new())
+    let syn_blob = _mk_syn_blob(100, list_new())
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    compact_opts_set_drop_label_prefix(opts, "debug:")
+    let res = compact_kgs(snap, opts)
+    ce_eq("prefix-drop removed 2 atoms", res[1], 2)
+    ce_eq("prefix-drop survivor count = 1", len(res[0][1]), 1)
+    ce_str_eq("only 'real' survived", res[0][1][0][3], "real")
+}
+
+// ---- compact_episodic -----------------------------------------------------
+
+fn test_compact_episodic_drops_archived() {
+    // 3 episodes: tiers RECENT(1), ARCHIVED(2), CONSOLIDATED(3).
+    // No moments to test moment age in this case.
+    let eps_spec = list_new()
+    let e1 = list_new() push(e1, 0) push(e1, 1) push(eps_spec, e1)   // RECENT
+    let e2 = list_new() push(e2, 1) push(e2, 2) push(eps_spec, e2)   // ARCHIVED
+    let e3 = list_new() push(e3, 2) push(e3, 3) push(eps_spec, e3)   // CONSOLIDATED
+    let kgs_blob = _mk_kgs_blob(list_new())
+    let ep_blob = _mk_episodic_blob(list_new(), eps_spec)
+    let syn_blob = _mk_syn_blob(100, list_new())
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    let res = compact_episodic(snap, opts)
+    ce_eq("compact_episodic dropped 1 archived episode", res[1], 1)
+    ce_eq("compact_episodic dropped 0 moments (empty stream)", res[2], 0)
+    ce_eq("compact_episodic survivor count = 2", len(res[0][1]), 2)
+}
+
+fn test_compact_episodic_drops_old_moments() {
+    // Newest moment ts = 1000. Old moments at ts <= 400 are out (age >= 600).
+    // Use opts.moment_max_age = 500 ns.
+    let mom_spec = list_new()
+    let m0 = list_new() push(m0, 100)  push(m0, 1) push(m0, 0) push(mom_spec, m0)
+    let m1 = list_new() push(m1, 400)  push(m1, 1) push(m1, 0) push(mom_spec, m1)
+    let m2 = list_new() push(m2, 600)  push(m2, 1) push(m2, 0) push(mom_spec, m2)
+    let m3 = list_new() push(m3, 1000) push(m3, 1) push(m3, 0) push(mom_spec, m3)
+    let kgs_blob = _mk_kgs_blob(list_new())
+    let ep_blob = _mk_episodic_blob(mom_spec, list_new())
+    let syn_blob = _mk_syn_blob(100, list_new())
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    compact_opts_set_moment_max_age(opts, 500)
+    let res = compact_episodic(snap, opts)
+    // age(m0) = 900, drop; age(m1) = 600, drop; age(m2) = 400, keep;
+    // age(m3) = 0, keep.
+    ce_eq("compact_episodic dropped 2 old moments", res[2], 2)
+    ce_eq("compact_episodic moment survivors = 2", len(res[0][0]), 2)
+    ce_eq("compact_episodic kept m2 (ts=600)", res[0][0][0][0], 600)
+    ce_eq("compact_episodic kept m3 (ts=1000)", res[0][0][1][0], 1000)
+}
+
+// ---- compact_synapses -----------------------------------------------------
+
+fn test_compact_synapses_tightens_threshold() {
+    // 5 synapses with weights 50, 150, 250, 350, -250. Default tighter
+    // threshold is 200 milli, so 50 and 150 should drop (and -250 keeps
+    // because |w|=250 >= 200).
+    let recs = list_new()
+    let s1 = list_new() push(s1, 0) push(s1, 1) push(s1, 50)       push(s1, 0) push(recs, s1)
+    let s2 = list_new() push(s2, 0) push(s2, 2) push(s2, 150)      push(s2, 0) push(recs, s2)
+    let s3 = list_new() push(s3, 0) push(s3, 3) push(s3, 250)      push(s3, 0) push(recs, s3)
+    let s4 = list_new() push(s4, 0) push(s4, 4) push(s4, 350)      push(s4, 0) push(recs, s4)
+    let s5 = list_new() push(s5, 0) push(s5, 5) push(s5, 0 - 250)  push(s5, 0) push(recs, s5)
+    let kgs_blob = _mk_kgs_blob(list_new())
+    let ep_blob = _mk_episodic_blob(list_new(), list_new())
+    let syn_blob = _mk_syn_blob(100, recs)
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    let res = compact_synapses(snap, opts)
+    ce_eq("compact_synapses dropped 2 sub-threshold", res[1], 2)
+    ce_eq("compact_synapses survivors = 3", len(res[0][1]), 3)
+    ce_eq("compact_synapses new threshold = 200", res[0][0], 200)
+}
+
+fn test_compact_synapses_no_op_when_threshold_lower() {
+    // Blob already has a threshold of 500; opts asks for 200. The compactor
+    // must not LOWER the cut (only ever tighten).
+    let recs = list_new()
+    let s1 = list_new() push(s1, 0) push(s1, 1) push(s1, 600) push(s1, 0) push(recs, s1)
+    let s2 = list_new() push(s2, 0) push(s2, 2) push(s2, 800) push(s2, 0) push(recs, s2)
+    let kgs_blob = _mk_kgs_blob(list_new())
+    let ep_blob = _mk_episodic_blob(list_new(), list_new())
+    let syn_blob = _mk_syn_blob(500, recs)
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    let res = compact_synapses(snap, opts)
+    ce_eq("compact_synapses dropped 0 when blob threshold > opts", res[1], 0)
+    ce_eq("compact_synapses keeps blob threshold at 500", res[0][0], 500)
+}
+
+// ---- snap_compact orchestrator --------------------------------------------
+
+fn test_snap_compact_full_pipeline() {
+    // Mixed-tier episodes + dead atoms + low-weight synapses.
+    let kgs_spec = list_new()
+    let a1 = list_new() push(a1, "alive1") push(a1, 800) push(a1, 200) push(kgs_spec, a1)
+    let a2 = list_new() push(a2, "dead1")  push(a2, 10)  push(a2, 990) push(kgs_spec, a2)
+    let a3 = list_new() push(a3, "alive2") push(a3, 900) push(a3, 100) push(kgs_spec, a3)
+    let kgs_blob = _mk_kgs_blob(kgs_spec)
+    let eps_spec = list_new()
+    let e1 = list_new() push(e1, 0) push(e1, 1) push(eps_spec, e1)
+    let e2 = list_new() push(e2, 1) push(e2, 2) push(eps_spec, e2)   // ARCHIVED
+    let ep_blob = _mk_episodic_blob(list_new(), eps_spec)
+    let recs = list_new()
+    let s1 = list_new() push(s1, 0) push(s1, 1) push(s1, 150) push(s1, 0) push(recs, s1)
+    let s2 = list_new() push(s2, 0) push(s2, 2) push(s2, 300) push(s2, 0) push(recs, s2)
+    let syn_blob = _mk_syn_blob(100, recs)
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    let stats = snap_compact_stats(snap, opts)
+    ce_eq("orchestrator stats: kgs drop = 1", stats[0], 1)
+    ce_eq("orchestrator stats: episodes drop = 1", stats[1], 1)
+    ce_eq("orchestrator stats: moments drop = 0", stats[2], 0)
+    ce_eq("orchestrator stats: syn drop = 1", stats[3], 1)
+    let compacted = snap_compact(snap, opts)
+    ce_check("orchestrator returned a snapshot", compacted != 0)
+    ce_check("compacted snapshot valid", snap_valid(compacted) == 1)
+    let kgs_after = snap_section(compacted, SEC_KGS)
+    ce_eq("compacted KGS = 2 atoms", len(kgs_after[1]), 2)
+    let ep_after = snap_section(compacted, SEC_EPISODIC)
+    ce_eq("compacted episodes = 1", len(ep_after[1]), 1)
+    let syn_after = snap_section(compacted, SEC_SYNAPSES)
+    ce_eq("compacted synapses = 1 record", len(syn_after[1]), 1)
+}
+
+// ---- round-trip: compacted snapshot still parses + applies ---------------
+
+fn test_compacted_snapshot_round_trips() {
+    let kgs_spec = list_new()
+    let a1 = list_new() push(a1, "real1") push(a1, 800) push(a1, 200) push(kgs_spec, a1)
+    let a2 = list_new() push(a2, "dead")  push(a2, 10)  push(a2, 990) push(kgs_spec, a2)
+    let a3 = list_new() push(a3, "real2") push(a3, 700) push(a3, 300) push(kgs_spec, a3)
+    let kgs_blob = _mk_kgs_blob(kgs_spec)
+    let ep_blob = _mk_episodic_blob(list_new(), list_new())
+    let syn_blob = _mk_syn_blob(100, list_new())
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let opts = compact_opts_new()
+    let compacted = snap_compact(snap, opts)
+    let text = snap_to_text(compacted)
+    ce_check("compacted text non-empty", len(text) > 0)
+    let parsed = snap_from_text(text)
+    ce_check("compacted text parses", parsed != 0)
+    let kgs_blob_after = snap_section(parsed, SEC_KGS)
+    ce_eq("post-round-trip atom count = 2", len(kgs_blob_after[1]), 2)
+}
+
+// ---- size shrinks --------------------------------------------------------
+
+fn test_compact_shrinks_text_size() {
+    // 100 atoms, half dead. Snap to text BEFORE then AFTER and confirm
+    // the text shrinks.
+    let kgs_spec = list_new()
+    let i = 0
+    while i < 100 {
+        let r = list_new()
+        push(r, "atom_" + int_to_str(i))
+        // Alternate alive (800/200) and dead (10/990).
+        if i / 2 * 2 == i {
+            push(r, 800)
+            push(r, 200)
+        } else {
+            push(r, 10)
+            push(r, 990)
+        }
+        push(kgs_spec, r)
+        i = i + 1
+    }
+    let kgs_blob = _mk_kgs_blob(kgs_spec)
+    let ep_blob = _mk_episodic_blob(list_new(), list_new())
+    let syn_blob = _mk_syn_blob(100, list_new())
+    let snap = _mk_full_snap(kgs_blob, ep_blob, syn_blob)
+    let before = len(snap_to_text(snap))
+    let opts = compact_opts_new()
+    let compacted = snap_compact(snap, opts)
+    let after = len(snap_to_text(compacted))
+    ce_check("compaction shrinks text", after < before)
+    // Ballpark: dropping ~50% of atoms drops ~40% of bytes (atom records
+    // dominate the body; the header is constant-overhead).
+    ce_check("compaction shrunk by >25%", (before - after) * 100 / before > 25)
+}
+
+// ---- edge cases ----------------------------------------------------------
+
+fn test_compact_handles_empty_snapshot() {
+    let s = snap_new(1, 1000)
+    let opts = compact_opts_new()
+    let stats = snap_compact_stats(s, opts)
+    ce_eq("empty snap: kgs drop = 0", stats[0], 0)
+    ce_eq("empty snap: episodes drop = 0", stats[1], 0)
+    ce_eq("empty snap: moments drop = 0", stats[2], 0)
+    ce_eq("empty snap: syn drop = 0", stats[3], 0)
+    let compacted = snap_compact(s, opts)
+    ce_check("empty snap compacted is non-zero", compacted != 0)
+}
+
+// ---- env-driven opts -----------------------------------------------------
+
+fn test_opts_from_env_defaults_when_unset() {
+    // CE_COMPACT_DEAD_BELIEF etc. are unset in the test harness; ensure
+    // compact_opts_from_env still produces sensible defaults.
+    let o = compact_opts_from_env()
+    ce_eq("env default dead_belief", compact_opts_dead_belief(o), 50)
+    ce_eq("env default syn_thresh", compact_opts_synapse_threshold(o), 200)
+}
+
+fn main() {
+    test_opts_defaults()
+    test_opts_setters()
+    test_compact_kgs_drops_dead_atoms()
+    test_compact_kgs_drops_by_label_prefix()
+    test_compact_episodic_drops_archived()
+    test_compact_episodic_drops_old_moments()
+    test_compact_synapses_tightens_threshold()
+    test_compact_synapses_no_op_when_threshold_lower()
+    test_snap_compact_full_pipeline()
+    test_compacted_snapshot_round_trips()
+    test_compact_shrinks_text_size()
+    test_compact_handles_empty_snapshot()
+    test_opts_from_env_defaults_when_unset()
+    ce_summary("snapshot_compaction")
+}
+main()

@@ -1,0 +1,323 @@
+// CrossEngin io/transducers: stdin streaming source (P2.8).
+//
+// Purpose
+//   First of three real-time event sources that feed the daemon's scheduler
+//   queue without a fixed pre-loaded script. This module owns stdin: at
+//   startup it switches fd 0 to non-blocking mode via fcntl(F_SETFL,
+//   O_NONBLOCK), and at every idle tick the daemon calls `stream_stdin_poll`
+//   to drain whatever bytes the kernel has buffered. Each newline-terminated
+//   line is normalized via the existing input_transducer text path and
+//   posted as an `EV_MESSAGE` on the shared event queue (the scheduler then
+//   wakes from idle and runs the six loops over the percept).
+//
+//   Why non-blocking + line buffer instead of `io_input()`? `io_input`
+//   blocks until the kernel returns SOME bytes, which would freeze the
+//   daemon's tick loop -- the scheduler would never get to advance
+//   imagination / checkpoint / KG learning while stdin is quiet. The
+//   non-blocking sys_read returns -1 (EAGAIN) immediately when stdin is
+//   drained, so a poll is "free" (one syscall) when no input is ready,
+//   and the daemon's tick rate is preserved. The persistent line buffer
+//   handles the case where a sys_read returns half a line (the trailing
+//   partial line is held until the rest arrives in a subsequent poll).
+//
+//   Enable via `CE_STREAM_STDIN=1`. Default off so all existing scripted-
+//   episode integration tests continue to drive the daemon as before.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path),
+//   ADR-0037 (event-driven scheduler; this module is an event producer).
+// NOVA dependencies: builtins -- alloc, store8, load8, len, substr, push,
+//   list_new, list_remove, getenv, str_trim, char_at, str_eq, asm.
+// CrossEngin dependencies: src/io/transducers/input_transducer.nova
+//   (transduce_text for normalization), src/scheduler/hybrid_scheduler.nova
+//   (hs_post_event, EV_MESSAGE constant -- the producer side of the event
+//   layer).
+
+import "input_transducer.nova"
+import "../../scheduler/hybrid_scheduler.nova"
+
+// File descriptor for stdin (POSIX).
+let STREAM_STDIN_FD = 0
+
+// fcntl: cmd F_SETFL = 4, flag O_NONBLOCK = 2048 (0o4000 on Linux x86-64).
+let STREAM_FCNTL_F_SETFL  = 4
+let STREAM_FCNTL_O_NONBLOCK = 2048
+
+// Maximum bytes per non-blocking read syscall. Lines longer than this are
+// still handled -- the residual is buffered and combined with the next read.
+let STREAM_STDIN_READ_CHUNK = 4096
+
+// Soft cap on the in-memory line buffer. If a single line exceeds this,
+// we flush the buffered prefix as a message to prevent unbounded growth.
+let STREAM_STDIN_BUF_MAX = 65536
+
+// ---- raw fcntl shim (no NOVA builtin) -------------------------------------
+// fcntl(fd, cmd, arg) -> int. syscall number 72 on Linux x86-64.
+// Used once at startup to switch stdin to O_NONBLOCK so subsequent sys_read
+// returns -EAGAIN instead of blocking when no data is buffered.
+fn _stream_fcntl(fd, cmd, arg) {
+    asm {
+        "mov rax, 72"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// Inline non-blocking read shim. Returns the raw sys_read result so the
+// caller can distinguish 0 (EOF), >0 (n bytes read), and <0 (EAGAIN or
+// error). syscall 0 = read.
+fn _stream_sys_read(fd, buf, count) {
+    asm {
+        "mov rax, 0"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// ---- stream state ---------------------------------------------------------
+// One stream state per process. Holds the line-residual buffer (bytes read
+// but not yet terminated by a newline), plus counters for observability.
+//
+// Shape:
+//   [0] tag          (sentinel)
+//   [1] enabled      (0|1: did init_from_env decide we should run?)
+//   [2] initialized  (0|1: did init_runtime switch stdin to non-blocking?)
+//   [3] residual     (string: bytes read mid-line; held until the LF arrives)
+//   [4] lines_total  (counter: complete lines ever pushed)
+//   [5] eof_seen     (0|1: stdin reached EOF -- stop polling)
+
+let STREAM_STDIN_TAG = 6201
+
+let SS_TAG          = 0
+let SS_ENABLED      = 1
+let SS_INITIALIZED  = 2
+let SS_RESIDUAL     = 3
+let SS_LINES_TOTAL  = 4
+let SS_EOF_SEEN     = 5
+
+fn stream_stdin_new() {
+    let s = list_new()
+    push(s, STREAM_STDIN_TAG)
+    push(s, 0)
+    push(s, 0)
+    push(s, "")
+    push(s, 0)
+    push(s, 0)
+    return s
+}
+
+// Did this stream get enabled by env?
+fn stream_stdin_enabled(s) { return s[SS_ENABLED] }
+// Total complete lines ever posted to the event queue.
+fn stream_stdin_lines_total(s) { return s[SS_LINES_TOTAL] }
+fn stream_stdin_residual(s) { return s[SS_RESIDUAL] }
+fn stream_stdin_eof(s) { return s[SS_EOF_SEEN] }
+
+// ---- env gate -------------------------------------------------------------
+// Read CE_STREAM_STDIN. Empty string or unset = disabled. "0" or "false"
+// (case-insensitive) explicitly disable; any other non-empty value enables.
+// We accept the common "1" / "true" / "yes" idioms permissively to keep
+// operator scripts portable.
+fn _stream_stdin_env_says_on() {
+    let env = getenv("CE_STREAM_STDIN")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "0") == 1 { return 0 }
+    if str_eq(env, "false") == 1 { return 0 }
+    if str_eq(env, "no") == 1 { return 0 }
+    return 1
+}
+
+// Decide whether this stream should run, based on the env. Mutates the
+// state's `enabled` slot. Callers ALSO need to call `stream_stdin_init` to
+// actually switch stdin into non-blocking mode.
+fn stream_stdin_init_from_env(s) {
+    if _stream_stdin_env_says_on() == 1 {
+        list_set(s, SS_ENABLED, 1)
+        return 1
+    }
+    list_set(s, SS_ENABLED, 0)
+    return 0
+}
+
+// Switch stdin to O_NONBLOCK and record success. Safe to call multiple
+// times -- the second call is a no-op. Returns 1 on success, 0 if fcntl
+// failed (in which case the stream stays disabled; the daemon falls back
+// to its scripted path).
+fn stream_stdin_init(s) {
+    if s[SS_ENABLED] == 0 { return 0 }
+    if s[SS_INITIALIZED] == 1 { return 1 }
+    let r = _stream_fcntl(STREAM_STDIN_FD, STREAM_FCNTL_F_SETFL,
+                          STREAM_FCNTL_O_NONBLOCK)
+    if r < 0 {
+        list_set(s, SS_ENABLED, 0)
+        return 0
+    }
+    list_set(s, SS_INITIALIZED, 1)
+    return 1
+}
+
+// ---- byte buffer -> string helper -----------------------------------------
+// Convert the raw byte buffer `buf` (n bytes) into a NOVA string by reading
+// each byte and appending. Bounded by n; no NUL trim. This pattern matches
+// _recv_line in kg_sync.nova (byte-at-a-time so we never over-read past a
+// boundary we care about).
+fn _stream_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    // Build a NOVA string by appending each byte's character to an
+    // initially-empty string. This avoids str_new / memcpy_raw entirely
+    // (which seems to interact poorly with the daemon's compilation
+    // unit) at the cost of an O(n) string-concatenation loop. n is
+    // bounded by STREAM_STDIN_READ_CHUNK (4096 bytes) per syscall, so
+    // the overhead is acceptable for the streaming use case.
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- line splitting -------------------------------------------------------
+// Given a string `text`, return [pre, post] split at the first '\n'. If
+// there's no newline, returns [text, 0] -- caller treats post==0 as "no
+// complete line, keep buffering".
+fn _stream_split_first_newline(text) {
+    let i = 0
+    let n = len(text)
+    while i < n {
+        if char_at(text, i) == 10 {
+            let pre = substr(text, 0, i)
+            let post = substr(text, i + 1, n - i - 1)
+            let pair = list_new()
+            push(pair, pre)
+            push(pair, post)
+            return pair
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Post a normalized message onto the scheduler. Returns 1 on success.
+// Trims and re-uses the existing text transducer to keep stdin-driven
+// messages indistinguishable from the script-mode `hs_post_event` calls.
+fn _stream_stdin_post_line(s, hs, line_text) {
+    // Normalize via the canonical input transducer: trim, lowercase,
+    // collapse internal whitespace. Empty lines (blank or whitespace-only)
+    // are silently dropped -- they're a benign convenience for the operator
+    // typing into the daemon.
+    let norm = transduce_text(line_text)
+    if len(norm) == 0 { return 0 }
+    hs_post_event(hs, EV_MESSAGE, norm)
+    list_set(s, SS_LINES_TOTAL, s[SS_LINES_TOTAL] + 1)
+    return 1
+}
+
+// ---- poll -----------------------------------------------------------------
+// One non-blocking drain. Read up to STREAM_STDIN_READ_CHUNK bytes from
+// stdin, append them to the residual buffer, then peel off and post every
+// complete '\n'-terminated line. Returns the number of complete lines
+// posted in THIS poll. Idempotent at EOF (eof_seen short-circuits).
+fn stream_stdin_poll(s, hs) {
+    if s[SS_ENABLED] == 0 { return 0 }
+    if s[SS_INITIALIZED] == 0 { return 0 }
+    if s[SS_EOF_SEEN] == 1 { return 0 }
+    let buf = alloc(STREAM_STDIN_READ_CHUNK)
+    let n = _stream_sys_read(STREAM_STDIN_FD, buf, STREAM_STDIN_READ_CHUNK)
+    if n == 0 {
+        // Clean EOF -- mark and never re-enter the drain loop. Any pending
+        // residual (a line without a trailing LF) is still flushed as a
+        // best-effort final message so the operator's last unfinished
+        // keystrokes are not silently lost.
+        list_set(s, SS_EOF_SEEN, 1)
+        let tail = s[SS_RESIDUAL]
+        list_set(s, SS_RESIDUAL, "")
+        if len(tail) > 0 {
+            if _stream_stdin_post_line(s, hs, tail) == 1 { return 1 }
+        }
+        return 0
+    }
+    if n < 0 {
+        // EAGAIN or other transient error: no bytes available right now.
+        // This is the expected hot path when stdin is quiet.
+        return 0
+    }
+    // Append the freshly-read bytes to the residual.
+    let chunk = _stream_bytes_to_str(buf, n)
+    let combined = s[SS_RESIDUAL] + chunk
+    list_set(s, SS_RESIDUAL, combined)
+
+    // Drain every complete line. If the combined buffer has grown past the
+    // soft cap WITHOUT a newline, flush the prefix as a synthetic line so
+    // the daemon never sits on an unbounded buffer.
+    let posted = 0
+    let keep_going = 1
+    while keep_going == 1 {
+        let current = s[SS_RESIDUAL]
+        let split = _stream_split_first_newline(current)
+        if split == 0 {
+            if len(current) >= STREAM_STDIN_BUF_MAX {
+                list_set(s, SS_RESIDUAL, "")
+                if _stream_stdin_post_line(s, hs, current) == 1 {
+                    posted = posted + 1
+                }
+            }
+            keep_going = 0
+        } else {
+            list_set(s, SS_RESIDUAL, split[1])
+            if _stream_stdin_post_line(s, hs, split[0]) == 1 {
+                posted = posted + 1
+            }
+        }
+    }
+    return posted
+}
+
+// ---- helpers for unit tests -----------------------------------------------
+// Append synthetic bytes to the residual (as if just read from stdin) and
+// drain into complete lines. The test uses this to exercise the splitting
+// logic WITHOUT touching real stdin -- a hermetic test path. Returns the
+// number of complete lines posted to `hs`.
+fn stream_stdin_test_feed(s, hs, bytes_str) {
+    list_set(s, SS_ENABLED, 1)
+    list_set(s, SS_INITIALIZED, 1)
+    let combined = s[SS_RESIDUAL] + bytes_str
+    list_set(s, SS_RESIDUAL, combined)
+    let posted = 0
+    let keep_going = 1
+    while keep_going == 1 {
+        let current = s[SS_RESIDUAL]
+        let split = _stream_split_first_newline(current)
+        if split == 0 {
+            if len(current) >= STREAM_STDIN_BUF_MAX {
+                list_set(s, SS_RESIDUAL, "")
+                if _stream_stdin_post_line(s, hs, current) == 1 {
+                    posted = posted + 1
+                }
+            }
+            keep_going = 0
+        } else {
+            list_set(s, SS_RESIDUAL, split[1])
+            if _stream_stdin_post_line(s, hs, split[0]) == 1 {
+                posted = posted + 1
+            }
+        }
+    }
+    return posted
+}
+
+// Test-mode reset: zero counters + clear the residual without touching real
+// stdin or fcntl. Used between unit-test cases.
+fn stream_stdin_test_reset(s) {
+    list_set(s, SS_ENABLED, 0)
+    list_set(s, SS_INITIALIZED, 0)
+    list_set(s, SS_RESIDUAL, "")
+    list_set(s, SS_LINES_TOTAL, 0)
+    list_set(s, SS_EOF_SEEN, 0)
+    return 1
+}

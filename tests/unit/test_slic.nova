@@ -1,0 +1,364 @@
+// Unit tests for src/io/transducers/image_superpixels.nova (R12B).
+//
+// Hermetic coverage of the SLIC superpixel segmenter. Every fixture is
+// built in-memory via alloc + store8 so the suite never touches the
+// filesystem. The integration scenario (scenario_yy_slic.sh) exercises
+// chat dispatch + PGM round-trip; this suite focuses on the algorithm
+// itself.
+//
+// Assertion targets (~30-35):
+//   * K=16 on a 64x64 image: 16 cluster centers initialized, all on
+//     grid (step S=16). Centers form a 4x4 grid.
+//   * K=256 on a 256x256 image: 256 cluster centers placed, step S=16.
+//   * Half-black/half-white fixture: boundary follows the intensity
+//     edge; clusters mostly stay within their respective halves.
+//   * 4-quadrant fixture: superpixels respect quadrant boundaries
+//     (no cluster spans multiple quadrants for the corner cells).
+//   * Simple fixture converges in <= 5 iterations.
+//   * slic_boundaries returns >= 1 boundary pixel on multi-cluster
+//     output.
+//   * slic_label_at(-1, 0) returns SLIC_LABEL_OOB.
+//   * Dimension cap rejects > 256.
+//   * K cap rejects < 16 and > 1024.
+//   * Render PGM has correct header and length.
+//   * slic_boundary_count_label bucket boundaries by image area.
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_superpixels.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+fn _flat_fixture(width, height, value) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Left half value `low`, right half value `high`.
+fn _left_right_fixture(width, height, low, high) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let half = width / 2
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = low
+            if x >= half { v = high }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// 4-quadrant fixture: TL = `a`, TR = `b`, BL = `c`, BR = `d`.
+fn _quadrant_fixture(width, height, a, b, c, d) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let half_x = width / 2
+    let half_y = height / 2
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = a
+            if x >= half_x {
+                if y < half_y { v = b } else { v = d }
+            } else {
+                if y >= half_y { v = c }
+            }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Ramp fixture: intensity varies linearly with x (0..255 across width).
+// Useful for testing that SLIC tracks a smooth gradient.
+fn _ramp_fixture(width, height) {
+    let area = width * height
+    let buf = alloc(area + 1)
+    let y = 0
+    while y < height {
+        let row_off = y * width
+        let x = 0
+        while x < width {
+            let v = (x * 255) / width
+            if v < 0 { v = 0 }
+            if v > 255 { v = 255 }
+            store8(buf + row_off + x, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// ---- core sizing tests ---------------------------------------------------
+
+fn test_k16_64x64_initializes_16_centers() {
+    let buf = _flat_fixture(64, 64, 128)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    ce_eq("K=16 64x64 center_count == 16", slic_center_count(r), 16)
+    ce_eq("K=16 64x64 width == 64",         slic_width(r), 64)
+    ce_eq("K=16 64x64 height == 64",        slic_height(r), 64)
+    // sqrt(4096/16) = sqrt(256) = 16.
+    ce_eq("K=16 64x64 step == 16",          slic_step(r), 16)
+    ce_eq("K=16 64x64 compactness == 10",   slic_compactness(r), 10)
+    // Iteration count > 0.
+    ce_check("K=16 64x64 iters > 0", slic_iterations(r) > 0)
+    // Convergence in <= 5 iters on a flat image (single update).
+    ce_check("K=16 64x64 iters <= 5", slic_iterations(r) <= 5)
+}
+
+fn test_k256_256x256_step_16() {
+    let buf = _flat_fixture(256, 256, 128)
+    let r = slic_segment_default(buf, 256, 256, 256)
+    ce_eq("K=256 256x256 center_count == 256", slic_center_count(r), 256)
+    // sqrt(65536/256) = sqrt(256) = 16.
+    ce_eq("K=256 256x256 step == 16",           slic_step(r), 16)
+}
+
+// ---- boundary adherence on intensity edges -------------------------------
+
+fn test_lr_split_clusters_respect_edge() {
+    // 64x64 image, left half black, right half white. K=16 -> 4x4
+    // grid of superpixels. Clusters near the centerline may have
+    // some boundary pixels at column 32, but the centers themselves
+    // should remain on the correct side of the divide.
+    let buf = _left_right_fixture(64, 64, 0, 255)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    ce_eq("LR center_count == 16", slic_center_count(r), 16)
+    // Top-left corner pixel should be on a cluster whose center is
+    // on the LEFT half (cx < 32).
+    let tl_label = slic_label_at(r, 0, 0)
+    ce_check("LR tl_label in [0..15]", tl_label >= 0)
+    ce_check("LR tl_label < 16",       tl_label < 16)
+    let tl_center = slic_center_at(r, tl_label)
+    ce_check("LR tl center on left half (cx < 32)", tl_center[1] < 32)
+    // Top-right corner pixel should be on a cluster on the RIGHT half.
+    let tr_label = slic_label_at(r, 63, 0)
+    let tr_center = slic_center_at(r, tr_label)
+    ce_check("LR tr center on right half (cx >= 32)", tr_center[1] >= 32)
+    // Centroid intensities split cleanly: the leftmost cluster's I is
+    // close to 0; the rightmost is close to 255.
+    ce_check("LR tl center I in dark band", tl_center[0] < 50)
+    ce_check("LR tr center I in bright band", tr_center[0] > 200)
+}
+
+fn test_lr_boundary_pixels_at_edge() {
+    // The intensity edge runs at column 32. Boundary pixels (between
+    // adjacent clusters) should include at least one pixel near the
+    // edge -- the proof that SLIC adheres to the visible boundary.
+    let buf = _left_right_fixture(64, 64, 0, 255)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    let bcount = slic_boundary_count(r)
+    ce_check("LR boundary count > 0", bcount > 0)
+    // For a 4x4 grid of superpixels on a 64x64 image, the boundary
+    // mesh totals roughly 4 horizontal + 4 vertical seams. Each seam
+    // is ~16 pixels long -> ~128 boundary pixels minimum.
+    ce_check("LR boundary count > 50", bcount > 50)
+}
+
+// ---- 4-quadrant boundary adherence ---------------------------------------
+
+fn test_quadrant_clusters_respect_quadrant_lines() {
+    // 64x64 image with 4 distinct quadrant intensities. K=16 -> 4x4
+    // grid; each quadrant gets 4 clusters. The corner pixel of each
+    // quadrant must end up in a cluster whose center is in the
+    // matching quadrant.
+    let buf = _quadrant_fixture(64, 64, 0, 80, 160, 240)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    ce_eq("QUAD center_count == 16", slic_center_count(r), 16)
+    ce_check("QUAD iters <= 10", slic_iterations(r) <= 10)
+    // TL = (0, 0): center.x < 32 AND center.y < 32.
+    let tl_lab = slic_label_at(r, 0, 0)
+    let tl_c   = slic_center_at(r, tl_lab)
+    ce_check("QUAD TL center x < 32", tl_c[1] < 32)
+    ce_check("QUAD TL center y < 32", tl_c[2] < 32)
+    // TR = (63, 0): center.x >= 32 AND center.y < 32.
+    let tr_lab = slic_label_at(r, 63, 0)
+    let tr_c   = slic_center_at(r, tr_lab)
+    ce_check("QUAD TR center x >= 32", tr_c[1] >= 32)
+    ce_check("QUAD TR center y < 32",  tr_c[2] < 32)
+    // BL = (0, 63): center.x < 32 AND center.y >= 32.
+    let bl_lab = slic_label_at(r, 0, 63)
+    let bl_c   = slic_center_at(r, bl_lab)
+    ce_check("QUAD BL center x < 32",  bl_c[1] < 32)
+    ce_check("QUAD BL center y >= 32", bl_c[2] >= 32)
+    // BR = (63, 63): center.x >= 32 AND center.y >= 32.
+    let br_lab = slic_label_at(r, 63, 63)
+    let br_c   = slic_center_at(r, br_lab)
+    ce_check("QUAD BR center x >= 32", br_c[1] >= 32)
+    ce_check("QUAD BR center y >= 32", br_c[2] >= 32)
+    // Boundary count is positive (clusters DO have edges in there).
+    let bcount = slic_boundary_count(r)
+    ce_check("QUAD boundary count > 0", bcount > 0)
+    // Intensity adherence: each quadrant corner's cluster center
+    // intensity matches its quadrant intensity (or near it).
+    ce_near("QUAD TL center.I near 0",   tl_c[0], 0,   30)
+    ce_near("QUAD TR center.I near 80",  tr_c[0], 80,  30)
+    ce_near("QUAD BL center.I near 160", bl_c[0], 160, 30)
+    ce_near("QUAD BR center.I near 240", br_c[0], 240, 30)
+}
+
+// ---- convergence ---------------------------------------------------------
+
+fn test_flat_converges_quickly() {
+    // A uniform image is the easiest convergence case: every pixel
+    // has the same intensity, so cluster centers can only move by
+    // spatial mean (which is already centered after init).
+    let buf = _flat_fixture(64, 64, 128)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    ce_check("FLAT iters > 0", slic_iterations(r) > 0)
+    ce_check("FLAT iters <= 5", slic_iterations(r) <= 5)
+}
+
+// ---- boundaries API ------------------------------------------------------
+
+fn test_boundaries_returns_pairs() {
+    let buf = _quadrant_fixture(64, 64, 0, 80, 160, 240)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    let pairs = slic_boundaries(r)
+    ce_check("boundaries returns >= 1 pair", len(pairs) >= 1)
+    // Each entry is a [x, y] pair.
+    if len(pairs) > 0 {
+        let p0 = pairs[0]
+        ce_eq("boundary pair has 2 elements", len(p0), 2)
+        ce_check("boundary pair x in [0..63]",
+                 p0[0] >= 0)
+        ce_check("boundary pair x < 64", p0[0] < 64)
+    }
+    // Count helper agrees with the pair-list length.
+    let bcount = slic_boundary_count(r)
+    ce_eq("boundary_count == len(boundaries)", bcount, len(pairs))
+}
+
+// ---- OOB safety ---------------------------------------------------------
+
+fn test_oob_label_safety() {
+    let buf = _flat_fixture(64, 64, 128)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    ce_eq("label(-1, 0) == OOB",  slic_label_at(r, -1, 0),  -1)
+    ce_eq("label(0, -1) == OOB",  slic_label_at(r, 0, -1),  -1)
+    ce_eq("label(64, 0) == OOB",  slic_label_at(r, 64, 0),  -1)
+    ce_eq("label(0, 64) == OOB",  slic_label_at(r, 0, 64),  -1)
+    ce_eq("label(99,99) == OOB",  slic_label_at(r, 99, 99), -1)
+}
+
+// ---- caps + rejection paths ---------------------------------------------
+
+fn test_dimension_cap_rejects_huge() {
+    let dummy = alloc(8)
+    let r = slic_segment_default(dummy, 300, 300, 16)
+    ce_eq("300x300 -> center_count == 0", slic_center_count(r), 0)
+    ce_eq("300x300 -> width == 0",         slic_width(r), 0)
+}
+
+fn test_k_cap_rejects_small_k() {
+    let buf = _flat_fixture(64, 64, 128)
+    // K=8 (below SLIC_MIN_K=16) -> reject.
+    let r = slic_segment_default(buf, 64, 64, 8)
+    ce_eq("K=8 -> center_count == 0", slic_center_count(r), 0)
+}
+
+fn test_k_cap_rejects_huge_k() {
+    let buf = _flat_fixture(64, 64, 128)
+    // K=2000 (above SLIC_MAX_K=1024) -> reject.
+    let r = slic_segment_default(buf, 64, 64, 2000)
+    ce_eq("K=2000 -> center_count == 0", slic_center_count(r), 0)
+}
+
+// ---- render PGM ----------------------------------------------------------
+
+fn test_render_pgm_header_and_size() {
+    let buf = _quadrant_fixture(64, 64, 0, 80, 160, 240)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    let total = slic_render_pgm_size(r)
+    // "P5\n64 64\n255\n" = 13 bytes header + 4096 pixels = 4109.
+    ce_eq("render_pgm_size for 64x64 == 4109", total, 4109)
+    let bytes = slic_render_pgm(r, buf)
+    ce_check("render_pgm returns non-zero pointer", bytes != 0)
+    // Header check.
+    ce_eq("render byte 0 == 'P'",  load8(bytes + 0), 80)
+    ce_eq("render byte 1 == '5'",  load8(bytes + 1), 53)
+    ce_eq("render byte 2 == '\\n'", load8(bytes + 2), 10)
+}
+
+// ---- label helpers -------------------------------------------------------
+
+fn test_boundary_count_label_buckets() {
+    // boundary_count of 1 against area 100000 -> 0 milli -> low.
+    ce_str_eq("low bucket",
+              slic_boundary_count_label(1, 100000),
+              "image_slic_boundary_count_low")
+    // 50 boundary pixels in area 1000 -> 50 milli -> mid.
+    ce_str_eq("mid bucket",
+              slic_boundary_count_label(50, 1000),
+              "image_slic_boundary_count_mid")
+    // 200 boundary pixels in area 1000 -> 200 milli -> high.
+    ce_str_eq("high bucket",
+              slic_boundary_count_label(200, 1000),
+              "image_slic_boundary_count_high")
+    // Defensive: area 0 -> low (no crash).
+    ce_str_eq("area=0 -> low",
+              slic_boundary_count_label(10, 0),
+              "image_slic_boundary_count_low")
+}
+
+// ---- ramp fixture: smooth gradient ---------------------------------------
+
+fn test_ramp_smooth_gradient() {
+    // A horizontal intensity ramp produces superpixels whose centers
+    // step in x. K=16 (4x4 grid) on 64x64.
+    let buf = _ramp_fixture(64, 64)
+    let r = slic_segment_default(buf, 64, 64, 16)
+    ce_eq("RAMP center_count == 16", slic_center_count(r), 16)
+    // Leftmost-column pixels should have a cluster center whose
+    // intensity is small (< 100).
+    let left_lab = slic_label_at(r, 0, 32)
+    let left_c   = slic_center_at(r, left_lab)
+    ce_check("RAMP left center.I < 100", left_c[0] < 100)
+    // Rightmost-column pixels should have a center whose intensity
+    // is large (> 150).
+    let right_lab = slic_label_at(r, 63, 32)
+    let right_c   = slic_center_at(r, right_lab)
+    ce_check("RAMP right center.I > 150", right_c[0] > 150)
+}
+
+// ---- main -------------------------------------------------------------
+
+fn main() {
+    test_k16_64x64_initializes_16_centers()
+    test_k256_256x256_step_16()
+    test_lr_split_clusters_respect_edge()
+    test_lr_boundary_pixels_at_edge()
+    test_quadrant_clusters_respect_quadrant_lines()
+    test_flat_converges_quickly()
+    test_boundaries_returns_pairs()
+    test_oob_label_safety()
+    test_dimension_cap_rejects_huge()
+    test_k_cap_rejects_small_k()
+    test_k_cap_rejects_huge_k()
+    test_render_pgm_header_and_size()
+    test_boundary_count_label_buckets()
+    test_ramp_smooth_gradient()
+    ce_summary("image_superpixels")
+}
+
+main()

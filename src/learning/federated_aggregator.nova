@@ -1,0 +1,1391 @@
+// CrossEngin learning: federated aggregator (P3.7 / ADR-0054).
+//
+// Purpose
+//   Phase 20 + P3.6 union: multiple CrossEngin souls share what *works*
+//   (which sources are productive) without sharing what they *learned*
+//   (which is private). Each soul keeps its raw atoms local; on a
+//   periodic federated round, each soul computes its per-source
+//   promotion + atrophy rates (from the meta_observer's lifetime
+//   counters) AND adds calibrated Laplace noise (via the local
+//   dp module) BEFORE sending the rate over the wire. The
+//   coordinator averages the noised rates across N souls and
+//   broadcasts the federation-wide mean back. Each soul then pulls
+//   its local source_authority signal toward the global mean via a
+//   slow EMA (90% local, 10% global) -- the federation influences,
+//   but does not overwrite, the local belief.
+//
+//   This is a FRAMEWORK + AUDIT, not a production federated-learning
+//   stack. Specifically:
+//     * The coordinator sees per-soul noised values (NOT raw values,
+//       but also not encrypted). True secure aggregation requires
+//       multi-party computation or homomorphic addition -- months of
+//       work. See FEDERATED_AUDIT.md for the threat model.
+//     * Auth is a shared token (mirrors P20's CE_KGSYNC_TOKEN).
+//       Production federation needs membership keys + attestation.
+//     * The privacy budget composes across rounds: spending epsilon
+//       per round * N rounds = total epsilon. A 10-epsilon session
+//       budget supports ~10 rounds at 1.0 epsilon each, or ~100
+//       rounds at 0.1 epsilon. The audit walks the trade-off.
+//
+//   This module owns the SOUL-SIDE state. The coordinator daemon
+//   lives in examples/crossengin_fed_coordinator.nova; the wire
+//   protocol parser lives next door in src/io/transducers/kg_sync.nova
+//   as a small additive case alongside the P20 kg-sync v2 events.
+//
+// Wire protocol (text, one op per line, '\n' terminated)
+//
+//   Handshake
+//     C->S : HELLO ce-fed v1                                    handshake
+//     S->C : OK v1 protocol accepted   (mirror v1)
+//     S->C : ERR auth                                           (token mismatch)
+//
+//   Federation
+//     C->S : FED_JOIN <soul_id> <epsilon_milli>                 soul joins
+//     S->C : FED_ROUND <round_id> <deadline_ns>                 coord opens
+//     C->S : FED_STAT <round_id> <source_tag> <noised_promo>
+//                <noised_atrophy>                               soul reports
+//     S->C : FED_AGGREGATE <round_id> <source_tag>
+//                <avg_promo_milli> <avg_atrophy_milli>
+//                <n_participants>                               coord broadcasts
+//     C->S : FED_LEAVE <soul_id>                                soul drops
+//
+//   All numeric fields are integer milli-fixed-point: a "promotion rate
+//   of 70%" travels as "700"; a deadline_ns is the deadline as a
+//   nanotime() integer. Token validation, line buffering, and the SUB-style
+//   handshake reuse the existing helpers in kg_sync.nova; the FED_*
+//   parser sits inside that module as an additive case so the v2 KG
+//   sync protocol stays unchanged.
+//
+// API summary
+//   fed_agg_new(soul_id, dp, mo) -> fed_state    -- aggregator object
+//   fed_agg_round_start(fed, round_id, deadline_ns)
+//   fed_agg_emit_noised_stats(fed) -> list of FED_STAT records
+//   fed_agg_receive_aggregate(fed, source_tag, avg_promo, avg_atrophy, n)
+//   fed_agg_round_end(fed, round_id)             -- clean per-round slate
+//   fed_agg_join(fed)                            -- mark active
+//   fed_agg_leave(fed)                           -- mark inactive
+//   fed_agg_format_join_line(fed) / _stat_line(...) / _leave_line(fed)
+//                                                -- wire formatters
+//   fed_agg_round_id(fed) / _deadline(fed) / _emit_count(fed) / _agg_count(fed)
+//                                                -- inspection
+//   fed_agg_global_seen(fed, source_tag) -> [avg_promo, avg_atrophy, n_participants]
+//                                                -- last-seen federation mean
+//                                                  per source (0 if never seen)
+//
+// ADRs implemented: ADR-0054 (federated multi-soul framework). NOVA
+//   dependencies: builtins (lists, strings, int math).
+// CrossEngin dependencies: src/safety/differential_privacy.nova (consume only;
+//   no API changes), src/parts/meta/meta_observer.nova (consume only;
+//   reads observer state via the public `mo_*` accessors),
+//   src/learning/source_authority.nova (consume only;
+//   `sa_tier_for_host` / `sa_host_set_tier`).
+
+import "std/io"
+import "../safety/differential_privacy.nova"
+import "../parts/meta/meta_observer.nova"
+import "source_authority.nova"
+import "secure_aggregation.nova"
+import "byzantine_aggregation.nova"
+
+// ---- protocol constants --------------------------------------------------
+// These mirror kg_sync's FED_* constants (kept in sync intentionally; the
+// brief lets us add the FED_* parser branch to kg_sync as an additive case,
+// but the chat imports `federated_aggregator` ONLY -- it does NOT import
+// kg_sync -- because kg_sync and snapshot_disk both define `_starts_with`
+// at TU-global scope, and snapshot_disk is in the do-not-touch list. The
+// duplicate-constant copies here keep federated_aggregator self-contained.
+let FED_HELLO_V1_LINE   = "HELLO ce-fed v1"
+let FED_OK_V1_LINE      = "OK ce-fed v1 protocol accepted"
+let FED_BYE_LINE        = "BYE"
+let FED_JOIN_PREFIX     = "FED_JOIN "
+let FED_ROUND_PREFIX    = "FED_ROUND "
+let FED_STAT_PREFIX     = "FED_STAT "
+let FED_AGG_PREFIX      = "FED_AGGREGATE "
+let FED_LEAVE_PREFIX    = "FED_LEAVE "
+let FED_ACK_PREFIX      = "ACK "
+let FED_ERR_PREFIX      = "ERR "
+let FED_OK_PREFIX       = "OK "
+let FED_TOKEN_TAG       = "token="
+let FED_ERR_AUTH        = "ERR auth"
+let FED_LINE_MAX        = 1024
+
+// Event tag values returned by the local parser (renamed copies of
+// KGSYNC_EV_FED_* with FED_EV_* names to avoid colliding when both
+// modules are present in the same compilation unit).
+let FED_EV_NONE  = 0
+let FED_EV_JOIN  = 1
+let FED_EV_ROUND = 2
+let FED_EV_STAT  = 3
+let FED_EV_AGG   = 4
+let FED_EV_LEAVE = 5
+let FED_EV_BYE   = 6
+let FED_EV_ACK   = 7
+
+// Record slot conventions:
+//   FED_JOIN  : [type, soul_id, epsilon_milli]
+//   FED_ROUND : [type, round_id, deadline_ns]
+//   FED_STAT  : [type, round_id, source_tag, noised_promo, noised_atr]
+//   FED_AGG   : [type, round_id, source_tag, avg_promo, avg_atr, n_part]
+//   FED_LEAVE : [type, soul_id]
+//   FED_BYE   : [type]
+//   FED_ACK   : [type, ack_id]
+let FEDR_TYPE     = 0
+let FEDR_SOUL_ID  = 1   // FED_JOIN, FED_LEAVE
+let FEDR_ROUND_ID = 1   // FED_ROUND, FED_STAT, FED_AGG
+let FEDR_EPSILON  = 2   // FED_JOIN
+let FEDR_DEADLINE = 2   // FED_ROUND
+let FEDR_TAG_SLOT = 2   // FED_STAT, FED_AGG
+let FEDR_PROMO    = 3   // FED_STAT, FED_AGG
+let FEDR_ATR      = 4   // FED_STAT, FED_AGG
+let FEDR_NPART    = 5   // FED_AGG
+
+// ---- FED_STATE layout ----------------------------------------------------
+let FED_TAG           = 0
+let FED_SOUL_ID       = 1   // string id (e.g. "default" or "alice")
+let FED_DP            = 2   // opaque dp_state handle
+let FED_MO            = 3   // opaque meta_observer handle
+let FED_ROUND_ID      = 4   // current round id (-1 if not in a round)
+let FED_DEADLINE_NS   = 5   // current round deadline (nanotime ref)
+let FED_EPSILON       = 6   // per-round epsilon budget in milli (default 1000 = 1.0)
+let FED_ACTIVE        = 7   // 0 = idle, 1 = JOIN sent / participating
+let FED_EMITS         = 8   // count of FED_STAT records emitted this lifetime
+let FED_AGGS          = 9   // count of FED_AGGREGATE records received this lifetime
+let FED_ROUNDS        = 10  // count of distinct rounds opened
+let FED_LAST_EMIT_LIST = 11 // list of [tag, noised_promo, noised_atr] from
+                            // the most recent emit (for /fed_stats dry-run)
+let FED_GLOBAL_SEEN   = 12  // list of [tag, avg_promo, avg_atr, n_part] --
+                            // the last federation aggregate observed per tag
+let FED_SECAGG_MODE   = 13  // 0 = v1 (DP-only), 1 = v2-sa (SecAgg)
+let FED_SA_STATE      = 14  // SA state handle (0 if not in v2-sa mode)
+let FED_OBJ_TAG = 7401      // disambiguating tag
+
+// Default epsilon spent per source per round, in milli. The audit doc
+// walks the trade-off: at 1000 milli (1.0 eps) per round, a 10000
+// milli session budget covers ~10 rounds; at 100 milli (0.1 eps)
+// it covers ~100 rounds. Caller can override via fed_agg_set_epsilon.
+let FED_DEFAULT_EPSILON_MILLI = 1000
+
+// EMA pull strength (out of 1000). 100 -> 10% pull toward global mean;
+// the local belief converges over ~10 rounds. Documented in the audit.
+let FED_EMA_NUMERATOR = 1
+let FED_EMA_DENOMINATOR = 10
+// Old weight in the EMA: new = (old * 9 + global) / 10
+let FED_EMA_OLD_WEIGHT = 9
+
+// Sensitivity for the noised rate (Delta_f for a rate in milli). Each
+// source's promotion / atrophy rate is in milli (0..1000). One atom flip
+// can move the rate by at most 1000 / sample_size (the worst case for
+// a single-atom flip in the rate denominator). We use a CONSERVATIVE
+// sensitivity of 100 milli -- generous enough that real noise drowns
+// the per-atom contribution at the typical sample sizes (>= 10).
+let FED_DEFAULT_SENSITIVITY_MILLI = 100
+
+// ---- FED_STAT_REC layout (one per source per round) ----------------------
+// The list-of-lists produced by fed_agg_emit_noised_stats. Each row:
+//   [source_tag, noised_promotion_milli, noised_atrophy_milli]
+let FED_STAT_TAG    = 0
+let FED_STAT_PROMO  = 1
+let FED_STAT_ATR    = 2
+
+// ---- FED_GLOBAL_SEEN row layout ------------------------------------------
+//   [source_tag, avg_promo_milli, avg_atrophy_milli, n_participants]
+let FED_GS_TAG    = 0
+let FED_GS_PROMO  = 1
+let FED_GS_ATR    = 2
+let FED_GS_NPART  = 3
+
+// ---- constructors --------------------------------------------------------
+// Build a fresh fed_state for the given soul id. The `dp` argument is the
+// existing per-session dp_state (so the federation rounds compose against
+// the same epsilon budget the chat surfaces via /dp_status). The `mo` arg
+// is the per-session meta_observer; the aggregator reads `mo_report(mo)`
+// to discover which source tags have a per-source rolling rate.
+//
+// Returns the new fed_state. Caller is responsible for storing it
+// somewhere reachable (the chat keeps it per-session, the daemon
+// alongside its other per-session state).
+fn fed_agg_new(soul_id, dp, mo) {
+    let f = list_new()
+    push(f, FED_OBJ_TAG)         // FED_TAG
+    push(f, soul_id)             // FED_SOUL_ID
+    push(f, dp)                  // FED_DP
+    push(f, mo)                  // FED_MO
+    push(f, 0 - 1)               // FED_ROUND_ID (none yet)
+    push(f, 0)                   // FED_DEADLINE_NS
+    push(f, FED_DEFAULT_EPSILON_MILLI)  // FED_EPSILON
+    push(f, 0)                   // FED_ACTIVE
+    push(f, 0)                   // FED_EMITS
+    push(f, 0)                   // FED_AGGS
+    push(f, 0)                   // FED_ROUNDS
+    push(f, list_new())          // FED_LAST_EMIT_LIST
+    push(f, list_new())          // FED_GLOBAL_SEEN
+    push(f, 0)                   // FED_SECAGG_MODE (0 = v1)
+    push(f, 0)                   // FED_SA_STATE (none)
+    return f
+}
+
+// Build a fresh fed_state in v2-sa SecAgg mode. The `sa` argument is
+// an sa_state from secure_aggregation.nova that already has its peers
+// registered (via sa_register_peer or sa_register_peers_from_env).
+// In SecAgg mode the soul does NOT apply DP noise to its stats --
+// the pairwise masks provide information-theoretic privacy for the
+// sum. The dp handle is still accepted (we keep it consistent so
+// callers don't have to special-case the API) but unused for noise.
+fn fed_agg_new_secagg(soul_id, dp, mo, sa) {
+    let f = fed_agg_new(soul_id, dp, mo)
+    list_set(f, FED_SECAGG_MODE, 1)
+    list_set(f, FED_SA_STATE, sa)
+    return f
+}
+
+// ---- accessors -----------------------------------------------------------
+fn fed_agg_soul_id(f)        { return f[FED_SOUL_ID] }
+fn fed_agg_dp(f)             { return f[FED_DP] }
+fn fed_agg_mo(f)             { return f[FED_MO] }
+fn fed_agg_round_id(f)       { return f[FED_ROUND_ID] }
+fn fed_agg_deadline(f)       { return f[FED_DEADLINE_NS] }
+fn fed_agg_epsilon(f)        { return f[FED_EPSILON] }
+fn fed_agg_active(f)         { return f[FED_ACTIVE] }
+fn fed_agg_emit_count(f)     { return f[FED_EMITS] }
+fn fed_agg_agg_count(f)      { return f[FED_AGGS] }
+fn fed_agg_rounds(f)         { return f[FED_ROUNDS] }
+fn fed_agg_last_emit(f)      { return f[FED_LAST_EMIT_LIST] }
+fn fed_agg_global_table(f)   { return f[FED_GLOBAL_SEEN] }
+fn fed_agg_secagg_mode(f)    { return f[FED_SECAGG_MODE] }
+fn fed_agg_sa_state(f)       { return f[FED_SA_STATE] }
+
+// Override the per-round epsilon. Used by tests and by the chat's
+// /fed_join command (which can carry an epsilon as a second token).
+fn fed_agg_set_epsilon(f, epsilon_milli) {
+    if epsilon_milli > 0 { list_set(f, FED_EPSILON, epsilon_milli) }
+    return 1
+}
+
+// Mark this aggregator as JOIN-active (caller is responsible for actually
+// sending the FED_JOIN line; this only updates the in-memory flag).
+fn fed_agg_join(f) {
+    list_set(f, FED_ACTIVE, 1)
+    return 1
+}
+
+// Mark this aggregator as inactive (sent FED_LEAVE).
+fn fed_agg_leave(f) {
+    list_set(f, FED_ACTIVE, 0)
+    list_set(f, FED_ROUND_ID, 0 - 1)
+    list_set(f, FED_DEADLINE_NS, 0)
+    return 1
+}
+
+// ---- round lifecycle -----------------------------------------------------
+// Open a round on the soul side. Records the round id + deadline_ns so the
+// soul can refuse stale FED_STAT / FED_AGGREGATE replies that drift past
+// the deadline. Does NOT consume any budget yet -- that happens when
+// `fed_agg_emit_noised_stats` is actually called.
+//
+// Returns 1 on success, 0 if the soul is not currently JOINed (round
+// open on an idle soul is a coordinator-side mistake; the soul refuses
+// quietly so the coordinator can't drag a non-participant into the round).
+fn fed_agg_round_start(f, round_id, deadline_ns) {
+    if f[FED_ACTIVE] == 0 { return 0 }
+    list_set(f, FED_ROUND_ID, round_id)
+    list_set(f, FED_DEADLINE_NS, deadline_ns)
+    list_set(f, FED_ROUNDS, f[FED_ROUNDS] + 1)
+    // Reset the last-emit cache so /fed_stats dry-run reflects the new round.
+    list_set(f, FED_LAST_EMIT_LIST, list_new())
+    return 1
+}
+
+// Close out the round. Clears the round id + deadline so any out-of-band
+// FED_STAT / FED_AGGREGATE messages tagged with an old round id are
+// silently dropped by the receive paths.
+//
+// Returns 1 if the closure matched the open id, 0 if it didn't (which
+// the caller can log; we still clear the slot for safety).
+fn fed_agg_round_end(f, round_id) {
+    let match_v = 0
+    if f[FED_ROUND_ID] == round_id { match_v = 1 }
+    list_set(f, FED_ROUND_ID, 0 - 1)
+    list_set(f, FED_DEADLINE_NS, 0)
+    return match_v
+}
+
+// ---- private helpers -----------------------------------------------------
+// Apply DP noise to a single milli rate. Sensitivity is bounded; returns
+// the noised rate clamped to [0, 1000] (rate semantics, milli). On budget
+// exhaustion returns -1 (sentinel) so the caller can drop the row from
+// the emit list -- a refused noise is worse than an absent row.
+fn _fed_noise_rate(dp, true_rate_milli, sensitivity_milli, epsilon_milli) {
+    if dp == 0 { return 0 - 1 }
+    let v = dp_noisy_mean(dp, true_rate_milli, sensitivity_milli, epsilon_milli)
+    if dp_is_refused(v) == 1 { return 0 - 1 }
+    return v
+}
+
+// Look up the global-seen row for a tag, or -1 if absent.
+fn _fed_find_global(f, tag) {
+    let tbl = f[FED_GLOBAL_SEEN]
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][FED_GS_TAG], tag) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Insert or update a global-seen row for a tag.
+fn _fed_set_global(f, tag, avg_promo, avg_atr, n_part) {
+    let idx = _fed_find_global(f, tag)
+    if idx >= 0 {
+        let row = f[FED_GLOBAL_SEEN][idx]
+        list_set(row, FED_GS_PROMO, avg_promo)
+        list_set(row, FED_GS_ATR, avg_atr)
+        list_set(row, FED_GS_NPART, n_part)
+        return 1
+    }
+    let row = list_new()
+    push(row, tag)
+    push(row, avg_promo)
+    push(row, avg_atr)
+    push(row, n_part)
+    push(f[FED_GLOBAL_SEEN], row)
+    return 1
+}
+
+// Public lookup: "what was the last federation-wide average we saw for
+// this source tag?". Returns a 4-row [tag, avg_promo, avg_atr, n_part]
+// list, or 0 if the tag has never been broadcast in an aggregate.
+fn fed_agg_global_seen(f, tag) {
+    let idx = _fed_find_global(f, tag)
+    if idx < 0 { return 0 }
+    return f[FED_GLOBAL_SEEN][idx]
+}
+
+// ---- emit + receive ------------------------------------------------------
+// Walk the meta_observer's tracked sources and produce a list of noised
+// FED_STAT records ready to ship to the coordinator. Each record carries
+// the source tag, the noised promotion rate (milli), and the noised
+// atrophy rate (milli). The DP module's budget is debited TWICE per
+// source per round (once per rate) at `f[FED_EPSILON]` milli each.
+//
+// Refused-on-exhaustion rows are dropped from the output -- the
+// coordinator will see fewer rows from this soul in a budget-exhausted
+// round, which is the correct privacy posture (a fresh refusal carries no
+// information about the data).
+//
+// Returns the list of [tag, noised_promo, noised_atr] rows. The list is
+// also cached on `f` so the chat's /fed_stats dry-run can print "what
+// would be sent next".
+fn fed_agg_emit_noised_stats(f) {
+    let out = list_new()
+    let mo = f[FED_MO]
+    if mo == 0 { return out }
+    let report = mo_report(mo)
+    let dp = f[FED_DP]
+    let eps = f[FED_EPSILON]
+    let i = 0
+    while i < len(report) {
+        let row = report[i]
+        let tag = row[0]
+        let promo = row[1]
+        let atr = row[2]
+        // Sample size guard: do not emit a noised stat for a source with
+        // fewer than 1 attributed atom -- the rate is 0/0 == 0 anyway and
+        // the noise dominates. The brief calls this out: tiny samples
+        // give degenerate signals; skip and conserve budget.
+        let sample = row[3]
+        if sample >= 1 {
+            let n_promo = _fed_noise_rate(dp, promo, FED_DEFAULT_SENSITIVITY_MILLI, eps)
+            let n_atr = _fed_noise_rate(dp, atr, FED_DEFAULT_SENSITIVITY_MILLI, eps)
+            // Both must succeed -- if either was refused, skip the row.
+            if n_promo >= 0 {
+                if n_atr >= 0 {
+                    let rec = list_new()
+                    push(rec, tag)
+                    push(rec, n_promo)
+                    push(rec, n_atr)
+                    push(out, rec)
+                    list_set(f, FED_EMITS, f[FED_EMITS] + 1)
+                }
+            }
+        }
+        i = i + 1
+    }
+    list_set(f, FED_LAST_EMIT_LIST, out)
+    return out
+}
+
+// SecAgg variant: walk the meta_observer's tracked sources and produce
+// a list of MASKED FED_STAT_MASKED records ready to ship. Instead of
+// applying DP noise, the soul applies pairwise additive masks via the
+// sa_state: for each peer registered on the SA state, the soul adds
+// +mask_ij (if its id is smaller) or -mask_ij (if its id is larger).
+// The coordinator's sum cancels the masks pairwise; the coordinator
+// never sees the raw x_i. SecAgg mode does NOT debit the DP budget --
+// the mask provides the privacy.
+//
+// Returns a list of [tag, masked_promo, masked_atr] rows. The list is
+// also cached on `f` so /fed_stats can preview "what would be sent".
+fn fed_agg_emit_masked_stats(f) {
+    let out = list_new()
+    let mo = f[FED_MO]
+    if mo == 0 { return out }
+    if f[FED_SECAGG_MODE] != 1 { return out }
+    let sa = f[FED_SA_STATE]
+    if sa == 0 { return out }
+    // Bind the SA state to the current round id so the mask derivation
+    // uses the same round id we tag the wire records with.
+    sa_round_set(sa, f[FED_ROUND_ID])
+    let report = mo_report(mo)
+    let i = 0
+    while i < len(report) {
+        let row = report[i]
+        let tag = row[0]
+        let promo = row[1]
+        let atr = row[2]
+        let sample = row[3]
+        if sample >= 1 {
+            let masked = sa_apply_masks_pair(sa, promo, atr)
+            let rec = list_new()
+            push(rec, tag)
+            push(rec, masked[0])
+            push(rec, masked[1])
+            push(out, rec)
+            list_set(f, FED_EMITS, f[FED_EMITS] + 1)
+        }
+        i = i + 1
+    }
+    list_set(f, FED_LAST_EMIT_LIST, out)
+    return out
+}
+
+// SecAgg-mode wire formatter for the v2-sa stat line.
+//   FED_STAT_MASKED <round_id> <source_tag> <masked_promo> <masked_atr>
+fn fed_agg_format_stat_masked_line(f, source_tag, masked_promo, masked_atr) {
+    return sa_format_stat_masked_line(f[FED_ROUND_ID], source_tag,
+        masked_promo, masked_atr)
+}
+
+// P3.8r reconciliation emit: given a dropped peer's id, walk the cached
+// last-emitted masked rows and produce a list of FED_RECON_MASKED-ready
+// rows. Each row is [tag, adj_promo, adj_atr] where the dropped peer's
+// mask contribution has been removed via sa_reconcile_for_dropped_pair.
+//
+// IMPORTANT: this REQUIRES that the SA round id is still bound to the
+// same value as when the original masked stats were emitted -- which is
+// the case as long as the chat invokes this BEFORE fed_agg_round_end.
+// (The coord broadcasts FED_DROPOUT between the soul's stat emit and
+// its FED_AGGREGATE_SUM receipt, so the round is still open.)
+//
+// Returns [] if not in SecAgg mode, or if there are no cached emits,
+// or if the dropped id is not a peer (no-op -- nothing to subtract).
+fn fed_agg_emit_recon_masked(f, dropped_soul_id) {
+    let out = list_new()
+    if f[FED_SECAGG_MODE] != 1 { return out }
+    let sa = f[FED_SA_STATE]
+    if sa == 0 { return out }
+    let rows = f[FED_LAST_EMIT_LIST]
+    if len(rows) == 0 { return out }
+    // Make sure SA's round_id matches the round we masked under -- the
+    // existing sa_round_set in fed_agg_emit_masked_stats already binds
+    // this, but a defensive re-bind here keeps the helper standalone.
+    sa_round_set(sa, f[FED_ROUND_ID])
+    let i = 0
+    while i < len(rows) {
+        let row = rows[i]
+        let tag = row[0]
+        let mp = row[1]
+        let ma = row[2]
+        let adj = sa_reconcile_for_dropped_pair(sa, mp, ma, dropped_soul_id)
+        let rec = list_new()
+        push(rec, tag)
+        push(rec, adj[0])
+        push(rec, adj[1])
+        push(out, rec)
+        i = i + 1
+    }
+    // Cache the new adjusted rows so a SECOND dropout in the same round
+    // (rare but possible) reconciles against the LATEST submission, not
+    // the original. This is the "stack" semantics that matches the
+    // surviving-set shrinking with every additional dropout.
+    list_set(f, FED_LAST_EMIT_LIST, out)
+    return out
+}
+
+// SecAgg-mode wire formatter for the v2-sa-r reconciled stat line.
+//   FED_RECON_MASKED <round_id> <soul_id> <source_tag> <adj_promo> <adj_atr>
+fn fed_agg_format_recon_masked_line(f, source_tag, adj_promo, adj_atr) {
+    return sa_format_recon_masked_line(f[FED_ROUND_ID], f[FED_SOUL_ID],
+        source_tag, adj_promo, adj_atr)
+}
+
+// Receive a SUM aggregate from the coordinator and recover the
+// federation-wide average. In v2-sa mode the coordinator broadcasts
+// the SUM (not the average) so the soul has the choice: divide by
+// n_participants to get the average (standard interpretation), or
+// keep the sum for a custom weight scheme.
+//
+// We forward to fed_agg_receive_aggregate after dividing by n_part,
+// so the tier-EMA logic + global-seen table stay identical between
+// v1 and v2-sa. n_part == 0 -> we treat as "no participants, no
+// signal" and skip (defensive).
+fn fed_agg_receive_aggregate_sum(f, source_tag, sum_promo, sum_atr, n_part, source_auth) {
+    if n_part <= 0 { return 0 }
+    let avg_p = sum_promo / n_part
+    let avg_a = sum_atr / n_part
+    return fed_agg_receive_aggregate(f, source_tag, avg_p, avg_a, n_part, source_auth)
+}
+
+// Receive a federation-wide aggregate for one source tag. Stores the
+// global mean on the aggregator + adjusts the local source_authority's
+// tier weighting toward the global by a slow EMA. The EMA formula:
+//   new = (old * 9 + global) / 10
+// (10% pull, 90% local). After ~10 rounds the local belief converges
+// to the global signal if the global stays put. The audit walks the
+// trade-off (convergence vs noise-resistance).
+//
+// `source_auth` is the process-shared source_authority registry the
+// caller passes in (e.g. the chat's `sauth`). The aggregator does NOT
+// own that registry -- it only reads + writes through the existing
+// `sa_tier_for_host` / `sa_host_set_tier` API.
+//
+// Returns 1 on success.
+//
+// IMPORTANT: this is where the federation actually influences local
+// belief. The signal we pull toward the global is the per-source
+// PROMOTION rate -- higher promotion across the federation means the
+// source is broadly productive, so we promote the tier (1 = A, 3 = C,
+// SMALLER is better). The mapping is:
+//   global_promo_milli >= 700  -> nudge toward tier A (smaller)
+//   global_promo_milli <= 300  -> nudge toward tier C (larger)
+//   in between                 -> no tier change, but the global is recorded
+// The "nudge" is one tier step every ~5 rounds at the 10% EMA pull, which
+// matches the meta_observer's own one-step-per-cycle conservatism (P1.1).
+fn fed_agg_receive_aggregate(f, source_tag, avg_promo_milli, avg_atr_milli, n_part, source_auth) {
+    _fed_set_global(f, source_tag, avg_promo_milli, avg_atr_milli, n_part)
+    list_set(f, FED_AGGS, f[FED_AGGS] + 1)
+    // Translate source tag -> host (mirrors the meta-observer's mapping).
+    let host = mo_tag_to_host(source_tag)
+    let cur_tier = sa_tier_for_host(source_auth, host)
+    // Read out the EMA-pulled milli rate. We keep an internal milli
+    // promotion belief per source -- but since we don't have a stored
+    // milli "current source rate" on the source_authority module, we
+    // approximate by reading the meta_observer's per-source rate and
+    // EMA-mixing with the global. The result is a milli value we then
+    // threshold to a tier nudge.
+    let mo = f[FED_MO]
+    let local_promo = 0
+    if mo != 0 {
+        let report = mo_report(mo)
+        let i = 0
+        while i < len(report) {
+            if str_eq(report[i][0], source_tag) == 1 {
+                local_promo = report[i][1]
+                i = len(report)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    // EMA: new = (old * 9 + global) / 10. Both operands fit well under
+    // 2^20 (each is <= 1000 milli * 9 = 9000), so no codegen workaround
+    // needed. Keep the old*9 expression literal so the codegen sees
+    // the small-immediate shape.
+    let blended = (local_promo * FED_EMA_OLD_WEIGHT + avg_promo_milli) / FED_EMA_DENOMINATOR
+    // Threshold the BLENDED rate (not the global alone) into a tier
+    // nudge. This is the "slow pull" -- a sustained global signal moves
+    // local belief, but a single noisy round cannot.
+    let new_tier = cur_tier
+    if blended >= 700 {
+        if cur_tier > SA_TIER_A { new_tier = cur_tier - 1 }
+    } else {
+        if blended <= 300 {
+            if cur_tier < SA_TIER_C { new_tier = cur_tier + 1 }
+        }
+    }
+    if new_tier != cur_tier {
+        sa_host_set_tier(source_auth, host, new_tier)
+    }
+    return 1
+}
+
+// ---- wire formatters -----------------------------------------------------
+// Encode FED_JOIN as a wire line. Caller appends the line terminator.
+//   "FED_JOIN <soul_id> <epsilon_milli>"
+fn fed_agg_format_join_line(f) {
+    return "FED_JOIN " + f[FED_SOUL_ID] + " "
+        + int_to_str(f[FED_EPSILON]) + "\n"
+}
+
+// Encode FED_STAT as a wire line.
+//   "FED_STAT <round_id> <source_tag> <noised_promo> <noised_atr>"
+fn fed_agg_format_stat_line(f, source_tag, noised_promo, noised_atr) {
+    return "FED_STAT " + int_to_str(f[FED_ROUND_ID]) + " "
+        + source_tag + " "
+        + int_to_str(noised_promo) + " "
+        + int_to_str(noised_atr) + "\n"
+}
+
+// Encode FED_LEAVE as a wire line.
+//   "FED_LEAVE <soul_id>"
+fn fed_agg_format_leave_line(f) {
+    return "FED_LEAVE " + f[FED_SOUL_ID] + "\n"
+}
+
+// Encode FED_ROUND as a wire line (coordinator-side helper).
+//   "FED_ROUND <round_id> <deadline_ns>"
+fn fed_format_round_line(round_id, deadline_ns) {
+    return "FED_ROUND " + int_to_str(round_id) + " "
+        + int_to_str(deadline_ns) + "\n"
+}
+
+// Encode FED_AGGREGATE as a wire line (coordinator-side helper).
+//   "FED_AGGREGATE <round_id> <source_tag> <avg_promo> <avg_atr> <n_part>"
+fn fed_format_aggregate_line(round_id, source_tag, avg_promo, avg_atr, n_part) {
+    return "FED_AGGREGATE " + int_to_str(round_id) + " "
+        + source_tag + " "
+        + int_to_str(avg_promo) + " "
+        + int_to_str(avg_atr) + " "
+        + int_to_str(n_part) + "\n"
+}
+
+// ---- coordinator-side helpers --------------------------------------------
+// The coordinator keeps an accumulator: per round, per source_tag, the
+// running sum of noised rates from each participating soul + the count
+// of contributors. fed_acc_new / _add_stat / _averages walk this state
+// without depending on any soul-side module.
+//
+// Coordinator-side accumulator layout:
+//   [ACC_TAG, round_id, list of [source_tag, sum_promo, sum_atr, n_part]]
+let FED_ACC_TAG      = 0
+let FED_ACC_ROUND    = 1
+let FED_ACC_ROWS     = 2
+let FED_ACC_OBJ_TAG  = 7402
+
+// Per-row layout under FED_ACC_ROWS:
+//   [source_tag, sum_promo, sum_atr, n_part]
+let FED_ACR_TAG    = 0
+let FED_ACR_PROMO  = 1
+let FED_ACR_ATR    = 2
+let FED_ACR_NPART  = 3
+
+fn fed_acc_new(round_id) {
+    let a = list_new()
+    push(a, FED_ACC_OBJ_TAG)
+    push(a, round_id)
+    push(a, list_new())
+    return a
+}
+
+fn fed_acc_round_id(a) { return a[FED_ACC_ROUND] }
+fn fed_acc_rows(a)     { return a[FED_ACC_ROWS] }
+
+// Add one FED_STAT record to the accumulator. The same source tag from
+// the same round just sums; participant count bumps once per contribution.
+//
+// Returns 1 on success.
+fn fed_acc_add_stat(a, source_tag, noised_promo, noised_atr) {
+    let rows = a[FED_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        if str_eq(rows[i][FED_ACR_TAG], source_tag) == 1 {
+            let row = rows[i]
+            list_set(row, FED_ACR_PROMO, row[FED_ACR_PROMO] + noised_promo)
+            list_set(row, FED_ACR_ATR, row[FED_ACR_ATR] + noised_atr)
+            list_set(row, FED_ACR_NPART, row[FED_ACR_NPART] + 1)
+            return 1
+        }
+        i = i + 1
+    }
+    let row = list_new()
+    push(row, source_tag)
+    push(row, noised_promo)
+    push(row, noised_atr)
+    push(row, 1)
+    push(rows, row)
+    return 1
+}
+
+// Compute the per-source averages. Returns a list of
+// [source_tag, avg_promo, avg_atr, n_part] rows.
+fn fed_acc_averages(a) {
+    let out = list_new()
+    let rows = a[FED_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        let row = rows[i]
+        let n = row[FED_ACR_NPART]
+        let ap = 0
+        let aa = 0
+        if n > 0 {
+            ap = row[FED_ACR_PROMO] / n
+            aa = row[FED_ACR_ATR] / n
+        }
+        let avg = list_new()
+        push(avg, row[FED_ACR_TAG])
+        push(avg, ap)
+        push(avg, aa)
+        push(avg, n)
+        push(out, avg)
+        i = i + 1
+    }
+    return out
+}
+
+// Count of distinct source tags accumulated so far.
+fn fed_acc_count(a) { return len(a[FED_ACC_ROWS]) }
+
+// ---- Byzantine-resilient accumulator (P3.10 / ADR-0056) ------------------
+// The standard fed_acc collapses every soul's contribution into a per-source
+// SUM the moment it lands. That is correct for plain averaging and for
+// SecAgg (which needs the sum), but a Byzantine-resilient aggregator MUST
+// see each participant's contribution individually so it can detect and
+// drop outliers. This parallel accumulator keeps per-participant rows
+// stashed in a per-source list-of-lists; the reducer
+// `fed_acc_byz_aggregate` then dispatches to byz_trimmed_mean /
+// byz_coordinate_median per the requested strategy.
+//
+// Trade-off: keeping per-participant updates means the coordinator
+// observes per-soul plaintext values -- this is FUNDAMENTALLY in tension
+// with SecAgg's privacy property. Operators pick ONE per round:
+// SecAgg (use fed_acc_*) or Byzantine (use fed_acc_byz_*). See
+// SECAGG_AUDIT.md for the full discussion.
+//
+// Layout:
+//   [BYZ_ACC_TAG, round_id,
+//    list of [source_tag, list of [promo, atr]]]  (per-soul rows under tag)
+let FED_BYZ_ACC_TAG     = 0
+let FED_BYZ_ACC_ROUND   = 1
+let FED_BYZ_ACC_ROWS    = 2
+let FED_BYZ_ACC_OBJ_TAG = 7403
+
+// Per-row layout under FED_BYZ_ACC_ROWS:
+//   [source_tag, list of [promo, atr] per-soul updates]
+let FED_BYZ_R_TAG     = 0
+let FED_BYZ_R_UPDATES = 1
+
+fn fed_acc_byz_new(round_id) {
+    let a = list_new()
+    push(a, FED_BYZ_ACC_OBJ_TAG)
+    push(a, round_id)
+    push(a, list_new())
+    return a
+}
+
+fn fed_acc_byz_round_id(a) { return a[FED_BYZ_ACC_ROUND] }
+fn fed_acc_byz_rows(a)     { return a[FED_BYZ_ACC_ROWS] }
+fn fed_acc_byz_count(a)    { return len(a[FED_BYZ_ACC_ROWS]) }
+
+// Add one per-participant raw stat record to the Byzantine accumulator.
+// Unlike fed_acc_add_stat (which sums into a running aggregate), this
+// stores the (promo, atr) pair so the reducer can inspect it later.
+// Same source tag from multiple souls accumulates rows; one call per
+// (source_tag, soul) per round.
+//
+// Returns 1 on success.
+fn fed_acc_byz_add_stat(a, source_tag, promo, atr) {
+    let rows = a[FED_BYZ_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        if str_eq(rows[i][FED_BYZ_R_TAG], source_tag) == 1 {
+            let pair = list_new()
+            push(pair, promo)
+            push(pair, atr)
+            push(rows[i][FED_BYZ_R_UPDATES], pair)
+            return 1
+        }
+        i = i + 1
+    }
+    let updates = list_new()
+    let pair = list_new()
+    push(pair, promo)
+    push(pair, atr)
+    push(updates, pair)
+    let row = list_new()
+    push(row, source_tag)
+    push(row, updates)
+    push(rows, row)
+    return 1
+}
+
+// Return how many per-participant rows the accumulator has stashed for a
+// given source tag. Returns 0 if the tag has never been observed. Used
+// by the chat / coordinator to know whether the trimmed-mean trim_k is
+// achievable for this round (need n_part > 2 * trim_k).
+fn fed_acc_byz_part_count(a, source_tag) {
+    let rows = a[FED_BYZ_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        if str_eq(rows[i][FED_BYZ_R_TAG], source_tag) == 1 {
+            return len(rows[i][FED_BYZ_R_UPDATES])
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Reduce the Byzantine accumulator using the given strategy + trim_k.
+// Returns a list of [source_tag, agg_promo, agg_atr, n_part] rows in
+// the same shape `fed_acc_averages` produces, so the caller can plug
+// it into the existing fed_agg_receive_aggregate path.
+//
+// Strategy dispatch (defined in byzantine_aggregation.nova):
+//   BYZ_NONE         -> coordinate-wise plain mean (matches fed_acc_averages)
+//   BYZ_TRIMMED_MEAN -> coordinate-wise trimmed mean with `trim_k`
+//   BYZ_MEDIAN       -> coordinate-wise median
+//
+// Each (promo, atr) pair is treated as a 2-dim update vector, so the
+// aggregation is per-coord on (promo, atr).
+fn fed_acc_byz_aggregate(a, strategy, trim_k) {
+    let out = list_new()
+    let rows = a[FED_BYZ_ACC_ROWS]
+    let i = 0
+    while i < len(rows) {
+        let row = rows[i]
+        let updates = row[FED_BYZ_R_UPDATES]
+        let agg = byz_aggregate(updates, strategy, trim_k)
+        let n = len(updates)
+        let p = 0
+        let r = 0
+        if len(agg) >= 2 {
+            p = agg[0]
+            r = agg[1]
+        } else {
+            if len(agg) == 1 {
+                p = agg[0]
+            }
+        }
+        let out_row = list_new()
+        push(out_row, row[FED_BYZ_R_TAG])
+        push(out_row, p)
+        push(out_row, r)
+        push(out_row, n)
+        push(out, out_row)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- env helpers ---------------------------------------------------------
+// Read the federation token from the env. Mirrors kg_sync's auth model:
+// CE_FED_TOKEN is the shared secret both coordinator and souls must
+// present; unset means anonymous mode (backwards-compatible default for
+// local development).
+fn fed_token_from_env() {
+    let env = getenv("CE_FED_TOKEN")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return 0
+}
+
+// Read the coordinator's round interval (ns) from the env. Default 30s.
+// Capped at 2^31 ns (~2.1s) to stay inside NOVA's int range; the
+// coordinator does NOT add this to nanotime() (NOVA bug #5: nanotime is
+// already > 2^40; any add would push us past the int range). The
+// coordinator uses subtraction against nanotime() to test "is now past
+// the deadline?", so the absolute deadline is stored as a literal int.
+fn fed_round_interval_from_env() {
+    let env = getenv("CE_FED_ROUND_INTERVAL_NS")
+    if env != 0 {
+        if len(env) > 0 {
+            let v = _fed_str_to_int(env)
+            if v > 0 { return v }
+        }
+    }
+    return 30000000000
+}
+
+// Read the coordinator listen port. Default 8777 (one above the kgsync
+// default 8766 so a local dev box can run both side-by-side without
+// port-clash juggling).
+fn fed_port_from_env() {
+    let env = getenv("CE_FED_PORT")
+    if env != 0 {
+        if len(env) > 0 {
+            let v = _fed_str_to_int(env)
+            if v > 0 { return v }
+        }
+    }
+    return 8777
+}
+
+fn fed_bind_from_env() {
+    let env = getenv("CE_FED_BIND")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return "127.0.0.1"
+}
+
+fn fed_host_from_env() {
+    let env = getenv("CE_FED_HOST")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return "127.0.0.1"
+}
+
+// Local str-to-int (same shape as the dp module's local copy).
+fn _fed_str_to_int(s) {
+    let n = 0
+    let i = 0
+    let neg = 0
+    if len(s) > 0 {
+        if char_at(s, 0) == 45 { neg = 1 i = 1 }
+    }
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    if neg == 1 { return 0 - n }
+    return n
+}
+
+// Public helper: render an integer milli as "NN.N" (mirrors mo_format_pct
+// in the meta_observer). Used by /fed_stats and the coordinator's stdout
+// logger so milli values format consistently across the system.
+fn fed_format_milli(milli) {
+    let whole = milli / 10
+    let tenth = milli - whole * 10
+    if tenth < 0 { tenth = 0 - tenth }
+    return int_to_str(whole) + "." + int_to_str(tenth)
+}
+
+// ---- local helpers (no kg_sync dependency) -------------------------------
+// federated_aggregator.nova is the SOLE federation interface used by
+// crossengin_chat.nova (the chat also imports `snapshot_disk` which
+// defines `_starts_with`, and kg_sync also defines `_starts_with` --
+// so if this module imported kg_sync, the two `_starts_with` symbols
+// would collide at TU level). Instead, this module carries its own
+// renamed copies (`_fed_*`) of the helpers we need. The coordinator
+// example (which does NOT import snapshot_disk) is free to import
+// kg_sync directly and reuse the v2 protocol implementation; this
+// module's copies are deliberately small and FED-specific.
+
+// String prefix check renamed to avoid the snapshot_disk / kg_sync
+// `_starts_with` collision when both are pulled into the same compile
+// unit (the chat does this when it imports both snapshot_disk for
+// /save/load and federated_aggregator for /fed_*).
+fn _fed_starts_with(s, prefix) {
+    let pn = len(prefix)
+    if len(s) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Strip trailing CR/LF (mirrors kg_sync's `_strip_eol`).
+fn _fed_strip_eol(s) {
+    let n = len(s)
+    let done = 0
+    while done == 0 {
+        if n <= 0 { done = 1 }
+        if done == 0 {
+            let c = char_at(s, n - 1)
+            if c == 10 { n = n - 1 }
+            else { if c == 13 { n = n - 1 } else { done = 1 } }
+        }
+    }
+    return substr(s, 0, n)
+}
+
+// Split on space.
+fn _fed_split_spaces(s) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            push(out, substr(s, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, substr(s, start, len(s) - start))
+    return out
+}
+
+// True iff every char is a digit 0..9. Empty string fails.
+fn _fed_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Token chars accept [A-Za-z0-9_-:] for source tags (mirrors kg_sync's
+// token-validation envelope minus '=' which is the token-clause sep).
+fn _fed_is_tag_char(c) {
+    if c >= 48 { if c <= 57  { return 1 } }   // 0..9
+    if c >= 65 { if c <= 90  { return 1 } }   // A..Z
+    if c >= 97 { if c <= 122 { return 1 } }   // a..z
+    if c == 95 { return 1 }                   // '_'
+    if c == 45 { return 1 }                   // '-'
+    if c == 58 { return 1 }                   // ':'
+    return 0
+}
+
+fn _fed_is_tag(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _fed_is_tag_char(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _fed_is_label(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        let ok = 0
+        if c >= 48 { if c <= 57  { ok = 1 } }
+        if ok == 0 { if c >= 65 { if c <= 90 { ok = 1 } } }
+        if ok == 0 { if c >= 97 { if c <= 122 { ok = 1 } } }
+        if ok == 0 { if c == 95 { ok = 1 } }
+        if ok == 0 { if c == 45 { ok = 1 } }
+        if ok == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Write the full string to fd. Loops on partial writes.
+fn _fed_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+// Read one '\n'-terminated line. Returns the bare line (without LF), or
+// 0 on EOF/error before any '\n' was seen.
+fn _fed_recv_line(fd) {
+    let buf = alloc(FED_LINE_MAX)
+    let n = 0
+    while n < FED_LINE_MAX - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return _fed_strip_eol(buf)
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return _fed_strip_eol(buf)
+        }
+    }
+    store8(buf + n, 0)
+    return _fed_strip_eol(buf)
+}
+
+// Encode a dotted-quad as a 32-bit value make_sockaddr_in expects.
+fn _fed_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return 0 - 1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _fed_is_digits(toks[i2]) == 0 { return 0 - 1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return 0 - 1 }
+        if v > 255 { return 0 - 1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    let b_p = b * k256
+    let c_p = c * k256 * k256
+    let d_p = d * k256 * k256 * k256
+    return a + b_p + c_p + d_p
+}
+
+// ---- local FED_* parsers (small, FED-only) -------------------------------
+// These are the soul-side parsers. They mirror the kg_sync FED_* parser
+// branches added under ADR-0054 (the brief asks for that branch as an
+// additive case in kg_sync.nova; this module needs a self-contained copy
+// because the chat cannot import kg_sync directly -- see the helper
+// comment block above for the snapshot_disk / kg_sync `_starts_with`
+// collision rationale).
+
+fn _fed_parse_round(text) {
+    let line = _fed_strip_eol(text)
+    if _fed_starts_with(line, FED_ROUND_PREFIX) == 0 { return 0 }
+    let toks = _fed_split_spaces(line)
+    if len(toks) != 3 { return 0 }
+    if str_eq(toks[0], "FED_ROUND") == 0 { return 0 }
+    if _fed_is_digits(toks[1]) == 0 { return 0 }
+    if _fed_is_digits(toks[2]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, FED_EV_ROUND)
+    push(rec, str_to_int(toks[1]))
+    push(rec, str_to_int(toks[2]))
+    return rec
+}
+
+fn _fed_parse_agg(text) {
+    let line = _fed_strip_eol(text)
+    if _fed_starts_with(line, FED_AGG_PREFIX) == 0 { return 0 }
+    let toks = _fed_split_spaces(line)
+    if len(toks) != 6 { return 0 }
+    if str_eq(toks[0], "FED_AGGREGATE") == 0 { return 0 }
+    if _fed_is_digits(toks[1]) == 0 { return 0 }
+    if _fed_is_tag(toks[2]) == 0 { return 0 }
+    if _fed_is_digits(toks[3]) == 0 { return 0 }
+    if _fed_is_digits(toks[4]) == 0 { return 0 }
+    if _fed_is_digits(toks[5]) == 0 { return 0 }
+    let rec = list_new()
+    push(rec, FED_EV_AGG)
+    push(rec, str_to_int(toks[1]))
+    push(rec, toks[2])
+    push(rec, str_to_int(toks[3]))
+    push(rec, str_to_int(toks[4]))
+    push(rec, str_to_int(toks[5]))
+    return rec
+}
+
+// Top-level dispatch -- only handles the events the soul receives.
+fn _fed_parse_line(text) {
+    let line = _fed_strip_eol(text)
+    if len(line) == 0 { return 0 }
+    if str_eq(line, FED_BYE_LINE) == 1 {
+        let rec = list_new()
+        push(rec, FED_EV_BYE)
+        return rec
+    }
+    if _fed_starts_with(line, FED_ROUND_PREFIX) == 1 { return _fed_parse_round(line) }
+    if _fed_starts_with(line, FED_AGG_PREFIX) == 1 { return _fed_parse_agg(line) }
+    if _fed_starts_with(line, FED_ACK_PREFIX) == 1 {
+        let toks = _fed_split_spaces(line)
+        if len(toks) != 2 { return 0 }
+        if _fed_is_digits(toks[1]) == 0 { return 0 }
+        let rec = list_new()
+        push(rec, FED_EV_ACK)
+        push(rec, str_to_int(toks[1]))
+        return rec
+    }
+    return 0
+}
+
+// ---- soul-side network bridge --------------------------------------------
+// Dial a federated coordinator and run the HELLO ce-fed v1 handshake.
+// Returns the fd on success, -1 on connect / handshake failure. Reads
+// CE_FED_TOKEN from env so the soul mirrors the coordinator's auth.
+fn fed_dial(host, port) {
+    let ip = _fed_ip_str_to_int(host)
+    if ip < 0 { return 0 - 1 }
+    let addr = make_sockaddr_in(port, ip)
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return 0 - 1 }
+    let r = connect_socket(sock, addr, 16)
+    if r < 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    let token = fed_token_from_env()
+    let hello = FED_HELLO_V1_LINE
+    if token != 0 {
+        if len(token) > 0 {
+            hello = FED_HELLO_V1_LINE + " " + FED_TOKEN_TAG + token
+        }
+    }
+    if _fed_send_all(sock, hello + "\n") == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    let ok = _fed_recv_line(sock)
+    if ok == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if _fed_starts_with(ok, FED_OK_PREFIX) == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    return sock
+}
+
+// Send FED_JOIN on the live fd. Returns 1 on success, 0 on send error.
+fn fed_send_join(f, fd) {
+    let line = fed_agg_format_join_line(f)
+    return _fed_send_all(fd, line)
+}
+
+// SecAgg-mode handshake dial: sends SECAGG_HELLO ce-fed v2-sa instead
+// of HELLO ce-fed v1. Returns the fd on success, -1 on failure.
+fn fed_dial_secagg(host, port) {
+    let ip = _fed_ip_str_to_int(host)
+    if ip < 0 { return 0 - 1 }
+    let addr = make_sockaddr_in(port, ip)
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return 0 - 1 }
+    let r = connect_socket(sock, addr, 16)
+    if r < 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if _fed_send_all(sock, sa_format_hello_line()) == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    let ok = _fed_recv_line(sock)
+    if ok == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if _fed_starts_with(ok, FED_OK_PREFIX) == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    return sock
+}
+
+// SecAgg-mode peer announcement: send one SECAGG_PEER line per peer
+// the soul has registered on the SA state. Returns count of lines
+// sent (0 if the SA state is empty or there's no SA state on f).
+fn fed_send_peers(f, fd) {
+    if f[FED_SECAGG_MODE] != 1 { return 0 }
+    let sa = f[FED_SA_STATE]
+    if sa == 0 { return 0 }
+    let peers = sa_peers(sa)
+    let sent = 0
+    let i = 0
+    while i < len(peers) {
+        let row = peers[i]
+        let line = sa_format_peer_line(row[SA_PEER_ID], row[SA_PEER_TOKEN])
+        if _fed_send_all(fd, line) == 1 {
+            sent = sent + 1
+        }
+        i = i + 1
+    }
+    return sent
+}
+
+// Send FED_LEAVE on the live fd.
+fn fed_send_leave(f, fd) {
+    let line = fed_agg_format_leave_line(f)
+    return _fed_send_all(fd, line)
+}
+
+// Close the live fd (best-effort).
+fn fed_close(fd) {
+    if fd < 0 { return 0 }
+    close_fd(fd)
+    return 1
+}
+
+// One-round driver -- the chat invokes this after a successful /fed_join.
+// Reads FED_ROUND, emits all FED_STAT records, sends ACK <round_id>,
+// then collects FED_AGGREGATE replies until any non-aggregate event
+// (BYE / next round / EOF). The receive-aggregate path updates the
+// passed-in source_auth registry.
+//
+// Returns a 4-element list:
+//   [round_id, n_stats_sent, n_aggregates_received, completed]
+// `completed` is 1 if the round closed cleanly (FED_ROUND seen +
+// aggregates received OR EOF after aggregates); 0 if the recv stream
+// died before FED_ROUND was even seen.
+fn fed_one_round(f, fd, source_auth) {
+    let out = list_new()
+    push(out, 0 - 1)   // round_id (unknown)
+    push(out, 0)       // stats sent
+    push(out, 0)       // aggregates received
+    push(out, 0)       // completed
+    let line = _fed_recv_line(fd)
+    if line == 0 { return out }
+    let rec = _fed_parse_line(line)
+    if rec == 0 { return out }
+    let t = rec[FEDR_TYPE]
+    if t == FED_EV_BYE { return out }
+    if t != FED_EV_ROUND { return out }
+    let round_id = rec[FEDR_ROUND_ID]
+    let deadline = rec[FEDR_DEADLINE]
+    list_set(out, 0, round_id)
+    fed_agg_round_start(f, round_id, deadline)
+    let stats = fed_agg_emit_noised_stats(f)
+    let i = 0
+    while i < len(stats) {
+        let row = stats[i]
+        let stat_line = fed_agg_format_stat_line(f, row[FED_STAT_TAG],
+            row[FED_STAT_PROMO], row[FED_STAT_ATR])
+        if _fed_send_all(fd, stat_line) == 0 {
+            i = len(stats)
+        } else {
+            list_set(out, 1, out[1] + 1)
+            i = i + 1
+        }
+    }
+    // ACK sentinel: signals "all my stats are in" to the coordinator.
+    let ack_line = FED_ACK_PREFIX + int_to_str(round_id) + "\n"
+    _fed_send_all(fd, ack_line)
+    // Collect aggregates.
+    let go = 1
+    while go == 1 {
+        let aline = _fed_recv_line(fd)
+        if aline == 0 {
+            go = 0
+        } else {
+            let arec = _fed_parse_line(aline)
+            if arec == 0 {
+                go = 0
+            } else {
+                let tt = arec[FEDR_TYPE]
+                if tt == FED_EV_AGG {
+                    let rid = arec[FEDR_ROUND_ID]
+                    if rid == round_id {
+                        let tag = arec[FEDR_TAG_SLOT]
+                        let p = arec[FEDR_PROMO]
+                        let a = arec[FEDR_ATR]
+                        let n = arec[FEDR_NPART]
+                        fed_agg_receive_aggregate(f, tag, p, a, n, source_auth)
+                        list_set(out, 2, out[2] + 1)
+                    }
+                } else {
+                    go = 0
+                }
+            }
+        }
+    }
+    fed_agg_round_end(f, round_id)
+    list_set(out, 3, 1)
+    return out
+}
+
+// Inspection helpers for the chat to pretty-print a one_round result.
+fn fed_round_result_round_id(r)    { return r[0] }
+fn fed_round_result_stats_sent(r)  { return r[1] }
+fn fed_round_result_aggs_recv(r)   { return r[2] }
+fn fed_round_result_completed(r)   { return r[3] }
+

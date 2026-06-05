@@ -1,0 +1,2142 @@
+// Unit tests for examples/voice_dialog.nova (R25B.2 through R25B.6).
+//
+// Covers:
+//   * Session bookkeeping -- new / reset / history cap at 5 turns.
+//   * Single turn -- same shape as R25B (the R25B parser path is the
+//     fallback for transcripts that don't match a follow-up pattern).
+//   * "Tell me more" -- escalates LIMIT, re-runs LIST_ALL on prior kind.
+//   * Anaphora -- "describe it" / "what is it" resolves to last ids[0].
+//   * Ordinal anaphora -- "the second one" -> last_ids[1].
+//   * "what about X" / "and X" -- pivots prior template onto new kind.
+//   * Topic shift -- "actually X" / "never mind" reset the session.
+//   * R25B.3 follow-up classifier (PIVOT / CONTINUE / ANAPHORA).
+//   * R25B.4 morphology + weighted Jaccard.
+//   * R25B.5 / R31F kind-pivot routing for known-second-kind remainders.
+//   * R25B.6 / R32F multi-kind CLARIFY: ambiguous remainders that name
+//     2+ known kinds emit a clarifying question; the next turn is
+//     parsed as a kind-selector first; give-up after 2 attempts.
+//     Env opt-out CE_VOICE_NO_CLARIFY=1 preserves R31F's first-match
+//     KIND_PIVOT behaviour byte-identically.
+//
+// We do NOT exercise the STT or TTS legs here -- vc_session_turn takes
+// already-transcribed text so the dialog state machine is the unit
+// under test. The integration scenario covers the WAV roundtrip.
+//
+// We build a real R15D KG with a handful of FACT / CONCEPT / RELATION
+// atoms so the SPARQL executor returns real bindings; the dialog layer
+// then has actual ids to anaphor against.
+
+import "std/syscall"
+import "../ce_test.nova"
+import "../../examples/voice_dialog.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/io/transducers/whisper_backend.nova"
+
+// ---- KG fixture ----------------------------------------------------------
+
+// Build a small KG: 3 FACT atoms (ids 0..2), 2 CONCEPT atoms (ids 3..4),
+// 1 RELATION (id 5). The ids are 0-indexed in order of insertion (the
+// R15D convention; see tests/unit/test_kg_query.nova for the same shape).
+fn _fixture_kg() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "dialog_test")
+    kg_add_atom(kg, ATOM_FACT,    "f1", 1000)
+    kg_add_atom(kg, ATOM_FACT,    "f2", 1100)
+    kg_add_atom(kg, ATOM_FACT,    "f3", 1200)
+    kg_add_atom(kg, ATOM_CONCEPT, "c1", 1500)
+    kg_add_atom(kg, ATOM_CONCEPT, "c2", 1600)
+    kg_add_atom(kg, ATOM_RELATION, "r1", 1700)
+    return kg
+}
+
+// ---- session bookkeeping -------------------------------------------------
+
+fn test_session_new_is_empty() {
+    let s = vc_session_new()
+    ce_eq("new session: history empty",
+        len(vc_session_history(s)), 0)
+    ce_eq("new session: turn_count 0",
+        vc_session_turn_count(s), 0)
+    ce_eq("new session: last_template UNKNOWN",
+        vc_session_last_template(s), vc_template_unknown())
+}
+
+fn test_session_reset_clears_state() {
+    let s = vc_session_new()
+    let kg = _fixture_kg()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("pre-reset: turn_count 1",
+        vc_session_turn_count(s), 1)
+    vc_session_reset(s)
+    ce_eq("post-reset: history empty",
+        len(vc_session_history(s)), 0)
+    ce_eq("post-reset: turn_count 0",
+        vc_session_turn_count(s), 0)
+    ce_eq("post-reset: last_template UNKNOWN",
+        vc_session_last_template(s), vc_template_unknown())
+}
+
+// ---- single turn (R25B parity) -------------------------------------------
+
+fn test_single_turn_list_all() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn(kg, s, "list all FACT")
+    let txt = vc_session_result_text(r)
+    // The KG has 3 FACTs (ids 0, 1, 2). The R25B formatter says
+    // "Found 3 FACT atoms: ids 0, 1, 2.".
+    ce_str_eq("single LIST_ALL FACT response",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("post-turn: template LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_str_eq("post-turn: kind FACT",
+        vc_session_last_kind(s), "FACT")
+    let ids = vc_session_last_ids(s)
+    ce_eq("post-turn: 3 ids captured", len(ids), 3)
+    ce_eq("post-turn: ids[0] = 0", ids[0], 0)
+    ce_eq("post-turn: ids[1] = 1", ids[1], 1)
+}
+
+fn test_single_turn_how_many() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn(kg, s, "how many FACT")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("how many FACT -> count sentence",
+        txt, "There are 3 FACT atoms.")
+    ce_eq("post-turn: template HOW_MANY",
+        vc_session_last_template(s), vc_template_how_many())
+    // HOW_MANY doesn't carry entity ids, so last_ids is empty.
+    ce_eq("post-turn: ids empty for HOW_MANY",
+        len(vc_session_last_ids(s)), 0)
+}
+
+fn test_single_turn_unknown_pattern_apology() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn(kg, s, "tell me a joke")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("unknown -> R25B apology",
+        txt, "I do not know how to answer that question.")
+    // Unknown does NOT push a turn into history.
+    ce_eq("unknown: history still empty",
+        len(vc_session_history(s)), 0)
+}
+
+// ---- "tell me more" -------------------------------------------------------
+
+fn test_more_request_escalates_limit() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("first turn: limit 10",
+        vc_session_last_limit(s), 10)
+    let r2 = vc_session_turn(kg, s, "tell me more")
+    let txt2 = vc_session_result_text(r2)
+    // KG only has 3 FACTs but LIST_ALL with LIMIT 20 still returns 3.
+    // The escalation is observable: last_limit should now be 20.
+    ce_eq("more: limit doubled to 20",
+        vc_session_last_limit(s), 20)
+    ce_str_eq("more: re-runs LIST_ALL on prior kind",
+        txt2, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("more: template still LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+}
+
+fn test_more_request_without_prior_complains() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn(kg, s, "tell me more")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("more without prior -> complaint",
+        txt, "There is nothing yet. Please ask a question first.")
+}
+
+// ---- anaphora ------------------------------------------------------------
+
+fn test_anaphora_describe_it_resolves_to_first_id() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "describe it")
+    let txt = vc_session_result_text(r)
+    // last_ids = [0, 1, 2]; "describe it" -> ids[0] = 0.
+    ce_str_eq("describe it -> id 0",
+        txt, "That FACT atom has id 0.")
+    ce_eq("describe it: template now WHAT_IS",
+        vc_session_last_template(s), vc_template_what_is())
+}
+
+fn test_anaphora_what_is_it_after_what_is() {
+    // Chain: "what is X" -> bindings carries ids -> "what is it"
+    // resolves to that first id. (Anaphora chains across WHAT_IS.)
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "what is CONCEPT")
+    let ids_after_first = vc_session_last_ids(s)
+    ce_eq("what is CONCEPT: 1 id captured",
+        len(ids_after_first), 1)
+    let first_id = ids_after_first[0]
+    let r = vc_session_turn(kg, s, "what is it")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("what is it -> id mirrored",
+        txt, "That CONCEPT atom has id " + int_to_str(first_id) + ".")
+}
+
+fn test_anaphora_without_prior_complains() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn(kg, s, "describe it")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("describe it without prior -> complaint",
+        txt, "I do not have a previous result to describe.")
+}
+
+// ---- ordinal anaphora ----------------------------------------------------
+
+fn test_ordinal_second_one_resolves_to_index_1() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "the second one")
+    let txt = vc_session_result_text(r)
+    // last_ids = [0, 1, 2]; "the second one" -> ids[1] = 1.
+    ce_str_eq("the second one -> id 1",
+        txt, "That FACT atom has id 1.")
+}
+
+fn test_ordinal_what_is_the_third_one() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "what is the third one")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("what is the third one -> id 2",
+        txt, "That FACT atom has id 2.")
+}
+
+fn test_ordinal_last_one_resolves_to_tail() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "the last one")
+    let txt = vc_session_result_text(r)
+    // 3 FACTs; last = ids[2] = 2.
+    ce_str_eq("the last one -> id 2",
+        txt, "That FACT atom has id 2.")
+}
+
+// ---- "what about X" / "and X" pivot --------------------------------------
+
+fn test_pivot_what_about_concept() {
+    // Prior: "list all FACT" -> reuse LIST_ALL with CONCEPT.
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "what about CONCEPT")
+    let txt = vc_session_result_text(r)
+    // KG has 2 CONCEPT atoms at ids 3, 4.
+    ce_str_eq("what about CONCEPT -> LIST_ALL CONCEPT",
+        txt, "Found 2 CONCEPT atoms: ids 3, 4.")
+    ce_str_eq("post-pivot: kind is CONCEPT",
+        vc_session_last_kind(s), "CONCEPT")
+}
+
+// ---- topic shift ---------------------------------------------------------
+
+fn test_topic_shift_actually_resets_and_parses_rest() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("pre-shift: history size 1",
+        len(vc_session_history(s)), 1)
+    let r = vc_session_turn(kg, s, "actually list all CONCEPT")
+    let txt = vc_session_result_text(r)
+    // The shift resets THEN parses "list all CONCEPT" fresh.
+    ce_str_eq("actually list all CONCEPT -> CONCEPT result",
+        txt, "Found 2 CONCEPT atoms: ids 3, 4.")
+    // History: shift reset, then one fresh turn pushed.
+    ce_eq("post-shift+parse: history size 1",
+        len(vc_session_history(s)), 1)
+    ce_str_eq("post-shift+parse: kind CONCEPT",
+        vc_session_last_kind(s), "CONCEPT")
+}
+
+fn test_topic_shift_bare_acknowledges_and_resets() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "never mind")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("never mind -> acknowledgement",
+        txt, "Okay, let us change the topic. What would you like to know?")
+    ce_eq("never mind: history wiped",
+        len(vc_session_history(s)), 0)
+    ce_eq("never mind: template UNKNOWN",
+        vc_session_last_template(s), vc_template_unknown())
+}
+
+// ---- history cap (5 turns) -----------------------------------------------
+
+fn test_history_caps_at_5_turns() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // 7 successful turns; only the last 5 should remain.
+    vc_session_turn(kg, s, "list all FACT")
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "list all RELATION")
+    vc_session_turn(kg, s, "how many FACT")
+    vc_session_turn(kg, s, "how many CONCEPT")
+    vc_session_turn(kg, s, "list all FACT")
+    vc_session_turn(kg, s, "list all CONCEPT")
+    let hist = vc_session_history(s)
+    ce_eq("after 7 turns: history capped at 5",
+        len(hist), 5)
+    // The MONOTONIC turn_count survives the cap.
+    ce_eq("turn_count survives cap",
+        vc_session_turn_count(s), 7)
+    // The OLDEST surviving entry should be the 3rd ingestion
+    // (turn index 2 in insertion order -- "list all RELATION").
+    let oldest = hist[0]
+    ce_str_eq("oldest surviving: 'list all RELATION'",
+        vc_turn_question(oldest), "list all RELATION")
+    // Newest is the 7th: "list all CONCEPT".
+    let newest = hist[len(hist) - 1]
+    ce_str_eq("newest surviving: 'list all CONCEPT'",
+        vc_turn_question(newest), "list all CONCEPT")
+}
+
+// ---- R25B.3 follow-up classifier + topic-shift detection ----------------
+//
+// The R28D dialog manager assumed every "tell me more" was a continuation
+// of the prior topic. R29C extends that with content-word Jaccard: when
+// the user says "tell me more about cats" after "list all FACT", the
+// "cats" tail is unrelated to "fact" so the turn is a PIVOT, not a
+// CONTINUE. Anaphora resolution wins over pivot detection so "describe
+// the first one" still resolves to last_ids[0] (the word "first" is a
+// stopword, not a content signal). Tests cover the four classifier
+// outputs + the runtime dispatch behaviour they trigger.
+
+// Classifier: no prior turn -> NONE.
+fn test_classify_no_prior_returns_none() {
+    let s = vc_session_new()
+    ce_eq("classify empty session 'tell me more' -> NONE",
+        voice_followup_classify(s, "tell me more"), vc_followup_none())
+    ce_eq("classify empty session 'describe it' -> NONE",
+        voice_followup_classify(s, "describe it"), vc_followup_none())
+    ce_eq("classify empty session 'list all FACT' -> NONE",
+        voice_followup_classify(s, "list all FACT"), vc_followup_none())
+    ce_eq("classify empty session '' -> NONE",
+        voice_followup_classify(s, ""), vc_followup_none())
+}
+
+// Classifier: bare "tell me more" after a prior turn -> CONTINUE (no
+// content-words in the remainder; nothing to disagree with).
+fn test_classify_bare_more_is_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more' after prior -> CONTINUE",
+        voice_followup_classify(s, "tell me more"), vc_followup_continue())
+    ce_eq("'more' after prior -> CONTINUE",
+        voice_followup_classify(s, "more"), vc_followup_continue())
+    ce_eq("'tell me more about it' after prior -> CONTINUE",
+        voice_followup_classify(s, "tell me more about it"), vc_followup_continue())
+}
+
+// Classifier: "tell me more about cats" -- "cats" unrelated to prior
+// "fact" -> PIVOT.
+fn test_classify_more_with_unrelated_remainder_is_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about cats' after FACT prior -> PIVOT",
+        voice_followup_classify(s, "tell me more about cats"),
+        vc_followup_pivot())
+    ce_eq("'more about dogs' after FACT prior -> PIVOT",
+        voice_followup_classify(s, "more about dogs"),
+        vc_followup_pivot())
+}
+
+// Classifier: "what about RULE atoms" -- explicit kind pivot.
+// R31F / R25B.5 UPDATE: this used to be VC_FOLLOWUP_PIVOT under R29C +
+// R30F. R25B.5 introduces VC_FOLLOWUP_KIND_PIVOT for the case where the
+// remainder names a KNOWN second kind != prior; the explicit
+// "what/how about KIND" path is one of the two routes into that
+// class. The end-state dispatch behaviour is unchanged (still goes
+// through _vd_pivot_turn with the prior template + new kind + LIMIT
+// reset); only the classifier output relabels.
+fn test_classify_what_about_kind_is_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'what about RULE atoms' after FACT -> KIND_PIVOT (R25B.5)",
+        voice_followup_classify(s, "what about RULE atoms"),
+        vc_followup_kind_pivot())
+    ce_eq("'what about CONCEPT' after FACT -> KIND_PIVOT (R25B.5)",
+        voice_followup_classify(s, "what about CONCEPT"),
+        vc_followup_kind_pivot())
+    ce_eq("'how about SKILL' after FACT -> KIND_PIVOT (R25B.5)",
+        voice_followup_classify(s, "how about SKILL"),
+        vc_followup_kind_pivot())
+}
+
+// Classifier: anaphora wins over pivot. "describe the first one" must
+// be ANAPHORA -- even though "first" could read as a content word, the
+// stopword list excludes it.
+fn test_classify_anaphora_priority() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'describe the first one' -> ANAPHORA",
+        voice_followup_classify(s, "describe the first one"),
+        vc_followup_anaphora())
+    ce_eq("'the second one' -> ANAPHORA",
+        voice_followup_classify(s, "the second one"),
+        vc_followup_anaphora())
+    ce_eq("'describe it' -> ANAPHORA",
+        voice_followup_classify(s, "describe it"),
+        vc_followup_anaphora())
+    ce_eq("'tell me about it' -> ANAPHORA",
+        voice_followup_classify(s, "tell me about it"),
+        vc_followup_anaphora())
+    ce_eq("'the last one' -> ANAPHORA",
+        voice_followup_classify(s, "the last one"),
+        vc_followup_anaphora())
+}
+
+// Classifier: same kind word in remainder as prior -> CONTINUE.
+fn test_classify_same_kind_remainder_is_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    // "and FACT" -- the remainder content is exactly the prior content;
+    // Jaccard = 1.0, well above 0.2 -> CONTINUE.
+    ce_eq("'and FACT' after FACT prior -> CONTINUE",
+        voice_followup_classify(s, "and FACT"),
+        vc_followup_continue())
+    // "more fact" -- same singular word -> CONTINUE.
+    ce_eq("'more fact' approximation -> CONTINUE (single-word overlap)",
+        voice_followup_classify(s, "more fact"),
+        vc_followup_continue())
+}
+
+// 3-turn fixture (extends R28D's): "list all FACT" -> "tell me more"
+// -> CONTINUE. Same byte-identical state transitions as R28D.
+fn test_three_turn_continue_byte_identical() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r1 = vc_session_turn(kg, s, "list all FACT")
+    ce_str_eq("turn 1: LIST_ALL FACT response",
+        vc_session_result_text(r1), "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("turn 1: limit base 10", vc_session_last_limit(s), 10)
+    ce_eq("turn 1: history size 1", len(vc_session_history(s)), 1)
+
+    let r2 = vc_session_turn(kg, s, "tell me more")
+    ce_str_eq("turn 2: more re-runs LIST_ALL with doubled LIMIT",
+        vc_session_result_text(r2), "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("turn 2: limit doubled to 20", vc_session_last_limit(s), 20)
+    ce_eq("turn 2: still LIST_ALL template",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_str_eq("turn 2: kind FACT preserved",
+        vc_session_last_kind(s), "FACT")
+    ce_eq("turn 2: history size 2", len(vc_session_history(s)), 2)
+    ce_eq("turn 2: turn_count 2", vc_session_turn_count(s), 2)
+}
+
+// 3-turn pivot fixture: "list all FACT" -> "tell me more about cats"
+// -> PIVOT. Session state is reset; "cats" is not a known kind so
+// R25B's parser returns UNKNOWN, but the pivot turn IS recorded in
+// history. The LIMIT does NOT escalate; the prior-kind context is
+// gone.
+fn test_three_turn_pivot_unrelated_remainder() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("pre-pivot: limit 10", vc_session_last_limit(s), 10)
+    ce_eq("pre-pivot: history size 1", len(vc_session_history(s)), 1)
+
+    let r = vc_session_turn(kg, s, "tell me more about cats")
+    let txt = vc_session_result_text(r)
+    // "cats" is not a known kind; R25B parses as UNKNOWN. The pivot
+    // path still records the turn so the operator sees the shift.
+    ce_str_eq("'tell me more about cats' -> UNKNOWN apology",
+        txt, "I do not know how to answer that question.")
+    // LIMIT must NOT escalate -- pivot reset it to base.
+    ce_eq("post-pivot: limit reset to base",
+        vc_session_last_limit(s), 10)
+    // Template / kind cleared (pivot resets prior context, and the
+    // UNKNOWN parse does not re-establish it).
+    ce_eq("post-pivot: template UNKNOWN",
+        vc_session_last_template(s), vc_template_unknown())
+    ce_str_eq("post-pivot: kind cleared",
+        vc_session_last_kind(s), "")
+    // History should still contain the pivot turn (brief: "history
+    // still records the pivot turn"). The reset wiped the FACT turn,
+    // then the pivot fresh-turn helper appended its own.
+    ce_eq("post-pivot: history records the pivot turn",
+        len(vc_session_history(s)), 1)
+    let pivot_turn = vc_session_history(s)[0]
+    ce_str_eq("post-pivot: history holds pivot question",
+        vc_turn_question(pivot_turn), "tell me more about cats")
+}
+
+// "list all FACT" -> "what about RULE atoms" -> KIND_PIVOT (R25B.5).
+// Template-preserving kind-pivot path; reuses LIST_ALL with RULE.
+// R31F UPDATE: classifier now returns KIND_PIVOT (was PIVOT under R29C
+// + R30F). End-state behaviour (response text, post-state kind +
+// template, history record) is byte-identical -- the handler still
+// runs _vd_pivot_turn(LIST_ALL, RULE). Rationale for the relabel:
+// remainder names a known kind != prior; KIND_PIVOT captures the
+// semantics of "shift to a known second kind" distinct from generic
+// PIVOT ("topic unrelated to anything I know about").
+fn test_three_turn_pivot_what_about_kind() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("pre-pivot: classifier sees KIND_PIVOT",
+        voice_followup_classify(s, "what about RULE atoms"),
+        vc_followup_kind_pivot())
+    let r = vc_session_turn(kg, s, "what about RULE atoms")
+    let txt = vc_session_result_text(r)
+    // The KG fixture has zero RULE atoms (only FACT / CONCEPT / RELATION).
+    ce_str_eq("'what about RULE atoms' -> LIST_ALL RULE empty",
+        txt, "No RULE atoms found.")
+    ce_str_eq("post-pivot: kind is RULE",
+        vc_session_last_kind(s), "RULE")
+    ce_eq("post-pivot: template LIST_ALL preserved",
+        vc_session_last_template(s), vc_template_list_all())
+    // History captures BOTH turns (R25B.2 behaviour: pivot does NOT
+    // reset history, only the more-cue-with-unrelated-remainder path
+    // does that).
+    ce_eq("post-pivot: history has both turns",
+        len(vc_session_history(s)), 2)
+}
+
+// "list all FACT" -> "describe the first one" -> ANAPHORA. Existing
+// behaviour: resolve to last_ids[0]. R28D parity assertion -- R29C
+// must not regress.
+fn test_three_turn_anaphora_unchanged() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("pre-anaphora: classifier sees ANAPHORA",
+        voice_followup_classify(s, "describe the first one"),
+        vc_followup_anaphora())
+    let r = vc_session_turn(kg, s, "describe the first one")
+    let txt = vc_session_result_text(r)
+    // The R28D ordinal path resolves "the first one" via WHAT_IS at
+    // ids[0] = 0.
+    ce_str_eq("'describe the first one' -> id 0",
+        txt, "That FACT atom has id 0.")
+    ce_eq("post-anaphora: template WHAT_IS",
+        vc_session_last_template(s), vc_template_what_is())
+    ce_str_eq("post-anaphora: kind FACT preserved",
+        vc_session_last_kind(s), "FACT")
+}
+
+// Stopword stripping smoke test -- the classifier should treat
+// "describe the first one" as ANAPHORA. Included here for
+// self-documenting symmetry with the next assertion.
+fn test_classify_describe_with_content_word() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'describe the first one' -> ANAPHORA",
+        voice_followup_classify(s, "describe the first one"),
+        vc_followup_anaphora())
+}
+
+// Pivot via "and X" cue (X unrelated): "list all FACT" -> "and dogs"
+// should be PIVOT (Jaccard = 0).
+fn test_classify_and_with_unrelated_remainder_is_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'and dogs' after FACT -> PIVOT",
+        voice_followup_classify(s, "and dogs"),
+        vc_followup_pivot())
+}
+
+// Multi-cue robustness: "also cats" -- "also" is a cue stopword,
+// "cats" alone is the content set; FACT prior -> PIVOT.
+fn test_classify_also_cue_unrelated_is_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'also cats' after FACT -> PIVOT",
+        voice_followup_classify(s, "also cats"),
+        vc_followup_pivot())
+}
+
+// Runtime dispatch: pivot via more-cue does NOT escalate LIMIT.
+fn test_dispatch_pivot_does_not_escalate_limit() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    vc_session_turn(kg, s, "tell me more")  // limit -> 20
+    ce_eq("pre-pivot: limit escalated to 20",
+        vc_session_last_limit(s), 20)
+    vc_session_turn(kg, s, "tell me more about cats")
+    ce_eq("post-pivot: limit reset to base 10",
+        vc_session_last_limit(s), 10)
+}
+
+// Cumulative R28D parity: after the R29C changes the original R28D
+// dispatcher must still emit the exact strings R28D published. We
+// re-assert the load-bearing transitions here. Note: the prior turn
+// was WHAT_IS (from "describe it"), so the pivot reuses WHAT_IS over
+// CONCEPT -- that's the documented R28D pivot semantics.
+fn test_r28d_parity_smoke() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r1 = vc_session_turn(kg, s, "list all FACT")
+    ce_str_eq("R28D parity: list all FACT",
+        vc_session_result_text(r1), "Found 3 FACT atoms: ids 0, 1, 2.")
+    let r2 = vc_session_turn(kg, s, "tell me more")
+    ce_str_eq("R28D parity: tell me more",
+        vc_session_result_text(r2), "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("R28D parity: limit doubled",
+        vc_session_last_limit(s), 20)
+    let r3 = vc_session_turn(kg, s, "describe it")
+    ce_str_eq("R28D parity: describe it -> id 0",
+        vc_session_result_text(r3), "That FACT atom has id 0.")
+    // After "describe it" the template is WHAT_IS; pivot reuses it.
+    let r4 = vc_session_turn(kg, s, "what about CONCEPT")
+    ce_str_eq("R28D parity: what about CONCEPT (reuses WHAT_IS)",
+        vc_session_result_text(r4), "The first CONCEPT atom has id 3.")
+}
+
+// ---- R25B.4 morphology + weighted Jaccard (R30F / R29C.2) ---------------
+//
+// R29C (R25B.3) shipped uniform-weight Jaccard. The exit report
+// documented two known failure modes:
+//
+//   1. Long unrelated remainder on the kind-naming side --
+//      "tell me more about that atom in the rule engine" after
+//      `list all RULE` scores 3/10 = CONTINUE (correct), but the
+//      same utterance after `list all FACT` scores 0/4 = PIVOT
+//      (loses the "more rows" intent on RULE topic).
+//   2. No morphology -- "facts" plural mismatches "fact" singular
+//      and trips PIVOT spuriously.
+//
+// R25B.4 closes (2) wholesale and partially closes (1):
+//   * _vd_stem normalises trailing-s plurals (cats -> cat, facts ->
+//     fact, rules -> rule, entities -> entity) so kind-naming
+//     remainders stay anchored to CONTINUE regardless of
+//     pluralisation.
+//   * _vd_weighted_score_tenths re-scores the same prior/remainder
+//     pair with the KIND word counting double on both sides of the
+//     ratio. Borderline remainders that include the prior kind get
+//     LIFTED into CONTINUE even when the uniform Jaccard rounds
+//     below the threshold.
+//
+// HONEST: the brief's case 1 ("tell me more about that atom in the
+// rule engine" after FACT) IS still PIVOT under the weighted model
+// because the remainder names a DIFFERENT kind (rule) than the
+// prior (fact). The weighted score for kind=fact + remainder=
+// {atom, rule, engine} is 0/2 = 0; no fact-token is present to
+// receive the kind weight. That's the honest answer: the operator
+// shifted topic from FACT to the rule engine. The right fix is
+// either (a) noticing the remainder names a DIFFERENT KNOWN kind
+// and routing as kind-pivot, or (b) a semantic-distance model that
+// recognises "rule engine" as off-topic from FACT. Deferred to a
+// future R25B.5; documented below.
+
+// Morphology unit tests -- direct probes of vc_stem (public wrapper
+// around _vd_stem). Covers the s-suffix rule + its quirks.
+fn test_morph_stem_basic_plurals() {
+    ce_str_eq("cats -> cat", vc_stem("cats"), "cat")
+    ce_str_eq("rules -> rule", vc_stem("rules"), "rule")
+    ce_str_eq("facts -> fact", vc_stem("facts"), "fact")
+    ce_str_eq("dogs -> dog", vc_stem("dogs"), "dog")
+    ce_str_eq("atoms -> atom", vc_stem("atoms"), "atom")
+}
+
+fn test_morph_stem_singular_unchanged() {
+    ce_str_eq("cat unchanged", vc_stem("cat"), "cat")
+    ce_str_eq("rule unchanged", vc_stem("rule"), "rule")
+    ce_str_eq("fact unchanged", vc_stem("fact"), "fact")
+    ce_str_eq("engine unchanged", vc_stem("engine"), "engine")
+}
+
+fn test_morph_stem_short_word_preserved() {
+    // Length < 4 -- "is" / "as" / "us" / "go" should not be touched.
+    ce_str_eq("is unchanged (short)", vc_stem("is"), "is")
+    ce_str_eq("as unchanged (short)", vc_stem("as"), "as")
+    ce_str_eq("us unchanged (short)", vc_stem("us"), "us")
+    ce_str_eq("os unchanged (short)", vc_stem("os"), "os")
+}
+
+fn test_morph_stem_suffix_quirks() {
+    // -ss / -us / -is / -as / -os tails should not strip the s.
+    ce_str_eq("kiss unchanged (-ss)", vc_stem("kiss"), "kiss")
+    ce_str_eq("grass unchanged (-ss)", vc_stem("grass"), "grass")
+    ce_str_eq("focus unchanged (-us)", vc_stem("focus"), "focus")
+    ce_str_eq("axis unchanged (-is)", vc_stem("axis"), "axis")
+    ce_str_eq("was unchanged (-as)", vc_stem("was"), "was")
+    ce_str_eq("has unchanged (-as)", vc_stem("has"), "has")
+    ce_str_eq("atlas unchanged (-as)", vc_stem("atlas"), "atlas")
+    ce_str_eq("kudos unchanged (-os)", vc_stem("kudos"), "kudos")
+}
+
+fn test_morph_stem_ies_to_y() {
+    // -ies (entities) -> -y (entity).
+    ce_str_eq("entities -> entity", vc_stem("entities"), "entity")
+    ce_str_eq("categories -> category", vc_stem("categories"),
+        "category")
+    ce_str_eq("facilities -> facility", vc_stem("facilities"),
+        "facility")
+}
+
+fn test_morph_stem_no_trailing_s_unchanged() {
+    // Words not ending in s should pass through.
+    ce_str_eq("hello unchanged", vc_stem("hello"), "hello")
+    ce_str_eq("query unchanged", vc_stem("query"), "query")
+    ce_str_eq("empty unchanged", vc_stem(""), "")
+}
+
+// Weighted-score unit tests -- direct probes of vc_weighted_score.
+// All inputs are pre-stemmed (caller's responsibility -- the public
+// wrapper is documented that way).
+fn test_weighted_score_kind_match_double_weight() {
+    // kind=fact, no other prior content, remainder=[fact]
+    // -> num = 2*1 + 0 = 2; den = 2*1 + 0 = 2 -> 10/10 = 10.
+    let prior_other = list_new()
+    let now = list_new()
+    push(now, "fact")
+    ce_eq("kind-only prior + remainder=[fact] -> 10",
+        vc_weighted_score(prior_other, "fact", now), 10)
+}
+
+fn test_weighted_score_no_kind_match_zero() {
+    // kind=fact, no other content, remainder=[cat] (unrelated)
+    // -> 0 / 2 = 0.
+    let prior_other = list_new()
+    let now = list_new()
+    push(now, "cat")
+    ce_eq("kind-only prior + unrelated remainder -> 0",
+        vc_weighted_score(prior_other, "fact", now), 0)
+}
+
+fn test_weighted_score_mixed_kind_and_other() {
+    // kind=fact, prior_other=[apple], remainder=[fact, apple, cat]
+    // -> kind_match=1, other_match=1, num = 2+1 = 3; den = 2+1 = 3
+    // -> 30/3 = 10.
+    let prior_other = list_new()
+    push(prior_other, "apple")
+    let now = list_new()
+    push(now, "fact")
+    push(now, "apple")
+    push(now, "cat")
+    ce_eq("kind+other match -> 10",
+        vc_weighted_score(prior_other, "fact", now), 10)
+}
+
+fn test_weighted_score_empty_prior() {
+    // No prior kind, no prior other; remainder unrelated -> 0.
+    let prior_other = list_new()
+    let now = list_new()
+    push(now, "cat")
+    ce_eq("empty prior + non-empty now -> 0",
+        vc_weighted_score(prior_other, "", now), 0)
+}
+
+fn test_weighted_score_empty_now() {
+    // Non-empty prior, empty remainder -> 0.
+    let prior_other = list_new()
+    let now = list_new()
+    ce_eq("non-empty prior + empty now -> 0",
+        vc_weighted_score(prior_other, "fact", now), 0)
+}
+
+// Classifier tests -- the new morphology + weighted scorer should
+// catch cases the uniform Jaccard missed.
+
+// Brief fixture: "list all FACT" + "tell me more facts" -- morphology
+// matches the plural; expect CONTINUE.
+fn test_classify_more_facts_after_fact_is_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more facts' after FACT prior -> CONTINUE",
+        voice_followup_classify(s, "tell me more facts"),
+        vc_followup_continue())
+}
+
+// Brief fixture: "list all RULE" + "more rules please" -- same
+// morphology win; expect CONTINUE.
+fn test_classify_more_rules_after_rule_is_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all RULE")
+    ce_eq("'more rules please' after RULE prior -> CONTINUE",
+        voice_followup_classify(s, "more rules please"),
+        vc_followup_continue())
+}
+
+// Brief fixture: the R29C / R30F documented failure case. After FACT
+// the remainder "that atom in the rule engine" names a DIFFERENT kind
+// (rule). R31F / R25B.5 routes this to KIND_PIVOT: the more-cue path
+// runs uniform Jaccard (miss), weighted Jaccard (miss -- no
+// fact-token in remainder), then scans the remainder for a token
+// naming a known kind != prior. "rule" stems to "rule", upcases to
+// "RULE", _vd_known_kind("RULE") == 1, and RULE != FACT, so the
+// classifier returns VC_FOLLOWUP_KIND_PIVOT. The handler then
+// re-runs the prior template (LIST_ALL) against RULE with the
+// baseline LIMIT.
+//
+// R31F UPDATE: prior expected was vc_followup_pivot() under R30F's
+// honest-PIVOT documentation. The R30F exit report explicitly named
+// this as the deferred R25B.5 case; R31F lands the fix.
+fn test_classify_r29c_failure_case_after_fact_is_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    // R25B.5 routes via the kind-pivot pass since "rule" in the
+    // remainder names a different known kind than FACT prior.
+    ce_eq("'tell me more about that atom in the rule engine' after FACT -> KIND_PIVOT (R25B.5)",
+        voice_followup_classify(s,
+            "tell me more about that atom in the rule engine"),
+        vc_followup_kind_pivot())
+}
+
+// Parity case: the R29C report said the same utterance after
+// `list all RULE` was correctly classified CONTINUE. Confirm
+// it stays CONTINUE under R25B.4.
+fn test_classify_r29c_correct_case_after_rule_is_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all RULE")
+    ce_eq("'tell me more about that atom in the rule engine' after RULE -> CONTINUE",
+        voice_followup_classify(s,
+            "tell me more about that atom in the rule engine"),
+        vc_followup_continue())
+}
+
+// Brief fixture (preserved from R29C): "list all FACT" + "tell me
+// more about cats" -- PIVOT under both uniform and weighted.
+fn test_classify_more_about_cats_after_fact_still_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about cats' after FACT -> PIVOT (preserved)",
+        voice_followup_classify(s, "tell me more about cats"),
+        vc_followup_pivot())
+}
+
+// Brief fixture: "list all FACT" + "what about RULE atoms" --
+// KIND_PIVOT (R31F / R25B.5) via the explicit kind-pivot path. The
+// remainder names a known kind != FACT.
+// R31F UPDATE: was vc_followup_pivot() under R30F; the explicit
+// "what about KIND" path is now one of the two entry points into
+// VC_FOLLOWUP_KIND_PIVOT.
+fn test_classify_what_about_rule_atoms_after_fact_is_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'what about RULE atoms' after FACT -> KIND_PIVOT (R25B.5)",
+        voice_followup_classify(s, "what about RULE atoms"),
+        vc_followup_kind_pivot())
+}
+
+// Long borderline: weighted lift makes the difference. Prior FACT,
+// remainder "facts and atoms and concepts and rules and skills and
+// langs" -- uniform Jaccard = 1/6 = 1 (below threshold 2) but the
+// weighted score = 2/2 = 10 lifts it to CONTINUE. (kind_terms = 1
+// and the remainder has at least one fact-token.)
+fn test_classify_weighted_lift_long_remainder() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("long remainder with kind term -> CONTINUE via weighting",
+        voice_followup_classify(s,
+            "more facts and atoms and concepts and rules and skills and langs"),
+        vc_followup_continue())
+}
+
+// Morphology lift: prior FACT, remainder "facts" alone after a
+// non-"tell me more" cue. "and facts" should be CONTINUE because
+// the stemmer normalises facts -> fact and prior content holds
+// fact.
+fn test_classify_and_facts_after_fact_is_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'and facts' after FACT -> CONTINUE via morphology",
+        voice_followup_classify(s, "and facts"),
+        vc_followup_continue())
+}
+
+// Negative parity: an unrelated kind plural ("dogs", "cats") after
+// FACT must still be PIVOT. Morphology alone cannot manufacture
+// agreement that isn't there.
+fn test_classify_more_dogs_after_fact_still_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'more dogs' after FACT -> PIVOT (no kind overlap)",
+        voice_followup_classify(s, "more dogs"),
+        vc_followup_pivot())
+}
+
+// Dispatch test: morphology-induced CONTINUE actually escalates
+// the LIMIT (the runtime consequence of the new classification).
+fn test_dispatch_morphology_continue_escalates_limit() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("pre-cont: limit base 10",
+        vc_session_last_limit(s), 10)
+    vc_session_turn(kg, s, "tell me more facts")
+    ce_eq("post-cont: limit doubled to 20",
+        vc_session_last_limit(s), 20)
+    ce_eq("post-cont: template still LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_str_eq("post-cont: kind FACT preserved",
+        vc_session_last_kind(s), "FACT")
+}
+
+// Composed scenario: "list all RULE" -> "more rules please" runs the
+// "tell me more" continuation path, doubles the LIMIT, returns the
+// LIST_ALL RULE response. The KG fixture has 0 RULE atoms so the
+// response is the empty-list sentence -- but the LIMIT escalation
+// still proves the CONTINUE branch fired.
+fn test_dispatch_more_rules_continues_rule_topic() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all RULE")
+    ce_eq("pre-cont (rule): limit 10",
+        vc_session_last_limit(s), 10)
+    let r = vc_session_turn(kg, s, "more rules please")
+    ce_eq("post-cont (rule): limit doubled to 20",
+        vc_session_last_limit(s), 20)
+    ce_str_eq("post-cont (rule): kind RULE preserved",
+        vc_session_last_kind(s), "RULE")
+}
+
+// ---- R25B.5 kind-pivot (R31F / R30F.2) ---------------------------------
+//
+// R30F's exit report explicitly named the deferred fix: "consult
+// `_vd_known_kind` against remainder tokens from the more-cue path and
+// route as a kind-pivot when the remainder names a known kind != prior".
+// R31F lands that fix and introduces VC_FOLLOWUP_KIND_PIVOT, a fifth
+// classifier output distinct from PIVOT. The handler treats a
+// KIND_PIVOT like a fresh template-preserving query against the new
+// kind (LIST_ALL by default, prior template when set), with LIMIT
+// reset to baseline -- NOT escalated.
+//
+// Test fixtures (20+ new assertions). Coverage:
+//   * The headline R29C/R30F failure case now classifies KIND_PIVOT.
+//   * The explicit "what about KIND" path upgrades to KIND_PIVOT
+//     (already updated in test_classify_what_about_kind_is_pivot
+//     above; we re-assert end-state here).
+//   * Same-kind remainder ("tell me more about facts" after FACT)
+//     stays CONTINUE -- no kind shift signal.
+//   * Unknown-kind remainder ("cats", "dogs") stays PIVOT -- no
+//     known-kind in remainder to route as KIND_PIVOT.
+//   * "list all RULE" + "tell me more about facts" -> KIND_PIVOT
+//     (the symmetric case).
+//   * Dispatch verifies handler runs prior template against new
+//     kind, LIMIT resets to baseline, history records the pivot
+//     turn with the new kind annotated.
+//   * Public probe voice_followup_kind_pivot_target returns the
+//     matched kind name on KIND_PIVOT inputs, "" otherwise.
+
+// Headline brief case: "list all FACT" -> "tell me more about RULE
+// atoms" -> KIND_PIVOT. Matches RULE in known kinds; new query
+// fires with kind=RULE, limit=10.
+fn test_kind_pivot_more_about_rule_atoms_after_fact() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about RULE atoms' after FACT -> KIND_PIVOT",
+        voice_followup_classify(s, "tell me more about RULE atoms"),
+        vc_followup_kind_pivot())
+    ce_str_eq("target kind = RULE",
+        voice_followup_kind_pivot_target(s, "tell me more about RULE atoms"),
+        "RULE")
+}
+
+// Headline brief case via morphology: "list all FACT" -> "tell me
+// more about that atom in the rule engine" -> KIND_PIVOT. Matches
+// "rule" via morphology against known kind RULE. (This is the
+// R29C-documented failure case that R30F honestly left as PIVOT.)
+fn test_kind_pivot_rule_engine_after_fact() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about that atom in the rule engine' after FACT -> KIND_PIVOT",
+        voice_followup_classify(s,
+            "tell me more about that atom in the rule engine"),
+        vc_followup_kind_pivot())
+    ce_str_eq("target kind = RULE (via morphology)",
+        voice_followup_kind_pivot_target(s,
+            "tell me more about that atom in the rule engine"),
+        "RULE")
+}
+
+// Symmetric case: "list all RULE" -> "tell me more about facts"
+// -> KIND_PIVOT (matches "fact" via morphology against kind FACT).
+fn test_kind_pivot_more_about_facts_after_rule() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all RULE")
+    ce_eq("'tell me more about facts' after RULE -> KIND_PIVOT",
+        voice_followup_classify(s, "tell me more about facts"),
+        vc_followup_kind_pivot())
+    ce_str_eq("target kind = FACT (via morphology)",
+        voice_followup_kind_pivot_target(s, "tell me more about facts"),
+        "FACT")
+}
+
+// Negative case: "list all FACT" -> "tell me more about cats" stays
+// PIVOT. "cats" isn't a known kind so no KIND_PIVOT signal.
+fn test_kind_pivot_more_about_cats_stays_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about cats' after FACT -> PIVOT (no known kind)",
+        voice_followup_classify(s, "tell me more about cats"),
+        vc_followup_pivot())
+    ce_str_eq("target kind = '' (no match)",
+        voice_followup_kind_pivot_target(s, "tell me more about cats"),
+        "")
+}
+
+// Edge case: "list all FACT" -> "tell me more" still CONTINUE.
+// No remainder, no KIND_PIVOT signal.
+fn test_kind_pivot_bare_more_stays_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more' after FACT -> CONTINUE (no remainder)",
+        voice_followup_classify(s, "tell me more"),
+        vc_followup_continue())
+}
+
+// Same-kind remainder: "list all FACT" -> "tell me more about facts"
+// stays CONTINUE. Even though "facts" stems to "fact" which is a
+// known kind, it EQUALS the prior kind, so the KIND_PIVOT pass
+// returns empty and the CONTINUE branch fires via weighted Jaccard
+// (kind word match).
+fn test_kind_pivot_same_kind_remainder_stays_continue() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about facts' after FACT -> CONTINUE (same kind)",
+        voice_followup_classify(s, "tell me more about facts"),
+        vc_followup_continue())
+    ce_str_eq("target kind = '' (no kind pivot for same-kind)",
+        voice_followup_kind_pivot_target(s, "tell me more about facts"),
+        "")
+}
+
+// Anaphora preserved: "describe it" / "the first one" still ANAPHORA
+// even with the new KIND_PIVOT logic in place. (Anaphora has highest
+// priority in the classifier.)
+fn test_kind_pivot_anaphora_paths_unchanged() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'describe it' after FACT -> ANAPHORA (preserved)",
+        voice_followup_classify(s, "describe it"),
+        vc_followup_anaphora())
+    ce_eq("'the first one' after FACT -> ANAPHORA (preserved)",
+        voice_followup_classify(s, "the first one"),
+        vc_followup_anaphora())
+    ce_eq("'describe the first one' after FACT -> ANAPHORA (preserved)",
+        voice_followup_classify(s, "describe the first one"),
+        vc_followup_anaphora())
+}
+
+// Probe: kind_pivot_target returns "" when input doesn't classify
+// to KIND_PIVOT (no prior, anaphora, CONTINUE, generic PIVOT).
+fn test_kind_pivot_target_returns_empty_on_non_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // No prior -> "".
+    ce_str_eq("no prior -> ''",
+        voice_followup_kind_pivot_target(s, "tell me more about RULE"),
+        "")
+    vc_session_turn(kg, s, "list all FACT")
+    // CONTINUE inputs -> "".
+    ce_str_eq("bare 'tell me more' -> ''",
+        voice_followup_kind_pivot_target(s, "tell me more"),
+        "")
+    ce_str_eq("anaphora 'describe it' -> ''",
+        voice_followup_kind_pivot_target(s, "describe it"),
+        "")
+    // Generic PIVOT input -> "".
+    ce_str_eq("'tell me more about cats' -> ''",
+        voice_followup_kind_pivot_target(s, "tell me more about cats"),
+        "")
+}
+
+// Probe: explicit "what about KIND" path -- target lookup returns
+// the kind even though the path doesn't traverse the more-cue
+// remainder scanner.
+fn test_kind_pivot_target_what_about_path() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_str_eq("'what about CONCEPT' target = CONCEPT",
+        voice_followup_kind_pivot_target(s, "what about CONCEPT"),
+        "CONCEPT")
+    ce_str_eq("'how about SKILL' target = SKILL",
+        voice_followup_kind_pivot_target(s, "how about SKILL"),
+        "SKILL")
+    ce_str_eq("'what about FACT' target = '' (same kind)",
+        voice_followup_kind_pivot_target(s, "what about FACT"),
+        "")
+}
+
+// Dispatch: KIND_PIVOT re-runs prior LIST_ALL template against new
+// kind. Response matches the fresh-LIST_ALL-on-RULE shape; LIMIT
+// resets to baseline 10 (NOT escalated). History captures both
+// turns (no session reset on KIND_PIVOT, unlike generic PIVOT).
+fn test_dispatch_kind_pivot_runs_fresh_query() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    vc_session_turn(kg, s, "tell me more")  // limit -> 20
+    ce_eq("pre-pivot: limit escalated to 20",
+        vc_session_last_limit(s), 20)
+    let r = vc_session_turn(kg, s, "tell me more about RULE atoms")
+    let txt = vc_session_result_text(r)
+    // KG has zero RULE atoms; LIST_ALL RULE returns empty.
+    ce_str_eq("KIND_PIVOT runs LIST_ALL RULE",
+        txt, "No RULE atoms found.")
+    ce_eq("post-kind-pivot: limit reset to base 10 (NOT escalated)",
+        vc_session_last_limit(s), 10)
+    ce_str_eq("post-kind-pivot: kind annotated as RULE",
+        vc_session_last_kind(s), "RULE")
+    ce_eq("post-kind-pivot: template LIST_ALL preserved",
+        vc_session_last_template(s), vc_template_list_all())
+    // KIND_PIVOT does NOT reset history (unlike generic PIVOT). The
+    // FACT turn + tell-me-more turn + kind-pivot turn = 3 turns.
+    ce_eq("post-kind-pivot: history has 3 turns",
+        len(vc_session_history(s)), 3)
+}
+
+// Dispatch: morphology-routed KIND_PIVOT runs new query.
+// "list all FACT" -> "tell me more about that atom in the rule engine"
+// dispatches to LIST_ALL RULE (the R29C failure-case fix).
+fn test_dispatch_kind_pivot_via_morphology() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s,
+        "tell me more about that atom in the rule engine")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("morphology-routed KIND_PIVOT runs LIST_ALL RULE",
+        txt, "No RULE atoms found.")
+    ce_str_eq("post: kind RULE (was FACT)",
+        vc_session_last_kind(s), "RULE")
+    ce_eq("post: limit baseline 10",
+        vc_session_last_limit(s), 10)
+}
+
+// Dispatch: KIND_PIVOT via explicit "what about KIND" path matches
+// the byte-identical end state of the previous R29C/R30F
+// "PIVOT via what-about" behaviour. End-state response text +
+// kind + template + LIMIT must be identical.
+fn test_dispatch_kind_pivot_what_about_matches_prior_endstate() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    let r = vc_session_turn(kg, s, "what about CONCEPT")
+    let txt = vc_session_result_text(r)
+    // KG has 2 CONCEPT atoms at ids 3, 4.
+    ce_str_eq("'what about CONCEPT' -> LIST_ALL CONCEPT (byte-identical)",
+        txt, "Found 2 CONCEPT atoms: ids 3, 4.")
+    ce_str_eq("kind CONCEPT", vc_session_last_kind(s), "CONCEPT")
+    ce_eq("template LIST_ALL preserved",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_eq("limit baseline 10", vc_session_last_limit(s), 10)
+}
+
+// Multi-kind ambiguous remainder: R31F shipped "first kind wins" and
+// documented the brief alternative ("clarify"). R32F lands the
+// clarifying-question path; the classifier now returns CLARIFY when
+// the remainder names 2+ known kinds (with `CE_VOICE_NO_CLARIFY`
+// unset). The target probe `voice_followup_kind_pivot_target` still
+// returns the first-match kind ("FACT") -- it walks
+// `_vd_remainder_known_kind` regardless of the classifier label so
+// the env-opt-out CE_VOICE_NO_CLARIFY=1 path (which routes via
+// KIND_PIVOT) sees the same first-match target.
+//
+// R32F UPDATE: prior expected on classify was vc_followup_kind_pivot();
+// the target accessor is unchanged from R31F.
+fn test_kind_pivot_multi_kind_ambiguous_picks_first() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    ce_eq("'more facts and rules' after CONCEPT -> CLARIFY (R32F)",
+        voice_followup_classify(s, "more facts and rules"),
+        vc_followup_clarify())
+    ce_str_eq("'more facts and rules' target = FACT (first in tokeniser order; preserved)",
+        voice_followup_kind_pivot_target(s, "more facts and rules"),
+        "FACT")
+}
+
+// Negative: "and dogs" stays PIVOT (no known kind, no kind-pivot).
+fn test_kind_pivot_and_dogs_stays_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'and dogs' after FACT -> PIVOT (no known kind)",
+        voice_followup_classify(s, "and dogs"),
+        vc_followup_pivot())
+}
+
+// Sanity: "and CONCEPT" after FACT routes via the more-cue path
+// (since "and X" lands there) and the remainder names a known
+// kind != prior, so it's KIND_PIVOT.
+fn test_kind_pivot_and_concept_after_fact() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'and CONCEPT' after FACT -> KIND_PIVOT",
+        voice_followup_classify(s, "and CONCEPT"),
+        vc_followup_kind_pivot())
+    ce_str_eq("target CONCEPT",
+        voice_followup_kind_pivot_target(s, "and CONCEPT"),
+        "CONCEPT")
+}
+
+// ---- R25B.6 multi-kind clarifying question (R32F / R31F.2) -------------
+//
+// R31F's exit report explicitly named the deferred fix: "multi-kind
+// ambiguous remainder ('more facts and rules' after CONCEPT finds TWO
+// known kinds). `_vd_remainder_known_kind` returns the FIRST match in
+// tokeniser order... future fix would add a confidence threshold or an
+// explicit disambiguation turn."
+//
+// R32F implements option (b/c hybrid): a new classifier output
+// `VC_FOLLOWUP_CLARIFY` fires when the more-cue remainder names 2+
+// known kinds (unless CE_VOICE_NO_CLARIFY=1 forces R31F's first-match
+// fallback). The dispatcher emits "Did you mean RULE or FACT atoms?"
+// and stashes the candidates in a new session slot; the NEXT user turn
+// is parsed as a kind-selector first (bare kind name, morphology
+// phrase, or "both" / "either" / "all" -> first-match shortcut). After
+// VC_DIALOG_CLARIFY_MAX_ATTEMPTS (2) failed resolution turns we give
+// up and route as PIVOT with an apologetic message + first-match
+// dispatch so the operator still gets a usable answer.
+//
+// Coverage: 25+ new assertions across 15 new test functions.
+
+// New classifier output -- the accessor returns 5 (next after the four
+// existing classes).
+fn test_clarify_constant_distinct() {
+    ce_eq("CLARIFY constant = 5",
+        vc_followup_clarify(), 5)
+    // Existing four still distinct.
+    ce_eq("NONE = 0", vc_followup_none(), 0)
+    ce_eq("CONTINUE = 1", vc_followup_continue(), 1)
+    ce_eq("PIVOT = 2", vc_followup_pivot(), 2)
+    ce_eq("ANAPHORA = 3", vc_followup_anaphora(), 3)
+    ce_eq("KIND_PIVOT = 4", vc_followup_kind_pivot(), 4)
+}
+
+// Max-attempts cap accessor -- exposes the constant so tests can
+// drive the give-up path deterministically.
+fn test_clarify_max_attempts_accessor() {
+    ce_eq("max-attempts cap = 2",
+        vc_dialog_clarify_max_attempts(), 2)
+}
+
+// Multi-kind detector: deduplicated UPPER-CASE list in tokeniser order.
+fn test_multi_kind_detector_two_kinds() {
+    let now = list_new()
+    push(now, "fact")
+    push(now, "rule")
+    let kinds = vc_remainder_known_kinds_all(now, "CONCEPT")
+    ce_eq("two-kind remainder -> len 2", len(kinds), 2)
+    ce_str_eq("first kind = FACT", kinds[0], "FACT")
+    ce_str_eq("second kind = RULE", kinds[1], "RULE")
+}
+
+fn test_multi_kind_detector_dedup() {
+    // "more rules and rule atoms" stems both "rules" + "rule" to "rule"
+    // so the detector only emits RULE once.
+    let now = list_new()
+    push(now, "rule")
+    push(now, "rule")
+    push(now, "atom")
+    let kinds = vc_remainder_known_kinds_all(now, "FACT")
+    ce_eq("dedup multi-mention -> len 1", len(kinds), 1)
+    ce_str_eq("only RULE", kinds[0], "RULE")
+}
+
+fn test_multi_kind_detector_excludes_prior() {
+    // Prior CONCEPT; remainder names CONCEPT + RULE; only RULE survives
+    // the exclude filter.
+    let now = list_new()
+    push(now, "concept")
+    push(now, "rule")
+    let kinds = vc_remainder_known_kinds_all(now, "CONCEPT")
+    ce_eq("exclude prior CONCEPT -> len 1", len(kinds), 1)
+    ce_str_eq("only RULE", kinds[0], "RULE")
+}
+
+fn test_multi_kind_detector_three_kinds() {
+    // "facts and rules and concepts" after SKILL -> all three.
+    let now = list_new()
+    push(now, "fact")
+    push(now, "rule")
+    push(now, "concept")
+    let kinds = vc_remainder_known_kinds_all(now, "SKILL")
+    ce_eq("three-kind remainder -> len 3", len(kinds), 3)
+    ce_str_eq("[0] FACT", kinds[0], "FACT")
+    ce_str_eq("[1] RULE", kinds[1], "RULE")
+    ce_str_eq("[2] CONCEPT", kinds[2], "CONCEPT")
+}
+
+fn test_multi_kind_detector_no_match() {
+    let now = list_new()
+    push(now, "cat")
+    push(now, "dog")
+    let kinds = vc_remainder_known_kinds_all(now, "FACT")
+    ce_eq("no known kinds -> empty list", len(kinds), 0)
+}
+
+// Headline classifier: "list all CONCEPT" + "tell me more about facts
+// and rules" -> CLARIFY (TWO known kinds in remainder).
+fn test_clarify_classifier_two_kinds() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    ce_eq("'tell me more about facts and rules' after CONCEPT -> CLARIFY",
+        voice_followup_classify(s, "tell me more about facts and rules"),
+        vc_followup_clarify())
+}
+
+// Clarify-candidates probe -- returns the deduplicated UPPER-CASE
+// list in tokeniser order on CLARIFY inputs.
+fn test_clarify_candidates_probe_two_kinds() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    let cands = voice_followup_clarify_candidates(s,
+        "tell me more about facts and rules")
+    ce_eq("two candidates", len(cands), 2)
+    ce_str_eq("[0] FACT", cands[0], "FACT")
+    ce_str_eq("[1] RULE", cands[1], "RULE")
+}
+
+// Negative -- single-kind remainder still routes KIND_PIVOT (not
+// CLARIFY) so R31F's behaviour is preserved.
+fn test_clarify_single_kind_still_kind_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about RULE atoms' after FACT still KIND_PIVOT",
+        voice_followup_classify(s, "tell me more about RULE atoms"),
+        vc_followup_kind_pivot())
+    let cands = voice_followup_clarify_candidates(s,
+        "tell me more about RULE atoms")
+    ce_eq("clarify candidates empty for single-kind", len(cands), 0)
+}
+
+// Negative -- no-known-kind remainder still routes PIVOT.
+fn test_clarify_no_kind_still_pivot() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    ce_eq("'tell me more about cats' after FACT still PIVOT",
+        voice_followup_classify(s, "tell me more about cats"),
+        vc_followup_pivot())
+}
+
+// Render -- "Did you mean RULE or FACT atoms?" for 2 candidates.
+fn test_clarify_render_two() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("render two candidates",
+        vc_render_clarify_question(cands),
+        "Did you mean RULE or FACT atoms?")
+}
+
+// Render -- "Did you mean RULE, FACT, or CONCEPT atoms?" for 3.
+fn test_clarify_render_three() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    push(cands, "CONCEPT")
+    ce_str_eq("render three candidates",
+        vc_render_clarify_question(cands),
+        "Did you mean RULE, FACT, or CONCEPT atoms?")
+}
+
+// Kind-selector resolver -- bare uppercase name resolves.
+fn test_clarify_selector_bare_upper_kind() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("'RULE' resolves to RULE",
+        vc_resolve_clarify_selector("RULE", cands), "RULE")
+    ce_str_eq("'FACT' resolves to FACT",
+        vc_resolve_clarify_selector("FACT", cands), "FACT")
+}
+
+// Kind-selector resolver -- bare lowercase name resolves via upcase.
+fn test_clarify_selector_bare_lower_kind() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("'rule' resolves to RULE (case-insensitive)",
+        vc_resolve_clarify_selector("rule", cands), "RULE")
+    ce_str_eq("'fact' resolves to FACT",
+        vc_resolve_clarify_selector("fact", cands), "FACT")
+}
+
+// Kind-selector resolver -- natural phrase via morphology.
+fn test_clarify_selector_natural_phrase() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("'the rules' resolves to RULE via morphology",
+        vc_resolve_clarify_selector("the rules", cands), "RULE")
+    ce_str_eq("'facts please' resolves to FACT",
+        vc_resolve_clarify_selector("facts please", cands), "FACT")
+    ce_str_eq("'I want the rules thanks' resolves to RULE",
+        vc_resolve_clarify_selector("I want the rules thanks", cands),
+        "RULE")
+}
+
+// Kind-selector resolver -- "both" maps to first candidate.
+fn test_clarify_selector_both_first_candidate() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("'both' -> first candidate RULE",
+        vc_resolve_clarify_selector("both", cands), "RULE")
+    ce_str_eq("'either' -> first candidate RULE",
+        vc_resolve_clarify_selector("either", cands), "RULE")
+    ce_str_eq("'all of them' -> first candidate RULE",
+        vc_resolve_clarify_selector("all of them", cands), "RULE")
+    ce_str_eq("'both please' -> RULE",
+        vc_resolve_clarify_selector("both please", cands), "RULE")
+}
+
+// Kind-selector resolver -- non-kind tokens fall through.
+fn test_clarify_selector_unresolved_fall_through() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("'cats' -> '' (no kind)",
+        vc_resolve_clarify_selector("cats", cands), "")
+    ce_str_eq("'I do not know' -> '' (no kind)",
+        vc_resolve_clarify_selector("I do not know", cands), "")
+}
+
+// Kind-selector resolver -- kind not in candidates returns "".
+fn test_clarify_selector_kind_not_in_candidates() {
+    let cands = list_new()
+    push(cands, "RULE")
+    push(cands, "FACT")
+    ce_str_eq("'CONCEPT' not in candidates -> ''",
+        vc_resolve_clarify_selector("CONCEPT", cands), "")
+}
+
+// Session-bookkeeping -- vc_session_new initialises pending-clarify
+// slots empty.
+fn test_clarify_session_new_pending_empty() {
+    let s = vc_session_new()
+    ce_eq("pending kinds empty",
+        len(vc_session_pending_clarify_kinds(s)), 0)
+    ce_eq("pending tpl UNKNOWN",
+        vc_session_pending_clarify_template(s),
+        vc_template_unknown())
+    ce_eq("pending attempts 0",
+        vc_session_pending_clarify_attempts(s), 0)
+    ce_str_eq("pending raw ''",
+        vc_session_pending_clarify_raw(s), "")
+    ce_eq("not in pending state",
+        vc_session_is_pending_clarify(s), 0)
+}
+
+// Session-bookkeeping -- reset clears pending-clarify slots.
+fn test_clarify_session_reset_clears_pending() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")  // triggers clarify
+    ce_eq("post-clarify: in pending state",
+        vc_session_is_pending_clarify(s), 1)
+    vc_session_reset(s)
+    ce_eq("post-reset: pending kinds empty",
+        len(vc_session_pending_clarify_kinds(s)), 0)
+    ce_eq("post-reset: not pending",
+        vc_session_is_pending_clarify(s), 0)
+}
+
+// Dispatch -- CLARIFY emits the question text + stashes candidates.
+fn test_dispatch_clarify_emits_question_and_stashes() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    let r = vc_session_turn(kg, s, "more facts and rules")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("clarify question text",
+        txt, "Did you mean FACT or RULE atoms?")
+    // Session is now mid-clarify.
+    ce_eq("session is pending clarify",
+        vc_session_is_pending_clarify(s), 1)
+    let pending = vc_session_pending_clarify_kinds(s)
+    ce_eq("two candidates stashed", len(pending), 2)
+    ce_str_eq("[0] FACT", pending[0], "FACT")
+    ce_str_eq("[1] RULE", pending[1], "RULE")
+    ce_eq("pending template = LIST_ALL",
+        vc_session_pending_clarify_template(s),
+        vc_template_list_all())
+    ce_eq("attempts = 1 (first clarify emitted)",
+        vc_session_pending_clarify_attempts(s), 1)
+    // Prior CONCEPT context is preserved -- no session reset.
+    ce_str_eq("prior kind preserved CONCEPT",
+        vc_session_last_kind(s), "CONCEPT")
+    ce_eq("history still has the CONCEPT turn",
+        len(vc_session_history(s)), 1)
+}
+
+// Dispatch -- next-turn "RULE" resolves and dispatches KIND_PIVOT.
+fn test_dispatch_clarify_next_turn_rule_resolves() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")  // emits clarify
+    ce_eq("mid-clarify", vc_session_is_pending_clarify(s), 1)
+    let r = vc_session_turn(kg, s, "RULE")
+    let txt = vc_session_result_text(r)
+    // KG has zero RULE atoms.
+    ce_str_eq("'RULE' resolves -> LIST_ALL RULE response",
+        txt, "No RULE atoms found.")
+    ce_eq("no longer pending",
+        vc_session_is_pending_clarify(s), 0)
+    ce_str_eq("kind RULE after resolution",
+        vc_session_last_kind(s), "RULE")
+    ce_eq("template LIST_ALL preserved",
+        vc_session_last_template(s),
+        vc_template_list_all())
+    ce_eq("limit reset to baseline 10",
+        vc_session_last_limit(s), 10)
+}
+
+// Dispatch -- next-turn "the facts" resolves via morphology.
+fn test_dispatch_clarify_next_turn_morphology_resolves() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")
+    let r = vc_session_turn(kg, s, "the facts")
+    let txt = vc_session_result_text(r)
+    // KG has 3 FACT atoms.
+    ce_str_eq("'the facts' morphology -> LIST_ALL FACT",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("no longer pending",
+        vc_session_is_pending_clarify(s), 0)
+    ce_str_eq("kind FACT after resolution",
+        vc_session_last_kind(s), "FACT")
+}
+
+// Dispatch -- next-turn "both" picks first candidate (documented).
+fn test_dispatch_clarify_next_turn_both_picks_first() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")
+    // Stashed order is [FACT, RULE]; "both" -> FACT.
+    let r = vc_session_turn(kg, s, "both")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("'both' -> LIST_ALL FACT (first candidate)",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_str_eq("kind FACT (first)",
+        vc_session_last_kind(s), "FACT")
+}
+
+// Dispatch -- next-turn "cats" doesn't resolve; re-emit clarify.
+fn test_dispatch_clarify_next_turn_unresolved_re_emits() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")
+    let r = vc_session_turn(kg, s, "cats")
+    let txt = vc_session_result_text(r)
+    // The reduced-patience re-clarify prefixes "Please answer with
+    // the kind name."
+    ce_str_eq("re-clarify with reduced patience",
+        txt,
+        "Please answer with the kind name. Did you mean FACT or RULE atoms?")
+    ce_eq("still pending",
+        vc_session_is_pending_clarify(s), 1)
+    ce_eq("attempts bumped to 2",
+        vc_session_pending_clarify_attempts(s), 2)
+}
+
+// Dispatch -- give up after MAX attempts.
+fn test_dispatch_clarify_give_up_after_max_attempts() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")  // attempts=1
+    vc_session_turn(kg, s, "cats")                  // attempts=2, re-clarify
+    // Third turn: still no resolution. attempts would go to 3 which
+    // exceeds MAX (2); give-up path fires.
+    let r = vc_session_turn(kg, s, "dogs")
+    let txt = vc_session_result_text(r)
+    // The give-up apology + first-match dispatch are joined into one
+    // response. First candidate = FACT; KG has 3 FACTs.
+    ce_str_eq("give-up apology + first-match dispatch",
+        txt,
+        "Sorry, I could not tell which kind you meant. Showing FACT atoms by default. Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("no longer pending",
+        vc_session_is_pending_clarify(s), 0)
+    ce_str_eq("kind FACT (first-match fallback)",
+        vc_session_last_kind(s), "FACT")
+}
+
+// Dispatch -- topic-shift mid-clarify cancels pending.
+fn test_dispatch_clarify_topic_shift_cancels() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")
+    vc_session_turn(kg, s, "more facts and rules")
+    ce_eq("mid-clarify",
+        vc_session_is_pending_clarify(s), 1)
+    let r = vc_session_turn(kg, s, "never mind")
+    let txt = vc_session_result_text(r)
+    ce_str_eq("'never mind' acknowledged",
+        txt, "Okay, let us change the topic. What would you like to know?")
+    ce_eq("no longer pending (reset cleared it)",
+        vc_session_is_pending_clarify(s), 0)
+    ce_eq("history wiped", len(vc_session_history(s)), 0)
+}
+
+// Brief full chain: list all CONCEPT -> CLARIFY -> RULE -> new query.
+fn test_clarify_full_chain_concept_clarify_rule() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r1 = vc_session_turn(kg, s, "list all CONCEPT")
+    ce_str_eq("turn 1: LIST_ALL CONCEPT",
+        vc_session_result_text(r1),
+        "Found 2 CONCEPT atoms: ids 3, 4.")
+    let r2 = vc_session_turn(kg, s, "tell me more about facts and rules")
+    ce_str_eq("turn 2: clarify question",
+        vc_session_result_text(r2),
+        "Did you mean FACT or RULE atoms?")
+    let r3 = vc_session_turn(kg, s, "RULE")
+    ce_str_eq("turn 3: 'RULE' resolves -> LIST_ALL RULE",
+        vc_session_result_text(r3), "No RULE atoms found.")
+    ce_str_eq("post-chain: kind RULE",
+        vc_session_last_kind(s), "RULE")
+}
+
+// CLARIFY produces no history entry of its own -- the pending state
+// is what carries the turn forward. (History only grows on resolved
+// or fresh-parsed turns.)
+fn test_clarify_no_history_growth_on_clarify_emission() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all CONCEPT")  // history = 1
+    vc_session_turn(kg, s, "more facts and rules")  // CLARIFY emit
+    ce_eq("history still 1 after CLARIFY emit",
+        len(vc_session_history(s)), 1)
+    vc_session_turn(kg, s, "RULE")  // resolution -> _vd_pivot_turn
+    // _vd_pivot_turn appends one turn entry on resolution.
+    ce_eq("history grows to 2 on resolution",
+        len(vc_session_history(s)), 2)
+}
+
+// Env opt-out: CE_VOICE_NO_CLARIFY=1 falls back to R31F's first-match
+// KIND_PIVOT byte-identically. We can't directly set env vars from
+// the test runner, but the public probe `vc_clarify_suppressed_by_env`
+// exposes the suppression decision so the test framework can verify
+// the wiring is in place. The runtime opt-out is exercised in the
+// integration scenario.
+fn test_clarify_env_opt_out_probe_default_off() {
+    // In the test runner the env var is not set -> probe returns 0.
+    ce_eq("default: clarify NOT suppressed",
+        vc_clarify_suppressed_by_env(), 0)
+}
+
+// Multi-kind detector "and" cue case: "and facts and rules" after
+// SKILL -> CLARIFY with FACT + RULE candidates.
+fn test_clarify_and_cue_multi_kind() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all SKILL")
+    ce_eq("'and facts and rules' after SKILL -> CLARIFY",
+        voice_followup_classify(s, "and facts and rules"),
+        vc_followup_clarify())
+    let cands = voice_followup_clarify_candidates(s,
+        "and facts and rules")
+    ce_eq("two candidates", len(cands), 2)
+}
+
+// Same-kind multi-mention is NOT clarify -- "and rules and rule
+// atoms" stems both to RULE; that's a single kind, not multi.
+fn test_clarify_same_kind_multi_mention_not_clarify() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn(kg, s, "list all FACT")
+    // Remainder has two mentions of RULE (rules + rule). Detector
+    // dedups -> single kind. Classifier returns KIND_PIVOT.
+    ce_eq("'more rules and rule atoms' after FACT -> KIND_PIVOT",
+        voice_followup_classify(s, "more rules and rule atoms"),
+        vc_followup_kind_pivot())
+}
+
+// Probe parity -- candidates is always empty when there's no prior
+// (defensive parity with kind_pivot_target).
+fn test_clarify_candidates_no_prior_empty() {
+    let s = vc_session_new()
+    let cands = voice_followup_clarify_candidates(s,
+        "tell me more about facts and rules")
+    ce_eq("no prior -> empty candidates", len(cands), 0)
+}
+
+// ---- R34D: STT confidence threshold + clarifying-question fallback ------
+//
+// R34D adds a "did I hear you?" gate in front of the dialog state
+// machine. When the STT seam reports confidence < threshold (default
+// 0.5 milli == 500), the dialog returns "I did not catch that clearly.
+// Could you repeat?" instead of advancing the state machine. The env
+// `CE_VOICE_STT_CONF_THRESHOLD` overrides the threshold; values are
+// integer-percent (50 = 0.5 = 500 milli, 70 = 0.7 = 700 milli).
+//
+// We do NOT exercise real STT here -- the new `vc_session_turn_with_
+// confidence(kg, session, transcript, conf_milli)` takes a plumbed
+// confidence so the dialog policy is the unit under test. The
+// integration scenario covers the WAV roundtrip.
+
+// Default-threshold env-resolved value: the test runner does NOT set
+// `CE_VOICE_STT_CONF_THRESHOLD`, so the resolver should return the
+// documented default 500 (= 0.5).
+fn test_r34d_default_threshold_is_500_milli() {
+    ce_eq("default STT threshold is 500 milli (0.5)",
+        vc_voice_stt_threshold_milli(), 500)
+}
+
+// Threshold-parser corner cases. We hit `_vd_parse_threshold_env`
+// directly (well, via its `vc_voice_stt_threshold_milli` wrapper) by
+// going through a helper that constructs synthetic env strings. NOVA's
+// test runner has no portable setenv, but we CAN test the pure
+// `_vd_parse_threshold_env` via... actually there's no public probe.
+// We test the wired path indirectly via the dispatch tests below
+// (which use `vc_session_turn_with_confidence` directly).
+
+// Clarify text is the canonical sentence -- byte-identical assertion.
+fn test_r34d_clarify_text_is_canonical() {
+    ce_str_eq("R34D clarify text",
+        vc_voice_stt_clarify_text(),
+        "I did not catch that clearly. Could you repeat?")
+}
+
+// New sessions report -1 last_stt_confidence (sentinel for "no STT
+// result threaded yet"). This is the legacy `vc_session_turn` path's
+// behaviour -- it doesn't have a confidence to plumb.
+fn test_r34d_new_session_stt_confidence_unset() {
+    let s = vc_session_new()
+    ce_eq("new session: last_stt_confidence = -1",
+        vc_session_last_stt_confidence(s), 0 - 1)
+}
+
+// vc_session_reset() restores the -1 sentinel. We populate the slot
+// via a high-confidence turn first, then reset, then check.
+fn test_r34d_reset_clears_stt_confidence() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // High-confidence turn: 950 milli is well above the 500 default.
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 950)
+    ce_eq("after high-conf turn: last_stt_confidence = 950",
+        vc_session_last_stt_confidence(s), 950)
+    vc_session_reset(s)
+    ce_eq("post-reset: last_stt_confidence = -1",
+        vc_session_last_stt_confidence(s), 0 - 1)
+}
+
+// High-confidence transcript routes to the existing dialog flow. We
+// pass 950 (0.95) for a "list all FACT" transcript; the response is
+// the canonical R25B sentence, the template moves to LIST_ALL, and
+// last_stt_confidence reflects the high value.
+fn test_r34d_high_confidence_routes_to_normal_dialog() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 950)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("high-conf list all FACT -> normal R25B response",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("high-conf: template advanced to LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_eq("high-conf: last_stt_confidence reflects STT value",
+        vc_session_last_stt_confidence(s), 950)
+}
+
+// Low-confidence transcript routes to the clarify response and does
+// NOT advance the dialog state machine. The session's template stays
+// UNKNOWN, no history is appended, but last_stt_confidence reflects
+// the (low) value so telemetry can see what was reported.
+fn test_r34d_low_confidence_routes_to_clarify() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // 300 milli (0.3) is below the 500 default threshold.
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 300)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("low-conf transcript -> canonical clarify text",
+        txt, "I did not catch that clearly. Could you repeat?")
+    ce_eq("low-conf: template NOT advanced (still UNKNOWN)",
+        vc_session_last_template(s), vc_template_unknown())
+    ce_eq("low-conf: history still empty",
+        len(vc_session_history(s)), 0)
+    ce_eq("low-conf: turn_count NOT bumped",
+        vc_session_turn_count(s), 0)
+    ce_eq("low-conf: last_stt_confidence reflects low value",
+        vc_session_last_stt_confidence(s), 300)
+}
+
+// Exact-threshold case: confidence == threshold routes to the NORMAL
+// path (the gate is strict "<"). 500 == default threshold -> high.
+fn test_r34d_exact_threshold_routes_to_normal() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 500)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("conf == threshold -> normal R25B (strict <)",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("exact-threshold: template advanced to LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+}
+
+// Zero-confidence (STT failure / empty transcript path) routes to
+// clarify. The seam returns 0 confidence for the stub backend and for
+// any whisper-cli error path; the dialog should treat this as "didn't
+// hear you" rather than feeding the placeholder string into the parser.
+fn test_r34d_zero_confidence_empty_transcript_clarifies() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // Pair: empty transcript + 0 confidence -> clarify.
+    let r = vc_session_turn_with_confidence(kg, s, "", 0)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("empty transcript + 0 conf -> clarify text",
+        txt, "I did not catch that clearly. Could you repeat?")
+    ce_eq("zero-conf: history still empty",
+        len(vc_session_history(s)), 0)
+    ce_eq("zero-conf: last_stt_confidence = 0",
+        vc_session_last_stt_confidence(s), 0)
+}
+
+// Boundary: conf = threshold - 1 routes to clarify (just below).
+fn test_r34d_just_below_threshold_clarifies() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 499)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("499 milli (just below) -> clarify",
+        txt, "I did not catch that clearly. Could you repeat?")
+}
+
+// last_stt_confidence reflects the MOST RECENT call, even across
+// multiple turns. We verify it updates on each call regardless of
+// whether the call routed to clarify or normal.
+fn test_r34d_last_stt_confidence_tracks_most_recent() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 900)
+    ce_eq("turn 1: last_stt_confidence = 900",
+        vc_session_last_stt_confidence(s), 900)
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 200)
+    ce_eq("turn 2 (clarify): last_stt_confidence = 200",
+        vc_session_last_stt_confidence(s), 200)
+    vc_session_turn_with_confidence(kg, s, "tell me more", 950)
+    ce_eq("turn 3: last_stt_confidence = 950",
+        vc_session_last_stt_confidence(s), 950)
+}
+
+// After a low-conf turn the dialog state is intact; the NEXT high-conf
+// turn proceeds as if the low-conf turn never happened. This is the
+// key invariant: a misheard utterance doesn't poison subsequent turns.
+fn test_r34d_low_conf_turn_then_high_conf_advances() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // Misheard low-conf turn -- clarifies, no state change.
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 200)
+    ce_eq("post-misheard: template still UNKNOWN",
+        vc_session_last_template(s), vc_template_unknown())
+    // High-conf turn -- proceeds normally.
+    let r2 = vc_session_turn_with_confidence(kg, s, "list all FACT", 900)
+    let txt2 = vc_session_result_text(r2)
+    ce_str_eq("retry high-conf -> normal response",
+        txt2, "Found 3 FACT atoms: ids 0, 1, 2.")
+    ce_eq("retry: template now LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+}
+
+// R31F kind-pivot regression: the kind-pivot routing (R25B.5) still
+// works for high-confidence transcripts. Prior FACT, then a tell-me-
+// more about RULE kind should KIND_PIVOT to RULE.
+fn test_r34d_r31f_kind_pivot_intact_for_high_confidence() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all FACT", 900)
+    ce_eq("prior turn: template LIST_ALL",
+        vc_session_last_template(s), vc_template_list_all())
+    ce_str_eq("prior turn: kind FACT",
+        vc_session_last_kind(s), "FACT")
+    // High-conf KIND_PIVOT to RULE: the more-cue path with "rule" in
+    // the remainder should pivot.
+    let r2 = vc_session_turn_with_confidence(kg, s,
+        "tell me more about RULE atoms", 850)
+    ce_str_eq("R31F kind-pivot intact: kind now RULE",
+        vc_session_last_kind(s), "RULE")
+    let txt2 = vc_session_result_text(r2)
+    // RULE has no atoms in the fixture -> "No RULE atoms found.".
+    ce_str_eq("R31F kind-pivot result text",
+        txt2, "No RULE atoms found.")
+}
+
+// R32F multi-kind clarify regression: an ambiguous remainder (2+
+// known kinds) with high confidence still emits the "Did you mean
+// X or Y?" question. The STT-confidence gate must not interfere with
+// the higher-level R32F multi-kind clarify state machine.
+fn test_r34d_r32f_multi_kind_clarify_intact_for_high_confidence() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all CONCEPT", 900)
+    // Remainder "facts and rules" names two kinds different from
+    // CONCEPT -> CLARIFY classifier emits the "Did you mean...?"
+    let r2 = vc_session_turn_with_confidence(kg, s,
+        "tell me more about facts and rules", 850)
+    let txt2 = vc_session_result_text(r2)
+    ce_str_eq("R32F multi-kind clarify intact",
+        txt2, "Did you mean FACT or RULE atoms?")
+    ce_eq("R32F: pending clarify set",
+        vc_session_is_pending_clarify(s), 1)
+}
+
+// A LOW-conf turn during an active R32F pending-clarify does NOT
+// advance the multi-kind state machine: the operator should be asked
+// to repeat themselves, and the pending-clarify candidates remain
+// intact for the next try.
+fn test_r34d_low_conf_during_pending_clarify_preserves_state() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    vc_session_turn_with_confidence(kg, s, "list all CONCEPT", 900)
+    vc_session_turn_with_confidence(kg, s,
+        "tell me more about facts and rules", 850)
+    // Pending clarify is active. A low-conf "RULE" reply should NOT
+    // resolve it -- the operator might have said something else.
+    ce_eq("pre-low-conf: pending clarify set",
+        vc_session_is_pending_clarify(s), 1)
+    let r3 = vc_session_turn_with_confidence(kg, s, "RULE", 200)
+    let txt3 = vc_session_result_text(r3)
+    ce_str_eq("low-conf during pending clarify -> clarify text",
+        txt3, "I did not catch that clearly. Could you repeat?")
+    // Pending clarify state preserved.
+    ce_eq("post-low-conf: pending clarify still set",
+        vc_session_is_pending_clarify(s), 1)
+}
+
+// Threshold parser unit tests via the wired probe. We can't directly
+// drive the env var from inside NOVA tests (the runner exports a fixed
+// env), but we CAN verify the default path via the public probe + the
+// dispatch tests above. Additionally we run the parser via a synthetic
+// shape: confidence 500 vs 499 around the documented default.
+fn test_r34d_threshold_gate_is_strict_less_than() {
+    let kg = _fixture_kg()
+    let s = vc_session_new()
+    // 500 (== threshold) -> high. Already covered in the exact-
+    // threshold test above; we add a 501 case for parity (above
+    // threshold by 1 milli).
+    let r = vc_session_turn_with_confidence(kg, s, "list all FACT", 501)
+    let txt = vc_session_result_text(r)
+    ce_str_eq("501 milli (above threshold) -> normal",
+        txt, "Found 3 FACT atoms: ids 0, 1, 2.")
+}
+
+// Whisper-side heuristic helper -- explicit unit tests for the pure
+// `whisper_heuristic_confidence_milli` function. Empty transcript +
+// empty error -> 0 (can't be confident in nothing). Non-empty
+// transcript + empty error -> 900 (we got SOMETHING). Any error
+// regardless of transcript -> 0.
+fn test_r34d_heuristic_empty_transcript_is_zero() {
+    ce_eq("heuristic: empty transcript + no error -> 0",
+        whisper_heuristic_confidence_milli("", ""), 0)
+}
+
+fn test_r34d_heuristic_non_empty_transcript_is_900() {
+    ce_eq("heuristic: 'hello' + no error -> 900",
+        whisper_heuristic_confidence_milli("hello", ""), 900)
+}
+
+fn test_r34d_heuristic_error_overrides_transcript() {
+    ce_eq("heuristic: 'hello' + 'binary not found' -> 0",
+        whisper_heuristic_confidence_milli("hello", "binary not found"), 0)
+}
+
+// Direct delegation: vc_session_turn() and vc_session_turn_with_
+// confidence() with a high-conf value should produce byte-identical
+// session state. The STT-confidence wrapper is purely additive on the
+// pass-through path; it must not alter the dialog state machine.
+fn test_r34d_high_conf_path_is_byte_identical_to_session_turn() {
+    let kg1 = _fixture_kg()
+    let s1 = vc_session_new()
+    vc_session_turn(kg1, s1, "list all FACT")
+    let kg2 = _fixture_kg()
+    let s2 = vc_session_new()
+    vc_session_turn_with_confidence(kg2, s2, "list all FACT", 1000)
+    ce_eq("byte-identical template",
+        vc_session_last_template(s1), vc_session_last_template(s2))
+    ce_str_eq("byte-identical kind",
+        vc_session_last_kind(s1), vc_session_last_kind(s2))
+    ce_eq("byte-identical turn_count",
+        vc_session_turn_count(s1), vc_session_turn_count(s2))
+    ce_eq("byte-identical history length",
+        len(vc_session_history(s1)), len(vc_session_history(s2)))
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    // session bookkeeping
+    test_session_new_is_empty()
+    test_session_reset_clears_state()
+    // R25B parity
+    test_single_turn_list_all()
+    test_single_turn_how_many()
+    test_single_turn_unknown_pattern_apology()
+    // tell me more
+    test_more_request_escalates_limit()
+    test_more_request_without_prior_complains()
+    // anaphora
+    test_anaphora_describe_it_resolves_to_first_id()
+    test_anaphora_what_is_it_after_what_is()
+    test_anaphora_without_prior_complains()
+    // ordinal anaphora
+    test_ordinal_second_one_resolves_to_index_1()
+    test_ordinal_what_is_the_third_one()
+    test_ordinal_last_one_resolves_to_tail()
+    // pivot
+    test_pivot_what_about_concept()
+    // topic shift
+    test_topic_shift_actually_resets_and_parses_rest()
+    test_topic_shift_bare_acknowledges_and_resets()
+    // history cap
+    test_history_caps_at_5_turns()
+    // R25B.3 -- topic-shift classifier
+    test_classify_no_prior_returns_none()
+    test_classify_bare_more_is_continue()
+    test_classify_more_with_unrelated_remainder_is_pivot()
+    test_classify_what_about_kind_is_pivot()
+    test_classify_anaphora_priority()
+    test_classify_same_kind_remainder_is_continue()
+    test_classify_describe_with_content_word()
+    test_classify_and_with_unrelated_remainder_is_pivot()
+    test_classify_also_cue_unrelated_is_pivot()
+    // R25B.3 -- 3-turn dispatch fixtures
+    test_three_turn_continue_byte_identical()
+    test_three_turn_pivot_unrelated_remainder()
+    test_three_turn_pivot_what_about_kind()
+    test_three_turn_anaphora_unchanged()
+    test_dispatch_pivot_does_not_escalate_limit()
+    test_r28d_parity_smoke()
+    // R25B.4 -- morphology + weighted Jaccard
+    test_morph_stem_basic_plurals()
+    test_morph_stem_singular_unchanged()
+    test_morph_stem_short_word_preserved()
+    test_morph_stem_suffix_quirks()
+    test_morph_stem_ies_to_y()
+    test_morph_stem_no_trailing_s_unchanged()
+    test_weighted_score_kind_match_double_weight()
+    test_weighted_score_no_kind_match_zero()
+    test_weighted_score_mixed_kind_and_other()
+    test_weighted_score_empty_prior()
+    test_weighted_score_empty_now()
+    test_classify_more_facts_after_fact_is_continue()
+    test_classify_more_rules_after_rule_is_continue()
+    test_classify_r29c_failure_case_after_fact_is_pivot()
+    test_classify_r29c_correct_case_after_rule_is_continue()
+    test_classify_more_about_cats_after_fact_still_pivot()
+    test_classify_what_about_rule_atoms_after_fact_is_pivot()
+    test_classify_weighted_lift_long_remainder()
+    test_classify_and_facts_after_fact_is_continue()
+    test_classify_more_dogs_after_fact_still_pivot()
+    test_dispatch_morphology_continue_escalates_limit()
+    test_dispatch_more_rules_continues_rule_topic()
+    // R25B.5 (R31F / R30F.2) -- kind-pivot routing
+    test_kind_pivot_more_about_rule_atoms_after_fact()
+    test_kind_pivot_rule_engine_after_fact()
+    test_kind_pivot_more_about_facts_after_rule()
+    test_kind_pivot_more_about_cats_stays_pivot()
+    test_kind_pivot_bare_more_stays_continue()
+    test_kind_pivot_same_kind_remainder_stays_continue()
+    test_kind_pivot_anaphora_paths_unchanged()
+    test_kind_pivot_target_returns_empty_on_non_pivot()
+    test_kind_pivot_target_what_about_path()
+    test_dispatch_kind_pivot_runs_fresh_query()
+    test_dispatch_kind_pivot_via_morphology()
+    test_dispatch_kind_pivot_what_about_matches_prior_endstate()
+    test_kind_pivot_multi_kind_ambiguous_picks_first()
+    test_kind_pivot_and_dogs_stays_pivot()
+    test_kind_pivot_and_concept_after_fact()
+    // R25B.6 (R32F / R31F.2) -- multi-kind clarifying question
+    test_clarify_constant_distinct()
+    test_clarify_max_attempts_accessor()
+    test_multi_kind_detector_two_kinds()
+    test_multi_kind_detector_dedup()
+    test_multi_kind_detector_excludes_prior()
+    test_multi_kind_detector_three_kinds()
+    test_multi_kind_detector_no_match()
+    test_clarify_classifier_two_kinds()
+    test_clarify_candidates_probe_two_kinds()
+    test_clarify_single_kind_still_kind_pivot()
+    test_clarify_no_kind_still_pivot()
+    test_clarify_render_two()
+    test_clarify_render_three()
+    test_clarify_selector_bare_upper_kind()
+    test_clarify_selector_bare_lower_kind()
+    test_clarify_selector_natural_phrase()
+    test_clarify_selector_both_first_candidate()
+    test_clarify_selector_unresolved_fall_through()
+    test_clarify_selector_kind_not_in_candidates()
+    test_clarify_session_new_pending_empty()
+    test_clarify_session_reset_clears_pending()
+    test_dispatch_clarify_emits_question_and_stashes()
+    test_dispatch_clarify_next_turn_rule_resolves()
+    test_dispatch_clarify_next_turn_morphology_resolves()
+    test_dispatch_clarify_next_turn_both_picks_first()
+    test_dispatch_clarify_next_turn_unresolved_re_emits()
+    test_dispatch_clarify_give_up_after_max_attempts()
+    test_dispatch_clarify_topic_shift_cancels()
+    test_clarify_full_chain_concept_clarify_rule()
+    test_clarify_no_history_growth_on_clarify_emission()
+    test_clarify_env_opt_out_probe_default_off()
+    test_clarify_and_cue_multi_kind()
+    test_clarify_same_kind_multi_mention_not_clarify()
+    test_clarify_candidates_no_prior_empty()
+    // R34D -- STT confidence threshold + clarifying-question fallback
+    test_r34d_default_threshold_is_500_milli()
+    test_r34d_clarify_text_is_canonical()
+    test_r34d_new_session_stt_confidence_unset()
+    test_r34d_reset_clears_stt_confidence()
+    test_r34d_high_confidence_routes_to_normal_dialog()
+    test_r34d_low_confidence_routes_to_clarify()
+    test_r34d_exact_threshold_routes_to_normal()
+    test_r34d_zero_confidence_empty_transcript_clarifies()
+    test_r34d_just_below_threshold_clarifies()
+    test_r34d_last_stt_confidence_tracks_most_recent()
+    test_r34d_low_conf_turn_then_high_conf_advances()
+    test_r34d_r31f_kind_pivot_intact_for_high_confidence()
+    test_r34d_r32f_multi_kind_clarify_intact_for_high_confidence()
+    test_r34d_low_conf_during_pending_clarify_preserves_state()
+    test_r34d_threshold_gate_is_strict_less_than()
+    test_r34d_heuristic_empty_transcript_is_zero()
+    test_r34d_heuristic_non_empty_transcript_is_900()
+    test_r34d_heuristic_error_overrides_transcript()
+    test_r34d_high_conf_path_is_byte_identical_to_session_turn()
+    ce_summary("voice_dialog")
+}
+
+main()

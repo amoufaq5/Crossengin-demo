@@ -1,0 +1,298 @@
+// Unit tests for src/federation/distributed_query.nova (R20E).
+//
+// Coverage (~25 assertions) -- maps to the brief's required scenarios:
+//   Bootstrap state: dq_init stores gossip ref + zero stats.
+//   Local-only fan-out: dq_query against a SINGLE-soul gossip mesh (no
+//     alive peers) returns LOCAL rows only.
+//   Peer-annotation: each returned row carries the source peer_addr.
+//   Query timeout: timeout enforcement on per-peer evaluation budget.
+//   Bad SPARQL: dq_query returns an empty list and bumps bad_query
+//     counter; does NOT break the dq_state or the gossip ref.
+//   Wire-format helpers: dq_format_binding round-trips through
+//     dq_parse_binding; missing var -> "?"; integer rebuilt from
+//     decimal string.
+//   Merge contract: dq_merge_results concatenates local + peer rows;
+//     duplicates from two peers stay distinct (no semantic dedupe).
+//   dq_pending_queries reflects in-flight queries (and clears them
+//     after dq_query returns).
+//   Stats accessors: dq_stats_queries / dq_stats_peers_ok /
+//     dq_stats_peers_timeout / dq_stats_rows_merged.
+//   _gossip_serve_dquery (the server-side handler in gossip.nova) is
+//     exercised end-to-end by the integration scenario via real
+//     sockets; here we cover its pure-function helpers via the
+//     dq_handle_incoming_query path with an in-memory fd substitute is
+//     impossible -- the call uses real send_data. Instead we verify
+//     the format helpers it relies on (dq_format_binding and the
+//     binding wire round-trip).
+//
+// The unit tests AVOID network I/O -- gossip_init seeds a fake peer
+// table and dq_query's fan-out short-circuits when no peer is alive.
+// The integration scenario in tests/integration/scenario_cccc_distributed_query.sh
+// covers the live-mesh path with real sockets.
+
+import "../ce_test.nova"
+import "../../src/federation/distributed_query.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+
+// ---- fixture ------------------------------------------------------------
+
+// Build a small KG with 3 FACTs (ids 0, 1, 2) and 2 CONCEPTs (ids 3, 4).
+// dq_query against `SELECT ?a WHERE { ?a kind FACT . }` returns 3 rows.
+fn _fixture_kg() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "test_dq")
+    kg_add_atom(kg, ATOM_FACT, "fact_0", 1000)
+    kg_add_atom(kg, ATOM_FACT, "fact_1", 1100)
+    kg_add_atom(kg, ATOM_FACT, "fact_2", 1200)
+    kg_add_atom(kg, ATOM_CONCEPT, "concept_0", 2000)
+    kg_add_atom(kg, ATOM_CONCEPT, "concept_1", 2100)
+    return kg
+}
+
+// Build a single-soul gossip mesh -- no live peers, so dq_query's
+// fan-out is a no-op and returns only the local rows.
+fn _mk_single_soul_dq() {
+    let gs = gossip_init("127.0.0.1:9970", 0)
+    return dq_init(gs)
+}
+
+// ---- bootstrap state ----------------------------------------------------
+
+fn test_init_stores_gossip_ref() {
+    let gs = gossip_init("127.0.0.1:9970", 0)
+    let dq = dq_init(gs)
+    ce_eq("init: pending count is 0", dq_pending_count(dq), 0)
+    ce_eq("init: recent count is 0", dq_recent_count(dq), 0)
+    ce_eq("init: queries counter is 0", dq_stats_queries(dq), 0)
+    ce_eq("init: peers_ok counter is 0", dq_stats_peers_ok(dq), 0)
+    ce_eq("init: peers_timeout counter is 0", dq_stats_peers_timeout(dq), 0)
+}
+
+// ---- local-only fan-out (single-soul mesh) -----------------------------
+
+fn test_dq_query_single_soul_returns_local_only() {
+    let kg = _fixture_kg()
+    let dq = _mk_single_soul_dq()
+    let rows = dq_query(dq, kg, "SELECT ?a WHERE { ?a kind FACT . }", 0)
+    ce_eq("single-soul query returns local FACT rows", len(rows), 3)
+    ce_eq("queries counter bumped", dq_stats_queries(dq), 1)
+    ce_eq("rows_merged bumped to 3", dq_stats_rows_merged(dq), 3)
+}
+
+fn test_dq_query_single_soul_zero_concepts_when_kg_empty() {
+    // Tightly check: a KG with no CONCEPTs returns 0 rows for a
+    // CONCEPT query, even though FACTs exist.
+    let kg = _fixture_kg()
+    let dq = _mk_single_soul_dq()
+    let rows = dq_query(dq, kg, "SELECT ?a WHERE { ?a kind LANG . }", 0)
+    ce_eq("no LANG atoms -> 0 rows", len(rows), 0)
+}
+
+// ---- peer annotation -----------------------------------------------------
+
+fn test_local_rows_annotated_with_self_addr() {
+    let kg = _fixture_kg()
+    let dq = _mk_single_soul_dq()
+    let rows = dq_query(dq, kg, "SELECT ?a WHERE { ?a kind FACT . }", 0)
+    // Every row in the single-soul case must have peer == self_addr.
+    let self_addr = "127.0.0.1:9970"
+    let i = 0
+    let all_annotated = 1
+    while i < len(rows) {
+        if str_eq(rows[i][DQ_R_PEER], self_addr) == 0 { all_annotated = 0 }
+        i = i + 1
+    }
+    ce_eq("every local row carries self_addr provenance", all_annotated, 1)
+}
+
+// ---- query timeout (per-peer budget) ------------------------------------
+
+fn test_dq_query_timeout_with_dead_peer_returns_local_only() {
+    // Construct a mesh with a peer addr that doesn't resolve to a
+    // listening socket. dq_query opens a TCP connection and tcp
+    // refuses (host unreachable on a localhost port no one binds).
+    // The fan-out call ends up bumping peers_timeout; local rows are
+    // returned. A SHORT timeout keeps the test under one second.
+    let bp = list_new()
+    push(bp, "127.0.0.1:9999")
+    let gs = gossip_init("127.0.0.1:9970", bp)
+    let dq = dq_init(gs)
+    let kg = _fixture_kg()
+    let rows = dq_query(dq, kg, "SELECT ?a WHERE { ?a kind FACT . }", 100000000)
+    // Local rows always present (3 FACTs).
+    ce_eq("dead peer: local rows preserved", len(rows), 3)
+    // peers_timeout counter must have advanced (the dial failed OR
+    // the recv timed out -- either way the peer counted as a miss).
+    ce_check("peers_timeout >= 1", dq_stats_peers_timeout(dq) >= 1)
+}
+
+// ---- bad SPARQL ---------------------------------------------------------
+
+fn test_dq_query_bad_sparql_returns_empty_and_bumps_counter() {
+    let kg = _fixture_kg()
+    let dq = _mk_single_soul_dq()
+    let rows = dq_query(dq, kg, "SELECT bogus syntax", 0)
+    ce_eq("bad SPARQL: empty result", len(rows), 0)
+    ce_eq("bad_query counter bumped", dq_stats_bad_query(dq), 1)
+    // The gossip ref and state must be intact -- subsequent calls work.
+    let rows2 = dq_query(dq, kg, "SELECT ?a WHERE { ?a kind FACT . }", 0)
+    ce_eq("subsequent good query still works", len(rows2), 3)
+}
+
+// ---- wire-format helpers ------------------------------------------------
+
+fn test_dq_format_binding_round_trip() {
+    let b = binding_new()
+    binding_set(b, "a", 42)
+    binding_set(b, "b", 100)
+    let vars = list_new()
+    push(vars, "a")
+    push(vars, "b")
+    let line = dq_format_binding(b, vars, "127.0.0.1:9971")
+    ce_check("format_binding starts with DQBIND prefix",
+             _gossip_starts_with(line, "DQBIND ") == 1)
+    let parsed = dq_parse_binding(line)
+    ce_check("parse_binding returns non-zero", parsed != 0)
+    ce_eq("round-trip: peer addr preserved",
+          str_eq(parsed[DQ_R_PEER], "127.0.0.1:9971"), 1)
+    ce_eq("round-trip: binding has a", binding_has(parsed[DQ_R_BINDING], "a"), 1)
+    ce_eq("round-trip: a=42", binding_get(parsed[DQ_R_BINDING], "a"), 42)
+    ce_eq("round-trip: binding has b", binding_has(parsed[DQ_R_BINDING], "b"), 1)
+    ce_eq("round-trip: b=100", binding_get(parsed[DQ_R_BINDING], "b"), 100)
+}
+
+fn test_dq_format_binding_missing_var_emits_question() {
+    let b = binding_new()
+    binding_set(b, "a", 42)
+    let vars = list_new()
+    push(vars, "a")
+    push(vars, "b")    // not in b
+    let line = dq_format_binding(b, vars, "127.0.0.1:9971")
+    let parsed = dq_parse_binding(line)
+    ce_check("parse_binding handles missing var", parsed != 0)
+    ce_eq("missing var not in binding",
+          binding_has(parsed[DQ_R_BINDING], "b"), 0)
+    ce_eq("present var still bound",
+          binding_get(parsed[DQ_R_BINDING], "a"), 42)
+}
+
+fn test_dq_parse_binding_rejects_non_dqbind_line() {
+    let r = dq_parse_binding("RANDOM line garbage")
+    ce_eq("non-DQBIND line returns 0 sentinel", r, 0)
+}
+
+// ---- merge contract -----------------------------------------------------
+
+fn test_dq_merge_concatenates_local_and_peer_rows() {
+    let dq = _mk_single_soul_dq()
+    // Build 2 local rows and 3 peer rows; merge must produce 5 entries
+    // in that order (locals first).
+    let locals = list_new()
+    let b1 = binding_new(); binding_set(b1, "a", 1)
+    let row1 = list_new(); push(row1, b1); push(row1, "self")
+    push(locals, row1)
+    let b2 = binding_new(); binding_set(b2, "a", 2)
+    let row2 = list_new(); push(row2, b2); push(row2, "self")
+    push(locals, row2)
+    let peers = list_new()
+    let b3 = binding_new(); binding_set(b3, "a", 3)
+    let row3 = list_new(); push(row3, b3); push(row3, "127.0.0.1:1")
+    push(peers, row3)
+    let b4 = binding_new(); binding_set(b4, "a", 4)
+    let row4 = list_new(); push(row4, b4); push(row4, "127.0.0.1:2")
+    push(peers, row4)
+    let b5 = binding_new(); binding_set(b5, "a", 5)
+    let row5 = list_new(); push(row5, b5); push(row5, "127.0.0.1:2")
+    push(peers, row5)
+    let merged = dq_merge_results(dq, locals, peers)
+    ce_eq("merge produces 5 rows", len(merged), 5)
+    ce_eq("first row is local self",
+          str_eq(merged[0][DQ_R_PEER], "self"), 1)
+    ce_eq("fourth row is peer 1",
+          str_eq(merged[2][DQ_R_PEER], "127.0.0.1:1"), 1)
+}
+
+fn test_dq_merge_keeps_duplicate_bindings_from_distinct_peers() {
+    // Same binding (a=42) from two different peers must show up
+    // separately. Federation policy: provenance is preserved; the
+    // caller can dedupe semantically if they choose.
+    let dq = _mk_single_soul_dq()
+    let locals = list_new()
+    let peers = list_new()
+    let b1 = binding_new(); binding_set(b1, "a", 42)
+    let row1 = list_new(); push(row1, b1); push(row1, "127.0.0.1:1")
+    push(peers, row1)
+    let b2 = binding_new(); binding_set(b2, "a", 42)
+    let row2 = list_new(); push(row2, b2); push(row2, "127.0.0.1:2")
+    push(peers, row2)
+    let merged = dq_merge_results(dq, locals, peers)
+    ce_eq("merge keeps duplicate-binding-from-distinct-peer rows separate",
+          len(merged), 2)
+    // Each row's peer differs.
+    ce_eq("dup row 1 from peer 1",
+          str_eq(merged[0][DQ_R_PEER], "127.0.0.1:1"), 1)
+    ce_eq("dup row 2 from peer 2",
+          str_eq(merged[1][DQ_R_PEER], "127.0.0.1:2"), 1)
+}
+
+// ---- pending queries ----------------------------------------------------
+
+fn test_dq_pending_queries_cleared_after_query_returns() {
+    let kg = _fixture_kg()
+    let dq = _mk_single_soul_dq()
+    // Before any query: pending list empty.
+    ce_eq("no pending queries at init",
+          len(dq_pending_queries(dq)), 0)
+    dq_query(dq, kg, "SELECT ?a WHERE { ?a kind FACT . }", 0)
+    // After dq_query returns: pending must be cleared.
+    ce_eq("pending cleared after query returns",
+          len(dq_pending_queries(dq)), 0)
+}
+
+// ---- stats line ---------------------------------------------------------
+
+fn test_dq_stats_line_emits_expected_keys() {
+    let dq = _mk_single_soul_dq()
+    let line = dq_stats_line(dq)
+    // Spot-check the prefix is present; emit-line discipline.
+    ce_check("stats_line includes 'dquery:' prefix",
+             _gossip_starts_with(line, "dquery:") == 1)
+}
+
+// ---- format helper for printing rows ------------------------------------
+
+fn test_dq_format_row_emits_peer_and_vars() {
+    let b = binding_new()
+    binding_set(b, "a", 7)
+    let row = list_new()
+    push(row, b)
+    push(row, "127.0.0.1:8770")
+    let vars = list_new()
+    push(vars, "a")
+    let s = dq_format_row(row, vars)
+    ce_check("format_row contains peer addr",
+             _gossip_starts_with(s, "row peer=") == 1)
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    test_init_stores_gossip_ref()
+    test_dq_query_single_soul_returns_local_only()
+    test_dq_query_single_soul_zero_concepts_when_kg_empty()
+    test_local_rows_annotated_with_self_addr()
+    test_dq_query_timeout_with_dead_peer_returns_local_only()
+    test_dq_query_bad_sparql_returns_empty_and_bumps_counter()
+    test_dq_format_binding_round_trip()
+    test_dq_format_binding_missing_var_emits_question()
+    test_dq_parse_binding_rejects_non_dqbind_line()
+    test_dq_merge_concatenates_local_and_peer_rows()
+    test_dq_merge_keeps_duplicate_bindings_from_distinct_peers()
+    test_dq_pending_queries_cleared_after_query_returns()
+    test_dq_stats_line_emits_expected_keys()
+    test_dq_format_row_emits_peer_and_vars()
+    ce_summary("distributed_query")
+}
+
+main()

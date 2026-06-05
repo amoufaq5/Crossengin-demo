@@ -1,0 +1,297 @@
+// CrossEngin reader: co-fire similarity side-index (P2.1).
+//
+// Purpose
+//   A substrate-native similarity signal mined from the moment stream
+//   (ADR-0021): two atoms that recurrently fire in the SAME moment are
+//   functionally close, regardless of whether they have an operator edge or
+//   cross-KG xref between them. The cofire index is a side-table keyed by the
+//   unordered pair {atom_a, atom_b}, counting how many distinct moments their
+//   activations co-appeared.
+//
+//   This module is the storage + query half. The wiring side -- when
+//   ci_record_moment fires -- lives at the moment-storage callsite (the
+//   `loop_memory_step` path that follows ms_capture / settle). Per
+//   NEXT_SESSION.md P14 / Tier-2 #2 follow-up: deferred from P14 because it
+//   needed a side-index; this closes the gap.
+//
+//   Storage: a list of `[atom_a, atom_b, count]` triples, with `atom_a <=
+//   atom_b` canonical so each pair has ONE row. Lookup is a linear scan -- N
+//   is small in practice (a few hundred pairs in the demo runs), and the
+//   builtin map caps at 16 keys (NEXT_SESSION.md blocker #1). A hash index is
+//   deferred until N hurts.
+//
+//   ci_strength(ci, a, b) returns a 0..1000 (milli) similarity, normalized by
+//   the GLOBAL maximum co-fire count: max_count == 1000, half of that == 500.
+//   That way `ci_strength` is comparable to find_neighbors' operator and xref
+//   strengths (every similarity source emits milli) without dividing by the
+//   atom's own activation count (which would penalize rare-but-tightly-bound
+//   pairs).
+//
+//   Normalization care: integer 0..1000 math, no large intermediates. The
+//   ratio is computed as (count * 1000) / max; max is bounded by the
+//   moment-stream length so for any sane run that product stays well below
+//   2^20 (the NOVA codegen pointer-threshold for literals -- the multiplies
+//   would otherwise dispatch through the list_repeat / str_repeat fallback
+//   per NEXT_SESSION.md blocker #11). We additionally early-return for the
+//   trivial cases (max == 0, count == 0, a == b) so the hot path is a single
+//   scan plus a small mul/div.
+//
+// ADRs touched: ADR-0021 (moments are the substrate input record), ADR-0012
+//   (extends the reader's similarity surface).
+// NOVA dependencies: builtins (lists). CrossEngin dependencies:
+//   src/kg/atom_store.nova (handle_new), src/substrate/node_pool_manager.nova
+//   (fp_mul, FP_SCALE).
+
+import "../kg/atom_store.nova"
+
+// ---- index layout ---------------------------------------------------------
+// Each row: [kg_label_a, atom_a, kg_label_b, atom_b, count]. The label-pair
+// preserves cross-KG correctness: two atoms with the same numeric id but in
+// different KGs are NOT the same atom. Canonicalization orders the row so
+// (a < b), preventing duplicate (a,b) vs (b,a) entries.
+let CI_KGA   = 0
+let CI_ATOMA = 1
+let CI_KGB   = 2
+let CI_ATOMB = 3
+let CI_COUNT = 4
+
+// Index header: [CI_TAG, rows, max_count]. max_count is the running global
+// maximum used to normalize ci_strength results -- updated on every record.
+let CI_TAG     = 0
+let CI_ROWS    = 1
+let CI_MAX     = 2
+let CI_OBJ_TAG = 2401
+
+fn ci_new() {
+    let ci = list_new()
+    push(ci, CI_OBJ_TAG)
+    push(ci, list_new())
+    push(ci, 0)
+    return ci
+}
+
+fn ci_size(ci)   { return len(ci[CI_ROWS]) }
+fn ci_max(ci)    { return ci[CI_MAX] }
+
+// Canonical order for a pair. We only need a deterministic total order on
+// (kg_label, atom_id) so each unordered pair has exactly one row -- the EXACT
+// order does not matter for correctness, only stability under swap. We use:
+//   same kg-label -> smaller atom-id first;
+//   else shorter kg-label first;
+//   else (same-length labels) smaller atom-id first.
+// For demo runs (a handful of kgs with distinct labels), this is enough; the
+// matched-pair lookup re-canonicalizes the same way so a row is always found.
+// Returns 1 if (kga, ida) should come first, 0 if (kgb, idb) should.
+fn _ci_a_first(kga, ida, kgb, idb) {
+    if str_eq(kga, kgb) == 1 {
+        if ida <= idb { return 1 }
+        return 0
+    }
+    if len(kga) < len(kgb) { return 1 }
+    if len(kga) > len(kgb) { return 0 }
+    // Same-length, different content -- fall back to atom-id order so the
+    // (kg, id) -> canonical mapping is still stable across calls.
+    if ida <= idb { return 1 }
+    return 0
+}
+
+// Find a canonicalized row by pair-key. Returns the row index, or -1 if absent.
+fn _ci_index(ci, kga, ida, kgb, idb) {
+    let rows = ci[CI_ROWS]
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        if str_eq(r[CI_KGA], kga) == 1 {
+            if r[CI_ATOMA] == ida {
+                if str_eq(r[CI_KGB], kgb) == 1 {
+                    if r[CI_ATOMB] == idb { return i }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Increment the count for a pair (or insert a fresh row). Updates max_count.
+fn _ci_bump(ci, kga, ida, kgb, idb) {
+    // Canonicalize: smaller side first.
+    let kg_left = kga
+    let id_left = ida
+    let kg_right = kgb
+    let id_right = idb
+    if _ci_a_first(kga, ida, kgb, idb) == 0 {
+        kg_left = kgb
+        id_left = idb
+        kg_right = kga
+        id_right = ida
+    }
+    let idx = _ci_index(ci, kg_left, id_left, kg_right, id_right)
+    if idx == -1 {
+        let row = list_new()
+        push(row, kg_left)
+        push(row, id_left)
+        push(row, kg_right)
+        push(row, id_right)
+        push(row, 1)
+        push(ci[CI_ROWS], row)
+        if 1 > ci[CI_MAX] { list_set(ci, CI_MAX, 1) }
+        return 1
+    }
+    let rows = ci[CI_ROWS]
+    let r = rows[idx]
+    let next = r[CI_COUNT] + 1
+    list_set(r, CI_COUNT, next)
+    if next > ci[CI_MAX] { list_set(ci, CI_MAX, next) }
+    return next
+}
+
+// Record a moment's atom set. `kg_label` is the KG label for every atom-id in
+// `atom_ids` (callers that span multiple KGs in one moment can use the
+// _multikg variant). For every unordered pair (i,j), i < j, bump the count.
+// No-op for moments with <2 atoms (a singleton co-fires only with itself,
+// which we ignore: a == b would short-circuit ci_strength to 0 anyway).
+fn ci_record_moment(ci, kg_label, atom_ids) {
+    if ci == 0 { return 0 }
+    if atom_ids == 0 { return 0 }
+    let n = len(atom_ids)
+    if n < 2 { return 0 }
+    let i = 0
+    let pairs = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            _ci_bump(ci, kg_label, atom_ids[i], kg_label, atom_ids[j])
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+// Same as ci_record_moment, but each entry is a [kg_label, atom_id] pair.
+// Used by callers whose moment trace spans multiple KGs (the daemon's
+// reasoning loop, for instance).
+fn ci_record_moment_multikg(ci, pairs) {
+    if ci == 0 { return 0 }
+    if pairs == 0 { return 0 }
+    let n = len(pairs)
+    if n < 2 { return 0 }
+    let i = 0
+    let bumped = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            _ci_bump(ci, pairs[i][0], pairs[i][1], pairs[j][0], pairs[j][1])
+            bumped = bumped + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return bumped
+}
+
+// Raw co-fire count for a pair (0 if unknown). Symmetric.
+fn ci_count(ci, kga, ida, kgb, idb) {
+    if ci == 0 { return 0 }
+    if str_eq(kga, kgb) == 1 {
+        if ida == idb { return 0 }
+    }
+    // Canonicalize lookup direction.
+    let kg_left = kga
+    let id_left = ida
+    let kg_right = kgb
+    let id_right = idb
+    if _ci_a_first(kga, ida, kgb, idb) == 0 {
+        kg_left = kgb
+        id_left = idb
+        kg_right = kga
+        id_right = ida
+    }
+    let idx = _ci_index(ci, kg_left, id_left, kg_right, id_right)
+    if idx == -1 { return 0 }
+    return ci[CI_ROWS][idx][CI_COUNT]
+}
+
+// Normalized strength in 0..1000 (milli) for use as a similarity source in
+// find_neighbors. Strength = (count * 1000) / max_count, with max_count the
+// global running max; rare pairs that co-fire as often as the most-frequent
+// pair get full 1000. Returns 0 for absent pairs or a == b. The (count *
+// 1000) intermediate stays well under NOVA's 2^20 pointer-threshold for the
+// run sizes we care about (max moment trace ~256 atoms; max pair count <<
+// 2000). If a caller pushes that bound we still produce a correct answer --
+// the * is on small integers, not heap labels.
+fn ci_strength(ci, kga, ida, kgb, idb) {
+    if ci == 0 { return 0 }
+    let m = ci[CI_MAX]
+    if m == 0 { return 0 }
+    let c = ci_count(ci, kga, ida, kgb, idb)
+    if c == 0 { return 0 }
+    if c >= m { return 1000 }
+    // Small intermediates only -- avoid the codegen pointer-threshold path.
+    let scaled = c * 1000
+    let s = scaled / m
+    if s < 0 { return 0 }
+    if s > 1000 { return 1000 }
+    return s
+}
+
+// Convenience: strength from handle to handle (the form find_neighbors uses).
+fn ci_strength_h(ci, ha, hb) {
+    if ha == 0 { return 0 }
+    if hb == 0 { return 0 }
+    return ci_strength(ci, ha[0], ha[1], hb[0], hb[1])
+}
+
+// Iterate every neighbor of (kg, atom_id) with strength > 0. Used by
+// find_neighbors_full to surface cofire-only neighbors that have no operator
+// or xref edge linking them yet. Returns a list of [handle, milli] entries.
+// `weight_scale` is the hop-decay scale (FP_SCALE for hop 1, NEIGH_HOP_DECAY
+// for hop 2), applied via fp_mul; pass FP_SCALE to skip decay.
+fn ci_neighbors(ci, kg, atom_id, weight_scale) {
+    let out = list_new()
+    if ci == 0 { return out }
+    let rows = ci[CI_ROWS]
+    let m = ci[CI_MAX]
+    if m == 0 { return out }
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        // Match either side of the pair to the source handle.
+        let other_kg = ""
+        let other_id = 0
+        let hit = 0
+        if str_eq(r[CI_KGA], kg) == 1 {
+            if r[CI_ATOMA] == atom_id {
+                other_kg = r[CI_KGB]
+                other_id = r[CI_ATOMB]
+                hit = 1
+            }
+        }
+        if hit == 0 {
+            if str_eq(r[CI_KGB], kg) == 1 {
+                if r[CI_ATOMB] == atom_id {
+                    other_kg = r[CI_KGA]
+                    other_id = r[CI_ATOMA]
+                    hit = 1
+                }
+            }
+        }
+        if hit == 1 {
+            let s = ci_strength(ci, kg, atom_id, other_kg, other_id)
+            if s > 0 {
+                let scaled = fp_mul(s, weight_scale)
+                if scaled > 0 {
+                    let nh = handle_new(other_kg, other_id)
+                    let entry = list_new()
+                    push(entry, nh)
+                    push(entry, scaled)
+                    push(out, entry)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}

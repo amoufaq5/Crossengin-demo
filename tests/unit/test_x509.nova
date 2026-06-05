@@ -1,0 +1,610 @@
+// Unit tests for src/safety/x509.nova (X.509 v3 cert parser + validity).
+//
+// Coverage
+//   * DER primitives in isolation:
+//       - INTEGER short-form length (1 byte: 0x02 0x01 0xFF -> 255).
+//       - INTEGER long-form length (0x02 0x82 0x01 0x00 ...).
+//       - INTEGER with leading 0x00 padding stripped (unsigned bigint).
+//       - OBJECT IDENTIFIER round-trip for ecdsa-with-SHA256
+//         (1.2.840.10045.4.3.2) and id-ecPublicKey (1.2.840.10045.2.1).
+//       - SEQUENCE tag rejection.
+//       - Indefinite-length (0x80) rejection (BER, not DER).
+//       - Length truncation rejection.
+//   * UTCTime / GeneralizedTime decode to known Unix seconds.
+//   * Full cert parse on an OpenSSL-generated self-signed P-256 cert:
+//       - subject CN == "CrossEnginTest"
+//       - issuer CN == "CrossEnginTest"
+//       - signature OID == "1.2.840.10045.4.3.2"
+//       - public-key buffer is 65 bytes, tag 0x04, matches expected hex.
+//       - serial number matches expected 20-byte big-int.
+//       - r and s decoded from BIT STRING signatureValue match expected.
+//       - tbsCertificate slice spans bytes [4 .. 311) of the cert (307B).
+//   * Validity:
+//       - check_validity at notBefore - 1 -> X509_ERR_NOT_YET_VALID.
+//       - check_validity at notBefore -> 0 (inclusive).
+//       - check_validity midway -> 0.
+//       - check_validity at notAfter -> 0 (inclusive).
+//       - check_validity at notAfter + 1 -> X509_ERR_EXPIRED.
+//   * Combined cert+verify smoke test:
+//       - SHA-256(tbs) + ecdsa_p256_verify_bn(pub, hash, r, s) -> true.
+//       - Tamper one byte of the tbs slice via a copy -> false.
+//
+// Notes on the test cert
+//   The DER bytes hardcoded below were generated offline via:
+//     openssl ecparam -name prime256v1 -genkey -noout -out k.pem
+//     openssl req -new -x509 -key k.pem -out c.pem -days 36500 \
+//       -subj "/CN=CrossEnginTest" -sha256
+//     openssl x509 -in c.pem -outform DER -out cert.der
+//   The output is non-deterministic (random ECDSA k + random serial),
+//   so the test embeds ONE specific generation as a canonical vector.
+//   The chosen cert is valid 2026-06-04 .. 2126-05-11 (~100 years).
+//
+// References:
+//   RFC 5280 §4.1 -- the Certificate ASN.1 layout this module parses.
+//   RFC 5480 §2.1 -- the ECDSA-Sig-Value SEQUENCE { r, s } wrapping.
+//   FIPS 186-4 §6.4 -- ECDSA verify recipe.
+
+import "std/io"
+import "../ce_test.nova"
+import "../../src/safety/x509.nova"
+
+// ---- Cert vector (hex -> byte buffer) -------------------------------------
+//
+// Total = 397 bytes. Layout (from openssl asn1parse):
+//   [0..4)   outer SEQUENCE header (30 82 01 89)
+//   [4..311) tbsCertificate (inner SEQUENCE; sig spans these bytes)
+//   [311..323) signatureAlgorithm SEQUENCE (30 0A 06 08 2A 86 48 CE 3D 04 03 02)
+//   [323..397) signatureValue BIT STRING (03 48 00 ...) wrapping
+//              ECDSA-Sig-Value SEQUENCE { r, s }.
+
+fn _t_cert_hex() {
+    return "308201893082012fa003020102021419dca68568de35378a1ba5a1fdfdcf5093ca4adb"
+         + "300a06082a8648ce3d04030230193117301506035504030c0e43726f7373456e67696e"
+         + "546573743020170d3236303630343036323631345a180f323132363035313130363236"
+         + "31345a30193117301506035504030c0e43726f7373456e67696e546573743059301306"
+         + "072a8648ce3d020106082a8648ce3d03010703420004b2aa9e2123f6f9fde41b87d347"
+         + "6fbb46505d56a6d2ce0f358ea38adc4630afec7e001cab2cb7f38c8b9e32f8829c6be8"
+         + "cb72c744caa9450b5a481627ad7b27caa3533051301d0603551d0e041604149ea48caf"
+         + "1d632e92421d0440fbcc2be37d7977e8301f0603551d230418301680149ea48caf1d63"
+         + "2e92421d0440fbcc2be37d7977e8300f0603551d130101ff040530030101ff300a0608"
+         + "2a8648ce3d0403020348003045022100e718b07cd46d27468236aa02347011387ec230"
+         + "c2bf8dc4d98d956e88d36396a602206f95c26709e8b30ef37bc433cb27dbe223ea5147"
+         + "5beb2174a4337ec0a40297d2"
+}
+
+fn _t_cert_buf() {
+    let p = p256_hex_decode(_t_cert_hex())
+    return p
+}
+
+// ---- DER primitive tests --------------------------------------------------
+//
+// We can't exercise the file-private _x509_read_* helpers directly from
+// here (they're underscore-prefixed but still in the imported module's
+// scope, so they ARE callable -- NOVA doesn't enforce visibility).
+
+fn test_der_read_tag_simple() {
+    let buf = alloc(4)
+    store8(buf + 0, 2)            // INTEGER tag
+    store8(buf + 1, 0)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    let r = _x509_read_tag(buf, 0, 4)
+    ce_eq("tag pos advanced", r[0], 1)
+    ce_eq("tag byte = 0x02", r[1], 2)
+}
+
+fn test_der_read_tag_rejects_longform() {
+    let buf = alloc(4)
+    store8(buf + 0, 31)           // long-form tag start: low 5 bits = 0x1F
+    store8(buf + 1, 0)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    let r = _x509_read_tag(buf, 0, 4)
+    ce_eq("longform tag rejected", r, X509_ERR_BAD_TAG)
+}
+
+fn test_der_read_length_short() {
+    let buf = alloc(2)
+    store8(buf, 5)
+    store8(buf + 1, 0)
+    let r = _x509_read_length(buf, 0, 2)
+    ce_eq("short-form len pos", r[0], 1)
+    ce_eq("short-form len value", r[1], 5)
+}
+
+fn test_der_read_length_long_2byte() {
+    // 0x82 0x01 0x00 -> length 256.
+    let buf = alloc(4)
+    store8(buf + 0, 130)
+    store8(buf + 1, 1)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    let r = _x509_read_length(buf, 0, 4)
+    ce_eq("long-form 2B len pos", r[0], 3)
+    ce_eq("long-form 2B len value", r[1], 256)
+}
+
+fn test_der_read_length_long_3byte() {
+    // 0x83 0x01 0x00 0x00 -> length 65536.
+    let buf = alloc(5)
+    store8(buf + 0, 131)
+    store8(buf + 1, 1)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    store8(buf + 4, 0)
+    let r = _x509_read_length(buf, 0, 5)
+    ce_eq("long-form 3B len pos", r[0], 4)
+    ce_eq("long-form 3B len value", r[1], 65536)
+}
+
+fn test_der_read_length_rejects_indefinite() {
+    let buf = alloc(2)
+    store8(buf, 128)              // indefinite length marker
+    store8(buf + 1, 0)
+    let r = _x509_read_length(buf, 0, 2)
+    ce_eq("indefinite-length rejected", r, X509_ERR_BAD_LENGTH)
+}
+
+fn test_der_read_length_rejects_overlong() {
+    // 0x86 -> 6 length bytes; we cap at 4.
+    let buf = alloc(8)
+    store8(buf + 0, 134)
+    let i = 1
+    while i < 8 { store8(buf + i, 0); i = i + 1 }
+    let r = _x509_read_length(buf, 0, 8)
+    ce_eq("overlong-length rejected", r, X509_ERR_BAD_LENGTH)
+}
+
+fn test_der_read_length_rejects_truncated() {
+    let buf = alloc(2)
+    store8(buf, 130)              // claim 2 length bytes
+    store8(buf + 1, 0)            // only 1 byte after, EOF
+    let r = _x509_read_length(buf, 0, 2)
+    ce_eq("truncated length rejected", r, X509_ERR_TRUNCATED)
+}
+
+fn test_der_read_integer_simple_255() {
+    // 0x02 0x02 0x00 0xFF -> 255 (with leading 0x00 padding).
+    let buf = alloc(5)
+    store8(buf + 0, 2)
+    store8(buf + 1, 2)
+    store8(buf + 2, 0)
+    store8(buf + 3, 255)
+    store8(buf + 4, 0)
+    let r = _x509_read_integer_bn(buf, 0, 4)
+    ce_eq("next_pos = 4", r[0], 4)
+    let bn = r[1]
+    let expected = bn256_from_int(255)
+    ce_eq("INTEGER 255 with leading 0", bn256_eq(bn, expected), 1)
+}
+
+fn test_der_read_integer_no_padding() {
+    // 0x02 0x01 0x05 -> 5 (no leading 0; top bit clear).
+    let buf = alloc(4)
+    store8(buf + 0, 2)
+    store8(buf + 1, 1)
+    store8(buf + 2, 5)
+    store8(buf + 3, 0)
+    let r = _x509_read_integer_bn(buf, 0, 3)
+    ce_eq("next_pos = 3", r[0], 3)
+    ce_eq("INTEGER 5 plain", bn256_eq(r[1], bn256_from_int(5)), 1)
+}
+
+fn test_der_read_integer_large() {
+    // 0x02 0x20 || 32 BE bytes -> a 256-bit integer.
+    let hex_val = "1234567890abcdef1234567890abcdef"
+                + "1234567890abcdef1234567890abcdef"
+    let p = p256_hex_decode(hex_val)
+    let buf = alloc(35)
+    store8(buf + 0, 2)
+    store8(buf + 1, 32)
+    let i = 0
+    while i < 32 {
+        store8(buf + 2 + i, load8(p[0] + i))
+        i = i + 1
+    }
+    store8(buf + 34, 0)
+    let r = _x509_read_integer_bn(buf, 0, 34)
+    let expected = bn256_from_hex(hex_val)
+    ce_eq("256-bit INTEGER round-trip", bn256_eq(r[1], expected), 1)
+}
+
+fn test_der_read_oid_ecdsa_sha256() {
+    // ecdsa-with-SHA256 OID encoding: 2A 86 48 CE 3D 04 03 02
+    // (= 1.2.840.10045.4.3.2). Prefix with tag (0x06) + length (0x08).
+    let buf = alloc(11)
+    store8(buf + 0, 6)
+    store8(buf + 1, 8)
+    store8(buf + 2, 42)           // 0x2A = 40*1 + 2
+    store8(buf + 3, 134)          // 0x86 = 0x06 | 0x80 (continuation)
+    store8(buf + 4, 72)           // 0x48 -> 840 with byte above
+    store8(buf + 5, 206)          // 0xCE
+    store8(buf + 6, 61)           // 0x3D -> 10045
+    store8(buf + 7, 4)
+    store8(buf + 8, 3)
+    store8(buf + 9, 2)
+    store8(buf + 10, 0)
+    let r = _x509_read_oid(buf, 0, 10)
+    ce_str_eq("OID parses to ecdsa-with-SHA256 dotted",
+        r[1], "1.2.840.10045.4.3.2")
+}
+
+fn test_der_read_oid_id_ecpublic_key() {
+    // id-ecPublicKey = 1.2.840.10045.2.1 -> 2A 86 48 CE 3D 02 01
+    let buf = alloc(10)
+    store8(buf + 0, 6)
+    store8(buf + 1, 7)
+    store8(buf + 2, 42)
+    store8(buf + 3, 134)
+    store8(buf + 4, 72)
+    store8(buf + 5, 206)
+    store8(buf + 6, 61)
+    store8(buf + 7, 2)
+    store8(buf + 8, 1)
+    store8(buf + 9, 0)
+    let r = _x509_read_oid(buf, 0, 9)
+    ce_str_eq("OID parses to id-ecPublicKey dotted",
+        r[1], "1.2.840.10045.2.1")
+}
+
+fn test_der_read_oid_prime256v1() {
+    // prime256v1 = 1.2.840.10045.3.1.7 -> 2A 86 48 CE 3D 03 01 07
+    let buf = alloc(11)
+    store8(buf + 0, 6)
+    store8(buf + 1, 8)
+    store8(buf + 2, 42)
+    store8(buf + 3, 134)
+    store8(buf + 4, 72)
+    store8(buf + 5, 206)
+    store8(buf + 6, 61)
+    store8(buf + 7, 3)
+    store8(buf + 8, 1)
+    store8(buf + 9, 7)
+    store8(buf + 10, 0)
+    let r = _x509_read_oid(buf, 0, 10)
+    ce_str_eq("OID parses to prime256v1 dotted",
+        r[1], "1.2.840.10045.3.1.7")
+}
+
+// ---- Time decoding --------------------------------------------------------
+
+fn test_der_read_utctime() {
+    // UTCTime "260604062614Z" (13 bytes including Z). Tag 0x17 = 23.
+    let s = "260604062614Z"
+    let buf = alloc(16)
+    store8(buf + 0, 23)
+    store8(buf + 1, 13)
+    let i = 0
+    while i < 13 {
+        store8(buf + 2 + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + 15, 0)
+    let r = _x509_read_time(buf, 0, 15)
+    // 2026-06-04 06:26:14 UTC -> 1780554374 (via python datetime).
+    ce_eq("UTCTime decodes to Unix seconds", r[1], 1780554374)
+}
+
+fn test_der_read_generalizedtime() {
+    // GeneralizedTime "21260511062614Z" (15 bytes). Tag 0x18 = 24.
+    let s = "21260511062614Z"
+    let buf = alloc(18)
+    store8(buf + 0, 24)
+    store8(buf + 1, 15)
+    let i = 0
+    while i < 15 {
+        store8(buf + 2 + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + 17, 0)
+    let r = _x509_read_time(buf, 0, 17)
+    // 2126-05-11 06:26:14 UTC -> 4934154374.
+    ce_eq("GeneralizedTime decodes to Unix seconds", r[1], 4934154374)
+}
+
+fn test_der_read_time_rejects_missing_z() {
+    // UTCTime without 'Z' terminator.
+    let s = "260604062614X"
+    let buf = alloc(16)
+    store8(buf + 0, 23)
+    store8(buf + 1, 13)
+    let i = 0
+    while i < 13 {
+        store8(buf + 2 + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + 15, 0)
+    let r = _x509_read_time(buf, 0, 15)
+    ce_eq("Time missing Z rejected", r, X509_ERR_BAD_TIME)
+}
+
+fn test_der_read_time_rejects_bad_month() {
+    let s = "261304062614Z"               // month 13
+    let buf = alloc(16)
+    store8(buf + 0, 23)
+    store8(buf + 1, 13)
+    let i = 0
+    while i < 13 {
+        store8(buf + 2 + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + 15, 0)
+    let r = _x509_read_time(buf, 0, 15)
+    ce_eq("Month 13 rejected", r, X509_ERR_BAD_TIME)
+}
+
+// ---- Full cert parse ------------------------------------------------------
+
+fn test_x509_parse_succeeds() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_check("cert parse returns non-error", cert != 0)
+    ce_check("cert parse not negative", cert > 0)
+}
+
+fn test_x509_parse_subject_cn() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_str_eq("subject CN", x509_subject_cn(cert), "CrossEnginTest")
+}
+
+fn test_x509_parse_issuer_cn() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_str_eq("issuer CN", x509_issuer_cn(cert), "CrossEnginTest")
+}
+
+fn test_x509_parse_sig_oid() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_str_eq("signature OID",
+        x509_signature_alg_oid(cert),
+        "1.2.840.10045.4.3.2")
+    ce_str_eq("OID accessor matches public constant",
+        x509_signature_alg_oid_value(),
+        "1.2.840.10045.4.3.2")
+}
+
+fn test_x509_parse_pub_key() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_eq("pubkey length = 65", x509_public_key_len(cert), 65)
+    let pub = x509_public_key_buf(cert)
+    ce_eq("pubkey tag = 0x04", load8(pub), 4)
+    let pub_hex = p256_hex_encode_buf(pub, 65)
+    ce_str_eq("pubkey hex matches expected",
+        pub_hex,
+        "04b2aa9e2123f6f9fde41b87d3476fbb46505d56a6d2ce0f358ea38adc4630afec"
+        + "7e001cab2cb7f38c8b9e32f8829c6be8cb72c744caa9450b5a481627ad7b27ca")
+}
+
+fn test_x509_parse_serial() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    let serial = x509_serial_bn(cert)
+    let expected = bn256_from_hex(
+        "19dca68568de35378a1ba5a1fdfdcf5093ca4adb")
+    ce_eq("serial matches expected 20-byte big-int",
+        bn256_eq(serial, expected), 1)
+}
+
+fn test_x509_parse_signature_rs() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    let r = x509_signature_r(cert)
+    let s = x509_signature_s(cert)
+    // The cert's DER encodes r with a leading 0x00 padding byte (top
+    // bit of r is set); the parser strips that padding, so the bn256
+    // value matches the 32-byte BE integer without the pad. bn256_to_hex
+    // emits a canonical 64-char lowercase string with leading zeros.
+    ce_str_eq("r hex",
+        bn256_to_hex(r),
+        "e718b07cd46d27468236aa02347011387ec230c2bf8dc4d98d956e88d36396a6")
+    ce_str_eq("s hex",
+        bn256_to_hex(s),
+        "6f95c26709e8b30ef37bc433cb27dbe223ea51475beb2174a4337ec0a40297d2")
+}
+
+fn test_x509_parse_tbs_span() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    // The tbsCertificate slice should be cert[4..311) = 307 bytes per the
+    // openssl asn1parse output. tbs_buf is a raw pointer; we check the
+    // first byte (== 0x30, the inner SEQUENCE tag) and the length.
+    ce_eq("tbs length = 307", x509_tbs_len(cert), 307)
+    let tbs = x509_tbs_buf(cert)
+    ce_eq("tbs first byte = 0x30 (SEQUENCE)", load8(tbs), 48)
+    ce_eq("tbs second byte = 0x82 (long-form length marker)",
+        load8(tbs + 1), 130)
+    // Bytes 2-3 encode the length 0x012F = 303.
+    ce_eq("tbs length hi byte", load8(tbs + 2), 1)
+    ce_eq("tbs length lo byte", load8(tbs + 3), 47)
+}
+
+fn test_x509_parse_not_before_after() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_eq("not_before unix sec", x509_not_before(cert), 1780554374)
+    ce_eq("not_after unix sec", x509_not_after(cert), 4934154374)
+}
+
+// ---- Validity check ------------------------------------------------------
+
+fn test_x509_validity_at_not_before() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_eq("at not_before -> 0 (inclusive)",
+        x509_check_validity(cert, 1780554374), 0)
+}
+
+fn test_x509_validity_before_not_before() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_eq("not_before - 1 -> NOT_YET_VALID",
+        x509_check_validity(cert, 1780554373),
+        X509_ERR_NOT_YET_VALID)
+}
+
+fn test_x509_validity_midway() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    // Halfway between nb and na: (1780554374 + 4934154374) / 2 = 3357354374.
+    ce_eq("midway -> 0", x509_check_validity(cert, 3357354374), 0)
+}
+
+fn test_x509_validity_at_not_after() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_eq("at not_after -> 0 (inclusive)",
+        x509_check_validity(cert, 4934154374), 0)
+}
+
+fn test_x509_validity_after_not_after() {
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    ce_eq("not_after + 1 -> EXPIRED",
+        x509_check_validity(cert, 4934154375),
+        X509_ERR_EXPIRED)
+}
+
+// ---- Combined cert+verify smoke test -------------------------------------
+
+fn test_x509_combined_verify_ok() {
+    // Parse cert -> get tbs_buf, tbs_len, pub_key, r, s.
+    // SHA-256(tbs) then ECDSA verify.
+    let p = _t_cert_buf()
+    let cert = x509_parse(p[0], p[1])
+    let tbs_buf = x509_tbs_buf(cert)
+    let tbs_len = x509_tbs_len(cert)
+    let pub = x509_public_key_buf(cert)
+    let pub_n = x509_public_key_len(cert)
+    let r_bn = x509_signature_r(cert)
+    let s_bn = x509_signature_s(cert)
+    let hash_buf = ecdsa_sha256(tbs_buf, tbs_len)
+    // Sanity-check the hash; we precomputed via python:
+    //   cfa7c41cc9cf98bd772c5398ca92692f30ca193e3dff5527105aafb957fd1ce6
+    let hash_hex = p256_hex_encode_buf(hash_buf, 32)
+    ce_str_eq("SHA-256(tbs) matches openssl/python reference",
+        hash_hex,
+        "cfa7c41cc9cf98bd772c5398ca92692f30ca193e3dff5527105aafb957fd1ce6")
+    let hash_bn = _p256_bytes_to_bn(hash_buf, 0)
+    let ok = ecdsa_p256_verify_bn(pub, pub_n, hash_bn, r_bn, s_bn)
+    ce_eq("combined SHA-256(tbs) + ECDSA verify -> true", ok, 1)
+}
+
+fn test_x509_combined_verify_tampered_tbs() {
+    // Copy the cert into a new buffer with one byte of the tbs slice
+    // flipped, then re-parse + verify. The signature is still over the
+    // original tbs bytes; flipping a byte makes the hash mismatch.
+    let p = _t_cert_buf()
+    let n = p[1]
+    let copy = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(copy + i, load8(p[0] + i))
+        i = i + 1
+    }
+    store8(copy + n, 0)
+    // Flip a byte inside the tbs slice (offset 100 is inside the issuer DN).
+    store8(copy + 100, int_xor(load8(copy + 100), 1))
+    let cert = x509_parse(copy, n)
+    if cert < 0 {
+        // Tampered byte in the issuer DN may break DN parsing -- accept
+        // either path (verify fails OR parse fails) as "tamper rejected".
+        ce_eq("tampered tbs detected at parse stage", 1, 1)
+        return 1
+    }
+    let tbs_buf = x509_tbs_buf(cert)
+    let tbs_len = x509_tbs_len(cert)
+    let pub = x509_public_key_buf(cert)
+    let pub_n = x509_public_key_len(cert)
+    let r_bn = x509_signature_r(cert)
+    let s_bn = x509_signature_s(cert)
+    let hash_buf = ecdsa_sha256(tbs_buf, tbs_len)
+    let hash_bn = _p256_bytes_to_bn(hash_buf, 0)
+    let ok = ecdsa_p256_verify_bn(pub, pub_n, hash_bn, r_bn, s_bn)
+    ce_eq("tampered tbs -> verify false", ok, 0)
+    return 1
+}
+
+// ---- Error paths ----------------------------------------------------------
+
+fn test_x509_parse_rejects_truncated() {
+    // Top 4 bytes only -- not enough for the outer SEQUENCE length.
+    let buf = alloc(5)
+    store8(buf + 0, 48)
+    store8(buf + 1, 130)
+    store8(buf + 2, 1)
+    store8(buf + 3, 0)
+    store8(buf + 4, 0)
+    let r = x509_parse(buf, 4)
+    ce_check("truncated cert rejected", r < 0)
+}
+
+fn test_x509_parse_rejects_bad_outer_tag() {
+    let buf = alloc(4)
+    store8(buf + 0, 49)           // SET instead of SEQUENCE
+    store8(buf + 1, 1)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    let r = x509_parse(buf, 3)
+    ce_check("bad outer tag rejected", r < 0)
+}
+
+fn test_x509_parse_rejects_indef_length() {
+    // x509_parse short-circuits on der_n < 4 with TRUNCATED, so pad
+    // out to 4 bytes here -- the 128 length marker in byte 1 is what
+    // triggers the BAD_LENGTH path.
+    let buf = alloc(5)
+    store8(buf + 0, 48)
+    store8(buf + 1, 128)
+    store8(buf + 2, 0)
+    store8(buf + 3, 0)
+    store8(buf + 4, 0)
+    let r = x509_parse(buf, 4)
+    ce_eq("indefinite length rejected", r, X509_ERR_BAD_LENGTH)
+}
+
+fn main() {
+    test_der_read_tag_simple()
+    test_der_read_tag_rejects_longform()
+    test_der_read_length_short()
+    test_der_read_length_long_2byte()
+    test_der_read_length_long_3byte()
+    test_der_read_length_rejects_indefinite()
+    test_der_read_length_rejects_overlong()
+    test_der_read_length_rejects_truncated()
+    test_der_read_integer_simple_255()
+    test_der_read_integer_no_padding()
+    test_der_read_integer_large()
+    test_der_read_oid_ecdsa_sha256()
+    test_der_read_oid_id_ecpublic_key()
+    test_der_read_oid_prime256v1()
+    test_der_read_utctime()
+    test_der_read_generalizedtime()
+    test_der_read_time_rejects_missing_z()
+    test_der_read_time_rejects_bad_month()
+    test_x509_parse_succeeds()
+    test_x509_parse_subject_cn()
+    test_x509_parse_issuer_cn()
+    test_x509_parse_sig_oid()
+    test_x509_parse_pub_key()
+    test_x509_parse_serial()
+    test_x509_parse_signature_rs()
+    test_x509_parse_tbs_span()
+    test_x509_parse_not_before_after()
+    test_x509_validity_at_not_before()
+    test_x509_validity_before_not_before()
+    test_x509_validity_midway()
+    test_x509_validity_at_not_after()
+    test_x509_validity_after_not_after()
+    test_x509_combined_verify_ok()
+    test_x509_combined_verify_tampered_tbs()
+    test_x509_parse_rejects_truncated()
+    test_x509_parse_rejects_bad_outer_tag()
+    test_x509_parse_rejects_indef_length()
+    ce_summary("x509")
+}
+
+main()

@@ -1,0 +1,796 @@
+// CrossEngin io/transducers: visual perception seam (P3.1 / P3.1.PNG).
+//
+// Purpose
+//   The visual half of the modality bridge that text (P15) and audio
+//   (P19 / P2.6 TTS + P2.5 STT framework) already cover. Image data is
+//   structurally different from text or speech: a raw pixel stream has
+//   no tokens, no phonemes, no inherent boundaries -- it is a 2-D field
+//   of intensities the substrate has to interpret. P3.1 lands the smallest
+//   plank that makes the substrate perceive an image AT ALL: a pluggable
+//   decoder (PGM-P5 + grayscale-8 PNG today; JPEG / WebP / color PNG
+//   deferred per `IMAGE_AUDIT.md`) plus a tiny feature-extraction pass
+//   that turns pixel statistics into a list of label-shaped "feature
+//   atoms" the agent's perception path can consume as if they were
+//   words. PNG support (P3.1.PNG) adds a pure-NOVA grayscale-8 decoder
+//   via `png_decode.nova` so PNG files round-trip without the
+//   ImageMagick / ffmpeg subprocess shim.
+//
+//   The seam EXACTLY mirrors the shape of `stt_seam.nova` (P2.5):
+//   pluggable backends keyed by integer id, an env-driven default,
+//   per-call result triple (extended to a 3-tuple here: feature atoms,
+//   confidence_milli, error_msg), and "last_*" mirrors for observability.
+//   Tests can register a mock backend without touching env. The only
+//   moving piece that does real work today is the PGM decoder; every
+//   other backend resolves to STUB.
+//
+//   "Feature atoms" are just labels (strings) the chat / daemon can
+//   append to its perception buffer or hand to `transduce_text` for
+//   normalization. Today's set:
+//     image_dim_small | image_dim_medium | image_dim_large
+//       -- by pixel area (small <= 4096; medium <= 65536; else large)
+//     image_dark | image_mid | image_bright
+//       -- by mean intensity (<80 dark; >175 bright; else mid)
+//     image_hist_peaked | image_hist_uniform
+//       -- by histogram entropy (entropy < 3000 milli-bits peaked;
+//          entropy > 6000 milli-bits uniform; else neither label)
+//     image_bucket_<0..7>
+//       -- dominant-intensity bucket (8 bins of 32 levels each)
+//   Each is independently included; a real "scene" image is typically
+//   2-3 atoms in size. The substrate later learns associations between
+//   these atoms and concepts via the same Hebbian + atom-birth path
+//   that text perception uses (ADR-0023 + ADR-0025).
+//
+//   The full vision pipeline -- edge detection (Sobel / Canny), corner
+//   features (Harris / SIFT), color histograms in HSV, deep-learning
+//   embeddings (CNN feature vectors) -- is months of work and out of
+//   scope for P3.1. See `IMAGE_AUDIT.md` for the wall-clock estimate
+//   and the recommended ImageMagick shim path until then.
+//
+// Public API
+//   vp_seam_new() -> vp_seam state
+//   vp_decode_image(seam, path) -> [feature_atoms, confidence_milli,
+//                                   error_msg]
+//   vp_register_decoder(seam, name, decoder_id)
+//   vp_default_decoder() -> VP_DECODER_PGM | VP_DECODER_PNG | VP_DECODER_STUB
+//   vp_seam_decoder_name(seam) -> string
+//   vp_seam_decoder_id_for(seam, name) -> int
+//   vp_seam_set_default(seam, decoder_id)
+//   vp_seam_last_features(seam) / _last_confidence / _last_error /
+//     _call_count
+//   vp_features_for_image(width, height, data) -> list of feature
+//     atom labels (no I/O; pure-function helper -- tests use this)
+//
+// Confidence: PGM-decoded features are reported at 800 milli (0.8
+// ballpark, the same default the STT subprocess backend uses for
+// successful transcriptions). The STUB path returns 0. Calibration is
+// a follow-up -- the meaningful signal today is whether the decoder
+// ran at all.
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+//   The output is label-shaped; mapping labels to atoms is the perception
+//   loop's job (a separate follow-up that lives in src/agent/, not here).
+// NOVA dependencies: builtins -- list_new, push, list_set, len, str_eq,
+//   getenv, int_to_str, char_at. CrossEngin dependencies: image_pgm.nova
+//   (PGM-P5 decoder) and png_decode.nova (grayscale-8 PNG decoder via
+//   deflate_decode.nova).
+
+import "image_pgm.nova"
+import "png_decode.nova"
+import "jpeg_decode.nova"
+import "image_sobel.nova"
+import "image_harris.nova"
+import "image_sift.nova"
+import "image_canny.nova"
+import "image_orb.nova"
+import "image_stereo.nova"
+import "image_optical_flow.nova"
+import "image_segmentation.nova"
+import "image_superpixels.nova"
+import "image_hog.nova"
+import "image_detector.nova"
+import "image_face_detect.nova"
+import "image_lbp.nova"
+
+// ---- decoder identifiers --------------------------------------------------
+
+let VP_DECODER_NONE   = 0       // sentinel, never registered
+let VP_DECODER_STUB   = 1       // deterministic placeholder
+let VP_DECODER_PGM    = 2       // real PGM-P5 decoder (image_pgm.nova)
+let VP_DECODER_PNG    = 3       // grayscale-8 PNG decoder (png_decode.nova)
+let VP_DECODER_JPEG   = 4       // grayscale baseline JPEG header parser
+                                //   (jpeg_decode.nova; entropy decode TODO)
+let VP_DECODER_CUSTOM = 5       // user-registered (tests, plugins)
+
+// Confidence sentinels (mirror the STT seam's pattern).
+let VP_CONFIDENCE_NONE    = 0
+let VP_CONFIDENCE_STUB    = 0
+let VP_CONFIDENCE_DEFAULT = 800
+
+// Placeholder feature list the STUB backend returns. A single
+// `image_unavailable` atom so the perception path sees ONE label even
+// when no decoder fires -- the agent can learn associations between
+// "saw something but could not decode it" and downstream outcomes.
+let VP_STUB_LABEL = "image_unavailable"
+
+// Feature labels exposed publicly so callers + tests can match against
+// them without re-hardcoding strings.
+let VP_LABEL_DIM_SMALL    = "image_dim_small"
+let VP_LABEL_DIM_MEDIUM   = "image_dim_medium"
+let VP_LABEL_DIM_LARGE    = "image_dim_large"
+let VP_LABEL_DARK         = "image_dark"
+let VP_LABEL_MID          = "image_mid"
+let VP_LABEL_BRIGHT       = "image_bright"
+let VP_LABEL_HIST_PEAKED  = "image_hist_peaked"
+let VP_LABEL_HIST_UNIFORM = "image_hist_uniform"
+
+// P3.3 structural feature labels (Sobel + Harris). These only fire if the
+// image is at least VP_STRUCTURAL_MIN_DIM in EACH axis -- the kernels need
+// at least a 3x3 neighborhood and the corner-count buckets need meaningful
+// scale.
+let VP_LABEL_EDGE_DENSE   = "image_edge_dense"
+let VP_LABEL_EDGE_SPARSE  = "image_edge_sparse"
+// Orientation atoms are emitted via sobel_orient_label() so all four
+// strings live next to the kernel definition; we also re-export them
+// here so the seam's caller can string-match without importing image_sobel.
+let VP_LABEL_ORIENT_0     = "image_orient_0"
+let VP_LABEL_ORIENT_45    = "image_orient_45"
+let VP_LABEL_ORIENT_90    = "image_orient_90"
+let VP_LABEL_ORIENT_135   = "image_orient_135"
+// Corner-count and density atoms come from image_harris.nova:
+let VP_LABEL_CORNER_LOW   = "image_corner_count_low"
+let VP_LABEL_CORNER_MID   = "image_corner_count_mid"
+let VP_LABEL_CORNER_HIGH  = "image_corner_count_high"
+// Spatial-distribution corner labels also come from image_harris.nova.
+
+// SIFT-detection keypoint-count atoms (image_sift.nova). The original
+// drop shipped detection-only with the descriptor deferred; the
+// descriptor + matcher half (P3.3 cont. v2) also emits an
+// `image_descriptors_<low|mid|high>` atom mirroring the keypoint bucket,
+// indicating that the rotation-invariant 128-D descriptor pipeline
+// successfully described N keypoints (a "structural fingerprint" the
+// substrate can use for image-to-image matching).
+let VP_LABEL_KEYPOINT_LOW   = "image_keypoint_count_low"
+let VP_LABEL_KEYPOINT_MID   = "image_keypoint_count_mid"
+let VP_LABEL_KEYPOINT_HIGH  = "image_keypoint_count_high"
+let VP_LABEL_DESCRIPTOR_LOW  = "image_descriptors_low"
+let VP_LABEL_DESCRIPTOR_MID  = "image_descriptors_mid"
+let VP_LABEL_DESCRIPTOR_HIGH = "image_descriptors_high"
+
+// Canny edge-density atoms (image_canny.nova). Canny adds non-max
+// suppression + hysteresis thresholding on top of Sobel's gradient
+// magnitude, producing single-pixel-wide edges. The density bucket
+// reflects how much of the (cleaned) edge map covers the image:
+// `image_canny_edges_low` (< 20 milli, ~most photos with smooth fields),
+// `image_canny_edges_mid` (20..100 milli, busy / textured scenes), or
+// `image_canny_edges_high` (> 100 milli, very busy text / line-art).
+let VP_LABEL_CANNY_LOW  = "image_canny_edges_low"
+let VP_LABEL_CANNY_MID  = "image_canny_edges_mid"
+let VP_LABEL_CANNY_HIGH = "image_canny_edges_high"
+
+// ORB (Oriented FAST + Rotated BRIEF) keypoint-count + density atoms
+// (image_orb.nova). ORB is the patent-free / integer-only alternative
+// to SIFT: FAST-9 corner detection + Harris score for ranking +
+// intensity-centroid orientation + 256-bit rBRIEF descriptor +
+// Hamming-distance matcher with Lowe's ratio test. Same minimum dim
+// (32x32) as SIFT/Canny.
+let VP_LABEL_ORB_KPS_LOW      = "image_orb_kps_low"
+let VP_LABEL_ORB_KPS_MID      = "image_orb_kps_mid"
+let VP_LABEL_ORB_KPS_HIGH     = "image_orb_kps_high"
+let VP_LABEL_ORB_DENSITY_LOW  = "image_orb_density_low"
+let VP_LABEL_ORB_DENSITY_MID  = "image_orb_density_mid"
+let VP_LABEL_ORB_DENSITY_HIGH = "image_orb_density_high"
+
+// Minimum dimension on each axis to run the structural detectors. Images
+// smaller than this are statistically uninteresting AND would force the
+// detectors to operate on near-empty 3x3 neighborhoods.
+let VP_STRUCTURAL_MIN_DIM = 16
+
+// Minimum dimension on each axis to run the SIFT-detection scale-space
+// scan. SIFT needs at least 3 octaves of meaningful pixel data; an
+// image below 32x32 would shrink to 8x8 at octave 2, where the 3x3
+// kernel + 3x3x3 extremum check has barely any interior pixels.
+let VP_SIFT_MIN_DIM = 32
+
+// Minimum dimension on each axis to run the Canny pipeline. Canny pays
+// gauss + sobel + NMS + hysteresis -- 4 full image-sized passes per
+// axis. At 32x32 the per-pass int_mul accumulators are well within
+// the codegen pointer-threshold ceiling and the algorithm still has
+// meaningful (interior) pixels.
+let VP_CANNY_MIN_DIM = 32
+
+// Minimum dimension on each axis to run ORB. Same 32x32 floor as SIFT
+// because ORB's 31x31 orientation patch + descriptor patch needs
+// enough interior pixels to be meaningful.
+let VP_ORB_MIN_DIM = 32
+// Minimum dimension to run stereo (R7E). Block-matching SAD needs >= 32x32 for the 7x7 window + 64-disp search to have headroom.
+let VP_STEREO_MIN_DIM = 32
+let VP_LABEL_STEREO_DENSITY_LOW = "image_stereo_density_low"
+// Minimum dimension to run Lucas-Kanade optical flow (R10D). The 5x5 window + 3-point gradient stencil needs >= 16x16 to have interior pixels.
+let VP_FLOW_MIN_DIM = 16
+// Maximum keypoints we ask ORB for per image (ORB_HARD_MAX caps at 200
+// internally).
+let VP_ORB_MAX_KEYPOINTS = 200
+
+// Maximum keypoints requested from SIFT per image. The detector itself
+// hard-caps at SIFT_HARD_MAX = 200 internally; we pass the same number
+// so the cap is the only ceiling.
+let VP_SIFT_MAX_KEYPOINTS = 200
+
+// Thresholds (kept as constants so the audit doc + tests can refer to
+// the same numbers).
+let VP_DIM_SMALL_AREA  = 4096        // 64x64
+let VP_DIM_MEDIUM_AREA = 65536       // 256x256
+let VP_DARK_MEAN       = 80
+let VP_BRIGHT_MEAN     = 175
+let VP_ENTROPY_PEAKED  = 3000        // milli-bits
+let VP_ENTROPY_UNIFORM = 6000        // milli-bits
+
+// ---- seam state layout ----------------------------------------------------
+//
+// Shape parallel to `stt_seam.nova`:
+//   [0] tag                (VP_SEAM_TAG)
+//   [1] default_decoder    (resolved from env at construction)
+//   [2] registered_count   (number of decoders registered)
+//   [3] registered_names   (list of strings)
+//   [4] registered_ids     (list of int ids -- parallel to names)
+//   [5] last_features      (list of strings -- most recent successful call)
+//   [6] last_confidence    (int milli -- mirror)
+//   [7] last_error         (string -- last error_msg, or "")
+//   [8] call_count         (counter for observability)
+//   [9] last_summary       (operator-readable digest: "256x256 mean=148 ...")
+//   [10] last_decoder_id   (id of the decoder actually used on the most
+//                           recent decode -- may differ from VP_DEFAULT_DEC
+//                           when extension routing dispatched to PNG/PGM)
+
+let VP_SEAM_TAG = 6311
+
+let VP_TAG            = 0
+let VP_DEFAULT_DEC    = 1
+let VP_REG_COUNT      = 2
+let VP_REG_NAMES      = 3
+let VP_REG_IDS        = 4
+let VP_LAST_FEATS     = 5
+let VP_LAST_CONF      = 6
+let VP_LAST_ERR       = 7
+let VP_CALL_COUNT     = 8
+let VP_LAST_SUMMARY   = 9
+let VP_LAST_DEC       = 10
+
+// ---- env helpers ----------------------------------------------------------
+
+// vp_default_decoder() reads CE_VP_DECODER once and returns the constant.
+// Empty / unset / "pgm" -> PGM; "png" -> PNG; "jpeg"/"jpg" -> JPEG (header
+// parse only -- entropy decode is deferred per JPEG_AUDIT.md); "stub" ->
+// STUB; anything else -> PGM (defensive default; per-call extension
+// detection in `_vp_pick_decoder_for_path` can still route a `.png` /
+// `.jpg` path to the matching decoder when the default is PGM).
+fn vp_default_decoder() {
+    let env = getenv("CE_VP_DECODER")
+    if env == 0 { return VP_DECODER_PGM }
+    if len(env) == 0 { return VP_DECODER_PGM }
+    if str_eq(env, "pgm") == 1 { return VP_DECODER_PGM }
+    if str_eq(env, "png") == 1 { return VP_DECODER_PNG }
+    if str_eq(env, "jpeg") == 1 { return VP_DECODER_JPEG }
+    if str_eq(env, "jpg") == 1 { return VP_DECODER_JPEG }
+    if str_eq(env, "stub") == 1 { return VP_DECODER_STUB }
+    return VP_DECODER_PGM
+}
+
+// ---- constructor ----------------------------------------------------------
+
+fn vp_seam_new() {
+    let s = list_new()
+    push(s, VP_SEAM_TAG)
+    push(s, vp_default_decoder())   // [1] default decoder
+    push(s, 0)                      // [2] registered_count
+    push(s, list_new())             // [3] names
+    push(s, list_new())             // [4] ids
+    push(s, list_new())             // [5] last_features
+    push(s, 0)                      // [6] last_confidence
+    push(s, "")                     // [7] last_error
+    push(s, 0)                      // [8] call_count
+    push(s, "")                     // [9] last_summary
+    push(s, VP_DECODER_NONE)        // [10] last_decoder_id
+    _vp_register_builtin(s, "stub", VP_DECODER_STUB)
+    _vp_register_builtin(s, "pgm",  VP_DECODER_PGM)
+    _vp_register_builtin(s, "png",  VP_DECODER_PNG)
+    _vp_register_builtin(s, "jpeg", VP_DECODER_JPEG)
+    return s
+}
+
+fn _vp_register_builtin(s, name, id) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    push(names, name)
+    push(ids, id)
+    list_set(s, VP_REG_COUNT, s[VP_REG_COUNT] + 1)
+    return 1
+}
+
+// ---- public accessors -----------------------------------------------------
+
+fn vp_seam_enabled(s) {
+    if s[VP_REG_COUNT] > 0 { return 1 }
+    return 0
+}
+
+fn vp_seam_decoder_name(s) {
+    let id = s[VP_DEFAULT_DEC]
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(ids)
+    while i < n {
+        if ids[i] == id { return names[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn vp_seam_last_features(s)   { return s[VP_LAST_FEATS] }
+fn vp_seam_last_confidence(s) { return s[VP_LAST_CONF] }
+fn vp_seam_last_error(s)      { return s[VP_LAST_ERR] }
+fn vp_seam_last_summary(s)    { return s[VP_LAST_SUMMARY] }
+fn vp_seam_call_count(s)      { return s[VP_CALL_COUNT] }
+fn vp_seam_default_decoder(s) { return s[VP_DEFAULT_DEC] }
+fn vp_seam_last_decoder(s)    { return s[VP_LAST_DEC] }
+fn vp_seam_last_decoder_name(s) { return _vp_name_for_id(s, s[VP_LAST_DEC]) }
+// R20C cross-modal fusion accessor: returns the most recent feature list (alias of last_features). Sensor fusion ring-buffers are R20C.2.
+fn _vp_recent_observations(s) { return s[VP_LAST_FEATS] }
+
+fn vp_register_decoder(s, name, decoder_id) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 {
+            list_set(ids, i, decoder_id)
+            return 1
+        }
+        i = i + 1
+    }
+    push(names, name)
+    push(ids, decoder_id)
+    list_set(s, VP_REG_COUNT, s[VP_REG_COUNT] + 1)
+    return 1
+}
+
+fn vp_seam_set_default(s, decoder_id) {
+    list_set(s, VP_DEFAULT_DEC, decoder_id)
+    return 1
+}
+
+fn vp_seam_decoder_id_for(s, name) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(names)
+    while i < n {
+        if str_eq(names[i], name) == 1 { return ids[i] }
+        i = i + 1
+    }
+    return VP_DECODER_NONE
+}
+
+// ---- result + mirror writers ----------------------------------------------
+
+fn _vp_result(s, feats, confidence, error_msg, summary) {
+    let triple = list_new()
+    push(triple, feats)
+    push(triple, confidence)
+    push(triple, error_msg)
+    list_set(s, VP_LAST_FEATS,   feats)
+    list_set(s, VP_LAST_CONF,    confidence)
+    list_set(s, VP_LAST_ERR,     error_msg)
+    list_set(s, VP_LAST_SUMMARY, summary)
+    list_set(s, VP_CALL_COUNT,   s[VP_CALL_COUNT] + 1)
+    return triple
+}
+
+// Lookup the registered name for a decoder id. Walks names+ids parallel
+// lists; returns the first matching name string, or "" if the id is
+// not registered. Used by `vp_seam_last_decoder_name(s)` to report
+// the decoder actually used for the most recent decode (which may differ
+// from the seam's default if extension routing dispatched to PNG/PGM).
+fn _vp_name_for_id(s, id) {
+    let names = s[VP_REG_NAMES]
+    let ids = s[VP_REG_IDS]
+    let i = 0
+    let n = len(ids)
+    while i < n {
+        if ids[i] == id { return names[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---- feature extraction (pure-function, image_pgm-shaped) -----------------
+//
+// `vp_features_for_image(w, h, data_ptr)` -- the substrate-facing surface
+// the perception path calls once the decoder has produced a pixel buffer.
+// Tests use this directly without going through a decoder.
+
+fn vp_features_for_image(width, height, data_ptr) {
+    let feats = list_new()
+    if width <= 0   { return feats }
+    if height <= 0  { return feats }
+    if data_ptr == 0 { return feats }
+
+    // Dimension bucket. We avoid an unnecessary width*height multiply when
+    // either dim is already over the medium threshold.
+    let area_bucket = 2   // 0=small, 1=medium, 2=large; default large
+    if width <= 256 {
+        if height <= 256 {
+            let area = width * height
+            if area <= VP_DIM_SMALL_AREA { area_bucket = 0 }
+            else {
+                if area <= VP_DIM_MEDIUM_AREA { area_bucket = 1 }
+            }
+        }
+    }
+    if area_bucket == 0 { push(feats, VP_LABEL_DIM_SMALL) }
+    if area_bucket == 1 { push(feats, VP_LABEL_DIM_MEDIUM) }
+    if area_bucket == 2 { push(feats, VP_LABEL_DIM_LARGE) }
+
+    // Mean intensity bucket.
+    let mean = pgm_mean_intensity(data_ptr, width, height)
+    if mean < VP_DARK_MEAN          { push(feats, VP_LABEL_DARK) }
+    else {
+        if mean > VP_BRIGHT_MEAN    { push(feats, VP_LABEL_BRIGHT) }
+        else                        { push(feats, VP_LABEL_MID) }
+    }
+
+    // Dominant intensity bucket as `image_bucket_<0..7>`.
+    let dom = pgm_dominant_intensity(data_ptr, width, height)
+    push(feats, "image_bucket_" + int_to_str(dom))
+
+    // Histogram entropy classification. Only emit a label at the extremes
+    // so the substrate has a clean peaked-vs-uniform signal -- mid-range
+    // entropy yields nothing on this axis (the dominant-bucket label
+    // already covers that case).
+    let hist = pgm_histogram(data_ptr, width, height)
+    let entropy = pgm_histogram_entropy_milli(hist)
+    if entropy < VP_ENTROPY_PEAKED  { push(feats, VP_LABEL_HIST_PEAKED) }
+    if entropy > VP_ENTROPY_UNIFORM { push(feats, VP_LABEL_HIST_UNIFORM) }
+
+    // P3.3 structural features (Sobel + Harris). Only fire if the image
+    // is large enough; smaller fixtures stick to the statistical labels
+    // above.
+    if width >= VP_STRUCTURAL_MIN_DIM {
+        if height >= VP_STRUCTURAL_MIN_DIM {
+            _vp_append_structural_features(feats, data_ptr, width, height)
+        }
+    }
+
+    return feats
+}
+
+// Compute the structural feature labels (Sobel edge density + dominant
+// orientation, Harris corner count + spatial distribution) and append
+// them to `feats`. Pulled out of vp_features_for_image so the structural
+// path stays easy to read and to skip when the image is too small.
+fn _vp_append_structural_features(feats, data_ptr, width, height) {
+    // Sobel: edge density + dominant orientation.
+    let sobel = sobel_apply(data_ptr, width, height)
+    let edge_count = sobel_result_edge_count(sobel)
+    let total = sobel_result_total(sobel)
+    let density_milli = sobel_edge_density_milli(edge_count, total)
+    if density_milli >= 100 { push(feats, VP_LABEL_EDGE_DENSE) }
+    else                    { push(feats, VP_LABEL_EDGE_SPARSE) }
+    let orient_counts = sobel_result_orient_counts(sobel)
+    let dom_orient = sobel_dominant_orientation(orient_counts)
+    if dom_orient >= 0 {
+        let orient_label = sobel_orient_label(dom_orient)
+        if len(orient_label) > 0 { push(feats, orient_label) }
+    }
+    // Harris: corner count bucket + spatial distribution.
+    let harris = harris_apply(data_ptr, width, height)
+    let corners = harris_result_corners(harris)
+    push(feats, harris_corner_count_label(len(corners)))
+    let dens = harris_density_labels(corners, width, height)
+    let i = 0
+    while i < len(dens) {
+        push(feats, dens[i])
+        i = i + 1
+    }
+    // SIFT keypoint count -- runs only when both axes are >= 32 (the
+    // 3-octave scale-space cannot sample usefully below that). Once we
+    // have keypoints we also run the 128-D descriptor pipeline and emit
+    // a parallel `image_descriptors_<bucket>` atom indicating how many
+    // structural fingerprints survived the rotation-invariant + L2-
+    // normalized descriptor build. The bucket counts ONLY valid
+    // descriptors (gradient-bearing regions); a "low" bucket means most
+    // of the detected keypoints sit on uniform fields where SIFT cannot
+    // build a discriminative descriptor.
+    if width >= VP_SIFT_MIN_DIM {
+        if height >= VP_SIFT_MIN_DIM {
+            let keypoints = sift_keypoints(data_ptr, width, height, VP_SIFT_MAX_KEYPOINTS)
+            push(feats, sift_count_label(len(keypoints)))
+            let descs = sift_describe_all(data_ptr, width, height, keypoints)
+            let valid_count = 0
+            let di = 0
+            while di < len(descs) {
+                if sift_descriptor_valid(descs[di]) == 1 {
+                    valid_count = int_add(valid_count, 1)
+                }
+                di = int_add(di, 1)
+            }
+            push(feats, sift_descriptor_count_label(valid_count))
+        }
+    }
+    // Canny edge-density bucket -- runs only when both axes are >= 32
+    // (smaller images don't have enough interior pixels for the NMS +
+    // hysteresis chain to be informative). Sobel-on-edges already fires
+    // on 16x16, so Canny adds NO label for tiny fixtures.
+    if width >= VP_CANNY_MIN_DIM {
+        if height >= VP_CANNY_MIN_DIM {
+            let canny_density = canny_density_milli(data_ptr, width, height)
+            push(feats, canny_density_label(canny_density))
+        }
+    }
+    // ORB keypoint-count + density atoms. ORB is the patent-free
+    // SIFT alternative -- FAST-9 + Harris ranking + intensity-centroid
+    // orientation + 256-bit rBRIEF + Hamming matcher.
+    if width >= VP_ORB_MIN_DIM {
+        if height >= VP_ORB_MIN_DIM {
+            let orb_r = orb_detect(data_ptr, width, height, VP_ORB_MAX_KEYPOINTS)
+            let orb_n = orb_result_count(orb_r)
+            push(feats, orb_kps_count_label(orb_n))
+            push(feats, orb_density_label(orb_n, int_mul(width, height)))
+        }
+    }
+    if width >= VP_STEREO_MIN_DIM { if height >= VP_STEREO_MIN_DIM { stereo_append_features_if_paired(feats, data_ptr, width, height) } }
+    if width >= VP_FLOW_MIN_DIM { if height >= VP_FLOW_MIN_DIM { lk_append_features_if_paired(feats, data_ptr, width, height) } }
+    seg_append_features(feats, data_ptr, width, height)
+    // R12B: SLIC boundary-adherent superpixels (>= 64x64 only).
+    slic_append_features(feats, data_ptr, width, height)
+    // R14D: HOG dense descriptor (>= 16x16 -- two 2x2 blocks of 8x8 cells minimum).
+    if width >= 16 { if height >= 16 { let _hog_r = hog_compute_default(data_ptr, width, height) push(feats, hog_descriptor_size_label(hog_result_descriptor_size(_hog_r))) push(feats, hog_dominant_bin_label(hog_result_dominant_bin(_hog_r))) } }
+    // R15C: HOG-based sliding-window detector (emits image_detector_count_* atom when CE_VP_DETECT_TEMPLATE is set to a PGM path).
+    det_append_features_if_templated(feats, data_ptr, width, height)
+    // R16D: Viola-Jones-style Haar cascade face detector (structural; emits image_face_count_* atom when CE_VP_FACE_DETECT=1).
+    face_append_features_if_enabled(feats, data_ptr, width, height)
+    // R17D: LBP texture descriptor (Ojala 1996) -- dominant-code atom + texture-entropy atom when image >= 32x32.
+    if width >= 32 { if height >= 32 { push(feats, lbp_dominant_code_label(lbp_dominant_code(data_ptr, width, height))) push(feats, lbp_texture_label(lbp_texture_entropy_milli(data_ptr, width, height))) } }
+    return 1
+}
+
+// vp_summary_for_image: operator-readable digest string. Format:
+//   "<w>x<h> mean=<mean> dom_bucket=<dom> entropy=<entropy_milli>"
+fn vp_summary_for_image(width, height, data_ptr) {
+    if width <= 0  { return "image: invalid dimensions" }
+    if height <= 0 { return "image: invalid dimensions" }
+    if data_ptr == 0 { return "image: no pixel data" }
+    let mean = pgm_mean_intensity(data_ptr, width, height)
+    let dom  = pgm_dominant_intensity(data_ptr, width, height)
+    let hist = pgm_histogram(data_ptr, width, height)
+    let ent  = pgm_histogram_entropy_milli(hist)
+    return int_to_str(width) + "x" + int_to_str(height)
+        + " mean=" + int_to_str(mean)
+        + " dom_bucket=" + int_to_str(dom)
+        + " entropy=" + int_to_str(ent)
+}
+
+// ---- STUB decoder ---------------------------------------------------------
+//
+// Deterministic single-element list `image_unavailable`. Always returns
+// confidence 0. Selected when CE_VP_DECODER=stub (or any tests that
+// explicitly switch via vp_seam_set_default).
+
+fn _vp_decode_stub(s, path) {
+    let feats = list_new()
+    push(feats, VP_STUB_LABEL)
+    return _vp_result(s, feats, VP_CONFIDENCE_STUB, "", "image: stub decoder (no pixel data)")
+}
+
+// ---- PGM decoder ----------------------------------------------------------
+//
+// Calls pgm_parse_file, then vp_features_for_image. Errors from the
+// underlying parser propagate to the seam's last_error slot and the
+// returned triple's error_msg. On error we still return a single-element
+// list with VP_STUB_LABEL so downstream callers always see at least one
+// atom (matches the contract of the STT seam).
+
+fn _vp_decode_pgm(s, path) {
+    let r = pgm_parse_file(path)
+    let err = pgm_result_error(r)
+    if len(err) > 0 {
+        let feats = list_new()
+        push(feats, VP_STUB_LABEL)
+        return _vp_result(s, feats, VP_CONFIDENCE_NONE, err, "image: pgm decode failed -- " + err)
+    }
+    let w    = pgm_result_width(r)
+    let h    = pgm_result_height(r)
+    let data = pgm_result_data(r)
+    let feats   = vp_features_for_image(w, h, data)
+    let summary = vp_summary_for_image(w, h, data)
+    return _vp_result(s, feats, VP_CONFIDENCE_DEFAULT, "", summary)
+}
+
+// ---- PNG decoder ----------------------------------------------------------
+//
+// Calls png_decode_grayscale_8 (which wraps the IDAT bytes through
+// deflate_decode_stored, so any PNG written by `pngcrush -force` / zlib
+// level 0 decodes; standard PNGs trip the documented
+// "deflate: BTYPE=NN not implemented (TODO)" error). The feature-
+// extraction surface (vp_features_for_image) is identical to the PGM
+// path -- once we have a [width, height, pixel_data] tuple the rest of
+// the pipeline is decoder-agnostic.
+
+fn _vp_decode_png(s, path) {
+    let r = png_decode_grayscale_8(path)
+    let err = png_result_error(r)
+    if len(err) > 0 {
+        let feats = list_new()
+        push(feats, VP_STUB_LABEL)
+        return _vp_result(s, feats, VP_CONFIDENCE_NONE, err, "image: png decode failed -- " + err)
+    }
+    let w    = png_result_width(r)
+    let h    = png_result_height(r)
+    let data = png_result_data(r)
+    let feats   = vp_features_for_image(w, h, data)
+    let summary = vp_summary_for_image(w, h, data)
+    return _vp_result(s, feats, VP_CONFIDENCE_DEFAULT, "", summary)
+}
+
+// ---- JPEG decoder ---------------------------------------------------------
+//
+// Calls jpeg_decode_grayscale, which today parses only the STRUCTURAL
+// half of a baseline grayscale JPEG (segment markers + DQT + SOF0 + DHT)
+// and returns the dimensions WITHOUT decoding any pixels. The full
+// entropy decode + IDCT + block assembly is deferred per
+// `JPEG_AUDIT.md` (estimated 3-4 more weeks). The seam still surfaces
+// the dimensions and a clear "JPEG entropy decode + IDCT not yet
+// implemented" diagnostic so operators and the perception path know
+// what is missing without the chat crashing.
+//
+// On success (dims-only): we emit a single VP_LABEL_JPEG_HEADER atom
+// + the dimension bucket atom so downstream learning has SOMETHING to
+// bind. Confidence is reported as VP_CONFIDENCE_NONE (zero) until the
+// full pixel-decoder lands.
+
+let VP_LABEL_JPEG_HEADER = "image_jpeg_header_only"
+
+fn _vp_decode_jpeg(s, path) {
+    let r = jpeg_decode_grayscale(path)
+    let err = jpeg_result_error(r)
+    let w   = jpeg_result_width(r)
+    let h   = jpeg_result_height(r)
+    let data = jpeg_result_data(r)
+    // Success path: pixel data available -- feed it through the same
+    // feature-extraction surface as PGM / PNG. This is the post-pipeline
+    // state once entropy decode + IDCT lands.
+    if jpeg_result_ok(r) == 1 {
+        let feats   = vp_features_for_image(w, h, data)
+        let summary = vp_summary_for_image(w, h, data)
+        return _vp_result(s, feats, VP_CONFIDENCE_DEFAULT, "", summary)
+    }
+    // Failure path: structural parse succeeded but pixel decode hit a
+    // documented gap (e.g. color JPEG, oversized dims, missing tables).
+    // Surface the dim bucket + header atom anyway so downstream learning
+    // has SOMETHING to bind, and pass the diagnostic through error_msg
+    // so the chat's "(saw image ... FAILED ...)" branch fires.
+    let feats = list_new()
+    push(feats, VP_LABEL_JPEG_HEADER)
+    let area_bucket = 2
+    if w > 0 {
+        if h > 0 {
+            if w <= 256 {
+                if h <= 256 {
+                    let area = w * h
+                    if area <= VP_DIM_SMALL_AREA { area_bucket = 0 }
+                    else {
+                        if area <= VP_DIM_MEDIUM_AREA { area_bucket = 1 }
+                    }
+                }
+            }
+        }
+    }
+    if area_bucket == 0 { push(feats, VP_LABEL_DIM_SMALL) }
+    if area_bucket == 1 { push(feats, VP_LABEL_DIM_MEDIUM) }
+    if area_bucket == 2 { push(feats, VP_LABEL_DIM_LARGE) }
+    let summary = ""
+    if w > 0 {
+        if h > 0 {
+            summary = "image: jpeg " + int_to_str(w) + "x" + int_to_str(h)
+                + " header parsed (pixel decode failed: " + err + ")"
+        } else {
+            summary = "image: jpeg decode failed -- " + err
+        }
+    } else {
+        summary = "image: jpeg decode failed -- " + err
+    }
+    return _vp_result(s, feats, VP_CONFIDENCE_NONE, err, summary)
+}
+
+// ---- file-extension routing -----------------------------------------------
+//
+// `_vp_pick_decoder_for_path(seam, path)` lets the seam route a `.png`
+// path to the PNG decoder even when the default is PGM (and vice versa).
+// The user-facing default still wins when the path has no recognised
+// extension. Comparison is case-sensitive on the trailing 4 bytes
+// (most images on disk use lowercase, and operators using uppercase
+// can fall back to CE_VP_DECODER).
+
+fn _vp_path_ends_with_png(path) {
+    let n = len(path)
+    if n < 4 { return 0 }
+    if char_at(path, n - 4) != 46 { return 0 }    // '.'
+    if char_at(path, n - 3) != 112 { return 0 }   // 'p'
+    if char_at(path, n - 2) != 110 { return 0 }   // 'n'
+    if char_at(path, n - 1) != 103 { return 0 }   // 'g'
+    return 1
+}
+
+fn _vp_path_ends_with_pgm(path) {
+    let n = len(path)
+    if n < 4 { return 0 }
+    if char_at(path, n - 4) != 46 { return 0 }    // '.'
+    if char_at(path, n - 3) != 112 { return 0 }   // 'p'
+    if char_at(path, n - 2) != 103 { return 0 }   // 'g'
+    if char_at(path, n - 1) != 109 { return 0 }   // 'm'
+    return 1
+}
+
+fn _vp_path_ends_with_jpg(path) {
+    let n = len(path)
+    if n < 4 { return 0 }
+    if char_at(path, n - 4) != 46 { return 0 }    // '.'
+    if char_at(path, n - 3) != 106 { return 0 }   // 'j'
+    if char_at(path, n - 2) != 112 { return 0 }   // 'p'
+    if char_at(path, n - 1) != 103 { return 0 }   // 'g'
+    return 1
+}
+
+fn _vp_path_ends_with_jpeg(path) {
+    let n = len(path)
+    if n < 5 { return 0 }
+    if char_at(path, n - 5) != 46 { return 0 }    // '.'
+    if char_at(path, n - 4) != 106 { return 0 }   // 'j'
+    if char_at(path, n - 3) != 112 { return 0 }   // 'p'
+    if char_at(path, n - 2) != 101 { return 0 }   // 'e'
+    if char_at(path, n - 1) != 103 { return 0 }   // 'g'
+    return 1
+}
+
+fn _vp_pick_decoder_for_path(s, path) {
+    // Forced STUB: never auto-route, the operator wants the placeholder.
+    let dflt = s[VP_DEFAULT_DEC]
+    if dflt == VP_DECODER_STUB { return VP_DECODER_STUB }
+    if _vp_path_ends_with_png(path) == 1 { return VP_DECODER_PNG }
+    if _vp_path_ends_with_pgm(path) == 1 { return VP_DECODER_PGM }
+    if _vp_path_ends_with_jpg(path) == 1 { return VP_DECODER_JPEG }
+    if _vp_path_ends_with_jpeg(path) == 1 { return VP_DECODER_JPEG }
+    return dflt
+}
+
+// ---- public dispatch ------------------------------------------------------
+
+// vp_decode_image(seam, path) -> [feature_atoms, confidence_milli,
+//                                 error_msg]
+//
+// Routes to the seam's active decoder, with per-call extension detection
+// for the common case of an operator passing a `.png` or `.pgm` path:
+// `.png` -> PNG decoder; `.pgm` -> PGM decoder; anything else -> seam
+// default. Tests can swap decoders via vp_seam_set_default; chat /
+// daemon resolves once from env.
+fn vp_decode_image(s, path) {
+    let id = _vp_pick_decoder_for_path(s, path)
+    list_set(s, VP_LAST_DEC, id)
+    if id == VP_DECODER_PGM    { return _vp_decode_pgm(s, path) }
+    if id == VP_DECODER_PNG    { return _vp_decode_png(s, path) }
+    if id == VP_DECODER_JPEG   { return _vp_decode_jpeg(s, path) }
+    if id == VP_DECODER_STUB   { return _vp_decode_stub(s, path) }
+    // Custom / unknown ids fall through to STUB (same contract as
+    // stt_seam.nova). A pluggable future replaces this with a function-
+    // pointer table when NOVA gains first-class fn pointers.
+    list_set(s, VP_LAST_DEC, VP_DECODER_STUB)
+    return _vp_decode_stub(s, path)
+}
+
+// ---- result-tuple accessors (mirror stt_result_*) ------------------------
+
+fn vp_result_features(r)   { return r[0] }
+fn vp_result_confidence(r) { return r[1] }
+fn vp_result_error(r)      { return r[2] }

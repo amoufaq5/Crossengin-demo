@@ -1,0 +1,789 @@
+// CrossEngin knowledge: semantic search over atom labels / text fields.
+//
+// Purpose
+//   The KG read story already covers exact lookup by atom id
+//   (atom_store), episodic retrieval by member / window / pattern
+//   (R6F + R8F, src/kg/episodic.nova), and the LSH-bucketed cosine
+//   nearest-neighbour over the milli-fixed-point atom EMBEDDING
+//   (`ann_index`, src/kg/ann_index.nova). What was missing is a
+//   purely textual "atoms whose LABELS look semantically similar to
+//   this query" surface -- so a chat operator can type `/find
+//   "machine learning"` and the substrate ranks ALL atoms by how
+//   well their label / text matches, without consulting an LLM or any
+//   neural embedding service.
+//
+//   This module implements a classic information-retrieval ranker:
+//   sub-linearly scaled term-frequency * inverse-document-frequency
+//   (TF-IDF), stored as integer milli-units (scale 1000, matching
+//   the substrate convention from node_pool_manager.nova / FP_SCALE),
+//   compared via cosine similarity (integer dot product / integer
+//   square root via Newton's method). Every input is text, every
+//   output is an integer score, nothing learned, nothing trained --
+//   pure deterministic counting math.
+//
+// Algorithm summary
+//   1. Tokenize: split on whitespace + ASCII punctuation, lowercase,
+//      drop tokens shorter than SS_MIN_TOKEN_LEN or longer than
+//      SS_MAX_TOKEN_LEN.
+//   2. TF: count(t in atom_text), then sub-linearly scaled as
+//      `1 + log2(count)`, stored as a milli integer. Sub-linear scale
+//      avoids over-weighting one atom that happens to repeat a token
+//      ten times. (This is the same family of TF kernels Lucene and
+//      friends use; we picked the simplest one that handles count=1
+//      gracefully: log2(1)=0 -> 1+0 = 1.0.)
+//   3. IDF (re-computed at query time only, cached in the index so
+//      identical queries pay the price once): `idf(t) = log2(N / df(t))`,
+//      stored as milli. N = total atoms in the index, df = number of
+//      atoms containing token t. We use integer log2 via the standard
+//      "count leading zeros" identity: log2(x) ~= floor(log2(x)) when
+//      x is a power of two, and we linearly interpolate the fractional
+//      part using the next bit so very-rare tokens (df=1, big N) get a
+//      LARGER idf than common tokens (df ~ N).
+//   4. TF-IDF: tfidf(t, a) = tf(t, a) * idf(t) / 1000 (the /1000
+//      keeps the milli-units consistent: milli * milli / 1000 = milli).
+//      Stored as a sparse list of [token_id, score_milli] pairs per
+//      atom; sorted by token_id so dot-product can be a merge-walk.
+//   5. Cosine: dot(a, b) / (norm(a) * norm(b)), where dot is the
+//      sum of co-occurring tfidf products and norm is sqrt(sum of
+//      tfidf^2). Returned as milli (0..1000). Identical vectors hit
+//      1000 exactly; orthogonal vectors hit 0 exactly.
+//   6. Top-K: insertion-sort over the candidate list (N is bounded by
+//      the inverted-index post lookup; the same O(N^2) the episodic
+//      retrieval module uses for the same bounded-N reason).
+//
+// Index layout (all sparse, list-of-pairs to avoid the 16-key builtin-map
+// cap NOVA's only map type has):
+//   ss_index = [SS_OBJ_TAG, tokens, forward, inverted, idf_cache,
+//               idf_valid, atom_text]
+//     - tokens:    list of [token_str, df]; token_id == position index
+//     - forward:   list of [atom_id, list[[token_id, tfidf_milli]],
+//                  norm_milli]; sorted by token_id internally
+//     - inverted:  list of [token_id, list[atom_id]]
+//     - idf_cache: list of idf_milli per token_id; -1 if invalid
+//     - idf_valid: 1 if the cache reflects the current corpus
+//     - atom_text: list of [atom_id, lower-cased text] for debugging /
+//                  search_by_atom_id (no re-tokenize needed; we keep
+//                  the canonical pre-IDF form, NOT the raw user input)
+//
+// ADRs implemented: ADR-0016 (atom labels are the textual field we rank),
+//   ADR-0049 (testing + benchmarks -- this module ships >=30 unit
+//   assertions per the brief).
+// NOVA dependencies: builtins (lists, str_lower, len, char_at, push,
+//   list_set, str_eq); std/io + std/string (re-imported by the chat
+//   dispatch surface below for io_println + rt_str_to_int).
+// CrossEngin dependencies: src/substrate/node_pool_manager.nova
+//   (FP_SCALE, fp_clamp -- the milli-fixed-point convention).
+
+import "std/io"
+import "std/string"
+import "../substrate/node_pool_manager.nova"
+import "multi_kg_manager.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let SS_MIN_TOKEN_LEN  = 3   // drop "a", "is", "an" -- noise tokens
+let SS_MAX_TOKEN_LEN  = 30  // drop overlong runs (URLs, hex blobs, ...)
+let SS_TOP_K_DEFAULT  = 5   // default top-K for the chat dispatch
+let SS_TOP_K_MAX      = 1000
+
+// ---- ss_index shape -------------------------------------------------------
+let SS_OBJ_TAG     = 1901   // distinct from ANN (1801), EPATOM (1602), ATOM (1601)
+let SS_TAG         = 0
+let SS_TOKENS      = 1
+let SS_FORWARD     = 2
+let SS_INVERTED    = 3
+let SS_IDF_CACHE   = 4
+let SS_IDF_VALID   = 5
+let SS_ATOM_TEXT   = 6
+
+let SS_TOK_STR     = 0
+let SS_TOK_DF      = 1
+
+let SS_FWD_ID      = 0
+let SS_FWD_VEC     = 1   // sorted-by-token_id list of [token_id, tfidf_milli]
+let SS_FWD_NORM    = 2   // sqrt(sum(tfidf^2)) in milli, cached after IDF
+
+let SS_INV_TID     = 0
+let SS_INV_POSTS   = 1
+
+let SS_TEXT_ID     = 0
+let SS_TEXT_BODY   = 1
+
+// ---- integer math helpers -------------------------------------------------
+//
+// Integer square root via Newton's method. Same Babylonian iteration the
+// ANN index uses (atom_store.isqrt) but kept local so this module does not
+// pull atom_store upstream just for one helper -- the dependency layer
+// stays kg/* leaf modules independent of each other.
+fn _int_sqrt(x) {
+    if x <= 0 { return 0 }
+    if x == 1 { return 1 }
+    let g = x
+    let h = (g + 1) / 2
+    while h < g {
+        g = h
+        h = (g + x / g) / 2
+    }
+    return g
+}
+
+// Integer log2 in milli (scale 1000). Returns 0 for x <= 1 (log2(1) = 0).
+// Uses the "highest set bit" identity: floor(log2(x)) is the position of
+// the leading 1-bit; we add a milli-fraction by linearly interpolating
+// across the next bit so log2(3) lands between 1000 and 2000 (not just
+// 1000). The interpolation: log2(2^k + r) ~= k + r / 2^k, kept in milli.
+//
+// Codegen note: every multiply here stays below the 1048576 threshold
+// (NOVA bug #11 workaround) -- the largest is `frac * 1000`, with frac
+// bounded by 2^k <= x, and x bounded by N (atom count); N over 2^30 would
+// be an arithmetic worry, but N <= SS_TOP_K_MAX is the realistic ceiling.
+fn _int_log2(x) {
+    if x <= 1 { return 0 }
+    // Find the highest set bit k such that 2^k <= x < 2^(k+1).
+    let k = 0
+    let p = 1   // 2^k
+    while p * 2 <= x {
+        p = p * 2
+        k = k + 1
+    }
+    // Linear interpolation on the next bit: frac = x - p, denominator p.
+    // log2(x) ~= k + frac/p; return in milli.
+    let frac = x - p
+    let f_milli = 0
+    if p > 0 { f_milli = (frac * FP_SCALE) / p }
+    return (k * FP_SCALE) + f_milli
+}
+
+// IDF in milli for a term with `df` postings out of `n` total atoms.
+// Uses an additive smoothing of +1 milli so a term in EVERY document
+// still gets a tiny non-zero IDF -- enough that two identical atoms
+// hit cosine == 1000 milli (per the brief's identical-vector property
+// test), while rare tokens still dominate the score. Standard Lucene
+// also adds a smoothing term; we picked the smallest constant that
+// preserves the "rare > common" ordering at integer resolution.
+//
+// Precision note: a naive `n / df` loses every fractional bit when n
+// and df are close (the 3-doc, df=2 case rounds 3/2 = 1, then log2(1)
+// = 0 milli -- collapsing every common-ish token to the smoothing
+// floor). We compute log2(n) - log2(df) in milli instead, which keeps
+// the discrimination across the full corpus range: log2(3) - log2(2)
+// = ~1585 - 1000 = ~585 milli for the df=2-of-3 case.
+//
+// Edge cases:
+//   - df = 0: term not in the corpus, IDF = log2(n) + smoothing.
+//   - df >= n: term in every atom, IDF = smoothing constant only
+//     (still nonzero, so identical-vector cosine works out to 1000).
+let SS_IDF_SMOOTH = 100
+fn _idf_milli(n, df) {
+    if n <= 0 { return 0 }
+    if df <= 0 { return _int_log2(n) + SS_IDF_SMOOTH }
+    if df >= n { return SS_IDF_SMOOTH }
+    let diff = _int_log2(n) - _int_log2(df)
+    if diff < 0 { diff = 0 }
+    return diff + SS_IDF_SMOOTH
+}
+
+// ---- tokenization --------------------------------------------------------
+//
+// Split on whitespace + ASCII punctuation, lowercase, drop short / long.
+// We walk the lowered string once, emitting tokens as we see runs of
+// alphanumeric / underscore characters; punctuation acts as a delimiter.
+// This mirrors what most TF-IDF pipelines do as their cheapest tokenizer.
+//
+// Character classification (ASCII only; UTF-8 multi-byte sequences pass
+// through verbatim as raw bytes -- we don't split them, so "Hello, World!"
+// in any 7-bit-clean encoding tokenizes to ["hello", "world"]):
+//   - 0..47:           punctuation / control / space      -> delimiter
+//   - 48..57   (0..9): digit                              -> token char
+//   - 58..64:          punctuation (':', ';', '<', '=', ...) -> delimiter
+//   - 65..90   (A..Z): letter (already lowered to 97..122) -> token char
+//   - 91..94:          punctuation ('[', '\\', ']', '^')   -> delimiter
+//   - 95       ('_'):  underscore                          -> token char
+//   - 96:              backtick                            -> delimiter
+//   - 97..122  (a..z): letter                              -> token char
+//   - 123..127:        punctuation ('{', '|', '}', '~', DEL) -> delimiter
+//   - >=128:           UTF-8 lead/continuation byte        -> token char
+//                      (so "café" stays as "café"; we don't NFD-fold)
+fn _ss_is_token_char(c) {
+    if c >= 128 { return 1 }
+    if c >= 97 {
+        if c <= 122 { return 1 }
+        return 0
+    }
+    if c == 95 { return 1 }
+    if c >= 48 {
+        if c <= 57 { return 1 }
+    }
+    return 0
+}
+
+fn _tokenize(text) {
+    let out = list_new()
+    if len(text) == 0 { return out }
+    let lower = str_lower(text)
+    let n = len(lower)
+    let i = 0
+    let start = -1
+    while i < n {
+        let c = char_at(lower, i)
+        let is_tok = _ss_is_token_char(c)
+        if is_tok == 1 {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 {
+                let tok_len = i - start
+                if tok_len >= SS_MIN_TOKEN_LEN {
+                    if tok_len <= SS_MAX_TOKEN_LEN {
+                        push(out, substr(lower, start, tok_len))
+                    }
+                }
+                start = -1
+            }
+        }
+        i = i + 1
+    }
+    if start >= 0 {
+        let tok_len = n - start
+        if tok_len >= SS_MIN_TOKEN_LEN {
+            if tok_len <= SS_MAX_TOKEN_LEN {
+                push(out, substr(lower, start, tok_len))
+            }
+        }
+    }
+    return out
+}
+
+// ---- constructor + accessors ---------------------------------------------
+fn ss_index_new() {
+    let ix = list_new()
+    push(ix, SS_OBJ_TAG)
+    push(ix, list_new())   // tokens
+    push(ix, list_new())   // forward
+    push(ix, list_new())   // inverted
+    push(ix, list_new())   // idf_cache
+    push(ix, 0)            // idf_valid (0 = stale)
+    push(ix, list_new())   // atom_text
+    return ix
+}
+
+fn ss_index_atom_count(ix) { return len(ix[SS_FORWARD]) }
+fn ss_index_token_count(ix) { return len(ix[SS_TOKENS]) }
+
+// Look up the position of a token in the token table; -1 if absent.
+fn _ss_token_lookup(ix, tok) {
+    let tokens = ix[SS_TOKENS]
+    let i = 0
+    while i < len(tokens) {
+        if str_eq(tokens[i][SS_TOK_STR], tok) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Register (or fetch) a token; returns its token_id. Bumps df on a new
+// atom-attribution path (the caller passes one atom_id per add call, and
+// we increment df once per token per atom -- not once per occurrence).
+fn _ss_token_intern(ix, tok) {
+    let tid = _ss_token_lookup(ix, tok)
+    if tid >= 0 { return tid }
+    let tokens = ix[SS_TOKENS]
+    let entry = list_new()
+    push(entry, tok)
+    push(entry, 0)
+    push(tokens, entry)
+    // Mirror the slot in the inverted index + IDF cache so token_id
+    // indexes line up across all three arrays.
+    let inv = ix[SS_INVERTED]
+    let inv_entry = list_new()
+    push(inv_entry, len(tokens) - 1)
+    push(inv_entry, list_new())
+    push(inv, inv_entry)
+    push(ix[SS_IDF_CACHE], -1)
+    return len(tokens) - 1
+}
+
+fn _ss_token_bump_df(ix, tid) {
+    let tok = ix[SS_TOKENS][tid]
+    list_set(tok, SS_TOK_DF, tok[SS_TOK_DF] + 1)
+    return 1
+}
+
+fn _ss_inverted_post(ix, tid, atom_id) {
+    let posts = ix[SS_INVERTED][tid][SS_INV_POSTS]
+    let i = 0
+    while i < len(posts) {
+        if posts[i] == atom_id { return 0 }
+        i = i + 1
+    }
+    push(posts, atom_id)
+    return 1
+}
+
+// Look up the forward-index slot for `atom_id`; -1 if absent.
+fn _ss_forward_lookup(ix, atom_id) {
+    let fwd = ix[SS_FORWARD]
+    let i = 0
+    while i < len(fwd) {
+        if fwd[i][SS_FWD_ID] == atom_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Sub-linearly scaled TF in milli: 1 + log2(count), so a token appearing
+// once contributes 1000 milli, twice contributes ~2000 milli (1 + log2(2)),
+// etc. `count` is the raw occurrence count of the token in this atom.
+fn _ss_tf_milli(count) {
+    if count <= 0 { return 0 }
+    return FP_SCALE + _int_log2(count)
+}
+
+// Add (or replace) an atom in the index. Re-adding the same atom_id with
+// the SAME text is a no-op (idempotency requirement from the brief): we
+// dedupe by atom_id in the forward slot, so subsequent ss_index_add_atom
+// calls overwrite rather than double-count.
+//
+// Returns the index (for chaining); never 0. Marks the IDF cache stale so
+// the next search recomputes.
+fn ss_index_add_atom(ix, atom_id, text) {
+    // Idempotency: if the atom is already present, drop the old row
+    // (rare: the typical workflow is add-once during indexing). We
+    // remove by rebuilding the forward / inverted entries without the
+    // stale pointers; this keeps the API simple and protects callers
+    // from doubled scores when an atom's label is updated.
+    let existing = _ss_forward_lookup(ix, atom_id)
+    if existing >= 0 {
+        _ss_remove_forward(ix, existing)
+    }
+    let tokens = _tokenize(text)
+    // Empty text: still record the atom (with an empty vector) so
+    // search_by_atom_id can find it and so the atom count is accurate.
+    let counts = _ss_count_tokens(tokens)
+    // Mint token ids + bump df once per unique token per atom.
+    let vec = list_new()
+    let i = 0
+    while i < len(counts) {
+        let pair = counts[i]
+        let tid = _ss_token_intern(ix, pair[0])
+        _ss_token_bump_df(ix, tid)
+        _ss_inverted_post(ix, tid, atom_id)
+        let entry = list_new()
+        push(entry, tid)
+        push(entry, _ss_tf_milli(pair[1]))   // store TF only; multiply by IDF at query time
+        push(vec, entry)
+        i = i + 1
+    }
+    _ss_sort_vec_by_tid(vec)
+    let fwd_entry = list_new()
+    push(fwd_entry, atom_id)
+    push(fwd_entry, vec)
+    push(fwd_entry, 0)             // norm filled in lazily at query time
+    push(ix[SS_FORWARD], fwd_entry)
+    let txt_entry = list_new()
+    push(txt_entry, atom_id)
+    push(txt_entry, str_lower(text))
+    push(ix[SS_ATOM_TEXT], txt_entry)
+    list_set(ix, SS_IDF_VALID, 0)  // mark cache stale
+    return ix
+}
+
+// Helper: walk the token list, return a list of [token_str, count] pairs.
+fn _ss_count_tokens(tokens) {
+    let counts = list_new()
+    let i = 0
+    while i < len(tokens) {
+        let t = tokens[i]
+        let found = -1
+        let j = 0
+        while j < len(counts) {
+            if found < 0 {
+                if str_eq(counts[j][0], t) == 1 { found = j }
+            }
+            j = j + 1
+        }
+        if found >= 0 {
+            list_set(counts[found], 1, counts[found][1] + 1)
+        } else {
+            let pair = list_new()
+            push(pair, t)
+            push(pair, 1)
+            push(counts, pair)
+        }
+        i = i + 1
+    }
+    return counts
+}
+
+// Insertion-sort a vector of [token_id, score] pairs by token_id ascending.
+// O(N^2) but N == unique-tokens-per-atom which is small (< 100 typical).
+fn _ss_sort_vec_by_tid(vec) {
+    let n = len(vec)
+    let i = 1
+    while i < n {
+        let cur = vec[i]
+        let j = i - 1
+        let placed = 0
+        while j >= 0 {
+            if placed == 0 {
+                if vec[j][0] > cur[0] {
+                    list_set(vec, j + 1, vec[j])
+                    j = j - 1
+                } else {
+                    list_set(vec, j + 1, cur)
+                    placed = 1
+                    j = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(vec, 0, cur) }
+        i = i + 1
+    }
+    return vec
+}
+
+// Remove the forward slot at `pos` AND decrement df / strip postings for
+// every token that pointed at it. The token entry stays (we never shrink
+// the token table; df hitting zero just makes the slot uninformative for
+// future queries). Caller must hold a fresh idf_valid=0 after.
+fn _ss_remove_forward(ix, pos) {
+    let fwd = ix[SS_FORWARD]
+    let row = fwd[pos]
+    let atom_id = row[SS_FWD_ID]
+    let vec = row[SS_FWD_VEC]
+    let i = 0
+    while i < len(vec) {
+        let tid = vec[i][0]
+        let tok = ix[SS_TOKENS][tid]
+        if tok[SS_TOK_DF] > 0 {
+            list_set(tok, SS_TOK_DF, tok[SS_TOK_DF] - 1)
+        }
+        let posts = ix[SS_INVERTED][tid][SS_INV_POSTS]
+        let new_posts = list_new()
+        let j = 0
+        while j < len(posts) {
+            if posts[j] != atom_id { push(new_posts, posts[j]) }
+            j = j + 1
+        }
+        list_set(ix[SS_INVERTED][tid], SS_INV_POSTS, new_posts)
+        i = i + 1
+    }
+    // Rebuild the forward list without `pos`.
+    let new_fwd = list_new()
+    let k = 0
+    while k < len(fwd) {
+        if k != pos { push(new_fwd, fwd[k]) }
+        k = k + 1
+    }
+    list_set(ix, SS_FORWARD, new_fwd)
+    // Same dance for atom_text.
+    let txts = ix[SS_ATOM_TEXT]
+    let new_txts = list_new()
+    let m = 0
+    while m < len(txts) {
+        if txts[m][SS_TEXT_ID] != atom_id { push(new_txts, txts[m]) }
+        m = m + 1
+    }
+    list_set(ix, SS_ATOM_TEXT, new_txts)
+    return 1
+}
+
+// ---- IDF cache + per-atom norm -------------------------------------------
+//
+// Lazily recompute the IDF cache + each forward vector's L2 norm. Called
+// once per search; cheap if the index hasn't changed since the previous
+// search (idf_valid flag guards). Norm is sqrt(sum(tfidf^2)).
+fn _ss_refresh_idf(ix) {
+    if ix[SS_IDF_VALID] == 1 { return 1 }
+    let n = len(ix[SS_FORWARD])
+    let tokens = ix[SS_TOKENS]
+    let cache = list_new()
+    let i = 0
+    while i < len(tokens) {
+        push(cache, _idf_milli(n, tokens[i][SS_TOK_DF]))
+        i = i + 1
+    }
+    list_set(ix, SS_IDF_CACHE, cache)
+    // Refresh per-atom norms.
+    let fwd = ix[SS_FORWARD]
+    let k = 0
+    while k < len(fwd) {
+        let row = fwd[k]
+        let vec = row[SS_FWD_VEC]
+        let sumsq = 0
+        let j = 0
+        while j < len(vec) {
+            let tid = vec[j][0]
+            let tf = vec[j][1]
+            let idf = cache[tid]
+            let tfidf = (tf * idf) / FP_SCALE
+            sumsq = sumsq + tfidf * tfidf
+            j = j + 1
+        }
+        list_set(row, SS_FWD_NORM, _int_sqrt(sumsq))
+        k = k + 1
+    }
+    list_set(ix, SS_IDF_VALID, 1)
+    return 1
+}
+
+// Build the query TF-IDF vector: identical shape to a forward-index row
+// but token_ids are looked up (not minted) so unknown query terms are
+// silently dropped. Returns [vec, norm_milli].
+fn _ss_query_vector(ix, text) {
+    let tokens = _tokenize(text)
+    let counts = _ss_count_tokens(tokens)
+    let cache = ix[SS_IDF_CACHE]
+    let vec = list_new()
+    let sumsq = 0
+    let i = 0
+    while i < len(counts) {
+        let tid = _ss_token_lookup(ix, counts[i][0])
+        if tid >= 0 {
+            let tf = _ss_tf_milli(counts[i][1])
+            let idf = cache[tid]
+            let tfidf = (tf * idf) / FP_SCALE
+            if tfidf > 0 {
+                let entry = list_new()
+                push(entry, tid)
+                push(entry, tfidf)
+                push(vec, entry)
+                sumsq = sumsq + tfidf * tfidf
+            }
+        }
+        i = i + 1
+    }
+    _ss_sort_vec_by_tid(vec)
+    let out = list_new()
+    push(out, vec)
+    push(out, _int_sqrt(sumsq))
+    return out
+}
+
+// Cosine similarity (milli) between query vector + a forward-index row's
+// stored TF vector. We multiply the row TF by its cached IDF on the fly
+// (since we only need it in the dot path, not stored everywhere).
+//
+// Precision note: tfidf values are stored in milli; a naive
+// (q_tfidf * d_tfidf) / 1000 in the dot loop loses every bit below ~1
+// when tfidf is small. Keep the dot in raw milli^2 product space and
+// normalize ONCE at the end -- norms are also in milli^2-space-sqrt'd
+// so the units cancel cleanly: dot[milli^2] / (norm[milli] * norm[milli])
+// = scalar in [0,1]; multiply by 1000 to convert to milli output.
+fn _ss_cosine_milli(query_vec, query_norm, fwd_row, idf_cache) {
+    if query_norm <= 0 { return 0 }
+    let row_norm = fwd_row[SS_FWD_NORM]
+    if row_norm <= 0 { return 0 }
+    let qv = query_vec
+    let dv = fwd_row[SS_FWD_VEC]
+    let qi = 0
+    let di = 0
+    let dot = 0
+    while qi < len(qv) {
+        if di >= len(dv) { qi = len(qv) } else {
+            let qt = qv[qi][0]
+            let dt = dv[di][0]
+            if qt == dt {
+                let q_tfidf = qv[qi][1]
+                let d_tf = dv[di][1]
+                let d_idf = idf_cache[dt]
+                let d_tfidf = (d_tf * d_idf) / FP_SCALE
+                dot = dot + q_tfidf * d_tfidf
+                qi = qi + 1
+                di = di + 1
+            } else {
+                if qt < dt { qi = qi + 1 } else { di = di + 1 }
+            }
+        }
+    }
+    let denom = query_norm * row_norm
+    if denom <= 0 { return 0 }
+    let cos = (dot * FP_SCALE) / denom
+    return fp_clamp(cos, 0, FP_SCALE)
+}
+
+// ---- public search API ---------------------------------------------------
+
+fn _ss_clamp_top_k(top_k) {
+    if top_k <= 0 { return 0 }
+    if top_k > SS_TOP_K_MAX { return SS_TOP_K_MAX }
+    return top_k
+}
+
+// Insertion-sort over a list of [atom_id, similarity] entries by sim desc,
+// tertiary by id asc to deterministically break ties. N is bounded by the
+// candidate set (every atom containing at least one query token), so even
+// at SS_TOP_K_MAX = 1000 this is microseconds.
+fn _ss_rank_by_sim(hits) {
+    let n = len(hits)
+    let i = 1
+    while i < n {
+        let cur = hits[i]
+        let j = i - 1
+        let placed = 0
+        while j >= 0 {
+            if placed == 0 {
+                let better = 0
+                if cur[1] > hits[j][1] {
+                    better = 1
+                } else {
+                    if cur[1] == hits[j][1] {
+                        if cur[0] < hits[j][0] { better = 1 }
+                    }
+                }
+                if better == 1 {
+                    list_set(hits, j + 1, hits[j])
+                    j = j - 1
+                } else {
+                    list_set(hits, j + 1, cur)
+                    placed = 1
+                    j = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(hits, 0, cur) }
+        i = i + 1
+    }
+    return hits
+}
+
+fn _ss_truncate(hits, k) {
+    if k <= 0 {
+        let empty = list_new()
+        return empty
+    }
+    let n = len(hits)
+    if n <= k { return hits }
+    let out = list_new()
+    let i = 0
+    while i < k {
+        push(out, hits[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Core scoring routine: walks every atom in the forward index, computes
+// cosine vs query_vec, drops zero scores, and returns the unsorted list.
+// Used by both ss_search and ss_search_by_atom_id.
+fn _ss_score_all(ix, query_vec, query_norm, exclude_atom_id) {
+    let cache = ix[SS_IDF_CACHE]
+    let fwd = ix[SS_FORWARD]
+    let hits = list_new()
+    let i = 0
+    while i < len(fwd) {
+        let row = fwd[i]
+        let aid = row[SS_FWD_ID]
+        let skip = 0
+        if exclude_atom_id >= 0 {
+            if aid == exclude_atom_id { skip = 1 }
+        }
+        if skip == 0 {
+            let sim = _ss_cosine_milli(query_vec, query_norm, row, cache)
+            if sim > 0 {
+                let entry = list_new()
+                push(entry, aid)
+                push(entry, sim)
+                push(hits, entry)
+            }
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+// Top-K most similar atoms to the given text query. Empty index OR empty
+// query OR top_k <= 0 -> empty list. Each hit is [atom_id, sim_milli].
+fn ss_search(ix, query_text, top_k) {
+    let k = _ss_clamp_top_k(top_k)
+    let empty = list_new()
+    if k == 0 { return empty }
+    if ss_index_atom_count(ix) == 0 { return empty }
+    if len(query_text) == 0 { return empty }
+    _ss_refresh_idf(ix)
+    let qv = _ss_query_vector(ix, query_text)
+    if len(qv[0]) == 0 { return empty }
+    let hits = _ss_score_all(ix, qv[0], qv[1], 0 - 1)
+    _ss_rank_by_sim(hits)
+    return _ss_truncate(hits, k)
+}
+
+// Top-K most similar atoms to the existing atom referenced by `atom_id`.
+// Excludes the query atom from results. Returns empty if the atom is not
+// in the index.
+fn ss_search_by_atom_id(ix, atom_id, top_k) {
+    let k = _ss_clamp_top_k(top_k)
+    let empty = list_new()
+    if k == 0 { return empty }
+    let pos = _ss_forward_lookup(ix, atom_id)
+    if pos < 0 { return empty }
+    if ss_index_atom_count(ix) <= 1 { return empty }
+    _ss_refresh_idf(ix)
+    // Pull the canonical lowered text we stashed at index time and re-
+    // tokenize against the CURRENT corpus -- this picks up any tokens
+    // that have gained IDF since the original add.
+    let txts = ix[SS_ATOM_TEXT]
+    let i = 0
+    let text = ""
+    while i < len(txts) {
+        if txts[i][SS_TEXT_ID] == atom_id { text = txts[i][SS_TEXT_BODY] }
+        i = i + 1
+    }
+    let qv = _ss_query_vector(ix, text)
+    if len(qv[0]) == 0 { return empty }
+    let hits = _ss_score_all(ix, qv[0], qv[1], atom_id)
+    _ss_rank_by_sim(hits)
+    return _ss_truncate(hits, k)
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// Mirror of episodic_recall_cmd: same emit-line discipline (HEADER /
+// per-result / END), same usage-line convention.
+fn _ss_emit_results(label, hits) {
+    io_println("FIND " + label + " matched=" + int_to_str(len(hits)))
+    let i = 0
+    while i < len(hits) {
+        let row = hits[i]
+        io_println("RESULT rank=" + int_to_str(i + 1)
+            + " atom_id=" + int_to_str(row[0])
+            + " sim=" + int_to_str(row[1]) + " milli")
+        i = i + 1
+    }
+    io_println("FIND_END " + label)
+    return 1
+}
+
+// Build an index covering every atom in `kg`: id -> label. Used by the
+// chat dispatch so /find walks the live KG without the operator having
+// to maintain a persistent semantic-search index. Idempotent: re-builds
+// from scratch every call (the chat doesn't keep an ss_index between
+// calls; this matches /recall's "transient" pattern in episodic.nova).
+fn ss_index_from_kg(kg) {
+    let ix = ss_index_new()
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        ss_index_add_atom(ix, atom_id(a), atom_label(a))
+        i = i + 1
+    }
+    return ix
+}
+
+// Public dispatch: builds an ad-hoc index from the provided KG (the chat
+// owns `kg`; we iterate kg_atoms and index every label) and runs the
+// search. Returns 1 (admin-command convention).
+//
+// `arg` is the rest-of-line after "/find" (the verbatim query). Empty arg
+// prints a usage line.
+fn ss_find_cmd(kg, arg) {
+    let ix = ss_index_from_kg(kg)
+    let total = ss_index_atom_count(ix)
+    if len(arg) == 0 {
+        io_println("usage: /find <query text>  -- top-" + int_to_str(SS_TOP_K_DEFAULT)
+            + " atoms by TF-IDF cosine similarity")
+        io_println("FIND store_size=" + int_to_str(total))
+        return 1
+    }
+    let hits = ss_search(ix, arg, SS_TOP_K_DEFAULT)
+    return _ss_emit_results("query=\"" + arg + "\"", hits)
+}

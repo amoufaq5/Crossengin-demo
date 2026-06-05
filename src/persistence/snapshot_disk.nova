@@ -1,0 +1,2619 @@
+// CrossEngin persistence: on-disk snapshot I/O (the runtime seam).
+//
+// Purpose
+//   Realize the byte-level write/read seam that snapshot_writer.nova names but
+//   intentionally leaves abstract. Two responsibilities:
+//
+//     1. Text-encode / decode the framed snapshot value so it can travel as a
+//        file. The format is line-oriented (one `key value` pair per line) so a
+//        human can inspect a checkpoint with `cat`, and so a parse failure has
+//        a localizable cause.
+//
+//     2. Provide the crash-safe write contract: write_tmp -> fsync -> atomic
+//        rename -> fsync(parent_dir). A crash mid-write never corrupts the last
+//        good snapshot because the live filename only flips after the new bytes
+//        are durable. The parent-dir fsync makes the rename itself durable on
+//        ext4/xfs (otherwise a power loss right after rename can lose the dir
+//        entry update). This is the contract `snap_durable_steps()` advertises.
+//
+//   The syscall floor (sys_open / sys_write / sys_fsync / sys_close /
+//   sys_rename) lives in NOVA's runtime; this module just composes it.
+//
+//   Phase 11 wire format -- full SOUL + KGS round-trip
+//   --------------------------------------------------
+//   The textual format is line-oriented ASCII; one `key SP value` pair per
+//   line. The first line is the version banner; the final line is `end`.
+//   Strings must not contain newlines (the seed never produces them).
+//
+//   Header / frame:
+//
+//     crossengin-snapshot v1
+//     tag <int>
+//     ver <int>
+//     instance <int>
+//     timestamp <int>
+//     sections <int>          # mandatory == SEC_COUNT (5)
+//
+//   SOUL section (when soul.present == 1). For backwards compat blob[0] is
+//   the name and blob[1] is the constitution count; the new fields extend the
+//   blob beyond that. Missing fields parse as the soul_new defaults.
+//
+//     soul.present 1
+//     soul.name <string>
+//     soul.constcount <int>            # rule count (metadata)
+//     soul.purpose <string>            # OPTIONAL; "" if absent
+//     soul.nature <string>             # OPTIONAL; "" if absent
+//     soul.mood.valence <int>          # OPTIONAL; 500 default (neutral)
+//     soul.mood.arousal <int>          # OPTIONAL; 300 default (calm)
+//     soul.ocean.o <int>               # OPTIONAL; 500 default
+//     soul.ocean.c <int>               # OPTIONAL; 500 default
+//     soul.ocean.e <int>               # OPTIONAL; 500 default
+//     soul.ocean.a <int>               # OPTIONAL; 500 default
+//     soul.ocean.n <int>               # OPTIONAL; 500 default
+//     soul.const.count <int>           # OPTIONAL; 0 (no rules) if absent
+//     soul.const[N].text <string>      # one block per rule, N in [0, count)
+//     soul.const[N].severity <int>
+//
+//   KGS section. For backwards compat blob[0] is still the atom count
+//   (the daemon prints it). New format ALSO emits `kgs.atoms.count` followed
+//   by per-atom blocks. An old snapshot with only `kgs.atoms` will parse and
+//   install zero atoms (legacy metadata-only hint -- see kgs_atoms below).
+//
+//     kgs.present 1
+//     kgs.atoms <int>                  # legacy metadata-only hint
+//     kgs.atoms.count <int>            # number of atoms that follow
+//     kgs.atoms[N].kg <string>         # owning KG label (e.g. "reasoning")
+//     kgs.atoms[N].id <int>            # atom id within KG
+//     kgs.atoms[N].kind <int>          # ATOM_FACT / _CONCEPT / _LANG / ...
+//     kgs.atoms[N].label <string>      # atom label (e.g. "widget")
+//     kgs.atoms[N].alpha <int>         # belief alpha (milli)
+//     kgs.atoms[N].beta <int>          # belief beta (milli)
+//
+//   EPISODIC section. The moment stream (append-only perception record) and
+//   episode storage (higher-order groupings). Atoms in moment traces are stored
+//   by their atom_id in the moment-owning KG context; on /load they restore
+//   into the same id space because kg_section_apply preserves order. Fields
+//   like raw text / soul_ref / salience are NOT persisted -- they're
+//   reconstructible from the next live perception cycle and we keep the wire
+//   format small. (Documented skip: moment.raw, moment.soul_ref, moment.salience,
+//   moment.modality default MODALITY_TEXT, moment.origin_part default 0.)
+//
+//     episodic.present 1
+//     episodic.moments.count <int>
+//     episodic.moments[N].timestamp <int>
+//     episodic.moments[N].lifecycle <int>      # PERCEIVED|SETTLED|CONSOLIDATED
+//     episodic.moments[N].valence <int>        # -1000..1000 (was: salience)
+//     episodic.moments[N].atom_count <int>
+//     episodic.moments[N].atoms[K] <int>       # ids of activated atoms
+//     episodic.episodes.count <int>
+//     episodic.episodes[N].id <int>
+//     episodic.episodes[N].tier <int>          # FRESH|RECENT|CONSOLIDATED|ARCHIVED
+//     episodic.episodes[N].moment_count <int>
+//     episodic.episodes[N].moments[K] <int>    # moment ids
+//
+//   EPISODIC sub-block: episodic_atoms (long-term memory promotion,
+//   ADR-0022 consolidation cycle). Forward-compatible extension to the
+//   EPISODIC blob: blob[2] is the list of compound atoms minted by
+//   src/kg/episodic.nova's consolidation pass. Each carries cluster
+//   members, observed count, first/last observation tick, Bayesian
+//   belief (alpha/beta in milli per ADR-0023), and a provenance label.
+//   A reader that only looks at blob[0]/[1] is unaffected (forward
+//   compat); a reader that processes the new keys reinstalls the
+//   compound atoms verbatim. NO version bump -- the format is a v2
+//   superset; older readers silently skip the lines.
+//
+//     episodic.atoms.count <int>
+//     episodic.atoms[N].id <int>
+//     episodic.atoms[N].member_count <int>
+//     episodic.atoms[N].members[K] <int>       # atom ids in the cluster
+//     episodic.atoms[N].count <int>            # observed co-occurrence count
+//     episodic.atoms[N].first_ns <int>         # first observation tick
+//     episodic.atoms[N].last_ns <int>          # last observation tick
+//     episodic.atoms[N].alpha <int>            # belief alpha (milli)
+//     episodic.atoms[N].beta <int>             # belief beta  (milli)
+//     episodic.atoms[N].provenance <string>    # producing label
+//
+//   SYNAPSES section. Captures only synapses with |weight| >= 100 milli (0.1)
+//   so we don't burn snapshot bytes on freshly-grown noise. If the above-threshold
+//   count exceeds 50K we auto-raise the cut to ~2MB ceiling (see SYN_SNAP_*).
+//
+//     synapses.present 1
+//     synapses.threshold <int>                 # the cut actually used (milli)
+//     synapses.count <int>                     # LEGACY: count of records in
+//                                              # the back-compat top-level block
+//                                              # (mirrors parts[0]'s records)
+//     synapses[N].src <int>
+//     synapses[N].dst <int>
+//     synapses[N].weight <int>                 # milli
+//     synapses[N].eligibility <int>            # milli
+//     synapses.parts.count <int>               # NEW: how many parts have synapses
+//     synapses.parts[N].label <string>         # e.g. "reasoning", "emotion"
+//     synapses.parts[N].synapses.count <int>
+//     synapses.parts[N].synapses[K].src <int>
+//     synapses.parts[N].synapses[K].dst <int>
+//     synapses.parts[N].synapses[K].weight <int>
+//     synapses.parts[N].synapses[K].eligibility <int>
+//
+//   Multi-part capture (P0.1 follow-up #2): the substrate's part registry
+//   exposes each part's synapse graph; the writer walks every part with
+//   live synapses and emits a per-part block. The top-level legacy block
+//   stays populated with whatever was previously the single captured graph
+//   ("reasoning") so an OLD reader still rehydrates the most learning-bearing
+//   part. A NEW reader that sees `synapses.parts.count` ignores the legacy
+//   block and consumes per-part records, installing each into its named
+//   part. Backwards compat: a snapshot WITHOUT `synapses.parts.count` parses
+//   as before -- the legacy records install into the reasoning part only.
+//
+//   SELFMODEL section. Per-domain competence (know/do/understand). Per record
+//   we encode reliability, evidence count, and the derived tier (so a /status
+//   right after /load reports the same tier even before the next assessment
+//   pass recomputes it).
+//
+//     selfmodel.present 1
+//     selfmodel.domains.count <int>
+//     selfmodel.domains[N].label <string>      # domain name (e.g. "medicine")
+//     selfmodel.domains[N].kind <int>          # COMP_KNOW|COMP_DO|COMP_UNDERSTAND
+//     selfmodel.domains[N].know <int>          # milli (reliability for COMP_KNOW)
+//     selfmodel.domains[N].do <int>            # milli (reliability for COMP_DO)
+//     selfmodel.domains[N].understand <int>    # milli (reliability for COMP_UNDERSTAND)
+//     selfmodel.domains[N].evidence <int>      # evidence count
+//     selfmodel.domains[N].tier <int>          # NOVICE|APPRENTICE|JOURNEYMAN|MASTER
+//
+//   Backwards compat: an `episodic.present 1` line with no moments.count
+//   parses to an EMPTY section (same legacy-hint policy as `kgs.atoms`); same
+//   for synapses / selfmodel.
+//
+//     end
+//
+//   Blob layout (in-memory section value):
+//     SOUL blob:
+//       [0] name (string)             # daemon reads this at restart
+//       [1] constcount (int)          # rule count, legacy
+//       [2] purpose (string)
+//       [3] nature  (string)
+//       [4] mood.valence (int)
+//       [5] mood.arousal (int)
+//       [6] ocean.o (int)
+//       [7] ocean.c (int)
+//       [8] ocean.e (int)
+//       [9] ocean.a (int)
+//       [10] ocean.n (int)
+//       [11] constitution rules: list of [text, severity]
+//     KGS blob:
+//       [0] atom_count (int)           # daemon prints this at restart
+//       [1] atoms: list of [kg_label, id, kind, label, alpha, beta]
+//
+//   This module is the format authority -- when an upstream subsystem grows a
+//   new persistent field, extend the helpers here and bump SNAP_FORMAT_VERSION
+//   in snapshot_writer.nova once the new shape becomes mandatory.
+//
+// ADRs implemented: ADR-0048 (the runtime seam for write_tmp -> fsync ->
+//   atomic_rename, and now the full SOUL + KGS subsystem blob serialization).
+//   NOVA dependencies: builtins + sys_open/sys_write/sys_read/sys_close/
+//   sys_fsync (74)/sys_rename (82) from std/syscall. CrossEngin dependencies:
+//   src/persistence/snapshot_writer.nova (frame + section ids),
+//   src/persistence/snapshot_reader.nova (snap_parse for the round-trip half),
+//   src/parts/soul/* (SOUL field shapes), src/kg/multi_kg_manager.nova and
+//   src/kg/atom_store.nova (KG/atom walk + create).
+
+import "std/syscall"
+import "std/io"
+import "snapshot_reader.nova"
+import "snapshot_compaction.nova"
+import "snapshot_delta.nova"
+import "schema_migration.nova"
+import "merkle.nova"
+import "merkle_signing.nova"
+import "../parts/soul/constitution.nova"
+import "../kg/multi_kg_manager.nova"
+import "../language/word_atoms.nova"
+import "../parts/episodic/moment_stream.nova"
+import "../parts/episodic/episode_storage.nova"
+import "../substrate/synapse_graph.nova"
+import "../substrate/part_registry.nova"
+import "../kg/competence_tracker.nova"
+import "../kg/episodic.nova"
+
+// ---- text encoding ---------------------------------------------------------
+
+let _SNAP_HEADER = "crossengin-snapshot v1"
+
+fn _line_kv_int(key, val) {
+    return key + " " + int_to_str(val) + "\n"
+}
+
+fn _line_kv_str(key, val) {
+    return key + " " + val + "\n"
+}
+
+// Append a `key val\n` pair to a list of strings (lines). Joining the list at
+// the end avoids the O(N^2) tax of naive `acc = acc + line` over thousands of
+// lines -- with 572+ atoms x 6 fields per atom, the naive form is measurable.
+fn _push_kv_int(lines, key, val) {
+    push(lines, key + " " + int_to_str(val) + "\n")
+    return 1
+}
+
+fn _push_kv_str(lines, key, val) {
+    push(lines, key + " " + val + "\n")
+    return 1
+}
+
+// ---- SOUL section blob: build / serialize / parse / apply ------------------
+//
+// Build the SOUL blob from a live soul object. The first two slots are kept
+// at [name, constcount] for backwards compatibility with the daemon's reboot
+// invariant `snap_section(restored, SEC_SOUL)[0] == "Aurora"`.
+fn soul_section_build(sl) {
+    let blob = list_new()
+    push(blob, soul_name(sl))                       // [0]
+    push(blob, soul_constitution_count(sl))         // [1]
+    push(blob, soul_purpose(sl))                    // [2]
+    push(blob, soul_nature(sl))                     // [3]
+    push(blob, soul_mood_valence(sl))               // [4]
+    push(blob, soul_mood_arousal(sl))               // [5]
+    push(blob, soul_openness(sl))                   // [6]
+    push(blob, soul_conscientiousness(sl))          // [7]
+    push(blob, soul_extraversion(sl))               // [8]
+    push(blob, soul_agreeableness(sl))              // [9]
+    push(blob, soul_neuroticism(sl))                // [10]
+    let rules = list_new()
+    let i = 0
+    while i < soul_constitution_count(sl) {
+        let r = soul_constitution_rule(sl, i)
+        let e = list_new()
+        push(e, r[CR_TEXT])
+        push(e, r[CR_SEVERITY])
+        push(rules, e)
+        i = i + 1
+    }
+    push(blob, rules)                               // [11]
+    return blob
+}
+
+// Read a SOUL field from the blob with a fallback for short (legacy) blobs.
+fn _soul_blob_str(blob, idx, default) {
+    if idx < len(blob) { return blob[idx] }
+    return default
+}
+fn _soul_blob_int(blob, idx, default) {
+    if idx < len(blob) { return blob[idx] }
+    return default
+}
+
+// Serialize the SOUL blob to text lines (one key/value per line, prefixed
+// `soul.`). Caller writes them between `soul.present 1` and the next section.
+fn soul_section_serialize(blob) {
+    let lines = list_new()
+    _push_kv_str(lines, "soul.name",         _soul_blob_str(blob, 0, ""))
+    _push_kv_int(lines, "soul.constcount",   _soul_blob_int(blob, 1, 0))
+    _push_kv_str(lines, "soul.purpose",      _soul_blob_str(blob, 2, ""))
+    _push_kv_str(lines, "soul.nature",       _soul_blob_str(blob, 3, ""))
+    _push_kv_int(lines, "soul.mood.valence", _soul_blob_int(blob, 4, 500))
+    _push_kv_int(lines, "soul.mood.arousal", _soul_blob_int(blob, 5, 300))
+    _push_kv_int(lines, "soul.ocean.o",      _soul_blob_int(blob, 6, 500))
+    _push_kv_int(lines, "soul.ocean.c",      _soul_blob_int(blob, 7, 500))
+    _push_kv_int(lines, "soul.ocean.e",      _soul_blob_int(blob, 8, 500))
+    _push_kv_int(lines, "soul.ocean.a",      _soul_blob_int(blob, 9, 500))
+    _push_kv_int(lines, "soul.ocean.n",      _soul_blob_int(blob, 10, 500))
+    let rules = list_new()
+    if len(blob) > 11 { rules = blob[11] }
+    _push_kv_int(lines, "soul.const.count",  len(rules))
+    let i = 0
+    while i < len(rules) {
+        let prefix = "soul.const[" + int_to_str(i) + "]"
+        _push_kv_str(lines, prefix + ".text",     rules[i][0])
+        _push_kv_int(lines, prefix + ".severity", rules[i][1])
+        i = i + 1
+    }
+    return lines
+}
+
+// Apply a parsed SOUL blob to a LIVE soul object. Replaces name, identity,
+// mood, OCEAN, and the entire constitution rule list. Returns 1 on success.
+fn soul_section_apply(sl, blob) {
+    if len(blob) == 0 { return 0 }
+    list_set(sl, S_NAME, _soul_blob_str(blob, 0, soul_name(sl)))
+    soul_set_identity(sl,
+        _soul_blob_str(blob, 2, soul_purpose(sl)),
+        _soul_blob_str(blob, 3, soul_nature(sl)))
+    soul_update_mood(sl,
+        _soul_blob_int(blob, 4, soul_mood_valence(sl)),
+        _soul_blob_int(blob, 5, soul_mood_arousal(sl)))
+    soul_set_ocean(sl,
+        _soul_blob_int(blob, 6, 500),
+        _soul_blob_int(blob, 7, 500),
+        _soul_blob_int(blob, 8, 500),
+        _soul_blob_int(blob, 9, 500),
+        _soul_blob_int(blob, 10, 500))
+    // Replace constitution: drop existing rules, install snapshot rules.
+    let existing = sl[S_CONSTITUTION]
+    while len(existing) > 0 {
+        list_set(existing, len(existing) - 1, 0)
+        list_set(sl, S_CONSTITUTION, list_new())
+        existing = sl[S_CONSTITUTION]
+    }
+    let rules = list_new()
+    if len(blob) > 11 { rules = blob[11] }
+    let i = 0
+    while i < len(rules) {
+        soul_add_constitution(sl, rules[i][0], rules[i][1])
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- KGS section blob: build / serialize / parse / apply -------------------
+//
+// Build the KGS blob from a live KG. Walks every atom and emits a flat
+// per-atom record (kg_label, id, kind, label, alpha, beta) we can replay on
+// the other side. blob[0] stays at atom_count so the daemon's reboot print
+// continues to work; the full list lands in blob[1].
+fn kg_section_build(kg) {
+    let blob = list_new()
+    let atoms = kg_atoms(kg)
+    let kg_lbl = kg_label(kg)
+    push(blob, len(atoms))           // [0] atom count -- daemon prints this
+    let recs = list_new()
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        let r = list_new()
+        push(r, kg_lbl)              // [0] kg label
+        push(r, atom_id(a))          // [1] id
+        push(r, atom_kind(a))        // [2] kind (ATOM_*)
+        push(r, atom_label(a))       // [3] label
+        let b = atom_belief(a)
+        push(r, b[0])                // [4] alpha
+        push(r, b[1])                // [5] beta
+        push(recs, r)
+        i = i + 1
+    }
+    push(blob, recs)                 // [1] atoms
+    return blob
+}
+
+// Serialize the KGS blob to text lines (one key/value per line, prefixed
+// `kgs.`). The legacy `kgs.atoms` line is preserved so an OLD daemon reading
+// a new file still sees the atom count, and a NEW daemon reading an old file
+// still recognizes the field (treating it as a metadata-only hint).
+fn kg_section_serialize(blob) {
+    let lines = list_new()
+    let atom_count = 0
+    if len(blob) > 0 { atom_count = blob[0] }
+    _push_kv_int(lines, "kgs.atoms",       atom_count)   // legacy
+    let recs = list_new()
+    if len(blob) > 1 { recs = blob[1] }
+    _push_kv_int(lines, "kgs.atoms.count", len(recs))
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        let prefix = "kgs.atoms[" + int_to_str(i) + "]"
+        _push_kv_str(lines, prefix + ".kg",    r[0])
+        _push_kv_int(lines, prefix + ".id",    r[1])
+        _push_kv_int(lines, prefix + ".kind",  r[2])
+        _push_kv_str(lines, prefix + ".label", r[3])
+        _push_kv_int(lines, prefix + ".alpha", r[4])
+        _push_kv_int(lines, prefix + ".beta",  r[5])
+        i = i + 1
+    }
+    return lines
+}
+
+// Apply a parsed KGS blob to a live KG registry. Policy: REPLACE BY LABEL --
+// if an atom with the same label already exists in the target KG, refresh its
+// belief (alpha/beta); otherwise create a fresh atom. This is idempotent on
+// re-load and survives both atom-id drift (the snapshot's id is informational)
+// and the seed-already-installed case (the chat installs the seed before
+// loading the snapshot, so the snapshot's "self" atom merges with the seed's
+// rather than orthogonally re-creating it).
+//
+// Bug 1 (unknown-KG) policy: SKIP-WITH-WARNING.
+//   `kg_spawn` is idempotent on label and silently creates a NEW KG for any
+//   label a hand-rewritten snapshot might name -- so a malicious snapshot
+//   could ask the running daemon to spin up arbitrary KG namespaces and
+//   land atoms in them, undetected. We harden this by validating each
+//   atom's `kg` field against the registry's known labels (populated at
+//   boot by *_kg_init); an unknown label is SKIPPED with a one-line stdout
+//   warning naming the atom index and the label. The remaining atoms in
+//   the snapshot still install (friendlier for forward-compat: a snapshot
+//   from a future build that mentions a new KG can rehydrate the parts an
+//   older build still recognizes, instead of failing the whole /load).
+//   The warning text format is:
+//     `(warning: snapshot atom #N has unknown kg 'X' -- skipped)`
+//   The chat's _admin_load wrapper does not need to change -- the warning
+//   travels on stdout alongside the apply's existing `applied=N new_atoms=K`
+//   summary line.
+//
+// LANG atoms (kind == ATOM_LANG) get the lexical fixture re-installed: the
+// `ltype = LWORD` payload and the deterministic character-vector embedding,
+// so `word_find` recognizes them and `is_word_atom` returns 1. We also walk
+// every OTHER KG in the registry looking for a same-labeled concept atom and
+// attach a sense xref from the word -> concept (the binding the reader needs
+// to anchor a token and route activation to its concept). The sense restore
+// is IDEMPOTENT (see _restore_word_senses) -- replaying the same snapshot
+// must never grow the xref count, which is the Bug 2 ping-pong-drift fix.
+//
+// Returns the number of new atoms created (0 if every atom merged into an
+// existing entry; skipped unknown-KG atoms are NOT counted as created).
+fn kg_section_apply(kg_reg, blob, moment) {
+    if len(blob) < 2 { return 0 }
+    let recs = blob[1]
+    let created = 0
+    let skipped = 0
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        let kg_lbl = r[0]
+        let kind   = r[2]
+        let label  = r[3]
+        let alpha  = r[4]
+        let beta   = r[5]
+        // Bug 1 guard: refuse to auto-spawn KGs the running daemon does not
+        // know. Skip the atom with a stdout warning and continue.
+        if kgreg_has_label(kg_reg, kg_lbl) == 0 {
+            io_println("(warning: snapshot atom #" + int_to_str(i)
+                + " has unknown kg '" + kg_lbl + "' -- skipped)")
+            skipped = skipped + 1
+        } else {
+            let target = kg_spawn(kg_reg, kg_lbl)
+            let existing = kg_find_atom(target, label)
+            let a = existing
+            if existing == 0 {
+                a = kg_add_atom(target, kind, label, moment)
+                created = created + 1
+            }
+            let b = atom_belief(a)
+            list_set(b, 0, alpha)
+            list_set(b, 1, beta)
+            if kind == ATOM_LANG {
+                // Re-install the lexical fixture so the reader recognizes the
+                // word: ltype = LWORD, char-vector embedding, and a sense xref to
+                // any same-labeled concept atom in a sibling KG of the registry.
+                atom_payload_set(a, "ltype", LWORD)
+                atom_set_embed(a, word_lexical_vec(label))
+                _restore_word_senses(kg_reg, a, label, kg_lbl)
+            }
+        }
+        i = i + 1
+    }
+    // P2.4: rebuild the per-KG hash indexes after applying snapshot atoms.
+    // kg_add_atom incrementally maintained the indexes during the loop, so a
+    // freshly-spawned KG already has a correct index; the rebuild handles the
+    // legacy case where a KG was rehydrated through some other path that
+    // bypassed kg_add_atom (and the no-op double-rebuild is cheap enough to
+    // do unconditionally, ~256 list_new's per KG).
+    //
+    // P3.4: `kg_rebuild_index` also rebuilds the optional ANN side-index
+    // when one is attached (it's a no-op when none is). The single call
+    // here covers both the label/kind indexes and the ANN buckets so the
+    // snapshot-apply path stays uniform.
+    let kgs = kg_reg[KREG_KGS]
+    let kj = 0
+    while kj < len(kgs) {
+        kg_rebuild_index(kgs[kj])
+        kj = kj + 1
+    }
+    return created
+}
+
+// Walk every NON-language KG in the registry; for any atom whose label
+// matches `form`, add a weighted sense xref from `word` to it.
+//
+// Bug 2 (idempotence): re-applying the same snapshot must NOT grow the
+// word's xref count. A /save + /load ping-pong in a single chat session
+// previously could drift the knowledge count by +1 because this routine
+// re-added sense xrefs on every replay -- if a candidate concept matched
+// by label but lived in a different KG slot than the original sense, the
+// (dst_kg, dst_atom) tuple did not match and a duplicate xref slipped in.
+// The current guards make the routine bit-for-bit idempotent:
+//
+//   1. Skip the word's own language KG (lang_label match) -- a sense from
+//      a word into itself in the same KG is never wanted.
+//   2. Skip a matched candidate that IS the word atom itself (atom_kg
+//      string + atom_id match) -- defends against a hypothetical second
+//      language KG holding a same-labeled word.
+//   3. Skip ATOM_LANG candidates -- senses must point at concept/fact/
+//      skill atoms in domain KGs, never at other words.
+//   4. _has_sense_to de-dupes by (dst_kg, dst_atom_id), so the add path is
+//      a no-op when the edge is already present.
+fn _restore_word_senses(kg_reg, word, form, lang_label) {
+    let kgs = kg_reg[KREG_KGS]
+    let word_kg = atom_kg(word)
+    let word_id = atom_id(word)
+    let i = 0
+    while i < len(kgs) {
+        let k = kgs[i]
+        // Guard (1): never link a word into its own language KG.
+        if str_eq(kg_label(k), lang_label) == 0 {
+            let concept = kg_find_atom(k, form)
+            if concept != 0 {
+                // Guard (2): never link a word to itself (a defense for a
+                // second language KG holding the same form).
+                let same_atom = 0
+                if str_eq(atom_kg(concept), word_kg) == 1 {
+                    if atom_id(concept) == word_id { same_atom = 1 }
+                }
+                if same_atom == 0 {
+                    // Guard (3): never link to another ATOM_LANG.
+                    if atom_kind(concept) != ATOM_LANG {
+                        // Guard (4): de-dupe on existing xref to the same dst.
+                        if _has_sense_to(word, atom_kg(concept), atom_id(concept)) == 0 {
+                            word_add_sense(word, concept, 900)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _has_sense_to(word, dst_kg, dst_atom) {
+    let xs = atom_xrefs(word)
+    let i = 0
+    while i < len(xs) {
+        if str_eq(xref_dst_kg(xs[i]), dst_kg) == 1 {
+            if xref_dst_atom(xs[i]) == dst_atom { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- EPISODIC section blob: build / serialize / parse / apply -------------
+//
+// Blob layout:
+//   [0] moments: list of per-moment records, each [ts, lifecycle, valence,
+//                                                   atom_ids_list]
+//   [1] episodes: list of per-episode records, each [id, tier, moment_ids_list]
+//   [2] episodic_atoms: list of per-atom records, each [id, members,
+//                                                       count, first_ns,
+//                                                       last_ns, alpha,
+//                                                       beta, provenance]
+//      (OPTIONAL -- the legacy 2-element build still parses; blob[2] is
+//       absent on a snapshot captured before this build landed.)
+// Fields documented as "skipped" in the section header (modality default
+// MODALITY_TEXT, raw=empty, salience hardcoded 600, soul_ref=0) are NOT
+// persisted: they reconstruct fine from the next live perception cycle.
+
+fn episodic_section_build(stream, em) {
+    return episodic_section_build_with_atoms(stream, em, 0)
+}
+
+// Extended builder. `eas` is the episodic-atom store (src/kg/episodic.nova);
+// pass 0 if the substrate hasn't minted any -- the legacy 2-element blob is
+// emitted in that case so an OLD reader sees the same bytes as before.
+fn episodic_section_build_with_atoms(stream, em, eas) {
+    let blob = list_new()
+    let moments = list_new()
+    let i = 0
+    let n = ms_count(stream)
+    while i < n {
+        let m = ms_get(stream, i)
+        if m != 0 {
+            let rec = list_new()
+            push(rec, moment_timestamp(m))
+            push(rec, moment_status(m))
+            push(rec, moment_salience(m))   // wire field "valence"
+            let trace = moment_trace(m)
+            let atoms = list_new()
+            let j = 0
+            while j < len(trace) {
+                push(atoms, trace[j])
+                j = j + 1
+            }
+            push(rec, atoms)
+            push(moments, rec)
+        }
+        i = i + 1
+    }
+    push(blob, moments)                     // [0]
+
+    let episodes = list_new()
+    let k = 0
+    let nk = em_count(em)
+    while k < nk {
+        let e = em_get(em, k)
+        if e != 0 {
+            // Only include live (non-DROPPED) episodes: a dropped episode is
+            // already excluded from any active recall/replay logic; the boot
+            // re-runs the drop sweep anyway.
+            if episode_tier(e) != EP_DROPPED {
+                let rec = list_new()
+                push(rec, episode_id(e))
+                push(rec, episode_tier(e))
+                // Per the brief, we serialize the moments list per episode.
+                // Each episode in this implementation tracks ONE moment ref;
+                // we emit [moment_id] as a 1-element list so the wire format
+                // is forward-compatible with multi-moment episodes.
+                let mids = list_new()
+                push(mids, episode_moment(e))
+                push(rec, mids)
+                push(episodes, rec)
+            }
+        }
+        k = k + 1
+    }
+    push(blob, episodes)                    // [1]
+
+    // Optional episodic-atom sub-block (long-term memory promotion,
+    // ADR-0022 consolidation cycle). When `eas` is non-zero, walk every
+    // minted episodic atom and emit a flat per-atom record.
+    let ea_recs = list_new()
+    if eas != 0 {
+        let na = episodic_atoms_count(eas)
+        let ea_i = 0
+        while ea_i < na {
+            let ep = episodic_atoms_get(eas, ea_i)
+            if ep != 0 {
+                let rec = list_new()
+                push(rec, episodic_atom_id(ep))
+                // Deep-copy the members list so a later in-memory mutation of
+                // the store doesn't leak through to the on-disk snapshot.
+                let mem_src = episodic_atom_members(ep)
+                let mem_cp = list_new()
+                let mi = 0
+                while mi < len(mem_src) {
+                    push(mem_cp, mem_src[mi])
+                    mi = mi + 1
+                }
+                push(rec, mem_cp)
+                push(rec, episodic_atom_count(ep))
+                push(rec, episodic_atom_first_seen(ep))
+                push(rec, episodic_atom_last_seen(ep))
+                push(rec, episodic_atom_alpha(ep))
+                push(rec, episodic_atom_beta(ep))
+                push(rec, episodic_atom_provenance(ep))
+                push(ea_recs, rec)
+            }
+            ea_i = ea_i + 1
+        }
+    }
+    push(blob, ea_recs)                     // [2]
+    return blob
+}
+
+fn episodic_section_serialize(blob) {
+    let lines = list_new()
+    let moments = list_new()
+    let episodes = list_new()
+    let ea_recs = list_new()
+    if len(blob) > 0 { moments  = blob[0] }
+    if len(blob) > 1 { episodes = blob[1] }
+    if len(blob) > 2 { ea_recs  = blob[2] }
+
+    _push_kv_int(lines, "episodic.moments.count", len(moments))
+    let i = 0
+    while i < len(moments) {
+        let r = moments[i]
+        let prefix = "episodic.moments[" + int_to_str(i) + "]"
+        _push_kv_int(lines, prefix + ".timestamp",  r[0])
+        _push_kv_int(lines, prefix + ".lifecycle",  r[1])
+        _push_kv_int(lines, prefix + ".valence",    r[2])
+        let atoms = r[3]
+        _push_kv_int(lines, prefix + ".atom_count", len(atoms))
+        let j = 0
+        while j < len(atoms) {
+            _push_kv_int(lines, prefix + ".atoms[" + int_to_str(j) + "]", atoms[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    _push_kv_int(lines, "episodic.episodes.count", len(episodes))
+    let k = 0
+    while k < len(episodes) {
+        let r = episodes[k]
+        let prefix = "episodic.episodes[" + int_to_str(k) + "]"
+        _push_kv_int(lines, prefix + ".id",            r[0])
+        _push_kv_int(lines, prefix + ".tier",          r[1])
+        let mids = r[2]
+        _push_kv_int(lines, prefix + ".moment_count", len(mids))
+        let mj = 0
+        while mj < len(mids) {
+            _push_kv_int(lines, prefix + ".moments[" + int_to_str(mj) + "]", mids[mj])
+            mj = mj + 1
+        }
+        k = k + 1
+    }
+
+    // Episodic atoms (long-term memory promotion). Always emit the count
+    // line; an empty list emits "episodic.atoms.count 0" -- a reader that
+    // doesn't recognize the key will silently skip it, so the line is
+    // safe to write unconditionally.
+    _push_kv_int(lines, "episodic.atoms.count", len(ea_recs))
+    let ea_i = 0
+    while ea_i < len(ea_recs) {
+        let r = ea_recs[ea_i]
+        let prefix = "episodic.atoms[" + int_to_str(ea_i) + "]"
+        _push_kv_int(lines, prefix + ".id",           r[0])
+        let members = r[1]
+        _push_kv_int(lines, prefix + ".member_count", len(members))
+        let mi = 0
+        while mi < len(members) {
+            _push_kv_int(lines, prefix + ".members[" + int_to_str(mi) + "]", members[mi])
+            mi = mi + 1
+        }
+        _push_kv_int(lines, prefix + ".count",      r[2])
+        _push_kv_int(lines, prefix + ".first_ns",   r[3])
+        _push_kv_int(lines, prefix + ".last_ns",    r[4])
+        _push_kv_int(lines, prefix + ".alpha",      r[5])
+        _push_kv_int(lines, prefix + ".beta",       r[6])
+        _push_kv_str(lines, prefix + ".provenance", r[7])
+        ea_i = ea_i + 1
+    }
+    return lines
+}
+
+// Apply the EPISODIC blob: REPLACE policy. Wipe the live stream + em, then
+// install moments + episodes from the snapshot in id order. Returns the
+// number of moments restored. Legacy 2-arg form -- callers without an
+// episodic-atom store skip blob[2] (the new sub-block is preserved on
+// disk because snap_to_text emits whatever is in the blob, but it isn't
+// reinstalled into any live store).
+fn episodic_section_apply(stream, em, blob) {
+    return episodic_section_apply_with_atoms(stream, em, 0, blob)
+}
+
+// Extended apply: also rehydrate the episodic-atom store from blob[2].
+// `eas` may be 0 (skip the third sub-block, legacy behaviour); otherwise
+// it's wiped via episodic_atoms_clear and repopulated verbatim.
+fn episodic_section_apply_with_atoms(stream, em, eas, blob) {
+    if len(blob) == 0 { return 0 }
+    ms_clear(stream)
+    em_clear(em)
+    if eas != 0 { episodic_atoms_clear(eas) }
+    let moments = blob[0]
+    let i = 0
+    while i < len(moments) {
+        let r = moments[i]
+        let ts        = r[0]
+        let lifecycle = r[1]
+        let valence   = r[2]
+        let atoms     = r[3]
+        // Restore at id=i to keep the monotonic id sequence aligned with the
+        // snapshot's iteration order (modality default TEXT, raw="" since the
+        // wire format doesn't carry it -- see brief's "skipped fields" note).
+        ms_restore(stream, i, ts, MODALITY_TEXT, "", valence, 0, lifecycle, atoms)
+        i = i + 1
+    }
+    if len(blob) > 1 {
+        let episodes = blob[1]
+        let k = 0
+        while k < len(episodes) {
+            let r = episodes[k]
+            let eid   = r[0]
+            let tier  = r[1]
+            let mids  = r[2]
+            // Use the first moment_id as the episode's moment ref (today's
+            // schema is one-moment-per-episode; the list wraps it for forward
+            // compatibility).
+            let mref = 0
+            if len(mids) > 0 { mref = mids[0] }
+            em_restore(em, eid, mref, tier)
+            k = k + 1
+        }
+    }
+    if eas != 0 {
+        if len(blob) > 2 {
+            let ea_recs = blob[2]
+            let ea_i = 0
+            while ea_i < len(ea_recs) {
+                let r = ea_recs[ea_i]
+                // Per-record shape: [id, members, count, first_ns, last_ns,
+                // alpha, beta, provenance].
+                episodic_atoms_restore(eas,
+                    r[0],   // id
+                    r[1],   // members (already a list)
+                    r[2],   // count
+                    r[3],   // first_ns
+                    r[4],   // last_ns
+                    r[5],   // alpha
+                    r[6],   // beta
+                    r[7])   // provenance
+                ea_i = ea_i + 1
+            }
+        }
+    }
+    return len(moments)
+}
+
+// ---- SYNAPSES section blob: build / serialize / parse / apply -------------
+//
+// Threshold cut: any synapse with |weight| below SYN_SNAP_MIN milli (default
+// 100 == 0.1) is skipped. If the above-threshold count exceeds SYN_SNAP_HARDCAP
+// (50K) we auto-raise the threshold to keep the snapshot small. The wire
+// format records the threshold actually used so a reader can know what was
+// dropped.
+//
+// Blob layout (multi-part):
+//   [0] threshold (int, milli)
+//   [1] records: list of [src, dst, weight, eligibility]   // LEGACY: the
+//       reasoning part's records (or the single-graph build's records),
+//       kept populated so an OLD reader still rehydrates that graph.
+//   [2] parts: list of per-part records, each a 2-element list
+//              [label_string, list of [src, dst, weight, eligibility]]
+//       This is the multi-part capture. A new reader prefers this list
+//       and installs each part's records into the matching named part;
+//       a missing or empty parts list falls through to the legacy block.
+
+let SYN_SNAP_MIN     = 100      // 0.1 default cut: anything weaker is noise
+let SYN_SNAP_HARDCAP = 50000    // auto-raise threshold once we'd write >50K syns
+
+fn _count_above_threshold(g, threshold) {
+    let n = syn_total(g)
+    let c = 0
+    let i = 0
+    while i < n {
+        if syn_alive(g, i) == 1 {
+            let w = syn_weight(g, i)
+            let aw = w
+            if aw < 0 { aw = 0 - aw }
+            if aw >= threshold { c = c + 1 }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// Pick a writer-side threshold for a single graph: start at SYN_SNAP_MIN,
+// auto-raise in 100-milli steps until the count above threshold is under the
+// 50K hardcap. Same auto-tune that `synapses_section_build` ran inline; we
+// pulled it out so the multi-part builder can apply ONE threshold across
+// every part (the wire format records ONE threshold for the whole section).
+fn _syn_pick_threshold(g) {
+    let threshold = SYN_SNAP_MIN
+    while _count_above_threshold(g, threshold) > SYN_SNAP_HARDCAP {
+        if threshold >= 900 {
+            threshold = 900
+            let above = _count_above_threshold(g, threshold)
+            if above > SYN_SNAP_HARDCAP { threshold = 1000 }
+        } else {
+            threshold = threshold + 100
+        }
+        if threshold > 999 {
+            threshold = 999
+            if _count_above_threshold(g, threshold) <= SYN_SNAP_HARDCAP {
+                // Acceptable; fall through.
+            } else {
+                threshold = 1000
+            }
+        }
+    }
+    return threshold
+}
+
+// Build the flat (src,dst,weight,elig) record list from a single graph, dropping
+// anything with |weight| below the supplied threshold.
+fn _syn_records_for(g, threshold) {
+    let recs = list_new()
+    let n = syn_total(g)
+    let i = 0
+    while i < n {
+        if syn_alive(g, i) == 1 {
+            let w = syn_weight(g, i)
+            let aw = w
+            if aw < 0 { aw = 0 - aw }
+            if aw >= threshold {
+                let r = list_new()
+                push(r, syn_pre(g, i))
+                push(r, syn_post(g, i))
+                push(r, w)
+                push(r, syn_elig(g, i))
+                push(recs, r)
+            }
+        }
+        i = i + 1
+    }
+    return recs
+}
+
+// Single-graph builder (legacy contract). Used by callers (and existing
+// tests) that only persist one graph. blob[2] is left empty -- the multi-
+// part list is opt-in via `synapses_section_build_multi`.
+fn synapses_section_build(g) {
+    let threshold = _syn_pick_threshold(g)
+    let recs = _syn_records_for(g, threshold)
+    let blob = list_new()
+    push(blob, threshold)
+    push(blob, recs)
+    push(blob, list_new())   // [2] parts: empty (single-graph build)
+    return blob
+}
+
+// Multi-part builder. Walks every part in the registry; for each part with at
+// least one synapse above the chosen threshold, emits a (label, records) pair
+// into blob[2]. The chosen threshold is the MAX of every per-part autotune so
+// the section's recorded `synapses.threshold` is a true lower-bound across
+// all captured records.
+//
+// blob[1] (legacy block) mirrors the reasoning part's records when one
+// exists; otherwise it mirrors the FIRST part with records. This keeps an
+// OLD reader rehydrating the most learning-bearing graph as before.
+fn synapses_section_build_multi(reg) {
+    // First pass: pick a section-wide threshold. We need ONE int for the
+    // whole section, so we take the max of every per-part autotune.
+    let threshold = SYN_SNAP_MIN
+    let n = registry_count(reg)
+    let i = 0
+    while i < n {
+        let p = registry_get(reg, i)
+        if p != 0 {
+            let g = part_syn(p)
+            if g != 0 {
+                let t = _syn_pick_threshold(g)
+                if t > threshold { threshold = t }
+            }
+        }
+        i = i + 1
+    }
+
+    // Second pass: capture per-part records. Skip parts whose record list
+    // is empty after the threshold cut -- they'd just add noise to the wire
+    // format. Order matches the registry's part-id order, which is stable
+    // for the process lifetime (registry_add appends).
+    let parts_list = list_new()
+    let legacy_recs = list_new()
+    let legacy_chosen = 0
+    let reasoning_recs = 0
+    let i2 = 0
+    while i2 < n {
+        let p = registry_get(reg, i2)
+        if p != 0 {
+            let g = part_syn(p)
+            if g != 0 {
+                let recs = _syn_records_for(g, threshold)
+                if len(recs) > 0 {
+                    let entry = list_new()
+                    push(entry, part_name(p))
+                    push(entry, recs)
+                    push(parts_list, entry)
+                    // Legacy fallback choice: prefer the reasoning part; else
+                    // first non-empty.
+                    if str_eq(part_name(p), "reasoning") == 1 {
+                        reasoning_recs = recs
+                    } else {
+                        if legacy_chosen == 0 {
+                            legacy_recs = recs
+                            legacy_chosen = 1
+                        }
+                    }
+                }
+            }
+        }
+        i2 = i2 + 1
+    }
+    if reasoning_recs != 0 { legacy_recs = reasoning_recs }
+
+    let blob = list_new()
+    push(blob, threshold)
+    push(blob, legacy_recs)
+    push(blob, parts_list)
+    return blob
+}
+
+fn synapses_section_serialize(blob) {
+    let lines = list_new()
+    let threshold = SYN_SNAP_MIN
+    let recs = list_new()
+    let parts_list = list_new()
+    if len(blob) > 0 { threshold = blob[0] }
+    if len(blob) > 1 { recs = blob[1] }
+    if len(blob) > 2 { parts_list = blob[2] }
+    _push_kv_int(lines, "synapses.threshold", threshold)
+    _push_kv_int(lines, "synapses.count",     len(recs))
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        let prefix = "synapses[" + int_to_str(i) + "]"
+        _push_kv_int(lines, prefix + ".src",         r[0])
+        _push_kv_int(lines, prefix + ".dst",         r[1])
+        _push_kv_int(lines, prefix + ".weight",      r[2])
+        _push_kv_int(lines, prefix + ".eligibility", r[3])
+        i = i + 1
+    }
+    // Multi-part block. We always emit `synapses.parts.count`, even when 0,
+    // so a reader can DISTINGUISH "no parts list known" (legacy snapshot
+    // omits the line) from "explicitly empty" (count = 0).
+    _push_kv_int(lines, "synapses.parts.count", len(parts_list))
+    let pj = 0
+    while pj < len(parts_list) {
+        let pe = parts_list[pj]
+        let plabel = pe[0]
+        let precs  = pe[1]
+        let pp = "synapses.parts[" + int_to_str(pj) + "]"
+        _push_kv_str(lines, pp + ".label",          plabel)
+        _push_kv_int(lines, pp + ".synapses.count", len(precs))
+        let pk = 0
+        while pk < len(precs) {
+            let r = precs[pk]
+            let pkpref = pp + ".synapses[" + int_to_str(pk) + "]"
+            _push_kv_int(lines, pkpref + ".src",         r[0])
+            _push_kv_int(lines, pkpref + ".dst",         r[1])
+            _push_kv_int(lines, pkpref + ".weight",      r[2])
+            _push_kv_int(lines, pkpref + ".eligibility", r[3])
+            pk = pk + 1
+        }
+        pj = pj + 1
+    }
+    return lines
+}
+
+// Apply the SYNAPSES blob: install each (src, dst, weight, elig) into the
+// live graph. Existing pre->post edges get their weight overwritten (idempotent
+// on a second /load of the same snapshot via syn_restore's syn_find shortcut).
+//
+// This is the LEGACY single-graph apply. The multi-part apply
+// `synapses_section_apply_multi(reg, blob)` is preferred when a part
+// registry is available; this function stays for callers that only have
+// one graph at hand (unit tests, the daemon's single-graph path).
+fn synapses_section_apply(g, blob) {
+    if len(blob) < 2 { return 0 }
+    let recs = blob[1]
+    let n = 0
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        syn_restore(g, r[0], r[1], r[2], r[3])
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// Multi-part apply. Looks up each `synapses.parts[N]` entry's named part in
+// the registry and installs its records there. If a part labelled in the
+// snapshot is not present in the live registry, the entry is SKIPPED with a
+// one-line stdout warning -- same friendly-forward-compat policy as
+// kg_section_apply: a snapshot from a future build that names a new part
+// (e.g. "language", added post-rebuild) can still rehydrate the parts an
+// older build still recognizes.
+//
+// Backwards compat: a snapshot without `synapses.parts.count` (legacy P0.1
+// shape) has blob[2] absent or empty; in that case we fall through to the
+// reasoning part and install blob[1] there -- bit-identical to the old
+// `synapses_section_apply(reasoning_syn_g, blob)` path.
+//
+// Returns the total number of synapses installed across all parts.
+fn synapses_section_apply_multi(reg, blob) {
+    if len(blob) < 2 { return 0 }
+    let parts_list = list_new()
+    if len(blob) > 2 { parts_list = blob[2] }
+    let n_parts = len(parts_list)
+    if n_parts == 0 {
+        // Legacy / empty multi-block: install legacy records into the
+        // reasoning part (the historic single-graph target).
+        let reasoning_id = registry_find(reg, "reasoning")
+        if reasoning_id == -1 { return 0 }
+        let rp = registry_get(reg, reasoning_id)
+        if rp == 0 { return 0 }
+        return synapses_section_apply(part_syn(rp), blob)
+    }
+    let total = 0
+    let i = 0
+    while i < n_parts {
+        let pe = parts_list[i]
+        let plabel = pe[0]
+        let precs  = pe[1]
+        let pid = registry_find(reg, plabel)
+        if pid == -1 {
+            // Split into single appends to dodge a NOVA codegen pointer-
+            // threshold overflow seen on a longer chained "+" form. The
+            // same workaround pattern as Agent B's long-line fix in the
+            // chat binary -- a single tall expression with this many
+            // string constants spills past the threshold.
+            let msg = "(warning: snapshot synapses.parts["
+            msg = msg + int_to_str(i)
+            msg = msg + "] names unknown part '"
+            msg = msg + plabel
+            msg = msg + "' -- skipped)"
+            io_println(msg)
+        } else {
+            let p = registry_get(reg, pid)
+            if p != 0 {
+                let g = part_syn(p)
+                let k = 0
+                while k < len(precs) {
+                    let r = precs[k]
+                    syn_restore(g, r[0], r[1], r[2], r[3])
+                    total = total + 1
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// Count of distinct parts captured in the multi-part block (0 for legacy).
+fn synapses_section_parts_count(blob) {
+    if len(blob) < 3 { return 0 }
+    return len(blob[2])
+}
+
+// ---- SELFMODEL section blob: build / serialize / parse / apply ------------
+//
+// Blob layout:
+//   [0] records: list of [domain_label, kind, reliability, evidence, tier]
+//
+// `tier` is the derived value from competence_tier(record); we persist it so
+// /status right after /load can report it without re-running the assessment
+// (which the snapshot boot order can't yet guarantee).
+
+fn selfmodel_section_build(sm) {
+    let blob = list_new()
+    let recs = list_new()
+    let records = self_model_snapshot(sm)
+    let i = 0
+    while i < len(records) {
+        let r = records[i]
+        let rec = list_new()
+        push(rec, competence_domain(r))
+        push(rec, competence_kind(r))
+        push(rec, competence_reliability(r))
+        push(rec, competence_evidence(r))
+        push(rec, competence_tier(r))
+        push(recs, rec)
+        i = i + 1
+    }
+    push(blob, recs)
+    return blob
+}
+
+fn selfmodel_section_serialize(blob) {
+    let lines = list_new()
+    let recs = list_new()
+    if len(blob) > 0 { recs = blob[0] }
+    _push_kv_int(lines, "selfmodel.domains.count", len(recs))
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        let prefix = "selfmodel.domains[" + int_to_str(i) + "]"
+        _push_kv_str(lines, prefix + ".label",      r[0])
+        _push_kv_int(lines, prefix + ".kind",       r[1])
+        // The brief asks for know/do/understand columns; we write the
+        // reliability into whichever column matches the record's kind so a
+        // future single-row-per-domain reader can pivot. For now we also write
+        // a kind-agnostic field so a domain can be reconstructed in one read.
+        let know = 0
+        let do_v = 0
+        let und  = 0
+        if r[1] == COMP_KNOW       { know = r[2] }
+        if r[1] == COMP_DO         { do_v = r[2] }
+        if r[1] == COMP_UNDERSTAND { und  = r[2] }
+        _push_kv_int(lines, prefix + ".know",       know)
+        _push_kv_int(lines, prefix + ".do",         do_v)
+        _push_kv_int(lines, prefix + ".understand", und)
+        _push_kv_int(lines, prefix + ".evidence",   r[3])
+        _push_kv_int(lines, prefix + ".tier",       r[4])
+        i = i + 1
+    }
+    return lines
+}
+
+// Apply the SELFMODEL blob: REPLACE policy. Wipe the live self-model, then
+// install one competence record per snapshot row.
+fn selfmodel_section_apply(sm, blob) {
+    if len(blob) == 0 { return 0 }
+    self_model_clear(sm)
+    let recs = blob[0]
+    let i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        self_model_restore(sm, r[0], r[1], r[2], r[3])
+        i = i + 1
+    }
+    return len(recs)
+}
+
+// ---- snap_to_text ----------------------------------------------------------
+//
+// Emit the framed snapshot as a list of newline-terminated lines, then join
+// them once. The list-then-join shape avoids the O(N^2) string-concat tax
+// that would otherwise dominate a snapshot with hundreds of atoms.
+//
+// v2 wire shape adds an OPTIONAL meta block between the `sections` header
+// and the first section. The block emits four lines:
+//   meta.creator <string>
+//   meta.created_ns <int>
+//   meta.compaction_threshold <int>
+//   meta.encryption <string>
+// A reader that ignores them parses unchanged (the lines look like any other
+// `key val` pair and aren't dispatched into a section blob). The block is
+// written iff snap_version(s) >= 2 -- a v1 image is preserved bit-identical.
+fn snap_to_text(s) {
+    if snap_valid(s) == 0 { return "" }
+    // R15E: recompute the Merkle root over the KGS section's atom
+    // records BEFORE emitting the meta block, then stamp the meta
+    // slot. The emitted `meta.merkle_root` line and the on-disk KGS
+    // atoms must match bit-for-bit, so the recompute MUST happen
+    // immediately before we serialize the rest of the file. The KGS
+    // blob shape is `[atom_count, recs_list]`; merkle_root_for_kgs_blob
+    // returns the empty-tree sentinel hex when KGS is absent / empty.
+    if snap_version(s) >= 2 {
+        if snap_has_meta(s) == 1 {
+            let kgs_blob_for_root = 0
+            if snap_has_section(s, SEC_KGS) == 1 {
+                kgs_blob_for_root = snap_section(s, SEC_KGS)
+            }
+            let root_hex = merkle_root_for_kgs_blob(kgs_blob_for_root)
+            snap_meta_set_merkle_root(s, root_hex)
+            // R16A: if CE_SNAPSHOT_SIGN_KEY points at a keypair file,
+            // sign the freshly-computed root and stamp the signature
+            // slot. The sign call reads <path>.priv + <path>.pub,
+            // signs over the 32 raw root bytes, and returns the
+            // 128-char hex; an unset env var, missing file, or sign
+            // failure leaves the slot empty (signals "no signature").
+            // The sign cost (~250-1100 ms per save per ed25519.nova's
+            // preamble) is one-shot per /save, not per atom.
+            let sig_hex = merkle_signing_sign_root_via_env(root_hex)
+            snap_meta_set_merkle_signature(s, sig_hex)
+        }
+    }
+    let lines = list_new()
+    push(lines, _SNAP_HEADER + "\n")
+    _push_kv_int(lines, "tag", snap_tag(s))
+    _push_kv_int(lines, "ver", snap_version(s))
+    _push_kv_int(lines, "instance", snap_instance(s))
+    _push_kv_int(lines, "timestamp", snap_timestamp(s))
+    _push_kv_int(lines, "sections", SEC_COUNT)
+
+    // v2 meta block. Emit only when the snapshot is at v2+ and carries a
+    // populated meta block (snap_has_meta == 1). The fields are optional on
+    // the wire -- a malformed file that drops one parses as the default for
+    // that field.
+    if snap_version(s) >= 2 {
+        if snap_has_meta(s) == 1 {
+            _push_kv_str(lines, "meta.creator",              snap_meta_creator(s))
+            _push_kv_int(lines, "meta.created_ns",           snap_meta_created_ns(s))
+            _push_kv_int(lines, "meta.compaction_threshold", snap_meta_compaction_threshold(s))
+            _push_kv_str(lines, "meta.encryption",           snap_meta_encryption(s))
+            // R8E: per-atom-kind schema generation. The line is emitted
+            // ONLY when the atoms_version slot is populated (a writer
+            // running on the R8E build always populates it via
+            // snap_meta_new; a pre-R8E framed value re-encoded by this
+            // writer also has the slot since snap_meta_atoms_version
+            // returns the legacy default when the slot is absent).
+            // Older v2 readers ignore this line -- it parses as any
+            // other unknown `key val` pair.
+            _push_kv_int(lines, "schema.atoms_version",      snap_meta_atoms_version(s))
+            // R15E: Merkle root of the KGS atom records. Recomputed
+            // above so it matches the rest of this same emit; older
+            // (pre-R15E) readers ignore the line. CE_SNAPSHOT_VERIFY_MERKLE
+            // makes new readers fail loudly when the recomputed root
+            // disagrees with the file's claim.
+            _push_kv_str(lines, "meta.merkle_root",          snap_meta_merkle_root(s))
+            // R16A: Ed25519 signature over the Merkle ROOT BYTES
+            // (NOT the hex rendering). Emitted ONLY when the signer
+            // succeeded above -- the empty default would emit a line
+            // with no value, which a strict reader could mistake for
+            // "signature explicitly empty". Older (pre-R16A) readers
+            // ignore the line, post-R16A readers verify when
+            // CE_SNAPSHOT_VERIFY_PUBKEY is set.
+            if snap_meta_has_merkle_signature(s) == 1 {
+                _push_kv_str(lines, "meta.merkle_signature",
+                             snap_meta_merkle_signature(s))
+            }
+        }
+    }
+
+    let soul_p = snap_has_section(s, SEC_SOUL)
+    _push_kv_int(lines, "soul.present", soul_p)
+    if soul_p == 1 {
+        let soul_lines = soul_section_serialize(snap_section(s, SEC_SOUL))
+        let i = 0
+        while i < len(soul_lines) {
+            push(lines, soul_lines[i])
+            i = i + 1
+        }
+    }
+
+    let kgs_p = snap_has_section(s, SEC_KGS)
+    _push_kv_int(lines, "kgs.present", kgs_p)
+    if kgs_p == 1 {
+        let kg_lines = kg_section_serialize(snap_section(s, SEC_KGS))
+        let i = 0
+        while i < len(kg_lines) {
+            push(lines, kg_lines[i])
+            i = i + 1
+        }
+    }
+
+    let ep_p = snap_has_section(s, SEC_EPISODIC)
+    _push_kv_int(lines, "episodic.present", ep_p)
+    if ep_p == 1 {
+        let ep_lines = episodic_section_serialize(snap_section(s, SEC_EPISODIC))
+        let i = 0
+        while i < len(ep_lines) {
+            push(lines, ep_lines[i])
+            i = i + 1
+        }
+    }
+
+    let syn_p = snap_has_section(s, SEC_SYNAPSES)
+    _push_kv_int(lines, "synapses.present", syn_p)
+    if syn_p == 1 {
+        let syn_lines = synapses_section_serialize(snap_section(s, SEC_SYNAPSES))
+        let i = 0
+        while i < len(syn_lines) {
+            push(lines, syn_lines[i])
+            i = i + 1
+        }
+    }
+
+    let sm_p = snap_has_section(s, SEC_SELFMODEL)
+    _push_kv_int(lines, "selfmodel.present", sm_p)
+    if sm_p == 1 {
+        let sm_lines = selfmodel_section_serialize(snap_section(s, SEC_SELFMODEL))
+        let i = 0
+        while i < len(sm_lines) {
+            push(lines, sm_lines[i])
+            i = i + 1
+        }
+    }
+    push(lines, "end\n")
+    return join(lines, "")
+}
+
+// ---- text decoding ---------------------------------------------------------
+
+fn _find_byte(s, start, byte) {
+    let n = len(s)
+    let i = start
+    while i < n {
+        if char_at(s, i) == byte { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Returns [line_text, position_after_newline]. If no newline is found, the
+// trailing characters are returned and position lands at end-of-text so the
+// caller's loop terminates.
+fn _next_line(text, pos) {
+    let nl = _find_byte(text, pos, 10)
+    let pair = list_new()
+    if nl < 0 {
+        push(pair, substr(text, pos, len(text) - pos))
+        push(pair, len(text))
+        return pair
+    }
+    push(pair, substr(text, pos, nl - pos))
+    push(pair, nl + 1)
+    return pair
+}
+
+fn _line_key(line) {
+    let sp = _find_byte(line, 0, 32)
+    if sp < 0 { return line }
+    return substr(line, 0, sp)
+}
+
+fn _line_val(line) {
+    let sp = _find_byte(line, 0, 32)
+    if sp < 0 { return "" }
+    return substr(line, sp + 1, len(line) - sp - 1)
+}
+
+fn _line_val_int(line) {
+    return str_to_int(_line_val(line))
+}
+
+// Does `s` start with `prefix`? Pure builtin scan (no extra alloc).
+fn _starts_with(s, prefix) {
+    let p = len(prefix)
+    if p > len(s) { return 0 }
+    let i = 0
+    while i < p {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Pull the integer index out of an indexed key like `kgs.atoms[12].label` ->
+// 12. Returns -1 if the key shape doesn't include `[N]`.
+fn _index_in_key(key) {
+    let lb = _find_byte(key, 0, 91)   // '['
+    if lb < 0 { return -1 }
+    let rb = _find_byte(key, lb + 1, 93)   // ']'
+    if rb < 0 { return -1 }
+    return str_to_int(substr(key, lb + 1, rb - lb - 1))
+}
+
+// Pull the suffix after `].` in an indexed key. `kgs.atoms[12].label` -> "label".
+fn _suffix_in_key(key) {
+    let rb = _find_byte(key, 0, 93)   // ']'
+    if rb < 0 { return "" }
+    if rb + 2 > len(key) { return "" }
+    if char_at(key, rb + 1) != 46 { return "" }   // '.'
+    return substr(key, rb + 2, len(key) - rb - 2)
+}
+
+// Ensure `recs` has at least `n` entries; pad new entries with empty records
+// in the shape kg_section_build emits. Lets us populate atoms in any order.
+fn _ensure_records(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, "")    // kg label
+        push(r, 0)     // id
+        push(r, 0)     // kind
+        push(r, "")    // label
+        push(r, 0)     // alpha
+        push(r, 0)     // beta
+        push(recs, r)
+    }
+    return 1
+}
+
+// Same for the constitution rules list (text, severity).
+fn _ensure_const_rules(rules, n) {
+    while len(rules) < n {
+        let e = list_new()
+        push(e, "")
+        push(e, 0)
+        push(rules, e)
+    }
+    return 1
+}
+
+// Pad a list of moment records (ts, lifecycle, valence, atoms) to length n.
+fn _ensure_moment_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)              // ts
+        push(r, MSTAT_PERCEIVED) // lifecycle (1 by default)
+        push(r, 0)              // valence
+        push(r, list_new())     // atoms
+        push(recs, r)
+    }
+    return 1
+}
+
+// Pad the atoms sub-list of a single moment record to k elements.
+fn _ensure_moment_atoms(atoms, k) {
+    while len(atoms) < k {
+        push(atoms, 0)
+        k = k
+    }
+    return 1
+}
+
+// Pad a list of episode records (id, tier, moment_ids).
+fn _ensure_episode_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)              // id
+        push(r, EP_RECENT)      // tier
+        push(r, list_new())     // moment ids
+        push(recs, r)
+    }
+    return 1
+}
+
+fn _ensure_episode_mids(mids, k) {
+    while len(mids) < k {
+        push(mids, 0)
+        k = k
+    }
+    return 1
+}
+
+// Pad a list of episodic-atom records (id, members, count, first_ns,
+// last_ns, alpha, beta, provenance) -- the long-term-memory promotion
+// sub-block of the EPISODIC section.
+fn _ensure_episodic_atom_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)                                // id
+        push(r, list_new())                       // members
+        push(r, 0)                                // count
+        push(r, 0)                                // first_ns
+        push(r, 0)                                // last_ns
+        push(r, BEL_PRIOR)                        // alpha (uniform prior)
+        push(r, BEL_PRIOR)                        // beta  (uniform prior)
+        push(r, EPISODIC_PROVENANCE_DEFAULT)      // provenance
+        push(recs, r)
+    }
+    return 1
+}
+
+fn _ensure_episodic_atom_members(members, k) {
+    while len(members) < k {
+        push(members, 0)
+        k = k
+    }
+    return 1
+}
+
+// Pad a list of synapse records (src, dst, weight, eligibility).
+fn _ensure_syn_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, 0)              // src
+        push(r, 0)              // dst
+        push(r, 0)              // weight
+        push(r, 0)              // eligibility
+        push(recs, r)
+    }
+    return 1
+}
+
+// Pad a list of multi-part synapse entries: each entry is [label, records_list].
+fn _ensure_syn_part_entries(parts, n) {
+    while len(parts) < n {
+        let pe = list_new()
+        push(pe, "")            // label
+        push(pe, list_new())    // records list (each rec: [src,dst,w,e])
+        push(parts, pe)
+    }
+    return 1
+}
+
+// Pad a list of selfmodel domain records (label, kind, reliability, evidence, tier).
+fn _ensure_sm_recs(recs, n) {
+    while len(recs) < n {
+        let r = list_new()
+        push(r, "")             // label
+        push(r, COMP_KNOW)      // kind default
+        push(r, 0)              // reliability
+        push(r, 0)              // evidence
+        push(r, TIER_UNKNOWN)   // tier
+        push(recs, r)
+    }
+    return 1
+}
+
+// Parse keys like `episodic.moments[12].atoms[3]` -> [12, 3]. Returns 0 if the
+// shape doesn't have the expected nested form.
+fn _nested_indices(key) {
+    let lb1 = _find_byte(key, 0, 91)   // first '['
+    if lb1 < 0 { return 0 }
+    let rb1 = _find_byte(key, lb1 + 1, 93)
+    if rb1 < 0 { return 0 }
+    let outer = str_to_int(substr(key, lb1 + 1, rb1 - lb1 - 1))
+    let lb2 = _find_byte(key, rb1 + 1, 91)
+    if lb2 < 0 { return 0 }
+    let rb2 = _find_byte(key, lb2 + 1, 93)
+    if rb2 < 0 { return 0 }
+    let inner = str_to_int(substr(key, lb2 + 1, rb2 - lb2 - 1))
+    let pair = list_new()
+    push(pair, outer)
+    push(pair, inner)
+    return pair
+}
+
+// Parse a textual snapshot. Returns the snapshot value on success, 0 on any
+// shape mismatch (wrong header, missing required key, wrong tag/version).
+//
+// Backwards compatibility: an old-format file that has `kgs.atoms` but no
+// `kgs.atoms.count` parses as a valid snapshot whose KGS blob carries the
+// metadata-only atom count in blob[0] and an EMPTY atom record list in
+// blob[1]. Applying that on the live KG installs zero atoms (an old
+// snapshot's content cannot be rehydrated in the new format -- the daemon
+// boots from seed and reports the absence).
+fn snap_from_text(text) {
+    let cursor = _next_line(text, 0)
+    if str_eq(cursor[0], _SNAP_HEADER) == 0 { return 0 }
+    let pos = cursor[1]
+
+    let tag = -1
+    let ver = -1
+    let instance = -1
+    let timestamp = -1
+    let sections = -1
+    let soul_present = 0
+    let soul_name = ""
+    let soul_constcount = 0
+    let soul_purpose = ""
+    let soul_nature = ""
+    let soul_mood_v = 500
+    let soul_mood_a = 300
+    let soul_o = 500
+    let soul_c = 500
+    let soul_e = 500
+    let soul_ag = 500
+    let soul_n = 500
+    let soul_const_rules = list_new()
+    let soul_const_count_seen = -1
+    let kgs_present = 0
+    let kgs_atoms = 0
+    let kgs_atoms_count_seen = -1
+    let kgs_recs = list_new()
+    let episodic_present = 0
+    let ep_moments = list_new()
+    let ep_moments_count_seen = -1
+    let ep_episodes = list_new()
+    let ep_episodes_count_seen = -1
+    let ep_atoms = list_new()
+    let ep_atoms_count_seen = -1
+    let synapses_present = 0
+    let syn_threshold = SYN_SNAP_MIN
+    let syn_count_seen = -1
+    let syn_recs = list_new()
+    let syn_parts_count_seen = -1
+    let syn_parts = list_new()        // list of [label, records_list]
+    let selfmodel_present = 0
+    let sm_count_seen = -1
+    let sm_recs = list_new()
+    let saw_end = 0
+    // v2 meta block. Defaults match the v1-migration recovery values so a
+    // file that omits one or more fields (legacy v1, or a v2 file with a
+    // partial meta block) parses without erroring.
+    let meta_seen     = 0
+    let meta_creator  = SNAP_META_CREATOR_DEFAULT_V1
+    let meta_created  = 0
+    let meta_compact  = SNAP_META_COMPACT_TH_UNKNOWN
+    let meta_encrypt  = SNAP_META_ENCRYPTION_NONE
+    // R8E: per-atom-kind schema generation. Absent from any pre-R8E
+    // file -- the reader treats absence as SNAP_META_ATOMS_VER_LEGACY
+    // (= 1, the implicit shape every pre-this-build atom has).
+    let meta_atoms_ver      = SNAP_META_ATOMS_VER_LEGACY
+    let meta_atoms_ver_seen = 0
+    // R15E: Merkle root of the KGS atom records. Absent from any
+    // pre-R15E file -- the reader treats absence as the empty
+    // sentinel (= no commitment was made, so verification is a no-op).
+    let meta_merkle_root      = SNAP_META_MERKLE_ROOT_NONE
+    let meta_merkle_root_seen = 0
+    // R16A: Ed25519 signature over the Merkle root. Absent from any
+    // pre-R16A file -- the reader treats absence as the empty
+    // sentinel (= no signature was emitted; CE_SNAPSHOT_VERIFY_PUBKEY
+    // takes the "no signature" branch on load).
+    let meta_merkle_sig       = SNAP_META_MERKLE_SIG_NONE
+    let meta_merkle_sig_seen  = 0
+
+    while pos < len(text) {
+        let parsed = _next_line(text, pos)
+        pos = parsed[1]
+        let line = parsed[0]
+        if len(line) > 0 {
+            let k = _line_key(line)
+            if str_eq(k, "end") == 1 {
+                saw_end = 1
+                pos = len(text)
+            } else {
+                if str_eq(k, "tag") == 1               { tag               = _line_val_int(line) }
+                if str_eq(k, "ver") == 1               { ver               = _line_val_int(line) }
+                if str_eq(k, "instance") == 1          { instance          = _line_val_int(line) }
+                if str_eq(k, "timestamp") == 1         { timestamp         = _line_val_int(line) }
+                if str_eq(k, "sections") == 1          { sections          = _line_val_int(line) }
+                if str_eq(k, "soul.present") == 1      { soul_present      = _line_val_int(line) }
+                if str_eq(k, "soul.name") == 1         { soul_name         = _line_val(line) }
+                if str_eq(k, "soul.constcount") == 1   { soul_constcount   = _line_val_int(line) }
+                if str_eq(k, "soul.purpose") == 1      { soul_purpose      = _line_val(line) }
+                if str_eq(k, "soul.nature") == 1       { soul_nature       = _line_val(line) }
+                if str_eq(k, "soul.mood.valence") == 1 { soul_mood_v       = _line_val_int(line) }
+                if str_eq(k, "soul.mood.arousal") == 1 { soul_mood_a       = _line_val_int(line) }
+                if str_eq(k, "soul.ocean.o") == 1      { soul_o            = _line_val_int(line) }
+                if str_eq(k, "soul.ocean.c") == 1      { soul_c            = _line_val_int(line) }
+                if str_eq(k, "soul.ocean.e") == 1      { soul_e            = _line_val_int(line) }
+                if str_eq(k, "soul.ocean.a") == 1      { soul_ag           = _line_val_int(line) }
+                if str_eq(k, "soul.ocean.n") == 1      { soul_n            = _line_val_int(line) }
+                if str_eq(k, "soul.const.count") == 1  { soul_const_count_seen = _line_val_int(line) }
+                if str_eq(k, "kgs.present") == 1       { kgs_present       = _line_val_int(line) }
+                if str_eq(k, "kgs.atoms") == 1         { kgs_atoms         = _line_val_int(line) }
+                if str_eq(k, "kgs.atoms.count") == 1   { kgs_atoms_count_seen = _line_val_int(line) }
+                if str_eq(k, "episodic.present") == 1  { episodic_present  = _line_val_int(line) }
+                if str_eq(k, "synapses.present") == 1  { synapses_present  = _line_val_int(line) }
+                if str_eq(k, "selfmodel.present") == 1 { selfmodel_present = _line_val_int(line) }
+
+                // v2 meta block. Each field is optional; an absent field
+                // keeps its default. The block lives between `sections` and
+                // the first section but the parser accepts the lines in any
+                // position (same shape as the rest of the file).
+                if str_eq(k, "meta.creator") == 1 {
+                    meta_creator = _line_val(line)
+                    meta_seen    = 1
+                }
+                if str_eq(k, "meta.created_ns") == 1 {
+                    meta_created = _line_val_int(line)
+                    meta_seen    = 1
+                }
+                if str_eq(k, "meta.compaction_threshold") == 1 {
+                    meta_compact = _line_val_int(line)
+                    meta_seen    = 1
+                }
+                if str_eq(k, "meta.encryption") == 1 {
+                    meta_encrypt = _line_val(line)
+                    meta_seen    = 1
+                }
+                // R8E schema-evolution: optional `schema.atoms_version`
+                // line in the meta block. A pre-R8E v2 file omits this
+                // line and the schema framework treats the atoms as
+                // SCHEMA_LEGACY_VERSION (= 1) -- exactly the implicit
+                // shape they had.
+                if str_eq(k, "schema.atoms_version") == 1 {
+                    meta_atoms_ver      = _line_val_int(line)
+                    meta_atoms_ver_seen = 1
+                    meta_seen           = 1
+                }
+                // R15E tamper-evidence: optional `meta.merkle_root`
+                // line. Absence = no commitment; presence = the
+                // 64-char hex form of SHA-256 over the KGS atom
+                // records. CE_SNAPSHOT_VERIFY_MERKLE=1 turns presence
+                // into a load-time tripwire.
+                if str_eq(k, "meta.merkle_root") == 1 {
+                    meta_merkle_root      = _line_val(line)
+                    meta_merkle_root_seen = 1
+                    meta_seen             = 1
+                }
+                // R16A attestation-chain: optional
+                // `meta.merkle_signature` line. Absence = no
+                // signature; presence = the 128-char hex form of the
+                // Ed25519 signature over the 32 root bytes.
+                // CE_SNAPSHOT_VERIFY_PUBKEY turns presence into a
+                // load-time tripwire (verifies under the trusted
+                // pubkey). The line is OPTIONAL even with R15E's
+                // merkle_root present -- some writers don't have a
+                // signing key configured.
+                if str_eq(k, "meta.merkle_signature") == 1 {
+                    meta_merkle_sig      = _line_val(line)
+                    meta_merkle_sig_seen = 1
+                    meta_seen            = 1
+                }
+
+                // Indexed atom keys: kgs.atoms[N].field
+                if _starts_with(k, "kgs.atoms[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_records(kgs_recs, idx + 1)
+                        let rec = kgs_recs[idx]
+                        if str_eq(suf, "kg") == 1    { list_set(rec, 0, _line_val(line)) }
+                        if str_eq(suf, "id") == 1    { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "kind") == 1  { list_set(rec, 2, _line_val_int(line)) }
+                        if str_eq(suf, "label") == 1 { list_set(rec, 3, _line_val(line)) }
+                        if str_eq(suf, "alpha") == 1 { list_set(rec, 4, _line_val_int(line)) }
+                        if str_eq(suf, "beta") == 1  { list_set(rec, 5, _line_val_int(line)) }
+                    }
+                }
+
+                // Indexed constitution rule keys: soul.const[N].field
+                if _starts_with(k, "soul.const[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_const_rules(soul_const_rules, idx + 1)
+                        let r = soul_const_rules[idx]
+                        if str_eq(suf, "text") == 1     { list_set(r, 0, _line_val(line)) }
+                        if str_eq(suf, "severity") == 1 { list_set(r, 1, _line_val_int(line)) }
+                    }
+                }
+
+                // ---- EPISODIC ------------------------------------------------
+                if str_eq(k, "episodic.moments.count") == 1 {
+                    ep_moments_count_seen = _line_val_int(line)
+                }
+                if str_eq(k, "episodic.episodes.count") == 1 {
+                    ep_episodes_count_seen = _line_val_int(line)
+                }
+                // episodic.moments[N].field (non-nested fields)
+                if _starts_with(k, "episodic.moments[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_moment_recs(ep_moments, idx + 1)
+                        let rec = ep_moments[idx]
+                        if str_eq(suf, "timestamp") == 1  { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "lifecycle") == 1  { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "valence") == 1    { list_set(rec, 2, _line_val_int(line)) }
+                        if str_eq(suf, "atom_count") == 1 {
+                            // Pre-allocate the atom slots so out-of-order keys
+                            // (atoms[K] arriving before atom_count) still land.
+                            let n_atoms = _line_val_int(line)
+                            _ensure_moment_atoms(rec[3], n_atoms)
+                        }
+                        // Nested atoms: episodic.moments[N].atoms[K]
+                        if _starts_with(suf, "atoms[") == 1 {
+                            let lb = _find_byte(suf, 0, 91)
+                            let rb = _find_byte(suf, lb + 1, 93)
+                            if lb >= 0 {
+                                if rb > lb + 1 {
+                                    let kidx = str_to_int(substr(suf, lb + 1, rb - lb - 1))
+                                    _ensure_moment_atoms(rec[3], kidx + 1)
+                                    list_set(rec[3], kidx, _line_val_int(line))
+                                }
+                            }
+                        }
+                    }
+                }
+                // episodic.episodes[N].field
+                if _starts_with(k, "episodic.episodes[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_episode_recs(ep_episodes, idx + 1)
+                        let rec = ep_episodes[idx]
+                        if str_eq(suf, "id") == 1            { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "tier") == 1          { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "moment_count") == 1 {
+                            let n_mids = _line_val_int(line)
+                            _ensure_episode_mids(rec[2], n_mids)
+                        }
+                        if _starts_with(suf, "moments[") == 1 {
+                            let lb = _find_byte(suf, 0, 91)
+                            let rb = _find_byte(suf, lb + 1, 93)
+                            if lb >= 0 {
+                                if rb > lb + 1 {
+                                    let kidx = str_to_int(substr(suf, lb + 1, rb - lb - 1))
+                                    _ensure_episode_mids(rec[2], kidx + 1)
+                                    list_set(rec[2], kidx, _line_val_int(line))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // episodic.atoms.* (long-term memory promotion sub-block).
+                // A pre-this-build snapshot has no such lines; a new
+                // reader that meets an old file just sees ep_atoms stay
+                // empty and writes 0 atoms back through the apply path.
+                if str_eq(k, "episodic.atoms.count") == 1 {
+                    ep_atoms_count_seen = _line_val_int(line)
+                }
+                if _starts_with(k, "episodic.atoms[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_episodic_atom_recs(ep_atoms, idx + 1)
+                        let rec = ep_atoms[idx]
+                        if str_eq(suf, "id") == 1           { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "member_count") == 1 {
+                            let n_mems = _line_val_int(line)
+                            _ensure_episodic_atom_members(rec[1], n_mems)
+                        }
+                        if _starts_with(suf, "members[") == 1 {
+                            let lb = _find_byte(suf, 0, 91)
+                            let rb = _find_byte(suf, lb + 1, 93)
+                            if lb >= 0 {
+                                if rb > lb + 1 {
+                                    let kidx = str_to_int(substr(suf, lb + 1, rb - lb - 1))
+                                    _ensure_episodic_atom_members(rec[1], kidx + 1)
+                                    list_set(rec[1], kidx, _line_val_int(line))
+                                }
+                            }
+                        }
+                        if str_eq(suf, "count") == 1      { list_set(rec, 2, _line_val_int(line)) }
+                        if str_eq(suf, "first_ns") == 1   { list_set(rec, 3, _line_val_int(line)) }
+                        if str_eq(suf, "last_ns") == 1    { list_set(rec, 4, _line_val_int(line)) }
+                        if str_eq(suf, "alpha") == 1      { list_set(rec, 5, _line_val_int(line)) }
+                        if str_eq(suf, "beta") == 1       { list_set(rec, 6, _line_val_int(line)) }
+                        if str_eq(suf, "provenance") == 1 { list_set(rec, 7, _line_val(line)) }
+                    }
+                }
+
+                // ---- SYNAPSES ------------------------------------------------
+                if str_eq(k, "synapses.threshold") == 1 {
+                    syn_threshold = _line_val_int(line)
+                }
+                if str_eq(k, "synapses.count") == 1 {
+                    syn_count_seen = _line_val_int(line)
+                }
+                // synapses[N].field (legacy single-graph records)
+                if _starts_with(k, "synapses[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_syn_recs(syn_recs, idx + 1)
+                        let rec = syn_recs[idx]
+                        if str_eq(suf, "src") == 1         { list_set(rec, 0, _line_val_int(line)) }
+                        if str_eq(suf, "dst") == 1         { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "weight") == 1      { list_set(rec, 2, _line_val_int(line)) }
+                        if str_eq(suf, "eligibility") == 1 { list_set(rec, 3, _line_val_int(line)) }
+                    }
+                }
+                // Multi-part synapses block (forward-compat with single-part
+                // capture). `synapses.parts.count` is the entry count; each
+                // entry is identified by `synapses.parts[N].<field>` and
+                // nested `synapses.parts[N].synapses[K].<field>` records.
+                if str_eq(k, "synapses.parts.count") == 1 {
+                    syn_parts_count_seen = _line_val_int(line)
+                }
+                if _starts_with(k, "synapses.parts[") == 1 {
+                    // Outer index is the parts-entry id; the rest of the key
+                    // is either `.label`, `.synapses.count`, or a nested
+                    // `.synapses[K].<field>`.
+                    let lb1 = _find_byte(k, 0, 91)              // first '['
+                    let rb1 = _find_byte(k, lb1 + 1, 93)
+                    if lb1 >= 0 {
+                        if rb1 > lb1 + 1 {
+                            let pidx = str_to_int(substr(k, lb1 + 1, rb1 - lb1 - 1))
+                            // Suffix begins after `].`
+                            let suf_start = rb1 + 2
+                            if suf_start <= len(k) {
+                                let suf = substr(k, suf_start, len(k) - suf_start)
+                                _ensure_syn_part_entries(syn_parts, pidx + 1)
+                                let pe = syn_parts[pidx]
+                                if str_eq(suf, "label") == 1 {
+                                    list_set(pe, 0, _line_val(line))
+                                }
+                                if str_eq(suf, "synapses.count") == 1 {
+                                    // No pre-allocation needed -- records
+                                    // are appended via _ensure_syn_recs as
+                                    // each `synapses[K]` arrives.
+                                }
+                                // Nested per-record: `synapses[K].<field>`.
+                                if _starts_with(suf, "synapses[") == 1 {
+                                    let lb2 = _find_byte(suf, 0, 91)
+                                    let rb2 = _find_byte(suf, lb2 + 1, 93)
+                                    if lb2 >= 0 {
+                                        if rb2 > lb2 + 1 {
+                                            let kidx = str_to_int(substr(suf, lb2 + 1, rb2 - lb2 - 1))
+                                            let suf2_start = rb2 + 2
+                                            let suf2 = ""
+                                            if suf2_start < len(suf) {
+                                                suf2 = substr(suf, suf2_start, len(suf) - suf2_start)
+                                            }
+                                            let p_recs = pe[1]
+                                            _ensure_syn_recs(p_recs, kidx + 1)
+                                            let rec = p_recs[kidx]
+                                            if str_eq(suf2, "src") == 1         { list_set(rec, 0, _line_val_int(line)) }
+                                            if str_eq(suf2, "dst") == 1         { list_set(rec, 1, _line_val_int(line)) }
+                                            if str_eq(suf2, "weight") == 1      { list_set(rec, 2, _line_val_int(line)) }
+                                            if str_eq(suf2, "eligibility") == 1 { list_set(rec, 3, _line_val_int(line)) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- SELFMODEL -----------------------------------------------
+                if str_eq(k, "selfmodel.domains.count") == 1 {
+                    sm_count_seen = _line_val_int(line)
+                }
+                if _starts_with(k, "selfmodel.domains[") == 1 {
+                    let idx = _index_in_key(k)
+                    let suf = _suffix_in_key(k)
+                    if idx >= 0 {
+                        _ensure_sm_recs(sm_recs, idx + 1)
+                        let rec = sm_recs[idx]
+                        if str_eq(suf, "label") == 1      { list_set(rec, 0, _line_val(line)) }
+                        if str_eq(suf, "kind") == 1       { list_set(rec, 1, _line_val_int(line)) }
+                        if str_eq(suf, "know") == 1 {
+                            // know/do/understand each carry the reliability for
+                            // ONE kind; the per-record kind tells us which one
+                            // owns the value. We coalesce in install below.
+                            let v = _line_val_int(line)
+                            if v > 0 { list_set(rec, 2, v) }
+                        }
+                        if str_eq(suf, "do") == 1 {
+                            let v = _line_val_int(line)
+                            if v > 0 { list_set(rec, 2, v) }
+                        }
+                        if str_eq(suf, "understand") == 1 {
+                            let v = _line_val_int(line)
+                            if v > 0 { list_set(rec, 2, v) }
+                        }
+                        if str_eq(suf, "evidence") == 1   { list_set(rec, 3, _line_val_int(line)) }
+                        if str_eq(suf, "tier") == 1       { list_set(rec, 4, _line_val_int(line)) }
+                    }
+                }
+            }
+        }
+    }
+
+    if saw_end == 0 { return 0 }
+    if tag != SNAP_TAG { return 0 }
+    // v2 backwards compatibility: we accept any version in
+    // [SNAP_FORMAT_VERSION_MIN_SUPPORTED, SNAP_FORMAT_VERSION] and migrate
+    // up after the section blobs are installed. A version newer than
+    // SNAP_FORMAT_VERSION is REJECTED loudly -- a future v3 carries fields
+    // this build doesn't understand and silently downgrading would lose
+    // data.
+    if ver < SNAP_FORMAT_VERSION_MIN_SUPPORTED { return 0 }
+    if ver > SNAP_FORMAT_VERSION {
+        // Split the diagnostic into a sequence of single appends to dodge
+        // a NOVA codegen pointer-threshold overflow on long chained "+"
+        // expressions over many string constants (same workaround pattern
+        // used elsewhere in this file for the unknown-part warning).
+        let msg = "(error: snapshot format v"
+        msg = msg + int_to_str(ver)
+        msg = msg + " is newer than this build supports (max v"
+        msg = msg + int_to_str(SNAP_FORMAT_VERSION)
+        msg = msg + "); upgrade required)"
+        io_println(msg)
+        return 0
+    }
+    if sections != SEC_COUNT { return 0 }
+
+    let s = snap_new(instance, timestamp)
+    // snap_new stamps SNAP_FORMAT_VERSION (today: 2) into the version slot.
+    // To run the migration path on a v1 file we have to roll the version
+    // back to what the file actually declared, install section blobs, then
+    // dispatch on `ver` to migrate up.
+    list_set(s, SNAP_VER, ver)
+    if soul_present == 1 {
+        let sb = list_new()
+        push(sb, soul_name)             // [0]
+        push(sb, soul_constcount)       // [1]
+        push(sb, soul_purpose)          // [2]
+        push(sb, soul_nature)           // [3]
+        push(sb, soul_mood_v)           // [4]
+        push(sb, soul_mood_a)           // [5]
+        push(sb, soul_o)                // [6]
+        push(sb, soul_c)                // [7]
+        push(sb, soul_e)                // [8]
+        push(sb, soul_ag)               // [9]
+        push(sb, soul_n)                // [10]
+        // If the file declared a const.count, trim/pad the rules list to it
+        // (defensive against malformed files); otherwise use what we saw.
+        if soul_const_count_seen >= 0 {
+            _ensure_const_rules(soul_const_rules, soul_const_count_seen)
+            while len(soul_const_rules) > soul_const_count_seen {
+                list_set(soul_const_rules, len(soul_const_rules) - 1, 0)
+                // No pop builtin -- rebuild the list to the desired length.
+                let trimmed = list_new()
+                let i = 0
+                while i < soul_const_count_seen {
+                    push(trimmed, soul_const_rules[i])
+                    i = i + 1
+                }
+                soul_const_rules = trimmed
+            }
+        }
+        push(sb, soul_const_rules)      // [11]
+        snap_put_section(s, SEC_SOUL, sb)
+    }
+    if kgs_present == 1 {
+        let kb = list_new()
+        push(kb, kgs_atoms)              // [0] legacy metadata-only hint
+        // If we saw an explicit count, honor it; else use what records we parsed.
+        if kgs_atoms_count_seen >= 0 {
+            _ensure_records(kgs_recs, kgs_atoms_count_seen)
+            while len(kgs_recs) > kgs_atoms_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < kgs_atoms_count_seen {
+                    push(trimmed, kgs_recs[i])
+                    i = i + 1
+                }
+                kgs_recs = trimmed
+            }
+        }
+        push(kb, kgs_recs)               // [1] full atom list (empty for legacy)
+        snap_put_section(s, SEC_KGS, kb)
+    }
+    if episodic_present == 1 {
+        let eb = list_new()
+        // Trim ep_moments / ep_episodes to explicit counts if seen; otherwise
+        // use what we accumulated (backwards-compat: presence flag alone means
+        // an empty section, same convention as `kgs.atoms` legacy hint).
+        if ep_moments_count_seen >= 0 {
+            _ensure_moment_recs(ep_moments, ep_moments_count_seen)
+            while len(ep_moments) > ep_moments_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < ep_moments_count_seen {
+                    push(trimmed, ep_moments[i])
+                    i = i + 1
+                }
+                ep_moments = trimmed
+            }
+        }
+        if ep_episodes_count_seen >= 0 {
+            _ensure_episode_recs(ep_episodes, ep_episodes_count_seen)
+            while len(ep_episodes) > ep_episodes_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < ep_episodes_count_seen {
+                    push(trimmed, ep_episodes[i])
+                    i = i + 1
+                }
+                ep_episodes = trimmed
+            }
+        }
+        // Episodic atoms (long-term memory promotion). The sub-block is
+        // optional -- a legacy file without `episodic.atoms.count` parses
+        // to an empty list, which writes back as an empty third sub-list
+        // and remains forward-compat with older readers that only look at
+        // blob[0]/[1].
+        if ep_atoms_count_seen >= 0 {
+            _ensure_episodic_atom_recs(ep_atoms, ep_atoms_count_seen)
+            while len(ep_atoms) > ep_atoms_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < ep_atoms_count_seen {
+                    push(trimmed, ep_atoms[i])
+                    i = i + 1
+                }
+                ep_atoms = trimmed
+            }
+        }
+        push(eb, ep_moments)
+        push(eb, ep_episodes)
+        push(eb, ep_atoms)
+        snap_put_section(s, SEC_EPISODIC, eb)
+    }
+    if synapses_present == 1 {
+        let sb = list_new()
+        if syn_count_seen >= 0 {
+            _ensure_syn_recs(syn_recs, syn_count_seen)
+            while len(syn_recs) > syn_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < syn_count_seen {
+                    push(trimmed, syn_recs[i])
+                    i = i + 1
+                }
+                syn_recs = trimmed
+            }
+        }
+        // Multi-part block: trim/pad to the explicit count when seen so a
+        // malformed file with extra `synapses.parts[N]` keys past the
+        // declared count doesn't leak entries through.
+        if syn_parts_count_seen >= 0 {
+            _ensure_syn_part_entries(syn_parts, syn_parts_count_seen)
+            while len(syn_parts) > syn_parts_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < syn_parts_count_seen {
+                    push(trimmed, syn_parts[i])
+                    i = i + 1
+                }
+                syn_parts = trimmed
+            }
+        } else {
+            // No `synapses.parts.count` line in the file -- legacy P0.1
+            // shape. Force the parts list to empty so the apply path
+            // chooses the legacy fallback (install blob[1] into reasoning).
+            syn_parts = list_new()
+        }
+        push(sb, syn_threshold)
+        push(sb, syn_recs)
+        push(sb, syn_parts)
+        snap_put_section(s, SEC_SYNAPSES, sb)
+    }
+    if selfmodel_present == 1 {
+        let mb = list_new()
+        if sm_count_seen >= 0 {
+            _ensure_sm_recs(sm_recs, sm_count_seen)
+            while len(sm_recs) > sm_count_seen {
+                let trimmed = list_new()
+                let i = 0
+                while i < sm_count_seen {
+                    push(trimmed, sm_recs[i])
+                    i = i + 1
+                }
+                sm_recs = trimmed
+            }
+        }
+        push(mb, sm_recs)
+        snap_put_section(s, SEC_SELFMODEL, mb)
+    }
+
+    // v1 -> v2 migration dispatch. Versions older than the current format
+    // need their meta block invented out of the v1-recovery defaults. We
+    // run that here so the daemon's snap_load() path receives a uniformly-
+    // shaped v2 snapshot regardless of the file's on-disk version.
+    //
+    // A v2 file installs the meta block as-parsed; if the file omitted some
+    // or all meta fields (forward-compat from a writer that stamped only a
+    // subset, or a v2 file produced by a build that's still rolling out),
+    // the missing fields keep the defaults set above (which match the v1
+    // migration recovery values).
+    if ver == 1 {
+        snap_migrate_v1_to_v2(s)
+        // R8E: a v1 file has no atoms_version meta field. The
+        // migrate_v1_to_v2 helper stamps the slot with the legacy
+        // default; nothing else to do here.
+    } else {
+        // v2+ path: install the parsed meta block. snap_new already attached
+        // a v2-default meta block; we overwrite the fields with the values
+        // pulled from the wire.
+        if snap_has_meta(s) == 1 {
+            snap_meta_set_creator(s,              meta_creator)
+            snap_meta_set_created_ns(s,           meta_created)
+            snap_meta_set_compaction_threshold(s, meta_compact)
+            snap_meta_set_encryption(s,           meta_encrypt)
+            // R8E: the parsed atoms_version, or LEGACY (= 1) when the
+            // line is missing. snap_meta_set_atoms_version extends a
+            // pre-R8E 4-cell meta block to 5 cells in place.
+            snap_meta_set_atoms_version(s, meta_atoms_ver)
+            // R15E: the parsed Merkle root hex, or the empty sentinel
+            // when the line is missing. snap_meta_set_merkle_root
+            // extends a pre-R15E meta block to the current cell count
+            // in place.
+            snap_meta_set_merkle_root(s, meta_merkle_root)
+            // R16A: the parsed Ed25519 signature hex, or the empty
+            // sentinel when the line is missing.
+            // snap_meta_set_merkle_signature extends a pre-R16A meta
+            // block to the current cell count in place.
+            snap_meta_set_merkle_signature(s, meta_merkle_sig)
+        }
+    }
+    return s
+}
+
+// ---- crash-safe disk I/O (the runtime seam) --------------------------------
+//
+// The five-step contract `snap_durable_steps()` advertises is realized here:
+//
+//   1. open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+//   2. write(tmp_fd, bytes)
+//   3. fsync(tmp_fd)
+//   4. close(tmp_fd) + rename(tmp -> final)
+//   5. open(parent_dir, O_RDONLY) + fsync(dir_fd) + close(dir_fd)
+//
+// Step 5 makes the rename itself durable on ext4/xfs (without it, a power
+// loss right after step 4 can lose the dir entry even though the data block
+// is already on disk). We ignore the parent-fsync's return: if the dir can't
+// be opened we still succeed at the file level (best-effort).
+
+let _SNAP_MODE = 420   // 0644: rw-r--r--
+
+// Find the rightmost '/' (byte 47) in `path`. Returns -1 if none.
+fn _last_slash(path) {
+    let i = len(path) - 1
+    while i >= 0 {
+        if char_at(path, i) == 47 { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _parent_dir(path) {
+    let i = _last_slash(path)
+    if i < 0 { return "." }
+    if i == 0 { return "/" }
+    return substr(path, 0, i)
+}
+
+// Write `text` to `path` durably. Returns 1 on success, 0 on any syscall
+// failure (open or write). A returned 1 means the snapshot has been committed
+// via fsync + atomic rename and survives an abrupt kill.
+fn snap_write_durable(text, path) {
+    let tmp = snap_tmp_path(path)
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(tmp, flags, _SNAP_MODE)
+    if fd < 0 { return 0 }
+    let n = len(text)
+    let written = sys_write(fd, text, n)
+    if written != n {
+        sys_close(fd)
+        sys_unlink(tmp)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    let rr = sys_rename(tmp, path)
+    if rr != 0 {
+        sys_unlink(tmp)
+        return 0
+    }
+    let parent = _parent_dir(path)
+    let dfd = sys_open(parent, O_RDONLY, 0)
+    if dfd >= 0 {
+        sys_fsync(dfd)
+        sys_close(dfd)
+    }
+    return 1
+}
+
+// Read the entire file at `path` as text. Returns 0 if the file can't be
+// opened (missing, permission denied), otherwise the textual content.
+fn snap_read_text(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let chunk = 4096
+    let buf = alloc(chunk + 1)
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        let m = sys_read(fd, buf, chunk)
+        if m <= 0 {
+            done = 1
+        } else {
+            store8(buf + m, 0)
+            acc = acc + buf
+            if m < chunk { done = 1 }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// Convenience: durably write a snapshot to disk in one call.
+//
+// P2.10: when CE_AUTO_COMPACT_ON_SAVE=1, run snap_compact (with env-driven
+// opts via compact_opts_from_env) before serializing -- so a long-running
+// daemon can opt into shrinking the on-disk image without an explicit
+// /compact call. Off by default to keep operator control of when the
+// compactor runs (the /compact admin command stays the primary surface).
+fn snap_save(s, path) {
+    if snap_valid(s) == 0 { return 0 }
+    let to_write = s
+    let auto = getenv("CE_AUTO_COMPACT_ON_SAVE")
+    if auto != 0 {
+        if str_eq(auto, "1") == 1 {
+            let opts = compact_opts_from_env()
+            to_write = snap_compact(s, opts)
+        }
+    }
+    return snap_write_durable(snap_to_text(to_write), path)
+}
+
+// Convenience: read + parse a snapshot from disk in one call. Returns 0 if
+// the file is missing, unreadable, or contents do not parse / validate.
+//
+// R15E: when CE_SNAPSHOT_VERIFY_MERKLE=1 and the file carries a
+// `meta.merkle_root` claim, the reader recomputes the Merkle root over
+// the parsed KGS records and refuses the load on a mismatch (returns
+// 0, the same sentinel a parse failure already uses, so callers don't
+// need a new error path). The mismatch is logged to stderr via
+// io_println so the operator can see what tripped.
+fn snap_load(path) {
+    let text = snap_read_text(path)
+    if text == 0 { return 0 }
+    if len(text) == 0 { return 0 }
+    let s = snap_from_text(text)
+    if s == 0 { return 0 }
+    if merkle_verify_on_load_enabled() == 1 {
+        if snap_verify_merkle(s) == 0 {
+            io_println("(load FAILED: Merkle root mismatch -- snapshot " + path
+                + " is TAMPERED or corrupt)")
+            return 0
+        }
+    }
+    // R16A signature tripwire: when CE_SNAPSHOT_VERIFY_PUBKEY points at
+    // a 32-byte pubkey file, verify the signature over the recomputed
+    // Merkle root. Policy:
+    //   * verified (1)    -- load proceeds.
+    //   * tampered (0)    -- load REFUSED loudly.
+    //   * no commitment   -- if CE_SNAPSHOT_REQUIRE_SIGNATURE=1 set,
+    //     (-1)               REFUSE (strict). Otherwise warn + proceed
+    //                        (lenient default, matching R15E's "no
+    //                        commitment" branch).
+    let sig_status = snap_verify_signature(s)
+    if sig_status == 0 {
+        io_println("(load FAILED: Merkle signature mismatch -- snapshot " + path
+            + " is TAMPERED, the on-disk signature does not match the recomputed"
+            + " root under the trusted pubkey)")
+        return 0
+    }
+    if sig_status == 0 - 1 {
+        if merkle_signing_require_signature() == 1 {
+            io_println("(load FAILED: snapshot " + path
+                + " has no Merkle signature under CE_SNAPSHOT_REQUIRE_SIGNATURE=1)")
+            return 0
+        }
+        // Lenient path: pubkey configured but file has no signature.
+        // We warn but proceed -- some operators run the verifier
+        // against a mix of signed and unsigned snapshots during a
+        // rollout. -2 is "no pubkey configured" (silent).
+        let pub_path = merkle_signing_verify_pubkey_path()
+        if str_eq(pub_path, "") == 0 {
+            io_println("(load: snapshot " + path
+                + " has no meta.merkle_signature -- skipping signature verify"
+                + " under lenient policy)")
+        }
+    }
+    return s
+}
+
+// R15E: recompute the Merkle root over the in-memory KGS records and
+// compare to the meta-block claim. Returns:
+//   1  -- the file claims a root and it matches (or the file claims
+//         none, which is treated as "no commitment, nothing to check")
+//   0  -- the file claims a root and it disagrees with the recompute
+// Use case: load-time tripwire, the chat's `/snap_verify` admin
+// command, and any future federation-peer attestation surface.
+fn snap_verify_merkle(s) {
+    if s == 0 { return 0 }
+    if snap_meta_has_merkle_root(s) == 0 { return 1 }
+    let claimed = snap_meta_merkle_root(s)
+    let kgs_blob = 0
+    if snap_has_section(s, SEC_KGS) == 1 {
+        kgs_blob = snap_section(s, SEC_KGS)
+    }
+    let actual = merkle_root_for_kgs_blob(kgs_blob)
+    if str_eq(claimed, actual) == 1 { return 1 }
+    return 0
+}
+
+// R15E: convenience for the chat's `/snap_verify` -- load + verify in
+// one call. Returns 1 on verified, 0 on tampered, -1 on file
+// missing/unparseable, -2 on file present but no Merkle commitment.
+// The chat formats the human-readable line.
+fn snap_verify_path(path) {
+    let text = snap_read_text(path)
+    if text == 0 { return 0 - 1 }
+    if len(text) == 0 { return 0 - 1 }
+    let s = snap_from_text(text)
+    if s == 0 { return 0 - 1 }
+    if snap_meta_has_merkle_root(s) == 0 { return 0 - 2 }
+    if snap_verify_merkle(s) == 1 { return 1 }
+    return 0
+}
+
+// R16A: verify the Merkle SIGNATURE against the recomputed root +
+// trusted pubkey. Returns:
+//   1   -- verified (sig matches under the env-var pubkey)
+//   0   -- tampered (sig present, doesn't verify -- TAMPER ALERT)
+//  -1   -- no signature on file
+//  -2   -- no pubkey configured (CE_SNAPSHOT_VERIFY_PUBKEY unset)
+//          -- in this case the verifier is a no-op, the caller's
+//          policy decides whether to require a signature.
+//
+// The recompute path mirrors snap_verify_merkle: take the in-memory
+// KGS records, run the same merkle_root_for_kgs_blob, then ask
+// merkle_signing_verify_via_env to do the Ed25519 verify under the
+// pubkey loaded from CE_SNAPSHOT_VERIFY_PUBKEY. We DO NOT verify the
+// signature against the meta-block's CLAIMED root, only the
+// recomputed root -- that's the whole point of R16A. An attacker who
+// rewrites the meta.merkle_root line cannot ALSO produce a fresh
+// signature unless they hold the private key.
+fn snap_verify_signature(s) {
+    if s == 0 { return 0 - 2 }
+    let pub_path = merkle_signing_verify_pubkey_path()
+    if str_eq(pub_path, "") == 1 { return 0 - 2 }
+    if snap_meta_has_merkle_signature(s) == 0 { return 0 - 1 }
+    let sig_hex = snap_meta_merkle_signature(s)
+    // Recompute the root over the in-memory KGS records (NOT the
+    // meta.merkle_root claim -- the whole point of R16A is that the
+    // signature binds to the actual atom contents).
+    let kgs_blob = 0
+    if snap_has_section(s, SEC_KGS) == 1 {
+        kgs_blob = snap_section(s, SEC_KGS)
+    }
+    let actual_root = merkle_root_for_kgs_blob(kgs_blob)
+    return merkle_signing_verify_via_env(actual_root, sig_hex)
+}
+
+// R16A: convenience reporter for the chat's `/snap_sign_status`.
+// Returns a 4-element list [has_signature, pubkey_configured,
+// last_verify_result, sig_hex_or_empty]. The chat formats the
+// human-readable line; we just gather the facts.
+//
+// last_verify_result:
+//    1 -- verified
+//    0 -- tampered
+//   -1 -- no signature
+//   -2 -- no pubkey configured
+//   -3 -- file missing / unparseable
+fn snap_sign_status_for_path(path) {
+    let out = list_new()
+    let text = snap_read_text(path)
+    if text == 0 {
+        push(out, 0); push(out, 0); push(out, 0 - 3); push(out, "")
+        return out
+    }
+    if len(text) == 0 {
+        push(out, 0); push(out, 0); push(out, 0 - 3); push(out, "")
+        return out
+    }
+    let s = snap_from_text(text)
+    if s == 0 {
+        push(out, 0); push(out, 0); push(out, 0 - 3); push(out, "")
+        return out
+    }
+    let has_sig = snap_meta_has_merkle_signature(s)
+    let pub_path = merkle_signing_verify_pubkey_path()
+    let pub_set = 0
+    if str_eq(pub_path, "") == 0 { pub_set = 1 }
+    let verify = snap_verify_signature(s)
+    let sig_hex = ""
+    if has_sig == 1 { sig_hex = snap_meta_merkle_signature(s) }
+    push(out, has_sig)
+    push(out, pub_set)
+    push(out, verify)
+    push(out, sig_hex)
+    return out
+}
+
+// ---- R13F: incremental delta-snapshot integration -------------------------
+//
+// The R5D `snap_save` / `snap_load` pair writes / reads a full snapshot
+// image; the R13F delta path adds two parallel entry points:
+//
+//   snap_delta_save(parent_path, writer)
+//     Append the writer's accumulated ops as a sibling `.delta.NNN` file
+//     beside `parent_path`. The writer's parent_fingerprint is what makes
+//     the delta well-formed; the caller stamps it via
+//     `snap_parent_fingerprint(parent_snap, len(snap_to_text(parent_snap)))`.
+//     This call does NOT touch the parent snapshot file -- only the
+//     sibling delta is written. Returns the index the delta was written
+//     to (>= 0) on success, -1 on failure.
+//
+//   snap_load_with_deltas(path, kg_reg)
+//     Load `path` as a full snapshot, then apply every sibling delta file
+//     to `kg_reg`. Returns the loaded snapshot (the in-memory KG carries
+//     the post-delta state). A delta whose parent fingerprint does not
+//     match aborts the apply at that delta -- earlier deltas are still
+//     installed, later ones are left on disk for the next compaction.
+//
+//   snap_delta_compact(parent_path, live_snap, max_deltas)
+//     If at least `max_deltas` sibling deltas exist for `parent_path`,
+//     load the parent, apply every delta, then re-save a new full
+//     snapshot at `parent_path` and unlink every delta. Returns the
+//     number of deltas collapsed (0 if below threshold). Idempotent
+//     when there are no deltas; safe to call after every save.
+//
+//   snap_delta_count_for(parent_path)
+//     Just the count -- a cheap helper for callers that want to log
+//     "N deltas pending" without doing the apply.
+//
+//   snap_make_delta_writer(parent_snap, now_ns)
+//     Build a fresh writer with the parent's fingerprint stamped in.
+//     Convenience wrapper -- the caller can also do it by hand via
+//     `delta_writer_new(snap_parent_fingerprint(...), now_ns)`.
+
+fn snap_make_delta_writer(parent_snap, now_ns) {
+    if parent_snap == 0 { return 0 }
+    let bytes = len(snap_to_text(parent_snap))
+    let fp = snap_parent_fingerprint(parent_snap, bytes)
+    return delta_writer_new(fp, now_ns)
+}
+
+fn snap_delta_save(parent_path, w) {
+    if w == 0 { return 0 - 1 }
+    let idx = delta_next_index_for_parent(parent_path)
+    let p = delta_path_for(parent_path, idx)
+    let ok = delta_writer_flush(w, p)
+    if ok == 0 { return 0 - 1 }
+    return idx
+}
+
+fn snap_delta_count_for(parent_path) {
+    return len(delta_paths_for_parent(parent_path))
+}
+
+// Load `path` as the parent full snapshot, then apply every sibling
+// delta file (in 0, 1, 2, ... order) onto `kg_reg`. Returns the parsed
+// snapshot (or 0 on parent-load failure). `kg_reg` must already have
+// the parent's KG atoms installed (the caller does kg_section_apply
+// between snap_load and this call, same as the existing /load path);
+// the deltas are layered on top.
+//
+// The `apply_stats` out-param (a 3-element list created by the caller)
+// is populated with [applied, skipped, mismatch_idx]; pass 0 to skip
+// stats reporting.
+fn snap_load_with_deltas(path, kg_reg, apply_stats) {
+    let snap = snap_load(path)
+    if snap == 0 { return 0 }
+    let bytes = len(snap_to_text(snap))
+    let fp = snap_parent_fingerprint(snap, bytes)
+    let res = delta_apply_all_for_parent(path, kg_reg, fp)
+    if apply_stats != 0 {
+        if len(apply_stats) >= 3 {
+            list_set(apply_stats, 0, res[0])
+            list_set(apply_stats, 1, res[1])
+            list_set(apply_stats, 2, res[2])
+        }
+    }
+    return snap
+}
+
+// Collapse N deltas into a fresh full snapshot. The caller passes the
+// LIVE in-memory snapshot (built from the post-delta KG state) and the
+// parent path; we serialize the live snapshot to `parent_path`, then
+// unlink every delta. The `max_deltas` argument is a HINT: when the
+// number of deltas on disk is below it, this is a no-op (returns 0).
+// Returns the number of deltas collapsed (== unlinked) on a successful
+// compaction.
+//
+// Crash-safety contract: the new full-snapshot write goes through
+// snap_write_durable (fsync + atomic rename), so a crash mid-compaction
+// leaves either (a) the old parent + all deltas (rename hasn't landed)
+// or (b) the new parent + zero deltas (the unlink loop hasn't run).
+// State (a) is correct -- we'll re-apply on the next load; state (b) is
+// correct -- the new parent already contains the post-delta state. The
+// ONE racy interval is "new parent written but mid-unlink": a delta from
+// the OLD parent that survives the partial unlink will get a fingerprint
+// mismatch on the next load and be silently dropped (the same loud-
+// rejection path the cross-snapshot mismatch goes through).
+fn snap_delta_compact(parent_path, live_snap, max_deltas) {
+    let n = snap_delta_count_for(parent_path)
+    if n == 0 { return 0 }
+    if max_deltas > 0 {
+        if n < max_deltas { return 0 }
+    }
+    let ok = snap_save(live_snap, parent_path)
+    if ok == 0 { return 0 }
+    let removed = delta_prune_all(parent_path)
+    return removed
+}

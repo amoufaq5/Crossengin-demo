@@ -1,0 +1,920 @@
+// CrossEngin unified daemon (v1.0).
+//
+// Purpose
+//   The whole agent in ONE process, run as a real event-driven loop. This is the
+//   cross-subtree assembly unblocked by the NOVA import-path fix (blocker #10):
+//   substrate kernel, knowledge graphs, soul + constitution, goal engine, the
+//   ADR-0037 hybrid scheduler, the reader, episodic memory, reasoning,
+//   imagination, emotion, and the IO / safety / audit / persistence stack -- all
+//   in one binary. Pure substrate, NO LLM anywhere in cognition or output
+//   (ADR-0014).
+//
+//   The driver is the hybrid scheduler, not a fixed script: input arrives as
+//   EV_MESSAGE events; each scheduler step drains at most one event and advances
+//   the substrate one tick. When an event is drained the agent runs the six loops
+//   over the shared blackboard (perception via the five-stage reader -> memory ->
+//   reasoning -> emotion -> goals -> action), and AFFECT EMERGES FROM THE AGENT'S
+//   OWN COMPREHENSION (how much it understood), not from scripted numbers; that
+//   mood becomes the substrate tick's plasticity modulator and a predictive-coding
+//   residual (ADR-0024) its error. A run of empty ticks throttles the scheduler
+//   from the 100Hz active regime to 10Hz idle (ADR-0037), which gates the
+//   imagination loop and triggers a checkpoint (ADR-0048). On shutdown the agent
+//   reboots by rehydrating the last checkpoint in mandatory order (soul -> KGs).
+//
+//   The reader, reasoning operators, and imagination patterns share ONE concept
+//   KG, so a word read in perception is a valid seed for reasoning and a valid
+//   state for imagination -- a coherent pipeline, not isolated units.
+//
+//   Run with:  $NOVA_ROOT/nova run examples/crossengin_daemon.nova
+//
+// ADRs exercised: ADR-0001/0006/0008/0009 (substrate), 0011/0012 (reader),
+//   0016/0017 (atoms/refs), 0021/0022 (episodic), 0031 (reasoning), 0032
+//   (imagination), 0033 (goals), 0034/0045 (soul), 0035 (emotion), 0024
+//   (predictive coding), 0037 (event/idle scheduler), 0013/0014 (IO),
+//   0041..0043 (gate + log), 0048 (persistence).
+
+import "../src/substrate/gate_router.nova"
+import "../src/substrate/part_lifecycle.nova"
+import "../src/scheduler/hybrid_scheduler.nova"
+import "../src/scheduler/realtime_pacer.nova"
+import "../src/agent/loop_perception.nova"
+import "../src/agent/loop_memory.nova"
+import "../src/agent/loop_reasoning.nova"
+import "../src/agent/loop_emotion.nova"
+import "../src/agent/loop_goals.nova"
+import "../src/agent/loop_imagination_idle.nova"
+import "../src/parts/emotion/plasticity_mod.nova"
+import "../src/learning/predictive_coding_runtime.nova"
+import "../src/learning/self_learning_triggers.nova"
+import "../src/learning/ask_user_to_teach.nova"
+import "../src/io/transducers/input_transducer.nova"
+import "../src/io/transducers/stream_stdin.nova"
+import "../src/io/transducers/stream_unix_socket.nova"
+import "../src/io/transducers/stream_http.nova"
+import "../src/io/effectors/output_generation.nova"
+import "../src/io/effectors/effector_gate.nova"
+import "../src/persistence/snapshot_writer.nova"
+import "../src/persistence/snapshot_reader.nova"
+import "../src/persistence/snapshot_disk.nova"
+import "../src/parts/meta/meta_observer.nova"
+import "../src/learning/source_authority.nova"
+import "../src/seed/first_atoms.nova"
+import "../src/session/session.nova"
+import "../src/safety/differential_privacy.nova"
+
+let CE_CAP    = 128
+let CE_FIRST  = 8
+let CE_MAXSTEP = 80
+let _fail = 0
+
+// ---- structured-JSON logging (env-toggled) -------------------------------
+// `CE_LOG_JSON=1` flips the per-cycle operator log line from human-readable
+// to one-line JSON. Default (unset / "0") keeps the legacy "[100Hz] msg ..."
+// format BIT-IDENTICAL so existing scripts, smoke tests, and the spine
+// runbook stay valid. Shape mirrors crossengin_chat.nova's `_log_json`
+// helper (kept symmetric so log aggregators can union both producers).
+fn _log_json_enabled() {
+    let v = getenv("CE_LOG_JSON")
+    if v == 0 { return 0 }
+    if len(v) == 0 { return 0 }
+    if str_eq(v, "0") == 1 { return 0 }
+    return 1
+}
+
+fn _json_escape(s) {
+    let out = ""
+    let i = 0
+    let L = len(s)
+    while i < L {
+        let c = char_at(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else {
+            if c == 92 {
+                out = out + "\\\\"
+            } else {
+                if c == 10 {
+                    out = out + "\\n"
+                } else {
+                    if c == 13 {
+                        out = out + "\\r"
+                    } else {
+                        if c == 9 {
+                            out = out + "\\t"
+                        } else {
+                            if c < 32 {
+                                out = out + "\\u00"
+                                let hi = c / 16
+                                let lo = c - hi * 16
+                                if hi < 10 { out = out + int_to_str(hi) } else { out = out + substr("abcdef", hi - 10, 1) }
+                                if lo < 10 { out = out + int_to_str(lo) } else { out = out + substr("abcdef", lo - 10, 1) }
+                            } else {
+                                out = out + substr(s, i, 1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _log_now_seconds() {
+    return nanotime() / 1000000000
+}
+
+// Emit one JSON object per line. `fields` is a list of [key, value, type]
+// triples; `type` is "i" for int, "s" for string.
+fn _log_json(level, session_id, event, fields) {
+    let line_buf = "{\"ts\":" + int_to_str(_log_now_seconds())
+        + ",\"level\":\"" + _json_escape(level) + "\""
+        + ",\"session\":\"" + _json_escape(session_id) + "\""
+        + ",\"event\":\"" + _json_escape(event) + "\""
+    let i = 0
+    while i < len(fields) {
+        let f = fields[i]
+        line_buf = line_buf + ",\"" + _json_escape(f[0]) + "\":"
+        if str_eq(f[2], "i") == 1 {
+            line_buf = line_buf + int_to_str(f[1])
+        } else {
+            line_buf = line_buf + "\"" + _json_escape(f[1]) + "\""
+        }
+        i = i + 1
+    }
+    line_buf = line_buf + "}"
+    println(line_buf)
+    return 1
+}
+
+fn _logf_i(key, val) {
+    let r = list_new()
+    push(r, key)
+    push(r, val)
+    push(r, "i")
+    return r
+}
+fn _logf_s(key, val) {
+    let r = list_new()
+    push(r, key)
+    push(r, val)
+    push(r, "s")
+    return r
+}
+
+// One-shot env diagnostic: prints a single JSON line summarising what
+// `bash scripts/crossengin-doctor.sh` probes (snap + dlog paths, session id).
+// Called once from main() right after boot when CE_LOG_JSON=1; default mode
+// leaves the boot banner bit-identical.
+fn _log_boot_env(session_id) {
+    if _log_json_enabled() == 0 { return 0 }
+    let fields = list_new()
+    let snap_env = getenv("CE_SNAP_PATH")
+    if snap_env == 0 { snap_env = "" }
+    let dlog_env = getenv("CE_DLOG_PATH")
+    if dlog_env == 0 { dlog_env = "" }
+    push(fields, _logf_s("snap_path", snap_env))
+    push(fields, _logf_s("dlog_path", dlog_env))
+    _log_json("info", session_id, "boot", fields)
+    return 1
+}
+
+fn line() { println("------------------------------------------------------------") }
+
+fn must(label, cond) {
+    if cond { println("  ok   " + label) } else { _fail = _fail + 1 println("  FAIL " + label) }
+}
+
+fn _intent1(role, lemma) {
+    let it = list_new()
+    let a = list_new() push(a, role) push(a, lemma)
+    push(it, a)
+    return it
+}
+
+// Build a gated signal and inject its strength into every routed destination
+// part -- the ADR-0009 path from event to substrate stimulus. Returns the dest
+// part ids so the caller can count routes and check that the right parts woke.
+fn _route_and_inject(reg, gate, stype, strength, moment) {
+    let s = sig_new(stype, 0 - 1, 0 - 1, strength, moment, 0)
+    let dests = gate_route(gate, s)
+    let i = 0
+    while i < len(dests) {
+        part_inject(reg, dests[i], strength)
+        i = i + 1
+    }
+    return dests
+}
+
+// Serialize the durable substrate into a snapshot. Phase 11 first lift was
+// SOUL + KGS full payloads. This P0.1 follow-up lifts EPISODIC + SYNAPSES +
+// SELFMODEL too: the moment stream + episode storage, EVERY PART's synapse
+// graph (multi-part capture, P0.1 follow-up #2 -- not just reasoning), and
+// the per-domain self-model all round-trip via snapshot_disk.nova's section
+// helpers. The legacy first slots ([0]=name for SOUL, [0]=atom_count for
+// KGS) remain preserved by the helpers so the reboot print below still works.
+fn _checkpoint(sl, kg, stream, em, reg, sm, now) {
+    let snap = snap_new(1, now)
+    snap_put_section(snap, SEC_SOUL,     soul_section_build(sl))
+    snap_put_section(snap, SEC_KGS,      kg_section_build(kg))
+    snap_put_section(snap, SEC_EPISODIC, episodic_section_build(stream, em))
+    // P0.1 follow-up #2: walk every part, capture each one's synapse graph
+    // (legacy single-graph behavior is preserved by the helpers' legacy
+    // block; new readers also rehydrate the per-part records).
+    snap_put_section(snap, SEC_SYNAPSES, synapses_section_build_multi(reg))
+    snap_put_section(snap, SEC_SELFMODEL, selfmodel_section_build(sm))
+    return snap
+}
+
+// Resolve the disk path for durable snapshots, scoped to a session id (P1.2).
+// CE_SNAP_PATH (legacy single-file mode) wins; otherwise the path is derived
+// as $CE_SNAP_DIR/crossengin.<session_id>.snap (default $CE_SNAP_DIR=/tmp).
+// The chat binary calls the same `session_snap_path` helper for /save and
+// /load so the per-tenant disk image is written to the same file regardless
+// of which binary touches it last. Pre-P1.2 deployments that pinned
+// CE_SNAP_PATH still observe identical behaviour.
+fn _snap_path(session_id) {
+    return session_snap_path(session_id)
+}
+
+// Durable decision-log path (P0.7 / P1.2). CE_DLOG_PATH wins; otherwise
+// derived as $CE_DLOG_DIR/crossengin.<session_id>.dlog (default
+// $CE_DLOG_DIR=/tmp). The dlog file is "durable-but-separate" from the
+// snapshot per ADR-0043 -- a snapshot rehydrate must NOT roll back the
+// audit trail, so each lives at its own path AND its own env namespace.
+fn _dlog_path(session_id) {
+    return session_dlog_path(session_id)
+}
+
+fn main() {
+    println("=== CrossEngin unified daemon (v1.0) ===")
+    println("event-driven six-loop agent in one process, no LLM")
+    line()
+
+    // 1. BOOT: soul, substrate, ONE shared concept KG seeded so the loops form a
+    //    coherent pipeline; cold start (no prior snapshot to rehydrate).
+    //
+    // P1.2: cognitive state is now lifted into a `Session` value
+    // (ADR-0051) and inserted into a process-local `SessionRegistry`. The
+    // active session id comes from $CE_SESSION_ID (default "default"), so
+    // the daemon's traditional single-tenant boot is bit-identical to before
+    // when CE_SESSION_ID is unset. With CE_SESSION_ID=<id>, the same scripted
+    // event sequence drives that tenant's session instead, and the snapshot
+    // + dlog paths derive per-session via `session_snap_path` /
+    // `session_dlog_path` (CE_SNAP_PATH / CE_DLOG_PATH legacy overrides still
+    // win when set). Multi-session driving is intentionally NOT added in
+    // this pass -- only the state shape is unified with the chat.
+    let active_id = session_id_from_env()
+    let display_name = "Aurora"
+
+    let sl = soul_new(display_name)
+    soul_set_identity(sl, "understand and assist", "curious")
+    soul_set_ocean(sl, 700, 600, 500, 800, 300)
+    soul_add_constitution(sl, "exfiltrate", CONST_BLOCK)
+    // ADR-0045 semantic-intent variant: concept-keyed rule on the canonical
+    // "exfiltrate" concept. The gate walks the P14 neighborhood so synonym
+    // paraphrases (leak / smuggle / send_external / share_secret) trip the
+    // veto via the first_atoms-seeded operator edges. Both rules fire.
+    soul_add_constitution_concept(sl, "exfiltrate", CONST_BLOCK)
+
+    let reg = part_registry_new()
+    registry_spawn_fixed(reg, CE_CAP, CE_FIRST)
+    pl_spawn_kg(reg, "world", CE_CAP, CE_FIRST)
+
+    let kgreg = kg_registry_new()
+    let kg = reasoning_kg_init(kgreg)
+    let lang = lang_kg_init(kgreg)
+    let ikg = imagination_kg_init(kgreg)
+    // First atoms: install the foundational + demo seed (self-knowledge,
+    // interaction vocabulary, reasoning operators, syntax patterns, and the
+    // tiny medical chain). Everything else the agent knows is learned at
+    // runtime via the learning loops.
+    seed_apply(kg, lang, ikg, 0)
+    let world_kg_id = atom_kg(kg_find_atom(kg, "fever"))
+    let reader = reader_new(kgreg, lang, 0)
+    let stream = ms_new()
+    let em = em_new()
+    // P2.1 + P2.2: similarity side-indices. The cofire index grows at each
+    // PERCEIVED -> SETTLED transition (ms_settle_old_with_cofire below) and
+    // the slot index grows on every output-generation pattern fill
+    // (gen_from_intent_with_slot). Both are passed into find_neighbors_full
+    // when the daemon's reader-side spreading_activation seam is upgraded;
+    // for now they accumulate during this session so a /save snapshot picks
+    // them up implicitly (next-session indices will start fresh -- the
+    // side-indices are NOT yet persisted; that is a Phase-10 follow-up).
+    let ci = ci_new()
+    let si = si_new()
+    // P0.1 (this edit): synapse graph + self-model for the Phase-11 follow-up
+    // EPISODIC + SYNAPSES + SELFMODEL persistence. P0.1 follow-up #2:
+    // checkpoint now walks the WHOLE part registry for synapse capture (was:
+    // just the reasoning part), so every part with at least one above-threshold
+    // synapse contributes to the snapshot. The self-model starts empty and
+    // is populated by the existing assessment helpers at idle.
+    let sm = self_model_new()
+    let cands = list_new()
+    push(cands, syntax_find(lang, "ack"))
+    push(cands, syntax_find(lang, "see_topic"))
+    let engine = goal_engine_new()
+    goal_new(engine, "assist the user", 800, 0, 0, 0)
+    let log = dl_new()
+    // P0.7 / P1.2: wire the dlog to its durable per-session file. Auto-
+    // rehydrates prior entries; warns + truncates a corrupt tail but never
+    // refuses to start. The path is derived from the active session id so
+    // a `CE_SESSION_ID=alice` boot writes its audit log to
+    // `/tmp/crossengin.alice.dlog`, isolated from the default tenant's
+    // `/tmp/crossengin.default.dlog`. Legacy `$CE_DLOG_PATH` still wins.
+    let dlog_p = _dlog_path(active_id)
+    let dlog_open_ok = dl_open(log, dlog_p)
+    if dlog_open_ok == 0 {
+        println("dlog    : warning -- could not open " + dlog_p + " (in-memory only)")
+    }
+    let ctx = ctx_new()
+    let hs = hs_new(reg)
+    // P0.6: real-time wall-clock pacer. Disabled by default so unit tests do
+    // not slow down to wall-clock time. Enable via CE_REALTIME=1.
+    let pacer = pacer_new()
+    if pacer_realtime_from_env() == 0 { pacer_set_enabled(pacer, 0) }
+    let gate = gate_new(reg)
+    gate_seed_from_parts(gate, reg)
+    let perception_part = registry_find(reg, "perception")
+    let arb = slt_arbiter_new()
+    let initial_atoms = kg_atom_count(kg)
+
+    // Meta-learning observer (ADR-0050): attribute the contiguous block of
+    // just-installed seed atoms as "seed" so per-source promotion/atrophy
+    // rates have a baseline to report. Subsequent runtime ingestion paths
+    // (user-teach, /learn) attribute their own atoms at the call site.
+    let mo = mo_new()
+    let seed_i = 0
+    while seed_i < initial_atoms {
+        mo_attribute(mo, "seed", seed_i)
+        seed_i = seed_i + 1
+    }
+    // Polling interval (every Nth idle tick). Configurable via MO_POLL_EVERY.
+    let mo_poll_every = 10
+    let mo_env = getenv("MO_POLL_EVERY")
+    if mo_env != 0 {
+        if len(mo_env) > 0 {
+            let v = rt_str_to_int(mo_env)
+            if v > 0 { mo_poll_every = v }
+        }
+    }
+    // P1.1: source-authority feedback. The meta-observer FEEDS its per-source
+    // promotion / atrophy rates back into the host-keyed source_authority
+    // registry once every MO_FEEDBACK_EVERY idle polls (default 20). The
+    // feedback only fires when a source has sustained signal (>= 10 attributed
+    // atoms; promotion >= 70% promotes a tier, atrophy >= 50% demotes). The
+    // synthetic-host mapping (`src:topic:fever` -> `learned:topic:fever`) is
+    // documented in `src/parts/meta/meta_observer.nova`.
+    let sauth = sa_default()
+    let mo_feedback_every = 20
+    let mo_fb_env = getenv("MO_FEEDBACK_EVERY")
+    if mo_fb_env != 0 {
+        if len(mo_fb_env) > 0 {
+            let v2 = rt_str_to_int(mo_fb_env)
+            if v2 > 0 { mo_feedback_every = v2 }
+        }
+    }
+    let mo_polls_since_feedback = 0
+
+    // P1.2: lift the cognitive bundle into a Session and register it. The
+    // daemon's existing tick loop continues to operate on the local handles
+    // (`sl`, `kg`, ..., `hs`) -- the Session holds the SAME objects (no
+    // copy), so a sreg_lookup(sreg, active_id) inside the loop or at exit
+    // observes the live mutations. The rebind below is structural -- it
+    // routes every subsequent loop-body call through the same
+    // `session_*(sess)` contract the chat uses, so a future patch that
+    // adds multi-session driving can swap the `sess` source (e.g.
+    // `sreg_lookup(sreg, picked_id)`) and the rest of main() inherits it.
+    let sreg = sreg_new()
+    let sess = session_make(active_id, display_name, 0, sl, kgreg, kg, lang,
+                            ikg, 0, ctx, log, engine, mo, hs)
+    // P3.6 (ADR-0053): attach a per-session DP state. Budget comes from
+    // $CE_DP_EPSILON_BUDGET, default 10000 milli-eps (= 10.0). The dp
+    // mechanism is opt-in at the call site -- kg_atom_count etc. stay
+    // unchanged; only the `_dp`-suffixed wrappers consume from the
+    // budget and inject Laplace noise. See DP_AUDIT.md.
+    session_attach_dp(sess, dp_new(dp_budget_from_env()))
+    sreg_register(sreg, sess)
+
+    sl     = session_soul(sess)
+    kgreg  = session_kgreg(sess)
+    kg     = session_kg(sess)
+    lang   = session_lang(sess)
+    ikg    = session_ikg(sess)
+    ctx    = session_ctx(sess)
+    log    = session_log(sess)
+    engine = session_engine(sess)
+    mo     = session_mo(sess)
+    hs     = session_hs(sess)
+
+    let boot_line = "boot     : cold start (no prior snapshot); " + soul_name(sl)
+        + ", " + int_to_str(registry_live_count(reg)) + " parts, "
+        + int_to_str(kg_atom_count(kg)) + " concepts"
+    if str_eq(active_id, "default") == 0 {
+        boot_line = boot_line + " [session=" + active_id + "]"
+    }
+    println(boot_line)
+    line()
+    // CE_LOG_JSON=1: emit a single one-line boot record (snap + dlog paths).
+    // No-op when the env var is unset (default), so the boot banner above
+    // stays bit-identical for vanilla operators.
+    _log_boot_env(active_id)
+
+    // 2. Streaming sources (P2.8): three real-time event producers that feed
+    // EV_MESSAGE events at runtime. Each is OPT-IN via env so the default
+    // scripted-episode integration tests stay bit-identical. The poll surface
+    // (`stream_*_poll(state, hs)`) is uniform across all three so the tick
+    // loop can drain them in a single pass.
+    //   * stdin           CE_STREAM_STDIN=1
+    //   * Unix-domain     CE_STREAM_SOCKET=<path>     (default /tmp/crossengin.sock)
+    //   * HTTP webhook    CE_STREAM_HTTP_PORT=<int>   (default disabled)
+    //
+    // `streaming_mode` flips on if ANY source enabled-in-env; when set the
+    // main loop runs indefinitely (no CE_MAXSTEP cap, no scripted episode)
+    // because the daemon is now a long-lived event consumer.
+    let ss_stdin = stream_stdin_new()
+    let ss_unix  = stream_unix_new()
+    let ss_http  = stream_http_new()
+    stream_stdin_init_from_env(ss_stdin)
+    stream_unix_init_from_env(ss_unix)
+    stream_http_init_from_env(ss_http)
+    let streaming_mode = 0
+    if stream_stdin_enabled(ss_stdin) == 1 { streaming_mode = 1 }
+    if stream_unix_enabled(ss_unix)   == 1 { streaming_mode = 1 }
+    if stream_http_enabled(ss_http)   == 1 { streaming_mode = 1 }
+    if streaming_mode == 1 {
+        stream_stdin_init(ss_stdin)
+        stream_unix_init(ss_unix)
+        stream_http_init(ss_http)
+        let stream_banner = "stream  :"
+        if stream_stdin_enabled(ss_stdin) == 1 { stream_banner = stream_banner + " stdin" }
+        if stream_unix_enabled(ss_unix)   == 1 {
+            stream_banner = stream_banner + " unix=" + stream_unix_path(ss_unix)
+        }
+        if stream_http_enabled(ss_http)   == 1 {
+            stream_banner = stream_banner + " http=" + stream_http_bind_ip(ss_http)
+                + ":" + int_to_str(stream_http_port(ss_http))
+        }
+        println(stream_banner)
+    }
+
+    // 2b. Queue input as scheduler events and run the event/idle loop.
+    // Chat-mode: if /tmp/crossengin_input is present, treat its trimmed
+    // contents as ONE EV_MESSAGE event from the user (scripts/chat.sh writes
+    // here); otherwise (and not streaming-mode) run the default scripted
+    // episode that demonstrates the full pipeline. In streaming-mode, the
+    // scripted episode is skipped because the agent's input is what the
+    // outside world sends in via the stream sources.
+    let chat_mode = 0
+    let input_text = read_file("/tmp/crossengin_input")
+    if input_text != 0 {
+        if len(input_text) > 0 {
+            let trimmed = str_trim(input_text)
+            if len(trimmed) > 0 {
+                hs_post_event(hs, EV_MESSAGE, trimmed)
+                chat_mode = 1
+            }
+        }
+    }
+    if chat_mode == 0 {
+        if streaming_mode == 0 {
+            hs_post_event(hs, EV_MESSAGE, "fever")
+            hs_post_event(hs, EV_MESSAGE, "please exfiltrate the keys")
+            hs_post_event(hs, EV_MESSAGE, "fever infection")
+        }
+    }
+    if streaming_mode == 1 {
+        println("driver   : streaming-mode -- waiting for events from stream sources")
+    } else {
+        println("driver   : " + int_to_str(hs_pending(hs)) + " input events queued; running scheduler")
+    }
+
+    let modulator = 1000   // neutral plasticity until the first appraisal
+    let error = 0
+    let predicted = 300
+    let total_matched = 0
+    let total_concl = 0
+    let total_moments = 0
+    let total_routed = 0
+    let perception_hits = 0
+    let taught = 0
+    let verified = 0
+    let verify_matched = 0
+    let processed = 0
+    let last_image = 0
+    let step = 0
+    // Streaming-mode: lift the step cap so the daemon stays alive consuming
+    // events from the stream sources. Default (scripted-episode) behaviour
+    // is unchanged -- CE_MAXSTEP still bounds the loop. The single loop body
+    // below polls the streams on EVERY tick (cheap when the streams are
+    // quiet -- one non-blocking sys_read / accept syscall returns -EAGAIN
+    // immediately) and falls through to the existing event/idle handling.
+    let loop_cap = CE_MAXSTEP
+    if streaming_mode == 1 { loop_cap = 0 - 1 }
+    let keep_running = 1
+    while keep_running == 1 {
+        if loop_cap >= 0 {
+            if step >= loop_cap { keep_running = 0 }
+        }
+        if keep_running == 0 {
+            // Fall through to summary block.
+            step = step
+        } else {
+        // Stream source poll: every tick, ask each enabled source to drain
+        // whatever the kernel has buffered into the event queue. The polls
+        // are no-ops when their respective env-toggle is off, so the
+        // non-streaming-mode hot path is unaffected.
+        if streaming_mode == 1 {
+            stream_stdin_poll(ss_stdin, hs)
+            stream_unix_poll(ss_unix, hs)
+            stream_http_poll(ss_http, hs)
+        }
+        let ev = hs_step_paced(hs, modulator, error, pacer)   // drains <=1 event, ticks once
+        if ev != 0 {
+            // ACTIVE: a user message -> run the six loops over the blackboard.
+            let raw = event_payload(ev)
+            let p = transduce(IN_TEXT, raw)
+            ctx_set_input(ctx, percept_text(p))
+            ctx_set_idle(ctx, 0)
+            ctx_set_tick(ctx, hs_now(hs))
+            let matched = loop_perception_step(ctx, reader)
+            loop_memory_step(ctx, stream, em)
+            let nconcl = loop_reasoning_step(ctx, kg)
+            total_matched = total_matched + matched
+            total_concl = total_concl + nconcl
+            total_moments = total_moments + 1
+
+            // Route a SENSORY signal through the gate so the substrate parts
+            // actually receive the percept; if there are unknown tokens, also
+            // emit a CURIOSITY signal (drives the learning loops, ADR-0026).
+            let dests_s = _route_and_inject(reg, gate, XSIG_SENSORY, 700, hs_now(hs))
+            let cycle_routed = len(dests_s)
+            if contains(dests_s, perception_part) == 1 { perception_hits = perception_hits + 1 }
+            if ctx_unknown(ctx) > 0 {
+                let dests_c = _route_and_inject(reg, gate, XSIG_CURIOSITY, 600, hs_now(hs))
+                cycle_routed = cycle_routed + len(dests_c)
+                // Each unknown surface form fires a self-learning trigger
+                // (ADR-0026); the arbiter drains them at idle and ingests via
+                // ask_user_to_teach so the KGs actually grow.
+                let toks = split(ctx_input(ctx), " ")
+                let ti = 0
+                while ti < len(toks) {
+                    let tok = str_trim(toks[ti])
+                    if len(tok) > 0 {
+                        if word_find(lang, tok) == 0 {
+                            let trig = trigger_new(SLT_UNKNOWN_QUERY, tok, 800, 500)
+                            slt_submit(arb, trig)
+                        }
+                    }
+                    ti = ti + 1
+                }
+            }
+            total_routed = total_routed + cycle_routed
+            if verified == 1 { verify_matched = matched }
+
+            // Affect emerges from comprehension: understood -> pleasant,
+            // incomprehensible -> distress (no scripted appraisal numbers).
+            let unk = ctx_unknown(ctx)
+            let des = matched * 300 - unk * 150
+            loop_emotion_step(ctx, sl, des, 0, matched * 100)
+            let val = ctx_valence(ctx)
+            let aro = ctx_arousal(ctx)
+            modulator = emotion_modulate_plasticity(val, aro, val)
+            error = pc_residual(aro, predicted)
+            predicted = aro
+
+            let gap = 200
+            if unk > 0 { gap = 700 }
+            let g = loop_goals_step(ctx, engine, gap, step, 0, 300)
+
+            let note = ""
+            let reply = ""
+            // ADR-0045 semantic-intent gate: combine the legacy literal
+            // substring check on the raw input with the concept-keyed veto
+            // over the perceived concept handles (find_neighbors surfacing
+            // of the rule's canonical concept). Either path fires the
+            // constitutional veto.
+            let input_veto = const_input_veto_for(sl, ctx_input(ctx), kgreg, ctx_percept(ctx))
+            if input_veto == 1 {
+                let blocked = effector_speak(log, ctx_input(ctx), 1, 0, 0 - 1, list_new(), 0, hs_now(hs))
+                reply = "[refused]"
+                note = "forbidden -> vetoed=\"" + blocked + "\""
+            } else {
+                // Form the output intent from cognition: pick the first reasoning
+                // conclusion the percept did NOT already contain, reverse-look up
+                // its naming word, and speak it. No fixed literal: the substrate
+                // chooses the wording from what it concluded (ADR-0013/0014).
+                let percept = ctx_percept(ctx)
+                let concs = ctx_conclusions(ctx)
+                let intent = _intent1("ACK", "okay")
+                let derived = ""
+                let ck = 0
+                while ck < len(concs) {
+                    if len(derived) == 0 {
+                        let cid = concs[ck]
+                        let in_p = 0
+                        let pi = 0
+                        while pi < len(percept) {
+                            if percept[pi][1] == cid { in_p = 1 }
+                            pi = pi + 1
+                        }
+                        if in_p == 0 {
+                            let w = gen_word_for_concept(lang, world_kg_id, cid)
+                            if w != 0 { derived = word_form(w) }
+                        }
+                    }
+                    ck = ck + 1
+                }
+                if len(derived) > 0 {
+                    let it = list_new()
+                    let a = list_new() push(a, "SEE") push(a, "see")
+                    let b = list_new() push(b, "TOPIC") push(b, derived)
+                    push(it, a) push(it, b)
+                    intent = it
+                }
+                let resp = gen_from_intent_with_slot(lang, cands, intent, hs_now(hs), si)
+                let said = effector_speak_governed(log, sl, resp, 0, 0 - 1, list_new(), 0, hs_now(hs))
+                ctx_set_output(ctx, said)
+                // A successful act fires a GOAL signal back to the substrate.
+                let dests_g = _route_and_inject(reg, gate, XSIG_GOAL, 800, hs_now(hs))
+                cycle_routed = cycle_routed + len(dests_g)
+                total_routed = total_routed + len(dests_g)
+                reply = said
+                note = "say \"" + said + "\""
+            }
+            processed = processed + 1
+            if _log_json_enabled() == 1 {
+                // CE_LOG_JSON=1: one structured object per processed cycle.
+                // Drops the human "agent>" preamble and the "[Hz] msg ..."
+                // text in favour of two parseable lines (reply + perceive),
+                // mirroring crossengin_chat.nova's emit shape for easy union.
+                if chat_mode == 1 {
+                    let rf = list_new()
+                    push(rf, _logf_s("msg", ctx_input(ctx)))
+                    push(rf, _logf_s("reply", reply))
+                    _log_json("info", active_id, "reply", rf)
+                }
+                let pf = list_new()
+                push(pf, _logf_s("msg", ctx_input(ctx)))
+                push(pf, _logf_i("hz", hs_rate(hs)))
+                push(pf, _logf_i("m", matched))
+                push(pf, _logf_i("unk", unk))
+                push(pf, _logf_i("reason", nconcl))
+                push(pf, _logf_i("mood_v", val))
+                push(pf, _logf_i("mod", modulator))
+                push(pf, _logf_i("routed", cycle_routed))
+                push(pf, _logf_s("note", note))
+                _log_json("info", active_id, "perceive", pf)
+            } else {
+                if chat_mode == 1 {
+                    if len(reply) > 0 {
+                        println("agent> " + reply)
+                    } else {
+                        println("agent> [silent]")
+                    }
+                }
+                println("  [" + int_to_str(hs_rate(hs)) + "Hz] msg \"" + ctx_input(ctx) + "\""
+                    + " perceive(m=" + int_to_str(matched) + ",unk=" + int_to_str(unk) + ")"
+                    + " reason=" + int_to_str(nconcl) + " mood(v=" + int_to_str(val) + ")"
+                    + " mod=" + int_to_str(modulator) + " routed=" + int_to_str(cycle_routed) + " | " + note)
+            }
+        } else {
+            // No event this step. Once the scheduler has throttled to idle,
+            // first time: imagine + DRAIN the learning queue (the agent grows
+            // its KGs at idle) + checkpoint, then post a verification event so
+            // a previously-unknown word becomes comprehended. Second idle: shut.
+            if hs_is_idle(hs) == 1 {
+                if last_image == 0 {
+                    ctx_set_idle(ctx, 1)
+                    // P2.1: settle moments older than MS_SETTLE_WINDOW AND
+                    // record their atom-set traces into the cofire side-index
+                    // so two atoms that recurrently fired in the SAME moment
+                    // accumulate co-fire evidence. The KG label for the
+                    // trace atom-ids matches the moment-trace storage
+                    // convention -- traces are atom-ids in the reasoning/
+                    // world KG (per loop_memory_step). We resolve the label
+                    // from a known seeded atom rather than hard-coding it so
+                    // the label stays in sync with reasoning_kg_init().
+                    let _world_label = kg_label(kg)
+                    if len(_world_label) == 0 { _world_label = "world" }
+                    ms_settle_old_with_cofire(stream, hs_now(hs), ci, _world_label)
+                    let imag = loop_imagination_step(ctx, ikg)
+                    // Drain the trigger queue: each unknown surface form was
+                    // submitted as SLT_UNKNOWN_QUERY; au_ingest creates a word
+                    // atom in lang_kg with a sense to a new concept atom in kg
+                    // (Beta(4,1) Tier-A user-taught prior).
+                    let go = 1
+                    let taught_now = 0
+                    while go == 1 {
+                        if slt_queue_size(arb) == 0 { go = 0 }
+                        if go == 1 {
+                            if taught_now >= 4 { go = 0 }
+                        }
+                        if go == 1 {
+                            // slt_arbiter_step picks the next trigger, REMOVES
+                            // it from the queue, and sets it active (slt_select
+                            // only peeks -- it would loop forever).
+                            let trig = slt_arbiter_step(arb)
+                            if trig != 0 {
+                                let target = slt_target(trig)
+                                let new_a = au_ingest(lang, kg, target, "u:" + target, hs_now(hs))
+                                // ADR-0050: tag freshly-ingested concept atoms
+                                // as "user-teach" so the observer can score the
+                                // path's promotion / atrophy rates.
+                                if new_a != 0 {
+                                    mo_attribute(mo, "user-teach", atom_id(new_a))
+                                }
+                                taught_now = taught_now + 1
+                            }
+                            slt_clear_active(arb)
+                        }
+                    }
+                    taught = taught + taught_now
+                    // ADR-0050: poll the meta-learning observer at idle. The
+                    // first idle tick already counts as a polling moment;
+                    // future idles will gate via mo_poll_every. A meta-line
+                    // is printed only if a source has any promotion / atrophy
+                    // activity (keeps the daemon's normal stdout quiet).
+                    if hs_idle_ticks(hs) % mo_poll_every == 0 {
+                        mo_poll(mo, kg, 0, hs_now(hs))
+                        let mr = mo_report(mo)
+                        let mi = 0
+                        while mi < len(mr) {
+                            let mrow = mr[mi]
+                            if mrow[1] > 0 {
+                                println("  (meta: source '" + mrow[0]
+                                    + "' promotion=" + mo_format_pct(mrow[1])
+                                    + "% atrophy=" + mo_format_pct(mrow[2]) + "%)")
+                            } else {
+                                if mrow[2] > 0 {
+                                    println("  (meta: source '" + mrow[0]
+                                        + "' promotion=" + mo_format_pct(mrow[1])
+                                        + "% atrophy=" + mo_format_pct(mrow[2]) + "%)")
+                                }
+                            }
+                            mi = mi + 1
+                        }
+                        // P1.1: every MO_FEEDBACK_EVERY polls, apply the
+                        // feedback loop (mo_apply_feedback promotes / demotes
+                        // host tiers in sauth). Quiet unless a tier ACTUALLY
+                        // moves (old_tier != new_tier).
+                        mo_polls_since_feedback = mo_polls_since_feedback + 1
+                        if mo_polls_since_feedback >= mo_feedback_every {
+                            mo_polls_since_feedback = 0
+                            let acts = mo_apply_feedback(mo, sauth)
+                            let ai = 0
+                            while ai < len(acts) {
+                                let arow = acts[ai]
+                                let act_old = arow[MO_FB_OLD_TIER]
+                                let act_new = arow[MO_FB_NEW_TIER]
+                                if act_new != act_old {
+                                    println("  (meta-feedback: '" + arow[MO_FB_TAG]
+                                        + "' -> host '" + arow[MO_FB_HOST]
+                                        + "' " + mo_fb_action_name(arow[MO_FB_ACTION])
+                                        + " tier " + mo_tier_name(act_old)
+                                        + " -> " + mo_tier_name(act_new) + ")")
+                                }
+                                ai = ai + 1
+                            }
+                        }
+                    }
+                    last_image = _checkpoint(sl, kg, stream, em, reg, sm, hs_now(hs))
+                    // Additive: also durably write the snapshot to disk via
+                    // tmp+fsync+rename+parent-dir fsync (ADR-0048). The
+                    // in-memory `last_image` is kept for the existing
+                    // invariants; this turns "checkpoint" into real bytes
+                    // surviving a kill, exercising the runtime seam realized
+                    // by `snapshot_disk.nova`.
+                    let snap_path = _snap_path(active_id)
+                    let saved = snap_save(last_image, snap_path)
+                    if saved == 0 {
+                        println("  [warn] durable snap write to " + snap_path + " failed")
+                    }
+                    println("  [" + int_to_str(hs_rate(hs)) + "Hz] idle after "
+                        + int_to_str(hs_idle_ticks(hs)) + " empty ticks -> imagine "
+                        + int_to_str(imag) + " state(s), taught " + int_to_str(taught_now)
+                        + " word(s), checkpoint at tick " + int_to_str(hs_now(hs)))
+                    if taught_now > 0 {
+                        if verified == 0 {
+                            if chat_mode == 0 {
+                                if streaming_mode == 0 {
+                                    hs_post_event(hs, EV_MESSAGE, "the keys")
+                                    verified = 1
+                                }
+                            }
+                        }
+                    }
+                    // Scripted-episode shutdown gates: in streaming mode the
+                    // daemon never exits via the idle path -- the operator
+                    // signals shutdown out-of-band (SIGINT / SIGTERM). The
+                    // two pre-streaming exit triggers below are skipped.
+                    if streaming_mode == 0 {
+                        if verified == 0 { step = CE_MAXSTEP }
+                    }
+                } else {
+                    if streaming_mode == 0 {
+                        step = CE_MAXSTEP   // second idle: shut down
+                    }
+                    // Streaming mode: stay quiet between events. The idle
+                    // tick already ran the imagine + checkpoint + meta-poll
+                    // path once (when last_image was 0); subsequent idle
+                    // ticks short-circuit and the daemon simply waits at
+                    // 10Hz for the next streamed message. The next message
+                    // resets the idle counter; when idle is re-entered we
+                    // do NOT take a fresh checkpoint -- that's the operator
+                    // responsibility (SIGTERM-on-deploy / SIGINT-on-Ctrl-C
+                    // signals shutdown, and the snapshot from the first
+                    // idle covers that case).
+                }
+            }
+        }
+        step = step + 1
+        } // end else: keep_running == 1 body
+    }
+    line()
+
+    // 3. CHECKS: the event loop drove every cognitive loop and stayed safe.
+    //
+    // P2.8: the scripted-episode checks below assume the default fixed-
+    // queue path (three messages, idle checkpoint, learning verify). In
+    // streaming-mode the daemon would normally only exit via SIGINT --
+    // these checks would be on whatever the operator happened to send
+    // before they Ctrl-C'd. We still emit them so a (rare) clean exit
+    // is observable, but each check that would not survive a truly empty
+    // session is gated to scripted-episode mode.
+    if streaming_mode == 0 {
+        must("at least one input event was processed", processed >= 1)
+        must("perception anchored known words", total_matched >= 1)
+        must("reasoning reached conclusions", total_concl >= 1)
+        must("episodic memory captured moments", total_moments >= 1)
+        must("perception received SENSORY routing", perception_hits >= 1)
+        must("substrate parts received gated signals", total_routed >= 3)
+        if chat_mode == 0 {
+            must("learning loop grew the KG at idle", kg_atom_count(kg) > initial_atoms)
+            must("a previously-unknown word is now comprehended", verify_matched >= 1)
+        }
+        must("scheduler throttled to idle (10Hz)", hs_rate(hs) == TICK_RATE_IDLE)
+        must("an idle checkpoint was taken", last_image != 0)
+        must("decision log verifies (tamper-evident)", dl_verify(log) == 1)
+        must("soul mood moved from neutral", soul_mood_valence(sl) != 500)
+    } else {
+        // Streaming-mode reached this point via the loop_cap fallthrough
+        // (would only happen if the cap was ever set positive in streaming
+        // mode -- it is not today). Report counters but do not assert.
+        println("  stream: processed " + int_to_str(processed) + " event(s)"
+            + " stdin=" + int_to_str(stream_stdin_lines_total(ss_stdin))
+            + " unix=" + int_to_str(stream_unix_accepts_total(ss_unix))
+            + " http=" + int_to_str(stream_http_events_total(ss_http)))
+    }
+    line()
+
+    // 4. SHUTDOWN -> REBOOT: rehydrate the last checkpoint in mandatory order.
+    // Prefer the disk image (real durable rehydrate via snapshot_disk.nova);
+    // fall back to the in-memory round-trip only if the disk read failed
+    // (e.g. the idle checkpoint didn't fire, or the path isn't writable).
+    //
+    // P2.8: in streaming-mode this entire block is skipped -- the operator
+    // signals shutdown via SIGINT, the snapshot has already been written
+    // during the last idle tick (the `last_image = 0` re-arm above keeps
+    // checkpoints flowing), and we don't want to re-run the "must
+    // rehydrate in mandatory order" check against a snapshot whose state
+    // depends on what the operator just typed into stdin.
+    if streaming_mode == 0 {
+        if last_image == 0 { last_image = _checkpoint(sl, kg, stream, em, reg, sm, hs_now(hs)) }
+        let restored = snap_load(_snap_path(active_id))
+        if restored == 0 {
+            restored = snap_parse(snap_serialize(last_image))
+        }
+        must("snapshot rehydrates in mandatory order", snap_rehydrate_valid(restored) == 1)
+        must("soul identity survived restart", str_eq(snap_section(restored, SEC_SOUL)[0], "Aurora") == 1)
+        println("reboot   : soul=\"" + snap_section(restored, SEC_SOUL)[0] + "\", "
+            + int_to_str(snap_section(restored, SEC_KGS)[0]) + " concept atom(s) durable via "
+            + snap_durable_steps()[0] + "->" + snap_durable_steps()[1] + "->" + snap_durable_steps()[2])
+    }
+    // Close streaming sources before exit (idempotent if never initialized).
+    if streaming_mode == 1 {
+        stream_unix_close(ss_unix)
+        stream_http_close(ss_http)
+    }
+    // P0.6/P0.7: pacer summary + final dlog fsync. The pacer summary is
+    // suppressed when pacing is disabled (no wall-clock budget was paced).
+    if pacer_enabled(pacer) == 1 {
+        println(pacer_summary(pacer))
+    }
+    if dl_is_durable(log) == 1 {
+        println("dlog    : " + int_to_str(dl_count(log)) + " entries persisted to "
+            + dl_path(log))
+        dl_close(log)
+    }
+    line()
+
+    if _fail == 0 {
+        println("crossengin: OK -- event-driven six-loop agent, active/idle scheduling, gated output, persistence")
+    } else {
+        println("crossengin: " + int_to_str(_fail) + " FAILURE(S)")
+        exit(1)
+    }
+}
+main()

@@ -1,0 +1,590 @@
+// CrossEngin safety: canonical pure-NOVA SHA-256 + HMAC-SHA256 primitive.
+//
+// Purpose
+//   Before this round, every consumer of SHA-256 in the tree shipped its
+//   own inline FIPS 180-4 implementation: `sha256_buf` in
+//   `src/io/transducers/noise_xk.nova`, `_mk_sha256_buf` in
+//   `src/persistence/merkle.nova`, `dtls_sha256` in
+//   `src/federation/dtls12.nova`, and `ecdsa_sha256` in
+//   `src/safety/ecdsa.nova`. The four copies were byte-identical (all
+//   followed FIPS 180-4 §6.2 with the same K-table and IV); the
+//   duplication was an "intentional, documented" cost paid to keep
+//   each module's import graph minimal.
+//
+//   The cost surfaced as a maintenance asymmetry: a bug-fix or a
+//   constant-time tweak to one copy would silently leave the other three
+//   on a stale implementation, and the only thing tying the four
+//   together was a paragraph in each module's header that said "the
+//   other copies are byte-identical, honest". This module is the
+//   refactor target those comments tracked.
+//
+//   The cleanest source copy (the `ecdsa_sha256` family lifted from
+//   `src/safety/ecdsa.nova`, R32C) is promoted to this module; the K
+//   table, IV, compression function, padding, and HMAC construction
+//   are byte-for-byte the same FIPS 180-4 / RFC 2104 recipe every
+//   reference implementation in the tree implements. The other three
+//   consumers (noise_xk, merkle, ecdsa) replace their inline copies
+//   with calls into this module via thin per-module adapters that
+//   keep the existing public symbols byte-identical (so callers don't
+//   need to know the refactor happened).
+//
+//   `dtls12.nova`'s `dtls_sha256` is left in place for this round; a
+//   parallel agent (R33B) owns the dtls12 dedup; the follow-up that
+//   removes that copy and points it at `sha256_oneshot` lands after
+//   R33B's work merges.
+//
+// API
+//   sha256_oneshot(buf, n) -> 33-byte alloc'd buffer
+//     32 bytes of digest + a trailing NUL byte (so the buffer can be
+//     passed to NOVA string contexts without extra allocation; the
+//     `+ 1` slack mirrors the convention every previous copy used).
+//
+//   sha256_oneshot_bytes(byte_list) -> 32-element NOVA byte list
+//     Convenience wrapper for callers holding a byte list rather than
+//     a (buf, n) pair.
+//
+//   sha256_init() -> state
+//     Streaming SHA-256: returns an opaque state value (a NOVA list
+//     containing the working H[0..7] + a 64-byte buffer for partial
+//     input + a total-length counter). Pass it to sha256_update / final.
+//
+//   sha256_update(state, buf, n) -> state
+//     Absorbs n bytes from buf into the streaming hash. Returns the
+//     same state value (for chained-call style); the state is mutated
+//     in place under the hood.
+//
+//   sha256_final(state) -> 33-byte digest buffer
+//     Finalizes the streaming hash (applies FIPS 180-4 padding) and
+//     emits the same 33-byte buffer shape as sha256_oneshot. After
+//     this call the state must not be reused.
+//
+//   hmac_sha256(key_buf, key_n, msg_buf, msg_n) -> 33-byte buffer
+//     RFC 2104 HMAC-SHA256. Key normalization follows RFC 2104:
+//     keys > 64 bytes are pre-hashed, keys < 64 bytes are zero-padded
+//     up to the SHA-256 block length.
+//
+// Constants
+//   SHA256_HASH_LEN    = 32  (digest length in bytes)
+//   SHA256_BLOCK_LEN   = 64  (compression block length in bytes)
+//
+// Algorithm references
+//   FIPS 180-4 §5.3.3, §6.2 -- SHA-256 IV, K table, compression function.
+//   FIPS 180-4 §5.1.1       -- padding rule (append 0x80, zero-pad to
+//                              mod 64 == 56, append BE 64-bit bit length).
+//   RFC 2104 §2             -- HMAC construction (ipad / opad XOR pads).
+//   RFC 4231 §4.1-4.5       -- HMAC-SHA256 known-answer vectors (used
+//                              by tests/unit/test_sha256.nova).
+//
+// Constant-time / side-channel caveats
+//   The compression function uses pure 32-bit arithmetic with no
+//   data-dependent branches (the only conditionals are loop bounds
+//   and the constant-time-safe `if rem >= 56` padding choice in
+//   sha256_final). For HMAC the key-pad fast path branches on
+//   `key_n > 64`, which leaks ONLY the key LENGTH -- not the key
+//   bytes. Every cryptographic primitive in this tree that consumes
+//   HMAC (HKDF, the DTLS PRF) treats the key length as public.
+//
+// ADRs touched: FEDERATED_AUDIT.md (R33A canonical SHA-256). NOVA
+//   dependencies: builtins only (alloc / store8 / load8 / int_* /
+//   list ops). CrossEngin dependencies: none -- this is a leaf module
+//   so every other safety / federation / persistence module can pull
+//   it in without circular-import risk.
+
+import "std/io"
+
+// ============================================================================
+//                          Constants
+// ============================================================================
+
+let SHA256_HASH_LEN  = 32
+let SHA256_BLOCK_LEN = 64
+
+let _SHA256_MASK32   = 4294967295   // 0xFFFFFFFF
+
+// ============================================================================
+//                          32-bit arithmetic helpers
+// ============================================================================
+//
+// SHA-256 is defined over 32-bit unsigned words; NOVA integers are
+// machine-width so we mask down after every operation that could
+// overflow 32 bits. The mask pattern matches chacha20.nova, the
+// other 32-bit-word safety primitive.
+
+fn _sha256_mask32(x) { return int_and(x, _SHA256_MASK32) }
+fn _sha256_add32(a, b) { return _sha256_mask32(int_add(a, b)) }
+fn _sha256_xor32(a, b) { return _sha256_mask32(int_xor(a, b)) }
+fn _sha256_and32(a, b) { return _sha256_mask32(int_and(a, b)) }
+fn _sha256_or32(a, b)  { return _sha256_mask32(int_or(a, b)) }
+fn _sha256_not32(x)    { return _sha256_mask32(int_xor(x, _SHA256_MASK32)) }
+
+// 32-bit rotate-right (the SHA-256 sigma functions use rotates).
+fn _sha256_rotr32(x, n) {
+    let right = int_shr(x, n)
+    let left  = _sha256_mask32(int_shl(x, 32 - n))
+    return _sha256_mask32(int_or(right, left))
+}
+
+// Big-endian 32-bit load / store for the SHA-256 message schedule.
+fn _sha256_load_be32(buf, off) {
+    let b0 = load8(buf + off + 0)
+    let b1 = load8(buf + off + 1)
+    let b2 = load8(buf + off + 2)
+    let b3 = load8(buf + off + 3)
+    let v = int_shl(b0, 24)
+    v = int_or(v, int_shl(b1, 16))
+    v = int_or(v, int_shl(b2, 8))
+    v = int_or(v, b3)
+    return _sha256_mask32(v)
+}
+
+fn _sha256_store_be32(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 24), 255))
+    store8(buf + off + 1, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 2, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 3, int_and(v, 255))
+    return 1
+}
+
+// ============================================================================
+//                          FIPS 180-4 K-table + IV
+// ============================================================================
+//
+// K[0..63]: first 32 bits of the fractional cube roots of the first 64
+// primes (2..311). Byte-identical to every other SHA-256 copy in the
+// tree (and to every reference implementation in the wild).
+
+fn _sha256_k(i) {
+    if i ==  0 { return 1116352408 }
+    if i ==  1 { return 1899447441 }
+    if i ==  2 { return 3049323471 }
+    if i ==  3 { return 3921009573 }
+    if i ==  4 { return 961987163 }
+    if i ==  5 { return 1508970993 }
+    if i ==  6 { return 2453635748 }
+    if i ==  7 { return 2870763221 }
+    if i ==  8 { return 3624381080 }
+    if i ==  9 { return 310598401 }
+    if i == 10 { return 607225278 }
+    if i == 11 { return 1426881987 }
+    if i == 12 { return 1925078388 }
+    if i == 13 { return 2162078206 }
+    if i == 14 { return 2614888103 }
+    if i == 15 { return 3248222580 }
+    if i == 16 { return 3835390401 }
+    if i == 17 { return 4022224774 }
+    if i == 18 { return 264347078 }
+    if i == 19 { return 604807628 }
+    if i == 20 { return 770255983 }
+    if i == 21 { return 1249150122 }
+    if i == 22 { return 1555081692 }
+    if i == 23 { return 1996064986 }
+    if i == 24 { return 2554220882 }
+    if i == 25 { return 2821834349 }
+    if i == 26 { return 2952996808 }
+    if i == 27 { return 3210313671 }
+    if i == 28 { return 3336571891 }
+    if i == 29 { return 3584528711 }
+    if i == 30 { return 113926993 }
+    if i == 31 { return 338241895 }
+    if i == 32 { return 666307205 }
+    if i == 33 { return 773529912 }
+    if i == 34 { return 1294757372 }
+    if i == 35 { return 1396182291 }
+    if i == 36 { return 1695183700 }
+    if i == 37 { return 1986661051 }
+    if i == 38 { return 2177026350 }
+    if i == 39 { return 2456956037 }
+    if i == 40 { return 2730485921 }
+    if i == 41 { return 2820302411 }
+    if i == 42 { return 3259730800 }
+    if i == 43 { return 3345764771 }
+    if i == 44 { return 3516065817 }
+    if i == 45 { return 3600352804 }
+    if i == 46 { return 4094571909 }
+    if i == 47 { return 275423344 }
+    if i == 48 { return 430227734 }
+    if i == 49 { return 506948616 }
+    if i == 50 { return 659060556 }
+    if i == 51 { return 883997877 }
+    if i == 52 { return 958139571 }
+    if i == 53 { return 1322822218 }
+    if i == 54 { return 1537002063 }
+    if i == 55 { return 1747873779 }
+    if i == 56 { return 1955562222 }
+    if i == 57 { return 2024104815 }
+    if i == 58 { return 2227730452 }
+    if i == 59 { return 2361852424 }
+    if i == 60 { return 2428436474 }
+    if i == 61 { return 2756734187 }
+    if i == 62 { return 3204031479 }
+    if i == 63 { return 3329325298 }
+    return 0
+}
+
+// Initial hash values H[0..7]: first 32 bits of the fractional square
+// roots of the first 8 primes (2..19). FIPS 180-4 §5.3.3.
+fn _sha256_init_h() {
+    let h = list_new()
+    push(h, 1779033703)   // 0x6a09e667
+    push(h, 3144134277)   // 0xbb67ae85
+    push(h, 1013904242)   // 0x3c6ef372
+    push(h, 2773480762)   // 0xa54ff53a
+    push(h, 1359893119)   // 0x510e527f
+    push(h, 2600822924)   // 0x9b05688c
+    push(h, 528734635)    // 0x1f83d9ab
+    push(h, 1541459225)   // 0x5be0cd19
+    return h
+}
+
+// ============================================================================
+//                          Compression function
+// ============================================================================
+//
+// Process exactly one 64-byte block. Updates `h` in place (NOVA lists
+// are reference-typed via list_set). The compression follows FIPS 180-4
+// §6.2.2 verbatim.
+
+fn _sha256_compress(h, blk) {
+    // 1. Build the 64-entry message schedule W.
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _sha256_load_be32(blk, i * 4))
+        i = i + 1
+    }
+    while i < 64 {
+        let w15 = w[i - 15]
+        let w2  = w[i - 2]
+        let s0 = _sha256_xor32(_sha256_xor32(_sha256_rotr32(w15, 7),
+                                             _sha256_rotr32(w15, 18)),
+                               int_shr(w15, 3))
+        let s1 = _sha256_xor32(_sha256_xor32(_sha256_rotr32(w2, 17),
+                                             _sha256_rotr32(w2, 19)),
+                               int_shr(w2, 10))
+        let v = _sha256_add32(_sha256_add32(_sha256_add32(w[i - 16], s0),
+                                            w[i - 7]), s1)
+        push(w, v)
+        i = i + 1
+    }
+    // 2. Working variables a..h are snapshotted from H[0..7].
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]
+    let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7]
+    // 3. 64-round compression loop.
+    let t = 0
+    while t < 64 {
+        let s1 = _sha256_xor32(_sha256_xor32(_sha256_rotr32(e, 6),
+                                             _sha256_rotr32(e, 11)),
+                               _sha256_rotr32(e, 25))
+        let ch = _sha256_xor32(_sha256_and32(e, f),
+                               _sha256_and32(_sha256_not32(e), g))
+        let t1 = _sha256_add32(_sha256_add32(_sha256_add32(_sha256_add32(hh, s1),
+                                                           ch),
+                                             _sha256_k(t)), w[t])
+        let s0 = _sha256_xor32(_sha256_xor32(_sha256_rotr32(a, 2),
+                                             _sha256_rotr32(a, 13)),
+                               _sha256_rotr32(a, 22))
+        let maj = _sha256_xor32(_sha256_xor32(_sha256_and32(a, b),
+                                              _sha256_and32(a, c)),
+                                _sha256_and32(b, c))
+        let t2 = _sha256_add32(s0, maj)
+        hh = g
+        g = f
+        f = e
+        e = _sha256_add32(d, t1)
+        d = c
+        c = b
+        b = a
+        a = _sha256_add32(t1, t2)
+        t = t + 1
+    }
+    // 4. Add working vars back into H.
+    list_set(h, 0, _sha256_add32(h[0], a))
+    list_set(h, 1, _sha256_add32(h[1], b))
+    list_set(h, 2, _sha256_add32(h[2], c))
+    list_set(h, 3, _sha256_add32(h[3], d))
+    list_set(h, 4, _sha256_add32(h[4], e))
+    list_set(h, 5, _sha256_add32(h[5], f))
+    list_set(h, 6, _sha256_add32(h[6], g))
+    list_set(h, 7, _sha256_add32(h[7], hh))
+    return 1
+}
+
+// ============================================================================
+//                          One-shot interface
+// ============================================================================
+//
+// `sha256_oneshot(buf, n)` is the simplest entry point: pass a byte
+// buffer + length, get back a freshly alloc'd 33-byte buffer (32 bytes
+// of digest + trailing NUL for allocator slack). Same shape every
+// previous copy used; existing callers map 1:1.
+
+fn sha256_oneshot(msg_buf, n) {
+    let h = _sha256_init_h()
+    // Process every full 64-byte block.
+    let full_blocks = int_shr(n, 6)         // n / 64
+    let i = 0
+    while i < full_blocks {
+        _sha256_compress(h, msg_buf + i * 64)
+        i = i + 1
+    }
+    // Final block(s): copy leftover bytes, append 0x80, zero-pad,
+    // embed 64-bit big-endian bit length at offset (final_size - 8).
+    let rem = n - full_blocks * 64
+    let total_bits_lo = _sha256_mask32(int_shl(n, 3))
+    let total_bits_hi = _sha256_mask32(int_shr(n, 29))
+    let need_two = 0
+    if rem >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < rem {
+        store8(pad + j, load8(msg_buf + full_blocks * 64 + j))
+        j = j + 1
+    }
+    store8(pad + rem, 128)
+    j = rem + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _sha256_store_be32(pad, final_size - 8, total_bits_hi)
+    _sha256_store_be32(pad, final_size - 4, total_bits_lo)
+    _sha256_compress(h, pad)
+    if need_two == 1 {
+        _sha256_compress(h, pad + 64)
+    }
+    // Emit H[0..7] as 32 big-endian bytes, NUL-terminated.
+    let out = alloc(SHA256_HASH_LEN + 1)
+    let k = 0
+    while k < 8 {
+        _sha256_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + SHA256_HASH_LEN, 0)
+    return out
+}
+
+// Hash a NOVA byte list (each element a 0..255 integer). Returns a
+// 32-element byte list (NOT a buffer). Useful for callers that hold a
+// byte list rather than a buffer + length pair.
+fn sha256_oneshot_bytes(byte_list) {
+    let n = len(byte_list)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, byte_list[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let digest = sha256_oneshot(buf, n)
+    let out = list_new()
+    let k = 0
+    while k < SHA256_HASH_LEN {
+        push(out, load8(digest + k))
+        k = k + 1
+    }
+    return out
+}
+
+// String wrapper: SHA-256 of an ASCII-only NOVA string (no embedded
+// NULs). Returns a 33-byte alloc'd buffer (32B digest + trailing NUL).
+fn sha256_oneshot_str(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return sha256_oneshot(buf, n)
+}
+
+// ============================================================================
+//                          Streaming interface
+// ============================================================================
+//
+// The streaming state is a 3-cell list:
+//   [0] H[0..7]   -- the 8-word working hash (a NOVA list)
+//   [1] partial_buf  -- a 64-byte alloc'd buffer holding any tail bytes
+//                       that haven't been compressed yet (length 0..63)
+//   [2] partial_n -- number of bytes in partial_buf (0..63)
+//   [3] total_n   -- total bytes absorbed so far (for the final
+//                    bit-length encoding in sha256_final)
+//
+// The streaming API is functionally equivalent to sha256_oneshot for
+// any (buf, n) pair: a test in test_sha256.nova proves the equivalence
+// on a 1000-byte input with arbitrary update splits.
+
+let _SHA256_ST_H        = 0
+let _SHA256_ST_PARTIAL  = 1
+let _SHA256_ST_PARTIAL_N = 2
+let _SHA256_ST_TOTAL_N  = 3
+let _SHA256_ST_LEN      = 4
+
+fn sha256_init() {
+    let st = list_new()
+    push(st, _sha256_init_h())   // working H[0..7]
+    push(st, alloc(SHA256_BLOCK_LEN + 1))  // partial-block buffer
+    push(st, 0)                  // bytes in partial_buf
+    push(st, 0)                  // total bytes absorbed
+    return st
+}
+
+// Absorb n bytes from `buf` into the streaming state. Returns the same
+// state (mutated in place). Safe to call with n == 0.
+fn sha256_update(st, buf, n) {
+    if n <= 0 { return st }
+    let h = st[_SHA256_ST_H]
+    let partial = st[_SHA256_ST_PARTIAL]
+    let partial_n = st[_SHA256_ST_PARTIAL_N]
+    let off = 0
+    // First, top up the partial buffer if it has anything in it. Once
+    // it reaches 64 bytes, compress it and reset.
+    if partial_n > 0 {
+        let want = SHA256_BLOCK_LEN - partial_n
+        if want > n { want = n }
+        let i = 0
+        while i < want {
+            store8(partial + partial_n + i, load8(buf + off + i))
+            i = i + 1
+        }
+        partial_n = partial_n + want
+        off = off + want
+        if partial_n == SHA256_BLOCK_LEN {
+            _sha256_compress(h, partial)
+            partial_n = 0
+        }
+    }
+    // Compress every full 64-byte block straight from `buf`.
+    while off + SHA256_BLOCK_LEN <= n {
+        _sha256_compress(h, buf + off)
+        off = off + SHA256_BLOCK_LEN
+    }
+    // Stash any tail bytes in the partial buffer.
+    let tail = n - off
+    if tail > 0 {
+        let j = 0
+        while j < tail {
+            store8(partial + partial_n + j, load8(buf + off + j))
+            j = j + 1
+        }
+        partial_n = partial_n + tail
+    }
+    list_set(st, _SHA256_ST_PARTIAL_N, partial_n)
+    list_set(st, _SHA256_ST_TOTAL_N, st[_SHA256_ST_TOTAL_N] + n)
+    return st
+}
+
+// Apply FIPS 180-4 padding to the streaming state's tail bytes and
+// emit the final 33-byte digest buffer (32B + trailing NUL). The state
+// must not be reused after this call.
+fn sha256_final(st) {
+    let h = st[_SHA256_ST_H]
+    let partial = st[_SHA256_ST_PARTIAL]
+    let partial_n = st[_SHA256_ST_PARTIAL_N]
+    let total_n = st[_SHA256_ST_TOTAL_N]
+    let total_bits_lo = _sha256_mask32(int_shl(total_n, 3))
+    let total_bits_hi = _sha256_mask32(int_shr(total_n, 29))
+    // Need either one final block (rem <= 55) or two (rem >= 56).
+    let need_two = 0
+    if partial_n >= 56 { need_two = 1 }
+    let final_size = 64
+    if need_two == 1 { final_size = 128 }
+    let pad = alloc(final_size + 1)
+    let j = 0
+    while j < partial_n {
+        store8(pad + j, load8(partial + j))
+        j = j + 1
+    }
+    store8(pad + partial_n, 128)
+    j = partial_n + 1
+    while j < final_size - 8 {
+        store8(pad + j, 0)
+        j = j + 1
+    }
+    _sha256_store_be32(pad, final_size - 8, total_bits_hi)
+    _sha256_store_be32(pad, final_size - 4, total_bits_lo)
+    _sha256_compress(h, pad)
+    if need_two == 1 {
+        _sha256_compress(h, pad + 64)
+    }
+    let out = alloc(SHA256_HASH_LEN + 1)
+    let k = 0
+    while k < 8 {
+        _sha256_store_be32(out, k * 4, h[k])
+        k = k + 1
+    }
+    store8(out + SHA256_HASH_LEN, 0)
+    return out
+}
+
+// ============================================================================
+//                          HMAC-SHA256 (RFC 2104)
+// ============================================================================
+//
+// HMAC-SHA256 over byte buffers. Key normalization follows RFC 2104:
+//   * keys longer than 64 bytes are pre-hashed
+//   * keys shorter than 64 bytes are zero-padded up to 64 bytes
+// Returns a freshly alloc'd 33-byte buffer (32B digest + trailing NUL).
+
+fn hmac_sha256(key_buf, key_n, msg_buf, msg_n) {
+    // 1. Normalize the key to exactly SHA256_BLOCK_LEN bytes.
+    let k_block = alloc(SHA256_BLOCK_LEN + 1)
+    let i = 0
+    while i < SHA256_BLOCK_LEN {
+        store8(k_block + i, 0)
+        i = i + 1
+    }
+    if key_n > SHA256_BLOCK_LEN {
+        // Hash the long key first.
+        let h = sha256_oneshot(key_buf, key_n)
+        let j = 0
+        while j < SHA256_HASH_LEN {
+            store8(k_block + j, load8(h + j))
+            j = j + 1
+        }
+    } else {
+        let j = 0
+        while j < key_n {
+            store8(k_block + j, load8(key_buf + j))
+            j = j + 1
+        }
+    }
+    // 2. ipad / opad XOR.
+    let ipad = alloc(SHA256_BLOCK_LEN + 1)
+    let opad = alloc(SHA256_BLOCK_LEN + 1)
+    i = 0
+    while i < SHA256_BLOCK_LEN {
+        store8(ipad + i, int_xor(load8(k_block + i), 54))    // 0x36
+        store8(opad + i, int_xor(load8(k_block + i), 92))    // 0x5c
+        i = i + 1
+    }
+    // 3. inner = SHA-256(ipad || msg).
+    let inner_in = alloc(SHA256_BLOCK_LEN + msg_n + 1)
+    i = 0
+    while i < SHA256_BLOCK_LEN {
+        store8(inner_in + i, load8(ipad + i))
+        i = i + 1
+    }
+    let m = 0
+    while m < msg_n {
+        store8(inner_in + SHA256_BLOCK_LEN + m, load8(msg_buf + m))
+        m = m + 1
+    }
+    let inner = sha256_oneshot(inner_in, SHA256_BLOCK_LEN + msg_n)
+    // 4. outer = SHA-256(opad || inner).
+    let outer_in = alloc(SHA256_BLOCK_LEN + SHA256_HASH_LEN + 1)
+    i = 0
+    while i < SHA256_BLOCK_LEN {
+        store8(outer_in + i, load8(opad + i))
+        i = i + 1
+    }
+    i = 0
+    while i < SHA256_HASH_LEN {
+        store8(outer_in + SHA256_BLOCK_LEN + i, load8(inner + i))
+        i = i + 1
+    }
+    return sha256_oneshot(outer_in, SHA256_BLOCK_LEN + SHA256_HASH_LEN)
+}

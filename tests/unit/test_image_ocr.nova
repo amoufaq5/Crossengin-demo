@@ -1,0 +1,318 @@
+// Unit tests for src/io/transducers/image_ocr.nova (R24C).
+//
+// Hermetic coverage of the template-matching OCR primitive:
+//   * gallery_new / gallery_add_char / gallery_size shape contract
+//   * uniform-shape rule (second add with mismatched dims is rejected)
+//   * self-match: gallery-rendered "A" yields a single "A" detection
+//                 with score 1000
+//   * noisy-match: a copy of "A" with one pixel flipped still matches
+//                  "A" above threshold
+//   * wrong-character: image of "B" matches "B", not "A"
+//   * confidence-threshold: a low-score detection is dropped when its
+//     score is below the supplied threshold
+//   * NMS: 3 overlapping detections of the SAME character collapse
+//     to 1 kept detection
+//   * empty image (smaller than template) yields 0 detections
+//   * multi-character: synthetic "HELLO" image -> "HELLO" text
+//   * ocr_to_text on empty list -> empty string
+//   * default_gallery has 36 entries (A-Z + 0-9), 8x8 each
+
+import "../ce_test.nova"
+import "../../src/io/transducers/image_ocr.nova"
+
+// ---- fixture builders ----------------------------------------------------
+
+// Build a single-glyph 8x8 stencil from a manual mask. Returns a fresh
+// buffer the caller may either free or push into a gallery (which
+// copies the bytes).
+fn _build_glyph_8x8(m0, m1, m2, m3, m4, m5, m6, m7) {
+    let buf = alloc(8 * 8 + 1)
+    let rows = list_new()
+    push(rows, m0)
+    push(rows, m1)
+    push(rows, m2)
+    push(rows, m3)
+    push(rows, m4)
+    push(rows, m5)
+    push(rows, m6)
+    push(rows, m7)
+    let r = 0
+    while r < 8 {
+        let mask = rows[r]
+        let col = 0
+        while col < 8 {
+            let shift = 7 - col
+            // Manual bit-extract: floor(mask / 2^shift) mod 2.
+            let p = 1
+            let s = 0
+            while s < shift { p = p * 2; s = s + 1 }
+            let bit = (mask / p) - (mask / (p * 2)) * 2
+            let v = 0
+            if bit == 1 { v = 255 }
+            store8(buf + r * 8 + col, v)
+            col = col + 1
+        }
+        r = r + 1
+    }
+    store8(buf + 64, 0)
+    return buf
+}
+
+// Build a flat image of size w x h filled with `value`. Caller frees.
+fn _build_flat_image(w, h, value) {
+    let area = w * h
+    let buf = alloc(area + 1)
+    let i = 0
+    while i < area {
+        store8(buf + i, value)
+        i = i + 1
+    }
+    store8(buf + area, 0)
+    return buf
+}
+
+// Blit an 8x8 glyph into a larger image at (x, y).
+fn _blit_glyph(dst, dst_w, glyph, x, y) {
+    let dy = 0
+    while dy < 8 {
+        let dx = 0
+        while dx < 8 {
+            let v = load8(glyph + dy * 8 + dx)
+            store8(dst + (y + dy) * dst_w + (x + dx), v)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+}
+
+// ---- gallery shape -------------------------------------------------------
+
+fn test_gallery_new_empty() {
+    let g = ocr_template_gallery_new()
+    ce_eq("empty gallery size=0", ocr_gallery_size(g), 0)
+    ce_eq("empty gallery template width=0", ocr_gallery_template_width(g), 0)
+    ce_eq("empty gallery template height=0", ocr_gallery_template_height(g), 0)
+}
+
+fn test_gallery_add_five_templates() {
+    let g = ocr_template_gallery_new()
+    let glyph = _build_glyph_8x8(56, 108, 198, 198, 254, 198, 198, 0)   // A
+    let ok1 = ocr_gallery_add_char(g, 65, glyph, 8, 8)
+    let ok2 = ocr_gallery_add_char(g, 66, glyph, 8, 8)
+    let ok3 = ocr_gallery_add_char(g, 67, glyph, 8, 8)
+    let ok4 = ocr_gallery_add_char(g, 68, glyph, 8, 8)
+    let ok5 = ocr_gallery_add_char(g, 69, glyph, 8, 8)
+    ce_eq("add A ok",  ok1, 1)
+    ce_eq("add B ok",  ok2, 1)
+    ce_eq("add C ok",  ok3, 1)
+    ce_eq("add D ok",  ok4, 1)
+    ce_eq("add E ok",  ok5, 1)
+    ce_eq("gallery size after 5 adds", ocr_gallery_size(g), 5)
+    ce_eq("gallery tw=8", ocr_gallery_template_width(g),  8)
+    ce_eq("gallery th=8", ocr_gallery_template_height(g), 8)
+}
+
+fn test_gallery_uniform_shape_rule() {
+    let g = ocr_template_gallery_new()
+    let glyph8 = _build_glyph_8x8(0, 0, 0, 0, 0, 0, 0, 0)
+    ce_eq("first add (8x8) ok", ocr_gallery_add_char(g, 65, glyph8, 8, 8), 1)
+    // Try to add a 4x4 template -- must be rejected.
+    let glyph4 = alloc(4 * 4 + 1)
+    let i = 0
+    while i < 16 { store8(glyph4 + i, 255); i = i + 1 }
+    let bad = ocr_gallery_add_char(g, 66, glyph4, 4, 4)
+    ce_eq("size mismatch rejected", bad, 0)
+    ce_eq("gallery still 1 entry after rejection", ocr_gallery_size(g), 1)
+}
+
+// ---- self-match ----------------------------------------------------------
+//
+// The image IS the "A" template glyph; sliding window finds an exact
+// match at (0, 0) with score 1000.
+
+fn test_self_match_score_1000() {
+    let g = ocr_template_gallery_new()
+    let glyph_a = _build_glyph_8x8(56, 108, 198, 198, 254, 198, 198, 0)
+    ocr_gallery_add_char(g, 65, glyph_a, 8, 8)
+    // The image IS the template (8x8). One detection at (0, 0).
+    let dets = ocr_recognize_text(glyph_a, 8, 8, g, 800)
+    ce_eq("self-match 1 detection", len(dets), 1)
+    let d = dets[0]
+    ce_eq("self-match char='A'", ocr_detection_char(d), 65)
+    ce_eq("self-match x=0", ocr_detection_x(d), 0)
+    ce_eq("self-match y=0", ocr_detection_y(d), 0)
+    ce_eq("self-match score=1000", ocr_detection_score(d), 1000)
+}
+
+// ---- noisy-match ---------------------------------------------------------
+//
+// Same "A" with ONE pixel flipped 255 -> 0 (a single bit of noise).
+// The L2 distance climbs by 255*255 = 65025; max_dist = 65025 * 64
+// = 4161600. The score drops by 65025 * 1000 / 4161600 = 15 milli,
+// landing at score ~985 -- well above the 800 threshold.
+
+fn test_noisy_match_still_recognized() {
+    let g = ocr_template_gallery_new()
+    let glyph_a = _build_glyph_8x8(56, 108, 198, 198, 254, 198, 198, 0)
+    ocr_gallery_add_char(g, 65, glyph_a, 8, 8)
+    // Make a noisy copy of the glyph: flip pixel (1, 1) which is 1 in
+    // mask 108 == 01101100 -- bit position 6 from MSB (shift=6) of 108
+    // is 1, but we want col 1 which has shift=7-1=6, mask 0b01000000=64;
+    // 108 & 64 == 64 so the pixel IS lit. Flip 255 -> 0 to add noise.
+    let noisy = alloc(8 * 8 + 1)
+    let i = 0
+    while i < 64 {
+        store8(noisy + i, load8(glyph_a + i))
+        i = i + 1
+    }
+    // Find the first lit (255) pixel and flip it to 0. This guarantees
+    // the noise is real regardless of the A's bit pattern.
+    let flipped = 0
+    let j = 0
+    while j < 64 {
+        if flipped == 0 {
+            if load8(noisy + j) == 255 {
+                store8(noisy + j, 0)
+                flipped = 1
+            }
+        }
+        j = j + 1
+    }
+    ce_eq("test setup: noisy has one flipped pixel", flipped, 1)
+    let dets = ocr_recognize_text(noisy, 8, 8, g, 800)
+    ce_check("noisy-match found a detection", len(dets) >= 1)
+    if len(dets) >= 1 {
+        let d = dets[0]
+        ce_eq("noisy-match char='A'", ocr_detection_char(d), 65)
+        ce_check("noisy-match score>800", ocr_detection_score(d) > 800)
+        ce_check("noisy-match score<1000", ocr_detection_score(d) < 1000)
+    }
+}
+
+// ---- wrong-character -----------------------------------------------------
+//
+// Gallery has both A (different mask) and B (different mask). Image is
+// the B glyph. The B template must win, not A.
+
+fn test_wrong_character_picks_correct_one() {
+    let g = ocr_template_gallery_new()
+    let glyph_a = _build_glyph_8x8(56, 108, 198, 198, 254, 198, 198, 0)
+    let glyph_b = _build_glyph_8x8(252, 198, 198, 252, 198, 198, 252, 0)
+    ocr_gallery_add_char(g, 65, glyph_a, 8, 8)
+    ocr_gallery_add_char(g, 66, glyph_b, 8, 8)
+    let dets = ocr_recognize_text(glyph_b, 8, 8, g, 800)
+    ce_eq("B-image detections=1", len(dets), 1)
+    if len(dets) >= 1 {
+        ce_eq("B-image -> char='B'", ocr_detection_char(dets[0]), 66)
+        ce_eq("B-image -> score=1000", ocr_detection_score(dets[0]), 1000)
+    }
+}
+
+// ---- confidence threshold ------------------------------------------------
+//
+// Push an "A" image into a gallery that contains a totally-different
+// glyph (an all-zero rectangle). Score will be ~0; threshold=500 must
+// drop the detection. Threshold=0 must keep it.
+
+fn test_threshold_drops_low_score() {
+    let g = ocr_template_gallery_new()
+    // Gallery glyph: all-black (zero everywhere).
+    let glyph_black = _build_flat_image(8, 8, 0)
+    ocr_gallery_add_char(g, 65, glyph_black, 8, 8)
+    // Image: mostly bright (mean 200), totally different from all-black.
+    let bright = _build_flat_image(8, 8, 200)
+    // Threshold=900: detection's score (low) is below; drop.
+    let dets_strict = ocr_recognize_text(bright, 8, 8, g, 900)
+    ce_eq("strict threshold drops bad match", len(dets_strict), 0)
+    // Threshold=0: even a bad match makes it through.
+    let dets_loose = ocr_recognize_text(bright, 8, 8, g, 0)
+    ce_check("threshold=0 keeps detection", len(dets_loose) >= 1)
+}
+
+// ---- NMS -----------------------------------------------------------------
+//
+// Build a 10x8 image with an "A" glyph at x=0; subsequent x positions
+// (1, 2) sample a SHIFTED version of the glyph that's still ~50%+
+// overlapping with the template. Without NMS we would get multiple
+// detections of "A" at x=0,1,2; NMS should leave one.
+
+fn test_nms_collapses_overlapping_detections() {
+    let g = ocr_template_gallery_new()
+    // Use a glyph that's the SAME at every x; specifically the full-block
+    // 255 glyph: every pixel = 255. This means every sliding-window
+    // position has an EXACT match -- 3 positions in a 10x8 image:
+    // x in {0, 1, 2}. NMS must collapse them.
+    let solid = _build_flat_image(8, 8, 255)
+    ocr_gallery_add_char(g, 88, solid, 8, 8)
+    let big = _build_flat_image(10, 8, 255)
+    // Without NMS: 3 detections (x=0,1,2). With NMS: 1.
+    let dets = ocr_recognize_text(big, 10, 8, g, 800)
+    ce_eq("NMS collapses 3 overlapping to 1", len(dets), 1)
+}
+
+// ---- empty image / image smaller than template ---------------------------
+
+fn test_image_smaller_than_template() {
+    let g = ocr_template_gallery_new()
+    let glyph = _build_flat_image(8, 8, 128)
+    ocr_gallery_add_char(g, 65, glyph, 8, 8)
+    let tiny = _build_flat_image(4, 4, 128)
+    let dets = ocr_recognize_text(tiny, 4, 4, g, 800)
+    ce_eq("tiny image -> 0 detections", len(dets), 0)
+}
+
+fn test_empty_gallery() {
+    let g = ocr_template_gallery_new()
+    let img = _build_flat_image(16, 16, 128)
+    let dets = ocr_recognize_text(img, 16, 16, g, 800)
+    ce_eq("empty gallery -> 0 detections", len(dets), 0)
+}
+
+// ---- multi-character "HELLO" ---------------------------------------------
+//
+// Render "HELLO" from the default gallery into an image, then OCR it
+// back. The result should read "HELLO".
+
+fn test_hello_round_trip() {
+    let g = ocr_default_gallery()
+    ce_eq("default gallery size=36", ocr_gallery_size(g), 36)
+    ce_eq("default gallery tw=8", ocr_gallery_template_width(g), 8)
+    ce_eq("default gallery th=8", ocr_gallery_template_height(g), 8)
+    let r = ocr_render_text("HELLO", g)
+    let img  = r[0]
+    let img_w = r[1]
+    let img_h = r[2]
+    ce_check("rendered HELLO returns image", img != 0)
+    ce_eq("HELLO image width = 5*8 = 40", img_w, 40)
+    ce_eq("HELLO image height = 8",       img_h, 8)
+    let dets = ocr_recognize_text(img, img_w, img_h, g, 950)
+    let text = ocr_to_text(dets)
+    ce_str_eq("HELLO round-trips to 'HELLO'", text, "HELLO")
+}
+
+// ---- ocr_to_text on empty list -------------------------------------------
+
+fn test_to_text_empty() {
+    let empty = list_new()
+    ce_str_eq("empty list -> empty string", ocr_to_text(empty), "")
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    test_gallery_new_empty()
+    test_gallery_add_five_templates()
+    test_gallery_uniform_shape_rule()
+    test_self_match_score_1000()
+    test_noisy_match_still_recognized()
+    test_wrong_character_picks_correct_one()
+    test_threshold_drops_low_score()
+    test_nms_collapses_overlapping_detections()
+    test_image_smaller_than_template()
+    test_empty_gallery()
+    test_hello_round_trip()
+    test_to_text_empty()
+    ce_summary("image_ocr")
+}
+
+main()

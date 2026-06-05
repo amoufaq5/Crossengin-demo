@@ -1,0 +1,3167 @@
+// CrossEngin federation: SWIM-style gossip protocol for peer discovery + KG delta sync.
+//
+// Purpose
+//   R18E. R6C/R7C kg_sync v3 carries Noise-XK-authed ATOM/PROMOTE events
+//   between TWO endpoints (publisher + subscriber). The remaining gap
+//   is N>2 federation without a central hub: peers must DISCOVER each
+//   other and gossip KG deltas opportunistically. This module ships
+//   that piece as a SWIM-style (Das et al. 2002) protocol layered on
+//   top of short-lived TCP probes (NOVA's send_data/recv_data builtins
+//   are TCP-shaped; UDP would require sendto/recvfrom, which the
+//   compiler does not currently expose).
+//
+// SWIM (Scalable Weakly-consistent Infection-style Membership)
+//
+//   1. Peer table -- each soul maintains `[addr, last_seen_ns,
+//      suspicion_count, status]` per known peer. status is one of
+//      ALIVE / SUSPECT / DEAD.
+//   2. Heartbeat (every PING_INTERVAL ms, default 1000) -- pick a
+//      random alive peer, open a short-lived TCP connection, send
+//      `PING <seq> <self_addr>\n`, await `ACK <seq>\n` within
+//      PING_TIMEOUT ms. On timeout / send error, increment the
+//      peer's suspicion_count. Status follows:
+//          suspicion 0..1  -> ALIVE
+//          suspicion 2     -> SUSPECT
+//          suspicion >=3   -> DEAD
+//      A successful ACK resets suspicion to 0 and bumps last_seen_ns
+//      to nanotime().
+//   3. Membership propagation (piggyback on PING) -- after the ACK,
+//      the pinger sends 2-3 `MEMBER <addr> <status>\n` lines drawn
+//      uniformly at random from its peer table (excluding the
+//      destination). Receiver merges into its own peer table:
+//          - unknown addr -> add as ALIVE with last_seen=now
+//          - known addr   -> update last_seen if newer
+//   4. Delta gossip (every DELTA_INTERVAL ms, default 2000) -- the
+//      gossiper picks a random alive peer, opens a short-lived TCP
+//      connection, sends `DELTA <self_addr> <last_synced_ns>\n`.
+//      The receiver replies with `ATOM <kg> <id> <kind> <alpha>
+//      <beta> <label>\n` for every atom whose updated_ns >
+//      last_synced_ns, then `DELTA_END\n`. The gossiper applies
+//      each ATOM via the existing sync_apply_atom path. After the
+//      exchange, gossiper bumps last_synced_ns[peer] to its
+//      pre-request nanotime() (the timestamp it included in the
+//      DELTA request).
+//
+//   The "step" function `gossip_step(state, kg) -> new_state` runs
+//   ONE tick of the loop above: it decides whether to ping
+//   (tick_count % ping_every == 0) and whether to gossip
+//   (tick_count % delta_every == 0), executes any due action, and
+//   returns the updated state. This shape keeps the daemon loop in
+//   control of the scheduler (no background threads).
+//
+// Wire protocol (line-oriented over TCP, port 8770 default; the same
+// kg_sync TCP machinery is REUSED for delta gossip when a peer is
+// known-alive). Lines are 1024 bytes max; '\n' is the terminator.
+//
+//   HELLO ce-gossip v1\n                    handshake (sender side)
+//   OK v1\n                                 handshake reply
+//   PING <seq> <self_addr>\n                liveness probe (sender)
+//   ACK <seq>\n                             liveness response
+//   MEMBER <addr> <status>\n                piggybacked membership
+//   DELTA <self_addr> <last_synced_ns>\n    request KG delta
+//   ATOM <kg> <id> <kind> <alpha> <beta> <label>\n   delta payload
+//   DELTA_END\n                             end of delta stream
+//   BYE\n                                   graceful close
+//
+//   The HELLO / OK lines disambiguate a gossip connection from a kg_sync
+//   v2 connection on the same host (a misdialed gossip probe to a kg_sync
+//   port gets `ERR unknown` from the kg_sync parser; a misdialed kg_sync
+//   probe to a gossip port gets `ERR unknown` from this parser; both fail
+//   closed instead of corrupting state).
+//
+// Public API
+//
+//   gossip_init(self_addr, bootstrap_peers) -> gossip_state_t
+//   gossip_step(state, kg)                  -> updated gossip_state_t
+//   gossip_peer_table(state)                -> list of peer entries
+//   gossip_alive_peers(state)               -> list of addrs with status=ALIVE
+//
+//   Plus helpers exercised by the unit tests:
+//   gossip_add_peer(state, addr)            -> updated state
+//   gossip_remove_peer(state, addr)         -> updated state
+//   gossip_find_peer(state, addr)           -> idx (-1 if absent)
+//   gossip_on_ack(state, addr)              -> reset suspicion, bump last_seen
+//   gossip_on_timeout(state, addr)          -> ++suspicion, maybe mark DEAD
+//   gossip_merge_member(state, addr, status) -> merge a membership notice
+//   gossip_pick_random_peer(state)          -> picks a peer using rng_state
+//   gossip_set_last_synced(state, addr, ns) -> tracking helper
+//   gossip_get_last_synced(state, addr)     -> last_synced_ns for peer (0 if absent)
+//
+// ADRs implemented: gossip-protocol (this module is the first SWIM impl
+//   in the tree, registers ADR-0078 in the audit log). NOVA dependencies:
+//   socket builtins (same set as kg_sync), nanotime, sleep_ms, getenv,
+//   alloc, store8, load8. CrossEngin dependencies: src/kg/atom_store.nova
+//   (read-only -- delta gossip needs atom_id / atom_updated / atom_label
+//   accessors), src/io/transducers/kg_sync.nova (read-only -- reuse the
+//   IP parsing helper conceptually; the gossip module reimplements the
+//   tiny subset it needs to avoid a hard dep cycle).
+
+import "std/io"
+import "../kg/atom_store.nova"
+import "../kg/multi_kg_manager.nova"
+import "../kg/query.nova"
+import "../io/transducers/kg_sync.nova"
+import "./snapshot_attestation.nova"
+import "./snapshot_replication.nova"
+
+// ---- protocol constants ---------------------------------------------------
+
+let GOSSIP_VERSION         = 1
+let GOSSIP_DEFAULT_PORT    = 8770
+let GOSSIP_LINE_MAX        = 1024
+let GOSSIP_PING_INTERVAL_MS = 1000
+let GOSSIP_PING_TIMEOUT_MS  = 500
+let GOSSIP_DELTA_INTERVAL_MS = 2000
+let GOSSIP_MAX_MEMBER_PIGGYBACK = 3
+let GOSSIP_SUSPICION_DEAD  = 3
+let GOSSIP_CONNECT_RETRIES = 3
+let GOSSIP_CONNECT_DELAY_MS = 50
+
+// Peer status enum.
+let GOSSIP_STATUS_ALIVE   = 0
+let GOSSIP_STATUS_SUSPECT = 1
+let GOSSIP_STATUS_DEAD    = 2
+
+// Wire op prefixes / lines.
+let GOSSIP_HELLO_LINE    = "HELLO ce-gossip v1"
+let GOSSIP_OK_LINE       = "OK v1"
+let GOSSIP_PING_PREFIX   = "PING "
+let GOSSIP_ACK_PREFIX    = "ACK "
+let GOSSIP_MEMBER_PREFIX = "MEMBER "
+let GOSSIP_DELTA_PREFIX  = "DELTA "
+let GOSSIP_ATOM_PREFIX   = "ATOM "
+let GOSSIP_DELTA_END_LINE = "DELTA_END"
+let GOSSIP_BYE_LINE      = "BYE"
+let GOSSIP_ERR_UNKNOWN   = "ERR unknown"
+
+// R20E -- distributed-query message prefixes. The gossip handler
+// dispatches DQUERY lines to a minimal inline handler that calls
+// kg_query_compile_and_run on the local KG and streams DQRES / DQBIND* /
+// DQEND back. The receiver side is intentionally implemented HERE (in
+// gossip.nova) rather than as a callback into distributed_query.nova to
+// avoid an import cycle (distributed_query imports gossip for the
+// alive-peer + dial helpers). The originator side lives in
+// distributed_query.nova; both sides share these literal prefixes.
+let GOSSIP_DQUERY_PREFIX = "DQUERY "
+let GOSSIP_DQRES_PREFIX  = "DQRES "
+let GOSSIP_DQBIND_PREFIX = "DQBIND "
+let GOSSIP_DQEND_PREFIX  = "DQEND "
+let GOSSIP_DQERR_PREFIX  = "DQERR "
+
+// R20F -- signed-snapshot attestation piggyback. A peer that wants to
+// publish a snapshot root broadcasts a single ATTESTATION line over a
+// short-lived TCP connection (same shape as PING piggyback). The
+// receiver parses + verifies + appends to a per-peer attestation log;
+// tampered or unknown-soul lines fail closed (counter bumps, store
+// unchanged). The originator side lives in snapshot_attestation.nova;
+// both sides share this literal prefix.
+let GOSSIP_ATTESTATION_PREFIX = "ATTESTATION "
+
+// ============================================================================
+// R23C -- snapshot replication wire types.
+// ============================================================================
+//
+// COORDINATION NOTE for R23 sprint: this block is additive (new
+// prefixes + new state slots + new dispatch entries). R23E (NAT
+// traversal) is also extending gossip.nova for EXTADDR; place R23E
+// state slots adjacent to keep the diff trivial to rebase.
+//
+// R23C extends R20F: after a signed ATTESTATION lands, a peer that
+// does NOT already hold the snapshot for that root dials the
+// originator and issues a SNAP_FETCH; the originator responds with
+// the snapshot bytes (the same text snap_to_text emits) framed as
+// SNAP_DATA lines terminated by SNAP_END. The receiver assembles the
+// body, verifies the meta.merkle_root line equals the signed root,
+// and stores the bytes iff verification passes. The verifier +
+// replica store lives in snapshot_replication.nova; the wire
+// prefixes here keep the import graph acyclic (gossip imports
+// snapshot_replication, not vice versa).
+//
+// Wire shapes:
+//   SNAP_FETCH <root_hex>\n
+//       Request: peer asks for the snapshot whose Merkle root is
+//       <root_hex>. Responder either streams SNAP_DATA + SNAP_END,
+//       or replies with a bare SNAP_END (no data) to signal miss.
+//   SNAP_DATA <text_line>\n
+//       One line of the snapshot's text body (the exact output of
+//       snap_to_text, line by line). The receiver concatenates the
+//       lines (re-adding \n) until SNAP_END arrives.
+//   SNAP_END\n
+//       End-of-response marker.
+let GOSSIP_SNAP_FETCH_PREFIX = "SNAP_FETCH "
+let GOSSIP_SNAP_DATA_PREFIX  = "SNAP_DATA "
+let GOSSIP_SNAP_END_LINE     = "SNAP_END"
+
+// ============================================================================
+// R23E -- NAT traversal external-addr advertisement.
+// ============================================================================
+//
+// A peer that discovered its public/external addr via the STUN-like
+// `nat_query_stun` flow (src/federation/nat_traversal.nova)
+// broadcasts a single EXTADDR line over a short-lived TCP
+// connection. The receiver parses + records the (internal, external)
+// mapping into the local nat_state; without an nat_state registered
+// the line is silently dropped.
+//
+// Wire shape:
+//   EXTADDR <internal_addr> <external_addr>\n
+//
+// nat_state cross-module protocol pins:
+//   slot 1 = peer_ext_table : list of [internal_addr, external_addr]
+//   slot 6 = inbound_ad_count counter
+let GOSSIP_EXTADDR_PREFIX = "EXTADDR "
+let GOSSIP_NAT_PEER_TABLE_SLOT = 1
+let GOSSIP_NAT_INBOUND_AD_SLOT = 6
+
+// R26E -- gossip relay wire prefixes. The relay layer in
+// src/federation/gossip_relay.nova owns the format/parse helpers and
+// the request-handling logic; here we pin the wire prefixes so the
+// additive parser branches at the end of gossip_handle_conn /
+// gossip_handle_conn_kg can route incoming relay lines without
+// importing the relay module (which would invert the dependency
+// graph -- gossip_relay imports gossip). When the GOSSIP_S_RELAY_STATE
+// slot is 0 the dispatch is a no-op so legacy souls stay
+// back-compatible.
+let GOSSIP_RELAY_REQ_PREFIX  = "RELAY_REQ "
+let GOSSIP_RELAY_DATA_PREFIX = "RELAY_DATA "
+let GOSSIP_RELAY_ACK_PREFIX  = "RELAY_ACK "
+// R27C.2 -- bulk binary path for srl-wrapped payloads. Mirrors
+// SRL_BIN_PREFIX from gossip_relay_secure.nova. Distinct from
+// every other RELAY_* prefix so the dispatch in
+// gossip_handle_conn / gossip_handle_conn_kg can route to the
+// binary-read codepath without ambiguity. The dispatcher reads
+// the rest of the header line (target/via/from/total_len),
+// drains total_len raw bytes off the fd, and either queues a
+// terminal-deliverable record onto the srl_state's pinned
+// SRL_S_INBOUND_BIN queue (slot 8) or forwards to the target.
+let GOSSIP_RELAY_BIN_PREFIX  = "RELAY_BIN "
+// Pinned cross-module slot indices. The srl_state record
+// (src/federation/gossip_relay_secure.nova) pins SRL_S_INBOUND_BIN
+// at slot 8 + SRL_S_RELAY at slot 0; gossip.nova reads + writes
+// those slots without importing the srl module so the import graph
+// stays acyclic.
+let GOSSIP_SRL_S_RELAY       = 0   // mirrors SRL_S_RELAY
+let GOSSIP_SRL_S_INBOUND_BIN = 8   // mirrors SRL_S_INBOUND_BIN
+
+// R21B -- distributed rule inference message types. Rule broadcast +
+// remote fact fetch + derivation broadcast. The originator side lives
+// in distributed_rules.nova; the receiver-side dispatch is inline here
+// (same pattern R20E uses to avoid the gossip <-> distributed_rules
+// import cycle).
+//
+// Wire shapes:
+//   RULE <rule_string>\n
+//       Broadcast when a peer adds a rule via dr_add_rule. The receiver
+//       enqueues the rule string onto dr_state's inbound-rule queue;
+//       distributed_rules.nova drains the queue at the top of every
+//       dr_run_round and appends parsed rules into the local R20B
+//       engine without re-broadcasting (avoids gossip storms).
+//   DRFETCH <pred>\n
+//       Request from the originator: stream every relation fact for
+//       the named predicate from the receiver's KG. Receiver replies
+//       with one DRFACT line per fact, then DREND.
+//   DRFACT <peer_addr> <pred> <arg1> <arg2> <atom_id>\n
+//       One fact returned by DRFETCH. peer_addr is the receiver's
+//       self_addr so the originator can attribute provenance.
+//   DREND\n
+//       End of DRFETCH stream.
+//   DERIVATION <rule_idx> <pred> <arg1> <arg2> <originator_addr> <contrib1>[,<contrib2>...]\n
+//       Broadcast when a peer derives a new fact under dr_run_round.
+//       Receiver caches the fact locally (kg_add_atom on the canonical
+//       label, dedupe via kg_find_atom) and records the contributing
+//       peers in its provenance log. Contributors are addrs of the
+//       peers whose KGs supplied the premise atoms.
+let GOSSIP_RULE_PREFIX        = "RULE "
+let GOSSIP_DRFETCH_PREFIX     = "DRFETCH "
+let GOSSIP_DRFACT_PREFIX      = "DRFACT "
+let GOSSIP_DREND_LINE         = "DREND"
+let GOSSIP_DERIVATION_PREFIX  = "DERIVATION "
+
+// R21B dr_state record indices that the gossip inbound handlers need
+// to know about. The full layout is defined in distributed_rules.nova;
+// these two slots are PINNED as part of the cross-module protocol so
+// the gossip handler can push inbound RULE / DERIVATION messages onto
+// queues without an import cycle. distributed_rules.nova asserts the
+// shape via type tagging.
+let GOSSIP_DR_INBOUND_RULES = 3      // queue of pending rule strings
+let GOSSIP_DR_INBOUND_DERIVS = 4     // queue of pending derivation records
+
+// R21E -- Noise-protected gossip. The R7C Noise XK module
+// (`src/io/transducers/noise_xk.nova`) provides a mutually-authenticated,
+// AEAD-encrypted transport over a TCP fd; this module layers it under
+// the existing line-oriented gossip wire protocol. Operating modes:
+//
+//   * LEGACY (no keypair): peers without a registered static keypair
+//     (the operator never called gossip_set_noise_keys) speak the v1
+//     plaintext wire exactly as R18E shipped. Back-compat path for
+//     souls that boot without a Noise identity.
+//
+//   * NOISE: both ends have static keypairs AND the dialer has the
+//     responder's pubkey pre-registered (the out-of-band XK
+//     assumption, mirroring R7C kg_sync). The dialer sends the
+//     v2-noise HELLO; the responder accepts and both ends run the
+//     three-message XK handshake. Post-Split, every gossip line
+//     (PING / ACK / MEMBER / ...) is sealed with nxk_seal and opened
+//     with nxk_open under the per-direction transport keys.
+//
+//   * STRICT (CE_GOSSIP_REQUIRE_NOISE=1): the responder REFUSES any
+//     dialer that does not produce a v2-noise HELLO with the error
+//     line GOSSIP_ERR_NOISE_REQ. The dialer, when strict, refuses to
+//     talk to a peer whose static pubkey is not registered (no
+//     plaintext fallback).
+//
+// R21E.1 ships the handshake + the PING/ACK/MEMBER wrap (the SWIM
+// core: liveness + membership propagation). R21E.2 (next session)
+// extends the same noise transport to DELTA / ATOM / DQUERY /
+// ATTESTATION -- same primitives, more callers. The wire framing
+// for handshake messages on the gossip TCP fd is `[4 byte BE len ||
+// N bytes]` per message (the noise_xk module itself emits this for
+// post-handshake frames; we mirror the framing for the three
+// handshake messages so the receiver knows exactly how many bytes
+// to await).
+let GOSSIP_HELLO_NOISE_LINE = "HELLO ce-gossip v2 noise"
+let GOSSIP_OK_NOISE_LINE    = "OK v2 noise"
+let GOSSIP_ERR_NOISE_REQ    = "ERR noise-required"
+
+// Per-recv timeout for the Noise handshake. Each `_gnoise_recv_framed`
+// reads a 4-byte BE length then up to NXK_FRAME_MAX bytes; the peer
+// could legitimately be in the middle of a 1-4s modpow before the
+// reply is dispatched. We extend the socket RCVTIMEO to 30s for the
+// handshake window and keep it post-Split so the immediately-
+// following PING/ACK round trip doesn't trip on a peer that is just
+// finishing its own nxk_split.
+let GOSSIP_NOISE_HANDSHAKE_TIMEOUT_MS = 30000
+
+// ---- peer entry record indices --------------------------------------------
+let GOSSIP_PE_ADDR       = 0
+let GOSSIP_PE_LAST_SEEN  = 1
+let GOSSIP_PE_SUSPICION  = 2
+let GOSSIP_PE_STATUS     = 3
+
+// ---- delta-tracking record indices ----------------------------------------
+let GOSSIP_DT_ADDR       = 0
+let GOSSIP_DT_LAST_SYNC  = 1
+
+// ---- gossip_state_t record indices ----------------------------------------
+let GOSSIP_S_SELF_ADDR   = 0   // string "host:port"
+let GOSSIP_S_PEERS       = 1   // list of peer entries
+let GOSSIP_S_DELTAS      = 2   // list of delta-tracking entries
+let GOSSIP_S_RNG         = 3   // deterministic RNG state (int)
+let GOSSIP_S_TICK        = 4   // tick counter
+let GOSSIP_S_PING_SEQ    = 5   // monotonic ping sequence
+let GOSSIP_S_LAST_PING_NS = 6  // nanotime of last ping action
+let GOSSIP_S_LAST_DELTA_NS = 7 // nanotime of last delta-gossip action
+let GOSSIP_S_PING_INTERVAL_NS = 8
+let GOSSIP_S_DELTA_INTERVAL_NS = 9
+let GOSSIP_S_STATS_PINGS = 10  // counters for /gossip status
+let GOSSIP_S_STATS_ACKS  = 11
+let GOSSIP_S_STATS_TIMEOUTS = 12
+let GOSSIP_S_STATS_DELTAS = 13
+// R20F: optional per-peer attestation log + pubkey map. Both are 0 by
+// default; the daemon calls gossip_set_att_store + gossip_register_att_pubkey
+// at bootstrap to wire them in. When the slots are 0 the inbound
+// ATTESTATION handler short-circuits to a no-op, so a soul that has not
+// opted into attestations still parses peer messages cleanly.
+let GOSSIP_S_ATT_STORE   = 14  // att_store_new() handle or 0
+let GOSSIP_S_ATT_PUBKEYS = 15  // list of [peer_id, pk_bytes] or 0
+let GOSSIP_S_STATS_ATT_RX = 16 // attestations received + verified
+let GOSSIP_S_STATS_ATT_BAD = 17 // attestations dropped (bad sig / unknown peer)
+// R21B: distributed-rule-inference plumbing. dr_state is wired in
+// here so the inbound-line dispatcher can:
+//   - parse RULE lines and add to the local rule engine
+//   - serve DRFETCH from the local KG (predicate -> relation atoms)
+//   - cache DERIVATION facts into the local KG with provenance
+// All slots are 0 by default; a soul that has not opted into R21B
+// short-circuits on inbound. The handler slot is the dr_state record
+// itself (carries the engine + provenance + back-ref to gossip).
+// Slot indices are chosen above R21E's noise slots (18-24) when
+// R21E lands in the same gossip layout; this commit places R21B at
+// 18-21 with a documented coordination note for the next agent.
+let GOSSIP_S_DR_STATE    = 18  // dr_state_t or 0
+let GOSSIP_S_STATS_DR_RULES_RX     = 19  // RULE lines received
+let GOSSIP_S_STATS_DR_DERIVS_RX    = 20  // DERIVATION lines received
+let GOSSIP_S_STATS_DR_FETCHES_RX   = 21  // DRFETCH requests served
+// R21E: Noise-protected gossip slots. All zero by default; populated
+// by gossip_set_noise_keys (own static keypair) and
+// gossip_register_peer_pubkey (per-addr peer pubkey table). A soul
+// that has not opted into Noise (NOISE_PRIV == 0) continues to speak
+// the v1 plaintext wire, preserving R18E back-compat. STRICT, when 1,
+// requires Noise on every connection (both sides).
+let GOSSIP_S_NOISE_PRIV   = 22  // own static priv hex (512 chars) or 0
+let GOSSIP_S_NOISE_PUB    = 23  // own static pub hex (512 chars) or 0
+let GOSSIP_S_NOISE_PEERS  = 24  // list of [peer_addr, pubkey_hex] or 0
+let GOSSIP_S_NOISE_STRICT = 25  // 1 = refuse plaintext, 0 = lenient fallback
+let GOSSIP_S_STATS_NOISE_HS = 26       // successful Noise handshakes
+let GOSSIP_S_STATS_NOISE_HS_FAIL = 27  // failed Noise handshakes (MITM / bad pubkey / mode mismatch)
+let GOSSIP_S_STATS_NOISE_REFUSED = 28  // strict-mode plaintext refusals
+// R23C -- snapshot replication. sr_state (snapshot_replication.nova)
+// wired here so the SNAP_FETCH / SNAP_DATA / SNAP_END dispatch can:
+//   - serve incoming SNAP_FETCH from our local replica table
+//   - count successful fetches + tamper rejections (verify lives
+//     in snapshot_replication.nova; gossip just bumps the wire-side
+//     counters)
+// The slot is 0 by default; a soul that has not opted into R23C
+// short-circuits on inbound (the parser branch does the nil-check).
+// Slot indices intentionally start at 29 (immediately after R21E) so
+// the layout extends linearly; R23E (NAT traversal) slots adjacent.
+let GOSSIP_S_SR_STATE          = 29  // sr_state_t or 0
+let GOSSIP_S_STATS_SR_FETCH_RX = 30  // SNAP_FETCH requests served
+let GOSSIP_S_STATS_SR_DATA_RX  = 31  // SNAP_DATA lines streamed in
+// R23E -- NAT traversal hook. nat_state slot + counters.
+let GOSSIP_S_NAT_STATE              = 32  // nat_state_t or 0
+let GOSSIP_S_STATS_NAT_EXTADDR_RX   = 33  // EXTADDR lines recorded
+let GOSSIP_S_STATS_NAT_EXTADDR_BAD  = 34  // EXTADDR lines dropped
+// R26E -- gossip relay. relay_state slot + per-message-type counters.
+// The relay layer (src/federation/gossip_relay.nova) routes peer-to-
+// peer messages through a common intermediary when direct dial fails;
+// the gossip handler dispatches RELAY_REQ to relay_handle_request,
+// RELAY_DATA to relay_handle_data, RELAY_ACK to relay_handle_ack via
+// the additive parser branches at the end of every inbound handler.
+// The slot is 0 by default; a soul that has not opted into R26E sees
+// RELAY_* lines arrive but drops them silently (the parser branch
+// nil-checks the relay slot before dispatch).
+let GOSSIP_S_RELAY_STATE            = 35  // relay_state_t or 0
+let GOSSIP_S_STATS_RELAY_REQ_RX     = 36  // RELAY_REQ lines forwarded
+let GOSSIP_S_STATS_RELAY_DATA_RX    = 37  // RELAY_DATA lines delivered
+let GOSSIP_S_STATS_RELAY_ACK_RX     = 38  // RELAY_ACK lines noted
+// R27C.2 -- bulk binary path for srl. srl_state_t back-ref + per-
+// message-type counters. The slot is 0 by default; a soul that has
+// not opted into R27C.2 sees RELAY_BIN lines arrive but drops them
+// (the parser branch nil-checks the slot). The dispatcher uses
+// the slot to push terminal records onto the srl's pinned binary-
+// inbound queue (SRL_S_INBOUND_BIN). Forwarding (target != self)
+// requires no srl wiring; the dispatcher writes binary bytes
+// directly to the next hop using the gossip.nova send helpers.
+let GOSSIP_S_SRL_STATE              = 39  // srl_state_t or 0
+let GOSSIP_S_STATS_RELAY_BIN_RX     = 40  // RELAY_BIN lines successfully read
+let GOSSIP_S_STATS_RELAY_BIN_FWD    = 41  // RELAY_BIN forwarded to next hop
+let GOSSIP_S_STATS_RELAY_BIN_BAD    = 42  // RELAY_BIN dropped (bad header / short read)
+
+// ---- low-level string helpers ---------------------------------------------
+
+fn _gossip_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _gossip_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        if _gossip_is_digit(char_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _gossip_starts_with(s, prefix) {
+    if len(s) < len(prefix) { return 0 }
+    let i = 0
+    while i < len(prefix) {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _gossip_strip_eol(s) {
+    let n = len(s)
+    while n > 0 {
+        let c = char_at(s, n - 1)
+        if c == 10 { n = n - 1 } else {
+            if c == 13 { n = n - 1 } else { return substr(s, 0, n) }
+        }
+    }
+    return ""
+}
+
+fn _gossip_split_spaces(s) {
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if char_at(s, i) == 32 {
+            if i > start { push(out, substr(s, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(s, start, i - start)) }
+    return out
+}
+
+// Parse "host:port" -> [host, port_int]. Returns 0 on parse failure.
+fn _gossip_parse_addr(addr) {
+    let i = 0
+    while i < len(addr) {
+        if char_at(addr, i) == 58 {
+            let host = substr(addr, 0, i)
+            let port_s = substr(addr, i + 1, len(addr) - i - 1)
+            if len(host) == 0 { return 0 }
+            if _gossip_is_digits(port_s) == 0 { return 0 }
+            let port = str_to_int(port_s)
+            if port <= 0 { return 0 }
+            if port > 65535 { return 0 }
+            let rec = list_new()
+            push(rec, host)
+            push(rec, port)
+            return rec
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Convert a dotted-quad to the 32-bit value make_sockaddr_in expects.
+fn _gossip_ip_str_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return -1 }
+    let i2 = 0
+    while i2 < 4 {
+        if _gossip_is_digits(toks[i2]) == 0 { return -1 }
+        let v = str_to_int(toks[i2])
+        if v < 0 { return -1 }
+        if v > 255 { return -1 }
+        i2 = i2 + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    let k256 = 256
+    return a + b * k256 + c * k256 * k256 + d * k256 * k256 * k256
+}
+
+// ---- deterministic RNG (xorshift32) ---------------------------------------
+//
+// SWIM specifies "pick a peer uniformly at random". Tests require the
+// selection to be deterministic when seeded so they can assert specific
+// peer picks. xorshift32 (Marsaglia 2003, period 2^32 - 1) is the
+// minimum-viable rng; quality is not load-bearing here.
+
+// Glibc LCG (a=1103515245, c=12345, m=2^31). Deterministic, full period
+// over 2^31. Quality is not load-bearing -- the tests just need the
+// selection to be reproducible from a fixed seed.
+fn _gossip_rng_next(seed) {
+    let x = seed
+    if x <= 0 { x = 2463534242 }
+    let m31 = 2147483648
+    let v = (x * 1103515245 + 12345) - ((x * 1103515245 + 12345) / m31) * m31
+    if v < 0 { v = 0 - v }
+    return v
+}
+
+fn _gossip_rng_in_range(seed, n) {
+    if n <= 0 { return 0 }
+    let next = _gossip_rng_next(seed)
+    let r = next - (next / n) * n
+    if r < 0 { r = 0 - r }
+    return r
+}
+
+// ---- state constructors ---------------------------------------------------
+
+fn gossip_init(self_addr, bootstrap_peers) {
+    let st = list_new()
+    push(st, self_addr)              // S_SELF_ADDR
+    push(st, list_new())             // S_PEERS
+    push(st, list_new())             // S_DELTAS
+    push(st, 2463534242)             // S_RNG (xorshift seed default)
+    push(st, 0)                      // S_TICK
+    push(st, 0)                      // S_PING_SEQ
+    push(st, 0)                      // S_LAST_PING_NS
+    push(st, 0)                      // S_LAST_DELTA_NS
+    push(st, GOSSIP_PING_INTERVAL_MS * 1000000)   // S_PING_INTERVAL_NS
+    push(st, GOSSIP_DELTA_INTERVAL_MS * 1000000)  // S_DELTA_INTERVAL_NS
+    push(st, 0)                      // S_STATS_PINGS
+    push(st, 0)                      // S_STATS_ACKS
+    push(st, 0)                      // S_STATS_TIMEOUTS
+    push(st, 0)                      // S_STATS_DELTAS
+    push(st, 0)                      // S_ATT_STORE (R20F)
+    push(st, 0)                      // S_ATT_PUBKEYS (R20F)
+    push(st, 0)                      // S_STATS_ATT_RX (R20F)
+    push(st, 0)                      // S_STATS_ATT_BAD (R20F)
+    push(st, 0)                      // S_DR_STATE (R21B)
+    push(st, 0)                      // S_STATS_DR_RULES_RX (R21B)
+    push(st, 0)                      // S_STATS_DR_DERIVS_RX (R21B)
+    push(st, 0)                      // S_STATS_DR_FETCHES_RX (R21B)
+    push(st, 0)                      // S_NOISE_PRIV (R21E)
+    push(st, 0)                      // S_NOISE_PUB (R21E)
+    push(st, 0)                      // S_NOISE_PEERS (R21E)
+    push(st, 0)                      // S_NOISE_STRICT (R21E)
+    push(st, 0)                      // S_STATS_NOISE_HS (R21E)
+    push(st, 0)                      // S_STATS_NOISE_HS_FAIL (R21E)
+    push(st, 0)                      // S_STATS_NOISE_REFUSED (R21E)
+    push(st, 0)                      // S_SR_STATE (R23C)
+    push(st, 0)                      // S_STATS_SR_FETCH_RX (R23C)
+    push(st, 0)                      // S_STATS_SR_DATA_RX (R23C)
+    push(st, 0)                      // S_NAT_STATE (R23E)
+    push(st, 0)                      // S_STATS_NAT_EXTADDR_RX (R23E)
+    push(st, 0)                      // S_STATS_NAT_EXTADDR_BAD (R23E)
+    push(st, 0)                      // S_RELAY_STATE (R26E)
+    push(st, 0)                      // S_STATS_RELAY_REQ_RX (R26E)
+    push(st, 0)                      // S_STATS_RELAY_DATA_RX (R26E)
+    push(st, 0)                      // S_STATS_RELAY_ACK_RX (R26E)
+    push(st, 0)                      // S_SRL_STATE (R27C.2)
+    push(st, 0)                      // S_STATS_RELAY_BIN_RX (R27C.2)
+    push(st, 0)                      // S_STATS_RELAY_BIN_FWD (R27C.2)
+    push(st, 0)                      // S_STATS_RELAY_BIN_BAD (R27C.2)
+
+    // Bootstrap peers are addresses; trust them at startup with
+    // status=ALIVE and last_seen=nanotime() (the operator just told
+    // us they exist; the next PING tick will either confirm or fall
+    // into the suspicion path).
+    if bootstrap_peers != 0 {
+        let bp = bootstrap_peers
+        let i = 0
+        while i < len(bp) {
+            let addr = bp[i]
+            if str_eq(addr, self_addr) == 0 {
+                gossip_add_peer(st, addr)
+            }
+            i = i + 1
+        }
+    }
+    return st
+}
+
+// Accessors --------------------------------------------------------------
+
+fn gossip_self_addr(state)  { return state[GOSSIP_S_SELF_ADDR] }
+fn gossip_peer_table(state) { return state[GOSSIP_S_PEERS] }
+fn gossip_tick_count(state) { return state[GOSSIP_S_TICK] }
+fn gossip_ping_seq(state)   { return state[GOSSIP_S_PING_SEQ] }
+fn gossip_stats_pings(state)    { return state[GOSSIP_S_STATS_PINGS] }
+fn gossip_stats_acks(state)     { return state[GOSSIP_S_STATS_ACKS] }
+fn gossip_stats_timeouts(state) { return state[GOSSIP_S_STATS_TIMEOUTS] }
+fn gossip_stats_deltas(state)   { return state[GOSSIP_S_STATS_DELTAS] }
+
+// Deterministic-seed setter so tests can pin peer selection.
+fn gossip_set_seed(state, seed) {
+    state[GOSSIP_S_RNG] = seed
+    return state
+}
+
+// ---- peer table operations -------------------------------------------------
+
+// Find idx of `addr` in the peer table, or -1.
+fn gossip_find_peer(state, addr) {
+    let peers = state[GOSSIP_S_PEERS]
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if str_eq(p[GOSSIP_PE_ADDR], addr) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gossip_peer_count(state) {
+    return len(state[GOSSIP_S_PEERS])
+}
+
+fn gossip_peer_at(state, idx) {
+    return state[GOSSIP_S_PEERS][idx]
+}
+
+fn gossip_peer_addr(entry)   { return entry[GOSSIP_PE_ADDR] }
+fn gossip_peer_status(entry) { return entry[GOSSIP_PE_STATUS] }
+fn gossip_peer_suspicion(entry) { return entry[GOSSIP_PE_SUSPICION] }
+fn gossip_peer_last_seen(entry) { return entry[GOSSIP_PE_LAST_SEEN] }
+
+// Add a peer with status=ALIVE, suspicion=0, last_seen=nanotime().
+// No-op if the peer is already known.
+fn gossip_add_peer(state, addr) {
+    if gossip_find_peer(state, addr) >= 0 { return state }
+    let entry = list_new()
+    push(entry, addr)                  // PE_ADDR
+    push(entry, nanotime())            // PE_LAST_SEEN
+    push(entry, 0)                     // PE_SUSPICION
+    push(entry, GOSSIP_STATUS_ALIVE)   // PE_STATUS
+    push(state[GOSSIP_S_PEERS], entry)
+    return state
+}
+
+fn gossip_remove_peer(state, addr) {
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 { return state }
+    let peers = state[GOSSIP_S_PEERS]
+    // Compact: replace idx with last, drop last.
+    let last = len(peers) - 1
+    if idx != last { peers[idx] = peers[last] }
+    pop(peers)
+    return state
+}
+
+// Mark addr as having ACKed a ping. Resets suspicion to 0, bumps
+// last_seen to nanotime(), restores status to ALIVE.
+fn gossip_on_ack(state, addr) {
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 { return state }
+    let entry = state[GOSSIP_S_PEERS][idx]
+    entry[GOSSIP_PE_LAST_SEEN] = nanotime()
+    entry[GOSSIP_PE_SUSPICION] = 0
+    entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_ALIVE
+    state[GOSSIP_S_STATS_ACKS] = state[GOSSIP_S_STATS_ACKS] + 1
+    return state
+}
+
+// Mark addr as having timed out on a ping. Increments suspicion;
+// promotes status to SUSPECT at suspicion=2, DEAD at suspicion>=3.
+fn gossip_on_timeout(state, addr) {
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 { return state }
+    let entry = state[GOSSIP_S_PEERS][idx]
+    let s = entry[GOSSIP_PE_SUSPICION] + 1
+    entry[GOSSIP_PE_SUSPICION] = s
+    if s >= GOSSIP_SUSPICION_DEAD {
+        entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_DEAD
+    } else {
+        if s >= 2 { entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_SUSPECT }
+    }
+    state[GOSSIP_S_STATS_TIMEOUTS] = state[GOSSIP_S_STATS_TIMEOUTS] + 1
+    return state
+}
+
+// Merge a membership notice from a peer. Adds the addr if unknown.
+// Updates last_seen if the addr is known.
+fn gossip_merge_member(state, addr, status) {
+    if str_eq(addr, state[GOSSIP_S_SELF_ADDR]) == 1 { return state }
+    let idx = gossip_find_peer(state, addr)
+    if idx < 0 {
+        gossip_add_peer(state, addr)
+        // The membership notice claims a status; respect it for new peers.
+        if status >= 0 {
+            let new_idx = gossip_find_peer(state, addr)
+            if new_idx >= 0 {
+                state[GOSSIP_S_PEERS][new_idx][GOSSIP_PE_STATUS] = status
+            }
+        }
+        return state
+    }
+    // Known peer: a gossiped MEMBER notice is a WEAK signal -- the
+    // gossiper is reporting THEIR view, which may be stale relative
+    // to our direct PING observations. We honor:
+    //   * an ALIVE notice ONLY when local suspicion == 0 (refreshes
+    //     last_seen but otherwise no-op). If local suspicion > 0 we
+    //     IGNORE the alive claim: our own failed PINGs are direct
+    //     evidence and outrank a third-party gossip.
+    //   * a SUSPECT/DEAD notice is corroborating evidence: when our
+    //     local status is ALIVE with suspicion == 0, it nudges
+    //     suspicion +1; if local suspicion is already >0 it does
+    //     nothing (we already have local evidence; we don't want
+    //     gossip storms to compound it).
+    // This keeps the SWIM property: failure detection is driven by
+    // DIRECT probes, gossip propagates discoveries but cannot fake
+    // them.
+    let entry = state[GOSSIP_S_PEERS][idx]
+    if status == GOSSIP_STATUS_ALIVE {
+        if entry[GOSSIP_PE_SUSPICION] == 0 {
+            if entry[GOSSIP_PE_STATUS] != GOSSIP_STATUS_DEAD {
+                entry[GOSSIP_PE_LAST_SEEN] = nanotime()
+                entry[GOSSIP_PE_STATUS] = GOSSIP_STATUS_ALIVE
+            }
+        }
+    } else {
+        if entry[GOSSIP_PE_STATUS] == GOSSIP_STATUS_ALIVE {
+            if entry[GOSSIP_PE_SUSPICION] == 0 {
+                entry[GOSSIP_PE_SUSPICION] = 1
+            }
+        }
+    }
+    return state
+}
+
+// Return list of addrs whose status == ALIVE.
+fn gossip_alive_peers(state) {
+    let out = list_new()
+    let peers = state[GOSSIP_S_PEERS]
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if p[GOSSIP_PE_STATUS] == GOSSIP_STATUS_ALIVE {
+            push(out, p[GOSSIP_PE_ADDR])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Return list of addrs regardless of status.
+fn gossip_all_peers(state) {
+    let out = list_new()
+    let peers = state[GOSSIP_S_PEERS]
+    let i = 0
+    while i < len(peers) {
+        push(out, peers[i][GOSSIP_PE_ADDR])
+        i = i + 1
+    }
+    return out
+}
+
+// Pick a random peer from the alive set, advancing the RNG. Returns 0
+// (sentinel) if there are no alive peers.
+fn gossip_pick_random_peer(state) {
+    let alive = gossip_alive_peers(state)
+    if len(alive) == 0 { return 0 }
+    let seed = state[GOSSIP_S_RNG]
+    let r = _gossip_rng_in_range(seed, len(alive))
+    state[GOSSIP_S_RNG] = _gossip_rng_next(seed)
+    return alive[r]
+}
+
+// Pick up to k random peer addrs for piggyback membership, excluding
+// `exclude_addr`. Returns a list of addr strings (possibly shorter than k).
+fn gossip_pick_piggyback(state, k, exclude_addr) {
+    let peers = state[GOSSIP_S_PEERS]
+    let out = list_new()
+    if len(peers) == 0 { return out }
+    let n = len(peers)
+    let max_tries = n * 2
+    let tried = 0
+    let seed = state[GOSSIP_S_RNG]
+    while len(out) < k {
+        if tried >= max_tries { return out }
+        let r = _gossip_rng_in_range(seed, n)
+        seed = _gossip_rng_next(seed)
+        let cand = peers[r][GOSSIP_PE_ADDR]
+        if str_eq(cand, exclude_addr) == 0 {
+            // dedupe within the output set
+            let dupe = 0
+            let i = 0
+            while i < len(out) {
+                if str_eq(out[i], cand) == 1 { dupe = 1 }
+                i = i + 1
+            }
+            if dupe == 0 { push(out, cand) }
+        }
+        tried = tried + 1
+    }
+    state[GOSSIP_S_RNG] = seed
+    return out
+}
+
+// ---- delta tracking -------------------------------------------------------
+
+fn _gossip_find_delta(state, addr) {
+    let dt = state[GOSSIP_S_DELTAS]
+    let i = 0
+    while i < len(dt) {
+        if str_eq(dt[i][GOSSIP_DT_ADDR], addr) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gossip_set_last_synced(state, addr, ns) {
+    let idx = _gossip_find_delta(state, addr)
+    if idx >= 0 {
+        state[GOSSIP_S_DELTAS][idx][GOSSIP_DT_LAST_SYNC] = ns
+        return state
+    }
+    let rec = list_new()
+    push(rec, addr)
+    push(rec, ns)
+    push(state[GOSSIP_S_DELTAS], rec)
+    return state
+}
+
+fn gossip_get_last_synced(state, addr) {
+    let idx = _gossip_find_delta(state, addr)
+    if idx < 0 { return 0 }
+    return state[GOSSIP_S_DELTAS][idx][GOSSIP_DT_LAST_SYNC]
+}
+
+// ---- wire helpers ---------------------------------------------------------
+
+fn _gossip_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+fn _gossip_recv_line(fd) {
+    let buf = alloc(GOSSIP_LINE_MAX)
+    let n = 0
+    while n < GOSSIP_LINE_MAX - 1 {
+        let b = recv_data(fd, buf + n, 1)
+        if b <= 0 {
+            if n == 0 { return 0 }
+            store8(buf + n, 0)
+            return _gossip_strip_eol(buf)
+        }
+        let c = load8(buf + n)
+        n = n + 1
+        if c == 10 {
+            store8(buf + n - 1, 0)
+            return _gossip_strip_eol(buf)
+        }
+    }
+    store8(buf + n, 0)
+    return _gossip_strip_eol(buf)
+}
+
+// Dial a peer's gossip port. Returns fd or -1 on failure. The returned
+// fd has SO_RCVTIMEO and SO_SNDTIMEO set to GOSSIP_PING_TIMEOUT_MS so a
+// stuck peer can't hang us indefinitely (e.g. tick-zero deadlock in a
+// fully-meshed N-soul boot).
+fn _gossip_dial(addr) {
+    let parsed = _gossip_parse_addr(addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _gossip_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let sa = make_sockaddr_in(port, ip)
+    let attempt = 0
+    while attempt < GOSSIP_CONNECT_RETRIES {
+        let fd = socket(2, 1, 0)
+        if fd < 0 { return -1 }
+        _gossip_set_rcvtimeo_ms(fd, GOSSIP_PING_TIMEOUT_MS)
+        if connect_socket(fd, sa, 16) >= 0 {
+            return fd
+        }
+        close_fd(fd)
+        sleep_ms(GOSSIP_CONNECT_DELAY_MS)
+        attempt = attempt + 1
+    }
+    return -1
+}
+
+// fcntl(2) wrapper -- used to set O_NONBLOCK on the listening fd so
+// accept() can be polled without blocking the gossip step loop.
+fn _gossip_fcntl(fd, cmd, arg) {
+    asm {
+        "mov rax, 72"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// setsockopt(2) wrapper. Used to set SO_REUSEADDR so an integration
+// scenario can rebind quickly after a previous run held the port
+// in TIME_WAIT.
+fn _gossip_setsockopt(fd, level, optname, optval, optlen) {
+    asm {
+        "mov rax, 54"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "mov r10, [rbp-32]"
+        "mov r8, [rbp-40]"
+        "syscall"
+    }
+}
+
+// Apply SO_REUSEADDR = 1 to the listening fd.
+fn _gossip_set_reuseaddr(fd) {
+    let one_buf = alloc(4)
+    store8(one_buf, 1)
+    store8(one_buf + 1, 0)
+    store8(one_buf + 2, 0)
+    store8(one_buf + 3, 0)
+    // SOL_SOCKET = 1, SO_REUSEADDR = 2 on Linux x86-64.
+    return _gossip_setsockopt(fd, 1, 2, one_buf, 4)
+}
+
+// Apply SO_RCVTIMEO = 500ms to a client socket. Without this, every
+// PING blocks until the peer's accept loop runs (or forever if the
+// peer's accept is itself stuck waiting on us -- a trivial deadlock
+// in a 3-soul mesh on tick 0). With a 500ms timeout the PING fails
+// fast on no-response, the suspicion counter advances, the inbound
+// drain runs next tick, and the mesh unsticks.
+//
+// struct timeval layout: { tv_sec :: i64, tv_usec :: i64 } -- 16 bytes
+// little-endian. For sub-second timeouts (the only case we use) the
+// tv_sec word is zero and tv_usec carries the value.
+fn _gossip_set_rcvtimeo_ms(fd, ms) {
+    let tv = alloc(16)
+    let i = 0
+    while i < 16 { store8(tv + i, 0); i = i + 1 }
+    // struct timeval: tv_sec (i64 at offset 0), tv_usec (i64 at offset 8).
+    // Linux requires tv_usec < 1_000_000; for ms >= 1000 we MUST
+    // split into seconds + remainder microseconds. (R21E: the noise
+    // handshake window uses 30s here; the original sub-second-only
+    // implementation wrote tv_usec = 30_000_000 which the kernel
+    // rejects with EINVAL -- timeouts > 999ms silently became zero
+    // and the recv returned EAGAIN immediately.)
+    let secs = ms / 1000
+    let rem_ms = ms - secs * 1000
+    let usec = rem_ms * 1000
+    // Write tv_sec at offset 0 as little-endian 8 bytes.
+    let vs = secs
+    let k = 0
+    while k < 8 {
+        store8(tv + k, vs - (vs / 256) * 256)
+        vs = vs / 256
+        k = k + 1
+    }
+    // Write tv_usec at offset 8 as little-endian 8 bytes.
+    let v = usec
+    let j = 0
+    while j < 8 {
+        store8(tv + 8 + j, v - (v / 256) * 256)
+        v = v / 256
+        j = j + 1
+    }
+    // SOL_SOCKET = 1, SO_RCVTIMEO = 20, SO_SNDTIMEO = 21.
+    _gossip_setsockopt(fd, 1, 20, tv, 16)
+    _gossip_setsockopt(fd, 1, 21, tv, 16)
+    return 0
+}
+
+// Make fd non-blocking via fcntl(fd, F_SETFL, O_NONBLOCK).
+// F_GETFL=3, F_SETFL=4, O_NONBLOCK=2048 on Linux x86-64.
+fn _gossip_set_nonblock(fd) {
+    let flags = _gossip_fcntl(fd, 3, 0)
+    if flags < 0 { return -1 }
+    return _gossip_fcntl(fd, 4, flags + 2048)
+}
+
+// Bind + listen on the gossip port derived from self_addr. Returns server
+// fd or -1 on failure. The fd is set to O_NONBLOCK so the daemon's
+// gossip_try_accept can poll it without stalling the step loop.
+fn gossip_listen(self_addr) {
+    let parsed = _gossip_parse_addr(self_addr)
+    if parsed == 0 { return -1 }
+    let host = parsed[0]
+    let port = parsed[1]
+    let ip = _gossip_ip_str_to_int(host)
+    if ip < 0 { return -1 }
+    let fd = socket(2, 1, 0)
+    if fd < 0 { return -1 }
+    _gossip_set_reuseaddr(fd)
+    let sa = make_sockaddr_in(port, ip)
+    if bind_socket(fd, sa, 16) < 0 {
+        close_fd(fd)
+        return -1
+    }
+    if listen_socket(fd, 8) < 0 {
+        close_fd(fd)
+        return -1
+    }
+    _gossip_set_nonblock(fd)
+    return fd
+}
+
+// Non-blocking accept poll: returns conn_fd >= 0 if a peer dialed in,
+// or -1 if no pending connection (EAGAIN). Daemons call this each tick.
+fn gossip_try_accept(server_fd) {
+    let conn_fd = accept_conn(server_fd, 0, 0)
+    return conn_fd
+}
+
+// ---- client side: PING + piggyback ---------------------------------------
+//
+// Send a PING to addr, await ACK, then send up to k piggyback MEMBER
+// lines drawn from this state's peer table. Returns 1 on a clean
+// exchange (ACK received with matching seq), 0 on any failure.
+// Side effects: bumps PING_SEQ; updates STATS_PINGS / STATS_ACKS /
+// STATS_TIMEOUTS via gossip_on_ack / gossip_on_timeout.
+
+fn gossip_send_ping(state, addr) {
+    state[GOSSIP_S_STATS_PINGS] = state[GOSSIP_S_STATS_PINGS] + 1
+    let fd = _gossip_dial(addr)
+    if fd < 0 {
+        gossip_on_timeout(state, addr)
+        return 0
+    }
+    // Optional handshake -- a misdialed kg_sync peer rejects this.
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let hello_ack = _gossip_recv_line(fd)
+    if hello_ack == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if str_eq(hello_ack, GOSSIP_OK_LINE) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+
+    let seq = state[GOSSIP_S_PING_SEQ] + 1
+    state[GOSSIP_S_PING_SEQ] = seq
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let ping_line = GOSSIP_PING_PREFIX + int_to_str(seq) + " " + self_addr + "\n"
+    if _gossip_send_all(fd, ping_line) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_starts_with(ack, GOSSIP_ACK_PREFIX) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let toks = _gossip_split_spaces(ack)
+    if len(toks) < 2 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_is_digits(toks[1]) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let recv_seq = str_to_int(toks[1])
+    if recv_seq != seq {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    // Clean ACK -- record liveness.
+    gossip_on_ack(state, addr)
+
+    // Piggyback membership: pick up to k=3 peers and broadcast.
+    let pb = gossip_pick_piggyback(state, GOSSIP_MAX_MEMBER_PIGGYBACK, addr)
+    let i = 0
+    while i < len(pb) {
+        let mb_addr = pb[i]
+        let mb_idx = gossip_find_peer(state, mb_addr)
+        let mb_status = GOSSIP_STATUS_ALIVE
+        if mb_idx >= 0 {
+            mb_status = state[GOSSIP_S_PEERS][mb_idx][GOSSIP_PE_STATUS]
+        }
+        let line = GOSSIP_MEMBER_PREFIX + mb_addr + " " + int_to_str(mb_status) + "\n"
+        if _gossip_send_all(fd, line) == 0 {
+            // Best-effort; if send fails the receiver simply learns less.
+            i = len(pb)
+        } else {
+            i = i + 1
+        }
+    }
+    // Graceful close.
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// ---- server side: handle one inbound connection -------------------------
+//
+// A handler called by the daemon loop after accept_conn() returns a
+// connection fd. Reads the HELLO, runs the PING/ACK/MEMBER... protocol,
+// returns when the client sends BYE or the socket closes. Updates the
+// caller's state with any learned membership.
+
+fn gossip_handle_conn(state, conn_fd) {
+    let hello = _gossip_recv_line(conn_fd)
+    if hello == 0 { close_fd(conn_fd); return state }
+    if str_eq(hello, GOSSIP_HELLO_LINE) == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_ERR_UNKNOWN + "\n")
+        close_fd(conn_fd)
+        return state
+    }
+    if _gossip_send_all(conn_fd, GOSSIP_OK_LINE + "\n") == 0 {
+        close_fd(conn_fd); return state
+    }
+
+    // Process lines until BYE or EOF.
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(conn_fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        // Learn the sender via implicit membership.
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        _gossip_send_all(conn_fd, GOSSIP_ACK_PREFIX + seq + "\n")
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            // Receiver of a DELTA request: stream every atom
+                            // in our KG with updated_ns > since_ns, then
+                            // DELTA_END. The caller passes a KG via a
+                            // separate handler entry point; here we have no
+                            // KG so we just send DELTA_END (the integration
+                            // scenario tests the full path via gossip_serve_delta).
+                            _gossip_send_all(conn_fd, GOSSIP_DELTA_END_LINE + "\n")
+                        }
+                        // R20F: handle ATTESTATION inbound here too (kg-less variant).
+                        if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                            _gossip_serve_attestation(state, line)
+                            // R23C: poke the snapshot-replication
+                            // layer so its known-roots table tracks
+                            // this root for a subsequent SNAP_FETCH.
+                            // Skips when sr_state is 0 (back-compat).
+                            let _sr0 = state[GOSSIP_S_SR_STATE]
+                            if _sr0 != 0 {
+                                let _att0 = att_parse_wire(line)
+                                if _att0 != 0 {
+                                    let _pk0 = gossip_lookup_att_pubkey(state, att_soul_id(_att0))
+                                    if _pk0 != 0 {
+                                        if att_verify(_att0, _pk0) == 1 {
+                                            sr_observe_attestation(_sr0, _att0)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // R23C: handle SNAP_FETCH inbound (kg-less variant).
+                        if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                            _gossip_serve_snap_fetch(conn_fd, state, line)
+                        }
+                        // R23E: handle EXTADDR inbound (kg-less variant).
+                        if _gossip_starts_with(line, GOSSIP_EXTADDR_PREFIX) == 1 {
+                            _gossip_serve_extaddr(state, line)
+                        }
+                        // R26E: handle RELAY_* inbound (kg-less variant).
+                        if _gossip_starts_with(line, GOSSIP_RELAY_REQ_PREFIX) == 1 {
+                            _gossip_serve_relay_req(state, line)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_RELAY_DATA_PREFIX) == 1 {
+                            _gossip_serve_relay_data(state, line)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
+                            _gossip_serve_relay_ack(state, line)
+                        }
+                        // R27C.2: handle RELAY_BIN bulk binary frames.
+                        // The header line carries routing tokens +
+                        // total_len; the dispatcher reads the raw
+                        // payload bytes off the fd before returning.
+                        if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 1 {
+                            _gossip_serve_relay_bin(state, conn_fd, line)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_fd(conn_fd)
+    return state
+}
+
+// Variant that knows about the local KG, used by the daemon to serve
+// DELTA requests. The handler honors PING/ACK identically but also
+// streams ATOM lines for the delta path.
+fn gossip_handle_conn_kg(state, conn_fd, kg) {
+    let hello = _gossip_recv_line(conn_fd)
+    if hello == 0 { close_fd(conn_fd); return state }
+    if str_eq(hello, GOSSIP_HELLO_LINE) == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_ERR_UNKNOWN + "\n")
+        close_fd(conn_fd)
+        return state
+    }
+    if _gossip_send_all(conn_fd, GOSSIP_OK_LINE + "\n") == 0 {
+        close_fd(conn_fd); return state
+    }
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(conn_fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        _gossip_send_all(conn_fd, GOSSIP_ACK_PREFIX + seq + "\n")
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            let dtoks = _gossip_split_spaces(line)
+                            if len(dtoks) >= 3 {
+                                let since_s = dtoks[2]
+                                let since_ns = 0
+                                if _gossip_is_digits(since_s) == 1 {
+                                    since_ns = str_to_int(since_s)
+                                }
+                                // Stream every atom whose updated_ns > since_ns.
+                                _gossip_stream_atoms_since(conn_fd, kg, since_ns)
+                            }
+                            _gossip_send_all(conn_fd, GOSSIP_DELTA_END_LINE + "\n")
+                        } else {
+                            // R20E: distributed-query dispatch. Minimal
+                            // inline handler that evaluates the SPARQL
+                            // against the local KG and streams the
+                            // standard DQRES / DQBIND / DQEND stanza.
+                            // Implemented HERE (rather than as a hook
+                            // into distributed_query.nova) to keep the
+                            // import graph acyclic.
+                            if _gossip_starts_with(line, GOSSIP_DQUERY_PREFIX) == 1 {
+                                _gossip_serve_dquery(conn_fd, state, kg, line)
+                            }
+                            // R20F additive parser branch: signed-snapshot
+                            // ATTESTATION lines. Validates via att_parse_wire +
+                            // att_verify (both fail closed on tamper) and
+                            // appends the verified tuple to the store wired
+                            // via gossip_set_att_store. Unrecognised peers
+                            // (no pubkey in the table) and bad signatures
+                            // both increment the bad-counter without
+                            // mutating the store -- the protocol's
+                            // tamper-resistance invariant.
+                            if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                                _gossip_serve_attestation(state, line)
+                                // R23C: poke the snapshot-replication
+                                // layer so its known-roots table tracks
+                                // this root for a subsequent SNAP_FETCH.
+                                let _sr_kg = state[GOSSIP_S_SR_STATE]
+                                if _sr_kg != 0 {
+                                    let _att_kg = att_parse_wire(line)
+                                    if _att_kg != 0 {
+                                        let _pk_kg = gossip_lookup_att_pubkey(state, att_soul_id(_att_kg))
+                                        if _pk_kg != 0 {
+                                            if att_verify(_att_kg, _pk_kg) == 1 {
+                                                sr_observe_attestation(_sr_kg, _att_kg)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // R23C: SNAP_FETCH request handler.
+                            if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                                _gossip_serve_snap_fetch(conn_fd, state, line)
+                            }
+                            // R21B additive parser branches: distributed-
+                            // rule inference message types. All three
+                            // are no-ops when gossip_set_dr_state has not
+                            // been wired (the dr_state slot is 0). The
+                            // RULE branch enqueues the rule string onto
+                            // the dr_state inbound queue (drained at the
+                            // top of dr_run_round); DRFETCH streams the
+                            // receiver's local relation facts for the
+                            // requested predicate; DERIVATION enqueues a
+                            // peer-derived fact for local caching. The
+                            // dispatch lives HERE so the import graph
+                            // remains acyclic (distributed_rules imports
+                            // gossip, not vice versa).
+                            if _gossip_starts_with(line, GOSSIP_RULE_PREFIX) == 1 {
+                                _gossip_serve_rule(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_DRFETCH_PREFIX) == 1 {
+                                _gossip_serve_drfetch(conn_fd, state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_DERIVATION_PREFIX) == 1 {
+                                _gossip_serve_derivation(state, kg, line)
+                            }
+                            // R23E: handle EXTADDR inbound (kg variant).
+                            if _gossip_starts_with(line, GOSSIP_EXTADDR_PREFIX) == 1 {
+                                _gossip_serve_extaddr(state, line)
+                            }
+                            // R26E: handle RELAY_* inbound (kg variant).
+                            if _gossip_starts_with(line, GOSSIP_RELAY_REQ_PREFIX) == 1 {
+                                _gossip_serve_relay_req(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_DATA_PREFIX) == 1 {
+                                _gossip_serve_relay_data(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
+                                _gossip_serve_relay_ack(state, line)
+                            }
+                            // R27C.2: bulk binary path under kg variant.
+                            // Same shape as the kg-less branch above.
+                            if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 1 {
+                                _gossip_serve_relay_bin(state, conn_fd, line)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_fd(conn_fd)
+    return state
+}
+
+// R20E -- serve a single DQUERY line. Parses `DQUERY <id> <originator>
+// <ts_ns> <query_string...>` (the query_string is everything from the
+// 5th wire token to end-of-line, joined by single spaces -- preserving
+// the originator's exact spacing is impossible across the tokenizer but
+// SPARQL whitespace is collapse-tolerant). Evaluates the query against
+// kg, writes the response stream:
+//
+//   DQRES <id> <self_addr> <count>\n
+//   DQBIND <self_addr> <var1>=<val1> <var2>=<val2> ...\n   (n times)
+//   DQEND <id>\n
+//
+// On parse error, writes a DQERR line instead of DQRES and a DQEND
+// after. The originator detects the DQERR and bumps its bad_query
+// counter without aborting the rest of the fan-out.
+fn _gossip_serve_dquery(conn_fd, state, kg, line) {
+    let toks = _gossip_split_spaces(line)
+    // Expected shape: ["DQUERY", "<id>", "<originator>", "<ts_ns>", "<rest...>"]
+    if len(toks) < 5 { return 0 }
+    let id_s = toks[1]
+    let qid = 0
+    if _gossip_is_digits(id_s) == 1 { qid = str_to_int(id_s) }
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    // Reassemble the query string from toks[4..]. The originator
+    // sends the SPARQL with single spaces between tokens; our
+    // line-split also splits on single space so the join is faithful.
+    let qs = toks[4]
+    let i = 5
+    while i < len(toks) {
+        qs = qs + " " + toks[i]
+        i = i + 1
+    }
+    let parsed = kg_query_parse(qs)
+    if _qry_is_error(parsed) == 1 {
+        let err_msg = qry_error_message(parsed)
+        let err_line = GOSSIP_DQERR_PREFIX + int_to_str(qid) + " " + err_msg + "\n"
+        _gossip_send_all(conn_fd, err_line)
+        _gossip_send_all(conn_fd, GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
+        return 0
+    }
+    let vars = kg_query_vars(parsed)
+    let bindings = kg_query_execute(kg, parsed)
+    let n = len(bindings)
+    let res_line = GOSSIP_DQRES_PREFIX + int_to_str(qid) + " " + self_addr
+        + " " + int_to_str(n) + "\n"
+    if _gossip_send_all(conn_fd, res_line) == 0 { return -1 }
+    let k = 0
+    while k < n {
+        let row = GOSSIP_DQBIND_PREFIX + self_addr
+        let v = 0
+        while v < len(vars) {
+            let name = vars[v]
+            if binding_has(bindings[k], name) == 1 {
+                let val = binding_get(bindings[k], name)
+                row = row + " " + name + "=" + int_to_str(val)
+            } else {
+                row = row + " " + name + "=?"
+            }
+            v = v + 1
+        }
+        if _gossip_send_all(conn_fd, row + "\n") == 0 { return -1 }
+        k = k + 1
+    }
+    _gossip_send_all(conn_fd, GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
+    return n
+}
+
+// Walk the KG and send ATOM lines for every atom whose updated_ns > since_ns.
+// The wire format mirrors kg_sync's ATOM line so the receiver can hand the
+// parsed payload straight to sync_apply_atom().
+fn _gossip_stream_atoms_since(conn_fd, kg, since_ns) {
+    if kg == 0 { return 0 }
+    let n = kg_atom_count(kg)
+    let i = 0
+    let sent = 0
+    while i < n {
+        let a = kg_atom(kg, i)
+        if a != 0 {
+            let updated = atom_updated(a)
+            if updated > since_ns {
+                // Belief is [alpha, beta] in milli; expose both in the
+                // wire form so the receiver can rebuild it.
+                let bel = atom_belief(a)
+                let alpha = bel[0]
+                let beta = bel[1]
+                let label = atom_label(a)
+                let kg_label_str = kg_label(kg)
+                let line = GOSSIP_ATOM_PREFIX + kg_label_str + " "
+                    + int_to_str(atom_id(a)) + " "
+                    + int_to_str(atom_kind(a)) + " "
+                    + int_to_str(alpha) + " "
+                    + int_to_str(beta) + " "
+                    + label + "\n"
+                if _gossip_send_all(conn_fd, line) == 0 { return sent }
+                sent = sent + 1
+            }
+        }
+        i = i + 1
+    }
+    return sent
+}
+
+// ---- delta gossip client side --------------------------------------------
+//
+// Dial a peer, request KG deltas since last_synced_ns, apply received
+// ATOM lines, bump last_synced_ns to the request timestamp. Returns the
+// number of atoms applied, or -1 on failure.
+
+fn gossip_send_delta_request(state, addr, kg) {
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return -1 }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return -1
+    }
+    let ok = _gossip_recv_line(fd)
+    if ok == 0 { close_fd(fd); return -1 }
+    if str_eq(ok, GOSSIP_OK_LINE) == 0 { close_fd(fd); return -1 }
+
+    let since_ns = gossip_get_last_synced(state, addr)
+    let request_ns = nanotime()
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let req = GOSSIP_DELTA_PREFIX + self_addr + " " + int_to_str(since_ns) + "\n"
+    if _gossip_send_all(fd, req) == 0 { close_fd(fd); return -1 }
+
+    let applied = 0
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_DELTA_END_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_ATOM_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // ATOM <kg> <id> <kind> <alpha> <beta> <label>
+                    if len(toks) >= 7 {
+                        let remote_id = str_to_int(toks[2])
+                        let kind = str_to_int(toks[3])
+                        let alpha = str_to_int(toks[4])
+                        let beta = str_to_int(toks[5])
+                        // label may contain spaces; rejoin trailing toks.
+                        let label = toks[6]
+                        let li = 7
+                        while li < len(toks) {
+                            label = label + " " + toks[li]
+                            li = li + 1
+                        }
+                        sync_apply_atom(kg, remote_id, kind, alpha, beta, label)
+                        applied = applied + 1
+                    }
+                }
+            }
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    gossip_set_last_synced(state, addr, request_ns)
+    state[GOSSIP_S_STATS_DELTAS] = state[GOSSIP_S_STATS_DELTAS] + 1
+    return applied
+}
+
+// ---- step function --------------------------------------------------------
+//
+// One tick of the gossip protocol. Caller drives at whatever cadence is
+// appropriate (1Hz works for the integration scenario).
+//
+//   - bumps tick counter
+//   - if (now - last_ping_ns) >= ping_interval, picks a peer and pings
+//   - if (now - last_delta_ns) >= delta_interval and there is an alive
+//     peer, requests a delta from a random alive peer
+//
+// This does NOT accept inbound connections -- the daemon owns the
+// listen fd and calls gossip_handle_conn_kg() per accepted conn. The
+// step function is the OUTBOUND clock.
+
+fn gossip_step(state, kg) {
+    state[GOSSIP_S_TICK] = state[GOSSIP_S_TICK] + 1
+    let now = nanotime()
+    let ping_due = 0
+    let delta_due = 0
+    if now - state[GOSSIP_S_LAST_PING_NS] >= state[GOSSIP_S_PING_INTERVAL_NS] {
+        ping_due = 1
+    }
+    if now - state[GOSSIP_S_LAST_DELTA_NS] >= state[GOSSIP_S_DELTA_INTERVAL_NS] {
+        delta_due = 1
+    }
+    if ping_due == 1 {
+        let target = gossip_pick_random_peer(state)
+        if target != 0 {
+            gossip_send_ping(state, target)
+        }
+        // Also run a suspicion sweep over peers we haven't seen in a while.
+        _gossip_suspicion_sweep(state, now)
+        state[GOSSIP_S_LAST_PING_NS] = now
+    }
+    if delta_due == 1 {
+        let target2 = gossip_pick_random_peer(state)
+        if target2 != 0 {
+            if kg != 0 { gossip_send_delta_request(state, target2, kg) }
+        }
+        state[GOSSIP_S_LAST_DELTA_NS] = now
+    }
+    return state
+}
+
+// Peers whose last_seen is older than 3 * ping_interval and have not
+// already been pinged in this tick are auto-incremented in suspicion.
+// This catches peers that the random pinger has been failing to select.
+fn _gossip_suspicion_sweep(state, now) {
+    let peers = state[GOSSIP_S_PEERS]
+    let stale_threshold = state[GOSSIP_S_PING_INTERVAL_NS] * GOSSIP_SUSPICION_DEAD
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        if p[GOSSIP_PE_STATUS] != GOSSIP_STATUS_DEAD {
+            let age = now - p[GOSSIP_PE_LAST_SEEN]
+            if age > stale_threshold {
+                let s = p[GOSSIP_PE_SUSPICION] + 1
+                p[GOSSIP_PE_SUSPICION] = s
+                if s >= GOSSIP_SUSPICION_DEAD {
+                    p[GOSSIP_PE_STATUS] = GOSSIP_STATUS_DEAD
+                } else {
+                    if s >= 2 { p[GOSSIP_PE_STATUS] = GOSSIP_STATUS_SUSPECT }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return state
+}
+
+// ---- env helpers + chat-side conveniences --------------------------------
+
+fn gossip_self_addr_from_env() {
+    let env = getenv("CE_GOSSIP_SELF")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    return "127.0.0.1:8770"
+}
+
+fn gossip_bootstrap_from_env() {
+    let env = getenv("CE_GOSSIP_PEERS")
+    if env == 0 { return list_new() }
+    if len(env) == 0 { return list_new() }
+    let out = list_new()
+    let i = 0
+    let start = 0
+    while i < len(env) {
+        if char_at(env, i) == 44 {
+            if i > start { push(out, substr(env, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(env, start, i - start)) }
+    return out
+}
+
+// One-liner status line for /gossip status in the chat.
+fn gossip_status_line(state) {
+    let peers = state[GOSSIP_S_PEERS]
+    let alive = 0
+    let suspect = 0
+    let dead = 0
+    let i = 0
+    while i < len(peers) {
+        let s = peers[i][GOSSIP_PE_STATUS]
+        if s == GOSSIP_STATUS_ALIVE { alive = alive + 1 }
+        if s == GOSSIP_STATUS_SUSPECT { suspect = suspect + 1 }
+        if s == GOSSIP_STATUS_DEAD { dead = dead + 1 }
+        i = i + 1
+    }
+    return "gossip: self=" + state[GOSSIP_S_SELF_ADDR]
+        + " peers=" + int_to_str(len(peers))
+        + " alive=" + int_to_str(alive)
+        + " suspect=" + int_to_str(suspect)
+        + " dead=" + int_to_str(dead)
+        + " pings=" + int_to_str(state[GOSSIP_S_STATS_PINGS])
+        + " acks=" + int_to_str(state[GOSSIP_S_STATS_ACKS])
+        + " timeouts=" + int_to_str(state[GOSSIP_S_STATS_TIMEOUTS])
+        + " deltas=" + int_to_str(state[GOSSIP_S_STATS_DELTAS])
+}
+
+// ============================================================================
+// R20F -- gossip-relayed signed snapshot attestation hooks.
+// ============================================================================
+//
+// Both hooks are no-ops until the daemon calls gossip_set_att_store /
+// gossip_register_att_pubkey at bootstrap. A soul that has not opted
+// into R20F sees ATTESTATION lines arrive over the wire (per the
+// parser branches in gossip_handle_conn / gossip_handle_conn_kg) but
+// drops them without exposing a state-mutation path.
+
+// Wire the per-peer attestation store into a gossip state. The store
+// is created via att_store_new() (snapshot_attestation.nova). Idempotent
+// -- re-setting overwrites.
+fn gossip_set_att_store(state, store) {
+    state[GOSSIP_S_ATT_STORE] = store
+    return state
+}
+
+fn gossip_att_store(state) {
+    return state[GOSSIP_S_ATT_STORE]
+}
+
+// Register a peer's Ed25519 long-term pubkey under its numeric soul_id.
+// Bootstrap process is operator-driven (same shape leader_election uses
+// for peer IDs -- typically the pubkey is the R7C Noise XK static
+// pubkey and the soul_id is its hash). Idempotent on the soul_id.
+fn gossip_register_att_pubkey(state, peer_id, pk_bytes) {
+    let table = state[GOSSIP_S_ATT_PUBKEYS]
+    if table == 0 {
+        table = list_new()
+        state[GOSSIP_S_ATT_PUBKEYS] = table
+    }
+    let i = 0
+    while i < len(table) {
+        if table[i][0] == peer_id {
+            table[i][1] = pk_bytes
+            return state
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_id)
+    push(rec, pk_bytes)
+    push(table, rec)
+    return state
+}
+
+fn gossip_lookup_att_pubkey(state, peer_id) {
+    let table = state[GOSSIP_S_ATT_PUBKEYS]
+    if table == 0 { return 0 }
+    let i = 0
+    while i < len(table) {
+        if table[i][0] == peer_id { return table[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Stats accessors -- integration scenarios read these to verify the
+// inbound side ran.
+fn gossip_stats_att_rx(state)  { return state[GOSSIP_S_STATS_ATT_RX] }
+fn gossip_stats_att_bad(state) { return state[GOSSIP_S_STATS_ATT_BAD] }
+
+// Receive a single ATTESTATION line. Parses, looks up the originator's
+// pubkey, verifies, appends to store. Returns 1 on stored, 0 on any
+// failure. Bumps the gossip stats counters either way.
+fn _gossip_serve_attestation(state, line) {
+    let att = att_parse_wire(line)
+    if att == 0 {
+        state[GOSSIP_S_STATS_ATT_BAD] = state[GOSSIP_S_STATS_ATT_BAD] + 1
+        return 0
+    }
+    let store = state[GOSSIP_S_ATT_STORE]
+    if store == 0 {
+        // No store configured -- drop silently (don't bump bad-counter:
+        // that counter is reserved for tamper / unknown-peer rejection).
+        return 0
+    }
+    let pk = gossip_lookup_att_pubkey(state, att_soul_id(att))
+    if pk == 0 {
+        state[GOSSIP_S_STATS_ATT_BAD] = state[GOSSIP_S_STATS_ATT_BAD] + 1
+        return 0
+    }
+    if att_verify(att, pk) == 0 {
+        state[GOSSIP_S_STATS_ATT_BAD] = state[GOSSIP_S_STATS_ATT_BAD] + 1
+        return 0
+    }
+    att_store_add(store, att)
+    state[GOSSIP_S_STATS_ATT_RX] = state[GOSSIP_S_STATS_ATT_RX] + 1
+    return 1
+}
+
+// Client-side helper: send a single ATTESTATION line to a peer over
+// a short-lived TCP connection. Returns 1 on a clean send, 0 on any
+// failure. Used by the daemon hooked into the snapshot save path and
+// by the integration scenario fixture.
+fn gossip_send_attestation(state, addr, att) {
+    if att == 0 { return 0 }
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    let wire = att_to_wire(att) + "\n"
+    if _gossip_send_all(fd, wire) == 0 { close_fd(fd); return 0 }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// Broadcast an attestation to every alive peer. Returns count of
+// successful deliveries (best-effort).
+fn gossip_broadcast_attestation(state, att) {
+    let alive = gossip_alive_peers(state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if gossip_send_attestation(state, alive[i], att) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// ============================================================================
+// R21B -- distributed-rule inference gossip hooks.
+// ============================================================================
+//
+// All three handlers are no-ops until distributed_rules.nova calls
+// gossip_set_dr_state to wire in a dr_state record. The state object
+// carries the rule engine + provenance log + inbound message queues at
+// pinned slots GOSSIP_DR_INBOUND_RULES (3) and GOSSIP_DR_INBOUND_DERIVS
+// (4) so the gossip handler can push without an import cycle. Inbound
+// RULE / DERIVATION / DRFETCH lines arrive via the parser branches in
+// gossip_handle_conn_kg.
+
+fn gossip_set_dr_state(state, dr_state) {
+    state[GOSSIP_S_DR_STATE] = dr_state
+    return state
+}
+
+fn gossip_dr_state(state) { return state[GOSSIP_S_DR_STATE] }
+
+fn gossip_stats_dr_rules_rx(state)   { return state[GOSSIP_S_STATS_DR_RULES_RX] }
+fn gossip_stats_dr_derivs_rx(state)  { return state[GOSSIP_S_STATS_DR_DERIVS_RX] }
+fn gossip_stats_dr_fetches_rx(state) { return state[GOSSIP_S_STATS_DR_FETCHES_RX] }
+
+// --- DR helpers: tiny self-contained label parser ------------------------
+//
+// The rule engine canonicalises facts as "pred|arg1|arg2" RELATION atoms
+// (RULE_FACT_SEPARATOR = "|"). We mirror that here without importing the
+// rule_inference module (to avoid cycles): scan label, split on the pipe
+// character (ASCII 124), accept only the 3-part shape.
+
+fn _gossip_dr_split_label(label) {
+    let parts = list_new()
+    let n = len(label)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(label, i) == 124 {
+            push(parts, substr(label, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(parts, substr(label, start, n - start))
+    return parts
+}
+
+// Receive a RULE line. Format: `RULE <rule_string>` (trailing newline
+// stripped by the recv-line helper). Enqueues the raw rule string
+// onto the dr_state's inbound-rule queue; distributed_rules.nova drains
+// the queue in dr_run_round (passive ingestion -- no callback cycle).
+// Returns 1 on enqueued, 0 on drop.
+fn _gossip_serve_rule(state, line) {
+    let dr = state[GOSSIP_S_DR_STATE]
+    if dr == 0 { return 0 }
+    if _gossip_starts_with(line, GOSSIP_RULE_PREFIX) == 0 { return 0 }
+    let rest = substr(line, len(GOSSIP_RULE_PREFIX), len(line) - len(GOSSIP_RULE_PREFIX))
+    if len(rest) == 0 { return 0 }
+    let q = dr[GOSSIP_DR_INBOUND_RULES]
+    if q == 0 { return 0 }
+    push(q, rest)
+    state[GOSSIP_S_STATS_DR_RULES_RX] = state[GOSSIP_S_STATS_DR_RULES_RX] + 1
+    return 1
+}
+
+// Receive a DERIVATION line. Format:
+//   `DERIVATION <rule_idx> <pred> <arg1> <arg2> <origin_addr> <contrib1>[,<contrib2>...]`
+// Enqueues the parsed tuple onto the dr_state's inbound-derivation
+// queue; distributed_rules.nova drains the queue in dr_run_round, where
+// it caches the fact into the KG (dedupe via kg_find_atom) and updates
+// the per-atom provenance log with the contributing peers.
+fn _gossip_serve_derivation(state, kg, line) {
+    let dr = state[GOSSIP_S_DR_STATE]
+    if dr == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 7 { return 0 }
+    // toks: DERIVATION, rule_idx, pred, arg1, arg2, origin_addr, contrib_csv
+    let rule_idx_s = toks[1]
+    let pred = toks[2]
+    let arg1 = toks[3]
+    let arg2 = toks[4]
+    let origin_addr = toks[5]
+    let contrib_csv = toks[6]
+    let rule_idx = 0
+    if _gossip_is_digits(rule_idx_s) == 1 { rule_idx = str_to_int(rule_idx_s) }
+    let q = dr[GOSSIP_DR_INBOUND_DERIVS]
+    if q == 0 { return 0 }
+    let rec = list_new()
+    push(rec, rule_idx)
+    push(rec, pred)
+    push(rec, arg1)
+    push(rec, arg2)
+    push(rec, origin_addr)
+    push(rec, contrib_csv)
+    push(q, rec)
+    state[GOSSIP_S_STATS_DR_DERIVS_RX] = state[GOSSIP_S_STATS_DR_DERIVS_RX] + 1
+    return 1
+}
+
+// Receive a DRFETCH request. Format: `DRFETCH <pred>`. Stream every
+// RELATION atom in the local KG whose canonical "pred|arg1|arg2" label
+// matches the requested pred, as DRFACT lines tagged with our self_addr;
+// terminate with DREND.
+fn _gossip_serve_drfetch(conn_fd, state, kg, line) {
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 2 { return 0 }
+    let pred = toks[1]
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    state[GOSSIP_S_STATS_DR_FETCHES_RX] = state[GOSSIP_S_STATS_DR_FETCHES_RX] + 1
+    if kg == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_DREND_LINE + "\n")
+        return 0
+    }
+    let atoms = kg_atoms(kg)
+    let i = 0
+    let sent = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_RELATION {
+                let label = atom_label(a)
+                let parts = _gossip_dr_split_label(label)
+                if len(parts) == 3 {
+                    if str_eq(parts[0], pred) == 1 {
+                        let fact_line = GOSSIP_DRFACT_PREFIX + self_addr
+                            + " " + pred
+                            + " " + parts[1]
+                            + " " + parts[2]
+                            + " " + int_to_str(atom_id(a)) + "\n"
+                        if _gossip_send_all(conn_fd, fact_line) == 0 {
+                            i = len(atoms)
+                        } else {
+                            sent = sent + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    _gossip_send_all(conn_fd, GOSSIP_DREND_LINE + "\n")
+    return sent
+}
+
+// Client-side: broadcast a RULE line to every alive peer.
+fn gossip_broadcast_rule(state, rule_string) {
+    let alive = gossip_alive_peers(state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if _gossip_dr_send_line(state, alive[i], GOSSIP_RULE_PREFIX + rule_string) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// Client-side: broadcast a DERIVATION line to every alive peer.
+// contrib_csv is the comma-joined list of contributing peer addrs (the
+// peers whose KGs supplied the premise atoms for this derivation). The
+// originator's own self_addr is included if any premise came from a
+// local fact.
+fn gossip_broadcast_derivation(state, rule_idx, pred, arg1, arg2, contrib_csv) {
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let line = GOSSIP_DERIVATION_PREFIX + int_to_str(rule_idx)
+        + " " + pred + " " + arg1 + " " + arg2
+        + " " + self_addr + " " + contrib_csv
+    let alive = gossip_alive_peers(state)
+    let i = 0
+    let ok = 0
+    while i < len(alive) {
+        if _gossip_dr_send_line(state, alive[i], line) == 1 {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// Client-side: fetch every relation fact for `pred` from one peer.
+// Returns a list of [peer_addr, pred, arg1, arg2, remote_atom_id]
+// records (zero-length if the peer is unreachable / has no facts).
+fn gossip_dr_fetch_from(state, peer_addr, pred) {
+    let out = list_new()
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return out }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return out
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return out }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return out }
+    if _gossip_send_all(fd, GOSSIP_DRFETCH_PREFIX + pred + "\n") == 0 {
+        close_fd(fd); return out
+    }
+    let running = 1
+    while running == 1 {
+        let line = _gossip_recv_line(fd)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_DREND_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_DRFACT_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    // DRFACT peer_addr pred arg1 arg2 atom_id
+                    if len(toks) >= 6 {
+                        let rec = list_new()
+                        push(rec, toks[1])     // peer_addr
+                        push(rec, toks[2])     // pred
+                        push(rec, toks[3])     // arg1
+                        push(rec, toks[4])     // arg2
+                        let aid = 0
+                        if _gossip_is_digits(toks[5]) == 1 { aid = str_to_int(toks[5]) }
+                        push(rec, aid)
+                        push(out, rec)
+                    }
+                }
+            }
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return out
+}
+
+// Helper: open a short-lived TCP connection to peer_addr, send one
+// line, expect graceful close. Used for RULE + DERIVATION broadcasts.
+fn _gossip_dr_send_line(state, peer_addr, line) {
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return 0 }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    if _gossip_send_all(fd, line + "\n") == 0 { close_fd(fd); return 0 }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// ============================================================================
+// R21E -- Noise-protected gossip plumbing.
+// ============================================================================
+//
+// Wire negotiation:
+//   * Dialer that knows the peer's static pubkey AND has its own
+//     keypair sends `HELLO ce-gossip v2 noise` as the first line.
+//     Responder accepts iff it has its own keypair; runs the
+//     three-message Noise XK handshake; replies `OK v2 noise`. Any
+//     line subsequent to OK is sealed under the post-Split transport
+//     keys.
+//   * Dialer without registered peer pubkey OR strict-mode peer that
+//     receives a non-noise hello falls back per the strict/lenient
+//     policy below.
+//
+//   Strict mode (CE_GOSSIP_REQUIRE_NOISE=1):
+//     - Responder: any non-noise hello -> ERR noise-required + close.
+//     - Dialer: peer without registered pubkey -> abort dial (returns
+//       0; gossip_send_ping treats as a soft timeout).
+//
+//   Lenient mode (default):
+//     - Responder accepts v1 plaintext or v2 noise hellos.
+//     - Dialer falls through to plaintext when peer pubkey unknown.
+
+// --- own keypair registration ---------------------------------------------
+
+fn gossip_set_noise_keys(state, my_priv, my_pub) {
+    state[GOSSIP_S_NOISE_PRIV] = my_priv
+    state[GOSSIP_S_NOISE_PUB] = my_pub
+    return state
+}
+
+fn gossip_noise_is_configured(state) {
+    let priv = state[GOSSIP_S_NOISE_PRIV]
+    if priv == 0 { return 0 }
+    if len(priv) != NXK_DH_HEX_LEN { return 0 }
+    return 1
+}
+
+fn gossip_noise_my_pubkey(state) {
+    return state[GOSSIP_S_NOISE_PUB]
+}
+
+// --- per-peer pubkey registry ---------------------------------------------
+
+fn gossip_register_peer_pubkey(state, peer_addr, pubkey_hex) {
+    let table = state[GOSSIP_S_NOISE_PEERS]
+    if table == 0 {
+        table = list_new()
+        state[GOSSIP_S_NOISE_PEERS] = table
+    }
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][0], peer_addr) == 1 {
+            table[i][1] = pubkey_hex
+            return state
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, peer_addr)
+    push(rec, pubkey_hex)
+    push(table, rec)
+    return state
+}
+
+fn gossip_noise_lookup_peer_pubkey(state, peer_addr) {
+    let table = state[GOSSIP_S_NOISE_PEERS]
+    if table == 0 { return 0 }
+    let i = 0
+    while i < len(table) {
+        if str_eq(table[i][0], peer_addr) == 1 { return table[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn gossip_noise_peer_count(state) {
+    let table = state[GOSSIP_S_NOISE_PEERS]
+    if table == 0 { return 0 }
+    return len(table)
+}
+
+// --- strict-mode controls -------------------------------------------------
+
+fn gossip_noise_set_strict(state, strict) {
+    state[GOSSIP_S_NOISE_STRICT] = strict
+    return state
+}
+
+fn gossip_noise_strict_mode(state) {
+    return state[GOSSIP_S_NOISE_STRICT]
+}
+
+fn gossip_noise_strict_from_env(state) {
+    let env = getenv("CE_GOSSIP_REQUIRE_NOISE")
+    if env == 0 { return state }
+    if len(env) == 0 { return state }
+    if str_eq(env, "1") == 1 {
+        state[GOSSIP_S_NOISE_STRICT] = 1
+    }
+    return state
+}
+
+// --- stats accessors ------------------------------------------------------
+
+fn gossip_stats_noise_hs(state)       { return state[GOSSIP_S_STATS_NOISE_HS] }
+fn gossip_stats_noise_hs_fail(state)  { return state[GOSSIP_S_STATS_NOISE_HS_FAIL] }
+fn gossip_stats_noise_refused(state)  { return state[GOSSIP_S_STATS_NOISE_REFUSED] }
+
+// --- handshake message framing -------------------------------------------
+
+fn _gnoise_raw_send(fd, buf, n) {
+    let sent = 0
+    while sent < n {
+        let r = send_data(fd, buf + sent, n - sent)
+        if r <= 0 { return 0 }
+        sent = sent + r
+    }
+    return 1
+}
+
+fn _gnoise_send_framed(fd, buf, n) {
+    let hdr = alloc(5)
+    store8(hdr + 0, int_and(int_shr(n, 24), 255))
+    store8(hdr + 1, int_and(int_shr(n, 16), 255))
+    store8(hdr + 2, int_and(int_shr(n, 8), 255))
+    store8(hdr + 3, int_and(n, 255))
+    store8(hdr + 4, 0)
+    if _gnoise_raw_send(fd, hdr, 4) == 0 { return 0 }
+    return _gnoise_raw_send(fd, buf, n)
+}
+
+fn _gnoise_recv_exact(fd, n) {
+    if n <= 0 { return 0 }
+    let buf = alloc(n + 1)
+    let got = 0
+    while got < n {
+        let r = recv_data(fd, buf + got, n - got)
+        if r <= 0 { return 0 }
+        got = got + r
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+fn _gnoise_recv_framed(fd) {
+    let hdr = _gnoise_recv_exact(fd, 4)
+    if hdr == 0 { return 0 }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let b2 = load8(hdr[0] + 2)
+    let b3 = load8(hdr[0] + 3)
+    let body_n = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                int_shl(b2, 8)), b3)
+    if body_n <= 0 { return 0 }
+    if body_n > NXK_FRAME_MAX { return 0 }
+    return _gnoise_recv_exact(fd, body_n)
+}
+
+// --- handshake drivers ----------------------------------------------------
+
+fn _gnoise_handshake_initiator(fd, my_priv, peer_pub) {
+    let st = nxk_initiator_new(my_priv, peer_pub)
+    if st == 0 { return 0 }
+    let m1 = nxk_msg1_send(st)
+    if m1 == 0 { return 0 }
+    if _gnoise_send_framed(fd, m1[0], m1[1]) == 0 { return 0 }
+    let m2 = _gnoise_recv_framed(fd)
+    if m2 == 0 { return 0 }
+    if nxk_msg2_recv(st, m2[0], m2[1]) == 0 { return 0 }
+    let m3 = nxk_msg3_send(st)
+    if m3 == 0 { return 0 }
+    if _gnoise_send_framed(fd, m3[0], m3[1]) == 0 { return 0 }
+    if nxk_split(st) == 0 { return 0 }
+    return st
+}
+
+fn _gnoise_handshake_responder(fd, my_priv) {
+    let st = nxk_responder_new(my_priv)
+    if st == 0 { return 0 }
+    let m1 = _gnoise_recv_framed(fd)
+    if m1 == 0 { return 0 }
+    if nxk_msg1_recv(st, m1[0], m1[1]) == 0 { return 0 }
+    let m2 = nxk_msg2_send(st)
+    if m2 == 0 { return 0 }
+    if _gnoise_send_framed(fd, m2[0], m2[1]) == 0 { return 0 }
+    let m3 = _gnoise_recv_framed(fd)
+    if m3 == 0 { return 0 }
+    if nxk_msg3_recv(st, m3[0], m3[1]) == 0 { return 0 }
+    if nxk_split(st) == 0 { return 0 }
+    return st
+}
+
+// --- gossip-connection abstraction ----------------------------------------
+
+let _GCONN_FD       = 0
+let _GCONN_NXK      = 1
+let _GCONN_ROLE     = 2
+let _GCONN_PEERPK   = 3
+
+fn _gconn_plain(fd) {
+    let g = list_new()
+    push(g, fd)
+    push(g, 0)
+    push(g, 0)
+    push(g, 0)
+    return g
+}
+
+fn _gconn_noise(fd, nxk_state, role, peer_pub_hex) {
+    let g = list_new()
+    push(g, fd)
+    push(g, nxk_state)
+    push(g, role)
+    push(g, peer_pub_hex)
+    return g
+}
+
+fn _gconn_fd(g)    { return g[_GCONN_FD] }
+fn _gconn_is_noise(g) {
+    if g[_GCONN_NXK] == 0 { return 0 }
+    return 1
+}
+fn _gconn_peer_pub(g) { return g[_GCONN_PEERPK] }
+
+fn _gconn_send_line(g, line) {
+    let s = line
+    let n = len(s)
+    if n == 0 { return 0 }
+    if char_at(s, n - 1) != 10 { s = s + "\n"; n = n + 1 }
+    if _gconn_is_noise(g) == 0 {
+        return _gossip_send_all(g[_GCONN_FD], s)
+    }
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let sealed = nxk_seal(g[_GCONN_NXK], g[_GCONN_ROLE], buf, n)
+    if sealed == 0 { return 0 }
+    return _gnoise_raw_send(g[_GCONN_FD], sealed[0], sealed[1])
+}
+
+fn _gconn_recv_line(g) {
+    if _gconn_is_noise(g) == 0 {
+        return _gossip_recv_line(g[_GCONN_FD])
+    }
+    let fd = g[_GCONN_FD]
+    let hdr = _gnoise_recv_exact(fd, 4)
+    if hdr == 0 { return 0 }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let b2 = load8(hdr[0] + 2)
+    let b3 = load8(hdr[0] + 3)
+    let body_n = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                int_shl(b2, 8)), b3)
+    if body_n <= 0 { return 0 }
+    if body_n > NXK_FRAME_MAX { return 0 }
+    let body = _gnoise_recv_exact(fd, body_n)
+    if body == 0 { return 0 }
+    let frame_n = 4 + body_n
+    let frame = alloc(frame_n + 1)
+    let i = 0
+    while i < 4 {
+        store8(frame + i, load8(hdr[0] + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < body_n {
+        store8(frame + 4 + j, load8(body[0] + j))
+        j = j + 1
+    }
+    store8(frame + frame_n, 0)
+    let opened = nxk_open(g[_GCONN_NXK], g[_GCONN_ROLE], frame, frame_n)
+    if opened == 0 { return 0 }
+    let pt_n = opened[1]
+    let s = ""
+    let k = 0
+    while k < pt_n {
+        let c = load8(opened[0] + k)
+        if c == 0 { k = pt_n }
+        else {
+            if c == 10 { k = pt_n }
+            else {
+                s = s + chr(c)
+                k = k + 1
+            }
+        }
+    }
+    return s
+}
+
+// --- dial + accept negotiation -------------------------------------------
+
+fn _gossip_dial_gconn(state, addr) {
+    let peer_pub = gossip_noise_lookup_peer_pubkey(state, addr)
+    let want_noise = 0
+    if peer_pub != 0 {
+        if gossip_noise_is_configured(state) == 1 { want_noise = 1 }
+    }
+    let strict = state[GOSSIP_S_NOISE_STRICT]
+    if strict == 1 {
+        if want_noise == 0 {
+            state[GOSSIP_S_STATS_NOISE_REFUSED] = state[GOSSIP_S_STATS_NOISE_REFUSED] + 1
+            return 0
+        }
+    }
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    if want_noise == 1 {
+        _gossip_set_rcvtimeo_ms(fd, GOSSIP_NOISE_HANDSHAKE_TIMEOUT_MS)
+        if _gossip_send_all(fd, GOSSIP_HELLO_NOISE_LINE + "\n") == 0 {
+            close_fd(fd); return 0
+        }
+        let reply = _gossip_recv_line(fd)
+        if reply == 0 { close_fd(fd); return 0 }
+        if str_eq(reply, GOSSIP_OK_NOISE_LINE) == 0 {
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(fd)
+            return 0
+        }
+        let nxk_state = _gnoise_handshake_initiator(fd,
+            state[GOSSIP_S_NOISE_PRIV], peer_pub)
+        if nxk_state == 0 {
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(fd)
+            return 0
+        }
+        state[GOSSIP_S_STATS_NOISE_HS] = state[GOSSIP_S_STATS_NOISE_HS] + 1
+        return _gconn_noise(fd, nxk_state, NXK_ROLE_INITIATOR, peer_pub)
+    }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 {
+        close_fd(fd); return 0
+    }
+    return _gconn_plain(fd)
+}
+
+fn _gossip_accept_gconn(state, conn_fd) {
+    let hello = _gossip_recv_line(conn_fd)
+    if hello == 0 { close_fd(conn_fd); return 0 }
+    let strict = state[GOSSIP_S_NOISE_STRICT]
+    if str_eq(hello, GOSSIP_HELLO_NOISE_LINE) == 1 {
+        if gossip_noise_is_configured(state) == 0 {
+            _gossip_send_all(conn_fd, GOSSIP_ERR_NOISE_REQ + "\n")
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(conn_fd)
+            return 0
+        }
+        _gossip_set_rcvtimeo_ms(conn_fd, GOSSIP_NOISE_HANDSHAKE_TIMEOUT_MS)
+        if _gossip_send_all(conn_fd, GOSSIP_OK_NOISE_LINE + "\n") == 0 {
+            close_fd(conn_fd); return 0
+        }
+        let nxk_state = _gnoise_handshake_responder(conn_fd,
+            state[GOSSIP_S_NOISE_PRIV])
+        if nxk_state == 0 {
+            state[GOSSIP_S_STATS_NOISE_HS_FAIL] = state[GOSSIP_S_STATS_NOISE_HS_FAIL] + 1
+            close_fd(conn_fd)
+            return 0
+        }
+        let peer_pub = nxk_peer_static_pub(nxk_state)
+        state[GOSSIP_S_STATS_NOISE_HS] = state[GOSSIP_S_STATS_NOISE_HS] + 1
+        return _gconn_noise(conn_fd, nxk_state, NXK_ROLE_RESPONDER, peer_pub)
+    }
+    if str_eq(hello, GOSSIP_HELLO_LINE) == 1 {
+        if strict == 1 {
+            _gossip_send_all(conn_fd, GOSSIP_ERR_NOISE_REQ + "\n")
+            state[GOSSIP_S_STATS_NOISE_REFUSED] = state[GOSSIP_S_STATS_NOISE_REFUSED] + 1
+            close_fd(conn_fd)
+            return 0
+        }
+        if _gossip_send_all(conn_fd, GOSSIP_OK_LINE + "\n") == 0 {
+            close_fd(conn_fd); return 0
+        }
+        return _gconn_plain(conn_fd)
+    }
+    _gossip_send_all(conn_fd, GOSSIP_ERR_UNKNOWN + "\n")
+    close_fd(conn_fd)
+    return 0
+}
+
+// --- noise-protected PING / ACK / MEMBER round-trip ----------------------
+
+fn gossip_send_ping_gconn(state, addr) {
+    state[GOSSIP_S_STATS_PINGS] = state[GOSSIP_S_STATS_PINGS] + 1
+    let gconn = _gossip_dial_gconn(state, addr)
+    if gconn == 0 {
+        gossip_on_timeout(state, addr)
+        return 0
+    }
+    let fd = _gconn_fd(gconn)
+    let seq = state[GOSSIP_S_PING_SEQ] + 1
+    state[GOSSIP_S_PING_SEQ] = seq
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    let ping_line = GOSSIP_PING_PREFIX + int_to_str(seq) + " " + self_addr
+    if _gconn_send_line(gconn, ping_line) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let ack = _gconn_recv_line(gconn)
+    if ack == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_starts_with(ack, GOSSIP_ACK_PREFIX) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let toks = _gossip_split_spaces(ack)
+    if len(toks) < 2 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    if _gossip_is_digits(toks[1]) == 0 {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    let recv_seq = str_to_int(toks[1])
+    if recv_seq != seq {
+        close_fd(fd); gossip_on_timeout(state, addr); return 0
+    }
+    gossip_on_ack(state, addr)
+    let pb = gossip_pick_piggyback(state, GOSSIP_MAX_MEMBER_PIGGYBACK, addr)
+    let i = 0
+    while i < len(pb) {
+        let mb_addr = pb[i]
+        let mb_idx = gossip_find_peer(state, mb_addr)
+        let mb_status = GOSSIP_STATUS_ALIVE
+        if mb_idx >= 0 {
+            mb_status = state[GOSSIP_S_PEERS][mb_idx][GOSSIP_PE_STATUS]
+        }
+        let line = GOSSIP_MEMBER_PREFIX + mb_addr + " " + int_to_str(mb_status)
+        if _gconn_send_line(gconn, line) == 0 {
+            i = len(pb)
+        } else {
+            i = i + 1
+        }
+    }
+    _gconn_send_line(gconn, GOSSIP_BYE_LINE)
+    close_fd(fd)
+    return 1
+}
+
+// --- noise-aware inbound handler -----------------------------------------
+
+fn gossip_handle_conn_kg_gconn(state, conn_fd, kg) {
+    let gconn = _gossip_accept_gconn(state, conn_fd)
+    if gconn == 0 { return state }
+    let running = 1
+    while running == 1 {
+        let line = _gconn_recv_line(gconn)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        _gconn_send_line(gconn, GOSSIP_ACK_PREFIX + seq)
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            let dtoks = _gossip_split_spaces(line)
+                            if len(dtoks) >= 3 {
+                                let since_s = dtoks[2]
+                                let since_ns = 0
+                                if _gossip_is_digits(since_s) == 1 {
+                                    since_ns = str_to_int(since_s)
+                                }
+                                _gossip_stream_atoms_since(_gconn_fd(gconn), kg, since_ns)
+                            }
+                            _gconn_send_line(gconn, GOSSIP_DELTA_END_LINE)
+                        } else {
+                            if _gossip_starts_with(line, GOSSIP_DQUERY_PREFIX) == 1 {
+                                _gossip_serve_dquery(_gconn_fd(gconn), state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                                _gossip_serve_attestation(state, line)
+                                // R23C: poke sr observe under the
+                                // noise-wrapped wire too.
+                                let _sr_n = state[GOSSIP_S_SR_STATE]
+                                if _sr_n != 0 {
+                                    let _att_n = att_parse_wire(line)
+                                    if _att_n != 0 {
+                                        let _pk_n = gossip_lookup_att_pubkey(state, att_soul_id(_att_n))
+                                        if _pk_n != 0 {
+                                            if att_verify(_att_n, _pk_n) == 1 {
+                                                sr_observe_attestation(_sr_n, _att_n)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // R23C: SNAP_FETCH parser under noise wire.
+                            if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                                _gossip_serve_snap_fetch(_gconn_fd(gconn), state, line)
+                            }
+                            // R23E: EXTADDR parser under noise wire.
+                            if _gossip_starts_with(line, GOSSIP_EXTADDR_PREFIX) == 1 {
+                                _gossip_serve_extaddr(state, line)
+                            }
+                            // R26E: RELAY_* parsers under noise wire.
+                            if _gossip_starts_with(line, GOSSIP_RELAY_REQ_PREFIX) == 1 {
+                                _gossip_serve_relay_req(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_DATA_PREFIX) == 1 {
+                                _gossip_serve_relay_data(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
+                                _gossip_serve_relay_ack(state, line)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_fd(_gconn_fd(gconn))
+    return state
+}
+
+// ============================================================================
+// R23E -- NAT traversal hooks.
+// ============================================================================
+//
+// The companion module src/federation/nat_traversal.nova owns the
+// nat_state record + the parse helper. Here we ship the gossip slots,
+// the wire-line parser branch, and the registration setter. A soul
+// that has not opted into R23E sees EXTADDR lines arrive but drops
+// them silently (counter unchanged); turning on R23E is a single
+// gossip_set_nat_state call at boot.
+
+fn gossip_set_nat_state(state, nat_state) {
+    state[GOSSIP_S_NAT_STATE] = nat_state
+    return state
+}
+
+fn gossip_nat_state(state) { return state[GOSSIP_S_NAT_STATE] }
+fn gossip_stats_nat_extaddr_rx(state)  { return state[GOSSIP_S_STATS_NAT_EXTADDR_RX] }
+fn gossip_stats_nat_extaddr_bad(state) { return state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] }
+
+// Validate "host:port" shape inline.
+fn _gossip_nat_validate_addr(addr) {
+    if len(addr) == 0 { return 0 }
+    let i = 0
+    let colon_at = -1
+    while i < len(addr) {
+        if char_at(addr, i) == 58 {
+            colon_at = i
+            i = len(addr)
+        } else { i = i + 1 }
+    }
+    if colon_at < 0 { return 0 }
+    if colon_at == 0 { return 0 }
+    let port_s = substr(addr, colon_at + 1, len(addr) - colon_at - 1)
+    if len(port_s) == 0 { return 0 }
+    return _gossip_is_digits(port_s)
+}
+
+// Parse + record an inbound EXTADDR line via the pinned slot indices.
+// Inlined here to keep the gossip <-> nat_traversal import graph
+// acyclic (nat_traversal imports gossip, gossip does NOT import
+// nat_traversal).
+fn _gossip_serve_extaddr(state, line) {
+    let nat_state = state[GOSSIP_S_NAT_STATE]
+    if nat_state == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 3 {
+        state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] = state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] + 1
+        return 0
+    }
+    let internal = toks[1]
+    let external = toks[2]
+    if _gossip_nat_validate_addr(internal) == 0 {
+        state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] = state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] + 1
+        return 0
+    }
+    if _gossip_nat_validate_addr(external) == 0 {
+        state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] = state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] + 1
+        return 0
+    }
+    if str_eq(internal, state[GOSSIP_S_SELF_ADDR]) == 1 {
+        state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] = state[GOSSIP_S_STATS_NAT_EXTADDR_BAD] + 1
+        return 0
+    }
+    let tbl = nat_state[GOSSIP_NAT_PEER_TABLE_SLOT]
+    if tbl == 0 { return 0 }
+    let i = 0
+    while i < len(tbl) {
+        if str_eq(tbl[i][0], internal) == 1 {
+            tbl[i][1] = external
+            nat_state[GOSSIP_NAT_INBOUND_AD_SLOT] = nat_state[GOSSIP_NAT_INBOUND_AD_SLOT] + 1
+            state[GOSSIP_S_STATS_NAT_EXTADDR_RX] = state[GOSSIP_S_STATS_NAT_EXTADDR_RX] + 1
+            return 1
+        }
+        i = i + 1
+    }
+    let rec = list_new()
+    push(rec, internal)
+    push(rec, external)
+    push(tbl, rec)
+    nat_state[GOSSIP_NAT_INBOUND_AD_SLOT] = nat_state[GOSSIP_NAT_INBOUND_AD_SLOT] + 1
+    state[GOSSIP_S_STATS_NAT_EXTADDR_RX] = state[GOSSIP_S_STATS_NAT_EXTADDR_RX] + 1
+    return 1
+}
+
+// --- chat status helper ---------------------------------------------------
+
+fn gossip_noise_status_line(state) {
+    let configured = "no"
+    if gossip_noise_is_configured(state) == 1 { configured = "yes" }
+    let strict = "lenient"
+    if state[GOSSIP_S_NOISE_STRICT] == 1 { strict = "strict" }
+    return "gossip_noise: configured=" + configured
+        + " peers=" + int_to_str(gossip_noise_peer_count(state))
+        + " mode=" + strict
+        + " hs_ok=" + int_to_str(state[GOSSIP_S_STATS_NOISE_HS])
+        + " hs_fail=" + int_to_str(state[GOSSIP_S_STATS_NOISE_HS_FAIL])
+        + " refused=" + int_to_str(state[GOSSIP_S_STATS_NOISE_REFUSED])
+}
+
+// ============================================================================
+// R23C -- snapshot replication hooks.
+// ============================================================================
+//
+// The companion module src/federation/snapshot_replication.nova owns
+// the sr_state record (known-roots table + replica table + stats),
+// the wire codec, and the verification logic. Here we ship the
+// gossip slots, the wire-line parser branches (SNAP_FETCH inbound +
+// SNAP_DATA stream collection), and the registration setter. A soul
+// that has not opted into R23C drops SNAP_* lines silently; turning
+// on R23C is a single gossip_set_sr_state call at boot.
+
+fn gossip_set_sr_state(state, sr_state) {
+    state[GOSSIP_S_SR_STATE] = sr_state
+    return state
+}
+
+fn gossip_sr_state(state) {
+    return state[GOSSIP_S_SR_STATE]
+}
+
+fn gossip_stats_sr_fetch_rx(state) { return state[GOSSIP_S_STATS_SR_FETCH_RX] }
+fn gossip_stats_sr_data_rx(state)  { return state[GOSSIP_S_STATS_SR_DATA_RX] }
+
+// Stream the snapshot text body, one line per SNAP_DATA frame.
+// Splits on '\n' (byte 10). Returns the number of SNAP_DATA frames
+// sent.
+fn _gossip_send_snap_body(conn_fd, bytes) {
+    let n = len(bytes)
+    let pos = 0
+    let sent = 0
+    while pos < n {
+        let scan = pos
+        let segment = ""
+        let next_pos = n
+        let found_nl = 0
+        while scan < n {
+            if char_at(bytes, scan) == 10 {
+                segment = substr(bytes, pos, scan - pos)
+                next_pos = scan + 1
+                found_nl = 1
+                scan = n
+            } else {
+                scan = scan + 1
+            }
+        }
+        if found_nl == 0 {
+            segment = substr(bytes, pos, n - pos)
+            next_pos = n
+        }
+        if _gossip_send_all(conn_fd, GOSSIP_SNAP_DATA_PREFIX + segment + "\n") == 0 {
+            return sent
+        }
+        sent = sent + 1
+        pos = next_pos
+    }
+    return sent
+}
+
+// Serve a SNAP_FETCH request on `conn_fd`. Parses the requested
+// root_hex; looks up the replica via sr_serve_snap_request; streams
+// each line of the snapshot text as SNAP_DATA <line>, then SNAP_END.
+// A miss (we don't have the root) is just SNAP_END alone.
+fn _gossip_serve_snap_fetch(conn_fd, state, line) {
+    let sr = state[GOSSIP_S_SR_STATE]
+    state[GOSSIP_S_STATS_SR_FETCH_RX] = state[GOSSIP_S_STATS_SR_FETCH_RX] + 1
+    if sr == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+        return 0
+    }
+    let root_hex = sr_parse_fetch_line(line)
+    if len(root_hex) == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+        return 0
+    }
+    let bytes = sr_serve_snap_request(sr, root_hex)
+    if bytes == 0 {
+        _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+        return 0
+    }
+    let sent = _gossip_send_snap_body(conn_fd, bytes)
+    _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+    return sent
+}
+
+// Client-side: dial `addr`, send SNAP_FETCH <root_hex>, collect the
+// SNAP_DATA stream until SNAP_END, hand the assembled bytes to
+// sr_observe_snap_response which verifies + stores. Returns 1 on
+// stored, 0 on miss / verify failure / network error.
+fn gossip_send_snap_fetch(state, addr, root_hex) {
+    let sr = state[GOSSIP_S_SR_STATE]
+    if sr == 0 { return 0 }
+    if len(root_hex) != 64 { return 0 }
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    let req = GOSSIP_SNAP_FETCH_PREFIX + root_hex + "\n"
+    if _gossip_send_all(fd, req) == 0 { close_fd(fd); return 0 }
+    let body = ""
+    let running = 1
+    let data_count = 0
+    while running == 1 {
+        let rline = _gossip_recv_line(fd)
+        if rline == 0 { running = 0 } else {
+            if str_eq(rline, GOSSIP_SNAP_END_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(rline, GOSSIP_SNAP_DATA_PREFIX) == 1 {
+                    let plen = len(GOSSIP_SNAP_DATA_PREFIX)
+                    let seg = substr(rline, plen, len(rline) - plen)
+                    body = body + seg + "\n"
+                    data_count = data_count + 1
+                }
+            }
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    state[GOSSIP_S_STATS_SR_DATA_RX] = state[GOSSIP_S_STATS_SR_DATA_RX] + data_count
+    if len(body) == 0 { return 0 }
+    return sr_observe_snap_response(sr, root_hex, body)
+}
+
+// Drive all pending fetch tasks: walk sr_pending_fetch_tasks() and
+// dial every alive peer (the originator and any peer that has
+// already cached the root will respond). Stops on first stored
+// per-task. Returns the count of stored fetches this round.
+fn gossip_drive_snap_fetches(state) {
+    let sr = state[GOSSIP_S_SR_STATE]
+    if sr == 0 { return 0 }
+    let tasks = sr_pending_fetch_tasks(sr)
+    if len(tasks) == 0 { return 0 }
+    let alive = gossip_alive_peers(state)
+    let stored = 0
+    let i = 0
+    while i < len(tasks) {
+        let root_hex = tasks[i][0]
+        let j = 0
+        let got = 0
+        while j < len(alive) {
+            if got == 0 {
+                if gossip_send_snap_fetch(state, alive[j], root_hex) == 1 {
+                    got = 1
+                    stored = stored + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return stored
+}
+
+// Status line for /snap_replicas. One-line summary of the SR sub-
+// system if it's wired up; "not configured" otherwise.
+fn gossip_sr_status_line(state) {
+    let sr = state[GOSSIP_S_SR_STATE]
+    if sr == 0 {
+        return "snap_repl: not configured"
+    }
+    return "snap_repl: " + sr_status_line(sr)
+        + " fetch_rx=" + int_to_str(state[GOSSIP_S_STATS_SR_FETCH_RX])
+        + " data_rx=" + int_to_str(state[GOSSIP_S_STATS_SR_DATA_RX])
+}
+
+// ============================================================================
+// R26E -- gossip relay hooks.
+// ============================================================================
+//
+// The companion module src/federation/gossip_relay.nova owns the
+// relay_state record + the public relay_send / relay_handle_request /
+// relay_handle_data / relay_handle_ack helpers + the wire codec.
+// Here we ship the gossip slot, the parser-branch dispatchers, and
+// the registration setter. The slot is 0 by default; a soul that has
+// not opted into R26E sees RELAY_* lines arrive but drops them
+// silently (the dispatcher nil-checks before calling out to the
+// relay module). Turning R26E on is a single gossip_set_relay_state
+// call at boot.
+//
+// COORDINATION NOTE: the dispatchers below are CALLED from the
+// additive parser branches at the end of gossip_handle_conn,
+// gossip_handle_conn_kg, and gossip_handle_conn_kg_gconn. The
+// relay module is the only owner of the parsing + forwarding
+// logic; this file only routes inbound lines + tracks the wire-
+// level rx counters. The dispatch function names are pinned as
+// part of the relay <-> gossip cross-module protocol.
+
+fn gossip_set_relay_state(state, relay_state) {
+    state[GOSSIP_S_RELAY_STATE] = relay_state
+    return state
+}
+
+fn gossip_relay_state(state) { return state[GOSSIP_S_RELAY_STATE] }
+fn gossip_stats_relay_req_rx(state)  { return state[GOSSIP_S_STATS_RELAY_REQ_RX] }
+fn gossip_stats_relay_data_rx(state) { return state[GOSSIP_S_STATS_RELAY_DATA_RX] }
+fn gossip_stats_relay_ack_rx(state)  { return state[GOSSIP_S_STATS_RELAY_ACK_RX] }
+
+// Relay-state pinned slot indices that gossip writes to. The relay
+// module owns the full layout (src/federation/gossip_relay.nova);
+// these two slots are pinned as part of the cross-module protocol so
+// gossip can enqueue inbound wire lines without importing
+// gossip_relay (which would invert the import graph -- gossip_relay
+// imports gossip). When the slot is 0 the gossip dispatch is a no-
+// op; the relay module's drain helper consumes the queue + runs the
+// forward / deliver / ack-bump per inbound line.
+let GOSSIP_RELAY_INBOUND_REQS  = 11  // queue of pending RELAY_REQ wire lines
+let GOSSIP_RELAY_INBOUND_DATA  = 12  // queue of pending RELAY_DATA wire lines
+let GOSSIP_RELAY_INBOUND_ACKS  = 13  // queue of pending RELAY_ACK wire lines
+
+// Dispatch a RELAY_REQ inbound line. Bumps the wire-level rx counter
+// and enqueues the raw line onto the relay's pinned inbound-REQ
+// queue; the relay module's drain helper forwards each on its next
+// round (matching the R21B inbound-RULES pattern). Synchronous
+// forwarding is intentionally avoided here because that would
+// require gossip.nova to import gossip_relay.nova (which itself
+// imports gossip -- the same cycle the R21B handlers already break
+// via this queue indirection).
+fn _gossip_serve_relay_req(state, line) {
+    state[GOSSIP_S_STATS_RELAY_REQ_RX] = state[GOSSIP_S_STATS_RELAY_REQ_RX] + 1
+    let r = state[GOSSIP_S_RELAY_STATE]
+    if r == 0 { return 0 }
+    let q = r[GOSSIP_RELAY_INBOUND_REQS]
+    if q == 0 { return 0 }
+    push(q, line)
+    return 1
+}
+
+// Dispatch a RELAY_DATA inbound line. Bumps the wire-level rx
+// counter and enqueues the raw line; the relay's drain helper
+// records the (req_id, payload, via, from) record into its received-
+// queue and bumps its delivered counter. Returns 1 on enqueued,
+// 0 if the relay state is unwired.
+fn _gossip_serve_relay_data(state, line) {
+    state[GOSSIP_S_STATS_RELAY_DATA_RX] = state[GOSSIP_S_STATS_RELAY_DATA_RX] + 1
+    let r = state[GOSSIP_S_RELAY_STATE]
+    if r == 0 { return 0 }
+    let q = r[GOSSIP_RELAY_INBOUND_DATA]
+    if q == 0 { return 0 }
+    push(q, line)
+    return 1
+}
+
+// Dispatch a RELAY_ACK inbound line. Best-effort: ACK loss is
+// tolerated (the cache already remembers the working via). Returns
+// 1 on enqueued, 0 if the relay state is unwired.
+fn _gossip_serve_relay_ack(state, line) {
+    state[GOSSIP_S_STATS_RELAY_ACK_RX] = state[GOSSIP_S_STATS_RELAY_ACK_RX] + 1
+    let r = state[GOSSIP_S_RELAY_STATE]
+    if r == 0 { return 0 }
+    let q = r[GOSSIP_RELAY_INBOUND_ACKS]
+    if q == 0 { return 0 }
+    push(q, line)
+    return 1
+}
+
+// One-line status for chat / diagnostics.
+fn gossip_relay_status_line(state) {
+    let r = state[GOSSIP_S_RELAY_STATE]
+    if r == 0 {
+        return "relay: not configured"
+    }
+    return relay_stats_line(r)
+        + " req_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_REQ_RX])
+        + " data_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_DATA_RX])
+        + " ack_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_ACK_RX])
+        + " bin_rx=" + int_to_str(state[GOSSIP_S_STATS_RELAY_BIN_RX])
+        + " bin_fwd=" + int_to_str(state[GOSSIP_S_STATS_RELAY_BIN_FWD])
+        + " bin_bad=" + int_to_str(state[GOSSIP_S_STATS_RELAY_BIN_BAD])
+}
+
+// ============================================================================
+// R27C.2 -- bulk binary path dispatcher
+// ============================================================================
+//
+// gossip_set_srl_state -- the caller registers the srl_state record so
+// the binary-path dispatcher knows where to push inbound terminal
+// records (the SRL_S_INBOUND_BIN queue at the pinned slot 8). The slot
+// is 0 by default; a soul that has not opted into R27C.2 sees
+// RELAY_BIN lines arrive, reads the bytes off the fd (so the
+// connection doesn't desync), bumps GOSSIP_S_STATS_RELAY_BIN_BAD, and
+// drops them.
+
+fn gossip_set_srl_state(state, srl_state) {
+    state[GOSSIP_S_SRL_STATE] = srl_state
+    return state
+}
+
+fn gossip_srl_state(state)            { return state[GOSSIP_S_SRL_STATE] }
+fn gossip_stats_relay_bin_rx(state)   { return state[GOSSIP_S_STATS_RELAY_BIN_RX] }
+fn gossip_stats_relay_bin_fwd(state)  { return state[GOSSIP_S_STATS_RELAY_BIN_FWD] }
+fn gossip_stats_relay_bin_bad(state)  { return state[GOSSIP_S_STATS_RELAY_BIN_BAD] }
+
+// Parse a `RELAY_BIN <req_id> <target> <via> <from> <total_len>` line.
+// Returns [req_id, target, via, from, total_len] on success, 0 on
+// malformed input. Mirror of srl_bin_parse_header (the srl module owns
+// the canonical implementation; we duplicate the few lines here so
+// gossip.nova does not import the srl module -- the same pattern
+// gossip uses for the relay parser branches).
+fn _gossip_parse_bin_hdr(line) {
+    if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 0 { return 0 }
+    let toks = _gossip_split_spaces(line)
+    if len(toks) < 6 { return 0 }
+    let id_s = toks[1]
+    if _gossip_is_digits(id_s) == 0 { return 0 }
+    let req_id = str_to_int(id_s)
+    let target = toks[2]
+    let via    = toks[3]
+    let from   = toks[4]
+    let len_s  = toks[5]
+    if len(target) == 0 { return 0 }
+    if len(via) == 0    { return 0 }
+    if len(from) == 0   { return 0 }
+    if _gossip_is_digits(len_s) == 0 { return 0 }
+    let total_len = str_to_int(len_s)
+    if total_len < 0 { return 0 }
+    let out = list_new()
+    push(out, req_id)
+    push(out, target)
+    push(out, via)
+    push(out, from)
+    push(out, total_len)
+    return out
+}
+
+// Build the RELAY_BIN header line (no trailing newline -- caller
+// appends "\n" before raw bytes). Duplicates srl_bin_format_header to
+// keep the gossip <-> srl import graph one-way.
+fn _gossip_format_bin_hdr(req_id, target, via, from, total_len) {
+    return GOSSIP_RELAY_BIN_PREFIX + int_to_str(req_id)
+        + " " + target + " " + via + " " + from
+        + " " + int_to_str(total_len)
+}
+
+// Forward a binary frame to the next hop (the relay role). Opens a
+// short-lived TCP connection to `addr`, runs HELLO/OK, sends the
+// header + raw frame bytes, sends BYE, closes. Returns 1 on success
+// 0 on any error. Reuses _gossip_dial + _gossip_send_all +
+// _gnoise_raw_send (already public in this module). Used by the
+// dispatcher's intermediate-forwarding branch.
+fn _gossip_forward_bin(addr, header_line, frame_buf, frame_n) {
+    let fd = _gossip_dial(addr)
+    if fd < 0 { return 0 }
+    _gossip_set_rcvtimeo_ms(fd, 5000)
+    if _gossip_send_all(fd, GOSSIP_HELLO_LINE + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    let ack = _gossip_recv_line(fd)
+    if ack == 0 { close_fd(fd); return 0 }
+    if str_eq(ack, GOSSIP_OK_LINE) == 0 { close_fd(fd); return 0 }
+    if _gossip_send_all(fd, header_line + "\n") == 0 {
+        close_fd(fd); return 0
+    }
+    if frame_n > 0 {
+        if _gnoise_raw_send(fd, frame_buf, frame_n) == 0 {
+            close_fd(fd); return 0
+        }
+    }
+    _gossip_send_all(fd, GOSSIP_BYE_LINE + "\n")
+    close_fd(fd)
+    return 1
+}
+
+// Dispatch a RELAY_BIN inbound line. Two cases:
+//   * target == self_addr: enqueue terminal record onto the srl's
+//     SRL_S_INBOUND_BIN queue; srl_drain_relay_recv_binary picks it
+//     up next tick. Bump STATS_RELAY_BIN_RX.
+//   * target != self_addr: forward as RELAY_BIN to target with
+//     via=self_addr, from preserved. Bump STATS_RELAY_BIN_FWD on
+//     successful forward.
+//
+// On parse failure, short fd read, or zero srl_state when terminal,
+// bumps STATS_RELAY_BIN_BAD and returns 0. The fd has already been
+// progressed by `recv_data` for the binary tail; we cannot rewind so
+// the connection is implicitly drained even on a drop.
+//
+// Returns 1 on a clean dispatch, 0 otherwise.
+fn _gossip_serve_relay_bin(state, fd, line) {
+    let parsed = _gossip_parse_bin_hdr(line)
+    if parsed == 0 {
+        state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+        return 0
+    }
+    let req_id    = parsed[0]
+    let target    = parsed[1]
+    let via       = parsed[2]
+    let from      = parsed[3]
+    let total_len = parsed[4]
+    // Drain raw bytes off the fd. _gnoise_recv_exact returns [buf, n]
+    // or 0 on EOF / timeout / short read. Same helper used by the
+    // R21E Noise handshake's framed reader.
+    let rxd = 0
+    if total_len > 0 {
+        rxd = _gnoise_recv_exact(fd, total_len)
+        if rxd == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+    }
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    if str_eq(target, self_addr) == 1 {
+        // Terminal delivery: push onto srl's binary inbound queue.
+        let srl = state[GOSSIP_S_SRL_STATE]
+        if srl == 0 {
+            // Soul not opted into R27C.2; bytes arrived, bump bad,
+            // drop. The TCP connection has been drained so subsequent
+            // PING/MEMBER lines parse cleanly.
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        let q = srl[GOSSIP_SRL_S_INBOUND_BIN]
+        if q == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        let rec = list_new()
+        push(rec, req_id)
+        push(rec, from)
+        if total_len > 0 {
+            push(rec, rxd[0])
+            push(rec, rxd[1])
+        } else {
+            push(rec, 0)
+            push(rec, 0)
+        }
+        push(q, rec)
+        state[GOSSIP_S_STATS_RELAY_BIN_RX] = state[GOSSIP_S_STATS_RELAY_BIN_RX] + 1
+        return 1
+    }
+    // Intermediate: forward to target.
+    let frame_buf = 0
+    let frame_n = 0
+    if total_len > 0 {
+        frame_buf = rxd[0]
+        frame_n   = rxd[1]
+    }
+    let fwd_hdr = _gossip_format_bin_hdr(req_id, target, self_addr,
+                                          from, frame_n)
+    if _gossip_forward_bin(target, fwd_hdr, frame_buf, frame_n) == 1 {
+        state[GOSSIP_S_STATS_RELAY_BIN_FWD] = state[GOSSIP_S_STATS_RELAY_BIN_FWD] + 1
+        // Bump the underlying relay's forwarded counter too so
+        // diagnostics reflect activity at the relay layer (matches
+        // the way RELAY_REQ -> RELAY_DATA forwarding bumps it).
+        let r0 = state[GOSSIP_S_RELAY_STATE]
+        if r0 != 0 {
+            r0[7] = r0[7] + 1  // RELAY_S_STATS_FORWARDED is slot 7
+        }
+        return 1
+    }
+    state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+    return 0
+}

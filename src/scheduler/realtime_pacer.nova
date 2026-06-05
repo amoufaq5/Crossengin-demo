@@ -1,0 +1,164 @@
+// CrossEngin scheduler: real-time wall-clock pacer (P0.6).
+//
+// Purpose
+//   Today the scheduler ticks at *abstract* tiers ("100Hz active, 10Hz idle")
+//   but never actually paces itself: a tight loop burns whatever CPU the host
+//   permits, so a deployed daemon's per-second budget is unpredictable. This
+//   module is the wall-clock pacer that turns the abstract tiers into ACTUAL
+//   100Hz / 10Hz by sampling `nanotime()` at tick start, doing the tick body,
+//   sampling again, and sleeping the unused remainder of the tick budget.
+//
+//   Pacer state and call pattern:
+//     let p = pacer_new()
+//     while running {
+//         pacer_begin(p)
+//         /* ... tick work ... */
+//         pacer_end(p, 10_000_000)    // 100Hz: 10ms budget
+//     }
+//
+//   When the tick body takes longer than the budget the tick has OVERRUN; the
+//   pacer counts these (visible via pacer_overruns), tracks the worst case in
+//   nanoseconds (pacer_max_overrun_ns), and does NOT sleep -- the next tick
+//   just starts immediately so we don't compound the latency. A test/slow-mo
+//   factor (pacer_set_factor) multiplies the effective budget so a regression
+//   test can deliberately stretch wall-clock time without changing the call
+//   sites.
+//
+//   When `CE_REALTIME=1` is NOT set the daemon should construct the pacer but
+//   not call pacer_end: the pacer functions degrade to no-ops with the
+//   `enabled` flag at the bottom of pacer_state, so unit tests that drive the
+//   scheduler at full speed don't slow down to wall-clock time.
+//
+// NOVA gotcha
+//   `nanotime()` returns nanoseconds since boot; differences between two
+//   samples fit comfortably in 63 bits (the universe isn't that old), but the
+//   raw value itself is large. The pacer never multiplies raw nanotime by
+//   anything -- only differences and budgets in ms x slow-mo factor are
+//   multiplied, all of which stay well under 2^31.
+//
+// ADRs implemented: ADR-0037 (the wall-clock half of the hybrid scheduler).
+// NOVA dependencies: nanotime() (from std/io) and sleep_ms() (codegen builtin).
+// CrossEngin dependencies: none.
+
+import "std/io"
+
+// Multiply two large nanosecond values without crossing the NOVA pointer
+// dispatcher. _nova_mul's pointer-threshold check (0x100000 = 1M) treats
+// large operands as potential pointers and dispatches into str_repeat /
+// list_repeat -- which segfaults when you actually meant integer multiply.
+// nanotime() and tick budgets are both >> 1M, so every multiply that
+// involves either must go through this raw-imul shim. Pattern lifted from
+// `_raw_imul_add` in NOVA's src/runtime/io.nova.
+fn _imul_raw(a, b) {
+    asm {
+        "mov rax, [rbp-8]"
+        "imul rax, [rbp-16]"
+    }
+}
+
+// ---- pacer state ----------------------------------------------------------
+let PACER_TAG = 6010
+
+let P_TAG          = 0
+let P_TICK_START   = 1  // nanotime sampled at last pacer_begin()
+let P_TICK_COUNT   = 2  // count of completed ticks
+let P_OVERRUNS     = 3  // count of ticks that overran their budget
+let P_MAX_OVER_NS  = 4  // worst-case overrun seen, in nanoseconds
+let P_FACTOR       = 5  // slow-mo factor (1 = real time; 2 = half speed)
+let P_ENABLED      = 6  // 1 = sleep + count; 0 = no-op (CE_REALTIME unset)
+
+// Build a fresh pacer. Defaults: enabled=1, factor=1 (real time), counts at 0.
+// Callers wrap the construction with the CE_REALTIME env check and explicitly
+// disable when running unit tests at full speed.
+fn pacer_new() {
+    let p = list_new()
+    push(p, PACER_TAG)
+    push(p, 0)          // tick start time (set at first pacer_begin)
+    push(p, 0)          // tick count
+    push(p, 0)          // overruns
+    push(p, 0)          // worst-case overrun ns
+    push(p, 1)          // slow-mo factor
+    push(p, 1)          // enabled
+    return p
+}
+
+// Toggle pacing. When disabled, pacer_begin / pacer_end are no-ops and the
+// counters do not advance -- the in-process unit tests for the scheduler
+// stay full-speed.
+fn pacer_set_enabled(p, on) {
+    list_set(p, P_ENABLED, on)
+    return on
+}
+
+fn pacer_enabled(p) { return p[P_ENABLED] }
+
+// Slow-mo: multiply each tick budget by k. Used by the pacer test to confirm
+// the sleep is actually wall-clock and not a phantom.
+fn pacer_set_factor(p, k) {
+    if k < 1 { k = 1 }
+    list_set(p, P_FACTOR, k)
+    return k
+}
+
+fn pacer_factor(p)         { return p[P_FACTOR] }
+fn pacer_tick_count(p)     { return p[P_TICK_COUNT] }
+fn pacer_overruns(p)       { return p[P_OVERRUNS] }
+fn pacer_max_overrun_ns(p) { return p[P_MAX_OVER_NS] }
+
+// Sample tick start. When disabled this is still cheap and harmless; we leave
+// the prior P_TICK_START because pacer_end ignores the value when disabled.
+fn pacer_begin(p) {
+    if p[P_ENABLED] == 0 { return 0 }
+    list_set(p, P_TICK_START, nanotime())
+    return 1
+}
+
+// Finish a tick. budget_ns is the wall-clock budget for THIS tick (10_000_000
+// for 100Hz, 100_000_000 for 10Hz). If the tick body finished early, sleep the
+// remainder; if late, count the overrun. Returns the overran-by-ns count
+// (0 if the tick was on time).
+fn pacer_end(p, budget_ns) {
+    if p[P_ENABLED] == 0 { return 0 }
+    let now = nanotime()
+    let start = p[P_TICK_START]
+    let elapsed = now - start
+    // Apply slow-mo: a factor k means each tick budget is k * budget_ns.
+    // Both operands are well above the NOVA pointer-threshold (0x100000),
+    // so we must bypass _nova_mul -- see _imul_raw at the top of this file.
+    let effective = _imul_raw(budget_ns, p[P_FACTOR])
+    let remaining = effective - elapsed
+    let overran = 0
+    if remaining > 0 {
+        // sleep_ms takes milliseconds, integer-divide and clamp to >=1 to
+        // avoid spinning on sub-millisecond residues that round to zero.
+        let ms = remaining / 1000000
+        if ms > 0 { sleep_ms(ms) }
+    } else {
+        overran = 0 - remaining
+        list_set(p, P_OVERRUNS, p[P_OVERRUNS] + 1)
+        if overran > p[P_MAX_OVER_NS] {
+            list_set(p, P_MAX_OVER_NS, overran)
+        }
+    }
+    list_set(p, P_TICK_COUNT, p[P_TICK_COUNT] + 1)
+    return overran
+}
+
+// Compose a one-line summary suitable for the daemon's shutdown banner.
+// Format mirrors: "pacer: 1247 ticks, 3 overruns (max 14ms over budget)"
+fn pacer_summary(p) {
+    let max_ms = p[P_MAX_OVER_NS] / 1000000
+    return "pacer: " + int_to_str(p[P_TICK_COUNT]) + " ticks, "
+        + int_to_str(p[P_OVERRUNS]) + " overruns (max "
+        + int_to_str(max_ms) + "ms over budget)"
+}
+
+// Resolve the CE_REALTIME env var. Returns 1 iff the value is exactly "1".
+// Used by the daemon at boot to decide whether to pacer_set_enabled.
+fn pacer_realtime_from_env() {
+    let env = getenv("CE_REALTIME")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq(env, "1") == 1 { return 1 }
+    return 0
+}

@@ -1,0 +1,232 @@
+// CrossEngin episodic: moments and the moment stream.
+//
+// Purpose
+//   A moment is a timestamped perception record -- the entry point for every
+//   input (ADR-0021). Moments are captured at the gate boundary before any node
+//   sees them, accumulate a signal trace as they propagate, and advance through
+//   a status lifecycle PERCEIVED -> SETTLED -> CONSOLIDATED. They are
+//   append-only and immutable once SETTLED; corrections arrive as new INTERNAL
+//   moments rather than mutations. The moment stream is the append-only log the
+//   episodic memory (ADR-0022) and learning fabric (ADR-0025) build on.
+//
+//   Timestamps are logical tick indices supplied by the caller (the 100Hz
+//   wall-clock pacer is NOVA enhancement #5); the stream enforces monotonicity.
+//
+// ADRs implemented: ADR-0021 (moments). ADR-0014: a modality bridge fills only
+//   the raw field; no cognition here.
+// NOVA dependencies: builtins (lists, str ops). CrossEngin dependencies:
+//   src/reader/cofire_index.nova (P2.1 -- optional cofire wiring at the
+//   PERCEIVED -> SETTLED transition; callers without an index pass 0).
+
+import "../../reader/cofire_index.nova"
+
+// ---- modality (ADR-0021) --------------------------------------------------
+let MODALITY_TEXT     = 1
+let MODALITY_AUDIO_STT= 2
+let MODALITY_SENSOR   = 3
+let MODALITY_CLOCK    = 4
+let MODALITY_FETCH    = 5
+let MODALITY_INTERNAL = 6
+
+// ---- status lifecycle -----------------------------------------------------
+let MSTAT_PERCEIVED    = 1
+let MSTAT_SETTLED      = 2
+let MSTAT_CONSOLIDATED = 3
+
+// ---- moment layout --------------------------------------------------------
+let M_TAG     = 0
+let M_ID      = 1
+let M_TS      = 2
+let M_MODAL   = 3
+let M_RAW     = 4
+let M_SAL     = 5
+let M_ORIGIN  = 6
+let M_TRACE   = 7   // list of node ids the input reached
+let M_SOULREF = 8
+let M_STATUS  = 9
+let MOMENT_OBJ_TAG = 2201
+
+fn _moment_new(id, ts, modality, raw, salience, origin_part) {
+    let m = list_new()
+    push(m, MOMENT_OBJ_TAG)
+    push(m, id)
+    push(m, ts)
+    push(m, modality)
+    push(m, raw)
+    push(m, salience)
+    push(m, origin_part)
+    push(m, list_new())   // trace
+    push(m, 0)            // soul_ref
+    push(m, MSTAT_PERCEIVED)
+    return m
+}
+
+fn moment_id(m)        { return m[M_ID] }
+fn moment_timestamp(m) { return m[M_TS] }
+fn moment_modality(m)  { return m[M_MODAL] }
+fn moment_raw(m)       { return m[M_RAW] }
+fn moment_salience(m)  { return m[M_SAL] }
+fn moment_origin(m)    { return m[M_ORIGIN] }
+fn moment_trace(m)     { return m[M_TRACE] }
+fn moment_status(m)    { return m[M_STATUS] }
+fn moment_is_immutable(m) {
+    if m[M_STATUS] >= MSTAT_SETTLED { return 1 }
+    return 0
+}
+
+// Append a node id to the signal trace -- only while still PERCEIVED.
+fn moment_add_trace(m, node_id) {
+    if moment_is_immutable(m) == 1 { return 0 }
+    push(m[M_TRACE], node_id)
+    return 1
+}
+
+fn moment_set_soul_ref(m, ref) {
+    if moment_is_immutable(m) == 1 { return 0 }
+    list_set(m, M_SOULREF, ref)
+    return 1
+}
+
+// Status may only advance (PERCEIVED -> SETTLED -> CONSOLIDATED). Returns 1 on a
+// valid advance, 0 otherwise.
+fn moment_set_status(m, status) {
+    if status <= m[M_STATUS] { return 0 }
+    list_set(m, M_STATUS, status)
+    return 1
+}
+
+fn moment_settle(m)      { return moment_set_status(m, MSTAT_SETTLED) }
+fn moment_consolidate(m) { return moment_set_status(m, MSTAT_CONSOLIDATED) }
+
+// ---- the append-only moment stream ----------------------------------------
+let MS_TAG    = 0
+let MS_LIST   = 1   // moments indexed by id
+let MS_NEXT   = 2
+let MS_LASTTS = 3   // last timestamp, for monotonicity
+let MS_OBJ_TAG = 2202
+
+fn ms_new() {
+    let s = list_new()
+    push(s, MS_OBJ_TAG)
+    push(s, list_new())
+    push(s, 0)
+    push(s, -1)
+    return s
+}
+
+// Capture a new moment at logical timestamp `ts` (clamped to be monotonic).
+// Assigns the next id and appends. Returns the moment.
+fn ms_capture(stream, ts, modality, raw, salience, origin_part) {
+    let t = ts
+    if t < stream[MS_LASTTS] { t = stream[MS_LASTTS] }
+    let id = stream[MS_NEXT]
+    let m = _moment_new(id, t, modality, raw, salience, origin_part)
+    push(stream[MS_LIST], m)
+    list_set(stream, MS_NEXT, id + 1)
+    list_set(stream, MS_LASTTS, t)
+    return m
+}
+
+fn ms_count(stream) { return len(stream[MS_LIST]) }
+
+fn ms_get(stream, id) {
+    let l = stream[MS_LIST]
+    if id < 0 { return 0 }
+    if id >= len(l) { return 0 }
+    return l[id]
+}
+
+// The most recent n moments (fewer if the stream is shorter), oldest-first.
+fn ms_recent(stream, n) {
+    let l = stream[MS_LIST]
+    let total = len(l)
+    let start = total - n
+    if start < 0 { start = 0 }
+    let out = list_new()
+    let i = start
+    while i < total { push(out, l[i]); i = i + 1 }
+    return out
+}
+
+// Settle every moment older than the settle window (ADR-0021: 20 ticks @100Hz).
+let MS_SETTLE_WINDOW = 20
+
+fn ms_settle_old(stream, now) {
+    return ms_settle_old_with_cofire(stream, now, 0, "")
+}
+
+// P2.1 additive overload: settle old moments AND record their atom-set traces
+// into a cofire side-index. Called from the daemon's idle path with a non-zero
+// `ci` so the index grows organically every settle window. `kg_label` is the
+// KG label the trace atom-ids belong to (the world / reasoning KG today). Pass
+// ci=0 to get the legacy ms_settle_old behavior. The cofire callback fires
+// EXACTLY ONCE per moment, at the PERCEIVED -> SETTLED transition: a moment
+// that was already SETTLED on entry is left alone (idempotent across calls
+// to ms_settle_old). We use moment_trace(m), the node-id list collected by
+// the reader's stage 1/2 lookups; it can be empty (a moment with no anchored
+// words), in which case ci_record_moment is a no-op for that moment.
+fn ms_settle_old_with_cofire(stream, now, ci, kg_label) {
+    let l = stream[MS_LIST]
+    let settled = 0
+    let i = 0
+    while i < len(l) {
+        let m = l[i]
+        if moment_status(m) == MSTAT_PERCEIVED {
+            if now - moment_timestamp(m) >= MS_SETTLE_WINDOW {
+                moment_settle(m)
+                if ci != 0 {
+                    ci_record_moment(ci, kg_label, moment_trace(m))
+                }
+                settled = settled + 1
+            }
+        }
+        i = i + 1
+    }
+    return settled
+}
+
+// ---- persistence (ADR-0048): restore helpers ------------------------------
+//
+// These helpers exist so snapshot_disk.nova can rebuild a moment stream from
+// an on-disk image. ms_capture() advances through the lifecycle (creates a
+// fresh PERCEIVED moment); restore needs to install a moment with the exact
+// id/ts/status/trace persisted to disk, BYPASSING the monotonic ts clamp and
+// the "immutable after SETTLED" trace lock (the snapshot is the ground truth).
+// We keep them small, additive, and clearly labelled so the regular
+// append-only invariant of the live system is unchanged.
+
+// Wipe a moment stream back to empty. /load policy is REPLACE (the snapshot
+// is the new ground truth) -- not append -- so we rebuild from scratch.
+fn ms_clear(stream) {
+    list_set(stream, MS_LIST, list_new())
+    list_set(stream, MS_NEXT, 0)
+    list_set(stream, MS_LASTTS, -1)
+    return 1
+}
+
+// Install a moment with the exact id/ts/modality/salience/origin/status/trace
+// supplied by the caller (the snapshot). Does NOT clamp ts to monotonic; does
+// NOT enforce the "trace is immutable after SETTLED" rule (the snapshot is
+// the authoritative state). Pushes the moment into the stream's list at the
+// next slot; updates MS_NEXT and MS_LASTTS.
+//
+// `atom_ids` is the list of atom-id integers that originally hit the moment's
+// trace. `lifecycle` is one of MSTAT_PERCEIVED/_SETTLED/_CONSOLIDATED.
+// Used by snapshot_disk.nova's episodic_section_apply().
+fn ms_restore(stream, id, ts, modality, raw, salience, origin_part, lifecycle, atom_ids) {
+    let m = _moment_new(id, ts, modality, raw, salience, origin_part)
+    // Install trace directly (skip moment_add_trace's immutability check).
+    let trace = m[M_TRACE]
+    let i = 0
+    while i < len(atom_ids) {
+        push(trace, atom_ids[i])
+        i = i + 1
+    }
+    list_set(m, M_STATUS, lifecycle)
+    push(stream[MS_LIST], m)
+    let next = stream[MS_NEXT]
+    if id + 1 > next { next = id + 1 }
+    list_set(stream, MS_NEXT, next)
+    if ts > stream[MS_LASTTS] { list_set(stream, MS_LASTTS, ts) }
+    return m
+}

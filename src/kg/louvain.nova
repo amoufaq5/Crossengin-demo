@@ -1,0 +1,1130 @@
+// CrossEngin knowledge: Louvain community detection (R12C).
+//
+// Purpose
+//   R11F shipped label-propagation community detection (LPA) on top of
+//   atom_xrefs. LPA is fast and streaming-friendly, but its greedy
+//   neighbour-vote heuristic plateaus 10..15 % below the true modularity
+//   optimum on real-world graphs. Louvain (Blondel, Guillaume, Lambiotte,
+//   Lefebvre 2008 -- "Fast unfolding of communities in large networks")
+//   is the gold-standard greedy MODULARITY-OPTIMIZING algorithm: each
+//   move is chosen to maximise the modularity gain DQ analytically, and
+//   the algorithm recurses on a coarser graph until no improvement
+//   remains. The result is typically the higher-modularity partition on
+//   the same KG, at modest extra cost (a logarithmic number of levels of
+//   sweep).
+//
+//   Louvain LIVES BESIDE R11F's LPA, not replacing it. The two answer
+//   subtly different questions:
+//     - LPA  -> "which atoms are LINKED tightly in the immediate xref
+//                neighbourhood?" (fast, decent quality, streaming-OK)
+//     - Louvain -> "which atoms collapse together when the GRAPH is
+//                   greedily refined to maximise modularity?" (slower,
+//                   gold-standard quality, hierarchical levels exposed
+//                   through the dendrogram)
+//
+// Algorithm summary -- Louvain, two-phase iterative
+//   Initialise: every node in its own community.
+//   Phase 1 (local moves):
+//     Repeat until no move improves modularity in a full sweep:
+//       For each node u (in a deterministic-shuffled order):
+//         For each neighbour community C reachable through u's edges
+//             (plus u's CURRENT community as the no-op baseline):
+//           Compute the modularity gain DQ of moving u into C.
+//         If the best DQ is STRICTLY POSITIVE, move u into the best C.
+//   Phase 2 (community aggregation):
+//     Build a new (smaller) graph in which:
+//       - Each Phase-1 community becomes a single super-node.
+//       - Edge weight between super-nodes A, B = sum of original edge
+//         weights between any atom in A and any atom in B.
+//       - Self-loop weight on super-node A = sum of intra-community
+//         edge weights inside A (each edge counted once, not twice).
+//   Recurse: re-run Phase 1 on the aggregated graph. Stop when an entire
+//   Phase-1 sweep produces zero positive moves OR max_iter levels have
+//   been processed.
+//
+//   DQ for moving u into community C (integer form, weights = number
+//   of xref edges, no FP weights here):
+//     2m  = SUM(degree of every node) = 2 * total_edges
+//     k_u = degree of u (= number of weighted edges incident to u)
+//     k_u_C_in = sum of weights of edges from u to any node ALREADY in C
+//                (u's contribution to "edges touching C")
+//     Sigma_tot_C = sum of degrees of every node in C (BEFORE u joins;
+//                  if u is in C we subtract u's degree first)
+//     gain = k_u_C_in - (k_u * Sigma_tot_C) / (2m)
+//   In milli units we keep the integer numerator
+//     gain_scaled = (2m) * k_u_C_in  -  k_u * Sigma_tot_C
+//   which is what we maximise: the ordering is preserved, all-integer.
+//
+// Determinism
+//   Phase 1 visits nodes in a deterministic-shuffled order seeded by an
+//   integer. Same KG snapshot + same seed -> bit-identical result. We
+//   reuse R11F's 15-bit shift-xor mixer style (NOVA codegen-bug-safe;
+//   see NOVA_BUG_THRESHOLD.md for why we keep intermediates < 2^20).
+//
+// Modularity reporting
+//   `louvain_modularity` computes Newman's Q in milli on the original
+//   graph + the final partition; it mirrors R11F's `gc_modularity`
+//   integer-only definition so the two are directly comparable.
+//
+// Result layout (louvain_result):
+//   [LV_OBJ_TAG, atom_ids, labels, communities, total_edges, levels,
+//    dendrogram]
+//     - atom_ids:    sorted-ascending list of live atom ids in the
+//                    original graph (same shape as R11F's gc_result).
+//     - labels:      list of final super-community labels, one per
+//                    atom_ids slot (community ids are FRESH integers
+//                    minted per level; the final label is the level-0
+//                    atom's super-community id at the LAST level).
+//     - communities: canonical [[community_id, [atom_id, ...]], ...]
+//                    table, sorted ascending by community_id.
+//     - total_edges: number of UNIQUE undirected edges in the original
+//                    graph (each xref counted once; (a -> b) fused
+//                    with (b -> a)).
+//     - levels:      number of Phase 1 + Phase 2 iterations actually
+//                    performed (<= max_iter; could be 0 if the graph is
+//                    empty).
+//     - dendrogram:  list of per-level partition records. Each entry is
+//                    [n_communities, labels_at_this_level_for_atom_ids]
+//                    -- captures the hierarchical merge tree from
+//                    finest (level 0: every atom its own community) to
+//                    coarsest (final level).
+//
+// ADRs implemented: ADR-0016 (atom xrefs ARE the links we cluster over),
+//   ADR-0049 (testing). Companion to ADR-0017 (cross-KG): like R11F,
+//   Louvain here clusters within a single KG.
+// NOVA dependencies: builtins (lists, push, list_set, len);
+//   std/io + std/string for the chat dispatch helpers (io_println,
+//   int_to_str).
+// CrossEngin dependencies: src/kg/atom_store.nova (atom_id, atom_xrefs),
+//   src/kg/multi_kg_manager.nova (kg_atoms, kg_label),
+//   src/kg/cross_kg_references.nova (xref_*),
+//   src/substrate/node_pool_manager.nova (FP_SCALE).
+
+import "std/io"
+import "std/string"
+import "../substrate/node_pool_manager.nova"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+import "cross_kg_references.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let LV_DEFAULT_MAX_ITER = 10    // each iter == one Phase 1 + Phase 2 cycle;
+                                // empirical Blondel: 3..5 levels suffices on
+                                // millions-of-edge graphs, so 10 is generous.
+let LV_DEFAULT_SEED     = 0     // deterministic LCG seed for shuffles.
+
+// Phase 1 inner loop bound -- never sweep the same level more than this
+// many times before declaring local optimum. Empirically 1..3 sweeps
+// suffice on the unit-test fixtures.
+let LV_INNER_MAX        = 20
+
+// ---- louvain_result layout ------------------------------------------------
+let LV_OBJ_TAG       = 2101     // distinct from GC_OBJ_TAG (2001),
+                                // SS_OBJ_TAG (1901), ANN_OBJ_TAG (1801).
+let LV_TAG           = 0
+let LV_ATOM_IDS      = 1
+let LV_LABELS        = 2
+let LV_COMMUNITIES   = 3
+let LV_TOTAL_EDGES   = 4
+let LV_LEVELS        = 5
+let LV_DENDROGRAM    = 6
+
+// Community-table slot offsets.
+let LV_COMM_ID       = 0
+let LV_COMM_MEMBERS  = 1
+
+// Dendrogram entry slot offsets.
+let LV_DG_NCOMM      = 0
+let LV_DG_LABELS     = 1
+
+// ---- deterministic shuffle ------------------------------------------
+//
+// Same shift-xor mixer pattern as R11F's _gc_rand_next: 15-bit mask so
+// every multiply intermediate stays < 2^20 (NOVA codegen-bug threshold,
+// see NOVA_BUG_THRESHOLD.md). Output is a non-negative 15-bit integer
+// used only for compare ordering during the insertion sort.
+let _LV_RAND_MASK = 32767       // 15-bit cap.
+
+fn _lv_rand_next(state, salt) {
+    let h = state
+    if h == 0 { h = 5381 }    // djb2 seed; non-zero so the multiply does work
+    h = ((h * 31) + salt + 1) & _LV_RAND_MASK
+    return h
+}
+
+// Deterministic visit order: walk the mixer `n` times to fill a list of
+// [rand_key, node_index] pairs, sort by rand_key ascending, return the
+// resulting node-index list. Stable insertion sort -- ties preserve
+// original order.
+fn _lv_shuffle_order(n, seed) {
+    let pairs = list_new()
+    let state = seed + 1
+    if state <= 0 { state = 1 }
+    let i = 0
+    while i < n {
+        state = _lv_rand_next(state, i)
+        let pair = list_new()
+        push(pair, state)
+        push(pair, i)
+        push(pairs, pair)
+        i = i + 1
+    }
+    let m = len(pairs)
+    let k = 1
+    while k < m {
+        let cur = pairs[k]
+        let j = k - 1
+        let placed = 0
+        while j >= 0 {
+            if placed == 0 {
+                if pairs[j][0] > cur[0] {
+                    list_set(pairs, j + 1, pairs[j])
+                    j = j - 1
+                } else {
+                    list_set(pairs, j + 1, cur)
+                    placed = 1
+                    j = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(pairs, 0, cur) }
+        k = k + 1
+    }
+    let out = list_new()
+    let p = 0
+    while p < m {
+        push(out, pairs[p][1])
+        p = p + 1
+    }
+    return out
+}
+
+// ---- adjacency extraction (original graph) --------------------------------
+//
+// Same shape as R11F's _gc_extract_graph: dedup'd undirected adjacency,
+// dead-atom skipping, single-KG. We additionally record an EDGE WEIGHT
+// for each adjacency entry (= 1 for each unique xref edge in the
+// original graph; the aggregated graph at deeper Louvain levels uses
+// real summed weights).
+//
+// Returns [atom_ids, adj_nodes, adj_weights, total_edges, total_weight]:
+//   - atom_ids:     sorted-ascending list of live atom ids.
+//   - adj_nodes:    parallel list of neighbour-index lists (positions
+//                   INTO atom_ids).
+//   - adj_weights:  parallel list of weight lists; weights[i][j] is the
+//                   weight of the edge from atom_ids[i] to
+//                   atom_ids[adj_nodes[i][j]].
+//   - total_edges:  unique undirected edges (each counted ONCE).
+//   - total_weight: sum of all edge weights (2m == 2 * total_weight for
+//                   this initial unweighted graph; for the aggregated
+//                   graph 2m includes self-loops counted twice).
+fn _lv_extract_graph(kg) {
+    let atoms = kg_atoms(kg)
+    let my_kg_label = kg_label(kg)
+    let n_raw = len(atoms)
+
+    let atom_ids = list_new()
+    let i = 0
+    while i < n_raw {
+        let a = atoms[i]
+        if a != 0 {
+            push(atom_ids, atom_id(a))
+        }
+        i = i + 1
+    }
+
+    let n = len(atom_ids)
+    let adj_nodes = list_new()
+    let adj_weights = list_new()
+    let j = 0
+    while j < n {
+        push(adj_nodes, list_new())
+        push(adj_weights, list_new())
+        j = j + 1
+    }
+
+    let k = 0
+    while k < n_raw {
+        let a = atoms[k]
+        if a != 0 {
+            let src_idx = _lv_atom_pos(atom_ids, atom_id(a))
+            if src_idx >= 0 {
+                let xs = atom_xrefs(a)
+                let xi = 0
+                while xi < len(xs) {
+                    let x = xs[xi]
+                    let dst_kg = xref_dst_kg(x)
+                    let dst_id = xref_dst_atom(x)
+                    if str_eq(dst_kg, my_kg_label) == 1 {
+                        let dst_idx = _lv_atom_pos(atom_ids, dst_id)
+                        if dst_idx >= 0 {
+                            if dst_idx != src_idx {
+                                // Initial extraction: idempotent
+                                // dedupe (every pair appears at most
+                                // once in each endpoint's neighbour
+                                // list). Aggregation uses
+                                // _lv_neighbour_bump which SUMS
+                                // weights instead.
+                                _lv_neighbour_dedup(adj_nodes[src_idx],
+                                    adj_weights[src_idx], dst_idx, 1)
+                                _lv_neighbour_dedup(adj_nodes[dst_idx],
+                                    adj_weights[dst_idx], src_idx, 1)
+                            }
+                        }
+                    }
+                    xi = xi + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+
+    // Count unique edges + total weight (= sum of degrees / 2 for an
+    // undirected graph with no self-loops at level 0).
+    let sum_w = 0
+    let p = 0
+    while p < n {
+        let wlist = adj_weights[p]
+        let q = 0
+        while q < len(wlist) {
+            sum_w = sum_w + wlist[q]
+            q = q + 1
+        }
+        p = p + 1
+    }
+    let total_edges = sum_w / 2
+    let total_weight = total_edges    // == sum_w/2; no self-loops here.
+
+    let out = list_new()
+    push(out, atom_ids)
+    push(out, adj_nodes)
+    push(out, adj_weights)
+    push(out, total_edges)
+    push(out, total_weight)
+    return out
+}
+
+// Linear position-of in atom_ids; -1 if absent. Same pattern as R11F.
+fn _lv_atom_pos(atom_ids, target_id) {
+    let n = len(atom_ids)
+    let i = 0
+    while i < n {
+        if atom_ids[i] == target_id { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// AGGREGATION neighbour append: if `idx` is already in the list, BUMP
+// its weight by `w` (so when two original edges aggregate to the same
+// super-edge their weights SUM). Otherwise push it with weight w.
+// Used by _lv_aggregate.
+fn _lv_neighbour_bump(nbrs, weights, idx, w) {
+    let i = 0
+    while i < len(nbrs) {
+        if nbrs[i] == idx {
+            list_set(weights, i, weights[i] + w)
+            return 0
+        }
+        i = i + 1
+    }
+    push(nbrs, idx)
+    push(weights, w)
+    return 1
+}
+
+// IDEMPOTENT neighbour append: if `idx` is already present, leave it
+// alone (the duplicate xref doesn't add a second edge). Used by the
+// initial graph extractor so the original-graph edge count matches
+// R11F's gc_total_edges exactly.
+fn _lv_neighbour_dedup(nbrs, weights, idx, w) {
+    let i = 0
+    while i < len(nbrs) {
+        if nbrs[i] == idx { return 0 }
+        i = i + 1
+    }
+    push(nbrs, idx)
+    push(weights, w)
+    return 1
+}
+
+// ---- node-degree helpers -------------------------------------------------
+//
+// Weighted degree of a node: sum of its neighbour-edge weights. The
+// aggregated-graph self-loop (an edge from a community-node to itself)
+// counts TWICE toward the weighted degree, per the standard modularity
+// convention. We store self-loops as a single (idx==self) entry with
+// the doubled weight already baked in -- see _lv_aggregate.
+fn _lv_weighted_degree(adj_nodes, adj_weights, u) {
+    let nbrs = adj_nodes[u]
+    let ws = adj_weights[u]
+    let n = len(nbrs)
+    let d = 0
+    let i = 0
+    while i < n {
+        d = d + ws[i]
+        i = i + 1
+    }
+    return d
+}
+
+// ---- Phase 1: local modularity optimisation ------------------------------
+//
+// labels[u] is the community id of node u (initially u itself). For
+// each node in the shuffled order we compute the DQ of moving it into
+// every neighbour-reachable community + into its current community
+// (the no-op baseline); pick the largest STRICTLY POSITIVE gain.
+//
+// To compute DQ we need, per community C:
+//   - Sigma_tot_C: sum of weighted degrees of every node in C.
+// We maintain a parallel `sigma_tot[c]` map that mirrors labels and
+// gets updated when a node moves out / in. The map is INDEXED BY THE
+// node id of the community's representative -- since communities are
+// labelled by one of their members, sigma_tot has the same length as
+// labels.
+//
+// Returns 1 if any node moved in this sweep, 0 otherwise.
+fn _lv_phase1_sweep(adj_nodes, adj_weights, labels, sigma_tot,
+        two_m, order, node_deg) {
+    let n = len(labels)
+    let moved = 0
+    let i = 0
+    while i < n {
+        let u = order[i]
+        let nbrs = adj_nodes[u]
+        let ws = adj_weights[u]
+        let deg_u = node_deg[u]
+        let cur_c = labels[u]
+
+        // Tally k_u_in for each candidate community (label -> sum of
+        // edge weights from u to that community). Skip self-loops (they
+        // don't reach a neighbour community in the move sense -- they
+        // attach to u's CURRENT community no matter where u goes, so
+        // they cancel out of the gain comparison).
+        //
+        // tally: list of [community_id, k_u_in].
+        let tally = list_new()
+        let d = len(nbrs)
+        let j = 0
+        while j < d {
+            let v = nbrs[j]
+            let w_uv = ws[j]
+            if v != u {
+                let c_v = labels[v]
+                let found = -1
+                let t = 0
+                while t < len(tally) {
+                    if found < 0 {
+                        if tally[t][0] == c_v { found = t }
+                    }
+                    t = t + 1
+                }
+                if found >= 0 {
+                    list_set(tally[found], 1, tally[found][1] + w_uv)
+                } else {
+                    let entry = list_new()
+                    push(entry, c_v)
+                    push(entry, w_uv)
+                    push(tally, entry)
+                }
+            }
+            j = j + 1
+        }
+
+        // Ensure cur_c is in the tally (as 0 contribution if u has no
+        // intra-community edges). We compare the gain of staying vs.
+        // moving with the same baseline.
+        let has_cur = -1
+        let tc = 0
+        while tc < len(tally) {
+            if has_cur < 0 {
+                if tally[tc][0] == cur_c { has_cur = tc }
+            }
+            tc = tc + 1
+        }
+        if has_cur < 0 {
+            let e = list_new()
+            push(e, cur_c)
+            push(e, 0)
+            push(tally, e)
+        }
+
+        // Find best community by gain. Removing u from cur_c first:
+        // Sigma_tot_cur_after_remove = sigma_tot[cur_c] - deg_u.
+        //
+        // For candidate community C:
+        //   gain_scaled = two_m * k_u_in_C - deg_u * Sigma_tot_C_effective
+        //   where Sigma_tot_C_effective =
+        //     sigma_tot[C] - deg_u   if C == cur_c (u is part of it now)
+        //     sigma_tot[C]           otherwise (u is NOT in C yet)
+        //
+        // The candidate "stay in cur_c" has gain_scaled = two_m *
+        // k_u_in_cur - deg_u * (sigma_tot[cur_c] - deg_u). This is
+        // the baseline; we MOVE only if some other community beats it
+        // strictly.
+        let best_c = cur_c
+        let best_gain = 0
+        let baseline_set = 0
+        let q = 0
+        while q < len(tally) {
+            let c_cand = tally[q][0]
+            let k_u_in = tally[q][1]
+            let sig_eff = sigma_tot[c_cand]
+            if c_cand == cur_c { sig_eff = sig_eff - deg_u }
+            let g = two_m * k_u_in - deg_u * sig_eff
+            if c_cand == cur_c {
+                best_c = cur_c
+                best_gain = g
+                baseline_set = 1
+            }
+            q = q + 1
+        }
+        // If cur_c wasn't in the tally (shouldn't happen after the
+        // insert above), guard against an unset baseline.
+        if baseline_set == 0 {
+            best_c = cur_c
+            best_gain = 0 - deg_u * (sigma_tot[cur_c] - deg_u)
+        }
+        // Now scan for strictly better candidates.
+        let q2 = 0
+        while q2 < len(tally) {
+            let c_cand = tally[q2][0]
+            let k_u_in = tally[q2][1]
+            if c_cand != cur_c {
+                let sig_eff = sigma_tot[c_cand]
+                let g = two_m * k_u_in - deg_u * sig_eff
+                let take = 0
+                if g > best_gain {
+                    take = 1
+                } else {
+                    if g == best_gain {
+                        // Deterministic tiebreak: prefer smaller label
+                        // id to keep results reproducible across
+                        // identical-gain candidates.
+                        if c_cand < best_c { take = 1 }
+                    }
+                }
+                if take == 1 {
+                    best_c = c_cand
+                    best_gain = g
+                }
+            }
+            q2 = q2 + 1
+        }
+
+        // Move u if best_c differs AND the gain is STRICTLY POSITIVE
+        // against the cur_c baseline. (The Blondel paper accepts ties;
+        // we don't, for determinism.)
+        //
+        // Compute the strict-improvement check: gain_move - gain_stay > 0.
+        // We've already computed gain_stay (when c == cur_c). Recompute
+        // for the best non-cur candidate.
+        if best_c != cur_c {
+            // Find best_c's k_u_in.
+            let k_in_best = 0
+            let qb = 0
+            while qb < len(tally) {
+                if tally[qb][0] == best_c { k_in_best = tally[qb][1] }
+                qb = qb + 1
+            }
+            // gain_move = two_m * k_in_best - deg_u * sigma_tot[best_c]
+            // gain_stay = two_m * k_u_in_cur - deg_u * (sigma_tot[cur_c] - deg_u)
+            let k_in_cur = 0
+            let qc = 0
+            while qc < len(tally) {
+                if tally[qc][0] == cur_c { k_in_cur = tally[qc][1] }
+                qc = qc + 1
+            }
+            let gain_move = two_m * k_in_best - deg_u * sigma_tot[best_c]
+            let gain_stay = two_m * k_in_cur - deg_u * (sigma_tot[cur_c] - deg_u)
+            if gain_move > gain_stay {
+                // Perform the move.
+                list_set(sigma_tot, cur_c, sigma_tot[cur_c] - deg_u)
+                list_set(sigma_tot, best_c, sigma_tot[best_c] + deg_u)
+                list_set(labels, u, best_c)
+                moved = 1
+            }
+        }
+        i = i + 1
+    }
+    return moved
+}
+
+// ---- Phase 2: community aggregation --------------------------------------
+//
+// Given the level's adj_nodes/adj_weights and labels, build a new
+// (smaller) graph where every Phase-1 community becomes a single
+// super-node. Edges:
+//   - Inter-community edges sum to weighted edges between the new
+//     super-nodes.
+//   - Intra-community edges sum to SELF-LOOPS on the new super-node;
+//     each such edge is counted ONCE in the self-loop entry (which
+//     contributes TWICE to the super-node's weighted degree, matching
+//     modularity convention).
+//
+// Returns:
+//   [new_adj_nodes, new_adj_weights, super_label_of_old, n_super_nodes,
+//    member_lists]
+//   - new_adj_nodes[s]:    neighbour super-node indices (incl. self).
+//   - new_adj_weights[s]:  parallel weight list.
+//   - super_label_of_old[u]: the super-node index that old node u maps
+//                            to (so callers can lift Phase-1 labels into
+//                            Phase-2's index space).
+//   - n_super_nodes:       number of distinct communities at this level.
+//   - member_lists[s]:     list of OLD node indices that aggregated
+//                          into super-node s (used by the level-roll-up
+//                          step to compose dendrogram entries).
+fn _lv_aggregate(adj_nodes, adj_weights, labels) {
+    let n = len(labels)
+
+    // Build label -> super_index map. Walk labels[]; for each fresh
+    // label, mint the next super_index. Use a small flat lookup since
+    // n is bounded.
+    let label_keys = list_new()
+    let label_sup = list_new()
+    let super_label_of_old = list_new()
+    let i = 0
+    while i < n {
+        let lab = labels[i]
+        let found = -1
+        let j = 0
+        while j < len(label_keys) {
+            if found < 0 {
+                if label_keys[j] == lab { found = j }
+            }
+            j = j + 1
+        }
+        let s = 0
+        if found >= 0 {
+            s = label_sup[found]
+        } else {
+            s = len(label_keys)
+            push(label_keys, lab)
+            push(label_sup, s)
+        }
+        push(super_label_of_old, s)
+        i = i + 1
+    }
+
+    let n_super = len(label_keys)
+    let new_adj_nodes = list_new()
+    let new_adj_weights = list_new()
+    let member_lists = list_new()
+    let k = 0
+    while k < n_super {
+        push(new_adj_nodes, list_new())
+        push(new_adj_weights, list_new())
+        push(member_lists, list_new())
+        k = k + 1
+    }
+
+    // Bucket old nodes into member_lists.
+    let m = 0
+    while m < n {
+        push(member_lists[super_label_of_old[m]], m)
+        m = m + 1
+    }
+
+    // Walk every old edge once (use adj's lower-index source to dedup
+    // -- in adj_nodes[u] every neighbour v appears once, and we'll
+    // emit only the u <= v ordering for inter-community edges; for
+    // intra-community edges we likewise count once).
+    let u = 0
+    while u < n {
+        let su = super_label_of_old[u]
+        let nbrs = adj_nodes[u]
+        let ws = adj_weights[u]
+        let d = len(nbrs)
+        let p = 0
+        while p < d {
+            let v = nbrs[p]
+            let w_uv = ws[p]
+            // Dedup undirected: only process v >= u (each pair lands
+            // through one of the two endpoints).
+            if v >= u {
+                let sv = super_label_of_old[v]
+                if su == sv {
+                    // Intra-community: self-loop on super-node su.
+                    // Each edge counted once (weight w_uv).
+                    _lv_neighbour_bump(new_adj_nodes[su],
+                        new_adj_weights[su], su, w_uv)
+                } else {
+                    // Inter-community: edge su <-> sv with weight w_uv.
+                    _lv_neighbour_bump(new_adj_nodes[su],
+                        new_adj_weights[su], sv, w_uv)
+                    _lv_neighbour_bump(new_adj_nodes[sv],
+                        new_adj_weights[sv], su, w_uv)
+                }
+            }
+            p = p + 1
+        }
+        u = u + 1
+    }
+
+    let out = list_new()
+    push(out, new_adj_nodes)
+    push(out, new_adj_weights)
+    push(out, super_label_of_old)
+    push(out, n_super)
+    push(out, member_lists)
+    return out
+}
+
+// Initial labels: every node in its own community (label = its index).
+// Initial sigma_tot[c] = weighted degree of node c (since c is alone).
+// Returns [labels, sigma_tot, node_deg, two_m].
+fn _lv_init_level(adj_nodes, adj_weights) {
+    let n = len(adj_nodes)
+    let labels = list_new()
+    let sigma_tot = list_new()
+    let node_deg = list_new()
+    let two_m = 0
+    let i = 0
+    while i < n {
+        let d = _lv_weighted_degree(adj_nodes, adj_weights, i)
+        push(labels, i)
+        push(sigma_tot, d)
+        push(node_deg, d)
+        two_m = two_m + d
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, labels)
+    push(out, sigma_tot)
+    push(out, node_deg)
+    push(out, two_m)
+    return out
+}
+
+// Run Phase 1 to a local-optimum on the level's graph. Returns the
+// final labels list. `seed` controls the visit order.
+fn _lv_phase1(adj_nodes, adj_weights, seed) {
+    let init = _lv_init_level(adj_nodes, adj_weights)
+    let labels = init[0]
+    let sigma_tot = init[1]
+    let node_deg = init[2]
+    let two_m = init[3]
+    let n = len(labels)
+    if n == 0 { return labels }
+    if two_m <= 0 {
+        // No edges -- every node stays in its own community.
+        return labels
+    }
+    let order = _lv_shuffle_order(n, seed)
+    let inner = 0
+    let done = 0
+    while inner < LV_INNER_MAX {
+        if done == 0 {
+            let moved = _lv_phase1_sweep(adj_nodes, adj_weights,
+                labels, sigma_tot, two_m, order, node_deg)
+            if moved == 0 { done = 1 }
+        }
+        inner = inner + 1
+    }
+    return labels
+}
+
+// ---- public API ----------------------------------------------------------
+
+// Run Louvain on the KG's link graph with a deterministic shuffle
+// seeded by `seed`. Returns a louvain_result. max_iter <= 0 falls back
+// to LV_DEFAULT_MAX_ITER; seed = LV_DEFAULT_SEED uses the default.
+//
+// Edge cases:
+//   - Empty KG (no atoms): 0 communities, total_edges = 0, levels = 0,
+//     dendrogram empty.
+//   - Single atom, no xrefs: 1 community of size 1, total_edges = 0,
+//     levels = 1 (we record the trivial level for dendrogram clarity).
+//   - Disconnected atoms / pairs: every disconnected component lands in
+//     its own community (Phase 1 can't merge across a missing edge).
+fn louvain_communities_seeded(kg, max_iter, seed) {
+    let mx = max_iter
+    if mx <= 0 { mx = LV_DEFAULT_MAX_ITER }
+
+    let g = _lv_extract_graph(kg)
+    let atom_ids = g[0]
+    let orig_adj_nodes = g[1]
+    let orig_adj_weights = g[2]
+    let total_edges = g[3]
+    let n = len(atom_ids)
+
+    let dendrogram = list_new()
+
+    // Empty graph -- short-circuit.
+    if n == 0 {
+        let empty_r = list_new()
+        push(empty_r, LV_OBJ_TAG)
+        push(empty_r, atom_ids)
+        push(empty_r, list_new())   // labels
+        push(empty_r, list_new())   // communities
+        push(empty_r, total_edges)
+        push(empty_r, 0)
+        push(empty_r, dendrogram)
+        return empty_r
+    }
+
+    // Per-level state. `cur_adj_nodes/_weights` start as the original
+    // graph; after each Phase 2 they become the aggregated graph.
+    let cur_adj_nodes = orig_adj_nodes
+    let cur_adj_weights = orig_adj_weights
+
+    // `atom_super` maps original-atom indices to the super-node index
+    // at the CURRENT level. Initially each atom is its own super-node.
+    let atom_super = list_new()
+    let i0 = 0
+    while i0 < n {
+        push(atom_super, i0)
+        i0 = i0 + 1
+    }
+
+    let level_iter = 0
+    let level_seed = seed
+    let stopped = 0
+    while level_iter < mx {
+        if stopped == 0 {
+            // Phase 1 on the current graph.
+            let new_labels = _lv_phase1(cur_adj_nodes, cur_adj_weights,
+                level_seed)
+
+            // Lift super-node labels back to original-atom labels for
+            // the dendrogram entry. atom_super[i] is the super-node
+            // index at THIS level, and new_labels[super] is that
+            // super-node's Phase-1 label.
+            let atom_labels = list_new()
+            let ai = 0
+            while ai < n {
+                push(atom_labels, new_labels[atom_super[ai]])
+                ai = ai + 1
+            }
+
+            // Count distinct Phase-1 communities (in the level's super-
+            // node space).
+            let n_phase1_comm = _lv_distinct_count(new_labels)
+
+            // Record dendrogram entry: at this level we now have
+            // n_phase1_comm super-communities; atom_labels lifts to
+            // every original atom.
+            let dg_entry = list_new()
+            push(dg_entry, n_phase1_comm)
+            push(dg_entry, atom_labels)
+            push(dendrogram, dg_entry)
+
+            // Termination check: if Phase 1 produced as many
+            // super-communities as there were super-nodes going in,
+            // nothing merged -> we're done.
+            let n_supers_in = len(cur_adj_nodes)
+            if n_phase1_comm >= n_supers_in {
+                stopped = 1
+            } else {
+                // Phase 2: aggregate.
+                let agg = _lv_aggregate(cur_adj_nodes,
+                    cur_adj_weights, new_labels)
+                cur_adj_nodes = agg[0]
+                cur_adj_weights = agg[1]
+                let super_label_of_old = agg[2]
+
+                // Update atom_super: every original atom's super-node
+                // index is now super_label_of_old[old_super].
+                let bi = 0
+                while bi < n {
+                    list_set(atom_super, bi,
+                        super_label_of_old[atom_super[bi]])
+                    bi = bi + 1
+                }
+
+                level_seed = level_seed + 1   // different shuffle per level
+            }
+        }
+        level_iter = level_iter + 1
+    }
+    // `levels` now records how many DENDROGRAM ENTRIES we appended --
+    // every Phase-1 sweep we actually ran adds one entry, so this is
+    // the natural "depth" measure (= number of Louvain levels).
+    let levels = len(dendrogram)
+
+    // The FINAL labels for the original atoms: the current atom_super
+    // index (which points into the most-recent aggregated graph; that
+    // super-node index IS the final community id, fresh-minted, dense).
+    let final_labels = list_new()
+    let f = 0
+    while f < n {
+        push(final_labels, atom_super[f])
+        f = f + 1
+    }
+
+    let communities = _lv_build_communities(atom_ids, final_labels)
+
+    let r = list_new()
+    push(r, LV_OBJ_TAG)
+    push(r, atom_ids)
+    push(r, final_labels)
+    push(r, communities)
+    push(r, total_edges)
+    push(r, levels)
+    push(r, dendrogram)
+    return r
+}
+
+// Convenience: default seed.
+fn louvain_communities(kg, max_iter) {
+    return louvain_communities_seeded(kg, max_iter, LV_DEFAULT_SEED)
+}
+
+// Helper: count distinct labels in a list.
+fn _lv_distinct_count(labels) {
+    let seen = list_new()
+    let n = len(labels)
+    let i = 0
+    while i < n {
+        let lab = labels[i]
+        let found = 0
+        let j = 0
+        while j < len(seen) {
+            if found == 0 {
+                if seen[j] == lab { found = 1 }
+            }
+            j = j + 1
+        }
+        if found == 0 { push(seen, lab) }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// Build the canonical communities table from atom_ids + final_labels.
+// Sorted by community_id ascending; members sorted by atom_id
+// ascending. Same shape as R11F's _gc_build_communities so callers can
+// reuse query patterns.
+fn _lv_build_communities(atom_ids, labels) {
+    let n = len(labels)
+    let by_label = list_new()
+    let i = 0
+    while i < n {
+        let lab = labels[i]
+        let aid = atom_ids[i]
+        let found = -1
+        let j = 0
+        while j < len(by_label) {
+            if found < 0 {
+                if by_label[j][LV_COMM_ID] == lab { found = j }
+            }
+            j = j + 1
+        }
+        if found >= 0 {
+            push(by_label[found][LV_COMM_MEMBERS], aid)
+        } else {
+            let entry = list_new()
+            push(entry, lab)
+            let members = list_new()
+            push(members, aid)
+            push(entry, members)
+            push(by_label, entry)
+        }
+        i = i + 1
+    }
+    // Insertion sort by community_id ascending.
+    let m = len(by_label)
+    let k = 1
+    while k < m {
+        let cur = by_label[k]
+        let p = k - 1
+        let placed = 0
+        while p >= 0 {
+            if placed == 0 {
+                if by_label[p][LV_COMM_ID] > cur[LV_COMM_ID] {
+                    list_set(by_label, p + 1, by_label[p])
+                    p = p - 1
+                } else {
+                    list_set(by_label, p + 1, cur)
+                    placed = 1
+                    p = 0 - 1
+                }
+            }
+        }
+        if placed == 0 { list_set(by_label, 0, cur) }
+        k = k + 1
+    }
+    return by_label
+}
+
+// Public accessors. Callers should never poke raw slot indices.
+
+fn louvain_total_edges(r) { return r[LV_TOTAL_EDGES] }
+fn louvain_levels(r)      { return r[LV_LEVELS] }
+fn louvain_dendrogram(r)  { return r[LV_DENDROGRAM] }
+
+// Community id for `atom_id`; -1 if absent.
+fn louvain_label_at(r, target_id) {
+    let atom_ids = r[LV_ATOM_IDS]
+    let labels = r[LV_LABELS]
+    let i = 0
+    while i < len(atom_ids) {
+        if atom_ids[i] == target_id { return labels[i] }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Number of distinct communities in the FINAL partition.
+fn louvain_community_count(r) {
+    return len(r[LV_COMMUNITIES])
+}
+
+// Members of a community, sorted ascending. Returns a fresh list.
+// Empty list if the community is missing.
+fn louvain_community_members(r, community_id) {
+    let comms = r[LV_COMMUNITIES]
+    let i = 0
+    while i < len(comms) {
+        if comms[i][LV_COMM_ID] == community_id {
+            let out = list_new()
+            let members = comms[i][LV_COMM_MEMBERS]
+            let j = 0
+            while j < len(members) {
+                push(out, members[j])
+                j = j + 1
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return list_new()
+}
+
+// Largest community: [community_id, size]. Ties break by lowest
+// community_id. Returns [-1, 0] when there are no communities.
+fn louvain_largest_community(r) {
+    let comms = r[LV_COMMUNITIES]
+    let best_id = 0 - 1
+    let best_sz = 0
+    let i = 0
+    while i < len(comms) {
+        let sz = len(comms[i][LV_COMM_MEMBERS])
+        let take = 0
+        if sz > best_sz {
+            take = 1
+        } else {
+            if sz == best_sz {
+                if best_id < 0 { take = 1 } else {
+                    if comms[i][LV_COMM_ID] < best_id { take = 1 }
+                }
+            }
+        }
+        if take == 1 {
+            best_id = comms[i][LV_COMM_ID]
+            best_sz = sz
+        }
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, best_id)
+    push(out, best_sz)
+    return out
+}
+
+// Newman modularity in milli on the ORIGINAL graph + the final
+// partition. Same formula as R11F's gc_modularity:
+//   Q = sum_c (e_cc / m  -  (a_c / (2m))^2)
+//     = (sum_c e_cc) / m  -  (sum_c a_c^2) / (4 * m^2)
+// In milli: scale numerators by FP_SCALE (= 1000); subtract; integer
+// truncation at every divide.
+fn louvain_modularity(kg, r) {
+    let m = r[LV_TOTAL_EDGES]
+    if m <= 0 { return 0 }
+
+    let g = _lv_extract_graph(kg)
+    let atom_ids = g[0]
+    let adj_nodes = g[1]
+    // adj_weights = g[2]   // unweighted at level 0 so deg = len(nbrs)
+
+    let n = len(atom_ids)
+    let labels = list_new()
+    let i = 0
+    while i < n {
+        push(labels, louvain_label_at(r, atom_ids[i]))
+        i = i + 1
+    }
+
+    // Group positions by label (same as R11F).
+    let groups = list_new()
+    let j = 0
+    while j < n {
+        let lab = labels[j]
+        let found = -1
+        let k = 0
+        while k < len(groups) {
+            if found < 0 {
+                if groups[k][0] == lab { found = k }
+            }
+            k = k + 1
+        }
+        if found >= 0 {
+            push(groups[found][1], j)
+        } else {
+            let entry = list_new()
+            push(entry, lab)
+            let pos_list = list_new()
+            push(pos_list, j)
+            push(entry, pos_list)
+            push(groups, entry)
+        }
+        j = j + 1
+    }
+
+    let sum_intra = 0
+    let sum_a_sq = 0
+    let gi = 0
+    while gi < len(groups) {
+        let members = groups[gi][1]
+        let a_c = 0
+        let intra_double = 0
+        let p = 0
+        while p < len(members) {
+            let pos = members[p]
+            let nbrs = adj_nodes[pos]
+            let deg = len(nbrs)
+            a_c = a_c + deg
+            let q = 0
+            while q < deg {
+                let nbr_pos = nbrs[q]
+                if labels[nbr_pos] == labels[pos] {
+                    intra_double = intra_double + 1
+                }
+                q = q + 1
+            }
+            p = p + 1
+        }
+        let intra = intra_double / 2
+        sum_intra = sum_intra + intra
+        sum_a_sq = sum_a_sq + a_c * a_c
+        gi = gi + 1
+    }
+
+    let term1 = (sum_intra * FP_SCALE) / m
+    let four_m_sq = 4 * m * m
+    let term2 = 0
+    if four_m_sq > 0 {
+        term2 = (sum_a_sq * FP_SCALE) / four_m_sq
+    }
+    return term1 - term2
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/louvain` admin: runs Louvain on the live KG and reports the
+// headline triple (# communities, modularity milli, depth). Mirrors
+// the emit-line discipline of /communities.
+fn louvain_communities_cmd(kg) {
+    let r = louvain_communities(kg, LV_DEFAULT_MAX_ITER)
+    let n_comm = louvain_community_count(r)
+    let big = louvain_largest_community(r)
+    let big_sz = big[1]
+    let q_milli = louvain_modularity(kg, r)
+    let depth = louvain_levels(r)
+    io_println("LOUVAIN n=" + int_to_str(n_comm)
+        + " largest=" + int_to_str(big_sz)
+        + " modularity=" + int_to_str(q_milli) + " milli"
+        + " edges=" + int_to_str(louvain_total_edges(r))
+        + " depth=" + int_to_str(depth))
+    return 1
+}

@@ -1,0 +1,774 @@
+// CrossEngin io/transducers: spectral-subtraction Wiener noise reduction
+// (R26C).
+//
+// Purpose
+//   Closes the **denoising** gap in CrossEngin's audio chain. R14E's noise
+//   gate attenuates whole sub-threshold windows wholesale; that's perfect
+//   for chopping silences but it leaves the noise floor that overlaps a
+//   speech utterance intact -- a quiet hiss UNDER a Klatt vowel still
+//   passes the gate because the vowel keeps the envelope above the
+//   threshold. R26C subtracts the noise in the **frequency domain**, so
+//   the bins occupied by the speech harmonics stay loud while the broad
+//   noise floor between them gets pulled down.
+//
+//   This is the classical move that pre-DNN telephony / hearing-aid /
+//   ASR-preprocessing systems have leaned on for decades (Boll 1979 for
+//   straight spectral subtraction; Lim & Oppenheim 1979 for the
+//   minimum-mean-square-error / Wiener formulation). Two motivating
+//   downstream cases for CrossEngin:
+//
+//     1. **TTS -> STT loop quality.** R25B's voice-conversation demo
+//        synthesizes a response with Klatt (R6E) and round-trips it
+//        through whisper.cpp (R8B). Whisper sometimes mis-hears a clean
+//        Klatt vowel because the integer-quantized formant carrier sits
+//        on top of a low-amplitude hash from the synthesizer's phase
+//        accumulator. Pre-filtering with /denoise pulls the hash floor
+//        down without touching the formant peaks.
+//     2. **General WAV cleanup.** Recordings from `audio_capture` carry
+//        whatever room/preamp noise the operator's hardware injects.
+//        A single /denoise pass moves transcript accuracy noticeably on
+//        recordings made outside a quiet booth.
+//
+//   Algorithm: spectral-subtraction Wiener filter, frame by frame.
+//
+//     1. **Estimate noise** from a leading silence frame (first 300 ms
+//        by default -- the VAD R7F-corroborated assumption that no
+//        speech begins inside that window). Take an STFT-aligned FFT of
+//        each noise frame and average the magnitude-squared per bin into
+//        the noise PSD estimate |N(k)|^2.
+//     2. **Per-frame STFT** of the rest of the input. Hann window,
+//        radix-2 FFT, identical analysis parameters to R16E so the noise
+//        estimate's bins align.
+//     3. **Wiener gain** per bin:
+//          H(k) = max(0, |X(k)|^2 - |N(k)|^2) / |X(k)|^2
+//        Clamped to [0.05, 1.0] in milli (50..1000) to avoid the classic
+//        spectral-subtraction "musical noise": when H drops to zero on
+//        sub-noise bins the inverse FFT introduces random sinusoidal
+//        bursts that sound worse than the noise we were trying to kill.
+//        A 5% gain floor (Berouti et al. 1979's "spectral floor") leaves
+//        a tiny residual which the ear hears as "quiet" rather than
+//        "tone artifacts".
+//     4. **Apply** the gain to the COMPLEX X(k) (so the original phase
+//        rides through unchanged) and inverse-FFT each frame back to the
+//        time domain.
+//     5. **Overlap-add** reconstruction with a synthesis window. The
+//        analysis Hann window already multiplied the input frame; we
+//        accumulate (windowed_inverse / hann_squared_sum) into the
+//        output buffer so the constant-overlap-add property of Hann at
+//        50% overlap reconstructs the unwindowed signal exactly (modulo
+//        FFT rounding).
+//
+//   Caps: total samples <= 480000 (30 s @ 16 kHz), matching R12D / R14E /
+//   R16E. Frame size fixed at 512 / hop 256 (the R16E default) for now;
+//   future revisions can plumb the analysis frame through.
+//
+//   Honest scope. Spectral subtraction is the simplest noise reduction.
+//   Modern approaches (DNN-based / DeepFilterNet / RNNoise) require
+//   trained models. R26C ships the classical integer Wiener that gives
+//   ~10-15 dB SNR improvement on stationary noise (white / pink / hum)
+//   under speech. Future work R26C.2:
+//     * **Multi-band Wiener.** Independent noise estimates per Mel band
+//       so non-stationary noise (a passing car, a slamming door) gets
+//       tracked instead of averaged into oblivion.
+//     * **Continuous noise re-estimation.** Track the inter-utterance
+//       silences and refresh the noise PSD as the recording progresses.
+//     * **Soft-decision Wiener.** Replace the hard floor with a
+//       probability-weighted gain (Ephraim-Malah 1984).
+//     * **VAD-driven noise tracking.** Let R7F's energy + ZCR detector
+//       mark the noise-only frames automatically instead of trusting the
+//       leading 300 ms.
+//
+// ADRs: ADR-0014 (audio modality bridge, frequency-domain leg).
+// NOVA dependencies: builtins -- alloc, list_new, push, list_set, len,
+//   int_mul / int_add / int_sub / int_div / int_shr / int_shl / int_and /
+//   int_or, str_eq, int_to_str, str_trim, split, char_at, chr (NO
+//   syscalls in the hot path; the module is pure -- caller does I/O).
+// CrossEngin dependencies:
+//   * audio_spectrogram (R16E) for the FFT / iFFT primitives and the
+//     window cache. We reuse fft_radix2 / ifft_radix2 directly rather
+//     than re-implementing the Cooley-Tukey butterfly -- the noise-
+//     reduction code is the gain layer on top, not a second FFT impl.
+//   * audio_capture (R8B-adjacent) for the WAV round-trip in the chat
+//     /denoise helper at the bottom of the file.
+
+import "audio_spectrogram.nova"
+import "audio_capture.nova"
+
+// ---- public caps + defaults ----------------------------------------------
+
+// Maximum number of input samples accepted by `nr_reduce`. Matches R12D /
+// R14E / R16E caps (30 s @ 16 kHz).
+let NR_MAX_SAMPLES = 480000
+
+// Sample-rate band -- inherited from R16E's clamp. Outside this range we
+// pin to the nearest end (matching the spectrogram behaviour).
+let NR_RATE_MIN = 8000
+let NR_RATE_MAX = 48000
+
+// Leading silence window for the convenience nr_reduce path. 300 ms is
+// the brief default: long enough to average 9-19 FFT frames at the
+// canonical 16 kHz hop=256 / 8 kHz hop=128, short enough that real
+// speech starting at 250 ms isn't included in the noise estimate.
+let NR_LEADING_MS_DEFAULT = 300
+
+// Wiener gain floor in milli (1000 == unity). 50 milli == 0.05; below
+// this the spectral-subtraction "musical noise" becomes audible. Above
+// this the residual noise is inaudible against typical PCM16 dither.
+let NR_GAIN_FLOOR_MILLI = 50
+let NR_GAIN_CEIL_MILLI  = 1000
+
+// Frame / hop -- fixed for now at the R16E 16 kHz default. Future
+// revisions can scale these per sample rate (the inner FFT doesn't care)
+// but the noise-estimate-bin / cleaned-frame-bin alignment requires
+// callers use the SAME frame size across nr_estimate_noise and
+// nr_apply_wiener.
+let NR_FRAME_SIZE_16K = 512
+let NR_HOP_SIZE_16K   = 256
+let NR_FRAME_SIZE_8K  = 256
+let NR_HOP_SIZE_8K    = 128
+
+let NR_MILLI = 1000
+
+// ---- public constant accessors -------------------------------------------
+
+fn nr_max_samples()         { return NR_MAX_SAMPLES }
+fn nr_leading_ms_default()  { return NR_LEADING_MS_DEFAULT }
+fn nr_gain_floor_milli()    { return NR_GAIN_FLOOR_MILLI }
+fn nr_gain_ceil_milli()     { return NR_GAIN_CEIL_MILLI }
+fn nr_frame_size_for_rate(sr) {
+    if sr <= 8000 { return NR_FRAME_SIZE_8K }
+    return NR_FRAME_SIZE_16K
+}
+fn nr_hop_size_for_rate(sr) {
+    if sr <= 8000 { return NR_HOP_SIZE_8K }
+    return NR_HOP_SIZE_16K
+}
+
+// ---- integer helpers (mirror the R16E pattern) ---------------------------
+//
+// Per R14E / R16E: NOVA's smart `<` / `>` operators dispatch to a string
+// helper when either operand crosses ~1 MB. Per-bin |X|^2 sums and
+// noise-PSD accumulators routinely cross that threshold (a 16000-amp
+// sine FFT bin peak hits ~3e6; squared and summed across 10 frames
+// reaches ~3e13). Route all such compares through arithmetic-shift sign
+// extraction.
+
+fn _nr_int_lt(a, b) {
+    let d = int_sub(a, b)
+    let sign = int_shr(d, 63)
+    if sign == 0 { return 0 }
+    return 1
+}
+
+fn _nr_int_gt(a, b) { return _nr_int_lt(b, a) }
+
+fn _nr_abs(v) {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+fn _nr_clamp(v, lo, hi) {
+    let x = v
+    if x < lo { x = lo }
+    if x > hi { x = hi }
+    return x
+}
+
+fn _nr_clamp_rate(sr) {
+    let r = sr
+    if r < NR_RATE_MIN { r = NR_RATE_MIN }
+    if r > NR_RATE_MAX { r = NR_RATE_MAX }
+    return r
+}
+
+// Integer Newton sqrt, same shape as R16E _stft_isqrt. The PSD
+// accumulator can reach ~3e13 so the smart-op dispatch must NOT fire on
+// the inner comparison.
+fn _nr_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 4 { return 1 }
+    let x = n
+    let y = int_div(int_add(x, 1), 2)
+    let i = 0
+    while _nr_int_lt(y, x) == 1 {
+        if i >= 64 { return x }
+        x = y
+        y = int_div(int_add(x, int_div(n, x)), 2)
+        i = i + 1
+    }
+    return x
+}
+
+// PCM16 clip (mirrors _dsp_clip_pcm16). The inverse-FFT product is
+// roughly the same magnitude as the input PCM (Hann window has gain
+// 0.5 average; the squared overlap-add factor is 1.5; net ~PCM16) but
+// can occasionally overshoot on transient frames, so we clip.
+fn _nr_clip_pcm16(v) {
+    let x = v
+    let hi = 32767
+    let lo = 0 - 32768
+    if _nr_int_gt(x, hi) == 1 { x = hi }
+    if _nr_int_lt(x, lo) == 1 { x = lo }
+    return x
+}
+
+// ---- internal: per-frame FFT exposing real + imag -----------------------
+//
+// R16E's stft() collapses each frame to a magnitude list -- it discards
+// phase, so we cannot run the IFFT on the cleaned spectrum and get the
+// original phase back. We need the SAME windowed-FFT pipeline as R16E
+// but with the complex output preserved. The radix-2 butterfly itself
+// is in audio_spectrogram (fft_radix2 / ifft_radix2); we wrap the
+// windowing here.
+//
+// _nr_window_frame(pcm, start, N) -> [windowed_real_list, zero_imag_list]
+//   pcm    : input PCM list
+//   start  : frame start index (inclusive)
+//   N      : frame size (must match what R16E supports)
+//
+// Returns a 2-element list [real, imag]. If start + N > len(pcm) the
+// missing tail is padded with zeros (matches the iSTFT overlap-add
+// expectation that the analyzer sees zero-padded input).
+
+fn _nr_window_frame(pcm, start, N) {
+    let real_in = list_new()
+    let imag_in = list_new()
+    let hann = _nr_hann_for(N)
+    let total = len(pcm)
+    let n = 0
+    while n < N {
+        let idx = start + n
+        let s = 0
+        if idx >= 0 {
+            if idx < total { s = pcm[idx] }
+        }
+        let w = hann[n]
+        // (s * w) / 1000. Both operands well under 1 MB.
+        push(real_in, (s * w) / NR_MILLI)
+        push(imag_in, 0)
+        n = n + 1
+    }
+    let r = list_new()
+    push(r, real_in)
+    push(r, imag_in)
+    return r
+}
+
+// Mirror R16E's Hann cache so we don't recompute the window for every
+// noise / signal frame in a single call. R16E's _stft_hann_for is a
+// private helper -- we re-derive the table here with the same formula.
+// The runtime cost is one alloc per unique frame size per nr_reduce()
+// call.
+let _nr_hann_cache = 0
+
+fn _nr_hann_compute(N) {
+    let w = list_new()
+    if N <= 1 {
+        push(w, NR_MILLI)
+        return w
+    }
+    let n = 0
+    let denom = N - 1
+    while n < N {
+        let deg = (360 * n) / denom
+        let c = _nr_cos_deg_milli(deg)
+        // (1 - cos)/2 in milli == (1000 - c)/2
+        push(w, (NR_MILLI - c) / 2)
+        n = n + 1
+    }
+    return w
+}
+
+// Bhaskara sin approximation (deg in [0, 90]) -> milli.
+// (Same constants as R16E _stft_sin_milli_q so the windows agree.)
+fn _nr_sin_milli_q(deg) {
+    let prod = deg * (180 - deg)
+    let num = 4 * prod * NR_MILLI
+    let den = 40500 - prod
+    if den <= 0 { return NR_MILLI }
+    return num / den
+}
+
+fn _nr_sin_deg_milli(deg) {
+    let d = deg
+    while d < 0     { d = d + 360 }
+    while d >= 360  { d = d - 360 }
+    if d <= 90  { return _nr_sin_milli_q(d) }
+    if d <= 180 { return _nr_sin_milli_q(180 - d) }
+    if d <= 270 { return 0 - _nr_sin_milli_q(d - 180) }
+    return 0 - _nr_sin_milli_q(360 - d)
+}
+
+fn _nr_cos_deg_milli(deg) {
+    return _nr_sin_deg_milli(90 - deg)
+}
+
+fn _nr_hann_for(N) {
+    if _nr_hann_cache == 0 { _nr_hann_cache = list_new() }
+    let i = 0
+    while i < len(_nr_hann_cache) {
+        let entry = _nr_hann_cache[i]
+        if entry[0] == N { return entry[1] }
+        i = i + 1
+    }
+    let w = _nr_hann_compute(N)
+    let entry = list_new()
+    push(entry, N)
+    push(entry, w)
+    push(_nr_hann_cache, entry)
+    return w
+}
+
+// ---- nr_estimate_noise --------------------------------------------------
+//
+// nr_estimate_noise(pcm, sample_rate, leading_ms) -> noise_spectrum
+//
+//   noise_spectrum is a list of length frame_size/2 holding the
+//   per-bin noise magnitude (sqrt of the per-bin power-spectral-
+//   density average across the leading frames).
+//
+//   * pcm           : PCM16 input list (integer samples in [-32768..32767]).
+//   * sample_rate   : Hz; clamped to [NR_RATE_MIN, NR_RATE_MAX].
+//   * leading_ms    : noise-window length in ms. Pass 0 for the default
+//                     (NR_LEADING_MS_DEFAULT = 300).
+//
+//   If the input is shorter than one frame, returns an empty list -- the
+//   caller's nr_apply_wiener call will treat that as "no noise estimate
+//   available, pass the input through unchanged".
+//
+//   Special case: silent input (all zeros across the leading window)
+//   yields an all-zero noise spectrum -- which makes nr_apply_wiener a
+//   no-op (every gain stays at 1.0). That preserves the "pure signal
+//   round-trips ~unchanged" property required by the brief.
+
+fn nr_estimate_noise(pcm, sample_rate, leading_ms) {
+    let result = list_new()
+    let n = len(pcm)
+    if n <= 0 { return result }
+    if n > NR_MAX_SAMPLES { return result }
+    let sr = _nr_clamp_rate(sample_rate)
+    let lead_ms = leading_ms
+    if lead_ms <= 0 { lead_ms = NR_LEADING_MS_DEFAULT }
+
+    let frame_size = nr_frame_size_for_rate(sr)
+    let hop = nr_hop_size_for_rate(sr)
+    let half = int_shr(frame_size, 1)
+
+    // Convert leading_ms to a sample budget; cap at the actual input
+    // length so a short clip with all-noise still produces an estimate.
+    let lead_samples = int_div(int_mul(lead_ms, sr), 1000)
+    if lead_samples > n { lead_samples = n }
+    if lead_samples < frame_size {
+        // Not enough samples to slide one analysis frame: pad with zeros
+        // (a quiet noise estimate; the floor clamp handles it downstream).
+        let zk = 0
+        while zk < half {
+            push(result, 0)
+            zk = zk + 1
+        }
+        return result
+    }
+
+    // Accumulate per-bin power across the leading frames. The accumulator
+    // can reach ~3e13 on a loud noise (3e6 per bin per frame * 10 frames)
+    // -- well above 1 MB so every accumulator update uses int_add /
+    // int_mul.
+    let psd_acc = list_new()
+    let zk = 0
+    while zk < half {
+        push(psd_acc, 0)
+        zk = zk + 1
+    }
+
+    let start = 0
+    let frames = 0
+    let last_start = lead_samples - frame_size
+    while start <= last_start {
+        let wf = _nr_window_frame(pcm, start, frame_size)
+        let real_in = wf[0]
+        let imag_in = wf[1]
+        let f = fft_radix2(real_in, imag_in, frame_size)
+        let re = fft_real(f)
+        let im = fft_imag(f)
+        let k = 0
+        while k < half {
+            let rv = re[k]
+            let iv = im[k]
+            // |X|^2 fits in int63 (re,im <= ~3e6 -> squared ~9e12).
+            let p = int_add(int_mul(rv, rv), int_mul(iv, iv))
+            let prev = psd_acc[k]
+            list_set(psd_acc, k, int_add(prev, p))
+            k = k + 1
+        }
+        frames = frames + 1
+        start = start + hop
+    }
+
+    if frames == 0 {
+        // Shouldn't happen given the lead_samples >= frame_size guard
+        // above, but defend against integer rounding.
+        let zk2 = 0
+        while zk2 < half {
+            push(result, 0)
+            zk2 = zk2 + 1
+        }
+        return result
+    }
+
+    // Average the PSD then take sqrt for the per-bin noise magnitude.
+    let k2 = 0
+    while k2 < half {
+        let mean_p = int_div(psd_acc[k2], frames)
+        push(result, _nr_isqrt(mean_p))
+        k2 = k2 + 1
+    }
+    return result
+}
+
+// ---- nr_apply_wiener ---------------------------------------------------
+//
+// nr_apply_wiener(pcm, sample_rate, noise_spectrum) -> cleaned_pcm
+//
+//   Walks `pcm` with the R16E analysis grid (frame_size / hop tied to
+//   sample_rate). For each frame:
+//     1. Hann-window + FFT (via R16E fft_radix2).
+//     2. Compute per-bin Wiener gain:
+//          H = max(0, |X|^2 - |N|^2) / |X|^2
+//        clamped to [floor, 1.0] in milli. We compute everything in
+//        squared/sqrt-pair units to keep the magnitude in PCM-range
+//        integer arithmetic.
+//     3. Apply H to BOTH re and im of X (gain scales the complex value
+//        uniformly, preserving phase).
+//     4. iFFT each cleaned frame, multiply by Hann (the synthesis
+//        window), and overlap-add into the output buffer.
+//     5. Final pass: divide by the accumulated hann-squared sum so the
+//        50% Hann constant-overlap-add property reconstructs the
+//        original amplitude.
+//
+//   Inputs:
+//     * pcm           : PCM16 list.
+//     * sample_rate   : Hz.
+//     * noise_spectrum: list of per-bin noise magnitudes; must have
+//                       length frame_size/2 (e.g. 256 at 16 kHz).
+//                       Length mismatch -> empty output list (graceful
+//                       error path the unit test exercises).
+//
+//   Returns a new PCM list of length len(pcm). Empty input -> empty
+//   output.
+
+fn nr_apply_wiener(pcm, sample_rate, noise_spectrum) {
+    let out = list_new()
+    let total = len(pcm)
+    if total <= 0 { return out }
+    if total > NR_MAX_SAMPLES { return out }
+    let sr = _nr_clamp_rate(sample_rate)
+    let frame_size = nr_frame_size_for_rate(sr)
+    let hop = nr_hop_size_for_rate(sr)
+    let half = int_shr(frame_size, 1)
+
+    // Validate noise_spectrum length. Graceful empty-list return on
+    // mismatch (the brief flags this as a mandatory edge case).
+    if len(noise_spectrum) != half { return out }
+
+    // Pre-allocate the output + the overlap-add weight buffer. We size
+    // out_buf so the last frame's tail still fits even if (total -
+    // frame_size) isn't a clean multiple of hop.
+    let out_buf = list_new()
+    let wsum = list_new()
+    let i = 0
+    let buf_len = total + frame_size
+    while i < buf_len {
+        push(out_buf, 0)
+        push(wsum, 0)
+        i = i + 1
+    }
+
+    let hann = _nr_hann_for(frame_size)
+
+    // Precompute |N|^2 for each bin so we don't square the noise mag
+    // inside the per-frame loop.
+    let noise_psd = list_new()
+    let nk = 0
+    while nk < half {
+        let nm = noise_spectrum[nk]
+        push(noise_psd, int_mul(nm, nm))
+        nk = nk + 1
+    }
+
+    // Walk frames at hop. We DON'T require the last frame to fit fully
+    // (we zero-pad inside _nr_window_frame). This way a 16001-sample
+    // input doesn't drop its last 1ms.
+    let start = 0
+    let last_start = total - 1
+    if last_start < 0 { last_start = 0 }
+    while start <= last_start {
+        let wf = _nr_window_frame(pcm, start, frame_size)
+        let real_in = wf[0]
+        let imag_in = wf[1]
+        let f = fft_radix2(real_in, imag_in, frame_size)
+        let re = fft_real(f)
+        let im = fft_imag(f)
+
+        // Per-bin Wiener gain in milli. Apply to BOTH the lower half
+        // (k < half) and the conjugate-symmetric upper half (k >= half)
+        // so the iFFT produces a real output. The conjugate symmetry:
+        // X[N-k] = conj(X[k]) for real inputs, so the noise magnitude
+        // at bin N-k is the same as at bin k.
+        let cleaned_re = list_new()
+        let cleaned_im = list_new()
+        let k = 0
+        while k < frame_size {
+            // Mirror upper half down to [0, half).
+            let mirror = k
+            if mirror >= half {
+                mirror = frame_size - k
+                if mirror >= half { mirror = half - 1 }
+            }
+            let rv = re[k]
+            let iv = im[k]
+            let p = int_add(int_mul(rv, rv), int_mul(iv, iv))
+            let n2 = noise_psd[mirror]
+            // gain_num / gain_den == max(0, |X|^2 - |N|^2) / |X|^2
+            let num = int_sub(p, n2)
+            if _nr_int_lt(num, 0) == 1 { num = 0 }
+            let gain_m = NR_GAIN_FLOOR_MILLI
+            if _nr_int_gt(p, 0) == 1 {
+                // gain_m = num * 1000 / p, but num * 1000 can be ~3e16
+                // for a loud signal frame -- safely under 9.2e18 so
+                // int_mul / int_div are fine.
+                gain_m = int_div(int_mul(num, NR_MILLI), p)
+            }
+            // Clamp gain to [floor, ceil] in milli.
+            if _nr_int_lt(gain_m, NR_GAIN_FLOOR_MILLI) == 1 {
+                gain_m = NR_GAIN_FLOOR_MILLI
+            }
+            if _nr_int_gt(gain_m, NR_GAIN_CEIL_MILLI) == 1 {
+                gain_m = NR_GAIN_CEIL_MILLI
+            }
+            // Apply.
+            push(cleaned_re, int_div(int_mul(rv, gain_m), NR_MILLI))
+            push(cleaned_im, int_div(int_mul(iv, gain_m), NR_MILLI))
+            k = k + 1
+        }
+
+        // iFFT cleaned frame back to time domain.
+        let inv = ifft_radix2(cleaned_re, cleaned_im, frame_size)
+        let time_re = fft_real(inv)
+        // (imag part is rounding noise for a real-input round-trip)
+
+        // Overlap-add with the synthesis window. The Hann analysis
+        // window already multiplied the input; we multiply the inverse
+        // by Hann again (so the effective window is hann^2) and
+        // accumulate the hann^2 sum into wsum for normalization. This
+        // is the standard Griffin-Lim STFT reconstruction pattern.
+        let nn = 0
+        while nn < frame_size {
+            let pos = start + nn
+            if pos >= 0 {
+                if pos < buf_len {
+                    let h = hann[nn]
+                    // time_re[nn] is the cleaned real time-domain sample
+                    // (PCM-range). Multiply by Hann (milli) to apply the
+                    // synthesis window.
+                    let w_sample = int_div(int_mul(time_re[nn], h), NR_MILLI)
+                    let cur_o = out_buf[pos]
+                    list_set(out_buf, pos, int_add(cur_o, w_sample))
+                    // Accumulate hann^2 (in milli^2 == micro). We'll
+                    // divide by it at the end; using full precision so
+                    // the constant-overlap-add fully reconstructs the
+                    // amplitude.
+                    let h2 = int_mul(h, h)
+                    let cur_w = wsum[pos]
+                    list_set(wsum, pos, int_add(cur_w, h2))
+                }
+            }
+            nn = nn + 1
+        }
+
+        start = start + hop
+    }
+
+    // Normalize and crop to original input length.
+    //
+    // Tracking the scale: inside the loop
+    //   real_in[n]    = pcm[n] * h_milli[n] / 1000           (PCM-scale)
+    //   time_re[n]    ~= real_in[n]                            (FFT round-trip)
+    //   w_sample      = time_re[n] * h_milli[n] / 1000        (PCM * h_unit^2)
+    //   out_buf[t]   += sum over frames of (sample * h_unit^2)
+    //   wsum[t]      += sum over frames of (h_milli * h_milli) = h_unit^2 * 1e6
+    // For a locally constant sample s the COLA reconstruction is:
+    //   s = sum(s * h_unit^2) / sum(h_unit^2)
+    //     = out_buf[t] / (wsum[t] / 1e6)
+    //     = out_buf[t] * 1e6 / wsum[t]
+    // So we multiply out_buf by MILLI * MILLI = 1e6 in the final divide.
+    // Intermediates: out_buf <= ~64000 * 1.5 (peak COLA factor) and the
+    // 1e6 multiplier puts the numerator at ~1e11, well under int63.
+    let j = 0
+    let milli_sq = int_mul(NR_MILLI, NR_MILLI)
+    while j < total {
+        let w = wsum[j]
+        let v = 0
+        if _nr_int_gt(w, 0) == 1 {
+            let num2 = int_mul(out_buf[j], milli_sq)
+            v = int_div(num2, w)
+        }
+        push(out, _nr_clip_pcm16(v))
+        j = j + 1
+    }
+    return out
+}
+
+// ---- nr_reduce ---------------------------------------------------------
+//
+// nr_reduce(pcm, sample_rate) -> cleaned_pcm
+//
+//   Convenience wrapper: estimate noise from the first 300 ms, then run
+//   the Wiener filter. Empty input -> empty output. Input over the cap
+//   -> empty output.
+
+fn nr_reduce(pcm, sample_rate) {
+    let n = len(pcm)
+    if n <= 0 { return list_new() }
+    if n > NR_MAX_SAMPLES { return list_new() }
+    let noise = nr_estimate_noise(pcm, sample_rate, NR_LEADING_MS_DEFAULT)
+    if len(noise) == 0 { return list_new() }
+    return nr_apply_wiener(pcm, sample_rate, noise)
+}
+
+// ---- diagnostic helpers ------------------------------------------------
+//
+// RMS of a PCM buffer. Used by the chat helper and the integration
+// scenario to report SNR / amplitude before-vs-after. Mirror of
+// dsp_rms (R14E) but private to this module so we don't import the
+// whole DSP chain just for one helper.
+
+fn nr_rms(pcm) {
+    let n = len(pcm)
+    if n <= 0 { return 0 }
+    let sum_sq = 0
+    let i = 0
+    while i < n {
+        let v = pcm[i]
+        sum_sq = int_add(sum_sq, int_mul(v, v))
+        i = i + 1
+    }
+    return _nr_isqrt(int_div(sum_sq, n))
+}
+
+// RMS over a sub-window [start, start + count). Used to measure
+// noise-band amplitude before vs after denoise on a fixture where the
+// trailing silence carries the noise we want to suppress.
+fn nr_rms_window(pcm, start, count) {
+    let n = len(pcm)
+    if n <= 0 { return 0 }
+    let lo = start
+    if lo < 0 { lo = 0 }
+    let hi = lo + count
+    if hi > n { hi = n }
+    let cnt = hi - lo
+    if cnt <= 0 { return 0 }
+    let sum_sq = 0
+    let i = lo
+    while i < hi {
+        let v = pcm[i]
+        sum_sq = int_add(sum_sq, int_mul(v, v))
+        i = i + 1
+    }
+    return _nr_isqrt(int_div(sum_sq, cnt))
+}
+
+// Sum-of-bins in a noise spectrum. Returns the total noise energy
+// across all bins. Used by the unit test to verify nr_estimate_noise
+// returns a non-zero envelope on noisy input.
+fn nr_noise_spectrum_total(noise_spectrum) {
+    let total = 0
+    let i = 0
+    while i < len(noise_spectrum) {
+        total = int_add(total, noise_spectrum[i])
+        i = i + 1
+    }
+    return total
+}
+
+// Length-of-spectrum accessor. Lets callers verify the
+// frame_size-derived bin count without recomputing.
+fn nr_noise_spectrum_len(noise_spectrum) {
+    return len(noise_spectrum)
+}
+
+// ---- int -> str helper (no dependency on audio_dsp's private one) --------
+
+fn _nr_int_to_str(n) {
+    if n == 0 { return "0" }
+    let neg = 0
+    let v = n
+    if v < 0 { neg = 1; v = 0 - v }
+    let out = ""
+    while v > 0 {
+        let d = v - (v / 10) * 10
+        out = chr(48 + d) + out
+        v = v / 10
+    }
+    if neg == 1 { out = "-" + out }
+    return out
+}
+
+// ---- chat helper -------------------------------------------------------
+//
+// nr_run_denoise_command(arg) -> single human-readable line summarising
+// the result of a /denoise PATH round-trip.
+//
+// Output shape (one line, parenthesized for visual symmetry with /gate
+// and /reverb):
+//
+//   (denoise /tmp/x.wav: leading_ms=300, frame_size=512, hop_size=256,
+//   input=N samples rms=R, noise_floor_sum=S, output=N samples rms=R'
+//   @ SR Hz -> PATH.denoise.wav)
+//
+// Error paths:
+//   (denoise FAILED: could not parse WAV at PATH)
+//   (denoise FAILED: invalid sample rate in WAV at PATH)
+//   (denoise FAILED: empty output -- input over cap?)
+//
+// The output WAV path is reported but not actually written (matching
+// R14E /gate and /reverb conventions -- the chat command is a
+// diagnostic; the integration scenario uses a NOVA driver to write the
+// WAV when it needs to disk-verify).
+
+fn nr_run_denoise_command(arg) {
+    if len(arg) == 0 {
+        return "(/denoise needs PATH -- usage: /denoise /tmp/x.wav)"
+    }
+    let path = str_trim(arg)
+    if len(path) == 0 {
+        return "(/denoise needs PATH -- usage: /denoise /tmp/x.wav)"
+    }
+    let r = audio_capture_to_pcm(path)
+    let pcm = audio_capture_pcm_samples(r)
+    let sr = audio_capture_pcm_rate(r)
+    if len(pcm) == 0 {
+        return "(denoise FAILED: could not parse WAV at " + path + ")"
+    }
+    if sr <= 0 {
+        return "(denoise FAILED: invalid sample rate in WAV at " + path + ")"
+    }
+    let noise = nr_estimate_noise(pcm, sr, NR_LEADING_MS_DEFAULT)
+    let cleaned = nr_apply_wiener(pcm, sr, noise)
+    if len(cleaned) == 0 {
+        return "(denoise FAILED: empty output -- input over cap?)"
+    }
+    let in_rms  = nr_rms(pcm)
+    let out_rms = nr_rms(cleaned)
+    let noise_total = nr_noise_spectrum_total(noise)
+    let frame_sz = nr_frame_size_for_rate(sr)
+    let hop_sz = nr_hop_size_for_rate(sr)
+    let out_path = path + ".denoise.wav"
+    return "(denoise " + path
+        + ": leading_ms=" + _nr_int_to_str(NR_LEADING_MS_DEFAULT)
+        + ", frame_size=" + _nr_int_to_str(frame_sz)
+        + ", hop_size=" + _nr_int_to_str(hop_sz)
+        + ", input=" + _nr_int_to_str(len(pcm)) + " samples rms=" + _nr_int_to_str(in_rms)
+        + ", noise_floor_sum=" + _nr_int_to_str(noise_total)
+        + ", output=" + _nr_int_to_str(len(cleaned)) + " samples rms=" + _nr_int_to_str(out_rms)
+        + " @ " + _nr_int_to_str(sr) + " Hz -> " + out_path + ")"
+}

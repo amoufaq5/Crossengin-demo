@@ -1,0 +1,2977 @@
+// CrossEngin io/transducers: Lucas-Kanade dense optical flow (R10D,
+// P3.3 cont. image structural feature -- the sixth pipeline after
+// Sobel + Harris + SIFT + Canny + ORB + Stereo).
+//
+// Purpose
+//   The CV motion pipeline so far covers BLOCK-based motion vectors
+//   (`video_motion_vectors.nova`, coarse per-block) and SPARSE
+//   keypoint matching (SIFT R5C + ORB R6D). What is missing is a
+//   DENSE per-pixel motion field between two consecutive frames -- the
+//   classic dense optical flow problem. Lucas-Kanade (1981) is the
+//   textbook local-window solution: pure integer arithmetic, no
+//   eigendecomposition, no sparse-matrix solver. For each pixel,
+//   compute image gradients (Ix, Iy) and the temporal gradient (It =
+//   I_next - I_prev) over a small WIN_SIZE x WIN_SIZE window centered
+//   there, then solve the 2x2 linear system:
+//
+//       [ Sum(Ix^2)   Sum(IxIy) ] [u]   [ -Sum(Ix*It) ]
+//       [                       ] [ ] = [             ]
+//       [ Sum(IxIy)   Sum(Iy^2) ] [v]   [ -Sum(Iy*It) ]
+//
+//   via the closed-form 2x2 inverse:
+//
+//       det     = (Sum Ix^2)(Sum Iy^2) - (Sum IxIy)^2
+//       u_milli = ((Sum Iy^2)(-Sum IxIt) - (Sum IxIy)(-Sum IyIt)) * 1000 / det
+//       v_milli = (-(Sum IxIy)(-Sum IxIt) + (Sum Ix^2)(-Sum IyIt)) * 1000 / det
+//
+//   Disparity-style milli encoding (u_milli = int(u * 1000)) keeps the
+//   whole thing in integer arithmetic; sub-pixel motion shows up as
+//   sub-1000 in the milli units. The det = 0 case (textureless region
+//   / aperture problem) is flagged invalid; flow at that pixel reads
+//   (0, 0, 0).
+//
+//   Gradients use the simple central / forward differences (also
+//   integer-friendly):
+//     Ix(x, y) = (I(x+1, y) - I(x-1, y)) / 2
+//     Iy(x, y) = (I(x, y+1) - I(x, y-1)) / 2
+//     It(x, y) = I_next(x, y) - I_prev(x, y)
+//
+//   The sums in the linear system are accumulated over the WIN_SIZE x
+//   WIN_SIZE window centered at the target pixel. Border pixels (where
+//   the window or the gradient stencil would fall off the image) are
+//   marked invalid -- the algorithm needs both a complete 3-point
+//   gradient stencil AND a complete window of sums.
+//
+//   Magnitude per pixel: mag_milli = sqrt(u_milli^2 + v_milli^2). We
+//   approximate sqrt with an integer Newton iteration (mirrors the
+//   image_sobel pattern). The mean magnitude over valid pixels is
+//   reported as the headline metric for the visual-perception seam.
+//
+// Algorithm caps:
+//   LK_MAX_DIM      = 256 per axis. Inner loop per pixel = O(WIN_SIZE^2)
+//                     so a 256x256 image with WIN_SIZE=5 runs ~1.6M ops.
+//                     Real callers downsample first; the 256 cap matches
+//                     R7E stereo so the same fixture sizes work end-to-end.
+//   WIN_SIZE [3..15] odd. Default 5 (matches OpenCV calcOpticalFlowPyrLK
+//                     winSize default; smaller is noisier, larger blurs
+//                     motion discontinuities).
+//
+// Public API
+//   lk_optical_flow(prev, next, w, h, win_size) -> flow_result
+//     `flow_result` = [flow_buf, valid_buf, mean_mag_milli,
+//                      valid_count, total_pixels, width, height]
+//     flow_buf  -- packed int buffer (2 ints per pixel: u_milli, v_milli)
+//     valid_buf -- packed int buffer (1 int per pixel: 0 / 1 valid flag)
+//   lk_flow_at(result, x, y) -> [u_milli, v_milli, valid]
+//   lk_flow_mean_magnitude(result) -> int (milli)
+//   lk_flow_density_label(result) -> "low" / "mid" / "high"
+//
+// Density label (per-axis pixel magnitude):
+//   low  : mean_mag < 200 milli  (stationary)
+//   mid  : 200 <= mean_mag < 2000 milli (moderate)
+//   high : mean_mag >= 2000 milli (large motion)
+//
+// ADRs implemented: ADR-0014 (modality bridge, no cognition path).
+// NOVA dependencies: builtins -- alloc, store8, load8, store64, load64,
+//   list_new, push, list_set, len, int_mul, int_add, int_sub, int_to_str,
+//   char_at, substr, getenv.
+// CrossEngin dependencies: image_pgm.nova (PGM-P5 decoder for the
+//   visual-perception seam + chat-admin pipe). The core algorithm has
+//   no intra-CrossEngin dependencies.
+
+import "image_pgm.nova"
+
+// ---- format constants ----------------------------------------------------
+
+// Hard cap on pixel area. 256 * 256 = 65536 == 2^16, comfortably under
+// the NOVA codegen pointer-threshold ceiling (#11). Matches R7E stereo's
+// cap so the same fixture sizes round-trip across the motion + stereo
+// pipelines.
+let LK_MAX_DIM        = 256
+let LK_MAX_PIXEL_AREA = 65536
+
+// Default Lucas-Kanade window size. 5x5 is OpenCV's default for
+// calcOpticalFlowPyrLK -- large enough to integrate enough texture for
+// the 2x2 normal-equation solve, small enough to preserve motion
+// boundaries.
+let LK_DEFAULT_WIN_SIZE = 5
+let LK_MIN_WIN_SIZE     = 3
+let LK_MAX_WIN_SIZE     = 15
+
+// Milli-disparity scale (mirrors stereo's STEREO_MILLI_PER_UNIT). u and
+// v are stored as int(u * 1000) so a flow of 3 pixels right reads u
+// == 3000.
+let LK_MILLI_PER_UNIT = 1000
+
+// Density bucket boundaries (in milli units = mean magnitude across
+// valid pixels). Stationary scenes typically read < 200 milli (noise
+// from gradient quantization); a moderate camera pan reads 500-1500;
+// rigid-shift fixtures read >= 2000.
+let LK_DENSITY_MID_MIN  = 200
+let LK_DENSITY_HIGH_MIN = 2000
+
+// Result tuple slot indices.
+let LK_R_FLOW_BUF    = 0
+let LK_R_VALID_BUF   = 1
+let LK_R_MEAN_MAG    = 2
+let LK_R_VALID_COUNT = 3
+let LK_R_TOTAL       = 4
+let LK_R_WIDTH       = 5
+let LK_R_HEIGHT      = 6
+
+// Feature-label strings (mirror image_stereo / image_orb / image_canny
+// convention).
+let LK_LABEL_DENSITY_LOW  = "image_optical_flow_density_low"
+let LK_LABEL_DENSITY_MID  = "image_optical_flow_density_mid"
+let LK_LABEL_DENSITY_HIGH = "image_optical_flow_density_high"
+
+// Magnitude-bucket atoms emitted by the visual_perception seam. These
+// summarize the SCALE of motion (mean magnitude over valid pixels) in
+// the same low / mid / high bucketing used for the density label, just
+// with different numeric thresholds.
+let LK_LABEL_MAG_LOW  = "image_optical_flow_magnitude_low"
+let LK_LABEL_MAG_MID  = "image_optical_flow_magnitude_mid"
+let LK_LABEL_MAG_HIGH = "image_optical_flow_magnitude_high"
+
+// Mean-magnitude bucket boundaries (milli units). Same scale as the
+// density label; we keep them distinct constants so the two axes can
+// drift independently if calibration ever calls for it.
+let LK_MAG_MID_MIN  = 500
+let LK_MAG_HIGH_MIN = 2000
+
+// ---- raw int-buffer accessors -------------------------------------------
+//
+// We pack (u_milli, v_milli) per pixel into a single int buffer indexed
+// by `2 * pixel_idx + slot`. valid_buf carries one int per pixel. Mirrors
+// the SGM cost-volume pattern in image_stereo.nova so memory ownership +
+// pointer arithmetic look the same across the IO layer.
+
+fn _lk_buf_alloc(num_ints, init_value) {
+    let bytes = int_mul(num_ints, 8)
+    let buf = alloc(int_add(bytes, 8))
+    let i = 0
+    while i < num_ints {
+        store64(int_add(buf, int_mul(i, 8)), init_value)
+        i = int_add(i, 1)
+    }
+    return buf
+}
+
+fn _lk_set(buf, idx, val) {
+    store64(int_add(buf, int_mul(idx, 8)), val)
+}
+
+fn _lk_get(buf, idx) {
+    return load64(int_add(buf, int_mul(idx, 8)))
+}
+
+// ---- result tuple helpers -----------------------------------------------
+
+fn _lk_result(flow_buf, valid_buf, mean_mag, valid_count, total, width, height) {
+    let r = list_new()
+    push(r, flow_buf)
+    push(r, valid_buf)
+    push(r, mean_mag)
+    push(r, valid_count)
+    push(r, total)
+    push(r, width)
+    push(r, height)
+    return r
+}
+
+fn _lk_fail() {
+    return _lk_result(0, 0, 0, 0, 0, 0, 0)
+}
+
+// ---- normalisation helpers ----------------------------------------------
+
+fn _lk_clamp_win_size(win_size) {
+    if win_size < LK_MIN_WIN_SIZE { return LK_DEFAULT_WIN_SIZE }
+    if win_size > LK_MAX_WIN_SIZE { return LK_MAX_WIN_SIZE }
+    let r = win_size
+    let q = r / 2
+    let twice_q = int_mul(2, q)
+    if twice_q == r { r = int_add(r, 1) }
+    if r > LK_MAX_WIN_SIZE { r = LK_MAX_WIN_SIZE }
+    return r
+}
+
+// ---- gradient helpers ---------------------------------------------------
+//
+// Central differences along x / y; forward difference (next - prev) along t.
+// All inputs are 8-bit grayscale; the central differences read 0..255
+// values and produce results in roughly -127..127.
+
+fn _lk_ix(data_ptr, width, x, y) {
+    let row_off = int_mul(y, width)
+    let left  = load8(int_add(data_ptr, int_add(row_off, int_sub(x, 1))))
+    let right = load8(int_add(data_ptr, int_add(row_off, int_add(x, 1))))
+    return int_sub(right, left) / 2
+}
+
+fn _lk_iy(data_ptr, width, x, y) {
+    let up   = load8(int_add(data_ptr, int_add(int_mul(int_sub(y, 1), width), x)))
+    let down = load8(int_add(data_ptr, int_add(int_mul(int_add(y, 1), width), x)))
+    return int_sub(down, up) / 2
+}
+
+fn _lk_it(prev_ptr, next_ptr, width, x, y) {
+    let off = int_add(int_mul(y, width), x)
+    let p = load8(int_add(prev_ptr, off))
+    let n = load8(int_add(next_ptr, off))
+    return int_sub(n, p)
+}
+
+// ---- integer sqrt (Newton iteration; mirrors image_sobel / image_harris) -
+
+fn _lk_isqrt(n) {
+    if n <= 0 { return 0 }
+    if n < 2  { return n }
+    let x = n
+    let y = int_add(x, 1) / 2
+    let cont = 1
+    while cont == 1 {
+        if y < x {
+            x = y
+            y = int_add(y, n / y) / 2
+        } else {
+            cont = 0
+        }
+    }
+    return x
+}
+
+// ---- core: Lucas-Kanade per-pixel flow ----------------------------------
+//
+// lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+//   -> [flow_buf, valid_buf, mean_mag, valid_count, total, width, height]
+//
+// For each interior pixel (where the WIN_SIZE x WIN_SIZE window AND the
+// 3-point gradient stencil fit), accumulate the five sums, solve the
+// 2x2 system, store (u_milli, v_milli) in flow_buf and the valid flag
+// in valid_buf. Border / degenerate pixels read (0, 0, 0).
+
+fn lk_optical_flow(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    // The gradient stencil needs (x-1, x+1) and (y-1, y+1); the window
+    // needs (x +/- half, y +/- half). The combined stencil requires
+    // (half + 1) padding on every side.
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Accumulate the 5 sums over the WIN_SIZE x WIN_SIZE window
+            // centered at (x, y).
+            let sum_ix2  = 0
+            let sum_iy2  = 0
+            let sum_ixiy = 0
+            let sum_ixit = 0
+            let sum_iyit = 0
+            let dy = 0 - half
+            while dy <= half {
+                let py = int_add(y, dy)
+                let dx = 0 - half
+                while dx <= half {
+                    let px = int_add(x, dx)
+                    let ix = _lk_ix(prev_ptr, width, px, py)
+                    let iy = _lk_iy(prev_ptr, width, px, py)
+                    let it = _lk_it(prev_ptr, next_ptr, width, px, py)
+                    sum_ix2  = int_add(sum_ix2,  int_mul(ix, ix))
+                    sum_iy2  = int_add(sum_iy2,  int_mul(iy, iy))
+                    sum_ixiy = int_add(sum_ixiy, int_mul(ix, iy))
+                    sum_ixit = int_add(sum_ixit, int_mul(ix, it))
+                    sum_iyit = int_add(sum_iyit, int_mul(iy, it))
+                    dx = int_add(dx, 1)
+                }
+                dy = int_add(dy, 1)
+            }
+            // 2x2 inverse:
+            //   det     = sum_ix2 * sum_iy2 - sum_ixiy * sum_ixiy
+            //   u_milli = (sum_iy2 * (-sum_ixit) - sum_ixiy * (-sum_iyit)) * 1000 / det
+            //   v_milli = (-sum_ixiy * (-sum_ixit) + sum_ix2 * (-sum_iyit)) * 1000 / det
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // Aperture problem / no texture -- leave (0, 0) flow,
+                // mark invalid. Already zero-initialized.
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,                 u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1),     v_milli)
+                _lk_set(valid_buf, pixel_idx,               1)
+                valid_count = int_add(valid_count, 1)
+                // Accumulate magnitude. sqrt(u^2 + v^2). u,v are milli.
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// ---- R12A: SIMD-accelerated Lucas-Kanade (uses R11D simd_add_i32x8) -----
+//
+// lk_optical_flow_simd(prev, next, w, h, win_size) -> same shape as
+// lk_optical_flow. Reuses identical gradient + 2x2 solve math; the only
+// difference is the WIN_SIZE x WIN_SIZE accumulator loop.
+//
+// SIMD accumulation strategy:
+//   1. Stage the 5 product streams (ix^2, iy^2, ixiy, ixit, iyit) for
+//      ALL win*win cells into 5 i32 lane buffers, padded to a multiple
+//      of 8 lanes with zero (zero adds harmlessly under simd_add_i32x8).
+//   2. For each of the 5 sums, maintain an 8-lane i32 accumulator buffer
+//      and invoke simd_add_i32x8(acc, stage_chunk, acc) per 8-lane chunk
+//      (lane-parallel partial sums).
+//   3. After all chunks, scalar-reduce the 8-lane accumulator to a
+//      single int via 8 load_i32_le + add. Mirrors what the AVX2
+//      vphaddd + vextracti128 sequence does at the end of
+//      simd_sum_abs_diff (R11D did not ship an explicit
+//      simd_horizontal_sum_i32x8 builtin).
+//
+// Bit-identical to scalar: integer add is associative + commutative, so
+// lane-parallel partial sums must reduce to the same scalar total.
+//
+// All scratch buffers are allocated ONCE per call and reused across the
+// entire interior pixel scan. Per-pixel alloc would eat the SIMD win.
+
+fn _lk_store_i32_le(buf, idx, v) {
+    let off = int_mul(idx, 4)
+    let u = v
+    if v < 0 { u = int_sub(4294967296, int_sub(0, v)) }
+    store8(int_add(buf, off),                     u % 256)
+    store8(int_add(buf, int_add(off, 1)),         int_div(u, 256) % 256)
+    store8(int_add(buf, int_add(off, 2)),         int_div(u, 65536) % 256)
+    store8(int_add(buf, int_add(off, 3)),         int_div(u, 16777216) % 256)
+}
+
+fn _lk_load_i32_le(buf, idx) {
+    let off = int_mul(idx, 4)
+    let b0 = load8(int_add(buf, off))
+    let b1 = load8(int_add(buf, int_add(off, 1)))
+    let b2 = load8(int_add(buf, int_add(off, 2)))
+    let b3 = load8(int_add(buf, int_add(off, 3)))
+    let u = int_add(b0, int_add(int_mul(b1, 256),
+                                int_add(int_mul(b2, 65536),
+                                        int_mul(b3, 16777216))))
+    if u >= 2147483648 { return int_sub(u, 4294967296) }
+    return u
+}
+
+// Sum lanes of an 8-lane i32 buffer to a scalar (horizontal reduce).
+fn _lk_simd_hsum8(buf) {
+    let s = 0
+    let i = 0
+    while i < 8 {
+        s = int_add(s, _lk_load_i32_le(buf, i))
+        i = int_add(i, 1)
+    }
+    return s
+}
+
+fn _lk_zero_buf(buf, n) {
+    let i = 0
+    while i < n {
+        _lk_store_i32_le(buf, i, 0)
+        i = int_add(i, 1)
+    }
+}
+
+// _lk_simd_enabled() -> 1 if CE_LK_SIMD env var is unset or "on", 0 if
+//   set to "off". A/B toggle for the bench script.
+fn _lk_simd_enabled() {
+    let env = getenv("CE_LK_SIMD")
+    if env == 0      { return 1 }
+    if len(env) == 0 { return 1 }
+    if str_eq(env, "off") == 1 { return 0 }
+    if str_eq(env, "0")   == 1 { return 0 }
+    if str_eq(env, "no")  == 1 { return 0 }
+    return 1
+}
+
+// Compute Σ(stage[0..n_padded)) via SIMD lane-parallel partial sums.
+// stage is an i32 lane buffer padded to a multiple of 8 with trailing
+// zeros; acc is an 8-lane scratch i32 buffer that is zeroed in-place
+// then mutated by the simd_add_i32x8 loop. Returns the scalar sum.
+fn _lk_simd_sum(stage, n_padded, acc) {
+    _lk_zero_buf(acc, 8)
+    let k = 0
+    while k < n_padded {
+        // acc = acc + stage[k .. k+8].
+        simd_add_i32x8(acc, int_add(stage, int_mul(k, 4)), acc)
+        k = int_add(k, 8)
+    }
+    return _lk_simd_hsum8(acc)
+}
+
+fn lk_optical_flow_simd(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+
+    // CE_LK_SIMD=off routes back through the scalar implementation.
+    if _lk_simd_enabled() == 0 {
+        return lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+    }
+
+    // Round n_cells (= ws * ws) up to the next multiple of 8 so the
+    // SIMD partial-sum loop's tail does not need a scalar fallback. The
+    // trailing zero lanes contribute 0 to every sum.
+    let n_cells  = int_mul(ws, ws)
+    let tail = int_sub(n_cells, int_mul(int_div(n_cells, 8), 8))
+    let n_padded = n_cells
+    if tail > 0 { n_padded = int_add(n_cells, int_sub(8, tail)) }
+    let buf_bytes = int_mul(int_add(n_padded, 8), 4)
+    let st_ix2  = alloc(buf_bytes)
+    let st_iy2  = alloc(buf_bytes)
+    let st_ixiy = alloc(buf_bytes)
+    let st_ixit = alloc(buf_bytes)
+    let st_iyit = alloc(buf_bytes)
+    let acc     = alloc(int_mul(8 + 8, 4))   // 8-lane scratch i32 buffer
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Stage the WIN_SIZE x WIN_SIZE product streams into the 5
+            // i32 lane buffers in row-major order. Pad trailing lanes
+            // with zero so simd_add_i32x8's chunk loop doesn't need a
+            // scalar tail.
+            let i = 0
+            let dy = 0 - half
+            while dy <= half {
+                let py = int_add(y, dy)
+                let dx = 0 - half
+                while dx <= half {
+                    let px = int_add(x, dx)
+                    let ix = _lk_ix(prev_ptr, width, px, py)
+                    let iy = _lk_iy(prev_ptr, width, px, py)
+                    let it = _lk_it(prev_ptr, next_ptr, width, px, py)
+                    _lk_store_i32_le(st_ix2,  i, int_mul(ix, ix))
+                    _lk_store_i32_le(st_iy2,  i, int_mul(iy, iy))
+                    _lk_store_i32_le(st_ixiy, i, int_mul(ix, iy))
+                    _lk_store_i32_le(st_ixit, i, int_mul(ix, it))
+                    _lk_store_i32_le(st_iyit, i, int_mul(iy, it))
+                    i = int_add(i, 1)
+                    dx = int_add(dx, 1)
+                }
+                dy = int_add(dy, 1)
+            }
+            while i < n_padded {
+                _lk_store_i32_le(st_ix2,  i, 0)
+                _lk_store_i32_le(st_iy2,  i, 0)
+                _lk_store_i32_le(st_ixiy, i, 0)
+                _lk_store_i32_le(st_ixit, i, 0)
+                _lk_store_i32_le(st_iyit, i, 0)
+                i = int_add(i, 1)
+            }
+            let sum_ix2  = _lk_simd_sum(st_ix2,  n_padded, acc)
+            let sum_iy2  = _lk_simd_sum(st_iy2,  n_padded, acc)
+            let sum_ixiy = _lk_simd_sum(st_ixiy, n_padded, acc)
+            let sum_ixit = _lk_simd_sum(st_ixit, n_padded, acc)
+            let sum_iyit = _lk_simd_sum(st_iyit, n_padded, acc)
+            // 2x2 inverse -- identical to lk_optical_flow.
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // No texture / aperture -- leave (0, 0, 0).
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,             u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1), v_milli)
+                _lk_set(valid_buf, pixel_idx,           1)
+                valid_count = int_add(valid_count, 1)
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// ---- R17C: u8 raw-byte SIMD path for Lucas-Kanade -----------------------
+//
+// R15A's stereo-SAD u8 path achieved a 5.5x absolute speedup over scalar
+// by wiring R14B's `simd_sad_u8(a_ptr, b_ptr, n_bytes) -> int` primitive
+// (AVX2 vpsadbw, 32 bytes -> 4 i64 partials) into the disparity inner
+// loop. R13A's LK i32 SIMD path plateaued at ~1.42x absolute because the
+// per-pixel byte->i32 staging bandwidth (5 store32 per cell to set up
+// the 5 product streams) competes with the SIMD reduction win.
+//
+// R17C applies the R15A u8 pattern to LK -- but the structural shape of
+// the algorithm constrains what `simd_sad_u8` can vectorize. Honest
+// analysis (R12A precedent: agent shipped wiring + honest perf even at
+// 0.84x / 0.20x):
+//
+//   1. LK accumulator products (Σ Ix*Ix, Σ Ix*It, ...) are byte * byte
+//      -> i32, NOT |a - b|. simd_sad_u8 computes absolute-difference
+//      sums on UNSIGNED bytes; it cannot produce signed-byte squared or
+//      cross products. The R15A primitive does not vectorize the inner
+//      accumulators -- that requires a `pmaddubsw`-shaped builtin
+//      (SSSE3) or i16-multiply (out-of-scope for R17C; documented as
+//      follow-up in NOVA SIMD_AUDIT).
+//
+//   2. Gradient computation Ix = (I(x+1) - I(x-1)) / 2 reads SIGNED
+//      differences; simd_sad_u8 zeros the sign so it doesn't fit
+//      directly.
+//
+//   3. BUT three operations DO match the R15A pattern naturally:
+//
+//      (a) Per-window |It| sum = Σ|next(p) - prev(p)| over the WIN^2
+//          cells. This is a textureless-region / motion-magnitude
+//          diagnostic (large = strong motion, zero = identical
+//          frames). simd_sad_u8 on packed prev + packed next windows
+//          delivers it in one call.
+//
+//      (b) Mean absolute photometric residual |warped - prev| across
+//          a full image is the canonical pyramidal-LK convergence
+//          metric -- rows ARE contiguous in memory, so simd_sad_u8
+//          can be called PER ROW with no packing at all. This is the
+//          cleanest SAD fit.
+//
+//      (c) Pack-then-scan pattern: pack the WIN^2 cells of prev + next
+//          into two contiguous byte buffers via `memcpy_raw`, then
+//          the scalar accumulator inner loop reads contiguous memory
+//          (better cache + prefetch locality) instead of strided
+//          per-row 5x loads. The accumulator stays scalar (the
+//          product math doesn't vectorize) but the load locality is
+//          materially better. This is the "wiring" win analogous to
+//          R12A's i32 SIMD on LK -- pay the staging cost, win the
+//          subsequent reduction loop's locality.
+//
+// R17C ships all three: the diagnostic SAD (a), the full-image residual
+// helper (b), and a packed-scan LK variant `lk_optical_flow_u8_simd`
+// that uses (c) under env-var dispatch CE_LK_U8_SIMD=on. The output is
+// BIT-IDENTICAL to scalar lk_optical_flow (same accumulator order, same
+// integer math, only the memory access pattern changed).
+//
+// PGM access strategy: pack-inline. PGM pixel data is already stored as
+// raw byte buffers (alloc + store8 + load8 via image_pgm.nova), so the
+// byte SIMD primitive + memcpy_raw pack is a direct representational
+// fit -- no list[int] -> byte conversion. Mirrors R15A's strategy.
+
+// Pack the WIN x WIN window centered at (x_center, y_center) into the
+// contiguous byte buffer `buf` (row-major). Uses NOVA's `memcpy_raw`
+// builtin (`rep movsb`) one row at a time -- ws bytes per row. Mirrors
+// R15A's _stereo_pack_block_u8 verbatim except for the half-row stride
+// shape (LK has odd ws like stereo).
+fn _lk_pack_block_u8(src_ptr, width, x_center, y_center, half, ws, buf) {
+    let row_bytes = ws
+    let dy = 0 - half
+    let dst = buf
+    while dy <= half {
+        let src_row = src_ptr + int_mul(int_add(y_center, dy), width)
+                              + int_sub(x_center, half)
+        memcpy_raw(dst, src_row, row_bytes)
+        dst = int_add(dst, row_bytes)
+        dy = int_add(dy, 1)
+    }
+}
+
+// lk_sad_block_u8(prev, next, w, x, y, ws, p_buf, n_buf) -> int
+//   Pack the WIN x WIN windows centered at (x, y) in `prev` and `next`,
+//   then reduce via simd_sad_u8. Diagnostic SAD: Σ|It| over the window
+//   (large = strong frame-to-frame change, zero = identical frames).
+//   Bit-identical to a scalar reference computing the same quantity.
+//   Caller pre-allocs both buffers as alloc(ws * ws + 8) (the +8 is
+//   the same scratch-headroom convention as R15A's stereo_sad_block_u8).
+fn lk_sad_block_u8(prev_ptr, next_ptr, width, x, y, win_size,
+                    p_buf, n_buf) {
+    let half = win_size / 2
+    let n = int_mul(win_size, win_size)
+    _lk_pack_block_u8(prev_ptr, width, x, y, half, win_size, p_buf)
+    _lk_pack_block_u8(next_ptr, width, x, y, half, win_size, n_buf)
+    return simd_sad_u8(p_buf, n_buf, n)
+}
+
+// lk_image_sad_residual_u8(prev, next, w, h) -> int
+//   Σ|next(p) - prev(p)| over ALL pixels in the image. PGM byte buffers
+//   are already contiguous in memory (row-major), so simd_sad_u8 can be
+//   called PER ROW with no packing. For width-W rows: one simd_sad_u8
+//   call processes W bytes via vpsadbw (32 bytes per instruction + tail).
+//   Bit-identical to scalar Σ|a[i] - b[i]|.
+//
+//   This is the canonical pyramidal-LK convergence metric (mean
+//   absolute photometric residual after warping). Used as a diagnostic
+//   probe in R11A / R13B; previously scalar O(area) per call.
+fn lk_image_sad_residual_u8(prev_ptr, next_ptr, width, height) {
+    if prev_ptr == 0 { return 0 }
+    if next_ptr == 0 { return 0 }
+    if width  <= 0   { return 0 }
+    if height <= 0   { return 0 }
+    let total = 0
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let row_sad = simd_sad_u8(int_add(prev_ptr, row_off),
+                                   int_add(next_ptr, row_off),
+                                   width)
+        total = int_add(total, row_sad)
+        y = int_add(y, 1)
+    }
+    return total
+}
+
+// _lk_u8_simd_enabled() -> 1 if CE_LK_U8_SIMD env var is set to "on"
+//   (mirrors R15A's CE_STEREO_U8_SIMD -- default OFF; opt-in via env
+//   for the bench script + future default-on flip when we have wider
+//   end-to-end validation). Separate from CE_LK_SIMD (R12A's i32 path
+//   toggle) so the two SIMD paths can be A/B'd independently.
+fn _lk_u8_simd_enabled() {
+    let env = getenv("CE_LK_U8_SIMD")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// Compute the LK gradient triplet (ix, iy, it) at packed-window cell
+// (dx, dy) using the PACKED buffers. The packed buffer is row-major
+// ws x ws bytes; cell at (dx, dy) is buf[(dy+half)*ws + (dx+half)].
+// For the gradient stencils we need the (x-1, x+1) etc neighbors --
+// these straddle row boundaries inside the packed buffer. Rather than
+// dealing with the boundary cases per-cell, we read directly from the
+// underlying image pointers for the gradient stencil (the WINDOW pack
+// gives us the cell value; the gradient stencil reaches OUTSIDE the
+// packed block to ±1 in both axes).
+//
+// Why pack at all then? The accumulator loop processes the central
+// pixel value at (px, py) from `prev` (for It = next - prev, since
+// It uses ONLY the center pixel of each cell). The packed buffer
+// reduces the It load to a contiguous read from the small scratch
+// buffer instead of a strided image-pointer load. The Ix / Iy loads
+// stay on the source pointer because they reach OUTSIDE the packed
+// window. Net win: 1/3 of the per-cell byte loads come from the
+// packed scratch (cache-warm) instead of the strided image buffer.
+//
+// _lk_packed_it(p_buf, n_buf, dx, dy, half, ws) returns It in the same
+// signed range as _lk_it. Reads from the PACKED scratch buffers.
+fn _lk_packed_it(p_buf, n_buf, dx, dy, half, ws) {
+    let r = int_add(dy, half)
+    let c = int_add(dx, half)
+    let idx = int_add(int_mul(r, ws), c)
+    let p = load8(int_add(p_buf, idx))
+    let n = load8(int_add(n_buf, idx))
+    return int_sub(n, p)
+}
+
+// _lk_optical_flow_u8_simd_inner: same inner-loop shape as the R12A i32
+//   SIMD variant, but uses the packed-byte locality strategy. Pack the
+//   WIN x WIN windows of `prev` and `next` per pixel into contiguous
+//   byte scratch buffers via memcpy_raw, then run the 5-accumulator
+//   scalar inner loop reading It from the packed buffer. Bit-identical
+//   to scalar (same integer math, same loop order).
+//
+//   This helper bypasses the env-var check + the input-validation
+//   prologue so unit tests can exercise the SIMD path directly without
+//   depending on env state. Mirrors R15A's
+//   _stereo_disparity_u8_simd_inner. Caller is responsible for
+//   ensuring (width, height, ws, area) are valid (the public entry
+//   point lk_optical_flow_u8_simd handles validation).
+fn _lk_optical_flow_u8_simd_inner(prev_ptr, next_ptr, width, height,
+                                    ws, half, pad, area) {
+    let n_cells  = int_mul(ws, ws)
+    // +8 scratch headroom past the actual ws^2 footprint to mirror the
+    // R15A pack convention and give vpsadbw's 32-byte chunk a safe
+    // over-read landing zone (used by lk_sad_block_u8 callers that
+    // share these buffers).
+    let buf_bytes = int_add(n_cells, 8)
+    let p_buf = alloc(buf_bytes)
+    let n_buf = alloc(buf_bytes)
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Pack the WIN x WIN windows of prev + next centered at
+            // (x, y) into the contiguous byte scratch buffers. This
+            // is the R15A pack-once-per-pixel pattern; the It reads
+            // in the inner loop become cache-warm contiguous loads.
+            _lk_pack_block_u8(prev_ptr, width, x, y, half, ws, p_buf)
+            _lk_pack_block_u8(next_ptr, width, x, y, half, ws, n_buf)
+            // Accumulate the 5 sums over the WIN x WIN window. Same
+            // scalar math + same loop order as lk_optical_flow; the
+            // ONLY change is It reads from the packed buffer instead
+            // of two strided image loads (per cell, saves the
+            // next-image load address arithmetic + boundary check).
+            let sum_ix2  = 0
+            let sum_iy2  = 0
+            let sum_ixiy = 0
+            let sum_ixit = 0
+            let sum_iyit = 0
+            let dy = 0 - half
+            while dy <= half {
+                let py = int_add(y, dy)
+                let dx = 0 - half
+                while dx <= half {
+                    let px = int_add(x, dx)
+                    let ix = _lk_ix(prev_ptr, width, px, py)
+                    let iy = _lk_iy(prev_ptr, width, px, py)
+                    let it = _lk_packed_it(p_buf, n_buf, dx, dy, half, ws)
+                    sum_ix2  = int_add(sum_ix2,  int_mul(ix, ix))
+                    sum_iy2  = int_add(sum_iy2,  int_mul(iy, iy))
+                    sum_ixiy = int_add(sum_ixiy, int_mul(ix, iy))
+                    sum_ixit = int_add(sum_ixit, int_mul(ix, it))
+                    sum_iyit = int_add(sum_iyit, int_mul(iy, it))
+                    dx = int_add(dx, 1)
+                }
+                dy = int_add(dy, 1)
+            }
+            // 2x2 inverse -- identical to lk_optical_flow.
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // No texture / aperture -- leave (0, 0, 0).
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,             u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1), v_milli)
+                _lk_set(valid_buf, pixel_idx,           1)
+                valid_count = int_add(valid_count, 1)
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// lk_optical_flow_u8_simd(prev, next, w, h, win_size)
+//   Same shape as lk_optical_flow. Public entry-point with input
+//   validation; routes to _lk_optical_flow_u8_simd_inner when
+//   CE_LK_U8_SIMD=on, otherwise falls back to scalar lk_optical_flow.
+//   Mirrors R15A's stereo_disparity_u8_simd contract.
+fn lk_optical_flow_u8_simd(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    // CE_LK_U8_SIMD=off / unset routes back through the scalar
+    // implementation (mirrors R15A's stereo_disparity_u8_simd opt-in).
+    if _lk_u8_simd_enabled() == 0 {
+        return lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+    }
+    return _lk_optical_flow_u8_simd_inner(prev_ptr, next_ptr, width, height,
+                                           ws, half, pad, area)
+}
+
+// ---- accessors -----------------------------------------------------------
+
+// lk_flow_at(result, x, y) -> [u_milli, v_milli, valid]
+//   OOB / no-result / invalid-pixel returns [0, 0, 0].
+fn lk_flow_at(result, x, y) {
+    let triple = list_new()
+    push(triple, 0)
+    push(triple, 0)
+    push(triple, 0)
+    if len(result) < 7 { return triple }
+    let width  = result[LK_R_WIDTH]
+    let height = result[LK_R_HEIGHT]
+    let flow_buf  = result[LK_R_FLOW_BUF]
+    let valid_buf = result[LK_R_VALID_BUF]
+    if width  <= 0 { return triple }
+    if height <= 0 { return triple }
+    if x < 0       { return triple }
+    if y < 0       { return triple }
+    if x >= width  { return triple }
+    if y >= height { return triple }
+    if flow_buf  == 0 { return triple }
+    if valid_buf == 0 { return triple }
+    let pixel_idx = int_add(int_mul(y, width), x)
+    let u = _lk_get(flow_buf, int_mul(pixel_idx, 2))
+    let v = _lk_get(flow_buf, int_add(int_mul(pixel_idx, 2), 1))
+    let valid = _lk_get(valid_buf, pixel_idx)
+    list_set(triple, 0, u)
+    list_set(triple, 1, v)
+    list_set(triple, 2, valid)
+    return triple
+}
+
+fn lk_flow_mean_magnitude(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_MEAN_MAG]
+}
+
+fn lk_flow_valid_count(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_VALID_COUNT]
+}
+
+fn lk_flow_total(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_TOTAL]
+}
+
+fn lk_flow_width(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_WIDTH]
+}
+
+fn lk_flow_height(result) {
+    if len(result) < 7 { return 0 }
+    return result[LK_R_HEIGHT]
+}
+
+// lk_flow_density_label(result) -> "low" / "mid" / "high"
+//   Categorises the MEAN-MAGNITUDE-OVER-VALID-PIXELS bucket. Bucket
+//   names mirror image_stereo_density_label so the visual_perception
+//   seam can emit them as feature atoms uniformly.
+fn lk_flow_density_label(result) {
+    let mean_mag = lk_flow_mean_magnitude(result)
+    if mean_mag < LK_DENSITY_MID_MIN  { return LK_LABEL_DENSITY_LOW }
+    if mean_mag < LK_DENSITY_HIGH_MIN { return LK_LABEL_DENSITY_MID }
+    return LK_LABEL_DENSITY_HIGH
+}
+
+// lk_flow_magnitude_label(mean_mag) -> "image_optical_flow_magnitude_low"
+//   etc. Same bucketing as the density label; kept separate so the
+//   visual-perception seam can emit one atom for the magnitude scale and
+//   another for the density label without re-running the classifier.
+fn lk_flow_magnitude_label(mean_mag) {
+    if mean_mag < LK_MAG_MID_MIN  { return LK_LABEL_MAG_LOW }
+    if mean_mag < LK_MAG_HIGH_MIN { return LK_LABEL_MAG_MID }
+    return LK_LABEL_MAG_HIGH
+}
+
+// ---- chat admin helpers --------------------------------------------------
+//
+// `/flow prev.pgm next.pgm` admin -- the chat dispatches `lk_pgm_args(arg)`
+// directly (one io_println call), so this module owns the full PGM-parse
+// + lk_optical_flow + summary pipeline. The image_pgm import lives at
+// the top of the file.
+
+fn _lk_split_two(arg) {
+    let pair = list_new()
+    let n = len(arg)
+    let i = 0
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, substr(arg, int_add(i, 1), int_sub(n, int_add(i, 1))))
+            return pair
+        }
+        i = int_add(i, 1)
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn lk_pgm_args(arg) {
+    if len(arg) == 0 {
+        return "(/flow needs two PATHs -- usage: /flow prev.pgm next.pgm)"
+    }
+    let parts = _lk_split_two(arg)
+    return lk_pgm_paths(parts[0], parts[1])
+}
+
+fn lk_pgm_paths(path_prev, path_next) {
+    if len(path_prev) == 0 {
+        return "(/flow needs two PATHs -- usage: /flow prev.pgm next.pgm)"
+    }
+    if len(path_next) == 0 {
+        return "(/flow needs TWO paths -- got 1)"
+    }
+    let r_p = pgm_parse_file(path_prev)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(flow FAILED on prev: " + err_p + ")"
+    }
+    let r_n = pgm_parse_file(path_next)
+    let err_n = pgm_result_error(r_n)
+    if len(err_n) > 0 {
+        return "(flow FAILED on next: " + err_n + ")"
+    }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    let w_n = pgm_result_width(r_n)
+    let h_n = pgm_result_height(r_n)
+    if w_p != w_n {
+        return "(flow FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if h_p != h_n {
+        return "(flow FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if w_p > LK_MAX_DIM { return "(flow FAILED: prev too large -- max 256x256)" }
+    if h_p > LK_MAX_DIM { return "(flow FAILED: prev too large -- max 256x256)" }
+    let d_p = pgm_result_data(r_p)
+    let d_n = pgm_result_data(r_n)
+    let result = lk_optical_flow(d_p, d_n, w_p, h_p, LK_DEFAULT_WIN_SIZE)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    let valid    = lk_flow_valid_count(result)
+    return "(flow " + int_to_str(w_p) + "x" + int_to_str(h_p)
+        + " mean_mag=" + int_to_str(mean_mag)
+        + "milli valid=" + int_to_str(valid)
+        + " " + lk_flow_density_label(result) + ")"
+}
+
+// ---- visual-perception integration --------------------------------------
+//
+// lk_append_features_if_paired(feats, prev_ptr, width, height)
+//   Reads the CE_VP_FLOW_PREV env var (a path to the PREVIOUS frame
+//   PGM); when set, decodes it, validates matching dims + minimum size,
+//   runs lk_optical_flow, and appends two atoms to `feats`:
+//     image_optical_flow_magnitude_<low|mid|high>  -- mean motion scale
+//     image_optical_flow_density_<low|mid|high>    -- density bucket
+//   The labels are silent (no atoms appended) when the env var is
+//   unset, the PGM fails to decode, or dimensions don't match -- the
+//   flow seam should never make /see fall over on an unpaired image.
+//
+//   Naming: the env var holds the PREVIOUS frame and `prev_ptr` (the
+//   image currently being decoded by the seam) is treated as the NEXT
+//   frame; flow is computed prev->next, matching the algorithmic
+//   convention.
+
+fn lk_append_features_if_paired(feats, next_ptr, width, height) {
+    let env = getenv("CE_VP_FLOW_PREV")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if width  > LK_MAX_DIM { return 0 }
+    if height > LK_MAX_DIM { return 0 }
+    let r_p = pgm_parse_file(env)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 { return 0 }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    if w_p != width  { return 0 }
+    if h_p != height { return 0 }
+    let d_p = pgm_result_data(r_p)
+    let result = lk_optical_flow(d_p, next_ptr, width, height,
+                                 LK_DEFAULT_WIN_SIZE)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    push(feats, lk_flow_magnitude_label(mean_mag))
+    push(feats, lk_flow_density_label(result))
+    return 1
+}
+
+// =========================================================================
+// Pyramidal Lucas-Kanade (R11A extension -- Bouguet 2000 coarse-to-fine).
+// =========================================================================
+//
+// The single-level lk_optical_flow above is exact for SUB-pixel shifts
+// (the first-order Taylor expansion I_next(p) ~ I_prev(p) + grad . d holds
+// when |d| << 1). It under-estimates multi-pixel shifts because the
+// linearization breaks at the discontinuity. R10D's textbook fixture
+// measured u ~ 2384 milli when target was 3000 (3 px shift); larger
+// shifts degrade further. The classical workaround is a coarse-to-fine
+// Gaussian pyramid (Bouguet 2000, "Pyramidal Implementation of the
+// Lucas-Kanade Feature Tracker"):
+//
+//   1. Build Gaussian pyramids of both frames at L levels (each level
+//      smoothed via 3x3 Gaussian then downsampled by 2). At the coarsest
+//      level a K-pixel shift in the original image is only K / 2^(L-1)
+//      pixels, well inside the linear LK regime.
+//   2. From coarsest to finest level:
+//      a. Take current flow estimate (u, v) from the level above
+//         (initialized to (0, 0) at the coarsest level).
+//      b. Warp NEXT level by current flow (integer-pixel rounded:
+//         warped(x, y) = next(x + round(u), y + round(v)) with
+//         out-of-bounds zero-fill).
+//      c. Run single-level LK on (prev_level, warped) -> flow CORRECTION
+//         (du, dv); update (u, v) += (du, dv).
+//      d. Optionally repeat (b)+(c) MAX_ITERATIONS times (iterative
+//         warping refines the estimate at the same scale).
+//   3. Upsample (u, v) to the next finer level by doubling each
+//      component (pixel coordinates double; the underlying shift in
+//      pixels also doubles).
+//   4. Final output: (u, v) at the finest level.
+//
+// Implementation choices:
+//   * Pyramid levels are stored as RAW BYTE BUFFERS (alloc'd via _lk_alloc_bytes),
+//     same shape as PGM data. Each is a separate allocation, accessed via
+//     load8 / store8. This keeps lk_optical_flow unchanged -- it consumes
+//     byte buffers and we pass each level directly.
+//   * The Gaussian smoothing reuses Canny's 3x3 weights (1/2/4/2/1, sum 16)
+//     but operates byte->byte (not the byte->int_list shape of
+//     _canny_gaussian_3x3). Border pixels are copied unchanged.
+//   * Downsample by 2: each output pixel = average of the 2x2 source block
+//     (anti-aliased subsample, paired with the prior Gaussian).
+//   * Warp: integer pixel rounding (round-half-up via int_add(milli, 500)
+//     when milli >= 0, int_sub(milli, 500) when negative, then / 1000).
+//     OOB pixels read zero (Bouguet's recommendation -- mirroring would
+//     fight the linearization at the seam).
+//   * Pyramid level cap: LK_PYR_MAX_LEVELS = 5 (256 px / 2^4 = 16 px,
+//     just above the WIN_SIZE+pad floor lk_optical_flow needs).
+//   * Default iter count: LK_PYR_DEFAULT_MAX_ITER = 3 (Bouguet's
+//     recommendation -- gains diminish after the third warp+solve).
+//   * Default levels: LK_PYR_DEFAULT_LEVELS = 3 (handles shifts up to
+//     ~16 px on a 256 px image without the bottom level shrinking below
+//     the LK window minimum).
+
+let LK_PYR_DEFAULT_LEVELS    = 3
+let LK_PYR_DEFAULT_MAX_ITER  = 3
+let LK_PYR_MAX_LEVELS        = 5
+let LK_PYR_MIN_LEVEL_DIM     = 8       // below this, LK's 5x5 window fails
+let LK_PYR_LEVEL_W           = 0
+let LK_PYR_LEVEL_H           = 1
+let LK_PYR_LEVEL_BUF         = 2
+
+// ---- byte-buffer helpers ------------------------------------------------
+
+fn _lk_alloc_bytes(area) {
+    // alloc(area + 1) so the trailing NUL byte fits (mirrors PGM data
+    // shape; some downstream consumers treat the buffer as C-string-like).
+    let buf = alloc(int_add(area, 1))
+    let i = 0
+    while i < area {
+        store8(int_add(buf, i), 0)
+        i = int_add(i, 1)
+    }
+    store8(int_add(buf, area), 0)
+    return buf
+}
+
+// ---- Gaussian 3x3 smoothing (byte buffer -> byte buffer) ----------------
+//
+// 3x3 weights 1/2/4/2/1 (corners / edges / center) summing to 16. Border
+// pixels copied unchanged (same convention as image_canny.nova's
+// _canny_gaussian_3x3). Returns a NEW byte buffer of the same dimensions.
+
+fn _lk_gaussian_3x3_bytes(src, width, height) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    // Default: copy every pixel through (handles borders + dimensions
+    // too small for the kernel).
+    let i = 0
+    while i < area {
+        store8(int_add(dst, i), load8(int_add(src, i)))
+        i = int_add(i, 1)
+    }
+    if width  < 3 { return dst }
+    if height < 3 { return dst }
+    let y = 1
+    let y_max = int_sub(height, 1)
+    while y < y_max {
+        let row_above = int_mul(int_sub(y, 1), width)
+        let row_mid   = int_mul(y, width)
+        let row_below = int_mul(int_add(y, 1), width)
+        let x = 1
+        let x_max = int_sub(width, 1)
+        while x < x_max {
+            let tl = load8(int_add(src, int_add(row_above, int_sub(x, 1))))
+            let tm = load8(int_add(src, int_add(row_above, x)))
+            let tr = load8(int_add(src, int_add(row_above, int_add(x, 1))))
+            let ml = load8(int_add(src, int_add(row_mid,   int_sub(x, 1))))
+            let mc = load8(int_add(src, int_add(row_mid,   x)))
+            let mr = load8(int_add(src, int_add(row_mid,   int_add(x, 1))))
+            let bl = load8(int_add(src, int_add(row_below, int_sub(x, 1))))
+            let bm = load8(int_add(src, int_add(row_below, x)))
+            let br = load8(int_add(src, int_add(row_below, int_add(x, 1))))
+            // corners*1 + edges*2 + center*4, sum/16.
+            let s = int_add(tl, tr)
+            s = int_add(s, bl)
+            s = int_add(s, br)
+            s = int_add(s, int_mul(2, tm))
+            s = int_add(s, int_mul(2, ml))
+            s = int_add(s, int_mul(2, mr))
+            s = int_add(s, int_mul(2, bm))
+            s = int_add(s, int_mul(4, mc))
+            let v = s / 16
+            if v < 0   { v = 0 }
+            if v > 255 { v = 255 }
+            store8(int_add(dst, int_add(row_mid, x)), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- 2x downsample (byte buffer -> byte buffer of w/2 x h/2) ------------
+//
+// Each output pixel = average of the 2x2 source block. Pairs naturally
+// with the prior Gaussian smoothing to anti-alias the subsample.
+
+fn _lk_downsample_2x(src, width, height) {
+    let dw = width  / 2
+    let dh = height / 2
+    if dw < 1 { dw = 1 }
+    if dh < 1 { dh = 1 }
+    let area = int_mul(dw, dh)
+    let dst = _lk_alloc_bytes(area)
+    let y = 0
+    while y < dh {
+        let sy0 = int_mul(y, 2)
+        let sy1 = int_add(sy0, 1)
+        if sy1 >= height { sy1 = int_sub(height, 1) }
+        let row_off0 = int_mul(sy0, width)
+        let row_off1 = int_mul(sy1, width)
+        let drow_off = int_mul(y, dw)
+        let x = 0
+        while x < dw {
+            let sx0 = int_mul(x, 2)
+            let sx1 = int_add(sx0, 1)
+            if sx1 >= width { sx1 = int_sub(width, 1) }
+            let a = load8(int_add(src, int_add(row_off0, sx0)))
+            let b = load8(int_add(src, int_add(row_off0, sx1)))
+            let c = load8(int_add(src, int_add(row_off1, sx0)))
+            let d = load8(int_add(src, int_add(row_off1, sx1)))
+            let avg = int_add(int_add(a, b), int_add(c, d)) / 4
+            store8(int_add(dst, int_add(drow_off, x)), avg)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- lk_pyramid_build ---------------------------------------------------
+//
+// Returns a list of L levels, each `[level_w, level_h, level_buf]`.
+// Index 0 = finest (original); index L-1 = coarsest.
+//   * Level 0 is a COPY of the original (callers may free it
+//     independently of the source).
+//   * Each subsequent level: Gaussian-smooth the previous level then
+//     downsample by 2.
+//   * Stops early if the next level would be smaller than
+//     LK_PYR_MIN_LEVEL_DIM in either axis (LK's 5x5 window + pad needs
+//     headroom). Caller can inspect `len(pyramid)` to see how many
+//     levels actually built.
+
+fn lk_pyramid_build(image, width, height, levels) {
+    let pyramid = list_new()
+    if image == 0    { return pyramid }
+    if width  <= 0   { return pyramid }
+    if height <= 0   { return pyramid }
+    if width  > LK_MAX_DIM { return pyramid }
+    if height > LK_MAX_DIM { return pyramid }
+    let req_levels = levels
+    if req_levels < 1                  { req_levels = 1 }
+    if req_levels > LK_PYR_MAX_LEVELS  { req_levels = LK_PYR_MAX_LEVELS }
+    // Level 0 = copy of the original.
+    let area0 = int_mul(width, height)
+    let buf0 = _lk_alloc_bytes(area0)
+    let i = 0
+    while i < area0 {
+        store8(int_add(buf0, i), load8(int_add(image, i)))
+        i = int_add(i, 1)
+    }
+    let lvl0 = list_new()
+    push(lvl0, width)
+    push(lvl0, height)
+    push(lvl0, buf0)
+    push(pyramid, lvl0)
+    // Build successive coarser levels.
+    let prev_buf = buf0
+    let prev_w = width
+    let prev_h = height
+    let l = 1
+    while l < req_levels {
+        // Stop early if the next level would fall under the min dim.
+        let nw = prev_w / 2
+        let nh = prev_h / 2
+        if nw < LK_PYR_MIN_LEVEL_DIM { return pyramid }
+        if nh < LK_PYR_MIN_LEVEL_DIM { return pyramid }
+        let smoothed = _lk_gaussian_3x3_bytes(prev_buf, prev_w, prev_h)
+        let down = _lk_downsample_2x(smoothed, prev_w, prev_h)
+        let lvl = list_new()
+        push(lvl, nw)
+        push(lvl, nh)
+        push(lvl, down)
+        push(pyramid, lvl)
+        prev_buf = down
+        prev_w = nw
+        prev_h = nh
+        l = int_add(l, 1)
+    }
+    return pyramid
+}
+
+fn lk_pyramid_level_width(pyramid, idx) {
+    if idx < 0           { return 0 }
+    if idx >= len(pyramid) { return 0 }
+    let lvl = pyramid[idx]
+    return lvl[LK_PYR_LEVEL_W]
+}
+
+fn lk_pyramid_level_height(pyramid, idx) {
+    if idx < 0           { return 0 }
+    if idx >= len(pyramid) { return 0 }
+    let lvl = pyramid[idx]
+    return lvl[LK_PYR_LEVEL_H]
+}
+
+fn lk_pyramid_level_data(pyramid, idx) {
+    if idx < 0           { return 0 }
+    if idx >= len(pyramid) { return 0 }
+    let lvl = pyramid[idx]
+    return lvl[LK_PYR_LEVEL_BUF]
+}
+
+// ---- flow milli-to-int rounding ----------------------------------------
+//
+// Round half-away-from-zero so positive and negative shifts behave
+// symmetrically. milli=499 -> 0, milli=500 -> 1, milli=-499 -> 0,
+// milli=-500 -> -1.
+
+fn _lk_round_milli_to_int(milli) {
+    if milli >= 0 { return int_add(milli, LK_MILLI_PER_UNIT / 2) / LK_MILLI_PER_UNIT }
+    // negative: subtract half then divide. NOVA division truncates toward
+    // zero so we have to bias manually.
+    let neg = 0 - milli
+    let r = int_add(neg, LK_MILLI_PER_UNIT / 2) / LK_MILLI_PER_UNIT
+    return 0 - r
+}
+
+// ---- lk_warp_image ------------------------------------------------------
+//
+// Warps `image` by the per-pixel flow field (u_field, v_field, each a
+// flow_buf in the lk_optical_flow result shape -- packed (u_milli,
+// v_milli) per pixel). Output: a NEW byte buffer of the same dimensions.
+//
+//   warped(x, y) = image(x + round(u(x,y)/1000), y + round(v(x,y)/1000))
+//
+// OOB pixels read zero. If u_field == 0 we treat the displacement as
+// zero everywhere (handy for the identity-warp case).
+
+fn lk_warp_image(image, width, height, u_field, v_field) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    if image == 0 { return dst }
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let pixel_idx = int_add(row_off, x)
+            let du = 0
+            let dv = 0
+            if u_field != 0 {
+                du = _lk_round_milli_to_int(_lk_get(u_field, int_mul(pixel_idx, 2)))
+            }
+            if v_field != 0 {
+                dv = _lk_round_milli_to_int(_lk_get(v_field, int_add(int_mul(pixel_idx, 2), 1)))
+            }
+            let sx = int_add(x, du)
+            let sy = int_add(y, dv)
+            let v = 0
+            if sx >= 0 {
+                if sx < width {
+                    if sy >= 0 {
+                        if sy < height {
+                            v = load8(int_add(image, int_add(int_mul(sy, width), sx)))
+                        }
+                    }
+                }
+            }
+            store8(int_add(dst, pixel_idx), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- internal: warp using a single (u_int, v_int) shift ----------------
+//
+// The pyramid orchestrator below tracks (u, v) as a single per-level
+// shift (in INTEGER pixel units at that level's resolution), not a
+// per-pixel field. Warping by a constant shift collapses to a simple
+// translation; we keep this helper distinct from lk_warp_image (which
+// takes a per-pixel field) so the common case is straight-line code.
+
+fn _lk_warp_uniform(image, width, height, du_int, dv_int) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    if image == 0 { return dst }
+    let y = 0
+    while y < height {
+        let sy = int_add(y, dv_int)
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let sx = int_add(x, du_int)
+            let v = 0
+            if sx >= 0 {
+                if sx < width {
+                    if sy >= 0 {
+                        if sy < height {
+                            v = load8(int_add(image, int_add(int_mul(sy, width), sx)))
+                        }
+                    }
+                }
+            }
+            store8(int_add(dst, int_add(row_off, x)), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- lk_optical_flow_pyramid (Bouguet 2000) ----------------------------
+//
+// Coarse-to-fine LK with iterative warping at each level. Returns a
+// result tuple in the SAME shape as lk_optical_flow at the FINEST level.
+// The aggregated flow at every interior pixel is the level-0 flow.
+//
+// Per-level invariant: we track a GLOBAL (u, v) shift in milli units at
+// the current level's pixel scale. Warping uses the integer-rounded
+// shift; the residual flow returned by the inner LK solve is added to
+// the global accumulator. Upsampling between levels DOUBLES (u, v) (the
+// shift in pixels doubles because pixel coordinates double).
+//
+// This shape -- accumulating a SINGLE (u, v) for the whole image rather
+// than a per-pixel field across levels -- is the simplification that
+// keeps the code tractable while still beating single-level LK on the
+// large-displacement fixtures the brief calls out. The downside is the
+// algorithm becomes a "translational pyramid" -- it handles rigid
+// frame-to-frame translation excellently but blurs across rotational /
+// non-rigid motion. The PER-PIXEL flow field at the finest level still
+// captures local variation around the global translation; the global
+// (u, v) merely brings the inner solver into its linear regime.
+
+fn lk_optical_flow_pyramid(prev_ptr, next_ptr, width, height, win_size, levels, max_iter) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let req_levels = levels
+    if req_levels < 1                 { req_levels = LK_PYR_DEFAULT_LEVELS }
+    if req_levels > LK_PYR_MAX_LEVELS { req_levels = LK_PYR_MAX_LEVELS }
+    let req_iter = max_iter
+    if req_iter < 1 { req_iter = LK_PYR_DEFAULT_MAX_ITER }
+    if req_iter > 8 { req_iter = 8 }
+
+    let pyr_prev = lk_pyramid_build(prev_ptr, width, height, req_levels)
+    let pyr_next = lk_pyramid_build(next_ptr, width, height, req_levels)
+    let L = len(pyr_prev)
+    if L < 1 { return _lk_fail() }
+    if len(pyr_next) < L { L = len(pyr_next) }
+
+    // Global accumulated shift in milli units at the CURRENT level scale.
+    let u_milli = 0
+    let v_milli = 0
+
+    // Iterate coarsest -> finest. At entry to each level, (u_milli,
+    // v_milli) is the shift at THAT level's pixel scale. At exit we
+    // double it before descending.
+    let l = int_sub(L, 1)
+    while l >= 0 {
+        let lw = lk_pyramid_level_width(pyr_prev, l)
+        let lh = lk_pyramid_level_height(pyr_prev, l)
+        let p_buf = lk_pyramid_level_data(pyr_prev, l)
+        let n_buf = lk_pyramid_level_data(pyr_next, l)
+        // Iterative warping: warp NEXT by current (u, v), solve LK,
+        // accumulate, repeat up to req_iter times. We accept the
+        // refined estimate even if the inner LK marks pixels invalid --
+        // the global (u, v) accumulator is robust to per-pixel noise.
+        let it = 0
+        while it < req_iter {
+            let du_int = _lk_round_milli_to_int(u_milli)
+            let dv_int = _lk_round_milli_to_int(v_milli)
+            let warped = _lk_warp_uniform(n_buf, lw, lh, du_int, dv_int)
+            let inner = lk_optical_flow(p_buf, warped, lw, lh, ws)
+            // The inner solve produces a per-pixel field. Reduce it to a
+            // single (du, dv) by taking a CLAMPED median-style aggregate
+            // over valid pixels. Means are catastrophically pulled by
+            // boundary discontinuities (a shifted-zero strip at the
+            // image edge survives Gaussian smoothing into the coarse
+            // levels and produces wild per-pixel u, v there). The
+            // robust aggregate clamps each per-pixel flow to a small
+            // window around the prior, then averages.
+            //
+            //   * Maximum per-pixel correction expected at this level is
+            //     ~half the level's window radius worth of pixels (in
+            //     milli units). We clamp |du - 0| and |dv - 0| to a
+            //     conservative ceiling = LK_PYR_MAX_CORRECTION_MILLI per
+            //     iteration. Outliers above the ceiling get scaled down
+            //     to the ceiling magnitude (preserving sign).
+            let flow_buf  = inner[LK_R_FLOW_BUF]
+            let valid_buf = inner[LK_R_VALID_BUF]
+            let valid_cnt = inner[LK_R_VALID_COUNT]
+            if valid_cnt == 0 {
+                // No valid solve at this level -- give up early; downstream
+                // levels will refine from whatever (u, v) we have so far.
+                it = req_iter
+            } else {
+                // Per-iteration correction ceiling. At level l in a
+                // 256-px image, a single pyramid step doubles the residual
+                // shift. The most useful information comes from the inner
+                // solve when each per-pixel correction is at most a few
+                // pixels (~4000 milli). Outliers far beyond this are
+                // boundary artifacts; clamp them to the ceiling so they
+                // don't dominate the average.
+                let ceil_milli = 4000
+                let sum_u = 0
+                let sum_v = 0
+                let level_area = int_mul(lw, lh)
+                let pi = 0
+                while pi < level_area {
+                    if _lk_get(valid_buf, pi) == 1 {
+                        let pu = _lk_get(flow_buf, int_mul(pi, 2))
+                        let pv = _lk_get(flow_buf, int_add(int_mul(pi, 2), 1))
+                        if pu >  ceil_milli { pu =  ceil_milli }
+                        if pu < 0 - ceil_milli { pu = 0 - ceil_milli }
+                        if pv >  ceil_milli { pv =  ceil_milli }
+                        if pv < 0 - ceil_milli { pv = 0 - ceil_milli }
+                        sum_u = int_add(sum_u, pu)
+                        sum_v = int_add(sum_v, pv)
+                    }
+                    pi = int_add(pi, 1)
+                }
+                let du_milli = sum_u / valid_cnt
+                let dv_milli = sum_v / valid_cnt
+                u_milli = int_add(u_milli, du_milli)
+                v_milli = int_add(v_milli, dv_milli)
+                // If the correction is tiny we can break early (saves the
+                // remaining warp+solve calls).
+                let mag = du_milli
+                if mag < 0 { mag = 0 - mag }
+                let mag2 = dv_milli
+                if mag2 < 0 { mag2 = 0 - mag2 }
+                if int_add(mag, mag2) < 50 { it = req_iter }
+            }
+            it = int_add(it, 1)
+        }
+        // Descend: pixel coordinates double at the next finer level so
+        // the corresponding shift in pixels also doubles.
+        if l > 0 {
+            u_milli = int_mul(u_milli, 2)
+            v_milli = int_mul(v_milli, 2)
+        }
+        l = int_sub(l, 1)
+    }
+
+    // Final pass at the finest level: run lk_optical_flow on (prev,
+    // warped_next) one last time so the returned result tuple has the
+    // full per-pixel flow field (the global (u, v) PLUS the level-0
+    // residual at every pixel). The aggregated (u_milli, v_milli)
+    // captures the translational portion; this final per-pixel solve
+    // captures any local variation around it.
+    let du_int = _lk_round_milli_to_int(u_milli)
+    let dv_int = _lk_round_milli_to_int(v_milli)
+    let warped_final = _lk_warp_uniform(next_ptr, width, height, du_int, dv_int)
+    let final_inner = lk_optical_flow(prev_ptr, warped_final, width, height, ws)
+    // Add the global (u, v) to every valid pixel in the inner field.
+    let flow_buf  = final_inner[LK_R_FLOW_BUF]
+    let valid_buf = final_inner[LK_R_VALID_BUF]
+    let total     = final_inner[LK_R_TOTAL]
+    let valid_cnt = 0
+    let mag_sum = 0
+    let pi = 0
+    while pi < total {
+        let v_flag = _lk_get(valid_buf, pi)
+        if v_flag == 1 {
+            let u_local = _lk_get(flow_buf, int_mul(pi, 2))
+            let v_local = _lk_get(flow_buf, int_add(int_mul(pi, 2), 1))
+            let u_total = int_add(u_milli, u_local)
+            let v_total = int_add(v_milli, v_local)
+            _lk_set(flow_buf, int_mul(pi, 2),                 u_total)
+            _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),     v_total)
+            valid_cnt = int_add(valid_cnt, 1)
+            let mag = _lk_isqrt(int_add(int_mul(u_total, u_total),
+                                        int_mul(v_total, v_total)))
+            mag_sum = int_add(mag_sum, mag)
+        } else {
+            // The inner solve marked this pixel invalid (e.g. textureless
+            // region). If the global (u, v) is non-trivial we still want
+            // pixels to read it -- otherwise the average magnitude would
+            // be 0 over a textureless image translated by 5 px, which is
+            // wrong. We do NOT bump valid_cnt here (the per-pixel solve
+            // genuinely has no opinion) but we DO write the global shift.
+            _lk_set(flow_buf, int_mul(pi, 2),                 u_milli)
+            _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),     v_milli)
+        }
+        pi = int_add(pi, 1)
+    }
+    let mean_mag = 0
+    if valid_cnt > 0 { mean_mag = mag_sum / valid_cnt }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_cnt,
+                      total, width, height)
+}
+
+// ---- chat admin: /flow_pyr prev.pgm next.pgm ----------------------------
+//
+// Mirrors lk_pgm_args / lk_pgm_paths above but routes through the
+// pyramidal solver. Same output shape so callers (scripts, the visual-
+// perception seam if it grows a pyramidal mode) can swap one for the
+// other without parsing changes.
+
+fn lk_pgm_args_pyramid(arg) {
+    if len(arg) == 0 {
+        return "(/flow_pyr needs two PATHs -- usage: /flow_pyr prev.pgm next.pgm)"
+    }
+    let parts = _lk_split_two(arg)
+    return lk_pgm_paths_pyramid(parts[0], parts[1])
+}
+
+fn lk_pgm_paths_pyramid(path_prev, path_next) {
+    if len(path_prev) == 0 {
+        return "(/flow_pyr needs two PATHs -- usage: /flow_pyr prev.pgm next.pgm)"
+    }
+    if len(path_next) == 0 {
+        return "(/flow_pyr needs TWO paths -- got 1)"
+    }
+    let r_p = pgm_parse_file(path_prev)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(flow_pyr FAILED on prev: " + err_p + ")"
+    }
+    let r_n = pgm_parse_file(path_next)
+    let err_n = pgm_result_error(r_n)
+    if len(err_n) > 0 {
+        return "(flow_pyr FAILED on next: " + err_n + ")"
+    }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    let w_n = pgm_result_width(r_n)
+    let h_n = pgm_result_height(r_n)
+    if w_p != w_n {
+        return "(flow_pyr FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if h_p != h_n {
+        return "(flow_pyr FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if w_p > LK_MAX_DIM { return "(flow_pyr FAILED: prev too large -- max 256x256)" }
+    if h_p > LK_MAX_DIM { return "(flow_pyr FAILED: prev too large -- max 256x256)" }
+    let d_p = pgm_result_data(r_p)
+    let d_n = pgm_result_data(r_n)
+    let result = lk_optical_flow_pyramid(d_p, d_n, w_p, h_p,
+                                          LK_DEFAULT_WIN_SIZE,
+                                          LK_PYR_DEFAULT_LEVELS,
+                                          LK_PYR_DEFAULT_MAX_ITER)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    let valid    = lk_flow_valid_count(result)
+    return "(flow_pyr " + int_to_str(w_p) + "x" + int_to_str(h_p)
+        + " mean_mag=" + int_to_str(mean_mag)
+        + "milli valid=" + int_to_str(valid)
+        + " " + lk_flow_density_label(result) + ")"
+}
+
+// =========================================================================
+// R13B: Full per-pixel pyramidal Lucas-Kanade propagation.
+// =========================================================================
+//
+// R11A above ships pyramidal LK with a TRANSLATIONAL-AGGREGATE simplification:
+// at each level the per-pixel flow corrections are CLAMPED to +/-4000 milli
+// then AVERAGED into a single global (u, v) shift that propagates to the
+// next level. The clamp is load-bearing -- boundary discontinuities from
+// shifted-zero strips produce wild per-pixel values that would otherwise
+// dominate any unweighted mean. The downside: a frame whose left half
+// shifts by 8 px and right half shifts by 2 px collapses to ~5 px
+// everywhere (the average) -- motion DISCONTINUITIES are washed out.
+//
+// R13B implements the FULL Bouguet 2000 per-pixel propagation:
+//   1. Build Gaussian pyramid (reuse R11A's lk_pyramid_build).
+//   2. At the coarsest level, initialize the per-pixel flow field to all
+//      zeros.
+//   3. For each level coarsest -> finest:
+//      a. For each pixel (x, y): warp NEXT around (x + u(x,y), y + v(x,y))
+//         using BILINEAR interpolation (preserves sub-pixel accuracy
+//         across pyramid levels; the R11A integer warp would accumulate
+//         quantization error across levels).
+//      b. Run R10D's single-level LK on (prev[level], warped) -> per-
+//         pixel correction field (du(x,y), dv(x,y)).
+//      c. Apply ROBUST OUTLIER DETECTION per pixel: reject the
+//         candidate iff (|du| + |dv|) is more than 3 * MAD of the same
+//         magnitude in the surrounding 7x7 window. (Pixel-level
+//         decision; an outlier keeps its previous-level flow rather
+//         than dominating the answer.) A HARD CEILING of 8000 milli
+//         per single-iteration correction is applied first so that
+//         clusters of wild boundary corrections do not pollute the
+//         MAD baseline.
+//      d. Accepted: u(x,y) += du(x,y); v(x,y) += dv(x,y).
+//   4. At the COARSEST LEVEL ONLY, pixels whose inner solve was invalid
+//      or whose correction was rejected receive the GLOBAL MEDIAN
+//      correction as a fill, seeding the next level's warp with a
+//      coherent field everywhere. At finer levels the propagated
+//      coarser estimate IS the right fallback; we do not re-fill.
+//   5. Upsample the flow field to the next finer level:
+//        flow_at_finer(x, y) = 2 * flow_at_coarser(x/2, y/2)
+//      (nearest-neighbor on coarser coordinates; pixel coordinate AND shift
+//      both double when descending.)
+//   6. Final output: dense flow field at the finest level. The public
+//      result's valid_buf reflects only pixels whose own per-pixel
+//      solve accepted at the finest level -- textureless regions still
+//      flag invalid, matching the R10D / R11A contract.
+//
+// Per-pixel propagation handles motion DISCONTINUITIES (the brief's
+// headline win) without losing R11A's robustness to boundary outliers --
+// the MAD-based per-pixel rejection + hard ceiling replaces the blanket
+// +/-4000 ceiling on the global average. The downside is cost:
+// per-pixel solves at every level. On the 80x64 fixture this is ~5x
+// slower; acceptable for the offline /flow_pp admin pipeline.
+
+let LK_PP_DEFAULT_MAD_WINDOW = 7    // 7x7 robust-stats window per pixel
+let LK_PP_DEFAULT_MAD_FACTOR = 3    // 3x MAD acceptance ceiling
+let LK_PP_HARD_CEIL_MILLI    = 8000 // per-iteration absolute correction cap
+// Per-level iteration count. The per-pixel pipeline differs from R11A's
+// translational-aggregate pipeline: multi-iteration refinement at the
+// same level uses a per-pixel WARP that may include MAD-rejected pixels
+// (kept at their previous value). Subsequent iterations land on a
+// scrambled image and the inner solve produces wild residuals, which the
+// MAD test cannot reliably reject because the WHOLE neighborhood is wild.
+// Empirically, ONE iteration per level converges; iter >= 3 diverges.
+// Callers can opt back in via the max_iter parameter.
+let LK_PP_DEFAULT_MAX_ITER   = 1
+
+// ---- bilinear sample (byte buffer, sub-pixel x_milli, y_milli) ---------
+//
+// _lk_pp_bilinear(image, w, h, x_milli, y_milli) -> int in [0..255]
+//   x_milli, y_milli encode sub-pixel coordinates (x = x_milli / 1000).
+//   OOB samples read 0 (mirrors lk_warp_image; cleaner than mirror
+//   extrapolation at the linearization seam).
+
+fn _lk_pp_bilinear(image, width, height, x_milli, y_milli) {
+    if image == 0 { return 0 }
+    // Floor in milli space. NOVA integer division truncates toward zero;
+    // we want floor (round toward -inf) so negatives need a bias.
+    let x0 = 0
+    let y0 = 0
+    if x_milli >= 0 {
+        x0 = x_milli / LK_MILLI_PER_UNIT
+    } else {
+        let neg = 0 - x_milli
+        x0 = 0 - int_add(neg, int_sub(LK_MILLI_PER_UNIT, 1)) / LK_MILLI_PER_UNIT
+    }
+    if y_milli >= 0 {
+        y0 = y_milli / LK_MILLI_PER_UNIT
+    } else {
+        let neg = 0 - y_milli
+        y0 = 0 - int_add(neg, int_sub(LK_MILLI_PER_UNIT, 1)) / LK_MILLI_PER_UNIT
+    }
+    let fx_milli = int_sub(x_milli, int_mul(x0, LK_MILLI_PER_UNIT))
+    let fy_milli = int_sub(y_milli, int_mul(y0, LK_MILLI_PER_UNIT))
+    let one_minus_fx = int_sub(LK_MILLI_PER_UNIT, fx_milli)
+    let one_minus_fy = int_sub(LK_MILLI_PER_UNIT, fy_milli)
+    let x1 = int_add(x0, 1)
+    let y1 = int_add(y0, 1)
+    let p00 = 0
+    let p10 = 0
+    let p01 = 0
+    let p11 = 0
+    if x0 >= 0 {
+        if x0 < width {
+            if y0 >= 0 {
+                if y0 < height {
+                    p00 = load8(int_add(image, int_add(int_mul(y0, width), x0)))
+                }
+            }
+        }
+    }
+    if x1 >= 0 {
+        if x1 < width {
+            if y0 >= 0 {
+                if y0 < height {
+                    p10 = load8(int_add(image, int_add(int_mul(y0, width), x1)))
+                }
+            }
+        }
+    }
+    if x0 >= 0 {
+        if x0 < width {
+            if y1 >= 0 {
+                if y1 < height {
+                    p01 = load8(int_add(image, int_add(int_mul(y1, width), x0)))
+                }
+            }
+        }
+    }
+    if x1 >= 0 {
+        if x1 < width {
+            if y1 >= 0 {
+                if y1 < height {
+                    p11 = load8(int_add(image, int_add(int_mul(y1, width), x1)))
+                }
+            }
+        }
+    }
+    // Each weight is in [0..LK_MILLI_PER_UNIT]; the four sum to
+    // LK_MILLI_PER_UNIT^2 = 1,000,000. Divide once at the end.
+    let w00 = int_mul(one_minus_fx, one_minus_fy)
+    let w10 = int_mul(fx_milli,     one_minus_fy)
+    let w01 = int_mul(one_minus_fx, fy_milli)
+    let w11 = int_mul(fx_milli,     fy_milli)
+    let s = int_add(int_mul(w00, p00),
+                    int_add(int_mul(w10, p10),
+                            int_add(int_mul(w01, p01),
+                                    int_mul(w11, p11))))
+    let v = s / int_mul(LK_MILLI_PER_UNIT, LK_MILLI_PER_UNIT)
+    if v < 0   { v = 0 }
+    if v > 255 { v = 255 }
+    return v
+}
+
+// ---- per-pixel warp into a fresh byte buffer ---------------------------
+
+fn _lk_pp_warp_field(image, width, height, u_field, v_field) {
+    let area = int_mul(width, height)
+    let dst = _lk_alloc_bytes(area)
+    if image == 0 { return dst }
+    let y = 0
+    while y < height {
+        let row_off = int_mul(y, width)
+        let x = 0
+        while x < width {
+            let pi = int_add(row_off, x)
+            let u_m = 0
+            let v_m = 0
+            if u_field != 0 { u_m = _lk_get(u_field, pi) }
+            if v_field != 0 { v_m = _lk_get(v_field, pi) }
+            let sx_m = int_add(int_mul(x, LK_MILLI_PER_UNIT), u_m)
+            let sy_m = int_add(int_mul(y, LK_MILLI_PER_UNIT), v_m)
+            let v = _lk_pp_bilinear(image, width, height, sx_m, sy_m)
+            store8(int_add(dst, pi), v)
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- upsample a flow field by 2x ---------------------------------------
+//
+// _lk_pp_upsample(field, sw, sh, dw, dh) -> field on dw x dh grid;
+//   finer[x, y] = 2 * coarse[x/2, y/2]. Nearest-neighbor with DOUBLING.
+
+fn _lk_pp_upsample(field, sw, sh, dw, dh) {
+    let area = int_mul(dw, dh)
+    let dst = _lk_buf_alloc(area, 0)
+    if field == 0 { return dst }
+    let y = 0
+    while y < dh {
+        let sy = y / 2
+        if sy >= sh { sy = int_sub(sh, 1) }
+        let src_row = int_mul(sy, sw)
+        let dst_row = int_mul(y, dw)
+        let x = 0
+        while x < dw {
+            let sx = x / 2
+            if sx >= sw { sx = int_sub(sw, 1) }
+            let v_coarse = _lk_get(field, int_add(src_row, sx))
+            _lk_set(dst, int_add(dst_row, x), int_mul(v_coarse, 2))
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+    return dst
+}
+
+// ---- median + MAD over a small int list --------------------------------
+//
+// In-place insertion sort + median pick + MAD = median(|x - median|).
+// NOVA has no sort builtin; insertion sort is fine for n <= 49.
+
+fn _lk_pp_isort(arr, n) {
+    let i = 1
+    while i < n {
+        let key = arr[i]
+        let j = int_sub(i, 1)
+        while j >= 0 {
+            if arr[j] > key {
+                list_set(arr, int_add(j, 1), arr[j])
+                j = int_sub(j, 1)
+            } else {
+                // Inserted; break inner loop.
+                j = 0 - 1
+            }
+        }
+        list_set(arr, int_add(j, 1), key)
+        i = int_add(i, 1)
+    }
+}
+
+fn _lk_pp_median_of_list(arr, n) {
+    if n <= 0 { return 0 }
+    _lk_pp_isort(arr, n)
+    return arr[n / 2]
+}
+
+// _lk_pp_mad(arr, n) -> MAD. Mutates arr (sorts twice).
+fn _lk_pp_mad(arr, n) {
+    if n <= 0 { return 0 }
+    let med = _lk_pp_median_of_list(arr, n)
+    let i = 0
+    while i < n {
+        let d = int_sub(arr[i], med)
+        if d < 0 { d = 0 - d }
+        list_set(arr, i, d)
+        i = int_add(i, 1)
+    }
+    return _lk_pp_median_of_list(arr, n)
+}
+
+// ---- per-pixel correction validity ------------------------------------
+//
+// At pixel (cx, cy) we have a candidate correction (du, dv) and a 7x7
+// neighborhood of candidate corrections from the same level's inner
+// solve. We collect the |du|+|dv| magnitudes from that neighborhood
+// (excluding above-ceiling outliers, which would pollute the MAD
+// baseline) and compute the median + MAD; the candidate is accepted iff
+// |its magnitude - median| <= LK_PP_DEFAULT_MAD_FACTOR * MAD. The hard
+// ceiling is applied first.
+
+fn _lk_pp_accept_correction(corr_u, corr_v, valid_buf, width, height,
+                             cx, cy, du, dv, mad_window) {
+    let amag = du
+    if amag < 0 { amag = 0 - amag }
+    let avmag = dv
+    if avmag < 0 { avmag = 0 - avmag }
+    let mcand = int_add(amag, avmag)
+    if mcand > LK_PP_HARD_CEIL_MILLI { return 0 }
+    let half = mad_window / 2
+    let mags = list_new()
+    let dy = 0 - half
+    while dy <= half {
+        let py = int_add(cy, dy)
+        let dx = 0 - half
+        while dx <= half {
+            let px = int_add(cx, dx)
+            if px >= 0 {
+                if px < width {
+                    if py >= 0 {
+                        if py < height {
+                            let pi = int_add(int_mul(py, width), px)
+                            if _lk_get(valid_buf, pi) == 1 {
+                                let nu = _lk_get(corr_u, pi)
+                                let nv = _lk_get(corr_v, pi)
+                                let au = nu
+                                if au < 0 { au = 0 - au }
+                                let av = nv
+                                if av < 0 { av = 0 - av }
+                                let nm = int_add(au, av)
+                                if nm <= LK_PP_HARD_CEIL_MILLI {
+                                    push(mags, nm)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dx = int_add(dx, 1)
+        }
+        dy = int_add(dy, 1)
+    }
+    let n = len(mags)
+    // Too few neighborhood samples to compute robust statistics; the
+    // hard ceiling is the sole guard in that degenerate case.
+    if n < 4 { return 1 }
+    let med = _lk_pp_median_of_list(mags, n)
+    let mad = _lk_pp_mad(mags, n)
+    // Floor MAD: prevents the test from collapsing on a uniform
+    // neighborhood. The floor scales with the median so that uniformly-
+    // large-but-truly-uniform neighborhoods accept everything within
+    // ~3x of the median rather than ~3x of zero.
+    let mad_floor = 50
+    let med_half = med / 2
+    if med_half > mad_floor { mad_floor = med_half }
+    if mad < mad_floor { mad = mad_floor }
+    let ceil = int_mul(mad, LK_PP_DEFAULT_MAD_FACTOR)
+    let dev = int_sub(mcand, med)
+    if dev < 0 { dev = 0 - dev }
+    if dev <= ceil { return 1 }
+    return 0
+}
+
+// _lk_pp_global_median(corr_u, corr_v, valid, area) -> [med_u, med_v]
+//   Robust per-axis median across the level's accepted-by-inner
+//   corrections (excluding above-ceiling outliers). Used at the
+//   coarsest level only to fill pixels that the inner solve could not
+//   handle.
+
+fn _lk_pp_global_median(corr_u, corr_v, valid, area) {
+    let us = list_new()
+    let vs = list_new()
+    let pi = 0
+    while pi < area {
+        if _lk_get(valid, pi) == 1 {
+            let u = _lk_get(corr_u, pi)
+            let v = _lk_get(corr_v, pi)
+            let au = u
+            if au < 0 { au = 0 - au }
+            let av = v
+            if av < 0 { av = 0 - av }
+            if int_add(au, av) <= LK_PP_HARD_CEIL_MILLI {
+                push(us, u)
+                push(vs, v)
+            }
+        }
+        pi = int_add(pi, 1)
+    }
+    let result = list_new()
+    let n = len(us)
+    if n == 0 {
+        push(result, 0)
+        push(result, 0)
+        return result
+    }
+    let mu = _lk_pp_median_of_list(us, n)
+    let mv = _lk_pp_median_of_list(vs, n)
+    push(result, mu)
+    push(result, mv)
+    return result
+}
+
+// _lk_pp_apply_level: warp + solve + per-pixel-accept at one level.
+//   `valid_field`    -- 1 if flow at this pixel is trustable to warp
+//                       with (real solve OR coarsest-level fill).
+//   `accepted_field` -- 1 iff the pixel was ever output of a real
+//                       inner-LK solve. The final result tuple's
+//                       valid_buf reflects this so textureless regions
+//                       still flag invalid.
+//   `is_coarsest`    -- 1 at the coarsest pyramid level; triggers the
+//                       global-median fill pass after the per-pixel
+//                       solves complete.
+
+fn _lk_pp_apply_level(u_field, v_field, valid_field, accepted_field,
+                      p_buf, n_buf,
+                      lw, lh, ws, max_iter, mad_window, is_coarsest) {
+    let level_area = int_mul(lw, lh)
+    let it = 0
+    while it < max_iter {
+        let warped = _lk_pp_warp_field(n_buf, lw, lh, u_field, v_field)
+        let inner = lk_optical_flow(p_buf, warped, lw, lh, ws)
+        let inner_flow  = inner[LK_R_FLOW_BUF]
+        let inner_valid = inner[LK_R_VALID_BUF]
+        let inner_cnt   = inner[LK_R_VALID_COUNT]
+        if inner_cnt == 0 {
+            it = max_iter
+        } else {
+            let corr_u = _lk_buf_alloc(level_area, 0)
+            let corr_v = _lk_buf_alloc(level_area, 0)
+            let pi = 0
+            while pi < level_area {
+                if _lk_get(inner_valid, pi) == 1 {
+                    _lk_set(corr_u, pi, _lk_get(inner_flow, int_mul(pi, 2)))
+                    _lk_set(corr_v, pi, _lk_get(inner_flow,
+                                                int_add(int_mul(pi, 2), 1)))
+                }
+                pi = int_add(pi, 1)
+            }
+            let u_new = _lk_buf_alloc(level_area, 0)
+            let v_new = _lk_buf_alloc(level_area, 0)
+            let valid_new = _lk_buf_alloc(level_area, 0)
+            let accepted_new = _lk_buf_alloc(level_area, 0)
+            let p0 = 0
+            while p0 < level_area {
+                _lk_set(u_new, p0, _lk_get(u_field, p0))
+                _lk_set(v_new, p0, _lk_get(v_field, p0))
+                _lk_set(valid_new, p0, _lk_get(valid_field, p0))
+                _lk_set(accepted_new, p0, _lk_get(accepted_field, p0))
+                p0 = int_add(p0, 1)
+            }
+            let total_correction_mag = 0
+            let accepted_cnt = 0
+            let y = 0
+            while y < lh {
+                let row_off = int_mul(y, lw)
+                let x = 0
+                while x < lw {
+                    let p = int_add(row_off, x)
+                    if _lk_get(inner_valid, p) == 1 {
+                        let du = _lk_get(corr_u, p)
+                        let dv = _lk_get(corr_v, p)
+                        let ok = _lk_pp_accept_correction(
+                            corr_u, corr_v, inner_valid, lw, lh,
+                            x, y, du, dv, mad_window)
+                        if ok == 1 {
+                            let new_u = int_add(_lk_get(u_field, p), du)
+                            let new_v = int_add(_lk_get(v_field, p), dv)
+                            _lk_set(u_new, p, new_u)
+                            _lk_set(v_new, p, new_v)
+                            _lk_set(valid_new, p, 1)
+                            _lk_set(accepted_new, p, 1)
+                            accepted_cnt = int_add(accepted_cnt, 1)
+                            let admag = du
+                            if admag < 0 { admag = 0 - admag }
+                            let avmag = dv
+                            if avmag < 0 { avmag = 0 - avmag }
+                            total_correction_mag = int_add(total_correction_mag,
+                                                            int_add(admag, avmag))
+                        }
+                    }
+                    x = int_add(x, 1)
+                }
+                y = int_add(y, 1)
+            }
+            if is_coarsest == 1 {
+                if accepted_cnt > 0 {
+                    let med = _lk_pp_global_median(corr_u, corr_v,
+                                                    inner_valid, level_area)
+                    let med_u = med[0]
+                    let med_v = med[1]
+                    let p2 = 0
+                    while p2 < level_area {
+                        if _lk_get(valid_new, p2) == 0 {
+                            _lk_set(u_new, p2,
+                                    int_add(_lk_get(u_field, p2), med_u))
+                            _lk_set(v_new, p2,
+                                    int_add(_lk_get(v_field, p2), med_v))
+                            _lk_set(valid_new, p2, 1)
+                        }
+                        p2 = int_add(p2, 1)
+                    }
+                }
+            }
+            let p1 = 0
+            while p1 < level_area {
+                _lk_set(u_field, p1, _lk_get(u_new, p1))
+                _lk_set(v_field, p1, _lk_get(v_new, p1))
+                _lk_set(valid_field, p1, _lk_get(valid_new, p1))
+                _lk_set(accepted_field, p1, _lk_get(accepted_new, p1))
+                p1 = int_add(p1, 1)
+            }
+            if accepted_cnt > 0 {
+                let mean_corr = total_correction_mag / accepted_cnt
+                if mean_corr < 100 { it = max_iter }
+            } else {
+                it = max_iter
+            }
+        }
+        it = int_add(it, 1)
+    }
+}
+
+// ---- lk_optical_flow_pyramid_perpixel (R13B public API) ---------------
+
+fn lk_optical_flow_pyramid_perpixel(prev_ptr, next_ptr, width, height,
+                                     win_size, levels, max_iter) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let req_levels = levels
+    if req_levels < 1                 { req_levels = LK_PYR_DEFAULT_LEVELS }
+    if req_levels > LK_PYR_MAX_LEVELS { req_levels = LK_PYR_MAX_LEVELS }
+    let req_iter = max_iter
+    if req_iter < 1 { req_iter = LK_PP_DEFAULT_MAX_ITER }
+    if req_iter > 8 { req_iter = 8 }
+
+    let pyr_prev = lk_pyramid_build(prev_ptr, width, height, req_levels)
+    let pyr_next = lk_pyramid_build(next_ptr, width, height, req_levels)
+    let L = len(pyr_prev)
+    if L < 1 { return _lk_fail() }
+    if len(pyr_next) < L { L = len(pyr_next) }
+
+    let coarsest = int_sub(L, 1)
+    let cw = lk_pyramid_level_width(pyr_prev,  coarsest)
+    let ch = lk_pyramid_level_height(pyr_prev, coarsest)
+    let coarsest_area = int_mul(cw, ch)
+    let u_field = _lk_buf_alloc(coarsest_area, 0)
+    let v_field = _lk_buf_alloc(coarsest_area, 0)
+    let valid_field    = _lk_buf_alloc(coarsest_area, 0)
+    let accepted_field = _lk_buf_alloc(coarsest_area, 0)
+
+    let l = coarsest
+    while l >= 0 {
+        let lw = lk_pyramid_level_width(pyr_prev,  l)
+        let lh = lk_pyramid_level_height(pyr_prev, l)
+        let p_buf = lk_pyramid_level_data(pyr_prev, l)
+        let n_buf = lk_pyramid_level_data(pyr_next, l)
+        let is_coarsest = 0
+        if l == coarsest { is_coarsest = 1 }
+        _lk_pp_apply_level(u_field, v_field, valid_field, accepted_field,
+                            p_buf, n_buf,
+                            lw, lh, ws, req_iter,
+                            LK_PP_DEFAULT_MAD_WINDOW, is_coarsest)
+        if l > 0 {
+            let nl = int_sub(l, 1)
+            let nw = lk_pyramid_level_width(pyr_prev,  nl)
+            let nh = lk_pyramid_level_height(pyr_prev, nl)
+            let new_u = _lk_pp_upsample(u_field, lw, lh, nw, nh)
+            let new_v = _lk_pp_upsample(v_field, lw, lh, nw, nh)
+            let new_valid_area = int_mul(nw, nh)
+            let new_valid    = _lk_buf_alloc(new_valid_area, 0)
+            let new_accepted = _lk_buf_alloc(new_valid_area, 0)
+            let yy = 0
+            while yy < nh {
+                let sy = yy / 2
+                if sy >= lh { sy = int_sub(lh, 1) }
+                let src_row = int_mul(sy, lw)
+                let dst_row = int_mul(yy, nw)
+                let xx = 0
+                while xx < nw {
+                    let sx = xx / 2
+                    if sx >= lw { sx = int_sub(lw, 1) }
+                    let sp = int_add(src_row, sx)
+                    let dp = int_add(dst_row, xx)
+                    _lk_set(new_valid,    dp, _lk_get(valid_field,    sp))
+                    _lk_set(new_accepted, dp, _lk_get(accepted_field, sp))
+                    xx = int_add(xx, 1)
+                }
+                yy = int_add(yy, 1)
+            }
+            u_field = new_u
+            v_field = new_v
+            valid_field    = new_valid
+            accepted_field = new_accepted
+        }
+        l = int_sub(l, 1)
+    }
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+    let pi = 0
+    while pi < area {
+        let u = _lk_get(u_field, pi)
+        let v = _lk_get(v_field, pi)
+        _lk_set(flow_buf, int_mul(pi, 2),               u)
+        _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),   v)
+        if _lk_get(accepted_field, pi) == 1 {
+            _lk_set(valid_buf, pi, 1)
+            valid_count = int_add(valid_count, 1)
+            let mag = _lk_isqrt(int_add(int_mul(u, u), int_mul(v, v)))
+            mag_sum = int_add(mag_sum, mag)
+        }
+        pi = int_add(pi, 1)
+    }
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// ---- chat admin: /flow_pp prev.pgm next.pgm ----------------------------
+
+fn lk_pgm_args_pyramid_perpixel(arg) {
+    if len(arg) == 0 {
+        return "(/flow_pp needs two PATHs -- usage: /flow_pp prev.pgm next.pgm)"
+    }
+    let parts = _lk_split_two(arg)
+    return lk_pgm_paths_pyramid_perpixel(parts[0], parts[1])
+}
+
+fn lk_pgm_paths_pyramid_perpixel(path_prev, path_next) {
+    if len(path_prev) == 0 {
+        return "(/flow_pp needs two PATHs -- usage: /flow_pp prev.pgm next.pgm)"
+    }
+    if len(path_next) == 0 {
+        return "(/flow_pp needs TWO paths -- got 1)"
+    }
+    let r_p = pgm_parse_file(path_prev)
+    let err_p = pgm_result_error(r_p)
+    if len(err_p) > 0 {
+        return "(flow_pp FAILED on prev: " + err_p + ")"
+    }
+    let r_n = pgm_parse_file(path_next)
+    let err_n = pgm_result_error(r_n)
+    if len(err_n) > 0 {
+        return "(flow_pp FAILED on next: " + err_n + ")"
+    }
+    let w_p = pgm_result_width(r_p)
+    let h_p = pgm_result_height(r_p)
+    let w_n = pgm_result_width(r_n)
+    let h_n = pgm_result_height(r_n)
+    if w_p != w_n {
+        return "(flow_pp FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if h_p != h_n {
+        return "(flow_pp FAILED: dim mismatch prev="
+            + int_to_str(w_p) + "x" + int_to_str(h_p)
+            + " next=" + int_to_str(w_n) + "x" + int_to_str(h_n) + ")"
+    }
+    if w_p > LK_MAX_DIM { return "(flow_pp FAILED: prev too large -- max 256x256)" }
+    if h_p > LK_MAX_DIM { return "(flow_pp FAILED: prev too large -- max 256x256)" }
+    let d_p = pgm_result_data(r_p)
+    let d_n = pgm_result_data(r_n)
+    let result = lk_optical_flow_pyramid_perpixel(
+        d_p, d_n, w_p, h_p,
+        LK_DEFAULT_WIN_SIZE,
+        LK_PYR_DEFAULT_LEVELS,
+        LK_PP_DEFAULT_MAX_ITER)
+    let mean_mag = lk_flow_mean_magnitude(result)
+    let valid    = lk_flow_valid_count(result)
+    return "(flow_pp " + int_to_str(w_p) + "x" + int_to_str(h_p)
+        + " mean_mag=" + int_to_str(mean_mag)
+        + "milli valid=" + int_to_str(valid)
+        + " " + lk_flow_density_label(result) + ")"
+}
+
+// =========================================================================
+// R18A.2: mul-acc SIMD wire-in for the 5 LK accumulator sums.
+// =========================================================================
+//
+// R17C documented the structural mismatch: LK's 5 accumulators are byte *
+// byte SIGNED mul-acc, NOT |a - b| SAD, so R14B's simd_sad_u8 could not
+// vectorize the inner products. R17C's packed-byte path topped out at
+// 0.80x absolute on the full LK (pack overhead exceeded the locality
+// saving; only It loads benefitted, Ix and Iy stayed strided).
+//
+// R18A (NOVA commit db34532) shipped the missing primitive:
+//
+//   simd_mul_acc_signed_signed_byte(a_i8_ptr, b_i8_ptr, n_bytes) -> int
+//     Sum a[i] * b[i] where BOTH operands are signed i8 in [-128, 127].
+//     AVX2: vpmovsxbw widens i8 -> i16 lanes, vpmaddwd pair-multiplies +
+//     adds adjacent i16 -> i32, vpaddd into running accumulator. 16
+//     bytes per vector iter; scalar tail for n % 16. ARM64 NEON:
+//     sshll widen + smull/smull2 + add. WASM: i32x4.dot_i16x8_s.
+//     Bit-identical to scalar Σ a[i] * b[i] since adds are associative.
+//
+// R18A.2 wires this into LK. The 5 accumulators map as:
+//
+//   Σ Ix * Ix : Ix in [-127, 127] (gradient stencil over u8 / 2), fits i8.
+//               One simd_mul_acc_signed_signed_byte call per pixel.
+//   Σ Iy * Iy : same shape as Ix * Ix.
+//   Σ Ix * Iy : same shape; both args are gradient i8.
+//   Σ Ix * It : Ix in i8 BUT It = next - prev in [-255, 255], DOES NOT
+//               fit i8 directly. We decompose It = 2 * It_lo + It_hi
+//               where:
+//                 It_lo = It / 2   in [-127, 127]   (NOVA division
+//                                                    truncates toward 0)
+//                 It_hi = It - 2 * It_lo  in {-1, 0, 1}
+//               then:
+//                 Σ Ix * It = 2 * Σ(Ix * It_lo) + Σ(Ix * It_hi)
+//               two simd_mul_acc_signed_signed_byte calls. Bit-identical
+//               to the scalar Σ Ix * It because Ix * (2 * It_lo + It_hi) ==
+//               2 * (Ix * It_lo) + (Ix * It_hi) for every cell.
+//   Σ Iy * It : same shape as Ix * It; two SIMD calls.
+//
+// Net: 7 SIMD calls replace the 5 * 25 scalar int_mul + int_add ops per
+// pixel. Per-pixel staging cost: pack Ix, Iy, It_lo, It_hi into four
+// 25-byte (5x5 win) i8 buffers via a single sweep over the WIN^2 cells.
+// Gradient computation itself stays scalar -- only the accumulators get
+// SIMD. The 25-cell window has 25 mod 16 = 9 tail bytes, so AVX2 lands
+// 16 bytes via vpmovsxbw+vpmaddwd and 9 via the scalar tail.
+//
+// Bit-identical output preserved: same integer math, same loop order.
+// Env-var dispatch CE_LK_MULACC_SIMD=on mirrors R15A's CE_STEREO_U8_SIMD
+// and R17C's CE_LK_U8_SIMD -- separate toggle so the three SIMD paths
+// (i32 R12A, u8-pack R17C, mul-acc R18A.2) can be A/B'd independently.
+
+// _lk_mulacc_simd_enabled() -> 1 iff CE_LK_MULACC_SIMD env-var is "on" /
+//   "1" / "yes" (default OFF; opt-in for the bench script + future
+//   default-on flip after wider end-to-end validation). Mirrors R15A
+//   and R17C's enable predicates.
+fn _lk_mulacc_simd_enabled() {
+    let env = getenv("CE_LK_MULACC_SIMD")
+    if env == 0       { return 0 }
+    if len(env) == 0  { return 0 }
+    if str_eq(env, "on")  == 1 { return 1 }
+    if str_eq(env, "1")   == 1 { return 1 }
+    if str_eq(env, "yes") == 1 { return 1 }
+    return 0
+}
+
+// Store a signed int in [-128, 127] at buf[idx] as a raw byte (two's
+// complement). Negative values map to (256 + v). NOVA's store8 takes
+// the low byte unmodified; for negative v we add 256 first so the
+// resulting byte is the i8 bit-pattern that simd_mul_acc_signed_signed_byte
+// reinterprets back to v via vpmovsxbw. Mirrors test_simd_mul_acc.nova's
+// store_i8 helper verbatim.
+fn _lk_store_i8(buf, idx, v) {
+    let raw = v
+    if raw < 0 { raw = int_add(raw, 256) }
+    store8(int_add(buf, idx), raw)
+}
+
+// _lk_optical_flow_mulacc_inner: pre-compute Ix, Iy, It_lo, It_hi as
+//   image-wide i8 byte buffers ONCE, then per pixel pack the 5x5
+//   windows of each via memcpy_raw (row-by-row) and accumulate the
+//   5 sums via 7 simd_mul_acc_signed_signed_byte calls. Bit-identical
+//   to scalar lk_optical_flow (same accumulator math, same loop order,
+//   same det / 2x2-inverse path).
+//
+//   Pre-compute strategy: the 5x5 window of N pixels reads 25 gradient
+//   triples per pixel; the naive per-pixel staging (75 gradient calls)
+//   dominates the SIMD reduction win on ws=5 (R18A.2 initial mulacc
+//   measured 0.67x). Pre-computing the gradients for the whole image
+//   ONCE (one pass: ~3 * area gradient calls total) amortizes the
+//   staging cost across all interior pixels. Per pixel then becomes
+//   4 * 5 memcpy_raw calls (one per row per pre-computed buffer) +
+//   7 SIMD calls, no scalar gradient ops.
+//
+//   Mirrors R15A's pack convention: row-major byte buffer, +8 headroom
+//   past area for AVX2's 16-byte over-read landing zone on tails.
+//
+//   Bypasses the env-var dispatch + input-validation prologue so unit
+//   tests can exercise the SIMD path directly without depending on env
+//   state. Mirrors R17C's _lk_optical_flow_u8_simd_inner contract.
+fn _lk_optical_flow_mulacc_inner(prev_ptr, next_ptr, width, height,
+                                  ws, half, pad, area) {
+    let n_cells = int_mul(ws, ws)
+    // Pre-compute the 4 i8 gradient buffers across the WHOLE image
+    // (one pass through every pixel; gradients at borders are zero
+    // since the central-difference stencil would read OOB). Each
+    // buffer is `area` bytes + 8 headroom for AVX2 over-read safety
+    // on the last row's tail bytes.
+    let img_buf_bytes = int_add(area, 8)
+    let ix_img = alloc(img_buf_bytes)
+    let iy_img = alloc(img_buf_bytes)
+    let it_lo_img = alloc(img_buf_bytes)
+    let it_hi_img = alloc(img_buf_bytes)
+    // Border init: zero every cell so OOB-stencil cells (y=0, x=0,
+    // y=h-1, x=w-1) read as 0. We overwrite the interior cells below.
+    let zi = 0
+    while zi < area {
+        store8(int_add(ix_img,    zi), 0)
+        store8(int_add(iy_img,    zi), 0)
+        store8(int_add(it_lo_img, zi), 0)
+        store8(int_add(it_hi_img, zi), 0)
+        zi = int_add(zi, 1)
+    }
+    // Interior: compute Ix, Iy, It at every pixel where the 3-point
+    // gradient stencil fits. It is in [-255, 255]; split into i8 pieces:
+    //   It_lo = It / 2 (NOVA truncates toward 0) -- range [-127, 127]
+    //   It_hi = It - 2 * It_lo                    -- range {-1, 0, 1}
+    // Then Ix * It = 2 * Ix * It_lo + Ix * It_hi cell-by-cell.
+    let pgy = 1
+    let pgy_max = int_sub(height, 1)
+    while pgy < pgy_max {
+        let row_off = int_mul(pgy, width)
+        let pgx = 1
+        let pgx_max = int_sub(width, 1)
+        while pgx < pgx_max {
+            let cell = int_add(row_off, pgx)
+            let ix = _lk_ix(prev_ptr, width, pgx, pgy)
+            let iy = _lk_iy(prev_ptr, width, pgx, pgy)
+            let it = _lk_it(prev_ptr, next_ptr, width, pgx, pgy)
+            let it_lo = it / 2
+            let it_hi = int_sub(it, int_mul(2, it_lo))
+            _lk_store_i8(ix_img,    cell, ix)
+            _lk_store_i8(iy_img,    cell, iy)
+            _lk_store_i8(it_lo_img, cell, it_lo)
+            _lk_store_i8(it_hi_img, cell, it_hi)
+            pgx = int_add(pgx, 1)
+        }
+        pgy = int_add(pgy, 1)
+    }
+    // Per-pixel pack scratch: 4 row-major i8 buffers of size n_cells +
+    // 8 headroom. The +8 mirrors R15A's pack convention and gives
+    // AVX2's 16-byte vector iter a safe over-read landing zone on
+    // tails (n_cells=25 for ws=5 -> 1 vector iter + 9-byte scalar tail;
+    // n_cells=49 for ws=7 -> 3 vector iters + 1-byte tail).
+    let pack_bytes = int_add(n_cells, 8)
+    let ix_buf    = alloc(pack_bytes)
+    let iy_buf    = alloc(pack_bytes)
+    let it_lo_buf = alloc(pack_bytes)
+    let it_hi_buf = alloc(pack_bytes)
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+
+    let y = pad
+    let y_max = int_sub(height, pad)
+    while y < y_max {
+        let x = pad
+        let x_max = int_sub(width, pad)
+        while x < x_max {
+            // Pack the 5x5 windows of the 4 pre-computed i8 buffers via
+            // memcpy_raw, one row per buffer per memcpy_raw call. This
+            // is the R15A pack pattern (one `rep movsb` per row); the
+            // 5-row window translates to 4 buffers * 5 rows = 20
+            // memcpy_raw calls per pixel, no scalar gradient ops.
+            let dy = 0 - half
+            let dst_off = 0
+            while dy <= half {
+                let src_off = int_add(int_mul(int_add(y, dy), width),
+                                      int_sub(x, half))
+                memcpy_raw(int_add(ix_buf,    dst_off),
+                           int_add(ix_img,    src_off), ws)
+                memcpy_raw(int_add(iy_buf,    dst_off),
+                           int_add(iy_img,    src_off), ws)
+                memcpy_raw(int_add(it_lo_buf, dst_off),
+                           int_add(it_lo_img, src_off), ws)
+                memcpy_raw(int_add(it_hi_buf, dst_off),
+                           int_add(it_hi_img, src_off), ws)
+                dst_off = int_add(dst_off, ws)
+                dy = int_add(dy, 1)
+            }
+            // ---- accumulator sums via simd_mul_acc_signed_signed_byte.
+            //   Three direct sums (Ix^2, Iy^2, Ix*Iy) take one SIMD call
+            //   each; two split sums (Ix*It, Iy*It) take two calls each.
+            //   Total 7 SIMD calls per pixel replacing 5*25 = 125 scalar
+            //   int_mul + int_add pairs.
+            let sum_ix2  = simd_mul_acc_signed_signed_byte(ix_buf, ix_buf, n_cells)
+            let sum_iy2  = simd_mul_acc_signed_signed_byte(iy_buf, iy_buf, n_cells)
+            let sum_ixiy = simd_mul_acc_signed_signed_byte(ix_buf, iy_buf, n_cells)
+            let sum_ix_itlo = simd_mul_acc_signed_signed_byte(ix_buf, it_lo_buf, n_cells)
+            let sum_ix_ithi = simd_mul_acc_signed_signed_byte(ix_buf, it_hi_buf, n_cells)
+            let sum_iy_itlo = simd_mul_acc_signed_signed_byte(iy_buf, it_lo_buf, n_cells)
+            let sum_iy_ithi = simd_mul_acc_signed_signed_byte(iy_buf, it_hi_buf, n_cells)
+            // Reassemble Σ Ix * It and Σ Iy * It from the two-piece split.
+            //   It = 2 * It_lo + It_hi  =>  Σ Ix*It = 2 * Σ(Ix*It_lo) + Σ(Ix*It_hi).
+            // Bit-identical to scalar because integer add is associative
+            // and the per-cell product math expands to the same total.
+            let sum_ixit = int_add(int_mul(2, sum_ix_itlo), sum_ix_ithi)
+            let sum_iyit = int_add(int_mul(2, sum_iy_itlo), sum_iy_ithi)
+            // ---- 2x2 inverse + (u, v) milli computation: identical to
+            //   the scalar lk_optical_flow (same det test, same neg_it
+            //   trick, same int_mul-by-LK_MILLI_PER_UNIT / det quotient).
+            let det = int_sub(int_mul(sum_ix2, sum_iy2),
+                              int_mul(sum_ixiy, sum_ixiy))
+            let pixel_idx = int_add(int_mul(y, width), x)
+            let flow_idx  = int_mul(pixel_idx, 2)
+            if det == 0 {
+                // No texture / aperture -- leave (0, 0, 0).
+            } else {
+                let neg_ixit = 0 - sum_ixit
+                let neg_iyit = 0 - sum_iyit
+                let u_num = int_sub(int_mul(sum_iy2,  neg_ixit),
+                                    int_mul(sum_ixiy, neg_iyit))
+                let v_num = int_add(int_mul(0 - sum_ixiy, neg_ixit),
+                                    int_mul(sum_ix2,    neg_iyit))
+                let u_milli = int_mul(u_num, LK_MILLI_PER_UNIT) / det
+                let v_milli = int_mul(v_num, LK_MILLI_PER_UNIT) / det
+                _lk_set(flow_buf, flow_idx,             u_milli)
+                _lk_set(flow_buf, int_add(flow_idx, 1), v_milli)
+                _lk_set(valid_buf, pixel_idx,           1)
+                valid_count = int_add(valid_count, 1)
+                let mag = _lk_isqrt(int_add(int_mul(u_milli, u_milli),
+                                            int_mul(v_milli, v_milli)))
+                mag_sum = int_add(mag_sum, mag)
+            }
+            x = int_add(x, 1)
+        }
+        y = int_add(y, 1)
+    }
+
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}
+
+// lk_optical_flow_mulacc_u8(prev, next, w, h, win_size)
+//   Same shape as lk_optical_flow. Public entry-point with input
+//   validation; routes to _lk_optical_flow_mulacc_inner when
+//   CE_LK_MULACC_SIMD=on, otherwise falls back to scalar lk_optical_flow.
+//   Mirrors R15A's stereo_disparity_u8_simd / R17C's lk_optical_flow_u8_simd
+//   contract.
+fn lk_optical_flow_mulacc_u8(prev_ptr, next_ptr, width, height, win_size) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let half = ws / 2
+    let pad = int_add(half, 1)
+    if width  < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    if height < int_add(int_mul(pad, 2), 1) {
+        return _lk_result(_lk_buf_alloc(int_mul(area, 2), 0),
+                          _lk_buf_alloc(area, 0), 0, 0, area, width, height)
+    }
+    // CE_LK_MULACC_SIMD=off / unset -> scalar (mirrors R15A/R17C opt-in).
+    if _lk_mulacc_simd_enabled() == 0 {
+        return lk_optical_flow(prev_ptr, next_ptr, width, height, win_size)
+    }
+    return _lk_optical_flow_mulacc_inner(prev_ptr, next_ptr, width, height,
+                                          ws, half, pad, area)
+}
+
+// ---- pyramidal variants wired to the mul-acc inner solver --------------
+//
+// The pyramidal orchestrators (R11A lk_optical_flow_pyramid and R13B
+// lk_optical_flow_pyramid_perpixel) call lk_optical_flow as the inner
+// single-level solver. The mul-acc variants take the SAME shape but
+// swap the inner call for _lk_optical_flow_mulacc_inner -- so each
+// per-level / per-pixel solve uses the SIMD accumulators.
+//
+// Bit-identical guarantee: at every level the inner solve is
+// _lk_optical_flow_mulacc_inner which is bit-identical to
+// lk_optical_flow; same det / 2x2-inverse path; same warp + iter +
+// MAD machinery. Output therefore matches the scalar pyramidal /
+// perpixel variants byte-for-byte.
+
+fn lk_optical_flow_mulacc_pyramid(prev_ptr, next_ptr, width, height, win_size, levels, max_iter) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let req_levels = levels
+    if req_levels < 1                 { req_levels = LK_PYR_DEFAULT_LEVELS }
+    if req_levels > LK_PYR_MAX_LEVELS { req_levels = LK_PYR_MAX_LEVELS }
+    let req_iter = max_iter
+    if req_iter < 1 { req_iter = LK_PYR_DEFAULT_MAX_ITER }
+    if req_iter > 8 { req_iter = 8 }
+    // CE_LK_MULACC_SIMD=off -> scalar pyramidal.
+    if _lk_mulacc_simd_enabled() == 0 {
+        return lk_optical_flow_pyramid(prev_ptr, next_ptr, width, height,
+                                        win_size, levels, max_iter)
+    }
+
+    let pyr_prev = lk_pyramid_build(prev_ptr, width, height, req_levels)
+    let pyr_next = lk_pyramid_build(next_ptr, width, height, req_levels)
+    let L = len(pyr_prev)
+    if L < 1 { return _lk_fail() }
+    if len(pyr_next) < L { L = len(pyr_next) }
+
+    let u_milli = 0
+    let v_milli = 0
+
+    let l = int_sub(L, 1)
+    while l >= 0 {
+        let lw = lk_pyramid_level_width(pyr_prev, l)
+        let lh = lk_pyramid_level_height(pyr_prev, l)
+        let p_buf = lk_pyramid_level_data(pyr_prev, l)
+        let n_buf = lk_pyramid_level_data(pyr_next, l)
+        let it = 0
+        while it < req_iter {
+            let du_int = _lk_round_milli_to_int(u_milli)
+            let dv_int = _lk_round_milli_to_int(v_milli)
+            let warped = _lk_warp_uniform(n_buf, lw, lh, du_int, dv_int)
+            // Mul-acc inner solve. Pad / area / half computed from lw, lh,
+            // ws -- mirrors the R11A scalar inner-call shape.
+            let lhalf = ws / 2
+            let lpad  = int_add(lhalf, 1)
+            let larea = int_mul(lw, lh)
+            let inner = _lk_optical_flow_mulacc_inner(p_buf, warped, lw, lh,
+                                                       ws, lhalf, lpad, larea)
+            let flow_buf  = inner[LK_R_FLOW_BUF]
+            let valid_buf = inner[LK_R_VALID_BUF]
+            let valid_cnt = inner[LK_R_VALID_COUNT]
+            if valid_cnt == 0 {
+                it = req_iter
+            } else {
+                let ceil_milli = 4000
+                let sum_u = 0
+                let sum_v = 0
+                let level_area = int_mul(lw, lh)
+                let pi = 0
+                while pi < level_area {
+                    if _lk_get(valid_buf, pi) == 1 {
+                        let pu = _lk_get(flow_buf, int_mul(pi, 2))
+                        let pv = _lk_get(flow_buf, int_add(int_mul(pi, 2), 1))
+                        if pu >  ceil_milli { pu =  ceil_milli }
+                        if pu < 0 - ceil_milli { pu = 0 - ceil_milli }
+                        if pv >  ceil_milli { pv =  ceil_milli }
+                        if pv < 0 - ceil_milli { pv = 0 - ceil_milli }
+                        sum_u = int_add(sum_u, pu)
+                        sum_v = int_add(sum_v, pv)
+                    }
+                    pi = int_add(pi, 1)
+                }
+                let du_milli = sum_u / valid_cnt
+                let dv_milli = sum_v / valid_cnt
+                u_milli = int_add(u_milli, du_milli)
+                v_milli = int_add(v_milli, dv_milli)
+                let mag = du_milli
+                if mag < 0 { mag = 0 - mag }
+                let mag2 = dv_milli
+                if mag2 < 0 { mag2 = 0 - mag2 }
+                if int_add(mag, mag2) < 50 { it = req_iter }
+            }
+            it = int_add(it, 1)
+        }
+        if l > 0 {
+            u_milli = int_mul(u_milli, 2)
+            v_milli = int_mul(v_milli, 2)
+        }
+        l = int_sub(l, 1)
+    }
+
+    let du_int = _lk_round_milli_to_int(u_milli)
+    let dv_int = _lk_round_milli_to_int(v_milli)
+    let warped_final = _lk_warp_uniform(next_ptr, width, height, du_int, dv_int)
+    let fhalf = ws / 2
+    let fpad  = int_add(fhalf, 1)
+    let final_inner = _lk_optical_flow_mulacc_inner(prev_ptr, warped_final,
+                                                     width, height,
+                                                     ws, fhalf, fpad, area)
+    let flow_buf  = final_inner[LK_R_FLOW_BUF]
+    let valid_buf = final_inner[LK_R_VALID_BUF]
+    let total     = final_inner[LK_R_TOTAL]
+    let valid_cnt = 0
+    let mag_sum = 0
+    let pi = 0
+    while pi < total {
+        let v_flag = _lk_get(valid_buf, pi)
+        if v_flag == 1 {
+            let u_local = _lk_get(flow_buf, int_mul(pi, 2))
+            let v_local = _lk_get(flow_buf, int_add(int_mul(pi, 2), 1))
+            let u_total = int_add(u_milli, u_local)
+            let v_total = int_add(v_milli, v_local)
+            _lk_set(flow_buf, int_mul(pi, 2),                 u_total)
+            _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),     v_total)
+            valid_cnt = int_add(valid_cnt, 1)
+            let mag = _lk_isqrt(int_add(int_mul(u_total, u_total),
+                                        int_mul(v_total, v_total)))
+            mag_sum = int_add(mag_sum, mag)
+        } else {
+            _lk_set(flow_buf, int_mul(pi, 2),                 u_milli)
+            _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),     v_milli)
+        }
+        pi = int_add(pi, 1)
+    }
+    let mean_mag = 0
+    if valid_cnt > 0 { mean_mag = mag_sum / valid_cnt }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_cnt,
+                      total, width, height)
+}
+
+// Per-pixel pyramidal variant that uses the mul-acc inner solve at every
+// level. Mirrors lk_optical_flow_pyramid_perpixel verbatim except for the
+// inner call swap. The R13B _lk_pp_apply_level helper hard-codes the
+// scalar lk_optical_flow call; rather than duplicate that whole routine,
+// we provide an inline equivalent below that calls _lk_optical_flow_mulacc_inner.
+// Bit-identical to R13B's output because the inner solve is bit-identical
+// to scalar.
+
+fn _lk_pp_apply_level_mulacc(u_field, v_field, valid_field, accepted_field,
+                              p_buf, n_buf,
+                              lw, lh, ws, max_iter, mad_window, is_coarsest) {
+    let level_area = int_mul(lw, lh)
+    let lhalf = ws / 2
+    let lpad  = int_add(lhalf, 1)
+    let it = 0
+    while it < max_iter {
+        let warped = _lk_pp_warp_field(n_buf, lw, lh, u_field, v_field)
+        // Mul-acc inner solve; bit-identical to lk_optical_flow.
+        let inner = _lk_optical_flow_mulacc_inner(p_buf, warped, lw, lh,
+                                                   ws, lhalf, lpad, level_area)
+        let inner_flow  = inner[LK_R_FLOW_BUF]
+        let inner_valid = inner[LK_R_VALID_BUF]
+        let inner_cnt   = inner[LK_R_VALID_COUNT]
+        if inner_cnt == 0 {
+            it = max_iter
+        } else {
+            let corr_u = _lk_buf_alloc(level_area, 0)
+            let corr_v = _lk_buf_alloc(level_area, 0)
+            let pi = 0
+            while pi < level_area {
+                if _lk_get(inner_valid, pi) == 1 {
+                    _lk_set(corr_u, pi, _lk_get(inner_flow, int_mul(pi, 2)))
+                    _lk_set(corr_v, pi, _lk_get(inner_flow,
+                                                int_add(int_mul(pi, 2), 1)))
+                }
+                pi = int_add(pi, 1)
+            }
+            let u_new = _lk_buf_alloc(level_area, 0)
+            let v_new = _lk_buf_alloc(level_area, 0)
+            let valid_new = _lk_buf_alloc(level_area, 0)
+            let accepted_new = _lk_buf_alloc(level_area, 0)
+            let p0 = 0
+            while p0 < level_area {
+                _lk_set(u_new, p0, _lk_get(u_field, p0))
+                _lk_set(v_new, p0, _lk_get(v_field, p0))
+                _lk_set(valid_new, p0, _lk_get(valid_field, p0))
+                _lk_set(accepted_new, p0, _lk_get(accepted_field, p0))
+                p0 = int_add(p0, 1)
+            }
+            let total_correction_mag = 0
+            let accepted_cnt = 0
+            let y = 0
+            while y < lh {
+                let row_off = int_mul(y, lw)
+                let x = 0
+                while x < lw {
+                    let p = int_add(row_off, x)
+                    if _lk_get(inner_valid, p) == 1 {
+                        let du = _lk_get(corr_u, p)
+                        let dv = _lk_get(corr_v, p)
+                        let ok = _lk_pp_accept_correction(
+                            corr_u, corr_v, inner_valid, lw, lh,
+                            x, y, du, dv, mad_window)
+                        if ok == 1 {
+                            let new_u = int_add(_lk_get(u_field, p), du)
+                            let new_v = int_add(_lk_get(v_field, p), dv)
+                            _lk_set(u_new, p, new_u)
+                            _lk_set(v_new, p, new_v)
+                            _lk_set(valid_new, p, 1)
+                            _lk_set(accepted_new, p, 1)
+                            accepted_cnt = int_add(accepted_cnt, 1)
+                            let admag = du
+                            if admag < 0 { admag = 0 - admag }
+                            let avmag = dv
+                            if avmag < 0 { avmag = 0 - avmag }
+                            total_correction_mag = int_add(total_correction_mag,
+                                                            int_add(admag, avmag))
+                        }
+                    }
+                    x = int_add(x, 1)
+                }
+                y = int_add(y, 1)
+            }
+            if is_coarsest == 1 {
+                if accepted_cnt > 0 {
+                    let med = _lk_pp_global_median(corr_u, corr_v,
+                                                    inner_valid, level_area)
+                    let med_u = med[0]
+                    let med_v = med[1]
+                    let p2 = 0
+                    while p2 < level_area {
+                        if _lk_get(valid_new, p2) == 0 {
+                            _lk_set(u_new, p2,
+                                    int_add(_lk_get(u_field, p2), med_u))
+                            _lk_set(v_new, p2,
+                                    int_add(_lk_get(v_field, p2), med_v))
+                            _lk_set(valid_new, p2, 1)
+                        }
+                        p2 = int_add(p2, 1)
+                    }
+                }
+            }
+            let p1 = 0
+            while p1 < level_area {
+                _lk_set(u_field, p1, _lk_get(u_new, p1))
+                _lk_set(v_field, p1, _lk_get(v_new, p1))
+                _lk_set(valid_field, p1, _lk_get(valid_new, p1))
+                _lk_set(accepted_field, p1, _lk_get(accepted_new, p1))
+                p1 = int_add(p1, 1)
+            }
+            if accepted_cnt > 0 {
+                let mean_corr = total_correction_mag / accepted_cnt
+                if mean_corr < 100 { it = max_iter }
+            } else {
+                it = max_iter
+            }
+        }
+        it = int_add(it, 1)
+    }
+}
+
+fn lk_optical_flow_mulacc_perpixel(prev_ptr, next_ptr, width, height,
+                                    win_size, levels, max_iter) {
+    if width  <= 0   { return _lk_fail() }
+    if height <= 0   { return _lk_fail() }
+    if prev_ptr == 0 { return _lk_fail() }
+    if next_ptr == 0 { return _lk_fail() }
+    if width  > LK_MAX_DIM { return _lk_fail() }
+    if height > LK_MAX_DIM { return _lk_fail() }
+    let area = int_mul(width, height)
+    if area > LK_MAX_PIXEL_AREA { return _lk_fail() }
+    let ws = _lk_clamp_win_size(win_size)
+    let req_levels = levels
+    if req_levels < 1                 { req_levels = LK_PYR_DEFAULT_LEVELS }
+    if req_levels > LK_PYR_MAX_LEVELS { req_levels = LK_PYR_MAX_LEVELS }
+    let req_iter = max_iter
+    if req_iter < 1 { req_iter = LK_PP_DEFAULT_MAX_ITER }
+    if req_iter > 8 { req_iter = 8 }
+    // CE_LK_MULACC_SIMD=off -> scalar per-pixel pyramidal.
+    if _lk_mulacc_simd_enabled() == 0 {
+        return lk_optical_flow_pyramid_perpixel(prev_ptr, next_ptr,
+                                                 width, height,
+                                                 win_size, levels, max_iter)
+    }
+
+    let pyr_prev = lk_pyramid_build(prev_ptr, width, height, req_levels)
+    let pyr_next = lk_pyramid_build(next_ptr, width, height, req_levels)
+    let L = len(pyr_prev)
+    if L < 1 { return _lk_fail() }
+    if len(pyr_next) < L { L = len(pyr_next) }
+
+    let coarsest = int_sub(L, 1)
+    let cw = lk_pyramid_level_width(pyr_prev,  coarsest)
+    let ch = lk_pyramid_level_height(pyr_prev, coarsest)
+    let coarsest_area = int_mul(cw, ch)
+    let u_field = _lk_buf_alloc(coarsest_area, 0)
+    let v_field = _lk_buf_alloc(coarsest_area, 0)
+    let valid_field    = _lk_buf_alloc(coarsest_area, 0)
+    let accepted_field = _lk_buf_alloc(coarsest_area, 0)
+
+    let l = coarsest
+    while l >= 0 {
+        let lw = lk_pyramid_level_width(pyr_prev,  l)
+        let lh = lk_pyramid_level_height(pyr_prev, l)
+        let p_buf = lk_pyramid_level_data(pyr_prev, l)
+        let n_buf = lk_pyramid_level_data(pyr_next, l)
+        let is_coarsest = 0
+        if l == coarsest { is_coarsest = 1 }
+        _lk_pp_apply_level_mulacc(u_field, v_field, valid_field, accepted_field,
+                                   p_buf, n_buf,
+                                   lw, lh, ws, req_iter,
+                                   LK_PP_DEFAULT_MAD_WINDOW, is_coarsest)
+        if l > 0 {
+            let nl = int_sub(l, 1)
+            let nw = lk_pyramid_level_width(pyr_prev,  nl)
+            let nh = lk_pyramid_level_height(pyr_prev, nl)
+            let new_u = _lk_pp_upsample(u_field, lw, lh, nw, nh)
+            let new_v = _lk_pp_upsample(v_field, lw, lh, nw, nh)
+            let new_valid_area = int_mul(nw, nh)
+            let new_valid    = _lk_buf_alloc(new_valid_area, 0)
+            let new_accepted = _lk_buf_alloc(new_valid_area, 0)
+            let yy = 0
+            while yy < nh {
+                let sy = yy / 2
+                if sy >= lh { sy = int_sub(lh, 1) }
+                let src_row = int_mul(sy, lw)
+                let dst_row = int_mul(yy, nw)
+                let xx = 0
+                while xx < nw {
+                    let sx = xx / 2
+                    if sx >= lw { sx = int_sub(lw, 1) }
+                    let sp = int_add(src_row, sx)
+                    let dp = int_add(dst_row, xx)
+                    _lk_set(new_valid,    dp, _lk_get(valid_field,    sp))
+                    _lk_set(new_accepted, dp, _lk_get(accepted_field, sp))
+                    xx = int_add(xx, 1)
+                }
+                yy = int_add(yy, 1)
+            }
+            u_field = new_u
+            v_field = new_v
+            valid_field    = new_valid
+            accepted_field = new_accepted
+        }
+        l = int_sub(l, 1)
+    }
+
+    let flow_buf  = _lk_buf_alloc(int_mul(area, 2), 0)
+    let valid_buf = _lk_buf_alloc(area, 0)
+    let valid_count = 0
+    let mag_sum = 0
+    let pi = 0
+    while pi < area {
+        let u = _lk_get(u_field, pi)
+        let v = _lk_get(v_field, pi)
+        _lk_set(flow_buf, int_mul(pi, 2),               u)
+        _lk_set(flow_buf, int_add(int_mul(pi, 2), 1),   v)
+        if _lk_get(accepted_field, pi) == 1 {
+            _lk_set(valid_buf, pi, 1)
+            valid_count = int_add(valid_count, 1)
+            let mag = _lk_isqrt(int_add(int_mul(u, u), int_mul(v, v)))
+            mag_sum = int_add(mag_sum, mag)
+        }
+        pi = int_add(pi, 1)
+    }
+    let mean_mag = 0
+    if valid_count > 0 { mean_mag = mag_sum / valid_count }
+    return _lk_result(flow_buf, valid_buf, mean_mag, valid_count,
+                      area, width, height)
+}

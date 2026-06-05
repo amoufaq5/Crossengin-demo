@@ -1,0 +1,893 @@
+// CrossEngin io/transducers: RSS / Atom feed ingestion into the KG (R25C).
+//
+// Purpose
+//   CrossEngin's KG layer already supports rich reads (R10C TF-IDF /find,
+//   R11F LPA + R12C Louvain communities, R13E PageRank, R18B link
+//   prediction, R19C Allen temporal, R20B Datalog rule inference,
+//   R22E explainability, R15D mini-SPARQL) and write paths via the
+//   substrate observation/snapshot lifecycle. What was MISSING was a way
+//   for the substrate to LEARN FROM THE WEB at a structured level --
+//   atoms born from RSS/Atom feed items, carrying their feed-URL
+//   provenance so source_authority (ADR-0029) can weight them, and
+//   deduplicated via the feed's own guid so re-ingest is a no-op.
+//
+//   R25C is that ingestion pathway: parse RSS 2.0 + Atom 1.0 XML, extract
+//   one record per item / entry (title, link, description, pubdate, guid),
+//   and emit a FACT atom per never-seen guid with provenance set to
+//   "rss:<feed_url>". Real-world feeds carry a hundred edge cases
+//   (namespaces, podcast extensions, RSS 1.0 / RDF, HTML entities in
+//   ad-hoc encodings, etc.); R25C covers the COMMON CASE only.
+//   R25C.2 handles the rest -- documented in NEXT_SESSION.md.
+//
+// Public API
+//   rss_parse(xml_bytes_str) -> [items_list, error_msg]
+//     items_list: list of item_t records (see layout below). Empty list
+//                 if the feed has no items, or if XML is malformed.
+//     error_msg : "" on success; descriptive non-empty string on
+//                 malformed XML / size cap / empty input.
+//   rss_fetch(url) -> [body_str, error_msg]
+//     url     : "http://..." (routes via http_client.http_get) or
+//               "file:///abs/path" (sys_open + sys_read, no shell).
+//               Other schemes return an error.
+//   rss_ingest_to_kg(kg, feed_url, max_items) -> int_new_atoms
+//     End-to-end pipeline: rss_fetch + rss_parse + dedup by guid +
+//     kg_add_atom for each new guid. Returns the count of NEW atoms
+//     created this call (excluding dedup hits). max_items clamps to
+//     RSS_MAX_ITEMS_PER_FEED (100). Returns 0 on fetch/parse errors.
+//   rss_chat_cmd(kg, arg) -> 1
+//     Chat dispatch entry for `/rss <feed_url> [max_items]`. Prints
+//     a one-line summary `RSS feed=... fetched=N parsed=N ingested=N`.
+//
+//   Accessors on an item record (read-only):
+//     rss_item_title(it) / rss_item_link(it) / rss_item_description(it)
+//     rss_item_pubdate(it) / rss_item_guid(it) /
+//     rss_item_label(it) / rss_item_provenance(it, feed_url)
+//
+//   Helpers (testable without IO):
+//     _rss_decode_entities(s) -- &amp; &lt; &gt; &apos; &quot; -> & < > ' "
+//                                + numeric &#NN; (decimal only)
+//     _rss_strip_cdata(s)     -- "<![CDATA[ X ]]>" -> "X" (with trim);
+//                                returns s untouched if no CDATA section.
+//     _rss_extract_tag(xml, tag, from) -> [text, end_offset]
+//                                Returns the inner text of the first
+//                                occurrence of <tag>...</tag> at or after
+//                                `from`. text is decoded + CDATA-stripped;
+//                                end_offset is one past the closing tag.
+//                                Returns ["", -1] when not found.
+//     _rss_find_block(xml, open, close, from) -> [block_text, end]
+//                                The verbatim block (no decoding) between
+//                                <open ...> ... </open>. Used to scope
+//                                tag extraction to one <item> at a time.
+//
+// XML parsing notes
+//   * The parser is a TAG-WALKER, not a full XML conformance pass. It
+//     handles the common case: well-formed RSS 2.0 / Atom 1.0 with
+//     ASCII tag names, no namespaces on item-level child tags, optional
+//     CDATA wrapping the text content, common entities decoded.
+//   * For Atom feeds, <link href="..."> stores the URL in the href
+//     attribute; the parser extracts href= when the <link> body is
+//     empty or self-closing.
+//   * Attribute parsing is minimal: it walks the open tag looking for
+//     `href="..."` literally. ' vs " quoting both work. No escaping.
+//   * Entity decoding handles the five named XML entities plus decimal
+//     numeric references (&#NNN;). Hex (&#xNN;) is deferred to R25C.2.
+//   * CDATA decoding: `<![CDATA[ ... ]]>` -> inner content (unchanged
+//     bytes, NO entity decoding -- CDATA is by spec literal).
+//
+// Dedup policy
+//   The first time rss_ingest_to_kg encounters an item, it kg_add_atom's
+//   a FACT carrying:
+//     label      = decoded title (truncated at RSS_LABEL_MAX bytes)
+//     payload    = [["link", url], ["description", desc],
+//                   ["pubdate", date], ["guid", guid]]
+//     provenance = ["rss:<feed_url>", -1]   (source_tier=string,
+//                                            producing_part=-1)
+//     created    = parse-time `now()` from clock_now_ns -- pubdate
+//                  string is preserved in payload but is NOT parsed
+//                  into an integer moment in R25C (locale + tz
+//                  variability is hairier than a one-round budget).
+//                  R25C.2 will add an RFC822 / ISO8601 -> ns parser.
+//   On the SECOND ingest of the same feed, every item's guid is found
+//   among existing atoms' payloads -- so no new atoms are created. The
+//   match is exact-string on the "guid" payload key. Items without a
+//   guid fall back to the link URL as the dedup key.
+//
+// Caps (anti-DoS / anti-stuck-loop)
+//   RSS_MAX_ITEMS_PER_FEED = 100   -- per ingest call
+//   RSS_MAX_FEED_BYTES     = 1048576 (1 MB) -- per fetch / per parse
+//   RSS_LABEL_MAX          = 200   -- truncate long titles
+//   RSS_TEXT_MAX           = 4000  -- truncate long description/etc
+//
+// Error model
+//   * rss_parse returns ["", error_msg] when the input exceeds
+//     RSS_MAX_FEED_BYTES, is empty, or contains neither an <rss> nor
+//     <feed> root tag. Specifically malformed XML inside a recognised
+//     root just yields an empty items list (best-effort; the tag walker
+//     skips items it can't lex).
+//   * rss_fetch returns ["", error_msg] on unsupported scheme, bad URL,
+//     transport error, or non-200 status.
+//   * rss_ingest_to_kg returns 0 on any upstream error (callers can
+//     interpret the count alone; for diagnostics use rss_chat_cmd which
+//     prints the fetch + parse error tags).
+//
+// ADRs touched
+//   * ADR-0029 (source_authority -- the provenance tier "rss:<url>"
+//     is the host-style identifier source_authority weights).
+//   * ADR-0016 (atom design -- FACT atoms with full payload + provenance).
+//   * ADR-0028 (whitelist / rate-limit pipeline -- callers that want
+//     gating should run rss_fetch via internet_fetch's dispatcher, not
+//     this module directly; rss_fetch is the leaf transport).
+//
+// NOVA dependencies
+//   sys_open / sys_read / sys_close, alloc, store8, load8,
+//   len, char_at, substr, str_eq, push, list_new, list_set,
+//   getenv (none directly), str_trim, str_to_int.
+//
+// CrossEngin dependencies
+//   src/io/transducers/http_client.nova (http_get for http:// URLs)
+//   src/kg/atom_store.nova          (atom_payload_get / atom_payload_set)
+//   src/kg/multi_kg_manager.nova    (kg_add_atom / kg_atoms / kg_atom)
+//
+// Test parity
+//   tests/unit/test_kg_rss_ingest.nova  -- ~25 assertions on the pure
+//   parser layer (no IO). Integration scenario
+//   tests/integration/scenario_tttt_rss_ingest.sh exercises the chat
+//   dispatch end-to-end with a local file:// fixture.
+
+import "std/syscall"
+import "http_client.nova"
+import "../../kg/atom_store.nova"
+import "../../kg/multi_kg_manager.nova"
+
+// ---- caps ----------------------------------------------------------------
+
+let RSS_MAX_ITEMS_PER_FEED = 100
+let RSS_MAX_FEED_BYTES     = 1048576    // 1 MB
+let RSS_LABEL_MAX          = 200
+let RSS_TEXT_MAX           = 4000
+
+// ---- item record layout --------------------------------------------------
+//
+// An item_t is a fixed-length list:
+//   [TITLE, LINK, DESCRIPTION, PUBDATE, GUID]
+// All five fields are strings (possibly "" if absent from the feed).
+// The constants below name the slots; callers should use the accessors
+// rss_item_title / _link / _description / _pubdate / _guid which read
+// these positions.
+
+let RSS_F_TITLE = 0
+let RSS_F_LINK  = 1
+let RSS_F_DESC  = 2
+let RSS_F_DATE  = 3
+let RSS_F_GUID  = 4
+let RSS_F_COUNT = 5
+
+fn _rss_item_new(title, link, desc, date, guid) {
+    let r = list_new()
+    push(r, title)
+    push(r, link)
+    push(r, desc)
+    push(r, date)
+    push(r, guid)
+    return r
+}
+
+fn rss_item_title(it)       { return it[RSS_F_TITLE] }
+fn rss_item_link(it)        { return it[RSS_F_LINK] }
+fn rss_item_description(it) { return it[RSS_F_DESC] }
+fn rss_item_pubdate(it)     { return it[RSS_F_DATE] }
+fn rss_item_guid(it)        { return it[RSS_F_GUID] }
+
+// Choose the FACT atom's label from an item. Title-first; falls back to
+// link, then guid, then a fixed placeholder so kg_add_atom never sees an
+// empty label. Truncates at RSS_LABEL_MAX bytes (the trailing UTF-8
+// codepoint may be cut at a multi-byte boundary; R25C's seed-pack
+// labels stay ASCII, so the cut is rare in practice).
+fn rss_item_label(it) {
+    let s = it[RSS_F_TITLE]
+    if len(s) == 0 { s = it[RSS_F_LINK] }
+    if len(s) == 0 { s = it[RSS_F_GUID] }
+    if len(s) == 0 { s = "rss:item" }
+    if len(s) > RSS_LABEL_MAX { s = substr(s, 0, RSS_LABEL_MAX) }
+    return s
+}
+
+// Provenance tier label for source_authority (ADR-0029).
+fn rss_item_provenance(it, feed_url) {
+    return "rss:" + feed_url
+}
+
+// Best-effort dedup key: the item's guid when present, else the link.
+// Items with neither dedup to "" which is treated as "always new" (the
+// safer side of the off-by-one: better to ingest twice than to silently
+// drop). Callers can route such items through their own normalisation.
+fn rss_item_dedup_key(it) {
+    if len(it[RSS_F_GUID]) > 0 { return it[RSS_F_GUID] }
+    if len(it[RSS_F_LINK]) > 0 { return it[RSS_F_LINK] }
+    return ""
+}
+
+// ---- tiny ASCII helpers (private) ----------------------------------------
+
+fn _rss_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+// Find first occurrence of substring `needle` in `hay` starting at `from`;
+// -1 if absent. Plain O(n*m). RSS feeds at 1MB cap stay bounded enough
+// that the per-call cost remains << 1ms on a modern CPU.
+fn _rss_find_str(hay, needle, from) {
+    let n = len(needle)
+    if n == 0 { return from }
+    if len(hay) < n { return -1 }
+    let limit = len(hay) - n
+    let i = from
+    if i < 0 { i = 0 }
+    while i <= limit {
+        let j = 0
+        let ok = 1
+        while j < n {
+            if char_at(hay, i + j) != char_at(needle, j) { ok = 0; j = n }
+            else { j = j + 1 }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Case-insensitive prefix match at offset.
+fn _rss_starts_with_at(hay, prefix, off) {
+    let pn = len(prefix)
+    if off < 0 { return 0 }
+    if off + pn > len(hay) { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(hay, off + i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Trim leading/trailing ASCII whitespace (space, tab, CR, LF). Returns a
+// new substring. Empty input returns "". Built on the str_trim builtin
+// which handles SP/TAB/CR/LF -- we just guard the empty case.
+fn _rss_trim(s) {
+    if len(s) == 0 { return "" }
+    return str_trim(s)
+}
+
+// ---- CDATA + entity decoding ---------------------------------------------
+
+// Strip a CDATA wrapper if present. Accepts leading/trailing whitespace:
+//   "  <![CDATA[ X ]]>  " -> " X "  (we keep the inner-section's bytes
+//   verbatim, then the caller's trim handles outer whitespace).
+// Returns the input unchanged if there's no CDATA section.
+fn _rss_strip_cdata(s) {
+    let trimmed = _rss_trim(s)
+    if len(trimmed) < 12 { return s }
+    let cdata_open = "<![CDATA["
+    let cdata_close = "]]>"
+    let open = _rss_find_str(trimmed, cdata_open, 0)
+    if open < 0 { return s }
+    let inner_start = open + len(cdata_open)
+    let close = _rss_find_str(trimmed, cdata_close, inner_start)
+    if close < 0 { return s }
+    return substr(trimmed, inner_start, close - inner_start)
+}
+
+// Decode the five named XML entities + decimal numeric references.
+//   &amp;   -> &
+//   &lt;    -> <
+//   &gt;    -> >
+//   &apos;  -> '
+//   &quot;  -> "
+//   &#NNN;  -> chr(NNN)   (decimal only; hex deferred to R25C.2)
+// Anything that looks like an entity but doesn't match is left as-is.
+//
+// Implementation: single forward pass, writing into a freshly alloc'd
+// buffer sized at the input length (decoding only ever SHRINKS the
+// stream).
+fn _rss_decode_entities(s) {
+    let n = len(s)
+    if n == 0 { return "" }
+    let buf = alloc(n + 1)
+    let w = 0
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c == 38 {
+            // '&' -- look ahead for a recognised entity.
+            let matched = 0
+            // &amp;
+            if _rss_starts_with_at(s, "amp;", i + 1) == 1 {
+                store8(buf + w, 38); w = w + 1; i = i + 5; matched = 1
+            }
+            if matched == 0 {
+                if _rss_starts_with_at(s, "lt;", i + 1) == 1 {
+                    store8(buf + w, 60); w = w + 1; i = i + 4; matched = 1
+                }
+            }
+            if matched == 0 {
+                if _rss_starts_with_at(s, "gt;", i + 1) == 1 {
+                    store8(buf + w, 62); w = w + 1; i = i + 4; matched = 1
+                }
+            }
+            if matched == 0 {
+                if _rss_starts_with_at(s, "apos;", i + 1) == 1 {
+                    store8(buf + w, 39); w = w + 1; i = i + 6; matched = 1
+                }
+            }
+            if matched == 0 {
+                if _rss_starts_with_at(s, "quot;", i + 1) == 1 {
+                    store8(buf + w, 34); w = w + 1; i = i + 6; matched = 1
+                }
+            }
+            // Numeric reference: &#NNN;
+            if matched == 0 {
+                if i + 2 < n {
+                    if char_at(s, i + 1) == 35 {
+                        // Find the terminating ';'. Cap the search at 8
+                        // chars after '#' (Unicode codepoints fit in 7
+                        // decimal digits).
+                        let j = i + 2
+                        let max_j = i + 10
+                        if max_j > n { max_j = n }
+                        let semi = -1
+                        let all_dig = 1
+                        while j < max_j {
+                            let dc = char_at(s, j)
+                            if dc == 59 { semi = j; j = max_j }
+                            else {
+                                if _rss_is_digit(dc) == 0 { all_dig = 0; j = max_j }
+                                else { j = j + 1 }
+                            }
+                        }
+                        if semi > 0 {
+                            if all_dig == 1 {
+                                let num = str_to_int(substr(s, i + 2, semi - (i + 2)))
+                                if num > 0 {
+                                    if num < 256 {
+                                        store8(buf + w, num); w = w + 1
+                                        i = semi + 1; matched = 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if matched == 0 {
+                store8(buf + w, c); w = w + 1; i = i + 1
+            }
+        } else {
+            store8(buf + w, c); w = w + 1; i = i + 1
+        }
+    }
+    store8(buf + w, 0)
+    // Convert the buffer to a string via substr (NOVA's substr on a raw
+    // pointer treats it as a NUL-terminated cstring).
+    return substr(buf, 0, w)
+}
+
+// Decode-then-strip helper used by tag extraction: CDATA inner content
+// is left alone (per spec), other text gets entities decoded. We try
+// CDATA first; if it stripped something, return it verbatim. Otherwise
+// run the entity decoder.
+fn _rss_decode_text(raw) {
+    let stripped = _rss_strip_cdata(raw)
+    if str_eq(stripped, raw) == 0 {
+        // CDATA WAS present; do not double-decode (CDATA is literal).
+        return _rss_trim(stripped)
+    }
+    return _rss_trim(_rss_decode_entities(raw))
+}
+
+// ---- tag extraction ------------------------------------------------------
+
+// Find the next opening of `<name`. Returns the byte offset of the '<'
+// or -1 if absent. Considers a hit at offset i a real open tag only if
+// the next char after `<name` is one of: '>', ' ', '\t', '\r', '\n',
+// '/' (the self-closing slash). This keeps us from matching <items>
+// when searching for <item>.
+fn _rss_find_open(xml, name, from) {
+    let needle = "<" + name
+    let pos = from
+    if pos < 0 { pos = 0 }
+    let nlen = len(needle)
+    while pos < len(xml) {
+        let f = _rss_find_str(xml, needle, pos)
+        if f < 0 { return -1 }
+        let after = f + nlen
+        if after >= len(xml) { return -1 }
+        let c = char_at(xml, after)
+        if c == 62 { return f }     // '>'
+        if c == 32 { return f }     // ' '
+        if c == 9  { return f }     // '\t'
+        if c == 10 { return f }     // '\n'
+        if c == 13 { return f }     // '\r'
+        if c == 47 { return f }     // '/'   (self-closing)
+        pos = after
+    }
+    return -1
+}
+
+// Given an offset to the '<' of an open tag, return the offset just past
+// the closing '>'. Walks chars looking for an unquoted '>'. -1 on
+// malformed (no '>' found).
+fn _rss_tag_open_end(xml, tag_start) {
+    let i = tag_start
+    while i < len(xml) {
+        if char_at(xml, i) == 62 { return i + 1 }
+        i = i + 1
+    }
+    return -1
+}
+
+// Is the tag at tag_start self-closing? (Looks for "/>" before the next
+// '>'.)
+fn _rss_tag_is_self_close(xml, tag_start) {
+    let i = tag_start
+    while i < len(xml) {
+        let c = char_at(xml, i)
+        if c == 62 { return 0 }
+        if c == 47 {
+            if i + 1 < len(xml) {
+                if char_at(xml, i + 1) == 62 { return 1 }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Read the inner text of <name>...</name> starting at or after `from`.
+// Returns [decoded_text, end_offset] -- end_offset is one past the
+// closing tag, suitable to pass back as the next search base.
+// ["", -1] when not found.
+fn _rss_extract_tag(xml, name, from) {
+    let bad = list_new()
+    push(bad, "")
+    push(bad, -1)
+    let open = _rss_find_open(xml, name, from)
+    if open < 0 { return bad }
+    let open_end = _rss_tag_open_end(xml, open)
+    if open_end < 0 { return bad }
+    // If the tag is self-closing (e.g. <link/>), the body is empty.
+    if _rss_tag_is_self_close(xml, open) == 1 {
+        let r = list_new()
+        push(r, "")
+        push(r, open_end)
+        return r
+    }
+    let close_needle = "</" + name + ">"
+    let close = _rss_find_str(xml, close_needle, open_end)
+    if close < 0 { return bad }
+    let body = substr(xml, open_end, close - open_end)
+    let r = list_new()
+    push(r, _rss_decode_text(body))
+    push(r, close + len(close_needle))
+    return r
+}
+
+// Atom's <link> usually carries the URL in href="..." attribute rather
+// than tag body. Walk the opening tag at `tag_start` and return the
+// attribute value, "" if absent.
+fn _rss_extract_attr(xml, tag_start, attr_name) {
+    let needle1 = " " + attr_name + "=\""
+    let needle2 = " " + attr_name + "='"
+    // Bound the search to the opening tag itself.
+    let open_end = _rss_tag_open_end(xml, tag_start)
+    if open_end < 0 { return "" }
+    let scope = substr(xml, tag_start, open_end - tag_start)
+    let q1 = _rss_find_str(scope, needle1, 0)
+    let quote_char = 34       // "
+    let start = -1
+    if q1 >= 0 { start = q1 + len(needle1) }
+    if start < 0 {
+        let q2 = _rss_find_str(scope, needle2, 0)
+        if q2 >= 0 {
+            start = q2 + len(needle2)
+            quote_char = 39   // '
+        }
+    }
+    if start < 0 { return "" }
+    let end = -1
+    let i = start
+    while i < len(scope) {
+        if char_at(scope, i) == quote_char { end = i; i = len(scope) }
+        else { i = i + 1 }
+    }
+    if end < 0 { return "" }
+    return _rss_decode_entities(substr(scope, start, end - start))
+}
+
+// Locate the next <name>...</name> block starting at or after `from`.
+// Returns [block_text, block_end] where block_text is the literal bytes
+// BETWEEN <name ...> and </name> (no decoding -- callers run their own
+// child-tag extraction on it) and block_end is one past the closing
+// tag. ["", -1] when no such block exists.
+fn _rss_find_block(xml, name, from) {
+    let bad = list_new()
+    push(bad, "")
+    push(bad, -1)
+    let open = _rss_find_open(xml, name, from)
+    if open < 0 { return bad }
+    let open_end = _rss_tag_open_end(xml, open)
+    if open_end < 0 { return bad }
+    if _rss_tag_is_self_close(xml, open) == 1 {
+        let r = list_new()
+        push(r, "")
+        push(r, open_end)
+        return r
+    }
+    let close_needle = "</" + name + ">"
+    let close = _rss_find_str(xml, close_needle, open_end)
+    if close < 0 { return bad }
+    let body = substr(xml, open_end, close - open_end)
+    let r = list_new()
+    push(r, body)
+    push(r, close + len(close_needle))
+    return r
+}
+
+// ---- per-item extraction -------------------------------------------------
+
+// Parse a single <item> block (RSS 2.0). Reads title, link, description,
+// pubDate, guid as child tags. Returns an item_t record. Missing children
+// surface as "".
+fn _rss_parse_item_rss(block) {
+    let title = _rss_extract_tag(block, "title",       0)
+    let link  = _rss_extract_tag(block, "link",        0)
+    let desc  = _rss_extract_tag(block, "description", 0)
+    let date  = _rss_extract_tag(block, "pubDate",     0)
+    let guid  = _rss_extract_tag(block, "guid",        0)
+    let t = title[0]
+    let l = link[0]
+    let d = desc[0]
+    let p = date[0]
+    let g = guid[0]
+    if len(d) > RSS_TEXT_MAX { d = substr(d, 0, RSS_TEXT_MAX) }
+    return _rss_item_new(t, l, d, p, g)
+}
+
+// Parse a single <entry> block (Atom 1.0). Reads title, link href,
+// summary (preferred) or content, published (preferred) or updated,
+// id. Missing children surface as "".
+fn _rss_parse_item_atom(block) {
+    let title = _rss_extract_tag(block, "title", 0)
+    // For Atom, <link href="..."/> is the canonical shape. Find the
+    // opening tag and pull the href attribute.
+    let link_open = _rss_find_open(block, "link", 0)
+    let l = ""
+    if link_open >= 0 {
+        l = _rss_extract_attr(block, link_open, "href")
+        if len(l) == 0 {
+            // Fallback: maybe the link's body has the URL.
+            let lbody = _rss_extract_tag(block, "link", 0)
+            l = lbody[0]
+        }
+    }
+    let summary = _rss_extract_tag(block, "summary", 0)
+    let d = summary[0]
+    if len(d) == 0 {
+        let content = _rss_extract_tag(block, "content", 0)
+        d = content[0]
+    }
+    let published = _rss_extract_tag(block, "published", 0)
+    let p = published[0]
+    if len(p) == 0 {
+        let updated = _rss_extract_tag(block, "updated", 0)
+        p = updated[0]
+    }
+    let aid = _rss_extract_tag(block, "id", 0)
+    let g = aid[0]
+    let t = title[0]
+    if len(d) > RSS_TEXT_MAX { d = substr(d, 0, RSS_TEXT_MAX) }
+    return _rss_item_new(t, l, d, p, g)
+}
+
+// ---- top-level parser ----------------------------------------------------
+
+// Public parser. Returns [items_list, error_msg]. error_msg is "" on
+// success. Tolerates: missing items (returns empty list, ""), unknown
+// child tags inside items, optional XML declaration prelude.
+fn rss_parse(xml) {
+    let out_list = list_new()
+    let result = list_new()
+    if len(xml) == 0 {
+        push(result, out_list)
+        push(result, "empty feed")
+        return result
+    }
+    if len(xml) > RSS_MAX_FEED_BYTES {
+        push(result, out_list)
+        push(result, "feed exceeds RSS_MAX_FEED_BYTES")
+        return result
+    }
+    // Detect root tag: <rss ...> or <feed ...>. Search for the first
+    // opening tag that is one of these two.
+    let is_atom = 0
+    let has_rss  = _rss_find_open(xml, "rss",  0)
+    let has_feed = _rss_find_open(xml, "feed", 0)
+    if has_rss < 0 {
+        if has_feed < 0 {
+            push(result, out_list)
+            push(result, "no <rss> or <feed> root element")
+            return result
+        }
+        is_atom = 1
+    } else {
+        if has_feed >= 0 {
+            // Both present is unusual but possible (e.g. an Atom that
+            // mentions "rss" in a literal). Prefer whichever came first.
+            if has_feed < has_rss { is_atom = 1 }
+        }
+    }
+    let item_tag = "item"
+    if is_atom == 1 { item_tag = "entry" }
+    let from = 0
+    let limit = RSS_MAX_ITEMS_PER_FEED
+    while from < len(xml) {
+        if len(out_list) >= limit { from = len(xml) }
+        else {
+            let blk = _rss_find_block(xml, item_tag, from)
+            if blk[1] < 0 { from = len(xml) }
+            else {
+                let body = blk[0]
+                let item = 0
+                if is_atom == 1 { item = _rss_parse_item_atom(body) }
+                else            { item = _rss_parse_item_rss(body) }
+                push(out_list, item)
+                from = blk[1]
+            }
+        }
+    }
+    push(result, out_list)
+    push(result, "")
+    return result
+}
+
+// ---- fetch (HTTP or file://) ---------------------------------------------
+//
+// rss_fetch routes by URL scheme:
+//   http://...      -> http_get with body cap = RSS_MAX_FEED_BYTES
+//   file:///path    -> sys_open + sys_read (no shell)
+// Anything else returns ["", "rss: unsupported scheme"].
+//
+// Returns [body_str, error_msg]. error_msg is "" on success.
+
+fn _rss_fetch_result(body, err) {
+    let r = list_new()
+    push(r, body)
+    push(r, err)
+    return r
+}
+
+// Strip the "file://" prefix and read the file at the resulting path.
+// Accepts both file:///abs/path (RFC 8089) and file://localhost/abs.
+fn _rss_fetch_file(url) {
+    let prefix1 = "file:///"
+    let prefix2 = "file://localhost/"
+    let path = ""
+    if _rss_starts_with_at(url, prefix1, 0) == 1 {
+        // Skip "file://" -> keep the leading '/'.
+        path = substr(url, 7, len(url) - 7)
+    } else {
+        if _rss_starts_with_at(url, prefix2, 0) == 1 {
+            path = substr(url, 16, len(url) - 16)
+        } else {
+            return _rss_fetch_result("", "rss: malformed file URL (need file:///abs/path)")
+        }
+    }
+    if len(path) == 0 {
+        return _rss_fetch_result("", "rss: empty file path")
+    }
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 {
+        return _rss_fetch_result("", "rss: cannot open file")
+    }
+    let buf = alloc(RSS_MAX_FEED_BYTES + 1)
+    let total = 0
+    let keep = 1
+    let chunk = 4096
+    while keep == 1 {
+        let space_left = RSS_MAX_FEED_BYTES - total
+        let want = chunk
+        if want > space_left { want = space_left }
+        if want <= 0 { keep = 0 }
+        if keep == 1 {
+            let n = sys_read(fd, buf + total, want)
+            if n <= 0 {
+                keep = 0
+            } else {
+                total = total + n
+                if total >= RSS_MAX_FEED_BYTES { keep = 0 }
+            }
+        }
+    }
+    sys_close(fd)
+    if total <= 0 {
+        return _rss_fetch_result("", "rss: empty file")
+    }
+    store8(buf + total, 0)
+    return _rss_fetch_result(substr(buf, 0, total), "")
+}
+
+fn rss_fetch(url) {
+    if len(url) == 0 {
+        return _rss_fetch_result("", "rss: empty URL")
+    }
+    if _rss_starts_with_at(url, "file://", 0) == 1 {
+        return _rss_fetch_file(url)
+    }
+    if _rss_starts_with_at(url, "http://", 0) == 1 {
+        let r = http_get(url, RSS_MAX_FEED_BYTES)
+        let status = r[0]
+        let body = r[2]
+        let err_msg = r[3]
+        if status != 200 {
+            if len(err_msg) > 0 {
+                return _rss_fetch_result("", "rss: http " + err_msg)
+            }
+            return _rss_fetch_result("", "rss: http non-200 status")
+        }
+        return _rss_fetch_result(body, "")
+    }
+    return _rss_fetch_result("", "rss: unsupported scheme (need http:// or file://)")
+}
+
+// ---- KG ingestion --------------------------------------------------------
+//
+// Walk every existing FACT atom in the KG and collect its "guid" payload
+// value (or "link" if guid is absent) into a set-style list. Used by
+// rss_ingest_to_kg to skip items the KG already remembers.
+
+fn _rss_collect_existing_keys(kg) {
+    let out = list_new()
+    let atoms = kg_atoms(kg)
+    let n = len(atoms)
+    let i = 0
+    while i < n {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_kind(a) == ATOM_FACT {
+                let g = atom_payload_get(a, "guid")
+                let l = atom_payload_get(a, "link")
+                let key = ""
+                if g != 0 {
+                    if str_eq(g, "") == 0 { key = g }
+                }
+                if len(key) == 0 {
+                    if l != 0 {
+                        if str_eq(l, "") == 0 { key = l }
+                    }
+                }
+                if len(key) > 0 { push(out, key) }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _rss_key_in(keys, k) {
+    if len(k) == 0 { return 0 }
+    let n = len(keys)
+    let i = 0
+    while i < n {
+        if str_eq(keys[i], k) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// End-to-end pipeline. Fetches the feed, parses, dedups by guid (or
+// link), then kg_add_atom's a FACT for each NEW item. Returns the count
+// of NEW atoms created. 0 on any upstream error or no new items.
+fn rss_ingest_to_kg(kg, feed_url, max_items) {
+    if kg == 0 { return 0 }
+    if max_items <= 0 { max_items = RSS_MAX_ITEMS_PER_FEED }
+    if max_items > RSS_MAX_ITEMS_PER_FEED { max_items = RSS_MAX_ITEMS_PER_FEED }
+    let fetched = rss_fetch(feed_url)
+    if len(fetched[1]) > 0 { return 0 }
+    let parsed = rss_parse(fetched[0])
+    if len(parsed[1]) > 0 { return 0 }
+    let items = parsed[0]
+    let n = len(items)
+    if n > max_items { n = max_items }
+    let existing = _rss_collect_existing_keys(kg)
+    let added = 0
+    // R25C punts RFC822 / ISO8601 pubdate parsing -> moment=0 for all
+    // ingested atoms (the raw pubdate string is preserved in the
+    // payload). R25C.2 will replace this with a parsed-date moment.
+    let moment = 0
+    let prov_tag = "rss:" + feed_url
+    let i = 0
+    while i < n {
+        let it = items[i]
+        let key = rss_item_dedup_key(it)
+        let dup = _rss_key_in(existing, key)
+        if dup == 0 {
+            let label = rss_item_label(it)
+            let atom = kg_add_atom(kg, ATOM_FACT, label, moment)
+            atom_payload_set(atom, "link",        it[RSS_F_LINK])
+            atom_payload_set(atom, "description", it[RSS_F_DESC])
+            atom_payload_set(atom, "pubdate",     it[RSS_F_DATE])
+            atom_payload_set(atom, "guid",        it[RSS_F_GUID])
+            atom_payload_set(atom, "feed_url",    feed_url)
+            // Provenance: tier name as a string, producing_part=-1.
+            list_set(atom, A_PROV, [prov_tag, -1])
+            // Remember the new key for in-call dedup against same-feed
+            // repeats (some feeds re-emit the same item twice in one
+            // payload; we only want one atom per call).
+            push(existing, key)
+            added = added + 1
+        }
+        i = i + 1
+    }
+    return added
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/rss <feed_url> [max_items]`. Splits the arg at the first space.
+// Prints a single line with feed=<url> fetched=<bytes> parsed=<count>
+// ingested=<count> err="<msg>". Always returns 1 (admin convention).
+
+fn _rss_split_first_space(arg) {
+    let i = 0
+    let n = len(arg)
+    let pair = list_new()
+    while i < n {
+        if char_at(arg, i) == 32 {
+            push(pair, substr(arg, 0, i))
+            push(pair, str_trim(substr(arg, i + 1, n - i - 1)))
+            return pair
+        }
+        i = i + 1
+    }
+    push(pair, arg)
+    push(pair, "")
+    return pair
+}
+
+fn rss_chat_cmd(kg, arg) {
+    let trimmed = str_trim(arg)
+    if len(trimmed) == 0 {
+        io_println("usage: /rss <feed_url> [max_items]")
+        io_println("  feed_url: http://... or file:///abs/path")
+        io_println("  max_items: 1.." + int_to_str(RSS_MAX_ITEMS_PER_FEED) + " (default " + int_to_str(RSS_MAX_ITEMS_PER_FEED) + ")")
+        return 1
+    }
+    let parts = _rss_split_first_space(trimmed)
+    let url = parts[0]
+    let mx_str = parts[1]
+    let mx = RSS_MAX_ITEMS_PER_FEED
+    if len(mx_str) > 0 {
+        let v = str_to_int(mx_str)
+        if v > 0 { mx = v }
+    }
+    let fetched = rss_fetch(url)
+    let body = fetched[0]
+    let fetch_err = fetched[1]
+    let fetched_bytes = len(body)
+    if len(fetch_err) > 0 {
+        io_println("RSS feed=" + url + " fetched=0 parsed=0 ingested=0 err=\"" + fetch_err + "\"")
+        return 1
+    }
+    let parsed = rss_parse(body)
+    let parse_err = parsed[1]
+    let parsed_count = len(parsed[0])
+    if len(parse_err) > 0 {
+        io_println("RSS feed=" + url + " fetched=" + int_to_str(fetched_bytes) + " parsed=0 ingested=0 err=\"" + parse_err + "\"")
+        return 1
+    }
+    // Re-run dedup via the public pipeline so the atom payload set is
+    // identical to what the public API would do.
+    let added = rss_ingest_to_kg(kg, url, mx)
+    io_println("RSS feed=" + url + " fetched=" + int_to_str(fetched_bytes) + " parsed=" + int_to_str(parsed_count) + " ingested=" + int_to_str(added) + " err=\"\"")
+    return 1
+}

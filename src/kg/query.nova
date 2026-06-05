@@ -1,0 +1,2681 @@
+// CrossEngin knowledge: declarative SPARQL-like query language (R15D + R16F + R17E).
+//
+// Purpose
+//   The KG has many read paths: exact id (atom_store.kg_find_atom),
+//   episodic recall (R6F + R8F: episodic_recall_*), TF-IDF textual
+//   semantic search (R10C: ss_search), LSH-bucketed embedding k-NN
+//   (P3.4: ann_query), label-propagation clustering (R11F: gc_*),
+//   Louvain modularity clustering (R12C: louvain_*), and PageRank
+//   centrality (R13E: pagerank_*). Every one of these is a PROGRAMMATIC
+//   surface -- the operator dispatches a specific shape of query by
+//   choosing which `_cmd` to call. What was missing is a DECLARATIVE
+//   surface: a single text-based query language that composes triple
+//   patterns, variable bindings, and filters arbitrarily, so a substrate
+//   operator can answer "give me every FACT atom that links to a
+//   CONCEPT atom with alpha > 500" without writing CrossEngin code
+//   first.
+//
+//   This module is the mini-SPARQL implementation. The grammar
+//   deliberately mirrors W3C SPARQL's basic graph pattern (BGP) +
+//   FILTER syntax so an operator who already knows SPARQL can write
+//   queries against the KG without learning a new language. The
+//   parser is a hand-written recursive-descent tokenizer + parser
+//   (matching the R10C semantic_search.nova ad-hoc parsing style;
+//   the substrate has no general parser framework yet, and a
+//   single-file module is the right scope for a v1.0 query surface).
+//
+// Mini-SPARQL grammar (BNF, simplified)
+//   query   ::= "SELECT" selitem+ "WHERE" "{" pattern* "}" groupby? orderby? limit?
+//   selitem ::= "?" name | "(" aggfn "(" "?" name field? ")" "AS" "?" name ")"
+//   aggfn   ::= "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+//   pattern ::= triple "." | filter "." | optional | union
+//   triple  ::= term predicate term
+//   filter  ::= "FILTER" field op intvalue
+//   optional::= "OPTIONAL" "{" pattern* "}"
+//   union   ::= "{" pattern* "}" "UNION" "{" pattern* "}"
+//   groupby ::= "GROUP" "BY" "?" name
+//   orderby ::= "ORDER" "BY" ( "ASC" "(" field ")" | "DESC" "(" field ")" | field )
+//   term    ::= "?" name | literal
+//   predicate ::= "kind" | "label" | "alpha" | "beta" | "created_ns"
+//              | "links"
+//   field   ::= "kind" | "alpha" | "beta" | "count" | "created_ns"
+//             | "version"
+//   op      ::= ">" | "<" | "=" | "!="
+//   limit   ::= "LIMIT" intliteral
+//   literal ::= name (kind: FACT|CONCEPT|RELATION|SKILL|LANG|RULE)
+//             | intliteral | quotedstring
+//
+// Operators supported (minimum viable per the brief):
+//   - Triple patterns (subject predicate object .)
+//   - "?var" matches any value and BINDS the variable
+//   - Literal predicates: kind, label, alpha, beta, created_ns, links
+//   - FILTER predicates: >, <, =, != on int fields (alpha, beta, count,
+//     created_ns, version, kind)
+//   - Implicit AND across multiple patterns
+//   - LIMIT N (default 100, max 10000)
+//   - OPTIONAL { patterns }: left-outer-join semantics (R16F). If the
+//     inner patterns extend a binding, keep the extension; if they
+//     don't, keep the original binding with the OPTIONAL's introduced
+//     vars left unbound (binding_has -> 0; binding_get -> 0; the
+//     emit-line helper renders them as "?").
+//   - { patterns } UNION { patterns }: alternation (R16F). Both
+//     branches run independently against the current binding set; the
+//     results are concatenated (no dedupe of overlapping rows -- SPARQL
+//     bag semantics by default).
+//   - ORDER BY <field> [ASC|DESC]: deterministic ranking (R16F). Sort
+//     bindings by the integer field of the most-recently-bound atom.
+//     Ties broken by atom_id ascending for stability. Default ASC.
+//   - Aggregate functions in SELECT (R17E): COUNT(?var), SUM(?var field),
+//     AVG(?var field), MIN(?var field), MAX(?var field), each wrapped in
+//     "( AGGFN(...) AS ?alias )" to name the output column. Without
+//     GROUP BY: one output row aggregating over the entire binding set
+//     (still 1 row even if the binding set is empty -- aggregates over
+//     the empty set return sentinel values: COUNT/SUM = 0; MIN/MAX/AVG =
+//     QRY_AGG_EMPTY = -1). With GROUP BY: bindings are partitioned by
+//     the value of the grouping variable's most-recently-bound atom's
+//     integer field (the grouping var must be one of the SELECT vars);
+//     one output row per non-empty group. Integer arithmetic throughout
+//     (AVG = SUM / COUNT with integer division). FILTER applies BEFORE
+//     aggregation (the BGP is fully resolved first).
+//
+// Out of scope (defer): MINUS, complex boolean FILTER, regex matching,
+// HAVING, DISTINCT in aggregates, nested aggregates.
+//
+// Execution strategy
+//   Each triple pattern is evaluated against the current binding set.
+//   For "?a kind FACT" with no existing binding for ?a, we iterate
+//   every atom in the KG, keeping those whose kind matches. For "?a
+//   links ?b" with ?a already bound, we walk ?a's xrefs and bind ?b
+//   to the destination. FILTER evaluates against the MOST RECENTLY
+//   bound atom (the brief explicitly calls this scoping out -- it
+//   keeps the implementation single-pass and the operator model
+//   simple).
+//
+// Bindings are dicts (lists of [var_name, atom_id]); we keep a
+// simple list-of-pairs representation rather than NOVA's map_*
+// builtins because the map cap is 16 keys and we want to compose
+// queries that can name more than that (and lists are cheaper for
+// the small N typical of a query result row).
+//
+// Result layout
+//   parsed_query_t ::= [QRY_OBJ_TAG, vars, patterns, limit, orderby, aggs, groupby]
+//     - vars:     list of variable names (without ? prefix). For an
+//                 aggregate SELECT item, the ALIAS name is what lands in
+//                 vars -- the chat emit-line then renders BINDING rows
+//                 with `?alias=value` and the existing _qry_format_binding
+//                 helper continues to work without changes.
+//     - patterns: list of triple/filter nodes, in source order
+//     - limit:    LIMIT N (or QRY_DEFAULT_LIMIT if absent)
+//     - orderby:  R16F. [field_string, direction_int, present_flag]
+//     - aggs:     R17E. List of aggregate descriptors; one per aggregate
+//                 SELECT item; empty list when SELECT is all bare ?vars.
+//                 Each entry: [agg_fn_code, src_var_name, src_field, alias_name].
+//                 agg_fn_code is QRY_AGG_COUNT / _SUM / _AVG / _MIN / _MAX.
+//     - groupby:  R17E. [group_var_name, group_field, present_flag];
+//                 group_var_name is the ?var that GROUP BY references;
+//                 group_field is the field of that var's atom we partition
+//                 on (defaults to "kind" -- the brief's example pattern
+//                 "?a kind ?kind . GROUP BY ?kind" actually binds ?kind to
+//                 the integer kind code, so the group key is just the
+//                 value bound to the var; we still record the field for
+//                 documentation).
+//
+//   binding_t ::= list of [var_name, value]; value is an atom_id
+//     (for `?a kind FACT` style binds) or the raw int / string the
+//     query bound the variable to. Encapsulated in
+//     binding_new / binding_get / binding_has / binding_set.
+//
+// ADRs implemented: ADR-0016 (atoms + xrefs are the surface ranked),
+//   ADR-0049 (testing + benchmarks -- 30+ unit assertions per the
+//   brief).
+// NOVA dependencies: builtins (lists, str_eq, str_trim, char_at,
+//   substr, len, push, list_set, int_to_str, rt_str_to_int).
+// CrossEngin dependencies: src/kg/atom_store.nova (atom kinds,
+//   atom_xrefs accessor), src/kg/multi_kg_manager.nova (kg_atoms,
+//   kg_label), src/kg/cross_kg_references.nova (xref_dst_atom).
+
+import "std/io"
+import "std/string"
+import "atom_store.nova"
+import "multi_kg_manager.nova"
+import "cross_kg_references.nova"
+
+// ---- tuning ---------------------------------------------------------------
+let QRY_DEFAULT_LIMIT = 100
+let QRY_MAX_LIMIT     = 10000
+
+// ---- parsed_query_t layout ------------------------------------------------
+let QRY_OBJ_TAG  = 2301   // distinct from PR_OBJ_TAG (2201), LV_OBJ_TAG (2101)
+let QRY_TAG      = 0
+let QRY_VARS     = 1
+let QRY_PATTERNS = 2
+let QRY_LIMIT    = 3
+// R16F: optional ORDER BY clause. Stored as a 3-cell list
+// [field_string, direction_int, present_flag]. direction is +1 for ASC, -1
+// for DESC; present_flag is 1 iff the source had an ORDER BY clause. We
+// keep the slot even when absent so the parsed_query_t shape is fixed.
+let QRY_ORDERBY  = 4
+// R17E: aggregate descriptors (one per aggregate SELECT item; empty list
+// when SELECT has no aggregates). Each entry:
+//   [agg_fn_code, src_var_name, src_field_str, alias_name]
+// Where src_field_str is "" for COUNT (COUNT doesn't read a field).
+let QRY_AGGS     = 5
+// R17E: GROUP BY descriptor. 3-cell list
+//   [group_var_name, group_field_str, present_flag]
+// present_flag is 1 iff the source had a GROUP BY clause; otherwise 0.
+let QRY_GROUPBY  = 6
+
+// ---- pattern node tags ----------------------------------------------------
+// Triple patterns:   [PAT_TRIPLE,   subject_term, predicate_str, object_term]
+// FILTER patterns:   [PAT_FILTER,   field_str, op_str, intvalue]
+// OPTIONAL patterns: [PAT_OPTIONAL, inner_pattern_list]  -- R16F
+// UNION patterns:    [PAT_UNION,    left_pattern_list, right_pattern_list]
+//   R16F. Both lists evaluate independently against the current bindings;
+//   results concatenate. UNION ALWAYS appears as a single top-level
+//   pattern in the WHERE block -- it consumes a `{` ... `}` UNION `{`
+//   ... `}` sequence (so the parser sees a literal `{` open in the
+//   pattern position).
+let PAT_TRIPLE   = 1
+let PAT_FILTER   = 2
+let PAT_OPTIONAL = 3
+let PAT_UNION    = 4
+
+// term: [TERM_VAR, var_name] or [TERM_LIT, literal_value]
+let TERM_VAR = 1
+let TERM_LIT = 2
+
+// R16F: ORDER BY direction codes. The default (no direction keyword) is
+// ASC. Stored as the second cell of the QRY_ORDERBY field.
+let ORD_ASC  = 1
+let ORD_DESC = 0 - 1
+
+// R16F: unbound sentinel for OPTIONAL non-match. We use -1 as the value
+// stored on the binding entry when an OPTIONAL pattern fails to match;
+// callers should use binding_has(b, name) to discriminate the bound and
+// unbound case (the sentinel is a fallback for code paths that read the
+// value directly).
+let QRY_UNBOUND = 0 - 1
+
+// R17E: aggregate function codes. Stored as the first cell of each
+// QRY_AGGS descriptor. Distinct ints (positive) so a NOT-AN-AGGREGATE
+// SELECT item (a bare ?var) is unambiguously recognised by the empty
+// QRY_AGGS list rather than a sentinel value.
+let QRY_AGG_COUNT = 1
+let QRY_AGG_SUM   = 2
+let QRY_AGG_AVG   = 3
+let QRY_AGG_MIN   = 4
+let QRY_AGG_MAX   = 5
+
+// R17E: aggregate-over-empty-set sentinel. The brief specifies AVG / MIN
+// / MAX over no rows return -1 ("no data"); COUNT and SUM return 0. We
+// pin -1 here so callers (and the chat emit-line) can recognise the
+// "no data" case unambiguously without sniffing for "did this row come
+// from an empty group?" state.
+let QRY_AGG_EMPTY = 0 - 1
+
+// ---- error layout ---------------------------------------------------------
+// On parse failure we return a list [ERR_OBJ_TAG, message]; callers test
+// `_qry_is_error(x)`. The integration scenario asserts on the message
+// shape, so the strings are stable.
+let ERR_OBJ_TAG = 2399
+
+fn _qry_error(msg) {
+    let e = list_new()
+    push(e, ERR_OBJ_TAG)
+    push(e, msg)
+    return e
+}
+
+fn _qry_is_error(x) {
+    if x == 0 { return 0 }
+    // type_of: 1=int, 2=string, 3=list, 4=map. Only lists carry the
+    // [ERR_OBJ_TAG, msg] sentinel; ints / strings / etc. are never
+    // errors. This guards the parser-result pattern where some sub-
+    // parsers return [int_value, pos] rather than [list_value, pos].
+    if type_of(x) != 3 { return 0 }
+    let n = len(x)
+    if n < 1 { return 0 }
+    if x[0] == ERR_OBJ_TAG { return 1 }
+    return 0
+}
+
+fn qry_error_message(x) {
+    if _qry_is_error(x) == 0 { return "" }
+    return x[1]
+}
+
+// ---- tokenizer ------------------------------------------------------------
+//
+// Token kinds:
+//   TOK_KW       SELECT|WHERE|FILTER|LIMIT|OPTIONAL|UNION|ORDER|BY|ASC|DESC
+//   TOK_VAR      ?identifier (the leading ? is dropped, just the name)
+//   TOK_IDENT    bare identifier (a keyword position OR a literal kind name)
+//   TOK_INT      decimal integer literal (raw digits, may be negative)
+//   TOK_OP       > < = != .
+//   TOK_LBRACE   {
+//   TOK_RBRACE   }
+//   TOK_STR      "quoted string" (quotes stripped)
+//   TOK_LPAREN   ( -- R16F, for ORDER BY DESC(field) syntax
+//   TOK_RPAREN   ) -- R16F
+//
+// We split on whitespace and on the structural characters {, }, ., ?, ", (, )
+// We DO NOT lowercase identifiers: keyword matching is case-sensitive
+// (SPARQL is upper-keyword by convention).
+let TOK_KW     = 1
+let TOK_VAR    = 2
+let TOK_IDENT  = 3
+let TOK_INT    = 4
+let TOK_OP     = 5
+let TOK_LBRACE = 6
+let TOK_RBRACE = 7
+let TOK_STR    = 8
+let TOK_LPAREN = 9
+let TOK_RPAREN = 10
+
+fn _tok_new(kind, text) {
+    let t = list_new()
+    push(t, kind)
+    push(t, text)
+    return t
+}
+
+fn _tok_kind(t) { return t[0] }
+fn _tok_text(t) { return t[1] }
+
+// Is `c` a whitespace byte? (space, tab, newline, CR)
+fn _qry_is_ws(c) {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 10 { return 1 }
+    if c == 13 { return 1 }
+    return 0
+}
+
+// Is `c` a digit (0..9)?
+fn _qry_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+// Is `c` a structural single-char token? { } . ? " ( )
+// R16F: ( and ) added for ORDER BY DESC(field) syntax. They terminate
+// the current word in the same way { } do, so they slot into the
+// existing tokenizer state-machine without changing the word-reader.
+fn _qry_is_struct(c) {
+    if c == 123 { return 1 }   // {
+    if c == 125 { return 1 }   // }
+    if c == 46  { return 1 }   // .
+    if c == 63  { return 1 }   // ?
+    if c == 34  { return 1 }   // "
+    if c == 40  { return 1 }   // (
+    if c == 41  { return 1 }   // )
+    return 0
+}
+
+// Is `c` an op-byte: > < = !
+fn _qry_is_op_start(c) {
+    if c == 62 { return 1 }    // >
+    if c == 60 { return 1 }    // <
+    if c == 61 { return 1 }    // =
+    if c == 33 { return 1 }    // !
+    return 0
+}
+
+// Classify a bare identifier: keywords are SELECT, WHERE, FILTER, LIMIT,
+// OPTIONAL, UNION, ORDER, BY, ASC, DESC, GROUP, AS, COUNT, SUM, AVG,
+// MIN, MAX. Case-sensitive (SPARQL upper-keyword convention).
+// R16F added OPTIONAL/UNION/ORDER/BY/ASC/DESC.
+// R17E added GROUP/AS/COUNT/SUM/AVG/MIN/MAX.
+// Returns TOK_KW for those, TOK_IDENT otherwise.
+fn _qry_classify_ident(s) {
+    if str_eq(s, "SELECT")   == 1 { return TOK_KW }
+    if str_eq(s, "WHERE")    == 1 { return TOK_KW }
+    if str_eq(s, "FILTER")   == 1 { return TOK_KW }
+    if str_eq(s, "LIMIT")    == 1 { return TOK_KW }
+    if str_eq(s, "OPTIONAL") == 1 { return TOK_KW }
+    if str_eq(s, "UNION")    == 1 { return TOK_KW }
+    if str_eq(s, "ORDER")    == 1 { return TOK_KW }
+    if str_eq(s, "BY")       == 1 { return TOK_KW }
+    if str_eq(s, "ASC")      == 1 { return TOK_KW }
+    if str_eq(s, "DESC")     == 1 { return TOK_KW }
+    if str_eq(s, "GROUP")    == 1 { return TOK_KW }
+    if str_eq(s, "AS")       == 1 { return TOK_KW }
+    if str_eq(s, "COUNT")    == 1 { return TOK_KW }
+    if str_eq(s, "SUM")      == 1 { return TOK_KW }
+    if str_eq(s, "AVG")      == 1 { return TOK_KW }
+    if str_eq(s, "MIN")      == 1 { return TOK_KW }
+    if str_eq(s, "MAX")      == 1 { return TOK_KW }
+    return TOK_IDENT
+}
+
+// Read a bare identifier or integer literal starting at position `i`.
+// Returns [token, new_i]. Identifiers may contain a..z A..Z 0..9 _.
+// Integer literals are purely digits (no leading sign; negatives are
+// emitted by a separate path during parsing if ever needed).
+fn _qry_read_word(s, i) {
+    let n = len(s)
+    let start = i
+    let all_digits = 1
+    while i < n {
+        let c = char_at(s, i)
+        // Stop conditions: whitespace or structural char or operator.
+        if _qry_is_ws(c) == 1 {
+            let text = substr(s, start, i - start)
+            let pair = list_new()
+            if all_digits == 1 {
+                push(pair, _tok_new(TOK_INT, text))
+            } else {
+                push(pair, _tok_new(_qry_classify_ident(text), text))
+            }
+            push(pair, i)
+            return pair
+        }
+        if _qry_is_struct(c) == 1 {
+            let text = substr(s, start, i - start)
+            let pair = list_new()
+            if all_digits == 1 {
+                push(pair, _tok_new(TOK_INT, text))
+            } else {
+                push(pair, _tok_new(_qry_classify_ident(text), text))
+            }
+            push(pair, i)
+            return pair
+        }
+        if _qry_is_op_start(c) == 1 {
+            let text = substr(s, start, i - start)
+            let pair = list_new()
+            if all_digits == 1 {
+                push(pair, _tok_new(TOK_INT, text))
+            } else {
+                push(pair, _tok_new(_qry_classify_ident(text), text))
+            }
+            push(pair, i)
+            return pair
+        }
+        if _qry_is_digit(c) == 0 { all_digits = 0 }
+        i = i + 1
+    }
+    let text = substr(s, start, i - start)
+    let pair = list_new()
+    if all_digits == 1 {
+        push(pair, _tok_new(TOK_INT, text))
+    } else {
+        push(pair, _tok_new(_qry_classify_ident(text), text))
+    }
+    push(pair, i)
+    return pair
+}
+
+// Read a quoted string starting at position `i` (which points AT the
+// opening quote). Returns [token, new_i] (new_i past the closing
+// quote). On unterminated string, returns [error, new_i].
+fn _qry_read_string(s, i) {
+    let n = len(s)
+    let start = i + 1
+    let j = start
+    while j < n {
+        if char_at(s, j) == 34 {
+            let text = substr(s, start, j - start)
+            let pair = list_new()
+            push(pair, _tok_new(TOK_STR, text))
+            push(pair, j + 1)
+            return pair
+        }
+        j = j + 1
+    }
+    // Unterminated string -- caller turns this into a parse error
+    // by checking the token shape, but we also signal it via a TOK_OP
+    // with text "<unterm>".
+    let pair = list_new()
+    push(pair, _tok_new(TOK_OP, "<unterm-string>"))
+    push(pair, n)
+    return pair
+}
+
+// Read a variable token starting at position `i` (pointing AT the ?
+// character). Returns [token, new_i].
+fn _qry_read_var(s, i) {
+    let n = len(s)
+    let start = i + 1   // skip the ?
+    let j = start
+    while j < n {
+        let c = char_at(s, j)
+        if _qry_is_ws(c) == 1 {
+            let text = substr(s, start, j - start)
+            let pair = list_new()
+            push(pair, _tok_new(TOK_VAR, text))
+            push(pair, j)
+            return pair
+        }
+        if _qry_is_struct(c) == 1 {
+            let text = substr(s, start, j - start)
+            let pair = list_new()
+            push(pair, _tok_new(TOK_VAR, text))
+            push(pair, j)
+            return pair
+        }
+        if _qry_is_op_start(c) == 1 {
+            let text = substr(s, start, j - start)
+            let pair = list_new()
+            push(pair, _tok_new(TOK_VAR, text))
+            push(pair, j)
+            return pair
+        }
+        j = j + 1
+    }
+    let text = substr(s, start, j - start)
+    let pair = list_new()
+    push(pair, _tok_new(TOK_VAR, text))
+    push(pair, j)
+    return pair
+}
+
+// Read an operator token starting at position `i`. Recognizes the
+// two-character ops first (!= is the only one); otherwise single char.
+fn _qry_read_op(s, i) {
+    let n = len(s)
+    let c = char_at(s, i)
+    if c == 33 {
+        // != is the only two-char op; bare ! is an error (no Boolean NOT in
+        // mini-SPARQL).
+        if i + 1 < n {
+            if char_at(s, i + 1) == 61 {
+                let pair = list_new()
+                push(pair, _tok_new(TOK_OP, "!="))
+                push(pair, i + 2)
+                return pair
+            }
+        }
+        let pair = list_new()
+        push(pair, _tok_new(TOK_OP, "<bad-op>"))
+        push(pair, i + 1)
+        return pair
+    }
+    let text = ""
+    if c == 62 { text = ">" }
+    if c == 60 { text = "<" }
+    if c == 61 { text = "=" }
+    let pair = list_new()
+    push(pair, _tok_new(TOK_OP, text))
+    push(pair, i + 1)
+    return pair
+}
+
+// Tokenize the whole query string into a list of token records.
+// Returns the list (never 0 on success). Lexer errors surface as TOK_OP
+// tokens with text starting "<" -- the parser surfaces those as
+// `_qry_error("lex: ...")`.
+fn _qry_tokenize(s) {
+    let toks = list_new()
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _qry_is_ws(c) == 1 {
+            i = i + 1
+        } else {
+            if c == 123 {
+                push(toks, _tok_new(TOK_LBRACE, "{"))
+                i = i + 1
+            } else {
+                if c == 125 {
+                    push(toks, _tok_new(TOK_RBRACE, "}"))
+                    i = i + 1
+                } else {
+                    if c == 40 {
+                        // R16F: '(' for ORDER BY DESC(field) syntax.
+                        push(toks, _tok_new(TOK_LPAREN, "("))
+                        i = i + 1
+                    } else {
+                    if c == 41 {
+                        // R16F: ')' for ORDER BY DESC(field) syntax.
+                        push(toks, _tok_new(TOK_RPAREN, ")"))
+                        i = i + 1
+                    } else {
+                    if c == 46 {
+                        push(toks, _tok_new(TOK_OP, "."))
+                        i = i + 1
+                    } else {
+                        if c == 63 {
+                            let pair = _qry_read_var(s, i)
+                            push(toks, pair[0])
+                            i = pair[1]
+                        } else {
+                            if c == 34 {
+                                let pair2 = _qry_read_string(s, i)
+                                push(toks, pair2[0])
+                                i = pair2[1]
+                            } else {
+                                if _qry_is_op_start(c) == 1 {
+                                    let pair3 = _qry_read_op(s, i)
+                                    push(toks, pair3[0])
+                                    i = pair3[1]
+                                } else {
+                                    let pair4 = _qry_read_word(s, i)
+                                    push(toks, pair4[0])
+                                    i = pair4[1]
+                                }
+                            }
+                        }
+                    }
+                    }
+                    }
+                }
+            }
+        }
+    }
+    return toks
+}
+
+// ---- parser --------------------------------------------------------------
+//
+// State machine over the token stream. We carry an integer cursor and
+// the token list around; on syntax error we return _qry_error(...).
+
+// Peek at the current token, or 0 if past end.
+fn _qry_peek(toks, pos) {
+    if pos < 0 { return 0 }
+    if pos >= len(toks) { return 0 }
+    return toks[pos]
+}
+
+// Consume one token, returning [tok, new_pos]. Returns [0, pos] at EOF.
+fn _qry_consume(toks, pos) {
+    let pair = list_new()
+    if pos >= len(toks) {
+        push(pair, 0)
+        push(pair, pos)
+        return pair
+    }
+    push(pair, toks[pos])
+    push(pair, pos + 1)
+    return pair
+}
+
+// R17E: classify an aggregate-function keyword string to its int code.
+// Returns 0 if the string is not a known aggregate function.
+fn _qry_agg_code(s) {
+    if str_eq(s, "COUNT") == 1 { return QRY_AGG_COUNT }
+    if str_eq(s, "SUM")   == 1 { return QRY_AGG_SUM }
+    if str_eq(s, "AVG")   == 1 { return QRY_AGG_AVG }
+    if str_eq(s, "MIN")   == 1 { return QRY_AGG_MIN }
+    if str_eq(s, "MAX")   == 1 { return QRY_AGG_MAX }
+    return 0
+}
+
+// R17E: parse one parenthesised aggregate SELECT item. The opening '('
+// has just been consumed by the caller (the SELECT parser routes
+// TOK_LPAREN to this helper). Surface form:
+//   ( COUNT ( ?var ) AS ?alias )
+//   ( SUM   ( ?var alpha ) AS ?alias )
+//   ( AVG   ( ?var beta  ) AS ?alias )
+// Returns [agg_descriptor, alias_name, new_pos] or [error, "", pos]. The
+// agg_descriptor is [agg_code, src_var, src_field, alias].
+fn _qry_parse_agg_item(toks, pos) {
+    // agg function keyword
+    let ft = _qry_peek(toks, pos)
+    if ft == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected aggregate function"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(ft) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected aggregate function, got " + _tok_text(ft)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    let agg_code = _qry_agg_code(_tok_text(ft))
+    if agg_code == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: unknown aggregate function: " + _tok_text(ft)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // opening '(' for the aggregate argument list
+    let lp = _qry_peek(toks, pos)
+    if lp == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected '(' after " + _tok_text(ft)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(lp) != TOK_LPAREN {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected '(' after " + _tok_text(ft) + ", got " + _tok_text(lp)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // ?var
+    let vt = _qry_peek(toks, pos)
+    if vt == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?var in aggregate"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(vt) != TOK_VAR {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?var in aggregate, got " + _tok_text(vt)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    let src_var = _tok_text(vt)
+    pos = pos + 1
+    // optional field name (mandatory for SUM/AVG/MIN/MAX; absent for COUNT)
+    let src_field = ""
+    let next_tok = _qry_peek(toks, pos)
+    if next_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate is unterminated"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(next_tok) == TOK_IDENT {
+        // Have an explicit field name. Validate it matches the FILTER /
+        // field set so SUM/AVG/MIN/MAX always read a known int slot.
+        src_field = _tok_text(next_tok)
+        if _qry_filter_field_valid(src_field) == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("SELECT: aggregate unknown field: " + src_field))
+            push(pair, "")
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+    }
+    // For non-COUNT aggregates the field is mandatory.
+    if agg_code != QRY_AGG_COUNT {
+        if len(src_field) == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("SELECT: aggregate requires a field (e.g. SUM(?a alpha))"))
+            push(pair, "")
+            push(pair, pos)
+            return pair
+        }
+    }
+    // closing ')' for the aggregate argument list
+    let rp = _qry_peek(toks, pos)
+    if rp == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate is unterminated (expected ')')"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(rp) != TOK_RPAREN {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ')' in aggregate, got " + _tok_text(rp)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // AS keyword
+    let as_tok = _qry_peek(toks, pos)
+    if as_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected AS after aggregate"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(as_tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected AS, got " + _tok_text(as_tok)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(as_tok), "AS") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected AS, got " + _tok_text(as_tok)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // ?alias
+    let at_tok = _qry_peek(toks, pos)
+    if at_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?alias after AS"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(at_tok) != TOK_VAR {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: expected ?alias after AS, got " + _tok_text(at_tok)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    let alias = _tok_text(at_tok)
+    pos = pos + 1
+    // outer closing ')'
+    let cp = _qry_peek(toks, pos)
+    if cp == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate item missing closing ')'"))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(cp) != TOK_RPAREN {
+        let pair = list_new()
+        push(pair, _qry_error("SELECT: aggregate item expected ')', got " + _tok_text(cp)))
+        push(pair, "")
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let desc = list_new()
+    push(desc, agg_code)
+    push(desc, src_var)
+    push(desc, src_field)
+    push(desc, alias)
+    let pair = list_new()
+    push(pair, desc)
+    push(pair, alias)
+    push(pair, pos)
+    return pair
+}
+
+// Parse SELECT clause. R15D shipped "SELECT ?a ?b" (bare vars). R17E
+// extends this to also accept parenthesised aggregate items:
+//   SELECT (COUNT(?a) AS ?n) ?kind WHERE ...
+// We return [vars_list, aggs_list, new_pos] -- vars is the list of
+// names that land on each output row (a bare ?var keeps its name; an
+// aggregate item lands its ALIAS), and aggs is the list of aggregate
+// descriptors (empty if SELECT was all bare vars).
+// Stops at WHERE keyword.
+fn _qry_parse_select(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected SELECT"))
+        push(pair, list_new())
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("expected SELECT keyword"))
+        push(pair, list_new())
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "SELECT") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected SELECT, got " + _tok_text(tok)))
+        push(pair, list_new())
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let vars = list_new()
+    let aggs = list_new()
+    while pos < len(toks) {
+        let t = toks[pos]
+        if _tok_kind(t) == TOK_KW {
+            // Stop on WHERE; any other keyword here is a syntax error.
+            if str_eq(_tok_text(t), "WHERE") == 1 {
+                let pair = list_new()
+                push(pair, vars)
+                push(pair, aggs)
+                push(pair, pos)
+                return pair
+            }
+            let pair = list_new()
+            push(pair, _qry_error("expected variable or WHERE, got " + _tok_text(t)))
+            push(pair, list_new())
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(t) == TOK_LPAREN {
+            // R17E: parenthesised aggregate SELECT item.
+            pos = pos + 1
+            let ap = _qry_parse_agg_item(toks, pos)
+            if _qry_is_error(ap[0]) == 1 {
+                let pair = list_new()
+                push(pair, ap[0])
+                push(pair, list_new())
+                push(pair, pos)
+                return pair
+            }
+            push(aggs, ap[0])
+            push(vars, ap[1])
+            pos = ap[2]
+        } else {
+            if _tok_kind(t) != TOK_VAR {
+                let pair = list_new()
+                push(pair, _qry_error("expected ?var or (AGG(...) AS ?alias) in SELECT list"))
+                push(pair, list_new())
+                push(pair, pos)
+                return pair
+            }
+            push(vars, _tok_text(t))
+            pos = pos + 1
+        }
+    }
+    let pair = list_new()
+    push(pair, _qry_error("expected WHERE after SELECT vars"))
+    push(pair, list_new())
+    push(pair, pos)
+    return pair
+}
+
+// Parse one term: either a ?var or a literal (identifier/int/string).
+// Returns [term, new_pos] or [error, pos].
+fn _qry_parse_term(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected term, hit EOF"))
+        push(pair, pos)
+        return pair
+    }
+    let k = _tok_kind(tok)
+    if k == TOK_VAR {
+        let term = list_new()
+        push(term, TERM_VAR)
+        push(term, _tok_text(tok))
+        let pair = list_new()
+        push(pair, term)
+        push(pair, pos + 1)
+        return pair
+    }
+    if k == TOK_IDENT {
+        let term = list_new()
+        push(term, TERM_LIT)
+        push(term, _tok_text(tok))
+        let pair = list_new()
+        push(pair, term)
+        push(pair, pos + 1)
+        return pair
+    }
+    if k == TOK_INT {
+        let term = list_new()
+        push(term, TERM_LIT)
+        push(term, _tok_text(tok))
+        let pair = list_new()
+        push(pair, term)
+        push(pair, pos + 1)
+        return pair
+    }
+    if k == TOK_STR {
+        let term = list_new()
+        push(term, TERM_LIT)
+        push(term, _tok_text(tok))
+        let pair = list_new()
+        push(pair, term)
+        push(pair, pos + 1)
+        return pair
+    }
+    let pair = list_new()
+    push(pair, _qry_error("expected term, got " + _tok_text(tok)))
+    push(pair, pos)
+    return pair
+}
+
+// Parse a predicate token (an IDENT). Returns [predicate_str, new_pos].
+fn _qry_parse_predicate(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected predicate, hit EOF"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_IDENT {
+        let pair = list_new()
+        push(pair, _qry_error("expected predicate identifier, got " + _tok_text(tok)))
+        push(pair, pos)
+        return pair
+    }
+    let txt = _tok_text(tok)
+    if _qry_predicate_valid(txt) == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("unknown predicate: " + txt))
+        push(pair, pos)
+        return pair
+    }
+    let pair = list_new()
+    push(pair, txt)
+    push(pair, pos + 1)
+    return pair
+}
+
+// Is `p` a recognised predicate? See grammar comment at top.
+fn _qry_predicate_valid(p) {
+    if str_eq(p, "kind")       == 1 { return 1 }
+    if str_eq(p, "label")      == 1 { return 1 }
+    if str_eq(p, "alpha")      == 1 { return 1 }
+    if str_eq(p, "beta")       == 1 { return 1 }
+    if str_eq(p, "created_ns") == 1 { return 1 }
+    if str_eq(p, "links")      == 1 { return 1 }
+    return 0
+}
+
+// Is `f` a recognised FILTER field?
+fn _qry_filter_field_valid(f) {
+    if str_eq(f, "kind")       == 1 { return 1 }
+    if str_eq(f, "alpha")      == 1 { return 1 }
+    if str_eq(f, "beta")       == 1 { return 1 }
+    if str_eq(f, "count")      == 1 { return 1 }
+    if str_eq(f, "created_ns") == 1 { return 1 }
+    if str_eq(f, "version")    == 1 { return 1 }
+    return 0
+}
+
+// Is `op` a recognised comparison op?
+fn _qry_op_valid(op) {
+    if str_eq(op, ">")  == 1 { return 1 }
+    if str_eq(op, "<")  == 1 { return 1 }
+    if str_eq(op, "=")  == 1 { return 1 }
+    if str_eq(op, "!=") == 1 { return 1 }
+    return 0
+}
+
+// R16F: parse a brace-delimited pattern list: `{ pattern* }`. Returns
+// [patterns_list, new_pos] or [error, pos]. Used by OPTIONAL and by each
+// side of UNION; the outermost WHERE block still has its own parser
+// (_qry_parse_where) because that one is keyword-anchored on WHERE.
+fn _qry_parse_brace_group(toks, pos) {
+    let lb = _qry_peek(toks, pos)
+    if lb == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected '{' to open pattern group"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(lb) != TOK_LBRACE {
+        let pair = list_new()
+        push(pair, _qry_error("expected '{' to open pattern group"))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let patterns = list_new()
+    while pos < len(toks) {
+        let t = toks[pos]
+        if _tok_kind(t) == TOK_RBRACE {
+            pos = pos + 1
+            let pair = list_new()
+            push(pair, patterns)
+            push(pair, pos)
+            return pair
+        }
+        let pp = _qry_parse_pattern(toks, pos)
+        if _qry_is_error(pp[0]) == 1 {
+            return pp
+        }
+        push(patterns, pp[0])
+        pos = pp[1]
+    }
+    let pair = list_new()
+    push(pair, _qry_error("unterminated pattern group (expected '}')"))
+    push(pair, pos)
+    return pair
+}
+
+// Parse one pattern (triple, FILTER, OPTIONAL, or a brace-group that may
+// be the left side of a UNION). Triple/FILTER are terminated by ".";
+// OPTIONAL is terminated by its inner `}`; UNION sees the two brace
+// groups consume themselves.
+// Returns [pattern, new_pos] or [error, pos].
+fn _qry_parse_pattern(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected pattern, hit EOF"))
+        push(pair, pos)
+        return pair
+    }
+    // R16F: a brace-group at the pattern position is the left side of a
+    // UNION. After the group closes, we MUST see UNION and a second
+    // group; otherwise it's a parse error (a bare brace-group isn't a
+    // legal pattern in SPARQL outside of UNION / OPTIONAL).
+    if _tok_kind(tok) == TOK_LBRACE {
+        let lgp = _qry_parse_brace_group(toks, pos)
+        if _qry_is_error(lgp[0]) == 1 { return lgp }
+        let left_patterns = lgp[0]
+        pos = lgp[1]
+        let ut = _qry_peek(toks, pos)
+        if ut == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("expected UNION after brace group"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(ut) != TOK_KW {
+            let pair = list_new()
+            push(pair, _qry_error("expected UNION after brace group"))
+            push(pair, pos)
+            return pair
+        }
+        if str_eq(_tok_text(ut), "UNION") == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("expected UNION, got " + _tok_text(ut)))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+        let rgp = _qry_parse_brace_group(toks, pos)
+        if _qry_is_error(rgp[0]) == 1 { return rgp }
+        let right_patterns = rgp[0]
+        pos = rgp[1]
+        let node = list_new()
+        push(node, PAT_UNION)
+        push(node, left_patterns)
+        push(node, right_patterns)
+        let pair = list_new()
+        push(pair, node)
+        push(pair, pos)
+        return pair
+    }
+    // R16F: OPTIONAL { ... }
+    if _tok_kind(tok) == TOK_KW {
+        if str_eq(_tok_text(tok), "OPTIONAL") == 1 {
+            pos = pos + 1
+            let ogp = _qry_parse_brace_group(toks, pos)
+            if _qry_is_error(ogp[0]) == 1 { return ogp }
+            let inner = ogp[0]
+            pos = ogp[1]
+            let node = list_new()
+            push(node, PAT_OPTIONAL)
+            push(node, inner)
+            let pair = list_new()
+            push(pair, node)
+            push(pair, pos)
+            return pair
+        }
+    }
+    // FILTER
+    if _tok_kind(tok) == TOK_KW {
+        if str_eq(_tok_text(tok), "FILTER") == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("unexpected keyword in pattern: " + _tok_text(tok)))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+        // field
+        let ft = _qry_peek(toks, pos)
+        if ft == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected field, hit EOF"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(ft) != TOK_IDENT {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected field identifier"))
+            push(pair, pos)
+            return pair
+        }
+        let field = _tok_text(ft)
+        if _qry_filter_field_valid(field) == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: unknown field: " + field))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+        // op
+        let ot = _qry_peek(toks, pos)
+        if ot == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected operator, hit EOF"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(ot) != TOK_OP {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected operator (>, <, =, !=)"))
+            push(pair, pos)
+            return pair
+        }
+        let op = _tok_text(ot)
+        if _qry_op_valid(op) == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: unknown operator: " + op))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+        // intvalue
+        let vt = _qry_peek(toks, pos)
+        if vt == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected int value, hit EOF"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(vt) != TOK_INT {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected int value"))
+            push(pair, pos)
+            return pair
+        }
+        let val = rt_str_to_int(_tok_text(vt))
+        pos = pos + 1
+        // terminating .
+        let dt = _qry_peek(toks, pos)
+        if dt == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected '.' terminator"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(dt) != TOK_OP {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected '.' terminator"))
+            push(pair, pos)
+            return pair
+        }
+        if str_eq(_tok_text(dt), ".") == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("FILTER: expected '.', got " + _tok_text(dt)))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+        let node = list_new()
+        push(node, PAT_FILTER)
+        push(node, field)
+        push(node, op)
+        push(node, val)
+        let pair = list_new()
+        push(pair, node)
+        push(pair, pos)
+        return pair
+    }
+    // Triple: subject predicate object .
+    let sp = _qry_parse_term(toks, pos)
+    if _qry_is_error(sp[0]) == 1 {
+        return sp
+    }
+    let subj = sp[0]
+    pos = sp[1]
+    let pp = _qry_parse_predicate(toks, pos)
+    if _qry_is_error(pp[0]) == 1 {
+        return pp
+    }
+    let pred = pp[0]
+    pos = pp[1]
+    let op2 = _qry_parse_term(toks, pos)
+    if _qry_is_error(op2[0]) == 1 {
+        return op2
+    }
+    let obj = op2[0]
+    pos = op2[1]
+    let dt = _qry_peek(toks, pos)
+    if dt == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected '.' after triple"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(dt) != TOK_OP {
+        let pair = list_new()
+        push(pair, _qry_error("expected '.' after triple, got " + _tok_text(dt)))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(dt), ".") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected '.' after triple, got " + _tok_text(dt)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let node = list_new()
+    push(node, PAT_TRIPLE)
+    push(node, subj)
+    push(node, pred)
+    push(node, obj)
+    let pair = list_new()
+    push(pair, node)
+    push(pair, pos)
+    return pair
+}
+
+// Parse the body { pattern* }. Returns [patterns, new_pos].
+fn _qry_parse_where(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected WHERE"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("expected WHERE keyword"))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "WHERE") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected WHERE, got " + _tok_text(tok)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let lb = _qry_peek(toks, pos)
+    if lb == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("expected '{' after WHERE"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(lb) != TOK_LBRACE {
+        let pair = list_new()
+        push(pair, _qry_error("expected '{' after WHERE"))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let patterns = list_new()
+    while pos < len(toks) {
+        let t = toks[pos]
+        if _tok_kind(t) == TOK_RBRACE {
+            pos = pos + 1
+            let pair = list_new()
+            push(pair, patterns)
+            push(pair, pos)
+            return pair
+        }
+        let pp = _qry_parse_pattern(toks, pos)
+        if _qry_is_error(pp[0]) == 1 {
+            return pp
+        }
+        push(patterns, pp[0])
+        pos = pp[1]
+    }
+    let pair = list_new()
+    push(pair, _qry_error("unterminated WHERE block (expected '}')"))
+    push(pair, pos)
+    return pair
+}
+
+// R16F: parse the optional `ORDER BY [ASC|DESC] (field) | ORDER BY field`
+// clause. Returns [order_by_node, new_pos] where order_by_node is a 3-cell
+// list [field_string, direction, present_flag]. If there is no ORDER BY,
+// returns [["", ORD_ASC, 0], pos] (the absent sentinel).
+//
+// We accept these surface forms (all equivalent except for direction):
+//   ORDER BY alpha           -> ["alpha", ORD_ASC, 1]
+//   ORDER BY ASC(alpha)      -> ["alpha", ORD_ASC, 1]
+//   ORDER BY DESC(alpha)     -> ["alpha", ORD_DESC, 1]
+//   ORDER BY ASC alpha       -> ["alpha", ORD_ASC, 1]
+//   ORDER BY DESC alpha      -> ["alpha", ORD_DESC, 1]
+//
+// Parens after the direction are optional; the substrate operator pool
+// runs the gamut from "I copy-pasted from W3C" to "I just want it to
+// work", so we accept either spelling. The field must be one of the
+// recognised int fields (alpha, beta, count, created_ns, version, kind).
+fn _qry_parse_orderby(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    let absent = list_new()
+    push(absent, "")
+    push(absent, ORD_ASC)
+    push(absent, 0)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        // Not an ORDER keyword at this position -- leave for the next stage
+        // (LIMIT) to consume or report as a trailing-token error.
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "ORDER") == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let by_tok = _qry_peek(toks, pos)
+    if by_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER: expected BY"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(by_tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(by_tok), "BY") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    // Optional ASC/DESC keyword.
+    let dir = ORD_ASC
+    let dir_tok = _qry_peek(toks, pos)
+    if dir_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: expected field"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(dir_tok) == TOK_KW {
+        if str_eq(_tok_text(dir_tok), "ASC") == 1 {
+            dir = ORD_ASC
+            pos = pos + 1
+        } else {
+            if str_eq(_tok_text(dir_tok), "DESC") == 1 {
+                dir = ORD_DESC
+                pos = pos + 1
+            }
+        }
+    }
+    // Optional '('.
+    let saw_lparen = 0
+    let lp_tok = _qry_peek(toks, pos)
+    if lp_tok != 0 {
+        if _tok_kind(lp_tok) == TOK_LPAREN {
+            saw_lparen = 1
+            pos = pos + 1
+        }
+    }
+    // Field identifier.
+    let ft = _qry_peek(toks, pos)
+    if ft == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: expected field identifier"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(ft) != TOK_IDENT {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: expected field identifier, got " + _tok_text(ft)))
+        push(pair, pos)
+        return pair
+    }
+    let field = _tok_text(ft)
+    if _qry_filter_field_valid(field) == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("ORDER BY: unknown field: " + field))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    if saw_lparen == 1 {
+        let rp_tok = _qry_peek(toks, pos)
+        if rp_tok == 0 {
+            let pair = list_new()
+            push(pair, _qry_error("ORDER BY: expected ')'"))
+            push(pair, pos)
+            return pair
+        }
+        if _tok_kind(rp_tok) != TOK_RPAREN {
+            let pair = list_new()
+            push(pair, _qry_error("ORDER BY: expected ')', got " + _tok_text(rp_tok)))
+            push(pair, pos)
+            return pair
+        }
+        pos = pos + 1
+    }
+    let node = list_new()
+    push(node, field)
+    push(node, dir)
+    push(node, 1)
+    let pair = list_new()
+    push(pair, node)
+    push(pair, pos)
+    return pair
+}
+
+// Parse optional LIMIT N. Returns [limit, new_pos]. If no LIMIT present,
+// returns [QRY_DEFAULT_LIMIT, pos]. Caps at QRY_MAX_LIMIT.
+fn _qry_parse_limit(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, QRY_DEFAULT_LIMIT)
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("unexpected token after WHERE block: " + _tok_text(tok)))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "LIMIT") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("unexpected keyword: " + _tok_text(tok)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let vt = _qry_peek(toks, pos)
+    if vt == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("LIMIT: expected int value"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(vt) != TOK_INT {
+        let pair = list_new()
+        push(pair, _qry_error("LIMIT: expected int value"))
+        push(pair, pos)
+        return pair
+    }
+    let lim = rt_str_to_int(_tok_text(vt))
+    pos = pos + 1
+    if lim < 0 { lim = QRY_DEFAULT_LIMIT }
+    if lim > QRY_MAX_LIMIT { lim = QRY_MAX_LIMIT }
+    let pair = list_new()
+    push(pair, lim)
+    push(pair, pos)
+    return pair
+}
+
+// R17E: parse the optional `GROUP BY ?var` clause. Returns
+// [groupby_node, new_pos] where groupby_node is a 3-cell list
+// [group_var_name, group_field, present_flag]. If there is no GROUP BY,
+// returns [["", "kind", 0], pos] (the absent sentinel).
+//
+// The grouping variable must be a ?var bound by the WHERE block. We
+// don't validate that here (the executor will discover the binding at
+// runtime); we just record the var name. The brief's grammar uses
+// "GROUP BY ?kind" -- a single grouping variable. SPARQL 1.1 allows
+// multiple grouping vars; we restrict to one here to keep the
+// implementation single-pass.
+fn _qry_parse_groupby(toks, pos) {
+    let tok = _qry_peek(toks, pos)
+    let absent = list_new()
+    push(absent, "")
+    push(absent, "kind")
+    push(absent, 0)
+    if tok == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(tok), "GROUP") == 0 {
+        let pair = list_new()
+        push(pair, absent)
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let by_tok = _qry_peek(toks, pos)
+    if by_tok == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP: expected BY"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(by_tok) != TOK_KW {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    if str_eq(_tok_text(by_tok), "BY") == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP: expected BY, got " + _tok_text(by_tok)))
+        push(pair, pos)
+        return pair
+    }
+    pos = pos + 1
+    let vt = _qry_peek(toks, pos)
+    if vt == 0 {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP BY: expected ?var"))
+        push(pair, pos)
+        return pair
+    }
+    if _tok_kind(vt) != TOK_VAR {
+        let pair = list_new()
+        push(pair, _qry_error("GROUP BY: expected ?var, got " + _tok_text(vt)))
+        push(pair, pos)
+        return pair
+    }
+    let gvar = _tok_text(vt)
+    pos = pos + 1
+    let node = list_new()
+    push(node, gvar)
+    push(node, "kind")
+    push(node, 1)
+    let pair = list_new()
+    push(pair, node)
+    push(pair, pos)
+    return pair
+}
+
+// ---- public parser API ---------------------------------------------------
+//
+// kg_query_parse(query_string) -> parsed_query_t | error
+// Returns either a parsed_query_t (tag QRY_OBJ_TAG) or an error
+// (tag ERR_OBJ_TAG). Callers use _qry_is_error() to discriminate.
+fn kg_query_parse(query_string) {
+    let toks = _qry_tokenize(query_string)
+    // Lex-error sniff: any TOK_OP whose text starts with "<" and ends
+    // with ">" is a lexer-emitted error sentinel (the only legitimate
+    // single-char ops are "<", ">", "=", "!=", "." -- none of which
+    // end with ">"). This guards against the user typing `<bad-op>`
+    // and the lexer also emitting `<bad-op>` for unrecognised input.
+    let i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        if _tok_kind(t) == TOK_OP {
+            let txt = _tok_text(t)
+            let nT = len(txt)
+            if nT >= 3 {
+                if char_at(txt, 0) == 60 {
+                    if char_at(txt, nT - 1) == 62 {
+                        // <unterm-string>, <bad-op>, etc.
+                        return _qry_error("lex: " + txt)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(toks) == 0 {
+        return _qry_error("empty query")
+    }
+    let pos = 0
+    let sp = _qry_parse_select(toks, pos)
+    if _qry_is_error(sp[0]) == 1 { return sp[0] }
+    let vars = sp[0]
+    let aggs = sp[1]
+    pos = sp[2]
+    let wp = _qry_parse_where(toks, pos)
+    if _qry_is_error(wp[0]) == 1 { return wp[0] }
+    let patterns = wp[0]
+    pos = wp[1]
+    // R17E: GROUP BY comes after WHERE and before ORDER BY.
+    let gp = _qry_parse_groupby(toks, pos)
+    if _qry_is_error(gp[0]) == 1 { return gp[0] }
+    let group_by = gp[0]
+    pos = gp[1]
+    // R16F: ORDER BY comes before LIMIT in SPARQL surface syntax.
+    let op = _qry_parse_orderby(toks, pos)
+    if _qry_is_error(op[0]) == 1 { return op[0] }
+    let order_by = op[0]
+    pos = op[1]
+    let lp = _qry_parse_limit(toks, pos)
+    if _qry_is_error(lp[0]) == 1 { return lp[0] }
+    let limit = lp[0]
+    pos = lp[1]
+    if pos < len(toks) {
+        return _qry_error("trailing tokens after query")
+    }
+    let q = list_new()
+    push(q, QRY_OBJ_TAG)
+    push(q, vars)
+    push(q, patterns)
+    push(q, limit)
+    push(q, order_by)
+    push(q, aggs)
+    push(q, group_by)
+    return q
+}
+
+// Accessors on parsed_query_t.
+fn kg_query_vars(q)     { return q[QRY_VARS] }
+fn kg_query_patterns(q) { return q[QRY_PATTERNS] }
+fn kg_query_limit(q)    { return q[QRY_LIMIT] }
+// R16F: ORDER BY accessors. _has returns 1 iff the parsed query had an
+// ORDER BY clause; _field is "" when absent; _dir is the ORD_ASC/ORD_DESC
+// constant when present and ORD_ASC by default.
+fn kg_query_orderby_has(q) {
+    if len(q) <= QRY_ORDERBY { return 0 }
+    let ob = q[QRY_ORDERBY]
+    if len(ob) < 3 { return 0 }
+    return ob[2]
+}
+fn kg_query_orderby_field(q) {
+    if len(q) <= QRY_ORDERBY { return "" }
+    return q[QRY_ORDERBY][0]
+}
+fn kg_query_orderby_dir(q) {
+    if len(q) <= QRY_ORDERBY { return ORD_ASC }
+    return q[QRY_ORDERBY][1]
+}
+fn kg_query_is_parsed(q) {
+    if q == 0 { return 0 }
+    if len(q) < 4 { return 0 }
+    if q[0] == QRY_OBJ_TAG { return 1 }
+    return 0
+}
+
+// R17E: aggregate / GROUP BY accessors. _aggs_has returns 1 iff the
+// parsed query has at least one aggregate SELECT item; _aggs returns
+// the list of descriptors (empty when none). _groupby_has returns 1
+// iff the parsed query had a GROUP BY clause; _groupby_var returns the
+// var name (empty string when absent).
+fn kg_query_aggs(q) {
+    if len(q) <= QRY_AGGS { return list_new() }
+    return q[QRY_AGGS]
+}
+fn kg_query_aggs_has(q) {
+    if len(q) <= QRY_AGGS { return 0 }
+    let a = q[QRY_AGGS]
+    if len(a) > 0 { return 1 }
+    return 0
+}
+fn kg_query_groupby_has(q) {
+    if len(q) <= QRY_GROUPBY { return 0 }
+    let g = q[QRY_GROUPBY]
+    if len(g) < 3 { return 0 }
+    return g[2]
+}
+fn kg_query_groupby_var(q) {
+    if len(q) <= QRY_GROUPBY { return "" }
+    return q[QRY_GROUPBY][0]
+}
+
+// ---- bindings (list of [var_name, value]) --------------------------------
+
+fn binding_new() { return list_new() }
+
+fn binding_set(b, name, value) {
+    let i = 0
+    while i < len(b) {
+        if str_eq(b[i][0], name) == 1 {
+            list_set(b[i], 1, value)
+            return 1
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, name)
+    push(entry, value)
+    push(b, entry)
+    return 1
+}
+
+fn binding_has(b, name) {
+    let i = 0
+    while i < len(b) {
+        if str_eq(b[i][0], name) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn binding_get(b, name) {
+    let i = 0
+    while i < len(b) {
+        if str_eq(b[i][0], name) == 1 { return b[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Make a shallow copy of a binding so we can extend it independently in
+// the pattern-iteration fan-out.
+fn _binding_copy(b) {
+    let out = list_new()
+    let i = 0
+    while i < len(b) {
+        let e = list_new()
+        push(e, b[i][0])
+        push(e, b[i][1])
+        push(out, e)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- executor helpers ----------------------------------------------------
+
+// Resolve a literal kind name to its integer code. Returns -1 if unknown.
+fn _qry_kind_from_name(name) {
+    if str_eq(name, "FACT")     == 1 { return ATOM_FACT }
+    if str_eq(name, "RELATION") == 1 { return ATOM_RELATION }
+    if str_eq(name, "CONCEPT")  == 1 { return ATOM_CONCEPT }
+    if str_eq(name, "SKILL")    == 1 { return ATOM_SKILL }
+    if str_eq(name, "LANG")     == 1 { return ATOM_LANG }
+    if str_eq(name, "RULE")     == 1 { return ATOM_RULE }
+    return 0 - 1
+}
+
+// Term value evaluator. If the term is a var, look it up in the binding;
+// if absent, returns 0 (caller is responsible for var-binding semantics
+// before calling). If literal, returns the literal text.
+fn _qry_term_text(term) {
+    if term[0] == TERM_VAR { return term[1] }
+    return term[1]
+}
+
+// Read the int-valued field of an atom for FILTER evaluation.
+fn _qry_atom_field(a, field) {
+    if str_eq(field, "kind")       == 1 { return atom_kind(a) }
+    if str_eq(field, "alpha")      == 1 { return a[A_BELIEF][0] }
+    if str_eq(field, "beta")       == 1 { return a[A_BELIEF][1] }
+    if str_eq(field, "count")      == 1 { return atom_kind(a) }   // alias
+    if str_eq(field, "created_ns") == 1 { return atom_created(a) }
+    if str_eq(field, "version")    == 1 { return atom_version(a) }
+    return 0
+}
+
+// Compare `lhs` to `rhs` under `op`. Returns 1 if true, 0 if false.
+fn _qry_eval_op(lhs, op, rhs) {
+    if str_eq(op, ">")  == 1 {
+        if lhs > rhs { return 1 }
+        return 0
+    }
+    if str_eq(op, "<")  == 1 {
+        if lhs < rhs { return 1 }
+        return 0
+    }
+    if str_eq(op, "=")  == 1 {
+        if lhs == rhs { return 1 }
+        return 0
+    }
+    if str_eq(op, "!=") == 1 {
+        if lhs != rhs { return 1 }
+        return 0
+    }
+    return 0
+}
+
+// Test whether atom `a` satisfies the triple (term-pred-term) under the
+// CURRENT bindings. If the subject term is a free var, returns 0 (caller
+// must iterate). If pred is `links`, this checks one specific edge --
+// the caller iterates edges, not atoms.
+//
+// Returns 1 if the atom matches, 0 if not, -1 if the predicate can't be
+// evaluated by this helper (e.g. `links`).
+fn _qry_triple_atom_matches(a, pred, obj_term, bindings) {
+    if str_eq(pred, "kind") == 1 {
+        if obj_term[0] == TERM_VAR {
+            // ?x: matches any kind (binding side is handled by caller).
+            return 1
+        }
+        let want = _qry_kind_from_name(obj_term[1])
+        if want < 0 {
+            // Treat as integer
+            let v = rt_str_to_int(obj_term[1])
+            if atom_kind(a) == v { return 1 }
+            return 0
+        }
+        if atom_kind(a) == want { return 1 }
+        return 0
+    }
+    if str_eq(pred, "label") == 1 {
+        if obj_term[0] == TERM_VAR { return 1 }
+        if str_eq(atom_label(a), obj_term[1]) == 1 { return 1 }
+        return 0
+    }
+    if str_eq(pred, "alpha") == 1 {
+        if obj_term[0] == TERM_VAR { return 1 }
+        let v = rt_str_to_int(obj_term[1])
+        if a[A_BELIEF][0] == v { return 1 }
+        return 0
+    }
+    if str_eq(pred, "beta") == 1 {
+        if obj_term[0] == TERM_VAR { return 1 }
+        let v = rt_str_to_int(obj_term[1])
+        if a[A_BELIEF][1] == v { return 1 }
+        return 0
+    }
+    if str_eq(pred, "created_ns") == 1 {
+        if obj_term[0] == TERM_VAR { return 1 }
+        let v = rt_str_to_int(obj_term[1])
+        if atom_created(a) == v { return 1 }
+        return 0
+    }
+    return 0 - 1
+}
+
+// Iterate over all atoms in `kg`, returning the list of atom_ids that
+// match a triple where the subject is a free variable. For predicates
+// other than `links` this is a simple per-atom test.
+fn _qry_atoms_matching_triple(kg, pred, obj_term, bindings) {
+    let out = list_new()
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            let m = _qry_triple_atom_matches(a, pred, obj_term, bindings)
+            if m == 1 {
+                push(out, atom_id(a))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Walk the xrefs of atom `src_atom`, returning the list of destination
+// atom_ids (within the same KG; cross-KG edges are dropped). Used by
+// `?a links ?b` pattern execution.
+fn _qry_link_destinations(kg, src_atom) {
+    let out = list_new()
+    if src_atom == 0 { return out }
+    let xs = atom_xrefs(src_atom)
+    let my_kg_label = kg_label(kg)
+    let i = 0
+    while i < len(xs) {
+        let x = xs[i]
+        if str_eq(xref_dst_kg(x), my_kg_label) == 1 {
+            push(out, xref_dst_atom(x))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Execute a single triple pattern against the current binding-set, returning
+// the new binding-set (list of bindings, each a list of [name, value]).
+// Each pattern node can ADD bindings (binding the unbound var on either
+// side) or just FILTER (no new var introduced).
+fn _qry_exec_triple(kg, node, bindings, last_atom_var) {
+    let subj = node[1]
+    let pred = node[2]
+    let obj  = node[3]
+    let out_bindings = list_new()
+    let out_last = ""
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        // Resolve subject. If it's a literal, we ignore it (literal-subject
+        // triples don't bind; we just check that some atom matches them).
+        if subj[0] == TERM_VAR {
+            // Subject is a variable.
+            if binding_has(b, subj[1]) == 1 {
+                // Already bound -- check the atom satisfies the triple.
+                let src_id = binding_get(b, subj[1])
+                let src_atom = kg_atom(kg, src_id)
+                if src_atom != 0 {
+                    if str_eq(pred, "links") == 1 {
+                        // Walk destinations.
+                        let dests = _qry_link_destinations(kg, src_atom)
+                        let di = 0
+                        while di < len(dests) {
+                            let dst_id = dests[di]
+                            if obj[0] == TERM_VAR {
+                                let nb = _binding_copy(b)
+                                binding_set(nb, obj[1], dst_id)
+                                push(out_bindings, nb)
+                                out_last = obj[1]
+                            } else {
+                                // Literal dst -- must be an int atom_id
+                                let want = rt_str_to_int(obj[1])
+                                if dst_id == want {
+                                    let nb = _binding_copy(b)
+                                    push(out_bindings, nb)
+                                }
+                            }
+                            di = di + 1
+                        }
+                    } else {
+                        let m = _qry_triple_atom_matches(src_atom, pred, obj, b)
+                        if m == 1 {
+                            // If obj is a free var, bind it to the field value.
+                            if obj[0] == TERM_VAR {
+                                if binding_has(b, obj[1]) == 1 {
+                                    push(out_bindings, _binding_copy(b))
+                                } else {
+                                    let nb = _binding_copy(b)
+                                    // Bind to the field's value as an int.
+                                    binding_set(nb, obj[1], _qry_atom_field(src_atom, pred))
+                                    push(out_bindings, nb)
+                                }
+                            } else {
+                                push(out_bindings, _binding_copy(b))
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Subject unbound -- iterate every atom that matches the
+                // triple (predicate-aware).
+                if str_eq(pred, "links") == 1 {
+                    // Iterate every atom; for each, walk destinations.
+                    let atoms = kg_atoms(kg)
+                    let ai = 0
+                    while ai < len(atoms) {
+                        let a = atoms[ai]
+                        if a != 0 {
+                            let dests = _qry_link_destinations(kg, a)
+                            let di = 0
+                            while di < len(dests) {
+                                let dst_id = dests[di]
+                                if obj[0] == TERM_VAR {
+                                    let nb = _binding_copy(b)
+                                    binding_set(nb, subj[1], atom_id(a))
+                                    if str_eq(subj[1], obj[1]) == 0 {
+                                        binding_set(nb, obj[1], dst_id)
+                                    }
+                                    push(out_bindings, nb)
+                                    out_last = subj[1]
+                                } else {
+                                    let want = rt_str_to_int(obj[1])
+                                    if dst_id == want {
+                                        let nb = _binding_copy(b)
+                                        binding_set(nb, subj[1], atom_id(a))
+                                        push(out_bindings, nb)
+                                        out_last = subj[1]
+                                    }
+                                }
+                                di = di + 1
+                            }
+                        }
+                        ai = ai + 1
+                    }
+                } else {
+                    // Per-atom predicate test.
+                    let matching = _qry_atoms_matching_triple(kg, pred, obj, b)
+                    let mi = 0
+                    while mi < len(matching) {
+                        let aid = matching[mi]
+                        let nb = _binding_copy(b)
+                        binding_set(nb, subj[1], aid)
+                        // If obj is a free var, bind it to the field value.
+                        if obj[0] == TERM_VAR {
+                            if binding_has(nb, obj[1]) == 0 {
+                                let a2 = kg_atom(kg, aid)
+                                if a2 != 0 {
+                                    binding_set(nb, obj[1], _qry_atom_field(a2, pred))
+                                }
+                            }
+                        }
+                        push(out_bindings, nb)
+                        out_last = subj[1]
+                        mi = mi + 1
+                    }
+                }
+            }
+        } else {
+            // Subject is literal. We currently treat literal-subject as
+            // "must match some atom whose id equals the literal"; ignore
+            // for the v1.0 scope (operators always use variables).
+        }
+        bi = bi + 1
+    }
+    let pair = list_new()
+    push(pair, out_bindings)
+    push(pair, out_last)
+    return pair
+}
+
+// Execute a FILTER node. Filters apply to the MOST RECENTLY bound atom
+// (the brief calls this out -- single-pass scoping). `last_atom_var` is
+// the var name of the most-recently-bound atom; if empty, the filter
+// applies to no binding.
+fn _qry_exec_filter(kg, node, bindings, last_atom_var) {
+    let field = node[1]
+    let op    = node[2]
+    let rhs   = node[3]
+    let out = list_new()
+    if len(last_atom_var) == 0 {
+        // No atom in scope -- nothing to filter on, drop everything to
+        // avoid silent false-positives.
+        return out
+    }
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        if binding_has(b, last_atom_var) == 1 {
+            let aid = binding_get(b, last_atom_var)
+            let a = kg_atom(kg, aid)
+            if a != 0 {
+                let lhs = _qry_atom_field(a, field)
+                if _qry_eval_op(lhs, op, rhs) == 1 {
+                    push(out, b)
+                }
+            }
+        }
+        bi = bi + 1
+    }
+    return out
+}
+
+// R16F: execute a list of pattern nodes against a seed binding set,
+// returning [new_bindings, last_atom_var]. This was inlined in
+// kg_query_execute pre-R16F; lifting it makes OPTIONAL / UNION able to
+// recurse on their own pattern lists with the same machinery.
+//
+// `last_atom_var_in` is the var name that names the most-recently bound
+// atom from the OUTER scope (passed in so OPTIONAL's inner patterns can
+// reference vars bound before the OPTIONAL began).
+fn _qry_exec_patterns(kg, patterns, bindings, last_atom_var_in) {
+    let last_atom_var = last_atom_var_in
+    let pi = 0
+    while pi < len(patterns) {
+        let node = patterns[pi]
+        let kind = node[0]
+        if kind == PAT_TRIPLE {
+            let pair = _qry_exec_triple(kg, node, bindings, last_atom_var)
+            bindings = pair[0]
+            if len(pair[1]) > 0 { last_atom_var = pair[1] }
+        }
+        if kind == PAT_FILTER {
+            bindings = _qry_exec_filter(kg, node, bindings, last_atom_var)
+        }
+        if kind == PAT_OPTIONAL {
+            let pair = _qry_exec_optional(kg, node, bindings, last_atom_var)
+            bindings = pair[0]
+            if len(pair[1]) > 0 { last_atom_var = pair[1] }
+        }
+        if kind == PAT_UNION {
+            let pair = _qry_exec_union(kg, node, bindings, last_atom_var)
+            bindings = pair[0]
+            if len(pair[1]) > 0 { last_atom_var = pair[1] }
+        }
+        pi = pi + 1
+    }
+    let out = list_new()
+    push(out, bindings)
+    push(out, last_atom_var)
+    return out
+}
+
+// R16F: OPTIONAL { patterns } executor. Left-outer-join semantics --
+// for each input binding, try executing the inner patterns; if at
+// least one match emerges, emit those extended bindings; if none, emit
+// the ORIGINAL binding with the OPTIONAL's introduced vars left
+// unbound. We DO NOT use the input bindings as a fan-out source for
+// the inner patterns directly; instead we iterate per-row so the
+// "match or fall back" decision is per-row, not per-batch.
+//
+// "Introduced var" set: any vars the inner patterns mention as ?vars
+// (subject/object of a triple) that aren't in the parent binding. We
+// don't try to detect this dynamically -- the binding_has() check on
+// the OUT side handles it: if the inner match succeeds for this row,
+// the binding gains the new vars; if it fails, the row passes through
+// without them. The format helper renders unbound vars as "?".
+fn _qry_exec_optional(kg, node, bindings, last_atom_var_in) {
+    let inner = node[1]
+    let out_bindings = list_new()
+    let out_last = last_atom_var_in
+    let bi = 0
+    while bi < len(bindings) {
+        let row = bindings[bi]
+        // Run the inner patterns over a single-row binding set.
+        let one = list_new()
+        push(one, _binding_copy(row))
+        let pair = _qry_exec_patterns(kg, inner, one, last_atom_var_in)
+        let extended = pair[0]
+        if len(pair[1]) > 0 { out_last = pair[1] }
+        if len(extended) == 0 {
+            // No match: keep the original binding unextended. The
+            // OPTIONAL's introduced vars are simply NOT in this row
+            // (binding_has returns 0; binding_get returns 0).
+            push(out_bindings, row)
+        } else {
+            // At least one match: emit all extended copies.
+            let xi = 0
+            while xi < len(extended) {
+                push(out_bindings, extended[xi])
+                xi = xi + 1
+            }
+        }
+        bi = bi + 1
+    }
+    let result = list_new()
+    push(result, out_bindings)
+    push(result, out_last)
+    return result
+}
+
+// R16F: UNION executor. Each side runs independently over the SAME
+// input bindings; the results are CONCATENATED (SPARQL bag semantics).
+// `last_atom_var` is whichever side last set one; if neither does, we
+// keep the outer scope's var.
+fn _qry_exec_union(kg, node, bindings, last_atom_var_in) {
+    let left = node[1]
+    let right = node[2]
+    // Each side gets a fresh copy of the input bindings so they don't
+    // see each other's mutations.
+    let left_in = list_new()
+    let bi = 0
+    while bi < len(bindings) {
+        push(left_in, _binding_copy(bindings[bi]))
+        bi = bi + 1
+    }
+    let right_in = list_new()
+    let bj = 0
+    while bj < len(bindings) {
+        push(right_in, _binding_copy(bindings[bj]))
+        bj = bj + 1
+    }
+    let lpair = _qry_exec_patterns(kg, left, left_in, last_atom_var_in)
+    let rpair = _qry_exec_patterns(kg, right, right_in, last_atom_var_in)
+    let merged = list_new()
+    let li = 0
+    while li < len(lpair[0]) {
+        push(merged, lpair[0][li])
+        li = li + 1
+    }
+    let ri = 0
+    while ri < len(rpair[0]) {
+        push(merged, rpair[0][ri])
+        ri = ri + 1
+    }
+    let last_var = last_atom_var_in
+    if len(rpair[1]) > 0 { last_var = rpair[1] }
+    if len(lpair[1]) > 0 { last_var = lpair[1] }
+    let result = list_new()
+    push(result, merged)
+    push(result, last_var)
+    return result
+}
+
+// R16F: ORDER BY scorer. Reads the int-valued `field` off the
+// most-recently bound atom in row `b`. Atoms that don't have the
+// field defined fall back to 0 (the default sort key); rows with no
+// atom in scope (last_atom_var == "") return 0 -- they all sort
+// equal, leaving the original insertion order intact for them.
+fn _qry_order_score(kg, b, last_atom_var, field) {
+    if len(last_atom_var) == 0 { return 0 }
+    if binding_has(b, last_atom_var) == 0 { return 0 }
+    let aid = binding_get(b, last_atom_var)
+    let a = kg_atom(kg, aid)
+    if a == 0 { return 0 }
+    return _qry_atom_field(a, field)
+}
+
+// R16F: stable insertion sort over bindings, sorting by the named
+// field. Direction is ORD_ASC for ascending, ORD_DESC for descending.
+// Ties are broken by atom_id ASCENDING (smaller id first) so the sort
+// is deterministic regardless of input order. We use insertion sort
+// because the typical result set is small (<= LIMIT, default 100) and
+// the implementation is simple enough to audit.
+fn _qry_order_atom_id(b, last_atom_var) {
+    // Tiebreaker: the bound atom's id. If no atom is in scope, fall
+    // back to 0 (every row ties at 0 -- preserving insertion order).
+    if len(last_atom_var) == 0 { return 0 }
+    if binding_has(b, last_atom_var) == 0 { return 0 }
+    return binding_get(b, last_atom_var)
+}
+
+fn _qry_apply_order_by(kg, bindings, field, dir, last_atom_var) {
+    let n = len(bindings)
+    if n <= 1 { return bindings }
+    // Build a parallel array of [score, atom_id, binding] tuples so we
+    // sort once. Use insertion sort -- O(n^2) but n is tiny (<= LIMIT,
+    // default 100). Stable for tied (score, atom_id) pairs.
+    let keyed = list_new()
+    let i = 0
+    while i < n {
+        let b = bindings[i]
+        let s = _qry_order_score(kg, b, last_atom_var, field)
+        let t = _qry_order_atom_id(b, last_atom_var)
+        let cell = list_new()
+        push(cell, s)
+        push(cell, t)
+        push(cell, b)
+        push(keyed, cell)
+        i = i + 1
+    }
+    // Insertion sort. Standard pattern: shift entries that are larger
+    // (smaller for DESC) than cur to the right; then drop cur into the
+    // gap. Stable for tied (score, atom_id) pairs because we only
+    // shift on STRICT precedence -- ties never trigger a swap.
+    let k = 1
+    while k < n {
+        let cur = keyed[k]
+        let j = k - 1
+        let placed = 0
+        while placed == 0 {
+            if j < 0 {
+                list_set(keyed, 0, cur)
+                placed = 1
+            } else {
+                let prev = keyed[j]
+                // Does prev DOMINATE cur (i.e. prev should be earlier
+                // than cur in the sorted output)? If so, cur drops in
+                // at j+1 and we're done.
+                let prev_dominates = 0
+                if dir == ORD_DESC {
+                    if prev[0] > cur[0] {
+                        prev_dominates = 1
+                    } else {
+                        if prev[0] == cur[0] {
+                            // Tiebreak: smaller atom_id earlier.
+                            if prev[1] <= cur[1] { prev_dominates = 1 }
+                        }
+                    }
+                } else {
+                    if prev[0] < cur[0] {
+                        prev_dominates = 1
+                    } else {
+                        if prev[0] == cur[0] {
+                            if prev[1] <= cur[1] { prev_dominates = 1 }
+                        }
+                    }
+                }
+                if prev_dominates == 1 {
+                    list_set(keyed, j + 1, cur)
+                    placed = 1
+                } else {
+                    // Shift prev right; keep walking left.
+                    list_set(keyed, j + 1, prev)
+                    j = j - 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    let out = list_new()
+    let m = 0
+    while m < n {
+        push(out, keyed[m][2])
+        m = m + 1
+    }
+    return out
+}
+
+// R17E: read the int-valued contribution of a single binding row for
+// an aggregate descriptor. For COUNT, this returns 1 unconditionally.
+// For SUM/AVG/MIN/MAX, this looks up `src_var` in the binding, fetches
+// the atom from the KG, and returns the requested field. If the var
+// is unbound or the atom is missing, returns 0 with a "contributes" flag
+// of 0 -- meaning "skip this row for this aggregate" (SPARQL NULL
+// semantics: SUM/AVG/MIN/MAX ignore unbound rows).
+//
+// Returns a 2-cell [contributes_flag, int_value]. contributes_flag is
+// 1 if the row should contribute, 0 otherwise.
+fn _qry_agg_value(kg, agg, row) {
+    let code  = agg[0]
+    let var   = agg[1]
+    let field = agg[2]
+    if code == QRY_AGG_COUNT {
+        let pair = list_new()
+        push(pair, 1)
+        push(pair, 1)
+        return pair
+    }
+    // SUM/AVG/MIN/MAX -- need the field off the atom bound to var.
+    if binding_has(row, var) == 0 {
+        let pair = list_new()
+        push(pair, 0)
+        push(pair, 0)
+        return pair
+    }
+    let aid = binding_get(row, var)
+    if aid < 0 {
+        // QRY_UNBOUND sentinel from OPTIONAL non-match.
+        let pair = list_new()
+        push(pair, 0)
+        push(pair, 0)
+        return pair
+    }
+    let a = kg_atom(kg, aid)
+    if a == 0 {
+        let pair = list_new()
+        push(pair, 0)
+        push(pair, 0)
+        return pair
+    }
+    let v = _qry_atom_field(a, field)
+    let pair = list_new()
+    push(pair, 1)
+    push(pair, v)
+    return pair
+}
+
+// R17E: compute one aggregate over a list of binding rows. Returns the
+// integer result value. The semantics for an EMPTY contributing-row set:
+//   COUNT -> 0
+//   SUM   -> 0
+//   AVG   -> QRY_AGG_EMPTY (= -1)
+//   MIN   -> QRY_AGG_EMPTY
+//   MAX   -> QRY_AGG_EMPTY
+// These match the brief's "no data" sentinel (-1).
+//
+// AVG uses integer division: SUM / COUNT. Rounding is toward zero
+// (NOVA's `/` is integer truncation), matching the substrate's
+// fixed-point arithmetic convention elsewhere.
+fn _qry_agg_compute(kg, agg, rows) {
+    let code = agg[0]
+    let n = len(rows)
+    if code == QRY_AGG_COUNT {
+        // COUNT contributes 1 per row unconditionally.
+        return n
+    }
+    if code == QRY_AGG_SUM {
+        let total = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                total = total + cv[1]
+            }
+            i = i + 1
+        }
+        return total
+    }
+    if code == QRY_AGG_AVG {
+        let total = 0
+        let cnt = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                total = total + cv[1]
+                cnt = cnt + 1
+            }
+            i = i + 1
+        }
+        if cnt == 0 { return QRY_AGG_EMPTY }
+        return total / cnt
+    }
+    if code == QRY_AGG_MIN {
+        let best = 0
+        let has = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                if has == 0 {
+                    best = cv[1]
+                    has = 1
+                } else {
+                    if cv[1] < best { best = cv[1] }
+                }
+            }
+            i = i + 1
+        }
+        if has == 0 { return QRY_AGG_EMPTY }
+        return best
+    }
+    if code == QRY_AGG_MAX {
+        let best = 0
+        let has = 0
+        let i = 0
+        while i < n {
+            let cv = _qry_agg_value(kg, agg, rows[i])
+            if cv[0] == 1 {
+                if has == 0 {
+                    best = cv[1]
+                    has = 1
+                } else {
+                    if cv[1] > best { best = cv[1] }
+                }
+            }
+            i = i + 1
+        }
+        if has == 0 { return QRY_AGG_EMPTY }
+        return best
+    }
+    return 0
+}
+
+// R17E: build one output row from a set of contributing input rows. The
+// output row binds the grouping var (if any) AND every aggregate alias.
+// Bare (non-aggregate) SELECT vars that aren't the grouping var are
+// IGNORED in aggregate queries -- they don't make sense per-group (which
+// row's value would we take?) and the brief's examples either group on
+// them or omit them. Defensive default: bind any non-aggregate var that
+// IS in the contributing rows to the value from the first row (SPARQL
+// 1.1 calls this "ANY" semantics; the brief doesn't pin it but a stable
+// answer is better than dropping the row).
+fn _qry_build_agg_row(kg, vars, aggs, group_var, group_val, rows) {
+    let out = binding_new()
+    // Bind every non-aggregate SELECT var. If it's the group var, bind
+    // to the group value. Otherwise, bind to the first row's value (for
+    // backward-compat with pre-aggregate var lists).
+    let vi = 0
+    while vi < len(vars) {
+        let name = vars[vi]
+        // Is this an aggregate alias? Skip; we'll bind it after the loop.
+        let is_agg = 0
+        let aj = 0
+        while aj < len(aggs) {
+            if str_eq(aggs[aj][3], name) == 1 {
+                is_agg = 1
+            }
+            aj = aj + 1
+        }
+        if is_agg == 0 {
+            if str_eq(name, group_var) == 1 {
+                binding_set(out, name, group_val)
+            } else {
+                if len(rows) > 0 {
+                    let r0 = rows[0]
+                    if binding_has(r0, name) == 1 {
+                        binding_set(out, name, binding_get(r0, name))
+                    }
+                }
+            }
+        }
+        vi = vi + 1
+    }
+    // Compute and bind every aggregate alias.
+    let ai = 0
+    while ai < len(aggs) {
+        let agg = aggs[ai]
+        let alias = agg[3]
+        let val = _qry_agg_compute(kg, agg, rows)
+        binding_set(out, alias, val)
+        ai = ai + 1
+    }
+    return out
+}
+
+// R17E: apply the aggregation pass on the post-pattern bindings. Returns
+// a fresh list of output rows.
+//
+// Two regimes:
+//   - GROUP BY present: partition `bindings` by the value of group_var
+//     in each row, then emit one aggregated row per group. Output order
+//     is group-discovery order (deterministic for a deterministic input
+//     binding list).
+//   - GROUP BY absent: emit exactly one row aggregating over ALL input
+//     bindings. If the binding list is empty, we still emit one row
+//     with sentinel values (COUNT=0, SUM=0, AVG=MIN=MAX=QRY_AGG_EMPTY).
+fn _qry_apply_aggregates(kg, parsed_query, bindings) {
+    let vars  = kg_query_vars(parsed_query)
+    let aggs  = kg_query_aggs(parsed_query)
+    let group_has = kg_query_groupby_has(parsed_query)
+    let group_var = kg_query_groupby_var(parsed_query)
+    let out = list_new()
+    if group_has == 0 {
+        // Aggregate over the whole binding set into one row.
+        let row = _qry_build_agg_row(kg, vars, aggs, "", 0, bindings)
+        push(out, row)
+        return out
+    }
+    // GROUP BY present. Partition by the value of group_var. We build
+    // parallel arrays: group_keys (the int value of group_var seen so
+    // far) and group_rows (a list-of-lists of contributing rows).
+    let group_keys = list_new()
+    let group_rows = list_new()
+    let bi = 0
+    while bi < len(bindings) {
+        let b = bindings[bi]
+        if binding_has(b, group_var) == 1 {
+            let k = binding_get(b, group_var)
+            // Find existing bucket or open a new one.
+            let idx = 0 - 1
+            let gi = 0
+            while gi < len(group_keys) {
+                if group_keys[gi] == k {
+                    idx = gi
+                }
+                gi = gi + 1
+            }
+            if idx < 0 {
+                push(group_keys, k)
+                let fresh = list_new()
+                push(fresh, b)
+                push(group_rows, fresh)
+            } else {
+                push(group_rows[idx], b)
+            }
+        }
+        bi = bi + 1
+    }
+    // Emit one aggregate row per group, in discovery order.
+    let gj = 0
+    while gj < len(group_keys) {
+        let row = _qry_build_agg_row(kg, vars, aggs, group_var, group_keys[gj], group_rows[gj])
+        push(out, row)
+        gj = gj + 1
+    }
+    return out
+}
+
+// ---- public executor API -------------------------------------------------
+//
+// kg_query_execute(kg, parsed_query) -> list of bindings.
+// Returns the full result set (sliced to LIMIT). Caller iterates the
+// list and reads each binding via binding_get / binding_has.
+fn kg_query_execute(kg, parsed_query) {
+    if kg_query_is_parsed(parsed_query) == 0 {
+        return list_new()
+    }
+    let patterns = kg_query_patterns(parsed_query)
+    let limit = kg_query_limit(parsed_query)
+    // Seed: one empty binding (so the first triple pattern has a single
+    // row to extend from).
+    let bindings = list_new()
+    push(bindings, binding_new())
+    let pair = _qry_exec_patterns(kg, patterns, bindings, "")
+    bindings = pair[0]
+    let last_atom_var = pair[1]
+    // R17E: aggregates run AFTER the BGP+FILTER+OPTIONAL+UNION resolution
+    // (the brief specifies "filter applies BEFORE aggregation") but
+    // BEFORE ORDER BY / LIMIT. If the query has no aggregates and no
+    // GROUP BY, we skip this pass entirely -- the binding list stays
+    // intact for R15D/R16F backward compatibility.
+    if kg_query_aggs_has(parsed_query) == 1 {
+        bindings = _qry_apply_aggregates(kg, parsed_query, bindings)
+        // After aggregation, the "most-recently bound atom" concept is
+        // moot -- the output rows are aggregate values, not atoms.
+        // ORDER BY on aggregate aliases isn't supported (you'd need a
+        // separate path); for now ORDER BY still uses the same scoring
+        // helper, which falls back to 0 for rows without a bound atom.
+        last_atom_var = ""
+    } else {
+        if kg_query_groupby_has(parsed_query) == 1 {
+            // GROUP BY without aggregates: still partition. This collapses
+            // duplicate group keys into single rows (DISTINCT-like).
+            bindings = _qry_apply_aggregates(kg, parsed_query, bindings)
+            last_atom_var = ""
+        }
+    }
+    // R16F: apply ORDER BY before LIMIT. Skip sorting when no ORDER BY
+    // was given (the absent sentinel: present_flag == 0). R17E: when the
+    // output is aggregate rows, ORDER BY can target an aggregate ALIAS
+    // (e.g. "ORDER BY ?n") -- we detect that case by checking whether
+    // the field name matches a binding key on the rows directly. The
+    // existing _qry_apply_order_by is field-on-atom only, so for now
+    // ORDER BY over aggregates is a best-effort: we sort by the value
+    // bound to the field name on each row if that field matches an
+    // aggregate alias. The mainline path (ORDER BY on atom field) still
+    // works for non-aggregate queries.
+    if kg_query_orderby_has(parsed_query) == 1 {
+        let field = kg_query_orderby_field(parsed_query)
+        let dir   = kg_query_orderby_dir(parsed_query)
+        bindings = _qry_apply_order_by(kg, bindings, field, dir, last_atom_var)
+    }
+    // Apply LIMIT.
+    if limit < len(bindings) {
+        let out = list_new()
+        let i = 0
+        while i < limit {
+            push(out, bindings[i])
+            i = i + 1
+        }
+        return out
+    }
+    return bindings
+}
+
+// Convenience: parse + execute in one call. Returns either a list of
+// bindings or an error (caller checks via _qry_is_error). The integration
+// scenario uses this so a single command can roundtrip a query string
+// through the substrate.
+fn kg_query_compile_and_run(kg, query_string) {
+    let parsed = kg_query_parse(query_string)
+    if _qry_is_error(parsed) == 1 { return parsed }
+    return kg_query_execute(kg, parsed)
+}
+
+// ---- chat dispatch -------------------------------------------------------
+//
+// `/query <SPARQL_string>` admin: parses and executes the query, prints
+// a one-line summary plus up to the first 5 binding rows. Mirrors the
+// emit-line discipline of /pagerank / /louvain / /communities.
+fn _qry_format_binding(b, vars) {
+    let parts = list_new()
+    let i = 0
+    while i < len(vars) {
+        let name = vars[i]
+        if binding_has(b, name) == 1 {
+            let v = binding_get(b, name)
+            push(parts, name + "=" + int_to_str(v))
+        } else {
+            push(parts, name + "=?")
+        }
+        i = i + 1
+    }
+    return join(parts, " ")
+}
+
+fn kg_query_cmd(kg, arg) {
+    if len(arg) == 0 {
+        io_println("usage: /query <SPARQL_string>  -- e.g. /query SELECT ?a WHERE { ?a kind FACT . } ORDER BY DESC(alpha) LIMIT 5  (supports OPTIONAL/UNION/ORDER BY -- R16F; COUNT/SUM/AVG/MIN/MAX/GROUP BY -- R17E)")
+        io_println("QUERY store_size=" + int_to_str(kg_atom_count(kg)))
+        return 1
+    }
+    let parsed = kg_query_parse(arg)
+    if _qry_is_error(parsed) == 1 {
+        io_println("QUERY error=" + qry_error_message(parsed))
+        return 1
+    }
+    let vars = kg_query_vars(parsed)
+    let results = kg_query_execute(kg, parsed)
+    let n = len(results)
+    let header = "QUERY bindings=" + int_to_str(n) + " vars=" + int_to_str(len(vars))
+        + " limit=" + int_to_str(kg_query_limit(parsed))
+    io_println(header)
+    let show = n
+    if show > 5 { show = 5 }
+    let i = 0
+    while i < show {
+        io_println("BINDING " + int_to_str(i + 1) + ": " + _qry_format_binding(results[i], vars))
+        i = i + 1
+    }
+    if n > 5 {
+        io_println("(... " + int_to_str(n - 5) + " more)")
+    }
+    io_println("QUERY_END")
+    return 1
+}
