@@ -3,6 +3,275 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R39E -- documentation: R39 self-identification + autonomous-learning architecture
+
+**Status: complete** -- documentation-only round describing the R39 sprint
+end-to-end. Explains WHY this architecture, WHAT each piece does, HOW to
+use it post-install, and HOW it relates to the existing ADRs. Documents
+the actual landed shape of sibling R39A / R39B / R39C / R39D / R39F as
+of this commit, including the honest gaps (HTTPS deferred to R39B.2,
+English-only stopwords in R39F, no atomic write in R39C, niche-phrasing
+misses in R39A's regex dispatcher).
+
+### What R39E delivers
+
+* **`docs/adr/r39-autonomous-learning-architecture.md`** (new) -- the
+  end-to-end trigger -> research -> preprocess -> ingest pipeline. The
+  diagram, performance budget (perceive ~0ms + deferred 2-10s + ingest
+  ~50ms), failure modes (whitelist-deny / rate-limit / timeout /
+  parse-fail / oversize / HTTPS-deferred / wrong content-type) and how
+  each surfaces, configuration knobs (`IF_MAX_PER_HOUR=30`,
+  `IF_DOMAIN_SPACING=2s`, `IF_MAX_BODY=2MB`, `SLT_QUEUE_MAX=8`,
+  `SLT_FUSION_WINDOW_TICKS=20`), security posture (bytes never reach an
+  LLM per ADR-0014; whitelist is the only network gate per ADR-0028;
+  source-authority tiers pinned per ADR-0029), and the honest gaps
+  (HTTPS, multi-language stopwords, small whitelist seed, single-active
+  cap, competence-gap reweighting deferred).
+
+* **`docs/adr/r39-self-identification-wiring.md`** (new) -- the chat
+  intent dispatcher and the regex pattern -> `SELFQ_*` map. Documents
+  the priority rule (self-ID first, then KG-match, then unknown-query
+  with side-effect), each row in the regex table mapping to
+  `smq_what_are_you` / `smq_capabilities` / `smq_goals` / `smq_state` /
+  `smq_activity`, and the honest gaps (niche phrasings missed; no ML
+  classifier; `SELFQ_COMPETENCE` quality bound to ADR-0020 maturity;
+  no ADR-0039 theory-of-mind tailoring yet).
+
+* **`docs/adr/r39-persistence-and-rehydration.md`** (new) -- the R39C
+  save/load API (text v1 line-record format at
+  `$HOME/.crossengin/chat_state.dat`), the rehydration order
+  (`VERSION` -> `SESSION_ID` -> soul -> dlog -> KG atoms ->
+  `META_PENDING` -> `END`, matching ADR-0048's "soul first" mandate),
+  the R40 plan (wire `chat_state_save` into `/quit`,
+  `chat_state_load` into boot, idle-tick checkpoint, atomic write,
+  `/save_chat` + `/load_chat` admin commands distinct from the
+  substrate `/save` + `/load`), and the honest gaps in R39C (no
+  atomic write, no compaction, no multi-process flock, no v2 schema
+  migration -- v1 only today).
+
+* **`docs/CHAT_USAGE.md`** (new) -- 12-section comprehensive
+  user-facing guide. The document to read after `GETTING_STARTED.md`.
+  Sections: (1) what the chat is + isn't; (2) quick start; (3) web vs
+  terminal modes persistence comparison; (4) full admin command table;
+  (5) what works out of the box (seeded vocab, greetings, `/status`,
+  `/why`); (6) `/teach <word>` and `/teach <s> <r> <o>`;
+  (7) `scripts/learn.sh` + `/learn` explicit path AND post-R39A/B/D
+  autonomous path with rate-limit + HTTPS-deferred caveats;
+  (8) self-identification examples per pattern; (9) `/status` /
+  `/why` / `/why-deep` / `/reflect` / `/history` / `/meta`;
+  (10) persistence today vs R40 plan; (11) troubleshooting
+  ("always okay" pre vs post R39, rate-limit warnings, fetch failure
+  outcomes, constitution blocks, `/quit` doesn't save, web LRU
+  eviction); (12) pointers to the ADRs.
+
+* **`docs/GETTING_STARTED.md`** (modified) -- added a 4-line
+  cross-reference after Section 2.7 ("After bootstrap, see
+  `docs/CHAT_USAGE.md` for the comprehensive feature walkthrough").
+
+### Cross-agent boundaries (concurrent R39 sprint)
+
+R39A (chat dispatch), R39B (HTTP transport), R39C (persistence API),
+R39D (idle/autonomous loop), R39F (preprocess), R39E (this round)
+operate on disjoint files. R39E touched ONLY:
+`docs/adr/r39-autonomous-learning-architecture.md` (new),
+`docs/adr/r39-self-identification-wiring.md` (new),
+`docs/adr/r39-persistence-and-rehydration.md` (new),
+`docs/CHAT_USAGE.md` (new), `docs/GETTING_STARTED.md` (one section
+appended), `README.md` (this row + the R39E section), and
+`NEXT_SESSION.md` (this section). No code module was modified.
+Stash discipline: pre-flight working tree was clean; sibling
+untracked files at handoff time (`src/learning/autonomous_research.nova`,
+`src/learning/preprocess.nova`, `src/persistence/chat_state.nova`,
+the three test files, and the working-tree edits to
+`examples/crossengin_chat.nova`, `src/chat/helpers.nova`,
+`src/io/transducers/http_client.nova`, `src/agent/loop_imagination_idle.nova`,
+`FEDERATED_AUDIT.md`) were never touched. No `git stash -u` was used.
+
+### Honest scope note
+
+The ADRs document the actual landed shape of the sibling R39 work as
+observed in the working tree at commit time. Sibling-agent
+implementation choices are reflected: R39B ships plain HTTP only (HTTPS
+explicitly returns `IF_TRANSPORT_DEFERRED` from `if_transport_get` --
+documented as "planned R39B.2 once http_client gets client-mode TLS");
+R39F's preprocess is English-only (documented in the architecture ADR
+and the CHAT_USAGE troubleshooting section); R39C's chat_state has no
+atomic write yet (documented as planned-R40 in the persistence ADR);
+R39A's regex map misses niche phrasings (each unsupported phrasing is
+named in the self-identification ADR's honest-gaps section).
+
+## R39A -- chat intent dispatcher (self-id routing + KG-templated reply + SLT trigger)
+
+**Status: complete** -- closes the "every chat input -> 'okay'" gap reported
+by the user. The substrate was perceiving and atomizing correctly, but the
+response generator (`gen_from_intent_with_slot`) had no signal pathway above
+the ACK fallback. R39A wires three intent paths into the REPL's reply
+hierarchy AHEAD of that fallback. The substrate modules themselves (soul,
+self_model_query, self_learning_triggers) are unchanged -- only the chat-side
+dispatcher and pure-string helpers were extended.
+
+### What R39A delivers
+
+* **`examples/crossengin_chat.nova`** -- new R39A intent dispatcher block in
+  the reply path (the `else` branch after the constitutional veto check).
+  Reply hierarchy:
+  1. INTENT_SELF_ID match -> route to `selfmodel_identity` /
+     `selfmodel_state` / `selfmodel_goals` / `selfmodel_activity`, or render
+     a per-domain competence summary for the CAPABILITIES kind. Replies
+     bypass `gen_from_intent_with_slot` (they are already complete
+     sentences) but still pass through `effector_speak_governed` so `/halt`
+     + decision-log semantics are honoured.
+  2. Admin `/...` (existing path, unchanged) -- handled before the agent
+     loop runs.
+  3. KG-matched concept ("what is X" / "tell me about X" / bare "X") ->
+     `_smq_kg_templated_reply` looks up the highest-belief operator atom
+     about X and renders "X <relation-phrase> Y." using the original
+     relation tag parsed from the operator's label.
+  4. Unknown-word filed -> "I don't know X yet -- I'll look into it" and
+     `_submit_curiosity` (now counting return) bumps the process-wide
+     `chat_stats_self_learning_triggers_filed` counter for telemetry.
+  5. Existing cognition-driven fallback (SEE TOPIC + ACK) runs only when
+     none of the above fire.
+* **`src/chat/helpers.nova`** -- 9 new pure helpers (all unit-tested) for
+  the dispatcher's classification logic:
+  * `_str_lower_ascii(s)` (thin wrapper over the `str_lower` builtin so the
+    helper module stays import-free).
+  * `_smq_strip_terminal_punct(s)`, `_smq_exact(s, pat)`,
+    `_smq_prefix(s, pat)`, `_smq_ends_with(s, suffix)` -- pattern-matching
+    building blocks.
+  * `_smq_match_identity` / `_match_state` / `_match_goals` /
+    `_match_capabilities` / `_match_activity` -- the five SMQ_KIND_*
+    matchers (anchored exact / prefix patterns, NEVER substring "what" or
+    "you" so "what is fever" does NOT trigger IDENTITY).
+  * `_intent_self_id_kind(raw)` -- top-level dispatcher returning one of
+    `SMQ_KIND_{NONE,IDENTITY,STATE,GOALS,CAPABILITIES,ACTIVITY}` with
+    ACTIVITY tried first so "what are you doing today" does not match
+    "what are you" (IDENTITY).
+  * `_smq_extract_concept_query(raw)` -- pulls X from "what is X" / "tell
+    me about X" / "describe X" / bare "X" (empty return on multi-token
+    non-shape).
+  * `_smq_relation_phrase(rel)` + `_smq_template_triple(s, r, o)` -- the
+    relation-tag canonicaliser ("is_a" -> "is a", "causal" -> "causes",
+    etc.) and the three-field templater.
+  * `_smq_unknown_reply(word)` -- the stable "I don't know X yet" phrasing
+    so smoke tests can pin it.
+* **`tests/unit/test_chat_intent_dispatch.nova` (new)** -- 60+ assertions
+  across 9 test functions covering: lowercase, terminal-punctuation strip,
+  intent classifier positive (5 IDENTITY + 3 STATE + 3 GOALS + 2
+  CAPABILITIES + 2 ACTIVITY = 15 positive), classifier negative ("what is
+  fever", "hello", admin command, empty, whitespace), concept-extract
+  positive + negative, relation-phrase mappings, triple template, the
+  unknown-reply pin, and the underlying ends_with / exact / prefix blocks.
+
+### Honest design caveats
+
+* The intent matcher is intentionally **narrow** (anchored exact + prefix
+  patterns). Niche phrasings ("yo who u" / "tell me who u r") will fall
+  through to the KG-templated path or the unknown-word path. The brief's
+  8+ positive patterns are all covered; adding more is a one-line append
+  in `_smq_match_*`.
+* The KG-templated reply parses the relation tag from the operator atom's
+  label (format: `src_prefix:S-R->O` per `_admin_learn_triples`). A
+  malformed label falls back to the ROP_* kind name. Tests cover the
+  string rendering; the kg-lookup path is exercised by the
+  `scripts/learn_smoke*.sh` integration tests.
+* `selfmodel_activity` takes an `active_loop_count` argument; the chat
+  passes `registry_live_count(reg)` which is the closest integer the
+  substrate offers (one cognitive loop per session today). The
+  `selfmodel_competence` overload requires (domain, kind) pairs; the chat
+  surface emits a count-only summary rather than refactor the
+  self_model_query signature.
+* `chat_stats_self_learning_triggers_filed` is incremented but not yet
+  surfaced via `/status` -- a one-line follow-up. The counter survives
+  `/switch` (process-wide) so /status reads correctly today.
+
+## R39F -- text preprocessing pipeline (ADR-0028 transform seam / ADR-0031)
+
+**Status: complete** -- closes the transform gap between R39B's HTTP fetch
+and the KG ingest. Previously `scripts/learn.sh` did naive sed/awk text
+extraction from a fetched page; R39F lifts that into a real NOVA module the
+autonomous research loop (R39D) calls in the PREPROCESSING phase.
+
+### What R39F delivers
+
+* **`src/learning/preprocess.nova` (new, no imports)** -- a pure-transform
+  module composing six stages: HTML strip, sentence split, tokenize,
+  stopword filter, triple extract, and an end-to-end composer with
+  telemetry counters. No KG / network / safety wiring -- the autonomous
+  research loop owns plumbing the output into multi-KG.
+  * `preprocess_strip_html(html)` -- removes `<script>`/`<style>` whole
+    blocks, replaces block-level openers/closers (`<br>`, `<p>`, `<div>`,
+    `<li>`, `<h1>..<h6>`) with newlines, strips remaining tags, decodes
+    six entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&nbsp;`, `&#39;`),
+    collapses whitespace runs.
+  * `preprocess_split_sentences(text)` -- splits on `.`/`?`/`!` followed
+    by whitespace + uppercase (or EOF). Common abbreviations don't end a
+    sentence: `Dr.`, `Mr.`, `Ms.`, `Mrs.`, `St.`, `e.g.`, `i.e.`.
+  * `preprocess_tokenize(sentence)` -- splits on whitespace + punctuation,
+    lowercases, drops pure-numeric tokens, drops single-char tokens.
+  * `preprocess_filter_stopwords(toks)` + `preprocess_set_stopwords(list)`
+    + `preprocess_is_stopword(tok)` -- shipped with ~110 common English
+    stopwords; swappable for domain modes / unit tests.
+  * `preprocess_extract_triples(sentence)` -- conservative pattern matcher
+    over six relation forms: `X is a Y` -> `(X, is_a, Y)`, `X has Y` ->
+    `(X, has_property, Y)`, `X causes Y` -> `(X, causes, Y)`,
+    `X is part of Y` -> `(X, part_of, Y)`, `X means Y` -> `(X, defined_as, Y)`,
+    `X is defined as Y` -> `(X, defined_as, Y)`. Optional articles
+    (`a`/`an`/`the`) before the object are skipped. Cap of 2 triples per
+    sentence. Quality > recall: garbage triples poison the KG (ADR-0031).
+  * `preprocess_run(html)` -- the composer: HTML strip -> sentence split
+    -> for each sentence (tokenize + stopword filter + extract triples).
+    Returns `[atoms, triples]`; atoms are the deduped union of kept tokens
+    across all sentences. Increments four telemetry counters
+    (`sentences`, `tokens`, `triples`, `html_bytes`) readable via
+    `preprocess_stats()` and resettable via `preprocess_stats_reset()`.
+
+* **`tests/unit/test_preprocess.nova` (new)** -- 88 assertions across 33
+  test functions:
+  * HTML strip: plain tags, `<script>` body deletion, `<style>` body
+    deletion, six entity decodes, empty input, block tags producing
+    newline boundaries, unknown-tag passthrough of content.
+  * Sentence split: basic three-way split, `?`/`!`, `Dr.` / `e.g.` /
+    `i.e.` abbreviation safety, no-split on period+lowercase, empty input,
+    trailing fragment with no terminator.
+  * Tokenize: lowercase, punctuation boundaries, pure-numeric drop,
+    single-char drop, empty input.
+  * Stopword: membership for the/is/a, list filtering, custom-list swap
+    via `preprocess_set_stopwords` and restore.
+  * Triple extraction: each of the six relations end-to-end, the 2-per-
+    sentence cap, short-sentence + empty-input early outs.
+  * End-to-end: empty input, pure-HTML-no-text, small Wikipedia-shaped
+    HTML fixture producing the expected `(fever, is_a, ...)` and
+    `(smoking, causes, cancer)` triples, telemetry counters non-zero,
+    atom dedup across repeated tokens.
+
+### Known gaps / honest caveats
+
+* **English-only stopwords.** Multilingual is a future round (R39F.2).
+  Callers can swap the list via `preprocess_set_stopwords` for domain
+  modes (medical, code, etc.).
+* **HTML strip is naive.** No CDATA, no JavaScript-rendered DOM, no
+  proper entity table (only the six common ones decode). Wikipedia + most
+  blog content works fine; pathological inputs (deeply nested malformed
+  markup) may mis-split. The strip is a regex-style state machine, not a
+  conformant HTML5 parser.
+* **Triple patterns are anchored regex.** Six relations only; quality is
+  prioritized over recall. Patterns like passive voice, multi-word
+  subjects, or "X, which is Y" relative clauses are out of scope.
+  Extending the list is one anchored block per relation in
+  `preprocess_extract_triples`.
+
+### Cross-agent boundaries (concurrent R39 sprint)
+
+R39A (chat dispatch), R39B (HTTP transport), R39C (persistence), R39D
+(idle/autonomous loop), R39E (others) operate on disjoint files. R39F
+touched ONLY: `src/learning/preprocess.nova` (new),
+`tests/unit/test_preprocess.nova` (new), plus this section in
+`NEXT_SESSION.md` / `README.md` / `FEDERATED_AUDIT.md`. No chat / agent /
+internet_fetch / autonomous_research / multi_kg / safety module was
+modified. Stash discipline: stashed only explicitly-owned paths before
+work; never `-u`; never touched sibling untracked files.
+
 ## R39B -- HTTP/1.1 transport seam for internet_fetch (NOVA enhancement #11 / ADR-0028)
 
 **Status: complete (plain HTTP/1.1 only; HTTPS deferred to R39B.2)**
