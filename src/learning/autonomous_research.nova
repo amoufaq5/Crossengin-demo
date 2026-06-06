@@ -1,0 +1,371 @@
+// CrossEngin learning: autonomous research orchestrator (R39D).
+//
+// Purpose
+//   Ties the self-learning-trigger queue (ADR-0026) to the gated, rate-limited
+//   internet fetch pipeline (ADR-0028), so the substrate's idle loop can
+//   actually act on its own initiative: dequeue an SLT_UNKNOWN_QUERY signal,
+//   derive a reference URL from the unknown concept, run it through
+//   `if_permit` / `if_dispatch_transport` / `if_ingest`, and land the bytes as
+//   provenance=fetched evidence in the domain KG. This is the "agent develops
+//   itself" path R39D delivers.
+//
+//   The orchestrator is a state machine, not a one-shot coroutine: each tick
+//   advances at most one phase, returning AR_TICK_OK on real progress,
+//   AR_TICK_BUSY when rate-limited, or AR_TICK_IDLE when there is nothing to
+//   do. This lets the idle loop interleave research with the other idle work
+//   (imagination, reflection, ...) at fine granularity -- a single signal
+//   takes 4-5 ticks (FETCHING -> PREPROCESSING -> INGESTING -> reset), and no
+//   tick blocks for I/O long enough to starve the cognitive cycle.
+//
+//   Mock strategy: the actual transport (`if_dispatch_transport`, post-R39B)
+//   touches sockets, which unit tests must not. We expose a function-level
+//   seam, `_ar_test_inject_body`, that pre-populates the in-flight body slot
+//   so the FETCHING phase short-circuits the transport call. Production code
+//   never calls the injector; it exists only so `tests/unit/` can drive the
+//   full pipeline without an HTTP responder.
+//
+// ADRs wired: ADR-0026 (self-learning triggers), ADR-0028 (whitelisted fetch).
+//   Read-only consumers: `src/learning/self_learning_triggers.nova` (queue),
+//   `src/learning/internet_fetch.nova` (gate + transport + ingest).
+// NOVA dependencies: builtins. CrossEngin dependencies:
+//   src/learning/self_learning_triggers.nova,
+//   src/learning/internet_fetch.nova,
+//   src/learning/source_whitelist.nova,
+//   src/kg/multi_kg_manager.nova,
+//   src/kg/atom_store.nova.
+
+import "self_learning_triggers.nova"
+import "internet_fetch.nova"
+import "source_whitelist.nova"
+import "../kg/multi_kg_manager.nova"
+import "../kg/atom_store.nova"
+
+// ---- tick return tags -----------------------------------------------------
+// Returned by `ar_tick` so the idle-loop integrator can decide whether to
+// fall through to the next idle step or short-circuit the iteration.
+let AR_TICK_OK   = 1   // advanced a phase; caller may run other idle steps
+let AR_TICK_BUSY = 2   // rate-limited or transport pending; skip other steps
+let AR_TICK_IDLE = 3   // nothing in the queue; caller may run other idle steps
+
+// ---- pipeline phase tags --------------------------------------------------
+let AR_PHASE_IDLE          = 0
+let AR_PHASE_FETCHING      = 1
+let AR_PHASE_PREPROCESSING = 2
+let AR_PHASE_INGESTING     = 3
+
+// ---- rate limiting --------------------------------------------------------
+// Minimum spacing between two consecutive `ar_tick`-initiated fetches, in ms.
+// Independent of the internet_fetch per-host spacing (which is in seconds and
+// applies to ALL callers); this is the orchestrator's own throttle so a hot
+// SLT queue cannot flood `if_permit` calls.
+let AR_RATE_LIMIT_MS = 2000
+
+// ---- minimum source weight for autonomous dispatch ------------------------
+// Only signals whose source-weight clears this floor are dequeued by ar_tick.
+// SLT_UNKNOWN_QUERY (weight 600) clears it; SLT_IMAGINATION_GAP (400) +
+// SLT_CURIOSITY (300) do not. User requests come in through a separate
+// chat-REPL path (R40 -- not threaded here).
+let AR_MIN_SRC_WEIGHT = 500
+
+// ---- transport caps -------------------------------------------------------
+let AR_MAX_BYTES = 2097152   // 2MB -- matches IF_MAX_BYTES
+
+// ---- state layout ---------------------------------------------------------
+let AR_TAG               = 0
+let AR_IN_FLIGHT_TARGET  = 1   // current target concept id (0 = idle)
+let AR_IN_FLIGHT_CONCEPT = 2   // current target concept string (for URL derivation)
+let AR_IN_FLIGHT_URL     = 3   // derived URL for the in-flight target
+let AR_IN_FLIGHT_PHASE   = 4   // AR_PHASE_*
+let AR_IN_FLIGHT_BODY    = 5   // fetched body (populated in FETCHING)
+let AR_IN_FLIGHT_CTYPE   = 6   // content-type (populated in FETCHING)
+let AR_IN_FLIGHT_BYTES   = 7   // byte count (populated in FETCHING)
+let AR_RATE_LIMIT_LAST   = 8   // last fetch timestamp (ms)
+let AR_STATS_ATTEMPTS    = 9
+let AR_STATS_SUCCEEDED   = 10
+let AR_STATS_FAILED      = 11
+let AR_STATS_RATE_LIM    = 12
+let AR_STATS_ATOMS       = 13
+let AR_FETCHER           = 14  // optional injected internet_fetch fetcher (0 = build default)
+let AR_OBJ_TAG = 3901
+
+// Initialise an empty orchestrator state. All stats zero, no in-flight target,
+// rate-limit timer in the past so the first tick is never throttled.
+fn ar_init() {
+    let s = list_new()
+    push(s, AR_OBJ_TAG)
+    push(s, 0)                    // in_flight_target
+    push(s, "")                   // in_flight_concept
+    push(s, "")                   // in_flight_url
+    push(s, AR_PHASE_IDLE)        // in_flight_phase
+    push(s, "")                   // in_flight_body
+    push(s, "")                   // in_flight_ctype
+    push(s, 0)                    // in_flight_bytes
+    push(s, 0 - AR_RATE_LIMIT_MS) // rate_limit_last_ms -- in the past
+    push(s, 0)                    // stats_attempts
+    push(s, 0)                    // stats_succeeded
+    push(s, 0)                    // stats_failed
+    push(s, 0)                    // stats_rate_limited
+    push(s, 0)                    // stats_atoms_ingested
+    push(s, 0)                    // fetcher (0 = none injected)
+    return s
+}
+
+// ---- accessors ------------------------------------------------------------
+fn ar_in_flight_target(s) { return s[AR_IN_FLIGHT_TARGET] }
+fn ar_in_flight_phase(s)  { return s[AR_IN_FLIGHT_PHASE] }
+fn ar_in_flight_url(s)    { return s[AR_IN_FLIGHT_URL] }
+fn ar_stats_attempts(s)     { return s[AR_STATS_ATTEMPTS] }
+fn ar_stats_succeeded(s)    { return s[AR_STATS_SUCCEEDED] }
+fn ar_stats_failed(s)       { return s[AR_STATS_FAILED] }
+fn ar_stats_rate_limited(s) { return s[AR_STATS_RATE_LIM] }
+fn ar_stats_atoms(s)        { return s[AR_STATS_ATOMS] }
+fn ar_rate_limit_last(s)    { return s[AR_RATE_LIMIT_LAST] }
+
+// Inject a fetcher (built with `if_fetcher_new(whitelist, authority)`). When
+// no fetcher is injected, `ar_tick` will need one threaded from the caller --
+// the chat-REPL integration (R40) will build one at boot and inject it here.
+fn ar_set_fetcher(s, fetcher) {
+    list_set(s, AR_FETCHER, fetcher)
+    return 1
+}
+
+fn ar_fetcher(s) { return s[AR_FETCHER] }
+
+// ---- URL derivation -------------------------------------------------------
+// Build a Wikipedia article URL for an unknown concept.
+//
+// TEMPORARY: R39B v0.1 only implements plain `http://` transport (TLS
+// deferred -- see TLS_AUDIT.md). To exercise the in-process transport we
+// emit `http://en.wikipedia.org/wiki/<concept>`; production will flip to
+// `https://` once R39B's secure_channel HTTPS path lands. The whitelist
+// gate accepts the same host on either scheme.
+//
+// The concept string is passed through verbatim -- no URL-encoding (NOVA
+// has no urllib equivalent + Wikipedia accepts most ASCII article titles
+// unencoded). A future R39D.2 may add percent-encoding for spaces.
+//
+// Returns an empty string for an empty / zero concept so the caller can
+// short-circuit cleanly.
+fn ar_derive_url(concept_str) {
+    if concept_str == 0 { return "" }
+    if len(concept_str) == 0 { return "" }
+    return "http://en.wikipedia.org/wiki/" + concept_str
+}
+
+// ---- test-only mock seam --------------------------------------------------
+// Pre-populate the in-flight body slot so the FETCHING phase advances without
+// calling `if_dispatch_transport`. Production code must NOT invoke this
+// (no caller does); it exists for `tests/unit/test_autonomous_research.nova`
+// to drive the full pipeline without an HTTP responder.
+fn _ar_test_inject_body(s, body, content_type, byte_count) {
+    list_set(s, AR_IN_FLIGHT_BODY, body)
+    list_set(s, AR_IN_FLIGHT_CTYPE, content_type)
+    list_set(s, AR_IN_FLIGHT_BYTES, byte_count)
+    return 1
+}
+
+// ---- state machine helpers ------------------------------------------------
+fn _ar_reset_in_flight(s) {
+    list_set(s, AR_IN_FLIGHT_TARGET, 0)
+    list_set(s, AR_IN_FLIGHT_CONCEPT, "")
+    list_set(s, AR_IN_FLIGHT_URL, "")
+    list_set(s, AR_IN_FLIGHT_PHASE, AR_PHASE_IDLE)
+    list_set(s, AR_IN_FLIGHT_BODY, "")
+    list_set(s, AR_IN_FLIGHT_CTYPE, "")
+    list_set(s, AR_IN_FLIGHT_BYTES, 0)
+    return 1
+}
+
+fn _ar_bump(s, slot) {
+    list_set(s, slot, s[slot] + 1)
+    return s[slot]
+}
+
+// The concept-string carrier on a learning signal lives in the SL_TARGET
+// slot. R39A's `trigger_new` stores whatever the caller passes (an integer
+// id, a string, or even 0); the autonomous-research path treats SL_TARGET
+// as the article title string when the source is SLT_UNKNOWN_QUERY. For
+// callers that file unknown-query signals with an integer id, we fall back
+// to "" and the FETCHING phase will record a stats_failed for the bad
+// URL (no whitelist match for the empty host).
+fn _ar_concept_of(sig) {
+    let t = slt_target(sig)
+    if t == 0 { return "" }
+    // If the value is non-string, the URL derivation below will produce a
+    // bogus URL that the whitelist rejects (stats_failed bumps cleanly).
+    return t
+}
+
+// ---- the tick -------------------------------------------------------------
+// Drive the orchestrator forward by at most one phase.
+//
+//   slt_queue        -- the arbitration queue (`slt_arbiter_new()` value)
+//   kg               -- the domain KG to ingest into
+//   current_time_ms  -- monotonic millisecond clock (caller-supplied)
+//
+// Returns AR_TICK_OK on real progress, AR_TICK_BUSY when throttled or
+// transport-pending, AR_TICK_IDLE when there is nothing to do.
+//
+// The contract is intentionally non-blocking: a long body never holds a
+// tick more than one phase. The phase ordering (FETCHING -> PREPROCESSING
+// -> INGESTING) means the caller observes intermediate progress on every
+// tick; an integrator that wants total throughput can call ar_tick in a
+// loop until it returns AR_TICK_IDLE.
+fn ar_tick(state, slt_queue, kg, current_time_ms) {
+    // ---- in-flight: continue the current pipeline -------------------------
+    if state[AR_IN_FLIGHT_TARGET] != 0 {
+        let phase = state[AR_IN_FLIGHT_PHASE]
+        if phase == AR_PHASE_FETCHING {
+            // The body should already be in the body slot -- either from a
+            // real transport call (production) or the test injector. If it
+            // is empty AND no fetcher is attached, we treat the fetch as a
+            // failure rather than spin forever waiting for a transport that
+            // will never come.
+            let body = state[AR_IN_FLIGHT_BODY]
+            if len(body) == 0 {
+                if state[AR_FETCHER] == 0 {
+                    _ar_bump(state, AR_STATS_FAILED)
+                    _ar_reset_in_flight(state)
+                    return AR_TICK_OK
+                }
+                // Production transport seam. R39B's `if_dispatch_transport`
+                // returns a [tag, status, body, err] tuple; we accept
+                // IF_TRANSPORT_HTTP_OK with a populated body and surface
+                // every other tag as a failure (the curl-shim fallback for
+                // https-deferred is the chat REPL's responsibility, not the
+                // idle loop's).
+                let tr = if_dispatch_transport(state[AR_IN_FLIGHT_URL], AR_MAX_BYTES)
+                if if_tr_tag(tr) != IF_TRANSPORT_HTTP_OK {
+                    _ar_bump(state, AR_STATS_FAILED)
+                    if_complete(state[AR_FETCHER])
+                    _ar_reset_in_flight(state)
+                    return AR_TICK_OK
+                }
+                list_set(state, AR_IN_FLIGHT_BODY, if_tr_body(tr))
+                list_set(state, AR_IN_FLIGHT_CTYPE, "text/html")
+                list_set(state, AR_IN_FLIGHT_BYTES, len(if_tr_body(tr)))
+                if_complete(state[AR_FETCHER])
+            }
+            list_set(state, AR_IN_FLIGHT_PHASE, AR_PHASE_PREPROCESSING)
+            return AR_TICK_OK
+        }
+        if phase == AR_PHASE_PREPROCESSING {
+            // R39F preprocess (text extraction, sentence segmentation, ...)
+            // has not landed yet. Until it does, this phase is a structural
+            // no-op -- we keep the phase split so the eventual preprocess
+            // wiring is a localised diff. The body bytes pass through to
+            // the INGESTING phase verbatim.
+            list_set(state, AR_IN_FLIGHT_PHASE, AR_PHASE_INGESTING)
+            return AR_TICK_OK
+        }
+        if phase == AR_PHASE_INGESTING {
+            let f = state[AR_FETCHER]
+            // No fetcher means no source-tier weighting -- attribute the
+            // ingest to a default-tier-C atom rather than crashing. Tests
+            // that omit the fetcher and rely on `kg_add_atom` directly land
+            // here; the chat-REPL path always has a fetcher attached.
+            let atom = 0
+            if f == 0 {
+                atom = kg_add_atom(kg, ATOM_FACT, state[AR_IN_FLIGHT_URL], current_time_ms)
+                atom_payload_set(atom, "fetched", state[AR_IN_FLIGHT_BODY])
+                atom_payload_set(atom, "provenance", "fetched")
+            } else {
+                atom = if_ingest(f, kg, state[AR_IN_FLIGHT_URL],
+                                 state[AR_IN_FLIGHT_CTYPE],
+                                 state[AR_IN_FLIGHT_BODY],
+                                 state[AR_IN_FLIGHT_BYTES],
+                                 current_time_ms)
+            }
+            if atom == 0 {
+                _ar_bump(state, AR_STATS_FAILED)
+                _ar_reset_in_flight(state)
+                return AR_TICK_OK
+            }
+            _ar_bump(state, AR_STATS_SUCCEEDED)
+            _ar_bump(state, AR_STATS_ATOMS)
+            _ar_reset_in_flight(state)
+            return AR_TICK_OK
+        }
+        // Unknown phase -- defensive reset so a corrupted state doesn't
+        // permanently wedge the orchestrator.
+        _ar_bump(state, AR_STATS_FAILED)
+        _ar_reset_in_flight(state)
+        return AR_TICK_OK
+    }
+    // ---- no in-flight: pick a new target ---------------------------------
+    let q = slt_queue[ARB_QUEUE]
+    if len(q) == 0 { return AR_TICK_IDLE }
+    // Peek the top signal (slt_select -- non-mutating).
+    let sig = slt_select(slt_queue)
+    if sig == 0 { return AR_TICK_IDLE }
+    // Source-weight gate: only signals whose source weight clears the floor
+    // are eligible for autonomous dispatch. Below-floor signals stay in the
+    // queue for now (a future R39D.2 may evict them on stale-timeout).
+    let src = slt_src_tag(sig)
+    if slt_source_weight(src) < AR_MIN_SRC_WEIGHT { return AR_TICK_IDLE }
+    let concept = _ar_concept_of(sig)
+    // Empty concept short-circuits cleanly so the orchestrator never wedges
+    // on a malformed signal. We DO consume the signal (otherwise it would
+    // re-trigger every tick) but stay idle for the caller.
+    if len(concept) == 0 {
+        _arb_remove(slt_queue, sig)
+        return AR_TICK_IDLE
+    }
+    // Rate limit: throttle the orchestrator's own dispatch rate independent
+    // of the internet_fetch per-host spacing. Two rapid ar_tick calls within
+    // AR_RATE_LIMIT_MS produce one ATTEMPT + one RATE_LIMITED.
+    if current_time_ms - state[AR_RATE_LIMIT_LAST] < AR_RATE_LIMIT_MS {
+        _ar_bump(state, AR_STATS_RATE_LIM)
+        return AR_TICK_BUSY
+    }
+    // Whitelist check: ar_derive_url builds an en.wikipedia.org URL; the
+    // gate at `if_permit` will deny anything off-list. For non-fetcher
+    // tests we replicate the host check inline so we can fail fast on
+    // deny without taking an in-flight slot.
+    let url = ar_derive_url(concept)
+    let f = state[AR_FETCHER]
+    if f != 0 {
+        let gate = if_permit(f, url, current_time_ms / 1000)
+        if gate == FETCH_DENIED_HOST {
+            _ar_bump(state, AR_STATS_FAILED)
+            _arb_remove(slt_queue, sig)
+            return AR_TICK_OK
+        }
+        if gate == FETCH_RATE_LIMITED {
+            _ar_bump(state, AR_STATS_RATE_LIM)
+            return AR_TICK_BUSY
+        }
+        // FETCH_CACHE_HIT short-circuits straight to INGESTING below.
+        if gate == FETCH_CACHE_HIT {
+            list_set(state, AR_IN_FLIGHT_TARGET, slt_target(sig))
+            list_set(state, AR_IN_FLIGHT_CONCEPT, concept)
+            list_set(state, AR_IN_FLIGHT_URL, url)
+            list_set(state, AR_IN_FLIGHT_BODY, if_cache_get(f, url, current_time_ms / 1000))
+            list_set(state, AR_IN_FLIGHT_CTYPE, "text/html")
+            list_set(state, AR_IN_FLIGHT_BYTES, len(if_cache_get(f, url, current_time_ms / 1000)))
+            list_set(state, AR_IN_FLIGHT_PHASE, AR_PHASE_PREPROCESSING)
+            list_set(state, AR_RATE_LIMIT_LAST, current_time_ms)
+            _ar_bump(state, AR_STATS_ATTEMPTS)
+            _arb_remove(slt_queue, sig)
+            return AR_TICK_OK
+        }
+    } else {
+        // No fetcher: do a bare host-whitelist check so test paths that
+        // file off-whitelist concepts still record stats_failed cleanly.
+        let host = sw_host(url)
+        if str_eq(host, "en.wikipedia.org") == 0 {
+            _ar_bump(state, AR_STATS_FAILED)
+            _arb_remove(slt_queue, sig)
+            return AR_TICK_OK
+        }
+    }
+    // Take the signal off the queue and enter FETCHING.
+    list_set(state, AR_IN_FLIGHT_TARGET, slt_target(sig))
+    list_set(state, AR_IN_FLIGHT_CONCEPT, concept)
+    list_set(state, AR_IN_FLIGHT_URL, url)
+    list_set(state, AR_IN_FLIGHT_PHASE, AR_PHASE_FETCHING)
+    list_set(state, AR_RATE_LIMIT_LAST, current_time_ms)
+    _ar_bump(state, AR_STATS_ATTEMPTS)
+    _arb_remove(slt_queue, sig)
+    return AR_TICK_OK
+}

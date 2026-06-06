@@ -6,6 +6,44 @@
 `examples/crossengin_fed_coordinator.nova`, FED\_\* parser branch
 additively added to `src/io/transducers/kg_sync.nova`
 
+## R39D addendum — autonomous-research orchestrator + idle-loop drain
+
+The federated-coordinator's data plane gains a self-initiated source: each
+participant's idle loop now drains the self-learning trigger queue
+(ADR-0026) into the gated internet-fetch pipeline (ADR-0028) without a
+human in the loop. The new orchestrator lives at
+`src/learning/autonomous_research.nova` as a phase state machine
+(FETCHING -> PREPROCESSING -> INGESTING) so the idle loop interleaves
+research with imagination on the same tick budget; no phase blocks for
+I/O long enough to starve cognitive cycles.
+
+For federation specifically: atoms born from this path carry the same
+`provenance=fetched` + `source_tier` payload as explicit `/learn` calls,
+so the kg-sync v2 atom-birth stream is byte-identical regardless of
+whether the source was a user request or an autonomous unknown-query.
+Downstream peers cannot distinguish "the user asked Aspirin" from "the
+substrate noticed Aspirin was unknown and looked it up" by looking at
+the replicated atom -- only by the absence of a corresponding `/learn`
+entry in the originator's decision-log. The aggregator's per-round DP
+noise envelope and the secure-aggregation byte boundaries are
+unaffected; only the local-ingest rate goes up.
+
+The `AR_RATE_LIMIT_MS = 2000` orchestrator-level throttle is independent
+of `IF_DOMAIN_SPACING = 2s` (the per-host gate inside internet_fetch); a
+hot SLT queue cannot flood `if_permit` calls even if a future R39D.2
+adds parallel hosts. The idle loop's `ar_tick` returns `AR_TICK_BUSY`
+when throttled so the integrator skips the rest of the idle steps that
+iteration (kg-sync among them, though kg-sync runs on its own cadence
+under the federation coordinator's tick rather than the chat REPL's).
+
+The chat-REPL integration that threads `ar_state_t` into
+`examples/crossengin_chat.nova` is deferred to R40 (R39A is
+concurrently editing the same REPL). For a federation participant
+running the daemon `examples/crossengin_daemon.nova` directly, R40
+will also add the `/research <topic>` admin command -- letting an
+operator force-queue a topic that the autonomous gap-detection didn't
+surface organically.
+
 ## R39C addendum — chat-state persistence module
 
 A new `src/persistence/chat_state.nova` ships the save / load API for

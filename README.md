@@ -4175,6 +4175,13 @@ The Phase 5 self-directed learning layer (`src/learning/`):
 - **internet_fetch** — whitelist + rate-limit + cache + validation + tiered
   ingestion (ADR-0028); the TLS transport itself is a deferred seam (NOVA
   enhancement #11).
+- **autonomous_research** (R39D) — the idle-loop orchestrator that ties the
+  self-learning trigger queue to the gated internet-fetch pipeline. State
+  machine: FETCHING → PREPROCESSING → INGESTING. Each `ar_tick` advances at
+  most one phase so the idle loop can interleave research with imagination
+  on the same wall-clock window. Wired via `loop_research_step` in
+  `src/agent/loop_imagination_idle.nova`; chat-REPL threading is deferred
+  to R40 (ADR-0026 + ADR-0028 consumer).
 
 The Phase 6 cognitive subsystems (`src/parts/`):
 

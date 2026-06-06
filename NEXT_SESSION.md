@@ -116,6 +116,151 @@ stash was needed because the owned paths were absent before this
 round began; a sibling agent's WIP on
 `src/io/transducers/http_client.nova` was left untouched.
 
+## R39D -- autonomous-research orchestrator + idle-loop drain (ADR-0026 + ADR-0028 wiring)
+
+**Status: complete** -- closes the "agent develops itself" path. The
+substrate's idle loop now dequeues self-learning-trigger signals (R39A files
+`SLT_UNKNOWN_QUERY` on unknown words), derives a Wikipedia URL, runs the
+gated internet-fetch pipeline (whitelist + rate-limit + tiered-evidence
+ingest), and lands the bytes in the domain KG as `provenance=fetched`. The
+pipeline is multi-phase (FETCHING -> PREPROCESSING -> INGESTING) so the
+idle loop can interleave research with imagination on the same wall-clock
+window; no tick blocks for I/O longer than one phase.
+
+### What R39D delivers
+
+* **`src/learning/autonomous_research.nova`** (new) -- the orchestrator
+  state machine:
+  - `ar_init()` -> a zero-stats idle state.
+  - `ar_tick(state, slt_queue, kg, current_time_ms) -> AR_TICK_OK |
+    AR_TICK_BUSY | AR_TICK_IDLE` -- advances at most one phase per call.
+    Dequeues an `SLT_UNKNOWN_QUERY` (or any source whose weight clears
+    `AR_MIN_SRC_WEIGHT = 500`), takes the in-flight slot, then on each
+    subsequent tick advances FETCHING -> PREPROCESSING -> INGESTING ->
+    reset.
+  - `ar_derive_url(concept_str) -> url_str` -- builds
+    `http://en.wikipedia.org/wiki/<concept>`. The `http://` scheme is the
+    R39B v0.1 production path; HTTPS is deferred to R39B.2 (TLS roadmap in
+    TLS_AUDIT.md). The whitelist gate accepts the host on either scheme.
+  - Rate limiting: `AR_RATE_LIMIT_MS = 2000` -- two consecutive `ar_tick`
+    calls within 2s second-call returns `AR_TICK_BUSY` and bumps
+    `stats_rate_limited`. Independent of the internet_fetch per-host
+    spacing (which is in seconds for ALL callers).
+  - Stats: `attempts`, `succeeded`, `failed`, `rate_limited`,
+    `atoms_ingested` -- each bumps independently so a dashboard can show
+    the orchestrator's throughput and failure mode breakdown.
+  - `ar_set_fetcher(state, fetcher)` -- inject a pre-built `if_fetcher_new`
+    so the chat-REPL path can share the global rate-limit budget with
+    explicit `/learn` calls. When no fetcher is injected, the orchestrator
+    falls back to a bare host check + direct `kg_add_atom` (the test
+    path).
+  - `_ar_test_inject_body(state, body, ctype, nbytes)` -- the function-level
+    mock seam unit tests use to drive the FETCHING phase without a real
+    HTTP responder. NOT called by production code.
+
+* **`src/agent/loop_imagination_idle.nova`** (extended) -- one new entry
+  point `loop_research_step(ctx, ar_state, slt_queue, kg, current_time_ms)`.
+  Guards on `ctx_idle == 1` (so a user-active REPL never sees a fetch),
+  then delegates to `ar_tick`. The imagination step is byte-identical to
+  before; this is purely additive.
+
+* **`tests/unit/test_autonomous_research.nova`** (new) -- **58 assertions
+  across 10 tests** covering: init zero-state, empty-queue idle-return,
+  URL derivation (Aspirin / empty / zero), full pipeline 4-tick walk
+  (FETCHING -> PREPROCESSING -> INGESTING -> reset, succeeded + atoms
+  bumped, KG atom count = 1), rate-limit fires + recovers past the 2s
+  window, whitelist-deny / empty-concept short-circuit, counters bump
+  independently, source-weight floor parks curiosity signals (weight 300
+  < AR_MIN_SRC_WEIGHT 500), in-flight ticks don't dequeue a new signal,
+  zero-target defensive short-circuit.
+
+### Mock strategy
+
+Function-level (not syscall-level). The injector
+`_ar_test_inject_body(state, body, content_type, byte_count)` pre-populates
+the in-flight body slot so the FETCHING phase reads the body directly
+from state and advances without calling `if_dispatch_transport`. The
+alternative -- mocking at the syscall layer (`socket`, `recv_data`, ...)
+-- would require either a NOVA test-runtime override (does not exist
+today) or a real HTTP responder in tests (slow + flaky). The
+function-level seam is one line in production code (a zero-check on the
+body slot) and zero overhead at runtime.
+
+### Chat-REPL integration deferred to R40
+
+The brief explicitly DEFERRED the chat-REPL wire. R39A is concurrently
+touching `examples/crossengin_chat.nova` and `src/chat/helpers.nova`;
+landing the `ar_state_t` + tick threading into the same file in a
+parallel agent would cause a merge conflict. R40 will:
+* hold an `ar_state_t` next to the chat REPL's other long-lived state,
+* build a single `if_fetcher_new` shared with explicit `/learn` calls,
+* call `loop_research_step` once per idle iteration AFTER
+  `loop_imagination_step`,
+* honor the `AR_TICK_BUSY` return by skipping the rest of the idle steps,
+* add a `/research <topic>` admin command that synthesizes a
+  `trigger_new(SLT_USER_REQUEST, topic, ...)` and submits it,
+* persist `ar_state.stats_*` through R39C's `chat_state_save` path so
+  the orchestrator's running totals survive restart.
+
+### Honest design caveats
+
+* **URL derivation is hardcoded to en.wikipedia.org.** The orchestrator
+  emits one URL per concept and that URL is always a Wikipedia article
+  title. The motivation: the seed whitelist (`sw_default`) only ships
+  five hosts, and only Wikipedia has a usefully predictable
+  `/wiki/<title>` URL space. A future R39D.2 may add per-source
+  derivation rules (docs.python.org -> `/3/library/<concept>.html`,
+  developer.mozilla.org -> `/en-US/docs/Web/API/<concept>`, etc.) once
+  the orchestrator needs to disambiguate across multiple sources for the
+  same concept.
+
+* **The PREPROCESSING phase is a structural no-op until R39F lands.**
+  We keep the phase split (rather than fusing FETCHING + INGESTING) so
+  R39F's text-preprocess wiring is a localized diff into one branch of
+  `ar_tick`. The body bytes pass through verbatim today; the eventual
+  preprocess will normalize / sentence-segment / strip-tags before the
+  atom is written.
+
+* **No URL-encoding on the concept string.** NOVA has no urllib
+  equivalent; Wikipedia accepts most ASCII article titles unencoded
+  (including underscored multi-word titles). A concept with embedded
+  spaces / non-ASCII / URL-special characters will produce a URL that
+  may 404. A future R39D.2 may add percent-encoding.
+
+* **No URL-encoding on the concept string** also means a malicious
+  signal source could file a concept that embeds a path-traversal or
+  scheme-override fragment. The whitelist gate at `if_permit` is the
+  defense in depth here: anything that doesn't extract back to
+  `en.wikipedia.org` via `sw_host` is denied + counted as `stats_failed`.
+
+* **One in-flight target at a time.** Matches the SLT arbiter contract
+  ("at most one external episode at a time" per ADR-0026). A future
+  R39D.2 could relax this for read-only sources, but the rate-limit
+  envelope makes parallelism only marginally useful.
+
+### Test results
+
+`tests/unit/test_autonomous_research.nova`: **58 checks PASS**.
+`tests/unit/test_loop_imagination_idle.nova`: 2 checks PASS
+(unchanged -- the extension is purely additive).
+`tests/unit/test_self_learning_triggers.nova`: 27 checks PASS
+(unchanged).
+`tests/unit/test_internet_fetch.nova`: 36 checks PASS (unchanged).
+`examples/crossengin_chat.nova` + `examples/crossengin_daemon.nova`:
+both compile cleanly through the new `loop_imagination_idle.nova` ->
+`autonomous_research.nova` import chain.
+
+### Concurrency + stash discipline
+
+R39D ran with the working tree carrying a sibling agent's WIP
+modification to `src/io/transducers/http_client.nova` (R39B's HTTPS
+transport work). That file is OUTSIDE R39D's ownership scope and was
+left untouched. The owned paths (`src/learning/autonomous_research.nova`,
+`src/agent/loop_imagination_idle.nova`,
+`tests/unit/test_autonomous_research.nova`, the three doc files)
+were ALL clean at pre-flight; no `git stash` was needed. No
+`git stash -u` was ever invoked.
+
 ## R39E -- documentation: R39 self-identification + autonomous-learning architecture
 
 **Status: complete** -- documentation-only round describing the R39 sprint
