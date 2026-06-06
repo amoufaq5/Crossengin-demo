@@ -626,6 +626,204 @@ fn _hc_parse_response(buf, total, max_bytes) {
     return out
 }
 
+// ---- chunked transfer-encoding decoder -----------------------------------
+//
+// RFC 7230 sec 4.1 framing:
+//   chunk      = chunk-size [chunk-ext] CRLF chunk-data CRLF
+//   chunk-size = 1*HEXDIG
+//   last-chunk = "0" [chunk-ext] CRLF
+//   trailer    = *( header-field CRLF )
+//   chunked-body = *chunk last-chunk trailer CRLF
+//
+// We do NOT preserve chunk extensions or trailers -- both are rare and
+// CrossEngin's ingest path treats the body as opaque bytes anyway. A
+// malformed chunk-size, missing CRLF after a chunk, or a chunk that runs
+// past the buffer returns ["", HTTP_ERR_CHUNKED]. An over-cap dechunked
+// payload returns ["", HTTP_ERR_TOO_LARGE] so the caller surfaces the
+// same error path as the recv-cap truncation case.
+
+fn _hc_hex_digit(c) {
+    if c >= 48 { if c <= 57 { return c - 48 } }       // 0..9
+    if c >= 97 { if c <= 102 { return c - 97 + 10 } } // a..f
+    if c >= 65 { if c <= 70  { return c - 65 + 10 } } // A..F
+    return -1
+}
+
+// Parse the chunk-size line at `body[from..]`. Returns [size, next_offset]
+// where next_offset points past the CRLF, or [-1, -1] on framing error.
+// Stops chunk-size at first non-hex (CR, LF, ';' for chunk-ext) per RFC.
+fn _hc_chunked_size(body, body_n, from) {
+    let bad = list_new(); push(bad, -1); push(bad, -1)
+    let i = from
+    let size = 0
+    let any = 0
+    while i < body_n {
+        let c = char_at(body, i)
+        let h = _hc_hex_digit(c)
+        if h < 0 {
+            if any == 0 { return bad }
+            // End of chunk-size token. Skip chunk-ext (everything up to CRLF).
+            let line_end = _hc_find_substr(body, "\r\n", i)
+            if line_end < 0 { return bad }
+            let out = list_new(); push(out, size); push(out, line_end + 2)
+            return out
+        }
+        size = size * 16 + h
+        any = any + 1
+        i = i + 1
+    }
+    return bad
+}
+
+// Decode a chunked body. Returns [decoded_string, err]. On success err is "".
+// On a framing error err is HTTP_ERR_CHUNKED; on over-cap err is HTTP_ERR_TOO_LARGE.
+fn _hc_chunked_decode(body, body_n, max_bytes) {
+    let cap_alloc = max_bytes
+    if cap_alloc < 1 { cap_alloc = 1 }
+    let out = alloc(cap_alloc + 1)
+    let out_n = 0
+    let pos = 0
+    let done = 0
+    let err = ""
+    while done == 0 {
+        let sz = _hc_chunked_size(body, body_n, pos)
+        if sz[0] < 0 { done = 1; err = HTTP_ERR_CHUNKED }
+        else {
+            let chunk_size = sz[0]
+            let after_size = sz[1]
+            if chunk_size == 0 {
+                // last-chunk; we ignore any trailer fields.
+                done = 1
+            } else {
+                if after_size + chunk_size > body_n {
+                    done = 1; err = HTTP_ERR_CHUNKED
+                } else {
+                    if out_n + chunk_size > cap_alloc {
+                        done = 1; err = HTTP_ERR_TOO_LARGE
+                    } else {
+                        let j = 0
+                        while j < chunk_size {
+                            store8(out + out_n + j, char_at(body, after_size + j))
+                            j = j + 1
+                        }
+                        out_n = out_n + chunk_size
+                        // Each chunk ends with CRLF.
+                        let trailing = after_size + chunk_size
+                        if trailing + 2 > body_n {
+                            done = 1; err = HTTP_ERR_CHUNKED
+                        } else {
+                            if char_at(body, trailing) != 13 {
+                                done = 1; err = HTTP_ERR_CHUNKED
+                            } else {
+                                if char_at(body, trailing + 1) != 10 {
+                                    done = 1; err = HTTP_ERR_CHUNKED
+                                } else {
+                                    pos = trailing + 2
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    store8(out + out_n, 0)
+    let result = list_new()
+    if len(err) > 0 {
+        push(result, "")
+        push(result, err)
+        return result
+    }
+    push(result, substr(out, 0, out_n))
+    push(result, "")
+    return result
+}
+
+// Honour Content-Length if present and shorter than the recv'd body; trims
+// the body to exactly the declared length. Returns the (possibly shorter)
+// body string. A Content-Length larger than the recv'd body is left alone --
+// callers detect short-read as a transport-layer concern.
+fn _hc_apply_content_length(headers, body) {
+    let cl = http_header_get(headers, "Content-Length")
+    if len(cl) == 0 { return body }
+    if _hc_all_digits(cl) == 0 { return body }
+    let want = str_to_int(cl)
+    if want < 0 { return body }
+    if want >= len(body) { return body }
+    return substr(body, 0, want)
+}
+
+// True if Transfer-Encoding header (case-insensitive) declares "chunked".
+// RFC 7230 sec 3.3.1 allows a comma-separated list ("gzip, chunked"); we
+// look for "chunked" as a token. We don't implement gzip, so a non-chunked
+// transfer-encoding is treated as opaque body bytes (server bug class --
+// the body slot will contain whatever was sent).
+fn _hc_is_chunked(headers) {
+    let te = http_header_get(headers, "Transfer-Encoding")
+    if len(te) == 0 { return 0 }
+    // Tokenise on ',' and look for "chunked" (case-insensitive, trimmed).
+    let i = 0
+    let start = 0
+    let found = 0
+    while i <= len(te) {
+        let at_end = 0
+        if i == len(te) { at_end = 1 }
+        let is_sep = 0
+        if at_end == 0 { if char_at(te, i) == 44 { is_sep = 1 } }
+        if at_end == 1 { is_sep = 1 }
+        if is_sep == 1 {
+            let tok = str_trim(substr(te, start, i - start))
+            if str_eq(_hc_str_lower(tok), "chunked") == 1 { found = 1 }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ---- recv timeout -------------------------------------------------------
+//
+// Set SO_RCVTIMEO on `fd`. NOVA's runtime does not currently expose
+// `setsockopt` as a builtin (only `socket`/`connect_socket`/`send_data`/
+// `recv_data`/`close_fd`/`make_sockaddr_in` are wired -- see
+// nat_traversal.nova). Without it we cannot bound a slow / hostile peer
+// in-process; the kernel's default TCP keepalive (~hours) is the only
+// backstop. This is the honest limitation -- the caller's surrounding
+// rate-limit budget (ADR-0028 <=10s) is the policy ceiling that fires
+// from outside the recv loop. We keep the constant + this seam so that
+// when `sys_setsockopt` lands, the wiring is one builtin away. The
+// function is a no-op today and returns 0 ("not applied"); tests can
+// assert on the gap so it doesn't regress silently.
+fn _hc_set_recv_timeout(fd, ms) {
+    // sys_setsockopt(fd, SOL_SOCKET=1, SO_RCVTIMEO=20, &timeval{sec, usec}, 16)
+    // -- not yet a NOVA builtin. Documented gap; see header comment.
+    return 0
+}
+
+// True if the runtime would honour a recv timeout via setsockopt. Returns 0
+// today (no builtin) so tests can pin the expectation and future work
+// can flip it without changing test assertions on the constant.
+fn http_recv_timeout_active() {
+    return 0
+}
+
+// Multi-value header lookup. Returns a list of every value matching `name`
+// (case-insensitive), preserving on-wire order. Empty list if absent. Used
+// for Set-Cookie / multi-value Cookie style headers where http_header_get's
+// "first match" semantics would drop data.
+fn http_header_get_all(headers, name) {
+    let out = list_new()
+    let i = 0
+    while i < len(headers) {
+        let h = headers[i]
+        if str_eq(_hc_str_lower(h[0]), _hc_str_lower(name)) == 1 {
+            push(out, h[1])
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // The public fetch entry. See file header for contract.
 fn http_get(url, max_bytes) {
     let parts = http_parse_url(url)
@@ -642,6 +840,7 @@ fn http_get(url, max_bytes) {
     if ip_int < 0 { return _http_err(HTTP_ERR_DNS) }
     let sock = socket(2, 1, 0)
     if sock < 0 { return _http_err(HTTP_ERR_SOCKET) }
+    _hc_set_recv_timeout(sock, HTTP_RECV_TIMEOUT_MS)
     let addr = make_sockaddr_in(port, ip_int)
     if connect_socket(sock, addr, 16) < 0 {
         close_fd(sock)
@@ -651,7 +850,7 @@ fn http_get(url, max_bytes) {
     let req = "GET " + path + " HTTP/1.1\r\n"
         + "Host: " + host + "\r\n"
         + "User-Agent: crossengin/0.1\r\n"
-        + "Accept: */*\r\n"
+        + "Accept: text/plain, text/html, application/json\r\n"
         + "Connection: close\r\n"
         + "\r\n"
     if _hc_send_all(sock, req) == 0 {
@@ -675,10 +874,23 @@ fn http_get(url, max_bytes) {
     if status < 0 {
         return _http_err(HTTP_ERR_BAD_STATUS)
     }
+    // Apply Transfer-Encoding: chunked dechunking, then Content-Length trim.
+    // Chunked wins -- RFC 7230 sec 3.3.3 (3): chunked precludes Content-Length.
+    let final_body = body
+    if _hc_is_chunked(headers) == 1 {
+        let dech = _hc_chunked_decode(body, len(body), max_bytes)
+        let dech_err = dech[1]
+        if len(dech_err) > 0 {
+            return _http_result(status, headers, "", dech_err)
+        }
+        final_body = dech[0]
+    } else {
+        final_body = _hc_apply_content_length(headers, body)
+    }
     let err = ""
     if truncated == 1 { err = HTTP_ERR_TOO_LARGE }
-    if len(body) >= max_bytes { err = HTTP_ERR_TOO_LARGE }
-    return _http_result(status, headers, body, err)
+    if len(final_body) >= max_bytes { err = HTTP_ERR_TOO_LARGE }
+    return _http_result(status, headers, final_body, err)
 }
 
 // ---- PSK-secured GET (https-but-not-really) ------------------------------

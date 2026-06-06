@@ -6,6 +6,22 @@
 `examples/crossengin_fed_coordinator.nova`, FED\_\* parser branch
 additively added to `src/io/transducers/kg_sync.nova`
 
+## R39B addendum — HTTP/1.1 transport seam for internet_fetch
+
+The federated coordinator's per-soul ingest stream now has a NOVA-native
+byte transport for plain `http://` source URLs:
+`src/learning/internet_fetch.nova` calls `http_get` in
+`src/io/transducers/http_client.nova` directly, no `curl` shim. The
+whitelist / rate-limit / cache / source-tier-weighting pipeline
+(ADR-0028, ADR-0029) is byte-identical; the `if_fetch` composer wires
+gate -> transport -> ingest in one call and surfaces structured
+`IF_ERR_HTTP_*` tags rather than the http_client's lexical
+`HTTP_ERR_*` strings, so a federation participant's policy code can
+switch on tag without parsing error text. HTTPS remains on the
+`scripts/learn.sh` curl shim until R39B.2 lands a client-mode TLS
+stack (the DTLS in `src/federation/dtls12.nova` is server-shaped).
+Federation telemetry (kg-sync atom-birth replication) was untouched.
+
 ## Why federated learning + DP is the right shape for CrossEngin
 
 Two foundations meet here. **P20 / P1.3 kg-sync v2** lets distinct

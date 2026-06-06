@@ -3,6 +3,151 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R39B -- HTTP/1.1 transport seam for internet_fetch (NOVA enhancement #11 / ADR-0028)
+
+**Status: complete (plain HTTP/1.1 only; HTTPS deferred to R39B.2)**
+
+Closes the ADR-0028 transport gap that previously left
+`src/learning/internet_fetch.nova` with a whitelist gate + ingest sink
+but no byte retrieval between them. R39B ships the HTTP/1.1-over-TCP
+client and the `if_fetch` composer that wires it end-to-end.
+
+### What R39B delivers
+
+* **`src/io/transducers/http_client.nova` (extended)** -- the chunked
+  transfer decoder, multi-value header lookup, recv-timeout seam, and a
+  Transfer-Encoding + Content-Length aware body finalisation pass on top
+  of the prior P1.4 plain-HTTP foundation:
+  * `_hc_hex_digit` + `_hc_chunked_size` + `_hc_chunked_decode` --
+    RFC 7230 sec 4.1 chunk framing decoder (`chunk-size [chunk-ext] CRLF
+    chunk-data CRLF` ... `0 CRLF`). Returns `[decoded, ""]` on success,
+    `["", HTTP_ERR_CHUNKED]` on framing error, `["", HTTP_ERR_TOO_LARGE]`
+    when the dechunked payload exceeds `max_bytes`. Verified on the
+    RFC 7230 sec 4.1.3 canonical example
+    (`4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n`
+    -> `Wikipedia in\r\n\r\nchunks.`).
+  * `_hc_is_chunked(headers)` -- case-insensitive token search across a
+    comma-separated `Transfer-Encoding` value, so `gzip, chunked` is
+    correctly detected.
+  * `_hc_apply_content_length(headers, body)` -- trims to declared
+    `Content-Length` when shorter than the recv'd body; passthrough on
+    absent / non-digit / longer-than-buffer.
+  * `http_header_get_all(headers, name)` -- multi-value lookup for
+    `Set-Cookie` / `Cookie` headers (the prior `http_header_get` returned
+    only the first match).
+  * `_hc_set_recv_timeout(fd, ms)` + `http_recv_timeout_active()` --
+    documented seam. NOVA's runtime does not currently expose
+    `sys_setsockopt`, so `_hc_set_recv_timeout` is a no-op returning 0
+    and `http_recv_timeout_active()` returns 0. When the builtin lands
+    this is a single-line flip. The 10 s budget is enforced today by
+    ADR-0028's policy-layer rate-limit ceiling (outside the recv loop).
+  * `http_get(url, max_bytes)` now applies dechunking + Content-Length
+    trimming in the success path; chunked precludes `Content-Length` per
+    RFC 7230 sec 3.3.3 (3). The `Accept` header is widened to the actual
+    set CrossEngin ingests (`text/plain, text/html, application/json`).
+  * `HTTP_ERR_TIMEOUT` + `HTTP_ERR_CHUNKED` sentinels added to the
+    public surface so the learning layer can route them to typed tags.
+
+* **`src/learning/internet_fetch.nova` (extended, purely additive)** --
+  the new composer + structured error sentinels:
+  * `if_fetch(f, domain_kg, url, now) -> [tag, status, body, byte_count, err]`
+    -- single-call composer wiring `if_permit` -> `http_get` ->
+    `if_complete` -> (optional `if_ingest` or cache write). Five-slot
+    record so callers don't have to unpack two different sub-records.
+    Cache hit short-circuits the whole transport leg. `if_complete`
+    runs in both success and transport-error paths so the in-flight
+    slot doesn't wedge.
+  * `IF_ERR_HTTP_CONNECT = 10` -- socket/connect/send/recv before any
+    data.
+  * `IF_ERR_HTTP_TIMEOUT = 11` -- reserved for the `sys_setsockopt`
+    landing; today recv timeouts surface from the policy layer.
+  * `IF_ERR_HTTP_PARSE   = 12` -- status line, header, or chunked
+    framing fault.
+  * `IF_ERR_HTTP_OVERSIZE = 13` -- recv hit 2MB cap or chunked decode
+    exceeded `max_bytes`. Body slot still holds the up-to-cap prefix.
+  * `IF_ERR_HTTP_DNS     = 14` -- DNS unresolved (no dotted-quad +
+    env cache miss).
+  * `IF_ERR_HTTP_SCHEME  = 15` -- `https://` (R39B.2) or unsupported
+    scheme.
+  * `_if_fetch_http_err_tag(err_msg)` -- string -> tag translator that
+    keeps the `HTTP_ERR_*` lexical surface inside the IO layer and
+    surfaces structured integers to policy code.
+  * `if_fetch_tag` / `if_fetch_status` / `if_fetch_body` /
+    `if_fetch_bytes` / `if_fetch_err` -- pure-sugar accessors on the
+    5-slot record.
+  * The R36F-shipped surface (`if_permit`, `if_complete`, `if_ingest`,
+    `if_dispatch_transport`, the cache helpers) is BYTE-IDENTICAL --
+    callers driving the explicit three-step flow keep working.
+
+### Verification
+
+* **`tests/unit/test_http_client.nova`** -- prior assertions preserved,
+  **42 new assertions** across 13 new test functions:
+  * status line parser for 500 Internal Server Error (in addition to
+    the prior 200 / 301 / 404 / bad cases);
+  * `http_header_get_all` multi-value cookie round-trip including
+    case-insensitive lookup + absent-header empty list;
+  * `_hc_is_chunked` for single token / comma-list / case variants /
+    absent;
+  * chunked decoder round-trip on the RFC 7230 sec 4.1.3 canonical
+    example + simple two-chunk + zero-only + malformed (missing CRLF
+    -> `HTTP_ERR_CHUNKED`) + oversize (chunk > cap -> `HTTP_ERR_TOO_LARGE`);
+  * `_hc_apply_content_length` trim / passthrough / longer-CL / absent /
+    non-digit;
+  * recv timeout documented gap (`HTTP_RECV_TIMEOUT_MS = 10000`,
+    `http_recv_timeout_active() = 0`, `_hc_set_recv_timeout` no-op);
+  * full response parser end-to-end (status + headers + body), no-body
+    204 path, malformed-no-blank-line -> `HTTP_ERR_NO_STATUS`;
+  * `IF_ERR_HTTP_*` sentinels pinned distinct from each other and from
+    `FETCH_*`.
+
+* **`tests/unit/test_internet_fetch.nova`** -- prior assertions preserved,
+  **18 new assertions** across 5 new test functions:
+  * `if_fetch` denies an off-whitelist URL (returns `FETCH_DENIED_HOST`,
+    empty body, zero bytes);
+  * `if_fetch` returns a cache hit short-circuit (seeded body comes back
+    via `FETCH_CACHE_HIT` without going through the transport leg);
+  * `if_fetch` returns `FETCH_RATE_LIMITED` when an in-flight request
+    is outstanding;
+  * 2MB validation boundary (`if_validate(text/html, IF_MAX_BYTES) = 1`
+    vs `if_validate(text/html, IF_MAX_BYTES+1) = 0`);
+  * `IF_ERR_HTTP_*` sentinels pinned distinct from `FETCH_*` (so a
+    caller's switch on the if_fetch tag never collides).
+
+* Total: 60 new assertions across the two suites (target was 25+).
+
+### Known gaps / honest caveats
+
+* **HTTPS deferred to R39B.2.** A client-mode TLS stack is the remaining
+  work; the existing `src/federation/dtls12.nova` is server-shaped (DTLS,
+  not TLS). The `if_dispatch_transport` https branch already returns
+  `IF_TRANSPORT_DEFERRED` so callers route through `scripts/learn.sh`
+  curl shim today.
+* **No `sys_setsockopt` builtin.** The 10 s recv timeout is enforced by
+  the rate-limit budget outside the recv loop, not by `SO_RCVTIMEO`
+  inside it. A slow / hostile peer holding the socket open relies on
+  the kernel TCP keepalive (hours by default). When NOVA adds
+  `sys_setsockopt`, `_hc_set_recv_timeout` is the one-line flip and
+  `http_recv_timeout_active` becomes 1.
+* **No `sys_getaddrinfo` builtin.** Hosts must be dotted-quad in the
+  URL or pre-seeded via `HTTP_DNS_HOST_TO_IP=name:ip,...` in the env.
+  This is the same constraint R28C+R32A flagged for STUN/NAT.
+* **Loopback integration mocked at the parser layer.** The full TCP
+  round-trip lives in `tests/integration/scenario_j_http_client.sh`
+  (Python `http.server` on 127.0.0.1); the unit tests pin parser /
+  decoder / composer correctness without a live socket so they pass
+  in environments without bind permissions.
+
+### Cross-agent boundaries (concurrent R39 sprint)
+
+R39A (chat dispatch), R39C (persistence), R39D (idle loop), R39F
+(preprocess) are operating on disjoint files. R39B touched ONLY:
+`src/io/transducers/http_client.nova`, `src/learning/internet_fetch.nova`,
+`tests/unit/test_http_client.nova`, `tests/unit/test_internet_fetch.nova`,
+plus this section in `NEXT_SESSION.md` / `README.md` / `FEDERATED_AUDIT.md`.
+No chat / agent / parts / cognition / federation / safety module was
+modified.
+
 ## R38D (R36A.alt) -- SCRAM-SHA-256 authentication for TURN (RFC 7635)
 
 **Status: complete** -- closes R36A's exit caveat ("MD5 is
