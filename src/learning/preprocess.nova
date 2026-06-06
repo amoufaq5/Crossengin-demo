@@ -1,0 +1,813 @@
+// CrossEngin learning: text preprocessing pipeline.
+//
+// Purpose
+//   The transform seam between R39B's HTTP fetch and the KG ingest:
+//   raw HTML/plain text in, deduped atoms + structural triples out.
+//   The autonomous research loop (PREPROCESSING phase) calls
+//   `preprocess_run(html, n)` and forwards the result to the KG.
+//
+//   Until now `scripts/learn.sh` did this with sed/awk; this module lifts
+//   the same job into NOVA so the agent owns its preprocessing
+//   deterministically (and we can unit-test it).
+//
+//   Pipeline:
+//     1. HTML strip       remove <script>/<style>, replace block tags with
+//                         newlines, strip remaining tags, decode 6 common
+//                         entities, collapse whitespace.
+//     2. Sentence split   split on . ? ! followed by whitespace + uppercase;
+//                         common abbreviations (Dr., Mr., e.g., i.e.) do not
+//                         end a sentence.
+//     3. Tokenize         whitespace + punctuation boundaries, lowercase,
+//                         skip pure-numeric tokens, skip single-char tokens.
+//     4. Stopword filter  ~100 common English stopwords; swappable via
+//                         preprocess_set_stopwords().
+//     5. Triple extract   pattern-based, high-precision, low-recall.
+//                         At most 2 triples per sentence.
+//     6. Compose          run all stages, dedupe atoms across sentences,
+//                         accumulate triples, update telemetry counters.
+//
+// Honest scope:
+//   - English-only stopwords. Multilingual is a future round.
+//   - HTML strip is naive: no JS-rendered pages, no CDATA, regex-style state
+//     machine. Wikipedia + most blog content works fine; pathological inputs
+//     (deeply nested or malformed markup) may mis-split.
+//   - Triple patterns are anchored, conservative regex-style matches; quality
+//     beats recall here -- garbage triples poison the KG (ADR-0031), so we
+//     prefer to miss than to invent.
+//
+// ADRs implemented: ADR-0028 (transform seam between fetch and ingest),
+//   ADR-0031 (reasoning operators / triples).
+// NOVA dependencies: builtins (substr, char_at, len, str_lower, str_trim,
+//   str_eq, list_new, push, list_set).
+// CrossEngin dependencies: none (pure transform; no imports).
+
+// ---- character class helpers ----------------------------------------------
+
+fn _pp_is_space(c) {
+    if c == 32 { return 1 }    // ' '
+    if c == 9  { return 1 }    // tab
+    if c == 10 { return 1 }    // \n
+    if c == 13 { return 1 }    // \r
+    return 0
+}
+
+fn _pp_is_upper(c) {
+    if c < 65 { return 0 }
+    if c > 90 { return 0 }
+    return 1
+}
+
+fn _pp_is_lower(c) {
+    if c < 97 { return 0 }
+    if c > 122 { return 0 }
+    return 1
+}
+
+fn _pp_is_alpha(c) {
+    if _pp_is_upper(c) == 1 { return 1 }
+    if _pp_is_lower(c) == 1 { return 1 }
+    return 0
+}
+
+fn _pp_is_digit(c) {
+    if c < 48 { return 0 }
+    if c > 57 { return 0 }
+    return 1
+}
+
+fn _pp_is_alnum(c) {
+    if _pp_is_alpha(c) == 1 { return 1 }
+    if _pp_is_digit(c) == 1 { return 1 }
+    return 0
+}
+
+fn _pp_is_sentence_end(c) {
+    if c == 46 { return 1 }    // '.'
+    if c == 63 { return 1 }    // '?'
+    if c == 33 { return 1 }    // '!'
+    return 0
+}
+
+// ---- string utility helpers ------------------------------------------------
+
+fn _pp_starts_with(s, prefix) {
+    let pn = len(prefix)
+    if len(s) < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Case-insensitive starts_with at a given offset; ASCII only (tag matching).
+fn _pp_starts_with_ci_at(s, prefix, from) {
+    let pn = len(prefix)
+    if len(s) < from + pn { return 0 }
+    let i = 0
+    while i < pn {
+        let a = char_at(s, from + i)
+        let b = char_at(prefix, i)
+        if a >= 65 { if a <= 90 { a = a + 32 } }
+        if b >= 65 { if b <= 90 { b = b + 32 } }
+        if a != b { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Find substring `needle` in `hay` starting at `from`, case-insensitive;
+// returns -1 if absent. O(n*m); inputs here are page-sized but tag scans only.
+fn _pp_find_ci(hay, needle, from) {
+    let n = len(needle)
+    if n == 0 { return from }
+    if len(hay) < from + n { return -1 }
+    let limit = len(hay) - n
+    let i = from
+    while i <= limit {
+        if _pp_starts_with_ci_at(hay, needle, i) == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _pp_str_eq_i(a, b) {
+    return str_eq(str_lower(a), str_lower(b))
+}
+
+// Is the substring at `from` one of the block-level opening/closing tags we
+// want to translate into a newline? Returns the tag length (incl. '<' and '>')
+// or 0 if none. Matches: <br>, <p>, <div>, <li>, <h1>..<h6>, with optional
+// '/' prefix and optional attributes. Caller already verified char_at == '<'.
+fn _pp_block_tag_len(s, from) {
+    if char_at(s, from) != 60 { return 0 }    // '<'
+    let p = from + 1
+    if p < len(s) {
+        if char_at(s, p) == 47 { p = p + 1 }   // '/' -- closing tag
+    }
+    if p >= len(s) { return 0 }
+    let name_start = p
+    let scanning = 1
+    while scanning == 1 {
+        if p >= len(s) { scanning = 0 }
+        else {
+            if _pp_is_alnum(char_at(s, p)) == 1 { p = p + 1 }
+            else { scanning = 0 }
+        }
+    }
+    if p == name_start { return 0 }
+    let name = substr(s, name_start, p - name_start)
+    let nlow = str_lower(name)
+    let is_block = 0
+    if str_eq(nlow, "br") == 1 { is_block = 1 }
+    if str_eq(nlow, "p") == 1 { is_block = 1 }
+    if str_eq(nlow, "div") == 1 { is_block = 1 }
+    if str_eq(nlow, "li") == 1 { is_block = 1 }
+    if str_eq(nlow, "h1") == 1 { is_block = 1 }
+    if str_eq(nlow, "h2") == 1 { is_block = 1 }
+    if str_eq(nlow, "h3") == 1 { is_block = 1 }
+    if str_eq(nlow, "h4") == 1 { is_block = 1 }
+    if str_eq(nlow, "h5") == 1 { is_block = 1 }
+    if str_eq(nlow, "h6") == 1 { is_block = 1 }
+    if is_block == 0 { return 0 }
+    // Skip to the closing '>'.
+    while p < len(s) {
+        if char_at(s, p) == 62 { return p - from + 1 }   // '>'
+        p = p + 1
+    }
+    return 0
+}
+
+// ---- HTML strip ------------------------------------------------------------
+
+// Decode the 6 common HTML entities at offset `from`. Returns
+// [decoded_char_code, consumed_length] on a hit, or [0, 0] on miss.
+fn _pp_decode_entity(s, from) {
+    let out = list_new()
+    push(out, 0)
+    push(out, 0)
+    if char_at(s, from) != 38 { return out }   // '&'
+    if _pp_starts_with_ci_at(s, "&amp;", from) == 1 {
+        list_set(out, 0, 38); list_set(out, 1, 5); return out
+    }
+    if _pp_starts_with_ci_at(s, "&lt;", from) == 1 {
+        list_set(out, 0, 60); list_set(out, 1, 4); return out
+    }
+    if _pp_starts_with_ci_at(s, "&gt;", from) == 1 {
+        list_set(out, 0, 62); list_set(out, 1, 4); return out
+    }
+    if _pp_starts_with_ci_at(s, "&quot;", from) == 1 {
+        list_set(out, 0, 34); list_set(out, 1, 6); return out
+    }
+    if _pp_starts_with_ci_at(s, "&nbsp;", from) == 1 {
+        list_set(out, 0, 32); list_set(out, 1, 6); return out
+    }
+    if _pp_starts_with_ci_at(s, "&#39;", from) == 1 {
+        list_set(out, 0, 39); list_set(out, 1, 5); return out
+    }
+    return out
+}
+
+// Strip HTML. Removes <script>...</script> and <style>...</style> as whole
+// blocks, replaces block-level tags with newlines, drops remaining tags,
+// decodes common entities, and collapses runs of whitespace to single spaces.
+// Returns the cleaned text.
+fn preprocess_strip_html(html) {
+    if len(html) == 0 { return "" }
+    let out = ""
+    let i = 0
+    let n = len(html)
+    while i < n {
+        let c = char_at(html, i)
+        if c == 60 {
+            // Whole-block skip for <script> / <style>.
+            if _pp_starts_with_ci_at(html, "<script", i) == 1 {
+                let close = _pp_find_ci(html, "</script>", i)
+                if close < 0 { i = n }
+                else { i = close + 9; out = out + " " }
+            } else {
+                if _pp_starts_with_ci_at(html, "<style", i) == 1 {
+                    let close = _pp_find_ci(html, "</style>", i)
+                    if close < 0 { i = n }
+                    else { i = close + 8; out = out + " " }
+                } else {
+                    // Block-level tag -> newline; others -> space.
+                    let blen = _pp_block_tag_len(html, i)
+                    if blen > 0 {
+                        out = out + "\n"
+                        i = i + blen
+                    } else {
+                        // Generic tag skip: advance past the next '>'.
+                        let j = i + 1
+                        let seeking = 1
+                        while seeking == 1 {
+                            if j >= n { seeking = 0 }
+                            else {
+                                if char_at(html, j) == 62 {
+                                    j = j + 1
+                                    seeking = 0
+                                } else {
+                                    j = j + 1
+                                }
+                            }
+                        }
+                        i = j
+                        out = out + " "
+                    }
+                }
+            }
+        } else {
+            if c == 38 {
+                let dec = _pp_decode_entity(html, i)
+                if dec[1] > 0 {
+                    out = out + chr(dec[0])
+                    i = i + dec[1]
+                } else {
+                    // Unknown entity; pass the '&' through.
+                    out = out + chr(c)
+                    i = i + 1
+                }
+            } else {
+                out = out + chr(c)
+                i = i + 1
+            }
+        }
+    }
+    return _pp_collapse_ws(out)
+}
+
+// Collapse runs of whitespace into single spaces. Leading/trailing trimmed.
+// (Newlines are preserved as ' ' here; sentence split works off . ? ! anyway.)
+fn _pp_collapse_ws(s) {
+    let out = ""
+    let i = 0
+    let n = len(s)
+    let prev_ws = 1   // collapse leading
+    while i < n {
+        let c = char_at(s, i)
+        if _pp_is_space(c) == 1 {
+            prev_ws = 1
+            i = i + 1
+        } else {
+            if prev_ws == 1 {
+                if len(out) > 0 { out = out + " " }
+                prev_ws = 0
+            }
+            out = out + chr(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ---- sentence split --------------------------------------------------------
+
+let _PP_ABBR_DR = "dr."
+let _PP_ABBR_MR = "mr."
+let _PP_ABBR_MS = "ms."
+let _PP_ABBR_MRS = "mrs."
+let _PP_ABBR_EG = "e.g."
+let _PP_ABBR_IE = "i.e."
+let _PP_ABBR_STDOT = "st."
+
+// Check whether the '.' at offset `i` ends an abbreviation (so we should NOT
+// split here). Looks at a small left context.
+fn _pp_is_abbrev_dot(s, i) {
+    if i < 2 { return 0 }
+    // Pull back up to 4 chars to compare.
+    let start = i - 3
+    if start < 0 { start = 0 }
+    let ctx = str_lower(substr(s, start, i - start + 1))
+    if _pp_endswith(ctx, _PP_ABBR_DR) == 1 { return 1 }
+    if _pp_endswith(ctx, _PP_ABBR_MR) == 1 { return 1 }
+    if _pp_endswith(ctx, _PP_ABBR_MS) == 1 { return 1 }
+    if _pp_endswith(ctx, _PP_ABBR_MRS) == 1 { return 1 }
+    if _pp_endswith(ctx, _PP_ABBR_EG) == 1 { return 1 }
+    if _pp_endswith(ctx, _PP_ABBR_IE) == 1 { return 1 }
+    if _pp_endswith(ctx, _PP_ABBR_STDOT) == 1 { return 1 }
+    return 0
+}
+
+fn _pp_endswith(s, suffix) {
+    let sn = len(s)
+    let xn = len(suffix)
+    if sn < xn { return 0 }
+    let off = sn - xn
+    let i = 0
+    while i < xn {
+        if char_at(s, off + i) != char_at(suffix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Trim spaces/tabs/newlines from both ends.
+fn _pp_trim(s) {
+    let n = len(s)
+    let lo = 0
+    let scanning = 1
+    while scanning == 1 {
+        if lo >= n { scanning = 0 }
+        else {
+            if _pp_is_space(char_at(s, lo)) == 1 { lo = lo + 1 }
+            else { scanning = 0 }
+        }
+    }
+    if lo >= n { return "" }
+    let hi = n - 1
+    let scan2 = 1
+    while scan2 == 1 {
+        if hi <= lo { scan2 = 0 }
+        else {
+            if _pp_is_space(char_at(s, hi)) == 1 { hi = hi - 1 }
+            else { scan2 = 0 }
+        }
+    }
+    return substr(s, lo, hi - lo + 1)
+}
+
+// Split text into sentences. Boundaries: . ? ! followed by whitespace+upper
+// (or end of input). Common abbreviations (Dr., e.g., ...) do not split.
+fn preprocess_split_sentences(text) {
+    let out = list_new()
+    let n = len(text)
+    if n == 0 { return out }
+    let start = 0
+    let i = 0
+    while i < n {
+        let c = char_at(text, i)
+        if _pp_is_sentence_end(c) == 1 {
+            let should_split = 0
+            if c == 46 {
+                if _pp_is_abbrev_dot(text, i) == 0 { should_split = 1 }
+            } else { should_split = 1 }
+            if should_split == 1 {
+                // Peek ahead: need whitespace then uppercase OR end-of-input.
+                let j = i + 1
+                let peeking = 1
+                while peeking == 1 {
+                    if j >= n { peeking = 0 }
+                    else {
+                        if _pp_is_space(char_at(text, j)) == 1 { j = j + 1 }
+                        else { peeking = 0 }
+                    }
+                }
+                if j >= n {
+                    // End of input -- close the final sentence.
+                    let piece = _pp_trim(substr(text, start, i - start + 1))
+                    if len(piece) > 0 { push(out, piece) }
+                    start = n
+                    i = n
+                } else {
+                    // j points to first non-space after the punctuation.
+                    if _pp_is_upper(char_at(text, j)) == 1 {
+                        let piece = _pp_trim(substr(text, start, i - start + 1))
+                        if len(piece) > 0 { push(out, piece) }
+                        start = j
+                        i = j
+                    } else {
+                        i = i + 1
+                    }
+                }
+            } else {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    if start < n {
+        let tail = _pp_trim(substr(text, start, n - start))
+        if len(tail) > 0 { push(out, tail) }
+    }
+    return out
+}
+
+// ---- tokenize --------------------------------------------------------------
+
+fn _pp_is_pure_numeric(tok) {
+    if len(tok) == 0 { return 0 }
+    let i = 0
+    while i < len(tok) {
+        if _pp_is_digit(char_at(tok, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Tokenize a sentence: split on whitespace + punctuation, lowercase,
+// drop pure-numeric tokens, drop single-char tokens.
+fn preprocess_tokenize(sentence) {
+    let out = list_new()
+    let n = len(sentence)
+    if n == 0 { return out }
+    let s = str_lower(sentence)
+    let start = -1
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _pp_is_alnum(c) == 1 {
+            if start < 0 { start = i }
+            i = i + 1
+        } else {
+            if start >= 0 {
+                let tok = substr(s, start, i - start)
+                if len(tok) >= 2 {
+                    if _pp_is_pure_numeric(tok) == 0 { push(out, tok) }
+                }
+                start = -1
+            }
+            i = i + 1
+        }
+    }
+    if start >= 0 {
+        let tok = substr(s, start, n - start)
+        if len(tok) >= 2 {
+            if _pp_is_pure_numeric(tok) == 0 { push(out, tok) }
+        }
+    }
+    return out
+}
+
+// ---- stopwords -------------------------------------------------------------
+
+let _pp_stopwords = 0   // lazy-initialized list
+
+fn _pp_default_stopwords() {
+    let sw = list_new()
+    // articles + conjunctions
+    push(sw, "a"); push(sw, "an"); push(sw, "the"); push(sw, "and"); push(sw, "or")
+    push(sw, "but"); push(sw, "if"); push(sw, "then"); push(sw, "so"); push(sw, "as")
+    // prepositions
+    push(sw, "of"); push(sw, "in"); push(sw, "on"); push(sw, "at"); push(sw, "to")
+    push(sw, "for"); push(sw, "with"); push(sw, "by"); push(sw, "from"); push(sw, "into")
+    push(sw, "onto"); push(sw, "about"); push(sw, "over"); push(sw, "under"); push(sw, "between")
+    push(sw, "through"); push(sw, "during"); push(sw, "before"); push(sw, "after"); push(sw, "above")
+    push(sw, "below"); push(sw, "up"); push(sw, "down"); push(sw, "out"); push(sw, "off")
+    // be verbs
+    push(sw, "is"); push(sw, "are"); push(sw, "was"); push(sw, "were"); push(sw, "be")
+    push(sw, "been"); push(sw, "being"); push(sw, "am")
+    // have/do
+    push(sw, "have"); push(sw, "has"); push(sw, "had"); push(sw, "do"); push(sw, "does")
+    push(sw, "did"); push(sw, "doing"); push(sw, "done")
+    // modals
+    push(sw, "will"); push(sw, "would"); push(sw, "could"); push(sw, "should")
+    push(sw, "may"); push(sw, "might"); push(sw, "can"); push(sw, "must"); push(sw, "shall")
+    // determiners
+    push(sw, "this"); push(sw, "that"); push(sw, "these"); push(sw, "those")
+    push(sw, "some"); push(sw, "any"); push(sw, "all"); push(sw, "no"); push(sw, "not")
+    push(sw, "such"); push(sw, "each"); push(sw, "every"); push(sw, "both")
+    // pronouns
+    push(sw, "i"); push(sw, "you"); push(sw, "he"); push(sw, "she"); push(sw, "it")
+    push(sw, "we"); push(sw, "they"); push(sw, "them"); push(sw, "us")
+    push(sw, "my"); push(sw, "your"); push(sw, "his"); push(sw, "her"); push(sw, "its")
+    push(sw, "our"); push(sw, "their"); push(sw, "me"); push(sw, "him")
+    push(sw, "mine"); push(sw, "yours"); push(sw, "hers"); push(sw, "ours"); push(sw, "theirs")
+    // wh-words
+    push(sw, "who"); push(sw, "what"); push(sw, "where"); push(sw, "when")
+    push(sw, "why"); push(sw, "how"); push(sw, "which"); push(sw, "whom")
+    // misc fillers (~14 more, brings total close to 100)
+    push(sw, "very"); push(sw, "just"); push(sw, "than"); push(sw, "too")
+    push(sw, "also"); push(sw, "only"); push(sw, "more"); push(sw, "most")
+    push(sw, "other"); push(sw, "same"); push(sw, "than"); push(sw, "yet")
+    push(sw, "while"); push(sw, "since")
+    return sw
+}
+
+fn _pp_ensure_stopwords() {
+    if _pp_stopwords == 0 {
+        _pp_stopwords = _pp_default_stopwords()
+    }
+    return _pp_stopwords
+}
+
+// Swap the stopword list (e.g. for medical-domain mode or unit tests).
+fn preprocess_set_stopwords(sw_list) {
+    _pp_stopwords = sw_list
+    return 1
+}
+
+// True if `tok` is in the active stopword list.
+fn preprocess_is_stopword(tok) {
+    let sw = _pp_ensure_stopwords()
+    let lo = str_lower(tok)
+    let i = 0
+    while i < len(sw) {
+        if str_eq(sw[i], lo) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Filter a token list, dropping stopwords.
+fn preprocess_filter_stopwords(toks) {
+    let out = list_new()
+    let i = 0
+    while i < len(toks) {
+        if preprocess_is_stopword(toks[i]) == 0 {
+            push(out, toks[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- triple extraction -----------------------------------------------------
+//
+// Patterns are anchored on a small relation vocabulary. The subject is the
+// alphabetic token before the relation; the object is the alphabetic token
+// after (with optional articles 'a'/'an'/'the' skipped). At most 2 triples
+// per sentence. Each triple is [subject, relation, object].
+//
+// Recognized:
+//   "X is a Y"            -> (X, is_a, Y)
+//   "X is an Y"           -> (X, is_a, Y)
+//   "X is the Y"          -> (X, is_a, Y)
+//   "X has Y" / "X have Y" -> (X, has_property, Y)
+//   "X causes Y" / "caused" / "cause" -> (X, causes, Y)
+//   "X is part of Y"      -> (X, part_of, Y)
+//   "X means Y"           -> (X, defined_as, Y)
+//   "X defined as Y"      -> (X, defined_as, Y)
+
+fn _pp_is_article(tok) {
+    if str_eq(tok, "a") == 1 { return 1 }
+    if str_eq(tok, "an") == 1 { return 1 }
+    if str_eq(tok, "the") == 1 { return 1 }
+    return 0
+}
+
+// Tokenize a sentence into a raw word list (no stopword filtering, single-char
+// allowed) so we can pattern-match on relation keywords like "is" / "has".
+fn _pp_words_for_triples(sentence) {
+    let out = list_new()
+    let n = len(sentence)
+    if n == 0 { return out }
+    let s = str_lower(sentence)
+    let start = -1
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _pp_is_alpha(c) == 1 {
+            if start < 0 { start = i }
+            i = i + 1
+        } else {
+            if start >= 0 {
+                push(out, substr(s, start, i - start))
+                start = -1
+            }
+            i = i + 1
+        }
+    }
+    if start >= 0 { push(out, substr(s, start, n - start)) }
+    return out
+}
+
+fn _pp_mktriple(s, r, o) {
+    let t = list_new()
+    push(t, s); push(t, r); push(t, o)
+    return t
+}
+
+// True if subj/obj are reasonable atoms: alphabetic, 2..32 chars, not the
+// same word, and the object isn't an article (defensive).
+fn _pp_ok_triple_arg(w) {
+    if len(w) < 2 { return 0 }
+    if len(w) > 32 { return 0 }
+    if _pp_is_article(w) == 1 { return 0 }
+    return 1
+}
+
+// Helper: read the object word following a relation keyword, skipping at most
+// one article (a/an/the). Returns the object string, or "" if none usable.
+fn _pp_pick_obj(w, n, after) {
+    if after >= n { return "" }
+    let cand = w[after]
+    if _pp_is_article(cand) == 1 {
+        if after + 1 >= n { return "" }
+        return w[after + 1]
+    }
+    return cand
+}
+
+fn _pp_push_triple(out, s, r, o) {
+    if _pp_ok_triple_arg(s) == 0 { return 0 }
+    if _pp_ok_triple_arg(o) == 0 { return 0 }
+    if str_eq(s, o) == 1 { return 0 }
+    push(out, _pp_mktriple(s, r, o))
+    return 1
+}
+
+fn preprocess_extract_triples(sentence) {
+    let out = list_new()
+    let w = _pp_words_for_triples(sentence)
+    let n = len(w)
+    if n < 3 { return out }
+    let i = 1
+    while i < n {
+        if len(out) >= 2 { i = n }
+        else {
+            let cur = w[i]
+            let prev = w[i - 1]
+            let advanced = 0
+            // "X is part of Y" -> (X, part_of, Y) -- check first so we don't
+            // also emit "X is_a part" for the same span.
+            if str_eq(cur, "is") == 1 {
+                if i + 3 < n {
+                    if str_eq(w[i + 1], "part") == 1 {
+                        if str_eq(w[i + 2], "of") == 1 {
+                            let obj = _pp_pick_obj(w, n, i + 3)
+                            if len(obj) > 0 {
+                                if _pp_push_triple(out, prev, "part_of", obj) == 1 {
+                                    i = i + 4   // jump past "part of Y"
+                                    advanced = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // "X is defined as Y" -> (X, defined_as, Y)
+            if advanced == 0 {
+                if str_eq(cur, "is") == 1 {
+                    if i + 3 < n {
+                        if str_eq(w[i + 1], "defined") == 1 {
+                            if str_eq(w[i + 2], "as") == 1 {
+                                let obj = _pp_pick_obj(w, n, i + 3)
+                                if len(obj) > 0 {
+                                    if _pp_push_triple(out, prev, "defined_as", obj) == 1 {
+                                        i = i + 4
+                                        advanced = 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // "X is a/an/the Y" -> (X, is_a, Y) and bare "X is Y"
+            if advanced == 0 {
+                if str_eq(cur, "is") == 1 {
+                    let obj = _pp_pick_obj(w, n, i + 1)
+                    if len(obj) > 0 {
+                        // Guard: don't fire on "is part" or "is defined"
+                        if str_eq(obj, "part") == 0 {
+                            if str_eq(obj, "defined") == 0 {
+                                _pp_push_triple(out, prev, "is_a", obj)
+                            }
+                        }
+                    }
+                }
+            }
+            // "X has/have/had Y" -> (X, has_property, Y)
+            if advanced == 0 {
+                let is_has = 0
+                if str_eq(cur, "has") == 1 { is_has = 1 }
+                if str_eq(cur, "have") == 1 { is_has = 1 }
+                if str_eq(cur, "had") == 1 { is_has = 1 }
+                if is_has == 1 {
+                    let obj = _pp_pick_obj(w, n, i + 1)
+                    if len(obj) > 0 {
+                        _pp_push_triple(out, prev, "has_property", obj)
+                    }
+                }
+            }
+            // "X causes/cause/caused Y" -> (X, causes, Y)
+            if advanced == 0 {
+                let is_cause = 0
+                if str_eq(cur, "causes") == 1 { is_cause = 1 }
+                if str_eq(cur, "cause") == 1 { is_cause = 1 }
+                if str_eq(cur, "caused") == 1 { is_cause = 1 }
+                if is_cause == 1 {
+                    let obj = _pp_pick_obj(w, n, i + 1)
+                    if len(obj) > 0 {
+                        _pp_push_triple(out, prev, "causes", obj)
+                    }
+                }
+            }
+            // "X means Y" -> (X, defined_as, Y)
+            if advanced == 0 {
+                if str_eq(cur, "means") == 1 {
+                    let obj = _pp_pick_obj(w, n, i + 1)
+                    if len(obj) > 0 {
+                        _pp_push_triple(out, prev, "defined_as", obj)
+                    }
+                }
+            }
+            if advanced == 0 { i = i + 1 }
+        }
+    }
+    return out
+}
+
+// ---- end-to-end pipeline + telemetry ---------------------------------------
+
+let _pp_stat_sentences = 0
+let _pp_stat_tokens    = 0
+let _pp_stat_triples   = 0
+let _pp_stat_html_bytes = 0
+
+fn preprocess_stats() {
+    let s = list_new()
+    push(s, _pp_stat_sentences)
+    push(s, _pp_stat_tokens)
+    push(s, _pp_stat_triples)
+    push(s, _pp_stat_html_bytes)
+    return s
+}
+
+fn preprocess_stats_reset() {
+    _pp_stat_sentences = 0
+    _pp_stat_tokens = 0
+    _pp_stat_triples = 0
+    _pp_stat_html_bytes = 0
+    return 1
+}
+
+fn _pp_contains(seen, tok) {
+    let i = 0
+    while i < len(seen) {
+        if str_eq(seen[i], tok) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Compose the full pipeline: html -> [atoms, triples].
+//   atoms   list of unique non-stopword tokens
+//   triples list of [subject, relation, object]
+// Telemetry counters are updated; call preprocess_stats() to read them.
+fn preprocess_run(html) {
+    _pp_stat_html_bytes = _pp_stat_html_bytes + len(html)
+    let text = preprocess_strip_html(html)
+    let sentences = preprocess_split_sentences(text)
+    let atoms = list_new()
+    let triples = list_new()
+    let si = 0
+    while si < len(sentences) {
+        let sent = sentences[si]
+        _pp_stat_sentences = _pp_stat_sentences + 1
+        let toks = preprocess_tokenize(sent)
+        let kept = preprocess_filter_stopwords(toks)
+        let ti = 0
+        while ti < len(kept) {
+            _pp_stat_tokens = _pp_stat_tokens + 1
+            if _pp_contains(atoms, kept[ti]) == 0 {
+                push(atoms, kept[ti])
+            }
+            ti = ti + 1
+        }
+        let trip = preprocess_extract_triples(sent)
+        let pi = 0
+        while pi < len(trip) {
+            _pp_stat_triples = _pp_stat_triples + 1
+            push(triples, trip[pi])
+            pi = pi + 1
+        }
+        si = si + 1
+    }
+    let out = list_new()
+    push(out, atoms)
+    push(out, triples)
+    return out
+}
