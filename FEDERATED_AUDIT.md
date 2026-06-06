@@ -6,6 +6,31 @@
 `examples/crossengin_fed_coordinator.nova`, FED\_\* parser branch
 additively added to `src/io/transducers/kg_sync.nova`
 
+## R39C addendum — chat-state persistence module
+
+A new `src/persistence/chat_state.nova` ships the save / load API for
+chat-session state -- soul + multi-KG state + decision-log tail -- as a
+single text-formatted file at `$HOME/.crossengin/chat_state.dat`
+(`CE_PERSIST_PATH` overrides). This is the federation-relevant surface
+for a per-participant chat REPL that re-joins a coordinator after a
+restart: the soul (identity tier + OCEAN + values), the participant's
+locally-grown KG atoms, and the audit-grade decision-log tail are all
+restored before the next learning round's aggregator step runs.
+
+The format is `VERSION 1` line-oriented; unknown record types within
+the known version are SKIPPED so a future R39C.2 (e.g. adding
+`GOAL_ENTRY`) won't break older participants reading newer files.
+Schema bumps (VERSION 2 / 3 / ...) return `PERSIST_ERR_VERSION` and
+are the new round's responsibility to migrate.
+
+Chat-REPL integration (call save on `/quit`, call load on boot) is
+intentionally deferred to R40 -- this round ships the API only because
+R39A is concurrently editing `examples/crossengin_chat.nova`.
+
+The federated-aggregator interaction stays unchanged: the local KG +
+decision-log are what a participant brings to the next round; the
+persistence layer just makes them survive a restart.
+
 ## R39B addendum — HTTP/1.1 transport seam for internet_fetch
 
 The federated coordinator's per-soul ingest stream now has a NOVA-native
@@ -21,6 +46,28 @@ switch on tag without parsing error text. HTTPS remains on the
 `scripts/learn.sh` curl shim until R39B.2 lands a client-mode TLS
 stack (the DTLS in `src/federation/dtls12.nova` is server-shaped).
 Federation telemetry (kg-sync atom-birth replication) was untouched.
+
+## R39F addendum — text preprocessing pipeline (ADR-0028 transform seam)
+
+The transform between R39B's byte transport and the KG ingest now lives
+in `src/learning/preprocess.nova` as a real NOVA module rather than the
+sed/awk inside `scripts/learn.sh`. Six stages: HTML strip (removes
+`<script>`/`<style>` blocks, converts block tags to newlines, decodes
+six entities, collapses whitespace), sentence split (anchored on `. ? !`
+followed by whitespace + uppercase, with abbreviation guards on `Dr.`,
+`Mr.`, `Ms.`, `Mrs.`, `St.`, `e.g.`, `i.e.`), tokenize (whitespace +
+punctuation boundaries, lowercase, drop pure-numeric, drop single-char),
+stopword filter (~110 common English; swappable via
+`preprocess_set_stopwords`), triple extract (six anchored patterns:
+`is_a`, `has_property`, `causes`, `part_of`, `defined_as`, plus the
+`is defined as` form; cap of 2 per sentence; quality over recall), and
+the `preprocess_run(html) -> [atoms, triples]` composer with telemetry
+counters. The federation data plane is unaffected -- triples emitted
+by the preprocess stage are local-only until a soul chooses to teach
+them; participating peers see the resulting atom-births via the kg-sync
+v2 stream, which is byte-identical to before. Honest scope: English-only
+stopword list, naive HTML strip (no CDATA, no JS-rendered DOM),
+high-precision low-recall triple patterns by design.
 
 ## Why federated learning + DP is the right shape for CrossEngin
 

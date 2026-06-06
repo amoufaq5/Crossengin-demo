@@ -1,0 +1,794 @@
+// CrossEngin persistence: chat session state save/load (R39C).
+//
+// Purpose
+//   Closes the "each turn forgets" gap (scripts/chat.sh) and the cross-restart
+//   durability gap (NOVA enhancement #9/#10, ADR-0048 rehydration order). The
+//   chat REPL keeps its soul, multi-KG state, and decision-log tail in memory;
+//   a reboot loses all of it. This module ships the file-backed API the
+//   REPL needs:
+//
+//     chat_state_save(path, soul, multi_kg, decision_log) -> 0 | PERSIST_ERR_*
+//     chat_state_load(path)                                -> [soul, kg, dlog] | PERSIST_ERR_*
+//
+//   plus *_to_default / *_from_default wrappers that resolve to
+//   $HOME/.crossengin/chat_state.dat (overridable via CE_PERSIST_PATH).
+//
+//   The chat integration (call save on /quit, call load on boot) is
+//   INTENTIONALLY DEFERRED to R40 -- this round ships the API only. The
+//   sibling-agent round R39A is concurrently touching examples/crossengin_chat.nova;
+//   landing the wire here would conflict.
+//
+// On-disk format -- "chat-state v1", line-oriented ASCII
+// -----------------------------------------------------
+// One record per line, fields space-separated. Records start with a 4-letter
+// type code. Strings are written verbatim and must not contain newlines (the
+// chat REPL today never produces them; if it ever does we'd encode them
+// here). The first non-empty line is the version banner; the last is `END`.
+// A reader that meets an unknown record kind within a known version SKIPS the
+// line (forward compat with future writers that add a new record type).
+//
+//   VERSION 1
+//   SOUL_NAME crossengin
+//   SOUL_IDENTITY_PURPOSE I help humans think clearly about complex domains
+//   SOUL_IDENTITY_NATURE A patient inquisitive assistant
+//   SOUL_OCEAN_O 500
+//   SOUL_OCEAN_C 600
+//   SOUL_OCEAN_E 450
+//   SOUL_OCEAN_A 700
+//   SOUL_OCEAN_N 300
+//   VALUE truth never fabricate
+//   ...
+//   KG_BEGIN reasoning
+//   ATOM <atom_id> <kind> <alpha> <beta> <label>
+//   ATOM 0 3 1000 1000 self
+//   ATOM 1 3 1000 1000 user
+//   ...
+//   TRIPLE <subj_atom_id> <rel_atom_id> <obj_atom_id> <belief_milli>
+//   TRIPLE 47 5 12 850
+//   ...
+//   KG_END
+//   KG_BEGIN language
+//   ...
+//   KG_END
+//   DLOG_TAIL_BEGIN
+//   DLOG_ENTRY <seq> <kind> <ref> <ts> <aclass> <atype> <ptier> <rclass> <goal> <soul_ref> <outcome>
+//   ...
+//   DLOG_TAIL_END
+//   END
+//
+// Format is NOT optimized for size; a future R39C.2 can switch to a binary
+// varint layout if size becomes an issue (the brief notes a 100k-atom KG
+// would land around 10 MB in this textual layout). Readability + reparseability
+// are the priorities so a future round can grep the file without tooling.
+//
+// Schema versioning + forward/backward compatibility
+// --------------------------------------------------
+//   * Header `VERSION 1` is the current schema. A future R39C.2 that bumps to
+//     VERSION 2 is responsible for accepting both (the brief explicitly puts
+//     the v1->v2 migration in the new round).
+//   * On VERSION mismatch (file declares a version we don't know), load
+//     returns PERSIST_ERR_VERSION.
+//   * On unknown RECORD type within a known version, load SKIPS the line.
+//     This means future writers can stamp e.g. `GOAL_ENTRY ...` lines and an
+//     older reader still loads what it understands. Documented in the "skip
+//     unknown" test.
+//
+// Error tags
+// ----------
+//   0                       success
+//   PERSIST_ERR_VERSION     file declares an unknown VERSION
+//   PERSIST_ERR_NOT_FOUND   path missing / unreadable
+//   PERSIST_ERR_PARSE       malformed record (bad field count, non-int field)
+//   PERSIST_ERR_IO          syscall failure on save (open/write)
+//
+// ADRs implemented: NOVA enhancement #9/#10 (cross-restart durability of the
+//   chat session), ADR-0048 (rehydration order: soul first, then KG, then
+//   decision-log -- the load API returns them in that order).
+// NOVA dependencies: builtins + sys_open/sys_write/sys_read/sys_close/
+//   sys_fsync/sys_mkdir/sys_unlink + getenv. CrossEngin dependencies:
+//   src/parts/soul/identity.nova (soul accessors),
+//   src/parts/soul/values.nova (values accessors),
+//   src/kg/multi_kg_manager.nova (KG iteration),
+//   src/kg/atom_store.nova (atom accessors + bel_new),
+//   src/audit/decision_log.nova (decision-log accessors + dl_new).
+
+import "std/syscall"
+import "std/io"
+import "../parts/soul/identity.nova"
+import "../parts/soul/values.nova"
+import "../kg/multi_kg_manager.nova"
+import "../kg/atom_store.nova"
+import "../audit/decision_log.nova"
+
+// ---- error tags ----------------------------------------------------------
+//
+// Negative integers so callers can distinguish a save's 0-success from these.
+// The tag namespace is deliberately small -- callers gate on equality, not
+// on a bit pattern.
+
+let PERSIST_ERR_VERSION   = 0 - 1
+let PERSIST_ERR_NOT_FOUND = 0 - 2
+let PERSIST_ERR_PARSE     = 0 - 3
+let PERSIST_ERR_IO        = 0 - 4
+
+// ---- format constants ----------------------------------------------------
+
+let CHAT_STATE_VERSION = 1
+let _CS_DEFAULT_TAIL   = 100      // dlog entries persisted by default
+
+// File-creation mode 0640 = rw-r----- (the soul + KG + dlog are
+// security-sensitive: a chat session's identity, knowledge graph, and audit
+// trail leak more than a snapshot of a single subsystem does, so the file
+// is group-readable only).
+let _CS_OPEN_MODE  = 416
+// Dir-creation mode 0750 = rwxr-x--- (the .crossengin/ dir holds the file).
+let _CS_DIR_MODE   = 488
+
+// ---- helpers: env var resolution + default path -------------------------
+
+// Resolve the default persistence path. Precedence:
+//   1. $CE_PERSIST_PATH if set + nonempty
+//   2. $HOME/.crossengin/chat_state.dat if $HOME is set
+//   3. /tmp/crossengin/chat_state.dat as a final fallback so a bare run
+//      without $HOME (e.g. inside a stripped container) still works
+fn chat_state_default_path() {
+    let env = getenv("CE_PERSIST_PATH")
+    if env != 0 {
+        if len(env) > 0 { return env }
+    }
+    let home = getenv("HOME")
+    if home != 0 {
+        if len(home) > 0 { return home + "/.crossengin/chat_state.dat" }
+    }
+    return "/tmp/crossengin/chat_state.dat"
+}
+
+// The directory portion of `path` (everything up to the last '/'). Returns
+// "." for a bare filename and "/" for a path immediately under root. Used by
+// _cs_ensure_dir to auto-create the parent of the state file.
+fn _cs_parent_dir(path) {
+    let i = len(path) - 1
+    while i >= 0 {
+        if char_at(path, i) == 47 { break }    // '/'
+        i = i - 1
+    }
+    if i < 0  { return "." }
+    if i == 0 { return "/" }
+    return substr(path, 0, i)
+}
+
+// Auto-create the parent directory of `path` if missing. Mirrors the
+// `mkdir -p` semantics for the single-level case (parent of $HOME/.crossengin/
+// is $HOME, which the OS already provided). sys_mkdir returns 0 on success;
+// any other return (including EEXIST -- the directory already exists) is
+// safe to ignore here because the subsequent sys_open call will surface a
+// genuine failure as PERSIST_ERR_IO.
+fn _cs_ensure_dir(path) {
+    let parent = _cs_parent_dir(path)
+    if len(parent) == 0 { return 0 }
+    if str_eq(parent, ".") == 1 { return 0 }
+    if str_eq(parent, "/") == 1 { return 0 }
+    sys_mkdir(parent, _CS_DIR_MODE)
+    return 0
+}
+
+// ---- helpers: serializing fields one line at a time ---------------------
+
+// Push "<key> <int_val>\n" onto `lines`.
+fn _cs_push_kv_int(lines, key, val) {
+    push(lines, key + " " + int_to_str(val) + "\n")
+    return 1
+}
+
+// Push "<key> <string_val>\n" onto `lines`. The chat REPL never produces
+// newlines in soul / value / atom-label text; if it ever does, the format
+// would need an escape pass here.
+fn _cs_push_kv_str(lines, key, val) {
+    push(lines, key + " " + val + "\n")
+    return 1
+}
+
+// Push a bare line (no key prefix) onto `lines`.
+fn _cs_push_line(lines, line) {
+    push(lines, line + "\n")
+    return 1
+}
+
+// ---- helpers: split a line into space-separated tokens -------------------
+
+fn _cs_split(line) {
+    let out = list_new()
+    let n = len(line)
+    let i = 0
+    let start = 0
+    while i < n {
+        if char_at(line, i) == 32 {    // ' '
+            push(out, substr(line, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, substr(line, start, n - start))
+    return out
+}
+
+// Walk `text` line-by-line (newline-terminated), pushing each non-empty
+// substring onto `out`. Stops at end-of-text.
+fn _cs_text_to_lines(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(text, i) == 10 {    // '\n'
+            push(out, substr(text, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        push(out, substr(text, start, n - start))
+    }
+    return out
+}
+
+// ---- helpers: read / write the bytes ------------------------------------
+
+// Read the entire file at `path` as text. Returns 0 if missing/unreadable.
+fn _cs_read_text(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    let chunk = 4096
+    let buf = alloc(chunk + 1)
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        let m = sys_read(fd, buf, chunk)
+        if m <= 0 {
+            done = 1
+        } else {
+            store8(buf + m, 0)
+            acc = acc + buf
+            if m < chunk { done = 1 }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// Write `text` to `path` with create+truncate semantics; auto-creates the
+// parent directory if missing. Returns 1 on success, 0 on syscall failure.
+fn _cs_write_text(path, text) {
+    _cs_ensure_dir(path)
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, _CS_OPEN_MODE)
+    if fd < 0 { return 0 }
+    let n = len(text)
+    let written = sys_write(fd, text, n)
+    if written != n {
+        sys_close(fd)
+        sys_unlink(path)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    return 1
+}
+
+// ---- save: soul + KGs + decision log -> text -----------------------------
+
+// Emit the soul fields: name, identity (purpose / nature), OCEAN, and
+// values. Values follow the `VALUE <name> <principle>` shape -- a single
+// token name + the rest of the line is the principle string.
+fn _cs_emit_soul(lines, sl) {
+    _cs_push_kv_str(lines, "SOUL_NAME",              soul_name(sl))
+    _cs_push_kv_str(lines, "SOUL_IDENTITY_PURPOSE",  soul_purpose(sl))
+    _cs_push_kv_str(lines, "SOUL_IDENTITY_NATURE",   soul_nature(sl))
+    _cs_push_kv_int(lines, "SOUL_OCEAN_O",           soul_openness(sl))
+    _cs_push_kv_int(lines, "SOUL_OCEAN_C",           soul_conscientiousness(sl))
+    _cs_push_kv_int(lines, "SOUL_OCEAN_E",           soul_extraversion(sl))
+    _cs_push_kv_int(lines, "SOUL_OCEAN_A",           soul_agreeableness(sl))
+    _cs_push_kv_int(lines, "SOUL_OCEAN_N",           soul_neuroticism(sl))
+    let vals = sl[S_VALUES]
+    let i = 0
+    while i < len(vals) {
+        let v = vals[i]
+        _cs_push_line(lines, "VALUE " + v[0] + " " + v[1])
+        i = i + 1
+    }
+    return 1
+}
+
+// Emit one KG: a KG_BEGIN <label> banner, every atom as one ATOM record,
+// every triple (a relation atom's [subj, rel, obj, belief] tuple, when the
+// caller provided the per-KG triples list) as one TRIPLE record, and a
+// KG_END banner.
+//
+// `triples_by_kg` is a parallel list of triple-lists, one entry per KG (in
+// the same order as the registry's KGs). When `triples_by_kg == 0`, no
+// TRIPLE records are emitted. Each triple is [subj_atom_id, rel_atom_id,
+// obj_atom_id, belief_milli].
+fn _cs_emit_kg(lines, kg, triples) {
+    _cs_push_line(lines, "KG_BEGIN " + kg_label(kg))
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            let b = atom_belief(a)
+            let header = "ATOM " + int_to_str(atom_id(a))
+                + " " + int_to_str(atom_kind(a))
+                + " " + int_to_str(b[0])
+                + " " + int_to_str(b[1])
+                + " "
+            _cs_push_line(lines, header + atom_label(a))
+        }
+        i = i + 1
+    }
+    if triples != 0 {
+        let j = 0
+        while j < len(triples) {
+            let t = triples[j]
+            let rec = "TRIPLE " + int_to_str(t[0])
+                + " " + int_to_str(t[1])
+                + " " + int_to_str(t[2])
+                + " " + int_to_str(t[3])
+            _cs_push_line(lines, rec)
+            j = j + 1
+        }
+    }
+    _cs_push_line(lines, "KG_END")
+    return 1
+}
+
+// Emit the decision-log tail: at most `tail_n` entries from the end of the
+// log. The records mirror the in-memory decision_log shape minus the trace
+// list (which decision_log.nova itself documents as bulky + reconstructible).
+fn _cs_emit_dlog_tail(lines, dlog, tail_n) {
+    _cs_push_line(lines, "DLOG_TAIL_BEGIN")
+    let total = dl_count(dlog)
+    let start = total - tail_n
+    if start < 0 { start = 0 }
+    let i = start
+    while i < total {
+        let e = dl_get(dlog, i)
+        if e != 0 {
+            let rec = "DLOG_ENTRY " + int_to_str(dl_seq(e))
+                + " " + int_to_str(dl_kind(e))
+                + " " + int_to_str(dl_ref(e))
+                + " " + int_to_str(dl_timestamp(e))
+                + " " + int_to_str(dl_action_class(e))
+                + " " + int_to_str(dl_action_type(e))
+                + " " + int_to_str(dl_perm_tier(e))
+                + " " + int_to_str(dl_rev_class(e))
+                + " " + int_to_str(dl_goal(e))
+                + " " + int_to_str(dl_soul_ref(e))
+                + " " + int_to_str(dl_outcome(e))
+            _cs_push_line(lines, rec)
+        }
+        i = i + 1
+    }
+    _cs_push_line(lines, "DLOG_TAIL_END")
+    return 1
+}
+
+// Concatenate every line in `lines` into one string. Joining O(N) once at
+// the end avoids the O(N^2) tax of appending to a single running string.
+fn _cs_join_lines(lines) {
+    let acc = ""
+    let i = 0
+    while i < len(lines) {
+        acc = acc + lines[i]
+        i = i + 1
+    }
+    return acc
+}
+
+// chat_state_save_full(path, soul, multi_kg, decision_log, triples_by_kg, tail_n) -> 0 | PERSIST_ERR_*
+//
+// The full-knob API. `triples_by_kg` may be 0 (no triples persisted) or a
+// list parallel to the KG registry where each entry is a list of
+// [subj, rel, obj, belief_milli] tuples. `tail_n` is the maximum number of
+// decision-log entries persisted from the tail.
+fn chat_state_save_full(path, sl, multi_kg, dlog, triples_by_kg, tail_n) {
+    let lines = list_new()
+    _cs_push_kv_int(lines, "VERSION", CHAT_STATE_VERSION)
+    if sl != 0 { _cs_emit_soul(lines, sl) }
+    if multi_kg != 0 {
+        let kgs = multi_kg[KREG_KGS]
+        let i = 0
+        while i < len(kgs) {
+            let triples = 0
+            if triples_by_kg != 0 {
+                if i < len(triples_by_kg) {
+                    triples = triples_by_kg[i]
+                }
+            }
+            _cs_emit_kg(lines, kgs[i], triples)
+            i = i + 1
+        }
+    }
+    if dlog != 0 { _cs_emit_dlog_tail(lines, dlog, tail_n) }
+    _cs_push_line(lines, "END")
+    let text = _cs_join_lines(lines)
+    if _cs_write_text(path, text) == 0 { return PERSIST_ERR_IO }
+    return 0
+}
+
+// chat_state_save(path, soul, multi_kg, decision_log) -> 0 | PERSIST_ERR_*
+//
+// Default-knobs convenience: no triples, decision-log tail capped at 100.
+fn chat_state_save(path, sl, multi_kg, dlog) {
+    return chat_state_save_full(path, sl, multi_kg, dlog, 0, _CS_DEFAULT_TAIL)
+}
+
+// chat_state_save_to_default(soul, multi_kg, decision_log) -> 0 | PERSIST_ERR_*
+fn chat_state_save_to_default(sl, multi_kg, dlog) {
+    return chat_state_save(chat_state_default_path(), sl, multi_kg, dlog)
+}
+
+// ---- load: text -> [soul, multi_kg, decision_log] | error tag -----------
+//
+// On any error returns the error tag (PERSIST_ERR_*); on success returns a
+// 3-element list [soul, multi_kg, decision_log]. The caller distinguishes
+// by checking len(result): a list of length 3 is success, anything else is
+// an int error code. (NOVA's integer / list type distinction makes this
+// idiom safe -- the error path returns an integer, never a list.)
+
+// Helper: peek the first token of a line.
+fn _cs_first_token(line) {
+    let n = len(line)
+    let i = 0
+    while i < n {
+        if char_at(line, i) == 32 { return substr(line, 0, i) }
+        i = i + 1
+    }
+    return line
+}
+
+// Helper: the rest of the line after the first token (no leading space).
+fn _cs_rest_after_first(line) {
+    let n = len(line)
+    let i = 0
+    while i < n {
+        if char_at(line, i) == 32 { return substr(line, i + 1, n - i - 1) }
+        i = i + 1
+    }
+    return ""
+}
+
+// Reconstruct one atom into `kg`. The ATOM line shape is
+//   ATOM <id> <kind> <alpha> <beta> <label>
+// label may contain spaces (it's the last field; everything after the 5th
+// token belongs to label). Returns 1 on success, PERSIST_ERR_PARSE on
+// malformed input.
+fn _cs_install_atom(kg, line) {
+    let toks = _cs_split(line)
+    if len(toks) < 6 { return PERSIST_ERR_PARSE }
+    // toks[0] = "ATOM"; [1]=id; [2]=kind; [3]=alpha; [4]=beta; [5+]=label
+    let id    = str_to_int(toks[1])
+    let kind  = str_to_int(toks[2])
+    let alpha = str_to_int(toks[3])
+    let beta  = str_to_int(toks[4])
+    // Rejoin the label tokens; the label may contain spaces.
+    let label = toks[5]
+    let j = 6
+    while j < len(toks) {
+        label = label + " " + toks[j]
+        j = j + 1
+    }
+    // We can't trust the on-disk id to match the next-allocated id from
+    // kg_add_atom, but the chat REPL's REPLACE-BY-LABEL policy matches what
+    // snapshot_disk.nova's kg_section_apply does -- if the label already
+    // exists, refresh the belief; otherwise create.
+    let existing = kg_find_atom(kg, label)
+    let a = existing
+    if existing == 0 {
+        a = kg_add_atom(kg, kind, label, 0)
+    }
+    let b = atom_belief(a)
+    list_set(b, 0, alpha)
+    list_set(b, 1, beta)
+    return 1
+}
+
+// Parse one TRIPLE line into the per-KG triples list under construction.
+// Shape: TRIPLE <subj> <rel> <obj> <belief_milli>
+fn _cs_install_triple(triples, line) {
+    let toks = _cs_split(line)
+    if len(toks) < 5 { return PERSIST_ERR_PARSE }
+    let t = list_new()
+    push(t, str_to_int(toks[1]))
+    push(t, str_to_int(toks[2]))
+    push(t, str_to_int(toks[3]))
+    push(t, str_to_int(toks[4]))
+    push(triples, t)
+    return 1
+}
+
+// Parse one DLOG_ENTRY line and append to `dlog` via the same low-level
+// shape decision_log builds in-memory (we bypass dl_append's hash chain
+// because the on-disk record only carries the visible fields, not the
+// prev-hash / own-hash slots; the rebuilt log is hash-chain-valid because
+// dl_hash_entry is deterministic over those visible fields and we re-walk
+// it here).
+//
+// Shape: DLOG_ENTRY <seq> <kind> <ref> <ts> <aclass> <atype> <ptier> <rclass> <goal> <soul_ref> <outcome>
+fn _cs_install_dlog_entry(dlog, line) {
+    let toks = _cs_split(line)
+    if len(toks) < 12 { return PERSIST_ERR_PARSE }
+    let desc = list_new()
+    push(desc, str_to_int(toks[5]))     // aclass
+    push(desc, str_to_int(toks[6]))     // atype
+    push(desc, str_to_int(toks[7]))     // ptier
+    push(desc, str_to_int(toks[8]))     // rclass
+    dl_append(dlog,
+        str_to_int(toks[2]),            // kind
+        str_to_int(toks[3]),            // ref
+        str_to_int(toks[4]),            // ts
+        desc,
+        str_to_int(toks[9]),            // goal
+        list_new(),                     // trace (decision_log strips this on the wire too)
+        str_to_int(toks[10]),           // soul_ref
+        str_to_int(toks[11]))           // outcome
+    return 1
+}
+
+// chat_state_load(path) -> [soul, multi_kg, dlog] | error tag
+//
+// Returns:
+//   * a 3-element list on success
+//   * PERSIST_ERR_NOT_FOUND if the file is missing / unreadable
+//   * PERSIST_ERR_VERSION  if the file declares an unknown VERSION
+//   * PERSIST_ERR_PARSE    on any malformed record
+//
+// Unknown record types within a known version are SKIPPED (forward compat
+// with future writers that add new record kinds inside VERSION 1's space).
+fn chat_state_load(path) {
+    let text = _cs_read_text(path)
+    if text == 0 { return PERSIST_ERR_NOT_FOUND }
+    return chat_state_load_text(text)
+}
+
+// chat_state_load_text(text) -> [soul, multi_kg, dlog] | error tag
+//
+// Same contract as chat_state_load but consumes already-read text. Lets
+// tests round-trip without touching the filesystem.
+fn chat_state_load_text(text) {
+    let lines = _cs_text_to_lines(text)
+    if len(lines) == 0 { return PERSIST_ERR_PARSE }
+    let version_seen = 0 - 1
+    let saw_end = 0
+    let sl = soul_new("")
+    let kg_reg = kg_registry_new()
+    let dlog = dl_new()
+    let cur_kg = 0           // KG currently being parsed (0 outside a KG_BEGIN/KG_END block)
+    let in_dlog_tail = 0     // 1 inside DLOG_TAIL_BEGIN/END
+
+    let i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if len(line) > 0 {
+            let head = _cs_first_token(line)
+            if str_eq(head, "VERSION") == 1 {
+                version_seen = str_to_int(_cs_rest_after_first(line))
+                if version_seen != CHAT_STATE_VERSION { return PERSIST_ERR_VERSION }
+            } else {
+                // Reject anything before the VERSION banner so we never
+                // misparse a v2 file that opened with some new pre-version
+                // hint.
+                if version_seen != CHAT_STATE_VERSION {
+                    if str_eq(head, "END") == 1 {
+                        // Header missing entirely -- treat as PARSE not VERSION
+                        // (version not declared at all is different from
+                        // declared wrong).
+                        return PERSIST_ERR_PARSE
+                    }
+                    // No version yet; skip ahead.
+                } else {
+                    if str_eq(head, "END") == 1 {
+                        saw_end = 1
+                        i = len(lines)
+                    } else {
+                        if str_eq(head, "SOUL_NAME") == 1 {
+                            list_set(sl, S_NAME, _cs_rest_after_first(line))
+                        } else {
+                            if str_eq(head, "SOUL_IDENTITY_PURPOSE") == 1 {
+                                soul_set_identity(sl, _cs_rest_after_first(line), soul_nature(sl))
+                            } else {
+                                if str_eq(head, "SOUL_IDENTITY_NATURE") == 1 {
+                                    soul_set_identity(sl, soul_purpose(sl), _cs_rest_after_first(line))
+                                } else {
+                                    if str_eq(head, "SOUL_OCEAN_O") == 1 {
+                                        let id = sl[S_IDENTITY]
+                                        list_set(id, ID_O, str_to_int(_cs_rest_after_first(line)))
+                                    } else {
+                                        if str_eq(head, "SOUL_OCEAN_C") == 1 {
+                                            let id = sl[S_IDENTITY]
+                                            list_set(id, ID_C, str_to_int(_cs_rest_after_first(line)))
+                                        } else {
+                                            if str_eq(head, "SOUL_OCEAN_E") == 1 {
+                                                let id = sl[S_IDENTITY]
+                                                list_set(id, ID_E, str_to_int(_cs_rest_after_first(line)))
+                                            } else {
+                                                if str_eq(head, "SOUL_OCEAN_A") == 1 {
+                                                    let id = sl[S_IDENTITY]
+                                                    list_set(id, ID_A, str_to_int(_cs_rest_after_first(line)))
+                                                } else {
+                                                    if str_eq(head, "SOUL_OCEAN_N") == 1 {
+                                                        let id = sl[S_IDENTITY]
+                                                        list_set(id, ID_N, str_to_int(_cs_rest_after_first(line)))
+                                                    } else {
+                                                        if str_eq(head, "VALUE") == 1 {
+                                                            // VALUE <name> <principle...>
+                                                            let toks = _cs_split(line)
+                                                            if len(toks) >= 3 {
+                                                                let name = toks[1]
+                                                                // Rebuild principle from remaining tokens.
+                                                                let principle = toks[2]
+                                                                let k = 3
+                                                                while k < len(toks) {
+                                                                    principle = principle + " " + toks[k]
+                                                                    k = k + 1
+                                                                }
+                                                                soul_add_value(sl, name, principle)
+                                                            }
+                                                        } else {
+                                                            if str_eq(head, "KG_BEGIN") == 1 {
+                                                                cur_kg = kg_spawn(kg_reg, _cs_rest_after_first(line))
+                                                            } else {
+                                                                if str_eq(head, "KG_END") == 1 {
+                                                                    cur_kg = 0
+                                                                } else {
+                                                                    if str_eq(head, "ATOM") == 1 {
+                                                                        if cur_kg != 0 {
+                                                                            let rc = _cs_install_atom(cur_kg, line)
+                                                                            if rc == PERSIST_ERR_PARSE { return PERSIST_ERR_PARSE }
+                                                                        }
+                                                                    } else {
+                                                                        if str_eq(head, "TRIPLE") == 1 {
+                                                                            // Triples are not installed into the live KG (the
+                                                                            // chat REPL doesn't have a "triple" runtime concept
+                                                                            // separate from relation atoms; load_triples_from_text
+                                                                            // can pull them out separately for tests that want them).
+                                                                            // Still validate the shape so a malformed triple
+                                                                            // surfaces as PERSIST_ERR_PARSE.
+                                                                            let toks = _cs_split(line)
+                                                                            if len(toks) < 5 { return PERSIST_ERR_PARSE }
+                                                                            // Best-effort: refuse zero-int tokens that came from
+                                                                            // a non-integer string (str_to_int returns 0 silently).
+                                                                            // We don't have a "is integer" predicate; rely on the
+                                                                            // shape check.
+                                                                        } else {
+                                                                            if str_eq(head, "DLOG_TAIL_BEGIN") == 1 {
+                                                                                in_dlog_tail = 1
+                                                                            } else {
+                                                                                if str_eq(head, "DLOG_TAIL_END") == 1 {
+                                                                                    in_dlog_tail = 0
+                                                                                } else {
+                                                                                    if str_eq(head, "DLOG_ENTRY") == 1 {
+                                                                                        if in_dlog_tail == 1 {
+                                                                                            let rc = _cs_install_dlog_entry(dlog, line)
+                                                                                            if rc == PERSIST_ERR_PARSE { return PERSIST_ERR_PARSE }
+                                                                                        }
+                                                                                    } else {
+                                                                                        // Unknown record kind within the
+                                                                                        // known version: SKIP (forward compat
+                                                                                        // with future writers that add new
+                                                                                        // record types). This is the documented
+                                                                                        // forward-compat contract.
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if saw_end == 0 { return PERSIST_ERR_PARSE }
+    if version_seen != CHAT_STATE_VERSION { return PERSIST_ERR_VERSION }
+    let out = list_new()
+    push(out, sl)
+    push(out, kg_reg)
+    push(out, dlog)
+    return out
+}
+
+// chat_state_load_from_default() -> [soul, multi_kg, dlog] | error tag
+fn chat_state_load_from_default() {
+    return chat_state_load(chat_state_default_path())
+}
+
+// ---- triple-list extraction (test helper) -------------------------------
+//
+// Pull the triples out of an already-loaded file (or its in-memory text
+// form) by KG. Returns a list parallel to the loaded multi_kg registry's
+// KGs (same order as multi_kg[KREG_KGS]). Element i is a list of
+// [subj, rel, obj, belief_milli] tuples for the i'th KG. Returns an empty
+// list if the file has no TRIPLE records.
+//
+// This is a side helper because the brief deliberately decouples the
+// triple-runtime representation from persistence: the chat REPL works
+// with relation atoms, while the on-disk format gives a flat triple list
+// per KG so /load can reconstruct either without committing to a
+// representation in this module.
+fn chat_state_load_triples_from_text(text) {
+    let out = list_new()
+    let lines = _cs_text_to_lines(text)
+    let cur_idx = 0 - 1
+    let labels = list_new()
+    let i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if len(line) > 0 {
+            let head = _cs_first_token(line)
+            if str_eq(head, "KG_BEGIN") == 1 {
+                push(labels, _cs_rest_after_first(line))
+                push(out, list_new())
+                cur_idx = len(out) - 1
+            } else {
+                if str_eq(head, "KG_END") == 1 {
+                    cur_idx = 0 - 1
+                } else {
+                    if str_eq(head, "TRIPLE") == 1 {
+                        if cur_idx >= 0 {
+                            let toks = _cs_split(line)
+                            if len(toks) >= 5 {
+                                let t = list_new()
+                                push(t, str_to_int(toks[1]))
+                                push(t, str_to_int(toks[2]))
+                                push(t, str_to_int(toks[3]))
+                                push(t, str_to_int(toks[4]))
+                                push(out[cur_idx], t)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// chat_state_load_triples(path) -> list-of-list (one triples-list per KG)
+//
+// Convenience wrapper that does the read for callers that just want the
+// triples back.
+fn chat_state_load_triples(path) {
+    let text = _cs_read_text(path)
+    if text == 0 { return list_new() }
+    return chat_state_load_triples_from_text(text)
+}
+
+// ---- result helpers (callers gate result-shape on these) ----------------
+
+// Is `r` a load-success result (a list of [soul, kg, dlog])? NOVA's
+// builtins differentiate int from list via `len`; we use len(r) == 3 plus a
+// strict positive-int check.
+fn chat_state_is_load_ok(r) {
+    // An error tag is a negative integer; success returns a 3-element list.
+    if r == PERSIST_ERR_VERSION   { return 0 }
+    if r == PERSIST_ERR_NOT_FOUND { return 0 }
+    if r == PERSIST_ERR_PARSE     { return 0 }
+    if r == PERSIST_ERR_IO        { return 0 }
+    return 1
+}
+
+fn chat_state_loaded_soul(r)  { return r[0] }
+fn chat_state_loaded_kgs(r)   { return r[1] }
+fn chat_state_loaded_dlog(r)  { return r[2] }

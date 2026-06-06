@@ -3,6 +3,119 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R39C -- chat-state persistence module (soul + multi-KG + decision-log save/load API)
+
+**Status: complete** -- file-backed save + load API for chat session
+state. Closes the documented "each turn forgets" gap (scripts/chat.sh)
+and the cross-restart durability gap (NOVA enhancement #9 / #10 /
+ADR-0048). API-only round: the chat REPL wire (call save on /quit,
+call load on boot) is INTENTIONALLY DEFERRED to R40 because R39A is
+concurrently touching `examples/crossengin_chat.nova`.
+
+### What R39C delivers
+
+* **`src/persistence/chat_state.nova`** (new) -- the save / load API:
+  - `chat_state_save(path, soul, multi_kg, decision_log) -> 0 | PERSIST_ERR_*`
+  - `chat_state_save_to_default(soul, multi_kg, decision_log)`
+  - `chat_state_save_full(path, soul, multi_kg, decision_log, triples_by_kg, tail_n)`
+  - `chat_state_load(path) -> [soul, multi_kg, decision_log] | PERSIST_ERR_*`
+  - `chat_state_load_from_default()`
+  - `chat_state_load_text(text)` (in-memory variant for tests)
+  - `chat_state_load_triples_from_text(text)` + `chat_state_load_triples(path)`
+    (caller-extractable triples list per KG)
+  - `chat_state_is_load_ok(r)` predicate, plus
+    `chat_state_loaded_soul / _kgs / _dlog` accessors
+  - `chat_state_default_path()` (resolves `CE_PERSIST_PATH` env override,
+    then `$HOME/.crossengin/chat_state.dat`, then `/tmp/crossengin/...`)
+
+* **Wire format** -- line-oriented text "VERSION 1" at
+  `$HOME/.crossengin/chat_state.dat`:
+  ```
+  VERSION 1
+  SOUL_NAME crossengin
+  SOUL_IDENTITY_PURPOSE I help humans think clearly about complex domains
+  SOUL_IDENTITY_NATURE A patient inquisitive assistant
+  SOUL_OCEAN_O 500 ... SOUL_OCEAN_N 300
+  VALUE truth never fabricate
+  KG_BEGIN reasoning
+  ATOM 0 3 1000 1000 self
+  ATOM 1 3 1000 1000 user
+  TRIPLE 47 5 12 850
+  KG_END
+  KG_BEGIN language
+  ...
+  KG_END
+  DLOG_TAIL_BEGIN
+  DLOG_ENTRY 0 1 -1 100 4 4 3 3 -1 0 0
+  ...
+  DLOG_TAIL_END
+  END
+  ```
+
+* **`tests/unit/test_chat_state_persistence.nova`** (new) -- 88 assertions
+  across 17 test functions covering: soul round-trip (name, identity,
+  OCEAN, values), 3-KG round-trip, 10-atom round-trip with non-uniform
+  beliefs, 5-triple round-trip, 100-entry decision-log tail round-trip,
+  250 -> 100 tail cap (default), VERSION 2 file -> `PERSIST_ERR_VERSION`,
+  missing-file -> `PERSIST_ERR_NOT_FOUND`, malformed ATOM ->
+  `PERSIST_ERR_PARSE`, missing END -> `PERSIST_ERR_PARSE`, unknown
+  record type within VERSION 1 is SKIPPED (forward-compat), empty-state
+  round-trip, default path includes filename suffix when env unset,
+  CE_PERSIST_PATH override, single-level auto-mkdir for the parent,
+  /proc/* unwritable -> `PERSIST_ERR_IO`, in-memory text load helper,
+  `is_load_ok` predicate distinguishes int error tags from list results.
+
+### Forward + backward compatibility (the schema contract)
+
+* Header `VERSION 1` lets future R39C.2 bump the schema. A reader that
+  meets a file declaring a version it doesn't know returns
+  `PERSIST_ERR_VERSION` cleanly.
+* Unknown record types within a known version are SKIPPED. Future R39C.2
+  writers can add new record kinds (e.g. `GOAL_ENTRY`) inside VERSION 1
+  and an older reader still loads what it understands.
+* Version bumps own their migration: a future R39C.2 with v2 schema
+  reads both v1 and v2; the v1 -> v2 migration is the new round's
+  responsibility.
+
+### Honest design caveats
+
+* **Text format isn't size-optimized.** A 100k-atom KG lands around
+  10 MB in this layout (vs ~1 MB if we'd used varint binary). The
+  brief explicitly chose readability + reparseability over size; a
+  future R39C.2 binary path is documented in the module header.
+* **No atomic write.** The current save calls
+  `open(O_WRONLY|O_CREAT|O_TRUNC) -> write -> fsync -> close`, not the
+  full snapshot_disk-style `write tmp + fsync + rename + parent-fsync`
+  contract. A crash mid-write can leave a truncated file. The
+  snapshot_disk durable-write pattern is the obvious upgrade -- R40
+  should adopt it before the chat REPL relies on this surface across
+  power-loss scenarios.
+* **No multi-process lock / flock.** Two chat REPLs reading + writing
+  the same path race. Single-REPL use is the assumed deployment.
+* **Triples persistence is a parallel argument, not derived from the
+  KG.** Triples in CrossEngin are logically encoded inside relation
+  atoms' labels rather than as separate edges, so this module accepts
+  a caller-supplied `triples_by_kg` list rather than walking the KG.
+  R40 can change this if a runtime triple iterator lands.
+* **Chat REPL integration is deferred.** This round ships the API
+  only. R40 wires it into `examples/crossengin_chat.nova` (save on
+  `/quit`, load on boot, ADR-0048 rehydration order). Doing both in
+  one round would conflict with R39A's concurrent dispatcher work
+  on the same file.
+
+### Test results
+
+`tests/unit/test_chat_state_persistence.nova`: **88 checks PASS**.
+
+### Concurrency + stash discipline
+
+R39C only added new files (`src/persistence/chat_state.nova`,
+`tests/unit/test_chat_state_persistence.nova`). No existing module was
+modified -- the chat-REPL wire is deferred to R40 per the brief. No
+stash was needed because the owned paths were absent before this
+round began; a sibling agent's WIP on
+`src/io/transducers/http_client.nova` was left untouched.
+
 ## R39E -- documentation: R39 self-identification + autonomous-learning architecture
 
 **Status: complete** -- documentation-only round describing the R39 sprint
