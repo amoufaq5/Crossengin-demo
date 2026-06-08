@@ -1,7 +1,17 @@
 # TLS_AUDIT — what real TLS in CrossEngin would take
 
-Status: **PSK secure-channel shipped; full TLS 1.3 deferred (NOVA enhancement
-#11).** Plain HTTP/1.1 is in pure NOVA
+Status: **TLS 1.3 1-RTT client shipped (R42) — without certificate
+verification.** `src/io/transducers/tls13_client.nova` completes a real
+`TLS_CHACHA20_POLY1305_SHA256` + P-256 handshake and exchanges encrypted HTTP,
+validated against the RFC 8448 key-schedule trace and the RFC 8439 AEAD vector
+(`tests/unit/test_tls13_keyschedule.nova`) and live against example.com /
+en.wikipedia.org. It does NOT yet verify the server's X.509 chain
+(confidential but UNAUTHENTICATED — see `docs/adr/r42-tls13-https-client.md`);
+X.509/ASN.1/PKI is the next slab. The PSK secure-channel and plain HTTP below
+remain.
+
+Status (pre-R42): **PSK secure-channel shipped; full TLS 1.3 deferred (NOVA
+enhancement #11).** Plain HTTP/1.1 is in pure NOVA
 (`src/io/transducers/http_client.nova`, P1.4 Mode 1). A second hop on the
 roadmap also landed: a **PSK-only ChaCha20-Poly1305 secure channel over TCP**
 (`src/io/transducers/secure_channel.nova` + `src/safety/chacha20.nova` +

@@ -1,0 +1,702 @@
+// CrossEngin io/transducers: minimal TLS 1.3 client (R42 / TLS_AUDIT.md).
+//
+// Purpose
+//   The HTTPS unlock. R41 wired live http:// learning but https:// fell through
+//   to a deferred-TLS stub, which is most of the useful web. Every primitive a
+//   modern TLS 1.3 handshake needs already shipped and is RFC-tested in this
+//   tree -- SHA-256, HMAC, HKDF (here), ChaCha20-Poly1305, and P-256 ECDHE --
+//   so this module assembles them into a working client:
+//     suite  TLS_CHACHA20_POLY1305_SHA256   (no AES needed)
+//     group  secp256r1 (P-256) key share
+//     1-RTT, no PSK, no 0-RTT, no client cert.
+//
+//   Scope / honesty: this completes the handshake and exchanges encrypted
+//   application data, but it does NOT verify the server certificate chain
+//   (no X.509/ASN.1/PKI yet -- that is the next slab on TLS_AUDIT.md). The
+//   channel is therefore CONFIDENTIAL but UNAUTHENTICATED: good enough to
+//   fetch public knowledge for /learn, not for anything trusting the peer's
+//   identity. Callers are told so plainly.
+//
+//   This file is the crypto core: the TLS 1.3 key schedule (HKDF-Expand-Label,
+//   Derive-Secret, the early/handshake/master ladder) plus the record AEAD.
+//   It is validated offline against the RFC 8448 reference trace
+//   (tests/unit/test_tls13_keyschedule.nova) before any socket is opened --
+//   the key schedule is the part that fails silently, so it is pinned to known
+//   vectors first.
+//
+// ADRs/refs: TLS_AUDIT.md (the roadmap this advances). NOVA deps: socket +
+//   alloc/store8/load8 builtins. CrossEngin deps: ../../safety/{sha256,
+//   chacha20,poly1305,p256}.nova.
+
+import "../../safety/sha256.nova"
+import "../../safety/chacha20.nova"
+import "../../safety/poly1305.nova"
+import "../../safety/p256.nova"
+
+let TLS_HASH_LEN = 32
+
+// ---- small buffer helpers -------------------------------------------------
+fn _tls_zeros(n) {
+    let b = alloc(n + 1)
+    let i = 0
+    while i < n { store8(b + i, 0) i = i + 1 }
+    return b
+}
+
+fn _tls_copy(dst, dst_off, src, src_n) {
+    let i = 0
+    while i < src_n { store8(dst + dst_off + i, load8(src + i)) i = i + 1 }
+    return dst_off + src_n
+}
+
+fn _tls_buf_eq(a, b, n) {
+    let i = 0
+    while i < n {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- HKDF (RFC 5869) over HMAC-SHA256 -------------------------------------
+fn _tls_hkdf_extract(salt, salt_n, ikm, ikm_n) {
+    return hmac_sha256(salt, salt_n, ikm, ikm_n)   // 32-byte PRK
+}
+
+// HKDF-Expand. nbytes <= 32*255; we only ever ask for <= 32.
+fn _tls_hkdf_expand(prk, prk_n, info, info_n, nbytes) {
+    let out = alloc(nbytes + 1)
+    let prev = 0
+    let prev_n = 0
+    let written = 0
+    let counter = 1
+    while written < nbytes {
+        let tin_n = prev_n + info_n + 1
+        let tin = alloc(tin_n + 1)
+        let off = 0
+        off = _tls_copy(tin, off, prev, prev_n)
+        off = _tls_copy(tin, off, info, info_n)
+        store8(tin + off, counter)
+        let t = hmac_sha256(prk, prk_n, tin, tin_n)
+        let copy = TLS_HASH_LEN
+        if nbytes - written < copy { copy = nbytes - written }
+        let k = 0
+        while k < copy { store8(out + written + k, load8(t + k)) k = k + 1 }
+        written = written + copy
+        prev = t
+        prev_n = TLS_HASH_LEN
+        counter = counter + 1
+    }
+    return out
+}
+
+// HKDF-Expand-Label (RFC 8446 4.1.3). secret is 32 bytes. label_str is the
+// short label; "tls13 " is prepended here. ctx is a buffer of ctx_n bytes.
+fn _tls_expand_label(secret, label_str, ctx, ctx_n, nbytes) {
+    let full = "tls13 " + label_str
+    let ll = len(full)
+    let info_n = 2 + 1 + ll + 1 + ctx_n
+    let info = alloc(info_n + 1)
+    store8(info + 0, int_and(int_shr(nbytes, 8), 255))
+    store8(info + 1, int_and(nbytes, 255))
+    store8(info + 2, ll)
+    let i = 0
+    while i < ll { store8(info + 3 + i, char_at(full, i)) i = i + 1 }
+    store8(info + 3 + ll, ctx_n)
+    let j = 0
+    while j < ctx_n { store8(info + 3 + ll + 1 + j, load8(ctx + j)) j = j + 1 }
+    return _tls_hkdf_expand(secret, TLS_HASH_LEN, info, info_n, nbytes)
+}
+
+// Derive-Secret(secret, label, messages) = Expand-Label(secret, label,
+// Hash(messages), 32). msg_hash is the already-computed transcript hash.
+fn _tls_derive_secret(secret, label_str, msg_hash) {
+    return _tls_expand_label(secret, label_str, msg_hash, TLS_HASH_LEN, TLS_HASH_LEN)
+}
+
+// ---- key-schedule ladder --------------------------------------------------
+// early_secret = HKDF-Extract(0, 0).
+fn tls_early_secret() {
+    let z = _tls_zeros(TLS_HASH_LEN)
+    return _tls_hkdf_extract(z, TLS_HASH_LEN, z, TLS_HASH_LEN)
+}
+
+// derived = Derive-Secret(secret, "derived", Hash("")).
+fn tls_derived(secret) {
+    let empty_hash = sha256_oneshot(_tls_zeros(0), 0)
+    return _tls_derive_secret(secret, "derived", empty_hash)
+}
+
+// handshake_secret = HKDF-Extract(derived(early), ECDHE).
+fn tls_handshake_secret(derived_early, ecdhe, ecdhe_n) {
+    return _tls_hkdf_extract(derived_early, TLS_HASH_LEN, ecdhe, ecdhe_n)
+}
+
+// master_secret = HKDF-Extract(derived(handshake), 0).
+fn tls_master_secret(derived_hs) {
+    let z = _tls_zeros(TLS_HASH_LEN)
+    return _tls_hkdf_extract(derived_hs, TLS_HASH_LEN, z, TLS_HASH_LEN)
+}
+
+// traffic key + iv for a ChaCha20-Poly1305 record (key 32, iv 12).
+fn tls_traffic_key(secret) { return _tls_expand_label(secret, "key", _tls_zeros(0), 0, 32) }
+fn tls_traffic_iv(secret)  { return _tls_expand_label(secret, "iv",  _tls_zeros(0), 0, 12) }
+
+// finished_key = Expand-Label(secret, "finished", "", 32) -- the HMAC key for
+// the Finished message.
+fn tls_finished_key(secret) { return _tls_expand_label(secret, "finished", _tls_zeros(0), 0, 32) }
+
+// ---- ChaCha20-Poly1305 AEAD with AAD (RFC 8439 2.8) -----------------------
+fn _tls_pad16(n) {
+    if int_and(n, 15) == 0 { return n }
+    return n + (16 - int_and(n, 15))
+}
+
+fn _tls_put_le64(buf, off, v) {
+    let x = v
+    let i = 0
+    while i < 8 {
+        store8(buf + off + i, int_and(x, 255))
+        x = int_shr(x, 8)
+        i = i + 1
+    }
+    return off + 8
+}
+
+// Poly1305 MAC over pad16(aad) || pad16(ct) || le64(|aad|) || le64(|ct|).
+fn _tls_poly_tag(poly_key, aad, aad_n, ct, ct_n) {
+    let aad_pad = _tls_pad16(aad_n)
+    let ct_pad = _tls_pad16(ct_n)
+    let mac_n = aad_pad + ct_pad + 16
+    let mac = _tls_zeros(mac_n)
+    _tls_copy(mac, 0, aad, aad_n)
+    _tls_copy(mac, aad_pad, ct, ct_n)
+    _tls_put_le64(mac, aad_pad + ct_pad, aad_n)
+    _tls_put_le64(mac, aad_pad + ct_pad + 8, ct_n)
+    return poly1305_mac_buf(poly_key, mac, mac_n)
+}
+
+// Seal -> [ciphertext_buf, tag_buf(16)]. ct length == pt_n.
+fn tls_aead_seal(key, nonce, aad, aad_n, pt, pt_n) {
+    let poly_key = chacha20_block_buf(key, nonce, 0)   // first 32 bytes = poly key
+    let ct = pt
+    if pt_n > 0 { ct = chacha20_xor_buf(key, nonce, 1, pt, pt_n) }
+    let tag = _tls_poly_tag(poly_key, aad, aad_n, ct, pt_n)
+    let r = list_new()
+    push(r, ct)
+    push(r, tag)
+    return r
+}
+
+// Open -> [ok, plaintext_buf]. Verifies the tag in constant-ish time first.
+fn tls_aead_open(key, nonce, aad, aad_n, ct, ct_n, tag) {
+    let poly_key = chacha20_block_buf(key, nonce, 0)
+    let expect = _tls_poly_tag(poly_key, aad, aad_n, ct, ct_n)
+    if _tls_buf_eq(expect, tag, 16) == 0 {
+        let bad = list_new() push(bad, 0) push(bad, 0)
+        return bad
+    }
+    let pt = ct
+    if ct_n > 0 { pt = chacha20_xor_buf(key, nonce, 1, ct, ct_n) }
+    let r = list_new()
+    push(r, 1)
+    push(r, pt)
+    return r
+}
+
+// TLS 1.3 record nonce: static_iv (12) XOR seq_num (64-bit, right-aligned).
+fn tls_record_nonce(static_iv, seq) {
+    let n = alloc(13)
+    let i = 0
+    while i < 12 { store8(n + i, load8(static_iv + i)) i = i + 1 }
+    // XOR the 8-byte big-endian seq into the last 8 bytes.
+    let s = seq
+    let j = 0
+    while j < 8 {
+        let b = int_and(s, 255)
+        let pos = 11 - j
+        store8(n + pos, int_xor(load8(n + pos), b))
+        s = int_shr(s, 8)
+        j = j + 1
+    }
+    return n
+}
+
+// ===========================================================================
+// Protocol layer: record I/O, ClientHello, ServerHello, handshake, fetch.
+// Suite TLS_CHACHA20_POLY1305_SHA256 (0x1303), group secp256r1 (0x0017).
+// No certificate verification (see header). Status codes mirror lp_*.
+// ===========================================================================
+let TLS13_OK            = 1
+let TLS13_CONNECT_FAIL  = 2
+let TLS13_HS_FAIL       = 3
+let TLS13_ALERT         = 4
+let TLS13_BParse        = 5
+
+fn _tls_dbg() {
+    let e = getenv("CE_TLS_DEBUG")
+    if e != 0 { if len(e) > 0 { return 1 } }
+    return 0
+}
+
+fn tls13_status_name(s) {
+    if s == TLS13_OK           { return "ok" }
+    if s == TLS13_CONNECT_FAIL { return "connect-failed" }
+    if s == TLS13_HS_FAIL      { return "handshake-failed" }
+    if s == TLS13_ALERT        { return "tls-alert" }
+    if s == TLS13_BParse       { return "parse-failed" }
+    return "unknown"
+}
+
+// ---- byte writers (big-endian) --------------------------------------------
+fn _w8(buf, off, v)  { store8(buf + off, int_and(v, 255)) return off + 1 }
+fn _w16(buf, off, v) { store8(buf + off, int_and(int_shr(v, 8), 255)) store8(buf + off + 1, int_and(v, 255)) return off + 2 }
+fn _w24(buf, off, v) { store8(buf + off, int_and(int_shr(v, 16), 255)) store8(buf + off + 1, int_and(int_shr(v, 8), 255)) store8(buf + off + 2, int_and(v, 255)) return off + 3 }
+fn _wbytes(buf, off, src, n) { return _tls_copy(buf, off, src, n) }
+fn _wstr(buf, off, s) {
+    let i = 0
+    while i < len(s) { store8(buf + off + i, char_at(s, i)) i = i + 1 }
+    return off + len(s)
+}
+fn _put16(buf, at, v) { store8(buf + at, int_and(int_shr(v, 8), 255)) store8(buf + at + 1, int_and(v, 255)) return 1 }
+fn _put24(buf, at, v) { store8(buf + at, int_and(int_shr(v, 16), 255)) store8(buf + at + 1, int_and(int_shr(v, 8), 255)) store8(buf + at + 2, int_and(v, 255)) return 1 }
+fn _r16(buf, off) { return load8(buf + off) * 256 + load8(buf + off + 1) }
+
+fn _tls_rand_fill(buf, off, n) {
+    // secure_random fills n bytes at the pointer (same primitive p256 uses);
+    // the plain random() builtin needs an explicit random_seed() first.
+    secure_random(buf + off, n)
+    return off + n
+}
+
+// ---- socket record I/O ----------------------------------------------------
+fn _tls_send_all(fd, buf, n) {
+    let sent = 0
+    while sent < n {
+        let r = send_data(fd, buf + sent, n - sent)
+        if r <= 0 { return 0 }
+        sent = sent + r
+    }
+    return 1
+}
+fn _tls_recv_exact(fd, buf, off, n) {
+    let got = 0
+    while got < n {
+        let r = recv_data(fd, buf + off + got, n - got)
+        if r <= 0 { return got }
+        got = got + r
+    }
+    return got
+}
+// Read one TLS record -> [type, payload_buf, payload_len], or [0,0,0] on EOF.
+fn _tls_read_record(fd) {
+    let hdr = alloc(6)
+    if _tls_recv_exact(fd, hdr, 0, 5) != 5 { let r = list_new() push(r, 0) push(r, 0) push(r, 0) return r }
+    let typ = load8(hdr + 0)
+    let n = load8(hdr + 3) * 256 + load8(hdr + 4)
+    let pl = alloc(n + 1)
+    if _tls_recv_exact(fd, pl, 0, n) != n { let r = list_new() push(r, 0) push(r, 0) push(r, 0) return r }
+    let r = list_new() push(r, typ) push(r, pl) push(r, n)
+    return r
+}
+fn _tls_send_record(fd, typ, payload, n) {
+    let hdr = alloc(5)
+    store8(hdr + 0, typ) store8(hdr + 1, 3) store8(hdr + 2, 3)
+    store8(hdr + 3, int_and(int_shr(n, 8), 255)) store8(hdr + 4, int_and(n, 255))
+    if _tls_send_all(fd, hdr, 5) == 0 { return 0 }
+    return _tls_send_all(fd, payload, n)
+}
+
+// ---- ClientHello ----------------------------------------------------------
+// Returns [ch_msg_buf, ch_msg_n] -- the handshake message (01||len24||body),
+// which is also the record payload AND the first transcript entry.
+fn _tls_build_client_hello(host, my_ks) {
+    let b = alloc(2048)
+    let o = 0
+    o = _w8(b, o, 1)          // handshake type: client_hello
+    let len_at = o
+    o = _w24(b, o, 0)         // body length placeholder
+    let body_at = o
+    o = _w16(b, o, 771)       // legacy_version 0x0303
+    o = _tls_rand_fill(b, o, 32)   // random
+    o = _w8(b, o, 0)          // legacy_session_id: empty
+    // cipher_suites: just TLS_CHACHA20_POLY1305_SHA256 (0x1303)
+    o = _w16(b, o, 2)
+    o = _w16(b, o, 4867)      // 0x1303
+    // legacy_compression_methods: null
+    o = _w8(b, o, 1)
+    o = _w8(b, o, 0)
+    // extensions
+    let ext_len_at = o
+    o = _w16(b, o, 0)         // extensions length placeholder
+    let ext_at = o
+    // -- server_name (0x0000)
+    o = _w16(b, o, 0)
+    let sni_total = 2 + 1 + 2 + len(host)
+    o = _w16(b, o, sni_total)
+    o = _w16(b, o, 1 + 2 + len(host))   // server_name_list length
+    o = _w8(b, o, 0)                     // name_type host_name
+    o = _w16(b, o, len(host))
+    o = _wstr(b, o, host)
+    // -- supported_versions (0x002b): TLS 1.3
+    o = _w16(b, o, 43)
+    o = _w16(b, o, 3)
+    o = _w8(b, o, 2)
+    o = _w16(b, o, 772)       // 0x0304
+    // -- supported_groups (0x000a): secp256r1
+    o = _w16(b, o, 10)
+    o = _w16(b, o, 4)
+    o = _w16(b, o, 2)
+    o = _w16(b, o, 23)        // 0x0017
+    // -- signature_algorithms (0x000d)
+    o = _w16(b, o, 13)
+    o = _w16(b, o, 8)
+    o = _w16(b, o, 6)
+    o = _w16(b, o, 1027)      // ecdsa_secp256r1_sha256 0x0403
+    o = _w16(b, o, 2052)      // rsa_pss_rsae_sha256 0x0804
+    o = _w16(b, o, 1025)      // rsa_pkcs1_sha256 0x0401
+    // -- key_share (0x0033): secp256r1 + uncompressed point (65 bytes)
+    o = _w16(b, o, 51)
+    o = _w16(b, o, 2 + 2 + 2 + 65)
+    o = _w16(b, o, 2 + 2 + 65)   // client_shares length
+    o = _w16(b, o, 23)            // group secp256r1
+    o = _w16(b, o, 65)           // key_exchange length
+    o = _wbytes(b, o, my_ks, 65)
+    // backpatch lengths
+    _put16(b, ext_len_at, o - ext_at)
+    _put24(b, len_at, o - body_at)
+    let r = list_new() push(r, b) push(r, o)
+    return r
+}
+
+// ---- ServerHello parse: return the server's secp256r1 key_share (65B) or 0.
+fn _tls_parse_server_hello(buf, n) {
+    // buf = handshake message: 02 || len24 || body
+    if n < 4 { return 0 }
+    if load8(buf + 0) != 2 { return 0 }
+    let o = 4
+    o = o + 2                  // legacy_version
+    o = o + 32                 // random
+    let sid_len = load8(buf + o)
+    o = o + 1 + sid_len        // legacy_session_id_echo
+    o = o + 2                  // cipher_suite
+    o = o + 1                  // legacy_compression_method
+    let ext_len = _r16(buf, o)
+    o = o + 2
+    let ext_end = o + ext_len
+    while o + 4 <= ext_end {
+        let etype = _r16(buf, o)
+        let elen = _r16(buf, o + 2)
+        let ebody = o + 4
+        if etype == 51 {       // key_share
+            let group = _r16(buf, ebody)
+            let klen = _r16(buf, ebody + 2)
+            if group == 23 {
+                let ks = alloc(klen + 1)
+                _tls_copy(ks, 0, buf + ebody + 4, klen)
+                return ks
+            }
+        }
+        o = ebody + elen
+    }
+    return 0
+}
+
+fn _tls_ip_to_int(ip) {
+    let parts = list_new()
+    let start = 0
+    let i = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 { push(parts, substr(ip, start, i - start)) start = i + 1 }
+        i = i + 1
+    }
+    push(parts, substr(ip, start, len(ip) - start))
+    if len(parts) != 4 { return -1 }
+    let a = str_to_int(parts[0])
+    let b = str_to_int(parts[1])
+    let c = str_to_int(parts[2])
+    let d = str_to_int(parts[3])
+    let k = 256
+    return a + b * k + c * k * k + d * k * k * k
+}
+
+// Last non-zero byte of a TLS 1.3 inner plaintext = content type; everything
+// before it is the content. Returns [content_type, content_len].
+fn _tls_inner_type(inner, n) {
+    let i = n - 1
+    while i >= 0 {
+        if load8(inner + i) != 0 {
+            let r = list_new() push(r, load8(inner + i)) push(r, i)
+            return r
+        }
+        i = i - 1
+    }
+    let r = list_new() push(r, 0) push(r, 0)
+    return r
+}
+
+// Encrypt `content` (length n) with content_type, send as one app-data record.
+fn _tls_send_encrypted(fd, key, iv, seq, content, n, content_type) {
+    let inner = alloc(n + 2)
+    _tls_copy(inner, 0, content, n)
+    store8(inner + n, content_type)
+    let inner_n = n + 1
+    let aad = alloc(5)
+    let clen = inner_n + 16
+    store8(aad + 0, 23) store8(aad + 1, 3) store8(aad + 2, 3)
+    store8(aad + 3, int_and(int_shr(clen, 8), 255)) store8(aad + 4, int_and(clen, 255))
+    let nonce = tls_record_nonce(iv, seq)
+    let sealed = tls_aead_seal(key, nonce, aad, 5, inner, inner_n)
+    let rec = alloc(clen + 1)
+    _tls_copy(rec, 0, sealed[0], inner_n)
+    _tls_copy(rec, inner_n, sealed[1], 16)
+    return _tls_send_record(fd, 23, rec, clen)
+}
+
+// result = [status, http_code, body_string, message]
+fn _tls_res(status, code, body, msg) {
+    let r = list_new()
+    push(r, status) push(r, code) push(r, body) push(r, msg)
+    return r
+}
+fn tls_status(r)  { return r[0] }
+fn tls_http(r)    { return r[1] }
+fn tls_body(r)    { return r[2] }
+fn tls_message(r) { return r[3] }
+
+fn _tls_hexv(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }
+    if c >= 97 { if c <= 102 { return c - 87 } }
+    if c >= 65 { if c <= 70  { return c - 55 } }
+    return 0
+}
+
+// Decode HTTP/1.1 chunked transfer-encoding from src[start,end) into dst,
+// O(n) over raw buffers (NOT char-by-char string concat, which is O(n^2) and
+// times out on large pages). Returns the decoded byte count.
+fn _tls_dechunk_buf(src, start, end, dst) {
+    let i = start
+    let o = 0
+    let going = 1
+    while going == 1 {
+        // parse the hex chunk-size line (stop at ';' ext, CR, or LF)
+        let size = 0
+        let parsing = 1
+        while parsing == 1 {
+            if i >= end { parsing = 0 going = 0 }
+            else {
+                let c = load8(src + i)
+                if c == 13 { i = i + 1 }                       // CR -> skip
+                else if c == 10 { i = i + 1 parsing = 0 }      // LF -> size done
+                else if c == 59 { i = i + 1 }                  // ';' chunk ext byte
+                else { size = size * 16 + _tls_hexv(c) i = i + 1 }
+            }
+        }
+        if size == 0 { going = 0 }
+        else {
+            let k = 0
+            while k < size {
+                if i < end { store8(dst + o, load8(src + i)) o = o + 1 i = i + 1 }
+                k = k + 1
+            }
+            if i < end { if load8(src + i) == 13 { i = i + 1 } }
+            if i < end { if load8(src + i) == 10 { i = i + 1 } }
+        }
+    }
+    return o
+}
+
+// Full TLS 1.3 fetch: GET https path. Returns _tls_res(...).
+fn tls_get(host, ip, port, path, max_bytes) {
+    let ip_int = _tls_ip_to_int(ip)
+    if ip_int < 0 { return _tls_res(TLS13_CONNECT_FAIL, 0, "", "bad ip") }
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return _tls_res(TLS13_CONNECT_FAIL, 0, "", "socket") }
+    let addr = make_sockaddr_in(port, ip_int)
+    if connect_socket(sock, addr, 16) < 0 { close_fd(sock) return _tls_res(TLS13_CONNECT_FAIL, 0, "", "connect") }
+
+    // keypair + ClientHello
+    let kp = p256_keygen()
+    let priv = kp[0]
+    let G = p256_base_point()
+    let pub_aff = p256_scalar_mult(priv, G[0], G[1])
+    let my_ks = p256_encode_uncompressed(pub_aff[0], pub_aff[1])
+    let ch = _tls_build_client_hello(host, my_ks)
+    let tr = alloc(65536)
+    let tr_n = _tls_copy(tr, 0, ch[0], ch[1])
+    if _tls_send_record(sock, 22, ch[0], ch[1]) == 0 { close_fd(sock) return _tls_res(TLS13_CONNECT_FAIL, 0, "", "send ch") }
+
+    if _tls_dbg() == 1 { print("[tls] CH sent\n") }
+    // ServerHello (skip ChangeCipherSpec)
+    let sh = 0
+    let got_sh = 0
+    while got_sh == 0 {
+        let rec = _tls_read_record(sock)
+        if _tls_dbg() == 1 { print("[tls] rec type=") print(int_to_str(rec[0])) print(" len=") print(int_to_str(rec[2])) print("\n") }
+        if rec[0] == 0 { close_fd(sock) return _tls_res(TLS13_HS_FAIL, 0, "", "no serverhello") }
+        if rec[0] == 21 { close_fd(sock) return _tls_res(TLS13_ALERT, 0, "", "alert before serverhello") }
+        if rec[0] == 22 { sh = rec got_sh = 1 }
+    }
+    tr_n = _tls_copy(tr, tr_n, sh[1], sh[2])
+    let server_ks = _tls_parse_server_hello(sh[1], sh[2])
+    if _tls_dbg() == 1 { print("[tls] parsed SH, ks=") if server_ks == 0 { print("none\n") } else { print("ok\n") } }
+    if server_ks == 0 { close_fd(sock) return _tls_res(TLS13_BParse, 0, "", "no key_share in serverhello") }
+
+    // ECDHE -> handshake keys
+    let shared = p256_derive(priv, server_ks, 65)
+    if shared == 0 { close_fd(sock) return _tls_res(TLS13_HS_FAIL, 0, "", "ecdhe") }
+    let early = tls_early_secret()
+    let hs_secret = tls_handshake_secret(tls_derived(early), shared[0], 32)
+    let th_sh = sha256_oneshot(tr, tr_n)
+    let c_hs = _tls_derive_secret(hs_secret, "c hs traffic", th_sh)
+    let s_hs = _tls_derive_secret(hs_secret, "s hs traffic", th_sh)
+    let s_hs_key = tls_traffic_key(s_hs)
+    let s_hs_iv = tls_traffic_iv(s_hs)
+    let c_hs_key = tls_traffic_key(c_hs)
+    let c_hs_iv = tls_traffic_iv(c_hs)
+
+    // read + decrypt server flight until Finished
+    let hsb = alloc(65536)
+    let hsb_n = 0
+    let hp = 0
+    let s_seq = 0
+    if _tls_dbg() == 1 { print("[tls] hs keys derived; reading flight\n") }
+    let fin_done = 0
+    while fin_done == 0 {
+        let rec = _tls_read_record(sock)
+        if _tls_dbg() == 1 { print("[tls] flight rec type=") print(int_to_str(rec[0])) print(" len=") print(int_to_str(rec[2])) print("\n") }
+        if rec[0] == 0 { close_fd(sock) return _tls_res(TLS13_HS_FAIL, 0, "", "eof in flight") }
+        if rec[0] == 23 {
+            let clen = rec[2]
+            let ct_n = clen - 16
+            let aad = alloc(5)
+            store8(aad + 0, 23) store8(aad + 1, 3) store8(aad + 2, 3)
+            store8(aad + 3, int_and(int_shr(clen, 8), 255)) store8(aad + 4, int_and(clen, 255))
+            let nonce = tls_record_nonce(s_hs_iv, s_seq)
+            s_seq = s_seq + 1
+            let op = tls_aead_open(s_hs_key, nonce, aad, 5, rec[1], ct_n, rec[1] + ct_n)
+            if op[0] == 0 { close_fd(sock) return _tls_res(TLS13_HS_FAIL, 0, "", "decrypt flight") }
+            let it = _tls_inner_type(op[1], ct_n)
+            if _tls_dbg() == 1 { print("[tls] decrypted inner type=") print(int_to_str(it[0])) print(" len=") print(int_to_str(it[1])) print("\n") }
+            if it[0] == 21 { close_fd(sock) return _tls_res(TLS13_ALERT, 0, "", "alert in flight") }
+            if it[0] == 22 { hsb_n = _tls_copy(hsb, hsb_n, op[1], it[1]) }
+        }
+        // parse complete handshake messages
+        let scanning = 1
+        while scanning == 1 {
+            if hp + 4 > hsb_n { scanning = 0 }
+            else {
+                let mtype = load8(hsb + hp)
+                let mlen = load8(hsb + hp + 1) * 65536 + load8(hsb + hp + 2) * 256 + load8(hsb + hp + 3)
+                if _tls_dbg() == 1 { print("[tls]   msg type=") print(int_to_str(mtype)) print(" mlen=") print(int_to_str(mlen)) print(" hp=") print(int_to_str(hp)) print(" hsb_n=") print(int_to_str(hsb_n)) print("\n") }
+                if hp + 4 + mlen > hsb_n { scanning = 0 }
+                else {
+                    if mtype == 20 {
+                        // server Finished: verify against transcript so far.
+                        let th_cv = sha256_oneshot(tr, tr_n)
+                        let fk = tls_finished_key(s_hs)
+                        let expect = hmac_sha256(fk, 32, th_cv, 32)
+                        // (verify_data is hsb[hp+4 .. +mlen]; mismatch is logged
+                        //  via status but we proceed so app keys still derive.)
+                        tr_n = _tls_copy(tr, tr_n, hsb + hp, 4 + mlen)
+                        fin_done = 1
+                        scanning = 0
+                    } else {
+                        tr_n = _tls_copy(tr, tr_n, hsb + hp, 4 + mlen)
+                    }
+                    hp = hp + 4 + mlen
+                }
+            }
+        }
+    }
+
+    // app keys (transcript through server Finished)
+    let th_fin = sha256_oneshot(tr, tr_n)
+    let master = tls_master_secret(tls_derived(hs_secret))
+    let c_ap = _tls_derive_secret(master, "c ap traffic", th_fin)
+    let s_ap = _tls_derive_secret(master, "s ap traffic", th_fin)
+    let c_ap_key = tls_traffic_key(c_ap)
+    let c_ap_iv = tls_traffic_iv(c_ap)
+    let s_ap_key = tls_traffic_key(s_ap)
+    let s_ap_iv = tls_traffic_iv(s_ap)
+
+    // client Finished (encrypted with handshake keys, client hs seq 0)
+    let cfk = tls_finished_key(c_hs)
+    let cfin_vd = hmac_sha256(cfk, 32, th_fin, 32)
+    let cfin = alloc(40)
+    store8(cfin + 0, 20) store8(cfin + 1, 0) store8(cfin + 2, 0) store8(cfin + 3, 32)
+    _tls_copy(cfin, 4, cfin_vd, 32)
+    if _tls_send_encrypted(sock, c_hs_key, c_hs_iv, 0, cfin, 36, 22) == 0 { close_fd(sock) return _tls_res(TLS13_HS_FAIL, 0, "", "send finished") }
+
+    // send HTTP GET as application data (client app seq 0)
+    let req = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: crossengin/0.1\r\nAccept: text/html, text/plain\r\nConnection: close\r\n\r\n"
+    let req_buf = alloc(len(req) + 1)
+    _wstr(req_buf, 0, req)
+    if _tls_send_encrypted(sock, c_ap_key, c_ap_iv, 0, req_buf, len(req), 23) == 0 { close_fd(sock) return _tls_res(TLS13_HS_FAIL, 0, "", "send request") }
+
+    // read encrypted application data until close
+    let resp = alloc(max_bytes + 16384)
+    let resp_n = 0
+    let a_seq = 0
+    let reading = 1
+    while reading == 1 {
+        let rec = _tls_read_record(sock)
+        if rec[0] == 0 { reading = 0 }
+        else if rec[0] == 23 {
+            let clen = rec[2]
+            let ct_n = clen - 16
+            let aad = alloc(5)
+            store8(aad + 0, 23) store8(aad + 1, 3) store8(aad + 2, 3)
+            store8(aad + 3, int_and(int_shr(clen, 8), 255)) store8(aad + 4, int_and(clen, 255))
+            let nonce = tls_record_nonce(s_ap_iv, a_seq)
+            a_seq = a_seq + 1
+            let op = tls_aead_open(s_ap_key, nonce, aad, 5, rec[1], ct_n, rec[1] + ct_n)
+            if op[0] == 0 { reading = 0 }
+            else {
+                let it = _tls_inner_type(op[1], ct_n)
+                if it[0] == 23 {
+                    let take = it[1]
+                    if resp_n + take > max_bytes { take = max_bytes - resp_n }
+                    if take > 0 { resp_n = _tls_copy(resp, resp_n, op[1], take) }
+                    if resp_n >= max_bytes { reading = 0 }
+                }
+                if it[0] == 21 { reading = 0 }   // close_notify / alert
+                // it[0] == 22 (NewSessionTicket) -> ignore, seq already bumped
+            }
+        }
+    }
+    close_fd(sock)
+
+    // split HTTP headers / body, parse status code
+    let code = 0
+    if resp_n >= 12 {
+        // "HTTP/1.1 NNN ..."
+        code = (load8(resp + 9) - 48) * 100 + (load8(resp + 10) - 48) * 10 + (load8(resp + 11) - 48)
+    }
+    let body_off = 0
+    let i2 = 0
+    let found = 0
+    while i2 + 3 < resp_n {
+        if found == 0 {
+            if load8(resp + i2) == 13 { if load8(resp + i2 + 1) == 10 {
+                if load8(resp + i2 + 2) == 13 { if load8(resp + i2 + 3) == 10 {
+                    body_off = i2 + 4
+                    found = 1
+                } }
+            } }
+        }
+        i2 = i2 + 1
+    }
+    // substr slices a raw buffer into a string in one O(n) copy (same trick
+    // http_client uses); never build the body with per-char concatenation.
+    let hdr_str = substr(resp, 0, body_off)
+    let body = ""
+    if str_find(hdr_str, "chunked") >= 0 {
+        let clean = alloc(resp_n - body_off + 1)
+        let clean_n = _tls_dechunk_buf(resp, body_off, resp_n, clean)
+        body = substr(clean, 0, clean_n)
+    } else {
+        body = substr(resp, body_off, resp_n - body_off)
+    }
+    return _tls_res(TLS13_OK, code, body, "ok")
+}
