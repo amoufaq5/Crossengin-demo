@@ -1,0 +1,203 @@
+// CrossEngin learning: live FETCH -> PREPROCESS -> INGEST pipeline (R41 /
+// ADR-0028 + ADR-0026).
+//
+// Purpose
+//   The missing "sequence" behind "/learn is not connected to the internet".
+//   The pieces existed but were never wired end to end inside the engine:
+//     - src/learning/dns_resolver.nova   resolve host -> IP (DNS over UDP)
+//     - src/io/transducers/http_client    real socket HTTP/1.1 GET
+//     - src/learning/internet_fetch       whitelist + rate-limit + transport
+//     - src/learning/preprocess           HTML -> content words + S/R/O triples
+//   This module joins them into a single call, `learn_from_url`, and -- the
+//   load-bearing fix -- INGESTS the result by CREATING atoms for new concepts
+//   and reasoning operators for every triple. The pre-R41 `/learn` only linked
+//   triples whose subject AND object already existed, so learning a genuinely
+//   new fact produced no reasoning edges; here a fetched "photosynthesis is_a
+//   process" mints both concept atoms and the implicative operator, so the
+//   academic strategy can immediately forward-chain over freshly-learned
+//   knowledge.
+//
+//   Scope: http:// only (https needs the deferred TLS stack -- the pipeline
+//   says so plainly rather than failing opaquely). Body capped at LP_MAX_BYTES.
+//   The fetch is gated by a per-call whitelist that admits exactly the
+//   requested host plus the ADR-0028 rate limiter, so an explicit user /learn
+//   cannot be turned into an open relay.
+//
+// ADRs implemented: ADR-0028 (gated fetch transport), ADR-0026 (ingest as
+//   provenance=fetched knowledge), ADR-0031 (operators it mints). NOVA deps:
+//   builtins. CrossEngin deps: internet_fetch, preprocess, dns_resolver,
+//   ../language/word_atoms, ../parts/reasoning/reasoning_atoms.
+
+import "internet_fetch.nova"
+import "preprocess.nova"
+import "dns_resolver.nova"
+import "../language/word_atoms.nova"
+import "../parts/reasoning/reasoning_atoms.nova"
+
+let LP_MAX_BYTES = 262144      // 256 KB is plenty for a knowledge page
+
+// ---- status codes ---------------------------------------------------------
+let LP_OK             = 1
+let LP_BAD_URL        = 2
+let LP_HTTPS_DEFERRED = 3
+let LP_DNS_FAIL       = 4
+let LP_FETCH_DENIED   = 5
+let LP_FETCH_ERR      = 6
+let LP_EMPTY          = 7
+
+fn lp_status_name(s) {
+    if s == LP_OK             { return "ok" }
+    if s == LP_BAD_URL        { return "bad-url" }
+    if s == LP_HTTPS_DEFERRED { return "https-deferred" }
+    if s == LP_DNS_FAIL       { return "dns-failed" }
+    if s == LP_FETCH_DENIED   { return "fetch-denied" }
+    if s == LP_FETCH_ERR      { return "fetch-error" }
+    if s == LP_EMPTY          { return "empty" }
+    return "unknown"
+}
+
+// result = [status, words, ops, new_atoms, http_status, message]
+fn _lp_result(status, words, ops, new_atoms, http_status, msg) {
+    let r = list_new()
+    push(r, status) push(r, words) push(r, ops)
+    push(r, new_atoms) push(r, http_status) push(r, msg)
+    return r
+}
+fn lp_status(r)     { return r[0] }
+fn lp_words(r)      { return r[1] }
+fn lp_ops(r)        { return r[2] }
+fn lp_new_atoms(r)  { return r[3] }
+fn lp_http(r)       { return r[4] }
+fn lp_message(r)    { return r[5] }
+
+// ---- relation -> operator kind (preprocess emits 5 relations) -------------
+fn _lp_rel_kind(rel) {
+    if str_eq(rel, "causes") == 1       { return ROP_CAUSAL }
+    if str_eq(rel, "has_property") == 1 { return ROP_CAUSAL }
+    if str_eq(rel, "is_a") == 1         { return ROP_IMPLY }
+    if str_eq(rel, "part_of") == 1      { return ROP_IMPLY }
+    if str_eq(rel, "defined_as") == 1   { return ROP_IMPLY }
+    return ROP_CAUSAL
+}
+
+// Ensure a concept atom for `name` exists in kg and is bound to a word atom in
+// lang. Returns [atom, created_flag].
+fn _lp_ensure_concept(kg, lang, name, now) {
+    let existing = kg_find_atom(kg, name)
+    let a = existing
+    let created = 0
+    if existing == 0 {
+        a = kg_add_atom(kg, ATOM_CONCEPT, name, now)
+        created = 1
+    }
+    let w = word_intern(lang, name, now)
+    word_add_sense(w, a, 700)
+    let r = list_new()
+    push(r, a) push(r, created)
+    return r
+}
+
+// Ingest a preprocessor result (atoms = content words, triples = [S,R,O]) into
+// the KGs. Content words become concept atoms; triples become reasoning
+// operators, CREATING their endpoint atoms when absent (the R41 fix). Returns
+// [words_ingested, ops_created, new_atoms]. Pure w.r.t. the network -- the
+// unit test drives it directly on a synthetic preprocessor result.
+fn lp_ingest(kg, lang, atoms, triples, src_label, now) {
+    let words = 0
+    let ops = 0
+    let new_atoms = 0
+
+    let i = 0
+    while i < len(atoms) {
+        let name = atoms[i]
+        if len(name) > 0 {
+            let res = _lp_ensure_concept(kg, lang, name, now)
+            if res[1] == 1 { new_atoms = new_atoms + 1 }
+            words = words + 1
+        }
+        i = i + 1
+    }
+
+    let t = 0
+    while t < len(triples) {
+        let tr = triples[t]
+        if len(tr) >= 3 {
+            let s = tr[0]
+            let rel = tr[1]
+            let o = tr[2]
+            if len(s) > 0 {
+                if len(o) > 0 {
+                    let sa = _lp_ensure_concept(kg, lang, s, now)
+                    let oa = _lp_ensure_concept(kg, lang, o, now)
+                    if sa[1] == 1 { new_atoms = new_atoms + 1 }
+                    if oa[1] == 1 { new_atoms = new_atoms + 1 }
+                    let kind = _lp_rel_kind(rel)
+                    rop_new(kg, kind, atom_id(sa[0]), atom_id(oa[0]),
+                            src_label + ":" + s + "-" + rel + "->" + o, now)
+                    ops = ops + 1
+                }
+            }
+        }
+        t = t + 1
+    }
+
+    let r = list_new()
+    push(r, words) push(r, ops) push(r, new_atoms)
+    return r
+}
+
+// ---- the full live sequence ------------------------------------------------
+// learn_from_url(url, kg, lang, now) -> result (see accessors above).
+fn learn_from_url(url, kg, lang, now) {
+    let parts = http_parse_url(url)
+    let scheme = parts[0]
+    let host = parts[1]
+    if len(host) == 0 {
+        return _lp_result(LP_BAD_URL, 0, 0, 0, 0, "could not parse a host out of the url")
+    }
+    if str_eq(scheme, "https") == 1 {
+        return _lp_result(LP_HTTPS_DEFERRED, 0, 0, 0, 0,
+            "https needs the deferred TLS stack -- try an http:// source")
+    }
+    if str_eq(scheme, "http") == 0 {
+        return _lp_result(LP_BAD_URL, 0, 0, 0, 0, "only http:// is supported in-engine")
+    }
+
+    // FETCH stage 1: resolve the host in-engine and inject the mapping so
+    // http_get connects to the right IP with the correct Host header.
+    let ip = dns_resolve(host)
+    if len(ip) == 0 {
+        return _lp_result(LP_DNS_FAIL, 0, 0, 0, 0, "could not resolve host " + host)
+    }
+    http_dns_add(host, ip)
+
+    // FETCH stage 2: gate (whitelist this host + ADR-0028 rate limiter).
+    let wl = sw_new()
+    sw_add(wl, host)
+    let fetcher = if_fetcher_new(wl, sa_new())
+    let permit = if_permit(fetcher, url, now)
+    if permit == FETCH_DENIED_HOST {
+        return _lp_result(LP_FETCH_DENIED, 0, 0, 0, 0, "host not permitted by the fetch gate")
+    }
+
+    // FETCH stage 3: transport (real socket GET via internet_fetch).
+    let tr = if_dispatch_transport(url, LP_MAX_BYTES)
+    if_complete(fetcher)
+    let tag = if_tr_tag(tr)
+    if tag == IF_TRANSPORT_DEFERRED {
+        return _lp_result(LP_HTTPS_DEFERRED, 0, 0, 0, if_tr_status(tr),
+            "transport deferred (https)")
+    }
+    if tag != IF_TRANSPORT_HTTP_OK {
+        return _lp_result(LP_FETCH_ERR, 0, 0, 0, if_tr_status(tr), if_tr_err(tr))
+    }
+    let body = if_tr_body(tr)
+    if len(body) == 0 {
+        return _lp_result(LP_EMPTY, 0, 0, 0, if_tr_status(tr), "fetched an empty body")
+    }
+
+    // PREPROCESS + INGEST.
+    let pp = preprocess_run(body)
+    let ing = lp_ingest(kg, lang, pp[0], pp[1], "src:url:" + host, now)
+    return _lp_result(LP_OK, ing[0], ing[1], ing[2], if_tr_status(tr), "ok")
+}
