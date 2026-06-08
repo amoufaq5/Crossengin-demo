@@ -1,6 +1,16 @@
 # TLS_AUDIT — what real TLS in CrossEngin would take
 
-Status: **TLS 1.3 1-RTT client shipped (R42) — without certificate
+Status: **TLS 1.3 client with opt-in strict authentication (R43).** R43 adds
+RSA cert-chain verification (`src/safety/rsa.nova` PKCS#1 v1.5 + PSS,
+`src/safety/x509_verify.nova` chain + SAN + validity) and a pinned gateway-root
+anchor: with `CE_TLS_STRICT=1` the client verifies the presented chain to the
+pinned sandbox egress-gateway CA + hostname + CertificateVerify before sending
+the request, and rejects on any failure (verified live, incl. wrong-host /
+wrong-pin rejection). The pins authenticate the gateway -- the actual TLS peer
+in this sandbox -- not the true origin; strict is opt-in, lenient is the
+portable default. See `docs/adr/r43-tls-certificate-verification.md`.
+
+Status (R42): **TLS 1.3 1-RTT client shipped — without certificate
 verification.** `src/io/transducers/tls13_client.nova` completes a real
 `TLS_CHACHA20_POLY1305_SHA256` + P-256 handshake and exchanges encrypted HTTP,
 validated against the RFC 8448 key-schedule trace and the RFC 8439 AEAD vector

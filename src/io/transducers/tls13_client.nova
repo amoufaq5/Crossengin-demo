@@ -32,6 +32,7 @@ import "../../safety/sha256.nova"
 import "../../safety/chacha20.nova"
 import "../../safety/poly1305.nova"
 import "../../safety/p256.nova"
+import "../../safety/x509_verify.nova"
 
 let TLS_HASH_LEN = 32
 
@@ -232,6 +233,7 @@ let TLS13_CONNECT_FAIL  = 2
 let TLS13_HS_FAIL       = 3
 let TLS13_ALERT         = 4
 let TLS13_BParse        = 5
+let TLS13_CERT_FAIL     = 6
 
 fn _tls_dbg() {
     let e = getenv("CE_TLS_DEBUG")
@@ -245,7 +247,89 @@ fn tls13_status_name(s) {
     if s == TLS13_HS_FAIL      { return "handshake-failed" }
     if s == TLS13_ALERT        { return "tls-alert" }
     if s == TLS13_BParse       { return "parse-failed" }
+    if s == TLS13_CERT_FAIL    { return "cert-verify-failed" }
     return "unknown"
+}
+
+// Strict mode (CE_TLS_STRICT=1) requires the presented chain to terminate at a
+// pinned anchor + pass hostname/validity + a valid CertificateVerify. Default
+// is lenient (encrypted but unauthenticated), for portability.
+fn _tls_strict() {
+    let e = getenv("CE_TLS_STRICT")
+    if e != 0 { if len(e) > 0 { if str_eq(e, "0") == 0 { return 1 } } }
+    return 0
+}
+
+// Pinned trust anchors: the sandbox egress-gateway root CAs (production +
+// staging). Environment-specific by design -- the sandbox terminates all
+// outbound TLS at this gateway, so authenticating it is the strongest check
+// available from inside (see docs/adr/r43-*). e = 65537 for both.
+fn _tls_pin_prod() { return "a901e5e36f0ce8b6603f42d7fa06f4ca914f1e0c608877eb482b5bc00a1a3e40b0252eae950e1439637e877e0ca81dcd0b04b2e240ec2ff7edf92b443681f6bbc297e1bdbb35ca06598b89949157f0ce41b2e967ef1f128ddb052b3ff8df2549be52bbd1717cb0c514c0cb9f64be2bf5929a800f853574e4fa935aaf7626ad3947e9a196bb85925544a188ff6a2a25e2133953144f8bad1d8a39cf0fa8d84bd8184887aaa3562c60830ebc01e02f42f5fb4e39882b2039d8bddba389f53f8e4df45109be2743501ad7eb2ea55e29b39785d87e148d54007b96a1f1b92d97972c5e8f7b124735eff589edaee60ca178654b5fe9b0f6dc339551fd02360650eb31" }
+fn _tls_pin_stag() { return "8d61b368adf3f5df64b051d051d53f84e0be3706a34a94caa51fa4df054208f730de98d5b97bc1f08c1758abaa2481cef3e16e6cc8b88f5f0a64bce283eeea3287fd03cf33733c826f359bb0b7d3e6b8bc47a2a38d5fc3bf235ff68544db4f8d383f186bf43ca68ce207561a8fe7b9094e8b8a543c1e890d64a468db94897a534e366e1759d6826206c531a15c198dea3f0df7f728dc076075fed34c8db7f822c6f56fb3741dfe70f969dee7a240260c2b331a7c1a0d400d5b44941f71aac56c2fdc164041735ab6c5b45cf4dc4974b39491a085a4b2debba05e19b8bca53defc1fa298febae412bebbaec97b8cbbe8c11546bfe5ff044795e3892481fbc96b7" }
+
+// Parse a TLS 1.3 Certificate handshake message (at hsb+off) into a list of
+// [der_ptr, der_len].
+fn _tls_parse_cert_msg(hsb, off) {
+    let p = off + 4                                  // skip handshake header
+    let ctx_len = load8(hsb + p)
+    p = p + 1 + ctx_len                              // certificate_request_context
+    let list_len = load8(hsb + p) * 65536 + load8(hsb + p + 1) * 256 + load8(hsb + p + 2)
+    p = p + 3
+    let list_end = p + list_len
+    let out = list_new()
+    while p < list_end {
+        let clen = load8(hsb + p) * 65536 + load8(hsb + p + 1) * 256 + load8(hsb + p + 2)
+        p = p + 3
+        let entry = list_new()
+        push(entry, hsb + p)
+        push(entry, clen)
+        push(out, entry)
+        p = p + clen
+        let ext_len = load8(hsb + p) * 256 + load8(hsb + p + 1)
+        p = p + 2 + ext_len
+    }
+    return out
+}
+
+// Chain-verify against each pinned anchor; first XV_OK wins.
+fn _tls_verify_chain(der_list, host, now) {
+    let pins = list_new()
+    push(pins, _tls_pin_prod())
+    push(pins, _tls_pin_stag())
+    let i = 0
+    let last = XV_NOT_PINNED
+    while i < len(pins) {
+        let r = cert_chain_verify(der_list, host, bn2048_from_hex(pins[i]), 65537, now)
+        if r[0] == XV_OK { return r }
+        if r[0] != XV_NOT_PINNED { last = r[0] }
+        i = i + 1
+    }
+    let r = list_new() push(r, last) push(r, 0)
+    return r
+}
+
+// Verify the server CertificateVerify (RSA-PSS rsa_pss_rsae_sha256) at hsb+off
+// using the leaf key, over the transcript hash through Certificate.
+fn _tls_verify_certverify(hsb, off, th_cert, leaf_N, leaf_e) {
+    let p = off + 4
+    let alg = load8(hsb + p) * 256 + load8(hsb + p + 1)
+    p = p + 2
+    let sig_len = load8(hsb + p) * 256 + load8(hsb + p + 1)
+    p = p + 2
+    let sig = hsb + p
+    let ctx = "TLS 1.3, server CertificateVerify"
+    let cn = 64 + len(ctx) + 1 + 32
+    let content = alloc(cn + 1)
+    let i = 0
+    while i < 64 { store8(content + i, 32) i = i + 1 }
+    let j = 0
+    while j < len(ctx) { store8(content + 64 + j, char_at(ctx, j)) j = j + 1 }
+    store8(content + 64 + len(ctx), 0)
+    let k = 0
+    while k < 32 { store8(content + 64 + len(ctx) + 1 + k, load8(th_cert + k)) k = k + 1 }
+    let cvhash = sha256_oneshot(content, cn)
+    if alg == 2052 { return rsa_pss_sha256_verify(leaf_N, leaf_e, cvhash, sig, sig_len) }
+    return 0                                          // only rsa_pss_rsae_sha256 (RSA leaf)
 }
 
 // ---- byte writers (big-endian) --------------------------------------------
@@ -561,6 +645,11 @@ fn tls_get(host, ip, port, path, max_bytes) {
     let hp = 0
     let s_seq = 0
     if _tls_dbg() == 1 { print("[tls] hs keys derived; reading flight\n") }
+    // R43: capture the Certificate + CertificateVerify (and the transcript hash
+    // through Certificate) for strict-mode authentication after the flight.
+    let cert_off = 0 - 1
+    let cv_off = 0 - 1
+    let th_cert = 0
     let fin_done = 0
     while fin_done == 0 {
         let rec = _tls_read_record(sock)
@@ -602,12 +691,30 @@ fn tls_get(host, ip, port, path, max_bytes) {
                         fin_done = 1
                         scanning = 0
                     } else {
+                        if mtype == 11 { cert_off = hp }                       // Certificate
+                        if mtype == 15 { th_cert = sha256_oneshot(tr, tr_n) cv_off = hp }  // CertificateVerify: hash through Certificate
                         tr_n = _tls_copy(tr, tr_n, hsb + hp, 4 + mlen)
                     }
                     hp = hp + 4 + mlen
                 }
             }
         }
+    }
+
+    // R43 strict authentication: verify the chain to a pinned gateway root +
+    // hostname + validity + the CertificateVerify, BEFORE sending the request.
+    // Lenient mode (default) skips this -- confidential but unauthenticated.
+    if _tls_strict() == 1 {
+        if cert_off < 0 { close_fd(sock) return _tls_res(TLS13_CERT_FAIL, 0, "", "strict: no Certificate message") }
+        let der_list = _tls_parse_cert_msg(hsb, cert_off)
+        let vr = _tls_verify_chain(der_list, host, time())
+        if vr[0] != XV_OK { close_fd(sock) return _tls_res(TLS13_CERT_FAIL, 0, "", "chain: " + xv_name(vr[0])) }
+        if cv_off < 0 { close_fd(sock) return _tls_res(TLS13_CERT_FAIL, 0, "", "strict: no CertificateVerify") }
+        let leaf = vr[1]
+        if _tls_verify_certverify(hsb, cv_off, th_cert, cert_N(leaf), cert_e(leaf)) == 0 {
+            close_fd(sock) return _tls_res(TLS13_CERT_FAIL, 0, "", "certificate-verify signature invalid")
+        }
+        if _tls_dbg() == 1 { print("[tls] STRICT: chain->pinned root + hostname + certverify OK\n") }
     }
 
     // app keys (transcript through server Finished)

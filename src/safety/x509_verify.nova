@@ -1,0 +1,276 @@
+// CrossEngin safety: X.509 chain verification for RSA certificates (R43).
+//
+// Purpose
+//   Authenticates a TLS 1.3 server by validating the presented certificate
+//   chain against a PINNED trust anchor. The existing `x509.nova` parses
+//   ECDSA certs for the DTLS path; this module handles the RSA chains the
+//   sandbox egress gateway presents (leaf <- SDS Issuing CA <- pinned root),
+//   extracting the bits a chain check needs that `x509.nova` does not: the RSA
+//   public key (modulus + exponent), the Subject Alternative Names, the exact
+//   tbsCertificate byte range (what the signature covers), and the signature.
+//
+//   Checks performed by cert_chain_verify():
+//     1. each cert's sha256WithRSAEncryption signature verifies under the next
+//        cert's public key (PKCS#1 v1.5);
+//     2. the top cert's public key equals the pinned anchor key;
+//     3. the leaf's SAN covers the requested host (exact or *.suffix);
+//     4. the leaf is within its validity window.
+//   The TLS 1.3 CertificateVerify (RSA-PSS) is checked separately by the
+//   caller (tls13_client) using the leaf key this module returns.
+//
+// NOVA deps: alloc/load8/store8, substr (buffer slice), time. CrossEngin deps:
+//   ../safety/rsa.nova (-> bignum_2048 + sha256). Tested in
+//   tests/unit/test_x509_verify.nova against the live gateway chain.
+
+import "rsa.nova"
+
+// ---- minimal DER reader: [tag, content_off, content_len, next_off] --------
+fn _der(buf, pos) {
+    let tag = load8(buf + pos)
+    let p = pos + 1
+    let b0 = load8(buf + p)
+    let length = 0
+    if b0 < 128 { length = b0 p = p + 1 }
+    else {
+        let num = b0 - 128
+        p = p + 1
+        let k = 0
+        while k < num { length = length * 256 + load8(buf + p) p = p + 1 k = k + 1 }
+    }
+    let r = list_new()
+    push(r, tag) push(r, p) push(r, length) push(r, p + length)
+    return r
+}
+
+fn _x509v_nib(v) { if v < 10 { return 48 + v } return 87 + v }
+fn _x509v_bytes_to_hex(buf, off, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = load8(buf + off + i)
+        s = s + chr(_x509v_nib(int_shr(b, 4))) + chr(_x509v_nib(int_and(b, 15)))
+        i = i + 1
+    }
+    return s
+}
+
+fn _x509v_two(buf, off) { return (load8(buf + off) - 48) * 10 + (load8(buf + off + 1) - 48) }
+fn _x509v_four(buf, off) {
+    return (load8(buf + off) - 48) * 1000 + (load8(buf + off + 1) - 48) * 100
+         + (load8(buf + off + 2) - 48) * 10 + (load8(buf + off + 3) - 48)
+}
+// days since 1970-01-01 (Howard Hinnant's algorithm; years >= 2000 here).
+fn _x509v_days(y, m, d) {
+    let yy = y
+    if m <= 2 { yy = yy - 1 }
+    let era = yy / 400
+    let yoe = yy - era * 400
+    let mm = m + 9
+    if m > 2 { mm = m - 3 }
+    let doy = (153 * mm + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+// Parse a UTCTime (0x17, YY...) or GeneralizedTime (0x18) TLV at pos -> unix.
+fn _x509v_time(buf, pos) {
+    let t = _der(buf, pos)
+    let o = t[1]
+    let year = 0
+    let rest = o
+    if t[0] == 23 {                       // UTCTime YYMMDDHHMMSSZ
+        let yy = _x509v_two(buf, o)
+        if yy < 50 { year = 2000 + yy } else { year = 1900 + yy }
+        rest = o + 2
+    } else {                              // GeneralizedTime YYYYMMDD...
+        year = _x509v_four(buf, o)
+        rest = o + 4
+    }
+    let mon = _x509v_two(buf, rest)
+    let day = _x509v_two(buf, rest + 2)
+    let hh = _x509v_two(buf, rest + 4)
+    let mm2 = _x509v_two(buf, rest + 6)
+    let ss = _x509v_two(buf, rest + 8)
+    return _x509v_days(year, mon, day) * 86400 + hh * 3600 + mm2 * 60 + ss
+}
+
+// ---- RSA SubjectPublicKeyInfo -> [N_bn, e_int] ----------------------------
+fn _x509v_rsa_spki(buf, spki_off) {
+    let spki = _der(buf, spki_off)
+    let alg = _der(buf, spki[1])
+    let bs = _der(buf, alg[3])            // subjectPublicKey BIT STRING
+    let rsa_seq = _der(buf, bs[1] + 1)    // skip unused-bits byte (0x00)
+    let modint = _der(buf, rsa_seq[1])    // INTEGER modulus
+    let expint = _der(buf, modint[3])     // INTEGER exponent
+    let moff = modint[1]
+    let mlen = modint[2]
+    if load8(buf + moff) == 0 { moff = moff + 1 mlen = mlen - 1 }   // strip sign byte
+    let n = bn2048_from_hex(_x509v_bytes_to_hex(buf, moff, mlen))
+    let e = 0
+    let i = 0
+    while i < expint[2] { e = e * 256 + load8(buf + expint[1] + i) i = i + 1 }
+    let r = list_new() push(r, n) push(r, e)
+    return r
+}
+
+// Collect dNSName SANs from the extensions SEQUENCE [off,end).
+fn _x509v_collect_san(buf, off, end, out) {
+    let p = off
+    while p < end {
+        let ext = _der(buf, p)
+        let oid = _der(buf, ext[1])
+        let is_san = 0
+        if oid[2] == 3 {
+            if load8(buf + oid[1]) == 85 { if load8(buf + oid[1] + 1) == 29 { if load8(buf + oid[1] + 2) == 17 { is_san = 1 } } }
+        }
+        if is_san == 1 {
+            let q = oid[3]
+            if load8(buf + q) == 1 { let bo = _der(buf, q) q = bo[3] }   // optional critical BOOLEAN
+            let octet = _der(buf, q)
+            let gnseq = _der(buf, octet[1])
+            let g = gnseq[1]
+            while g < gnseq[3] {
+                let gn = _der(buf, g)
+                if gn[0] == 130 { push(out, substr(buf, gn[1], gn[2])) }   // [2] dNSName
+                g = gn[3]
+            }
+        }
+        p = ext[3]
+    }
+    return 1
+}
+
+// ---- cert record ----------------------------------------------------------
+// [ok, N_bn, e_int, der_buf, tbs_off, tbs_len, sig_off, sig_n, san_list, nb, na]
+fn cert_parse(der, n) {
+    let cert = _der(der, 0)
+    let cpos = cert[1]
+    let tbs = _der(der, cpos)
+    let tbs_off = cpos
+    let tbs_end = tbs[3]
+    let tbs_len = tbs_end - cpos
+    let p = tbs[1]
+    if load8(der + p) == 160 { let v = _der(der, p) p = v[3] }   // version [0]
+    let ser = _der(der, p) p = ser[3]                            // serialNumber
+    let alg1 = _der(der, p) p = alg1[3]                          // signature alg
+    let issuer = _der(der, p) p = issuer[3]                      // issuer
+    let val = _der(der, p)                                       // validity
+    let nbt = _der(der, val[1])
+    let nb = _x509v_time(der, val[1])
+    let na = _x509v_time(der, nbt[3])
+    p = val[3]
+    let subj = _der(der, p) p = subj[3]                          // subject
+    let spki = _der(der, p)                                      // SPKI
+    let pk = _x509v_rsa_spki(der, p)
+    p = spki[3]
+    let san = list_new()
+    if p < tbs_end {
+        if load8(der + p) == 163 {                              // extensions [3]
+            let exts_exp = _der(der, p)
+            let exts = _der(der, exts_exp[1])
+            _x509v_collect_san(der, exts[1], exts[3], san)
+        }
+    }
+    let sig_alg = _der(der, tbs_end)
+    let sig_bs = _der(der, sig_alg[3])                          // signature BIT STRING
+    let sig_off = sig_bs[1] + 1                                 // skip unused-bits byte
+    let sig_n = sig_bs[2] - 1
+    let r = list_new()
+    push(r, 1) push(r, pk[0]) push(r, pk[1]) push(r, der)
+    push(r, tbs_off) push(r, tbs_len) push(r, sig_off) push(r, sig_n)
+    push(r, san) push(r, nb) push(r, na)
+    return r
+}
+fn cert_ok(c)      { return c[0] }
+fn cert_N(c)       { return c[1] }
+fn cert_e(c)       { return c[2] }
+fn cert_san(c)     { return c[8] }
+fn cert_not_before(c) { return c[9] }
+fn cert_not_after(c)  { return c[10] }
+// SHA-256 over the tbsCertificate bytes (what the signature covers).
+fn cert_tbs_hash(c) { return sha256_oneshot(c[3] + c[4], c[5]) }
+fn cert_sig_buf(c) { return c[3] + c[6] }
+fn cert_sig_n(c)   { return c[7] }
+
+// hostname vs one SAN pattern: exact, or "*.suffix".
+fn _x509v_san_match(host, pat) {
+    if str_eq(host, pat) == 1 { return 1 }
+    if len(pat) >= 2 {
+        if char_at(pat, 0) == 42 { if char_at(pat, 1) == 46 {     // "*."
+            let suffix = substr(pat, 1, len(pat) - 1)             // ".rest"
+            let hi = str_find(host, suffix)
+            if hi > 0 { if hi + len(suffix) == len(host) {
+                // wildcard matches exactly one leftmost label (no extra dot)
+                if str_find(substr(host, 0, hi), ".") < 0 { return 1 }
+            } }
+        } }
+    }
+    return 0
+}
+fn _x509v_host_ok(host, san) {
+    let i = 0
+    while i < len(san) {
+        if _x509v_san_match(host, san[i]) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- chain verification ---------------------------------------------------
+let XV_OK            = 1
+let XV_PARSE         = 2
+let XV_SIG           = 3
+let XV_NOT_PINNED    = 4
+let XV_HOSTNAME      = 5
+let XV_EXPIRED       = 6
+
+fn xv_name(s) {
+    if s == XV_OK         { return "ok" }
+    if s == XV_PARSE      { return "parse-failed" }
+    if s == XV_SIG        { return "bad-chain-signature" }
+    if s == XV_NOT_PINNED { return "root-not-pinned" }
+    if s == XV_HOSTNAME   { return "hostname-mismatch" }
+    if s == XV_EXPIRED    { return "expired-or-not-yet-valid" }
+    return "unknown"
+}
+
+// der_list: list of [buf, len] leaf-first. pinned_N/pinned_e: the trust anchor
+// RSA key. Returns [status, leaf_cert] (leaf_cert valid only on XV_OK; used by
+// the caller for the CertificateVerify check).
+fn cert_chain_verify(der_list, host, pinned_N, pinned_e, now) {
+    let certs = list_new()
+    let i = 0
+    while i < len(der_list) {
+        let c = cert_parse(der_list[i][0], der_list[i][1])
+        if cert_ok(c) == 0 { let r = list_new() push(r, XV_PARSE) push(r, 0) return r }
+        push(certs, c)
+        i = i + 1
+    }
+    if len(certs) == 0 { let r = list_new() push(r, XV_PARSE) push(r, 0) return r }
+
+    // 1. each cert signed by its parent (next in the list).
+    let k = 0
+    while k < len(certs) - 1 {
+        let child = certs[k]
+        let parent = certs[k + 1]
+        if rsa_pkcs1_sha256_verify(cert_N(parent), cert_e(parent), cert_tbs_hash(child), cert_sig_buf(child), cert_sig_n(child)) == 0 {
+            let r = list_new() push(r, XV_SIG) push(r, 0) return r
+        }
+        k = k + 1
+    }
+
+    // 2. top cert's key == pinned anchor.
+    let top = certs[len(certs) - 1]
+    if bn2048_cmp(cert_N(top), pinned_N) != 0 {
+        let r = list_new() push(r, XV_NOT_PINNED) push(r, 0) return r
+    }
+
+    // 3 + 4. leaf hostname + validity.
+    let leaf = certs[0]
+    if _x509v_host_ok(host, cert_san(leaf)) == 0 {
+        let r = list_new() push(r, XV_HOSTNAME) push(r, 0) return r
+    }
+    if now < cert_not_before(leaf) { let r = list_new() push(r, XV_EXPIRED) push(r, 0) return r }
+    if now > cert_not_after(leaf)  { let r = list_new() push(r, XV_EXPIRED) push(r, 0) return r }
+
+    let r = list_new() push(r, XV_OK) push(r, leaf) return r
+}
