@@ -1,6 +1,13 @@
 # TLS_AUDIT — what real TLS in CrossEngin would take
 
-Status: **TLS 1.3 client with opt-in strict authentication (R43).** R43 adds
+Status: **TLS 1.3 client with opt-in strict authentication + a pluggable PEM
+trust store (R43, R46).** R46 (`src/safety/pem_truststore.nova`) loads RSA trust
+anchors from a PEM CA bundle pointed to by `CE_TLS_CA_BUNDLE` (e.g.
+`/etc/ssl/certs/ca-certificates.crt`), so anchors are configuration rather than
+hard-coded; the built-in gateway pins remain the no-config fallback. See
+`docs/adr/r46-pluggable-pem-trust-store.md`.
+
+Status (R43): **TLS 1.3 client with opt-in strict authentication.** R43 adds
 RSA cert-chain verification (`src/safety/rsa.nova` PKCS#1 v1.5 + PSS,
 `src/safety/x509_verify.nova` chain + SAN + validity) and a pinned gateway-root
 anchor: with `CE_TLS_STRICT=1` the client verifies the presented chain to the
