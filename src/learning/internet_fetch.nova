@@ -263,3 +263,165 @@ fn if_tr_tag(r)    { return r[0] }
 fn if_tr_status(r) { return r[1] }
 fn if_tr_body(r)   { return r[2] }
 fn if_tr_err(r)    { return r[3] }
+
+// ---- if_fetch: composer (R39B / NOVA enhancement #11) --------------------
+//
+// The single-call composer that wires
+//   if_permit (whitelist + rate-limit gate)
+//     -> http_get over TCP (the new transport seam)
+//     -> if_ingest (validation + KG ingestion + cache write)
+//
+// Prior API (if_permit / if_complete / if_ingest / if_validate / if_dispatch_transport)
+// is UNCHANGED. Callers that already drive the explicit three-step flow
+// (permit -> transport -> complete + ingest) keep working byte-identical;
+// `if_fetch` is purely a convenience for the common "give me bytes for this
+// URL" case used by the agent / chat / atom-birth-monitor wiring.
+//
+// Returns one uniform 5-slot record so the caller can switch on `tag`
+// without unpacking the http_client's 4-slot record AND the fetcher's
+// 5-slot record separately:
+//
+//   if_fetch(f, domain_kg, url, now)
+//     -> [tag, status_code, body, byte_count, err]
+//
+// Tag values (re-using FETCH_* for gate decisions, adding IF_ERR_* for HTTP
+// failures so the caller doesn't have to interpret HTTP_ERR_* strings):
+//
+//   FETCH_OK            (=1) -- request succeeded; body and byte_count populated.
+//                               If a domain_kg was supplied AND content was
+//                               valid for ingest, if_ingest ran and the body
+//                               is cached. byte_count is len(body).
+//   FETCH_DENIED_HOST   (=2) -- whitelist denied the URL; body "".
+//   FETCH_RATE_LIMITED  (=3) -- rate-limit budget exhausted; body "".
+//   FETCH_INVALID       (=4) -- HTTP succeeded but content_type / size failed
+//                               if_validate; status_code is populated, body
+//                               is the bytes that came back so the caller can
+//                               log them.
+//   FETCH_CACHE_HIT     (=5) -- the URL was in cache; body is the cached body.
+//   IF_ERR_HTTP_CONNECT (=10) -- socket / connect / send failed.
+//   IF_ERR_HTTP_TIMEOUT (=11) -- recv timed out (today: no timeout builtin so
+//                                this surfaces only via the policy-layer
+//                                rate-limit ceiling; reserved for the day
+//                                sys_setsockopt lands).
+//   IF_ERR_HTTP_PARSE   (=12) -- status line / header / chunked decode error.
+//   IF_ERR_HTTP_OVERSIZE(=13) -- recv hit the 2MB cap or chunked decode
+//                                exceeded max_bytes. body slot still holds
+//                                whatever was read up to the cap.
+//   IF_ERR_HTTP_DNS     (=14) -- DNS unresolved (no dotted-quad host, env
+//                                cache miss).
+//   IF_ERR_HTTP_SCHEME  (=15) -- https deferred to R39B.2 or unsupported scheme.
+
+let IF_ERR_HTTP_CONNECT  = 10
+let IF_ERR_HTTP_TIMEOUT  = 11
+let IF_ERR_HTTP_PARSE    = 12
+let IF_ERR_HTTP_OVERSIZE = 13
+let IF_ERR_HTTP_DNS      = 14
+let IF_ERR_HTTP_SCHEME   = 15
+
+fn _if_fetch_result(tag, status, body, byte_count, err) {
+    let r = list_new()
+    push(r, tag)
+    push(r, status)
+    push(r, body)
+    push(r, byte_count)
+    push(r, err)
+    return r
+}
+
+// Map an HTTP_ERR_* string from http_client.nova to an IF_ERR_HTTP_* tag.
+// The string -> tag mapping is the seam where the http_client's lexical
+// error surface becomes the learning layer's structured tag, so callers
+// don't have to do string comparisons in policy code.
+fn _if_fetch_http_err_tag(err_msg) {
+    if str_eq(err_msg, HTTP_ERR_CONNECT)  == 1 { return IF_ERR_HTTP_CONNECT }
+    if str_eq(err_msg, HTTP_ERR_SOCKET)   == 1 { return IF_ERR_HTTP_CONNECT }
+    if str_eq(err_msg, HTTP_ERR_SEND)     == 1 { return IF_ERR_HTTP_CONNECT }
+    if str_eq(err_msg, HTTP_ERR_RECV)     == 1 { return IF_ERR_HTTP_CONNECT }
+    if str_eq(err_msg, HTTP_ERR_TIMEOUT)  == 1 { return IF_ERR_HTTP_TIMEOUT }
+    if str_eq(err_msg, HTTP_ERR_TOO_LARGE) == 1 { return IF_ERR_HTTP_OVERSIZE }
+    if str_eq(err_msg, HTTP_ERR_DNS)      == 1 { return IF_ERR_HTTP_DNS }
+    if str_eq(err_msg, HTTP_ERR_SCHEME)   == 1 { return IF_ERR_HTTP_SCHEME }
+    if str_eq(err_msg, HTTP_ERR_MALFORMED) == 1 { return IF_ERR_HTTP_SCHEME }
+    // Anything else (NO_STATUS, BAD_STATUS, CHUNKED) is a parse-class fault.
+    return IF_ERR_HTTP_PARSE
+}
+
+// Convenience accessors for the 5-slot if_fetch record.
+fn if_fetch_tag(r)    { return r[0] }
+fn if_fetch_status(r) { return r[1] }
+fn if_fetch_body(r)   { return r[2] }
+fn if_fetch_bytes(r)  { return r[3] }
+fn if_fetch_err(r)    { return r[4] }
+
+// The composer. See header comment above.
+//   f          : fetcher built via if_fetcher_new(whitelist, authority)
+//   domain_kg  : optional -- if 0, ingestion is skipped (transport-only).
+//                if a KG ref, if_ingest runs on FETCH_OK + valid content type.
+//   url        : absolute http(s):// URL.
+//   now        : seconds since epoch (caller supplies; clock policy out of scope).
+//
+// On any non-OK outcome, the body slot is "" except FETCH_INVALID (caller
+// may want to log) and IF_ERR_HTTP_OVERSIZE (the prefix that was recv'd
+// before the cap fired). byte_count is len(body) in every case so the
+// caller never has to call len() twice.
+fn if_fetch(f, domain_kg, url, now) {
+    // Gate first. Cache hit short-circuits the whole transport / ingestion.
+    let gate = if_permit(f, url, now)
+    if gate == FETCH_CACHE_HIT {
+        let cached = if_cache_get(f, url, now)
+        return _if_fetch_result(FETCH_CACHE_HIT, 0, cached, len(cached), "")
+    }
+    if gate == FETCH_DENIED_HOST {
+        return _if_fetch_result(FETCH_DENIED_HOST, 0, "", 0, "")
+    }
+    if gate == FETCH_RATE_LIMITED {
+        return _if_fetch_result(FETCH_RATE_LIMITED, 0, "", 0, "")
+    }
+    if gate != FETCH_OK {
+        // Defensive -- if_permit only returns the five known tags.
+        return _if_fetch_result(FETCH_RATE_LIMITED, 0, "", 0, "")
+    }
+    // Transport. We always tell if_complete in both success + failure paths
+    // so the in-flight slot doesn't wedge on a transport error.
+    let resp = http_get(url, IF_MAX_BYTES)
+    if_complete(f)
+    let status = resp[0]
+    let headers = resp[1]
+    let body = resp[2]
+    let err_msg = resp[3]
+    if status == 0 {
+        let tag = _if_fetch_http_err_tag(err_msg)
+        return _if_fetch_result(tag, 0, "", 0, err_msg)
+    }
+    // HTTP_ERR_TOO_LARGE arrives as a "success-with-warning" -- status is
+    // populated and body is the up-to-max bytes. Surface it as an OVERSIZE
+    // tag so the caller can choose policy (drop / log / ingest the prefix).
+    if str_eq(err_msg, HTTP_ERR_TOO_LARGE) == 1 {
+        return _if_fetch_result(IF_ERR_HTTP_OVERSIZE, status, body, len(body), err_msg)
+    }
+    // Content type policy + (optional) ingestion. The HTTP layer already
+    // dechunked / Content-Length-trimmed the body; len(body) is the
+    // authoritative byte count.
+    let body_n = len(body)
+    let ct = http_header_get(headers, "Content-Type")
+    // Strip any parameter ("text/html; charset=utf-8" -> "text/html").
+    let semi = -1
+    let i = 0
+    while i < len(ct) {
+        if char_at(ct, i) == 59 { semi = i; i = len(ct) }
+        else { i = i + 1 }
+    }
+    let ct_main = ct
+    if semi >= 0 { ct_main = str_trim(substr(ct, 0, semi)) }
+    if if_validate(ct_main, body_n) == 0 {
+        return _if_fetch_result(FETCH_INVALID, status, body, body_n, "")
+    }
+    if domain_kg != 0 {
+        if_ingest(f, domain_kg, url, ct_main, body, body_n, now)
+    } else {
+        // No KG to attach to -- still record the cache entry so a subsequent
+        // if_fetch on the same URL is a cache hit (matches ingestion path).
+        if_cache_put(f, url, body, IF_TTL_DEFAULT, now)
+    }
+    return _if_fetch_result(FETCH_OK, status, body, body_n, "")
+}

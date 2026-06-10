@@ -6,6 +6,107 @@
 `examples/crossengin_fed_coordinator.nova`, FED\_\* parser branch
 additively added to `src/io/transducers/kg_sync.nova`
 
+## R39D addendum — autonomous-research orchestrator + idle-loop drain
+
+The federated-coordinator's data plane gains a self-initiated source: each
+participant's idle loop now drains the self-learning trigger queue
+(ADR-0026) into the gated internet-fetch pipeline (ADR-0028) without a
+human in the loop. The new orchestrator lives at
+`src/learning/autonomous_research.nova` as a phase state machine
+(FETCHING -> PREPROCESSING -> INGESTING) so the idle loop interleaves
+research with imagination on the same tick budget; no phase blocks for
+I/O long enough to starve cognitive cycles.
+
+For federation specifically: atoms born from this path carry the same
+`provenance=fetched` + `source_tier` payload as explicit `/learn` calls,
+so the kg-sync v2 atom-birth stream is byte-identical regardless of
+whether the source was a user request or an autonomous unknown-query.
+Downstream peers cannot distinguish "the user asked Aspirin" from "the
+substrate noticed Aspirin was unknown and looked it up" by looking at
+the replicated atom -- only by the absence of a corresponding `/learn`
+entry in the originator's decision-log. The aggregator's per-round DP
+noise envelope and the secure-aggregation byte boundaries are
+unaffected; only the local-ingest rate goes up.
+
+The `AR_RATE_LIMIT_MS = 2000` orchestrator-level throttle is independent
+of `IF_DOMAIN_SPACING = 2s` (the per-host gate inside internet_fetch); a
+hot SLT queue cannot flood `if_permit` calls even if a future R39D.2
+adds parallel hosts. The idle loop's `ar_tick` returns `AR_TICK_BUSY`
+when throttled so the integrator skips the rest of the idle steps that
+iteration (kg-sync among them, though kg-sync runs on its own cadence
+under the federation coordinator's tick rather than the chat REPL's).
+
+The chat-REPL integration that threads `ar_state_t` into
+`examples/crossengin_chat.nova` is deferred to R40 (R39A is
+concurrently editing the same REPL). For a federation participant
+running the daemon `examples/crossengin_daemon.nova` directly, R40
+will also add the `/research <topic>` admin command -- letting an
+operator force-queue a topic that the autonomous gap-detection didn't
+surface organically.
+
+## R39C addendum — chat-state persistence module
+
+A new `src/persistence/chat_state.nova` ships the save / load API for
+chat-session state -- soul + multi-KG state + decision-log tail -- as a
+single text-formatted file at `$HOME/.crossengin/chat_state.dat`
+(`CE_PERSIST_PATH` overrides). This is the federation-relevant surface
+for a per-participant chat REPL that re-joins a coordinator after a
+restart: the soul (identity tier + OCEAN + values), the participant's
+locally-grown KG atoms, and the audit-grade decision-log tail are all
+restored before the next learning round's aggregator step runs.
+
+The format is `VERSION 1` line-oriented; unknown record types within
+the known version are SKIPPED so a future R39C.2 (e.g. adding
+`GOAL_ENTRY`) won't break older participants reading newer files.
+Schema bumps (VERSION 2 / 3 / ...) return `PERSIST_ERR_VERSION` and
+are the new round's responsibility to migrate.
+
+Chat-REPL integration (call save on `/quit`, call load on boot) is
+intentionally deferred to R40 -- this round ships the API only because
+R39A is concurrently editing `examples/crossengin_chat.nova`.
+
+The federated-aggregator interaction stays unchanged: the local KG +
+decision-log are what a participant brings to the next round; the
+persistence layer just makes them survive a restart.
+
+## R39B addendum — HTTP/1.1 transport seam for internet_fetch
+
+The federated coordinator's per-soul ingest stream now has a NOVA-native
+byte transport for plain `http://` source URLs:
+`src/learning/internet_fetch.nova` calls `http_get` in
+`src/io/transducers/http_client.nova` directly, no `curl` shim. The
+whitelist / rate-limit / cache / source-tier-weighting pipeline
+(ADR-0028, ADR-0029) is byte-identical; the `if_fetch` composer wires
+gate -> transport -> ingest in one call and surfaces structured
+`IF_ERR_HTTP_*` tags rather than the http_client's lexical
+`HTTP_ERR_*` strings, so a federation participant's policy code can
+switch on tag without parsing error text. HTTPS remains on the
+`scripts/learn.sh` curl shim until R39B.2 lands a client-mode TLS
+stack (the DTLS in `src/federation/dtls12.nova` is server-shaped).
+Federation telemetry (kg-sync atom-birth replication) was untouched.
+
+## R39F addendum — text preprocessing pipeline (ADR-0028 transform seam)
+
+The transform between R39B's byte transport and the KG ingest now lives
+in `src/learning/preprocess.nova` as a real NOVA module rather than the
+sed/awk inside `scripts/learn.sh`. Six stages: HTML strip (removes
+`<script>`/`<style>` blocks, converts block tags to newlines, decodes
+six entities, collapses whitespace), sentence split (anchored on `. ? !`
+followed by whitespace + uppercase, with abbreviation guards on `Dr.`,
+`Mr.`, `Ms.`, `Mrs.`, `St.`, `e.g.`, `i.e.`), tokenize (whitespace +
+punctuation boundaries, lowercase, drop pure-numeric, drop single-char),
+stopword filter (~110 common English; swappable via
+`preprocess_set_stopwords`), triple extract (six anchored patterns:
+`is_a`, `has_property`, `causes`, `part_of`, `defined_as`, plus the
+`is defined as` form; cap of 2 per sentence; quality over recall), and
+the `preprocess_run(html) -> [atoms, triples]` composer with telemetry
+counters. The federation data plane is unaffected -- triples emitted
+by the preprocess stage are local-only until a soul chooses to teach
+them; participating peers see the resulting atom-births via the kg-sync
+v2 stream, which is byte-identical to before. Honest scope: English-only
+stopword list, naive HTML strip (no CDATA, no JS-rendered DOM),
+high-precision low-recall triple patterns by design.
+
 ## Why federated learning + DP is the right shape for CrossEngin
 
 Two foundations meet here. **P20 / P1.3 kg-sync v2** lets distinct

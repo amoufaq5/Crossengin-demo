@@ -103,6 +103,11 @@ bash scripts/chat.sh
 
 You're at the CrossEngin prompt. Type something. Exit with `:quit`.
 
+After bootstrap, see [`docs/CHAT_USAGE.md`](./CHAT_USAGE.md) for the
+comprehensive feature walkthrough -- admin commands, self-identification,
+self-directed learning, persistence, troubleshooting. That is the document
+to read next.
+
 ### 2.8 Optional -- voice STT
 
 To enable the voice transducer (`src/io/transducers/whisper_backend.nova`):

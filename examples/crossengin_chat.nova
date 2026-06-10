@@ -64,6 +64,7 @@ import "../src/seed/pack_registry.nova"
 import "../src/parts/reasoning/proof_checker.nova"
 import "../src/parts/meta/reflection_loop.nova"
 import "../src/parts/meta/meta_observer.nova"
+import "../src/parts/meta/self_model_query.nova"
 import "../src/learning/source_authority.nova"
 import "../src/persistence/snapshot_disk.nova"
 import "../src/session/session.nova"
@@ -101,6 +102,18 @@ let halted = 0
 // `/speak` (Phase 19 Tier-4 #1): the agent's last reply, captured after each
 // drained event. `/speak` with no text speaks this; mutated by the main loop.
 let _last_reply = ""
+
+// R39A intent-dispatcher telemetry. Bumped every time the unknown-word path
+// files a SLT_UNKNOWN_QUERY signal so /status (and external smoke tests) can
+// confirm autonomous learning is being triggered from chat input. Process-wide
+// so the counter survives /switch.
+let chat_stats_self_learning_triggers_filed = 0
+// Total self-ID intents handled (sum of identity/state/goals/capabilities/
+// activity branches). Surfaced for telemetry only.
+let chat_stats_self_id_replies = 0
+// Total KG-triple-templated replies emitted. Useful for verifying the chat
+// is reaching for real knowledge rather than the ACK fallback.
+let chat_stats_kg_triple_replies = 0
 
 // Phase 18 (Half A): in-process multi-tenant routing. `sreg` is the
 // SessionRegistry (built at boot); `active_id` is the id of the session every
@@ -497,20 +510,123 @@ fn _route_and_inject(reg, gate, stype, strength, moment) {
     return dests
 }
 
-// Submit one trigger per unknown surface form (ADR-0026).
+// Submit one trigger per unknown surface form (ADR-0026). Returns the number
+// of triggers actually filed so the caller (and the R39A intent dispatcher)
+// can bump telemetry + decide whether to surface a "filed-to-learn" reply.
 fn _submit_curiosity(arb, lang, input_text) {
     let toks = split(input_text, " ")
+    let filed = 0
     let ti = 0
     while ti < len(toks) {
         let tok = str_trim(toks[ti])
         if len(tok) > 0 {
             if word_find(lang, tok) == 0 {
                 slt_submit(arb, trigger_new(SLT_UNKNOWN_QUERY, tok, 800, 500))
+                filed = filed + 1
             }
         }
         ti = ti + 1
     }
-    return 1
+    return filed
+}
+
+// R39A: find the first unknown (not-in-lang-KG) token in the user input,
+// trimmed. Returns "" if every token is known (or input is empty). Used by
+// the chat dispatcher to phrase the "I don't know X yet" reply naming a
+// SPECIFIC word rather than the whole sentence.
+fn _smq_first_unknown_token(lang, input_text) {
+    let toks = split(input_text, " ")
+    let ti = 0
+    while ti < len(toks) {
+        let tok = str_trim(toks[ti])
+        if len(tok) > 0 {
+            if word_find(lang, tok) == 0 { return tok }
+        }
+        ti = ti + 1
+    }
+    return ""
+}
+
+// R39A: look up the highest-belief triple operator atom whose premise is the
+// given atom id, in `kg`. Returns the operator atom (or 0 if no triple about
+// it exists). Used by the chat's KG-templated reply path: a "what is X" query
+// finds the strongest assertion the agent has learned about X.
+fn _smq_pick_best_triple(kg, subj_atom_id) {
+    let ops = rk_operators_from(kg, subj_atom_id)
+    let best = 0
+    let best_c = 0 - 1
+    let i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        let c = rop_confidence(op)
+        if c > best_c {
+            best_c = c
+            best = op
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// R39A: derive a relation phrase from a triple operator atom. The triple's
+// original relation text is encoded in the operator's label
+// ("src_prefix:S-R->O" -- see _admin_learn_triples) so the renderer can pick
+// the natural-language form even when several relations map to the same
+// ROP_* kind (e.g. "has" and "causal" both -> ROP_CAUSAL). If the label is
+// malformed the renderer falls back to the rop_kind_name.
+fn _smq_relation_from_op(op) {
+    let lbl = atom_label(op)
+    // Find "->" (sequence 0x2D 0x3E) to delimit relation from object.
+    let arrow = 0 - 1
+    let n = len(lbl)
+    let i = 0
+    while i < n - 1 {
+        if char_at(lbl, i) == 45 {
+            if char_at(lbl, i + 1) == 62 {
+                if arrow < 0 { arrow = i }
+            }
+        }
+        i = i + 1
+    }
+    if arrow < 0 {
+        // Malformed label -- use the rop_kind_name as a best-effort string.
+        let k = rop_kind(op)
+        if k == ROP_IMPLY { return "is_a" }
+        if k == ROP_CAUSAL { return "has" }
+        return rop_kind_name(k)
+    }
+    // Walk backwards from arrow to find the LAST '-' that separates S from R.
+    let dash = 0 - 1
+    let j = arrow - 1
+    while j >= 0 {
+        if dash < 0 {
+            if char_at(lbl, j) == 45 { dash = j }
+        }
+        j = j - 1
+    }
+    if dash < 0 {
+        let k2 = rop_kind(op)
+        if k2 == ROP_IMPLY { return "is_a" }
+        if k2 == ROP_CAUSAL { return "has" }
+        return rop_kind_name(k2)
+    }
+    // The relation text is between (dash + 1) and arrow.
+    let rel = substr(lbl, dash + 1, arrow - dash - 1)
+    return _smq_relation_phrase(rel)
+}
+
+// R39A: full KG-templated reply for a known concept. Returns "" if no triple
+// exists about the concept (caller falls back to other paths). The reply is
+// "<subject> <relation_phrase> <object>." in natural form.
+fn _smq_kg_templated_reply(kg, concept) {
+    let subj_atom = kg_find_atom(kg, concept)
+    if subj_atom == 0 { return "" }
+    let op = _smq_pick_best_triple(kg, atom_id(subj_atom))
+    if op == 0 { return "" }
+    let obj_atom = kg_atom(kg, rop_conclusion(op))
+    if obj_atom == 0 { return "" }
+    let rel_phrase = _smq_relation_from_op(op)
+    return concept + " " + rel_phrase + " " + atom_label(obj_atom) + "."
 }
 
 // Drain the trigger arbiter, ingesting up to 4 unknowns into the KGs at idle.
@@ -3090,7 +3206,11 @@ fn main() {
                 last_unk = unk
                 if unk > 0 {
                     _route_and_inject(reg, gate, XSIG_CURIOSITY, 600, hs_now(hs))
-                    _submit_curiosity(arb, lang, ctx_input(ctx))
+                    // R39A: count every SLT_UNKNOWN_QUERY signal filed; the
+                    // counter is process-wide so it survives /switch and is
+                    // surfaced by /status (Tier-4 telemetry).
+                    let _filed = _submit_curiosity(arb, lang, ctx_input(ctx))
+                    chat_stats_self_learning_triggers_filed = chat_stats_self_learning_triggers_filed + _filed
                 }
 
                 // Affect from comprehension -> mood -> tick modulation.
@@ -3117,6 +3237,89 @@ fn main() {
                     effector_speak(log, ctx_input(ctx), 1, halted, 0 - 1, list_new(), 0, hs_now(hs))
                     reply = "[refused]"
                 } else {
+                    // ====== R39A intent dispatcher (ADR-0038 + ADR-0026) =====
+                    // Reply hierarchy (the user-facing FIX for "every line ->
+                    // 'okay'"): self-identification queries route to the real
+                    // self_model_query module; known-concept inputs render a
+                    // triple-templated reply from KG operator atoms; unknown
+                    // words emit a "filed-to-learn" reply alongside the
+                    // SLT_UNKNOWN_QUERY trigger already submitted upstream.
+                    // The existing fallback (cognition-driven SEE TOPIC + ACK)
+                    // runs ONLY when none of these fire.
+                    let raw_msg = ctx_input(ctx)
+                    let smq_kind = _intent_self_id_kind(raw_msg)
+                    let dispatched = ""
+                    if smq_kind != SMQ_KIND_NONE {
+                        if smq_kind == SMQ_KIND_IDENTITY {
+                            dispatched = selfmodel_identity(sl)
+                        }
+                        if smq_kind == SMQ_KIND_STATE {
+                            dispatched = selfmodel_state(sl)
+                        }
+                        if smq_kind == SMQ_KIND_GOALS {
+                            dispatched = selfmodel_goals(engine)
+                        }
+                        if smq_kind == SMQ_KIND_CAPABILITIES {
+                            // Competence is per-domain+kind, so the chat surface
+                            // summarises rather than emits a single record:
+                            // "I have N competence record(s); recently <tier>."
+                            // This mirrors the /status surface, scoped to a
+                            // single sentence so it slots into the chat reply.
+                            let cn = self_model_count(sm)
+                            if cn == 0 {
+                                dispatched = "I have no calibrated competences yet -- I'm still learning what I can do."
+                            } else {
+                                dispatched = "I have " + int_to_str(cn)
+                                    + " calibrated competence record(s) across the KG."
+                            }
+                        }
+                        if smq_kind == SMQ_KIND_ACTIVITY {
+                            // The chat REPL holds one cognitive loop per session;
+                            // selfmodel_activity wants an integer "running loops"
+                            // count. Pull it from the part registry.
+                            dispatched = selfmodel_activity(registry_live_count(reg))
+                        }
+                        chat_stats_self_id_replies = chat_stats_self_id_replies + 1
+                    }
+                    if len(dispatched) == 0 {
+                        // KG-templated reply: extract the concept the user is
+                        // asking about ("what is fever" / bare "fever") and try
+                        // the highest-belief triple. An empty return means no
+                        // known triple -- the fallback paths run below.
+                        let concept = _smq_extract_concept_query(raw_msg)
+                        if len(concept) > 0 {
+                            let kg_reply = _smq_kg_templated_reply(kg, concept)
+                            if len(kg_reply) > 0 {
+                                dispatched = kg_reply
+                                chat_stats_kg_triple_replies = chat_stats_kg_triple_replies + 1
+                            }
+                        }
+                    }
+                    if len(dispatched) == 0 {
+                        // Unknown-word path: when perceive reported unk > 0 the
+                        // SLT signals are ALREADY filed upstream. Surface the
+                        // first unknown token by name so the user knows what
+                        // the agent is going to look into.
+                        if last_unk > 0 {
+                            let unk_word = _smq_first_unknown_token(lang, raw_msg)
+                            if len(unk_word) > 0 {
+                                dispatched = _smq_unknown_reply(unk_word)
+                            }
+                        }
+                    }
+                    if len(dispatched) > 0 {
+                        // Speak the dispatched reply directly (bypassing the
+                        // syntax-pattern generator, since the reply is already
+                        // a complete sentence). Still goes through the
+                        // governed-speak effector so /halt + decision-log
+                        // semantics are honoured.
+                        let said = effector_speak_governed(log, sl, dispatched, halted, 0 - 1, list_new(), 0, hs_now(hs))
+                        ctx_set_output(ctx, said)
+                        _route_and_inject(reg, gate, XSIG_GOAL, 800, hs_now(hs))
+                        reply = said
+                        if len(reply) == 0 { reply = "[silent]" }
+                    } else {
+                    // ====== existing cognition-driven fallback path ==========
                     // Output emerges from cognition: pick the first NEW
                     // conclusion, reverse-look up its naming word, speak it.
                     let percept = ctx_percept(ctx)
@@ -3153,6 +3356,7 @@ fn main() {
                     _route_and_inject(reg, gate, XSIG_GOAL, 800, hs_now(hs))
                     reply = said
                     if len(reply) == 0 { reply = "[silent]" }
+                    }
                 }
                 drained = 1
             } else {

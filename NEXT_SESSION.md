@@ -3,6 +3,678 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R39C -- chat-state persistence module (soul + multi-KG + decision-log save/load API)
+
+**Status: complete** -- file-backed save + load API for chat session
+state. Closes the documented "each turn forgets" gap (scripts/chat.sh)
+and the cross-restart durability gap (NOVA enhancement #9 / #10 /
+ADR-0048). API-only round: the chat REPL wire (call save on /quit,
+call load on boot) is INTENTIONALLY DEFERRED to R40 because R39A is
+concurrently touching `examples/crossengin_chat.nova`.
+
+### What R39C delivers
+
+* **`src/persistence/chat_state.nova`** (new) -- the save / load API:
+  - `chat_state_save(path, soul, multi_kg, decision_log) -> 0 | PERSIST_ERR_*`
+  - `chat_state_save_to_default(soul, multi_kg, decision_log)`
+  - `chat_state_save_full(path, soul, multi_kg, decision_log, triples_by_kg, tail_n)`
+  - `chat_state_load(path) -> [soul, multi_kg, decision_log] | PERSIST_ERR_*`
+  - `chat_state_load_from_default()`
+  - `chat_state_load_text(text)` (in-memory variant for tests)
+  - `chat_state_load_triples_from_text(text)` + `chat_state_load_triples(path)`
+    (caller-extractable triples list per KG)
+  - `chat_state_is_load_ok(r)` predicate, plus
+    `chat_state_loaded_soul / _kgs / _dlog` accessors
+  - `chat_state_default_path()` (resolves `CE_PERSIST_PATH` env override,
+    then `$HOME/.crossengin/chat_state.dat`, then `/tmp/crossengin/...`)
+
+* **Wire format** -- line-oriented text "VERSION 1" at
+  `$HOME/.crossengin/chat_state.dat`:
+  ```
+  VERSION 1
+  SOUL_NAME crossengin
+  SOUL_IDENTITY_PURPOSE I help humans think clearly about complex domains
+  SOUL_IDENTITY_NATURE A patient inquisitive assistant
+  SOUL_OCEAN_O 500 ... SOUL_OCEAN_N 300
+  VALUE truth never fabricate
+  KG_BEGIN reasoning
+  ATOM 0 3 1000 1000 self
+  ATOM 1 3 1000 1000 user
+  TRIPLE 47 5 12 850
+  KG_END
+  KG_BEGIN language
+  ...
+  KG_END
+  DLOG_TAIL_BEGIN
+  DLOG_ENTRY 0 1 -1 100 4 4 3 3 -1 0 0
+  ...
+  DLOG_TAIL_END
+  END
+  ```
+
+* **`tests/unit/test_chat_state_persistence.nova`** (new) -- 88 assertions
+  across 17 test functions covering: soul round-trip (name, identity,
+  OCEAN, values), 3-KG round-trip, 10-atom round-trip with non-uniform
+  beliefs, 5-triple round-trip, 100-entry decision-log tail round-trip,
+  250 -> 100 tail cap (default), VERSION 2 file -> `PERSIST_ERR_VERSION`,
+  missing-file -> `PERSIST_ERR_NOT_FOUND`, malformed ATOM ->
+  `PERSIST_ERR_PARSE`, missing END -> `PERSIST_ERR_PARSE`, unknown
+  record type within VERSION 1 is SKIPPED (forward-compat), empty-state
+  round-trip, default path includes filename suffix when env unset,
+  CE_PERSIST_PATH override, single-level auto-mkdir for the parent,
+  /proc/* unwritable -> `PERSIST_ERR_IO`, in-memory text load helper,
+  `is_load_ok` predicate distinguishes int error tags from list results.
+
+### Forward + backward compatibility (the schema contract)
+
+* Header `VERSION 1` lets future R39C.2 bump the schema. A reader that
+  meets a file declaring a version it doesn't know returns
+  `PERSIST_ERR_VERSION` cleanly.
+* Unknown record types within a known version are SKIPPED. Future R39C.2
+  writers can add new record kinds (e.g. `GOAL_ENTRY`) inside VERSION 1
+  and an older reader still loads what it understands.
+* Version bumps own their migration: a future R39C.2 with v2 schema
+  reads both v1 and v2; the v1 -> v2 migration is the new round's
+  responsibility.
+
+### Honest design caveats
+
+* **Text format isn't size-optimized.** A 100k-atom KG lands around
+  10 MB in this layout (vs ~1 MB if we'd used varint binary). The
+  brief explicitly chose readability + reparseability over size; a
+  future R39C.2 binary path is documented in the module header.
+* **No atomic write.** The current save calls
+  `open(O_WRONLY|O_CREAT|O_TRUNC) -> write -> fsync -> close`, not the
+  full snapshot_disk-style `write tmp + fsync + rename + parent-fsync`
+  contract. A crash mid-write can leave a truncated file. The
+  snapshot_disk durable-write pattern is the obvious upgrade -- R40
+  should adopt it before the chat REPL relies on this surface across
+  power-loss scenarios.
+* **No multi-process lock / flock.** Two chat REPLs reading + writing
+  the same path race. Single-REPL use is the assumed deployment.
+* **Triples persistence is a parallel argument, not derived from the
+  KG.** Triples in CrossEngin are logically encoded inside relation
+  atoms' labels rather than as separate edges, so this module accepts
+  a caller-supplied `triples_by_kg` list rather than walking the KG.
+  R40 can change this if a runtime triple iterator lands.
+* **Chat REPL integration is deferred.** This round ships the API
+  only. R40 wires it into `examples/crossengin_chat.nova` (save on
+  `/quit`, load on boot, ADR-0048 rehydration order). Doing both in
+  one round would conflict with R39A's concurrent dispatcher work
+  on the same file.
+
+### Test results
+
+`tests/unit/test_chat_state_persistence.nova`: **88 checks PASS**.
+
+### Concurrency + stash discipline
+
+R39C only added new files (`src/persistence/chat_state.nova`,
+`tests/unit/test_chat_state_persistence.nova`). No existing module was
+modified -- the chat-REPL wire is deferred to R40 per the brief. No
+stash was needed because the owned paths were absent before this
+round began; a sibling agent's WIP on
+`src/io/transducers/http_client.nova` was left untouched.
+
+## R39D -- autonomous-research orchestrator + idle-loop drain (ADR-0026 + ADR-0028 wiring)
+
+**Status: complete** -- closes the "agent develops itself" path. The
+substrate's idle loop now dequeues self-learning-trigger signals (R39A files
+`SLT_UNKNOWN_QUERY` on unknown words), derives a Wikipedia URL, runs the
+gated internet-fetch pipeline (whitelist + rate-limit + tiered-evidence
+ingest), and lands the bytes in the domain KG as `provenance=fetched`. The
+pipeline is multi-phase (FETCHING -> PREPROCESSING -> INGESTING) so the
+idle loop can interleave research with imagination on the same wall-clock
+window; no tick blocks for I/O longer than one phase.
+
+### What R39D delivers
+
+* **`src/learning/autonomous_research.nova`** (new) -- the orchestrator
+  state machine:
+  - `ar_init()` -> a zero-stats idle state.
+  - `ar_tick(state, slt_queue, kg, current_time_ms) -> AR_TICK_OK |
+    AR_TICK_BUSY | AR_TICK_IDLE` -- advances at most one phase per call.
+    Dequeues an `SLT_UNKNOWN_QUERY` (or any source whose weight clears
+    `AR_MIN_SRC_WEIGHT = 500`), takes the in-flight slot, then on each
+    subsequent tick advances FETCHING -> PREPROCESSING -> INGESTING ->
+    reset.
+  - `ar_derive_url(concept_str) -> url_str` -- builds
+    `http://en.wikipedia.org/wiki/<concept>`. The `http://` scheme is the
+    R39B v0.1 production path; HTTPS is deferred to R39B.2 (TLS roadmap in
+    TLS_AUDIT.md). The whitelist gate accepts the host on either scheme.
+  - Rate limiting: `AR_RATE_LIMIT_MS = 2000` -- two consecutive `ar_tick`
+    calls within 2s second-call returns `AR_TICK_BUSY` and bumps
+    `stats_rate_limited`. Independent of the internet_fetch per-host
+    spacing (which is in seconds for ALL callers).
+  - Stats: `attempts`, `succeeded`, `failed`, `rate_limited`,
+    `atoms_ingested` -- each bumps independently so a dashboard can show
+    the orchestrator's throughput and failure mode breakdown.
+  - `ar_set_fetcher(state, fetcher)` -- inject a pre-built `if_fetcher_new`
+    so the chat-REPL path can share the global rate-limit budget with
+    explicit `/learn` calls. When no fetcher is injected, the orchestrator
+    falls back to a bare host check + direct `kg_add_atom` (the test
+    path).
+  - `_ar_test_inject_body(state, body, ctype, nbytes)` -- the function-level
+    mock seam unit tests use to drive the FETCHING phase without a real
+    HTTP responder. NOT called by production code.
+
+* **`src/agent/loop_imagination_idle.nova`** (extended) -- one new entry
+  point `loop_research_step(ctx, ar_state, slt_queue, kg, current_time_ms)`.
+  Guards on `ctx_idle == 1` (so a user-active REPL never sees a fetch),
+  then delegates to `ar_tick`. The imagination step is byte-identical to
+  before; this is purely additive.
+
+* **`tests/unit/test_autonomous_research.nova`** (new) -- **58 assertions
+  across 10 tests** covering: init zero-state, empty-queue idle-return,
+  URL derivation (Aspirin / empty / zero), full pipeline 4-tick walk
+  (FETCHING -> PREPROCESSING -> INGESTING -> reset, succeeded + atoms
+  bumped, KG atom count = 1), rate-limit fires + recovers past the 2s
+  window, whitelist-deny / empty-concept short-circuit, counters bump
+  independently, source-weight floor parks curiosity signals (weight 300
+  < AR_MIN_SRC_WEIGHT 500), in-flight ticks don't dequeue a new signal,
+  zero-target defensive short-circuit.
+
+### Mock strategy
+
+Function-level (not syscall-level). The injector
+`_ar_test_inject_body(state, body, content_type, byte_count)` pre-populates
+the in-flight body slot so the FETCHING phase reads the body directly
+from state and advances without calling `if_dispatch_transport`. The
+alternative -- mocking at the syscall layer (`socket`, `recv_data`, ...)
+-- would require either a NOVA test-runtime override (does not exist
+today) or a real HTTP responder in tests (slow + flaky). The
+function-level seam is one line in production code (a zero-check on the
+body slot) and zero overhead at runtime.
+
+### Chat-REPL integration deferred to R40
+
+The brief explicitly DEFERRED the chat-REPL wire. R39A is concurrently
+touching `examples/crossengin_chat.nova` and `src/chat/helpers.nova`;
+landing the `ar_state_t` + tick threading into the same file in a
+parallel agent would cause a merge conflict. R40 will:
+* hold an `ar_state_t` next to the chat REPL's other long-lived state,
+* build a single `if_fetcher_new` shared with explicit `/learn` calls,
+* call `loop_research_step` once per idle iteration AFTER
+  `loop_imagination_step`,
+* honor the `AR_TICK_BUSY` return by skipping the rest of the idle steps,
+* add a `/research <topic>` admin command that synthesizes a
+  `trigger_new(SLT_USER_REQUEST, topic, ...)` and submits it,
+* persist `ar_state.stats_*` through R39C's `chat_state_save` path so
+  the orchestrator's running totals survive restart.
+
+### Honest design caveats
+
+* **URL derivation is hardcoded to en.wikipedia.org.** The orchestrator
+  emits one URL per concept and that URL is always a Wikipedia article
+  title. The motivation: the seed whitelist (`sw_default`) only ships
+  five hosts, and only Wikipedia has a usefully predictable
+  `/wiki/<title>` URL space. A future R39D.2 may add per-source
+  derivation rules (docs.python.org -> `/3/library/<concept>.html`,
+  developer.mozilla.org -> `/en-US/docs/Web/API/<concept>`, etc.) once
+  the orchestrator needs to disambiguate across multiple sources for the
+  same concept.
+
+* **The PREPROCESSING phase is a structural no-op until R39F lands.**
+  We keep the phase split (rather than fusing FETCHING + INGESTING) so
+  R39F's text-preprocess wiring is a localized diff into one branch of
+  `ar_tick`. The body bytes pass through verbatim today; the eventual
+  preprocess will normalize / sentence-segment / strip-tags before the
+  atom is written.
+
+* **No URL-encoding on the concept string.** NOVA has no urllib
+  equivalent; Wikipedia accepts most ASCII article titles unencoded
+  (including underscored multi-word titles). A concept with embedded
+  spaces / non-ASCII / URL-special characters will produce a URL that
+  may 404. A future R39D.2 may add percent-encoding.
+
+* **No URL-encoding on the concept string** also means a malicious
+  signal source could file a concept that embeds a path-traversal or
+  scheme-override fragment. The whitelist gate at `if_permit` is the
+  defense in depth here: anything that doesn't extract back to
+  `en.wikipedia.org` via `sw_host` is denied + counted as `stats_failed`.
+
+* **One in-flight target at a time.** Matches the SLT arbiter contract
+  ("at most one external episode at a time" per ADR-0026). A future
+  R39D.2 could relax this for read-only sources, but the rate-limit
+  envelope makes parallelism only marginally useful.
+
+### Test results
+
+`tests/unit/test_autonomous_research.nova`: **58 checks PASS**.
+`tests/unit/test_loop_imagination_idle.nova`: 2 checks PASS
+(unchanged -- the extension is purely additive).
+`tests/unit/test_self_learning_triggers.nova`: 27 checks PASS
+(unchanged).
+`tests/unit/test_internet_fetch.nova`: 36 checks PASS (unchanged).
+`examples/crossengin_chat.nova` + `examples/crossengin_daemon.nova`:
+both compile cleanly through the new `loop_imagination_idle.nova` ->
+`autonomous_research.nova` import chain.
+
+### Concurrency + stash discipline
+
+R39D ran with the working tree carrying a sibling agent's WIP
+modification to `src/io/transducers/http_client.nova` (R39B's HTTPS
+transport work). That file is OUTSIDE R39D's ownership scope and was
+left untouched. The owned paths (`src/learning/autonomous_research.nova`,
+`src/agent/loop_imagination_idle.nova`,
+`tests/unit/test_autonomous_research.nova`, the three doc files)
+were ALL clean at pre-flight; no `git stash` was needed. No
+`git stash -u` was ever invoked.
+
+## R39E -- documentation: R39 self-identification + autonomous-learning architecture
+
+**Status: complete** -- documentation-only round describing the R39 sprint
+end-to-end. Explains WHY this architecture, WHAT each piece does, HOW to
+use it post-install, and HOW it relates to the existing ADRs. Documents
+the actual landed shape of sibling R39A / R39B / R39C / R39D / R39F as
+of this commit, including the honest gaps (HTTPS deferred to R39B.2,
+English-only stopwords in R39F, no atomic write in R39C, niche-phrasing
+misses in R39A's regex dispatcher).
+
+### What R39E delivers
+
+* **`docs/adr/r39-autonomous-learning-architecture.md`** (new) -- the
+  end-to-end trigger -> research -> preprocess -> ingest pipeline. The
+  diagram, performance budget (perceive ~0ms + deferred 2-10s + ingest
+  ~50ms), failure modes (whitelist-deny / rate-limit / timeout /
+  parse-fail / oversize / HTTPS-deferred / wrong content-type) and how
+  each surfaces, configuration knobs (`IF_MAX_PER_HOUR=30`,
+  `IF_DOMAIN_SPACING=2s`, `IF_MAX_BODY=2MB`, `SLT_QUEUE_MAX=8`,
+  `SLT_FUSION_WINDOW_TICKS=20`), security posture (bytes never reach an
+  LLM per ADR-0014; whitelist is the only network gate per ADR-0028;
+  source-authority tiers pinned per ADR-0029), and the honest gaps
+  (HTTPS, multi-language stopwords, small whitelist seed, single-active
+  cap, competence-gap reweighting deferred).
+
+* **`docs/adr/r39-self-identification-wiring.md`** (new) -- the chat
+  intent dispatcher and the regex pattern -> `SELFQ_*` map. Documents
+  the priority rule (self-ID first, then KG-match, then unknown-query
+  with side-effect), each row in the regex table mapping to
+  `smq_what_are_you` / `smq_capabilities` / `smq_goals` / `smq_state` /
+  `smq_activity`, and the honest gaps (niche phrasings missed; no ML
+  classifier; `SELFQ_COMPETENCE` quality bound to ADR-0020 maturity;
+  no ADR-0039 theory-of-mind tailoring yet).
+
+* **`docs/adr/r39-persistence-and-rehydration.md`** (new) -- the R39C
+  save/load API (text v1 line-record format at
+  `$HOME/.crossengin/chat_state.dat`), the rehydration order
+  (`VERSION` -> `SESSION_ID` -> soul -> dlog -> KG atoms ->
+  `META_PENDING` -> `END`, matching ADR-0048's "soul first" mandate),
+  the R40 plan (wire `chat_state_save` into `/quit`,
+  `chat_state_load` into boot, idle-tick checkpoint, atomic write,
+  `/save_chat` + `/load_chat` admin commands distinct from the
+  substrate `/save` + `/load`), and the honest gaps in R39C (no
+  atomic write, no compaction, no multi-process flock, no v2 schema
+  migration -- v1 only today).
+
+* **`docs/CHAT_USAGE.md`** (new) -- 12-section comprehensive
+  user-facing guide. The document to read after `GETTING_STARTED.md`.
+  Sections: (1) what the chat is + isn't; (2) quick start; (3) web vs
+  terminal modes persistence comparison; (4) full admin command table;
+  (5) what works out of the box (seeded vocab, greetings, `/status`,
+  `/why`); (6) `/teach <word>` and `/teach <s> <r> <o>`;
+  (7) `scripts/learn.sh` + `/learn` explicit path AND post-R39A/B/D
+  autonomous path with rate-limit + HTTPS-deferred caveats;
+  (8) self-identification examples per pattern; (9) `/status` /
+  `/why` / `/why-deep` / `/reflect` / `/history` / `/meta`;
+  (10) persistence today vs R40 plan; (11) troubleshooting
+  ("always okay" pre vs post R39, rate-limit warnings, fetch failure
+  outcomes, constitution blocks, `/quit` doesn't save, web LRU
+  eviction); (12) pointers to the ADRs.
+
+* **`docs/GETTING_STARTED.md`** (modified) -- added a 4-line
+  cross-reference after Section 2.7 ("After bootstrap, see
+  `docs/CHAT_USAGE.md` for the comprehensive feature walkthrough").
+
+### Cross-agent boundaries (concurrent R39 sprint)
+
+R39A (chat dispatch), R39B (HTTP transport), R39C (persistence API),
+R39D (idle/autonomous loop), R39F (preprocess), R39E (this round)
+operate on disjoint files. R39E touched ONLY:
+`docs/adr/r39-autonomous-learning-architecture.md` (new),
+`docs/adr/r39-self-identification-wiring.md` (new),
+`docs/adr/r39-persistence-and-rehydration.md` (new),
+`docs/CHAT_USAGE.md` (new), `docs/GETTING_STARTED.md` (one section
+appended), `README.md` (this row + the R39E section), and
+`NEXT_SESSION.md` (this section). No code module was modified.
+Stash discipline: pre-flight working tree was clean; sibling
+untracked files at handoff time (`src/learning/autonomous_research.nova`,
+`src/learning/preprocess.nova`, `src/persistence/chat_state.nova`,
+the three test files, and the working-tree edits to
+`examples/crossengin_chat.nova`, `src/chat/helpers.nova`,
+`src/io/transducers/http_client.nova`, `src/agent/loop_imagination_idle.nova`,
+`FEDERATED_AUDIT.md`) were never touched. No `git stash -u` was used.
+
+### Honest scope note
+
+The ADRs document the actual landed shape of the sibling R39 work as
+observed in the working tree at commit time. Sibling-agent
+implementation choices are reflected: R39B ships plain HTTP only (HTTPS
+explicitly returns `IF_TRANSPORT_DEFERRED` from `if_transport_get` --
+documented as "planned R39B.2 once http_client gets client-mode TLS");
+R39F's preprocess is English-only (documented in the architecture ADR
+and the CHAT_USAGE troubleshooting section); R39C's chat_state has no
+atomic write yet (documented as planned-R40 in the persistence ADR);
+R39A's regex map misses niche phrasings (each unsupported phrasing is
+named in the self-identification ADR's honest-gaps section).
+
+## R39A -- chat intent dispatcher (self-id routing + KG-templated reply + SLT trigger)
+
+**Status: complete** -- closes the "every chat input -> 'okay'" gap reported
+by the user. The substrate was perceiving and atomizing correctly, but the
+response generator (`gen_from_intent_with_slot`) had no signal pathway above
+the ACK fallback. R39A wires three intent paths into the REPL's reply
+hierarchy AHEAD of that fallback. The substrate modules themselves (soul,
+self_model_query, self_learning_triggers) are unchanged -- only the chat-side
+dispatcher and pure-string helpers were extended.
+
+### What R39A delivers
+
+* **`examples/crossengin_chat.nova`** -- new R39A intent dispatcher block in
+  the reply path (the `else` branch after the constitutional veto check).
+  Reply hierarchy:
+  1. INTENT_SELF_ID match -> route to `selfmodel_identity` /
+     `selfmodel_state` / `selfmodel_goals` / `selfmodel_activity`, or render
+     a per-domain competence summary for the CAPABILITIES kind. Replies
+     bypass `gen_from_intent_with_slot` (they are already complete
+     sentences) but still pass through `effector_speak_governed` so `/halt`
+     + decision-log semantics are honoured.
+  2. Admin `/...` (existing path, unchanged) -- handled before the agent
+     loop runs.
+  3. KG-matched concept ("what is X" / "tell me about X" / bare "X") ->
+     `_smq_kg_templated_reply` looks up the highest-belief operator atom
+     about X and renders "X <relation-phrase> Y." using the original
+     relation tag parsed from the operator's label.
+  4. Unknown-word filed -> "I don't know X yet -- I'll look into it" and
+     `_submit_curiosity` (now counting return) bumps the process-wide
+     `chat_stats_self_learning_triggers_filed` counter for telemetry.
+  5. Existing cognition-driven fallback (SEE TOPIC + ACK) runs only when
+     none of the above fire.
+* **`src/chat/helpers.nova`** -- 9 new pure helpers (all unit-tested) for
+  the dispatcher's classification logic:
+  * `_str_lower_ascii(s)` (thin wrapper over the `str_lower` builtin so the
+    helper module stays import-free).
+  * `_smq_strip_terminal_punct(s)`, `_smq_exact(s, pat)`,
+    `_smq_prefix(s, pat)`, `_smq_ends_with(s, suffix)` -- pattern-matching
+    building blocks.
+  * `_smq_match_identity` / `_match_state` / `_match_goals` /
+    `_match_capabilities` / `_match_activity` -- the five SMQ_KIND_*
+    matchers (anchored exact / prefix patterns, NEVER substring "what" or
+    "you" so "what is fever" does NOT trigger IDENTITY).
+  * `_intent_self_id_kind(raw)` -- top-level dispatcher returning one of
+    `SMQ_KIND_{NONE,IDENTITY,STATE,GOALS,CAPABILITIES,ACTIVITY}` with
+    ACTIVITY tried first so "what are you doing today" does not match
+    "what are you" (IDENTITY).
+  * `_smq_extract_concept_query(raw)` -- pulls X from "what is X" / "tell
+    me about X" / "describe X" / bare "X" (empty return on multi-token
+    non-shape).
+  * `_smq_relation_phrase(rel)` + `_smq_template_triple(s, r, o)` -- the
+    relation-tag canonicaliser ("is_a" -> "is a", "causal" -> "causes",
+    etc.) and the three-field templater.
+  * `_smq_unknown_reply(word)` -- the stable "I don't know X yet" phrasing
+    so smoke tests can pin it.
+* **`tests/unit/test_chat_intent_dispatch.nova` (new)** -- 60+ assertions
+  across 9 test functions covering: lowercase, terminal-punctuation strip,
+  intent classifier positive (5 IDENTITY + 3 STATE + 3 GOALS + 2
+  CAPABILITIES + 2 ACTIVITY = 15 positive), classifier negative ("what is
+  fever", "hello", admin command, empty, whitespace), concept-extract
+  positive + negative, relation-phrase mappings, triple template, the
+  unknown-reply pin, and the underlying ends_with / exact / prefix blocks.
+
+### Honest design caveats
+
+* The intent matcher is intentionally **narrow** (anchored exact + prefix
+  patterns). Niche phrasings ("yo who u" / "tell me who u r") will fall
+  through to the KG-templated path or the unknown-word path. The brief's
+  8+ positive patterns are all covered; adding more is a one-line append
+  in `_smq_match_*`.
+* The KG-templated reply parses the relation tag from the operator atom's
+  label (format: `src_prefix:S-R->O` per `_admin_learn_triples`). A
+  malformed label falls back to the ROP_* kind name. Tests cover the
+  string rendering; the kg-lookup path is exercised by the
+  `scripts/learn_smoke*.sh` integration tests.
+* `selfmodel_activity` takes an `active_loop_count` argument; the chat
+  passes `registry_live_count(reg)` which is the closest integer the
+  substrate offers (one cognitive loop per session today). The
+  `selfmodel_competence` overload requires (domain, kind) pairs; the chat
+  surface emits a count-only summary rather than refactor the
+  self_model_query signature.
+* `chat_stats_self_learning_triggers_filed` is incremented but not yet
+  surfaced via `/status` -- a one-line follow-up. The counter survives
+  `/switch` (process-wide) so /status reads correctly today.
+
+## R39F -- text preprocessing pipeline (ADR-0028 transform seam / ADR-0031)
+
+**Status: complete** -- closes the transform gap between R39B's HTTP fetch
+and the KG ingest. Previously `scripts/learn.sh` did naive sed/awk text
+extraction from a fetched page; R39F lifts that into a real NOVA module the
+autonomous research loop (R39D) calls in the PREPROCESSING phase.
+
+### What R39F delivers
+
+* **`src/learning/preprocess.nova` (new, no imports)** -- a pure-transform
+  module composing six stages: HTML strip, sentence split, tokenize,
+  stopword filter, triple extract, and an end-to-end composer with
+  telemetry counters. No KG / network / safety wiring -- the autonomous
+  research loop owns plumbing the output into multi-KG.
+  * `preprocess_strip_html(html)` -- removes `<script>`/`<style>` whole
+    blocks, replaces block-level openers/closers (`<br>`, `<p>`, `<div>`,
+    `<li>`, `<h1>..<h6>`) with newlines, strips remaining tags, decodes
+    six entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&nbsp;`, `&#39;`),
+    collapses whitespace runs.
+  * `preprocess_split_sentences(text)` -- splits on `.`/`?`/`!` followed
+    by whitespace + uppercase (or EOF). Common abbreviations don't end a
+    sentence: `Dr.`, `Mr.`, `Ms.`, `Mrs.`, `St.`, `e.g.`, `i.e.`.
+  * `preprocess_tokenize(sentence)` -- splits on whitespace + punctuation,
+    lowercases, drops pure-numeric tokens, drops single-char tokens.
+  * `preprocess_filter_stopwords(toks)` + `preprocess_set_stopwords(list)`
+    + `preprocess_is_stopword(tok)` -- shipped with ~110 common English
+    stopwords; swappable for domain modes / unit tests.
+  * `preprocess_extract_triples(sentence)` -- conservative pattern matcher
+    over six relation forms: `X is a Y` -> `(X, is_a, Y)`, `X has Y` ->
+    `(X, has_property, Y)`, `X causes Y` -> `(X, causes, Y)`,
+    `X is part of Y` -> `(X, part_of, Y)`, `X means Y` -> `(X, defined_as, Y)`,
+    `X is defined as Y` -> `(X, defined_as, Y)`. Optional articles
+    (`a`/`an`/`the`) before the object are skipped. Cap of 2 triples per
+    sentence. Quality > recall: garbage triples poison the KG (ADR-0031).
+  * `preprocess_run(html)` -- the composer: HTML strip -> sentence split
+    -> for each sentence (tokenize + stopword filter + extract triples).
+    Returns `[atoms, triples]`; atoms are the deduped union of kept tokens
+    across all sentences. Increments four telemetry counters
+    (`sentences`, `tokens`, `triples`, `html_bytes`) readable via
+    `preprocess_stats()` and resettable via `preprocess_stats_reset()`.
+
+* **`tests/unit/test_preprocess.nova` (new)** -- 88 assertions across 33
+  test functions:
+  * HTML strip: plain tags, `<script>` body deletion, `<style>` body
+    deletion, six entity decodes, empty input, block tags producing
+    newline boundaries, unknown-tag passthrough of content.
+  * Sentence split: basic three-way split, `?`/`!`, `Dr.` / `e.g.` /
+    `i.e.` abbreviation safety, no-split on period+lowercase, empty input,
+    trailing fragment with no terminator.
+  * Tokenize: lowercase, punctuation boundaries, pure-numeric drop,
+    single-char drop, empty input.
+  * Stopword: membership for the/is/a, list filtering, custom-list swap
+    via `preprocess_set_stopwords` and restore.
+  * Triple extraction: each of the six relations end-to-end, the 2-per-
+    sentence cap, short-sentence + empty-input early outs.
+  * End-to-end: empty input, pure-HTML-no-text, small Wikipedia-shaped
+    HTML fixture producing the expected `(fever, is_a, ...)` and
+    `(smoking, causes, cancer)` triples, telemetry counters non-zero,
+    atom dedup across repeated tokens.
+
+### Known gaps / honest caveats
+
+* **English-only stopwords.** Multilingual is a future round (R39F.2).
+  Callers can swap the list via `preprocess_set_stopwords` for domain
+  modes (medical, code, etc.).
+* **HTML strip is naive.** No CDATA, no JavaScript-rendered DOM, no
+  proper entity table (only the six common ones decode). Wikipedia + most
+  blog content works fine; pathological inputs (deeply nested malformed
+  markup) may mis-split. The strip is a regex-style state machine, not a
+  conformant HTML5 parser.
+* **Triple patterns are anchored regex.** Six relations only; quality is
+  prioritized over recall. Patterns like passive voice, multi-word
+  subjects, or "X, which is Y" relative clauses are out of scope.
+  Extending the list is one anchored block per relation in
+  `preprocess_extract_triples`.
+
+### Cross-agent boundaries (concurrent R39 sprint)
+
+R39A (chat dispatch), R39B (HTTP transport), R39C (persistence), R39D
+(idle/autonomous loop), R39E (others) operate on disjoint files. R39F
+touched ONLY: `src/learning/preprocess.nova` (new),
+`tests/unit/test_preprocess.nova` (new), plus this section in
+`NEXT_SESSION.md` / `README.md` / `FEDERATED_AUDIT.md`. No chat / agent /
+internet_fetch / autonomous_research / multi_kg / safety module was
+modified. Stash discipline: stashed only explicitly-owned paths before
+work; never `-u`; never touched sibling untracked files.
+
+## R39B -- HTTP/1.1 transport seam for internet_fetch (NOVA enhancement #11 / ADR-0028)
+
+**Status: complete (plain HTTP/1.1 only; HTTPS deferred to R39B.2)**
+
+Closes the ADR-0028 transport gap that previously left
+`src/learning/internet_fetch.nova` with a whitelist gate + ingest sink
+but no byte retrieval between them. R39B ships the HTTP/1.1-over-TCP
+client and the `if_fetch` composer that wires it end-to-end.
+
+### What R39B delivers
+
+* **`src/io/transducers/http_client.nova` (extended)** -- the chunked
+  transfer decoder, multi-value header lookup, recv-timeout seam, and a
+  Transfer-Encoding + Content-Length aware body finalisation pass on top
+  of the prior P1.4 plain-HTTP foundation:
+  * `_hc_hex_digit` + `_hc_chunked_size` + `_hc_chunked_decode` --
+    RFC 7230 sec 4.1 chunk framing decoder (`chunk-size [chunk-ext] CRLF
+    chunk-data CRLF` ... `0 CRLF`). Returns `[decoded, ""]` on success,
+    `["", HTTP_ERR_CHUNKED]` on framing error, `["", HTTP_ERR_TOO_LARGE]`
+    when the dechunked payload exceeds `max_bytes`. Verified on the
+    RFC 7230 sec 4.1.3 canonical example
+    (`4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n`
+    -> `Wikipedia in\r\n\r\nchunks.`).
+  * `_hc_is_chunked(headers)` -- case-insensitive token search across a
+    comma-separated `Transfer-Encoding` value, so `gzip, chunked` is
+    correctly detected.
+  * `_hc_apply_content_length(headers, body)` -- trims to declared
+    `Content-Length` when shorter than the recv'd body; passthrough on
+    absent / non-digit / longer-than-buffer.
+  * `http_header_get_all(headers, name)` -- multi-value lookup for
+    `Set-Cookie` / `Cookie` headers (the prior `http_header_get` returned
+    only the first match).
+  * `_hc_set_recv_timeout(fd, ms)` + `http_recv_timeout_active()` --
+    documented seam. NOVA's runtime does not currently expose
+    `sys_setsockopt`, so `_hc_set_recv_timeout` is a no-op returning 0
+    and `http_recv_timeout_active()` returns 0. When the builtin lands
+    this is a single-line flip. The 10 s budget is enforced today by
+    ADR-0028's policy-layer rate-limit ceiling (outside the recv loop).
+  * `http_get(url, max_bytes)` now applies dechunking + Content-Length
+    trimming in the success path; chunked precludes `Content-Length` per
+    RFC 7230 sec 3.3.3 (3). The `Accept` header is widened to the actual
+    set CrossEngin ingests (`text/plain, text/html, application/json`).
+  * `HTTP_ERR_TIMEOUT` + `HTTP_ERR_CHUNKED` sentinels added to the
+    public surface so the learning layer can route them to typed tags.
+
+* **`src/learning/internet_fetch.nova` (extended, purely additive)** --
+  the new composer + structured error sentinels:
+  * `if_fetch(f, domain_kg, url, now) -> [tag, status, body, byte_count, err]`
+    -- single-call composer wiring `if_permit` -> `http_get` ->
+    `if_complete` -> (optional `if_ingest` or cache write). Five-slot
+    record so callers don't have to unpack two different sub-records.
+    Cache hit short-circuits the whole transport leg. `if_complete`
+    runs in both success and transport-error paths so the in-flight
+    slot doesn't wedge.
+  * `IF_ERR_HTTP_CONNECT = 10` -- socket/connect/send/recv before any
+    data.
+  * `IF_ERR_HTTP_TIMEOUT = 11` -- reserved for the `sys_setsockopt`
+    landing; today recv timeouts surface from the policy layer.
+  * `IF_ERR_HTTP_PARSE   = 12` -- status line, header, or chunked
+    framing fault.
+  * `IF_ERR_HTTP_OVERSIZE = 13` -- recv hit 2MB cap or chunked decode
+    exceeded `max_bytes`. Body slot still holds the up-to-cap prefix.
+  * `IF_ERR_HTTP_DNS     = 14` -- DNS unresolved (no dotted-quad +
+    env cache miss).
+  * `IF_ERR_HTTP_SCHEME  = 15` -- `https://` (R39B.2) or unsupported
+    scheme.
+  * `_if_fetch_http_err_tag(err_msg)` -- string -> tag translator that
+    keeps the `HTTP_ERR_*` lexical surface inside the IO layer and
+    surfaces structured integers to policy code.
+  * `if_fetch_tag` / `if_fetch_status` / `if_fetch_body` /
+    `if_fetch_bytes` / `if_fetch_err` -- pure-sugar accessors on the
+    5-slot record.
+  * The R36F-shipped surface (`if_permit`, `if_complete`, `if_ingest`,
+    `if_dispatch_transport`, the cache helpers) is BYTE-IDENTICAL --
+    callers driving the explicit three-step flow keep working.
+
+### Verification
+
+* **`tests/unit/test_http_client.nova`** -- prior assertions preserved,
+  **42 new assertions** across 13 new test functions:
+  * status line parser for 500 Internal Server Error (in addition to
+    the prior 200 / 301 / 404 / bad cases);
+  * `http_header_get_all` multi-value cookie round-trip including
+    case-insensitive lookup + absent-header empty list;
+  * `_hc_is_chunked` for single token / comma-list / case variants /
+    absent;
+  * chunked decoder round-trip on the RFC 7230 sec 4.1.3 canonical
+    example + simple two-chunk + zero-only + malformed (missing CRLF
+    -> `HTTP_ERR_CHUNKED`) + oversize (chunk > cap -> `HTTP_ERR_TOO_LARGE`);
+  * `_hc_apply_content_length` trim / passthrough / longer-CL / absent /
+    non-digit;
+  * recv timeout documented gap (`HTTP_RECV_TIMEOUT_MS = 10000`,
+    `http_recv_timeout_active() = 0`, `_hc_set_recv_timeout` no-op);
+  * full response parser end-to-end (status + headers + body), no-body
+    204 path, malformed-no-blank-line -> `HTTP_ERR_NO_STATUS`;
+  * `IF_ERR_HTTP_*` sentinels pinned distinct from each other and from
+    `FETCH_*`.
+
+* **`tests/unit/test_internet_fetch.nova`** -- prior assertions preserved,
+  **18 new assertions** across 5 new test functions:
+  * `if_fetch` denies an off-whitelist URL (returns `FETCH_DENIED_HOST`,
+    empty body, zero bytes);
+  * `if_fetch` returns a cache hit short-circuit (seeded body comes back
+    via `FETCH_CACHE_HIT` without going through the transport leg);
+  * `if_fetch` returns `FETCH_RATE_LIMITED` when an in-flight request
+    is outstanding;
+  * 2MB validation boundary (`if_validate(text/html, IF_MAX_BYTES) = 1`
+    vs `if_validate(text/html, IF_MAX_BYTES+1) = 0`);
+  * `IF_ERR_HTTP_*` sentinels pinned distinct from `FETCH_*` (so a
+    caller's switch on the if_fetch tag never collides).
+
+* Total: 60 new assertions across the two suites (target was 25+).
+
+### Known gaps / honest caveats
+
+* **HTTPS deferred to R39B.2.** A client-mode TLS stack is the remaining
+  work; the existing `src/federation/dtls12.nova` is server-shaped (DTLS,
+  not TLS). The `if_dispatch_transport` https branch already returns
+  `IF_TRANSPORT_DEFERRED` so callers route through `scripts/learn.sh`
+  curl shim today.
+* **No `sys_setsockopt` builtin.** The 10 s recv timeout is enforced by
+  the rate-limit budget outside the recv loop, not by `SO_RCVTIMEO`
+  inside it. A slow / hostile peer holding the socket open relies on
+  the kernel TCP keepalive (hours by default). When NOVA adds
+  `sys_setsockopt`, `_hc_set_recv_timeout` is the one-line flip and
+  `http_recv_timeout_active` becomes 1.
+* **No `sys_getaddrinfo` builtin.** Hosts must be dotted-quad in the
+  URL or pre-seeded via `HTTP_DNS_HOST_TO_IP=name:ip,...` in the env.
+  This is the same constraint R28C+R32A flagged for STUN/NAT.
+* **Loopback integration mocked at the parser layer.** The full TCP
+  round-trip lives in `tests/integration/scenario_j_http_client.sh`
+  (Python `http.server` on 127.0.0.1); the unit tests pin parser /
+  decoder / composer correctness without a live socket so they pass
+  in environments without bind permissions.
+
+### Cross-agent boundaries (concurrent R39 sprint)
+
+R39A (chat dispatch), R39C (persistence), R39D (idle loop), R39F
+(preprocess) are operating on disjoint files. R39B touched ONLY:
+`src/io/transducers/http_client.nova`, `src/learning/internet_fetch.nova`,
+`tests/unit/test_http_client.nova`, `tests/unit/test_internet_fetch.nova`,
+plus this section in `NEXT_SESSION.md` / `README.md` / `FEDERATED_AUDIT.md`.
+No chat / agent / parts / cognition / federation / safety module was
+modified.
+
 ## R38D (R36A.alt) -- SCRAM-SHA-256 authentication for TURN (RFC 7635)
 
 **Status: complete** -- closes R36A's exit caveat ("MD5 is
