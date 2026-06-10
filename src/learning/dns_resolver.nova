@@ -1,0 +1,217 @@
+// CrossEngin learning: minimal DNS-over-UDP A-record resolver (ADR-0028 / R41).
+//
+// Purpose
+//   The in-process HTTP transport (src/io/transducers/http_client.nova) can do
+//   real socket GETs but has NO name resolution -- NOVA exposes no
+//   getaddrinfo, so http_get only accepts dotted-quad IPs or a hand-populated
+//   env cache. That is the concrete blocker behind "/learn is not connected to
+//   the internet": you cannot fetch http://en.wikipedia.org without first
+//   knowing its IP.
+//
+//   This module closes that gap with a tiny, self-contained DNS client: it
+//   builds an A-record query, sends it over UDP to a recursive resolver
+//   (8.8.8.8:53 by default, CE_DNS_SERVER to override -- itself a dotted quad,
+//   so there is no bootstrap problem), and parses the first A record out of
+//   the response (handling DNS name compression). It returns a dotted-quad
+//   string that http_get already knows how to use, so the learn pipeline can
+//   resolve a host and inject it via http_dns_add() before fetching.
+//
+//   Scope (intentional): A records only, single UDP datagram (no TCP
+//   fallback for >512B answers), no DNSSEC. recv_data has no timeout builtin,
+//   so a dropped datagram blocks -- acceptable for the opt-in /learn path
+//   against a reliable resolver; documented, not hidden.
+//
+// ADRs implemented: ADR-0028 (the fetch transport). NOVA dependencies:
+//   socket builtins (socket/connect_socket/send_data/recv_data/close_fd/
+//   make_sockaddr_in), alloc, store8, load8, getenv. CrossEngin deps: NONE
+//   (leaf module, mirrors http_client's contract).
+
+let DNS_PORT       = 53
+let DNS_QUERY_ID   = 4660          // 0x1234
+let DNS_MAX_PACKET = 1024
+
+// ---- dotted-quad helpers (same int encoding make_sockaddr_in expects) -----
+fn _dns_all_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _dns_is_dotted_quad(s) {
+    let parts = list_new()
+    let start = 0
+    let i = 0
+    while i < len(s) {
+        if char_at(s, i) == 46 { push(parts, substr(s, start, i - start)) start = i + 1 }
+        i = i + 1
+    }
+    push(parts, substr(s, start, len(s) - start))
+    if len(parts) != 4 { return 0 }
+    let k = 0
+    while k < 4 {
+        if _dns_all_digits(parts[k]) == 0 { return 0 }
+        let v = str_to_int(parts[k])
+        if v < 0 { return 0 }
+        if v > 255 { return 0 }
+        k = k + 1
+    }
+    return 1
+}
+
+// "a.b.c.d" -> a + b*256 + c*65536 + d*16777216 (the byte order
+// make_sockaddr_in writes into sin_addr; matches http_client).
+fn _dns_ip_to_int(ip) {
+    if _dns_is_dotted_quad(ip) == 0 { return -1 }
+    let parts = list_new()
+    let start = 0
+    let i = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 { push(parts, substr(ip, start, i - start)) start = i + 1 }
+        i = i + 1
+    }
+    push(parts, substr(ip, start, len(ip) - start))
+    let a = str_to_int(parts[0])
+    let b = str_to_int(parts[1])
+    let c = str_to_int(parts[2])
+    let d = str_to_int(parts[3])
+    let k = 256
+    return a + b * k + c * k * k + d * k * k * k
+}
+
+// ---- packet build / parse (big-endian on the wire) ------------------------
+fn _dns_put16(buf, off, v) {
+    store8(buf + off, (v / 256) % 256)
+    store8(buf + off + 1, v % 256)
+    return off + 2
+}
+
+fn _dns_get16(buf, off) {
+    return load8(buf + off) * 256 + load8(buf + off + 1)
+}
+
+// Encode header + question for an A query into buf; returns the byte length.
+fn _dns_build_query(buf, host, id) {
+    let off = 0
+    off = _dns_put16(buf, off, id)        // ID
+    off = _dns_put16(buf, off, 256)       // flags: 0x0100 (RD)
+    off = _dns_put16(buf, off, 1)         // QDCOUNT
+    off = _dns_put16(buf, off, 0)         // ANCOUNT
+    off = _dns_put16(buf, off, 0)         // NSCOUNT
+    off = _dns_put16(buf, off, 0)         // ARCOUNT
+    // QNAME: one length-prefixed label per dot-separated segment, then root 0.
+    let n = len(host)
+    let label_start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else if char_at(host, i) == 46 { boundary = 1 }
+        if boundary == 1 {
+            let label_len = i - label_start
+            store8(buf + off, label_len)
+            off = off + 1
+            let j = label_start
+            while j < i {
+                store8(buf + off, char_at(host, j))
+                off = off + 1
+                j = j + 1
+            }
+            label_start = i + 1
+        }
+        i = i + 1
+    }
+    store8(buf + off, 0)                   // root label
+    off = off + 1
+    off = _dns_put16(buf, off, 1)          // QTYPE = A
+    off = _dns_put16(buf, off, 1)          // QCLASS = IN
+    return off
+}
+
+// Advance past a DNS name at `off`, honouring 0xC0 compression pointers.
+fn _dns_skip_name(buf, off, total) {
+    let cur = off
+    let going = 1
+    while going == 1 {
+        if cur >= total { going = 0 }
+        else {
+            let b = load8(buf + cur)
+            if b == 0 { cur = cur + 1 going = 0 }
+            else if b >= 192 { cur = cur + 2 going = 0 }   // pointer: 2 bytes
+            else { cur = cur + 1 + b }                      // label
+        }
+    }
+    return cur
+}
+
+// Parse the first A record out of a response buffer -> "a.b.c.d" or "".
+fn _dns_parse_answer(buf, total, query_id) {
+    if total < 12 { return "" }
+    let flags = _dns_get16(buf, 2)
+    let rcode = flags % 16
+    if rcode != 0 { return "" }
+    let qd = _dns_get16(buf, 4)
+    let an = _dns_get16(buf, 6)
+    if an == 0 { return "" }
+    let off = 12
+    let q = 0
+    while q < qd {
+        off = _dns_skip_name(buf, off, total)
+        off = off + 4                       // QTYPE + QCLASS
+        q = q + 1
+    }
+    let a = 0
+    while a < an {
+        off = _dns_skip_name(buf, off, total)
+        if off + 10 > total { return "" }
+        let rtype = _dns_get16(buf, off)
+        let rdlen = _dns_get16(buf, off + 8)
+        let rdata = off + 10
+        if rtype == 1 {
+            if rdlen == 4 {
+                if rdata + 4 <= total {
+                    return int_to_str(load8(buf + rdata)) + "."
+                        + int_to_str(load8(buf + rdata + 1)) + "."
+                        + int_to_str(load8(buf + rdata + 2)) + "."
+                        + int_to_str(load8(buf + rdata + 3))
+                }
+            }
+        }
+        off = rdata + rdlen
+        a = a + 1
+    }
+    return ""
+}
+
+// ---- public resolve -------------------------------------------------------
+fn _dns_server_ip() {
+    let env = getenv("CE_DNS_SERVER")
+    if env != 0 { if len(env) > 0 { if _dns_is_dotted_quad(env) == 1 { return env } } }
+    return "8.8.8.8"
+}
+
+// dns_resolve(host) -> "a.b.c.d" or "" on any failure. Dotted-quad hosts pass
+// through unchanged.
+fn dns_resolve(host) {
+    if len(host) == 0 { return "" }
+    if _dns_is_dotted_quad(host) == 1 { return host }
+    let server_int = _dns_ip_to_int(_dns_server_ip())
+    if server_int < 0 { return "" }
+    let sock = socket(2, 2, 0)               // AF_INET, SOCK_DGRAM (UDP)
+    if sock < 0 { return "" }
+    let addr = make_sockaddr_in(DNS_PORT, server_int)
+    if connect_socket(sock, addr, 16) < 0 { close_fd(sock) return "" }
+    let qbuf = alloc(512)
+    let qlen = _dns_build_query(qbuf, host, DNS_QUERY_ID)
+    if send_data(sock, qbuf, qlen) <= 0 { close_fd(sock) return "" }
+    let rbuf = alloc(DNS_MAX_PACKET)
+    let n = recv_data(sock, rbuf, DNS_MAX_PACKET)
+    close_fd(sock)
+    if n <= 0 { return "" }
+    return _dns_parse_answer(rbuf, n, DNS_QUERY_ID)
+}

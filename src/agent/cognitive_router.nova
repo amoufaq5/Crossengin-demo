@@ -1,0 +1,714 @@
+// CrossEngin agent: cognitive router (ADR-0055).
+//
+// Purpose
+//   The dispatch heart of per-category cognition. Given an input's category
+//   (src/perception/input_classifier.nova) plus the live percept over the
+//   reasoning KG, it runs a DIFFERENT strategy per category and returns a
+//   triple [reply, trace, ops_csv]:
+//     reply     -- the user-facing sentence (never a bare "okay")
+//     trace     -- a one-line, human-readable record of WHICH reasoning ran
+//                  ("academic: forward-chain fever->infection->symptom"), so
+//                  reasoning is finally VISIBLE at the chat surface
+//     ops_csv   -- the reasoning-operator atom ids the reply leaned on, so a
+//                  /good or /bad from the user re-weights exactly those edges
+//                  (closing the feedback loop the meta-observer never did)
+//
+//   Strategy per category (the "different approaches for different input"):
+//     academic   forward-chain over causal/implicative operators; fall back to
+//                a single learned triple; else name the knowledge gap honestly
+//     factual    treat a user assertion as something to learn, echo S/O, ack
+//     procedural surface a stored step-chain or admit no procedure yet
+//     debatable  present BOTH sides, hedge, refuse to assert one truth
+//     personal   empathic acknowledgement; no causal claim, no KG fact write
+//     social     warm smalltalk; no KG write
+//     greeting   minimal courtesy; no KG write
+//     financial  compute if numeric, else reason + a not-advice caveat
+//     arithmetic evaluate the expression and return the number
+//     unknown    name the first unknown CONTENT word (stopwords/numbers
+//                filtered -- fixing the "I don't know the / 2 yet" bug)
+//
+// ADRs implemented: ADR-0055 (per-category routing), ADR-0031 (reasoning
+//   strategies it drives), ADR-0007 (operator re-weighting via /good//bad).
+// NOVA dependencies: builtins. CrossEngin dependencies:
+//   src/parts/reasoning/reasoning_module.nova (reason_* + rop_* + kg/atom API),
+//   src/perception/input_classifier.nova (CAT_* + the shared tokenizer),
+//   src/language/arithmetic.nova (arith_eval).
+
+import "../parts/reasoning/reasoning_module.nova"
+import "../language/word_atoms.nova"
+import "../perception/input_classifier.nova"
+import "../language/arithmetic.nova"
+
+// ---- triple constructor ---------------------------------------------------
+fn _rr(reply, trace, ops) {
+    let r = list_new()
+    push(r, reply)
+    push(r, trace)
+    push(r, ops)
+    return r
+}
+fn rr_reply(r) { return r[0] }
+fn rr_trace(r) { return r[1] }
+fn rr_ops(r)   { return r[2] }
+
+// ---- KG helpers -----------------------------------------------------------
+fn _cr_label(kg, cid) {
+    let a = kg_atom(kg, cid)
+    if a == 0 { return "" }
+    return atom_label(a)
+}
+
+// Distinct concept ids underlying the percept -- the same handles the
+// reasoning loop seeds its forward chain from (loop_reasoning_step uses
+// percept[i][1] directly, so we mirror it with no id filter; atom id 0 is a
+// valid concept).
+fn _cr_seeds(percept) {
+    let seeds = list_new()
+    let i = 0
+    while i < len(percept) {
+        let p = percept[i]
+        if len(p) >= 2 {
+            let cid = p[1]
+            if contains(seeds, cid) == 0 { push(seeds, cid) }
+        }
+        i = i + 1
+    }
+    return seeds
+}
+
+fn _cr_is_chaining(kind) {
+    if kind == ROP_CAUSAL { return 1 }
+    if kind == ROP_IMPLY { return 1 }
+    return 0
+}
+
+// Greedily follow the highest-confidence causal/implicative edge from `seed`
+// R71: source-authority weight (milli-factor) for an operator, from its label's
+// provenance prefix -- so the forward-chain prefers edges learned from more
+// authoritative sources when confidences are close. Seed / curated operators (no
+// src: prefix) are fully trusted (1000), so single-edge chains are unchanged.
+fn _cr_src_weight(label) {
+    if str_find(label, "wikipedia.org") >= 0 { return 1000 }
+    if str_find(label, "wiktionary.org") >= 0 { return 900 }
+    if str_find(label, "src:dict:") >= 0 { return 850 }
+    if str_find(label, "src:topic:") >= 0 { return 920 }
+    if str_find(label, "src:url:") >= 0 { return 950 }
+    if str_find(label, "src:") >= 0 { return 850 }
+    return 1000
+}
+
+// R74: the confidence of a chain is its WEAKEST link -- the lowest operator
+// belief along it (milli). An empty chain is fully confident (1000).
+fn _cr_chain_confidence(kg, ops) {
+    let m = 1001
+    let i = 0
+    while i < len(ops) {
+        let o = kg_atom(kg, ops[i])
+        if o != 0 {
+            let c = rop_confidence(o)
+            if c < m { m = c }
+        }
+        i = i + 1
+    }
+    if m > 1000 { return 1000 }
+    return m
+}
+// R76: the confidence (milli) of a single operator by atom id -- 1000 if absent.
+fn _cr_op_confidence(kg, opid) {
+    let o = kg_atom(kg, opid)
+    if o == 0 { return 1000 }
+    return rop_confidence(o)
+}
+// R74: a leading hedge phrase for a chain's confidence -- confident answers go
+// unqualified, mid ones get "i think", weak ones "tentatively,".
+fn _cr_confidence_phrase(conf) {
+    if conf >= 700 { return "" }
+    if conf >= 400 { return "i think " }
+    return "tentatively, "
+}
+
+// to an unvisited node, up to max_depth hops. Returns [nodes_list, op_ids].
+fn _cr_chain(kg, seed, max_depth) {
+    let nodes = list_new()
+    push(nodes, seed)
+    let ops = list_new()
+    let cur = seed
+    let d = 0
+    let going = 1
+    while going == 1 {
+        if d >= max_depth { going = 0 }
+        else {
+            let cands = rk_operators_from(kg, cur)
+            let best = 0
+            let best_score = 0 - 1
+            let j = 0
+            while j < len(cands) {
+                let op = cands[j]
+                if _cr_is_chaining(rop_kind(op)) == 1 {
+                    let concl = rop_conclusion(op)
+                    if contains(nodes, concl) == 0 {
+                        // R71: confidence weighted by the edge's source authority.
+                        let score = rop_confidence(op) * _cr_src_weight(atom_label(op)) / 1000
+                        if score > best_score {
+                            best_score = score
+                            best = op
+                        }
+                    }
+                }
+                j = j + 1
+            }
+            if best == 0 { going = 0 }
+            else {
+                let concl = rop_conclusion(best)
+                push(nodes, concl)
+                push(ops, atom_id(best))
+                cur = concl
+                d = d + 1
+            }
+        }
+    }
+    let out = list_new()
+    push(out, nodes)
+    push(out, ops)
+    return out
+}
+
+// The longest chain reachable from any percept seed. [nodes, op_ids].
+fn _cr_best_chain(kg, percept) {
+    let seeds = _cr_seeds(percept)
+    let best_nodes = list_new()
+    let best_ops = list_new()
+    let i = 0
+    while i < len(seeds) {
+        let ch = _cr_chain(kg, seeds[i], 3)
+        if len(ch[0]) > len(best_nodes) {
+            best_nodes = ch[0]
+            best_ops = ch[1]
+        }
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, best_nodes)
+    push(out, best_ops)
+    return out
+}
+
+// The first operator of `kind` leaving a percept seed -> [head, dst, op_id], or
+// 0. ROP_ANALOGY (synonym, R66) and ROP_OPPOSITE (antonym, R67) aren't followed
+// by the forward-chain (_cr_is_chaining), so they're surfaced separately. (The
+// legacy ":ant->" label on an R66 ANALOGY op is skipped for synonyms, for
+// backward-compat with pre-R67 data.)
+fn _cr_related_of(kg, percept, kind) {
+    let seeds = _cr_seeds(percept)
+    let i = 0
+    while i < len(seeds) {
+        let ops = rk_operators_from(kg, seeds[i])
+        let j = 0
+        while j < len(ops) {
+            let op = ops[j]
+            if rop_kind(op) == kind {
+                let skip = 0
+                if kind == ROP_ANALOGY { if str_find(atom_label(op), ":ant->") >= 0 { skip = 1 } }
+                if skip == 0 {
+                    let r = list_new()
+                    push(r, _cr_label(kg, seeds[i]))
+                    push(r, _cr_label(kg, rop_conclusion(op)))
+                    push(r, atom_id(op))
+                    return r
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// R73: opposite-aware belief update -- asserting (and corroborating) a fact about
+// X makes X's antonym Y a little LESS likely: one negative observation on Y's
+// belief. Returns the weakened opposite's label, or "" when X has no antonym.
+fn _cr_weaken_opposite(kg, percept) {
+    let opp = _cr_related_of(kg, percept, ROP_OPPOSITE)
+    if opp == 0 { return "" }
+    let opatom = kg_atom(kg, opp[2])
+    if opatom == 0 { return "" }
+    let ya = kg_atom(kg, rop_conclusion(opatom))
+    if ya == 0 { return "" }
+    atom_observe(ya, 0 - 1)
+    return opp[1]
+}
+
+fn _cr_render_chain(kg, nodes) {
+    let s = ""
+    let i = 0
+    while i < len(nodes) {
+        if i > 0 { s = s + "->" }
+        s = s + _cr_label(kg, nodes[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn _cr_ops_csv(ops) {
+    let s = ""
+    let i = 0
+    while i < len(ops) {
+        if i > 0 { s = s + "," }
+        s = s + int_to_str(ops[i])
+        i = i + 1
+    }
+    return s
+}
+
+// Strongest single learned relation leaving a percept seed.
+// Returns [subject_label, relation_phrase, object_label, op_id] or 0.
+fn _cr_single_triple(kg, percept) {
+    let seeds = _cr_seeds(percept)
+    let i = 0
+    while i < len(seeds) {
+        let ops = rk_operators_from(kg, seeds[i])
+        let best = 0
+        let bc = 0 - 1
+        let j = 0
+        while j < len(ops) {
+            // R66/R67: analogy (synonym) and opposite (antonym) edges have their
+            // own surfaces (_cr_related_of), so don't let a raw one render here.
+            if rop_kind(ops[j]) != ROP_ANALOGY { if rop_kind(ops[j]) != ROP_OPPOSITE {
+                if rop_confidence(ops[j]) > bc { bc = rop_confidence(ops[j]) best = ops[j] }
+            } }
+            j = j + 1
+        }
+        if best != 0 {
+            let out = list_new()
+            push(out, _cr_label(kg, seeds[i]))
+            push(out, _cr_rel(rop_kind(best)))
+            push(out, _cr_label(kg, rop_conclusion(best)))
+            push(out, atom_id(best))
+            return out
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _cr_rel(kind) {
+    if kind == ROP_CAUSAL { return "leads to" }
+    if kind == ROP_IMPLY { return "implies" }
+    if kind == ROP_ANALOGY { return "is like" }
+    if kind == ROP_OPPOSITE { return "is the opposite of" }
+    return "relates to"
+}
+
+// ---- stopword-aware unknown-word selection (fixes the "the"/"2" bug) ------
+fn _cr_stopwords() {
+    return ["the", "a", "an", "is", "are", "was", "were", "be", "been", "am",
+            "of", "to", "in", "on", "at", "for", "and", "or", "but", "so", "if",
+            "then", "than", "as", "by", "with", "from", "into", "about",
+            "i", "you", "we", "they", "he", "she", "it", "me", "my", "your",
+            "this", "that", "these", "those", "do", "does", "did", "done",
+            "what", "why", "how", "when", "where", "who", "which", "whose",
+            "can", "could", "will", "would", "should", "shall", "may", "might",
+            "must", "have", "has", "had", "i'm", "im", "its", "it's"]
+}
+
+fn _cr_tokens(raw_msg) { return _ic_tokens(_ic_lower(str_trim(raw_msg))) }
+
+fn _cr_first_content_unknown(lang, raw_msg) {
+    let toks = _cr_tokens(raw_msg)
+    let i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        // R48: a known learned bigram ("lung cancer" -> lung_cancer) is NOT a
+        // gap -- skip both tokens so the academic path reasons over the
+        // compound instead of flagging "lung" unknown.
+        let span = 1
+        if i + 1 < len(toks) {
+            if word_find_morph(lang, t + "_" + toks[i + 1]) != 0 { span = 2 }
+        }
+        if span == 1 {
+            if _ic_in(t, _cr_stopwords()) == 0 {
+                if _ic_is_number_tok(t) == 0 {
+                    if word_find_morph(lang, t) == 0 { return t }
+                }
+            }
+        }
+        i = i + span
+    }
+    return ""
+}
+
+// First content token (known or not) -- used to name a topic in replies.
+fn _cr_topic_word(raw_msg) {
+    let toks = _cr_tokens(raw_msg)
+    let i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        if _ic_in(t, _cr_stopwords()) == 0 {
+            if _ic_is_number_tok(t) == 0 { return t }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// R60: [word, gloss] of the first known content token that carries a dictionary
+// gloss, or ["", ""]. Lets the academic/unknown paths answer "X means: ..." for
+// a word that was defined (R60 autodefine) but has no reasoning chain yet.
+fn _cr_first_gloss(lang, raw_msg) {
+    let toks = _cr_tokens(raw_msg)
+    let i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        if _ic_in(t, _cr_stopwords()) == 0 {
+            if _ic_is_number_tok(t) == 0 {
+                let w = word_find_morph(lang, t)
+                if w != 0 {
+                    let g = word_gloss(w)
+                    if len(g) > 0 {
+                        let r = list_new() push(r, t) push(r, g) return r
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let z = list_new() push(z, "") push(z, "") return z
+}
+
+// ---- named-feeling extraction (personal) ----------------------------------
+fn _cr_pos_feelings() { return ["happy", "excited", "proud", "grateful", "glad", "joyful", "calm", "great", "good", "relieved", "content", "hopeful"] }
+fn _cr_neg_feelings() { return ["sad", "tired", "angry", "anxious", "scared", "afraid", "lonely", "bored", "sick", "worried", "stressed", "depressed", "nervous", "ashamed", "upset", "down", "unhappy", "exhausted", "frustrated"] }
+
+// Returns [feeling_word, polarity] (polarity 1/-1) or ["", 0].
+fn _cr_find_feeling(toks) {
+    let i = 0
+    while i < len(toks) {
+        if _ic_in(toks[i], _cr_pos_feelings()) == 1 {
+            let r = list_new() push(r, toks[i]) push(r, 1) return r
+        }
+        if _ic_in(toks[i], _cr_neg_feelings()) == 1 {
+            let r = list_new() push(r, toks[i]) push(r, 0 - 1) return r
+        }
+        i = i + 1
+    }
+    let z = list_new() push(z, "") push(z, 0) return z
+}
+
+// Two compared options around or/than/vs -> [a, b] or 0.
+fn _cr_two_options(raw_msg) {
+    let toks = _cr_tokens(raw_msg)
+    let i = 0
+    while i < len(toks) {
+        let w = toks[i]
+        let marker = 0
+        if str_eq(w, "or") == 1 { marker = 1 }
+        if str_eq(w, "than") == 1 { marker = 1 }
+        if str_eq(w, "vs") == 1 { marker = 1 }
+        if str_eq(w, "versus") == 1 { marker = 1 }
+        if marker == 1 {
+            let a = _cr_content_before(toks, i)
+            let b = _cr_content_after(toks, i)
+            if len(a) > 0 { if len(b) > 0 {
+                let r = list_new() push(r, a) push(r, b) return r
+            } }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// For option extraction we skip stopwords AND comparison adjectives, so
+// "democracy better than monarchy" yields democracy/monarchy, not better/...
+fn _cr_opt_skip(w) {
+    if _ic_in(w, _cr_stopwords()) == 1 { return 1 }
+    if _ic_in(w, ["better", "worse", "more", "less", "best", "worst", "rather", "much", "most", "least"]) == 1 { return 1 }
+    return 0
+}
+fn _cr_content_before(toks, idx) {
+    let j = idx - 1
+    while j >= 0 {
+        if _cr_opt_skip(toks[j]) == 0 { return toks[j] }
+        j = j - 1
+    }
+    return ""
+}
+fn _cr_content_after(toks, idx) {
+    let j = idx + 1
+    while j < len(toks) {
+        if _cr_opt_skip(toks[j]) == 0 { return toks[j] }
+        j = j + 1
+    }
+    return ""
+}
+
+// ---- per-category strategies ----------------------------------------------
+fn _cr_arith(raw_msg) {
+    let r = arith_eval(raw_msg)
+    if arith_ok(r) == 1 {
+        return _rr("= " + arith_text(r), "arithmetic: evaluated expression", "")
+    }
+    return _rr("that looks like a calculation, but I couldn't parse it -- try e.g. '12 * 5' or '15% of 200'.",
+               "arithmetic: unparsed", "")
+}
+
+fn _cr_financial(raw_msg, kg, lang, percept, now) {
+    let r = arith_eval(raw_msg)
+    if arith_ok(r) == 1 {
+        return _rr("= " + arith_text(r) + "  (I can run the numbers, but this isn't financial advice.)",
+                   "financial: computed", "")
+    }
+    // If the subject itself is an unknown word, name the gap rather than
+    // reaching for an incidental forward-chain over function words.
+    let unknown = _cr_first_content_unknown(lang, raw_msg)
+    if len(unknown) > 0 {
+        return _rr("that's a financial question about '" + unknown
+                   + "'. i don't have a model for it yet -- teach me with /learn. (not financial advice.)",
+                   "financial: knowledge gap", "")
+    }
+    let ch = _cr_best_chain(kg, percept)
+    if len(ch[0]) >= 2 {
+        let chain = _cr_render_chain(kg, ch[0])
+        return _rr("on money matters i reason from what i've learned: " + chain
+                   + ". i can weigh trade-offs, but this isn't financial advice.",
+                   "financial: forward-chain " + chain, _cr_ops_csv(ch[1]))
+    }
+    return _rr("that's a financial question. i can compute figures and weigh trade-offs, but i won't give financial advice.",
+               "financial: no numeric expression", "")
+}
+
+fn _cr_greeting(raw_msg) {
+    let toks = _cr_tokens(raw_msg)
+    if _ic_has_any(toks, ["thanks", "thank", "thx"]) == 1 {
+        return _rr("you're welcome!", "social: thanks (no KG write)", "")
+    }
+    if _ic_has_any(toks, ["bye", "goodbye", "cya"]) == 1 {
+        return _rr("take care -- talk soon.", "social: farewell (no KG write)", "")
+    }
+    return _rr("hello! what would you like to explore?", "social: greeting (no KG write)", "")
+}
+
+fn _cr_social(raw_msg) {
+    let norm = _ic_lower(str_trim(raw_msg))
+    if _ic_sub(norm, "how are you") == 1 {
+        return _rr("i'm running well -- curious and ready to think. how are you?",
+                   "social: smalltalk (no KG write)", "")
+    }
+    return _rr("i'm here and listening. what's on your mind?",
+               "social: smalltalk (no KG write)", "")
+}
+
+fn _cr_personal(raw_msg) {
+    let toks = _cr_tokens(raw_msg)
+    let f = _cr_find_feeling(toks)
+    let feeling = f[0]
+    if len(feeling) > 0 {
+        if f[1] > 0 {
+            return _rr("i'm glad you're feeling " + feeling + ". want to tell me more?",
+                       "personal: empathic+ (episodic, not asserted as fact)", "")
+        }
+        return _rr("i'm sorry you're feeling " + feeling + ". i'm here if you want to talk about it.",
+                   "personal: empathic- (episodic, not asserted as fact)", "")
+    }
+    return _rr("thanks for sharing that with me -- i'll keep it in mind.",
+               "personal: acknowledged (episodic, not asserted as fact)", "")
+}
+
+fn _cr_debatable(raw_msg, kg, lang, percept, now) {
+    let opts = _cr_two_options(raw_msg)
+    let ops = ""
+    let consider = ""
+    // Only offer a traceable thread when the topic is fully known -- otherwise
+    // the chain is an incidental over function words and reads as a non-sequitur
+    // ("democracy vs monarchy" must not append a stray help->response).
+    if len(_cr_first_content_unknown(lang, raw_msg)) == 0 {
+        let ch = _cr_best_chain(kg, percept)
+        if len(ch[0]) >= 2 {
+            consider = " one thread i can trace: " + _cr_render_chain(kg, ch[0]) + "."
+            ops = _cr_ops_csv(ch[1])
+        }
+    }
+    if opts != 0 {
+        return _rr("that's a matter of judgement -- both '" + opts[0] + "' and '" + opts[1]
+                   + "' have a case, and which wins depends on what you value most." + consider
+                   + " i can lay out considerations for each, but i won't assert one as the truth.",
+                   "debatable: balanced (belief held with wide uncertainty)", ops)
+    }
+    return _rr("that's debatable -- reasonable people disagree. i can map the trade-offs," + consider
+               + " but i'll avoid claiming a single answer is correct.",
+               "debatable: balanced (belief held with wide uncertainty)", ops)
+}
+
+fn _cr_procedural(raw_msg, kg, lang, percept, now) {
+    // Prefer naming the unknown subject over an incidental chain (so "how do i
+    // bake bread" admits it doesn't know "bread", not "i->self").
+    let unknown = _cr_first_content_unknown(lang, raw_msg)
+    if len(unknown) > 0 {
+        return _rr("i don't have a stored procedure for '" + unknown
+                   + "' yet -- teach me the steps with /learn and i'll remember them.",
+                   "procedural: no stored procedure", "")
+    }
+    let ch = _cr_best_chain(kg, percept)
+    if len(ch[0]) >= 2 {
+        let chain = _cr_render_chain(kg, ch[0])
+        return _rr("here's a sequence i've learned: " + chain
+                   + ". want me to expand any step?",
+                   "procedural: step-chain " + chain, _cr_ops_csv(ch[1]))
+    }
+    return _rr("i don't have those steps yet -- teach me with /learn and i'll remember the procedure.",
+               "procedural: no stored procedure", "")
+}
+
+fn _cr_academic(raw_msg, kg, lang, percept, now) {
+    // When the subject contains an unknown content word, the honest answer is
+    // to name the gap -- not to surface an incidental forward-chain over the
+    // function words that happened to anchor ("why is the sky blue" should
+    // admit it doesn't know "sky", not chain help->response).
+    let unknown = _cr_first_content_unknown(lang, raw_msg)
+    if len(unknown) > 0 {
+        return _rr("i don't have a model of '" + unknown
+                   + "' yet -- want me to /learn it?",
+                   "academic: knowledge gap (unknown concept)", "")
+    }
+    let ch = _cr_best_chain(kg, percept)
+    if len(ch[0]) >= 2 {
+        let nodes = ch[0]
+        let chain = _cr_render_chain(kg, nodes)
+        let head = _cr_label(kg, nodes[0])
+        let tail = _cr_label(kg, nodes[len(nodes) - 1])
+        // R72: opposite-aware contrast -- if the subject has an antonym, note it
+        // ("...; as opposed to Y"), so the agent reasons with what X is NOT.
+        let opp = _cr_related_of(kg, percept, ROP_OPPOSITE)
+        let contrast = ""
+        let ctrace = ""
+        if opp != 0 { contrast = ", as opposed to " + opp[1] ctrace = " (vs " + opp[1] + ")" }
+        // R74: hedge the answer by the weakest link in the chain.
+        let conf = _cr_chain_confidence(kg, ch[1])
+        let qual = _cr_confidence_phrase(conf)
+        return _rr(qual + head + " leads to " + tail + " (" + chain + ")" + contrast + ".",
+                   "academic: forward-chain " + chain + ctrace + " [conf=" + int_to_str(conf) + "]",
+                   _cr_ops_csv(ch[1]))
+    }
+    let tri = _cr_single_triple(kg, percept)
+    if tri != 0 {
+        let tc = _cr_op_confidence(kg, tri[3])
+        return _rr(_cr_confidence_phrase(tc) + tri[0] + " " + tri[1] + " " + tri[2] + ".",
+                   "academic: known relation [conf=" + int_to_str(tc) + "]", int_to_str(tri[3]))
+    }
+    // R66: no chain, but a synonym edge -> "X is like Y" (synonyms preferred).
+    let an = _cr_related_of(kg, percept, ROP_ANALOGY)
+    if an != 0 {
+        let ac = _cr_op_confidence(kg, an[2])
+        return _rr(_cr_confidence_phrase(ac) + an[0] + " is like " + an[1] + ".",
+                   "academic: analogy (synonym) [conf=" + int_to_str(ac) + "]", int_to_str(an[2]))
+    }
+    // R67: else an antonym edge -> "X is the opposite of Y".
+    let op = _cr_related_of(kg, percept, ROP_OPPOSITE)
+    if op != 0 {
+        let oc = _cr_op_confidence(kg, op[2])
+        return _rr(_cr_confidence_phrase(oc) + op[0] + " is the opposite of " + op[1] + ".",
+                   "academic: opposite (antonym) [conf=" + int_to_str(oc) + "]", int_to_str(op[2]))
+    }
+    // R60: no chain, but the word has a dictionary gloss -> answer with it.
+    let gl = _cr_first_gloss(lang, raw_msg)
+    if len(gl[1]) > 0 {
+        return _rr(gl[0] + " means: " + gl[1], "academic: dictionary gloss", "")
+    }
+    let topic = _cr_topic_word(raw_msg)
+    if len(topic) > 0 {
+        return _rr("i don't have a model of '" + topic
+                   + "' yet -- want me to /learn it?",
+                   "academic: knowledge gap (unknown concept)", "")
+    }
+    return _rr("i don't have enough to reason about that yet -- teach me with /learn.",
+               "academic: knowledge gap", "")
+}
+
+fn _cr_factual(raw_msg, kg, lang, percept, now) {
+    let unknown = _cr_first_content_unknown(lang, raw_msg)
+    if len(unknown) > 0 {
+        return _rr("noted -- '" + unknown
+                   + "' is new to me. teach me with /learn so it sticks.",
+                   "factual: assertion with new term (queued to learn)", "")
+    }
+    let tri = _cr_single_triple(kg, percept)
+    if tri != 0 {
+        // R73: corroborating a fact about X makes X's opposite a bit less likely.
+        let weakened = _cr_weaken_opposite(kg, percept)
+        let note = ""
+        if len(weakened) > 0 { note = " ('" + weakened + "', its opposite, now a bit less likely)" }
+        return _rr("noted. that lines up with what i know: " + tri[0] + " " + tri[1] + " " + tri[2] + "." + note,
+                   "factual: assertion corroborated", int_to_str(tri[3]))
+    }
+    return _rr("noted -- i'll treat that as something to learn. use /learn to make it durable.",
+               "factual: assertion (queued to learn)", "")
+}
+
+fn _cr_unknown(raw_msg, kg, lang, percept, now) {
+    let unknown = _cr_first_content_unknown(lang, raw_msg)
+    if len(unknown) > 0 {
+        return _rr("i don't know '" + unknown + "' yet -- i'll look into it.",
+                   "unknown: new content word", "")
+    }
+    // Everything is known but nothing categorised -- try reasoning anyway.
+    let ch = _cr_best_chain(kg, percept)
+    if len(ch[0]) >= 2 {
+        let chain = _cr_render_chain(kg, ch[0])
+        return _rr(_cr_label(kg, ch[0][0]) + " leads to "
+                   + _cr_label(kg, ch[0][len(ch[0]) - 1]) + " (" + chain + ").",
+                   "unknown: forward-chain " + chain, _cr_ops_csv(ch[1]))
+    }
+    // R66: a synonym edge -> "X is like Y".
+    let an = _cr_related_of(kg, percept, ROP_ANALOGY)
+    if an != 0 {
+        return _rr(an[0] + " is like " + an[1] + ".",
+                   "unknown: analogy (synonym)", int_to_str(an[2]))
+    }
+    // R67: an antonym edge -> "X is the opposite of Y".
+    let op = _cr_related_of(kg, percept, ROP_OPPOSITE)
+    if op != 0 {
+        return _rr(op[0] + " is the opposite of " + op[1] + ".",
+                   "unknown: opposite (antonym)", int_to_str(op[2]))
+    }
+    // R60: fall back to a dictionary gloss if the word carries one.
+    let gl = _cr_first_gloss(lang, raw_msg)
+    if len(gl[1]) > 0 {
+        return _rr(gl[0] + " means: " + gl[1], "unknown: dictionary gloss", "")
+    }
+    return _rr("i hear you -- could you say a bit more, or ask me something specific?",
+               "unknown: no strong signal", "")
+}
+
+// ---- public entry point ---------------------------------------------------
+// router_reply(category, raw_msg, kg, lang, percept, now) -> [reply, trace, ops].
+fn router_reply(category, raw_msg, kg, lang, percept, now) {
+    if category == CAT_ARITHMETIC { return _cr_arith(raw_msg) }
+    if category == CAT_FINANCIAL  { return _cr_financial(raw_msg, kg, lang, percept, now) }
+    if category == CAT_GREETING   { return _cr_greeting(raw_msg) }
+    if category == CAT_SOCIAL     { return _cr_social(raw_msg) }
+    if category == CAT_PERSONAL   { return _cr_personal(raw_msg) }
+    if category == CAT_DEBATABLE  { return _cr_debatable(raw_msg, kg, lang, percept, now) }
+    if category == CAT_PROCEDURAL { return _cr_procedural(raw_msg, kg, lang, percept, now) }
+    if category == CAT_ACADEMIC   { return _cr_academic(raw_msg, kg, lang, percept, now) }
+    if category == CAT_FACTUAL    { return _cr_factual(raw_msg, kg, lang, percept, now) }
+    return _cr_unknown(raw_msg, kg, lang, percept, now)
+}
+
+// Apply user feedback to the operators a prior reply leaned on: sign +1
+// reinforces (the inference was good), -1 weakens it. Returns the count
+// adjusted. Drives ADR-0007 plasticity from conversation, not just sources.
+fn router_apply_feedback(kg, ops_csv, sign) {
+    if len(ops_csv) == 0 { return 0 }
+    let ids = split(ops_csv, ",")
+    let n = 0
+    let i = 0
+    while i < len(ids) {
+        let t = str_trim(ids[i])
+        if len(t) > 0 {
+            let id = str_to_int(t)
+            let a = kg_atom(kg, id)
+            if a != 0 { rop_observe(a, sign) n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
