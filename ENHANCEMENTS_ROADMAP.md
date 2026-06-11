@@ -36,6 +36,18 @@ unfixed) wastes effort because entity resolution will fragment the KG.
 
 ## P1 — HDC/VSA embedding layer  *(keystone)*
 
+> **STATUS: implemented (2026-06-11), behind `ATOM_EMBED_MODE` (default LEGACY).**
+> Module `src/kg/hdc_embed.nova` (D=10000 bipolar VSA: bind/bundle/permute/
+> unbind/cosine + symbol/encode), flag + accessors in `atom_store.nova`,
+> `word_atom_new` wired via `word_embed_vec`, ADR-0051, and
+> `tests/unit/test_hdc_embed.nova` (39 checks). All acceptance criteria met
+> (measured): bind self-inverse exact; `(France⊗capital)→Paris`;
+> `cos(encode(car),encode(automobile))=731 (>700)`; capacity 35/35 perfect,
+> 58/60 at N=60. Prior tests green at the LEGACY default.
+> **Remaining for full cutover:** symbol-vector cache; extend the mode branch to
+> `snapshot_disk.nova` + `concept_layer.nova`; `entity_resolve.nova` (P3) as the
+> first real `hdc_cosine` consumer. See ADR-0051 "Honest gaps".
+
 **Problem.** `atom_store` uses `ATOM_EMBED_DIMS = 8` from `word_lexical_vec` →
 captures spelling, not meaning. "car" and "automobile" are far apart.
 

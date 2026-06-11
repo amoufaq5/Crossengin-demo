@@ -1,0 +1,241 @@
+// CrossEngin knowledge: HDC / VSA embedding layer (P1 keystone, ADR-0051).
+//
+// Purpose
+//   A Vector Symbolic Architecture (VSA) over high-dimensional bipolar
+//   hypervectors. This replaces the 8-dim lexical hash (`word_lexical_vec`),
+//   which captures spelling rather than meaning: "car" and "automobile" share
+//   no characters so the lexical vectors are far apart, even though the two
+//   words denote the same concept. With HDC, meaning is carried compositionally
+//   by an atom's *neighbourhood* (the relations and neighbours it participates
+//   in), so two atoms that occur with the same neighbours land close together
+//   regardless of spelling.
+//
+//   A hypervector here is a plain list of D = 10,000 integers, each +1 or -1
+//   (bipolar). Keeping the same "list of ints" shape as `vec_new`/`atom_embed`
+//   means HDC vectors are a drop-in replacement for the legacy embedding: they
+//   live in the same atom embed slot and flow through `ann_index` (which is
+//   dimension-agnostic) and the milli-fixed-point cosine convention unchanged.
+//
+//   Algebra (Kanerva 2009; Plate's HRR; Gayler):
+//     bind    = element-wise multiply (role (x) filler). Self-inverse for
+//               bipolar vectors because (+/-1)^2 = 1, so unbind == bind.
+//     bundle  = element-wise sum then sign (superposition / set membership).
+//     permute = cyclic shift (encodes order / protects a slot from binding).
+//   These give one-shot, gradient-free, compositional representations:
+//     record  = bundle( bind(role_1, filler_1), ... )           (a struct)
+//     filler  = unbind(record, role_k)                          (a query)
+//
+// Determinism + provenance: every symbol vector is a pure function of its
+//   label (FNV-1a seed -> LCG bit stream), so the same label always yields the
+//   same hypervector across processes and snapshots -- no stored random tables.
+//
+// NOVA codegen note (#11): the pointer-threshold multiply heuristic miscompiles
+//   `a * b` when either operand is >= 0x100000 (1048576). The PRNG multiplies by
+//   large LCG/FNV constants, so it uses the overflow-safe `int_mul`/`int_mod`/
+//   `int_div`/`int_add` builtins (the same choice NOVA's own std HDC makes).
+//   The bipolar arithmetic (bind/bundle/cosine) only ever multiplies tiny
+//   operands (+/-1, and accumulators bounded by D), so it uses bare operators.
+//
+// ADRs implemented: ADR-0051 (HDC/VSA embeddings). Related: ADR-0016 (atom
+//   embed slot), ADR-0049 (tests/benches).
+// NOVA dependencies: builtins (list_new/push/list_set/len, int_mul/int_add/
+//   int_mod/int_div, char_at).
+// CrossEngin dependencies: src/kg/atom_store.nova (isqrt, FP_SCALE, vec shape).
+
+import "atom_store.nova"
+
+// ---- dimensionality -------------------------------------------------------
+// D = 10,000: high enough that ~10k random bipolar vectors are mutually
+// near-orthogonal (cosine ~ 0) yet capacity for bundling stays generous.
+let HDC_DIMS = 10000
+
+fn hdc_dims() { return HDC_DIMS }
+
+// ---- deterministic PRNG (overflow-safe) -----------------------------------
+// Classic glibc LCG: state' = (state * 1103515245 + 12345) mod 2^31. We read
+// bit 16 (mid bits are better distributed than the low bit) to draw each
+// coordinate. int_* builtins dodge the large-multiply codegen bug (#11).
+let _HDC_LCG_MUL = 1103515245
+let _HDC_LCG_INC = 12345
+let _HDC_LCG_MOD = 2147483648   // 2^31
+
+fn _hdc_lcg_next(s) {
+    return int_mod(int_add(int_mul(s, _HDC_LCG_MUL), _HDC_LCG_INC), _HDC_LCG_MOD)
+}
+
+// FNV-1a over the label bytes, folded into the LCG's 31-bit range. Gives ~2^31
+// distinct seeds so distinct labels almost never collide (cf. the 15-bit
+// `label_hash`, which only has 32768 buckets -- fine for indexing, too few for
+// unique symbol vectors).
+let _HDC_FNV_OFFSET = 2166136261   // 0x811C9DC5
+let _HDC_FNV_PRIME  = 16777619     // 0x01000193
+
+fn hdc_str_seed(label) {
+    let h = int_mod(_HDC_FNV_OFFSET, _HDC_LCG_MOD)
+    let i = 0
+    while i < len(label) {
+        h = int_mod(int_mul(h ^ char_at(label, i), _HDC_FNV_PRIME), _HDC_LCG_MOD)
+        i = i + 1
+    }
+    if h == 0 { h = 1 }
+    return h
+}
+
+// A deterministic +/-1 hypervector for an integer seed. The seed is scrambled
+// through two LCG steps first so that adjacent seeds (0,1,2) still produce
+// near-orthogonal vectors rather than correlated prefixes.
+fn hdc_random_atom_vector(seed) {
+    let st = _hdc_lcg_next(int_add(_hdc_lcg_next(seed), 1))
+    let v = list_new()
+    let i = 0
+    while i < HDC_DIMS {
+        st = _hdc_lcg_next(st)
+        if int_mod(int_div(st, 65536), 2) == 1 {
+            push(v, 1)
+        } else {
+            push(v, -1)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// The hypervector standing for an atomic symbol (a word/relation/label).
+// Pure function of the label, so it is stable across calls and processes.
+fn hdc_symbol(label) {
+    return hdc_random_atom_vector(hdc_str_seed(label))
+}
+
+// ---- core VSA operations --------------------------------------------------
+
+// bind: element-wise multiply (role (x) filler). Bipolar => self-inverse.
+fn hdc_bind(a, b) {
+    let n = len(a)
+    if len(b) < n { n = len(b) }
+    let r = list_new()
+    let i = 0
+    while i < n {
+        push(r, a[i] * b[i])
+        i = i + 1
+    }
+    return r
+}
+
+// unbind: recover a filler bound under `key`. For bipolar vectors this is just
+// bind again, since key (x) key = all-ones.
+fn hdc_unbind(bound, key) {
+    return hdc_bind(bound, key)
+}
+
+// bundle: superpose a list of hypervectors (element-wise sum, then sign). The
+// result is similar to each input and dissimilar to non-members. Ties (sum 0,
+// only possible with an even count) resolve to +1 -- a fixed, documented bias.
+fn hdc_bundle(vecs) {
+    let count = len(vecs)
+    if count == 0 { return list_new() }
+    let dims = len(vecs[0])
+    let acc = list_new()
+    let i = 0
+    while i < dims { push(acc, 0); i = i + 1 }
+    let v = 0
+    while v < count {
+        let vec = vecs[v]
+        let m = len(vec)
+        if m > dims { m = dims }
+        let j = 0
+        while j < m {
+            list_set(acc, j, acc[j] + vec[j])
+            j = j + 1
+        }
+        v = v + 1
+    }
+    let out = list_new()
+    i = 0
+    while i < dims {
+        if acc[i] >= 0 { push(out, 1) } else { push(out, -1) }
+        i = i + 1
+    }
+    return out
+}
+
+// permute: cyclic shift by k (out[i] = v[(i - k) mod dims]). Used to encode
+// order / sequence and to keep a slot distinct under repeated binding. The
+// inverse is hdc_permute(v, -k).
+fn hdc_permute(v, k) {
+    let dims = len(v)
+    if dims == 0 { return list_new() }
+    let sh = int_mod(k, dims)
+    if sh < 0 { sh = sh + dims }
+    let out = list_new()
+    let i = 0
+    while i < dims {
+        let src = i - sh
+        if src < 0 { src = src + dims }
+        push(out, v[src])
+        i = i + 1
+    }
+    return out
+}
+
+// cosine similarity in milli, SIGNED in [-1000, 1000]. Unlike `vec_cosine`
+// (which clamps at 0 for the non-negative lexical vectors), HDC vectors are
+// bipolar so anti-correlation is meaningful; near-orthogonal random vectors
+// score ~0. For pure +/-1 vectors both norms are sqrt(D), so this reduces to
+// dot/D, but we compute the norms explicitly to stay correct for raw sums too.
+fn hdc_cosine(a, b) {
+    let n = len(a)
+    if len(b) < n { n = len(b) }
+    let dot = 0
+    let na = 0
+    let nb = 0
+    let i = 0
+    while i < n {
+        let x = a[i]
+        let y = b[i]
+        dot = dot + x * y
+        na = na + x * x
+        nb = nb + y * y
+        i = i + 1
+    }
+    if na == 0 { return 0 }
+    if nb == 0 { return 0 }
+    let denom = isqrt(na) * isqrt(nb)
+    if denom == 0 { return 0 }
+    let neg = 0
+    let adot = dot
+    if adot < 0 { neg = 1; adot = 0 - adot }
+    let c = adot * FP_SCALE / denom
+    if c > FP_SCALE { c = FP_SCALE }
+    if neg == 1 { return 0 - c }
+    return c
+}
+
+// ---- atom encoding --------------------------------------------------------
+// Encode an atom's meaning as the bundle of (relation (x) neighbour) over its
+// edges. Two atoms with the same neighbourhood get near-identical vectors --
+// this is what makes "car" and "automobile" resolve close together even though
+// their spellings (and therefore their `hdc_symbol`s) are unrelated.
+//
+// `edges` is a list of [relation_label, neighbour_label] pairs. The atom's own
+// label is deliberately NOT bundled in: meaning lives in the neighbourhood, and
+// folding the (unique) self-label into every record would push synonyms apart.
+fn hdc_encode_edges(edges) {
+    let bound = list_new()
+    let i = 0
+    while i < len(edges) {
+        let e = edges[i]
+        let rel = hdc_symbol(e[0])
+        let nbr = hdc_symbol(e[1])
+        push(bound, hdc_bind(rel, nbr))
+        i = i + 1
+    }
+    if len(bound) == 0 { return list_new() }
+    return hdc_bundle(bound)
+}
+
+// Encode an atom from its label + edge list. An atom with no edges falls back
+// to its own symbol vector (its only available meaning is its identity).
+fn hdc_encode_atom(label, edges) {
+    if len(edges) == 0 { return hdc_symbol(label) }
+    return hdc_encode_edges(edges)
+}
