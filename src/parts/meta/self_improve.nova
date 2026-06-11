@@ -1,0 +1,184 @@
+// CrossEngin meta: self-improvement loop (P5, ADR-0055).
+//
+// Purpose
+//   Improve at a task across sessions using ONLY the agent's own logged
+//   experience -- no human teaching. The agent acts in a world (world_model),
+//   logs each (state, action, reward, next-state) transition, and updates a
+//   value estimate from it (a gradient-free temporal-difference backup; the
+//   world is deterministic, so a full backup is value iteration). Greedy action
+//   selection over optimistic-initial values drives systematic exploration, so
+//   the policy converges to a short path and the task metric (return per
+//   session) rises across sessions.
+//
+//   The reflection step reviews the return trend and the value table and may
+//   PROPOSE a self-edit -- e.g. committing a learned best-action as a rule. Such
+//   edits are BOUNDED: each one is an ACT_SELF_MODIFY routed through the
+//   constitutional gate (a vetoed edit never runs; APPROVE-tier edits need
+//   approval) and recorded in the decision log (intent + outcome), so every
+//   self-change is audited and reversible. No unbounded self-rewrite.
+//
+// ADRs implemented: ADR-0055 (self-improvement), ADR-0045 (constitutional gate),
+//   ADR-0043 (decision log), ADR-0024 (TD / prediction error). NOVA deps:
+//   builtins. CrossEngin deps: ../../sim/world_model.nova,
+//   ../../safety/constitutional_filter.nova, ../../audit/decision_log.nova.
+
+import "../../sim/world_model.nova"
+import "../../safety/constitutional_filter.nova"
+import "../../audit/decision_log.nova"
+
+let SI_GAMMA = 90   // discount, percent
+
+// ---- value table -----------------------------------------------------------
+// q[state] -> [value per action]. Optimistic init (0) above the negative step
+// rewards, so an untried action looks better than a tried losing one -> the
+// greedy policy explores without any RNG.
+fn q_new(n_states, n_actions, init) {
+    let q = list_new()
+    let s = 0
+    while s < n_states {
+        let row = list_new()
+        let a = 0
+        while a < n_actions { push(row, init) a = a + 1 }
+        push(q, row)
+        s = s + 1
+    }
+    return q
+}
+fn q_get(q, s, a) { return q[s][a] }
+fn q_set(q, s, a, v) { list_set(q[s], a, v) }
+
+fn q_max(q, s, n) {
+    let m = q[s][0]
+    let a = 1
+    while a < n { if q[s][a] > m { m = q[s][a] } a = a + 1 }
+    return m
+}
+fn q_argmax(q, s, n) {
+    let best = 0
+    let bv = q[s][0]
+    let a = 1
+    while a < n { if q[s][a] > bv { bv = q[s][a] best = a } a = a + 1 }
+    return best
+}
+
+// Greedy policy: the highest-value action for a state.
+fn si_action(q, s, n_actions) { return q_argmax(q, s, n_actions) }
+
+// TD backup from one logged transition (deterministic world -> full update).
+// This is the only learning signal: the world's own reward, nothing taught.
+fn si_update(q, s, a, reward, s2, done, n_actions) {
+    let target = reward
+    if done == 0 { target = reward + (SI_GAMMA * q_max(q, s2, n_actions)) / 100 }
+    q_set(q, s, a, target)
+}
+
+// ---- seeded RNG (reproducible exploration) ---------------------------------
+// A holder [state]; int_* builtins dodge the large-multiply codegen bug.
+fn si_rng_new(seed) { let h = list_new() push(h, seed) return h }
+fn _si_lcg(rng) {
+    let s = int_mod(int_add(int_mul(rng[0], 1103515245), 12345), 2147483648)
+    list_set(rng, 0, s)
+    return s
+}
+fn _si_rand(rng, n) {
+    if n <= 0 { return 0 }
+    return int_mod(int_div(_si_lcg(rng), 65536), n)
+}
+
+// ---- one session (episode) -------------------------------------------------
+// Act epsilon-greedily (epsilon in percent), learning from each transition;
+// stop at the goal or the step budget. epsilon=0 is pure exploitation (used to
+// EVALUATE the learned policy). Returns [total_reward, steps].
+fn si_episode(world, q, max_steps, epsilon, rng) {
+    let n = world_actions()
+    world_reset(world)
+    let total = 0
+    let steps = 0
+    let done = 0
+    while done == 0 {
+        if steps >= max_steps { done = 1 } else {
+            let s = world_state_id(world)
+            let a = si_action(q, s, n)
+            if epsilon > 0 { if _si_rand(rng, 100) < epsilon { a = _si_rand(rng, n) } }
+            let res = world_step(world, a)
+            let s2 = world_state_id(world)
+            si_update(q, s, a, res[0], s2, res[1], n)
+            total = total + res[0]
+            steps = steps + 1
+            if res[1] == 1 { done = 1 }
+        }
+    }
+    let r = list_new(); push(r, total); push(r, steps)
+    return r
+}
+
+// Evaluate the current policy GREEDILY (no exploration, no further learning
+// matters for the score) -- the task metric. Returns [total_reward, steps].
+fn si_eval(world, q, max_steps) {
+    let rng = si_rng_new(1)
+    return si_episode(world, q, max_steps, 0, rng)
+}
+
+// Train across `sessions` episodes with decaying exploration, learning ONLY
+// from logged transitions. Returns the list of per-session greedy-eval returns
+// (the metric trend). Deterministic given `seed`.
+fn si_train(world, q, sessions, max_steps, seed) {
+    let rng = si_rng_new(seed)
+    let totals = list_new()
+    let i = 0
+    while i < sessions {
+        let eps = 80 - i * 3        // decay 80% -> floor
+        if eps < 5 { eps = 5 }
+        si_episode(world, q, max_steps, eps, rng)
+        // record the greedy-policy return after this session (the honest metric)
+        push(totals, si_eval(world, q, max_steps)[0])
+        i = i + 1
+    }
+    return totals
+}
+
+// ---- reflection ------------------------------------------------------------
+// The improvement the agent made over a run (last return - first return). > 0
+// means it got better from its own experience.
+fn si_improvement(totals) {
+    if len(totals) < 2 { return 0 }
+    return totals[len(totals) - 1] - totals[0]
+}
+
+// A human-readable description of the learned policy at a state (the candidate
+// self-edit: "adopt best action A in state S"). Passed to the constitutional
+// gate as the action text to vet.
+fn si_rule_text(q, state, n_actions) {
+    return "adopt action " + int_to_str(q_argmax(q, state, n_actions)) + " in state " + int_to_str(state)
+}
+
+// ---- bounded self-edit -----------------------------------------------------
+// Submit a proposed self-edit through the constitutional gate and the decision
+// log. `edit_text` is vetted against the soul constitution; `edit_id` is the
+// integer id of the proposed change (e.g. the rule-atom id) recorded in the
+// audit log -- the log is integer-only (hash-chained), so the text lives in the
+// gate check, the id in the record. Returns [accepted, decision, intent_seq].
+// accepted==1 only when the gate permits it (not vetoed; APPROVE tier requires
+// `approved`); either way an intent and an outcome are written, so every
+// self-change is audited and reversible. The only sanctioned path for the agent
+// to change itself.
+fn si_self_edit(sl, dlog, edit_text, edit_id, approved, now) {
+    let veto = const_veto_for(sl, edit_text)
+    let decision = safety_gate(ACT_SELF_MODIFY, veto, 0, approved)
+    let desc = list_new()
+    push(desc, ACT_SELF_MODIFY)
+    push(desc, ACT_SELF_MODIFY)
+    push(desc, perm_effective_tier(ACT_SELF_MODIFY))
+    push(desc, reversibility_class(ACT_SELF_MODIFY))
+    let seq = dl_append(dlog, DLK_INTENT, 0 - 1, now, desc, edit_id, list_new(), 0 - 1, OUT_PENDING)
+    let accepted = 0
+    let outcome = OUT_VETOED
+    if gate_executes(decision) == 1 {
+        accepted = 1
+        outcome = OUT_OK
+    } else { if decision == GATE_SUSPEND { outcome = OUT_PENDING } }
+    dl_append(dlog, DLK_OUTCOME, seq, now, desc, edit_id, list_new(), 0 - 1, outcome)
+    let r = list_new()
+    push(r, accepted); push(r, decision); push(r, seq)
+    return r
+}

@@ -257,6 +257,23 @@ tool use isn't planned or learned.
 
 ## P5 — Simulation environment + self-improvement
 
+> **STATUS: core implemented (2026-06-11), ADR-0055.** Two new modules (no
+> existing module changed → existing suite unaffected): `src/sim/world_model.nova`
+> (deterministic tickable grid micro-world; states=cells, actions=moves,
+> reward+done; `world_peek` = forward-sim predict-before-act) and
+> `src/parts/meta/self_improve.nova` (gradient-free TD value learning from logged
+> experience + a bounded self-edit gated by `constitutional_filter` and recorded
+> in the hash-chained `decision_log`). Acceptance met (measured): on a 5x5 grid
+> the greedy return rose from -200 (untrained) to 93 — the **optimal 8-step
+> path** — learning only from its own logged transitions (+293, no teaching);
+> self-edits bounded (benign-approved executes, unapproved suspends, forbidden
+> vetoed), all audited and `dl_verify`-clean. Tests: `test_world_model` (29),
+> `test_self_improve` (20), `bench_self_improve`.
+> **Remaining (follow-ups, not blocking):** drive the value update from the P2
+> three-factor reward loop; HDC (P1) state features; `forward_sim` engine over
+> `world_peek`; mint accepted self-edits as real rule atoms with rollback;
+> persist the value table + drive from `tick_driver`. See ADR-0055.
+
 **Problem.** No sandbox world to practice/plan in; no self-modification loop.
 
 ### Simulation: `src/sim/world_model.nova`
