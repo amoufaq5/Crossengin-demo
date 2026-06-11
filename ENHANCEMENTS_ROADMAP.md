@@ -208,6 +208,21 @@ sentence, no PDF/CSV/table. Cannot read books or papers; fragments entities.
 
 ## P4 — Agentic tooling
 
+> **STATUS: core implemented (2026-06-11), ADR-0054.** Six new modules (no
+> existing module changed → existing suite unaffected): `io/effectors/tool.nova`
+> (tools as skill-atoms with Bayesian competence + registry + selection +
+> permission/reversibility gate), four effectors (`effector_code_exec`,
+> `effector_file_ops`, `effector_http_action`, `effector_mcp`), and
+> `agent/tool_use.nova` (plan → select-by-competence → gate → invoke → thread →
+> learn). Acceptance met (measured): a 3-step plan search→compute→write runs
+> end-to-end (file holds "42"); a failing tool's competence falls 800→400 and
+> selection flips to the alternative; irreversible actions (send/spend) gated to
+> APPROVE. Tests: `test_tool` (25), `test_effectors` (16), `test_tool_use` (11).
+> **Remaining (follow-ups, not blocking):** drive plans from `goal_engine`; route
+> pre-sim through `forward_sim`; emit results into `moment_stream` + feed the P2
+> reward loop; wire live HTTP/MCP transports; automate self-directed tool
+> acquisition (P3 docs → mint skill-atom → try → competence). See ADR-0054.
+
 **Problem.** Effectors are speech-centric; no code-exec / web-action / API tools;
 tool use isn't planned or learned.
 
