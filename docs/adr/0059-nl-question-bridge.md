@@ -74,10 +74,13 @@ invariant intact:
 - **HDC resolution is inert here.** `_nlq_resolve` passes an empty mention vector
   to `er_resolve`, so only exact + alias resolution fires; wiring the
   neighbourhood-vector path would let "the vehicle" resolve to "car" in HDC mode.
-- **Not yet wired into the live chat router.** This ADR lands the bridge + tests;
-  adopting it as a CAT_FACTUAL/CAT_ACADEMIC pre-pass in
-  `cognitive_router.router_reply` is a deliberate, separately-tested follow-up so
-  the existing routing suite is not perturbed.
+- ~~**Not yet wired into the live chat router.**~~ **Done (follow-up).** The
+  bridge is now a pre-pass in `_cr_academic` and `_cr_factual`
+  (`_cr_nlq_answer`), but **only for yes/no and how-many forms** and **only when
+  it finds an answer** — what/why/who stay on the router's richer forward-chain,
+  and a no-answer falls straight through, so the existing routing suite was not
+  perturbed (`test_cognitive_router` 48 → 55). Wiring what/why through the bridge
+  (vs. the router's chaining) remains a judgement call left open.
 
 ## Implementation Notes
 

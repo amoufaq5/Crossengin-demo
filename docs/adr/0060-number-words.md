@@ -47,11 +47,14 @@ ordinary operators (operand < threshold ⇒ the int path is taken correctly).
 
 ## Honest gaps
 
-- **Not yet wired into `arithmetic.nova`.** Letting "two hundred plus fifty"
-  evaluate means teaching `_ar_scan` (a char-level scanner) to consume multi-word
-  number runs — a real change to a tested module, so it is a deliberate,
-  separately-tested follow-up rather than folded in here. The value bridge is
-  ready (`numw_parse` returns milli, arithmetic's native unit).
+- ~~**Not yet wired into `arithmetic.nova`.**~~ **Done (follow-up).**
+  `arith_eval` now runs `_ar_normalize_numbers` first, rewriting spelled-out
+  number runs to digits ("two hundred plus fifty" → "200 plus 50") before the
+  char-level scan; digit-only inputs pass through unchanged (no number word ⇒
+  identical text), so `test_arithmetic` keeps its old checks and gains word-
+  number ones (16 → 23). Caveat: arithmetic between two ≥-threshold operands
+  ("two million plus two million") still hits codegen bug #11 — a pre-existing
+  arithmetic limitation, not specific to word intake.
 - **Ordinals and fractions** ("third", "two and a half", "1/2") are out of scope;
   only cardinals and decimal digit tokens are handled.
 - **Unit conversion is not done.** A unit is captured and canonicalised, not

@@ -86,8 +86,9 @@ reader / word_atoms / openie / query stack. Execute after C1, one per phase.
 > focus+relation extraction, `er_resolve` entity resolution, operator lookup
 > (out for "what causes", in for "why"), and R74 confidence-hedged rendering
 > with source provenance. "what is X" / "is X a Y" / "how many Z" answered from a
-> seeded KG with the backing op id returned for /good//bad. Live router wiring
-> deferred (honest-gaps).
+> seeded KG with the backing op id returned for /good//bad. Wired into the live
+> router (ADR-0059 follow-up): yes/no + how-many questions answered through the
+> bridge in `_cr_academic`/`_cr_factual` (`test_cognitive_router` 48 → 55).
 
 A bridge from a natural-language question to a `query.nova` query (or a direct
 KG lookup) and back to an answer atom. Classify the question form
@@ -103,7 +104,9 @@ relation via the OpenIE/word-atom layer, resolve the entity (P3
 > thousand/million/billion, filler + hyphen) and `numw_parse` → `[ok, milli,
 > unit]` over digit tokens or word runs with a canonicalised measurement unit.
 > All value math uses the `int_*` escape hatch (scaled milli exceed codegen
-> bug #11's 0x100000). Wiring into `arithmetic.nova` deferred (honest-gaps).
+> bug #11's 0x100000). Wired into `arithmetic.nova` (ADR-0060 follow-up):
+> `arith_eval` normalises word runs to digits first, so "two hundred plus fifty"
+> evaluates (`test_arithmetic` 16 → 23); digit-only inputs unchanged.
 
 `"three hundred"`, `"a dozen"`, `"2.5 kg"` → milli values feeding
 `arithmetic.nova` and table/measure ingestion. Pure, deterministic, fully tested.
