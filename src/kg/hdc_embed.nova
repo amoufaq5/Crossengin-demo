@@ -108,9 +108,33 @@ fn hdc_random_atom_vector(seed) {
 // of buckets keyed by `label_hash`; a bucket is a list of [label, vector]
 // scanned with str_eq. The cached value is byte-identical to recomputing it
 // (determinism is preserved), so this is purely an optimisation.
+//
+// Bounded eviction (ADR-0051 "Symbol cache has no eviction policy"). Without a
+// cap the cache grows one 10k-int vector per distinct label ever seen -- real
+// memory for a large vocabulary. We add a global entry cap (`hdc_cache_cap` /
+// `hdc_cache_set_cap`) and evict when a fresh symbol would exceed it. Eviction
+// is SAFE because every value is a pure function of its label: an evicted
+// vector is recomputed bit-identically on the next request, so eviction only
+// trades a cache miss (a 10k-step PRNG walk) for memory, never correctness.
+//
+// Policy: a CLOCK-style round-robin pointer (`_hdc_cache_clock`) sweeps the
+// buckets and drops the oldest entry (bucket head -- entries are appended, so
+// index 0 is the least-recently-inserted in that bucket) from the first
+// non-empty bucket it lands on. This is O(buckets) worst case per eviction but
+// O(1) amortised (the clock advances past empties only once per fill cycle),
+// needs no per-entry timestamp, and keeps total entries <= the cap at all times.
 let _HDC_CACHE_BUCKETS = 1024            // power of two -> mask, not modulo
 let _HDC_CACHE_MASK    = 1023            // _HDC_CACHE_BUCKETS - 1
 let _hdc_cache = 0                        // lazily initialised list of buckets
+let _hdc_cache_count = 0                  // live entry count (across all buckets)
+let _hdc_cache_clock = 0                  // round-robin eviction pointer
+
+// Default cap: generous enough that ordinary workloads never evict (a few
+// thousand distinct relation/word symbols), small enough to bound memory. At
+// 8192 entries * 10000 ints this is the ceiling on cache footprint. Tests can
+// lower it via hdc_cache_set_cap to exercise the eviction path cheaply.
+let _HDC_CACHE_CAP_DEFAULT = 8192
+let _hdc_cache_cap = 8192                 // == _HDC_CACHE_CAP_DEFAULT
 
 fn _hdc_cache_init() {
     if _hdc_cache != 0 { return _hdc_cache }
@@ -118,6 +142,8 @@ fn _hdc_cache_init() {
     let i = 0
     while i < _HDC_CACHE_BUCKETS { push(c, list_new()); i = i + 1 }
     _hdc_cache = c
+    _hdc_cache_count = 0
+    _hdc_cache_clock = 0
     return c
 }
 
@@ -125,6 +151,8 @@ fn _hdc_cache_init() {
 // hdc_symbol call rebuilds lazily; values are unchanged because they are pure.
 fn hdc_cache_clear() {
     _hdc_cache = 0
+    _hdc_cache_count = 0
+    _hdc_cache_clock = 0
     return 1
 }
 
@@ -137,9 +165,55 @@ fn hdc_cache_size() {
     return total
 }
 
+// Current cache capacity (max live entries). Diagnostics / tests.
+fn hdc_cache_cap() { return _hdc_cache_cap }
+
+// Set the cache capacity. A cap of 0 (or negative) means "no memoisation":
+// every symbol is recomputed and nothing is retained. If the new cap is below
+// the current size, entries are evicted immediately so the invariant
+// (size <= cap) holds on return. Returns the cap in force. Values stay correct
+// regardless of cap because they are pure functions of the label.
+fn hdc_cache_set_cap(n) {
+    let cap = n
+    if cap < 0 { cap = 0 }
+    _hdc_cache_cap = cap
+    // Shrink to fit: evict until size <= cap (or the cache is empty).
+    while _hdc_cache_count > _hdc_cache_cap {
+        if _hdc_cache_evict_one() == 0 { _hdc_cache_count = 0 }
+    }
+    return _hdc_cache_cap
+}
+
+// Evict the oldest entry from the next non-empty bucket the clock reaches.
+// Returns 1 if an entry was dropped, 0 if the cache held nothing. Rebuilds the
+// chosen bucket without its head element (NOVA has no list `pop`/`shift`).
+fn _hdc_cache_evict_one() {
+    if _hdc_cache == 0 { return 0 }
+    let scanned = 0
+    while scanned < _HDC_CACHE_BUCKETS {
+        if _hdc_cache_clock >= _HDC_CACHE_BUCKETS { _hdc_cache_clock = 0 }
+        let bidx = _hdc_cache_clock
+        let bucket = _hdc_cache[bidx]
+        if len(bucket) > 0 {
+            // Drop the head (oldest insert in this bucket).
+            let kept = list_new()
+            let j = 1
+            while j < len(bucket) { push(kept, bucket[j]); j = j + 1 }
+            list_set(_hdc_cache, bidx, kept)
+            _hdc_cache_count = _hdc_cache_count - 1
+            // Advance so the next eviction spreads across buckets.
+            _hdc_cache_clock = bidx + 1
+            return 1
+        }
+        _hdc_cache_clock = bidx + 1
+        scanned = scanned + 1
+    }
+    return 0
+}
+
 // The hypervector standing for an atomic symbol (a word/relation/label).
-// Pure function of the label (memoised), so it is stable across calls and
-// processes.
+// Pure function of the label (memoised under a bounded cache), so it is stable
+// across calls and processes regardless of whether a prior entry was evicted.
 fn hdc_symbol(label) {
     let cache = _hdc_cache_init()
     let b = label_hash(label) & _HDC_CACHE_MASK
@@ -150,10 +224,19 @@ fn hdc_symbol(label) {
         i = i + 1
     }
     let v = hdc_random_atom_vector(hdc_str_seed(label))
+    // Cap == 0 disables memoisation entirely (recompute every time).
+    if _hdc_cache_cap <= 0 { return v }
+    // Make room first so the cache never exceeds its cap. (Evicting before the
+    // insert keeps the peak bounded; the entry we just computed is never the
+    // one evicted because it is not in the table yet.)
+    while _hdc_cache_count >= _hdc_cache_cap {
+        if _hdc_cache_evict_one() == 0 { _hdc_cache_count = 0 }
+    }
     let entry = list_new()
     push(entry, label)
     push(entry, v)
     push(bucket, entry)
+    _hdc_cache_count = _hdc_cache_count + 1
     return v
 }
 
@@ -289,4 +372,86 @@ fn hdc_encode_edges(edges) {
 fn hdc_encode_atom(label, edges) {
     if len(edges) == 0 { return hdc_symbol(label) }
     return hdc_encode_edges(edges)
+}
+
+// ---- live mode re-embedding (ADR-0051 "A live mode switch does not re-embed
+//      existing atoms") --------------------------------------------------------
+// Flipping ATOM_EMBED_MODE only changes how *newly produced* embeds are built;
+// atoms already in a KG keep their old-dimension vectors until something
+// rewrites them. A true runtime cutover walks the KG and re-derives each
+// label-keyed embed under the active mode. These helpers are that walk.
+//
+// Scope: only ATOM_LANG (word) atoms are re-embedded, because only their embed
+// is a pure function of the atom *label* (HDC -> hdc_symbol(label); LEGACY ->
+// the 8-dim lexical hash). Fact/concept atoms derive their embed from their
+// neighbourhood (hdc_encode_atom) or a centroid, so a bare-label re-derivation
+// would be wrong -- those are left untouched and must be rebuilt by their own
+// producer (e.g. concept_promote re-runs the semantic facet). This matches the
+// ADR wording "for word/lang atoms, from the atom label".
+
+// The 8-dim lexical hash, kept byte-identical to word_atoms.word_lexical_vec.
+// hdc_embed.nova cannot import word_atoms (word_atoms imports us -> a cycle),
+// so the canonical formula is mirrored here for the LEGACY re-embed path. If
+// word_lexical_vec ever changes, this mirror must change with it; the LEGACY
+// branch only matters when re-embedding back down from HDC to LEGACY.
+fn _hdc_legacy_lexical_vec(form) {
+    let v = vec_new(ATOM_EMBED_DIMS)
+    let i = 0
+    while i < len(form) {
+        let d = char_at(form, i) % ATOM_EMBED_DIMS
+        vec_set(v, d, vec_get(v, d) + 40)
+        i = i + 1
+    }
+    return v
+}
+
+// The mode-appropriate embed for a word/label, mirroring
+// word_atoms.word_embed_vec but available at this layer so the re-embed walk is
+// self-contained (no reverse import). HDC -> the hypervector; LEGACY -> lexical.
+fn hdc_word_embed(label) {
+    if atom_embed_is_hdc() == 1 { return hdc_symbol(label) }
+    return _hdc_legacy_lexical_vec(label)
+}
+
+// Re-derive one atom's embed from its label under the CURRENT mode. Only acts
+// on ATOM_LANG atoms (see scope note above); returns 1 if the atom was
+// re-embedded, 0 otherwise (non-lang atom, or null). The new vector is written
+// in place with atom_set_embed. NOTE: if the atom's KG has an ANN attached, the
+// caller must rebuild that index afterwards (e.g. kg_rebuild_index) -- this
+// low-level helper deliberately does not reach up into multi_kg_manager.
+fn hdc_reembed_atom(atom) {
+    if atom == 0 { return 0 }
+    if atom_kind(atom) != ATOM_LANG { return 0 }
+    atom_set_embed(atom, hdc_word_embed(atom_label(atom)))
+    return 1
+}
+
+// Re-embed every label-keyed atom in a raw atoms list (the shape kg_atoms(kg)
+// returns -- a list indexed by atom_id, possibly with 0 holes). Returns the
+// number of atoms actually re-embedded. This mirrors ann_rebuild_from_atoms,
+// which also takes the atoms list rather than the KG record to avoid pulling
+// multi_kg_manager into this module's dependency graph.
+fn hdc_reembed_atoms(atoms) {
+    let n = len(atoms)
+    let i = 0
+    let done = 0
+    while i < n {
+        if atoms[i] != 0 {
+            done = done + hdc_reembed_atom(atoms[i])
+        }
+        i = i + 1
+    }
+    return done
+}
+
+// KG-level convenience: re-embed every word atom in a language KG under the
+// active mode. Reads the KG's atoms list directly from its record (the KG_ATOMS
+// slot is index 3 in multi_kg_manager's layout; mirrored here as a literal so
+// this module needs no import of multi_kg_manager). Returns the count
+// re-embedded. Callers holding the atoms list already can use hdc_reembed_atoms.
+let _HDC_KG_ATOMS_SLOT = 3   // == multi_kg_manager KG_ATOMS
+
+fn hdc_reembed_lang_kg(lang_kg) {
+    if lang_kg == 0 { return 0 }
+    return hdc_reembed_atoms(lang_kg[_HDC_KG_ATOMS_SLOT])
 }

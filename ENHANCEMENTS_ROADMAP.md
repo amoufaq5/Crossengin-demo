@@ -32,6 +32,18 @@
 Do **not** reorder. Building ingestion (P3) on top of the weak embedding (P1
 unfixed) wastes effort because entity resolution will fragment the KG.
 
+> **ALL FIVE PHASES IMPLEMENTED + FOLLOW-UPS WIRED (2026-06-11).** P1–P5 each
+> shipped behind a flag/new file (ADRs 0051–0055). A follow-up integration round
+> (ADR-0056) then closed the tractable "Honest gaps": HDC cache eviction +
+> re-embed + signed coherence; the three-factor pass wired into `tick_driver`
+> (opt-in); OpenIE+entity-resolution ingest (`lp_ingest_resolved`) and
+> FlateDecode PDFs; tools driven from `goal_engine` + live HTTP + moment
+> emission; and self-improvement with lookahead planning, value-table
+> persistence, and minting accepted self-edits as rule atoms. 23 affected test
+> suites (873 checks) green over the combined tree. Remaining frontier: a single
+> always-on autonomous loop, live MCP transport, and snapshot-backed
+> cross-session persistence — see ADR-0056 "Honest gaps".
+
 ---
 
 ## P1 — HDC/VSA embedding layer  *(keystone)*

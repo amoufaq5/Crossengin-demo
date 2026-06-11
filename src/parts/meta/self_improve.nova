@@ -25,6 +25,8 @@
 import "../../sim/world_model.nova"
 import "../../safety/constitutional_filter.nova"
 import "../../audit/decision_log.nova"
+import "../../kg/hdc_embed.nova"
+import "../../kg/skills_kg.nova"
 
 let SI_GAMMA = 90   // discount, percent
 
@@ -119,6 +121,81 @@ fn si_eval(world, q, max_steps) {
     return si_episode(world, q, max_steps, 0, rng)
 }
 
+// ---- forward-sim lookahead planning (ADR-0055; the world_peek seam) --------
+// Predict-before-act: instead of acting on the learned value alone, IMAGINE
+// each action's consequences `depth` steps ahead through world_peek_at (the
+// pure forward-simulation primitive) and back the imagined rollouts up with the
+// learned value at the horizon. The world is deterministic, so the best n-step
+// rollout is exact model-based planning; bootstrapping the tail with q_max
+// means a shallow lookahead over a partly-learned table still finds the goal
+// (planning compensates for an under-trained value estimate). depth==0 reduces
+// to the greedy tabular policy. Nothing is mutated -- it is all peeking.
+
+// Best predicted `depth`-step return achievable FROM `state` (the imagined
+// value of the state under optimal play within the horizon). At the horizon, or
+// once a rollout would reach the goal, fall back to the learned value.
+fn _si_plan_value(world, q, state, depth, n_actions) {
+    if depth <= 0 { return q_max(q, state, n_actions) }
+    let best = 0
+    let seen = 0
+    let a = 0
+    while a < n_actions {
+        let pk = world_peek_at(world, state, a)
+        let val = pk[0]
+        if pk[1] == 0 {
+            val = pk[0] + (SI_GAMMA * _si_plan_value(world, q, pk[2], depth - 1, n_actions)) / 100
+        }
+        if seen == 0 { best = val seen = 1 } else { if val > best { best = val } }
+        a = a + 1
+    }
+    if seen == 0 { return q_max(q, state, n_actions) }
+    return best
+}
+
+// The action whose imagined `depth`-step rollout scores highest from the
+// agent's current state. depth==1 looks one peek ahead (immediate reward + the
+// learned next-state value); deeper depths plan further before trusting the
+// table. Ties keep the lowest action index (stable, matches q_argmax).
+fn si_plan_action(world, q, depth) {
+    let n = world_actions()
+    let s = world_state_id(world)
+    let best = 0
+    let bv = 0
+    let seen = 0
+    let a = 0
+    while a < n {
+        let pk = world_peek_at(world, s, a)
+        let val = pk[0]
+        if pk[1] == 0 {
+            val = pk[0] + (SI_GAMMA * _si_plan_value(world, q, pk[2], depth - 1, n)) / 100
+        }
+        if seen == 0 { bv = val best = a seen = 1 } else { if val > bv { bv = val best = a } }
+        a = a + 1
+    }
+    return best
+}
+
+// Evaluate the PLANNING policy: drive the real world with world_step but choose
+// each action by `depth`-step lookahead (no exploration, no learning). The
+// honest planning metric, comparable to si_eval. Returns [total_reward, steps].
+fn si_eval_plan(world, q, max_steps, depth) {
+    world_reset(world)
+    let total = 0
+    let steps = 0
+    let done = 0
+    while done == 0 {
+        if steps >= max_steps { done = 1 } else {
+            let a = si_plan_action(world, q, depth)
+            let res = world_step(world, a)
+            total = total + res[0]
+            steps = steps + 1
+            if res[1] == 1 { done = 1 }
+        }
+    }
+    let r = list_new(); push(r, total); push(r, steps)
+    return r
+}
+
 // Train across `sessions` episodes with decaying exploration, learning ONLY
 // from logged transitions. Returns the list of per-session greedy-eval returns
 // (the metric trend). Deterministic given `seed`.
@@ -135,6 +212,100 @@ fn si_train(world, q, sessions, max_steps, seed) {
         i = i + 1
     }
     return totals
+}
+
+// ---- HDC state features (ADR-0055 P1<->P5 tie; ADR-0051) -------------------
+// The tabular learner keys on the raw integer state id (one value-table row per
+// cell). That does not scale: large or continuous state spaces need a
+// representation, not an index. HDC (P1) is the natural source of features --
+// hdc_symbol maps any label to a deterministic D=10000 bipolar hypervector, so
+// distinct states land near-orthogonal (cosine ~ 0) while the same state is
+// always identical (a stable, content-free feature). This is the representation
+// SEAM toward function approximation: a future approximator can read
+// si_state_vector(s) instead of the row index, and the tabular learner above is
+// unchanged. Pure + memoised (the hdc_embed cache), so it is cheap and stable
+// across processes.
+fn si_state_label(state_id) { return "ce_sim_state_" + int_to_str(state_id) }
+fn si_state_vector(state_id) { return hdc_symbol(si_state_label(state_id)) }
+
+// Cosine similarity (signed milli, [-1000,1000]) between two states' feature
+// vectors -- ~0 for distinct states, 1000 for the same state. A diagnostic for
+// the seam (and what an HDC-keyed nearest-state lookup would use).
+fn si_state_similarity(state_a, state_b) {
+    return hdc_cosine(si_state_vector(state_a), si_state_vector(state_b))
+}
+
+// ---- persistence (ADR-0055 "not persisted"; ADR-0048 the wiring point) -----
+// The learned value table is the only thing a session carries forward, but it
+// lived in memory only -- "across sessions" held within a run, not across
+// process restarts. These give it a deterministic, integer-only text encoding
+// so it can be snapshotted and rehydrated bit-identically.
+//
+// Format (comma-separated, one token stream): n_states, n_actions, then the
+// values row-major (state 0's actions, then state 1's, ...). Every token is an
+// integer; values are signed (int_to_str/str_to_int round-trip negatives), so
+// the restored table equals the saved one exactly -- and therefore gives the
+// same greedy policy and the same eval.
+let _SI_SEP = 44   // ','
+
+// Split a comma-separated token stream into a list of ints (mirrors the
+// decision-log line parser; NOVA has no string split builtin).
+fn _si_split_ints(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(text, i) == _SI_SEP {
+            push(out, str_to_int(substr(text, start, i - start)))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, str_to_int(substr(text, start, n - start)))
+    return out
+}
+
+// Serialize a value table to a deterministic string. n_states/n_actions are
+// read from the table itself, so the header is self-describing.
+fn si_q_serialize(q) {
+    let n_states = len(q)
+    let n_actions = 0
+    if n_states > 0 { n_actions = len(q[0]) }
+    let s = int_to_str(n_states) + "," + int_to_str(n_actions)
+    let st = 0
+    while st < n_states {
+        let a = 0
+        while a < n_actions {
+            s = s + "," + int_to_str(q[st][a])
+            a = a + 1
+        }
+        st = st + 1
+    }
+    return s
+}
+
+// Restore a value table from si_q_serialize's output. The caller passes the
+// expected dimensions (a snapshot consumer knows the world); the encoded header
+// is honoured but the table is built to the requested shape, and any missing
+// cell defaults to 0 (the optimistic init) so a short/legacy string degrades
+// safely rather than crashing. Returns a fresh q table.
+fn si_q_restore(text, n_states, n_actions) {
+    let q = q_new(n_states, n_actions, 0)
+    let toks = _si_split_ints(text)
+    // toks[0]=n_states, toks[1]=n_actions, values start at index 2 row-major.
+    let idx = 2
+    let st = 0
+    while st < n_states {
+        let a = 0
+        while a < n_actions {
+            if idx < len(toks) { q_set(q, st, a, toks[idx]) }
+            idx = idx + 1
+            a = a + 1
+        }
+        st = st + 1
+    }
+    return q
 }
 
 // ---- reflection ------------------------------------------------------------
@@ -181,4 +352,68 @@ fn si_self_edit(sl, dlog, edit_text, edit_id, approved, now) {
     let r = list_new()
     push(r, accepted); push(r, decision); push(r, seq)
     return r
+}
+
+// ---- applying an accepted edit: mint a rule atom (ADR-0055 "gated+logged,
+//      not yet applied"; ADR-0019 procedural rules) ---------------------------
+// The bounded self-edit above is vetted + audited, but the proposed change was
+// only recorded, never made live. This applies it: an accepted "in state S take
+// action A" proposal is MINTED as a real ATOM_RULE in the skills KG (the
+// canonical home for condition -> action procedural rules, mirroring
+// skill_add_step's payload convention: RULE_COND = the triggering state,
+// RULE_ACTION = the action to take). The minted atom is the live policy rule; the
+// decision-log INTENT/OUTCOME pair written by si_self_edit is its rollback record
+// (the audited "undo handle"). A vetoed or suspended proposal mints NOTHING --
+// only a gate-approved edit reaches the KG, so the safety scaffolding still
+// bounds every change that becomes live.
+
+// Mint one "in state S take action A" rule atom into a skills KG. Returns the
+// atom (caller reads atom_id for the audit link). Pure KG side-effect; no gate
+// here -- callers must have passed the gate (si_apply_edit does).
+fn si_mint_rule_atom(skills_kg, state, action, moment) {
+    let label = "sim_policy_s" + int_to_str(state) + "_a" + int_to_str(action)
+    let rule = kg_add_atom(skills_kg, ATOM_RULE, label, moment)
+    atom_payload_set(rule, RULE_COND, state)
+    atom_payload_set(rule, RULE_ACTION, action)
+    return rule
+}
+
+// Propose committing the learned best action at `state` as a live rule, ROUTED
+// through the bounded self-edit gate; mint the rule atom ONLY if the gate
+// accepts. `edit_id` (e.g. an external change id) is what the audit log records.
+// Returns [accepted, decision, intent_seq, atom_id] -- atom_id is the minted
+// rule's id, or -1 when nothing was minted (vetoed/suspended). The decision-log
+// entry at intent_seq is the rollback record for the minted rule.
+fn si_apply_edit(sl, dlog, skills_kg, q, state, n_actions, edit_id, approved, now) {
+    let edit_text = si_rule_text(q, state, n_actions)
+    let res = si_self_edit(sl, dlog, edit_text, edit_id, approved, now)
+    let atom_id_out = 0 - 1
+    if res[0] == 1 {
+        let action = q_argmax(q, state, n_actions)
+        let rule = si_mint_rule_atom(skills_kg, state, action, now)
+        atom_id_out = atom_id(rule)
+    }
+    let r = list_new()
+    push(r, res[0]); push(r, res[1]); push(r, res[2]); push(r, atom_id_out)
+    return r
+}
+
+// Look up the action a minted policy rule prescribes for `state` in a skills
+// KG, or -1 if no such rule was minted. The live-policy read a consumer would
+// use; also lets a test confirm the mint took (and what it committed).
+fn si_rule_action_for(skills_kg, state) {
+    let ids = kg_atoms_by_kind(skills_kg, ATOM_RULE)
+    let i = 0
+    while i < len(ids) {
+        let a = kg_atom(skills_kg, ids[i])
+        if a != 0 {
+            if atom_payload_has(a, RULE_COND) == 1 {
+                if atom_payload_get(a, RULE_COND) == state {
+                    return atom_payload_get(a, RULE_ACTION)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
 }

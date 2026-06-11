@@ -15,8 +15,19 @@
 //   their streams; `pdf_has_flate` reports that, and wiring the existing
 //   deflate decoder in front of this is the documented next step.
 //
+//   FlateDecode (ADR-0053 "PDF is uncompressed-only" follow-up). Real papers
+//   compress their content streams with zlib(DEFLATE). pdf_extract_text_auto
+//   locates each `stream`..`endstream` region, strips the 2-byte zlib header
+//   (deflate_decode.nova wants RAW DEFLATE, not the zlib wrapper -- its own
+//   docs say the 2-byte header + Adler-32 trailer live in the caller), inflates
+//   via deflate_decode, and runs the existing extractor over the result; an
+//   uncompressed PDF still flows through pdf_extract_text untouched.
+//
 // ADRs implemented: ADR-0053 (ingestion / formats). NOVA dependencies: builtins
-//   (chr, char_at, len, substr). CrossEngin dependencies: none.
+//   (chr, char_at, len, substr, alloc, store8, load8). CrossEngin dependencies:
+//   src/io/transducers/deflate_decode.nova (the inner DEFLATE inflater).
+
+import "../io/transducers/deflate_decode.nova"
 
 // ---- byte helpers ----------------------------------------------------------
 fn _pdf_match2(b, i, c0, c1) {
@@ -144,4 +155,138 @@ fn pdf_has_flate(bytes) {
         i = i + 1
     }
     return 0
+}
+
+// ---- FlateDecode support (ADR-0053 follow-up) ------------------------------
+//
+// pdf_extract_text reads the visible strings out of UNCOMPRESSED content
+// streams. Most real PDFs FlateDecode their streams, so pdf_has_flate flagged
+// the gap and this is the documented next hook: inflate the streams with the
+// in-tree deflate_decode.nova, then run the existing extractor over the
+// inflated bytes.
+
+// Find the literal `needle` in `b` at or after `from`; return its index or -1.
+fn _pdf_find(b, from, needle) {
+    let n = len(b)
+    let m = len(needle)
+    if m == 0 { return from }
+    let i = from
+    while i + m <= n {
+        let k = 0
+        let ok = 1
+        while k < m {
+            if char_at(b, i + k) != char_at(needle, k) { ok = 0 k = m } else { k = k + 1 }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// A stream body begins right after the `stream` keyword, skipping the single
+// EOL that PDF requires there (CRLF or a bare LF). Returns the index of the
+// first payload byte.
+fn _pdf_stream_data_start(b, kw_end) {
+    let n = len(b)
+    let i = kw_end
+    if i < n { if char_at(b, i) == 13 { i = i + 1 } }   // CR
+    if i < n { if char_at(b, i) == 10 { i = i + 1 } }   // LF
+    return i
+}
+
+// True if the two bytes at b[start] look like a zlib header (CMF/FLG):
+// CM (low nibble of CMF) must be 8 (DEFLATE) and (CMF*256 + FLG) % 31 == 0
+// (the spec's check value). deflate_decode wants RAW DEFLATE, so when this
+// holds we hand it the bytes AFTER these two.
+fn _pdf_is_zlib_header(b, start) {
+    let n = len(b)
+    if start + 1 >= n { return 0 }
+    let cmf = char_at(b, start)
+    let flg = char_at(b, start + 1)
+    if (cmf & 15) != 8 { return 0 }            // CM != deflate
+    let check = cmf * 256 + flg                 // both < 256 -> product < 65536, safe
+    if check - (check / 31) * 31 != 0 { return 0 }   // (check % 31) != 0
+    return 1
+}
+
+// Copy bytes b[start .. start+count) into a freshly-allocated raw buffer and
+// return its pointer (so the pointer-based deflate_decode can load8 over it).
+// count is small for a single content stream; pointer offsets use bare `+`
+// (codegen bug #11 is about multiply, not add).
+fn _pdf_str_to_ptr(b, start, count) {
+    let buf = alloc(count + 1)
+    let i = 0
+    while i < count {
+        store8(buf + i, char_at(b, start + i))
+        i = i + 1
+    }
+    store8(buf + count, 0)
+    return buf
+}
+
+// Build a NOVA string from `count` bytes at pointer `ptr`. chr() of a 0..255
+// byte is safe (mirrors _pdf_escape's chr(val & 255)); the codegen multiply
+// gotcha does not apply to chr/string-append.
+fn _pdf_ptr_to_str(ptr, count) {
+    let out = ""
+    let i = 0
+    while i < count {
+        out = out + chr(load8(ptr + i) & 255)
+        i = i + 1
+    }
+    return out
+}
+
+// Inflate one content stream (raw bytes b[start..end)) and return its decoded
+// text via pdf_extract_text, or "" if it does not inflate. Strips a leading
+// zlib header when present (deflate_decode consumes raw DEFLATE).
+fn _pdf_inflate_stream_text(b, start, end) {
+    let count = end - start
+    if count <= 0 { return "" }
+    let off = start
+    if _pdf_is_zlib_header(b, start) == 1 { off = start + 2 }
+    let raw_len = end - off
+    if raw_len <= 0 { return "" }
+    let ptr = _pdf_str_to_ptr(b, off, raw_len)
+    let res = deflate_decode(ptr, raw_len)
+    if len(deflate_result_error(res)) > 0 { return "" }
+    let out_ptr = deflate_result_output(res)
+    let out_len = deflate_result_length(res)
+    if out_len <= 0 { return "" }
+    let inflated = _pdf_ptr_to_str(out_ptr, out_len)
+    return pdf_extract_text(inflated)
+}
+
+// Extract visible text, auto-handling FlateDecoded content streams.
+//
+//   * No FlateDecode filter declared -> identical to pdf_extract_text (the
+//     uncompressed path is completely unchanged).
+//   * FlateDecode present -> walk every `stream`..`endstream` region, inflate
+//     it (stripping the zlib header for deflate_decode), and run the existing
+//     extractor over the inflated bytes; also run the extractor over the whole
+//     document so any uncompressed text objects (outside streams) still
+//     contribute. Results are concatenated.
+//
+// A stream that fails to inflate contributes nothing (precision over noise);
+// the routing decision is pdf_has_flate so a purely uncompressed PDF never
+// pays the stream-walking cost.
+fn pdf_extract_text_auto(bytes) {
+    if pdf_has_flate(bytes) == 0 { return pdf_extract_text(bytes) }
+
+    let out = pdf_extract_text(bytes)   // any uncompressed text objects too
+    let n = len(bytes)
+    let i = 0
+    let go = 1
+    while go == 1 {
+        let s = _pdf_find(bytes, i, "stream")
+        if s < 0 { go = 0 } else {
+            let data_start = _pdf_stream_data_start(bytes, s + 6)   // 6 = len("stream")
+            let e = _pdf_find(bytes, data_start, "endstream")
+            if e < 0 { go = 0 } else {
+                out = out + _pdf_inflate_stream_text(bytes, data_start, e)
+                i = e + 9   // 9 = len("endstream")
+            }
+        }
+    }
+    return out
 }
