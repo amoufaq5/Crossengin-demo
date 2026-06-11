@@ -18,6 +18,13 @@
 
 ---
 
+## EXECUTION LOG
+- **C1 / WordNet track — STARTED.** `src/data/kb_import_core.nova` +
+  `src/data/import_wordnet.nova` + `tests/unit/test_import_wordnet.nova` +
+  `docs/adr/r76-kb-bulk-import.md`. Acceptance gate (`make build && make test`)
+  pending a NOVA-toolchain session. Next: the raw-dump→feed converter script,
+  then the ConceptNet (X1) and Wikidata tracks reusing `kb_import_core`.
+
 ## THE SINGLE HIGHEST-ROI ACTION
 
 **Bulk-import Wikidata + ConceptNet + WordNet before building any extraction
