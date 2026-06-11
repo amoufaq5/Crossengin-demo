@@ -147,6 +147,23 @@ runtime is thin.
 
 ## P3 — Ingestion, formats, scraping
 
+> **STATUS: core implemented (2026-06-11), ADR-0053.** Four new, individually
+> tested modules (no existing module changed → existing suite unaffected):
+> `src/data/table.nova` (CSV + Markdown → GROUP BY-queryable row-atoms),
+> `src/data/pdf_text.nova` (PDF text-object extraction), `src/learning/openie.nova`
+> (shallow SVO + n-ary OpenIE with *discovered* predicates), and
+> `src/learning/entity_resolve.nova` (exact → alias → **HDC** resolution — the
+> first real `hdc_cosine` consumer). All three acceptance criteria met
+> (measured): PDF text → provenanced triples (`plants absorb_from air`);
+> car/automobile → ONE atom via HDC (unrelated mentions not merged); CSV →
+> GROUP BY (west=400, east=250). Tests: `test_entity_resolve` (19), `test_table`
+> (24), `test_openie` (33), `test_pdf_text` (10).
+> **Remaining (follow-ups, not blocking):** wire `openie_triples` +
+> `er_resolve_or_create` into `learn_pipeline`; FlateDecode PDFs via the existing
+> `deflate_decode`; politeness crawler + arXiv/PubMed/Wikidata connectors;
+> multimodal (OCR/STT) → triple routing; ingest-time source-authority +
+> contradiction gating. See ADR-0053 "Honest gaps".
+
 **Problem.** `preprocess.nova` is English-only, 6 fixed patterns, 2 triples/
 sentence, no PDF/CSV/table. Cannot read books or papers; fragments entities.
 
