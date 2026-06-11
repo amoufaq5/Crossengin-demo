@@ -1,0 +1,506 @@
+// CrossEngin language: NL question -> structured KG answer (N1, ADR-0059).
+//
+// Purpose
+//   The keystone of the natural-language track. The reasoning KG already holds
+//   everything the agent knows as operator atoms (premise -RELATION-> conclusion,
+//   each with a Bayesian belief; src/parts/reasoning/reasoning_atoms.nova). What
+//   was missing was a BRIDGE from an English question to that store and back to a
+//   confidence-qualified answer. This module is that bridge, in three shallow,
+//   auditable, gradient-free steps:
+//
+//     1. CLASSIFY the question form -- yes/no ("is X a Y") vs. a wh- question
+//        (what / who / where / when / why / how / how-many).
+//     2. EXTRACT the focus entity (and, for yes/no, the subject+object) plus a
+//        relation kind, by scanning tokens against small curated word sets --
+//        the same shallow-heuristic style as openie.nova, never a parser.
+//     3. LOOK UP the answer by walking the operators leaving (or entering) the
+//        resolved focus atom (entity_resolve handles exact + alias resolution),
+//        and RENDER it hedged by the matched operator's belief, exactly the R74
+//        weakest-link confidence tiers the cognitive router uses.
+//
+//   Example, over a KG with rain -CAUSAL-> flood (belief 500):
+//     "what causes flood"  -> answer into `flood`: "rain leads to flood"  (i think)
+//     "does rain cause flood" -> "i think yes"
+//     "is rain a flood"    -> (no is_a edge) "i don't have that"
+//     "how many things does rain cause" -> "1"
+//
+//   Grounded and bounded by design: every answer is backed by a real operator
+//   atom (its id is returned, so /good//bad can re-weight it) and tagged with the
+//   source the edge came from. No template that isn't anchored on a fact fires.
+//
+// ADRs implemented: ADR-0059 (NL question bridge), building on ADR-0031
+//   (operator atoms), ADR-0053 (entity resolution), R74 (confidence hedging).
+// NOVA dependencies: builtins. CrossEngin dependencies:
+//   src/parts/reasoning/reasoning_atoms.nova (rop_* + rk_operators_from/to + kg
+//   API), src/learning/entity_resolve.nova (er_resolve -- exact + alias).
+
+import "../parts/reasoning/reasoning_atoms.nova"
+import "../learning/entity_resolve.nova"
+
+// ---- question forms --------------------------------------------------------
+let NLQ_NONE    = 0   // not a question we handle
+let NLQ_YESNO   = 1   // is/are/was/does/can ... ?
+let NLQ_WHAT    = 2
+let NLQ_WHO     = 3
+let NLQ_WHERE   = 4
+let NLQ_WHEN    = 5
+let NLQ_WHY     = 6
+let NLQ_HOW     = 7
+let NLQ_HOWMANY = 8
+
+fn nlq_form_name(f) {
+    if f == NLQ_YESNO   { return "yesno" }
+    if f == NLQ_WHAT    { return "what" }
+    if f == NLQ_WHO     { return "who" }
+    if f == NLQ_WHERE   { return "where" }
+    if f == NLQ_WHEN    { return "when" }
+    if f == NLQ_WHY     { return "why" }
+    if f == NLQ_HOW     { return "how" }
+    if f == NLQ_HOWMANY { return "how-many" }
+    return "none"
+}
+
+let NLQ_NP_MAX = 3   // max tokens joined into a focus noun-phrase
+
+// ---- tokenisation (alnum, lowercased) -- same shape as openie._oie_tokens ---
+fn _nlq_tokens(s) {
+    let out = list_new()
+    let lo = str_lower(s)
+    let n = len(lo)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        let c = char_at(lo, i)
+        let alnum = 0
+        if c >= 97 { if c <= 122 { alnum = 1 } }
+        if c >= 48 { if c <= 57 { alnum = 1 } }
+        if alnum == 1 {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 { push(out, substr(lo, start, i - start)) start = 0 - 1 }
+        }
+        i = i + 1
+    }
+    if start >= 0 { push(out, substr(lo, start, n - start)) }
+    return out
+}
+
+// ---- small curated word sets (built once, lazily) -------------------------
+fn _nlq_in(t, lst) {
+    let i = 0
+    while i < len(lst) {
+        if str_eq(t, lst[i]) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _nlq_words(csv) {
+    let out = list_new()
+    let n = len(csv)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(csv, i) == 32 {
+            if i > start { push(out, substr(csv, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if n > start { push(out, substr(csv, start, n - start)) }
+    return out
+}
+
+let _NLQ_AUX = 0   // yes/no openers
+fn _nlq_is_aux(t) {
+    if _NLQ_AUX == 0 { _NLQ_AUX = _nlq_words("is are was were be been am do does did can could will would shall should may might must has have had") }
+    return _nlq_in(t, _NLQ_AUX)
+}
+fn _nlq_is_copula(t) {
+    return _nlq_in(t, _nlq_words("is are was were be been am"))
+}
+
+let _NLQ_DET = 0
+fn _nlq_is_det(t) {
+    if _NLQ_DET == 0 { _NLQ_DET = _nlq_words("a an the this that these those its their his her our your my some any") }
+    return _nlq_in(t, _NLQ_DET)
+}
+
+// Tokens that never belong in a focus noun-phrase: question words, copulas/aux,
+// determiners, prepositions, relation keywords, and the "how many" filler. A
+// relation keyword is skipped from the FOCUS but separately detected as the
+// relation kind by _nlq_rel_kind.
+let _NLQ_SKIP = 0
+fn _nlq_is_skip(t) {
+    if _NLQ_SKIP == 0 {
+        _NLQ_SKIP = _nlq_words("what who where when why how which whose is are was were be been am do does did can could will would shall should may might must has have had a an the this that these those its their his her our your my some any many much to of in on at for and or with by from into about as it they he she we you i there here things thing kind type sort happen happens happened occur occurs occurred work works exist exists exist mean")
+    }
+    if _nlq_in(t, _NLQ_SKIP) == 1 { return 1 }
+    return _nlq_rel_kind_word(t) != 0
+}
+
+// ---- relation keyword -> operator kind ------------------------------------
+// A single token's relation kind (0 = not a relation word). Causal verbs,
+// is_a/definition words, similarity, and antonymy map onto the four operator
+// kinds the reasoning KG actually stores.
+fn _nlq_rel_kind_word(t) {
+    if str_eq(t, "cause") == 1    { return ROP_CAUSAL }
+    if str_eq(t, "causes") == 1   { return ROP_CAUSAL }
+    if str_eq(t, "caused") == 1   { return ROP_CAUSAL }
+    if str_eq(t, "lead") == 1     { return ROP_CAUSAL }
+    if str_eq(t, "leads") == 1    { return ROP_CAUSAL }
+    if str_eq(t, "produce") == 1  { return ROP_CAUSAL }
+    if str_eq(t, "produces") == 1 { return ROP_CAUSAL }
+    if str_eq(t, "means") == 1    { return ROP_IMPLY }
+    if str_eq(t, "implies") == 1  { return ROP_IMPLY }
+    if str_eq(t, "like") == 1     { return ROP_ANALOGY }
+    if str_eq(t, "similar") == 1  { return ROP_ANALOGY }
+    if str_eq(t, "opposite") == 1 { return ROP_OPPOSITE }
+    return 0
+}
+
+// The relation kind a whole question is asking about (0 = unspecified). Scans
+// the tokens for the first relation keyword; falls back per question form.
+fn _nlq_rel_kind(toks, form) {
+    let i = 0
+    while i < len(toks) {
+        let k = _nlq_rel_kind_word(toks[i])
+        if k != 0 { return k }
+        i = i + 1
+    }
+    if form == NLQ_WHY { return ROP_CAUSAL }
+    return 0
+}
+
+// Render an operator kind as a clause connective (shared spelling with the
+// cognitive router's _cr_rel so replies read consistently).
+fn nlq_rel_phrase(kind) {
+    if kind == ROP_CAUSAL   { return "leads to" }
+    if kind == ROP_IMPLY    { return "is a" }
+    if kind == ROP_ANALOGY  { return "is like" }
+    if kind == ROP_OPPOSITE { return "is the opposite of" }
+    return "relates to"
+}
+
+// ---- focus / entity extraction --------------------------------------------
+// First content NP starting at or after `from`, plus the index just past it,
+// returned as [np, next_index]. Leading skip-words are passed over; the NP is
+// underscored and NP_MAX-bounded and stops at the first skip-word after it
+// begins ("" / n when no content token remains).
+fn _nlq_np_span(toks, from) {
+    let n = len(toks)
+    let r = list_new()
+    // advance to the first content token.
+    let i = from
+    let scanning = 1
+    while scanning == 1 {
+        if i >= n { scanning = 0 }
+        else { if _nlq_is_skip(toks[i]) == 1 { i = i + 1 } else { scanning = 0 } }
+    }
+    if i >= n { push(r, ""); push(r, n); return r }
+    let s = ""
+    let cnt = 0
+    let go = 1
+    while go == 1 {
+        if i >= n { go = 0 }
+        else { if cnt >= NLQ_NP_MAX { go = 0 }
+        else { if _nlq_is_skip(toks[i]) == 1 { go = 0 }
+        else {
+            if len(s) == 0 { s = toks[i] } else { s = s + "_" + toks[i] }
+            cnt = cnt + 1
+            i = i + 1
+        } } }
+    }
+    push(r, s); push(r, i)
+    return r
+}
+
+// The focus noun-phrase of a wh- question: the first content run.
+fn nlq_focus(toks) {
+    return _nlq_np_span(toks, 0)[0]
+}
+
+// Yes/no decomposition -> [subject, object, kind]. Handles the two shapes the
+// classifier admits:
+//   copula:  "is/are X (a|an|the)? Y"   -> subject=X, object=Y, kind=is_a
+//   do-verb: "does/do X <verb> Y"       -> subject=X, object=Y, kind=<verb>
+fn _nlq_yesno_parts(toks) {
+    let n = len(toks)
+    let r = list_new()
+    if n < 2 { push(r, ""); push(r, ""); push(r, ROP_IMPLY); return r }
+    let aux = toks[0]
+    // subject = first content NP after the aux.
+    let sp = _nlq_np_span(toks, 1)
+    let subject = sp[0]
+    let after = sp[1]
+    let kind = ROP_IMPLY
+    // a relation verb between subject and object overrides the kind.
+    let j = after
+    while j < n {
+        let k = _nlq_rel_kind_word(toks[j])
+        if k != 0 { kind = k j = n + 1 } else { j = j + 1 }
+    }
+    // object = first content NP after the subject (skip-words include the
+    // determiner and any relation verb, so "a"/"cause" are passed over).
+    let op = _nlq_np_span(toks, after)
+    let object = op[0]
+    push(r, subject); push(r, object); push(r, kind)
+    return r
+}
+
+// ---- classification --------------------------------------------------------
+fn nlq_classify(text) {
+    let toks = _nlq_tokens(text)
+    let n = len(toks)
+    if n == 0 { return NLQ_NONE }
+    let w0 = toks[0]
+    if str_eq(w0, "how") == 1 {
+        if n >= 2 { if str_eq(toks[1], "many") == 1 { return NLQ_HOWMANY } }
+        if n >= 2 { if str_eq(toks[1], "much") == 1 { return NLQ_HOWMANY } }
+        return NLQ_HOW
+    }
+    if str_eq(w0, "what") == 1  { return NLQ_WHAT }
+    if str_eq(w0, "who") == 1   { return NLQ_WHO }
+    if str_eq(w0, "where") == 1 { return NLQ_WHERE }
+    if str_eq(w0, "when") == 1  { return NLQ_WHEN }
+    if str_eq(w0, "why") == 1   { return NLQ_WHY }
+    if str_eq(w0, "which") == 1 { return NLQ_WHAT }
+    if _nlq_is_aux(w0) == 1 { return NLQ_YESNO }
+    return NLQ_NONE
+}
+
+// ---- answer record ---------------------------------------------------------
+// [found, form, text, conf_milli, op_ids, source_tag]
+fn _nlq_ans(found, form, text, conf, ops, src) {
+    let r = list_new()
+    push(r, found); push(r, form); push(r, text); push(r, conf); push(r, ops); push(r, src)
+    return r
+}
+fn nlq_found(a)  { return a[0] }
+fn nlq_aform(a)  { return a[1] }
+fn nlq_text(a)   { return a[2] }
+fn nlq_conf(a)   { return a[3] }
+fn nlq_ops(a)    { return a[4] }
+fn nlq_source(a) { return a[5] }
+
+fn _nlq_no(form, msg) { return _nlq_ans(0, form, msg, 0, list_new(), "") }
+
+// Source tag for an operator from its provenance-prefixed label (mirrors the
+// router's _cr_src_weight markers). "seed" when no src: prefix is present.
+fn nlq_source_tag(label) {
+    if str_find(label, "wikipedia.org") >= 0  { return "wikipedia" }
+    if str_find(label, "wiktionary.org") >= 0 { return "wiktionary" }
+    if str_find(label, "src:dict:") >= 0      { return "dictionary" }
+    if str_find(label, "src:topic:") >= 0     { return "topic" }
+    if str_find(label, "src:url:") >= 0        { return "web" }
+    if str_find(label, "src:") >= 0            { return "learned" }
+    return "seed"
+}
+
+// ---- KG lookups -------------------------------------------------------------
+fn _nlq_label(kg, cid) {
+    let a = kg_atom(kg, cid)
+    if a == 0 { return "" }
+    return atom_label(a)
+}
+
+// Resolve a mention to an atom id in kg (exact + alias), or -1 if absent.
+fn _nlq_resolve(kg, aliases, mention) {
+    if len(mention) == 0 { return 0 - 1 }
+    let res = er_resolve(kg, aliases, mention, list_new(), ER_HDC_THRESHOLD)
+    if res[0] == 0 { return 0 - 1 }
+    return atom_id(res[0])
+}
+
+// Strongest operator leaving `aid`. kind_filter 0 => any chaining-ish edge
+// (excluding analogy/opposite, which have their own surfaces); else exact kind.
+// Returns the operator atom or 0.
+fn _nlq_strongest_out(kg, aid, kind_filter) {
+    let ops = rk_operators_from(kg, aid)
+    let best = 0
+    let bc = 0 - 1
+    let i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        let k = rop_kind(op)
+        let ok = 0
+        if kind_filter == 0 {
+            if k != ROP_ANALOGY { if k != ROP_OPPOSITE { ok = 1 } }
+        } else { if k == kind_filter { ok = 1 } }
+        if ok == 1 { if rop_confidence(op) > bc { bc = rop_confidence(op) best = op } }
+        i = i + 1
+    }
+    return best
+}
+
+// Strongest causal operator ENTERING `aid` (for "why X" / "what causes X").
+fn _nlq_strongest_in(kg, aid, kind_filter) {
+    let ops = rk_operators_to(kg, aid)
+    let best = 0
+    let bc = 0 - 1
+    let i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        let k = rop_kind(op)
+        let ok = 0
+        if kind_filter == 0 {
+            if k != ROP_ANALOGY { if k != ROP_OPPOSITE { ok = 1 } }
+        } else { if k == kind_filter { ok = 1 } }
+        if ok == 1 { if rop_confidence(op) > bc { bc = rop_confidence(op) best = op } }
+        i = i + 1
+    }
+    return best
+}
+
+fn _nlq_op_answer(kg, op, subj_label, obj_label) {
+    let ops = list_new()
+    push(ops, atom_id(op))
+    let text = subj_label + " " + nlq_rel_phrase(rop_kind(op)) + " " + obj_label
+    return _nlq_ans(1, NLQ_WHAT, text, rop_confidence(op), ops, nlq_source_tag(atom_label(op)))
+}
+
+// ---- per-form answerers -----------------------------------------------------
+// "what/who/which is X" and "what does X cause": the strongest relation leaving
+// the focus (preferring is_a, then the requested kind, then anything).
+fn nlq_answer_what(kg, aliases, focus, kind) {
+    let aid = _nlq_resolve(kg, aliases, focus)
+    if aid < 0 { return _nlq_no(NLQ_WHAT, "i don't know " + focus + " yet") }
+    // a requested kind wins; else "what is X" prefers an is_a edge; else the
+    // strongest relation of any (non-analogy/opposite) kind.
+    let op = 0
+    if kind != 0 { op = _nlq_strongest_out(kg, aid, kind) }
+    if op == 0 { op = _nlq_strongest_out(kg, aid, ROP_IMPLY) }
+    if op == 0 { op = _nlq_strongest_out(kg, aid, 0) }
+    if op == 0 { return _nlq_no(NLQ_WHAT, "i don't have a fact about " + focus + " yet") }
+    return _nlq_op_answer(kg, op, focus, _nlq_label(kg, rop_conclusion(op)))
+}
+
+// "why X" / "what causes X": the strongest causal edge whose conclusion is X.
+fn nlq_answer_why(kg, aliases, focus) {
+    let aid = _nlq_resolve(kg, aliases, focus)
+    if aid < 0 { return _nlq_no(NLQ_WHY, "i don't know " + focus + " yet") }
+    let op = _nlq_strongest_in(kg, aid, ROP_CAUSAL)
+    if op == 0 { return _nlq_no(NLQ_WHY, "i don't know what causes " + focus + " yet") }
+    let ans = _nlq_op_answer(kg, op, _nlq_label(kg, rop_premise(op)), focus)
+    list_set(ans, 1, NLQ_WHY)
+    return ans
+}
+
+// "is X a Y" / "does X cause Y": a yes/no backed by the matching edge. A direct
+// OPPOSITE edge X->Y answers "no"; otherwise the absence of an edge is honest
+// ("i don't have that") rather than a guessed "no".
+fn nlq_answer_yesno(kg, aliases, subject, object, kind) {
+    let sid = _nlq_resolve(kg, aliases, subject)
+    if sid < 0 { return _nlq_no(NLQ_YESNO, "i don't know " + subject + " yet") }
+    let oid = _nlq_resolve(kg, aliases, object)
+    if oid < 0 { return _nlq_no(NLQ_YESNO, "i don't know " + object + " yet") }
+    let ops = rk_operators_from(kg, sid)
+    let pos = 0
+    let neg = 0
+    let i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        if rop_conclusion(op) == oid {
+            let k = rop_kind(op)
+            // Classify the edge as supporting (pos) or contradicting (neg) the
+            // question. When the question itself asks about opposition
+            // ("is X the opposite of Y"), an OPPOSITE edge is the positive
+            // answer; otherwise an OPPOSITE edge contradicts an is_a/causal claim.
+            let supports = 0
+            if kind == ROP_OPPOSITE {
+                if k == ROP_OPPOSITE { supports = 1 }
+            } else {
+                if k == ROP_OPPOSITE { supports = 0 - 1 }
+                else { if kind == 0 { if k != ROP_ANALOGY { supports = 1 } }
+                       else { if k == kind { supports = 1 } } }
+            }
+            if supports == 1 {
+                if pos == 0 { pos = op } else { if rop_confidence(op) > rop_confidence(pos) { pos = op } }
+            } else { if supports < 0 {
+                if neg == 0 { neg = op } else { if rop_confidence(op) > rop_confidence(neg) { neg = op } }
+            } }
+        }
+        i = i + 1
+    }
+    if pos != 0 {
+        let opl = list_new() push(opl, atom_id(pos))
+        return _nlq_ans(1, NLQ_YESNO, "yes", rop_confidence(pos), opl, nlq_source_tag(atom_label(pos)))
+    }
+    if neg != 0 {
+        let opl = list_new() push(opl, atom_id(neg))
+        return _nlq_ans(1, NLQ_YESNO, "no", rop_confidence(neg), opl, nlq_source_tag(atom_label(neg)))
+    }
+    return _nlq_no(NLQ_YESNO, "i don't have a link between " + subject + " and " + object)
+}
+
+// "how many <rel> does X have": count the DISTINCT conclusions reachable from X
+// under the relation (kind 0 => any non-analogy/opposite edge). Counting is
+// exact, so confidence is full (1000).
+fn nlq_answer_howmany(kg, aliases, focus, kind) {
+    let aid = _nlq_resolve(kg, aliases, focus)
+    if aid < 0 { return _nlq_no(NLQ_HOWMANY, "i don't know " + focus + " yet") }
+    let ops = rk_operators_from(kg, aid)
+    let seen = list_new()
+    let i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        let k = rop_kind(op)
+        let ok = 0
+        if kind == 0 { if k != ROP_ANALOGY { if k != ROP_OPPOSITE { ok = 1 } } }
+        else { if k == kind { ok = 1 } }
+        if ok == 1 {
+            let c = rop_conclusion(op)
+            if contains(seen, c) == 0 { push(seen, c) }
+        }
+        i = i + 1
+    }
+    let opl = list_new()
+    return _nlq_ans(1, NLQ_HOWMANY, int_to_str(len(seen)), 1000, opl, "count")
+}
+
+// ---- top-level bridge -------------------------------------------------------
+// nlq_respond(kg, aliases, text) -> answer record. `aliases` may be 0.
+fn nlq_respond(kg, aliases, text) {
+    let form = nlq_classify(text)
+    if form == NLQ_NONE { return _nlq_no(NLQ_NONE, "that doesn't look like a question i can answer from what i know") }
+    let toks = _nlq_tokens(text)
+    let kind = _nlq_rel_kind(toks, form)
+
+    if form == NLQ_YESNO {
+        let parts = _nlq_yesno_parts(toks)
+        return nlq_answer_yesno(kg, aliases, parts[0], parts[1], parts[2])
+    }
+    if form == NLQ_HOWMANY {
+        return nlq_answer_howmany(kg, aliases, nlq_focus(toks), kind)
+    }
+    if form == NLQ_WHY {
+        return nlq_answer_why(kg, aliases, nlq_focus(toks))
+    }
+    // what / who / where / when / how: strongest relation leaving the focus.
+    let ans = nlq_answer_what(kg, aliases, nlq_focus(toks), kind)
+    list_set(ans, 1, form)
+    return ans
+}
+
+// ---- rendering (R74 confidence hedging) ------------------------------------
+// Hedge tier for a milli confidence -- identical thresholds to the cognitive
+// router's _cr_confidence_phrase so the agent's voice is consistent.
+fn nlq_phrase(conf) {
+    if conf >= 700 { return "" }
+    if conf >= 400 { return "i think " }
+    return "tentatively, "
+}
+
+// A user-facing sentence. Not-found answers carry their own honest message;
+// found answers are prefixed with the confidence hedge and tagged with the
+// source the backing edge came from.
+fn nlq_render(a) {
+    if nlq_found(a) == 0 { return nlq_text(a) }
+    let hedge = nlq_phrase(nlq_conf(a))
+    let body = nlq_text(a)
+    if nlq_aform(a) == NLQ_HOWMANY { return body }
+    let src = nlq_source(a)
+    let tail = ""
+    if len(src) > 0 { tail = " [from " + src + "]" }
+    return hedge + body + tail
+}
