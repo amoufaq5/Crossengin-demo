@@ -91,6 +91,22 @@ inverse property, capacity/crosstalk at N bundled pairs, query round-trip).
 
 ## P2 — Predictive coding + three-factor learning
 
+> **STATUS: implemented (2026-06-11), ADR-0052.** Additive (no behaviour change
+> to existing rules). `synapse_graph.nova` gains three-factor plasticity
+> (`dw = eta·neuromod·eligibility`) + STDP-asymmetric eligibility deposit
+> (`syn_stdp_kernel`/`syn_coactivate`/`syn_eligibility_step`/`syn_neuromodulate`);
+> `predictive_coding_runtime.nova` gains a gradient-free adaptive predictor +
+> `pc_neuromod_scalar`; new `src/learning/forward_forward.nova` (goodness-based,
+> no cross-layer gradient). Acceptance met (measured): delayed reward (t+5)
+> potentiates where pure Hebbian can't; STDP forward ≈4× backward; the
+> predict→err→reward bench cuts mean error **99%** (1013→9) over 150 ticks; FF
+> separates real vs corrupted data. Tests: `test_three_factor` (18),
+> `test_predictive_coding_runtime` (30), `test_forward_forward` (8),
+> `bench_predictive_coding`; `test_synapse_graph` (55) green = no regression.
+> **Remaining (not blocking):** wire the eligibility/neuromodulate pass + the
+> predictor into `tick_driver`; source FF negatives from `dream_recombination`;
+> consider a signed STDP trace + a learned critic. See ADR-0052 "Honest gaps".
+
 **Problem.** Current plasticity is two-factor Hebbian (`pre × post`) → no credit
 assignment → plateaus. ADR-0024 (predictive coding) is documented but the
 runtime is thin.
