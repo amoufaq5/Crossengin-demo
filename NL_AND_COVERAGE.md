@@ -64,8 +64,13 @@ Unit-test the pure, deterministic logic of each (no real sockets/audio/video):
   `tests/unit/test_<module>.nova`; the integration-only paths are documented as
   such. (ADR-0058.)
 
-### C2 — coverage quality + tracking
-- A `make`/script target (or doc) that reports covered/uncovered module counts.
+### C2 — coverage quality + tracking  *(DONE 2026-06-11)*
+- **DONE.** `scripts/coverage.sh` + `make coverage` report covered/uncovered
+  module counts by walking the transitive `import` graph from `tests/unit/`;
+  exits non-zero on any gap. Confirms **241/241** covered (after N1/N2/N4 added
+  three modules, each landing with its own suite). Pure static analysis — no
+  NOVA toolchain needed, so it runs even while the dtls12 compile hang blocks a
+  full `make test`.
 - Raise assertion depth on any thin suite surfaced while doing C1/N work.
 
 ---
@@ -75,7 +80,15 @@ Unit-test the pure, deterministic logic of each (no real sockets/audio/video):
 Concrete, KG-grounded, fully-unit-testable capabilities built on the existing
 reader / word_atoms / openie / query stack. Execute after C1, one per phase.
 
-### N1 — NL question → structured KG answer  *(keystone of this track)*
+### N1 — NL question → structured KG answer  *(keystone of this track)* *(DONE 2026-06-11, ADR-0059)*
+> **DONE.** `src/language/nl_query.nova` (+ `test_nl_query`, 55 checks):
+> `nlq_classify` (yes/no vs what/who/where/when/why/how/how-many),
+> focus+relation extraction, `er_resolve` entity resolution, operator lookup
+> (out for "what causes", in for "why"), and R74 confidence-hedged rendering
+> with source provenance. "what is X" / "is X a Y" / "how many Z" answered from a
+> seeded KG with the backing op id returned for /good//bad. Live router wiring
+> deferred (honest-gaps).
+
 A bridge from a natural-language question to a `query.nova` query (or a direct
 KG lookup) and back to an answer atom. Classify the question form
 (yes/no vs wh- : what/who/where/when/how-many), extract the focus entity +
@@ -84,16 +97,36 @@ relation via the OpenIE/word-atom layer, resolve the entity (P3
 (reusing the R74 confidence machinery). **Acceptance:** "what is X" / "is X a Y"
 / "how many Z" answered from a seeded KG with provenance; unit-tested end to end.
 
-### N2 — number-words & units → value
+### N2 — number-words & units → value  *(DONE 2026-06-11, ADR-0060)*
+> **DONE.** `src/language/number_words.nova` (+ `test_number_words`, 45 checks):
+> `numw_words_to_value` (accumulate-on-scale over ones/tens/hundred/dozen/score/
+> thousand/million/billion, filler + hyphen) and `numw_parse` → `[ok, milli,
+> unit]` over digit tokens or word runs with a canonicalised measurement unit.
+> All value math uses the `int_*` escape hatch (scaled milli exceed codegen
+> bug #11's 0x100000). Wiring into `arithmetic.nova` deferred (honest-gaps).
+
 `"three hundred"`, `"a dozen"`, `"2.5 kg"` → milli values feeding
 `arithmetic.nova` and table/measure ingestion. Pure, deterministic, fully tested.
 
-### N3 — OpenIE depth: negation, coordination, coreference
+### N3 — OpenIE depth: negation, coordination, coreference  *(DONE 2026-06-11, ADR-0061)*
+> **DONE.** `src/learning/openie.nova` gains `polarity` + `coords` fact fields
+> (accessors `oie_polarity`/`oie_coords`/`oie_is_negated`): negation is carried,
+> not dropped ("sky is not blue" → fact tagged -1, *no* positive triple);
+> `and`/`or` objects split ("X has A and B" → two triples); a leading subject
+> pronoun corefers to the previous sentence's subject (`openie_extract_ctx` +
+> threaded `openie_run`). `test_openie` 31 → 64 checks; reverse-deps green.
+
 Carry negation as a polarity flag (not silent drop), split coordinated objects
 ("X has A and B" → two triples), and resolve simple intra-sentence pronouns
 ("it"/"they") to the subject (extending the R75 anaphora work). Confidence-gated.
 
-### N4 — NL generation quality
+### N4 — NL generation quality  *(DONE 2026-06-11, ADR-0062)*
+> **DONE.** `src/language/nl_generate.nova` (+ `test_nl_generate`, 35 checks):
+> `nlg_clause`/`nlg_fact_sentence` (article a/an, is/are agreement, plural
+> object, de-underscore, capitalisation), `nlg_object_list` (Oxford comma) +
+> `nlg_clause_multi` for N3 coordination, and `nlg_chain`/`nlg_chain_sentence`.
+> Tied into the N1 bridge: `nl_query` now renders answers via `nlg_clause`.
+
 Render KG facts / reasoning chains as fluent clauses (subject–relation–object
 with article/agreement), not template fragments; tie into the chat reply path.
 
