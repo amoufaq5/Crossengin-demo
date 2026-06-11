@@ -36,17 +36,21 @@ unfixed) wastes effort because entity resolution will fragment the KG.
 
 ## P1 — HDC/VSA embedding layer  *(keystone)*
 
-> **STATUS: implemented (2026-06-11), behind `ATOM_EMBED_MODE` (default LEGACY).**
+> **STATUS: implemented + full cutover wired (2026-06-11), behind
+> `ATOM_EMBED_MODE` (default LEGACY).**
 > Module `src/kg/hdc_embed.nova` (D=10000 bipolar VSA: bind/bundle/permute/
-> unbind/cosine + symbol/encode), flag + accessors in `atom_store.nova`,
-> `word_atom_new` wired via `word_embed_vec`, ADR-0051, and
-> `tests/unit/test_hdc_embed.nova` (39 checks). All acceptance criteria met
+> unbind/cosine + symbol/encode + a memoising symbol cache), flag + accessors in
+> `atom_store.nova`, and ADR-0051. **All three embed producers honour the flag:**
+> `word_atom_new` (`word_embed_vec`), `snapshot_disk` rehydration, and
+> `concept_layer` semantic facets (`hdc_bundle` in HDC mode). Acceptance met
 > (measured): bind self-inverse exact; `(France⊗capital)→Paris`;
 > `cos(encode(car),encode(automobile))=731 (>700)`; capacity 35/35 perfect,
-> 58/60 at N=60. Prior tests green at the LEGACY default.
-> **Remaining for full cutover:** symbol-vector cache; extend the mode branch to
-> `snapshot_disk.nova` + `concept_layer.nova`; `entity_resolve.nova` (P3) as the
-> first real `hdc_cosine` consumer. See ADR-0051 "Honest gaps".
+> 58/60 at N=60. Tests: `test_hdc_embed` (45 checks) + HDC concept-promotion +
+> HDC snapshot round-trip + a `word_atoms` mode case. Every bounded-time test
+> passes; prior results byte-identical at the LEGACY default.
+> **Remaining (not blocking):** cache eviction policy; re-embedding pre-existing
+> atoms on a live mode switch; `entity_resolve.nova` (P3) as the first real
+> `hdc_cosine` consumer. See ADR-0051 "Honest gaps".
 
 **Problem.** `atom_store` uses `ATOM_EMBED_DIMS = 8` from `word_lexical_vec` →
 captures spelling, not meaning. "car" and "automobile" are far apart.

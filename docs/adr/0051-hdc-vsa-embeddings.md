@@ -100,9 +100,14 @@ auditable switch the roadmap asks for.
   nothing breaks until we choose to switch. `ann_index` needed no change — LSH
   scales to D=10k; tests build it with K=16 (65,536 buckets).
 - **Negative / costs.** A 10,000-int list per atom is ~1250x the storage of the
-  8-dim vector, and `hdc_symbol` recomputes a 10k-step PRNG on each call (no cache
-  yet). For large KGs this matters; see Honest gaps. Bundling has finite capacity
+  8-dim vector. `hdc_symbol` is now memoised (a label->vector cache), so recurring
+  relation/neighbour symbols cost a bucket scan, not a 10k-step PRNG; the cache
+  trades memory for speed (see Honest gaps). Bundling has finite capacity
   (crosstalk grows with the number of superposed pairs).
+- **Cutover wired across all three producers.** `word_atom_new`,
+  `snapshot_disk` rehydration, and `concept_layer` semantic facets all honour the
+  flag; flipping `ATOM_EMBED_MODE` to HDC now propagates end-to-end (verified by
+  an HDC snapshot round-trip and an HDC concept-promotion test).
 
 ## Honest gaps
 
@@ -111,20 +116,29 @@ auditable switch the roadmap asks for.
   (D=10000). Real atoms with very high degree will exceed this; we do not yet
   segment or normalise high-degree neighbourhoods. Mitigation (future): cap edges
   per encode, weight by belief, or use multiple bundles.
-- **No symbol-vector cache.** `hdc_symbol(label)` is pure but recomputed every
-  call; `hdc_encode_edges` calls it per endpoint. A label->vector memo (or
-  persisting the vector on the language atom) is needed before HDC mode is
-  economical at scale.
-- **The cutover is partial.** Only `word_atom_new` honours the flag so far.
-  `snapshot_disk.nova` reconstructs embeds with `word_lexical_vec` and
-  `concept_layer.nova` facets are still lexical; both need the same
-  `word_embed_vec`-style branch before HDC can be the global default. They remain
-  correct in the default LEGACY mode.
+- **Symbol cache has no eviction policy.** `hdc_symbol` now memoises into a
+  1024-bucket table (`hdc_cache_clear`/`hdc_cache_size` for control), but it grows
+  unbounded — one 10k-int vector per distinct label ever seen. For a very large
+  vocabulary this is real memory; an LRU/size cap (or persisting the vector on the
+  language atom and skipping the cache) is future work. Eviction is safe because
+  the values are pure and re-derivable.
+- **A live mode switch does not re-embed existing atoms.** Flipping
+  `ATOM_EMBED_MODE` affects newly produced embeds; atoms already in a KG keep
+  their old-dimension vectors until rewritten. A true runtime cutover would walk
+  the KG and re-embed. In practice the flag is set once at boot before atoms are
+  created/loaded. `atom_new`'s placeholder embed is also still an 8-dim zero
+  vector regardless of mode (harmless — it is overwritten by a producer before any
+  similarity use, and a zero vector scores 0 against everything).
 - **`semantic_search.nova` is not re-pointed.** Despite the roadmap wording, that
   module is a TF-IDF *term* index, not an embed-cosine search, so "re-point its
   cosine at HDC" doesn't apply to it directly; the embed cosine that HDC replaces
   is `atom_store.vec_cosine` (used by `ann_index`). Entity resolution (P3) is the
   natural first real consumer of `hdc_cosine`.
+- **`ann_index` and coherence still use `vec_cosine`.** For bipolar vectors
+  `vec_cosine` equals `hdc_cosine` on the positive range (both reduce to dot/D),
+  and clamps negatives to 0 — which is fine for nearest-neighbour ranking and the
+  concept-coherence threshold, where only positive similarity matters. Switching
+  these to signed `hdc_cosine` is a refinement, not a correctness fix.
 - **Even-count bundles use a fixed +1 tie-break.** When a bundle has an even
   number of members a coordinate can sum to zero; we resolve to +1. This injects a
   tiny DC bias rather than a random tie-break vector. Harmless at the thresholds
@@ -149,16 +163,27 @@ auditable switch the roadmap asks for.
 - **Cosine is signed.** `hdc_cosine` returns [-1000, 1000] rather than clamping at
   0 like `vec_cosine` (which assumes the non-negative lexical vectors), because
   bipolar anti-correlation is meaningful.
-- **Tests.** `tests/unit/test_hdc_embed.nova` (39 checks) covers bipolarity,
+- **Cutover producers.** Three places produce embeds and all now branch on the
+  flag: `word_atoms.word_atom_new` (via `word_embed_vec`), `snapshot_disk`
+  rehydration of `ATOM_LANG` atoms (re-derives the embed under the active mode),
+  and `concept_layer.concept_promote` (semantic facet = `hdc_bundle` of members in
+  HDC mode, arithmetic-mean centroid in LEGACY). `atom_birth_monitor` is a conduit
+  — it propagates whatever embed its caller supplies — so it needs no branch.
+- **Tests.** `tests/unit/test_hdc_embed.nova` (46 checks) covers bipolarity,
   determinism, near-orthogonality, the bind self-inverse, bundle membership,
   permute round-trip, the France/capital/Paris record recovery, the
   car/automobile synonym acceptance (> 700), capacity/crosstalk at N = 5/35/60,
-  and an `ann_index` query round-trip at D=10k. `tests/unit/test_word_atoms.nova`
-  gains a case proving `word_atom_new` honours the mode flag. All prior tests pass
-  unchanged with the flag at its LEGACY default.
-- **Next (P1 -> P2/P3).** Cache symbol vectors; extend the flag branch to
-  `snapshot_disk` and `concept_layer`; make `entity_resolve.nova` (P3) the first
-  consumer of `hdc_cosine` for synonym collapse before insertion.
+  an `ann_index` query round-trip at D=10k, and the symbol cache. The cutover is
+  proved end-to-end by an HDC concept-promotion test (`test_concept_layer`: facet
+  is a D=10000 bundle) and an HDC word snapshot round-trip
+  (`test_snapshot_disk_full`: a rehydrated word's embed matches its symbol
+  vector). `test_word_atoms` proves `word_atom_new` honours the flag. Every test
+  that compiles in bounded time passes; the flag's LEGACY default keeps all prior
+  results byte-identical. (`test_dtls12` is a pre-existing toolchain compile
+  timeout on `src/federation/dtls12.nova`, unrelated to this change.)
+- **Next (P1 -> P3).** Add a cache eviction policy; make `entity_resolve.nova`
+  (P3) the first real consumer of `hdc_cosine` for synonym collapse before
+  insertion; optionally move `ann_index`/coherence to signed `hdc_cosine`.
 ```
 P1 HDC embeddings  --►  P2 predictive coding + 3-factor  --►  P3 ingestion/OpenIE
 ```
