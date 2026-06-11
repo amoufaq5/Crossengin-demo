@@ -44,6 +44,18 @@ unfixed) wastes effort because entity resolution will fragment the KG.
 > always-on autonomous loop, live MCP transport, and snapshot-backed
 > cross-session persistence — see ADR-0056 "Honest gaps".
 
+> **CAPSTONE — ONE AUTONOMOUS LOOP (2026-06-11, ADR-0057).**
+> `src/agent/autonomous_loop.nova` composes all five phases into a single
+> deterministic cycle: act+learn the task (P5) → reward drives three-factor
+> substrate plasticity (P2) → goal-driven gated tool plan emitting moments (P4)
+> → entity-resolved ingestion (P1+P3) → bounded, audited self-edit (P5+safety).
+> Measured over a 30-cycle run (`test_autonomous_loop`, 13 checks): task return
+> −100→95 (optimal path learned from its own experience); task-value synapse
+> 0→65; 90 moments; KG stable at a handful of atoms (no fragmentation); 3 gated
+> self-edits, audit chain verifies; **0** self-edits when approval is withheld.
+> Remaining: make tool calls the task actions, fold the cycle into `tick_driver`,
+> snapshot agent state across restarts, live MCP. See ADR-0057 "Honest gaps".
+
 ---
 
 ## P1 — HDC/VSA embedding layer  *(keystone)*
