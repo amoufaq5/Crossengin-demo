@@ -96,6 +96,17 @@ same "values are untyped at runtime" design:
    same value is correct. Write large constants in decimal (or build them with
    `int_shl`/`int_or` from small parts).
 
+3. **`==` / `!=` against a NEGATIVE value is unsafe.** A negative int is
+   `0xFFFF...` in two's complement, i.e. `>= 0x100000`. So `x == 0 - 1`,
+   `r == SOME_ERR` (where `SOME_ERR = 0 - 1`), or any equality against a negative
+   sentinel is a two-large-operand compare whenever the other side is also large
+   (a negative value, or a list/heap pointer) — ASLR-flaky SIGSEGV (ADR-0073:
+   `_ice_turn_is_parse_err` misclassified responses this way). Test sentinels
+   with **`x < 0`** (the constant 0 is small, so the scalar path is always taken)
+   or `int_xor(x, sentinel) == 0` for an exact match. `make lint-ints` flags the
+   literal `== 0 - N` form; named negative-sentinel constants are a lint blind
+   spot covered by the `< 0` idiom under review.
+
 These are covered by the same `int_*` discipline + code review; the automated
 `make lint-ints` gate only sees the literal-`*` case (see "What the lint can and
 cannot catch"). The permanent fix is the tagged-value compiler change (ADR-0066).

@@ -112,6 +112,16 @@ def adjacent_danger_op(code, start, end):
     return None
 
 
+# A comparison against a NEGATIVE literal: `x == 0 - 1`, `x != 0 - 7`. In two's
+# complement a negative is 0xFFFF...  >= 0x100000, so `==`/`!=` against it is a
+# two-large-operand compare whenever the other side is also large (a pointer or
+# a negative value) -> bug #11, ASLR-flaky (see ADR-0073). Use `< 0` (one small
+# operand) or int_xor instead. Catches the literal form; named negative-sentinel
+# constants (e.g. `== SOME_ERR` where SOME_ERR = 0 - 1) are a documented lint
+# blind spot covered by the `< 0` coding standard under review.
+NEG_CMP = re.compile(r'(==|!=)\s*0\s*-\s*\d')
+
+
 def scan_file(path):
     findings = []
     with open(path, 'r', errors='replace') as f:
@@ -119,6 +129,9 @@ def scan_file(path):
             code, int_safe = strip_code(raw.rstrip('\n'))
             if int_safe:
                 continue
+            if NEG_CMP.search(code):
+                findings.append((lineno, '== neg', '0 - N',
+                                 raw.strip()))
             for m in NUM.finditer(code):
                 if value_of(m.group(0)) < THRESHOLD:
                     continue
@@ -142,8 +155,12 @@ def main():
             p = os.path.join(dirpath, fn)
             for (lineno, op, lit, text) in scan_file(p):
                 total += 1
-                print(f"  {p}:{lineno}: large literal {lit} is a raw '{op}' "
-                      f"operand (bug #11 risk; use int_* or annotate // int-safe)")
+                if op == '== neg':
+                    print(f"  {p}:{lineno}: comparison against a negative literal "
+                          f"(bug #11 risk; use `< 0` or int_xor, or annotate // int-safe)")
+                else:
+                    print(f"  {p}:{lineno}: large literal {lit} is a raw '{op}' "
+                          f"operand (bug #11 risk; use int_* or annotate // int-safe)")
                 print(f"      {text}")
     print("-" * 40)
     if total == 0:
