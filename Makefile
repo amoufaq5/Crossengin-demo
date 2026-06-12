@@ -28,7 +28,7 @@ KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 FED_COORD   := examples/crossengin_fed_coordinator.nova
 
-.PHONY: all build test benchmark coverage install integration clean check-nova help cross-windows smoke-windows-ce
+.PHONY: all build test benchmark coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
 
 all: build
 
@@ -202,6 +202,12 @@ test: check-nova
 coverage:
 	@bash scripts/coverage.sh
 
+# Static guard against NOVA codegen bug #11: flag large integer literals used as
+# raw operands of multiplication/bitwise ops (use int_* or annotate // int-safe).
+# Fails (exit 1) on any unguarded finding. No NOVA toolchain required. (ADR-0066.)
+lint-ints:
+	@python3 scripts/int_safety_lint.py
+
 benchmark: check-nova
 	@if [ -z "$(BENCHMARKS)" ]; then echo "benchmark: no benchmarks under tests/benchmark/ yet."; exit 0; fi
 	@for b in $(BENCHMARKS); do \
@@ -296,6 +302,7 @@ help:
 	@echo "  test        compile and run every unit test under tests/unit/"
 	@echo "  benchmark   run every benchmark under tests/benchmark/"
 	@echo "  coverage    report module-level unit-test coverage (static)"
+	@echo "  lint-ints   flag large-literal arithmetic at risk of codegen bug #11"
 	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, and fed-coordinator into ./bin/"
 	@echo "  integration run every end-to-end scenario + admin-command script in tests/integration/"
 	@echo "  clean       remove build artifacts"
