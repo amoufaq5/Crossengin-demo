@@ -76,6 +76,30 @@ So the lint is a backstop, not a substitute for applying the rule when you write
 arithmetic on values that can grow past a megabyte (timestamps in ns, hashes,
 fixed-point milli accumulators, PRNGs, packed addresses, sizes).
 
+## Related NOVA value gotchas (same magnitude-dispatch family)
+
+Discovered while driving the suite green (ADR-0067/0068/0069). All stem from the
+same "values are untyped at runtime" design:
+
+1. **`==` / `!=` on two large values is unsafe — including two pointers.**
+   `cookie != TURN_MAGIC_COOKIE` (both ≥ 0x100000) dispatched to string-compare
+   and dereferenced an integer as a pointer → ASLR-flaky SIGSEGV. And `==`/`!=`
+   on two heap **pointers** compares by *type-tag*, so two distinct `alloc`'d
+   buffers always test **equal**. Use:
+   - equality of two large ints / a cookie vs constant: `int_xor(a, b) != 0`
+     (xor is 0 iff equal; `… != 0` is safe because 0 < 0x100000).
+   - "is this a fresh/different pointer?": `(p2 - p1) != 0` (subtraction is pure
+     scalar); null-check with `p != 0` (0 is the int sentinel, reliable).
+
+2. **Large *hex* literals can miscompile; prefer decimal.** `0x2112A442` was
+   observed to lower to a wrong constant, while the decimal `554869826` of the
+   same value is correct. Write large constants in decimal (or build them with
+   `int_shl`/`int_or` from small parts).
+
+These are covered by the same `int_*` discipline + code review; the automated
+`make lint-ints` gate only sees the literal-`*` case (see "What the lint can and
+cannot catch"). The permanent fix is the tagged-value compiler change (ADR-0066).
+
 ## The permanent fix (tracked, NOVA side)
 
 The real resolution is a low-bit pointer tag in `NOVA/src/compiler/codegen.nova`
