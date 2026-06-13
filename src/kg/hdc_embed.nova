@@ -1,0 +1,457 @@
+// CrossEngin knowledge: HDC / VSA embedding layer (P1 keystone, ADR-0051).
+//
+// Purpose
+//   A Vector Symbolic Architecture (VSA) over high-dimensional bipolar
+//   hypervectors. This replaces the 8-dim lexical hash (`word_lexical_vec`),
+//   which captures spelling rather than meaning: "car" and "automobile" share
+//   no characters so the lexical vectors are far apart, even though the two
+//   words denote the same concept. With HDC, meaning is carried compositionally
+//   by an atom's *neighbourhood* (the relations and neighbours it participates
+//   in), so two atoms that occur with the same neighbours land close together
+//   regardless of spelling.
+//
+//   A hypervector here is a plain list of D = 10,000 integers, each +1 or -1
+//   (bipolar). Keeping the same "list of ints" shape as `vec_new`/`atom_embed`
+//   means HDC vectors are a drop-in replacement for the legacy embedding: they
+//   live in the same atom embed slot and flow through `ann_index` (which is
+//   dimension-agnostic) and the milli-fixed-point cosine convention unchanged.
+//
+//   Algebra (Kanerva 2009; Plate's HRR; Gayler):
+//     bind    = element-wise multiply (role (x) filler). Self-inverse for
+//               bipolar vectors because (+/-1)^2 = 1, so unbind == bind.
+//     bundle  = element-wise sum then sign (superposition / set membership).
+//     permute = cyclic shift (encodes order / protects a slot from binding).
+//   These give one-shot, gradient-free, compositional representations:
+//     record  = bundle( bind(role_1, filler_1), ... )           (a struct)
+//     filler  = unbind(record, role_k)                          (a query)
+//
+// Determinism + provenance: every symbol vector is a pure function of its
+//   label (FNV-1a seed -> LCG bit stream), so the same label always yields the
+//   same hypervector across processes and snapshots -- no stored random tables.
+//
+// NOVA codegen note (#11): the pointer-threshold multiply heuristic miscompiles
+//   `a * b` when either operand is >= 0x100000 (1048576). The PRNG multiplies by
+//   large LCG/FNV constants, so it uses the overflow-safe `int_mul`/`int_mod`/
+//   `int_div`/`int_add` builtins (the same choice NOVA's own std HDC makes).
+//   The bipolar arithmetic (bind/bundle/cosine) only ever multiplies tiny
+//   operands (+/-1, and accumulators bounded by D), so it uses bare operators.
+//
+// ADRs implemented: ADR-0051 (HDC/VSA embeddings). Related: ADR-0016 (atom
+//   embed slot), ADR-0049 (tests/benches).
+// NOVA dependencies: builtins (list_new/push/list_set/len, int_mul/int_add/
+//   int_mod/int_div, char_at).
+// CrossEngin dependencies: src/kg/atom_store.nova (isqrt, FP_SCALE, vec shape).
+
+import "atom_store.nova"
+
+// ---- dimensionality -------------------------------------------------------
+// D = 10,000: high enough that ~10k random bipolar vectors are mutually
+// near-orthogonal (cosine ~ 0) yet capacity for bundling stays generous.
+let HDC_DIMS = 10000
+
+fn hdc_dims() { return HDC_DIMS }
+
+// ---- deterministic PRNG (overflow-safe) -----------------------------------
+// Classic glibc LCG: state' = (state * 1103515245 + 12345) mod 2^31. We read
+// bit 16 (mid bits are better distributed than the low bit) to draw each
+// coordinate. int_* builtins dodge the large-multiply codegen bug (#11).
+let _HDC_LCG_MUL = 1103515245
+let _HDC_LCG_INC = 12345
+let _HDC_LCG_MOD = 2147483648   // 2^31
+
+fn _hdc_lcg_next(s) {
+    return int_mod(int_add(int_mul(s, _HDC_LCG_MUL), _HDC_LCG_INC), _HDC_LCG_MOD)
+}
+
+// FNV-1a over the label bytes, folded into the LCG's 31-bit range. Gives ~2^31
+// distinct seeds so distinct labels almost never collide (cf. the 15-bit
+// `label_hash`, which only has 32768 buckets -- fine for indexing, too few for
+// unique symbol vectors).
+let _HDC_FNV_OFFSET = 2166136261   // 0x811C9DC5
+let _HDC_FNV_PRIME  = 16777619     // 0x01000193
+
+fn hdc_str_seed(label) {
+    let h = int_mod(_HDC_FNV_OFFSET, _HDC_LCG_MOD)
+    let i = 0
+    while i < len(label) {
+        h = int_mod(int_mul(h ^ char_at(label, i), _HDC_FNV_PRIME), _HDC_LCG_MOD)
+        i = i + 1
+    }
+    if h == 0 { h = 1 }
+    return h
+}
+
+// A deterministic +/-1 hypervector for an integer seed. The seed is scrambled
+// through two LCG steps first so that adjacent seeds (0,1,2) still produce
+// near-orthogonal vectors rather than correlated prefixes.
+fn hdc_random_atom_vector(seed) {
+    let st = _hdc_lcg_next(int_add(_hdc_lcg_next(seed), 1))
+    let v = list_new()
+    let i = 0
+    while i < HDC_DIMS {
+        st = _hdc_lcg_next(st)
+        if int_mod(int_div(st, 65536), 2) == 1 {
+            push(v, 1)
+        } else {
+            push(v, -1)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// ---- symbol-vector cache --------------------------------------------------
+// hdc_symbol is a pure function of its label, but computing it walks a 10k-step
+// PRNG. During encoding the same relation/neighbour symbols recur constantly
+// ("is_a", "has", ...), and snapshot rehydration re-derives every word vector,
+// so without memoisation HDC mode is far too slow. The cache is a fixed array
+// of buckets keyed by `label_hash`; a bucket is a list of [label, vector]
+// scanned with str_eq. The cached value is byte-identical to recomputing it
+// (determinism is preserved), so this is purely an optimisation.
+//
+// Bounded eviction (ADR-0051 "Symbol cache has no eviction policy"). Without a
+// cap the cache grows one 10k-int vector per distinct label ever seen -- real
+// memory for a large vocabulary. We add a global entry cap (`hdc_cache_cap` /
+// `hdc_cache_set_cap`) and evict when a fresh symbol would exceed it. Eviction
+// is SAFE because every value is a pure function of its label: an evicted
+// vector is recomputed bit-identically on the next request, so eviction only
+// trades a cache miss (a 10k-step PRNG walk) for memory, never correctness.
+//
+// Policy: a CLOCK-style round-robin pointer (`_hdc_cache_clock`) sweeps the
+// buckets and drops the oldest entry (bucket head -- entries are appended, so
+// index 0 is the least-recently-inserted in that bucket) from the first
+// non-empty bucket it lands on. This is O(buckets) worst case per eviction but
+// O(1) amortised (the clock advances past empties only once per fill cycle),
+// needs no per-entry timestamp, and keeps total entries <= the cap at all times.
+let _HDC_CACHE_BUCKETS = 1024            // power of two -> mask, not modulo
+let _HDC_CACHE_MASK    = 1023            // _HDC_CACHE_BUCKETS - 1
+let _hdc_cache = 0                        // lazily initialised list of buckets
+let _hdc_cache_count = 0                  // live entry count (across all buckets)
+let _hdc_cache_clock = 0                  // round-robin eviction pointer
+
+// Default cap: generous enough that ordinary workloads never evict (a few
+// thousand distinct relation/word symbols), small enough to bound memory. At
+// 8192 entries * 10000 ints this is the ceiling on cache footprint. Tests can
+// lower it via hdc_cache_set_cap to exercise the eviction path cheaply.
+let _HDC_CACHE_CAP_DEFAULT = 8192
+let _hdc_cache_cap = 8192                 // == _HDC_CACHE_CAP_DEFAULT
+
+fn _hdc_cache_init() {
+    if _hdc_cache != 0 { return _hdc_cache }
+    let c = list_new()
+    let i = 0
+    while i < _HDC_CACHE_BUCKETS { push(c, list_new()); i = i + 1 }
+    _hdc_cache = c
+    _hdc_cache_count = 0
+    _hdc_cache_clock = 0
+    return c
+}
+
+// Drop every memoised vector (e.g. between tests, or to bound memory). The next
+// hdc_symbol call rebuilds lazily; values are unchanged because they are pure.
+fn hdc_cache_clear() {
+    _hdc_cache = 0
+    _hdc_cache_count = 0
+    _hdc_cache_clock = 0
+    return 1
+}
+
+// Number of distinct symbols currently memoised (diagnostics / tests).
+fn hdc_cache_size() {
+    if _hdc_cache == 0 { return 0 }
+    let total = 0
+    let i = 0
+    while i < len(_hdc_cache) { total = total + len(_hdc_cache[i]); i = i + 1 }
+    return total
+}
+
+// Current cache capacity (max live entries). Diagnostics / tests.
+fn hdc_cache_cap() { return _hdc_cache_cap }
+
+// Set the cache capacity. A cap of 0 (or negative) means "no memoisation":
+// every symbol is recomputed and nothing is retained. If the new cap is below
+// the current size, entries are evicted immediately so the invariant
+// (size <= cap) holds on return. Returns the cap in force. Values stay correct
+// regardless of cap because they are pure functions of the label.
+fn hdc_cache_set_cap(n) {
+    let cap = n
+    if cap < 0 { cap = 0 }
+    _hdc_cache_cap = cap
+    // Shrink to fit: evict until size <= cap (or the cache is empty).
+    while _hdc_cache_count > _hdc_cache_cap {
+        if _hdc_cache_evict_one() == 0 { _hdc_cache_count = 0 }
+    }
+    return _hdc_cache_cap
+}
+
+// Evict the oldest entry from the next non-empty bucket the clock reaches.
+// Returns 1 if an entry was dropped, 0 if the cache held nothing. Rebuilds the
+// chosen bucket without its head element (NOVA has no list `pop`/`shift`).
+fn _hdc_cache_evict_one() {
+    if _hdc_cache == 0 { return 0 }
+    let scanned = 0
+    while scanned < _HDC_CACHE_BUCKETS {
+        if _hdc_cache_clock >= _HDC_CACHE_BUCKETS { _hdc_cache_clock = 0 }
+        let bidx = _hdc_cache_clock
+        let bucket = _hdc_cache[bidx]
+        if len(bucket) > 0 {
+            // Drop the head (oldest insert in this bucket).
+            let kept = list_new()
+            let j = 1
+            while j < len(bucket) { push(kept, bucket[j]); j = j + 1 }
+            list_set(_hdc_cache, bidx, kept)
+            _hdc_cache_count = _hdc_cache_count - 1
+            // Advance so the next eviction spreads across buckets.
+            _hdc_cache_clock = bidx + 1
+            return 1
+        }
+        _hdc_cache_clock = bidx + 1
+        scanned = scanned + 1
+    }
+    return 0
+}
+
+// The hypervector standing for an atomic symbol (a word/relation/label).
+// Pure function of the label (memoised under a bounded cache), so it is stable
+// across calls and processes regardless of whether a prior entry was evicted.
+fn hdc_symbol(label) {
+    let cache = _hdc_cache_init()
+    let b = label_hash(label) & _HDC_CACHE_MASK
+    let bucket = cache[b]
+    let i = 0
+    while i < len(bucket) {
+        if str_eq(bucket[i][0], label) == 1 { return bucket[i][1] }
+        i = i + 1
+    }
+    let v = hdc_random_atom_vector(hdc_str_seed(label))
+    // Cap == 0 disables memoisation entirely (recompute every time).
+    if _hdc_cache_cap <= 0 { return v }
+    // Make room first so the cache never exceeds its cap. (Evicting before the
+    // insert keeps the peak bounded; the entry we just computed is never the
+    // one evicted because it is not in the table yet.)
+    while _hdc_cache_count >= _hdc_cache_cap {
+        if _hdc_cache_evict_one() == 0 { _hdc_cache_count = 0 }
+    }
+    let entry = list_new()
+    push(entry, label)
+    push(entry, v)
+    push(bucket, entry)
+    _hdc_cache_count = _hdc_cache_count + 1
+    return v
+}
+
+// ---- core VSA operations --------------------------------------------------
+
+// bind: element-wise multiply (role (x) filler). Bipolar => self-inverse.
+fn hdc_bind(a, b) {
+    let n = len(a)
+    if len(b) < n { n = len(b) }
+    let r = list_new()
+    let i = 0
+    while i < n {
+        push(r, a[i] * b[i])
+        i = i + 1
+    }
+    return r
+}
+
+// unbind: recover a filler bound under `key`. For bipolar vectors this is just
+// bind again, since key (x) key = all-ones.
+fn hdc_unbind(bound, key) {
+    return hdc_bind(bound, key)
+}
+
+// bundle: superpose a list of hypervectors (element-wise sum, then sign). The
+// result is similar to each input and dissimilar to non-members. Ties (sum 0,
+// only possible with an even count) resolve to +1 -- a fixed, documented bias.
+fn hdc_bundle(vecs) {
+    let count = len(vecs)
+    if count == 0 { return list_new() }
+    let dims = len(vecs[0])
+    let acc = list_new()
+    let i = 0
+    while i < dims { push(acc, 0); i = i + 1 }
+    let v = 0
+    while v < count {
+        let vec = vecs[v]
+        let m = len(vec)
+        if m > dims { m = dims }
+        let j = 0
+        while j < m {
+            list_set(acc, j, acc[j] + vec[j])
+            j = j + 1
+        }
+        v = v + 1
+    }
+    let out = list_new()
+    i = 0
+    while i < dims {
+        if acc[i] >= 0 { push(out, 1) } else { push(out, -1) }
+        i = i + 1
+    }
+    return out
+}
+
+// permute: cyclic shift by k (out[i] = v[(i - k) mod dims]). Used to encode
+// order / sequence and to keep a slot distinct under repeated binding. The
+// inverse is hdc_permute(v, -k).
+fn hdc_permute(v, k) {
+    let dims = len(v)
+    if dims == 0 { return list_new() }
+    let sh = int_mod(k, dims)
+    if sh < 0 { sh = sh + dims }
+    let out = list_new()
+    let i = 0
+    while i < dims {
+        let src = i - sh
+        if src < 0 { src = src + dims }
+        push(out, v[src])
+        i = i + 1
+    }
+    return out
+}
+
+// cosine similarity in milli, SIGNED in [-1000, 1000]. Unlike `vec_cosine`
+// (which clamps at 0 for the non-negative lexical vectors), HDC vectors are
+// bipolar so anti-correlation is meaningful; near-orthogonal random vectors
+// score ~0. For pure +/-1 vectors both norms are sqrt(D), so this reduces to
+// dot/D, but we compute the norms explicitly to stay correct for raw sums too.
+fn hdc_cosine(a, b) {
+    let n = len(a)
+    if len(b) < n { n = len(b) }
+    let dot = 0
+    let na = 0
+    let nb = 0
+    let i = 0
+    while i < n {
+        let x = a[i]
+        let y = b[i]
+        dot = dot + x * y
+        na = na + x * x
+        nb = nb + y * y
+        i = i + 1
+    }
+    if na == 0 { return 0 }
+    if nb == 0 { return 0 }
+    let denom = isqrt(na) * isqrt(nb)
+    if denom == 0 { return 0 }
+    let neg = 0
+    let adot = dot
+    if adot < 0 { neg = 1; adot = 0 - adot }
+    let c = adot * FP_SCALE / denom
+    if c > FP_SCALE { c = FP_SCALE }
+    if neg == 1 { return 0 - c }
+    return c
+}
+
+// ---- atom encoding --------------------------------------------------------
+// Encode an atom's meaning as the bundle of (relation (x) neighbour) over its
+// edges. Two atoms with the same neighbourhood get near-identical vectors --
+// this is what makes "car" and "automobile" resolve close together even though
+// their spellings (and therefore their `hdc_symbol`s) are unrelated.
+//
+// `edges` is a list of [relation_label, neighbour_label] pairs. The atom's own
+// label is deliberately NOT bundled in: meaning lives in the neighbourhood, and
+// folding the (unique) self-label into every record would push synonyms apart.
+fn hdc_encode_edges(edges) {
+    let bound = list_new()
+    let i = 0
+    while i < len(edges) {
+        let e = edges[i]
+        let rel = hdc_symbol(e[0])
+        let nbr = hdc_symbol(e[1])
+        push(bound, hdc_bind(rel, nbr))
+        i = i + 1
+    }
+    if len(bound) == 0 { return list_new() }
+    return hdc_bundle(bound)
+}
+
+// Encode an atom from its label + edge list. An atom with no edges falls back
+// to its own symbol vector (its only available meaning is its identity).
+fn hdc_encode_atom(label, edges) {
+    if len(edges) == 0 { return hdc_symbol(label) }
+    return hdc_encode_edges(edges)
+}
+
+// ---- live mode re-embedding (ADR-0051 "A live mode switch does not re-embed
+//      existing atoms") --------------------------------------------------------
+// Flipping ATOM_EMBED_MODE only changes how *newly produced* embeds are built;
+// atoms already in a KG keep their old-dimension vectors until something
+// rewrites them. A true runtime cutover walks the KG and re-derives each
+// label-keyed embed under the active mode. These helpers are that walk.
+//
+// Scope: only ATOM_LANG (word) atoms are re-embedded, because only their embed
+// is a pure function of the atom *label* (HDC -> hdc_symbol(label); LEGACY ->
+// the 8-dim lexical hash). Fact/concept atoms derive their embed from their
+// neighbourhood (hdc_encode_atom) or a centroid, so a bare-label re-derivation
+// would be wrong -- those are left untouched and must be rebuilt by their own
+// producer (e.g. concept_promote re-runs the semantic facet). This matches the
+// ADR wording "for word/lang atoms, from the atom label".
+
+// The 8-dim lexical hash, kept byte-identical to word_atoms.word_lexical_vec.
+// hdc_embed.nova cannot import word_atoms (word_atoms imports us -> a cycle),
+// so the canonical formula is mirrored here for the LEGACY re-embed path. If
+// word_lexical_vec ever changes, this mirror must change with it; the LEGACY
+// branch only matters when re-embedding back down from HDC to LEGACY.
+fn _hdc_legacy_lexical_vec(form) {
+    let v = vec_new(ATOM_EMBED_DIMS)
+    let i = 0
+    while i < len(form) {
+        let d = char_at(form, i) % ATOM_EMBED_DIMS
+        vec_set(v, d, vec_get(v, d) + 40)
+        i = i + 1
+    }
+    return v
+}
+
+// The mode-appropriate embed for a word/label, mirroring
+// word_atoms.word_embed_vec but available at this layer so the re-embed walk is
+// self-contained (no reverse import). HDC -> the hypervector; LEGACY -> lexical.
+fn hdc_word_embed(label) {
+    if atom_embed_is_hdc() == 1 { return hdc_symbol(label) }
+    return _hdc_legacy_lexical_vec(label)
+}
+
+// Re-derive one atom's embed from its label under the CURRENT mode. Only acts
+// on ATOM_LANG atoms (see scope note above); returns 1 if the atom was
+// re-embedded, 0 otherwise (non-lang atom, or null). The new vector is written
+// in place with atom_set_embed. NOTE: if the atom's KG has an ANN attached, the
+// caller must rebuild that index afterwards (e.g. kg_rebuild_index) -- this
+// low-level helper deliberately does not reach up into multi_kg_manager.
+fn hdc_reembed_atom(atom) {
+    if atom == 0 { return 0 }
+    if atom_kind(atom) != ATOM_LANG { return 0 }
+    atom_set_embed(atom, hdc_word_embed(atom_label(atom)))
+    return 1
+}
+
+// Re-embed every label-keyed atom in a raw atoms list (the shape kg_atoms(kg)
+// returns -- a list indexed by atom_id, possibly with 0 holes). Returns the
+// number of atoms actually re-embedded. This mirrors ann_rebuild_from_atoms,
+// which also takes the atoms list rather than the KG record to avoid pulling
+// multi_kg_manager into this module's dependency graph.
+fn hdc_reembed_atoms(atoms) {
+    let n = len(atoms)
+    let i = 0
+    let done = 0
+    while i < n {
+        if atoms[i] != 0 {
+            done = done + hdc_reembed_atom(atoms[i])
+        }
+        i = i + 1
+    }
+    return done
+}
+
+// KG-level convenience: re-embed every word atom in a language KG under the
+// active mode. Reads the KG's atoms list directly from its record (the KG_ATOMS
+// slot is index 3 in multi_kg_manager's layout; mirrored here as a literal so
+// this module needs no import of multi_kg_manager). Returns the count
+// re-embedded. Callers holding the atoms list already can use hdc_reembed_atoms.
+let _HDC_KG_ATOMS_SLOT = 3   // == multi_kg_manager KG_ATOMS
+
+fn hdc_reembed_lang_kg(lang_kg) {
+    if lang_kg == 0 { return 0 }
+    return hdc_reembed_atoms(lang_kg[_HDC_KG_ATOMS_SLOT])
+}

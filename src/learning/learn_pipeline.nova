@@ -34,6 +34,9 @@ import "dns_resolver.nova"
 import "../io/transducers/tls13_client.nova"
 import "../language/word_atoms.nova"
 import "../parts/reasoning/reasoning_atoms.nova"
+import "openie.nova"
+import "entity_resolve.nova"
+import "../kg/hdc_embed.nova"
 
 let LP_MAX_BYTES = 262144      // 256 KB is plenty for a knowledge page
 
@@ -230,4 +233,152 @@ fn learn_from_url(url, kg, lang, now) {
     let pp = preprocess_run(body)
     let ing = lp_ingest(kg, lang, pp[0], pp[1], "src:url:" + host, now)
     return _lp_result(LP_OK, ing[0], ing[1], ing[2], http_code, "ok")
+}
+
+// ===========================================================================
+// OpenIE-aware, entity-resolving ingest (ADR-0053 "Honest gaps": wires
+// openie_triples + er_resolve_or_create into the pipeline).
+//
+//   Why a SEPARATE entry point. The original lp_ingest / _lp_ensure_concept
+//   resolve a concept by EXACT label only, which is what fragments the KG
+//   ("car" and "automobile" become two atoms). We must not change that for
+//   the existing fetch path (its callers and tests depend on the exact-match
+//   behaviour), so this is additive: lp_ingest_resolved is a NEW path that
+//   (a) extracts triples with OpenIE (discovered predicates, not the fixed 6),
+//   (b) for every distinct endpoint builds a NEIGHBOURHOOD hypervector from the
+//   triples that mention it and resolves it through er_resolve_or_create BEFORE
+//   any atom is linked -- so spelling-unrelated synonyms that share a
+//   neighbourhood collapse onto ONE canonical atom (the first real consumer of
+//   the P1 HDC layer wired into ingest), then (c) links the RESOLVED endpoints
+//   with the same operator-minting lp_ingest uses.
+//
+//   HDC resolution is only as good as the context it is given and only active
+//   in HDC embed mode (ADR-0051); in LEGACY mode this degrades gracefully to
+//   exact + alias resolution (er_resolve handles both). The caller owns the
+//   embed-mode switch and the alias table.
+// ===========================================================================
+
+// A tiny surface-form -> resolved-atom map, scanned with str_eq. One per
+// ingest call so that repeated mentions of the SAME surface string in one text
+// resolve to the same atom exactly once (and the per-text neighbourhood is the
+// resolution context). Entry = [label, atom].
+fn _lpr_map_new() { return list_new() }
+
+fn _lpr_map_get(m, label) {
+    let i = 0
+    while i < len(m) {
+        if str_eq(m[i][0], label) == 1 { return m[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _lpr_map_put(m, label, atom) {
+    let i = 0
+    while i < len(m) {
+        if str_eq(m[i][0], label) == 1 { list_set(m[i], 1, atom) return 1 }
+        i = i + 1
+    }
+    let e = list_new()
+    push(e, label); push(e, atom)
+    push(m, e)
+    return 1
+}
+
+// Collect the neighbourhood edges for surface mention `name` from the full
+// triple list: when `name` is the SUBJECT of [name, rel, o] -> edge [rel, o];
+// when it is the OBJECT of [s, rel, name] -> edge [rel, s]. Keeping the
+// relation label on both directions means two synonyms that occur in the same
+// role with the same relations/neighbours get the SAME bundle (and thus a
+// near-identical hypervector), which is exactly what lets HDC merge them.
+// `edges` is the [relation_label, neighbour_label] shape hdc_encode_atom wants.
+fn _lpr_edges_for(triples, name) {
+    let edges = list_new()
+    let t = 0
+    while t < len(triples) {
+        let tr = triples[t]
+        if len(tr) >= 3 {
+            let s = tr[0]
+            let rel = tr[1]
+            let o = tr[2]
+            if len(s) > 0 { if len(o) > 0 {
+                if str_eq(s, name) == 1 {
+                    let e = list_new()
+                    push(e, rel); push(e, o)
+                    push(edges, e)
+                }
+                if str_eq(o, name) == 1 {
+                    let e2 = list_new()
+                    push(e2, rel); push(e2, s)
+                    push(edges, e2)
+                }
+            } }
+        }
+        t = t + 1
+    }
+    return edges
+}
+
+// Resolve a single surface mention to a canonical atom, memoised in `m`. On a
+// cache miss it builds the mention's neighbourhood hypervector from `triples`
+// (empty list in LEGACY mode -> er_resolve simply skips the HDC step) and runs
+// er_resolve_or_create, then binds the resolved atom to a word sense (mirrors
+// _lp_ensure_concept). counts = [words, new_atoms] mutable holder. Returns the
+// resolved atom (0 only if name is empty, which the caller guards).
+fn _lpr_resolve(kg, lang, aliases, triples, m, name, counts, now) {
+    let cached = _lpr_map_get(m, name)
+    if cached != 0 { return cached }
+    let mvec = list_new()
+    if atom_embed_is_hdc() == 1 {
+        let edges = _lpr_edges_for(triples, name)
+        mvec = hdc_encode_atom(name, edges)
+    }
+    let res = er_resolve_or_create(kg, aliases, name, mvec, ER_HDC_THRESHOLD, now)
+    let a = res[0]
+    if res[2] == 1 { list_set(counts, 1, counts[1] + 1) }   // new_atoms
+    // Bind a word sense so the resolved concept is reachable from the lexicon,
+    // exactly as _lp_ensure_concept does for the exact-match path.
+    let w = word_intern(lang, name, now)
+    word_add_sense(w, a, 700)
+    list_set(counts, 0, counts[0] + 1)                      // words touched
+    _lpr_map_put(m, name, a)
+    return a
+}
+
+// OpenIE-aware, entity-resolving ingest. Extracts [S,R,O] triples from `text`
+// via OpenIE, resolves every endpoint to a canonical atom (collapsing
+// synonyms in HDC mode) BEFORE linking, then mints one reasoning operator per
+// triple over the RESOLVED endpoints. `aliases` may be 0 (skip the alias step)
+// or an er_aliases_new() table. Returns [words, ops, new_atoms] -- the same
+// shape lp_ingest returns, so callers can treat the two interchangeably.
+fn lp_ingest_resolved(kg, lang, aliases, text, src_label, now) {
+    let triples = openie_triples(text)
+    let m = _lpr_map_new()
+    // counts holder: [words, new_atoms]; ops counted locally.
+    let counts = list_new()
+    push(counts, 0); push(counts, 0)
+    let ops = 0
+
+    let t = 0
+    while t < len(triples) {
+        let tr = triples[t]
+        if len(tr) >= 3 {
+            let s = tr[0]
+            let rel = tr[1]
+            let o = tr[2]
+            if len(s) > 0 { if len(o) > 0 {
+                let sa = _lpr_resolve(kg, lang, aliases, triples, m, s, counts, now)
+                let oa = _lpr_resolve(kg, lang, aliases, triples, m, o, counts, now)
+                let kind = _lp_rel_kind(rel)
+                rop_new(kg, kind, atom_id(sa), atom_id(oa),
+                        src_label + ":" + s + "-" + rel + "->" + o, now)
+                ops = ops + 1
+            } }
+        }
+        t = t + 1
+    }
+
+    let r = list_new()
+    push(r, counts[0]); push(r, ops); push(r, counts[1])
+    return r
 }

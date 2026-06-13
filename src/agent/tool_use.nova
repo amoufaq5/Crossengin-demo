@@ -1,0 +1,244 @@
+// CrossEngin agent: tool-use planning + execution (P4, ADR-0054).
+//
+// Purpose
+//   Turn a goal-decomposed PLAN (a sequence of capability steps) into action.
+//   For each step the planner SELECTS the highest-competence tool for that
+//   capability, GATES it through the permission/reversibility safety layer,
+//   INVOKES the matching effector, THREADS the result into the next step, and
+//   LEARNS from the outcome (success/failure updates the tool's competence, so
+//   a failing tool is selected less next time). Each result is also surfaced as
+//   a lightweight moment in the trace, the seam by which an effector's outcome
+//   re-enters perception / ingestion for deeper learning.
+//
+//   A step can optionally be PRE-SIMULATED first (predict the result before
+//   acting) -- the forward_sim hook; for the deterministic code-exec backend the
+//   prediction is just a dry run. For non-deterministic backends the imagination
+//   forward_sim engine is the predictor, reached through a SEAM (see
+//   tool_presimulate_via_fwd) so tool_use stays light and acyclic.
+//
+//   ADR-0054 "Honest gaps" P4 follow-ups wired here (additive, the original
+//   plan_execute signature and behaviour are unchanged so existing tests are
+//   untouched):
+//     - results-as-moments: plan_execute_moments runs the plan AND captures a
+//       real moment_stream moment per tool result (MODALITY_INTERNAL), the seam
+//       by which an effector outcome re-enters perception / ingestion.
+//     - forward-sim pre-check: tool_presimulate keeps the deterministic
+//       code-exec dry run; tool_presimulate_via_fwd is the forward_sim seam for
+//       the rest (the caller forward-simulates and hands the predicted state in,
+//       because forward_sim predicts atom-id STATE evolution, not a concrete
+//       [ok,value,text] tool result -- see the note on that function).
+//
+// ADRs: ADR-0054 (agentic tooling), ADR-0033 (goal -> plan), ADR-0032
+//   (forward simulation), ADR-0021 (moments). CrossEngin deps: tool.nova + the
+//   four effectors + moment_stream (results-as-moments).
+
+import "../io/effectors/tool.nova"
+import "../io/effectors/effector_code_exec.nova"
+import "../io/effectors/effector_file_ops.nova"
+import "../io/effectors/effector_http_action.nova"
+import "../io/effectors/effector_mcp.nova"
+import "../parts/episodic/moment_stream.nova"
+
+// ---- plan model ------------------------------------------------------------
+// A step names a capability and how to build its argument from the prior step.
+let ARG_LITERAL    = 0   // use the literal
+let ARG_PREV_TEXT  = 1   // prior result text, then append the literal suffix
+let ARG_PREV_VALUE = 2   // prior result integer value, then the literal suffix
+
+let STEP_CAP = 0
+let STEP_SRC = 1
+let STEP_LIT = 2
+
+fn plan_step(capability, arg_source, literal) {
+    let s = list_new()
+    push(s, capability); push(s, arg_source); push(s, literal)
+    return s
+}
+fn plan_new() { return list_new() }
+fn plan_add(plan, step) { push(plan, step); return len(plan) }
+
+// Build a step's argument text from the previous result.
+fn _arg_text(step, prev) {
+    let src = step[STEP_SRC]
+    let lit = step[STEP_LIT]
+    if src == ARG_LITERAL { return lit }
+    if prev == 0 { return lit }
+    if src == ARG_PREV_TEXT { return tr_text(prev) + lit }
+    return int_to_str(tr_value(prev)) + lit
+}
+
+// ---- invocation ------------------------------------------------------------
+// Dispatch a gated tool call to its effector backend.
+fn tool_invoke(tool, arg_text, approved) {
+    let g = tool_gate(tool, approved)
+    if g == TGATE_DENY { return tr_denied() }
+    let k = tool_kind(tool)
+    if k == TOOLK_CODE_EXEC  { return code_exec_run(arg_text) }
+    if k == TOOLK_FILE_WRITE { return file_ops_write(tool_config(tool), arg_text) }
+    if k == TOOLK_FILE_READ  { return file_ops_read(tool_config(tool)) }
+    if k == TOOLK_HTTP       { return http_action_run(arg_text, 1, tool_config(tool)) }
+    if k == TOOLK_MCP        { return mcp_call_direct(tool_config(tool), arg_text, tool_config(tool)) }
+    return tr_new(0, 0, "unknown-tool-kind")
+}
+
+// Pre-simulate a tool call (predict before acting). Deterministic backends
+// (code exec) dry-run -- the prediction IS the result, exactly. Others return an
+// "unknown prediction" marker, the signal to use the forward_sim seam below.
+fn tool_presimulate(tool, arg_text) {
+    if tool_kind(tool) == TOOLK_CODE_EXEC { return code_exec_run(arg_text) }
+    return tr_new(0, 0, "no-prediction")
+}
+
+// Forward-sim pre-check SEAM (ADR-0032 integration point).
+//
+//   Why a seam and not a direct forward_simulate() call here. The imagination
+//   forward_sim engine predicts how a SET OF ACTIVE ATOM IDS evolves under
+//   learned pattern atoms (forward_simulate(ikg, state, steps, min_confidence)
+//   -> a predicted atom-id state). A tool call instead produces a concrete
+//   [ok, value, text] result (e.g. code_exec "6 * 7" -> "42"); forward_sim has
+//   no representation of that value. So forward_sim does not predict a tool
+//   RESULT -- it predicts whether the world-state the tool's effect corresponds
+//   to is REACHABLE/expected. We model that honestly: the caller (which holds
+//   the imagination KG) runs forward_simulate itself and passes the resulting
+//   predicted-state in; this function reports whether the step's "effect atom"
+//   is present in that predicted state. Keeping forward_sim out of tool_use's
+//   import tree also keeps this module light and free of the multi_kg stack
+//   (the same discipline the live-HTTP seam uses).
+//
+//   predicted_state : the atom-id list returned by forward_simulate(...).
+//   effect_atom_id  : the atom id that represents "this step's effect happened".
+// Returns a tool result: ok=1 with text "forward-sim:reachable" if the effect
+// atom is in the predicted state (proceed), ok=0 "forward-sim:unreachable"
+// otherwise (the planner may skip / down-weight the step before acting).
+fn tool_presimulate_via_fwd(predicted_state, effect_atom_id) {
+    let i = 0
+    while i < len(predicted_state) {
+        if predicted_state[i] == effect_atom_id {
+            return tr_new(1, effect_atom_id, "forward-sim:reachable")
+        }
+        i = i + 1
+    }
+    return tr_new(0, 0, "forward-sim:unreachable")
+}
+
+// Surface a result as a lightweight moment [label, ok, text] for the trace /
+// re-ingestion. This is the in-trace shape plan_execute records; the full
+// moment_stream capture is plan_execute_moments below.
+fn _tool_moment(capability, tr) {
+    let m = list_new()
+    push(m, "tool:" + capability)
+    push(m, tr_ok(tr))
+    push(m, tr_text(tr))
+    return m
+}
+
+// Capture a tool result as a REAL moment_stream moment (ADR-0021): an INTERNAL
+// modality perception whose raw text is "tool:<capability>=<result-text>", at
+// logical time `ts`, salient (700) when the call succeeded and low (100) when
+// it failed -- so a failed action is still recorded but ranks low. The moment's
+// origin_part is MODALITY_INTERNAL (the tool layer is an internal effector
+// source). This is the seam by which an effector's outcome re-enters the
+// episodic log for downstream ingestion / consolidation. Returns the moment.
+let TOOL_MOMENT_OK_SAL   = 700
+let TOOL_MOMENT_FAIL_SAL = 100
+
+fn tool_emit_moment(stream, ts, capability, tr) {
+    let sal = TOOL_MOMENT_FAIL_SAL
+    if tr_ok(tr) == 1 { sal = TOOL_MOMENT_OK_SAL }
+    let raw = "tool:" + capability + "=" + tr_text(tr)
+    return ms_capture(stream, ts, MODALITY_INTERNAL, raw, sal, MODALITY_INTERNAL)
+}
+
+// ---- execution -------------------------------------------------------------
+// Execute a plan against a registry. `approved` is the in-the-moment approval
+// for gated actions. Returns [final_result, trace, ok_count]. Stops at the
+// first failed/denied step (the trace records it). Every attempt updates the
+// chosen tool's competence.
+fn plan_execute(registry, plan, approved) {
+    let prev = 0
+    let trace = list_new()
+    let ok_count = 0
+    let i = 0
+    let aborted = 0
+    while i < len(plan) {
+        if aborted == 0 {
+            let step = plan[i]
+            let cap = step[STEP_CAP]
+            let tool = tool_select(registry, cap)
+            if tool == 0 {
+                push(trace, _tool_moment(cap, tr_new(0, 0, "no-tool-for-capability")))
+                aborted = 1
+            } else {
+                let arg = _arg_text(step, prev)
+                let tr = tool_invoke(tool, arg, approved)
+                tool_observe(tool, tr_ok(tr))          // learn from the outcome
+                push(trace, _tool_moment(cap, tr))
+                if tr_ok(tr) == 1 { ok_count = ok_count + 1 prev = tr }
+                else { aborted = 1 }
+            }
+        }
+        i = i + 1
+    }
+    let final_tr = prev
+    if final_tr == 0 { final_tr = tr_new(0, 0, "no-result") }
+    let out = list_new()
+    push(out, final_tr); push(out, trace); push(out, ok_count)
+    return out
+}
+
+fn plan_result(out)  { return out[0] }
+fn plan_trace(out)   { return out[1] }
+fn plan_ok_count(out){ return out[2] }
+
+// As plan_execute, but ALSO capture every tool result into `stream` as a real
+// moment_stream moment (tool_emit_moment), advancing a logical clock from
+// `start_ts` (one tick per step) so the moments are ordered and monotonic.
+// This is the ADR-0054 "results are lightweight trace moments, not emitted into
+// moment_stream" gap closed: an effector outcome now enters the episodic log.
+//
+// Behaviour matches plan_execute exactly (same selection / gate / invoke /
+// thread / competence-update / abort-on-first-failure), so it is a strict
+// superset; plan_execute is left untouched for the existing tests. Returns
+// [final_result, trace, ok_count, moments] -- positions 0..2 identical to
+// plan_execute (plan_result/plan_trace/plan_ok_count all still apply), with the
+// captured moment list at position 3 (plan_moments). The "no-tool" abort step
+// is also emitted as a (failed) moment so the episodic log is complete.
+fn plan_execute_moments(registry, plan, approved, stream, start_ts) {
+    let prev = 0
+    let trace = list_new()
+    let moments = list_new()
+    let ok_count = 0
+    let ts = start_ts
+    let i = 0
+    let aborted = 0
+    while i < len(plan) {
+        if aborted == 0 {
+            let step = plan[i]
+            let cap = step[STEP_CAP]
+            let tool = tool_select(registry, cap)
+            if tool == 0 {
+                let miss = tr_new(0, 0, "no-tool-for-capability")
+                push(trace, _tool_moment(cap, miss))
+                push(moments, tool_emit_moment(stream, ts, cap, miss))
+                aborted = 1
+            } else {
+                let arg = _arg_text(step, prev)
+                let tr = tool_invoke(tool, arg, approved)
+                tool_observe(tool, tr_ok(tr))          // learn from the outcome
+                push(trace, _tool_moment(cap, tr))
+                push(moments, tool_emit_moment(stream, ts, cap, tr))
+                if tr_ok(tr) == 1 { ok_count = ok_count + 1 prev = tr }
+                else { aborted = 1 }
+            }
+            ts = ts + 1
+        }
+        i = i + 1
+    }
+    let final_tr = prev
+    if final_tr == 0 { final_tr = tr_new(0, 0, "no-result") }
+    let out = list_new()
+    push(out, final_tr); push(out, trace); push(out, ok_count); push(out, moments)
+    return out
+}
+
+fn plan_moments(out) { return out[3] }

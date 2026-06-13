@@ -17,19 +17,31 @@
 //   NOVA enhancement #5; the substrate's per-tick semantics are complete here.
 //
 // ADRs implemented: ADR-0006 (xnode_tick orchestration), ADR-0001 (tick-driven
-//   substrate). Depends-on note: SIMD-batched propagation across millions of
+//   substrate), ADR-0052 (opt-in three-factor / predictive-coding pass).
+//   Depends-on note: SIMD-batched propagation across millions of
 //   synapses is enhancement #4; this scalar pass is correct now.
 // NOVA dependencies: builtins (lists).
 // CrossEngin dependencies: src/substrate/part_registry.nova,
-//   src/substrate/synapse_graph.nova, src/substrate/node_pool_manager.nova.
+//   src/substrate/synapse_graph.nova, src/substrate/node_pool_manager.nova,
+//   src/learning/predictive_coding_runtime.nova (neuromod scalar + adaptive
+//   predictor, three-factor pass only), src/parts/emotion/appraisal.nova
+//   (valence -> signed reward, three-factor convenience only).
 
 import "part_registry.nova"
 import "synapse_graph.nova"
 import "node_pool_manager.nova"
+import "../learning/predictive_coding_runtime.nova"
+import "../parts/emotion/appraisal.nova"
 
 let TD_SPIKE       = 1000   // 1.0 spike output of a fired node (FP_ONE)
 let TD_MOD_NEUTRAL = 1000   // 1.0 neutral plasticity modulator
 let TD_ENG_TAG     = 1010
+
+// Three-factor pass tuning (ADR-0052). The adaptive predictor, when run for the
+// prediction-error term, uses these defaults; callers may bypass it and pass an
+// explicit pred_error/surprise instead.
+let TD_PC_PRECISION = 1000  // 1.0 precision when scoring predictor error
+let TD_PC_LR        = 200   // 0.2 delta-rule learning rate of the predictor
 
 // Execute one tick over a single part object. Returns the number of nodes that
 // fired this tick.
@@ -86,6 +98,94 @@ fn _td_exec(part, tick, modulator, error) {
     return len(fired)
 }
 
+// ===========================================================================
+// Three-factor / predictive-coding pass (P2, ADR-0052) -- OPT-IN, ADDITIVE.
+//
+// The default tick (`_td_exec` above) runs the fused two-factor Hebbian rule and
+// is unchanged. This section adds the delayed-credit-assignment machinery from
+// ADR-0052 as a SEPARATE, opt-in pass: eligibility deposit from a per-node
+// fire-tick snapshot, a single broadcast neuromodulator (reward / prediction
+// error / surprise), then eligibility decay. Nothing here runs unless a caller
+// explicitly invokes a `*_3f` entry point or `tick_three_factor_pass` directly.
+// ---------------------------------------------------------------------------
+
+// Build a per-node fire-tick snapshot for a pool over [0, cap): entry `i` is
+// node i's most-recent fire tick (npm_last_fired), or -1 if it has never fired
+// (also -1 for dead/empty slots). This is exactly the list `syn_eligibility_step`
+// consumes. Built AFTER the integrate phase, so a node that fired THIS tick
+// reports the current tick -- the co-firing the trace must capture.
+fn td_fire_snapshot(pool, cap) {
+    let ft = list_new()
+    let i = 0
+    while i < cap {
+        if npm_node_is_live(pool, i) == 1 {
+            push(ft, npm_last_fired(pool, i))
+        } else {
+            push(ft, -1)
+        }
+        i = i + 1
+    }
+    return ft
+}
+
+// The standalone three-factor pass over a synapse graph `g`, given a per-node
+// fire-tick snapshot. Runs the full ADR-0052 sequence:
+//   (1) syn_eligibility_step  -- STDP-shaped eligibility deposit from co-firing
+//   (2) pc_neuromod_scalar    -- collapse reward/pred_error/surprise to a signed
+//                                broadcast scalar (the third factor)
+//   (3) syn_neuromodulate     -- move every weight by eta_3f * neuromod * elig
+//   (4) syn_decay_eligibility -- the trace decays so old credit fades
+// This is the clean seam the live loop invokes; it is also directly callable by
+// tests and other learning machinery. `reward` is a signed milli scalar (from
+// XSIG_REWARD or emotion_valence_signed); `pred_error`/`surprise` amplify
+// salience and may be 0 when no predictor is run. Returns the neuromod scalar
+// that was applied (0 means "no weight moved this pass").
+fn tick_three_factor_pass(g, fire_tick, reward, pred_error, surprise) {
+    syn_eligibility_step(g, fire_tick)
+    let neuromod = pc_neuromod_scalar(reward, pred_error, surprise)
+    syn_neuromodulate(g, neuromod)
+    syn_decay_eligibility(g)
+    return neuromod
+}
+
+// Convenience: a reward-only three-factor pass (no predictor term). Equivalent
+// to tick_three_factor_pass(g, fire_tick, reward, 0, 0).
+fn tick_three_factor_reward(g, fire_tick, reward) {
+    return tick_three_factor_pass(g, fire_tick, reward, 0, 0)
+}
+
+// Convenience: derive the reward from an OCC appraisal (desirability, praise,
+// appeal -> valence -> signed reward) and run the reward-only pass. Keeps the
+// substrate free of an emotion dependency at the *default* tick path while
+// letting an opt-in caller wire appraisal -> three-factor in one call.
+fn tick_three_factor_appraised(g, fire_tick, desirability, praise, appeal) {
+    let appr = emotion_appraise(desirability, praise, appeal)
+    let reward = emotion_valence_signed(appraisal_valence(appr))
+    return tick_three_factor_pass(g, fire_tick, reward, 0, 0)
+}
+
+// Run the three-factor pass over one part: snapshot its fire ticks (over its
+// capacity) and apply the pass to its synapse graph. Returns the neuromod
+// applied. Used by the opt-in exec path and callable on its own.
+fn td_part_three_factor(part, reward, pred_error, surprise) {
+    let pool = part_pool(part)
+    let g = part_syn(part)
+    let cap = part_capacity(part)
+    let ft = td_fire_snapshot(pool, cap)
+    return tick_three_factor_pass(g, ft, reward, pred_error, surprise)
+}
+
+// Opt-in tick: run the standard four-phase tick, then the three-factor pass over
+// the SAME within-tick fire snapshot. This is the in-loop wiring -- it is the
+// default `_td_exec` followed by `td_part_three_factor`, and is reached only via
+// a `*_3f` entry point. Returns the number of nodes that fired this tick (same
+// contract as `_td_exec`, so callers can swap paths transparently).
+fn _td_exec_3f(part, tick, modulator, error, reward, pred_error, surprise) {
+    let fired = _td_exec(part, tick, modulator, error)
+    td_part_three_factor(part, reward, pred_error, surprise)
+    return fired
+}
+
 // Tick a single part by id at an explicit tick number. Inactive or unknown
 // parts are skipped (return 0).
 fn td_tick_part(reg, part_id, tick, modulator, error) {
@@ -110,16 +210,54 @@ fn td_tick_all(reg, tick, modulator, error) {
     return total
 }
 
+// ---- opt-in three-factor tick entry points (ADR-0052) ---------------------
+// Mirrors td_tick_part / td_tick_all but runs the additional three-factor pass.
+// A single broadcast reward/pred_error/surprise is applied to every ticked part
+// (the neuromodulator is a global signal by design). Default callers never reach
+// these; they exist so the live loop CAN opt in without touching the default path.
+
+// Tick a single part by id, then run the three-factor pass over it.
+fn td_tick_part_3f(reg, part_id, tick, modulator, error, reward, pred_error, surprise) {
+    let part = registry_get(reg, part_id)
+    if part == 0 { return 0 }
+    if part_is_alive(part) == 0 { return 0 }
+    return _td_exec_3f(part, tick, modulator, error, reward, pred_error, surprise)
+}
+
+// Tick every active part, then run the three-factor pass over each. Returns
+// total nodes fired.
+fn td_tick_all_3f(reg, tick, modulator, error, reward, pred_error, surprise) {
+    let total = 0
+    let ids = registry_ids(reg)
+    let i = 0
+    while i < len(ids) {
+        let part = registry_get(reg, ids[i])
+        if part_is_alive(part) == 1 {
+            total = total + _td_exec_3f(part, tick, modulator, error, reward, pred_error, surprise)
+        }
+        i = i + 1
+    }
+    return total
+}
+
 // ---- logical clock --------------------------------------------------------
+let TD_ENG_3F = 3   // engine slot: three-factor enabled flag (0 == OFF default)
+
 fn td_engine_new(reg) {
     let e = list_new()
     push(e, TD_ENG_TAG)
     push(e, reg)
     push(e, 0)
+    push(e, 0)            // TD_ENG_3F: three-factor pass OFF by default
     return e
 }
 
 fn td_now(e) { return e[2] }
+
+// Three-factor enable flag (opt-in). Read with td_three_factor_enabled; toggle
+// with td_enable_three_factor(e, 1). Off by default -> td_step is unchanged.
+fn td_three_factor_enabled(e) { return e[TD_ENG_3F] }
+fn td_enable_three_factor(e, on) { list_set(e, TD_ENG_3F, on); return on }
 
 // Advance the clock by one and tick all active parts. Returns nodes fired.
 fn td_step(e, modulator, error) {
@@ -141,6 +279,44 @@ fn td_run(e, n, modulator, error) {
     let k = 0
     while k < n {
         total = total + td_step(e, modulator, error)
+        k = k + 1
+    }
+    return total
+}
+
+// ---- opt-in three-factor clock steps (ADR-0052) ---------------------------
+// Same clock semantics as td_step / td_run, but each tick also runs the
+// three-factor pass with the supplied broadcast reward/pred_error/surprise.
+// These honour the engine's enable flag: if three-factor is OFF, they fall back
+// to the plain path so a caller can flip behaviour with one toggle and a value
+// of 0 for the neuromod components is inert regardless.
+
+// Advance the clock and tick all active parts with the three-factor pass.
+fn td_step_3f(e, modulator, error, reward, pred_error, surprise) {
+    let t = e[2] + 1
+    list_set(e, 2, t)
+    if e[TD_ENG_3F] == 0 {
+        return td_tick_all(e[1], t, modulator, error)
+    }
+    return td_tick_all_3f(e[1], t, modulator, error, reward, pred_error, surprise)
+}
+
+// Advance the clock and tick a single part with the three-factor pass.
+fn td_step_part_3f(e, part_id, modulator, error, reward, pred_error, surprise) {
+    let t = e[2] + 1
+    list_set(e, 2, t)
+    if e[TD_ENG_3F] == 0 {
+        return td_tick_part(e[1], part_id, t, modulator, error)
+    }
+    return td_tick_part_3f(e[1], part_id, t, modulator, error, reward, pred_error, surprise)
+}
+
+// Run n three-factor steps over all active parts; returns total nodes fired.
+fn td_run_3f(e, n, modulator, error, reward, pred_error, surprise) {
+    let total = 0
+    let k = 0
+    while k < n {
+        total = total + td_step_3f(e, modulator, error, reward, pred_error, surprise)
         k = k + 1
     }
     return total

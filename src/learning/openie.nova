@@ -1,0 +1,411 @@
+// CrossEngin learning: Open Information Extraction (P3, ADR-0053).
+//
+// Purpose
+//   preprocess.nova anchors triples on a fixed 6-relation vocabulary
+//   (is_a / has_property / causes / part_of / defined_as). That misses most of
+//   what a sentence asserts. OpenIE instead DISCOVERS the predicate: it finds a
+//   (subject, verb, object) skeleton and keeps the verb itself as the relation,
+//   then captures trailing prepositional phrases as n-ary arguments (role ->
+//   value), which is where who-did-what-to-whom-WHEN/WHERE (event structure)
+//   lives.
+//
+//   "Einstein discovered relativity in 1905."
+//      -> fact(einstein, discovered, relativity, [[in, 1905]])
+//      -> triples (einstein, discovered, relativity), (einstein, discovered_in, 1905)
+//
+//   This is a shallow, heuristic parser (no full dependency parse): subject =
+//   the content run before the first verb, predicate = that verb (copulas
+//   normalised to is_a), object = the content run after it up to a preposition,
+//   then (preposition, noun-phrase) tails. Precision over recall -- garbage
+//   triples poison the KG -- so a fact must have a subject, a predicate, and
+//   either an object or at least one prepositional argument.
+//
+// ADRs implemented: ADR-0053 (ingestion / OpenIE). NOVA dependencies: builtins.
+//   CrossEngin dependencies: src/learning/preprocess.nova (sentence splitting,
+//   stopword set, NP bound).
+
+import "preprocess.nova"
+
+let OIE_NP_MAX = 3   // max words in a noun-phrase chunk
+
+// fact = [subject, predicate, object, args, polarity, coords].
+//   args     = list of [role, value] prepositional tails.
+//   polarity = +1 asserted, -1 negated ("X is not Y") -- carried, never silently
+//              dropped (N3); downstream decides (the ingest path skips negatives).
+//   coords   = additional coordinated objects ("X has A and B" -> coords=[B]).
+fn oie_fact(s, p, o, args, polarity, coords) {
+    let f = list_new()
+    push(f, s); push(f, p); push(f, o); push(f, args); push(f, polarity); push(f, coords)
+    return f
+}
+fn oie_subject(f)   { return f[0] }
+fn oie_predicate(f) { return f[1] }
+fn oie_object(f)    { return f[2] }
+fn oie_args(f)      { return f[3] }
+fn oie_polarity(f)  { return f[4] }
+fn oie_coords(f)    { return f[5] }
+fn oie_is_negated(f) {
+    if f[4] < 0 { return 1 }
+    return 0
+}
+
+// ---- token classification --------------------------------------------------
+fn _oie_ends(t, suf) {
+    let lt = len(t)
+    let ls = len(suf)
+    if lt < ls { return 0 }
+    let i = 0
+    while i < ls {
+        if char_at(t, lt - ls + i) != char_at(suf, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _oie_in_set(t, lst) {
+    let i = 0
+    while i < len(lst) {
+        if str_eq(t, lst[i]) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+let _OIE_LINK = 0      // lazily-built small word sets
+let _OIE_AUX  = 0
+let _OIE_PREP = 0
+let _OIE_VERB = 0
+
+fn _oie_words(csv) {
+    // build a list from a space-separated string (avoids 16-key map cap).
+    let out = list_new()
+    let n = len(csv)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(csv, i) == 32 {
+            if i > start { push(out, substr(csv, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if n > start { push(out, substr(csv, start, n - start)) }
+    return out
+}
+
+fn _oie_ensure_sets() {
+    if _OIE_LINK == 0 { _OIE_LINK = _oie_words("is are was were be been being am") }
+    if _OIE_AUX == 0  { _OIE_AUX  = _oie_words("has have had do does did can could will would shall should may might must") }
+    if _OIE_PREP == 0 { _OIE_PREP = _oie_words("to in on at with by from of for into about as over under through during between against") }
+    if _OIE_VERB == 0 { _OIE_VERB = _oie_words("orbits orbit cause causes contain contains produce produces make makes use uses include includes affect affects emit emits absorb absorbs require requires") }
+    return 1
+}
+
+let _OIE_NEG = 0
+fn _oie_is_neg(t) {
+    if _OIE_NEG == 0 { _OIE_NEG = _oie_words("not no never cannot nor none") }
+    return _oie_in_set(t, _OIE_NEG)
+}
+
+// Subject pronouns, for intra-text coreference (N3): a sentence opening with one
+// of these refers back to the previous sentence's subject.
+let _OIE_PRON = 0
+fn _oie_is_pronoun(t) {
+    if _OIE_PRON == 0 { _OIE_PRON = _oie_words("it its they them their he she him her his") }
+    return _oie_in_set(t, _OIE_PRON)
+}
+
+// Coordinating conjunctions that split a coordinated object ("A and B").
+let _OIE_COORD = 0
+fn _oie_is_coord(t) {
+    if _OIE_COORD == 0 { _OIE_COORD = _oie_words("and or") }
+    return _oie_in_set(t, _OIE_COORD)
+}
+
+fn _oie_is_linking(t) { _oie_ensure_sets() return _oie_in_set(t, _OIE_LINK) }
+fn _oie_is_aux(t)     { _oie_ensure_sets() return _oie_in_set(t, _OIE_AUX) }
+fn _oie_is_prep(t)    { _oie_ensure_sets() return _oie_in_set(t, _OIE_PREP) }
+
+// Is `t` a likely verb (the discovered predicate)? Linking/aux verbs, the
+// -ed / -ing inflections (high precision), a small action-verb lexicon, and
+// finally the noisier -s / -es ending as a fallback.
+fn _oie_is_verb(t) {
+    if _oie_is_linking(t) == 1 { return 1 }
+    if _oie_is_aux(t) == 1 { return 1 }
+    if len(t) > 3 { if _oie_ends(t, "ed") == 1 { return 1 } }
+    if len(t) > 4 { if _oie_ends(t, "ing") == 1 { return 1 } }
+    _oie_ensure_sets()
+    if _oie_in_set(t, _OIE_VERB) == 1 { return 1 }
+    if len(t) > 3 { if _oie_ends(t, "es") == 1 { return 1 } }
+    if len(t) > 3 { if _oie_ends(t, "s") == 1 { return 1 } }
+    return 0
+}
+
+// alnum tokenizer (keeps numbers, e.g. years), lowercased.
+fn _oie_tokens(sentence) {
+    let out = list_new()
+    let s = str_lower(sentence)
+    let n = len(s)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        let alnum = 0
+        if c >= 97 { if c <= 122 { alnum = 1 } }   // a-z
+        if c >= 48 { if c <= 57 { alnum = 1 } }    // 0-9
+        if alnum == 1 {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 { push(out, substr(s, start, i - start)) start = 0 - 1 }
+        }
+        i = i + 1
+    }
+    if start >= 0 { push(out, substr(s, start, n - start)) }
+    return out
+}
+
+fn _oie_is_skip(t) {
+    if preprocess_is_stopword(t) == 1 { return 1 }
+    return 0
+}
+
+// Join a content run [from..to] (inclusive) into an NP, bounded by NP_MAX.
+fn _oie_np(toks, from, to) {
+    let s = ""
+    let cnt = 0
+    let i = from
+    while i <= to {
+        if cnt >= OIE_NP_MAX { i = to + 1 } else {
+            if len(s) == 0 { s = toks[i] } else { s = s + "_" + toks[i] }
+            cnt = cnt + 1
+            i = i + 1
+        }
+    }
+    return s
+}
+
+// First index >= from that is not a stopword (n if none). Used to find the
+// SUBJECT head, where leading prepositions/determiners are all skippable.
+fn _oie_next_content(toks, n, from) {
+    let i = from
+    while i < n {
+        if _oie_is_skip(toks[i]) == 0 { return i }
+        i = i + 1
+    }
+    return n
+}
+
+let _OIE_DET = 0
+fn _oie_is_det(t) {
+    if _OIE_DET == 0 { _OIE_DET = _oie_words("a an the this that these those its their his her our your my no some any each every") }
+    return _oie_in_set(t, _OIE_DET)
+}
+
+// First index >= from skipping ONLY determiners (n if none). Used for the
+// object head and prepositional-argument heads, so a preposition immediately
+// after the verb is detected (intransitive) rather than silently skipped as a
+// stopword -- that is what preserves the n-ary "at 100 degrees" argument.
+fn _oie_skip_det(toks, n, from) {
+    let i = from
+    while i < n {
+        if _oie_is_det(toks[i]) == 0 { return i }
+        i = i + 1
+    }
+    return n
+}
+
+// Last index of the content run starting at `start`, stopping before the first
+// preposition or stopword.
+fn _oie_run_end(toks, n, start) {
+    let end = start
+    let k = start + 1
+    let go = 1
+    while go == 1 {
+        if k >= n { go = 0 }
+        else { if _oie_is_prep(toks[k]) == 1 { go = 0 }
+        else { if _oie_is_skip(toks[k]) == 1 { go = 0 }
+        else { end = k k = k + 1 } } }
+    }
+    return end
+}
+
+// Extract a single fact from one sentence (or 0 if none found). `prev_subject`
+// is the previous sentence's subject for pronoun coreference ("" to disable):
+// a sentence opening with a subject pronoun ("It is hot") adopts it.
+fn openie_extract_ctx(sentence, prev_subject) {
+    let toks = _oie_tokens(sentence)
+    let n = len(toks)
+    if n < 2 { return 0 }
+
+    // ---- subject (with leading-pronoun coreference) -----------------------
+    // A sentence that opens with a subject pronoun and has an antecedent takes
+    // that antecedent as its subject; the verb is then sought after the pronoun.
+    let coref = 0
+    if _oie_is_pronoun(toks[0]) == 1 { if len(prev_subject) > 0 { coref = 1 } }
+
+    let subj_start = 0
+    let subject = ""
+    if coref == 1 {
+        subject = prev_subject
+        subj_start = 0
+    } else {
+        subj_start = _oie_next_content(toks, n, 0)
+        if subj_start >= n { return 0 }
+    }
+
+    // predicate = first verb-like token strictly after the subject start.
+    let vi = 0 - 1
+    let j = subj_start + 1
+    while j < n {
+        if _oie_is_verb(toks[j]) == 1 { vi = j j = n } else { j = j + 1 }
+    }
+    if vi < 0 { return 0 }
+
+    // subject NP (skip for coref -- the antecedent is already a finished NP).
+    if coref == 0 {
+        let subj_end = vi - 1
+        let trimming = 1
+        while trimming == 1 {
+            if subj_end <= subj_start { trimming = 0 }
+            else { if _oie_is_skip(toks[subj_end]) == 1 { subj_end = subj_end - 1 } else { trimming = 0 } }
+        }
+        subject = _oie_np(toks, subj_start, subj_end)
+        if len(subject) == 0 { return 0 }
+    }
+
+    // predicate: copulas -> is_a; a leading aux hands off to the next verb.
+    // Negation between the verb/aux and the object is CARRIED as polarity (N3),
+    // not dropped: "X is not Y" / "X does not eat Y" still yield a fact, tagged
+    // negative, so the relation isn't silently lost.
+    let pred = toks[vi]
+    let after = vi + 1
+    let polarity = 1
+    if _oie_is_linking(toks[vi]) == 1 {
+        pred = "is_a"
+        if after < n { if _oie_is_neg(toks[after]) == 1 { polarity = 0 - 1 after = after + 1 } }
+    } else { if _oie_is_aux(toks[vi]) == 1 {
+        if after < n { if _oie_is_neg(toks[after]) == 1 { polarity = 0 - 1 after = after + 1 } }
+        if after < n { if _oie_is_verb(toks[after]) == 1 { pred = toks[after] after = after + 1 } }
+    } }
+
+    // object = the content run after the verb, unless a preposition comes first
+    // (then it is intransitive and the prepositional tail carries the args). A
+    // negation right at the object head is also carried as polarity.
+    let oi = _oie_skip_det(toks, n, after)
+    let neg_go = 1
+    while neg_go == 1 {
+        if oi < n { if _oie_is_neg(toks[oi]) == 1 {
+            polarity = 0 - 1
+            oi = _oie_skip_det(toks, n, oi + 1)
+        } else { neg_go = 0 } } else { neg_go = 0 }
+    }
+    let object = ""
+    let scan = oi
+    if oi < n { if _oie_is_prep(toks[oi]) == 0 {
+        let oend = _oie_run_end(toks, n, oi)
+        object = _oie_np(toks, oi, oend)
+        scan = oend + 1
+    } }
+
+    // coordinated objects: "... A and B (and C)" -> primary A, coords [B, C].
+    let coords = list_new()
+    let cgo = 1
+    while cgo == 1 {
+        if scan >= n { cgo = 0 }
+        else { if _oie_is_coord(toks[scan]) == 1 {
+            let cstart = _oie_skip_det(toks, n, scan + 1)
+            let took = 0
+            if cstart < n { if _oie_is_prep(toks[cstart]) == 0 { if _oie_is_neg(toks[cstart]) == 0 {
+                let cend = _oie_run_end(toks, n, cstart)
+                let cnp = _oie_np(toks, cstart, cend)
+                if len(cnp) > 0 { push(coords, cnp) scan = cend + 1 took = 1 }
+            } } }
+            if took == 0 { cgo = 0 }
+        } else { cgo = 0 } }
+    }
+
+    // n-ary args: (preposition, noun-phrase) tails.
+    let args = list_new()
+    let p = scan
+    while p < n {
+        if _oie_is_prep(toks[p]) == 1 {
+            let role = toks[p]
+            let astart = _oie_skip_det(toks, n, p + 1)
+            if astart < n { if _oie_is_prep(toks[astart]) == 0 {
+                let aend = _oie_run_end(toks, n, astart)
+                let pair = list_new()
+                push(pair, role); push(pair, _oie_np(toks, astart, aend))
+                push(args, pair)
+                p = aend + 1
+            } else { p = p + 1 } } else { p = n }
+        } else { p = p + 1 }
+    }
+
+    // confidence gate: need a subject + predicate + (object or >=1 arg).
+    if len(object) == 0 { if len(args) == 0 { return 0 } }
+    return oie_fact(subject, pred, object, args, polarity, coords)
+}
+
+// Single-sentence extraction with no coreference context (the standalone API).
+fn openie_extract(sentence) {
+    return openie_extract_ctx(sentence, "")
+}
+
+// Extract facts across an entire text (HTML/plain). One fact per sentence max.
+// Threads the last subject so a pronoun-led sentence corefers to it (N3).
+fn openie_run(text) {
+    let plain = preprocess_strip_html(text)
+    let sents = preprocess_split_sentences(plain)
+    let facts = list_new()
+    let last_subj = ""
+    let i = 0
+    while i < len(sents) {
+        let f = openie_extract_ctx(sents[i], last_subj)
+        if f != 0 { push(facts, f) last_subj = oie_subject(f) }
+        i = i + 1
+    }
+    return facts
+}
+
+// Flatten facts into [S, R, O] triples for the ingest path (lp_ingest): the
+// core (subject, predicate, object) plus one (subject, predicate_role, value)
+// per n-ary argument (the discovered composite predicate carries the role).
+fn openie_triples(text) {
+    let facts = openie_run(text)
+    let triples = list_new()
+    let i = 0
+    while i < len(facts) {
+        let f = facts[i]
+        // KG safety: a negated fact ("X is not Y") must not assert (X, R, Y), so
+        // it emits no positive triple. The polarity survives on the fact itself
+        // (openie_run) for any consumer that wants to record the negation.
+        if oie_is_negated(f) == 0 {
+            if len(oie_object(f)) > 0 {
+                let t = list_new()
+                push(t, oie_subject(f)); push(t, oie_predicate(f)); push(t, oie_object(f))
+                push(triples, t)
+            }
+            // coordinated objects share the subject + predicate.
+            let coords = oie_coords(f)
+            let c = 0
+            while c < len(coords) {
+                let tc = list_new()
+                push(tc, oie_subject(f)); push(tc, oie_predicate(f)); push(tc, coords[c])
+                push(triples, tc)
+                c = c + 1
+            }
+            let args = oie_args(f)
+            let j = 0
+            while j < len(args) {
+                let t2 = list_new()
+                push(t2, oie_subject(f))
+                push(t2, oie_predicate(f) + "_" + args[j][0])
+                push(t2, args[j][1])
+                push(triples, t2)
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return triples
+}
