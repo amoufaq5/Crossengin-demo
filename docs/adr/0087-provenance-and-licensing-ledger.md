@@ -132,3 +132,31 @@ emitted claim can be walked back to its sources and licenses on demand.
   an `EMPIRICAL_STRONG` one at equal tier.
 - DEPENDS ON: NOVA enhancement #8 (multi-KG namespacing for `KG-licenses`/
   `KG-proofs`), #9 (audit log). No new arithmetic enhancement required.
+
+## Implementation status
+
+**Increment 1 (landed): the in-memory ledger schema.** `src/kg/atom_store.nova`
+extends the atom `A_PROV` slot from the ADR-0029 `[source_tier, producing_part]`
+pair to the full ADR-0087 ledger `[source_tier, producing_part, license,
+evidence_grade, source_timestamp, proof_ref]`. The extension is
+backward-compatible: indices 0,1 keep their meaning, and accessors are defensive
+(`_prov_get`) so a short provenance written by older code — e.g.
+`kg_rss_ingest` — still reads, returning safe defaults; `_prov_ensure` upgrades a
+short list in place when any new field is set. Added: evidence-grade constants
+(`GRADE_FORMAL`/`EMPIRICAL_STRONG`/`EMPIRICAL_WEAK`/`TESTIMONIAL`/`CONTESTED`),
+license codes (`LICENSE_UNKNOWN`/`OWNER`/`OPEN`), accessors and setters
+(`atom_license`, `atom_evidence_grade`, `atom_proof_ref`, `atom_set_provenance`,
+…), the FORMAL-requires-a-proof invariant (`atom_grade_consistent`), and the
+clean/quarantine gate (`atom_is_clean`: `LICENSE_UNKNOWN` → not clean).
+
+Verified by `tests/unit/test_atom_store.nova` (now 66 checks, up from 42;
+compiled and run via the bootstrap): defaults, full-ledger set/read, grade
+naming, the FORMAL/proof invariant, the cleanliness gate, and backward
+compatibility with an old 2-element provenance.
+
+**Scope still open:** core-atom provenance is still not serialized in the
+snapshot format (`snapshot_disk.nova` `kg_section_build` omits `A_PROV`; episodic
+provenance already persists) — persisting the ledger needs a snapshot-format
+version bump and is the next sub-increment. The `KG-licenses` / `KG-proofs` KGs,
+ingestion-time license resolution, and the belief grade-multiplier (ADR-0023
+integration) also remain follow-on work.
