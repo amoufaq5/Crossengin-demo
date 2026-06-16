@@ -154,9 +154,30 @@ compiled and run via the bootstrap): defaults, full-ledger set/read, grade
 naming, the FORMAL/proof invariant, the cleanliness gate, and backward
 compatibility with an old 2-element provenance.
 
-**Scope still open:** core-atom provenance is still not serialized in the
-snapshot format (`snapshot_disk.nova` `kg_section_build` omits `A_PROV`; episodic
-provenance already persists) — persisting the ledger needs a snapshot-format
-version bump and is the next sub-increment. The `KG-licenses` / `KG-proofs` KGs,
-ingestion-time license resolution, and the belief grade-multiplier (ADR-0023
-integration) also remain follow-on work.
+**Increment 2 (landed): snapshot persistence.** The ledger now survives a
+restart. `snapshot_disk.nova` carries provenance through the full round trip: the
+per-atom record gains six trailing fields (`kg_section_build_r`); they serialize
+as `kgs.atoms[N].prov.{tier,part,license,grade,ts,proof}` keys, emitted only when
+non-default to keep snapshots compact (`kg_section_serialize`); the parser reads
+them back into the record and `_ensure_records` pre-allocates the slots; and
+`kg_section_apply` restores them onto the rehydrated atom via
+`atom_set_provenance`. The change is additive and backward-compatible — an old
+snapshot with no `prov.*` keys rehydrates with the atom's `atom_new` defaults
+(unresolved license → quarantine on the clean-build gate).
+
+*Verification note (environment limitation).* The change is verified at unit
+scale: the `atom_store` suite stays green (66 checks), and a direct
+`kg_section_build_r → kg_section_apply` round-trip over the full `snapshot_disk`
+graph correctly restores `tier`, `license`, `evidence_grade`, and
+`source_timestamp`. It is **not** fully runtime-verified end-to-end in this
+environment: the only available NOVA compiler is the bootstrap (the self-host
+build segfaults here, a pre-existing issue), and the bootstrap mis-generates code
+for the ~19k-line snapshot program — the `proof_ref` field reads back as garbage
+and `snap_to_text` segfaults, *even on the baseline `test_snapshot_disk` before
+this change*. Identical provenance logic passes at small scale, so these are
+bootstrap-at-scale codegen defects, not logic errors. Full end-to-end
+verification (the text round trip and `proof_ref`) needs a working `bin/nova`.
+
+**Scope still open:** the `KG-licenses` / `KG-proofs` KGs, ingestion-time license
+resolution, and the belief grade-multiplier (ADR-0023 integration) remain
+follow-on work.
