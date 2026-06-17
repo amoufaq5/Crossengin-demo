@@ -165,18 +165,23 @@ them back into the record and `_ensure_records` pre-allocates the slots; and
 snapshot with no `prov.*` keys rehydrates with the atom's `atom_new` defaults
 (unresolved license → quarantine on the clean-build gate).
 
-*Verification note (environment limitation).* The change is verified at unit
-scale: the `atom_store` suite stays green (66 checks), and a direct
-`kg_section_build_r → kg_section_apply` round-trip over the full `snapshot_disk`
-graph correctly restores `tier`, `license`, `evidence_grade`, and
-`source_timestamp`. It is **not** fully runtime-verified end-to-end in this
-environment: the only available NOVA compiler is the bootstrap (the self-host
-build segfaults here, a pre-existing issue), and the bootstrap mis-generates code
-for the ~19k-line snapshot program — the `proof_ref` field reads back as garbage
-and `snap_to_text` segfaults, *even on the baseline `test_snapshot_disk` before
-this change*. Identical provenance logic passes at small scale, so these are
-bootstrap-at-scale codegen defects, not logic errors. Full end-to-end
-verification (the text round trip and `proof_ref`) needs a working `bin/nova`.
+*Verification.* Verified at unit scale (the `atom_store` suite stays green, 66
+checks) **and end-to-end**: the full round trip
+`kg_section_build_r → snap_to_text → snap_from_text → kg_section_apply` over the
+real `snapshot_disk` graph preserves every ledger field, including `proof_ref`
+and `evidence_grade`, and the direct build→apply path preserves `tier`/`ts` too.
+
+This end-to-end run required fixing the NOVA compiler. The bootstrap and the
+shipped range-based `bin/nova` both mis-handle the ~19k-line snapshot program
+(`proof_ref` read back as garbage; `snap_to_text` segfaults — *even on the
+baseline `test_snapshot_disk`*), so the verification was done under the
+value-tagged compiler (NOVA branch `claude/adoring-wozniak-gdnye9`) after three
+tagging fixes landed there: `str_eq` must tag its 0/1 result (`fc5d059`),
+`_nova_str_eq` must guard NULL (`b17c783`), and `getenv` must return tagged-0 for
+unset vars (`27e17c6`) so CrossEngin's `merkle_signing` NULL guard fires and
+`snap_to_text` skips signing instead of crashing. With those, the round trip is
+green. Full standing verification under a shipped `bin/nova` waits on that tagged
+compiler landing (it is not yet installed; tracked in NOVA `PTR_TAGGING_PLAN.md`).
 
 **Scope still open:** the `KG-licenses` / `KG-proofs` KGs, ingestion-time license
 resolution, and the belief grade-multiplier (ADR-0023 integration) remain
