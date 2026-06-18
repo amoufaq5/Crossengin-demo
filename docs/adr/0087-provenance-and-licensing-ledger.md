@@ -195,7 +195,20 @@ belief. The pin constant is kept < 2^20 so `bel_mean`'s multiply stays in the
 bootstrap's safe integer range. Verified: `atom_store` suite now 77 checks
 (strong 0.666 > weak 0.583 > testimonial 0.555; FORMAL 0.999 / refuted 0.001).
 
-**Scope still open:** the `KG-licenses` / `KG-proofs` KGs and ingestion-time
-license resolution remain follow-on work, as does wiring `atom_observe_graded`
-into the learning/ingestion pipeline (today the loop calls the ungraded
-`atom_observe`; grade-weighted updates are available but not yet the default path).
+**Increment 4 (landed): the `KG-licenses` table.** `src/kg/licenses.nova` is the
+table the atom's interned `license` code resolves into: each code maps to a
+record `[spdx_or_name, commercial_use, attribution_required, share_alike, url]`.
+`lic_registry_new` seeds the built-ins (UNKNOWN/OWNER/OPEN/CC-BY-SA/PROPRIETARY);
+`lic_register` adds more at ingestion time. `atom_license_clean(reg, a)` now gates
+on the *actual* `commercial_use` term (superseding atom_store's coarse
+`license != UNKNOWN`), and `atom_requires_attribution` / `atom_requires_share_alike`
+expose obligations — so the Edge/Enterprise clean-build partition (ADR-0091) can
+exclude encumbered atoms by real terms, and attribution/share-alike can be
+honored. Out-of-range codes fail safe to UNKNOWN (not clean). Verified:
+`licenses` suite, 24 checks.
+
+**Scope still open:** the `KG-proofs` KG (ADR-0088) and ingestion-time license
+*resolution* (mapping a fetched source's stated license to a registry code)
+remain follow-on work, as does wiring `atom_observe_graded` into the
+learning/ingestion pipeline (today the loop calls the ungraded `atom_observe`;
+grade-weighted updates are available but not yet the default path).
