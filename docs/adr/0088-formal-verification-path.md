@@ -160,3 +160,21 @@ explicitly **future work** and out of scope here.
   fallback for unprovable claims); NOVA enhancement #8 (multi-KG namespacing for
   `KG-proofs` and cross-KG lemma references); #9 (audit log of every `check`
   verdict, pin, and unpin).
+
+## Implementation status
+
+**Increment 1 (landed): the `KG-proofs` store.** `src/kg/proofs.nova` is the
+table an atom's `proof_ref` (ADR-0087) interns into — the storage layer beneath
+the checker kernel. A proof record is `[claim_label, checker_status,
+axioms_used, derivation_blob]`; `proof_register` files an obligation
+(`UNCHECKED`), and the kernel (future `mind/verify.nova`) records its verdict via
+`proof_set_status` (`VERIFIED` / `FAILED`). `atom_proof_verified(reg, a)` makes
+FORMAL-grade consistency mean "has a VERIFIED proof" (superseding atom_store's
+`atom_grade_consistent`, which only checked a `proof_ref` was present). Slot 0 is
+a reserved no-proof placeholder so a `PROV_NONE`/out-of-range ref fails safe to
+UNCHECKED (never VERIFIED). Verified via the bootstrap: `proofs` suite, 15 checks.
+
+**Scope still open:** the proof-checker kernel itself (the small trusted core
+that turns `UNCHECKED` into `VERIFIED`/`FAILED`), and the FORMAL belief-pin
+unpinning on a failed re-check (the pin exists, ADR-0087 increment 3; tying it to
+`proof_set_status(FAILED)` is follow-on).
