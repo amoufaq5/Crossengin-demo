@@ -207,8 +207,18 @@ exclude encumbered atoms by real terms, and attribution/share-alike can be
 honored. Out-of-range codes fail safe to UNKNOWN (not clean). Verified:
 `licenses` suite, 24 checks.
 
-**Scope still open:** the `KG-proofs` KG (ADR-0088) and ingestion-time license
-*resolution* (mapping a fetched source's stated license to a registry code)
-remain follow-on work, as does wiring `atom_observe_graded` into the
-learning/ingestion pipeline (today the loop calls the ungraded `atom_observe`;
-grade-weighted updates are available but not yet the default path).
+**Increment 5 (landed): ingestion-time license resolution.** `lic_resolve_source`
+maps a fetched source string (a URL or a `rss:<url>` tag) to a license code —
+Wikipedia → `CC_BY_SA`, user-taught → `OWNER`, anything unrecognized →
+`UNKNOWN` (quarantine), failing safe rather than minting unclean atoms.
+`atom_resolve_license(a, source)` stamps the atom at mint time. This is the bridge
+ADR-0087 requires ("resolve a license for every fetched source before any atom is
+minted"). Verified: `licenses` suite now 38 checks (incl. resolution + the
+substring helper).
+
+**Scope still open:** wiring `atom_resolve_license` and `atom_observe_graded`
+into the live learning/ingestion loop (today the loop mints atoms without
+resolving a license and calls the ungraded `atom_observe`; both graded updates
+and license resolution are available and tested but not yet the default path —
+this is the ADR-0092 governed-promotion integration). The proof-checker kernel
+(ADR-0088) also remains.
