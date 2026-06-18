@@ -195,3 +195,37 @@ knowledge; it does not touch governance.
 - DEPENDS ON: NOVA enhancement #8 (multi-KG namespacing for the staging partition),
   #9 (audit log). Builds on ADR-0087, ADR-0088, ADR-0089, ADR-0029. No new
   arithmetic enhancement required.
+
+## Implementation status
+
+**Increment 1 (landed): the promotion state machine + gates.**
+`src/learning/promotion.nova` implements the CANDIDATE→PROMOTED lifecycle and the
+ordered gates, composing the verified ADR-0087/0088 pieces:
+- **(a) license** — `atom_resolve_license` + `lic_commercial_ok`; a
+  non-commercial/unresolved source → `CAND_QUARANTINED` (never enters the clean KB).
+- **(e) conflict** — a candidate contradicting a protected atom (user-taught
+  `LICENSE_OWNER`, or confidence > 0.8) freezes both `CONTESTED` and is NOT
+  promoted (`CAND_CONTESTED`); ADR-0029/0023.
+- **(b/c/d) grade** — `cand_assign_grade`: `FORMAL` only with a VERIFIED KG-proof
+  (ADR-0088), else corroboration-based (`>= 2` independent → `EMPIRICAL_STRONG`,
+  a lone fetch → `EMPIRICAL_WEAK`, none → `TESTIMONIAL`).
+- **(4) governance** — refuses to promote over a `governance`-flagged atom
+  (ADR-0045 non-revisable) → `CAND_REJECTED`.
+- On promotion, a grade-weighted observation (ADR-0087 increment 3) sets the
+  atom's confidence; `cand_is_usable` gates answer-construction to PROMOTED atoms.
+
+The **(f) debate-adjudication gate is a stub** that currently accepts a clean,
+graded, non-conflicting candidate; it becomes real when the debate engine
+(ADR-0089) lands. Verified via the bootstrap: `promotion` suite, 21 checks
+(clean promote, unlicensed quarantine, user-taught conflict, FORMAL+proof,
+unproven fallback, governance refusal, lone-fetch weak).
+
+Note: `cand_promote` takes a bundled `claim` + `pctx` (≤3 args) and
+`atom_set_provenance` now takes a `prov_ledger` tuple — NOVA's bootstrap
+mis-passes a function's 7th+ argument, so the gate inputs and the 7-arg
+provenance setter were restructured to stay within the limit (this also fixed a
+latent corruption of the provenance `proof` field under the bootstrap).
+
+**Scope still open:** wiring the machine into the live r50 `learn_from_url` path
+(CANDIDATE atoms into a staging partition, excluded from answers until promoted);
+the per-session fetch/promotion budgets; and the real debate gate (ADR-0089).

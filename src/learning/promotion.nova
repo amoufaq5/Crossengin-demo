@@ -1,0 +1,174 @@
+// Governed promotion pipeline (ADR-0092): the gate between r39/r50 fetch-
+// extraction and the trusted knowledge base. A self-researched claim enters as
+// a CANDIDATE and may only become a usable (PROMOTED) atom by surviving ordered,
+// symbolic, auditable gates — never an LLM judgment (ADR-0014).
+//
+// This module is the state machine + gates, operating on atoms and the
+// ADR-0087/0088 registries. Wiring it into the live r50 loop (CANDIDATE atoms
+// into a staging partition, excluded from answers until PROMOTED) is the
+// integration step; the gate logic here is unit-tested in isolation.
+
+import "../kg/atom_store.nova"
+import "../kg/licenses.nova"
+import "../kg/proofs.nova"
+
+// ---- promotion states (ADR-0092 lifecycle) --------------------------------
+let CAND_CANDIDATE   = 0   // freshly extracted; in staging, excluded from answers
+let CAND_PROMOTED    = 1   // cleared the gates; trusted, usable in answers
+let CAND_QUARANTINED = 2   // failed the license gate; cannot enter the clean KB
+let CAND_CONTESTED   = 3   // conflicts a protected atom; queued for adjudication
+let CAND_REJECTED    = 4   // refused (e.g. would edit governance)
+
+fn cand_state_name(s) {
+    if s == CAND_CANDIDATE   { return "candidate" }
+    if s == CAND_PROMOTED    { return "promoted" }
+    if s == CAND_QUARANTINED { return "quarantined" }
+    if s == CAND_CONTESTED   { return "contested" }
+    if s == CAND_REJECTED    { return "rejected" }
+    return "unknown"
+}
+
+// Tunable gate thresholds (ADR-0092 notes these need calibration).
+let CAND_STRONG_CORROBORATION = 2    // >= this many independent sources -> STRONG
+let CAND_HIGH_CONF            = 800  // milli (0.8): a "high-confidence" atom
+
+// An atom is protected from silent overwrite if it is user-taught (Tier-A,
+// ADR-0027) or already high-confidence (ADR-0029 hard-conflict freeze).
+fn cand_is_protected(a) {
+    if atom_license(a) == LICENSE_OWNER { return 1 }
+    if atom_confidence(a) > CAND_HIGH_CONF { return 1 }
+    return 0
+}
+
+// Governance atoms (constitution/soul, ADR-0045/0034) are non-revisable by the
+// autonomous loop. Flagged via the "governance" payload key.
+fn cand_is_governance(a) {
+    return atom_payload_has(a, "governance")
+}
+
+// Evidence-grade assignment, gates (b)/(c)/(d) of ADR-0092:
+//  (c) proof gate  — FORMAL only with a VERIFIED proof (ADR-0088);
+//  (d) corroboration — EMPIRICAL_STRONG needs >= CAND_STRONG_CORROBORATION
+//      independent sources, a lone fetch is at most EMPIRICAL_WEAK, none is
+//      TESTIMONIAL.
+fn cand_assign_grade(formally_tractable, proof_code, proofs_reg, corroboration) {
+    if formally_tractable == 1 {
+        if proof_code > 0 {
+            if proof_status(proofs_reg, proof_code) == PROOF_VERIFIED {
+                return GRADE_FORMAL
+            }
+        }
+        // formally tractable but unproven -> fall back to empirical
+    }
+    if corroboration >= CAND_STRONG_CORROBORATION { return GRADE_EMPIRICAL_STRONG }
+    if corroboration >= 1 { return GRADE_EMPIRICAL_WEAK }
+    return GRADE_TESTIMONIAL
+}
+
+// A claim descriptor for promotion. Bundled into one argument because NOVA's
+// bootstrap mis-passes a function's 7th+ argument, and the gate inputs would
+// otherwise overflow that limit.
+//   [source, corroboration, formally_tractable, proof_code, conflict_atom]
+let CLM_SOURCE   = 0   // source string (license resolution, ADR-0087)
+let CLM_CORROB   = 1   // count of independent corroborating sources
+let CLM_FORMAL   = 2   // 1 if the claim can be expressed/checked formally
+let CLM_PROOF    = 3   // KG-proofs ref for a formal claim, or PROV_NONE
+let CLM_CONFLICT = 4   // an existing atom this candidate contradicts, or 0
+
+fn claim_new(source, corroboration, formally_tractable, proof_code, conflict_atom) {
+    let c = list_new()
+    push(c, source)
+    push(c, corroboration)
+    push(c, formally_tractable)
+    push(c, proof_code)
+    push(c, conflict_atom)
+    return c
+}
+
+// The promotion context: the ADR-0087 / ADR-0088 registries.
+let PCTX_LIC = 0
+let PCTX_PRF = 1
+
+fn pctx_new(lic_reg, proofs_reg) {
+    let p = list_new()
+    push(p, lic_reg)
+    push(p, proofs_reg)
+    return p
+}
+
+// Run the governed promotion gates on a freshly-extracted CANDIDATE atom.
+// Returns the resulting state. Gates are evaluated in ADR-0092 order; the first
+// failure halts and returns. On PROMOTED, the atom is stamped with its license,
+// grade, (and proof_ref if FORMAL) and a grade-weighted observation is applied
+// so its confidence reflects the evidence (ADR-0087 increment 3).
+//   atom   the candidate (minted, belief at prior)
+//   claim  a claim_new(...) descriptor
+//   pctx   a pctx_new(lic_reg, proofs_reg) context
+fn cand_promote(atom, claim, pctx) {
+    let source = claim[CLM_SOURCE]
+    let corroboration = claim[CLM_CORROB]
+    let formally_tractable = claim[CLM_FORMAL]
+    let proof_code = claim[CLM_PROOF]
+    let conflict_atom = claim[CLM_CONFLICT]
+    let lic_reg = pctx[PCTX_LIC]
+    let proofs_reg = pctx[PCTX_PRF]
+
+    // (4) self-update cannot edit governance (ADR-0045): refuse outright.
+    if conflict_atom != 0 {
+        if cand_is_governance(conflict_atom) == 1 {
+            atom_payload_set(atom, "cand_state", CAND_REJECTED)
+            return CAND_REJECTED
+        }
+    }
+
+    // (a) License gate (ADR-0087): resolve and require commercial-clean.
+    let lcode = atom_resolve_license(atom, source)
+    if lic_commercial_ok(lic_reg, lcode) == 0 {
+        atom_payload_set(atom, "cand_state", CAND_QUARANTINED)
+        return CAND_QUARANTINED
+    }
+
+    // (e) Conflict gate (ADR-0029/0023): never silently overwrite a protected
+    // atom. Freeze both as CONTESTED and queue for adjudication; do NOT promote.
+    if conflict_atom != 0 {
+        if cand_is_protected(conflict_atom) == 1 {
+            atom_set_evidence_grade(atom, GRADE_CONTESTED)
+            atom_set_evidence_grade(conflict_atom, GRADE_CONTESTED)
+            atom_payload_set(atom, "cand_state", CAND_CONTESTED)
+            return CAND_CONTESTED
+        }
+    }
+
+    // (b)/(c)/(d) Grade assignment.
+    let grade = cand_assign_grade(formally_tractable, proof_code, proofs_reg, corroboration)
+    if grade == GRADE_FORMAL {
+        atom_set_proof_ref(atom, proof_code)
+    }
+    atom_set_evidence_grade(atom, grade)
+
+    // (f) Debate adjudication (ADR-0089) -- STUB until the debate engine lands
+    // (Phase 2). For now a clean, graded, non-conflicting candidate is accepted;
+    // the real gate will require the candidate's argument to survive grounded
+    // acceptability against existing beliefs.
+
+    // Promote: apply a grade-weighted observation so confidence reflects the
+    // evidence grade, and record the terminal state.
+    atom_observe_graded(atom, 1)
+    atom_payload_set(atom, "cand_state", CAND_PROMOTED)
+    return CAND_PROMOTED
+}
+
+// The recorded lifecycle state of an atom (CAND_CANDIDATE if never run).
+fn cand_state(a) {
+    if atom_payload_has(a, "cand_state") == 1 {
+        return atom_payload_get(a, "cand_state")
+    }
+    return CAND_CANDIDATE
+}
+
+// Is this atom usable in answers? Only PROMOTED atoms are (staging/quarantine/
+// contested atoms are excluded from answer construction, ADR-0092).
+fn cand_is_usable(a) {
+    if cand_state(a) == CAND_PROMOTED { return 1 }
+    return 0
+}
