@@ -183,6 +183,19 @@ unset vars (`27e17c6`) so CrossEngin's `merkle_signing` NULL guard fires and
 green. Full standing verification under a shipped `bin/nova` waits on that tagged
 compiler landing (it is not yet installed; tracked in NOVA `PTR_TAGGING_PLAN.md`).
 
-**Scope still open:** the `KG-licenses` / `KG-proofs` KGs, ingestion-time license
-resolution, and the belief grade-multiplier (ADR-0023 integration) remain
-follow-on work.
+**Increment 3 (landed): grade-weighted belief updates.** `evidence_grade` now
+modulates how evidence moves the Beta belief (ADR-0023), making the grade field
+functional rather than inert. `atom_observe_graded(a, sign)` weights the
+observation by `grade_weight(grade)` — `EMPIRICAL_STRONG` full (1000 milli),
+`EMPIRICAL_WEAK` 400, `TESTIMONIAL`/`CONTESTED` 250, `UNKNOWN` 600 — so a weaker
+source shifts confidence less. `GRADE_FORMAL` is not accumulated probabilistically
+but **pinned** near-certain via `bel_pin_formal` (mean ≈ 0.999, or ≈ 0.001 when a
+proof refutes), reflecting that a machine-checked proof (ADR-0088) fixes the
+belief. The pin constant is kept < 2^20 so `bel_mean`'s multiply stays in the
+bootstrap's safe integer range. Verified: `atom_store` suite now 77 checks
+(strong 0.666 > weak 0.583 > testimonial 0.555; FORMAL 0.999 / refuted 0.001).
+
+**Scope still open:** the `KG-licenses` / `KG-proofs` KGs and ingestion-time
+license resolution remain follow-on work, as does wiring `atom_observe_graded`
+into the learning/ingestion pipeline (today the loop calls the ungraded
+`atom_observe`; grade-weighted updates are available but not yet the default path).
