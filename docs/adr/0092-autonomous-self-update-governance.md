@@ -226,6 +226,20 @@ mis-passes a function's 7th+ argument, so the gate inputs and the 7-arg
 provenance setter were restructured to stay within the limit (this also fixed a
 latent corruption of the provenance `proof` field under the bootstrap).
 
-**Scope still open:** wiring the machine into the live r50 `learn_from_url` path
-(CANDIDATE atoms into a staging partition, excluded from answers until promoted);
-the per-session fetch/promotion budgets; and the real debate gate (ADR-0089).
+**Increment 2 (landed): extraction-side wiring.** `govern_fetched_atom(atom,
+src_label)` is now called from `lp_ingest` on every newly-minted atom in the live
+learning path: it resolves the source's license (ADR-0087), assigns a default
+grade (user-taught -> TESTIMONIAL, a lone web fetch -> EMPIRICAL_WEAK), and marks
+the atom `CAND_CANDIDATE` so `cand_is_usable` excludes it from answers until a
+promotion pass runs. So self-fetched knowledge now carries real, source-resolved
+provenance from the moment it is minted. Verified: `promotion` suite, 28 checks
+(incl. govern_fetched); the wiring compiles into the full ~16k-line
+`learn_pipeline` graph. (The end-to-end `lp_ingest` test can't be run here -- the
+bootstrap can't execute a graph that large; it fails identically with and without
+this change. It runs under a working `bin/nova`.)
+
+**Scope still open:** the answer-path check on `cand_is_usable` (so CANDIDATE
+atoms are actually excluded from answer construction) and the promotion pass that
+moves CANDIDATE -> PROMOTED via `cand_promote`; a dedicated staging KG partition
+(multi-KG #8); per-session fetch/promotion budgets; and the real debate gate
+(ADR-0089).
