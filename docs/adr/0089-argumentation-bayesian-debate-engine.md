@@ -254,7 +254,16 @@ rule it argues through -- realizing ADR-0089's "premises with provenance".
 `arg0 FOR: aspirin [empirical_strong] via src:wikipedia -> IN`. Verified:
 `debate` suite 46 checks.
 
-**Scope still open:** using the preferred positions (increment 6) in `debate.nova`
-/ ADR-0090 to render contested claims as multiple steelmanned sides; persisting
-the trace to the append-only decision log (ADR-0043, #9) for after-the-fact
-audit.
+**Increment 9 (landed): traces persist to the decision log.**
+`src/parts/reasoning/decision_record.nova` writes a debate trace (and a steelman
+position-set, and a governed-promotion outcome) as one immutable, hash-chained
+`DLK_DECISION` entry in the ADR-0043 append-only log: claim id, adjudicated
+confidence, contested flag, the premise atom ids weighed, and an OK/VETOED
+outcome. So a debate is now auditable after the fact and survives a restart —
+`drec_render` reconstructs it in plain language with no LLM (ADR-0014/0038). See
+ADR-0043's Implementation Status. Verified: `decision_record` 33 checks.
+
+**Scope still open:** routing a CONTESTED debate result to the answer path so the
+user is shown the steelmanned sides rather than a collapsed verdict; the proof-
+checker kernel (ADR-0088) feeding strict arguments; benchmarking the adjudicator
+against LLM judgments (ADR-0093 Phase 7).

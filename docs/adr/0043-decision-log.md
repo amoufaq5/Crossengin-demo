@@ -36,3 +36,26 @@ A log entry is a tag-prefixed record: `[LOG_ENTRY, seq, timestamp, action_class,
 
 ## Implementation Notes
 `core/safety.nova` gains `decision_log_open`, `decision_log_append(entry)`, `decision_log_iter`, and `decision_log_verify` (re-checks the hash chain). Storage uses `runtime/db.nova` segment files with fsync; entries serialized via `runtime/json.nova` or a compact binary record. The `signal_trace` field is taken directly from the gating signal's `trace` per `core/signal.nova`. Hash chaining uses `runtime/crypto.nova`. Write ordering: append intent entry + fsync (for `REV_IRREVERSIBLE`, ADR-0042) -> run effector -> append outcome entry. Inspection surfaces through the self-model query API (ADR-0038) rendering log entries as language via pure substrate (ADR-0013) — explicitly NOT through `runtime/llm.nova`. Snapshot/rehydration (ADR-0048) treats the log as durable-but-separate (it is not rolled back by a substrate snapshot restore). DEPENDS ON: NOVA enhancement #9 — append-only, crash-safe (fsync) decision/audit log atop `runtime/db.nova` + `core/safety.nova`. Tests: kill-process-mid-action and assert no executed action lacks an entry; assert hash-chain verification fails on a mutated entry; assert AUTO actions still log.
+
+## Implementation Status
+
+**Increment (landed): reasoning adjudications persist to the decision log.**
+`src/parts/reasoning/decision_record.nova` bridges the truth-seeking engine
+(ADR-0089/0090/0092) to this log. The core gains a `DLK_DECISION` kind; a debate
+trace, a steelman position-set, or a governed-promotion outcome each appends one
+immutable, hash-chained `DLK_DECISION` entry. The reasoning semantics live in the
+recorder (the core stays domain-free, the way `audit_writer` owns the effector
+semantics): `goal` = the claim atom id, `desc = [ACLASS_REASONING, subtype,
+scalar, flag]` where subtype is debate/promotion/steelman, scalar is the
+adjudicated confidence / assigned grade / surviving-position count, and flag is
+the contested bit / terminal `cand_state`; `outcome` is OK for a decided/promoted
+claim, VETOED for a contested/failed one. The `trace` field holds the premise
+atom ids weighed (the field's flat-int contract — the full per-argument structure
+stays in the debate trace object, reconstructible from the snapshot, as this ADR
+already documents the trace to be). `drec_render` reconstructs each entry in
+plain language with no LLM (ADR-0014/0038). Verified via the bootstrap:
+`decision_record` 33 checks (decided debate → OK + premise trace; contested debate
+→ VETOED; promotion grade/state → OK vs VETOED; contested steelman → 2 positions;
+a mixed debate→promotion chain verifies and a field-tamper is caught). The
+durable file seam (`dl_open`/fsync) is unchanged and already covered by
+`decision_log` + `chat_state`.
