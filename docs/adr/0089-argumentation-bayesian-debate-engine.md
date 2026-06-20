@@ -161,9 +161,25 @@ extension), reinstatement chain A→B→C (A,C in; B out), self-attack (UNDEC),
 unattacked (all in), defense C→B→A (A reinstated), and an unreinstated case (a
 surviving second attacker keeps the target OUT).
 
-**Scope still open:** stage 5 Bayesian adjudication (combine surviving arguments'
-premise beliefs + evidence grades, ADR-0023/0087, into a conclusion confidence);
-stages 1-2 argument construction from atoms + strict/defeasible rules; deriving
-the attack relation from rebut/undercut/undermine over real arguments; preferred
-semantics for contested multi-extension cases (→ ADR-0090); and the first-class
-argument trace to the decision log (ADR-0043).
+**Increment 2 (landed): rebut wiring + Bayesian adjudication (stages 3 rebut +
+5).** `src/parts/reasoning/debate.nova` binds abstract arguments to claims --
+`darg_new(conclusion_id, sign, weight, strict)` -- and turns "which arguments
+survive" into "how confident". `debate_build_af` derives the rebut attack
+relation (same conclusion, opposite sign), with the ASPIC+ asymmetry that a
+*strict* argument (a proof, ADR-0088) defeats a defeasible opponent but is not
+rebutted back. `debate_decide` builds the AF, runs `af_grounded`, and
+`debate_adjudicate` combines only the surviving (IN) arguments into a Beta
+posterior (each supporting IN argument adds to alpha, each opposing to beta,
+weighted by evidence mass derived upstream from belief x grade, ADR-0023/0087).
+An unresolved rebut cycle leaves the claim at the prior 0.5 and is flagged by
+`debate_is_contested` -- the signal ADR-0090 steelmans rather than collapsing.
+Verified via the bootstrap: `debate` suite, 9 checks (single support 0.666, two
+supports 0.75, single against 0.333, contested rebut 0.5 + flagged, strict
+defeats defeasible both directions).
+
+**Scope still open:** stages 1-2 argument *construction* from atoms +
+strict/defeasible rules (deriving `darg` weights from real premise beliefs and
+the grade ledger, and the strict-from-FORMAL flag); undercut/undermine attacks
+(attacking an inference step or a premise, beyond rebut); preferred semantics for
+multi-extension contested cases (→ ADR-0090); and the first-class argument trace
+to the decision log (ADR-0043).
