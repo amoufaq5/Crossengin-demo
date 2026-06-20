@@ -150,3 +150,26 @@ Phase 7 LLM comparison. The checklist is the gate between phases for each domain
   (strict/defeasible debate consuming the slice); ADR-0087 (per-atom licensing &
   grade), ADR-0029 + NOVA enhancement #8 (per-domain KG namespacing), r50
   (ingestion pipeline).
+
+## Implementation status
+
+**Per-domain CONTESTED tag (landed, slice 4 routing).** Slice 4 (social /
+economic / political) hands off to ADR-0090 steelman rather than collapsing to
+one answer -- the mechanism is now wired. `src/kg/multi_kg_manager.nova` gains
+a `KG_DOMAIN_FLAGS` bitfield slot on every KG and `kg_set_contested_domain` /
+`kg_is_contested_domain` accessors (default 0 -> bit-identical legacy
+behaviour). `src/language/nl_query.nova`'s `_nlq_try_domain_contested` is
+called from both `nlq_answer_yesno` and `nlq_answer_why`: when the KG carries
+the contested-domain bit, every routable claim becomes an `NLQ_CONTESTED`
+answer with the "value-laden domain ($label): reasonable disagreement exists
+on $topic even where this KG is one-sided" framing + steelman_render of
+whatever local arguments exist (empty render branch is honest: "no evidenced
+position"). The CONTESTED form keys the same `nl_audit` hook, so a slice-4
+answer is also a `DLK_DECISION/DREC_DEBATE` entry. Verified: `domain_contested`
+23 checks (flag mechanics: default off, set/clear, idempotent clear, per-KG
+independence; helper short-circuits when untagged; helper fires when tagged
+even with zero arguments; render contract preserved; form matches the audit
+hook). The chat compiles with the routing wired (`crossengin_chat` builds
+clean; the full `nlq_respond` pipeline hits the same bootstrap-at-scale limit
+`test_nl_query` does -- helper is unit-tested directly, the established scope
+cut).
