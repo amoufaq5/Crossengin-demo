@@ -52,3 +52,38 @@ In genuinely contested domains the engine MUST represent every *evidenced, survi
 - Per-domain contested tagging is owned by ADR-0093; this ADR only consumes the tag.
 - Testing: (1) a value-laden query (e.g. a policy tradeoff with no factual defeater) returns >=2 steelmanned positions, each with sources and confidence, with NO single verdict and an explicit value-fork explanation. (2) A factually-settled query that some low-grade sources dispute returns the supported answer and notes the refuted claim as refuted — NOT a false-balance pair. (3) A consensus-vs-minority query labels each position correctly by corroboration/evidence grade rather than by screen space. (4) A query below the confidence floor on its second position does NOT enter contested mode.
 - DEPENDS ON: ADR-0089 (argument graph + multi-preferred-extension result + trace, the immediate upstream), ADR-0023 (CONTESTED belief state), ADR-0087 (provenance + evidence_grade weighting), ADR-0029 (hard-conflict freeze/surface), ADR-0093 (per-domain contested tagging), ADR-0043 (audit log), ADR-0086 (axis D of the master architecture).
+
+## Implementation status
+
+**Increment 1 (landed): the steelman over the debate engine.**
+`src/parts/reasoning/steelman.nova` consumes the ADR-0089 debate output to present
+a contested claim as every *surviving* evidenced position at its strength --
+never a false verdict, never false balance. `steelman_positions` summarizes each
+PREFERRED extension (ADR-0089 inc 6) that takes a stance on the claim;
+`steelman_is_contested` is true only when both a supporting and an opposing
+position survive; `steelman_render` / `steelman_atom_render` produce the
+user-facing text with consensus (strongest evidence) vs minority labelling.
+
+The empirical-defeat-vs-value-disagreement line (the heart of this ADR) falls out
+of preferred semantics for free: a side defeated on the merits -- e.g. by a strict
+proof -- is in *no* preferred extension, so it is simply absent (reported elsewhere
+as refuted), never steelmanned as a peer; only genuinely defensible sides each
+survive as their own extension and are steelmanned. Verified via the bootstrap:
+`steelman` suite, 7 checks -- a defeasible for/against clash steelmans both sides
+(consensus/minority by strength), a proof-settled claim yields a single supported
+position (the opposing side absent), and a KG-level clash of two studies renders
+two positions.
+
+Sample render:
+
+```
+Claim #0 -- CONTESTED; evidenced positions (steelmanned):
+  - SUPPORTS the claim (evidence strength 1000, consensus)
+  - OPPOSES the claim (evidence strength 400, minority)
+```
+
+**Scope still open:** attaching each position's provenance chain (the sources and
+evidence grades behind its arguments, ADR-0087) to the render; the per-domain
+contested tag (ADR-0093) and the CONTESTED belief flag (ADR-0023) as additional
+triggers beyond a multi-extension debate; and routing the debate engine's
+contested results into this renderer at the answer path.
