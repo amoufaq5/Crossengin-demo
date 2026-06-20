@@ -39,6 +39,21 @@ A log entry is a tag-prefixed record: `[LOG_ENTRY, seq, timestamp, action_class,
 
 ## Implementation Status
 
+**Increment 3 (landed): the chat path is audited.**
+`src/agent/cognitive_router.nova` gains a session-scoped audit-log register
+(`cr_set_audit_log`, `_cr_audit_log` — a 1-element list NOVA-idiomatic
+module-mutable handle, wired-or-not the way `dl_open` is). The NL-answer path
+in the router (yes/no + how-many) reads the register; if a log is wired, the
+call goes through `nlq_respond_audited` and CONTESTED replies leave a
+DLK_DECISION trail, otherwise the original unaudited `nlq_respond` runs. This
+bypasses the 6-arg passing limit that prevented threading the log down
+`router_reply` directly. `examples/crossengin_chat.nova` calls
+`cr_set_audit_log(_boot_log)` once at chat boot, right after `dl_open` -- so
+every contested answer in a real session writes through automatically. Verified:
+`router_audit` 6 checks (default off; wire/read round-trips; rewire replaces
+without leaking; unwire restores off). `cognitive_router` baseline is unchanged
+(no regression from the `_cr_nlq_answer` 3-arg signature).
+
 **Increment 2 (landed): the answer path is audited.**
 `src/language/nl_audit.nova` wraps `nlq_respond` as
 `nlq_respond_audited(kg, aliases, text, log, moment)`: when the answer comes
