@@ -229,9 +229,26 @@ has one home. Verified via the bootstrap: `decay_exemption` suite, 13 checks
 lifts after unpin; tb_decay refactor still decays); `bayesian_updates` 20 still
 green.
 
+**Increment 5 (landed): the periodic belief-decay sweep.**
+`src/learning/belief_decay.nova` is the runtime side of increment 4's
+exemption hook. `belief_decay_sweep(kg, retain_milli)` walks a KG and calls
+`atom_decay_belief` per atom; the multi-KG fold `belief_decay_sweep_all(reg,
+retain)` covers every KG in a registry. Verified FORMAL atoms are counted
+into a separate `exempted` bucket (the kernel's exemption is honored at the
+sweep level); GC-managed atoms (tombstoned / dead) are skipped (the death
+monitor owns their lifecycle). Cadence is the caller's decision -- same
+contract as `adm_sweep`; a future substrate scheduler tick wires both. So
+the FORMAL pin is no longer just a one-shot grant: it survives every periodic
+sweep that would otherwise drift the belief toward the prior, exactly as
+ADR-0023's "classical atom barely moves" fixture intends -- now realised for
+the proof-backed grade specifically. Verified via the bootstrap:
+`belief_decay` suite, 12 checks (sweep counts + decays ordinary atoms;
+repeated sweeps don't erode FORMAL atoms even at 0.2 retention x 4 rounds;
+multi-KG fold sums correctly; retain=1000 is a clean no-op).
+
 **Scope still open:** wiring `verify_recheck_atom` to fire on
-`proof_set_status(_, FAILED)`-induced cascades and on a periodic substrate
-sweep; the periodic belief-decay sweep itself that calls `atom_decay_belief`
-per atom; widening the rule set (quantifiers, arithmetic decision procedures)
-without bloating the trusted core; and the v2 bounded automated search to
-*construct* shallow obligations (still strictly checking-only here).
+`proof_set_status(_, FAILED)`-induced cascades; the substrate scheduler tick
+that calls `belief_decay_sweep_all` on a cadence (the sweep exists; the tick
+hook is the wire-up); widening the rule set (quantifiers, arithmetic decision
+procedures) without bloating the trusted core; and the v2 bounded automated
+search to *construct* shallow obligations (still strictly checking-only here).
