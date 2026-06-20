@@ -82,8 +82,24 @@ Claim #0 -- CONTESTED; evidenced positions (steelmanned):
   - OPPOSES the claim (evidence strength 400, minority)
 ```
 
-**Scope still open:** attaching each position's provenance chain (the sources and
-evidence grades behind its arguments, ADR-0087) to the render; the per-domain
+**Increment 2 (landed): provenance per position.** `steelman_render_prov` /
+`steelman_atom_render_prov` attach each surviving position's provenance chain --
+for every argument in the position, its premise atom + evidence grade and source
+(via debate.nova's `_darg_prov_str`). A position carries its claim-bearing
+argument indices (`POS_ARGS`). Sample render:
+
+```
+Claim #0 -- CONTESTED; evidenced positions (steelmanned):
+  - SUPPORTS (strength 500, consensus):
+      from trial_pro [empirical_strong] via src:journal_a
+  - OPPOSES (strength 200, minority):
+      from trial_con [empirical_weak] via src:journal_b
+```
+
+So a contested answer shows every side WITH its sources and grades, and the
+weaker-sourced side is labelled minority. Verified: `steelman` suite 11 checks.
+
+**Scope still open:** the per-domain
 contested tag (ADR-0093) and the CONTESTED belief flag (ADR-0023) as additional
 triggers beyond a multi-extension debate; and routing the debate engine's
 contested results into this renderer at the answer path.

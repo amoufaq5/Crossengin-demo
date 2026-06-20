@@ -246,6 +246,14 @@ Stage 3 now covers all three ASPIC+ attacks: REBUT (conclusion), UNDERMINE
 checks -- an undercut defeasible argument goes OUT and its claim falls to the
 prior, while a strict (proof) argument is immune to undercut and stays ~0.99.
 
+**Increment 8 (landed): provenance in the trace.** `debate_trace_render_prov`
+(and `debate_atom_trace_render_prov`) render the argument trace WITH each
+argument's provenance chain -- its premise atom + evidence grade and the source
+rule it argues through -- realizing ADR-0089's "premises with provenance".
+`_darg_prov_str` resolves the premise/rule atom ids in the KG. Sample:
+`arg0 FOR: aspirin [empirical_strong] via src:wikipedia -> IN`. Verified:
+`debate` suite 46 checks.
+
 **Scope still open:** using the preferred positions (increment 6) in `debate.nova`
 / ADR-0090 to render contested claims as multiple steelmanned sides; persisting
 the trace to the append-only decision log (ADR-0043, #9) for after-the-fact
