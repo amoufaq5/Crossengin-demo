@@ -263,7 +263,14 @@ outcome. So a debate is now auditable after the fact and survives a restart —
 `drec_render` reconstructs it in plain language with no LLM (ADR-0014/0038). See
 ADR-0043's Implementation Status. Verified: `decision_record` 33 checks.
 
-**Scope still open:** routing a CONTESTED debate result to the answer path so the
-user is shown the steelmanned sides rather than a collapsed verdict; the proof-
-checker kernel (ADR-0088) feeding strict arguments; benchmarking the adjudicator
-against LLM judgments (ADR-0093 Phase 7).
+**Increment 10 (landed): the answer path routes contested claims through the
+steelman.** `src/language/nl_query.nova` adds a `NLQ_CONTESTED` answer form; a
+yes/no or why claim with both supporting and opposing evidence runs through
+`construct_arguments` -> `debate_is_contested` and, when contested, returns
+`steelman_render` of every surviving position instead of collapsing to a
+single-edge verdict. See ADR-0090's Increment 3. Verified: `nl_contested` 14
+checks.
+
+**Scope still open:** the proof-checker kernel (ADR-0088) feeding strict
+arguments; benchmarking the adjudicator against LLM judgments (ADR-0093 Phase
+7).

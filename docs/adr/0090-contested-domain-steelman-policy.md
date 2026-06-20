@@ -99,7 +99,18 @@ Claim #0 -- CONTESTED; evidenced positions (steelmanned):
 So a contested answer shows every side WITH its sources and grades, and the
 weaker-sourced side is labelled minority. Verified: `steelman` suite 11 checks.
 
+**Increment 3 (landed): the answer path routes through the steelman.**
+`src/language/nl_query.nova` adds a `NLQ_CONTESTED` answer form. When a yes/no
+or why question's claim atom has BOTH supporting and opposing evidence, the
+answerer runs `construct_arguments` -> `debate_is_contested`; if contested, it
+returns the `steelman_render` of every surviving position instead of collapsing
+to the strongest single edge. `nlq_render` skips the "i think" hedge + `[from
+src]` tail on a CONTESTED answer (the body already states the contention
+honestly). Pure-logic core `_nlq_contested_from_dargs` is split out for
+synthetic-darg testing under this bootstrap launcher. Verified: `nl_contested`
+14 checks (contested routes -> SUPPORTS+OPPOSES both shown; one-sided -> normal
+path; strict proof settles -> normal path; CONTESTED render preserves body).
+
 **Scope still open:** the per-domain
 contested tag (ADR-0093) and the CONTESTED belief flag (ADR-0023) as additional
-triggers beyond a multi-extension debate; and routing the debate engine's
-contested results into this renderer at the answer path.
+triggers beyond a multi-extension debate.
