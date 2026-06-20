@@ -39,7 +39,21 @@ A log entry is a tag-prefixed record: `[LOG_ENTRY, seq, timestamp, action_class,
 
 ## Implementation Status
 
-**Increment (landed): reasoning adjudications persist to the decision log.**
+**Increment 2 (landed): the answer path is audited.**
+`src/language/nl_audit.nova` wraps `nlq_respond` as
+`nlq_respond_audited(kg, aliases, text, log, moment)`: when the answer comes
+back CONTESTED (the debate engine reported a multi-extension contention), the
+wrapper persists the debate trace for the same claim atom as one DLK_DECISION
+entry alongside the steelmanned reply the user sees. So every time the user is
+told "this is contested", `drec_render` on that entry can later reconstruct
+which arguments were weighed and what verdict the debate engine returned. The
+answer record carries the claim atom id out via a `nlq_claim` accessor (set by
+`_nlq_ans_set_claim` to sidestep NOVA's 6-arg passing limit). Non-contested
+answers don't write -- the per-effector audit (`audit_writer`) already covers
+the action surface, and this log is reserved for adjudications. Verified:
+`nl_audit` 12 checks.
+
+**Increment 1 (landed): reasoning adjudications persist to the decision log.**
 `src/parts/reasoning/decision_record.nova` bridges the truth-seeking engine
 (ADR-0089/0090/0092) to this log. The core gains a `DLK_DECISION` kind; a debate
 trace, a steelman position-set, or a governed-promotion outcome each appends one
