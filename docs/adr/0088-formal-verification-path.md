@@ -246,6 +246,35 @@ the proof-backed grade specifically. Verified via the bootstrap:
 repeated sweeps don't erode FORMAL atoms even at 0.2 retention x 4 rounds;
 multi-KG fold sums correctly; retain=1000 is a clean no-op).
 
+**Increment 7 (landed): cascading re-check.**
+The dep-graph half of ADR-0088's "lemma loses its grade triggers re-check and
+unpin of everything that depended on it". Two layers:
+- `src/kg/proofs.nova` adds a `PRF_DEPS` slot to each proof record (the
+  dependents -- downstream proofs that used this one via HYP) and a
+  `proof_invalidate(reg, code)` that flips `code` to FAILED and recursively
+  flips every dependent. Already-FAILED proofs are not re-walked, so diamond
+  dep graphs terminate.
+- `src/mind/verify.nova`'s `verify_pin_atom` now records dep edges at check
+  time (`_verify_register_hyp_deps` walks the proof tree and adds an edge for
+  every HYP step), and `verify_unpin_atom` is extracted as the shared atom-
+  level unpin (drop grade, reset belief to prior; the proof_ref is left
+  pointing at the FAILED record, the informative state for /why audit).
+- `src/mind/cascade.nova` is the entry point: `verify_cascade_invalidate(reg,
+  kgreg, root_code)` runs `proof_invalidate` then walks every KG and unpins
+  every FORMAL atom whose `proof_ref` is no longer VERIFIED. Returns
+  `[proofs_flipped, atoms_unpinned]` so the caller / audit can observe the
+  blast radius.
+
+So one tampered axiom, or one re-check failure on a lemma, now correctly
+withdraws every downstream theorem's FORMAL grade with no further intervention.
+Verified via the bootstrap: `cascade` suite, 28 checks (dep edges recorded at
+check time; chain cascade flips 2; already-FAILED is a clean no-op; diamond
+cascade flips exactly 3 with no double-walk; end-to-end cascade unpins 2 atoms
+and resets their beliefs to the prior; a second cascade is idempotent; an
+unrelated FORMAL atom in another KG is untouched). `verify`, `formal_ingest`,
+`decay_exemption`, `belief_decay`, `maintenance`, `decision_record` all stay
+green; `proofs`' 1 pre-existing identical-string failure is unchanged.
+
 **Increment 6 (landed): the maintenance scheduler tick is wired.**
 `src/learning/maintenance.nova` is the per-tick cadence hook (ADR-0037):
 `maint_on_tick(sched, now)` / `maint_on_tick_reg(sched, reg, now)` run the
@@ -261,8 +290,8 @@ steady cadence, first-run warm-up, decay disabled, GC opt-in on an independent
 cadence, quiet-tick no-op, and the registry-explicit hook across a switched
 registry); the chat compiles with the hook wired.
 
-**Scope still open:** wiring `verify_recheck_atom` to fire on
-`proof_set_status(_, FAILED)`-induced cascades; widening the rule set
-(quantifiers, arithmetic decision procedures) without bloating the trusted
-core; and the v2 bounded automated search to *construct* shallow obligations
-(still strictly checking-only here).
+**Scope still open:** widening the rule set (quantifiers, arithmetic decision
+procedures) without bloating the trusted core; the v2 bounded automated search
+to *construct* shallow obligations (still strictly checking-only here); and a
+periodic substrate-tick re-check sweep that walks a sample of FORMAL atoms
+through `verify_recheck_atom` to catch silent proof-blob tampering.
