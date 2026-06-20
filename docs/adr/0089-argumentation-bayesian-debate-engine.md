@@ -235,7 +235,18 @@ grounded fallback) since enumeration is exponential. Verified via the bootstrap:
 `argumentation` suite 37 checks (2-cycle/4-cycle multi-position, single, unattacked,
 self-attack).
 
-**Scope still open:** undercut attacks (attacking a defeasible inference step,
-which needs rule identity); using the preferred positions in `debate.nova` /
-ADR-0090 to render contested claims; persisting the trace to the append-only
-decision log (ADR-0043, #9) for after-the-fact audit.
+**Increment 7 (landed): undercut attacks -- the ASPIC+ attack triad is complete.**
+A `darg` carries its inference/rule (`DARG_RULE`, the operator id);
+`debate_build_af` adds UNDERCUT edges symmetric with undermine -- B undercuts A
+iff B concludes that A's RULE is inapplicable (argues against the rule id) -- with
+the asymmetry that a STRICT inference (a proof, truth-preserving) cannot be
+undercut. `construct_arguments` sets each argument's rule from its operator.
+Stage 3 now covers all three ASPIC+ attacks: REBUT (conclusion), UNDERMINE
+(premise), UNDERCUT (inference). Verified via the bootstrap: `debate` suite 42
+checks -- an undercut defeasible argument goes OUT and its claim falls to the
+prior, while a strict (proof) argument is immune to undercut and stays ~0.99.
+
+**Scope still open:** using the preferred positions (increment 6) in `debate.nova`
+/ ADR-0090 to render contested claims as multiple steelmanned sides; persisting
+the trace to the append-only decision log (ADR-0043, #9) for after-the-fact
+audit.
