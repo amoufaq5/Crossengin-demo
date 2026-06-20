@@ -267,3 +267,35 @@ engine (that would cycle via reasoning_atoms); it only reads the verdict. Verifi
 via the bootstrap: `promotion` 38 checks (incl. lost-debate -> contested,
 won-debate -> promoted) and `debate` 21 checks (the closed loop end-to-end: a
 proof-backed claim promotes, a clash of studies is frozen contested).
+
+**Increment 5 (landed): the full promotion pass.** `src/parts/reasoning/
+promotion_pass.nova` assembles the complete ADR-0092 gate ladder that
+`govern_fetched_atom` (license-only, at mint time) was the down-payment on.
+`promo_apply(atom, claim, pctx, debate_verdict, now)` runs `cand_promote`'s
+ordered gates -- (4) governance freeze, (a) license, (e) protected-conflict,
+(b/c/d) grade, (f) debate -- and records the terminal state to the decision log
+(ADR-0043) when one is wired (`promo_set_audit_log`, the same handle idiom as
+the router / ingest paths). The full `promo_run(pctx, rkg, atom, src_label,
+hint, now)` gathers the gate inputs from the reasoning KG: `promo_corroboration`
+counts the DISTINCT sources among the operators concluding the claim (the (d)
+signal that lifts a lone fetch to EMPIRICAL_STRONG), `promo_find_conflict`
+returns the premise of an oppositional operator (gate (e)), and the gate-(f)
+verdict comes from `debate_verdict_for`. The recorder lives at this layer, not
+in promotion.nova, because it needs the debate engine + decision_record (which
+import promotion -- recording from inside promotion would cycle). Verified via
+the bootstrap: `promotion_pass` 23 checks -- clean+corroborated -> PROMOTED at
+EMPIRICAL_STRONG; unclean -> QUARANTINED; lost debate -> CONTESTED; protected
+conflict -> CONTESTED; DEBATE_NONE skips gate (f); audit records PROMOTED as OK
+and QUARANTINED as VETOED with an intact chain; the src-dedup helper and the
+no-operator gatherer paths. The KG-input gatherers' populated path uses the
+operator walk (`rk_operators_to` -> `atom_payload_get`/str_eq), which mis-
+compiles under the current bootstrap launcher, so they are compile-verified
+(the established KG-construct scope cut); the gate ladder + audit are
+runtime-tested directly. `crossengin_chat` wires `promo_set_audit_log(_boot_log)`
+at boot and compiles with the pass available.
+
+**Scope still open:** the live caller that threads real corroboration counts
+through the r50 research pipeline into `promo_run` (the pass is callable + audit-
+ready; the ingest path still uses the lighter `govern_fetched_atom` at mint
+time); a dedicated staging KG partition (multi-KG #8); per-session fetch/
+promotion budgets.
