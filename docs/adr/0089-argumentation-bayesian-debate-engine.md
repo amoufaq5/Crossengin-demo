@@ -271,6 +271,14 @@ yes/no or why claim with both supporting and opposing evidence runs through
 single-edge verdict. See ADR-0090's Increment 3. Verified: `nl_contested` 14
 checks.
 
-**Scope still open:** the proof-checker kernel (ADR-0088) feeding strict
-arguments; benchmarking the adjudicator against LLM judgments (ADR-0093 Phase
-7).
+**Increment 11 (landed): strict arguments are now backed by a real proof
+kernel.** `src/mind/verify.nova` (ADR-0088 increment 2) is the only writer of
+the `FORMAL` grade and the only path from `UNCHECKED` to `VERIFIED`. So when
+`construct_arguments` sees `atom_evidence_grade(premise) == GRADE_FORMAL`, the
+strict-defeats-defeasible asymmetry the engine has been honoring all along is
+backed by a machine-checked derivation, not a label -- which is what the
+"premises with provenance" line of ADR-0086 / ADR-0089 actually required.
+
+**Scope still open:** benchmarking the adjudicator against LLM judgments
+(ADR-0093 Phase 7); widening the proof kernel's rule set (quantifiers,
+arithmetic) so more strict arguments become expressible.

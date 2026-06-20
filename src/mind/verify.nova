@@ -1,0 +1,326 @@
+// The proof-checker kernel (ADR-0088): the small, trusted, native NOVA core
+// that turns an UNCHECKED proof into VERIFIED -- and is the ONLY code allowed
+// to grant the FORMAL grade. Everything outside this file is untrusted: it may
+// propose proofs; only `verify_check` signs off.
+//
+// Soundness rests on three properties this file MUST preserve:
+//   (1) the trusted base stays small enough for one person to audit by reading
+//       this file -- keep the rule set narrow, keep the helpers obvious;
+//   (2) the kernel never grants FORMAL on its own -- only on the strength of a
+//       proof object whose every step it has just re-checked against the fixed
+//       rule set;
+//   (3) a FORMAL atom referenced by a HYP step is itself VERIFIED at check time
+//       (cascading re-check honesty -- a verified theorem cannot rest on a peer
+//       whose own proof has lapsed).
+//
+// Honest scope (per ADR-0088): proof CHECKING, not search. The kernel walks a
+// supplied derivation; it does not discover one. Future work: bounded automated
+// search to construct shallow obligations.
+//
+// Term language v1 (propositional, the math/logic/CS proving ground ADR-0093
+// opens with):
+//     term     = atom(label) | and(t1, t2) | imp(t1, t2)
+// Rule set v1 (classical Hilbert-style, minimal but real):
+//     AXIOM   : leaf; conclusion structurally matches a registered axiom.
+//     HYP     : leaf; conclusion is the term of an already-FORMAL atom whose
+//               KG-proofs entry is currently VERIFIED. Re-checked at every
+//               `verify_check`, so a lemma losing its grade invalidates every
+//               proof that used it (ADR-0088's re-check trigger).
+//     AND_I   : from proofs of A and B, derive A and B.
+//     AND_EL  : from a proof of A and B, derive A.
+//     AND_ER  : from a proof of A and B, derive B.
+//     MP      : from proofs of (A -> B) and A, derive B (modus ponens).
+//
+// ADRs implemented: ADR-0088 (the trusted kernel; the only writer of a
+// FORMAL grade). CrossEngin dependencies: src/kg/proofs.nova (the store),
+// src/kg/atom_store.nova (grade + belief pin).
+
+import "../kg/proofs.nova"
+import "../kg/atom_store.nova"
+
+// ---- term language --------------------------------------------------------
+let TERM_ATOM = 0
+let TERM_AND  = 1
+let TERM_IMP  = 2
+
+fn term_atom(label) {
+    let t = list_new()
+    push(t, TERM_ATOM); push(t, label)
+    return t
+}
+
+fn term_and(l, r) {
+    let t = list_new()
+    push(t, TERM_AND); push(t, l); push(t, r)
+    return t
+}
+
+fn term_imp(a, c) {
+    let t = list_new()
+    push(t, TERM_IMP); push(t, a); push(t, c)
+    return t
+}
+
+fn term_kind(t) { return t[0] }
+
+// Defensive kind read -- a malformed term (length 0) is treated as no match.
+fn t_kind_safe(t) {
+    if len(t) == 0 { return 0 - 1 }
+    return t[0]
+}
+
+// Structural term equality. Two atom terms are equal iff their labels match
+// (char by char, since the launcher's str_eq is environmentally flaky on some
+// literals -- see the audit_reader / nl_contested test workarounds). Compound
+// terms recurse. Length mismatch is short-circuited so AND vs IMP can't alias.
+fn _label_eq(a, b) {
+    let n = len(a)
+    if n != len(b) { return 0 }
+    let i = 0
+    while i < n {
+        if char_at(a, i) != char_at(b, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn term_eq(a, b) {
+    if a == 0 { return 0 }
+    if b == 0 { return 0 }
+    let ka = t_kind_safe(a)
+    let kb = t_kind_safe(b)
+    if ka != kb { return 0 }
+    if ka == TERM_ATOM { return _label_eq(a[1], b[1]) }
+    if ka == TERM_AND {
+        if term_eq(a[1], b[1]) == 0 { return 0 }
+        return term_eq(a[2], b[2])
+    }
+    if ka == TERM_IMP {
+        if term_eq(a[1], b[1]) == 0 { return 0 }
+        return term_eq(a[2], b[2])
+    }
+    return 0
+}
+
+// ---- proof object shape ---------------------------------------------------
+let PROOF_AXIOM  = 0   // [AXIOM,  conclusion]
+let PROOF_AND_I  = 1   // [AND_I,  conclusion, left_proof,  right_proof]
+let PROOF_AND_EL = 2   // [AND_EL, conclusion, conj_proof]
+let PROOF_AND_ER = 3   // [AND_ER, conclusion, conj_proof]
+let PROOF_MP     = 4   // [MP,     conclusion, imp_proof,   ant_proof]
+let PROOF_HYP    = 5   // [HYP,    conclusion, hyp_label]
+
+fn pf_axiom(c)               { let p = list_new() push(p, PROOF_AXIOM)  push(p, c) return p }
+fn pf_and_i(c, lp, rp)       { let p = list_new() push(p, PROOF_AND_I)  push(p, c) push(p, lp) push(p, rp) return p }
+fn pf_and_el(c, cp)          { let p = list_new() push(p, PROOF_AND_EL) push(p, c) push(p, cp) return p }
+fn pf_and_er(c, cp)          { let p = list_new() push(p, PROOF_AND_ER) push(p, c) push(p, cp) return p }
+fn pf_mp(c, ip, ap)          { let p = list_new() push(p, PROOF_MP)     push(p, c) push(p, ip) push(p, ap) return p }
+fn pf_hyp(c, label)          { let p = list_new() push(p, PROOF_HYP)    push(p, c) push(p, label) return p }
+
+fn proof_rule(p)       { return p[0] }
+fn proof_conclusion(p) { return p[1] }
+
+// ---- hypothesis context ----------------------------------------------------
+// A hyp ctx is a list of triples [label, term, proof_code]. Each entry says:
+// "at this proof's check time, the atom labelled `label` is FORMAL, asserts the
+// proposition `term`, and its proof_ref is `proof_code`". HYP looks up by
+// label and re-checks proof_status(reg, code) == VERIFIED (point 3 of the
+// soundness preamble: cascading re-check honesty).
+fn hyp_new() { return list_new() }
+
+fn hyp_add(ctx, label, term, proof_code) {
+    let e = list_new()
+    push(e, label); push(e, term); push(e, proof_code)
+    push(ctx, e)
+    return ctx
+}
+
+fn _hyp_lookup(ctx, label) {
+    let i = 0
+    while i < len(ctx) {
+        if _label_eq(ctx[i][0], label) == 1 { return ctx[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- axiom table -----------------------------------------------------------
+// A list of terms; AXIOM succeeds iff its conclusion structurally matches one.
+fn axiom_table_new() { return list_new() }
+fn axiom_table_add(tbl, term) { push(tbl, term) return tbl }
+
+fn _axiom_matches(tbl, term) {
+    let i = 0
+    while i < len(tbl) {
+        if term_eq(tbl[i], term) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- kernel ----------------------------------------------------------------
+//
+// `_check_step` is the heart of the trusted core: it verifies that ONE proof
+// node is a legal instance of its rule, given its children's claimed
+// conclusions (which it recursively re-checks). Returns 1 iff the step is
+// sound and every recursive child step was sound. Anything not covered here
+// is rejected (fail closed).
+fn _check_step(reg, axioms, hyps, p) {
+    if len(p) < 2 { return 0 }
+    let rule = proof_rule(p)
+    let concl = proof_conclusion(p)
+    if concl == 0 { return 0 }
+
+    if rule == PROOF_AXIOM {
+        return _axiom_matches(axioms, concl)
+    }
+
+    if rule == PROOF_HYP {
+        if len(p) < 3 { return 0 }
+        let entry = _hyp_lookup(hyps, p[2])
+        if entry == 0 { return 0 }
+        // The proof at HYP-time must still be VERIFIED -- a lemma whose proof
+        // failed (PROOF_FAILED) or was unchecked (PROOF_UNCHECKED) cannot
+        // support a downstream proof. This is the cascading re-check.
+        if proof_status(reg, entry[2]) != PROOF_VERIFIED { return 0 }
+        return term_eq(entry[1], concl)
+    }
+
+    if rule == PROOF_AND_I {
+        if len(p) < 4 { return 0 }
+        if t_kind_safe(concl) != TERM_AND { return 0 }
+        let lp = p[2]
+        let rp = p[3]
+        if _check_step(reg, axioms, hyps, lp) == 0 { return 0 }
+        if _check_step(reg, axioms, hyps, rp) == 0 { return 0 }
+        if term_eq(proof_conclusion(lp), concl[1]) == 0 { return 0 }
+        return term_eq(proof_conclusion(rp), concl[2])
+    }
+
+    if rule == PROOF_AND_EL {
+        if len(p) < 3 { return 0 }
+        let cp = p[2]
+        if _check_step(reg, axioms, hyps, cp) == 0 { return 0 }
+        let conj = proof_conclusion(cp)
+        if t_kind_safe(conj) != TERM_AND { return 0 }
+        return term_eq(conj[1], concl)
+    }
+
+    if rule == PROOF_AND_ER {
+        if len(p) < 3 { return 0 }
+        let cp = p[2]
+        if _check_step(reg, axioms, hyps, cp) == 0 { return 0 }
+        let conj = proof_conclusion(cp)
+        if t_kind_safe(conj) != TERM_AND { return 0 }
+        return term_eq(conj[2], concl)
+    }
+
+    if rule == PROOF_MP {
+        if len(p) < 4 { return 0 }
+        let ip = p[2]
+        let ap = p[3]
+        if _check_step(reg, axioms, hyps, ip) == 0 { return 0 }
+        if _check_step(reg, axioms, hyps, ap) == 0 { return 0 }
+        let imp = proof_conclusion(ip)
+        if t_kind_safe(imp) != TERM_IMP { return 0 }
+        // imp = A -> B; antecedent proof's conclusion must be A; concl == B.
+        if term_eq(imp[1], proof_conclusion(ap)) == 0 { return 0 }
+        return term_eq(imp[2], concl)
+    }
+
+    return 0
+}
+
+// Top-level verifier: does this proof object actually establish `claim_term`,
+// given the registered axioms and currently-FORMAL hypotheses?
+//   reg         : the KG-proofs registry (HYP re-checks proof_status here)
+//   axioms      : axiom_table_new() + axiom_table_add(...)
+//   hyps        : hyp_new() + hyp_add(label, term, proof_code) ...
+//   proof       : a proof object (pf_axiom / pf_and_i / ... / pf_hyp tree)
+//   claim_term  : the term the caller asserts the proof concludes
+// Returns 1 iff the proof's root conclusion matches `claim_term` AND every
+// step is a legal instance of its rule.
+fn verify_check(reg, axioms, hyps, proof, claim_term) {
+    if proof == 0 { return 0 }
+    if claim_term == 0 { return 0 }
+    if term_eq(proof_conclusion(proof), claim_term) == 0 { return 0 }
+    return _check_step(reg, axioms, hyps, proof)
+}
+
+// ---- the FORMAL-grade gate (the ONLY writer of GRADE_FORMAL) ---------------
+//
+// Submit a proof obligation to the kernel and, if it verifies, pin the atom
+// FORMAL: set evidence_grade to FORMAL, pin the belief at BEL_FORMAL_PIN
+// (ADR-0087 increment 3), and stamp the atom's proof_ref with the registered
+// proof code. Returns the proof code on VERIFIED, or 0 on FAILED (the atom is
+// left untouched). The caller bundles the kernel inputs into a list to stay
+// under NOVA's 6-arg passing limit.
+//
+// `pkt` shape: [axioms, hyps, proof_tree, claim_term, claim_label,
+//               derivation_blob]
+let VPKT_AXIOMS = 0
+let VPKT_HYPS   = 1
+let VPKT_PROOF  = 2
+let VPKT_TERM   = 3
+let VPKT_LABEL  = 4
+let VPKT_BLOB   = 5
+
+fn verify_packet(axioms, hyps, proof, claim_term, claim_label, blob) {
+    let p = list_new()
+    push(p, axioms); push(p, hyps); push(p, proof)
+    push(p, claim_term); push(p, claim_label); push(p, blob)
+    return p
+}
+
+fn verify_pin_atom(reg, atom, pkt) {
+    let claim_label = pkt[VPKT_LABEL]
+    let axioms      = pkt[VPKT_AXIOMS]
+    let hyps        = pkt[VPKT_HYPS]
+    let proof       = pkt[VPKT_PROOF]
+    let claim_term  = pkt[VPKT_TERM]
+    let blob        = pkt[VPKT_BLOB]
+    // Register the obligation FIRST so we always have a code to record the
+    // verdict against (PROOF_UNCHECKED -> VERIFIED/FAILED, never silently
+    // skipped). The axioms list serialized into the record is the labels-only
+    // shape proofs.nova documents; we project a flat list of atom-term labels.
+    let axiom_labels = list_new()
+    let i = 0
+    while i < len(axioms) {
+        let t = axioms[i]
+        if t_kind_safe(t) == TERM_ATOM { push(axiom_labels, t[1]) }
+        i = i + 1
+    }
+    let code = proof_register(reg, claim_label, axiom_labels, blob)
+    let ok = verify_check(reg, axioms, hyps, proof, claim_term)
+    if ok == 1 {
+        proof_set_status(reg, code, PROOF_VERIFIED)
+        atom_set_evidence_grade(atom, GRADE_FORMAL)
+        atom_set_proof_ref(atom, code)
+        bel_pin_formal(atom_belief(atom), 1)
+        return code
+    }
+    proof_set_status(reg, code, PROOF_FAILED)
+    return 0
+}
+
+// Re-check an atom's existing proof_ref. Use case (ADR-0088 re-check triggers):
+// a referenced lemma lost its FORMAL grade, the proof object was tampered with,
+// or a periodic sweep is running. On success, the verdict is reaffirmed; on
+// failure, the proof's status flips to FAILED and the atom is unpinned -- grade
+// dropped from FORMAL to UNKNOWN and the belief returned to the uniform prior.
+// (Restoring an empirical-grade fallback is left to the ingestion path: this
+// kernel only owns the FORMAL grade and its withdrawal.)
+fn verify_recheck_atom(reg, atom, pkt) {
+    if atom_evidence_grade(atom) != GRADE_FORMAL { return 1 }
+    let ok = verify_check(reg, pkt[VPKT_AXIOMS], pkt[VPKT_HYPS],
+        pkt[VPKT_PROOF], pkt[VPKT_TERM])
+    if ok == 1 { return 1 }
+    // Unpin: flip proof to FAILED, drop the FORMAL grade, reset the belief.
+    let pref = atom_proof_ref(atom)
+    if pref > 0 { proof_set_status(reg, pref, PROOF_FAILED) }
+    atom_set_evidence_grade(atom, GRADE_UNKNOWN)
+    let b = atom_belief(atom)
+    list_set(b, 0, BEL_PRIOR)
+    list_set(b, 1, BEL_PRIOR)
+    return 0
+}

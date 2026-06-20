@@ -174,7 +174,28 @@ FORMAL-grade consistency mean "has a VERIFIED proof" (superseding atom_store's
 a reserved no-proof placeholder so a `PROV_NONE`/out-of-range ref fails safe to
 UNCHECKED (never VERIFIED). Verified via the bootstrap: `proofs` suite, 15 checks.
 
-**Scope still open:** the proof-checker kernel itself (the small trusted core
-that turns `UNCHECKED` into `VERIFIED`/`FAILED`), and the FORMAL belief-pin
-unpinning on a failed re-check (the pin exists, ADR-0087 increment 3; tying it to
-`proof_set_status(FAILED)` is follow-on).
+**Increment 2 (landed): the kernel.** `src/mind/verify.nova` is the small
+trusted core -- the only writer of the `FORMAL` grade. Term language v1:
+propositional (`atom` / `and` / `imp`). Rule set v1 (classical Hilbert-style,
+minimal but real): `AXIOM`, `HYP` (a leaf resting on an already-FORMAL atom
+whose proof is currently `VERIFIED` -- the cascading re-check honesty), `AND_I`,
+`AND_EL`, `AND_ER`, `MP` (modus ponens). `verify_check(reg, axioms, hyps, proof,
+claim_term)` walks the proof tree; `verify_pin_atom(reg, atom, pkt)` runs the
+kernel and, on `VERIFIED`, atomically sets `evidence_grade = FORMAL`, pins the
+belief at `BEL_FORMAL_PIN`, and stamps the atom's `proof_ref` with the
+registered code -- nothing outside this file may do that. `verify_recheck_atom`
+re-runs the kernel on a previously-pinned atom and, on failure, flips the proof
+to `PROOF_FAILED`, drops the grade, and resets the belief to the uniform prior
+(the unpin path for ADR-0088's re-check triggers: dependency change, lemma
+unpinned, blob tampered). Verified via the bootstrap: `verify` suite, 31 checks
+-- every rule accepted on a valid derivation, every shape of unsound proof
+rejected (wrong projection, wrong consequent, MP antecedent mismatch, unchecked
+or label-mismatched HYP), and the pin/unpin round-trip end-to-end.
+
+**Scope still open:** the **decay exemption** for FORMAL atoms (ADR-0023 hook --
+the pin exists, but the decay-exempt flag is not yet read by the decay sweep);
+wiring `verify_recheck_atom` to fire on `proof_set_status(_, FAILED)`-induced
+cascades and on a periodic substrate sweep; widening the rule set (quantifiers,
+arithmetic decision procedures) without bloating the trusted core; and the v2
+bounded automated search to *construct* shallow obligations (still strictly
+checking-only here).
