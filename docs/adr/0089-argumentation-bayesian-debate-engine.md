@@ -196,3 +196,25 @@ doubt -> ~0.99 resolved.
 premise, beyond rebut); preferred semantics for multi-extension contested cases
 (→ ADR-0090); the first-class argument trace to the decision log (ADR-0043); `debate_verdict_for` is now wired as the real ADR-0092 promotion gate (f) --
 a candidate promotes only if its argument wins the debate (inc 4 of ADR-0092).
+
+**Increment 4 (landed): the argument trace (explainability).** `debate.nova` now
+emits a first-class, auditable trace -- `debate_trace_build` / `debate_atom_trace`
+record the claim, the arguments, their attacks, the grounded labelling (IN/OUT/
+UNDEC per argument), the adjudicated confidence, and the contested flag, with
+accessors (`debate_trace_confidence` / `_contested` / `_label` / ...).
+`debate_trace_render` produces human-readable "show your work" text, e.g.:
+
+```
+Debate on claim #0:
+  arg0 FOR (strict-proof, weight 99000) -> IN
+  arg1 AGAINST (defeasible, weight 125) -> OUT
+  => confidence 990
+```
+
+This is the faithful, re-checkable explanation that distinguishes the engine from
+post-hoc LLM rationalization. Verified via the bootstrap: `debate` suite now 34
+checks (trace structure for contested / proof-wins cases + the rendered output).
+
+**Scope still open:** undercut/undermine attacks (beyond rebut); preferred
+semantics for multi-extension contested cases (→ ADR-0090); persisting the trace
+to the append-only decision log (ADR-0043, #9) for after-the-fact audit.
