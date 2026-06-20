@@ -194,5 +194,5 @@ doubt -> ~0.99 resolved.
 
 **Scope still open:** undercut/undermine attacks (attacking an inference step or a
 premise, beyond rebut); preferred semantics for multi-extension contested cases
-(→ ADR-0090); the first-class argument trace to the decision log (ADR-0043); and
-using `debate_atom` as the real promotion gate (f) in ADR-0092.
+(→ ADR-0090); the first-class argument trace to the decision log (ADR-0043); `debate_verdict_for` is now wired as the real ADR-0092 promotion gate (f) --
+a candidate promotes only if its argument wins the debate (inc 4 of ADR-0092).

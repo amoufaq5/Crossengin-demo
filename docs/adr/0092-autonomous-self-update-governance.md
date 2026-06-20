@@ -255,3 +255,15 @@ an ungoverned one are followed); `promotion` 33 checks.
 debate gates via `cand_promote`, beyond the extraction-time license gate); a
 dedicated staging KG partition (multi-KG #8); per-session fetch/promotion budgets;
 and the real debate gate (ADR-0089).
+
+**Increment 4 (landed): the debate gate (f) is real.** `cand_promote` takes a
+`debate_verdict` (DEBATE_PASSED / FAILED / NONE) computed upstream by the debate
+engine's `debate_verdict_for` (ADR-0089: construct arguments -> grounded
+acceptability -> Bayesian adjudication). A FAILED/contested debate freezes the
+candidate CONTESTED instead of promoting it -- promotion is now literally "win the
+argument against existing beliefs", with a proof-backed candidate winning by the
+strict-defeats-defeasible asymmetry. promotion.nova does not import the debate
+engine (that would cycle via reasoning_atoms); it only reads the verdict. Verified
+via the bootstrap: `promotion` 38 checks (incl. lost-debate -> contested,
+won-debate -> promoted) and `debate` 21 checks (the closed loop end-to-end: a
+proof-backed claim promotes, a clash of studies is frozen contested).
