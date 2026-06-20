@@ -238,8 +238,20 @@ provenance from the moment it is minted. Verified: `promotion` suite, 28 checks
 bootstrap can't execute a graph that large; it fails identically with and without
 this change. It runs under a working `bin/nova`.)
 
-**Scope still open:** the answer-path check on `cand_is_usable` (so CANDIDATE
-atoms are actually excluded from answer construction) and the promotion pass that
-moves CANDIDATE -> PROMOTED via `cand_promote`; a dedicated staging KG partition
-(multi-KG #8); per-session fetch/promotion budgets; and the real debate gate
-(ADR-0089).
+**Increment 3 (landed): answer-path exclusion.** Governance now has teeth in
+answers. `cand_is_usable` was corrected so *ungoverned* base/seed knowledge stays
+usable and only governed-but-not-promoted atoms are excluded. `govern_fetched_atom`
+now enforces the load-bearing Rule-3 license gate at mint time — a clean source is
+graded and PROMOTED (usable), an unlicensed/encumbered source is QUARANTINED — and
+forward-chaining (`rk_operators_from`) skips operators whose conclusion is not
+usable, so the reasoner never cites quarantined/candidate knowledge. Conservative:
+a conclusion that doesn't resolve in the reasoning KG is kept (cross-KG operators
+unaffected), and ungoverned atoms pass, so there is no regression
+(`reasoning_atoms` 38 + `reasoning_module` 12 still green). Verified:
+`answer_exclusion` 5 checks (a quarantined conclusion is excluded, a promoted and
+an ungoverned one are followed); `promotion` 33 checks.
+
+**Scope still open:** the fuller promotion *pass* (corroboration / conflict /
+debate gates via `cand_promote`, beyond the extraction-time license gate); a
+dedicated staging KG partition (multi-KG #8); per-session fetch/promotion budgets;
+and the real debate gate (ADR-0089).
