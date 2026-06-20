@@ -39,6 +39,24 @@ A log entry is a tag-prefixed record: `[LOG_ENTRY, seq, timestamp, action_class,
 
 ## Implementation Status
 
+**Increment 4 (landed): governed promotion is audited in the live ingest path.**
+`learn_pipeline.nova` gains a session-scoped audit-log register
+(`lp_set_audit_log`, `_lp_audit_log` -- the same 1-element-list handle idiom as
+the router's). `_lp_govern_audited` wraps `govern_fetched_atom`: it governs the
+freshly-minted atom (license gate -> PROMOTED / QUARANTINED, ADR-0092) and, when
+a log is wired, records the outcome as a `DREC_PROMOTION` entry (claim id =
+atom id, flag = terminal `cand_state`, outcome OK for PROMOTED / VETOED
+otherwise). The three `lp_ingest` mint sites (word loop + both triple endpoints)
+route through it. The recorder lives at the ingest layer, not in
+`promotion.nova`, because `decision_record` imports the debate engine which
+imports `promotion` -- recording from inside promotion would cycle.
+`examples/crossengin_chat` calls `lp_set_audit_log(_boot_log)` at boot beside
+`cr_set_audit_log`, so every governance decision on fetched knowledge lands in
+the same durable log as contested answers. Verified: `lp_audit` 15 checks
+(promotion -> OK entry; quarantine -> VETOED entry; no log wired -> governs but
+records nothing; multi-entry chain stays intact). `learn_pipeline`'s pre-
+existing at-scale segfault is unchanged (additive hook, confirmed via stash).
+
 **Increment 3 (landed): the chat path is audited.**
 `src/agent/cognitive_router.nova` gains a session-scoped audit-log register
 (`cr_set_audit_log`, `_cr_audit_log` — a 1-element list NOVA-idiomatic
