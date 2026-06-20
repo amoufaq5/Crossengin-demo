@@ -215,6 +215,16 @@ This is the faithful, re-checkable explanation that distinguishes the engine fro
 post-hoc LLM rationalization. Verified via the bootstrap: `debate` suite now 34
 checks (trace structure for contested / proof-wins cases + the rendered output).
 
-**Scope still open:** undercut/undermine attacks (beyond rebut); preferred
+**Increment 5 (landed): undermine attacks.** `debate_build_af` now also derives
+UNDERMINE edges (ADR-0089 stage 3): an argument is defeated by refuting the
+*premise* it rests on, not only by rebutting its conclusion. A `darg` carries its
+premise atom (`DARG_PREMISE`); B undermines A iff B concludes A's premise while
+arguing against it. `construct_arguments` sets each argument's premise from the
+operator. Verified via the bootstrap: `debate` suite 37 checks -- an argument
+whose premise is refuted goes OUT and its claim falls to the prior, with rebut /
+construction / trace / closed-loop unchanged.
+
+**Scope still open:** undercut attacks (attacking a defeasible inference step,
+which needs rule identity); preferred
 semantics for multi-extension contested cases (→ ADR-0090); persisting the trace
 to the append-only decision log (ADR-0043, #9) for after-the-fact audit.
