@@ -212,10 +212,26 @@ stamps license; unclean source QUARANTINES before the kernel; kernel
 rejection falls back to CANDIDATE with belief intact; HYP chains promote;
 ingested FORMAL atoms compose into MP chains end-to-end).
 
-**Scope still open:** the **decay exemption** for FORMAL atoms (ADR-0023 hook --
-the pin exists, but the decay-exempt flag is not yet read by the decay sweep);
-wiring `verify_recheck_atom` to fire on `proof_set_status(_, FAILED)`-induced
-cascades and on a periodic substrate sweep; widening the rule set (quantifiers,
-arithmetic decision procedures) without bloating the trusted core; and the v2
-bounded automated search to *construct* shallow obligations (still strictly
-checking-only here).
+**Increment 4 (landed): the decay exemption.** `atom_store.nova` gains
+`atom_decay_exempt(a)` (1 iff grade is FORMAL) and `atom_decay_belief(a,
+retain)` -- the ADR-0023 per-atom belief-decay hook a future periodic sweep
+calls instead of `bel_decay` directly. A verified FORMAL atom is exempt: its
+pinned belief is left untouched ("a theorem does not become less true while
+unobserved"). The exemption is DERIVED from the grade, not stored as a separate
+flag, so it can never drift out of sync and the kernel's unpin path
+(`verify_recheck_atom` dropping the grade on a failed re-check) automatically
+re-enables decay -- the "pin is conditional on re-checkability" contract. The
+GC path was already covered: a pinned belief's strength (~999000) sits far
+above `DEATH_BELIEF`, so a FORMAL atom is never collectable. `tb_decay`
+(bayesian_updates) now delegates to the shared `bel_decay` so the decay math
+has one home. Verified via the bootstrap: `decay_exemption` suite, 13 checks
+(ordinary atom decays; FORMAL atom unchanged under aggressive decay; exemption
+lifts after unpin; tb_decay refactor still decays); `bayesian_updates` 20 still
+green.
+
+**Scope still open:** wiring `verify_recheck_atom` to fire on
+`proof_set_status(_, FAILED)`-induced cascades and on a periodic substrate
+sweep; the periodic belief-decay sweep itself that calls `atom_decay_belief`
+per atom; widening the rule set (quantifiers, arithmetic decision procedures)
+without bloating the trusted core; and the v2 bounded automated search to
+*construct* shallow obligations (still strictly checking-only here).
