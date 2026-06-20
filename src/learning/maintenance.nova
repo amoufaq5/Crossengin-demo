@@ -1,0 +1,143 @@
+// Maintenance scheduler (ADR-0037 cadence hook): the seam the live loop calls
+// once per substrate tick that decides WHEN to run the periodic KG-level
+// sweeps -- belief decay (ADR-0023 / ADR-0088 increment 5) and the atom-death
+// GC (ADR-0025). The sweeps themselves are cadence-agnostic; this module owns
+// the "every N ticks" policy so the loop just calls maint_on_tick(sched, now)
+// and never re-implements the timing.
+//
+// Why a separate scheduler rather than bolting onto td_engine: the tick driver
+// operates on the PART registry (substrate nodes/synapses); these sweeps
+// operate on the KG registry (atoms). Keeping maintenance separate means the
+// substrate clock stays a pure logical clock while a different registry's
+// upkeep rides the same tick count -- the live loop passes td_now(e) in.
+//
+// Cadence is in ticks. Belief decay typically runs far less often than GC (a
+// belief barely moves tick-to-tick), and both run far less often than the
+// 100Hz substrate tick. A `*_every` of 0 disables that sweep. The retention
+// factor is the per-SWEEP decay (not per-tick), so the loop's decay rate is
+// retain_milli applied once every decay_every ticks.
+//
+// ADRs implemented: ADR-0037 (scheduler cadence), ADR-0023/0088 (belief decay
+// + FORMAL exemption, via belief_decay_sweep_all), ADR-0025 (atom GC, via
+// adm_sweep). CrossEngin dependencies: src/learning/belief_decay.nova,
+// src/learning/atom_death_monitor.nova, src/kg/multi_kg_manager.nova.
+
+import "belief_decay.nova"
+import "atom_death_monitor.nova"
+import "../kg/multi_kg_manager.nova"
+
+let MAINT_TAG         = 3710
+let MAINT_REG         = 1   // the KG registry the sweeps run over
+let MAINT_DECAY_EVERY = 2   // run belief decay every N ticks (0 = disabled)
+let MAINT_RETAIN      = 3   // per-sweep retention factor (milli)
+let MAINT_LAST_DECAY  = 4   // tick of the last belief-decay sweep
+let MAINT_GC_EVERY    = 5   // run atom GC every N ticks (0 = disabled)
+let MAINT_LAST_GC     = 6   // tick of the last GC sweep
+
+// New scheduler. GC is disabled by default (gc_every = 0); enable it with
+// maint_enable_gc. last_* start at 0, so the first sweep fires on the first
+// tick at or after `decay_every` (one interval of warm-up, then steady cadence).
+fn maint_new(reg, decay_every, retain_milli) {
+    let s = list_new()
+    push(s, MAINT_TAG)
+    push(s, reg)
+    push(s, decay_every)
+    push(s, retain_milli)
+    push(s, 0)                 // last_decay
+    push(s, 0)                 // gc_every (disabled)
+    push(s, 0)                 // last_gc
+    return s
+}
+
+// Enable (or reconfigure) the atom-death GC at its own cadence.
+fn maint_enable_gc(sched, gc_every) {
+    list_set(sched, MAINT_GC_EVERY, gc_every)
+    list_set(sched, MAINT_LAST_GC, 0)
+    return sched
+}
+
+fn maint_decay_every(s) { return s[MAINT_DECAY_EVERY] }
+fn maint_gc_every(s)    { return s[MAINT_GC_EVERY] }
+
+// A sweep is due if it is enabled (every > 0) and at least `every` ticks have
+// elapsed since it last ran. Using >= against (now - last) makes the cadence
+// robust to a loop that skips tick numbers (the clock can jump).
+fn _maint_due(every, last, now) {
+    if every <= 0 { return 0 }
+    if now - last >= every { return 1 }
+    return 0
+}
+
+// ---- result record --------------------------------------------------------
+// What one maint_on_tick call did, so the loop / audit can observe the budget:
+//   ran_decay : 1 if the belief-decay sweep fired this call
+//   decay     : the belief_decay stats record (0 if it didn't run)
+//   ran_gc    : 1 if the GC sweep fired this call
+//   gc        : [tombstoned, removed, rescued] folded across KGs (0 if no run)
+let MR_RAN_DECAY = 0
+let MR_DECAY     = 1
+let MR_RAN_GC    = 2
+let MR_GC        = 3
+
+fn _maint_result(ran_decay, decay, ran_gc, gc) {
+    let r = list_new()
+    push(r, ran_decay); push(r, decay); push(r, ran_gc); push(r, gc)
+    return r
+}
+
+fn maint_ran_decay(r) { return r[MR_RAN_DECAY] }
+fn maint_decay(r)     { return r[MR_DECAY] }
+fn maint_ran_gc(r)    { return r[MR_RAN_GC] }
+fn maint_gc(r)        { return r[MR_GC] }
+
+// Fold one GC sweep across every KG in the registry. Returns
+// [tombstoned, removed, rescued]. (belief_decay already ships a *_all fold;
+// adm_sweep is per-KG, so we fold here.)
+fn _maint_gc_all(reg) {
+    let tombstoned = 0
+    let removed = 0
+    let rescued = 0
+    let n = kg_count(reg)
+    let k = 0
+    while k < n {
+        let s = adm_sweep(reg, kg_get(reg, k))
+        tombstoned = tombstoned + s[0]
+        removed = removed + s[1]
+        rescued = rescued + s[2]
+        k = k + 1
+    }
+    let out = list_new()
+    push(out, tombstoned); push(out, removed); push(out, rescued)
+    return out
+}
+
+// THE HOOK. The live loop calls this once per substrate tick, passing the
+// current logical clock (td_now / hs_now). It runs whichever sweeps are due and
+// returns a result record. Cheap on the common tick (just two comparisons) --
+// the expensive walks only happen on a due tick. Sweeps run over the registry
+// the scheduler was built with (maint_new).
+fn maint_on_tick(sched, now) {
+    return maint_on_tick_reg(sched, sched[MAINT_REG], now)
+}
+
+// Registry-explicit hook: same cadence policy, but sweep over `reg` rather than
+// the scheduler's default. The live chat loop uses this because the active KG
+// registry changes when the user `/switch`es sessions -- the scheduler carries
+// only the cadence + last-run state, the caller supplies the current registry.
+fn maint_on_tick_reg(sched, reg, now) {
+    let ran_decay = 0
+    let decay = 0
+    let ran_gc = 0
+    let gc = 0
+    if _maint_due(sched[MAINT_DECAY_EVERY], sched[MAINT_LAST_DECAY], now) == 1 {
+        decay = belief_decay_sweep_all(reg, sched[MAINT_RETAIN])
+        list_set(sched, MAINT_LAST_DECAY, now)
+        ran_decay = 1
+    }
+    if _maint_due(sched[MAINT_GC_EVERY], sched[MAINT_LAST_GC], now) == 1 {
+        gc = _maint_gc_all(reg)
+        list_set(sched, MAINT_LAST_GC, now)
+        ran_gc = 1
+    }
+    return _maint_result(ran_decay, decay, ran_gc, gc)
+}
