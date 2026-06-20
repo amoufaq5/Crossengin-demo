@@ -224,7 +224,18 @@ operator. Verified via the bootstrap: `debate` suite 37 checks -- an argument
 whose premise is refuted goes OUT and its claim falls to the prior, with rebut /
 construction / trace / closed-loop unchanged.
 
+**Increment 6 (landed): preferred semantics.** `argumentation.nova` adds
+`af_preferred_extensions` -- the maximal admissible sets (Dung's credulous
+semantics), the distinct *coherent positions* a framework admits where the
+skeptical grounded extension is undecided. A 2-cycle A<->B (empty grounded) yields
+two positions {A} and {B}; a 4-cycle yields {A,C} and {B,D}. `af_num_positions`
+counts them. This is the multi-extension input ADR-0090 steelmans -- each
+preferred extension is one defensible side. Bounded (PREF_MAX_ARGS=16, else
+grounded fallback) since enumeration is exponential. Verified via the bootstrap:
+`argumentation` suite 37 checks (2-cycle/4-cycle multi-position, single, unattacked,
+self-attack).
+
 **Scope still open:** undercut attacks (attacking a defeasible inference step,
-which needs rule identity); preferred
-semantics for multi-extension contested cases (→ ADR-0090); persisting the trace
-to the append-only decision log (ADR-0043, #9) for after-the-fact audit.
+which needs rule identity); using the preferred positions in `debate.nova` /
+ADR-0090 to render contested claims; persisting the trace to the append-only
+decision log (ADR-0043, #9) for after-the-fact audit.
