@@ -177,9 +177,22 @@ Verified via the bootstrap: `debate` suite, 9 checks (single support 0.666, two
 supports 0.75, single against 0.333, contested rebut 0.5 + flagged, strict
 defeats defeasible both directions).
 
-**Scope still open:** stages 1-2 argument *construction* from atoms +
-strict/defeasible rules (deriving `darg` weights from real premise beliefs and
-the grade ledger, and the strict-from-FORMAL flag); undercut/undermine attacks
-(attacking an inference step or a premise, beyond rebut); preferred semantics for
-multi-extension contested cases (→ ADR-0090); and the first-class argument trace
-to the decision log (ADR-0043).
+**Increment 3 (landed): argument construction from atoms (stages 1-2) -- the
+full pipeline on the real KB.** `construct_arguments(rkg, target_id)` builds the
+debate arguments for a claim from the reasoning KG: each operator concluding the
+target is an argument FOR it, an oppositional operator (ROP_OPPOSITE) is an
+argument AGAINST, and each argument's weight and strictness come from its PREMISE
+atom -- `arg_weight_from_atom` = premise confidence (ADR-0023) x grade weight
+(ADR-0087 increment 3), with FORMAL premises given a heavy fixed mass; `arg_strict
+_from_atom` sets the strict flag from a FORMAL grade (ADR-0088). `debate_atom(rkg,
+target_id)` then runs the whole pipeline (construct -> rebut AF -> grounded ->
+adjudicate), so the engine reasons over actual atoms, not synthetic inputs.
+Verified via the bootstrap: `debate` suite now 16 checks -- a strong empirical
+premise -> 0.6, a FORMAL premise -> ~0.99, two clashing defeasible studies ->
+contested 0.5 (flagged for ADR-0090), and a strict proof defeating defeasible
+doubt -> ~0.99 resolved.
+
+**Scope still open:** undercut/undermine attacks (attacking an inference step or a
+premise, beyond rebut); preferred semantics for multi-extension contested cases
+(→ ADR-0090); the first-class argument trace to the decision log (ADR-0043); and
+using `debate_atom` as the real promotion gate (f) in ADR-0092.
