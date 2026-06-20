@@ -192,6 +192,26 @@ unpinned, blob tampered). Verified via the bootstrap: `verify` suite, 31 checks
 rejected (wrong projection, wrong consequent, MP antecedent mismatch, unchecked
 or label-mismatched HYP), and the pin/unpin round-trip end-to-end.
 
+**Increment 3 (landed): the ingestion path is kernel-gated.**
+`src/learning/formal_ingest.nova` is the parallel "supplied derivation" ingest
+path (ADR-0088 path (a)), beside `govern_fetched_atom` for the empirical track.
+`lp_ingest_formal(atom, proofs_reg, src_label, pkt)`: license gate FIRST (an
+unclean source cannot drive a FORMAL pin even with a valid derivation -- Rule
+3 / ADR-0087 redistribution constraint), then the trusted kernel
+(`verify_pin_atom`). On VERIFIED: PROMOTED + grade FORMAL + belief pinned +
+`proof_ref` stamped, atomically. On unclean source: QUARANTINED before the
+kernel runs. On kernel rejection: CANDIDATE at the uniform prior (the caller
+may then route through ordinary empirical promotion as TESTIMONIAL). So the
+ONLY path to a FORMAL grade in the entire engine now bottoms out in a
+machine-checked derivation -- "a source's say-so is never enough" is now
+enforced architecturally, not just stated. HYP-chain ingestion is covered:
+an atom ingested as FORMAL can be reused as a HYP for a downstream proof,
+which then chains through MP / AND / etc. Verified via the bootstrap:
+`formal_ingest` suite, 18 checks (verified-proof PROMOTES + pins FORMAL +
+stamps license; unclean source QUARANTINES before the kernel; kernel
+rejection falls back to CANDIDATE with belief intact; HYP chains promote;
+ingested FORMAL atoms compose into MP chains end-to-end).
+
 **Scope still open:** the **decay exemption** for FORMAL atoms (ADR-0023 hook --
 the pin exists, but the decay-exempt flag is not yet read by the decay sweep);
 wiring `verify_recheck_atom` to fire on `proof_set_status(_, FAILED)`-induced
