@@ -145,3 +145,25 @@ principled, auditable form.
   (HDC retrieval). No new NOVA enhancement strictly required beyond the existing
   graph/arithmetic primitives; benefits from #4 (batched propagation) for
   large argument graphs.
+
+## Implementation status
+
+**Increment 1 (landed): abstract argumentation + grounded acceptability
+(stages 3-4).** `src/parts/reasoning/argumentation.nova` implements the symbolic
+core: an argumentation framework `af_new`/`af_attack` (arguments as indices, a
+binary attack relation, Dung 1995) and `af_grounded` — the grounded labelling
+computed as the least fixed point (an argument is IN iff every attacker is OUT;
+OUT iff some attacker is IN; otherwise UNDEC). `af_grounded_extension` returns the
+accepted set. This is the skeptical "which arguments survive" stage; it is pure
+(builtins only) and exactly testable. Verified via the bootstrap: `argumentation`
+suite, 22 checks — single attack (A in, B out), 2-cycle (both UNDEC, empty
+extension), reinstatement chain A→B→C (A,C in; B out), self-attack (UNDEC),
+unattacked (all in), defense C→B→A (A reinstated), and an unreinstated case (a
+surviving second attacker keeps the target OUT).
+
+**Scope still open:** stage 5 Bayesian adjudication (combine surviving arguments'
+premise beliefs + evidence grades, ADR-0023/0087, into a conclusion confidence);
+stages 1-2 argument construction from atoms + strict/defeasible rules; deriving
+the attack relation from rebut/undercut/undermine over real arguments; preferred
+semantics for contested multi-extension cases (→ ADR-0090); and the first-class
+argument trace to the decision log (ADR-0043).
