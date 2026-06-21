@@ -502,9 +502,27 @@ mortal(socrates), declines immortal(socrates) and mortal(plato)). Incomplete by
 design (no backward search / no unification beyond ground instantiation) -- it
 finds the shallow mechanical derivations v1 search scopes for.
 
-**Scope still open:** universal generalization + existential elimination
-(need eigenvariable + discharge -- the harder, deferred frontier); overflow-safe
-big-integer arithmetic; and a richer search (backward chaining, non-ground
-unification) beyond the v1 forward saturation. The chat wiring is single-
-session-scoped (the `rcks` + formal env hold the boot session's state), the same
-scope cut the audit-log wiring carries.
+**Increment 19 (landed): universal generalization (UG), with the eigenvariable
+condition.** The one ∀-introduction rule that is tractable WITHOUT assumption
+discharge: from a proof of `B[x:=c]` for an eigenconstant `c`, conclude
+`∀x.B` -- but only if `c` is genuinely arbitrary. Soundness is entirely in the
+side conditions the kernel checks: (a) `c` is a constant; (b) `c` does not occur
+in the body `B` (total, not partial, generalization); (c) `B[x:=c]` is exactly
+the sub-proof's conclusion; and (d) THE EIGENVARIABLE CONDITION -- `c` occurs in
+NO axiom or hypothesis the sub-proof depends on (`_proof_uses_const` walks the
+proof's AXIOM/HYP leaves; it deliberately ignores UI-instantiation/EI-witness
+terms, since instantiating a universal AT the fresh `c` is legitimate). Without
+(d) one could "prove" `∀x.P(x)` from a single axiom `P(c)` -- the classic
+unsoundness, now explicitly forbidden and tested. Real new power: `∀x.(P(x)->
+Q(x)), ∀x.P(x) ⊢ ∀x.Q(x)` (UI both at a fresh `c`, MP, UG). Serialization gains
+the `G` tag. Verified via the bootstrap: `verify` 79 (UG from a single instance
+REJECTED; the valid all-P-are-Q derivation; partial-generalization rejected; UG
+over a HYP mentioning `c` rejected) and `proof_serial` 19 (UG round-trips +
+re-verifies, eigenvariable check intact).
+
+**Scope still open:** existential elimination (needs assumption discharge -- the
+remaining hard quantifier rule); overflow-safe big-integer arithmetic; and a
+richer search (backward chaining, non-ground unification, UG-aware) beyond the
+v1 forward saturation. The chat wiring is single-session-scoped (the `rcks` +
+formal env hold the boot session's state), the same scope cut the audit-log
+wiring carries.
