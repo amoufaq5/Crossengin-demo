@@ -223,3 +223,22 @@ NOT reported PROVEN (it falls through to the belief ladder), keeping the pin
 conditional on re-checkability. Verified: `epistemic_status` 23 checks (each
 tier; the lapsed-proof case; the assertable gate). This is the legible face of
 the engine's calibration -- a theorem and a rumor are never reported alike.
+
+**Calibration measurement (landed): are the stated confidences honest?**
+`src/bench/calibration.nova` is the complement to the soundness benchmark.
+Soundness proves the engine never asserts a FALSE proof; calibration measures
+whether its GRADED beliefs are honest -- when it says "0.7", are such claims
+true ~70% of the time. Two standard metrics in integer milli: the Brier score
+(mean squared error of confidence vs 0/1 outcome) and Expected Calibration
+Error (ECE -- the count-weighted gap between each reliability bin's mean
+confidence and its actual hit-rate). ECE isolates CALIBRATION from accuracy: an
+honestly-uncertain engine (0.5 predictions right half the time) scores ECE ~0
+even at 50% accuracy, while systematic overconfidence (0.9 predictions right
+only half the time) scores a ~0.4 gap. `cal_from_atoms` draws samples straight
+from atom beliefs so calibration can be measured over the engine's real graded
+knowledge; `cal_render` reports Brier/ECE/accuracy in plain language (no LLM).
+Verified: `calibration` 18 checks (perfect -> Brier/ECE 0; overconfident-wrong
+-> Brier/ECE 1000; honest-uncertainty -> Brier 250 but ECE 0; exact Brier
+values; ECE catches overconfidence; cal_from_atoms over real beliefs). Together
+with the soundness bench this gives the two halves of "truth-seeking, measured":
+never wrong on a proof, and honest about everything graded.
