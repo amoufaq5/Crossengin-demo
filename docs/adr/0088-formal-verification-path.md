@@ -334,11 +334,31 @@ NOT register; re-assertion pins both times; render strings distinguish the
 outcomes). `crossengin_chat` compiles with the `/axiom` command, the boot
 registries, and the per-turn re-check hook wired.
 
-**Scope still open:** theorems DERIVED from the asserted axioms (an `/prove`-
-style command building MP / AND derivations over the FORMAL leaves) -- the
-axiom seam lands the leaves; derived-theorem ingest is the next; widening the
-rule set (quantifiers, arithmetic decision procedures) without bloating the
-trusted core; and the v2 bounded automated search to *construct* shallow
-obligations (still strictly checking-only here). The chat wiring is single-
-session-scoped (the `rcks` holds the boot session's KG registry), the same
-scope cut the audit-log wiring carries.
+**Increment 10 (landed): derived theorems.** `formal_chat.nova` grows a formal
+environment (label -> [term, proof_code, atom]) so a proof can reference an
+earlier FORMAL proposition by name, and two new operations over it:
+`fc_assert_imp` (assert `L` as the FORMAL implication `A -> C`) and
+`fc_prove_mp` (DERIVE `C` by modus ponens from a FORMAL implication and its
+FORMAL antecedent). The derivation rests on two HYP steps -- one per premise --
+so the kernel records dependency edges from BOTH premises to the new theorem;
+the theorem is a real, kernel-checked FORMAL atom, and invalidating either
+premise CASCADES a withdrawal of it (and the periodic sweep re-checks it). So
+the engine now holds derived theorems, not just asserted axioms. The chat
+exposes `/imply L A C` and `/derive C IMP A` (the formal path; the pre-existing
+`/prove` is the separate forward-chaining reasoning-KG search, untouched).
+A shape mismatch or unknown premise reports CAND_REJECTED (ill-formed request)
+distinctly from a kernel/license failure. Verified via the bootstrap:
+`formal_chat` 27 checks -- MP derives a FORMAL theorem; unknown premise +
+shape mismatch -> REJECTED; the load-bearing case: a derived theorem is
+WITHDRAWN when its premise is cascade-invalidated (the HYP dep edges do their
+job end-to-end through /derive); the theorem auto-registers for re-check; render
+strings distinguish the outcomes. `crossengin_chat` compiles with both commands
+wired.
+
+**Scope still open:** more inference forms at the chat seam (AND intro/elim
+derivations; chained multi-step proofs) -- the MP seam proves the pattern;
+widening the rule set (quantifiers, arithmetic decision procedures) without
+bloating the trusted core; and the v2 bounded automated search to *construct*
+shallow obligations (still strictly checking-only here). The chat wiring is
+single-session-scoped (the `rcks` holds the boot session's KG registry), the
+same scope cut the audit-log wiring carries.
