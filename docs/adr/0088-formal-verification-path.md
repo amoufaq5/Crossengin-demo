@@ -534,9 +534,35 @@ still verifies; `2^32 * 2^32` is refused for ANY claimed RHS, including a
 plausible one). Bounded-but-honest: equalities the engine cannot compute exactly
 are declined, not guessed.
 
-**Scope still open:** existential elimination (needs assumption discharge -- the
-remaining hard quantifier rule); true big-integer (arbitrary-precision)
-arithmetic beyond the 63-bit safe range; and a richer search (backward chaining,
-non-ground unification, UG-aware) beyond the v1 forward saturation. The chat
-wiring is single-session-scoped (the `rcks` + formal env hold the boot session's
-state), the same scope cut the audit-log wiring carries.
+**Increment 21 (landed): existential elimination (EE) -- the discharge rule.**
+The last major inference rule, and the one that genuinely grows the trusted core
+(deferred until now precisely because it needs assumption DISCHARGE). From a
+proof of `exists x.P` and a sub-derivation of `C` that may ASSUME `P(c)` for a
+fresh eigenconstant `c`, conclude `C`. The assumption is a temporary HYP carrying
+the kernel-internal sentinel `EE_ASSUMED`, inserted into the hyp context ONLY for
+the sub-derivation and discharged by the EE step -- it cannot leak (no caller
+ever puts EE_ASSUMED in the top-level context; a dangling HYP at top level fails,
+tested). Soundness rests on: (a) `c` is a constant; (e1) the premise is really
+`exists x.P`; (b) `c` not in the existential; (c) `c` not in `C` (the witness
+cannot leak into the conclusion); (d) the sub-derivation concludes exactly `C`
+under `P(c)`; (f) the EIGENVARIABLE CONDITION -- `c` occurs in no axiom or
+*other* (non-discharged) assumption the sub-derivation uses (`_proof_uses_const`
+gained an `except_label` so the discharged `P(c)` is exempt). Verified via the
+bootstrap: `verify` 87 (the valid `exists x.P(x) + all-P-imply-q |- q`; concluding
+`P(c)` REJECTED -- witness leak; an eigenvariable violation via a c-mentioning
+axiom REJECTED; non-existential premise REJECTED; a dangling top-level HYP
+REJECTED), `proof_serial` 20 (EE round-trips with its discharged label +
+re-verifies). The first-order rule set is now complete: UI, EI, UG, EE.
+
+**Honest note on the trusted core:** EE is the one rule whose soundness is not a
+single local structural match -- it requires the scoped-assumption mechanism +
+the eigenvariable walk. It remains auditable (the EE branch + `_proof_uses_const`
++ the EE_ASSUMED HYP special-case are all readable in one sitting), but it is the
+deliberate, documented exception to the "every rule is a one-line check"
+discipline -- which is why it came last.
+
+**Scope still open:** true big-integer (arbitrary-precision) arithmetic beyond
+the 63-bit safe range; and a richer search (backward chaining, non-ground
+unification, UG/EE-aware) beyond the v1 forward saturation. The chat wiring is
+single-session-scoped (the `rcks` + formal env hold the boot session's state),
+the same scope cut the audit-log wiring carries.
