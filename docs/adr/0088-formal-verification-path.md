@@ -446,10 +446,23 @@ proves true sums/products, refuses `3+3=7`), `reasoning_bench` 27 (9-item bank,
 6 proven incl. arithmetic, still SOUND). Bounded to ground (variable-free)
 arithmetic in the safe integer range -- no overflow checking, the honest scope.
 
+**Increment 16 (landed): subtraction + exact division.** Rounds out the four
+operations: `TERM_SUB` / `TERM_DIV` join add/mul in `_eval_arith`. Subtraction
+handles negatives (`5 - 8 = -3` verifies). Division is EXACT-only: a zero
+divisor or a non-even quotient evaluates to "undefined" (not-ok), so `7 / 2 = 3`
+is REFUSED -- the engine never rounds `3.5` into a false equality, the sound
+choice. Serialization gains the `s` / `d` tags; the `/calc` seam parses `-` and
+`/`; the benchmark bank gains `6/2=3` (proven) and `7/2=3` (refused, inexact).
+Verified: `verify` 60 (sub incl. negatives; exact div verifies; inexact + div-
+by-zero refused), `proof_serial` 15 ((10-4)/2=3 round-trips + verifies),
+`formal_chat` 66 (`/calc` sub/div proves the exact ones, refuses the inexact),
+`reasoning_bench` 27 (11-item bank, 7 proven, still SOUND). `crossengin_chat`
+compiles with the full `{+,-,*,/}` /calc.
+
 **Scope still open:** quantifiers (the genuinely harder widening -- variable
 binding + substitution would materially grow the trusted core, deliberately
-deferred per the small-kernel principle); subtraction/division + overflow-safe
-arithmetic; and the v2 bounded automated search to *construct* shallow
-obligations (still strictly checking-only here). The chat wiring is single-
-session-scoped (the `rcks` + formal env hold the boot session's state), the same
-scope cut the audit-log wiring carries.
+deferred per the small-kernel principle); overflow-safe big-integer arithmetic;
+and the v2 bounded automated search to *construct* shallow obligations (still
+strictly checking-only here). The chat wiring is single-session-scoped (the
+`rcks` + formal env hold the boot session's state), the same scope cut the
+audit-log wiring carries.
