@@ -372,8 +372,31 @@ mis-named conjunct or unknown premise -> REJECTED; and the load-bearing
 `crossengin_chat` compiles with all five formal commands (`/axiom /imply
 /derive /and /andl /andr`) wired and the pre-existing `/prove` untouched.
 
-**Scope still open:** widening the rule set (quantifiers, arithmetic decision
-procedures) without bloating the trusted core; and the v2 bounded automated
-search to *construct* shallow obligations (still strictly checking-only here).
-The chat wiring is single-session-scoped (the `rcks` holds the boot session's
-KG registry), the same scope cut the audit-log wiring carries.
+**Increment 12 (landed): a wider propositional rule set.** The kernel's term
+language gains OR and IFF (every connective is now a uniform binary
+`[kind, left, right]`, so `term_eq` handles them with one recursive case), and
+the rule set gains -- all with NO assumption-discharge machinery, so each stays
+a single structurally-obvious check the trusted core's reader can verify:
+disjunction introduction (`OR_IL` / `OR_IR`: `L |- (L or R)`), biconditional
+introduction + both eliminations (`IFF_I` from the two directions, `IFF_EL` /
+`IFF_ER` recovering each), and hypothetical syllogism (`HS`:
+`(A->B),(B->C) |- (A->C)`). The dep-recording walker recurses into the new
+rules' children, so HYP edges inside them participate in cascade + re-check.
+The chat seam exposes the two highest-value chaining forms: `/hs C AB BC`
+(compose implications) and `/iff C AB BA` (form an equivalence); a composed
+implication can itself be a premise in a further `/hs`, and it cascades when a
+source implication is withdrawn. Verified via the bootstrap: `verify` 45 checks
+(each new rule accepts a valid derivation and rejects unsound variants -- a
+mismatched disjunct, a non-mirroring IFF, a broken HS middle term or wrong
+endpoints) and `formal_chat` 47 checks (HS composes + chains on a derived
+implication; middle-term mismatch + non-mirror IFF -> REJECTED; a composed
+implication cascades when its source is pulled). `crossengin_chat` compiles with
+all seven formal commands (`/axiom /imply /derive /and /andl /andr /hs /iff`)
+wired.
+
+**Scope still open:** quantifiers and arithmetic decision procedures (the
+genuinely harder widening that grows the trusted core -- deliberately deferred
+per the small-kernel principle); and the v2 bounded automated search to
+*construct* shallow obligations (still strictly checking-only here). The chat
+wiring is single-session-scoped (the `rcks` holds the boot session's KG
+registry), the same scope cut the audit-log wiring carries.
