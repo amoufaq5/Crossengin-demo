@@ -570,9 +570,34 @@ budget per call so cyclic premises terminate. Like all search it is UNTRUSTED --
 10 checks (trivial; MP chain; AND-intro; AND-elim; unprovable -> 0; cycle
 safety).
 
-**Scope still open:** true big-integer (arbitrary-precision) arithmetic wired
-into the kernel (a standalone bignum library is the building block); non-ground
+**Increment 23 (landed): arbitrary-precision integer library.**
+`src/mind/bignum.nova` -- signed bignums as `[sign, d0, d1, ...]` base-10000
+little-endian digit lists (digit products <= 1e8, within NOVA's safe range):
+bn_from_int/str, bn_to_str, bn_cmp, bn_eq, bn_add, bn_sub, bn_mul. The building
+block for arithmetic beyond the 63-bit safe range, kept STANDALONE (not yet
+wired into the kernel's TERM_NUM -- that integration is a separate, careful
+step, since it would touch the trusted arithmetic core). Verified: `bignum` 39
+checks (round-trips incl. a 30-digit value + negatives; carry/borrow across
+base; (10^20-1)^2; self-checking identities).
+
+**Increment 24 (landed): LLM transcript ingestion + bench wiring.**
+`src/bench/llm_transcript.nova` ingests RECORDED LLM verdicts (one
+`<id> <affirm|deny>` per line, `#` comments) so a real captured transcript can
+drive the head-to-head instead of hardcoded illustrative values:
+llm_transcript_parse / llm_verdict_for / llm_transcript_from_file (the file read
+mirrors `_dl_read_text`; file syscalls are disabled in this sandbox -- the same
+limit that disables `test_decision_log_durable` -- so the file path is compile-
+verified and the parse pipeline is exercised inline). `reasoning_bench` gains
+`bench_compare_transcript(reg, transcript)`, pairing the default bank with the
+transcript's verdicts by item id (missing -> LLM_DENY). Verified: `llm_transcript`
+6 checks (inline parse, lookups, default); `reasoning_bench` 45 (incl. a
+transcript-driven head-to-head: engine all-correct + zero false proofs, LLM
+>=1 false-confident).
+
+**Scope still open:** wiring bignum into the kernel's `TERM_NUM` for unbounded
+arithmetic (the standalone library is the building block); non-ground
 unification in search (the current forward/backward searches are ground +
-structural); and real captured LLM transcripts feeding the head-to-head bench.
-The chat wiring is single-session-scoped (the `rcks` + formal env hold the boot
-session's state), the same scope cut the audit-log wiring carries.
+structural); and CAPTURING real LLM transcripts (the ingestion path is ready;
+the data is the missing piece). The chat wiring is single-session-scoped (the
+`rcks` + formal env hold the boot session's state), the same scope cut the
+audit-log wiring carries.
