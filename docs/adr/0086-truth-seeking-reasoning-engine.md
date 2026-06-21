@@ -164,3 +164,28 @@ on them landing before Phases 1 (storage) and 5 (consensus).
 DEPENDS ON: NOVA-0006 (infrastructure boundary) for Phases 1 and 5.
 DEPENDS ON: the existing belief (ADR-0023), provenance (ADR-0029), and
 autonomous-research (r50) machinery as the substrate the expansion extends.
+
+## Implementation status
+
+**Phase 7 (down-payment landed): the reasoning benchmark.**
+`src/bench/reasoning_bench.nova` measures the central claim instead of asserting
+it, on the math/logic proving ground (ADR-0093 slice 1). Rule 1 forbids running
+a third-party LLM, so the harness measures the property the claim rests on and
+that next-token prediction cannot structurally guarantee: SOUNDNESS ON
+CHECKABLE QUESTIONS. A mixed bank of provable theorems (each with a real kernel
+proof) and UNPROVABLE claims (no proof / a bogus proof) is run through the
+ADR-0088 kernel; the scorecard tallies proven (with machine-checked proofs),
+refused (honest abstention), correct vs ground truth, missed (incompleteness --
+refused a true theorem, still sound), and the load-bearing FALSE PROOFS count,
+which must be 0. The built-in bank (axiom / MP / AND-intro / hypothetical
+syllogism / biconditional + two unprovable claims) scores 5 proven, 2 refused,
+100% accuracy, 0 false proofs -- SOUND. The `/bench` chat command prints the
+scorecard live. Verified via the bootstrap: `reasoning_bench` 27 checks (the
+perfect-soundness scorecard; the harness FLAGS a deliberately-mislabeled false
+proof and reports UNSOUND, so a kernel regression cannot hide behind a green
+bench; incompleteness is scored as missed, never as unsound; empty-bank guards).
+The gap an LLM cannot close: on the unprovable items, the engine refuses while a
+next-token model answers confidently -- its false-confident rate is bounded by
+training, not by a soundness guarantee. Recording actual LLM baselines on a
+shared bank (and broadening the bank beyond the seed rules) is the remaining
+Phase 7 expansion work.
