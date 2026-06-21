@@ -290,8 +290,31 @@ steady cadence, first-run warm-up, decay disabled, GC opt-in on an independent
 cadence, quiet-tick no-op, and the registry-explicit hook across a switched
 registry); the chat compiles with the hook wired.
 
-**Scope still open:** widening the rule set (quantifiers, arithmetic decision
-procedures) without bloating the trusted core; the v2 bounded automated search
-to *construct* shallow obligations (still strictly checking-only here); and a
-periodic substrate-tick re-check sweep that walks a sample of FORMAL atoms
-through `verify_recheck_atom` to catch silent proof-blob tampering.
+**Increment 8 (landed): the periodic re-check sweep.**
+Increment 7's cascade handles re-check on a KNOWN failure; this is the other
+direction -- proactively re-running the kernel over FORMAL proofs on a cadence
+to catch SILENT corruption (a tampered proof blob, a dependency that changed
+without firing an invalidate) before anything queries the atom.
+`src/mind/recheck.nova` adds a re-check registry (`rck_register(rck, atom,
+pkt)`, called at pin time -- atoms don't carry their packet, so the registry
+holds the (atom, packet) pairs the kernel needs). `rck_sweep_window` re-runs
+`verify_check` over a bounded window and, on any failure, cascades through
+`verify_cascade_invalidate` so one tampered lemma withdraws its whole downstream
+cone. `rcks_on_tick(s, now)` is the cadence wrapper (mirrors maintenance.nova):
+SAMPLED -- each due tick re-checks `sample` entries from a cursor that advances
+and wraps, so a large proof base is amortised rather than fully re-verified on
+any single tick. The FORMAL ingest path (`lp_ingest_formal`) auto-registers
+every atom it pins via a wired-or-not handle (`fi_set_recheck_registry`), so
+producer and consumer compose with no per-call bookkeeping. Verified via the
+bootstrap: `recheck` suite, 27 checks -- a valid proof survives the sweep; a
+proof whose lemma silently flipped is caught and its atom withdrawn to UNKNOWN
+with belief reset; the cursor advances + wraps so all entries are covered over
+successive ticks; due/not-due cadence; disabled cadence is inert; the ingest
+path auto-registers a pinned proof and skips a quarantined one.
+
+**Scope still open:** wiring `rcks_on_tick` into the live loop once a FORMAL
+producer runs in the chat turn loop (the sweep + registry + ingest auto-
+registration are ready; the chat does not yet call `lp_ingest_formal` in its
+turn path); widening the rule set (quantifiers, arithmetic decision procedures)
+without bloating the trusted core; and the v2 bounded automated search to
+*construct* shallow obligations (still strictly checking-only here).
