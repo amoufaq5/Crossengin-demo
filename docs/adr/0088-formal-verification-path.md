@@ -594,10 +594,22 @@ transcript's verdicts by item id (missing -> LLM_DENY). Verified: `llm_transcrip
 transcript-driven head-to-head: engine all-correct + zero false proofs, LLM
 >=1 false-confident).
 
+**Increment 25 (landed): unification-driven search (instantiation discovery).**
+`src/mind/unify.nova` is standard first-order syntactic unification (vars,
+preds, connectives; occurs-check; chained substitutions). `src/mind/search_uni.nova`
+uses it for a backward prover that DISCOVERS how to instantiate a universal law
+by unifying its consequent with the goal -- so it proves `mortal(socrates)` from
+`forall x.(human(x)->mortal(x))` + `human(socrates)` with NO hint about the
+witness (it finds `x:=socrates`, instantiates, recurses on the antecedent).
+UNTRUSTED like all search: `su_solve_ok` gates every constructed proof through
+`verify_check`. Verified: `unify` 14 (atoms/vars/preds/implications; occurs
+check; inconsistent-binding failure; instantiation discovery), `search_uni` 6
+(Socrates discovered; direct universal; a two-law chain; unprovable -> 0; no
+matching predicate -> 0).
+
 **Scope still open:** wiring bignum into the kernel's `TERM_NUM` for unbounded
-arithmetic (the standalone library is the building block); non-ground
-unification in search (the current forward/backward searches are ground +
-structural); and CAPTURING real LLM transcripts (the ingestion path is ready;
-the data is the missing piece). The chat wiring is single-session-scoped (the
-`rcks` + formal env hold the boot session's state), the same scope cut the
-audit-log wiring carries.
+arithmetic (the standalone library is the building block; it would enlarge the
+trusted core, so it is a deliberate, careful step); and CAPTURING real LLM
+transcripts (the ingestion path is ready; the data is the missing piece). The
+chat wiring is single-session-scoped (the `rcks` + formal env hold the boot
+session's state), the same scope cut the audit-log wiring carries.
