@@ -299,3 +299,17 @@ through the r50 research pipeline into `promo_run` (the pass is callable + audit
 ready; the ingest path still uses the lighter `govern_fetched_atom` at mint
 time); a dedicated staging KG partition (multi-KG #8); per-session fetch/
 promotion budgets.
+
+
+**Increment 6 (landed): corroboration is live in the ingest path.**
+`src/learning/corroboration.nova` tracks distinct (claim-label, source) pairs;
+`learn_pipeline.nova` records EVERY concept occurrence (new or existing) via
+`_lp_corroborate` and, the moment a claim is independently corroborated by a
+second source, upgrades its atom EMPIRICAL_WEAK -> EMPIRICAL_STRONG (ADR-0092
+gate (d), now accruing across ingests rather than only at mint time). Wired-or-
+not (`lp_set_corroboration`); only WEAK is upgraded (FORMAL / CONTESTED /
+TESTIMONIAL / already-STRONG untouched); a source re-asserting the same claim
+does not inflate the count. `crossengin_chat` wires a registry at boot. Verified:
+`corroboration` 20 checks (dedup, distinct-source counting); `lp_corroboration`
+5 checks (second source upgrades; same source does not; no-registry inert; only
+WEAK upgraded); `lp_audit` 15 still green; the chat recompiles.
