@@ -394,9 +394,31 @@ implication cascades when its source is pulled). `crossengin_chat` compiles with
 all seven formal commands (`/axiom /imply /derive /and /andl /andr /hs /iff`)
 wired.
 
+**Increment 13 (landed): cross-session persistence (re-checkable).** Persisting
+a FORMAL atom's GRADE alone would be unsound -- on reload it would claim
+theorem-grade with no re-checkable derivation behind it, breaking "the pin is
+conditional on re-checkability". So `src/mind/proof_serial.nova` serializes the
+DERIVATIONS (terms + proof trees, a flat newline-tagged stream parsed by
+recursive descent, no str_eq), and `fc_snapshot` / `fc_restore` round-trip the
+whole formal environment in assertion order. Restore RE-RUNS THE KERNEL on each
+derivation (re-earning every FORMAL grade from verified ground) rather than
+trusting persisted state: a tampered persisted proof simply fails to re-verify
+and is not re-pinned. The env entry now also carries its verification packet +
+source so the derivation can be re-serialized; the restore rebuilds each proof's
+HYP context from the env-so-far. The chat exposes `/fsave [PATH]` and `/fload
+[PATH]` over the same durable-write path snapshots use. Verified via the
+bootstrap: `proof_serial` 11 checks (term/proof round-trips; a parsed proof
+still verifies; a parsed BOGUS proof still fails -- serialization launders
+nothing) and `formal_chat` 58 checks (a 5-proposition env snapshots + restores
+into a fresh registry/KG with all grades FORMAL again; a restored theorem still
+CASCADES when its root is withdrawn -- the dep edges were rebuilt by re-running
+the kernel, not copied; a hand-tampered snapshot entry is refused on restore).
+
 **Scope still open:** quantifiers and arithmetic decision procedures (the
 genuinely harder widening that grows the trusted core -- deliberately deferred
-per the small-kernel principle); and the v2 bounded automated search to
-*construct* shallow obligations (still strictly checking-only here). The chat
-wiring is single-session-scoped (the `rcks` holds the boot session's KG
-registry), the same scope cut the audit-log wiring carries.
+per the small-kernel principle); the v2 bounded automated search to *construct*
+shallow obligations (still strictly checking-only here); and folding the formal
+store into the main chat snapshot path so `/save` carries it automatically (the
+seam exists as `/fsave` / `/fload`). The chat wiring is single-session-scoped
+(the `rcks` + formal env hold the boot session's state), the same scope cut the
+audit-log wiring carries.
