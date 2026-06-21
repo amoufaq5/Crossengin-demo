@@ -312,9 +312,33 @@ with belief reset; the cursor advances + wraps so all entries are covered over
 successive ticks; due/not-due cadence; disabled cadence is inert; the ingest
 path auto-registers a pinned proof and skips a quarantined one.
 
-**Scope still open:** wiring `rcks_on_tick` into the live loop once a FORMAL
-producer runs in the chat turn loop (the sweep + registry + ingest auto-
-registration are ready; the chat does not yet call `lp_ingest_formal` in its
-turn path); widening the rule set (quantifiers, arithmetic decision procedures)
-without bloating the trusted core; and the v2 bounded automated search to
-*construct* shallow obligations (still strictly checking-only here).
+**Increment 9 (landed): FORMAL ingest is live in the chat.**
+`src/agent/formal_chat.nova` is the live producer that makes the whole formal
+machinery real in the running system. A fetched page can't supply a derivation,
+but an AXIOM is itself a valid leaf proof, and a user (or curated math source)
+asserting a foundational axiom IS the "supplied derivation" path. `/axiom
+<label>` -> `fc_assert_axiom`: mints/finds the atom, builds the trivial AXIOM
+leaf proof, and runs it through `lp_ingest_formal` -- so the Rule-3 license gate
+(`user-taught` = OWNER, clean) and the trusted kernel both apply, the pin
+auto-registers for the periodic re-check sweep, and the promotion is audited.
+The chat boot wires a proofs registry + re-check registry (`fc_boot`) and an
+`rcks` scheduler over the boot session's KG; the turn loop now calls
+`rcks_on_tick(_rcks, hs_now(hs))` beside `maint_on_tick_reg`, so a sample of
+pinned proofs is re-verified each cadence and any silent corruption cascades a
+withdrawal. So every piece -- kernel, license gate, FORMAL pin, decay exemption,
+GC immunity, dependency cascade, periodic re-check, decision-log audit -- is now
+exercised end-to-end from a chat command, not just unit tests. Verified via the
+bootstrap: `formal_chat` 16 checks (unbooted is safe; a user axiom pins FORMAL +
+auto-registers + survives a clean sweep; an unclean source quarantines and does
+NOT register; re-assertion pins both times; render strings distinguish the
+outcomes). `crossengin_chat` compiles with the `/axiom` command, the boot
+registries, and the per-turn re-check hook wired.
+
+**Scope still open:** theorems DERIVED from the asserted axioms (an `/prove`-
+style command building MP / AND derivations over the FORMAL leaves) -- the
+axiom seam lands the leaves; derived-theorem ingest is the next; widening the
+rule set (quantifiers, arithmetic decision procedures) without bloating the
+trusted core; and the v2 bounded automated search to *construct* shallow
+obligations (still strictly checking-only here). The chat wiring is single-
+session-scoped (the `rcks` holds the boot session's KG registry), the same
+scope cut the audit-log wiring carries.
