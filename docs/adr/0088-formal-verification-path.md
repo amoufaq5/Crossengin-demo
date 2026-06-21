@@ -561,8 +561,18 @@ the eigenvariable walk. It remains auditable (the EE branch + `_proof_uses_const
 deliberate, documented exception to the "every rule is a one-line check"
 discipline -- which is why it came last.
 
-**Scope still open:** true big-integer (arbitrary-precision) arithmetic beyond
-the 63-bit safe range; and a richer search (backward chaining, non-ground
-unification, UG/EE-aware) beyond the v1 forward saturation. The chat wiring is
-single-session-scoped (the `rcks` + formal env hold the boot session's state),
-the same scope cut the audit-log wiring carries.
+**Increment 22 (landed): backward (goal-directed) proof search.**
+`src/mind/search_back.nova` complements the forward saturating search with a
+goal-directed prover: `sb_prove(premises, goal, budget)` recurses on the goal
+(AXIOM match / AND-intro / MP via a premise `A->goal` / AND-elim), decrementing
+budget per call so cyclic premises terminate. Like all search it is UNTRUSTED --
+`sb_prove_ok` gates the result through `verify_check`. Verified: `search_back`
+10 checks (trivial; MP chain; AND-intro; AND-elim; unprovable -> 0; cycle
+safety).
+
+**Scope still open:** true big-integer (arbitrary-precision) arithmetic wired
+into the kernel (a standalone bignum library is the building block); non-ground
+unification in search (the current forward/backward searches are ground +
+structural); and real captured LLM transcripts feeding the head-to-head bench.
+The chat wiring is single-session-scoped (the `rcks` + formal env hold the boot
+session's state), the same scope cut the audit-log wiring carries.
