@@ -186,6 +186,24 @@ proof and reports UNSOUND, so a kernel regression cannot hide behind a green
 bench; incompleteness is scored as missed, never as unsound; empty-bank guards).
 The gap an LLM cannot close: on the unprovable items, the engine refuses while a
 next-token model answers confidently -- its false-confident rate is bounded by
-training, not by a soundness guarantee. Recording actual LLM baselines on a
-shared bank (and broadening the bank beyond the seed rules) is the remaining
-Phase 7 expansion work.
+training, not by a soundness guarantee.
+
+**Phase 7 (expanded): the head-to-head comparison harness.**
+`reasoning_bench.nova` now scores the SAME bank against a recorded LLM
+transcript. Rule 1 forbids the engine running an LLM, so the harness ingests
+RECORDED verdicts (captured offline) as data and scores both sides against the
+same ground truth, on COMMITMENT: affirm the provable, withhold on the
+unprovable. `bench_compare` -> a comparative scorecard [engine correct, engine
+false-proofs, LLM correct, LLM false-confident]; `bench_compare_render` leads
+with the qualitative gap. The engine's false-proof column is 0 BY CONSTRUCTION
+(its errors are abstentions); affirming an unprovable claim is the live failure
+mode an LLM has and the engine cannot. The chat exposes `/vs`. The shipped
+`bench_default_pairs` is ONE illustrative transcript (clearly labelled --
+real captured recordings drop in unchanged); on it the engine scores 11/11 with
+0 false proofs while the illustrative LLM scores 8/11 with 3 false-confident
+commitments (rounding 7/2 to 3, and committing to two unbacked claims). Verified:
+`reasoning_bench` 40 checks (the engine invariant holds over the comparison --
+all-correct, zero false proofs, regardless of the LLM column; the harness scores
+a controlled 3-item bank's LLM verdicts exactly; the default pairs show the gap).
+Broadening the bank beyond the seed rules and capturing REAL LLM transcripts is
+the remaining expansion -- the harness is ready for them.
