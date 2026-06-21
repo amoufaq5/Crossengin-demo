@@ -520,9 +520,23 @@ REJECTED; the valid all-P-are-Q derivation; partial-generalization rejected; UG
 over a HYP mentioning `c` rejected) and `proof_serial` 19 (UG round-trips +
 re-verifies, eigenvariable check intact).
 
+**Increment 20 (landed): overflow safety -- a soundness guard for arithmetic.**
+Without it the EVAL decision procedure had a real hole: a large product could
+silently wrap 63-bit and EVAL would "verify" a mathematically false equality
+(recomputing the SAME wrong value on both checks). `_eval_arith` now detects
+overflow per operation -- add/sub by signed wrap detection (same-sign sum that
+flips sign; a difference that moves the wrong way), mul by the self-validating
+exactness check (`p / a == b`, which catches wrap AND the backend's large-
+multiply miscompile). An overflowing expression evaluates to UNDEFINED, so EVAL
+REFUSES it rather than asserting a wrong result -- incompleteness, never
+unsoundness. Verified via the bootstrap: `verify` 82 (a safe `1e6*1e6=1e12`
+still verifies; `2^32 * 2^32` is refused for ANY claimed RHS, including a
+plausible one). Bounded-but-honest: equalities the engine cannot compute exactly
+are declined, not guessed.
+
 **Scope still open:** existential elimination (needs assumption discharge -- the
-remaining hard quantifier rule); overflow-safe big-integer arithmetic; and a
-richer search (backward chaining, non-ground unification, UG-aware) beyond the
-v1 forward saturation. The chat wiring is single-session-scoped (the `rcks` +
-formal env hold the boot session's state), the same scope cut the audit-log
-wiring carries.
+remaining hard quantifier rule); true big-integer (arbitrary-precision)
+arithmetic beyond the 63-bit safe range; and a richer search (backward chaining,
+non-ground unification, UG-aware) beyond the v1 forward saturation. The chat
+wiring is single-session-scoped (the `rcks` + formal env hold the boot session's
+state), the same scope cut the audit-log wiring carries.
