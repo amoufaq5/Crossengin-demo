@@ -459,10 +459,31 @@ by-zero refused), `proof_serial` 15 ((10-4)/2=3 round-trips + verifies),
 `reasoning_bench` 27 (11-item bank, 7 proven, still SOUND). `crossengin_chat`
 compiles with the full `{+,-,*,/}` /calc.
 
-**Scope still open:** quantifiers (the genuinely harder widening -- variable
-binding + substitution would materially grow the trusted core, deliberately
-deferred per the small-kernel principle); overflow-safe big-integer arithmetic;
-and the v2 bounded automated search to *construct* shallow obligations (still
-strictly checking-only here). The chat wiring is single-session-scoped (the
-`rcks` + formal env hold the boot session's state), the same scope cut the
-audit-log wiring carries.
+**Increment 17 (landed): first-order quantifiers (bounded, sound).** The kernel
+gains variables, predicate application, and ∀/∃ terms, plus substitution
+(`_subst`) -- and exactly the two quantifier rules that need NO eigenvariable
+condition or assumption discharge: **universal instantiation** (`∀x.B ⊢ B[x:=t]`)
+and **existential introduction** (`Q[x:=w] ⊢ ∃x.Q`). Both are unconditionally
+sound; instantiation/witness terms are restricted to CLOSED terms so the simple
+(non-renaming) substitution cannot capture. Universal generalization +
+existential elimination are DELIBERATELY omitted (they need discharge +
+freshness, which would materially grow the trusted core -- the small-kernel
+principle). Substitution is the one new trusted piece, a standard recursion.
+The whole first-order syllogism is machine-checked end-to-end: `∀x.(human(x) ->
+mortal(x))`, `human(socrates)` ⊢ `mortal(socrates)` via UI then MP. The chat
+seam exposes `/forall L P1 P2` (a universal law), `/fact L PRED CONST`, and
+`/syllogism C LAW FACT` (UI + MP in one step); serialization round-trips the new
+terms + UI/EI so quantified theorems persist + re-verify. Verified via the
+bootstrap: `verify` 75 (UI/EI accept valid, reject wrong substitution + open
+instantiation + witness mismatch + non-forall; the Socrates syllogism;
+quantifier term_eq), `proof_serial` 18 (quantified term + UI/EI round-trip +
+re-verify), `formal_chat` 73 (the `/syllogism` Socrates demo, a mismatched fact
+refused, the derived predicate theorem persists + restores), `reasoning_bench`
+40 (12-item bank incl. a UI item, still SOUND).
+
+**Scope still open:** universal generalization + existential elimination
+(need eigenvariable + discharge -- the harder, deferred frontier); overflow-safe
+big-integer arithmetic; and the v2 bounded automated search to *construct*
+shallow obligations (still strictly checking-only here). The chat wiring is
+single-session-scoped (the `rcks` + formal env hold the boot session's state),
+the same scope cut the audit-log wiring carries.
