@@ -355,10 +355,25 @@ job end-to-end through /derive); the theorem auto-registers for re-check; render
 strings distinguish the outcomes. `crossengin_chat` compiles with both commands
 wired.
 
-**Scope still open:** more inference forms at the chat seam (AND intro/elim
-derivations; chained multi-step proofs) -- the MP seam proves the pattern;
-widening the rule set (quantifiers, arithmetic decision procedures) without
-bloating the trusted core; and the v2 bounded automated search to *construct*
-shallow obligations (still strictly checking-only here). The chat wiring is
-single-session-scoped (the `rcks` holds the boot session's KG registry), the
-same scope cut the audit-log wiring carries.
+**Increment 11 (landed): more inference forms + chained proofs.** The chat seam
+now exposes the kernel's full propositional rule set, not just MP.
+`fc_prove_and` (and-introduction: `(L and R)` from two FORMAL conjuncts) and
+`fc_prove_and_elim` (and-elimination: recover a conjunct from a FORMAL
+conjunction) join `fc_prove_mp`; the chat commands are `/and C L R`, `/andl C
+CONJ`, `/andr C CONJ`. Because every derived theorem is recorded in the formal
+environment with its proof code, proofs CHAIN automatically: a theorem derived
+by MP can be a conjunct in an and-introduction, whose result can feed a further
+step. The dependency edges chain too -- a 3-deep proof `p -> q -> (q and r)`
+withdraws ENTIRELY when its root axiom `p` is invalidated, every link cascading
+through the HYP edges the kernel recorded at each step. Verified via the
+bootstrap: `formal_chat` 38 checks -- and-intro + both elims pin FORMAL; a
+mis-named conjunct or unknown premise -> REJECTED; and the load-bearing
+3-deep chained cascade (invalidating `p` withdraws `p`, `q`, AND `q and r`).
+`crossengin_chat` compiles with all five formal commands (`/axiom /imply
+/derive /and /andl /andr`) wired and the pre-existing `/prove` untouched.
+
+**Scope still open:** widening the rule set (quantifiers, arithmetic decision
+procedures) without bloating the trusted core; and the v2 bounded automated
+search to *construct* shallow obligations (still strictly checking-only here).
+The chat wiring is single-session-scoped (the `rcks` holds the boot session's
+KG registry), the same scope cut the audit-log wiring carries.
