@@ -426,9 +426,30 @@ smuggle a false theorem into the loaded session. The standalone `/fsave` /
 fold wired (the formal modules' behaviour is unchanged from increment 13 --
 `formal_chat` 58, `proof_serial` 11 still green).
 
-**Scope still open:** quantifiers and arithmetic decision procedures (the
-genuinely harder widening that grows the trusted core -- deliberately deferred
-per the small-kernel principle); and the v2 bounded automated search to
-*construct* shallow obligations (still strictly checking-only here). The chat
-wiring is single-session-scoped (the `rcks` + formal env hold the boot session's
-state), the same scope cut the audit-log wiring carries.
+**Increment 15 (landed): ground arithmetic -- "2+2=4 with a checkable proof".**
+The kernel's term language gains numeric literals + `+` / `*` expressions and an
+equality PROPOSITION, plus one new rule `EVAL` that DECIDES a ground equality by
+RECOMPUTING both sides and comparing (`_eval_arith`, the standard total recursive
+evaluation). It stays a small trusted addition because the computation IS the
+justification: EVAL cannot accept a false equality (`3+3=7` fails, `6 != 7`) or a
+non-arithmetic claim (eval refuses atoms/connectives), so soundness is obvious
+from reading the one branch. Serialization (proof_serial) round-trips the new
+terms + EVAL, so arithmetic theorems persist + restore like any other. The chat
+seam is `/calc L A op B C` (e.g. `/calc t 2 + 2 4`); a false sum is refused, not
+pinned. The reasoning benchmark's default bank gains `2+2=4` (proven) and
+`2+2=5` (refused) -- the canonical ADR-0093 example, where the engine cannot be
+argued into `2+2=5` and an LLM can. Verified via the bootstrap: `verify` 55
+checks (true equalities verify incl. nested `(2+3)*4=20`; false + non-arithmetic
+rejected; numeric term_eq by value), `proof_serial` 14 (arith + EVAL round-trip
+still verifies; a restored false EVAL still fails), `formal_chat` 63 (`/calc`
+proves true sums/products, refuses `3+3=7`), `reasoning_bench` 27 (9-item bank,
+6 proven incl. arithmetic, still SOUND). Bounded to ground (variable-free)
+arithmetic in the safe integer range -- no overflow checking, the honest scope.
+
+**Scope still open:** quantifiers (the genuinely harder widening -- variable
+binding + substitution would materially grow the trusted core, deliberately
+deferred per the small-kernel principle); subtraction/division + overflow-safe
+arithmetic; and the v2 bounded automated search to *construct* shallow
+obligations (still strictly checking-only here). The chat wiring is single-
+session-scoped (the `rcks` + formal env hold the boot session's state), the same
+scope cut the audit-log wiring carries.
