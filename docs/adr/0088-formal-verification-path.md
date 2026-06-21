@@ -414,11 +414,21 @@ into a fresh registry/KG with all grades FORMAL again; a restored theorem still
 CASCADES when its root is withdrawn -- the dep edges were rebuilt by re-running
 the kernel, not copied; a hand-tampered snapshot entry is refused on restore).
 
+**Increment 14 (landed): the formal store rides /save and /load.** The formal
+sidecar is now folded into the main chat snapshot path: `_admin_save` writes the
+formal env to a `<snap>.formal` file beside the snapshot whenever something
+formal was asserted, and `_admin_load` reads it back AND re-runs the kernel over
+each persisted derivation. So the snapshot's FORMAL atoms (which carry grade +
+pinned belief in the KGS section) are kept re-checkable -- a `/load` re-proves
+them rather than trusting them, and a corrupted `.formal` sidecar can never
+smuggle a false theorem into the loaded session. The standalone `/fsave` /
+`/fload` remain for manual control. Verified: `crossengin_chat` compiles with the
+fold wired (the formal modules' behaviour is unchanged from increment 13 --
+`formal_chat` 58, `proof_serial` 11 still green).
+
 **Scope still open:** quantifiers and arithmetic decision procedures (the
 genuinely harder widening that grows the trusted core -- deliberately deferred
-per the small-kernel principle); the v2 bounded automated search to *construct*
-shallow obligations (still strictly checking-only here); and folding the formal
-store into the main chat snapshot path so `/save` carries it automatically (the
-seam exists as `/fsave` / `/fload`). The chat wiring is single-session-scoped
-(the `rcks` + formal env hold the boot session's state), the same scope cut the
-audit-log wiring carries.
+per the small-kernel principle); and the v2 bounded automated search to
+*construct* shallow obligations (still strictly checking-only here). The chat
+wiring is single-session-scoped (the `rcks` + formal env hold the boot session's
+state), the same scope cut the audit-log wiring carries.
