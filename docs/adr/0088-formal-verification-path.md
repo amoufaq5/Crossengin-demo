@@ -607,9 +607,33 @@ check; inconsistent-binding failure; instantiation discovery), `search_uni` 6
 (Socrates discovered; direct universal; a two-law chain; unprovable -> 0; no
 matching predicate -> 0).
 
-**Scope still open:** wiring bignum into the kernel's `TERM_NUM` for unbounded
-arithmetic (the standalone library is the building block; it would enlarge the
-trusted core, so it is a deliberate, careful step); and CAPTURING real LLM
-transcripts (the ingestion path is ready; the data is the missing piece). The
-chat wiring is single-session-scoped (the `rcks` + formal env hold the boot
-session's state), the same scope cut the audit-log wiring carries.
+**Increment 26 (landed): bignum wired into the kernel -- unbounded arithmetic.**
+A new `TERM_BIGNUM` literal (arbitrary-precision, payload a bignum list) and a
+new `PROOF_EVALBIG` rule decide arithmetic equalities far beyond the 63-bit
+native range, by recomputing both sides with `bignum.nova` (`bn_add`/`bn_sub`/
+`bn_mul`) and comparing via `bn_eq`. Done ADDITIVELY: the native `TERM_NUM` /
+`PROOF_EVAL` / `_eval_arith` path (overflow-guarded, increment 20) is left
+byte-identical, so `EVAL` still serves small ground arithmetic and `EVALBIG`
+serves the unbounded case. `EVALBIG` is a LEAF that consults no axiom/hyp -- the
+exact bignum recomputation IS the justification -- so it cannot accept a false
+equality (bn_eq is exact, no overflow path) nor a non-arithmetic claim
+(`_eval_big` returns not-ok for atoms/connectives/division). `term_eq` gains a
+`bn_eq` branch; serialization round-trips `TERM_BIGNUM` (`b` tag, via bn_to_str/
+bn_from_str) and `EVALBIG` (`W` tag).
+
+**This DELIBERATELY ENLARGES the trusted core** (documented at the
+`import "bignum.nova"` site): bignum's correctness is now a soundness dependency
+of the kernel -- the one place where ADR-0088's small-kernel principle is
+knowingly traded for a capability (deciding equalities beyond 63 bits). The
+trade was reviewed: bignum is a focused, separately-tested library (39 checks),
+and the existing native path is untouched. Verified via the bootstrap:
+`verify_big` 11 checks (10^30 * 10^30 = 10^60 verifies; a false big equality
+refused; big sum with carry; EVALBIG + TERM_BIGNUM round-trip + re-verify) and
+the FULL regression gate stays green (verify 87, proof_serial 20, formal_chat
+76, reasoning_bench 45, bench_bank_ext 9, search/search_back/search_uni/unify,
+cascade 28, recheck 27, bignum 39); `crossengin_chat` recompiles.
+
+**Scope still open:** CAPTURING real LLM transcripts (the ingestion + scoring
+machinery and a documented methodology are in place; the data is an external,
+offline step). The chat wiring is single-session-scoped (the `rcks` + formal env
+hold the boot session's state), the same scope cut the audit-log wiring carries.
