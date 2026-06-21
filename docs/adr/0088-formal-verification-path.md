@@ -481,9 +481,30 @@ re-verify), `formal_chat` 73 (the `/syllogism` Socrates demo, a mismatched fact
 refused, the derived predicate theorem persists + restores), `reasoning_bench`
 40 (12-item bank incl. a UI item, still SOUND).
 
+**Increment 18 (landed): bounded proof SEARCH (the v2 "construct, don't only
+check").** `src/mind/search.nova` forward-chains over known premises to
+CONSTRUCT a proof of a goal -- but the search is UNTRUSTED: it builds candidate
+proof objects, and `verify_check` remains the sole gate, so however heuristic or
+incomplete the search is it can never yield a false theorem (the LCF discipline:
+an untrusted tactic proposes, the trusted kernel disposes). Strategy: saturating
+forward chaining to a budget -- seed with the premises (AXIOM), then apply MP /
+HS / AND-elim / universal-instantiation-at-supplied-constants, deduping derived
+[term, proof] pairs by `term_eq`, until the goal appears, a fixpoint is reached,
+or the budget is spent. `search_prove_ok` searches AND kernel-confirms. The chat
+seam is `fc_can_derive` / `/search PRED CONST`: ask the engine to AUTO-DERIVE a
+goal from everything in the formal env (it collects the env's propositions as
+premises + the constants to instantiate at). The Socrates conclusion is now
+found with NO supplied derivation. Verified via the bootstrap: `search` 11
+(Socrates auto-derived + kernel-confirmed; MP chains; HS; AND-elim; trivial
+goal; an UNPROVABLE goal returns 0 -- the soundness property; budget
+incompleteness stays sound), `formal_chat` 76 (`/search` derives
+mortal(socrates), declines immortal(socrates) and mortal(plato)). Incomplete by
+design (no backward search / no unification beyond ground instantiation) -- it
+finds the shallow mechanical derivations v1 search scopes for.
+
 **Scope still open:** universal generalization + existential elimination
 (need eigenvariable + discharge -- the harder, deferred frontier); overflow-safe
-big-integer arithmetic; and the v2 bounded automated search to *construct*
-shallow obligations (still strictly checking-only here). The chat wiring is
-single-session-scoped (the `rcks` + formal env hold the boot session's state),
-the same scope cut the audit-log wiring carries.
+big-integer arithmetic; and a richer search (backward chaining, non-ground
+unification) beyond the v1 forward saturation. The chat wiring is single-
+session-scoped (the `rcks` + formal env hold the boot session's state), the same
+scope cut the audit-log wiring carries.
