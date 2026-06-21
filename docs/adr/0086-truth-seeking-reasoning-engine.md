@@ -207,3 +207,19 @@ all-correct, zero false proofs, regardless of the LLM column; the harness scores
 a controlled 3-item bank's LLM verdicts exactly; the default pairs show the gap).
 Broadening the bank beyond the seed rules and capturing REAL LLM transcripts is
 the remaining expansion -- the harness is ready for them.
+
+**Epistemic-status capstone (landed): "how do I know this?"**
+`src/parts/reasoning/epistemic_status.nova` synthesizes every layer's signal
+into ONE calibrated, honest classification per atom: EP_PROVEN (a VERIFIED
+ADR-0088 FORMAL proof backs it), EP_CORROBORATED (strong grounded belief),
+EP_BELIEVED (a modest grounded lean), EP_CONTESTED (grade frozen by the debate
+engine, ADR-0090), EP_REFUTED (grounded evidence against it), or EP_UNKNOWN (no
+grounding -- a first-class answer). `epistemic_render` gives the plain-language
+"how do I know this?" line (no LLM); `epistemic_is_assertable` gates the answer
+path so only PROVEN/CORROBORATED claims may be stated unhedged. Pure synthesis
+over existing substrate state (grade + belief + proof status) -- it asserts
+nothing new (ADR-0020). A FORMAL grade whose proof has LAPSED is deliberately
+NOT reported PROVEN (it falls through to the belief ladder), keeping the pin
+conditional on re-checkability. Verified: `epistemic_status` 23 checks (each
+tier; the lapsed-proof case; the assertable gate). This is the legible face of
+the engine's calibration -- a theorem and a rumor are never reported alike.
