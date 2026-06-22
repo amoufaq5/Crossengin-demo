@@ -1,0 +1,181 @@
+// Raft cluster harness (NOVA-0008, ADR-0086 Phase 5): drives N raft_core nodes
+// through real elections and log replication, in memory and deterministically.
+// raft_core.nova encodes the PER-NODE rules (RequestVote, AppendEntries, majority
+// commit); this layer composes them into CLUSTER behaviour so the system-level
+// safety properties become unit-testable:
+//   - Election Safety:    at most ONE leader in a given term.
+//   - Log Matching:       replicated logs are prefix-consistent.
+//   - State-Machine Safety: a committed entry is identical on every node that
+//                           has reached that commit index.
+// No networking, no timers: a candidate index is chosen explicitly and votes /
+// appends are delivered synchronously. This is the testable meaning of Raft; the
+// real transport (RPC, randomized timeouts) is the separate I/O shell.
+//
+// NOVA gotchas: ids/terms/indexes are small counters, so == is safe; no function
+// exceeds 6 params; no str_eq. CrossEngin dependencies: raft_core.nova only.
+
+import "raft_core.nova"
+
+// ---- cluster construction --------------------------------------------------
+// A cluster is just a list of nodes with ids 0..num-1.
+fn rc_new(num) {
+    let c = list_new()
+    let i = 0
+    while i < num {
+        push(c, rf_new(i))
+        i = i + 1
+    }
+    return c
+}
+
+fn rc_size(c)        { return len(c) }
+fn rc_node(c, i)     { return c[i] }
+fn _rc_majority(c)   { return len(c) / 2 + 1 }
+
+// ---- elections -------------------------------------------------------------
+// Run one election with `cand` as the candidate: it bumps its term, votes for
+// itself, then collects votes from every peer (delivered synchronously). On a
+// majority it becomes leader. Returns 1 if it won, 0 otherwise. Peers adopt the
+// candidate's term and apply the 5.4.1 up-to-date check inside rf_request_vote,
+// so a candidate with a stale log loses exactly as Raft requires.
+fn rc_run_election(c, cand) {
+    let me = c[cand]
+    rf_become_candidate(me)                 // term++, role=candidate, self-vote
+    let term = rf_term(me)
+    let last_idx = rf_last_index(me)
+    let last_term = rf_last_term(me)
+    let votes = 1                            // counts its own self-vote
+    let i = 0
+    while i < len(c) {
+        if i != cand {
+            let r = rf_request_vote(c[i], term, cand, last_idx, last_term)
+            if r[0] == 1 { votes = votes + 1 }
+        }
+        i = i + 1
+    }
+    if votes >= _rc_majority(c) {
+        rf_become_leader(me)
+        return 1
+    }
+    return 0
+}
+
+// Count nodes currently believing they are leader in `term` (Election Safety
+// probe: this must never exceed 1 for any single term).
+fn rc_count_leaders(c, term) {
+    let cnt = 0
+    let i = 0
+    while i < len(c) {
+        if rf_role(c[i]) == RF_LEADER {
+            if rf_term(c[i]) == term { cnt = cnt + 1 }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ---- replication -----------------------------------------------------------
+// The leader's log entries from index 1 (skipping the sentinel) -- what it must
+// drive onto the followers.
+fn _rc_tail(log) {
+    let e = list_new()
+    let i = 1
+    while i < len(log) {
+        push(e, log[i])
+        i = i + 1
+    }
+    return e
+}
+
+// Leader-local append: add `cmd` to the leader's own log at its current term
+// (the entry every follower must converge to). Returns the new last index.
+fn rc_leader_append(c, leader, cmd) {
+    let me = c[leader]
+    push(me[RF_LOG], rf_entry(rf_term(me), cmd))
+    return rf_last_index(me)
+}
+
+// Replicate the leader's log to every follower and advance commit. One synchronous
+// round: (1) AppendEntries the full tail to each follower (Log Matching truncates
+// any divergent suffix); (2) compute the highest index now on a majority via
+// rf_majority_index, committing it only if it is from the CURRENT term (Raft's
+// no-commit-from-prior-terms rule, 5.4.2); (3) heartbeat the new commit so
+// followers advance too. Returns the committed index.
+fn rc_replicate(c, leader) {
+    let me = c[leader]
+    let term = rf_term(me)
+    let entries = _rc_tail(me[RF_LOG])
+    // (1) push entries to each follower.
+    let i = 0
+    while i < len(c) {
+        if i != leader {
+            rf_append_entries(c[i], term, 0, 0, entries, 0)
+        }
+        i = i + 1
+    }
+    // (2) majority match index (the leader counts itself).
+    let matches = list_new()
+    let j = 0
+    while j < len(c) {
+        push(matches, rf_last_index(c[j]))
+        j = j + 1
+    }
+    let target = rf_majority_index(matches)
+    // commit only an entry from the current term.
+    if target > rf_commit(me) {
+        if rf_log_term(me, target) == term {
+            list_set(me, RF_COMMIT, target)
+        }
+    }
+    // (3) heartbeat the new commit so followers catch up.
+    let commit = rf_commit(me)
+    let k = 0
+    while k < len(c) {
+        if k != leader {
+            rf_append_entries(c[k], term, rf_last_index(me), rf_last_term(me), list_new(), commit)
+        }
+        k = k + 1
+    }
+    return commit
+}
+
+// ---- cluster-level safety checks -------------------------------------------
+// Do two nodes agree on every committed entry they share? Compares entry commands
+// up to the smaller of the two commit indexes. Returns 1 if consistent.
+fn _rc_pair_agree(a, b) {
+    let lo = rf_commit(a)
+    if rf_commit(b) < lo { lo = rf_commit(b) }
+    let idx = 1
+    while idx <= lo {
+        if a[RF_LOG][idx][RF_E_CMD] != b[RF_LOG][idx][RF_E_CMD] { return 0 }
+        if a[RF_LOG][idx][RF_E_TERM] != b[RF_LOG][idx][RF_E_TERM] { return 0 }
+        idx = idx + 1
+    }
+    return 1
+}
+
+// State-Machine Safety across the whole cluster: every pair of nodes agrees on
+// their shared committed prefix. Returns 1 if the cluster is consistent.
+fn rc_committed_consistent(c) {
+    let i = 0
+    while i < len(c) {
+        let j = i + 1
+        while j < len(c) {
+            if _rc_pair_agree(c[i], c[j]) == 0 { return 0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Highest commit index reached anywhere in the cluster (handy for assertions).
+fn rc_max_commit(c) {
+    let best = 0
+    let i = 0
+    while i < len(c) {
+        if rf_commit(c[i]) > best { best = rf_commit(c[i]) }
+        i = i + 1
+    }
+    return best
+}
