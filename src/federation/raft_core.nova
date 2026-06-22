@@ -1,0 +1,216 @@
+// Raft consensus core (NOVA-0008, ADR-0086 Phase 5): the log-and-term
+// abstraction the Bully leader-election (leader_election.nova) explicitly defers
+// to "when we need to order WRITES across the federation". This is the SAFETY
+// core of Raft as a pure state machine -- term management, the replicated log,
+// the RequestVote and AppendEntries decision rules, and majority commit. No
+// networking, no timers: the federation transport drives it; here we encode the
+// rules that make it CORRECT (Raft's safety properties), which is the part that
+// must be right and is the part that is unit-testable.
+//
+// Deliberately NOT here (the I/O shell, separate): RPC transport, randomized
+// election timeouts, snapshotting, membership change. Those are mechanism; the
+// invariants below are the meaning.
+//
+// NOVA gotchas: terms/indexes are small counters, so == against them is safe;
+// no function exceeds 6 params; no str_eq. CrossEngin dependencies: none
+// (builtins only).
+
+// ---- roles -----------------------------------------------------------------
+let RF_FOLLOWER  = 0
+let RF_CANDIDATE = 1
+let RF_LEADER    = 2
+
+fn rf_role_name(r) {
+    if r == RF_FOLLOWER  { return "follower" }
+    if r == RF_CANDIDATE { return "candidate" }
+    if r == RF_LEADER    { return "leader" }
+    return "unknown"
+}
+
+// ---- node state ------------------------------------------------------------
+let RF_SELF   = 0   // this node's id
+let RF_ROLE   = 1
+let RF_TERM   = 2   // currentTerm
+let RF_VOTED  = 3   // votedFor this term (-1 == none)
+let RF_LOG    = 4   // log; slot 0 is a sentinel so Raft index == list index
+let RF_COMMIT = 5   // commitIndex
+
+// A log entry [term, command].
+let RF_E_TERM = 0
+let RF_E_CMD  = 1
+fn rf_entry(term, cmd) { let e = list_new() push(e, term) push(e, cmd) return e }
+
+fn rf_new(self_id) {
+    let n = list_new()
+    push(n, self_id)
+    push(n, RF_FOLLOWER)
+    push(n, 0)            // term
+    push(n, 0 - 1)        // votedFor = none
+    let log = list_new()
+    push(log, rf_entry(0, 0))   // index-0 sentinel (term 0)
+    push(n, log)
+    push(n, 0)            // commitIndex
+    return n
+}
+
+fn rf_role(n)       { return n[RF_ROLE] }
+fn rf_term(n)       { return n[RF_TERM] }
+fn rf_voted_for(n)  { return n[RF_VOTED] }
+fn rf_commit(n)     { return n[RF_COMMIT] }
+
+// Last real log index (0 means "empty -- only the sentinel").
+fn rf_last_index(n) { return len(n[RF_LOG]) - 1 }
+fn rf_log_term(n, idx) {
+    if idx < 0 { return 0 }
+    if idx > rf_last_index(n) { return 0 }
+    return n[RF_LOG][idx][RF_E_TERM]
+}
+fn rf_last_term(n)  { return rf_log_term(n, rf_last_index(n)) }
+
+// ---- term / role transitions ----------------------------------------------
+// Adopt a strictly-higher term: step down to follower and clear the vote (Raft
+// "if RPC term > currentTerm, set currentTerm, convert to follower"). Returns 1
+// if a step-down happened.
+fn _rf_maybe_step_down(n, term) {
+    if term > n[RF_TERM] {
+        list_set(n, RF_TERM, term)
+        list_set(n, RF_VOTED, 0 - 1)
+        list_set(n, RF_ROLE, RF_FOLLOWER)
+        return 1
+    }
+    return 0
+}
+
+// Start an election: increment term, become candidate, vote for self.
+fn rf_become_candidate(n) {
+    list_set(n, RF_TERM, n[RF_TERM] + 1)
+    list_set(n, RF_ROLE, RF_CANDIDATE)
+    list_set(n, RF_VOTED, n[RF_SELF])
+    return n[RF_TERM]
+}
+
+// Win the election (caller has confirmed a majority of votes).
+fn rf_become_leader(n) { list_set(n, RF_ROLE, RF_LEADER) return 1 }
+
+// ---- RequestVote (the election-safety rule) --------------------------------
+// Decide whether to grant a vote. Returns [granted(0/1), currentTerm]. Mutates
+// the node (term adoption + recorded vote). Grants iff: the candidate's term is
+// not stale; we have not already voted for someone else this term; and the
+// candidate's log is at least as up-to-date as ours (Raft 5.4.1 -- a higher last
+// term wins, ties break on length). This is what prevents electing a leader that
+// would erase committed entries.
+fn rf_request_vote(n, cand_term, cand_id, cand_last_idx, cand_last_term) {
+    if cand_term < n[RF_TERM] {
+        let r = list_new() push(r, 0) push(r, n[RF_TERM]) return r
+    }
+    _rf_maybe_step_down(n, cand_term)
+    let can_vote = 0
+    if n[RF_VOTED] == (0 - 1) { can_vote = 1 }
+    if n[RF_VOTED] == cand_id { can_vote = 1 }
+    let up_to_date = 0
+    let our_term = rf_last_term(n)
+    let our_idx = rf_last_index(n)
+    if cand_last_term > our_term { up_to_date = 1 }
+    if cand_last_term == our_term {
+        if cand_last_idx >= our_idx { up_to_date = 1 }
+    }
+    if can_vote == 1 {
+        if up_to_date == 1 {
+            list_set(n, RF_VOTED, cand_id)
+            let r = list_new() push(r, 1) push(r, n[RF_TERM]) return r
+        }
+    }
+    let r = list_new() push(r, 0) push(r, n[RF_TERM]) return r
+}
+
+// ---- AppendEntries (the log-matching rule) --------------------------------
+// Truncate the log down to `newlen` entries (keeping indices 0..newlen-1).
+fn _rf_truncate(log, newlen) {
+    while len(log) > newlen {
+        list_remove(log, len(log) - 1)
+    }
+    return 1
+}
+
+// Handle an AppendEntries (also the heartbeat when `entries` is empty). Returns
+// [success(0/1), currentTerm]. Mutates the node. Rejects a stale leader term;
+// rejects unless the entry at prev_idx matches prev_term (the Log Matching
+// Property); on success truncates any conflicting suffix, appends the new
+// entries, and advances commitIndex to min(leader_commit, last index).
+fn rf_append_entries(n, leader_term, prev_idx, prev_term, entries, leader_commit) {
+    if leader_term < n[RF_TERM] {
+        let r = list_new() push(r, 0) push(r, n[RF_TERM]) return r
+    }
+    // A valid (current-or-newer-term) leader: adopt term + follow it.
+    _rf_maybe_step_down(n, leader_term)
+    list_set(n, RF_TERM, leader_term)
+    list_set(n, RF_ROLE, RF_FOLLOWER)
+    let log = n[RF_LOG]
+    // consistency check at prev_idx.
+    if prev_idx > rf_last_index(n) {
+        let r = list_new() push(r, 0) push(r, n[RF_TERM]) return r
+    }
+    if rf_log_term(n, prev_idx) != prev_term {
+        let r = list_new() push(r, 0) push(r, n[RF_TERM]) return r
+    }
+    // splice entries in: skip matching prefix, truncate at first conflict, append.
+    let i = 0
+    let append_from = 0 - 1
+    while i < len(entries) {
+        let idx = prev_idx + 1 + i
+        if idx > rf_last_index(n) {
+            append_from = i
+            i = len(entries)
+        } else {
+            if rf_log_term(n, idx) != entries[i][RF_E_TERM] {
+                _rf_truncate(log, idx)        // keep 0..idx-1
+                append_from = i
+                i = len(entries)
+            } else {
+                i = i + 1                     // already matches; keep
+            }
+        }
+    }
+    if append_from >= 0 {
+        let j = append_from
+        while j < len(entries) {
+            push(log, entries[j])
+            j = j + 1
+        }
+    }
+    // advance commit.
+    if leader_commit > n[RF_COMMIT] {
+        let last = rf_last_index(n)
+        let c = leader_commit
+        if last < c { c = last }
+        list_set(n, RF_COMMIT, c)
+    }
+    let r = list_new() push(r, 1) push(r, n[RF_TERM]) return r
+}
+
+// ---- leader commit advancement --------------------------------------------
+// Given each node's replicated match-index (a list including the leader's own),
+// the highest index replicated on a MAJORITY -- the commit index a leader may
+// advance to. (Raft additionally requires the entry be from the current term;
+// the caller checks rf_log_term == currentTerm before committing.)
+fn rf_majority_index(matches) {
+    let n = len(matches)
+    if n == 0 { return 0 }
+    let majority = n / 2 + 1
+    let best = 0
+    let i = 0
+    while i < n {
+        let cand = matches[i]
+        let c = 0
+        let j = 0
+        while j < n {
+            if matches[j] >= cand { c = c + 1 }
+            j = j + 1
+        }
+        if c >= majority {
+            if cand > best { best = cand }
+        }
+        i = i + 1
+    }
+    return best
+}

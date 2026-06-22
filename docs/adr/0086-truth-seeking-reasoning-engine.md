@@ -242,3 +242,20 @@ Verified: `calibration` 18 checks (perfect -> Brier/ECE 0; overconfident-wrong
 values; ECE catches overconfidence; cal_from_atoms over real beliefs). Together
 with the soundness bench this gives the two halves of "truth-seeking, measured":
 never wrong on a proof, and honest about everything graded.
+
+**Phase 5 down-payment (landed): the Raft consensus core (NOVA-0008).**
+`src/federation/raft_core.nova` is the log-and-term abstraction the Bully
+leader-election (leader_election.nova) explicitly defers to "when we need to
+order WRITES across the federation". It is the SAFETY core of Raft as a pure
+state machine -- term management + step-down, the replicated log, the
+RequestVote rule (election safety 5.4.1: one vote per term + reject a
+less-up-to-date candidate), the AppendEntries rule (Log Matching: reject on a
+prev-entry mismatch, truncate conflicting suffixes, append, advance commit), and
+majority commit (rf_majority_index). No networking/timers/snapshots/membership
+(that I/O shell is separate mechanism); the invariants that make Raft CORRECT
+are here and are unit-tested. Verified: `raft_core` 35 checks (vote granted/
+stale-term/one-per-term/stale-log; append basic+heartbeat, stale-leader reject,
+log-mismatch reject, conflict truncation, idempotent re-delivery; majority index
+incl. the no-majority case; candidate + step-down). This is a Phase 5 building
+block -- distributed multi-node scale remains gated on the transport shell + the
+sharded-KG work, not asserted by this commit.
