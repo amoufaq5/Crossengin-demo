@@ -116,3 +116,18 @@ requirement.
 - DEPENDS ON: no new NOVA enhancement; references #12 (plasticity kernels), #4
   (batched propagation for the learners), and the #14 bridge isolation that backs
   the LLM prohibition.
+
+## Implementation status (landed)
+- `src/learning/learning_policy.nova` (prefix `mlp_`) turns the prose litmus into
+  an **enforceable, testable gate**: `mlp_litmus(online, local, auditable,
+  frozen_artifact)` returns PERMITTED iff online ∧ local ∧ auditable ∧ ¬frozen.
+- A vetted technique table (`LT_BAYESIAN…LT_PREDICTIVE_CODING` permitted;
+  `LT_LLM_COGNITION`, `LT_FROZEN_DEEP_MODEL`, `LT_GLOBAL_BACKPROP`,
+  `LT_OFFLINE_BATCH` forbidden) carries each technique's four-criterion profile;
+  `mlp_technique_decide` runs it through the litmus. **Unknown techniques fail
+  CLOSED to FORBIDDEN** — a new technique must be vetted, never assumed safe.
+- `mlp_ruling(k)` gives a plain-language verdict (no LLM, ADR-0013) that names the
+  *specific* litmus criterion a forbidden technique breaches (frozen-artifact
+  cited first as the headline ADR-0014 breach, then online/local/auditable).
+- Covered by `tests/unit/test_learning_policy.nova` (24 checks): permitted family,
+  forbidden family, per-criterion litmus, fail-closed unknown, and reason text.
