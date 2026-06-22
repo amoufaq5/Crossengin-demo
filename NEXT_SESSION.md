@@ -3,6 +3,98 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R40 -- reasoning capstones + Raft safety layer (proof search → ML-policy gate → consensus)
+
+**Status: complete (all unit-tested, all on branch `claude/confident-fermi-op241b`).**
+A long session that closed out several reasoning frontiers and built the
+federation consensus-safety layer end to end. Every item below is a new file or a
+contained extension with its own passing test; the trusted proof kernel
+(`src/mind/verify.nova`) remained the sole soundness gate throughout.
+
+### Reasoning engine (ADR-0088 proof kernel + ADR-0086)
+
+* **Bounded forward proof search** (`148c035`, #18) and **backward / goal-directed
+  search** (`7a9e931`, #22): untrusted search proposes, the kernel disposes
+  (LCF discipline) -- search never asserts; `verify_check` still gates.
+* **First-order quantifiers** -- UI/EI (`7ab959a`, #17), **universal
+  generalization** with the eigenvariable condition (`0ac8e96`, #19), and
+  **existential elimination** with assumption discharge (`57a56eb`, #21).
+* **Arithmetic in the kernel** -- ground eval `2+2=4` with a checkable proof
+  (`a928176`, #15), subtraction + exact division (`d1c9dad`, #16), an
+  **overflow-safety soundness guard** (`21fb53a`, #20).
+* **Arbitrary-precision integers (bignum)** library (`30d8bc1`, #23) **wired into
+  the kernel** as TERM_BIGNUM + PROOF_EVALBIG (`e0b0d2e`, #26) -- unbounded
+  arithmetic, kernel-checked. (bignum funcs are `mbn_*` in mind to avoid a
+  full-graph collision with `src/safety/bignum.nova`.)
+* **Unification + unification-driven search** (`ee9478e`, #25): auto-discovers
+  instantiations; `su_solve_ok` is kernel-gated.
+* **Epistemic-status capstone** (`83be1e9`): `epistemic_status()` answers "how do I
+  know this?" -- PROVEN / CORROBORATED / BELIEVED / CONTESTED / REFUTED / UNKNOWN
+  (FORMAL-without-a-verified-proof is NOT proven). Wired into chat as **`/grounds`**
+  (`6bb1c9b`) -- distinct from the existing `/why` and `/explain`.
+* **Cross-session persistence of the formal env** (`3728035`, #13) folded into
+  `/save` + `/load` (`d4b3c13`, #14) -- proofs survive a restart and re-check.
+
+### Benchmark + calibration (ADR-0086 Phase 7)
+
+* **Reasoning benchmark** (`8f7360a`) + **head-to-head comparison vs a recorded
+  LLM transcript** (`2b8d3cc`) + **transcript ingestion** (`a587114`, #24) +
+  **extended 26-item bank** with capture methodology (`6186459`).
+* **Calibration measurement** (`f063873`): `cal_brier` + `cal_ece` (10 bins) --
+  separates "never asserts a false proof" (soundness) from graded-belief honesty
+  (calibration). Integer-milli; ECE isolates calibration from accuracy.
+
+### Learning + safety + editions
+
+* **Corroboration tracker** (`570b593`, ADR-0092) made **live in the ingest path**
+  (`3c4e07e`): repeated independent observations upgrade
+  EMPIRICAL_WEAK → EMPIRICAL_STRONG (the full promotion pass).
+* **Capability authorization gate** (`b5ff6ee`, ADR-0094): fail-closed; a
+  governance-touching action is never silently ALLOWed.
+* **Tiered-edition gate** (`66c470d`, ADR-0091): Edge / Enterprise / Research
+  capability matrix.
+* **Enforceable ML-policy gate** (`fe77d8c`, ADR-0096): `src/learning/learning_policy.nova`
+  turns the prose litmus into a testable gate -- PERMITTED iff online ∧ local ∧
+  auditable ∧ ¬frozen; vetted technique table; unknown techniques fail CLOSED;
+  `mlp_ruling` names the breached criterion. (24 checks.)
+
+### Federation consensus-safety layer (NOVA-0008 / ADR-0086 Phase 5)
+
+A complete, unit-tested Raft *safety* core -- the part that must be right -- with
+the I/O shell (RPC transport, randomized timeouts) deliberately deferred:
+
+* **`src/federation/raft_core.nova`** (`cce760d`, 35 checks): per-node rules --
+  term management, RequestVote (election restriction §5.4.1), AppendEntries
+  (Log Matching + conflict truncation), majority commit.
+* **`src/federation/raft_cluster.nova`** (`b99f0ad`, 21 checks): composes the rules
+  into real elections + replication; Election Safety (≤1 leader/term) and
+  State-Machine Safety (committed prefixes agree) as cluster invariants.
+* **`src/federation/raft_partition.nova`** (`b228c00`, 15 checks): the
+  **no-split-brain** guarantee -- majorities counted against the WHOLE cluster, so
+  a minority partition can neither elect nor commit, and a stale minority converges
+  on heal.
+
+### Where to continue (open threads, none blocking)
+
+* **Raft I/O shell** -- RPC transport + randomized election timeouts + snapshotting
+  + membership change. This is networked *mechanism*; the *meaning* (above) is done
+  and tested.
+* **Real captured LLM transcripts** for `bench_compare` (currently a small recorded
+  bank) -- needs external data capture.
+* **NOVA-0007 storage integration**; **embodiment ADR-0095**; the chat
+  run-verification limitation. All larger, none on the critical path.
+
+### Standing constraints (unchanged)
+
+Develop on `claude/confident-fermi-op241b`; never push elsewhere; no PRs unless
+asked. Rule 1 (no third-party deps -- NOVA only). Rule 3 (KB commercially clean).
+ADR-0014 (no LLM cognition). NOVA gotchas that bit this session: flat global
+namespace (a `let`/`fn` name collision across imported files breaks the full-graph
+build even when unit tests pass -- *compile the chat after any shared/verify.nova
+change*); `==`/`!=` structurally deref operands ≥ 0x100000 (use small counters or
+`int_sub(a,b)==0`); `str_find(...) != -1` for "contains" (not `>= 0`); `fn` and
+`match` are reserved; >6 params corrupts args 7+; definition order matters.
+
 ## R39C -- chat-state persistence module (soul + multi-KG + decision-log save/load API)
 
 **Status: complete** -- file-backed save + load API for chat session
