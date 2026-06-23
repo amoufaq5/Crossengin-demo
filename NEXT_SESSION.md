@@ -100,6 +100,32 @@ a really-booted formal subsystem. Fixing the startup segfault (so the whole REPL
 is drivable) is its own thread; it touches the trusted NOVA toolchain, so it wants
 care, not a quick patch.
 
+#### ROOT CAUSE (found -- it is a NOVA toolchain bug, not chat-specific)
+
+The crash is **`io_println` on a bare string LITERAL**, and it reproduces in a
+two-line hello-world under both `nova run` and `nova build`. It is masked in the
+green test suite only because `ce_test`/`ce_summary` print *concatenated* (heap)
+strings, never bare literals -- so passing runs dodge it (a FAILING test's literal
+`FAIL:` message would also crash).
+
+It is a gap in NOVA's in-flight **pointer-tagging migration** (NOVA commits
+`f033ca1` "alloc tags address … store8/load8 untag at hw boundary", `3842732`,
+`359a000`, `1f0cfc4`). The canonical convention is: a raw address `A` is carried as
+the **tagged** value `2A+1` (`alloc` does `lea rax,[rax+rax+1]`), and `load8` /
+`store8` `sar rdi,1` to recover `A`. **String literals violate it**: codegen emits
+`lea rax,[rip + _str_N]` (raw `A`, untagged) at `src/compiler/codegen.nova:4625`,
+so `str_len`'s `load8(s+i)` halves the literal address and faults
+(`A -> A/2`, observed `0x5ec6b6 -> 0x2f635b`).
+
+Proven first step: tagging the literal (`lea rax,[rax+rax+1]` after the `lea`)
+moves the fault PAST `str_len` -- but `io_print` then crashes at the list-header
+probe `cmpq $-1,(%rax)`, because `str_data` / `sys_write` / that probe also assume
+a raw pointer. So the real fix is a **multi-site untag audit** of the string/print
+runtime (`src/runtime/io.nova` io_print/sys_write/str_data, `src/runtime/string.nova`)
+PLUS the codegen literal tag -- a focused NOVA-repo change that MUST be gated by
+`nova self-host` (the self-host fixpoint) and a hello-world `io_println("literal")`
+smoke test, not a one-liner. Until then, drive command logic headlessly as above.
+
 ### Standing constraints (unchanged)
 
 Develop on `claude/confident-fermi-op241b`; never push elsewhere; no PRs unless
