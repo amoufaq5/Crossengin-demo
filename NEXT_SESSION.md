@@ -117,14 +117,65 @@ the **tagged** value `2A+1` (`alloc` does `lea rax,[rax+rax+1]`), and `load8` /
 so `str_len`'s `load8(s+i)` halves the literal address and faults
 (`A -> A/2`, observed `0x5ec6b6 -> 0x2f635b`).
 
-Proven first step: tagging the literal (`lea rax,[rax+rax+1]` after the `lea`)
-moves the fault PAST `str_len` -- but `io_print` then crashes at the list-header
-probe `cmpq $-1,(%rax)`, because `str_data` / `sys_write` / that probe also assume
-a raw pointer. So the real fix is a **multi-site untag audit** of the string/print
-runtime (`src/runtime/io.nova` io_print/sys_write/str_data, `src/runtime/string.nova`)
-PLUS the codegen literal tag -- a focused NOVA-repo change that MUST be gated by
-`nova self-host` (the self-host fixpoint) and a hello-world `io_println("literal")`
-smoke test, not a one-liner. Until then, drive command logic headlessly as above.
+#### DEEPER FINDING (full investigation -- it is a half-finished migration, NOT a bounded fix)
+
+A second pass with gdb/objdump/empirical probes corrected the picture. The NOVA
+runtime currently has **multiple coexisting value conventions**:
+- native builtins (`println`, `print`, `_nova_len`, `_nova_concat`) operate on
+  **raw** pointers -- so `println("literal")` WORKS and `_nova_len`/concat walk raw
+  bytes;
+- the memory intrinsics (`alloc`, `load8`, `store8`, `load64`, `store64`) use the
+  **tagged-address** convention (`alloc` returns `2A+1`; load/store `sar` to untag)
+  -- the f033ca1 migration converted these for tensor/hdc/SIMD;
+- nova integers are tagged `2n+1`, but **kernel fds returned by the syscall asm
+  wrappers are raw**, and the wrappers pass their scalar args (fd/count/flags) to
+  the kernel **without untagging**;
+- string LITERALS and `_nova_concat` output are **raw**.
+
+The std library (`src/runtime/string.nova`, `io.nova`) is written against the OLD
+all-raw convention but calls the NOW-tagged `load8`/`store8`/`alloc` -- so it is
+broken for user programs. Symptoms confirmed: `io_println("x")` segfaults; ANY
+program importing `std/io` segfaults; the 13 currently-failing NOVA tests
+(`test_runtime`, `test_stdlib`, `test_json`, `test_knowledge`, `test_sum_types`,
+`test_persistent_alloc`, `test_udp_syscalls`, … -- mostly exit 139) are the
+casualties. The green 164 pass only because they output via native `print_int` +
+`println("literal")`, which take the working raw path.
+
+Why it is NOT a small fix: the smoking gun is `_nova_add`'s `.add_int` path
+(`lea rax,[rdi+rsi]; dec` = `a+b-1`). For `ptr + tagged_int` to land on the right
+byte, the pointer MUST be tagged `2A+1` (then `(2A+1)+(2i+1)-1 = 2(A+i)+1`,
+untagged by load8). A raw pointer makes `ptr + i` land at `ptr + 2i` (offset
+doubling). So pointers are forced tagged -- which means making string
+literals/concat consistent requires `_nova_len`/`_nova_concat`/literal-emission
+(all compiler-shared, in `gen_runtime`) to go tagged too, plus tagging list
+pointers (the `cmpq $-1,(rdi)` list-header probe derefs raw). It is all-or-nothing
+across the compiler's core string/list/memory handling -- exactly why f033ca1
+explicitly scoped AWAY from the compiler path ("Compiler doesn't call these so
+fixpoint holds") and shipped the migration incrementally (`154/177` → `157/177` →
+`164/177` …).
+
+#### Staged plan to finish it (a dedicated NOVA-repo effort, gated)
+
+Self-host check (`make self-host` → "SELF-HOSTING VERIFIED") currently PASSES and is
+the backstop; baseline test suite is 164/184 pass, 13 fail, 7 skip (capture the
+failing set first so regressions are distinguishable). Then, incrementally, each
+step gated by self-host + the full `bash tests/run_tests.sh`:
+1. Pick ONE convention (tagged, matching the migration) and apply it to the
+   compiler-shared runtime: tag string-literal emission (`codegen.nova:4625`),
+   make `_nova_len` and `_nova_concat` untag inputs / tag outputs, ensure list
+   pointers are tagged consistently. Keep `make self-host` green at every step.
+2. Reconcile the syscall wrappers (`src/runtime/syscall.nova`): untag SCALAR args
+   (fd/count/flags/mode/size/offset), keep POINTER args raw, and TAG return values
+   so kernel fds become normal tagged nova ints.
+3. Bring `string.nova`/`io.nova` onto the same convention (they are NOT in
+   `COMPILER_SRC`, so they are self-host-safe to change).
+4. Smoke test: `io_println("literal")` in a 2-line program must print and exit 0;
+   the 13 failing tests should go green without regressing the 164.
+
+This session: root-caused + scoped it precisely and PROVED it is a staged compiler
+migration, not a one-liner; deliberately did NOT half-land it on the trusted
+self-hosting compiler. Until it is done, drive chat/command logic headlessly (see
+`tests/unit/test_formal_consistency.nova`).
 
 ### Standing constraints (unchanged)
 
