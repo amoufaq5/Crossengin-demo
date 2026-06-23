@@ -84,6 +84,22 @@ the I/O shell (RPC transport, randomized timeouts) deliberately deferred:
 * **NOVA-0007 storage integration**; **embodiment ADR-0095**; the chat
   run-verification limitation. All larger, none on the critical path.
 
+### Chat run-verification limitation (diagnosed this session)
+
+The `examples/crossengin_chat` binary **SIGSEGVs at NOVA-runtime startup** --
+strace shows the crash immediately after the initial `brk` calls, BEFORE the
+first `write` (no banner) and before `main`. It is therefore not an input/EOF or
+TTY issue (reproduces with `</dev/null`, here-strings, and pipes alike) and is
+**pre-existing** -- the chat built from `HEAD~1` crashes identically. Root cause is
+in the runtime/codegen startup for this very large program (the assembler also
+warns on the generated `.s`). Consequence: REPL commands cannot be smoke-tested by
+driving the binary here. Mitigation landed: exercise command logic headlessly --
+e.g. `tests/unit/test_formal_consistency.nova` drives the exact `/not` +
+`/consistency` code path (fc_assert_imp + fc_env_axioms + con_scan_axioms) against
+a really-booted formal subsystem. Fixing the startup segfault (so the whole REPL
+is drivable) is its own thread; it touches the trusted NOVA toolchain, so it wants
+care, not a quick patch.
+
 ### Standing constraints (unchanged)
 
 Develop on `claude/confident-fermi-op241b`; never push elsewhere; no PRs unless
