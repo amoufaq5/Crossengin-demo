@@ -177,6 +177,47 @@ migration, not a one-liner; deliberately did NOT half-land it on the trusted
 self-hosting compiler. Until it is done, drive chat/command logic headlessly (see
 `tests/unit/test_formal_consistency.nova`).
 
+#### DEEPER ATTEMPT (step-1 findings, WIP scrapped and reverted)
+
+Went one layer deeper on a bounded step-1 fix and hit two additional constraints
+worth recording so the next attempt doesn't repeat them:
+
+- **The sidestep pattern WORKS locally.** Rewriting `string.nova` to do address
+  arithmetic inside tiny `asm{}` helpers (`raw_alloc` = untag `alloc`; `raw_load8`
+  = `mov rdi,[rbp-8]; sar rdi,1; add rdi,rsi>>1; movzx eax,byte ptr [rdi]; lea
+  rax,[rax+rax+1]`; `raw_store8`; `raw_ptr_add`) sidesteps the `ptr + tagged_int`
+  offset-doubling. On this branch, empirical: `io_println("literal")`, string
+  concat, `int_to_str(42)`, `str_slice`/`str_contains` on literals ALL WORKED
+  with self-host still green -- validates the raw-convention plan.
+- **BUT: routing `io_print`/`io_println` through the raw helpers still crashed**
+  in a *second, distinct* bug -- a codegen quirk on RUNTIME-TO-RUNTIME indirect
+  calls (`cmpq $-1,(%rax)` list-type probe on an uninitialized closure slot when
+  `io.nova` calls `str_data`/`str_len`/`raw_alloc` defined in `string.nova`). The
+  workaround that landed: `io_print(s){print(s)}` / `io_println(s){println(s)}`
+  route through the native builtins, which take raw strings correctly. That
+  passes T1/T2/T3/T7 but leaves `io_input()` broken because it must call
+  `raw_alloc`/`str_new` (no builtin equivalent) -- so the indirect-call bug
+  blocks completing this step.
+- **Std dependency table needs updating too.** `src/pkg/pkg.nova` registers `io`
+  and `string` as separate packages, so `import "std/io"` does NOT auto-bundle
+  `string.nova` -- any `io.nova` function that references `str_*` sees an
+  undefined label. Add `string` (and `syscall`) as `io`'s deps in `pkg.nova`
+  before landing io.nova changes that call into string.nova.
+- **Test-suite baseline captured:** 164 pass / 13 fail / 7 skip. The 13 failers
+  are the std-io casualties (`test_runtime`, `test_stdlib`, `test_json`,
+  `test_knowledge`, `test_persistent_alloc`, `test_sum_types`, `test_udp_syscalls`,
+  `test_coro_advanced`, `test_imagination`, `test_ffi_syscall`, `test_flow_ops`,
+  `test_float_utils`, `test_cognitive_llm`). The WIP maintained no regressions
+  but did not net-move the suite (the residual crashes are the same
+  file-I/O + indirect-call paths). Both files reverted to baseline; NOVA repo
+  clean; self-host still VERIFIED.
+
+Order of operations for a future attempt: (1) understand the runtime-to-runtime
+indirect-call quirk first (isolate the failing lowering in `codegen.nova`); (2)
+add the pkg-deps entry; (3) then finish string/io.nova on the raw sidestep
+pattern. The sidestep is validated; the indirect-call codegen bug is the actual
+blocker.
+
 ### Standing constraints (unchanged)
 
 Develop on `claude/confident-fermi-op241b`; never push elsewhere; no PRs unless
