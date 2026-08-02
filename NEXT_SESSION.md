@@ -245,13 +245,16 @@ using the reliable OOB fallback. 23-check unit test.
 *Migrated to `list_remove_at` this session:*
 - `agent/formal_chat.nova` (retract env-remove) -- was silently corrupting on
   successive retracts; caught by the /retractions log tests.
+- `substrate/signal_dispatch.nova:218` (sigq_pop) -- was silently violating
+  FIFO order within a priority bucket (`test_priority_queue_ordering`
+  "pop EXCITE#2 fourth" was failing 101 -> 100 in the baseline). Fix landed
+  + regression guard `test_fifo_deep_same_priority` covers N=5 same-bucket
+  pops. `signal_dispatch` now 53 passing (was 46 with 1 latent failure).
 
 *NOT YET MIGRATED (arbitrary-index removes; could be silently corrupting):*
 - `federation/turn.nova:2185, 2197` -- perms/chans by index
 - `federation/turn_server.nova:414, 902, 1219, 1230, 1241` -- pool/allocs/perms/chans by index
 - `substrate/synapse_graph.nova:391` -- `list_remove(outs, j)` -- arbitrary
-- `substrate/signal_dispatch.nova:218` -- `list_remove(bucket, 0)` -- the
-  "remove first" pattern is BROKEN for len >= 2 (removes idx 1)
 - `scheduler/event_dispatch.nova:76` -- `list_remove(l, best)` -- arbitrary
 - `learning/self_learning_triggers.nova:162` -- `list_remove(q, i)` -- arbitrary
 
