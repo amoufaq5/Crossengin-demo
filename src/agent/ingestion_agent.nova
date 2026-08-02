@@ -1,0 +1,226 @@
+// CrossEngin ingestion agent (skill-shaped).
+//
+// The composition point for every ingest path. An ingestion agent owns:
+//   * a source_whitelist (which sources are trusted enough to ingest
+//     directly; unknown sources land in the review queue)
+//   * a source_registry (format-name -> format-tag dispatch)
+//   * a KG registry (the state atoms actually land in)
+//   * a meta-observer (attribution / atrophy tracking)
+//   * a review queue (for records from untrusted sources or failed ingests)
+//
+// The agent exposes ONE run entry point:
+//
+//   ing_agent_run(agent, format_name, path, kg_hint, extra) -> summary
+//
+// which:
+//   1. Looks up the format in source_registry.
+//   2. Dispatches to the matching importer (records/csv/nt/wikidata/
+//      conceptnet/papermeta/wordnet/llm) via ing_dispatch_parse.
+//   3. Iterates over the parsed records:
+//        - if the source_tag's host/prefix is whitelisted (or the format
+//          is the CrossEngin-native cerec importer), the record ingests
+//          straight through the pipeline and attributes atoms via mo.
+//        - otherwise the record is submitted to the review queue for
+//          owner approval.
+//   4. Returns a summary list:
+//        [ok_records, queued_records, dropped_records, total_atoms_added,
+//         parse_error_count]
+//
+// This is deliberately narrow: the agent COMPOSES ingest primitives; it
+// does NOT reason about content or make ontology decisions. Those are the
+// pipeline's job (atom seeding, implication wiring), and the operator's
+// job (approve/deny at the review queue).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/{curriculum, pipeline, review_queue, source_registry}
+//   src/ingest/importers/{records, csv_facts, nt_triples, wikidata,
+//                         conceptnet, paper_meta, wordnet}
+//   src/learning/source_whitelist.nova
+//   src/util/str_safe.nova.
+
+import "../ingest/curriculum.nova"
+import "../ingest/pipeline.nova"
+import "../ingest/review_queue.nova"
+import "../ingest/source_registry.nova"
+import "../ingest/importers/records.nova"
+import "../ingest/importers/csv_facts.nova"
+import "../ingest/importers/nt_triples.nova"
+import "../ingest/importers/wikidata.nova"
+import "../ingest/importers/conceptnet.nova"
+import "../ingest/importers/paper_meta.nova"
+import "../ingest/importers/wordnet.nova"
+import "../learning/source_whitelist.nova"
+import "../util/str_safe.nova"
+
+// ---- agent slots ----------------------------------------------------------
+let ING_AGENT_KGREG        = 0
+let ING_AGENT_MO           = 1
+let ING_AGENT_SOURCES      = 2   // source_registry
+let ING_AGENT_WHITELIST    = 3   // sw_new()
+let ING_AGENT_QUEUE        = 4   // rq_new()
+let ING_AGENT_TRUSTED_TAGS = 5   // list of source-tag PREFIXES to trust
+                                 // (like "src:pack:", "src:cerec:") -- these
+                                 // bypass whitelist + queue and go direct
+                                 // to the pipeline.
+let ING_AGENT_FIELDS       = 6
+
+// ---- summary slots --------------------------------------------------------
+let ING_SUM_OK       = 0
+let ING_SUM_QUEUED   = 1
+let ING_SUM_DROPPED  = 2
+let ING_SUM_ATOMS    = 3
+let ING_SUM_ERRORS   = 4
+
+// ---- constructors ---------------------------------------------------------
+
+// A fresh agent wired to its own registries + defaults.
+fn ing_agent_new() {
+    let a = list_new()
+    push(a, kg_registry_new())          // KGREG
+    push(a, mo_new())                   // MO
+    let sr = reg_source_new()
+    reg_source_install_defaults(sr)
+    push(a, sr)                         // SOURCES
+    push(a, sw_new())                   // WHITELIST (empty by default)
+    push(a, rq_new())                   // QUEUE
+    let trusted = list_new()
+    push(trusted, "src:pack:")          // seed packs (already vetted at compile)
+    push(trusted, "src:cerec:")         // author-typed .cerec files
+    push(trusted, "src:user:")          // interactive user assertions
+    push(a, trusted)                    // TRUSTED_TAGS
+    return a
+}
+
+// Convenience: attach an existing registry / observer instead of fresh
+// (so the agent participates in the session's shared KG state).
+fn ing_agent_bind(kgreg, mo) {
+    let a = ing_agent_new()
+    list_set(a, ING_AGENT_KGREG, kgreg)
+    list_set(a, ING_AGENT_MO, mo)
+    return a
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn ing_kgreg(a)     { return a[ING_AGENT_KGREG] }
+fn ing_mo(a)        { return a[ING_AGENT_MO] }
+fn ing_sources(a)   { return a[ING_AGENT_SOURCES] }
+fn ing_whitelist(a) { return a[ING_AGENT_WHITELIST] }
+fn ing_queue(a)     { return a[ING_AGENT_QUEUE] }
+
+// Add a trusted source-tag prefix.
+fn ing_agent_trust_prefix(a, prefix) {
+    let t = a[ING_AGENT_TRUSTED_TAGS]
+    let i = 0
+    while i < len(t) {
+        if str_eq_bytes(t[i], prefix) == 1 { return 0 }
+        i = i + 1
+    }
+    push(t, prefix)
+    return 1
+}
+
+fn ing_agent_trusted_prefixes(a) { return a[ING_AGENT_TRUSTED_TAGS] }
+
+// True if `src_tag` starts with any registered trusted prefix.
+fn _ing_is_trusted(a, src_tag) {
+    let t = a[ING_AGENT_TRUSTED_TAGS]
+    let n = len(src_tag)
+    let i = 0
+    while i < len(t) {
+        let p = t[i]
+        let pn = len(p)
+        if n >= pn {
+            let ok = 1
+            let j = 0
+            while j < pn {
+                if char_at(src_tag, j) != char_at(p, j) { ok = 0 j = pn }
+                else { j = j + 1 }
+            }
+            if ok == 1 { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- dispatch to importer -------------------------------------------------
+
+// Returns [records_list, errors_list] for the given format+path.
+// kg_hint is the destination KG name (record parsers embed this into their
+// output). extra is a format-specific auxiliary path (e.g. wikidata labels).
+fn ing_dispatch_parse(sources, format_name, path, kg_hint, source_tag, extra) {
+    let tag = reg_source_tag(sources, format_name)
+    if tag == FMT_UNKNOWN {
+        let recs = list_new() let errs = list_new()
+        let e = list_new() push(e, 0) push(e, "unknown format: " + format_name)
+        push(errs, e)
+        let out = list_new() push(out, recs) push(out, errs) return out
+    }
+    if tag == FMT_CEREC       { return cerec_parse(path) }
+    if tag == FMT_CSV         { return csv_parse(path, kg_hint, source_tag) }
+    if tag == FMT_NTRIPLES    { return nt_parse(path, kg_hint, source_tag) }
+    if tag == FMT_WIKIDATA    { return wd_parse(path, kg_hint, source_tag, extra) }
+    if tag == FMT_CONCEPTNET  { return cn_parse(path, kg_hint, source_tag) }
+    if tag == FMT_PAPERMETA   { return pm_parse(path, kg_hint) }
+    if tag == FMT_WORDNET     { return wn_parse(path, kg_hint, source_tag) }
+    if tag == FMT_LLM_EXTRACT { return cerec_parse(path) }  // same wire, different trust
+    let recs = list_new() let errs = list_new()
+    let e = list_new() push(e, 0) push(e, "no dispatch for tag " + reg_source_name(tag))
+    push(errs, e)
+    let out = list_new() push(out, recs) push(out, errs) return out
+}
+
+// ---- run ------------------------------------------------------------------
+
+// One-shot: parse the file, then either ingest each record directly
+// (trusted) or queue it for review (untrusted). Returns a summary list.
+// LLM-extracted records ALWAYS queue regardless of tag prefix -- the
+// operator explicitly approves each LLM output before it lands in the KG.
+fn ing_agent_run(agent, format_name, path, kg_hint, source_tag, extra, now) {
+    let summary = list_new()
+    push(summary, 0) push(summary, 0) push(summary, 0)
+    push(summary, 0) push(summary, 0)
+    let sources = ing_sources(agent)
+    let parse_res = ing_dispatch_parse(sources, format_name, path, kg_hint, source_tag, extra)
+    let recs = parse_res[0]
+    let errs = parse_res[1]
+    list_set(summary, ING_SUM_ERRORS, len(errs))
+    // LLM formats: always queue.
+    let tag = reg_source_tag(sources, format_name)
+    let force_queue = 0
+    if tag == FMT_LLM_EXTRACT { force_queue = 1 }
+    let i = 0
+    while i < len(recs) {
+        let rec = recs[i]
+        if cur_validate(rec) != CUR_OK {
+            list_set(summary, ING_SUM_DROPPED, summary[ING_SUM_DROPPED] + 1)
+        } else {
+            let trusted = _ing_is_trusted(agent, cur_source(rec))
+            if force_queue == 1 { trusted = 0 }
+            if trusted == 1 {
+                let status = pip_ingest(ing_kgreg(agent), rec, ing_mo(agent))
+                if pip_ok(status) == 1 {
+                    list_set(summary, ING_SUM_OK, summary[ING_SUM_OK] + 1)
+                    list_set(summary, ING_SUM_ATOMS,
+                             summary[ING_SUM_ATOMS] + pip_atoms_added(status))
+                } else {
+                    rq_submit(ing_queue(agent), rec, now)
+                    list_set(summary, ING_SUM_QUEUED, summary[ING_SUM_QUEUED] + 1)
+                }
+            } else {
+                rq_submit(ing_queue(agent), rec, now)
+                list_set(summary, ING_SUM_QUEUED, summary[ING_SUM_QUEUED] + 1)
+            }
+        }
+        i = i + 1
+    }
+    return summary
+}
+
+fn ing_sum_ok(s)      { return s[ING_SUM_OK] }
+fn ing_sum_queued(s)  { return s[ING_SUM_QUEUED] }
+fn ing_sum_dropped(s) { return s[ING_SUM_DROPPED] }
+fn ing_sum_atoms(s)   { return s[ING_SUM_ATOMS] }
+fn ing_sum_errors(s)  { return s[ING_SUM_ERRORS] }

@@ -1,0 +1,158 @@
+// CrossEngin ingestion: LLM-extractor bridge.
+//
+// The "LLM as preprocessor ONLY" hard boundary (ADR-0013 / ADR-0014).
+//
+// An external LLM (Claude, GPT, Llama, ...) reads unstructured text and
+// emits a .cerec file per document -- one KG record per document, with
+// atoms + implications + observations + citations. That file gets piped
+// into CrossEngin via this module. The core invariants this module
+// ENFORCES beyond a normal cerec_parse:
+//
+//   1. Every source_tag is rewritten so the "src:extractor:llm:MODEL:RUN"
+//      pedigree is preserved. If the LLM emits a bare source, it is
+//      REPLACED with the run tag; if it emits its own extractor tag,
+//      that tag is prefixed with the run's tag so downstream atrophy
+//      analysis can attribute per-model / per-run failure modes.
+//   2. Every record is QUARANTINED to the review queue by default. No
+//      configuration bypasses this -- the extractor's output never
+//      goes straight into a KG. The operator approves each record.
+//   3. Suspicious atoms (label collides with a formal-env axiom, or
+//      belief > 900) are downgraded before enqueue: FORMAL implications
+//      become EMPIRICAL, and any belief above 800 is capped at 800.
+//      This is defence-in-depth: even if an owner accidentally bulk-
+//      approves, the LLM cannot mint a Tier-A user-taught-equivalent
+//      or a kernel axiom.
+//   4. A per-run summary is returned so the operator UI can show
+//      "LLM run R1: 42 records emitted, 3 malformed, 39 queued, 0 auto-
+//      approved (guaranteed 0 by design)".
+//
+// The LLM CALL itself is out of scope for this file. The bridge assumes
+// the LLM has already run and produced a .cerec file on disk; the
+// operator invokes /ingest llm <path> <model-id> <run-id> which flows
+// through here.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova, src/ingest/review_queue.nova,
+//   src/ingest/importers/records.nova, src/util/str_safe.nova.
+
+import "./curriculum.nova"
+import "./review_queue.nova"
+import "./importers/records.nova"
+import "../util/str_safe.nova"
+
+// ---- constants ------------------------------------------------------------
+let LLM_MAX_ATOM_BELIEF = 800    // hard cap; higher values downgraded
+let LLM_FORCE_EMPIRICAL = 1      // FORMAL implications become EMPIRICAL
+
+// ---- summary slots --------------------------------------------------------
+let LLM_SUM_RECORDS         = 0
+let LLM_SUM_ENQUEUED        = 1
+let LLM_SUM_DROPPED         = 2
+let LLM_SUM_DOWNGRADED_BEL  = 3
+let LLM_SUM_DOWNGRADED_IMP  = 4
+let LLM_SUM_PARSE_ERRORS    = 5
+
+// ---- source-tag rewriting -------------------------------------------------
+
+fn _llm_run_prefix(model_id, run_id) {
+    return "src:extractor:llm:" + model_id + ":" + run_id
+}
+
+// Does `src_tag` already start with an extractor prefix?
+fn _llm_has_extractor_prefix(src_tag) {
+    let needle = "src:extractor:llm:"
+    let nn = len(needle)
+    if len(src_tag) < nn { return 0 }
+    let i = 0
+    while i < nn {
+        if char_at(src_tag, i) != char_at(needle, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Rewrite so pedigree is unambiguous.
+fn _llm_rewrite_source(orig, model_id, run_id) {
+    let pref = _llm_run_prefix(model_id, run_id)
+    if _llm_has_extractor_prefix(orig) == 1 {
+        // Already extractor-flavored: keep it but scope inside our run.
+        return pref + ":upstream:" + orig
+    }
+    // Non-extractor tag: replace entirely (the LLM doesn't get to
+    // masquerade as src:pack:medical).
+    return pref
+}
+
+// ---- record downgrading ---------------------------------------------------
+
+fn _llm_downgrade_atoms(record, summary) {
+    let atoms = cur_atoms(record)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a[CUR_ATOM_BELIEF] > LLM_MAX_ATOM_BELIEF {
+            list_set(a, CUR_ATOM_BELIEF, LLM_MAX_ATOM_BELIEF)
+            list_set(summary, LLM_SUM_DOWNGRADED_BEL,
+                     summary[LLM_SUM_DOWNGRADED_BEL] + 1)
+        }
+        i = i + 1
+    }
+}
+
+fn _llm_downgrade_imps(record, summary) {
+    if LLM_FORCE_EMPIRICAL == 0 { return 0 }
+    let imps = cur_imps(record)
+    let i = 0
+    while i < len(imps) {
+        let ii = imps[i]
+        if str_eq_bytes(ii[CUR_IMP_STR], "FORMAL") == 1 {
+            list_set(ii, CUR_IMP_STR, "EMPIRICAL")
+            list_set(summary, LLM_SUM_DOWNGRADED_IMP,
+                     summary[LLM_SUM_DOWNGRADED_IMP] + 1)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- main entry -----------------------------------------------------------
+
+// Parse `path` as .cerec (the LLM emits records format), then for each
+// record: rewrite source, cap beliefs, downgrade FORMAL imps, submit
+// to the review queue. Returns a summary list.
+fn llm_extract_ingest(path, queue, model_id, run_id, now) {
+    let summary = list_new()
+    push(summary, 0) push(summary, 0) push(summary, 0)
+    push(summary, 0) push(summary, 0) push(summary, 0)
+    let parsed = cerec_parse(path)
+    let records = cerec_records(parsed)
+    let errors  = cerec_errors(parsed)
+    list_set(summary, LLM_SUM_PARSE_ERRORS, len(errors))
+    let i = 0
+    while i < len(records) {
+        let rec = records[i]
+        list_set(summary, LLM_SUM_RECORDS, summary[LLM_SUM_RECORDS] + 1)
+        // Rewrite source.
+        list_set(rec, CUR_SOURCE, _llm_rewrite_source(cur_source(rec), model_id, run_id))
+        // Downgrade untrusted claims.
+        _llm_downgrade_atoms(rec, summary)
+        _llm_downgrade_imps(rec, summary)
+        // Validate then enqueue or drop.
+        if cur_validate(rec) == CUR_OK {
+            rq_submit(queue, rec, now)
+            list_set(summary, LLM_SUM_ENQUEUED, summary[LLM_SUM_ENQUEUED] + 1)
+        } else {
+            list_set(summary, LLM_SUM_DROPPED, summary[LLM_SUM_DROPPED] + 1)
+        }
+        i = i + 1
+    }
+    return summary
+}
+
+fn llm_sum_records(s)        { return s[LLM_SUM_RECORDS] }
+fn llm_sum_enqueued(s)       { return s[LLM_SUM_ENQUEUED] }
+fn llm_sum_dropped(s)        { return s[LLM_SUM_DROPPED] }
+fn llm_sum_downgraded_bel(s) { return s[LLM_SUM_DOWNGRADED_BEL] }
+fn llm_sum_downgraded_imp(s) { return s[LLM_SUM_DOWNGRADED_IMP] }
+fn llm_sum_parse_errors(s)   { return s[LLM_SUM_PARSE_ERRORS] }
