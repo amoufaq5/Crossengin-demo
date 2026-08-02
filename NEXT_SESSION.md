@@ -372,16 +372,44 @@ code without an authoritative test story risks masking behavioral regressions.
 The underlying NOVA bug should also be reported/fixed upstream; the runtime
 should either `sar` its index or use a different signature.
 
-### Standing constraints (unchanged)
+### Standing constraints
 
 Develop on `claude/confident-fermi-op241b`; never push elsewhere; no PRs unless
 asked. Rule 1 (no third-party deps -- NOVA only). Rule 3 (KB commercially clean).
-ADR-0014 (no LLM cognition). NOVA gotchas that bit this session: flat global
-namespace (a `let`/`fn` name collision across imported files breaks the full-graph
-build even when unit tests pass -- *compile the chat after any shared/verify.nova
-change*); `==`/`!=` structurally deref operands ≥ 0x100000 (use small counters or
-`int_sub(a,b)==0`); `str_find(...) != -1` for "contains" (not `>= 0`); `fn` and
-`match` are reserved; >6 params corrupts args 7+; definition order matters.
+ADR-0014 (no LLM cognition).
+
+**NOVA gotchas -- verified this session, keep only the ones that reproduce:**
+
+*Real (empirically confirmed 2026-08):*
+- **Flat global namespace.** A `let`/`fn` name collision across imported files
+  breaks the full-graph build even when unit tests pass. *Always compile the
+  chat after any shared / verify.nova change.*
+- **`==`/`!=` structurally deref heap pointers.** Two distinct lists with equal
+  content compare EQUAL under `==`. Fine for content compare; use `int_sub(a,b)
+  == 0` if you actually want pointer identity.
+- **`str_eq` is environmentally flaky on some literal pairs.** Byte-identical
+  strings can compare unequal. Prefer char-by-char via `char_at` (see
+  `_ce_str_eq_bytes` in `tests/ce_test.nova` or `_fc_label_eq` in
+  `src/agent/formal_chat.nova`).
+- **`str_find(x, y) >= 0` is broken at position 0** -- `0 >= 0` evaluates to
+  FALSE. Use `str_find(x, y) != (0 - 1)`. Fixed 26 sites this session.
+- **`fn` and `match` are reserved** language keywords; can't be var/param names.
+- **`list_remove(l, i)` doesn't untag `i`.** OOB (any large index) is the only
+  reliable path; for any specific index, use `list_remove_at` from
+  `src/util/list_safe.nova` (workaround shipped, 3 real substrate bugs caught).
+- **`exit(n)` returns `2n+1` to the kernel** -- can't signal `exit(0)`=SUCCESS.
+  Fall off the end of `main()` instead.
+- **`std/io` / `std/string` at runtime**: any program importing them SIGSEGVs
+  at NOVA-runtime startup (unless the runtime tagging migration is completed
+  upstream). This is why the chat REPL binary can't be driven -- documented
+  above with the full fix plan.
+
+*STALE (previously listed, but no longer reproduce -- verified empirically
+2026-08 and thus removed):*
+- ~~"functions with >6 params corrupt args 7+"~~ -- 15 mixed-type params
+  transit correctly; no corruption observed.
+- ~~"definition order matters (forward references segfault)"~~ -- calling a
+  function defined below its caller works cleanly.
 
 ## R39C -- chat-state persistence module (soul + multi-KG + decision-log save/load API)
 
