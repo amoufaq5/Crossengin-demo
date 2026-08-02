@@ -451,11 +451,26 @@ using the reliable OOB fallback. 23-check unit test.
   index; same story as synapse_graph (existing 27-test suite passes both
   ways, migration removes latent risk).
 
-*NOT YET MIGRATED (arbitrary-index removes; risky, need per-file audits):*
-- `federation/turn.nova:2185, 2197` -- perms/chans by index (networked;
-  needs integration-test story before migration)
-- `federation/turn_server.nova:414, 902, 1219, 1230, 1241` -- pool/allocs/
-  perms/chans by index (same caveat)
+*Migrated after finding turn.nova had a real failing test the audit surfaced:*
+- `federation/turn.nova:2185, 2197` (tick_perms perm-expire + chan-expire) --
+  was silently violating "surviving perm" ordering after removing an expired
+  entry; `test_turn::test_tick_perms_mixed_window` was FAILING in the
+  baseline ("surviving perm ip = '192.0.2.51' got '192.0.2.50'"). Fix landed;
+  `test_turn` now 452/0 (was 451/1).
+- `federation/turn_server.nova:414, 902, 1219, 1230, 1241` (5 sites: port pool
+  return, allocs prune, perms/chans expire) -- defensive migration; the
+  existing turn_server test failures (`stale-nonce code`, `dup-allocate code`,
+  `CB idempotent class` + a segfault) are all pre-existing and unrelated to
+  list_remove (verified by comparing baseline with/without the migration).
+  Latent risk removed; test-suite counts unchanged for this file.
+
+*ALL crossengin `list_remove` sites now migrated to `list_remove_at`* --
+the audit is complete except for the trivially-safe OOB-idiom uses
+(`raft_core.nova:130`, `synapse_graph.nova:120`, `concept_layer.nova:231`,
+all of the shape `list_remove(l, len(l)-1)` which happen to work correctly
+because the tagged index always exceeds storage). Real bugs caught: 4
+(formal_chat retract, signal_dispatch FIFO, event_dispatch drain, turn perm
+survivor). Total sites migrated: 11 across 7 files.
 
 Migration is 1-line-per-site (import `../util/list_safe.nova`; swap the call),
 but each site needs regression validation. That is a dedicated audit thread --
