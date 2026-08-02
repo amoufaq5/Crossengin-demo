@@ -218,6 +218,51 @@ add the pkg-deps entry; (3) then finish string/io.nova on the raw sidestep
 pattern. The sidestep is validated; the indirect-call codegen bug is the actual
 blocker.
 
+### NOVA runtime bug: `list_remove` doesn't untag its index (discovered this session)
+
+`list_remove(l, i)` in NOVA receives a **tagged** int `2i+1` but does not `sar`
+to untag before using it as the raw storage index. Consequence: only OOB (any
+index larger than `len(l)`) is reliable -- it falls back to "remove last".
+Empirical, from `_prev8`/`_prev10`:
+
+```
+list_remove([a,b,c], 0)     -> [a, c]      # removed b (idx 1), not a
+list_remove([a,b,c,d], 1)   -> [a, b, c]   # removed d (idx 3), not b
+list_remove([a,b,c,d,e], 2) -> [a,b,c,d]   # removed e (idx 4), not c
+```
+
+**Workaround landed:** `src/util/list_safe.nova::list_remove_at(l, i)` --
+shifts the tail down via `list_set` then drops the (now-duplicate) last slot
+using the reliable OOB fallback. 23-check unit test.
+
+**Systemic audit (which call sites in this repo need migration):**
+
+*Safe today (uses the reliable OOB / "remove last" idiom):*
+- `raft_core.nova:130` -- `list_remove(log, len(log)-1)`
+- `synapse_graph.nova:120` -- `list_remove(free, len(free)-1)`
+- `concept_layer.nova:231` -- `list_remove(frontier, len(frontier)-1)`
+
+*Migrated to `list_remove_at` this session:*
+- `agent/formal_chat.nova` (retract env-remove) -- was silently corrupting on
+  successive retracts; caught by the /retractions log tests.
+
+*NOT YET MIGRATED (arbitrary-index removes; could be silently corrupting):*
+- `federation/turn.nova:2185, 2197` -- perms/chans by index
+- `federation/turn_server.nova:414, 902, 1219, 1230, 1241` -- pool/allocs/perms/chans by index
+- `substrate/synapse_graph.nova:391` -- `list_remove(outs, j)` -- arbitrary
+- `substrate/signal_dispatch.nova:218` -- `list_remove(bucket, 0)` -- the
+  "remove first" pattern is BROKEN for len >= 2 (removes idx 1)
+- `scheduler/event_dispatch.nova:76` -- `list_remove(l, best)` -- arbitrary
+- `learning/self_learning_triggers.nova:162` -- `list_remove(q, i)` -- arbitrary
+
+Migration is 1-line-per-site (import `../util/list_safe.nova`; swap the call),
+but each site needs regression validation. That is a dedicated audit thread --
+NOT done in the discovery session, because touching passing federation/substrate
+code without an authoritative test story risks masking behavioral regressions.
+
+The underlying NOVA bug should also be reported/fixed upstream; the runtime
+should either `sar` its index or use a different signature.
+
 ### Standing constraints (unchanged)
 
 Develop on `claude/confident-fermi-op241b`; never push elsewhere; no PRs unless
