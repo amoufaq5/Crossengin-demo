@@ -64,6 +64,39 @@ Two previously-listed constraints RETIRED after empirical verification (no
 longer reproduce): "6+ params corrupts args 7+" (15 mixed-type params all
 survive), "definition order matters / forward refs segfault" (works cleanly).
 
+### Curated-tests delta (R41 impact, verified by focused rerun 2026-08)
+
+Full suite is impractical to rerun on demand (5+ min, mostly std/io startup
+crashes anyway). Instead, focused rerun of the tests R41's fixes should have
+affected + our curated substrate + Raft + reasoning tests:
+
+**Real-bug fixes flipped 16 tests from RED to GREEN:**
+| Test | Baseline | After R41 |
+|---|---|---|
+| `test_signal_dispatch` | 46/3 | **55/0** (+3: FIFO bug + 2 str_eq ghosts) |
+| `test_event_dispatch` | 8/2 | **15/0** (+2: drain-duplicate bug) |
+| `test_turn` | 451/1 | **452/0** (+1: perm-survivor bug) |
+| `test_input_classifier` | 11/24 | **20/15** (+9: str_find `>= 0` fix) |
+| `test_cognitive_router` | 15/40 | **16/39** (+1: str_find `>= 0` fix) |
+
+**New test suites landed this session (240 combined checks, all green):**
+- `test_formal_consistency` -- 100 checks (retract loop, KG context, preview,
+  persistence, health, workflows).
+- `test_contradiction` -- 52 checks (detect, transitive, conflict-set,
+  render + annotations).
+- `test_reasoning_workflow` -- 26 checks (three-act story).
+- `test_list_safe` -- 23 checks (safe list_remove_at).
+- `test_ce_test` -- 15 checks (meta-suite for the harness).
+- `test_learning_policy` -- 24 checks (from R40 area, kept green through R41).
+
+**Modules unchanged, still green:**
+`test_formal_chat` 76/0, `test_synapse_graph` 55/0, `test_self_learning_triggers`
+27/0, `test_raft_core/cluster/partition/membership` 35/21/15/22, `test_constitution`
+11/0 (semantics now actually correct, previously "correct by luck").
+
+**Still failing (unrelated to R41):** `test_turn_server` (3 pre-existing assert
+failures + segfault -- auth-code sequencing bugs, not list_remove).
+
 ### Test-harness improvements (this session)
 
 - `tests/ce_test.nova::ce_str_eq` now char-by-char via `_ce_str_eq_bytes`
