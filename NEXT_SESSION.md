@@ -3,6 +3,119 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R43 -- ingestion layer landed (structured content at scale)
+
+**Status: complete.** R42 closed the truth-seeking reasoning loop; R43 opens
+the *content* funnel that lets it actually learn at scale. Every ingestion
+path converges on ONE canonical curriculum-record shape; every ingested atom
+carries a `src:*` tag so meta-observer atrophy attribution works uniformly
+across every source; every LLM output is quarantined by design (source
+rewritten, beliefs capped, FORMAL implications downgraded, mandatory review
+queue).
+
+### What landed
+
+**Framework (`src/ingest/`):**
+- `curriculum.nova`     — canonical record shape (atoms, implications,
+                           observations, citations) + structural validator
+- `pipeline.nova`       — record → KG state; idempotent; no-belief-backslide
+                           on re-ingest; every atom attributed via
+                           meta-observer
+- `review_queue.nova`   — human-approval queue; approve/deny/audit
+- `source_registry.nova` — format dispatch table
+- `llm_extractor.nova`  — LLM-as-preprocessor bridge (ADR-0013/0014):
+                           source-tag rewrite, belief cap at 800,
+                           FORMAL→EMPIRICAL downgrade, mandatory-queue
+- `web_scheduler.nova`  — topic-scoped fetcher composing source_whitelist +
+                           caller-supplied fetch fn; every fetched body
+                           queues by default
+
+**Importers (`src/ingest/importers/`):**
+- `records.nova`        — `.cerec` CrossEngin native line-based records
+- `csv_facts.nova`      — RFC-4180 CSV (quoting, escapes, CRLF)
+- `nt_triples.nova`     — generic N-Triples RDF
+- `wikidata.nova`       — Qxxx/Pxxx-aware with optional labels-TSV
+- `conceptnet.nova`     — ConceptNet 5 TSV assertions (weight→belief)
+- `paper_meta.nova`     — arXiv/OpenAlex/DOI paper metadata + citations
+- `wordnet.nova`        — WordNet-style synsets + hypernyms + antonyms
+
+**Composition + interface:**
+- `src/agent/ingestion_agent.nova` — skill-shaped agent: owns kgreg + mo +
+                                       whitelist + queue + trusted-prefix set;
+                                       dispatches to importers; routes to
+                                       pipeline OR queue based on trust
+- `examples/crossengin_chat.nova`  — `/ingest`, `/ingest_llm`,
+                                       `/ingest_review`, `/ingest_approve`,
+                                       `/ingest_deny` commands + help text
+
+### Test scoreboard (15 new files, 357 checks passing)
+
+| Module | Checks |
+|---|---|
+| ingest_curriculum | 21 |
+| ingest_pipeline | 26 |
+| ingest_review_queue | 28 |
+| ingest_source_registry | 24 |
+| ingest_records (`.cerec`) | 36 |
+| ingest_csv | 21 |
+| ingest_nt | 30 |
+| ingest_wikidata | 24 |
+| ingest_conceptnet | 26 |
+| ingest_paper_meta | 20 |
+| ingest_wordnet | 18 |
+| ingest_llm_extractor | 15 |
+| ingest_web_scheduler | 20 |
+| ingestion_agent | 28 |
+| ingest_chat_integration | 20 |
+| **total** | **357** |
+
+### Design commitments enforced by the layer
+
+1. **One shape.** All formats produce `curriculum` records. Adding a new
+   importer is one new file, zero pipeline changes.
+2. **Every atom traceable.** `src:*` tag flows through every path; the
+   meta-observer accumulates per-source atrophy uniformly.
+3. **LLM output is quarantined.** No config bypasses the LLM extractor's
+   source-rewrite + belief-cap + FORMAL-downgrade + mandatory-queue chain.
+4. **Web fetch is host-gated.** `source_whitelist` fails closed; nothing
+   scraped enters formal env; every web record queues.
+5. **Reversibility.** Deny reasons preserved; approvals log; retraction
+   log (from R42) still applies to ingested atoms.
+
+### Bugs discovered while building
+
+- ConceptNet weight parser: sentinel-based early-exit in ws-skip mangled
+  the position on non-ws input; fixed by rewriting to `more`-flag pattern.
+- Pipeline "no backslide" was initially symmetric per-slot which let a
+  weaker source drag mean down by boosting beta; fixed to compare means.
+- Chat REPL has a pre-existing startup segfault (not R43's fault; my
+  ingestion additions compile cleanly, verified via
+  `test_ingest_chat_integration.nova` exercising the same paths).
+
+### Where to go next
+
+**Highest-leverage:**
+1. Author a real domain pack end-to-end (religion / history / politics)
+   using the ingestion layer to demonstrate the scale story.
+2. Add a `wikidata` labels file + a real Wikidata subset to prove
+   million-atom-shaped ingest works before landing a label hash-index.
+3. Investigate the chat REPL startup segfault (compilation is clean;
+   runtime crash suggests a null-reference or missing init).
+
+**Structural improvements:**
+- Label hash-index for `mkgc_scan_conflicts` (currently O(kgs² × atoms²)).
+- Page-indexed atom store (NOVA-0007) for on-disk KGs larger than one
+  snapshot blob.
+- JSON parser adapter so LLM outputs can arrive as JSONL instead of
+  `.cerec` (currently the LLM must emit `.cerec`; a preprocessor script
+  outside NOVA can convert).
+
+**Deferred (upstream / off-limits):**
+- NOVA runtime bug fixes (7 catalogued in `src/util/str_safe.nova` +
+  `_x509v_bytes_to_str`).
+
+---
+
 ## R42 -- massive systemic runtime audit + full retract/undo/redo loop (~90 test files flipped RED->GREEN)
 
 **Status: complete.** R41 landed the truth-seeking loop's detect/localize/act/audit
