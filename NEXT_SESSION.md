@@ -249,6 +249,42 @@ even though they don't fix the underlying crashes:
   block the whole suite. TIMEOUT is reported distinctly from FAIL. Also
   supports `--fail-fast` (or `CE_FAIL_FAST=1`) to stop on the first failure.
 
+### NOVA gotcha migration: `str_find(x, y) >= 0` -> `!= (0 - 1)` (fixed 26 sites)
+
+Empirically confirmed the standing-constraints note that `str_find(...) >= 0`
+mis-compares at index 0: `str_find("hello", "hello") = 0`, but `0 >= 0`
+evaluates to FALSE. Any "does x contain y" check using `>= 0` silently misses
+matches at position 0 -- which in practice means labels/URLs where the needle
+is a prefix.
+
+26 sites across 7 files, all fixed this session by converting to
+`!= (0 - 1)` (the reliable pattern the constraints doc calls out):
+- `src/agent/cognitive_router.nova` (7 sites -- source routing on
+  "wikipedia.org"/"src:dict:"/... prefixes was silently misclassifying every
+  label where the prefix WAS at position 0)
+- `src/chat/helpers.nova` (6 sites -- host/label classification)
+- `src/perception/input_classifier.nova` (1 site)
+- `src/parts/soul/constitution.nova` (2 sites -- SAFETY-critical
+  constitutional filter was silently letting forbidden text through when it
+  appeared at the START of an action string)
+- `src/io/transducers/tls13_client.nova` (1 site -- chunked-encoding header)
+- `src/language/nl_query.nova` (6 sites -- source classification)
+- `examples/crossengin_chat.nova` (3 sites)
+
+Impact on the test suite (per-module reruns; the shell-driven full suite is
+too big to rerun quickly on demand):
+- `test_cognitive_router`: 15/40 -> 16/39 (+1 pass)
+- `test_input_classifier`: 11/24 -> 20/15 (+9 pass)
+- `test_chat_helpers`: 92/8 -> 92/8 (unchanged; those 8 failures unrelated)
+- `test_constitution`: 11/0 -> 11/0 (all-green already; the filter is now
+  ACTUALLY correct rather than lucky)
+- `test_nl_query`: crashes both ways (pre-existing runtime issue)
+
+10 tests flipped RED -> GREEN in one small mechanical batch; zero regressions.
+Notably `constitution.nova` did not gain new PASSes but the filter's
+semantics went from "silently letting through prefix-matched forbidden text"
+to actually correct.
+
 ### NOVA runtime bug: `exit(n)` returns `2n+1` (same tagging class, discovered this session)
 
 `exit(n)` in a NOVA program returns exit code `2n+1` to the kernel -- the tagged
