@@ -280,14 +280,25 @@ using the reliable OOB fallback. 23-check unit test.
   FIFO order within a priority bucket (`test_priority_queue_ordering`
   "pop EXCITE#2 fourth" was failing 101 -> 100 in the baseline). Fix landed
   + regression guard `test_fifo_deep_same_priority` covers N=5 same-bucket
-  pops. `signal_dispatch` now 53 passing (was 46 with 1 latent failure).
+  pops. `signal_dispatch` now 55/0.
+- `scheduler/event_dispatch.nova:76` (evq_drain) -- was returning the SAME
+  event for consecutive drains (`test_event_dispatch` "second message" and
+  "then moment" failing in the baseline, 8/2). Fix landed + regression guard
+  `test_drain_no_duplicates` covers N=4 same-priority drains.
+  `event_dispatch` now 15/0.
+- `substrate/synapse_graph.nova:391` (synapse remove) -- arbitrary-index
+  remove; existing 55-test suite passes with and without the migration
+  (didn't exercise the buggy path), but the swap eliminates the latent
+  risk. No behavioral change to passing tests.
+- `learning/self_learning_triggers.nova:162` (_arb_remove) -- arbitrary
+  index; same story as synapse_graph (existing 27-test suite passes both
+  ways, migration removes latent risk).
 
-*NOT YET MIGRATED (arbitrary-index removes; could be silently corrupting):*
-- `federation/turn.nova:2185, 2197` -- perms/chans by index
-- `federation/turn_server.nova:414, 902, 1219, 1230, 1241` -- pool/allocs/perms/chans by index
-- `substrate/synapse_graph.nova:391` -- `list_remove(outs, j)` -- arbitrary
-- `scheduler/event_dispatch.nova:76` -- `list_remove(l, best)` -- arbitrary
-- `learning/self_learning_triggers.nova:162` -- `list_remove(q, i)` -- arbitrary
+*NOT YET MIGRATED (arbitrary-index removes; risky, need per-file audits):*
+- `federation/turn.nova:2185, 2197` -- perms/chans by index (networked;
+  needs integration-test story before migration)
+- `federation/turn_server.nova:414, 902, 1219, 1230, 1241` -- pool/allocs/
+  perms/chans by index (same caveat)
 
 Migration is 1-line-per-site (import `../util/list_safe.nova`; swap the call),
 but each site needs regression validation. That is a dedicated audit thread --
