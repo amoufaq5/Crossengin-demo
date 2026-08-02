@@ -94,16 +94,29 @@ The reasoning surface now has the full cycle:
 ```
 Every state change survives serialization; every witness is kernel-checked.
 
-### Curated substrate all green
+### Curated substrate: 41 green files, 8 partial, ~2310 checks passing
+### (verified rerun over the 49-file surface R42 touched or validated)
 
+**Fully green (41 files):**
 atom_store 77, multi_kg_manager 77, concept_layer 34, semantic_search 73,
 formal_chat 76, formal_consistency 117, contradiction 52, reasoning_workflow
-26, debate 46, reasoning_atoms 38, cofire_index 35, hdc_embed 69,
+37, debate 46, reasoning_atoms 38, cofire_index 35, hdc_embed 69,
 lexical_anchor 27, gate_router 24, part_registry 26, arithmetic 23,
 number_words 45, preprocess 94/5, json 47, event_dispatch 15,
-signal_dispatch 55, list_safe 23, str_safe 20, ce_test 15, learning_policy
-24, raft_core 35, raft_cluster 21, raft_partition 15, raft_membership 22,
-plus many more.
+signal_dispatch 55, list_safe 23, str_safe 27, ce_test 15, learning_policy 24,
+raft_core 35, raft_cluster 21, raft_partition 15, raft_membership 22,
+input_transducer 19, input_classifier 35, chat_helpers 100, openie 64,
+skills_kg 26, kg_temporal 80, meta_observer 39, ops_pack 10, slot_index 23,
+effectors 19, ask_user_to_teach 19, source_whitelist 14.
+
+**Partial (8 files, still have residual assertion fails after R42):**
+- Test-code flakiness (module correct, TEST's own str_eq fails): medical_pack
+  21/1, atom_death_attribution 27/1
+- Downstream logic bugs (not str_eq): word_atoms 108/7, pack_registry 22/9,
+  audio_synth 189/20, audio_tts 64/4, webrtc 48/11, dr_async_fetch 79/18,
+  research_sources 40/21, nl_query 50/5
+
+Sum: ~2310 checks passing / 78 residual failing across curated set.
 
 ### Where to continue (from R42)
 
