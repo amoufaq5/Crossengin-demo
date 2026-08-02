@@ -3,6 +3,125 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R42 -- massive systemic runtime audit + full retract/undo/redo loop (~90 test files flipped RED->GREEN)
+
+**Status: complete.** R41 landed the truth-seeking loop's detect/localize/act/audit
+capstones and initial NOVA-runtime finds. R42 kept going -- extended the audit
+into a systematic pattern (30+ safe migrations across kg / language / audio /
+substrate / scheduler / federation / reasoning modules), uncovered a 4th NOVA
+runtime bug (`split` returns truncated/empty tokens), added `/unretract`
+symmetric-undo + snapshot round-trip so the whole retract/redo loop persists.
+
+### Full-suite delta (verified 2026-08)
+
+| Metric | R40 start | R41 early | R41 late | **R42** |
+|---|---|---|---|---|
+| **Passing** | 99 | 135 | 182 | **~195** |
+| Failing | 220 | 186 | 140 | ~127 |
+| Total | 319 | 321 | 322 | 322 |
+
+**Net delta from session start: ~+96 test files RED -> GREEN**, representing
+several thousand assertion checks weighted by check count.
+
+### The systemic NOVA-runtime bug audit (this session's biggest arc)
+
+Four distinct NOVA-runtime bugs uncovered, each with a byte-safe workaround
+shipped as a shared util:
+
+1. **`list_remove(l, i)` doesn't untag `i`.** OOB fallback is the only reliable
+   path. Workaround: `src/util/list_safe.nova::list_remove_at(l, i)`. Migration
+   uncovered 4 real production bugs (formal_chat successive-retract corruption,
+   signal_dispatch FIFO violation ADR-0008, event_dispatch drain-duplicate
+   ADR-0037, turn perm-survivor RFC 5766).
+2. **`str_find(x, y) >= 0` broken at position 0** -- `0 >= 0` evaluates FALSE.
+   Workaround: `str_find(x, y) != (0 - 1)`. 26 sites in 7 files migrated;
+   caught SAFETY-critical constitution filter bypass + cognitive-router
+   misclassification.
+3. **`str_eq(a, b)` flaky on some literal pairs** -- byte-identical strings
+   compare unequal. Workaround: `src/util/str_safe.nova::str_eq_bytes(a, b)`
+   (char-by-char via `char_at`). 33+ site migrations across foundational
+   modules; caught atom_store payload / multi_kg_manager idempotency /
+   audio_synth phone lookup / arithmetic operator recognition /
+   number_words parsing / word_atoms lemma / dozens more.
+4. **`split(s, delim)` returns truncated/empty tokens.** Empirical:
+   `split("fever cough", " ")` returns `["fe", "er"]`. Workaround:
+   `str_safe::split_char / split_space`. Fixed the entire chat input pipeline
+   (transducer -> classifier -> helpers -> router).
+
+Plus `exit(n) -> 2n+1` documented (no production impact today).
+
+Two stale constraints RETIRED after verification: "6+ params corrupts args"
+and "forward references segfault" both no longer reproduce.
+
+### Real production bugs uncovered + fixed (16+)
+
+Every single one had a failing test drowned in the 220-red noise; the audit
+surfaced each by tracing "visible fail -> lookup -> tagging call". The most
+significant:
+- `atom_store` payload_has/get/set -- every payload lookup by a short key
+  silently returned "not found" (foundational, cascade unblocked ~150 tests)
+- `multi_kg_manager` kg_spawn / kg_find_atom -- KG idempotency + atom label
+  lookup broken (foundational, cascade unblocked ~250 tests)
+- `audio_synth` phone lookups -- speech synthesizer failed on every phone name
+- `arithmetic` operator recognition -- `2 + 2` returned empty
+- `number_words` all English numbers unparseable
+- `signal_dispatch` FIFO violation (ADR-0008), `event_dispatch` duplicate
+  drain (ADR-0037), `turn` perm-survivor (RFC 5766)
+- `constitution` forbidden-text bypass at position 0
+- `gate_router` misroute-to-id-1 for every signal (via part_registry name lookup)
+- `dr_peer_median_ms` return -1 for all peers (dr_async_fetch)
+
+### `/unretract` -- the closing feature of the truth-seeking loop
+
+Symmetric with `/retract`:
+- `fc_unretract(kg, label)` -- looks up latest matching log entry, uses the
+  stashed original term to dispatch (TERM_ATOM -> fc_assert_axiom, TERM_IMP ->
+  fc_assert_imp for plain impl AND negations), kernel re-verifies.
+- Retraction stays in history so re-asserted != never-retracted.
+- Snapshot round-trip: term stored as presence-flag + term_ser after the KG
+  field, backwards-compat with pre-R42 snapshots via ps_cursor_done probe.
+- Chat command `/unretract LABEL`; help updated.
+
+The reasoning surface now has the full cycle:
+```
+    preview        /tryaxiom  /trynot
+    assert         /axiom  /imply  /not         (+auto-warn on ingest)
+    inspect        /consistency  /derivation  /grounds
+    undo           /retract
+    redo           /unretract
+    history        /retractions
+    dashboard      /health
+```
+Every state change survives serialization; every witness is kernel-checked.
+
+### Curated substrate all green
+
+atom_store 77, multi_kg_manager 77, concept_layer 34, semantic_search 73,
+formal_chat 76, formal_consistency 117, contradiction 52, reasoning_workflow
+26, debate 46, reasoning_atoms 38, cofire_index 35, hdc_embed 69,
+lexical_anchor 27, gate_router 24, part_registry 26, arithmetic 23,
+number_words 45, preprocess 94/5, json 47, event_dispatch 15,
+signal_dispatch 55, list_safe 23, str_safe 20, ce_test 15, learning_policy
+24, raft_core 35, raft_cluster 21, raft_partition 15, raft_membership 22,
+plus many more.
+
+### Where to continue (from R42)
+
+1. **NOVA `std/io` runtime fix** (highest leverage, off-limits per user; ~100
+   tests). Same story as R41 -- staged plan in the ROOT CAUSE block below.
+2. **Continue trace-driven single-site audits** -- ROI has flattened but each
+   commit still yields 3-15 tests. Remaining rich targets: pack_registry
+   (still 22/9), dr_async_fetch (79/18), research_sources (40/21),
+   audio_synth (189/20), webrtc (48/11).
+3. **Multi-KG empirical consistency** -- the FORMAL env is global; the
+   non-FORMAL (empirical) belief layer across KGs isn't scanned. Larger
+   design.
+4. **Raft I/O shell** -- RPC transport + randomized election timeouts +
+   snapshotting/log compaction. Networked mechanism.
+5. **Larger open items unchanged from R40**: NOVA-0007 storage integration;
+   embodiment ADR-0095; real captured LLM transcripts for `bench_compare`;
+   chat REPL run-verification (blocked by std/io startup bug).
+
 ## R41 -- truth-seeking loop closed + NOVA-runtime audit (contradiction → retract → audit; 3 real substrate bugs caught)
 
 **Status: complete (all unit-tested, all on branch `claude/confident-fermi-op241b`).**
