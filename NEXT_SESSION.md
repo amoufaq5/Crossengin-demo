@@ -249,6 +249,34 @@ even though they don't fix the underlying crashes:
   block the whole suite. TIMEOUT is reported distinctly from FAIL. Also
   supports `--fail-fast` (or `CE_FAIL_FAST=1`) to stop on the first failure.
 
+### NOVA runtime bug: `exit(n)` returns `2n+1` (same tagging class, discovered this session)
+
+`exit(n)` in a NOVA program returns exit code `2n+1` to the kernel -- the tagged
+int `2n+1` reaches the syscall without untagging. Empirical:
+
+```
+exit(0) -> 1     # SUCCESS becomes FAILURE
+exit(1) -> 3
+exit(7) -> 15
+```
+
+**Concrete consequence:** a NOVA program CANNOT signal clean success via
+`exit(0)` -- it must fall off the end of `main()` (which does return 0 to the
+kernel correctly, empirically verified via passing tests). Callers of `exit(0)`
+in `tests/integration/scenario_*.sh` and `tests/integration/_scenario_*_drivers/`
+are all bash-driven scenarios that check output patterns rather than exit
+codes, so this hasn't been visibly harming production code -- but any script
+relying on `exit(0)` for success will misfire.
+
+`scripts/test.sh` is unaffected: it treats ANY non-zero as failure, and
+passing tests don't call `exit(0)` (they fall off the end). But `exit(1)` at
+least propagates as non-zero (specifically 3), so failure signalling works
+too.
+
+Not fixed (NOVA-runtime concern -- `_nova_exit` builtin needs `sar rdi, 1`
+before the syscall). Recorded as another instance of the tagging-migration
+gap; workaround is "return from main, don't `exit(0)`".
+
 ### NOVA runtime bug: `list_remove` doesn't untag its index (discovered this session)
 
 `list_remove(l, i)` in NOVA receives a **tagged** int `2i+1` but does not `sar`
