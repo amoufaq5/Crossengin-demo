@@ -3,6 +3,99 @@
 This file is the source of truth for what works, what does not, and where to
 continue. It is updated at every session boundary.
 
+## R41 -- truth-seeking loop closed + NOVA-runtime audit (contradiction → retract → audit; 3 real substrate bugs caught)
+
+**Status: complete (all unit-tested, all on branch `claude/confident-fermi-op241b`).**
+R40 stopped at "contradiction detected". R41 built the whole loop: detect →
+localize → suggest → surface-at-ingest → retract-with-cascade → explain-any-proof
+→ audit-with-provenance → dashboard, plus a systematic audit that surfaced four
+distinct NOVA-runtime bugs (three fixed in crossengin via workaround, one
+documented for upstream).
+
+### Truth-seeking loop -- the eleven-command chat surface
+
+| Command | Purpose | Commit |
+|---|---|---|
+| `/health` | 1-shot dashboard: size, consistency, retractions, conflict cue | `6b79655` |
+| `/tryaxiom`, `/trynot` | Preview a hypothesis (non-destructive) | `f4abca0` |
+| `/axiom`, `/imply`, `/not` | Assert (with **auto-warn** on conflict via `_admin_post_assert_check`) | `0be0bd3` |
+| `/consistency` | Direct + transitive scan, conflict set, retract suggestion, full derivation | `ce35a44`, `5b1dc8d`, `9b6df87`, `c9f8b02`, `77d1c33`, `6f033a6` |
+| `/derivation LABEL` | Kernel-checked proof of any FORMAL claim, with `[source]` annotations on leaves | `719f161`, `6f033a6` |
+| `/retract LABEL` | Withdraw + cascade + log | `ebdf7a0` |
+| `/retractions` | Session audit log with KG context | `71bfb1e`, `402d03b` |
+
+Under the hood: `src/parts/reasoning/contradiction.nova` (52-check suite;
+direct + transitive scan, conflict-set extraction, proof renderer with optional
+`[term, source]` annotations), `src/agent/formal_chat.nova` (retract with
+cascade, retraction log with label/source/kg/counts, hypothesis-safe env
+snapshot). Story-integration test `tests/unit/test_reasoning_workflow.nova`
+(26 checks) exercises the whole loop in one narrative. Curated substrate tests
+all green: `formal_consistency` 92, `formal_chat` 76, `contradiction` 52,
+`reasoning_workflow` 26.
+
+### NOVA-runtime bug audit (this session's discoveries)
+
+Empirically probed and either fixed-via-workaround or documented:
+
+1. **`std/io` startup segfault** (documented; user off-limits). The chat REPL
+   binary segfaults at NOVA-runtime startup because pointer-tagging migration
+   is incomplete in `string.nova` / `io.nova` / `syscall.nova`. Full diagnosis
+   + staged fix plan below.
+2. **`list_remove(l, i)` doesn't untag `i`** (fixed via `src/util/list_safe.nova::list_remove_at`).
+   Caught **3 real bugs in shipped substrate code**: `formal_chat` retract env-remove
+   (silent corruption on successive retracts), `signal_dispatch::sigq_pop` (FIFO
+   violation in the priority queue, ADR-0008 -- `test_priority_queue_ordering`
+   was FAILING in the baseline), `event_dispatch::evq_drain` (duplicate drains
+   in the scheduler, ADR-0037 -- `test_event_dispatch` was FAILING 8/2). Two
+   defensive migrations in `synapse_graph.nova` and `self_learning_triggers.nova`
+   removed latent risk. `federation/turn*.nova` (7 call sites) deferred pending
+   integration-test story.
+3. **`str_find(x, y) >= 0` broken at position 0** (fixed via 26-site migration
+   to `!= (0 - 1)`). SAFETY-critical: `constitution.nova` was silently letting
+   forbidden text through when it appeared at the START of an action string.
+   `cognitive_router.nova` / `nl_query.nova` / `chat/helpers.nova` were
+   misclassifying every label whose prefix was at position 0. **10 tests
+   flipped RED -> GREEN** with zero regressions.
+4. **`exit(n) -> 2n+1`** (documented). Can't signal `exit(0)`=SUCCESS. All
+   affected callers are bash-driven integration scenarios that check output
+   patterns; no production impact today.
+
+Two previously-listed constraints RETIRED after empirical verification (no
+longer reproduce): "6+ params corrupts args 7+" (15 mixed-type params all
+survive), "definition order matters / forward refs segfault" (works cleanly).
+
+### Test-harness improvements (this session)
+
+- `tests/ce_test.nova::ce_str_eq` now char-by-char via `_ce_str_eq_bytes`
+  instead of NOVA's flaky `str_eq` builtin -- eliminates the ghost
+  `expected='X' got='X'` false-positive family. `test_ce_test.nova` meta-suite
+  covers the harness itself (15 checks).
+- `scripts/test.sh` enforces per-test `CE_TEST_TIMEOUT` (default 60s) via
+  `timeout --preserve-status`; TIMEOUT reported distinctly from FAIL. Adds
+  `--fail-fast` / `CE_FAIL_FAST=1`.
+- Full-suite baseline captured: 99 pass / 220 fail / 319 total. Almost every
+  failure is NOVA std/io startup propagation; fixing that upstream would flip
+  ~200 tests green in one shot.
+
+### Where to continue (from R41)
+
+Ordered by leverage / scope:
+
+1. **NOVA `std/io` runtime fix** (highest leverage, off-limits per user;
+   ~200 tests would flip GREEN). Root cause + staged plan below.
+2. **Federation `turn*.nova` list_remove sites** -- 7 remaining call sites in
+   `federation/turn.nova` (perms/chans by index) and `federation/turn_server.nova`
+   (pool/allocs/perms/chans by index). Deferred pending integration-test story
+   because networked code needs an authoritative test angle.
+3. **Persist the retraction log** through `fc_snapshot`/`fc_restore` so audit
+   history survives session restarts.
+4. **`/unretract LABEL`** -- symmetric with `/retract` for exploration. Would
+   need to stash packets in the log so re-verification is possible.
+5. **Multi-KG consistency at the empirical (non-FORMAL) level** -- corroborated
+   beliefs across KGs. Larger design.
+6. **The other still-open items from R40** below stay open: Raft I/O shell,
+   NOVA-0007 storage, embodiment ADR-0095, real captured LLM transcripts.
+
 ## R40 -- reasoning capstones + Raft safety layer (proof search → ML-policy gate → consensus)
 
 **Status: complete (all unit-tested, all on branch `claude/confident-fermi-op241b`).**
