@@ -64,11 +64,26 @@ Two previously-listed constraints RETIRED after empirical verification (no
 longer reproduce): "6+ params corrupts args 7+" (15 mixed-type params all
 survive), "definition order matters / forward refs segfault" (works cleanly).
 
-### Curated-tests delta (R41 impact, verified by focused rerun 2026-08)
+### Full-suite delta (R41 impact, verified 2026-08)
 
-Full suite is impractical to rerun on demand (5+ min, mostly std/io startup
-crashes anyway). Instead, focused rerun of the tests R41's fixes should have
-affected + our curated substrate + Raft + reasoning tests:
+Full `bash scripts/test.sh` rerun 2026-08 (with the new per-test timeout so it
+completes): **135 pass / 186 fail / 321 total**. Baseline (start of session):
+99 pass / 220 fail / 319 total. **Net: +36 tests RED -> GREEN, -34 failing,
++2 total (6 new test files added this session, minus some now-obsolete).**
+
+Discussion: 36 is bigger than the 16-real-bug delta because (a) new test files
+added this session count as new PASSes, (b) other tests transitively benefit
+from the str_find fixes and the harness's ce_str_eq fix removing ghost FAILs
+in tests that call ce_str_eq incidentally, (c) the per-test timeout also
+prevented a couple of hangs from cascading and blocking downstream tests.
+
+Ceiling: of the 186 still-failing tests, the vast majority are the NOVA
+std/io startup segfault propagating through `import "std/io"`. Fixing that
+one upstream bug would likely flip ~150 more tests GREEN in a single stroke.
+
+### Curated-tests delta (R41 impact, focused rerun 2026-08)
+
+Same numbers, per module, for the tests R41's fixes directly touched:
 
 **Real-bug fixes flipped 16 tests from RED to GREEN:**
 | Test | Baseline | After R41 |
