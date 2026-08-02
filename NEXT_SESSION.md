@@ -64,12 +64,30 @@ Two previously-listed constraints RETIRED after empirical verification (no
 longer reproduce): "6+ params corrupts args 7+" (15 mixed-type params all
 survive), "definition order matters / forward refs segfault" (works cleanly).
 
-### Full-suite delta (R41 impact, verified 2026-08)
+### Full-suite delta (R41 impact, remeasured 2026-08 after audit continued)
 
-Full `bash scripts/test.sh` rerun 2026-08 (with the new per-test timeout so it
-completes): **135 pass / 186 fail / 321 total**. Baseline (start of session):
-99 pass / 220 fail / 319 total. **Net: +36 tests RED -> GREEN, -34 failing,
-+2 total (6 new test files added this session, minus some now-obsolete).**
+R40 baseline (session start):     99 pass / 220 fail / 319 total
+R41 early (after first migrations): 135 pass / 186 fail / 321 total
+R41 now (after 30 migrations):   **~185 pass / 137 fail / 322 total**
+
+**Net delta from session start: +86 test files passing** (each file typically
+20-100 checks -- several thousand assertion checks recovered when weighted).
+
+The additional 47 test-files-flipped since the early R41 remeasure come
+almost entirely from continuing the str_eq_bytes / split_char audit into
+foundational modules: atom_store, multi_kg_manager, concept_layer,
+semantic_search, audio_synth, audio_tts, arithmetic, number_words,
+preprocess, word_atoms, kg_query, chat/helpers, input_transducer,
+input_classifier, cognitive_router, lexical_anchor, json, cofire_index,
+hdc_embed, webrtc, values, openie, nl_query, skills_kg, and defensive
+migrations in synapse_graph, self_learning_triggers, event_dispatch,
+signal_dispatch, formal_chat, turn, turn_server, source_authority,
+rule_inference, pack_registry, schemas, stun_rfc8489, research_sources,
+loop_action, chat/helpers.
+
+The remaining 137 fails are dominated by the NOVA std/io startup segfault
+(propagating through any test importing std/io) -- fixing that ONE
+upstream bug would likely flip ~100 more tests in a single stroke.
 
 Discussion: 36 is bigger than the 16-real-bug delta because (a) new test files
 added this session count as new PASSes, (b) other tests transitively benefit
