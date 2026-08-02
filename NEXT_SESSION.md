@@ -218,6 +218,37 @@ add the pkg-deps entry; (3) then finish string/io.nova on the raw sidestep
 pattern. The sidestep is validated; the indirect-call codegen bug is the actual
 blocker.
 
+### Test-suite health snapshot (sobering baseline)
+
+A full run of `bash scripts/test.sh` on 2026-08-02 reported **99 pass / 220 fail
+/ 319 total**. Two-thirds of the suite is currently red. The failing tests are
+NOT independent bugs -- almost every failure is a NOVA runtime startup segfault
+propagating through `import "std/io"` and `import "std/string"` (see the "chat
+run-verification limitation / std runtime tagging bug" section above). That is a
+single toolchain root cause with a broad blast radius.
+
+What that means honestly:
+- Modules whose tests don't touch `std/io` DO pass and are trustworthy
+  (`test_formal_chat` 76, `test_formal_consistency` 69, `test_contradiction`
+  52, `test_raft_*` 35/21/15/22, `test_signal_dispatch` 55, etc.).
+- Modules whose tests import `std/io` for output cannot even boot -- their
+  reported failure is infrastructure, not logic.
+- **Fixing the NOVA std/io tagging bug (the "chat run-verification limitation"
+  above) would likely flip ~200 tests from RED to GREEN in one shot.** That is
+  the single highest-leverage remaining task.
+
+Harness-side improvements landed this session that HELP the report be accurate,
+even though they don't fix the underlying crashes:
+- `tests/ce_test.nova::ce_str_eq` now uses char-by-char comparison via
+  `_ce_str_eq_bytes` instead of NOVA's flaky `str_eq` builtin. This eliminates
+  the "expected='X' got='X'" (byte-identical) false-positive FAIL family that
+  was polluting every affected suite. New `tests/unit/test_ce_test.nova`
+  (15 checks) guards the harness itself.
+- `scripts/test.sh` now enforces a per-test timeout (`CE_TEST_TIMEOUT`,
+  default 60s) via `timeout --preserve-status`, so a single hang can no longer
+  block the whole suite. TIMEOUT is reported distinctly from FAIL. Also
+  supports `--fail-fast` (or `CE_FAIL_FAST=1`) to stop on the first failure.
+
 ### NOVA runtime bug: `list_remove` doesn't untag its index (discovered this session)
 
 `list_remove(l, i)` in NOVA receives a **tagged** int `2i+1` but does not `sar`
