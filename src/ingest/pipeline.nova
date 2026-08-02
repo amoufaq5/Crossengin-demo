@@ -1,0 +1,289 @@
+// CrossEngin ingestion: pipeline core.
+//
+// Takes a VALIDATED curriculum record (src/ingest/curriculum.nova) and turns
+// it into KG state: resolves the target KG in a registry (spawning if
+// absent), seeds atoms with graded beliefs, wires implications through the
+// formal env (FORMAL strength) or as empirical association atoms (EMPIRICAL
+// strength), attributes every atom to the record's source_tag via the
+// meta-observer, and records citation edges as separate meta-observer notes
+// so cross-source support/contradiction remains queryable.
+//
+// Idempotency
+//   Re-ingesting the same record does NOT double-count. Atoms are keyed by
+//   label; re-seeding an existing atom takes the max of the current and the
+//   requested belief mass rather than adding. Observations DO accumulate --
+//   that's their whole point (evidence is additive) -- but the pipeline
+//   never turns a stronger belief into a weaker one by re-import.
+//
+// Failure model
+//   pip_ingest returns a status list [ok, atoms_added, atoms_seen,
+//   imps_added, obs_applied, cites_recorded, error_code, error_detail].
+//   ok == 1 means every operation applied. ok == 0 with error_code set to
+//   a PIP_ERR_* value means the record was rejected mid-flight; the
+//   error_detail names the offending sub-record. The KG is left in a
+//   consistent state either way -- partial atom seeding is tolerated
+//   (atoms without implications are still knowledge) and the caller can
+//   re-run the same record safely.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/kg/multi_kg_manager.nova (kg_registry, kg_spawn, kg_get, kg_atoms,
+//     kg_label, kg_add_atom, kg_find_atom)
+//   src/kg/atom_store.nova (atom_belief, atom_id, atom_label, bel_observe_weighted,
+//     ATOM_FACT, ATOM_CONCEPT)
+//   src/agent/formal_chat.nova (fc_assert_axiom, fc_assert_imp)
+//   src/parts/meta/meta_observer.nova (mo_attribute)
+//   src/ingest/curriculum.nova (record shape + accessors + validator)
+//   src/util/str_safe.nova (str_eq_bytes)
+
+import "../kg/multi_kg_manager.nova"
+import "../kg/atom_store.nova"
+import "../agent/formal_chat.nova"
+import "../parts/meta/meta_observer.nova"
+import "./curriculum.nova"
+import "../util/str_safe.nova"
+
+// ---- status slot indices --------------------------------------------------
+let PIP_OK              = 0
+let PIP_ATOMS_ADDED     = 1
+let PIP_ATOMS_SEEN      = 2  // atoms in the record whose label already existed
+let PIP_IMPS_ADDED      = 3
+let PIP_OBS_APPLIED     = 4
+let PIP_CITES_RECORDED  = 5
+let PIP_ERR_CODE        = 6
+let PIP_ERR_DETAIL      = 7
+
+// ---- error codes ----------------------------------------------------------
+let PIP_ERR_NONE                = 0
+let PIP_ERR_INVALID_RECORD      = -1
+let PIP_ERR_NULL_REG            = -2
+let PIP_ERR_IMP_DANGLING_ANTE   = -3
+let PIP_ERR_IMP_DANGLING_CONSEQ = -4
+let PIP_ERR_OBS_DANGLING        = -5
+let PIP_ERR_UNKNOWN_STRENGTH    = -6
+
+// ---- helpers --------------------------------------------------------------
+
+// Find a KG by label in the registry; return 0 if absent.
+fn _pip_kg_by_name(reg, name) {
+    let n = kg_count(reg)
+    let i = 0
+    while i < n {
+        let kg = kg_get(reg, i)
+        if kg != 0 {
+            if str_eq_bytes(kg_label(kg), name) == 1 { return kg }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Resolve or spawn `name` in `reg`.
+fn _pip_kg_ensure(reg, name) {
+    let existing = _pip_kg_by_name(reg, name)
+    if existing != 0 { return existing }
+    return kg_spawn(reg, name)
+}
+
+// Convert a seed_belief in milli (0..1000) to an (alpha, beta) pair at a
+// fixed evidence total of 5000. seed=500 -> Beta(2500,2500), seed=800 ->
+// Beta(4000,1000), seed=1000 -> Beta(5000,0). Chosen to match the strength
+// of a Tier-A user teach (Beta(4,1)) at seed=800.
+fn _pip_belief_from_seed(seed_milli) {
+    let s = seed_milli
+    if s < 0    { s = 0 }
+    if s > 1000 { s = 1000 }
+    let alpha = s * 5
+    let beta  = (1000 - s) * 5
+    let b = list_new() push(b, alpha) push(b, beta)
+    return b
+}
+
+// Seed or refresh an atom in `kg` with `label`, `kind`, and target seed
+// belief. Returns [atom, was_new] where was_new is 1 if the atom was minted
+// on this call, 0 if it already existed. Refresh policy is "no mean
+// backslide": if the atom already exists, we compare the CURRENT mean to
+// the requested seed mean; a stronger seed promotes both alpha and beta to
+// the target counts, a weaker one is silently ignored. This keeps re-imports
+// of a stronger source strictly upgrading, without letting a weaker source
+// drag an atom's mean down (which would erase accumulated evidence).
+fn _pip_seed_atom(kg, label, kind, seed_milli) {
+    let existing = kg_find_atom(kg, label)
+    if existing != 0 {
+        let b = atom_belief(existing)
+        let cur_mean = bel_mean(b)
+        // Only promote when the new source claims a strictly stronger belief.
+        // Cur mean uses the same milli scale as seed_milli (0..1000).
+        if seed_milli > cur_mean {
+            let target = _pip_belief_from_seed(seed_milli)
+            list_set(b, 0, target[0])
+            list_set(b, 1, target[1])
+        }
+        let r = list_new() push(r, existing) push(r, 0)
+        return r
+    }
+    let a = kg_add_atom(kg, kind, label, 0)
+    let target = _pip_belief_from_seed(seed_milli)
+    let b = atom_belief(a)
+    list_set(b, 0, target[0])
+    list_set(b, 1, target[1])
+    let r = list_new() push(r, a) push(r, 1)
+    return r
+}
+
+// Build an empirical-only association atom (label = "<ante>-imp-<conseq>")
+// so cross-KG scans still see EMPIRICAL implications as first-class objects.
+// Belief starts at 800 (asserted-but-graded) and can be reinforced by
+// subsequent observations. Returns [atom, was_new].
+fn _pip_seed_emp_imp(kg, ante_label, conseq_label) {
+    let label = ante_label + "-imp-" + conseq_label
+    return _pip_seed_atom(kg, label, ATOM_RELATION, 800)
+}
+
+// ---- driver ---------------------------------------------------------------
+
+// The main entry point. `reg` is the KG registry, `record` is a curriculum
+// record (must pass cur_validate first -- driver re-checks defensively),
+// `mo` is the meta-observer to attribute atoms to. Returns a status list;
+// see slot indices above.
+fn pip_ingest(reg, record, mo) {
+    let status = list_new()
+    push(status, 0)     // PIP_OK
+    push(status, 0)     // PIP_ATOMS_ADDED
+    push(status, 0)     // PIP_ATOMS_SEEN
+    push(status, 0)     // PIP_IMPS_ADDED
+    push(status, 0)     // PIP_OBS_APPLIED
+    push(status, 0)     // PIP_CITES_RECORDED
+    push(status, PIP_ERR_NONE)
+    push(status, "")
+    if reg == 0 {
+        list_set(status, PIP_ERR_CODE, PIP_ERR_NULL_REG)
+        list_set(status, PIP_ERR_DETAIL, "registry is null")
+        return status
+    }
+    let vcode = cur_validate(record)
+    if vcode != CUR_OK {
+        list_set(status, PIP_ERR_CODE, PIP_ERR_INVALID_RECORD)
+        list_set(status, PIP_ERR_DETAIL, cur_err_name(vcode))
+        return status
+    }
+    let kg = _pip_kg_ensure(reg, cur_kg(record))
+    let source_tag = cur_source(record)
+    // ---- atoms --------------------------------------------------------
+    let atoms = cur_atoms(record)
+    let i = 0
+    while i < len(atoms) {
+        let a_rec = atoms[i]
+        let seeded = _pip_seed_atom(kg, a_rec[CUR_ATOM_LABEL],
+                                    a_rec[CUR_ATOM_KIND],
+                                    a_rec[CUR_ATOM_BELIEF])
+        let atom = seeded[0]
+        let was_new = seeded[1]
+        if was_new == 1 {
+            list_set(status, PIP_ATOMS_ADDED, status[PIP_ATOMS_ADDED] + 1)
+        } else {
+            list_set(status, PIP_ATOMS_SEEN, status[PIP_ATOMS_SEEN] + 1)
+        }
+        if mo != 0 { mo_attribute(mo, source_tag, atom_id(atom)) }
+        i = i + 1
+    }
+    // ---- implications -------------------------------------------------
+    let imps = cur_imps(record)
+    let j = 0
+    while j < len(imps) {
+        let ir = imps[j]
+        let ante = ir[CUR_IMP_ANTE]
+        let conseq = ir[CUR_IMP_CONSEQ]
+        let strength = ir[CUR_IMP_STR]
+        // Antecedent must already exist (either seeded above or previously ingested).
+        if kg_find_atom(kg, ante) == 0 {
+            list_set(status, PIP_ERR_CODE, PIP_ERR_IMP_DANGLING_ANTE)
+            list_set(status, PIP_ERR_DETAIL, ante)
+            return status
+        }
+        if kg_find_atom(kg, conseq) == 0 {
+            list_set(status, PIP_ERR_CODE, PIP_ERR_IMP_DANGLING_CONSEQ)
+            list_set(status, PIP_ERR_DETAIL, conseq)
+            return status
+        }
+        if str_eq_bytes(strength, "FORMAL") == 1 {
+            // Kernel-checked implication axiom; label under the source for audit.
+            let imp_label = source_tag + ":imp:" + ante + "->" + conseq
+            fc_assert_imp(kg, imp_label, ante, conseq, source_tag)
+            list_set(status, PIP_IMPS_ADDED, status[PIP_IMPS_ADDED] + 1)
+        } else {
+            if str_eq_bytes(strength, "EMPIRICAL") == 1 {
+                let seeded = _pip_seed_emp_imp(kg, ante, conseq)
+                let assoc_atom = seeded[0]
+                if mo != 0 { mo_attribute(mo, source_tag, atom_id(assoc_atom)) }
+                list_set(status, PIP_IMPS_ADDED, status[PIP_IMPS_ADDED] + 1)
+            } else {
+                list_set(status, PIP_ERR_CODE, PIP_ERR_UNKNOWN_STRENGTH)
+                list_set(status, PIP_ERR_DETAIL, strength)
+                return status
+            }
+        }
+        j = j + 1
+    }
+    // ---- observations -------------------------------------------------
+    let obs = cur_obs(record)
+    let k = 0
+    while k < len(obs) {
+        let o = obs[k]
+        let a = kg_find_atom(kg, o[CUR_OBS_LABEL])
+        if a == 0 {
+            list_set(status, PIP_ERR_CODE, PIP_ERR_OBS_DANGLING)
+            list_set(status, PIP_ERR_DETAIL, o[CUR_OBS_LABEL])
+            return status
+        }
+        let b = atom_belief(a)
+        let weight = o[CUR_OBS_WEIGHT]
+        if weight <= 0 { weight = 1000 }
+        bel_observe_weighted(b, o[CUR_OBS_SIGN], weight)
+        if mo != 0 { mo_attribute(mo, source_tag, atom_id(a)) }
+        list_set(status, PIP_OBS_APPLIED, status[PIP_OBS_APPLIED] + 1)
+        k = k + 1
+    }
+    // ---- citations ----------------------------------------------------
+    // Citations get recorded as source-side attribution notes. There is no
+    // KG-atom for a citation edge today (citations live at the source level,
+    // not the concept level), but the meta-observer accumulates from/to
+    // sources on both sides so a later query can compute "sources that
+    // support src:X" vs "sources that contradict src:X" from the atom-level
+    // atrophy correlations.
+    let cites = cur_cites(record)
+    let m = 0
+    while m < len(cites) {
+        let c = cites[m]
+        // The citation itself becomes an atom in a meta-KG so it's queryable.
+        let cite_label = c[CUR_CITE_FROM] + " " + c[CUR_CITE_REL] + " " + c[CUR_CITE_TO]
+        let meta_kg = _pip_kg_ensure(reg, "citations")
+        let seeded = _pip_seed_atom(meta_kg, cite_label, ATOM_RELATION, 900)
+        if mo != 0 { mo_attribute(mo, source_tag, atom_id(seeded[0])) }
+        list_set(status, PIP_CITES_RECORDED, status[PIP_CITES_RECORDED] + 1)
+        m = m + 1
+    }
+    list_set(status, PIP_OK, 1)
+    return status
+}
+
+// Accessors on the status list for chat/UI code.
+fn pip_ok(s)              { return s[PIP_OK] }
+fn pip_atoms_added(s)     { return s[PIP_ATOMS_ADDED] }
+fn pip_atoms_seen(s)      { return s[PIP_ATOMS_SEEN] }
+fn pip_imps_added(s)      { return s[PIP_IMPS_ADDED] }
+fn pip_obs_applied(s)     { return s[PIP_OBS_APPLIED] }
+fn pip_cites_recorded(s)  { return s[PIP_CITES_RECORDED] }
+fn pip_err_code(s)        { return s[PIP_ERR_CODE] }
+fn pip_err_detail(s)      { return s[PIP_ERR_DETAIL] }
+
+fn pip_err_name(code) {
+    if code == PIP_ERR_NONE                { return "ok" }
+    if code == PIP_ERR_INVALID_RECORD      { return "invalid-record" }
+    if code == PIP_ERR_NULL_REG            { return "null-registry" }
+    if code == PIP_ERR_IMP_DANGLING_ANTE   { return "implication-antecedent-missing" }
+    if code == PIP_ERR_IMP_DANGLING_CONSEQ { return "implication-consequent-missing" }
+    if code == PIP_ERR_OBS_DANGLING        { return "observation-atom-missing" }
+    if code == PIP_ERR_UNKNOWN_STRENGTH    { return "unknown-implication-strength" }
+    return "unknown"
+}

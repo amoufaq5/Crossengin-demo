@@ -1,0 +1,174 @@
+// CrossEngin ingestion: human-review approval queue.
+//
+// Records from unknown or untrusted sources land here instead of going
+// straight into the KG. The owner reviews via /ingest_review, approves via
+// /ingest_approve N, or denies via /ingest_deny N REASON. Approval
+// dispatches through pip_ingest; denial keeps the record on file (with the
+// deny reason) so a later audit can ask "what did we refuse to learn, and
+// why?" That audit trail is the point -- silent rejection has no operator
+// value.
+//
+// Queue entry:
+//   [id, source_tag, record, state, reason, submitted_at]
+//     id            monotonically-increasing (per-queue) integer
+//     source_tag    duplicated from record for fast "list by source"
+//     record        the curriculum record itself
+//     state         RQ_PENDING | RQ_APPROVED | RQ_DENIED | RQ_INGESTED
+//     reason        empty until deny, then holds the deny reason;
+//                   on ingest failure holds the pipeline error name
+//     submitted_at  a caller-supplied moment (integer; caller decides
+//                   whether it's wall-clock, sequence, etc.)
+//
+// Queue itself:
+//   [next_id, entries]
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova (record shape), src/ingest/pipeline.nova
+//   (pip_ingest for approvals), src/util/str_safe.nova.
+
+import "./curriculum.nova"
+import "./pipeline.nova"
+import "../util/str_safe.nova"
+
+// ---- slot indices (entry) -------------------------------------------------
+let RQE_ID           = 0
+let RQE_SOURCE       = 1
+let RQE_RECORD       = 2
+let RQE_STATE        = 3
+let RQE_REASON       = 4
+let RQE_SUBMITTED    = 5
+
+// ---- slot indices (queue) -------------------------------------------------
+let RQ_NEXT_ID       = 0
+let RQ_ENTRIES       = 1
+
+// ---- entry states ---------------------------------------------------------
+let RQ_PENDING       = 0
+let RQ_APPROVED      = 1
+let RQ_DENIED        = 2
+let RQ_INGESTED      = 3
+let RQ_INGEST_FAILED = 4
+
+// ---- approval return codes ------------------------------------------------
+let RQ_APPROVE_OK             = 0
+let RQ_APPROVE_UNKNOWN_ID     = -1
+let RQ_APPROVE_ALREADY_DONE   = -2
+let RQ_APPROVE_INGEST_FAILED  = -3
+
+// ---- constructors ---------------------------------------------------------
+
+fn rq_new() {
+    let q = list_new()
+    push(q, 1)               // RQ_NEXT_ID
+    push(q, list_new())      // RQ_ENTRIES
+    return q
+}
+
+// Submit a record for review. Returns the assigned entry id.
+fn rq_submit(q, record, submitted_at) {
+    let e = list_new()
+    let id = q[RQ_NEXT_ID]
+    push(e, id)
+    push(e, cur_source(record))
+    push(e, record)
+    push(e, RQ_PENDING)
+    push(e, "")
+    push(e, submitted_at)
+    push(q[RQ_ENTRIES], e)
+    list_set(q, RQ_NEXT_ID, id + 1)
+    return id
+}
+
+// ---- lookup helpers -------------------------------------------------------
+
+// Find an entry by id; returns 0 if absent.
+fn rq_find(q, id) {
+    let entries = q[RQ_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        if entries[i][RQE_ID] == id { return entries[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn rq_size(q)         { return len(q[RQ_ENTRIES]) }
+fn rq_entries(q)      { return q[RQ_ENTRIES] }
+
+fn rq_state(e)        { return e[RQE_STATE] }
+fn rq_source(e)       { return e[RQE_SOURCE] }
+fn rq_record(e)       { return e[RQE_RECORD] }
+fn rq_reason(e)       { return e[RQE_REASON] }
+fn rq_submitted(e)    { return e[RQE_SUBMITTED] }
+fn rq_id(e)           { return e[RQE_ID] }
+
+// Count entries in a specific state.
+fn rq_count_state(q, state) {
+    let entries = q[RQ_ENTRIES]
+    let i = 0
+    let n = 0
+    while i < len(entries) {
+        if entries[i][RQE_STATE] == state { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// Return only entries whose state matches `state`. Fresh list.
+fn rq_filter_state(q, state) {
+    let out = list_new()
+    let entries = q[RQ_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        if entries[i][RQE_STATE] == state { push(out, entries[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- approve / deny -------------------------------------------------------
+
+// Approve entry `id`: mark APPROVED, then attempt pip_ingest. On success
+// mark INGESTED. On failure mark INGEST_FAILED and stash the pipeline
+// error name in the reason. Returns RQ_APPROVE_* code.
+fn rq_approve(q, id, reg, mo) {
+    let e = rq_find(q, id)
+    if e == 0 { return RQ_APPROVE_UNKNOWN_ID }
+    let st = rq_state(e)
+    if st == RQ_INGESTED { return RQ_APPROVE_ALREADY_DONE }
+    if st == RQ_DENIED   { return RQ_APPROVE_ALREADY_DONE }
+    list_set(e, RQE_STATE, RQ_APPROVED)
+    let status = pip_ingest(reg, rq_record(e), mo)
+    if pip_ok(status) == 1 {
+        list_set(e, RQE_STATE, RQ_INGESTED)
+        return RQ_APPROVE_OK
+    }
+    list_set(e, RQE_STATE, RQ_INGEST_FAILED)
+    list_set(e, RQE_REASON, pip_err_name(pip_err_code(status))
+                            + ":" + pip_err_detail(status))
+    return RQ_APPROVE_INGEST_FAILED
+}
+
+// Deny entry `id` with a reason. Returns 1 if applied, 0 if entry not found
+// or already terminal.
+fn rq_deny(q, id, reason) {
+    let e = rq_find(q, id)
+    if e == 0 { return 0 }
+    let st = rq_state(e)
+    if st == RQ_INGESTED { return 0 }
+    if st == RQ_DENIED   { return 0 }
+    list_set(e, RQE_STATE, RQ_DENIED)
+    list_set(e, RQE_REASON, reason)
+    return 1
+}
+
+// Human-readable label for a state.
+fn rq_state_name(st) {
+    if st == RQ_PENDING       { return "pending" }
+    if st == RQ_APPROVED      { return "approved-not-yet-ingested" }
+    if st == RQ_DENIED        { return "denied" }
+    if st == RQ_INGESTED      { return "ingested" }
+    if st == RQ_INGEST_FAILED { return "ingest-failed" }
+    return "unknown"
+}
