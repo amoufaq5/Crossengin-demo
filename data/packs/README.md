@@ -24,12 +24,23 @@ to feed into the ingestion pipeline (`src/ingest/`).
   Oxford Handbook of Religion) — makes NO theological truth claims.
   Answers the vision's "religious analysis" call-out.
   `src:pack:religion:v1`.
+- **`politics.cerec`** (73 atoms) — descriptive comparative political
+  science: taxonomy of political systems, ideologies (as documented,
+  not endorsed), institutions, foundational documents + concepts,
+  international bodies, well-documented milestones. Reference-level
+  content (Britannica, Oxford Handbook of Comparative Politics) — no
+  partisan claims, no living-figure claims. Answers the vision's
+  "political analysis" call-out. `src:pack:politics:v1`.
 - **`folk_astronomy.cerec`** (5 atoms) — LOW-belief historical / folk
   beliefs (Pluto still a planet, sun orbits earth). Designed to
   demonstrate cross-KG conflict detection when ingested alongside the
   scientific packs. `src:pack:folk_astronomy:v1`.
 
-**Total: 174 atoms across 5 packs, ready to ingest.**
+**Total: 247 atoms across 6 packs, ready to ingest.**
+
+The three vision-called-out domains — religious, historical, political —
+are now covered, plus two scientific packs (solar_system, physics) and
+one deliberate-disagreement pack (folk_astronomy).
 
 ## Ingest via the chat REPL
 
