@@ -9,6 +9,13 @@
 > [`docs/adr/`](docs/adr/) -- the R36F-prefixed series covers the rounds-up
 > rationale (language choice, federation stack, substrate commitment,
 > self-hosting invariant, canonical crypto primitives).
+>
+> **Want to actually use it?** See
+> [`docs/USING.md`](docs/USING.md) -- the user-facing operator's guide.
+> Feeding data at three scales (interactive `/assert`, `.cerec` packs,
+> external importers + LLM-as-preprocessor via `scripts/llm_extract.sh`),
+> the full slash-command reference, cross-KG conflict workflows, and an
+> honest gap analysis vs. Claude/ChatGPT.
 
 CrossEngin is a non-LLM cognitive **substrate** system, implemented in
 [NOVA](https://github.com/amoufaq5/nova). It targets AGI-relevant capability —
