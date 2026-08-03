@@ -31,16 +31,24 @@ to feed into the ingestion pipeline (`src/ingest/`).
   content (Britannica, Oxford Handbook of Comparative Politics) — no
   partisan claims, no living-figure claims. Answers the vision's
   "political analysis" call-out. `src:pack:politics:v1`.
+- **`biology.cerec`** (77 atoms) — undergraduate biology reference:
+  three domains of life, kingdoms, taxonomic ranks, representative
+  organisms, cell types + organelles, key molecules (DNA/RNA/protein/
+  ATP/glucose), organ systems, core biological processes
+  (photosynthesis, cellular respiration, evolution, natural selection),
+  foundational figures (Darwin, Mendel, Watson, Crick, Franklin) +
+  milestone dates. Sourced against Campbell Biology, Alberts MBoC,
+  NCBI Taxonomy. `src:pack:biology:v1`.
 - **`folk_astronomy.cerec`** (5 atoms) — LOW-belief historical / folk
   beliefs (Pluto still a planet, sun orbits earth). Designed to
   demonstrate cross-KG conflict detection when ingested alongside the
   scientific packs. `src:pack:folk_astronomy:v1`.
 
-**Total: 247 atoms across 6 packs, ready to ingest.**
+**Total: 324 atoms across 7 packs, ready to ingest.**
 
 The three vision-called-out domains — religious, historical, political —
-are now covered, plus two scientific packs (solar_system, physics) and
-one deliberate-disagreement pack (folk_astronomy).
+are all covered, plus three scientific packs (solar_system, physics,
+biology) and one deliberate-disagreement pack (folk_astronomy).
 
 ## Ingest via the chat REPL
 
