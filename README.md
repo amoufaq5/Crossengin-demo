@@ -17,6 +17,13 @@
 > the full slash-command reference, cross-KG conflict workflows, and an
 > honest gap analysis vs. Claude/ChatGPT.
 
+CrossEngin implements **Moment-Signal Cognition (MSC)** — a named
+alternative to transformer-based LLMs built on four primitives (nodes,
+signals, moments, attribution). See
+[`docs/adr/0100-moment-signal-cognition.md`](docs/adr/0100-moment-signal-cognition.md)
+for the architectural contract. The rest of this section describes
+the substrate MSC runs on.
+
 CrossEngin is a non-LLM cognitive **substrate** system, implemented in
 [NOVA](https://github.com/amoufaq5/nova). It targets AGI-relevant capability —
 continuous learning, self-directed skill acquisition, theory of mind,

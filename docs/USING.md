@@ -19,15 +19,18 @@ scale it up.
 
 ## 0. What CrossEngin is in one paragraph
 
-CrossEngin holds beliefs as explicit `(alpha, beta)` Bayesian counts on
-labeled atoms, arranged into multiple knowledge graphs (one per
-domain). It exposes contradictions with kernel-checked FALSE witnesses
-(formal layer) and cross-KG belief spreads (empirical layer). It can
-retract a belief and cascade the withdrawal, then bring the belief
-back symmetrically. Every atom carries its source; the meta-observer
-tracks which sources produce beliefs that decay. There is **no LLM in
-the answer path** and **no gradient descent anywhere**. It learns by
-absorbing observations, one at a time, tagged by source.
+CrossEngin implements **Moment-Signal Cognition (MSC)** — see
+[`../docs/adr/0100-moment-signal-cognition.md`](adr/0100-moment-signal-cognition.md)
+for the architectural contract. In plain terms: it holds beliefs as
+explicit `(alpha, beta)` Bayesian counts on labeled atoms, arranged
+into multiple knowledge graphs (one per domain). It exposes
+contradictions with kernel-checked FALSE witnesses (formal layer) and
+cross-KG belief spreads (empirical layer). It can retract a belief
+and cascade the withdrawal, then bring the belief back symmetrically.
+Every atom carries its source; the meta-observer tracks which sources
+produce beliefs that decay. There is **no LLM in the answer path** and
+**no gradient descent anywhere**. It learns by absorbing observations,
+one at a time, tagged by source.
 
 ---
 
