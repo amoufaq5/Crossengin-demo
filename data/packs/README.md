@@ -5,17 +5,24 @@ to feed into the ingestion pipeline (`src/ingest/`).
 
 ## Available packs
 
-- **`solar_system.cerec`** — 33 atoms + 49 implications + 4 observations
-  covering the eight planets, the Sun, major moons, and compositional
-  facts. Ontological is-a edges are `FORMAL`; graded associations are
-  `EMPIRICAL`. Source-tagged `src:pack:solar_system:v1` with citations
-  to three external references (IAU 2006 planet definition, NASA fact
-  sheet, JPL Horizons).
+- **`solar_system.cerec`** (33 atoms) — eight planets, the Sun, major
+  moons, compositional facts. `src:pack:solar_system:v1`.
+- **`physics.cerec`** (35 atoms) — classical mechanics, four fundamental
+  forces, particle taxonomy, celestial physics. Deliberate label
+  overlap with `solar_system` (sun, star, earth, planet) so cross-KG
+  scans can verify the two scientific packs AGREE where they overlap.
+  `src:pack:physics:v1`.
+- **`world_history.cerec`** (43 atoms) — milestones from antiquity
+  through the 20th century, focused on well-documented, high-consensus
+  events (dates + actors + first-order consequences). Answers the
+  vision's "historical analysis" call-out.
+  `src:pack:world_history:v1`.
+- **`folk_astronomy.cerec`** (5 atoms) — LOW-belief historical / folk
+  beliefs (Pluto still a planet, sun orbits earth). Designed to
+  demonstrate cross-KG conflict detection when ingested alongside the
+  scientific packs. `src:pack:folk_astronomy:v1`.
 
-- **`folk_astronomy.cerec`** — 5 atoms deliberately holding low-belief
-  historical / folk beliefs (Pluto still a planet, geocentric universe)
-  under `src:pack:folk_astronomy:v1`. Designed to demonstrate cross-KG
-  conflict detection when ingested alongside `solar_system`.
+**Total: 116 atoms across 4 packs, ready to ingest.**
 
 ## Ingest via the chat REPL
 
