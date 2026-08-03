@@ -17,12 +17,19 @@ to feed into the ingestion pipeline (`src/ingest/`).
   events (dates + actors + first-order consequences). Answers the
   vision's "historical analysis" call-out.
   `src:pack:world_history:v1`.
+- **`religion.cerec`** (58 atoms) — descriptive comparative-religion:
+  taxonomy of major traditions (Abrahamic + Dharmic + others), sacred
+  texts, historical founders, sacred places, cross-tradition practices,
+  well-documented dates. Descriptive/academic-level content (Britannica,
+  Oxford Handbook of Religion) — makes NO theological truth claims.
+  Answers the vision's "religious analysis" call-out.
+  `src:pack:religion:v1`.
 - **`folk_astronomy.cerec`** (5 atoms) — LOW-belief historical / folk
   beliefs (Pluto still a planet, sun orbits earth). Designed to
   demonstrate cross-KG conflict detection when ingested alongside the
   scientific packs. `src:pack:folk_astronomy:v1`.
 
-**Total: 116 atoms across 4 packs, ready to ingest.**
+**Total: 174 atoms across 5 packs, ready to ingest.**
 
 ## Ingest via the chat REPL
 
