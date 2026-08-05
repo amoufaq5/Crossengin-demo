@@ -1,0 +1,297 @@
+// CrossEngin skills: research_skill -- topic walk with cross-KG conflict
+// surfacing (ADR-0103 §Reference).
+//
+// The first reference skill with genuine research value. Given
+//   perception = [topic_string, kg_names_list]
+// research_skill walks each named KG (or all KGs if kg_names is empty),
+// collects atoms whose labels overlap the topic tokens, aggregates
+// per-KG belief means, and reports cross-KG conflicts on those atoms
+// via mkgc_scan_conflicts. Persona projection applied by the runtime
+// (skill_dispatch.nova) so the user sees "here's what I know about
+// TOPIC, here's where sources disagree, and here's what your persona
+// projects onto answering this."
+//
+// Composition point demonstrated: MSC substrate (atoms + beliefs) +
+// Capsules (via per-KG groups) + Persona (projection attached by
+// runtime) + audit (meta-observer attribution). No effectors.
+//
+// Perception shape: 2-list [topic:string, kg_names:list<string>].
+//                   Empty kg_names -> walk every KG in the registry.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/skills/skill_manifest.nova, src/skills/skill_supervisor.nova,
+//   src/kg/multi_kg_manager.nova, src/kg/atom_store.nova,
+//   src/parts/reasoning/multi_kg_consistency.nova, src/util/str_safe.nova.
+
+import "../skill_manifest.nova"
+import "../skill_supervisor.nova"
+import "../../kg/multi_kg_manager.nova"
+import "../../kg/atom_store.nova"
+import "../../parts/reasoning/multi_kg_consistency.nova"
+import "../../util/str_safe.nova"
+
+let SKILL_POLICY_RESEARCH = 2
+
+// Default spread threshold for surfacing cross-KG conflicts. 300 milli
+// = 0.3 belief-mean gap. Callers can override by wrapping the manifest
+// (a future skill_manifest field could carry this per-skill).
+let RESEARCH_DEFAULT_SPREAD = 300
+
+fn research_skill_manifest() {
+    return skill_manifest_new("research", "1.0.0",
+        "Walk named KGs for topic-token label matches; report per-source beliefs + cross-KG conflicts.",
+        SKILL_POLICY_RESEARCH)
+}
+
+// ---- tokenizer (identical shape to echo_skill's + persona_project's) -----
+
+fn _rs_is_wordchar(c) {
+    if c >= 65 { if c <= 90  { return 1 } }
+    if c >= 97 { if c <= 122 { return 1 } }
+    if c >= 48 { if c <= 57  { return 1 } }
+    if c == 95 { return 1 }
+    return 0
+}
+
+fn _rs_lower(c) {
+    if c >= 65 { if c <= 90 { return c + 32 } }
+    return c
+}
+
+fn _rs_is_stopword(w) {
+    if len(w) < 3 { return 1 }
+    if str_eq_bytes(w, "the") == 1 { return 1 }
+    if str_eq_bytes(w, "and") == 1 { return 1 }
+    if str_eq_bytes(w, "for") == 1 { return 1 }
+    if str_eq_bytes(w, "with") == 1 { return 1 }
+    if str_eq_bytes(w, "that") == 1 { return 1 }
+    if str_eq_bytes(w, "this") == 1 { return 1 }
+    if str_eq_bytes(w, "what") == 1 { return 1 }
+    if str_eq_bytes(w, "does") == 1 { return 1 }
+    if str_eq_bytes(w, "know") == 1 { return 1 }
+    if str_eq_bytes(w, "about") == 1 { return 1 }
+    return 0
+}
+
+fn _rs_lower_str(s) {
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n {
+        out = out + chr(_rs_lower(char_at(s, i)))
+        i = i + 1
+    }
+    return out
+}
+
+fn _rs_tokenize(s) {
+    let out = list_new()
+    let n = len(s)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _rs_is_wordchar(c) == 1 {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 {
+                let w = _rs_lower_str(substr(s, start, i - start))
+                if _rs_is_stopword(w) == 0 { push(out, w) }
+                start = 0 - 1
+            }
+        }
+        i = i + 1
+    }
+    if start >= 0 {
+        let w = _rs_lower_str(substr(s, start, n - start))
+        if _rs_is_stopword(w) == 0 { push(out, w) }
+    }
+    return out
+}
+
+// Case-insensitive substring match: does lowercase(label) contain `token`?
+fn _rs_label_contains_token(label, token) {
+    let low = _rs_lower_str(label)
+    let ln = len(low)
+    let tn = len(token)
+    if tn == 0 { return 0 }
+    if tn > ln { return 0 }
+    let limit = ln - tn
+    let i = 0
+    while i <= limit {
+        let ok = 1
+        let j = 0
+        while j < tn {
+            if char_at(low, i + j) != char_at(token, j) { ok = 0 j = tn }
+            else { j = j + 1 }
+        }
+        if ok == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- registry / label filters --------------------------------------------
+
+// Is `kg_name` in `wanted` list? Empty wanted = accept all.
+fn _rs_kg_wanted(kg_name, wanted) {
+    if len(wanted) == 0 { return 1 }
+    let i = 0
+    while i < len(wanted) {
+        if str_eq_bytes(wanted[i], kg_name) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Is `label` referenced in `matched_labels`? (Used to filter conflict
+// reports to only the labels this research turn actually surfaced.)
+fn _rs_label_in_set(label, matched_labels) {
+    let i = 0
+    while i < len(matched_labels) {
+        if str_eq_bytes(matched_labels[i], label) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- the policy -----------------------------------------------------------
+
+// Walks the requested KGs for atoms whose labels overlap the topic
+// tokens; aggregates per-KG belief; surfaces cross-KG conflicts on the
+// matched labels; assembles a proposal + confidence.
+//
+// perception is a 2-list: [topic_string, kg_names_list]
+//   * topic_string may be empty (returns an "empty topic" trace, no atoms)
+//   * kg_names_list may be empty (walk every KG in the registry)
+fn research_skill_policy(supervisor, perception, result) {
+    let kgreg = skill_sup_kg_registry(supervisor)
+    if kgreg == 0 {
+        skill_pr_add_trace(result, "no KG registry attached; nothing to search")
+        skill_pr_set_proposal(result, "(no KGs available for research)")
+        skill_pr_set_confidence(result, 0)
+        skill_pr_set_ok(result)
+        return 0
+    }
+    if perception == 0 {
+        skill_pr_add_trace(result, "perception is null; expected [topic, kg_names]")
+        skill_pr_set_proposal(result, "(no topic supplied)")
+        skill_pr_set_confidence(result, 0)
+        skill_pr_set_ok(result)
+        return 0
+    }
+    let topic = perception[0]
+    let wanted = list_new()
+    if len(perception) >= 2 { wanted = perception[1] }
+    if len(topic) == 0 {
+        skill_pr_add_trace(result, "empty topic; returning noop")
+        skill_pr_set_proposal(result, "(empty topic)")
+        skill_pr_set_confidence(result, 0)
+        skill_pr_set_ok(result)
+        return 0
+    }
+    let tokens = _rs_tokenize(topic)
+    skill_pr_add_trace(result,
+        "tokenized topic to " + int_to_str(len(tokens)) + " content words")
+    if len(tokens) == 0 {
+        skill_pr_set_proposal(result,
+            "(topic had no content words after stopword filter)")
+        skill_pr_set_confidence(result, 0)
+        skill_pr_set_ok(result)
+        return 0
+    }
+    // ---- walk KGs ----------------------------------------------------
+    let proposal = "research on '" + topic + "':\n"
+    let max_mean = 0
+    let total_matches = 0
+    let matched_labels = list_new()   // for later conflict filtering
+    let n_kgs_scanned = 0
+    let n_kgs = kg_count(kgreg)
+    let ki = 0
+    while ki < n_kgs {
+        let kg = kg_get(kgreg, ki)
+        if kg != 0 {
+            let kg_lab = kg_label(kg)
+            if _rs_kg_wanted(kg_lab, wanted) == 1 {
+                n_kgs_scanned = n_kgs_scanned + 1
+                let atoms = kg_atoms(kg)
+                let per_kg_hits = 0
+                let ai = 0
+                while ai < len(atoms) {
+                    let a = atoms[ai]
+                    if a != 0 {
+                        let lab = atom_label(a)
+                        let matched = 0
+                        let ti = 0
+                        while ti < len(tokens) {
+                            if _rs_label_contains_token(lab, tokens[ti]) == 1 {
+                                matched = 1
+                                ti = len(tokens)
+                            }
+                            ti = ti + 1
+                        }
+                        if matched == 1 {
+                            let mean = bel_mean(atom_belief(a))
+                            proposal = proposal + "  [" + kg_lab + "] " + lab
+                                     + " belief=" + int_to_str(mean) + "\n"
+                            skill_pr_add_atom(result, a)
+                            if _rs_label_in_set(lab, matched_labels) == 0 {
+                                push(matched_labels, lab)
+                            }
+                            if mean > max_mean { max_mean = mean }
+                            per_kg_hits = per_kg_hits + 1
+                            total_matches = total_matches + 1
+                        }
+                    }
+                    ai = ai + 1
+                }
+                if per_kg_hits > 0 {
+                    skill_pr_add_trace(result, "KG " + kg_lab + ": "
+                        + int_to_str(per_kg_hits) + " matches")
+                }
+            }
+        }
+        ki = ki + 1
+    }
+    // ---- cross-KG conflicts ------------------------------------------
+    let all_conflicts = mkgc_scan_conflicts(kgreg, RESEARCH_DEFAULT_SPREAD)
+    let relevant_conflicts = 0
+    let ci = 0
+    while ci < len(all_conflicts) {
+        let c = all_conflicts[ci]
+        let cl = mkgc_conflict_label(c)
+        // Only report conflicts on labels this research surface actually
+        // hit, AND both sides are on KGs we scanned (or wanted was empty).
+        if _rs_label_in_set(cl, matched_labels) == 1 {
+            let ka = mkgc_conflict_kg_a(c)
+            let kb = mkgc_conflict_kg_b(c)
+            if _rs_kg_wanted(ka, wanted) == 1 {
+                if _rs_kg_wanted(kb, wanted) == 1 {
+                    if relevant_conflicts == 0 {
+                        proposal = proposal + "\ncross-KG conflicts on matched atoms (spread >= "
+                            + int_to_str(RESEARCH_DEFAULT_SPREAD) + " milli):\n"
+                    }
+                    proposal = proposal + "  '" + cl + "': " + ka
+                        + " believes " + int_to_str(mkgc_conflict_mean_a(c))
+                        + " vs " + kb + " believes "
+                        + int_to_str(mkgc_conflict_mean_b(c)) + "\n"
+                    relevant_conflicts = relevant_conflicts + 1
+                }
+            }
+        }
+        ci = ci + 1
+    }
+    // ---- summary ----------------------------------------------------
+    if total_matches == 0 {
+        proposal = proposal + "  (no matches across "
+                            + int_to_str(n_kgs_scanned) + " scanned KGs)\n"
+    }
+    skill_pr_add_trace(result, "scanned " + int_to_str(n_kgs_scanned) + " KGs, "
+        + int_to_str(total_matches) + " total atom matches, "
+        + int_to_str(relevant_conflicts) + " cross-KG conflicts on matched labels")
+    skill_pr_set_proposal(result, proposal)
+    skill_pr_set_confidence(result, max_mean)
+    skill_pr_set_ok(result)
+    return total_matches
+}
