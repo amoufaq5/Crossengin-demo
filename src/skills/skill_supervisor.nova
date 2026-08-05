@@ -1,0 +1,310 @@
+// CrossEngin skills: supervisor + skill_run invocation contract (ADR-0103).
+//
+// A Supervisor wraps one Skill for its lifetime. It carries refs to the
+// KG registry, capsule registry, persona, effector gate handle, and
+// meta-observer. It owns the runtime GUARANTEES from ADR-0103's
+// invocation contract:
+//
+//   1. Refusal conditions checked BEFORE the policy runs (short-circuit).
+//   2. Persona projection ALWAYS attached (even for refused proposals).
+//   3. Effector calls are DESCRIBED, not executed.
+//   4. Every atom the policy touched flows to the meta-observer under
+//      the skill's attribution prefix.
+//   5. The persona is never modified by the runtime.
+//
+// The `skill_run` entry point takes a perception (interpretation is
+// skill-specific -- for echo_skill it's the query string) and returns
+// a ProposalResult with the shape documented in ADR-0103.
+//
+// Policy dispatch happens via skill_dispatch_run(supervisor, perception,
+// state) which switches on manifest.policy_id -- NOVA doesn't uniformly
+// expose function references, so the dispatch table lives in
+// skill_dispatch.nova as an integer switch.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/skills/skill_manifest.nova
+//   src/kg/multi_kg_manager.nova (kg count / kg_atoms for KG_EMPTY check)
+//   src/capsules/capsule_registry.nova (CAPSULE_UNINSTALLED check)
+//   src/persona/persona.nova + persona_project.nova (projection)
+//   src/parts/meta/meta_observer.nova (mo_attribute)
+//   src/util/str_safe.nova.
+
+import "./skill_manifest.nova"
+import "../kg/multi_kg_manager.nova"
+import "../kg/atom_store.nova"
+import "../capsules/capsule_registry.nova"
+import "../persona/persona.nova"
+import "../persona/persona_project.nova"
+import "../parts/meta/meta_observer.nova"
+import "../util/str_safe.nova"
+
+// ---- Supervisor lifecycle status codes ------------------------------------
+let SKILL_STARTING = 0
+let SKILL_RUNNING  = 1
+let SKILL_REFUSED  = 2
+let SKILL_RETIRED  = 3
+let SKILL_ERROR    = 4
+
+// ---- Supervisor slot layout -----------------------------------------------
+let SUP_MANIFEST         = 0
+let SUP_KG_REGISTRY      = 1   // ref (may be 0)
+let SUP_CAPSULE_REGISTRY = 2   // ref (may be 0)
+let SUP_PERSONA          = 3   // ref (may be 0)
+let SUP_EFFECTOR_GATE    = 4   // opaque handle (may be 0)
+let SUP_META_OBSERVER    = 5   // ref (may be 0)
+let SUP_LIVE_STATE       = 6   // opaque per-skill state (list)
+let SUP_TICK_COUNT       = 7
+let SUP_STARTED_AT       = 8
+let SUP_STATUS           = 9
+let SUP_SLOT_COUNT       = 10
+
+// ---- ProposalResult slot layout -------------------------------------------
+let PR_OK             = 0   // 0/1
+let PR_PROPOSAL       = 1   // string
+let PR_ATOMS          = 2   // list<atom_ref>
+let PR_PROJECTION     = 3   // persona projection list (0 if no persona)
+let PR_EFFECTOR_CALLS = 4   // list<[name, args_list]>
+let PR_REFUSAL_REASON = 5   // string; "" iff ok=1
+let PR_CONFIDENCE     = 6   // 0..1000 milli; policy sets
+let PR_TRACE          = 7   // list<string>; policy + supervisor append
+let PR_SLOT_COUNT     = 8
+
+// ---- constructors ---------------------------------------------------------
+
+fn skill_supervisor_new(manifest, kg_reg, capreg, persona, eff_gate, mo, now) {
+    let s = list_new()
+    push(s, manifest)               // MANIFEST
+    push(s, kg_reg)                 // KG_REGISTRY
+    push(s, capreg)                 // CAPSULE_REGISTRY
+    push(s, persona)                // PERSONA
+    push(s, eff_gate)               // EFFECTOR_GATE
+    push(s, mo)                     // META_OBSERVER
+    push(s, list_new())             // LIVE_STATE
+    push(s, 0)                      // TICK_COUNT
+    push(s, now)                    // STARTED_AT
+    push(s, SKILL_STARTING)         // STATUS
+    return s
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn skill_sup_manifest(s)     { return s[SUP_MANIFEST] }
+fn skill_sup_kg_registry(s)  { return s[SUP_KG_REGISTRY] }
+fn skill_sup_capreg(s)       { return s[SUP_CAPSULE_REGISTRY] }
+fn skill_sup_persona(s)      { return s[SUP_PERSONA] }
+fn skill_sup_effector_gate(s){ return s[SUP_EFFECTOR_GATE] }
+fn skill_sup_meta_observer(s){ return s[SUP_META_OBSERVER] }
+fn skill_sup_live_state(s)   { return s[SUP_LIVE_STATE] }
+fn skill_sup_tick_count(s)   { return s[SUP_TICK_COUNT] }
+fn skill_sup_started_at(s)   { return s[SUP_STARTED_AT] }
+fn skill_sup_status(s)       { return s[SUP_STATUS] }
+
+fn skill_sup_status_name(status) {
+    if status == SKILL_STARTING { return "starting" }
+    if status == SKILL_RUNNING  { return "running" }
+    if status == SKILL_REFUSED  { return "refused" }
+    if status == SKILL_RETIRED  { return "retired" }
+    if status == SKILL_ERROR    { return "error" }
+    return "unknown"
+}
+
+// Retire the supervisor. Clears live state but leaves atoms alone
+// (the supervisor NEVER owns atoms; capsules and KGs do).
+fn skill_sup_retire(supervisor) {
+    list_set(supervisor, SUP_STATUS, SKILL_RETIRED)
+    list_set(supervisor, SUP_LIVE_STATE, list_new())
+    return 1
+}
+
+// ---- ProposalResult constructor -------------------------------------------
+
+fn skill_pr_new() {
+    let r = list_new()
+    push(r, 0)                       // OK
+    push(r, "")                      // PROPOSAL
+    push(r, list_new())              // ATOMS
+    push(r, 0)                       // PROJECTION (0 = none yet)
+    push(r, list_new())              // EFFECTOR_CALLS
+    push(r, "")                      // REFUSAL_REASON
+    push(r, 0)                       // CONFIDENCE
+    push(r, list_new())              // TRACE
+    return r
+}
+
+fn skill_pr_ok(r)             { return r[PR_OK] }
+fn skill_pr_proposal(r)       { return r[PR_PROPOSAL] }
+fn skill_pr_atoms(r)          { return r[PR_ATOMS] }
+fn skill_pr_projection(r)     { return r[PR_PROJECTION] }
+fn skill_pr_effector_calls(r) { return r[PR_EFFECTOR_CALLS] }
+fn skill_pr_refusal_reason(r) { return r[PR_REFUSAL_REASON] }
+fn skill_pr_confidence(r)     { return r[PR_CONFIDENCE] }
+fn skill_pr_trace(r)          { return r[PR_TRACE] }
+
+fn skill_pr_set_ok(r)               { list_set(r, PR_OK, 1) }
+fn skill_pr_set_proposal(r, s)      { list_set(r, PR_PROPOSAL, s) }
+fn skill_pr_set_confidence(r, c)    { list_set(r, PR_CONFIDENCE, c) }
+fn skill_pr_add_atom(r, a)          { push(r[PR_ATOMS], a) }
+fn skill_pr_add_effector_call(r, name, args) {
+    let ec = list_new() push(ec, name) push(ec, args)
+    push(r[PR_EFFECTOR_CALLS], ec)
+}
+fn skill_pr_add_trace(r, msg)       { push(r[PR_TRACE], msg) }
+fn skill_pr_refuse(r, reason) {
+    list_set(r, PR_OK, 0)
+    list_set(r, PR_REFUSAL_REASON, reason)
+}
+
+// ---- refusal-condition checks (pre-policy short-circuit) ------------------
+
+// Look up a KG by label in the registry. Returns 0 if absent.
+fn _sup_kg_by_name(kgreg, name) {
+    if kgreg == 0 { return 0 }
+    let n = kg_count(kgreg)
+    let i = 0
+    while i < n {
+        let kg = kg_get(kgreg, i)
+        if kg != 0 {
+            if str_eq_bytes(kg_label(kg), name) == 1 { return kg }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Evaluate one condition. Returns 0 if the condition PASSES (skill may
+// run) or a non-empty refusal-reason string if it FAILS.
+fn _sup_eval_condition(supervisor, cond) {
+    let kind = cond[0]
+    let arg  = cond[1]
+    if kind == COND_PERSONA_MISSING {
+        if skill_sup_persona(supervisor) == 0 {
+            return "persona-missing: skill declared a persona is required"
+        }
+        return 0
+    }
+    if kind == COND_KG_EMPTY {
+        let kg = _sup_kg_by_name(skill_sup_kg_registry(supervisor), arg)
+        if kg == 0 {
+            return "kg-empty: required KG '" + arg + "' is not registered"
+        }
+        if len(kg_atoms(kg)) == 0 {
+            return "kg-empty: required KG '" + arg + "' has no atoms"
+        }
+        return 0
+    }
+    if kind == COND_CAPSULE_UNINSTALLED {
+        let cr = skill_sup_capreg(supervisor)
+        if cr == 0 {
+            return "capsule-uninstalled: capsule registry unavailable"
+        }
+        if capreg_is_installed(cr, arg) == 0 {
+            return "capsule-uninstalled: '" + arg + "' is not installed"
+        }
+        return 0
+    }
+    // MIN_CONFIDENCE is a POST-policy check; skipped here.
+    if kind == COND_MIN_CONFIDENCE { return 0 }
+    // Unknown condition kind: fail-open (log via trace happens above).
+    return 0
+}
+
+// Check every pre-policy refusal condition on the manifest. Returns 0
+// on all-pass, or the first failure's reason string.
+fn _sup_check_refusals_pre(supervisor) {
+    let manifest = skill_sup_manifest(supervisor)
+    let conds = skill_manifest_refusal_conds(manifest)
+    let i = 0
+    while i < len(conds) {
+        let r = _sup_eval_condition(supervisor, conds[i])
+        if r != 0 { return r }
+        i = i + 1
+    }
+    return 0
+}
+
+// Post-policy check: only MIN_CONFIDENCE. Returns 0 or reason string.
+fn _sup_check_refusals_post(supervisor, result) {
+    let manifest = skill_sup_manifest(supervisor)
+    let conds = skill_manifest_refusal_conds(manifest)
+    let i = 0
+    while i < len(conds) {
+        let c = conds[i]
+        if c[0] == COND_MIN_CONFIDENCE {
+            let threshold = c[1]
+            if skill_pr_confidence(result) < threshold {
+                return "min-confidence: proposal confidence "
+                    + int_to_str(skill_pr_confidence(result))
+                    + " below threshold " + int_to_str(threshold)
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- meta-observer attribution --------------------------------------------
+
+// For each atom the policy touched, attribute it under the skill's
+// attribution prefix. Idempotent by mo_attribute contract.
+fn _sup_attribute_atoms(supervisor, result) {
+    let mo = skill_sup_meta_observer(supervisor)
+    if mo == 0 { return 0 }
+    let manifest = skill_sup_manifest(supervisor)
+    let tag = skill_manifest_attribution(manifest)
+    let atoms = skill_pr_atoms(result)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 { mo_attribute(mo, tag, atom_id(a)) }
+        i = i + 1
+    }
+    return len(atoms)
+}
+
+// ---- persona projection (advise-only) -------------------------------------
+
+// If the supervisor has a persona, run persona_project on the proposal
+// text and attach the projection to the ProposalResult. If no persona,
+// projection stays 0. Returns 1 if a projection was attached, 0 else.
+fn _sup_attach_projection(supervisor, result) {
+    let p = skill_sup_persona(supervisor)
+    if p == 0 { return 0 }
+    let proj = persona_project(p, skill_pr_proposal(result))
+    list_set(result, PR_PROJECTION, proj)
+    return 1
+}
+
+// ---- public wrappers around the pre/post/attribution/projection helpers --
+//
+// The actual `skill_run` orchestration lives in src/skills/skill_dispatch.nova
+// -- it imports this module for the helpers below plus the reference-skill
+// policies for dispatch. Splitting the concern keeps this module a pure
+// shape+helpers file that reference skills can import without pulling in
+// their siblings' policy code.
+
+fn skill_sup_check_pre_refusals(supervisor) {
+    return _sup_check_refusals_pre(supervisor)
+}
+
+fn skill_sup_check_post_refusals(supervisor, result) {
+    return _sup_check_refusals_post(supervisor, result)
+}
+
+fn skill_sup_attribute_atoms(supervisor, result) {
+    return _sup_attribute_atoms(supervisor, result)
+}
+
+fn skill_sup_attach_projection(supervisor, result) {
+    return _sup_attach_projection(supervisor, result)
+}
+
+fn skill_sup_set_status(supervisor, status) {
+    list_set(supervisor, SUP_STATUS, status)
+    return 1
+}
+
+fn skill_sup_bump_tick(supervisor) {
+    list_set(supervisor, SUP_TICK_COUNT, skill_sup_tick_count(supervisor) + 1)
+    return 1
+}
