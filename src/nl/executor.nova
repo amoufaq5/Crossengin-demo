@@ -1,0 +1,269 @@
+// CrossEngin NL Surface: query executor (ADR-0104 R48p3).
+//
+// Takes a StructuredQuery (from grammar_parser or the LLM fallback),
+// dispatches it to the right skill supervisor via skill_run, or
+// delegates admin queries (retract, capsule/skill install/list) to
+// the caller by naming them in the ExecutionResult. Preserves all
+// 5 ADR-0103 guarantees end-to-end:
+//
+//   1. Refusal conditions checked BEFORE the policy runs
+//      -- handled entirely inside skill_run; the executor just
+//      forwards the perception through unchanged.
+//   2. Persona projection ALWAYS attached
+//      -- same; skill_run attaches, executor never strips.
+//   3. Effector calls are DESCRIBED, not executed
+//      -- ProposalResult carries the described list; templater
+//      surfaces it; NOBODY in this pipeline dispatches an effector.
+//   4. Every atom the policy touched -> meta-observer under the
+//      skill's attribution prefix
+//      -- skill_run does this. Executor does NOT double-tag; the
+//      grammar-vs-llm parser attribution is on the query itself,
+//      not the touched atoms.
+//   5. Persona is READ-ONLY
+//      -- executor passes persona ref only; templater only reads
+//      style_capsule_ref.
+//
+// Executor is STATELESS: caller supplies every reference it needs.
+// This makes it easy to test (pass a mock supervisor) and easy to
+// reuse from both the chat REPL and the JSON-RPC surface (R48p7).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/nl/query_shape.nova
+//   src/skills/skill_registry.nova
+//   src/skills/skill_dispatch.nova (for skill_run)
+//   src/skills/skills/research_skill.nova (perception construction)
+//   src/persona/persona_registry.nova (persona lookup by user_id)
+//   src/util/str_safe.nova.
+
+import "./query_shape.nova"
+import "../skills/skill_registry.nova"
+import "../skills/skill_dispatch.nova"
+import "../skills/skills/research_skill.nova"
+import "../persona/persona_registry.nova"
+import "../util/str_safe.nova"
+
+// ---- ExecutionResult slot layout ------------------------------------------
+let ER_OK                = 0    // 0/1 -- 0 iff a REFUSAL happened before
+                                // reaching the policy (unknown skill, no
+                                // registries, etc.). Note: a REFUSED
+                                // ProposalResult still yields ER_OK=1 --
+                                // the query DID execute; the SKILL just
+                                // returned a refusal. Distinguishes
+                                // "system couldn't dispatch" from "skill
+                                // ran and refused."
+let ER_QUERY             = 1    // the StructuredQuery that ran (echoed
+                                // back so callers can trace)
+let ER_PROPOSAL_RESULT   = 2    // ProposalResult from skill_run; 0 for
+                                // admin actions
+let ER_PARSER_USED       = 3    // "grammar" | "llm" | "none" (copied
+                                // from the query for convenience)
+let ER_TEMPLATED_ANSWER  = 4    // string -- LEFT EMPTY by executor;
+                                // filled by src/nl/templater.nova
+let ER_REFUSAL_REASON    = 5    // "" if ER_OK==1
+let ER_ADMIN_ACTION      = 6    // "" for skill-based; one of
+                                // "retract" | "capsule_install" |
+                                // "skill_install" | "capsule_list" |
+                                // "skill_list" for admin queries the
+                                // caller (chat / rpc) executes.
+let ER_ADMIN_ARGS        = 7    // list<string> args for admin_action
+let ER_SLOT_COUNT        = 8
+
+// ---- constructor + accessors ---------------------------------------------
+
+fn nl_er_new(query, parser_used) {
+    let r = list_new()
+    push(r, 0)                            // OK
+    push(r, query)                        // QUERY
+    push(r, 0)                            // PROPOSAL_RESULT
+    push(r, parser_used)                  // PARSER_USED
+    push(r, "")                           // TEMPLATED_ANSWER
+    push(r, "")                           // REFUSAL_REASON
+    push(r, "")                           // ADMIN_ACTION
+    push(r, list_new())                   // ADMIN_ARGS
+    return r
+}
+
+fn nl_er_ok(r)                { return r[ER_OK] }
+fn nl_er_query(r)             { return r[ER_QUERY] }
+fn nl_er_proposal_result(r)   { return r[ER_PROPOSAL_RESULT] }
+fn nl_er_parser_used(r)       { return r[ER_PARSER_USED] }
+fn nl_er_templated_answer(r)  { return r[ER_TEMPLATED_ANSWER] }
+fn nl_er_refusal_reason(r)    { return r[ER_REFUSAL_REASON] }
+fn nl_er_admin_action(r)      { return r[ER_ADMIN_ACTION] }
+fn nl_er_admin_args(r)        { return r[ER_ADMIN_ARGS] }
+
+// Templater fills this in; executor leaves it empty.
+fn nl_er_set_templated_answer(r, s) { list_set(r, ER_TEMPLATED_ANSWER, s) }
+
+// ---- mutators for the executor -------------------------------------------
+
+fn _er_succeed_with_proposal(r, pr) {
+    list_set(r, ER_OK, 1)
+    list_set(r, ER_PROPOSAL_RESULT, pr)
+}
+
+fn _er_succeed_with_admin(r, action, args) {
+    list_set(r, ER_OK, 1)
+    list_set(r, ER_ADMIN_ACTION, action)
+    list_set(r, ER_ADMIN_ARGS, args)
+}
+
+fn _er_refuse(r, reason) {
+    list_set(r, ER_OK, 0)
+    list_set(r, ER_REFUSAL_REASON, reason)
+}
+
+// ---- helpers -------------------------------------------------------------
+
+// Look up (or auto-install) the 'research' skill in `skill_reg`. Returns
+// the supervisor handle, or 0 if we can't build one (missing prereqs).
+//
+// Auto-install policy: if the skill is registered but not installed,
+// install it now with the supplied refs. If it's not registered, we
+// register the manifest first. Persona is looked up via user_id if
+// a persona_registry is present; else 0.
+fn _er_ensure_research_supervisor(skill_reg, kg_reg, capreg,
+                                  persona_reg, mo, user_id, now) {
+    if skill_reg == 0 { return 0 }
+    // Register research manifest if absent.
+    if skill_registry_manifest(skill_reg, "research") == 0 {
+        skill_registry_register(skill_reg, research_skill_manifest())
+    }
+    // If already installed, reuse its supervisor.
+    if skill_registry_is_installed(skill_reg, "research") == 1 {
+        return skill_registry_supervisor(skill_reg, "research")
+    }
+    // Install now.
+    let persona = 0
+    if persona_reg != 0 {
+        if len(user_id) > 0 { persona = persona_registry_lookup(persona_reg, user_id) }
+    }
+    let manifest = skill_registry_manifest(skill_reg, "research")
+    let sup = skill_supervisor_new(manifest, kg_reg, capreg, persona, 0, mo, now)
+    let code = skill_registry_install(skill_reg, "research", capreg, sup, now)
+    if code != SKILL_INSTALL_OK { return 0 }
+    return sup
+}
+
+// Build a perception list [topic, kg_names=[]] the research policy expects.
+fn _er_research_perception(topic) {
+    let p = list_new()
+    push(p, topic) push(p, list_new())
+    return p
+}
+
+// Compose the topic string a skill will search for, from the kind's args.
+fn _er_topic_for(query) {
+    let k = sq_kind(query)
+    if k == NLQ_RESEARCH        { return sq_research_topic(query) }
+    if k == NLQ_RELATE          { return sq_relate_a(query) + " " + sq_relate_b(query) }
+    if k == NLQ_CONTRADICT_SCAN { return sq_contradict_a(query) + " " + sq_contradict_b(query) }
+    if k == NLQ_IS_A            { return sq_is_a_x(query) + " " + sq_is_a_y(query) }
+    return ""
+}
+
+// One-arg admin-args list convenience.
+fn _er_args1(x) {
+    let l = list_new() push(l, x) return l
+}
+
+// ---- the entry point -----------------------------------------------------
+
+// Execute `query` against the given registries. Returns ExecutionResult.
+//
+// `kg_reg`, `capreg`, `persona_reg`, `skill_reg`, `mo` may be 0 --
+// executor refuses cleanly with a descriptive reason. `user_id` and
+// `now` are always required (empty string / 0 are permitted defaults).
+fn nl_execute(query, kg_reg, capreg, persona_reg, skill_reg, mo,
+              user_id, now) {
+    // Null-query fast path -- avoid touching accessors on 0.
+    if query == 0 {
+        let r0 = nl_er_new(0, "none")
+        _er_refuse(r0, "null query")
+        return r0
+    }
+    let r = nl_er_new(query, sq_parser_used(query))
+    let vcode = sq_validate(query)
+    if vcode != SQ_OK {
+        _er_refuse(r, "invalid query: " + sq_err_name(vcode))
+        return r
+    }
+    let kind = sq_kind(query)
+    // ---- NONE / UNPARSED: pass through, don't dispatch ---------------
+    if kind == NLQ_NONE {
+        // Empty input; nothing to do, but not an error condition.
+        list_set(r, ER_OK, 1)
+        return r
+    }
+    if kind == NLQ_UNPARSED {
+        _er_refuse(r,
+            "grammar could not parse this input; LLM fallback not linked yet (R48p6)")
+        return r
+    }
+    // ---- Skill-invoking kinds ----------------------------------------
+    let skill_kind = 0
+    if kind == NLQ_RESEARCH        { skill_kind = 1 }
+    if kind == NLQ_RELATE          { skill_kind = 1 }
+    if kind == NLQ_CONTRADICT_SCAN { skill_kind = 1 }
+    if kind == NLQ_IS_A            { skill_kind = 1 }
+    if skill_kind == 1 {
+        if skill_reg == 0 {
+            _er_refuse(r, "no skill registry supplied")
+            return r
+        }
+        if kg_reg == 0 {
+            _er_refuse(r, "no KG registry supplied")
+            return r
+        }
+        let sup = _er_ensure_research_supervisor(skill_reg, kg_reg, capreg,
+                                                 persona_reg, mo, user_id, now)
+        if sup == 0 {
+            _er_refuse(r, "could not build a supervisor for the 'research' skill")
+            return r
+        }
+        let perception = _er_research_perception(_er_topic_for(query))
+        // skill_run enforces all 5 ADR-0103 guarantees INSIDE.
+        let pr = skill_run(sup, perception)
+        _er_succeed_with_proposal(r, pr)
+        return r
+    }
+    // ---- Admin-delegated kinds ---------------------------------------
+    // These are NAMED for the chat/rpc layer to execute; the executor
+    // does not touch formal_chat / capsule_registry / skill_registry
+    // itself (keeps the executor free of admin-side transitive deps).
+    if kind == NLQ_RETRACT {
+        _er_succeed_with_admin(r, "retract", _er_args1(sq_retract_label(query)))
+        return r
+    }
+    if kind == NLQ_CAPSULE_INSTALL {
+        _er_succeed_with_admin(r, "capsule_install",
+                               _er_args1(sq_capsule_install_name(query)))
+        return r
+    }
+    if kind == NLQ_SKILL_INSTALL {
+        _er_succeed_with_admin(r, "skill_install",
+                               _er_args1(sq_skill_install_name(query)))
+        return r
+    }
+    if kind == NLQ_CAPSULE_LIST {
+        _er_succeed_with_admin(r, "capsule_list", list_new())
+        return r
+    }
+    if kind == NLQ_SKILL_LIST {
+        _er_succeed_with_admin(r, "skill_list", list_new())
+        return r
+    }
+    if kind == NLQ_SKILL_RUN {
+        // Named skill_run happens via the admin path -- lets the caller
+        // pick the right supervisor by NAME (rather than the executor
+        // hard-coding a mapping like it does for research).
+        let args = list_new()
+        push(args, sq_skill_run_skill(query))
+        push(args, sq_skill_run_arg(query))
+        _er_succeed_with_admin(r, "skill_run", args)
+        return r
+    }
+    _er_refuse(r, "unknown query kind: " + sq_kind_name(kind))
+    return r
+}
