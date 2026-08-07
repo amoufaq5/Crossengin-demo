@@ -1,0 +1,309 @@
+// CrossEngin JSON-RPC daemon (R49, ADR-0104 §Component 5).
+//
+// A tiny standalone TCP daemon that binds a socket, accepts one
+// connection at a time, reads ONE JSON-RPC request per connection,
+// dispatches through src/nl/rpc_server.rpc_server_handle_line, writes
+// the response line back, and closes. The dispatcher's 12 verbs are
+// documented in src/nl/rpc_verbs.nova; the wire is documented in
+// src/nl/rpc_server.nova.
+//
+// Configuration (env vars, all optional):
+//   CE_RPC_PORT   TCP port to bind. Required to start; without it the
+//                 daemon prints a hint and exits.
+//   CE_RPC_BIND   Bind IP. Defaults to 127.0.0.1 (loopback). Change
+//                 ONLY if you understand the security implication --
+//                 the wire executes named skills.
+//   CE_RPC_MAX_REQUEST  Bytes cap per request (default 65536). Requests
+//                 exceeding this are truncated to force a parse error.
+//
+// State on boot:
+//   * kg_registry:      empty (spawn one "world" KG for skills that
+//                       need a target). Operators can /skill install
+//                       research to grow the KG via wire-driven skill
+//                       runs, or preload from a snapshot with a
+//                       separate script that populates the registry
+//                       before invoking rpc_dispatch.
+//   * capsule_registry: empty (packs can be registered here by other
+//                       tooling that shares the process; for a
+//                       standalone daemon the registry stays empty).
+//   * skill_registry:   pre-registers the two reference skills
+//                       (echo, research). Not installed by default;
+//                       an installer script or the wire can install.
+//   * persona_registry: empty. persona.show returns "no persona" for
+//                       any user_id until one is created via the
+//                       chat REPL's /persona commands.
+//   * meta_observer:    a fresh observer.
+//
+// The daemon is DELIBERATELY minimal -- it exists to prove the RPC
+// path works end-to-end. R50 (ship as app) will layer a full boot
+// scaffold on top: snapshot loading, session slots, dp accounting,
+// same audit hooks the chat has.
+//
+// Usage:
+//   CE_RPC_PORT=9876 ./bin/crossengin-rpc-daemon
+//   echo '{"verb":"kg.list"}' | nc 127.0.0.1 9876
+//     -> {"ok":true,"result":["world"],"error":""}
+//
+// NOVA dependencies: builtins (socket / bind_socket / listen_socket /
+//   accept_conn / recv_data / send_data / close_fd / make_sockaddr_in /
+//   alloc / load8 / getenv).
+// CrossEngin dependencies:
+//   src/nl/rpc_server.nova
+//   src/nl/rpc_verbs.nova
+//   src/kg/multi_kg_manager.nova
+//   src/capsules/capsule_registry.nova
+//   src/persona/persona_registry.nova
+//   src/skills/skill_registry.nova
+//   src/skills/skills/echo_skill.nova
+//   src/skills/skills/research_skill.nova
+//   src/parts/meta/meta_observer.nova
+//   src/util/str_safe.nova.
+
+import "../src/nl/rpc_server.nova"
+import "../src/nl/rpc_verbs.nova"
+import "../src/kg/multi_kg_manager.nova"
+import "../src/capsules/capsule_registry.nova"
+import "../src/persona/persona_registry.nova"
+import "../src/skills/skill_registry.nova"
+import "../src/skills/skills/echo_skill.nova"
+import "../src/skills/skills/research_skill.nova"
+import "../src/parts/meta/meta_observer.nova"
+import "../src/util/str_safe.nova"
+
+// ---- socket constants (mirror stream_http.nova) --------------------------
+let RPCD_AF_INET     = 2
+let RPCD_SOCK_STREAM = 1
+let RPCD_F_SETFL     = 4
+let RPCD_O_NONBLOCK  = 2048
+let RPCD_RECV_CHUNK  = 4096
+let RPCD_DEFAULT_MAX_REQUEST = 65536
+let RPCD_DEFAULT_BIND = "127.0.0.1"
+let RPCD_LISTEN_BACKLOG = 32
+
+// ---- env parsing ---------------------------------------------------------
+
+fn _rpcd_is_digits(s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _rpcd_port_from_env() {
+    let env = getenv("CE_RPC_PORT")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if _rpcd_is_digits(env) == 0 { return 0 }
+    let v = str_to_int(env)
+    if v <= 0 { return 0 }
+    if v > 65535 { return 0 }
+    return v
+}
+
+fn _rpcd_bind_from_env() {
+    let env = getenv("CE_RPC_BIND")
+    if env == 0 { return RPCD_DEFAULT_BIND }
+    if len(env) == 0 { return RPCD_DEFAULT_BIND }
+    return env
+}
+
+fn _rpcd_max_request_from_env() {
+    let env = getenv("CE_RPC_MAX_REQUEST")
+    if env == 0 { return RPCD_DEFAULT_MAX_REQUEST }
+    if _rpcd_is_digits(env) == 0 { return RPCD_DEFAULT_MAX_REQUEST }
+    let v = str_to_int(env)
+    if v <= 0 { return RPCD_DEFAULT_MAX_REQUEST }
+    return v
+}
+
+// ---- IP dotted-quad -> int (mirrors stream_http._stream_http_ip_to_int) --
+
+fn _rpcd_ip_to_int(ip) {
+    let toks = list_new()
+    let i = 0
+    let start = 0
+    while i < len(ip) {
+        if char_at(ip, i) == 46 {
+            push(toks, substr(ip, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(toks, substr(ip, start, len(ip) - start))
+    if len(toks) != 4 { return 0 - 1 }
+    let j = 0
+    while j < 4 {
+        if _rpcd_is_digits(toks[j]) == 0 { return 0 - 1 }
+        let v = str_to_int(toks[j])
+        if v < 0    { return 0 - 1 }
+        if v > 255  { return 0 - 1 }
+        j = j + 1
+    }
+    let a = str_to_int(toks[0])
+    let b = str_to_int(toks[1])
+    let c = str_to_int(toks[2])
+    let d = str_to_int(toks[3])
+    // Same NOVA-codegen-bug-#11 workaround stream_http.nova uses:
+    // avoid the smart-op dispatch mis-routing operands >= 0x100000
+    // into string-concat by going through the int_* escape hatch.
+    let b_p = int_mul(b, 256)
+    let c_p = int_mul(c, 65536)
+    let d_p = int_mul(d, 16777216)
+    return int_add(int_add(int_add(a, b_p), c_p), d_p)
+}
+
+// ---- fcntl shim ----------------------------------------------------------
+// Kept blocking on the listen fd: this daemon accepts one connection at
+// a time in a serial loop, so blocking accept is the natural fit (no
+// idle tick to poll from). Non-blocking mode would need an event loop
+// which R49 does not build.
+
+// ---- byte -> string ------------------------------------------------------
+
+fn _rpcd_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- per-connection read: one line-terminated OR full-body request ------
+//
+// Reads until the first '\n' OR the client closes the connection OR we
+// hit the per-request byte cap. Returns the collected string (with the
+// trailing newline stripped, if any). Empty string means the client
+// closed without sending anything.
+fn _rpcd_read_request(conn_fd, max_bytes) {
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        if len(acc) >= max_bytes { done = 1 }
+        else {
+            let buf = alloc(RPCD_RECV_CHUNK)
+            let n = recv_data(conn_fd, buf, RPCD_RECV_CHUNK)
+            if n <= 0 { done = 1 }
+            else {
+                let chunk = _rpcd_bytes_to_str(buf, n)
+                acc = acc + chunk
+                // Look for first '\n' -- one JSON object per line.
+                let nl = 0
+                let found = 0 - 1
+                while nl < len(acc) {
+                    if char_at(acc, nl) == 10 {
+                        if found < 0 { found = nl }
+                    }
+                    nl = nl + 1
+                }
+                if found >= 0 {
+                    acc = substr(acc, 0, found)
+                    done = 1
+                }
+            }
+        }
+    }
+    return acc
+}
+
+fn _rpcd_send_all(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let n = send_data(fd, chunk, total - sent)
+        if n <= 0 { return 0 }
+        sent = sent + n
+    }
+    return 1
+}
+
+// ---- boot: build the shared RpcContext ----------------------------------
+
+fn _rpcd_build_ctx(now) {
+    let kgreg = kg_registry_new()
+    // A single "world" KG so skills that need a KG target find one.
+    kg_spawn(kgreg, "world")
+    let capreg = capreg_new()
+    let mo = mo_new()
+    let sr = skill_registry_new()
+    skill_registry_register(sr, echo_skill_manifest())
+    skill_registry_register(sr, research_skill_manifest())
+    let preg = persona_registry_new()
+    // ingest_agent + review_queue left 0; ingest.* verbs will refuse
+    // with "no ingest agent / no review queue" -- deliberate for the
+    // standalone daemon (R49 does not wire the ingestion pipeline).
+    return rpc_ctx_new(kgreg, capreg, preg, sr, mo, 0, 0, now)
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    let port = _rpcd_port_from_env()
+    if port == 0 {
+        println("CrossEngin JSON-RPC daemon: CE_RPC_PORT not set.")
+        println("Usage: CE_RPC_PORT=9876 ./bin/crossengin-rpc-daemon")
+        println(rpc_server_banner())
+        return 1
+    }
+    let bind = _rpcd_bind_from_env()
+    let max_request = _rpcd_max_request_from_env()
+    let ip = _rpcd_ip_to_int(bind)
+    if ip < 0 {
+        println("bad bind IP: " + bind)
+        return 1
+    }
+    let listen_fd = socket(RPCD_AF_INET, RPCD_SOCK_STREAM, 0)
+    if listen_fd < 0 {
+        println("socket() failed")
+        return 1
+    }
+    let addr = make_sockaddr_in(port, ip)
+    if bind_socket(listen_fd, addr, 16) < 0 {
+        println("bind failed on " + bind + ":" + int_to_str(port))
+        close_fd(listen_fd)
+        return 1
+    }
+    if listen_socket(listen_fd, RPCD_LISTEN_BACKLOG) < 0 {
+        println("listen failed on " + bind + ":" + int_to_str(port))
+        close_fd(listen_fd)
+        return 1
+    }
+    let ctx = _rpcd_build_ctx(0)
+    println("=== " + rpc_server_banner() + " ===")
+    println("listening on " + bind + ":" + int_to_str(port)
+        + "  (max_request=" + int_to_str(max_request) + " bytes)")
+    println("hit with: echo '{\"verb\":\"kg.list\"}' | nc "
+        + bind + " " + int_to_str(port))
+    // Accept loop. One request per connection; connection is closed
+    // after the response is sent. Serial (no threads): the daemon
+    // trades throughput for simplicity in this first cut.
+    let served = 0
+    let go = 1
+    while go == 1 {
+        let conn_fd = accept_conn(listen_fd, 0, 0)
+        if conn_fd < 0 {
+            // A negative accept means the listen socket was closed or
+            // a signal interrupted the syscall. Either way, wind up.
+            go = 0
+        } else {
+            served = served + 1
+            let req = _rpcd_read_request(conn_fd, max_request)
+            let resp = rpc_server_handle_line(req, ctx)
+            _rpcd_send_all(conn_fd, resp + "\n")
+            close_fd(conn_fd)
+        }
+    }
+    close_fd(listen_fd)
+    println("bye. (served " + int_to_str(served) + " request(s))")
+    return 0
+}
+
+main()
