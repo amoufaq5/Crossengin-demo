@@ -1,0 +1,635 @@
+// CrossEngin NL Surface: JSON-RPC verbs (R48p7, ADR-0104 §Component 5).
+//
+// The 12 verbs a web app / mobile client / IDE plugin / TCP CLI can
+// speak to drive CrossEngin from OUTSIDE the interactive chat REPL.
+// Every verb funnels through the SAME nl_execute + templater + admin
+// handlers the chat uses, so a client gets bit-identical answers to
+// what a user typing into the REPL would see. The 5 ADR-0103 hard
+// guarantees pass through end-to-end.
+//
+// Wire protocol: JSON. Every verb returns:
+//
+//   {"ok": true|false, "result": <verb-specific>, "error": "..."}
+//
+// Args come in as a list of [key_string, value_string] pairs (same
+// shape a caller reading params out of a JSON object would build). The
+// dispatcher looks each up by key. Unknown keys are ignored; missing
+// required keys yield {ok:false, error:"missing arg: KEY"}. Numbers
+// are still strings we parse on demand.
+//
+// The 12 verbs (contract from ADR-0104 §Component 5):
+//
+//   nl.ask            {text, user_id}       -> ExecutionResult (templated)
+//   nl.parse_only     {text}                -> StructuredQuery
+//   kg.list           {}                    -> list of KG names
+//   capsule.list      {}                    -> list of capsules + install state
+//   capsule.install   {name}                -> install status
+//   skill.list        {}                    -> list of skills + install state
+//   skill.run         {name, arg}           -> ProposalResult (templated)
+//   persona.show      {user_id}             -> persona record
+//   persona.project   {user_id, proposal}   -> Projection
+//   ingest.review     {}                    -> queue entries
+//   ingest.approve    {id}                  -> status
+//   ingest.deny       {id, reason}          -> status
+//
+// This module is CONTEXT-DRIVEN: callers hand in an RpcContext carrying
+// every registry the verbs need. That keeps the module free of any
+// per-session state (session snapshots + multi-tenant chat can reuse
+// one rpc_verbs.nova across many contexts) and makes each verb
+// testable in isolation.
+//
+// A daemon (`src/nl/rpc_server.nova` + `crossengin_daemon.nova`,
+// deferred to R49) binds a socket and calls rpc_dispatch() per line.
+// The daemon does not need to know about the verbs' shapes; it just
+// forwards the JSON.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/nl/query_shape.nova
+//   src/nl/grammar_parser.nova
+//   src/nl/executor.nova
+//   src/nl/templater.nova
+//   src/nl/llm_parser.nova (source-tag helper only; NOT invoked here)
+//   src/kg/multi_kg_manager.nova (kg_count / kg_label)
+//   src/capsules/capsule_registry.nova + src/capsules/capsule.nova
+//   src/persona/persona_registry.nova + src/persona/persona_project.nova
+//   src/skills/skill_registry.nova + src/skills/skill_supervisor.nova
+//   src/skills/skill_dispatch.nova (skill_run for skill.run verb)
+//   src/skills/skills/research_skill.nova (perception adapter)
+//   src/agent/ingestion_agent.nova (ing_capreg)
+//   src/ingest/review_queue.nova (rq_* for ingest.* verbs)
+//   src/parts/meta/meta_observer.nova (mo passthrough)
+//   src/util/str_safe.nova.
+
+import "./query_shape.nova"
+import "./grammar_parser.nova"
+import "./executor.nova"
+import "./templater.nova"
+import "./llm_parser.nova"
+import "../kg/multi_kg_manager.nova"
+import "../capsules/capsule.nova"
+import "../capsules/capsule_registry.nova"
+import "../persona/persona.nova"
+import "../persona/persona_registry.nova"
+import "../persona/persona_project.nova"
+import "../skills/skill_registry.nova"
+import "../skills/skill_dispatch.nova"
+import "../skills/skill_supervisor.nova"
+import "../skills/skill_manifest.nova"
+import "../skills/skills/research_skill.nova"
+import "../agent/ingestion_agent.nova"
+import "../ingest/review_queue.nova"
+import "../parts/meta/meta_observer.nova"
+import "../util/str_safe.nova"
+
+// ---- RpcContext slot layout ---------------------------------------------
+let RCTX_KGREG        = 0    // multi_kg_manager registry (may be 0)
+let RCTX_CAPREG       = 1    // capsule_registry (may be 0)
+let RCTX_PERSONA_REG  = 2    // persona_registry (may be 0)
+let RCTX_SKILL_REG    = 3    // skill_registry (may be 0)
+let RCTX_MO           = 4    // meta_observer (may be 0)
+let RCTX_INGEST_AGENT = 5    // ingestion_agent (may be 0)
+let RCTX_REVIEW_QUEUE = 6    // ingest review_queue (may be 0)
+let RCTX_NOW          = 7    // logical clock reading at request time
+let RCTX_SLOTS        = 8
+
+fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
+               ingest_agent, review_queue, now) {
+    let c = list_new()
+    push(c, kgreg)
+    push(c, capreg)
+    push(c, persona_reg)
+    push(c, skill_reg)
+    push(c, mo)
+    push(c, ingest_agent)
+    push(c, review_queue)
+    push(c, now)
+    return c
+}
+
+// Convenience accessors (used by dispatch below; also stable for
+// clients that want to introspect a context they've built).
+fn rpc_ctx_kgreg(c)         { return c[RCTX_KGREG] }
+fn rpc_ctx_capreg(c)        { return c[RCTX_CAPREG] }
+fn rpc_ctx_persona_reg(c)   { return c[RCTX_PERSONA_REG] }
+fn rpc_ctx_skill_reg(c)     { return c[RCTX_SKILL_REG] }
+fn rpc_ctx_mo(c)            { return c[RCTX_MO] }
+fn rpc_ctx_ingest_agent(c)  { return c[RCTX_INGEST_AGENT] }
+fn rpc_ctx_review_queue(c)  { return c[RCTX_REVIEW_QUEUE] }
+fn rpc_ctx_now(c)           { return c[RCTX_NOW] }
+
+// ---- JSON encoding helpers ----------------------------------------------
+
+// Escape one string for JSON. Escapes " \ \n \r \t and any control
+// byte < 32 (as \u00XX). Non-ASCII bytes pass through unchanged --
+// UTF-8 is JSON-safe by construction.
+fn _rpc_esc(s) {
+    let out = ""
+    let L = len(s)
+    let i = 0
+    while i < L {
+        let c = char_at(s, i)
+        if c == 34      { out = out + "\\\"" }
+        else if c == 92 { out = out + "\\\\" }
+        else if c == 10 { out = out + "\\n" }
+        else if c == 13 { out = out + "\\r" }
+        else if c == 9  { out = out + "\\t" }
+        else if c < 32 {
+            let hi = c / 16
+            let lo = c - hi * 16
+            let hexd = "0123456789abcdef"
+            out = out + "\\u00"
+                + substr(hexd, hi, 1) + substr(hexd, lo, 1)
+        }
+        else { out = out + substr(s, i, 1) }
+        i = i + 1
+    }
+    return out
+}
+
+// Return "\"...\"" for a string.
+fn _rpc_str(s) { return "\"" + _rpc_esc(s) + "\"" }
+
+// Return int as an unquoted JSON number.
+fn _rpc_int(n) { return int_to_str(n) }
+
+// Return "true" or "false".
+fn _rpc_bool(b) {
+    if b == 0 { return "false" }
+    return "true"
+}
+
+fn _rpc_null() { return "null" }
+
+// Serialize a list of already-encoded JSON fragments as a JSON array.
+fn _rpc_arr(fragments) {
+    let out = "["
+    let i = 0
+    while i < len(fragments) {
+        if i > 0 { out = out + "," }
+        out = out + fragments[i]
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// Convenience: array of strings.
+fn _rpc_arr_of_str(strings) {
+    let frags = list_new()
+    let i = 0
+    while i < len(strings) {
+        push(frags, _rpc_str(strings[i]))
+        i = i + 1
+    }
+    return _rpc_arr(frags)
+}
+
+// Serialize a list of [key_string, encoded_value_string] pairs as a
+// JSON object. Callers build the value strings via _rpc_str / _rpc_int
+// / _rpc_arr / recursive _rpc_obj as needed.
+fn _rpc_obj(pairs) {
+    let out = "{"
+    let i = 0
+    while i < len(pairs) {
+        if i > 0 { out = out + "," }
+        out = out + _rpc_str(pairs[i][0]) + ":" + pairs[i][1]
+        i = i + 1
+    }
+    return out + "}"
+}
+
+// ---- envelope helpers ----------------------------------------------------
+
+// {ok: true, result: <inner>, error: ""}
+fn _rpc_ok(inner) {
+    let kv = list_new()
+    let p1 = list_new() push(p1, "ok")     push(p1, "true")     push(kv, p1)
+    let p2 = list_new() push(p2, "result") push(p2, inner)      push(kv, p2)
+    let p3 = list_new() push(p3, "error")  push(p3, _rpc_str("")) push(kv, p3)
+    return _rpc_obj(kv)
+}
+
+// {ok: false, result: null, error: "..."}
+fn _rpc_err(reason) {
+    let kv = list_new()
+    let p1 = list_new() push(p1, "ok")     push(p1, "false")     push(kv, p1)
+    let p2 = list_new() push(p2, "result") push(p2, _rpc_null()) push(kv, p2)
+    let p3 = list_new() push(p3, "error")  push(p3, _rpc_str(reason)) push(kv, p3)
+    return _rpc_obj(kv)
+}
+
+// ---- arg-list helpers ----------------------------------------------------
+
+// Lookup by key. Args is list of [key, value]. Returns "" if absent.
+fn _rpc_arg(args, key) {
+    let i = 0
+    while i < len(args) {
+        if str_eq_bytes(args[i][0], key) == 1 { return args[i][1] }
+        i = i + 1
+    }
+    return ""
+}
+
+// Present-flag: distinguishes "missing" from "empty string".
+fn _rpc_has_arg(args, key) {
+    let i = 0
+    while i < len(args) {
+        if str_eq_bytes(args[i][0], key) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Build a single [k,v] pair for callers constructing args programmatically.
+fn rpc_arg_kv(key, value) {
+    let p = list_new()
+    push(p, key)
+    push(p, value)
+    return p
+}
+
+// ---- StructuredQuery encoder --------------------------------------------
+
+fn _rpc_encode_query(q) {
+    let args_frags = list_new()
+    let ai = 0
+    let n = sq_arg_count(q)
+    while ai < n {
+        push(args_frags, _rpc_str(sq_arg(q, ai)))
+        ai = ai + 1
+    }
+    let kv = list_new()
+    let a = list_new() push(a, "kind")        push(a, _rpc_str(sq_kind_name(sq_kind(q))))       push(kv, a)
+    let b = list_new() push(b, "raw_text")    push(b, _rpc_str(sq_raw_text(q)))                push(kv, b)
+    let c = list_new() push(c, "parser_used") push(c, _rpc_str(sq_parser_used(q)))             push(kv, c)
+    let d = list_new() push(d, "args")        push(d, _rpc_arr(args_frags))                    push(kv, d)
+    return _rpc_obj(kv)
+}
+
+// ---- ProposalResult encoder ---------------------------------------------
+
+fn _rpc_encode_atom_ref(a) {
+    if a == 0 { return _rpc_null() }
+    let kv = list_new()
+    let p1 = list_new() push(p1, "kg")     push(p1, _rpc_str(atom_kg(a)))            push(kv, p1)
+    let p2 = list_new() push(p2, "label")  push(p2, _rpc_str(atom_label(a)))         push(kv, p2)
+    let p3 = list_new() push(p3, "belief") push(p3, _rpc_int(atom_confidence(a)))    push(kv, p3)
+    return _rpc_obj(kv)
+}
+
+fn _rpc_encode_projection(proj) {
+    if proj == 0 { return _rpc_null() }
+    let kv = list_new()
+    let p1 = list_new() push(p1, "valence_shift") push(p1, _rpc_int(proj_valence_shift(proj))) push(kv, p1)
+    let p2 = list_new() push(p2, "arousal_shift") push(p2, _rpc_int(proj_arousal_shift(proj))) push(kv, p2)
+    let p3 = list_new() push(p3, "risk_score")    push(p3, _rpc_int(proj_risk_score(proj)))    push(kv, p3)
+    let p4 = list_new() push(p4, "similar_count") push(p4, _rpc_int(proj_similar_count(proj))) push(kv, p4)
+    let p5 = list_new() push(p5, "pref_matches")  push(p5, _rpc_int(proj_pref_match_count(proj))) push(kv, p5)
+    return _rpc_obj(kv)
+}
+
+fn _rpc_encode_effector_call(ec) {
+    let args_frags = list_new()
+    let ai = 0
+    while ai < len(ec[1]) {
+        push(args_frags, _rpc_str(ec[1][ai]))
+        ai = ai + 1
+    }
+    let kv = list_new()
+    let p1 = list_new() push(p1, "name") push(p1, _rpc_str(ec[0])) push(kv, p1)
+    let p2 = list_new() push(p2, "args") push(p2, _rpc_arr(args_frags)) push(kv, p2)
+    return _rpc_obj(kv)
+}
+
+fn _rpc_encode_proposal(pr) {
+    if pr == 0 { return _rpc_null() }
+    let atoms = skill_pr_atoms(pr)
+    let atom_frags = list_new()
+    let i = 0
+    while i < len(atoms) {
+        push(atom_frags, _rpc_encode_atom_ref(atoms[i]))
+        i = i + 1
+    }
+    let ecs = skill_pr_effector_calls(pr)
+    let ec_frags = list_new()
+    let j = 0
+    while j < len(ecs) {
+        push(ec_frags, _rpc_encode_effector_call(ecs[j]))
+        j = j + 1
+    }
+    let trace = skill_pr_trace(pr)
+    let trace_frags = list_new()
+    let k = 0
+    while k < len(trace) {
+        push(trace_frags, _rpc_str(trace[k]))
+        k = k + 1
+    }
+    let kv = list_new()
+    let a = list_new() push(a, "ok")             push(a, _rpc_bool(skill_pr_ok(pr)))                push(kv, a)
+    let b = list_new() push(b, "proposal")       push(b, _rpc_str(skill_pr_proposal(pr)))           push(kv, b)
+    let c = list_new() push(c, "confidence")     push(c, _rpc_int(skill_pr_confidence(pr)))         push(kv, c)
+    let d = list_new() push(d, "refusal_reason") push(d, _rpc_str(skill_pr_refusal_reason(pr)))     push(kv, d)
+    let e = list_new() push(e, "atoms")          push(e, _rpc_arr(atom_frags))                      push(kv, e)
+    let f = list_new() push(f, "effector_calls") push(f, _rpc_arr(ec_frags))                        push(kv, f)
+    let g = list_new() push(g, "projection")     push(g, _rpc_encode_projection(skill_pr_projection(pr))) push(kv, g)
+    let h = list_new() push(h, "trace")          push(h, _rpc_arr(trace_frags))                     push(kv, h)
+    return _rpc_obj(kv)
+}
+
+// ---- ExecutionResult encoder --------------------------------------------
+
+fn _rpc_encode_execution_result(er, persona) {
+    if er == 0 { return _rpc_null() }
+    let admin_args = nl_er_admin_args(er)
+    let arg_frags = list_new()
+    let i = 0
+    while i < len(admin_args) {
+        push(arg_frags, _rpc_str(admin_args[i]))
+        i = i + 1
+    }
+    // Render the templated answer if it hasn't been rendered yet. The
+    // templater fills the answer slot as a side-effect, so subsequent
+    // encodes return the cached string.
+    let templated = nl_er_templated_answer(er)
+    if len(templated) == 0 { templated = templater_render(er, persona) }
+    let kv = list_new()
+    let a = list_new() push(a, "ok")             push(a, _rpc_bool(nl_er_ok(er)))                     push(kv, a)
+    let b = list_new() push(b, "parser_used")    push(b, _rpc_str(nl_er_parser_used(er)))             push(kv, b)
+    let c = list_new() push(c, "refusal_reason") push(c, _rpc_str(nl_er_refusal_reason(er)))          push(kv, c)
+    let d = list_new() push(d, "admin_action")   push(d, _rpc_str(nl_er_admin_action(er)))            push(kv, d)
+    let e = list_new() push(e, "admin_args")     push(e, _rpc_arr(arg_frags))                         push(kv, e)
+    let f = list_new() push(f, "query")          push(f, _rpc_encode_query(nl_er_query(er)))          push(kv, f)
+    let g = list_new() push(g, "proposal")       push(g, _rpc_encode_proposal(nl_er_proposal_result(er))) push(kv, g)
+    let h = list_new() push(h, "templated_answer") push(h, _rpc_str(templated))                       push(kv, h)
+    return _rpc_obj(kv)
+}
+
+// ---- persona encoder ----------------------------------------------------
+
+fn _rpc_encode_persona(p) {
+    if p == 0 { return _rpc_null() }
+    let o = persona_ocean(p)
+    let ocean_frags = list_new()
+    push(ocean_frags, _rpc_int(o[0]))
+    push(ocean_frags, _rpc_int(o[1]))
+    push(ocean_frags, _rpc_int(o[2]))
+    push(ocean_frags, _rpc_int(o[3]))
+    push(ocean_frags, _rpc_int(o[4]))
+    let kv = list_new()
+    let a = list_new() push(a, "user_id")            push(a, _rpc_str(persona_user_id(p)))          push(kv, a)
+    let b = list_new() push(b, "name")               push(b, _rpc_str(persona_name(p)))             push(kv, b)
+    let c = list_new() push(c, "purpose")            push(c, _rpc_str(persona_purpose(p)))          push(kv, c)
+    let d = list_new() push(d, "ocean")              push(d, _rpc_arr(ocean_frags))                 push(kv, d)
+    let e = list_new() push(e, "valence")            push(e, _rpc_int(persona_valence(p)))          push(kv, e)
+    let f = list_new() push(f, "arousal")            push(f, _rpc_int(persona_arousal(p)))          push(kv, f)
+    let g = list_new() push(g, "risk_tolerance")     push(g, _rpc_int(persona_risk_tolerance(p)))   push(kv, g)
+    let h = list_new() push(h, "history_count")      push(h, _rpc_int(persona_history_count(p)))    push(kv, h)
+    let i = list_new() push(i, "preferences_count")  push(i, _rpc_int(persona_preferences_count(p))) push(kv, i)
+    let j = list_new() push(j, "reflection_count")   push(j, _rpc_int(persona_reflection_count(p))) push(kv, j)
+    let k = list_new() push(k, "style_capsule")      push(k, _rpc_str(persona_style_capsule(p)))    push(kv, k)
+    return _rpc_obj(kv)
+}
+
+// ---- verb implementations ------------------------------------------------
+
+// nl.ask -- parse + execute + template.
+fn _rpc_verb_nl_ask(args, ctx) {
+    if _rpc_has_arg(args, "text") == 0 { return _rpc_err("missing arg: text") }
+    let text = _rpc_arg(args, "text")
+    let uid = _rpc_arg(args, "user_id")
+    let q = grammar_parse(text)
+    let er = nl_execute(q, rpc_ctx_kgreg(ctx), rpc_ctx_capreg(ctx),
+                        rpc_ctx_persona_reg(ctx), rpc_ctx_skill_reg(ctx),
+                        rpc_ctx_mo(ctx), uid, rpc_ctx_now(ctx))
+    let persona = 0
+    let preg = rpc_ctx_persona_reg(ctx)
+    if preg != 0 {
+        if len(uid) > 0 { persona = persona_registry_lookup(preg, uid) }
+    }
+    return _rpc_ok(_rpc_encode_execution_result(er, persona))
+}
+
+// nl.parse_only -- for debugging: what did the grammar think?
+fn _rpc_verb_nl_parse_only(args, ctx) {
+    if _rpc_has_arg(args, "text") == 0 { return _rpc_err("missing arg: text") }
+    let q = grammar_parse(_rpc_arg(args, "text"))
+    return _rpc_ok(_rpc_encode_query(q))
+}
+
+// kg.list -- enumerate KG labels in the registry.
+fn _rpc_verb_kg_list(args, ctx) {
+    let reg = rpc_ctx_kgreg(ctx)
+    if reg == 0 { return _rpc_err("no KG registry in context") }
+    let labels = list_new()
+    let i = 0
+    let n = kg_count(reg)
+    while i < n {
+        let kg = kg_get(reg, i)
+        if kg != 0 { push(labels, kg_label(kg)) }
+        i = i + 1
+    }
+    return _rpc_ok(_rpc_arr_of_str(labels))
+}
+
+// capsule.list -- name + version + install-state for every registered capsule.
+fn _rpc_verb_capsule_list(args, ctx) {
+    let cr = rpc_ctx_capreg(ctx)
+    if cr == 0 { return _rpc_err("no capsule registry in context") }
+    let entries = capreg_capsules(cr)
+    let frags = list_new()
+    let i = 0
+    while i < len(entries) {
+        let c = entries[i]
+        let installed = capreg_is_installed(cr, capsule_name(c))
+        let kv = list_new()
+        let a = list_new() push(a, "name")      push(a, _rpc_str(capsule_name(c)))    push(kv, a)
+        let b = list_new() push(b, "version")   push(b, _rpc_str(capsule_version(c))) push(kv, b)
+        let d = list_new() push(d, "installed") push(d, _rpc_bool(installed))         push(kv, d)
+        push(frags, _rpc_obj(kv))
+        i = i + 1
+    }
+    return _rpc_ok(_rpc_arr(frags))
+}
+
+// capsule.install -- install a registered capsule by name.
+fn _rpc_verb_capsule_install(args, ctx) {
+    let cr = rpc_ctx_capreg(ctx)
+    if cr == 0 { return _rpc_err("no capsule registry in context") }
+    if _rpc_has_arg(args, "name") == 0 { return _rpc_err("missing arg: name") }
+    let name = _rpc_arg(args, "name")
+    let code = capreg_install(cr, name, rpc_ctx_now(ctx))
+    let kv = list_new()
+    let a = list_new() push(a, "name") push(a, _rpc_str(name))         push(kv, a)
+    let b = list_new() push(b, "code") push(b, _rpc_int(code))         push(kv, b)
+    let c = list_new() push(c, "installed") push(c, _rpc_bool(capreg_is_installed(cr, name))) push(kv, c)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// skill.list -- manifest + install state for every registered skill.
+fn _rpc_verb_skill_list(args, ctx) {
+    let sr = rpc_ctx_skill_reg(ctx)
+    if sr == 0 { return _rpc_err("no skill registry in context") }
+    let names = skill_registry_names(sr)
+    let frags = list_new()
+    let i = 0
+    while i < len(names) {
+        let name = names[i]
+        let m = skill_registry_manifest(sr, name)
+        let installed = skill_registry_is_installed(sr, name)
+        let kv = list_new()
+        let a = list_new() push(a, "name")      push(a, _rpc_str(name))         push(kv, a)
+        if m != 0 {
+            let b = list_new() push(b, "version")     push(b, _rpc_str(skill_manifest_version(m)))     push(kv, b)
+            let c = list_new() push(c, "description") push(c, _rpc_str(skill_manifest_description(m))) push(kv, c)
+        }
+        let d = list_new() push(d, "installed") push(d, _rpc_bool(installed))   push(kv, d)
+        push(frags, _rpc_obj(kv))
+        i = i + 1
+    }
+    return _rpc_ok(_rpc_arr(frags))
+}
+
+// skill.run -- direct skill invocation. Bypasses the NL parse layer.
+// The skill.run verb is the RPC equivalent of `/skill run NAME ARG`.
+fn _rpc_verb_skill_run(args, ctx) {
+    if _rpc_has_arg(args, "name") == 0 { return _rpc_err("missing arg: name") }
+    let sr = rpc_ctx_skill_reg(ctx)
+    if sr == 0 { return _rpc_err("no skill registry in context") }
+    let name = _rpc_arg(args, "name")
+    let arg  = _rpc_arg(args, "arg")
+    let sup = skill_registry_supervisor(sr, name)
+    if sup == 0 { return _rpc_err("skill not installed: " + name) }
+    // Perception adapter: research policy expects [topic, kg_names_list].
+    // Other policies get the arg string as-is; each policy defines its
+    // own perception shape.
+    let perception = arg
+    let m = skill_registry_manifest(sr, name)
+    if m != 0 {
+        if skill_manifest_policy_id(m) == SKILL_POLICY_RESEARCH {
+            let pp = list_new()
+            push(pp, arg)
+            push(pp, list_new())     // walk all KGs
+            perception = pp
+        }
+    }
+    let pr = skill_run(sup, perception)
+    return _rpc_ok(_rpc_encode_proposal(pr))
+}
+
+// persona.show -- lookup a persona by user_id (does NOT auto-create).
+fn _rpc_verb_persona_show(args, ctx) {
+    let preg = rpc_ctx_persona_reg(ctx)
+    if preg == 0 { return _rpc_err("no persona registry in context") }
+    if _rpc_has_arg(args, "user_id") == 0 { return _rpc_err("missing arg: user_id") }
+    let uid = _rpc_arg(args, "user_id")
+    let p = persona_registry_lookup(preg, uid)
+    if p == 0 { return _rpc_err("no persona for user_id: " + uid) }
+    return _rpc_ok(_rpc_encode_persona(p))
+}
+
+// persona.project -- run persona_project(p, proposal) and return the
+// projection. Uses the persona named by user_id if present; else 0
+// (in which case persona_project returns a neutral projection).
+fn _rpc_verb_persona_project(args, ctx) {
+    if _rpc_has_arg(args, "user_id")  == 0 { return _rpc_err("missing arg: user_id") }
+    if _rpc_has_arg(args, "proposal") == 0 { return _rpc_err("missing arg: proposal") }
+    let uid = _rpc_arg(args, "user_id")
+    let proposal = _rpc_arg(args, "proposal")
+    let preg = rpc_ctx_persona_reg(ctx)
+    let p = 0
+    if preg != 0 { p = persona_registry_lookup(preg, uid) }
+    let proj = persona_project(p, proposal)
+    return _rpc_ok(_rpc_encode_projection(proj))
+}
+
+// ingest.review -- list entries in the review queue.
+fn _rpc_verb_ingest_review(args, ctx) {
+    let q = rpc_ctx_review_queue(ctx)
+    if q == 0 { return _rpc_err("no review queue in context") }
+    let entries = rq_entries(q)
+    let frags = list_new()
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let kv = list_new()
+        let a = list_new() push(a, "id")        push(a, _rpc_int(rq_id(e)))                        push(kv, a)
+        let b = list_new() push(b, "state")     push(b, _rpc_str(rq_state_name(rq_state(e))))      push(kv, b)
+        let c = list_new() push(c, "source")    push(c, _rpc_str(rq_source(e)))                    push(kv, c)
+        let d = list_new() push(d, "reason")    push(d, _rpc_str(rq_reason(e)))                    push(kv, d)
+        let f = list_new() push(f, "submitted") push(f, _rpc_int(rq_submitted(e)))                 push(kv, f)
+        push(frags, _rpc_obj(kv))
+        i = i + 1
+    }
+    return _rpc_ok(_rpc_arr(frags))
+}
+
+fn _rpc_verb_ingest_approve(args, ctx) {
+    let q = rpc_ctx_review_queue(ctx)
+    if q == 0 { return _rpc_err("no review queue in context") }
+    if _rpc_has_arg(args, "id") == 0 { return _rpc_err("missing arg: id") }
+    let a = rpc_ctx_ingest_agent(ctx)
+    if a == 0 { return _rpc_err("no ingest agent in context") }
+    let id = str_to_int(_rpc_arg(args, "id"))
+    let ok = rq_approve(q, id, ing_capreg(a), rpc_ctx_mo(ctx))
+    let kv = list_new()
+    let p1 = list_new() push(p1, "id")       push(p1, _rpc_int(id))     push(kv, p1)
+    let p2 = list_new() push(p2, "approved") push(p2, _rpc_bool(ok))    push(kv, p2)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+fn _rpc_verb_ingest_deny(args, ctx) {
+    let q = rpc_ctx_review_queue(ctx)
+    if q == 0 { return _rpc_err("no review queue in context") }
+    if _rpc_has_arg(args, "id") == 0 { return _rpc_err("missing arg: id") }
+    let id = str_to_int(_rpc_arg(args, "id"))
+    let reason = _rpc_arg(args, "reason")
+    let ok = rq_deny(q, id, reason)
+    let kv = list_new()
+    let p1 = list_new() push(p1, "id")     push(p1, _rpc_int(id))      push(kv, p1)
+    let p2 = list_new() push(p2, "denied") push(p2, _rpc_bool(ok))     push(kv, p2)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// ---- top-level dispatch --------------------------------------------------
+
+// The one entry point a daemon calls. `verb` is the verb name string;
+// `args` is a list of [key, value] pairs; `ctx` is an RpcContext.
+// Returns a JSON string suitable for direct socket write.
+//
+// Unknown verbs yield {ok:false, error:"unknown verb: X"} so an
+// operator can distinguish "verb missing" from "verb failed."
+fn rpc_dispatch(verb, args, ctx) {
+    if str_eq_bytes(verb, "nl.ask")           == 1 { return _rpc_verb_nl_ask(args, ctx) }
+    if str_eq_bytes(verb, "nl.parse_only")    == 1 { return _rpc_verb_nl_parse_only(args, ctx) }
+    if str_eq_bytes(verb, "kg.list")          == 1 { return _rpc_verb_kg_list(args, ctx) }
+    if str_eq_bytes(verb, "capsule.list")     == 1 { return _rpc_verb_capsule_list(args, ctx) }
+    if str_eq_bytes(verb, "capsule.install")  == 1 { return _rpc_verb_capsule_install(args, ctx) }
+    if str_eq_bytes(verb, "skill.list")       == 1 { return _rpc_verb_skill_list(args, ctx) }
+    if str_eq_bytes(verb, "skill.run")        == 1 { return _rpc_verb_skill_run(args, ctx) }
+    if str_eq_bytes(verb, "persona.show")     == 1 { return _rpc_verb_persona_show(args, ctx) }
+    if str_eq_bytes(verb, "persona.project")  == 1 { return _rpc_verb_persona_project(args, ctx) }
+    if str_eq_bytes(verb, "ingest.review")    == 1 { return _rpc_verb_ingest_review(args, ctx) }
+    if str_eq_bytes(verb, "ingest.approve")   == 1 { return _rpc_verb_ingest_approve(args, ctx) }
+    if str_eq_bytes(verb, "ingest.deny")      == 1 { return _rpc_verb_ingest_deny(args, ctx) }
+    return _rpc_err("unknown verb: " + verb)
+}
+
+// Public list of the verb names the dispatcher recognizes -- callers
+// (introspection endpoints, help printers) can enumerate what's
+// available without hand-mirroring the switch above.
+fn rpc_verb_names() {
+    let v = list_new()
+    push(v, "nl.ask")
+    push(v, "nl.parse_only")
+    push(v, "kg.list")
+    push(v, "capsule.list")
+    push(v, "capsule.install")
+    push(v, "skill.list")
+    push(v, "skill.run")
+    push(v, "persona.show")
+    push(v, "persona.project")
+    push(v, "ingest.review")
+    push(v, "ingest.approve")
+    push(v, "ingest.deny")
+    return v
+}
