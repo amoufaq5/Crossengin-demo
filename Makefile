@@ -24,6 +24,7 @@ SELFCHECK   := examples/kernel_selfcheck.nova
 SPINE       := examples/companion_spine.nova
 DAEMON      := examples/crossengin_daemon.nova
 CHAT        := examples/crossengin_chat.nova
+RPC_DAEMON  := examples/crossengin_rpc_daemon.nova
 KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 FED_COORD   := examples/crossengin_fed_coordinator.nova
@@ -57,6 +58,7 @@ CROSS_WIN_PAIRS = \
 	$(SPINE)::crossengin-spine \
 	$(DAEMON)::crossengin \
 	$(CHAT)::crossengin-chat \
+	$(RPC_DAEMON)::crossengin-rpc-daemon \
 	$(KGSYNC_PUB)::crossengin-kg-publisher \
 	$(KGSYNC_SUB)::crossengin-kg-subscriber \
 	$(FED_COORD)::crossengin-fed-coordinator
@@ -263,6 +265,14 @@ install: build
 	  printf '  build %s ... ' "$(KGSYNC_SUB)"; \
 	  if "$(NOVA)" build "$(KGSYNC_SUB)" -o "$(BIN)/crossengin-kg-subscriber" >/tmp/ce_install.log 2>&1; then \
 	    echo "OK -> $(BIN)/crossengin-kg-subscriber"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
+	@if [ -f "$(RPC_DAEMON)" ]; then \
+	  printf '  build %s ... ' "$(RPC_DAEMON)"; \
+	  if "$(NOVA)" build "$(RPC_DAEMON)" -o "$(BIN)/crossengin-rpc-daemon" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-rpc-daemon"; \
 	  else \
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
