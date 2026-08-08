@@ -259,13 +259,30 @@ Sandbox layers ADD enforcement; they never RELAX ADR-0103:
 - [x] All prior tests unchanged (backward compatible when the
       env flag is off)
 
-## Deferred
+## Deferred → shipped
 
-- **R54.1 — TLS sidecar recipe** (docs/SHIP_AS_APP.md only, no
-  code change)
+- **R54.1 — TLS sidecar recipe** ✅ shipped:
+  * `scripts/gen_tls_cert.sh` — one-shot self-signed cert
+    generator (ed25519 preferred; RSA fallback; SAN + fingerprint)
+  * `infra/tls/stunnel.rpc.conf.example` — reference stunnel conf
+    (TLS 1.2+, modern ciphers, foreground/log/pid/setuid)
+  * `infra/tls/nginx.rpc.conf.example` — reference nginx `stream`
+    conf (raw-TCP forward, TLS termination on :9977)
+  * `docs/DEPLOY_TLS.md` — 7-section operator manual:
+    when-you-need-this, threat model, cert generation, sidecar
+    setup, daemon boot with loopback-only bind, client examples
+    (openssl s_client + Python stdlib + fingerprint pinning),
+    Let's Encrypt for public deployments, verification steps, R55+
+    replacement path
+
+## Still deferred
+
 - **R54.2 — Signed skill install** (`src/sandbox/skill_signature.nova`
   + `skill.install` verb integration)
 - **R55 — Multi-user daemon** (session slots per token holder,
-  per-session DP accounting, snapshot round-trip via wire)
-- **R56+ — Rate limits per capability**, in-process TLS,
-  hardware-key-backed admin bootstrap
+  per-session DP accounting, snapshot round-trip via wire,
+  `capability.issue` verb so admin can mint child tokens
+  over the wire instead of via a small in-process program)
+- **R56+ — Rate limits per capability**, in-process TLS
+  (retires the sidecar recipe), hardware-key-backed admin
+  bootstrap

@@ -281,10 +281,12 @@ Refusal shape for a request without a required cap:
 ```
 
 The full sandbox / TLS / signed-skill roadmap is in
-[ADR-0105](adr/0105-sandbox-architecture.md). **TLS is currently
-delivered as a sidecar recipe** (R54.1): put stunnel or nginx in front
-of the daemon on loopback, terminate TLS there, forward decrypted
-bytes to `crossengin-rpc-daemon`. **Signed skill install** is R54.2.
+[ADR-0105](adr/0105-sandbox-architecture.md). **TLS is delivered as
+a sidecar recipe** — see the 7-section operator manual in
+[`docs/DEPLOY_TLS.md`](DEPLOY_TLS.md): stunnel or nginx in front of
+the daemon on loopback, terminate TLS on `:9977`, forward decrypted
+bytes to `crossengin-rpc-daemon` on `:9876`. Reference configs live
+in `infra/tls/`. **Signed skill install** is R54.2.
 
 ## 8. Interactive REPL (existing, still works)
 
@@ -341,8 +343,6 @@ daemon are separate processes with their own in-memory state.
 
 ## 12. What comes next (R55+)
 
-- **R54.1** — TLS sidecar recipe (docs only; stunnel/nginx in
-  front of `crossengin-rpc-daemon`)
 - **R54.2** — Signed skill install (`src/sandbox/skill_signature.nova`
   + trust-anchor list + `skill.install` verb integration)
 - **R55** — Multi-user daemon: session slots per user, per-session
