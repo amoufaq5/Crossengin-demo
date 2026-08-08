@@ -21,6 +21,9 @@
 #   CE_RPC_HOST     daemon host (default 127.0.0.1)
 #   CE_RPC_PORT     daemon port (default 9876)
 #   CE_RPC_JQ       set to any value to pretty-print with jq if installed
+#   CE_RPC_TOKEN    if set, sent as the request's "token" field (needed
+#                   when the daemon is in sandbox-enforced mode, R54;
+#                   see docs/adr/0105-sandbox-architecture.md)
 
 set -uo pipefail
 
@@ -53,7 +56,13 @@ fi
 # Compose request. NOTE: this uses `printf` -- no eval, no shell expansion
 # of the args payload once composed, so a quoted "-o" or "; rm ..." inside
 # the payload doesn't reach the shell.
-REQ=$(printf '{"verb":"%s","args":%s}\n' "$VERB" "$ARGS")
+if [ -n "${CE_RPC_TOKEN:-}" ]; then
+    # Escape any backslash / double-quote in the token id before splicing.
+    ESC_TOKEN=$(printf '%s' "$CE_RPC_TOKEN" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    REQ=$(printf '{"verb":"%s","token":"%s","args":%s}\n' "$VERB" "$ESC_TOKEN" "$ARGS")
+else
+    REQ=$(printf '{"verb":"%s","args":%s}\n' "$VERB" "$ARGS")
+fi
 
 # Send + read one line. Prefer `nc` if present; fall back to bash /dev/tcp.
 send_via_nc() {

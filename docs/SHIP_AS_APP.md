@@ -235,6 +235,57 @@ The whole thing is ~350 lines of Python + 250 lines of HTML/CSS/JS.
 There is no build step, no bundler, no framework. Distribution is
 "clone the repo, run two scripts."
 
+## 7.7 Sandbox / capability tokens (R54, ADR-0105)
+
+For anything beyond single-user local, enable capability enforcement:
+
+```bash
+# Generate a fresh 128-bit token id and store it 0600.
+head -c 16 /dev/urandom | xxd -p > ~/.crossengin/admin.token
+chmod 600 ~/.crossengin/admin.token
+
+CE_RPC_REQUIRE_TOKEN=1 \
+CE_RPC_ADMIN_TOKEN_FILE=~/.crossengin/admin.token \
+scripts/rpc_daemon.sh
+```
+
+The daemon boots with an admin token loaded, refuses any request
+that doesn't carry a live token. Clients pass the token via the
+request's `"token"` field; `scripts/rpc.sh` reads
+`CE_RPC_TOKEN` and injects it:
+
+```bash
+export CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token)
+scripts/rpc.sh nl.ask '{"text":"what is mars","user_id":"owner"}'
+```
+
+Capabilities are namespaced permissions:
+`nl:ask`, `kg:read`, `capsule:read`, `capsule:install`, `skill:read`,
+`skill:run`, `skill:install`, `persona:read`, `persona:write`,
+`ingest:review`, `ingest:decide`. The daemon's verb-to-cap table
+lives in `src/sandbox/capability.nova` — every verb declares exactly
+one required capability.
+
+Built-in **roles** bundle common capability sets: `admin` (all),
+`reader` (read-only), `skill_user` (reader + skill:run), `curator`
+(reader + capsule:install + ingest), `service` (nl:ask + skill:run).
+`R55+` will add wire verbs to mint child tokens from admin; for R54
+the admin token is the bootstrap and additional tokens are minted
+in-process from a separate program that imports
+`src/sandbox/capability.nova`.
+
+Refusal shape for a request without a required cap:
+
+```json
+{"ok":false,"result":null,"error":"capability required: skill:run"}
+```
+
+The full sandbox / TLS / signed-skill roadmap is in
+[ADR-0105](adr/0105-sandbox-architecture.md). **TLS is currently
+delivered as a sidecar recipe** (R54.1): put stunnel or nginx in front
+of the daemon on loopback, terminate TLS there, forward decrypted
+bytes to `crossengin-rpc-daemon`. **Signed skill install** is R54.2.
+
 ## 8. Interactive REPL (existing, still works)
 
 Power users and operators can keep the chat REPL:
@@ -288,14 +339,17 @@ The RPC daemon does NOT yet expose these via the wire (deferred to
 R51+ under `session.save` / `session.load` verbs). For now, chat and
 daemon are separate processes with their own in-memory state.
 
-## 12. What comes next (R52+)
+## 12. What comes next (R55+)
 
-- **R52** — Style Capsules (ADR-0108 implementation)
-- **R53** — Pattern Capsules (ADR-0107 implementation)
-- **R54** — Sandbox architecture (ADR-0105): capability separation,
-  TLS on RPC, user-signed skill install
+- **R54.1** — TLS sidecar recipe (docs only; stunnel/nginx in
+  front of `crossengin-rpc-daemon`)
+- **R54.2** — Signed skill install (`src/sandbox/skill_signature.nova`
+  + trust-anchor list + `skill.install` verb integration)
 - **R55** — Multi-user daemon: session slots per user, per-session
-  DP accounting, snapshot round-trip via wire
+  DP accounting, snapshot round-trip via wire, `capability.issue`
+  wire verb to mint child tokens from admin
+- **R56+** — Rate limits per capability, in-process TLS,
+  hardware-key-backed admin bootstrap
 
 ## 13. Troubleshooting
 

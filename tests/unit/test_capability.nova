@@ -1,0 +1,439 @@
+// Unit tests for src/sandbox/capability.nova (R54, ADR-0105).
+//
+// Covers the capability primitive layer:
+//   - verb -> cap map (every wire verb declares the right cap)
+//   - role expansion (admin / reader / skill_user / curator / service)
+//   - Token constructor + accessors + de-dupe
+//   - Token liveness (revoked / expired / never-expires)
+//   - Registry (add / lookup / revoke)
+//   - Authorize gate (enforcement off = pass-through; enforcement on
+//     with all failure modes)
+//   - End-to-end: rpc_dispatch honours the sandbox when enforced
+//     and stays byte-identical when off
+
+import "../ce_test.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/skills/skills/research_skill.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- helpers -------------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+fn _has_str(list, s) {
+    let i = 0
+    while i < len(list) {
+        if str_eq_bytes(list[i], s) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _mk_ctx() {
+    let kgreg = kg_registry_new()
+    kg_spawn(kgreg, "world")
+    let sr = skill_registry_new()
+    skill_registry_register(sr, research_skill_manifest())
+    return rpc_ctx_new(kgreg, capreg_new(), persona_registry_new(),
+                        sr, mo_new(), 0, 0, 100)
+}
+
+// ---- verb -> cap map ---------------------------------------------------
+
+fn test_verb_map_covers_every_wire_verb() {
+    // Every verb rpc_verb_names() lists must have a required cap
+    // registered (empty is invalid -- means the verb is unauthenticated,
+    // which for the current 12 is never correct).
+    let names = rpc_verb_names()
+    let i = 0
+    while i < len(names) {
+        let need = capability_verb_required(names[i])
+        ce_check(names[i] + " has a cap", len(need) > 0)
+        i = i + 1
+    }
+}
+
+fn test_unknown_verb_declares_no_cap() {
+    // Unknown-to-sandbox verbs return "" (no requirement); the RPC
+    // dispatcher still refuses them with "unknown verb: X".
+    ce_eq("unknown verb -> empty cap",
+          len(capability_verb_required("no.such.verb")), 0)
+}
+
+fn test_verb_map_specific_caps() {
+    ce_eq("nl.ask maps to nl:ask",
+          str_eq_bytes(capability_verb_required("nl.ask"), CAP_NL_ASK), 1)
+    ce_eq("nl.parse_only shares nl:ask",
+          str_eq_bytes(capability_verb_required("nl.parse_only"), CAP_NL_ASK), 1)
+    ce_eq("skill.run -> skill:run",
+          str_eq_bytes(capability_verb_required("skill.run"), CAP_SKILL_RUN), 1)
+    ce_eq("skill.install -> skill:install",
+          str_eq_bytes(capability_verb_required("skill.install"), CAP_SKILL_INSTALL), 1)
+    ce_eq("persona.show -> persona:read",
+          str_eq_bytes(capability_verb_required("persona.show"), CAP_PERSONA_READ), 1)
+    ce_eq("ingest.approve -> ingest:decide",
+          str_eq_bytes(capability_verb_required("ingest.approve"), CAP_INGEST_DECIDE), 1)
+    ce_eq("ingest.review -> ingest:review",
+          str_eq_bytes(capability_verb_required("ingest.review"), CAP_INGEST_REVIEW), 1)
+}
+
+// ---- role expansion ---------------------------------------------------
+
+fn test_role_admin_has_everything() {
+    let caps = capability_role_expand("admin")
+    ce_check("has nl:ask",         _has_str(caps, CAP_NL_ASK))
+    ce_check("has kg:read",        _has_str(caps, CAP_KG_READ))
+    ce_check("has skill:install",  _has_str(caps, CAP_SKILL_INSTALL))
+    ce_check("has ingest:decide",  _has_str(caps, CAP_INGEST_DECIDE))
+    ce_check("has persona:write",  _has_str(caps, CAP_PERSONA_WRITE))
+}
+
+fn test_role_reader_is_read_only() {
+    let caps = capability_role_expand("reader")
+    ce_check("reader has nl:ask",     _has_str(caps, CAP_NL_ASK))
+    ce_check("reader has kg:read",    _has_str(caps, CAP_KG_READ))
+    ce_check("reader has skill:read", _has_str(caps, CAP_SKILL_READ))
+    ce_check("reader has persona:read", _has_str(caps, CAP_PERSONA_READ))
+    ce_eq("reader has NO skill:run",     _has_str(caps, CAP_SKILL_RUN),     0)
+    ce_eq("reader has NO skill:install", _has_str(caps, CAP_SKILL_INSTALL), 0)
+    ce_eq("reader has NO ingest:review", _has_str(caps, CAP_INGEST_REVIEW), 0)
+    ce_eq("reader has NO persona:write", _has_str(caps, CAP_PERSONA_WRITE), 0)
+}
+
+fn test_role_skill_user_extends_reader() {
+    let caps = capability_role_expand("skill_user")
+    ce_check("has kg:read",     _has_str(caps, CAP_KG_READ))
+    ce_check("has skill:run",   _has_str(caps, CAP_SKILL_RUN))
+    ce_eq("still NO skill:install", _has_str(caps, CAP_SKILL_INSTALL), 0)
+}
+
+fn test_role_curator_extends_reader() {
+    let caps = capability_role_expand("curator")
+    ce_check("has capsule:install", _has_str(caps, CAP_CAPSULE_INSTALL))
+    ce_check("has ingest:decide",   _has_str(caps, CAP_INGEST_DECIDE))
+    ce_check("has ingest:review",   _has_str(caps, CAP_INGEST_REVIEW))
+    ce_eq("still NO skill:install", _has_str(caps, CAP_SKILL_INSTALL), 0)
+}
+
+fn test_role_service_minimal() {
+    let caps = capability_role_expand("service")
+    ce_check("has nl:ask",   _has_str(caps, CAP_NL_ASK))
+    ce_check("has skill:run", _has_str(caps, CAP_SKILL_RUN))
+    ce_eq("no kg:read",       _has_str(caps, CAP_KG_READ), 0)
+}
+
+fn test_role_unknown_empty() {
+    ce_eq("empty", len(capability_role_expand("no-such-role")), 0)
+}
+
+fn test_role_names_lists_five() {
+    let ns = capability_role_names()
+    ce_eq("5 roles",   len(ns), 5)
+    ce_check("admin",  _has_str(ns, "admin"))
+    ce_check("reader", _has_str(ns, "reader"))
+}
+
+// ---- Token constructor + accessors ------------------------------------
+
+fn test_token_shape() {
+    let caps = list_new() push(caps, CAP_NL_ASK) push(caps, CAP_KG_READ)
+    let t = capability_token_new("tk-1", "alice", caps, 100, 1000)
+    ce_eq("id",        str_eq_bytes(token_id(t), "tk-1"), 1)
+    ce_eq("holder",    str_eq_bytes(token_holder(t), "alice"), 1)
+    ce_eq("2 caps",    len(token_caps(t)), 2)
+    ce_eq("issued",    token_issued_at(t), 100)
+    ce_eq("expires",   token_expires_at(t), 1000)
+    ce_eq("not revoked", token_revoked(t), 0)
+}
+
+fn test_token_dedupes_caps() {
+    let caps = list_new()
+    push(caps, CAP_NL_ASK) push(caps, CAP_NL_ASK) push(caps, CAP_KG_READ)
+    let t = capability_token_new("tk-2", "alice", caps, 0, 0)
+    ce_eq("dedupe -> 2 caps", len(token_caps(t)), 2)
+}
+
+fn test_token_has_cap() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-3", "alice", caps, 0, 0)
+    ce_eq("has nl:ask", token_has_cap(t, CAP_NL_ASK), 1)
+    ce_eq("no skill:run", token_has_cap(t, CAP_SKILL_RUN), 0)
+}
+
+fn test_token_new_roles_expands() {
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-4", "alice", roles, 0, 0)
+    ce_check("expanded has nl:ask",    token_has_cap(t, CAP_NL_ASK))
+    ce_check("expanded has kg:read",   token_has_cap(t, CAP_KG_READ))
+    ce_eq("no skill:run",              token_has_cap(t, CAP_SKILL_RUN), 0)
+}
+
+fn test_token_new_roles_multi_dedupes() {
+    let roles = list_new() push(roles, "reader") push(roles, "skill_user")
+    let t = capability_token_new_roles("tk-5", "alice", roles, 0, 0)
+    // Both roles include nl:ask; must appear only once.
+    let caps = token_caps(t)
+    let hits = 0
+    let i = 0
+    while i < len(caps) {
+        if str_eq_bytes(caps[i], CAP_NL_ASK) == 1 { hits = hits + 1 }
+        i = i + 1
+    }
+    ce_eq("dedupe across roles", hits, 1)
+}
+
+// ---- Token liveness ----------------------------------------------------
+
+fn test_token_never_expires() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-perp", "alice", caps, 0, 0)
+    ce_eq("live @ far future", token_is_live(t, 999999), 1)
+}
+
+fn test_token_expires() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-exp", "alice", caps, 100, 500)
+    ce_eq("live @ 400", token_is_live(t, 400), 1)
+    ce_eq("dead @ 500", token_is_live(t, 500), 0)
+    ce_eq("dead @ 600", token_is_live(t, 600), 0)
+}
+
+fn test_token_revoked_kills_liveness() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-rev", "alice", caps, 0, 0)
+    ce_eq("live pre-revoke", token_is_live(t, 100), 1)
+    list_set(t, TOK_REVOKED, 1)
+    ce_eq("dead post-revoke", token_is_live(t, 100), 0)
+}
+
+fn test_null_token_never_live() {
+    ce_eq("null -> dead", token_is_live(0, 100), 0)
+}
+
+// ---- Registry ---------------------------------------------------------
+
+fn test_registry_add_and_lookup() {
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-r1", "alice", caps, 0, 0)
+    capability_registry_add(reg, t)
+    ce_eq("count 1", capability_registry_count(reg), 1)
+    let got = capability_registry_lookup(reg, "tk-r1")
+    ce_check("looked up", got != 0)
+    ce_eq("same id",     str_eq_bytes(token_id(got), "tk-r1"), 1)
+    let miss = capability_registry_lookup(reg, "no-such")
+    ce_eq("miss returns 0", miss, 0)
+}
+
+fn test_registry_revoke() {
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-r2", "alice", caps, 0, 0)
+    capability_registry_add(reg, t)
+    ce_eq("revoke ok",   capability_registry_revoke(reg, "tk-r2"), 1)
+    let got = capability_registry_lookup(reg, "tk-r2")
+    ce_eq("revoked bit set", token_revoked(got), 1)
+    ce_eq("revoking unknown -> 0",
+          capability_registry_revoke(reg, "no-such"), 0)
+}
+
+// ---- Authorize gate ---------------------------------------------------
+
+fn test_authorize_off_is_pass_through() {
+    // enforced=0 -> "" always.
+    ce_eq("off returns empty (no token)",
+          len(capability_authorize(0, 0, "", "nl.ask", 100)), 0)
+    ce_eq("off returns empty (with token, off)",
+          len(capability_authorize(0, 0, "tk-x", "skill.install", 100)), 0)
+}
+
+fn test_authorize_missing_registry() {
+    let out = capability_authorize(1, 0, "tk-x", "nl.ask", 100)
+    ce_check("names sandbox misconfigured", _has(out, "sandbox misconfigured"))
+}
+
+fn test_authorize_missing_token() {
+    let reg = capability_registry_new()
+    let out = capability_authorize(1, reg, "", "nl.ask", 100)
+    ce_check("names missing token", _has(out, "missing 'token' field"))
+}
+
+fn test_authorize_unknown_token() {
+    let reg = capability_registry_new()
+    let out = capability_authorize(1, reg, "tk-ghost", "nl.ask", 100)
+    ce_check("names unknown token", _has(out, "unknown token"))
+}
+
+fn test_authorize_expired_token() {
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-exp2", "alice", caps, 0, 500)
+    capability_registry_add(reg, t)
+    let out = capability_authorize(1, reg, "tk-exp2", "nl.ask", 600)
+    ce_check("names expired", _has(out, "token expired"))
+}
+
+fn test_authorize_revoked_token() {
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-rev2", "alice", caps, 0, 0)
+    capability_registry_add(reg, t)
+    capability_registry_revoke(reg, "tk-rev2")
+    let out = capability_authorize(1, reg, "tk-rev2", "nl.ask", 100)
+    ce_check("names revoked", _has(out, "token revoked"))
+}
+
+fn test_authorize_insufficient_cap() {
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_KG_READ)     // no nl:ask
+    let t = capability_token_new("tk-ins", "alice", caps, 0, 0)
+    capability_registry_add(reg, t)
+    let out = capability_authorize(1, reg, "tk-ins", "nl.ask", 100)
+    ce_check("names required cap", _has(out, "capability required: nl:ask"))
+}
+
+fn test_authorize_grants_when_cap_present() {
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-ok", "alice", caps, 0, 0)
+    capability_registry_add(reg, t)
+    let out = capability_authorize(1, reg, "tk-ok", "nl.ask", 100)
+    ce_eq("empty means authorized", len(out), 0)
+}
+
+fn test_authorize_unknown_verb_passes() {
+    // A verb the sandbox doesn't know about (no cap requirement) passes
+    // through even under enforcement -- the dispatcher then rejects it
+    // for being unknown, which is the correct signal.
+    let reg = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-any", "alice", caps, 0, 0)
+    capability_registry_add(reg, t)
+    let out = capability_authorize(1, reg, "tk-any", "future.verb", 100)
+    ce_eq("empty -> authorize passes; dispatcher handles unknown-verb",
+          len(out), 0)
+}
+
+// ---- End-to-end: rpc_dispatch under enforcement -----------------------
+
+fn test_rpc_dispatch_off_by_default() {
+    // ctx built with rpc_ctx_new has cap_enforced=0; dispatch runs
+    // without any sandbox interaction (R49/R50 wire behavior).
+    let ctx = _mk_ctx()
+    let out = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("ok even with no token", _has(out, "\"ok\":true"))
+}
+
+fn test_rpc_dispatch_enforcement_refuses_without_token() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    let out = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("refused", _has(out, "\"ok\":false"))
+    ce_check("names missing token", _has(out, "missing 'token' field"))
+}
+
+fn test_rpc_dispatch_enforcement_with_token_and_cap() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-e1", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-e1")
+    let out = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("granted", _has(out, "\"ok\":true"))
+}
+
+fn test_rpc_dispatch_enforcement_refuses_under_capped() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    // reader role has NO skill:run.
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-e2", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-e2")
+    let out = rpc_dispatch("skill.run",
+        list_new(), ctx)
+    ce_check("refused",           _has(out, "\"ok\":false"))
+    ce_check("names skill:run",   _has(out, "capability required: skill:run"))
+}
+
+fn test_rpc_dispatch_enforcement_admin_can_do_anything() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-adm", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-adm")
+    // Skill list, capsule list, persona show all should pass.
+    ce_check("kg.list",       _has(rpc_dispatch("kg.list",      list_new(), ctx), "\"ok\":true"))
+    ce_check("capsule.list",  _has(rpc_dispatch("capsule.list", list_new(), ctx), "\"ok\":true"))
+    ce_check("skill.list",    _has(rpc_dispatch("skill.list",   list_new(), ctx), "\"ok\":true"))
+}
+
+// ---- audit-tag helper -------------------------------------------------
+
+fn test_holder_source_tag_shape() {
+    let caps = list_new()
+    let t = capability_token_new("tk-tag", "alice", caps, 0, 0)
+    ce_eq("tag has prefix",
+          str_eq_bytes(capability_holder_source_tag(t), "src:token:alice"), 1)
+    ce_eq("null -> anonymous",
+          str_eq_bytes(capability_holder_source_tag(0), "src:token:anonymous"), 1)
+}
+
+// ---- main ------------------------------------------------------------
+
+fn main() {
+    test_verb_map_covers_every_wire_verb()
+    test_unknown_verb_declares_no_cap()
+    test_verb_map_specific_caps()
+    test_role_admin_has_everything()
+    test_role_reader_is_read_only()
+    test_role_skill_user_extends_reader()
+    test_role_curator_extends_reader()
+    test_role_service_minimal()
+    test_role_unknown_empty()
+    test_role_names_lists_five()
+    test_token_shape()
+    test_token_dedupes_caps()
+    test_token_has_cap()
+    test_token_new_roles_expands()
+    test_token_new_roles_multi_dedupes()
+    test_token_never_expires()
+    test_token_expires()
+    test_token_revoked_kills_liveness()
+    test_null_token_never_live()
+    test_registry_add_and_lookup()
+    test_registry_revoke()
+    test_authorize_off_is_pass_through()
+    test_authorize_missing_registry()
+    test_authorize_missing_token()
+    test_authorize_unknown_token()
+    test_authorize_expired_token()
+    test_authorize_revoked_token()
+    test_authorize_insufficient_cap()
+    test_authorize_grants_when_cap_present()
+    test_authorize_unknown_verb_passes()
+    test_rpc_dispatch_off_by_default()
+    test_rpc_dispatch_enforcement_refuses_without_token()
+    test_rpc_dispatch_enforcement_with_token_and_cap()
+    test_rpc_dispatch_enforcement_refuses_under_capped()
+    test_rpc_dispatch_enforcement_admin_can_do_anything()
+    test_holder_source_tag_shape()
+    ce_summary("capability")
+}
+
+main()
