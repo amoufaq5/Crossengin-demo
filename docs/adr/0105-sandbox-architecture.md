@@ -275,10 +275,30 @@ Sandbox layers ADD enforcement; they never RELAX ADR-0103:
     Let's Encrypt for public deployments, verification steps, R55+
     replacement path
 
+- **R54.2 — Signed skill install** ✅ shipped:
+  * `src/sandbox/skill_signature.nova` — SkillPackage type wrapping
+    a manifest + ed25519 signature + signer_pk; canonicalizer
+    (`crossengin-skill-manifest-v1` versioned + fixed field order
+    for reproducibility); sha256 pre-hash before ed25519 (32-byte
+    input shape); trust-anchor registry (direct trust list,
+    add/remove/trusts, byte-list equality); `skill_pkg_authorize`
+    gate composed uniformly with `capability_authorize` (both
+    return "" on OK for clean chaining); `skill_pkg_source_tag`
+    fingerprint (first-8-bytes hex) for meta_observer audit.
+  * `tests/unit/test_skill_signature.nova` (50 checks) covering
+    canonicalization determinism, hash stability, sign/verify
+    roundtrip, tamper detection (manifest / signature / pubkey
+    all swapped), trust-anchor lifecycle, authorize gate
+    (off / null pkg / null reg / bad sig / untrusted signer /
+    happy path), source-tag shape.
+  * The RPC-layer wiring (skill.install verb consulting the
+    trust anchors when CE_RPC_REQUIRE_SIGNED_SKILL=1) is a
+    follow-up: the primitive lands here; the daemon flag +
+    verb integration is a small change on top when a shop
+    actually wants marketplace-shaped installs.
+
 ## Still deferred
 
-- **R54.2 — Signed skill install** (`src/sandbox/skill_signature.nova`
-  + `skill.install` verb integration)
 - **R55 — Multi-user daemon** (session slots per token holder,
   per-session DP accounting, snapshot round-trip via wire,
   `capability.issue` verb so admin can mint child tokens

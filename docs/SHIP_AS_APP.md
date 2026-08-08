@@ -343,11 +343,10 @@ daemon are separate processes with their own in-memory state.
 
 ## 12. What comes next (R55+)
 
-- **R54.2** — Signed skill install (`src/sandbox/skill_signature.nova`
-  + trust-anchor list + `skill.install` verb integration)
 - **R55** — Multi-user daemon: session slots per user, per-session
   DP accounting, snapshot round-trip via wire, `capability.issue`
-  wire verb to mint child tokens from admin
+  wire verb to mint child tokens from admin, and skill.install
+  verb wiring for the R54.2 signature primitive
 - **R56+** — Rate limits per capability, in-process TLS,
   hardware-key-backed admin bootstrap
 
