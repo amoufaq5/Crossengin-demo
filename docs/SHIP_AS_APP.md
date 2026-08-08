@@ -175,6 +175,66 @@ Wire envelope for every response:
 Requests may carry an optional `"id"` field (number, string, or null)
 that the daemon echoes verbatim for client-side correlation.
 
+## 7.5 Web UI (R51, browser-shaped)
+
+For a browser-facing surface, run the shim + open the SPA:
+
+```bash
+# Terminal 1: daemon (as in section 3)
+scripts/rpc_daemon.sh
+
+# Terminal 2: web shim (Python 3 stdlib, no pip install)
+scripts/serve_web.sh
+# -> listening on http://127.0.0.1:8080/
+```
+
+Then open [http://127.0.0.1:8080/](http://127.0.0.1:8080/) in a browser.
+
+The UI:
+
+- **Ask box** — free-text question, submit runs `nl.ask` end-to-end
+- **Parse only** button — runs `nl.parse_only`, shows what the
+  grammar understood without invoking a skill (useful for debugging
+  phrasing coverage)
+- **Answer** — the templated English answer from the templater
+- **Sources cited** — every atom the skill leaned on, tagged with
+  its KG label + belief mean
+- **⚠ Sources disagree** — surfaced automatically when the same
+  label appears in 2+ KGs with belief spread ≥ 300 milli (matches
+  the templater's disagreement threshold)
+- **Persona projection** — the advise-only projection, marked so
+  operators know it never overrides
+- **Effector calls** — described, not executed (safety guarantee 3)
+- **Parse debug** — the underlying `StructuredQuery`
+- **Raw JSON-RPC response** — the exact wire envelope, for
+  transparency + client debugging
+- **Side panels** — live inventory of installed skills + KGs
+
+The shim serves static files from `web/` and routes `POST
+/rpc/<verb>` requests to the TCP daemon. Endpoint allowlist matches
+the 12 wire verbs; unknown verbs 400 out at the shim (not forwarded).
+Path traversal (`../`) is blocked at the resolve step. Loopback
+default; non-loopback bind requires `CE_WEB_BIND_ALLOW_NON_LOOPBACK=1`.
+
+Env vars the shim honors:
+
+```
+CE_WEB_PORT       (default 8080)          shim's HTTP port
+CE_WEB_BIND       (default 127.0.0.1)     shim's bind IP
+CE_WEB_BIND_ALLOW_NON_LOOPBACK  "1" to bind LAN (see security posture)
+CE_RPC_HOST       (default 127.0.0.1)     TCP daemon host
+CE_RPC_PORT       (default 9876)          TCP daemon port
+CE_WEB_ROOT       (default <repo>/web)    static-file root
+CE_WEB_TIMEOUT_S  (default 30)            per-request daemon timeout
+```
+
+`GET /healthz` returns `ok` if the shim is up (does not check the
+daemon; use `POST /rpc/kg.list` for a live health probe).
+
+The whole thing is ~350 lines of Python + 250 lines of HTML/CSS/JS.
+There is no build step, no bundler, no framework. Distribution is
+"clone the repo, run two scripts."
+
 ## 8. Interactive REPL (existing, still works)
 
 Power users and operators can keep the chat REPL:
@@ -228,10 +288,8 @@ The RPC daemon does NOT yet expose these via the wire (deferred to
 R51+ under `session.save` / `session.load` verbs). For now, chat and
 daemon are separate processes with their own in-memory state.
 
-## 12. What comes next (R51+)
+## 12. What comes next (R52+)
 
-- **R51** — Web UI: a minimal SPA that hits the daemon via a
-  WebSocket-to-TCP shim; renders templated answers with citations
 - **R52** — Style Capsules (ADR-0108 implementation)
 - **R53** — Pattern Capsules (ADR-0107 implementation)
 - **R54** — Sandbox architecture (ADR-0105): capability separation,

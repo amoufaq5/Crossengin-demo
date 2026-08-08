@@ -66,11 +66,23 @@ R51+ (future) delivers user surfaces (web app, mobile).
 7. **`docs/SHIP_AS_APP.md`** — operator manual: install → boot
    daemon → preload → hit with client → verify → next steps
 
-### Deliverables deferred to R51+
+### Deliverables added in R51
 
-- Web UI (client-side JS talking to `crossengin-rpc-daemon` over
-  a WebSocket-to-TCP bridge; requires the R48p8 style-capsule
-  work + a small HTTP bridge)
+- **Web UI shipped** (`web/index.html` + `web/app.js` +
+  `web/styles.css`) + Python 3 HTTP shim
+  (`scripts/rpc_web_shim.py`) that forwards `POST /rpc/<verb>` to
+  the TCP daemon. Launcher: `scripts/serve_web.sh`. Renders
+  templated answers with source chips + disagreement callouts +
+  persona projection + effector-calls (described, not executed) +
+  parse-debug panel. Loopback default, path-traversal blocked,
+  wire-verb allowlist at the shim. Stdlib-only Python; no npm,
+  no bundler.
+
+### Deliverables deferred to R52+
+
+- WebSocket streaming (current R51 shim is request/response only;
+  a streaming variant would let long-running skill runs push
+  progress)
 - Mobile app (native shell wrapping a WebView + the same wire)
 - Distributable installers (deb / rpm / brew / MSI); the current
   cross-windows `.exe` build is a foundation but not a signed
@@ -186,11 +198,8 @@ uses:
   or a `preload.ps1` (deferred). The daemon itself is native
   Windows; only the boot scaffold is Unix-first.
 
-## Roadmap after R50
+## Roadmap after R51
 
-- **R51** — Web UI: minimal SPA that hits the daemon via a
-  WebSocket-to-TCP shim; renders templated answers with source
-  citations
 - **R52** — Style Capsules (ADR-0108 implementation): personas
   can pick a rendering style; templater consults the capsule
 - **R53** — Pattern Capsules (ADR-0107 implementation): skills
