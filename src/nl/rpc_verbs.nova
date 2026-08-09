@@ -81,6 +81,7 @@ import "../agent/ingestion_agent.nova"
 import "../ingest/review_queue.nova"
 import "../parts/meta/meta_observer.nova"
 import "../sandbox/capability.nova"
+import "../sandbox/skill_signature.nova"
 import "../util/str_safe.nova"
 
 // ---- RpcContext slot layout ---------------------------------------------
@@ -97,7 +98,11 @@ let RCTX_CAP_REG      = 8    // capability registry (may be 0)
 let RCTX_CAP_ENFORCED = 9    // 0/1 -- CE_RPC_REQUIRE_TOKEN gate
 let RCTX_PRESENTED_TOKEN = 10  // token id from the current request; ""
                                 // when off; rpc_server sets per request
-let RCTX_SLOTS        = 11
+// R55.1 signed-skill-install slots.
+let RCTX_TRUST_ANCHORS   = 11  // trust_anchor_registry for signed
+                                //   skill installs (may be 0)
+let RCTX_SIGNED_ENFORCED = 12  // 0/1 -- CE_RPC_REQUIRE_SIGNED_SKILL gate
+let RCTX_SLOTS        = 13
 
 fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
                ingest_agent, review_queue, now) {
@@ -113,6 +118,8 @@ fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
     push(c, 0)          // CAP_REG (0 = no sandbox)
     push(c, 0)          // CAP_ENFORCED (0 = off, backward-compat)
     push(c, "")         // PRESENTED_TOKEN (rpc_server sets per request)
+    push(c, 0)          // TRUST_ANCHORS (0 = no signed-skill sandbox)
+    push(c, 0)          // SIGNED_ENFORCED (0 = off, backward-compat)
     return c
 }
 
@@ -132,6 +139,16 @@ fn rpc_ctx_set_presented_token(ctx, token_id_str) {
     return ctx
 }
 
+// R55.1 mutator: wire a trust-anchor registry for signed skill installs.
+// Callers OPT INTO signature enforcement by passing enforced=1. Absent
+// this (or enforced=0), skill.install accepts pre-registered manifests
+// by name -- same shape a builder-time-registered built-in has.
+fn rpc_ctx_set_signed_skill_enforcement(ctx, trust_reg, enforced) {
+    list_set(ctx, RCTX_TRUST_ANCHORS, trust_reg)
+    list_set(ctx, RCTX_SIGNED_ENFORCED, enforced)
+    return ctx
+}
+
 // Convenience accessors (used by dispatch below; also stable for
 // clients that want to introspect a context they've built).
 fn rpc_ctx_kgreg(c)         { return c[RCTX_KGREG] }
@@ -145,6 +162,8 @@ fn rpc_ctx_now(c)           { return c[RCTX_NOW] }
 fn rpc_ctx_cap_reg(c)          { return c[RCTX_CAP_REG] }
 fn rpc_ctx_cap_enforced(c)     { return c[RCTX_CAP_ENFORCED] }
 fn rpc_ctx_presented_token(c)  { return c[RCTX_PRESENTED_TOKEN] }
+fn rpc_ctx_trust_anchors(c)    { return c[RCTX_TRUST_ANCHORS] }
+fn rpc_ctx_signed_enforced(c)  { return c[RCTX_SIGNED_ENFORCED] }
 
 // ---- JSON encoding helpers ----------------------------------------------
 
@@ -544,6 +563,204 @@ fn _rpc_verb_skill_run(args, ctx) {
     return _rpc_ok(_rpc_encode_proposal(pr))
 }
 
+// ---- skill.install (R55.1, R54.2 signing integration) ------------------
+//
+// Two modes:
+//
+// (a) Enforcement OFF (default): install a PRE-REGISTERED manifest by
+//     name. This is the "pre-anchored built-ins" path -- echo,
+//     research, coding_helper compile into the daemon and get
+//     registered at boot; the wire just asks the runtime to build the
+//     supervisor + install.
+//
+//     args: {name}
+//     returns: {name, installed (bool), pre_anchored: true}
+//
+// (b) Enforcement ON (rpc_ctx_set_signed_skill_enforcement with
+//     enforced=1): require a full SkillPackage on the wire. The
+//     caller supplies enough fields to RECONSTRUCT the manifest
+//     server-side (so the daemon doesn't have to parse arbitrary
+//     JSON -- args are already stringly-typed key/value pairs). The
+//     server re-canonicalizes, verifies the ed25519 signature
+//     against the reconstructed hash, and checks the signer_pk
+//     against the trust anchor list. Refuses cleanly on every
+//     mismatch path.
+//
+//     args: {
+//       name, version, description, policy_id (int str), tier (int str),
+//       effectors     (csv of effector names; may be empty),
+//       capsule_deps  (csv of "name:version"; may be empty),
+//       refusals      (csv of "int:arg"; may be empty),
+//       signer_pk     (64 lowercase hex chars, 32 bytes),
+//       signature     (128 lowercase hex chars, 64 bytes),
+//     }
+//     returns: {name, installed (bool), signer: "<8-byte hex>"}
+//
+// The verb ALSO refuses in mode (b) if the caller passes only a name
+// (with no signature fields) -- that would be a downgrade attack
+// against a signature-enforced daemon.
+//
+// Under enforcement, PRE-registered built-ins are still installable
+// by name via mode (a) only if you flip enforcement OFF at boot for
+// that install, OR pre-install them at daemon boot (which the
+// R55.1 crossengin_rpc_daemon already does for echo + research).
+// A fresh signed install under enforcement lands as a NEW skill
+// (not a re-install of a built-in).
+
+// Hex-string -> byte list. Returns 0 on shape error (odd length or
+// non-hex chars). Every caller lives on this fast-path.
+fn _rpc_hex_nibble(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }   // 0-9
+    if c >= 97 { if c <= 102 { return c - 87 } }   // a-f
+    if c >= 65 { if c <= 70  { return c - 55 } }   // A-F
+    return 0 - 1
+}
+
+fn _rpc_hex_to_bytes(s, expected_bytes) {
+    let n = len(s)
+    if n != expected_bytes * 2 { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < n {
+        let hi = _rpc_hex_nibble(char_at(s, i))
+        let lo = _rpc_hex_nibble(char_at(s, i + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        push(out, hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+// Reconstruct a SkillManifest from the wire args. Every field is a
+// string; effectors / capsule_deps / refusals are parsed from CSV.
+// The reconstruction is the AUTHORITATIVE source of the canonical form
+// -- whatever the signer signed, the wire caller must supply the same
+// input to reproduce the same hash.
+fn _rpc_split_csv_pair(s, sep_char) {
+    // "kind:arg" -> [kind, arg]. If sep absent -> [s, ""].
+    let idx = find_char(s, sep_char)
+    let pair = list_new()
+    if idx < 0 {
+        push(pair, s)
+        push(pair, "")
+        return pair
+    }
+    push(pair, substr(s, 0, idx))
+    push(pair, substr(s, idx + 1, len(s) - idx - 1))
+    return pair
+}
+
+fn _rpc_reconstruct_manifest(args) {
+    let name        = _rpc_arg(args, "name")
+    let version     = _rpc_arg(args, "version")
+    let description = _rpc_arg(args, "description")
+    let policy_id   = str_to_int(_rpc_arg(args, "policy_id"))
+    let tier        = str_to_int(_rpc_arg(args, "tier"))
+    let m = skill_manifest_new(name, version, description, policy_id)
+    skill_manifest_set_tier(m, tier)
+    let effectors = _rpc_split_csv(_rpc_arg(args, "effectors"))
+    let i = 0
+    while i < len(effectors) {
+        skill_manifest_add_effector(m, effectors[i])
+        i = i + 1
+    }
+    let deps = _rpc_split_csv(_rpc_arg(args, "capsule_deps"))
+    let j = 0
+    while j < len(deps) {
+        let pair = _rpc_split_csv_pair(deps[j], 58)     // ':'
+        skill_manifest_add_capsule_dep(m, pair[0], pair[1])
+        j = j + 1
+    }
+    let refs = _rpc_split_csv(_rpc_arg(args, "refusals"))
+    let k = 0
+    while k < len(refs) {
+        let pair = _rpc_split_csv_pair(refs[k], 58)     // ':'
+        let kind = str_to_int(pair[0])
+        skill_manifest_add_refusal(m, kind, pair[1])
+        k = k + 1
+    }
+    return m
+}
+
+fn _rpc_verb_skill_install(args, ctx) {
+    let sr = rpc_ctx_skill_reg(ctx)
+    if sr == 0 { return _rpc_err("no skill registry in context") }
+    if _rpc_has_arg(args, "name") == 0 { return _rpc_err("missing arg: name") }
+    let name = _rpc_arg(args, "name")
+    let signed_enforced = rpc_ctx_signed_enforced(ctx)
+    // Signing enforcement short-circuits down two paths depending on
+    // what the caller sent. A caller sending ONLY a name to a
+    // signing-enforced daemon must be refused (downgrade defense).
+    if signed_enforced == 1 {
+        if _rpc_has_arg(args, "signature") == 0 {
+            return _rpc_err("signed skill required: missing arg: signature")
+        }
+        if _rpc_has_arg(args, "signer_pk") == 0 {
+            return _rpc_err("signed skill required: missing arg: signer_pk")
+        }
+        let signer_pk = _rpc_hex_to_bytes(_rpc_arg(args, "signer_pk"), 32)
+        let signature = _rpc_hex_to_bytes(_rpc_arg(args, "signature"), 64)
+        if signer_pk == 0 {
+            return _rpc_err("signed skill refused: signer_pk not 64 lowercase hex chars")
+        }
+        if signature == 0 {
+            return _rpc_err("signed skill refused: signature not 128 lowercase hex chars")
+        }
+        // Reconstruct + verify.
+        let m = _rpc_reconstruct_manifest(args)
+        let pkg = skill_pkg_new(m, signer_pk, signature)
+        let cap_err = skill_pkg_authorize(1,
+            rpc_ctx_trust_anchors(ctx), pkg)
+        if len(cap_err) > 0 { return _rpc_err(cap_err) }
+        // Signature verified + signer trusted. Register the manifest
+        // (last-write-wins by name; a re-signed newer version REPLACES
+        // the prior manifest even if it was itself pre-anchored).
+        skill_registry_register(sr, m)
+        let a = _ensure_capreg_from_ctx(ctx)
+        let sup = skill_supervisor_new(m, rpc_ctx_kgreg(ctx),
+                                        a, 0, 0, rpc_ctx_mo(ctx),
+                                        rpc_ctx_now(ctx))
+        let code = skill_registry_install(sr, name, a, sup, rpc_ctx_now(ctx))
+        let installed = 0
+        if code == SKILL_INSTALL_OK { installed = 1 }
+        let kv = list_new()
+        let p1 = list_new() push(p1, "name")      push(p1, _rpc_str(name))              push(kv, p1)
+        let p2 = list_new() push(p2, "installed") push(p2, _rpc_bool(installed))        push(kv, p2)
+        let p3 = list_new() push(p3, "signer")    push(p3, _rpc_str(skill_pkg_source_tag(pkg))) push(kv, p3)
+        let p4 = list_new() push(p4, "code")      push(p4, _rpc_int(code))              push(kv, p4)
+        return _rpc_ok(_rpc_obj(kv))
+    }
+    // ---- Enforcement OFF: pre-anchored install by name ---------------
+    let m = skill_registry_manifest(sr, name)
+    if m == 0 {
+        return _rpc_err("no manifest registered for '" + name
+            + "'; register at daemon boot or enable signing enforcement + supply a signed package")
+    }
+    let a = _ensure_capreg_from_ctx(ctx)
+    let sup = skill_supervisor_new(m, rpc_ctx_kgreg(ctx), a, 0, 0,
+                                    rpc_ctx_mo(ctx), rpc_ctx_now(ctx))
+    let code = skill_registry_install(sr, name, a, sup, rpc_ctx_now(ctx))
+    let installed = 0
+    if code == SKILL_INSTALL_OK { installed = 1 }
+    let kv = list_new()
+    let p1 = list_new() push(p1, "name")          push(p1, _rpc_str(name))       push(kv, p1)
+    let p2 = list_new() push(p2, "installed")     push(p2, _rpc_bool(installed)) push(kv, p2)
+    let p3 = list_new() push(p3, "pre_anchored")  push(p3, _rpc_bool(1))         push(kv, p3)
+    let p4 = list_new() push(p4, "code")          push(p4, _rpc_int(code))       push(kv, p4)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// A capreg the install path needs. In the standalone daemon this comes
+// from rpc_ctx_capreg; when the daemon runs without a capsule registry
+// (should not happen but be defensive), a fresh one is minted so the
+// install call has SOMETHING to bind to.
+fn _ensure_capreg_from_ctx(ctx) {
+    let c = rpc_ctx_capreg(ctx)
+    if c != 0 { return c }
+    return capreg_new()
+}
+
 // persona.show -- lookup a persona by user_id (does NOT auto-create).
 fn _rpc_verb_persona_show(args, ctx) {
     let preg = rpc_ctx_persona_reg(ctx)
@@ -782,6 +999,7 @@ fn rpc_dispatch(verb, args, ctx) {
     if str_eq_bytes(verb, "capsule.install")  == 1 { return _rpc_verb_capsule_install(args, ctx) }
     if str_eq_bytes(verb, "skill.list")       == 1 { return _rpc_verb_skill_list(args, ctx) }
     if str_eq_bytes(verb, "skill.run")        == 1 { return _rpc_verb_skill_run(args, ctx) }
+    if str_eq_bytes(verb, "skill.install")    == 1 { return _rpc_verb_skill_install(args, ctx) }
     if str_eq_bytes(verb, "persona.show")     == 1 { return _rpc_verb_persona_show(args, ctx) }
     if str_eq_bytes(verb, "persona.project")  == 1 { return _rpc_verb_persona_project(args, ctx) }
     if str_eq_bytes(verb, "ingest.review")    == 1 { return _rpc_verb_ingest_review(args, ctx) }
@@ -805,6 +1023,7 @@ fn rpc_verb_names() {
     push(v, "capsule.install")
     push(v, "skill.list")
     push(v, "skill.run")
+    push(v, "skill.install")
     push(v, "persona.show")
     push(v, "persona.project")
     push(v, "ingest.review")

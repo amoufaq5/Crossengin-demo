@@ -367,12 +367,51 @@ The RPC daemon does NOT yet expose these via the wire (deferred to
 R51+ under `session.save` / `session.load` verbs). For now, chat and
 daemon are separate processes with their own in-memory state.
 
-## 12. What comes next (R55.x+)
+### 7.8 Signed skill install (R55.1)
 
-- **R55.1** — `skill.install` wire integration for the R54.2 signature
-  primitive: accept a `SkillPackage` args payload
-  (manifest_json + signer_pk_hex + signature_hex) under
-  `CE_RPC_REQUIRE_SIGNED_SKILL=1`; refuse unsigned / untrusted-signed
+For deployments that install user-authored skills over the wire
+(marketplace-shape), enable signature enforcement:
+
+```bash
+CE_RPC_REQUIRE_TOKEN=1 \
+CE_RPC_ADMIN_TOKEN_FILE=~/.crossengin/admin.token \
+CE_RPC_REQUIRE_SIGNED_SKILL=1 \
+scripts/rpc_daemon.sh
+```
+
+Pre-register trust anchors in-process (there is no wire verb for
+anchor management yet — R56+). Signed installs supply the full
+manifest fields + signer_pk_hex + signature_hex on the wire:
+
+```bash
+scripts/rpc.sh skill.install '{
+  "name": "shop_debug_helper",
+  "version": "1.0.0",
+  "description": "extended debug patterns for shop-X",
+  "policy_id": "3",
+  "tier": "1",
+  "effectors": "effector_code_exec,effector_file_ops",
+  "capsule_deps": "",
+  "refusals": "",
+  "signer_pk": "<64 hex chars>",
+  "signature": "<128 hex chars>"
+}'
+```
+
+Refusal modes (all `{ok:false}`):
+- `missing arg: signature` / `missing arg: signer_pk` — downgrade defense
+- `signer_pk not 64 lowercase hex chars` — malformed key
+- `signature not 128 lowercase hex chars` — malformed sig
+- `signature does not verify against declared signer_pk` — tampered
+- `signer_pk not in trust-anchor list` — untrusted
+
+When enforcement is OFF (default), `skill.install {name: "echo"}`
+installs a pre-registered built-in — no signature required. That
+covers the single-user local case where the operator implicitly
+trusts the daemon binary itself.
+
+## 12. What comes next (R55.2+)
+
 - **R55.2** — Per-user KG isolation: token holder scopes which
   KGs / capsules are visible on `kg.list` / `capsule.list`
 - **R55.3** — Snapshot round-trip via wire: `session.save` /
