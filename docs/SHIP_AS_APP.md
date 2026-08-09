@@ -452,13 +452,77 @@ overlay only decides what's LISTED. Wire-transmitted skills
 a shared resource. R56+ can extend ownership to skills if
 per-user skill scoping is needed.
 
-## 12. What comes next (R55.3+)
+### 7.10 Session persistence (R55.3)
 
-- **R55.3** — Snapshot round-trip via wire: `session.save` /
-  `session.load` verbs so a client can persist per-user state
-  without dropping into the chat REPL
-- **R56+** — Rate limits per capability, in-process TLS,
-  hardware-key-backed admin bootstrap
+For a daemon whose state should survive a restart (personas +
+capability tokens + trust anchors + ownership overlay), enable
+snapshot persistence:
+
+```bash
+mkdir -p ~/.crossengin/snaps
+chmod 0700 ~/.crossengin/snaps
+
+CE_RPC_REQUIRE_TOKEN=1 \
+CE_RPC_ADMIN_TOKEN_FILE=~/.crossengin/admin.token \
+CE_RPC_SNAPSHOT_DIR=~/.crossengin/snaps \
+scripts/rpc_daemon.sh
+```
+
+Then over the wire (admin token required — both verbs need the
+`admin:session` capability):
+
+```bash
+# Persist current state to ~/.crossengin/snaps/prod.snap.
+CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token) \
+scripts/rpc.sh session.save '{"name":"prod"}'
+# -> {"ok":true,"result":{"name":"prod","path":".../prod.snap",
+#      "bytes":12345,"personas":2,"tokens":3,"anchors":1,
+#      "ownership_entries":4,"include_secrets":true}}
+
+# Save without live token secrets (safer for backup pipelines).
+scripts/rpc.sh session.save '{"name":"prod-shape","include_secrets":"0"}'
+
+# Restore state (destructive: additive to current registries).
+CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token) \
+scripts/rpc.sh session.load '{"name":"prod"}'
+# When loading a shape-only snapshot, `result.rekeyed` carries
+# [{holder, new_token_id}, ...] pairs the operator must redistribute.
+```
+
+**What's in a snapshot:**
+- `#PERSONA v1` blocks — every registered persona via `persona_export`
+- `#OWNERSHIP v1` — every (kind, name, owner) triple
+- `#TRUST v1` — every anchor pubkey (hex-encoded)
+- `#CAPS v1` — every token as (holder + caps + expiry + revoked) +
+  optionally the token_id (`include_secrets=1`, default) OR a `-`
+  placeholder (`include_secrets=0`; loader mints a fresh id)
+
+**Path sandbox** — the daemon accepts a bare `name` only. Names
+must match `[A-Za-z0-9._-]{1,64}`, cannot start with `.`, and
+cannot be `.` or `..`. Slash, backslash, and NUL bytes are
+refused before any file operation. The composed path is always
+`<CE_RPC_SNAPSHOT_DIR>/<name>.snap`; traversal outside the
+configured dir is structurally impossible.
+
+**Security posture:**
+- Snapshot files contain live bearer credentials when
+  `include_secrets=1` (the default). Chmod the directory 0700 and
+  own it as the daemon user. Never copy a full snapshot to an
+  untrusted machine.
+- Use `include_secrets=0` for backups / migrations you want to
+  ship elsewhere. The operator distributes the rekeyed token
+  ids returned by `session.load` to their holders.
+- The snapshot is a DAEMON-shaped state dump. A running chat
+  REPL alongside the daemon has its own separate snapshot
+  (`/save PATH` in the chat) that persists cognition-loop state
+  the daemon doesn't own.
+
+## 12. What comes next (R56+)
+
+- **R56+** — Rate limits per capability, in-process TLS
+  (retires the sidecar recipe), hardware-key-backed admin
+  bootstrap, per-holder skill-run scoping (extending R55.2's
+  overlay to gate skill.run execution, not just list visibility)
 - **R56+** — Rate limits per capability, in-process TLS,
   hardware-key-backed admin bootstrap
 

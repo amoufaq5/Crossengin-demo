@@ -1,0 +1,481 @@
+// Unit tests for R55.3 -- session_snapshot serializer/deserializer +
+// session.save/session.load wire-verb path-safety and refusal shapes
+// (ADR-0105 §Multi-user).
+//
+// The serializer/deserializer is exercised end-to-end in-memory
+// (build state -> serialize -> parse into a fresh set of registries
+// -> assert the round-trip is faithful). File I/O is the daemon's
+// concern and isn't tested here (the container's sandbox refuses
+// most file ops anyway).
+
+import "../ce_test.nova"
+import "../../src/sandbox/session_snapshot.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/sandbox/skill_signature.nova"
+import "../../src/sandbox/ownership.nova"
+import "../../src/persona/persona.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/persona/persona_export.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- helpers -------------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+fn _mk_persona_reg() {
+    let r = persona_registry_new()
+    let a = persona_registry_ensure(r, "alice", 100)
+    persona_set_identity(a, "Alice", "test persona", 100)
+    let b = persona_registry_ensure(r, "bob", 200)
+    persona_set_identity(b, "Bob", "second test persona", 200)
+    return r
+}
+
+fn _mk_cap_reg() {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t1 = capability_token_new_roles("tok-alice-01", "alice", roles, 100, 0)
+    capability_registry_add(reg, t1)
+    let roles2 = list_new() push(roles2, "skill_user")
+    let t2 = capability_token_new_roles("tok-bob-01", "bob", roles2, 100, 5000)
+    capability_registry_add(reg, t2)
+    let roles3 = list_new() push(roles3, "reader")
+    let t3 = capability_token_new_roles("tok-carol-01", "carol", roles3, 100, 0)
+    capability_registry_add(reg, t3)
+    capability_registry_revoke(reg, "tok-carol-01")
+    return reg
+}
+
+// A 32-byte pubkey blob (deterministic; not a real ed25519 point,
+// but the trust anchor registry stores blobs by value so it doesn't
+// need to be one for these tests).
+fn _mk_pubkey(fill) {
+    let out = list_new()
+    let i = 0
+    while i < 32 { push(out, fill & 255) i = i + 1 }
+    return out
+}
+
+fn _mk_trust_reg() {
+    let r = trust_anchor_registry_new()
+    trust_anchor_add(r, _mk_pubkey(0xAA))
+    trust_anchor_add(r, _mk_pubkey(0xBB))
+    return r
+}
+
+fn _mk_ownership() {
+    let o = ownership_registry_new()
+    ownership_set_kg(o, "alice_notebook", "alice")
+    ownership_set_kg(o, "bob_notebook",   "bob")
+    ownership_set_capsule(o, "alice_pack", "alice")
+    return o
+}
+
+// ---- serializer shape --------------------------------------------------
+
+fn test_serialize_has_version_banner() {
+    let text = session_snapshot_serialize(0, 0, 0, 0, 1, 100)
+    ce_check("starts with banner", _has(text, "#CROSSENGIN-SESSION v1"))
+    ce_check("names timestamp",    _has(text, "#saved-at 100"))
+}
+
+fn test_serialize_include_secrets_flag() {
+    let with_secret = session_snapshot_serialize(0, 0, 0, 0, 1, 0)
+    let without     = session_snapshot_serialize(0, 0, 0, 0, 0, 0)
+    ce_check("with-flag names it",  _has(with_secret, "#include-secrets 1"))
+    ce_check("without-flag names it", _has(without,   "#include-secrets 0"))
+}
+
+fn test_serialize_persona_section() {
+    let text = session_snapshot_serialize(_mk_persona_reg(), 0, 0, 0, 1, 0)
+    ce_check("has PERSONA marker",  _has(text, "#PERSONA v1"))
+    ce_check("names alice",         _has(text, "USER alice"))
+    ce_check("names bob",           _has(text, "USER bob"))
+}
+
+fn test_serialize_ownership_section() {
+    let text = session_snapshot_serialize(0, 0, 0, _mk_ownership(), 1, 0)
+    ce_check("has OWNERSHIP marker",   _has(text, "#OWNERSHIP v1"))
+    ce_check("names kg alice_notebook", _has(text, "kg alice_notebook alice"))
+    ce_check("names capsule alice_pack", _has(text, "capsule alice_pack alice"))
+}
+
+fn test_serialize_trust_section() {
+    let text = session_snapshot_serialize(0, 0, _mk_trust_reg(), 0, 1, 0)
+    ce_check("has TRUST marker",     _has(text, "#TRUST v1"))
+    // Two anchors; each is 64 hex chars starting with the fill nibble.
+    ce_check("anchor 0xAA hex",      _has(text, "ANCHOR aaaaaaaa"))
+    ce_check("anchor 0xBB hex",      _has(text, "ANCHOR bbbbbbbb"))
+}
+
+fn test_serialize_caps_with_secrets() {
+    let text = session_snapshot_serialize(0, _mk_cap_reg(), 0, 0, 1, 0)
+    ce_check("has CAPS marker",      _has(text, "#CAPS v1"))
+    ce_check("token_id present",     _has(text, "TOKEN tok-alice-01"))
+    ce_check("holder present",       _has(text, "alice"))
+    ce_check("caps CSV",             _has(text, "nl:ask,kg:read"))
+    ce_check("revoked bit",          _has(text, "tok-carol-01 carol"))
+}
+
+fn test_serialize_caps_shape_only() {
+    let text = session_snapshot_serialize(0, _mk_cap_reg(), 0, 0, 0, 0)
+    ce_check("token_id placeholder", _has(text, "TOKEN - alice"))
+    ce_check("hides tok-alice-01",   _has(text, "tok-alice-01") == 0)
+    ce_check("hides tok-bob-01",     _has(text, "tok-bob-01")   == 0)
+}
+
+// ---- deserializer round-trip ------------------------------------------
+
+fn test_roundtrip_personas() {
+    let src = _mk_persona_reg()
+    let text = session_snapshot_serialize(src, 0, 0, 0, 1, 100)
+    let dst = persona_registry_new()
+    let r = session_snapshot_apply(text, dst, 0, 0, 0, 100)
+    ce_eq("apply ok",           snap_result_ok(r), 1)
+    ce_eq("2 personas loaded",  snap_result_personas(r), 2)
+    // Verify by lookup.
+    let a = persona_registry_lookup(dst, "alice")
+    ce_check("alice restored",  a != 0)
+    ce_eq("alice name",
+          str_eq_bytes(persona_name(a), "Alice"), 1)
+    let b = persona_registry_lookup(dst, "bob")
+    ce_check("bob restored",    b != 0)
+    ce_eq("bob purpose",
+          str_eq_bytes(persona_purpose(b), "second test persona"), 1)
+}
+
+fn test_roundtrip_trust_anchors() {
+    let src = _mk_trust_reg()
+    let text = session_snapshot_serialize(0, 0, src, 0, 1, 0)
+    let dst = trust_anchor_registry_new()
+    let r = session_snapshot_apply(text, 0, 0, dst, 0, 0)
+    ce_eq("2 anchors loaded",  snap_result_anchors(r), 2)
+    ce_eq("registry populated", trust_anchor_registry_count(dst), 2)
+    ce_eq("0xAA present",  trust_anchor_trusts(dst, _mk_pubkey(0xAA)), 1)
+    ce_eq("0xBB present",  trust_anchor_trusts(dst, _mk_pubkey(0xBB)), 1)
+    ce_eq("random absent", trust_anchor_trusts(dst, _mk_pubkey(0xCC)), 0)
+}
+
+fn test_roundtrip_ownership() {
+    let src = _mk_ownership()
+    let text = session_snapshot_serialize(0, 0, 0, src, 1, 0)
+    let dst = ownership_registry_new()
+    let r = session_snapshot_apply(text, 0, 0, 0, dst, 0)
+    ce_eq("3 entries loaded", snap_result_ownership(r), 3)
+    ce_eq("kg alice",
+          str_eq_bytes(ownership_owner(dst, OWN_KIND_KG, "alice_notebook"), "alice"), 1)
+    ce_eq("kg bob",
+          str_eq_bytes(ownership_owner(dst, OWN_KIND_KG, "bob_notebook"), "bob"), 1)
+    ce_eq("capsule alice",
+          str_eq_bytes(ownership_owner(dst, OWN_KIND_CAPSULE, "alice_pack"), "alice"), 1)
+}
+
+fn test_roundtrip_capabilities_with_secrets() {
+    let src = _mk_cap_reg()
+    let text = session_snapshot_serialize(0, src, 0, 0, 1, 0)
+    let dst = capability_registry_new()
+    let r = session_snapshot_apply(text, 0, dst, 0, 0, 0)
+    ce_eq("3 tokens loaded", snap_result_tokens(r), 3)
+    // Token ids preserved verbatim.
+    let t = capability_registry_lookup(dst, "tok-alice-01")
+    ce_check("alice token restored", t != 0)
+    ce_eq("holder alice",  str_eq_bytes(token_holder(t), "alice"), 1)
+    ce_eq("has nl:ask",    token_has_cap(t, CAP_NL_ASK), 1)
+    ce_eq("has kg:read",   token_has_cap(t, CAP_KG_READ), 1)
+    ce_eq("no skill:run",  token_has_cap(t, CAP_SKILL_RUN), 0)
+    // Bob expires_at preserved.
+    let tb = capability_registry_lookup(dst, "tok-bob-01")
+    ce_check("bob restored",  tb != 0)
+    ce_eq("bob expires 5000", token_expires_at(tb), 5000)
+    // Carol was revoked at save; must be revoked on load.
+    let tc = capability_registry_lookup(dst, "tok-carol-01")
+    ce_check("carol restored", tc != 0)
+    ce_eq("carol revoked",     token_revoked(tc), 1)
+    ce_eq("rekeyed empty (secrets present)",
+          len(snap_result_rekeyed(r)), 0)
+}
+
+fn test_roundtrip_capabilities_shape_only_rekeys() {
+    let src = _mk_cap_reg()
+    let text = session_snapshot_serialize(0, src, 0, 0, 0, 0)
+    let dst = capability_registry_new()
+    let r = session_snapshot_apply(text, 0, dst, 0, 0, 200)
+    ce_eq("3 tokens loaded", snap_result_tokens(r), 3)
+    ce_eq("3 rekeys",        len(snap_result_rekeyed(r)), 3)
+    // Old ids MUST be gone (shape-only hid them).
+    ce_eq("old alice id absent",
+          capability_registry_lookup(dst, "tok-alice-01"), 0)
+    // The rekey list carries (holder, new_id) pairs; new_id is a 32
+    // hex-char freshly minted string.
+    let pair = snap_result_rekeyed(r)[0]
+    let new_id = pair[1]
+    ce_eq("new_id is 32 chars", len(new_id), 32)
+    let t = capability_registry_lookup(dst, new_id)
+    ce_check("looked up under new id", t != 0)
+}
+
+fn test_roundtrip_full_state() {
+    // Every registry filled -> serialize -> apply to fresh empties.
+    let p_src = _mk_persona_reg()
+    let c_src = _mk_cap_reg()
+    let t_src = _mk_trust_reg()
+    let o_src = _mk_ownership()
+    let text = session_snapshot_serialize(p_src, c_src, t_src, o_src, 1, 42)
+    let p_dst = persona_registry_new()
+    let c_dst = capability_registry_new()
+    let t_dst = trust_anchor_registry_new()
+    let o_dst = ownership_registry_new()
+    let r = session_snapshot_apply(text, p_dst, c_dst, t_dst, o_dst, 100)
+    ce_eq("ok",        snap_result_ok(r),        1)
+    ce_eq("personas",  snap_result_personas(r),  2)
+    ce_eq("tokens",    snap_result_tokens(r),    3)
+    ce_eq("anchors",   snap_result_anchors(r),   2)
+    ce_eq("ownership", snap_result_ownership(r), 3)
+}
+
+// ---- deserializer refusal paths ---------------------------------------
+
+fn test_apply_empty_refuses() {
+    let r = session_snapshot_apply("", 0, 0, 0, 0, 0)
+    ce_eq("ok=0", snap_result_ok(r), 0)
+    ce_check("names empty", _has(snap_result_err(r), "empty snapshot"))
+}
+
+fn test_apply_bad_banner_refuses() {
+    let r = session_snapshot_apply("bad-header\n#PERSONA v1\n", 0, 0, 0, 0, 0)
+    ce_eq("ok=0", snap_result_ok(r), 0)
+    ce_check("names version", _has(snap_result_err(r), "bad version banner"))
+}
+
+fn test_apply_no_newline_refuses() {
+    let r = session_snapshot_apply("no-newline", 0, 0, 0, 0, 0)
+    ce_eq("ok=0", snap_result_ok(r), 0)
+    ce_check("names no newline", _has(snap_result_err(r), "no newline"))
+}
+
+fn test_apply_ignores_unknown_sections() {
+    let text = SNAP_VERSION_LINE + "\n#saved-at 0\n#UNKNOWN v1\nrandom junk\n"
+    let r = session_snapshot_apply(text, persona_registry_new(),
+                                    capability_registry_new(),
+                                    trust_anchor_registry_new(),
+                                    ownership_registry_new(), 0)
+    ce_eq("ok=1 (unknowns tolerated)", snap_result_ok(r), 1)
+    ce_eq("no personas loaded",  snap_result_personas(r), 0)
+}
+
+fn test_apply_missing_registry_skips_section() {
+    // Serialize a persona-only snapshot; apply with persona_reg=0.
+    let text = session_snapshot_serialize(_mk_persona_reg(), 0, 0, 0, 1, 0)
+    let r = session_snapshot_apply(text, 0, 0, 0, 0, 0)
+    ce_eq("ok=1",             snap_result_ok(r), 1)
+    ce_eq("0 personas loaded (registry absent)",
+          snap_result_personas(r), 0)
+}
+
+// ---- wire verb: capability gate ---------------------------------------
+
+fn _mk_ctx() {
+    let kgreg = kg_registry_new()
+    kg_spawn(kgreg, "world")
+    return rpc_ctx_new(kgreg, capreg_new(), _mk_persona_reg(),
+                        skill_registry_new(), mo_new(), 0, 0, 100)
+}
+
+fn _grant_admin(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-admin", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-admin")
+    return reg
+}
+
+fn _mk_arg1(k, v) {
+    let a = list_new() push(a, rpc_arg_kv(k, v)) return a
+}
+
+fn test_verbs_registered() {
+    let names = rpc_verb_names()
+    let has_save = 0
+    let has_load = 0
+    let i = 0
+    while i < len(names) {
+        if str_eq_bytes(names[i], "session.save") == 1 { has_save = 1 }
+        if str_eq_bytes(names[i], "session.load") == 1 { has_load = 1 }
+        i = i + 1
+    }
+    ce_eq("save registered", has_save, 1)
+    ce_eq("load registered", has_load, 1)
+}
+
+fn test_verbs_require_admin_session_cap() {
+    ce_eq("save -> admin:session",
+          str_eq_bytes(capability_verb_required("session.save"),
+                       CAP_ADMIN_SESSION), 1)
+    ce_eq("load -> admin:session",
+          str_eq_bytes(capability_verb_required("session.load"),
+                       CAP_ADMIN_SESSION), 1)
+}
+
+fn test_admin_has_session_cap() {
+    let caps = capability_role_expand("admin")
+    let saw = 0
+    let i = 0
+    while i < len(caps) {
+        if str_eq_bytes(caps[i], CAP_ADMIN_SESSION) == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("admin has admin:session", saw, 1)
+}
+
+fn test_reader_lacks_session_cap() {
+    let caps = capability_role_expand("reader")
+    let saw = 0
+    let i = 0
+    while i < len(caps) {
+        if str_eq_bytes(caps[i], CAP_ADMIN_SESSION) == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("reader lacks admin:session", saw, 0)
+}
+
+fn test_reader_cannot_call_save() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-r", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-r")
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save", _mk_arg1("name", "s1"), ctx)
+    ce_check("refused",           _has(out, "\"ok\":false"))
+    ce_check("names admin:session", _has(out, "capability required: admin:session"))
+}
+
+// ---- wire verb: refusal paths (no file I/O actually happens) ----------
+
+fn test_save_no_snapshot_dir_refuses() {
+    let ctx = _mk_ctx()
+    let out = rpc_dispatch("session.save", _mk_arg1("name", "s1"), ctx)
+    ce_check("names no dir", _has(out, "no snapshot directory configured"))
+}
+
+fn test_load_no_snapshot_dir_refuses() {
+    let ctx = _mk_ctx()
+    let out = rpc_dispatch("session.load", _mk_arg1("name", "s1"), ctx)
+    ce_check("names no dir", _has(out, "no snapshot directory configured"))
+}
+
+fn test_save_missing_name_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save", list_new(), ctx)
+    ce_check("names missing name", _has(out, "missing arg: name"))
+}
+
+fn test_save_traversal_slash_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save",
+        _mk_arg1("name", "../etc/passwd"), ctx)
+    ce_check("names slash refusal",
+             _has(out, "name contains '/' (traversal)"))
+}
+
+fn test_save_traversal_backslash_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save",
+        _mk_arg1("name", "..\\etc\\passwd"), ctx)
+    // Backslash appears JSON-escaped as \\ in the response text.
+    ce_check("names backslash refusal",
+             _has(out, "traversal"))
+}
+
+fn test_save_dotdot_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save", _mk_arg1("name", ".."), ctx)
+    ce_check("names ..", _has(out, "'..' rejected"))
+}
+
+fn test_save_leading_dot_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save", _mk_arg1("name", ".hidden"), ctx)
+    ce_check("names leading dot", _has(out, "may not start with '.'"))
+}
+
+fn test_save_disallowed_char_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save", _mk_arg1("name", "has space"), ctx)
+    ce_check("names disallowed char",
+             _has(out, "name contains disallowed char"))
+}
+
+fn test_save_empty_name_refuses() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.save", _mk_arg1("name", ""), ctx)
+    ce_check("names empty",       _has(out, "name must be non-empty"))
+}
+
+fn test_load_traversal_refuses_symmetric() {
+    let ctx = _mk_ctx()
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-snaps")
+    let out = rpc_dispatch("session.load",
+        _mk_arg1("name", "../secret"), ctx)
+    ce_check("names traversal", _has(out, "traversal"))
+}
+
+// ---- main -------------------------------------------------------------
+
+fn main() {
+    test_serialize_has_version_banner()
+    test_serialize_include_secrets_flag()
+    test_serialize_persona_section()
+    test_serialize_ownership_section()
+    test_serialize_trust_section()
+    test_serialize_caps_with_secrets()
+    test_serialize_caps_shape_only()
+    test_roundtrip_personas()
+    test_roundtrip_trust_anchors()
+    test_roundtrip_ownership()
+    test_roundtrip_capabilities_with_secrets()
+    test_roundtrip_capabilities_shape_only_rekeys()
+    test_roundtrip_full_state()
+    test_apply_empty_refuses()
+    test_apply_bad_banner_refuses()
+    test_apply_no_newline_refuses()
+    test_apply_ignores_unknown_sections()
+    test_apply_missing_registry_skips_section()
+    test_verbs_registered()
+    test_verbs_require_admin_session_cap()
+    test_admin_has_session_cap()
+    test_reader_lacks_session_cap()
+    test_reader_cannot_call_save()
+    test_save_no_snapshot_dir_refuses()
+    test_load_no_snapshot_dir_refuses()
+    test_save_missing_name_refuses()
+    test_save_traversal_slash_refuses()
+    test_save_traversal_backslash_refuses()
+    test_save_dotdot_refuses()
+    test_save_leading_dot_refuses()
+    test_save_disallowed_char_refuses()
+    test_save_empty_name_refuses()
+    test_load_traversal_refuses_symmetric()
+    ce_summary("session_snapshot")
+}
+
+main()

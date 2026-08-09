@@ -1,0 +1,531 @@
+// CrossEngin sandbox: session snapshot serialize / deserialize
+// (R55.3, ADR-0105 §Multi-user).
+//
+// Wraps four registries the daemon owns into one line-oriented text
+// dump the wire's session.save/session.load verbs read + write:
+//
+//   * persona_registry     -- per-user personas (delegates to
+//                              persona_export / persona_import)
+//   * capability_registry  -- live tokens (holder + caps + expiry +
+//                              revoked; token_id ONLY when
+//                              include_secrets = 1)
+//   * trust_anchor_registry (R54.2) -- ed25519 pubkeys, hex-encoded
+//   * ownership_registry (R55.2)    -- (kind, name, owner) triples
+//
+// The snapshot is a DAEMON-SHAPED state dump, not a full chat REPL
+// snapshot (that lives in src/persistence/snapshot_disk.nova and
+// integrates cognition-loop state the daemon doesn't own). What the
+// daemon does own, it persists; a chat REPL running alongside keeps
+// its own separate snapshots.
+//
+// SECURITY NOTE: token_ids are BEARER SECRETS. When
+// include_secrets = 1, the snapshot text contains live token_ids
+// verbatim and the file MUST be 0600-permissioned. When
+// include_secrets = 0 (the "shape only" mode), tokens are dumped
+// WITHOUT their ids; a session.load in that mode re-mints fresh
+// ids and returns holder -> new_id pairs for the operator to
+// redistribute. R55.3 ships the include_secrets=1 default; the
+// shape-only mode is available via the load-side "rekey" toggle.
+//
+// The format is versioned: `#CROSSENGIN-SESSION v1` on line 1.
+// Adding fields = new lines / directives; changing shape = bump
+// version to v2 with a parallel parser (v1 always readable).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/persona/persona.nova, src/persona/persona_registry.nova,
+//   src/persona/persona_export.nova,
+//   src/sandbox/capability.nova, src/sandbox/skill_signature.nova,
+//   src/sandbox/ownership.nova, src/util/str_safe.nova.
+
+import "../persona/persona.nova"
+import "../persona/persona_registry.nova"
+import "../persona/persona_export.nova"
+import "./capability.nova"
+import "./skill_signature.nova"
+import "./ownership.nova"
+import "../util/str_safe.nova"
+
+// ---- version constant --------------------------------------------------
+
+let SNAP_VERSION_LINE = "#CROSSENGIN-SESSION v1"
+
+// ---- byte -> hex + hex -> byte helpers ---------------------------------
+
+fn _snap_hex_nibble(n) {
+    if n < 10 { return chr(48 + n) }         // 0..9
+    return chr(87 + n)                        // a..f
+}
+
+fn _snap_bytes_to_hex(b) {
+    if b == 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < len(b) {
+        let x = b[i]
+        out = out + _snap_hex_nibble(x / 16)
+                   + _snap_hex_nibble(x - (x / 16) * 16)
+        i = i + 1
+    }
+    return out
+}
+
+fn _snap_hex_nibble_val(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }       // 0-9
+    if c >= 97 { if c <= 102 { return c - 87 } }       // a-f
+    if c >= 65 { if c <= 70  { return c - 55 } }       // A-F
+    return 0 - 1
+}
+
+// Hex string -> byte list. Returns 0 on odd length or non-hex chars.
+fn _snap_hex_to_bytes(s) {
+    let n = len(s)
+    if n == 0 { return 0 }
+    if (n / 2) * 2 != n { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < n {
+        let hi = _snap_hex_nibble_val(char_at(s, i))
+        let lo = _snap_hex_nibble_val(char_at(s, i + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        push(out, hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+// ---- caps CSV encoder/decoder -----------------------------------------
+
+fn _snap_caps_csv(caps) {
+    let s = ""
+    let i = 0
+    while i < len(caps) {
+        if i > 0 { s = s + "," }
+        s = s + caps[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Split "a,b,c" -> list<string>. Empty pieces dropped.
+fn _snap_split_csv(s) {
+    let out = list_new()
+    let n = len(s)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(s, i) == 44 { boundary = 1 } }
+        if boundary == 1 {
+            let piece = substr(s, start, i - start)
+            if len(piece) > 0 { push(out, piece) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- section builders --------------------------------------------------
+
+fn _snap_persona_section(persona_reg) {
+    if persona_reg == 0 { return "" }
+    let out = ""
+    let ps = persona_registry_personas(persona_reg)
+    let i = 0
+    while i < len(ps) {
+        out = out + "\n" + persona_export(ps[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _snap_ownership_section(overlay) {
+    if overlay == 0 { return "" }
+    let entries = ownership_entries(overlay)
+    if len(entries) == 0 { return "" }
+    let out = "\n#OWNERSHIP v1\n"
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        out = out + e[OWN_ENTRY_KIND] + " " + e[OWN_ENTRY_NAME]
+                  + " " + e[OWN_ENTRY_OWNER] + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+fn _snap_trust_section(trust_reg) {
+    if trust_reg == 0 { return "" }
+    let anchors = trust_anchor_registry_anchors(trust_reg)
+    if len(anchors) == 0 { return "" }
+    let out = "\n#TRUST v1\n"
+    let i = 0
+    while i < len(anchors) {
+        out = out + "ANCHOR " + _snap_bytes_to_hex(anchors[i]) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// Serialize tokens. `include_secrets`: 1 -> write token_id; 0 -> omit.
+fn _snap_caps_section(cap_reg, include_secrets) {
+    if cap_reg == 0 { return "" }
+    let tokens = capability_registry_tokens(cap_reg)
+    if len(tokens) == 0 { return "" }
+    let out = "\n#CAPS v1\n"
+    if include_secrets == 0 {
+        out = out + "# shape-only: token_ids omitted; loader mints fresh ids\n"
+    }
+    let i = 0
+    while i < len(tokens) {
+        let t = tokens[i]
+        let id_field = "-"
+        if include_secrets == 1 { id_field = token_id(t) }
+        let revoked_str = "0"
+        if token_revoked(t) == 1 { revoked_str = "1" }
+        out = out + "TOKEN " + id_field + " " + token_holder(t)
+                  + " " + _snap_caps_csv(token_caps(t))
+                  + " " + int_to_str(token_issued_at(t))
+                  + " " + int_to_str(token_expires_at(t))
+                  + " " + revoked_str + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// ---- public serialize --------------------------------------------------
+//
+// Compose one text dump of every registry passed. Any registry arg
+// that's 0 contributes no section (the version banner + timestamp
+// always render). `now` is the moment stamped on the header.
+fn session_snapshot_serialize(persona_reg, cap_reg, trust_reg,
+                              overlay, include_secrets, now) {
+    let out = SNAP_VERSION_LINE + "\n"
+    out = out + "#saved-at " + int_to_str(now) + "\n"
+    if include_secrets == 0 {
+        out = out + "#include-secrets 0\n"
+    } else {
+        out = out + "#include-secrets 1\n"
+    }
+    out = out + _snap_persona_section(persona_reg)
+    out = out + _snap_ownership_section(overlay)
+    out = out + _snap_trust_section(trust_reg)
+    out = out + _snap_caps_section(cap_reg, include_secrets)
+    return out
+}
+
+// ---- deserialize --------------------------------------------------------
+//
+// Parse the text back and apply to the passed-in registries IN PLACE.
+// Every registry arg that's 0 causes its section to be SKIPPED (a
+// snapshot with a persona section but no persona registry to load
+// into is a partial-load; caller supplies whichever registries they
+// have). `now` is the moment stamped on any newly-minted tokens
+// when the snapshot loaded shape-only tokens (include_secrets=0).
+//
+// Returns a result record:
+//   [ok, err_str, personas_loaded, anchors_loaded, tokens_loaded,
+//    ownership_entries_loaded, rekeyed_tokens (list of [holder,new_id])]
+//
+// A malformed line does NOT abort the whole parse; it counts as
+// dropped and the parse continues (returns ok=1 with a warning field).
+// Only a completely bad header (wrong version) yields ok=0.
+
+let SNAPRES_OK          = 0
+let SNAPRES_ERR         = 1
+let SNAPRES_PERSONAS    = 2
+let SNAPRES_ANCHORS     = 3
+let SNAPRES_TOKENS      = 4
+let SNAPRES_OWNERSHIP   = 5
+let SNAPRES_REKEYED     = 6
+let SNAPRES_SLOTS       = 7
+
+fn _snap_result_new() {
+    let r = list_new()
+    push(r, 0)                  // OK
+    push(r, "")                 // ERR
+    push(r, 0)                  // PERSONAS
+    push(r, 0)                  // ANCHORS
+    push(r, 0)                  // TOKENS
+    push(r, 0)                  // OWNERSHIP
+    push(r, list_new())         // REKEYED (holder, new_id pairs)
+    return r
+}
+
+fn snap_result_ok(r)         { return r[SNAPRES_OK] }
+fn snap_result_err(r)        { return r[SNAPRES_ERR] }
+fn snap_result_personas(r)   { return r[SNAPRES_PERSONAS] }
+fn snap_result_anchors(r)    { return r[SNAPRES_ANCHORS] }
+fn snap_result_tokens(r)     { return r[SNAPRES_TOKENS] }
+fn snap_result_ownership(r)  { return r[SNAPRES_OWNERSHIP] }
+fn snap_result_rekeyed(r)    { return r[SNAPRES_REKEYED] }
+
+// Split the whole dump into individual sections keyed by their header
+// marker (#PERSONA v1 / #OWNERSHIP v1 / #TRUST v1 / #CAPS v1). Returns
+// a list of [marker, body] pairs in the ORDER they appear.
+fn _snap_split_sections(text) {
+    let sections = list_new()
+    let n = len(text)
+    let cur_marker = ""
+    let cur_body = ""
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(text, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(text, start, i - start)
+            // A line starting with "#" AND matching one of our
+            // section markers begins a new section.
+            let is_marker = 0
+            if len(line) > 0 {
+                if char_at(line, 0) == 35 {         // '#'
+                    if str_eq_bytes(line, "#PERSONA v1")   == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#OWNERSHIP v1") == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#TRUST v1")     == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#CAPS v1")      == 1 { is_marker = 1 }
+                }
+            }
+            if is_marker == 1 {
+                // Flush current section (if any) into the list.
+                if len(cur_marker) > 0 {
+                    let pair = list_new()
+                    push(pair, cur_marker) push(pair, cur_body)
+                    push(sections, pair)
+                }
+                cur_marker = line
+                cur_body = ""
+            } else {
+                if len(cur_marker) > 0 {
+                    if len(cur_body) > 0 { cur_body = cur_body + "\n" }
+                    cur_body = cur_body + line
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if len(cur_marker) > 0 {
+        let pair = list_new()
+        push(pair, cur_marker) push(pair, cur_body)
+        push(sections, pair)
+    }
+    return sections
+}
+
+fn _snap_apply_persona(body, persona_reg) {
+    if persona_reg == 0 { return 0 }
+    // persona_import expects a full #PERSONA v1 block including the
+    // header (persona_export writes that shape). We drop back to the
+    // header + body.
+    let full = "#PERSONA v1\n" + body
+    let p = persona_import(full)
+    if p == 0 { return 0 }
+    // Register (last-write-wins for a duplicate user_id).
+    persona_registry_register(persona_reg, p)
+    return 1
+}
+
+fn _snap_apply_ownership(body, overlay) {
+    if overlay == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {         // skip comments
+                    // Format: "<kind> <name> <owner>"
+                    let sp1 = find_char(line, 32)
+                    if sp1 > 0 {
+                        let kind = substr(line, 0, sp1)
+                        let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                        let sp2 = find_char(rest, 32)
+                        if sp2 > 0 {
+                            let name  = substr(rest, 0, sp2)
+                            let owner = substr(rest, sp2 + 1, len(rest) - sp2 - 1)
+                            if ownership_set(overlay, kind, name, owner) == 1 {
+                                applied = applied + 1
+                            }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+fn _snap_apply_trust(body, trust_reg) {
+    if trust_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {
+                    // Format: "ANCHOR <hex64>"
+                    let sp = find_char(line, 32)
+                    if sp > 0 {
+                        let head = substr(line, 0, sp)
+                        if str_eq_bytes(head, "ANCHOR") == 1 {
+                            let hex = substr(line, sp + 1, len(line) - sp - 1)
+                            let pk = _snap_hex_to_bytes(hex)
+                            if pk != 0 {
+                                if trust_anchor_add(trust_reg, pk) == 1 {
+                                    applied = applied + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+// Parse a TOKEN line: "TOKEN <id-or-'-'> <holder> <caps-csv> <issued> <expires> <revoked>"
+// Returns [id_str, holder, caps_list, issued, expires, revoked] or 0.
+fn _snap_parse_token_line(line) {
+    let toks = list_new()
+    let n = len(line)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(line, i) == 32 { boundary = 1 } }
+        if boundary == 1 {
+            push(toks, substr(line, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if len(toks) < 7 { return 0 }
+    if str_eq_bytes(toks[0], "TOKEN") == 0 { return 0 }
+    let out = list_new()
+    push(out, toks[1])                      // id
+    push(out, toks[2])                      // holder
+    push(out, _snap_split_csv(toks[3]))     // caps
+    push(out, str_to_int(toks[4]))          // issued
+    push(out, str_to_int(toks[5]))          // expires
+    push(out, str_to_int(toks[6]))          // revoked
+    return out
+}
+
+fn _snap_apply_caps(body, cap_reg, now, result) {
+    if cap_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {
+                    let parts = _snap_parse_token_line(line)
+                    if parts != 0 {
+                        let raw_id = parts[0]
+                        let holder = parts[1]
+                        let caps   = parts[2]
+                        let issued = parts[3]
+                        let expires = parts[4]
+                        let revoked = parts[5]
+                        let tid = raw_id
+                        // "-" placeholder means the snapshot was
+                        // saved with include_secrets=0; mint a fresh
+                        // id and record the rekey.
+                        if str_eq_bytes(raw_id, "-") == 1 {
+                            tid = capability_token_id_mint()
+                            let rk = list_new()
+                            push(rk, holder) push(rk, tid)
+                            push(result[SNAPRES_REKEYED], rk)
+                        }
+                        let t = capability_token_new(tid, holder, caps,
+                                                     issued, expires)
+                        if revoked == 1 { list_set(t, TOK_REVOKED, 1) }
+                        capability_registry_add(cap_reg, t)
+                        applied = applied + 1
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+// The public deserialize entry point. Consumes `text`, applies each
+// section to its matching (non-null) registry. `now` is used for
+// freshly-minted token ids on shape-only snapshots.
+fn session_snapshot_apply(text, persona_reg, cap_reg, trust_reg,
+                          overlay, now) {
+    let r = _snap_result_new()
+    if len(text) == 0 {
+        list_set(r, SNAPRES_ERR, "empty snapshot text")
+        return r
+    }
+    // Version banner MUST be the first line.
+    let nl = find_char(text, 10)
+    if nl < 0 {
+        list_set(r, SNAPRES_ERR, "no newline in snapshot")
+        return r
+    }
+    let first_line = substr(text, 0, nl)
+    if str_eq_bytes(first_line, SNAP_VERSION_LINE) == 0 {
+        list_set(r, SNAPRES_ERR, "bad version banner (want " + SNAP_VERSION_LINE + ")")
+        return r
+    }
+    // Walk sections and apply each to its target registry.
+    let sections = _snap_split_sections(text)
+    let i = 0
+    while i < len(sections) {
+        let s = sections[i]
+        let marker = s[0]
+        let body   = s[1]
+        if str_eq_bytes(marker, "#PERSONA v1") == 1 {
+            let a = _snap_apply_persona(body, persona_reg)
+            list_set(r, SNAPRES_PERSONAS, r[SNAPRES_PERSONAS] + a)
+        }
+        if str_eq_bytes(marker, "#OWNERSHIP v1") == 1 {
+            let a = _snap_apply_ownership(body, overlay)
+            list_set(r, SNAPRES_OWNERSHIP, r[SNAPRES_OWNERSHIP] + a)
+        }
+        if str_eq_bytes(marker, "#TRUST v1") == 1 {
+            let a = _snap_apply_trust(body, trust_reg)
+            list_set(r, SNAPRES_ANCHORS, r[SNAPRES_ANCHORS] + a)
+        }
+        if str_eq_bytes(marker, "#CAPS v1") == 1 {
+            let a = _snap_apply_caps(body, cap_reg, now, r)
+            list_set(r, SNAPRES_TOKENS, r[SNAPRES_TOKENS] + a)
+        }
+        i = i + 1
+    }
+    list_set(r, SNAPRES_OK, 1)
+    return r
+}

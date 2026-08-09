@@ -83,6 +83,7 @@ import "../parts/meta/meta_observer.nova"
 import "../sandbox/capability.nova"
 import "../sandbox/skill_signature.nova"
 import "../sandbox/ownership.nova"
+import "../sandbox/session_snapshot.nova"
 import "../util/str_safe.nova"
 
 // ---- RpcContext slot layout ---------------------------------------------
@@ -107,7 +108,9 @@ let RCTX_SIGNED_ENFORCED = 12  // 0/1 -- CE_RPC_REQUIRE_SIGNED_SKILL gate
 let RCTX_OWNERSHIP    = 13     // ownership_registry (may be 0);
                                 //   when 0, kg.list / capsule.list
                                 //   return everything (backward-compat)
-let RCTX_SLOTS        = 14
+// R55.3 session snapshot directory (from CE_RPC_SNAPSHOT_DIR).
+let RCTX_SNAPSHOT_DIR = 14     // absolute path; "" = feature off
+let RCTX_SLOTS        = 15
 
 fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
                ingest_agent, review_queue, now) {
@@ -126,6 +129,7 @@ fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
     push(c, 0)          // TRUST_ANCHORS (0 = no signed-skill sandbox)
     push(c, 0)          // SIGNED_ENFORCED (0 = off, backward-compat)
     push(c, 0)          // OWNERSHIP (0 = no filter; fully-visible)
+    push(c, "")         // SNAPSHOT_DIR (empty = session.* refuse)
     return c
 }
 
@@ -163,6 +167,15 @@ fn rpc_ctx_set_ownership(ctx, overlay) {
     return ctx
 }
 
+// R55.3 mutator: wire a snapshot directory. Once set, session.save
+// and session.load accept a bare filename (no path separators);
+// path is resolved as `<dir>/<name>.snap`. Absent this, both verbs
+// refuse cleanly with "no snapshot directory configured".
+fn rpc_ctx_set_snapshot_dir(ctx, dir) {
+    list_set(ctx, RCTX_SNAPSHOT_DIR, dir)
+    return ctx
+}
+
 // Convenience accessors (used by dispatch below; also stable for
 // clients that want to introspect a context they've built).
 fn rpc_ctx_kgreg(c)         { return c[RCTX_KGREG] }
@@ -179,6 +192,7 @@ fn rpc_ctx_presented_token(c)  { return c[RCTX_PRESENTED_TOKEN] }
 fn rpc_ctx_trust_anchors(c)    { return c[RCTX_TRUST_ANCHORS] }
 fn rpc_ctx_signed_enforced(c)  { return c[RCTX_SIGNED_ENFORCED] }
 fn rpc_ctx_ownership(c)        { return c[RCTX_OWNERSHIP] }
+fn rpc_ctx_snapshot_dir(c)     { return c[RCTX_SNAPSHOT_DIR] }
 
 // R55.2 helper: resolve the presented token to its holder string.
 // Returns "" (anonymous) when there's no token, no cap registry, or
@@ -1014,6 +1028,225 @@ fn _rpc_verb_capability_list(args, ctx) {
     return _rpc_ok(_rpc_arr(frags))
 }
 
+// ---- session lifecycle verbs (R55.3, ADR-0105) --------------------------
+//
+// session.save + session.load persist / restore the DAEMON-shaped
+// state (personas + capability tokens + trust anchors + ownership
+// overlay). NOT a full chat REPL snapshot -- that lives in
+// src/persistence/snapshot_disk.nova. Both verbs require
+// admin:session capability; admin role carries it, others don't.
+//
+// Path sandbox: CE_RPC_SNAPSHOT_DIR configures a directory; verbs
+// accept a bare `name` (no path separators) and the daemon composes
+// `<dir>/<name>.snap`. Traversal attempts (name with '/' or '..')
+// are refused before any file I/O.
+
+// Validate a snapshot name: non-empty, no path separators, no NUL,
+// no leading dot (so ".snap" alone doesn't hide the file), no
+// "..". Returns "" on OK, refusal string on error.
+fn _rpc_snap_name_check(name) {
+    if len(name) == 0 { return "name must be non-empty" }
+    if len(name) > 64 { return "name too long (max 64 chars)" }
+    let i = 0
+    while i < len(name) {
+        let c = char_at(name, i)
+        // Refuse '/' (47), '\' (92), NUL (0). Allow letters/digits/
+        // '-'/'_'/'.'; other chars refused for path-parser safety.
+        if c == 0                { return "name contains NUL byte" }
+        if c == 47               { return "name contains '/' (traversal)" }
+        if c == 92               { return "name contains '\\' (traversal)" }
+        // Wordchar-ish allowlist.
+        let ok = 0
+        if c == 45 { ok = 1 }        // '-'
+        if c == 46 { ok = 1 }        // '.'
+        if c == 95 { ok = 1 }        // '_'
+        if c >= 48 { if c <= 57  { ok = 1 } }
+        if c >= 65 { if c <= 90  { ok = 1 } }
+        if c >= 97 { if c <= 122 { ok = 1 } }
+        if ok == 0 { return "name contains disallowed char" }
+        i = i + 1
+    }
+    // Reject "." and ".." explicitly.
+    if str_eq_bytes(name, ".")  == 1 { return "name '.' rejected" }
+    if str_eq_bytes(name, "..") == 1 { return "name '..' rejected" }
+    // Refuse a leading dot so ".snap" isn't a hidden file.
+    if char_at(name, 0) == 46 { return "name may not start with '.'" }
+    return ""
+}
+
+// Compose the on-disk path from the ctx's snapshot dir + bare name.
+fn _rpc_snap_path(ctx, name) {
+    let dir = rpc_ctx_snapshot_dir(ctx)
+    // Ensure a trailing '/' (dir may or may not have one already).
+    let n = len(dir)
+    let slash = "/"
+    if n > 0 { if char_at(dir, n - 1) == 47 { slash = "" } }
+    return dir + slash + name + ".snap"
+}
+
+// Write `text` bytes to `path` atomically. Uses tmp + rename shape
+// mirroring src/persistence/snapshot_disk._snap_write_atomic; kept
+// local so this module doesn't pull snapshot_disk's heavy graph.
+fn _rpc_snap_write(path, text) {
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let tmp = path + ".tmp"
+    let fd = sys_open(tmp, flags, 384)   // 0600 in decimal
+    if fd < 0 { return 0 }
+    let n = len(text)
+    let written = sys_write(fd, text, n)
+    sys_close(fd)
+    if written != n { return 0 }
+    let rn = sys_rename(tmp, path)
+    if rn < 0 { return 0 }
+    return 1
+}
+
+// Read the whole file at `path` into a NOVA string. Returns "" on
+// any failure (missing / unreadable / oversize).
+fn _rpc_snap_read(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return "" }
+    // Read in chunks. Hard-cap at 4 MiB total (a persona + tokens +
+    // anchors + overlay snapshot is small; a 4 MiB cap protects
+    // against a mis-configured dir pointing at a huge file).
+    let cap = 4194304
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        if len(acc) >= cap { done = 1 }
+        else {
+            let buf = alloc(4097)
+            let m = sys_read(fd, buf, 4096)
+            if m <= 0 { done = 1 }
+            else {
+                let piece = ""
+                let i = 0
+                while i < m {
+                    piece = piece + chr(load8(buf + i))
+                    i = i + 1
+                }
+                acc = acc + piece
+            }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// session.save -- write a snapshot to <snapshot_dir>/<name>.snap.
+//   args: {name, include_secrets? (int str; default "1")}
+//   returns: {name, path, bytes, personas, tokens, anchors, ownership_entries}
+fn _rpc_verb_session_save(args, ctx) {
+    let dir = rpc_ctx_snapshot_dir(ctx)
+    if len(dir) == 0 {
+        return _rpc_err("no snapshot directory configured")
+    }
+    if _rpc_has_arg(args, "name") == 0 {
+        return _rpc_err("missing arg: name")
+    }
+    let name = _rpc_arg(args, "name")
+    let name_err = _rpc_snap_name_check(name)
+    if len(name_err) > 0 { return _rpc_err(name_err) }
+    let include_secrets = 1
+    if _rpc_has_arg(args, "include_secrets") == 1 {
+        let v = _rpc_arg(args, "include_secrets")
+        if str_eq_bytes(v, "0") == 1 { include_secrets = 0 }
+    }
+    let text = session_snapshot_serialize(
+        rpc_ctx_persona_reg(ctx),
+        rpc_ctx_cap_reg(ctx),
+        rpc_ctx_trust_anchors(ctx),
+        rpc_ctx_ownership(ctx),
+        include_secrets,
+        rpc_ctx_now(ctx))
+    let path = _rpc_snap_path(ctx, name)
+    let ok = _rpc_snap_write(path, text)
+    if ok == 0 {
+        return _rpc_err("write failed to " + path)
+    }
+    // Count summary fields from the ORIGINAL registries (cheap).
+    let n_personas = 0
+    if rpc_ctx_persona_reg(ctx) != 0 {
+        n_personas = len(persona_registry_personas(rpc_ctx_persona_reg(ctx)))
+    }
+    let n_tokens = 0
+    if rpc_ctx_cap_reg(ctx) != 0 {
+        n_tokens = capability_registry_count(rpc_ctx_cap_reg(ctx))
+    }
+    let n_anchors = 0
+    if rpc_ctx_trust_anchors(ctx) != 0 {
+        n_anchors = len(trust_anchor_registry_anchors(rpc_ctx_trust_anchors(ctx)))
+    }
+    let n_own = 0
+    if rpc_ctx_ownership(ctx) != 0 {
+        n_own = ownership_registry_count(rpc_ctx_ownership(ctx))
+    }
+    let kv = list_new()
+    let a = list_new() push(a, "name")              push(a, _rpc_str(name))               push(kv, a)
+    let b = list_new() push(b, "path")              push(b, _rpc_str(path))               push(kv, b)
+    let c = list_new() push(c, "bytes")             push(c, _rpc_int(len(text)))          push(kv, c)
+    let d = list_new() push(d, "personas")          push(d, _rpc_int(n_personas))         push(kv, d)
+    let e = list_new() push(e, "tokens")            push(e, _rpc_int(n_tokens))           push(kv, e)
+    let f = list_new() push(f, "anchors")           push(f, _rpc_int(n_anchors))          push(kv, f)
+    let g = list_new() push(g, "ownership_entries") push(g, _rpc_int(n_own))              push(kv, g)
+    let h = list_new() push(h, "include_secrets")   push(h, _rpc_bool(include_secrets))   push(kv, h)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// session.load -- read + apply a snapshot from <snapshot_dir>/<name>.snap.
+//   args: {name}
+//   returns: {name, path, personas, tokens, anchors, ownership_entries,
+//             rekeyed: [[holder, new_token_id], ...]}
+fn _rpc_verb_session_load(args, ctx) {
+    let dir = rpc_ctx_snapshot_dir(ctx)
+    if len(dir) == 0 {
+        return _rpc_err("no snapshot directory configured")
+    }
+    if _rpc_has_arg(args, "name") == 0 {
+        return _rpc_err("missing arg: name")
+    }
+    let name = _rpc_arg(args, "name")
+    let name_err = _rpc_snap_name_check(name)
+    if len(name_err) > 0 { return _rpc_err(name_err) }
+    let path = _rpc_snap_path(ctx, name)
+    let text = _rpc_snap_read(path)
+    if len(text) == 0 {
+        return _rpc_err("read failed or empty: " + path)
+    }
+    let r = session_snapshot_apply(text,
+        rpc_ctx_persona_reg(ctx),
+        rpc_ctx_cap_reg(ctx),
+        rpc_ctx_trust_anchors(ctx),
+        rpc_ctx_ownership(ctx),
+        rpc_ctx_now(ctx))
+    if snap_result_ok(r) == 0 {
+        return _rpc_err("snapshot apply failed: " + snap_result_err(r))
+    }
+    // Rekeyed pairs: emitted only when the snapshot was saved with
+    // include_secrets=0 and the loader minted fresh token_ids. The
+    // operator uses this to redistribute the new tokens.
+    let rekeyed = snap_result_rekeyed(r)
+    let rekey_frags = list_new()
+    let i = 0
+    while i < len(rekeyed) {
+        let pair = rekeyed[i]
+        let kv = list_new()
+        let p1 = list_new() push(p1, "holder")       push(p1, _rpc_str(pair[0])) push(kv, p1)
+        let p2 = list_new() push(p2, "new_token_id") push(p2, _rpc_str(pair[1])) push(kv, p2)
+        push(rekey_frags, _rpc_obj(kv))
+        i = i + 1
+    }
+    let kv = list_new()
+    let a = list_new() push(a, "name")              push(a, _rpc_str(name))                        push(kv, a)
+    let b = list_new() push(b, "path")              push(b, _rpc_str(path))                        push(kv, b)
+    let c = list_new() push(c, "personas")          push(c, _rpc_int(snap_result_personas(r)))     push(kv, c)
+    let d = list_new() push(d, "tokens")            push(d, _rpc_int(snap_result_tokens(r)))       push(kv, d)
+    let e = list_new() push(e, "anchors")           push(e, _rpc_int(snap_result_anchors(r)))      push(kv, e)
+    let f = list_new() push(f, "ownership_entries") push(f, _rpc_int(snap_result_ownership(r)))    push(kv, f)
+    let g = list_new() push(g, "rekeyed")           push(g, _rpc_arr(rekey_frags))                 push(kv, g)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
 // ---- top-level dispatch --------------------------------------------------
 
 // The one entry point a daemon calls. `verb` is the verb name string;
@@ -1053,6 +1286,8 @@ fn rpc_dispatch(verb, args, ctx) {
     if str_eq_bytes(verb, "capability.issue")  == 1 { return _rpc_verb_capability_issue(args, ctx) }
     if str_eq_bytes(verb, "capability.revoke") == 1 { return _rpc_verb_capability_revoke(args, ctx) }
     if str_eq_bytes(verb, "capability.list")   == 1 { return _rpc_verb_capability_list(args, ctx) }
+    if str_eq_bytes(verb, "session.save")      == 1 { return _rpc_verb_session_save(args, ctx) }
+    if str_eq_bytes(verb, "session.load")      == 1 { return _rpc_verb_session_load(args, ctx) }
     return _rpc_err("unknown verb: " + verb)
 }
 
@@ -1077,5 +1312,7 @@ fn rpc_verb_names() {
     push(v, "capability.issue")
     push(v, "capability.revoke")
     push(v, "capability.list")
+    push(v, "session.save")
+    push(v, "session.load")
     return v
 }
