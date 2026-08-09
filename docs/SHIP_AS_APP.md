@@ -410,10 +410,50 @@ installs a pre-registered built-in — no signature required. That
 covers the single-user local case where the operator implicitly
 trusts the daemon binary itself.
 
-## 12. What comes next (R55.2+)
+### 7.9 Per-user KG + capsule ownership (R55.2)
 
-- **R55.2** — Per-user KG isolation: token holder scopes which
-  KGs / capsules are visible on `kg.list` / `capsule.list`
+When a shared daemon holds resources for multiple users, mark them
+owned so each holder only sees their own on `kg.list` /
+`capsule.list`. The overlay is a side-registry — kg_manager and
+capsule_registry stay untouched; ownership marks are additive.
+
+```nova
+// At daemon boot (before the accept loop), in a small NOVA helper:
+let ownership = ownership_registry_new()
+ownership_set_kg(ownership, "alice_notebook", "alice")
+ownership_set_kg(ownership, "bob_notebook",   "bob")
+ownership_set_capsule(ownership, "alice_private", "alice")
+// "world" and other unset KGs stay public (every holder sees them).
+rpc_ctx_set_ownership(ctx, ownership)
+```
+
+Then over the wire:
+
+```bash
+# Alice's token -> sees world + alice_notebook, NOT bob_notebook.
+CE_RPC_TOKEN=$ALICE_TOKEN scripts/rpc.sh kg.list
+# {"ok":true,"result":["world","alice_notebook"],"error":""}
+
+# Bob's token -> sees world + bob_notebook, NOT alice_notebook.
+CE_RPC_TOKEN=$BOB_TOKEN scripts/rpc.sh kg.list
+# {"ok":true,"result":["world","bob_notebook"],"error":""}
+```
+
+**Rule** (in `src/sandbox/ownership.nova`):
+- No overlay wired → nothing filtered (backward compat).
+- Resource unset in overlay → visible to everyone (public).
+- Resource has an owner → visible only to that exact holder.
+  Anonymous callers (no valid token) see ONLY unset/public.
+
+Ownership is a wire-visible filter, not a hard-gate. A capability
+gate + skill_run is still what enforces execution boundaries; the
+overlay only decides what's LISTED. Wire-transmitted skills
+(R55.1) don't consult the overlay yet — a signed install lands as
+a shared resource. R56+ can extend ownership to skills if
+per-user skill scoping is needed.
+
+## 12. What comes next (R55.3+)
+
 - **R55.3** — Snapshot round-trip via wire: `session.save` /
   `session.load` verbs so a client can persist per-user state
   without dropping into the chat REPL
