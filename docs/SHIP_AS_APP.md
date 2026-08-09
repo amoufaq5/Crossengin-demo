@@ -269,10 +269,36 @@ one required capability.
 Built-in **roles** bundle common capability sets: `admin` (all),
 `reader` (read-only), `skill_user` (reader + skill:run), `curator`
 (reader + capsule:install + ingest), `service` (nl:ask + skill:run).
-`R55+` will add wire verbs to mint child tokens from admin; for R54
-the admin token is the bootstrap and additional tokens are minted
-in-process from a separate program that imports
-`src/sandbox/capability.nova`.
+
+**R55 wire verbs** let an admin token mint / revoke / list child
+tokens over the wire (no in-process program needed):
+
+```bash
+# Mint alice a skill_user token that expires at moment 100000.
+CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token) \
+scripts/rpc.sh capability.issue \
+  '{"holder":"alice","roles":"skill_user","expires_at":"100000"}'
+# -> {"ok":true,"result":{"token_id":"...","holder":"alice",
+#      "caps":["nl:ask","kg:read","capsule:read","skill:read",
+#              "persona:read","skill:run"],
+#      "issued_at":..., "expires_at":100000}}
+
+# Alice's client sets that id as its CE_RPC_TOKEN and can now
+# call nl.ask + skill.run but not skill.install or capability.*.
+
+# Revoke alice's token immediately.
+CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token) \
+scripts/rpc.sh capability.revoke '{"token_id":"..."}'
+
+# Audit -- list every live token (holder + caps + expiry only;
+# never the token_id itself, since that's a bearer secret).
+CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token) \
+scripts/rpc.sh capability.list
+```
+
+All three verbs require the `admin:sandbox` capability. Only the
+`admin` role carries it by default. A `reader` / `skill_user` /
+`curator` / `service` token cannot mint new tokens.
 
 Refusal shape for a request without a required cap:
 
@@ -341,12 +367,19 @@ The RPC daemon does NOT yet expose these via the wire (deferred to
 R51+ under `session.save` / `session.load` verbs). For now, chat and
 daemon are separate processes with their own in-memory state.
 
-## 12. What comes next (R55+)
+## 12. What comes next (R55.x+)
 
-- **R55** — Multi-user daemon: session slots per user, per-session
-  DP accounting, snapshot round-trip via wire, `capability.issue`
-  wire verb to mint child tokens from admin, and skill.install
-  verb wiring for the R54.2 signature primitive
+- **R55.1** — `skill.install` wire integration for the R54.2 signature
+  primitive: accept a `SkillPackage` args payload
+  (manifest_json + signer_pk_hex + signature_hex) under
+  `CE_RPC_REQUIRE_SIGNED_SKILL=1`; refuse unsigned / untrusted-signed
+- **R55.2** — Per-user KG isolation: token holder scopes which
+  KGs / capsules are visible on `kg.list` / `capsule.list`
+- **R55.3** — Snapshot round-trip via wire: `session.save` /
+  `session.load` verbs so a client can persist per-user state
+  without dropping into the chat REPL
+- **R56+** — Rate limits per capability, in-process TLS,
+  hardware-key-backed admin bootstrap
 - **R56+** — Rate limits per capability, in-process TLS,
   hardware-key-backed admin bootstrap
 
