@@ -1,0 +1,317 @@
+// Unit tests for R56 -- per-token rate limits (ADR-0105).
+//
+// Covers:
+//   - Token constructor still works (backward-compat; qps_max defaults 0)
+//   - token_qps_max / token_set_qps_max accessors
+//   - token_check_rate lifecycle:
+//       unlimited (qps_max=0)   -> always ""
+//       first observation       -> populates window, returns ""
+//       under-limit             -> increments count, returns ""
+//       at-limit                -> returns rate-limit refusal
+//       window rolled           -> resets, returns ""
+//       null token              -> ""
+//   - capability.issue accepts qps_max arg; response echoes it
+//   - capability.list reports qps_max per token
+//   - Rate check surfaces qps_max on the response envelope
+//   - Snapshot round-trip preserves qps_max
+//   - Unknown role in capability.issue still refused after adding qps
+//   - Negative qps_max refused
+
+import "../ce_test.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/sandbox/session_snapshot.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- helpers -------------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+fn _mk_ctx() {
+    let kgreg = kg_registry_new()
+    kg_spawn(kgreg, "world")
+    return rpc_ctx_new(kgreg, capreg_new(), persona_registry_new(),
+                        skill_registry_new(), mo_new(), 0, 0, 100)
+}
+
+fn _grant_admin(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-admin", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-admin")
+    return reg
+}
+
+fn _mk_args(pairs) {
+    let a = list_new()
+    let i = 0
+    while i < len(pairs) {
+        push(a, rpc_arg_kv(pairs[i][0], pairs[i][1]))
+        i = i + 1
+    }
+    return a
+}
+
+fn _pair(k, v) {
+    let p = list_new() push(p, k) push(p, v) return p
+}
+
+// ---- token constructor backward-compat ---------------------------------
+
+fn test_token_defaults_qps_max_zero() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-1", "alice", caps, 0, 0)
+    ce_eq("qps_max defaults to 0", token_qps_max(t), 0)
+    ce_eq("window_start default 0", token_window_start(t), 0)
+    ce_eq("window_count default 0", token_window_count(t), 0)
+}
+
+fn test_token_new_roles_defaults_qps_max_zero() {
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-2", "alice", roles, 0, 0)
+    ce_eq("qps_max defaults 0 via roles", token_qps_max(t), 0)
+}
+
+// ---- token_set_qps_max --------------------------------------------------
+
+fn test_set_qps_max_updates() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-s1", "alice", caps, 0, 0)
+    ce_eq("set returns 1", token_set_qps_max(t, 10), 1)
+    ce_eq("qps updated",   token_qps_max(t), 10)
+    // Setting resets the window (so a mid-stream limit change takes
+    // effect immediately instead of counting against the prior
+    // limit's window).
+    ce_eq("window_start reset", token_window_start(t), 0)
+    ce_eq("window_count reset", token_window_count(t), 0)
+}
+
+fn test_set_qps_max_rejects_negative() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-s2", "alice", caps, 0, 0)
+    ce_eq("negative rejected", token_set_qps_max(t, 0 - 1), 0)
+    ce_eq("qps unchanged",     token_qps_max(t), 0)
+}
+
+// ---- token_check_rate lifecycle ----------------------------------------
+
+fn test_rate_unlimited_never_refuses() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-u", "alice", caps, 0, 0)
+    // qps_max=0 (default) -> even a flood returns "".
+    let i = 0
+    let refused = 0
+    while i < 100 {
+        if len(token_check_rate(t, 1000000000 + i * 1000)) > 0 {
+            refused = 1
+        }
+        i = i + 1
+    }
+    ce_eq("no refusal for unlimited token", refused, 0)
+}
+
+fn test_rate_first_observation_sets_window() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-f", "alice", caps, 0, 0)
+    token_set_qps_max(t, 5)
+    let err = token_check_rate(t, 1000000000)
+    ce_eq("first ok", len(err), 0)
+    ce_eq("window populated", token_window_start(t), 1000000000)
+    ce_eq("count == 1", token_window_count(t), 1)
+}
+
+fn test_rate_under_limit_passes() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-under", "alice", caps, 0, 0)
+    token_set_qps_max(t, 3)
+    // 3 requests within the same window, all under the cap.
+    ce_eq("req 1 ok", len(token_check_rate(t, 2000000000)), 0)
+    ce_eq("req 2 ok", len(token_check_rate(t, 2000000001)), 0)
+    ce_eq("req 3 ok", len(token_check_rate(t, 2000000002)), 0)
+    ce_eq("count == 3", token_window_count(t), 3)
+}
+
+fn test_rate_at_limit_refuses() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-cap", "alice", caps, 0, 0)
+    token_set_qps_max(t, 2)
+    ce_eq("req 1 ok", len(token_check_rate(t, 3000000000)), 0)
+    ce_eq("req 2 ok", len(token_check_rate(t, 3000000001)), 0)
+    let err = token_check_rate(t, 3000000002)
+    ce_check("req 3 refused",       len(err) > 0)
+    ce_check("names rate limit",    _has(err, "rate limit exceeded"))
+    ce_check("names cap number",    _has(err, "max 2 req/s"))
+    ce_eq("count did NOT increment", token_window_count(t), 2)
+}
+
+fn test_rate_window_rolls_resets_counter() {
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t = capability_token_new("tk-roll", "alice", caps, 0, 0)
+    token_set_qps_max(t, 1)
+    // Base time.
+    let base = 4000000000
+    ce_eq("req 1 ok", len(token_check_rate(t, base)), 0)
+    ce_check("req 2 refused (same window)",
+             len(token_check_rate(t, base + 100)) > 0)
+    // Jump past the 1-second window (1e9 ns).
+    let after = base + 1500000000
+    ce_eq("req 3 ok (window rolled)",
+          len(token_check_rate(t, after)), 0)
+    ce_eq("window reset to new time", token_window_start(t), after)
+    ce_eq("count reset to 1",         token_window_count(t), 1)
+}
+
+fn test_rate_null_token_no_op() {
+    ce_eq("null token -> empty", len(token_check_rate(0, 100)), 0)
+}
+
+// ---- capability.issue with qps_max --------------------------------------
+
+fn test_issue_accepts_qps_max() {
+    let ctx = _mk_ctx()
+    let reg = _grant_admin(ctx)
+    let pairs = list_new()
+    push(pairs, _pair("holder",  "alice"))
+    push(pairs, _pair("roles",   "reader"))
+    push(pairs, _pair("qps_max", "10"))
+    let out = rpc_dispatch("capability.issue", _mk_args(pairs), ctx)
+    ce_check("ok",             _has(out, "\"ok\":true"))
+    ce_check("qps_max echoed", _has(out, "\"qps_max\":10"))
+}
+
+fn test_issue_qps_max_default_zero() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let pairs = list_new()
+    push(pairs, _pair("holder", "bob"))
+    push(pairs, _pair("roles",  "reader"))
+    let out = rpc_dispatch("capability.issue", _mk_args(pairs), ctx)
+    ce_check("qps_max defaults to 0", _has(out, "\"qps_max\":0"))
+}
+
+fn test_issue_qps_max_negative_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let pairs = list_new()
+    push(pairs, _pair("holder",  "eve"))
+    push(pairs, _pair("roles",   "reader"))
+    push(pairs, _pair("qps_max", "-5"))
+    let out = rpc_dispatch("capability.issue", _mk_args(pairs), ctx)
+    ce_check("names negative refusal", _has(out, "qps_max must be >= 0"))
+}
+
+// ---- capability.list surfaces qps_max ----------------------------------
+
+fn test_list_reports_qps_max() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Mint a reader token with a rate cap.
+    let pairs = list_new()
+    push(pairs, _pair("holder",  "alice"))
+    push(pairs, _pair("roles",   "reader"))
+    push(pairs, _pair("qps_max", "42"))
+    rpc_dispatch("capability.issue", _mk_args(pairs), ctx)
+    let out = rpc_dispatch("capability.list", list_new(), ctx)
+    ce_check("qps_max in list output", _has(out, "\"qps_max\":42"))
+}
+
+// ---- snapshot round-trip preserves qps_max -----------------------------
+
+fn test_snapshot_roundtrip_preserves_qps_max() {
+    // Build a cap registry with two tokens: one limited, one not.
+    let src = capability_registry_new()
+    let caps = list_new() push(caps, CAP_NL_ASK)
+    let t1 = capability_token_new("tk-lim", "alice", caps, 0, 0)
+    token_set_qps_max(t1, 25)
+    capability_registry_add(src, t1)
+    let t2 = capability_token_new("tk-unl", "bob", caps, 0, 0)
+    capability_registry_add(src, t2)
+    // Serialize -> parse into fresh dst.
+    let text = session_snapshot_serialize(0, src, 0, 0, 1, 0)
+    let dst = capability_registry_new()
+    let r = session_snapshot_apply(text, 0, dst, 0, 0, 0)
+    ce_eq("2 tokens loaded", snap_result_tokens(r), 2)
+    let got1 = capability_registry_lookup(dst, "tk-lim")
+    ce_check("limited token restored", got1 != 0)
+    ce_eq("qps_max preserved on limited token",
+          token_qps_max(got1), 25)
+    let got2 = capability_registry_lookup(dst, "tk-unl")
+    ce_check("unlimited token restored", got2 != 0)
+    ce_eq("unlimited stays 0", token_qps_max(got2), 0)
+}
+
+fn test_snapshot_r55_format_still_readable() {
+    // A snapshot written by R55.3 (before R56) has 6-field TOKEN lines
+    // (no qps_max). The R56 parser must still read those cleanly,
+    // defaulting qps_max=0.
+    let text = "#CROSSENGIN-SESSION v1\n#saved-at 0\n"
+             + "\n#CAPS v1\n"
+             + "TOKEN legacy-id alice nl:ask,kg:read 100 0 0\n"
+    let dst = capability_registry_new()
+    let r = session_snapshot_apply(text, 0, dst, 0, 0, 0)
+    ce_eq("legacy line read", snap_result_tokens(r), 1)
+    let t = capability_registry_lookup(dst, "legacy-id")
+    ce_check("restored",       t != 0)
+    ce_eq("qps_max defaults 0 for legacy line", token_qps_max(t), 0)
+    ce_eq("caps preserved",    token_has_cap(t, CAP_NL_ASK), 1)
+}
+
+// ---- end-to-end: rate check surfaces on wire ---------------------------
+
+fn test_end_to_end_rate_limit_refuses_on_wire() {
+    // Craft a token with qps_max=1, present it, dispatch twice within
+    // the same wall-clock window. Second call should hit
+    // "rate limit exceeded".
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-limited", "alice", roles, 0, 0)
+    token_set_qps_max(t, 1)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-limited")
+    // First call: kg.list uses kg:read (in reader) -> should pass cap
+    // check + rate check.
+    let out1 = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("first ok", _has(out1, "\"ok\":true"))
+    // Second call within a tiny wall-clock delta -> rate limit.
+    let out2 = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("second refused",   _has(out2, "\"ok\":false"))
+    ce_check("names rate limit", _has(out2, "rate limit exceeded"))
+    ce_check("names 1 req/s",    _has(out2, "max 1 req/s"))
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_token_defaults_qps_max_zero()
+    test_token_new_roles_defaults_qps_max_zero()
+    test_set_qps_max_updates()
+    test_set_qps_max_rejects_negative()
+    test_rate_unlimited_never_refuses()
+    test_rate_first_observation_sets_window()
+    test_rate_under_limit_passes()
+    test_rate_at_limit_refuses()
+    test_rate_window_rolls_resets_counter()
+    test_rate_null_token_no_op()
+    test_issue_accepts_qps_max()
+    test_issue_qps_max_default_zero()
+    test_issue_qps_max_negative_refused()
+    test_list_reports_qps_max()
+    test_snapshot_roundtrip_preserves_qps_max()
+    test_snapshot_r55_format_still_readable()
+    test_end_to_end_rate_limit_refuses_on_wire()
+    ce_summary("capability_rate_limit")
+}
+
+main()

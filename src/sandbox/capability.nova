@@ -160,7 +160,14 @@ let TOK_CAPS         = 2    // list<string>
 let TOK_ISSUED_AT    = 3    // moment
 let TOK_EXPIRES_AT   = 4    // moment; 0 = never expires
 let TOK_REVOKED      = 5    // 0/1
-let TOK_SLOTS        = 6
+// R56 rate-limit slots. qps_max=0 means unlimited (backward-compat
+// with every R54/R55 token). Window is 1 second of wall-clock time
+// tracked via nanotime(); WINDOW_START_NANOS holds the epoch
+// nanosecond count when the current window began.
+let TOK_QPS_MAX             = 6    // requests-per-second cap; 0 = unlimited
+let TOK_WINDOW_START_NANOS  = 7    // nanotime() when the current window opened
+let TOK_WINDOW_COUNT        = 8    // requests observed in the current window
+let TOK_SLOTS        = 9
 
 // De-dupe a cap list so a token holding "admin+reader" doesn't carry
 // nl:ask twice. Cheap linear scan -- caps are short lists.
@@ -194,7 +201,10 @@ fn capability_token_new(token_id, holder, capabilities,
     push(t, _tok_dedupe_caps(capabilities))         // CAPS
     push(t, issued_at)                              // ISSUED_AT
     push(t, expires_at)                             // EXPIRES_AT
-    push(t, 0)                                       // REVOKED
+    push(t, 0)                                      // REVOKED
+    push(t, 0)                                      // QPS_MAX (0 = unlimited)
+    push(t, 0)                                      // WINDOW_START_NANOS
+    push(t, 0)                                      // WINDOW_COUNT
     return t
 }
 
@@ -218,6 +228,21 @@ fn token_caps(t)        { return t[TOK_CAPS] }
 fn token_issued_at(t)   { return t[TOK_ISSUED_AT] }
 fn token_expires_at(t)  { return t[TOK_EXPIRES_AT] }
 fn token_revoked(t)     { return t[TOK_REVOKED] }
+fn token_qps_max(t)     { return t[TOK_QPS_MAX] }
+fn token_window_start(t) { return t[TOK_WINDOW_START_NANOS] }
+fn token_window_count(t) { return t[TOK_WINDOW_COUNT] }
+
+// R56: set a rate-limit on the token in-place. qps_max=0 disables the
+// limit (unlimited); positive values cap requests-per-second in a
+// wall-clock fixed window (via nanotime). Resets the current window
+// so a change takes effect immediately.
+fn token_set_qps_max(t, qps) {
+    if qps < 0 { return 0 }
+    list_set(t, TOK_QPS_MAX, qps)
+    list_set(t, TOK_WINDOW_START_NANOS, 0)
+    list_set(t, TOK_WINDOW_COUNT, 0)
+    return 1
+}
 
 fn token_has_cap(t, cap) {
     let caps = token_caps(t)
@@ -288,6 +313,49 @@ fn capability_registry_revoke(reg, token_id_str) {
     return 1
 }
 
+// ---- rate limiting (R56) -----------------------------------------------
+//
+// Fixed 1-second wall-clock window per token. When qps_max > 0 the
+// authorize gate consults token_check_rate; when qps_max == 0 the
+// helper is a no-op (backward compat for every R54/R55 token).
+//
+// The window is per-TOKEN, not per-holder: two tokens for the same
+// holder each carry their own bucket. That matches operational
+// intuition -- a service account issued a high-QPS token should
+// not have its budget consumed by the holder's ordinary tokens.
+
+let _TOK_WINDOW_NS = 1000000000       // 1 second in nanoseconds
+
+// Check + record one request against `t`'s rate limit. `now_nanos` is
+// wall-clock nanotime (callers grab it via nanotime()). Returns ""
+// on OK; on refusal returns a human-readable message. Mutates the
+// token's window slots in place so the count carries forward.
+fn token_check_rate(t, now_nanos) {
+    if t == 0 { return "" }
+    let qps = token_qps_max(t)
+    if qps <= 0 { return "" }                // unlimited -> no check
+    let ws = token_window_start(t)
+    let wc = token_window_count(t)
+    if ws == 0 {
+        // First observation.
+        list_set(t, TOK_WINDOW_START_NANOS, now_nanos)
+        list_set(t, TOK_WINDOW_COUNT, 1)
+        return ""
+    }
+    if now_nanos - ws >= _TOK_WINDOW_NS {
+        // Window rolled -- reset.
+        list_set(t, TOK_WINDOW_START_NANOS, now_nanos)
+        list_set(t, TOK_WINDOW_COUNT, 1)
+        return ""
+    }
+    if wc >= qps {
+        return "rate limit exceeded: max " + int_to_str(qps)
+             + " req/s for this token"
+    }
+    list_set(t, TOK_WINDOW_COUNT, wc + 1)
+    return ""
+}
+
 // ---- authorization gate --------------------------------------------------
 //
 // The core check the RPC daemon runs BEFORE dispatching a verb. Given
@@ -300,6 +368,11 @@ fn capability_registry_revoke(reg, token_id_str) {
 // Enforcement is OPT-IN: pass `enforced = 0` to bypass entirely
 // (returns "", always). This is what CE_RPC_REQUIRE_TOKEN=0 boils
 // down to and keeps R49/R50 wire behavior byte-identical.
+//
+// R56: rate limits are checked LAST -- after the cap check passes.
+// The clock reading uses nanotime() (wall-clock); the `now` arg is
+// still the logical clock used elsewhere (token expiry). A token
+// with qps_max=0 bypasses the rate check entirely.
 
 fn capability_authorize(enforced, reg, presented_token_id, verb, now) {
     if enforced == 0 { return "" }
@@ -318,11 +391,12 @@ fn capability_authorize(enforced, reg, presented_token_id, verb, now) {
         return "capability required: token expired"
     }
     let need = capability_verb_required(verb)
-    if len(need) == 0 { return "" }       // verb declares no cap -> pass
-    if token_has_cap(t, need) == 0 {
-        return "capability required: " + need
+    if len(need) > 0 {
+        if token_has_cap(t, need) == 0 {
+            return "capability required: " + need
+        }
     }
-    return ""
+    return token_check_rate(t, nanotime())
 }
 
 // ---- token id minter (R55) ----------------------------------------------

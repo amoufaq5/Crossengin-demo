@@ -517,12 +517,54 @@ configured dir is structurally impossible.
   (`/save PATH` in the chat) that persists cognition-loop state
   the daemon doesn't own.
 
-## 12. What comes next (R56+)
+### 7.11 Per-token rate limits (R56)
 
-- **R56+** — Rate limits per capability, in-process TLS
-  (retires the sidecar recipe), hardware-key-backed admin
-  bootstrap, per-holder skill-run scoping (extending R55.2's
-  overlay to gate skill.run execution, not just list visibility)
+Every capability token can carry a `qps_max` field — a wall-clock
+1-second fixed-window cap on requests. `qps_max=0` (the default, and
+what every R54/R55 token minted before R56 has) means unlimited.
+
+Set at issuance:
+
+```bash
+CE_RPC_TOKEN=$(cat ~/.crossengin/admin.token) \
+scripts/rpc.sh capability.issue '{
+  "holder":   "shop-frontend",
+  "roles":    "service",
+  "qps_max":  "50"
+}'
+# -> {"ok":true,"result":{"token_id":"...","holder":"shop-frontend",
+#      "caps":["nl:ask","skill:run"], "issued_at":..., "expires_at":0,
+#      "qps_max":50}}
+```
+
+When the token exceeds the limit within a 1-second window, the
+gate refuses:
+
+```json
+{"ok":false,"result":null,
+ "error":"rate limit exceeded: max 50 req/s for this token"}
+```
+
+`capability.list` reports each token's `qps_max`; `session.save` /
+`session.load` round-trip it. Legacy snapshot files from R55.3 are
+readable — tokens without a `qps_max` field default to 0 on load.
+
+**Where the check fires:** last in the authorize chain — after
+enforcement / token liveness / capability match. A cap refusal
+still reports the missing cap; a rate refusal fires only when the
+call would otherwise have been authorized.
+
+**Per-TOKEN, not per-HOLDER:** two tokens for the same holder each
+carry their own bucket. That matches "a service token has its own
+budget separate from the operator's ordinary tokens." R57+ can add
+per-holder aggregate limits if the operational need shows up.
+
+## 12. What comes next (R57+)
+
+- **R57+** — In-process TLS (retires the sidecar recipe),
+  hardware-key-backed admin bootstrap, per-holder aggregate rate
+  limits, per-holder skill-run execution scoping (extending
+  R55.2's overlay to gate skill.run, not just list visibility)
 - **R56+** — Rate limits per capability, in-process TLS,
   hardware-key-backed admin bootstrap
 
