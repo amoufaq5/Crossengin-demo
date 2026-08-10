@@ -613,15 +613,70 @@ its dispatched skill runs through `skill_run` directly, bypassing
 `nl_execute` to also gate the auto-dispatched skill (research /
 coding_helper) but that's an executor-layer change.
 
-## 12. What comes next (R58+)
+### 7.12 Curator auto-approval policies (R58)
 
-- **R58+** — In-process TLS (retires the sidecar recipe),
-  hardware-key-backed admin bootstrap, per-holder aggregate rate
-  limits, holder context threaded into nl_execute so
-  auto-dispatched skills (research / coding_helper via nl.ask)
+A running daemon can auto-approve safe ingest records without a
+human in the loop, while still keeping every approval attributable
+to a named policy in the audit log.
+
+Register policies in-process at daemon boot (a small NOVA helper
+that imports `src/ingest/policy.nova`):
+
+```nova
+let preg = policy_registry_new()
+
+// Trust: any authored .cerec pack with an OPEN license and <= 500
+// atoms auto-approves. First-match-wins so put restrictive
+// policies first.
+let safe = policy_new("safe-open-packs", POL_ACTION_APPROVE)
+policy_add_predicate(safe, POL_OP_SOURCE_PREFIX, "src:pack:")
+policy_add_predicate(safe, POL_OP_LICENSE_EQ,    LICENSE_OPEN)
+policy_add_predicate(safe, POL_OP_MAX_ATOMS,     500)
+policy_registry_register(preg, safe)
+
+rpc_ctx_set_ingest_policy(ctx, preg)
+```
+
+Then over the wire (admin token with `ingest:decide` cap; admin
+role carries it, so does the R55 `curator` role):
+
+```bash
+scripts/rpc.sh ingest.auto_approve
+# -> {"ok":true,"result":{"scanned":7,"matched":4,"approved":4,
+#      "ingest_failed":0,
+#      "entries":[
+#        {"id":1,"policy":"safe-open-packs","state":"ingested"},
+#        {"id":2,"policy":"","state":"pending"},
+#        ...]}}
+```
+
+Every approved entry carries `"auto-approved by policy:<name>"` in
+its reason field so a subsequent `ingest.review` walk shows exactly
+which policy fired.
+
+**Preserves the ADR-0101 invariant** ("no atom without a traceable
+decision"): every atom the pipeline commits is attributable to
+either a named policy or a human decision. Auto-approval
+accelerates the operator; it doesn't remove the audit trail.
+
+Predicate ops (v1): `POL_OP_ANY`, `POL_OP_SOURCE_PREFIX`,
+`POL_OP_KG_EQUALS`, `POL_OP_LICENSE_EQ`, `POL_OP_MAX_ATOMS`.
+Policies use AND semantics — every predicate must match. Wire
+verbs for policy management (`ingest.policy.add` / `.list` /
+`.remove`) are R59+.
+
+## 12. What comes next (R59+)
+
+- **R59+** — .cerec pattern packs (R53 patterns authored + shipped
+  as .cerec files through the R43 pipeline), wire verbs for policy
+  management, holder context threaded into `nl_execute` so
+  auto-dispatched skills (research / coding_helper via `nl.ask`)
   also honor the ownership overlay
-- **R56+** — Rate limits per capability, in-process TLS,
-  hardware-key-backed admin bootstrap
+- **R60+** — In-process TLS (retires the sidecar recipe), generic
+  structured-record adapter for one-off JSON/YAML sources
+- **R61+** — Per-source rate budgets controllable via admin wire
+  verb, hardware-key-backed admin bootstrap, per-holder aggregate
+  rate limits
 
 ## 13. Troubleshooting
 

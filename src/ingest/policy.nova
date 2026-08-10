@@ -1,0 +1,296 @@
+// CrossEngin ingest: curator auto-approval policies (R58, ADR-0101
+// roadmap §R58).
+//
+// A Policy is an ordered set of Predicates + an ACTION. The curator
+// loop (policy_run) walks the review queue's pending entries, tries
+// each policy in registration order, and applies the first matching
+// policy's action to the entry. Entries that no policy matches stay
+// pending -- human-in-the-loop remains the default.
+//
+// R58 ships one action: POL_APPROVE. Auto-approvals write the policy
+// name into the entry's REASON slot BEFORE calling rq_approve, so the
+// decision log carries "auto-approved by policy:<name>" on success (and
+// still gets the pipeline error text if promotion fails, since
+// rq_approve overwrites REASON on INGEST_FAILED). No "no atom without a
+// traceable decision" invariant loses -- every auto-approval is
+// attributable to a named policy.
+//
+// A POL_APPROVE Policy is DATA. Operators register policies in-process
+// at daemon boot (a NOVA helper builds the PolicyRegistry and hands it
+// to rpc_ctx_set_ingest_policy). Wire verbs for policy management are
+// R59+ (see the R43+ ADR-0101 roadmap). For R58 the mechanism ships
+// alongside a wire trigger (ingest.auto_approve) that runs one sweep.
+//
+// Predicate ops (v1):
+//   POL_OP_SOURCE_PREFIX  arg = string; matches if rq_source starts with it
+//   POL_OP_KG_EQUALS      arg = string; matches if cur_kg equals it
+//   POL_OP_LICENSE_EQ     arg = int (LICENSE_OPEN et al.); matches capsule license
+//   POL_OP_MAX_ATOMS      arg = int; matches iff len(cur_atoms) <= arg
+//   POL_OP_ANY            args ignored; always matches (catch-all)
+//
+// Adding a new op = one case in _pol_check_predicate, one constant here.
+// The op vocabulary is deliberately narrow -- the primitive is boring
+// on purpose. Rich matching (regex, custom expressions) is R60+ scope.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova
+//   src/ingest/review_queue.nova
+//   src/kg/atom_store.nova (LICENSE_* constants)
+//   src/util/str_safe.nova.
+
+import "./curriculum.nova"
+import "./review_queue.nova"
+import "../kg/atom_store.nova"
+import "../util/str_safe.nova"
+
+// ---- op codes ------------------------------------------------------------
+
+let POL_OP_ANY            = 0
+let POL_OP_SOURCE_PREFIX  = 1
+let POL_OP_KG_EQUALS      = 2
+let POL_OP_LICENSE_EQ     = 3
+let POL_OP_MAX_ATOMS      = 4
+
+// ---- action codes --------------------------------------------------------
+
+let POL_ACTION_APPROVE    = 1
+// (POL_ACTION_DENY reserved for R59+; today an unmatched entry stays
+//  pending -- the "defer to human" outcome doesn't need its own action.)
+
+// ---- Predicate slot layout ----------------------------------------------
+
+let POL_PRED_OP   = 0
+let POL_PRED_ARG  = 1     // string or int depending on op
+
+// ---- Policy slot layout -------------------------------------------------
+
+let POL_NAME       = 0
+let POL_PREDICATES = 1    // list<Predicate>; ALL must match
+let POL_ACTION     = 2
+
+// ---- constructors -------------------------------------------------------
+
+fn pol_pred(op_code, arg) {
+    let p = list_new()
+    push(p, op_code)
+    push(p, arg)
+    return p
+}
+
+fn policy_new(name, action) {
+    let p = list_new()
+    push(p, name)
+    push(p, list_new())          // predicates (add via policy_add_predicate)
+    push(p, action)
+    return p
+}
+
+fn policy_add_predicate(pol, op_code, arg) {
+    push(pol[POL_PREDICATES], pol_pred(op_code, arg))
+    return len(pol[POL_PREDICATES])
+}
+
+// ---- accessors ----------------------------------------------------------
+
+fn policy_name(p)       { return p[POL_NAME] }
+fn policy_predicates(p) { return p[POL_PREDICATES] }
+fn policy_action(p)     { return p[POL_ACTION] }
+
+// ---- predicate evaluation ----------------------------------------------
+
+fn _pol_starts_with(s, prefix) {
+    let n = len(prefix)
+    if len(s) < n { return 0 }
+    let i = 0
+    while i < n {
+        if char_at(s, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Evaluate one predicate against a queue entry. Returns 1 on match,
+// 0 otherwise. Predicates that reference fields the record doesn't
+// carry (a records-only file has no capsule meta) fail cleanly.
+fn _pol_check_predicate(pred, entry) {
+    let op  = pred[POL_PRED_OP]
+    let arg = pred[POL_PRED_ARG]
+    if op == POL_OP_ANY { return 1 }
+    let rec = rq_record(entry)
+    if op == POL_OP_SOURCE_PREFIX {
+        return _pol_starts_with(rq_source(entry), arg)
+    }
+    if op == POL_OP_KG_EQUALS {
+        if rec == 0 { return 0 }
+        return str_eq_bytes(cur_kg(rec), arg)
+    }
+    if op == POL_OP_LICENSE_EQ {
+        if rec == 0 { return 0 }
+        let meta = cur_capsule_meta(rec)
+        if meta == 0 { return 0 }
+        if len(meta) == 0 { return 0 }
+        let lic = cur_capsule_license(rec)
+        if lic == arg { return 1 }
+        return 0
+    }
+    if op == POL_OP_MAX_ATOMS {
+        if rec == 0 { return 0 }
+        let atoms = cur_atoms(rec)
+        if len(atoms) <= arg { return 1 }
+        return 0
+    }
+    return 0
+}
+
+// A policy matches an entry iff EVERY predicate matches. An empty
+// predicate list matches trivially -- callers that want a
+// never-fire policy add POL_OP_ANY explicitly with the wrong sign
+// (or don't register the policy at all).
+fn policy_matches(pol, entry) {
+    let preds = policy_predicates(pol)
+    let i = 0
+    while i < len(preds) {
+        if _pol_check_predicate(preds[i], entry) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- Policy registry ---------------------------------------------------
+//
+// An ORDERED list of policies. First-match-wins semantics for the
+// curator loop, so policy order matters. Operators register the most
+// restrictive policies first, the catch-alls last.
+
+fn policy_registry_new() {
+    let r = list_new()
+    push(r, list_new())     // POLICIES
+    return r
+}
+
+fn policy_registry_register(reg, policy) {
+    push(reg[0], policy)
+    return len(reg[0])
+}
+
+fn policy_registry_count(reg) {
+    if reg == 0 { return 0 }
+    return len(reg[0])
+}
+
+fn policy_registry_policies(reg) {
+    if reg == 0 { return list_new() }
+    return reg[0]
+}
+
+fn policy_registry_names(reg) {
+    let out = list_new()
+    if reg == 0 { return out }
+    let ps = reg[0]
+    let i = 0
+    while i < len(ps) {
+        push(out, policy_name(ps[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// Find the first policy that matches `entry`; returns the policy or 0
+// (no match; entry stays pending). Order = registration order.
+fn policy_registry_first_match(reg, entry) {
+    if reg == 0 { return 0 }
+    let ps = reg[0]
+    let i = 0
+    while i < len(ps) {
+        if policy_matches(ps[i], entry) == 1 { return ps[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- curator loop ------------------------------------------------------
+//
+// Walk the queue's pending entries, apply first-matching policy per
+// entry, run rq_approve on APPROVE actions. Returns a result record:
+//
+//   [scanned, matched, approved, ingest_failed, per_entry]
+//     per_entry = list of [id, policy_name-or-"", state-int-post]
+//
+// `kg_reg` + `mo` are threaded through to rq_approve as usual.
+
+let POLR_SCANNED        = 0
+let POLR_MATCHED        = 1
+let POLR_APPROVED       = 2
+let POLR_INGEST_FAILED  = 3
+let POLR_PER_ENTRY      = 4
+let POLR_SLOTS          = 5
+
+fn _pol_result_new() {
+    let r = list_new()
+    push(r, 0)
+    push(r, 0)
+    push(r, 0)
+    push(r, 0)
+    push(r, list_new())
+    return r
+}
+
+fn policy_result_scanned(r)       { return r[POLR_SCANNED] }
+fn policy_result_matched(r)       { return r[POLR_MATCHED] }
+fn policy_result_approved(r)      { return r[POLR_APPROVED] }
+fn policy_result_ingest_failed(r) { return r[POLR_INGEST_FAILED] }
+fn policy_result_per_entry(r)     { return r[POLR_PER_ENTRY] }
+
+fn _pol_entry_outcome(id, policy_name_str, state_post) {
+    let o = list_new()
+    push(o, id)
+    push(o, policy_name_str)
+    push(o, state_post)
+    return o
+}
+
+// Run the curator sweep. Every pending entry that matches a policy is
+// (a) tagged in its REASON slot with "auto-approved by policy:<name>"
+// so the audit trail records the policy that fired, then (b) run
+// through rq_approve. On INGEST_FAILED, rq_approve overwrites REASON
+// with the pipeline error -- that's the right choice (the operator
+// needs to see WHY promotion failed, not just which policy fired).
+fn policy_run(pol_reg, queue, kg_reg, mo) {
+    let r = _pol_result_new()
+    if queue == 0 { return r }
+    let entries = rq_entries(queue)
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if rq_state(e) == RQ_PENDING {
+            list_set(r, POLR_SCANNED, r[POLR_SCANNED] + 1)
+            let matched = policy_registry_first_match(pol_reg, e)
+            let name = ""
+            let state_post = RQ_PENDING
+            if matched != 0 {
+                name = policy_name(matched)
+                list_set(r, POLR_MATCHED, r[POLR_MATCHED] + 1)
+                let action = policy_action(matched)
+                if action == POL_ACTION_APPROVE {
+                    // Tag reason BEFORE rq_approve; on success it
+                    // survives, on INGEST_FAILED it's overwritten.
+                    list_set(e, RQE_REASON,
+                        "auto-approved by policy:" + name)
+                    let code = rq_approve(queue, rq_id(e), kg_reg, mo)
+                    if code == RQ_APPROVE_OK {
+                        list_set(r, POLR_APPROVED, r[POLR_APPROVED] + 1)
+                    } else {
+                        list_set(r, POLR_INGEST_FAILED,
+                                 r[POLR_INGEST_FAILED] + 1)
+                    }
+                }
+                state_post = rq_state(e)
+            }
+            push(r[POLR_PER_ENTRY],
+                 _pol_entry_outcome(rq_id(e), name, state_post))
+        }
+        i = i + 1
+    }
+    return r
+}

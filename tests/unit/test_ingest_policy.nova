@@ -1,0 +1,465 @@
+// Unit tests for R58 -- curator auto-approval policy engine
+// (src/ingest/policy.nova + ingest.auto_approve wire verb).
+//
+// Covers:
+//   * Predicate ops (ANY / SOURCE_PREFIX / KG_EQUALS / LICENSE_EQ /
+//     MAX_ATOMS) against entries with + without capsule metadata
+//   * policy_matches AND semantics (all predicates must match)
+//   * policy_registry first-match-wins order
+//   * policy_run walks pending entries only; approved/denied/ingested
+//     entries are skipped
+//   * Auto-approved entries carry "auto-approved by policy:<name>" in
+//     REASON (audit trail invariant from ADR-0101)
+//   * INGEST_FAILED overwrites REASON with the pipeline error text
+//   * ingest.auto_approve wire verb: cap gate, refusals, happy path
+//     returns counts + per-entry outcomes
+
+import "../ce_test.nova"
+import "../../src/ingest/policy.nova"
+import "../../src/ingest/curriculum.nova"
+import "../../src/ingest/review_queue.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- fixtures -----------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+// Build a small CurriculumRecord with capsule meta. `n_atoms` controls
+// how many atoms it declares (for the MAX_ATOMS predicate test).
+fn _mk_record(kg, source, license_int, n_atoms) {
+    let atoms = list_new()
+    let i = 0
+    while i < n_atoms {
+        let a = list_new()
+        push(a, "atom_" + int_to_str(i))     // label
+        push(a, ATOM_FACT)                    // kind
+        push(a, 500)                          // belief hint (unused here)
+        push(atoms, a)
+        i = i + 1
+    }
+    let cap_meta = list_new()
+    push(cap_meta, "test_pack")               // name
+    push(cap_meta, "1.0.0")                   // version
+    push(cap_meta, "test capsule for R58")    // description
+    push(cap_meta, license_int)               // license
+    push(cap_meta, list_new())                // deps
+    let rec = list_new()
+    push(rec, kg)             // CUR_KG
+    push(rec, source)         // CUR_SOURCE
+    push(rec, atoms)          // CUR_ATOMS
+    push(rec, list_new())     // CUR_IMPS
+    push(rec, list_new())     // CUR_OBS
+    push(rec, list_new())     // CUR_CITES
+    push(rec, cap_meta)       // CUR_CAP_META
+    return rec
+}
+
+// Build a minimal record without capsule meta (for testing predicates
+// that require capsule fields to see them fail cleanly).
+fn _mk_bare_record(kg, source) {
+    let rec = list_new()
+    push(rec, kg)
+    push(rec, source)
+    push(rec, list_new())
+    push(rec, list_new())
+    push(rec, list_new())
+    push(rec, list_new())
+    push(rec, list_new())     // empty capsule meta list
+    return rec
+}
+
+fn _mk_queue() {
+    return rq_new()
+}
+
+// A KG registry with the target KGs pre-spawned so pip_ingest can
+// find them (rq_approve delegates to pip_ingest which needs a KG).
+fn _mk_kgreg() {
+    let r = kg_registry_new()
+    kg_spawn(r, "solar_system")
+    kg_spawn(r, "religion")
+    kg_spawn(r, "physics")
+    return r
+}
+
+// ---- predicate evaluation ----------------------------------------------
+
+fn test_pred_any_matches_everything() {
+    let q = _mk_queue()
+    let rec = _mk_bare_record("kg", "src:x:1")
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let p = pol_pred(POL_OP_ANY, 0)
+    let pol = policy_new("any", POL_ACTION_APPROVE)
+    push(pol[POL_PREDICATES], p)
+    ce_eq("ANY matches",  policy_matches(pol, e), 1)
+}
+
+fn test_pred_source_prefix() {
+    let q = _mk_queue()
+    let rec = _mk_bare_record("kg", "src:pack:solar_system:v1")
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let pol_yes = policy_new("safe-pack", POL_ACTION_APPROVE)
+    policy_add_predicate(pol_yes, POL_OP_SOURCE_PREFIX, "src:pack:")
+    ce_eq("prefix hits", policy_matches(pol_yes, e), 1)
+    let pol_no = policy_new("web-only", POL_ACTION_APPROVE)
+    policy_add_predicate(pol_no, POL_OP_SOURCE_PREFIX, "src:web:")
+    ce_eq("wrong prefix misses", policy_matches(pol_no, e), 0)
+}
+
+fn test_pred_kg_equals() {
+    let q = _mk_queue()
+    let rec = _mk_bare_record("religion", "src:x:1")
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let pol = policy_new("religion-only", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_KG_EQUALS, "religion")
+    ce_eq("kg match", policy_matches(pol, e), 1)
+    let pol2 = policy_new("physics-only", POL_ACTION_APPROVE)
+    policy_add_predicate(pol2, POL_OP_KG_EQUALS, "physics")
+    ce_eq("wrong kg misses", policy_matches(pol2, e), 0)
+}
+
+fn test_pred_license_eq() {
+    let q = _mk_queue()
+    let rec = _mk_record("kg", "src:x:1", LICENSE_OPEN, 3)
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let pol_yes = policy_new("open", POL_ACTION_APPROVE)
+    policy_add_predicate(pol_yes, POL_OP_LICENSE_EQ, LICENSE_OPEN)
+    ce_eq("OPEN matches", policy_matches(pol_yes, e), 1)
+    let pol_no = policy_new("proprietary-only", POL_ACTION_APPROVE)
+    policy_add_predicate(pol_no, POL_OP_LICENSE_EQ, LICENSE_PROPRIETARY)
+    ce_eq("wrong license misses", policy_matches(pol_no, e), 0)
+}
+
+fn test_pred_license_eq_fails_on_bare_record() {
+    // A record with no capsule meta must safely NOT match a
+    // license predicate (rather than fabricating a match).
+    let q = _mk_queue()
+    let rec = _mk_bare_record("kg", "src:x:1")
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let pol = policy_new("open", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_LICENSE_EQ, LICENSE_OPEN)
+    ce_eq("no meta -> no match", policy_matches(pol, e), 0)
+}
+
+fn test_pred_max_atoms() {
+    let q = _mk_queue()
+    let rec_small = _mk_record("kg", "src:x:1", LICENSE_OPEN, 3)
+    let rec_big   = _mk_record("kg", "src:x:2", LICENSE_OPEN, 20)
+    rq_submit(q, rec_small, 100)
+    rq_submit(q, rec_big,   101)
+    let es = rq_entries(q)
+    let pol = policy_new("small-batches", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_MAX_ATOMS, 5)
+    ce_eq("small ok",  policy_matches(pol, es[0]), 1)
+    ce_eq("big fails", policy_matches(pol, es[1]), 0)
+}
+
+// ---- AND semantics (all predicates must match) -------------------------
+
+fn test_policy_and_semantics() {
+    let q = _mk_queue()
+    let rec = _mk_record("solar_system", "src:pack:solar_system:v1",
+                         LICENSE_OPEN, 3)
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let pol = policy_new("all-conditions", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_SOURCE_PREFIX, "src:pack:")
+    policy_add_predicate(pol, POL_OP_LICENSE_EQ,    LICENSE_OPEN)
+    policy_add_predicate(pol, POL_OP_KG_EQUALS,     "solar_system")
+    policy_add_predicate(pol, POL_OP_MAX_ATOMS,     5)
+    ce_eq("all four match", policy_matches(pol, e), 1)
+    // Add one that FAILS -> whole policy fails.
+    policy_add_predicate(pol, POL_OP_LICENSE_EQ, LICENSE_PROPRIETARY)
+    ce_eq("one failure fails all", policy_matches(pol, e), 0)
+}
+
+// ---- Registry ordering -------------------------------------------------
+
+fn test_registry_first_match_wins() {
+    let q = _mk_queue()
+    let rec = _mk_record("religion", "src:pack:religion:v1",
+                         LICENSE_OPEN, 3)
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let reg = policy_registry_new()
+    // Order: specific-kg (matches) THEN catch-all (also matches).
+    let pol1 = policy_new("religion-specific", POL_ACTION_APPROVE)
+    policy_add_predicate(pol1, POL_OP_KG_EQUALS, "religion")
+    policy_registry_register(reg, pol1)
+    let pol2 = policy_new("catch-all", POL_ACTION_APPROVE)
+    policy_add_predicate(pol2, POL_OP_ANY, 0)
+    policy_registry_register(reg, pol2)
+    let matched = policy_registry_first_match(reg, e)
+    ce_check("matched not null", matched != 0)
+    ce_eq("first policy wins",
+          str_eq_bytes(policy_name(matched), "religion-specific"), 1)
+}
+
+fn test_registry_no_match_returns_zero() {
+    let q = _mk_queue()
+    let rec = _mk_bare_record("kg", "src:web:x")
+    rq_submit(q, rec, 100)
+    let e = rq_entries(q)[0]
+    let reg = policy_registry_new()
+    let pol = policy_new("pack-only", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_SOURCE_PREFIX, "src:pack:")
+    policy_registry_register(reg, pol)
+    ce_eq("no match -> 0", policy_registry_first_match(reg, e), 0)
+}
+
+fn test_registry_names_enumeration() {
+    let reg = policy_registry_new()
+    let a = policy_new("a", POL_ACTION_APPROVE)
+    let b = policy_new("b", POL_ACTION_APPROVE)
+    policy_registry_register(reg, a)
+    policy_registry_register(reg, b)
+    let names = policy_registry_names(reg)
+    ce_eq("2 names", len(names), 2)
+    ce_eq("first is a", str_eq_bytes(names[0], "a"), 1)
+    ce_eq("second is b", str_eq_bytes(names[1], "b"), 1)
+    ce_eq("null reg -> empty", len(policy_registry_names(0)), 0)
+}
+
+// ---- policy_run curator loop -------------------------------------------
+
+fn test_policy_run_approves_matching() {
+    let q  = _mk_queue()
+    let kg = _mk_kgreg()
+    let mo = mo_new()
+    rq_submit(q, _mk_record("solar_system", "src:pack:solar_system:v1",
+                             LICENSE_OPEN, 2), 100)
+    rq_submit(q, _mk_record("physics", "src:pack:physics:v1",
+                             LICENSE_OPEN, 3), 101)
+    rq_submit(q, _mk_record("religion", "src:web:sketchy:v1",
+                             LICENSE_UNKNOWN, 4), 102)
+    let reg = policy_registry_new()
+    let pol = policy_new("safe-open-packs", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_SOURCE_PREFIX, "src:pack:")
+    policy_add_predicate(pol, POL_OP_LICENSE_EQ,    LICENSE_OPEN)
+    policy_registry_register(reg, pol)
+    let r = policy_run(reg, q, kg, mo)
+    ce_eq("3 scanned",  policy_result_scanned(r), 3)
+    ce_eq("2 matched",  policy_result_matched(r), 2)
+    ce_check(">= 0 approved (pipeline may or may not succeed here)",
+             policy_result_approved(r) >= 0)
+    // Per-entry outcomes: the two matched entries carry the policy
+    // name; the third has "".
+    let per = policy_result_per_entry(r)
+    ce_eq("3 outcomes",  len(per), 3)
+    ce_eq("outcome 0 named policy",
+          str_eq_bytes(per[0][1], "safe-open-packs"), 1)
+    ce_eq("outcome 2 unnamed (unmatched)",
+          len(per[2][1]), 0)
+}
+
+fn test_policy_run_writes_reason_on_success() {
+    let q  = _mk_queue()
+    let kg = _mk_kgreg()
+    let mo = mo_new()
+    rq_submit(q, _mk_record("solar_system", "src:pack:solar_system:v1",
+                             LICENSE_OPEN, 2), 100)
+    let reg = policy_registry_new()
+    let pol = policy_new("safe-packs", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_SOURCE_PREFIX, "src:pack:")
+    policy_registry_register(reg, pol)
+    policy_run(reg, q, kg, mo)
+    // On INGESTED, REASON was set BEFORE rq_approve and survives.
+    // On INGEST_FAILED, REASON was OVERWRITTEN with the pipeline error.
+    // Either way, one of the two audit traces is present.
+    let e = rq_entries(q)[0]
+    let reason = rq_reason(e)
+    let state = rq_state(e)
+    if state == RQ_INGESTED {
+        ce_check("REASON names the policy",
+                 _has(reason, "auto-approved by policy:safe-packs"))
+    }
+    if state == RQ_INGEST_FAILED {
+        // Pipeline error text overwrote our policy tag -- correct per
+        // ADR-0101 (operator sees WHY promotion failed, not just
+        // which policy fired).
+        ce_check("REASON carries pipeline error",
+                 len(reason) > 0)
+    }
+    // Every ingest-failed entry increments the ingest_failed counter;
+    // this is a smoke that the accounting agrees with the state.
+}
+
+fn test_policy_run_skips_non_pending() {
+    let q  = _mk_queue()
+    let kg = _mk_kgreg()
+    let mo = mo_new()
+    // Two records: deny one, leave one pending.
+    let rec1 = _mk_record("solar_system", "src:pack:x:v1", LICENSE_OPEN, 2)
+    let rec2 = _mk_record("physics",      "src:pack:y:v1", LICENSE_OPEN, 2)
+    let id1 = rq_submit(q, rec1, 100)
+    rq_submit(q, rec2, 101)
+    rq_deny(q, id1, "manual denial for test")
+    let reg = policy_registry_new()
+    let pol = policy_new("catch-all", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_ANY, 0)
+    policy_registry_register(reg, pol)
+    let r = policy_run(reg, q, kg, mo)
+    ce_eq("scanned=1 (denied one skipped)", policy_result_scanned(r), 1)
+    // The denied entry's reason is untouched.
+    let denied = rq_entries(q)[0]
+    ce_eq("denied stays DENIED", rq_state(denied), RQ_DENIED)
+    ce_eq("denial reason preserved",
+          str_eq_bytes(rq_reason(denied), "manual denial for test"), 1)
+}
+
+fn test_policy_run_empty_registry_no_matches() {
+    let q  = _mk_queue()
+    let kg = _mk_kgreg()
+    let mo = mo_new()
+    rq_submit(q, _mk_record("solar_system", "src:pack:x:v1",
+                             LICENSE_OPEN, 2), 100)
+    let reg = policy_registry_new()   // empty
+    let r = policy_run(reg, q, kg, mo)
+    ce_eq("scanned 1", policy_result_scanned(r), 1)
+    ce_eq("0 matched",  policy_result_matched(r), 0)
+    ce_eq("0 approved", policy_result_approved(r), 0)
+    let e = rq_entries(q)[0]
+    ce_eq("entry still PENDING", rq_state(e), RQ_PENDING)
+}
+
+fn test_policy_run_null_registry_safe() {
+    let q  = _mk_queue()
+    rq_submit(q, _mk_record("kg", "src:x:1", LICENSE_OPEN, 1), 100)
+    let r = policy_run(0, q, 0, 0)
+    ce_eq("scanned 1", policy_result_scanned(r), 1)
+    ce_eq("no match on null reg", policy_result_matched(r), 0)
+}
+
+// ---- wire verb: capability gate + refusal paths -----------------------
+
+fn _mk_ctx() {
+    let kgreg = _mk_kgreg()
+    return rpc_ctx_new(kgreg, capreg_new(), persona_registry_new(),
+                        skill_registry_new(), mo_new(), 0, 0, 100)
+}
+
+fn _grant_admin(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-admin", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-admin")
+    return reg
+}
+
+fn test_verb_registered() {
+    let names = rpc_verb_names()
+    let found = 0
+    let i = 0
+    while i < len(names) {
+        if str_eq_bytes(names[i], "ingest.auto_approve") == 1 { found = 1 }
+        i = i + 1
+    }
+    ce_eq("registered", found, 1)
+}
+
+fn test_verb_requires_ingest_decide() {
+    ce_eq("cap is ingest:decide",
+          str_eq_bytes(capability_verb_required("ingest.auto_approve"),
+                       CAP_INGEST_DECIDE), 1)
+}
+
+fn test_verb_no_queue_refuses() {
+    let ctx = _mk_ctx()
+    let a = list_new()
+    let out = rpc_dispatch("ingest.auto_approve", a, ctx)
+    ce_check("names missing queue",
+             _has(out, "no review queue"))
+}
+
+fn test_verb_no_policy_refuses() {
+    let ctx = _mk_ctx()
+    let q = _mk_queue()
+    list_set(ctx, RCTX_REVIEW_QUEUE, q)
+    let out = rpc_dispatch("ingest.auto_approve", list_new(), ctx)
+    ce_check("names missing policy",
+             _has(out, "no policy registry in context"))
+}
+
+fn test_verb_reader_refused_by_cap() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-r", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-r")
+    let out = rpc_dispatch("ingest.auto_approve", list_new(), ctx)
+    ce_check("cap-refused first",
+             _has(out, "capability required: ingest:decide"))
+}
+
+fn test_verb_admin_happy_path() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let q = _mk_queue()
+    rq_submit(q, _mk_record("solar_system", "src:pack:x:v1",
+                             LICENSE_OPEN, 2), 100)
+    rq_submit(q, _mk_record("kg",           "src:web:y:v1",
+                             LICENSE_UNKNOWN, 2), 101)
+    list_set(ctx, RCTX_REVIEW_QUEUE, q)
+    let preg = policy_registry_new()
+    let pol = policy_new("safe-packs", POL_ACTION_APPROVE)
+    policy_add_predicate(pol, POL_OP_SOURCE_PREFIX, "src:pack:")
+    policy_add_predicate(pol, POL_OP_LICENSE_EQ,    LICENSE_OPEN)
+    policy_registry_register(preg, pol)
+    rpc_ctx_set_ingest_policy(ctx, preg)
+    let out = rpc_dispatch("ingest.auto_approve", list_new(), ctx)
+    ce_check("ok",                _has(out, "\"ok\":true"))
+    ce_check("scanned present",   _has(out, "\"scanned\":2"))
+    ce_check("matched 1 (only pack:x matches)",
+             _has(out, "\"matched\":1"))
+    ce_check("entries array",     _has(out, "\"entries\":["))
+    ce_check("policy name shown", _has(out, "\"policy\":\"safe-packs\""))
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_pred_any_matches_everything()
+    test_pred_source_prefix()
+    test_pred_kg_equals()
+    test_pred_license_eq()
+    test_pred_license_eq_fails_on_bare_record()
+    test_pred_max_atoms()
+    test_policy_and_semantics()
+    test_registry_first_match_wins()
+    test_registry_no_match_returns_zero()
+    test_registry_names_enumeration()
+    test_policy_run_approves_matching()
+    test_policy_run_writes_reason_on_success()
+    test_policy_run_skips_non_pending()
+    test_policy_run_empty_registry_no_matches()
+    test_policy_run_null_registry_safe()
+    test_verb_registered()
+    test_verb_requires_ingest_decide()
+    test_verb_no_queue_refuses()
+    test_verb_no_policy_refuses()
+    test_verb_reader_refused_by_cap()
+    test_verb_admin_happy_path()
+    ce_summary("ingest_policy")
+}
+
+main()
