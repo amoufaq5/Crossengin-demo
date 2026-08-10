@@ -4,9 +4,12 @@ This document walks a new operator from a fresh checkout to a running
 CrossEngin JSON-RPC daemon serving live requests.
 
 CrossEngin ships as a **local daemon + client** pair. The daemon
-(`crossengin-rpc-daemon`) binds a TCP socket and serves 12 stable
-verbs. Any client that can speak line-oriented JSON over TCP can
-drive it — `curl`, `nc`, a shell script, a native app, a browser
+(`crossengin-rpc-daemon`) binds a TCP socket and serves a
+stable JSON-RPC surface (12 core verbs at R48p7, extended
+through R59 with capability lifecycle, session snapshots, and
+ingest-policy management — see §7 for the current list). Any
+client that can speak line-oriented JSON over TCP can drive it
+— `curl`, `nc`, a shell script, a native app, a browser
 extension. The reference client is `scripts/rpc.sh`.
 
 The design lives in [`ADR-0109 Ship as App`](adr/0109-ship-as-app.md).
@@ -661,18 +664,64 @@ accelerates the operator; it doesn't remove the audit trail.
 
 Predicate ops (v1): `POL_OP_ANY`, `POL_OP_SOURCE_PREFIX`,
 `POL_OP_KG_EQUALS`, `POL_OP_LICENSE_EQ`, `POL_OP_MAX_ATOMS`.
-Policies use AND semantics — every predicate must match. Wire
-verbs for policy management (`ingest.policy.add` / `.list` /
-`.remove`) are R59+.
+Policies use AND semantics — every predicate must match.
 
-## 12. What comes next (R59+)
+### 7.13 Policy management over the wire (R59)
 
-- **R59+** — .cerec pattern packs (R53 patterns authored + shipped
-  as .cerec files through the R43 pipeline), wire verbs for policy
-  management, holder context threaded into `nl_execute` so
-  auto-dispatched skills (research / coding_helper via `nl.ask`)
-  also honor the ownership overlay
-- **R60+** — In-process TLS (retires the sidecar recipe), generic
+R59 adds three verbs so an admin/curator can add, list, and
+remove policies dynamically instead of only at daemon boot. The
+registry stays in-process (still call `rpc_ctx_set_ingest_policy`
+at boot to attach an empty or seeded registry); these verbs mutate
+it live:
+
+```bash
+# List currently registered policies (cap: ingest:review).
+scripts/rpc.sh ingest.policy.list
+# -> {"ok":true,"result":[
+#      {"name":"safe-open-packs","action":"APPROVE","predicates":[
+#         {"op":"SOURCE_PREFIX","arg":"src:pack:"},
+#         {"op":"LICENSE_EQ","arg":1},
+#         {"op":"MAX_ATOMS","arg":500}]}]}
+
+# Register a new policy (cap: ingest:decide).
+# Predicates encoded as "OP:arg|OP:arg|..." with pipe as
+# separator; first ':' in each token splits op-name from arg
+# (so "SOURCE_PREFIX:src:pack:" is well-formed -- the trailing
+# colons stay in the arg).
+scripts/rpc.sh ingest.policy.add \
+  name safe-open-packs \
+  action APPROVE \
+  predicates "SOURCE_PREFIX:src:pack:|LICENSE_EQ:1|MAX_ATOMS:500"
+# -> {"ok":true,"result":{"name":"safe-open-packs","action":"APPROVE",
+#      "predicate_count":3,"registry_count":1}}
+
+# Remove every policy with a given name (cap: ingest:decide).
+# Duplicates by name are legal; remove drops them all.
+scripts/rpc.sh ingest.policy.remove name safe-open-packs
+# -> {"ok":true,"result":{"name":"safe-open-packs","removed":1,
+#      "registry_count":0}}
+```
+
+Op names accepted: `ANY`, `SOURCE_PREFIX`, `KG_EQUALS`,
+`LICENSE_EQ`, `MAX_ATOMS`. Action names accepted: `APPROVE`
+(deny reserved for R60+). Ops whose arg is an int (`LICENSE_EQ`,
+`MAX_ATOMS`) are rejected with a clean refusal when the arg is
+missing or unparseable — a bad predicate short-circuits so the
+registry is never left with a partial policy. Empty
+`predicates` yields a catch-all policy that matches every
+entry.
+
+Reader-role tokens can `list` (read-only inspection is
+review-capped) but not `add`/`remove` — those need `curator` or
+`admin`.
+
+## 12. What comes next (R60+)
+
+- **R60+** — .cerec pattern packs (R53 patterns authored + shipped
+  as .cerec files through the R43 pipeline), holder context
+  threaded into `nl_execute` so auto-dispatched skills (research /
+  coding_helper via `nl.ask`) also honor the ownership overlay,
+  in-process TLS (retires the sidecar recipe), generic
   structured-record adapter for one-off JSON/YAML sources
 - **R61+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
