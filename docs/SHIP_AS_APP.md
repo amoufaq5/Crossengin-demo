@@ -559,12 +559,67 @@ carry their own bucket. That matches "a service token has its own
 budget separate from the operator's ordinary tokens." R57+ can add
 per-holder aggregate limits if the operational need shows up.
 
-## 12. What comes next (R57+)
+### 7.12 Per-holder skill.run scoping (R57)
 
-- **R57+** — In-process TLS (retires the sidecar recipe),
+R55.2's ownership overlay handled list visibility (`kg.list`,
+`capsule.list`). R57 extends it to EXECUTION for `skill.run` +
+symmetric filtering on `skill.list`. Mark a skill owned and only
+its holder can invoke it:
+
+```nova
+// At daemon boot, in a small NOVA helper:
+let ownership = ownership_registry_new()
+ownership_set_skill(ownership, "shop_deploy",     "ops-lead")
+ownership_set_skill(ownership, "shop_pagerduty",  "on-call")
+// Skills NOT in the overlay ("echo", "research") stay public --
+// every holder can invoke them (backward compat).
+rpc_ctx_set_ownership(ctx, ownership)
+```
+
+Then over the wire:
+
+```bash
+# ops-lead can invoke their owned skill.
+CE_RPC_TOKEN=$OPS_LEAD_TOKEN \
+  scripts/rpc.sh skill.run '{"name":"shop_deploy","arg":"canary"}'
+# -> {"ok":true,"result":{...ProposalResult...}}
+
+# on-call cannot (owned by ops-lead).
+CE_RPC_TOKEN=$ON_CALL_TOKEN \
+  scripts/rpc.sh skill.run '{"name":"shop_deploy","arg":"canary"}'
+# -> {"ok":false,"error":"skill not accessible to on-call: shop_deploy"}
+
+# Public skills stay callable by everyone.
+CE_RPC_TOKEN=$ON_CALL_TOKEN \
+  scripts/rpc.sh skill.run '{"name":"echo","arg":"hi"}'
+# -> {"ok":true,...}
+```
+
+**Refusal ordering matters** — ownership refusal takes precedence
+over "skill not installed" so a caller learns nothing about the
+existence of a skill they can't access. Their `skill.list` view
+also hides those names.
+
+**Gate composition** — the capability gate still fires FIRST.
+A reader token (no `skill:run` cap) is refused at the capability
+check before the ownership check runs, so debugging output
+correctly reports `capability required: skill:run` for the
+missing cap and never leaks the fact that a skill is owned.
+
+**What's not gated:** the NL surface (`nl.ask`) still routes
+its dispatched skill runs through `skill_run` directly, bypassing
+`skill.run`. Ownership scoping applies to explicit wire calls to
+`skill.run` only. A future R58+ could thread holder context into
+`nl_execute` to also gate the auto-dispatched skill (research /
+coding_helper) but that's an executor-layer change.
+
+## 12. What comes next (R58+)
+
+- **R58+** — In-process TLS (retires the sidecar recipe),
   hardware-key-backed admin bootstrap, per-holder aggregate rate
-  limits, per-holder skill-run execution scoping (extending
-  R55.2's overlay to gate skill.run, not just list visibility)
+  limits, holder context threaded into nl_execute so
+  auto-dispatched skills (research / coding_helper via nl.ask)
+  also honor the ownership overlay
 - **R56+** — Rate limits per capability, in-process TLS,
   hardware-key-backed admin bootstrap
 
