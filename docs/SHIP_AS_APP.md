@@ -838,14 +838,62 @@ the older entry in place, and every downstream skill's next
 `pattern_registry_match_all(...)` call sees the new patterns
 immediately.
 
-## 12. What comes next (R63+)
+### 7.16 Holder-scoped pattern overlay (R63)
 
-- **R63+** — In-process TLS (retires the sidecar recipe),
+The R61/R62 pattern registry is process-wide by design (matches
+R53). R63 adds an OPTIONAL scope layer on top of that global
+registry via the same R55.2 ownership overlay every other
+resource kind already uses:
+
+```
+OWN_KIND_KG       (R55.2)  — kg.list filters by holder
+OWN_KIND_CAPSULE  (R55.2)  — capsule.list filters by holder
+OWN_KIND_SKILL    (R57)    — skill.run refuses non-owner
+OWN_KIND_PATTERN  (R63)    — pattern.list filters + install auto-assigns
+```
+
+When an ownership overlay is wired into the RpcContext:
+
+- **`pattern.list`** filters output by holder visibility.
+  A caller sees a pack iff either (a) no owner is set for
+  that pack, or (b) the pack's owner matches the presented
+  holder. Anonymous callers see only unset (public) packs.
+- **`pattern.install`** auto-assigns the presented holder as
+  the owner of every capsule in the body. The response now
+  echoes an `owners: [...]` list alongside `names: [...]` so
+  operators see exactly what ownership was written.
+- Anonymous installs (no valid token) leave capsules public
+  even when an overlay is wired — there's no plausible holder
+  to stamp, and refusing outright would be surprising for
+  bootstrap flows.
+- Snapshot save/load automatically round-trips pattern
+  ownership entries because R55.3's `#OWNERSHIP v1` section
+  walks generic `ownership_entries` and the R63 loader
+  accepts `pattern` as a known kind.
+
+Skills that consult patterns can opt in to the same gate via
+the new `pattern_registry_match_scoped(tokens, filter_names,
+overlay, holder)` API — a drop-in replacement for
+`pattern_registry_match_all` that honors the overlay. The
+built-in reference skills (`research`, `coding_helper`) stay
+on the unscoped API for R63 to keep behavior identical for
+single-user deployments; a future R64+ can thread holder
+context through the skill dispatch path (matches the R57 →
+R60 arc for skill execution).
+
+Backward compat: without an overlay wired, R63 behavior is
+byte-identical to R62. The overlay is DATA — no default is
+constructed; operators opt in by calling
+`rpc_ctx_set_ownership(...)` at daemon boot.
+
+## 12. What comes next (R64+)
+
+- **R64+** — In-process TLS (retires the sidecar recipe),
   generic structured-record adapter for one-off JSON/YAML
-  sources, holder-scoped pattern registry so a pack installed
-  by holder X isn't visible to holder Y (mirrors R55.2's KG /
-  capsule ownership overlay)
-- **R64+** — Per-source rate budgets controllable via admin wire
+  sources, holder-scoped `pattern_registry_match` inside
+  `research`/`coding_helper` (via the executor holder-context
+  thread already established in R60)
+- **R65+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
