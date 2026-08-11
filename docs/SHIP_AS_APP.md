@@ -874,26 +874,32 @@ When an ownership overlay is wired into the RpcContext:
 Skills that consult patterns can opt in to the same gate via
 the new `pattern_registry_match_scoped(tokens, filter_names,
 overlay, holder)` API — a drop-in replacement for
-`pattern_registry_match_all` that honors the overlay. The
-built-in reference skills (`research`, `coding_helper`) stay
-on the unscoped API for R63 to keep behavior identical for
-single-user deployments; a future R64+ can thread holder
-context through the skill dispatch path (matches the R57 →
-R60 arc for skill execution).
+`pattern_registry_match_all` that honors the overlay.
 
-Backward compat: without an overlay wired, R63 behavior is
-byte-identical to R62. The overlay is DATA — no default is
+**R64 update:** the `coding_helper` reference skill now uses
+this scoped API automatically when the daemon has an overlay
+wired. Threading is:
+`skill.run` verb → `skill_run_scoped(sup, perc, overlay,
+holder)` → `skill_dispatch_policy_scoped` →
+`coding_helper_policy_scoped` → `pattern_registry_match_scoped`.
+A caller who can't see `debug_common` under the overlay gets
+zero matches (proposal falls back to the "add more concrete
+symptoms" hint, confidence collapses to 0) — no owned advice
+leaks across holders. `research` is scope-agnostic (walks KGs,
+not patterns) so its dispatch stays unchanged; the scoped path
+transparently forwards it to the unscoped policy.
+
+Backward compat: without an overlay wired, R63 + R64 behavior
+is byte-identical to R62. The overlay is DATA — no default is
 constructed; operators opt in by calling
 `rpc_ctx_set_ownership(...)` at daemon boot.
 
-## 12. What comes next (R64+)
+## 12. What comes next (R65+)
 
-- **R64+** — In-process TLS (retires the sidecar recipe),
+- **R65+** — In-process TLS (retires the sidecar recipe),
   generic structured-record adapter for one-off JSON/YAML
-  sources, holder-scoped `pattern_registry_match` inside
-  `research`/`coding_helper` (via the executor holder-context
-  thread already established in R60)
-- **R65+** — Per-source rate budgets controllable via admin wire
+  sources
+- **R66+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
