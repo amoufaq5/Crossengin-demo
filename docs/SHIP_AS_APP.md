@@ -723,13 +723,83 @@ Reader-role tokens can `list` (read-only inspection is
 review-capped) but not `add`/`remove` — those need `curator` or
 `admin`.
 
-## 12. What comes next (R60+)
+### 7.14 Pattern packs authored as .cerec files (R61)
 
-- **R61+** — .cerec pattern packs (R53 patterns authored + shipped
-  as .cerec files through the R43 pipeline), in-process TLS
-  (retires the sidecar recipe), generic structured-record adapter
-  for one-off JSON/YAML sources
-- **R61+** — Per-source rate budgets controllable via admin wire
+R53 Pattern Capsules were built-in only — the two shipped
+capsules (`debug_common`, `research_hygiene`) compiled into the
+daemon. R61 adds a `.cerec`-shaped **pattern pack** file
+format so operators can ship additional pattern capsules as
+authored data:
+
+```
+# data/patterns/security_review.cerec
+CAPSULE security_review
+VERSION 1.0.0
+DESCRIPTION OWASP + CWE derived review patterns for coding_helper
+LICENSE CC-BY-4.0
+
+PATTERN 900
+TRIGGER sql injection
+GUIDANCE Prefer parameterized queries; never interpolate user input into SQL.
+
+PATTERN 850
+TRIGGER hardcoded secret
+GUIDANCE Extract to environment or a secrets manager; check git history for prior commits.
+```
+
+Load at daemon boot via a small NOVA helper:
+
+```nova
+import "src/ingest/pattern_pack.nova"
+
+pattern_pack_load("data/patterns/security_review.cerec")
+// -> patterns register into the process-wide pattern registry;
+//    coding_helper's next `pattern_registry_match_all(...)` call
+//    now sees them alongside the built-ins.
+```
+
+**Why not through the R43 review queue?** Pattern packs are
+ADVICE, not truth-claims. They never write atoms into a KG, so
+the ADR-0101 "no atom without a traceable decision" invariant
+simply doesn't apply. Trust flows through the pack's manifest
+(capsule name + version + auto-generated `src:pattern:<name>:v<ver>`
+tag) and the operator's decision to call `pattern_pack_load`.
+The R58 auto-approval policies + R59 wire management only cover
+KG-bound records — pattern packs live on the parallel advice
+track.
+
+**Directive grammar** — `CAPSULE`, `VERSION` (semver required),
+`DESCRIPTION` (metadata; parsed for forward-compat but not stored
+today), `LICENSE` (same), `SOURCE_TAG` (optional override for
+the auto tag), then a sequence of `PATTERN <0..1000>` blocks
+each followed by `TRIGGER <tok1> <tok2> ...` and `GUIDANCE
+<text>`. A new `PATTERN` closes the previous one; a new
+`CAPSULE` closes the previous capsule. Blank lines don't close
+anything (matches the .cerec convention). Comments (`# ...`) are
+line-scoped.
+
+**Lenient parser** — a PATTERN missing TRIGGER or GUIDANCE, a
+confidence outside 0..1000, or an unknown directive records an
+error at that line and skips the fragment; other patterns in
+the same file still register. Ships a validated sample pack at
+`data/patterns/security_review.cerec` (25 OWASP/CWE-derived
+patterns across injection, XSS, auth, deserialization, crypto,
+and side-channel families).
+
+**Idempotent by name** — loading the same file twice or two
+files that define the same `CAPSULE` name is safe: the second
+load REPLACES the first in the registry (last-write-wins,
+matches R53 `pattern_registry_register` semantics). Useful for
+hot-reloading a pack during development without restarting the
+daemon.
+
+## 12. What comes next (R62+)
+
+- **R62+** — In-process TLS (retires the sidecar recipe),
+  generic structured-record adapter for one-off JSON/YAML
+  sources, wire verb `pattern.install` to install a pattern
+  pack over JSON-RPC (mirrors `skill.install`'s R55.1 shape)
+- **R63+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 

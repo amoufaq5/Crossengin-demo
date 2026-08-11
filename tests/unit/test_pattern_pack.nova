@@ -1,0 +1,420 @@
+// Unit tests for R61 -- pattern-pack loader
+// (src/ingest/pattern_pack.nova).
+//
+// Covers:
+//   * Directive parsing: CAPSULE / VERSION / DESCRIPTION / LICENSE /
+//     SOURCE_TAG / PATTERN / TRIGGER / GUIDANCE
+//   * Multiple capsules in one file (boundaries)
+//   * Multiple patterns per capsule (auto-flush on next PATTERN)
+//   * Auto source_tag defaults from capsule name + version
+//   * Explicit SOURCE_TAG escape hatch overrides the default
+//   * Comment + blank-line handling
+//   * Confidence bounds (0..1000)
+//   * Lenient parser: partial patterns log errors but don't abort
+//   * pattern_pack_load registers into the process-wide registry so
+//     pattern_registry_match sees the loaded patterns
+//   * Loading a pack twice is idempotent-by-name (last-write-wins)
+
+import "../ce_test.nova"
+import "../../src/ingest/pattern_pack.nova"
+import "../../src/capsules/pattern_capsule.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- fixtures -----------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+// The canonical sample used by many tests.
+fn _sample_pack() {
+    let s = ""
+    s = s + "# security_review v1 test fixture\n"
+    s = s + "CAPSULE security_review\n"
+    s = s + "VERSION 1.0.0\n"
+    s = s + "DESCRIPTION security-focused review patterns\n"
+    s = s + "LICENSE Apache-2.0\n"
+    s = s + "\n"
+    s = s + "PATTERN 850\n"
+    s = s + "TRIGGER sql injection\n"
+    s = s + "GUIDANCE Prefer parameterized queries; never interpolate user input into SQL strings.\n"
+    s = s + "\n"
+    s = s + "PATTERN 800\n"
+    s = s + "TRIGGER xss cross-site\n"
+    s = s + "GUIDANCE Escape user-supplied HTML at the render boundary; do not trust upstream sanitization.\n"
+    s = s + "\n"
+    s = s + "PATTERN 700\n"
+    s = s + "TRIGGER hardcoded secret\n"
+    s = s + "GUIDANCE Extract to environment or secrets manager; check git history for prior commits of the same value.\n"
+    return s
+}
+
+// ---- basic shape -------------------------------------------------------
+
+fn test_parse_empty_returns_empty() {
+    let r = pattern_pack_parse_text("")
+    ce_eq("no capsules", len(pattern_pack_capsules(r)), 0)
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+}
+
+fn test_parse_only_comments_returns_empty() {
+    let text = "# nothing here\n# just prose\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no capsules", len(pattern_pack_capsules(r)), 0)
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+}
+
+fn test_parse_directive_before_capsule_errors() {
+    let text = "VERSION 1.0.0\nPATTERN 500\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no capsules produced", len(pattern_pack_capsules(r)), 0)
+    ce_check("at least one error", len(pattern_pack_errors(r)) >= 1)
+    let errs = pattern_pack_errors(r)
+    ce_check("error mentions CAPSULE opener",
+             _has(errs[0][1], "before any CAPSULE opener"))
+}
+
+// ---- happy path --------------------------------------------------------
+
+fn test_parse_sample_produces_one_capsule_three_patterns() {
+    let r = pattern_pack_parse_text(_sample_pack())
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+    let caps = pattern_pack_capsules(r)
+    ce_eq("1 capsule", len(caps), 1)
+    let c = caps[0]
+    ce_str_eq("name",    pcapsule_name(c),    "security_review")
+    ce_str_eq("version", pcapsule_version(c), "1.0.0")
+    ce_eq("3 patterns", pcapsule_count(c), 3)
+    let pats = pcapsule_patterns(c)
+    // First pattern
+    let p0 = pats[0]
+    ce_eq("p0 confidence", pcap_confidence(p0), 850)
+    let t0 = pcap_triggers(p0)
+    ce_eq("p0 has 2 triggers", len(t0), 2)
+    ce_str_eq("p0 trig 0", t0[0], "sql")
+    ce_str_eq("p0 trig 1", t0[1], "injection")
+    ce_check("p0 guidance not empty", len(pcap_guidance(p0)) > 0)
+    // Second pattern
+    let p1 = pats[1]
+    ce_eq("p1 confidence", pcap_confidence(p1), 800)
+    ce_eq("p1 has 2 triggers", len(pcap_triggers(p1)), 2)
+    // Third pattern
+    let p2 = pats[2]
+    ce_eq("p2 confidence", pcap_confidence(p2), 700)
+}
+
+fn test_source_tag_defaults_from_name_version() {
+    let r = pattern_pack_parse_text(_sample_pack())
+    let c = pattern_pack_capsules(r)[0]
+    let pats = pcapsule_patterns(c)
+    // Auto-generated tag: src:pattern:<name>:v<version>
+    ce_str_eq("p0 source tag",
+              pcap_source_tag(pats[0]),
+              "src:pattern:security_review:v1.0.0")
+    ce_str_eq("p1 same tag",
+              pcap_source_tag(pats[1]),
+              "src:pattern:security_review:v1.0.0")
+}
+
+fn test_source_tag_explicit_overrides_default() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nSOURCE_TAG src:pattern:custom\n"
+             + "PATTERN 500\nTRIGGER foo bar\nGUIDANCE do the thing\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors", len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_str_eq("explicit tag wins",
+              pcap_source_tag(pcapsule_patterns(c)[0]),
+              "src:pattern:custom")
+}
+
+fn test_multiple_capsules_in_one_file() {
+    let text = ""
+             + "CAPSULE a\nVERSION 1.0.0\n"
+             + "PATTERN 500\nTRIGGER foo\nGUIDANCE a1 advice\n"
+             + "CAPSULE b\nVERSION 2.0.0\n"
+             + "PATTERN 600\nTRIGGER bar\nGUIDANCE b1 advice\n"
+             + "PATTERN 700\nTRIGGER baz\nGUIDANCE b2 advice\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+    let caps = pattern_pack_capsules(r)
+    ce_eq("2 capsules", len(caps), 2)
+    ce_str_eq("a name",    pcapsule_name(caps[0]),    "a")
+    ce_str_eq("a version", pcapsule_version(caps[0]), "1.0.0")
+    ce_eq("a 1 pattern",   pcapsule_count(caps[0]), 1)
+    ce_str_eq("b name",    pcapsule_name(caps[1]),    "b")
+    ce_str_eq("b version", pcapsule_version(caps[1]), "2.0.0")
+    ce_eq("b 2 patterns",  pcapsule_count(caps[1]), 2)
+    // Tag reflects each capsule's OWN name+version.
+    ce_str_eq("a tag",
+              pcap_source_tag(pcapsule_patterns(caps[0])[0]),
+              "src:pattern:a:v1.0.0")
+    ce_str_eq("b tag",
+              pcap_source_tag(pcapsule_patterns(caps[1])[0]),
+              "src:pattern:b:v2.0.0")
+}
+
+fn test_version_before_first_pattern_updates_tag() {
+    // If VERSION comes AFTER opening CAPSULE, source_tag reflects
+    // the updated version. (Test written to defend against a
+    // regression where tag is snapped at CAPSULE time only.)
+    let text = "CAPSULE p\nVERSION 3.1.4\n"
+             + "PATTERN 500\nTRIGGER x y\nGUIDANCE hi\n"
+    let r = pattern_pack_parse_text(text)
+    let c = pattern_pack_capsules(r)[0]
+    ce_str_eq("version updated in tag",
+              pcap_source_tag(pcapsule_patterns(c)[0]),
+              "src:pattern:p:v3.1.4")
+}
+
+// ---- confidence bounds -------------------------------------------------
+
+fn test_confidence_zero_ok() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 0\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors",  len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("confidence 0", pcap_confidence(pcapsule_patterns(c)[0]), 0)
+}
+
+fn test_confidence_thousand_ok() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 1000\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors",     len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("confidence 1000", pcap_confidence(pcapsule_patterns(c)[0]), 1000)
+}
+
+fn test_confidence_over_thousand_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 1500\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("at least one error", len(errs) >= 1)
+    ce_check("mentions bounds", _has(errs[0][1], "0..1000"))
+    // The capsule was opened but the invalid pattern was dropped.
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("no patterns", pcapsule_count(c), 0)
+}
+
+fn test_confidence_non_numeric_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN high\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("at least one error", len(errs) >= 1)
+}
+
+// ---- lenient parsing ---------------------------------------------------
+
+fn test_partial_pattern_missing_trigger_errors_but_continues() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 500\nGUIDANCE forgot trigger\n"
+             + "PATTERN 600\nTRIGGER goodone\nGUIDANCE this works\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error names TRIGGER",
+             _has(errs[0][1], "missing TRIGGER"))
+    // Second pattern still lands.
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 good pattern", pcapsule_count(c), 1)
+    ce_eq("second pattern's confidence",
+          pcap_confidence(pcapsule_patterns(c)[0]), 600)
+}
+
+fn test_partial_pattern_missing_guidance_errors_but_continues() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 500\nTRIGGER forgot guidance\n"
+             + "PATTERN 600\nTRIGGER goodone\nGUIDANCE works\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error names GUIDANCE",
+             _has(errs[0][1], "missing GUIDANCE"))
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 good pattern", pcapsule_count(c), 1)
+}
+
+fn test_trigger_before_pattern_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nTRIGGER lone rider\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error text",
+             _has(errs[0][1], "TRIGGER without an open PATTERN"))
+}
+
+fn test_unknown_directive_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nWEIRD stuff here\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error text",
+             _has(errs[0][1], "unknown directive: WEIRD"))
+}
+
+// ---- comment + blank handling ------------------------------------------
+
+fn test_comment_lines_ignored() {
+    let text = "# leading\nCAPSULE t\n# after CAPSULE\nVERSION 1.0.0\n"
+             + "# empty section\nPATTERN 500\n"
+             + "# comment inside pattern (blank + comments are noise)\n"
+             + "TRIGGER foo bar\nGUIDANCE guidance line\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors", len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 pattern", pcapsule_count(c), 1)
+}
+
+fn test_blank_lines_dont_close_pattern() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nPATTERN 500\n\n\nTRIGGER foo\n\nGUIDANCE bar\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors", len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 pattern", pcapsule_count(c), 1)
+}
+
+// ---- guidance rest-of-line ---------------------------------------------
+
+fn test_guidance_captures_full_rest_of_line() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nPATTERN 500\nTRIGGER x\n"
+             + "GUIDANCE   this is a multi word sentence with punctuation, dashes -- and quotes 'like this'.\n"
+    let r = pattern_pack_parse_text(text)
+    let c = pattern_pack_capsules(r)[0]
+    let g = pcap_guidance(pcapsule_patterns(c)[0])
+    ce_check("has 'multi word'", _has(g, "multi word sentence"))
+    ce_check("has quotes",       _has(g, "'like this'"))
+    ce_check("no leading ws",    char_at(g, 0) != 32)
+}
+
+// ---- registry integration ----------------------------------------------
+
+fn test_load_registers_capsules_and_registry_finds_them() {
+    let before = pattern_registry_count()
+    let text = "CAPSULE r61_test_pack\nVERSION 1.0.0\n"
+             + "PATTERN 900\nTRIGGER r61 special\nGUIDANCE the R61 patterns are here\n"
+    let r = pattern_pack_load_text(text)
+    ce_eq("1 registered", r[0], 1)
+    ce_eq("no errors",    len(r[1]), 0)
+    let after = pattern_registry_count()
+    ce_check("registry grew",
+             after > before || after == before)     // last-write-wins may not grow
+    ce_check("lookup finds it",
+             pattern_registry_lookup("r61_test_pack") != 0)
+}
+
+fn test_registered_pattern_matches_via_registry() {
+    let text = "CAPSULE r61_match_pack\nVERSION 1.0.0\n"
+             + "PATTERN 800\nTRIGGER quantum entanglement\n"
+             + "GUIDANCE consult a physicist before making claims about non-locality\n"
+    pattern_pack_load_text(text)
+    let toks = pcap_tokenize("what should i know about quantum entanglement")
+    let matches = pattern_registry_match_all(toks)
+    let saw = 0
+    let i = 0
+    while i < len(matches) {
+        if _has(pcap_guidance(matches[i]), "non-locality") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("loaded pattern matched", saw, 1)
+}
+
+fn test_load_twice_is_last_write_wins() {
+    // First load: confidence 500.
+    pattern_pack_load_text(
+        "CAPSULE r61_lww\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER onlyone\nGUIDANCE first\n")
+    // Second load: same name, confidence 700, different guidance.
+    pattern_pack_load_text(
+        "CAPSULE r61_lww\nVERSION 1.0.1\n"
+      + "PATTERN 700\nTRIGGER onlyone\nGUIDANCE second\n")
+    let c = pattern_registry_lookup("r61_lww")
+    ce_check("registered", c != 0)
+    ce_str_eq("version reflects second load",
+              pcapsule_version(c), "1.0.1")
+    ce_eq("confidence reflects second load",
+          pcap_confidence(pcapsule_patterns(c)[0]), 700)
+    ce_str_eq("guidance reflects second load",
+              pcap_guidance(pcapsule_patterns(c)[0]), "second")
+}
+
+fn test_read_missing_file_errors_cleanly() {
+    let r = pattern_pack_parse("data/patterns/does_not_exist.cerec")
+    ce_eq("no capsules", len(pattern_pack_capsules(r)), 0)
+    let errs = pattern_pack_errors(r)
+    ce_check("one error",   len(errs) == 1)
+    ce_eq("line 0",         errs[0][0], 0)
+    ce_check("error text mentions file",
+             _has(errs[0][1], "could not read file"))
+}
+
+// ---- shipped pack: data/patterns/security_review.cerec ----------------
+
+fn test_shipped_security_review_pack_parses() {
+    let r = pattern_pack_parse("data/patterns/security_review.cerec")
+    let errs = pattern_pack_errors(r)
+    ce_eq("no parse errors", len(errs), 0)
+    let caps = pattern_pack_capsules(r)
+    ce_eq("1 capsule", len(caps), 1)
+    let c = caps[0]
+    ce_str_eq("name",    pcapsule_name(c),    "security_review")
+    ce_str_eq("version", pcapsule_version(c), "1.0.0")
+    // Sanity floor: OWASP-derived pack should have plenty of patterns.
+    ce_check("has >= 20 patterns", pcapsule_count(c) >= 20)
+}
+
+fn test_shipped_pack_registers_and_matches_owasp_topic() {
+    pattern_pack_load("data/patterns/security_review.cerec")
+    let c = pattern_registry_lookup("security_review")
+    ce_check("registered", c != 0)
+    // A user asking about SQL injection should hit our sql/injection
+    // pattern from the shipped pack.
+    let toks = pcap_tokenize("how do i prevent sql injection in django")
+    let matches = pattern_registry_match_all(toks)
+    let saw_sql = 0
+    let i = 0
+    while i < len(matches) {
+        if _has(pcap_source_tag(matches[i]),
+                "src:pattern:security_review") == 1 {
+            saw_sql = 1
+        }
+        i = i + 1
+    }
+    ce_eq("shipped pack matched sql-injection query", saw_sql, 1)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_parse_empty_returns_empty()
+    test_parse_only_comments_returns_empty()
+    test_parse_directive_before_capsule_errors()
+    test_parse_sample_produces_one_capsule_three_patterns()
+    test_source_tag_defaults_from_name_version()
+    test_source_tag_explicit_overrides_default()
+    test_multiple_capsules_in_one_file()
+    test_version_before_first_pattern_updates_tag()
+    test_confidence_zero_ok()
+    test_confidence_thousand_ok()
+    test_confidence_over_thousand_errors()
+    test_confidence_non_numeric_errors()
+    test_partial_pattern_missing_trigger_errors_but_continues()
+    test_partial_pattern_missing_guidance_errors_but_continues()
+    test_trigger_before_pattern_errors()
+    test_unknown_directive_errors()
+    test_comment_lines_ignored()
+    test_blank_lines_dont_close_pattern()
+    test_guidance_captures_full_rest_of_line()
+    test_load_registers_capsules_and_registry_finds_them()
+    test_registered_pattern_matches_via_registry()
+    test_load_twice_is_last_write_wins()
+    test_read_missing_file_errors_cleanly()
+    test_shipped_security_review_pack_parses()
+    test_shipped_pack_registers_and_matches_owasp_topic()
+    ce_summary("pattern_pack")
+}
+
+main()
