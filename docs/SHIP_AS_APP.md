@@ -793,13 +793,59 @@ matches R53 `pattern_registry_register` semantics). Useful for
 hot-reloading a pack during development without restarting the
 daemon.
 
-## 12. What comes next (R62+)
+### 7.15 Pattern packs over the wire (R62)
 
-- **R62+** — In-process TLS (retires the sidecar recipe),
+R61 shipped `pattern_pack_load` for boot-time file loading;
+R62 puts it on the JSON-RPC surface so an admin can install
+packs dynamically the same way `capability.issue` /
+`ingest.policy.add` land.
+
+```bash
+# List every pattern capsule currently registered
+# (cap: capsule:read -- reader role can do this).
+scripts/rpc.sh pattern.list
+# -> {"ok":true,"result":[
+#      {"name":"debug_common","version":"1.0.0",
+#       "pattern_count":12,"source_tag":"src:pattern:debug_common:v1"},
+#      {"name":"research_hygiene","version":"1.0.0",
+#       "pattern_count":5,"source_tag":"src:pattern:research_hygiene:v1"},
+#      {"name":"security_review","version":"1.0.0",
+#       "pattern_count":25,"source_tag":"src:pattern:security_review:v1.0.0"}]}
+
+# Install a pack body inline (cap: capsule:install -- admin or
+# curator). The `body` arg is the RAW .cerec-shaped pack text;
+# JSON-escape newlines + quotes at the client. scripts/rpc.sh
+# handles that for you:
+scripts/rpc.sh pattern.install body "$(cat pack.cerec)"
+# -> {"ok":true,"result":{
+#      "registered":1,
+#      "names":["my_local_pack"],
+#      "error_count":0,
+#      "errors":[],
+#      "registry_count":4}}
+```
+
+Parse errors are surfaced per-line + per-message but never
+abort the install — every WELL-FORMED capsule in the body still
+registers. A pack with zero parseable capsules returns
+`registered:0` alongside the error list so an operator can
+diagnose without a second call.
+
+**Same trust boundary as R61 file loading** — patterns are
+advice; no review queue; last-write-wins by capsule name.
+Re-installing `security_review v1.0.1` over `v1.0.0` REPLACES
+the older entry in place, and every downstream skill's next
+`pattern_registry_match_all(...)` call sees the new patterns
+immediately.
+
+## 12. What comes next (R63+)
+
+- **R63+** — In-process TLS (retires the sidecar recipe),
   generic structured-record adapter for one-off JSON/YAML
-  sources, wire verb `pattern.install` to install a pattern
-  pack over JSON-RPC (mirrors `skill.install`'s R55.1 shape)
-- **R63+** — Per-source rate budgets controllable via admin wire
+  sources, holder-scoped pattern registry so a pack installed
+  by holder X isn't visible to holder Y (mirrors R55.2's KG /
+  capsule ownership overlay)
+- **R64+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
