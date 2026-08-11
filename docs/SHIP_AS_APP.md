@@ -609,12 +609,20 @@ check before the ownership check runs, so debugging output
 correctly reports `capability required: skill:run` for the
 missing cap and never leaks the fact that a skill is owned.
 
-**What's not gated:** the NL surface (`nl.ask`) still routes
-its dispatched skill runs through `skill_run` directly, bypassing
-`skill.run`. Ownership scoping applies to explicit wire calls to
-`skill.run` only. A future R58+ could thread holder context into
-`nl_execute` to also gate the auto-dispatched skill (research /
-coding_helper) but that's an executor-layer change.
+**R60 update:** `nl.ask` now honors the ownership overlay too.
+When an overlay is wired, an `nl.ask` that would auto-dispatch a
+skill (research / relate / contradict / is_a) runs the same
+ownership check `skill.run` runs. Refusal shape is bit-identical
+(`"skill not accessible to <holder>: research"`), stamped into
+the ExecutionResult's `refusal_reason` slot; the JSON envelope
+still returns `ok:true` because the verb executed successfully
+even though the executor refused to dispatch. Admin-delegated
+kinds (`list capsules`, `list skills`, `retract …`) never touch
+the gate — they were never skill dispatches to begin with. The
+old executor-only path (chat REPL, unit tests, any caller of
+`nl_execute` with the 8-arg signature) is unchanged; a new
+`nl_execute_scoped(...)` variant accepts the overlay + holder
+and is what `nl.ask` calls under the hood.
 
 ### 7.12 Curator auto-approval policies (R58)
 
@@ -717,12 +725,10 @@ review-capped) but not `add`/`remove` — those need `curator` or
 
 ## 12. What comes next (R60+)
 
-- **R60+** — .cerec pattern packs (R53 patterns authored + shipped
-  as .cerec files through the R43 pipeline), holder context
-  threaded into `nl_execute` so auto-dispatched skills (research /
-  coding_helper via `nl.ask`) also honor the ownership overlay,
-  in-process TLS (retires the sidecar recipe), generic
-  structured-record adapter for one-off JSON/YAML sources
+- **R61+** — .cerec pattern packs (R53 patterns authored + shipped
+  as .cerec files through the R43 pipeline), in-process TLS
+  (retires the sidecar recipe), generic structured-record adapter
+  for one-off JSON/YAML sources
 - **R61+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits

@@ -134,6 +134,13 @@ openai-compatible / dry-run).
 nl_execute(query, kg_registry, capsule_registry, persona_registry,
            skill_registry, mo, user_id, now) -> ExecutionResult
 
+// R60: overlay-aware variant. `nl_execute` calls this with
+// overlay=0, holder="" for byte-identical R48p3 behavior.
+nl_execute_scoped(query, kg_registry, capsule_registry,
+                   persona_registry, skill_registry, mo,
+                   user_id, now,
+                   ownership_overlay, holder) -> ExecutionResult
+
 ExecutionResult = [
   ok:                 0/1
   proposal_result:    ProposalResult (from skill_run)
@@ -156,6 +163,18 @@ Dispatch table:
 Every skill invocation goes through `skill_run` — all 5 hard
 guarantees preserved. Persona is looked up by `user_id` from the
 persona_registry and passed through. No shortcuts.
+
+**R60 ownership gate** — when `nl_execute_scoped` receives a
+non-zero `ownership_overlay`, skill-invoking kinds run an
+`ownership_skill_visible(overlay, "research", holder)` check
+BEFORE building the supervisor. A holder who doesn't own the
+skill gets `refusal_reason = "skill not accessible to <holder>:
+research"` — bit-identical to the wire `skill.run` refusal from
+R57, so the two entrances stay in sync. Admin-delegated kinds
+never touch the gate. The RPC verb `nl.ask` (Component 5) passes
+`rpc_ctx_ownership(ctx)` + `rpc_ctx_presented_holder(ctx)`
+through; other callers (chat REPL, tests) keep the R48p3 8-arg
+signature and see no behavior change.
 
 ### Component 4: Templater
 
