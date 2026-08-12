@@ -1096,14 +1096,63 @@ Non-wikidata formats **silently ignore** `labels_body` +
 `formal_preds` so a common config shipped to multiple ingests
 doesn't need per-format arg-stripping.
 
-## 12. What comes next (R70+)
+### 7.20 Ownership auto-assignment on install verbs (R70)
 
-- **R70+** — In-process TLS (retires the sidecar recipe), YAML
+R63 shipped auto-assignment for `pattern.install` — when an
+overlay is wired and a holder is presented, the installed
+capsule gets stamped as owned by that holder so `pattern.list`
+correctly filters. R70 finishes the story by applying the
+same shape to `capsule.install` and `skill.install`.
+
+Rules (identical across all three install verbs now):
+
+| condition | outcome |
+|---|---|
+| no overlay wired | `owner=""` (no stamp) |
+| overlay wired, anonymous caller | `owner=""` (no plausible stamp target) |
+| overlay wired, resource unowned | stamp holder → `owner=<holder>` |
+| overlay wired, resource owned by holder | no-op (idempotent re-install) |
+| overlay wired, resource owned by someone else | **refused**: `"<kind> '<name>' already owned by <other>"` |
+
+The cross-holder refusal fires BEFORE any state mutation —
+a bob attempting `capsule.install public_pack` after alice
+already installed it gets a clean refusal, the capreg's
+install-state doesn't flip, and the overlay is unchanged.
+
+Response envelope now carries `owner`:
+
+```bash
+scripts/rpc.sh capsule.install name public_pack
+# -> {"ok":true,"result":{
+#      "name":"public_pack",
+#      "code":0,
+#      "installed":true,
+#      "owner":"alice"}}     # <-- new in R70
+
+scripts/rpc.sh skill.install name research
+# -> {"ok":true,"result":{
+#      "name":"research",
+#      "installed":true,
+#      "pre_anchored":true,
+#      "code":0,
+#      "owner":"alice"}}     # <-- new in R70
+```
+
+Combined with R55.2's `kg.list` + `capsule.list` filtering
+and R63's `pattern.list` filtering, this means every RESOURCE
+kind now flows through a consistent lifecycle: an admin
+install stamps ownership; only the owner can re-install or
+touch the resource under the overlay; every list surface
+filters correctly.
+
+## 12. What comes next (R71+)
+
+- **R71+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), extend `pattern.install` with a
-  holder-scoped assignment path that mirrors the R63 wire
-  ownership auto-assignment
-- **R71+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), holder-scoped auto-assignment for
+  `ingest.file` (kg + capsule ownership stamped on the target
+  KG / any capsule metadata in the ingested record)
+- **R72+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
