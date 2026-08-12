@@ -1,0 +1,349 @@
+// Unit tests for R66 -- ingest.file wire verb
+// (src/nl/rpc_verbs.nova + src/agent/ingestion_agent.nova helper).
+//
+// Covers:
+//   * Verb registered + cap-required is ingest:decide
+//   * Refusals: no ingest agent in context, missing format, missing/
+//     empty body, unsupported format
+//   * cerec body: trusted src:cerec: source lands direct in the KG;
+//     untrusted source queues to the review queue
+//   * json body: same trust split, with kg/source defaults threaded
+//   * force_queue=1 short-circuits trust and queues everything
+//   * Parse errors are surfaced per-record but well-formed records
+//     still land
+//   * Reader token refused by cap gate; curator/admin allowed
+
+import "../ce_test.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/agent/ingestion_agent.nova"
+import "../../src/ingest/review_queue.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/util/str_safe.nova"
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+// Build a ctx with a fully-wired ingest agent + its review queue
+// (rpc_ctx tracks them separately -- test_ingest_policy shows the
+// pattern).
+fn _mk_ctx() {
+    let agent = ing_agent_new()
+    // Seed a KG so pipeline promotion has a target.
+    kg_spawn(ing_kgreg(agent), "solar_system")
+    kg_spawn(ing_kgreg(agent), "climate")
+    let ctx = rpc_ctx_new(ing_kgreg(agent), capreg_new(),
+                           persona_registry_new(),
+                           skill_registry_new(),
+                           ing_mo(agent),
+                           agent,
+                           ing_queue(agent),
+                           100)
+    return ctx
+}
+
+fn _grant_admin(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-a", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-a")
+    return reg
+}
+
+fn _grant_reader(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-r", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-r")
+    return reg
+}
+
+// ---- registration + cap wiring ----------------------------------------
+
+fn test_verb_registered() {
+    let names = rpc_verb_names()
+    let saw = 0
+    let i = 0
+    while i < len(names) {
+        if str_eq_bytes(names[i], "ingest.file") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("ingest.file registered", saw, 1)
+}
+
+fn test_verb_cap_is_ingest_decide() {
+    ce_eq("cap is ingest:decide",
+          str_eq_bytes(capability_verb_required("ingest.file"),
+                       CAP_INGEST_DECIDE), 1)
+}
+
+// ---- refusals ---------------------------------------------------------
+
+fn test_no_ingest_agent_refused() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   "KG k\nSRC src:cerec:t\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("no ingest agent refused",
+             _has(out, "no ingest agent in context"))
+}
+
+fn test_missing_format_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("body", "x"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("missing format refused",
+             _has(out, "missing arg: format"))
+}
+
+fn test_missing_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("missing body refused",
+             _has(out, "missing arg: body"))
+}
+
+fn test_empty_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   ""))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("empty body refused",
+             _has(out, "body must be non-empty"))
+}
+
+fn test_unsupported_format_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "csv"))
+    push(a, rpc_arg_kv("body",   "name,value\nalice,1\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("unsupported format refused",
+             _has(out, "unsupported format: csv"))
+    ce_check("names the R66 supported formats",
+             _has(out, "cerec + json"))
+}
+
+fn test_reader_refused_by_cap() {
+    let ctx = _mk_ctx()
+    _grant_reader(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   "KG k\nSRC src:cerec:t\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("reader refused",
+             _has(out, "capability required: ingest:decide"))
+}
+
+// ---- cerec: trusted source lands direct in the KG --------------------
+
+fn test_cerec_trusted_source_ingests_direct() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:cerec: is in the default trusted-tags list (ing_agent_new)
+    // so this record goes to the pipeline, not the queue.
+    let body = "KG solar_system\nSRC src:cerec:sample:v1\n"
+             + "ATOM mercury 1 900\n"
+             + "ATOM hot 3 800\n"
+             + "IMP mercury hot EMPIRICAL\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",               _has(out, "\"ok\":true"))
+    ce_check("parsed 1",         _has(out, "\"records_parsed\":1"))
+    ce_check("ingested 1",       _has(out, "\"records_ingested\":1"))
+    ce_check("queued 0",         _has(out, "\"records_queued\":0"))
+    ce_check("dropped 0",        _has(out, "\"records_dropped\":0"))
+    ce_check("atoms_added > 0",
+             _has(out, "\"atoms_added\":2")
+          || _has(out, "\"atoms_added\":3"))
+}
+
+fn test_cerec_untrusted_source_queues() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:web:... is NOT in the default trusted-tags list -> queue.
+    let body = "KG solar_system\nSRC src:web:sketchy:v1\n"
+             + "ATOM mercury 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("queued 1",        _has(out, "\"records_queued\":1"))
+    ce_check("ingested 0",      _has(out, "\"records_ingested\":0"))
+    // Verify the queue actually grew.
+    let q = rpc_ctx_review_queue(ctx)
+    ce_check("queue non-empty", len(rq_entries(q)) >= 1)
+}
+
+fn test_cerec_multi_record_body() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "KG solar_system\nSRC src:cerec:multi:1\nATOM mercury 1 900\n\n"
+             + "KG solar_system\nSRC src:cerec:multi:2\nATOM venus 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("2 parsed",        _has(out, "\"records_parsed\":2"))
+    ce_check("2 ingested",      _has(out, "\"records_ingested\":2"))
+}
+
+fn test_cerec_parse_error_surfaces_but_valid_records_land() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Second record has a bad ATOM line (missing belief).
+    let body = "KG solar_system\nSRC src:cerec:mixed:v1\n"
+             + "ATOM good 1 900\n"
+             + "ATOM bad 1\n"                 // needs belief
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+    ce_check("error surfaced",  _has(out, "\"error_count\":1"))
+    ce_check("error message present",
+             _has(out, "ATOM needs label kind belief"))
+    // Well-formed atom still landed via the pipeline.
+    ce_check("ingested 1", _has(out, "\"records_ingested\":1"))
+}
+
+// ---- json: trusted / defaults / queue --------------------------------
+
+fn test_json_trusted_ingests_direct() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:cerec: is a trusted prefix; use it in the body directly.
+    let body = "[{\"kg\":\"solar_system\",\"source\":\"src:cerec:jsonwire\","
+             + "\"atoms\":[{\"label\":\"mars\",\"kind\":\"fact\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("json ok",             _has(out, "\"ok\":true"))
+    ce_check("json format echoed",
+             _has(out, "\"format\":\"json\""))
+    ce_check("json ingested 1",     _has(out, "\"records_ingested\":1"))
+}
+
+fn test_json_kg_source_defaults_from_args() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Record omits kg + source; args provide them.
+    let body = "[{\"atoms\":[{\"label\":\"jupiter\",\"kind\":\"fact\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    push(a, rpc_arg_kv("kg",     "solar_system"))
+    push(a, rpc_arg_kv("source", "src:cerec:jsonwire2"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("defaults applied + ingested",
+             _has(out, "\"records_ingested\":1"))
+}
+
+fn test_json_untrusted_queues() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "[{\"kg\":\"climate\",\"source\":\"src:json:untrusted:v1\","
+             + "\"atoms\":[{\"label\":\"co2\",\"kind\":\"concept\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("queued 1", _has(out, "\"records_queued\":1"))
+}
+
+fn test_json_top_level_syntax_error() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   "not-json"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("error surfaced",
+             _has(out, "\"error_count\":1"))
+    ce_check("error mentions json",
+             _has(out, "json:"))
+    ce_check("nothing ingested",
+             _has(out, "\"records_ingested\":0"))
+}
+
+// ---- force_queue -----------------------------------------------------
+
+fn test_force_queue_bypasses_trust() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Trusted source, force_queue=1 -> must queue rather than
+    // pipeline.
+    let body = "KG solar_system\nSRC src:cerec:trusted:v1\nATOM saturn 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format",      "cerec"))
+    push(a, rpc_arg_kv("body",        body))
+    push(a, rpc_arg_kv("force_queue", "1"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("force_queue true in response",
+             _has(out, "\"force_queue\":true"))
+    ce_check("queued 1",    _has(out, "\"records_queued\":1"))
+    ce_check("ingested 0",  _has(out, "\"records_ingested\":0"))
+}
+
+fn test_force_queue_default_off() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "KG solar_system\nSRC src:cerec:default:v1\nATOM pluto 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    // no force_queue arg -> default off
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("force_queue false in response",
+             _has(out, "\"force_queue\":false"))
+    ce_check("trusted ingested",
+             _has(out, "\"records_ingested\":1"))
+}
+
+fn main() {
+    test_verb_registered()
+    test_verb_cap_is_ingest_decide()
+    test_no_ingest_agent_refused()
+    test_missing_format_refused()
+    test_missing_body_refused()
+    test_empty_body_refused()
+    test_unsupported_format_refused()
+    test_reader_refused_by_cap()
+    test_cerec_trusted_source_ingests_direct()
+    test_cerec_untrusted_source_queues()
+    test_cerec_multi_record_body()
+    test_cerec_parse_error_surfaces_but_valid_records_land()
+    test_json_trusted_ingests_direct()
+    test_json_kg_source_defaults_from_args()
+    test_json_untrusted_queues()
+    test_json_top_level_syntax_error()
+    test_force_queue_bypasses_trust()
+    test_force_queue_default_off()
+    ce_summary("ingest_file_wire")
+}
+
+main()

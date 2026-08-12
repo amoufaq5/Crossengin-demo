@@ -961,19 +961,92 @@ Shipped: `data/packs/samples/climate_facts.json` — 10 atoms +
 climate-science reference; parses clean and demonstrates every
 directive.
 
-**YAML deferred to R66+** — YAML's indentation semantics,
+**YAML deferred to R67+** — YAML's indentation semantics,
 anchors, tags, and flow-style ambiguity are a much larger
 surface than JSON's clean grammar; a subset would be
 misleading. Operators today can pre-convert YAML with `yq -o
 json` at the shell and pipe into the JSON importer.
 
-## 12. What comes next (R66+)
+### 7.18 ingest.file wire verb (R66)
 
-- **R66+** — In-process TLS (retires the sidecar recipe), YAML
+R43 shipped `/ingest <format> <path>` for the chat REPL and
+the ingest agent behind it. R66 puts the same capability on
+the JSON-RPC surface so a remote client can push records
+inline (no file on disk):
+
+```bash
+# .cerec body inline (cap: ingest:decide -- curator or admin).
+scripts/rpc.sh ingest.file \
+  format cerec \
+  body "KG solar_system
+SRC src:cerec:sample:v1
+ATOM mercury 1 900
+ATOM hot 3 800
+IMP mercury hot EMPIRICAL"
+# -> {"ok":true,"result":{
+#      "format":"cerec",
+#      "records_parsed":1,
+#      "records_ingested":1,
+#      "records_queued":0,
+#      "records_dropped":0,
+#      "atoms_added":2,
+#      "error_count":0,
+#      "errors":[],
+#      "force_queue":false}}
+
+# JSON body with kg/source defaults.
+scripts/rpc.sh ingest.file \
+  format json \
+  kg climate \
+  source src:cerec:climate:v1 \
+  body '[{"atoms":[{"label":"co2","kind":"concept","belief":950}]}]'
+# -> {"ok":true,"result":{"format":"json","records_parsed":1,
+#      "records_ingested":1,...}}
+
+# Force human review even for a trusted source.
+scripts/rpc.sh ingest.file \
+  format cerec \
+  body "KG k
+SRC src:cerec:review-me
+ATOM x 1 500" \
+  force_queue 1
+# -> ingested:0, queued:1
+```
+
+Formats supported at R66: **cerec** and **json**. Both have
+text-parse variants (`cerec_parse_text` / `jsonr_parse_text`);
+the other importers (csv, ntriples, wikidata, conceptnet,
+papermeta, wordnet) need text variants first — a per-format
+one-liner in R67+ scope.
+
+**Trust boundary preserved** — the same `_ing_is_trusted`
+check that gates `/ingest` from a file-path applies here:
+records with a trusted source-tag prefix (`src:pack:`,
+`src:cerec:`, `src:user:`, `src:cap:`) go direct to the
+pipeline; everything else lands in the review queue. R58
+auto-approval policies then decide on queued entries the same
+way they do for file-loaded ingests.
+
+**`force_queue: "1"`** short-circuits trust and queues every
+record — useful when an operator wants human review of every
+record even from a trusted origin (e.g., debugging a suspect
+source, or building a curator audit trail).
+
+**Parse errors surface per-line + per-message** but never
+abort the ingest — every well-formed record still lands. A
+body with zero parseable records returns `records_parsed:0` +
+the error list so an operator can diagnose without a second
+call.
+
+## 12. What comes next (R67+)
+
+- **R67+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), wire verb `ingest.file` that accepts a
-  format + body inline (mirrors `pattern.install`)
-- **R67+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), text-parse variants for the remaining
+  importers so `ingest.file` can accept csv/ntriples/etc.
+  bodies, consolidate the R65 `jsonr_parse_value` parser onto
+  the pre-existing `src/data/json.nova` tagged parser
+- **R68+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
