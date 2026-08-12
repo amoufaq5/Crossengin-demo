@@ -1281,14 +1281,78 @@ capability lifecycle verbs use. Curators (`ingest:decide`)
 can create ownership via install/ingest verbs but can't
 audit or transfer it.
 
-## 12. What comes next (R73+)
+### 7.23 Policy registry round-trip via session snapshots (R73)
 
-- **R73+** — In-process TLS (retires the sidecar recipe), YAML
+R55.3 shipped `session.save`/`session.load` covering personas,
+capability tokens, trust anchors, and ownership overlay. R58's
+policy registry was boot-time-only — a `session.load` would
+restore every other piece of daemon state but leave auto-
+approval policies to be re-registered by hand. R73 closes the
+gap.
+
+Snapshot format gets one new section:
+
+```
+#POLICY v1
+POLICY safe_open_packs APPROVE
+PRED SOURCE_PREFIX src:pack:
+PRED LICENSE_EQ 2
+PRED MAX_ATOMS 500
+POLICY catch_all APPROVE
+PRED ANY 0
+```
+
+Each policy emits a `POLICY <name> <action>` line, then a
+`PRED <op> <arg>` for every predicate. Predicate encoding
+mirrors R58: `SOURCE_PREFIX` and `KG_EQUALS` take a string
+arg (everything after the space, so colons in values round-
+trip); `LICENSE_EQ` and `MAX_ATOMS` take an integer arg;
+`ANY`'s arg is written as `0` and ignored on load.
+
+Wire responses now carry a `policies` count:
+
+```bash
+scripts/rpc.sh session.save name my_daemon
+# -> {"ok":true,"result":{
+#      ...
+#      "personas":3,"tokens":7,"anchors":2,
+#      "ownership_entries":12,"policies":4,
+#      ...}}
+
+scripts/rpc.sh session.load name my_daemon
+# -> {"ok":true,"result":{
+#      ...
+#      "policies":4,       # <-- R73: repopulated ingest.policy registry
+#      ...}}
+```
+
+New signatures (existing callers unchanged):
+
+```
+session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
+                              overlay, policy_reg, include_secrets, now)
+session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
+                          overlay, policy_reg, now)
+```
+
+The 6-arg `session_snapshot_serialize` / 6-arg
+`session_snapshot_apply` still work — they delegate with
+`policy_reg=0` so a `#POLICY v1` section is neither written
+nor read. Every R55.3-R72 test remained byte-identical.
+
+**Lenient parser** — a malformed `PRED` line, an unknown op
+name, an unknown action, or a `PRED` before any `POLICY`
+opener is dropped without aborting the parse; the rest of
+the section still loads.
+
+## 12. What comes next (R74+)
+
+- **R74+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), snapshot round-trip for ingest.policy
-  registry (currently a boot-time-only registry; a snapshot
-  restore doesn't repopulate it)
-- **R74+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), snapshot round-trip for the pattern
+  registry (R53 built-ins reload on daemon start but any
+  R62-installed authored pack is boot-time-lost)
+- **R75+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 

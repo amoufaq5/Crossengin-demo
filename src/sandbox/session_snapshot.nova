@@ -44,6 +44,7 @@ import "../persona/persona_export.nova"
 import "./capability.nova"
 import "./skill_signature.nova"
 import "./ownership.nova"
+import "../ingest/policy.nova"
 import "../util/str_safe.nova"
 
 // ---- version constant --------------------------------------------------
@@ -199,13 +200,80 @@ fn _snap_caps_section(cap_reg, include_secrets) {
     return out
 }
 
+// ---- R73: policy registry section builder ------------------------------
+//
+// Serialize the R58 ingest.policy registry (list of Policy records).
+// Each policy is emitted as:
+//
+//   POLICY <name> <action_name>
+//   PRED <op_name> <arg>
+//   PRED <op_name> <arg>
+//   ...
+//
+// The action name uses policy_action_to_name (APPROVE today).
+// For each predicate:
+//   * ANY:            arg is written as "0" (parser ignores)
+//   * SOURCE_PREFIX / KG_EQUALS: arg is the string value, kept
+//                                verbatim (may contain colons or
+//                                other chars up to end-of-line)
+//   * LICENSE_EQ / MAX_ATOMS: arg is int_to_str(int_value)
+//
+// Split rule at parse time: `PRED <op> <rest-of-line>` so string
+// args with spaces (unusual but tolerated) round-trip cleanly.
+fn _snap_policy_section(policy_reg) {
+    if policy_reg == 0 { return "" }
+    let pols = policy_registry_policies(policy_reg)
+    if len(pols) == 0 { return "" }
+    let out = "\n#POLICY v1\n"
+    let i = 0
+    while i < len(pols) {
+        let p = pols[i]
+        out = out + "POLICY " + policy_name(p)
+                  + " " + policy_action_to_name(policy_action(p)) + "\n"
+        let preds = policy_predicates(p)
+        let j = 0
+        while j < len(preds) {
+            let pr = preds[j]
+            let op = pr[POL_PRED_OP]
+            let arg = pr[POL_PRED_ARG]
+            let arg_str = ""
+            if policy_op_arg_is_int(op) == 1 {
+                arg_str = int_to_str(arg)
+            } else {
+                if op == POL_OP_ANY { arg_str = "0" }
+                else                { arg_str = arg }
+            }
+            out = out + "PRED " + policy_op_to_name(op)
+                      + " " + arg_str + "\n"
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // ---- public serialize --------------------------------------------------
 //
 // Compose one text dump of every registry passed. Any registry arg
 // that's 0 contributes no section (the version banner + timestamp
 // always render). `now` is the moment stamped on the header.
+//
+// R73 note: the 6-arg signature is preserved for every existing
+// caller (backward-compat with R55.3-R72). Use
+// session_snapshot_serialize_ex when the R58 policy registry needs
+// to round-trip too.
 fn session_snapshot_serialize(persona_reg, cap_reg, trust_reg,
                               overlay, include_secrets, now) {
+    return session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
+                                          overlay, 0,
+                                          include_secrets, now)
+}
+
+// R73 extended serializer: policy_reg (may be 0) round-trips as
+// a #POLICY v1 section. Every other section behaves identically.
+fn session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
+                                  overlay, policy_reg,
+                                  include_secrets, now) {
     let out = SNAP_VERSION_LINE + "\n"
     out = out + "#saved-at " + int_to_str(now) + "\n"
     if include_secrets == 0 {
@@ -217,6 +285,7 @@ fn session_snapshot_serialize(persona_reg, cap_reg, trust_reg,
     out = out + _snap_ownership_section(overlay)
     out = out + _snap_trust_section(trust_reg)
     out = out + _snap_caps_section(cap_reg, include_secrets)
+    out = out + _snap_policy_section(policy_reg)
     return out
 }
 
@@ -244,7 +313,8 @@ let SNAPRES_ANCHORS     = 3
 let SNAPRES_TOKENS      = 4
 let SNAPRES_OWNERSHIP   = 5
 let SNAPRES_REKEYED     = 6
-let SNAPRES_SLOTS       = 7
+let SNAPRES_POLICIES    = 7    // R73
+let SNAPRES_SLOTS       = 8
 
 fn _snap_result_new() {
     let r = list_new()
@@ -255,6 +325,7 @@ fn _snap_result_new() {
     push(r, 0)                  // TOKENS
     push(r, 0)                  // OWNERSHIP
     push(r, list_new())         // REKEYED (holder, new_id pairs)
+    push(r, 0)                  // POLICIES (R73)
     return r
 }
 
@@ -265,6 +336,7 @@ fn snap_result_anchors(r)    { return r[SNAPRES_ANCHORS] }
 fn snap_result_tokens(r)     { return r[SNAPRES_TOKENS] }
 fn snap_result_ownership(r)  { return r[SNAPRES_OWNERSHIP] }
 fn snap_result_rekeyed(r)    { return r[SNAPRES_REKEYED] }
+fn snap_result_policies(r)   { return r[SNAPRES_POLICIES] }
 
 // Split the whole dump into individual sections keyed by their header
 // marker (#PERSONA v1 / #OWNERSHIP v1 / #TRUST v1 / #CAPS v1). Returns
@@ -291,6 +363,7 @@ fn _snap_split_sections(text) {
                     if str_eq_bytes(line, "#OWNERSHIP v1") == 1 { is_marker = 1 }
                     if str_eq_bytes(line, "#TRUST v1")     == 1 { is_marker = 1 }
                     if str_eq_bytes(line, "#CAPS v1")      == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#POLICY v1")    == 1 { is_marker = 1 }
                 }
             }
             if is_marker == 1 {
@@ -492,11 +565,102 @@ fn _snap_apply_caps(body, cap_reg, now, result) {
     return applied
 }
 
+// R73 policy loader. Walks a #POLICY v1 body line by line:
+//   POLICY <name> <action_name>    opens a new policy
+//   PRED   <op_name> <arg-rest>    appends a predicate to the CURRENT
+//                                  open policy
+// A malformed PRED line is skipped (lenient parser); a PRED before any
+// POLICY is dropped; unknown op or action name causes the line to be
+// skipped without aborting the parse. Returns the count of REGISTERED
+// policies (a policy with 0 predicates still registers -- matches R58's
+// "empty predicates matches everything" semantics).
+fn _snap_apply_policy(body, policy_reg) {
+    if policy_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    let cur = 0                 // currently-open Policy, or 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {  // skip # comments
+                let sp1 = find_char(line, 32)
+                if sp1 > 0 {
+                    let head = substr(line, 0, sp1)
+                    let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                    if str_eq_bytes(head, "POLICY") == 1 {
+                        // Flush any previous policy to the registry.
+                        if cur != 0 {
+                            policy_registry_register(policy_reg, cur)
+                            applied = applied + 1
+                            cur = 0
+                        }
+                        // Parse "<name> <action>".
+                        let sp2 = find_char(rest, 32)
+                        if sp2 > 0 {
+                            let name = substr(rest, 0, sp2)
+                            let act_name = substr(rest, sp2 + 1,
+                                                   len(rest) - sp2 - 1)
+                            let act = policy_action_from_name(act_name)
+                            if act >= 0 {
+                                if len(name) > 0 {
+                                    cur = policy_new(name, act)
+                                }
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "PRED") == 1 {
+                        if cur != 0 {
+                            let sp3 = find_char(rest, 32)
+                            if sp3 > 0 {
+                                let op_name = substr(rest, 0, sp3)
+                                let arg_str = substr(rest, sp3 + 1,
+                                                      len(rest) - sp3 - 1)
+                                let op = policy_op_from_name(op_name)
+                                if op >= 0 {
+                                    let arg = arg_str
+                                    if policy_op_arg_is_int(op) == 1 {
+                                        arg = str_to_int(arg_str)
+                                    } else {
+                                        if op == POL_OP_ANY { arg = 0 }
+                                    }
+                                    push(cur[POL_PREDICATES],
+                                          pol_pred(op, arg))
+                                }
+                            }
+                        }
+                    } }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Flush the final open policy.
+    if cur != 0 {
+        policy_registry_register(policy_reg, cur)
+        applied = applied + 1
+    }
+    return applied
+}
+
 // The public deserialize entry point. Consumes `text`, applies each
 // section to its matching (non-null) registry. `now` is used for
 // freshly-minted token ids on shape-only snapshots.
+//
+// R73: preserved as a thin wrapper. Use session_snapshot_apply_ex
+// when the policy registry needs to be populated.
 fn session_snapshot_apply(text, persona_reg, cap_reg, trust_reg,
                           overlay, now) {
+    return session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
+                                      overlay, 0, now)
+}
+
+fn session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
+                              overlay, policy_reg, now) {
     let r = _snap_result_new()
     if len(text) == 0 {
         list_set(r, SNAPRES_ERR, "empty snapshot text")
@@ -535,6 +699,10 @@ fn session_snapshot_apply(text, persona_reg, cap_reg, trust_reg,
         if str_eq_bytes(marker, "#CAPS v1") == 1 {
             let a = _snap_apply_caps(body, cap_reg, now, r)
             list_set(r, SNAPRES_TOKENS, r[SNAPRES_TOKENS] + a)
+        }
+        if str_eq_bytes(marker, "#POLICY v1") == 1 {
+            let a = _snap_apply_policy(body, policy_reg)
+            list_set(r, SNAPRES_POLICIES, r[SNAPRES_POLICIES] + a)
         }
         i = i + 1
     }
