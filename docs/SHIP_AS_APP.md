@@ -1013,11 +1013,22 @@ ATOM x 1 500" \
 # -> ingested:0, queued:1
 ```
 
-Formats supported at R66: **cerec** and **json**. Both have
-text-parse variants (`cerec_parse_text` / `jsonr_parse_text`);
-the other importers (csv, ntriples, wikidata, conceptnet,
-papermeta, wordnet) need text variants first — a per-format
-one-liner in R67+ scope.
+Formats supported at R67: **cerec**, **json**, **csv**,
+**ntriples**, **wikidata**, **conceptnet**, **papermeta**,
+**wordnet** — every importer whose module ships a
+`_parse_text` variant. Each takes the same envelope
+(`format` + `body`) plus format-specific args:
+
+| format     | requires `kg` | requires `source` | extra              |
+|------------|---------------|-------------------|--------------------|
+| cerec      | no (in body)  | no (in body)      | —                  |
+| json       | no (default)  | no (default)      | `kg`/`source` default when a record omits them |
+| csv        | **yes**       | **yes**           | —                  |
+| ntriples   | **yes**       | **yes**           | —                  |
+| wikidata   | **yes**       | **yes**           | uses empty labels + default FORMAL preds; pre-resolve labels off-wire if needed |
+| conceptnet | **yes**       | **yes**           | optional `keep_lang="1"` for multilingual |
+| papermeta  | **yes**       | no                | source computed per-DOI |
+| wordnet    | **yes**       | **yes**           | —                  |
 
 **Trust boundary preserved** — the same `_ing_is_trusted`
 check that gates `/ingest` from a file-path applies here:
@@ -1038,15 +1049,15 @@ body with zero parseable records returns `records_parsed:0` +
 the error list so an operator can diagnose without a second
 call.
 
-## 12. What comes next (R67+)
+## 12. What comes next (R68+)
 
-- **R67+** — In-process TLS (retires the sidecar recipe), YAML
+- **R68+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), text-parse variants for the remaining
-  importers so `ingest.file` can accept csv/ntriples/etc.
-  bodies, consolidate the R65 `jsonr_parse_value` parser onto
-  the pre-existing `src/data/json.nova` tagged parser
-- **R68+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), multi-body wire ingest so `wikidata` can
+  carry its labels table alongside the triples, consolidate
+  the R65 `jsonr_parse_value` parser onto the pre-existing
+  `src/data/json.nova` tagged parser
+- **R69+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
