@@ -1230,14 +1230,65 @@ operator can wire a single ownership overlay and every
 resource kind an alice creates via any entry point is
 invisible to bob and refuses cross-holder writes uniformly.
 
-## 12. What comes next (R72+)
+### 7.22 Ownership audit + transfer over the wire (R72)
 
-- **R72+** — In-process TLS (retires the sidecar recipe), YAML
+R55.2/R63/R70/R71 all stamp ownership on their respective
+entry points. R72 exposes two admin verbs so operators can
+audit + hand off the overlay from the wire instead of
+dropping into NOVA helper code.
+
+```bash
+# Enumerate every ownership entry (cap: admin:sandbox).
+scripts/rpc.sh ownership.list
+# -> {"ok":true,"result":[
+#      {"kind":"kg","name":"alice_notebook","owner":"alice"},
+#      {"kind":"capsule","name":"security_pack","owner":"alice"},
+#      {"kind":"skill","name":"research","owner":"alice"},
+#      {"kind":"pattern","name":"my_debug_pack","owner":"bob"}]}
+
+# Filter by kind and/or holder (both optional; compose with AND).
+scripts/rpc.sh ownership.list kind kg holder alice
+# -> only KGs owned by alice
+
+# Hand off ownership from alice to bob (cap: admin:sandbox).
+scripts/rpc.sh ownership.transfer \
+  kind kg name alice_notebook new_owner bob
+# -> {"ok":true,"result":{
+#      "kind":"kg","name":"alice_notebook",
+#      "old_owner":"alice","new_owner":"bob",
+#      "cleared":false}}
+
+# Make a resource public again (empty new_owner clears the entry).
+scripts/rpc.sh ownership.transfer \
+  kind capsule name shared_pack new_owner ""
+# -> {"ok":true,"result":{...,"cleared":true}}
+```
+
+**Refusal rules for `ownership.transfer`**:
+
+- Missing any of `kind`, `name`, `new_owner` → refuse (empty
+  `new_owner` string is OK — that's the "make public" case)
+- `kind` outside {kg, capsule, skill, pattern} → refuse
+- Empty `name` → refuse
+- Target resource has no existing owner AND `new_owner`
+  non-empty → refuse (`"cannot transfer: <kind> '<name>' has
+  no existing owner (use an install verb to establish)"`).
+  Transfer means HAND-OFF; use an install verb to establish
+  fresh ownership.
+
+Both verbs require **admin:sandbox** — the same cap the R55
+capability lifecycle verbs use. Curators (`ingest:decide`)
+can create ownership via install/ingest verbs but can't
+audit or transfer it.
+
+## 12. What comes next (R73+)
+
+- **R73+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), a wire verb (`ownership.list` /
-  `ownership.transfer`) so an operator can audit + hand off
-  owned resources without dropping into NOVA helper code
-- **R73+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), snapshot round-trip for ingest.policy
+  registry (currently a boot-time-only registry; a snapshot
+  restore doesn't repopulate it)
+- **R74+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
