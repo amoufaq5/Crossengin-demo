@@ -1,5 +1,5 @@
-// CrossEngin ingestion: JSON structured-record importer (R65,
-// SHIP_AS_APP §12 -- generic structured-record adapter).
+// CrossEngin ingestion: JSON structured-record importer (R65 shape,
+// R69 refactored onto src/data/json.nova).
 //
 // Turns a JSON array of record objects into curriculum records that
 // slot into the same pipeline / review-queue / policy engine every
@@ -7,6 +7,19 @@
 // one-off JSON dataset (a scraper output, an internal admin dump,
 // an LLM-emitted JSON structure) without hand-authoring .cerec
 // syntax or writing a format-specific importer.
+//
+// R69 refactor: the R65 recursive-descent parser (~350 lines of
+// jsonr_parse_value + _jr_* helpers) was deleted in favor of the
+// pre-existing tagged JV_* parser at src/data/json.nova. Two wins:
+//
+//   * one JSON parser in the codebase (was two; the R66 silent-crash
+//     bug was a symptom of the duplication)
+//   * data/json.nova accepts floats/exponents where R65 explicitly
+//     rejected them at the parser layer. R69 moves float rejection to
+//     the schema layer -- a float that lands in an int-typed slot
+//     (belief / weight / sign) records a per-record error and skips
+//     that field, matching the "lenient parser" contract every other
+//     importer already provides.
 //
 // Wire format (top-level MUST be a JSON array of record objects):
 //
@@ -64,463 +77,15 @@
 // CrossEngin dependencies:
 //   src/ingest/curriculum.nova
 //   src/kg/atom_store.nova (ATOM_* constants)
+//   src/data/json.nova (json_parse + JV_* accessors)
 //   src/util/str_safe.nova.
 
 import "../curriculum.nova"
 import "../../kg/atom_store.nova"
+import "../../data/json.nova"
 import "../../util/str_safe.nova"
 
-// ---- JSON parser (recursive descent) -----------------------------------
-//
-// R66 refactor note: `src/data/json.nova` already ships a tagged
-// JV_NULL/BOOL/NUM/STR/ARR/OBJ/ERR parser. R65 wrote this fresh
-// parser (jsonr_parse_value) because the ingest layer already
-// treats values as untyped NOVA lists/strings/ints. A future R67+
-// consolidation could swap this parser for a data/json.nova
-// adapter to reduce surface. Keeping the two parsers separate for
-// R66 avoids a mid-round refactor.
-//
-// Untyped return values -- NOVA has no discriminated union. Convention:
-//   null       -> a sentinel list [tag_JSON_NULL]
-//   true       -> 1
-//   false      -> 0
-//   integer    -> NOVA int
-//   string     -> NOVA string
-//   array      -> NOVA list of values
-//   object     -> NOVA list of [key_string, value] pairs
-//
-// Callers use the type-check helpers below (_jr_is_null, _jr_is_arr,
-// _jr_is_obj) to demux. Number values are integers only in R65 --
-// floats would need a `float` type NOVA doesn't natively surface for
-// belief arithmetic. Belief / weight fields must be milli-scaled
-// integers (0..1000).
-
-// The null sentinel: a single list carrying a discriminator symbol.
-// Kept private + returned by the parser only; callers demux via
-// `_jr_is_null`.
-let _JR_NULL_TAG = "__json_null__"
-
-fn _jr_null() {
-    let n = list_new()
-    push(n, _JR_NULL_TAG)
-    return n
-}
-
-fn _jr_is_null(v) {
-    // The null sentinel is a 1-element list whose first slot is
-    // _JR_NULL_TAG. Any other list is an array/object (or a value).
-    // We don't need to distinguish arrays-vs-null when
-    // arrays never contain the tag as their first element (they hold
-    // parsed values, and the tag isn't produced by any other path).
-    return 0
-}
-
-// Parser state -- {text, pos, err}. Advanced through by all
-// _jr_* helpers.
-fn _jr_state_new(text) {
-    let s = list_new()
-    push(s, text)     // 0 TEXT
-    push(s, 0)        // 1 POS
-    push(s, "")       // 2 ERR
-    return s
-}
-
-fn _jr_text(s) { return s[0] }
-fn _jr_pos(s)  { return s[1] }
-fn _jr_err(s)  { return s[2] }
-fn _jr_set_err(s, msg) {
-    if len(s[2]) == 0 { list_set(s, 2, msg) }
-}
-
-fn _jr_at(s) {
-    if s[1] >= len(s[0]) { return 0 - 1 }
-    return char_at(s[0], s[1])
-}
-
-fn _jr_advance(s) { list_set(s, 1, s[1] + 1) }
-
-fn _jr_is_ws(c) {
-    if c == 32 { return 1 }
-    if c == 9  { return 1 }
-    if c == 10 { return 1 }
-    if c == 13 { return 1 }
-    return 0
-}
-
-fn _jr_skip_ws(s) {
-    let more = 1
-    while more == 1 {
-        let c = _jr_at(s)
-        if c < 0 { more = 0 }
-        else {
-            if _jr_is_ws(c) == 1 { _jr_advance(s) }
-            else { more = 0 }
-        }
-    }
-}
-
-fn _jr_expect(s, want_char, name) {
-    _jr_skip_ws(s)
-    let c = _jr_at(s)
-    if c == want_char {
-        _jr_advance(s)
-        return 1
-    }
-    _jr_set_err(s, "expected " + name + " at pos "
-                    + int_to_str(_jr_pos(s)))
-    return 0
-}
-
-// String literal. Handles \n \r \t \" \\ \/ \b \f and \uXXXX (BMP).
-// Returns the parsed string, or "" with err set on failure.
-fn _jr_hex_nibble(c) {
-    if c >= 48 { if c <= 57  { return c - 48 } }   // 0-9
-    if c >= 97 { if c <= 102 { return c - 87 } }   // a-f
-    if c >= 65 { if c <= 70  { return c - 55 } }   // A-F
-    return 0 - 1
-}
-
-// Encode a Unicode code point as UTF-8 (1-3 bytes for BMP; 4 bytes
-// for supplementary planes via surrogate-pair reassembly done at
-// the caller). Returns "" on invalid code point.
-fn _jr_utf8_from_cp(cp) {
-    if cp < 0 { return "" }
-    if cp < 128 {
-        return chr(cp)
-    }
-    if cp < 2048 {
-        let b1 = 192 + cp / 64
-        let b2 = 128 + (cp - (cp / 64) * 64)
-        return chr(b1) + chr(b2)
-    }
-    if cp < 65536 {
-        let b1 = 224 + cp / 4096
-        let mid = cp - (cp / 4096) * 4096
-        let b2 = 128 + mid / 64
-        let b3 = 128 + (mid - (mid / 64) * 64)
-        return chr(b1) + chr(b2) + chr(b3)
-    }
-    if cp < 1114112 {
-        let b1 = 240 + cp / 262144
-        let r1 = cp - (cp / 262144) * 262144
-        let b2 = 128 + r1 / 4096
-        let r2 = r1 - (r1 / 4096) * 4096
-        let b3 = 128 + r2 / 64
-        let b4 = 128 + (r2 - (r2 / 64) * 64)
-        return chr(b1) + chr(b2) + chr(b3) + chr(b4)
-    }
-    return ""
-}
-
-// Read 4 hex digits after \u; returns code point or -1 on error.
-fn _jr_read_u4(s) {
-    let out = 0
-    let i = 0
-    while i < 4 {
-        let c = _jr_at(s)
-        let n = _jr_hex_nibble(c)
-        if n < 0 { return 0 - 1 }
-        out = out * 16 + n
-        _jr_advance(s)
-        i = i + 1
-    }
-    return out
-}
-
-fn _jr_string(s) {
-    _jr_skip_ws(s)
-    if _jr_at(s) != 34 {
-        _jr_set_err(s, "expected string quote at pos "
-                        + int_to_str(_jr_pos(s)))
-        return ""
-    }
-    _jr_advance(s)
-    let out = ""
-    let more = 1
-    while more == 1 {
-        let c = _jr_at(s)
-        if c < 0 {
-            _jr_set_err(s, "unterminated string")
-            more = 0
-        } else {
-            if c == 34 {
-                _jr_advance(s)
-                more = 0
-            } else {
-                if c == 92 {                    // '\'
-                    _jr_advance(s)
-                    let e = _jr_at(s)
-                    if e == 34 { out = out + "\"" _jr_advance(s) }
-                    else { if e == 92 { out = out + "\\" _jr_advance(s) }
-                    else { if e == 47 { out = out + "/"  _jr_advance(s) }
-                    else { if e == 110 { out = out + "\n" _jr_advance(s) }
-                    else { if e == 114 { out = out + "\r" _jr_advance(s) }
-                    else { if e == 116 { out = out + "\t" _jr_advance(s) }
-                    else { if e == 98  { out = out + chr(8)  _jr_advance(s) }
-                    else { if e == 102 { out = out + chr(12) _jr_advance(s) }
-                    else { if e == 117 {
-                        // \uXXXX
-                        _jr_advance(s)
-                        let cp = _jr_read_u4(s)
-                        if cp < 0 {
-                            _jr_set_err(s, "invalid \\u escape")
-                            more = 0
-                        } else {
-                            // Surrogate-pair handling for BMP overflow.
-                            if cp >= 55296 { if cp <= 56319 {
-                                // High surrogate -- expect a low one.
-                                let ok = 1
-                                if _jr_at(s) == 92 { _jr_advance(s) }
-                                else { ok = 0 }
-                                if ok == 1 {
-                                    if _jr_at(s) == 117 { _jr_advance(s) }
-                                    else { ok = 0 }
-                                }
-                                if ok == 1 {
-                                    let cp2 = _jr_read_u4(s)
-                                    if cp2 < 56320 { ok = 0 }
-                                    if cp2 > 57343 { ok = 0 }
-                                    if ok == 1 {
-                                        let full = 65536
-                                              + (cp  - 55296) * 1024
-                                              + (cp2 - 56320)
-                                        out = out + _jr_utf8_from_cp(full)
-                                    }
-                                }
-                                if ok == 0 {
-                                    _jr_set_err(s, "bad surrogate pair")
-                                    more = 0
-                                }
-                            } else {
-                                out = out + _jr_utf8_from_cp(cp)
-                            } }
-                            else {
-                                out = out + _jr_utf8_from_cp(cp)
-                            }
-                        }
-                    } else {
-                        _jr_set_err(s, "unknown escape \\"
-                                        + chr(e))
-                        more = 0
-                    }
-                    } } } } } } } }
-                } else {
-                    out = out + chr(c)
-                    _jr_advance(s)
-                }
-            }
-        }
-    }
-    return out
-}
-
-// Parse an integer literal. Supports optional leading '-'; no
-// decimals or exponents (R65 is int-only). Returns the number, or
-// 0 with err set on failure.
-fn _jr_int(s) {
-    _jr_skip_ws(s)
-    let sign = 1
-    if _jr_at(s) == 45 { sign = 0 - 1 _jr_advance(s) }
-    let c = _jr_at(s)
-    if c < 48 { _jr_set_err(s, "expected digit at pos "
-                                + int_to_str(_jr_pos(s))) return 0 }
-    if c > 57 { _jr_set_err(s, "expected digit at pos "
-                                + int_to_str(_jr_pos(s))) return 0 }
-    let v = 0
-    let more = 1
-    while more == 1 {
-        let d = _jr_at(s)
-        if d < 48 { more = 0 }
-        else { if d > 57 { more = 0 }
-        else {
-            v = v * 10 + (d - 48)
-            _jr_advance(s)
-        } }
-    }
-    // Reject a bare fraction (indicates the value was a float).
-    if _jr_at(s) == 46 {
-        _jr_set_err(s, "float values not supported (R65 is int-only)")
-        return 0
-    }
-    return sign * v
-}
-
-// Forward decl trick: call site names _jr_value; NOVA compiles the
-// whole file so forward references resolve fine at compile time.
-
-fn _jr_array(s) {
-    if _jr_expect(s, 91, "'['") == 0 { return list_new() }   // '['
-    let out = list_new()
-    _jr_skip_ws(s)
-    if _jr_at(s) == 93 { _jr_advance(s) return out }        // ']'
-    let more = 1
-    while more == 1 {
-        let v = _jr_value(s)
-        if len(_jr_err(s)) > 0 { more = 0 }
-        else {
-            push(out, v)
-            _jr_skip_ws(s)
-            let c = _jr_at(s)
-            if c == 44 { _jr_advance(s) }                    // ','
-            else { if c == 93 { _jr_advance(s) more = 0 }    // ']'
-            else {
-                _jr_set_err(s, "expected ',' or ']' at pos "
-                                + int_to_str(_jr_pos(s)))
-                more = 0
-            } }
-        }
-    }
-    return out
-}
-
-fn _jr_object(s) {
-    if _jr_expect(s, 123, "'{'") == 0 { return list_new() }  // '{'
-    let out = list_new()
-    _jr_skip_ws(s)
-    if _jr_at(s) == 125 { _jr_advance(s) return out }        // '}'
-    let more = 1
-    while more == 1 {
-        let key = _jr_string(s)
-        if len(_jr_err(s)) > 0 { more = 0 }
-        else {
-            _jr_skip_ws(s)
-            if _jr_expect(s, 58, "':'") == 0 { more = 0 }    // ':'
-            else {
-                let v = _jr_value(s)
-                if len(_jr_err(s)) > 0 { more = 0 }
-                else {
-                    let kv = list_new() push(kv, key) push(kv, v)
-                    push(out, kv)
-                    _jr_skip_ws(s)
-                    let c = _jr_at(s)
-                    if c == 44 { _jr_advance(s) }             // ','
-                    else { if c == 125 { _jr_advance(s) more = 0 } // '}'
-                    else {
-                        _jr_set_err(s, "expected ',' or '}' at pos "
-                                        + int_to_str(_jr_pos(s)))
-                        more = 0
-                    } }
-                }
-            }
-        }
-    }
-    return out
-}
-
-// Dispatch: peek at next non-ws char and route to the right parser.
-fn _jr_value(s) {
-    _jr_skip_ws(s)
-    let c = _jr_at(s)
-    if c == 123 { return _jr_object(s) }        // '{'
-    if c == 91  { return _jr_array(s) }         // '['
-    if c == 34  { return _jr_string(s) }        // '"'
-    // literals: true / false / null
-    if c == 116 {                                // 't'
-        if _jr_pos(s) + 4 <= len(_jr_text(s)) {
-            let sub = substr(_jr_text(s), _jr_pos(s), 4)
-            if str_eq_bytes(sub, "true") == 1 {
-                list_set(s, 1, _jr_pos(s) + 4)
-                return 1
-            }
-        }
-        _jr_set_err(s, "expected 'true' at pos "
-                        + int_to_str(_jr_pos(s)))
-        return 0
-    }
-    if c == 102 {                                // 'f'
-        if _jr_pos(s) + 5 <= len(_jr_text(s)) {
-            let sub = substr(_jr_text(s), _jr_pos(s), 5)
-            if str_eq_bytes(sub, "false") == 1 {
-                list_set(s, 1, _jr_pos(s) + 5)
-                return 0
-            }
-        }
-        _jr_set_err(s, "expected 'false' at pos "
-                        + int_to_str(_jr_pos(s)))
-        return 0
-    }
-    if c == 110 {                                // 'n'
-        if _jr_pos(s) + 4 <= len(_jr_text(s)) {
-            let sub = substr(_jr_text(s), _jr_pos(s), 4)
-            if str_eq_bytes(sub, "null") == 1 {
-                list_set(s, 1, _jr_pos(s) + 4)
-                return _jr_null()
-            }
-        }
-        _jr_set_err(s, "expected 'null' at pos "
-                        + int_to_str(_jr_pos(s)))
-        return 0
-    }
-    // number: '-' or digit
-    if c == 45 { return _jr_int(s) }
-    if c >= 48 { if c <= 57 { return _jr_int(s) } }
-    _jr_set_err(s, "unexpected char at pos " + int_to_str(_jr_pos(s)))
-    return 0
-}
-
-// Public parse. Returns [top_value, error_string_or_""].
-fn jsonr_parse_value(text) {
-    let s = _jr_state_new(text)
-    let v = _jr_value(s)
-    _jr_skip_ws(s)
-    if len(_jr_err(s)) == 0 {
-        if _jr_pos(s) < len(_jr_text(s)) {
-            _jr_set_err(s, "trailing garbage after JSON value at pos "
-                            + int_to_str(_jr_pos(s)))
-        }
-    }
-    let out = list_new()
-    push(out, v)
-    push(out, _jr_err(s))
-    return out
-}
-
-// ---- schema layer: JSON -> curriculum records --------------------------
-
-// Lookup a key in a JSON object (list of [k, v] pairs). Returns v or
-// 0 if the key is absent. Beware: since 0 is also a legal parsed
-// value (JSON `false`), use `_jr_has_key` when disambiguation matters.
-fn _jr_obj_get(obj, key) {
-    let i = 0
-    while i < len(obj) {
-        if str_eq_bytes(obj[i][0], key) == 1 { return obj[i][1] }
-        i = i + 1
-    }
-    return 0
-}
-
-fn _jr_has_key(obj, key) {
-    let i = 0
-    while i < len(obj) {
-        if str_eq_bytes(obj[i][0], key) == 1 { return 1 }
-        i = i + 1
-    }
-    return 0
-}
-
-// Map a kind spec (string OR int) to the atom_store constant.
-// Returns -1 on unknown kind.
-fn _jr_kind_to_int(v) {
-    if str_eq_bytes(v, "fact")     == 1 { return ATOM_FACT }
-    if str_eq_bytes(v, "relation") == 1 { return ATOM_RELATION }
-    if str_eq_bytes(v, "concept")  == 1 { return ATOM_CONCEPT }
-    if str_eq_bytes(v, "skill")    == 1 { return ATOM_SKILL }
-    if str_eq_bytes(v, "lang")     == 1 { return ATOM_LANG }
-    if str_eq_bytes(v, "rule")     == 1 { return ATOM_RULE }
-    return 0 - 1
-}
-
-// Try string first, fall through to integer if the field is a number.
-// (`v` is the raw parsed value: string or int.)
-fn _jr_resolve_kind(v) {
-    // If it "looks like" an int (str_eq_bytes against a known kind
-    // name won't match, so we test the type by attempting a name
-    // lookup and falling through). Simplest: if it's already an
-    // int, atom_kind_valid returns 1 for 1..6.
-    if atom_kind_valid(v) == 1 { return v }
-    // Otherwise treat as a string.
-    return _jr_kind_to_int(v)
-}
+// ---- helpers -----------------------------------------------------------
 
 fn _jr_err_rec(errors, idx, msg) {
     let e = list_new()
@@ -529,43 +94,90 @@ fn _jr_err_rec(errors, idx, msg) {
     push(errors, e)
 }
 
+// Extract an int-typed field from a JV value. Returns [ok, value]:
+// ok = 1 when the value is a JV_NUM whose raw token has no '.', 'e',
+// or 'E' (a strict integer). Floats and other types yield ok = 0.
+// This lets the schema layer reject a float slid into a belief /
+// weight / sign slot with a clean per-record error rather than
+// silently truncating.
+fn _jr_int_field(v) {
+    let out = list_new()
+    if json_type(v) != JV_NUM {
+        push(out, 0) push(out, 0) return out
+    }
+    // v is [JV_NUM, intval, raw]. Reject if raw contains float chars.
+    let raw = v[2]
+    let n = len(raw)
+    let i = 0
+    while i < n {
+        let c = char_at(raw, i)
+        if c == 46  { push(out, 0) push(out, 0) return out }   // '.'
+        if c == 101 { push(out, 0) push(out, 0) return out }   // 'e'
+        if c == 69  { push(out, 0) push(out, 0) return out }   // 'E'
+        i = i + 1
+    }
+    push(out, 1)
+    push(out, json_num(v))
+    return out
+}
+
+// Get a string field (empty string if absent or wrong type).
+fn _jr_str_field(obj, key) {
+    if json_has(obj, key) == 0 { return "" }
+    let v = json_get(obj, key)
+    if json_type(v) != JV_STR { return "" }
+    return json_str(v)
+}
+
+// Map a kind spec (JV_STR name or JV_NUM constant) to the atom_store
+// constant. Returns -1 on unknown / wrong-type.
+fn _jr_resolve_kind(v) {
+    if json_type(v) == JV_NUM {
+        let n = json_num(v)
+        if atom_kind_valid(n) == 1 { return n }
+        return 0 - 1
+    }
+    if json_type(v) != JV_STR { return 0 - 1 }
+    let s = json_str(v)
+    if str_eq_bytes(s, "fact")     == 1 { return ATOM_FACT }
+    if str_eq_bytes(s, "relation") == 1 { return ATOM_RELATION }
+    if str_eq_bytes(s, "concept")  == 1 { return ATOM_CONCEPT }
+    if str_eq_bytes(s, "skill")    == 1 { return ATOM_SKILL }
+    if str_eq_bytes(s, "lang")     == 1 { return ATOM_LANG }
+    if str_eq_bytes(s, "rule")     == 1 { return ATOM_RULE }
+    return 0 - 1
+}
+
+// ---- schema layer ------------------------------------------------------
+
 fn jsonr_parse_text(text, kg_hint, source_tag) {
     let records = list_new()
     let errors  = list_new()
-    let r = jsonr_parse_value(text)
-    let top = r[0]
-    let err = r[1]
-    if len(err) > 0 {
-        _jr_err_rec(errors, 0, "json: " + err)
+    let top = json_parse(text)
+    if json_is_valid(top) == 0 {
+        _jr_err_rec(errors, 0, "json: malformed JSON at top level")
         let out = list_new() push(out, records) push(out, errors) return out
     }
-    // Accept either an array of records, or a single record object at
-    // the top (a convenience for single-record files).
-    let items = list_new()
-    if len(top) > 0 {
-        let first = top[0]
-        // Object: [key,value] pair -- first[0] is a string. Array of
-        // records: first is itself a NOVA list (object or scalar).
-        // We can't cheaply typecheck; instead check whether the top
-        // looks like [key,value,...] pairs. If len(top[0]) == 2 AND
-        // top[0][0] is a string like "kg"/"source" we ASSUME single-
-        // object. Otherwise treat as array.
-        //
-        // Simpler + more predictable: require an array. A single-record
-        // file needs [{...}] wrappers. Documented in the module header.
-        let i = 0
-        while i < len(top) {
-            push(items, top[i])
-            i = i + 1
-        }
+    if json_type(top) != JV_ARR {
+        _jr_err_rec(errors, 0,
+            "json: top level must be a JSON array of record objects")
+        let out = list_new() push(out, records) push(out, errors) return out
     }
+    let n_records = json_arr_len(top)
     let idx = 0
-    while idx < len(items) {
-        let obj = items[idx]
+    while idx < n_records {
+        let obj = json_arr_get(top, idx)
+        if json_type(obj) != JV_OBJ {
+            _jr_err_rec(errors, idx, "record at index "
+                + int_to_str(idx) + " must be an object")
+            idx = idx + 1
+            continue
+        }
         // kg
         let kg_name = kg_hint
-        if _jr_has_key(obj, "kg") == 1 {
-            kg_name = _jr_obj_get(obj, "kg")
+        if json_has(obj, "kg") == 1 {
+            let kv_v = json_get(obj, "kg")
+            if json_type(kv_v) == JV_STR { kg_name = json_str(kv_v) }
         }
         if len(kg_name) == 0 {
             _jr_err_rec(errors, idx,
@@ -575,8 +187,9 @@ fn jsonr_parse_text(text, kg_hint, source_tag) {
         }
         // source
         let src = source_tag
-        if _jr_has_key(obj, "source") == 1 {
-            src = _jr_obj_get(obj, "source")
+        if json_has(obj, "source") == 1 {
+            let sv = json_get(obj, "source")
+            if json_type(sv) == JV_STR { src = json_str(sv) }
         }
         if len(src) == 0 {
             _jr_err_rec(errors, idx,
@@ -586,139 +199,186 @@ fn jsonr_parse_text(text, kg_hint, source_tag) {
         }
         let rec = cur_new(kg_name, src)
         // capsule (optional)
-        if _jr_has_key(obj, "capsule") == 1 {
-            let cap = _jr_obj_get(obj, "capsule")
-            let cn  = ""
-            let cv  = ""
-            let cd  = ""
-            let cl  = ""
-            if _jr_has_key(cap, "name")        == 1 { cn = _jr_obj_get(cap, "name") }
-            if _jr_has_key(cap, "version")     == 1 { cv = _jr_obj_get(cap, "version") }
-            if _jr_has_key(cap, "description") == 1 { cd = _jr_obj_get(cap, "description") }
-            if _jr_has_key(cap, "license")     == 1 { cl = _jr_obj_get(cap, "license") }
-            if len(cn) > 0 {
-                cur_set_capsule(rec, cn, cv, cd, cl)
-                if _jr_has_key(cap, "deps") == 1 {
-                    let deps = _jr_obj_get(cap, "deps")
-                    let di = 0
-                    while di < len(deps) {
-                        let d = deps[di]
-                        let dn = ""
-                        let dv = ""
-                        if _jr_has_key(d, "name")    == 1 { dn = _jr_obj_get(d, "name") }
-                        if _jr_has_key(d, "version") == 1 { dv = _jr_obj_get(d, "version") }
-                        if len(dn) > 0 {
-                            cur_add_capsule_dep(rec, dn, dv)
+        if json_has(obj, "capsule") == 1 {
+            let cap = json_get(obj, "capsule")
+            if json_type(cap) == JV_OBJ {
+                let cn = _jr_str_field(cap, "name")
+                let cv = _jr_str_field(cap, "version")
+                let cd = _jr_str_field(cap, "description")
+                let cl = _jr_str_field(cap, "license")
+                if len(cn) > 0 {
+                    cur_set_capsule(rec, cn, cv, cd, cl)
+                    if json_has(cap, "deps") == 1 {
+                        let deps = json_get(cap, "deps")
+                        if json_type(deps) == JV_ARR {
+                            let dn_count = json_arr_len(deps)
+                            let di = 0
+                            while di < dn_count {
+                                let d = json_arr_get(deps, di)
+                                if json_type(d) == JV_OBJ {
+                                    let dn = _jr_str_field(d, "name")
+                                    let dv = _jr_str_field(d, "version")
+                                    if len(dn) > 0 {
+                                        cur_add_capsule_dep(rec, dn, dv)
+                                    }
+                                }
+                                di = di + 1
+                            }
                         }
-                        di = di + 1
                     }
                 }
             }
         }
         // atoms
-        if _jr_has_key(obj, "atoms") == 1 {
-            let atoms = _jr_obj_get(obj, "atoms")
-            let ai = 0
-            while ai < len(atoms) {
-                let a = atoms[ai]
-                let lab = ""
-                let kind_raw = 0
-                let bel = 0
-                if _jr_has_key(a, "label")  == 1 { lab      = _jr_obj_get(a, "label") }
-                if _jr_has_key(a, "kind")   == 1 { kind_raw = _jr_obj_get(a, "kind") }
-                if _jr_has_key(a, "belief") == 1 { bel      = _jr_obj_get(a, "belief") }
-                if len(lab) == 0 {
-                    _jr_err_rec(errors, idx,
-                        "atom missing 'label' at atoms[" + int_to_str(ai) + "]")
-                } else {
-                    let k = _jr_resolve_kind(kind_raw)
-                    if k < 0 {
+        if json_has(obj, "atoms") == 1 {
+            let atoms = json_get(obj, "atoms")
+            if json_type(atoms) == JV_ARR {
+                let a_count = json_arr_len(atoms)
+                let ai = 0
+                while ai < a_count {
+                    let a = json_arr_get(atoms, ai)
+                    if json_type(a) != JV_OBJ {
                         _jr_err_rec(errors, idx,
-                            "atom has unknown 'kind' at atoms[" + int_to_str(ai) + "]")
+                            "atom at atoms[" + int_to_str(ai) + "] must be an object")
                     } else {
-                        cur_add_atom(rec, lab, k, bel)
+                        let lab = _jr_str_field(a, "label")
+                        if len(lab) == 0 {
+                            _jr_err_rec(errors, idx,
+                                "atom missing 'label' at atoms[" + int_to_str(ai) + "]")
+                        } else {
+                            let k = 0 - 1
+                            if json_has(a, "kind") == 1 {
+                                k = _jr_resolve_kind(json_get(a, "kind"))
+                            }
+                            if k < 0 {
+                                _jr_err_rec(errors, idx,
+                                    "atom has unknown 'kind' at atoms[" + int_to_str(ai) + "]")
+                            } else {
+                                // belief must be a strict int (no floats).
+                                let bel = 0
+                                let bad = 0
+                                if json_has(a, "belief") == 1 {
+                                    let bpair = _jr_int_field(json_get(a, "belief"))
+                                    if bpair[0] == 0 {
+                                        _jr_err_rec(errors, idx,
+                                            "atom 'belief' must be an integer at atoms["
+                                            + int_to_str(ai) + "]")
+                                        bad = 1
+                                    } else {
+                                        bel = bpair[1]
+                                    }
+                                }
+                                if bad == 0 { cur_add_atom(rec, lab, k, bel) }
+                            }
+                        }
                     }
+                    ai = ai + 1
                 }
-                ai = ai + 1
             }
         }
         // implications
-        if _jr_has_key(obj, "implications") == 1 {
-            let imps = _jr_obj_get(obj, "implications")
-            let ii = 0
-            while ii < len(imps) {
-                let m = imps[ii]
-                let a1 = ""
-                let a2 = ""
-                let st = ""
-                if _jr_has_key(m, "ante")     == 1 { a1 = _jr_obj_get(m, "ante") }
-                if _jr_has_key(m, "conseq")   == 1 { a2 = _jr_obj_get(m, "conseq") }
-                if _jr_has_key(m, "strength") == 1 { st = _jr_obj_get(m, "strength") }
-                if len(a1) == 0 { _jr_err_rec(errors, idx,
-                    "implication missing 'ante' at implications[" + int_to_str(ii) + "]") }
-                else { if len(a2) == 0 { _jr_err_rec(errors, idx,
-                    "implication missing 'conseq' at implications[" + int_to_str(ii) + "]") }
-                else { if str_eq_bytes(st, "FORMAL") == 0 {
-                    if str_eq_bytes(st, "EMPIRICAL") == 0 {
-                        _jr_err_rec(errors, idx,
-                            "implication 'strength' must be FORMAL or EMPIRICAL at implications["
-                            + int_to_str(ii) + "]")
-                        st = ""
+        if json_has(obj, "implications") == 1 {
+            let imps = json_get(obj, "implications")
+            if json_type(imps) == JV_ARR {
+                let i_count = json_arr_len(imps)
+                let ii = 0
+                while ii < i_count {
+                    let m = json_arr_get(imps, ii)
+                    if json_type(m) == JV_OBJ {
+                        let a1 = _jr_str_field(m, "ante")
+                        let a2 = _jr_str_field(m, "conseq")
+                        let st = _jr_str_field(m, "strength")
+                        if len(a1) == 0 { _jr_err_rec(errors, idx,
+                            "implication missing 'ante' at implications[" + int_to_str(ii) + "]") }
+                        else { if len(a2) == 0 { _jr_err_rec(errors, idx,
+                            "implication missing 'conseq' at implications[" + int_to_str(ii) + "]") }
+                        else {
+                            let ok = 0
+                            if str_eq_bytes(st, "FORMAL")    == 1 { ok = 1 }
+                            if str_eq_bytes(st, "EMPIRICAL") == 1 { ok = 1 }
+                            if ok == 0 {
+                                _jr_err_rec(errors, idx,
+                                    "implication 'strength' must be FORMAL or EMPIRICAL at implications["
+                                    + int_to_str(ii) + "]")
+                            } else {
+                                cur_add_imp(rec, a1, a2, st)
+                            }
+                        } }
                     }
+                    ii = ii + 1
                 }
-                if len(st) > 0 { cur_add_imp(rec, a1, a2, st) }
-                } }
-                ii = ii + 1
             }
         }
         // observations
-        if _jr_has_key(obj, "observations") == 1 {
-            let obs = _jr_obj_get(obj, "observations")
-            let oi = 0
-            while oi < len(obs) {
-                let o = obs[oi]
-                let ol = ""
-                let os = 0
-                let ow = 0
-                if _jr_has_key(o, "label")  == 1 { ol = _jr_obj_get(o, "label") }
-                if _jr_has_key(o, "sign")   == 1 { os = _jr_obj_get(o, "sign") }
-                if _jr_has_key(o, "weight") == 1 { ow = _jr_obj_get(o, "weight") }
-                if len(ol) == 0 {
-                    _jr_err_rec(errors, idx,
-                        "observation missing 'label' at observations["
-                        + int_to_str(oi) + "]")
-                } else {
-                    if os != 1 { if os != (0 - 1) {
-                        _jr_err_rec(errors, idx,
-                            "observation 'sign' must be +1 or -1 at observations["
-                            + int_to_str(oi) + "]")
-                        os = 0
-                    } }
-                    if os != 0 { cur_add_obs(rec, ol, os, ow) }
+        if json_has(obj, "observations") == 1 {
+            let obs = json_get(obj, "observations")
+            if json_type(obs) == JV_ARR {
+                let o_count = json_arr_len(obs)
+                let oi = 0
+                while oi < o_count {
+                    let o = json_arr_get(obs, oi)
+                    if json_type(o) == JV_OBJ {
+                        let ol = _jr_str_field(o, "label")
+                        if len(ol) == 0 {
+                            _jr_err_rec(errors, idx,
+                                "observation missing 'label' at observations["
+                                + int_to_str(oi) + "]")
+                        } else {
+                            let os = 0
+                            let ok = 0
+                            if json_has(o, "sign") == 1 {
+                                let sp = _jr_int_field(json_get(o, "sign"))
+                                if sp[0] == 1 {
+                                    if sp[1] == 1        { os = 1  ok = 1 }
+                                    if sp[1] == (0 - 1)  { os = 0 - 1 ok = 1 }
+                                }
+                            }
+                            if ok == 0 {
+                                _jr_err_rec(errors, idx,
+                                    "observation 'sign' must be +1 or -1 at observations["
+                                    + int_to_str(oi) + "]")
+                            } else {
+                                let ow = 0
+                                let wbad = 0
+                                if json_has(o, "weight") == 1 {
+                                    let wp = _jr_int_field(json_get(o, "weight"))
+                                    if wp[0] == 0 {
+                                        _jr_err_rec(errors, idx,
+                                            "observation 'weight' must be an integer at observations["
+                                            + int_to_str(oi) + "]")
+                                        wbad = 1
+                                    } else { ow = wp[1] }
+                                }
+                                if wbad == 0 { cur_add_obs(rec, ol, os, ow) }
+                            }
+                        }
+                    }
+                    oi = oi + 1
                 }
-                oi = oi + 1
             }
         }
         // citations
-        if _jr_has_key(obj, "citations") == 1 {
-            let cites = _jr_obj_get(obj, "citations")
-            let ci = 0
-            while ci < len(cites) {
-                let c = cites[ci]
-                let f = ""
-                let t = ""
-                let rl = ""
-                if _jr_has_key(c, "from") == 1 { f  = _jr_obj_get(c, "from") }
-                if _jr_has_key(c, "to")   == 1 { t  = _jr_obj_get(c, "to") }
-                if _jr_has_key(c, "rel")  == 1 { rl = _jr_obj_get(c, "rel") }
-                if len(f) == 0 { _jr_err_rec(errors, idx,
-                    "citation missing 'from' at citations[" + int_to_str(ci) + "]") }
-                else { if len(t) == 0 { _jr_err_rec(errors, idx,
-                    "citation missing 'to' at citations[" + int_to_str(ci) + "]") }
-                else { if len(rl) == 0 { _jr_err_rec(errors, idx,
-                    "citation missing 'rel' at citations[" + int_to_str(ci) + "]") }
-                else { cur_add_cite(rec, f, t, rl) } } }
-                ci = ci + 1
+        if json_has(obj, "citations") == 1 {
+            let cites = json_get(obj, "citations")
+            if json_type(cites) == JV_ARR {
+                let c_count = json_arr_len(cites)
+                let ci = 0
+                while ci < c_count {
+                    let c = json_arr_get(cites, ci)
+                    if json_type(c) == JV_OBJ {
+                        let f  = _jr_str_field(c, "from")
+                        let t  = _jr_str_field(c, "to")
+                        let rl = _jr_str_field(c, "rel")
+                        if len(f) == 0 { _jr_err_rec(errors, idx,
+                            "citation missing 'from' at citations[" + int_to_str(ci) + "]") }
+                        else { if len(t) == 0 { _jr_err_rec(errors, idx,
+                            "citation missing 'to' at citations[" + int_to_str(ci) + "]") }
+                        else { if len(rl) == 0 { _jr_err_rec(errors, idx,
+                            "citation missing 'rel' at citations[" + int_to_str(ci) + "]") }
+                        else { cur_add_cite(rec, f, t, rl) } } }
+                    }
+                    ci = ci + 1
+                }
             }
         }
         push(records, rec)
@@ -730,8 +390,7 @@ fn jsonr_parse_text(text, kg_hint, source_tag) {
     return out
 }
 
-// File entry point. Signature matches every other importer: returns
-// [records_list, errors_list].
+// File entry point. Signature matches every other importer.
 fn jsonr_parse(path, kg_hint, source_tag) {
     let text = read_file(path)
     if text == 0 {

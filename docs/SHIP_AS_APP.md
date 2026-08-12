@@ -1096,14 +1096,14 @@ Non-wikidata formats **silently ignore** `labels_body` +
 `formal_preds` so a common config shipped to multiple ingests
 doesn't need per-format arg-stripping.
 
-## 12. What comes next (R69+)
+## 12. What comes next (R70+)
 
-- **R69+** — In-process TLS (retires the sidecar recipe), YAML
+- **R70+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), consolidate the R65 `jsonr_parse_value`
-  parser onto the pre-existing `src/data/json.nova` tagged
-  parser
-- **R70+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), extend `pattern.install` with a
+  holder-scoped assignment path that mirrors the R63 wire
+  ownership auto-assignment
+- **R71+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
