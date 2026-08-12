@@ -1145,14 +1145,99 @@ install stamps ownership; only the owner can re-install or
 touch the resource under the overlay; every list surface
 filters correctly.
 
-## 12. What comes next (R71+)
+### 7.21 Ownership auto-assignment on ingest.file (R71)
 
-- **R71+** — In-process TLS (retires the sidecar recipe), YAML
+R70 closed auto-assignment for the three install verbs
+(pattern.install / capsule.install / skill.install). R71
+completes the ownership lifecycle by wiring the same shape
+into `ingest.file`. Now every RESOURCE ENTRY POINT stamps
+ownership consistently:
+
+| entry point | stamps |
+|---|---|
+| pattern.install (R63) | pattern capsule |
+| capsule.install (R70) | capsule |
+| skill.install (R70)   | skill |
+| **ingest.file (R71)** | **target KG + capsule metadata (if any)** |
+
+`ingest.file` runs a per-record pre-pass BEFORE the R66 apply
+step:
+
+1. **Check phase** (no writes): look up existing owner for the
+   record's target `kg` AND (if the record ships capsule
+   metadata) its capsule name.
+2. **Refuse phase**: if either resource is already owned by
+   someone other than the presented holder, record a
+   per-record refusal error (`"ownership refused: <kind>
+   '<name>' already owned by <other>"`) and drop the record.
+3. **Apply phase**: if the check phase passed, stamp the
+   presented holder on any currently-unowned resource. The
+   split ensures a capsule refusal never leaves the KG
+   half-stamped.
+
+Response echoes three new counters:
+
+| field | meaning |
+|---|---|
+| `kgs_stamped`                    | net-new KG stamps (dedupes within batch) |
+| `capsules_stamped`               | net-new capsule stamps (dedupes) |
+| `records_refused_by_ownership`   | records dropped due to owner-mismatch |
+
+Backward compat: `kgs_stamped` and `capsules_stamped` stay at
+`0` when no overlay is wired OR when the caller is anonymous
+— existing R66-R68 wire tests are byte-identical.
+
+Example:
+
+```bash
+# Alice ingests a JSON record with capsule metadata under a
+# wired overlay -- gets both her KG and her capsule stamped.
+scripts/rpc.sh ingest.file \
+  format json \
+  body '[{"kg":"solar_system","source":"src:cerec:x",
+          "capsule":{"name":"solar_pack_r71","version":"1.0.0"},
+          "atoms":[{"label":"venus","kind":"fact","belief":900}]}]'
+# -> {"ok":true,"result":{
+#      "records_parsed":1,
+#      "records_ingested":1,
+#      "kgs_stamped":1,
+#      "capsules_stamped":1,
+#      "records_refused_by_ownership":0,
+#      ...}}
+
+# Bob tries the same body -> owner-mismatch on both resources;
+# per-record refusal error, nothing ingested.
+# -> {"ok":true,"result":{
+#      "records_parsed":1,
+#      "records_ingested":0,
+#      "records_refused_by_ownership":1,
+#      "errors":[{"line":0,"message":"ownership refused: kg
+#                 'solar_system' already owned by alice"}],
+#      ...}}
+```
+
+**Batch semantics** — a mixed batch is atomic per-record but
+lenient overall: a bob-ingest with one record targeting an
+alice-owned KG + another targeting a fresh KG refuses record
+1 (per-record error) and stamps + ingests record 2. Matches
+the R66 lenient pattern used for every other error class.
+
+**Full lifecycle now consistent** — combined with R55.2's
+`kg.list` / `capsule.list` filters, R57's `skill.run` gate,
+R60's `nl.ask` gate, R63's pattern gates, R64's
+`coding_helper` gate, and R70's install-verb stamps, an
+operator can wire a single ownership overlay and every
+resource kind an alice creates via any entry point is
+invisible to bob and refuses cross-holder writes uniformly.
+
+## 12. What comes next (R72+)
+
+- **R72+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), holder-scoped auto-assignment for
-  `ingest.file` (kg + capsule ownership stamped on the target
-  KG / any capsule metadata in the ingested record)
-- **R72+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), a wire verb (`ownership.list` /
+  `ownership.transfer`) so an operator can audit + hand off
+  owned resources without dropping into NOVA helper code
+- **R73+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
