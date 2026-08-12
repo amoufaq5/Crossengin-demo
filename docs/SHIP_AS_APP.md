@@ -894,12 +894,86 @@ is byte-identical to R62. The overlay is DATA — no default is
 constructed; operators opt in by calling
 `rpc_ctx_set_ownership(...)` at daemon boot.
 
-## 12. What comes next (R65+)
+### 7.17 JSON structured-record importer (R65)
 
-- **R65+** — In-process TLS (retires the sidecar recipe),
-  generic structured-record adapter for one-off JSON/YAML
-  sources
-- **R66+** — Per-source rate budgets controllable via admin wire
+R43 shipped importers for `.cerec`, CSV, N-Triples, Wikidata,
+ConceptNet, paper metadata, WordNet, and LLM-emitted `.cerec`.
+R65 adds a **JSON** adapter for one-off structured sources
+(scraper output, admin dumps, LLM-emitted JSON structures) so
+an operator doesn't have to hand-author `.cerec` syntax to
+ingest a small dataset.
+
+Wire format: a JSON array of record objects. Each object
+carries `kg` + `source` plus optional `capsule` metadata and
+`atoms` / `implications` / `observations` / `citations` arrays
+that mirror the `.cerec` record shape 1:1:
+
+```json
+[
+  {
+    "kg": "climate",
+    "source": "src:json:sample:climate:v1",
+    "capsule": {
+      "name": "climate_sample",
+      "version": "1.0.0",
+      "description": "small illustrative climate reference",
+      "license": "CC-BY-4.0"
+    },
+    "atoms": [
+      {"label": "co2",                 "kind": "concept", "belief": 950},
+      {"label": "atmospheric_warming", "kind": "fact",    "belief": 900}
+    ],
+    "implications": [
+      {"ante": "co2", "conseq": "atmospheric_warming", "strength": "EMPIRICAL"}
+    ]
+  }
+]
+```
+
+Ingest via the standard `/ingest json <path>` chat command
+(or the `ingest.*` wire verbs when they land). The importer
+produces curriculum records identical in shape to `.cerec`
+output, so:
+
+- **R43 pipeline** applies them unchanged (auto-register capsules,
+  seed atoms, wire implications, credit citations).
+- **R58 auto-approval policies** treat them as first-class
+  entries — a JSON-imported record with `src:json:...` prefix
+  can be approved by a `SOURCE_PREFIX:src:json:` policy.
+- **R55.3 session snapshots** persist any resulting KG state.
+
+`kind` accepts either the string name (`fact`, `relation`,
+`concept`, `skill`, `lang`, `rule`) or the raw integer
+constant. `strength` accepts `FORMAL` | `EMPIRICAL`. `sign` is
++1 or -1. Beliefs / weights are integer milli-scaled (0..1000).
+`kg` and `source` default to the values supplied to
+`jsonr_parse(path, kg_hint, source_tag)` when omitted from a
+record; per-record values win when both are present.
+
+**Lenient parser** — a malformed field records an error at the
+offending record's array index and skips just that fragment;
+other well-formed records still land. A top-level JSON syntax
+error returns the parse error with an empty records list so
+the operator can fix + retry without partial ingestion.
+
+Shipped: `data/packs/samples/climate_facts.json` — 10 atoms +
+7 implications + 3 observations + 2 citations across a small
+climate-science reference; parses clean and demonstrates every
+directive.
+
+**YAML deferred to R66+** — YAML's indentation semantics,
+anchors, tags, and flow-style ambiguity are a much larger
+surface than JSON's clean grammar; a subset would be
+misleading. Operators today can pre-convert YAML with `yq -o
+json` at the shell and pipe into the JSON importer.
+
+## 12. What comes next (R66+)
+
+- **R66+** — In-process TLS (retires the sidecar recipe), YAML
+  input adapter (or make `jsonr_parse` accept a
+  yaml-to-json shim), wire verb `ingest.file` that accepts a
+  format + body inline (mirrors `pattern.install`)
+- **R67+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
