@@ -1025,7 +1025,7 @@ Formats supported at R67: **cerec**, **json**, **csv**,
 | json       | no (default)  | no (default)      | `kg`/`source` default when a record omits them |
 | csv        | **yes**       | **yes**           | —                  |
 | ntriples   | **yes**       | **yes**           | —                  |
-| wikidata   | **yes**       | **yes**           | uses empty labels + default FORMAL preds; pre-resolve labels off-wire if needed |
+| wikidata   | **yes**       | **yes**           | R68 adds `labels_body` (TSV) + `formal_preds` (CSV) |
 | conceptnet | **yes**       | **yes**           | optional `keep_lang="1"` for multilingual |
 | papermeta  | **yes**       | no                | source computed per-DOI |
 | wordnet    | **yes**       | **yes**           | —                  |
@@ -1049,15 +1049,61 @@ body with zero parseable records returns `records_parsed:0` +
 the error list so an operator can diagnose without a second
 call.
 
-## 12. What comes next (R68+)
+### 7.19 Wikidata multi-body ingest (R68)
 
-- **R68+** — In-process TLS (retires the sidecar recipe), YAML
+R67 wired wikidata over `ingest.file` but with an empty labels
+table + default `FORMAL` predicate set, so imported atoms
+surfaced as raw `Q76` / `Q5` IDs. R68 adds two optional args
+so a caller can ship the labels table + additional FORMAL
+predicates alongside the triples in one JSON-RPC call:
+
+- **`labels_body`** — TSV `Qid<TAB>label\n...`. Comment lines
+  starting with `#` and blank lines are dropped. Parsed via
+  `wd_labels_parse_text`; the resulting table replaces the
+  empty default so atoms surface with human-readable labels.
+- **`formal_preds`** — comma-separated `Pxx` predicate IDs.
+  Each is added on top of the R67 default set (`P31`, `P279`,
+  `P361`, `P527`, `P171`, `P105`, `P17`) via
+  `wd_promote_predicate` which dedupes internally. Adding a
+  predicate already in the default set is a no-op.
+
+Example:
+
+```bash
+scripts/rpc.sh ingest.file \
+  format wikidata \
+  kg wd \
+  source src:cerec:wd \
+  body "$(cat triples.nt)" \
+  labels_body "$(printf 'Q76\tobama\nQ5\thuman\nQ729\tanimal\n')" \
+  formal_preds "P625,P569"
+# -> {"ok":true,"result":{
+#      "format":"wikidata",
+#      "records_parsed":1,
+#      "records_ingested":1,
+#      "labels_loaded":3,
+#      "extra_formal_preds":2,
+#      ...}}
+```
+
+Response echoes `labels_loaded` (row count from
+`labels_body`) and `extra_formal_preds` (net-new predicate
+count, excluding defaults). Both fields stay `0` for
+non-wikidata formats OR when the args aren't supplied — a
+caller can key on them without format-branch code.
+
+Non-wikidata formats **silently ignore** `labels_body` +
+`formal_preds` so a common config shipped to multiple ingests
+doesn't need per-format arg-stripping.
+
+## 12. What comes next (R69+)
+
+- **R69+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), multi-body wire ingest so `wikidata` can
-  carry its labels table alongside the triples, consolidate
-  the R65 `jsonr_parse_value` parser onto the pre-existing
-  `src/data/json.nova` tagged parser
-- **R69+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), consolidate the R65 `jsonr_parse_value`
+  parser onto the pre-existing `src/data/json.nova` tagged
+  parser
+- **R70+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
