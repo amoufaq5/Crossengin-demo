@@ -1415,15 +1415,103 @@ pack before still can't — the ownership overlay stops him
 in `pattern.list` + `coding_helper` (R63/R64) exactly as
 before the restart.
 
-## 12. What comes next (R75+)
+### 7.25 Skill registry round-trip via session snapshots (R75)
 
-- **R75+** — In-process TLS (retires the sidecar recipe), YAML
+R73 (policy registry) and R74 (pattern registry) closed the
+persistence gap for those two boot-time-only registries. R75
+finishes the arc with the R55.1 skill registry — skills
+registered via `skill.install` (both pre-anchored + signed
+variants) now survive daemon restart.
+
+Snapshot format gets a `#SKILL v1` section that captures
+manifest identity + install marker:
+
+```
+#SKILL v1
+SKILL research 1.0.0 2 1 1
+DESC walk KGs for topic-token label matches
+EFFECTOR effector_read_kg
+EFFECTOR effector_search
+DEP solar_system:1.0.0
+REFUSAL 1:400
+SKILL coding_helper 1.0.0 3 1 0
+DESC pattern-match debug problems
+EFFECTOR effector_pattern_match
+```
+
+The `SKILL <name> <ver> <policy_id> <tier> <installed>` line
+carries the identity + install-flag; `DESC` / `EFFECTOR` /
+`DEP` / `REFUSAL` capture the rest. Supervisors are NOT
+serialized (they hold live refs to kg/capsule/mo/persona
+registries the snapshot doesn't own) — the load side ships
+the installed-flag names back to the wire caller so the
+daemon can rebuild supervisors from its live context.
+
+Wire responses carry `skills` + `skills_installed_names`:
+
+```bash
+scripts/rpc.sh session.save name my_daemon
+# -> {"ok":true,"result":{
+#      ...
+#      "patterns":3, "skills":3,
+#      ...}}
+
+scripts/rpc.sh session.load name my_daemon
+# -> {"ok":true,"result":{
+#      ...
+#      "patterns":3,
+#      "skills":3,
+#      "skills_installed_names":["research","coding_helper"],
+#      ...}}
+```
+
+`skills_installed_names` is the list of manifests marked
+INSTALLED in the snapshot. A wire caller iterates it and
+calls `skill_registry_install` per name with a fresh
+supervisor built from the ctx's live registries — this
+re-hydrates the install state that the manifest+register
+step alone can't restore.
+
+**Last-write-wins on name** (matches R73/R74 semantics).
+Reloading a snapshot that contains `research` over the
+compile-time built-in is a no-op when the content matches;
+an operator's hand-edit gets honored.
+
+**Lenient parser** — bad `SKILL` line (fewer than 5 tokens)
+drops that skill; orphan `EFFECTOR`/`DEP`/`REFUSAL` (before
+any `SKILL` opener) is dropped; unknown directives inside a
+skill are skipped without aborting the parse.
+
+**New signature** (backward-compat wrappers preserved):
+
+```
+session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
+                              overlay, policy_reg, skill_reg,
+                              include_secrets, now)
+session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
+                          overlay, policy_reg, skill_reg, now)
+```
+
+The 6-arg `session_snapshot_serialize` and
+`session_snapshot_apply` still work — they delegate with
+`policy_reg=0` and `skill_reg=0` so no `#POLICY v1` /
+`#SKILL v1` section is written or read on the legacy path.
+
+**Persistence arc complete**: every registry the daemon
+owns now round-trips through `session.save` / `session.load`
+— personas (R55.3), capability tokens (R55.3), trust anchors
+(R55.3), ownership overlay (R55.3), policies (R73), patterns
+(R74), skills (R75). An operator can `session.save`, restart
+the daemon, `session.load`, and every piece of state comes
+back consistent.
+
+## 12. What comes next (R76+)
+
+- **R76+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), snapshot round-trip for the R55.1
-  installed-skill registry (skills registered via
-  `skill.install` at wire time are lost across restart the
-  same way patterns were pre-R74)
-- **R76+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), a `session.list` wire verb so operators
+  can enumerate existing snapshots in the configured directory
+- **R77+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
