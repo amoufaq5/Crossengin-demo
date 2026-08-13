@@ -1505,13 +1505,65 @@ owns now round-trips through `session.save` / `session.load`
 the daemon, `session.load`, and every piece of state comes
 back consistent.
 
-## 12. What comes next (R76+)
+### 7.26 session.list wire verb (R76)
 
-- **R76+** — In-process TLS (retires the sidecar recipe), YAML
+R73-R75 completed the persistence arc but an operator still had
+no wire way to enumerate existing snapshots — knowing what
+names were available meant shelling out to `ls`. R76 closes
+that gap with a `session.list` verb.
+
+```bash
+scripts/rpc.sh session.list
+# -> {"ok":true,"result":[
+#      {"name":"nightly-2026-08-12","path":"/var/lib/cxe/nightly-2026-08-12.snap",
+#       "bytes":48231,"saved_at":11440820},
+#      {"name":"before-migration","path":"/var/lib/cxe/before-migration.snap",
+#       "bytes":48944,"saved_at":11441105}]}
+```
+
+Cap: `admin:session` (same as `session.save` + `session.load`).
+
+**Directory index implementation.** NOVA exposes
+`sys_open`/`read`/`write`/`fstat`/`unlink` but has no
+`readdir`/`getdents`. Rather than parse raw dirent bytes,
+R76 keeps a small text index at `<snapshot_dir>/index.txt`:
+
+```
+<name>\t<bytes>\t<saved_at>
+<name>\t<bytes>\t<saved_at>
+...
+```
+
+`session.save` upserts the entry (last-write-wins on name)
+after successfully writing the `.snap` payload atomically.
+`session.list` reads the index, splits by newline, and
+returns the entries in insertion order (matches save order).
+The tradeoffs:
+
+- **Cross-daemon integrity**: only the daemon writes the
+  index. If an operator deletes a `.snap` file with `rm`
+  outside the daemon, `session.list` still shows the entry
+  (subsequent `session.load` returns "read failed"). Manual
+  ops should either use the daemon or maintain the index by
+  hand.
+- **Missing index = empty list** (not an error) — that's
+  the natural "fresh install, no snapshots yet" case.
+- **Malformed index lines** dropped silently by the parser;
+  a corrupt index yields an empty list + `ok:true`. The
+  index rebuilds itself on the next `session.save`.
+
+The index file is a separate concern from any single `.snap`
+payload — the `.snap` files themselves remain the source of
+truth for state, the index is metadata for enumeration.
+
+## 12. What comes next (R77+)
+
+- **R77+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), a `session.list` wire verb so operators
-  can enumerate existing snapshots in the configured directory
-- **R77+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), a `session.delete` wire verb (pairs with
+  R76 list so operators can prune old snapshots without shell
+  access)
+- **R78+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 

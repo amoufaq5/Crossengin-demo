@@ -2014,6 +2014,114 @@ fn _rpc_snap_read(path) {
     return acc
 }
 
+// ---- R76: snapshot index (session.list backing store) -----------------
+//
+// NOVA has sys_open/read/write but no readdir/getdents, so we can't
+// enumerate a directory natively. Instead we maintain a small text
+// index at `<snapshot_dir>/index.txt`, one entry per line:
+//
+//   <name>\t<bytes>\t<saved_at>
+//
+// session.save UPSERTS the entry (last-write-wins on name) after
+// atomically writing the .snap payload. session.list reads the index
+// and returns its contents to the wire caller.
+//
+// The index survives daemon restarts (it's on-disk) and is the ONLY
+// authoritative directory listing -- if an operator deletes a .snap
+// file outside the daemon, session.list will still show its old
+// entry (session.load then returns "read failed"). That's the
+// tradeoff for not having readdir.
+
+let _RPC_SNAP_INDEX_NAME = "index.txt"
+
+fn _rpc_snap_index_path(ctx) {
+    let dir = rpc_ctx_snapshot_dir(ctx)
+    let n = len(dir)
+    let slash = "/"
+    if n > 0 { if char_at(dir, n - 1) == 47 { slash = "" } }
+    return dir + slash + _RPC_SNAP_INDEX_NAME
+}
+
+// Parse the index text into a list of [name, bytes, saved_at] entries.
+// Malformed lines dropped silently.
+fn _rpc_snap_index_parse(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(text, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(text, start, i - start)
+            if len(line) > 0 {
+                // Split on tabs.
+                let t1 = find_char(line, 9)
+                if t1 > 0 {
+                    let name = substr(line, 0, t1)
+                    let rest = substr(line, t1 + 1, len(line) - t1 - 1)
+                    let t2 = find_char(rest, 9)
+                    if t2 > 0 {
+                        let bytes_str = substr(rest, 0, t2)
+                        let sav_str   = substr(rest, t2 + 1, len(rest) - t2 - 1)
+                        let entry = list_new()
+                        push(entry, name)
+                        push(entry, str_to_int(bytes_str))
+                        push(entry, str_to_int(sav_str))
+                        push(out, entry)
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Serialize [name, bytes, saved_at] entries into the tab-separated
+// wire format.
+fn _rpc_snap_index_serialize(entries) {
+    let out = ""
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        out = out + e[0] + chr(9)
+                  + int_to_str(e[1]) + chr(9)
+                  + int_to_str(e[2]) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// Upsert an entry (last-write-wins on name). Preserves insertion
+// order for existing entries; new entries append.
+fn _rpc_snap_index_upsert(ctx, name, bytes_written, saved_at) {
+    let path = _rpc_snap_index_path(ctx)
+    let cur_text = _rpc_snap_read(path)     // "" when missing
+    let entries = _rpc_snap_index_parse(cur_text)
+    let updated = 0
+    let i = 0
+    while i < len(entries) {
+        if str_eq_bytes(entries[i][0], name) == 1 {
+            list_set(entries[i], 1, bytes_written)
+            list_set(entries[i], 2, saved_at)
+            updated = 1
+        }
+        i = i + 1
+    }
+    if updated == 0 {
+        let e = list_new()
+        push(e, name)
+        push(e, bytes_written)
+        push(e, saved_at)
+        push(entries, e)
+    }
+    _rpc_snap_write(path, _rpc_snap_index_serialize(entries))
+    return 1
+}
+
 // session.save -- write a snapshot to <snapshot_dir>/<name>.snap.
 //   args: {name, include_secrets? (int str; default "1")}
 //   returns: {name, path, bytes, personas, tokens, anchors, ownership_entries}
@@ -2047,6 +2155,9 @@ fn _rpc_verb_session_save(args, ctx) {
     if ok == 0 {
         return _rpc_err("write failed to " + path)
     }
+    // R76: upsert the snapshot's directory-index entry so
+    // session.list can enumerate without needing readdir.
+    _rpc_snap_index_upsert(ctx, name, len(text), rpc_ctx_now(ctx))
     // Count summary fields from the ORIGINAL registries (cheap).
     let n_personas = 0
     if rpc_ctx_persona_reg(ctx) != 0 {
@@ -2162,6 +2273,53 @@ fn _rpc_verb_session_load(args, ctx) {
     return _rpc_ok(_rpc_obj(kv))
 }
 
+// session.list -- enumerate snapshots recorded in the R76 index.
+//   args: {}
+//   returns: [{name, path, bytes, saved_at}, ...] in insertion order
+//            (matches the order session.save wrote them)
+//
+// Cap: admin:session (same as save/load).
+//
+// Refusals:
+//   * no snapshot dir configured (same shape as session.save/load)
+//
+// Behavior:
+//   * No index file yet (no session.save has ever run) -> empty array,
+//     ok=true. That's the natural "fresh install" case.
+//   * Malformed index lines are dropped silently by
+//     _rpc_snap_index_parse. If the whole index is corrupt, an
+//     empty array + ok=true is returned.
+//   * `path` is the FULL path a session.load would use (dir + name
+//     + ".snap"). The `bytes` + `saved_at` come from what session.save
+//     wrote; they may be stale if the .snap file was mutated outside
+//     the daemon.
+fn _rpc_verb_session_list(args, ctx) {
+    let dir = rpc_ctx_snapshot_dir(ctx)
+    if len(dir) == 0 {
+        return _rpc_err("no snapshot directory configured")
+    }
+    let idx_path = _rpc_snap_index_path(ctx)
+    let text = _rpc_snap_read(idx_path)
+    let entries = _rpc_snap_index_parse(text)
+    let frags = list_new()
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let name = e[0]
+        let bytes = e[1]
+        let sav = e[2]
+        let path = _rpc_snap_path(ctx, name)
+        let kv = list_new()
+        let a = list_new() push(a, "name")     push(a, _rpc_str(name)) push(kv, a)
+        let b = list_new() push(b, "path")     push(b, _rpc_str(path)) push(kv, b)
+        let c = list_new() push(c, "bytes")    push(c, _rpc_int(bytes)) push(kv, c)
+        let d = list_new() push(d, "saved_at") push(d, _rpc_int(sav))  push(kv, d)
+        push(frags, _rpc_obj(kv))
+        i = i + 1
+    }
+    return _rpc_ok(_rpc_arr(frags))
+}
+
 // ---- top-level dispatch --------------------------------------------------
 
 // The one entry point a daemon calls. `verb` is the verb name string;
@@ -2212,6 +2370,7 @@ fn rpc_dispatch(verb, args, ctx) {
     if str_eq_bytes(verb, "capability.list")   == 1 { return _rpc_verb_capability_list(args, ctx) }
     if str_eq_bytes(verb, "session.save")      == 1 { return _rpc_verb_session_save(args, ctx) }
     if str_eq_bytes(verb, "session.load")      == 1 { return _rpc_verb_session_load(args, ctx) }
+    if str_eq_bytes(verb, "session.list")      == 1 { return _rpc_verb_session_list(args, ctx) }
     return _rpc_err("unknown verb: " + verb)
 }
 
@@ -2247,5 +2406,6 @@ fn rpc_verb_names() {
     push(v, "capability.list")
     push(v, "session.save")
     push(v, "session.load")
+    push(v, "session.list")
     return v
 }
