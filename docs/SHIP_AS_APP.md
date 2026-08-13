@@ -1345,14 +1345,85 @@ name, an unknown action, or a `PRED` before any `POLICY`
 opener is dropped without aborting the parse; the rest of
 the section still loads.
 
-## 12. What comes next (R74+)
+### 7.24 Pattern registry round-trip via session snapshots (R74)
 
-- **R74+** — In-process TLS (retires the sidecar recipe), YAML
+R73 put the R58 policy registry into session snapshots. R74
+does the same for the R53/R61/R62 pattern registry so R62-
+installed authored packs survive a daemon restart.
+
+Snapshot format gets one more section — mirrors R61's .cerec
+pattern-pack authoring shape so an operator can eyeball or
+hand-edit:
+
+```
+#PATTERN v1
+CAPSULE security_review 1.0.0
+PATTERN 900 src:pattern:security_review:v1.0.0
+TRIGGER sql injection
+GUIDANCE Prefer parameterized queries; never interpolate user input into SQL.
+PATTERN 850 src:pattern:security_review:v1.0.0
+TRIGGER hardcoded secret
+GUIDANCE Extract to environment or secrets manager; check git history.
+CAPSULE debug_common 1.0.0
+PATTERN 800 src:pattern:debug_common:v1
+...
+```
+
+The pattern registry is a process-wide singleton (no reg
+param) so the `#PATTERN v1` section is emitted
+**unconditionally** in every R74+ snapshot — the lazy-init
+built-ins always populate the section with at least
+`debug_common` + `research_hygiene`.
+
+Wire responses now carry a `patterns` count:
+
+```bash
+scripts/rpc.sh session.save name my_daemon
+# -> {"ok":true,"result":{
+#      ...
+#      "policies":4,
+#      "patterns":3,       # <-- R74: 2 built-ins + 1 authored pack
+#      ...}}
+
+scripts/rpc.sh session.load name my_daemon
+# -> {"ok":true,"result":{
+#      ...
+#      "patterns":3,
+#      ...}}
+```
+
+**Last-write-wins on capsule name** (matches R53 semantics).
+Re-loading a snapshot that contains `debug_common v1.0.0`
+into a daemon whose lazy-init already registered
+`debug_common v1.0.0` is a no-op. An operator who edits a
+snapshot to bump a built-in's guidance (or version) and
+reloads gets their edit honored — the tweaked capsule
+overwrites the compiled built-in.
+
+**Lenient parser** — non-numeric `PATTERN <conf>` (typo
+guard: `str_to_int` returns 0 for garbage, so we explicitly
+reject non-digit chars in the conf slot), missing `TRIGGER`,
+missing `GUIDANCE`, or malformed `CAPSULE` all drop the
+fragment; other patterns in the same capsule still register.
+
+**Ownership + patterns compose**: an R63-stamped
+`ownership_pattern` entry survives R74 round-trip through
+the `#OWNERSHIP v1` section already; the pattern registry
+survives through `#PATTERN v1`. After
+save/restart/load, a bob who couldn't see alice's authored
+pack before still can't — the ownership overlay stops him
+in `pattern.list` + `coding_helper` (R63/R64) exactly as
+before the restart.
+
+## 12. What comes next (R75+)
+
+- **R75+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), snapshot round-trip for the pattern
-  registry (R53 built-ins reload on daemon start but any
-  R62-installed authored pack is boot-time-lost)
-- **R75+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), snapshot round-trip for the R55.1
+  installed-skill registry (skills registered via
+  `skill.install` at wire time are lost across restart the
+  same way patterns were pre-R74)
+- **R76+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
