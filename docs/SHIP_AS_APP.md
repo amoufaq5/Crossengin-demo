@@ -1731,14 +1731,70 @@ scripts/rpc.sh capability.list
 An audit surface for "which tokens exist for holder X" via
 a hashed id remains R81+ scope.
 
-## 12. What comes next (R81+)
+### 7.31 admin.set_expires wire verb (R81)
 
-- **R81+** — In-process TLS (retires the sidecar recipe), YAML
+Third live-token knob alongside R78 `admin.rotate_token`
+(change bearer id) and R79 `admin.set_qps` (change rate
+ceiling). R81 lets an operator extend or shorten a token's
+expiry without minting a new token — useful for time-limited
+delegations, emergency expiration, or extending a long-running
+service token past its original cutoff.
+
+```bash
+# Extend from expires_at=0 (never) to a specific moment
+scripts/rpc.sh admin.set_expires token_id "tk-service-01" expires_at 5000000
+# -> {"ok":true,"result":{
+#      "token_id":"tk-service-01","holder":"service-01",
+#      "old_expires_at":0,"new_expires_at":5000000}}
+
+# Remove the ceiling (make it never-expires)
+scripts/rpc.sh admin.set_expires token_id "tk-service-01" expires_at 0
+
+# Emergency: expire immediately (any expires_at < current `now`
+# makes the token non-live on the next authorize check without
+# needing capability.revoke)
+scripts/rpc.sh admin.set_expires token_id "tk-suspected-leak" expires_at 1
+```
+
+Cap: `admin:sandbox`. Refusals mirror R78/R79: no cap
+registry, missing args, negative `expires_at`, unknown
+`token_id`, reader-role refused by cap gate.
+
+**Semantics**:
+
+| `expires_at` value | effect |
+|---|---|
+| `0`                    | token never expires (R54 default) |
+| `> now`                | token live until that moment |
+| `< now` (or `== now`)  | token immediately non-live on next authorize |
+
+Revoked state is **independent** of expiry. A revoked token
+stays refused regardless of a fresh expiry (revoked check
+runs first in `token_is_live`). To "un-revoke" without
+recycling the token, use R78 `admin.rotate_token` — rotate
+preserves everything else, and mis-revocation is a rare
+operator error.
+
+**Live-token-knob trio complete** (R78 + R79 + R81):
+
+| verb | changes | preserves |
+|---|---|---|
+| `admin.rotate_token` | `token_id`                | holder, caps, expiry, revoked, qps, window |
+| `admin.set_qps`      | `qps_max` (+ resets window) | token_id, holder, caps, expiry, revoked |
+| `admin.set_expires`  | `expires_at`              | token_id, holder, caps, revoked, qps, window |
+
+An operator can now tune any dimension of a live token
+individually. `capability.revoke` remains the one-way kill
+switch.
+
+## 12. What comes next (R82+)
+
+- **R82+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), an `admin.set_expires` verb for
-  extending/shortening a live token's expiry without
-  minting a new one (pairs with R78 rotate + R79 set_qps)
-- **R82+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), an `admin.grant_cap` / `admin.remove_cap`
+  pair for changing a live token's cap set without recycling
+  it (completes the "every token dimension is mutable" arc)
+- **R83+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
