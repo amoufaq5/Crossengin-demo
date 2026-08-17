@@ -1602,14 +1602,58 @@ can detect "index was stale, file was already gone" vs
 is single-threaded per-connection and admin ops are
 low-frequency, so this is fine.
 
-## 12. What comes next (R78+)
+### 7.28 admin.rotate_token wire verb (R78)
 
-- **R78+** — In-process TLS (retires the sidecar recipe), YAML
+R55 shipped `capability.issue`/`revoke`/`list`. R78 adds
+one more: **`admin.rotate_token`** — mint a fresh bearer
+ID for a live token while preserving everything else
+(holder, caps, expiry, revocation state, rate-limit
+window).
+
+The use case: a token ID appears in a log, a paste, or a
+compromised client image. The operator wants to keep the
+token's IDENTITY (alice's admin token stays alice's admin
+token) but wants a new bearer secret.
+
+```bash
+scripts/rpc.sh admin.rotate_token token_id "tk-carol-old-id"
+# -> {"ok":true,"result":{
+#      "old_token_id":"tk-carol-old-id",
+#      "new_token_id":"1f8a3e0b9c7d4562...", (32 hex chars)
+#      "holder":"carol"}}
+```
+
+Cap: `admin:sandbox` (same as R55 capability verbs).
+
+**In-place rotation** — the token record's `TOK_ID` slot is
+mutated. Every other slot stays pointer-identical: caps
+list, holder, issued_at, expires_at, revoked flag, qps_max,
+current-window state (R56). A subsequent
+`capability_registry_lookup(reg, new_id)` returns THE SAME
+token record; the old_id is now unknown.
+
+**Refusals**:
+
+- No capability registry wired
+- Missing `token_id` arg
+- Unknown `token_id` (already rotated or typo)
+- Reader-role refused by cap gate (`admin:sandbox`)
+
+**Response transport**: both the old and new IDs are bearer
+secrets. The wire response echoes them in cleartext because
+the operator NEEDS to know the new one to redistribute.
+Ship this call only over a secure channel (loopback socket
+or the R54.1 TLS sidecar) — the verb itself doesn't add
+extra confidentiality.
+
+## 12. What comes next (R79+)
+
+- **R79+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), an `admin.rotate_token` verb so
-  operators can rotate a live capability token's ID without
-  churning the whole registry (pairs with R55 `capability.*`)
-- **R79+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), an `admin.set_qps` verb for changing a
+  live token's rate-limit ceiling (currently only settable at
+  `capability.issue` time)
+- **R80+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
