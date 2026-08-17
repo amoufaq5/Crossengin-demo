@@ -1646,14 +1646,53 @@ Ship this call only over a secure channel (loopback socket
 or the R54.1 TLS sidecar) — the verb itself doesn't add
 extra confidentiality.
 
-## 12. What comes next (R79+)
+### 7.29 admin.set_qps wire verb (R79)
 
-- **R79+** — In-process TLS (retires the sidecar recipe), YAML
+R56 shipped per-token rate limits. Setting `qps_max` was
+only possible at `capability.issue` time -- changing a live
+token's ceiling meant revoke + re-issue, which churns the
+bearer id. R79 adds `admin.set_qps` so a rate-limit ceiling
+can be dialed up or down in place.
+
+```bash
+scripts/rpc.sh admin.set_qps token_id "tk-gina" qps_max 100
+# -> {"ok":true,"result":{
+#      "token_id":"tk-gina","holder":"gina",
+#      "old_qps_max":0,"new_qps_max":100}}
+
+# Zero means "unlimited" (matches R56 semantics; a change back
+# to 0 removes the ceiling).
+scripts/rpc.sh admin.set_qps token_id "tk-gina" qps_max 0
+```
+
+Cap: `admin:sandbox` (same as R55 / R78).
+
+**In-place mutation + window reset**: R56's underlying
+`token_set_qps_max` updates the `TOK_QPS_MAX` slot AND
+resets `TOK_WINDOW_START_NANOS` + `TOK_WINDOW_COUNT` to 0.
+The new ceiling takes effect on the very next request
+without carrying credit or debt from the old ceiling. Every
+other slot (id, holder, caps, expiry, revocation flag)
+stays pointer-identical.
+
+**Refusals**:
+
+- No capability registry wired
+- Missing `token_id` / `qps_max` args
+- `qps_max` is negative (`str_to_int` returns 0 for garbage;
+  accepting "0" as intentional "unlimited" and rejecting only
+  negatives keeps the ambiguity on the safer side)
+- Unknown `token_id`
+- Reader-role refused by cap gate
+
+## 12. What comes next (R80+)
+
+- **R80+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), an `admin.set_qps` verb for changing a
-  live token's rate-limit ceiling (currently only settable at
-  `capability.issue` time)
-- **R80+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), a `capability.list` variant that
+  includes the current `qps_max` per token so an operator can
+  audit rate limits without minting a new token to inspect
+- **R81+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
