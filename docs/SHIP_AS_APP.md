@@ -1685,14 +1685,60 @@ stays pointer-identical.
 - Unknown `token_id`
 - Reader-role refused by cap gate
 
-## 12. What comes next (R80+)
+### 7.30 capability.list echoes live rate-limit window state (R80)
 
-- **R80+** — In-process TLS (retires the sidecar recipe), YAML
+R56 shipped per-token rate limits; R79 made them mutable at
+runtime. But `capability.list` gave operators no way to see
+whether the ceilings mattered — a token with `qps_max=1000`
+but only 2 req/s of real traffic doesn't need to be rate-
+limited, and there was no wire signal to notice.
+
+R80 adds two fields to every entry in the `capability.list`
+response:
+
+| field | meaning |
+|---|---|
+| `window_count`       | requests observed in the CURRENT 1-second window. Meaningful only when `qps_max > 0`. |
+| `window_start_nanos` | `nanotime` when the current window opened (`0` if the token hasn't been used yet, or `qps_max=0`). |
+
+Combined with `qps_max` (already in the response since R56),
+an operator can tell at a glance:
+
+- **Ceiling not binding** — `window_count << qps_max`
+  consistently → dial `qps_max` down via R79 `admin.set_qps`
+- **Running hot** — `window_count` frequently near `qps_max`
+  → dial `qps_max` up
+- **Dormant** — `window_start_nanos == 0` → token isn't
+  seeing traffic; candidate for `capability.revoke`
+
+The response envelope is a pure addition — every prior R55
+field stays byte-identical for backward-compat.
+
+```bash
+scripts/rpc.sh capability.list
+# -> {"ok":true,"result":[
+#      {"holder":"alice","caps":["nl:ask","kg:read",...],
+#       "issued_at":11440820,"expires_at":0,"revoked":false,
+#       "qps_max":100,"window_count":47,
+#       "window_start_nanos":1755060742394817293},
+#      {"holder":"bob-svc","caps":["nl:ask","skill:run"],
+#       "issued_at":11440900,"expires_at":0,"revoked":false,
+#       "qps_max":10,"window_count":0,
+#       "window_start_nanos":0}]}
+```
+
+`token_id` still omitted from the response — bearer secret.
+An audit surface for "which tokens exist for holder X" via
+a hashed id remains R81+ scope.
+
+## 12. What comes next (R81+)
+
+- **R81+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), a `capability.list` variant that
-  includes the current `qps_max` per token so an operator can
-  audit rate limits without minting a new token to inspect
-- **R81+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), an `admin.set_expires` verb for
+  extending/shortening a live token's expiry without
+  minting a new one (pairs with R78 rotate + R79 set_qps)
+- **R82+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
