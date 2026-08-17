@@ -1787,14 +1787,75 @@ An operator can now tune any dimension of a live token
 individually. `capability.revoke` remains the one-way kill
 switch.
 
-## 12. What comes next (R82+)
+### 7.32 admin.grant_cap + admin.remove_cap wire verbs (R82)
 
-- **R82+** — In-process TLS (retires the sidecar recipe), YAML
+R78/R79/R81 made token id, rate ceiling, and expiry mutable
+in place. R82 closes the arc by adding cap-set mutation.
+An operator can now tune EVERY dimension of a live token
+without recycling.
+
+```bash
+# Grant a cap (idempotent -- granted=false if already present).
+scripts/rpc.sh admin.grant_cap token_id "tk-tara" cap "skill:run"
+# -> {"ok":true,"result":{
+#      "token_id":"tk-tara","holder":"tara","cap":"skill:run",
+#      "granted":true,
+#      "caps":["nl:ask","kg:read","capsule:read","skill:read",
+#              "persona:read","skill:run"]}}
+
+# Remove a cap (idempotent -- removed=false if absent).
+scripts/rpc.sh admin.remove_cap token_id "tk-uma" cap "nl:ask"
+# -> {"ok":true,"result":{
+#      "token_id":"tk-uma","holder":"uma","cap":"nl:ask",
+#      "removed":true,
+#      "caps":["kg:read","capsule:read","skill:read","persona:read"]}}
+```
+
+Both verbs: cap `admin:sandbox`.
+
+**grant_cap validates against the 13 well-known caps**
+(nl:ask, kg:read, capsule:read/install, skill:read/run/install,
+persona:read/write, ingest:review/decide, admin:sandbox/session).
+Typos like `"cap":"skil:run"` refuse with `"unknown cap: ..."`.
+Otherwise a typo'd cap would sit in the token's list where
+no verb's required-cap lookup would ever match it.
+
+**remove_cap does NOT validate** — an operator might be
+cleaning up a legacy token with a stale cap from an older
+schema; refusing on "unknown cap" here would prevent that
+cleanup. `remove` should always succeed at removing whatever's
+there.
+
+**Live-token-knob quartet complete** (R78 + R79 + R81 + R82):
+
+| verb | changes | preserves |
+|---|---|---|
+| `admin.rotate_token` (R78) | `token_id`   | holder, caps, expiry, revoked, qps, window |
+| `admin.set_qps` (R79)      | `qps_max` (+ resets window) | id, holder, caps, expiry, revoked |
+| `admin.set_expires` (R81)  | `expires_at` | id, holder, caps, revoked, qps, window |
+| `admin.grant_cap` (R82)    | `caps` (add) | id, holder, expiry, revoked, qps, window |
+| `admin.remove_cap` (R82)   | `caps` (rm)  | id, holder, expiry, revoked, qps, window |
+
+Only `holder` is truly immutable (an admin who needs to
+change a token's holder mints a new one via
+`capability.issue`). `capability.revoke` remains the one-way
+kill switch; a mis-revoke can be recovered via
+`admin.rotate_token` which resets the revoked flag as a
+side effect of preserving nothing about revocation (well —
+actually it doesn't touch the revoked slot; a rotated token
+stays revoked. The right recovery is a fresh
+`capability.issue`. Rare enough.)
+
+## 12. What comes next (R83+)
+
+- **R83+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), an `admin.grant_cap` / `admin.remove_cap`
-  pair for changing a live token's cap set without recycling
-  it (completes the "every token dimension is mutable" arc)
-- **R83+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), an `admin.set_revoked` verb for
+  reversing a mis-revoke without losing the token's
+  identity (currently the only recovery is `capability.issue`
+  which mints a new token; some operators need "un-revoke
+  in place" for audit purity)
+- **R84+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
