@@ -1556,14 +1556,60 @@ The index file is a separate concern from any single `.snap`
 payload — the `.snap` files themselves remain the source of
 truth for state, the index is metadata for enumeration.
 
-## 12. What comes next (R77+)
+### 7.27 session.delete wire verb (R77)
 
-- **R77+** — In-process TLS (retires the sidecar recipe), YAML
+R76 gave operators a way to enumerate snapshots. R77 lets them
+prune stale ones without shell access:
+
+```bash
+scripts/rpc.sh session.delete name old-backup
+# -> {"ok":true,"result":{
+#      "name":"old-backup",
+#      "path":"/var/lib/cxe/old-backup.snap",
+#      "deleted":true,
+#      "index_removed":true}}
+```
+
+Cap: `admin:session` (same as save/load/list).
+
+**Idempotent** — a name whose `.snap` is already gone (or was
+never registered) returns `ok:true` with
+`deleted:false`/`index_removed:false`. This matches the
+operator intuition of `rm -f <name>.snap` — the goal is "make
+sure this is gone", not "assert the file exists".
+
+**Response semantics**:
+
+| field | meaning |
+|---|---|
+| `deleted`       | `sys_unlink` succeeded on the `.snap` file |
+| `index_removed` | the R76 index had an entry for this name and it was rewritten without it |
+
+Both booleans reflect independent successes, so an operator
+can detect "index was stale, file was already gone" vs
+"first-ever delete of an existing snapshot".
+
+**Refusals** — mirror `session.save`/`session.load`:
+
+- No snapshot dir configured
+- Missing `name` arg
+- `name` fails the shared `_rpc_snap_name_check` (traversal,
+  disallowed chars, empty, `.`/`..`)
+- Reader-role token refused by cap gate (`admin:session`)
+
+**Not atomic across processes** — two concurrent
+`session.delete` calls against the same name race; the daemon
+is single-threaded per-connection and admin ops are
+low-frequency, so this is fine.
+
+## 12. What comes next (R78+)
+
+- **R78+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), a `session.delete` wire verb (pairs with
-  R76 list so operators can prune old snapshots without shell
-  access)
-- **R78+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), an `admin.rotate_token` verb so
+  operators can rotate a live capability token's ID without
+  churning the whole registry (pairs with R55 `capability.*`)
+- **R79+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
