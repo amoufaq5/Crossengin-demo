@@ -961,11 +961,13 @@ Shipped: `data/packs/samples/climate_facts.json` — 10 atoms +
 climate-science reference; parses clean and demonstrates every
 directive.
 
-**YAML deferred to R67+** — YAML's indentation semantics,
-anchors, tags, and flow-style ambiguity are a much larger
-surface than JSON's clean grammar; a subset would be
-misleading. Operators today can pre-convert YAML with `yq -o
-json` at the shell and pipe into the JSON importer.
+**YAML now lands in R85** — see §7.35. R65's original "defer
+YAML to a later round" call turned into a strict-subset
+adapter under `src/ingest/importers/yaml_records.nova` that
+rejects anchors, tags, flow-style, and block scalars up-front
+rather than parsing them permissively. Operators who need
+the rejected features still pre-convert with `yq -p yaml -o
+json` and pipe into the JSON importer.
 
 ### 7.18 ingest.file wire verb (R66)
 
@@ -1013,16 +1015,17 @@ ATOM x 1 500" \
 # -> ingested:0, queued:1
 ```
 
-Formats supported at R67: **cerec**, **json**, **csv**,
-**ntriples**, **wikidata**, **conceptnet**, **papermeta**,
-**wordnet** — every importer whose module ships a
-`_parse_text` variant. Each takes the same envelope
+Formats supported as of R85: **cerec**, **json**, **yaml**,
+**csv**, **ntriples**, **wikidata**, **conceptnet**,
+**papermeta**, **wordnet** — every importer whose module ships
+a `_parse_text` variant. Each takes the same envelope
 (`format` + `body`) plus format-specific args:
 
 | format     | requires `kg` | requires `source` | extra              |
 |------------|---------------|-------------------|--------------------|
 | cerec      | no (in body)  | no (in body)      | —                  |
 | json       | no (default)  | no (default)      | `kg`/`source` default when a record omits them |
+| yaml       | no (default)  | no (default)      | R85 subset only (see §7.35); `kg`/`source` default when a record omits them |
 | csv        | **yes**       | **yes**           | —                  |
 | ntriples   | **yes**       | **yes**           | —                  |
 | wikidata   | **yes**       | **yes**           | R68 adds `labels_body` (TSV) + `formal_preds` (CSV) |
@@ -1962,16 +1965,89 @@ and there is no reason to want that reversed.
 | `admin.set_revoked` (R83)  | `revoked`    | id, holder, caps, expiry, qps, window |
 | `admin.set_holder` (R84)   | `holder`     | id, caps, expiry, revoked, qps, window |
 
-## 12. What comes next (R85+)
+### 7.35 YAML ingest adapter (R85)
 
-- **R85+** — In-process TLS (retires the R54.1 sidecar recipe so
+R65 shipped a JSON structured-record adapter (§7.17) and R66/R67
+put every importer on the `ingest.file` wire (§7.18). R85
+completes the "config-shaped pack" side of that story with a
+YAML adapter — a hand-rolled YAML 1.2 SUBSET parser under
+`src/ingest/importers/yaml_records.nova` that produces exactly
+the same curriculum records the JSON adapter produces. This
+matters because operator-authored records packs are the
+common case, and YAML's indentation + comments read cleaner
+by hand than JSON's `{}`/`""` scaffolding.
+
+The parser is a **strict subset** by design. A partial YAML
+parser that silently drops anchors would be a worse operator
+experience than "the doc uses `&anchor`, refuse it clearly and
+tell the operator to pre-convert with `yq -p yaml -o json`".
+
+**Subset supported:**
+
+- Top-level list of records (`- kg: ...`)
+- Top-level `records:` key holding such a list
+- Bare-string, single-quoted, and double-quoted scalars
+  (`\n \t \r \" \\ \/` escapes)
+- Integer scalars (optional leading `-`)
+- Boolean scalars (`true` / `false`)
+- Null (`null`, `~`, or an empty value after `key:`)
+- One-level nested mappings inside a record (e.g. `capsule:`)
+- Nested lists of mappings (`atoms:`, `implications:`, ...)
+- Comments starting with `#` (bare column-0 or space-preceded)
+- Indentation: **strictly 2 spaces per level** — any tab
+  anywhere on a line refuses the parse; odd-column indent
+  refuses the parse
+
+**Explicitly rejected** (per-parse error, nothing lands):
+
+- Anchors (`&anchor`) and aliases (`*anchor`)
+- Multi-document streams (`---` after any content); a leading
+  `---` on the very first line is tolerated as an optional
+  first-doc header
+- Flow-style sequences (`[a, b]`) and mappings (`{k: v}`)
+- Block scalars (`|` and `>`)
+- Tags (`!!str`, `!custom`)
+- Merge keys (`<<:`)
+
+**Wire integration** — the `ingest.file` verb (§7.18) dispatches
+`format: yaml` to `yamlr_parse_text(body, kg_hint, source_tag)`.
+`kg` + `source` args default in for records that omit them, per-
+record values override, all of the R71 KG + capsule ownership
+auto-assignment (§7.21) applies unchanged — the yaml body is
+just another `records[]` source once the parser is done. Same
+trust/queue split, same `force_queue` bypass, same
+`records_refused_by_ownership` echo.
+
+**source_registry** — `reg_source_install_defaults` now
+registers `yaml` → `src:yaml:` (FMT_YAML = 10); the format
+count is 10.
+
+Example:
+
+```bash
+scripts/rpc.sh ingest.file \
+  format yaml \
+  body "$(cat data/packs/samples/climate_facts.yaml)"
+# -> {"ok":true,"result":{
+#      "format":"yaml",
+#      "records_parsed":1,
+#      "records_queued":1,     # src:yaml: is not in the default
+#                              # trusted prefix list -> review queue
+#      "atoms_added":0,
+#      ...}}
+```
+
+Shipped: `data/packs/samples/climate_facts.yaml` — the same 10
+atoms + 7 implications + 3 observations + 2 citations as the
+R65 JSON sample, so operators can diff the two side-by-side.
+
+## 12. What comes next (R86+)
+
+- **R86+** — In-process TLS (retires the R54.1 sidecar recipe so
   the daemon can bind an HTTPS socket directly without stunnel),
-  YAML input adapter (either a new importer wrapping
-  `jsonr_parse` via a yaml-to-json shim, or a first-class parser
-  under `src/data/yaml.nova`), per-session pre/post hooks so a
-  daemon operator can attach an audit-log writer without editing
-  `rpc_server.nova`
-- **R86+** — Per-source rate budgets controllable via admin wire
+  per-session pre/post hooks so a daemon operator can attach an
+  audit-log writer without editing `rpc_server.nova`
+- **R87+** — Per-source rate budgets controllable via admin wire
   verb (aggregate ceilings that span multiple tokens from the
   same origin), hardware-key-backed admin bootstrap (yubikey
   attestation on `capability.issue` for the first admin token),

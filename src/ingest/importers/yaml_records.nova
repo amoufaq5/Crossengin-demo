@@ -1,0 +1,972 @@
+// CrossEngin ingestion: YAML structured-record importer (R85).
+//
+// Turns a YAML document into curriculum records that slot into the
+// same pipeline / review-queue / policy engine every other importer
+// already feeds. Mirrors the R65/R69 JSON importer shape one-to-one:
+// the top-level YAML is a list of record mappings (or a single map
+// with a `records:` key whose value is that list), and each record
+// carries `kg` / `source` plus optional `capsule` / `atoms` /
+// `implications` / `observations` / `citations` sub-shapes.
+//
+// -----------------------------------------------------------------
+// SUPPORTED YAML 1.2 SUBSET (R85)
+// -----------------------------------------------------------------
+//
+// The R65 JSON adapter reached for `src/data/json.nova` so we get a
+// mature grammar for free. YAML has no such shared parser in the
+// tree, so this file ships a hand-rolled tokenizer + tree builder
+// tuned to the tiny subset an operator-authored records pack needs.
+// Everything outside that subset is REJECTED with a clear error
+// rather than parsed permissively -- a partial YAML parser that
+// silently drops anchors would be a worse operator experience than
+// "pre-convert with `yq -o yaml` and try again".
+//
+// Supported:
+//   * Top-level list of records:   `- kg: ...`
+//   * Top-level `records:` key holding such a list
+//   * Scalars: bare strings, single-quoted, double-quoted (with
+//     simple escapes: \n \t \r \" \\ \/)
+//   * Integers: optional leading `-`, then digits only
+//   * Booleans: `true` / `false`
+//   * Null: `null`, `~`, or an empty value after `key:`
+//   * One-level-deep nested mappings inside a record (a record's
+//     `capsule:` key, for example, holds `name:` / `version:` / ...)
+//   * Nested lists of mappings (atoms / implications / ...)
+//   * Comments starting with `#` (bare column-0 `#` or a space-
+//     preceded `#`, honoring quoted-string context)
+//   * Indentation: STRICTLY 2 spaces per level. Any tab character
+//     anywhere on a line is refused. Odd-column indents are refused.
+//
+// Explicitly REJECTED with a per-parse error:
+//   * Anchors (`&anchor`) and aliases (`*anchor`)
+//   * Multi-document streams -- a `---` that follows any content
+//     refuses the whole parse (a leading `---` on the very first
+//     line is tolerated as an optional first-doc header)
+//   * Flow-style sequences (`[a, b]`) and mappings (`{k: v}`)
+//   * Block scalars (`|` and `>`)
+//   * Tags (`!!str`, `!custom`)
+//   * Merge keys (`<<:`)
+//
+// The rejections fire at tokenize time so the schema layer never
+// sees a partially-parsed pathological doc.
+//
+// -----------------------------------------------------------------
+// RETURN SHAPE (matches every other importer)
+// -----------------------------------------------------------------
+//
+//   yamlr_parse_text(text, kg_hint, source_tag)
+//     -> [records_list, errors_list]
+//   yamlr_parse(path, kg_hint, source_tag)
+//     -> same, reading the file first
+//
+// `kg_hint` and `source_tag` are DEFAULTS for records that omit the
+// corresponding top-level field; a per-record value wins. When both
+// the record's field AND the hint are empty, the record is dropped
+// with a parse error, mirroring jsonr_parse_text.
+//
+// Lenient parser (schema layer): a per-record field error is logged
+// with the record's array index in the "line" slot (YAML is line-
+// oriented but the batch may be arbitrarily reindented -- index is
+// what's meaningful for a batch); other well-formed records still
+// land.
+//
+// Symbol prefix: EVERY helper is `yamlr_` or `_yamlr_` to avoid
+// collisions with a future `src/data/yaml.nova` (R66's lesson --
+// `json_parse` collided with the pre-existing shared parser).
+//
+// NOVA dependencies: builtins (read_file, char_at, len, substr).
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova
+//   src/kg/atom_store.nova (ATOM_* constants)
+//   src/util/str_safe.nova.
+
+import "../curriculum.nova"
+import "../../kg/atom_store.nova"
+import "../../util/str_safe.nova"
+
+// ---- YAML tree value tags --------------------------------------------
+
+let YT_STR   = 1
+let YT_INT   = 2
+let YT_BOOL  = 3
+let YT_NULL  = 4
+let YT_MAP   = 5    // payload: list of [key_string, YVAL]
+let YT_LIST  = 6    // payload: list of YVAL
+let YT_ERR   = 7    // payload: error string
+
+// ---- value constructors ----------------------------------------------
+
+fn yamlr_yv(tag, payload) {
+    let v = list_new() push(v, tag) push(v, payload) return v
+}
+fn yamlr_yv_null()      { return yamlr_yv(YT_NULL, 0) }
+fn yamlr_yv_str(s)      { return yamlr_yv(YT_STR, s) }
+fn yamlr_yv_int(n)      { return yamlr_yv(YT_INT, n) }
+fn yamlr_yv_bool(b)     { return yamlr_yv(YT_BOOL, b) }
+fn yamlr_yv_err(msg)    { return yamlr_yv(YT_ERR, msg) }
+
+fn yamlr_tag(v)     { return v[0] }
+fn yamlr_payload(v) { return v[1] }
+fn yamlr_is_err(v)  { if v[0] == YT_ERR { return 1 } return 0 }
+
+// ---- error-list helper -----------------------------------------------
+
+fn yamlr_err_rec(errors, idx, msg) {
+    let e = list_new() push(e, idx) push(e, msg) push(errors, e)
+}
+
+// ---- string helpers --------------------------------------------------
+
+fn _yamlr_starts_with(s, pre) {
+    let sl = len(s)
+    let pl = len(pre)
+    if sl < pl { return 0 }
+    return str_eq_bytes(substr(s, 0, pl), pre)
+}
+
+// Return the byte index in `content` where a mapping's VALUE starts,
+// counting past `key: ` (or the bare `key:` at end of line). Returns
+// -1 if the content is NOT a mapping-key line (no `: ` outside quoted
+// scalars and not ending in `:`). Quoted-string state is honored so a
+// literal ": " inside `"a: b"` doesn't fool the scanner.
+fn _yamlr_value_start(content) {
+    let n = len(content)
+    let in_dq = 0
+    let in_sq = 0
+    let i = 0
+    while i < n {
+        let c = char_at(content, i)
+        if in_dq == 1 {
+            if c == 92 { i = i + 2 continue }   // '\' escape
+            if c == 34 { in_dq = 0 }
+        } else { if in_sq == 1 {
+            if c == 39 { in_sq = 0 }
+        } else {
+            if c == 34 { in_dq = 1 }
+            else { if c == 39 { in_sq = 1 }
+            else { if c == 58 {
+                // ':' at end-of-content, or followed by ' '
+                if i + 1 == n { return n }
+                if char_at(content, i + 1) == 32 { return i + 2 }
+            } } }
+        } }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- error return helper (tokenize) ----------------------------------
+
+fn _yamlr_tk_err(msg) {
+    let out = list_new()
+    push(out, list_new())
+    push(out, msg)
+    return out
+}
+
+// ---- tokenizer -------------------------------------------------------
+//
+// Returns [tokens, error_string]. On error, tokens is [] and the
+// error names the offending line. A token is [indent, content,
+// line_no] where content is the trimmed line with any trailing
+// comment stripped. Blank + comment-only lines are dropped.
+fn yamlr_tokenize(text) {
+    let toks = list_new()
+    let n = len(text)
+    let i = 0
+    let line = 1
+    let saw_content = 0
+    while i < n {
+        let start = i
+        while i < n {
+            if char_at(text, i) == 10 { break }
+            i = i + 1
+        }
+        let raw = substr(text, start, i - start)
+        if i < n { if char_at(text, i) == 10 { i = i + 1 } }
+        let rlen = len(raw)
+        // Strip trailing \r (CRLF tolerance).
+        if rlen > 0 { if char_at(raw, rlen - 1) == 13 {
+            raw = substr(raw, 0, rlen - 1) rlen = len(raw)
+        } }
+        // Refuse tabs anywhere -- the subset commits to 2-space indent.
+        let ti = 0
+        while ti < rlen {
+            if char_at(raw, ti) == 9 {
+                return _yamlr_tk_err("yaml: tab character at line "
+                    + int_to_str(line) + " (indent must be spaces)")
+            }
+            ti = ti + 1
+        }
+        // Count leading spaces.
+        let indent = 0
+        while indent < rlen {
+            if char_at(raw, indent) != 32 { break }
+            indent = indent + 1
+        }
+        // Strip trailing comment (respecting quoted-string context).
+        let hash = 0 - 1
+        let ci = indent
+        let in_dq = 0
+        let in_sq = 0
+        while ci < rlen {
+            let cc = char_at(raw, ci)
+            if in_dq == 1 {
+                if cc == 92 { ci = ci + 2 continue }
+                if cc == 34 { in_dq = 0 }
+            } else { if in_sq == 1 {
+                if cc == 39 { in_sq = 0 }
+            } else {
+                if cc == 34 { in_dq = 1 }
+                else { if cc == 39 { in_sq = 1 }
+                else { if cc == 35 {
+                    // '#' -- comment marker if at column 0 or preceded by space.
+                    if ci == indent { hash = ci break }
+                    if char_at(raw, ci - 1) == 32 { hash = ci break }
+                } } }
+            } }
+            ci = ci + 1
+        }
+        if hash >= 0 { raw = substr(raw, 0, hash) rlen = len(raw) }
+        // Trim trailing spaces.
+        while rlen > 0 {
+            if char_at(raw, rlen - 1) != 32 { break }
+            rlen = rlen - 1
+        }
+        raw = substr(raw, 0, rlen)
+        // Blank / whitespace-only / comment-only line -- skip. Trailing-
+        // space trimming may have shrunk rlen below the original indent
+        // count (a bare "   \n" line), so any rlen <= indent is empty.
+        if rlen <= indent {
+            line = line + 1
+            continue
+        }
+        let content = substr(raw, indent, rlen - indent)
+        // Document markers.
+        if str_eq_bytes(content, "---") == 1 {
+            if saw_content == 1 {
+                return _yamlr_tk_err(
+                    "yaml: multi-document streams not supported (line "
+                    + int_to_str(line) + ")")
+            }
+            // Leading first-doc header -- tolerate.
+            line = line + 1
+            continue
+        }
+        if str_eq_bytes(content, "...") == 1 {
+            // End-of-doc marker; stop consuming.
+            break
+        }
+        // Merge keys.
+        if _yamlr_starts_with(content, "<<:") == 1 {
+            return _yamlr_tk_err(
+                "yaml: merge keys ('<<:') not supported (line "
+                + int_to_str(line) + ")")
+        }
+        // Reject markers at the very first content character.
+        let fc = char_at(content, 0)
+        if fc == 91 {
+            return _yamlr_tk_err(
+                "yaml: flow-style sequences ('[...]') not supported (line "
+                + int_to_str(line) + ")")
+        }
+        if fc == 123 {
+            return _yamlr_tk_err(
+                "yaml: flow-style mappings ('{...}') not supported (line "
+                + int_to_str(line) + ")")
+        }
+        if fc == 38 {
+            return _yamlr_tk_err(
+                "yaml: anchors ('&') not supported (line "
+                + int_to_str(line) + ")")
+        }
+        if fc == 42 {
+            return _yamlr_tk_err(
+                "yaml: aliases ('*') not supported (line "
+                + int_to_str(line) + ")")
+        }
+        // Reject markers inside a list-item body (`- <marker>...`).
+        if fc == 45 { if len(content) >= 2 { if char_at(content, 1) == 32 {
+            let bfc = char_at(content, 2)
+            if bfc == 91 { return _yamlr_tk_err(
+                "yaml: flow-style sequences ('[...]') not supported (line "
+                + int_to_str(line) + ")") }
+            if bfc == 123 { return _yamlr_tk_err(
+                "yaml: flow-style mappings ('{...}') not supported (line "
+                + int_to_str(line) + ")") }
+            if bfc == 38 { return _yamlr_tk_err(
+                "yaml: anchors ('&') not supported (line "
+                + int_to_str(line) + ")") }
+            if bfc == 42 { return _yamlr_tk_err(
+                "yaml: aliases ('*') not supported (line "
+                + int_to_str(line) + ")") }
+            if bfc == 33 { return _yamlr_tk_err(
+                "yaml: tags ('!'/'!!') not supported (line "
+                + int_to_str(line) + ")") }
+        } } }
+        // Reject markers at the start of a mapping-key VALUE portion.
+        let vs = _yamlr_value_start(content)
+        if vs >= 0 { if vs < len(content) {
+            let vc0 = char_at(content, vs)
+            if vc0 == 91 { return _yamlr_tk_err(
+                "yaml: flow-style sequences ('[...]') not supported (line "
+                + int_to_str(line) + ")") }
+            if vc0 == 123 { return _yamlr_tk_err(
+                "yaml: flow-style mappings ('{...}') not supported (line "
+                + int_to_str(line) + ")") }
+            if vc0 == 38 { return _yamlr_tk_err(
+                "yaml: anchors ('&') not supported (line "
+                + int_to_str(line) + ")") }
+            if vc0 == 42 { return _yamlr_tk_err(
+                "yaml: aliases ('*') not supported (line "
+                + int_to_str(line) + ")") }
+            if vc0 == 33 { return _yamlr_tk_err(
+                "yaml: tags ('!'/'!!') not supported (line "
+                + int_to_str(line) + ")") }
+            if len(content) - vs == 1 { if vc0 == 124 { return _yamlr_tk_err(
+                "yaml: block scalars ('|') not supported (line "
+                + int_to_str(line) + ")") } }
+            if len(content) - vs == 1 { if vc0 == 62 { return _yamlr_tk_err(
+                "yaml: block scalars ('>') not supported (line "
+                + int_to_str(line) + ")") } }
+        } }
+        // Enforce even indent (multiple of 2 spaces).
+        if (indent / 2) * 2 != indent {
+            return _yamlr_tk_err(
+                "yaml: indent must be a multiple of 2 spaces (line "
+                + int_to_str(line) + " has " + int_to_str(indent) + ")")
+        }
+        let tok = list_new()
+        push(tok, indent) push(tok, content) push(tok, line)
+        push(toks, tok)
+        saw_content = 1
+        line = line + 1
+    }
+    let out = list_new() push(out, toks) push(out, "") return out
+}
+
+// ---- scalar parser ---------------------------------------------------
+
+fn _yamlr_scalar(s, line_no) {
+    if len(s) == 0 { return yamlr_yv_null() }
+    let c0 = char_at(s, 0)
+    // Reject markers at start of a scalar (block scalar / flow-style /
+    // anchor / alias / tag). These can only reach _yamlr_scalar via a
+    // list-item inline body -- the tokenizer already rejects them for
+    // mapping-key values.
+    if c0 == 91 { return yamlr_yv_err(
+        "yaml: flow-style sequences ('[...]') not supported (line "
+        + int_to_str(line_no) + ")") }
+    if c0 == 123 { return yamlr_yv_err(
+        "yaml: flow-style mappings ('{...}') not supported (line "
+        + int_to_str(line_no) + ")") }
+    if c0 == 38 { return yamlr_yv_err(
+        "yaml: anchors ('&') not supported (line " + int_to_str(line_no) + ")") }
+    if c0 == 42 { return yamlr_yv_err(
+        "yaml: aliases ('*') not supported (line " + int_to_str(line_no) + ")") }
+    if c0 == 33 { return yamlr_yv_err(
+        "yaml: tags ('!'/'!!') not supported (line " + int_to_str(line_no) + ")") }
+    if c0 == 124 { if len(s) == 1 { return yamlr_yv_err(
+        "yaml: block scalars ('|') not supported (line "
+        + int_to_str(line_no) + ")") } }
+    if c0 == 62 { if len(s) == 1 { return yamlr_yv_err(
+        "yaml: block scalars ('>') not supported (line "
+        + int_to_str(line_no) + ")") } }
+    // Double-quoted.
+    if c0 == 34 {
+        let n = len(s)
+        if n < 2 { return yamlr_yv_err(
+            "yaml: unterminated double-quoted string at line "
+            + int_to_str(line_no)) }
+        if char_at(s, n - 1) != 34 { return yamlr_yv_err(
+            "yaml: unterminated double-quoted string at line "
+            + int_to_str(line_no)) }
+        let out = ""
+        let i = 1
+        while i < n - 1 {
+            let c = char_at(s, i)
+            if c == 92 {
+                if i + 1 >= n - 1 { return yamlr_yv_err(
+                    "yaml: dangling escape at line " + int_to_str(line_no)) }
+                let e = char_at(s, i + 1)
+                if e == 110      { out = out + "\n" }
+                else { if e == 116 { out = out + "\t" }
+                else { if e == 114 { out = out + "\r" }
+                else { if e == 34  { out = out + "\"" }
+                else { if e == 92  { out = out + "\\" }
+                else { if e == 47  { out = out + "/" }
+                else {
+                    return yamlr_yv_err(
+                        "yaml: unsupported escape '\\" + substr(s, i + 1, 1)
+                        + "' at line " + int_to_str(line_no))
+                } } } } } }
+                i = i + 2
+                continue
+            }
+            if c == 34 {
+                return yamlr_yv_err(
+                    "yaml: unescaped '\"' inside double-quoted string at line "
+                    + int_to_str(line_no))
+            }
+            out = out + substr(s, i, 1)
+            i = i + 1
+        }
+        return yamlr_yv_str(out)
+    }
+    // Single-quoted ('' is a literal ').
+    if c0 == 39 {
+        let n = len(s)
+        if n < 2 { return yamlr_yv_err(
+            "yaml: unterminated single-quoted string at line "
+            + int_to_str(line_no)) }
+        if char_at(s, n - 1) != 39 { return yamlr_yv_err(
+            "yaml: unterminated single-quoted string at line "
+            + int_to_str(line_no)) }
+        let out = ""
+        let i = 1
+        while i < n - 1 {
+            let c = char_at(s, i)
+            if c == 39 {
+                if i + 1 < n - 1 { if char_at(s, i + 1) == 39 {
+                    out = out + "'"
+                    i = i + 2
+                    continue
+                } }
+                return yamlr_yv_err(
+                    "yaml: unescaped single quote at line "
+                    + int_to_str(line_no))
+            }
+            out = out + substr(s, i, 1)
+            i = i + 1
+        }
+        return yamlr_yv_str(out)
+    }
+    // Null.
+    if str_eq_bytes(s, "null") == 1 { return yamlr_yv_null() }
+    if str_eq_bytes(s, "~")    == 1 { return yamlr_yv_null() }
+    // Bool.
+    if str_eq_bytes(s, "true")  == 1 { return yamlr_yv_bool(1) }
+    if str_eq_bytes(s, "false") == 1 { return yamlr_yv_bool(0) }
+    // Int: optional leading '-', then digits only.
+    let n = len(s)
+    let j = 0
+    if char_at(s, 0) == 45 { j = 1 }
+    let has_digit = 0
+    let all_digit = 1
+    while j < n {
+        let c = char_at(s, j)
+        if c < 48 { all_digit = 0 j = n continue }
+        if c > 57 { all_digit = 0 j = n continue }
+        has_digit = 1
+        j = j + 1
+    }
+    if all_digit == 1 { if has_digit == 1 {
+        return yamlr_yv_int(str_to_int(s))
+    } }
+    // Bare string.
+    return yamlr_yv_str(s)
+}
+
+// ---- tree parser -----------------------------------------------------
+
+fn _yamlr_is_list_item(content) {
+    let n = len(content)
+    if n == 0 { return 0 }
+    if char_at(content, 0) != 45 { return 0 }
+    if n == 1 { return 1 }
+    if char_at(content, 1) == 32 { return 1 }
+    return 0
+}
+
+fn _yamlr_synth_tok(indent, content, line_no) {
+    let t = list_new()
+    push(t, indent) push(t, content) push(t, line_no)
+    return t
+}
+
+fn yamlr_parse_block(tokens, pos, indent) {
+    if pos >= len(tokens) {
+        let out = list_new() push(out, yamlr_yv_null()) push(out, pos) return out
+    }
+    let first = tokens[pos]
+    if first[0] != indent {
+        let out = list_new() push(out, yamlr_yv_null()) push(out, pos) return out
+    }
+    if _yamlr_is_list_item(first[1]) == 1 {
+        return yamlr_parse_list(tokens, pos, indent)
+    }
+    return yamlr_parse_map(tokens, pos, indent)
+}
+
+fn yamlr_parse_list(tokens, pos, indent) {
+    let items = list_new()
+    let p = pos
+    while p < len(tokens) {
+        let tok = tokens[p]
+        if tok[0] < indent { break }
+        if tok[0] > indent {
+            let e = yamlr_yv_err("yaml: unexpected indent at line "
+                + int_to_str(tok[2]))
+            let out = list_new() push(out, e) push(out, p) return out
+        }
+        let content = tok[1]
+        if _yamlr_is_list_item(content) == 0 { break }
+        let body = ""
+        if len(content) >= 2 { body = substr(content, 2, len(content) - 2) }
+        let item_val = 0
+        let next_pos = p + 1
+        if len(body) == 0 {
+            let sub = yamlr_parse_block(tokens, next_pos, indent + 2)
+            if yamlr_is_err(sub[0]) == 1 {
+                let out = list_new() push(out, sub[0]) push(out, sub[1]) return out
+            }
+            item_val = sub[0]
+            next_pos = sub[1]
+        } else {
+            let bvs = _yamlr_value_start(body)
+            if bvs >= 0 {
+                // `- key: value` -- item is a mapping. The mapping's
+                // first pair lives on this line (synthesized at
+                // indent+2), and any continuation lives on subsequent
+                // lines at indent+2.
+                let synth = _yamlr_synth_tok(indent + 2, body, tok[2])
+                let combined = list_new()
+                push(combined, synth)
+                let q = next_pos
+                while q < len(tokens) {
+                    let t2 = tokens[q]
+                    if t2[0] < indent + 2 { break }
+                    push(combined, t2)
+                    q = q + 1
+                }
+                let sub = yamlr_parse_map(combined, 0, indent + 2)
+                if yamlr_is_err(sub[0]) == 1 {
+                    let out = list_new() push(out, sub[0]) push(out, q) return out
+                }
+                let consumed = sub[1] - 1   // subtract the synth token
+                item_val = sub[0]
+                next_pos = next_pos + consumed
+            } else {
+                item_val = _yamlr_scalar(body, tok[2])
+                if yamlr_is_err(item_val) == 1 {
+                    let out = list_new() push(out, item_val) push(out, p + 1) return out
+                }
+            }
+        }
+        push(items, item_val)
+        p = next_pos
+    }
+    let out = list_new()
+    push(out, yamlr_yv(YT_LIST, items))
+    push(out, p)
+    return out
+}
+
+fn yamlr_parse_map(tokens, pos, indent) {
+    let entries = list_new()
+    let p = pos
+    while p < len(tokens) {
+        let tok = tokens[p]
+        if tok[0] < indent { break }
+        if tok[0] > indent {
+            let e = yamlr_yv_err("yaml: unexpected indent at line "
+                + int_to_str(tok[2]))
+            let out = list_new() push(out, e) push(out, p) return out
+        }
+        let content = tok[1]
+        if _yamlr_is_list_item(content) == 1 { break }
+        let vs = _yamlr_value_start(content)
+        if vs < 0 {
+            let e = yamlr_yv_err(
+                "yaml: expected 'key: value' at line "
+                + int_to_str(tok[2]))
+            let out = list_new() push(out, e) push(out, p) return out
+        }
+        let n = len(content)
+        let key_end = vs - 2
+        if vs == n { key_end = vs - 1 }
+        let key = substr(content, 0, key_end)
+        let val_str = ""
+        if vs < n { val_str = substr(content, vs, n - vs) }
+        let val = 0
+        let next_pos = p + 1
+        if len(val_str) == 0 {
+            let sub = yamlr_parse_block(tokens, next_pos, indent + 2)
+            if yamlr_is_err(sub[0]) == 1 {
+                let out = list_new() push(out, sub[0]) push(out, sub[1]) return out
+            }
+            val = sub[0]
+            next_pos = sub[1]
+        } else {
+            val = _yamlr_scalar(val_str, tok[2])
+            if yamlr_is_err(val) == 1 {
+                let out = list_new() push(out, val) push(out, p + 1) return out
+            }
+        }
+        let pair = list_new()
+        push(pair, key) push(pair, val)
+        push(entries, pair)
+        p = next_pos
+    }
+    let out = list_new()
+    push(out, yamlr_yv(YT_MAP, entries))
+    push(out, p)
+    return out
+}
+
+// ---- schema-layer helpers --------------------------------------------
+
+fn _yamlr_map_get(entries, key) {
+    let i = 0
+    while i < len(entries) {
+        if str_eq_bytes(entries[i][0], key) == 1 { return entries[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _yamlr_has_key(entries, key) {
+    let i = 0
+    while i < len(entries) {
+        if str_eq_bytes(entries[i][0], key) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _yamlr_str_field(entries, key) {
+    let v = _yamlr_map_get(entries, key)
+    if v == 0 { return "" }
+    let t = yamlr_tag(v)
+    if t == YT_STR  { return yamlr_payload(v) }
+    if t == YT_INT  { return int_to_str(yamlr_payload(v)) }
+    if t == YT_NULL { return "" }
+    return ""
+}
+
+// [ok, value] pair: ok=1 only when the field is present AND typed as
+// an integer scalar (not a numeric string, not a float, not missing).
+fn _yamlr_int_field(entries, key) {
+    let out = list_new()
+    let v = _yamlr_map_get(entries, key)
+    if v == 0 { push(out, 0) push(out, 0) return out }
+    if yamlr_tag(v) != YT_INT { push(out, 0) push(out, 0) return out }
+    push(out, 1) push(out, yamlr_payload(v))
+    return out
+}
+
+fn _yamlr_resolve_kind(v) {
+    if v == 0 { return 0 - 1 }
+    if yamlr_tag(v) == YT_INT {
+        let n = yamlr_payload(v)
+        if atom_kind_valid(n) == 1 { return n }
+        return 0 - 1
+    }
+    if yamlr_tag(v) != YT_STR { return 0 - 1 }
+    let s = yamlr_payload(v)
+    if str_eq_bytes(s, "fact")     == 1 { return ATOM_FACT }
+    if str_eq_bytes(s, "relation") == 1 { return ATOM_RELATION }
+    if str_eq_bytes(s, "concept")  == 1 { return ATOM_CONCEPT }
+    if str_eq_bytes(s, "skill")    == 1 { return ATOM_SKILL }
+    if str_eq_bytes(s, "lang")     == 1 { return ATOM_LANG }
+    if str_eq_bytes(s, "rule")     == 1 { return ATOM_RULE }
+    return 0 - 1
+}
+
+// ---- schema layer: apply one record ---------------------------------
+
+fn _yamlr_apply_record(obj, idx, kg_hint, source_tag, records, errors) {
+    if yamlr_tag(obj) != YT_MAP {
+        yamlr_err_rec(errors, idx,
+            "record at index " + int_to_str(idx) + " must be a mapping")
+        return 0
+    }
+    let entries = yamlr_payload(obj)
+    let kg_name = kg_hint
+    if _yamlr_has_key(entries, "kg") == 1 {
+        let s = _yamlr_str_field(entries, "kg")
+        if len(s) > 0 { kg_name = s }
+    }
+    if len(kg_name) == 0 {
+        yamlr_err_rec(errors, idx,
+            "record missing 'kg' and no kg_hint supplied")
+        return 0
+    }
+    let src = source_tag
+    if _yamlr_has_key(entries, "source") == 1 {
+        let s = _yamlr_str_field(entries, "source")
+        if len(s) > 0 { src = s }
+    }
+    if len(src) == 0 {
+        yamlr_err_rec(errors, idx,
+            "record missing 'source' and no source_tag supplied")
+        return 0
+    }
+    let rec = cur_new(kg_name, src)
+    // Capsule (optional).
+    if _yamlr_has_key(entries, "capsule") == 1 {
+        let cap = _yamlr_map_get(entries, "capsule")
+        if yamlr_tag(cap) == YT_MAP {
+            let ce = yamlr_payload(cap)
+            let cn = _yamlr_str_field(ce, "name")
+            let cv = _yamlr_str_field(ce, "version")
+            let cd = _yamlr_str_field(ce, "description")
+            let cl = _yamlr_str_field(ce, "license")
+            if len(cn) > 0 {
+                cur_set_capsule(rec, cn, cv, cd, cl)
+                if _yamlr_has_key(ce, "deps") == 1 {
+                    let deps = _yamlr_map_get(ce, "deps")
+                    if yamlr_tag(deps) == YT_LIST {
+                        let dl = yamlr_payload(deps)
+                        let di = 0
+                        while di < len(dl) {
+                            let d = dl[di]
+                            if yamlr_tag(d) == YT_MAP {
+                                let de = yamlr_payload(d)
+                                let dn = _yamlr_str_field(de, "name")
+                                let dv = _yamlr_str_field(de, "version")
+                                if len(dn) > 0 {
+                                    cur_add_capsule_dep(rec, dn, dv)
+                                }
+                            }
+                            di = di + 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Atoms.
+    if _yamlr_has_key(entries, "atoms") == 1 {
+        let atoms = _yamlr_map_get(entries, "atoms")
+        if yamlr_tag(atoms) == YT_LIST {
+            let al = yamlr_payload(atoms)
+            let ai = 0
+            while ai < len(al) {
+                let a = al[ai]
+                if yamlr_tag(a) != YT_MAP {
+                    yamlr_err_rec(errors, idx,
+                        "atom at atoms[" + int_to_str(ai) + "] must be a mapping")
+                } else {
+                    let ae = yamlr_payload(a)
+                    let lab = _yamlr_str_field(ae, "label")
+                    if len(lab) == 0 {
+                        yamlr_err_rec(errors, idx,
+                            "atom missing 'label' at atoms[" + int_to_str(ai) + "]")
+                    } else {
+                        let k = 0 - 1
+                        if _yamlr_has_key(ae, "kind") == 1 {
+                            k = _yamlr_resolve_kind(_yamlr_map_get(ae, "kind"))
+                        }
+                        if k < 0 {
+                            yamlr_err_rec(errors, idx,
+                                "atom has unknown 'kind' at atoms[" + int_to_str(ai) + "]")
+                        } else {
+                            let bel = 0
+                            let bad = 0
+                            if _yamlr_has_key(ae, "belief") == 1 {
+                                let bp = _yamlr_int_field(ae, "belief")
+                                if bp[0] == 0 {
+                                    yamlr_err_rec(errors, idx,
+                                        "atom 'belief' must be an integer at atoms["
+                                        + int_to_str(ai) + "]")
+                                    bad = 1
+                                } else { bel = bp[1] }
+                            }
+                            if bad == 0 { cur_add_atom(rec, lab, k, bel) }
+                        }
+                    }
+                }
+                ai = ai + 1
+            }
+        }
+    }
+    // Implications.
+    if _yamlr_has_key(entries, "implications") == 1 {
+        let imps = _yamlr_map_get(entries, "implications")
+        if yamlr_tag(imps) == YT_LIST {
+            let il = yamlr_payload(imps)
+            let ii = 0
+            while ii < len(il) {
+                let m = il[ii]
+                if yamlr_tag(m) == YT_MAP {
+                    let me = yamlr_payload(m)
+                    let a1 = _yamlr_str_field(me, "ante")
+                    let a2 = _yamlr_str_field(me, "conseq")
+                    let st = _yamlr_str_field(me, "strength")
+                    if len(a1) == 0 { yamlr_err_rec(errors, idx,
+                        "implication missing 'ante' at implications["
+                        + int_to_str(ii) + "]") }
+                    else { if len(a2) == 0 { yamlr_err_rec(errors, idx,
+                        "implication missing 'conseq' at implications["
+                        + int_to_str(ii) + "]") }
+                    else {
+                        let ok = 0
+                        if str_eq_bytes(st, "FORMAL")    == 1 { ok = 1 }
+                        if str_eq_bytes(st, "EMPIRICAL") == 1 { ok = 1 }
+                        if ok == 0 {
+                            yamlr_err_rec(errors, idx,
+                                "implication 'strength' must be FORMAL or EMPIRICAL at implications["
+                                + int_to_str(ii) + "]")
+                        } else {
+                            cur_add_imp(rec, a1, a2, st)
+                        }
+                    } }
+                }
+                ii = ii + 1
+            }
+        }
+    }
+    // Observations.
+    if _yamlr_has_key(entries, "observations") == 1 {
+        let obs = _yamlr_map_get(entries, "observations")
+        if yamlr_tag(obs) == YT_LIST {
+            let ol = yamlr_payload(obs)
+            let oi = 0
+            while oi < len(ol) {
+                let o = ol[oi]
+                if yamlr_tag(o) == YT_MAP {
+                    let oe = yamlr_payload(o)
+                    let lab = _yamlr_str_field(oe, "label")
+                    if len(lab) == 0 {
+                        yamlr_err_rec(errors, idx,
+                            "observation missing 'label' at observations["
+                            + int_to_str(oi) + "]")
+                    } else {
+                        let os = 0
+                        let ok = 0
+                        if _yamlr_has_key(oe, "sign") == 1 {
+                            let sp = _yamlr_int_field(oe, "sign")
+                            if sp[0] == 1 {
+                                if sp[1] == 1       { os = 1  ok = 1 }
+                                if sp[1] == (0 - 1) { os = 0 - 1 ok = 1 }
+                            }
+                        }
+                        if ok == 0 {
+                            yamlr_err_rec(errors, idx,
+                                "observation 'sign' must be +1 or -1 at observations["
+                                + int_to_str(oi) + "]")
+                        } else {
+                            let ow = 0
+                            let wbad = 0
+                            if _yamlr_has_key(oe, "weight") == 1 {
+                                let wp = _yamlr_int_field(oe, "weight")
+                                if wp[0] == 0 {
+                                    yamlr_err_rec(errors, idx,
+                                        "observation 'weight' must be an integer at observations["
+                                        + int_to_str(oi) + "]")
+                                    wbad = 1
+                                } else { ow = wp[1] }
+                            }
+                            if wbad == 0 { cur_add_obs(rec, lab, os, ow) }
+                        }
+                    }
+                }
+                oi = oi + 1
+            }
+        }
+    }
+    // Citations.
+    if _yamlr_has_key(entries, "citations") == 1 {
+        let cites = _yamlr_map_get(entries, "citations")
+        if yamlr_tag(cites) == YT_LIST {
+            let cl = yamlr_payload(cites)
+            let ci = 0
+            while ci < len(cl) {
+                let c = cl[ci]
+                if yamlr_tag(c) == YT_MAP {
+                    let cee = yamlr_payload(c)
+                    let f  = _yamlr_str_field(cee, "from")
+                    let t  = _yamlr_str_field(cee, "to")
+                    let rl = _yamlr_str_field(cee, "rel")
+                    if len(f) == 0 { yamlr_err_rec(errors, idx,
+                        "citation missing 'from' at citations["
+                        + int_to_str(ci) + "]") }
+                    else { if len(t) == 0 { yamlr_err_rec(errors, idx,
+                        "citation missing 'to' at citations["
+                        + int_to_str(ci) + "]") }
+                    else { if len(rl) == 0 { yamlr_err_rec(errors, idx,
+                        "citation missing 'rel' at citations["
+                        + int_to_str(ci) + "]") }
+                    else { cur_add_cite(rec, f, t, rl) } } }
+                }
+                ci = ci + 1
+            }
+        }
+    }
+    push(records, rec)
+    return 1
+}
+
+// ---- top-level entry -------------------------------------------------
+
+fn yamlr_parse_text(text, kg_hint, source_tag) {
+    let records = list_new()
+    let errors  = list_new()
+    let tk = yamlr_tokenize(text)
+    let tokens = tk[0]
+    let terr   = tk[1]
+    if len(terr) > 0 {
+        yamlr_err_rec(errors, 0, terr)
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    if len(tokens) == 0 {
+        // Empty / comments-only document. No records, no errors.
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    let tree_pair = yamlr_parse_block(tokens, 0, 0)
+    let tree = tree_pair[0]
+    if yamlr_is_err(tree) == 1 {
+        yamlr_err_rec(errors, 0, yamlr_payload(tree))
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    let list_of_records = 0
+    let have_list = 0
+    if yamlr_tag(tree) == YT_LIST {
+        list_of_records = yamlr_payload(tree)
+        have_list = 1
+    } else { if yamlr_tag(tree) == YT_MAP {
+        let entries = yamlr_payload(tree)
+        if _yamlr_has_key(entries, "records") == 0 {
+            yamlr_err_rec(errors, 0,
+                "yaml: top-level map must have a 'records' key")
+            let out = list_new() push(out, records) push(out, errors) return out
+        }
+        let recs_entry = _yamlr_map_get(entries, "records")
+        if yamlr_tag(recs_entry) != YT_LIST {
+            yamlr_err_rec(errors, 0,
+                "yaml: 'records' value must be a list")
+            let out = list_new() push(out, records) push(out, errors) return out
+        }
+        list_of_records = yamlr_payload(recs_entry)
+        have_list = 1
+    } else {
+        yamlr_err_rec(errors, 0,
+            "yaml: top-level must be a list of records or a map with a 'records' key")
+        let out = list_new() push(out, records) push(out, errors) return out
+    } }
+    if have_list == 1 {
+        let ri = 0
+        while ri < len(list_of_records) {
+            _yamlr_apply_record(list_of_records[ri], ri, kg_hint, source_tag,
+                                 records, errors)
+            ri = ri + 1
+        }
+    }
+    let out = list_new() push(out, records) push(out, errors) return out
+}
+
+fn yamlr_parse(path, kg_hint, source_tag) {
+    let text = read_file(path)
+    if text == 0 {
+        let records = list_new()
+        let errors  = list_new()
+        let e = list_new() push(e, 0) push(e, "could not read file: " + path)
+        push(errors, e)
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    return yamlr_parse_text(text, kg_hint, source_tag)
+}
+
+fn yamlr_records(result) { return result[0] }
+fn yamlr_errors(result)  { return result[1] }
