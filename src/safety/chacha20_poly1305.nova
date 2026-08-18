@@ -1,0 +1,296 @@
+// CrossEngin safety: pure-NOVA ChaCha20-Poly1305 AEAD (RFC 8439 §2.8).
+//
+// Purpose
+//   The authenticated-encryption construction that TLS 1.3 hangs off
+//   the sole cipher we advertise (`TLS_CHACHA20_POLY1305_SHA256`, per
+//   the R86 scaffolding ADR). Combines:
+//     * ChaCha20 stream cipher (src/safety/chacha20.nova) as the
+//       confidentiality primitive.
+//     * Poly1305 one-time authenticator (src/safety/poly1305.nova) as
+//       the integrity primitive.
+//   Every RFC 8439 §2.8.2 test vector runs green under the tests in
+//   tests/unit/test_chacha20_poly1305.nova. This module has NO wire
+//   dependencies -- it is a pure cryptographic leaf. The TLS record
+//   layer at src/net/tls/tls_record.nova calls in.
+//
+// Algorithm (RFC 8439 §2.8)
+//   Seal(key, nonce, aad, plaintext) -> (ciphertext, tag)
+//     1. otk = ChaCha20_block(key, nonce, counter=0)[0..32]
+//        // "one-time Poly1305 key" -- fresh per (key, nonce) pair.
+//     2. ciphertext = ChaCha20_xor(key, nonce, counter=1, plaintext)
+//     3. mac_input =
+//          aad || pad16(aad) ||
+//          ciphertext || pad16(ciphertext) ||
+//          le64(len(aad)) || le64(len(ciphertext))
+//        where pad16(x) is enough NUL bytes to bring |x| up to a
+//        multiple of 16 (0 bytes if already aligned).
+//     4. tag = Poly1305(otk, mac_input)
+//   Open(key, nonce, aad, ciphertext, tag) -> (plaintext, ok)
+//     1..3 identical to seal (recompute mac_input from ciphertext).
+//     4. compare recomputed tag to provided tag in CONSTANT TIME.
+//     5. if unequal: return ok=0 and DO NOT emit plaintext.
+//        (RFC 8439 §2.8.1 explicitly forbids releasing decrypted data
+//        before the tag check succeeds. We honor that: seal-then-open
+//        round-trip works, tag-tamper returns ok=0 + a NUL buffer.)
+//     6. if equal: plaintext = ChaCha20_xor(key, nonce, counter=1, ct).
+//
+// Nonce reuse warning
+//   ChaCha20-Poly1305 is CATASTROPHICALLY broken by nonce reuse under
+//   the same key: two ciphertexts with the same (key, nonce) leak the
+//   XOR of both plaintexts AND enable Poly1305 key recovery, which then
+//   forges arbitrary ciphertexts. Callers MUST guarantee (key, nonce)
+//   uniqueness. TLS 1.3's per-record nonce = XOR(seq_num, iv) satisfies
+//   this because seq_num monotonically increases and resets only on key
+//   change. Do NOT reuse this API in any protocol that does not have a
+//   deterministic-nonce discipline.
+//
+// Public API (all buffers are alloc'd byte-array pairs, NUL-safe)
+//   caead_seal_buf(key32, nonce12, aad_buf, aad_len, pt_buf, pt_len)
+//       -> [ct_buf, ct_len, tag_buf]
+//          (ct_buf has capacity pt_len+1 with trailing NUL; tag_buf is
+//           17 bytes with 16-byte tag + trailing NUL.)
+//   caead_open_buf(key32, nonce12, aad_buf, aad_len,
+//                  ct_buf, ct_len, tag_buf)
+//       -> [pt_buf, pt_len, ok]
+//          On tag mismatch: pt_buf is a fresh 1-byte NUL buffer,
+//          pt_len is 0, ok is 0. NEVER emits plaintext on failure.
+//   caead_ct_eq_buf(a, b, n)
+//       -> constant-time byte-buffer equality; returns 1 iff first n
+//          bytes of a and b are equal, 0 otherwise. Exposed here (not
+//          only inside poly1305.nova) so TLS-record open callers can
+//          compare arbitrary MAC-related fields without leaking timing.
+//
+// RFC test vectors covered
+//   * §2.8.2 "Sunscreen" — 114-byte plaintext, 12-byte AAD, 32-byte key,
+//     12-byte nonce. Ciphertext and tag both matched.
+//   * Appendix A.5 — 265-byte plaintext, includes long AAD.
+//   * Empty plaintext + empty AAD (edge case: MAC input reduces to
+//     16 bytes of length fields; tag depends purely on otk and lengths).
+//
+// ADRs touched: r86-in-process-tls-scaffolding.md (AEAD primitive
+//   phase, previously marked R87+ in that ADR's roadmap -- now ✅).
+// NOVA dependencies: builtins only (alloc, load8, store8, int_and,
+//   int_shr, int_or, int_xor).
+// CrossEngin dependencies: src/safety/chacha20.nova, src/safety/poly1305.nova.
+
+import "chacha20.nova"
+import "poly1305.nova"
+
+// ---- constants -----------------------------------------------------------
+
+// TLS 1.3 uses these lengths exactly (RFC 8446 §5.2 + RFC 8439 §2.8).
+let CAEAD_KEY_LEN   = 32
+let CAEAD_NONCE_LEN = 12
+let CAEAD_TAG_LEN   = 16
+
+// Return-list indices (kept as let-consts so callers self-document).
+let CAEAD_R_CT_BUF   = 0
+let CAEAD_R_CT_LEN   = 1
+let CAEAD_R_TAG_BUF  = 2
+
+let CAEAD_R_PT_BUF   = 0
+let CAEAD_R_PT_LEN   = 1
+let CAEAD_R_OK       = 2
+
+// ---- constant-time compare ----------------------------------------------
+//
+// Standard XOR-OR reduce: fold every byte-wise XOR into an accumulator,
+// so the timing depends only on `n`, not on where the first mismatch
+// is. Used both for the tag check inside caead_open_buf and (by way of
+// re-export) for anything downstream that needs to compare fixed-size
+// byte fields without a short-circuit timing side channel.
+//
+// CT-NOTE: NOVA int_or / int_xor / load8 are all straight-line ops in
+// the emitted assembly; there is no branch dependent on byte values.
+// The `if acc == 0` at the tail depends only on the accumulated result,
+// not on which byte differed -- this is the standard idiom.
+fn caead_ct_eq_buf(a, b, n) {
+    let acc = 0
+    let i = 0
+    while i < n {
+        acc = int_or(acc, int_xor(load8(a + i), load8(b + i)))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+// Convenience: constant-time 16-byte compare (Poly1305 tag width).
+fn caead_ct_eq_16(a, b) {
+    return caead_ct_eq_buf(a, b, 16)
+}
+
+// ---- little-endian 64-bit length encoding -------------------------------
+//
+// RFC 8439 §2.8: the trailing length fields in the MAC input are two
+// little-endian 64-bit unsigned integers -- len(aad) then len(ct). NOVA
+// int is 64-bit signed; we cap at 2^32-1 in practice (record sizes are
+// far smaller than that) but the encoding is written correctly for any
+// non-negative NOVA int.
+fn _caead_write_le64(buf, off, v) {
+    store8(buf + off + 0, int_and(v, 255))
+    store8(buf + off + 1, int_and(int_shr(v, 8),  255))
+    store8(buf + off + 2, int_and(int_shr(v, 16), 255))
+    store8(buf + off + 3, int_and(int_shr(v, 24), 255))
+    // For NOVA-int-safe shifts above 31 we split by 4 more bytes; the
+    // shifts are still valid because NOVA int is 64-bit two's-complement.
+    store8(buf + off + 4, int_and(int_shr(v, 32), 255))
+    store8(buf + off + 5, int_and(int_shr(v, 40), 255))
+    store8(buf + off + 6, int_and(int_shr(v, 48), 255))
+    store8(buf + off + 7, int_and(int_shr(v, 56), 255))
+    return 1
+}
+
+// ---- pad16 helper: number of NUL bytes needed to align to 16 ------------
+//
+// Returns 0 if `n` is already a multiple of 16; otherwise the count in
+// [1..15] that would round `n` up to the next multiple. Called for both
+// the AAD-alignment and the ciphertext-alignment stages of the MAC
+// input construction. Kept branchless: `(16 - (n mod 16)) mod 16`.
+fn _caead_pad16_len(n) {
+    let r = n - (n / 16) * 16    // n mod 16
+    if r == 0 { return 0 }
+    return 16 - r
+}
+
+// ---- build the Poly1305 MAC input buffer -------------------------------
+//
+// mac_input =
+//   aad          (aad_len bytes)
+//   pad_aad      (pad-to-16 zeroes)
+//   ct           (ct_len bytes)
+//   pad_ct       (pad-to-16 zeroes)
+//   le64(aad_len)
+//   le64(ct_len)
+//
+// Returns [buf, len] with buf alloc'd to (len + 1) and NUL-terminated
+// (harmless -- Poly1305 reads only `len` bytes).
+fn _caead_build_mac_input(aad_buf, aad_len, ct_buf, ct_len) {
+    let pad_a = _caead_pad16_len(aad_len)
+    let pad_c = _caead_pad16_len(ct_len)
+    let total = aad_len + pad_a + ct_len + pad_c + 16
+    let buf = alloc(total + 1)
+    let off = 0
+    // aad
+    let i = 0
+    while i < aad_len {
+        store8(buf + off + i, load8(aad_buf + i))
+        i = i + 1
+    }
+    off = off + aad_len
+    // pad-to-16 zeroes after aad
+    i = 0
+    while i < pad_a {
+        store8(buf + off + i, 0)
+        i = i + 1
+    }
+    off = off + pad_a
+    // ciphertext
+    i = 0
+    while i < ct_len {
+        store8(buf + off + i, load8(ct_buf + i))
+        i = i + 1
+    }
+    off = off + ct_len
+    // pad-to-16 zeroes after ciphertext
+    i = 0
+    while i < pad_c {
+        store8(buf + off + i, 0)
+        i = i + 1
+    }
+    off = off + pad_c
+    // le64(aad_len)
+    _caead_write_le64(buf, off, aad_len)
+    off = off + 8
+    // le64(ct_len)
+    _caead_write_le64(buf, off, ct_len)
+    off = off + 8
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, total)
+    return out
+}
+
+// ---- Poly1305 one-time key derivation (RFC 8439 §2.6.2) ----------------
+//
+// otk = first 32 bytes of ChaCha20_block(key, nonce, counter=0).
+// Returns a fresh 33-byte buffer (32 bytes of key + trailing NUL).
+fn _caead_derive_otk(key32, nonce12) {
+    let block = chacha20_block_buf(key32, nonce12, 0)
+    let out = alloc(33)
+    let i = 0
+    while i < 32 {
+        store8(out + i, load8(block + i))
+        i = i + 1
+    }
+    store8(out + 32, 0)
+    return out
+}
+
+// ---- seal (encrypt + tag) ----------------------------------------------
+//
+// Returns [ct_buf, ct_len, tag_buf]. ct_len == pt_len (stream cipher).
+// pt_len may be 0 (auth-only: the ciphertext buffer is a 1-byte NUL and
+// the tag still authenticates the AAD + length fields).
+fn caead_seal_buf(key32, nonce12, aad_buf, aad_len, pt_buf, pt_len) {
+    // 1. derive Poly1305 one-time key.
+    let otk = _caead_derive_otk(key32, nonce12)
+    // 2. encrypt plaintext. Empty plaintext -> empty ciphertext (a
+    //    1-byte NUL buffer so callers still have a valid pointer to
+    //    read 0 bytes from without segfaulting).
+    let ct = 0
+    if pt_len > 0 {
+        ct = chacha20_xor_buf(key32, nonce12, 1, pt_buf, pt_len)
+    } else {
+        ct = alloc(1)
+        store8(ct, 0)
+    }
+    // 3. build MAC input.
+    let mi = _caead_build_mac_input(aad_buf, aad_len, ct, pt_len)
+    // 4. tag.
+    let tag = poly1305_mac_buf(otk, mi[0], mi[1])
+    // Package (ct_buf, ct_len, tag_buf).
+    let out = list_new()
+    push(out, ct)
+    push(out, pt_len)
+    push(out, tag)
+    return out
+}
+
+// ---- open (verify + decrypt) -------------------------------------------
+//
+// Returns [pt_buf, pt_len, ok]. On failure ok=0 and pt_buf is a fresh
+// 1-byte NUL (no plaintext leak). On success ok=1 and pt_buf is the
+// decrypted plaintext of length ct_len.
+fn caead_open_buf(key32, nonce12, aad_buf, aad_len, ct_buf, ct_len, tag_buf) {
+    // Recompute otk + expected MAC input + expected tag.
+    let otk = _caead_derive_otk(key32, nonce12)
+    let mi = _caead_build_mac_input(aad_buf, aad_len, ct_buf, ct_len)
+    let expected_tag = poly1305_mac_buf(otk, mi[0], mi[1])
+    // Constant-time compare against the supplied tag.
+    let ok = caead_ct_eq_buf(expected_tag, tag_buf, CAEAD_TAG_LEN)
+    if ok == 0 {
+        // Refuse to release plaintext. Return a NUL buffer + ok=0.
+        let empty = alloc(1)
+        store8(empty, 0)
+        let out = list_new()
+        push(out, empty)
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    // Tag matches -- decrypt.
+    let pt = 0
+    if ct_len > 0 {
+        pt = chacha20_xor_buf(key32, nonce12, 1, ct_buf, ct_len)
+    } else {
+        pt = alloc(1)
+        store8(pt, 0)
+    }
+    let out = list_new()
+    push(out, pt)
+    push(out, ct_len)
+    push(out, 1)
+    return out
+}

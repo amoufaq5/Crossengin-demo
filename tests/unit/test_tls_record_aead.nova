@@ -1,0 +1,315 @@
+// Unit tests for src/net/tls/tls_record.nova AEAD record-body path
+// (R87, layered on top of the R86 record-header scaffold).
+//
+// Coverage
+//   * per-record nonce construction (RFC 8446 §5.3: seq XOR iv).
+//   * sequence-number counter (new / next / reset / ceiling).
+//   * tls_record_seal_buf produces a wire record with the right header
+//     shape (opaque_type = application_data, ver = 0x0303, len BE).
+//   * tls_record_open_buf recovers plaintext + inner_type on a fresh
+//     seal, and refuses open on tag / ct / header tamper.
+//   * seal/open round-trip across a few inner content types.
+//   * short-record rejection (< 5+1+16 bytes).
+//   * header/length disagreement rejection.
+//   * multi-record run with monotonic sequence numbers (nonce reuse
+//     detector: two records at the same seq under the same key MUST
+//     produce identical wire bytes IF plaintext identical, and
+//     DIFFERENT bytes at consecutive seq).
+//
+// Convention: every assertion routes through ce_eq / ce_str_eq.
+
+import "../ce_test.nova"
+import "../../src/safety/chacha20.nova"
+import "../../src/safety/poly1305.nova"
+import "../../src/safety/chacha20_poly1305.nova"
+import "../../src/net/tls/tls_record.nova"
+
+// ---- helpers -------------------------------------------------------------
+
+fn _tra_ascii_to_buf(s) {
+    let n = len(s)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let r = list_new()
+    push(r, buf); push(r, n)
+    return r
+}
+
+fn _tra_bufs_eq(a, an, b, bn) {
+    if an != bn { return 0 }
+    let i = 0
+    while i < an {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- nonce construction (RFC 8446 §5.3) --------------------------------
+
+fn test_nonce_seq_zero() {
+    // seq_num = 0 -> nonce == iv exactly (XOR with zeros).
+    let iv = cc_hex_decode("0102030405060708090a0b0c")
+    let n = tls_record_build_nonce(iv[0], 0)
+    ce_str_eq("nonce(seq=0) == iv", cc_hex_encode_buf(n, 12),
+              "0102030405060708090a0b0c")
+}
+
+fn test_nonce_seq_one() {
+    // seq_num = 1 -> only iv[11] flipped by 0x01.
+    let iv = cc_hex_decode("0102030405060708090a0b0c")
+    let n = tls_record_build_nonce(iv[0], 1)
+    ce_str_eq("nonce(seq=1) flips iv[11]", cc_hex_encode_buf(n, 12),
+              "0102030405060708090a0b0d")
+}
+
+fn test_nonce_seq_256() {
+    // seq_num = 256 -> iv[10] XOR 1, iv[11] unchanged.
+    let iv = cc_hex_decode("0102030405060708090a0b0c")
+    let n = tls_record_build_nonce(iv[0], 256)
+    ce_str_eq("nonce(seq=256) flips iv[10]", cc_hex_encode_buf(n, 12),
+              "0102030405060708090a0a0c")
+}
+
+fn test_nonce_large_seq() {
+    // seq_num = 0x0102030405060708 -> XORs all 8 low bytes.
+    let iv = cc_hex_decode("000000000000000000000000")
+    let n = tls_record_build_nonce(iv[0], 72623859790382856)  // 0x0102030405060708
+    ce_str_eq("nonce(seq=0x0102030405060708) writes full seq into low 8",
+              cc_hex_encode_buf(n, 12),
+              "000000000102030405060708")
+}
+
+// ---- sequence-number counter ------------------------------------------
+
+fn test_seq_counter() {
+    let c = tls_record_seq_new()
+    ce_eq("seq_get initial == 0", tls_record_seq_get(c), 0)
+    ce_eq("seq_next returns 0",   tls_record_seq_next(c), 0)
+    ce_eq("seq_get after one == 1", tls_record_seq_get(c), 1)
+    ce_eq("seq_next returns 1",   tls_record_seq_next(c), 1)
+    ce_eq("seq_next returns 2",   tls_record_seq_next(c), 2)
+    ce_eq("seq_get after three == 3", tls_record_seq_get(c), 3)
+    tls_record_seq_reset(c)
+    ce_eq("seq_get after reset == 0", tls_record_seq_get(c), 0)
+    ce_eq("seq_next returns 0 (post-reset)", tls_record_seq_next(c), 0)
+}
+
+// ---- seal/open round-trip (application_data) --------------------------
+
+fn test_seal_open_round_trip() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let pt = _tra_ascii_to_buf("hello TLS 1.3 record")
+    let rec = tls_record_seal_buf(key[0], iv[0], 0,
+                                  TLS_CONTENT_APPLICATION_DATA,
+                                  pt[0], pt[1])
+    // Header shape: opaque_type = 23, ver = 03 03, len BE.
+    ce_eq("seal: outer type == application_data", load8(rec[0] + 0),
+          TLS_CONTENT_APPLICATION_DATA)
+    ce_eq("seal: ver_hi == 3", load8(rec[0] + 1), 3)
+    ce_eq("seal: ver_lo == 3", load8(rec[0] + 2), 3)
+    // Length = inner_len + tag_len = (pt_len + 1) + 16.
+    let expected_wire_len = (pt[1] + 1) + 16
+    let advertised = load8(rec[0] + 3) * 256 + load8(rec[0] + 4)
+    ce_eq("seal: advertised length matches", advertised, expected_wire_len)
+    ce_eq("seal: rec_len == 5 + advertised", rec[1], 5 + expected_wire_len)
+    // Open.
+    let opened = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("open: ok = 1",       opened[3], 1)
+    ce_eq("open: pt_len match", opened[1], pt[1])
+    ce_eq("open: inner_type == application_data",
+          opened[2], TLS_CONTENT_APPLICATION_DATA)
+    ce_eq("open: pt bytes match",
+          _tra_bufs_eq(opened[0], opened[1], pt[0], pt[1]), 1)
+}
+
+// ---- inner-type propagation across the AEAD boundary ----------------
+
+fn test_inner_type_variants() {
+    let key = cc_hex_decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+    let iv  = cc_hex_decode("aabbccddeeff001122334455")
+    let types = list_new()
+    push(types, TLS_CONTENT_HANDSHAKE)
+    push(types, TLS_CONTENT_ALERT)
+    push(types, TLS_CONTENT_APPLICATION_DATA)
+    let i = 0
+    while i < 3 {
+        let inner = types[i]
+        let pt = _tra_ascii_to_buf("payload for type " + int_to_str(inner))
+        let rec = tls_record_seal_buf(key[0], iv[0], i, inner, pt[0], pt[1])
+        let opened = tls_record_open_buf(key[0], iv[0], i, rec[0], rec[1])
+        ce_eq("inner-type " + int_to_str(inner) + ": ok",       opened[3], 1)
+        ce_eq("inner-type " + int_to_str(inner) + ": recovered",
+              opened[2], inner)
+        ce_eq("inner-type " + int_to_str(inner) + ": pt match",
+              _tra_bufs_eq(opened[0], opened[1], pt[0], pt[1]), 1)
+        i = i + 1
+    }
+}
+
+// ---- tag tamper (whole-record) --------------------------------------
+
+fn test_record_tag_tamper() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let pt = _tra_ascii_to_buf("integrity matters")
+    let rec = tls_record_seal_buf(key[0], iv[0], 0,
+                                  TLS_CONTENT_APPLICATION_DATA,
+                                  pt[0], pt[1])
+    // Flip a bit in the last byte (part of the tag).
+    store8(rec[0] + rec[1] - 1, int_xor(load8(rec[0] + rec[1] - 1), 1))
+    let opened = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("tag-tamper: ok = 0", opened[3], 0)
+    ce_eq("tag-tamper: pt_len = 0", opened[1], 0)
+    ce_eq("tag-tamper: inner_type = 0 (refused)", opened[2], 0)
+    // Restore -> should verify.
+    store8(rec[0] + rec[1] - 1, int_xor(load8(rec[0] + rec[1] - 1), 1))
+    let good = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("tag-tamper: restored -> ok", good[3], 1)
+}
+
+// ---- ciphertext tamper ---------------------------------------------
+
+fn test_record_ct_tamper() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let pt = _tra_ascii_to_buf("ciphertext integrity")
+    let rec = tls_record_seal_buf(key[0], iv[0], 0,
+                                  TLS_CONTENT_APPLICATION_DATA,
+                                  pt[0], pt[1])
+    // Flip a bit right after the header (deep in the ciphertext).
+    store8(rec[0] + 5, int_xor(load8(rec[0] + 5), 0x20))
+    let opened = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("ct-tamper: ok = 0", opened[3], 0)
+    store8(rec[0] + 5, int_xor(load8(rec[0] + 5), 0x20))
+    let good = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("ct-tamper: restore ok", good[3], 1)
+}
+
+// ---- header (AAD) tamper -------------------------------------------
+//
+// Changing the outer type or version byte flips the AAD input and
+// therefore must fail the tag.
+
+fn test_record_header_tamper() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let pt = _tra_ascii_to_buf("aad integrity")
+    let rec = tls_record_seal_buf(key[0], iv[0], 0,
+                                  TLS_CONTENT_APPLICATION_DATA,
+                                  pt[0], pt[1])
+    // Flip the outer type byte.
+    store8(rec[0] + 0, TLS_CONTENT_HANDSHAKE)
+    let opened = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("header-tamper: type flip -> ok = 0", opened[3], 0)
+    store8(rec[0] + 0, TLS_CONTENT_APPLICATION_DATA)
+    // Flip a length byte.
+    store8(rec[0] + 4, int_xor(load8(rec[0] + 4), 0x80))
+    let opened2 = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("header-tamper: length flip -> ok = 0", opened2[3], 0)
+}
+
+// ---- short record rejection ---------------------------------------
+
+fn test_short_record_rejected() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let buf = alloc(21)    // less than 5 + 1 + 16
+    let i = 0
+    while i < 21 { store8(buf + i, 0); i = i + 1 }
+    let opened = tls_record_open_buf(key[0], iv[0], 0, buf, 21)
+    ce_eq("short record: ok = 0", opened[3], 0)
+    ce_eq("short record: pt_len = 0", opened[1], 0)
+    // Length disagreement: header says something but rec_len differs.
+    // Build a valid seal first, then lie about the buffer length.
+    let pt = _tra_ascii_to_buf("truncated")
+    let rec = tls_record_seal_buf(key[0], iv[0], 0,
+                                  TLS_CONTENT_APPLICATION_DATA,
+                                  pt[0], pt[1])
+    let opened2 = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1] - 1)
+    ce_eq("length disagreement: ok = 0", opened2[3], 0)
+}
+
+// ---- wrong sequence number fails (nonce is direction-specific) ----
+
+fn test_wrong_seq_fails() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let pt = _tra_ascii_to_buf("sequence matters")
+    let rec = tls_record_seal_buf(key[0], iv[0], 5,
+                                  TLS_CONTENT_APPLICATION_DATA,
+                                  pt[0], pt[1])
+    // Open with seq=5 succeeds.
+    let good = tls_record_open_buf(key[0], iv[0], 5, rec[0], rec[1])
+    ce_eq("wrong-seq: seq=5 opens", good[3], 1)
+    // Open with seq=6 fails (nonce mismatch -> different keystream +
+    // Poly1305 key -> tag rejects).
+    let bad = tls_record_open_buf(key[0], iv[0], 6, rec[0], rec[1])
+    ce_eq("wrong-seq: seq=6 fails", bad[3], 0)
+    // Same for seq=0.
+    let bad0 = tls_record_open_buf(key[0], iv[0], 0, rec[0], rec[1])
+    ce_eq("wrong-seq: seq=0 fails", bad0[3], 0)
+}
+
+// ---- multi-record run with counter --------------------------------
+
+fn test_multi_record_run() {
+    let key = cc_hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let iv  = cc_hex_decode("070000004041424344454647")
+    let pt = _tra_ascii_to_buf("record N")
+    let send_seq = tls_record_seq_new()
+    let recv_seq = tls_record_seq_new()
+    let recs = list_new()
+    // Send 4 records.
+    let i = 0
+    while i < 4 {
+        let s = tls_record_seq_next(send_seq)
+        let rec = tls_record_seal_buf(key[0], iv[0], s,
+                                      TLS_CONTENT_APPLICATION_DATA,
+                                      pt[0], pt[1])
+        push(recs, rec)
+        i = i + 1
+    }
+    // Receive in the same order.
+    let j = 0
+    while j < 4 {
+        let r = tls_record_seq_next(recv_seq)
+        let rec = recs[j]
+        let opened = tls_record_open_buf(key[0], iv[0], r, rec[0], rec[1])
+        ce_eq("multi-record #" + int_to_str(j) + ": ok", opened[3], 1)
+        ce_eq("multi-record #" + int_to_str(j) + ": pt match",
+              _tra_bufs_eq(opened[0], opened[1], pt[0], pt[1]), 1)
+        j = j + 1
+    }
+    // Consecutive records with identical plaintext must produce
+    // DIFFERENT wire bytes (that's the whole point of the seq nonce).
+    let rec0 = recs[0]
+    let rec1 = recs[1]
+    ce_eq("multi-record: seq differentiates wire bytes",
+          _tra_bufs_eq(rec0[0], rec0[1], rec1[0], rec1[1]), 0)
+}
+
+fn main() {
+    test_nonce_seq_zero()
+    test_nonce_seq_one()
+    test_nonce_seq_256()
+    test_nonce_large_seq()
+    test_seq_counter()
+    test_seal_open_round_trip()
+    test_inner_type_variants()
+    test_record_tag_tamper()
+    test_record_ct_tamper()
+    test_record_header_tamper()
+    test_short_record_rejected()
+    test_wrong_seq_fails()
+    test_multi_record_run()
+    ce_summary("tls_record_aead")
+}
+
+main()

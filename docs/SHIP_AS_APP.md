@@ -2125,36 +2125,114 @@ side implements every field-arithmetic and DER primitive as a source
 file, so no runtime change is required for the non-random / non-poll
 parts of the roadmap.
 
-## 12. What comes next (R87+)
+### 7.37 ChaCha20-Poly1305 AEAD (R87)
+
+**Honest status: wire is still cleartext.** R87 lands the first real
+crypto brick under R86's TLS scaffold — a pure-NOVA
+ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) — and wires it into the TLS
+1.3 record-layer body per RFC 8446 §5.2 + §5.3. The wire hook
+(`wire_connection_wrap`) is still a pass-through: the handshake state
+machine has to land (R92) and be flipped on (R93) before a live
+connection encrypts anything. Operators who need TLS today keep
+using the R54.1 sidecar recipe.
+
+What shipped in R87:
+
+- `src/safety/poly1305.nova` — the Poly1305 one-time authenticator
+  (RFC 8439 §2.5), already in tree from earlier work; R87 extended
+  the test coverage to 56 checks including all RFC §2.5.2 + Appendix
+  A.3 test vectors plus clamp bit-boundary verification, exact and
+  partial block boundaries, and constant-time compare unit tests.
+- `src/safety/chacha20_poly1305.nova` — **NEW.** The AEAD
+  construction that combines the existing ChaCha20 stream cipher
+  (`src/safety/chacha20.nova`) with Poly1305:
+  - `caead_seal_buf(key32, nonce12, aad, aad_len, pt, pt_len)`
+    → `[ct_buf, ct_len, tag_buf]`. Derives the one-time Poly1305
+    key from ChaCha20 counter=0 per RFC 8439 §2.6.2, encrypts the
+    plaintext at counter=1, tags `pad16(aad) || pad16(ct) ||
+    le64(|aad|) || le64(|ct|)`.
+  - `caead_open_buf(key32, nonce12, aad, aad_len, ct, ct_len, tag)`
+    → `[pt_buf, pt_len, ok]`. Recomputes the tag, compares in
+    constant time; on mismatch returns `ok = 0` and a NUL buffer
+    (never releases plaintext).
+  - `caead_ct_eq_buf(a, b, n)` — constant-time byte-buffer equality.
+    Exposed for reuse.
+- `src/net/tls/tls_record.nova` — **extended.** The R86 header
+  parse/serialize path stays; R87 adds:
+  - `tls_record_seal_buf(key32, iv12, seq_num, inner_type, pt, pt_len)`
+    → `[rec_buf, rec_len]`. Builds a TLS 1.3 TLSCiphertext record:
+    5-byte header || ciphertext || 16-byte tag. Inner content type
+    rides as the trailing byte of the plaintext (RFC 8446 §5.2
+    TLSInnerPlaintext.type). The record header IS the AAD.
+  - `tls_record_open_buf(key32, iv12, seq_num, rec_buf, rec_len)`
+    → `[pt_buf, pt_len, inner_type, ok]`. Parses the header,
+    reconstructs the per-record nonce, verifies the tag in constant
+    time, strips the inner-type byte. On any failure (short buffer,
+    header disagreement, tag reject) returns a NUL plaintext + ok=0.
+  - `tls_record_build_nonce(iv12, seq_num)` — per-record nonce =
+    seq_num (right-aligned big-endian in 12 bytes) XOR iv (RFC 8446
+    §5.3).
+  - `tls_record_seq_new / _get / _next / _reset` — per-direction
+    64-bit sequence-number counter. Resets on key change, refuses to
+    advance if it ever goes negative (nonce-reuse guard).
+
+Test vectors verified:
+
+| Test vector | Where | Status |
+|---|---|---|
+| Poly1305 §2.5 clamp bit-mask | test_poly1305 | ✅ |
+| Poly1305 §2.5.2 canonical MAC | test_poly1305 | ✅ |
+| Poly1305 Appendix A.3 #1 (zero key + zero msg → zero tag) | test_poly1305 | ✅ |
+| ChaCha20-Poly1305 §2.8.2 "Sunscreen" (seal + open) | test_chacha20_poly1305 | ✅ |
+| ChaCha20-Poly1305 Appendix A.5 (265-byte plaintext + long AAD) | test_chacha20_poly1305 | ✅ |
+
+Test totals (R87 delta): poly1305 grew from 9 → 56 checks;
+chacha20_poly1305 landed at 55 checks; tls_record_aead landed at 53
+checks. Regression sweep across R86 tests (`test_chacha20`,
+`test_tls_alerts`, `test_tls_state`, `test_tls_scaffold`) +
+`test_capability_wire` + `test_nl_rpc_verbs` all green.
+
+**Nonce-reuse hazard.** ChaCha20-Poly1305 is catastrophically broken
+by nonce reuse under the same key: two records with the same
+(key, nonce) leak the XOR of both plaintexts AND enable Poly1305
+key recovery. The TLS 1.3 per-record nonce discipline (seq XOR iv,
+seq monotonically increasing, resets only on key change) guarantees
+uniqueness. Do not reuse the `caead_*` primitives in any protocol
+without a comparable discipline; the module docstring says the same.
+
+## 12. What comes next (R88+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
 candidates queue alongside so no round idles waiting on a runtime
 blocker.
 
-**TLS build-out (drives R87..R9X — see §7.36):**
+**TLS build-out (drives R88..R9X — see §7.36 and §7.37):**
 
-- **R87** — Random-source seam (`src/net/tls/prims/rand.nova`) and
-  wire-integer serializers (uint16 / uint24 / vector-of-N).
-- **R88** — ChaCha20 block function + Poly1305 MAC, RFC 7539 vectors.
+- **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
+  RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
+  seal/open runs today; handshake still stubbed.
+- **R88** — HKDF-SHA-256 + TLS 1.3 key schedule (RFC 5869 + RFC 8446
+  §7.1). Layers on top of the SHA-256 already in tree.
 - **R89** — x25519 field arithmetic + Montgomery ladder, RFC 7748
   vectors.
-- **R90** — HKDF-SHA-256 + TLS 1.3 key schedule.
-- **R91** — X.509 DER subset parser (leaf-only).
-- **R92** — ed25519 verify.
-- **R93** — Handshake state-machine wire-up (fills in the R86
+- **R90** — X.509 DER subset parser (leaf-only).
+- **R91** — ed25519 verify.
+- **R92** — Handshake state-machine wire-up (fills in the R86
   `tls_handshake.nova` stubs).
-- **R94** — AEAD record wrap/unwrap + `wire_connection_wrap` starts
-  returning a real wrapped_conn. **First deployable in-process TLS
-  round.**
-- **R95..R9X** — Trust-anchor chain validation, session tickets,
+- **R93** — Wire-hook flip: `wire_connection_wrap` starts returning a
+  real wrapped_conn under a `tls_config`. **First deployable
+  in-process TLS round.**
+- **R94..R9X** — Trust-anchor chain validation, session tickets,
   live-alert delivery, hardening / fuzz audits.
 
 **Other candidates (any round can pull one instead of a TLS phase
 that's blocked on a runtime primitive):**
 
+- Admin bulk-ops (multi-token grants / revokes in one wire call).
 - Per-session pre/post hooks so a daemon operator can attach an
   audit-log writer without editing `rpc_server.nova`.
-- Admin bulk-ops (multi-token grants / revokes in one wire call).
+- Ownership audit log — a per-holder append-only log of
+  `ownership.transfer` and `admin.set_holder` events.
 - Per-source rate budgets controllable via admin wire verb (aggregate
   ceilings across many tokens from one origin).
 - Per-holder aggregate rate limits (an owner's tokens share a

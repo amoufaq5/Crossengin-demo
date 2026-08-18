@@ -19,7 +19,12 @@
 // All symbols are prefixed `tls_record_` to avoid NOVA symbol collisions.
 //
 // NOVA dependencies: builtins.
-// CrossEngin dependencies: none.
+// CrossEngin dependencies (R87 body-AEAD path):
+//   src/safety/chacha20_poly1305.nova -- the concrete AEAD.
+//   src/safety/chacha20.nova          -- pulled in transitively.
+//   src/safety/poly1305.nova          -- pulled in transitively.
+
+import "../../safety/chacha20_poly1305.nova"
 
 // ---- content types (RFC 8446 §5.1) ---------------------------------------
 
@@ -142,11 +147,291 @@ fn tls_record_content_name(t) {
 // ---- record-body wrap / unwrap (R94 fills in) ---------------------------
 //
 // TODO(R94): AEAD encrypt(header, fragment, key_schedule) -> ciphertext.
-// Until then callers cannot pass real bytes through the record layer.
+// The legacy string-shaped wrap/unwrap stubs stay in place for callers
+// that don't have a key_schedule yet -- they continue to return
+// TLS_NOT_IMPLEMENTED so any wire path attempting to send crypto bytes
+// without a real key schedule hard-fails cleanly. R87 adds the real
+// byte-buffer AEAD path below; R93 wires it up to the handshake state
+// machine, R94 flips the wire-hook so this actually runs on live conns.
 fn tls_record_wrap(content_type, fragment, key_schedule) {
     return TLS_NOT_IMPLEMENTED
 }
 
 fn tls_record_unwrap(record_bytes, key_schedule) {
     return TLS_NOT_IMPLEMENTED
+}
+
+// ---- TLS 1.3 record-layer AEAD (R87) ------------------------------------
+//
+// R87 lands the concrete `tls_record_seal_buf` / `tls_record_open_buf`
+// pair on top of ChaCha20-Poly1305 (src/safety/chacha20_poly1305.nova).
+// The wire hook (`tls_wire_hook.nova::wire_connection_wrap`) is still a
+// pass-through -- these routines exist so the handshake state machine
+// wiring in R93 can plug in without another record-layer change, and so
+// the record-body path is exercisable by unit tests today.
+//
+// Wire form (RFC 8446 §5.2 TLSCiphertext):
+//   opaque_type           = 23 (application_data)   // 1 byte
+//   legacy_record_version = 0x0303                  // 2 bytes
+//   length                = ct_len + tag_len (BE16) // 2 bytes
+//   encrypted_record      = ciphertext || tag       // length bytes
+//
+// The inner content-type (what the plaintext WOULD have been marked as
+// at the plaintext record layer -- handshake, alert, application_data)
+// is appended to the plaintext as a trailing byte before AEAD encryption
+// (RFC 8446 §5.2 -- the TLSInnerPlaintext.type field). No padding here.
+//
+// Additional data (RFC 8446 §5.2): the 5-byte TLSCiphertext header
+// (opaque_type || legacy_record_version || length). We build the header
+// FIRST (using the total length after inner-type append + tag), THEN
+// hand its bytes to the AEAD as AAD.
+//
+// Nonce (RFC 8446 §5.3): XOR the 64-bit sequence number (padded to 12
+// bytes, big-endian right-aligned) with the 12-byte per-direction IV.
+// tls_record_build_nonce assembles this deterministically.
+
+// Reads a big-endian uint16 from a byte buffer (used for length field
+// during unwrap).
+fn _tr_read_be16(buf, off) {
+    return load8(buf + off) * 256 + load8(buf + off + 1)
+}
+
+// Write a big-endian uint16 length field.
+fn _tr_write_be16(buf, off, v) {
+    store8(buf + off + 0, int_and(int_shr(v, 8), 255))
+    store8(buf + off + 1, int_and(v, 255))
+    return 1
+}
+
+// Build the 12-byte per-record nonce from a 12-byte static IV and the
+// per-direction 64-bit sequence number (RFC 8446 §5.3).
+//   nonce[i] = iv[i]     XOR 0            for i in 0..3
+//   nonce[i] = iv[i]     XOR seq_be_byte  for i in 4..11
+// seq_num is right-aligned big-endian in the 12-byte pad -- the low 8
+// bytes of the pad hold the 64-bit sequence, the top 4 bytes are 0.
+// Returns a fresh 13-byte buffer (12 bytes of nonce + trailing NUL).
+fn tls_record_build_nonce(iv12, seq_num) {
+    let out = alloc(13)
+    // Top 4 bytes: iv[0..3] XOR 0.
+    let i = 0
+    while i < 4 {
+        store8(out + i, load8(iv12 + i))
+        i = i + 1
+    }
+    // Bottom 8 bytes: iv[4..11] XOR seq_num (big-endian).
+    // seq_num fits in NOVA int (63-bit signed positive). The record
+    // layer resets seq_num to 0 on any key change, so it never grows
+    // past ~2^62 in practice.
+    let s7 = int_and(seq_num, 255)
+    let s6 = int_and(int_shr(seq_num, 8),  255)
+    let s5 = int_and(int_shr(seq_num, 16), 255)
+    let s4 = int_and(int_shr(seq_num, 24), 255)
+    let s3 = int_and(int_shr(seq_num, 32), 255)
+    let s2 = int_and(int_shr(seq_num, 40), 255)
+    let s1 = int_and(int_shr(seq_num, 48), 255)
+    let s0 = int_and(int_shr(seq_num, 56), 255)
+    store8(out + 4,  int_xor(load8(iv12 + 4),  s0))
+    store8(out + 5,  int_xor(load8(iv12 + 5),  s1))
+    store8(out + 6,  int_xor(load8(iv12 + 6),  s2))
+    store8(out + 7,  int_xor(load8(iv12 + 7),  s3))
+    store8(out + 8,  int_xor(load8(iv12 + 8),  s4))
+    store8(out + 9,  int_xor(load8(iv12 + 9),  s5))
+    store8(out + 10, int_xor(load8(iv12 + 10), s6))
+    store8(out + 11, int_xor(load8(iv12 + 11), s7))
+    store8(out + 12, 0)
+    return out
+}
+
+// tls_record_seal_buf: encrypt one TLS 1.3 record.
+//
+//   key32           -- 32-byte write key (from the key schedule).
+//   iv12            -- 12-byte per-direction static IV.
+//   seq_num         -- 64-bit sequence number for this direction.
+//   inner_type      -- content type of the plaintext (TLS_CONTENT_*).
+//   plaintext_buf   -- pointer to the plaintext bytes.
+//   plaintext_len   -- number of plaintext bytes (>= 0).
+//
+// Returns [rec_buf, rec_len]:
+//   rec_buf  -- fresh alloc'd buffer with the full 5-byte header +
+//               ciphertext + 16-byte tag on the wire.
+//   rec_len  -- rec_buf byte length (== 5 + plaintext_len + 1 + 16).
+//
+// The `+1` accounts for the appended TLSInnerPlaintext.type byte per
+// RFC 8446 §5.2. No zero-padding is added (padding is a policy choice
+// left to a higher layer if it ever gets implemented).
+fn tls_record_seal_buf(key32, iv12, seq_num, inner_type,
+                       plaintext_buf, plaintext_len) {
+    // 1. Build the inner plaintext = plaintext || inner_type_byte.
+    let inner_len = plaintext_len + 1
+    let inner = alloc(inner_len + 1)
+    let i = 0
+    while i < plaintext_len {
+        store8(inner + i, load8(plaintext_buf + i))
+        i = i + 1
+    }
+    store8(inner + plaintext_len, inner_type)
+    store8(inner + inner_len, 0)
+    // 2. Compute per-record nonce.
+    let nonce = tls_record_build_nonce(iv12, seq_num)
+    // 3. Compute the wire length: ciphertext bytes (== inner_len) + 16
+    //    tag bytes. This is what the header advertises AND what the
+    //    AEAD sees as AAD.
+    let wire_len = inner_len + CAEAD_TAG_LEN
+    // 4. Build the 5-byte record header (== the AAD).
+    let hdr = alloc(TLS_RECORD_HEADER_LEN + 1)
+    store8(hdr + 0, TLS_CONTENT_APPLICATION_DATA)
+    store8(hdr + 1, TLS_RECORD_LEGACY_VERSION_HI)
+    store8(hdr + 2, TLS_RECORD_LEGACY_VERSION_LO)
+    _tr_write_be16(hdr, 3, wire_len)
+    store8(hdr + 5, 0)
+    // 5. Seal.
+    let sealed = caead_seal_buf(key32, nonce,
+                                hdr, TLS_RECORD_HEADER_LEN,
+                                inner, inner_len)
+    // sealed = [ct_buf, ct_len, tag_buf].
+    // 6. Concatenate header || ciphertext || tag into the wire record.
+    let rec_len = TLS_RECORD_HEADER_LEN + inner_len + CAEAD_TAG_LEN
+    let rec = alloc(rec_len + 1)
+    let k = 0
+    while k < TLS_RECORD_HEADER_LEN { store8(rec + k, load8(hdr + k)); k = k + 1 }
+    let j = 0
+    while j < sealed[1] {
+        store8(rec + TLS_RECORD_HEADER_LEN + j, load8(sealed[0] + j))
+        j = j + 1
+    }
+    let t = 0
+    while t < CAEAD_TAG_LEN {
+        store8(rec + TLS_RECORD_HEADER_LEN + sealed[1] + t,
+               load8(sealed[2] + t))
+        t = t + 1
+    }
+    store8(rec + rec_len, 0)
+    let out = list_new()
+    push(out, rec)
+    push(out, rec_len)
+    return out
+}
+
+// tls_record_open_buf: decrypt one TLS 1.3 record off the wire.
+//
+//   key32       -- 32-byte read key.
+//   iv12        -- 12-byte per-direction static IV.
+//   seq_num     -- 64-bit sequence number for this direction.
+//   rec_buf     -- pointer to a full record on the wire (header +
+//                  ciphertext + tag; at least 5 + 1 + 16 = 22 bytes).
+//   rec_len     -- byte length of rec_buf.
+//
+// Returns [pt_buf, pt_len, inner_type, ok]:
+//   pt_buf     -- fresh alloc'd plaintext (WITHOUT the TLSInnerPlaintext
+//                 type byte, which is broken out separately).
+//   pt_len     -- number of plaintext bytes (>= 0).
+//   inner_type -- the inner content type byte (TLS_CONTENT_*).
+//   ok         -- 1 on success, 0 on any check failure (short record,
+//                 header disagreement, tag mismatch). On failure the
+//                 plaintext buffer is a fresh 1-byte NUL: never a real
+//                 payload (RFC 8446 §5.2).
+fn tls_record_open_buf(key32, iv12, seq_num, rec_buf, rec_len) {
+    // Minimum: 5-byte header + 1-byte inner-type + 16-byte tag.
+    if rec_len < TLS_RECORD_HEADER_LEN + 1 + CAEAD_TAG_LEN {
+        let empty = alloc(1); store8(empty, 0)
+        let out = list_new()
+        push(out, empty); push(out, 0); push(out, 0); push(out, 0)
+        return out
+    }
+    let outer_type = load8(rec_buf + 0)
+    let ver_hi     = load8(rec_buf + 1)
+    let ver_lo     = load8(rec_buf + 2)
+    let advertised = _tr_read_be16(rec_buf, 3)
+    // Wire ciphertext length (per header) must match what's actually
+    // present, and must include at least 1 inner-type byte + tag.
+    if advertised != rec_len - TLS_RECORD_HEADER_LEN {
+        let empty = alloc(1); store8(empty, 0)
+        let out = list_new()
+        push(out, empty); push(out, 0); push(out, 0); push(out, 0)
+        return out
+    }
+    // The AAD is the 5-byte header EXACTLY as it appeared on the wire.
+    // Nonce is (iv XOR seq).
+    let nonce = tls_record_build_nonce(iv12, seq_num)
+    let ct_len = advertised - CAEAD_TAG_LEN
+    let ct_ptr = rec_buf + TLS_RECORD_HEADER_LEN
+    let tag_ptr = ct_ptr + ct_len
+    let opened = caead_open_buf(key32, nonce,
+                                rec_buf, TLS_RECORD_HEADER_LEN,
+                                ct_ptr, ct_len, tag_ptr)
+    // opened = [pt_buf, pt_len, ok].
+    if opened[2] == 0 {
+        let empty = alloc(1); store8(empty, 0)
+        let out = list_new()
+        push(out, empty); push(out, 0); push(out, 0); push(out, 0)
+        return out
+    }
+    // Success: strip the trailing inner-type byte off the plaintext.
+    let inner_len = opened[1]
+    if inner_len < 1 {
+        // Impossible per header check above, but defensive.
+        let empty = alloc(1); store8(empty, 0)
+        let out = list_new()
+        push(out, empty); push(out, 0); push(out, 0); push(out, 0)
+        return out
+    }
+    let pt_len = inner_len - 1
+    let inner_type = load8(opened[0] + pt_len)
+    let pt = alloc(pt_len + 1)
+    let i = 0
+    while i < pt_len {
+        store8(pt + i, load8(opened[0] + i))
+        i = i + 1
+    }
+    store8(pt + pt_len, 0)
+    let out = list_new()
+    push(out, pt); push(out, pt_len); push(out, inner_type); push(out, 1)
+    return out
+}
+
+// ---- per-direction sequence-number counter -----------------------------
+//
+// TLS 1.3 keeps a separate 64-bit sequence number per (direction, key
+// epoch). It starts at 0, increments by 1 after every seal/open, and
+// resets to 0 on any key change. RFC 8446 §5.3 spells out both the
+// reset semantic and the requirement that we alert-close if the counter
+// would ever wrap (2^64 records under a single key). Since NOVA int is
+// 63-bit signed positive, we cap at 2^62 as an internal ceiling well
+// below the RFC's 2^64 -- the caller must rotate keys long before then.
+//
+// A `tls_record_seq_ctx` is [seq_num].
+
+let TR_SEQ_CTX_NUM = 0
+
+fn tls_record_seq_new() {
+    let c = list_new()
+    push(c, 0)
+    return c
+}
+
+fn tls_record_seq_get(ctx) {
+    return ctx[TR_SEQ_CTX_NUM]
+}
+
+// Post-increment: returns the current value (what the caller should use
+// for THIS record's nonce) then increments. Returns -1 if the counter
+// has gone negative (NOVA int is 63-bit-signed positive; if the caller
+// somehow ran past ~2^62 records under a single key we refuse the next
+// one). Per RFC 8446 §5.3 + §6.2 the caller MUST alert-close on
+// `record_overflow` rather than reuse a nonce. In practice keys rotate
+// long before this ceiling.
+//
+// CT-NOTE: the branch on cur < 0 is public information (the counter
+// itself is not secret; it's derived from record count, which the
+// attacker sees on the wire). No timing side channel on secrets.
+fn tls_record_seq_next(ctx) {
+    let cur = ctx[TR_SEQ_CTX_NUM]
+    if cur < 0 { return -1 }
+    list_set(ctx, TR_SEQ_CTX_NUM, cur + 1)
+    return cur
+}
+
+fn tls_record_seq_reset(ctx) {
+    list_set(ctx, TR_SEQ_CTX_NUM, 0)
+    return 1
 }

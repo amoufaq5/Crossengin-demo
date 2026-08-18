@@ -128,19 +128,28 @@ Each phase is one round. Phases are independent enough that they can
 be reordered if a runtime blocker slips, but the ordering below is
 what unlocks the most testable surface earliest.
 
-- **R87 — random source seam + serialize primitives.** Ship
-  `src/net/tls/prims/rand.nova` that wraps whatever RNG the runtime
-  offers by then, or fails cleanly. Ship the wire-integer serializers
-  (uint16 / uint24 / vector-of-N) all handshake messages need. Cover
-  by unit tests; the RNG seam is stubbed in tests with a fixed vector.
-- **R88 — ChaCha20 block function + Poly1305 MAC.** Pure integer.
-  Test vectors from RFC 7539. Standalone; no wire integration yet.
+- **R87 — ✅ Poly1305 + ChaCha20-Poly1305 AEAD.** The AEAD primitive
+  phase (previously slated for R88 in the original roadmap; pulled
+  into R87 once ChaCha20 and Poly1305 were both already present in
+  `src/safety/`). Ships `src/safety/chacha20_poly1305.nova`
+  (`caead_seal_buf` / `caead_open_buf` / `caead_ct_eq_buf` per
+  RFC 8439 §2.8), extends `src/net/tls/tls_record.nova` with a
+  concrete record-body seal/open path (`tls_record_seal_buf` /
+  `tls_record_open_buf` per RFC 8446 §5.2 + §5.3), and adds the
+  per-direction sequence-number counter (`tls_record_seq_*`). All
+  RFC 8439 §2.8.2 + Appendix A.5 vectors green. **Wire hook still a
+  pass-through** — the AEAD is exercisable via unit tests only,
+  a live connection has to wait on handshake wire-up (R92) and the
+  wire-hook flip (R93). The random-source seam and wire-integer
+  serializers originally slated for R87 move to whichever later
+  round needs them first (they're not on the AEAD path).
+- **R88 — HKDF-SHA-256 + TLS 1.3 key schedule.** Pull-in from the
+  original R90 slot; every downstream handshake step needs the
+  derived secrets before any of them can run. Layers on top of
+  `src/safety/sha256.nova`. Standalone, vector-tested.
 - **R89 — x25519 field arithmetic + Montgomery ladder.** Pure integer.
   Test vectors from RFC 7748. Standalone.
-- **R90 — HKDF-SHA-256 + TLS 1.3 key schedule.** Layer on top of an
-  existing SHA-256 (already in tree as `src/util/sha256.nova` if
-  available; audit and reuse or vendor a fresh copy). Standalone,
-  vector-tested.
+- **R90 — (rolled into R88; see above.)**
 - **R91 — X.509 DER subset parser (leaf-only).** Parse the six
   required fields, refuse the rest. Vector-tested against a
   hand-authored cert.
