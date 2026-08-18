@@ -1846,16 +1846,74 @@ actually it doesn't touch the revoked slot; a rotated token
 stays revoked. The right recovery is a fresh
 `capability.issue`. Rare enough.)
 
-## 12. What comes next (R83+)
+### 7.33 admin.set_revoked wire verb (R83)
 
-- **R83+** — In-process TLS (retires the sidecar recipe), YAML
+`capability.revoke` (R55) is a one-way kill switch — great
+for "I know this token is compromised" but wrong for the
+mis-revoke case where an operator accidentally revoked a
+live token and needs to restore it. Before R83 the only
+recovery was a fresh `capability.issue`, which mints a new
+token id and breaks audit continuity.
+
+R83 adds `admin.set_revoked` — the audit-pure reversible
+alternative. The token's identity (id, caps, holder,
+expiry, rate limit, window state) all stay intact; only
+the `revoked` flag flips.
+
+```bash
+# Un-revoke a mis-revoked token.
+scripts/rpc.sh admin.set_revoked token_id "tk-wanda" revoked 0
+# -> {"ok":true,"result":{
+#      "token_id":"tk-wanda","holder":"wanda",
+#      "old_revoked":true,"new_revoked":false}}
+
+# Revoke via the admin knob (equivalent to capability.revoke
+# but with the mutable audit shape -- useful when a workflow
+# needs symmetric revoke+un-revoke).
+scripts/rpc.sh admin.set_revoked token_id "tk-xander" revoked 1
+```
+
+Cap: `admin:sandbox`.
+
+**Refusals**: no cap registry, missing args, `revoked` not
+exactly `"0"` or `"1"` (rejects `"2"`, `"-1"`, `"true"`,
+non-numeric — `str_to_int` returns 0 for garbage so we
+require the literal `"0"`/`"1"` string), unknown token_id,
+reader-role refused by cap gate.
+
+**Idempotent**: setting the same value returns
+`old_revoked == new_revoked` and the token stays as-is.
+
+**Note**: this doesn't retroactively help a request that
+already hit `capability_authorize` and got `"capability
+required: token revoked"` — that request stays refused.
+Only SUBSEQUENT requests benefit from the state change.
+
+**Live-token-knob quintet complete** (R78 + R79 + R81 + R82 + R83):
+every dimension of a token is mutable at runtime except
+`holder`. The only truly one-way surface left is
+`capability.issue` itself (minting new tokens) and there's
+no reason to want that reversed — an admin who wants to
+"un-mint" a token uses `capability.revoke` (or
+`admin.set_revoked` if they might change their mind later).
+
+| verb | changes | preserves |
+|---|---|---|
+| `admin.rotate_token` (R78) | `token_id` | everything else |
+| `admin.set_qps` (R79)      | `qps_max` + resets window | id, holder, caps, expiry, revoked |
+| `admin.set_expires` (R81)  | `expires_at` | id, holder, caps, revoked, qps, window |
+| `admin.grant_cap` (R82)    | `caps` (add) | id, holder, expiry, revoked, qps, window |
+| `admin.remove_cap` (R82)   | `caps` (rm)  | id, holder, expiry, revoked, qps, window |
+| `admin.set_revoked` (R83)  | `revoked`    | id, holder, caps, expiry, qps, window |
+
+## 12. What comes next (R84+)
+
+- **R84+** — In-process TLS (retires the sidecar recipe), YAML
   input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), an `admin.set_revoked` verb for
-  reversing a mis-revoke without losing the token's
-  identity (currently the only recovery is `capability.issue`
-  which mints a new token; some operators need "un-revoke
-  in place" for audit purity)
-- **R84+** — Per-source rate budgets controllable via admin wire
+  yaml-to-json shim), an `admin.set_holder` verb — the last
+  remaining immutable dimension, useful for transferring a
+  service token's identity when the owning team changes
+- **R85+** — Per-source rate budgets controllable via admin wire
   verb, hardware-key-backed admin bootstrap, per-holder aggregate
   rate limits
 
