@@ -1,0 +1,212 @@
+// CrossEngin in-process TLS: connection state machine
+// (R86, ADR r86-in-process-tls-scaffolding).
+//
+// The TLS 1.3 handshake state machine, abstracted down to what the
+// wire hook needs to guard: which transitions are legal, which end
+// the connection, which represent an in-progress handshake vs a live
+// application-data channel. No crypto lives here. R93 fills in the
+// handshake-message-driven advance() calls; today it is a pure state
+// enum + a transition table.
+//
+// States (server perspective; the client mirror is symmetric enough
+// to reuse the same enum for the R86 scaffold):
+//
+//   INIT
+//     |  peer connects; ClientHello is expected next
+//     v
+//   HANDSHAKE_HELLO_RECEIVED
+//     |  we've read ClientHello + will send ServerHello +
+//     |  {EncryptedExtensions, Certificate, CertificateVerify, Finished}
+//     v
+//   HANDSHAKE_HELLO_SENT
+//     |  our flight is out; awaiting peer's Finished
+//     v
+//   HANDSHAKE_FINISHED
+//     |  Finished flights match; both sides derive application keys
+//     v
+//   APPLICATION
+//     |  either side sent close_notify OR a fatal alert / error
+//     v
+//   CLOSING
+//     |  close_notify was ACKed OR the socket has been shut down
+//     v
+//   CLOSED  (terminal)
+//
+// The state machine intentionally uses ONE enum for both client and
+// server; the roles differ only in who initiates the ClientHello. The
+// client sends ClientHello from INIT and moves to HANDSHAKE_HELLO_SENT;
+// the server reads it and moves to HANDSHAKE_HELLO_RECEIVED. Both
+// paths converge at HANDSHAKE_FINISHED. R93 splits this into two
+// role-specific advance() functions if the shared table becomes a
+// footgun; for R86 the single table is simpler.
+//
+// All symbols are prefixed `tls_state_` to avoid NOVA symbol collisions.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: none.
+
+// ---- state codes ---------------------------------------------------------
+
+let TLS_STATE_INIT                     = 0
+let TLS_STATE_HANDSHAKE_HELLO_SENT     = 1
+let TLS_STATE_HANDSHAKE_HELLO_RECEIVED = 2
+let TLS_STATE_HANDSHAKE_FINISHED       = 3
+let TLS_STATE_APPLICATION              = 4
+let TLS_STATE_CLOSING                  = 5
+let TLS_STATE_CLOSED                   = 6
+
+// ---- state names (for logs) ----------------------------------------------
+
+fn tls_state_name(s) {
+    if s == TLS_STATE_INIT                     { return "INIT" }
+    if s == TLS_STATE_HANDSHAKE_HELLO_SENT     { return "HANDSHAKE_HELLO_SENT" }
+    if s == TLS_STATE_HANDSHAKE_HELLO_RECEIVED { return "HANDSHAKE_HELLO_RECEIVED" }
+    if s == TLS_STATE_HANDSHAKE_FINISHED       { return "HANDSHAKE_FINISHED" }
+    if s == TLS_STATE_APPLICATION              { return "APPLICATION" }
+    if s == TLS_STATE_CLOSING                  { return "CLOSING" }
+    if s == TLS_STATE_CLOSED                   { return "CLOSED" }
+    return "UNKNOWN(" + int_to_str(s) + ")"
+}
+
+// ---- classification queries ----------------------------------------------
+
+// A terminal state accepts no further transitions. CLOSED is terminal.
+fn tls_state_is_terminal(s) {
+    if s == TLS_STATE_CLOSED { return 1 }
+    return 0
+}
+
+// A "handshaking" state means the record layer is either not yet
+// established or only established for handshake traffic. Application
+// data MUST NOT flow in these states.
+fn tls_state_is_handshaking(s) {
+    if s == TLS_STATE_INIT                     { return 1 }
+    if s == TLS_STATE_HANDSHAKE_HELLO_SENT     { return 1 }
+    if s == TLS_STATE_HANDSHAKE_HELLO_RECEIVED { return 1 }
+    if s == TLS_STATE_HANDSHAKE_FINISHED       { return 1 }
+    return 0
+}
+
+// Application data may only be sent while the state is APPLICATION.
+// CLOSING is allowed to RECEIVE a trailing close_notify but not send
+// user data.
+fn tls_state_can_send_app(s) {
+    if s == TLS_STATE_APPLICATION { return 1 }
+    return 0
+}
+
+// ---- legal transition table ----------------------------------------------
+//
+// Returns 1 if (from -> to) is a legal advance under normal handshake
+// progress, 0 otherwise. Any state can transition to CLOSING (via a
+// received / sent alert or a socket-level shutdown) and from CLOSING
+// to CLOSED; that shortcut is captured by tls_state_can_close_now().
+
+fn tls_state_can_advance(from, to) {
+    if from == TLS_STATE_INIT {
+        if to == TLS_STATE_HANDSHAKE_HELLO_SENT     { return 1 }
+        if to == TLS_STATE_HANDSHAKE_HELLO_RECEIVED { return 1 }
+        return 0
+    }
+    if from == TLS_STATE_HANDSHAKE_HELLO_SENT {
+        if to == TLS_STATE_HANDSHAKE_FINISHED { return 1 }
+        return 0
+    }
+    if from == TLS_STATE_HANDSHAKE_HELLO_RECEIVED {
+        if to == TLS_STATE_HANDSHAKE_HELLO_SENT { return 1 }
+        if to == TLS_STATE_HANDSHAKE_FINISHED   { return 1 }
+        return 0
+    }
+    if from == TLS_STATE_HANDSHAKE_FINISHED {
+        if to == TLS_STATE_APPLICATION { return 1 }
+        return 0
+    }
+    if from == TLS_STATE_APPLICATION {
+        // No normal advance out of APPLICATION -- the only way out is
+        // via CLOSING (see can_close_now).
+        return 0
+    }
+    if from == TLS_STATE_CLOSING {
+        // No advance out of CLOSING except into CLOSED via can_close_now.
+        return 0
+    }
+    return 0
+}
+
+// A close is legal from any non-terminal state. CLOSED cannot re-close.
+fn tls_state_can_close_now(s) {
+    if s == TLS_STATE_CLOSED { return 0 }
+    return 1
+}
+
+// A hard close skips CLOSING entirely (a fatal alert or a socket error
+// forces the state directly to CLOSED). Legal from any non-terminal
+// state.
+fn tls_state_can_hard_close(s) {
+    if s == TLS_STATE_CLOSED { return 0 }
+    return 1
+}
+
+// ---- connection-state holder --------------------------------------------
+//
+// A tls_state_ctx is a two-element list [current_state, role_is_client].
+// role_is_client = 1 for client, 0 for server. R93 will grow this into
+// a full connection record (transcript hash, negotiated params, key
+// schedule state); R86 keeps it minimal.
+
+let TSC_STATE = 0
+let TSC_ROLE  = 1
+
+let TLS_ROLE_SERVER = 0
+let TLS_ROLE_CLIENT = 1
+
+fn tls_state_ctx_new(role) {
+    let ctx = list_new()
+    push(ctx, TLS_STATE_INIT)
+    push(ctx, role)
+    return ctx
+}
+
+fn tls_state_ctx_state(ctx) {
+    return ctx[TSC_STATE]
+}
+
+fn tls_state_ctx_role(ctx) {
+    return ctx[TSC_ROLE]
+}
+
+// Advance the state machine. Returns 1 on success, 0 if the requested
+// transition is illegal (caller should treat as protocol error and hard-
+// close). Terminal states refuse every advance.
+fn tls_state_ctx_advance(ctx, to) {
+    let cur = ctx[TSC_STATE]
+    if tls_state_is_terminal(cur) == 1 { return 0 }
+    if tls_state_can_advance(cur, to) == 0 { return 0 }
+    list_set(ctx, TSC_STATE, to)
+    return 1
+}
+
+// Soft close: transition to CLOSING (a close_notify was sent or received).
+fn tls_state_ctx_close(ctx) {
+    let cur = ctx[TSC_STATE]
+    if tls_state_can_close_now(cur) == 0 { return 0 }
+    list_set(ctx, TSC_STATE, TLS_STATE_CLOSING)
+    return 1
+}
+
+// Finalize the close: CLOSING -> CLOSED. Legal from CLOSING only.
+fn tls_state_ctx_finalize_close(ctx) {
+    let cur = ctx[TSC_STATE]
+    if cur != TLS_STATE_CLOSING { return 0 }
+    list_set(ctx, TSC_STATE, TLS_STATE_CLOSED)
+    return 1
+}
+
+// Hard close: skip CLOSING; go straight to CLOSED. For fatal alerts /
+// socket errors.
+fn tls_state_ctx_hard_close(ctx) {
+    let cur = ctx[TSC_STATE]
+    if tls_state_can_hard_close(cur) == 0 { return 0 }
+    list_set(ctx, TSC_STATE, TLS_STATE_CLOSED)
+    return 1
+}

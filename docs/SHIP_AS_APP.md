@@ -2041,18 +2041,126 @@ Shipped: `data/packs/samples/climate_facts.yaml` — the same 10
 atoms + 7 implications + 3 observations + 2 citations as the
 R65 JSON sample, so operators can diff the two side-by-side.
 
-## 12. What comes next (R86+)
+### 7.36 In-process TLS scaffolding (R86)
 
-- **R86+** — In-process TLS (retires the R54.1 sidecar recipe so
-  the daemon can bind an HTTPS socket directly without stunnel),
-  per-session pre/post hooks so a daemon operator can attach an
-  audit-log writer without editing `rpc_server.nova`
-- **R87+** — Per-source rate budgets controllable via admin wire
-  verb (aggregate ceilings that span multiple tokens from the
-  same origin), hardware-key-backed admin bootstrap (yubikey
-  attestation on `capability.issue` for the first admin token),
-  per-holder aggregate rate limits (an owner's tokens share a
-  combined ceiling)
+**Honest status: wire is still cleartext.** R86 lays the module
+skeleton, connection-state enum, alert enum, and wire-integration
+seam for an in-process TLS 1.3 implementation. No cryptographic
+operation runs. Operators who need TLS today keep using the R54.1
+sidecar recipe.
+
+Why an in-process implementation matters: the R54.1 stunnel sidecar
+terminates TLS in a separate process and hops to the daemon over
+loopback in cleartext. On a shared-tenancy box (the daemon co-tenants
+with other users), any co-tenant that can read `lo` sees the
+capability tokens and every wire payload. A daemon that speaks TLS
+directly closes that gap and drops one process from the supervision
+tree.
+
+R86 ships:
+
+- `src/net/tls/tls_alerts.nova` — **fully implemented**: the RFC 8446
+  §6 alert enum (all 27 codes), a `tls_alert` struct, byte-buffer
+  serialize / parse (the wire form is 2 bytes and one of them may be
+  NUL, so it uses `[buf, len]` pairs the way
+  `src/safety/chacha20.nova` does, not NOVA strings).
+- `src/net/tls/tls_state.nova` — connection-state enum (INIT ->
+  HANDSHAKE_HELLO_SENT | HANDSHAKE_HELLO_RECEIVED -> FINISHED ->
+  APPLICATION -> CLOSING -> CLOSED) with a full legal-transition
+  table and a `tls_state_ctx` holder. No crypto; the state machine
+  is testable now.
+- `src/net/tls/tls_config.nova` — server-side material holder (cert
+  DER, key DER, cipher preference, session-cache size). Empty by
+  default; nothing today constructs one with real material.
+- `src/net/tls/tls_record.nova` — record-layer header (5-byte parse /
+  serialize, fully implemented; the header can carry NUL bytes so it
+  uses `[buf, len]` too). Body wrap/unwrap are `TLS_NOT_IMPLEMENTED`
+  stubs (R94 fills in).
+- `src/net/tls/tls_handshake.nova` — handshake type enum + a
+  message struct stub. All per-type parsers/serializers return
+  `TLS_NOT_IMPLEMENTED` (R93 fills in).
+- `src/net/tls/tls_wire_hook.nova` — the one seam the daemon calls:
+  `wire_connection_wrap(fd, tls_config)`. When `tls_config == 0`
+  (always, today) it returns the raw fd unchanged. The daemon's
+  accept loop now routes through it so R94 flips the semantics
+  without a second daemon change.
+
+**Chosen algorithm suite** (justified in the ADR):
+
+- Cipher: `TLS_CHACHA20_POLY1305_SHA256` — a single integer-only
+  suite avoids the constant-time AES S-box problem in a language
+  without SIMD or CLMUL.
+- Key exchange: `x25519` — a single 255-bit prime field, no NIST
+  point-format serialization.
+- Signature: `ed25519` — deterministic (no CSPRNG dependency at the
+  signing side), same field as the KX.
+- KDF: `HKDF-SHA-256`.
+- Cert: DER-encoded X.509 subset (Subject / SubjectPublicKeyInfo /
+  Validity / SignatureAlgorithm / Signature); chain length <= 2 in
+  the first cut.
+
+**Phased build-out roadmap** (see ADR
+`docs/adr/r86-in-process-tls-scaffolding.md` for the full inventory):
+
+| Phase | What lands |
+|---|---|
+| R87 | Random-source seam; wire-integer serializers |
+| R88 | ChaCha20 block function + Poly1305 MAC (RFC 7539 vectors) |
+| R89 | x25519 field arithmetic + Montgomery ladder (RFC 7748) |
+| R90 | HKDF-SHA-256 + TLS 1.3 key schedule |
+| R91 | X.509 DER subset parser |
+| R92 | ed25519 verify |
+| R93 | Handshake state-machine wire-up |
+| R94 | **First round where in-process TLS is usable** — AEAD wrap/unwrap; `wire_connection_wrap` starts returning a real wrapped_conn |
+| R95 | Trust-anchor registry + cert chain validation |
+| R96 | Session-ticket resumption |
+| R97 | Alert delivery on live connections; close_notify |
+| R98..R9X | Hardening / audits / fuzz |
+
+**Missing runtime capabilities** (documented in the ADR; blocking
+each phase from starting): a CSPRNG source (blocks R87 first-cut) and
+non-blocking accept + poll (blocks multi-connection TLS at R94+).
+NOVA runtime is off-limits per the standing constraint; the CrossEngin
+side implements every field-arithmetic and DER primitive as a source
+file, so no runtime change is required for the non-random / non-poll
+parts of the roadmap.
+
+## 12. What comes next (R87+)
+
+The in-process TLS build-out drives the next several rounds. Non-TLS
+candidates queue alongside so no round idles waiting on a runtime
+blocker.
+
+**TLS build-out (drives R87..R9X — see §7.36):**
+
+- **R87** — Random-source seam (`src/net/tls/prims/rand.nova`) and
+  wire-integer serializers (uint16 / uint24 / vector-of-N).
+- **R88** — ChaCha20 block function + Poly1305 MAC, RFC 7539 vectors.
+- **R89** — x25519 field arithmetic + Montgomery ladder, RFC 7748
+  vectors.
+- **R90** — HKDF-SHA-256 + TLS 1.3 key schedule.
+- **R91** — X.509 DER subset parser (leaf-only).
+- **R92** — ed25519 verify.
+- **R93** — Handshake state-machine wire-up (fills in the R86
+  `tls_handshake.nova` stubs).
+- **R94** — AEAD record wrap/unwrap + `wire_connection_wrap` starts
+  returning a real wrapped_conn. **First deployable in-process TLS
+  round.**
+- **R95..R9X** — Trust-anchor chain validation, session tickets,
+  live-alert delivery, hardening / fuzz audits.
+
+**Other candidates (any round can pull one instead of a TLS phase
+that's blocked on a runtime primitive):**
+
+- Per-session pre/post hooks so a daemon operator can attach an
+  audit-log writer without editing `rpc_server.nova`.
+- Admin bulk-ops (multi-token grants / revokes in one wire call).
+- Per-source rate budgets controllable via admin wire verb (aggregate
+  ceilings across many tokens from one origin).
+- Per-holder aggregate rate limits (an owner's tokens share a
+  combined ceiling).
+- Hardware-key-backed admin bootstrap (yubikey attestation on
+  `capability.issue` for the first admin token).
 
 ## 13. Troubleshooting
 
