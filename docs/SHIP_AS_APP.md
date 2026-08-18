@@ -1906,16 +1906,77 @@ no reason to want that reversed — an admin who wants to
 | `admin.remove_cap` (R82)   | `caps` (rm)  | id, holder, expiry, revoked, qps, window |
 | `admin.set_revoked` (R83)  | `revoked`    | id, holder, caps, expiry, qps, window |
 
-## 12. What comes next (R84+)
+### 7.34 admin.set_holder wire verb (R84)
 
-- **R84+** — In-process TLS (retires the sidecar recipe), YAML
-  input adapter (or make `jsonr_parse` accept a
-  yaml-to-json shim), an `admin.set_holder` verb — the last
-  remaining immutable dimension, useful for transferring a
-  service token's identity when the owning team changes
-- **R85+** — Per-source rate budgets controllable via admin wire
-  verb, hardware-key-backed admin bootstrap, per-holder aggregate
-  rate limits
+R84 closes the live-token-knob loop. Before R84 the ONLY way to
+change a token's holder was to `capability.revoke` it and mint a
+fresh one via `capability.issue` — which broke audit continuity
+(the token id changed, so every downstream log entry keyed on
+that id became orphaned) and required the new owner to redeploy
+whatever pinned the old bearer string. `admin.set_holder`
+reassigns the token's ownership pointer IN PLACE. The id, caps,
+expiry, revoked flag, rate ceiling, and mid-window count all
+stay put; only the `holder` slot moves.
+
+The intended use case is an **ops handoff** — team A's service
+account rolls to team B without disturbing anything else:
+
+```bash
+# Team A -> team B, keeping tk-svc-42's audit identity.
+scripts/rpc.sh admin.set_holder token_id "tk-svc-42" holder "team_b"
+# -> {"ok":true,"result":{
+#      "token_id":"tk-svc-42",
+#      "old_holder":"team_a","new_holder":"team_b"}}
+```
+
+Cap: `admin:sandbox`.
+
+**Refusals**: no cap registry, missing args, empty `holder`
+(a token with no owner would silently anonymize ownership
+checks — refuse pre-mutation), unknown `token_id`,
+reader-role refused by cap gate.
+
+**Idempotent**: reassigning to the current holder returns
+`old_holder == new_holder` and the token is untouched.
+
+**Rate-limit window NOT reset**: the new holder inherits the
+old holder's mid-window count. This is intentional — a
+malicious operator cannot burn a rate ceiling and then hand
+off to reset the budget. If a genuine reset is wanted, follow
+up with `admin.set_qps` which does reset the window as a side
+effect.
+
+**Live-token-knob sextet complete** (R78 + R79 + R81 + R82 + R83 + R84):
+every dimension of a capability token — including `holder` —
+is now mutable at runtime without minting a new token. The
+only truly one-way surface left is `capability.issue` itself
+and there is no reason to want that reversed.
+
+| verb | changes | preserves |
+|---|---|---|
+| `admin.rotate_token` (R78) | `token_id`   | everything else |
+| `admin.set_qps` (R79)      | `qps_max` + resets window | id, holder, caps, expiry, revoked |
+| `admin.set_expires` (R81)  | `expires_at` | id, holder, caps, revoked, qps, window |
+| `admin.grant_cap` (R82)    | `caps` (add) | id, holder, expiry, revoked, qps, window |
+| `admin.remove_cap` (R82)   | `caps` (rm)  | id, holder, expiry, revoked, qps, window |
+| `admin.set_revoked` (R83)  | `revoked`    | id, holder, caps, expiry, qps, window |
+| `admin.set_holder` (R84)   | `holder`     | id, caps, expiry, revoked, qps, window |
+
+## 12. What comes next (R85+)
+
+- **R85+** — In-process TLS (retires the R54.1 sidecar recipe so
+  the daemon can bind an HTTPS socket directly without stunnel),
+  YAML input adapter (either a new importer wrapping
+  `jsonr_parse` via a yaml-to-json shim, or a first-class parser
+  under `src/data/yaml.nova`), per-session pre/post hooks so a
+  daemon operator can attach an audit-log writer without editing
+  `rpc_server.nova`
+- **R86+** — Per-source rate budgets controllable via admin wire
+  verb (aggregate ceilings that span multiple tokens from the
+  same origin), hardware-key-backed admin bootstrap (yubikey
+  attestation on `capability.issue` for the first admin token),
+  per-holder aggregate rate limits (an owner's tokens share a
+  combined ceiling)
 
 ## 13. Troubleshooting
 
