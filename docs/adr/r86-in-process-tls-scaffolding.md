@@ -143,12 +143,22 @@ what unlocks the most testable surface earliest.
   wire-hook flip (R93). The random-source seam and wire-integer
   serializers originally slated for R87 move to whichever later
   round needs them first (they're not on the AEAD path).
-- **R88 — HKDF-SHA-256 + TLS 1.3 key schedule.** Pull-in from the
-  original R90 slot; every downstream handshake step needs the
-  derived secrets before any of them can run. Layers on top of
-  `src/safety/sha256.nova`. Standalone, vector-tested.
+- **R88 — ✅ HKDF-SHA-256 + TLS 1.3 key-schedule wrappers.** Pull-in
+  from the original R90 slot; every downstream handshake step needs
+  the derived secrets before any of them can run. Ships
+  `src/safety/hkdf_sha256.nova` (`hkdf_extract` / `hkdf_expand` /
+  `hkdf_sha256` per RFC 5869) on top of the existing
+  `src/safety/sha256.nova` (SHA-256 + HMAC-SHA-256, already in tree
+  from R33A -- no re-implementation), plus `src/net/tls/tls_kdf.nova`
+  with the TLS 1.3 wrappers per RFC 8446 §7.1 + §7.3:
+  `tls_kdf_hkdf_label_bytes`, `tls_kdf_hkdf_expand_label`,
+  `tls_kdf_derive_secret`, and `tls_kdf_derive_key_iv` (the entry
+  point the record-layer AEAD from R87 will consume once traffic
+  secrets exist). All three RFC 5869 test cases plus the RFC 8448
+  §3 `early_secret` and `derived-from-early` spot-checks green
+  (29 hkdf + 27 tls_kdf checks). Wire hook still a pass-through.
 - **R89 — x25519 field arithmetic + Montgomery ladder.** Pure integer.
-  Test vectors from RFC 7748. Standalone.
+  Test vectors from RFC 7748. Standalone. **Next TLS phase.**
 - **R90 — (rolled into R88; see above.)**
 - **R91 — X.509 DER subset parser (leaf-only).** Parse the six
   required fields, refuse the rest. Vector-tested against a

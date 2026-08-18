@@ -2200,21 +2200,98 @@ seq monotonically increasing, resets only on key change) guarantees
 uniqueness. Do not reuse the `caead_*` primitives in any protocol
 without a comparable discipline; the module docstring says the same.
 
-## 12. What comes next (R88+)
+### 7.38 HKDF-SHA-256 + TLS 1.3 key-schedule wrappers (R88)
+
+**Honest status: key-schedule primitives are ready; the handshake is
+still stubbed and the wire is still cleartext.** R88 lands the KDF
+brick R92 (handshake wire-up) and R93 (wire-hook flip) both need
+before an in-process TLS deployment can encrypt bytes. The
+`wire_connection_wrap` hook remains a pass-through.
+
+What shipped in R88:
+
+- `src/safety/hkdf_sha256.nova` — **NEW.** Generic HKDF-SHA-256 per
+  RFC 5869:
+  - `hkdf_extract(salt, salt_len, ikm, ikm_len) -> 32-byte PRK`.
+    When `salt_len == 0` the RFC 5869 §2.2 zero-salt substitution
+    (32 zero bytes) is materialized internally, so callers can
+    pass `(0, 0)` for "no salt".
+  - `hkdf_expand(prk, prk_len, info, info_len, out_len) ->
+    [okm_buf, okm_len]`. Implements the T(i) chain from §2.3 with
+    the RFC's 255-HashLen (== 8160-byte) ceiling. Requests >8160
+    bytes and negative lengths return `okm_len = 0` (refusal).
+  - `hkdf_sha256(salt, salt_len, ikm, ikm_len, info, info_len, out_len)
+    -> [okm_buf, okm_len]`. Extract-then-Expand convenience.
+- `src/net/tls/tls_kdf.nova` — **NEW.** TLS 1.3 key-schedule
+  wrappers per RFC 8446 §7.1 + §7.3:
+  - `tls_kdf_hkdf_label_bytes(length, label, label_len, ctx, ctx_len)
+    -> [buf, len]`. Serializes the `HkdfLabel` struct verbatim
+    (big-endian uint16 length, 1-byte-prefixed label with the
+    "tls13 " prefix, 1-byte-prefixed context).
+  - `tls_kdf_hkdf_expand_label(secret, sec_len, label, label_len,
+    context, ctx_len, length) -> [okm_buf, okm_len]`. Validates
+    label / context / length against the RFC 8446 bounds, then
+    hands off to `hkdf_expand`.
+  - `tls_kdf_derive_secret(secret, sec_len, label, label_len,
+    messages, msg_len) -> [okm_buf, okm_len]`. Composes
+    `Transcript-Hash(messages) = SHA-256(messages)` into the
+    context field per RFC 8446 §7.1.
+  - `tls_kdf_derive_key_iv(secret, sec_len) -> [key32, iv12]`. The
+    per-direction record-layer entry point (labels `"key"` /
+    `"iv"`, empty context, 32-byte key and 12-byte IV sized for
+    ChaCha20-Poly1305). This is what R92's handshake state
+    machine will feed into `tls_record_seal_buf` /
+    `tls_record_open_buf` once traffic secrets exist.
+- **Prerequisites already in tree:** SHA-256 and HMAC-SHA-256 were
+  shipped by R33A as `src/safety/sha256.nova` (streaming +
+  one-shot + RFC 2104 HMAC). R88 does not re-implement either; it
+  just imports.
+
+Test vectors verified:
+
+| Test vector | Where | Status |
+|---|---|---|
+| RFC 5869 Appendix A.1 (basic SHA-256) — PRK, OKM, combined | test_hkdf_sha256 | ✅ |
+| RFC 5869 Appendix A.2 (80/80/80 byte inputs, 82-byte OKM) | test_hkdf_sha256 | ✅ |
+| RFC 5869 Appendix A.3 (empty salt + empty info) | test_hkdf_sha256 | ✅ |
+| Extract equivalence to HMAC(salt, ikm) + zero-salt substitution | test_hkdf_sha256 | ✅ |
+| Boundary out_len ∈ {0, 32, 33, 8160}; refusal at 8161 and negative | test_hkdf_sha256 | ✅ |
+| RFC 8448 §3 `early_secret` (HKDF-Extract(0^32, 0^32)) | test_tls_kdf | ✅ |
+| RFC 8448 §3 `derived_from_early` via expand_label + derive_secret | test_tls_kdf | ✅ |
+| HkdfLabel byte-serialization ("derived", "key", "iv" labels; big-endian length) | test_tls_kdf | ✅ |
+| `derive_key_iv` matches manual expand_label with "key"/"iv" labels | test_tls_kdf | ✅ |
+| RFC 8446 label bounds: refuse empty label, oversize label, oversize context, length > 65535 | test_tls_kdf | ✅ |
+
+Test totals (R88 delta): hkdf_sha256 landed at 29 checks; tls_kdf
+landed at 27 checks. Regression sweep across R86 + R87 suites
+(`test_sha256`, `test_chacha20`, `test_chacha20_poly1305`,
+`test_poly1305`, `test_tls_alerts`, `test_tls_state`,
+`test_tls_scaffold`, `test_tls_record_aead`) + `test_capability_wire`
++ `test_nl_rpc_verbs` all green.
+
+What R89 unlocks next: with HKDF in place, the remaining crypto
+prerequisites for the handshake are x25519 (ECDH for the ephemeral
+key), an X.509 subset parser, and ed25519 verification. R89 picks
+up x25519; the field arithmetic is pure integer with no runtime
+primitive missing.
+
+## 12. What comes next (R89+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
 candidates queue alongside so no round idles waiting on a runtime
 blocker.
 
-**TLS build-out (drives R88..R9X — see §7.36 and §7.37):**
+**TLS build-out (drives R89..R9X — see §7.36, §7.37, §7.38):**
 
 - **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
   RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
   seal/open runs today; handshake still stubbed.
-- **R88** — HKDF-SHA-256 + TLS 1.3 key schedule (RFC 5869 + RFC 8446
-  §7.1). Layers on top of the SHA-256 already in tree.
+- **R88** — ✅ HKDF-SHA-256 + TLS 1.3 key-schedule wrappers (see §7.38;
+  RFC 5869 + RFC 8446 §7.1, §7.3; all RFC vectors green).
+  Traffic-secret → (key, iv) derivation ready; handshake still
+  stubbed.
 - **R89** — x25519 field arithmetic + Montgomery ladder, RFC 7748
-  vectors.
+  vectors. Next TLS phase.
 - **R90** — X.509 DER subset parser (leaf-only).
 - **R91** — ed25519 verify.
 - **R92** — Handshake state-machine wire-up (fills in the R86

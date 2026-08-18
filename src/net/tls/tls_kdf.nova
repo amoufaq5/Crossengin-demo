@@ -1,0 +1,255 @@
+// CrossEngin in-process TLS: TLS 1.3 key-schedule wrappers over HKDF
+// (R88, ADR r86-in-process-tls-scaffolding.md).
+//
+// Purpose
+//   RFC 8446 §7.1 defines the TLS 1.3 key schedule as a series of
+//   HKDF-Extract / HKDF-Expand calls with a specific label format
+//   ("HkdfLabel") and a specific "Derive-Secret" helper that folds a
+//   handshake-transcript hash into the label's context field.
+//
+//   R88 lands both wrappers -- `tls_hkdf_expand_label` and
+//   `tls_derive_secret` -- so R92 can wire the handshake state machine
+//   and R93 can flip the wire hook without inventing a new primitive.
+//
+// HkdfLabel serialization (RFC 8446 §7.1)
+//
+//   struct {
+//       uint16 length = Length;
+//       opaque label<7..255>   = "tls13 " + Label;
+//       opaque context<0..255> = Context;
+//   } HkdfLabel;
+//
+//   Wire form (big-endian):
+//     [2 bytes]        length             -- BE uint16, requested OKM length
+//     [1 byte]         label_length       -- 7..255, always
+//                                            len("tls13 ") + len(Label)
+//     [label_length]   ascii bytes of "tls13 " || Label
+//     [1 byte]         context_length     -- 0..255
+//     [context_length] context bytes
+//
+//   Total serialized length = 2 + 1 + label_length + 1 + context_length.
+//
+// Derive-Secret (RFC 8446 §7.1)
+//
+//   Derive-Secret(secret, label, messages) =
+//       HKDF-Expand-Label(secret, label, Transcript-Hash(messages),
+//                         Hash.length)
+//
+//   For our fixed suite (TLS_CHACHA20_POLY1305_SHA256) the hash is
+//   SHA-256 and Hash.length == 32.
+//
+// Per-direction record keys (RFC 8446 §7.3)
+//
+//   [sender]_write_key = HKDF-Expand-Label(secret, "key", "", key_length)
+//   [sender]_write_iv  = HKDF-Expand-Label(secret, "iv",  "", iv_length)
+//
+//   For ChaCha20-Poly1305 key_length = 32 and iv_length = 12
+//   (RFC 8446 §5.3 -> RFC 8439 §2.4). `tls_kdf_derive_key_iv` is the
+//   record-layer entry point R87's `tls_record_seal_buf` /
+//   `tls_record_open_buf` will consume once the handshake state
+//   machine (R92) populates traffic secrets.
+//
+// Byte-buffer discipline
+//   Every input/output is `[buf, len]`-shaped. Labels and info come in
+//   as buf+len pairs; the module owns the "tls13 " prefix so callers
+//   pass only the RFC 8446 label text ("derived", "c hs traffic",
+//   "key", "iv", etc).
+//
+// ADRs touched: r86-in-process-tls-scaffolding.md (R88 HKDF phase).
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/safety/hkdf_sha256.nova -- HKDF-Extract / HKDF-Expand.
+//   src/safety/sha256.nova       -- transcript hash (SHA-256).
+
+import "../../safety/hkdf_sha256.nova"
+import "../../safety/sha256.nova"
+
+// ---- suite constants (fixed for R86's TLS_CHACHA20_POLY1305_SHA256) -----
+
+let TLS_KDF_HASH_LEN     = 32       // SHA-256 output
+let TLS_KDF_KEY_LEN      = 32       // ChaCha20-Poly1305 key length
+let TLS_KDF_IV_LEN       = 12       // ChaCha20-Poly1305 nonce length
+
+// The "tls13 " prefix that HkdfLabel prepends to every RFC 8446 label
+// name. Ten bytes total when concatenated with a label like "derived".
+let _TLS_KDF_PREFIX      = "tls13 "
+let _TLS_KDF_PREFIX_LEN  = 6
+
+// ============================================================================
+//                          HkdfLabel serializer
+// ============================================================================
+//
+// Build the exact byte sequence documented in RFC 8446 §7.1 for the
+// (length, label, context) triple. Returns [buf, len]. Callers that
+// want to hand-verify the wire bytes (see test_tls_kdf.nova) use this
+// directly; hkdf_expand_label calls it internally.
+
+fn tls_kdf_hkdf_label_bytes(length, label_buf, label_len,
+                            context_buf, context_len) {
+    let full_label_len = _TLS_KDF_PREFIX_LEN + label_len
+    let total = 2 + 1 + full_label_len + 1 + context_len
+    let buf = alloc(total + 1)
+    // uint16 length, big-endian.
+    store8(buf + 0, int_and(int_shr(length, 8), 255))
+    store8(buf + 1, int_and(length, 255))
+    // opaque label<7..255>: 1-byte length, then bytes.
+    store8(buf + 2, int_and(full_label_len, 255))
+    let off = 3
+    let i = 0
+    while i < _TLS_KDF_PREFIX_LEN {
+        store8(buf + off + i, char_at(_TLS_KDF_PREFIX, i))
+        i = i + 1
+    }
+    off = off + _TLS_KDF_PREFIX_LEN
+    i = 0
+    while i < label_len {
+        store8(buf + off + i, load8(label_buf + i))
+        i = i + 1
+    }
+    off = off + label_len
+    // opaque context<0..255>: 1-byte length, then bytes.
+    store8(buf + off, int_and(context_len, 255))
+    off = off + 1
+    i = 0
+    while i < context_len {
+        store8(buf + off + i, load8(context_buf + i))
+        i = i + 1
+    }
+    off = off + context_len
+    store8(buf + total, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, total)
+    return out
+}
+
+// ============================================================================
+//                          HKDF-Expand-Label (RFC 8446 §7.1)
+// ============================================================================
+//
+// HKDF-Expand-Label(Secret, Label, Context, Length) =
+//     HKDF-Expand(Secret, HkdfLabel, Length)
+//
+// The secret is always a 32-byte pseudorandom key (SHA-256 output).
+// Label is caller-supplied ASCII (without the "tls13 " prefix; this
+// function adds it). Context is either a transcript hash (32 bytes)
+// or empty. `length` is the number of OKM bytes the caller wants.
+//
+// Constraints (RFC 8446 §7.1):
+//   - 7 <= 6 + label_len <= 255, i.e. 1 <= label_len <= 249.
+//   - 0 <= context_len <= 255.
+//   - 1 <= length <= 65535 (uint16). Additionally, length inherits the
+//     HKDF ceiling of 255*32 = 8160 from RFC 5869.
+//
+// On any constraint violation returns [zero_buf, 0]; the caller must
+// check the length to detect refusal (a zero length was legitimately
+// asked, so callers who requested >0 use out_len==0 as the refusal
+// signal).
+
+fn tls_kdf_hkdf_expand_label(secret_buf, secret_len,
+                             label_buf, label_len,
+                             context_buf, context_len,
+                             length) {
+    // Refuse invalid label / context / length up-front.
+    let full_label_len = _TLS_KDF_PREFIX_LEN + label_len
+    if label_len < 1 {
+        let zero = alloc(1); store8(zero, 0)
+        let r0 = list_new(); push(r0, zero); push(r0, 0)
+        return r0
+    }
+    if full_label_len > 255 {
+        let zero = alloc(1); store8(zero, 0)
+        let r1 = list_new(); push(r1, zero); push(r1, 0)
+        return r1
+    }
+    if context_len < 0 {
+        let zero = alloc(1); store8(zero, 0)
+        let r2 = list_new(); push(r2, zero); push(r2, 0)
+        return r2
+    }
+    if context_len > 255 {
+        let zero = alloc(1); store8(zero, 0)
+        let r3 = list_new(); push(r3, zero); push(r3, 0)
+        return r3
+    }
+    if length < 0 {
+        let zero = alloc(1); store8(zero, 0)
+        let r4 = list_new(); push(r4, zero); push(r4, 0)
+        return r4
+    }
+    if length > 65535 {
+        let zero = alloc(1); store8(zero, 0)
+        let r5 = list_new(); push(r5, zero); push(r5, 0)
+        return r5
+    }
+    // Serialize HkdfLabel and hand to HKDF-Expand.
+    let info = tls_kdf_hkdf_label_bytes(length,
+                                        label_buf, label_len,
+                                        context_buf, context_len)
+    return hkdf_expand(secret_buf, secret_len, info[0], info[1], length)
+}
+
+// ============================================================================
+//                          Derive-Secret (RFC 8446 §7.1)
+// ============================================================================
+//
+// Derive-Secret(Secret, Label, Messages) =
+//     HKDF-Expand-Label(Secret, Label,
+//                       Transcript-Hash(Messages), Hash.length)
+//
+// For our suite Transcript-Hash is SHA-256 and Hash.length is 32.
+// `messages_buf`/`messages_len` is the concatenated wire form of the
+// handshake messages up to (but not including) the message this
+// secret is derived for -- exactly what R92's handshake state machine
+// will feed once wire-up lands.
+
+fn tls_kdf_derive_secret(secret_buf, secret_len,
+                         label_buf, label_len,
+                         messages_buf, messages_len) {
+    // Transcript-Hash: SHA-256 of the handshake message stream.
+    let th = sha256_oneshot(messages_buf, messages_len)
+    return tls_kdf_hkdf_expand_label(secret_buf, secret_len,
+                                     label_buf, label_len,
+                                     th, TLS_KDF_HASH_LEN,
+                                     TLS_KDF_HASH_LEN)
+}
+
+// ============================================================================
+//                          Per-direction (key, iv) derivation
+// ============================================================================
+//
+// RFC 8446 §7.3 lifts a traffic secret into a concrete
+// (write_key, write_iv) pair:
+//
+//   write_key = HKDF-Expand-Label(secret, "key", "", key_length)
+//   write_iv  = HKDF-Expand-Label(secret, "iv",  "", iv_length)
+//
+// This is the entry point R87's `tls_record_seal_buf` /
+// `tls_record_open_buf` will consume once R92's handshake state
+// machine populates the traffic secrets. Returns [key32, iv12].
+
+fn tls_kdf_derive_key_iv(secret_buf, secret_len) {
+    // "key" label, empty context, 32-byte output.
+    let key_label = alloc(4)
+    store8(key_label + 0, 107)   // 'k'
+    store8(key_label + 1, 101)   // 'e'
+    store8(key_label + 2, 121)   // 'y'
+    store8(key_label + 3, 0)
+    let key_pair = tls_kdf_hkdf_expand_label(secret_buf, secret_len,
+                                             key_label, 3,
+                                             0, 0,
+                                             TLS_KDF_KEY_LEN)
+    // "iv" label, empty context, 12-byte output.
+    let iv_label = alloc(3)
+    store8(iv_label + 0, 105)    // 'i'
+    store8(iv_label + 1, 118)    // 'v'
+    store8(iv_label + 2, 0)
+    let iv_pair = tls_kdf_hkdf_expand_label(secret_buf, secret_len,
+                                            iv_label, 2,
+                                            0, 0,
+                                            TLS_KDF_IV_LEN)
+    let out = list_new()
+    push(out, key_pair[0])
+    push(out, iv_pair[0])
+    return out
+}
