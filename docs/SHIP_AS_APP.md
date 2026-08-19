@@ -2275,13 +2275,128 @@ key), an X.509 subset parser, and ed25519 verification. R89 picks
 up x25519; the field arithmetic is pure integer with no runtime
 primitive missing.
 
+### 7.39 x25519 ECDH (R89)
+
+**Honest status: ECDH primitive is ready and byte-exact against RFC 7748;
+the handshake is still stubbed, the wire is still cleartext, and the
+RNG source needed to sample the ephemeral scalar is not yet wired.**
+R89 lands the key-exchange half of the TLS 1.3 handshake without
+touching the state machine or the wire hook -- both of those stay
+where R86 left them.
+
+What shipped in R89:
+
+- `src/safety/field25519.nova` — **NEW.** GF(2^255 - 19) field
+  arithmetic in the classic Bernstein 10-limb 26/25-bit layout
+  (a.k.a. curve25519-donna / ref10). Constant-time throughout
+  (data-independent branches, XOR-mask conditional swap, fixed
+  addition-chain modular inverse). Exposes `fe_zero`, `fe_one`,
+  `fe_copy`, `fe_add`, `fe_sub`, `fe_neg`, `fe_mul`, `fe_sq`,
+  `fe_mul121666`, `fe_invert`, `fe_frombytes`, `fe_tobytes`,
+  `fe_cswap`. Every intermediate product stays well inside NOVA's
+  63-bit signed-positive integer range (worst-case fe_mul sum
+  ~2^61, empirically fuzzed against `bignum_256`'s modmul over
+  the same prime).
+- `src/safety/x25519.nova` — **NEW.** X-only Curve25519 Montgomery
+  ladder per RFC 7748 §5. Exposes:
+  - `x25519_clamp_scalar(out, in)` — RFC 7748 clamp (bottom 3 bits
+    clear, top bit clear, bit 254 set).
+  - `x25519_scalarmult(out, scalar, u)` — raw scalar-mult (clamps
+    the scalar, decodes u with high-bit mask, runs the ladder,
+    inverts z_2 and encodes canonical bytes).
+  - `x25519(out, scalar, u)` — scalar-mult with the RFC 7748 §6.1
+    all-zero-shared-secret rejection: on a low-order u (u=0 or u=1)
+    returns ok=0 and zeros out.
+  - `x25519_base(out, scalar)` — public-key generation (u = 9).
+- `src/net/tls/tls_keyshare.nova` — **NEW.** TLS-facing thin wrapper:
+  - `tls_keyshare_x25519_public(pub, scalar)`.
+  - `tls_keyshare_x25519_shared(shared, scalar, peer_pk)` — with
+    the all-zero rejection propagated.
+  - `tls_keyshare_derive_handshake_secret(shared, len, early, len)`
+    — folds the shared secret into the RFC 8446 §7.1 key schedule
+    at the `Derive-Secret(early, "derived", "") -> HKDF-Extract`
+    transition, giving R92's handshake state machine the exact PRK
+    it will feed into subsequent `Derive-Secret` calls.
+  Length constants: `TLS_X25519_SCALAR_LEN = TLS_X25519_PUBLIC_LEN
+  = TLS_X25519_SHARED_LEN = 32`.
+
+Test vectors verified (byte-exact, all in `test_x25519` and
+`test_tls_keyshare`):
+
+| Test vector | Where | Status |
+|---|---|---|
+| RFC 7748 §5.2 scalar-mult test 1 (scalar=a546…, u=e6db…) | test_x25519 | ✅ |
+| RFC 7748 §5.2 scalar-mult test 2 (scalar=4b66…, u=e521…) | test_x25519 | ✅ |
+| RFC 7748 §5.2 iterated test after 1 iteration | test_x25519 | ✅ |
+| RFC 7748 §5.2 iterated test after 1000 iterations | test_x25519 | ✅ |
+| RFC 7748 §6.1 Alice public key from Alice sk | test_x25519, test_tls_keyshare | ✅ |
+| RFC 7748 §6.1 Bob public key from Bob sk | test_x25519, test_tls_keyshare | ✅ |
+| RFC 7748 §6.1 shared secret (Alice·Bob, both directions) | test_x25519, test_tls_keyshare | ✅ |
+| RFC 7748 §6.1 low-order u=0 rejection (ok=0, zeroed out) | test_x25519, test_tls_keyshare | ✅ |
+| Low-order u=1 rejection | test_x25519 | ✅ |
+| RFC 7748 scalar-clamp idempotence and unclamped==clamped equivalence | test_x25519 | ✅ |
+| CT-ladder determinism (two runs on identical input match bytewise) | test_x25519 | ✅ |
+| GF(p25519) field-arithmetic identities (comm, assoc, distrib, inv) | test_field25519 | ✅ |
+| fe_frombytes/fe_tobytes canonical roundtrip (0, 1, p-1, p→0, arbitrary) | test_field25519 | ✅ |
+| fe_frombytes high-bit mask (0x80/0xFF top byte decodes same as masked) | test_field25519 | ✅ |
+| fe_cswap(a, b, 0) no-op / fe_cswap(a, b, 1) swaps / double-swap restores | test_field25519 | ✅ |
+| fe_sq(a) == fe_mul(a, a) byte-identical across seed set | test_field25519 | ✅ |
+| fe_mul121666(a) == fe_mul(a, 121666_fe) | test_field25519 | ✅ |
+| The RFC 7748 §5.2 1,000,000-iteration case is deliberately SKIPPED (optional; exceeds 60s test cap). | test_x25519 (noted) | -- |
+
+NOVA-arithmetic decisions (why 10x(26/25) not 5x51):
+
+- **Limb layout: 10 limbs alternating 26-bit and 25-bit windows
+  (radix 2^25.5), the "curve25519-donna" / ref10 layout.** Chosen
+  over 5x51 specifically to keep every fe_mul intermediate safely
+  under NOVA's 63-bit signed-positive integer range. Worst-case
+  fe_mul term: `2 * canonical_limb * (19 * canonical_limb) < 2^27
+  * 2^30.25 = 2^57.3`; ten-term sum `~2^60.6`. 5x51 would push
+  intermediates to ~2^108, requiring a split into hi/lo halves
+  that NOVA's 63-bit arithmetic can't express in one word. The
+  Bernstein 10-limb bound is well-studied and matches the classic
+  reference implementations.
+- **Reduction strategy: two sequential carry cascades (each
+  h[0]->h[1]->...->h[9] with the 19*carry9 wrap folded back into
+  h[0]).** Every fe_ operation ends canonical (h[even] in
+  [0, 2^26), h[odd] in [0, 2^25)); the second cascade absorbs the
+  wrap-induced growth in h[0]->h[1]->h[2].
+- **Constant-time freeze in fe_tobytes: add 19 to a canonical h,
+  sequentially cascade UP TO h[9] without applying the wrap, and
+  inspect bit 25 of t[9] as the "h >= p" flag.** Then multiply-
+  select between h and (t with top bit cleared) -- branch-free.
+- **fe_sub folds through +4p limbs** ([2^28 - 76, 2^27 - 4,
+  2^28 - 4, ..., 2^27 - 4]) so no intermediate goes negative
+  (NOVA has no signed-integer wrap; a negative value would
+  silently be interpreted as a very large positive).
+
+RNG dependency (still open, not fixed in R89):
+The keyshare functions take a caller-supplied 32-byte scalar. That
+scalar MUST come from a CSPRNG for the shared secret to be secret.
+The NOVA runtime does not yet expose `sys_getrandom`; R89 does not
+add a random source. R92's handshake wire-up will need to close
+this (either via a NOVA runtime addition or a stub-scalar-with-
+audit-warning path). This is called out again in §12.
+
+Test totals (R89 delta): field25519 landed at 37 checks;
+x25519 at 15 checks; tls_keyshare at 14 checks. Regression sweep
+across R86 + R87 + R88 suites (`test_hkdf_sha256`, `test_tls_kdf`,
+`test_tls_record_aead`, `test_chacha20_poly1305`, `test_poly1305`,
+`test_sha256`, `test_tls_alerts`, `test_tls_state`, `test_tls_scaffold`,
+`test_capability_wire`, `test_nl_rpc_verbs`) all green.
+
+What R90 unlocks next: ed25519 verify (RFC 8032). With ECDH landed
+and ed25519 verify landed, the last crypto primitive gap before the
+handshake state machine can be wired is X.509 parsing; R91 picks
+that up.
+
 ## 12. What comes next (R89+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
 candidates queue alongside so no round idles waiting on a runtime
 blocker.
 
-**TLS build-out (drives R89..R9X — see §7.36, §7.37, §7.38):**
+**TLS build-out (drives R90..R9X — see §7.36, §7.37, §7.38, §7.39):**
 
 - **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
   RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
@@ -2290,17 +2405,35 @@ blocker.
   RFC 5869 + RFC 8446 §7.1, §7.3; all RFC vectors green).
   Traffic-secret → (key, iv) derivation ready; handshake still
   stubbed.
-- **R89** — x25519 field arithmetic + Montgomery ladder, RFC 7748
-  vectors. Next TLS phase.
-- **R90** — X.509 DER subset parser (leaf-only).
-- **R91** — ed25519 verify.
+- **R89** — ✅ x25519 ECDH (see §7.39; RFC 7748 §5.2 + §6.1; all
+  vectors green). Key-share primitive + TLS keyshare glue landed;
+  handshake still stubbed, wire still cleartext, RNG source still
+  missing (see gap below).
+- **R90** — ed25519 verify (RFC 8032). Signature verification for
+  cert auth; reuses the R89 field25519 module (Ed25519 lives on
+  Edwards25519, over the same GF(2^255-19) prime). **Next TLS
+  phase.**
+- **R91** — X.509 DER subset parser (leaf-only).
 - **R92** — Handshake state-machine wire-up (fills in the R86
-  `tls_handshake.nova` stubs).
+  `tls_handshake.nova` stubs). **This is the round where the
+  CSPRNG/RNG gap MUST be closed** (server-random, client-random,
+  and ephemeral x25519 scalar all need a cryptographic RNG).
 - **R93** — Wire-hook flip: `wire_connection_wrap` starts returning a
   real wrapped_conn under a `tls_config`. **First deployable
   in-process TLS round.**
 - **R94..R9X** — Trust-anchor chain validation, session tickets,
   live-alert delivery, hardening / fuzz audits.
+
+**Runtime gaps that R92 must resolve** (called out here so R90/R91
+don't get blocked by them and so operators know the picture):
+
+- **CSPRNG source.** No NOVA runtime primitive exposes
+  `sys_getrandom` / `/dev/urandom` read today. R89's keyshare
+  wrapper takes a caller-supplied scalar with a docstring flagging
+  this. R92 must land either a NOVA runtime addition or an
+  explicit stub-with-audit-warning path -- shipping the handshake
+  without a real RNG would be a fatal correctness bug for the
+  privacy story the TLS work exists to give the wire.
 
 **Other candidates (any round can pull one instead of a TLS phase
 that's blocked on a runtime primitive):**

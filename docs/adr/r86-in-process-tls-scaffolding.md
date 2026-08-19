@@ -112,7 +112,7 @@ CrossEngin work.
 |---|---|---|
 | CSPRNG (e.g. `sys_getrandom` / `/dev/urandom` read) | R87 (client-random / server-random / ephemeral key) | ADR blocks handshake landing until runtime ships it |
 | 64-bit unsigned add/xor/rotate that survives NOVA's integer-op smart-dispatch bug #11 | R88 (ChaCha20 block function) | Use `int_add` / `int_xor` / `int_shl` escape hatches the way `stream_http` does for IP parsing |
-| Big-int (255-bit) field arithmetic — add, sub, mul, invert mod p25519 | R89 (x25519 Montgomery ladder) | Implemented in `src/net/tls/prims/field25519.nova` on top of int_* escape hatches; runtime need not change |
+| Big-int (255-bit) field arithmetic — add, sub, mul, invert mod p25519 | R89 (x25519 Montgomery ladder) | ✅ Delivered as `src/safety/field25519.nova` on top of int_* escape hatches; runtime needed no change |
 | DER parsing helpers (`asn1_read_len`, tag reader) | R91 (X.509 subset parse) | Implemented in `src/net/tls/prims/der.nova`; runtime need not change |
 | Non-blocking accept + poll loop | R94 (multi-connection TLS) | R86 keeps the serial accept loop; TLS handshakes serialize behind it — acceptable for single-user first cut |
 
@@ -157,29 +157,40 @@ what unlocks the most testable surface earliest.
   secrets exist). All three RFC 5869 test cases plus the RFC 8448
   §3 `early_secret` and `derived-from-early` spot-checks green
   (29 hkdf + 27 tls_kdf checks). Wire hook still a pass-through.
-- **R89 — x25519 field arithmetic + Montgomery ladder.** Pure integer.
-  Test vectors from RFC 7748. Standalone. **Next TLS phase.**
-- **R90 — (rolled into R88; see above.)**
+- **R89 — ✅ x25519 field arithmetic + Montgomery ladder.** Pure
+  integer. Every RFC 7748 §5.2 and §6.1 vector byte-exact
+  (`test_field25519` / `test_x25519` / `test_tls_keyshare`, +66
+  checks total). Ships `src/safety/field25519.nova` (10-limb 26/25
+  Bernstein layout), `src/safety/x25519.nova` (Montgomery ladder
+  with clamp + all-zero rejection + base-point wrap), and
+  `src/net/tls/tls_keyshare.nova` (TLS-facing thin wrapper +
+  handshake_secret derivation into the RFC 8446 §7.1 key schedule).
+  Wire hook still a pass-through; RNG source still missing (see
+  §12 "Runtime gaps R92 must resolve" in `docs/SHIP_AS_APP.md`).
+- **R90 — ed25519 verify (signing deferred).** Verify a server cert
+  signature over its TBS bytes. Reuses R89's `field25519.nova` for
+  the underlying GF(2^255-19) arithmetic. **Next TLS phase.**
 - **R91 — X.509 DER subset parser (leaf-only).** Parse the six
   required fields, refuse the rest. Vector-tested against a
   hand-authored cert.
-- **R92 — ed25519 verify (signing deferred to R92.1).** Verify a
-  server cert signature over its TBS bytes. Vector-tested.
-- **R93 — handshake state machine wire-up.** Fill in the
+- **R92 — handshake state machine wire-up.** Fill in the
   `tls_handshake.nova` message parsers/serializers. Drive
   `tls_state.nova` through a real ClientHello/ServerHello round trip.
-- **R94 — record-layer AEAD wrap/unwrap + application-data path.**
+  This is where the CSPRNG/RNG gap MUST be closed (server_random,
+  client_random, and the ephemeral x25519 scalar all need a real
+  cryptographic RNG). See the R89 §7.39 note in SHIP_AS_APP.md.
+- **R93 — record-layer AEAD wrap/unwrap + application-data path.**
   `wire_connection_wrap` starts returning a REAL wrapped_conn whose
   read/write encrypt/decrypt through the record layer. Feature-flag
   ON only when a `tls_config` is present.
-- **R95 — trust-anchor registry + cert chain validation (len<=2).**
+- **R94 — trust-anchor registry + cert chain validation (len<=2).**
   Layer on the R55.1 trust-anchor pattern.
-- **R96 — session-ticket resumption (0-RTT deferred).** Bring back the
+- **R95 — session-ticket resumption (0-RTT deferred).** Bring back the
   session cache stub in `tls_config.nova`.
-- **R97 — alert delivery on live connections, close_notify semantics.**
-  Today R86 tests the alert enum; R97 tests alerts actually reaching
+- **R96 — alert delivery on live connections, close_notify semantics.**
+  Today R86 tests the alert enum; R96 tests alerts actually reaching
   the peer.
-- **R98..R9X — hardening.** Constant-time comparisons audit, cache-
+- **R97..R9X — hardening.** Constant-time comparisons audit, cache-
   timing audit on ChaCha20 (no S-boxes so light), fuzz the DER parser,
   fuzz the handshake state machine, review the alert mapping against
   RFC 8446 §6.

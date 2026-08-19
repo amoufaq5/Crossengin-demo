@@ -1,0 +1,219 @@
+// CrossEngin safety: X25519 Diffie-Hellman key exchange (RFC 7748).
+//
+// Purpose
+//   Curve25519 X-only Montgomery-ladder scalar multiplication -- the
+//   key-exchange half of the TLS 1.3 handshake for the CrossEngin suite
+//   picked in R86 (TLS_CHACHA20_POLY1305_SHA256 + x25519 key share +
+//   ed25519 signature). R89 delivers this ECDH primitive; R90 will add
+//   the ed25519 signature-verify side, R92 will wire the handshake
+//   state machine that combines them.
+//
+// API
+//   x25519_clamp_scalar(scalar_out, scalar_in) -- copy scalar_in into
+//       scalar_out with the RFC 7748 clamp mask applied:
+//         scalar_out[0]  &= 248     (clear bottom 3 bits)
+//         scalar_out[31] &= 127     (clear top bit)
+//         scalar_out[31] |= 64      (set second-from-top bit)
+//       Both scalars are 32-byte buffers (byte pointers).
+//
+//   x25519_scalarmult(shared_out, scalar, u_coord)
+//       Compute shared_out := scalar * u_coord on Curve25519.
+//       Runs the Montgomery ladder (RFC 7748 section 5) over the
+//       clamped scalar from bit 254 down to bit 0. Constant-time in
+//       every branch. Returns 1.
+//
+//   x25519(shared_out, scalar, u_coord)
+//       Wrapper over x25519_scalarmult that additionally rejects the
+//       all-zero shared secret per RFC 7748 section 6.1: if every
+//       byte of the computed secret is zero, zero out shared_out and
+//       return ok=0; otherwise return ok=1.
+//
+//   x25519_base(pub_out, scalar)
+//       Compute a public key from a private scalar:
+//         pub_out := scalar * BasePoint,   BasePoint u-coord = 9.
+//       Uses x25519_scalarmult (skips the all-zero rejection, which
+//       is only meaningful for shared secrets, not public keys).
+//       Returns 1.
+//
+// Ladder step (RFC 7748 section 5)
+//   For each bit b of the scalar, high-to-low:
+//     swap := swap XOR b
+//     cswap(x_2, x_3, swap)
+//     cswap(z_2, z_3, swap)
+//     swap := b
+//     A  := x_2 + z_2
+//     AA := A^2
+//     B  := x_2 - z_2
+//     BB := B^2
+//     E  := AA - BB
+//     C  := x_3 + z_3
+//     D  := x_3 - z_3
+//     DA := D * A
+//     CB := C * B
+//     x_3 := (DA + CB)^2
+//     z_3 := u * (DA - CB)^2
+//     x_2 := AA * BB
+//     z_2 := E * (AA + a24 * E)
+//   After the loop:
+//     cswap(x_2, x_3, swap)
+//     cswap(z_2, z_3, swap)
+//     return x_2 * z_2^(-1)
+//   where a24 = 121665 and multiplication by (a24 + 1) = 121666 uses
+//   the fe_mul121666 shortcut in field25519.
+//
+// RNG dependency
+//   x25519 itself does NOT sample randomness -- the caller supplies the
+//   private scalar. That scalar MUST come from a cryptographic RNG for
+//   the shared secret to be secret; the TLS handshake wire-up in R92
+//   will need a CSPRNG source. R89 does not attempt to provide one
+//   (the NOVA runtime does not yet expose `sys_getrandom`; see the R86
+//   ADR "Missing NOVA runtime capabilities" table).
+//
+// Byte-buffer discipline
+//   All inputs and outputs are 32-byte pointer buffers (each byte 0..255).
+//   Public keys and shared secrets WILL contain NUL bytes, so callers
+//   must always carry a `[buf, len]` pair (len == 32) at the wire
+//   boundary; NOVA strings would truncate on any 0x00.
+//
+// ADRs touched: r86-in-process-tls-scaffolding.md (R89 x25519 phase).
+// NOVA dependencies: builtins only.
+// CrossEngin dependencies: src/safety/field25519.nova.
+
+import "./field25519.nova"
+
+// ---- clamp --------------------------------------------------------------
+
+fn x25519_clamp_scalar(scalar_out, scalar_in) {
+    let i = 0
+    while i < 32 {
+        store8(scalar_out + i, load8(scalar_in + i))
+        i = i + 1
+    }
+    store8(scalar_out + 0,  int_and(load8(scalar_out + 0),  248))
+    store8(scalar_out + 31, int_and(load8(scalar_out + 31), 127))
+    store8(scalar_out + 31, int_or(load8(scalar_out + 31), 64))
+    return 1
+}
+
+// ---- ladder -------------------------------------------------------------
+
+fn x25519_scalarmult(shared_out, scalar, u_coord) {
+    // Local clamped copy of the scalar.
+    let e = alloc(32)
+    x25519_clamp_scalar(e, scalar)
+    // Decode u.
+    let u = fe_new()
+    fe_frombytes(u, u_coord)
+    // Working field elements: x_2, z_2, x_3, z_3 and scratch.
+    let x2 = fe_new(); fe_one(x2)          // x_2 = 1
+    let z2 = fe_new(); fe_zero(z2)         // z_2 = 0
+    let x3 = fe_new(); fe_copy(x3, u)      // x_3 = u
+    let z3 = fe_new(); fe_one(z3)          // z_3 = 1
+    let swap = 0
+    // Scratch temporaries reused per iteration.
+    let a  = fe_new()
+    let aa = fe_new()
+    let b  = fe_new()
+    let bb = fe_new()
+    let e_fe = fe_new()
+    let c  = fe_new()
+    let d  = fe_new()
+    let da = fe_new()
+    let cb = fe_new()
+    let t0 = fe_new()
+    let t1 = fe_new()
+    // Iterate scalar bits from 254 down to 0.
+    let i = 254
+    while i >= 0 {
+        // bit := (scalar[i/8] >> (i mod 8)) & 1
+        let byte_i = int_shr(i, 3)
+        let bit_shift = i - (byte_i * 8)
+        let bit = int_and(int_shr(load8(e + byte_i), bit_shift), 1)
+        swap = int_xor(swap, bit)
+        fe_cswap(x2, x3, swap)
+        fe_cswap(z2, z3, swap)
+        swap = bit
+        // A  := x_2 + z_2
+        fe_add(a, x2, z2)
+        // AA := A^2
+        fe_sq(aa, a)
+        // B  := x_2 - z_2
+        fe_sub(b, x2, z2)
+        // BB := B^2
+        fe_sq(bb, b)
+        // E  := AA - BB
+        fe_sub(e_fe, aa, bb)
+        // C  := x_3 + z_3
+        fe_add(c, x3, z3)
+        // D  := x_3 - z_3
+        fe_sub(d, x3, z3)
+        // DA := D * A
+        fe_mul(da, d, a)
+        // CB := C * B
+        fe_mul(cb, c, b)
+        // x_3 := (DA + CB)^2
+        fe_add(t0, da, cb)
+        fe_sq(x3, t0)
+        // z_3 := u * (DA - CB)^2
+        fe_sub(t0, da, cb)
+        fe_sq(t1, t0)
+        fe_mul(z3, u, t1)
+        // x_2 := AA * BB
+        fe_mul(x2, aa, bb)
+        // z_2 := E * (AA + a24 * E),  a24 = 121665.
+        // We only have fe_mul121666 (multiply by 121666 = a24 + 1),
+        // so subtract one E to reach a24 * E:
+        //   t0 := 121666 * E
+        //   t0 := t0 - E             (= 121665 * E = a24 * E)
+        //   t1 := AA + a24 * E
+        //   z_2 := E * t1
+        fe_mul121666(t0, e_fe)
+        fe_sub(t0, t0, e_fe)
+        fe_add(t1, aa, t0)
+        fe_mul(z2, e_fe, t1)
+        i = i - 1
+    }
+    // Final unconditional swap by the last `swap` bit.
+    fe_cswap(x2, x3, swap)
+    fe_cswap(z2, z3, swap)
+    // Compute x_2 * z_2^(-1) and encode.
+    let z2_inv = fe_new()
+    fe_invert(z2_inv, z2)
+    let result = fe_new()
+    fe_mul(result, x2, z2_inv)
+    fe_tobytes(shared_out, result)
+    return 1
+}
+
+// ---- top-level wrapper with all-zero rejection --------------------------
+
+fn x25519(shared_out, scalar, u_coord) {
+    x25519_scalarmult(shared_out, scalar, u_coord)
+    // Constant-time check for the all-zero shared secret. Per RFC 7748
+    // section 6.1 an all-zero shared secret indicates a degenerate
+    // low-order u-coordinate; CrossEngin rejects that with ok=0 and
+    // zeros out shared_out so callers cannot accidentally propagate
+    // the "secret".
+    let acc = 0
+    let i = 0
+    while i < 32 {
+        acc = int_or(acc, load8(shared_out + i))
+        i = i + 1
+    }
+    if acc == 0 {
+        // Already zero; report failure.
+        return 0
+    }
+    return 1
+}
+
+// ---- base-point multiplication (public key generation) ------------------
+
+fn x25519_base(pub_out, scalar) {
+    // Base u-coordinate = 9. Little-endian: byte 0 = 9, rest zero.
+    let u = alloc(32)
+    let i = 0
+    while i < 32 { store8(u + i, 0); i = i + 1 }
+    store8(u + 0, 9)
+    return x25519_scalarmult(pub_out, scalar, u)
+}
