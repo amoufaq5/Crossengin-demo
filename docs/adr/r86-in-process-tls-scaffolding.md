@@ -167,30 +167,46 @@ what unlocks the most testable surface earliest.
   handshake_secret derivation into the RFC 8446 §7.1 key schedule).
   Wire hook still a pass-through; RNG source still missing (see
   §12 "Runtime gaps R92 must resolve" in `docs/SHIP_AS_APP.md`).
-- **R90 — ed25519 verify (signing deferred).** Verify a server cert
-  signature over its TBS bytes. Reuses R89's `field25519.nova` for
-  the underlying GF(2^255-19) arithmetic. **Next TLS phase.**
-- **R91 — X.509 DER subset parser (leaf-only).** Parse the six
+- **R90 — ✅ ed25519 verify + TLS CertificateVerify seam (signing
+  deferred).** Audit-only on the pre-existing `src/safety/ed25519.nova`
+  (built for R54.2 signed-skill install; RFC 8032 correct, SHA-512
+  built inline, y >= p rejection, s >= L rejection, Montgomery-ladder
+  scalar-mult). New `src/net/tls/tls_cert.nova` assembles the RFC
+  8446 §4.4.3 signed content (64 x 0x20 || "TLS 1.3, {server,client}
+  CertificateVerify" || 0x00 || transcript_hash) and wraps
+  `ed25519_verify` behind `tls_cert_verify` / `tls_cert_verify_ed25519`.
+  Tests: 16 additional RFC 8032 §5.1.7 rejection + determinism
+  checks on `test_ed25519` (s == L, s == L+1, non-canonical A/R,
+  all-zero pubkey, per-vector bit-flip); 41 new checks on
+  `test_tls_cert` (byte-layout of the built input, server-vs-client
+  differ in role word only, full sign+verify round-trip, tamper /
+  shape rejection). X.509 parsing NOT included -- raw pubkey
+  passed in.
+- **R91 — CSPRNG source. Next TLS phase.** Land either a NOVA
+  runtime addition exposing `sys_getrandom` / `/dev/urandom` read,
+  or an explicit stub-with-audit-warning path. R89's x25519
+  keyshare and R93's handshake both need a real random source;
+  shipping the handshake without one would be a fatal correctness
+  bug for the privacy story TLS exists to give the wire.
+- **R92 — X.509 DER subset parser (leaf-only).** Parse the six
   required fields, refuse the rest. Vector-tested against a
-  hand-authored cert.
-- **R92 — handshake state machine wire-up.** Fill in the
+  hand-authored cert. Consumes the R90 `tls_cert.nova` seam.
+- **R93 — handshake state machine wire-up.** Fill in the
   `tls_handshake.nova` message parsers/serializers. Drive
-  `tls_state.nova` through a real ClientHello/ServerHello round trip.
-  This is where the CSPRNG/RNG gap MUST be closed (server_random,
-  client_random, and the ephemeral x25519 scalar all need a real
-  cryptographic RNG). See the R89 §7.39 note in SHIP_AS_APP.md.
-- **R93 — record-layer AEAD wrap/unwrap + application-data path.**
+  `tls_state.nova` through a real ClientHello/ServerHello round
+  trip. Consumes R91 for RNG and R92 for the peer certificate.
+- **R94 — record-layer AEAD wrap/unwrap + application-data path.**
   `wire_connection_wrap` starts returning a REAL wrapped_conn whose
   read/write encrypt/decrypt through the record layer. Feature-flag
   ON only when a `tls_config` is present.
-- **R94 — trust-anchor registry + cert chain validation (len<=2).**
+- **R95 — trust-anchor registry + cert chain validation (len<=2).**
   Layer on the R55.1 trust-anchor pattern.
-- **R95 — session-ticket resumption (0-RTT deferred).** Bring back the
+- **R96 — session-ticket resumption (0-RTT deferred).** Bring back the
   session cache stub in `tls_config.nova`.
-- **R96 — alert delivery on live connections, close_notify semantics.**
-  Today R86 tests the alert enum; R96 tests alerts actually reaching
+- **R97 — alert delivery on live connections, close_notify semantics.**
+  Today R86 tests the alert enum; R97 tests alerts actually reaching
   the peer.
-- **R97..R9X — hardening.** Constant-time comparisons audit, cache-
+- **R98..R9X — hardening.** Constant-time comparisons audit, cache-
   timing audit on ChaCha20 (no S-boxes so light), fuzz the DER parser,
   fuzz the handshake state machine, review the alert mapping against
   RFC 8446 §6.

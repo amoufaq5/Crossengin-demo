@@ -2390,13 +2390,121 @@ and ed25519 verify landed, the last crypto primitive gap before the
 handshake state machine can be wired is X.509 parsing; R91 picks
 that up.
 
-## 12. What comes next (R89+)
+### 7.40 Ed25519 verify + TLS cert-auth seam (R90)
+
+**Honest status: verify-only Ed25519 is audited + widened; the TLS
+cert-auth seam (`tls_cert_verify_input_build`, `tls_cert_verify`,
+`tls_cert_verify_ed25519`) is callable and byte-exact against
+RFC 8446 §4.4.3 for both server and client roles; handshake still
+stubbed, X.509 not yet parsed (raw pubkey passed in), CSPRNG still
+missing, wire still cleartext.** R90 is the LAST TLS primitive
+round — every RFC-standardized primitive TLS 1.3 needs
+(ChaCha20-Poly1305 AEAD, HKDF-SHA-256, x25519 ECDH, Ed25519 verify,
+SHA-512) is now in tree. Remaining TLS work is orchestration
+(handshake state machine, CSPRNG, X.509 parsing) plus the
+wire-hook flip.
+
+Audit finding on the pre-existing `src/safety/ed25519.nova` (shipped
+in R54.2 for signed-skill install): the module already implements
+RFC 8032 correctly — SHA-512 built inline (128-byte block, 80
+rounds, 64-bit-as-`[lo32, hi32]` limb pairs so NOVA's arithmetic
+sign-extension can't corrupt the round-function shifts); the verify
+path decodes A and R via the standard sqrt-of-ratio trick and
+rejects any y >= p (non-canonical encoding, RFC 8032 §5.1.3);
+rejects any s >= L (RFC 8032 §5.1.7); uses a Montgomery-ladder
+scalar-mult for bit-independent outer control flow. The verify
+equation checked is `sB == R + kA` (strict, not the cofactor-8
+batched form) — both are RFC 8032-compliant; strict verification
+is the stricter of the two.
+
+What shipped in R90:
+
+- `src/safety/ed25519.nova` — **UNCHANGED.** Verify path audited
+  against RFC 8032 §5.1.7 (verify algorithm) and §5.1.3 (point
+  decoding). No changes to the primitive itself.
+- `tests/unit/test_ed25519.nova` — **EXTENDED.** 45 -> 61 passing
+  checks (+16 R90-added):
+  - RFC 8032 TEST 2 and TEST 3 bit-flip coverage on message.
+  - RFC 8032 TEST 3 bit-flip on R and pubkey.
+  - `s == L` exactly rejected (spliced signature with s bytes = L
+    in little-endian).
+  - `s == L + 1` rejected.
+  - Non-canonical A (all-0xFF pubkey → y = 2^255 - 1 > p) rejected.
+  - Non-canonical R (all-0xFF R → y = 2^255 - 1 > p) rejected.
+  - All-zero pubkey + arbitrary sig rejected.
+  - Verify determinism: repeated calls on the same triple return
+    the same 0/1 value (both accept and reject paths).
+  - (Pre-existing sandbox quirk: the `ed25519_sign latency > 0`
+    assertion has `nanotime()` returning 0 on this sandbox and
+    fails; unchanged from R89. Not blocking any correctness
+    coverage.)
+- `src/net/tls/tls_cert.nova` — **NEW.** TLS 1.3 CertificateVerify
+  seam (RFC 8446 §4.4.3):
+  - `tls_cert_verify_input_build(transcript_hash, transcript_hash_len,
+    is_server)` — assembles the 130-byte signed content: 64 octets
+    of 0x20, the 33-byte context string ("TLS 1.3, server
+    CertificateVerify" or "TLS 1.3, client CertificateVerify"),
+    one 0x00 separator, then the transcript hash. Deterministic;
+    no crypto.
+  - `tls_cert_verify(cert_pubkey, signed_data, signed_data_len,
+    signature)` — thin adapter over `ed25519_verify` with a
+    signed_data_len parameter for the R93 handshake plumbing.
+  - `tls_cert_verify_ed25519(cert_pubkey, transcript_hash,
+    transcript_hash_len, is_server, signature)` — one-call
+    convenience combining build + verify.
+  - Length constants: `TLS_CERT_PAD_LEN = 64`,
+    `TLS_CERT_CONTEXT_LEN = 33`, `TLS_CERT_SEP_LEN = 1`,
+    `TLS_CERT_PUBKEY_LEN = 32`, `TLS_CERT_SIGNATURE_LEN = 64`.
+  - Role sentinels: `TLS_CERT_ROLE_SERVER`, `TLS_CERT_ROLE_CLIENT`.
+- `tests/unit/test_tls_cert.nova` — **NEW.** 41 checks:
+  byte-layout coverage of the build output (0x20 padding, both
+  context strings verbatim, separator, transcript verbatim,
+  server-vs-client differ in the 6-byte role word only, partial
+  transcript_hash_len only consumes the leading N bytes), full
+  sign+verify round-trip using an RFC 8032 TEST 1 keypair over
+  the built input, tamper detection (bit-flipped sig, bit-flipped
+  pubkey, bit-flipped transcript, role mismatch), and shape
+  rejection (wrong pubkey length, wrong signature length, negative
+  or oversized signed_data_len).
+
+X.509 note: R90 does NOT parse X.509. The cert-pubkey is passed
+into the verify seam as raw 32 bytes with a docstring flagging
+this. The X.509 subset parser is the next TLS phase (R92 candidate
+in the current roadmap; see §12).
+
+Signing note: R90 is verify-only on the TLS path. `ed25519_sign`
+continues to work for the R54.2 signed-skill-install flow (which
+signs a SHA-256 digest with a stored 32-byte seed); the TLS server-
+signing wrapper is deferred until the handshake state machine
+exists to consume it (there is no plumbing to test it against
+until then).
+
+Test totals (R90 delta): test_ed25519 landed at 61 checks
+(+16); test_tls_cert at 41 checks (all new). Regression sweep
+across all R86..R89 TLS suites (`test_field25519`, `test_x25519`,
+`test_tls_keyshare`, `test_hkdf_sha256`, `test_tls_kdf`,
+`test_tls_record_aead`, `test_chacha20_poly1305`, `test_poly1305`,
+`test_sha256`, `test_tls_alerts`, `test_tls_state`,
+`test_tls_scaffold`, `test_tls13_keyschedule`) and the higher-level
+suites (`test_capability_wire`, `test_nl_rpc_verbs`) all green.
+The `test_dtls12` failure (72/450 checks red) is pre-existing —
+same red counts on `git stash` of the R90 patch — unrelated to
+this round.
+
+What R90 unlocks next: with every TLS crypto primitive now in
+tree, the remaining TLS work is pure orchestration. R91 candidate
+is a CSPRNG source (R92's handshake wire-up must have this; better
+to land the primitive first). R92 candidate is the X.509 subset
+parser. R93 candidate is the handshake state machine. R94
+candidate is the wire-hook flip.
+
+## 12. What comes next (R90+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
 candidates queue alongside so no round idles waiting on a runtime
 blocker.
 
-**TLS build-out (drives R90..R9X — see §7.36, §7.37, §7.38, §7.39):**
+**TLS build-out (drives R91..R9X — see §7.36, §7.37, §7.38, §7.39, §7.40):**
 
 - **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
   RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
@@ -2409,28 +2517,35 @@ blocker.
   vectors green). Key-share primitive + TLS keyshare glue landed;
   handshake still stubbed, wire still cleartext, RNG source still
   missing (see gap below).
-- **R90** — ed25519 verify (RFC 8032). Signature verification for
-  cert auth; reuses the R89 field25519 module (Ed25519 lives on
-  Edwards25519, over the same GF(2^255-19) prime). **Next TLS
-  phase.**
-- **R91** — X.509 DER subset parser (leaf-only).
-- **R92** — Handshake state-machine wire-up (fills in the R86
-  `tls_handshake.nova` stubs). **This is the round where the
-  CSPRNG/RNG gap MUST be closed** (server-random, client-random,
-  and ephemeral x25519 scalar all need a cryptographic RNG).
-- **R93** — Wire-hook flip: `wire_connection_wrap` starts returning a
-  real wrapped_conn under a `tls_config`. **First deployable
+- **R90** — ✅ Ed25519 verify + TLS 1.3 CertificateVerify seam (see
+  §7.40; RFC 8032 + RFC 8446 §4.4.3; all vectors green + 41
+  cert-seam checks). Audit + widen on the pre-existing
+  `ed25519.nova` (R54.2), new `tls_cert.nova` for the RFC 8446
+  §4.4.3 signed-content assembly + verify. **Every TLS crypto
+  primitive is now in tree.** Remaining TLS work is orchestration.
+- **R91** — CSPRNG source (RUNTIME work in NOVA or an explicit
+  stub-with-audit-warning path). Must land before the handshake
+  wire-up (R93) can produce a real server-random / client-random /
+  ephemeral x25519 scalar. **Next TLS phase.**
+- **R92** — X.509 DER subset parser (leaf-only, six required
+  fields, refuse the rest). Vector-tested against a hand-authored
+  cert. Consumes the R90 `tls_cert.nova` seam (raw-pubkey today
+  → parsed-cert then).
+- **R93** — Handshake state-machine wire-up (fills in the R86
+  `tls_handshake.nova` stubs). Consumes R91 for the RNG and R92
+  for the peer cert.
+- **R94** — Wire-hook flip: `wire_connection_wrap` starts returning
+  a real wrapped_conn under a `tls_config`. **First deployable
   in-process TLS round.**
-- **R94..R9X** — Trust-anchor chain validation, session tickets,
+- **R95..R9X** — Trust-anchor chain validation, session tickets,
   live-alert delivery, hardening / fuzz audits.
 
-**Runtime gaps that R92 must resolve** (called out here so R90/R91
-don't get blocked by them and so operators know the picture):
+**Runtime gap that R91 must resolve:**
 
 - **CSPRNG source.** No NOVA runtime primitive exposes
   `sys_getrandom` / `/dev/urandom` read today. R89's keyshare
   wrapper takes a caller-supplied scalar with a docstring flagging
-  this. R92 must land either a NOVA runtime addition or an
+  this. R91 must land either a NOVA runtime addition or an
   explicit stub-with-audit-warning path -- shipping the handshake
   without a real RNG would be a fatal correctness bug for the
   privacy story the TLS work exists to give the wire.
