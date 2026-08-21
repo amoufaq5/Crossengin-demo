@@ -1,0 +1,1298 @@
+// CrossEngin in-process TLS: connection state machine (R93).
+//
+// Wires the R87..R92 primitives (AEAD, KDF, ECDH, cert-verify, RNG,
+// X.509) plus the R93 message layer (tls_handshake.nova) and transcript
+// hash (tls_transcript.nova) into a working TLS 1.3 handshake per
+// RFC 8446 §4 -- driven in-memory only. Both peers are constructed in
+// the same process and exchange bytes through caller-supplied queues.
+// The wire hook (`wire_connection_wrap`) is UNTOUCHED; R94 flips it.
+//
+// Simplifications (documented in commit + docs):
+//   * No 0-RTT / early data.
+//   * No PSK / session resumption.
+//   * No HelloRetryRequest (client always picks x25519; server rejects
+//     a ClientHello that doesn't offer it, with a fatal
+//     handshake_failure alert).
+//   * No client certificate authentication.
+//   * No key update.
+//   * No post-handshake authentication.
+//   * One record per handshake message on the send path, EXCEPT the
+//     server's encrypted flight (EE || Cert || CertVerify || Finished)
+//     is a single AEAD record. The parser tolerates fragmentation on
+//     receive.
+//
+// State machine (per role):
+//
+//   CLIENT: INIT
+//             -- start -> emit CH cleartext, transcript.absorb(CH)
+//                                                              --> C_WAIT_SH
+//   CLIENT: C_WAIT_SH
+//             -- recv SH cleartext -> transcript.absorb(SH); ECDH; derive
+//                                     early + handshake + hs traffic
+//                                     secrets; switch rx to
+//                                     server_hs_traffic
+//                                                              --> C_WAIT_ENC
+//   CLIENT: C_WAIT_ENC
+//             -- recv encrypted flight (one record: inner_type=HANDSHAKE
+//                              containing EE || Cert || CertVerify ||
+//                              Finished) -> absorb each in turn; run
+//                              chain verify + certverify sig verify +
+//                              finished verify; then build our Finished
+//                              under client_hs_traffic; absorb it;
+//                              switch tx to client_hs_traffic first (to
+//                              seal), send; derive master +
+//                              application traffic secrets; switch tx
+//                              and rx to application traffic
+//                                                              --> APPLICATION
+//
+//   SERVER: INIT
+//             -- recv CH cleartext -> transcript.absorb(CH); build SH
+//                                     with own keyshare + random; emit
+//                                     SH cleartext; absorb; ECDH;
+//                                     derive early + handshake + hs
+//                                     traffic secrets; build encrypted
+//                                     flight (EE, Cert, CertVerify,
+//                                     server Finished) under
+//                                     server_hs_traffic; absorb each;
+//                                     after server Finished, derive
+//                                     master + app traffic secrets
+//                                     (server Finished is the last
+//                                     transcript input the client will
+//                                     see too, so derivation matches);
+//                                     switch rx to client_hs_traffic
+//                                                              --> S_WAIT_CFIN
+//   SERVER: S_WAIT_CFIN
+//             -- recv encrypted client Finished record -> verify
+//                                     verify_data; switch rx to
+//                                     client_app_traffic; switch tx to
+//                                     server_app_traffic (already
+//                                     derived); state -> APPLICATION
+//                                                              --> APPLICATION
+//
+//   APPLICATION: seal / open under (server|client)_ap_traffic. Recv of
+//   an alert record transitions to CLOSING; close_notify sent -> CLOSING;
+//   fatal alert sent or received -> CLOSED.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/safety/hkdf_sha256.nova       -- hkdf_extract
+//   src/safety/sha256.nova            -- hmac_sha256
+//   src/safety/x25519.nova            -- x25519_base, x25519
+//   src/safety/rng.nova               -- rng_read
+//   src/safety/ed25519.nova           -- ed25519_sign / verify
+//   src/net/tls/tls_kdf.nova          -- hkdf_expand_label / derive_key_iv
+//   src/net/tls/tls_keyshare.nova     -- generate / derive_handshake_secret
+//   src/net/tls/tls_record.nova       -- seal_buf / open_buf / seq
+//   src/net/tls/tls_handshake.nova    -- serialize / parse per type
+//   src/net/tls/tls_transcript.nova   -- absorb / get
+//   src/net/tls/tls_alerts.nova       -- alert enum
+//   src/net/tls/tls_cert.nova         -- verify_chain_and_signature,
+//                                        verify_input_build
+//   src/net/tls/x509.nova             -- x509_chain_verify, x509_parse
+
+import "../../safety/hkdf_sha256.nova"
+import "../../safety/sha256.nova"
+import "../../safety/x25519.nova"
+import "../../safety/rng.nova"
+import "../../safety/ed25519.nova"
+import "./tls_kdf.nova"
+import "./tls_keyshare.nova"
+import "./tls_record.nova"
+import "./tls_handshake.nova"
+import "./tls_transcript.nova"
+import "./tls_alerts.nova"
+import "./tls_cert.nova"
+import "./x509.nova"
+
+// ============================================================================
+//                          state constants
+// ============================================================================
+
+let TLS_ROLE_SERVER_SESSION = 0
+let TLS_ROLE_CLIENT_SESSION = 1
+
+let TSS_INIT           = 0
+let TSS_C_WAIT_SH      = 1
+let TSS_C_WAIT_ENC     = 2
+let TSS_S_WAIT_CFIN    = 3
+let TSS_APPLICATION    = 4
+let TSS_CLOSING        = 5
+let TSS_CLOSED         = 6
+
+fn tls_session_state_name(s) {
+    if s == TSS_INIT { return "INIT" }
+    if s == TSS_C_WAIT_SH { return "CLIENT_WAIT_SH" }
+    if s == TSS_C_WAIT_ENC { return "CLIENT_WAIT_ENCRYPTED_FLIGHT" }
+    if s == TSS_S_WAIT_CFIN { return "SERVER_WAIT_CLIENT_FINISHED" }
+    if s == TSS_APPLICATION { return "APPLICATION" }
+    if s == TSS_CLOSING { return "CLOSING" }
+    if s == TSS_CLOSED { return "CLOSED" }
+    return "UNKNOWN"
+}
+
+// ============================================================================
+//                          session struct layout
+// ============================================================================
+
+let SI_ROLE = 0
+let SI_STATE = 1
+let SI_NOW = 2
+let SI_RNG = 3
+let SI_OUR_PRIV = 4
+let SI_OUR_PUB = 5
+let SI_PEER_PUB = 6
+let SI_SHARED = 7
+let SI_OUR_RANDOM = 8
+let SI_PEER_RANDOM = 9
+let SI_TRANSCRIPT = 10
+let SI_EARLY_SECRET = 11
+let SI_HANDSHAKE_SECRET = 12
+let SI_MASTER_SECRET = 13
+let SI_C_HS_TRAFFIC = 14
+let SI_S_HS_TRAFFIC = 15
+let SI_C_AP_TRAFFIC = 16
+let SI_S_AP_TRAFFIC = 17
+let SI_TX_KEY = 18
+let SI_TX_IV = 19
+let SI_TX_SEQ = 20
+let SI_RX_KEY = 21
+let SI_RX_IV = 22
+let SI_RX_SEQ = 23
+let SI_TX_ENCRYPTED = 24
+let SI_RX_ENCRYPTED = 25
+let SI_INBOUND = 26
+let SI_OUTBOUND = 27
+let SI_CERT_DER = 28
+let SI_CERT_PRIV = 29
+let SI_CERT_PUB = 30
+let SI_ROOT_DER = 31
+let SI_LEAF_PARSED = 32
+let SI_HANDSHAKE_DONE = 33
+let SI_ALERT_SENT = 34
+let SI_ALERT_DESC = 35
+let SI_LAST_ERROR = 36
+let SI_STRUCT_LEN = 37
+
+// ============================================================================
+//                          byte helpers
+// ============================================================================
+
+// Convert a byte list to a freshly allocated raw buffer (bytes only,
+// NUL-terminated for safety).
+fn _ts_list_to_buf(byte_list) {
+    let n = len(byte_list)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, byte_list[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+// Convert a raw buffer + length to a byte list.
+fn _ts_buf_to_list(buf, n) {
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+// Append a byte list to another byte list.
+fn _ts_append_list(dst, src) {
+    let i = 0
+    let n = len(src)
+    while i < n {
+        push(dst, src[i])
+        i = i + 1
+    }
+    return n
+}
+
+// 32-byte zero byte list.
+fn _ts_zero32() {
+    let b = list_new()
+    let i = 0
+    while i < 32 {
+        push(b, 0)
+        i = i + 1
+    }
+    return b
+}
+
+// Zero-fill a raw buffer.
+fn _ts_zero_buf(buf, n) {
+    let i = 0
+    while i < n {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    return 1
+}
+
+// Byte-list ASCII label helper.
+fn _ts_label(s) {
+    let out = list_new()
+    let i = 0
+    let n = len(s)
+    while i < n {
+        push(out, char_at(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+// Return a 33-byte buffer containing SHA-256(""); useful as empty
+// context in Derive-Secret.
+fn _ts_empty_hash_buf() {
+    let empty = alloc(1)
+    store8(empty, 0)
+    return sha256_oneshot(empty, 0)
+}
+
+// ============================================================================
+//                          construction
+// ============================================================================
+
+fn _ts_alloc_session() {
+    let s = list_new()
+    let i = 0
+    while i < SI_STRUCT_LEN {
+        push(s, 0)
+        i = i + 1
+    }
+    return s
+}
+
+// Populate the common fields shared by client and server. `role` is
+// TLS_ROLE_CLIENT_SESSION or TLS_ROLE_SERVER_SESSION. Returns 1 on
+// success, 0 on RNG failure. Consumes 32 bytes from rng_ctx for the
+// x25519 private scalar and another 32 for our .random.
+fn _ts_init_common(sess, role, rng_ctx, now_unix) {
+    list_set(sess, SI_ROLE, role)
+    list_set(sess, SI_STATE, TSS_INIT)
+    list_set(sess, SI_NOW, now_unix)
+    list_set(sess, SI_RNG, rng_ctx)
+    // x25519 keypair.
+    let priv_buf = alloc(33)
+    let pub_buf = alloc(33)
+    _ts_zero_buf(priv_buf, 32)
+    _ts_zero_buf(pub_buf, 32)
+    let kok = tls_keyshare_generate(rng_ctx, priv_buf, pub_buf)
+    if kok != 1 { return 0 }
+    list_set(sess, SI_OUR_PRIV, _ts_buf_to_list(priv_buf, 32))
+    list_set(sess, SI_OUR_PUB, _ts_buf_to_list(pub_buf, 32))
+    list_set(sess, SI_PEER_PUB, _ts_zero32())
+    list_set(sess, SI_SHARED, _ts_zero32())
+    // Our .random (32 bytes from RNG).
+    let rand_buf = alloc(33)
+    _ts_zero_buf(rand_buf, 32)
+    let rok = tls_random_generate(rng_ctx, rand_buf, 32)
+    if rok != 1 { return 0 }
+    list_set(sess, SI_OUR_RANDOM, _ts_buf_to_list(rand_buf, 32))
+    list_set(sess, SI_PEER_RANDOM, _ts_zero32())
+    list_set(sess, SI_TRANSCRIPT, transcript_new())
+    list_set(sess, SI_EARLY_SECRET, _ts_zero32())
+    list_set(sess, SI_HANDSHAKE_SECRET, _ts_zero32())
+    list_set(sess, SI_MASTER_SECRET, _ts_zero32())
+    list_set(sess, SI_C_HS_TRAFFIC, _ts_zero32())
+    list_set(sess, SI_S_HS_TRAFFIC, _ts_zero32())
+    list_set(sess, SI_C_AP_TRAFFIC, _ts_zero32())
+    list_set(sess, SI_S_AP_TRAFFIC, _ts_zero32())
+    list_set(sess, SI_TX_KEY, 0)
+    list_set(sess, SI_TX_IV, 0)
+    list_set(sess, SI_TX_SEQ, tls_record_seq_new())
+    list_set(sess, SI_RX_KEY, 0)
+    list_set(sess, SI_RX_IV, 0)
+    list_set(sess, SI_RX_SEQ, tls_record_seq_new())
+    list_set(sess, SI_TX_ENCRYPTED, 0)
+    list_set(sess, SI_RX_ENCRYPTED, 0)
+    list_set(sess, SI_INBOUND, list_new())
+    list_set(sess, SI_OUTBOUND, list_new())
+    list_set(sess, SI_CERT_DER, list_new())
+    list_set(sess, SI_CERT_PRIV, list_new())
+    list_set(sess, SI_CERT_PUB, list_new())
+    list_set(sess, SI_ROOT_DER, list_new())
+    list_set(sess, SI_LEAF_PARSED, 0)
+    list_set(sess, SI_HANDSHAKE_DONE, 0)
+    list_set(sess, SI_ALERT_SENT, 0)
+    list_set(sess, SI_ALERT_DESC, 0)
+    list_set(sess, SI_LAST_ERROR, 0)
+    return 1
+}
+
+// Construct a client-role session.
+//   sess_out       -- caller-owned empty list; filled in on success.
+//   root_der       -- byte list of the trust-anchor cert DER.
+//   rng_ctx        -- from src/safety/rng.nova.
+//   now_unix       -- current time for cert validity check.
+// Returns 1 on success, 0 on RNG failure or bad root shape.
+fn session_new_client(sess_out, root_der, rng_ctx, now_unix) {
+    let s = _ts_alloc_session()
+    let ok = _ts_init_common(s, TLS_ROLE_CLIENT_SESSION, rng_ctx, now_unix)
+    if ok != 1 { return 0 }
+    list_set(s, SI_ROOT_DER, root_der)
+    // Copy fields into sess_out.
+    let i = 0
+    while i < SI_STRUCT_LEN {
+        push(sess_out, s[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// Construct a server-role session.
+//   sess_out    -- caller-owned empty list.
+//   cert_der    -- byte list of leaf cert DER (the one we present).
+//   cert_priv   -- byte list of the Ed25519 seed for that leaf.
+//   cert_pub    -- byte list of the Ed25519 public key matching seed.
+//   rng_ctx / now_unix as in session_new_client.
+// Returns 1 on success, 0 on RNG failure.
+fn session_new_server(sess_out, cert_der, cert_priv, cert_pub,
+                      rng_ctx, now_unix) {
+    let s = _ts_alloc_session()
+    let ok = _ts_init_common(s, TLS_ROLE_SERVER_SESSION, rng_ctx, now_unix)
+    if ok != 1 { return 0 }
+    list_set(s, SI_CERT_DER, cert_der)
+    list_set(s, SI_CERT_PRIV, cert_priv)
+    list_set(s, SI_CERT_PUB, cert_pub)
+    let i = 0
+    while i < SI_STRUCT_LEN {
+        push(sess_out, s[i])
+        i = i + 1
+    }
+    return 1
+}
+
+// ============================================================================
+//                          accessors + queue plumbing
+// ============================================================================
+
+fn session_state(sess)            { return sess[SI_STATE] }
+fn session_role(sess)             { return sess[SI_ROLE] }
+fn session_handshake_done(sess)   { return sess[SI_HANDSHAKE_DONE] }
+fn session_alert_sent(sess)       { return sess[SI_ALERT_SENT] }
+fn session_alert_desc(sess)       { return sess[SI_ALERT_DESC] }
+fn session_last_error(sess)       { return sess[SI_LAST_ERROR] }
+fn session_client_hs_traffic(sess) { return sess[SI_C_HS_TRAFFIC] }
+fn session_server_hs_traffic(sess) { return sess[SI_S_HS_TRAFFIC] }
+fn session_client_ap_traffic(sess) { return sess[SI_C_AP_TRAFFIC] }
+fn session_server_ap_traffic(sess) { return sess[SI_S_AP_TRAFFIC] }
+
+// Bytes ready for the caller to hand to the peer transport.
+fn session_want_send(sess) {
+    return len(sess[SI_OUTBOUND])
+}
+
+// Move up to out_max bytes from the outbound queue into caller's byte
+// list (populated by push). Returns the number of bytes moved.
+fn session_drain_send(sess, out_list, out_max) {
+    let ob = sess[SI_OUTBOUND]
+    let have = len(ob)
+    let take = have
+    if out_max < take { take = out_max }
+    let i = 0
+    while i < take {
+        push(out_list, ob[i])
+        i = i + 1
+    }
+    // Remove drained bytes: rebuild the outbound queue with the tail.
+    let tail = list_new()
+    let j = take
+    while j < have {
+        push(tail, ob[j])
+        j = j + 1
+    }
+    list_set(sess, SI_OUTBOUND, tail)
+    return take
+}
+
+// Append inbound bytes to the queue. Runs the state machine step until
+// no more progress possible. Returns 1 unless a fatal error killed
+// the session.
+fn session_recv(sess, in_bytes) {
+    let ib = sess[SI_INBOUND]
+    _ts_append_list(ib, in_bytes)
+    return _ts_run_steps(sess)
+}
+
+// ============================================================================
+//                          record layer wrappers (byte-list surface)
+// ============================================================================
+
+// Enqueue a cleartext handshake record wrapping `payload_bytes`.
+fn _ts_emit_cleartext_handshake_record(sess, payload_bytes) {
+    let ob = sess[SI_OUTBOUND]
+    let n = len(payload_bytes)
+    // Wire: 5-byte header (type=22, ver=0x0303, length=n BE) + payload.
+    push(ob, TLS_CONTENT_HANDSHAKE)
+    push(ob, TLS_RECORD_LEGACY_VERSION_HI)
+    push(ob, TLS_RECORD_LEGACY_VERSION_LO)
+    push(ob, int_and(int_shr(n, 8), 255))
+    push(ob, int_and(n, 255))
+    _ts_append_list(ob, payload_bytes)
+    return 1
+}
+
+// Encrypt `plaintext_bytes` under current TX key with inner_type,
+// enqueue the resulting record. Returns 1 on success, 0 if TX not set.
+fn _ts_emit_encrypted_record(sess, inner_type, plaintext_bytes) {
+    if sess[SI_TX_ENCRYPTED] != 1 { return 0 }
+    let key_list = sess[SI_TX_KEY]
+    let iv_list = sess[SI_TX_IV]
+    let key_buf = _ts_list_to_buf(key_list)
+    let iv_buf = _ts_list_to_buf(iv_list)
+    let pt_buf = _ts_list_to_buf(plaintext_bytes)
+    let pt_len = len(plaintext_bytes)
+    let seq = tls_record_seq_next(sess[SI_TX_SEQ])
+    let sealed = tls_record_seal_buf(key_buf, iv_buf, seq, inner_type,
+                                     pt_buf, pt_len)
+    let rec_buf = sealed[0]
+    let rec_len = sealed[1]
+    let rec_list = _ts_buf_to_list(rec_buf, rec_len)
+    _ts_append_list(sess[SI_OUTBOUND], rec_list)
+    return 1
+}
+
+// Emit a cleartext alert record (TLS 1.3 alert = 2 bytes wrapped in an
+// alert record). Fatal alerts should follow a call to session mark_fatal.
+fn _ts_emit_alert(sess, level, desc) {
+    let ob = sess[SI_OUTBOUND]
+    push(ob, TLS_CONTENT_ALERT)
+    push(ob, TLS_RECORD_LEGACY_VERSION_HI)
+    push(ob, TLS_RECORD_LEGACY_VERSION_LO)
+    push(ob, 0)
+    push(ob, 2)
+    push(ob, level)
+    push(ob, desc)
+    list_set(sess, SI_ALERT_SENT, 1)
+    list_set(sess, SI_ALERT_DESC, desc)
+    return 1
+}
+
+// Encrypted alert wrapper for post-handshake alerts (when rx/tx are
+// under traffic keys). R93 always sends alerts cleartext when the
+// handshake hasn't finished (the peer would fail to decrypt otherwise).
+fn _ts_send_fatal_alert(sess, desc) {
+    _ts_emit_alert(sess, TLS_ALERT_LEVEL_FATAL, desc)
+    list_set(sess, SI_LAST_ERROR, desc)
+    list_set(sess, SI_STATE, TSS_CLOSED)
+    return 0
+}
+
+// ============================================================================
+//                          key schedule
+// ============================================================================
+
+// early_secret = HKDF-Extract(salt=00..00, ikm=00..00) for no-PSK.
+fn _ts_derive_early_secret(sess) {
+    let salt = alloc(33)
+    _ts_zero_buf(salt, 32)
+    let ikm = alloc(33)
+    _ts_zero_buf(ikm, 32)
+    let es = hkdf_extract(salt, 32, ikm, 32)
+    list_set(sess, SI_EARLY_SECRET, _ts_buf_to_list(es, 32))
+    return 1
+}
+
+// handshake_secret = HKDF-Extract(salt=Derive-Secret(early_secret,
+//                                                     "derived", ""),
+//                                  ikm=shared_secret).
+fn _ts_derive_handshake_secret(sess) {
+    let es = sess[SI_EARLY_SECRET]
+    let es_buf = _ts_list_to_buf(es)
+    // Derive-Secret with empty transcript.
+    let empty = alloc(1); store8(empty, 0)
+    let lbl = _ts_label("derived")
+    let lbl_buf = _ts_list_to_buf(lbl)
+    let salt_pair = tls_kdf_derive_secret(es_buf, 32,
+                                           lbl_buf, len(lbl),
+                                           empty, 0)
+    let shared_buf = _ts_list_to_buf(sess[SI_SHARED])
+    let hs = hkdf_extract(salt_pair[0], salt_pair[1], shared_buf, 32)
+    list_set(sess, SI_HANDSHAKE_SECRET, _ts_buf_to_list(hs, 32))
+    return 1
+}
+
+// c_hs_traffic = Derive-Secret(handshake_secret, "c hs traffic",
+//                              transcript_thru_SH).
+// s_hs_traffic = Derive-Secret(handshake_secret, "s hs traffic",
+//                              transcript_thru_SH).
+fn _ts_derive_hs_traffic_secrets(sess) {
+    let hs_buf = _ts_list_to_buf(sess[SI_HANDSHAKE_SECRET])
+    let th = transcript_get(sess[SI_TRANSCRIPT])   // through SH already
+    let th_buf = _ts_list_to_buf(th)
+    let clbl = _ts_label("c hs traffic")
+    let slbl = _ts_label("s hs traffic")
+    let c_pair = tls_kdf_hkdf_expand_label(hs_buf, 32,
+                                            _ts_list_to_buf(clbl), len(clbl),
+                                            th_buf, 32, 32)
+    let s_pair = tls_kdf_hkdf_expand_label(hs_buf, 32,
+                                            _ts_list_to_buf(slbl), len(slbl),
+                                            th_buf, 32, 32)
+    list_set(sess, SI_C_HS_TRAFFIC, _ts_buf_to_list(c_pair[0], 32))
+    list_set(sess, SI_S_HS_TRAFFIC, _ts_buf_to_list(s_pair[0], 32))
+    return 1
+}
+
+// master_secret = HKDF-Extract(salt=Derive-Secret(handshake_secret,
+//                                                  "derived", ""),
+//                               ikm=00..00).
+fn _ts_derive_master_secret(sess) {
+    let hs_buf = _ts_list_to_buf(sess[SI_HANDSHAKE_SECRET])
+    let empty = alloc(1); store8(empty, 0)
+    let lbl = _ts_label("derived")
+    let salt_pair = tls_kdf_derive_secret(hs_buf, 32,
+                                           _ts_list_to_buf(lbl), len(lbl),
+                                           empty, 0)
+    let ikm = alloc(33)
+    _ts_zero_buf(ikm, 32)
+    let ms = hkdf_extract(salt_pair[0], salt_pair[1], ikm, 32)
+    list_set(sess, SI_MASTER_SECRET, _ts_buf_to_list(ms, 32))
+    return 1
+}
+
+// c_ap_traffic = Derive-Secret(master_secret, "c ap traffic",
+//                              transcript_thru_server_Finished).
+// s_ap_traffic = Derive-Secret(master_secret, "s ap traffic",
+//                              transcript_thru_server_Finished).
+// MUST be called after absorbing server Finished.
+fn _ts_derive_ap_traffic_secrets(sess) {
+    let ms_buf = _ts_list_to_buf(sess[SI_MASTER_SECRET])
+    let th = transcript_get(sess[SI_TRANSCRIPT])
+    let th_buf = _ts_list_to_buf(th)
+    let clbl = _ts_label("c ap traffic")
+    let slbl = _ts_label("s ap traffic")
+    let c_pair = tls_kdf_hkdf_expand_label(ms_buf, 32,
+                                            _ts_list_to_buf(clbl), len(clbl),
+                                            th_buf, 32, 32)
+    let s_pair = tls_kdf_hkdf_expand_label(ms_buf, 32,
+                                            _ts_list_to_buf(slbl), len(slbl),
+                                            th_buf, 32, 32)
+    list_set(sess, SI_C_AP_TRAFFIC, _ts_buf_to_list(c_pair[0], 32))
+    list_set(sess, SI_S_AP_TRAFFIC, _ts_buf_to_list(s_pair[0], 32))
+    return 1
+}
+
+// From a traffic secret, derive (key, iv) via HKDF-Expand-Label.
+// Returns a two-element list: [key_bytes_list, iv_bytes_list].
+fn _ts_key_iv_from_secret(secret_list) {
+    let secret_buf = _ts_list_to_buf(secret_list)
+    let pair = tls_kdf_derive_key_iv(secret_buf, 32)
+    let key_list = _ts_buf_to_list(pair[0], 32)
+    let iv_list = _ts_buf_to_list(pair[1], 12)
+    let out = list_new()
+    push(out, key_list)
+    push(out, iv_list)
+    return out
+}
+
+// Point TX at the given traffic secret. Resets TX sequence.
+fn _ts_set_tx_from_secret(sess, secret_list) {
+    let ki = _ts_key_iv_from_secret(secret_list)
+    list_set(sess, SI_TX_KEY, ki[0])
+    list_set(sess, SI_TX_IV, ki[1])
+    tls_record_seq_reset(sess[SI_TX_SEQ])
+    list_set(sess, SI_TX_ENCRYPTED, 1)
+    return 1
+}
+
+fn _ts_set_rx_from_secret(sess, secret_list) {
+    let ki = _ts_key_iv_from_secret(secret_list)
+    list_set(sess, SI_RX_KEY, ki[0])
+    list_set(sess, SI_RX_IV, ki[1])
+    tls_record_seq_reset(sess[SI_RX_SEQ])
+    list_set(sess, SI_RX_ENCRYPTED, 1)
+    return 1
+}
+
+// finished_key = HKDF-Expand-Label(base_key, "finished", "", 32).
+fn _ts_finished_key(base_secret_list) {
+    let base_buf = _ts_list_to_buf(base_secret_list)
+    let lbl = _ts_label("finished")
+    let pair = tls_kdf_hkdf_expand_label(base_buf, 32,
+                                          _ts_list_to_buf(lbl), len(lbl),
+                                          0, 0, 32)
+    return _ts_buf_to_list(pair[0], 32)
+}
+
+// verify_data = HMAC(finished_key, transcript_hash).
+fn _ts_verify_data(base_secret_list, transcript_hash_list) {
+    let fk = _ts_finished_key(base_secret_list)
+    let fk_buf = _ts_list_to_buf(fk)
+    let th_buf = _ts_list_to_buf(transcript_hash_list)
+    let mac = hmac_sha256(fk_buf, 32, th_buf, len(transcript_hash_list))
+    return _ts_buf_to_list(mac, 32)
+}
+
+// Compare two 32-byte byte lists (constant-time-ish; TLS 1.3 verify_data
+// mismatch is fatal regardless of timing side channels here).
+fn _ts_ct_eq32(a, b) {
+    if len(a) != 32 { return 0 }
+    if len(b) != 32 { return 0 }
+    let acc = 0
+    let i = 0
+    while i < 32 {
+        acc = int_or(acc, int_xor(a[i], b[i]))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+// ============================================================================
+//                          public: start client
+// ============================================================================
+//
+// Builds the ClientHello, absorbs it into the transcript, and enqueues
+// the record. Returns 1 on success. Legal only from INIT client-side.
+
+fn session_start_client(sess) {
+    if sess[SI_ROLE] != TLS_ROLE_CLIENT_SESSION { return 0 }
+    if sess[SI_STATE] != TSS_INIT { return 0 }
+    let ch = hs_client_hello_new()
+    hs_client_hello_set_random(ch, sess[SI_OUR_RANDOM])
+    hs_client_hello_set_keyshare(ch, sess[SI_OUR_PUB])
+    let msg = hs_client_hello_serialize(ch)
+    transcript_absorb(sess[SI_TRANSCRIPT], msg, len(msg))
+    _ts_emit_cleartext_handshake_record(sess, msg)
+    list_set(sess, SI_STATE, TSS_C_WAIT_SH)
+    return 1
+}
+
+// ============================================================================
+//                          inbound record extraction
+// ============================================================================
+//
+// Try to peel one record off the inbound queue. Returns:
+//   [ok, content_type, record_body_list, consumed_bytes]
+// ok:
+//   1 = a full record was extracted
+//   0 = need more bytes (nothing consumed)
+//  -1 = protocol error (bad header, oversize)
+
+fn _ts_try_read_record(sess) {
+    let ib = sess[SI_INBOUND]
+    let n = len(ib)
+    let out = list_new()
+    if n < TLS_RECORD_HEADER_LEN {
+        push(out, 0); push(out, 0); push(out, list_new()); push(out, 0)
+        return out
+    }
+    let ct = ib[0]
+    let vh = ib[1]
+    let vl = ib[2]
+    if tls_record_content_type_known(ct) == 0 {
+        push(out, 0 - 1); push(out, 0); push(out, list_new()); push(out, 0)
+        return out
+    }
+    let ln = ib[3] * 256 + ib[4]
+    if ln > TLS_RECORD_MAX_CIPHERTEXT_LEN {
+        push(out, 0 - 1); push(out, 0); push(out, list_new()); push(out, 0)
+        return out
+    }
+    let total = TLS_RECORD_HEADER_LEN + ln
+    if n < total {
+        push(out, 0); push(out, 0); push(out, list_new()); push(out, 0)
+        return out
+    }
+    // We need to hand a raw buffer to the AEAD open path if encrypted;
+    // meanwhile the plaintext handshake path just takes the fragment as
+    // a byte list.
+    let frag = list_new()
+    let i = 0
+    while i < ln {
+        push(frag, ib[TLS_RECORD_HEADER_LEN + i])
+        i = i + 1
+    }
+    // Consume from inbound.
+    let tail = list_new()
+    let j = total
+    while j < n {
+        push(tail, ib[j])
+        j = j + 1
+    }
+    list_set(sess, SI_INBOUND, tail)
+    push(out, 1); push(out, ct); push(out, frag); push(out, total)
+    return out
+}
+
+// If content_type is HANDSHAKE and rx is not encrypted, the fragment
+// is already the handshake body; return it as-is. If content_type is
+// APPLICATION_DATA and rx is encrypted, AEAD-open and return
+// [plaintext_list, inner_type]. Returns [ok, plaintext_list, inner_type].
+fn _ts_extract_plaintext(sess, ct, fragment_list) {
+    let out = list_new()
+    if sess[SI_RX_ENCRYPTED] == 0 {
+        if ct == TLS_CONTENT_HANDSHAKE {
+            push(out, 1); push(out, fragment_list); push(out, TLS_CONTENT_HANDSHAKE)
+            return out
+        }
+        if ct == TLS_CONTENT_ALERT {
+            push(out, 1); push(out, fragment_list); push(out, TLS_CONTENT_ALERT)
+            return out
+        }
+        push(out, 0); push(out, list_new()); push(out, 0)
+        return out
+    }
+    // Encrypted path: reconstruct the full record on the wire (header +
+    // fragment) and feed to tls_record_open_buf.
+    let ln = len(fragment_list)
+    let rec_buf = alloc(TLS_RECORD_HEADER_LEN + ln + 1)
+    store8(rec_buf + 0, TLS_CONTENT_APPLICATION_DATA)
+    store8(rec_buf + 1, TLS_RECORD_LEGACY_VERSION_HI)
+    store8(rec_buf + 2, TLS_RECORD_LEGACY_VERSION_LO)
+    store8(rec_buf + 3, int_and(int_shr(ln, 8), 255))
+    store8(rec_buf + 4, int_and(ln, 255))
+    let i = 0
+    while i < ln {
+        store8(rec_buf + TLS_RECORD_HEADER_LEN + i, fragment_list[i])
+        i = i + 1
+    }
+    store8(rec_buf + TLS_RECORD_HEADER_LEN + ln, 0)
+    let key_buf = _ts_list_to_buf(sess[SI_RX_KEY])
+    let iv_buf = _ts_list_to_buf(sess[SI_RX_IV])
+    let seq = tls_record_seq_next(sess[SI_RX_SEQ])
+    let opened = tls_record_open_buf(key_buf, iv_buf, seq,
+                                     rec_buf, TLS_RECORD_HEADER_LEN + ln)
+    if opened[3] == 0 {
+        push(out, 0); push(out, list_new()); push(out, 0)
+        return out
+    }
+    let pt_list = _ts_buf_to_list(opened[0], opened[1])
+    push(out, 1); push(out, pt_list); push(out, opened[2])
+    return out
+}
+
+// ============================================================================
+//                          state machine driver
+// ============================================================================
+
+// Run the state machine as far as inbound bytes allow. Returns 1 on
+// success (possibly with more bytes still needed) or 0 on fatal error.
+fn _ts_run_steps(sess) {
+    let progressed = 1
+    while progressed == 1 {
+        progressed = 0
+        let st = sess[SI_STATE]
+        if st == TSS_CLOSED { return 0 }
+        if st == TSS_INIT {
+            if sess[SI_ROLE] == TLS_ROLE_SERVER_SESSION {
+                let did = _ts_server_step_init(sess)
+                if did == 0 - 1 { return 0 }
+                if did == 1 { progressed = 1 }
+            } else {
+                // Client sits in INIT until session_start_client emits CH.
+                return 1
+            }
+        } else {
+        if st == TSS_C_WAIT_SH {
+            let did = _ts_client_step_wait_sh(sess)
+            if did == 0 - 1 { return 0 }
+            if did == 1 { progressed = 1 }
+        } else {
+        if st == TSS_C_WAIT_ENC {
+            let did = _ts_client_step_wait_enc(sess)
+            if did == 0 - 1 { return 0 }
+            if did == 1 { progressed = 1 }
+        } else {
+        if st == TSS_S_WAIT_CFIN {
+            let did = _ts_server_step_wait_cfin(sess)
+            if did == 0 - 1 { return 0 }
+            if did == 1 { progressed = 1 }
+        } else {
+        if st == TSS_APPLICATION {
+            // No auto step; app data is caller-driven.
+            return 1
+        } else {
+        if st == TSS_CLOSING {
+            return 1
+        }
+        }
+        }
+        }
+        }
+        }
+    }
+    return 1
+}
+
+// ---- server: INIT -> S_WAIT_CFIN ----------------------------------------
+//
+// Waits for a full ClientHello record. On success:
+//   * absorb CH into transcript
+//   * ECDH shared secret
+//   * emit ServerHello cleartext, absorb SH
+//   * derive early_secret, handshake_secret, hs traffic secrets
+//   * switch TX to server_hs_traffic
+//   * build EE + Cert + CertVerify + server Finished concatenated
+//     plaintext; absorb each; send as one AEAD record
+//   * derive master + app traffic secrets (transcript_thru_server_Finished
+//     is the input, which the client will also compute after absorbing
+//     server Finished)
+//   * switch RX to client_hs_traffic
+//   * state -> S_WAIT_CFIN
+
+fn _ts_server_step_init(sess) {
+    let rr = _ts_try_read_record(sess)
+    if rr[0] == 0 { return 0 }
+    if rr[0] == 0 - 1 { return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR) }
+    let ct = rr[1]
+    let frag = rr[2]
+    if ct != TLS_CONTENT_HANDSHAKE {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    // ClientHello: header is the first 4 bytes of `frag`.
+    let ht = list_new(); push(ht, 0)
+    let hl = list_new(); push(hl, 0)
+    if hs_parse_header(frag, 0, ht, hl) == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    if ht[0] != TLS_HS_CLIENT_HELLO {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    let ch = hs_client_hello_parse(frag)
+    if ch == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_HANDSHAKE_FAILURE)
+    }
+    // Save peer material.
+    list_set(sess, SI_PEER_PUB, hs_client_hello_keyshare(ch))
+    list_set(sess, SI_PEER_RANDOM, hs_client_hello_random(ch))
+    // Absorb CH.
+    transcript_absorb(sess[SI_TRANSCRIPT], frag, len(frag))
+    // Build + emit ServerHello cleartext, absorb it.
+    let sh = hs_server_hello_new()
+    hs_server_hello_set_random(sh, sess[SI_OUR_RANDOM])
+    hs_server_hello_set_keyshare(sh, sess[SI_OUR_PUB])
+    let sh_msg = hs_server_hello_serialize(sh)
+    transcript_absorb(sess[SI_TRANSCRIPT], sh_msg, len(sh_msg))
+    _ts_emit_cleartext_handshake_record(sess, sh_msg)
+    // ECDH.
+    let shared_buf = alloc(33)
+    _ts_zero_buf(shared_buf, 32)
+    let priv_buf = _ts_list_to_buf(sess[SI_OUR_PRIV])
+    let peer_buf = _ts_list_to_buf(sess[SI_PEER_PUB])
+    let dh_ok = x25519(shared_buf, priv_buf, peer_buf)
+    if dh_ok != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_HANDSHAKE_FAILURE)
+    }
+    list_set(sess, SI_SHARED, _ts_buf_to_list(shared_buf, 32))
+    _ts_derive_early_secret(sess)
+    _ts_derive_handshake_secret(sess)
+    _ts_derive_hs_traffic_secrets(sess)
+    // Switch TX to server_hs_traffic (for the encrypted flight).
+    _ts_set_tx_from_secret(sess, sess[SI_S_HS_TRAFFIC])
+    // Build EE.
+    let ee_msg = hs_encrypted_extensions_serialize()
+    transcript_absorb(sess[SI_TRANSCRIPT], ee_msg, len(ee_msg))
+    // Build Certificate.
+    let cert_msg = hs_certificate_serialize(sess[SI_CERT_DER])
+    transcript_absorb(sess[SI_TRANSCRIPT], cert_msg, len(cert_msg))
+    // CertVerify: sign transcript-thru-Cert as SERVER role.
+    let th_after_cert = transcript_get(sess[SI_TRANSCRIPT])
+    let cv_input = tls_cert_verify_input_build(th_after_cert, 32,
+                                                TLS_CERT_ROLE_SERVER)
+    let cv_sig = ed25519_sign(cv_input, sess[SI_CERT_PRIV], sess[SI_CERT_PUB])
+    let cv_msg = hs_certificate_verify_serialize(cv_sig)
+    transcript_absorb(sess[SI_TRANSCRIPT], cv_msg, len(cv_msg))
+    // Server Finished: HMAC(finished_key(s_hs_traffic), transcript_thru_CV).
+    let th_after_cv = transcript_get(sess[SI_TRANSCRIPT])
+    let sfin_vd = _ts_verify_data(sess[SI_S_HS_TRAFFIC], th_after_cv)
+    let sfin_msg = hs_finished_serialize(sfin_vd)
+    transcript_absorb(sess[SI_TRANSCRIPT], sfin_msg, len(sfin_msg))
+    // Concatenate all four handshake messages and seal as one record.
+    let flight = list_new()
+    _ts_append_list(flight, ee_msg)
+    _ts_append_list(flight, cert_msg)
+    _ts_append_list(flight, cv_msg)
+    _ts_append_list(flight, sfin_msg)
+    _ts_emit_encrypted_record(sess, TLS_CONTENT_HANDSHAKE, flight)
+    // Post server Finished, derive master + app traffic secrets. The
+    // client will compute these too after absorbing server Finished.
+    _ts_derive_master_secret(sess)
+    _ts_derive_ap_traffic_secrets(sess)
+    // RX switches to client_hs_traffic to open the client Finished
+    // record that will arrive next. TX stays on server_hs_traffic until
+    // we've received client Finished (post-client-Finished we switch TX
+    // to server_ap_traffic).
+    _ts_set_rx_from_secret(sess, sess[SI_C_HS_TRAFFIC])
+    list_set(sess, SI_STATE, TSS_S_WAIT_CFIN)
+    return 1
+}
+
+// ---- server: S_WAIT_CFIN -> APPLICATION ---------------------------------
+
+fn _ts_server_step_wait_cfin(sess) {
+    let rr = _ts_try_read_record(sess)
+    if rr[0] == 0 { return 0 }
+    if rr[0] == 0 - 1 { return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR) }
+    let ct = rr[1]
+    let frag = rr[2]
+    if ct != TLS_CONTENT_APPLICATION_DATA {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    // Snapshot transcript BEFORE absorbing client Finished -- verify_data
+    // is over this hash.
+    let expected_th = transcript_get(sess[SI_TRANSCRIPT])
+    let pt = _ts_extract_plaintext(sess, ct, frag)
+    if pt[0] != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_BAD_RECORD_MAC)
+    }
+    let pt_bytes = pt[1]
+    let inner = pt[2]
+    if inner != TLS_CONTENT_HANDSHAKE {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    // Should be one Finished message.
+    let ht = list_new(); push(ht, 0)
+    let hl = list_new(); push(hl, 0)
+    if hs_parse_header(pt_bytes, 0, ht, hl) == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    if ht[0] != TLS_HS_FINISHED {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    let body = list_new()
+    let i = 0
+    while i < hl[0] {
+        push(body, pt_bytes[TLS_HS_HEADER_LEN + i])
+        i = i + 1
+    }
+    let recv_vd = hs_finished_parse_body(body)
+    if recv_vd == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    let expected_vd = _ts_verify_data(sess[SI_C_HS_TRAFFIC], expected_th)
+    if _ts_ct_eq32(recv_vd, expected_vd) != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECRYPT_ERROR)
+    }
+    // Absorb client Finished (in case we ever need transcript beyond
+    // this -- for R93 we don't, but consistency is cheap).
+    let cfin_msg = list_new()
+    _ts_append_list(cfin_msg, pt_bytes)
+    transcript_absorb(sess[SI_TRANSCRIPT], cfin_msg, len(cfin_msg))
+    // Switch TX to server_ap_traffic, RX to client_ap_traffic.
+    _ts_set_tx_from_secret(sess, sess[SI_S_AP_TRAFFIC])
+    _ts_set_rx_from_secret(sess, sess[SI_C_AP_TRAFFIC])
+    list_set(sess, SI_STATE, TSS_APPLICATION)
+    list_set(sess, SI_HANDSHAKE_DONE, 1)
+    return 1
+}
+
+// ---- client: C_WAIT_SH -> C_WAIT_ENC ------------------------------------
+
+fn _ts_client_step_wait_sh(sess) {
+    let rr = _ts_try_read_record(sess)
+    if rr[0] == 0 { return 0 }
+    if rr[0] == 0 - 1 { return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR) }
+    let ct = rr[1]
+    let frag = rr[2]
+    if ct != TLS_CONTENT_HANDSHAKE {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    let ht = list_new(); push(ht, 0)
+    let hl = list_new(); push(hl, 0)
+    if hs_parse_header(frag, 0, ht, hl) == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    if ht[0] != TLS_HS_SERVER_HELLO {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    let sh = hs_server_hello_parse(frag)
+    if sh == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_HANDSHAKE_FAILURE)
+    }
+    list_set(sess, SI_PEER_PUB, hs_server_hello_keyshare(sh))
+    list_set(sess, SI_PEER_RANDOM, hs_server_hello_random(sh))
+    // Absorb SH.
+    transcript_absorb(sess[SI_TRANSCRIPT], frag, len(frag))
+    // ECDH.
+    let shared_buf = alloc(33)
+    _ts_zero_buf(shared_buf, 32)
+    let priv_buf = _ts_list_to_buf(sess[SI_OUR_PRIV])
+    let peer_buf = _ts_list_to_buf(sess[SI_PEER_PUB])
+    let dh_ok = x25519(shared_buf, priv_buf, peer_buf)
+    if dh_ok != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_HANDSHAKE_FAILURE)
+    }
+    list_set(sess, SI_SHARED, _ts_buf_to_list(shared_buf, 32))
+    _ts_derive_early_secret(sess)
+    _ts_derive_handshake_secret(sess)
+    _ts_derive_hs_traffic_secrets(sess)
+    // RX switches to server_hs_traffic to decrypt the incoming flight.
+    _ts_set_rx_from_secret(sess, sess[SI_S_HS_TRAFFIC])
+    list_set(sess, SI_STATE, TSS_C_WAIT_ENC)
+    return 1
+}
+
+// ---- client: C_WAIT_ENC -> APPLICATION ----------------------------------
+//
+// The server sends EE || Cert || CertVerify || Finished as one AEAD
+// record. We open it once, then iterate the concatenated handshake
+// messages, absorbing each after the appropriate verification snapshot.
+
+fn _ts_client_step_wait_enc(sess) {
+    let rr = _ts_try_read_record(sess)
+    if rr[0] == 0 { return 0 }
+    if rr[0] == 0 - 1 { return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR) }
+    let ct = rr[1]
+    let frag = rr[2]
+    if ct != TLS_CONTENT_APPLICATION_DATA {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    let pt = _ts_extract_plaintext(sess, ct, frag)
+    if pt[0] != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_BAD_RECORD_MAC)
+    }
+    let pt_bytes = pt[1]
+    if pt[2] != TLS_CONTENT_HANDSHAKE {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_UNEXPECTED_MESSAGE)
+    }
+    let off = 0
+    let n = len(pt_bytes)
+    // ---- EE.
+    let ee_res = _ts_slice_next_hs(pt_bytes, off, TLS_HS_ENCRYPTED_EXTENSIONS)
+    if ee_res[0] == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    let ee_msg = ee_res[1]
+    off = ee_res[2]
+    let ee_body_len = len(ee_msg) - TLS_HS_HEADER_LEN
+    let ee_body = list_new()
+    let i = 0
+    while i < ee_body_len { push(ee_body, ee_msg[TLS_HS_HEADER_LEN + i]); i = i + 1 }
+    if hs_encrypted_extensions_parse_body(ee_body) != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    transcript_absorb(sess[SI_TRANSCRIPT], ee_msg, len(ee_msg))
+    // ---- Certificate.
+    let cert_res = _ts_slice_next_hs(pt_bytes, off, TLS_HS_CERTIFICATE)
+    if cert_res[0] == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    let cert_msg = cert_res[1]
+    off = cert_res[2]
+    let cert_body_len = len(cert_msg) - TLS_HS_HEADER_LEN
+    let cert_body = list_new()
+    let j = 0
+    while j < cert_body_len {
+        push(cert_body, cert_msg[TLS_HS_HEADER_LEN + j])
+        j = j + 1
+    }
+    let leaf_der = hs_certificate_parse_body(cert_body)
+    if leaf_der == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    // Chain verify against root NOW so bad_certificate / expired fires
+    // before we absorb CertVerify.
+    let leaf_parsed = x509_parsed_new()
+    let root_parsed = x509_parsed_new()
+    let chain_ok = x509_chain_verify(leaf_der, len(leaf_der),
+                                      sess[SI_ROOT_DER], len(sess[SI_ROOT_DER]),
+                                      sess[SI_NOW], leaf_parsed, root_parsed)
+    if chain_ok == 0 {
+        // Distinguish "expired" vs "bad cert" cheaply: reparse leaf and
+        // test validity window.
+        let re_leaf = x509_parsed_new()
+        if x509_parse(leaf_der, len(leaf_der), re_leaf) == 1 {
+            if x509_check_validity(re_leaf, sess[SI_NOW]) == 0 {
+                return _ts_send_fatal_alert(sess, TLS_ALERT_CERTIFICATE_EXPIRED)
+            }
+        }
+        return _ts_send_fatal_alert(sess, TLS_ALERT_BAD_CERTIFICATE)
+    }
+    list_set(sess, SI_CERT_DER, leaf_der)
+    list_set(sess, SI_LEAF_PARSED, leaf_parsed)
+    transcript_absorb(sess[SI_TRANSCRIPT], cert_msg, len(cert_msg))
+    // ---- CertificateVerify. Snapshot BEFORE absorbing.
+    let th_thru_cert = transcript_get(sess[SI_TRANSCRIPT])
+    let cv_res = _ts_slice_next_hs(pt_bytes, off, TLS_HS_CERTIFICATE_VERIFY)
+    if cv_res[0] == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    let cv_msg = cv_res[1]
+    off = cv_res[2]
+    let cv_body_len = len(cv_msg) - TLS_HS_HEADER_LEN
+    let cv_body = list_new()
+    let k = 0
+    while k < cv_body_len {
+        push(cv_body, cv_msg[TLS_HS_HEADER_LEN + k])
+        k = k + 1
+    }
+    let cv_sig = hs_certificate_verify_parse_body(cv_body)
+    if cv_sig == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    // Extract leaf pubkey (32 bytes at parsed.spki_pub_off in leaf_der).
+    let pk_off = leaf_parsed[X509_IDX_SPKI_PUB_OFF]
+    let leaf_pk = list_new()
+    let pi = 0
+    while pi < 32 {
+        push(leaf_pk, leaf_der[pk_off + pi])
+        pi = pi + 1
+    }
+    let cv_ok = tls_cert_verify_ed25519(leaf_pk, th_thru_cert, 32,
+                                         TLS_CERT_ROLE_SERVER, cv_sig)
+    if cv_ok == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECRYPT_ERROR)
+    }
+    transcript_absorb(sess[SI_TRANSCRIPT], cv_msg, len(cv_msg))
+    // ---- Server Finished. Snapshot BEFORE absorbing (verify_data is
+    // over transcript_thru_CertVerify).
+    let th_thru_cv = transcript_get(sess[SI_TRANSCRIPT])
+    let sfin_res = _ts_slice_next_hs(pt_bytes, off, TLS_HS_FINISHED)
+    if sfin_res[0] == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    let sfin_msg = sfin_res[1]
+    off = sfin_res[2]
+    let sfin_body_len = len(sfin_msg) - TLS_HS_HEADER_LEN
+    let sfin_body = list_new()
+    let l = 0
+    while l < sfin_body_len {
+        push(sfin_body, sfin_msg[TLS_HS_HEADER_LEN + l])
+        l = l + 1
+    }
+    let sfin_vd = hs_finished_parse_body(sfin_body)
+    if sfin_vd == 0 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    let expected_sfin_vd = _ts_verify_data(sess[SI_S_HS_TRAFFIC], th_thru_cv)
+    if _ts_ct_eq32(sfin_vd, expected_sfin_vd) != 1 {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECRYPT_ERROR)
+    }
+    transcript_absorb(sess[SI_TRANSCRIPT], sfin_msg, len(sfin_msg))
+    // Derive master + application traffic secrets NOW (transcript-through-
+    // server-Finished). Must precede the "compute client Finished then
+    // switch keys" step so both endpoints derive identical secrets.
+    _ts_derive_master_secret(sess)
+    _ts_derive_ap_traffic_secrets(sess)
+    // Build client Finished: HMAC over transcript-thru-server-Finished
+    // with finished_key(client_hs_traffic).
+    let th_after_sfin = transcript_get(sess[SI_TRANSCRIPT])
+    let cfin_vd = _ts_verify_data(sess[SI_C_HS_TRAFFIC], th_after_sfin)
+    let cfin_msg = hs_finished_serialize(cfin_vd)
+    // TX must be client_hs_traffic for THIS record; switch, seal, switch
+    // to app.
+    _ts_set_tx_from_secret(sess, sess[SI_C_HS_TRAFFIC])
+    _ts_emit_encrypted_record(sess, TLS_CONTENT_HANDSHAKE, cfin_msg)
+    // (Optional) absorb client Finished for symmetry.
+    transcript_absorb(sess[SI_TRANSCRIPT], cfin_msg, len(cfin_msg))
+    // Post-handshake keys: TX = client_ap_traffic, RX = server_ap_traffic.
+    _ts_set_tx_from_secret(sess, sess[SI_C_AP_TRAFFIC])
+    _ts_set_rx_from_secret(sess, sess[SI_S_AP_TRAFFIC])
+    if off != n {
+        return _ts_send_fatal_alert(sess, TLS_ALERT_DECODE_ERROR)
+    }
+    list_set(sess, SI_STATE, TSS_APPLICATION)
+    list_set(sess, SI_HANDSHAKE_DONE, 1)
+    return 1
+}
+
+// Slice the next handshake message from `pt_bytes` starting at `off`,
+// asserting its type equals `expected_type`. Returns [ok, msg_bytes,
+// next_off] where msg_bytes includes the 4-byte header. ok = 0 on any
+// wire error.
+fn _ts_slice_next_hs(pt_bytes, off, expected_type) {
+    let out = list_new()
+    let n = len(pt_bytes)
+    if off + TLS_HS_HEADER_LEN > n {
+        push(out, 0); push(out, list_new()); push(out, off)
+        return out
+    }
+    let t = pt_bytes[off]
+    let body_len = pt_bytes[off + 1] * 65536 + pt_bytes[off + 2] * 256 + pt_bytes[off + 3]
+    let total = TLS_HS_HEADER_LEN + body_len
+    if off + total > n {
+        push(out, 0); push(out, list_new()); push(out, off)
+        return out
+    }
+    if t != expected_type {
+        push(out, 0); push(out, list_new()); push(out, off)
+        return out
+    }
+    let msg = list_new()
+    let i = 0
+    while i < total {
+        push(msg, pt_bytes[off + i])
+        i = i + 1
+    }
+    push(out, 1); push(out, msg); push(out, off + total)
+    return out
+}
+
+// ============================================================================
+//                          application-data API
+// ============================================================================
+
+// Encrypt plaintext byte list into an application_data record; enqueue
+// on outbound. Returns 1 on success.
+fn session_encrypt_app(sess, plaintext_bytes) {
+    if sess[SI_STATE] != TSS_APPLICATION { return 0 }
+    return _ts_emit_encrypted_record(sess, TLS_CONTENT_APPLICATION_DATA,
+                                     plaintext_bytes)
+}
+
+// Decrypt one full application_data record from inbound. Returns the
+// plaintext byte list on success, empty list on failure.
+fn session_decrypt_app(sess) {
+    if sess[SI_STATE] != TSS_APPLICATION { return list_new() }
+    let rr = _ts_try_read_record(sess)
+    if rr[0] != 1 { return list_new() }
+    let ct = rr[1]
+    let frag = rr[2]
+    if ct == TLS_CONTENT_ALERT {
+        // Cleartext alert unlikely at this point; treat as close.
+        list_set(sess, SI_STATE, TSS_CLOSING)
+        return list_new()
+    }
+    if ct != TLS_CONTENT_APPLICATION_DATA { return list_new() }
+    let pt = _ts_extract_plaintext(sess, ct, frag)
+    if pt[0] != 1 { return list_new() }
+    let inner = pt[2]
+    if inner == TLS_CONTENT_ALERT {
+        // Encrypted alert; peer's close_notify or fatal.
+        let a_body = pt[1]
+        if len(a_body) >= 2 {
+            let desc = a_body[1]
+            if desc == TLS_ALERT_CLOSE_NOTIFY {
+                list_set(sess, SI_STATE, TSS_CLOSING)
+                return list_new()
+            }
+        }
+        list_set(sess, SI_STATE, TSS_CLOSED)
+        return list_new()
+    }
+    if inner != TLS_CONTENT_APPLICATION_DATA { return list_new() }
+    return pt[1]
+}
+
+// Send close_notify (encrypted under current TX key if handshake done,
+// cleartext otherwise). Transitions to CLOSING.
+fn session_close(sess) {
+    let st = sess[SI_STATE]
+    if st == TSS_CLOSED { return 0 }
+    if st == TSS_APPLICATION {
+        // Wrap the 2-byte alert record as an encrypted app_data record
+        // whose inner_type is ALERT (RFC 8446 §5).
+        let alert_bytes = list_new()
+        push(alert_bytes, TLS_ALERT_LEVEL_WARNING)
+        push(alert_bytes, TLS_ALERT_CLOSE_NOTIFY)
+        _ts_emit_encrypted_record(sess, TLS_CONTENT_ALERT, alert_bytes)
+    } else {
+        _ts_emit_alert(sess, TLS_ALERT_LEVEL_WARNING, TLS_ALERT_CLOSE_NOTIFY)
+    }
+    list_set(sess, SI_STATE, TSS_CLOSING)
+    return 1
+}
+
+// Force final CLOSED state (call after both close_notify have been
+// exchanged, or on socket-level termination).
+fn session_finalize_close(sess) {
+    list_set(sess, SI_STATE, TSS_CLOSED)
+    return 1
+}

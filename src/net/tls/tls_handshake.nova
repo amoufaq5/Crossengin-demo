@@ -1,20 +1,28 @@
-// CrossEngin in-process TLS: handshake message stubs
-// (R86, ADR r86-in-process-tls-scaffolding).
+// CrossEngin in-process TLS: handshake message layer (R93).
 //
 // TLS 1.3 handshake messages (RFC 8446 §4) all share the same 4-byte
 // header:
-//   +--------+--------+--------+--------+
-//   |  type  |     length (3 bytes)     |
-//   +--------+--------+--------+--------+
+//     +--------+--------+--------+--------+
+//     |  type  |     length (3 bytes)     |
+//     +--------+--------+--------+--------+
 //
-// R86 ships the type enum + a message-struct stub. R93 fills in the
-// per-type parsers/serializers. R94 wires them into the record layer.
+// R93 fills in real parse / serialize for the six message types the
+// in-process handshake exchanges: ClientHello, ServerHello,
+// EncryptedExtensions, Certificate, CertificateVerify, Finished.
+// Every function speaks byte LISTS (NOVA lists of ints in [0, 255]);
+// crypto payloads contain NUL bytes so a NOVA C-string is unusable
+// (mirrors x509.nova / tls_cert.nova).
 //
-// All symbols are prefixed `tls_handshake_` to avoid NOVA symbol collisions.
+// Suite pinned by R86 ADR:
+//     * TLS_CHACHA20_POLY1305_SHA256  (0x13 0x03)
+//     * x25519 group only             (0x00 0x1D)
+//     * ed25519 sig only              (0x08 0x07)
+// R93 refuses anything else (no HRR, no fallback).
 //
 // NOVA dependencies: builtins.
 // CrossEngin dependencies: src/net/tls/tls_record.nova (for the shared
-//     TLS_NOT_IMPLEMENTED sentinel).
+//     TLS_NOT_IMPLEMENTED sentinel; kept exported so callers that
+//     still hold R86 stubs get a clean sentinel).
 
 import "./tls_record.nova"
 
@@ -32,32 +40,41 @@ let TLS_HS_FINISHED                = 20
 let TLS_HS_KEY_UPDATE              = 24
 let TLS_HS_MESSAGE_HASH            = 254
 
-// ---- message-header + body limits ---------------------------------------
-
 let TLS_HS_HEADER_LEN = 4
-// RFC 8446 §4: handshake message body length is a uint24, capped
-// implicitly by the record-layer plaintext limit.
+// RFC 8446 §4: handshake message body length is a uint24; the record
+// layer caps individual message bodies well below this in practice.
 let TLS_HS_MAX_BODY_LEN = 16777215
 
-// ---- handshake-message struct -------------------------------------------
-//
-// A tls_handshake_message is [type, body_bytes]. R93 replaces
-// body_bytes with a per-type struct once parsers land; R86 keeps it as
-// raw bytes so the scaffold can round-trip a fixed message shape in
-// unit tests.
+// ---- pinned suite constants (R86 ADR) -----------------------------------
 
-let THM_TYPE = 0
-let THM_BODY = 1
+let TLS_CIPHER_CHACHA20_POLY1305_SHA256_HI = 19   // 0x13
+let TLS_CIPHER_CHACHA20_POLY1305_SHA256_LO = 3    // 0x03
+let TLS_GROUP_X25519_HI = 0
+let TLS_GROUP_X25519_LO = 29                       // 0x001D
+let TLS_SIGALG_ED25519_HI = 8
+let TLS_SIGALG_ED25519_LO = 7                      // 0x0807
 
-fn tls_handshake_message_new(hs_type, body) {
-    let m = list_new()
-    push(m, hs_type)
-    push(m, body)
-    return m
-}
+// TLS legacy_version + supported_versions selector (RFC 8446 §4.1.2).
+let TLS_LEGACY_VERSION_HI = 3
+let TLS_LEGACY_VERSION_LO = 3        // 0x0303
+let TLS_VERSION_13_HI = 3
+let TLS_VERSION_13_LO = 4            // 0x0304
 
-fn tls_handshake_message_type(m) { return m[THM_TYPE] }
-fn tls_handshake_message_body(m) { return m[THM_BODY] }
+// Extension type codes (RFC 8446 §4.2).
+let TLS_EXT_SERVER_NAME          = 0        // 0x0000
+let TLS_EXT_SUPPORTED_GROUPS     = 10       // 0x000A
+let TLS_EXT_SIGNATURE_ALGORITHMS = 13       // 0x000D
+let TLS_EXT_SUPPORTED_VERSIONS   = 43       // 0x002B
+let TLS_EXT_KEY_SHARE            = 51       // 0x0033
+
+// SNI name-type (RFC 6066 §3).
+let TLS_SNI_HOST_NAME = 0
+
+// Fixed sizes.
+let TLS_HS_RANDOM_LEN     = 32
+let TLS_HS_X25519_KEY_LEN = 32
+let TLS_HS_ED25519_SIG_LEN = 64
+let TLS_HS_SHA256_FINISHED_LEN = 32
 
 // ---- type-name (for logs) -----------------------------------------------
 
@@ -91,49 +108,808 @@ fn tls_handshake_type_known(t) {
     return 0
 }
 
-// ---- per-type parse / serialize (STUB; R93 fills in) --------------------
+// =========================================================================
+//                     byte-list helpers (private)
+// =========================================================================
+
+fn _hs_push_u8(out, v) {
+    push(out, int_and(v, 255))
+    return 1
+}
+
+fn _hs_push_u16(out, v) {
+    push(out, int_and(int_shr(v, 8), 255))
+    push(out, int_and(v, 255))
+    return 1
+}
+
+fn _hs_push_u24(out, v) {
+    push(out, int_and(int_shr(v, 16), 255))
+    push(out, int_and(int_shr(v, 8), 255))
+    push(out, int_and(v, 255))
+    return 1
+}
+
+fn _hs_push_bytes(out, src) {
+    let i = 0
+    let n = len(src)
+    while i < n {
+        push(out, src[i])
+        i = i + 1
+    }
+    return n
+}
+
+// Prepend a 3-byte length header + type byte to `body` (byte list),
+// producing a freshly allocated wire-form byte list.
+fn hs_wrap_header(hs_type, body) {
+    let out = list_new()
+    let bn = len(body)
+    if bn > TLS_HS_MAX_BODY_LEN { return out }
+    _hs_push_u8(out, hs_type)
+    _hs_push_u24(out, bn)
+    _hs_push_bytes(out, body)
+    return out
+}
+
+// Parse the 4-byte handshake header at offset `off` in buf (byte list).
+// Populates out_type[0] with the type and out_len[0] with the body
+// length. Returns 1 on ok, 0 on any bound violation.
+fn hs_parse_header(buf, off, out_type, out_len) {
+    let n = len(buf)
+    if off < 0 { return 0 }
+    if off + TLS_HS_HEADER_LEN > n { return 0 }
+    let t = buf[off]
+    let hi = buf[off + 1]
+    let mi = buf[off + 2]
+    let lo = buf[off + 3]
+    let bl = hi * 65536 + mi * 256 + lo
+    list_set(out_type, 0, t)
+    list_set(out_len, 0, bl)
+    if off + TLS_HS_HEADER_LEN + bl > n { return 0 }
+    return 1
+}
+
+// Read a big-endian uint16 at off in buf. Returns -1 on bound violation.
+fn _hs_read_u16(buf, off) {
+    if off < 0 { return 0 - 1 }
+    if off + 2 > len(buf) { return 0 - 1 }
+    return buf[off] * 256 + buf[off + 1]
+}
+
+// Read a big-endian uint24 at off in buf. Returns -1 on bound violation.
+fn _hs_read_u24(buf, off) {
+    if off < 0 { return 0 - 1 }
+    if off + 3 > len(buf) { return 0 - 1 }
+    return buf[off] * 65536 + buf[off + 1] * 256 + buf[off + 2]
+}
+
+// Slice a byte list into a fresh byte list.
+fn _hs_slice(buf, off, ln) {
+    let out = list_new()
+    let i = 0
+    while i < ln {
+        push(out, buf[off + i])
+        i = i + 1
+    }
+    return out
+}
+
+// =========================================================================
+//                     ClientHello / ServerHello structs
+// =========================================================================
 //
-// Every one of these returns TLS_NOT_IMPLEMENTED for R86. Callers must
-// treat that as a wire failure and close (fatal internal_error alert).
-// The signatures are chosen to match what R93 will need so R93 doesn't
-// have to touch any call site.
+// A parsed ClientHello is a NOVA list of fixed shape; index constants
+// below. Every offset / length referenced in the struct is into the
+// caller-supplied `buf`; the parse never copies.
+//
+//   [0]  legacy_version_hi
+//   [1]  legacy_version_lo
+//   [2]  random         (byte list, 32 bytes, copied)
+//   [3]  cipher_suite_hi
+//   [4]  cipher_suite_lo
+//   [5]  key_share_pubkey (byte list, 32 bytes, copied; empty if not
+//                          present -- but R93 refuses if absent)
+//   [6]  sni_present     (0 or 1)
+//   [7]  sni             (byte list of host_name bytes when present)
+//
+// ServerHello has the same shape but its "cipher_suite" is a single
+// selected suite (not a list) and its key_share is the server's chosen
+// group + pubkey.
 
-fn tls_handshake_parse_client_hello(body) {
-    return TLS_NOT_IMPLEMENTED
+let CH_IDX_VER_HI = 0
+let CH_IDX_VER_LO = 1
+let CH_IDX_RANDOM = 2
+let CH_IDX_SUITE_HI = 3
+let CH_IDX_SUITE_LO = 4
+let CH_IDX_KEYSHARE = 5
+let CH_IDX_SNI_PRESENT = 6
+let CH_IDX_SNI = 7
+
+let CH_STRUCT_LEN = 8
+
+fn hs_client_hello_new() {
+    let s = list_new()
+    push(s, TLS_LEGACY_VERSION_HI)
+    push(s, TLS_LEGACY_VERSION_LO)
+    push(s, list_new())     // random
+    push(s, TLS_CIPHER_CHACHA20_POLY1305_SHA256_HI)
+    push(s, TLS_CIPHER_CHACHA20_POLY1305_SHA256_LO)
+    push(s, list_new())     // keyshare pubkey
+    push(s, 0)              // sni_present
+    push(s, list_new())     // sni bytes
+    return s
 }
 
-fn tls_handshake_serialize_client_hello(msg) {
-    return TLS_NOT_IMPLEMENTED
+fn hs_client_hello_set_random(ch, random_bytes) {
+    list_set(ch, CH_IDX_RANDOM, random_bytes)
+    return 1
 }
 
-fn tls_handshake_parse_server_hello(body) {
-    return TLS_NOT_IMPLEMENTED
+fn hs_client_hello_set_keyshare(ch, pubkey_bytes) {
+    list_set(ch, CH_IDX_KEYSHARE, pubkey_bytes)
+    return 1
 }
 
-fn tls_handshake_serialize_server_hello(msg) {
-    return TLS_NOT_IMPLEMENTED
+fn hs_client_hello_set_sni(ch, name_bytes) {
+    list_set(ch, CH_IDX_SNI_PRESENT, 1)
+    list_set(ch, CH_IDX_SNI, name_bytes)
+    return 1
 }
 
-fn tls_handshake_parse_certificate(body) {
-    return TLS_NOT_IMPLEMENTED
+fn hs_client_hello_random(ch)     { return ch[CH_IDX_RANDOM] }
+fn hs_client_hello_keyshare(ch)   { return ch[CH_IDX_KEYSHARE] }
+fn hs_client_hello_sni_present(ch) { return ch[CH_IDX_SNI_PRESENT] }
+fn hs_client_hello_sni(ch)        { return ch[CH_IDX_SNI] }
+
+// Serialize a ClientHello STRUCT into the RFC 8446 §4.1.2 body bytes
+// (WITHOUT the 4-byte handshake header). Returns a byte list.
+//
+// Wire form:
+//   uint16 legacy_version = 0x0303
+//   opaque random[32]
+//   opaque legacy_session_id<0..32> = ""    (1-byte length + 0 bytes)
+//   CipherSuite cipher_suites<2..2^16-2>    (list of 2-byte codes)
+//   opaque legacy_compression_methods<1..2^8-1> = 0x00 (1 method: null)
+//   Extension extensions<8..2^16-1>
+//
+// Extensions R93 always sends:
+//   supported_versions [43]: 1 x 0x0304
+//   supported_groups   [10]: 1 x 0x001D
+//   signature_algorithms [13]: 1 x 0x0807
+//   key_share          [51]: 1 entry x25519 with 32-byte pubkey
+// Optional:
+//   server_name [0]: single host_name entry when sni_present.
+fn hs_client_hello_serialize_body(ch) {
+    let out = list_new()
+    // legacy_version.
+    _hs_push_u8(out, ch[CH_IDX_VER_HI])
+    _hs_push_u8(out, ch[CH_IDX_VER_LO])
+    // random (32 bytes; if the struct's random is short, pad zeros --
+    // callers should always populate 32).
+    let r = ch[CH_IDX_RANDOM]
+    let rn = len(r)
+    let ri = 0
+    while ri < TLS_HS_RANDOM_LEN {
+        if ri < rn {
+            push(out, r[ri])
+        } else {
+            push(out, 0)
+        }
+        ri = ri + 1
+    }
+    // legacy_session_id: 0-length OCTET.
+    _hs_push_u8(out, 0)
+    // cipher_suites: length prefix (2 bytes for one suite = 2 bytes) then
+    // the one 2-byte suite code.
+    _hs_push_u16(out, 2)
+    _hs_push_u8(out, ch[CH_IDX_SUITE_HI])
+    _hs_push_u8(out, ch[CH_IDX_SUITE_LO])
+    // legacy_compression_methods: 1 byte length + one null-method byte.
+    _hs_push_u8(out, 1)
+    _hs_push_u8(out, 0)
+    // Extensions.
+    let exts = _hs_build_client_hello_extensions(ch)
+    _hs_push_u16(out, len(exts))
+    _hs_push_bytes(out, exts)
+    return out
 }
 
-fn tls_handshake_serialize_certificate(msg) {
-    return TLS_NOT_IMPLEMENTED
+fn _hs_build_client_hello_extensions(ch) {
+    let e = list_new()
+    // --- supported_versions (0x002B): list_len + one uint16 version.
+    _hs_push_u16(e, TLS_EXT_SUPPORTED_VERSIONS)
+    _hs_push_u16(e, 3)        // extension_data length: 1 + 2 = 3
+    _hs_push_u8(e, 2)         // versions list byte-length
+    _hs_push_u8(e, TLS_VERSION_13_HI)
+    _hs_push_u8(e, TLS_VERSION_13_LO)
+    // --- supported_groups (0x000A): list_len (u16) + one uint16 group.
+    _hs_push_u16(e, TLS_EXT_SUPPORTED_GROUPS)
+    _hs_push_u16(e, 4)        // ext_data length: 2 + 2 = 4
+    _hs_push_u16(e, 2)        // list_len
+    _hs_push_u8(e, TLS_GROUP_X25519_HI)
+    _hs_push_u8(e, TLS_GROUP_X25519_LO)
+    // --- signature_algorithms (0x000D): list_len (u16) + one uint16 alg.
+    _hs_push_u16(e, TLS_EXT_SIGNATURE_ALGORITHMS)
+    _hs_push_u16(e, 4)
+    _hs_push_u16(e, 2)
+    _hs_push_u8(e, TLS_SIGALG_ED25519_HI)
+    _hs_push_u8(e, TLS_SIGALG_ED25519_LO)
+    // --- key_share (0x0033): ClientHello variant.
+    //   uint16 client_shares_len
+    //   KeyShareEntry entries[]:
+    //     uint16 group
+    //     opaque key_exchange<1..2^16-1> = pubkey
+    let ks_pub = ch[CH_IDX_KEYSHARE]
+    let ks_pub_n = len(ks_pub)
+    // Each entry = 2 (group) + 2 (key_exchange len) + ks_pub_n
+    let entry_len = 2 + 2 + ks_pub_n
+    let client_shares_len = entry_len
+    let ext_data_len = 2 + client_shares_len
+    _hs_push_u16(e, TLS_EXT_KEY_SHARE)
+    _hs_push_u16(e, ext_data_len)
+    _hs_push_u16(e, client_shares_len)
+    _hs_push_u8(e, TLS_GROUP_X25519_HI)
+    _hs_push_u8(e, TLS_GROUP_X25519_LO)
+    _hs_push_u16(e, ks_pub_n)
+    _hs_push_bytes(e, ks_pub)
+    // --- server_name (0x0000), optional.
+    if ch[CH_IDX_SNI_PRESENT] == 1 {
+        let sni = ch[CH_IDX_SNI]
+        let sni_n = len(sni)
+        // ServerNameList (RFC 6066 §3):
+        //   uint16 list_len
+        //   ServerName entries[]:
+        //     NameType name_type (1 byte, 0 = host_name)
+        //     opaque HostName<1..2^16-1>
+        let sn_entry_len = 1 + 2 + sni_n
+        let sn_list_len = sn_entry_len
+        let sn_ext_data_len = 2 + sn_list_len
+        _hs_push_u16(e, TLS_EXT_SERVER_NAME)
+        _hs_push_u16(e, sn_ext_data_len)
+        _hs_push_u16(e, sn_list_len)
+        _hs_push_u8(e, TLS_SNI_HOST_NAME)
+        _hs_push_u16(e, sni_n)
+        _hs_push_bytes(e, sni)
+    }
+    return e
 }
 
-fn tls_handshake_parse_certificate_verify(body) {
-    return TLS_NOT_IMPLEMENTED
+// Wrap ClientHello body in the 4-byte handshake header. Returns byte list.
+fn hs_client_hello_serialize(ch) {
+    let body = hs_client_hello_serialize_body(ch)
+    return hs_wrap_header(TLS_HS_CLIENT_HELLO, body)
 }
 
-fn tls_handshake_serialize_certificate_verify(msg) {
-    return TLS_NOT_IMPLEMENTED
+// Parse a ClientHello body (WITHOUT the 4-byte header) into a fresh
+// struct. Returns the struct on success, 0 on any wire error / suite
+// mismatch. Refuses cipher != 0x1303 / group != x25519 / sigalg !=
+// ed25519 / legacy_version != 0x0303 / no key_share.
+fn hs_client_hello_parse_body(body) {
+    let n = len(body)
+    if n < 34 + 1 + 2 { return 0 }
+    let ver_hi = body[0]
+    let ver_lo = body[1]
+    if ver_hi != TLS_LEGACY_VERSION_HI { return 0 }
+    if ver_lo != TLS_LEGACY_VERSION_LO { return 0 }
+    let ch = hs_client_hello_new()
+    // random.
+    let random = _hs_slice(body, 2, TLS_HS_RANDOM_LEN)
+    list_set(ch, CH_IDX_RANDOM, random)
+    let off = 2 + TLS_HS_RANDOM_LEN
+    // legacy_session_id.
+    let sid_len = body[off]
+    off = off + 1
+    if off + sid_len > n { return 0 }
+    if sid_len > 32 { return 0 }
+    off = off + sid_len
+    // cipher_suites.
+    if off + 2 > n { return 0 }
+    let cs_ln = _hs_read_u16(body, off)
+    off = off + 2
+    if cs_ln < 2 { return 0 }
+    if int_and(cs_ln, 1) != 0 { return 0 }   // must be even
+    if off + cs_ln > n { return 0 }
+    // Must contain exactly the one pinned suite -- any offering is
+    // legal per RFC 8446 §4.1.2 but R93 refuses if 0x1303 is not one
+    // of them. We walk the list and match.
+    let cs_end = off + cs_ln
+    let cs_ok = 0
+    let cs_pos = off
+    while cs_pos < cs_end {
+        let sh = body[cs_pos]
+        let sl = body[cs_pos + 1]
+        if sh == TLS_CIPHER_CHACHA20_POLY1305_SHA256_HI {
+            if sl == TLS_CIPHER_CHACHA20_POLY1305_SHA256_LO { cs_ok = 1 }
+        }
+        cs_pos = cs_pos + 2
+    }
+    if cs_ok == 0 { return 0 }
+    list_set(ch, CH_IDX_SUITE_HI, TLS_CIPHER_CHACHA20_POLY1305_SHA256_HI)
+    list_set(ch, CH_IDX_SUITE_LO, TLS_CIPHER_CHACHA20_POLY1305_SHA256_LO)
+    off = cs_end
+    // legacy_compression_methods.
+    if off + 1 > n { return 0 }
+    let cm_ln = body[off]
+    off = off + 1
+    if off + cm_ln > n { return 0 }
+    if cm_ln < 1 { return 0 }
+    // Must include null-method (0x00).
+    let cm_ok = 0
+    let cmi = 0
+    while cmi < cm_ln {
+        if body[off + cmi] == 0 { cm_ok = 1 }
+        cmi = cmi + 1
+    }
+    if cm_ok == 0 { return 0 }
+    off = off + cm_ln
+    // Extensions.
+    if off + 2 > n { return 0 }
+    let ext_total_ln = _hs_read_u16(body, off)
+    off = off + 2
+    if off + ext_total_ln != n { return 0 }
+    let ext_end = off + ext_total_ln
+    // Walk extensions.
+    let saw_supported_versions = 0
+    let saw_supported_groups = 0
+    let saw_sigalg = 0
+    let saw_keyshare = 0
+    let epos = off
+    while epos < ext_end {
+        if epos + 4 > ext_end { return 0 }
+        let et = _hs_read_u16(body, epos)
+        let el = _hs_read_u16(body, epos + 2)
+        epos = epos + 4
+        if epos + el > ext_end { return 0 }
+        if et == TLS_EXT_SUPPORTED_VERSIONS {
+            // ClientHello: 1-byte list_len + list of uint16 versions.
+            if el < 1 { return 0 }
+            let list_ln = body[epos]
+            if list_ln != el - 1 { return 0 }
+            if int_and(list_ln, 1) != 0 { return 0 }
+            let v_ok = 0
+            let vp = epos + 1
+            let vend = epos + el
+            while vp < vend {
+                if body[vp] == TLS_VERSION_13_HI {
+                    if body[vp + 1] == TLS_VERSION_13_LO { v_ok = 1 }
+                }
+                vp = vp + 2
+            }
+            if v_ok == 0 { return 0 }
+            saw_supported_versions = 1
+        } else {
+        if et == TLS_EXT_SUPPORTED_GROUPS {
+            if el < 2 { return 0 }
+            let g_list_ln = _hs_read_u16(body, epos)
+            if g_list_ln != el - 2 { return 0 }
+            if int_and(g_list_ln, 1) != 0 { return 0 }
+            let g_ok = 0
+            let gp = epos + 2
+            let gend = epos + el
+            while gp < gend {
+                if body[gp] == TLS_GROUP_X25519_HI {
+                    if body[gp + 1] == TLS_GROUP_X25519_LO { g_ok = 1 }
+                }
+                gp = gp + 2
+            }
+            if g_ok == 0 { return 0 }
+            saw_supported_groups = 1
+        } else {
+        if et == TLS_EXT_SIGNATURE_ALGORITHMS {
+            if el < 2 { return 0 }
+            let s_list_ln = _hs_read_u16(body, epos)
+            if s_list_ln != el - 2 { return 0 }
+            if int_and(s_list_ln, 1) != 0 { return 0 }
+            let s_ok = 0
+            let sp = epos + 2
+            let send = epos + el
+            while sp < send {
+                if body[sp] == TLS_SIGALG_ED25519_HI {
+                    if body[sp + 1] == TLS_SIGALG_ED25519_LO { s_ok = 1 }
+                }
+                sp = sp + 2
+            }
+            if s_ok == 0 { return 0 }
+            saw_sigalg = 1
+        } else {
+        if et == TLS_EXT_KEY_SHARE {
+            // ClientHello: uint16 client_shares_len + entries[]
+            if el < 2 { return 0 }
+            let cs_list_ln = _hs_read_u16(body, epos)
+            if cs_list_ln != el - 2 { return 0 }
+            let kp = epos + 2
+            let kend = epos + el
+            while kp < kend {
+                if kp + 4 > kend { return 0 }
+                let gh = body[kp]
+                let gl = body[kp + 1]
+                let kx_ln = _hs_read_u16(body, kp + 2)
+                if kp + 4 + kx_ln > kend { return 0 }
+                if gh == TLS_GROUP_X25519_HI {
+                    if gl == TLS_GROUP_X25519_LO {
+                        if kx_ln != TLS_HS_X25519_KEY_LEN { return 0 }
+                        let pk = _hs_slice(body, kp + 4, kx_ln)
+                        list_set(ch, CH_IDX_KEYSHARE, pk)
+                        saw_keyshare = 1
+                    }
+                }
+                kp = kp + 4 + kx_ln
+            }
+        } else {
+        if et == TLS_EXT_SERVER_NAME {
+            if el >= 2 {
+                let sn_list_ln = _hs_read_u16(body, epos)
+                if sn_list_ln == el - 2 {
+                    if sn_list_ln >= 3 {
+                        let nt = body[epos + 2]
+                        if nt == TLS_SNI_HOST_NAME {
+                            let hn_ln = _hs_read_u16(body, epos + 3)
+                            if epos + 5 + hn_ln <= epos + el {
+                                let sn = _hs_slice(body, epos + 5, hn_ln)
+                                list_set(ch, CH_IDX_SNI_PRESENT, 1)
+                                list_set(ch, CH_IDX_SNI, sn)
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Unknown extension: RFC 8446 §4.2 says receivers MAY ignore
+            // unknown extensions. Skip past.
+        }
+        }
+        }
+        }
+        }
+        epos = epos + el
+    }
+    if saw_supported_versions == 0 { return 0 }
+    if saw_supported_groups == 0 { return 0 }
+    if saw_sigalg == 0 { return 0 }
+    if saw_keyshare == 0 { return 0 }
+    if len(ch[CH_IDX_KEYSHARE]) != TLS_HS_X25519_KEY_LEN { return 0 }
+    return ch
 }
 
-fn tls_handshake_parse_finished(body) {
-    return TLS_NOT_IMPLEMENTED
+// Parse a ClientHello (with 4-byte header). Returns struct or 0.
+fn hs_client_hello_parse(buf) {
+    let t = list_new(); push(t, 0)
+    let l = list_new(); push(l, 0)
+    if hs_parse_header(buf, 0, t, l) == 0 { return 0 }
+    if t[0] != TLS_HS_CLIENT_HELLO { return 0 }
+    let body = _hs_slice(buf, TLS_HS_HEADER_LEN, l[0])
+    return hs_client_hello_parse_body(body)
 }
 
-fn tls_handshake_serialize_finished(msg) {
-    return TLS_NOT_IMPLEMENTED
+// -------------------------------------------------------------------------
+//                     ServerHello (RFC 8446 §4.1.3)
+// -------------------------------------------------------------------------
+
+fn hs_server_hello_new() {
+    let s = list_new()
+    push(s, TLS_LEGACY_VERSION_HI)
+    push(s, TLS_LEGACY_VERSION_LO)
+    push(s, list_new())     // random
+    push(s, TLS_CIPHER_CHACHA20_POLY1305_SHA256_HI)
+    push(s, TLS_CIPHER_CHACHA20_POLY1305_SHA256_LO)
+    push(s, list_new())     // keyshare pubkey
+    push(s, 0)              // sni_present (unused server-side)
+    push(s, list_new())     // sni bytes (unused)
+    return s
 }
+
+fn hs_server_hello_set_random(sh, random_bytes) {
+    list_set(sh, CH_IDX_RANDOM, random_bytes)
+    return 1
+}
+
+fn hs_server_hello_set_keyshare(sh, pubkey_bytes) {
+    list_set(sh, CH_IDX_KEYSHARE, pubkey_bytes)
+    return 1
+}
+
+fn hs_server_hello_random(sh)   { return sh[CH_IDX_RANDOM] }
+fn hs_server_hello_keyshare(sh) { return sh[CH_IDX_KEYSHARE] }
+
+// Serialize ServerHello body (no header). Wire form (RFC 8446 §4.1.3):
+//   uint16 legacy_version = 0x0303
+//   opaque random[32]
+//   opaque legacy_session_id_echo<0..32>
+//   CipherSuite cipher_suite
+//   uint8 legacy_compression_method = 0
+//   Extension extensions<6..2^16-1>
+// R93 always echoes an empty legacy_session_id (client sent one).
+// Extensions: supported_versions (0x0304) + key_share (x25519 + pk).
+fn hs_server_hello_serialize_body(sh) {
+    let out = list_new()
+    _hs_push_u8(out, sh[CH_IDX_VER_HI])
+    _hs_push_u8(out, sh[CH_IDX_VER_LO])
+    let r = sh[CH_IDX_RANDOM]
+    let rn = len(r)
+    let ri = 0
+    while ri < TLS_HS_RANDOM_LEN {
+        if ri < rn { push(out, r[ri]) } else { push(out, 0) }
+        ri = ri + 1
+    }
+    _hs_push_u8(out, 0)       // legacy_session_id_echo (0-length)
+    _hs_push_u8(out, sh[CH_IDX_SUITE_HI])
+    _hs_push_u8(out, sh[CH_IDX_SUITE_LO])
+    _hs_push_u8(out, 0)       // legacy_compression_method
+    let exts = _hs_build_server_hello_extensions(sh)
+    _hs_push_u16(out, len(exts))
+    _hs_push_bytes(out, exts)
+    return out
+}
+
+fn _hs_build_server_hello_extensions(sh) {
+    let e = list_new()
+    // supported_versions (ServerHello variant): single uint16 version.
+    _hs_push_u16(e, TLS_EXT_SUPPORTED_VERSIONS)
+    _hs_push_u16(e, 2)   // ext_data length
+    _hs_push_u8(e, TLS_VERSION_13_HI)
+    _hs_push_u8(e, TLS_VERSION_13_LO)
+    // key_share (ServerHello variant): single KeyShareEntry.
+    //   uint16 group
+    //   opaque key_exchange<1..2^16-1>
+    let ks_pub = sh[CH_IDX_KEYSHARE]
+    let ks_n = len(ks_pub)
+    let ext_data_len = 2 + 2 + ks_n
+    _hs_push_u16(e, TLS_EXT_KEY_SHARE)
+    _hs_push_u16(e, ext_data_len)
+    _hs_push_u8(e, TLS_GROUP_X25519_HI)
+    _hs_push_u8(e, TLS_GROUP_X25519_LO)
+    _hs_push_u16(e, ks_n)
+    _hs_push_bytes(e, ks_pub)
+    return e
+}
+
+fn hs_server_hello_serialize(sh) {
+    let body = hs_server_hello_serialize_body(sh)
+    return hs_wrap_header(TLS_HS_SERVER_HELLO, body)
+}
+
+// Parse ServerHello body. Returns struct or 0.
+fn hs_server_hello_parse_body(body) {
+    let n = len(body)
+    if n < 34 + 1 + 2 + 1 + 2 { return 0 }
+    if body[0] != TLS_LEGACY_VERSION_HI { return 0 }
+    if body[1] != TLS_LEGACY_VERSION_LO { return 0 }
+    let sh = hs_server_hello_new()
+    list_set(sh, CH_IDX_RANDOM, _hs_slice(body, 2, TLS_HS_RANDOM_LEN))
+    let off = 2 + TLS_HS_RANDOM_LEN
+    let sid_ln = body[off]
+    off = off + 1
+    if sid_ln > 32 { return 0 }
+    if off + sid_ln > n { return 0 }
+    off = off + sid_ln
+    if off + 2 > n { return 0 }
+    let suite_hi = body[off]
+    let suite_lo = body[off + 1]
+    if suite_hi != TLS_CIPHER_CHACHA20_POLY1305_SHA256_HI { return 0 }
+    if suite_lo != TLS_CIPHER_CHACHA20_POLY1305_SHA256_LO { return 0 }
+    list_set(sh, CH_IDX_SUITE_HI, suite_hi)
+    list_set(sh, CH_IDX_SUITE_LO, suite_lo)
+    off = off + 2
+    if off + 1 > n { return 0 }
+    if body[off] != 0 { return 0 }
+    off = off + 1
+    if off + 2 > n { return 0 }
+    let ext_total_ln = _hs_read_u16(body, off)
+    off = off + 2
+    if off + ext_total_ln != n { return 0 }
+    let ext_end = off + ext_total_ln
+    let saw_versions = 0
+    let saw_keyshare = 0
+    let epos = off
+    while epos < ext_end {
+        if epos + 4 > ext_end { return 0 }
+        let et = _hs_read_u16(body, epos)
+        let el = _hs_read_u16(body, epos + 2)
+        epos = epos + 4
+        if epos + el > ext_end { return 0 }
+        if et == TLS_EXT_SUPPORTED_VERSIONS {
+            if el != 2 { return 0 }
+            if body[epos] != TLS_VERSION_13_HI { return 0 }
+            if body[epos + 1] != TLS_VERSION_13_LO { return 0 }
+            saw_versions = 1
+        } else {
+        if et == TLS_EXT_KEY_SHARE {
+            if el < 4 { return 0 }
+            let gh = body[epos]
+            let gl = body[epos + 1]
+            if gh != TLS_GROUP_X25519_HI { return 0 }
+            if gl != TLS_GROUP_X25519_LO { return 0 }
+            let kx_ln = _hs_read_u16(body, epos + 2)
+            if el != 4 + kx_ln { return 0 }
+            if kx_ln != TLS_HS_X25519_KEY_LEN { return 0 }
+            let pk = _hs_slice(body, epos + 4, kx_ln)
+            list_set(sh, CH_IDX_KEYSHARE, pk)
+            saw_keyshare = 1
+        } else {
+            // ignore unknown
+        }
+        }
+        epos = epos + el
+    }
+    if saw_versions == 0 { return 0 }
+    if saw_keyshare == 0 { return 0 }
+    if len(sh[CH_IDX_KEYSHARE]) != TLS_HS_X25519_KEY_LEN { return 0 }
+    return sh
+}
+
+fn hs_server_hello_parse(buf) {
+    let t = list_new(); push(t, 0)
+    let l = list_new(); push(l, 0)
+    if hs_parse_header(buf, 0, t, l) == 0 { return 0 }
+    if t[0] != TLS_HS_SERVER_HELLO { return 0 }
+    let body = _hs_slice(buf, TLS_HS_HEADER_LEN, l[0])
+    return hs_server_hello_parse_body(body)
+}
+
+// -------------------------------------------------------------------------
+//                     EncryptedExtensions (RFC 8446 §4.3.1)
+// -------------------------------------------------------------------------
+//
+// Body:
+//   Extension extensions<0..2^16-1>
+// R93 sends empty extensions.
+
+fn hs_encrypted_extensions_serialize_body() {
+    let out = list_new()
+    _hs_push_u16(out, 0)
+    return out
+}
+
+fn hs_encrypted_extensions_serialize() {
+    let body = hs_encrypted_extensions_serialize_body()
+    return hs_wrap_header(TLS_HS_ENCRYPTED_EXTENSIONS, body)
+}
+
+// Parse body. Returns 1 if valid (empty or well-formed extensions list),
+// 0 on wire error. Populates nothing -- we don't store any received EE.
+fn hs_encrypted_extensions_parse_body(body) {
+    let n = len(body)
+    if n < 2 { return 0 }
+    let el = _hs_read_u16(body, 0)
+    if el != n - 2 { return 0 }
+    // Walk extensions but ignore contents (R93 tolerates every EE).
+    let pos = 2
+    while pos < n {
+        if pos + 4 > n { return 0 }
+        let xl = _hs_read_u16(body, pos + 2)
+        pos = pos + 4 + xl
+        if pos > n { return 0 }
+    }
+    return 1
+}
+
+// -------------------------------------------------------------------------
+//                     Certificate (RFC 8446 §4.4.2)
+// -------------------------------------------------------------------------
+//
+// Body:
+//   opaque certificate_request_context<0..2^8-1>
+//   CertificateEntry certificate_list<0..2^24-1>
+// CertificateEntry:
+//   opaque cert_data<1..2^24-1>
+//   Extension extensions<0..2^16-1>   (empty per R93)
+//
+// A parsed Certificate is a byte list of leaf-cert DER bytes (first
+// entry). R93 stores only the leaf.
+
+// Serialize with a single leaf cert (byte list). Empty context.
+fn hs_certificate_serialize_body(leaf_der) {
+    let out = list_new()
+    _hs_push_u8(out, 0)       // 0-length certificate_request_context
+    // One entry: 3-byte cert_data length + cert_data + 2-byte extensions
+    // length (0).
+    let leaf_n = len(leaf_der)
+    let entry_len = 3 + leaf_n + 2
+    _hs_push_u24(out, entry_len)
+    _hs_push_u24(out, leaf_n)
+    _hs_push_bytes(out, leaf_der)
+    _hs_push_u16(out, 0)
+    return out
+}
+
+fn hs_certificate_serialize(leaf_der) {
+    let body = hs_certificate_serialize_body(leaf_der)
+    return hs_wrap_header(TLS_HS_CERTIFICATE, body)
+}
+
+// Parse body. Returns byte list of the FIRST cert's DER bytes on
+// success (0 on wire error).
+fn hs_certificate_parse_body(body) {
+    let n = len(body)
+    if n < 4 { return 0 }
+    let ctx_ln = body[0]
+    let off = 1 + ctx_ln
+    if off + 3 > n { return 0 }
+    let list_ln = _hs_read_u24(body, off)
+    off = off + 3
+    if off + list_ln != n { return 0 }
+    // Walk entries; return first cert's DER slice.
+    if off >= n { return 0 }
+    if off + 3 > n { return 0 }
+    let ce_ln = _hs_read_u24(body, off)
+    if ce_ln < 1 { return 0 }
+    if off + 3 + ce_ln > n { return 0 }
+    let cert_der = _hs_slice(body, off + 3, ce_ln)
+    // Skip extensions.
+    let ext_off = off + 3 + ce_ln
+    if ext_off + 2 > n { return 0 }
+    return cert_der
+}
+
+// -------------------------------------------------------------------------
+//                CertificateVerify (RFC 8446 §4.4.3)
+// -------------------------------------------------------------------------
+//
+// Body:
+//   SignatureScheme algorithm     (uint16, must be 0x0807 for R93)
+//   opaque signature<0..2^16-1>   (must be 64 bytes for ed25519)
+
+fn hs_certificate_verify_serialize_body(signature_64) {
+    let out = list_new()
+    _hs_push_u8(out, TLS_SIGALG_ED25519_HI)
+    _hs_push_u8(out, TLS_SIGALG_ED25519_LO)
+    _hs_push_u16(out, len(signature_64))
+    _hs_push_bytes(out, signature_64)
+    return out
+}
+
+fn hs_certificate_verify_serialize(signature_64) {
+    let body = hs_certificate_verify_serialize_body(signature_64)
+    return hs_wrap_header(TLS_HS_CERTIFICATE_VERIFY, body)
+}
+
+// Parse body. Returns byte list of the 64-byte signature or 0.
+fn hs_certificate_verify_parse_body(body) {
+    let n = len(body)
+    if n < 4 { return 0 }
+    if body[0] != TLS_SIGALG_ED25519_HI { return 0 }
+    if body[1] != TLS_SIGALG_ED25519_LO { return 0 }
+    let sig_ln = _hs_read_u16(body, 2)
+    if sig_ln != TLS_HS_ED25519_SIG_LEN { return 0 }
+    if 4 + sig_ln != n { return 0 }
+    return _hs_slice(body, 4, sig_ln)
+}
+
+// -------------------------------------------------------------------------
+//                Finished (RFC 8446 §4.4.4)
+// -------------------------------------------------------------------------
+//
+// Body: opaque verify_data[Hash.length]  (32 bytes for SHA-256)
+
+fn hs_finished_serialize_body(verify_data_32) {
+    let out = list_new()
+    _hs_push_bytes(out, verify_data_32)
+    return out
+}
+
+fn hs_finished_serialize(verify_data_32) {
+    let body = hs_finished_serialize_body(verify_data_32)
+    return hs_wrap_header(TLS_HS_FINISHED, body)
+}
+
+// Parse body. Returns byte list of the 32-byte verify_data or 0.
+fn hs_finished_parse_body(body) {
+    if len(body) != TLS_HS_SHA256_FINISHED_LEN { return 0 }
+    return _hs_slice(body, 0, TLS_HS_SHA256_FINISHED_LEN)
+}
+
+// ---- R86 stub retention (kept so callers importing them still compile)
+// R93 supersedes every stub; the new callers should use the concrete
+// hs_*_serialize / hs_*_parse routines above.
+
+fn tls_handshake_parse_client_hello(body)      { return hs_client_hello_parse_body(body) }
+fn tls_handshake_serialize_client_hello(msg)   { return hs_client_hello_serialize(msg) }
+fn tls_handshake_parse_server_hello(body)      { return hs_server_hello_parse_body(body) }
+fn tls_handshake_serialize_server_hello(msg)   { return hs_server_hello_serialize(msg) }
+fn tls_handshake_parse_certificate(body)       { return hs_certificate_parse_body(body) }
+fn tls_handshake_serialize_certificate(leaf)   { return hs_certificate_serialize(leaf) }
+fn tls_handshake_parse_certificate_verify(body) { return hs_certificate_verify_parse_body(body) }
+fn tls_handshake_serialize_certificate_verify(sig) { return hs_certificate_verify_serialize(sig) }
+fn tls_handshake_parse_finished(body)          { return hs_finished_parse_body(body) }
+fn tls_handshake_serialize_finished(vd)        { return hs_finished_serialize(vd) }

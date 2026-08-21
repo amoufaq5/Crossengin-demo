@@ -2792,6 +2792,163 @@ real wrapped_conn under a `tls_config`; ships alongside a
 sidecar recipe for supplying entropy through Backend C in
 seccomp-filtered containers).
 
+### 7.43 TLS 1.3 handshake state machine (R93)
+
+**Honest status: full in-process TLS 1.3 handshake runs end-to-end
+in tests; a server session and a client session (both instantiated
+in the same process, exchanging bytes through caller-owned queues)
+converge on byte-identical `client_application_traffic_secret_0`
+and `server_application_traffic_secret_0` and then round-trip
+encrypted application data in both directions. Wire is STILL
+cleartext — `wire_connection_wrap` is untouched; R94 flips it.**
+
+**What the state machine does end-to-end (RFC 8446 §4):**
+
+1. Client emits `ClientHello` cleartext with the pinned suite
+   (`TLS_CHACHA20_POLY1305_SHA256` / x25519 / ed25519), a
+   32-byte `random`, a 32-byte x25519 keyshare, and the
+   supported_versions / supported_groups / signature_algorithms
+   extensions.
+2. Server parses `ClientHello`, absorbs it into the SHA-256
+   transcript, emits `ServerHello` cleartext with its own keyshare,
+   computes the x25519 shared secret, and derives the RFC 8446 §7.1
+   `early_secret` → `handshake_secret` → `(client|server)_hs_traffic`
+   secrets.
+3. Server sends `EncryptedExtensions` (empty) || `Certificate`
+   (single leaf) || `CertificateVerify` (ed25519 sig over the
+   RFC 8446 §4.4.3 signed content assembled from the transcript
+   through `Certificate`) || server `Finished` (HMAC-SHA-256 with
+   `HKDF-Expand-Label(server_hs_traffic, "finished", "", 32)`
+   over the transcript through `CertificateVerify`) as one AEAD
+   record sealed under `server_hs_traffic`.
+4. Client decrypts the flight, absorbs each message in turn, chain-
+   verifies the leaf against the caller-supplied root (`x509_chain_verify`
+   from R92), verifies the `CertificateVerify` signature under the
+   leaf's SPKI pubkey, and verifies the server `Finished` HMAC.
+5. Both sides derive `master_secret` and
+   `(client|server)_application_traffic_secret_0` from the transcript
+   through server `Finished` (identical inputs → identical outputs).
+6. Client sends its `Finished` (HMAC over transcript-through-server-
+   `Finished` with `finished_key(client_hs_traffic)`) as an AEAD
+   record sealed under `client_hs_traffic`, then switches TX to
+   `client_ap_traffic` and RX to `server_ap_traffic`.
+7. Server verifies the client `Finished` HMAC, then switches keys
+   the same way. Both endpoints are now in `APPLICATION`.
+
+**Explicit simplifications (R93 does NOT cover):**
+
+- No 0-RTT / no early data.
+- No PSK / no session resumption.
+- No HelloRetryRequest (client always offers x25519; a server that
+  gets a ClientHello without x25519 sends a fatal `handshake_failure`
+  alert — R93 has no HRR path).
+- No client certificate authentication.
+- No key update after handshake.
+- No post-handshake authentication.
+- One record per handshake message on the send path, EXCEPT the
+  server's encrypted flight (EE || Cert || CertVerify || Finished),
+  which is a single AEAD record. The parser tolerates cross-record
+  fragmentation on receive as required by RFC 8446 §5.1.
+
+**In-memory test harness (crown-jewel pattern):**
+
+- Two sessions instantiated in the same process:
+  `session_new_client(client, root_der, rng_ctx, now_unix)` and
+  `session_new_server(server, cert_der, cert_priv, cert_pub, rng_ctx, now_unix)`.
+- Distinct-seed deterministic RNGs (R91 Backend B) drive each side's
+  ephemeral x25519 scalar and `.random` fields so the whole test is
+  reproducible byte-for-byte.
+- Pump loop: alternately `session_drain_send` each side's outbound
+  and `session_recv` on the other; state machines advance eagerly
+  after each `recv`. Loop until both `session_handshake_done`.
+- Root and leaf certs assembled programmatically via R92's
+  `x509_build_test_cert` (RFC 8032 TEST 1 root, TEST 2 leaf).
+
+**Module layout (R93 delta):**
+
+- `src/net/tls/tls_handshake.nova` — replaces the R86 `TLS_NOT_IMPLEMENTED`
+  stubs with real parse / serialize per message type
+  (`hs_client_hello_*`, `hs_server_hello_*`, `hs_encrypted_extensions_*`,
+  `hs_certificate_*`, `hs_certificate_verify_*`, `hs_finished_*`) plus
+  the shared `hs_wrap_header` / `hs_parse_header` helpers. R86 wrappers
+  (`tls_handshake_parse_*`) retained as thin adapters onto the new
+  concrete routines so any straggling caller compiles.
+- `src/net/tls/tls_transcript.nova` — NEW. SHA-256 transcript hash
+  rolling with a snapshot-`get` (deep-copy the streaming state so
+  `sha256_final` on the snapshot yields the interim digest without
+  disturbing the live stream). Used by every derivation step and by
+  the CertificateVerify / Finished input construction.
+- `src/net/tls/tls_session.nova` — NEW. Connection state machine +
+  key schedule invocations + per-direction record keys (with
+  epoch-resetting sequence counters) + inbound / outbound byte
+  queues + public API (`session_new_client` / `session_new_server` /
+  `session_start_client` / `session_recv` / `session_want_send` /
+  `session_drain_send` / `session_encrypt_app` / `session_decrypt_app` /
+  `session_close` / `session_finalize_close` / `session_handshake_done` /
+  accessors for each derived secret).
+
+**Tests (R93 delta, 120 new checks):**
+
+- `test_tls_handshake_msgs` — 54 checks. Round-trips for every
+  message type (ClientHello without / with SNI, ServerHello,
+  EncryptedExtensions, Certificate, CertificateVerify, Finished);
+  hand-encoded byte-level layout of ClientHello; reject wrong
+  `legacy_version`, wrong cipher (non-0x1303), missing key_share,
+  wrong sigalg on CertificateVerify, wrong Finished length;
+  extension-length-overflow rejection; unknown-extension tolerance
+  (RFC 8446 §4.2 "MUST ignore" semantic); header-parse bounds.
+- `test_tls_transcript` — 16 checks. Empty transcript equals
+  `SHA-256("")`; single / two / ten-piece absorbs all equal the
+  concatenated one-shot; snapshot doesn't disturb the live state;
+  boundary at 63 / 64 bytes (SHA-256 block edge); `absorb` vs
+  `absorb_buf` parity; `get_into` equals `get`; init variant
+  matches new variant.
+- `test_tls_session` — 35 checks. **Crown jewel:** both peers
+  finish the handshake and derive byte-identical
+  `client_hs_traffic`, `server_hs_traffic`, `client_ap_traffic`,
+  `server_ap_traffic`. Application-data round-trip in both
+  directions. Multiple app records with correct sequence-counter
+  progression. `close_notify` transitions both sides to CLOSING;
+  `session_finalize_close` transitions both to CLOSED.
+- `test_tls_session_tamper` — 15 checks. Client rejects wrong
+  root (`bad_certificate`), expired leaf (`certificate_expired`),
+  bogus CertVerify signature (`decrypt_error`), tampered server
+  Finished (`bad_record_mac` or `decrypt_error`). Server rejects
+  wrong cipher (`handshake_failure`), wrong group (`handshake_failure`),
+  tampered client Finished (`bad_record_mac` or `decrypt_error`).
+
+**Regression sweep (R93):** all TLS suites green —
+`test_tls_alerts` (161), `test_tls_scaffold` (66), `test_tls_state` (68),
+`test_tls_kdf` (27), `test_tls_keyshare` (14), `test_tls_keyshare_rng` (27),
+`test_tls_cert` (41), `test_tls_cert_chain` (14),
+`test_tls_record_aead` (53), `test_tls13_keyschedule` (28),
+`test_tls_handshake_msgs` (54), `test_tls_transcript` (16),
+`test_tls_session` (35), `test_tls_session_tamper` (15). Wire
+regressions `test_capability_wire` (245), `test_nl_rpc_verbs` (74)
+green. Pre-existing `test_dtls12` reds and the `ed25519_sign latency`
+red on `test_ed25519` are unchanged (they precede R93 and are
+tracked in §12).
+
+**What's still missing for wire deployment:**
+
+- **R94 flip of `wire_connection_wrap`.** R93 wires the state
+  machine into a callable API, but the daemon accept loop still
+  hands raw fds through the pass-through hook. R94 replaces the
+  passthrough with a real wrapped_conn whose read/write path
+  drives `session_recv` / `session_drain_send` under a
+  `tls_config`.
+- **Entropy sidecar for this container.** The OS RNG backend from
+  R91 remains unavailable in this project's seccomp-filtered
+  sandbox. R94 needs to ship a launcher / sidecar recipe that
+  supplies bytes through the R91 callback backend (Backend C) so
+  a live handshake has real entropy for its ephemeral scalar and
+  `.random` fields.
+- **Cert provisioning story.** R93 tests programmatically-built
+  Ed25519 certs (RFC 8032 TEST 1 / TEST 2 keys); a real deployment
+  needs a supported path for operators to bring their own leaf
+  cert + private key (and a root cert operators trust). R94 ties
+  this into the `tls_config` on daemon boot.
+
 ## 12. What comes next (R90+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
@@ -2837,17 +2994,23 @@ blocker.
   (`tls_cert_verify_ed25519` with a raw 32-byte pubkey) stays for
   the low-level path and its tests; the R92 wrapper adds
   cert-chain gating on top.
-- **R93** — Handshake state-machine wire-up (fills in the R86
-  `tls_handshake.nova` stubs). Consumes R91 for the RNG via
-  `tls_keyshare_generate` / `tls_random_generate`, and R92 for
-  the peer cert. **Next TLS phase.**
+- **R93** — ✅ Handshake state-machine wire-up (see §7.43;
+  RFC 8446 §4; 120 new checks). In-memory only: two sessions in
+  one process exchange bytes through caller-owned queues and
+  converge on byte-identical application traffic secrets, then
+  round-trip encrypted app data both ways. Consumes R87 (AEAD),
+  R88 (KDF), R89 (ECDH), R90 (CertificateVerify), R91 (RNG),
+  R92 (cert chain). Explicit simplifications: no 0-RTT, PSK,
+  HRR, client cert, key update, post-handshake auth.
 - **R94** — Wire-hook flip: `wire_connection_wrap` starts returning
-  a real wrapped_conn under a `tls_config`. **First deployable
-  in-process TLS round.** Ships alongside a sidecar recipe for
-  supplying entropy through Backend C in seccomp-filtered
-  containers.
+  a real wrapped_conn under a `tls_config`. **Final TLS build-out
+  round.** Ships alongside a sidecar recipe for supplying entropy
+  through Backend C in seccomp-filtered containers, plus operator
+  docs for cert provisioning. **After R94 the TLS build-out is
+  done (with the R93 simplifications documented).**
 - **R95..R9X** — Trust-anchor chain validation, session tickets,
-  live-alert delivery, hardening / fuzz audits.
+  live-alert delivery, hardening / fuzz audits — deprioritized;
+  after R94 the front-of-queue is non-TLS candidates below.
 
 **Runtime gap (R91 partially addressed):**
 
@@ -2862,14 +3025,14 @@ blocker.
   A full HKDF-based DRBG is a candidate for a later round if the
   OS source proves unreliable across target environments.
 
-**Other candidates (any round can pull one instead of a TLS phase
-that's blocked on a runtime primitive):**
+**Other candidates (front-of-queue after R94 completes the
+TLS build-out; the top three become the immediate targets):**
 
-- Admin bulk-ops (multi-token grants / revokes in one wire call).
-- Per-session pre/post hooks so a daemon operator can attach an
-  audit-log writer without editing `rpc_server.nova`.
-- Ownership audit log — a per-holder append-only log of
-  `ownership.transfer` and `admin.set_holder` events.
+1. **Admin bulk-ops** (multi-token grants / revokes in one wire call).
+2. **Per-session pre/post hooks** so a daemon operator can attach an
+   audit-log writer without editing `rpc_server.nova`.
+3. **Ownership audit log** — a per-holder append-only log of
+   `ownership.transfer` and `admin.set_holder` events.
 - Per-source rate budgets controllable via admin wire verb (aggregate
   ceilings across many tokens from one origin).
 - Per-holder aggregate rate limits (an owner's tokens share a

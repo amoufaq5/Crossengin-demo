@@ -114,6 +114,7 @@ CrossEngin work.
 | 64-bit unsigned add/xor/rotate that survives NOVA's integer-op smart-dispatch bug #11 | R88 (ChaCha20 block function) | Use `int_add` / `int_xor` / `int_shl` escape hatches the way `stream_http` does for IP parsing |
 | Big-int (255-bit) field arithmetic — add, sub, mul, invert mod p25519 | R89 (x25519 Montgomery ladder) | ✅ Delivered as `src/safety/field25519.nova` on top of int_* escape hatches; runtime needed no change |
 | DER parsing helpers (`asn1_read_len`, tag reader) | R92 (X.509 subset parse) | ✅ Delivered as `src/net/tls/der.nova` (R92); runtime needed no change. Byte-list buffers with (buf, buf_len, off, out_params) shape, short + long form length, indefinite-length + long-form-tag + >4-length-bytes all refused. |
+| Handshake state machine orchestration | R93 (end-to-end in-process TLS 1.3) | ✅ Delivered as `src/net/tls/tls_transcript.nova` + `src/net/tls/tls_session.nova`; runtime needed no change. Session driven by caller-owned inbound/outbound byte queues so R93 needs no wire integration. |
 | Non-blocking accept + poll loop | R94 (multi-connection TLS) | R86 keeps the serial accept loop; TLS handshakes serialize behind it — acceptable for single-user first cut |
 
 **Runtime is off-limits for R86** (standing constraint: never edit
@@ -218,16 +219,35 @@ what unlocks the most testable surface earliest.
   **R95's trust-anchor registry lifts the "root supplied
   explicitly by caller" constraint by wiring the R55.1 trust
   material into cert selection.**
-- **R93 — handshake state machine wire-up. Next TLS phase.**
-  Fill in the `tls_handshake.nova` message parsers/serializers.
-  Drive `tls_state.nova` through a real ClientHello/ServerHello
-  round trip. Consumes R91 for RNG (via `tls_keyshare_generate`
-  and `tls_random_generate`) and R92 for the peer certificate
-  (via `tls_cert_verify_chain_and_signature`).
+- **R93 — ✅ handshake state machine wire-up.** In-memory only
+  (both peers instantiated in one process, byte queues as mock
+  transport). Replaces the R86 `tls_handshake.nova` stubs with real
+  parse / serialize for `ClientHello`, `ServerHello`,
+  `EncryptedExtensions`, `Certificate`, `CertificateVerify`,
+  `Finished` (RFC 8446 §4). Adds `src/net/tls/tls_transcript.nova`
+  (SHA-256 transcript rolling with snapshot-`get`) and
+  `src/net/tls/tls_session.nova` (connection state machine +
+  per-direction record keys + inbound/outbound byte queues).
+  Consumes R91 for RNG, R92 for the peer certificate chain, R88 for
+  the RFC 8446 §7.1 key schedule (early / handshake / master +
+  application traffic secrets), R89 for the ECDH shared secret, R90
+  for CertificateVerify, R87 for the record-layer AEAD, and the
+  R86 alert enum for fatal wire failures. **Crown-jewel test:** both
+  peers derive byte-identical `client_application_traffic_secret_0`
+  and `server_application_traffic_secret_0`; app data round-trips
+  in both directions with correct sequence-counter progression;
+  close_notify transitions both to CLOSING. **Explicit
+  simplifications** (documented at commit): no 0-RTT / no PSK /
+  no HelloRetryRequest / no client cert / no key update /
+  no post-handshake auth. **Wire still cleartext** — `wire_connection_wrap`
+  untouched; R94 flips it.
 - **R94 — record-layer AEAD wrap/unwrap + application-data path.**
   `wire_connection_wrap` starts returning a REAL wrapped_conn whose
   read/write encrypt/decrypt through the record layer. Feature-flag
-  ON only when a `tls_config` is present.
+  ON only when a `tls_config` is present. **Final TLS build-out
+  round.** Also ships the sidecar recipe for supplying entropy
+  through R91 Backend C in seccomp-filtered containers, and
+  operator docs.
 - **R95 — trust-anchor registry + cert chain validation (len<=2).**
   Layer on the R55.1 trust-anchor pattern.
 - **R96 — session-ticket resumption (0-RTT deferred).** Bring back the
