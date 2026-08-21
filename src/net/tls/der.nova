@@ -1,0 +1,258 @@
+// CrossEngin in-process TLS: minimal ASN.1 DER TLV walker (R92).
+//
+// Purpose
+//   Byte-level Distinguished-Encoding-Rules traversal used by
+//   `src/net/tls/x509.nova` to pull the six fields the R86 TLS 1.3
+//   suite needs from a certificate: serialNumber, issuer/subject CN,
+//   validity, subjectPublicKeyInfo (Ed25519 pubkey), signature. Kept
+//   deliberately small: this is TLV-level plumbing (parse one tag,
+//   parse one length, expose the value slice, hand back the offset of
+//   the next TLV). Anything semantic -- INTEGER-to-bignum, OID-to-name,
+//   time-string decoding -- lives in x509.nova.
+//
+//   Separate from `src/safety/x509.nova` (ECDSA-P-256 R32C parser)
+//   on purpose: the R86-chosen suite is Ed25519 only, wants a much
+//   smaller subset, and the DER walker itself is generic enough that
+//   later DER-carrying formats (session tickets, signed skill manifests,
+//   ...) can reuse it without dragging along the ECDSA code path.
+//
+// Byte representation
+//   Everything is a byte LIST (each entry an int in [0, 255]). This
+//   matches how `tls_cert.nova`, `ed25519_verify`, and the rest of the
+//   TLS module tree pass byte payloads. Certificates contain NUL bytes
+//   in abundance -- OID payloads, INTEGER content, BIT STRING content,
+//   BOOLEAN 0x00 -- so a C-string representation would truncate mid
+//   cert. All parse helpers accept `(buf, buf_len, off, ...)` where
+//   `buf_len` is the caller-declared usable prefix length; the walker
+//   never reads past `buf_len` and never past `len(buf)` if the two
+//   differ (defensive: caller MAY pass buf_len < len(buf) to restrict
+//   parsing to a sub-range).
+//
+// Out-parameters
+//   Every returned integer is delivered via a caller-supplied
+//   single-element list (idiomatic NOVA pattern; the module-level
+//   helpers `list_new`/`list_set` are used, and the value lives at
+//   index 0). The scalar return value from every parse helper is
+//   `ok` -- 1 on success, 0 on any malformed / truncated / disallowed
+//   input. On failure the out-parameter lists are left as the caller
+//   passed them.
+//
+// DER subset supported
+//   * Class 0 (universal) tags: INTEGER, BIT STRING, OCTET STRING,
+//     NULL, OBJECT IDENTIFIER, UTF8String, PrintableString, UTCTime,
+//     GeneralizedTime, SEQUENCE, SET.
+//   * Class 2 (context-specific) constructed tags [0]..[3] EXPLICIT
+//     (0xA0..0xA3) -- needed for TBSCertificate `version [0]` and the
+//     v3 `extensions [3]` wrapper.
+//   * Short-form length (< 128 direct).
+//   * Long-form length: 0x81..0x84 (1..4 length bytes big-endian).
+//     0x85+ (5+ length bytes) is rejected -- five-byte length would
+//     exceed the 63-bit signed integer range NOVA guarantees, and no
+//     legitimate CrossEngin-shaped cert exceeds 4 GiB.
+//   * Indefinite length (0x80 solo) is BER, NOT DER -- rejected.
+//
+// Anything else (long-form tags with the low-5-bits == 0x1F escape
+// hatch, primitive BIT STRING with a nonzero unused-bits count read
+// through der_bitstring_content, etc.) is either treated as an opaque
+// TLV (`der_read_tlv` passes the tag byte through -- interpretation
+// is x509's job) or explicitly rejected in the dedicated helper.
+//
+// NOVA quirks
+//   * NOVA strings are C-style NUL-terminated; use `[buf, len]` for
+//     every byte handling path -- byte lists carry NULs safely.
+//   * `len(0)` segfaults; caller must never pass a raw 0 as buf.
+//   * DER length parsing uses byte arithmetic, never str_to_int (which
+//     returns 0 for garbage).
+//   * 63-bit signed positive ints comfortably cover DER offsets and
+//     the 4-byte long-form length ceiling (2^32 - 1).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: none.
+
+// ---- tag constants -------------------------------------------------------
+
+// Universal, primitive.
+let DER_INTEGER            = 2
+let DER_BIT_STRING         = 3
+let DER_OCTET_STRING       = 4
+let DER_NULL               = 5
+let DER_OID                = 6
+let DER_UTF8STRING         = 12
+let DER_PRINTABLESTRING    = 19
+let DER_UTCTIME            = 23
+let DER_GENERALIZEDTIME    = 24
+
+// Universal, constructed.
+let DER_SEQUENCE           = 48   // 0x30
+let DER_SET                = 49   // 0x31
+
+// Context-specific, constructed (class 2, constructed bit set).
+//   Tag byte = 0xA0 | tag_number, for tag_number in 0..30.
+let DER_CONTEXT_0          = 160  // 0xA0 -- [0] EXPLICIT (version wrapper)
+let DER_CONTEXT_1          = 161  // 0xA1 -- [1] IMPLICIT (issuerUniqueID)
+let DER_CONTEXT_2          = 162  // 0xA2 -- [2] IMPLICIT (subjectUniqueID)
+let DER_CONTEXT_3          = 163  // 0xA3 -- [3] EXPLICIT (extensions)
+
+// Long-form length cap (in bytes). 4 bytes -> up to 2^32 - 1 = 4 GiB.
+// A five-byte long-form length is rejected outright -- no legitimate
+// cert or TLS message in this codebase approaches that size.
+let DER_MAX_LEN_BYTES      = 4
+
+// Return-code sentinels for the walker. `ok` is 1; every failure is 0.
+let DER_OK                 = 1
+let DER_ERR                = 0
+
+// ---- low-level TLV walker ------------------------------------------------
+
+// Read one TLV at `off` in `buf[0..buf_len]`. Populates:
+//   tag_out[0]      = the tag byte
+//   len_out[0]      = the content length in bytes
+//   val_off_out[0]  = offset of the first content byte (== off + header_len)
+//   next_off_out[0] = offset one past the last content byte
+//
+// Returns DER_OK on success. Returns DER_ERR on any of:
+//   * off < 0 or off >= buf_len (no room for tag byte)
+//   * long-form tag identifier (low 5 bits of tag == 0x1F)
+//   * indefinite length (0x80 solo)
+//   * long-form length with > DER_MAX_LEN_BYTES length bytes
+//   * length bytes missing (past buf_len)
+//   * content past buf_len
+fn der_read_tlv(buf, buf_len, off,
+                tag_out, len_out, val_off_out, next_off_out) {
+    if off < 0 { return DER_ERR }
+    if off >= buf_len { return DER_ERR }
+    // Refuse if the caller declared a length past the real buffer.
+    // `buf` may be a byte list; length is len(buf). We keep buf_len as
+    // the *usable* prefix but never allow it to exceed the true buffer.
+    if buf_len > len(buf) { return DER_ERR }
+    let tag = buf[off]
+    // Reject long-form tag identifiers (low 5 bits = 0x1F). None of
+    // the tags TLS 1.3 X.509 needs escape into long form; treating any
+    // encounter as malformed is safe here.
+    if int_and(tag, 31) == 31 { return DER_ERR }
+    let pos = off + 1
+    if pos >= buf_len { return DER_ERR }
+    let b0 = buf[pos]
+    let content_len = 0
+    let header_end = 0
+    if int_and(b0, 128) == 0 {
+        // Short form.
+        content_len = b0
+        header_end = pos + 1
+    } else {
+        if b0 == 128 {
+            // Indefinite length -- BER, not DER.
+            return DER_ERR
+        }
+        let n_bytes = int_and(b0, 127)
+        if n_bytes > DER_MAX_LEN_BYTES { return DER_ERR }
+        if n_bytes < 1 { return DER_ERR }
+        if pos + 1 + n_bytes > buf_len { return DER_ERR }
+        let acc = 0
+        let i = 0
+        while i < n_bytes {
+            acc = int_or(int_shl(acc, 8), buf[pos + 1 + i])
+            i = i + 1
+        }
+        content_len = acc
+        header_end = pos + 1 + n_bytes
+    }
+    if content_len < 0 { return DER_ERR }
+    let content_end = header_end + content_len
+    if content_end > buf_len { return DER_ERR }
+    list_set(tag_out,      0, tag)
+    list_set(len_out,      0, content_len)
+    list_set(val_off_out,  0, header_end)
+    list_set(next_off_out, 0, content_end)
+    return DER_OK
+}
+
+// Read a TLV and assert the tag matches `expected_tag`. Convenience
+// wrapper for the common case. Out shape mirrors der_read_tlv minus
+// the tag (redundant when the caller already knows what it expects).
+fn der_expect_tag(buf, buf_len, off, expected_tag,
+                  val_off_out, val_len_out, next_off_out) {
+    let tag = list_new()
+    push(tag, 0)
+    let ln = list_new()
+    push(ln, 0)
+    let vo = list_new()
+    push(vo, 0)
+    let no = list_new()
+    push(no, 0)
+    let ok = der_read_tlv(buf, buf_len, off, tag, ln, vo, no)
+    if ok == DER_ERR { return DER_ERR }
+    if tag[0] != expected_tag { return DER_ERR }
+    list_set(val_off_out, 0, vo[0])
+    list_set(val_len_out, 0, ln[0])
+    list_set(next_off_out, 0, no[0])
+    return DER_OK
+}
+
+// ---- semantic helpers ----------------------------------------------------
+
+// Compare an OID content slice `buf[off..off+len]` to a caller-supplied
+// expected OID content byte sequence `expected_bytes[0..expected_len]`.
+// Returns 1 on byte-equal match, 0 otherwise. Note: this compares the
+// CONTENT of the OID (subidentifier bytes), not a wrapped TLV -- the
+// caller will already have unwrapped the OID TLV with
+// `der_expect_tag(..., DER_OID, val_off, val_len, ...)`.
+//
+// Ed25519 OID from RFC 8410 §3: `1.3.101.112`
+//   subidentifier encoding: 43 (== 1*40+3), 101, 112
+//   3 content bytes: 0x2B 0x65 0x70
+// The full wrapped TLV is: 06 03 2B 65 70 (five bytes). This helper
+// takes the three content bytes.
+fn der_oid_equal(buf, off, ln, expected_bytes, expected_len) {
+    if ln != expected_len { return 0 }
+    if off < 0 { return 0 }
+    if off + ln > len(buf) { return 0 }
+    let i = 0
+    while i < ln {
+        if buf[off + i] != expected_bytes[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Extract the byte-aligned content of a BIT STRING VALUE. `off` is the
+// start of the BIT STRING's V bytes (the caller has already parsed
+// tag+length); `ln` is the V length. Populates:
+//   out_off[0] = off + 1 (first payload byte)
+//   out_len[0] = ln - 1  (payload byte count)
+//
+// Rejects (returns DER_ERR):
+//   * ln == 0 (BIT STRING must have at least the unused-bits byte)
+//   * the leading unused-bits byte is nonzero (we only accept
+//     byte-aligned BIT STRINGs -- the ones X.509 uses for signatures
+//     and SPKI pubkeys)
+//   * off/ln out of buffer range.
+fn der_bitstring_content(buf, off, ln, out_off, out_len) {
+    if ln < 1 { return DER_ERR }
+    if off < 0 { return DER_ERR }
+    if off + ln > len(buf) { return DER_ERR }
+    if buf[off] != 0 { return DER_ERR }
+    list_set(out_off, 0, off + 1)
+    list_set(out_len, 0, ln - 1)
+    return DER_OK
+}
+
+// ---- convenience: byte-equal comparison across two lists ----------------
+//
+// Not a DER primitive per se, but every caller of the DER walker ends
+// up needing "compare a slice of buf against a slice of another buf"
+// (e.g. leaf.issuer vs root.subject). Colocated here so x509.nova
+// stays focused on cert semantics.
+fn der_bytes_equal(a_buf, a_off, a_len, b_buf, b_off, b_len) {
+    if a_len != b_len { return 0 }
+    if a_off < 0 { return 0 }
+    if b_off < 0 { return 0 }
+    if a_off + a_len > len(a_buf) { return 0 }
+    if b_off + b_len > len(b_buf) { return 0 }
+    let i = 0
+    while i < a_len {
+        if a_buf[a_off + i] != b_buf[b_off + i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}

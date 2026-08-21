@@ -2628,13 +2628,177 @@ pubkey). R94 candidate is the wire-hook flip
 a `tls_config`). Handshake orchestration is the last big lift
 before an in-process TLS deployment is possible.
 
+### 7.42 X.509 subset parser + chain verify (R92)
+
+**Honest status: cert parsing + chain-verify + TLS
+CertificateVerify end-to-end works in tests. Handshake state
+machine still stubbed; wire still cleartext; RNG still
+sidecar-dependent in this sandbox.** R92 shipped the piece the
+R86 ADR flagged as "the last big cryptographic-plumbing bill"
+before handshake orchestration -- turning a raw 32-byte Ed25519
+pubkey (the R90 seam) into a real X.509 leaf + root pair the
+caller can hand in and get back a boolean "trust this pubkey?".
+
+**What the R92 profile supports:**
+
+- Ed25519 signature algorithm only (RFC 8410 OID `1.3.101.112`,
+  DER `06 03 2B 65 70`) -- both the outer signatureAlgorithm and
+  the SPKI algorithm are validated as Ed25519 and byte-equal to
+  each other (RFC 5280 §4.1.1.2).
+- Chain length capped at 2 (leaf + root). Root is passed in
+  explicitly by the caller -- there is no trust-anchor store
+  yet (R95+ territory). Root MUST be self-signed; leaf MUST NOT
+  be byte-identical to the root.
+- Distinguished Name reduced to CN (OID `2.5.4.3`). UTF8String
+  and PrintableString value encodings both accepted. Full DN
+  comparison is out of scope for R92; issuer/subject linkage
+  uses byte-equal CN comparison.
+- UTCTime (`YYMMDDHHMMSSZ`, 13 bytes) and GeneralizedTime
+  (`YYYYMMDDHHMMSSZ`, 15 bytes) parsed to a unix timestamp via
+  Howard Hinnant's public-domain `days_from_civil`. YY < 50
+  maps to 20YY per RFC 5280 §4.1.2.5.1.
+- Non-critical extensions are tolerated (stepped over).
+  Critical extensions the parser does not understand are
+  refused -- and R92 understands zero extensions, so any
+  critical extension in the cert fails the parse.
+
+**What the R92 profile refuses (unambiguous):**
+
+- Any signature algorithm other than Ed25519 (RSA / ECDSA /
+  Ed448 etc.).
+- Chain length > 2. Root that is not self-signed. Self-signed
+  leaf (leaf byte-equal to root).
+- UTCTime / GeneralizedTime without a trailing `Z` (offset
+  timezones would require arithmetic the R92 helper does not
+  carry, and TLS 1.3 servers ship Z-suffix certs in practice).
+- Any critical extension.
+- BIT STRING with a nonzero unused-bits count in the SPKI or
+  signature slot (both are byte-aligned).
+- Long-form length encodings > 4 bytes (0x85+). Indefinite
+  length (0x80 solo -- BER, not DER).
+- Long-form tag identifiers (low 5 bits == 0x1F).
+- Anything other than a 32-byte SPKI pubkey / 64-byte signature.
+
+**Why algorithm rigidity, not agility:** the R86 ADR chose one
+TLS suite (`TLS_CHACHA20_POLY1305_SHA256`) with x25519 and
+Ed25519 uniformly. The daemon has no reason to accept a cert
+signed with a different scheme -- there is no interop matrix to
+cover, no legacy suite to negotiate down to. Refusing everything
+else here means the R93 handshake code path never has to
+double-check `sig_alg == Ed25519` on its own; a cert that passed
+`x509_parse` is Ed25519 by construction.
+
+**Module layout:**
+
+- `src/net/tls/der.nova` -- minimal ASN.1 DER TLV walker
+  (`der_read_tlv`, `der_expect_tag`, `der_oid_equal`,
+  `der_bitstring_content`, `der_bytes_equal`, tag constants).
+  Deliberately kept generic: byte-list buffers with
+  offset/length pairs, out-parameters via single-element lists,
+  no cert-specific state.
+- `src/net/tls/x509.nova` -- cert parser + chain verifier
+  (`x509_parse`, `x509_verify_self_signed`,
+  `x509_verify_signed_by`, `x509_check_validity`,
+  `x509_check_issuer`, `x509_chain_verify`,
+  `x509_parse_utctime`, `x509_parse_generalizedtime`). Parsed
+  cert is a fixed-index NOVA list holding offsets into the
+  original cert buffer -- no allocation for the parse result
+  beyond the struct itself.
+- `src/net/tls/tls_cert.nova` -- new
+  `tls_cert_verify_chain_and_signature(leaf_buf, leaf_len,
+  root_buf, root_len, now_unix, transcript_hash,
+  transcript_hash_len, is_server, tls_signature)` end-to-end
+  wrapper: chain-verify + assemble the RFC 8446 §4.4.3
+  signed-content blob + verify the TLS CertificateVerify
+  signature under the leaf's SPKI pubkey, all in one call.
+  R90's raw-pubkey APIs stay (still called by tests and by the
+  low-level wrappers).
+
+**Note on `src/safety/x509.nova`:** that pre-existing 903-line
+module is the DTLS 1.2 ECDSA-P-256 parser (R32C). It is
+intentionally NOT reused by the R92 TLS 1.3 path -- different
+suite, different algorithm rigidity, and folding the two would
+force the TLS 1.3 path to accept algorithm choices the R86 ADR
+already rejected. Keeping them separate lets each remain
+small and single-purpose.
+
+**Fixture strategy (test cert building):**
+
+- `tests/unit/fixtures/x509_test_certs.nova` --
+  `x509_build_test_cert(subject_cn, issuer_cn, serial, nb_utc,
+  na_utc, spki_pk_32, signer_seed_32, signer_pk_32)` assembles
+  a proper DER-encoded cert programmatically and signs the TBS
+  with `ed25519_sign`. Round-trip tests then feed the result
+  straight into `x509_parse` / `x509_chain_verify`. Preferred
+  over hex-literal fixtures: the DER assembly is auditable in
+  NOVA, the signature always corresponds to the current TBS
+  bytes (no stale-hex risk), and negative-case variants
+  (`x509_build_test_cert_bad_alg`, `x509_build_test_cert_with_ext`
+  with critical/non-critical flag, `x509_build_test_cert_non_z_time`)
+  reuse the same encoder. Root key = RFC 8032 §7.1 TEST 1;
+  leaf key = TEST 2.
+
+**Tests (R92 delta):**
+
+- `test_der` -- 73 checks. Short-form and long-form (0x81/0x82)
+  length parsing; indefinite-length / >4-length-bytes / truncated /
+  long-form-tag rejection; nested SEQUENCE walk; BIT STRING
+  zero and nonzero unused-bits; OID equality (match, prefix
+  mismatch, length mismatch, out-of-range); [0] EXPLICIT wrap;
+  `der_bytes_equal` cases.
+- `test_x509_r92` -- 60 checks. UTCTime YY=49 → 2049 and YY=50
+  → 1950; GeneralizedTime 1970-01-01 → unix 0 and
+  2020-02-29 12:00 (leap year); non-Z suffix rejection;
+  round-trip on a built root/leaf pair with every field
+  cross-checked; self-signature verify; leaf-by-root verify;
+  validity window with inclusive-boundary edge cases;
+  CN-based issuer check; happy-path `x509_chain_verify`; five
+  tamper cases (sig bit, TBS bit, wrong root, expired, self-
+  signed leaf); four format rejections (non-Ed25519 alg,
+  critical extension, non-critical extension tolerated,
+  non-Z time in cert); trailing-byte rejection; empty-buf
+  rejection.
+- `test_tls_cert_chain` -- 14 checks. End-to-end
+  `tls_cert_verify_chain_and_signature` happy path for both
+  server-role and client-role CertificateVerify; wrong-root
+  fail; expired-cert fail; tampered CertVerify signature fail;
+  swapped-role fail (both directions); 63/65-byte sig
+  rejection; negative and oversized transcript_hash_len
+  rejection; tampered transcript fail; tampered leaf-TBS fail;
+  byte-equal leaf/root refusal.
+
+All 147 new R92 checks green.
+
+**Regression sweep (R92):** `test_tls_cert` (41),
+`test_tls_kdf` (27), `test_tls_keyshare` (14),
+`test_tls_keyshare_rng` (27), `test_tls_alerts` (161),
+`test_tls_state` (68), `test_tls_scaffold` (70),
+`test_tls_record_aead` (53), `test_tls13_keyschedule` (28),
+`test_capability_wire` (245), `test_nl_rpc_verbs` (74) all
+green. `test_ed25519` retains the one pre-existing
+`ed25519_sign latency positive` red carried since R89/R90
+(nanotime segfaults in this sandbox); not attributable to
+R92. Pre-existing `test_dtls12` reds untouched -- unrelated
+to the R87..R92 TLS 1.3 build-out.
+
+What R92 unlocks next: R93 candidate is the handshake
+state-machine wire-up (ClientHello → ServerHello →
+EncryptedExtensions → Certificate → CertificateVerify →
+Finished orchestration), consuming R91's RNG for the two
+`.random` fields and the ephemeral x25519 scalar and R92's
+parsed cert for the peer's Ed25519 pubkey. R94 candidate is
+the wire-hook flip (`wire_connection_wrap` starts returning a
+real wrapped_conn under a `tls_config`; ships alongside a
+sidecar recipe for supplying entropy through Backend C in
+seccomp-filtered containers).
+
 ## 12. What comes next (R90+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
 candidates queue alongside so no round idles waiting on a runtime
 blocker.
 
-**TLS build-out (drives R92..R9X — see §7.36, §7.37, §7.38, §7.39, §7.40, §7.41):**
+**TLS build-out (drives R93..R9X — see §7.36, §7.37, §7.38, §7.39, §7.40, §7.41, §7.42):**
 
 - **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
   RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
@@ -2660,17 +2824,28 @@ blocker.
   RNG-driven. **Caveat**: OS backend is UNAVAILABLE in this
   project's sandbox container (seccomp blocks `getrandom`); use
   Backend C (callback) in that case, wired by a launcher/sidecar.
-- **R92** — X.509 DER subset parser (leaf-only, six required
-  fields, refuse the rest). Vector-tested against a hand-authored
-  cert. Consumes the R90 `tls_cert.nova` seam (raw-pubkey today
-  → parsed-cert then). **Next TLS phase.**
+- **R92** — ✅ X.509 subset parser + cert-chain verify (see §7.42;
+  RFC 5280 + RFC 8410, Ed25519-only, chain-len-2, CN-only DN,
+  UTCTime + GeneralizedTime with Z suffix). New
+  `src/net/tls/der.nova` (73 checks) + `src/net/tls/x509.nova`
+  (60 checks) + `tls_cert_verify_chain_and_signature` end-to-end
+  wrapper on `tls_cert.nova` (14 checks). Test-cert fixture built
+  programmatically via `x509_build_test_cert` (RFC 8032 TEST 1
+  root, TEST 2 leaf) — DER assembler colocated at
+  `tests/unit/fixtures/x509_test_certs.nova`, signed at test time
+  by the in-tree `ed25519_sign`. The R90 seam
+  (`tls_cert_verify_ed25519` with a raw 32-byte pubkey) stays for
+  the low-level path and its tests; the R92 wrapper adds
+  cert-chain gating on top.
 - **R93** — Handshake state-machine wire-up (fills in the R86
   `tls_handshake.nova` stubs). Consumes R91 for the RNG via
   `tls_keyshare_generate` / `tls_random_generate`, and R92 for
-  the peer cert.
+  the peer cert. **Next TLS phase.**
 - **R94** — Wire-hook flip: `wire_connection_wrap` starts returning
   a real wrapped_conn under a `tls_config`. **First deployable
-  in-process TLS round.**
+  in-process TLS round.** Ships alongside a sidecar recipe for
+  supplying entropy through Backend C in seccomp-filtered
+  containers.
 - **R95..R9X** — Trust-anchor chain validation, session tickets,
   live-alert delivery, hardening / fuzz audits.
 

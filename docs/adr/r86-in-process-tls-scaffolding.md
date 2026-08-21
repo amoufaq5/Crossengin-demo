@@ -113,7 +113,7 @@ CrossEngin work.
 | CSPRNG (e.g. `sys_getrandom` / `/dev/urandom` read) | R87 (client-random / server-random / ephemeral key) | ✅ R91 shipped `src/safety/rng.nova` — pluggable interface with three backends (OS via NOVA's `secure_random` builtin, TEST-ONLY deterministic ChaCha20-CTR, caller-supplied callback). No NOVA runtime change; OS backend is unavailable when the container's seccomp blocks `getrandom` (this project's sandbox is such an environment), so the callback backend is the recommended production integration when a launcher/sidecar supplies bytes. |
 | 64-bit unsigned add/xor/rotate that survives NOVA's integer-op smart-dispatch bug #11 | R88 (ChaCha20 block function) | Use `int_add` / `int_xor` / `int_shl` escape hatches the way `stream_http` does for IP parsing |
 | Big-int (255-bit) field arithmetic — add, sub, mul, invert mod p25519 | R89 (x25519 Montgomery ladder) | ✅ Delivered as `src/safety/field25519.nova` on top of int_* escape hatches; runtime needed no change |
-| DER parsing helpers (`asn1_read_len`, tag reader) | R91 (X.509 subset parse) | Implemented in `src/net/tls/prims/der.nova`; runtime need not change |
+| DER parsing helpers (`asn1_read_len`, tag reader) | R92 (X.509 subset parse) | ✅ Delivered as `src/net/tls/der.nova` (R92); runtime needed no change. Byte-list buffers with (buf, buf_len, off, out_params) shape, short + long form length, indefinite-length + long-form-tag + >4-length-bytes all refused. |
 | Non-blocking accept + poll loop | R94 (multi-connection TLS) | R86 keeps the serial accept loop; TLS handshakes serialize behind it — acceptable for single-user first cut |
 
 **Runtime is off-limits for R86** (standing constraint: never edit
@@ -197,15 +197,33 @@ what unlocks the most testable surface earliest.
   `secure_random` returns -1); Backend C is the intended path
   there. A full HKDF-based DRBG is a candidate for a later round
   if the OS source proves unreliable across target environments.
-- **R92 — X.509 DER subset parser (leaf-only). Next TLS phase.**
-  Parse the six required fields, refuse the rest. Vector-tested
-  against a hand-authored cert. Consumes the R90 `tls_cert.nova`
-  seam.
-- **R93 — handshake state machine wire-up.** Fill in the
-  `tls_handshake.nova` message parsers/serializers. Drive
-  `tls_state.nova` through a real ClientHello/ServerHello round
-  trip. Consumes R91 for RNG (via `tls_keyshare_generate` and
-  `tls_random_generate`) and R92 for the peer certificate.
+- **R92 — ✅ X.509 subset parser + chain verify (chain-len<=2).**
+  Ships `src/net/tls/der.nova` (minimal ASN.1 DER TLV walker) +
+  `src/net/tls/x509.nova` (cert parser + chain verifier). RFC 5280
+  fields extracted: serialNumber, issuer/subject CN, validity,
+  SPKI (Ed25519), tbsCertificate byte range, signatureAlgorithm,
+  signatureValue. RFC 8410 Ed25519 OID (`1.3.101.112`) recognized
+  in both slots; RSA/ECDSA/other refused. UTCTime and
+  GeneralizedTime with Z suffix supported (non-Z rejected).
+  Non-critical extensions tolerated; critical extensions refused.
+  `x509_chain_verify(leaf, root, now_unix, ...)` runs the full
+  chain check (Ed25519 rigidity, validity window, root
+  self-signature, leaf-signed-by-root, CN-based issuer match,
+  self-signed-leaf refusal). `tls_cert.nova` gains
+  `tls_cert_verify_chain_and_signature(...)` end-to-end wrapper.
+  Test-cert fixture built programmatically via
+  `x509_build_test_cert` (RFC 8032 TEST 1 root, TEST 2 leaf).
+  147 new checks (73 der + 60 x509 + 14 chain end-to-end);
+  regression sweep green. Consumes the R90 `tls_cert.nova` seam.
+  **R95's trust-anchor registry lifts the "root supplied
+  explicitly by caller" constraint by wiring the R55.1 trust
+  material into cert selection.**
+- **R93 — handshake state machine wire-up. Next TLS phase.**
+  Fill in the `tls_handshake.nova` message parsers/serializers.
+  Drive `tls_state.nova` through a real ClientHello/ServerHello
+  round trip. Consumes R91 for RNG (via `tls_keyshare_generate`
+  and `tls_random_generate`) and R92 for the peer certificate
+  (via `tls_cert_verify_chain_and_signature`).
 - **R94 — record-layer AEAD wrap/unwrap + application-data path.**
   `wire_connection_wrap` starts returning a REAL wrapped_conn whose
   read/write encrypt/decrypt through the record layer. Feature-flag
