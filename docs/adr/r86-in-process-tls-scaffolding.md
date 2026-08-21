@@ -110,7 +110,7 @@ CrossEngin work.
 
 | Missing runtime primitive | First round it blocks | Cope in the interim |
 |---|---|---|
-| CSPRNG (e.g. `sys_getrandom` / `/dev/urandom` read) | R87 (client-random / server-random / ephemeral key) | ADR blocks handshake landing until runtime ships it |
+| CSPRNG (e.g. `sys_getrandom` / `/dev/urandom` read) | R87 (client-random / server-random / ephemeral key) | ✅ R91 shipped `src/safety/rng.nova` — pluggable interface with three backends (OS via NOVA's `secure_random` builtin, TEST-ONLY deterministic ChaCha20-CTR, caller-supplied callback). No NOVA runtime change; OS backend is unavailable when the container's seccomp blocks `getrandom` (this project's sandbox is such an environment), so the callback backend is the recommended production integration when a launcher/sidecar supplies bytes. |
 | 64-bit unsigned add/xor/rotate that survives NOVA's integer-op smart-dispatch bug #11 | R88 (ChaCha20 block function) | Use `int_add` / `int_xor` / `int_shl` escape hatches the way `stream_http` does for IP parsing |
 | Big-int (255-bit) field arithmetic — add, sub, mul, invert mod p25519 | R89 (x25519 Montgomery ladder) | ✅ Delivered as `src/safety/field25519.nova` on top of int_* escape hatches; runtime needed no change |
 | DER parsing helpers (`asn1_read_len`, tag reader) | R91 (X.509 subset parse) | Implemented in `src/net/tls/prims/der.nova`; runtime need not change |
@@ -182,19 +182,30 @@ what unlocks the most testable surface earliest.
   differ in role word only, full sign+verify round-trip, tamper /
   shape rejection). X.509 parsing NOT included -- raw pubkey
   passed in.
-- **R91 — CSPRNG source. Next TLS phase.** Land either a NOVA
-  runtime addition exposing `sys_getrandom` / `/dev/urandom` read,
-  or an explicit stub-with-audit-warning path. R89's x25519
-  keyshare and R93's handshake both need a real random source;
-  shipping the handshake without one would be a fatal correctness
-  bug for the privacy story TLS exists to give the wire.
-- **R92 — X.509 DER subset parser (leaf-only).** Parse the six
-  required fields, refuse the rest. Vector-tested against a
-  hand-authored cert. Consumes the R90 `tls_cert.nova` seam.
+- **R91 — ✅ CSPRNG source + pluggable RNG interface.** Ships
+  `src/safety/rng.nova` with three backends: OS entropy (wraps
+  NOVA's `secure_random` builtin, which itself wraps the Linux
+  `getrandom` syscall, folded through a SHA-256 extractor);
+  TEST-ONLY deterministic ChaCha20-CTR keyed by SHA-256(seed) for
+  reproducible test coverage; and caller-supplied callback for
+  integrators to plug in bespoke entropy sources. Wire integration:
+  `tls_keyshare_generate(rng_ctx, priv, pub)` and
+  `tls_random_generate(rng_ctx, buf, len)` on `tls_keyshare.nova`.
+  75 new test checks (48 rng + 27 tls_keyshare_rng); regression
+  green. **Caveat**: the OS backend is unavailable in this
+  project's sandbox container (seccomp blocks `getrandom`, so
+  `secure_random` returns -1); Backend C is the intended path
+  there. A full HKDF-based DRBG is a candidate for a later round
+  if the OS source proves unreliable across target environments.
+- **R92 — X.509 DER subset parser (leaf-only). Next TLS phase.**
+  Parse the six required fields, refuse the rest. Vector-tested
+  against a hand-authored cert. Consumes the R90 `tls_cert.nova`
+  seam.
 - **R93 — handshake state machine wire-up.** Fill in the
   `tls_handshake.nova` message parsers/serializers. Drive
   `tls_state.nova` through a real ClientHello/ServerHello round
-  trip. Consumes R91 for RNG and R92 for the peer certificate.
+  trip. Consumes R91 for RNG (via `tls_keyshare_generate` and
+  `tls_random_generate`) and R92 for the peer certificate.
 - **R94 — record-layer AEAD wrap/unwrap + application-data path.**
   `wire_connection_wrap` starts returning a REAL wrapped_conn whose
   read/write encrypt/decrypt through the record layer. Feature-flag

@@ -2498,13 +2498,143 @@ to land the primitive first). R92 candidate is the X.509 subset
 parser. R93 candidate is the handshake state machine. R94
 candidate is the wire-hook flip.
 
+### 7.41 CSPRNG source + RNG interface (R91)
+
+**Honest status: RNG interface + three pluggable backends ship;
+`tls_keyshare_generate` and `tls_random_generate` are RNG-driven
+wire entry points on the R89 keyshare module. Callers no longer
+have to supply a scalar. But — OS-entropy backend is UNAVAILABLE
+in this project's sandbox container (NOVA's `secure_random` builtin
+wraps the Linux `getrandom` syscall, and the container's seccomp
+filter blocks it: `secure_random` returns -1). The interface still
+ships; on this container it must be driven via the deterministic
+test backend (TEST-ONLY) or the caller-supplied callback backend
+that a launcher/sidecar wires up. Handshake orchestration remains
+stubbed; wire is still cleartext.**
+
+**Probe finding (this container, R91):**
+
+- `secure_random(buf, 32)` → returns `-1` (getrandom blocked by
+  seccomp).
+- `nanotime()` → the ARM64 stub-clock in this container is broken
+  in a way that segfaults the process on a bare call, so it is
+  NOT a viable fallback entropy source anywhere (and would be a
+  cryptographic-quality liability even if it worked).
+- No `/dev/urandom` sys_open probe was attempted: R73/R74/R75
+  showed that `sys_open` in this container aborts on some paths,
+  and `secure_random` returning `-1` already gives us the
+  authoritative "OS entropy is not reachable" signal. In a
+  production deployment where `getrandom` is not filtered out,
+  `rng_os_new` will succeed and the OS backend serves normally.
+
+Because Backend A cannot be exercised here, we do NOT hard-fail
+the test suite over its absence. `test_rng` logs
+`SKIP: OS entropy source not available in this container ...` and
+still passes 48 checks against Backends B and C plus the interface
+sanity coverage. In an environment where `getrandom` is available,
+`test_rng` upgrades that skip to an actively-exercised path
+without any test-code change.
+
+**Interface (src/safety/rng.nova):**
+
+```
+rng_read(rng_ctx, out_buf, out_len)               -> ok  (1|0)
+rng_kind(rng_ctx)                                 -> int  (RNG_KIND_*)
+rng_os_new(ctx_out)                               -> ok  (1|0)
+rng_test_new(ctx_out, seed_buf, seed_len)         -> ok  (1|0)
+rng_callback_new(ctx_out, cb_fn)                  -> ok  (1|0)
+```
+
+`rng_ctx` is an opaque NOVA list produced by a backend constructor.
+Callers do not know or care which backend is behind it. `rng_read`
+returns 1 iff `out_buf` was fully populated with `out_len` bytes;
+0 on any failure (RNG dry, bad-shape ctx, negative or oversized
+`out_len`, unknown-kind sentinel). A zero-length read is a
+no-op returning 1.
+
+**Backends shipped:**
+
+- **A — OS entropy via `secure_random`.** Wraps NOVA's `secure_random`
+  builtin (which itself wraps the Linux `getrandom` syscall) and
+  folds the raw bytes through a lightweight SHA-256 extractor
+  (read 64 bytes → SHA-256 → 32-byte pool, serve pool). Not a full
+  HKDF-based DRBG — that upgrade is a candidate for a later round
+  if the OS source proves unreliable across target environments.
+  `rng_os_new` probes the source at construction and returns 0 if
+  it is unavailable (as in this container). Use in production
+  where `getrandom` is reachable.
+- **B — TEST-ONLY deterministic RNG.** ChaCha20-CTR keystream
+  keyed by SHA-256(seed), block-counter monotonic. Byte-identical
+  output from a given seed. Rejected empty seed. **Never for real
+  handshakes.** Present so downstream tests (x25519 keyshare,
+  handshake orchestration once it lands) can be reproducible.
+  An exported constant `RNG_TEST_BACKEND_WARNING` carries the
+  explicit warning string; `test_rng` pins its shape so a future
+  refactor cannot quietly soften it.
+- **C — Caller-supplied callback.** Wraps a function reference
+  `fn cb_fn(out_buf, out_len) -> ok` so integrators can plug in
+  any entropy source without the RNG interface knowing. **This is
+  the recommended production integration when Backend A is
+  unavailable in the target environment** — a launcher / sidecar
+  that reads from `/dev/urandom` on the operator's behalf and
+  supplies bytes through the callback closes the R91 gap without
+  any NOVA-runtime change.
+
+**Wire integration (src/net/tls/tls_keyshare.nova):**
+
+- `tls_keyshare_generate(rng_ctx, priv_out, pub_out) -> ok` —
+  pulls 32 bytes into `priv_out` from `rng_ctx`, computes
+  `pub_out = x25519_base(priv_out)`, returns 1 on success. Zero
+  on RNG failure, `x25519_base` failure, or an all-zero pubkey
+  (defensive check — a real RNG never hits this in practice).
+- `tls_random_generate(rng_ctx, out_buf, out_len) -> ok` —
+  generic random-bytes helper for ClientHello.random,
+  ServerHello.random, session-ticket nonces, etc. Length capped
+  at `TLS_RANDOM_MAX = 1024` so a caller confused about a signed
+  length can't request a huge fill.
+- The pre-existing caller-supplied-scalar path
+  (`tls_keyshare_x25519_public` / `_shared`) is kept for the
+  RFC 7748 §6.1 test vector and for tests that need a known
+  scalar.
+
+**Tests (R91 delta):** `test_rng` at 48 checks
+(interface-independent shape + Backend B determinism at four
+lengths + Backend C invocation/propagation + Backend A probe with
+SKIP semantics). `test_tls_keyshare_rng` at 27 checks (reproducible
+keyshare from a seeded RNG, DH round-trip end-to-end through the
+wire entry point, `tls_random_generate` length bounds and
+determinism, RNG-failure propagation via a rigged callback). All
+green.
+
+**Regression sweep (R91):** `test_tls_keyshare`, `test_tls_kdf`,
+`test_tls_record_aead`, `test_chacha20`, `test_chacha20_poly1305`,
+`test_poly1305`, `test_sha256`, `test_x25519`, `test_field25519`,
+`test_hkdf_sha256`, `test_tls_alerts`, `test_tls_state`,
+`test_tls_scaffold`, `test_tls_cert`, `test_capability_wire`,
+`test_nl_rpc_verbs` all green. `test_ed25519` has the one
+pre-existing `ed25519_sign latency positive` red carried since
+R89/R90 (nanotime broken container-side; R91 confirms nanotime is
+not merely returning 0 in this sandbox — it segfaults the process
+on a bare call, matching R90's "sandbox-quirk" note). Not
+attributable to R91.
+
+What R91 unlocks next: R92 candidate is the X.509 DER subset
+parser (leaf-only, six required fields). R93 candidate is the
+handshake state-machine wire-up (consumes R91's RNG interface for
+ClientHello.random / ServerHello.random / ephemeral x25519 scalar
+via `tls_keyshare_generate`, and R92's parsed cert for the peer
+pubkey). R94 candidate is the wire-hook flip
+(`wire_connection_wrap` starts returning a real wrapped_conn under
+a `tls_config`). Handshake orchestration is the last big lift
+before an in-process TLS deployment is possible.
+
 ## 12. What comes next (R90+)
 
 The in-process TLS build-out drives the next several rounds. Non-TLS
 candidates queue alongside so no round idles waiting on a runtime
 blocker.
 
-**TLS build-out (drives R91..R9X — see §7.36, §7.37, §7.38, §7.39, §7.40):**
+**TLS build-out (drives R92..R9X — see §7.36, §7.37, §7.38, §7.39, §7.40, §7.41):**
 
 - **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
   RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
@@ -2523,32 +2653,39 @@ blocker.
   `ed25519.nova` (R54.2), new `tls_cert.nova` for the RFC 8446
   §4.4.3 signed-content assembly + verify. **Every TLS crypto
   primitive is now in tree.** Remaining TLS work is orchestration.
-- **R91** — CSPRNG source (RUNTIME work in NOVA or an explicit
-  stub-with-audit-warning path). Must land before the handshake
-  wire-up (R93) can produce a real server-random / client-random /
-  ephemeral x25519 scalar. **Next TLS phase.**
+- **R91** — ✅ CSPRNG source + pluggable RNG interface (see §7.41;
+  three backends: OS via `secure_random`, TEST-ONLY deterministic
+  ChaCha20-CTR, caller-supplied callback). `tls_keyshare_generate`
+  and `tls_random_generate` on the R89 keyshare module now
+  RNG-driven. **Caveat**: OS backend is UNAVAILABLE in this
+  project's sandbox container (seccomp blocks `getrandom`); use
+  Backend C (callback) in that case, wired by a launcher/sidecar.
 - **R92** — X.509 DER subset parser (leaf-only, six required
   fields, refuse the rest). Vector-tested against a hand-authored
   cert. Consumes the R90 `tls_cert.nova` seam (raw-pubkey today
-  → parsed-cert then).
+  → parsed-cert then). **Next TLS phase.**
 - **R93** — Handshake state-machine wire-up (fills in the R86
-  `tls_handshake.nova` stubs). Consumes R91 for the RNG and R92
-  for the peer cert.
+  `tls_handshake.nova` stubs). Consumes R91 for the RNG via
+  `tls_keyshare_generate` / `tls_random_generate`, and R92 for
+  the peer cert.
 - **R94** — Wire-hook flip: `wire_connection_wrap` starts returning
   a real wrapped_conn under a `tls_config`. **First deployable
   in-process TLS round.**
 - **R95..R9X** — Trust-anchor chain validation, session tickets,
   live-alert delivery, hardening / fuzz audits.
 
-**Runtime gap that R91 must resolve:**
+**Runtime gap (R91 partially addressed):**
 
-- **CSPRNG source.** No NOVA runtime primitive exposes
-  `sys_getrandom` / `/dev/urandom` read today. R89's keyshare
-  wrapper takes a caller-supplied scalar with a docstring flagging
-  this. R91 must land either a NOVA runtime addition or an
-  explicit stub-with-audit-warning path -- shipping the handshake
-  without a real RNG would be a fatal correctness bug for the
-  privacy story the TLS work exists to give the wire.
+- **CSPRNG source.** The RNG interface (R91) unblocks callers by
+  giving them a pluggable seam. The OS backend uses NOVA's
+  `secure_random` builtin (wraps `getrandom` on Linux). When the
+  target environment permits `getrandom`, this backend serves
+  entropy end-to-end with no additional work. When it does not
+  (seccomp-filtered containers, this project's sandbox included),
+  operators wire Backend C (callback) to a sidecar or launcher
+  that supplies bytes from a source NOVA cannot reach directly.
+  A full HKDF-based DRBG is a candidate for a later round if the
+  OS source proves unreliable across target environments.
 
 **Other candidates (any round can pull one instead of a TLS phase
 that's blocked on a runtime primitive):**
@@ -2564,6 +2701,10 @@ that's blocked on a runtime primitive):**
   combined ceiling).
 - Hardware-key-backed admin bootstrap (yubikey attestation on
   `capability.issue` for the first admin token).
+- DTLS-12 red-fix (72/450 checks red since R86; unrelated to the
+  R87..R91 TLS build-out but the tally deserves a pass).
+- Consolidation refactor: `bignum_256` / `field25519` overlap —
+  both carry 256-bit modular arithmetic paths.
 
 ## 13. Troubleshooting
 

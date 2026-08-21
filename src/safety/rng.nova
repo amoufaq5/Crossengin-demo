@@ -1,0 +1,319 @@
+// CrossEngin safety/rng: pluggable RNG interface (R91, ADR
+// r86-in-process-tls-scaffolding.md).
+//
+// Purpose
+//   TLS 1.3 handshake orchestration needs cryptographically-secure
+//   random bytes in two places: the 32-byte x25519 keyshare private
+//   scalar (RFC 7748 §5), and the 32-byte ClientHello.random /
+//   ServerHello.random nonces (RFC 8446 §4.1.2 / §4.1.3). R89 landed
+//   the x25519 primitive with a caller-supplied scalar; R91 adds the
+//   RNG source the wire path will consume, without deciding today
+//   exactly which entropy backend a given deployment uses.
+//
+// The interface is deliberately narrow:
+//     rng_read(rng_ctx, out_buf, out_len) -> ok
+//
+// where `rng_ctx` is an opaque handle produced by a backend
+// constructor (`rng_os_new`, `rng_test_new`, `rng_callback_new`).
+// Callers (x25519 keyshare, TLS nonce generation, capability-token
+// mint) do not know or care which backend is behind `rng_ctx`; only
+// the constructor knows.
+//
+// Backends shipped in R91
+//   A) rng_os_new(ctx_out) — OS entropy via NOVA's `secure_random`
+//      builtin (which wraps the getrandom() syscall on Linux). The
+//      builtin returns -1 (or fewer bytes than requested) when the
+//      syscall is blocked / unavailable; in that case rng_os_new
+//      itself returns ok=0 and the caller must pick a different
+//      backend or supply its own entropy via backend C. On success
+//      the OS bytes are folded through a lightweight SHA-256
+//      extractor (read 64 bytes at a time, hash to a 32-byte pool,
+//      serve out of the pool) so we get a small forward-secrecy
+//      buffer if the OS source is briefly slow. This is NOT a full
+//      HKDF-based DRBG (that's a candidate for a later round if the
+//      OS backend proves unreliable across target environments).
+//
+//   B) rng_test_new(ctx_out, seed_buf, seed_len) — deterministic
+//      ChaCha20-CTR keystream keyed by SHA-256(seed). Reproducible
+//      byte-for-byte from a given seed. TEST-ONLY: MUST NEVER be used
+//      for a real TLS handshake — the "randomness" is fully predictable
+//      to anyone who knows the seed. Reject empty seed with ok=0.
+//
+//   C) rng_callback_new(ctx_out, cb_fn) — wraps a caller-supplied
+//      function of signature `fn cb_fn(out_buf, out_len) -> ok`.
+//      Lets integrators plug in a hardware RNG, a sidecar entropy
+//      daemon, or any bespoke entropy source without the RNG interface
+//      needing to know about it. When OS backend A is unavailable in
+//      the deployment environment (e.g. a seccomp-restricted container
+//      that blocks getrandom, as this project's sandbox does — see
+//      R91 probe finding in the ADR), backend C is the recommended
+//      production integration.
+//
+// Return conventions
+//   rng_read(rng_ctx, out_buf, out_len) returns 1 on success (out_buf
+//   fully filled with out_len bytes) or 0 on failure. Zero-length
+//   reads are a no-op that returns 1. Negative lengths return 0.
+//
+//   Constructors (`rng_*_new`) return 1 on success and populate
+//   ctx_out (a list you allocate empty and pass in) with the ctx
+//   fields; 0 on failure.
+//
+// NOVA dependencies: builtins (alloc, load8, store8, list_new, push,
+//   list_set, len, int_and, int_shl, int_shr, int_or, int_xor,
+//   secure_random).
+// CrossEngin dependencies:
+//   src/safety/sha256.nova    -- sha256_oneshot (OS extractor + test
+//                                seed → key).
+//   src/safety/chacha20.nova  -- chacha20_block_buf (test backend
+//                                keystream).
+
+import "./sha256.nova"
+import "./chacha20.nova"
+
+// ---- constants ----------------------------------------------------------
+
+let RNG_KIND_OS       = 1
+let RNG_KIND_TEST     = 2
+let RNG_KIND_CALLBACK = 3
+
+// Explicit exported warning string. Tests grep this at runtime to
+// confirm the TEST-ONLY warning survives future refactors of the
+// backing implementation.
+let RNG_TEST_BACKEND_WARNING = "TEST-ONLY: rng_test_new is deterministic and MUST NEVER be used for a real TLS handshake, x25519 keyshare, ClientHello.random / ServerHello.random, or capability-token mint."
+
+// OS extractor: read this many bytes from `secure_random` at a time
+// and fold through SHA-256 to a 32-byte pool.
+let _RNG_OS_RAW_LEN = 64
+let _RNG_OS_POOL_LEN = 32
+
+// Maximum bytes a single rng_read is willing to serve. Keeps a
+// bogus call (negative-as-huge-unsigned, integer-overflow) from
+// hanging the process. TLS handshake needs 32-byte nonces and
+// 32-byte scalars, nowhere close to this cap.
+let RNG_MAX_READ = 65536
+
+// ---- rng_ctx list indices -----------------------------------------------
+//
+// Every rng_ctx is a NOVA list with kind at index 0. The rest of the
+// layout is backend-specific.
+
+let _RNG_IDX_KIND = 0
+
+// OS backend layout (ctx list):
+//   [0] kind = RNG_KIND_OS
+//   [1] pool_buf     -- alloc(_RNG_OS_POOL_LEN + 1) holding 32 bytes
+//   [2] pos_slot     -- 1-element list holding [pool_pos] (int)
+//   [3] valid_slot   -- 1-element list holding [1 if pool has data]
+let _RNG_OS_POOL   = 1
+let _RNG_OS_POS    = 2
+let _RNG_OS_VALID  = 3
+
+// Test backend layout (ctx list):
+//   [0] kind = RNG_KIND_TEST
+//   [1] key_buf      -- alloc(33) holding SHA-256(seed)
+//   [2] ctr_slot     -- 1-element list holding [block_counter]
+//   [3] block_buf    -- alloc(65) holding current 64-byte block
+//   [4] pos_slot     -- 1-element list holding [byte_pos in current block]
+let _RNG_TEST_KEY   = 1
+let _RNG_TEST_CTR   = 2
+let _RNG_TEST_BLOCK = 3
+let _RNG_TEST_POS   = 4
+
+// Callback backend layout (ctx list):
+//   [0] kind = RNG_KIND_CALLBACK
+//   [1] cb_fn        -- function reference: fn cb_fn(out_buf, out_len) -> ok
+let _RNG_CB_FN = 1
+
+// ---- helpers ------------------------------------------------------------
+
+fn _rng_zero_buf(buf, n) {
+    let i = 0
+    while i < n {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+}
+
+fn _rng_copy_buf(dst, dst_off, src, src_off, n) {
+    let i = 0
+    while i < n {
+        store8(dst + dst_off + i, load8(src + src_off + i))
+        i = i + 1
+    }
+}
+
+// ---- OS backend --------------------------------------------------------
+
+// Populate the OS pool from `secure_random`. Returns 1 on success,
+// 0 if the OS source returned fewer than _RNG_OS_RAW_LEN bytes
+// (i.e. getrandom is unavailable or partial).
+fn _rng_os_refill(ctx) {
+    let raw = alloc(_RNG_OS_RAW_LEN + 1)
+    _rng_zero_buf(raw, _RNG_OS_RAW_LEN)
+    let got = secure_random(raw, _RNG_OS_RAW_LEN)
+    if got != _RNG_OS_RAW_LEN {
+        return 0
+    }
+    // Extractor: SHA-256(raw). Digest is 32 bytes, exactly one pool.
+    let digest = sha256_oneshot(raw, _RNG_OS_RAW_LEN)
+    let pool = ctx[_RNG_OS_POOL]
+    _rng_copy_buf(pool, 0, digest, 0, _RNG_OS_POOL_LEN)
+    list_set(ctx[_RNG_OS_POS], 0, 0)
+    list_set(ctx[_RNG_OS_VALID], 0, 1)
+    return 1
+}
+
+// Construct an OS-entropy RNG. Probes `secure_random` immediately with
+// a fresh pool read; if the syscall is unavailable in this environment
+// (returns -1 or a short count), returns 0 and leaves ctx_out
+// UNPOPULATED. Callers MUST check the return before using the ctx.
+fn rng_os_new(ctx_out) {
+    let pool = alloc(_RNG_OS_POOL_LEN + 1)
+    _rng_zero_buf(pool, _RNG_OS_POOL_LEN)
+    let pos_slot = list_new()
+    push(pos_slot, _RNG_OS_POOL_LEN)   // start "empty" (forces refill on first read)
+    let valid_slot = list_new()
+    push(valid_slot, 0)
+    push(ctx_out, RNG_KIND_OS)
+    push(ctx_out, pool)
+    push(ctx_out, pos_slot)
+    push(ctx_out, valid_slot)
+    // Probe. If it fails, the caller sees ok=0 and knows this
+    // container can't do OS entropy.
+    return _rng_os_refill(ctx_out)
+}
+
+// Read from OS pool, refilling when exhausted.
+fn _rng_os_read(ctx, out_buf, out_len) {
+    let pool = ctx[_RNG_OS_POOL]
+    let written = 0
+    while written < out_len {
+        let pos = ctx[_RNG_OS_POS][0]
+        let valid = ctx[_RNG_OS_VALID][0]
+        if pos >= _RNG_OS_POOL_LEN {
+            valid = 0
+        }
+        if valid == 0 {
+            let ok = _rng_os_refill(ctx)
+            if ok != 1 { return 0 }
+            pos = 0
+        }
+        let take = _RNG_OS_POOL_LEN - pos
+        let remaining = out_len - written
+        if remaining < take { take = remaining }
+        _rng_copy_buf(out_buf, written, pool, pos, take)
+        list_set(ctx[_RNG_OS_POS], 0, pos + take)
+        written = written + take
+    }
+    return 1
+}
+
+// ---- Test / deterministic backend --------------------------------------
+//
+// WARNING: TEST-ONLY. This backend produces byte-identical output for
+// a given seed and MUST NEVER be used for a real TLS handshake, x25519
+// keyshare, ClientHello.random / ServerHello.random, or capability
+// token mint. Anyone who knows (or guesses) the seed can reproduce
+// every "random" byte this backend has produced or will produce.
+// Present in the interface only so the tests around downstream users
+// of `rng_read` can be deterministic.
+
+// Populate ctx.block_buf with ChaCha20(key, nonce=0, counter=ctr),
+// then bump the counter and reset pos.
+fn _rng_test_refill(ctx) {
+    let nonce = alloc(13)
+    _rng_zero_buf(nonce, 12)
+    let ctr = ctx[_RNG_TEST_CTR][0]
+    let blk = chacha20_block_buf(ctx[_RNG_TEST_KEY], nonce, ctr)
+    _rng_copy_buf(ctx[_RNG_TEST_BLOCK], 0, blk, 0, 64)
+    list_set(ctx[_RNG_TEST_CTR], 0, ctr + 1)
+    list_set(ctx[_RNG_TEST_POS], 0, 0)
+    return 1
+}
+
+// Construct a deterministic test RNG from an arbitrary seed. Returns
+// 0 for empty seed. TEST-ONLY -- see WARNING above.
+fn rng_test_new(ctx_out, seed_buf, seed_len) {
+    if seed_len <= 0 { return 0 }
+    // Derive a 32-byte key from the seed. Any byte-length seed works;
+    // SHA-256 acts as the extractor so callers don't have to be careful
+    // about the seed's shape.
+    let key_digest = sha256_oneshot(seed_buf, seed_len)
+    let key = alloc(33)
+    _rng_copy_buf(key, 0, key_digest, 0, 32)
+    store8(key + 32, 0)
+    let ctr_slot = list_new()
+    push(ctr_slot, 0)
+    let block = alloc(65)
+    _rng_zero_buf(block, 64)
+    let pos_slot = list_new()
+    push(pos_slot, 64)   // start "empty" (forces refill on first read)
+    push(ctx_out, RNG_KIND_TEST)
+    push(ctx_out, key)
+    push(ctx_out, ctr_slot)
+    push(ctx_out, block)
+    push(ctx_out, pos_slot)
+    return 1
+}
+
+fn _rng_test_read(ctx, out_buf, out_len) {
+    let block = ctx[_RNG_TEST_BLOCK]
+    let written = 0
+    while written < out_len {
+        let pos = ctx[_RNG_TEST_POS][0]
+        if pos >= 64 {
+            _rng_test_refill(ctx)
+            pos = 0
+        }
+        let take = 64 - pos
+        let remaining = out_len - written
+        if remaining < take { take = remaining }
+        _rng_copy_buf(out_buf, written, block, pos, take)
+        list_set(ctx[_RNG_TEST_POS], 0, pos + take)
+        written = written + take
+    }
+    return 1
+}
+
+// ---- Callback backend --------------------------------------------------
+//
+// Wraps a caller-supplied function of signature:
+//     fn cb_fn(out_buf, out_len) -> ok  (1 or 0)
+// The RNG interface takes ownership of routing every read through cb_fn.
+// Suitable production integration when OS backend A is not available
+// in the target environment (e.g. seccomp-restricted container that
+// blocks getrandom): the operator wires a sidecar or launcher that
+// supplies entropy to a NOVA-side callback and passes it in here.
+
+fn rng_callback_new(ctx_out, cb_fn) {
+    if cb_fn == 0 { return 0 }
+    push(ctx_out, RNG_KIND_CALLBACK)
+    push(ctx_out, cb_fn)
+    return 1
+}
+
+fn _rng_callback_read(ctx, out_buf, out_len) {
+    let cb_fn = ctx[_RNG_CB_FN]
+    return cb_fn(out_buf, out_len)
+}
+
+// ---- top-level dispatch ------------------------------------------------
+
+fn rng_read(rng_ctx, out_buf, out_len) {
+    if out_len < 0 { return 0 }
+    if out_len == 0 { return 1 }
+    if out_len > RNG_MAX_READ { return 0 }
+    if rng_ctx == 0 { return 0 }
+    let kind = rng_ctx[_RNG_IDX_KIND]
+    if kind == RNG_KIND_OS { return _rng_os_read(rng_ctx, out_buf, out_len) }
+    if kind == RNG_KIND_TEST { return _rng_test_read(rng_ctx, out_buf, out_len) }
+    if kind == RNG_KIND_CALLBACK { return _rng_callback_read(rng_ctx, out_buf, out_len) }
+    return 0
+}
+
+// Small helper: report the backend kind of a ctx (for diagnostic /
+// audit logging). Returns 0 for a NULL / malformed ctx.
+fn rng_kind(rng_ctx) {
+    if rng_ctx == 0 { return 0 }
+    return rng_ctx[_RNG_IDX_KIND]
+}
