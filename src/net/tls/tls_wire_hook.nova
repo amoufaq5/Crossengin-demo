@@ -1,90 +1,551 @@
-// CrossEngin in-process TLS: wire integration seam
-// (R86, ADR r86-in-process-tls-scaffolding).
+// CrossEngin in-process TLS: wire integration seam (R94 -- FLIPPED).
 //
-// The ONE call site the daemon's accept loop needs to know about. Given
-// a raw fd from accept_conn() and a tls_config (or 0 for "not
-// configured"), returns a "wrapped connection" the daemon can read /
-// write / close through.
+// R86 scaffolded this file as a pass-through. R94 flips it: given a
+// non-null tls_config, wire_connection_wrap builds a real tls_session
+// around the raw fd, drives the RFC 8446 §4 handshake to completion,
+// and returns a `tls_conn` that encrypts on write and decrypts on
+// read. When tls_config is 0 the hook is still a pass-through -- TLS
+// is OPT-IN. Backwards-compatible for every deployment that hasn't
+// wired a config.
 //
-// R86 behavior (all that ships today):
-//   * tls_config == 0                       -> return raw fd unchanged.
-//   * tls_config != 0                       -> return raw fd unchanged
-//                                              AND print a warning
-//                                              (never happens today
-//                                              because nothing passes a
-//                                              non-null tls_config).
+// tls_conn shape
+//   A `tls_conn` is a NOVA list holding the fd, the session, the RNG
+//   context we've been given, the config we were built from, and
+//   status flags. Every wire_conn_* accessor pulls fields by named
+//   index -- no positional twiddling in caller code.
 //
-// R87..R94 behavior (planned, DOES NOT ship in R86):
-//   * tls_config == 0                       -> return raw fd unchanged.
-//   * tls_config != 0                       -> perform TLS 1.3
-//                                              handshake, return a
-//                                              wrapped_conn struct that
-//                                              encrypts on write and
-//                                              decrypts on read. R94 is
-//                                              the first round where
-//                                              this branch does real
-//                                              work.
+//   Two transport modes:
+//     WC_TRANSPORT_REAL  -- fd is a real socket; wire_connection_read
+//                           / _write / _close go through recv_data /
+//                           send_data / close_fd. Handshake drives
+//                           BLOCKINGLY on the fd.
+//     WC_TRANSPORT_MOCK  -- fd is unused (typically -1); in-memory
+//                           byte queues stand in for the wire. Used by
+//                           the wire-hook unit tests to pair a
+//                           client-role and server-role tls_conn and
+//                           exchange bytes without a real socket. The
+//                           daemon never sets this mode.
 //
-// The wrapped_conn abstraction is deliberately thin: the daemon only
-// needs read / write / close, so R94 will introduce three thin
-// wrappers: wire_conn_read / wire_conn_write / wire_conn_close that
-// dispatch on whether the underlying handle is a raw fd (int) or a
-// TLS-wrapped connection (struct). Today the daemon still calls
-// recv_data / send_data / close_fd directly on the raw fd because the
-// hook returns the fd unchanged.
+// Public API (daemon-facing)
+//   wire_connection_wrap(fd, tls_config, rng_ctx, out_conn) -> ok
+//     Server-role wrap. If tls_config is 0, returns a null-op RAW
+//     tls_conn with fd stored. If non-null, builds a server session
+//     from tls_config's leaf cert + priv seed + trust anchor, then
+//     drives the handshake using recv_data / send_data on the fd.
+//     Returns 1 on established, 0 on any handshake failure.
 //
-// Symbols prefixed `tls_wire_` to avoid NOVA symbol collisions.
+//   wire_connection_read(conn, out_buf, out_len_max, out_len) -> ok
+//     Post-handshake read. For a RAW conn this is a thin recv_data
+//     wrapper. For a TLS conn: pulls a record off the wire, decrypts,
+//     copies up to out_len_max bytes into out_buf, and writes the
+//     actual bytes-delivered into out_len (a 1-slot list caller
+//     allocates). Returns 0 on EOF / decrypt failure / peer alert;
+//     out_len[0] = 0 on clean close.
 //
-// NOVA dependencies: builtins (println).
-// CrossEngin dependencies: src/net/tls/tls_config.nova.
+//   wire_connection_write(conn, buf, len) -> ok
+//     Encrypts + sends. RAW conn -> send_data. Returns 1 on success,
+//     0 on failure.
+//
+//   wire_connection_close(conn) -> ok
+//     Sends close_notify (TLS), drains, closes fd. RAW conn -> close_fd.
+//
+// Test / library API (mock transport)
+//   wire_connection_wrap_client(fd, tls_config_client, rng_ctx,
+//                                now_unix, out_conn) -> ok
+//     Client-role counterpart. Used by the test harness to pair a
+//     client tls_conn against a server tls_conn under mock transport.
+//     Not exposed on the daemon accept loop (daemons don't originate
+//     TLS connections; they accept them).
+//
+//   wire_conn_new_mock_server(tls_config, rng_ctx, now_unix, out_conn)
+//   wire_conn_new_mock_client(tls_config, rng_ctx, now_unix, out_conn)
+//     Construct a tls_conn in MOCK transport mode without touching a
+//     socket. Handshake is NOT driven; caller uses
+//     wire_conn_mock_pump_pair to shuttle bytes between two mock
+//     conns until both report established.
+//
+//   wire_conn_mock_pump_pair(conn_a, conn_b, max_iter) -> iters_used
+//     Drains each conn's session-outbound into the other's session-
+//     inbound, stepping until both handshakes complete or `max_iter`
+//     is exhausted. Returns the iteration count actually used.
+//
+// Accessors
+//   wire_conn_tag(conn)          RAW or TLS
+//   wire_conn_fd(conn)           the raw fd
+//   wire_conn_session(conn)      the underlying tls_session (0 for RAW)
+//   wire_conn_is_established(c)  1 once handshake succeeded
+//   wire_conn_is_closed(c)       1 after close_notify+finalize
+//   wire_conn_transport(c)       WC_TRANSPORT_REAL or _MOCK
+//
+// NOVA dependencies: builtins (recv_data, send_data, close_fd,
+//   list_new, push, list_set, len, alloc, load8, store8).
+// CrossEngin dependencies:
+//   src/net/tls/tls_config.nova
+//   src/net/tls/tls_session.nova
 
 import "./tls_config.nova"
+import "./tls_session.nova"
 
-// A sentinel struct so R94's wrapped_conn cannot be confused with a raw
-// fd (which is a plain integer). R86 does not construct this; it exists
-// to nail down the shape R87..R94 will fill.
-//
-// Layout: [WIRE_CONN_TAG_TLS, fd, tls_config, state_ctx].
+// ---- tag / transport constants ------------------------------------------
+
 let TLS_WIRE_CONN_TAG_RAW = 0
 let TLS_WIRE_CONN_TAG_TLS = 1
 
-// wire_connection_wrap: given a raw fd from accept_conn and a
-// tls_config (0 for "no TLS"), return the handle the daemon should
-// read/write/close through.
-//
-// TODAY:  returns fd unchanged (a plain int). The daemon's existing
-//         recv_data(fd, ...) / send_data(fd, ...) / close_fd(fd)
-//         calls keep working byte-identically.
-// R94+:   returns a wrapped_conn struct when tls_config is non-null;
-//         the daemon MUST switch to wire_conn_read / wire_conn_write /
-//         wire_conn_close (also in this module) to dispatch. Until
-//         R94 lands, this hook is a pass-through.
-//
-// Passing a non-null tls_config today emits a one-line stderr warning
-// and STILL returns the raw fd (fail-open in the direction of "no
-// crypto happened"). Once R94 ships the flip is: non-null config
-// engages TLS, null config keeps pass-through.
-fn wire_connection_wrap(fd, tls_config) {
-    if tls_config == 0 { return fd }
-    // Non-null config: R86 does NOT know how to negotiate TLS. Warn
-    // loudly and return the raw fd so the caller doesn't send
-    // ciphertext-shaped bytes over a still-cleartext socket. Once R94
-    // lands this branch actually engages the handshake and returns a
-    // wrapped_conn struct.
-    println("WARN tls: wire_connection_wrap called with a non-null"
-        + " tls_config; R86 scaffolding does not perform TLS."
-        + " Returning raw fd. See ADR r86-in-process-tls-scaffolding.")
-    return fd
+let WC_TRANSPORT_REAL = 0
+let WC_TRANSPORT_MOCK = 1
+
+// ---- struct offsets -----------------------------------------------------
+
+let WC_TAG          = 0
+let WC_FD           = 1
+let WC_SESSION      = 2   // 0 for RAW
+let WC_RNG_CTX      = 3   // 0 for RAW
+let WC_TLS_CONFIG   = 4   // 0 for RAW
+let WC_ESTABLISHED  = 5
+let WC_CLOSED       = 6
+let WC_ROLE         = 7   // 0 = server, 1 = client (matches TLS_ROLE_* from tls_session)
+let WC_RX_PLAIN     = 8   // list of decrypted app bytes buffered (unread)
+let WC_TRANSPORT    = 9   // WC_TRANSPORT_REAL or _MOCK
+let WC_STRUCT_LEN   = 10
+
+// ---- constants ----------------------------------------------------------
+
+let _WIRE_RECV_CHUNK  = 4096
+let _WIRE_MAX_HANDSHAKE_ROUNDS = 64
+
+// ---- construction helpers -----------------------------------------------
+
+fn _wc_alloc(out_conn) {
+    let i = 0
+    while i < WC_STRUCT_LEN {
+        push(out_conn, 0)
+        i = i + 1
+    }
+    return 1
 }
 
-// Convenience: is this handle a raw fd or a TLS-wrapped conn? R86 only
-// ever gets raw fds so this always returns TLS_WIRE_CONN_TAG_RAW; R94
-// will start returning TLS_WIRE_CONN_TAG_TLS for TLS-wrapped handles.
-fn wire_conn_tag(handle) {
-    // A raw fd is a plain integer; NOVA does not distinguish that from
-    // a struct at the type level, but a wrapped_conn is a list whose
-    // first element is TLS_WIRE_CONN_TAG_TLS. We detect that shape.
-    // For R86, no wrapped_conn is ever constructed, so this always
-    // returns RAW.
-    return TLS_WIRE_CONN_TAG_RAW
+fn _wc_fill_raw(conn, fd) {
+    list_set(conn, WC_TAG, TLS_WIRE_CONN_TAG_RAW)
+    list_set(conn, WC_FD, fd)
+    list_set(conn, WC_SESSION, 0)
+    list_set(conn, WC_RNG_CTX, 0)
+    list_set(conn, WC_TLS_CONFIG, 0)
+    list_set(conn, WC_ESTABLISHED, 1)   // no handshake for RAW
+    list_set(conn, WC_CLOSED, 0)
+    list_set(conn, WC_ROLE, 0)
+    list_set(conn, WC_RX_PLAIN, list_new())
+    list_set(conn, WC_TRANSPORT, WC_TRANSPORT_REAL)
+    return 1
+}
+
+// ---- accessors ----------------------------------------------------------
+
+fn wire_conn_tag(c) {
+    // R86 back-compat: passing a plain int (raw fd) reports RAW too.
+    if c == 0 { return TLS_WIRE_CONN_TAG_RAW }
+    return c[WC_TAG]
+}
+
+fn wire_conn_fd(c)              { return c[WC_FD] }
+fn wire_conn_session(c)         { return c[WC_SESSION] }
+fn wire_conn_is_established(c)  { return c[WC_ESTABLISHED] }
+fn wire_conn_is_closed(c)       { return c[WC_CLOSED] }
+fn wire_conn_transport(c)       { return c[WC_TRANSPORT] }
+
+// ---- real-fd transport shuttling ---------------------------------------
+//
+// Push all pending session-outbound bytes into send_data, and pull any
+// available bytes off recv_data into session-inbound. Returns 1 on
+// success, 0 on socket error / EOF-before-handshake-done.
+
+fn _wc_send_drain_real(conn) {
+    let sess = conn[WC_SESSION]
+    let fd = conn[WC_FD]
+    let out = list_new()
+    session_drain_send(sess, out, 65536)
+    let n = len(out)
+    if n == 0 { return 1 }
+    // Convert byte list to a raw buffer; send_data takes (fd, buf,
+    // count) with a raw pointer -- no string/NUL trap, matching the
+    // gossip / http_client / stream_http shape.
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, out[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let sent = 0
+    while sent < n {
+        let m = send_data(fd, buf + sent, n - sent)
+        if m <= 0 { return 0 }
+        sent = sent + m
+    }
+    return 1
+}
+
+fn _wc_recv_feed_real(conn) {
+    let sess = conn[WC_SESSION]
+    let fd = conn[WC_FD]
+    let buf = alloc(_WIRE_RECV_CHUNK)
+    let m = recv_data(fd, buf, _WIRE_RECV_CHUNK)
+    if m <= 0 { return 0 }
+    let bytes = list_new()
+    let i = 0
+    while i < m {
+        push(bytes, load8(buf + i))
+        i = i + 1
+    }
+    session_recv(sess, bytes)
+    return 1
+}
+
+// ---- handshake driver (real transport, blocking) -----------------------
+//
+// Drain any pending outbound, then loop: if session done, return 1; else
+// read a chunk and feed. Cap iterations so a hostile / stuck peer can't
+// hang the daemon forever.
+
+fn _wc_drive_handshake_real(conn) {
+    let sess = conn[WC_SESSION]
+    // Client role: start emits ClientHello into outbound.
+    if conn[WC_ROLE] == TLS_ROLE_CLIENT_SESSION {
+        session_start_client(sess)
+    }
+    let iter = 0
+    while iter < _WIRE_MAX_HANDSHAKE_ROUNDS {
+        // Push whatever we have to the peer.
+        if _wc_send_drain_real(conn) != 1 { return 0 }
+        if session_handshake_done(sess) == 1 {
+            list_set(conn, WC_ESTABLISHED, 1)
+            return 1
+        }
+        // Pull the peer's response.
+        if _wc_recv_feed_real(conn) != 1 { return 0 }
+        // Any fatal alert baked into the state machine?
+        if session_state(sess) == TSS_CLOSED { return 0 }
+        iter = iter + 1
+    }
+    return 0
+}
+
+// ---- public: daemon-facing server wrap ---------------------------------
+
+fn wire_connection_wrap(fd, tls_config, rng_ctx, out_conn) {
+    _wc_alloc(out_conn)
+    if tls_config == 0 {
+        _wc_fill_raw(out_conn, fd)
+        return 1
+    }
+    // TLS branch. Config must be server-role.
+    if tls_config_role(tls_config) != TLS_CONFIG_ROLE_SERVER { return 0 }
+    let cert_der = tls_config_cert_der(tls_config)
+    let cert_priv = tls_config_key_der(tls_config)
+    let cert_pub = tls_config_cert_pub(tls_config)
+    if len(cert_der) == 0 { return 0 }
+    if len(cert_priv) == 0 { return 0 }
+    if len(cert_pub) == 0 { return 0 }
+    let sess = list_new()
+    let now = 0
+    let ok = session_new_server(sess, cert_der, cert_priv, cert_pub,
+                                 rng_ctx, now)
+    if ok != 1 { return 0 }
+    list_set(out_conn, WC_TAG, TLS_WIRE_CONN_TAG_TLS)
+    list_set(out_conn, WC_FD, fd)
+    list_set(out_conn, WC_SESSION, sess)
+    list_set(out_conn, WC_RNG_CTX, rng_ctx)
+    list_set(out_conn, WC_TLS_CONFIG, tls_config)
+    list_set(out_conn, WC_ESTABLISHED, 0)
+    list_set(out_conn, WC_CLOSED, 0)
+    list_set(out_conn, WC_ROLE, TLS_ROLE_SERVER_SESSION)
+    list_set(out_conn, WC_RX_PLAIN, list_new())
+    list_set(out_conn, WC_TRANSPORT, WC_TRANSPORT_REAL)
+    return _wc_drive_handshake_real(out_conn)
+}
+
+// ---- public: client wrap (for tests + future client-side daemons) ------
+
+fn wire_connection_wrap_client(fd, tls_config, rng_ctx, now_unix, out_conn) {
+    _wc_alloc(out_conn)
+    if tls_config == 0 {
+        _wc_fill_raw(out_conn, fd)
+        return 1
+    }
+    if tls_config_role(tls_config) != TLS_CONFIG_ROLE_CLIENT { return 0 }
+    let root_der = tls_config_root_der(tls_config)
+    if len(root_der) == 0 { return 0 }
+    let sess = list_new()
+    let ok = session_new_client(sess, root_der, rng_ctx, now_unix)
+    if ok != 1 { return 0 }
+    list_set(out_conn, WC_TAG, TLS_WIRE_CONN_TAG_TLS)
+    list_set(out_conn, WC_FD, fd)
+    list_set(out_conn, WC_SESSION, sess)
+    list_set(out_conn, WC_RNG_CTX, rng_ctx)
+    list_set(out_conn, WC_TLS_CONFIG, tls_config)
+    list_set(out_conn, WC_ESTABLISHED, 0)
+    list_set(out_conn, WC_CLOSED, 0)
+    list_set(out_conn, WC_ROLE, TLS_ROLE_CLIENT_SESSION)
+    list_set(out_conn, WC_RX_PLAIN, list_new())
+    list_set(out_conn, WC_TRANSPORT, WC_TRANSPORT_REAL)
+    return _wc_drive_handshake_real(out_conn)
+}
+
+// ---- mock-transport constructors + pump (test harness) -----------------
+
+fn wire_conn_new_mock_server(tls_config, rng_ctx, now_unix, out_conn) {
+    _wc_alloc(out_conn)
+    if tls_config == 0 { return 0 }
+    if tls_config_role(tls_config) != TLS_CONFIG_ROLE_SERVER { return 0 }
+    let sess = list_new()
+    let ok = session_new_server(sess,
+                                 tls_config_cert_der(tls_config),
+                                 tls_config_key_der(tls_config),
+                                 tls_config_cert_pub(tls_config),
+                                 rng_ctx, now_unix)
+    if ok != 1 { return 0 }
+    list_set(out_conn, WC_TAG, TLS_WIRE_CONN_TAG_TLS)
+    list_set(out_conn, WC_FD, 0 - 1)
+    list_set(out_conn, WC_SESSION, sess)
+    list_set(out_conn, WC_RNG_CTX, rng_ctx)
+    list_set(out_conn, WC_TLS_CONFIG, tls_config)
+    list_set(out_conn, WC_ESTABLISHED, 0)
+    list_set(out_conn, WC_CLOSED, 0)
+    list_set(out_conn, WC_ROLE, TLS_ROLE_SERVER_SESSION)
+    list_set(out_conn, WC_RX_PLAIN, list_new())
+    list_set(out_conn, WC_TRANSPORT, WC_TRANSPORT_MOCK)
+    return 1
+}
+
+fn wire_conn_new_mock_client(tls_config, rng_ctx, now_unix, out_conn) {
+    _wc_alloc(out_conn)
+    if tls_config == 0 { return 0 }
+    if tls_config_role(tls_config) != TLS_CONFIG_ROLE_CLIENT { return 0 }
+    let sess = list_new()
+    let ok = session_new_client(sess, tls_config_root_der(tls_config),
+                                 rng_ctx, now_unix)
+    if ok != 1 { return 0 }
+    list_set(out_conn, WC_TAG, TLS_WIRE_CONN_TAG_TLS)
+    list_set(out_conn, WC_FD, 0 - 1)
+    list_set(out_conn, WC_SESSION, sess)
+    list_set(out_conn, WC_RNG_CTX, rng_ctx)
+    list_set(out_conn, WC_TLS_CONFIG, tls_config)
+    list_set(out_conn, WC_ESTABLISHED, 0)
+    list_set(out_conn, WC_CLOSED, 0)
+    list_set(out_conn, WC_ROLE, TLS_ROLE_CLIENT_SESSION)
+    list_set(out_conn, WC_RX_PLAIN, list_new())
+    list_set(out_conn, WC_TRANSPORT, WC_TRANSPORT_MOCK)
+    return 1
+}
+
+// Drive a pair of mock conns to handshake completion. Kicks the client
+// (session_start_client) on the first iteration, then alternately
+// shuttles session-outbound between them until both handshake_done.
+// Returns iteration count used; caller inspects
+// wire_conn_is_established() on both sides.
+fn wire_conn_mock_pump_pair(client_conn, server_conn, max_iter) {
+    let client_sess = client_conn[WC_SESSION]
+    let server_sess = server_conn[WC_SESSION]
+    session_start_client(client_sess)
+    let it = 0
+    while it < max_iter {
+        let cout = list_new()
+        session_drain_send(client_sess, cout, 65536)
+        let sout = list_new()
+        session_drain_send(server_sess, sout, 65536)
+        if len(cout) == 0 {
+            if len(sout) == 0 {
+                if session_handshake_done(client_sess) == 1 {
+                    if session_handshake_done(server_sess) == 1 {
+                        list_set(client_conn, WC_ESTABLISHED, 1)
+                        list_set(server_conn, WC_ESTABLISHED, 1)
+                    }
+                }
+                return it
+            }
+        }
+        if len(cout) > 0 { session_recv(server_sess, cout) }
+        if len(sout) > 0 { session_recv(client_sess, sout) }
+        if session_handshake_done(client_sess) == 1 {
+            if session_handshake_done(server_sess) == 1 {
+                list_set(client_conn, WC_ESTABLISHED, 1)
+                list_set(server_conn, WC_ESTABLISHED, 1)
+            }
+        }
+        it = it + 1
+    }
+    return it
+}
+
+// Shuttle any pending session-outbound bytes from `from_conn` into
+// `to_conn`'s session-inbound. For mock transport only. Returns the
+// number of bytes shuttled.
+fn wire_conn_mock_shuttle(from_conn, to_conn) {
+    let from_sess = from_conn[WC_SESSION]
+    let to_sess = to_conn[WC_SESSION]
+    let out = list_new()
+    session_drain_send(from_sess, out, 65536)
+    let n = len(out)
+    if n == 0 { return 0 }
+    session_recv(to_sess, out)
+    return n
+}
+
+// ---- read / write / close (real + mock) ---------------------------------
+
+// Fill `out_buf` with up to out_len_max bytes of plaintext; write the
+// actual count into out_len[0]. Returns 1 on success (even with 0 bytes
+// if peer sent an empty frame), 0 on error / EOF / peer-close.
+fn wire_connection_read(conn, out_buf, out_len_max, out_len) {
+    if c_is_closed(conn) == 1 {
+        list_set(out_len, 0, 0)
+        return 0
+    }
+    if conn[WC_TAG] == TLS_WIRE_CONN_TAG_RAW {
+        let fd = conn[WC_FD]
+        let m = recv_data(fd, out_buf, out_len_max)
+        if m < 0 { list_set(out_len, 0, 0); return 0 }
+        list_set(out_len, 0, m)
+        if m == 0 { return 0 }
+        return 1
+    }
+    // TLS path.
+    let sess = conn[WC_SESSION]
+    // Serve any buffered plaintext first.
+    let buffered = conn[WC_RX_PLAIN]
+    if len(buffered) > 0 {
+        return _wc_serve_from_buffer(conn, out_buf, out_len_max, out_len)
+    }
+    // Need to pull a record off the wire.
+    if conn[WC_TRANSPORT] == WC_TRANSPORT_REAL {
+        // Loop: recv until a full record decrypts.
+        let tries = 0
+        while tries < 8 {
+            let pt = session_decrypt_app(sess)
+            if len(pt) > 0 {
+                _wc_append_bytes(buffered, pt)
+                return _wc_serve_from_buffer(conn, out_buf, out_len_max, out_len)
+            }
+            if session_state(sess) == TSS_CLOSING {
+                list_set(conn, WC_CLOSED, 1)
+                list_set(out_len, 0, 0)
+                return 0
+            }
+            if session_state(sess) == TSS_CLOSED {
+                list_set(conn, WC_CLOSED, 1)
+                list_set(out_len, 0, 0)
+                return 0
+            }
+            if _wc_recv_feed_real(conn) != 1 {
+                list_set(out_len, 0, 0)
+                return 0
+            }
+            tries = tries + 1
+        }
+        list_set(out_len, 0, 0)
+        return 0
+    }
+    // Mock transport: caller must have pre-fed the session's inbound.
+    let pt = session_decrypt_app(sess)
+    if len(pt) == 0 {
+        if session_state(sess) == TSS_CLOSING {
+            list_set(conn, WC_CLOSED, 1)
+        }
+        list_set(out_len, 0, 0)
+        return 0
+    }
+    _wc_append_bytes(buffered, pt)
+    return _wc_serve_from_buffer(conn, out_buf, out_len_max, out_len)
+}
+
+// Encrypt `buf[0..len]` as one application_data record; send. Returns
+// 1 on success, 0 on any error.
+fn wire_connection_write(conn, buf, buf_len) {
+    if c_is_closed(conn) == 1 { return 0 }
+    if buf_len <= 0 { return 1 }
+    if conn[WC_TAG] == TLS_WIRE_CONN_TAG_RAW {
+        let fd = conn[WC_FD]
+        let sent = 0
+        while sent < buf_len {
+            let n = send_data(fd, buf + sent, buf_len - sent)
+            if n <= 0 { return 0 }
+            sent = sent + n
+        }
+        return 1
+    }
+    let sess = conn[WC_SESSION]
+    if conn[WC_ESTABLISHED] != 1 { return 0 }
+    // Byte-list plaintext for session_encrypt_app.
+    let pt = list_new()
+    let j = 0
+    while j < buf_len {
+        push(pt, load8(buf + j))
+        j = j + 1
+    }
+    let ok = session_encrypt_app(sess, pt)
+    if ok != 1 { return 0 }
+    if conn[WC_TRANSPORT] == WC_TRANSPORT_REAL {
+        return _wc_send_drain_real(conn)
+    }
+    // Mock: outbound bytes stay in the session's outbound queue; the
+    // test harness shuttles them via wire_conn_mock_shuttle().
+    return 1
+}
+
+fn wire_connection_close(conn) {
+    if c_is_closed(conn) == 1 { return 1 }
+    if conn[WC_TAG] == TLS_WIRE_CONN_TAG_RAW {
+        let fd = conn[WC_FD]
+        close_fd(fd)
+        list_set(conn, WC_CLOSED, 1)
+        return 1
+    }
+    let sess = conn[WC_SESSION]
+    session_close(sess)
+    if conn[WC_TRANSPORT] == WC_TRANSPORT_REAL {
+        _wc_send_drain_real(conn)
+        close_fd(conn[WC_FD])
+    }
+    session_finalize_close(sess)
+    list_set(conn, WC_CLOSED, 1)
+    return 1
+}
+
+// ---- internal buffer / helpers ------------------------------------------
+
+fn _wc_append_bytes(dst, src) {
+    let i = 0
+    let n = len(src)
+    while i < n {
+        push(dst, src[i])
+        i = i + 1
+    }
+    return n
+}
+
+fn _wc_serve_from_buffer(conn, out_buf, out_len_max, out_len) {
+    let buffered = conn[WC_RX_PLAIN]
+    let have = len(buffered)
+    let take = have
+    if out_len_max < take { take = out_len_max }
+    let i = 0
+    while i < take {
+        store8(out_buf + i, buffered[i])
+        i = i + 1
+    }
+    // Rebuild the tail.
+    let tail = list_new()
+    let j = take
+    while j < have {
+        push(tail, buffered[j])
+        j = j + 1
+    }
+    list_set(conn, WC_RX_PLAIN, tail)
+    list_set(out_len, 0, take)
+    return 1
+}
+
+// Small helper so the closed check doesn't need to know shape.
+fn c_is_closed(conn) {
+    if conn == 0 { return 1 }
+    return conn[WC_CLOSED]
 }

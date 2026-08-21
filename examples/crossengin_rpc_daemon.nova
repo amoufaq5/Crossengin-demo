@@ -71,6 +71,9 @@ import "../src/skills/skills/echo_skill.nova"
 import "../src/skills/skills/research_skill.nova"
 import "../src/parts/meta/meta_observer.nova"
 import "../src/net/tls/tls_wire_hook.nova"
+import "../src/net/tls/tls_config.nova"
+import "../src/net/tls/base64.nova"
+import "../src/safety/rng.nova"
 import "../src/util/str_safe.nova"
 
 // ---- socket constants (mirror stream_http.nova) --------------------------
@@ -145,6 +148,124 @@ fn _rpcd_signed_skill_from_env() {
     if env == 0 { return 0 }
     if len(env) == 0 { return 0 }
     if str_eq_bytes(env, "1") == 1 { return 1 }
+    return 0
+}
+
+// R94 TLS bootstrap: opt-in via CROSSENGIN_TLS=1. When enabled, three
+// env vars carry base64-encoded DER material to the daemon:
+//   CROSSENGIN_TLS_LEAF_DER      base64(leaf.der)
+//   CROSSENGIN_TLS_LEAF_PRIV     base64(32-byte Ed25519 seed)
+//   CROSSENGIN_TLS_ROOT_DER      base64(root.der)
+// See docs/SHIP_AS_APP.md §7.44 for the sidecar recipe.
+fn _rpcd_tls_enabled_from_env() {
+    let env = getenv("CROSSENGIN_TLS")
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq_bytes(env, "1") == 1 { return 1 }
+    return 0
+}
+
+// Decode a single base64 env-var into a byte list. Returns 0 on any
+// failure (missing env-var, empty, malformed base64).
+fn _rpcd_env_b64_bytes(name) {
+    let env = getenv(name)
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    let res = base64_decode(env)
+    if res[0] != 1 { return 0 }
+    return res[1]
+}
+
+// Attempt to build a server-role tls_config from the three env vars.
+// Returns [ok, cfg]. ok = 1 populates cfg with a ready-to-use config;
+// ok = 0 leaves cfg empty and the caller should either refuse to boot
+// or fall back to cleartext depending on operator preference. We
+// choose "refuse to boot" when CROSSENGIN_TLS=1 is set but the
+// material is missing/malformed -- silent fallback would demote
+// confidentiality without the operator noticing.
+fn daemon_load_tls_config_from_sidecar(cfg_out) {
+    let leaf_der = _rpcd_env_b64_bytes("CROSSENGIN_TLS_LEAF_DER")
+    if leaf_der == 0 { return 0 }
+    let leaf_priv = _rpcd_env_b64_bytes("CROSSENGIN_TLS_LEAF_PRIV")
+    if leaf_priv == 0 { return 0 }
+    let root_der = _rpcd_env_b64_bytes("CROSSENGIN_TLS_ROOT_DER")
+    if root_der == 0 { return 0 }
+    return tls_config_new_server(cfg_out, leaf_der, len(leaf_der),
+                                  leaf_priv, root_der, len(root_der))
+}
+
+// RNG mode selection.
+//   CROSSENGIN_RNG_MODE=os        -- attempt Backend A (secure_random).
+//                                    Fails in seccomp-restricted
+//                                    containers (this one included --
+//                                    R91 probe finding).
+//   CROSSENGIN_RNG_MODE=test      -- deterministic Backend B seeded
+//                                    from CROSSENGIN_RNG_SEED (string).
+//                                    NOT PRODUCTION SAFE.
+//   CROSSENGIN_RNG_MODE=callback  -- Backend C. R94 wires this to a
+//                                    named FIFO at CROSSENGIN_RNG_FIFO
+//                                    that the operator's sidecar
+//                                    keeps supplied with 32-byte
+//                                    entropy chunks.
+// Returns 0 on any failure (missing env var, missing seed for test,
+// missing fifo for callback, OS backend unavailable).
+fn _rpcd_rng_mode_from_env() {
+    let env = getenv("CROSSENGIN_RNG_MODE")
+    if env == 0 { return "" }
+    return env
+}
+
+// Callback backend: the operator's sidecar writes 32-byte chunks to
+// CROSSENGIN_RNG_FIFO; we read from it on demand. R94 opens the FIFO
+// once at boot; a real integrator can enrich this to reopen on EOF,
+// add framing, etc. When the FIFO env-var is not set OR the file
+// can't be opened, the callback refuses (returns 0), which propagates
+// as "handshake failure" -- deliberate loud failure over silent
+// weak-entropy.
+let _RPCD_RNG_FIFO_FD = 0 - 1
+
+fn _rpcd_rng_fifo_callback(out_buf, out_len) {
+    if _RPCD_RNG_FIFO_FD < 0 { return 0 }
+    let got = 0
+    while got < out_len {
+        let n = sys_read(_RPCD_RNG_FIFO_FD, out_buf + got, out_len - got)
+        if n <= 0 { return 0 }
+        got = got + n
+    }
+    return 1
+}
+
+fn daemon_build_rng_ctx(mode) {
+    let ctx = list_new()
+    if str_eq_bytes(mode, "os") == 1 {
+        if rng_os_new(ctx) == 1 { return ctx }
+        return 0
+    }
+    if str_eq_bytes(mode, "test") == 1 {
+        let seed = getenv("CROSSENGIN_RNG_SEED")
+        if seed == 0 { return 0 }
+        if len(seed) == 0 { return 0 }
+        let n = len(seed)
+        let buf = alloc(n + 1)
+        let i = 0
+        while i < n {
+            store8(buf + i, char_at(seed, i))
+            i = i + 1
+        }
+        store8(buf + n, 0)
+        if rng_test_new(ctx, buf, n) == 1 { return ctx }
+        return 0
+    }
+    if str_eq_bytes(mode, "callback") == 1 {
+        let fifo = getenv("CROSSENGIN_RNG_FIFO")
+        if fifo == 0 { return 0 }
+        if len(fifo) == 0 { return 0 }
+        let fd = sys_open(fifo, O_RDONLY, 0)
+        if fd < 0 { return 0 }
+        _RPCD_RNG_FIFO_FD = fd
+        if rng_callback_new(ctx, _rpcd_rng_fifo_callback) == 1 { return ctx }
+        return 0
+    }
     return 0
 }
 
@@ -289,6 +410,66 @@ fn _rpcd_send_all(fd, s) {
     return 1
 }
 
+// ---- wire_conn-aware line read / send (R94) ------------------------------
+//
+// The daemon used to call recv_data / send_data directly on a raw fd.
+// R94 flips the wire hook to a real tls_conn when TLS is enabled, so
+// I/O has to go through wire_connection_read / wire_connection_write
+// instead. These two helpers are the equivalents of _rpcd_read_request
+// / _rpcd_send_all built on the wire_conn API. When TLS is off the
+// wire_conn is a RAW-tag null-op wrapper and the semantics are byte-
+// identical to the pre-R94 recv_data / send_data path.
+
+fn _rpcd_read_line_via_conn(conn, max_bytes) {
+    let acc = ""
+    let done = 0
+    let out_len = list_new()
+    push(out_len, 0)
+    while done == 0 {
+        if len(acc) >= max_bytes { done = 1 }
+        else {
+            let buf = alloc(RPCD_RECV_CHUNK + 1)
+            let ok = wire_connection_read(conn, buf, RPCD_RECV_CHUNK, out_len)
+            let n = out_len[0]
+            if ok != 1 { done = 1 }
+            else {
+                if n <= 0 { done = 1 }
+                else {
+                    let chunk = _rpcd_bytes_to_str(buf, n)
+                    acc = acc + chunk
+                    // First '\n' terminates a line-shaped request.
+                    let nl = 0
+                    let found = 0 - 1
+                    while nl < len(acc) {
+                        if char_at(acc, nl) == 10 {
+                            if found < 0 { found = nl }
+                        }
+                        nl = nl + 1
+                    }
+                    if found >= 0 {
+                        acc = substr(acc, 0, found)
+                        done = 1
+                    }
+                }
+            }
+        }
+    }
+    return acc
+}
+
+fn _rpcd_send_via_conn(conn, s) {
+    let total = len(s)
+    if total <= 0 { return 1 }
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < total {
+        store8(buf + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(buf + total, 0)
+    return wire_connection_write(conn, buf, total)
+}
+
 // ---- boot: build the shared RpcContext ----------------------------------
 
 fn _rpcd_build_ctx(now) {
@@ -373,9 +554,55 @@ fn main() {
         return 1
     }
     let ctx = _rpcd_build_ctx(0)
+    // R94 TLS bootstrap. Opt-in via CROSSENGIN_TLS=1. Failure to
+    // load the cert material with TLS enabled is treated as a hard
+    // boot error (better to refuse than to silently downgrade the
+    // wire to cleartext without the operator noticing).
+    let tls_cfg = 0
+    let rng_ctx = 0
+    if _rpcd_tls_enabled_from_env() == 1 {
+        let cfg = list_new()
+        if daemon_load_tls_config_from_sidecar(cfg) != 1 {
+            println("TLS: CROSSENGIN_TLS=1 but cert material missing or")
+            println("     malformed. Set CROSSENGIN_TLS_LEAF_DER,")
+            println("     CROSSENGIN_TLS_LEAF_PRIV, CROSSENGIN_TLS_ROOT_DER")
+            println("     to base64(DER-bytes). See docs/SHIP_AS_APP.md")
+            println("     section 7.44 for the sidecar recipe.")
+            close_fd(listen_fd)
+            return 1
+        }
+        tls_cfg = cfg
+        let mode = _rpcd_rng_mode_from_env()
+        if len(mode) == 0 {
+            println("TLS: CROSSENGIN_RNG_MODE not set. In this sandbox")
+            println("     use 'callback' with CROSSENGIN_RNG_FIFO=<path>;")
+            println("     'os' works only when getrandom is available.")
+            close_fd(listen_fd)
+            return 1
+        }
+        rng_ctx = daemon_build_rng_ctx(mode)
+        if rng_ctx == 0 {
+            println("TLS: RNG mode '" + mode + "' failed to initialize.")
+            println("     'os' likely means seccomp blocks getrandom;")
+            println("     'callback' needs CROSSENGIN_RNG_FIFO=<path>;")
+            println("     'test' needs CROSSENGIN_RNG_SEED=<string>.")
+            close_fd(listen_fd)
+            return 1
+        }
+    }
     println("=== " + rpc_server_banner() + " ===")
     println("listening on " + bind + ":" + int_to_str(port)
         + "  (max_request=" + int_to_str(max_request) + " bytes)")
+    if tls_cfg == 0 {
+        println("TLS: OFF (default). Set CROSSENGIN_TLS=1 + the three")
+        println("     CROSSENGIN_TLS_* env vars + CROSSENGIN_RNG_MODE")
+        println("     to opt into in-process TLS 1.3 (see docs/SHIP_AS_APP.md")
+        println("     section 7.44).")
+    } else {
+        println("TLS: ON (R94, in-process TLS 1.3 with")
+        println("     TLS_CHACHA20_POLY1305_SHA256, x25519, Ed25519).")
+        println("     RNG mode: " + _rpcd_rng_mode_from_env())
+    }
     if rpc_ctx_cap_enforced(ctx) == 1 {
         let cap_reg = rpc_ctx_cap_reg(ctx)
         let n = capability_registry_count(cap_reg)
@@ -423,17 +650,24 @@ fn main() {
             // a signal interrupted the syscall. Either way, wind up.
             go = 0
         } else {
-            // R86 wire-integration seam: wire_connection_wrap is a
-            // pass-through today (tls_config = 0 -> returns raw fd
-            // unchanged). Once R94 ships the in-process TLS handshake,
-            // passing a non-null tls_config here engages TLS with no
-            // other daemon change. See ADR r86-in-process-tls-scaffolding.
-            let wrapped = wire_connection_wrap(conn_fd, 0)
-            served = served + 1
-            let req = _rpcd_read_request(wrapped, max_request)
-            let resp = rpc_server_handle_line(req, ctx)
-            _rpcd_send_all(wrapped, resp + "\n")
-            close_fd(wrapped)
+            // R94 wire-integration: wire_connection_wrap now flips to
+            // real TLS when tls_cfg is non-null. When null it stays a
+            // pass-through, so pre-R94 deployments boot unchanged. See
+            // ADR r86-in-process-tls-scaffolding for the phase history.
+            let wrapped = list_new()
+            let hok = wire_connection_wrap(conn_fd, tls_cfg, rng_ctx, wrapped)
+            if hok != 1 {
+                // Handshake failure -- drop the connection quietly and
+                // move on. A hostile / mis-configured peer must not
+                // hang the accept loop.
+                close_fd(conn_fd)
+            } else {
+                served = served + 1
+                let req = _rpcd_read_line_via_conn(wrapped, max_request)
+                let resp = rpc_server_handle_line(req, ctx)
+                _rpcd_send_via_conn(wrapped, resp + "\n")
+                wire_connection_close(wrapped)
+            }
         }
     }
     close_fd(listen_fd)

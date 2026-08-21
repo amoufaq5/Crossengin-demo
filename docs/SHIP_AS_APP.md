@@ -2949,13 +2949,166 @@ tracked in §12).
   cert + private key (and a root cert operators trust). R94 ties
   this into the `tls_config` on daemon boot.
 
+### 7.44 TLS wire-enable (R94) — TLS 1.3 on the wire
+
+**Honest status: the TLS build-out is COMPLETE.** R86 scaffolded the
+seam; R87..R92 landed the primitives; R93 landed the handshake state
+machine as an in-memory test; R94 flips `wire_connection_wrap` from
+pass-through to a real TLS-wrapped-fd type and wires the daemon's
+accept loop to it. Opt-in via `CROSSENGIN_TLS=1`; deployments that
+don't set it boot byte-identically to pre-R94 (the null-`tls_config`
+branch is a no-op RAW wrapper).
+
+**Opt-in switch:**
+
+- `CROSSENGIN_TLS=1` — turn TLS on. Any other value (unset / "0")
+  leaves the wire in cleartext, backwards-compatible with every
+  pre-R94 launcher.
+
+**Cert material (three env vars, all base64-encoded DER):**
+
+- `CROSSENGIN_TLS_LEAF_DER`  — `base64(leaf.der)`, the server
+  certificate the daemon presents on the wire.
+- `CROSSENGIN_TLS_LEAF_PRIV` — `base64(leaf-priv-seed)`, the 32-byte
+  Ed25519 seed that signs `CertificateVerify`. R94 does NOT parse
+  PKCS#8 wrappers; the sidecar / launcher extracts the raw seed
+  before exporting.
+- `CROSSENGIN_TLS_ROOT_DER`  — `base64(root.der)`, the trust anchor
+  the daemon carries alongside its leaf. R94 uses this internally
+  for shape validation; a future client-cert-auth round (see the R86
+  ADR post-scriptum) will use it to gate incoming client certs.
+
+If `CROSSENGIN_TLS=1` is set but any of the three env vars is missing
+or malformed, the daemon refuses to boot with a diagnostic pointing at
+this section. Silent fallback to cleartext is deliberately NOT the
+default — a mis-configured launcher must not quietly downgrade the
+confidentiality guarantee.
+
+**RNG modes (`CROSSENGIN_RNG_MODE`):**
+
+- `os`       — Backend A. Uses NOVA's `secure_random` builtin,
+               which wraps the Linux `getrandom` syscall. Fails
+               in seccomp-restricted containers.
+- `test`     — Backend B. Deterministic ChaCha20-CTR keyed by
+               `SHA-256(seed)` where `seed = CROSSENGIN_RNG_SEED`
+               env var. **NOT PRODUCTION SAFE** — every "random"
+               byte is reproducible to anyone who knows the seed.
+               Present for smoke tests / bring-up.
+- `callback` — Backend C. Reads 32-byte entropy chunks on demand
+               from a named FIFO at `CROSSENGIN_RNG_FIFO`. The
+               operator's sidecar keeps the FIFO supplied with
+               real entropy from a source NOVA cannot reach
+               directly (a hardware RNG, a chain of `getrandom`
+               calls in a permissive process, etc.).
+
+**Sandbox note (this container):** This project's sandbox runs
+inside a seccomp-restricted container that BLOCKS `getrandom`;
+`secure_random` returns -1 and `CROSSENGIN_RNG_MODE=os` fails. In
+this container the daemon MUST use `CROSSENGIN_RNG_MODE=callback`
+with a FIFO fed by an external process. In unrestricted deployments
+(bare metal, permissive containers, standard cloud VMs)
+`CROSSENGIN_RNG_MODE=os` works out of the box.
+
+**Sidecar recipe (operator writes this; R94 does NOT ship it):**
+
+R94 ships the CONTRACT, not the sidecar. The sidecar is a launcher
+script the operator supplies; below is an illustrative shell recipe
+for the shape it takes.
+
+```
+# Operator's launcher -- NOT shipped, illustrative only.
+# The sidecar wraps the daemon so cert material + entropy reach it
+# through env vars / a FIFO the daemon reads.
+#
+# export CROSSENGIN_TLS=1
+# export CROSSENGIN_TLS_LEAF_DER="$(base64 -w0 leaf.der)"
+# export CROSSENGIN_TLS_LEAF_PRIV="$(base64 -w0 leaf.priv)"   # 32-byte seed
+# export CROSSENGIN_TLS_ROOT_DER="$(base64 -w0 root.der)"
+#
+# # In a permissive environment:
+# export CROSSENGIN_RNG_MODE=os
+#
+# # In a seccomp-restricted environment (this project's sandbox):
+# mkfifo /run/crossengin/rng.fifo
+# ( while :; do dd if=/dev/urandom bs=32 count=1; done ) \
+#     > /run/crossengin/rng.fifo &
+# export CROSSENGIN_RNG_MODE=callback
+# export CROSSENGIN_RNG_FIFO=/run/crossengin/rng.fifo
+#
+# export CE_RPC_PORT=9876
+# exec /path/to/crossengin_rpc_daemon
+```
+
+**Cert provisioning is out of scope for R94.** Recommended path:
+the operator uses their existing internal PKI to mint Ed25519 leaf
++ root pairs (RFC 8410 §7 format), or generates them via any
+Ed25519-capable tool (openssl 3.0+, `step-cli`, etc.). The sidecar
+extracts the raw seed from the PKCS#8 wrapper before base64-
+encoding it — R94 does NOT include a PKCS#8 parser.
+
+**Explicit list of supported / unsupported (R94 profile):**
+
+Supported:
+- TLS 1.3 only (RFC 8446). No TLS 1.2 fallback path.
+- Cipher suite: `TLS_CHACHA20_POLY1305_SHA256` (0x1303) ONLY.
+- Key exchange: `x25519` ONLY.
+- Signature algorithm: `Ed25519` ONLY.
+- Cert chain length ≤ 2 (leaf + root).
+- Self-signed root only (root == trust anchor, no intermediate CAs).
+- Full handshake per accepted connection.
+
+Unsupported / refused / out of scope for R94:
+- Session resumption (0-RTT / PSK / ticket cache).
+- HelloRetryRequest (a ClientHello that doesn't already offer
+  x25519 gets a fatal `handshake_failure`).
+- Client-certificate authentication.
+- Post-handshake key update.
+- Post-handshake authentication.
+- SNI-based multi-cert selection.
+- OCSP / CRL revocation checks.
+- Longer cert chains.
+
+**TLS build-out is now complete.** The phase history (R86..R94) lives
+in `docs/adr/r86-in-process-tls-scaffolding.md`; the post-scriptum
+there enumerates hardening candidates (see also §12 below).
+
+**Tests (R94 delta, 106 new checks):**
+
+- `test_base64` (35 checks) — RFC 4648 §10 vectors plus shape-
+  rejection cases.
+- `test_tls_config` (22 checks) — new server / client constructors
+  with valid + malformed material.
+- `test_tls_wire_hook` (40 checks) — crown-jewel handshake pump
+  under mock transport; app-data round-trip in both directions;
+  close_notify propagation; null-config back-compat.
+- `test_daemon_tls_bootstrap` (9 checks) — end-to-end env-var pipe
+  (encode → decode → tls_config_new_server) plus a garbled-
+  base64 refusal spot-check.
+
+**Regression sweep (R94):** every existing TLS suite green —
+`test_tls_scaffold` (70), `test_tls_alerts` (161), `test_tls_state`
+(68), `test_tls_kdf` (27), `test_tls_keyshare` (14),
+`test_tls_keyshare_rng` (27), `test_tls_record_aead` (53),
+`test_tls_transcript` (16), `test_tls13_keyschedule` (28),
+`test_tls_cert` (41), `test_tls_cert_chain` (14),
+`test_tls_handshake_msgs` (54), `test_tls_session` (35),
+`test_tls_session_tamper` (15), `test_x509` (54), `test_x509_r92`
+(60), `test_x509_verify` (14), `test_capability_wire` (245),
+`test_nl_rpc_verbs` (74). Pre-existing DTLS-12 reds and the
+Ed25519 latency red are untouched (they predate R87).
+
 ## 12. What comes next (R90+)
 
-The in-process TLS build-out drives the next several rounds. Non-TLS
-candidates queue alongside so no round idles waiting on a runtime
-blocker.
+**TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
+wire wiring, sidecar recipe — all in tree; opt-in via
+`CROSSENGIN_TLS=1`; see §7.36..§7.44. Front-of-queue is now non-TLS
+candidates (see the list further down this section). Any post-R94
+TLS work is now pure hardening / feature-add layered on top of the
+existing tree (session resumption, client-cert auth, HRR, cert
+rotation, OCSP/CRL, SNI multi-cert, ACME sidecar, concurrent TLS —
+the R86 ADR's post-scriptum enumerates these).
 
-**TLS build-out (drives R93..R9X — see §7.36, §7.37, §7.38, §7.39, §7.40, §7.41, §7.42):**
+**TLS build-out (historical roadmap, all ✅; see §7.36..§7.44):**
 
 - **R87** — ✅ Poly1305 + ChaCha20-Poly1305 AEAD (see §7.37;
   RFC 8439 §2.5, §2.8; all vectors green). TLS 1.3 record-layer
@@ -3002,15 +3155,17 @@ blocker.
   R88 (KDF), R89 (ECDH), R90 (CertificateVerify), R91 (RNG),
   R92 (cert chain). Explicit simplifications: no 0-RTT, PSK,
   HRR, client cert, key update, post-handshake auth.
-- **R94** — Wire-hook flip: `wire_connection_wrap` starts returning
-  a real wrapped_conn under a `tls_config`. **Final TLS build-out
-  round.** Ships alongside a sidecar recipe for supplying entropy
-  through Backend C in seccomp-filtered containers, plus operator
-  docs for cert provisioning. **After R94 the TLS build-out is
-  done (with the R93 simplifications documented).**
-- **R95..R9X** — Trust-anchor chain validation, session tickets,
-  live-alert delivery, hardening / fuzz audits — deprioritized;
-  after R94 the front-of-queue is non-TLS candidates below.
+- **R94** — ✅ Wire-hook flip + sidecar recipe (see §7.44). Opt-in
+  via `CROSSENGIN_TLS=1`; three base64 env vars carry cert material
+  (`CROSSENGIN_TLS_LEAF_DER` / `CROSSENGIN_TLS_LEAF_PRIV` /
+  `CROSSENGIN_TLS_ROOT_DER`); RNG mode picked via
+  `CROSSENGIN_RNG_MODE` (`os` / `test` / `callback`); tiny in-tree
+  `src/net/tls/base64.nova` decoder unwraps the env vars into byte
+  lists. New `tls_config_new_server` / `tls_config_new_client`
+  constructors + role tag. `test_tls_wire_hook` (40),
+  `test_tls_config` (22), `test_base64` (35),
+  `test_daemon_tls_bootstrap` (9) — 106 new checks. Regression
+  green. **TLS build-out is now COMPLETE.**
 
 **Runtime gap (R91 partially addressed):**
 
@@ -3025,8 +3180,14 @@ blocker.
   A full HKDF-based DRBG is a candidate for a later round if the
   OS source proves unreliable across target environments.
 
-**Other candidates (front-of-queue after R94 completes the
-TLS build-out; the top three become the immediate targets):**
+**TLS COMPLETE (R86..R94) milestone:** primitives, handshake, wire
+wiring, sidecar contract — all in tree. Any further TLS work
+(session resumption / client-cert auth / HRR / OCSP / SNI /
+concurrent handshakes / ACME sidecar) is optional hardening layered
+on top; see the R86 ADR's post-scriptum for the full list.
+
+**Front-of-queue (non-TLS, post-R94; the top three are the
+immediate targets):**
 
 1. **Admin bulk-ops** (multi-token grants / revokes in one wire call).
 2. **Per-session pre/post hooks** so a daemon operator can attach an
@@ -3040,9 +3201,18 @@ TLS build-out; the top three become the immediate targets):**
 - Hardware-key-backed admin bootstrap (yubikey attestation on
   `capability.issue` for the first admin token).
 - DTLS-12 red-fix (72/450 checks red since R86; unrelated to the
-  R87..R91 TLS build-out but the tally deserves a pass).
+  R87..R94 TLS 1.3 build-out but the tally deserves a pass).
 - Consolidation refactor: `bignum_256` / `field25519` overlap —
   both carry 256-bit modular arithmetic paths.
+
+**R95+ epic candidate: Mother/Child architecture.** A concurrent
+ADR-0200 draft (parallel R94 work) may land the design for a
+process-tree-style deployment where a supervisor "mother" spawns
+per-tenant "child" daemons. If that ADR lands under
+`docs/adr/adr-0200-*.md`, it becomes the R95+ epic (post-TLS
+front-of-queue), and the eight items above deprioritize behind it.
+Cross-reference it from here when it exists; ordering is a design
+call at R95 kickoff.
 
 ## 13. Troubleshooting
 

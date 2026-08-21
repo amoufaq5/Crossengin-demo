@@ -2,11 +2,17 @@
 
 ## Status
 
-Accepted — R86 round. **Scaffolding only.** No cryptographic operation
-is performed by any code this ADR introduces; the wire is still
-cleartext by default. R86 lays the module skeleton, state machine, and
-alert enum that R87..R9X will slot real primitives into without churning
-the daemon architecture.
+Accepted — R86 round; **wire-enabled in R94.** R86 scaffolded the
+module skeleton, state machine, and alert enum. R87..R92 landed each
+primitive (AEAD, KDF, ECDH, cert-verify, RNG, X.509). R93 landed the
+handshake state machine with an in-memory test pump. **R94 flipped
+`wire_connection_wrap` from a pass-through into a real
+TLS-wrapped-fd type and shipped the sidecar recipe.** The in-process
+TLS build-out (R86..R94) is now complete; the wire is TLS 1.3 when
+the operator sets `CROSSENGIN_TLS=1` and provides cert material.
+The full phase status table in "Build-out roadmap" below carries the
+per-round ✅ marks; see the post-scriptum for what a hardened
+deployment still wants.
 
 ## Date
 
@@ -115,7 +121,7 @@ CrossEngin work.
 | Big-int (255-bit) field arithmetic — add, sub, mul, invert mod p25519 | R89 (x25519 Montgomery ladder) | ✅ Delivered as `src/safety/field25519.nova` on top of int_* escape hatches; runtime needed no change |
 | DER parsing helpers (`asn1_read_len`, tag reader) | R92 (X.509 subset parse) | ✅ Delivered as `src/net/tls/der.nova` (R92); runtime needed no change. Byte-list buffers with (buf, buf_len, off, out_params) shape, short + long form length, indefinite-length + long-form-tag + >4-length-bytes all refused. |
 | Handshake state machine orchestration | R93 (end-to-end in-process TLS 1.3) | ✅ Delivered as `src/net/tls/tls_transcript.nova` + `src/net/tls/tls_session.nova`; runtime needed no change. Session driven by caller-owned inbound/outbound byte queues so R93 needs no wire integration. |
-| Non-blocking accept + poll loop | R94 (multi-connection TLS) | R86 keeps the serial accept loop; TLS handshakes serialize behind it — acceptable for single-user first cut |
+| Non-blocking accept + poll loop | R94 (multi-connection TLS) | R94 stays with the serial accept loop; TLS handshakes serialize behind it, which is acceptable for the single-user first cut but is a scaling ceiling. Concurrent TLS is a candidate for a post-R94 hardening round (see post-scriptum below). |
 
 **Runtime is off-limits for R86** (standing constraint: never edit
 `/home/user/NOVA/src/runtime/*`). The two runtime items above
@@ -241,13 +247,29 @@ what unlocks the most testable surface earliest.
   no HelloRetryRequest / no client cert / no key update /
   no post-handshake auth. **Wire still cleartext** — `wire_connection_wrap`
   untouched; R94 flips it.
-- **R94 — record-layer AEAD wrap/unwrap + application-data path.**
-  `wire_connection_wrap` starts returning a REAL wrapped_conn whose
-  read/write encrypt/decrypt through the record layer. Feature-flag
-  ON only when a `tls_config` is present. **Final TLS build-out
-  round.** Also ships the sidecar recipe for supplying entropy
-  through R91 Backend C in seccomp-filtered containers, and
-  operator docs.
+- **R94 — ✅ Wire-hook flip + sidecar recipe.**
+  `wire_connection_wrap(fd, tls_config, rng_ctx, out_conn)` returns a
+  real `tls_conn` when `tls_config` is non-null; the accept loop in
+  `examples/crossengin_rpc_daemon.nova` opts in via
+  `CROSSENGIN_TLS=1` and reads cert material from three base64 env
+  vars. A tiny `src/net/tls/base64.nova` decoder unwraps them into
+  the byte lists `tls_config_new_server` expects. `tls_config` grew
+  new production-shape constructors:
+  `tls_config_new_server(cfg_out, leaf_cert_buf, leaf_cert_len,
+  leaf_priv_buf, root_cert_buf, root_cert_len)` and
+  `tls_config_new_client(cfg_out, root_cert_buf, root_cert_len)`.
+  The RNG for the handshake is selected via `CROSSENGIN_RNG_MODE`
+  (`os` for Backend A / `test` for Backend B seeded from
+  `CROSSENGIN_RNG_SEED` / `callback` for Backend C reading from
+  `CROSSENGIN_RNG_FIFO`). This container's seccomp blocks
+  `getrandom` (R91 finding), so the daemon MUST use
+  `CROSSENGIN_RNG_MODE=callback` here; unrestricted deployments can
+  use `os`. Sidecar itself is NOT shipped; the launcher recipe (env
+  vars + `exec`) lives in `docs/SHIP_AS_APP.md` §7.44. Tests:
+  `test_tls_wire_hook` (40 checks), `test_tls_config` (22 checks),
+  `test_base64` (35 checks), `test_daemon_tls_bootstrap` (9 checks).
+  Regression sweep across every existing TLS suite green. **Final
+  TLS build-out round.**
 - **R95 — trust-anchor registry + cert chain validation (len<=2).**
   Layer on the R55.1 trust-anchor pattern.
 - **R96 — session-ticket resumption (0-RTT deferred).** Bring back the
@@ -281,18 +303,77 @@ what unlocks the most testable surface earliest.
 
 ## Consequences / scope
 
-- **Wire is still cleartext.** R86 does not change what goes on the
-  wire. Operators who need TLS today continue to use the R54.1 sidecar
-  recipe.
-- The R54.1 sidecar recipe stays supported for the whole R87..R94
-  window; R94 is the first round where an in-process TLS deployment
-  becomes possible, and even then it is opt-in (feature-flagged via a
-  `tls_config` on daemon boot).
-- The daemon accept loop is unchanged in behavior. It gains ONE call
-  site (`wire_connection_wrap`), which is a pass-through.
+- **R86 baseline: wire is still cleartext.** The scaffolding round
+  does not change what goes on the wire. Operators who need TLS
+  before R94 lands continue to use the R54.1 sidecar recipe.
+- **R94 update: wire can be TLS 1.3 when `CROSSENGIN_TLS=1`.** The
+  R54.1 sidecar recipe stays supported (both paths coexist). R94 is
+  the first round where an in-process TLS deployment is possible; it
+  remains opt-in (feature-flagged via a non-null `tls_config` on
+  daemon boot). Operators who don't set `CROSSENGIN_TLS=1` boot
+  byte-identically to pre-R94.
+- The daemon accept loop's shape is preserved. R86 added ONE call
+  site (`wire_connection_wrap`); R94 kept that call site and changed
+  what it returns (raw fd → real `tls_conn` when TLS is on).
 - The module tree at `src/net/tls/` is stable — R87..R94 add files
   under `src/net/tls/prims/` and fill in the stubs, they do not
   re-shape the outer layout.
 - Future ADRs r87..r9x reference this one for the chosen suite. Any
   cipher/kx/sig change from the choices above requires a new ADR
   because it changes the primitive set every phase depends on.
+
+## Post-scriptum (R94): what a hardened deployment still wants
+
+R94 closes the R86..R94 in-process TLS epic — the wire carries real
+TLS 1.3 with cert-authenticated x25519 + ChaCha20-Poly1305, gated by
+the operator's own trust anchor. What a hardened multi-user
+deployment would still want on top, in rough order of value:
+
+- **Session resumption / 0-RTT / PSK.** R94 does one full handshake
+  per accepted connection. `tls_config.session_cache_size` is still
+  a stub. RFC 8446 §2.2 + §4.2.10 + §4.2.11 spell out the shape;
+  R96 is a candidate.
+- **Client-cert authentication (mutual TLS).** R94 authenticates
+  server → client only. `session_new_server` never asks for a
+  `Certificate` message from the client. A wire path where the
+  daemon accepts only whitelisted client certs would fold in with
+  the R55.1 signed-skill trust-anchor pattern (RFC 8446 §4.3.2).
+- **HelloRetryRequest.** R94 rejects any ClientHello that doesn't
+  already offer x25519. A tolerant server would negotiate down to
+  the client's best offered group via HRR (RFC 8446 §4.1.4).
+- **Post-handshake key update.** RFC 8446 §4.6.3 rotates keys mid-
+  connection. Long-lived TLS connections without this leak more
+  material to a single-key-compromise attacker over time; R94 has
+  no time or byte-count driven rotation.
+- **Certificate rotation without downtime.** `tls_config` is
+  captured at daemon boot; changing the cert requires a restart.
+  A future round could add a `tls_config_reload(cfg, new_material)`
+  path that swaps atomically between handshakes.
+- **OCSP / CRL revocation checking.** R94 trusts a valid cert chain
+  unconditionally once it verifies against the root. Real
+  deployments need a way to say "this leaf was revoked" without
+  waiting for validity-window expiry (RFC 6960 / RFC 5280 §5).
+- **SNI-based multi-cert selection.** R94 presents one leaf. A
+  reverse-proxy-style daemon serving multiple hostnames would need
+  to pick the leaf from a table keyed by ClientHello.SNI (RFC 6066
+  §3).
+- **External trust anchor store.** R94 passes the root DER inline
+  through `tls_config_new_server` / `tls_config_new_client`. A
+  bigger deployment would want a directory (or database) of anchors
+  the daemon reloads without a restart, plus a wire verb for
+  admin-managed anchor rotation — folds naturally with the R55.1
+  trust-anchor registry pattern.
+- **Automated cert issuance (ACME / step-ca) in the sidecar.** R94
+  ships the sidecar CONTRACT (three env vars) but not the sidecar
+  itself. An operator running against Let's Encrypt / an internal
+  step-ca still writes the fetch + renewal loop by hand. A
+  reference sidecar (shell or NOVA program) would remove that tax.
+- **Concurrent TLS handshakes.** The daemon serializes accept +
+  handshake. A concurrent handshake path needs a runtime primitive
+  (non-blocking accept + poll) that today is not in NOVA; the R86
+  runtime-gap table above tracked this. When the runtime gains
+  non-blocking I/O this is one of the first daemon-side lifts.
+
+None of these block a real R94 deployment — they extend it. The
+primitives + handshake + wire wiring are in tree today; a hardening
+round would layer on top.
