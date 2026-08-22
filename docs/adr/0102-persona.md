@@ -334,3 +334,30 @@ FEEDS INTO: ADR-0103 (Skill Runtime — declares persona injection
 contract), ADR-0104 (NL surface — consults style_capsule_ref),
 ADR-0108 (Style Capsules — defines what the templater does with
 the reference).
+
+## Role in the Model Substrate
+
+Persona is the primitive that makes **per-user selective-load**
+(consumption mode 2) meaningful and that gives every other
+consumption mode a per-user identity to project against. The mother
+holds one persona per user; a selective-load instance carries its
+user's persona as portable digital-second-self; a baked child (mode
+3) ships with a persona-set allowlist; a client app (mode 4) reads
+and writes the persona over the RPC surface; an embedded deployment
+(mode 5) holds a single owner's persona locally.
+
+Within the reasoning triad, Persona is state that composes into the
+**cognitive sandbox** — not a KG node and not a belief signal, but
+per-user context the sandbox consults when a skill proposes, when
+the NL templater phrases, and when advice-only projections run. The
+persona layer is what lets the LLM-free primary NLP path (ADR-0104)
+produce user-shaped answers without a sidecar LLM having to be
+prompted with user history: history and preferences live here, in
+inspectable Bayesian state, and the deterministic templater reads
+them directly.
+
+**See also:** ADR-0200 (five consumption modes — persona is
+per-user across all of them), ADR-0204 (persona projection contract
+inside the cognitive sandbox), ADR-0208 (persona-set allowlist in
+bake manifests), ADR-0211 (LLM-free NLP primary path that consults
+persona style + preferences deterministically).

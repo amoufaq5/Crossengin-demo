@@ -186,3 +186,29 @@ ADR-0043 (audit log), ADR-0050 (meta-observer), ADR-0088 (kernel).
 FEEDS INTO: ADR-0101 (data acquisition), ADR-0102 (persona),
 ADR-0103 (skills), ADR-0104 (NL surface), ADR-0105 (sandbox
 architecture), ADR-0106 (capsules).
+
+## Role in the Model Substrate
+
+MSC is the substrate every one of the five consumption modes runs on
+— mother-daemon-direct, per-user selective-load, baked-child,
+client-app, and embedded — because "the model" IS the composition of
+MSC primitives, not a shape sitting above them.
+
+MSC defines the reasoning triad itself: **nodes** are the addressable
+knowledge (KG atoms with belief), **signals** are the source-tagged
+moment-stamped observations that move belief, and both together are
+walked and re-observed inside the **cognitive sandbox** (the mind
+where learning, agent production, and answering happen — a distinct
+concept from ADR-0105's access-control sandbox). Everything else in
+ADR-0200's factory frame — capsules, personas, skills, patterns,
+styles, the NL surface, the bake/deploy path — is a layer over these
+three components. The LLM-free primary NLP path (ADR-0104 grammar +
+HDC + templater) works precisely because MSC's answers are already
+symbolic node walks; the sidecar LLM (ADR-0201 in the new series) has
+nothing it must generate from scratch, only phrase.
+
+**See also:** ADR-0200 (AI-factory frame that MSC is the substrate
+for), ADR-0202 (cognitive sandbox — the runtime side of the triad),
+ADR-0211 (LLM-free NLP primary path built on MSC's node walks),
+ADR-0201 (sidecar LLM adapter that never touches the MSC reasoning
+path).

@@ -453,3 +453,70 @@ no-LLM-in-reasoning invariant.
 - R73..R75 — Snapshot format (reused by R97 as the child KG payload).
 - R86..R94 — TLS on the wire (presumed by the mother-to-child
   update channel).
+
+## Extension: The Five Consumption Modes
+
+Post-vision alignment: the "AI Factory" (bake children, deploy
+children, update children) is ONE of five ways CrossEngin's
+substrate is consumed, not the total picture. This ADR is now
+positioned as the parent doc for the AI-Factory arm of the
+substrate, not for every consumption shape.
+
+The five modes:
+
+1. **Mother-daemon-direct.** An operator or a small team drives the
+   mother itself — full ingest, full skills, full sandbox, no
+   children. This is the shape the daemon has today and the shape
+   an internal-tools deployment stops at.
+2. **Per-user selective-load.** One mother, many users; each user
+   loads a persona-scoped, capability-scoped subset (their
+   capsules, their personas, their skill/pattern allowlists) into a
+   session isolated from other users. The mother is the substrate;
+   the selection is what the user carries around.
+3. **Baked-child.** The mode this ADR describes — the mother emits
+   a signed, immutable, domain-filtered child bundle; the child
+   runs on customer infra and receives signed KG-deltas from the
+   mother's update channel. Enterprise deployments live here.
+4. **Client-app (desktop / web / mobile).** A frontend consumes the
+   mother OR a child over the RPC wire (ADR-0104 verbs, TLS from
+   R86-R94, capability tokens from R54). Ship-as-app targets live
+   here.
+5. **Embedded (long-horizon).** A device (robot, OS layer, IoT
+   endpoint) holds a scoped child locally and reaches back to its
+   owner's mother for updates. Latency and offline behavior lead
+   here; this is the deepest deployment shape and the last to
+   mature.
+
+The bake/deploy/update machinery this ADR defines is the mode-3
+path. Modes 1, 2, 4, 5 use overlapping infrastructure (the same
+substrate, the same skill runtime, the same NL surface, the same
+capability perimeter) with different composition and different wire
+posture. Later ADRs in the 0201-0211 series enumerate each mode
+individually so the substrate is not conflated with any one of them.
+
+## Role in the Model Substrate
+
+This ADR is the north-star frame for **consumption mode 3**
+(baked-child) specifically, and the parent doc naming all five
+consumption modes generally. It is not itself part of the reasoning
+triad — it names the mother/child packaging around the substrate
+that MSC (ADR-0100), the KG, capsules, personas, skills, and the NL
+surface constitute.
+
+The mother/child architecture is what turns the LLM-free primary
+NLP path (ADR-0104 + ADR-0211), the KG-as-knowledge substitute for
+fine-tuning (ADR-0101 + ADR-0106), and the deterministic cognitive
+sandbox (ADR-0202) into a shippable product for enterprises: the
+mother holds the full substrate and factory, children carry
+domain-scoped immutable subsets, and every update is a signed
+KG-delta rather than a re-train. The sidecar LLM (ADR-0201) sits
+strictly at the NL boundary in both mother and children, never in
+the reasoning path, preserving the ADR-0013/0014 invariant across
+every mode.
+
+**See also:** ADR-0201 (sidecar LLM adapter — the NL boundary role
+this ADR names), ADR-0202 (cognitive sandbox — the "mind" the
+factory ships), ADR-0207 (bake manifest — the concrete mode-3
+artifact this ADR sketches), ADR-0211 (LLM-free NLP primary path —
+what preserves the no-LLM-in-reasoning invariant across all five
+modes).

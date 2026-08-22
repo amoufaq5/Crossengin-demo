@@ -393,3 +393,30 @@ The pipeline is a shipped invariant. What this ADR adds is the
 CONTRACT: any future change to any stage must document how it
 preserves the six-stage shape, the schema-validation-per-stage
 rule, and the "no atom without a source_tag" invariant.
+
+## Role in the Model Substrate
+
+The acquisition pipeline runs in the **mother-daemon-direct** mode
+(consumption mode 1) — it is the mother's mouth. Baked children
+(mode 3) inherit its output as an immutable KG slice at bake time
+and never run the pipeline themselves; per-user selective-load
+instances (mode 2), client apps (mode 4), and embedded deployments
+(mode 5) receive the pipeline's output indirectly via signed
+KG-deltas from the mother's update channel.
+
+Within the reasoning triad this ADR feeds **nodes**: every atom that
+downstream signals move, and every atom the cognitive sandbox walks,
+enters existence here with a source_tag, a grade, and a provenance
+ledger. Because knowledge is data (ADR-0200 Sub-decision 1) instead
+of frozen weights, this pipeline is the sole entry point for the
+model to gain new knowledge — there is no gradient step, no
+fine-tune, no RAG index bypass. That property is what makes the
+mother/child factory possible: a delta out of this pipeline is a
+delta a child can apply in seconds without any re-training.
+
+**See also:** ADR-0200 (AI-factory frame — this pipeline is the
+mother's ingest arm), ADR-0203 (federated update channel — signed
+KG-deltas flowing to children reuse this pipeline's provenance),
+ADR-0207 (bake manifest — allowlists a slice of this pipeline's
+output into a child), ADR-0202 (cognitive sandbox — consumes
+pipeline output when learning).

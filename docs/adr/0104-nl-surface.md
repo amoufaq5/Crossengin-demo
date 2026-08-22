@@ -428,3 +428,36 @@ call).
 FEEDS INTO: ADR-0108 (Style Capsules — configure the templater),
 ADR-0111ish (multi-turn context — deferred), R50 ship-as-app
 (the frontend consumes the JSON-RPC verbs).
+
+## Role in the Model Substrate
+
+The NL Surface is the primary boundary layer for consumption modes
+that speak to a human — client-app (mode 4), per-user selective-load
+(mode 2), and long-horizon embedded (mode 5) — and it also serves
+mother-daemon-direct (mode 1) whenever an operator drives the daemon
+in English rather than slash-commands. It is not part of the
+reasoning triad; it is the mouth and ear that sit outside it.
+
+**Explicit long-term shape (post-vision alignment):** the intended
+end state of this layer is **LLM-free primary**. The deterministic
+route — grammar parser + HDC classifier for shape recognition +
+deterministic templater — is the trunk, not a fallback. The sidecar
+LLM (ADR-0201, expanding the ADR-0104 R48 preprocessor role) is
+strictly a *fallback* for phrasings the deterministic layer does not
+yet recognize, and it never touches the reasoning path or the answer
+content. A **fallback-rate metric** (share of `nl.ask` calls that
+required the sidecar) is the KPI that drives investment in the
+deterministic layer: the grammar + HDC + templater grows toward the
+observed question distribution over time, the fallback rate trends
+down, and the sidecar's remaining role narrows to the long tail.
+This is what preserves the ADR-0013 / ADR-0014 no-LLM-in-reasoning
+invariant at the same time as latency-parity with LLMs (an ADR-0200
+hard requirement): the primary path is a byte walk, not a model
+call.
+
+**See also:** ADR-0211 (LLM-free NLP primary path — grammar + HDC +
+templater as the trunk), ADR-0201 (sidecar LLM adapter — bounded
+fallback role and schema-enforced boundary contract), ADR-0200
+(five consumption modes — this layer is the user-facing one),
+ADR-0202 (cognitive sandbox — receives StructuredQueries from
+either parse route identically).

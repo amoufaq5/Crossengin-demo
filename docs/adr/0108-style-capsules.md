@@ -202,3 +202,30 @@ v1 that inventory lives in the operator docs.
       falls back to default, sections respect SHOW_* flags
 - [x] All 60 existing templater checks pass unchanged (default
       style renders byte-identically to R48p4)
+
+## Role in the Model Substrate
+
+Style Capsules serve the consumption modes with a rendered surface
+— client-app (mode 4) most visibly, per-user selective-load (mode
+2) via `persona.style_capsule_ref`, embedded (mode 5) when the
+device presents text, and mother-daemon-direct (mode 1) whenever
+the operator uses the NL layer. Baked-child instances (mode 3)
+ship with a style-capsule-set allowlist alongside the persona set.
+
+Style Capsules are NOT part of the reasoning triad. They configure
+the **NL surface** — specifically the deterministic templater
+(ADR-0104 Component 4) — with the wording knobs that vary phrasing
+without varying content. This split is what lets the LLM-free
+primary NLP path stay LLM-free: style variation is data (knob
+strings), never a generative call, so the sidecar LLM (ADR-0201)
+adds no expressiveness the deterministic templater lacks — it only
+covers phrasings the grammar has not yet parsed. Style is thus the
+audit-safe surface for tone and register while the substrate below
+stays byte-deterministic.
+
+**See also:** ADR-0211 (LLM-free NLP primary path — style capsules
+are the phrasing dial the deterministic templater reads), ADR-0201
+(sidecar LLM adapter — must respect the same slot-only render
+contract style capsules define), ADR-0208 (bake manifest persona +
+style set), ADR-0200 (five consumption modes — style capsules
+serve every rendered surface).

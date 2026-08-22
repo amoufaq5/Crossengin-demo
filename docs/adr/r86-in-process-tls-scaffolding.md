@@ -377,3 +377,32 @@ deployment would still want on top, in rough order of value:
 None of these block a real R94 deployment — they extend it. The
 primitives + handshake + wire wiring are in tree today; a hardening
 round would layer on top.
+
+## Role in the Model Substrate
+
+In-process TLS gates every consumption mode that carries traffic
+over a wire — client-app (mode 4) between the frontend and the
+daemon, per-user selective-load (mode 2) on the multi-user host,
+mother-daemon-direct (mode 1) whenever the mother accepts non-
+loopback callers, embedded (mode 5) when a device speaks to its
+owner's mother, and baked-child (mode 3) both between the child
+and its clients and on the mother-to-child update channel that
+ADR-0200's factory frame relies on.
+
+This ADR is not part of the reasoning triad. It is transport for
+the substrate — the layer that keeps capability tokens, KG-deltas,
+signed child bundles, and RPC payloads confidential and integrity-
+checked in flight. The choice of ChaCha20-Poly1305 + x25519 +
+ed25519 is what makes the factory's "child polls mother for a
+signed KG-delta" step tractable: the mother/child update channel
+reuses the same primitives that already sign skills (R54.2) and
+that ADR-0209 extends to whole child bundles. Nothing in the
+reasoning path or the LLM-free primary NLP path (ADR-0211) is
+affected by whether TLS is on — this layer is orthogonal to
+cognition.
+
+**See also:** ADR-0200 (AI-factory frame — presumes an encrypted
+mother-to-child wire), ADR-0203 (KG-delta update channel — rides
+this transport), ADR-0209 (signed child bundle — reuses ed25519
+from this suite), ADR-0207 (bake manifest — update_key is an
+ed25519 key from this suite).

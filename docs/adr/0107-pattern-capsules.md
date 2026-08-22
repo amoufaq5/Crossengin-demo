@@ -215,3 +215,29 @@ surfacing).
       with matched patterns, source_tag in trace)
 - [x] All 60 existing templater checks + 127 style_capsule checks
       + full R48/R49 NL suite pass unchanged
+
+## Role in the Model Substrate
+
+Pattern Capsules serve every consumption mode that runs skills —
+mother-daemon-direct (mode 1), per-user selective-load (mode 2),
+baked-child (mode 3), client app (mode 4), and embedded (mode 5) —
+because a pattern is data that a skill's policy consults at run
+time, and every mode runs skills. A bake manifest names a
+`pattern_allowlist`; children inherit it and reload updated patterns
+via the KG-delta channel.
+
+Within the reasoning triad, pattern capsules feed the **cognitive
+sandbox**: they are the shared, source-tagged heuristics a skill's
+policy weaves into a proposal while walking KG nodes. Because the
+match is a deterministic token walk, pattern-driven proposals stay
+inside the LLM-free primary NLP path (ADR-0104 + ADR-0211) — the
+sidecar LLM (ADR-0201) never sees a pattern and never mints one.
+Retiring a pattern is a data retract, not a re-train; upgrading a
+pattern capsule ripples to every skill that consults it in one
+install.
+
+**See also:** ADR-0202 (cognitive sandbox — skill policies consult
+patterns while composing proposals), ADR-0207 (bake manifest
+pattern_allowlist), ADR-0203 (pattern-capsule updates ride the same
+KG-delta channel), ADR-0211 (LLM-free NLP primary path — patterns
+are the heuristic layer of the grammar route).

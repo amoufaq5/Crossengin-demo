@@ -385,3 +385,30 @@ ADR-0088 (kernel discipline), ADR-0050 (meta-observer).
 FEEDS INTO: ADR-0107 (Pattern Capsules — drive skill policies as
 state machines), ADR-0108 (Style Capsules — render skill proposals),
 ADR-0104 (NL surface — natural-language entry point to `/skill run`).
+
+## Role in the Model Substrate
+
+The Skill Runtime is the composition point that every one of the
+five consumption modes routes through — mother-daemon-direct (mode
+1), per-user selective-load (mode 2), baked-child (mode 3), client
+app (mode 4), and embedded (mode 5) all ultimately reach knowledge
+through a `skill_run`. It is the mechanism, not a mode of its own.
+
+Within the reasoning triad, the skill runtime IS the **cognitive
+sandbox in operation**: it is where MSC nodes (KG atoms) and MSC
+signals (source-tagged observations) meet persona and safety gates
+to produce a proposal a user can act on. A baked child (ADR-0207)
+ships an allowlist of skills; a per-user instance loads skills
+selectively per persona; the mother can add or update skills at any
+time and children pick them up through the update channel. The
+LLM-free primary NLP path (ADR-0104 + ADR-0211) invokes skills
+identically to the sidecar-LLM fallback (ADR-0201); the skill layer
+does not know or care which parser dispatched it, which is what
+keeps the sidecar LLM strictly at the NL boundary.
+
+**See also:** ADR-0202 (cognitive sandbox — the runtime frame this
+skill runtime executes inside), ADR-0207 (bake manifest —
+skill_allowlist selects skills into children), ADR-0201 (sidecar
+LLM adapter — dispatches to skill_run without touching reasoning),
+ADR-0211 (LLM-free NLP primary path — grammar route dispatches to
+the same skill_run).

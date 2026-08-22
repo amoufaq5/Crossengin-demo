@@ -1,5 +1,10 @@
 # ADR-0105: Sandbox Architecture — capability separation, TLS, signed skill install
 
+**Title note (post-vision-alignment):** This ADR covers the
+ACCESS-CONTROL sandbox (capability tokens + ownership overlay). The
+COGNITIVE sandbox (the mind, where learning + agent production +
+answering happens) is a separate concept covered by ADR-0202.
+
 ## Status
 
 Proposed (R54 delivers capability tokens + verb-cap map; TLS + signed
@@ -306,3 +311,31 @@ Sandbox layers ADD enforcement; they never RELAX ADR-0103:
 - **R56+ — Rate limits per capability**, in-process TLS
   (retires the sidecar recipe), hardware-key-backed admin
   bootstrap
+
+## Role in the Model Substrate
+
+The access-control sandbox this ADR defines gates every consumption
+mode that exposes a wire — mother-daemon-direct (mode 1) when the
+mother is multi-user, per-user selective-load (mode 2) where every
+holder needs its own capability grant, client-app (mode 4) where
+the frontend authenticates over the RPC surface, and long-horizon
+embedded (mode 5) where a device holds a scoped token to its
+owner's mother. Baked-child instances (mode 3) inherit this layer
+whole and bind it to the child-appropriate verb subset.
+
+This ADR is NOT part of the reasoning triad. It is a perimeter
+around the substrate — capability tokens, transport TLS, signed
+skill install — that keeps unauthorized callers out and audit
+tags on every request that gets in. The cognitive sandbox where
+reasoning actually happens is a separate concept (ADR-0202); the
+name "sandbox" is shared but the scopes are disjoint. Keeping the
+two straight is what lets the mother/child factory (ADR-0200) ship
+children that are safe on customer infra without conflating "the
+mind" with "the socket."
+
+**See also:** ADR-0202 (cognitive sandbox — the mind, distinct
+from this access-control perimeter), ADR-0207 (bake manifest —
+capability grants baked into a child), ADR-0209 (signed child
+bundle — extends R54.2's signature pattern to whole bundles),
+ADR-0200 (five consumption modes — this perimeter gates each mode
+that exposes a wire).

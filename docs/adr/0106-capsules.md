@@ -282,3 +282,30 @@ FEEDS INTO: ADR-0102 (Persona will reference a preferred style
 capsule), ADR-0103 (Skills will declare required capsules),
 ADR-0104 (NL templater will consult a style capsule), ADR-0107
 (Pattern Capsules subtype), ADR-0108 (Style Capsules subtype).
+
+## Role in the Model Substrate
+
+Capsules are the composition primitive that makes **per-user
+selective-load** (consumption mode 2) and **baked-child** (mode 3)
+tractable — a user asks for "medical + legal" as capsule names, a
+bake manifest allowlists a capsule set into a child, and the same
+primitive serves both. Mother-daemon-direct (mode 1) uses capsules
+as inventory units for what the mother currently knows; client apps
+(mode 4) and embedded deployments (mode 5) consume capsules as the
+unit of knowledge distribution over the update channel.
+
+Within the reasoning triad, capsules are **grouped node membership**
+— they name atoms without owning them, so a capsule install is a
+data operation over KG nodes, not a change to the reasoning engine
+that walks them. This is what makes capsules the AI-factory replacement
+for fine-tuning: installing a capsule adds knowledge in seconds,
+without gradients, and the LLM-free primary NLP path (ADR-0104) walks
+the new atoms the same way it walked every prior atom. Capsule installs
+compose with KG-deltas (ADR-0203) to give the child update channel a
+uniform shape.
+
+**See also:** ADR-0200 (AI-factory frame — capsules are the
+knowledge-distribution unit for children), ADR-0207 (bake manifest
+capsule_allowlist), ADR-0203 (KG-delta / capsule-update wire
+format), ADR-0202 (cognitive sandbox — walks capsule atoms during
+skill runs).
