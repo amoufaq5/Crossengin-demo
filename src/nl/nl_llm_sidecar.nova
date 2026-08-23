@@ -1,0 +1,517 @@
+// CrossEngin NL Surface: small-LLM sidecar runner (R95, Phase B).
+//
+// Purpose
+//   Bridge the shipped-but-never-wired LLM parser (src/nl/llm_parser.nova,
+//   R48p6) into the live NL pipeline as a FALLBACK when the grammar
+//   parser returns NLK_UNPARSED. When enabled + available, this module
+//   fork+exec's `scripts/nl_parse_llm.sh` (the RFC-locked sidecar from
+//   ADR-0201) with the raw NL text, drains the wire-format stdout, and
+//   hands the bytes back to the caller. The caller (rpc_verbs /
+//   chat REPL) then parses the wire via llm_parse_wire_verbose and
+//   substitutes the resulting StructuredQuery for the UNPARSED one.
+//
+//   ADR-0211 makes the LLM the FALLBACK path -- LLM-free NLP is the
+//   primary target -- so every invocation is counted through the
+//   nl_metrics registry and the fallback rate is meant to drive toward
+//   zero as grammar coverage widens.
+//
+//   NOVA has no `run_shell` primitive (docs/NOVA_RUNTIME_GAPS.md P-1);
+//   we invoke the script via direct fork+exec, following the pattern
+//   proven in src/io/transducers/whisper_backend.nova:380-449. The
+//   helpers here are prefixed `_nls_` (local duplicates) so this module
+//   is a leaf.
+//
+// Env-var contract (documented in ADR-0201, implemented here at R95):
+//
+//   CROSSENGIN_NL_LLM_ENABLED     Master gate. Any value other than
+//                                 "1" disables the sidecar path so
+//                                 UNPARSED continues to refuse.
+//   CROSSENGIN_NL_LLM_MODEL       Value passed to --model. Default
+//                                 "local-small".
+//   CROSSENGIN_NL_LLM_BACKEND     Value passed to --backend. Default
+//                                 "ollama". Operators pick a real
+//                                 backend (ollama / llama-cpp /
+//                                 openai) or "dry-run" for CI.
+//   CROSSENGIN_NL_LLM_TESTMODE    Bypass shell-out entirely. Set to
+//                                 "1" in tests so we exercise the
+//                                 wire-handoff logic without touching
+//                                 the OS process table.
+//   CROSSENGIN_NL_LLM_TEST_WIRE   Wire-format response for testmode.
+//                                 E.g. "KIND research\nARG cats\n".
+//
+// Public API:
+//
+//   nl_llm_sidecar_available() -> 0|1
+//     One-shot check: is CROSSENGIN_NL_LLM_ENABLED=1 AND is
+//     scripts/nl_parse_llm.sh openable-and-readable at the resolved
+//     path? Cached after first call to keep the hot path cheap; a
+//     process restart is required to pick up env changes.
+//
+//   nl_llm_sidecar_parse(raw_text) -> [ok, wire_bytes, err_msg]
+//     Invokes the script (or the test-mode fixture) with raw_text as
+//     --input. Returns a 3-slot list:
+//       [0] ok         -- 1 iff the sidecar exited 0 AND produced
+//                         non-empty stdout.
+//       [1] wire_bytes -- the stdout string (may be empty on failure).
+//       [2] err_msg    -- "" on success, human-readable diagnostic on
+//                         failure ("sidecar disabled", "fork failed",
+//                         "sidecar exited with status N", ...).
+//
+//   nl_llm_try_fallback(q, raw_text, metrics_reg, holder) -> StructuredQuery
+//     The shared helper both RPC verb and chat REPL call. Semantics:
+//       * sq_kind(q) != NLK_UNPARSED  -> return q unchanged (no-op;
+//                                        no metrics touched).
+//       * sidecar unavailable         -> return q unchanged; NO
+//                                        fallback-attempt counter
+//                                        (we didn't try).
+//       * sidecar available, tried:
+//           - malformed wire          -> return original q,
+//                                        inc attempt + failure.
+//           - valid wire              -> return the new StructuredQuery,
+//                                        inc attempt + success.
+//
+//   nl_llm_sidecar_testmode() -> 0|1
+//     Whether CROSSENGIN_NL_LLM_TESTMODE=1. Useful for tests to gate
+//     their own assertions.
+//
+//   nl_llm_sidecar_testmode_fixture() -> string
+//     The CROSSENGIN_NL_LLM_TEST_WIRE value ("" if unset).
+//
+// NOVA dependencies: builtins -- alloc, store8, store64, load8,
+//   list_new, push, list_set, getenv, str_eq_bytes, fork_process,
+//   exec_program, waitpid, sys_open, sys_close, chr.
+// CrossEngin dependencies:
+//   src/nl/query_shape.nova
+//   src/nl/llm_parser.nova
+//   src/nl/nl_metrics.nova
+//   src/util/str_safe.nova
+
+import "std/syscall"
+import "./query_shape.nova"
+import "./llm_parser.nova"
+import "./nl_metrics.nova"
+import "../util/str_safe.nova"
+
+// ---- canonical script path -----------------------------------------------
+//
+// The sidecar script lives at `scripts/nl_parse_llm.sh` relative to the
+// repo root. Daemons are launched from the repo root by convention
+// (see docs/SHIP_AS_APP.md), so a relative path resolves. Operators
+// can override with CROSSENGIN_NL_LLM_SCRIPT for out-of-tree installs
+// (e.g. /usr/local/libexec/crossengin/nl_parse_llm.sh).
+let _NLS_DEFAULT_SCRIPT = "scripts/nl_parse_llm.sh"
+
+// Cap on stdout bytes we drain from the child. LLM wire responses are
+// tiny (KIND + up to 2 ARG lines ~= 50 bytes; audit headers extend
+// but stay well under 1 KB). 16 KiB leaves ample slack for a chatty
+// backend and stops runaway output from a misbehaving backend.
+let _NLS_MAX_OUT_BYTES = 16384
+
+// Default env values.
+let _NLS_DEFAULT_MODEL   = "local-small"
+let _NLS_DEFAULT_BACKEND = "ollama"
+
+// ---- env resolvers -------------------------------------------------------
+//
+// Every getenv() follows the canonical guard: check ptr == 0 (unset)
+// AND len(env) == 0 (present-but-empty; both count as "unset").
+
+fn _nls_env_or(name, dfl) {
+    let env = getenv(name)
+    if env == 0 { return dfl }
+    if len(env) == 0 { return dfl }
+    return env
+}
+
+fn _nls_env_is_one(name) {
+    let env = getenv(name)
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq_bytes(env, "1") == 1 { return 1 }
+    return 0
+}
+
+// ---- module-level cache --------------------------------------------------
+//
+// One-shot resolution of env + script existence. Cached because the
+// hot path (an UNPARSED query on every call) mustn't re-probe the
+// filesystem. Cache is populated on the first nl_llm_sidecar_available()
+// call and never invalidated -- an operator flipping env vars needs
+// to restart the daemon (documented in docs/SHIP_AS_APP.md §7.45).
+let _NLS_CACHE_UNSET   = 0    // sentinel: not yet computed
+let _NLS_CACHE_OFF     = 1    // enabled=0 OR script not openable
+let _NLS_CACHE_ON      = 2    // enabled=1 AND script openable
+
+let _nls_cache_state    = 0        // _NLS_CACHE_UNSET
+let _nls_cache_script   = ""
+let _nls_cache_model    = ""
+let _nls_cache_backend  = ""
+let _nls_cache_testmode = 0
+let _nls_cache_testwire = ""
+
+// Monotonic invocation counter for --run audit IDs. Not reset on cache
+// resolve; each sidecar call gets a strictly greater number.
+let _nls_run_counter = 0
+
+// Try to open+close a file; returns 1 iff sys_open succeeded.
+fn _nls_file_openable(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    sys_close(fd)
+    return 1
+}
+
+fn _nls_cache_populate() {
+    if _nls_cache_state != _NLS_CACHE_UNSET { return 0 }
+    _nls_cache_script   = _nls_env_or("CROSSENGIN_NL_LLM_SCRIPT",
+                                      _NLS_DEFAULT_SCRIPT)
+    _nls_cache_model    = _nls_env_or("CROSSENGIN_NL_LLM_MODEL",
+                                      _NLS_DEFAULT_MODEL)
+    _nls_cache_backend  = _nls_env_or("CROSSENGIN_NL_LLM_BACKEND",
+                                      _NLS_DEFAULT_BACKEND)
+    _nls_cache_testmode = _nls_env_is_one("CROSSENGIN_NL_LLM_TESTMODE")
+    _nls_cache_testwire = _nls_env_or("CROSSENGIN_NL_LLM_TEST_WIRE", "")
+    let enabled = _nls_env_is_one("CROSSENGIN_NL_LLM_ENABLED")
+    // Testmode is a superset of enabled -- if the operator flipped
+    // testmode on we must return "available" so the seam exercises
+    // the fallback path (the fixture stands in for a real backend).
+    if _nls_cache_testmode == 1 {
+        _nls_cache_state = _NLS_CACHE_ON
+        return 1
+    }
+    if enabled == 0 {
+        _nls_cache_state = _NLS_CACHE_OFF
+        return 1
+    }
+    if _nls_file_openable(_nls_cache_script) == 0 {
+        _nls_cache_state = _NLS_CACHE_OFF
+        return 1
+    }
+    _nls_cache_state = _NLS_CACHE_ON
+    return 1
+}
+
+// Force cache re-resolve. Tests call this between scenarios so a
+// per-test env-var change re-registers instead of latching to the
+// first-observed state. Not part of the operator-facing contract.
+fn nl_llm_sidecar_reset_cache() {
+    _nls_cache_state    = _NLS_CACHE_UNSET
+    _nls_cache_script   = ""
+    _nls_cache_model    = ""
+    _nls_cache_backend  = ""
+    _nls_cache_testmode = 0
+    _nls_cache_testwire = ""
+    return 1
+}
+
+// ---- test-only cache injectors ------------------------------------------
+//
+// NOVA has no `setenv` (docs/NOVA_RUNTIME_GAPS.md), so unit tests that
+// need to exercise multiple env-var configurations can't do it by
+// mutating the environment between scenarios. These setters let a
+// test bypass the env-read step and inject the cache directly; they
+// are prefixed `_test_` to make it clear at the call site that a
+// production caller should not use them. They are NOT part of the
+// operator-facing contract.
+
+fn nl_llm_sidecar_test_force_off() {
+    _nls_cache_state    = _NLS_CACHE_OFF
+    _nls_cache_testmode = 0
+    _nls_cache_testwire = ""
+    return 1
+}
+
+fn nl_llm_sidecar_test_force_testmode(wire) {
+    // Testmode short-circuit -- parse() returns wire without forking.
+    _nls_cache_state    = _NLS_CACHE_ON
+    _nls_cache_testmode = 1
+    _nls_cache_testwire = wire
+    return 1
+}
+
+fn nl_llm_sidecar_test_force_live(script_path) {
+    // Pretend a real sidecar is available at script_path. Never used
+    // by nl_llm_sidecar_parse in tests (we don't want to actually
+    // fork+exec) -- only useful to exercise the availability check.
+    _nls_cache_state    = _NLS_CACHE_ON
+    _nls_cache_testmode = 0
+    _nls_cache_testwire = ""
+    _nls_cache_script   = script_path
+    _nls_cache_model    = _NLS_DEFAULT_MODEL
+    _nls_cache_backend  = _NLS_DEFAULT_BACKEND
+    return 1
+}
+
+// ---- public: availability / test-mode readers ----------------------------
+
+fn nl_llm_sidecar_available() {
+    _nls_cache_populate()
+    if _nls_cache_state == _NLS_CACHE_ON { return 1 }
+    return 0
+}
+
+fn nl_llm_sidecar_testmode() {
+    _nls_cache_populate()
+    return _nls_cache_testmode
+}
+
+fn nl_llm_sidecar_testmode_fixture() {
+    _nls_cache_populate()
+    return _nls_cache_testwire
+}
+
+fn nl_llm_sidecar_script_path() {
+    _nls_cache_populate()
+    return _nls_cache_script
+}
+
+fn nl_llm_sidecar_model() {
+    _nls_cache_populate()
+    return _nls_cache_model
+}
+
+fn nl_llm_sidecar_backend() {
+    _nls_cache_populate()
+    return _nls_cache_backend
+}
+
+// ---- raw syscall shims (pipe2 / dup2 / close / read) ---------------------
+//
+// Duplicated locally (prefixed _nls_) so this module is a leaf and can
+// be tested without pulling in the whisper backend's transitive graph.
+// Numbers are Linux x86-64.
+
+fn _nls_pipe2(pipefd_buf) {
+    asm {
+        "mov rax, 293"
+        "mov rdi, [rbp-8]"
+        "xor rsi, rsi"
+        "syscall"
+    }
+}
+
+fn _nls_dup2(oldfd, newfd) {
+    asm {
+        "mov rax, 33"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "syscall"
+    }
+}
+
+fn _nls_close(fd) {
+    asm {
+        "mov rax, 3"
+        "mov rdi, [rbp-8]"
+        "syscall"
+    }
+}
+
+fn _nls_read(fd, buf, count) {
+    asm {
+        "mov rax, 0"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+// Reassemble a little-endian int32 from a 4-byte buffer (fd numbers).
+fn _nls_load_le_u32(addr) {
+    let b0 = load8(addr)
+    let b1 = load8(addr + 1)
+    let b2 = load8(addr + 2)
+    let b3 = load8(addr + 3)
+    let lo = b0 + b1 * 256
+    let hi = b2 + b3 * 256
+    return lo + hi * 65536
+}
+
+// ---- argv builder --------------------------------------------------------
+//
+// Fixed shape (10 slots + NULL terminator):
+//   [0] script_path
+//   [1] "--input"
+//   [2] raw_text
+//   [3] "--output"
+//   [4] "-"                    (stdout)
+//   [5] "--model"
+//   [6] model_name
+//   [7] "--run"
+//   [8] run_id_str
+//   [9] "--backend"
+//   [10] backend_name
+//   [11] NULL
+//
+// Matches scripts/nl_parse_llm.sh CLI (lines 75-89).
+fn _nls_argv(script_path, raw_text, model_name, run_id_str, backend_name) {
+    let p = alloc(12 * 8)
+    store64(p,      script_path)
+    store64(p + 8,  "--input")
+    store64(p + 16, raw_text)
+    store64(p + 24, "--output")
+    store64(p + 32, "-")
+    store64(p + 40, "--model")
+    store64(p + 48, model_name)
+    store64(p + 56, "--run")
+    store64(p + 64, run_id_str)
+    store64(p + 72, "--backend")
+    store64(p + 80, backend_name)
+    store64(p + 88, 0)
+    return p
+}
+
+// ---- stdout drain --------------------------------------------------------
+//
+// Read from `fd` until EOF or `max_bytes` reached. Same shape as
+// whisper's _whisper_drain_fd.
+
+fn _nls_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _nls_drain_fd(fd, max_bytes) {
+    let acc = ""
+    let buf = alloc(4096)
+    let total = 0
+    let keep = 1
+    while keep == 1 {
+        let n = _nls_read(fd, buf, 4096)
+        if n <= 0 {
+            keep = 0
+        } else {
+            acc = acc + _nls_bytes_to_str(buf, n)
+            total = total + n
+            if total >= max_bytes { keep = 0 }
+        }
+    }
+    return acc
+}
+
+// ---- result helper -------------------------------------------------------
+
+fn _nls_result(ok, wire, err) {
+    let r = list_new()
+    push(r, ok)
+    push(r, wire)
+    push(r, err)
+    return r
+}
+
+// ---- public: sidecar_parse -----------------------------------------------
+
+fn nl_llm_sidecar_parse(raw_text) {
+    _nls_cache_populate()
+    // Testmode short-circuit: no fork, no exec, no filesystem I/O.
+    // The fixture stands in for what the real sidecar would have
+    // written to stdout. An empty fixture is still "ok"; downstream
+    // llm_parse_wire will surface the empty-wire diagnostic.
+    if _nls_cache_testmode == 1 {
+        return _nls_result(1, _nls_cache_testwire, "")
+    }
+    if _nls_cache_state != _NLS_CACHE_ON {
+        return _nls_result(0, "", "sidecar disabled or script missing")
+    }
+    // Bump the run counter for audit identity.
+    _nls_run_counter = _nls_run_counter + 1
+    let run_id = "r95-" + int_to_str(_nls_run_counter)
+
+    let pipefd_buf = alloc(8)
+    _nls_pipe2(pipefd_buf)
+    let read_fd  = _nls_load_le_u32(pipefd_buf)
+    let write_fd = _nls_load_le_u32(pipefd_buf + 4)
+    // pipe2 returns 0 on success and puts the fds in the buffer; a
+    // failure leaves the fds at 0 which sys_open never yields, so
+    // check for the sentinel shape.
+    if read_fd == 0 {
+        return _nls_result(0, "", "pipe2 failed")
+    }
+
+    let argv = _nls_argv(_nls_cache_script, raw_text,
+                         _nls_cache_model, run_id, _nls_cache_backend)
+    let pid = fork_process()
+    if pid < 0 {
+        _nls_close(read_fd)
+        _nls_close(write_fd)
+        return _nls_result(0, "", "fork failed")
+    }
+    if pid == 0 {
+        // CHILD: rewire stdout onto the pipe, close both raw fds,
+        // exec. stderr stays attached to the parent so an operator
+        // running interactively sees any backend diagnostics. On
+        // exec failure exit 127 so the parent's waitpid sees it.
+        _nls_dup2(write_fd, 1)
+        _nls_close(write_fd)
+        _nls_close(read_fd)
+        exec_program(_nls_cache_script, argv)
+        exit(127)
+    }
+    // PARENT: close the write end so the read side EOFs when the
+    // child exits, drain, reap.
+    _nls_close(write_fd)
+    let wire = _nls_drain_fd(read_fd, _NLS_MAX_OUT_BYTES)
+    _nls_close(read_fd)
+    let status = waitpid(pid)
+    if status != 0 {
+        // Exit non-zero -- treat as failure even if some wire bytes
+        // arrived (they'd be partial / diagnostic). Report the raw
+        // status so operators can distinguish exec-fail (127) from
+        // backend-refused (usually 1-2) from signal-killed.
+        return _nls_result(0, "", "sidecar exited with status "
+                                  + int_to_str(status))
+    }
+    if len(wire) == 0 {
+        return _nls_result(0, "", "sidecar produced empty output")
+    }
+    return _nls_result(1, wire, "")
+}
+
+// ---- result accessors ---------------------------------------------------
+
+fn nls_ok(r)    { return r[0] }
+fn nls_wire(r)  { return r[1] }
+fn nls_err(r)   { return r[2] }
+
+// ---- public: shared helper called from both seams -----------------------
+//
+// Called identically from _rpc_verb_nl_ask (wire) and _try_nl (chat).
+// Preserves the existing "genuinely no NL match" contract: if the
+// grammar parsed OK, we do nothing; if the LLM sidecar also refuses
+// (or is unavailable), we return the original UNPARSED so the
+// executor's refusal branch (or the chat REPL's fall-through to
+// legacy cognition) still fires.
+//
+// Metrics semantics:
+//   * unavailable       -> no counters touched (we didn't try).
+//   * attempted+success -> inc attempt + inc success.
+//   * attempted+failure -> inc attempt + inc failure.
+// Total + unparsed are the CALLER's responsibility (they observe the
+// original query kind; we only see what happens IF it was UNPARSED).
+
+fn nl_llm_try_fallback(q, raw_text, metrics_reg, holder) {
+    if q == 0 { return q }
+    if sq_kind(q) != NLK_UNPARSED { return q }
+    if nl_llm_sidecar_available() == 0 { return q }
+    // Try the sidecar.
+    nl_metrics_inc_llm_fallback_attempt(metrics_reg, holder)
+    let side = nl_llm_sidecar_parse(raw_text)
+    if nls_ok(side) == 0 {
+        nl_metrics_inc_llm_fallback_failure(metrics_reg, holder)
+        return q
+    }
+    let vres = llm_parse_wire_verbose(nls_wire(side), raw_text)
+    if llmp_ok(vres) == 0 {
+        nl_metrics_inc_llm_fallback_failure(metrics_reg, holder)
+        return q
+    }
+    nl_metrics_inc_llm_fallback_success(metrics_reg, holder)
+    return llmp_query(vres)
+}

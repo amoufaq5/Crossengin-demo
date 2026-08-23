@@ -3097,6 +3097,163 @@ there enumerates hardening candidates (see also §12 below).
 `test_nl_rpc_verbs` (74). Pre-existing DTLS-12 reds and the
 Ed25519 latency red are untouched (they predate R87).
 
+### 7.45 Small-LLM NL adapter wired as fallback (R95 — Phase B)
+
+Phase A codified the AI-Factory vision in 22 ADRs. R95 (Phase B) is
+the first user-visible code round on top of that vision: the LLM
+parser that shipped in R48p6 but was never called is now wired as
+a FALLBACK on `nl.ask` when the grammar returns `NLK_UNPARSED`.
+ADR-0211 keeps LLM-free NLP as the primary target; the sidecar is
+the escape hatch when grammar coverage misses. Every fallback fires
+under a per-holder counter so the operator can drive the LLM
+dependence toward zero over time (Phase C's grammar expansion + HDC
+classifier + `nl.metrics` wire verb will feed on these numbers).
+
+**What shipped:**
+
+- `src/nl/nl_llm_sidecar.nova` — module that fork+exec's
+  `scripts/nl_parse_llm.sh` (the RFC-locked script from ADR-0201),
+  drains stdout, hands the wire bytes to `llm_parse_wire_verbose`.
+  Follows the fork+exec pattern proven in `whisper_backend.nova`
+  since NOVA has no `run_shell` primitive
+  (`docs/NOVA_RUNTIME_GAPS.md` P-1). Env-driven; cached at first
+  probe.
+- `src/nl/nl_metrics.nova` — per-holder counter registry with
+  slots `total / unparsed / llm_fallback_attempts /
+  successes / failures`. Public API `nl_metrics_new()` +
+  `nl_metrics_inc_*(reg, holder)` + `nl_metrics_snapshot(reg)`.
+  Anonymous holders (`""`) are a first-class bucket. Reads never
+  allocate rows (no side effect in getters).
+- `nl_llm_try_fallback(q, raw_text, metrics, holder)` — the shared
+  helper both seams call. No-op on non-UNPARSED. On UNPARSED with
+  the sidecar unavailable it returns the original query and touches
+  NO counters (we didn't try). On UNPARSED with the sidecar
+  available it inc's attempt, invokes the sidecar, parses the wire,
+  and on success replaces `q` (inc'ing success) or on malformed
+  wire returns the original (inc'ing failure).
+
+**The two seams:**
+
+1. **Wire — `_rpc_verb_nl_ask` (`src/nl/rpc_verbs.nova`)** — a new
+   `RCTX_NL_METRICS` slot on `rpc_ctx` (accessor
+   `rpc_ctx_nl_metrics(ctx)`, mutator `rpc_ctx_set_nl_metrics(ctx,
+   reg)`). The verb inc's total on every call, inc's unparsed when
+   grammar whiffs, then calls `nl_llm_try_fallback(q, text,
+   metrics, holder)` before dispatching to `nl_execute_scoped`.
+   `crossengin_rpc_daemon.nova` allocates a fresh `nl_metrics`
+   registry at boot so this daemon always feeds the counters —
+   removes the "did the operator remember to wire the registry?"
+   trap. Absent the wiring (custom daemons pre-R95) the seam
+   silently no-ops.
+2. **Chat — `_try_nl` (`examples/crossengin_chat.nova`)** — the
+   line-2076 `if k == NLK_UNPARSED { return 0 }` is replaced with
+   a `nl_llm_try_fallback` call; still-UNPARSED after the sidecar
+   returns 0 (preserves the "genuinely no NL match" fall-through
+   to legacy cognition). A module-level lazy-init singleton
+   `_nl_metrics_singleton` keeps process-scoped counters for the
+   chat session, mirroring the pattern used by `_skill_registry`
+   and `_ingest_agent`.
+
+**Env-var contract (documented in ADR-0201, implemented at R95):**
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `CROSSENGIN_NL_LLM_ENABLED` | Master gate. Value must be `"1"` to arm the sidecar path. | off |
+| `CROSSENGIN_NL_LLM_MODEL` | Passed to `--model`. | `local-small` |
+| `CROSSENGIN_NL_LLM_BACKEND` | Passed to `--backend` (`ollama` / `llama-cpp` / `openai` / `dry-run`). | `ollama` |
+| `CROSSENGIN_NL_LLM_SCRIPT` | Override the resolved script path (out-of-tree installs). | `scripts/nl_parse_llm.sh` |
+| `CROSSENGIN_NL_LLM_TESTMODE` | Bypass shell-out entirely; short-circuit to the fixture. | off |
+| `CROSSENGIN_NL_LLM_TEST_WIRE` | Wire-format bytes returned in test-mode. E.g. `"KIND research\nARG cats\n"`. | `""` |
+
+Env is read ONCE at first `nl_llm_sidecar_available()` and cached.
+Restart to pick up changes — documented so operators don't chase
+"why isn't my new `MODEL` taking effect?" ghosts.
+
+**Test-mode pattern.** NOVA has no `setenv` (see
+`docs/NOVA_RUNTIME_GAPS.md`), so unit tests can't mutate env vars
+between scenarios to exercise different configurations. The
+sidecar module exposes three test-only injectors —
+`nl_llm_sidecar_test_force_off()`,
+`nl_llm_sidecar_test_force_live(script_path)`,
+`nl_llm_sidecar_test_force_testmode(wire)` — that let a test bypass
+the env-read step and inject the cache state directly. Every unit
+test calls `nl_llm_sidecar_reset_cache()` first so scenarios don't
+latch to the first observation.
+
+**Metric slots per holder:**
+
+- `total` — every `nl.ask` (or `_try_nl` call).
+- `unparsed` — grammar returned `NLK_UNPARSED`.
+- `llm_fallback_attempts` — sidecar was invoked. Always equal to
+  `successes + failures`. Sidecar-unavailable does NOT count.
+- `llm_fallback_successes` — sidecar returned + wire parsed +
+  produced a valid `StructuredQuery`.
+- `llm_fallback_failures` — attempt fired but wire was malformed /
+  empty / kind-less.
+
+**Sidecar-unavailability semantics.** When
+`nl_llm_sidecar_available() == 0` the helper returns the original
+UNPARSED query untouched and does not inc any counter. The
+executor's refusal branch then fires with the updated message
+`"grammar could not parse this input; LLM sidecar was unavailable
+or also refused"` (was `"...LLM fallback not linked yet (R48p6)"`;
+same behavior, clearer text). This is deliberate: the metric
+measures "we tried the LLM"; treating an unwired sidecar as an
+attempt would misrepresent the fallback rate.
+
+**New tests (163 checks total):**
+
+- `test_nl_llm_sidecar` (53) — availability contract, test-mode
+  short-circuit, wire handoff to `llm_parse_wire_verbose`, malformed
+  wire refusal, the shared helper's contract with the metrics
+  registry, null-query defense, 0-registry no-op safety.
+- `test_nl_metrics` (51) — fresh-registry all-zero, single- and
+  multi-holder increments, anonymous bucket, snapshot idempotence,
+  order independence, 0-registry no-op mutators + readers.
+- `test_nl_rpc_llm_fallback` (33) — end-to-end through
+  `rpc_dispatch("nl.ask", ...)`: grammar-parseable fast path
+  (attempts=0), sidecar off (unparsed=1, attempts=0), sidecar
+  success (attempts=1, successes=1, parser_used flips to `"llm"`),
+  sidecar malformed (attempts=1, failures=1), ctx accessor
+  round-trip, 0-metrics ctx compatibility.
+- `test_nl_chat_llm_fallback` (26) — analogous coverage for the
+  chat seam via the shared helper (chat's `_try_nl` calls `print()`
+  directly and pulls in a large substrate slice, making black-box
+  import impractical; the plan explicitly allows testing the
+  helper directly for this surface).
+
+**Regression sweep (all green):** `test_nl_grammar_parser` (103),
+`test_nl_query_shape` (86), `test_nl_executor` (76),
+`test_nl_templater` (60), `test_nl_llm_parser` (66),
+`test_nl_rpc_server` (37), `test_nl_chat_wire` (29),
+`test_capability_wire` (245), `test_nl_rpc_verbs` (74). Executor's
+message-text assertion still matches (the new message contains the
+`"LLM"` substring the test scans for).
+
+**Live-sidecar smoke.** Deferred to a permissive host. This
+project's sandbox container blocks / observes fork+exec in ways
+that make a live smoke unreliable inside the test harness; the
+test-mode short-circuit exercises the same handoff logic (parse
++ metrics + fallback semantics) without touching the process
+table, and is the primary confidence gate for R95. Operators
+running the daemon on a normal host validate the live path with:
+
+```
+CROSSENGIN_NL_LLM_ENABLED=1 \
+CROSSENGIN_NL_LLM_BACKEND=dry-run \
+CE_NL_LLM_DRY_KIND=research \
+CE_NL_LLM_DRY_ARGS=weather \
+  bin/crossengin-rpc-daemon
+```
+
+and issuing `nl.ask` with a text the grammar rejects; the sidecar
+returns the fixture, `llm_parse_wire` promotes it to a research
+query, and the daemon dispatches the research skill.
+
+**References**: ADR-0201 (small-LLM sidecar contract), ADR-0211
+(LLM-free NLP as primary path; fallback rate drives investment),
+plan file `gentle-toasting-zephyr.md`.
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -3186,13 +3343,26 @@ wiring, sidecar contract — all in tree. Any further TLS work
 concurrent handshakes / ACME sidecar) is optional hardening layered
 on top; see the R86 ADR's post-scriptum for the full list.
 
-**Front-of-queue (non-TLS, post-R94; the top three are the
+**AI-Factory epic (Phase A + B ✅; Phase C is the front-of-queue).**
+Phase A shipped the vision (ADR-0200..0211 + 5 top-level docs).
+Phase B (R95) wired the small-LLM sidecar as the freeform-NL
+fallback and stood up the per-holder metrics registry (see §7.45).
+**Phase C — LLM-free NLP expansion** is the immediate next
+target: (a) add `nl.metrics` wire verb so operators can snapshot
+the fallback rate live, (b) extend `grammar_parser.nova` to
+50–100 patterns so the LLM path fires on fewer inputs, (c) ship
+the HDC prototype-vector intent classifier so more inputs are
+handled with zero-shot symbolic matching instead of grammar. Every
+Phase C improvement is measurable via the R95 metric slots.
+
+**Front-of-queue (non-TLS, post-Phase-B; the top three are the
 immediate targets):**
 
-1. **Admin bulk-ops** (multi-token grants / revokes in one wire call).
-2. **Per-session pre/post hooks** so a daemon operator can attach an
+1. **Phase C — LLM-free NLP expansion** (see above).
+2. **Admin bulk-ops** (multi-token grants / revokes in one wire call).
+3. **Per-session pre/post hooks** so a daemon operator can attach an
    audit-log writer without editing `rpc_server.nova`.
-3. **Ownership audit log** — a per-holder append-only log of
+4. **Ownership audit log** — a per-holder append-only log of
    `ownership.transfer` and `admin.set_holder` events.
 - Per-source rate budgets controllable via admin wire verb (aggregate
   ceilings across many tokens from one origin).
