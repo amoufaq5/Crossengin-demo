@@ -3510,6 +3510,145 @@ sidecar), and is also measurable via `nl.metrics`.
 as primary path; fallback rate as tuning signal), §7.46 (the metric
 that R97 moves).
 
+### 7.48 HDC prototype-vector intent classifier (R98 — Phase C part 3)
+
+R97 pushed the grammar rung from ~12 to ~85 patterns. R98 fills the
+middle rung of the ADR-0211 three-rung pipeline so freeform
+utterances that STILL slip past the grammar have a symbolic, offline
+path to try BEFORE the sidecar LLM. The pipeline order is now:
+
+    grammar_parse                   -- src/nl/grammar_parser.nova   (R48p2, R97)
+    -> nl_ic_try_classify            -- src/nl/nl_intent_classifier.nova (R98)
+    -> nl_llm_try_fallback           -- src/nl/nl_llm_sidecar.nova   (R95)
+
+Both call sites (`_rpc_verb_nl_ask` in `src/nl/rpc_verbs.nova` and
+`_try_nl` in `examples/crossengin_chat.nova`) funnel through the new
+shared helper `nl_pipeline_try_fallback_rungs` in
+`src/nl/nl_pipeline.nova`, so the ordering + metric-touch contract
+lives in ONE place. A future rung (e.g. KG-driven paraphrase) only
+edits that helper.
+
+**Algorithm.** For each SQ kind, hand-authored training utterances
+are tokenized + preamble-stripped, and each token is looked up in
+the R-P1 HDC layer's deterministic symbol table
+(`hdc_symbol(label)`, 10 000-dim bipolar hypervector). Utterance
+vectors are HDC-bundled (element-wise sum + majority-clip), and
+utterance vectors are bundled again into a per-kind PROTOTYPE
+vector. Classification:
+
+1. Tokenize + preamble-strip the raw utterance.
+2. Bundle its token-vectors into an utterance vector.
+3. Compute cosine similarity against every prototype
+   (`hdc_cosine`, milli-scale, converted to basis points).
+4. Pick the winner; hit iff `sim_bp >= threshold` (default 3500).
+5. Slot-fill from the utterance tokens (kind-specific: strip
+   signal words, split on connectors); validate via `sq_validate`;
+   fall through to unparsed if either step fails.
+
+**Deterministic + offline.** `hdc_symbol` is a pure function of the
+label (FNV-1a seed + bounded LCG), memoised under the 8192-entry
+HDC cache. Same corpus + same input → bit-identical prototype +
+similarity every time, across processes and snapshots. No network,
+no floats.
+
+**Training corpus.** Ships at `data/nl_intent/prototypes.txt` for
+operator inspection, and is ALSO embedded in the classifier module
+(`_nlic_corpus_blocks` in `src/nl/nl_intent_classifier.nova`) so
+daemon boot needs no file I/O — the sandbox container's `sys_open`
+on `/tmp` aborts (see `docs/NOVA_RUNTIME_GAPS.md`), and reading a
+data file at every start would inherit the same risk. Keep the two
+in sync when adding utterances (a later round can unify them). The
+starter corpus authors 10-20 utterances per kind (skipping NONE /
+UNPARSED) across biology / physics / history / ops / meta topics so
+no prototype vector is locked to one domain lexicon.
+
+**Threshold** (`CROSSENGIN_NL_IC_THRESHOLD_BP`, default 3500).
+Integer basis points; 0-10000 (10000 = 100% cosine similarity).
+Chosen empirically against the shipped 10-kind corpus: on-topic
+paraphrases score 4000-5900 bp; two-word non-sense inputs land
+around 3000-3200 bp; clearly-off inputs (unknown vocabulary
+throughout) land below 500 bp. 3500 clears the noise floor with
+room to spare while still catching on-topic paraphrases. Lower
+values raise hit rate (and mis-classification risk); higher values
+push more traffic to the sidecar. The chosen threshold is emitted
+at module init via a `println` for operator visibility.
+
+**Slot fill.** The classifier recognizes intent, not full
+structure. For simple single-arg kinds (RESEARCH / RETRACT /
+CAPSULE_INSTALL / SKILL_INSTALL) the recovered slot is the
+utterance minus a kind-specific "signal words" list — the tokens
+that identify the intent (e.g. `explain` / `describe` / `about`
+for RESEARCH) get stripped and the remainder is the topic. For
+two-arg kinds (RELATE / IS_A / SKILL_RUN) the utterance is split
+on a known connector (`and` / `to` / `vs` / `versus` / `with`
+for RELATE; `a` / `an` for IS_A; `on` / `with` / `using` for
+SKILL_RUN). If the split cannot yield two non-empty slots the
+classification is DROPPED — a slot-fill failure returns
+`sq_unparsed` rather than a malformed SQ, so the executor's
+invariants stay intact. CONTRADICT_SCAN copies its topic into both
+argument slots (grammar's existing 1-topic → 2-slot convention).
+Every constructed SQ is passed through `sq_validate`; an
+SQ_ERR_ARITY / SQ_ERR_EMPTY_ARG also aborts to unparsed.
+
+**Metrics** (extends `src/nl/nl_metrics.nova`; the R96 wire verb
+picks up the new fields automatically):
+
+- `classifier_attempts` — inc'd every time the classifier is
+  invoked (i.e. grammar returned UNPARSED and the classifier ran).
+- `classifier_hits` — inc'd when the classifier returned a valid
+  SQ (kind other than UNPARSED, `sq_validate == SQ_OK`).
+- `classifier_misses` — inc'd otherwise. Invariant:
+  `classifier_attempts == classifier_hits + classifier_misses`.
+- `classifier_hit_rate` — derived field in the `nl.metrics`
+  response, in basis points:
+  `classifier_hits * 10000 / classifier_attempts`;
+  0 when `classifier_attempts == 0`. Independent of the R96
+  `fallback_rate` — a classifier hit BYPASSES the sidecar
+  entirely, so `llm_attempts` stays at 0 for those calls.
+
+**Response schema.** `nl.metrics` responses (both per-holder and
+`_total_all_holders` aggregate) gain four fields beyond the R96
+payload: `classifier_attempts`, `classifier_hits`,
+`classifier_misses`, `classifier_hit_rate`. Existing consumers
+ignoring the new fields see the R96 payload unchanged.
+
+**Effect on the R96 metric.** Every classifier HIT is an utterance
+that would otherwise have been counted against `llm_attempts`. So
+`fallback_rate` (in bp, the ADR-0211 target) drops by the exact
+count of hits per holder, no sidecar-side change required. The
+new `classifier_hit_rate` sits alongside `fallback_rate` on the
+dashboard: fallback shrinking while classifier hit-rate rises is
+Phase C progressing; both stagnant means the next rung of expansion
+(more training utterances, or a new prototype) is due.
+
+**Tests.** `tests/unit/test_nl_intent_classifier.nova` (71 checks)
+covers init idempotence, prototype count, self-similarity on
+training utterances, paraphrase classification, threshold default,
+off-topic misses, all seven slot-fill kinds, validator
+fall-through, per-holder metric increments, and prototype
+determinism (same corpus → identical similarity). Extended
+`test_nl_metrics` (74 checks total; +23) exercises the new IC
+counter mutators + reads + snapshot slots. Extended
+`test_nl_rpc_metrics_verb` (89 checks total; +8) asserts the new
+response fields on both the aggregate branch and the per-holder
+branch. Extended `test_nl_rpc_llm_fallback` (43 checks total;
++15) asserts the classifier-hit-skips-sidecar invariant, the
+classifier-miss-falls-to-sidecar path, and the
+grammar-hit-touches-neither-rung fast path.
+
+**Not touched.** SQ shape (`query_shape.nova`), executor kind
+dispatch, templater, LLM parser, and the grammar parser are all
+unchanged. No new SQ kinds introduced — the classifier only routes
+utterances into the same 11 kinds the executor already dispatches.
+The three rungs stay independent: a future round can swap any rung
+without touching the others.
+
+**References**: ADR-0104 (NL Surface Layer), ADR-0051
+(HDC / VSA embeddings — the substrate this reuses), ADR-0211
+(LLM-free NLP as primary path; fallback rate as tuning signal),
+§7.45 (sidecar), §7.46 (metrics wire verb + basis-points math),
+§7.47 (R97 grammar expansion — the neighbouring rung).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -3599,28 +3738,44 @@ wiring, sidecar contract — all in tree. Any further TLS work
 concurrent handshakes / ACME sidecar) is optional hardening layered
 on top; see the R86 ADR's post-scriptum for the full list.
 
-**AI-Factory epic (Phase A + B ✅; Phase C in progress).** Phase A
-shipped the vision (ADR-0200..0211 + 5 top-level docs). Phase B
-(R95) wired the small-LLM sidecar as the freeform-NL fallback and
-stood up the per-holder metrics registry (see §7.45). **Phase C
-part 1 (R96)** landed the `nl.metrics` wire verb (see §7.46) so
-operators can snapshot the per-holder fallback rate live in basis
-points — the ADR-0211 metric that drives the rest of Phase C is
-now visible. **Phase C part 2 (R97)** expanded the LLM-free grammar
-parser from ~12 canonical patterns to ~85 natural phrasings across
-the same 11 SQ kinds (see §7.47) — the first metric-driven grammar
-expansion. Regression suite grew 103 -> 512 checks; every added
-phrasing has a direct kind+args assertion plus a validator sweep.
-Sidecar fallback rate for any holder whose traffic contains the
-newly-recognized forms drops without any sidecar-side change.
-**Front-of-queue for Phase C:**
-- **R98 (candidate)** — ship the HDC prototype-vector intent
-  classifier so freeform inputs the grammar STILL misses are handled
-  by a zero-shot symbolic path before the sidecar. Also measurable
-  via the same `nl.metrics` verb.
+**AI-Factory epic (Phase A + B ✅; Phase C ✅).** Phase A shipped
+the vision (ADR-0200..0211 + 5 top-level docs). Phase B (R95) wired
+the small-LLM sidecar as the freeform-NL fallback and stood up the
+per-holder metrics registry (see §7.45). **Phase C part 1 (R96)**
+landed the `nl.metrics` wire verb (see §7.46) so operators can
+snapshot the per-holder fallback rate live in basis points — the
+ADR-0211 metric that drives the rest of Phase C is now visible.
+**Phase C part 2 (R97)** expanded the LLM-free grammar parser from
+~12 canonical patterns to ~85 natural phrasings across the same 11
+SQ kinds (see §7.47) — the first metric-driven grammar expansion.
+**Phase C part 3 (R98)** shipped the HDC prototype-vector intent
+classifier as the middle rung of the ADR-0211 pipeline (see §7.48).
+Grammar-miss utterances now try a symbolic, offline HDC classifier
+(10 kinds, ~130 training utterances, threshold-tuned at 3500 bp)
+BEFORE the LLM sidecar; a hit skips the sidecar entirely, dropping
+`fallback_rate` by the exact count of hits per holder. The
+`nl.metrics` response gains four fields
+(`classifier_attempts` / `classifier_hits` / `classifier_misses` /
+`classifier_hit_rate`) so both rungs are dashboardable side by
+side.
+
+**Front-of-queue after Phase C ✅:**
+- **R99 (candidate)** — KG-driven paraphrase: consult the live KG
+  for atom aliases at classify time so a training utterance that
+  says "photosynthesis" also matches queries about "photosynthetic
+  process" without adding a new corpus line. Slots in as a fourth
+  pipeline rung; measurable via the same `nl.metrics` verb.
+- **R99 alt** — fallback-rate driven grammar backfill loop: an
+  operator tool that reads `nl.metrics` snapshots, harvests the
+  top-N high-frequency unparsed inputs from a holder's traffic, and
+  suggests new grammar patterns for R100 to add.
+- **Phase D** — bake-factory work (R95..R100 was originally
+  planned; renumber if we skip R99 KG paraphrase).
+- **Phase E** — selective load (operator preference).
+
 Each Phase C improvement is directly measurable via the R96 verb;
 the fallback-rate basis-points number is the single scalar tuning
-target, and R97 is the first knob turned against it.
+target, and R97 + R98 are the first two knobs turned against it.
 
 **Front-of-queue (non-TLS, post-Phase-B; the top three are the
 immediate targets):**
